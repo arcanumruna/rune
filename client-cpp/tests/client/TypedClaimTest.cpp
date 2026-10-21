@@ -116,8 +116,13 @@ TEST(TypedClaim, StampsTheBoundVersionAndTheKeyFieldAndRoundTripsEveryField) {
     ASSERT_EQ(v.size(), PositionEncoder::kEncodedLength);
     EXPECT_EQ(static_cast<uint8_t>(v[2]), 7);
     EXPECT_EQ(static_cast<uint8_t>(v[3]), 0) << "the bound version is stamped at bytes [2..3]";
+    // #418: a reader places a record by its version; v7 is after Position::kVersion, so it reads through the
+    // topic's lineage (here: the same fields through v7).
+    rune::codec::Descriptor lineage7 = Position::descriptor();
+    lineage7.version = 7;
     Position back;
-    back.decode(span(v));
+    EXPECT_FALSE(back.decode(span(v))) << "a version after kVersion is unknown without the lineage";
+    ASSERT_TRUE(back.decode(span(v), Position::lineage(lineage7)));
     EXPECT_EQ(back.userId, 42) << "claim(key) writes the key field";
     EXPECT_EQ(back.zone, -3);
     EXPECT_EQ(back.x, 1.5);
@@ -223,7 +228,7 @@ TEST(TypedClaimRegression, OverlongStringKeyThrowsAndClaimsNothingRegression) {
     EXPECT_EQ(cap.recs[0].partition,
               Key(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(k16.data()), k16.size())).partition(8));
     LongKey back;
-    back.decode(span(cap.recs[0].value));
+    ASSERT_TRUE(back.decode(span(cap.recs[0].value)));
     EXPECT_EQ(std::string_view(back.code.data(), 16), k16);
     EXPECT_EQ(back.v, 5);
 }

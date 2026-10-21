@@ -936,18 +936,102 @@ bool GroupCoordinationService::staleLineage_(const rune::coordination::Committed
 // ---------------------------------------------------------------------------
 // applyTransactionalOffset - an offset of a committed transaction (see the header).
 // ---------------------------------------------------------------------------
-bool GroupCoordinationService::applyTransactionalOffset(const std::string& group, const coord::TopicPartition& tp,
-                                                        int64_t offset, int64_t nowNs)
+coord::TxnOffsetApply GroupCoordinationService::applyTransactionalOffset(const std::string& group,
+                                                                         const coord::TopicPartition& tp,
+                                                                         int64_t offset, int64_t nowNs,
+                                                                         coord::TxnOffsetToken token)
 {
-    if (offsets_ == nullptr || !isLocalCoordinator() || !offsetsLoaded_()) return false;
+    using R = coord::TxnOffsetApply;
+    if (offsets_ == nullptr || !isLocalCoordinator() || !offsetsLoaded_()) return R::Refused;
     uint64_t lineage = 0;
     if (topics_ != nullptr) {
         if (const auto id = topics_->topicIdForName(tp.topic)) {
             lineage = lineageOf_(*id, tp.partition);   // C1: 0 for a disk partition
-            if (lineage == kLineagePending) return false;
+            if (lineage == kLineagePending) return R::Refused;
         }
     }
-    return offsets_->commit(group, tp, offset, {}, nowNs, lineage);
+    const rune::replication::PartitionReplica* r = offsets_->replica();
+    if (r == nullptr) return offsets_->commit(group, tp, offset, {}, nowNs, lineage) ? R::Applied : R::Refused;
+    // #358: Applied only once a record carrying this offset or a NEWER one of the key is COMMITTED (see the header).
+    const uint64_t leadGen = r->leadershipGeneration(), logGen = r->logGeneration();
+    const int64_t  hw = r->highWatermark();
+    const TxnOffsetKey key{group, tp.topic, tp.partition};
+    auto slot = txnOffsetsInFlight_.find(key);
+    if (slot != txnOffsetsInFlight_.end()) {
+        TxnOffsetKeyState& k = slot->second;
+        // A newest record seen committed survives every later change of leadership or log.
+        if (k.lastRecord >= 0 && k.lastLeadershipGen == leadGen && k.lastLogGen == logGen && hw > k.lastRecord)
+            k.lastCommitted = true;
+        for (std::size_t i = 0; i < k.waiters.size(); ++i) {
+            TxnOffsetWaiter& w = k.waiters[i];
+            if (!(w.token == token) || w.offset != offset) continue;
+            // An anonymous caller (a default token: rigs) cannot tell two transactions apart; it is matched only
+            // as the key's newest waiter (an older anonymous entry is dropped when a newer record is appended).
+            if (token == coord::TxnOffsetToken{} && i + 1 != k.waiters.size()) continue;
+            const auto leave = [&] {
+                k.waiters.erase(k.waiters.begin() + static_cast<std::ptrdiff_t>(i));
+                --txnOffsetsWaiting_;
+                if (k.waiters.empty()) txnOffsetsInFlight_.erase(slot);
+                return R::Applied;
+            };
+            if (k.lastCommitted) return leave();   // its record or a newer one of the key is committed
+            const bool sameGen = k.lastLeadershipGen == leadGen && k.lastLogGen == logGen;
+            if (sameGen) return R::Replicating;    // the newest record of the key is still replicating
+            // Leadership or log changed and the newest record may be gone.  Only the newest waiter appends again;
+            // an older one waits for it (a newer value is never overwritten by an older one).  A plain commit that
+            // was the newest and may be gone hands that role back to the newest waiter.
+            if (i + 1 != k.waiters.size()) return R::Replicating;
+            const int64_t at = offsets_->commitAt(group, tp, offset, {}, nowNs, lineage);
+            if (at < 0) return R::Refused;
+            w.recordOffset = at; w.leadershipGen = leadGen; w.logGen = logGen;
+            k.lastRecord = at; k.lastLeadershipGen = leadGen; k.lastLogGen = logGen;
+            k.lastCommitted = r->highWatermark() > at; k.plainIsLast = false;
+            return k.lastCommitted ? leave() : R::Replicating;
+        }
+        if (k.waiters.size() >= kMaxTxnOffsetWaiters) return R::Refused;   // never evict: the coordinator retries
+    }
+    const int64_t at = offsets_->commitAt(group, tp, offset, {}, nowNs, lineage);
+    if (at < 0) return R::Refused;
+    if (slot == txnOffsetsInFlight_.end()) slot = txnOffsetsInFlight_.try_emplace(key).first;
+    TxnOffsetKeyState& k = slot->second;
+    {   // older anonymous entries can never be asked for again (see above)
+        const std::size_t before = k.waiters.size();
+        std::erase_if(k.waiters, [](const TxnOffsetWaiter& w) { return w.token == coord::TxnOffsetToken{}; });
+        txnOffsetsWaiting_ -= before - k.waiters.size();
+    }
+    k.lastRecord = at; k.lastLeadershipGen = leadGen; k.lastLogGen = logGen;
+    k.lastCommitted = r->highWatermark() > at; k.plainIsLast = false;
+    if (k.lastCommitted) {   // committed on the append (a single-replica offsets partition): nothing waits
+        if (k.waiters.empty()) txnOffsetsInFlight_.erase(slot);
+        return R::Applied;
+    }
+    k.waiters.push_back(TxnOffsetWaiter{token, offset, at, leadGen, logGen});
+    ++txnOffsetsWaiting_;
+    return R::Replicating;
+}
+
+void GroupCoordinationService::releaseTransactionalOffsets(const coord::TxnOffsetToken& token)
+{
+    if (txnOffsetsWaiting_ == 0) return;
+    for (auto it = txnOffsetsInFlight_.begin(); it != txnOffsetsInFlight_.end();) {
+        auto& ws = it->second.waiters;
+        const std::size_t before = ws.size();
+        std::erase_if(ws, [&](const TxnOffsetWaiter& w) { return w.token == token; });
+        txnOffsetsWaiting_ -= before - ws.size();
+        it = ws.empty() ? txnOffsetsInFlight_.erase(it) : std::next(it);
+    }
+}
+
+void GroupCoordinationService::notePlainOffsetCommit_(const std::string& group, const coord::TopicPartition& tp,
+                                                      int64_t at)
+{
+    if (txnOffsetsWaiting_ == 0 || offsets_ == nullptr || offsets_->replica() == nullptr) return;
+    const auto it = txnOffsetsInFlight_.find(TxnOffsetKey{group, tp.topic, tp.partition});
+    if (it == txnOffsetsInFlight_.end()) return;
+    const rune::replication::PartitionReplica* r = offsets_->replica();
+    TxnOffsetKeyState& k = it->second;
+    k.lastRecord = at; k.lastLeadershipGen = r->leadershipGeneration(); k.lastLogGen = r->logGeneration();
+    k.lastCommitted = r->highWatermark() > at; k.plainIsLast = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,7 +1182,9 @@ size_t GroupCoordinationService::handleOffsetCommit(
                 continue;
             }
         }
-        const bool committed = offsets_->commit(groupIdStr, tp, e.offset, meta, nowNs, lineage);
+        const int64_t at = offsets_->commitAt(groupIdStr, tp, e.offset, meta, nowNs, lineage);
+        const bool committed = at >= 0;
+        if (committed) notePlainOffsetCommit_(groupIdStr, tp, at);   // the newest record of the key (F2)
         r.errorCode = committed ? static_cast<int16_t>(pc::ErrorCode::OK)
                                 : static_cast<int16_t>(pc::ErrorCode::MinIsrViolation);
         commitResultScratch_.push_back(r);

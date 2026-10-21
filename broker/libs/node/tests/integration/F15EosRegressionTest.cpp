@@ -1839,6 +1839,7 @@ struct CoordRig {
         tcs = std::make_unique<TransactionCoordinationService>(store.get(), nullptr,
                                                               [this] { return consensusLeader; },
                                                               [] { return NodeId{1}; });
+        tcs->setAnswerSinkForTest(&CoordRig::captureAnswer_, this);   // #358 class: answers parked until committed
         tcs->setAppendFnOverride([this](std::string_view, int32_t, std::span<const uint8_t> b) -> int64_t {
             tx::ControlMarkerPayload p;
             if (tx::ControlMarker::extract(b.data(), 0, p, b.size()))
@@ -1851,7 +1852,22 @@ struct CoordRig {
         q.transactionalId = {reinterpret_cast<const uint8_t*>(txnId.data()), txnId.size()};
         std::vector<uint8_t> f(q.encodedSize()); q.encode(f.data());
         const auto n = tcs->handleInitProducerId(f.data(), f.size(), now, out.data(), out.size());
+        if (n == 0) return Init{kParkedAnswer, -1, -1};   // #358 class: answered once its record commits
         auto r = pc::InitProducerIdResponse::decode(out.data(), n);
+        if (!r) return {};
+        return {r->errorCode, r->producerId, r->producerEpoch};
+    }
+    /// #358 class: the last answer sent after its record committed (tcs->doWork releases parked answers).
+    static constexpr int16_t kParkedAnswer = -2;
+    std::vector<std::vector<uint8_t>> answers;
+    static void captureAnswer_(void* ctx, int64_t, const uint8_t* f, std::size_t n) {
+        static_cast<CoordRig*>(ctx)->answers.emplace_back(f, f + n);
+    }
+    Init releasedInit(int64_t now) {
+        answers.clear();
+        (void)tcs->doWork(now);
+        if (answers.empty()) return Init{kParkedAnswer, -1, -1};
+        auto r = pc::InitProducerIdResponse::decode(answers.back().data(), answers.back().size());
         if (!r) return {};
         return {r->errorCode, r->producerId, r->producerEpoch};
     }
@@ -1897,7 +1913,10 @@ TEST(TxnCoordinatorLoadRegression, NewTxnStateLeaderLoadsAtOnceWhenHwEqualsLeo) 
     EXPECT_NE(R.initPid("t").err, kNotCoordinator) << "a new txn-state leader did not load";
     R.fetchFrom2(R.log->logEndOffset(), 3);                 // the pid-block ceiling commits
     R.fetchFrom(3, R.log->logEndOffset(), 3);
-    EXPECT_EQ(R.initPid("t").err, 0);
+    EXPECT_EQ(R.initPid("t").err, CoordRig::kParkedAnswer) << "#358 class: the epoch is answered once it commits";
+    R.fetchFrom2(R.log->logEndOffset(), 4);
+    R.fetchFrom(3, R.log->logEndOffset(), 4);
+    EXPECT_EQ(R.releasedInit(4).err, 0);
 }
 
 TEST(TxnCoordinatorLoadRegression, NotCoordinatorUntilHwEqualsLeo) {
@@ -2107,8 +2126,11 @@ TEST(TxnPidBlockRegression, AllocationWaitsForCommittedCeiling) {
     EXPECT_EQ(R.log->logEndOffset(), 1) << "only the ceiling record is written";
     EXPECT_EQ(R.initPid("").err, kConcurrent) << "idempotent InitProducerId waits too";
     R.fetchFrom2(R.log->logEndOffset(), 2);
-    const auto ok = R.initPid("t");
-    EXPECT_EQ(ok.err, 0) << "allocates once the ceiling is committed";
+    EXPECT_EQ(R.initPid("t").err, CoordRig::kParkedAnswer) << "allocates once the ceiling is committed; "
+                                                              "#358 class: answered once the epoch commits";
+    R.fetchFrom2(R.log->logEndOffset(), 3);
+    const auto ok = R.releasedInit(3);
+    EXPECT_EQ(ok.err, 0);
     EXPECT_GE(ok.pid, 0);
 }
 

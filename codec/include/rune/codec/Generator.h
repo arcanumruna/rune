@@ -14,7 +14,8 @@ namespace rune::codec {
 ///   - Typed members for each field (fixed members first, then var members
 ///     as std::string_view).
 ///   - encode(uint8_t* buf) -> size_t  : writes the record framing + data.
-///   - decode(std::span<const uint8_t>) : reads fields from a record buffer.
+///   - decode(std::span<const uint8_t>[, const Lineage&]) -> bool : reads fields from a record of any known
+///     version, through that version's row of the lineage (#418).
 ///   - encodedSize() const -> size_t   : returns the total byte count.
 ///   - static constexpr uint64_t kFingerprint  (= fingerprint(descriptor)).
 ///   - static constexpr uint16_t kBlockLength.
@@ -38,6 +39,16 @@ namespace rune::codec {
 /// @param d       The descriptor to generate code for.
 /// @param nspace  The C++ namespace to emit the struct in (default "rune::gen").
 [[nodiscard]] std::string generateHeader(const Descriptor& d,
+                                         std::string_view nspace = "rune::gen");
+
+/// #418: the type of schema `version` of the topic whose EVOLVING descriptor (every field ever declared, with its
+/// lifetime: what `rune schema generate` fetches) is `evolving`.  The generated decode() / Decoder place every
+/// field by the record's own version: kLineage holds each field's place in versions 1..version, and a run-time
+/// Lineage (T::lineage(evolving)) places records of later versions.  The one-argument form is
+/// generateHeader(d, d.version): `d` is taken as the lineage, so a descriptor that hides a DROP (a materialized
+/// one) places the versions before that DROP wrongly — give it the evolving descriptor.
+/// @throws std::invalid_argument when `version` is 0 or after evolving.version.
+[[nodiscard]] std::string generateHeader(const Descriptor& evolving, uint16_t version,
                                          std::string_view nspace = "rune::gen");
 
 } // namespace rune::codec

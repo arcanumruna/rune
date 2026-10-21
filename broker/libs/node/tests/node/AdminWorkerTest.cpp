@@ -17,7 +17,9 @@
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/Descriptor.h>
+#include <rune/codec/Evolve.h>
 #include <rune/codec/Serialize.h>
+#include <rune/protocol/client/SchemaMessages.h>
 
 #include <gtest/gtest.h>
 
@@ -551,4 +553,32 @@ TEST(AdminWorkerRegression, DdlQueueIsBoundedAndOverflowIsAnsweredInternalRegres
     rig.admin().submit(DdlRequest{std::move(a)});
     ASSERT_TRUE(rig.answerFor(1000).has_value());
     EXPECT_EQ(rig.answerFor(1000)->code, 6);
+}
+
+// #418: GetTopicSchema with kSchemaLineageFingerprint answers the topic's EVOLVING descriptor (every field ever
+// declared, the retired ones with their lifetimes) at the latest version, so a typed reader can place a record of
+// any version; a plain request still answers the materialized latest version.
+TEST(AdminWorkerRegression, GetSchemaLineageAnswersTheEvolvingDescriptorRegression) {
+    CatalogDdlRig rig("aw_lineage", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(define(rig, "characters", 4, false, charsBlob()).code, 0);
+    ASSERT_EQ(rig.alter("characters", {dropOp("userId")}).code, 0);                // v2: a mid-block DROP
+    ASSERT_EQ(rig.alter("characters", {addOp("level", PrimType::Int32)}).code, 0);  // v3
+    const auto lin = rig.getSchema("characters", rune::protocol::client::kSchemaLineageFingerprint);
+    ASSERT_EQ(lin.code, 0);
+    EXPECT_EQ(lin.version, 3u);
+    EXPECT_EQ(lin.partitionCount, 4);
+    const auto ev = rune::codec::deserialize(lin.blob);
+    ASSERT_NE(ev.find("userId"), nullptr) << "the retired field stays in the lineage";
+    EXPECT_EQ(ev.find("userId")->untilVersion, 2u);
+    ASSERT_NE(ev.find("level"), nullptr);
+    EXPECT_EQ(ev.find("level")->sinceVersion, 3u);
+    // The rows a v1 reader needs: userId at 8 in v1, absent from v2 on; level absent before v3.
+    EXPECT_EQ(rune::codec::materializeAsOf(ev, 1).find("userId")->offset, 8u);
+    EXPECT_EQ(rune::codec::materializeAsOf(ev, 2).find("userId"), nullptr);
+
+    const auto latest = rig.getSchema("characters");
+    ASSERT_EQ(latest.code, 0);
+    EXPECT_EQ(rune::codec::deserialize(latest.blob).find("userId"), nullptr) << "the plain answer is the materialized v3";
+    EXPECT_EQ(rig.getSchema("nope", rune::protocol::client::kSchemaLineageFingerprint).code, 7) << "UnknownTopic";
 }

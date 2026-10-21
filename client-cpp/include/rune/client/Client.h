@@ -1058,6 +1058,24 @@ public:
                              r.version);
     }
 
+    /// #418: the run-time lineage of the generated type T for topic `name` (T::Lineage), built from the topic's
+    /// evolving descriptor (GetTopicSchema with kSchemaLineageFingerprint).  A T decodes records of versions
+    /// 1..T::kVersion on its own; a record written at a LATER version (the topic evolved after T was generated)
+    /// needs this:  `auto lin = client.lineageAndWait<T>("chars");  rec.decode(bytes, lin);`  (or T::Decoder(bytes,
+    /// lin)).  Cold: once per topic, then reuse it (re-fetch after the topic evolves again: a record of a version
+    /// the lineage does not know decodes false).  Throws std::runtime_error when the broker answers an error, and
+    /// std::invalid_argument when the topic's schema is not T's.
+    template <class T>
+    [[nodiscard]] typename T::Lineage lineageAndWait(std::string_view name,
+                                                     std::chrono::nanoseconds timeout = kDefaultWaitTimeout) {
+        TopicSchemaResult r = getTopicSchemaAndWait(name, rune::protocol::client::kSchemaLineageFingerprint, timeout);
+        if (r.errorCode != 0) {
+            throw std::runtime_error("lineage: the broker did not serve the schema lineage of '" + std::string(name) +
+                                     "' (error " + std::to_string(r.errorCode) + ")");
+        }
+        return T::lineage(rune::codec::deserialize(std::span<const uint8_t>(r.descriptorBlob)));
+    }
+
     /// Phase 2b F (FD7): the same version-binding open, but the typed topic BORROWS `shared` instead of owning
     /// a producer of its own - its sends and claims go through that producer, inside its transaction when one
     /// is open.  `shared` must outlive the returned topic.

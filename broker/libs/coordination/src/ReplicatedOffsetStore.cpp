@@ -124,19 +124,19 @@ void ReplicatedOffsetStore::encodeVal(Offset offset, int64_t tsNs, std::string_v
 // commit
 // ---------------------------------------------------------------------------
 
-bool ReplicatedOffsetStore::commit(const GroupId&        group,
-                                    const TopicPartition& tp,
-                                    Offset                offset,
-                                    std::string_view      metadata,
-                                    int64_t               tsNs,
-                                    uint64_t              lineage)
+rune::replication::Offset ReplicatedOffsetStore::commitAt(const GroupId&        group,
+                                                          const TopicPartition& tp,
+                                                          Offset                offset,
+                                                          std::string_view      metadata,
+                                                          int64_t               tsNs,
+                                                          uint64_t              lineage)
 {
     // Guard: group name, topic name, and metadata must each fit in uint16_t.
     // A size() >= 64 KiB would silently truncate the encoded length to a wrong
     // value and mis-frame every record after this one in rebuildFromLog().
-    if (group.size()      > UINT16_MAX) return false;
-    if (tp.topic.size()   > UINT16_MAX) return false;
-    if (metadata.size()   > UINT16_MAX) return false;
+    if (group.size()      > UINT16_MAX) return -1;
+    if (tp.topic.size()   > UINT16_MAX) return -1;
+    if (metadata.size()   > UINT16_MAX) return -1;
 
     // 1. Encode key + value into reusable scratch buffers.
     encodeKey(group, tp);
@@ -177,7 +177,7 @@ bool ReplicatedOffsetStore::commit(const GroupId&        group,
 
     if (base < 0) {
         // minIsr-gated: the append was rejected.  Do NOT update in-memory map.
-        return false;
+        return -1;
     }
 
     // 4. Update the in-memory map only on success.
@@ -187,7 +187,7 @@ bool ReplicatedOffsetStore::commit(const GroupId&        group,
     co.commitTimestampNs = tsNs;
     co.lineage           = lineage;
     index_[group][tp]    = std::move(co);
-    return true;
+    return base;
 }
 
 // ---------------------------------------------------------------------------

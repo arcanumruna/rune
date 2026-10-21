@@ -83,7 +83,20 @@ public:
                 Offset                offset,
                 std::string_view      metadata,
                 int64_t               tsNs,
-                uint64_t              lineage = 0);
+                uint64_t              lineage = 0) {
+        return commitAt(group, tp, offset, metadata, tsNs, lineage) >= 0;
+    }
+
+    /// #358: commit(), returning the appended record's log offset (-1: refused).  The commit is durable once the
+    /// replica's high watermark has passed it (replica()->highWatermark() > the returned offset) - an acks-all
+    /// append replicates asynchronously, so a caller that must not act before the offset survives a failover (a
+    /// transaction's CompleteCommit) waits for that.
+    rune::replication::Offset commitAt(const GroupId&        group,
+                                       const TopicPartition& tp,
+                                       Offset                offset,
+                                       std::string_view      metadata,
+                                       int64_t               tsNs,
+                                       uint64_t              lineage = 0);
 
     // -----------------------------------------------------------------------
     // Read path (cold — O(1) or O(n) over the group's partitions).

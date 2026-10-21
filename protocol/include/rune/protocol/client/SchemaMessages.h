@@ -300,6 +300,14 @@ struct DefineTopicResponse {
 
 // GetTopicSchema (66): body = requestedFingerprint:u64 (0 = latest), then
 //   topicName(varstr).
+//
+// #418: requestedFingerprint = kSchemaLineageFingerprint asks for the topic's LINEAGE instead of one version: the
+// response's descriptorBlob is the EVOLVING descriptor (every field ever declared, with its lifetime) and its
+// version is the latest.  Typed readers place records of every version with it (T::lineage), and
+// `rune schema generate` builds a type from it.  (A broker before #418 looks it up as a fingerprint and answers
+// UnknownTopic.)
+inline constexpr uint64_t kSchemaLineageFingerprint = ~uint64_t{0};
+
 struct GetTopicSchema {
     int64_t sessionId = 0, correlationId = 0;
     std::string_view topicName;

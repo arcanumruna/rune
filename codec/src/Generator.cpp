@@ -1,5 +1,7 @@
 // src/Generator.cpp
 #include <rune/codec/Generator.h>
+#include <rune/codec/Evolve.h>
+#include <rune/codec/Lineage.h>
 #include <rune/codec/Serialize.h>
 #include <sstream>
 #include <cctype>
@@ -219,41 +221,48 @@ static void emitClaimEncoder(std::ostringstream& o, const Descriptor& d, const s
 static void emitDecoder(std::ostringstream& o, const Descriptor& d, const std::string& structName) {
     const std::string cls = structName + "Decoder";
     const FieldDescriptor* k = singleKeyField(d);
-    o << "// " << cls << " — zero-copy reader over one record of any version: a field\n"
-      << "// outside the record's own block (an older, shorter version) or past its end\n"
-      << "// reads as 0 / empty; a longer block (a newer version) is fine (fixed offsets).\n";
+    o << "// " << cls << " — zero-copy reader over one record of any version it knows (#418): a record of\n"
+      << "// " << structName << "::kVersion reads at the constant offsets; any other version reads through its row of\n"
+      << "// the lineage (" << structName << "::kLineage, or the run-time Lineage for a newer version).  A field the\n"
+      << "// record's version does not carry, a version nobody knows (known() == false) or bytes past the record\n"
+      << "// read as 0 / empty — never another field's bytes.\n";
     o << "class " << cls << " {\n";
     o << "public:\n";
     o << "    static constexpr uint32_t kBlockLength = " << d.blockLength << "u;\n";
     o << "    static constexpr bool     kHasKey      = " << (k != nullptr ? "true" : "false") << ";\n";
     if (k != nullptr) o << "    using KeyType = " << memberType(*k) << ";\n";
     o << "\n";
-    o << "    explicit " << cls << "(std::span<const uint8_t> rec) noexcept\n"
-      << "        : p_(rec.data()), size_(rec.size()),\n"
-      << "          bl_(rec.size() >= 2 ? ::rune::codec::fly::load<uint16_t>(rec.data()) : 0u) {}\n\n";
-    for (const auto& f : d.fields) {
+    o << "    explicit " << cls << "(std::span<const uint8_t> rec) noexcept : " << cls << "(rec, nullptr) {}\n";
+    o << "    /// A record of a version after kVersion needs the topic's lineage (Client::lineageAndWait).\n";
+    o << "    " << cls << "(std::span<const uint8_t> rec, const " << structName << "::Lineage& lineage) noexcept\n"
+      << "        : " << cls << "(rec, &lineage) {}\n\n";
+    o << "    /// False: the record's version is unknown to this reader (every field reads as 0 / empty).\n";
+    o << "    [[nodiscard]] bool known() const noexcept { return ver_ == " << structName << "::kVersion || row_ != nullptr; }\n";
+    o << "    [[nodiscard]] uint16_t version() const noexcept { return ver_; }\n\n";
+    for (std::size_t i = 0; i < d.fields.size(); ++i) {
+        const auto& f = d.fields[i];
         const uint32_t w = fieldWidth(f);
-        if (f.type == PrimType::FixedStr) {
-            o << "    [[nodiscard]] std::string_view " << f.name << "() const noexcept {\n"
-              << "        return has_(" << f.offset << "u, " << w << "u)\n"
-              << "            ? ::rune::codec::fly::loadFixedStr(p_ + 4u + " << f.offset << "u, " << w << "u)\n"
-              << "            : std::string_view{};\n"
-              << "    }\n";
-        } else {
-            o << "    [[nodiscard]] " << cppType(f.type) << " " << f.name << "() const noexcept {\n"
-              << "        return has_(" << f.offset << "u, " << w << "u)\n"
-              << "            ? ::rune::codec::fly::load<" << flyType(f.type) << ">(p_ + 4u + " << f.offset << "u)\n"
-              << "            : " << cppType(f.type) << "{};\n"
-              << "    }\n";
-        }
+        const bool str = f.type == PrimType::FixedStr;
+        const std::string ret = str ? std::string("std::string_view") : std::string(cppType(f.type));
+        const auto load = [&](const std::string& off) {
+            return str ? "::rune::codec::fly::loadFixedStr(p_ + 4u + " + off + ", " + std::to_string(w) + "u)"
+                       : "::rune::codec::fly::load<" + std::string(flyType(f.type)) + ">(p_ + 4u + " + off + ")";
+        };
+        const std::string none = str ? std::string("std::string_view{}") : ret + "{}";
+        o << "    [[nodiscard]] " << ret << " " << f.name << "() const noexcept {\n"
+          << "        if (ver_ == " << structName << "::kVersion) [[likely]]\n"
+          << "            return has_(" << f.offset << "u, " << w << "u) ? " << load(std::to_string(f.offset) + "u")
+          << " : " << none << ";\n"
+          << "        return at_(" << i << "u, " << w << "u) ? " << load("row_[" + std::to_string(i) + "]") << " : "
+          << none << ";\n"
+          << "    }\n";
     }
     if (k != nullptr && k->name != "key") {
         if (k->type == PrimType::FixedStr) {
             o << "    [[nodiscard]] KeyType key() const noexcept {\n"
               << "        KeyType v{};\n"
-              << "        if (has_(" << k->offset << "u, " << k->fixedLen << "u)) {\n"
-              << "            std::memcpy(v.data(), p_ + 4u + " << k->offset << "u, " << k->fixedLen << "u);\n"
-              << "        }\n"
+              << "        const std::string_view s = " << k->name << "();\n"
+              << "        if (s.size() == " << k->fixedLen << "u) std::memcpy(v.data(), s.data(), " << k->fixedLen << "u);\n"
               << "        return v;\n"
               << "    }\n";
         } else {
@@ -261,18 +270,189 @@ static void emitDecoder(std::ostringstream& o, const Descriptor& d, const std::s
         }
     }
     o << "\nprivate:\n";
+    o << "    " << cls << "(std::span<const uint8_t> rec, const " << structName << "::Lineage* lineage) noexcept\n"
+      << "        : p_(rec.data()), size_(rec.size()),\n"
+      << "          bl_(rec.size() >= 4 ? ::rune::codec::fly::load<uint16_t>(rec.data()) : 0u),\n"
+      << "          ver_(rec.size() >= 4 ? ::rune::codec::fly::load<uint16_t>(rec.data() + 2) : uint16_t{0}),\n"
+      << "          row_(rec.size() >= 4 && ver_ != " << structName << "::kVersion ? " << structName
+      << "::layoutFor(ver_, lineage) : nullptr) {}   // kVersion reads at the constant offsets\n";
     o << "    [[nodiscard]] bool has_(uint32_t off, uint32_t w) const noexcept {\n";
     o << "        return off + w <= bl_ && 4u + off + w <= size_;\n";
     o << "    }\n";
-    o << "    const uint8_t* p_;\n";
-    o << "    std::size_t    size_;\n";
-    o << "    uint32_t       bl_;\n";
+    o << "    [[nodiscard]] bool at_(uint32_t i, uint32_t w) const noexcept {\n";
+    o << "        return row_ != nullptr && row_[i] != ::rune::codec::kAbsentField && has_(row_[i], w);\n";
+    o << "    }\n";
+    o << "    const uint8_t*  p_;\n";
+    o << "    std::size_t     size_;\n";
+    o << "    uint32_t        bl_;\n";
+    o << "    uint16_t        ver_;\n";
+    o << "    const uint32_t* row_;   // the row of any other version (nullptr: unknown)\n";
     o << "};\n\n";
+}
+
+// ─── #418: the lineage table and the version-dispatching decode() ────────────
+
+/// kFieldTags / kLineage (rows for versions 1..kVersion) / lineage() / layoutFor().
+static void emitLineage(std::ostringstream& o, const Descriptor& evolving, const Descriptor& d,
+                        const std::string& structName) {
+    std::vector<uint16_t> tags;
+    tags.reserve(d.fields.size());
+    for (const auto& f : d.fields) tags.push_back(f.id);
+    const std::size_t n = tags.size();
+    o << "    static constexpr std::size_t  kFieldCount = " << n << "u;\n";
+    o << "    /// The fields' durable tags, in member order.\n";
+    o << "    static constexpr uint16_t     kFieldTags[kFieldCount] = {";
+    for (std::size_t i = 0; i < n; ++i) o << (i ? ", " : "") << tags[i] << "u";
+    o << "};\n";
+    o << "    /// The fields' types (rune::codec::PrimType), in member order.\n";
+    o << "    static constexpr uint8_t      kFieldTypes[kFieldCount] = {";
+    for (std::size_t i = 0; i < n; ++i) o << (i ? ", " : "") << static_cast<unsigned>(d.fields[i].type) << "u";
+    o << "};\n";
+    o << "    /// #418: row v-1 = where each field sits in a record of version v (fixed: byte offset in the block;\n"
+      << "    /// string / bytes: var index; ::rune::codec::kAbsentField: not part of version v).\n";
+    o << "    static constexpr uint32_t     kLineage[kVersion][kFieldCount] = {\n";
+    std::vector<uint32_t> row(n);
+    for (uint32_t v = 1; v <= d.version; ++v) {
+        lineageRow(evolving, static_cast<uint16_t>(v), tags, row.data());
+        o << "        {";
+        for (std::size_t i = 0; i < n; ++i) {
+            o << (i ? ", " : "");
+            if (row[i] == kAbsentField) o << "::rune::codec::kAbsentField";
+            else o << row[i] << "u";
+        }
+        o << "},  // v" << v << "\n";
+    }
+    o << "    };\n";
+    o << "    using Lineage = ::rune::codec::FieldLineage;\n";
+    o << "    /// COLD: the run-time lineage that also places records of versions after kVersion, from the topic's\n"
+      << "    /// evolving descriptor (Client::lineageAndWait<" << structName << ">).  Throws std::invalid_argument when\n"
+      << "    /// `evolving` is not this type's schema (FieldLineage::forReader).\n";
+    o << "    [[nodiscard]] static Lineage lineage(const ::rune::codec::Descriptor& evolving) {\n"
+      << "        return Lineage::forReader(evolving, kSchemaName, kVersion, std::span<const uint16_t>(kFieldTags, kFieldCount),\n"
+      << "                                  std::span<const uint8_t>(kFieldTypes, kFieldCount), kLineage[kVersion - 1u]);\n"
+      << "    }\n";
+    o << "    /// The row for a record of version `ver` (nullptr: unknown — newer than kVersion and not in `lineage`).\n";
+    o << "    [[nodiscard]] static const uint32_t* layoutFor(uint16_t ver, const Lineage* lineage) noexcept {\n"
+      << "        if (lineage != nullptr) {\n"
+      << "            if (const uint32_t* r = lineage->row(ver)) return r;\n"
+      << "        }\n"
+      << "        return (ver >= 1u && ver <= kVersion) ? kLineage[ver - 1u] : nullptr;\n"
+      << "    }\n";
+}
+
+/// The steady state of decode_(): a whole record of kVersion reads every field at its constant offset (one
+/// predicted branch, no table, no reset: every member is assigned).
+static void emitDecodeFastPath(std::ostringstream& o, const Descriptor& d) {
+    o << "        if (::rune::codec::fly::load<uint16_t>(r + 2) == kVersion && bl >= kBlockLength) [[likely]] {\n";
+    std::vector<const FieldDescriptor*> vars;
+    for (const auto& f : d.fields) {
+        if (isVarLen(f.type)) { vars.push_back(&f); continue; }
+        if (f.type == PrimType::FixedStr) {
+            o << "            std::memcpy(" << f.name << ".data(), r + 4u + " << f.offset << "u, " << f.fixedLen << "u);\n";
+        } else {
+            o << "            " << f.name << " = ::rune::codec::fly::load<" << flyType(f.type) << ">(r + 4u + " << f.offset
+              << "u);\n";
+        }
+    }
+    if (!vars.empty()) {
+        std::sort(vars.begin(), vars.end(), [](const FieldDescriptor* a, const FieldDescriptor* b) { return a->offset < b->offset; });
+        // At kVersion the var fields are exactly the members, in var-index order: one sequential walk.
+        // F1 (PR #434 review): a hostile block length past the record's end starts the walk AT the end (every var
+        // field empty) - `n - pos` never wraps.
+        o << "            std::size_t pos = 4u + bl <= n ? 4u + bl : n;\n";
+        for (const FieldDescriptor* f : vars) {
+            o << "            if (n - pos >= 4u && ::rune::codec::fly::load<uint32_t>(r + pos) <= n - pos - 4u) {\n"
+              << "                const uint32_t len = ::rune::codec::fly::load<uint32_t>(r + pos);\n"
+              << "                " << f->name << " = std::string_view(reinterpret_cast<const char*>(r + pos + 4u), len);\n"
+              << "                pos += 4u + len;\n"
+              << "            } else {\n"
+              << "                " << f->name << " = {};\n"
+              << "                pos = n;   // truncated: every later var field reads empty\n"
+              << "            }\n";
+        }
+    }
+    o << "            return true;\n";
+    o << "        }\n";
+}
+
+/// decode(record) / decode(record, lineage): every member is reset, then read through the row of the record's
+/// own version.  False (every member at its default): shorter than a header, or a version this reader does not know.
+static void emitDecode(std::ostringstream& o, const Descriptor& d, const std::string& structName) {
+    o << "    // #418: decode() places every field by the record's OWN version (its row of the lineage), so a record\n";
+    o << "    // written before or after a DROP / ADD / RENAME reads each field right or absent (default), never\n";
+    o << "    // shifted.  Returns false — every member at its default — for a record shorter than its header or of a\n";
+    o << "    // version this type does not know (after kVersion: pass the topic's Lineage).  The Validator is still\n";
+    o << "    // the gate for untrusted input; every access is bounds-checked, so a hostile record can never read\n";
+    o << "    // out of bounds.\n";
+    o << "    [[nodiscard]] bool decode(std::span<const uint8_t> record) noexcept {\n"
+      << "        return decodeOwn_(record) || decodeAny_(record, nullptr);\n"
+      << "    }\n";
+    o << "    [[nodiscard]] bool decode(std::span<const uint8_t> record, const Lineage& lineage) noexcept {\n"
+      << "        return decodeOwn_(record) || decodeAny_(record, &lineage);\n"
+      << "    }\n\n";
+    o << "    /// The steady state, inlined: a whole record of kVersion at the constant offsets (false: anything else).\n";
+    o << "    [[nodiscard]] bool decodeOwn_(std::span<const uint8_t> record) noexcept {\n";
+    o << "        if (record.size() < 4u + kBlockLength) return false;\n";
+    o << "        const uint8_t* const r = record.data();\n";
+    o << "        const std::size_t n = record.size();\n";
+    o << "        const uint32_t bl = ::rune::codec::fly::load<uint16_t>(r);\n";
+    o << "        (void)n;\n";
+    emitDecodeFastPath(o, d);
+    o << "        return false;\n";
+    o << "    }\n";
+    o << "    /// Any other record: every member reset, then each field through the row of the record's version.\n";
+    o << "    [[gnu::noinline]] [[nodiscard]] bool decodeAny_(std::span<const uint8_t> record, const Lineage* lineage) noexcept {\n";
+    o << "        *this = " << structName << "{};\n";
+    o << "        if (record.size() < 4) return false;\n";
+    o << "        const uint8_t* const r = record.data();\n";
+    o << "        const std::size_t n = record.size();\n";
+    o << "        const uint32_t bl = ::rune::codec::fly::load<uint16_t>(r);\n";
+    o << "        const uint16_t ver = ::rune::codec::fly::load<uint16_t>(r + 2);\n";
+    o << "        const uint32_t* const row = layoutFor(ver, lineage);\n";
+    o << "        if (row == nullptr) return false;\n";
+    o << "        (void)bl; (void)n;\n";
+    bool anyVar = false;
+    for (std::size_t i = 0; i < d.fields.size(); ++i) {
+        const auto& f = d.fields[i];
+        if (isVarLen(f.type)) { anyVar = true; continue; }
+        const uint32_t w = fieldWidth(f);
+        o << "        if (row[" << i << "] != ::rune::codec::kAbsentField && row[" << i << "] + " << w << "u <= bl && 4u + row["
+          << i << "] + " << w << "u <= n) ";
+        if (f.type == PrimType::FixedStr) {
+            o << "std::memcpy(" << f.name << ".data(), r + 4u + row[" << i << "], " << w << "u);\n";
+        } else {
+            o << f.name << " = ::rune::codec::fly::load<" << flyType(f.type) << ">(r + 4u + row[" << i << "]);\n";
+        }
+    }
+    if (anyVar) {
+        o << "        std::size_t pos = 4u + bl <= n ? 4u + bl : n;   // never past the end (F1)\n";
+        o << "        uint32_t    at  = 0;\n";
+        for (std::size_t i = 0; i < d.fields.size(); ++i) {
+            const auto& f = d.fields[i];
+            if (!isVarLen(f.type)) continue;
+            o << "        if (row[" << i << "] != ::rune::codec::kAbsentField) (void)::rune::codec::fly::readVar(r, n, pos, at, row["
+              << i << "], " << f.name << ");\n";
+        }
+    }
+    o << "        return true;\n";
+    o << "    }\n\n";
 }
 
 // ─── generateHeader ───────────────────────────────────────────────────────────
 
 std::string generateHeader(const Descriptor& d, std::string_view nspace) {
+    return generateHeader(d, d.version, nspace);
+}
+
+std::string generateHeader(const Descriptor& evolving, uint16_t version, std::string_view nspace) {
+    if (version == 0 || version > evolving.version) {
+        throw std::invalid_argument("generateHeader: schema '" + evolving.name + "' has no version " +
+                                    std::to_string(version) + " (its lineage ends at " +
+                                    std::to_string(evolving.version) + ")");
+    }
+    // #418: the type is the schema AS OF `version`; the lineage (every field ever declared, with its lifetime) gives
+    // each of its fields' place in a record of every version 1..version.
+    const Descriptor d = materializeAsOf(evolving, version);
     // Compute derived values
     const uint64_t fp   = fingerprint(d);
     const std::string structName = toPascalCase(d.name);
@@ -313,6 +493,7 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
     o << "#include <rune/codec/Descriptor.h>\n";
     o << "#include <rune/codec/Fingerprint.h>\n";
     o << "#include <rune/codec/Flyweight.h>\n";
+    o << "#include <rune/codec/Lineage.h>\n";
     o << "#include <rune/codec/Serialize.h>\n";
     o << "\n";
 
@@ -338,6 +519,7 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
     o << "    static constexpr uint16_t     kVersion     = " << d.version << "u;\n";
     o << "    static constexpr uint64_t     kFingerprint = " << fp << "ull;\n";
     o << "    static constexpr std::string_view kSchemaName = \"" << d.name << "\";\n";
+    emitLineage(o, evolving, d, structName);
     if (fly) {
         o << "    using Encoder = " << structName << "Encoder;  // zero-copy writer (all-fixed schema)\n";
         o << "    using Decoder = " << structName << "Decoder;  // zero-copy reader\n";
@@ -501,99 +683,8 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
     o << "        return static_cast<size_t>(p - buf);\n";
     o << "    }\n\n";
 
-    // ── decode() ─────────────────────────────────────────────────────────────
-    o << "    // PRECONDITION: `record` is assumed to be a pre-validated, well-formed\n";
-    o << "    // record. decode() trusts the record's declared blockLength to locate the\n";
-    o << "    // var-data section and does NOT reject a blockLength that disagrees with\n";
-    o << "    // the descriptor — it is the zero-copy hot path and stays branch-lean.\n";
-    o << "    // For untrusted input, call rune::codec::Validator::validate first; the\n";
-    o << "    // Validator is the gate. All accesses here are still bounds-checked, so a\n";
-    o << "    // hostile record can never read out of bounds.\n";
-    o << "    void decode(std::span<const uint8_t> record) noexcept {\n";
-    o << "        if (record.size() < 4) return;\n";
-    o << "        const uint8_t* p = record.data();\n";
-    o << "        auto rd16 = [&]() -> uint16_t { uint16_t v = uint16_t(p[0])|(uint16_t(p[1])<<8); p+=2; return v; };\n";
-    o << "        auto rd32 = [&]() -> uint32_t { uint32_t v = uint32_t(p[0])|(uint32_t(p[1])<<8)|(uint32_t(p[2])<<16)|(uint32_t(p[3])<<24); p+=4; return v; };\n";
-    o << "        auto rd64 = [&]() -> uint64_t { uint64_t v=0; for(int i=0;i<8;i++) v|=uint64_t(p[i])<<(8*i); p+=8; return v; };\n";
-    o << "        uint16_t bl  = rd16();\n";
-    o << "        uint16_t ver = rd16();\n";
-    o << "        (void)ver;\n";
-    o << "        const uint8_t* fixedStart = p;\n";
-
-    // Fixed fields
-    {
-        std::vector<const FieldDescriptor*> fixedFields;
-        for (const auto& f : d.fields) {
-            if (!isVarLen(f.type)) {
-                fixedFields.push_back(&f);
-            }
-        }
-        std::sort(fixedFields.begin(), fixedFields.end(),
-                  [](const FieldDescriptor* a, const FieldDescriptor* b) {
-                      return a->offset < b->offset;
-                  });
-        for (const FieldDescriptor* f : fixedFields) {
-            const uint32_t w = fieldWidth(*f);
-            o << "        if (size_t(p - record.data()) + " << w << "u <= record.size()) {\n";
-            o << "            p = fixedStart + " << f->offset << "u;\n";
-            switch (f->type) {
-                case PrimType::Int32:
-                case PrimType::Enum:
-                    o << "            " << f->name << " = static_cast<int32_t>(rd32());\n";
-                    break;
-                case PrimType::Int64:
-                    o << "            " << f->name << " = static_cast<int64_t>(rd64());\n";
-                    break;
-                case PrimType::UInt16:
-                    o << "            " << f->name << " = rd16();\n";
-                    break;
-                case PrimType::UInt32:
-                    o << "            " << f->name << " = rd32();\n";
-                    break;
-                case PrimType::UInt64:
-                    o << "            " << f->name << " = rd64();\n";
-                    break;
-                case PrimType::Float64:
-                    o << "            { uint64_t _tmp = rd64(); std::memcpy(&" << f->name << ", &_tmp, 8); }\n";
-                    break;
-                case PrimType::Bool:
-                    o << "            " << f->name << " = (*p++ != 0);\n";
-                    break;
-                case PrimType::FixedStr:
-                    o << "            std::memcpy(" << f->name << ".data(), p, " << f->fixedLen << "u); p += " << f->fixedLen << "u;\n";
-                    break;
-                default:
-                    break;
-            }
-            o << "        }\n";
-        }
-    }
-
-    o << "        // Var-len fields\n";
-    o << "        const uint8_t* varStart = record.data() + 4 + bl;\n";
-    o << "        p = varStart;\n";
-    {
-        std::vector<const FieldDescriptor*> varFields;
-        for (const auto& f : d.fields) {
-            if (isVarLen(f.type)) {
-                varFields.push_back(&f);
-            }
-        }
-        std::sort(varFields.begin(), varFields.end(),
-                  [](const FieldDescriptor* a, const FieldDescriptor* b) {
-                      return a->offset < b->offset;
-                  });
-        for (const FieldDescriptor* f : varFields) {
-            o << "        if (p + 4 <= record.data() + record.size()) {\n";
-            o << "            uint32_t len = uint32_t(p[0])|(uint32_t(p[1])<<8)|(uint32_t(p[2])<<16)|(uint32_t(p[3])<<24); p+=4;\n";
-            o << "            if (p + len <= record.data() + record.size()) {\n";
-            o << "                " << f->name << " = std::string_view(reinterpret_cast<const char*>(p), len); p += len;\n";
-            o << "            }\n";
-            o << "        }\n";
-        }
-    }
-
-    o << "    }\n\n";
+    // ── decode() — #418: through the row of the record's OWN version ─────────
+    emitDecode(o, d, structName);
 
     // ── descriptor() ────────────────────────────────────────────────────────
     // Embed the serialized blob as a constexpr uint8_t array

@@ -34,6 +34,10 @@ namespace rune::consensus {
 /// Must be a power of two; ring total = capacity + TRAILER_LENGTH.
 inline constexpr int kDefaultIngressCapacity = 64 * 1024; // 64 KiB payload
 
+/// The largest consensus frame on the wire: the default ingress ring's maximum message (agrona: capacity / 8).
+/// A sender never sends more; a receiver drops (never throws on) anything larger (#254).
+inline constexpr std::size_t kMaxConsensusFrameBytes = static_cast<std::size_t>(kDefaultIngressCapacity) / 8;
+
 /// Message type id for consensus SBE frames in the ring.
 inline constexpr int32_t kConsensusMsgTypeId = 1;
 

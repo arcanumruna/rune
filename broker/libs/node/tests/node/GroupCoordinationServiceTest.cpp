@@ -1984,3 +1984,292 @@ TEST_F(MemberBindingTest, LeaveGroupTruncatedAtEveryOffsetAdversarialRegression)
     }
     EXPECT_EQ(heartbeat(1, "g-trunc", m.id, m.generation), kOk);
 }
+
+// ===========================================================================
+// #358: a COMMITTED transaction's offset is Applied only once the __consumer_offsets record is committed (the
+// offsets replica's high watermark passed it).  Until then Replicating - the transaction coordinator keeps the
+// transaction PrepareCommit and asks again - and asking again waits on the same record (never re-appends) unless
+// the offsets replica's leadership changed under it (the record may be gone): then it is appended again.
+// ===========================================================================
+TEST(TxnOffsetApplyRegression, ATransactionalOffsetIsAppliedOnlyOnceTheOffsetsRecordIsCommittedRegression) {
+    using rune::coordination::TxnOffsetApply;
+    TempDir dir("txnoff_hw"), topicDir("txnoff_hw_topics");
+    rune::storage::Log log(dir.path);
+    NullTransport transport;
+    // Leader 1 with follower 2 in the ISR: an acks-all append commits only once 2 has fetched it.
+    PartitionReplica rep(makeSingleNodeConfig(1, /*minIsr=*/1), Role::Leader, /*epoch=*/1,
+                         std::vector<NodeId>{1, 2}, std::vector<NodeId>{1, 2}, &log, &transport);
+    ReplicatedOffsetStore store(&rep);
+    rune::gateway::TopicRegistry registry(std::vector<TopicSpec>{makeTopicSpec(std::string(kTestTopic), 2, kTestTopicId)},
+                                          topicDir.path);
+    GroupCoordinationService svc(&store, &registry, [] { return true; }, [] { return NodeId{1}; });
+    int64_t clock = 0;
+    svc.doWork(clock);   // loads the (empty) offsets
+
+    const auto followerFetches = [&](int64_t upTo) {
+        FetchRequestMsg req{};
+        req.leaderEpoch = rep.epoch(); req.partition = 0; req.followerId = 2; req.fetchOffset = upTo;
+        req.maxBytes = 1 << 20; req.topicId = 0;
+        clock += 1'000'000;
+        (void)rep.onFetchRequest(req, clock);
+        rep.doWork(clock);
+    };
+
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 42, clock), TxnOffsetApply::Replicating)
+        << "appended, not committed: never Applied on the local append alone";
+    const auto leo = rep.logEndOffset();
+    ASSERT_EQ(rep.highWatermark(), 0);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 42, clock), TxnOffsetApply::Replicating);
+    EXPECT_EQ(rep.logEndOffset(), leo) << "asking again waits on the record, it does not append another";
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 1u);
+
+    followerFetches(leo);
+    ASSERT_GT(rep.highWatermark(), leo - 1) << "the follower has the record: committed";
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 42, clock), TxnOffsetApply::Applied);
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 0u);
+    EXPECT_EQ(rep.logEndOffset(), leo);
+    ASSERT_TRUE(store.fetch("g", tp(std::string(kTestTopic), 0)).has_value());
+    EXPECT_EQ(store.fetch("g", tp(std::string(kTestTopic), 0))->offset, 42);
+
+    // A pending record whose leadership changes (it may be truncated away) is appended again by the new leadership.
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 1), 7, clock), TxnOffsetApply::Replicating);
+    const auto leo2 = rep.logEndOffset();
+    rep.becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
+    rep.becomeLeader(/*newEpoch=*/3, std::vector<NodeId>{1, 2});
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 1), 7, clock), TxnOffsetApply::Refused)
+        << "the new leadership has not reloaded the offsets yet";
+    followerFetches(rep.logEndOffset());   // the new leadership commits its log end ...
+    clock += 1'000'000;
+    svc.doWork(clock);                     // ... and the group coordinator reloads the offsets
+    const auto r = svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 1), 7, clock);
+    EXPECT_EQ(r, TxnOffsetApply::Replicating);
+    EXPECT_GT(rep.logEndOffset(), leo2) << "a new leadership appends the offset again";
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 1u) << "the earlier leadership's entry is gone";
+    followerFetches(rep.logEndOffset());
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 1), 7, clock), TxnOffsetApply::Applied);
+
+    // Not the coordinator: Refused, nothing appended.
+    GroupCoordinationService notCoord(&store, &registry, [] { return false; }, [] { return NodeId{2}; });
+    const auto leo3 = rep.logEndOffset();
+    EXPECT_EQ(notCoord.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 99, clock), TxnOffsetApply::Refused);
+    EXPECT_EQ(rep.logEndOffset(), leo3);
+}
+
+// #358: a single-replica offsets partition commits on the append itself - Applied at once, nothing waits.
+TEST(TxnOffsetApplyRegression, ASingleReplicaOffsetsPartitionAppliesAtOnceRegression) {
+    using rune::coordination::TxnOffsetApply;
+    TempDir dir("txnoff_one"), topicDir("txnoff_one_topics");
+    rune::storage::Log log(dir.path);
+    NullTransport transport;
+    PartitionReplica rep(makeSingleNodeConfig(1, 1), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1},
+                         &log, &transport);
+    ReplicatedOffsetStore store(&rep);
+    rune::gateway::TopicRegistry registry(std::vector<TopicSpec>{makeTopicSpec(std::string(kTestTopic), 2, kTestTopicId)},
+                                          topicDir.path);
+    GroupCoordinationService svc(&store, &registry, [] { return true; }, [] { return NodeId{1}; });
+    svc.doWork(0);
+    auto r = svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 5, 0);
+    if (r == TxnOffsetApply::Replicating) {   // the HW may move on the replica's next duty pass
+        rep.doWork(1'000'000);
+        r = svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 5, 1'000'000);
+    }
+    EXPECT_EQ(r, TxnOffsetApply::Applied);
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 0u);
+}
+
+// Adversarial review of PR #434 (#358): transactional offsets of several transactions for the same (group, tp),
+// interleaved while they replicate.  A record waited on by a transaction that never asks again (its coordinator
+// moved away) must not stand in for a later transaction that commits the same offset value after another value was
+// committed in between: the later commit must append, and the committed offset must end at its value.
+TEST(TxnOffsetApplyRegression, InterleavedTransactionsOnOneGroupPartitionEndAtTheLastCommitAdversarialRegression) {
+    using rune::coordination::TxnOffsetApply;
+    TempDir dir("txnoff_adv"), topicDir("txnoff_adv_topics");
+    rune::storage::Log log(dir.path);
+    NullTransport transport;
+    PartitionReplica rep(makeSingleNodeConfig(1, /*minIsr=*/1), Role::Leader, /*epoch=*/1,
+                         std::vector<NodeId>{1, 2}, std::vector<NodeId>{1, 2}, &log, &transport);
+    ReplicatedOffsetStore store(&rep);
+    rune::gateway::TopicRegistry registry(std::vector<TopicSpec>{makeTopicSpec(std::string(kTestTopic), 2, kTestTopicId)},
+                                          topicDir.path);
+    GroupCoordinationService svc(&store, &registry, [] { return true; }, [] { return NodeId{1}; });
+    int64_t clock = 0;
+    svc.doWork(clock);
+    const auto followerFetches = [&] {
+        FetchRequestMsg req{};
+        req.leaderEpoch = rep.epoch(); req.partition = 0; req.followerId = 2; req.fetchOffset = rep.logEndOffset();
+        req.maxBytes = 1 << 20; req.topicId = 0;
+        clock += 1'000'000;
+        (void)rep.onFetchRequest(req, clock);
+        rep.doWork(clock);
+    };
+    const auto t0 = tp(std::string(kTestTopic), 0);
+
+    // T1 offers 42 and never asks again (its coordinator moved away); T2 commits 50.
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 42, clock), TxnOffsetApply::Replicating);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock), TxnOffsetApply::Replicating);
+    followerFetches();
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock), TxnOffsetApply::Applied);
+    ASSERT_EQ(store.fetch("g", t0)->offset, 50);
+
+    // T3 commits 42 (the group was rewound).  It must be appended and end as the committed offset.
+    const auto leo = rep.logEndOffset();
+    TxnOffsetApply r = svc.applyTransactionalOffset("g", t0, 42, clock);
+    if (r == TxnOffsetApply::Replicating) {
+        followerFetches();
+        r = svc.applyTransactionalOffset("g", t0, 42, clock);
+    }
+    EXPECT_EQ(r, TxnOffsetApply::Applied);
+    EXPECT_GT(rep.logEndOffset(), leo) << "T3's commit is appended, not answered by T1's older record";
+    EXPECT_EQ(store.fetch("g", t0)->offset, 42) << "the committed offset is the last transaction's";
+}
+
+// PR #434 review F2: two transactions waiting on one (group, tp) never re-append over each other.  The older waiter is
+// superseded by the newer append: it is answered from its own (older) record, never appends again, so the value
+// ends as the last append's - no rewind, no ping-pong.  A later transaction (another token) always appends.
+TEST(TxnOffsetApplyRegression, AnOlderWaiterIsSupersededAndNeverAppendsOverTheNewerValueRegression) {
+    using rune::coordination::TxnOffsetApply;
+    TempDir dir("txnoff_sup"), topicDir("txnoff_sup_topics");
+    rune::storage::Log log(dir.path);
+    NullTransport transport;
+    PartitionReplica rep(makeSingleNodeConfig(1, 1), Role::Leader, 1, std::vector<NodeId>{1, 2},
+                         std::vector<NodeId>{1, 2}, &log, &transport);
+    ReplicatedOffsetStore store(&rep);
+    rune::gateway::TopicRegistry registry(std::vector<TopicSpec>{makeTopicSpec(std::string(kTestTopic), 2, kTestTopicId)},
+                                          topicDir.path);
+    GroupCoordinationService svc(&store, &registry, [] { return true; }, [] { return NodeId{1}; });
+    int64_t clock = 0;
+    svc.doWork(clock);
+    const auto fetch = [&] {
+        FetchRequestMsg req{};
+        req.leaderEpoch = rep.epoch(); req.partition = 0; req.followerId = 2; req.fetchOffset = rep.logEndOffset();
+        req.maxBytes = 1 << 20; req.topicId = 0;
+        clock += 1'000'000;
+        (void)rep.onFetchRequest(req, clock);
+        rep.doWork(clock);
+    };
+    const auto t0 = tp(std::string(kTestTopic), 0);
+    constexpr uint64_t kTx1 = 11, kTx2 = 13, kTx3 = 15;
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 42, clock, kTx1), TxnOffsetApply::Replicating);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock, kTx2), TxnOffsetApply::Replicating);
+    const auto leo = rep.logEndOffset();
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 42, clock, kTx1), TxnOffsetApply::Replicating);
+    EXPECT_EQ(rep.logEndOffset(), leo) << "the superseded waiter waits on its own record";
+    fetch();
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 42, clock, kTx1), TxnOffsetApply::Applied);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock, kTx2), TxnOffsetApply::Applied);
+    EXPECT_EQ(rep.logEndOffset(), leo) << "nothing re-appended";
+    EXPECT_EQ(store.fetch("g", t0)->offset, 50) << "the last append wins";
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 0u);
+    // The same value again by a later transaction: appended, not answered by any earlier record.
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock, kTx3), TxnOffsetApply::Replicating);
+    EXPECT_GT(rep.logEndOffset(), leo);
+    // Bounded without eviction: a full key refuses a NEW transaction (its coordinator retries); no waiter is dropped.
+    std::size_t accepted = svc.txnOffsetsReplicating();
+    for (uint64_t t = 100; t < 200; ++t)
+        if (svc.applyTransactionalOffset("g", t0, static_cast<int64_t>(t), clock, t) == TxnOffsetApply::Replicating) ++accepted;
+    EXPECT_EQ(svc.txnOffsetsReplicating(), accepted);
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 64u);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 999, clock, 999), TxnOffsetApply::Refused);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock, kTx3), TxnOffsetApply::Replicating) << "kept, not evicted";
+    // The coordinator releases a transaction it no longer completes: its waiter leaves.
+    svc.releaseTransactionalOffsets(kTx3);
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 63u);
+}
+
+// PR #434 re-check: after the offsets replica's leadership changed under several waiters, only the NEWEST appends
+// again; the older ones wait for it and are answered by it - the committed offset ends at the newest commit, never
+// at an older value re-appended later.
+TEST(TxnOffsetApplyRegression, AfterALeadershipChangeOnlyTheNewestWaiterAppendsAgainRegression) {
+    using rune::coordination::TxnOffsetApply;
+    TempDir dir("txnoff_lc"), topicDir("txnoff_lc_topics");
+    rune::storage::Log log(dir.path);
+    NullTransport transport;
+    PartitionReplica rep(makeSingleNodeConfig(1, 1), Role::Leader, 1, std::vector<NodeId>{1, 2},
+                         std::vector<NodeId>{1, 2}, &log, &transport);
+    ReplicatedOffsetStore store(&rep);
+    rune::gateway::TopicRegistry registry(std::vector<TopicSpec>{makeTopicSpec(std::string(kTestTopic), 2, kTestTopicId)},
+                                          topicDir.path);
+    GroupCoordinationService svc(&store, &registry, [] { return true; }, [] { return NodeId{1}; });
+    int64_t clock = 0;
+    svc.doWork(clock);
+    const auto fetch = [&] {
+        FetchRequestMsg req{};
+        req.leaderEpoch = rep.epoch(); req.partition = 0; req.followerId = 2; req.fetchOffset = rep.logEndOffset();
+        req.maxBytes = 1 << 20; req.topicId = 0;
+        clock += 1'000'000;
+        (void)rep.onFetchRequest(req, clock);
+        rep.doWork(clock);
+    };
+    const auto t0 = tp(std::string(kTestTopic), 0);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 42, clock, 1), TxnOffsetApply::Replicating);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock, 2), TxnOffsetApply::Replicating);
+    rep.becomeFollower(2, 2);
+    rep.becomeLeader(3, std::vector<NodeId>{1, 2});
+    fetch();
+    clock += 1'000'000;
+    svc.doWork(clock);                          // the offsets are reloaded under the new leadership
+    const auto leo = rep.logEndOffset();
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 42, clock, 1), TxnOffsetApply::Replicating)
+        << "the older waiter waits for the newest";
+    EXPECT_EQ(rep.logEndOffset(), leo) << "an older value is never appended again";
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock, 2), TxnOffsetApply::Replicating);
+    EXPECT_GT(rep.logEndOffset(), leo) << "the newest appends again";
+    fetch();
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 42, clock, 1), TxnOffsetApply::Applied);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock, 2), TxnOffsetApply::Applied);
+    EXPECT_EQ(store.fetch("g", t0)->offset, 50);
+}
+
+// Re-check of PR #434 round 1 (F2 redesign): two or more concurrent transactional committers on one (group, tp).
+namespace {
+struct OffRig {
+    TempDir dir{"txnoff_rr"}, topicDir{"txnoff_rr_topics"};
+    rune::storage::Log log{dir.path};
+    NullTransport transport;
+    PartitionReplica rep{makeSingleNodeConfig(1, 1), Role::Leader, 1, std::vector<NodeId>{1, 2},
+                         std::vector<NodeId>{1, 2}, &log, &transport};
+    ReplicatedOffsetStore store{&rep};
+    rune::gateway::TopicRegistry registry{std::vector<TopicSpec>{makeTopicSpec(std::string(kTestTopic), 2, kTestTopicId)},
+                                          topicDir.path};
+    GroupCoordinationService svc{&store, &registry, [] { return true; }, [] { return NodeId{1}; }};
+    int64_t clock = 0;
+    OffRig() { svc.doWork(clock); }
+    void fetch() {
+        FetchRequestMsg req{};
+        req.leaderEpoch = rep.epoch(); req.partition = 0; req.followerId = 2; req.fetchOffset = rep.logEndOffset();
+        req.maxBytes = 1 << 20; req.topicId = 0;
+        clock += 1'000'000;
+        (void)rep.onFetchRequest(req, clock);
+        rep.doWork(clock);
+    }
+};
+}  // namespace
+
+TEST(TxnOffsetApplyRegression, ANewerWaiterAppliedFirstNeverLetsTheOlderOneRewindAdversarialRegression) {
+    using rune::coordination::TxnOffsetApply;
+    OffRig g;
+    const auto t0 = tp(std::string(kTestTopic), 0);
+    EXPECT_EQ(g.svc.applyTransactionalOffset("g", t0, 42, g.clock, 11), TxnOffsetApply::Replicating);
+    EXPECT_EQ(g.svc.applyTransactionalOffset("g", t0, 50, g.clock, 13), TxnOffsetApply::Replicating);
+    g.fetch();
+    EXPECT_EQ(g.svc.applyTransactionalOffset("g", t0, 50, g.clock, 13), TxnOffsetApply::Applied);   // newer first
+    const auto leo = g.rep.logEndOffset();
+    const auto r = g.svc.applyTransactionalOffset("g", t0, 42, g.clock, 11);                        // then older
+    EXPECT_EQ(r, TxnOffsetApply::Applied);
+    EXPECT_EQ(g.rep.logEndOffset(), leo) << "the older waiter re-appended";
+    EXPECT_EQ(g.store.fetch("g", t0)->offset, 50) << "the committed offset was rewound";
+}
+
+TEST(TxnOffsetApplyRegression, ANinthWaiterNeverMakesTheEvictedOldestRewindAdversarialRegression) {
+    using rune::coordination::TxnOffsetApply;
+    OffRig g;
+    const auto t0 = tp(std::string(kTestTopic), 0);
+    for (uint64_t t = 1; t <= 9; ++t)
+        EXPECT_EQ(g.svc.applyTransactionalOffset("g", t0, static_cast<int64_t>(100 + t), g.clock, t), TxnOffsetApply::Replicating);
+    const auto leo = g.rep.logEndOffset();
+    (void)g.svc.applyTransactionalOffset("g", t0, 101, g.clock, 1);   // the evicted oldest asks again
+    EXPECT_EQ(g.rep.logEndOffset(), leo) << "the evicted waiter re-appended its older value";
+    g.fetch();
+    for (uint64_t t = 1; t <= 9; ++t) (void)g.svc.applyTransactionalOffset("g", t0, static_cast<int64_t>(100 + t), g.clock, t);
+    EXPECT_EQ(g.store.fetch("g", t0)->offset, 109) << "the committed offset is the newest commit's";
+}

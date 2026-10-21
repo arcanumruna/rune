@@ -608,3 +608,36 @@ TEST(RuneCliBrokerRegression, QlExpectedVersionConflictIsTheBrokersSchemaConflic
                               "--broker", b.endpoint()}, o3, e3), 1);
     EXPECT_NE(e3.str().find("SchemaConflict"), std::string::npos) << e3.str();
 }
+
+// ── schema generate (#418) ────────────────────────────────────────────────────
+
+// `rune schema generate` builds the type from the topic's LINEAGE: after a mid-block DROP the generated v2 type has
+// only v2's members, and its kLineage still places a v1 record's fields (score at 12 in v1, at 8 from v2 on).
+TEST(RuneCliBrokerRegression, SchemaGenerateEmbedsTheLineageOfEveryVersionRegression) {
+    OneBroker b("cli_gen_lineage");
+    rune::client::Client& c = *b.connectClient();
+    const auto blob = rune::codec::serialize(rune::codec::DescriptorBuilder("evo")
+                                                 .add("id", rune::codec::PrimType::Int64, 1, true)
+                                                 .add("age", rune::codec::PrimType::Int32)
+                                                 .add("score", rune::codec::PrimType::Int32)
+                                                 .build());
+    ASSERT_EQ(c.defineTopicAndWait("evo", 1, "id", blob, false, rune::client::Persistence::Disk, {}, {}, 10s).errorCode, 0);
+    rune::codec::AlterOp drop{}; drop.type = rune::codec::AlterOpType::Drop; drop.name = "age";
+    const auto altered = c.alterTopicAndWait("evo", 0, rune::codec::encodeAlterOps({drop}), {}, 10s);
+    ASSERT_EQ(altered.errorCode, 0) << altered.detail;
+
+    const fs::path out = tmpDir() / "gen_lineage";
+    std::string o, e;
+    // The `schema` commands take a full Aeron channel (as the docker e2e passes it) and a reachable egress.
+    const std::string egress = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+    ASSERT_EQ(runCli({"schema", "generate", "evo", "--out", out.string(), "--broker", "aeron:udp?endpoint=" + b.endpoint(),
+                      "--cli-egress", egress, "--cli-data-dir", (tmpDir() / "gen_lineage_cli").string()}, &o, &e), 0) << e;
+    std::ifstream in(out / "evo.gen.h");
+    ASSERT_TRUE(in);
+    const std::string hdr((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    EXPECT_NE(hdr.find("kVersion     = 2u"), std::string::npos);
+    EXPECT_NE(hdr.find("int32_t score = {};"), std::string::npos);
+    EXPECT_EQ(hdr.find("int32_t age = {};"), std::string::npos) << "age is retired at v2";
+    EXPECT_NE(hdr.find("{0u, 12u},  // v1"), std::string::npos) << "a v1 record's score is at 12\n" << hdr;
+    EXPECT_NE(hdr.find("{0u, 8u},  // v2"), std::string::npos) << "a v2 record's score is at 8";
+}

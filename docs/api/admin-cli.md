@@ -92,7 +92,7 @@ rune schema generate <topic> --out <dir> [--broker <ep>]
 | `get` | Fetch a topic's schema and print it. |
 | `list` | List the topics the broker knows; `--verbose` prints more detail per topic. |
 | `generate --from-file` | Generate a C++ header from a serialized descriptor blob, offline. |
-| `generate <topic>` | Fetch the topic's schema from the broker and write `<out>/<topic>.gen.h`. |
+| `generate <topic>` | Fetch the topic's schema lineage from the broker and write `<out>/<topic>.gen.h`, a type that reads records of every version up to the current one. |
 
 ## `rune catalog`
 

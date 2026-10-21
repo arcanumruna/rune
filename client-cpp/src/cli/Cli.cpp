@@ -320,7 +320,9 @@ int cmdSchemaGenerate(const std::vector<std::string>& args,
 
         TopicSchemaResult r;
         try {
-            r = client.getTopicSchemaAndWait(topic, kCliWait);
+            // #418: the topic's LINEAGE (evolving descriptor), so the generated type places records of every
+            // version up to its own; a materialized descriptor would hide every DROP before it.
+            r = client.getTopicSchemaAndWait(topic, rune::protocol::client::kSchemaLineageFingerprint, kCliWait);
         } catch (const std::exception& e) {
             if (isWaitTimeout(e)) {
                 err << "rune: getTopicSchema timed out for topic: " << topic << "\n";

@@ -70,6 +70,8 @@ namespace rune::node {
 // fields are not yet wired. Multi-node path reads from config_.
 // ---------------------------------------------------------------------------
 static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
+static_assert(static_cast<std::size_t>(kIngressCapacity) / 8 >= rune::consensus::kMaxConsensusFrameBytes,
+              "#254: the consensus ingress ring must carry the largest consensus frame a peer sends");
 /// Combined fix program M13 (X102): permission bits of every `__security` segment / index / checkpoint file.
 static constexpr unsigned kSecurityFileMode = 0600;
 
@@ -2504,11 +2506,14 @@ void BrokerNode::buildGateway() {
             if (groupCoordService_) {
                 txnCoordService_->setTxnOffsetSink(
                     [](void* ctx, const std::string& group, const rune::coordination::TopicPartition& tp,
-                       int64_t offset, int64_t nowNs) {
+                       int64_t offset, int64_t nowNs, const rune::coordination::TxnOffsetToken& token) {
                         return static_cast<GroupCoordinationService*>(ctx)->applyTransactionalOffset(group, tp, offset,
-                                                                                                      nowNs);
+                                                                                                      nowNs, token);
                     },
-                    groupCoordService_.get());
+                    groupCoordService_.get(),
+                    [](void* ctx, const rune::coordination::TxnOffsetToken& token) {
+                        static_cast<GroupCoordinationService*>(ctx)->releaseTransactionalOffsets(token);
+                    });
             }
 
             // D9: cross-node transaction markers over the cluster plane — a

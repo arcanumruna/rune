@@ -197,7 +197,11 @@ int main() {
                 return 8;
             }
             rune::gen_v1::CharsEvo d;
-            d.decode(std::span<const uint8_t>(raw));
+            if (!d.decode(std::span<const uint8_t>(raw))) {   // #418: a version unknown to the reader
+                std::cerr << "PROBE v2: FAIL a record of version " << rawVersion(raw) << " did not decode\n";
+                c.close();
+                return 30;
+            }
             ExpectedV1 exp = makeExpectedV1(i);
             if (d.id != exp.id || d.userId != exp.userId || std::string(d.name) != exp.name) {
                 std::cerr << "PROBE v2: FAIL v1-group mismatch at i=" << i
@@ -216,7 +220,11 @@ int main() {
                 return 10;
             }
             rune::gen_v2::CharsEvo d;
-            d.decode(std::span<const uint8_t>(raw));
+            if (!d.decode(std::span<const uint8_t>(raw))) {   // #418: a version unknown to the reader
+                std::cerr << "PROBE v2: FAIL a record of version " << rawVersion(raw) << " did not decode\n";
+                c.close();
+                return 30;
+            }
             ExpectedV2 exp = makeExpectedV2(i);
             if (d.id != exp.id || d.userId != exp.userId || std::string(d.name) != exp.name ||
                 d.level != exp.level) {

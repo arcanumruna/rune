@@ -469,7 +469,7 @@ static int typedRoutingLeg(Client& c, std::chrono::milliseconds wait, int boundM
     for (int32_t p = 0; p < kParts; ++p) {
         subs.push_back(c.subscribe(th, p, opts, [&, p](const Record& r) {
             rune::gen::Characters d;
-            d.decode(r.value);
+            if (!d.decode(r.value)) return;   // #418: an unknown version is missing, never misread
             const Key want(static_cast<int64_t>(d.userId));
             const bool keyOk = r.key.size() == want.size() &&
                                std::equal(r.key.begin(), r.key.end(), want.bytes().begin());

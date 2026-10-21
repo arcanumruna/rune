@@ -7249,7 +7249,7 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
 
     std::size_t encoded = 0;
     // Fix round 3 (I3): the scratch always holds any fixed-size txn answer and
-    // any rejection — a handler's 0 can only mean EndTxn's "deferred".
+    // any rejection — a handler's 0 can only mean "deferred" (ITxnRequestHandler).
     static_assert(kScratchSize >= kTxnMinOutCap, "txn handlers need kTxnMinOutCap");
     const std::size_t cap = scratch_.size();
     const auto templateId = static_cast<pc::TemplateId>(tid);
@@ -7276,18 +7276,13 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
             return;
     }
 
-    // 0 = the answer is DEFERRED — legal for EndTxn only (sent by
-    // completeAwaiting_ when the last marker lands; ITxnRequestHandler
-    // contract).  The service answers decode failures (InvalidRequest) and
-    // responses that do not fit (MessageTooLarge) itself.  A 0 from any other
-    // handler is a broken contract: answered Internal, never dropped.
-    if (encoded == 0) {
-        if (templateId == pc::TemplateId::EndTxn) return;   // deferred
-        spdlog::error("ClientGateway: txn handler tid={} produced no answer — answered Internal", tid);
-        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal),
-                             "txn service produced no answer");
-        return;
-    }
+    // 0 = the answer is DEFERRED (ITxnRequestHandler contract): EndTxn waits for
+    // its markers, and (#358) any answer that depends on a __transaction_state
+    // record waits for that record to commit - the service sends it later (or
+    // answers NotCoordinator when it unloads first).  The service answers decode
+    // failures (InvalidRequest) and responses that do not fit (MessageTooLarge)
+    // itself.
+    if (encoded == 0) return;   // deferred
     if (encoded > scratch_.size()) [[unlikely]] {
         spdlog::error("ClientGateway: txn response tid={} encoded size {} > scratch {} — BUG; answered Internal",
                       tid, encoded, scratch_.size());

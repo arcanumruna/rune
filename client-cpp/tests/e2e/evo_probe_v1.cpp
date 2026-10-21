@@ -184,7 +184,7 @@ int main() {
 
         auto sub = c.subscribe(th, /*partition=*/0, opts, [&](const Record& r) {
             rune::gen_v1::CharsEvo d;
-            d.decode(r.value);
+            if (!d.decode(r.value)) return;   // #418: an unknown version is missing, never misread
             std::lock_guard<std::mutex> lk(mtx);
             got.push_back(ExpectedV1{d.id, d.userId, std::string(d.name)});
         });

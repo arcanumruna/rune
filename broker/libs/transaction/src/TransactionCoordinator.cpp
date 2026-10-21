@@ -461,11 +461,14 @@ CompleteTransactionResult TransactionCoordinator::completeTransaction(
         // committed consumer offsets were lost (a read-process-write pipeline
         // reprocesses inputs after failover — an exactly-once violation).
         if (checkedOffsetApplyCb_) {
-            // A refusal returns BEFORE anything is persisted or cleared: the txn stays PrepareCommit.
+            // A refusal returns BEFORE anything is persisted or cleared: the txn stays PrepareCommit.  #358: every
+            // offset is offered on every pass (not only up to the first one not applied yet), so all of a
+            // transaction's offset records replicate together instead of one replication round each.
+            bool allApplied = true;
             for (const auto& po : meta->pendingOffsets) {
-                if (!checkedOffsetApplyCb_(po.group, po.tp, po.offset, /*timestampNs=*/0))
-                    return { .errorCode = CompleteTransactionResult::kOffsetsPending };
+                if (!checkedOffsetApplyCb_(po.group, po.tp, po.offset, /*timestampNs=*/0)) allApplied = false;
             }
+            if (!allApplied) return { .errorCode = CompleteTransactionResult::kOffsetsPending };
         } else if (offsetApplyCb_) {
             for (const auto& po : meta->pendingOffsets) {
                 offsetApplyCb_(po.group, po.tp, po.offset, /*timestampNs=*/0);

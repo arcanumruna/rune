@@ -60,7 +60,7 @@ TEST(FlyweightGen, EncoderBytesEqualStructEncode) {
 TEST(FlyweightGen, DecoderReadsWhatDecodeReads) {
     const std::vector<uint8_t> rec = encoded(sample());
     AllfixedSample back;
-    back.decode(rec);
+    ASSERT_TRUE(back.decode(rec));
     const Dec dec(rec);
     EXPECT_EQ(dec.id(), back.id);
     EXPECT_EQ(dec.a(), back.a);

@@ -376,6 +376,8 @@ players.send(p);                                                       // routed
 - Routing: when `T` has a key field, `send` hashes `T::key()` (at most 16 bytes, never truncated) to the partition. A schema
   without a key sends to partition 0. The partition count comes from the broker (`typedPartitionCount`).
 - `TypedTopic<T>` is move-only; `handle()` returns its `TopicHandle` and `boundVersion()` the schema version.
+- Reading: `T::decode` / `T::Decoder` place each record by its own version. `lineageAndWait<T>(topic)` returns the
+  lineage that also places records written after `T` was generated ([codec.md](codec.md#generate-c-types)).
 
 ## Materialized views
 

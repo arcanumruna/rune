@@ -108,7 +108,10 @@ int runLive(const std::string& topic,
 
         TopicSchemaResult r;
         try {
-            r = client.getTopicSchemaAndWait(topic, std::chrono::seconds(10));
+            // #418: the topic's LINEAGE (evolving descriptor): the generated type places records of every
+            // version up to its own.
+            r = client.getTopicSchemaAndWait(topic, rune::protocol::client::kSchemaLineageFingerprint,
+                                             std::chrono::seconds(10));
         } catch (const std::exception& e) {
             if (std::string_view(e.what()).find("timed out") != std::string_view::npos) {
                 std::cerr << "rune_schema_gen: getTopicSchema timed out for topic: " << topic << "\n";
