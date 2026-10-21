@@ -1314,3 +1314,144 @@ TEST_F(TxnStateReplicationTest, ACoordinatorRestartedOverAnUncommittedTailLoadsO
     ASSERT_EQ(r->results.size(), 1u);
     EXPECT_EQ(r->results[0].errorCode, 0) << "the registration survived the restart";
 }
+
+// ===========================================================================
+// M1 (issues #125, #438, #359).  A transaction on the single-replica txn store (answers inline): init, one
+// partition, AddOffsetsToTxn, then TxnOffsetCommit entries are sent by the test.
+// ===========================================================================
+namespace {
+struct OffsetsTxn {
+    std::string txn;
+    std::string group;
+    int64_t     pid   = -1;
+    int16_t     epoch = 0;
+};
+
+OffsetsTxn beginOffsetsTxn(rune::node::TransactionCoordinationService& svc, uint8_t* req, uint8_t* out, std::size_t cap,
+                           const std::string& txn, const std::string& group, int64_t nowNs) {
+    OffsetsTxn t{txn, group};
+    std::size_t n = encodeInitProducerId(req, cap, 1, 1, 30'000, txn);
+    const auto init = pc::InitProducerIdResponse::decode(out, svc.handleInitProducerId(req, n, nowNs, out, cap));
+    if (!init) return t;
+    t.pid = init->producerId;
+    t.epoch = init->producerEpoch;
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+    n = encodeAddPartitions(req, cap, 1, 2, t.pid, t.epoch, txn, parts);
+    (void)svc.handleAddPartitions(req, n, nowNs, out, cap);
+    pc::AddOffsetsToTxn add;
+    add.sessionId = 1; add.correlationId = 3; add.producerId = t.pid; add.producerEpoch = t.epoch;
+    add.transactionalId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(t.txn.data()), t.txn.size());
+    add.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(t.group.data()), t.group.size());
+    n = add.encode(req);
+    (void)svc.handleAddOffsets(req, n, nowNs, out, cap);
+    return t;
+}
+
+/// TxnOffsetCommit of one entry (topic 0, partition 0); `generation < 0` sends no KIP-447 block (legacy).
+int16_t txnOffsetCommit(rune::node::TransactionCoordinationService& svc, uint8_t* req, uint8_t* out, std::size_t cap,
+                        const OffsetsTxn& t, int64_t offset, int64_t nowNs, int32_t generation = -1,
+                        const std::string& member = {}) {
+    pc::TxnOffsetCommit toc;
+    toc.sessionId = 1; toc.correlationId = 4; toc.producerId = t.pid; toc.producerEpoch = t.epoch;
+    toc.transactionalId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(t.txn.data()), t.txn.size());
+    toc.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(t.group.data()), t.group.size());
+    toc.generationId = generation;
+    toc.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(member.data()), member.size());
+    const std::vector<pc::TxnOffsetCommitEntry> entries = {{0, 0, offset, {}}};
+    const std::size_t n = toc.encode(req, entries);
+    const auto r = pc::TxnOffsetCommitResponse::decode(out, svc.handleTxnOffsetCommit(req, n, nowNs, out, cap));
+    return r && !r->results.empty() ? r->results[0].errorCode : int16_t{-1};
+}
+
+struct MemberFence {
+    std::string member = "m-1";
+    int32_t     generation = 4;
+    int         calls = 0;
+    static pc::ErrorCode check(void* ctx, const std::string&, const std::string& member, int32_t generation, int64_t) {
+        auto* f = static_cast<MemberFence*>(ctx);
+        ++f->calls;
+        if (member != f->member) return pc::ErrorCode::UnknownMember;
+        return generation == f->generation ? pc::ErrorCode::OK : pc::ErrorCode::IllegalGeneration;
+    }
+};
+}  // namespace
+
+// Issue #125: TxnOffsetCommit carries the KIP-447 member id and generation and is fenced exactly as OffsetCommit.
+TEST_F(TransactionCoordinationServiceTest, TxnOffsetCommitIsFencedByMemberAndGenerationRegression) {
+    MemberFence fence;
+    svc_->setTxnOffsetMemberFence(&MemberFence::check, &fence);
+    const OffsetsTxn t = beginOffsetsTxn(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), "tx125", "cg125", 0);
+    ASSERT_GE(t.pid, 0);
+    EXPECT_EQ(txnOffsetCommit(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), t, 10, 0, 3, "m-1"),
+              static_cast<int16_t>(pc::ErrorCode::IllegalGeneration)) << "a stale generation committed";
+    EXPECT_EQ(txnOffsetCommit(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), t, 10, 0, 4, "m-other"),
+              static_cast<int16_t>(pc::ErrorCode::UnknownMember)) << "a foreign member committed";
+    EXPECT_TRUE(svc_->pendingOffsetsForTest("tx125").empty()) << "a fenced commit still added offsets";
+    EXPECT_EQ(txnOffsetCommit(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), t, 10, 0, 4, "m-1"), 0);
+    EXPECT_EQ(svc_->pendingOffsetsForTest("tx125").size(), 1u);
+    const int before = fence.calls;
+    EXPECT_EQ(txnOffsetCommit(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), t, 11, 0), 0)
+        << "a legacy commit (no KIP-447 block) is accepted, as Kafka does";
+    EXPECT_EQ(fence.calls, before) << "a legacy commit has no member to check";
+}
+
+// Issue #438: a (group, tp) is held by at most one unfinished transaction - another transaction's TxnOffsetCommit on
+// it is answered ConcurrentTransactions (retriable) and adds nothing; the hold survives a coordinator reload (it is
+// rebuilt from the durable txn state) and is released only once the holder's Complete* record is in the log.
+TEST_F(TransactionCoordinationServiceTest, OneGroupPartitionIsHeldByOneTransactionAcrossAReloadRegression) {
+    const OffsetsTxn a = beginOffsetsTxn(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), "tx-a", "cg438", 0);
+    const OffsetsTxn b = beginOffsetsTxn(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), "tx-b", "cg438", 0);
+    ASSERT_EQ(txnOffsetCommit(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), a, 42, 0), 0);
+    const auto conflict = static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions);
+    EXPECT_EQ(txnOffsetCommit(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), b, 50, 0), conflict);
+    EXPECT_TRUE(svc_->pendingOffsetsForTest("tx-b").empty());
+    const rune::coordination::TopicPartition k{"topic_0", 0};
+    EXPECT_EQ(svc_->txnOffsetHold("cg438", k), rune::coordination::TxnOffsetHold::Held);
+
+    // a reaches PrepareCommit; the coordinator reloads (a new service over the same durable txn store).
+    std::size_t n = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 1, 5, a.pid, a.epoch, /*commit=*/true, a.txn);
+    ASSERT_EQ(pc::EndTxnResponse::decode(outBuf_.data(), svc_->handleEndTxn(reqBuf_.data(), n, 0, outBuf_.data(),
+                                                                            outBuf_.size()))->errorCode, 0);
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [this] { return leaderNodeId_; });
+    EXPECT_EQ(svc_->txnOffsetHold("cg438", k), rune::coordination::TxnOffsetHold::Unknown)
+        << "before the load nothing is known: a fetch must not be answered";
+    RefusingSink sink;
+    sink.refusals = 1000;   // the group coordinator refuses: a stays PrepareCommit
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    int64_t now = 1'000'000'000;
+    (void)svc_->doWork(now);
+    EXPECT_EQ(svc_->txnOffsetHold("cg438", k), rune::coordination::TxnOffsetHold::Held)
+        << "the reload forgot that a PrepareCommit holds the key";
+    EXPECT_EQ(txnOffsetCommit(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), b, 50, now), conflict)
+        << "after the reload another transaction could commit the held key (the #438 rewind)";
+}
+
+// Issue #359: a commit stuck on a refused offset apply is visible - a gauge of stuck commits, the oldest one's age,
+// and a periodic WARN - instead of a silent retry loop.
+TEST_F(TransactionCoordinationServiceTest, AStuckOffsetApplyIsCountedAgedAndReportedRegression) {
+    const OffsetsTxn t = beginOffsetsTxn(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), "tx359", "cg359", 0);
+    ASSERT_EQ(txnOffsetCommit(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), t, 7, 0), 0);
+    std::size_t n = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 1, 5, t.pid, t.epoch, /*commit=*/true, t.txn);
+    ASSERT_EQ(pc::EndTxnResponse::decode(outBuf_.data(), svc_->handleEndTxn(reqBuf_.data(), n, 0, outBuf_.data(),
+                                                                            outBuf_.size()))->errorCode, 0);
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [this] { return leaderNodeId_; });
+    RefusingSink sink;
+    sink.refusals = 1'000'000;
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    const int64_t start = 1'000'000'000;
+    int64_t now = start;
+    (void)svc_->doWork(now);
+    svc_->onControlMarkerLanded(0, 0, t.pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    EXPECT_EQ(svc_->txnOffsetCommitsStuck(), 1u);
+    const uint64_t warnsAtStart = svc_->stuckTxnOffsetWarnsForTest();
+    for (int i = 0; i < 70; ++i) { now += 1'000'000'000; (void)svc_->doWork(now); }   // 70 s of injected clock
+    EXPECT_EQ(svc_->txnOffsetCommitsStuck(), 1u);
+    EXPECT_GE(svc_->oldestStuckTxnOffsetAgeNs(now), int64_t{69'000'000'000}) << "the age of the oldest stuck commit";
+    const uint64_t warns = svc_->stuckTxnOffsetWarnsForTest() - warnsAtStart;
+    EXPECT_GE(warns, 2u) << "no periodic WARN while a commit is stuck";
+    EXPECT_LE(warns, 3u) << "the WARN is rate-limited (once per 30 s)";
+}

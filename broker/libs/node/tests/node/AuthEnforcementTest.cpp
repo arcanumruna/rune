@@ -888,3 +888,18 @@ TEST(AuthEnforcementRegression, ProducerIdBindingSurvivesABrokerRestartAdversari
     EXPECT_GT(rune::protocol::producerIdCounter(fresh.pid), rune::protocol::producerIdCounter(p.pid))
         << "a recovered bound id's counter was re-issued";
 }
+
+// Issue #125: TxnOffsetCommit needs READ on every listed topic, exactly as OffsetCommit does (the gateway checked only
+// the transactional id and the group).
+TEST(AuthEnforcementRegression, TxnOffsetCommitNeedsReadOnEveryTopicRegression) {
+    AuthRig r;
+    const std::vector<AuthGrant> base{exact(SO::Write, ST::TransactionalId, "tx1"), exact(SO::Write, ST::Topic, "orders"),
+                                      exact(SO::Read, ST::Group, "cg")};
+    std::vector<AuthGrant> withRead = base;
+    withRead.push_back(exact(SO::Read, ST::Topic, "orders"));
+    const int64_t noRead = r.newUser(base);
+    const int64_t reader = r.newUser(withRead);
+    EXPECT_EQ(r.txnOffsetCommit(noRead, "tx1", "cg", r.orders), kNotAuthorized)
+        << "an offset was committed for a topic the caller cannot READ";
+    EXPECT_NE(r.txnOffsetCommit(reader, "tx1", "cg", r.orders), kNotAuthorized);
+}

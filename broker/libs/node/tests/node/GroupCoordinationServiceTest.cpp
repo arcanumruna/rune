@@ -2273,3 +2273,111 @@ TEST(TxnOffsetApplyRegression, ANinthWaiterNeverMakesTheEvictedOldestRewindAdver
     for (uint64_t t = 1; t <= 9; ++t) (void)g.svc.applyTransactionalOffset("g", t0, static_cast<int64_t>(100 + t), g.clock, t);
     EXPECT_EQ(g.store.fetch("g", t0)->offset, 109) << "the committed offset is the newest commit's";
 }
+
+// ===========================================================================
+// Issue #433: a plain OffsetCommit is answered only once its __consumer_offsets record is COMMITTED (the high
+// watermark passed it), as the transactional path does (#358).  Before the fix the answer left on the local append,
+// and a failover of the offsets partition in that window lost an offset the consumer had been told was committed.
+// Issue #438: a (group, tp) held by an unfinished transaction is neither fetched nor plainly committed (retriable).
+// ===========================================================================
+namespace {
+struct GroupAnswers {
+    std::vector<std::vector<uint8_t>> frames;
+    static void sink(void* ctx, int64_t, const uint8_t* f, std::size_t n) {
+        static_cast<GroupAnswers*>(ctx)->frames.emplace_back(f, f + n);
+    }
+};
+
+/// OffRig (two-replica offsets partition) plus one Stable member of `group` bound to session 1.
+struct CommitRig : OffRig {
+    GroupAnswers answers;
+    uint8_t      req[4096]{};
+    uint8_t      out[4096]{};
+    int64_t      corr = 1;
+    std::string  member;
+    int32_t      gen = -1;
+    explicit CommitRig(const std::string& group) {
+        svc.setAnswerSinkForTest(&GroupAnswers::sink, &answers);
+        std::size_t n = svc.handleJoinGroup(req, encodeJoinGroup(req, 1, corr++, group, ""), clock, out, sizeof out);
+        const auto j = pc::JoinGroupResponse::decode(out, n);
+        if (j) member.assign(reinterpret_cast<const char*>(j->memberId.data()), j->memberId.size());
+        (void)svc.handleJoinGroup(req, encodeJoinGroup(req, 1, corr++, group, member), clock, out, sizeof out);
+        for (int i = 0; i < 200 && svc.coordinator(group).state() != GroupState::Stable; ++i) {
+            clock += 10'000'000;
+            svc.doWork(clock);
+        }
+        gen = svc.coordinator(group).generationId();
+    }
+    std::size_t commit(const std::string& group, int64_t offset) {
+        return svc.handleOffsetCommit(req, encodeOffsetCommit(req, 1, corr++, group, member, gen, kTestTopicId, 0, offset),
+                                      clock, out, sizeof out);
+    }
+    static int16_t codeOf(const uint8_t* f, std::size_t n) {
+        const auto r = pc::OffsetCommitResponse::decode(f, n);
+        return r && !r->results.empty() ? r->results[0].errorCode : int16_t{-1};
+    }
+};
+}  // namespace
+
+TEST(OffsetCommitDurabilityRegression, APlainCommitIsAnsweredOnlyOnceItsRecordIsCommittedRegression) {
+    CommitRig g("g433");
+    ASSERT_FALSE(g.member.empty());
+    ASSERT_EQ(g.svc.coordinator("g433").state(), GroupState::Stable);
+    EXPECT_EQ(g.commit("g433", 77), 0u) << "answered on the local append, before the record committed";
+    EXPECT_TRUE(g.answers.frames.empty());
+    EXPECT_EQ(g.svc.parkedOffsetCommits(), 1u);
+    g.svc.doWork(g.clock);
+    EXPECT_TRUE(g.answers.frames.empty()) << "released before the follower had the record";
+    g.fetch();                                   // the follower fetched: the high watermark passes the record
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u);
+    EXPECT_EQ(CommitRig::codeOf(g.answers.frames[0].data(), g.answers.frames[0].size()), 0);
+    EXPECT_EQ(g.svc.parkedOffsetCommits(), 0u);
+    EXPECT_EQ(g.store.fetch("g433", tp(std::string(kTestTopic), 0))->offset, 77);
+}
+
+TEST(OffsetCommitDurabilityRegression, AnOffsetsLeaderChangeUnderAParkedCommitNeverAnswersOkRegression) {
+    CommitRig g("g433lc");
+    ASSERT_EQ(g.commit("g433lc", 88), 0u);
+    g.rep.becomeFollower(2, 2);                  // the record may be gone with the old leadership
+    g.rep.becomeLeader(3, std::vector<NodeId>{1, 2});
+    g.fetch();
+    g.clock += 1'000'000;
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u) << "a parked commit is always answered (no hang)";
+    EXPECT_EQ(CommitRig::codeOf(g.answers.frames[0].data(), g.answers.frames[0].size()),
+              static_cast<int16_t>(pc::ErrorCode::NotCoordinator))
+        << "OK was answered for a record that may not have survived the leader change";
+}
+
+TEST(OffsetCommitDurabilityRegression, AHeldKeyIsNeitherFetchedNorPlainlyCommittedRegression) {
+    CommitRig g("g438");
+    struct Probe {
+        rune::coordination::TxnOffsetHold hold = rune::coordination::TxnOffsetHold::Held;
+        static rune::coordination::TxnOffsetHold of(void* ctx, const std::string&, const TopicPartition&) {
+            return static_cast<Probe*>(ctx)->hold;
+        }
+    } probe;
+    g.svc.setTxnOffsetHoldProbe(&Probe::of, &probe);
+    const auto unstable = static_cast<int16_t>(pc::ErrorCode::UnstableOffsetCommit);
+    std::size_t n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, "g438", kTestTopicId, 0), g.clock,
+                                            g.out, sizeof g.out);
+    auto f = pc::OffsetFetchResponse::decode(g.out, n);
+    ASSERT_TRUE(f && !f->results.empty());
+    EXPECT_EQ(f->results[0].errorCode, unstable) << "a held key's committed offset was handed out";
+    const auto leo = g.rep.logEndOffset();
+    n = g.commit("g438", 5);
+    ASSERT_GT(n, 0u) << "a refusal is answered at once";
+    EXPECT_EQ(CommitRig::codeOf(g.out, n), unstable);
+    EXPECT_EQ(g.rep.logEndOffset(), leo) << "a plain record was appended over a held key";
+    probe.hold = rune::coordination::TxnOffsetHold::Unknown;   // the txn coordinator is not loaded here
+    n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, "g438", kTestTopicId, 0), g.clock, g.out,
+                                sizeof g.out);
+    f = pc::OffsetFetchResponse::decode(g.out, n);
+    ASSERT_TRUE(f && !f->results.empty());
+    EXPECT_EQ(f->results[0].errorCode, unstable) << "unknown hold state must be treated as held";
+    probe.hold = rune::coordination::TxnOffsetHold::Free;
+    n = g.commit("g438", 6);
+    if (n == 0) { g.fetch(); g.svc.doWork(g.clock); }
+    EXPECT_EQ(g.store.fetch("g438", tp(std::string(kTestTopic), 0))->offset, 6);
+}
