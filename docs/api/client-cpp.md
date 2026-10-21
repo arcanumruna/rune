@@ -79,7 +79,7 @@ for the exchange and [SECURITY.md](../../broker/docs/SECURITY.md) for the model.
 
 - A client **with** credentials refuses a broker that skips the login (a dev-mode broker, an old broker) with
   `AuthenticationFailed`. Set `allowUnauthenticatedBroker = true` to accept it.
-- `authErrorName(code)` returns the name of codes 44 to 47 for `Completion::errorCode` when the status is `BrokerError`.
+- `authErrorName(code)` returns the name of codes 44 to 48 for `Completion::errorCode` when the status is `BrokerError` (48 `AuthUnavailable` is retriable: try another broker).
 - A password is never logged and never sent; only a proof derived from it. Setting both `password` and `passwordFile`
   throws `std::invalid_argument`.
 

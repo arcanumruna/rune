@@ -1367,6 +1367,7 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         const bool fsWasArmed = followerSync_.fetchArmed();
         const bool hadRecords = !resp.records.empty();
         followerSync_.onResponse(hadRecords, resp.highWatermark);
+        ++leaderAnswers_;   // issues #15 / #111: the current leader answered (the admin plane's freshness signal)
         // Change-gated: only log a STATE transition (not every applied response — that
         // floods under load and starves the worker).
         if (fsLogEnabled() && fsPrev != followerSync_.state()) {

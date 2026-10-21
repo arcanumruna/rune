@@ -9,6 +9,7 @@
 #include "support/AuthTrio.h"
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <cstdio>
 #include <future>
@@ -299,22 +300,20 @@ TEST(AuthClusterRegression, WrongKeyBrokerNeverJoinsRegression) {
         std::this_thread::sleep_for(100ms);   // observation window of a state that must NOT change
         for (int obs : {1, 2}) EXPECT_TRUE(isrHas(t, obs, 3, false, led.id)) << "node 3 re-entered an ISR seen by node " << obs;
     }
-    // A client session on node 3 (its security view is on its own disk) cannot produce to a partition led elsewhere:
-    // the gateway never forwards a produce, it answers Redirect (3) to the leader's endpoint (NotLeader (2) only when its
-    // routing image has no leader for the partition), and nothing is stored on the leader.
-    AuthTrio::Session w3;
-    ASSERT_TRUE(AuthTrio::until(30s, [&] { try { w3 = t.login(3, "writer"); return true; } catch (...) { return false; } }));
-    const bool routeKnown = t.node(3).onControlThreadForTest([&t, &led]() {
-        const MetadataService* ms = t.node(3).metadataServiceForTest();
-        const auto* pa = ms ? ms->assignment(led.id, led.part[0]) : nullptr;
-        return pa != nullptr && pa->leaderNode != rune::metadata::NO_LEADER;
-    });
+    // Issues #15 / #111: node 3 reaches no peer, so its `__security` state (on its own disk) is not provably current -
+    // it serves no login at all (the retriable AuthUnavailable, never an OK on a frozen state), so no session of it
+    // can send anything, and nothing reaches the leader's log.
     const int64_t leo0 = partitionLeo(&t.node(1), led.id, led.part[0]);
-    const int64_t corr = w3.w->raw().nextCorrelationId();
-    ASSERT_TRUE(w3.w->raw().produce(t.channel(3), AuthWireClient::kClientStream, w3.sid, corr, led.id, led.part[0], 1, makeBatch(1)));
-    const int code3 = ackOrErrorCode(w3.w->raw(), corr, 10s);
-    if (routeKnown) EXPECT_EQ(code3, 3) << "Redirect to the partition's leader";
-    else EXPECT_TRUE(code3 == 3 || code3 == 2) << "Redirect, or NotLeader while the routing image is empty; got " << code3;
+    {
+        AuthWireClient& w = t.wire();
+        for (int i = 0; i < 5; ++i) {
+            const int64_t sid = w.connect(t.channel(3));
+            ASSERT_GT(sid, 0);
+            EXPECT_EQ(w.login(t.channel(3), sid, "writer", {AuthTrio::kPw, AuthTrio::kPw}).errorCode(), 48)
+                << "attempt " << i << ": a broker cut off its peers answers AuthUnavailable";
+        }
+        EXPECT_NE(t.node(3).securityServingForTest(), "Serving");
+    }
     EXPECT_EQ(partitionLeo(&t.node(1), led.id, led.part[0]), leo0) << "nothing reached the leader's log";
 
     // Node 3 never votes in a term the others accept.  Its consensus frames do not open on nodes 1 and 2, so with the
@@ -962,4 +961,359 @@ TEST(AuthClusterRegression, AForcedLastAdminRemovalKeepsEveryBrokerAskingForALog
         for (int id : {1, 2, 3}) if (!t.node(id).securityViewForTest().hasSecurityAdmin) return false;
         return true;
     })) << "every broker closes the window again";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Issues #15 / #111 (decision M7): a broker whose `__security` state is not provably current - restarted behind the
+// cluster, partitioned from its leader, or a partitioned ex-leader (a zombie) - serves no login (the retriable
+// AuthUnavailable, 48) and, stale longer than R, ends its authenticated sessions with a session-level 48.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+constexpr uint16_t kAuthUnavailable = 48;
+/// The login answer of `user` on broker `id` (a fresh session on the trio wire); 0xFFFF = none / no connect.
+uint16_t loginCode(AuthTrio& t, int id, const std::string& user, const std::string& pw = AuthTrio::kPw) {
+    AuthWireClient& w = t.wire();
+    const int64_t sid = w.connect(t.channel(id));
+    if (sid <= 0) return 0xFFFF;
+    return w.login(t.channel(id), sid, user, {pw, pw}).errorCode();
+}
+/// Shorter R for the tests (F stays the default 1 s: it must exceed the broker liveness + 500 ms).
+void withStaleSessionEnd(AuthTrio& t, int64_t ms) {
+    auto base = t.cluster().configTweak;
+    t.cluster().configTweak = [base, ms](NodeConfig& cfg) { if (base) base(cfg); cfg.securityStaleSessionEndMs = ms; };
+}
+bool sessionEndedWith(AuthTrio::Session& s, int16_t code, std::chrono::milliseconds within) {
+    auto& c = s.w->raw();
+    bool seen = false;
+    c.pollFor(within, [&] {
+        for (const auto& e : c.errors()) if (e.sessionId == s.sid && e.correlationId == 0 && e.code == code) { seen = true; return true; }
+        return false;
+    });
+    if (!seen)
+        for (const auto& e : c.errors())
+            std::fprintf(stderr, "DIAG error sid=%lld corr=%lld code=%d msg=%s (want sid=%lld)\n", (long long)e.sessionId,
+                         (long long)e.correlationId, e.code, e.message.c_str(), (long long)s.sid);
+    return seen;
+}
+}  // namespace
+
+// Issue #15 (RED before the fix: node 3 restarted with its local `__security` prefix - ws1 still enabled there - and,
+// its applier behind, accepted ws1's password although the cluster had disabled ws1 while it was down).
+TEST(AuthRestartRegression, ARestartedBrokerNeverAcceptsADisabledUsersOldPasswordClusterRegression) {
+    AuthTrio t("restartdisabled");
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1");
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return loginCode(t, 3, "ws1") == 0; })) << "ws1 logs in on node 3";
+    t.stopNode(3);
+    t.mustOk(t.ddl(1, [](AuthWireClient& w, const std::string& ch, int64_t sid) {
+        return w.alterPassword(ch, sid, "ws1", pc::UserChangeKind::Disable, "");
+    }), "ALTER USER ws1 DISABLE");
+    // Node 3 comes back behind: its applier is held, so its local state (ws1 enabled) never advances on its own.
+    t.cluster().beforeStart = [](int id, BrokerNode& n) { if (id == 3) n.holdSecurityApplyAtBootForTest(true); };
+    t.restart(3, t.keyContentsPath(3));
+    t.cluster().beforeStart = nullptr;
+    int unavailable = 0;
+    for (int i = 0; i < 10; ++i) {
+        const uint16_t code = loginCode(t, 3, "ws1");
+        ASSERT_NE(code, 0) << "attempt " << i << ": the disabled user's old password must never log in";
+        unavailable += code == kAuthUnavailable ? 1 : 0;
+        std::this_thread::sleep_for(100ms);
+    }
+    EXPECT_GT(unavailable, 0) << "a broker that cannot vouch for its state answers the retriable AuthUnavailable";
+    EXPECT_EQ(t.node(3).securityServingForTest(), "CatchingUp");
+    t.node(3).holdSecurityApplyForTest(false);
+    ASSERT_TRUE(t.awaitDigestsAgree(2, 60s)) << "node 3 applied the DISABLE";
+    EXPECT_TRUE(AuthTrio::until(30s, [&] { return loginCode(t, 3, "ws1") == 44; })) << "now judged: disabled (44)";
+    EXPECT_EQ(t.node(3).securityServingForTest(), "Serving");
+}
+
+// Issue #111 (RED before the fix: a follower cut off its `__security` leader kept serving logins and its sessions
+// forever from the frozen state).  Stale after F: logins 48; after R its authenticated sessions end with 48 (their
+// clients move); the contact back plus a full catch-up -> Serving again.
+TEST(AuthRestartRegression, APartitionedBrokerGoesStaleThenEndsSessionsRetriablyRegression) {
+    AuthTrio t("partitionedfollower");
+    withStaleSessionEnd(t, 3'000);
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1");
+    const int32_t leader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(leader, 0);
+    const int cut = leader == 3 ? 2 : 3;   // a follower
+    AuthTrio::Session live;
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { try { live = t.login(cut, "ws1"); return true; } catch (...) { return false; } }));
+    BrokerNode& n = t.node(cut);
+    n.onAdminThreadForTest([&n]() {   // its `__security` follower hears its leader no more (no fetch, no answer)
+        n.securityReplicaForTest()->holdFetchesUntilForTest(INT64_MAX);
+        return 0;
+    });
+    EXPECT_TRUE(AuthTrio::until(10s, [&] { return n.securityServingForTest() == "Stale"; }));
+    EXPECT_EQ(loginCode(t, cut, "ws1"), kAuthUnavailable) << "a stale broker serves no login";
+    EXPECT_TRUE(n.gatewayHasSessionForTest(live.sid)) << "within R the live session keeps working";
+    EXPECT_TRUE(sessionEndedWith(live, static_cast<int16_t>(kAuthUnavailable), 15s))
+        << "stale past R: the session is ended retriably (session-level 48)";
+    EXPECT_FALSE(n.gatewayHasSessionForTest(live.sid));
+    EXPECT_EQ(loginCode(t, leader, "ws1"), 0) << "a current broker serves";
+    n.onAdminThreadForTest([&n]() { n.securityReplicaForTest()->holdFetchesUntilForTest(0); return 0; });
+    EXPECT_TRUE(AuthTrio::until(30s, [&] { return loginCode(t, cut, "ws1") == 0; })) << "contact back + caught up: serving";
+}
+
+// Issue #111, the zombie leader (RED before the fix: the `__security` leader cut off the consensus kept "leading" -
+// nothing tells it otherwise - and served logins and permissions from its frozen state while the majority moved on: a
+// user DISABLEd there still logged in on it).  Stale F after its last consensus contact: logins 48, sessions ended
+// after R; healed, it follows the new leader and judges the user disabled.
+TEST(AuthRestartRegression, APartitionedSecurityLeaderStopsServingWithoutALeaseRegression) {
+    AuthTrio t("zombieleader");
+    withStaleSessionEnd(t, 3'000);
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1");
+    const int32_t zombie = settledSecurityLeader(t.cluster());
+    ASSERT_GT(zombie, 0);
+    const int other = zombie == 1 ? 2 : 1;
+    AuthTrio::Session live;
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { try { live = t.login(zombie, "ws1"); return true; } catch (...) { return false; } }));
+    BrokerNode& z = t.node(zombie);
+    z.partitionFromPeersForTest(true);
+    // Stale first (its admin plane is still up: a DDL reaching it before would still commit through its followers).
+    ASSERT_TRUE(AuthTrio::until(10s, [&] { return z.securityServingForTest() == "Stale"; }));
+    // The majority moves on: a new `__security` leader, then the DISABLE commits there.
+    {   // a retry after a commit timeout may find it applied already (a fresh request id each attempt): either is fine
+        const auto a = t.ddl(other, [](AuthWireClient& w, const std::string& ch, int64_t sid) {
+            return w.alterPassword(ch, sid, "ws1", pc::UserChangeKind::Disable, "");
+        }, 60s);
+        ASSERT_TRUE(a.errorCode == 0 || a.detail.find("already disabled") != std::string::npos)
+            << "ALTER USER ws1 DISABLE (majority): " << a.errorCode << " " << a.detail;
+    }
+    EXPECT_TRUE(AuthTrio::until(10s, [&] { return z.securityServingForTest() == "Stale"; }));
+    for (int i = 0; i < 5; ++i)
+        EXPECT_EQ(loginCode(t, zombie, "ws1"), kAuthUnavailable) << "attempt " << i << ": the zombie serves no login";
+    EXPECT_TRUE(sessionEndedWith(live, static_cast<int16_t>(kAuthUnavailable), 15s)) << "its sessions end after R";
+    z.partitionFromPeersForTest(false);
+    EXPECT_TRUE(AuthTrio::until(60s, [&] { return loginCode(t, zombie, "ws1") == 44; }))
+        << "healed: it follows the new leader and the user is disabled";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Adversarial review of PR #459 (issues #15 / #111): try to make a broker serve a login from a `__security` state the
+// cluster has moved past - at the moment a zombie leader heals, while it is cut off, right after a restart with no
+// seam, and on the survivors of a `__security` leader crash (a normal failover must never make them refuse logins).
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+struct ServingBounds { int64_t fMs = 0; int64_t livenessMs = 0; };
+/// Captures F and the broker liveness timeout the brokers apply.
+void captureBounds(AuthTrio& t, ServingBounds& b) {
+    auto base = t.cluster().configTweak;
+    t.cluster().configTweak = [base, &b](NodeConfig& cfg) {
+        if (base) base(cfg);
+        b.fMs = cfg.effectiveSecurityMaxStalenessMs();
+        b.livenessMs = cfg.effectiveBrokerLivenessMs();
+    };
+}
+int64_t msSince(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+}  // namespace
+
+// The healed zombie: it believed it led `__security` through the whole partition, so its admin verdict never lapsed;
+// the moment its consensus closes again it must not serve logins from the state it froze (ws1 still enabled there)
+// before it has learnt it was replaced and applied the DISABLE it missed.
+TEST(AuthRestartAdversarialRegression, AHealedZombieLeaderNeverServesTheDisabledUserAdversarialRegression) {
+    AuthTrio t("advzombieheal");
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1");
+    const int32_t zombie = settledSecurityLeader(t.cluster());
+    ASSERT_GT(zombie, 0);
+    const int other = zombie == 1 ? 2 : 1;
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return loginCode(t, zombie, "ws1") == 0; }));
+    BrokerNode& z = t.node(zombie);
+    z.partitionFromPeersForTest(true);
+    {
+        const auto a = t.ddl(other, [](AuthWireClient& w, const std::string& ch, int64_t sid) {
+            return w.alterPassword(ch, sid, "ws1", pc::UserChangeKind::Disable, "");
+        }, 60s);
+        ASSERT_TRUE(a.errorCode == 0 || a.detail.find("already disabled") != std::string::npos)
+            << "ALTER USER ws1 DISABLE (majority): " << a.errorCode << " " << a.detail;
+    }
+    ASSERT_TRUE(AuthTrio::until(15s, [&] { return z.securityServingForTest() == "Stale"; }));
+    z.partitionFromPeersForTest(false);
+    const auto healed = std::chrono::steady_clock::now();
+    int accepted = 0, attempts = 0, judged = 0;
+    std::string firstAccept;
+    while (msSince(healed) < 60'000 && judged < 5) {
+        const uint16_t code = loginCode(t, zombie, "ws1");
+        ++attempts;
+        if (code == 0) {
+            if (accepted++ == 0) firstAccept = std::to_string(msSince(healed)) + " ms after the heal (state " +
+                                               z.securityServingForTest() + ")";
+        }
+        judged = code == 44 ? judged + 1 : 0;
+    }
+    EXPECT_EQ(accepted, 0) << "the healed ex-leader accepted the DISABLEd user's password " << accepted << " of " << attempts
+                           << " times, first " << firstAccept;
+    EXPECT_EQ(judged, 5) << "it ends up judging ws1 disabled";
+}
+
+// The zombie while cut off: what it serves is never more than about F behind the cluster.  No login of the DISABLEd
+// user may succeed on it later than F after the majority committed the DISABLE, nor later than F + the liveness timeout
+// after it lost its peers.
+TEST(AuthRestartAdversarialRegression, AZombieLeaderStopsServingWithinTheStalenessBoundAdversarialRegression) {
+    AuthTrio t("advzombiebound");
+    ServingBounds b;
+    captureBounds(t, b);
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1");
+    const int32_t zombie = settledSecurityLeader(t.cluster());
+    ASSERT_GT(zombie, 0);
+    const int other = zombie == 1 ? 2 : 1;
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return loginCode(t, zombie, "ws1") == 0; }));
+    BrokerNode& z = t.node(zombie);
+    const auto cut = std::chrono::steady_clock::now();
+    z.partitionFromPeersForTest(true);
+    // Probe the zombie from another thread on its own wire client while the majority DISABLEs ws1.
+    std::atomic<bool> stop{false};
+    std::atomic<int64_t> lastAcceptMs{-1};
+    std::thread probe([&] {
+        AuthWireClient w(t.cluster().clientsDir->path / "adv_probe_wire");
+        while (!stop.load()) {
+            const int64_t sid = w.connect(t.channel(zombie));
+            if (sid > 0 && w.login(t.channel(zombie), sid, "ws1", {AuthTrio::kPw, AuthTrio::kPw}).errorCode() == 0)
+                lastAcceptMs.store(msSince(cut));
+        }
+    });
+    int64_t disabledMs = -1;
+    {
+        const auto a = t.ddl(other, [](AuthWireClient& w, const std::string& ch, int64_t sid) {
+            return w.alterPassword(ch, sid, "ws1", pc::UserChangeKind::Disable, "");
+        }, 60s);
+        disabledMs = msSince(cut);
+        ASSERT_TRUE(a.errorCode == 0 || a.detail.find("already disabled") != std::string::npos);
+    }
+    EXPECT_TRUE(AuthTrio::until(20s, [&] { return z.securityServingForTest() == "Stale"; }));
+    std::this_thread::sleep_for(500ms);   // observation window: a state that must not change
+    stop.store(true);
+    probe.join();
+    const int64_t last = lastAcceptMs.load();
+    std::fprintf(stderr, "ADV zombie bound: F=%lld ms liveness=%lld ms, DISABLE committed at %lld ms, last accepted login at %lld ms\n",
+                 (long long)b.fMs, (long long)b.livenessMs, (long long)disabledMs, (long long)last);
+    EXPECT_LE(last, disabledMs + b.fMs) << "a login of the DISABLEd user more than F after the cluster committed it";
+    EXPECT_LE(last, b.fMs + b.livenessMs + 1'000) << "the zombie served longer than F + liveness after it lost its peers";
+}
+
+// A normal failover: the `__security` leader crashes; the survivors must keep serving logins throughout (F exceeds the
+// liveness timeout so that this never makes a healthy broker stale - SECURITY.md, NodeConfig).
+TEST(AuthRestartAdversarialRegression, ASecurityLeaderCrashNeverMakesTheSurvivorsStaleAdversarialRegression) {
+    AuthTrio t("advleadercrash");
+    ServingBounds b;
+    captureBounds(t, b);
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1");
+    const int32_t leader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(leader, 0);
+    std::vector<int> survivors;
+    for (int id : {1, 2, 3}) if (id != leader) survivors.push_back(id);
+    for (int id : survivors) ASSERT_TRUE(AuthTrio::until(30s, [&] { return t.node(id).securityServingForTest() == "Serving"; }));
+    t.node(leader).crashForTest();
+    t.stopNode(leader);
+    const auto crashed = std::chrono::steady_clock::now();
+    std::map<int, std::string> lapses;
+    bool newLeader = false;
+    while (msSince(crashed) < 20'000) {
+        for (int id : survivors) {
+            const std::string s = t.node(id).securityServingForTest();
+            if (s != "Serving" && lapses[id].empty()) lapses[id] = s + " at " + std::to_string(msSince(crashed)) + " ms";
+        }
+        if (!newLeader) { const int32_t l = settledSecurityLeader(t.cluster()); newLeader = l > 0 && l != leader; }
+        std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_TRUE(newLeader) << "a new __security leader";
+    for (int id : survivors)
+        EXPECT_TRUE(lapses[id].empty()) << "survivor " << id << " stopped serving logins during a normal failover: " << lapses[id]
+                                        << " (F=" << b.fMs << " ms, liveness=" << b.livenessMs << " ms)";
+}
+
+// A restart with no seam at all: node 3 comes back after ws1 was DISABLEd while it was down, and is hammered with ws1's
+// old password from the first moment its client endpoint answers.  Not one login may succeed.
+TEST(AuthRestartAdversarialRegression, ARestartedBrokerHammeredFromBootNeverAcceptsADisabledUserAdversarialRegression) {
+    AuthTrio t("advrestarthammer");
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1");
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return loginCode(t, 3, "ws1") == 0; }));
+    t.stopNode(3);
+    t.mustOk(t.ddl(1, [](AuthWireClient& w, const std::string& ch, int64_t sid) {
+        return w.alterPassword(ch, sid, "ws1", pc::UserChangeKind::Disable, "");
+    }), "ALTER USER ws1 DISABLE");
+    std::atomic<bool> stop{false};
+    std::atomic<int> accepted{0}, answered{0}, unavailable{0};
+    std::thread probe;
+    t.cluster().beforeStart = [&](int id, BrokerNode&) {
+        if (id != 3) return;
+        probe = std::thread([&] {   // starts BEFORE node 3's start(): probes from its very first answer
+            AuthWireClient w(t.cluster().clientsDir->path / "adv_probe_wire");
+            while (!stop.load()) {
+                const int64_t sid = w.connect(t.channel(3));
+                if (sid <= 0) continue;
+                const uint16_t code = w.login(t.channel(3), sid, "ws1", {AuthTrio::kPw, AuthTrio::kPw}).errorCode();
+                if (code == 0xFFFF) continue;
+                ++answered;
+                if (code == 0) ++accepted;
+                if (code == 48) ++unavailable;
+            }
+        });
+    };
+    t.restart(3, t.keyContentsPath(3));
+    t.cluster().beforeStart = nullptr;
+    EXPECT_TRUE(AuthTrio::until(60s, [&] { return t.node(3).securityServingForTest() == "Serving"; }));
+    std::this_thread::sleep_for(1s);
+    stop.store(true);
+    probe.join();
+    std::fprintf(stderr, "ADV restart hammer: %d answered, %d AuthUnavailable, %d accepted\n", answered.load(),
+                 unavailable.load(), accepted.load());
+    EXPECT_GT(answered.load(), 0);
+    EXPECT_EQ(accepted.load(), 0) << "the restarted broker accepted the DISABLEd user's old password";
+}
+
+// The healed zombie again, with its applier slow (held from just before the heal: a long partition leaves it many
+// events to fetch and apply).  Demoted, it must re-earn the verdict as a follower - caught up with its new leader and
+// every committed record applied - before it serves a login; its leader-era "contact" says nothing about the cluster.
+TEST(AuthRestartAdversarialRegression, AHealedZombieWithASlowApplierNeverServesTheDisabledUserAdversarialRegression) {
+    AuthTrio t("advzombieslow");
+    ServingBounds b;
+    captureBounds(t, b);
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1");
+    const int32_t zombie = settledSecurityLeader(t.cluster());
+    ASSERT_GT(zombie, 0);
+    const int other = zombie == 1 ? 2 : 1;
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return loginCode(t, zombie, "ws1") == 0; }));
+    BrokerNode& z = t.node(zombie);
+    z.partitionFromPeersForTest(true);
+    {
+        const auto a = t.ddl(other, [](AuthWireClient& w, const std::string& ch, int64_t sid) {
+            return w.alterPassword(ch, sid, "ws1", pc::UserChangeKind::Disable, "");
+        }, 60s);
+        ASSERT_TRUE(a.errorCode == 0 || a.detail.find("already disabled") != std::string::npos)
+            << "ALTER USER ws1 DISABLE (majority): " << a.errorCode << " " << a.detail;
+    }
+    ASSERT_TRUE(AuthTrio::until(15s, [&] { return z.securityServingForTest() == "Stale"; }));
+    z.holdSecurityApplyForTest(true);
+    z.partitionFromPeersForTest(false);
+    const auto healed = std::chrono::steady_clock::now();
+    int accepted = 0, attempts = 0;
+    std::string firstAccept;
+    while (msSince(healed) < 3 * b.fMs) {
+        const uint16_t code = loginCode(t, zombie, "ws1");
+        ++attempts;
+        if (code == 0 && accepted++ == 0)
+            firstAccept = std::to_string(msSince(healed)) + " ms after the heal (state " + z.securityServingForTest() + ")";
+    }
+    EXPECT_EQ(accepted, 0) << "the healed ex-leader, its DISABLE not applied yet, accepted the DISABLEd user's password "
+                           << accepted << " of " << attempts << " times, first " << firstAccept << " (F=" << b.fMs << " ms)";
+    z.holdSecurityApplyForTest(false);
+    EXPECT_TRUE(AuthTrio::until(60s, [&] { return loginCode(t, zombie, "ws1") == 44; })) << "then judged disabled";
 }

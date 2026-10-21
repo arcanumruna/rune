@@ -43,7 +43,7 @@ on a command line or in the environment.
   `AuthenticationFailed`; `ClientConfig::allowUnauthenticatedBroker = true` opts out.
 - The `ConnectResponse` carries `authMode` and `authState`; a resumed session keeps its authentication.
 
-## 3. New error codes 44 to 47
+## 3. New error codes 44 to 48
 
 | Code | Name | Meaning |
 |---|---|---|
@@ -51,6 +51,7 @@ on a command line or in the environment.
 | 45 | `NotAuthorized` | The operation is not granted, or the object is not visible. Fails exactly that request. A revoked `READ` ends the subscription with it. |
 | 46 | `SessionRevoked` | The user was dropped or disabled, or `TERMINATE SESSIONS` ran. Terminal for the session. |
 | 47 | `PasswordChangeRequired` | The first login with the one-time password; every request except `ALTER USER ... SET PASSWORD` answers it. |
+| 48 | `AuthUnavailable` | This broker's `__security` state is not current (catching up after a start, or stale: cut off its leader or the consensus). Retriable: the client backs off and tries another broker. As a session-level notice: the broker stayed stale too long and ended the session. |
 
 ## 4. Breaking: inter-broker frames are encrypted
 

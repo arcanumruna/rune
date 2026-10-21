@@ -56,6 +56,7 @@ public:
         TOPIC_DROPPED = static_cast<std::uint8_t>(20),
         SESSION_PERMISSIONS = static_cast<std::uint8_t>(21),
         PEER_LINK_KEYS = static_cast<std::uint8_t>(22),
+        ENFORCE_FENCE = static_cast<std::uint8_t>(23),
         TEST_TASK = static_cast<std::uint8_t>(200),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
@@ -87,6 +88,7 @@ public:
             case static_cast<std::uint8_t>(20): return TOPIC_DROPPED;
             case static_cast<std::uint8_t>(21): return SESSION_PERMISSIONS;
             case static_cast<std::uint8_t>(22): return PEER_LINK_KEYS;
+            case static_cast<std::uint8_t>(23): return ENFORCE_FENCE;
             case static_cast<std::uint8_t>(200): return TEST_TASK;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
@@ -121,6 +123,7 @@ public:
             case TOPIC_DROPPED: return "TOPIC_DROPPED";
             case SESSION_PERMISSIONS: return "SESSION_PERMISSIONS";
             case PEER_LINK_KEYS: return "PEER_LINK_KEYS";
+            case ENFORCE_FENCE: return "ENFORCE_FENCE";
             case TEST_TASK: return "TEST_TASK";
             case NULL_VALUE: return "NULL_VALUE";
         }

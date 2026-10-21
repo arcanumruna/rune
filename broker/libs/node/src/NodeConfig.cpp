@@ -257,6 +257,22 @@ std::optional<std::string> NodeConfig::validateStreamRanges() const {
 }
 
 // ---------------------------------------------------------------------------
+// NodeConfig::validateSecurityServing  (issues #15 / #111 / #120, decision M7)
+// ---------------------------------------------------------------------------
+std::optional<std::string> NodeConfig::validateSecurityServing(bool stalenessExplicit, bool sessionEndExplicit) const {
+    const int64_t liveness = effectiveBrokerLivenessMs();
+    if (stalenessExplicit && securityMaxStalenessMs <= liveness + 500)
+        return "RUNE_SECURITY_MAX_STALENESS_MS (" + std::to_string(securityMaxStalenessMs) +
+               ") must exceed the broker liveness timeout + 500 ms (" + std::to_string(liveness + 500) +
+               "): otherwise a leadership move makes healthy brokers refuse logins until the new leader answers";
+    if (sessionEndExplicit && securityStaleSessionEndMs <= effectiveSecurityMaxStalenessMs())
+        return "RUNE_SECURITY_STALE_SESSION_END_MS (" + std::to_string(securityStaleSessionEndMs) +
+               ") must exceed RUNE_SECURITY_MAX_STALENESS_MS (" + std::to_string(effectiveSecurityMaxStalenessMs()) + ")";
+    if (securityGateDeadlineMs <= 0) return "RUNE_SECURITY_GATE_DEADLINE_MS must be positive";
+    return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
 // NodeConfig::validateCatalogStream  (catalog history Task 6)
 // ---------------------------------------------------------------------------
 std::optional<std::string> NodeConfig::validateCatalogStream() const {
@@ -912,6 +928,23 @@ ConfigResult parseNodeConfig(
             return {{}, std::string("RUNE_AUTH_TIMEOUT_MS must be a positive integer (ms), got: ") + raw};
         cfg.authTimeoutMs = v;
     }
+    // Issues #15 / #111 / #120: the security serving bounds (validated together, last, below).
+    bool securityStalenessSet = false, securitySessionEndSet = false;
+    {
+        struct Knob { const char* name; int64_t* field; bool* set; };
+        const Knob knobs[] = {{"RUNE_SECURITY_MAX_STALENESS_MS", &cfg.securityMaxStalenessMs, &securityStalenessSet},
+                              {"RUNE_SECURITY_STALE_SESSION_END_MS", &cfg.securityStaleSessionEndMs, &securitySessionEndSet},
+                              {"RUNE_SECURITY_GATE_DEADLINE_MS", &cfg.securityGateDeadlineMs, nullptr}};
+        for (const Knob& k : knobs) {
+            if (const char* raw = getenv_fn(k.name); raw && *raw) {
+                int64_t v = 0;
+                if (!parseInt64Positive(raw, v))
+                    return {{}, std::string(k.name) + " must be a positive integer (ms), got: " + raw};
+                *k.field = v;
+                if (k.set != nullptr) *k.set = true;
+            }
+        }
+    }
     if (const char* raw = getenv_fn("RUNE_PEER_AUTH_STREAM_ID"); raw && *raw) {
         int32_t v = 0;
         if (!parseInt32(raw, v) || v < 1)
@@ -1438,6 +1471,7 @@ ConfigResult parseNodeConfig(
     if (cfg.authMode == AuthMode::DevDisabled && cfg.peers.size() > 1)
         return {{}, "RUNE_AUTH=disabled (dev mode) refuses to start as part of a multi-broker cluster (RUNE_PEERS lists " +
                         std::to_string(cfg.peers.size()) + " brokers); enable authentication"};
+    if (auto err = cfg.validateSecurityServing(securityStalenessSet, securitySessionEndSet)) return {{}, *err};
     if (cfg.authMode == AuthMode::Enabled && cfg.clusterKeyFile.empty())
         return {{}, "RUNE_CLUSTER_KEY_FILE is required when authentication is enabled (RUNE_AUTH unset or 'enabled'): "
                     "point it at the shared cluster key file (generate one with `rune security gen-cluster-key`), or set "

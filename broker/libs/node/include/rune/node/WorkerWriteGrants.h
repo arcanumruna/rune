@@ -54,6 +54,10 @@ inline constexpr uint8_t kPermFlagTable    = 0x04;   ///< issue #259: the varian
 inline constexpr uint8_t kPermFlagPatch    = 0x08;
 inline constexpr uint8_t kPermFlagBind     = 0x10;
 inline constexpr uint8_t kPermFlagDrop     = 0x20;
+/// Issue #196: an enforcement fence on the session-lifecycle ring (correlationId = the fence sequence number): the
+/// worker answers SessionSignal FenceAck{sessionId 1} - every permission item, bind and SessionClose queued before it
+/// on this ring is installed.  Carries no table.
+inline constexpr uint8_t kPermFlagFence    = 0x40;
 /// The worker's table store bound (== gateway PermissionPool::kMaxTables).
 inline constexpr std::size_t kMaxWritePermTables = 4096;
 

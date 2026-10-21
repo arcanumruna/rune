@@ -194,7 +194,13 @@ enum class ErrorCode : uint16_t {
     SessionRevoked         = 46,  // client version 9: the session's user was dropped / disabled /
                                   // terminated; terminal (corr 0 = the session-level notice)
     PasswordChangeRequired = 47,  // client version 9: a one-time-password session may only change its password
-    // 48 is reserved for AuthUnavailable (combined auth fix programme, decision M7).
+    AuthUnavailable        = 48,  // issues #15 / #111 (decision M7): this broker's `__security` state is not provably
+                                  // current (catching up after a boot / wipe, partitioned from the leader or the
+                                  // consensus): it serves no login, no `__security` read and no security DDL.  On an
+                                  // AuthServerFinal / DdlResponse / SubscribeResponse: RETRIABLE - back off and try
+                                  // another broker (rotate seeds).  As the session-level ErrorResponse (corr 0): the
+                                  // broker stayed stale too long and ended the session - reconnect elsewhere.  Sent to
+                                  // every client version (an older client treats it as a retriable connect failure).
     RecordEgressUnavailable = 49, // issue #118 / PR #441: an authenticating broker could not build the session's own
                                   // record-egress stream for the partition's worker (it never falls back to the shared
                                   // one).  Answered as SubscribeResponse.errorCode on the still-pending Subscribe (its

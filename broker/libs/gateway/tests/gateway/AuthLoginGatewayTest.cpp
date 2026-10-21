@@ -824,3 +824,237 @@ TEST(AuthLoginRegression, TheSecurityDdlTrailerUnderVersionSkewAndGarbageAdversa
     rig.send(f);
     EXPECT_EQ(rig.admin.securityDdls, 1) << "a valid proof with FORCE set goes through";
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Issues #15 / #111 (decision M7): an authenticating broker whose `__security` state is not provably current (booting,
+// wiped, new, partitioned) serves no login, `__security` read or security DDL: the retriable AuthUnavailable (48).
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+/// The chain as it stood BEFORE ws1 was disabled (a broker that was down while the DISABLE committed).
+SecurityEventChain chainBeforeDisable() {
+    namespace sec = rune::security;
+    SecurityEventChain c;
+    sec::BootstrapOps b; b.verifier = scramVerifierOf(kTestAdminPassword, 9); b.fakeSaltSeed.fill(0x42);
+    (void)c.emit(b, "admin", "BOOTSTRAP", "bootstrap");
+    (void)c.emit(sec::CreateUserOps{scramVerifierOf(kTestPasswordA, 1)}, "ws1", "CREATE USER ws1 WITH PASSWORD '<redacted>';");
+    return c;
+}
+}  // namespace
+
+// Issue #15 (RED before the fix: the restarted broker verified the login against its stale local state - the user's
+// old password logged in although the cluster had disabled the user).  Not current: AuthServerFinal{48} and the end of
+// the session (never the terminal 44: the credentials may be fine); once current the login is judged normally.
+TEST(AuthRestartRegression, ARestartedBrokerNeverAcceptsADisabledUsersOldPasswordRegression) {
+    Rig rig(chainBeforeDisable());
+    rig.gw.setSecurityServing(false);   // what BrokerNode sets at boot, until the admin thread vouches
+    const auto o = rig.login("ws1", {kTestPasswordA, ""});
+    ASSERT_TRUE(o.fin.has_value());
+    EXPECT_EQ(o.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable)) << "never verified against a stale view";
+    EXPECT_TRUE(o.fin->serverSignature.empty());
+    EXPECT_FALSE(rig.gw.hasSessionForTest(o.sid)) << "the session is ended; the client retries elsewhere";
+    EXPECT_EQ(rig.gw.loginsOk(), 0u);
+    EXPECT_EQ(rig.gw.loginsUnavailable(), 1u);
+    EXPECT_EQ(rig.gw.loginsFailed(), 0u) << "not a failed login (no throttle charge)";
+    EXPECT_TRUE(rig.logContains("reason=security-not-current"));
+    // Caught up: the view now holds the DISABLE (applied before the verdict, same FIFO) - the old password is refused.
+    const auto dis = rig.chain.emit(rune::security::AlterUserOps{rune::security::DisableUser{}}, "ws1", "ALTER USER ws1 DISABLE;");
+    ASSERT_TRUE(rig.view.onApplied(static_cast<int64_t>(rig.chain.count()) - 1, *rune::security::encode(dis)).has_value());
+    rig.gw.setSecurityServing(true);
+    const auto after = rig.login("ws1", {kTestPasswordA, ""});
+    ASSERT_TRUE(after.fin.has_value());
+    EXPECT_EQ(after.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+}
+
+TEST(AuthRestartRegression, AWipedBrokerAnswersRetriableUntilCaughtUpRegression) {
+    Rig rig;
+    rig.gw.setSecurityServing(false);
+    for (int i = 0; i < 3; ++i) {
+        const auto o = rig.login("ws1", {kTestPasswordA, ""});
+        ASSERT_TRUE(o.fin.has_value());
+        EXPECT_EQ(o.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable)) << i;
+    }
+    // The view went stale BETWEEN the legs: the final leg is refused the same way.
+    rig.gw.setSecurityServing(true);
+    const int64_t sid = rig.newSession();
+    pc::AuthClientFirst cf;
+    cf.sessionId = sid; cf.correlationId = 901; cf.username = "ws1"; cf.clientNonce = "nonce-901";
+    std::vector<uint8_t> b(cf.encodedSize()); b.resize(cf.encode(b.data()));
+    rig.send(b);
+    const Frame* f1 = rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFirst), sid);
+    ASSERT_NE(f1, nullptr);
+    const auto first = pc::AuthServerFirst::decode(f1->bytes.data(), f1->bytes.size());
+    auto ans = scramAnswer("ws1", "nonce-901", *first, {kTestPasswordA, ""}, sid, 902);
+    rig.gw.setSecurityServing(false);
+    std::vector<uint8_t> fb(ans->final.encodedSize()); fb.resize(ans->final.encode(fb.data()));
+    rig.send(fb);
+    const Frame* fin = rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), sid);
+    ASSERT_NE(fin, nullptr);
+    EXPECT_EQ(pc::AuthServerFinal::decode(fin->bytes.data(), fin->bytes.size())->errorCode,
+              static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable));
+    // Current again: the same password logs in.
+    rig.gw.setSecurityServing(true);
+    const auto ok = rig.login("ws1", {kTestPasswordA, ""});
+    ASSERT_TRUE(ok.fin.has_value());
+    EXPECT_EQ(ok.fin->errorCode, 0);
+}
+
+// Issue #15 (M8): a new / wiped broker's replica is empty - it must not tell a Connect "Anonymous" (the bootstrap window
+// of a fresh cluster) while it is not current: the cluster may have been bootstrapped long ago.
+TEST(AuthRestartRegression, ANewBrokerNeverAdvertisesTheBootstrapWindowRegression) {
+    Rig rig;
+    SecurityView empty{rune::security::SecurityState{}};
+    rig.gw.setAuthMode(GatewayAuthMode::Required, &empty);
+    rig.gw.setSecurityServing(false);
+    EXPECT_EQ(rig.gw.connectAuthStateForTest(), pc::AuthState::MustAuthenticate) << "not current: never Anonymous";
+    rig.gw.setSecurityServing(true);
+    EXPECT_EQ(rig.gw.connectAuthStateForTest(), pc::AuthState::Anonymous) << "a current, never-bootstrapped cluster";
+}
+
+// Issue #111: a broker stale for longer than R ends its authenticated sessions retriably (session-level 48), so their
+// clients move to a current broker; a session still logging in is not authenticated and is left to its own deadline.
+TEST(AuthRestartRegression, AStaleBrokerEndsItsAuthenticatedSessionsRetriablyRegression) {
+    Rig rig;
+    const auto a = rig.login("ws1", {kTestPasswordA, ""});
+    const auto b = rig.login("ws2", {kTestPasswordA, ""});
+    ASSERT_EQ(a.fin->errorCode, 0);
+    ASSERT_EQ(b.fin->errorCode, 0);
+    const int64_t pending = rig.newSession();
+    rig.gw.setSecurityServing(false);
+    EXPECT_TRUE(rig.gw.hasSessionForTest(a.sid)) << "stale but within R: authenticated sessions keep working";
+    rig.gw.endSessionsSecurityUnavailable();
+    for (const int64_t sid : {a.sid, b.sid}) {
+        EXPECT_FALSE(rig.gw.hasSessionForTest(sid));
+        const Frame* e = rig.last(static_cast<uint16_t>(pc::TemplateId::ErrorResponse), sid);
+        ASSERT_NE(e, nullptr) << sid;
+        const auto er = pc::ErrorResponse::decode(e->bytes.data(), e->bytes.size());
+        EXPECT_EQ(er->correlationId, 0) << "session level";
+        EXPECT_EQ(er->code, static_cast<int16_t>(pc::ErrorCode::AuthUnavailable));
+    }
+    EXPECT_TRUE(rig.gw.hasSessionForTest(pending));
+    EXPECT_EQ(rig.gw.sessionsEndedUnavailable(), 2u);
+    EXPECT_EQ(rig.gw.sessionsRevoked(), 0u) << "not a revocation (46 is terminal for the client)";
+}
+
+// Issue #111: while not current, security DDL / bootstrap and `__security` reads answer 48 too - none is built on (or
+// served from) a stale state; DDL that does not touch `__security` is not affected.
+TEST(AuthRestartRegression, SecurityDdlAndSecurityReadsAnswerAuthUnavailableWhileNotCurrentRegression) {
+    Rig rig;
+    struct { int64_t sid; } admin{rig.newSession()};
+    rig.gw.setSessionAuthForTest(admin.sid, AuthAuthenticated{1, "admin", PermissionTable::allowAll(), "nonce"});
+    rig.gw.setSecurityServing(false);
+    pc::SecurityDdl m;
+    m.sessionId = admin.sid; m.correlationId = 77; m.ext.clientName = "t"; m.ext.requestId = {1, 77};
+    m.kind = pc::SecurityOpKind::CreateRole; m.name = "r";
+    std::vector<uint8_t> b(m.encodedSize()); b.resize(m.encode(b.data()));
+    rig.send(b);
+    EXPECT_EQ(rig.admin.securityDdls, 0) << "never forwarded";
+    const Frame* d = rig.last(static_cast<uint16_t>(pc::TemplateId::DdlResponse), admin.sid);
+    ASSERT_NE(d, nullptr);
+    EXPECT_EQ(pc::DdlResponse::decode(d->bytes.data(), d->bytes.size())->errorCode,
+              static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable));
+    pc::Subscribe s;
+    s.sessionId = admin.sid; s.correlationId = 78; s.topicId = -7; s.partition = 0; s.partitionKnown = 1; s.fromOffset = 0;
+    std::vector<uint8_t> sb(s.encodedSize()); sb.resize(s.encode(sb.data()));
+    rig.send(sb);
+    const Frame* r = rig.last(static_cast<uint16_t>(pc::TemplateId::SubscribeResponse), admin.sid);
+    ASSERT_NE(r, nullptr);
+    EXPECT_EQ(pc::SubscribeResponse::decode(r->bytes.data(), r->bytes.size())->errorCode,
+              static_cast<int16_t>(pc::ErrorCode::AuthUnavailable));
+    rig.gw.setSecurityServing(true);
+    rig.send(b);
+    EXPECT_EQ(rig.admin.securityDdls, 1) << "current again: forwarded";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Adversarial review of PR #459 (issues #15 / #111): sibling entry points to a login or a credential change while the
+// broker is not current, and the protocol state around the 48.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// Protocol state: a first leg answered 48 ended the session; a final leg replayed on that session id afterwards - even
+// once the broker is current again - logs nobody in.  A final leg with no first leg at all is not a login either.
+TEST(AuthRestartRegression, AFinalLegAfterAnUnavailableFirstLegNeverLogsInAdversarialRegression) {
+    Rig rig;
+    // The proof a real client would send, prepared on a CURRENT broker for a session that then goes away.
+    const int64_t probe = rig.newSession();
+    pc::AuthClientFirst cf;
+    cf.sessionId = probe; cf.correlationId = 950; cf.username = "ws1"; cf.clientNonce = "nonce-950";
+    std::vector<uint8_t> b(cf.encodedSize()); b.resize(cf.encode(b.data()));
+    rig.send(b);
+    const Frame* f1 = rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFirst), probe);
+    ASSERT_NE(f1, nullptr);
+    auto ans = scramAnswer("ws1", "nonce-950", *pc::AuthServerFirst::decode(f1->bytes.data(), f1->bytes.size()),
+                           {kTestPasswordA, ""}, probe, 951);
+    ASSERT_TRUE(ans.has_value());
+    // Not current: the first leg of the SAME session id is answered 48 and the session ends.
+    rig.gw.setSecurityServing(false);
+    rig.send(b);
+    EXPECT_FALSE(rig.gw.hasSessionForTest(probe));
+    // Current again: the prepared final leg arrives on the ended session - nothing logs in.
+    rig.gw.setSecurityServing(true);
+    std::vector<uint8_t> fb(ans->final.encodedSize()); fb.resize(ans->final.encode(fb.data()));
+    rig.send(fb);
+    for (const Frame& x : rig.seen)
+        if (x.tid == static_cast<uint16_t>(pc::TemplateId::AuthServerFinal) && x.sid == probe)
+            EXPECT_NE(pc::AuthServerFinal::decode(x.bytes.data(), x.bytes.size())->errorCode, 0) << "no login on an ended session";
+    EXPECT_EQ(rig.gw.loginsOk(), 0u);
+    // A final leg with no first leg on a fresh session, not current: never an OK either.
+    rig.gw.setSecurityServing(false);
+    const int64_t fresh = rig.newSession();
+    ans->final.sessionId = fresh;
+    std::vector<uint8_t> fb2(ans->final.encodedSize()); fb2.resize(ans->final.encode(fb2.data()));
+    rig.send(fb2);
+    EXPECT_EQ(rig.gw.loginsOk(), 0u);
+}
+
+// Escalation through a sibling op: while not current, a session's own credential changes - the must-change session's
+// ALTER USER <self> SET PASSWORD (proven with the one-time password) and an authenticated user's own ADD PASSWORD
+// (proven, #114) - are security DDL built on the stale view: 48, never forwarded, and the sessions stay.
+TEST(AuthRestartRegression, OwnCredentialChangesAnswerAuthUnavailableWhileNotCurrentAdversarialRegression) {
+    Rig rig;
+    const auto mc = rig.login("admin", {kTestAdminPassword, ""});
+    ASSERT_TRUE(mc.fin.has_value());
+    ASSERT_TRUE(std::holds_alternative<AuthPasswordChangeRequired>(*rig.gw.sessionAuthForTest(mc.sid)));
+    const auto a = rig.login("ws1", {kTestPasswordA, ""});
+    ASSERT_EQ(a.fin->errorCode, 0);
+    rig.gw.setSecurityServing(false);
+    rig.send(alterUserFrame(mc.sid, 990, "admin", pc::UserChangeKind::SetPassword, &mc));
+    rig.send(alterUserFrame(a.sid, 991, "ws1", pc::UserChangeKind::AddPassword, &a));
+    EXPECT_EQ(rig.admin.securityDdls, 0) << "never forwarded while not current";
+    for (const int64_t c : {990, 991}) {
+        const Frame* f = nullptr;
+        for (const Frame& x : rig.seen) if (x.corr == c) f = &x;
+        ASSERT_NE(f, nullptr) << c << ": answered, never hung";
+        EXPECT_EQ(pc::DdlResponse::decode(f->bytes.data(), f->bytes.size())->errorCode,
+                  static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable)) << c;
+    }
+    EXPECT_TRUE(rig.gw.hasSessionForTest(mc.sid));
+    EXPECT_TRUE(rig.gw.hasSessionForTest(a.sid));
+    EXPECT_EQ(rig.gw.loginsFailed(), 0u) << "a 48 is not a failed proof (no throttle charge)";
+    rig.gw.setSecurityServing(true);
+    rig.send(alterUserFrame(mc.sid, 992, "admin", pc::UserChangeKind::SetPassword, &mc));
+    EXPECT_EQ(rig.admin.securityDdls, 1) << "current again: the proven change is forwarded";
+}
+
+// Ending the sessions after R twice (a second stale episode, or a repeated call) is idempotent: every session is told
+// once, and a session that logs in between the two is ended only by the second.
+TEST(AuthRestartRegression, EndingStaleSessionsTwiceTellsEachSessionOnceAdversarialRegression) {
+    Rig rig;
+    const auto a = rig.login("ws1", {kTestPasswordA, ""});
+    ASSERT_EQ(a.fin->errorCode, 0);
+    rig.gw.setSecurityServing(false);
+    rig.gw.endSessionsSecurityUnavailable();
+    rig.gw.setSecurityServing(true);
+    const auto b = rig.login("ws2", {kTestPasswordA, ""});
+    ASSERT_EQ(b.fin->errorCode, 0);
+    rig.gw.setSecurityServing(false);
+    rig.gw.endSessionsSecurityUnavailable();
+    auto endsOf = [&](int64_t sid) {
+        int n = 0;
+        for (const Frame& x : rig.seen)
+            if (x.tid == static_cast<uint16_t>(pc::TemplateId::ErrorResponse) && x.sid == sid && x.corr == 0) ++n;
+        return n;
+    };
+    EXPECT_EQ(endsOf(a.sid), 1);
+    EXPECT_EQ(endsOf(b.sid), 1);
+    EXPECT_EQ(rig.gw.sessionsEndedUnavailable(), 2u);
+}
