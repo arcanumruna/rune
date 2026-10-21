@@ -194,6 +194,12 @@ enum class ErrorCode : uint16_t {
     SessionRevoked         = 46,  // client version 9: the session's user was dropped / disabled /
                                   // terminated; terminal (corr 0 = the session-level notice)
     PasswordChangeRequired = 47,  // client version 9: a one-time-password session may only change its password
+    // 48 is reserved for AuthUnavailable (combined auth fix programme, decision M7).
+    RecordEgressUnavailable = 49, // issue #118 / PR #441: an authenticating broker could not build the session's own
+                                  // record-egress stream for the partition's worker (it never falls back to the shared
+                                  // one).  Answered as SubscribeResponse.errorCode on the still-pending Subscribe (its
+                                  // OK is held until the egress exists).  RETRIABLE a few times (the client's small
+                                  // per-subscription budget, reset by a bind), then a terminal, explicit failure.
 };
 
 // ---------------------------------------------------------------------------

@@ -454,6 +454,13 @@ struct AuthRigEgress : Rig {
             const auto hdr = pc::MessageHeader::decode(b, n);
             if (hdr && hdr->templateId == static_cast<uint16_t>(pc::TemplateId::ErrorResponse))
                 if (auto e = pc::ErrorResponse::decode(b, n)) errors.push_back(*e);
+            if (hdr && hdr->templateId == static_cast<uint16_t>(pc::TemplateId::SubscribeResponse))   // PR #441 F4
+                if (auto sr = pc::SubscribeResponse::decode(b, n); sr && sr->errorCode != 0) {
+                    pc::ErrorResponse e;
+                    e.correlationId = sr->correlationId;
+                    e.code          = sr->errorCode;
+                    errors.push_back(e);
+                }
         });
         gw.setAuthMode(GatewayAuthMode::Required, nullptr);
     }
@@ -490,7 +497,7 @@ TEST(AuthEnforcementRegression, NoRecordIsEverBroadcastToAnUnauthorizedSubscribe
     }
     EXPECT_FALSE(AuthRigEgress::anyCursorWithoutItsOwnEgress(w)) << "a cursor on the shared MDC egress broadcasts";
     EXPECT_TRUE(w.subscriptionsForTest().empty());
-    EXPECT_EQ(r.errorOn(77), static_cast<int>(pc::ErrorCode::NotLeader))
+    EXPECT_EQ(r.errorOn(77), static_cast<int>(pc::ErrorCode::RecordEgressUnavailable))
         << "the subscription is retired retriably on its correlation id, never left silent";
     EXPECT_EQ(r.gw.subscriptionCount(), 0u) << "the gateway holds no subscription it cannot serve";
 }
@@ -626,7 +633,10 @@ struct AnswerLog : Rig {
     }
     [[nodiscard]] bool refused(int64_t corr) const {
         for (const auto& a : answers)
-            if (a.isError && a.corr == corr && a.code == static_cast<int>(pc::ErrorCode::NotLeader)) return true;
+            if ((a.isError && a.corr == corr && a.code == static_cast<int>(pc::ErrorCode::NotLeader)) ||
+                (!a.isError && a.corr == corr &&
+                 a.code == static_cast<int>(pc::ErrorCode::RecordEgressUnavailable)))   // F4: the held Subscribe's own cause
+                return true;
         return false;
     }
 };
@@ -737,4 +747,49 @@ TEST(AuthEnforcementAdversarialRegression, AnExistingCursorReSubscribedWithoutEg
     r.gw.closeSessionForTest(a);
     w.doWork(3);
     r.gw.drainWorkerReturnsForTest(4);
+}
+
+// PR #441 re-check adversarial (the held OK): while a Subscribe's OK is held for its egress, a duplicate of it gets no
+// early OK; the resolve sends exactly ONE OK and hands the worker the session's own pub; the stale failed-resolve entry
+// that follows never retires the now-served subscription (no NotLeader after an OK).
+TEST(AuthEnforcementAdversarialRegression, AHeldOkIsSentOnceOnTheResolveAndNeverFollowedByARefusalAdversarialRegression) {
+    AnswerLog r;
+    FakePub pub;
+    auto& w = r.pool.worker(r.owner(0));
+    const int64_t sid = r.authenticated();
+    r.subscribeCorr(sid, 77);
+    r.subscribeCorr(sid, 77);   // a client resend while the OK is held
+    EXPECT_EQ(r.okSubId(77), 0) << "no OK before the egress exists";
+    EXPECT_FALSE(r.refused(77));
+    const int64_t subId = r.gw.subscriptionIdOfCorrForTest(sid, 77);
+    ASSERT_NE(subId, 0);
+    r.gw.resolveRecordEgressForTest(sid, r.owner(0), pub.make(), subId, 0, 0);
+    int oks = 0;
+    for (const auto& a : r.answers) oks += !a.isError && a.corr == 77 && a.code == 0 ? 1 : 0;
+    EXPECT_EQ(oks, 1) << "exactly one OK";
+    EXPECT_EQ(r.okSubId(77), subId);
+    for (int p = 0; p < 4; ++p) r.cycle(1 + p);
+    EXPECT_FALSE(r.refused(77)) << "never a NotLeader after the OK (that was the fresh-budget move loop)";
+    ASSERT_EQ(w.subscriptionsForTest().size(), 1u);
+    EXPECT_EQ(w.subscriptionsForTest()[0].egressPub, pub.ptr());
+    r.gw.closeSessionForTest(sid);
+    w.doWork(10);
+    r.gw.drainWorkerReturnsForTest(11);
+}
+
+// Many held Subscribes of one session whose egress never resolves: each is refused once (NotLeader, never an OK) and
+// nothing is left held - the held state is bounded by the resolve timeout, never accumulates.
+TEST(AuthEnforcementAdversarialRegression, ManyHeldSubscribesAreEachRefusedOnceAndNothingStaysHeldAdversarialRegression) {
+    AnswerLog r;
+    const int64_t sid = r.authenticated();
+    for (int i = 0; i < 200; ++i) r.subscribeCorr(sid, 5000 + i);
+    for (int p = 0; p < 4; ++p) r.cycle(1 + p);
+    for (int i = 0; i < 200; ++i) {
+        EXPECT_EQ(r.okSubId(5000 + i), 0);
+        int refusals = 0;
+        for (const auto& a : r.answers) refusals += a.corr == 5000 + i && (a.isError || a.code != 0) ? 1 : 0;   // F4: SubscribeResponse{49}
+        EXPECT_EQ(refusals, 1) << i;
+    }
+    EXPECT_EQ(r.gw.subscriptionCount(), 0u);
+    EXPECT_EQ(r.gw.pendingRecordEgressCountForTest(), 0u);
 }

@@ -161,6 +161,39 @@ TEST(GroupRoutingRegression, NotLeaderGroupSubscribeConvergesOnMetadataRegressio
     ASSERT_TRUE(r.drive([&] { return led.records[1] == 3; }));
 }
 
+// PR #441 F4, real timing (the client's own metadata pacing, wall clock): partition 1 has no reachable leader for ~5 s
+// - every metadata answer keeps naming the refusing node, which answers each re-subscribe NotLeader.  The member must
+// survive it (routing refusals are unbounded, however many the pacing produces) and bind once a leader appears.
+TEST(GroupRoutingRegression, AFiveSecondLeaderlessPartitionStillBindsWhenALeaderAppearsRegression) {
+    GroupRig r(4195, 4196);
+    const auto [n1, p1port] = r.addNode(4195);
+    r.gw.moreBrokers        = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions         = {{1, 0, 0, 1, 4195, ""}, {1, 1, /*stale*/ 0, 1, 4195, ""}};
+    r.gw.subscribeLeader    = {{0, 0}, {1, n1}};
+    r.gw.subscribeNotLeader = true;
+    r.gw.groupAssignment    = {{1, 0}, {1, 1}};
+
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0 && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribeRefusals >= 1; }));
+    const auto t0 = std::chrono::steady_clock::now();
+    (void)r.drive([&] { return std::chrono::steady_clock::now() - t0 >= std::chrono::seconds(5); }, 50'000'000);
+    const int refusals = r.gw.subscribeRefusals;
+    std::fprintf(stderr, "leaderless 5 s: %d NotLeader refusals of the partition-1 fetch\n", refusals);
+    EXPECT_GT(refusals, 1) << "the client kept re-subscribing during the outage";
+    EXPECT_FALSE(gc.finished()) << "a leaderless partition ended the group consumer";
+
+    r.gw.partitions = {{1, 0, 0, 1, 4195, ""}, {1, 1, 1, 2, 4195, ""}};   // a leader appears: node 1, epoch 2
+    r.gw.sendMetadata(r.gw.groupSessionIds.front(), /*correlationId=*/0);
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; })) << "never bound on the new leader";
+    r.gw.pushRecords(*r.subAt(1, n1), 0, 3);
+    ASSERT_TRUE(r.drive([&] { return led.records[1] == 3; }));
+}
+
 // Leader change: partition 1 moves from node 1 to node 2 (metadata at a newer
 // epoch).  The member must re-subscribe on node 2 FROM ITS POSITION (no gap, no
 // replay of what it already consumed) and unsubscribe the old node-1

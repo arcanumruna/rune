@@ -3970,6 +3970,31 @@ void Client::onEgressFrame(codec::TemplateId tid,
                                                        opt->subscriptionId)) {
             break;
         }
+        // PR #441 F4 (issue #118): RecordEgressUnavailable - the broker could not build this session's own record
+        // stream.  Retried like a pending NotLeader (paced by fresh metadata + backoff) within a small budget of THIS
+        // request, then failed explicitly with the code (onSubscribeResponse below finishes it).
+        if (opt->errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::RecordEgressUnavailable) &&
+            subscriberHub_.isPending(opt->correlationId)) {
+            if (subscriberHub_.chargeNotLeaderRetry(opt->correlationId, kMaxEgressUnavailableRetries)) {
+                if (std::find(redirectedSubscribes_.begin(), redirectedSubscribes_.end(), opt->correlationId) ==
+                    redirectedSubscribes_.end()) {
+                    try {
+                        redirectedSubscribes_.push_back(opt->correlationId);
+                    } catch (...) {
+                        // allocation failure (cold path): it times out explicitly
+                    }
+                }
+                redirectMetaSeen_          = metadataResponses_;
+                nextRedirectedResendNs_    = now() + redirectedResendBackoffNs_;
+                redirectedResendBackoffNs_ = std::min<int64_t>(redirectedResendBackoffNs_ * 2, kRedirectedResendMaxNs);
+                requestMetadataNow_();
+                break;
+            }
+            if (cbError_)
+                invokeUserCallback_("onError", [&] {
+                    cbError_("Subscribe failed: RecordEgressUnavailable (retry budget exhausted)");
+                });
+        }
         // CB-5 A2: pass a sendFn so SubscriberHub can emit a late Unsubscribe
         // if the app called unsubscribe() before the response arrived.
         {

@@ -4507,15 +4507,17 @@ void ClientGateway::retireWithoutRecordEgress_(int64_t subId)
     Session* session = sessions_.find(sub.sessionId);
     if (session == nullptr) return;           // closed: it ended with its session
     if (sub.okOwed) {
-        // PR #441 F1: the Subscribe was never answered OK - refuse it as a PENDING request (bare NotLeader): the
-        // client spends that request's retry budget and fails it explicitly once the budget is gone ("Subscribe
-        // failed: NotLeader (retry budget exhausted)"); a group member's fetch counts its refusals the same way.
+        // PR #441 F1/F4: the Subscribe was never answered OK - it is answered now, as the pending request it still
+        // is, with its own cause (RecordEgressUnavailable, never a routing NotLeader): the client retries it a few
+        // times (plain and group-member fetches alike), then fails it explicitly; routing refusals stay unbounded.
         session->subIdByKey.erase(Session::SubKey{sub.subscribeCorrId, sub.topicId, sub.partition});
-        pc::ErrorResponse err;
-        err.sessionId     = sub.sessionId;
-        err.correlationId = sub.subscribeCorrId;
-        err.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
-        sendAnswer_(*session, scratch_.data(), err.encode(scratch_.data()));
+        pc::SubscribeResponse resp;
+        resp.sessionId      = sub.sessionId;
+        resp.correlationId  = sub.subscribeCorrId;
+        resp.errorCode      = static_cast<int16_t>(pc::ErrorCode::RecordEgressUnavailable);
+        resp.partition      = sub.partition;
+        resp.subscriptionId = 0;
+        sendAnswer_(*session, scratch_.data(), resp.encode(scratch_.data()));
         return;
     }
     if (sub.isGroup) {

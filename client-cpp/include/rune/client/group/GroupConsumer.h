@@ -253,7 +253,7 @@ struct GroupConsumerImpl {
         uint32_t rewindEpoch    = 0;      // bumped by every rewind applied to this partition (a delivery callback's seek wins over the post-callback advance)
         bool     rewound        = false;  // Task 10: restarted by a seek, not yet re-bound (the pending Rewind waits on it)
         uint8_t  redirects      = 0;      // consecutive Redirects without a bind
-        uint16_t refusals       = 0;      // PR #441 F1: refused (NotLeader / Redirect) Subscribes since the last bind
+        uint8_t  egressRefusals = 0;      // PR #441 F4: RecordEgressUnavailable answers since the last bind
     };
     std::map<TopicPartition, FetchSub> fetch;
     // MEDIUM-2: OffsetFetch re-send pacing (duty-clock ns; 0 = due).
