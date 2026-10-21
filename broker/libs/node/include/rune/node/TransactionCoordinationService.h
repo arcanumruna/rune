@@ -58,6 +58,7 @@
 #include <rune/coordination/TxnOffsetApply.h>
 
 #include <cstddef>
+#include <deque>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -245,7 +246,72 @@ public:
         stuckSink_ = fn; stuckSinkCtx_ = ctx; stuckPublished_ = -1;
     }
 
+    /// #358 class: answers parked until their __transaction_state record commits, and transactions whose markers
+    /// wait for their Prepare* record to commit (test / observability).
+    [[nodiscard]] std::size_t parkedAnswers() const noexcept { return parked_.size(); }
+    [[nodiscard]] std::size_t prepareGates() const noexcept { return prepareGates_.size(); }
+    /// Test seam: where a deferred answer goes when no gateway is wired (production: ClientGateway::sendControlFrame).
+    using AnswerSinkFn = void (*)(void* ctx, int64_t sessionId, const uint8_t* frame, std::size_t len);
+    void setAnswerSinkForTest(AnswerSinkFn fn, void* ctx) noexcept { answerSink_ = fn; answerSinkCtx_ = ctx; }
+
 private:
+    // ----- #358 class: nothing that depends on a __transaction_state record happens before it is COMMITTED -----
+    // An acks-all append replicates asynchronously; a coordinator failover before the record reaches the new
+    // leader loses it.  So an answer that follows an append (InitProducerId's epoch, AddPartitions' registration,
+    // AddOffsets / TxnOffsetCommit's offsets, a synchronous EndTxn) is PARKED until the replica's HW passes the
+    // record, and a transaction's markers are written only once its Prepare* record is committed (a commit marker
+    // ahead of a lost PrepareCommit lets the next coordinator abort the same transaction elsewhere).
+    struct ParkedAnswer {
+        int64_t              recordOffset = -1;
+        int64_t              sessionId    = 0;
+        std::vector<uint8_t> request;   ///< answered NotCoordinator from it if the coordinator unloads first
+        std::vector<uint8_t> answer;
+    };
+    std::deque<ParkedAnswer> parked_;                 ///< in record order (appends are monotone)
+    std::vector<std::vector<uint8_t>> spareBufs_;     ///< recycled ParkedAnswer buffers (steady state allocates nothing)
+    static constexpr int64_t kNeedsPut = -2;          ///< PrepareGate: the Prepare* record is not appended yet
+    struct PrepareGate {
+        rune::transaction::TransactionalId          txnId;
+        int64_t                                     producerId       = -1;
+        int16_t                                     producerEpoch    = 0;
+        int32_t                                     coordinatorEpoch = -1;
+        bool                                        commit           = false;
+        std::vector<rune::transaction::TopicPartition> parts;
+        bool                                        respond          = false;   ///< a deferred EndTxn answer
+        int64_t                                     sessionId = 0, correlationId = 0;
+        bool                                        durable          = false;   ///< loaded from the committed log
+        int64_t                                     recordOffset     = kNeedsPut;
+    };
+    std::vector<PrepareGate> prepareGates_;
+    /// The offset of the last record appended per transactional id (cleared on load: the loaded log is committed).
+    std::map<rune::transaction::TransactionalId, int64_t, std::less<>> lastPutOffset_;
+    int64_t requestPutOffset_  = -1;      ///< the newest record the current request appended
+    bool    requestPutRefused_ = false;   ///< the current request's append was refused (min-ISR)
+    AnswerSinkFn answerSink_    = nullptr;
+    void*        answerSinkCtx_ = nullptr;
+    /// Append `meta` (records the offset); false: refused.
+    bool persist_(const rune::transaction::TransactionMetadata& meta);
+    [[nodiscard]] bool committed_(int64_t recordOffset) const;
+    void beginRequest_() noexcept { requestPutOffset_ = -1; requestPutRefused_ = false; }
+    /// The handler's answer `n`, sent now when every record it depends on is committed, else parked (returns 0).
+    size_t finishRequest_(const uint8_t* buf, size_t len, uint8_t* out, size_t outCap, size_t n);
+    void sendDeferred_(int64_t sessionId, const uint8_t* frame, std::size_t n);
+    void sendEndTxnAnswer_(int64_t sessionId, int64_t correlationId, int16_t errorCode);
+    int  releaseParked_();
+    /// The gate for `meta`'s markers (respond: the EndTxn answer waits on them).
+    [[nodiscard]] PrepareGate makeGate_(const rune::transaction::TransactionMetadata& meta, bool commit,
+                                        std::vector<rune::transaction::TopicPartition> parts, bool respond,
+                                        int64_t sessionId, int64_t correlationId);
+    /// True once `g`'s Prepare* record is committed (appending it first when needed).
+    bool gateOpen_(PrepareGate& g);
+    int  processPrepareGates_();
+    void dropDeferred_();   ///< unload: every parked answer / gated EndTxn answered NotCoordinator
+    size_t handleInitProducerId_ (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
+    size_t handleAddPartitions_  (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
+    size_t handleAddOffsets_     (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
+    size_t handleTxnOffsetCommit_(const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
+    size_t handleEndTxn_         (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
+
     uint64_t controlMarkersRefused_ = 0;
     uint64_t transactionsCompleted_ = 0;
     TxnOffsetSink offsetSink_    = nullptr;

@@ -189,6 +189,8 @@ void TransactionCoordinationService::load_(int64_t nowNs)
     const tx::ProducerId maxPid =
         coordinator_.reload(txnState_ ? txnState_->all() : noSnapshot_, coordinatorEpoch_, nowNs);
     awaiting_.clear();
+    dropDeferred_();       // nothing deferred survives a load (unload answered it)
+    lastPutOffset_.clear();   // the loaded log is committed
     offsetsPendingTxns_ = 0;
     queuedRetries_ = 0;
     stuckMarkers_  = 0;
@@ -220,6 +222,7 @@ void TransactionCoordinationService::unload_()
     // m3: every deferred EndTxn is answered NotCoordinator (the client
     // re-discovers and retries; the new coordinator answers from the durable
     // state), every marker task is dropped.
+    dropDeferred_();   // #358 class: so is every answer still waiting for its record, and every gated EndTxn
     for (auto& [pid, a] : awaiting_) {
         if (!a.respPending || gateway_ == nullptr) continue;
         pc::EndTxnResponse resp;
@@ -292,8 +295,9 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
     if (!ensureLoaded_(nowNs)) return 0;
 
     lastNowNs_ = nowNs;
+    int work = releaseParked_();   // #358 class: answers whose record committed
     // Drive coordinator timeout aborts (sets markersPending on timed-out txns).
-    int work = coordinator_.doWork(nowNs);
+    work += coordinator_.doWork(nowNs);
     work += retryRefusedMarkers_(nowNs);
     work += retryDeferredCompletions_(nowNs);
     // Observability only, rate-limited (review LOW-1): never a per-pass walk.
@@ -314,11 +318,15 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
         const auto pending = coordinator_.pendingMarkerTransactions();
         for (const auto& p : pending) {
             coordinator_.markersDispatched(p.txnId);
-            dispatchMarkers_(p.txnId, p.producerId, p.producerEpoch, coordinatorEpoch_,
-                             p.commit, p.partitions);
+            // #358 class: a timeout abort / fencing abort is persisted and committed before its markers (a loaded
+            // Prepare* is committed already).
+            const auto* meta = coordinator_.metadata(p.txnId);
+            if (meta == nullptr) continue;
+            prepareGates_.push_back(makeGate_(*meta, p.commit, p.partitions, /*respond=*/false, 0, 0));
             ++work;
         }
     }
+    work += processPrepareGates_();
 
     return work;
 }
@@ -375,10 +383,206 @@ int64_t TransactionCoordinationService::requestPid_(int64_t pid, int64_t session
     return rune::protocol::producerIdUsableBy(pid, principalOf_(sessionId)) ? pid : kNoSuchProducerId;
 }
 
+
+// ---------------------------------------------------------------------------
+// #358 class: answers and markers wait for the __transaction_state records they depend on to COMMIT.
+// ---------------------------------------------------------------------------
+size_t TransactionCoordinationService::handleInitProducerId(const uint8_t* buf, size_t len, int64_t nowNs,
+                                                            uint8_t* out, size_t outCap)
+{
+    beginRequest_();
+    return finishRequest_(buf, len, out, outCap, handleInitProducerId_(buf, len, nowNs, out, outCap));
+}
+size_t TransactionCoordinationService::handleAddPartitions(const uint8_t* buf, size_t len, int64_t nowNs,
+                                                           uint8_t* out, size_t outCap)
+{
+    beginRequest_();
+    return finishRequest_(buf, len, out, outCap, handleAddPartitions_(buf, len, nowNs, out, outCap));
+}
+size_t TransactionCoordinationService::handleAddOffsets(const uint8_t* buf, size_t len, int64_t nowNs,
+                                                        uint8_t* out, size_t outCap)
+{
+    beginRequest_();
+    return finishRequest_(buf, len, out, outCap, handleAddOffsets_(buf, len, nowNs, out, outCap));
+}
+size_t TransactionCoordinationService::handleTxnOffsetCommit(const uint8_t* buf, size_t len, int64_t nowNs,
+                                                             uint8_t* out, size_t outCap)
+{
+    beginRequest_();
+    return finishRequest_(buf, len, out, outCap, handleTxnOffsetCommit_(buf, len, nowNs, out, outCap));
+}
+size_t TransactionCoordinationService::handleEndTxn(const uint8_t* buf, size_t len, int64_t nowNs,
+                                                    uint8_t* out, size_t outCap)
+{
+    beginRequest_();
+    return finishRequest_(buf, len, out, outCap, handleEndTxn_(buf, len, nowNs, out, outCap));
+}
+
+bool TransactionCoordinationService::persist_(const tx::TransactionMetadata& meta)
+{
+    if (txnState_ == nullptr) return true;
+    const int64_t at = txnState_->putAt(meta, coordinatorEpoch_);
+    if (at < 0) {
+        requestPutRefused_ = true;
+        return false;
+    }
+    if (at > requestPutOffset_) requestPutOffset_ = at;
+    lastPutOffset_[meta.txnId] = at;
+    return true;
+}
+
+bool TransactionCoordinationService::committed_(int64_t recordOffset) const
+{
+    return txnState_ == nullptr || txnState_->replica()->highWatermark() > recordOffset;
+}
+
+void TransactionCoordinationService::sendDeferred_(int64_t sessionId, const uint8_t* frame, std::size_t n)
+{
+    if (gateway_ != nullptr) (void)gateway_->sendControlFrame(sessionId, frame, n);
+    else if (answerSink_ != nullptr) answerSink_(answerSinkCtx_, sessionId, frame, n);
+}
+
+void TransactionCoordinationService::sendEndTxnAnswer_(int64_t sessionId, int64_t correlationId, int16_t errorCode)
+{
+    pc::EndTxnResponse resp;
+    resp.sessionId     = sessionId;
+    resp.correlationId = correlationId;
+    resp.errorCode     = errorCode;
+    std::array<uint8_t, pc::EndTxnResponse::ENCODED_SIZE> buf{};
+    const std::size_t n = resp.encode(buf.data());
+    sendDeferred_(sessionId, buf.data(), n);
+}
+
+size_t TransactionCoordinationService::finishRequest_(const uint8_t* buf, size_t len, uint8_t* out, size_t outCap,
+                                                      size_t n)
+{
+    if (n == 0) return 0;   // already deferred (EndTxn)
+    if (requestPutRefused_) [[unlikely]] {
+        // Not durable: never an OK.  NotCoordinator is retriable - the client re-discovers and retries, and the
+        // retry appends the (idempotent) state again.
+        spdlog::warn("TCS: a __transaction_state append was refused (min-ISR) - the request is answered "
+                     "NotCoordinator and retried by the client");
+        const size_t r = rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::NotCoordinator), out, outCap);
+        return r != 0 ? r : n;
+    }
+    if (requestPutOffset_ < 0 || committed_(requestPutOffset_)) return n;
+    const auto hdr = pc::MessageHeader::decode(buf, len);
+    ParkedAnswer pa;
+    pa.recordOffset = requestPutOffset_;
+    pa.sessionId    = hdr ? hdr->sessionId : 0;
+    const auto take = [&](std::vector<uint8_t>& v, const uint8_t* p, std::size_t k) {
+        if (!spareBufs_.empty()) { v = std::move(spareBufs_.back()); spareBufs_.pop_back(); }
+        v.assign(p, p + k);
+    };
+    take(pa.request, buf, len);
+    take(pa.answer, out, n);
+    parked_.push_back(std::move(pa));
+    return 0;   // sent by releaseParked_ once the record is committed
+}
+
+int TransactionCoordinationService::releaseParked_()
+{
+    int n = 0;
+    while (!parked_.empty() && committed_(parked_.front().recordOffset)) {
+        ParkedAnswer& pa = parked_.front();
+        sendDeferred_(pa.sessionId, pa.answer.data(), pa.answer.size());
+        spareBufs_.push_back(std::move(pa.request));
+        spareBufs_.push_back(std::move(pa.answer));
+        parked_.pop_front();
+        ++n;
+    }
+    return n;
+}
+
+TransactionCoordinationService::PrepareGate TransactionCoordinationService::makeGate_(
+    const tx::TransactionMetadata& meta, bool commit, std::vector<tx::TopicPartition> parts, bool respond,
+    int64_t sessionId, int64_t correlationId)
+{
+    PrepareGate g;
+    g.txnId            = meta.txnId;
+    g.producerId       = meta.producerId;
+    g.producerEpoch    = meta.producerEpoch;
+    g.coordinatorEpoch = coordinatorEpoch_;
+    g.commit           = commit;
+    g.parts            = std::move(parts);
+    g.respond          = respond;
+    g.sessionId        = sessionId;
+    g.correlationId    = correlationId;
+    if (txnState_ == nullptr) {
+        g.durable = true;
+        return g;
+    }
+    // The record of THIS Prepare* is the store's last append for the id when it matches the state; a loaded one
+    // (no append since the load) is committed.  Otherwise (a timeout abort is never appended by the coordinator
+    // itself) it is appended by gateOpen_.
+    const auto* stored = txnState_->get(meta.txnId);
+    const bool same = stored != nullptr && stored->state == meta.state && stored->producerId == meta.producerId &&
+                      stored->producerEpoch == meta.producerEpoch;
+    if (same) {
+        const auto it = lastPutOffset_.find(meta.txnId);
+        if (it == lastPutOffset_.end()) g.durable = true;
+        else g.recordOffset = it->second;
+    }
+    return g;
+}
+
+bool TransactionCoordinationService::gateOpen_(PrepareGate& g)
+{
+    if (g.durable) return true;
+    if (g.recordOffset == kNeedsPut) {
+        const auto* meta = coordinator_.metadata(g.txnId);
+        if (meta == nullptr || !persist_(*meta)) return false;   // refused: retried on the next doWork
+        g.recordOffset = lastPutOffset_[g.txnId];
+    }
+    return committed_(g.recordOffset);
+}
+
+int TransactionCoordinationService::processPrepareGates_()
+{
+    int work = 0;
+    for (std::size_t i = 0; i < prepareGates_.size();) {
+        PrepareGate& g = prepareGates_[i];
+        const auto* meta = coordinator_.metadata(g.txnId);
+        const bool stale = meta == nullptr || meta->producerId != g.producerId ||
+                           meta->producerEpoch != g.producerEpoch ||
+                           (meta->state != tx::TxnState::PrepareCommit && meta->state != tx::TxnState::PrepareAbort);
+        if (!stale && !gateOpen_(g)) { ++i; continue; }
+        PrepareGate open = std::move(g);
+        prepareGates_.erase(prepareGates_.begin() + static_cast<std::ptrdiff_t>(i));
+        ++work;
+        if (stale) {   // the transaction moved on meanwhile: nothing to write; a waiting EndTxn retries
+            if (open.respond) sendEndTxnAnswer_(open.sessionId, open.correlationId,
+                                                static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
+            continue;
+        }
+        const bool deferred = dispatchMarkers_(open.txnId, open.producerId, open.producerEpoch, open.coordinatorEpoch,
+                                               open.commit, open.parts, open.respond ? open.sessionId : 0,
+                                               open.respond ? open.correlationId : 0);
+        if (!deferred && open.respond) sendEndTxnAnswer_(open.sessionId, open.correlationId, 0);   // completed now
+    }
+    return work;
+}
+
+void TransactionCoordinationService::dropDeferred_()
+{
+    for (ParkedAnswer& pa : parked_) {
+        std::array<uint8_t, rune::gateway::kMaxRejectionBytes> rej{};
+        const std::size_t n = rune::gateway::encodeRejectionFor(
+            pa.request.data(), pa.request.size(), static_cast<uint16_t>(pc::ErrorCode::NotCoordinator),
+            rej.data(), rej.size());
+        if (n != 0) sendDeferred_(pa.sessionId, rej.data(), n);
+    }
+    parked_.clear();
+    for (const PrepareGate& g : prepareGates_)
+        if (g.respond) sendEndTxnAnswer_(g.sessionId, g.correlationId, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    prepareGates_.clear();
+}
+
 // ---------------------------------------------------------------------------
 // handleInitProducerId (templateId 45)
 // ---------------------------------------------------------------------------
-size_t TransactionCoordinationService::handleInitProducerId(
+size_t TransactionCoordinationService::handleInitProducerId_(
     const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
@@ -441,7 +645,7 @@ size_t TransactionCoordinationService::handleInitProducerId(
             // Ignore persist failure here: the coordinator already updated
             // in-memory state; a log failure is a degraded-durability condition
             // not a protocol error (minIsr-gate on startup would have prevented this).
-            txnState_->put(*meta, coordinatorEpoch_);
+            (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
         }
     }
 
@@ -455,7 +659,7 @@ size_t TransactionCoordinationService::handleInitProducerId(
 // ---------------------------------------------------------------------------
 // handleAddPartitions (templateId 47)
 // ---------------------------------------------------------------------------
-size_t TransactionCoordinationService::handleAddPartitions(
+size_t TransactionCoordinationService::handleAddPartitions_(
     const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
@@ -535,7 +739,7 @@ size_t TransactionCoordinationService::handleAddPartitions(
     if (result.ok()) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, coordinatorEpoch_);
+            (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
         }
     }
 
@@ -560,7 +764,7 @@ size_t TransactionCoordinationService::handleAddPartitions(
 // ---------------------------------------------------------------------------
 // handleAddOffsets (templateId 49)
 // ---------------------------------------------------------------------------
-size_t TransactionCoordinationService::handleAddOffsets(
+size_t TransactionCoordinationService::handleAddOffsets_(
     const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
@@ -606,7 +810,7 @@ size_t TransactionCoordinationService::handleAddOffsets(
     if (result.ok()) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, coordinatorEpoch_);
+            (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
         }
     }
 
@@ -618,7 +822,7 @@ size_t TransactionCoordinationService::handleAddOffsets(
 // ---------------------------------------------------------------------------
 // handleTxnOffsetCommit (templateId 51)
 // ---------------------------------------------------------------------------
-size_t TransactionCoordinationService::handleTxnOffsetCommit(
+size_t TransactionCoordinationService::handleTxnOffsetCommit_(
     const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
@@ -691,7 +895,7 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit(
     if (result.ok()) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, coordinatorEpoch_);
+            (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
         }
     }
 
@@ -716,7 +920,7 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit(
 // ---------------------------------------------------------------------------
 // handleEndTxn (templateId 53)
 // ---------------------------------------------------------------------------
-size_t TransactionCoordinationService::handleEndTxn(
+size_t TransactionCoordinationService::handleEndTxn_(
     const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
@@ -756,7 +960,7 @@ size_t TransactionCoordinationService::handleEndTxn(
     if (transitioned) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, coordinatorEpoch_);
+            (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
         }
     }
 
@@ -768,11 +972,18 @@ size_t TransactionCoordinationService::handleEndTxn(
     if (transitioned && gateway_ && topics_) {
         const auto* m = coordinator_.metadata(txnIdScratch_);
         if (m) {
-            const std::vector<tx::TopicPartition> parts(m->partitions.begin(), m->partitions.end());
             const bool isCommit = (m->state == tx::TxnState::PrepareCommit);
-            const tx::TransactionalId txnId = txnIdScratch_;
-            if (dispatchMarkers_(txnId, m->producerId, m->producerEpoch, coordinatorEpoch_,
-                                 isCommit, parts, msg.sessionId, msg.correlationId)) {
+            PrepareGate g = makeGate_(*m, isCommit, std::vector<tx::TopicPartition>(m->partitions.begin(),
+                                                                                   m->partitions.end()),
+                                      /*respond=*/true, msg.sessionId, msg.correlationId);
+            // #358 class: the markers are written only once the Prepare* record is committed; until then the
+            // EndTxn answer waits with them (doWork opens the gate).
+            if (!gateOpen_(g)) {
+                prepareGates_.push_back(std::move(g));
+                return 0;
+            }
+            if (dispatchMarkers_(g.txnId, g.producerId, g.producerEpoch, g.coordinatorEpoch,
+                                 g.commit, g.parts, msg.sessionId, msg.correlationId)) {
                 return 0;   // response sent by completeAwaiting_ when the last marker lands
             }
         }

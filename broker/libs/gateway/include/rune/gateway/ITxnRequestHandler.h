@@ -30,9 +30,11 @@ struct ITxnRequestHandler {
     // No-hang contract (fix round 2, I3): EVERY outcome writes an answer — a
     // body that does not decode answers InvalidRequest, a response that does
     // not fit outCap answers MessageTooLarge (RequestRejection.h).  0 means
-    // exactly one thing: the answer is DEFERRED (handleEndTxn only: sent via
-    // ClientGateway::sendControlFrame when the transaction's last marker
-    // lands).  The gateway answers Internal for a 0 from any other handler.
+    // exactly one thing: the answer is DEFERRED and the handler sends it later via
+    // ClientGateway::sendControlFrame - EndTxn when the transaction's last marker
+    // lands, and (#358) ANY handler whose answer depends on a __transaction_state
+    // record that is not committed yet (sent once the replica's HW passes it, or
+    // answered NotCoordinator if the coordinator unloads first).
     //
     // Fix round 3 (I3): outCap is ALWAYS >= kTxnMinOutCap (the gateway passes
     // its 68 KiB scratch — static_assert-ed at the call site), which holds every

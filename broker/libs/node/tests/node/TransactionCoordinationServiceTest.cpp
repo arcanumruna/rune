@@ -968,3 +968,140 @@ TEST_F(TransactionCoordinationServiceTest, BoundProducerIdsWaitForTheClusterFeat
     EXPECT_NE(rebound.first, a.first) << "the raw id, owned by nobody, is rebound at the level";
     EXPECT_TRUE(rune::protocol::producerIdOwnedBy(rebound.first, 8));
 }
+
+// ===========================================================================
+// #358 class: nothing that depends on a __transaction_state record happens before the record is COMMITTED.  The
+// txn-state leader (node 1) has follower 2 in its ISR, so an acks-all append commits only once 2 fetched it.  An
+// answer that follows an append is parked until then (an AddPartitions acked before its registration commits is
+// lost by a coordinator failover: the new coordinator never writes that partition's marker and the partition's
+// LSO stays pinned - the failover hang of #112); a transaction's markers wait for its Prepare* record.
+// ===========================================================================
+namespace {
+struct CapturedAnswers {
+    std::vector<std::vector<uint8_t>> frames;
+    static void sink(void* ctx, int64_t, const uint8_t* f, std::size_t n) {
+        static_cast<CapturedAnswers*>(ctx)->frames.emplace_back(f, f + n);
+    }
+};
+}  // namespace
+
+class TxnStateReplicationTest : public ::testing::Test {
+protected:
+    TxnStateReplicationTest() : dir_("svc_repl"), log_(dir_.path) {}
+    void SetUp() override {
+        transport_.reset(new NullTransport{});
+        replica_ = std::make_unique<rep::PartitionReplica>(makeSingleNodeConfig(), rep::Role::Leader, /*epoch=*/1,
+                                                           std::vector<rep::NodeId>{1, 2}, std::vector<rep::NodeId>{1, 2},
+                                                           &log_, transport_.get());
+        txnStore_ = std::make_unique<tx::ReplicatedTxnStateStore>(replica_.get());
+        svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+            txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [] { return rune::node::NodeId{1}; });
+        svc_->setAnswerSinkForTest(&CapturedAnswers::sink, &answers_);
+        (void)svc_->doWork(now_);                  // loads; requests the first pid block ceiling
+        followerFetches();
+        (void)svc_->doWork(now_);                  // the ceiling is committed: pids can be handed out
+    }
+    /// Node 2 fetches up to the leader's log end: everything appended so far commits.
+    void followerFetches() {
+        rep::FetchRequestMsg req{};
+        req.leaderEpoch = replica_->epoch(); req.partition = 0; req.followerId = 2;
+        req.fetchOffset = replica_->logEndOffset(); req.maxBytes = 1 << 20; req.topicId = 0;
+        now_ += 1'000'000;
+        (void)replica_->onFetchRequest(req, now_);
+        replica_->doWork(now_);
+    }
+    int64_t initPid(const std::string& txn, int16_t& epoch, int32_t timeoutMs = 30'000) {
+        const std::size_t reqLen = encodeInitProducerId(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, timeoutMs, txn);
+        EXPECT_EQ(svc_->handleInitProducerId(reqBuf_.data(), reqLen, now_, outBuf_.data(), outBuf_.size()), 0u)
+            << "the epoch is answered only once its record commits";
+        EXPECT_EQ(svc_->parkedAnswers(), 1u);
+        EXPECT_TRUE(answers_.frames.empty());
+        followerFetches();
+        (void)svc_->doWork(now_);
+        EXPECT_EQ(svc_->parkedAnswers(), 0u);
+        EXPECT_EQ(answers_.frames.size(), 1u);
+        const auto r = pc::InitProducerIdResponse::decode(answers_.frames.back().data(), answers_.frames.back().size());
+        EXPECT_TRUE(r && r->errorCode == 0);
+        answers_.frames.clear();
+        epoch = r ? r->producerEpoch : 0;
+        return r ? r->producerId : -1;
+    }
+
+    TmpDir dir_;
+    rune::storage::Log log_;
+    std::unique_ptr<rep::PartitionTransport>          transport_;
+    std::unique_ptr<rep::PartitionReplica>            replica_;
+    std::unique_ptr<tx::ReplicatedTxnStateStore>      txnStore_;
+    std::unique_ptr<rune::node::TransactionCoordinationService> svc_;
+    CapturedAnswers answers_;
+    bool    isLeader_ = true;
+    int64_t now_      = 1'000'000'000;
+    int64_t corr_     = 0;
+    std::array<uint8_t, 1024> reqBuf_{};
+    std::array<uint8_t, 1024> outBuf_{};
+};
+
+TEST_F(TxnStateReplicationTest, AnAddPartitionsIsAnsweredOnlyOnceItsRegistrationCommitsRegression) {
+    int16_t ep = 0;
+    const int64_t pid = initPid("txReg", ep);
+    ASSERT_GE(pid, 0);
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}, {0, 1}};
+    const std::size_t reqLen = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, pid, ep, "txReg", parts);
+    EXPECT_EQ(svc_->handleAddPartitions(reqBuf_.data(), reqLen, now_, outBuf_.data(), outBuf_.size()), 0u);
+    EXPECT_EQ(svc_->parkedAnswers(), 1u);
+    (void)svc_->doWork(now_ + 1);
+    EXPECT_TRUE(answers_.frames.empty()) << "no OK while the registration is only on the leader";
+    followerFetches();
+    (void)svc_->doWork(now_);
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    const auto r = pc::AddPartitionsToTxnResponse::decode(answers_.frames[0].data(), answers_.frames[0].size());
+    ASSERT_TRUE(r);
+    ASSERT_EQ(r->results.size(), 2u);
+    EXPECT_EQ(r->results[0].errorCode, 0);
+    EXPECT_EQ(r->results[1].errorCode, 0);
+}
+
+TEST_F(TxnStateReplicationTest, AParkedAnswerIsNotCoordinatorWhenTheCoordinatorUnloadsFirstRegression) {
+    int16_t ep = 0;
+    const int64_t pid = initPid("txLost", ep);
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+    const std::size_t reqLen = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, pid, ep, "txLost", parts);
+    ASSERT_EQ(svc_->handleAddPartitions(reqBuf_.data(), reqLen, now_, outBuf_.data(), outBuf_.size()), 0u);
+    isLeader_ = false;                          // the coordinator moves before the registration committed
+    (void)svc_->doWork(now_ + 1);
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    const auto r = pc::AddPartitionsToTxnResponse::decode(answers_.frames[0].data(), answers_.frames[0].size());
+    ASSERT_TRUE(r);
+    ASSERT_GE(r->results.size(), 1u);
+    EXPECT_EQ(r->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::NotCoordinator))
+        << "never an OK for a registration the next coordinator may not have: the client retries there";
+    EXPECT_EQ(svc_->parkedAnswers(), 0u);
+}
+
+TEST_F(TxnStateReplicationTest, AbortMarkersWaitForThePrepareAbortRecordToCommitRegression) {
+    int markerAppends = 0;
+    svc_->setAppendFnOverride([&](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t {
+        ++markerAppends;
+        return 0;
+    });
+    int16_t ep = 0;
+    const int64_t pid = initPid("txTimeout", ep, /*timeoutMs=*/100);
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+    const std::size_t reqLen = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, pid, ep, "txTimeout", parts);
+    ASSERT_EQ(svc_->handleAddPartitions(reqBuf_.data(), reqLen, now_, outBuf_.data(), outBuf_.size()), 0u);
+    followerFetches();
+    (void)svc_->doWork(now_);
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    now_ += 1'000'000'000;                      // past the 100 ms transaction timeout
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnStateForTest("txTimeout"), tx::TxnState::PrepareAbort);
+    EXPECT_EQ(markerAppends, 0) << "no marker before the PrepareAbort record commits";
+    EXPECT_EQ(svc_->prepareGates(), 1u);
+    (void)svc_->doWork(now_ + 1);
+    EXPECT_EQ(markerAppends, 0);
+    followerFetches();
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(markerAppends, 1) << "the abort marker goes out once its record is committed";
+    EXPECT_EQ(svc_->prepareGates(), 0u);
+    EXPECT_EQ(svc_->awaitingMarkerTxnsForTest(), 1u);
+}

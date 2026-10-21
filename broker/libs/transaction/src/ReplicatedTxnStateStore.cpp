@@ -149,8 +149,8 @@ void ReplicatedTxnStateStore::encodeRecord(
 // ---------------------------------------------------------------------------
 // put — encode + append + update in-memory map on success.
 // ---------------------------------------------------------------------------
-bool ReplicatedTxnStateStore::put(const TransactionMetadata& meta,
-                                   int32_t coordinatorEpoch)
+rune::replication::Offset ReplicatedTxnStateStore::putAt(const TransactionMetadata& meta,
+                                                         int32_t coordinatorEpoch)
 {
     encodeRecord(meta, coordinatorEpoch);
 
@@ -169,12 +169,12 @@ bool ReplicatedTxnStateStore::put(const TransactionMetadata& meta,
 
     if (base < 0) {
         // minIsr-gated: reject without updating in-memory map.
-        return false;
+        return -1;
     }
 
     // Update in-memory map only on success.
     index_[meta.txnId] = meta;
-    return true;
+    return base;
 }
 
 // ---------------------------------------------------------------------------
