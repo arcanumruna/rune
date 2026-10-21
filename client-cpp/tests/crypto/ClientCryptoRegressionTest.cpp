@@ -72,11 +72,16 @@ std::string testdataPath(const char* name) {
 
 struct FakeIo final : sm::SessionIo {
     std::vector<std::vector<uint8_t>> sends;
+    std::string channel;   // issue #115: the session's current endpoint (its host is the certificate name)
     bool sendFrame(const uint8_t* buf, std::size_t len) override {
         sends.emplace_back(buf, buf + len);
         return true;
     }
-    bool retarget(const std::string&) noexcept override { return true; }
+    bool retarget(const std::string& ep) noexcept override {
+        channel = ep.rfind("aeron:", 0) == 0 ? ep : "aeron:udp?endpoint=" + ep;
+        return true;
+    }
+    [[nodiscard]] std::string ingressChannel() const override { return channel; }
     [[nodiscard]] std::size_t sendCount() const { return sends.size(); }
     [[nodiscard]] const std::vector<uint8_t>& last() const { return sends.back(); }
 };
@@ -539,11 +544,16 @@ TEST(ClientCryptoRegression, Sender64BoundaryOpensSender65Dropped) {
 }
 
 // ===========================================================================
-// Downgrade safety: requireCrypto terminal-fails on a no-cipher
-// ConnectResponse, never silent plaintext.
+// Downgrade safety: requireCrypto never proceeds plaintext on a no-cipher
+// ConnectResponse - and (issue #14) never turns that unauthenticated answer
+// into a terminal verdict either.
 // ===========================================================================
 
-TEST(ClientCryptoRegression, RequireCryptoTerminalFailsOnNoCipherResponse) {
+// A plaintext ConnectResponse{OK} to a crypto offer (a stripped offer) never yields a plaintext session: the connect
+// is retried as a fresh TLS episode within the connect budget, then the session is Disconnected with lastConnectError
+// HandshakeFailed - never Rejected, which any forged packet could otherwise cause.  RED (issue #14): route the
+// no-cipher OK to rejectHandshake_ (the old terminal path).
+TEST(ClientCryptoRegression, RequireCryptoNeverProceedsPlaintextOnANoCipherResponseRegression) {
     FakeIo io;
     sm::SessionConfig cfg;
     cfg.egressChannel = "aeron:udp?endpoint=client:40456";
@@ -554,15 +564,18 @@ TEST(ClientCryptoRegression, RequireCryptoTerminalFailsOnNoCipherResponse) {
 
     constexpr int64_t T0 = 1'000'000'000LL;
     m.connect(T0);
-    auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
-    ASSERT_TRUE(req.has_value());
-
-    m.onConnectResponse(/*code=*/0, /*leaderMemberId=*/-1, /*assignedSessionId=*/99,
-                         req->correlationId, T0 + 1, /*chosenCipher=*/0, /*handshakeBytes=*/{});
-
-    EXPECT_EQ(m.state(), sm::SessionState::Rejected)
-        << "requireCrypto must terminally fail, never silently proceed plaintext";
-    EXPECT_FALSE(m.cryptoState().encrypted);
+    for (int attempt = 0; attempt <= cfg.maxConnectRetries; ++attempt) {
+        auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
+        ASSERT_TRUE(req.has_value()) << attempt;
+        EXPECT_FALSE(req->cipherList.empty()) << "every retry offers crypto again (" << attempt << ")";
+        m.onConnectResponse(/*code=*/0, /*leaderMemberId=*/-1, /*assignedSessionId=*/99,
+                             req->correlationId, T0 + 1 + attempt, /*chosenCipher=*/0, /*handshakeBytes=*/{});
+        ASSERT_NE(m.state(), sm::SessionState::Connected) << "never a plaintext session";
+        ASSERT_NE(m.state(), sm::SessionState::Rejected) << "an unauthenticated answer is never a verdict";
+        EXPECT_FALSE(m.cryptoState().encrypted);
+    }
+    EXPECT_EQ(m.state(), sm::SessionState::Disconnected) << "the connect budget is spent";
+    EXPECT_EQ(m.lastConnectError(), static_cast<int16_t>(rune::protocol::client::ErrorCode::HandshakeFailed));
 }
 
 // ===========================================================================
@@ -1059,4 +1072,144 @@ TEST(ClientCryptoRegression, AbandonResumeHintWhileConnectingKeepsTheHandshakeRe
     EXPECT_EQ(t.m->rejectCode(), 0);
     // The episode still completes the handshake for its request.
     EXPECT_TRUE(t.completeFrom(t.io.sendCount() - 1, 42));
+}
+
+// ===========================================================================
+// Issue #115: with no tlsExpectHost the certificate name is the host of the
+// session's endpoint - and a pre-TLS (unauthenticated) redirect never moves it.
+// ===========================================================================
+namespace {
+sm::SessionConfig derivedHostCfg(const std::string& caPem) {
+    sm::SessionConfig c;
+    c.egressChannel = "aeron:udp?endpoint=client:40456";
+    c.offerCrypto   = true;
+    c.requireCrypto = true;
+    c.tlsTrustPem   = caPem;   // tlsExpectHost left empty: derived from the endpoint
+    return c;
+}
+}  // namespace
+
+// The test certificate names localhost and 127.0.0.1: an endpoint at 127.0.0.1 verifies, one at another name does not
+// (even under the pinned CA).  RED: makeClient with the configured (empty) tlsExpectHost - no name check, both pass.
+TEST(ClientCryptoRegression, TheCertificateNameIsTheSessionEndpointsHostRegression) {
+    const std::string ca = slurp(testdataPath("ca.pem"));
+    for (const auto& [endpoint, ok] : std::vector<std::pair<std::string, bool>>{
+             {"aeron:udp?endpoint=127.0.0.1:40200", true},
+             {"aeron:udp?endpoint=localhost:40200|mtu=1408", true},
+             {"aeron:udp?endpoint=other.example:40200", false}}) {
+        FakeIo io;
+        io.channel = endpoint;
+        auto srv = cr::TlsSession::makeServer(slurp(testdataPath("server.pem")).c_str(),
+                                              slurp(testdataPath("server.key")).c_str());
+        sm::SessionMachine m(io, derivedHostCfg(ca));
+        m.connect(1'000'000'000LL);
+        EXPECT_EQ(driveHandshake(m, io, srv, 42, 1'000'000'001LL), ok) << endpoint;
+        EXPECT_EQ(m.cryptoState().encrypted, ok) << endpoint;
+    }
+}
+
+// A redirect answered before TLS (ConnectResponse / ErrorResponse in Connecting) is unauthenticated: the session follows
+// it, but keeps verifying the name of the endpoint it was redirected FROM - a forged redirect to a host the attacker
+// holds a certificate for never verifies.  Here the redirect names a host the certificate does not: the handshake
+// still succeeds against the pinned original name.  RED: drop notePreTlsRedirect_ (the name follows the redirect).
+TEST(ClientCryptoRegression, APreTlsRedirectNeverMovesTheCertificateNameRegression) {
+    const std::string ca = slurp(testdataPath("ca.pem"));
+    for (const bool viaErrorResponse : {false, true}) {
+        FakeIo io;
+        io.channel = "aeron:udp?endpoint=127.0.0.1:40200";
+        auto srv = cr::TlsSession::makeServer(slurp(testdataPath("server.pem")).c_str(),
+                                              slurp(testdataPath("server.key")).c_str());
+        sm::SessionMachine m(io, derivedHostCfg(ca));
+        constexpr int64_t T0 = 1'000'000'000LL;
+        m.connect(T0);
+        auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
+        ASSERT_TRUE(req.has_value());
+        if (viaErrorResponse)
+            m.onErrorResponse(static_cast<int16_t>(rune::protocol::client::ErrorCode::Redirect), "elsewhere.example:40200",
+                              req->correlationId, T0 + 1);
+        else
+            m.onConnectResponseRedirect("elsewhere.example:40200", req->correlationId, T0 + 1);
+        ASSERT_EQ(io.channel, "aeron:udp?endpoint=elsewhere.example:40200") << "the session followed the redirect";
+        io.sends.erase(io.sends.begin(), io.sends.end() - 1);   // drive the handshake from the resent Connect
+        EXPECT_TRUE(driveHandshake(m, io, srv, 42, T0 + 2)) << "verified against 127.0.0.1, not the redirect's name";
+        // A trusted move (metadata, a sealed redirect, the bootstrap) changes the endpoint: its own host counts again.
+        io.channel = "aeron:udp?endpoint=other.example:40200";
+        io.sends.clear();
+        m.forceReconnect(T0 + 3);
+        if (!io.sends.empty()) {
+            auto srv2 = cr::TlsSession::makeServer(slurp(testdataPath("server.pem")).c_str(),
+                                                   slurp(testdataPath("server.key")).c_str());
+            EXPECT_FALSE(driveHandshake(m, io, srv2, 43, T0 + 4)) << "other.example is checked (and not in the cert)";
+        }
+    }
+}
+
+// ===========================================================================
+// Issue #14: with crypto required, an answer that arrives before the session's
+// TLS keys exist is unauthenticated - never a terminal Rejected.
+// ===========================================================================
+
+// RED: delete the requireCrypto branch at the top of onConnectError_ (ProtocolVersion / HandshakeFailed /
+// AuthenticationFailed then go terminal Rejected under reconnectForeverAfterLive), or route onHandshakeFailed_ straight
+// to rejectHandshake_.
+TEST(SessionMachineAuthRegression, APreTlsRefusalNeverRejectsRegression) {
+    namespace rpc = rune::protocol::client;
+    const std::string ca = slurp(testdataPath("ca.pem"));
+    constexpr int64_t T0 = 1'000'000'000LL;
+    // A ConnectResponse refusal, every code (the non-retriable ones included).
+    for (const auto code : {rpc::ErrorCode::ProtocolVersion, rpc::ErrorCode::HandshakeFailed,
+                            rpc::ErrorCode::AuthenticationFailed, rpc::ErrorCode::Internal}) {
+        for (const bool required : {true, false}) {
+            FakeIo io;
+            io.channel = "aeron:udp?endpoint=127.0.0.1:40200";
+            sm::SessionConfig cfg = derivedHostCfg(ca);
+            cfg.requireCrypto = required;
+            cfg.reconnectForeverAfterLive = true;
+            sm::SessionMachine m(io, cfg);
+            m.connect(T0);
+            auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
+            ASSERT_TRUE(req.has_value());
+            m.onConnectResponse(static_cast<int16_t>(code), -1, 0, req->correlationId, T0 + 1);
+            const bool nonRetriable = code != rpc::ErrorCode::Internal;
+            if (required)
+                EXPECT_NE(m.state(), sm::SessionState::Rejected) << "code " << int(code) << ": unauthenticated, never a verdict";
+            else if (nonRetriable)
+                EXPECT_EQ(m.state(), sm::SessionState::Rejected) << "control: optional crypto keeps the old verdict";
+            if (required) EXPECT_EQ(m.lastConnectError(), static_cast<int16_t>(code));
+        }
+    }
+    // A HandshakeContinueResponse{HandshakeFailed} mid-handshake, and a failed verify of the server's flight.
+    {
+        FakeIo io;
+        io.channel = "aeron:udp?endpoint=127.0.0.1:40200";
+        sm::SessionConfig cfg = derivedHostCfg(ca);
+        cfg.reconnectForeverAfterLive = true;
+        sm::SessionMachine m(io, cfg);
+        auto srv = cr::TlsSession::makeServer(slurp(testdataPath("server.pem")).c_str(),
+                                              slurp(testdataPath("server.key")).c_str());
+        m.connect(T0);
+        auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
+        ASSERT_TRUE(req.has_value());
+        (void)srv.readInbound(reinterpret_cast<const uint8_t*>(req->handshakeBytes.data()), req->handshakeBytes.size());
+        uint8_t out[16384];
+        const std::size_t n = srv.writeOutbound(out, sizeof out);
+        m.onConnectResponse(0, -1, 42, req->correlationId, T0 + 1, req->cipherList[0],
+                            std::string_view(reinterpret_cast<const char*>(out), n / 2));   // half a flight
+        ASSERT_EQ(m.state(), sm::SessionState::Handshaking);
+        m.onHandshakeContinueResponse(static_cast<int16_t>(rpc::ErrorCode::HandshakeFailed), {}, req->correlationId, T0 + 2);
+        EXPECT_NE(m.state(), sm::SessionState::Rejected) << "a mid-handshake refusal is unauthenticated";
+        EXPECT_EQ(m.lastConnectError(), static_cast<int16_t>(rpc::ErrorCode::HandshakeFailed));
+    }
+    {
+        FakeIo io;
+        io.channel = "aeron:udp?endpoint=127.0.0.1:40200";
+        sm::SessionConfig cfg = derivedHostCfg("");   // trust nothing: the server's flight fails to verify
+        cfg.reconnectForeverAfterLive = true;
+        sm::SessionMachine m(io, cfg);
+        auto srv = cr::TlsSession::makeServer(slurp(testdataPath("server.pem")).c_str(),
+                                              slurp(testdataPath("server.key")).c_str());
+        m.connect(T0);
+        EXPECT_FALSE(driveHandshake(m, io, srv, 42, T0 + 1));
+        EXPECT_NE(m.state(), sm::SessionState::Rejected) << "a forged server flight must not end the client for good";
+    }
 }

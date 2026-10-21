@@ -143,6 +143,8 @@ struct ClaimRig {
         c.dataDir         = b.clientDir().string();
         c.username        = user;
         c.password        = kPw;
+        c.offerCrypto     = true;                      // issue #14: credentials only over TLS
+        c.tlsTrustPem     = AuthBroker::tlsCaPem();   // the rig's test CA (the certificate names 127.0.0.1)
         c.runnerMode      = mode;
         c.topics          = std::move(topics);
         auto cl = std::make_unique<rc::Client>(c);

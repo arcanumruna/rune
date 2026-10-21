@@ -116,6 +116,8 @@ struct SessionEndpointIo : session::SessionIo {
     bool retargetToBootstrap() noexcept override;
     /// T15a fix2 A-B1: the seed's return to the last-known leader (leader sessions: no-op).
     bool retargetToLastKnownLeader() noexcept override;
+    /// Issue #115: the seed's current default-publication channel; a leader session's own endpoint.
+    [[nodiscard]] std::string ingressChannel() const override;
 };
 
 struct Session {
@@ -859,6 +861,7 @@ private:
     // -------------------------------------------------------------------------
     bool sendFrame(const uint8_t* buf, std::size_t len) override;
     bool retarget(const std::string& newIngressChannel) noexcept override;
+    [[nodiscard]] std::string ingressChannel() const override { return transport_.ingressChannel(); }   // issue #115
 
     // -------------------------------------------------------------------------
     // Command message type IDs for the ring

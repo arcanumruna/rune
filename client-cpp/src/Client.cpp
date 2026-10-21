@@ -64,6 +64,22 @@ ClientConfig validatedConfig(ClientConfig c) {
         while (!pw.empty() && (pw.back() == '\n' || pw.back() == '\r')) pw.pop_back();
         c.password = std::move(pw);
     }
+    // Issues #14 / #113: credentials (a SCRAM proof, a verifier in security DDL) and the bootstrap material travel
+    // only over TLS.  Without offerCrypto that is impossible: refused, never silently plaintext.
+    const bool credentialed = !c.username.empty() || !c.password.empty() || c.securityBootstrapOnly;
+    if (credentialed && !c.insecurePlaintextAuth) {
+        if (!c.offerCrypto)
+            throw std::invalid_argument("ClientConfig: credentials (username / password / securityBootstrapOnly) are "
+                                        "sent only over TLS: set offerCrypto (with tlsTrustPem and / or tlsExpectHost) "
+                                        "- insecurePlaintextAuth is for tests only");
+        c.requireCrypto = true;
+    }
+    // Issue #115: the system store with no name check accepts any public certificate for any name.
+    if (c.offerCrypto && !c.tlsTrustPem && c.tlsExpectHost.empty() &&
+        session::tlsHostOfChannel(c.gatewayChannel).empty())
+        throw std::invalid_argument("ClientConfig: offerCrypto with the system trust store needs a certificate name: "
+                                    "set tlsExpectHost (the gateway channel '" + c.gatewayChannel + "' names no host), "
+                                    "or pin a CA bundle with tlsTrustPem");
     return c;
 }
 // F8c C8: the runner start latch (spec §3.4) — one empty record on a

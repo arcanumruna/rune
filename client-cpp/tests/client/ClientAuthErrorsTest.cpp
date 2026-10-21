@@ -43,6 +43,11 @@ int freePort() {
 }
 std::string udp(int port) { return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port); }
 
+std::string testPem(const char* name) {
+    std::ifstream f(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/" + name, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
 rc::ClientConfig authCfg(int32_t in, const std::string& user, const std::string& pw) {
     rc::ClientConfig c;
     c.gatewayChannel = "aeron:ipc"; c.gatewayStreamId = in; c.egressChannel = "aeron:ipc"; c.egressStreamId = in + 1;
@@ -51,6 +56,8 @@ rc::ClientConfig authCfg(int32_t in, const std::string& user, const std::string&
     c.nanoClock = &fakeNow;
     c.ddlTimeoutMs = 3'000;
     c.username = user; c.password = pw;
+    c.offerCrypto = true;               // issue #14: credentials only over TLS - the fake serves the test certificate
+    c.tlsTrustPem = testPem("ca.pem");
     rc::TopicSpec ts; ts.name = "t"; ts.topicId = 1; ts.partitionCount = 1;
     c.topics.push_back(ts);
     return c;
@@ -62,6 +69,8 @@ struct Rig {
     explicit Rig(const rc::ClientConfig& c, pc::AuthMode mode = pc::AuthMode::Required)
         : client(c), gw(c.dataDir + "/aeron", c.gatewayChannel, c.gatewayStreamId, c.egressChannel, c.egressStreamId) {
         gw.authMode = mode;
+        gw.tlsCertPem = testPem("server.pem");
+        gw.tlsKeyPem  = testPem("server.key");
         gw.addUser("ws1", kPw);
     }
     template <class P> bool drive(P&& pred, int64_t stepNs = 0) {
@@ -237,6 +246,8 @@ struct TwoNodeRig {
     }
     explicit TwoNodeRig(int32_t in) : c(cfg(in)), client(c), gw(c.dataDir + "/aeron", "aeron:ipc", in, "aeron:ipc", in + 1) {
         gw.authMode = pc::AuthMode::Required;
+        gw.tlsCertPem = testPem("server.pem");   // issue #14: every node session is TLS (names 127.0.0.1)
+        gw.tlsKeyPem  = testPem("server.key");
         gw.addUser("ws1", kPw);
         gw.uniqueSessionIds = true;
         gw.replyFromArrival = true;
@@ -710,4 +721,66 @@ TEST(ClientAuthErrorsRegression, ScramCachePaysPbkdf2OncePerVerifierRegression) 
     EXPECT_EQ(gw.authFailed, 0);
     EXPECT_EQ(agent.scramCache().pbkdf2Computations(), 2u) << "one PBKDF2 per distinct salt, not per session";
     EXPECT_EQ(agent.scramCache().hits(), 4u) << "the two later sessions hit the cache for both salts";
+}
+
+// ---- issues #14 / #115: credentials only over TLS; no name-less system trust -------------------------------------
+
+// A MITM that strips the crypto offer (here: a broker without a certificate answers the offer in plaintext) never gets
+// a credentialed client's login: requireCrypto is forced on with credentials, so no AuthClientFirst is ever sent and
+// the connect fails.  RED (issue #14): drop `c.requireCrypto = true` from validatedConfig - the client logs in plaintext.
+TEST(ClientAuthErrorsRegression, ACredentialedClientNeverLogsInOverAStrippedConnectRegression) {
+    rc::ClientConfig c = authCfg(3790, "ws1", kPw);
+    ASSERT_FALSE(c.requireCrypto) << "precondition: the caller did not ask for it";
+    Rig r(c);
+    r.gw.tlsCertPem.clear();   // the offer is answered plaintext (chosenCipher 0)
+    r.gw.tlsKeyPem.clear();
+    test_support::TestCq cq(r.client);
+    auto f = r.connectOp(cq);
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/1'000'000'000LL));
+    EXPECT_FALSE(f.ok()) << f.describe();
+    EXPECT_EQ(r.gw.authFirsts, 0) << "no SCRAM leg ever left the client in clear";
+    EXPECT_EQ(r.gw.unauthenticatedRequests, 0);
+    EXPECT_GE(r.gw.connects, 1);
+    EXPECT_NE(r.client.state(), rc::session::SessionState::Rejected) << "the stripped answer is unauthenticated";
+}
+
+// Credentials (username / password / passwordFile) or the bootstrap-only mode without offerCrypto are refused at
+// construction - never sent in clear; insecurePlaintextAuth (tests only) allows it.  RED: drop the offerCrypto check.
+TEST(ClientAuthErrorsRegression, CredentialsWithoutTlsAreRefusedAtConstructionRegression) {
+    auto plain = [](rc::ClientConfig c) { c.offerCrypto = false; c.tlsTrustPem.reset(); return c; };
+    EXPECT_THROW(rc::Client{plain(authCfg(3792, "ws1", kPw))}, std::invalid_argument);
+    {
+        rc::ClientConfig c = plain(authCfg(3794, "", ""));
+        c.securityBootstrapOnly = true;
+        EXPECT_THROW(rc::Client{c}, std::invalid_argument) << "the bootstrap material is credentials too";
+    }
+    {
+        rc::ClientConfig c = plain(authCfg(3796, "ws1", kPw));
+        c.insecurePlaintextAuth = true;
+        EXPECT_NO_THROW(rc::Client{c});
+    }
+    EXPECT_NO_THROW(rc::Client{plain(authCfg(3798, "", ""))}) << "no credentials: TLS stays optional";
+}
+
+// Issue #115: offerCrypto with the system store, no tlsExpectHost and a gateway channel that names no host would check
+// no name at all - any public certificate for any name would pass.  Refused at construction; a host in the channel, an
+// explicit tlsExpectHost or a pinned CA each make it valid.  RED: drop the tlsHostOfChannel check in validatedConfig.
+TEST(ClientCryptoRegression, SystemTrustWithoutAHostIsRefusedRegression) {
+    auto sys = [](int32_t in) {
+        rc::ClientConfig c = authCfg(in, "", "");
+        c.tlsTrustPem.reset();   // the system store
+        return c;
+    };
+    EXPECT_THROW(rc::Client{sys(3800)}, std::invalid_argument) << "aeron:ipc names no host";
+    {
+        rc::ClientConfig c = sys(3802);
+        c.tlsExpectHost = "broker.example";
+        EXPECT_NO_THROW(rc::Client{c});
+    }
+    {
+        rc::ClientConfig c = sys(3804);
+        c.gatewayChannel = udp(freePort());   // names a host (127.0.0.1)
+        EXPECT_NO_THROW(rc::Client{c});
+    }
+    EXPECT_NO_THROW(rc::Client{authCfg(3806, "", "")}) << "a pinned CA";
 }

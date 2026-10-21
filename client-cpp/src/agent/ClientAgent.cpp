@@ -1148,6 +1148,11 @@ bool ClientAgent::retargetSeedOnConnectRedirect_(const std::string& endpoint) no
     }
 }
 
+std::string SessionEndpointIo::ingressChannel() const {
+    if (owner == &agent->seedSession()) return agent->seedChannel();   // D4 r2: the seed by identity
+    return endpoint;
+}
+
 bool SessionEndpointIo::retargetToBootstrap() noexcept {
     // Only the seed session's endpoint is the transport's default publication,
     // which redirects / stick-to-leader retarget.  A leader session addresses its
