@@ -2388,13 +2388,19 @@ private:
     // per-worker pendingSubOps_ FIFO (ending Unsubscribes).  The event is enforced once every worker acknowledged its
     // fence on every ring in use (SessionSignal FenceAck).  Control thread, cold (one entry per security event).
     static constexpr int kMaxFenceWorkers = 64;   // validateShardConfig
-    struct PendingEnforce { int64_t offset; uint64_t seq; };
+    /// One applied event still awaiting its fence acks: `opWorkers` = the workers whose OP ring got this event's
+    /// Unsubscribes (only they are fenced there), `lifecycle` = this event shipped permission items (every worker's
+    /// lifecycle ring is fenced).  An event that queued nothing for any worker is enforced at once.
+    struct PendingEnforce { int64_t offset; uint64_t seq; uint64_t opWorkers; bool lifecycle; };
     std::deque<PendingEnforce>               pendingEnforce_;
     uint64_t                                 enforceFenceSeq_ = 0;
     std::array<uint64_t, kMaxFenceWorkers>   opFenceAcked_{};
     std::array<uint64_t, kMaxFenceWorkers>   lifeFenceAcked_{};
     [[nodiscard]] bool fencesOpRing_() const noexcept;
     [[nodiscard]] bool fencesLifecycleRing_() const noexcept;
+    // What the event being applied (onSecurityApplied) queued for the workers - the fences it needs.
+    bool     applyTracking_    = false;
+    uint64_t applyOpWorkers_   = 0;   ///< bit w: an Unsubscribe of this event went to worker w's op ring
     void onEnforceFenceAck_(int32_t worker, int ring, uint64_t seq) noexcept;
     void promoteEnforced_() noexcept;
     std::vector<int64_t> liveScratch_;           ///< reused session-id list (capacity persists)
@@ -2404,7 +2410,7 @@ private:
     void revokeSession_(int64_t sid, std::string_view reason);
     void executeLiveActions_(Session& s, const rune::gateway::LiveActions& act);
     void sendErrorOn_(Session& s, int64_t corr, uint16_t code, std::string_view message);
-    void noteEnforced_(int64_t offset);
+    void noteEnforced_(int64_t offset, uint64_t opWorkers, bool lifecycle);
     int32_t  currentImageSessionId_ = 0;   ///< the Aeron image (publication) session id of the frame being dispatched
     std::vector<int64_t> authReapScratch_; ///< reused by reapAuthDeadlines_ (capacity persists)
     uint64_t authGateRefusals_ = 0;

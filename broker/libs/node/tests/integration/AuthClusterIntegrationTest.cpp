@@ -299,22 +299,20 @@ TEST(AuthClusterRegression, WrongKeyBrokerNeverJoinsRegression) {
         std::this_thread::sleep_for(100ms);   // observation window of a state that must NOT change
         for (int obs : {1, 2}) EXPECT_TRUE(isrHas(t, obs, 3, false, led.id)) << "node 3 re-entered an ISR seen by node " << obs;
     }
-    // A client session on node 3 (its security view is on its own disk) cannot produce to a partition led elsewhere:
-    // the gateway never forwards a produce, it answers Redirect (3) to the leader's endpoint (NotLeader (2) only when its
-    // routing image has no leader for the partition), and nothing is stored on the leader.
-    AuthTrio::Session w3;
-    ASSERT_TRUE(AuthTrio::until(30s, [&] { try { w3 = t.login(3, "writer"); return true; } catch (...) { return false; } }));
-    const bool routeKnown = t.node(3).onControlThreadForTest([&t, &led]() {
-        const MetadataService* ms = t.node(3).metadataServiceForTest();
-        const auto* pa = ms ? ms->assignment(led.id, led.part[0]) : nullptr;
-        return pa != nullptr && pa->leaderNode != rune::metadata::NO_LEADER;
-    });
+    // Issues #15 / #111: node 3 reaches no peer, so its `__security` state (on its own disk) is not provably current -
+    // it serves no login at all (the retriable AuthUnavailable, never an OK on a frozen state), so no session of it
+    // can send anything, and nothing reaches the leader's log.
     const int64_t leo0 = partitionLeo(&t.node(1), led.id, led.part[0]);
-    const int64_t corr = w3.w->raw().nextCorrelationId();
-    ASSERT_TRUE(w3.w->raw().produce(t.channel(3), AuthWireClient::kClientStream, w3.sid, corr, led.id, led.part[0], 1, makeBatch(1)));
-    const int code3 = ackOrErrorCode(w3.w->raw(), corr, 10s);
-    if (routeKnown) EXPECT_EQ(code3, 3) << "Redirect to the partition's leader";
-    else EXPECT_TRUE(code3 == 3 || code3 == 2) << "Redirect, or NotLeader while the routing image is empty; got " << code3;
+    {
+        AuthWireClient& w = t.wire();
+        for (int i = 0; i < 5; ++i) {
+            const int64_t sid = w.connect(t.channel(3));
+            ASSERT_GT(sid, 0);
+            EXPECT_EQ(w.login(t.channel(3), sid, "writer", {AuthTrio::kPw, AuthTrio::kPw}).errorCode(), 48)
+                << "attempt " << i << ": a broker cut off its peers answers AuthUnavailable";
+        }
+        EXPECT_NE(t.node(3).securityServingForTest(), "Serving");
+    }
     EXPECT_EQ(partitionLeo(&t.node(1), led.id, led.part[0]), leo0) << "nothing reached the leader's log";
 
     // Node 3 never votes in a term the others accept.  Its consensus frames do not open on nodes 1 and 2, so with the

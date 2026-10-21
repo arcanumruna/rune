@@ -171,8 +171,8 @@ TEST(SecurityEnforcementFenceRegression, AShardRevokeIsEnforcedOnlyOnceEveryWork
 
     r.runWorker(0, 10);
     EXPECT_LT(r.gw.securityEnforcedOffset(), off) << "worker 1 has not installed the revoke yet";
-    EXPECT_GE(r.gw.enforceFenceAckedForTest(0, 0), 1u);
-    EXPECT_GE(r.gw.enforceFenceAckedForTest(0, 1), 1u);
+    EXPECT_GE(r.gw.enforceFenceAckedForTest(0, 1), 1u) << "worker 0 acknowledged the lifecycle fence";
+    EXPECT_EQ(r.gw.enforceFenceAckedForTest(0, 0), 0u) << "no Unsubscribe was queued: no op-ring fence is owed";
 
     r.runWorker(1, 11);
     EXPECT_EQ(r.gw.securityEnforcedOffset(), off) << "every worker acknowledged the fence behind the revoke";
@@ -260,6 +260,36 @@ TEST(SecurityEnforcementFenceRegression, AWorkerPushedSubscriptionIsEndedByItsWo
     r.gw.handleWorkerReturnForTest(ack);
     EXPECT_EQ(r.gw.securityEnforcedOffset(), off);
     EXPECT_EQ(r.errorOn(77), -1) << "still nothing from the gateway: the worker sends the 45 after its last Records";
+}
+
+// Issues #109 / #196: an event that queues nothing for any worker (a CREATE USER, a GRANT to a user with no session)
+// is enforced at once - only what an event queued for a worker is waited for, so a busy or slow worker never delays
+// an unrelated OK.
+TEST(SecurityEnforcementFenceRegression, AnEventThatQueuesNothingForTheWorkersIsEnforcedAtOnceRegression) {
+    FenceRig r(2);
+    (void)r.login("w");
+    for (int i = 0; i < 3; ++i) r.runAll(1 + i);
+    const uint64_t fences = r.gw.enforceFencesIssuedForTest();
+    const auto ev = r.chain.createUser("nobody-logged-in");
+    const auto bytes = sec::encode(ev);
+    ASSERT_TRUE(bytes.has_value());
+    const auto off = static_cast<int64_t>(r.chain.count()) - 1;
+    auto applied = r.view->onApplied(off, *bytes);
+    ASSERT_TRUE(applied.has_value());
+    r.gw.onSecurityApplied(off, *applied);
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), off) << "nothing to wait for";
+    EXPECT_EQ(r.gw.enforceFencesIssuedForTest(), fences) << "no fence issued";
+    // ... and an event behind a still-fenced one waits for it (the enforced offset moves forward, in order).
+    const int64_t revoke = r.revoke(sec::Operation::Write, "w");
+    const auto ev2 = r.chain.createUser("another");
+    const auto off2 = static_cast<int64_t>(r.chain.count()) - 1;
+    auto applied2 = r.view->onApplied(off2, *sec::encode(ev2));
+    ASSERT_TRUE(applied2.has_value());
+    r.gw.onSecurityApplied(off2, *applied2);
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), off) << "behind the REVOKE still awaiting its fence";
+    r.runAll(20);
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), off2);
+    (void)revoke;
 }
 
 // Issue #109 control: a subscription whose Subscribe never reached a worker (it waited for its record egress) has no

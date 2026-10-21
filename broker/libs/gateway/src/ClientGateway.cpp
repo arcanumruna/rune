@@ -4586,6 +4586,7 @@ bool ClientGateway::forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, 
     p.endCode       = atWorker ? endCode : int16_t{0};
     if (p.endCode != 0) p.endDetail.assign(endDetail.substr(0, 192));   // cold: a revoked READ
     const auto w = static_cast<std::size_t>(workerPool_->ownerWorkerId(topicId, partition));
+    if (applyTracking_ && w < 64) [[unlikely]] applyOpWorkers_ |= uint64_t{1} << w;   // #109: the event's fence covers it
     const bool behind = w < pendingSubOps_.size() && !pendingSubOps_[w].empty();
     if (behind || !trySubOp_(p)) queueSubOp_(std::move(p));
     return atWorker;
@@ -8477,33 +8478,33 @@ bool ClientGateway::fencesOpRing_() const noexcept
     return workerPool_ != nullptr && perWorkerEgressActive_;
 }
 
-void ClientGateway::noteEnforced_(int64_t offset)
+void ClientGateway::noteEnforced_(int64_t offset, uint64_t opWorkers, bool lifecycle)
 {
-    // Enforced = every table refreshed here (synchronous, done by the caller) AND, with workers, every worker executed
-    // what this event queued for it: a fence goes behind the event's ops on each ring in use; the event is enforced
-    // once every worker acknowledged it (onEnforceFenceAck_).  Without workers it is enforced now.
-    const bool life = fencesLifecycleRing_();
-    const bool ops  = fencesOpRing_();
-    if (!life && !ops) {
+    // Enforced = every table refreshed here (synchronous, done by the caller) AND every worker executed what this
+    // event queued for it: a fence goes behind the event's ops on each ring that got some - the lifecycle ring of every
+    // worker when it shipped permission items, the op ring of each worker an Unsubscribe went to - and the event is
+    // enforced once those workers acknowledged it (onEnforceFenceAck_).  An event that queued nothing is enforced now
+    // (behind any still-fenced earlier one: the enforced offset only moves forward, in event order).
+    const bool life = lifecycle && fencesLifecycleRing_();
+    const uint64_t ops = fencesOpRing_() ? opWorkers : 0;
+    if (!life && ops == 0) {
         if (pendingEnforce_.empty()) securityEnforcedOffset_ = std::max(securityEnforcedOffset_, offset);
-        else pendingEnforce_.push_back({offset, pendingEnforce_.back().seq});   // behind the still-fenced ones
-        promoteEnforced_();
+        else pendingEnforce_.push_back({offset, 0, 0, false});
         return;
     }
     const uint64_t seq = ++enforceFenceSeq_;
     if (life) (void)permissionShipper_.fence(*workerPool_, seq);   // FIFO behind every bitmap / bind queued so far
-    if (ops) {
-        const int32_t n = std::min<int32_t>(workerPool_->workerCount(), kMaxFenceWorkers);
-        for (int32_t w = 0; w < n; ++w) {
-            PendingSubOp p;
-            p.fenceSeq    = seq;
-            p.fenceWorker = w;
-            const auto wi = static_cast<std::size_t>(w);
-            const bool behind = wi < pendingSubOps_.size() && !pendingSubOps_[wi].empty();   // FIFO behind the ends
-            if (behind || !trySubOp_(p)) queueSubOp_(std::move(p));
-        }
+    const int32_t n = std::min<int32_t>(workerPool_->workerCount(), kMaxFenceWorkers);
+    for (int32_t w = 0; w < n; ++w) {
+        if ((ops & (uint64_t{1} << w)) == 0) continue;
+        PendingSubOp p;
+        p.fenceSeq    = seq;
+        p.fenceWorker = w;
+        const auto wi = static_cast<std::size_t>(w);
+        const bool behind = wi < pendingSubOps_.size() && !pendingSubOps_[wi].empty();   // FIFO behind the ends
+        if (behind || !trySubOp_(p)) queueSubOp_(std::move(p));
     }
-    pendingEnforce_.push_back({offset, seq});
+    pendingEnforce_.push_back({offset, seq, ops, life});
 }
 
 void ClientGateway::onEnforceFenceAck_(int32_t worker, int ring, uint64_t seq) noexcept
@@ -8516,18 +8517,17 @@ void ClientGateway::onEnforceFenceAck_(int32_t worker, int ring, uint64_t seq) n
 
 void ClientGateway::promoteEnforced_() noexcept
 {
-    const bool life = fencesLifecycleRing_();
-    const bool ops  = fencesOpRing_();
-    uint64_t done = UINT64_MAX;   // the newest fence EVERY worker acknowledged on every ring in use
-    if (workerPool_ != nullptr && (life || ops)) {
-        const int32_t n = std::min<int32_t>(workerPool_->workerCount(), kMaxFenceWorkers);
-        for (int32_t w = 0; w < n; ++w) {
-            if (life) done = std::min(done, lifeFenceAcked_[static_cast<std::size_t>(w)]);
-            if (ops)  done = std::min(done, opFenceAcked_[static_cast<std::size_t>(w)]);
+    const int32_t n = workerPool_ != nullptr ? std::min<int32_t>(workerPool_->workerCount(), kMaxFenceWorkers) : 0;
+    while (!pendingEnforce_.empty()) {
+        const PendingEnforce& e = pendingEnforce_.front();
+        bool done = true;
+        for (int32_t w = 0; w < n && done; ++w) {
+            const auto wi = static_cast<std::size_t>(w);
+            if (e.lifecycle && lifeFenceAcked_[wi] < e.seq) done = false;
+            if ((e.opWorkers & (uint64_t{1} << w)) != 0 && opFenceAcked_[wi] < e.seq) done = false;
         }
-    }
-    while (!pendingEnforce_.empty() && pendingEnforce_.front().seq <= done) {
-        securityEnforcedOffset_ = std::max(securityEnforcedOffset_, pendingEnforce_.front().offset);
+        if (!done) return;
+        securityEnforcedOffset_ = std::max(securityEnforcedOffset_, e.offset);
         pendingEnforce_.pop_front();
     }
 }
@@ -8546,6 +8546,10 @@ void ClientGateway::onSecurityApplied(int64_t offset, const rune::security::Appl
 {
     using namespace rune::gateway;
     if (securityView_ == nullptr || securityView_->halted()) return;
+    // Issues #109 / #196: what this event queues for the workers decides which of their rings its fence must cover.
+    applyTracking_  = true;
+    applyOpWorkers_ = 0;
+    const uint64_t shippedBefore = permissionShipper_.queuedSeq();
     if (applied.effect != rune::security::SessionEffect::None && !applied.affectedUsers.empty()) {
         liveScratch_.clear();
         sessions_.forEach([&](Session& s) {
@@ -8564,7 +8568,8 @@ void ClientGateway::onSecurityApplied(int64_t offset, const rune::security::Appl
             for (const int64_t sid : liveScratch_) revokeSession_(sid, reason);
         }
     }
-    noteEnforced_(offset);
+    applyTracking_ = false;
+    noteEnforced_(offset, applyOpWorkers_, permissionShipper_.queuedSeq() != shippedBefore);
 }
 
 void ClientGateway::refreshSession_(int64_t sid)

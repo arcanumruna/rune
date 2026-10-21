@@ -82,6 +82,8 @@ public:
         return sent;
     }
 
+    /// The newest sequence number queued so far (0 = none) - what a caller compares to know whether it shipped anything.
+    [[nodiscard]] uint64_t queuedSeq() const noexcept { return endSeq_ - 1; }
     /// The newest sequence number every worker accepted (0 = none).
     [[nodiscard]] uint64_t shippedSeq() const noexcept { return frontSeq_ - 1; }
     [[nodiscard]] std::size_t pendingUpdates() const noexcept { return queue_.size(); }
