@@ -1719,6 +1719,8 @@ TEST_F(CG3ServiceTest, FilterMismatchAnswersInvalidRequestWithDetailRegression) 
     constexpr int32_t v10 = rune::protocol::client::kClientVersion;
     auto n = encodeJoinGroup(req_, 1, 1, "fg", "", 5000, kGroupFilterA);
     (void)service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize);
+    const auto gen0   = service_->coordinator("fg").generationId();
+    const auto state0 = service_->coordinator("fg").state();
 
     for (const auto* other : {&kGroupFilterB, static_cast<const std::vector<uint8_t>*>(nullptr)}) {
         n = encodeJoinGroup(req_, 2, 2, "fg", "", 5000, other ? std::span<const uint8_t>(*other) : std::span<const uint8_t>{});
@@ -1731,6 +1733,8 @@ TEST_F(CG3ServiceTest, FilterMismatchAnswersInvalidRequestWithDetailRegression) 
         EXPECT_NE(r->detail.find("0101ab"), std::string_view::npos) << r->detail;
     }
     EXPECT_EQ(service_->coordinator("fg").memberCount(), 1u) << "the refused joiner is not a member";
+    EXPECT_EQ(service_->coordinator("fg").generationId(), gen0) << "a refusal does not rebalance";
+    EXPECT_EQ(service_->coordinator("fg").state(), state0);
 }
 
 TEST_F(CG3ServiceTest, OldMemberWithoutFilterIsRefusedFromAFilteredGroupRegression) {
@@ -1745,4 +1749,68 @@ TEST_F(CG3ServiceTest, OldMemberWithoutFilterIsRefusedFromAFilteredGroupRegressi
     EXPECT_TRUE(r->detail.empty());
     EXPECT_EQ(o, pc::JoinGroupResponse{}.encodedSize()) << "the byte-identical legacy frame";
     EXPECT_EQ(service_->coordinator("fg").memberCount(), 1u);
+}
+
+TEST_F(CG3ServiceTest, SoleMemberRejoiningWithADifferentFilterIsRefusedAndKeptRegression) {
+    constexpr int32_t v10 = rune::protocol::client::kClientVersion;
+    auto n = encodeJoinGroup(req_, 1, 1, "fg", "", 5000, kGroupFilterA);
+    auto r1 = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize));
+    ASSERT_TRUE(r1.has_value());
+    const std::string m1(reinterpret_cast<const char*>(r1->memberId.data()), r1->memberId.size());
+    const auto gen0 = service_->coordinator("fg").generationId();
+
+    n = encodeJoinGroup(req_, 1, 2, "fg", m1, 5000, kGroupFilterB);
+    auto r2 = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize));
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r2->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(service_->coordinator("fg").memberCount(), 1u) << "the refusal does not remove the member";
+    EXPECT_EQ(service_->coordinator("fg").generationId(), gen0);
+    EXPECT_EQ(std::vector<uint8_t>(service_->coordinator("fg").filterBytes().begin(),
+                                   service_->coordinator("fg").filterBytes().end()), kGroupFilterA);
+}
+
+TEST_F(CG3ServiceTest, FilterJoiningAGroupFixedWithNoFilterNamesNoneRegression) {
+    constexpr int32_t v10 = rune::protocol::client::kClientVersion;
+    auto n = encodeJoinGroup(req_, 1, 1, "fg", "");
+    (void)service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize);
+    n = encodeJoinGroup(req_, 2, 2, "fg", "", 5000, kGroupFilterA);
+    auto r = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_TRUE(r->detail.ends_with("filter none")) << r->detail;
+}
+
+TEST_F(CG3ServiceTest, PreV5MemberIsRefusedWithProtocolVersionFromAFilteredGroupRegression) {
+    auto n = encodeJoinGroup(req_, 1, 1, "fg", "", 5000, kGroupFilterA);
+    (void)service_->handleJoinGroup(req_, n, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
+    for (const int32_t old : {3, 4}) {   // below 5 re-joins forever on InvalidRequest
+        n = encodeJoinGroup(req_, 2, 2, "fg", "");
+        const std::size_t o = service_->handleJoinGroup(req_, n, old, clock_, out_, kBufSize);
+        auto r = pc::JoinGroupResponse::decode(out_, o);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::ProtocolVersion)) << old;
+        EXPECT_TRUE(r->detail.empty());
+        EXPECT_EQ(o, pc::JoinGroupResponse{}.encodedSize());
+    }
+    EXPECT_EQ(service_->coordinator("fg").memberCount(), 1u);
+}
+
+TEST_F(CG3ServiceTest, OverCapJoinGroupFilterIsRefusedAndNeverFixesTheGroupRegression) {
+    constexpr int32_t v10 = rune::protocol::client::kClientVersion;
+    const std::vector<uint8_t> big(rune::codec::kMaxFilterBytes + 1, 0x42);
+    const std::vector<uint8_t> atCap(rune::codec::kMaxFilterBytes, 0x42);
+    auto n = encodeJoinGroup(req_, 1, 1, "fg", "", 5000, big);
+    std::size_t o = service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize);
+    auto r = pc::JoinGroupResponse::decode(out_, o);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_FALSE(r->detail.empty());
+    EXPECT_EQ(service_->coordinator("fg").memberCount(), 0u);
+    EXPECT_TRUE(service_->coordinator("fg").filterBytes().empty());
+
+    // the cap itself is admitted (validation of the bytes is the Subscribe path's job)
+    n = encodeJoinGroup(req_, 1, 2, "fg", "", 5000, atCap);
+    r = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
 }

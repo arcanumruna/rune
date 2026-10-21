@@ -1385,6 +1385,42 @@ TEST(GroupCoordinatorFilter, EmptyGroupAcceptsANewFilter) {
     EXPECT_EQ(std::vector<uint8_t>(gc.filterBytes().begin(), gc.filterBytes().end()), kF2);
 }
 
+// Every way a group empties reopens the filter: session-timeout expiry and rebalance-timeout eviction too.
+TEST(GroupCoordinatorFilterRegression, FilterReopensWhenTheGroupEmptiesBySessionExpiryRegression) {
+    GroupCoordinator gc("g");
+    ASSERT_TRUE(gc.admitFilter(kF1));
+    (void)gc.join("a", kDefaultTimeoutMs, kNoTopics, 0);
+    EXPECT_FALSE(gc.admitFilter(kF2));
+    gc.doWork(afterTimeout(0, kDefaultTimeoutMs));
+    ASSERT_TRUE(gc.isEmpty());
+    EXPECT_TRUE(gc.admitFilter(kF2));
+    EXPECT_EQ(std::vector<uint8_t>(gc.filterBytes().begin(), gc.filterBytes().end()), kF2);
+}
+
+TEST(GroupCoordinatorFilterRegression, FilterReopensWhenTheGroupEmptiesByRebalanceEvictionRegression) {
+    GroupCoordinator gc("g");
+    gc.setRebalanceTimeoutMs(1000);
+    ASSERT_TRUE(gc.admitFilter(kF1));
+    (void)gc.join("a", kDefaultTimeoutMs, kNoTopics, 0);
+    // the first join starts a rebalance; "a" never re-joins, so the rebalance timeout evicts it
+    // (well before its 30 s session timeout)
+    const int64_t t = 1000LL * 1'000'000LL + 1;
+    gc.doWork(t);
+    ASSERT_TRUE(gc.isEmpty());
+    EXPECT_TRUE(gc.admitFilter(kF2));
+}
+
+TEST(GroupCoordinatorFilterRegression, FilterStaysFixedWhileAMemberRemainsRegression) {
+    GroupCoordinator gc("g");
+    ASSERT_TRUE(gc.admitFilter(kF1));
+    const JoinResult a = gc.join("a", kDefaultTimeoutMs, kNoTopics, 0);
+    ASSERT_TRUE(gc.admitFilter(kF1));
+    (void)gc.join("b", kDefaultTimeoutMs, kNoTopics, 1);
+    gc.leave(a.memberId, gc.generationId(), 2);
+    ASSERT_EQ(gc.memberCount(), 1u);
+    EXPECT_FALSE(gc.admitFilter(kF2)) << "a non-last leave keeps the filter fixed";
+}
+
 TEST(GroupCoordinatorFilterRegression, NoFilterIsAFilterValueRegression) {
     GroupCoordinator plain("g");
     ASSERT_TRUE(plain.admitFilter({}));

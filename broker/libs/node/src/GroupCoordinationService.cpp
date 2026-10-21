@@ -11,6 +11,7 @@
 
 #include <rune/gateway/ClientGateway.h>  // CG-4: addGroupSubscription / revokeGroupSubscriptions / sendControlFrame
 
+#include <rune/codec/FilterWire.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/Protocol.h>
@@ -486,7 +487,9 @@ size_t GroupCoordinationService::handleJoinGroup(
     // The session's version is the one the frame was decoded with: an older member carries no filter.
     const int32_t ver = clientVersion;
     const std::span<const uint8_t> filter = pc::clientUnderstandsFilters(ver) ? msg.filter : std::span<const uint8_t>{};
-    if (!gc.admitFilter(filter)) {
+    // A refused join: never admitted, no state change.  Old clients get the rule's ProtocolVersion; the detail
+    // (cold; reserved member string) goes to a session >= 10 only.
+    auto refuseJoin = [&](std::string detail) {
         pc::JoinGroupResponse resp;
         resp.sessionId     = msg.sessionId;
         resp.correlationId = msg.correlationId;
@@ -495,13 +498,22 @@ size_t GroupCoordinationService::handleJoinGroup(
         resp.isLeader      = 0;
         resp.memberId      = std::span<const uint8_t>();
         if (pc::clientUnderstandsFilters(ver)) {
-            filterDetailScratch_ = groupFilterMismatchDetail(gc.filterBytes());   // cold; reserved member string
+            filterDetailScratch_ = std::move(detail);
             resp.detail = filterDetailScratch_;
         }
-        noteFilterMismatch_(groupIdStr, msg.sessionId);
         // encodeFor writes the detail only to a session >= 10 (encode() never does)
         const std::size_t n = resp.encodeFor(out, ver, outCap);
         return n != 0 ? n : resp.encode(out);
+    };
+    // The same cap the Subscribe filter path enforces (CompiledFilter::compile): no group is fixed to bytes every
+    // Subscribe would refuse.
+    if (filter.size() > rune::codec::kMaxFilterBytes) {
+        return refuseJoin("group filter too large: " + std::to_string(filter.size()) + " bytes, at most " +
+                          std::to_string(rune::codec::kMaxFilterBytes));
+    }
+    if (!gc.admitFilter(filter)) {
+        noteFilterMismatch_(groupIdStr, msg.sessionId);
+        return refuseJoin(groupFilterMismatchDetail(gc.filterBytes()));
     }
 
     // Collect subscribedTopicIds → topic names.
