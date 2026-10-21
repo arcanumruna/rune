@@ -67,7 +67,7 @@ public:
         for (int32_t w = 0; w < workers_; ++w) sent += pumpWorker_(pool, w);
         // Items every worker passed leave the queue.
         uint64_t low = endSeq_;
-        for (int32_t w = 0; w < workers_; ++w) low = std::min(low, next_[static_cast<std::size_t>(w)].seq);
+        for (int32_t w = 0; w < workers_; ++w) low = std::min(low, next_[static_cast<std::size_t>(w)].nextSeq);
         while (frontSeq_ < low) { queue_.pop_front(); ++frontSeq_; }
         return sent;
     }
@@ -90,7 +90,7 @@ private:
         bool                  grantAll = false;
         std::vector<uint64_t> words;
     };
-    struct Cursor { uint64_t seq = 1; std::size_t word = 0; };   // per worker: the next item and, in a Table, word
+    struct Cursor { uint64_t nextSeq = 1; std::size_t nextWord = 0; };   // per worker: the next item and, in a Table, word
 
     uint64_t push_(WorkerPool& pool, Item it) {
         queue_.push_back(std::move(it));
@@ -138,18 +138,18 @@ private:
 
     /// Worker `w`: send its next ops in queue order until its ring is full or it has every item.
     int pumpWorker_(WorkerPool& pool, int32_t w) {
-        Cursor& c = next_[static_cast<std::size_t>(w)];
+        Cursor& cur = next_[static_cast<std::size_t>(w)];
         int sent = 0;
-        while (c.seq < endSeq_) {
-            const Item& it = queue_[static_cast<std::size_t>(c.seq - frontSeq_)];
+        while (cur.nextSeq < endSeq_) {
+            const Item& it = queue_[static_cast<std::size_t>(cur.nextSeq - frontSeq_)];
             bool last = true;
-            WorkerOp op = opOf_(it, c.word, last);
+            WorkerOp op = opOf_(it, cur.nextWord, last);
             const std::size_t words = op.permWordCount;
             if (!pool.worker(w).tryEnqueueOp(std::move(op))) return sent;   // ring full: resume here next retry
             ++sent;
             ++chunksSent_;
             wordsSent_ += words;
-            if (last) { ++c.seq; c.word = 0; } else { c.word += words; }
+            if (last) { ++cur.nextSeq; cur.nextWord = 0; } else { cur.nextWord += words; }
         }
         return sent;
     }
