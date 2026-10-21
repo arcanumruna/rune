@@ -1025,4 +1025,75 @@ TEST_F(WorkerFilterRegression, FilteredDiskCursorBelowTheLogStartIsRaisedRegress
     std::filesystem::remove_all(dir);
 }
 
+// ---- Task 16: the unfiltered pass walks a list once a filtered group exists; every mutation must invalidate it ----
+TEST_F(WorkerFilterRegression, UnfilteredSubscribeAddedAfterAFilteredGroupExistsReceivesDataRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    for (int i = 0; i < 4; ++i) appendRows(log, worlds({7, 1}));
+    openEgress(3425);
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(eg_.get());
+    const Fb f = worldEq(7);
+    ASSERT_TRUE(w.tryEnqueueOp(schemaOp(kTopic, 2)));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(1, kTopic, 0, 0, &log, f)));
+    FilterCollector c;
+    ASSERT_TRUE(pump(w, c, [&] { return c.offsets(1).size() == 4; }));
+    ASSERT_NE(w.filterGroupForTest(kTopic, 0, 0), nullptr) << "precondition: a filtered group is alive";
+    settle(w, c, 20ms);   // the unfiltered pass has already walked its list at least once without sub 2
+    // Only now does the unfiltered subscription arrive; it must be served from the start, and keep being served.
+    ASSERT_TRUE(w.tryEnqueueOp(plainSubscribeOp(2, kTopic, 0, 0, &log)));
+    ASSERT_TRUE(pump(w, c, [&] { return c.dataFrames(2) == 4; })) << "unfiltered frames: " << c.dataFrames(2) << "/4";
+    appendRows(log, worlds({7, 1}));
+    ASSERT_TRUE(pump(w, c, [&] { return c.dataFrames(2) == 5 && c.offsets(1).size() == 5; }))
+        << "the late unfiltered subscription stopped being served: " << c.dataFrames(2) << "/5";
+    EXPECT_TRUE(c.notes(2).empty());
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(WorkerFilterRegression, FilteredTooLargeOwedErrorIsRetriedUnderBackPressureWhileTheGroupLivesRegression) {
+    auto dirA = tempLogDir();
+    auto dirB = tempLogDir();
+    rune::storage::Log logA(dirA.string(), 64LL * 1024 * 1024);
+    rune::storage::Log logB(dirB.string(), 64LL * 1024 * 1024);
+    for (int i = 0; i < 120; ++i) {   // an unfiltered backlog that fills the egress while nobody polls
+        const int64_t base = logA.logEndOffset();
+        rune::protocol::RecordBatchBuilder b(base, 1000);
+        b.append("k", std::string(4 * 1024, 'x'), 1000);
+        const auto bytes = b.build();
+        logA.appendNoSync(bytes.data(), bytes.size(), base);
+    }
+    appendRows(logB, worlds({7, 9}));   // both members are InSync after this
+    openEgress(3426);
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(eg_.get());
+    const Fb f7 = worldEq(7), f9 = worldEq(9);
+    ASSERT_TRUE(w.tryEnqueueOp(schemaOp(kTopic, 2)));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(1, kTopic, 0, 0, &logB, f7)));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(2, kTopic, 0, 0, &logB, f9)));   // keeps the group alive
+    FilterCollector c;
+    ASSERT_TRUE(pump(w, c, [&] { return c.offsets(1).size() == 1 && c.offsets(2).size() == 1; }));
+    ASSERT_TRUE(std::holds_alternative<filter::InSync>(w.filterGroupForTest(kTopic, 0, 0)->stateOf(0)));
+    ASSERT_TRUE(w.tryEnqueueOp(plainSubscribeOp(3, 11, 0, 0, &logA)));
+    for (int i = 0; i < 300; ++i) { w.doWork(nowNs()); std::this_thread::sleep_for(100us); }   // no polling: the egress saturates
+    std::vector<PlayerRow> huge;
+    for (int i = 0; i < 300; ++i) huge.push_back(PlayerRow{.worldId = 7});   // ~18 KB > the 8 KiB egress max message
+    appendRows(logB, huge);
+    for (int i = 0; i < 40; ++i) { w.doWork(nowNs()); std::this_thread::sleep_for(100us); }
+    bool owed = false;
+    for (const auto& s : w.subscriptionsForTest()) if (s.subscriptionId == 1) owed = s.pushState == Worker::WorkerSubscription::PushState::ErrorOwed;
+    ASSERT_TRUE(owed) << "precondition: the egress was back-pressured, so the TooLarge error is still owed";
+    ASSERT_NE(w.filterGroupForTest(kTopic, 0, 0), nullptr);
+    ASSERT_EQ(w.filterGroupForTest(kTopic, 0, 0)->memberCount(), 2u) << "precondition: another filtered member keeps the group alive";
+    ASSERT_TRUE(pump(w, c, [&] {
+        for (const auto& e : c.errors) if (e.code == static_cast<int16_t>(pc::ErrorCode::MessageTooLarge)) return true;
+        return false;
+    })) << "the owed TooLarge error never arrived (a hang)";
+    settle(w, c, 100ms);
+    std::size_t tooLarge = 0;
+    for (const auto& e : c.errors) tooLarge += e.code == static_cast<int16_t>(pc::ErrorCode::MessageTooLarge);
+    EXPECT_EQ(tooLarge, 1u) << "exactly one";
+    std::filesystem::remove_all(dirA);
+    std::filesystem::remove_all(dirB);
+}
+
 }  // namespace

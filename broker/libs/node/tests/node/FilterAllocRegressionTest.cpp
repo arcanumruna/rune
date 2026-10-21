@@ -16,6 +16,7 @@
 #include <rune/storage/Log.h>
 
 #include <Aeron.h>
+#include <FragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
 #include <gtest/gtest.h>
 #include <unistd.h>
@@ -166,11 +167,13 @@ TEST(FilterAllocRegression, SteadyStateFilteredPushAllocatesNothingRegression) {
         variants.push_back(makePlayerBatch(0, kVer, rowsOf(ws)));
     }
 
-    uint64_t dataFrames = 0;
-    auto handler = [&](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off, aeron::util::index_t len, aeron::Header&) {
+    uint64_t dataFrames = 0, controlFrames = 0;
+    // IPC fragments at the MTU: reassemble whole messages (the unfiltered control's 32-row batches span several fragments).
+    aeron::FragmentAssembler assembler([&](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off, aeron::util::index_t len, aeron::Header&) {
         const auto r = pc::Records::decode(reinterpret_cast<const uint8_t*>(buf.buffer() + off), static_cast<std::size_t>(len));
-        if (r && !r->recordBatch.empty()) ++dataFrames;
-    };
+        if (r && !r->recordBatch.empty()) { ++dataFrames; if (r->subscriptionId == kControlSub) ++controlFrames; }
+    });
+    auto handler = assembler.handler();
     auto drain = [&] { while (sub->poll(handler, 256) > 0) {} };
 
     auto batchStep = [&](int i, uint64_t& allocs) {
@@ -203,6 +206,7 @@ TEST(FilterAllocRegression, SteadyStateFilteredPushAllocatesNothingRegression) {
     EXPECT_GT(end.rebuilt, warm.rebuilt);
     EXPECT_GT(end.notes, warm.notes);
     EXPECT_GT(dataFrames, 10'000u);
+    EXPECT_GE(controlFrames, 10'000u) << "the unfiltered control must be served every batch while the filtered group is alive";
 
     sub.reset();
     pub.reset();

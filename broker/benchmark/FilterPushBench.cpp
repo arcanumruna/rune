@@ -132,9 +132,14 @@ void BM_FilterIndexLookup(benchmark::State& state) {
     const bool ok = ns <= 5.0;
     if (subs == 1) gLookupNs1[hit ? 1 : 0] = bestNs;
     bool flat = true;
-    if (subs == 500 && gLookupNs1[hit ? 1 : 0] > 0.0) flat = bestNs <= 1.10 * gLookupNs1[hit ? 1 : 0];
+    // The 500 arm needs the 1-subscriber reference of the same hit mode: a narrower --benchmark_filter fails loudly.
+    const bool missingRef = subs == 500 && gLookupNs1[hit ? 1 : 0] <= 0.0;
+    if (subs == 500 && !missingRef) flat = bestNs <= 1.10 * gLookupNs1[hit ? 1 : 0];
     if (state.thread_index() == 0)
-        rune::bench::gateCheck(state, ok && flat, !ok ? "ns_per_record > 5.0" : "ns_per_record(500) > 1.10 x ns_per_record(1)");
+        rune::bench::gateCheck(state, ok && flat && !missingRef,
+                               !ok ? "ns_per_record > 5.0"
+                               : missingRef ? "flatness reference missing: run the 1-subscriber arm (BM_FilterIndexLookup/1/<hit>) in the same process"
+                                            : "ns_per_record(500) > 1.10 x ns_per_record(1)");
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -382,7 +387,9 @@ void BM_FilterWorkerPush(benchmark::State& state) {
 
     if (subs == 1) gPushNs1 = nsPerRec;
     const char* msg = nullptr;
-    if (p50 > 50.0) msg = "p50_us > 50";
+    if (subs == 500 && gPushNs1 <= 0.0)
+        msg = "flatness reference missing: run BM_FilterWorkerPush/1 in the same process";
+    else if (p50 > 50.0) msg = "p50_us > 50";
     else if (p99 > 200.0) msg = "p99_us > 200";
     else if (allocs != 0) msg = "allocs != 0";
     else if (subs == 500 && gPushNs1 > 0.0 && nsPerRec > 1.10 * gPushNs1)
