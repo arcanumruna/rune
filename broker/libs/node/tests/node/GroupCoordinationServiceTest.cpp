@@ -1856,3 +1856,131 @@ TEST_F(MemberBindingTest, ExpiredMemberLosesItsBindingRegression) {
         req_, encodeJoinGroup(req_, 1, ++corr_, "g-expire", m.id, 5000), clock_, out_, kBufSize));
     EXPECT_NE(next, m.id);
 }
+
+// ===========================================================================
+// Adversarial review of PR #423 (issues #123 / #124 / #169): attack the member-binding area through the service's
+// public handlers (the wire frames the gateway forwards).
+// ===========================================================================
+
+// Protocol state (replay after Leave): a member id that left is never re-adopted - not by its own session, not by
+// another - and every member-scoped request naming it is UnknownMember.
+TEST_F(MemberBindingTest, LeftMemberIdIsNeverReadoptedAdversarialRegression) {
+    const JoinedMember m = joinStable(1, "g-left");
+    ASSERT_EQ(leave(1, "g-left", m.id), kOk);
+    for (const int64_t sid : {int64_t{1}, int64_t{2}}) {
+        EXPECT_EQ(heartbeat(sid, "g-left", m.id, m.generation), kUnknownMember) << "session " << sid;
+        EXPECT_EQ(sync(sid, "g-left", m.id, m.generation),
+                  sync(sid, "g-left", "g-left-9-00000000000000000000000000000000", m.generation)) << "session " << sid;
+        EXPECT_EQ(commit(sid, "g-left", m.id, m.generation, 9), kUnknownMember) << "session " << sid;
+        EXPECT_EQ(leave(sid, "g-left", m.id), kUnknownMember) << "session " << sid;
+        const std::string got = memberOf(service_->handleJoinGroup(
+            req_, encodeJoinGroup(req_, sid, ++corr_, "g-left", m.id, 5000), clock_, out_, kBufSize));
+        EXPECT_NE(got, m.id) << "session " << sid << ": a departed member id was re-adopted";
+        EXPECT_FALSE(got.empty());
+    }
+}
+
+// Protocol state x group state: requests naming another session's member while the group is PreparingRebalance and
+// then Stable change nothing (no generation bump, no member removed, no position moved) and are answered exactly as
+// for a member that does not exist.
+TEST_F(MemberBindingTest, ForeignRequestsInEveryRebalanceStateChangeNothingAdversarialRegression) {
+    const JoinedMember a = joinStable(1, "g-states");
+    auto& gc = service_->coordinator("g-states");
+    ASSERT_EQ(commit(1, "g-states", a.id, a.generation, 100), kOk);
+    // A second member (session 4) joins: PreparingRebalance.
+    const std::string b = memberOf(service_->handleJoinGroup(
+        req_, encodeJoinGroup(req_, 4, ++corr_, "g-states", "", 5000), clock_, out_, kBufSize));
+    ASSERT_EQ(gc.state(), GroupState::PreparingRebalance);
+    auto attack = [&](const char* where) {
+        const int32_t gen = gc.generationId();
+        const GroupState st = gc.state();
+        const std::size_t members = gc.memberCount();
+        const std::string nobody = "g-states-9-00000000000000000000000000000000";
+        for (const std::string& victim : {a.id, b}) {
+            EXPECT_EQ(heartbeat(2, "g-states", victim, gen), heartbeat(2, "g-states", nobody, gen)) << where;
+            EXPECT_EQ(sync(2, "g-states", victim, gen), sync(2, "g-states", nobody, gen)) << where;
+            EXPECT_EQ(commit(2, "g-states", victim, gen, 777), kUnknownMember) << where;
+            EXPECT_EQ(leave(2, "g-states", victim), kUnknownMember) << where;
+        }
+        EXPECT_EQ(gc.generationId(), gen) << where;
+        EXPECT_EQ(gc.state(), st) << where;
+        EXPECT_EQ(gc.memberCount(), members) << where;
+        EXPECT_EQ(committed("g-states"), 100) << where << ": a foreign commit moved the position";
+    };
+    attack("PreparingRebalance");
+    (void)service_->handleJoinGroup(req_, encodeJoinGroup(req_, 1, ++corr_, "g-states", a.id, 5000), clock_, out_, kBufSize);
+    (void)service_->handleJoinGroup(req_, encodeJoinGroup(req_, 4, ++corr_, "g-states", b, 5000), clock_, out_, kBufSize);
+    ASSERT_TRUE(driveUntil([&] { return gc.state() == GroupState::Stable; }, 10));
+    attack("Stable");
+    EXPECT_EQ(gc.memberCount(), 2u);
+}
+
+// Concurrency / reconnect: the owner re-joins from a new session (same principal) and so moves its member there.  The
+// old session closing afterwards (session reap) must not evict the moved member, and the old session no longer owns it.
+TEST_F(MemberBindingTest, ClosingTheOldSessionDoesNotEvictAMemberItsOwnerMovedAdversarialRegression) {
+    const JoinedMember m = joinStable(1, "g-moved");
+    const std::string again = memberOf(service_->handleJoinGroup(
+        req_, encodeJoinGroup(req_, 3, ++corr_, "g-moved", m.id, 5000), clock_, out_, kBufSize));
+    ASSERT_EQ(again, m.id) << "a reconnect of the same principal keeps its member";
+    service_->evictSessionMembers(/*sessionId=*/1, clock_);
+    EXPECT_EQ(service_->coordinator("g-moved").memberCount(), 1u) << "the old session's reap evicted the moved member";
+    const int32_t gen = service_->coordinator("g-moved").generationId();
+    EXPECT_EQ(heartbeat(1, "g-moved", m.id, gen), kUnknownMember);
+    EXPECT_EQ(leave(1, "g-moved", m.id), kUnknownMember);
+    EXPECT_NE(heartbeat(3, "g-moved", m.id, gen), kUnknownMember);
+    EXPECT_EQ(leave(3, "g-moved", m.id), kOk);
+}
+
+// Input bounds: the binding key is "<group>:<member>".  A group name and a member id that concatenate to another
+// group's key must never reach that member, and a JoinGroup naming such an id must not adopt it (an id is never taken
+// from the client) nor move the other group's binding.  All sessions are the same (anonymous) principal here, so the
+// principal check does not mask the alias.
+TEST_F(MemberBindingTest, MemberKeySeparatorDoesNotAliasAcrossGroupsAdversarialRegression) {
+    const JoinedMember victim = joinStable(1, "x:y");
+    const int32_t gen = victim.generation;
+    // Group "x" + member "y:<victim id>" builds the victim's key "x:y:<victim id>".
+    const std::string alias = "y:" + victim.id;
+    EXPECT_EQ(heartbeat(2, "x", alias, gen), kUnknownMember);
+    EXPECT_EQ(leave(2, "x", alias), kUnknownMember);
+    EXPECT_EQ(commit(2, "x", alias, gen, 5), kUnknownMember);
+    const std::string got = memberOf(service_->handleJoinGroup(
+        req_, encodeJoinGroup(req_, 2, ++corr_, "x", alias, 5000), clock_, out_, kBufSize));
+    EXPECT_NE(got, alias);
+    EXPECT_EQ(service_->coordinator("x:y").memberCount(), 1u);
+    EXPECT_EQ(heartbeat(1, "x:y", victim.id, gen), kOk) << "the victim is untouched";
+}
+
+// Input bounds: an EMPTY member id (a standalone consumer's commit, or an id cleared by a refusal) is never a member:
+// OffsetCommit, Heartbeat, Sync and Leave naming it are UnknownMember and the position does not move.
+TEST_F(MemberBindingTest, EmptyMemberIdIsNeverAMemberAdversarialRegression) {
+    const JoinedMember m = joinStable(1, "g-empty");
+    ASSERT_EQ(commit(1, "g-empty", m.id, m.generation, 100), kOk);
+    for (const int64_t sid : {int64_t{1}, int64_t{2}}) {
+        EXPECT_EQ(commit(sid, "g-empty", "", m.generation, 500), kUnknownMember) << "session " << sid;
+        EXPECT_EQ(heartbeat(sid, "g-empty", "", m.generation), kUnknownMember) << "session " << sid;
+        EXPECT_EQ(sync(sid, "g-empty", "", m.generation), kUnknownMember) << "session " << sid;
+        EXPECT_EQ(leave(sid, "g-empty", ""), kUnknownMember) << "session " << sid;
+    }
+    EXPECT_EQ(committed("g-empty"), 100);
+    EXPECT_EQ(service_->coordinator("g-empty").memberCount(), 1u);
+}
+
+// Input bounds: a LeaveGroup truncated at every byte offset is answered (InvalidRequest, or nothing for a frame too
+// short to carry a header) and never evicts the member.
+TEST_F(MemberBindingTest, LeaveGroupTruncatedAtEveryOffsetAdversarialRegression) {
+    const JoinedMember m = joinStable(1, "g-trunc");
+    const std::size_t full = encodeLeaveGroup(req_, 1, ++corr_, "g-trunc", m.id);
+    std::vector<uint8_t> frame(req_, req_ + full);
+    for (std::size_t cut = 0; cut < full; ++cut) {
+        std::vector<uint8_t> t(frame.begin(), frame.begin() + static_cast<std::ptrdiff_t>(cut));
+        const std::size_t n = service_->handleLeaveGroup(t.data(), t.size(), clock_, out_, kBufSize);
+        if (n > 0) {
+            const auto r = pc::LeaveGroupResponse::decode(out_, n);
+            const auto e = pc::ErrorResponse::decode(out_, n);
+            const int code = r ? r->errorCode : (e ? static_cast<int>(e->code) : -1);
+            EXPECT_NE(code, static_cast<int>(kOk)) << "cut " << cut << ": a truncated Leave succeeded";
+        }
+        ASSERT_EQ(service_->coordinator("g-trunc").memberCount(), 1u) << "cut " << cut << ": the member was evicted";
+    }
+    EXPECT_EQ(heartbeat(1, "g-trunc", m.id, m.generation), kOk);
+}

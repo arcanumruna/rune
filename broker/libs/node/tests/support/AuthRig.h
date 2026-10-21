@@ -241,30 +241,32 @@ public:
         m.transactionalId = bytes(txnId);
         return rawCode(sendRaw(m, 256, m.correlationId));
     }
-    int addPartitions(int64_t sid, const std::string& txnId, int32_t topicId) {
+    int addPartitions(int64_t sid, const std::string& txnId, int32_t topicId, int64_t pid = 1, int16_t epoch = 0) {
         pc::AddPartitionsToTxn m;
-        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = 1; m.producerEpoch = 0;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = pid; m.producerEpoch = epoch;
         m.transactionalId = bytes(txnId);
         const pc::TxnTopicPartition tp{topicId, 0};
         return rawCode(sendRaw(m, 256, m.correlationId, std::span<const pc::TxnTopicPartition>(&tp, 1)));
     }
-    int addOffsets(int64_t sid, const std::string& txnId, const std::string& group) {
+    int addOffsets(int64_t sid, const std::string& txnId, const std::string& group, int64_t pid = 1, int16_t epoch = 0) {
         pc::AddOffsetsToTxn m;
-        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = 1; m.producerEpoch = 0;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = pid; m.producerEpoch = epoch;
         m.transactionalId = bytes(txnId); m.groupId = bytes(group);
         return rawCode(sendRaw(m, 256, m.correlationId));
     }
-    int txnOffsetCommit(int64_t sid, const std::string& txnId, const std::string& group, int32_t topicId) {
+    int txnOffsetCommit(int64_t sid, const std::string& txnId, const std::string& group, int32_t topicId, int64_t pid = 1,
+                        int16_t epoch = 0) {
         pc::TxnOffsetCommit m;
-        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = 1; m.producerEpoch = 0;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = pid; m.producerEpoch = epoch;
         m.transactionalId = bytes(txnId); m.groupId = bytes(group);
         pc::TxnOffsetCommitEntry e;
         e.topicId = topicId; e.partition = 0; e.offset = 1; e.metadata = {};
         return rawCode(sendRaw(m, 512, m.correlationId, std::span<const pc::TxnOffsetCommitEntry>(&e, 1)));
     }
-    int endTxn(int64_t sid, const std::string& txnId) {
+    int endTxn(int64_t sid, const std::string& txnId, int64_t pid = 1, int16_t epoch = 0, bool commit = true) {
         pc::EndTxn m;
-        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = 1; m.producerEpoch = 0; m.commit = 1;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = pid; m.producerEpoch = epoch;
+        m.commit = commit ? 1 : 0;
         m.transactionalId = bytes(txnId);
         return rawCode(sendRaw(m, 256, m.correlationId));
     }

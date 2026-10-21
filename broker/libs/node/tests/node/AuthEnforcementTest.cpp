@@ -2,6 +2,7 @@
 // frames): every row of the §2.1 enforcement map, granted -> the request's normal answer, not granted -> code 45 in the
 // request's OWN response type.  A user per test, holding exactly the grants the row names.
 #include "support/AuthRig.h"
+#include <rune/protocol/ProducerIdBinding.h>
 
 using namespace rune::node;
 using namespace rune::node::test;
@@ -778,4 +779,112 @@ TEST(AuthEnforcementRegression, AReusedRequestIdAnswersTheSameForARightAndAWrong
     EXPECT_EQ(wrong.errorCode, 45u) << wrong.detail;
     EXPECT_EQ(right.detail, wrong.detail) << "the answer never tells a right proof from a wrong one";
     EXPECT_EQ(r.broker().node().securityViewForTest().appliedOffset, applied) << "nothing applied";
+}
+
+// ===========================================================================
+// Adversarial review of PR #423 (issue #122): attack producer-id ownership through the wire, on both produce paths.
+// ===========================================================================
+
+// Input bounds: ids m was never issued but that are in the bound format - another principal's tag on a counter that
+// was never handed out, the extreme bound ids (counter 0 / tag 0, INT64_MAX) - are refused 45 on worker ingress and
+// on the gateway-routed path.  A legacy id (bit 62 clear) stays usable by anyone (the deliberate version-skew rule).
+TEST(AuthEnforcementRegression, ForgedBoundProducerIdsAreRefusedOnBothPathsAdversarialRegression) {
+    AuthBroker::Options o;
+    o.shard = true;
+    AuthRig r("pidforge", o);
+    const int64_t ws2 = r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    const int64_t m = r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    const std::string worker = r.broker().workerIngressChannel();
+    const auto p = r.initProducer(ws2);
+    ASSERT_EQ(p.code, kOk);
+    ASSERT_TRUE(rune::protocol::isBoundProducerId(p.pid));
+    const int64_t forged[] = {
+        p.pid + (int64_t{1} << rune::protocol::kPidOwnerBits),   // ws2's tag, the next (never issued) counter
+        rune::protocol::kBoundPidFlag,                           // counter 0, tag 0 (the "no principal" tag)
+        INT64_MAX,                                               // the last counter, tag 0xFFFFFF
+    };
+    for (const int64_t f : forged) {
+        EXPECT_EQ(r.produceAs(m, r.orders, f, 0, 0, false, "v", &worker).code, kNotAuthorized) << "worker, pid " << f;
+        EXPECT_EQ(r.produceAs(m, r.orders, f, 0, 0).code, kNotAuthorized) << "routed, pid " << f;
+    }
+    EXPECT_NE(r.produceAs(m, r.orders, 5, 0, 0, false, "v", &worker).code, kNotAuthorized) << "a legacy id is unowned";
+    EXPECT_NE(r.produceAs(m, r.orders, 6, 0, 0).code, kNotAuthorized) << "a legacy id is unowned (routed)";
+    const auto own = r.produceAs(ws2, r.orders, p.pid, p.epoch, 0, false, "v", &worker);
+    EXPECT_EQ(own.code, kOk) << "the owner is untouched";
+}
+
+// Auth (grant changed mid-session): every re-ship of a session's WRITE grants to the workers must carry its
+// principal.  The owner keeps producing under its id over worker ingress after a grant is added, after its WRITE is
+// revoked (45) and re-granted; the other principal stays refused throughout.
+TEST(AuthEnforcementRegression, ProducerIdOwnerSurvivesGrantChangesMidSessionAdversarialRegression) {
+    AuthBroker::Options o;
+    o.shard = true;
+    AuthRig r("pidregrant", o);
+    std::string name;
+    const int64_t ws2 = r.newUser({exact(SO::Write, ST::Topic, "orders")}, &name);
+    const int64_t m = r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    const std::string worker = r.broker().workerIngressChannel();
+    const auto p = r.initProducer(ws2);
+    ASSERT_EQ(p.code, kOk);
+    int32_t seq = 0;
+    ASSERT_EQ(r.produceAs(ws2, r.orders, p.pid, p.epoch, seq++, false, "v", &worker).code, kOk);
+    auto& admin = r.broker().admin();
+    const int64_t adm = r.broker().adminSession();
+    using SP = rune::protocol::SecurityPatternKind;
+    ASSERT_EQ(admin.grant(r.ch(), adm, name, false, SO::Write, ST::Topic, SP::Exact, "secret").errorCode, 0u);
+    EXPECT_EQ(r.produceAs(ws2, r.orders, p.pid, p.epoch, seq++, false, "v", &worker).code, kOk) << "after a grant";
+    ASSERT_EQ(admin.revoke(r.ch(), adm, name, false, SO::Write, ST::Topic, SP::Exact, "orders").errorCode, 0u);
+    EXPECT_EQ(r.produceAs(ws2, r.orders, p.pid, p.epoch, seq, false, "v", &worker).code, kNotAuthorized) << "revoked";
+    ASSERT_EQ(admin.grant(r.ch(), adm, name, false, SO::Write, ST::Topic, SP::Exact, "orders").errorCode, 0u);
+    EXPECT_EQ(r.produceAs(ws2, r.orders, p.pid, p.epoch, seq++, false, "v", &worker).code, kOk) << "re-granted";
+    EXPECT_EQ(r.produceAs(m, r.orders, p.pid, p.epoch, seq, false, "v", &worker).code, kNotAuthorized);
+}
+
+// Escalation through a sibling op: principal b shares WRITE on a transactional id with a, and READ on a group.  b
+// naming a's producer id on AddPartitions, AddOffsets, TxnOffsetCommit and EndTxn (abort) gets exactly the wrong-id
+// answer, and a's open transaction is untouched: a commits it afterwards.
+TEST(AuthEnforcementRegression, ForeignPidOnEveryTransactionRequestChangesNothingAdversarialRegression) {
+    AuthRig r;
+    const std::vector<AuthGrant> g{exact(SO::Write, ST::TransactionalId, "tx-s"), exact(SO::Write, ST::Topic, "orders"),
+                                   exact(SO::Read, ST::Group, "cg-t"), exact(SO::Read, ST::Topic, "orders")};
+    const int64_t a = r.newUser(g);
+    const int64_t b = r.newUser(g);
+    const auto pa = r.initProducer(a, "tx-s");
+    ASSERT_EQ(pa.code, kOk);
+    ASSERT_EQ(r.addPartitions(a, "tx-s", r.orders, pa.pid, pa.epoch), kOk) << "a's transaction is open";
+    const int64_t wrong = 12345;   // a legacy id nobody holds: the plain wrong-id answer
+    const int wrongAdd = r.addPartitions(b, "tx-s", r.orders, wrong, pa.epoch);
+    ASSERT_NE(wrongAdd, kOk);
+    EXPECT_EQ(r.addPartitions(b, "tx-s", r.orders, pa.pid, pa.epoch), wrongAdd);
+    EXPECT_EQ(r.addOffsets(b, "tx-s", "cg-t", pa.pid, pa.epoch), r.addOffsets(b, "tx-s", "cg-t", wrong, pa.epoch));
+    EXPECT_EQ(r.txnOffsetCommit(b, "tx-s", "cg-t", r.orders, pa.pid, pa.epoch),
+              r.txnOffsetCommit(b, "tx-s", "cg-t", r.orders, wrong, pa.epoch));
+    EXPECT_EQ(r.endTxn(b, "tx-s", pa.pid, pa.epoch, /*commit=*/false), r.endTxn(b, "tx-s", wrong, pa.epoch, false));
+    EXPECT_NE(r.endTxn(b, "tx-s", pa.pid, pa.epoch, false), kOk);
+    EXPECT_EQ(r.endTxn(a, "tx-s", pa.pid, pa.epoch, /*commit=*/true), kOk) << "b's requests touched a's transaction";
+}
+
+// Crash and restart: the owner is in the id itself, so a broker restart (and the owner's new session after it) keeps
+// the binding - the owner's idempotent producer carries on at its next sequence, another principal is still refused.
+TEST(AuthEnforcementRegression, ProducerIdBindingSurvivesABrokerRestartAdversarialRegression) {
+    AuthRig r;
+    std::string ownerName, otherName;
+    (void)r.newUser({exact(SO::Write, ST::Topic, "orders")}, &ownerName);
+    (void)r.newUser({exact(SO::Write, ST::Topic, "orders")}, &otherName);
+    int64_t owner = r.login(ownerName);
+    const auto p = r.initProducer(owner);
+    ASSERT_EQ(p.code, kOk);
+    const auto first = r.produceAs(owner, r.orders, p.pid, p.epoch, 0);
+    ASSERT_EQ(first.code, kOk);
+    r.restart();
+    owner = r.login(ownerName);
+    const int64_t other = r.login(otherName);
+    EXPECT_EQ(r.produceAs(other, r.orders, p.pid, p.epoch, 1).code, kNotAuthorized) << "after the restart";
+    const auto next = r.produceAs(owner, r.orders, p.pid, p.epoch, 1);
+    EXPECT_EQ(next.code, kOk) << "the owner lost its producer id across the restart";
+    EXPECT_GT(next.baseOffset, first.baseOffset);
+    const auto fresh = r.initProducer(owner);
+    ASSERT_EQ(fresh.code, kOk);
+    EXPECT_GT(rune::protocol::producerIdCounter(fresh.pid), rune::protocol::producerIdCounter(p.pid))
+        << "a recovered bound id's counter was re-issued";
 }
