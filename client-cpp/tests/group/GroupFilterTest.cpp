@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -32,6 +33,11 @@ rune::codec::FilterBytes someFilter() {
     for (uint16_t i = 0; i < 9; ++i) f.bytes[i] = static_cast<uint8_t>(0xA0 + i);
     f.len = 9;
     return f;
+}
+
+bool isTheFilter(std::span<const uint8_t> got) {
+    const auto want = someFilter().span();
+    return std::equal(got.begin(), got.end(), want.begin(), want.end());
 }
 
 std::vector<uint8_t> joinOk(int32_t gen, const std::string& member) {
@@ -410,7 +416,7 @@ TEST_F(GroupFilterHubTest, FilterSurvivesANewGenerationRegression) {
     const auto subs = fr_.subscribes(0);
     ASSERT_EQ(subs.size(), 2u);
     EXPECT_EQ(subs[1].fromOffset, 12);
-    EXPECT_EQ(subs[1].filter.size(), someFilter().len);
+    EXPECT_TRUE(isTheFilter(subs[1].filter));
 }
 
 TEST_F(GroupFilterHubTest, FilterSurvivesALeaderFailoverRegression) {
@@ -427,7 +433,7 @@ TEST_F(GroupFilterHubTest, FilterSurvivesALeaderFailoverRegression) {
     hub_->reconcileFetch();
     const auto subs = fr_.subscribes(1);
     ASSERT_EQ(subs.size(), 1u);
-    EXPECT_EQ(subs[0].filter.size(), someFilter().len);
+    EXPECT_TRUE(isTheFilter(subs[0].filter));
 }
 
 TEST_F(GroupFilterHubTest, FilterSurvivesALostNodeSessionRegression) {
@@ -441,7 +447,7 @@ TEST_F(GroupFilterHubTest, FilterSurvivesALostNodeSessionRegression) {
     hub_->resendUnanswered(1);                 // node 1's session (re)connected
     const auto subs = fr_.subscribes(1);
     ASSERT_EQ(subs.size(), 2u);
-    EXPECT_EQ(subs[1].filter.size(), someFilter().len);
+    EXPECT_TRUE(isTheFilter(subs[1].filter));
 }
 
 // M2: notes on an unseeded or revoked partition never move a position.

@@ -103,3 +103,88 @@ TEST(GroupFilterClient, LeaderFilterRefusalSurfacesAndEndsTheGroupNoRetryLoopReg
     EXPECT_EQ(r.gw.subscribeFrames.size(), frames) << "the refused Subscribe is never retried";
     EXPECT_EQ(frames, 1u);
 }
+
+// N1: the leader drops a BOUND filtered fetch instance with ErrorResponse{InvalidRequest} on its Subscribe
+// correlation id: the consumer ends RefusedByBroker and the text reaches onError (no silent stall).
+TEST(GroupFilterClient, BoundInstanceRefusedByTheLeaderEndsTheGroupRegression) {
+    FilteredGroup r(4506);
+    auto gc = r.client.subscribeGroup("g", {"t"}, filteredCfg());
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr; }));
+    const auto s0 = *r.subAt(0, 0);
+    ASSERT_TRUE(r.drive([&] { return gc.active() && s0.subscriptionId != 0; }));
+    r.passes(20);
+    ASSERT_EQ(gc.failReason(), rc::GroupFailReason::None);
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::InvalidRequest),
+                   "filter no longer servable", s0.sessionId, s0.corrId);
+    ASSERT_TRUE(r.drive([&] { return gc.failReason() == rc::GroupFailReason::RefusedByBroker; }));
+    EXPECT_TRUE(r.errorMentions("filter no longer servable"));
+    const auto frames = r.gw.subscribeFrames.size();
+    r.passes(300);
+    EXPECT_EQ(r.gw.subscribeFrames.size(), frames) << "never re-armed";
+}
+
+// N2: a seek re-arms the partition with the group's filter bytes.
+TEST(GroupFilterClient, SeekReArmsWithTheFilterBytesRegression) {
+    FilteredGroup r(4508);
+    auto gc = r.client.subscribeGroup("g", {"t"}, filteredCfg());
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr; }));
+    const auto first = *r.subAt(0, 0);
+    EXPECT_EQ(first.filter, wantBytes());
+    const rc::Token t = r.nextToken++;
+    ASSERT_EQ(gc.seek({1, 0}, 5, rc::CompletionTarget(r.cq), t), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] {
+        const auto* s = r.gw.latestSubscription(1, 0);
+        return s != nullptr && s->corrId != first.corrId;
+    })) << "the seek never re-subscribed";
+    const auto* again = r.gw.latestSubscription(1, 0);
+    EXPECT_EQ(again->fromOffset, 5);
+    EXPECT_EQ(again->filter, wantBytes()) << "a seek re-arm keeps the filter";
+}
+
+// M3: the seed reconnects onto an OLDER node while the coordinator lives on a node of its own at the current
+// version.  A filtered consumer created afterwards is judged by the COORDINATOR's version, not the seed's.
+// (One consumer per Client: the brief's unfiltered consumer A cannot coexist with B; the group-less
+// coordinator move is made by a transactional producer's InitProducerId.)
+TEST(GroupFilterClient, SeedOnAnOlderNodeDoesNotJudgeAFilteredConsumerOnAnotherCoordinatorRegression) {
+    FilteredGroup r(4510);
+    const auto [n1, p1port] = r.addNode(4510);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions            = {{1, 0, n1, 1, 4510, ""}, {1, 1, n1, 1, 4510, ""}};
+    r.gw.subscribeLeader       = {{0, n1}, {1, n1}};
+    r.gw.groupAssignment       = {{1, 0}};
+    r.gw.coordinatorEndpoint   = n1;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p1port);
+    r.gw.initPidReply          = true;
+    r.gw.holdJoins             = false;
+    rc::ProducerConfig pcfg;
+    pcfg.acks            = rc::Acks::All;
+    pcfg.transactionalId = "tx-m3";
+    auto tp = r.client.producer(pcfg);
+    r.connect();
+    const rc::Token t = r.nextToken++;
+    ASSERT_EQ(tp.initTransactions(r.cq, t), rc::OpResult::Accepted);
+    bool done = false;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) { if (cc.token == t) done = true; });
+        return done;
+    })) << "precondition: the coordinator moved to node 1";
+    // The seed's node is rolled back below the filter version and the seed reconnects.
+    r.gw.advertisedBrokerVersionAt[0] = rune::protocol::client::kBrokerVersionFilter - 1;
+    const int connects = r.gw.connectsAt[0];
+    r.gw.expireSession(r.seedSid);
+    ASSERT_TRUE(r.drive([&] { return r.gw.connectsAt[0] > connects; })) << "precondition: the seed reconnected";
+    r.passes(50);
+    auto gc = r.client.subscribeGroup("g", {"t"}, filteredCfg());
+    ASSERT_TRUE(r.drive([&] { return r.gw.joinGroups > 0; })) << "the filtered consumer never joined";
+    EXPECT_EQ(r.gw.groupEndpoints.back(), n1) << "its JoinGroup reaches the coordinator";
+    EXPECT_EQ(r.gw.joinFilters.back(), wantBytes());
+    r.passes(100);
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::None) << "judged by the seed's older node";
+    EXPECT_TRUE(gc.active());
+}

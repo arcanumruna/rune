@@ -187,9 +187,10 @@ enum class GroupFailReason : int32_t {
     /// partitions whose leader is a not-yet-upgraded node are only skipped
     /// (logged once) until that node is upgraded and reconnects.
     BrokerTooOld = 1,
-    /// The broker coordinator refused this consumer's request non-retriably
-    /// (ProtocolVersion, or InvalidRequest: the broker could not decode it).
-    /// Recreating the consumer will be refused again.
+    /// The broker refused this consumer's request non-retriably: the coordinator (ProtocolVersion, or
+    /// InvalidRequest: it could not decode the request), or — Phase 2c — a partition leader refusing the group's
+    /// FILTER (untyped topic, over its capacity, unknown tag; the detail reaches onError).  Fix the cause (the
+    /// request, the filter or the topic's schema) before recreating the consumer; a plain retry is refused again.
     RefusedByBroker = 2,
     /// No-hang fix round 3: a retriable failure persisted past its retry budget
     /// (Internal / unclassified coordinator answers, OffsetFetch per-entry
