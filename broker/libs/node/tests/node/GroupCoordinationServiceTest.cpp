@@ -2543,3 +2543,116 @@ TEST(OffsetCommitDurabilityRegression, TxnOffsetMemberFenceMatrixRegression) {
     g.svc.setLocalLeadership(false);
     EXPECT_EQ(g.svc.checkTxnOffsetMember("gfence", g.member, g.gen, 1), EC::NotCoordinator);
 }
+
+// ===========================================================================
+// Adversarial review of PR #466 (#433): the parked-answer pool at its bounds, and a lost parked commit re-sent.
+// ===========================================================================
+namespace {
+/// A plain OffsetCommit of `n` entries: entry i is (kTestTopicId, i % 2, base + i), except every 7th names an unknown
+/// topic (its answer is UnknownTopic - a marker of the entry's position in the parked results ring).
+std::vector<uint8_t> encodeWideCommit(int64_t sessionId, int64_t corr, std::string_view group, std::string_view member,
+                                      int32_t gen, std::size_t n, int64_t base) {
+    std::vector<pc::OffsetCommitEntry> entries(n);
+    for (std::size_t i = 0; i < n; ++i)
+        entries[i] = pc::OffsetCommitEntry{i % 7 == 3 ? 4242 : kTestTopicId, static_cast<int32_t>(i % 2),
+                                           base + static_cast<int64_t>(i), {}};
+    pc::OffsetCommit msg;
+    msg.sessionId = sessionId; msg.correlationId = corr; msg.generationId = gen;
+    msg.groupId  = {reinterpret_cast<const uint8_t*>(group.data()), group.size()};
+    msg.memberId = {reinterpret_cast<const uint8_t*>(member.data()), member.size()};
+    std::vector<uint8_t> buf(64 + group.size() + member.size() + n * 32);
+    buf.resize(msg.encode(buf.data(), std::span<const pc::OffsetCommitEntry>(entries)));
+    return buf;
+}
+void expectWideAnswer(const std::vector<uint8_t>& f, std::size_t n, int16_t okCode, const char* what) {
+    const auto r = pc::OffsetCommitResponse::decode(f.data(), f.size());
+    ASSERT_TRUE(r) << what;
+    ASSERT_EQ(r->results.size(), n) << what;
+    for (std::size_t i = 0; i < n; ++i) {
+        const bool unknown = i % 7 == 3;
+        ASSERT_EQ(r->results[i].topicId, unknown ? 4242 : kTestTopicId) << what << " entry " << i;
+        ASSERT_EQ(r->results[i].partition, static_cast<int32_t>(i % 2)) << what << " entry " << i;
+        ASSERT_EQ(r->results[i].errorCode,
+                  unknown ? static_cast<int16_t>(pc::ErrorCode::UnknownTopic) : okCode) << what << " entry " << i;
+    }
+}
+}  // namespace
+
+// Never a hang, bounded memory: the results ring (8192) refuses a commit that does not fit WITHOUT appending, every
+// parked answer drains, and a commit whose results WRAP the ring is answered entry-for-entry in request order.
+TEST(OffsetCommitDurabilityRegression, TheParkedResultsRingRefusesWhenFullAndWrapsInOrderAdversarialRegression) {
+    CommitRig g("gring");
+    constexpr std::size_t kN = 3000;   // 3 x 3000 > 8192: the third does not fit
+    std::vector<uint8_t> out(kN * 16 + 64);
+    auto commitWide = [&](int64_t base) {
+        const auto req = encodeWideCommit(1, g.corr++, "gring", g.member, g.gen, kN, base);
+        return g.svc.handleOffsetCommit(req.data(), req.size(), g.clock, out.data(), out.size());
+    };
+    ASSERT_EQ(commitWide(1'000), 0u);
+    ASSERT_EQ(commitWide(10'000), 0u);
+    EXPECT_EQ(g.svc.parkedOffsetCommits(), 2u);
+    const auto leo = g.rep.logEndOffset();
+    const std::size_t n = commitWide(20'000);
+    ASSERT_GT(n, 0u) << "a commit that does not fit the results ring was parked (or dropped)";
+    EXPECT_EQ(g.rep.logEndOffset(), leo) << "a refused commit appended records";
+    {
+        const auto r = pc::OffsetCommitResponse::decode(out.data(), n);
+        ASSERT_TRUE(r && r->results.size() == kN);
+        for (const auto& e : r->results)
+            ASSERT_EQ(e.errorCode, static_cast<int16_t>(pc::ErrorCode::NotCoordinator)) << "a refusal must be retriable";
+    }
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 2u);
+    expectWideAnswer(g.answers.frames[0], kN, 0, "first");
+    expectWideAnswer(g.answers.frames[1], kN, 0, "second");
+    g.answers.frames.clear();
+    // The ring's head is now at 6000: this commit's 3000 results wrap past 8192.
+    ASSERT_EQ(commitWide(30'000), 0u);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u);
+    expectWideAnswer(g.answers.frames[0], kN, 0, "wrapped");
+    // The last known-topic entry of each partition is the committed offset (never an older one of the request).
+    // Entry 2999 (partition 1) names the unknown topic (2999 % 7 == 3): partition 1's last is 2997, partition 0's 2998.
+    EXPECT_EQ(g.store.fetch("gring", tp(std::string(kTestTopic), 1))->offset, 30'000 + 2'997);
+    EXPECT_EQ(g.store.fetch("gring", tp(std::string(kTestTopic), 0))->offset, 30'000 + 2'998);
+    EXPECT_EQ(g.svc.parkedOffsetCommits(), 0u);
+}
+
+// The same commit sent twice around a lost park: the first answer is NotCoordinator (the offsets leader changed), the
+// re-sent one is OK only once committed, and the committed offset never moves back to the earlier commit's.
+TEST(OffsetCommitDurabilityRegression, ACommitResentAfterALostParkIsOkOnceCommittedAndNeverMovesBackAdversarialRegression) {
+    CommitRig g("gresend");
+    ASSERT_EQ(g.commit("gresend", 50), 0u);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u);
+    ASSERT_EQ(CommitRig::codeOf(g.answers.frames[0].data(), g.answers.frames[0].size()), 0);
+    g.answers.frames.clear();
+
+    ASSERT_EQ(g.commit("gresend", 88), 0u);
+    ASSERT_EQ(g.commit("gresend", 88), 0u) << "the duplicate queues behind the first";
+    g.rep.becomeFollower(2, 2);
+    g.rep.becomeLeader(3, std::vector<NodeId>{1, 2});
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 2u) << "both parked answers are released on the leader change";
+    for (const auto& f : g.answers.frames)
+        EXPECT_EQ(CommitRig::codeOf(f.data(), f.size()), static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    g.answers.frames.clear();
+    g.fetch();             // the new leadership commits its tail: the coordinator reloads the offsets index
+    g.svc.doWork(g.clock);
+    EXPECT_EQ(g.store.fetch("gresend", tp(std::string(kTestTopic), 0))->offset, 88) << "the reloaded index";
+
+    {
+        const std::size_t n = g.commit("gresend", 88);   // the client's retry
+        ASSERT_EQ(n, 0u) << "answered inline: " << CommitRig::codeOf(g.out, n);
+    }
+    g.svc.doWork(g.clock);
+    EXPECT_TRUE(g.answers.frames.empty()) << "OK before the retried record committed under the new leadership";
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u);
+    EXPECT_EQ(CommitRig::codeOf(g.answers.frames[0].data(), g.answers.frames[0].size()), 0);
+    EXPECT_EQ(g.store.fetch("gresend", tp(std::string(kTestTopic), 0))->offset, 88);
+}

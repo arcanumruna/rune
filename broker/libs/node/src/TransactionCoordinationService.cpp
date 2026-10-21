@@ -1181,8 +1181,10 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
     // reload could still find it Prepare* and re-drive it.
     if (r.ok()) {
         int64_t record = -3;   // no store: nothing to wait for
+        int64_t floor  = -1;   // the id's last record before the completion (its Prepare*): never the stand-in
         if (txnState_ != nullptr) {
             record = kHoldNeedsPut;
+            if (const auto lp = lastPutOffset_.find(a.txnId); lp != lastPutOffset_.end()) floor = lp->second;
             if (const auto* meta = coordinator_.metadata(a.txnId)) {
                 const int64_t at = txnState_->putAt(*meta, coordinatorEpoch_);
                 if (at >= 0) {
@@ -1191,7 +1193,7 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
                 }
             }
         }
-        completeHolds_(a.txnId, record);
+        completeHolds_(a.txnId, record, floor);
     }
     if (respond && a.respPending && gateway_) {
         pc::EndTxnResponse resp;
@@ -1420,6 +1422,7 @@ void TransactionCoordinationService::addHold_(const std::string& group, const ru
     n.key().partition = tp.partition;
     n.mapped().txnId.assign(txnId);
     n.mapped().completeRecord = kHoldOpen;
+    n.mapped().putFloor       = -1;
     holds_.insert(std::move(n));
 }
 
@@ -1456,7 +1459,7 @@ void TransactionCoordinationService::rebuildHolds_()
     }
 }
 
-void TransactionCoordinationService::completeHolds_(const std::string& txnId, int64_t record)
+void TransactionCoordinationService::completeHolds_(const std::string& txnId, int64_t record, int64_t putFloor)
 {
     for (auto it = holds_.begin(); it != holds_.end();) {
         Holder& h = it->second;
@@ -1468,6 +1471,7 @@ void TransactionCoordinationService::completeHolds_(const std::string& txnId, in
             continue;
         }
         h.completeRecord = record;
+        h.putFloor       = putFloor;
         ++completingHolds_;
         ++it;
     }
@@ -1480,13 +1484,15 @@ int TransactionCoordinationService::releaseCommittedHolds_()
         Holder& h = it->second;
         if (h.completeRecord == kHoldNeedsPut) {
             // The Complete* append was refused (min-ISR): append it again while the id still rests there; once the
-            // id moved on, its newest record (appended after the completion) stands in for it.
+            // id moved on, its newest record (appended after the completion) stands in for it.  Never the id's
+            // Prepare* record (lastPutOffset_ before the completion, putFloor): that one is committed already, and a
+            // reload would find the transaction Prepare* and re-drive it over the released key (the #438 rewind).
             const auto* m = coordinator_.metadata(h.txnId);
             if (m != nullptr && (m->state == tx::TxnState::CompleteCommit || m->state == tx::TxnState::CompleteAbort)) {
                 const int64_t at = txnState_->putAt(*m, coordinatorEpoch_);
                 if (at >= 0) lastPutOffset_[h.txnId] = at;
             }
-            if (const auto lp = lastPutOffset_.find(h.txnId); lp != lastPutOffset_.end()) {
+            if (const auto lp = lastPutOffset_.find(h.txnId); lp != lastPutOffset_.end() && lp->second > h.putFloor) {
                 for (auto& [k, other] : holds_)   // every key of that completion waits on the same record
                     if (other.txnId == h.txnId && other.completeRecord == kHoldNeedsPut) other.completeRecord = lp->second;
             }

@@ -1008,3 +1008,47 @@ TEST(TxnOffsetCommitMemberBlockRegression, VersionGatesForTheFenceAndUnstableOff
     EXPECT_TRUE(rpc::clientUnderstandsUnstableOffsetCommit(-1)) << "unknown (rigs) = current";
     EXPECT_FALSE(rpc::clientUnderstandsUnstableOffsetCommit(9));
 }
+
+// ===========================================================================
+// Adversarial review of PR #466 (#125): input bounds of the version-10 member block.
+// ===========================================================================
+TEST(TxnOffsetCommitMemberBlockRegression, OverclaimedMemberLengthNegativeGenerationAndMaxLengthAdversarialRegression) {
+    // 1. A member length that claims more bytes than the frame holds (1 over, and u16 max): malformed, never a member
+    //    read past the frame.
+    for (const uint16_t claim : {uint16_t{11}, uint16_t{0xFFFF}}) {
+        TocFrame f = encodeToc(3, "member-xyz");   // 10 bytes of member id
+        rpc::detail::putLE16(f.bytes.data(), static_cast<int>(f.entriesEnd) + 4, claim);
+        EXPECT_FALSE(rpc::TxnOffsetCommit::decode(f.bytes.data(), f.bytes.size())) << "claimed " << claim;
+    }
+    // 2. A PRESENT block with a negative generation is still a block: it must be fenced, never read as the legacy
+    //    (unchecked) form - otherwise a zombie opts out of the fence by sending generation -1.
+    {
+        TocFrame f = encodeToc(0, "m");
+        rpc::detail::putLE32(f.bytes.data(), static_cast<int>(f.entriesEnd), -1);
+        const auto m = rpc::TxnOffsetCommit::decode(f.bytes.data(), f.bytes.size());
+        ASSERT_TRUE(m);
+        EXPECT_TRUE(m->hasMemberBlock) << "a present block with generation -1 decoded as legacy";
+        EXPECT_EQ(m->generationId, -1);
+        EXPECT_EQ(m->memberId.size(), 1u);
+    }
+    // 3. The longest member id the u16 length can carry round-trips exactly (no wrap of the length).
+    {
+        const std::string member(0xFFFF, 'z');
+        const TocFrame f = encodeToc(9, member, /*withMeta=*/false);
+        ASSERT_EQ(f.bytes.size(), f.entriesEnd + rpc::TxnOffsetCommit::kMemberBlockFixed + member.size());
+        const auto m = rpc::TxnOffsetCommit::decode(f.bytes.data(), f.bytes.size());
+        ASSERT_TRUE(m);
+        EXPECT_TRUE(m->hasMemberBlock);
+        EXPECT_EQ(m->memberId.size(), member.size());
+        EXPECT_EQ(m->entries.size(), 2u);
+    }
+    // 4. One to five stray bytes after the entries (less than the block's fixed part) are a malformed frame.
+    {
+        const TocFrame legacy = encodeToc(-1, "");
+        for (std::size_t extra = 1; extra < rpc::TxnOffsetCommit::kMemberBlockFixed; ++extra) {
+            std::vector<uint8_t> b = legacy.bytes;
+            b.resize(b.size() + extra, 0);
+            EXPECT_FALSE(rpc::TxnOffsetCommit::decode(b.data(), b.size())) << extra << " stray bytes accepted";
+        }
+    }
+}

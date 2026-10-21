@@ -387,6 +387,9 @@ private:
     struct Holder {
         rune::transaction::TransactionalId txnId;
         int64_t completeRecord = kHoldOpen;   ///< >= 0: completed - released once this record is committed
+        /// kHoldNeedsPut only: the id's last record BEFORE the completion (its Prepare*).  Only a record of the id
+        /// appended after it (> putFloor) can stand in for the refused Complete* - never the Prepare* itself.
+        int64_t putFloor = -1;
     };
     using HoldMap = std::map<HoldKey, Holder, HoldLess>;
     HoldMap holds_;
@@ -396,8 +399,9 @@ private:
     void eraseHold_(HoldMap::iterator it);
     void clearHolds_();
     void rebuildHolds_();
-    /// `txnId` completed with its Complete* record at `record` (kHoldNeedsPut: not appended; -3: no store).
-    void completeHolds_(const std::string& txnId, int64_t record);
+    /// `txnId` completed with its Complete* record at `record` (kHoldNeedsPut: not appended - `putFloor` is the id's
+    /// last record before it; -3: no store).
+    void completeHolds_(const std::string& txnId, int64_t record, int64_t putFloor = -1);
     int  releaseCommittedHolds_();
     /// True when a key of offsetsScratch_ is held by another transaction (or by this id's completing one).
     [[nodiscard]] bool heldByOther_(const std::string& group, const std::string& txnId) const;
