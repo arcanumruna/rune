@@ -420,12 +420,13 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     gtest_discover_tests(rune_worker_tests)
 
-    # Phase 2c Tasks 6-7: FilterIndex (value -> members) and FilterGroup (member state machine, shared scan,
+    # Phase 2c Tasks 6-7, 15: FilterIndex (value -> members) and FilterGroup (member state machine, shared scan,
     # rebuild delivery, position notes). No Aeron. AllocWindow.cpp replaces the global operator new for this
     # binary (the zero-allocation gates); later filter test binaries link it the same way.
     add_executable(rune_filter_engine_tests
         tests/node/FilterIndexTest.cpp
         tests/node/FilterGroupTest.cpp
+        tests/node/FilterStressRegressionTest.cpp
         tests/support/AllocWindow.cpp)
     target_include_directories(rune_filter_engine_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
