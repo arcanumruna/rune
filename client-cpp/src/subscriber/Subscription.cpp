@@ -167,6 +167,12 @@ uint32_t Subscription::dataResets() const {
     return cache_.dataResets;
 }
 
+uint64_t Subscription::batchBytes() const {
+    if (impl_ && onDutyThread_()) return impl_->batchBytes;
+    drainStatus_();
+    return cache_.batchBytes;
+}
+
 uint16_t Subscription::brokerErrorCode() const {
     if (impl_ && onDutyThread_()) return impl_->brokerErrorCode;
     drainStatus_();

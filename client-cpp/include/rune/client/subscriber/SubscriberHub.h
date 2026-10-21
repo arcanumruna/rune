@@ -325,6 +325,21 @@ public:
     bool failActiveSubscription(int64_t subscriptionId, SubscriptionFailReason reason, int64_t unsubCorrId,
                                 int64_t sessionId, const SendFn& submitFn);
 
+    /// Phase 2c: (topicId, partition) the PENDING Subscribe `correlationId` asked for (the refusal text names
+    /// them).  False when it is not pending.  Cold.
+    bool pendingSubscribeTarget(int64_t correlationId, int32_t& topicId, int32_t& partition) const;
+
+    /// Phase 2c: the BOUND subscription whose Subscribe was sent with `correlationId` (the broker's defensive
+    /// InvalidRequest answer on it) finishes with `why` / `code` and is unsubscribed like unsubscribe().  False if
+    /// no active subscription has that correlation id.  Duty thread.
+    bool failActiveByCorrelation(int64_t correlationId, SubscriptionFailReason why, uint16_t code,
+                                 int64_t unsubCorrId, int64_t sessionId, const SendFn& submitFn);
+
+    /// Phase 2c (SD3): a session's broker version (0 = not connected yet), wired once before start by the Client.
+    /// A FILTERED subscription is never sent to a session below kBrokerVersionFilter: it finishes BrokerTooOld.
+    using BrokerVersionFn = int32_t (*)(void* ctx, uint32_t session) noexcept;
+    void setBrokerVersionFn(BrokerVersionFn fn, void* ctx) noexcept { brokerVersion_ = fn; brokerVersionCtx_ = ctx; }
+
     /// M2 FIX [CB-5]: Sweep pending subscriptions whose subscribe-request
     /// deadline has expired.  Mirrors the produce-ack timeout sweep.
     /// Called from Client::sweepTimeouts() on the runner thread.
@@ -484,6 +499,11 @@ private:
     void publishStatus_(SubscriptionImpl& impl);
 
     // F8a fix2: direct Unsubscribe send + retry.
+    BrokerVersionFn brokerVersion_    = nullptr;
+    void*           brokerVersionCtx_ = nullptr;
+    /// True (and `impl.failReason` = BrokerTooOld) when `impl` is filtered and its home session's broker is known
+    /// to be below kBrokerVersionFilter.  The caller then finishes it and sends nothing.
+    [[nodiscard]] bool brokerTooOldForFilter_(SubscriptionImpl& impl) noexcept;
     DirectSendFn directSend_    = nullptr;
     void*        directSendCtx_ = nullptr;
     std::size_t  pendingUnsubCount_  = 0;

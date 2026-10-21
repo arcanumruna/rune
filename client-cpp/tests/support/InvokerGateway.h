@@ -147,11 +147,16 @@ struct InvokerGateway {
         int64_t corrId     = 0;
         uint8_t partitionKnown = 0;       // the Subscribe's wire partitionKnown (0: the broker resolves by key)
         std::vector<uint8_t> key;         // the Subscribe's wire key bytes
+        std::vector<uint8_t> filter;      // Phase 2c: the Subscribe's trailing filter bytes (empty = unfiltered)
     };
     std::vector<Subscribed> subscribed;
+    std::vector<std::vector<uint8_t>> subscribeFrames;   // Phase 2c: every Subscribe frame received, verbatim
     // A nonzero code answers every Subscribe with a SubscribeResponse carrying it (nothing is bound, as the
     // broker does for UnknownTopic / UnknownPartition / InvalidRequest).
     int16_t subscribeErrorCode = 0;
+    // Phase 2c: the refusal text sent with subscribeErrorCode (a session >= kClientVersionFilter gets it as the
+    // SubscribeResponse detail trailer; this gateway's sessions always are).
+    std::string subscribeErrorDetail;
     // E2 round 6 (F1): a TRANSIENT partition's current data lineage (partition ->
     // token).  A Subscribe carrying a lineage CLAIM (partitionKnown, 8-byte key)
     // for a partition listed here with another token is answered
@@ -880,6 +885,17 @@ struct InvokerGateway {
         send(from, out.data(), n);
     }
 
+    /// Phase 2c: a filtered subscription's POSITION NOTE — an empty-batch Records frame whose baseOffset is the
+    /// offset every record below was evaluated up to.
+    void pushNote(const Subscribed& sub, int64_t offset) {
+        namespace rcc = rune::client::codec;
+        std::vector<uint8_t> out(256);
+        const std::size_t n = rcc::encodeRecords(out.data(), out.size(), sub.subscriptionId, sub.topicId,
+                                                 sub.partition, offset, std::span<const uint8_t>{}, sub.sessionId,
+                                                 stampSubscribeCorr ? sub.corrId : 0);
+        send(replyFromArrival ? sub.endpoint : 0, out.data(), n);
+    }
+
     /// E2 round 6: the broker's transient LINEAGE NOTE for `sub` (an 8-byte batch).
     void sendLineageNote(const Subscribed& sub, uint64_t token) {
         namespace rcc = rune::client::codec;
@@ -1585,6 +1601,7 @@ private:
         case rcc::TemplateId::Subscribe: {
             const auto sv = rcc::decodeSubscribe(buf, len);
             if (!sv) return;
+            subscribeFrames.emplace_back(buf, buf + len);
             subscribeCorrIds.push_back(sv->correlationId);
             if (subscribeRedirectNext > 0) {
                 --subscribeRedirectNext;
@@ -1628,11 +1645,12 @@ private:
                 }
             }
             if (subscribeErrorCode != 0) {
-                uint8_t eout[64];
-                const std::size_t en = rcc::encodeSubscribeResponse(
-                    eout, sizeof eout, subscribeErrorCode, /*partition=*/-1, /*subscriptionId=*/0, sv->sessionId,
-                    sv->correlationId);
-                if (en > 0) send(replyFromArrival ? endpoint : 0, eout, en);
+                rp::SubscribeResponse r;
+                r.sessionId = sv->sessionId; r.correlationId = sv->correlationId; r.errorCode = subscribeErrorCode;
+                r.partition = -1; r.subscriptionId = 0; r.detail = subscribeErrorDetail;
+                std::vector<uint8_t> eout(r.encodedSizeWithDetail());
+                const std::size_t en = r.encodeFor(eout.data(), rp::kClientVersion, eout.size());
+                if (en > 0) send(replyFromArrival ? endpoint : 0, eout.data(), en);
                 return;
             }
             int64_t subId = nextSubscriptionId++;
@@ -1644,7 +1662,8 @@ private:
             }
             const Subscribed sub{subId, sv->topicId, sv->partition, sv->sessionId,
                                  endpoint, sv->fromOffset, sv->correlationId, sv->partitionKnown,
-                                 std::vector<uint8_t>(sv->key.begin(), sv->key.end())};
+                                 std::vector<uint8_t>(sv->key.begin(), sv->key.end()),
+                                 std::vector<uint8_t>(sv->filter.begin(), sv->filter.end())};
             subscribed.push_back(sub);
             uint8_t out[64];
             const std::size_t n = rcc::encodeSubscribeResponse(

@@ -254,6 +254,7 @@ Client::Client(ClientConfig cfg)
     // from the duty thread (retried every duty cycle on refusal), never via the
     // command ring.
     subscriberHub_.setDirectSend(&Client::directSendTrampoline_, this);
+    subscriberHub_.setBrokerVersionFn(&Client::fetchBrokerVersionTrampoline_, this);   // Phase 2c (SD3)
     groupConsumerHub_.setDirectSend(&Client::coordDirectSendTrampoline_, this);  // D4: the coordinator
     // D4: every group frame goes to the COORDINATOR session — the seed's ring
     // path (unchanged) while the coordinator is the seed, else that node's own
@@ -3473,6 +3474,24 @@ void Client::onEgressFrame(codec::TemplateId tid,
             if (onAuthErrorResponse_(*opt)) break;
         }
 
+        // Phase 2c: the broker's defensive InvalidRequest on a BOUND subscription's Subscribe correlation id (a
+        // filtered stream it can no longer serve): finished with the code, never re-armed.  Cold.
+        if (ec == rpc::ErrorCode::InvalidRequest && opt->correlationId != 0) [[unlikely]] {
+            const auto snap = agent_.stateAndSessionId();
+            const int64_t unsubCorrId = nextCorrId_++;
+            if (subscriberHub_.failActiveByCorrelation(
+                    opt->correlationId, SubscriptionFailReason::RejectedByBroker,
+                    static_cast<uint16_t>(opt->code), unsubCorrId, snap.sessionId,
+                    [this](int32_t, const uint8_t* fbuf, std::size_t flen) -> bool {
+                        return agent_.submitSend(fbuf, flen);
+                    })) {
+                std::string msg(opt->message);
+                if (msg.empty()) msg = "subscription refused by the broker: InvalidRequest (39)";
+                if (cbError_) invokeUserCallback_("onError", [&] { cbError_(msg); });
+                break;
+            }
+        }
+
         // A group member's per-partition Subscribe refused by a non-leader:
         // re-route THAT partition (never a seed-level redirect — the seed
         // session is the group coordinator's).
@@ -3967,6 +3986,11 @@ void Client::onEgressFrame(codec::TemplateId tid,
         {
             const int64_t unsubCorrId = nextCorrId_++;
             const auto snap = agent_.stateAndSessionId();
+            // Phase 2c: a refusal with a detail (a filter the broker rejected) is surfaced through onError, naming
+            // what was asked for.  The target is read before the hub forgets the pending Subscribe.
+            int32_t refusedTopic = -1, refusedPartition = -1;
+            const bool refusedWithDetail = opt->errorCode != 0 && !opt->detail.empty() &&
+                subscriberHub_.pendingSubscribeTarget(opt->correlationId, refusedTopic, refusedPartition);
             subscriberHub_.onSubscribeResponse(
                 *opt,
                 unsubCorrId,
@@ -3974,6 +3998,16 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 [this](int32_t /*streamId*/, const uint8_t* fbuf, std::size_t flen) -> bool {
                     return agent_.submitSend(fbuf, flen);
                 });
+            if (refusedWithDetail && cbError_) {
+                const auto code = static_cast<uint16_t>(opt->errorCode);
+                const char* name = authErrorName(code) != nullptr ? authErrorName(code)
+                                 : code == static_cast<uint16_t>(rune::protocol::client::ErrorCode::InvalidRequest)
+                                       ? "InvalidRequest" : "Error";
+                const std::string msg = "subscribe topic " + std::to_string(refusedTopic) + " partition " +
+                                        std::to_string(refusedPartition) + " refused: " + name + " (" +
+                                        std::to_string(code) + "): " + std::string(opt->detail);
+                invokeUserCallback_("onError", [&] { cbError_(msg); });
+            }
         }
         break;
     }
@@ -4827,6 +4861,7 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
     impl->fromWire      = opts.from.toWire();
     impl->isolation     = static_cast<uint8_t>(opts.isolation);
     impl->handler       = std::move(handler);
+    impl->filter        = opts.filterBytes;   // Phase 2c: encoded once, here; every (re-)send reuses it
     // Catalog history (Task 13): the epoch note / caught-up marker callbacks (TopicHandle::catalog()).
     if (isEventLogTopic(topic.topicId)) {
         impl->onCaughtUp     = std::move(opts.onCaughtUp);

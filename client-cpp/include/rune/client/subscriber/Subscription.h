@@ -23,6 +23,9 @@
 #include <rune/client/detail/HubCommand.h>
 #include <rune/client/detail/StatusRing.h>
 
+#include <rune/codec/FilterWire.h>
+
+#include <concepts>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -92,6 +95,14 @@ struct SubscribeOptions {
     /// epoch}, before any record of it): every record that follows belongs to
     /// the committed history it names.  Runner thread; must not block.
     std::function<void(uint64_t historyEpoch)> onHistoryEpoch;
+    /// Phase 2c: the encoded filter (empty = unfiltered; the Subscribe frame is then byte-identical to version 9).
+    rune::codec::FilterBytes filterBytes;
+    /// A generated E::Filter (or anything with `FilterBytes encode() const`).  Throws std::invalid_argument
+    /// (the encode error, naming the term) — explicit, before anything is sent.
+    template <class F>
+        requires requires(const F& f) { { f.encode() } -> std::same_as<rune::codec::FilterBytes>; }
+    SubscribeOptions& filter(const F& f) { filterBytes = f.encode(); return *this; }
+    SubscribeOptions& filter(const rune::codec::FilterBytes& b) noexcept { filterBytes = b; return *this; }   // FilterBuilder
 };
 
 // ---------------------------------------------------------------------------
@@ -106,6 +117,7 @@ struct Record {
     int64_t                  timestamp; // producer timestamp, epoch MILLISECONDS (wire contract, Kafka parity)
     std::span<const uint8_t> key;       // zero-copy — valid only in-callback
     std::span<const uint8_t> value;     // zero-copy — valid only in-callback
+    int32_t                  partition = 0;  // the partition the record was read from (the bound one)
 };
 
 // ---------------------------------------------------------------------------
@@ -169,6 +181,10 @@ enum class SubscriptionFailReason : int32_t {
     /// the client released it.  Re-subscribing from the same offset meets the
     /// same batch: raise the broker's / client's term (max message) size.
     UndeliverableBatch = 8,
+    /// Phase 2c (SD3): a filtered subscription whose broker session is older than kBrokerVersionFilter — such a
+    /// broker would ignore the filter and deliver everything, so nothing was sent.  Upgrade the broker, or
+    /// subscribe unfiltered.
+    BrokerTooOld = 9,
 };
 
 struct SubscriptionStatus {
@@ -177,6 +193,7 @@ struct SubscriptionStatus {
     SubscriptionFailReason failReason = SubscriptionFailReason::None;  // final snapshot only
     uint16_t brokerErrorCode = 0;  // RejectedByBroker: the SubscribeResponse errorCode (final snapshot only)
     uint32_t dataResets      = 0;  // E2 round 6: times the partition's data was reset under it (see dataResets())
+    uint64_t batchBytes      = 0;  // Phase 2c (FD13): sum of the delivered recordBatch sizes
 };
 
 // ---------------------------------------------------------------------------
@@ -216,13 +233,16 @@ struct SubscriptionImpl {
     RecordHandler handler;             // always valid (non-null after subscribe())
     std::function<void(int64_t, uint64_t)> onCaughtUp;   // catalog subscriptions only (may be empty)
     std::function<void(uint64_t)> onHistoryEpoch;        // catalog subscriptions only (may be empty)
+    rune::codec::FilterBytes filter;                     // Phase 2c: the encoded filter (empty = unfiltered)
+    [[nodiscard]] bool filtered() const noexcept { return !filter.empty(); }
 
     // ---- Duty-thread owned ------------------------------------------------------
     int64_t subscriptionId = 0;  // bound by SubscribeResponse (0 = pending)
     int32_t boundPartition = -1; // the partition the SubscribeResponse resolved
     SubscriptionFailReason failReason = SubscriptionFailReason::None;  // set before a failing finish
     uint16_t brokerErrorCode = 0;  // RejectedByBroker: the broker's error code
-    int64_t nextOffset     = 0;  // lastDelivered + 1 (CB-5 resume point)
+    int64_t nextOffset     = 0;  // lastDelivered + 1 (CB-5 resume point); filtered: follows batch ends and notes
+    uint64_t batchBytes    = 0;  // Phase 2c (FD13): sum of the delivered recordBatch sizes
     // E2 Task 13: the resume position of a moved subscription (rearmMovedAway).
     // Records below it were delivered before the move: dropped (a straddling
     // batch's lower records, whole batches below it while the new leader's HW
@@ -395,6 +415,10 @@ public:
     /// reset are gone.  0 for a disk partition.  Never silent: this counter is
     /// the application's signal.
     [[nodiscard]] uint32_t dataResets() const;
+
+    /// Phase 2c (FD13): the sum of the recordBatch sizes delivered so far — the egress bytes the broker sent this
+    /// subscription (a filter's saving is visible against an unfiltered one).
+    [[nodiscard]] uint64_t batchBytes() const;
 
 private:
     [[nodiscard]] bool onDutyThread_() const noexcept {

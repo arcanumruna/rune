@@ -1039,7 +1039,7 @@ if(BUILD_TESTING)
         tests/DataConformanceTest.cpp
     )
     target_link_libraries(rune_client_tests PRIVATE rune_client GTest::gtest_main)
-    target_include_directories(rune_client_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_include_directories(rune_client_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${RUNE_CODEC_ROOT}/include)   # DataCodec.h: FilterWire.h
     target_compile_definitions(rune_client_tests PRIVATE
         RUNE_CONFORMANCE_DIR="${RUNE_CONFORMANCE_DIR}"
     )
@@ -1531,10 +1531,11 @@ if(BUILD_TESTING)
             tests/client/HandleLifetimeTest.cpp
             tests/client/GroupRoutingRegressionTest.cpp
             tests/client/GroupSeekTest.cpp
+            tests/subscriber/SubscriberFilterTest.cpp   # Phase 2c Task 11
             tests/support/AllocCounter.cpp
         )
         target_include_directories(rune_invoker_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
-        target_include_directories(rune_invoker_tests PRIVATE ${RUNE_CLAIM_GEN_DIR})
+        target_include_directories(rune_invoker_tests PRIVATE ${RUNE_CLAIM_GEN_DIR} "${RUNE_CLAIM_GEN_DIR}/gen")   # player_event.gen.h
         add_dependencies(rune_invoker_tests generate_claim_schema_headers)
         target_link_libraries(rune_invoker_tests PRIVATE rune_client_api GTest::gtest_main)
         if(UNIX AND NOT APPLE)
