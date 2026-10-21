@@ -915,9 +915,59 @@ TEST(CatalogApplierRegression, TopicFramesSizeEveryVersionBootWillPostRegression
     ASSERT_GT(v1, v2) << "the dropped fields make the older version the larger frame";
     const std::size_t cap = v1 - 1;
     ASSERT_GE(cap, catalogTopicAppliedWireLen(t.name, t.config));
-    EXPECT_FALSE(topicEffectFramesError(t, cap, 2).has_value()) << "live posts the current version only: it fits";
-    EXPECT_TRUE(topicEffectFramesError(t, cap, 1).has_value()) << "boot posts version 1 too: it does not";
-    EXPECT_FALSE(topicEffectFramesError(t, v1, 1).has_value());
+    // The EVOLVING descriptor (FilterSchema frame, Phase 2c) keeps the dropped fields, so it is at least as large as v1.
+    const std::size_t fsz = filterSchemaWireLen(t.schema->evolvingBlob.size());
+    ASSERT_GE(fsz, v1);
+    const auto live = topicEffectFramesError(t, cap, 2);
+    ASSERT_TRUE(live.has_value()) << "the FilterSchema frame does not fit under this cap";
+    EXPECT_EQ(live->find("SchemaUpdate"), std::string::npos) << "live posts the current validator only: it fits: " << *live;
+    const auto boot = topicEffectFramesError(t, cap, 1);
+    ASSERT_TRUE(boot.has_value());
+    EXPECT_NE(boot->find("SchemaUpdate"), std::string::npos) << "boot posts version 1 too: it does not fit: " << *boot;
+    EXPECT_FALSE(topicEffectFramesError(t, fsz, 1).has_value());
+}
+
+// Phase 2c: the FilterSchema frame carries the EVOLVING descriptor and is posted for every typed topic (validate or not).
+// The leader's dry run must refuse a CREATE / ALTER whose evolving descriptor cannot fit one admin->control frame,
+// before anything is appended (else every broker drops the frame after commit: silent loss for filtered clients).
+TEST(CatalogApplierRegression, LeaderDryRunRefusesAFilterSchemaFrameThatCannotBePostedRegression) {
+    using namespace rune::node;
+    {   // CREATE: ~3000 fields, validate = false (no validator frame): only the FilterSchema frame is too large
+        const auto events = wideScript(3000, /*validate=*/false, /*withView=*/false);
+        const auto refusal = catalogEventEffectsRefusal(cat::CatalogState{}, events.at(0));
+        ASSERT_TRUE(refusal.has_value()) << "the oversize CREATE is refused before it is appended";
+        EXPECT_NE(refusal->find("FilterSchema"), std::string::npos) << *refusal;
+    }
+    {   // ALTER growing past the limit: the CREATE fits, the ALTER does not
+        gd::ScriptBuilder b;
+        cat::CreateTopicOps o;
+        o.partitions = 1;
+        o.schema = cat::SchemaDef{.keyField = "", .validate = false,
+                                  .descriptorBlob = wideDescriptor("grow", 2500, 40, false), .nextTag = 2500};
+        b.createTopic("grow", std::move(o), "CREATE TOPIC grow (...)");
+        std::vector<rune::codec::AlterOp> ops;
+        for (int i = 0; i < 600; ++i) {
+            std::string f = "added_" + std::to_string(i) + "_";
+            f.resize(40, 'y');
+            ops.push_back(gd::addOp(f, rune::codec::PrimType::Int32));
+        }
+        b.alterSchema("grow", std::move(ops), "ALTER TOPIC grow ADD ...");
+        const auto events = std::move(b).take();
+        cat::CatalogState s;
+        ASSERT_FALSE(catalogEventEffectsRefusal(s, events.at(0)).has_value()) << "the CREATE fits";
+        ASSERT_TRUE(cat::apply(s, events.at(0), 0).has_value());
+        const auto refusal = catalogEventEffectsRefusal(s, events.at(1));
+        ASSERT_TRUE(refusal.has_value()) << "the ALTER that grows the evolving descriptor past the frame is refused";
+        EXPECT_NE(refusal->find("FilterSchema"), std::string::npos) << *refusal;
+        EXPECT_EQ(s.appliedOffset(), 0) << "a dry run: nothing applied";
+    }
+    // the follower's boot sizing agrees
+    {
+        const auto events = wideScript(3000, false, false);
+        cat::CatalogState s;
+        ASSERT_TRUE(cat::apply(s, events.at(0), 0).has_value());
+        EXPECT_TRUE(topicEffectFramesError(*s.topicByName("wide"), catalogEffectMaxFrame(), 1).has_value());
+    }
 }
 
 // I1 — the backlog never aborts: it grows (capacity kept) and drains in order.

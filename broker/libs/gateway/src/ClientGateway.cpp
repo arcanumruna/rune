@@ -4975,9 +4975,14 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
                      rune::codec::describe({rune::codec::FilterErrorKind::UntypedTopic}));
             return;
         }
-        if (filterSchemaTooLargeTopics_.contains(msg.topicId) || !workerPool_->fitsIngressTail(msg.filter.size())) {
+        if (filterSchemaTooLargeTopics_.contains(msg.topicId)) {
             sendResp(pc::ErrorCode::InvalidRequest, partition, 0,
                      "filter schema too large for the worker ring (RUNE_WORKER_INGRESS_RING_BYTES)");
+            return;
+        }
+        if (!workerPool_->fitsIngressTail(msg.filter.size())) {
+            sendResp(pc::ErrorCode::InvalidRequest, partition, 0,
+                     "filter too large for the worker ring (RUNE_WORKER_INGRESS_RING_BYTES)");
             return;
         }
         auto c = rune::codec::CompiledFilter::compile(msg.filter, *fs);

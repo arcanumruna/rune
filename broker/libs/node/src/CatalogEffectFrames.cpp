@@ -62,6 +62,13 @@ std::optional<std::string> topicEffectFramesError(const cat::TopicObject& t, std
             return "the schema of '" + t.name + "' does not materialize: " + ex.what();
         }
     }
+    // Phase 2c: every typed topic also posts its FilterSchema (the EVOLVING descriptor: retired fields stay, so it can
+    // outgrow the materialized one) - validate or not.  Unsized, a frame the ring cannot take is refused on every broker
+    // AFTER commit: filtered subscribers silently lose the new version's records.
+    if (t.schema) {
+        if (auto e = tooLarge("the FilterSchema effect", t.name, filterSchemaWireLen(t.schema->evolvingBlob.size()), maxFrame))
+            return e;
+    }
     return std::nullopt;
 }
 
