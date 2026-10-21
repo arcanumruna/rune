@@ -82,6 +82,7 @@ public:
                 assembler_.onFragment(
                     [this](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
                            aeron::util::index_t length, aeron::Header&) {
+                        if (partitionedForTest_) [[unlikely]] { ++droppedPartitionedForTest_; return; }   // #111 seam
                         const auto* frame = reinterpret_cast<const uint8_t*>(buffer.buffer() + offset);
                         const auto len = static_cast<std::size_t>(length);
                         if (auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_)) [[unlikely]] {
@@ -111,6 +112,11 @@ public:
     }
 
     aeron::Subscription& subscription() { return *sub_; }
+
+    /// Test seam (issue #111), the polling thread only: while set, every inbound consensus frame is consumed and
+    /// dropped - this node hears no peer (with UdpMessageSink::setPartitionedForTest: a node cut off the consensus).
+    void setPartitionedForTest(bool on) noexcept { partitionedForTest_ = on; }
+    [[nodiscard]] uint64_t droppedPartitionedForTest() const noexcept { return droppedPartitionedForTest_; }
 
     /// #254: inbound frames dropped because they exceed the ingress ring's maximum message (monotonic).
     [[nodiscard]] uint64_t oversizeDrops() const noexcept { return oversizeDrops_; }
@@ -161,6 +167,8 @@ private:
     std::shared_ptr<aeron::Aeron>          aeron_;
     std::shared_ptr<aeron::Subscription>   sub_;
     IngressRing&                           ingressRing_;
+    bool                                   partitionedForTest_ = false;   // test seam (polling thread)
+    uint64_t                               droppedPartitionedForTest_ = 0;
     std::size_t                            maxFrame_;                              // ingressRing_.maxMsgLength()
     rune::peerlink::PeerCryptoMode         crypto_{rune::peerlink::PeerPlain{}};   // Task 16: chosen at construction
     std::vector<uint8_t>                   recvScratch_;                           // an opened frame (preallocated)

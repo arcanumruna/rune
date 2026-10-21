@@ -264,6 +264,7 @@ AdminWorker::AdminWorker(SchemaRegistry& reg,
     , catalogReplica_(catalogReplica)
     , catalogPlane_(catalogPlane)
     , applier_(catalogDirOf(catalogReplica), reg, *viewRegistry_) {
+    securityCatchUp_ = SecurityCatchUp{deps_.securityMaxStalenessNs};   // issues #15 / #111: F from the config
     if (catalogReplica_ != nullptr) {
         // One max fetch + the batch framing slack the worker's scratch carries.
         catalogReadScratch_.reset(static_cast<std::size_t>(rune::replication::kDefaultMaxFetchBytes) + 64u * 1024u);
@@ -646,6 +647,7 @@ int AdminWorker::doWork(int64_t nowNs) {
         work += securityReplica_->doWork(nowNs);
         if (!securityApplyHeldForTest_) [[likely]] work += securityApplier_->applyCommitted(*securityReplica_);
         work += securityAdmin_->doWork(nowNs);
+        work += stepSecurityServing_(nowNs);   // after the applier: the verdict follows every event it posted
     }
     if (catalogReplica_) {
         work += catalogReplica_->doWork(nowNs);
@@ -667,6 +669,37 @@ int AdminWorker::doWork(int64_t nowNs) {
         ++work;
     }
     return work;
+}
+
+// Issues #15 / #111 (decision M7): is this broker's `__security` state caught up and fresh?  Posted on change.
+int AdminWorker::stepSecurityServing_(int64_t nowNs) {
+    if (!deps_.securityServing) return 0;
+    namespace rr = rune::replication;
+    SecurityCatchUp::Inputs in;
+    in.nowNs              = nowNs;
+    in.present            = securityReplica_ != nullptr && securityApplier_.has_value();
+    in.halted             = in.present && securityApplier_->halted();
+    in.leader             = in.present && securityReplica_->role() == rr::Role::Leader;
+    in.epoch              = in.present ? static_cast<int32_t>(securityReplica_->epoch()) : 0;
+    in.leaderServing      = in.leader && securityAdmin_ && securityAdmin_->isLeader() &&
+                            std::get<SecurityLeaderServing>(securityAdmin_->role()).epoch == in.epoch;
+    in.leaderAnswers      = in.present ? securityReplica_->leaderAnswers() : 0;
+    in.caughtUpWithLeader = in.present && securityReplica_->caughtUpWithLeader();
+    in.appliedNext        = in.present && !in.halted ? securityApplier_->nextOffset() : -1;
+    in.highWatermark      = in.present ? securityReplica_->leaderCommittedHw() : 0;   // PR #459 F1: never capped at LEO
+    const bool caughtUp = securityCatchUp_.step(in);
+    const int32_t vEpoch = caughtUp ? securityCatchUp_.verdictEpoch() : -1;
+    const bool vLeader = caughtUp && securityCatchUp_.verdictAsLeader();
+    if (securityServingPosted_ == (caughtUp ? 1 : 0) && securityServingPostedEpoch_ == vEpoch &&
+        securityServingPostedLeader_ == vLeader) [[likely]] return 0;
+    securityServingPosted_ = caughtUp ? 1 : 0;
+    securityServingPostedEpoch_ = vEpoch;
+    securityServingPostedLeader_ = vLeader;
+    spdlog::info("AdminWorker: __security {} (role {}, epoch {}, applied {} / hw {})",
+                 caughtUp ? "caught up - logins served" : "not caught up - logins answer AuthUnavailable",
+                 in.leader ? "leader" : "follower", in.epoch, in.appliedNext, in.highWatermark);
+    deps_.securityServing(caughtUp, in.highWatermark, vEpoch, vLeader);
+    return 1;
 }
 
 // ─── startNext_ — gate, dedupe, build, dry-run, append ──────────────────────

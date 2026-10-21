@@ -266,11 +266,35 @@ A change takes effect on live sessions. Nothing is silent (D24 to D26).
 | `ADD PASSWORD`, `DROP PASSWORD`, `CREATE *`, `ENABLE` | Nothing for live sessions. |
 
 A security DDL is answered OK once the broker that served the statement enforces it: its control thread
-releases the answer once its view applied the event and every refreshed permission table reached every
-worker of that broker (D24). The OK does not mean every broker enforces it. Other brokers apply the event
-asynchronously (typically within 100 ms on healthy brokers); a lagging or partitioned broker can keep
-enforcing the old grants until it catches up.
+releases the answer once its view applied the event and **every worker of that broker acknowledged** what
+the event changed there (D24): its new permission bitmaps and binds are installed, a revoked session is
+bound to nothing, and an ended subscription's cursor is gone. A subscription a worker pushes is ended by
+that worker: its `NotAuthorized` follows its last `Records` frame, and nothing follows it. An OK whose
+enforcement is not confirmed within `RUNE_SECURITY_GATE_DEADLINE_MS` (default 5 000) is answered `Internal`
+"committed at offset N; enforcement on this broker not confirmed" (the change is committed; a retry with
+the same request id returns its result). The OK does not mean every broker enforces it. Other brokers
+apply the event asynchronously (typically within 100 ms on healthy brokers).
 A revoke ends the affected subscriptions within 100 ms on a 3-node cluster.
+
+### A broker serves only a current security state (`#serving`)
+
+A broker serves logins, `__security` reads and security DDL only while its `__security` state is provably
+current; otherwise it answers the retriable `AuthUnavailable` (48) and the client tries another broker:
+
+- **Catching up.** After a start (a restart, a wiped or a new broker) it serves nothing until it has
+  fetched everything its current `__security` leader has and applied it. A leader serves once its whole
+  log is committed and applied.
+- **Stale.** A follower whose leader has not answered for `RUNE_SECURITY_MAX_STALENESS_MS` (F, default
+  1 000), whose apply lags that long, or any broker that lost contact with the consensus for F (a broker cut
+  off the cluster, including a `__security` leader that does not know it was replaced) is stale. F exceeds
+  the broker liveness timeout, so a planned leadership move does not make a broker stale; a hard leader
+  failure can make the surviving followers answer logins `AuthUnavailable` briefly until the new leader
+  answers them (tracked in #460).
+- A broker stale for `RUNE_SECURITY_STALE_SESSION_END_MS` (R, default 10 000) ends its authenticated
+  sessions with a session-level `AuthUnavailable`; their clients reconnect to a current broker. Until then
+  those sessions keep working on the state the broker last had: what a broker serves is never more than
+  about F behind the cluster.
+- A new or wiped broker never advertises the bootstrap window while it is catching up.
 
 On the hot path an authorization check is one bitmask load from the session's own table (at most 2 ns,
 zero allocation); tables are owned by the thread that owns the session and updated through the rings.
@@ -300,6 +324,7 @@ zero allocation); tables are owned by the thread that owns the session and updat
 | A client older than version 9 against an authenticated cluster | refused at the handshake (`Connect`), never downgraded | version gate |
 | A broker without a valid cluster key | refused at the peer connection, logged on both sides | counter 1 000 234 |
 | `__security` apply halted on this broker | logins `AuthenticationFailed`, sessions `SessionRevoked`, security DDL `Internal` | see `#halted` |
+| This broker's `__security` state is not current (catching up, stale) | logins, `__security` reads and security DDL `AuthUnavailable`; retriable, try another broker. Stale longer than R: a session-level `AuthUnavailable` ends the authenticated sessions | 48, see `#serving` |
 
 ### `#halted`: the `__security` apply halted (D28)
 

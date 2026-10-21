@@ -234,7 +234,7 @@ senderId u8` (0 = gateway, `i+1` = worker `i`) and a `seq u64`
 | 45 | `NotAuthorized` | Not granted (default deny), or the object is not visible. Fails exactly that request. | never re-sent |
 | 46 | `SessionRevoked` | The session's user was dropped, disabled or terminated. Terminal for the session. | terminal for the session |
 | 47 | `PasswordChangeRequired` | A one-time-password session may only change its password. | fails that request |
-| 48 | (reserved) | Reserved for `AuthUnavailable`. |  |
+| 48 | `AuthUnavailable` | The broker's `__security` state is not current (catching up after a start, or stale: cut off its leader or the consensus): no login, `__security` read or security DDL is served. As the session-level `ErrorResponse` (correlation id 0): the broker stayed stale too long and ended the session. Sent to every client version. | retried: back off and reconnect fresh, rotating brokers; never terminal |
 | 49 | `RecordEgressUnavailable` | Authenticating broker only: the session's own record stream for the partition's worker could not be built (there is no shared-stream fallback). Sent in `SubscribeResponse.errorCode` on the pending Subscribe. | retried a few times (a bind resets the count), then fails the subscription or the group consumer with an error |
 | 50 | `UnstableOffsetCommit` | Client 10: `OffsetFetch` / `OffsetCommit` of a partition an unfinished transaction holds a pending offset on (until its completion is durable), or while the transaction coordinator is not loaded. Nothing is appended. | retried after a backoff, never surfaced |
 

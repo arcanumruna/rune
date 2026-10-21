@@ -1,0 +1,64 @@
+# Builds the broker image and publishes it to GitHub Container Registry when a broker release tag
+# (broker-vX.Y.Z, made by broker/release.sh) is pushed. Manual runs build without publishing.
+name: broker-image
+
+on:
+  push:
+    tags: ['broker-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: broker-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/rune-broker
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/flight-recorder
+          path: flight-recorder
+
+      - name: Check tag matches VERSION.txt
+        run: |
+          VERSION=$(< broker/VERSION.txt)
+          if [[ $GITHUB_REF_TYPE == tag && ${GITHUB_REF_NAME#broker-v} != "$VERSION" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match broker/VERSION.txt ($VERSION)"
+            exit 1
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: github.ref_type == 'tag'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        env:
+          IMAGE_NAME: ${{ env.IMAGE }}
+          FLIGHT_RECORDER_DIR: ${{ github.workspace }}/flight-recorder
+          CMAKE_BUILD_PARALLEL_LEVEL: '4'
+        run: |
+          ARGS=(--platform linux/amd64
+                --cache-from type=gha,scope=broker
+                --cache-to type=gha,scope=broker,mode=max)
+          if [[ $GITHUB_REF_TYPE == tag ]]; then
+            ARGS+=(--tag "$IMAGE:latest" --push)
+          else
+            ARGS+=(--output type=cacheonly)
+          fi
+          broker/build_docker.sh "${ARGS[@]}"

@@ -97,6 +97,11 @@
            established inter-broker link.  topicId = peer node id, partition = link epoch,
            tail (TailKind = PEER_KEYS) = [sendMaster 32][recvMaster 32]. -->
       <validValue name="PEER_LINK_KEYS">22</validValue>
+      <!-- Issues #109 / #196: control -> ONE worker on its op ring: an enforcement fence.  correlationId = the
+           fence sequence number.  The worker answers SessionSignal FenceAck{partition = worker, baseOffset = seq,
+           sessionId = 0 (op ring)} once it executed every op queued before it.  (The lifecycle-ring fence is a
+           SESSION_PERMISSIONS op with the fence flag, sessionId = 1 on its ack.) -->
+      <validValue name="ENFORCE_FENCE">23</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica
@@ -121,6 +126,8 @@
       <validValue name="PERMISSION_BITS">8</validValue>
       <!-- Authentication: PEER_LINK_KEYS tail — [sendMaster 32][recvMaster 32]. -->
       <validValue name="PEER_KEYS">9</validValue>
+      <!-- Issue #109: an ending UNSUBSCRIBE's terminal ErrorResponse message text (UTF-8 bytes). -->
+      <validValue name="END_DETAIL">10</validValue>
     </enum>
 
     <!-- WorkerReturn::Type -->

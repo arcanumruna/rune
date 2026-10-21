@@ -320,6 +320,8 @@ public:
     /// DR-7: connect attempts that ended without a session (timed out / refused);
     /// monotonic — each increment is an event (the owner asks for fresh metadata).
     [[nodiscard]] uint64_t connectFailures() const noexcept { return connectFailures_; }
+    /// Issues #15 / #111: AuthUnavailable (48) answers / session ends seen (each a retriable failure, never Rejected).
+    [[nodiscard]] uint64_t authUnavailableCount() const noexcept { return authUnavailable_; }
     /// No-hang fix round 4 (item 6): Connected → Resuming edges caused by THIS
     /// client's own liveness check (response timeout / own stall) — the session
     /// is treated as lost, exactly as if the broker had sent SessionExpired.
@@ -773,6 +775,7 @@ public:
         if (f.errorCode != 0) {
             const auto ec = static_cast<rpc::ErrorCode>(f.errorCode);
             if (ec == rpc::ErrorCode::AuthenticationFailed) failAuth_(ec, f.retryAfterMs, nowNs);
+            else if (ec == rpc::ErrorCode::AuthUnavailable) onAuthUnavailable_(nowNs);   // issues #15 / #111
             else onConnectError_(ec, nowNs);   // anything else (Internal ...): a connect failure
             return;
         }
@@ -825,6 +828,10 @@ public:
                 transitionTo(SessionState::Resuming);
                 // doResume fires on the next tick (FIX D: Resuming is a real waiting state).
                 resumeEntryNs_ = nowNs;
+            } else if (ec == rpc::ErrorCode::AuthUnavailable && incomingCorrelationId == 0) {
+                // Issues #15 / #111: the broker's security state stayed stale and it ended this session - retriable:
+                // reconnect FRESH elsewhere (the seed failover rotates the candidates), never resume here.
+                onAuthUnavailable_(nowNs);
             } else if (ec == rpc::ErrorCode::SessionRevoked && incomingCorrelationId == 0) {
                 // Authentication (D26): the session-level ErrorResponse{SessionRevoked, corr 0} — the user was
                 // dropped / disabled (or the broker's security log halted).  The broker closes the session:
@@ -1232,6 +1239,18 @@ private:
         transitionTo(SessionState::Rejected);
     }
 
+    /// Issues #15 / #111: AuthUnavailable (48) - THIS broker cannot vouch for its security state right now (catching
+    /// up, partitioned): never a verdict on the credentials.  The broker closed the session, so the retry is a fresh
+    /// connect; a retriable connect failure (Backoff for a reconnect-forever session that was Live - the seed failover
+    /// moves it to another broker - Disconnected otherwise, the caller's connect retry).
+    void onAuthUnavailable_(int64_t nowNs) noexcept {
+        cryptoState_            = CryptoState{};
+        sessionId_              = 0;
+        authenticatedSessionId_ = 0;
+        ++authUnavailable_;
+        onConnectError_(rune::protocol::client::ErrorCode::AuthUnavailable, nowNs);
+    }
+
     /// A LOCAL failure (no randomness, PBKDF2 refused): not the broker's verdict, but never a plaintext login.
     void failAuthLocal_() noexcept {
         lastConnectError_ = static_cast<int16_t>(static_cast<uint16_t>(rune::protocol::client::ErrorCode::Internal));
@@ -1525,6 +1544,7 @@ private:
     int64_t resumeEntryNs_       = 0;  // FIX D: timestamp when Resuming was entered
     // DR-BUG-2: fast-retry state for the connect path.
     uint64_t connectFailures_ = 0;   // DR-7: see connectFailures()
+    uint64_t authUnavailable_ = 0;   // issues #15 / #111: see authUnavailableCount()
     uint64_t staleSessionLosses_ = 0;   // fix round 4: see staleSessionLosses()
     uint64_t ownStallLosses_     = 0;   // M1: see ownStallLosses()
     int16_t  lastConnectError_   = 0;   // I2: see lastConnectError()

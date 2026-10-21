@@ -2163,6 +2163,14 @@ void BrokerNode::buildGateway() {
                               : config_.authMode == AuthMode::DevDisabled ? rune::gateway::GatewayAuthMode::Dev
                                                                           : rune::gateway::GatewayAuthMode::InProcess,
                               securityView_ ? &*securityView_ : nullptr);
+        // Issues #15 / #111 (M7): an authenticating broker starts CatchingUp - no login, `__security` read or security
+        // DDL is served until the admin thread vouches that its `__security` state is caught up (and the consensus is
+        // in contact).  Dev / in-process brokers authenticate nobody: nothing to gate.
+        if (config_.authMode == AuthMode::Enabled && securityView_) {
+            securityServing_.emplace(config_.effectiveSecurityMaxStalenessMs() * 1'000'000LL,
+                                     config_.effectiveSecurityStaleSessionEndMs() * 1'000'000LL);
+            gateway_->setSecurityServing(false);
+        }
         gateway_->setBootObjects(std::move(bootObjects_));   // authentication Task 12: the catalog's live topics / views at boot
         // Authentication Task 10 (D4/D32): the gateway's OWN copy of the cluster keys (loaded on this startup thread,
         // validated by validateAuth) verifies the bootstrap proof.  Dev / in-process configs hold none.
@@ -3251,7 +3259,7 @@ void BrokerNode::publishCatalogMetrics_() noexcept {
 // ---------------------------------------------------------------------------
 void BrokerNode::onSecurityApplied_(const uint8_t* p, std::size_t n) {
     if (heldMirror_.on) [[unlikely]] {   // test seam: stash, apply nothing
-        heldMirror_.frames.emplace_back(p, p + n);
+        heldMirror_.frames.emplace_back(kA2cSecurityApplied, std::vector<uint8_t>(p, p + n));
         return;
     }
     int64_t offset = -1;
@@ -3274,6 +3282,61 @@ void BrokerNode::onSecurityApplied_(const uint8_t* p, std::size_t n) {
         failSecurityClosed_(a.error().offset, a.error().detail);
     }
     publishSecurityMetrics_();
+}
+
+// Issues #15 / #111: the admin thread's `__security` catch-up verdict (behind every applied event it vouches for).
+void BrokerNode::onSecurityServing_(const uint8_t* p, std::size_t n) {
+    if (heldMirror_.on) [[unlikely]] {   // test seam: in order with the held events
+        heldMirror_.frames.emplace_back(kA2cSecurityServing, std::vector<uint8_t>(p, p + n));
+        return;
+    }
+    bool caughtUp = false, asLeader = false;
+    int64_t leaderHw = -1;
+    int32_t epoch = -1;
+    if (!decodeSecurityServing(p, n, caughtUp, leaderHw, epoch, asLeader)) [[unlikely]] {
+        if (adminToControlRejects_++ % 1024 == 0)
+            spdlog::error("BrokerNode[{}]: malformed kA2cSecurityServing (len={}) skipped", config_.nodeId, n);
+        return;
+    }
+    if (securityServing_) securityServing_->onAdminCaughtUp(caughtUp, leaderHw, epoch, asLeader);
+}
+
+// Issues #15 / #111: one control pass of SecurityServing.  The consensus contact is the election being CLOSED (a
+// steady leader or follower): a minority leader steps down and a cut-off follower re-canvasses, so a partitioned
+// broker - a zombie `__security` leader included - leaves CLOSED and goes Stale F later.
+int BrokerNode::stepSecurityServing_(int64_t nowNs) {
+    if (!securityServing_ || !gateway_) return 0;
+    const bool closed = election_ == nullptr ||
+                        election_->stateCode() == static_cast<int32_t>(rune::consensus::ElectionState::Closed);
+    // PR #459 F2: multi-node, the verdict counts only for the committed (-7, 0) epoch and role - a healed zombie's
+    // leader-era verdict is for an old epoch, so it serves nothing until its admin thread vouches for the new one.
+    SecurityServing::Committed committed;
+    const SecurityServing::Committed* cp = nullptr;
+    if (catalogOnController_ && metadataService_) {
+        if (const auto* pa = metadataService_->assignment(kSecurityTopicId, kSecurityPartition)) {
+            committed.epoch     = pa->leaderEpoch;
+            committed.selfLeads = pa->leaderNode == config_.nodeId;
+        }
+        committed.mapCurrent = metadataService_->mapCurrent();
+        committed.mapAnswers = metadataService_->mapLeaderAnswers();
+        committed.mapControls = metadataService_->mapControls();
+        cp = &committed;   // no committed assignment yet: epoch -1 never matches a verdict (not current)
+    }
+    const SecurityServing::Actions a = securityServing_->step(nowNs, closed, cp);
+    if (a.changed) {
+        spdlog::warn("BrokerNode[{}]: __security serving -> {} (admin caught up: {}, consensus closed: {}){}", config_.nodeId,
+                     securityServing_->name(), securityServing_->adminCaughtUp(), closed,
+                     securityServing_->serving() ? "" : " - logins, __security reads and security DDL answer "
+                                                         "AuthUnavailable (48) until it is current again");
+        gateway_->setSecurityServing(securityServing_->serving());
+    }
+    if (a.endSessions) {
+        spdlog::warn("BrokerNode[{}]: __security stale for more than {} ms - ending the authenticated sessions "
+                     "(AuthUnavailable): their clients reconnect to a current broker",
+                     config_.nodeId, config_.effectiveSecurityStaleSessionEndMs());
+        gateway_->endSessionsSecurityUnavailable();
+    }
+    return a.changed || a.endSessions ? 1 : 0;
 }
 
 void BrokerNode::onSecurityHalted_(const uint8_t* p, std::size_t n) {
@@ -3578,10 +3641,26 @@ void BrokerNode::holdSecurityMirrorForTest(bool on) {
         if (!on) {
             auto frames = std::move(heldMirror_.frames);
             heldMirror_.frames.clear();
-            for (const auto& f : frames) onSecurityApplied_(f.data(), f.size());
+            for (const auto& [tid, f] : frames) {   // in ring order (issues #15 / #111: the verdicts with the events)
+                if (tid == kA2cSecurityServing) onSecurityServing_(f.data(), f.size());
+                else onSecurityApplied_(f.data(), f.size());
+            }
         }
         return 0;
     });
+}
+
+void BrokerNode::partitionFromPeersForTest(bool on) {
+    onControlThreadForTest([this, on]() {
+        if (aeronIngress_) aeronIngress_->setPartitionedForTest(on);
+        if (udpSink_) udpSink_->setPartitionedForTest(on);
+        if (replTransport_) replTransport_->setPartitionedForTest(on);
+        return 0;
+    });
+}
+
+std::string BrokerNode::securityServingForTest() {
+    return onControlThreadForTest([this]() { return std::string(securityServing_ ? securityServing_->name() : "none"); });
 }
 
 void BrokerNode::holdSecurityApplyForTest(bool on) {
@@ -4154,6 +4233,11 @@ void BrokerNode::buildAdminWorker() {
             if (!adminWorkerAgent_) return;
             adminWorkerAgent_->postErrorResponse(session, corr, code, message);
         };
+        // Issues #15 / #111: the `__security` catch-up verdict -> the control thread's SecurityServing.
+        deps.securityServing = [this](bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader) {
+            if (adminWorkerAgent_) adminWorkerAgent_->postSecurityServing(caughtUp, leaderHw, epoch, asLeader);
+        };
+        deps.securityMaxStalenessNs = config_.effectiveSecurityMaxStalenessMs() * 1'000'000LL;
         // Catalog history Task 12: the catalog read server's frames (admin thread)
         // → the agent's catalog-read ring → the control thread → the session.
         deps.catalogRead = [this](const CatalogReadFrameHead& head, std::span<const uint8_t> frame) {
@@ -4174,6 +4258,7 @@ void BrokerNode::buildAdminWorker() {
                                                    adminWorkerAgent_->securityLiveEffects());
         bootSecurityApplier_.reset();
         if (holdCatalogApplyAtBootForTest_) adminWorkerAgent_->worker().holdApplyForTest(true);
+        if (holdSecurityApplyAtBootForTest_) adminWorkerAgent_->worker().holdSecurityApplyForTest(true);
         if (bootReconcileDeferred_) {
             adminWorkerAgent_->worker().deferTopicDirReconcile(config_.dataDir);
         }
@@ -4636,6 +4721,7 @@ int BrokerNode::pumpViewFanout_() {
 // ---------------------------------------------------------------------------
 int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     int work = 0;
+    controlNowNs_ = nowNs;   // PR #459 M2: the one injected clock of this control pass (the D24 gate's deadline)
 
     // Task 9 (RUNE_TLS SIGHUP reload): polled FIRST, unconditionally — must
     // work even on a deployment with no admin worker configured (the early
@@ -4670,6 +4756,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     });
 
     work += serviceAuthMode_(nowNs);   // Authentication Task 9: the dev-mode warning timer + the auth-mode counter
+    work += stepSecurityServing_(nowNs);   // issues #15 / #111: serving only while provably current
     work += servicePeerLinks_(nowNs);  // Authentication Task 15: the peer link handshakes + key distribution
 
     auto* agent = adminWorkerAgent_.get();
@@ -4790,6 +4877,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             if (tid == kA2cSecurityAlterIsr) { forwardSecurityAlterIsr_(p, n); return; }
             if (tid == kA2cSecurityApplied)  { onSecurityApplied_(p, n); return; }
             if (tid == kA2cSecurityHalted)   { onSecurityHalted_(p, n); return; }
+            if (tid == kA2cSecurityServing)  { onSecurityServing_(p, n); return; }
             if (tid == kA2cPeerFrameDrops) {   // Authentication Task 16: the admin plane's dropped inter-broker frames
                 if (n == 8) std::memcpy(&adminPeerDrops_, p, 8);
                 else if (adminToControlRejects_++ % 1024 == 0)
@@ -4969,7 +5057,8 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                     // applied the event (pumpSecurityGate_); a full gate answers Internal at once, never drops.
                     if (n < 16 + rune::protocol::client::MessageHeader::ENCODED_SIZE) return;
                     const int64_t eventOffset = admin_wire::getI64(p + 8);
-                    securityGate_.hold(session, eventOffset, std::span<const uint8_t>(p + 16, n - 16), send);
+                    // #120: the deadline runs on the control pass's injected clock (PR #459 M2).
+                    securityGate_.hold(session, eventOffset, std::span<const uint8_t>(p + 16, n - 16), send, controlNowNs_);
                     return;
                 }
                 const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -5004,7 +5093,12 @@ int BrokerNode::pumpSecurityGate_() {
     // Task 14: the gateway reports what it enforces (tables refreshed, bitmaps accepted by every worker); the boot / no-gateway
     // baseline is securityRefreshedOffset_.
     const int64_t enforced = gateway_ ? std::max(securityRefreshedOffset_, gateway_->securityEnforcedOffset()) : securityRefreshedOffset_;
-    return securityGate_.release(std::min(securityView_->appliedOffset(), enforced), send);
+    int n = securityGate_.release(std::min(securityView_->appliedOffset(), enforced), send);
+    // Issue #120: never held forever - a worker that does not acknowledge its fence (a stalled op ring) leaves the OK
+    // in doubt after the deadline (Internal, "committed at offset N; enforcement not confirmed"; a retry dedupes).
+    if (!securityGate_.empty()) [[unlikely]]
+        n += securityGate_.expire(controlNowNs_, config_.securityGateDeadlineMs * 1'000'000LL, send);
+    return n;
 }
 
 int AdminControlPlane::doWork(int64_t nowNs) {

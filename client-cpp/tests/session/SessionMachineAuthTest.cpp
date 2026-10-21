@@ -658,3 +658,100 @@ TEST(SessionMachineAuthRegression, AFinalLegHandshakeFailedWhileAuthenticatingIs
     EXPECT_EQ(m.rejectCode(), static_cast<int16_t>(pc::ErrorCode::HandshakeFailed));
     EXPECT_FALSE(m.cryptoState().encrypted) << "the keys of the failed episode are gone";
 }
+
+// Issues #15 / #111: AuthUnavailable (48) - the broker cannot vouch for its security state right now (booting, wiped,
+// partitioned).  Never a verdict on the credentials (never Rejected), and the broker closed that session: the retry is a
+// FRESH connect (sessionId dropped) - a reconnect-forever session that was Live backs off (the client's seed failover
+// moves it to another broker on its odd Backoff attempts), a first connect fails retriably (Disconnected, code 48).
+TEST(ClientAuthUnavailableRegression, BacksOffAndRotatesSeedsRegression) {
+    constexpr int16_t kUnavailable = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
+    {   // a first connect: a retriable failure the caller sees as 48 - never Rejected / AuthenticationFailed
+        Rig t; t.connectAuthRequired();
+        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, 3);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Disconnected);
+        EXPECT_EQ(t.m->lastConnectError(), kUnavailable);
+        EXPECT_EQ(t.m->sessionId(), 0) << "the broker ended that session: never resumed";
+        EXPECT_EQ(t.m->authUnavailableCount(), 1u);
+    }
+    {   // reconnect-forever after Live: the re-login answered 48 -> Backoff, then a fresh ConnectRequest
+        Rig t("ws1", "correct horse battery", /*forever=*/true, /*allowUnauthenticated=*/true);
+        t.m->connect(0);
+        t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), 1);
+        ASSERT_TRUE(t.m->everLive());
+        t.m->forceReconnect(10);
+        auto r = authRequired(t.io.lastCorrelation());
+        t.m->onConnectResponse(r.code, -1, 43, t.io.lastCorrelation(), 11, 0, {}, r.authMode, r.authState);
+        ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating);
+        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, 20);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Backoff) << "retriable: back off, never Rejected";
+        EXPECT_EQ(t.m->sessionId(), 0);
+        t.m->tick(t.m->nextAttemptNs());
+        EXPECT_EQ(t.m->state(), sm::SessionState::Connecting) << "a fresh attempt";
+    }
+    {   // Connected, then the broker stays stale past R: the session-level 48 (corr 0) ends it retriably
+        Rig t("ws1", "correct horse battery", /*forever=*/true, /*allowUnauthenticated=*/true);
+        t.m->connect(0);
+        t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), 1);
+        ASSERT_EQ(t.m->state(), sm::SessionState::Connected);
+        t.m->onErrorResponse(kUnavailable, "stale", /*corr=*/0, 50, /*noticeSessionId=*/42);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Backoff);
+        EXPECT_EQ(t.m->sessionId(), 0) << "reconnect FRESH elsewhere, never resume the ended session";
+        EXPECT_EQ(t.m->authUnavailableCount(), 1u);
+    }
+    {   // the same for a plain session: Disconnected (the application reconnects), never Rejected
+        Rig t("ws1", "correct horse battery", /*forever=*/false, /*allowUnauthenticated=*/true);
+        t.m->connect(0);
+        t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), 1);
+        t.m->onErrorResponse(kUnavailable, "stale", 0, 50, 42);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Disconnected);
+        EXPECT_NE(t.m->state(), sm::SessionState::Rejected);
+    }
+    {   // a 48 on a request's own correlation id is not a session end
+        Rig t("ws1", "correct horse battery", true, true);
+        t.m->connect(0);
+        t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), 1);
+        t.m->onErrorResponse(kUnavailable, "", /*corr=*/77, 50, 42);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Connected);
+    }
+}
+
+// Adversarial review of PR #459 (issues #15 / #111): a 48 notice that names ANOTHER session (one this machine already
+// left: a late notice from the stale broker after the client moved) never ends the current session; a broker that keeps
+// answering 48 to every re-login is retried with a growing backoff, forever, and never turns into Rejected.
+TEST(ClientAuthUnavailableRegression, AStaleNoticeNeverEndsTheNewSessionAndRepeated48sKeepRetryingAdversarialRegression) {
+    constexpr int16_t kUnavailable = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
+    {
+        Rig t("ws1", "correct horse battery", /*forever=*/true, /*allowUnauthenticated=*/true);
+        t.m->connect(0);
+        t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), 1);
+        ASSERT_EQ(t.m->state(), sm::SessionState::Connected);
+        t.m->onErrorResponse(kUnavailable, "stale", /*corr=*/0, 50, /*noticeSessionId=*/41);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Connected) << "a notice for session 41 never ends session 42";
+        EXPECT_EQ(t.m->sessionId(), 42);
+        EXPECT_EQ(t.m->authUnavailableCount(), 0u);
+    }
+    {
+        Rig t("ws1", "correct horse battery", /*forever=*/true, /*allowUnauthenticated=*/true);
+        t.m->connect(0);
+        t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), 1);
+        ASSERT_TRUE(t.m->everLive());
+        int64_t now = 10;
+        t.m->forceReconnect(now);
+        int64_t lastDelay = -1;
+        for (int i = 0; i < 40; ++i) {
+            ASSERT_EQ(t.m->state(), sm::SessionState::Connecting) << i;
+            auto r = authRequired(t.io.lastCorrelation());
+            t.m->onConnectResponse(r.code, -1, 100 + i, t.io.lastCorrelation(), ++now, 0, {}, r.authMode, r.authState);
+            ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating) << i;
+            t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, ++now);
+            ASSERT_EQ(t.m->state(), sm::SessionState::Backoff) << i << ": never Rejected";
+            const int64_t delay = t.m->nextAttemptNs() - now;
+            EXPECT_GE(delay, lastDelay) << i << ": the backoff never shrinks";
+            lastDelay = delay;
+            now = t.m->nextAttemptNs();
+            t.m->tick(now);
+        }
+        EXPECT_EQ(t.m->authUnavailableCount(), 40u);
+        EXPECT_EQ(t.m->rejectCode(), 0);
+    }
+}

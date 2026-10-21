@@ -88,6 +88,9 @@ clients or peers reach the node through Docker port mappings.
 | `RUNE_AUTH` | `enabled` | `enabled` or `disabled`. `disabled` is dev mode: no login, every request runs as `anonymous` with full access. A broker whose `RUNE_PEERS` lists more than one node refuses to start in dev mode. |
 | `RUNE_CLUSTER_KEY_FILE_NEXT` | unset | Second key for [rotation](operations.md#rotating-the-cluster-key): the broker accepts the current or the next key. |
 | `RUNE_AUTH_TIMEOUT_MS` | `10000` | A session that has not finished its login within this is answered `AuthenticationFailed` and ended (positive ms). |
+| `RUNE_SECURITY_MAX_STALENESS_MS` | `1000` | F: a broker whose `__security` leader (or the consensus) has been silent this long answers logins, `__security` reads and security DDL `AuthUnavailable` (48) until it is current again. Must exceed the broker liveness timeout + 500 ms (an explicit smaller value is refused; the default is raised to it). A hard leader failure can still make followers answer 48 briefly (#460). |
+| `RUNE_SECURITY_STALE_SESSION_END_MS` | `10000` | R (> F): a broker stale this long ends its authenticated sessions with a session-level `AuthUnavailable`, so their clients reconnect to a current broker. |
+| `RUNE_SECURITY_GATE_DEADLINE_MS` | `5000` | A security DDL OK whose enforcement on this broker is not confirmed within this is answered `Internal` "committed at offset N; enforcement not confirmed" (retry with the same request id). |
 | `RUNE_TLS_CERT_FILE` | unset | PEM certificate file. Read only by a broker built with `-DRUNE_TLS=ON`; reloaded on SIGHUP. |
 | `RUNE_TLS_KEY_FILE` | unset | PEM private key file. Same conditions. |
 | `RUNE_REQUIRE_TLS` | off | `1`/`true`/`TRUE`: refuse any client that does not establish an encrypted session. Read only in a `RUNE_TLS` build; ignored otherwise. |

@@ -164,7 +164,8 @@ public:
                 last = fn(*a.w, channel(id), a.sid);
                 // 0xFFFF (no answer: the session idle-expired) / 44 / 46 (revoked): log in again before the next attempt
                 if (last.errorCode == 0xFFFF || last.errorCode == 44 || last.errorCode == 46) { admin_[static_cast<std::size_t>(id - 1)] = {}; continue; }
-                if (last.errorCode != 2 && last.errorCode != 3) return last;
+                // 48 (issues #15 / #111): that broker's security state is not current right now - try another.
+                if (last.errorCode != 2 && last.errorCode != 3 && last.errorCode != 48) return last;
             }
             if (Clock3::now() >= deadline) return last;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));

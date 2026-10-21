@@ -8,7 +8,8 @@
 // word per live table (instead of one full bitmap per session that gains WRITE).
 //
 // One FIFO of items (Table / Patch / Bind / Drop), each with a sequence number; every worker receives every item, in
-// queue order, as SESSION_PERMISSIONS ops (a Table in chunks of <= kChunkWords words, the last flagged).  A full
+// queue order, as SESSION_PERMISSIONS ops (a Table in chunks of <= kChunkWords words, the last flagged; issue #196: a
+// Fence, which each worker acknowledges once it installed everything before it).  A full
 // lifecycle ring stops that worker at its next op and retry() resumes there - an op is never sent twice and never
 // skipped; no item is coalesced or reordered (a bind always follows the content of the table it names, and a table's
 // drop follows every rebind away from it).  shippedSeq() is the newest item EVERY worker accepted: the gateway answers
@@ -60,6 +61,15 @@ public:
         return push_(pool, std::move(it));
     }
 
+    /// Issue #196: an enforcement fence `fenceSeq` behind every item queued so far.  Each worker acknowledges it
+    /// (SessionSignal FenceAck{sessionId 1}) once it INSTALLED those items - ring acceptance (shippedSeq) is not
+    /// installation.  The D24 gate waits for the acks, not for an empty queue.
+    uint64_t fence(WorkerPool& pool, uint64_t fenceSeq) {
+        Item it{Kind::Fence};
+        it.epoch = fenceSeq;
+        return push_(pool, std::move(it));
+    }
+
     /// Resume every worker; returns how many ops were accepted this call.
     int retry(WorkerPool& pool) {
         int sent = 0;
@@ -72,6 +82,8 @@ public:
         return sent;
     }
 
+    /// The newest sequence number queued so far (0 = none) - what a caller compares to know whether it shipped anything.
+    [[nodiscard]] uint64_t queuedSeq() const noexcept { return endSeq_ - 1; }
     /// The newest sequence number every worker accepted (0 = none).
     [[nodiscard]] uint64_t shippedSeq() const noexcept { return frontSeq_ - 1; }
     [[nodiscard]] std::size_t pendingUpdates() const noexcept { return queue_.size(); }
@@ -79,7 +91,7 @@ public:
     [[nodiscard]] uint64_t wordsSentForTest() const noexcept { return wordsSent_; }
 
 private:
-    enum class Kind : uint8_t { Table, Patch, Bind, Drop };
+    enum class Kind : uint8_t { Table, Patch, Bind, Drop, Fence };
     struct Item {
         Kind                  kind;
         int64_t               key   = 0;   ///< table id (Table / Patch / Drop) or session id (Bind)
@@ -131,6 +143,10 @@ private:
             break;
         case Kind::Drop:
             op.isolation     = kPermFlagDrop | kPermFlagLast;
+            break;
+        case Kind::Fence:
+            op.isolation     = kPermFlagFence | kPermFlagLast;
+            op.correlationId = static_cast<int64_t>(it.epoch);   // the fence sequence number
             break;
         }
         return op;

@@ -1820,6 +1820,10 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
         onEgressReleased_(ret.partition, static_cast<uint64_t>(ret.baseOffset));
         return;
     }
+    if (kind == K::FenceAck) [[unlikely]] {                           // issues #109 / #196: the D24 gate's proof
+        onEnforceFenceAck_(ret.partition, static_cast<int>(ret.sessionId), static_cast<uint64_t>(ret.baseOffset));
+        return;
+    }
     if (kind != K::Failed && kind != K::Expire) {
         Session* s = sessions_.find(ret.sessionId);
         if (!s) return;                                               // closed meanwhile
@@ -2463,8 +2467,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
                 resp.v9 = true;
                 resp.authMode = authMode_ == rune::gateway::GatewayAuthMode::Required ? pc::AuthMode::Required
                                                                                        : pc::AuthMode::DevDisabled;
-                resp.authState = authMode_ == rune::gateway::GatewayAuthMode::Required && !neverBootstrapped_()
-                                     ? pc::AuthState::MustAuthenticate : pc::AuthState::Anonymous;
+                resp.authState = connectAuthState_();
             }
             if (pending.tls) {
                 // client<->broker TLS/AEAD (Task 7): offer the chosen cipher +
@@ -4287,7 +4290,8 @@ void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egress
 
 void ClientGateway::queueSubOp_(PendingSubOp p)
 {
-    const auto w = static_cast<std::size_t>(workerPool_->ownerWorkerId(p.sub.topicId, p.sub.partition));
+    const auto w = static_cast<std::size_t>(p.fenceSeq != 0 ? p.fenceWorker
+                                                            : workerPool_->ownerWorkerId(p.sub.topicId, p.sub.partition));
     if (pendingSubOps_.size() <= w) pendingSubOps_.resize(static_cast<std::size_t>(workerPool_->workerCount()));
     pendingSubOps_[w].push_back(std::move(p));
     const std::size_t n = pendingSubOpsForTest();
@@ -4298,11 +4302,18 @@ void ClientGateway::queueSubOp_(PendingSubOp p)
 bool ClientGateway::trySubOp_(const PendingSubOp& p)
 {
     rune::node::WorkerOp op;
+    if (p.fenceSeq != 0) [[unlikely]] {   // issues #109 / #196: behind every op queued before it for this worker
+        op.type          = rune::node::WorkerOp::Type::EnforceFence;
+        op.correlationId = static_cast<int64_t>(p.fenceSeq);
+        return workerPool_->worker(p.fenceWorker).tryEnqueueOp(std::move(op));
+    }
     if (p.unsubscribe) {
         op.type           = rune::node::WorkerOp::Type::Unsubscribe;
         op.subscriptionId = p.sub.subId;
         op.topicId        = p.sub.topicId;
         op.partition      = p.sub.partition;
+        op.endCode        = p.endCode;      // issue #109: the worker ends it after its last Records
+        op.endDetail      = p.endDetail;    // a view: valid for this (synchronous) enqueue
         return workerPool_->tryEnqueueOp(p.sub.topicId, p.sub.partition, std::move(op));
     }
     // Re-resolve the egress publication NOW (never a pointer held across cycles).
@@ -4545,7 +4556,8 @@ void ClientGateway::retireWithoutRecordEgress_(int64_t subId)
     sendAnswer_(*session, scratch_.data(), err.encode(scratch_.data()));
 }
 
-void ClientGateway::forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition)
+bool ClientGateway::forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition, int16_t endCode,
+                                                std::string_view endDetail)
 {
     // Task 18 (seeded stress): a subscription in state AwaitingEgress has not reached the worker (its Subscribe waits in
     // pendingRecordEgress_ for the session's pub), so there is nothing there to unsubscribe - and left waiting it would be
@@ -4558,18 +4570,26 @@ void ClientGateway::forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, 
             ws.erase(std::remove_if(ws.begin(), ws.end(), [subId](const BufferedSubscribe& w) { return w.subId == subId; }), ws.end());
         }
         sit->second.cursor = Cursor::GatewayPushed;
-        return;
+        return false;   // no worker ever had it: the caller answers the end
     }
     // M5: never dropped on a full ring — queued (behind any queued Subscribe of
     // the same worker, so the pair keeps its order) and retried every doWork.
+    // Issue #109: only a cursor the worker HOLDS (its Subscribe was forwarded) is ended by the worker; anything else
+    // is answered by the caller (the plain Unsubscribe still goes, harmless if the worker never had it).
+    const auto sw = subscriptions_.find(subId);
+    const bool atWorker = sw != subscriptions_.end() && sw->second.cursor == Cursor::AtWorker;
     PendingSubOp p;
     p.unsubscribe   = true;
     p.sub.subId     = subId;
     p.sub.topicId   = topicId;
     p.sub.partition = partition;
+    p.endCode       = atWorker ? endCode : int16_t{0};
+    if (p.endCode != 0) p.endDetail.assign(endDetail.substr(0, 192));   // cold: a revoked READ
     const auto w = static_cast<std::size_t>(workerPool_->ownerWorkerId(topicId, partition));
+    if (applyTracking_ && w < 64) [[unlikely]] applyOpWorkers_ |= uint64_t{1} << w;   // #109: the event's fence covers it
     const bool behind = w < pendingSubOps_.size() && !pendingSubOps_[w].empty();
     if (behind || !trySubOp_(p)) queueSubOp_(std::move(p));
+    return atWorker;
 }
 
 // ---------------------------------------------------------------------------
@@ -4587,7 +4607,11 @@ void ClientGateway::retireRecordEgress_(int64_t sid, int32_t worker,
     r.sessionId = sid;
     r.worker    = worker;
     r.pub       = std::move(pub);
-    r.enqueued  = tryEnqueueEgressRelease_(r);
+    // PR #459 F3: FIFO behind this worker's queued subscription ops (an ending Unsubscribe among them must run while
+    // its egress still exists) - a release never overtakes them.
+    const auto wq = static_cast<std::size_t>(worker);
+    const bool behind = wq < pendingSubOps_.size() && !pendingSubOps_[wq].empty();
+    r.enqueued  = !behind && tryEnqueueEgressRelease_(r);
     if (!r.enqueued) ++retiringUnsent_;
     retiringEgress_.push_back(std::move(r));
 }
@@ -4618,6 +4642,8 @@ int ClientGateway::pumpEgressReleases_()
         if (r.enqueued) continue;
         const uint64_t bit = uint64_t{1} << static_cast<unsigned>(r.worker);
         if ((refused & bit) != 0) continue;
+        const auto wq = static_cast<std::size_t>(r.worker);
+        if (wq < pendingSubOps_.size() && !pendingSubOps_[wq].empty()) { refused |= bit; continue; }   // F3: FIFO
         if (!tryEnqueueEgressRelease_(r)) {
             refused |= bit;
             continue;
@@ -5179,6 +5205,10 @@ void ClientGateway::handleSecuritySubscribe_(Session& session, const pc::Subscri
     }
     if (adminSink_ == nullptr) {
         answer(pc::ErrorCode::Internal);
+        return;
+    }
+    if (securityUnavailable_()) [[unlikely]] {   // issues #15 / #111: a stale replica serves no `__security` read
+        answer(pc::ErrorCode::AuthUnavailable);
         return;
     }
     // Issue #117: an end of this kind still owed to the admin goes first (FIFO) - else it would end the new read.
@@ -8213,6 +8243,43 @@ void ClientGateway::failLogin_(Session& session, int64_t correlationId, uint32_t
     (void)closeSession_(session.sessionId);
 }
 
+void ClientGateway::unavailableLogin_(Session& session, int64_t correlationId, std::string_view user)
+{
+    ++loginsUnavailable_;
+    if (unauthLog_.due(7)) [[unlikely]]
+        spdlog::warn("auth: login refused user={} source={} session={} reason=security-not-current (AuthUnavailable; "
+                     "refused so far: {})", user, session.sourceHost, session.sessionId, loginsUnavailable_);
+    pc::AuthServerFinal f;
+    f.sessionId     = session.sessionId;
+    f.correlationId = correlationId;
+    f.errorCode     = static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable);
+    f.detail        = "this broker's security state is not current - retry on another broker";
+    const std::size_t n = f.encode(scratch_.data());
+    sendAnswer_(session, scratch_.data(), n);
+    (void)closeSession_(session.sessionId);
+}
+
+void ClientGateway::endSessionsSecurityUnavailable()
+{
+    using namespace rune::gateway;
+    liveScratch_.clear();
+    sessions_.forEach([&](Session& s) {
+        if (std::holds_alternative<AuthAuthenticated>(s.auth) || std::holds_alternative<AuthPasswordChangeRequired>(s.auth))
+            liveScratch_.push_back(s.sessionId);
+    });
+    for (const int64_t sid : liveScratch_) {
+        Session* s = sessions_.find(sid);
+        if (s == nullptr) continue;
+        ++sessionsEndedUnavailable_;
+        // Session level (corr 0): every in-flight request of the session ends with it; the client reconnects elsewhere.
+        sendErrorOn_(*s, 0, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable),
+                     "this broker's security state is stale - reconnect to another broker");
+        (void)closeSession_(sid);
+    }
+    if (!liveScratch_.empty())
+        spdlog::warn("auth: {} authenticated session(s) ended: this broker's security state stayed stale", liveScratch_.size());
+}
+
 void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
 {
     using namespace rune::gateway;
@@ -8256,6 +8323,10 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
         failLogin_(*session, m->correlationId, 0);
         return;
     }
+    if (securityUnavailable_()) [[unlikely]] {   // issues #15 / #111: never verified against a stale view
+        unavailableLogin_(*session, m->correlationId, user);
+        return;
+    }
     ServerFirstPlan plan = scramServerFirst(securityView_->state(), *m, deadline, securityView_->fakeIterations());
     if (plan.frame.empty()) {   // no randomness for the nonce: fail closed
         ++loginsFailed_;
@@ -8293,6 +8364,10 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         if (unauthLog_.due(1)) [[unlikely]]
             spdlog::warn("auth: rate limited user={} source={} retry_after_ms={}", user, session->sourceHost, v.retryAfterMs);
         failLogin_(*session, hdr->correlationId, v.retryAfterMs);
+        return;
+    }
+    if (securityUnavailable_()) [[unlikely]] {   // issues #15 / #111: the view went stale between the two legs
+        unavailableLogin_(*session, hdr->correlationId, user);
         return;
     }
     const auto fin = pc::AuthClientFinal::decode(buf, len);
@@ -8372,12 +8447,9 @@ int ClientGateway::servicePermissionShippingWork_()
 
 int ClientGateway::servicePermissionShipping_()
 {
-    const int work = servicePermissionShippingWork_();
-    if (securityPendingEnforce_ >= 0 && permissionShipper_.pendingUpdates() == 0) {   // Task 14: the D24 gate may release
-        securityEnforcedOffset_ = std::max(securityEnforcedOffset_, securityPendingEnforce_);
-        securityPendingEnforce_ = -1;
-    }
-    return work;
+    // Issues #109 / #196: the D24 gate is released by the fence acks (onEnforceFenceAck_), never by the shipper's
+    // queue draining - a chunk on a worker's ring is not installed yet.
+    return servicePermissionShippingWork_();
 }
 
 
@@ -8410,15 +8482,70 @@ void ClientGateway::reapAuthDeadlines_(int64_t nowNs)
 // ---------------------------------------------------------------------------
 // Authentication Task 14 (spec §6, D24-D26, D28): live security changes.  Control thread; cold (one security event).
 // ---------------------------------------------------------------------------
-void ClientGateway::noteEnforced_(int64_t offset) noexcept
+// Issues #109 / #196: which worker rings a security event's enforcement must be fenced on.  The lifecycle ring
+// carries the WRITE bitmaps / binds (shipped only in shard mode under authentication); the op ring the ending
+// Unsubscribes of worker-pushed subscriptions (per-worker egress).
+bool ClientGateway::fencesLifecycleRing_() const noexcept
 {
-    // Enforced = every table refreshed AND every shipped bitmap accepted by every worker; until the shipper drains the
-    // event waits (servicePermissionShipping_ promotes it).
-    if (permissionShipper_.pendingUpdates() == 0) {
-        securityEnforcedOffset_ = std::max(securityEnforcedOffset_, offset);
-        securityPendingEnforce_ = -1;
-    } else {
-        securityPendingEnforce_ = std::max(securityPendingEnforce_, offset);
+    return workerPool_ != nullptr && shardMode_ && authMode_ == rune::gateway::GatewayAuthMode::Required;
+}
+
+bool ClientGateway::fencesOpRing_() const noexcept
+{
+    return workerPool_ != nullptr && perWorkerEgressActive_;
+}
+
+void ClientGateway::noteEnforced_(int64_t offset, uint64_t opWorkers, bool lifecycle)
+{
+    // Enforced = every table refreshed here (synchronous, done by the caller) AND every worker executed what this
+    // event queued for it: a fence goes behind the event's ops on each ring that got some - the lifecycle ring of every
+    // worker when it shipped permission items, the op ring of each worker an Unsubscribe went to - and the event is
+    // enforced once those workers acknowledged it (onEnforceFenceAck_).  An event that queued nothing is enforced now
+    // (behind any still-fenced earlier one: the enforced offset only moves forward, in event order).
+    const bool life = lifecycle && fencesLifecycleRing_();
+    const uint64_t ops = fencesOpRing_() ? opWorkers : 0;
+    if (!life && ops == 0) {
+        if (pendingEnforce_.empty()) securityEnforcedOffset_ = std::max(securityEnforcedOffset_, offset);
+        else pendingEnforce_.push_back({offset, 0, 0, false});
+        return;
+    }
+    const uint64_t seq = ++enforceFenceSeq_;
+    if (life) (void)permissionShipper_.fence(*workerPool_, seq);   // FIFO behind every bitmap / bind queued so far
+    const int32_t n = std::min<int32_t>(workerPool_->workerCount(), kMaxFenceWorkers);
+    for (int32_t w = 0; w < n; ++w) {
+        if ((ops & (uint64_t{1} << w)) == 0) continue;
+        PendingSubOp p;
+        p.fenceSeq    = seq;
+        p.fenceWorker = w;
+        const auto wi = static_cast<std::size_t>(w);
+        const bool behind = wi < pendingSubOps_.size() && !pendingSubOps_[wi].empty();   // FIFO behind the ends
+        if (behind || !trySubOp_(p)) queueSubOp_(std::move(p));
+    }
+    pendingEnforce_.push_back({offset, seq, ops, life});
+}
+
+void ClientGateway::onEnforceFenceAck_(int32_t worker, int ring, uint64_t seq) noexcept
+{
+    if (worker < 0 || worker >= kMaxFenceWorkers) [[unlikely]] return;
+    auto& acked = (ring == 0 ? opFenceAcked_ : lifeFenceAcked_)[static_cast<std::size_t>(worker)];
+    if (seq > acked) acked = seq;   // a ring is FIFO: an ack covers every earlier fence on it
+    promoteEnforced_();
+}
+
+void ClientGateway::promoteEnforced_() noexcept
+{
+    const int32_t n = workerPool_ != nullptr ? std::min<int32_t>(workerPool_->workerCount(), kMaxFenceWorkers) : 0;
+    while (!pendingEnforce_.empty()) {
+        const PendingEnforce& e = pendingEnforce_.front();
+        bool done = true;
+        for (int32_t w = 0; w < n && done; ++w) {
+            const auto wi = static_cast<std::size_t>(w);
+            if (e.lifecycle && lifeFenceAcked_[wi] < e.seq) done = false;
+            if ((e.opWorkers & (uint64_t{1} << w)) != 0 && opFenceAcked_[wi] < e.seq) done = false;
+        }
+        if (!done) return;
+        securityEnforcedOffset_ = std::max(securityEnforcedOffset_, e.offset);
+        pendingEnforce_.pop_front();
     }
 }
 
@@ -8436,6 +8563,10 @@ void ClientGateway::onSecurityApplied(int64_t offset, const rune::security::Appl
 {
     using namespace rune::gateway;
     if (securityView_ == nullptr || securityView_->halted()) return;
+    // Issues #109 / #196: what this event queues for the workers decides which of their rings its fence must cover.
+    applyTracking_  = true;
+    applyOpWorkers_ = 0;
+    const uint64_t shippedBefore = permissionShipper_.queuedSeq();
     if (applied.effect != rune::security::SessionEffect::None && !applied.affectedUsers.empty()) {
         liveScratch_.clear();
         sessions_.forEach([&](Session& s) {
@@ -8454,7 +8585,8 @@ void ClientGateway::onSecurityApplied(int64_t offset, const rune::security::Appl
             for (const int64_t sid : liveScratch_) revokeSession_(sid, reason);
         }
     }
-    noteEnforced_(offset);
+    applyTracking_ = false;
+    noteEnforced_(offset, applyOpWorkers_, permissionShipper_.queuedSeq() != shippedBefore);
 }
 
 void ClientGateway::refreshSession_(int64_t sid)
@@ -8488,13 +8620,19 @@ void ClientGateway::executeLiveActions_(Session& s, const rune::gateway::LiveAct
     using namespace rune::gateway;
     const PermissionTable& perms = permsOf_(s);
     for (const EndSubscription& e : act.ends) {
-        // Unsubscribe to the owning worker (ordered before any later push on its ring), then forget it here: the gateway
-        // drops a racing push of an ended subscription id.
-        if (perWorkerEgressActive_ && workerPool_) forwardUnsubscribeToWorker_(e.subscriptionId, e.topicId, e.partition);
+        const auto d = authorizeTopicId(perms, e.topicId, rune::security::Operation::Read, objectIndex_);
+        const std::string_view detail = d ? std::string_view(d->detail) : std::string_view("not authorized");
+        // Issue #109: a WORKER-pushed subscription (per-worker egress) is ended by its push owner - the worker writes
+        // its Records on its own publication, so only it can put the terminal NotAuthorized AFTER its last Records.
+        // The ending Unsubscribe is queued behind the subscription's Subscribe (never dropped) and the event's
+        // enforcement fence behind it (noteEnforced_): the DDL's OK waits until the worker dropped the cursor.  A
+        // gateway-pushed subscription is ended here: forgotten first, so the gateway drops a racing push of its id.
+        const bool workerEnds = perWorkerEgressActive_ && workerPool_ && e.topicId >= 0 &&
+                                forwardUnsubscribeToWorker_(e.subscriptionId, e.topicId, e.partition,
+                                                            static_cast<int16_t>(e.code), detail);
         s.subIdByKey.erase(Session::SubKey{e.correlationId, e.topicId, e.partition});
         subscriptions_.erase(e.subscriptionId);
-        const auto d = authorizeTopicId(perms, e.topicId, rune::security::Operation::Read, objectIndex_);
-        sendErrorOn_(s, e.correlationId, e.code, d ? std::string_view(d->detail) : std::string_view("not authorized"));
+        if (!workerEnds) sendErrorOn_(s, e.correlationId, e.code, detail);
         ++notAuthorizedAnswers_;
     }
     if (act.endCatalogReads) {
@@ -8548,9 +8686,26 @@ void ClientGateway::revokeSession_(int64_t sid, std::string_view reason)
     else if (const auto* p = std::get_if<AuthPasswordChangeRequired>(&s->auth)) user = p->user;
     ++sessionsRevoked_;
     spdlog::warn("auth: session {} of user {} revoked: {}", sid, user, reason);
+    // Issue #196: on the shard path a worker accepts this session's direct produce until its SessionClose is
+    // processed, and the close may queue behind a full lifecycle ring on its own (announcer) FIFO.  Bind the session
+    // to nothing FIRST, on the permission shipper's FIFO: the event's lifecycle fence follows it, so the DDL's OK is
+    // released only once every worker refuses this session's produce, whatever the close's progress.
+    if (fencesLifecycleRing_()) {
+        uint64_t owner = 0;
+        if (const auto* a = std::get_if<AuthAuthenticated>(&s->auth)) owner = a->userId;
+        else if (const auto* p = std::get_if<AuthPasswordChangeRequired>(&s->auth)) owner = p->userId;
+        (void)permissionShipper_.bind(*workerPool_, sid, rune::node::PermissionShipper::kDenyTable, ++permEpoch_, owner);
+    }
     const auto code = static_cast<uint16_t>(pc::ErrorCode::SessionRevoked);
-    // Each live subscription (and admin-log read) completes SessionRevoked on its correlation id ...
-    for (const auto& [key, subId] : s->subIdByKey) { (void)subId; sendErrorOn_(*s, key.correlationId, code, reason); }
+    // Each live subscription (and admin-log read) completes SessionRevoked on its correlation id.  PR #459 F3 (the #109
+    // class): a subscription a WORKER pushes is ended by that worker - its 46 follows its last Records on the same
+    // egress, and it is forgotten here first so the close below sends no plain Unsubscribe that would cancel the end.
+    for (const auto& [key, subId] : s->subIdByKey) {
+        const bool workerEnds = perWorkerEgressActive_ && workerPool_ && key.topicId >= 0 &&
+                                forwardUnsubscribeToWorker_(subId, key.topicId, key.partition, static_cast<int16_t>(code), reason);
+        if (workerEnds) subscriptions_.erase(subId);
+        else sendErrorOn_(*s, key.correlationId, code, reason);
+    }
     for (const int64_t corr : s->catalogReadCorrs) sendErrorOn_(*s, corr, code, reason);
     for (const int64_t corr : s->securityReadCorrs) sendErrorOn_(*s, corr, code, reason);
     // ... then the session-level frame (corr 0): every other in-flight request of the session completes with it.
@@ -8625,6 +8780,11 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
     if (!pc::clientUnderstandsAuth(session->clientVersion)) {
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
                              "SecurityDdl needs client version 9");
+        return;
+    }
+    if (securityUnavailable_()) [[unlikely]] {   // issues #15 / #111: never built on (or judged against) a stale view
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable),
+                             "this broker's security state is not current - retry on another broker");
         return;
     }
     // Authentication Task 12 (D20): ADMIN ON CLUSTER - except a user's own ALTER USER <self> ADD / DROP / SET PASSWORD,
@@ -8741,6 +8901,11 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
     if (!pc::clientUnderstandsAuth(session->clientVersion)) {
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
                              "SecurityBootstrap needs client version 9");
+        return;
+    }
+    if (securityUnavailable_()) [[unlikely]] {   // issues #15 / #111
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable),
+                             "this broker's security state is not current - retry on another broker");
         return;
     }
     // D4: a fresh cluster cannot be hijacked by whoever reaches it first - the request must prove possession of the
