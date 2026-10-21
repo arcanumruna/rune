@@ -188,6 +188,7 @@ void TransactionCoordinationService::load_(int64_t nowNs)
     }
     const tx::ProducerId maxPid =
         coordinator_.reload(txnState_ ? txnState_->all() : noSnapshot_, coordinatorEpoch_, nowNs);
+    for (const auto& [pid, a] : awaiting_) releaseOffsets_(a.offsetToken);
     awaiting_.clear();
     dropDeferred_();       // nothing deferred survives a load (unload answered it)
     lastPutOffset_.clear();   // the loaded log is committed
@@ -223,6 +224,7 @@ void TransactionCoordinationService::unload_()
     // re-discovers and retries; the new coordinator answers from the durable
     // state), every marker task is dropped.
     dropDeferred_();   // #358 class: so is every answer still waiting for its record, and every gated EndTxn
+    for (const auto& [pid, a] : awaiting_) releaseOffsets_(a.offsetToken);   // their offset waiters go
     for (auto& [pid, a] : awaiting_) {
         if (!a.respPending || gateway_ == nullptr) continue;
         pc::EndTxnResponse resp;
@@ -1082,18 +1084,14 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
     if (it == awaiting_.end()) return true;
     AwaitingMarkers& cur = it->second;
     offsetRefusedThisPass_ = false;
-    completionToken_ = 0;
+    completionToken_ = {};
     if (const auto* m = coordinator_.metadata(cur.txnId)) {
-        // F2: unique per transaction (a producer's next transaction starts after this one completed) and stable
-        // across this coordinator's retries; another coordinator's re-drive gets its own record appended.
-        uint64_t h = 0xcbf29ce484222325ull;
-        for (const uint64_t v : {static_cast<uint64_t>(m->producerId), static_cast<uint64_t>(m->producerEpoch),
-                                 static_cast<uint64_t>(m->txnStartNs), static_cast<uint64_t>(coordinatorEpoch_)}) {
-            h ^= v;
-            h *= 0x100000001b3ull;
-        }
-        completionToken_ = h | 1u;   // never the anonymous 0
+        // F2: one token per transaction (a producer's next transaction starts after this one completed) and per
+        // load (another load re-drives with its own record), compared field by field.
+        completionToken_ = rune::coordination::TxnOffsetToken{m->producerId, m->producerEpoch, m->txnStartNs,
+                                                               coordinatorEpoch_};
     }
+    cur.offsetToken = completionToken_;
     const auto r = coordinator_.completeTransaction(cur.txnId);
     if (r.errorCode == tx::CompleteTransactionResult::kOffsetsPending && !offsetRefusedThisPass_) {
         // #358: every offset is appended, some not committed yet on the offsets replica.  CompleteCommit waits for
@@ -1126,6 +1124,7 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
     }
     const AwaitingMarkers a = std::move(cur);
     awaiting_.erase(it);
+    releaseOffsets_(a.offsetToken);   // nothing waits on its offsets any more
     if (a.offsetsPending && offsetsPendingTxns_ > 0) --offsetsPendingTxns_;
     ++transactionsCompleted_;
     // F15 m4: persist the resting Complete* (offsets were applied first, inside

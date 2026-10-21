@@ -151,10 +151,14 @@ public:
     /// record and appends again only when it may be gone (the offsets replica changed leadership or truncated).
     /// Control thread.
     /// `token` (PR #434 review F2): identifies the committing transaction (the coordinator passes one per
-    /// transaction; 0 = an anonymous caller, test rigs).
+    /// transaction and load; a default token = an anonymous caller, test rigs).
     rune::coordination::TxnOffsetApply applyTransactionalOffset(const std::string& group,
                                                                 const rune::coordination::TopicPartition& tp,
-                                                                int64_t offset, int64_t nowNs, uint64_t token = 0);
+                                                                int64_t offset, int64_t nowNs,
+                                                                rune::coordination::TxnOffsetToken token = {});
+    /// PR #434 review: the transaction coordinator no longer waits for `token`'s offsets (it completed elsewhere,
+    /// unloaded, or dropped the transaction): its waiters leave.  Control thread.
+    void releaseTransactionalOffsets(const rune::coordination::TxnOffsetToken& token);
     /// #358: transactional offset records appended and not yet known committed (test / observability).
     [[nodiscard]] std::size_t txnOffsetsReplicating() const noexcept { return txnOffsetsWaiting_; }
     /// E2 residual round 5 (R1): a counter that moves whenever a committed
@@ -273,32 +277,38 @@ private:
     // Members
     // -----------------------------------------------------------------------
     rune::coordination::ReplicatedOffsetStore* offsets_;    // non-owning
-    /// #358: the transactional offset records of one (group, topic, partition) appended and waited on.  Cold path.
-    /// Each entry is one committing transaction's (its completion `token`) record and the offsets replica's
-    /// (leadership, log) generation it was appended under.  PR #434 review F2: an entry answers only the
-    /// transaction that appended it - a later transaction (another token) always appends, so a lingering entry can
-    /// never answer Applied for a commit it did not write.  A newer append for the same (group, tp) - transactional
-    /// or a plain OffsetCommit - marks the older entries superseded: their waiter then waits on its own (older)
-    /// record and never appends again over the newer value (no rewind, no ping-pong between two waiters).  Entries
-    /// leave when their waiter is answered Applied, when a newer non-superseded entry of the key is Applied (every
-    /// older record is then committed), when the generation changes, or past kMaxTxnOffsetWaiters per key (oldest).
+    /// #358 / PR #434 review: the transactions waiting on their offset records of one (group, topic, partition),
+    /// in APPEND order.  Cold path.  The order is the commit order, and it is what keeps the committed offset at the
+    /// newest commit:
+    ///   - a waiter's offset is safe once its own record, or any NEWER record of the key, is committed;
+    ///   - only the newest waiter ever appends again (after the offsets replica's leadership or log changed and its
+    ///     record may be gone); an older one waits for the newer record, so an older value never lands over a newer;
+    ///   - a waiter leaves only when it is answered Applied or when the transaction coordinator releases it
+    ///     (releaseTransactionalOffsets); never evicted - a full key refuses a new transaction instead (it retries).
+    /// A plain OffsetCommit counts as the newest record of the key (it is newer than every waiter).
     struct TxnOffsetKey {
         std::string group, topic;
         int32_t     partition = 0;
         auto operator<=>(const TxnOffsetKey&) const = default;
     };
-    struct TxnOffsetInFlight {
-        uint64_t token        = 0;
+    struct TxnOffsetWaiter {
+        rune::coordination::TxnOffsetToken token;
         int64_t  offset       = 0;
-        int64_t  recordOffset = -1;
+        int64_t  recordOffset = -1;   ///< its own record
         uint64_t leadershipGen = 0, logGen = 0;
-        bool     superseded   = false;
     };
-    static constexpr std::size_t kMaxTxnOffsetWaiters = 8;
-    std::map<TxnOffsetKey, std::vector<TxnOffsetInFlight>> txnOffsetsInFlight_;
-    std::size_t txnOffsetsWaiting_ = 0;   ///< total entries (txnOffsetsReplicating())
-    /// A plain OffsetCommit appended for (group, tp): every waiting transactional entry of it is superseded.
-    void supersedeTxnOffsets_(const std::string& group, const rune::coordination::TopicPartition& tp);
+    struct TxnOffsetKeyState {
+        std::vector<TxnOffsetWaiter> waiters;          ///< append order
+        int64_t  lastRecord = -1;                      ///< the key's newest record (a waiter's or a plain commit's)
+        uint64_t lastLeadershipGen = 0, lastLogGen = 0;
+        bool     lastCommitted = false;                ///< observed committed (then it survives any change)
+        bool     plainIsLast   = false;                ///< the newest record is a plain OffsetCommit
+    };
+    static constexpr std::size_t kMaxTxnOffsetWaiters = 64;   ///< per key; beyond: Refused (the coordinator retries)
+    std::map<TxnOffsetKey, TxnOffsetKeyState> txnOffsetsInFlight_;
+    std::size_t txnOffsetsWaiting_ = 0;   ///< total waiters (txnOffsetsReplicating())
+    /// A plain OffsetCommit appended record `at` for (group, tp): it is the key's newest record.
+    void notePlainOffsetCommit_(const std::string& group, const rune::coordination::TopicPartition& tp, int64_t at);
     rune::gateway::TopicRegistry*              topics_;     // non-owning; may be null
     std::function<bool()>                      isLeaderFn_;
     int8_t                                     localLeader_ = -1;   // see setLocalLeadership()

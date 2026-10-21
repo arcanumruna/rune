@@ -234,8 +234,14 @@ public:
     /// answers a transaction only from the offset record THAT transaction appended.
     using TxnOffsetSink = rune::coordination::TxnOffsetApply (*)(void* ctx, const std::string& group,
                                                                  const rune::coordination::TopicPartition& tp,
-                                                                 int64_t offset, int64_t nowNs, uint64_t token);
-    void setTxnOffsetSink(TxnOffsetSink fn, void* ctx) noexcept { offsetSink_ = fn; offsetSinkCtx_ = ctx; }
+                                                                 int64_t offset, int64_t nowNs,
+                                                                 const rune::coordination::TxnOffsetToken& token);
+    /// PR #434 review: the coordinator no longer waits for `token`'s offsets (completed, unloaded, dropped) - the
+    /// sink lets its waiters go (GroupCoordinationService::releaseTransactionalOffsets).  Optional.
+    using TxnOffsetRelease = void (*)(void* ctx, const rune::coordination::TxnOffsetToken& token);
+    void setTxnOffsetSink(TxnOffsetSink fn, void* ctx, TxnOffsetRelease release = nullptr) noexcept {
+        offsetSink_ = fn; offsetSinkCtx_ = ctx; offsetRelease_ = release;
+    }
     /// Completion attempts deferred because the sink refused (a retry counter, not a loss counter).
     [[nodiscard]] uint64_t txnOffsetApplyRetries() const noexcept { return offsetApplyRetries_; }
     /// #358: completion attempts deferred because an offset record was still replicating.
@@ -321,7 +327,11 @@ private:
     uint64_t      offsetApplyRetries_ = 0;
     uint64_t      offsetReplicationWaits_ = 0;
     bool          offsetRefusedThisPass_  = false;   ///< #358: a completion pass met a Refused (vs only Replicating)
-    uint64_t      completionToken_        = 0;       ///< F2: the transaction completeAwaiting_ is completing
+    rune::coordination::TxnOffsetToken completionToken_{};   ///< F2: the transaction completeAwaiting_ is completing
+    TxnOffsetRelease offsetRelease_ = nullptr;
+    void releaseOffsets_(const rune::coordination::TxnOffsetToken& t) {
+        if (offsetRelease_ != nullptr && offsetSink_ != nullptr && t.producerId >= 0) offsetRelease_(offsetSinkCtx_, t);
+    }
     std::size_t   offsetsPendingTxns_ = 0;   ///< awaiting_ entries deferred on a refused offset apply
     static constexpr int64_t kOffsetRetryMinNs = 10'000'000;     // 10 ms
     static constexpr int64_t kOffsetRetryMaxNs = 1'000'000'000;  // 1 s
@@ -352,6 +362,7 @@ private:
         int32_t coordinatorEpoch = -1;
         bool    commit           = false;
         bool    offsetsPending   = false;   // completeTransaction deferred: the offset sink refused
+        rune::coordination::TxnOffsetToken offsetToken{};   // the token its offsets were applied under
         int64_t offsetDueNs      = 0;
         int64_t offsetBackoffNs  = 0;
         int64_t dispatchedNs     = 0;       // D9 re-review MEDIUM-2: gauge age of never-refused markers

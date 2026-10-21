@@ -2506,11 +2506,14 @@ void BrokerNode::buildGateway() {
             if (groupCoordService_) {
                 txnCoordService_->setTxnOffsetSink(
                     [](void* ctx, const std::string& group, const rune::coordination::TopicPartition& tp,
-                       int64_t offset, int64_t nowNs, uint64_t token) {
+                       int64_t offset, int64_t nowNs, const rune::coordination::TxnOffsetToken& token) {
                         return static_cast<GroupCoordinationService*>(ctx)->applyTransactionalOffset(group, tp, offset,
                                                                                                       nowNs, token);
                     },
-                    groupCoordService_.get());
+                    groupCoordService_.get(),
+                    [](void* ctx, const rune::coordination::TxnOffsetToken& token) {
+                        static_cast<GroupCoordinationService*>(ctx)->releaseTransactionalOffsets(token);
+                    });
             }
 
             // D9: cross-node transaction markers over the cluster plane — a

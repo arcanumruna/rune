@@ -658,7 +658,7 @@ struct RefusingSink {
     int replicating = 0;       ///< #358: then answer Replicating this many times before Applied
     std::vector<int64_t> offered;
     static rune::coordination::TxnOffsetApply apply(void* ctx, const std::string&, const rune::coordination::TopicPartition&,
-                                                    int64_t offset, int64_t, uint64_t) {
+                                                    int64_t offset, int64_t, const rune::coordination::TxnOffsetToken&) {
         auto* s = static_cast<RefusingSink*>(ctx);
         ++s->calls;
         s->offered.push_back(offset);
@@ -667,6 +667,13 @@ struct RefusingSink {
         ++s->accepted;
         s->acceptedOffsets.push_back(offset);
         return rune::coordination::TxnOffsetApply::Applied;
+    }
+    int released = 0;
+    std::vector<rune::coordination::TxnOffsetToken> tokens;
+    static void release(void* ctx, const rune::coordination::TxnOffsetToken& t) {
+        auto* s = static_cast<RefusingSink*>(ctx);
+        ++s->released;
+        s->tokens.push_back(t);
     }
 };
 }  // namespace
@@ -787,7 +794,7 @@ TEST_F(TransactionCoordinationServiceTest, CompleteCommitWaitsUntilTheOffsetReco
     // append seam (outstanding until they land), exactly the re-drive path of a failover.
     svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
         txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [this] { return leaderNodeId_; });
-    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink, &RefusingSink::release);
     svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
     int64_t now = 1'000'000'000;
     (void)svc_->doWork(now);
@@ -813,6 +820,10 @@ TEST_F(TransactionCoordinationServiceTest, CompleteCommitWaitsUntilTheOffsetReco
     EXPECT_EQ(svc_->awaitingMarkerTxnsForTest(), 0u);
     EXPECT_EQ(svc_->txnOffsetReplicationWaits(), 2u);
     EXPECT_EQ(svc_->txnOffsetApplyRetries(), 0u) << "a replication wait is not a refusal";
+    ASSERT_EQ(sink.released, 1) << "PR #434 re-check: the completed transaction's offset waiters are released";
+    EXPECT_EQ(sink.tokens[0].producerId, pid);
+    EXPECT_EQ(sink.tokens[0].producerEpoch, ep);
+    EXPECT_GE(sink.tokens[0].coordinatorEpoch, 0);
     now += 1'100'000'000;
     (void)svc_->doWork(now);
     EXPECT_EQ(sink.calls, 6) << "nothing re-applies a completed commit";
@@ -875,6 +886,51 @@ TEST_F(TransactionCoordinationServiceTest, ARefusalAfterReplicationWaitsBacksOff
     (void)svc_->doWork(now);
     EXPECT_EQ(sink.calls, 3);
     EXPECT_EQ(svc_->txnStateForTest(txn), tx::TxnState::CompleteCommit);
+}
+
+// PR #434 re-check: a coordinator that unloads while a commit waits on its offsets releases those waiters.
+TEST_F(TransactionCoordinationServiceTest, AnUnloadReleasesTheOffsetWaitersOfItsWaitingCommitsRegression) {
+    RefusingSink sink;
+    sink.replicating = 100;
+    const std::string txn = "txnOffsetRel";
+    std::size_t reqLen = encodeInitProducerId(reqBuf_.data(), reqBuf_.size(), 1, 1, 30'000, txn);
+    std::size_t outLen = svc_->handleInitProducerId(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+    auto init = pc::InitProducerIdResponse::decode(outBuf_.data(), outLen);
+    ASSERT_TRUE(init);
+    const int64_t pid = init->producerId;
+    const int16_t ep  = init->producerEpoch;
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+    reqLen = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, 2, pid, ep, txn, parts);
+    ASSERT_GT(svc_->handleAddPartitions(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size()), 0u);
+    const std::string grp = "cg-rel";
+    pc::AddOffsetsToTxn add;
+    add.sessionId = 1; add.correlationId = 3; add.producerId = pid; add.producerEpoch = ep;
+    add.transactionalId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(txn.data()), txn.size());
+    add.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(grp.data()), grp.size());
+    reqLen = add.encode(reqBuf_.data());
+    ASSERT_GT(svc_->handleAddOffsets(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size()), 0u);
+    pc::TxnOffsetCommit toc;
+    toc.sessionId = 1; toc.correlationId = 4; toc.producerId = pid; toc.producerEpoch = ep;
+    toc.transactionalId = add.transactionalId;
+    toc.groupId = add.groupId;
+    const std::vector<pc::TxnOffsetCommitEntry> entries = {{0, 0, 9, {}}};
+    reqLen = toc.encode(reqBuf_.data(), entries);
+    ASSERT_GT(svc_->handleTxnOffsetCommit(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size()), 0u);
+    reqLen = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 1, 5, pid, ep, /*commit=*/true, txn);
+    (void)svc_->handleEndTxn(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [this] { return leaderNodeId_; });
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink, &RefusingSink::release);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    int64_t now = 1'000'000'000;
+    (void)svc_->doWork(now);
+    svc_->onControlMarkerLanded(0, 0, pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    ASSERT_GE(sink.calls, 1);
+    EXPECT_EQ(sink.released, 0) << "still waiting";
+    isLeader_ = false;
+    (void)svc_->doWork(now + 1'000);
+    ASSERT_EQ(sink.released, 1) << "the unloaded coordinator lets its offset waiters go";
+    EXPECT_EQ(sink.tokens[0].producerId, pid);
 }
 
 // ===========================================================================
