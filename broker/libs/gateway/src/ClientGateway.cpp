@@ -1910,9 +1910,10 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
 
     const auto& req = *reqOpt;
 
-    // Authentication Task 11 (D11): a session that already authenticated on THIS broker, reconnecting from the same
-    // endpoint, keeps its authentication (answered ResumedAuthenticated; no new session).
-    if (resumeAuthenticated_(req)) return;
+    // Issue #10 (M1): a Connect never resumes an authenticated session by its id.  The plaintext resume-by-id
+    // (D11) let any UDP sender that names a session id and its reply endpoint take the session over; every client
+    // session of an authenticating broker is TLS now, and an encrypted session is bound to its keys, so a reconnect
+    // is a fresh session that logs in again.
     // Authentication Task 11 (D11 version gate): an authenticating broker refuses a pre-v9 client AT THE HANDSHAKE
     // (ConnectResponse{ProtocolVersion}, non-retriable for every client version) - it could never log in, and it
     // must not be able to reach a gated session at all.  No session is created.
@@ -8712,33 +8713,6 @@ void ClientGateway::onSecurityHalted(int64_t offset)
     });
     for (const int64_t sid : liveScratch_) revokeSession_(sid, "security log halted on this broker");
     (void)offset;
-}
-
-bool ClientGateway::resumeAuthenticated_(const pc::ConnectRequest& req)
-{
-    using namespace rune::gateway;
-    if (authMode_ != GatewayAuthMode::Required || req.sessionId == 0 || !pc::clientUnderstandsAuth(req.clientVersion)) return false;
-    if (!req.cipherList.empty() || !req.handshakeBytes.empty()) return false;   // a crypto offer starts a fresh session
-    Session* s = sessions_.find(req.sessionId);
-    if (s == nullptr || s->crypto.encrypted) return false;
-    if (!std::holds_alternative<AuthAuthenticated>(s->auth) && !std::holds_alternative<AuthPasswordChangeRequired>(s->auth))
-        return false;
-    // The same client: the same reply endpoint AND the same source host.
-    if (s->egressChannel != req.egressChannel || s->egressStreamId != req.egressStreamId ||
-        s->sourceHost != sourceHostOf_(req.egressChannel))
-        return false;
-    pc::ConnectResponse resp;
-    resp.sessionId         = s->sessionId;
-    resp.correlationId     = req.correlationId;
-    resp.code              = static_cast<int16_t>(pc::ErrorCode::OK);
-    resp.leaderMemberId    = thisNodeId_;
-    resp.assignedSessionId = s->sessionId;
-    resp.v9                = true;
-    resp.authMode          = pc::AuthMode::Required;
-    resp.authState         = pc::AuthState::ResumedAuthenticated;
-    sessions_.touch(s->sessionId, nowNs_);
-    sendAnswer_(*s, scratch_.data(), resp.encode(scratch_.data()));
-    return true;
 }
 
 // ---------------------------------------------------------------------------

@@ -2094,16 +2094,16 @@ void BrokerNode::buildGateway() {
             ", key loaded=" + (tlsKeyLoaded ? "yes" : "no") +
             ") — refusing to start rather than silently degrade to plaintext");
     }
-    if (config_.requireTls && (tlsCertPem.empty() || tlsKeyPem.empty())) {
+    if (config_.requiresClientTls() && (tlsCertPem.empty() || tlsKeyPem.empty())) {
         // require_tls with no usable cert would hard-reject every Connect
         // (never a silent plaintext fleet) — refuse to start instead of
         // bricking the broker at runtime on the first client connect.  The
         // check above already covers "TLS configured but unloadable"; this
         // one remains for "require_tls set but TLS not configured at all"
         // (both paths empty).
-        throw std::runtime_error("BrokerNode: RUNE_REQUIRE_TLS is set but no usable TLS cert/key "
-                                  "was loaded (RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE) — refusing to "
-                                  "start (every Connect would be rejected)");
+        throw std::runtime_error("BrokerNode: every client session must be TLS (RUNE_REQUIRE_TLS, or authentication "
+                                  "enabled) but no usable TLS cert/key was loaded (RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE) "
+                                  "— refusing to start (every Connect would be rejected)");
     }
     // Task 19 (per-worker egress crypto addendum): shard mode + require_tls
     // used to be refused at startup here (the shard worker's Records egress
@@ -2120,7 +2120,7 @@ void BrokerNode::buildGateway() {
     // clear. Refuse to start rather than fail open.
     const bool brokerHasTlsAtStartup = !tlsCertPem.empty() && !tlsKeyPem.empty();
     if (rune::node::mustRefuseNonShardPerWorkerEgressTls(
-            config_.perWorkerEgressEnabled, config_.shardMode(), config_.requireTls,
+            config_.perWorkerEgressEnabled, config_.shardMode(), config_.requiresClientTls(),
             brokerHasTlsAtStartup)) {
         throw std::runtime_error(
             "BrokerNode[" + std::to_string(nodeId) + "]: non-shard per-worker-egress has no "
@@ -2141,7 +2141,7 @@ void BrokerNode::buildGateway() {
             rune::aeronutil::AeronPump{},
             tlsCertPem,
             tlsKeyPem,
-            config_.requireTls
+            config_.requiresClientTls()   // issue #10 (M1): authentication => a plaintext Connect is HandshakeFailed
         );
         if (config_.maxHeldIdleMs > 0) gateway_->setMaxHeldIdleNs(config_.maxHeldIdleMs * 1'000'000LL);   // D8b
         static_assert(NodeConfig::kMaxGatewayProduceCredits == rune::gateway::ClientGateway::kMaxSessionProduceCredits);

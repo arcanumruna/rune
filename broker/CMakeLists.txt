@@ -174,15 +174,12 @@ target_include_directories(rune_security PUBLIC ${RUNE_CODEC_ROOT}/include)
 target_link_libraries(rune_security PUBLIC rune_catalog)
 target_compile_features(rune_security PUBLIC cxx_std_23)
 
-# Task 9 / spec §11: RUNE_TLS — the client<->broker TLS/AEAD enablement gate.
-# OFF (default): NodeConfig.cpp never reads RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE/
-# RUNE_REQUIRE_TLS from the environment (guarded by the RUNE_TLS_ENABLED compile
-# definition below) — tlsCertFile/tlsKeyFile/requireTls stay at their empty/false
-# defaults no matter what an operator sets, so a RUNE_TLS=OFF build is
-# byte-identical plaintext (the crypto core itself, Tasks 5-8/8b, is already
-# always compiled in — this option gates ONLY the config path that could ever
-# arm it). ON: the broker can be deployed with cert/key files + require_tls.
-option(RUNE_TLS "Enable the RUNE_TLS client<->broker TLS/AEAD config path (cert/key file loading, require_tls, SIGHUP reload)" OFF)
+# Task 9 / spec §11, issues #10 / #11 (combined fix program M1): RUNE_TLS — the client<->broker TLS config path.
+# ON (default): NodeConfig.cpp reads RUNE_TLS_CERT_FILE / RUNE_TLS_KEY_FILE / RUNE_REQUIRE_TLS (the RUNE_TLS_ENABLED
+# compile definition below).  Authentication is served only over TLS, so an OFF build REFUSES to start with
+# authentication enabled (the default mode) or with any of those variables set - it is a plaintext dev-mode-only
+# (RUNE_AUTH=disabled) build.  The crypto core itself is always compiled in.
+option(RUNE_TLS "Enable the RUNE_TLS client<->broker TLS config path (cert/key file loading, require_tls, SIGHUP reload); OFF refuses authentication" ON)
 
 option(ENABLE_COVERAGE "Enable coverage instrumentation" OFF)
 if(ENABLE_COVERAGE)
