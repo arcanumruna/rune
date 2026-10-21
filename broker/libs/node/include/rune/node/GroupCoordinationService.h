@@ -375,7 +375,7 @@ private:
     std::map<int64_t, uint64_t> oldClientRefusals_;
 
     // CG-4: member → sessionId tracking.
-    // Keyed by (groupId + ":" + memberId) for global uniqueness.
+    // Keyed by buildMemberKey_(groupId, memberId) ("<len>:<group><member>", unambiguous).
     // Populated on JoinGroup; cleared on Leave and whenever the coordinator
     // removes the member (expiry, join timeout: drainDeparted_).
     // Used by doWork to know which egress session to send Assign frames to and
@@ -390,6 +390,8 @@ private:
     // std::map with std::less<> enables transparent find() with string_view.
     struct MemberBinding { int64_t sessionId = 0; uint64_t principal = 0; };
     std::map<std::string, MemberBinding, std::less<>> memberSessionMap_;
+    /// The map key of (groupId, memberId) into memberKeyScratch_ (unambiguous: length-prefixed group).
+    void buildMemberKey_(std::string_view groupId, std::string_view memberId);
     /// The binding of (groupId, memberId), or nullptr.  Builds memberKeyScratch_.
     const MemberBinding* bindingOf_(std::string_view groupId, std::string_view memberId);
     /// True when (groupId, memberId) is bound to `sessionId`.

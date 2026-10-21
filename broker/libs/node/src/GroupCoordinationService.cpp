@@ -20,6 +20,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cstring>
 
 namespace rune::node {
@@ -100,13 +101,23 @@ coord::GroupCoordinator& GroupCoordinationService::coordinator(const GroupId& gr
 // ---------------------------------------------------------------------------
 // Issues #123 / #124 / #169: member ownership (see memberSessionMap_).
 // ---------------------------------------------------------------------------
+void GroupCoordinationService::buildMemberKey_(std::string_view groupId, std::string_view memberId) {
+    // PR #423 review F2: "<group length>:<group><member>" - unambiguous for any bytes in either id (a ':' separator
+    // alone let group "x" + member "y:m" alias group "x:y" + member "m").  No allocation once the capacity is reached.
+    char len[8];
+    const auto [end, ec] = std::to_chars(len, len + sizeof len, groupId.size());
+    (void)ec;   // a u16-prefixed wire field: at most 5 digits
+    memberKeyScratch_.clear();
+    memberKeyScratch_.append(len, static_cast<std::size_t>(end - len));
+    memberKeyScratch_ += ':';
+    memberKeyScratch_.append(groupId);
+    memberKeyScratch_.append(memberId);
+}
+
 const GroupCoordinationService::MemberBinding* GroupCoordinationService::bindingOf_(std::string_view groupId,
                                                                                     std::string_view memberId) {
     if (memberId.empty()) return nullptr;
-    memberKeyScratch_.clear();
-    memberKeyScratch_.append(groupId);
-    memberKeyScratch_ += ':';
-    memberKeyScratch_.append(memberId);
+    buildMemberKey_(groupId, memberId);
     const auto it = memberSessionMap_.find(memberKeyScratch_);
     return it == memberSessionMap_.end() ? nullptr : &it->second;
 }
@@ -121,10 +132,7 @@ void GroupCoordinationService::drainDeparted_(std::string_view groupId, coord::G
     gc.takeDeparted(departedScratch_);
     for (const std::string& m : departedScratch_) {
         if (gc.hasMember(m)) continue;   // re-joined since (same id, its owner): keep the binding
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupId);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(m);
+        buildMemberKey_(groupId, m);
         memberSessionMap_.erase(memberKeyScratch_);
     }
     departedScratch_.clear();
@@ -501,13 +509,13 @@ size_t GroupCoordinationService::handleJoinGroup(
     // same session, or a reconnect of the same principal).  Any other id - another principal's member, a member that
     // no longer exists, an id the client made up - joins as a NEW member with a fresh id: the answer looks the same
     // whether or not the id names someone (nothing to enumerate), and an id is never adopted from the client.
+    // PR #423 review F2: and only for a CURRENT member of THIS group (a binding never stands in for membership).
     const uint64_t principal = principalOf_(msg.sessionId);
+    coord::GroupCoordinator& gc = coordinator(groupIdStr);
     if (!memberIdScratch_.empty()) {
         const MemberBinding* b = bindingOf_(groupIdStr, memberIdStr);
-        if (b == nullptr || b->principal != principal) memberIdScratch_.clear();
+        if (b == nullptr || b->principal != principal || !gc.hasMember(memberIdStr)) memberIdScratch_.clear();
     }
-
-    coord::GroupCoordinator& gc = coordinator(groupIdStr);
 
     // Set rebalance timeout from the member's sessionTimeout (or a sane default).
     gc.setRebalanceTimeoutMs(
@@ -541,10 +549,7 @@ size_t GroupCoordinationService::handleJoinGroup(
     // but from a new TCP session with a different sessionId).
     if (!jr.memberId.empty() && jr.errorCode != coord::JoinResult::kErrDead) {
         // CG-7 zero-alloc: build composite key into pre-reserved scratch.
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupIdStr);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(jr.memberId);
+        buildMemberKey_(groupIdStr, jr.memberId);
         memberSessionMap_[memberKeyScratch_] = MemberBinding{msg.sessionId, principal};
         spdlog::debug("GroupCoordinationService: JoinGroup tracking member '{}' sessionId={}",
                       memberKeyScratch_, msg.sessionId);
@@ -851,10 +856,7 @@ void GroupCoordinationService::evictMember(std::string_view groupId, std::string
     evictScratch_.clear();
     for (const auto& member : coord.members()) {
         if (!memberId.empty() && member.memberId != memberId) continue;
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupId);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(member.memberId);
+        buildMemberKey_(groupId, member.memberId);
         const auto it = memberSessionMap_.find(memberKeyScratch_);
         if (it != memberSessionMap_.end() && it->second.sessionId == sessionId) evictScratch_.push_back(member.memberId);
     }
@@ -862,10 +864,7 @@ void GroupCoordinationService::evictMember(std::string_view groupId, std::string
         spdlog::warn("GroupCoordinationService: old client (session {}) member '{}' of group '{}' evicted — "
                      "answered UnknownMember instead of an error it would ignore", sessionId, m, groupId);
         coord.leave(m, coord.generationId(), nowNs);
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupId);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(m);
+        buildMemberKey_(groupId, m);
         memberSessionMap_.erase(memberKeyScratch_);
     }
 }
@@ -878,10 +877,7 @@ int GroupCoordinationService::removeUnauthorizedMembers(int64_t sessionId, int64
         if (check.mayRead(check.ctx, groupId)) continue;
         evictScratch_.clear();
         for (const auto& member : coord.members()) {
-            memberKeyScratch_.clear();
-            memberKeyScratch_.append(groupId);
-            memberKeyScratch_ += ':';
-            memberKeyScratch_.append(member.memberId);
+            buildMemberKey_(groupId, member.memberId);
             const auto it = memberSessionMap_.find(memberKeyScratch_);
             if (it != memberSessionMap_.end() && it->second.sessionId == sessionId) evictScratch_.push_back(member.memberId);
         }
@@ -891,10 +887,7 @@ int GroupCoordinationService::removeUnauthorizedMembers(int64_t sessionId, int64
             spdlog::warn("GroupCoordinationService: session {} lost READ on group '{}' - member '{}' removed (its next "
                          "request is answered NotAuthorized)", sessionId, groupId, memberId);
             coord.leave(memberId, coord.generationId(), nowNs);
-            memberKeyScratch_.clear();
-            memberKeyScratch_.append(groupId);
-            memberKeyScratch_ += ':';
-            memberKeyScratch_.append(memberId);
+            buildMemberKey_(groupId, memberId);
             memberSessionMap_.erase(memberKeyScratch_);
             ++removed;
         }
@@ -907,10 +900,7 @@ void GroupCoordinationService::evictSessionMembers(int64_t sessionId, int64_t no
     for (auto& [groupId, coord] : coordinators_) {
         evictScratch_.clear();
         for (const auto& member : coord.members()) {
-            memberKeyScratch_.clear();
-            memberKeyScratch_.append(groupId);
-            memberKeyScratch_ += ':';
-            memberKeyScratch_.append(member.memberId);
+            buildMemberKey_(groupId, member.memberId);
             const auto it = memberSessionMap_.find(memberKeyScratch_);
             if (it != memberSessionMap_.end() && it->second.sessionId == sessionId) evictScratch_.push_back(member.memberId);
         }
@@ -920,10 +910,7 @@ void GroupCoordinationService::evictSessionMembers(int64_t sessionId, int64_t no
             spdlog::warn("GroupCoordinationService: old client (session {}) member '{}' of group '{}' evicted — "
                          "answered UnknownMember instead of an error it would ignore", sessionId, memberId, groupId);
             coord.leave(memberId, coord.generationId(), nowNs);
-            memberKeyScratch_.clear();
-            memberKeyScratch_.append(groupId);
-            memberKeyScratch_ += ':';
-            memberKeyScratch_.append(memberId);
+            buildMemberKey_(groupId, memberId);
             memberSessionMap_.erase(memberKeyScratch_);
         }
     }
@@ -1321,10 +1308,7 @@ void GroupCoordinationService::onEnterPreparingRebalance(
 
     for (const auto& member : coord.members()) {
         // CG-7 zero-alloc: build memberKey into pre-reserved scratch string.
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupId);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(member.memberId);
+        buildMemberKey_(groupId, member.memberId);
         const auto it = memberSessionMap_.find(memberKeyScratch_);
         if (it == memberSessionMap_.end()) continue;  // no session tracked yet (early join)
 
@@ -1390,10 +1374,7 @@ void GroupCoordinationService::onReachedStable(
 
     for (const auto& member : coord.members()) {
         // CG-7 zero-alloc: build memberKey into pre-reserved scratch string.
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupId);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(member.memberId);
+        buildMemberKey_(groupId, member.memberId);
         const auto it = memberSessionMap_.find(memberKeyScratch_);
         if (it == memberSessionMap_.end()) {
             spdlog::warn("GroupCoordinationService::onReachedStable: "
