@@ -438,6 +438,21 @@ public:
     /// Test probes (Task 18): the event waiting for the shipper to drain (-1 none) and the shipper's queued updates.
     [[nodiscard]] int64_t securityPendingEnforceForTest() const noexcept { return securityPendingEnforce_; }
     [[nodiscard]] std::size_t permissionPendingUpdatesForTest() const noexcept { return permissionShipper_.pendingUpdates(); }
+    /// Issue #259 test seam: authenticate `sid` as `userId` holding exactly `grants` (sorted, unique) - through the pool
+    /// and the shipper, as a login does.
+    void authenticateWithGrantsForTest(int64_t sid, uint64_t userId, std::vector<rune::security::GrantSpec> grants) {
+        Session* s = sessions_.find(sid);
+        if (s == nullptr) return;
+        s->auth = rune::gateway::AuthAuthenticated{userId, "u" + std::to_string(userId),
+                                                    permPool_.acquire(std::move(grants), objectIndex_), {}};
+        (void)shipPermissions_(*s);
+    }
+    int servicePermissionShippingForTest() { return servicePermissionShipping_(); }
+    /// Issue #259 probes: tables compiled so far, live pooled tables, and the words / ops shipped to the workers.
+    [[nodiscard]] uint64_t permissionCompilesForTest() const noexcept { return permPool_.compiles(); }
+    [[nodiscard]] std::size_t permissionTablesForTest() const noexcept { return permPool_.liveTables(); }
+    [[nodiscard]] uint64_t permissionWordsShippedForTest() const noexcept { return permissionShipper_.wordsSentForTest(); }
+    [[nodiscard]] uint64_t permissionOpsShippedForTest() const noexcept { return permissionShipper_.chunksSentForTest(); }
     /// Counter 1'000'232: sessions revoked (disabled / dropped / TERMINATE SESSIONS / security halt).
     [[nodiscard]] uint64_t sessionsRevoked() const noexcept { return sessionsRevoked_; }
     // ── authentication Task 12: per-session permission tables and the enforcement of every request type ──
@@ -455,7 +470,7 @@ public:
     [[nodiscard]] const rune::gateway::PermissionTable* sessionPermissionsForTest(int64_t sid) {
         const Session* s = sessions_.find(sid);
         const auto* a = s ? std::get_if<rune::gateway::AuthAuthenticated>(&s->auth) : nullptr;
-        return a ? &a->perms : nullptr;
+        return a ? &a->perms.table() : nullptr;
     }
     /// Test seam: the auth state of an existing session.
     void setSessionAuthForTest(int64_t sid, rune::gateway::SessionAuth a) {
@@ -2074,6 +2089,9 @@ private:
     /// credits in the episode is never expired.
     static constexpr uint32_t kCapEvictAfterDeferredPolls = 64;
 
+    // Issue #259: ONE compiled table per distinct grant set, shared by the sessions holding it.  Declared BEFORE
+    // sessions_ so it outlives every session's PermissionRef.
+    rune::gateway::PermissionPool        permPool_;
     SessionTable                         sessions_;
     // Retire-on-ack record-egress pubs (see RetiringEgress).  Declared after
     // sessions_ / aeron_ so it is destroyed before them (pubs before client).
@@ -2276,7 +2294,9 @@ private:
     /// The permission table the session's auth state grants: its compiled one, allow-all (anonymous), else deny-all.
     [[nodiscard]] const rune::gateway::PermissionTable& permsOf_(const Session& s) const noexcept;
     /// Compile the table of `userId` against the live ObjectIndex (login and SET PASSWORD; Task 14 refreshes with it).
-    [[nodiscard]] rune::gateway::PermissionTable compilePerms_(uint64_t userId) const;
+    [[nodiscard]] rune::gateway::PermissionRef compilePerms_(uint64_t userId);
+    /// Issue #259: the pool's table births / deaths to the shard workers (FIFO, before any bind or patch).
+    void syncPermissionTables_();
     /// true = DENIED here: answered NotAuthorized (45) in the request's own response type (D23 text where the type
     /// carries one) - the caller returns without forwarding anything.
     [[nodiscard]] bool deny_(Session& session, const std::optional<rune::gateway::Denial>& denial, const uint8_t* buf, std::size_t len);
@@ -2357,7 +2377,8 @@ private:
     uint64_t permEpoch_ = 0;
     struct HeldLoginFinal { int64_t sessionId; uint64_t epoch; std::vector<uint8_t> frame; };
     std::vector<HeldLoginFinal> heldLoginFinals_;     ///< cold: one per login whose grants are still being shipped
-    /// Ship `session`'s WRITE bitmap (Required mode + shard mode only); returns its epoch (0 = nothing to ship).
+    /// Bind `session` to its table on every worker (Required mode + shard mode only; the table itself is shipped once
+    /// per grant set); returns the bind's shipper sequence (0 = nothing to ship).
     uint64_t shipPermissions_(const Session& session);
     /// Release the held AuthServerFinal frames whose epoch every worker has accepted; retry unfinished shipments.
     int servicePermissionShipping_();

@@ -2576,21 +2576,35 @@ private:
     // sink adds this worker's own exclusive publication on its next flush.
     // Workers without worker-side acks (legacy, unit rigs) only count it.
     // -------------------------------------------------------------------
-    // Authentication Task 13 (D30): one chunk of a session's WRITE bitmap.  Staged in this worker's one
-    // PermissionStager and swapped into the session's slot on the last chunk (a partial table is never visible).
+    // Authentication Task 13 (D30) / issue #259: the WRITE tables and the sessions' bindings to them (see
+    // WorkerWriteGrants.h for the variants).  A full table is staged in this worker's one PermissionStager and swapped
+    // in on its last chunk (a partial table is never visible); a patch, a bind and a drop are single ops.
     [[gnu::cold]] void executeSessionPermissionsWire_(sbe::WorkerOp& op) {
         ++sessionPermissionChunksSeen_;
         if (!ackSink_) return;   // a worker without worker-side acks keeps no session table (and enforces nothing)
         const auto first = static_cast<uint64_t>(op.nextOffset());
         const auto total = static_cast<uint64_t>(op.hwBound());
+        const uint8_t flags = op.isolation();
         const std::uint32_t tailLen = op.tailLength();   // SBE var data: the length FIRST, then tail() advances past it
         const auto* tail = reinterpret_cast<const uint8_t*>(op.tail());
-        const PermissionChunkResult r = permStager_.apply(
-            *ackSink_, op.sessionId(), first, total, op.isolation(), static_cast<uint64_t>(op.correlationId()), tail, tailLen,
-            static_cast<uint64_t>(op.producerId()));   // #122: the session's principal
-        if (r == PermissionChunkResult::Dropped) [[unlikely]]
-            spdlog::debug("Worker {}: permission chunk for session {} dropped (closed session or out-of-order chunk)",
-                          workerId_, op.sessionId());
+        bool ok = true;
+        if ((flags & kPermFlagBind) != 0) {
+            ok = ackSink_->bindWriteGrants(op.sessionId(), op.nextOffset(), static_cast<uint64_t>(op.correlationId()),
+                                           static_cast<uint64_t>(op.producerId()));   // #122: the session's principal
+        } else if ((flags & kPermFlagDrop) != 0) {
+            ok = ackSink_->dropWriteTable(op.sessionId());
+        } else if ((flags & kPermFlagPatch) != 0) {
+            ok = tailLen % 8 == 0 && ackSink_->patchWriteTable(op.sessionId(), first, total, tail, tailLen / 8);
+        } else if ((flags & kPermFlagTable) != 0) {
+            ok = permStager_.apply(*ackSink_, op.sessionId(), first, total, flags,
+                                   static_cast<uint64_t>(op.correlationId()), tail, tailLen,
+                                   static_cast<uint64_t>(op.producerId())) != PermissionChunkResult::Dropped;
+        } else {
+            ok = false;   // no variant flag: not sent by this runtime
+        }
+        if (!ok) [[unlikely]]
+            spdlog::debug("Worker {}: permission op (flags {:#x}) for {} dropped (closed session, bad id or out-of-order "
+                          "chunk)", workerId_, flags, op.sessionId());
     }
 
     [[gnu::cold]] void executeSessionAnnounceWire_(sbe::WorkerOp& op) {

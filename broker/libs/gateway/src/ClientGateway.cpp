@@ -1523,7 +1523,6 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     // Task 13: the workers forget it too (its queued acks drop, its
     // publications are released) — retried until every worker has it.
     if (shardMode_ && workerPool_) sessionAnnouncer_.close(*workerPool_, sid);
-    permissionShipper_.forget(sid);
     for (std::size_t i = 0; i < heldLoginFinals_.size(); ++i)
         if (heldLoginFinals_[i].sessionId == sid) { heldLoginFinals_.erase(heldLoginFinals_.begin() + static_cast<std::ptrdiff_t>(i)); break; }
     // Hybrid egress: drop any in-flight record-egress resolves for this session
@@ -7911,7 +7910,7 @@ void ClientGateway::answerGate_(Session& sessionRef, const pc::MessageHeader& hd
 // ---------------------------------------------------------------------------
 const rune::gateway::PermissionTable& ClientGateway::permsOf_(const Session& s) const noexcept
 {
-    if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) return a->perms;
+    if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) return a->perms.table();
     // Dev / in-process brokers authenticate nobody: everything is allowed whatever a session's (test-set) state says.
     // On an authenticating broker only AuthAuthenticated holds grants: AuthAnonymous (the state of nobody who logged
     // in) is denied everything (X013).
@@ -7919,11 +7918,25 @@ const rune::gateway::PermissionTable& ClientGateway::permsOf_(const Session& s) 
     return denyAllPerms_;
 }
 
-rune::gateway::PermissionTable ClientGateway::compilePerms_(uint64_t userId) const
+rune::gateway::PermissionRef ClientGateway::compilePerms_(uint64_t userId)
 {
-    if (securityView_ == nullptr) return rune::gateway::PermissionTable::denyAll();
-    const std::vector<rune::security::GrantSpec> grants = rune::security::effectiveGrants(securityView_->state(), userId);
-    return rune::gateway::PermissionTable::compile(grants, objectIndex_);
+    if (securityView_ == nullptr) return rune::gateway::PermissionRef{};   // deny-all
+    // Issue #259: the effective set is computed per principal (O(its grants)); the table is compiled only when no
+    // session holds that exact set already.
+    return permPool_.acquire(rune::security::effectiveGrants(securityView_->state(), userId), objectIndex_);
+}
+
+void ClientGateway::syncPermissionTables_()
+{
+    if (!permPool_.hasEvents()) return;
+    const bool shipping = authMode_ == rune::gateway::GatewayAuthMode::Required && shardMode_ && workerPool_;
+    permPool_.drainEvents([&](rune::gateway::PermissionPool::Event ev, uint32_t id, const PermissionTable& t) {
+        if (!shipping) return;
+        if (ev == rune::gateway::PermissionPool::Event::Created)
+            (void)permissionShipper_.shipTable(*workerPool_, id, t.writeBits(), t.isAllowAll());
+        else
+            (void)permissionShipper_.dropTable(*workerPool_, id);
+    });
 }
 
 void ClientGateway::onCatalogObjectApplied(int32_t id, const std::string& name, bool isView)
@@ -7931,24 +7944,27 @@ void ClientGateway::onCatalogObjectApplied(int32_t id, const std::string& name, 
     if (isView) objectIndex_.onView(id, name); else objectIndex_.onTopic(id, name);
     const rune::gateway::ObjectEntry* e = objectIndex_.at(id);
     if (e == nullptr) return;
-    sessions_.forEach([&](Session& s) {
-        if (auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) {
-            a->perms.onObjectCreated(id, *e);
-            // Prefix extension (spec §6): a WRITE grant that now covers the new topic reaches the workers too.
-            if (a->perms.allows(id, rune::security::opBit(rune::security::Operation::Write))) (void)shipPermissions_(s);
-        }
+    // Issue #259: every LIVE TABLE once (not every session); a table whose WRITE bit of the new object changed (a
+    // prefix grant now covering it, spec §6) ships that one word - never a full bitmap.
+    syncPermissionTables_();   // the workers know every live table before any patch of one
+    const bool shipping = authMode_ == rune::gateway::GatewayAuthMode::Required && shardMode_ && workerPool_;
+    permPool_.onObjectCreated(id, *e, [&](uint32_t tid, const PermissionTable& t, bool before, bool after) {
+        if (!shipping || before == after) return;
+        const auto w = static_cast<std::size_t>(id) / 64;
+        (void)permissionShipper_.patchTable(*workerPool_, tid, w, t.writeBits().subspan(w, 1), t.writeBits().size());
     });
 }
 
 void ClientGateway::onCatalogObjectDropped(int32_t id)
 {
     objectIndex_.onDropped(id);
-    sessions_.forEach([&](Session& s) {
-        if (auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) {
-            const bool hadWrite = a->perms.allows(id, rune::security::opBit(rune::security::Operation::Write));
-            a->perms.onObjectDropped(id);
-            if (hadWrite) (void)shipPermissions_(s);
-        }
+    syncPermissionTables_();
+    const bool shipping = authMode_ == rune::gateway::GatewayAuthMode::Required && shardMode_ && workerPool_;
+    permPool_.onObjectDropped(id, [&](uint32_t tid, const PermissionTable& t, bool before, bool) {
+        if (!shipping || !before) return;
+        const auto w = static_cast<std::size_t>(id) / 64;
+        if (w < t.writeBits().size())
+            (void)permissionShipper_.patchTable(*workerPool_, tid, w, t.writeBits().subspan(w, 1), t.writeBits().size());
     });
 }
 
@@ -8257,7 +8273,7 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     f.flags           = ok.mustChangePassword ? pc::kAuthFlagMustChangePassword : uint8_t{0};
     f.serverSignature = std::string_view(reinterpret_cast<const char*>(ok.serverSignature.data()), ok.serverSignature.size());
     const std::size_t finalLen = f.encode(scratch_.data());
-    if (shipEpoch != 0 && permissionShipper_.fullyShippedEpoch(session->sessionId) < shipEpoch) {
+    if (shipEpoch != 0 && permissionShipper_.shippedSeq() < shipEpoch) {
         // A worker's lifecycle ring is full: hold the OK (cold, login rate) until every worker accepted the bitmap.
         heldLoginFinals_.push_back({session->sessionId, shipEpoch,
                                     std::vector<uint8_t>(scratch_.data(), scratch_.data() + finalLen)});
@@ -8271,20 +8287,24 @@ uint64_t ClientGateway::shipPermissions_(const Session& session)
     if (authMode_ != rune::gateway::GatewayAuthMode::Required || !shardMode_ || !workerPool_) return 0;
     const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth);
     if (a == nullptr) return 0;   // must-change-password / anonymous: the worker slot stays empty (deny)
+    syncPermissionTables_();   // a new table's content goes first: a bind never names a table the workers lack
     const uint64_t epoch = ++permEpoch_;
-    (void)permissionShipper_.ship(*workerPool_, session.sessionId, a->perms.writeBits(), a->perms.isAllowAll(), epoch,
-                                  a->userId);   // #122: producer ids are checked against the principal
-    return epoch;
+    const uint32_t id = a->perms.id();
+    return permissionShipper_.bind(*workerPool_, session.sessionId,
+                                   id == rune::gateway::PermissionRef::kNoId ? rune::node::PermissionShipper::kDenyTable
+                                                                             : static_cast<int64_t>(id),
+                                   epoch, a->userId);   // #122: producer ids are checked against the principal
 }
 
 int ClientGateway::servicePermissionShippingWork_()
 {
     int work = 0;
+    syncPermissionTables_();   // issue #259: a freed table's drop (after every rebind away from it)
     if (!workerPool_ || !shardMode_) return 0;
     if (permissionShipper_.pendingUpdates() != 0) work += permissionShipper_.retry(*workerPool_);
     for (std::size_t i = 0; i < heldLoginFinals_.size(); ) {
         HeldLoginFinal& h = heldLoginFinals_[i];
-        if (permissionShipper_.fullyShippedEpoch(h.sessionId) < h.epoch) { ++i; continue; }
+        if (permissionShipper_.shippedSeq() < h.epoch) { ++i; continue; }
         if (Session* s = sessions_.find(h.sessionId)) sendAnswer_(*s, h.frame.data(), h.frame.size());
         heldLoginFinals_.erase(heldLoginFinals_.begin() + static_cast<std::ptrdiff_t>(i));
         ++work;
@@ -8394,13 +8414,14 @@ void ClientGateway::refreshSession_(int64_t sid)
     }
     auto* a = std::get_if<AuthAuthenticated>(&s->auth);
     if (a == nullptr) return;
-    PermissionTable fresh = compilePerms_(a->userId);
-    const LiveActions actions = refreshActions(a->perms, fresh, *s, objectIndex_);
-    const bool writeChanged = a->perms.isAllowAll() != fresh.isAllowAll() ||
-                              !std::equal(a->perms.writeBits().begin(), a->perms.writeBits().end(),
-                                          fresh.writeBits().begin(), fresh.writeBits().end());
-    a->perms = std::move(fresh);
-    if (writeChanged) (void)shipPermissions_(*s);   // a revoked WRITE fails the next produce on both paths
+    // Issue #259: a pooled table - compiled only if no session holds the new set yet; the same set = the same table.
+    PermissionRef fresh = compilePerms_(a->userId);
+    if (fresh.id() == a->perms.id() && fresh.id() != PermissionRef::kNoId) return;   // nothing changed for it
+    const LiveActions actions = refreshActions(a->perms.table(), fresh.table(), *s, objectIndex_);
+    // The old table is held until the rebind is queued: its drop (if this was its last holder) must FOLLOW the bind,
+    // or the worker would deny this session between the two.
+    const PermissionRef old = std::exchange(a->perms, std::move(fresh));
+    (void)shipPermissions_(*s);   // a revoked WRITE fails the next produce on both paths
     if (!actions.empty()) executeLiveActions_(*s, actions);
 }
 

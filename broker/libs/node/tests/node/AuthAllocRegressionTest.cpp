@@ -137,9 +137,12 @@ struct WorkerAuth {
         a.egressStreamId = kEgress; a.egressChannel = "aeron:ipc?term-length=1048576"; a.grantAll = false;
         (void)worker->tryEnqueueOp(std::move(a));
         std::vector<uint64_t> bits(1, uint64_t{1} << 1);            // WRITE on topic 1
-        WorkerOp g; g.type = WorkerOp::Type::SessionPermissions; g.sessionId = 5; g.correlationId = 1;
-        g.nextOffset = 0; g.hwBound = 1; g.isolation = kPermFlagLast; g.permWords = bits.data(); g.permWordCount = 1;
+        WorkerOp g; g.type = WorkerOp::Type::SessionPermissions; g.sessionId = /*table*/ 0;
+        g.nextOffset = 0; g.hwBound = 1; g.isolation = kPermFlagTable | kPermFlagLast; g.permWords = bits.data(); g.permWordCount = 1;
         (void)worker->tryEnqueueOp(std::move(g));
+        WorkerOp bnd; bnd.type = WorkerOp::Type::SessionPermissions; bnd.sessionId = 5; bnd.nextOffset = /*table*/ 0;
+        bnd.correlationId = 1; bnd.producerId = 7; bnd.isolation = kPermFlagBind | kPermFlagLast;   // issue #259: bound to it
+        (void)worker->tryEnqueueOp(std::move(bnd));
         for (int i = 0; i < 16; ++i) step();
     }
     ~WorkerAuth() {

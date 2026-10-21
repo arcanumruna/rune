@@ -2,10 +2,12 @@
 // write bits) and the Authorizer (the one place a code or a detail text is chosen).
 #include <rune/gateway/Authorizer.h>
 #include <rune/gateway/ObjectIndex.h>
+#include <rune/gateway/PermissionPool.h>
 #include <rune/gateway/PermissionTable.h>
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -165,4 +167,84 @@ TEST(AuthorizerRegression, AnOverlongNameIsCutInTheDetailIdenticallyForHiddenAnd
     const auto d = rg::authorizeName(t, ResourceType::Topic, std::string(5000, 'x'), Operation::Drop);
     ASSERT_TRUE(d.has_value());
     EXPECT_LE(d->detail.size(), 300u);
+}
+
+// ── Issue #259 (X108): one compiled table per distinct grant set ──
+namespace {
+std::vector<rs::GrantSpec> roleSet(const std::string& prefix) {
+    std::vector<rs::GrantSpec> v = {g(Operation::Read, ResourceType::Topic, PatternKind::Prefix, prefix),
+                                    g(Operation::Write, ResourceType::Topic, PatternKind::Prefix, prefix + "w")};
+    std::sort(v.begin(), v.end());
+    return v;
+}
+rg::ObjectIndex manyTopics(int n) {
+    rg::ObjectIndex idx;
+    for (int i = 0; i < n; ++i) idx.onTopic(i, (i % 2 ? "worldw." : "world.") + std::to_string(i));
+    return idx;
+}
+}  // namespace
+
+// RED before the fix (one compile per session): 1 000 sessions of one role compiled 1 000 tables.
+TEST(PermissionPoolRegression, SessionsSharingAGrantSetCompileOneTableRegression) {
+    const auto idx = manyTopics(2000);
+    rg::PermissionPool pool;
+    std::vector<rg::PermissionRef> sessions;
+    for (int i = 0; i < 1000; ++i) sessions.push_back(pool.acquire(roleSet("world"), idx));
+    EXPECT_EQ(pool.compiles(), 1u) << "one compile for the set, not one per session";
+    EXPECT_EQ(pool.liveTables(), 1u);
+    EXPECT_EQ(&sessions.front().table(), &sessions.back().table()) << "the very same table";
+    EXPECT_TRUE(sessions[7]->allows(1, rs::opBit(Operation::Write)));
+    EXPECT_FALSE(sessions[7]->allows(0, rs::opBit(Operation::Write)));
+    const auto other = pool.acquire(roleSet("other"), idx);
+    EXPECT_EQ(pool.compiles(), 2u);
+    EXPECT_NE(other.id(), sessions[0].id()) << "a different set never shares";
+}
+
+TEST(PermissionPoolRegression, TheLastHolderFreesTheTableAndItsIdIsReusedRegression) {
+    const auto idx = manyTopics(10);
+    rg::PermissionPool pool;
+    uint32_t id = 0;
+    {
+        auto a = pool.acquire(roleSet("world"), idx);
+        auto b = a;   // a second holder
+        id = a.id();
+        EXPECT_EQ(pool.refsOf(id), 2u);
+        pool.drainEvents([](auto, uint32_t, const rg::PermissionTable&) {});
+    }
+    EXPECT_EQ(pool.liveTables(), 0u);
+    std::vector<rg::PermissionPool::Event> evs;
+    pool.drainEvents([&](rg::PermissionPool::Event e, uint32_t i, const rg::PermissionTable&) { evs.push_back(e); EXPECT_EQ(i, id); });
+    ASSERT_EQ(evs.size(), 1u);
+    EXPECT_EQ(evs[0], rg::PermissionPool::Event::Freed) << "the workers are told to drop it";
+    const auto c = pool.acquire(roleSet("other"), idx);
+    EXPECT_EQ(c.id(), id) << "ids stay dense (the workers' table store is bounded)";
+    EXPECT_FALSE(c->allows(1, rs::opBit(Operation::Write))) << "the reused entry holds the NEW set only";
+}
+
+TEST(PermissionPoolRegression, AnObjectCreatedUpdatesEachLiveTableOnceRegression) {
+    auto idx = manyTopics(10);
+    rg::PermissionPool pool;
+    std::vector<rg::PermissionRef> sessions;
+    for (int i = 0; i < 100; ++i) sessions.push_back(pool.acquire(roleSet("world"), idx));
+    const auto stranger = pool.acquire(roleSet("other"), idx);
+    idx.onTopic(10, "worldw.new");
+    int calls = 0, writeGained = 0;
+    pool.onObjectCreated(10, *idx.at(10), [&](uint32_t, const rg::PermissionTable&, bool before, bool after) {
+        ++calls;
+        writeGained += !before && after ? 1 : 0;
+    });
+    EXPECT_EQ(calls, 2) << "two live tables, not 101 sessions";
+    EXPECT_EQ(writeGained, 1);
+    EXPECT_TRUE(sessions[42]->allows(10, rs::opBit(Operation::Write)));
+    EXPECT_FALSE(stranger->allows(10, rs::opBit(Operation::Write)));
+}
+
+TEST(PermissionPoolRegression, AnUnpooledRefIsItsOwnTableAndDenyByDefaultRegression) {
+    const rg::PermissionRef none;
+    EXPECT_EQ(none.id(), rg::PermissionRef::kNoId);
+    EXPECT_FALSE(none->allows(0, rs::opBit(Operation::Read)));
+    const rg::PermissionRef all(rg::PermissionTable::allowAll());
+    EXPECT_TRUE(all->isAllowAll());
+    const rg::PermissionRef copy = all;
+    EXPECT_TRUE(copy->isAllowAll());
 }

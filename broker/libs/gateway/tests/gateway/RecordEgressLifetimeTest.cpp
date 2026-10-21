@@ -540,3 +540,37 @@ TEST(AuthEnforcementRegression, AnAuthenticatingWorkerNeverRegistersACursorWitho
     EXPECT_TRUE(w.subscriptionsForTest().empty());
     EXPECT_EQ(w.subscribesRefusedWithoutEgressForTest(), 1u);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #259 (X108): the shard workers learn ONE table per grant set and one bind per session - never one full bitmap
+// per session - and a created topic ships the one changed word of each live table.  RED before the fix: every session's
+// full WRITE bitmap went to every worker (200 sessions x 4 workers x 32 words), and every session that gained WRITE on a
+// new topic re-shipped its whole bitmap.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST(PermissionShippingRegression, ARoleOfManySessionsShipsOneTableAndOneBindEachRegression) {
+    constexpr int32_t kWorkers = 4, kSessions = 200, kTopicsHere = 2000;
+    Rig r(kWorkers);
+    r.gw.setAuthMode(GatewayAuthMode::Required, nullptr);
+    for (int32_t t = 0; t < kTopicsHere; ++t) r.gw.onCatalogObjectApplied(t, "world." + std::to_string(t), false);
+    namespace rs = rune::security;
+    std::vector<rs::GrantSpec> role = {
+        {rs::Operation::Write, {rs::ResourceType::Topic, rs::PatternKind::Prefix, "world."}}};
+    for (int i = 0; i < kSessions; ++i) {
+        const int64_t sid = r.gw.injectTestSession(0);
+        r.gw.authenticateWithGrantsForTest(sid, static_cast<uint64_t>(100 + i), role);
+        for (int32_t w = 0; w < kWorkers; ++w) r.pool.worker(w).doWork(1);   // keep the lifecycle rings drained
+        (void)r.gw.servicePermissionShippingForTest();
+    }
+    const uint64_t tableWords = (kTopicsHere + 63) / 64;
+    EXPECT_EQ(r.gw.permissionCompilesForTest(), 1u) << "one compile for the role's set";
+    EXPECT_EQ(r.gw.permissionTablesForTest(), 1u);
+    EXPECT_EQ(r.gw.permissionWordsShippedForTest(), kWorkers * tableWords)
+        << "the table once per worker; a bind carries no bitmap";
+    EXPECT_EQ(r.gw.permissionOpsShippedForTest(), static_cast<uint64_t>(kWorkers) * (1 + kSessions));
+
+    const uint64_t wordsBefore = r.gw.permissionWordsShippedForTest();
+    r.gw.onCatalogObjectApplied(kTopicsHere, "world.new", false);   // the prefix grant now covers it
+    EXPECT_EQ(r.gw.permissionWordsShippedForTest() - wordsBefore, static_cast<uint64_t>(kWorkers))
+        << "one word per worker (a patch of the shared table), not every session's bitmap";
+    EXPECT_EQ(r.gw.permissionCompilesForTest(), 1u) << "a created object recompiles nothing";
+}
