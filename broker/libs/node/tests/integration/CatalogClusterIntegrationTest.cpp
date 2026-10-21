@@ -46,7 +46,9 @@
 #include <gtest/gtest-spi.h>
 
 #include <fcntl.h>
+#if defined(__APPLE__)
 #include <sys/sysctl.h>
+#endif
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -56,6 +58,7 @@
 #include <csignal>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -915,10 +918,32 @@ struct CellSeams {
 /// fork().  The child's SIGSTOP landed there.  In ~15% of runs only the forking thread stayed stopped (it returned from fork()
 /// ~340 ms later); the fork's own release resumed the other threads, so the watchdog thread saw only the 36-38 ms fork hold, not
 /// the 300 ms stop.  Fix: (1) the child waits on a pipe until the parent is back from fork() - the stop now always hits a fully
-/// running process; (2) it sends SIGSTOP and confirms the kernel's process state (sysctl KERN_PROC_PID, p_stat == SSTOP) before
+/// running process; (2) it sends SIGSTOP and confirms the kernel's process state (processIsStopped: sysctl on macOS, /proc/<pid>/stat on Linux) before
 /// (3) holding it `ms` from that point, then SIGCONT.  The
 /// child's exit status reports whether the stop was confirmed; the parent throws if not (never a silent short stop).
-/// The child only makes plain syscalls (read, kill, sysctl, nanosleep, _exit).
+/// The child only makes plain syscalls (read, kill, sysctl or open/read, nanosleep, _exit).
+/// Whether the kernel reports `pid` stopped (SSTOP / state 'T'). Plain syscalls only: it runs in the forked child.
+inline bool processIsStopped(pid_t pid) {
+#if defined(__APPLE__)
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+    struct kinfo_proc kp{};
+    std::size_t len = sizeof kp;
+    return ::sysctl(mib, 4, &kp, &len, nullptr, 0) == 0 && len == sizeof kp && kp.kp_proc.p_stat == SSTOP;
+#else
+    char path[32];
+    (void)std::snprintf(path, sizeof path, "/proc/%d/stat", static_cast<int>(pid));
+    const int fd = ::open(path, O_RDONLY);
+    if (fd < 0) return false;
+    char buf[512];
+    const ssize_t n = ::read(fd, buf, sizeof buf - 1);
+    ::close(fd);
+    if (n <= 0) return false;
+    buf[n] = '\0';
+    const char* rp = std::strrchr(buf, ')');   // "pid (comm) S ...": comm may hold spaces or ')'
+    return rp != nullptr && rp[1] == ' ' && rp[2] == 'T';
+#endif
+}
+
 inline void stopThisProcessFor(long ms) {
     int ready[2];
     if (::pipe(ready) != 0) throw std::runtime_error("pipe failed");
@@ -935,10 +960,7 @@ inline void stopThisProcessFor(long ms) {
         ::kill(parent, SIGSTOP);
         bool stopped = false;
         for (int i = 0; i < 2000 && !stopped; ++i) {   // <= 2 s: the stop takes effect (it is asynchronous)
-            int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, parent};
-            struct kinfo_proc kp{};
-            std::size_t len = sizeof kp;
-            if (::sysctl(mib, 4, &kp, &len, nullptr, 0) == 0 && len == sizeof kp) stopped = kp.kp_proc.p_stat == SSTOP;
+            stopped = processIsStopped(parent);
             if (!stopped) { const timespec t{0, 1'000'000}; ::nanosleep(&t, nullptr); }
         }
         const timespec ts{ms / 1000, (ms % 1000) * 1'000'000};
