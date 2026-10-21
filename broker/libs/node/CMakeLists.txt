@@ -1406,6 +1406,25 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_worker_filter_tests
             PROPERTIES TIMEOUT 180
             ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+        # Phase 2c Task 14: the worker-level filter interaction matrix - 5 ops x 4 entities x 14 timings (232 applicable
+        # cells, 48 skipped by rule), each over a real Worker, a real disk Log or a transient ring, an embedded Aeron
+        # driver and a model client.  AllocWindow.cpp replaces the global operator new (the zero-allocation point).
+        add_executable(rune_worker_filter_matrix_tests
+            tests/node/WorkerFilterMatrixTest.cpp
+            tests/support/AllocWindow.cpp)
+        target_include_directories(rune_worker_filter_matrix_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${RUNE_CLIENT_ROOT}/examples)
+        target_link_libraries(rune_worker_filter_matrix_tests PRIVATE
+            rune_node
+            rune_codec
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_worker_filter_matrix_tests
+            PROPERTIES TIMEOUT 600
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+        rune_regression_batches(rune_worker_filter_matrix_tests 4 TIMEOUT 900 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 
     # ---------------------------------------------------------------------------
