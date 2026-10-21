@@ -19,6 +19,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -65,6 +66,8 @@ struct LiveFake {
             std::this_thread::sleep_for(50ms);   // let the driver finish writing its cnc file
             test_support::InvokerGateway gw(dir + "/aeron", "aeron:ipc", in, "aeron:ipc", out);
             gw.authMode = md;
+            gw.tlsCertPem = readPem_("server.pem");   // issue #13: TLS as the real gateway serves it
+            gw.tlsKeyPem  = readPem_("server.key");
             setup(gw, *this);
             while (!stop.load()) { if (gw.pump() == 0) std::this_thread::yield(); }
             std::lock_guard<std::mutex> l(m);
@@ -73,10 +76,15 @@ struct LiveFake {
         });
     }
     void finish() { stop.store(true); if (t.joinable()) t.join(); }
+    static std::string readPem_(const char* name) {
+        std::ifstream f(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/" + name, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    }
     ~LiveFake() { finish(); std::error_code ec; fs::remove_all(dir, ec); }
     [[nodiscard]] std::vector<std::string> baseArgs() const {
+        // Issue #13: credentials only over TLS - trust the fake's test CA (an ipc channel names no host to check).
         return {"--broker", "aeron:ipc", "--cli-stream-in", std::to_string(in), "--cli-stream-out", std::to_string(out),
-                "--cli-data-dir", dir};
+                "--cli-data-dir", dir, "--tls-ca", std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/ca.pem"};
     }
 };
 
