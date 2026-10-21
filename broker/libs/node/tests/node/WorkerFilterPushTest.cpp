@@ -722,6 +722,9 @@ TEST_F(WorkerFilterTransient, ReBoundReplicaLandsInANewGroupNotTheOldRegression)
     for (int i = 0; i < 4; ++i) step(w, c);
     ASSERT_TRUE(w.tryEnqueueOp(ringSubscribeOp(2, &rep2, 0, &f)));
     for (int i = 0; i < 4; ++i) step(w, c);
+    // Re-read g1: binding sub 2 may have grown filterGroups_ and moved the groups (the worker keeps indices, not pointers).
+    g1 = w.filterGroupOfSubForTest(1);
+    ASSERT_NE(g1, nullptr);
     const filter::FilterGroup* g2 = w.filterGroupOfSubForTest(2);
     ASSERT_NE(g2, nullptr);
     EXPECT_NE(g1, g2) << "a member of a different replica incarnation must not join the old group (never mix sources)";
