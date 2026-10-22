@@ -538,6 +538,7 @@ if(BUILD_BENCHMARKS)
         benchmark/ViewFoldBench.cpp
         benchmark/ViewCheckpointBench.cpp
         benchmark/ViewFoldSourceBench.cpp
+        benchmark/GetViewRowServeBench.cpp
         benchmark/CatalogBootReplayBench.cpp
         benchmark/CatalogHotPathBench.cpp
         benchmark/AuthCheckBench.cpp
