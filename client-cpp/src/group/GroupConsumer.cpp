@@ -155,7 +155,10 @@ void GroupConsumer::commit() {
         return;
     }
     if (closed_) return;
-    (void)submit_(cmd);  // Closed: nothing to commit any more
+    // #355: a refusal never comes back as a value — the trampoline waits out a
+    // full ring where it may and throws where it may not; only Accepted / Closed
+    // return, and Closed means nothing is left to commit.
+    (void)submit_(cmd);
 }
 
 // ---------------------------------------------------------------------------

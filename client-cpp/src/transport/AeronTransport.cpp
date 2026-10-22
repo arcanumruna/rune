@@ -192,6 +192,11 @@ void AeronTransport::start() {
     if (pubRes.ready() == nullptr || subRes.ready() == nullptr) {
         const std::string why = pubRes.rejected() || subRes.rejected() ? "rejected by the driver"
                                                                         : "timed out";
+        // #432: a handle that did resolve is released while its conductor is
+        // still alive (its dtor locks the conductor's admin mutex); left to the
+        // unwinding below it would outlive aeron_.reset() and abort the process.
+        pubRes.reset();
+        subRes.reset();
         aeron_.reset();
         stopEmbeddedDriver();
         throw std::runtime_error("AeronTransport: resolving ExclusivePublication/Subscription " + why +
