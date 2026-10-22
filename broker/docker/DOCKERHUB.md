@@ -2,7 +2,7 @@
 
 # Quick reference
 
-- **Maintained by:** [Arcanum](https://github.com/arcanumruna/rune)
+- **Maintained by:** [Arcanum Realms](https://github.com/arcanumruna/rune)
 - **Where to get help:** [GitHub issues](https://github.com/arcanumruna/rune/issues)
 - **Source and full documentation:** [github.com/arcanumruna/rune](https://github.com/arcanumruna/rune) ·
   [Self-hosting guide](https://github.com/arcanumruna/rune/blob/main/broker/docs/SELF-HOSTING.md) ·
