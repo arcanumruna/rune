@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/arcanumruna/rune/main/docs/assets/rune-mark.png" alt="Rune" width="128"></p>
+
 # Quick reference
 
 - **Maintained by:** [Arcanum](https://github.com/arcanumruna/rune)
