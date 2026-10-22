@@ -62,7 +62,7 @@ missing or malformed.
 | `RUNE_TRANSIENT_LOG_RING_BYTES` | no | `8388608` (8 MiB) | int32 bytes | Node-wide ring size of every transient partition. Must be a power of two; any other value keeps the default. `RUNE_MEMORY_LOG_RING_BYTES` is a **deprecated** alias that logs one warning; when both are set, the canonical name wins. |
 
 > Not env-configurable (yet): dynamic membership.
-> `/dev/shm` size and published ports are **container** settings (`--shm-size`, `-p`), not broker env.
+> `/dev/shm` size and networking are **container** settings (`--shm-size`, `--network host`), not broker env.
 
 > **Format gotcha:** `RUNE_CLIENT_ENDPOINT` and the `host:port` in `RUNE_PEERS` are **raw**
 > (e.g. `0.0.0.0:40200`, `rune-1:40111`) — the broker builds the `aeron:udp?endpoint=…`
@@ -500,6 +500,7 @@ for throw-away local development add `-e RUNE_AUTH=disabled` instead of the key)
 ```sh
 docker run --rm \
   --platform linux/amd64 \
+  --network host \
   --shm-size=256m \
   -v "$PWD/secrets:/run/secrets:ro" \
   -e RUNE_CLUSTER_KEY_FILE=/run/secrets/cluster.key \
@@ -522,16 +523,26 @@ rune-broker: running — send SIGINT or SIGTERM to stop
 Stop with `docker stop <id>` (SIGTERM → clean shutdown). The named volume `rune-data`
 persists the node's data dir across restarts.
 
-To reach it from a client outside Docker, publish the client UDP port and set the
-endpoint to a routable address, e.g. `-p 40200:40200/udp` with
-`RUNE_CLIENT_ENDPOINT='0.0.0.0:40200'`.
+With `--network host` the broker's UDP ports are the host's ports, so a client on the host (or the network) reaches
+`40200` directly. Host networking is the low-latency mode: the Docker bridge adds about 35 µs at p50 for one node and
+about 60% for three, and published ports (`-p`) make p99 about 10x worse. It is Linux only in practice (Docker
+Desktop runs it inside its VM). The default ports (`40111`, `40200`, `40222`) lie in Linux's ephemeral range, so the
+broker logs a startup warning; reserve them once with
+`sysctl -w net.ipv4.ip_local_reserved_ports=40111,40200,40222`.
+
+If you must use a bridge, publish the client port **and** the node's whole shard block (`8200 + 192n` to
+`8200 + 192n + 191`; clients reach the shard ingress ports too).
 
 ---
 
 ## Three nodes (clustered)
 
-The three nodes elect **one leader** over `aeron:udp`; they must share a network so the
-peer DNS names resolve. The repo ships `docker/docker-compose.yml` wired for exactly this.
+The three nodes elect **one leader** over `aeron:udp`. For a deployment on one host, run each node with
+`network_mode: host` and its own ports (the three-node example of the
+[Docker Hub page](../docker/DOCKERHUB.md#three-node-cluster): `RUNE_PEERS` on `127.0.0.1`, consensus `40111`-`40113`,
+client `40200`-`40202`, replication `40222`-`40224`, one `--shm-size=256m`, ulimit and volume per container). The
+repo's `docker/docker-compose.yml` is the bridge-network build-and-test setup: the nodes share a network so the peer DNS
+names resolve.
 
 Every node needs the same cluster key first (see [Authentication is on by default](#authentication-is-on-by-default));
 the compose files mount `./secrets/cluster.key` (or `$RUNE_SECRETS_DIR/cluster.key`) read-only and refuse to
@@ -579,9 +590,9 @@ Tear down (including volumes): `docker compose -f docker/docker-compose.yml down
   `RUNE_NODE_ID` differs.
 - **Consensus port** (`40111`) is the `host:port` in `RUNE_PEERS`; the **client port**
   (`40200`) is separate (`RUNE_CLIENT_ENDPOINT`).
-- Peer addresses are **DNS names on the shared compose network** (`rune-1`, `rune-2`,
-  `rune-3`) — the default Docker bridge has no multicast, so consensus uses `aeron:udp`
-  unicast to those names.
+- Peer addresses are `127.0.0.1` with distinct ports per node under host networking (the Docker Hub example), or
+  **DNS names on the shared compose network** (`rune-1`, `rune-2`, `rune-3`) in the repo's bridge setup. Either way
+  consensus uses `aeron:udp` unicast (the default Docker bridge has no multicast).
 - **The cluster key is identical on every node**; rotate it with three rolling restarts
   ([SECURITY.md](SECURITY.md#the-cluster-key-d32-d35)). Inter-broker frames are encrypted and carry 32
   bytes of overhead.
@@ -687,8 +698,9 @@ docker compose --env-file docker/rune-cluster.env -f docker/docker-compose.custo
 docker compose --env-file docker/rune-cluster.env -f docker/docker-compose.custom.yml down
 ```
 
-Clients outside Docker connect to the published host ports (`CLIENT_HOST_PORT_1..3`, e.g.
-`localhost:40201/40202/40203`); intra-cluster consensus stays on the compose network via the
+This parameterized file uses the bridge network: clients outside Docker connect to the published host ports
+(`CLIENT_HOST_PORT_1..3`, e.g. `localhost:40201/40202/40203`) and the nodes' shard blocks; for the lowest latency use
+`network_mode: host` as in the Docker Hub example. intra-cluster consensus stays on the compose network via the
 `rune-1/2/3` DNS names. Data lives in the host `DATA_DIR_*` dirs (default `./rune-data/nodeN`)
 and survives `down` (use `down -v`-equivalent by deleting those dirs to reset).
 
@@ -699,13 +711,12 @@ so all nodes must list all peers. Odd node counts (3, 5, 7) give the best quorum
 
 ### Multi-host (nodes on separate machines)
 Compose DNS names only resolve within one host's network. Across machines, run **one node
-per host** with plain `docker run` (or one compose service per host) and use **real routable
-hostnames/IPs + published UDP ports** in `RUNE_PEERS` — the consensus port must be reachable
+per host** with plain `docker run --network host` (or one compose service per host) and use **real routable
+hostnames/IPs** in `RUNE_PEERS` with the same ports on every host — the consensus port must be reachable
 host-to-host. Example for node 0 on `hostA` (peers `hostA/hostB/hostC`):
 
 ```sh
-docker run -d --name rune-0 --platform linux/amd64 --shm-size=256m \
-  -p 40111:40111/udp -p 40200:40200/udp -p 40222:40222/udp \
+docker run -d --name rune-0 --platform linux/amd64 --network host --shm-size=256m \
   -e RUNE_NODE_ID=0 \
   -e RUNE_PEERS='0@hostA:40111:40200:40222,1@hostB:40111:40200:40222,2@hostC:40111:40200:40222' \
   -e RUNE_CLIENT_ENDPOINT='0.0.0.0:40200' \
@@ -717,7 +728,8 @@ docker run -d --name rune-0 --platform linux/amd64 --shm-size=256m \
   rune:latest
 ```
 
-Also publish the per-worker UDP ports, which shard mode derives from the node id (`8200 + 192 × id` and the next 191 ports;
+Host networking needs no port publishing. If you use a bridge instead, publish the client, consensus and replication
+ports and the per-worker UDP ports, which shard mode derives from the node id (`8200 + 192 × id` and the next 191 ports;
 see [Derived ports](../../docs/configuration.md#derived-ports)).
 
 Before the first start, format `/srv/rune/node0` once on each host (`docker run --rm -v /srv/rune/node0:/var/lib/rune

@@ -32,9 +32,10 @@ rune ql --user admin --password-file otp.txt -f change-password.rql --broker run
 rune ql --user admin --password-file admin.pw -f topics.rql --broker rune-1:40200
 ```
 
-Container requirements: `--shm-size=256m` (the default 64 MB is too small), the data directory on a volume, the client UDP
-port (and in a multi-host cluster the consensus, replication and per-worker ports) published, and a file-descriptor hard
-limit that covers the partitions (the broker raises its soft limit to the hard limit and refuses to start when the hard
+Container requirements: `--shm-size=256m` (the default 64 MB is too small), the data directory on a volume, `--network host` (the
+low-latency mode: the Docker bridge adds about 35 µs at p50, and published ports make p99 about 10x worse; Linux only in
+practice; on a bridge, publish the client port and the node's shard block `8200 + 192n` to `8200 + 192n + 191`), and a
+file-descriptor hard limit that covers the partitions (the broker raises its soft limit to the hard limit and refuses to start when the hard
 limit is below the estimated need; see SELF-HOSTING, "Open-file limit").
 
 Run an **odd** number of nodes: one for development, three or more for availability. A two-node cluster tolerates no
