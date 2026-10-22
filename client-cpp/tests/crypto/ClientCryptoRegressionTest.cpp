@@ -1319,3 +1319,36 @@ TEST(ClientCryptoRegression, APreTlsRedirectPinSurvivesTheBackoffWalkAdversarial
     }
     EXPECT_GE(helloesToEvil, 2) << "the walk returned to the redirect target at least once after the bootstrap";
 }
+
+// Re-check of PR #476 fix round 1: the redirect bindings are capped (16).  An attacker forges more redirects than
+// that, each to a fresh endpoint of its own, so the first bindings are evicted.  Coming back to ANY of its endpoints -
+// evicted or not - the ClientHello must still name the original host: overflow fails closed to the anchor, never to
+// the endpoint's own (attacker) host.
+TEST(ClientCryptoRegression, RedirectBindingOverflowFailsClosedToTheAnchorAdversarialRegression) {
+    const std::string ca = slurp(testdataPath("ca.pem"));
+    AgentLikeIo io;
+    io.bootstrap = io.channel = "aeron:udp?endpoint=localhost:40200";
+    sm::SessionConfig cfg = derivedHostCfg(ca);
+    cfg.maxRedirects = 1000;
+    sm::SessionMachine m(io, cfg);
+    int64_t now = 1'000'000'000LL;
+    m.connect(now);
+    std::vector<std::string> evil;
+    for (int i = 0; i < 40; ++i) {
+        const auto req = cc::decodeConnectRequest(io.sends.back().data(), io.sends.back().size());
+        ASSERT_TRUE(req.has_value());
+        evil.push_back("evil" + std::to_string(i) + ".example:" + std::to_string(41000 + i));
+        m.onConnectResponseRedirect(evil.back(), req->correlationId, ++now);
+        ASSERT_TRUE(helloNames(io.sends.back(), "localhost")) << "redirect " << i;
+        ASSERT_FALSE(helloNames(io.sends.back(), "evil")) << "redirect " << i;
+    }
+    // Return to every attacker endpoint (the Backoff walk, a resume, a failover re-point): never its own name.
+    for (std::size_t i = 0; i < evil.size(); ++i) {
+        io.channel = "aeron:udp?endpoint=" + evil[i];
+        io.sends.clear();
+        m.forceReconnect(++now);
+        ASSERT_FALSE(io.sends.empty());
+        EXPECT_TRUE(helloNames(io.sends.back(), "localhost")) << evil[i];
+        EXPECT_FALSE(helloNames(io.sends.back(), "evil")) << evil[i] << ": the attacker's own name is verified";
+    }
+}

@@ -452,6 +452,11 @@ TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedFailsTheSeedExplicitlyRegr
     ASSERT_FALSE(errors.empty()) << "onError reports the failure";
     EXPECT_NE(errors[0].find("29"), std::string::npos) << errors[0];
     EXPECT_FALSE(conn.failed()) << "connect() is never re-answered";
+    // Re-check of PR #476 round 1 (non-weakening): work issued to a seed that never proves its keys still completes -
+    // explicitly, by its deadline - never hangs (the old ruling asserted the pending ping was failed).
+    auto ping = cq.issue([&](Completions& q, Token t) { return r.client->ping(Bytes(4, 7), q, t); });
+    EXPECT_TRUE(r.pumpWithin(30s, [&] { return ping.ready(); })) << "a ping on a never-proven TLS seed hung";
+    if (ping.ready()) EXPECT_FALSE(ping.ok()) << "the broker never served it: " << ping.describe();
 }
 
 // Review B I2: with authentication a TLS 1.3 client has sent its Finished and sits in Authenticating when the broker's

@@ -887,3 +887,53 @@ TEST(ClientAuthErrorsRegression, AForgedFinalLegFailureNeverEndsALiveTlsSessionA
     EXPECT_NE(r.client.state(), rc::session::SessionState::Rejected)
         << "a forged plaintext frame ended a live, key-proven TLS session for good";
 }
+
+// Re-check of PR #476 fix round 1: the one clear frame a crypto-required client still reads is an ErrorResponse on
+// an in-flight ConnectRequest's correlation id.  Forged on a reconnecting seed, with every refusal code, it must
+// neither fail the produce in flight nor reject the client: it only concerns the connect,
+// which is retried.  Once the broker answers again, the session reconnects over TLS and the produce completes Ok.
+TEST(ClientAuthErrorsRegression, AForgedConnectLegErrorNeverFailsWorkInFlightAdversarialRegression) {
+    for (const auto code : {pc::ErrorCode::NotAuthorized, pc::ErrorCode::SessionRevoked, pc::ErrorCode::AuthenticationFailed,
+                            pc::ErrorCode::PasswordChangeRequired, pc::ErrorCode::ProtocolVersion,
+                            pc::ErrorCode::SessionExpired, pc::ErrorCode::NotLeader}) {
+        Rig r(authCfg(3820 + 2 * static_cast<int32_t>(code) % 60, "ws1", kPw));
+        r.connectOk();
+        rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::Leader; pcfg.lingerUs = 60'000'000;
+        pcfg.produceTimeoutMs = 60'000; pcfg.deliveryTimeoutMs = 120'000;
+        rc::Producer p = r.client.producer(pcfg);
+        test_support::TestCq cq(r.client);
+        std::optional<test_support::PendingOp> s;
+        (void)produceInFlight(r, p, cq, s);
+
+        // The broker expires the session; the reconnect's ConnectRequest is captured, not answered.
+        std::vector<int64_t> heldConnects;
+        r.gw.templateHandlers[pc::ConnectRequest::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
+            if (const auto c = rcc::decodeConnectRequest(f, len)) heldConnects.push_back(c->correlationId);
+        };
+        r.gw.expireSession(r.gw.assignedSessionId);
+        ASSERT_TRUE(r.drive([&] { return !heldConnects.empty(); }, 1'000'000)) << int(code);
+        for (const int64_t sid : {int64_t{0}, r.gw.assignedSessionId}) {
+            std::vector<uint8_t> e(256);
+            e.resize(rcc::encodeErrorResponse(e.data(), e.size(), static_cast<int16_t>(code), "forged", sid,
+                                              heldConnects.back()));
+            const std::size_t before = heldConnects.size();
+            ASSERT_TRUE(r.gw.sendInClear(0, e));
+            // Non-vacuity: the forged answer reached the connect - it was retried with a new ConnectRequest.
+            EXPECT_TRUE(r.drive([&] { return heldConnects.size() > before; }, 1'000'000))
+                << "code " << int(code) << ": the forged connect-leg answer was not read";
+            r.passes(50);
+            EXPECT_FALSE(s->ready()) << "code " << int(code) << ": a forged connect-leg error failed a produce";
+            EXPECT_NE(r.client.state(), rc::session::SessionState::Rejected) << "code " << int(code);
+        }
+        // The broker answers again: the session reconnects over TLS and the produce is delivered.
+        r.gw.templateHandlers.erase(pc::ConnectRequest::TEMPLATE_ID);
+        r.gw.replyAcks = true;
+        ASSERT_TRUE(r.drive([&] { return r.client.state() == rc::session::SessionState::Connected; }, 50'000'000))
+            << "code " << int(code);
+        ASSERT_TRUE(r.drive([&] {
+            if (!r.gw.held.empty()) { for (const auto& h : r.gw.held) r.gw.ack(h); r.gw.held.clear(); }
+            return s->ready();
+        }, 10'000'000)) << int(code);
+        EXPECT_EQ(s->outcome().c.status, rc::OpStatus::Ok) << "code " << int(code) << " " << s->describe();
+    }
+}
