@@ -3605,8 +3605,10 @@ private:
             //     catching up / rebuilding answers NotReady below, at once); while the RC state is not Ready (it
             //     rebuilds after a leadership / log change - the instance is then CatchingUp anyway) no bound is taken.
             if (r.target < 0 && st.ready) {
-                if (const RcState* rc = rcServe_(srcRep, rcOf_(srcRep)); rc != nullptr) [[likely]]
-                    r.target = rc->lso(srcRep->highWatermark());
+                // The fold bound is the LSO <= HW: a table folded up to the HW is caught up (one load + compare); only
+                // a lagging one takes the bound from the RC state.
+                if (const int64_t hw = srcRep->highWatermark(); st.foldCursor < hw) [[unlikely]]
+                    if (const RcState* rc = rcServe_(srcRep, rcOf_(srcRep)); rc != nullptr) r.target = rc->lso(hw);
             }
             if (r.target >= 0 && st.foldCursor < r.target) [[unlikely]] return ViewServe::Hold;
         }
