@@ -1,6 +1,6 @@
 # Builds the Rune image (broker + `rune` CLI) and publishes it to Docker Hub and GitHub Container Registry when a
-# broker release tag (broker-vX.Y.Z, made by broker/release.sh) is pushed, and keeps the Docker Hub page
-# (broker/docker/DOCKERHUB.md) in sync. Manual runs build without publishing.
+# broker release tag (broker-vX.Y.Z, made by broker/release.sh) is pushed, then syncs the Docker Hub page
+# (broker/docker/DOCKERHUB.md). Release tags are the only trigger.
 #
 # Repository settings it needs:
 #   secrets.DOCKERHUB_USERNAME, secrets.DOCKERHUB_TOKEN  a Docker Hub user and a personal access token (Read, Write, Delete: the page sync needs Delete)
@@ -10,9 +10,6 @@ name: broker-image
 on:
   push:
     tags: ['broker-v*']
-    branches: [main]
-    paths: ['broker/docker/DOCKERHUB.md']   # path filters apply to the branch push only, never to the tags
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -28,7 +25,6 @@ env:
 
 jobs:
   image:
-    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -42,13 +38,12 @@ jobs:
       - name: Check tag matches VERSION.txt
         run: |
           VERSION=$(< broker/VERSION.txt)
-          if [[ $GITHUB_REF_TYPE == tag && ${GITHUB_REF_NAME#broker-v} != "$VERSION" ]]; then
+          if [[ ${GITHUB_REF_NAME#broker-v} != "$VERSION" ]]; then
             echo "::error::tag $GITHUB_REF_NAME does not match broker/VERSION.txt ($VERSION)"
             exit 1
           fi
 
       - name: Check Docker Hub credentials
-        if: github.ref_type == 'tag'
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -61,14 +56,12 @@ jobs:
       - uses: docker/setup-buildx-action@v4
 
       - uses: docker/login-action@v4
-        if: github.ref_type == 'tag'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/login-action@v4
-        if: github.ref_type == 'tag'
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -80,21 +73,14 @@ jobs:
           CMAKE_BUILD_PARALLEL_LEVEL: '4'
         run: |
           VERSION=$(< broker/VERSION.txt)
-          ARGS=(--platform linux/amd64
-                --cache-from type=gha,scope=broker
-                --cache-to type=gha,scope=broker,mode=max)
-          if [[ $GITHUB_REF_TYPE == tag ]]; then
-            ARGS+=(--tag "$GHCR_IMAGE:latest"
-                   --tag "docker.io/$DOCKERHUB_REPO:$VERSION" --tag "docker.io/$DOCKERHUB_REPO:latest"
-                   --push)
-          else
-            ARGS+=(--output type=cacheonly)
-          fi
-          broker/build_docker.sh "${ARGS[@]}"
+          broker/build_docker.sh --platform linux/amd64 \
+            --cache-from type=gha,scope=broker --cache-to type=gha,scope=broker,mode=max \
+            --tag "$GHCR_IMAGE:latest" \
+            --tag "docker.io/$DOCKERHUB_REPO:$VERSION" --tag "docker.io/$DOCKERHUB_REPO:latest" \
+            --push
 
   dockerhub-page:
     needs: image
-    if: always() && (needs.image.result == 'success' || needs.image.result == 'skipped') && github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

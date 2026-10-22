@@ -5,6 +5,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # clangd / tooling: export compile_commands.json (C++23 flags reach the IDE).
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# The Conan package builds position-independent static libs (consumers link them into PIE executables).  With -fPIC
+# GCC treats every external function as interposable and refuses to inline the [[gnu::always_inline]] hot-path
+# functions defined in .cpp files; these are static archives, nothing is ever interposed.
+if(CMAKE_POSITION_INDEPENDENT_CODE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-semantic-interposition>)
+endif()
+
 # rune-protocol is header-only; consumed via the sibling source include path.
 set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../protocol/include"
     CACHE PATH "rune-protocol include dir")
@@ -1815,4 +1822,30 @@ if(BUILD_TESTING AND aeron_FOUND)
         endif()
     endif()
     gtest_discover_tests(rune_cli_live_tests)
+endif()
+
+# ── Install (the Conan package; see conanfile.py) ─────────────────────────────
+# Only for a top-level build: embedded in the broker's test project this adds nothing.  The static libs
+# a consumer links (listed in dependents-first order in conanfile.py package_info) and every public header
+# tree they include go to one prefix; aeron, spdlog and OpenSSL stay separate dependencies.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    include(GNUInstallDirs)
+    set(RUNE_INSTALL_TARGETS
+        rune_client_api rune_client_producer rune_client_subscriber rune_client_group rune_client_agent
+        rune_client_transport rune_gso rune_client_driver_wake rune_ql rune_security rune_catalog
+        rune_codec rune_client_scram rune_crypto flight_recorder)
+    foreach(_t IN LISTS RUNE_INSTALL_TARGETS)
+        # rune_client_api and the aeron-only libraries do not exist without aeron (the macOS/armv8 IDE stub).
+        if(TARGET ${_t})
+            install(TARGETS ${_t} ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+        endif()
+    endforeach()
+    install(DIRECTORY
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/
+        ${RUNE_PROTOCOL_INCLUDE}/
+        ${RUNE_CODEC_ROOT}/include/
+        ${RUNE_QL_ROOT}/include/
+        ${RUNE_CRYPTO_ROOT}/include/
+        ${FLIGHT_RECORDER_DIR}/include/
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif()

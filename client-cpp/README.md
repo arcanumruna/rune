@@ -2,6 +2,30 @@
 
 The C++ Rune client library. Mirrors `rune-broker`'s Conan2/CMake/C++23 build system so later tickets can add the codec adapter, transport layer, session state machine, and public API. The `rune-protocol` headers are consumed via the sibling include path (`../protocol/include`) exactly as in `rune-broker`.
 
+## Install
+
+Releases are tagged `client-cpp-vX.Y.Z`. C++23, Linux x86_64.
+
+**Conan** (recommended):
+
+```bash
+conan remote add arcanum <remote URL>
+```
+
+```python
+# conanfile.py
+requires = "rune-client-cpp/X.Y.Z"
+```
+
+```cmake
+find_package(rune-client-cpp REQUIRED)
+target_link_libraries(my_app PRIVATE rune::client)   # brings aeron, spdlog and OpenSSL
+```
+
+**Source tarball:** `rune-client-cpp-X.Y.Z.tar.gz` (with its `.sha256`) on the
+[GitHub Releases](https://github.com/arcanumruna/rune/releases) page holds the client, the sibling sources it compiles
+and flight-recorder. Build with `-DFLIGHT_RECORDER_DIR=<unpacked dir>/flight-recorder`.
+
 ## Build
 
 ```bash

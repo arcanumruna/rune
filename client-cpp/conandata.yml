@@ -2,8 +2,10 @@ requirements:
   # rune-protocol is consumed via sibling include path (not yet conan-published).
   - "aeron/1.41.4"
   - "spdlog/1.14.0"
-  - "gtest/1.16.0"
-  - "benchmark/1.8.2"
   # client<->broker TLS/AEAD (Task 5): TLS 1.3 handshake + AEAD, via the sibling
   # rune-crypto repo (RUNE_CRYPTO_ROOT in CMakeLists.txt).
   - "openssl/3.3.2"
+# Only needed to build the tests/benchmarks; dropped when tools.build:skip_test is set.
+test_requirements:
+  - "gtest/1.16.0"
+  - "benchmark/1.8.2"
