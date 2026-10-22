@@ -3209,6 +3209,106 @@ TEST_F(GroupJoinAdversarial, ASinkCreatedThenDroppedWhileTheGroupLivesIsRefusedT
     EXPECT_TRUE(gc.hasMember(member));
 }
 
+// ===========================================================================
+// #549: a JoinGroup naming a topic id the coordinator could not assign then (the catalog create not applied here
+// yet) must not lose it for good: once it becomes assignable the group rebalances and the re-join resolves it.
+// ===========================================================================
+class GroupJoinLateTopic : public GroupJoinAdversarial {
+protected:
+    static constexpr int32_t kLate = 8;
+    int16_t sync(int64_t sid, const std::string& group, const std::string& member, int32_t gen) {
+        return decodeSyncErrorCode(out_, service_->handleSyncGroup(req_, encodeSyncGroup(req_, sid, ++corr_, group, member, gen),
+                                                                 clock_, out_, kBufSize));
+    }
+    bool lateHeld(const std::string& g) {
+        for (const auto& m : service_->coordinator(g).members())
+            for (const auto& tp : m.assignment) if (tp.topic == "m16-late") return true;
+        return false;
+    }
+    std::size_t lateParts(const std::string& g) {
+        std::size_t n = 0;
+        for (const auto& m : service_->coordinator(g).members())
+            for (const auto& tp : m.assignment) if (tp.topic == "m16-late") ++n;
+        return n;
+    }
+    void createLate() {
+        TopicSpec late = makeTopicSpec("m16-late", 2, kLate);
+        ASSERT_EQ(registry_->createTopicAt(kLate, late), kLate);
+    }
+    /// A member joined to {kTestTopicId, kLate} (kLate unknown) and driven to Stable; returns its id.
+    std::string stableWithUnknownLate(const std::string& g) {
+        const auto first = joinAs({kTestTopicId, kLate}, g);
+        EXPECT_EQ(first.code, static_cast<int16_t>(pc::ErrorCode::OK));
+        clock_ += kStep;
+        const auto again = joinAs({kTestTopicId, kLate}, g, first.memberId);
+        EXPECT_EQ(again.code, static_cast<int16_t>(pc::ErrorCode::OK));
+        EXPECT_TRUE(driveUntil([&] { return service_->coordinator(g).state() == GroupState::Stable; }, 10));
+        return first.memberId;
+    }
+    /// The member re-joins for {kTestTopicId, kLate} and the group is driven back to Stable.
+    void rejoinToStable(const std::string& g, const std::string& member) {
+        const auto r = joinAs({kTestTopicId, kLate}, g, member);
+        ASSERT_EQ(r.code, static_cast<int16_t>(pc::ErrorCode::OK));
+        ASSERT_TRUE(driveUntil([&] { return service_->coordinator(g).state() == GroupState::Stable; }, 50));
+    }
+};
+
+// RED (remove the doWork block): the generation never moves, the member never gets kLate.
+TEST_F(GroupJoinLateTopic, ATopicCreatedAfterTheJoinIsAssignedWithoutARejoinRegression) {
+    const std::string g = "g-late";
+    const std::string member = stableWithUnknownLate(g);
+    auto& gc = service_->coordinator(g);
+    EXPECT_FALSE(lateHeld(g));
+    EXPECT_EQ(service_->unassignedJoinTopicsForTest(g), 1u);
+    const int32_t genBefore = gc.generationId();
+    createLate();
+    for (int i = 0; i < 50 && gc.generationId() == genBefore; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    ASSERT_GT(gc.generationId(), genBefore) << "the group must rebalance once the topic became assignable";
+    EXPECT_NE(gc.state(), GroupState::Stable);
+    rejoinToStable(g, member);
+    EXPECT_EQ(sync(1, g, member, gc.generationId()), static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(lateParts(g), 2u);
+    EXPECT_EQ(service_->unassignedJoinTopicsForTest(g), 0u);
+}
+
+// RED (drop the pending-set bookkeeping or the held check): a rebalance loop / a spurious one.
+TEST_F(GroupJoinLateTopic, ATopicAlreadyHeldDoesNotRebalanceAgainRegression) {
+    const std::string g = "g-late-held";
+    const std::string member = stableWithUnknownLate(g);
+    auto& gc = service_->coordinator(g);
+    const int32_t genBefore = gc.generationId();
+    createLate();
+    for (int i = 0; i < 50 && gc.generationId() == genBefore; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    rejoinToStable(g, member);
+    ASSERT_EQ(lateParts(g), 2u);
+    const int32_t gen = gc.generationId();
+    for (int i = 0; i < 200; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    EXPECT_EQ(gc.generationId(), gen);
+    EXPECT_EQ(gc.state(), GroupState::Stable);
+}
+
+TEST_F(GroupJoinLateTopic, AnUnknownTopicThatNeverAppearsNeverForcesARebalanceRegression) {
+    const std::string g = "g-late-never";
+    (void)stableWithUnknownLate(g);
+    auto& gc = service_->coordinator(g);
+    const int32_t gen = gc.generationId();
+    for (int i = 0; i < 200; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    EXPECT_EQ(gc.generationId(), gen);
+    EXPECT_EQ(gc.state(), GroupState::Stable);
+    EXPECT_EQ(service_->unassignedJoinTopicsForTest(g), 1u);
+}
+
+TEST_F(GroupJoinLateTopic, UnassignedJoinTopicsAreBoundedPerGroupRegression) {
+    std::vector<int32_t> ids;
+    for (int32_t i = 0; i < 100; ++i) ids.push_back(1000 + i);
+    const auto r = joinAs(ids, "g-late-cap");
+    ASSERT_EQ(r.code, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(service_->unassignedJoinTopicsForTest("g-late-cap"), GroupCoordinationService::kMaxUnassignedJoinTopics);
+    // The same ids again do not grow the set.
+    (void)joinAs(ids, "g-late-cap", r.memberId);
+    EXPECT_EQ(service_->unassignedJoinTopicsForTest("g-late-cap"), GroupCoordinationService::kMaxUnassignedJoinTopics);
+}
+
 // The group filter: a refused join into an EMPTY group never fixes the group's filter - the next member joins with
 // another filter (here none) and is admitted.  RED (revert #19): the sink join is admitted and fixes filter F, so the
 // second join is refused filter-mismatch.
