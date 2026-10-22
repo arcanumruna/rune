@@ -5,10 +5,13 @@
 
 #include <cstdio>
 
-int main() {
+int main(int argc, char**) {
     const rune::client::Key key(std::uint64_t{42});
-    rune::client::ClientConfig cfg;   // aeron:ipc defaults; nothing connects until connect() is called
-    rune::client::Client client(cfg);
+    if (argc > 1) {
+        // Linked, never run: constructing a Client starts its media driver, which needs a configured data directory.
+        rune::client::ClientConfig cfg;
+        rune::client::Client client(cfg);
+    }
     std::printf("rune-client %.*s ok, key bytes=%zu\n", static_cast<int>(rune::client::kVersion.size()),
                 rune::client::kVersion.data(), key.bytes().size());
     return 0;
