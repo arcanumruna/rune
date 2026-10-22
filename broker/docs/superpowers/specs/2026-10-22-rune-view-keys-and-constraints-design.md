@@ -87,6 +87,40 @@ select characterId from character_name where nameKey = lower('Foo');  -- point r
 
 **#537: views fold records from aborted transactions.** The constraints treat view state as committed truth, so this must be fixed and re-folded first.
 
+**3.1 Every topic is typed, and every write is validated** (owner decision, 2026-10-22)
+
+Today Rune allows writes that don't match any schema:
+
+- **Untyped topics.** `topic events partitions 3;` has no field list and accepts opaque bytes (`Parser.cpp:583`, `Backends.cpp:52`).
+- **Typed topics that don't validate.** Validation is opt-in through `--validate` (`CatalogCommands.cpp:250`) and the `validate` argument of `createTopic` (`Client.h:782`). It defaults to false, so the broker accepts any bytes, and the view fold then silently counts undecodable records as `skippedMalformed`.
+
+Such records would bypass every constraint, intent and `autoincrement` rule.
+
+**Rules**
+
+- **`topic <name>` requires a field list.** Opaque payloads become an explicit field: `topic events { payload bytes } partitions 3;`.
+- **`key` stays optional.** A topic without a key is an append-only event stream, routed round-robin or sticky like Kafka's null keys.
+- **Validation is always on.** The `validate` flag, `--validate` and the `validate` parameter are removed.
+  - Every record must decode against a schema version the topic knows, or the whole batch is rejected with `SchemaValidationFailed` and never appended.
+  - Control batches are exempt.
+- **The wire key must match the key field.** On a keyed topic, the record's wire key must equal the encoded value of its key field. The only exception is the `autoincrement` placeholder, which has 0 in both.
+  - Without this rule, routing, compaction and the view identity follow the wire key while readers and view columns see a different value.
+  - The view fold already decodes the key field as an output column and the wire key as the identity (`ViewFold.cpp:162-188`), so a mismatch splits them.
+- **Rune's internal `__` topics** keep their own fixed formats. Users can't create `__` names.
+
+**How it fits with each feature**
+
+| Feature | Effect |
+|---|---|
+| Hot path | Validation moves from the `validatedTopics_` hash lookup to the per-partition pointer used in §6.2. The decode is the same single pass as the constraint hook and uses the fold's descriptor cache. A `{payload bytes}` schema costs a header and length check. The latency gate is an ABAB n=3 run on the existing produce benches, with no regression allowed. |
+| Schema evolution | A record is still validated against its own writer version (`schemaRejects_` already selects by exact `(topicId, version)`). An unknown version is rejected. |
+| Transactions | Data batches are validated. Commit and abort markers are control batches and are exempt. |
+| Compaction, views, filters, intents, `autoincrement`, constraints | All of them need a typed topic. Every one except filters also needs a key. A missing key is refused at DDL time with a clear message, not at write time. |
+| Transient topics | Same rules. `transient topic t { … }`. |
+| Raw `send(topic, key, bytes)` | Still allowed. The bytes must be a valid encoded record, or they are rejected by validation. The typed API is the normal path. |
+| Existing clusters | Behind the new feature level: DDL creating an untyped topic or setting `validate = false` is refused. Topics that already exist are converted when the level is raised. An untyped topic becomes `{ payload bytes }`, keeping its old bytes readable as the payload: a catalog `AlterTopic` with a v1 schema that maps the old records verbatim (the builder confirms this reads old records). Validation turns on for every typed topic. A producer that was writing garbage then starts getting `SchemaValidationFailed`, which is the intended outcome. |
+| Repo ripple | All of these move to `{ payload bytes }` (or a real schema) in the same part: the e2e topic scripts (`broker/docker/topics/*.rql`, `catalog-e2e.sh`), `broker/bench/kafka-compare/lib.sh`, the DR harness (`broker/dr-e2e/harness/cluster.py`), the QL, CLI and console tests, the protocol conformance vectors, `README.md`, `client-cpp/README.md`, `docs/api/ql.md`, `docs/benchmarks.md`, `SELF-HOSTING.md` and `DOCKERHUB.md`. |
+
 ## 4. Keys
 
 **4.1 Key forms**
@@ -527,6 +561,7 @@ Every cell is a test (unit, integration or e2e, wherever it can first be seen). 
 - `create or replace` while writes run
 - drop while writes run
 - a full overlay
+- §3.1: an untyped-topic DDL refused, a record matching no schema version rejected, a wire key that doesn't match the key field rejected, control batches passing, a keyless topic refusing views and intents at DDL time, and an existing untyped topic converted to `{ payload bytes }` with its old records still readable
 - a write to a source key held by another open transaction, followed by that transaction committing or aborting
 - a committed transactional release followed by a reuse before the fold catches up
 - a non-idempotent, `acks=leader` or version-11 client writing to a constrained topic
@@ -561,6 +596,7 @@ The stress run has racing writers, injected failovers and aborts. At every obser
 Each part can be shipped on its own:
 
 1. #537, the fix for aborted-transaction folding.
+1b. Every topic typed, validation always on, and wire key = key field (§3.1).
 2. Keys: wide and derived keys, the owner map, the seeded hash and checkpoint v3. Covers §4 and §5 apart from §5.4.
 3. Composite keys, the prefix index, `GetViewRowK`, `ScanViewRows` and the client read API. Covers §5.4 and §8.
 4. Rune QL `create view` (plan v2, the feature level) and `select`, plus the CLI. Covers §9.
@@ -576,6 +612,7 @@ Each part can be shipped on its own:
 - One batch in flight per constrained partition (§7.2).
 - A constraint violation inside a transaction aborts the transaction.
 - A source key with a pending entry from another open transaction is locked until that transaction ends (§6.4).
+- Keyless typed topics replace untyped ones. Existing untyped topics are converted to `{ payload bytes }` when the feature level is raised (§3.1).
 - `lower()` is ASCII-only. The first users' names are `[A-Za-z0-9]{1,16}`.
 - The default overlay capacity is 65 536 entries per view.
 - Autoincrement topics use a modulo partitioner (`id % P`). Reservation step 4096. Assignment budget under 200 ns per batch. Dedupe returns ids by reading the stored batch back, so the producer-state entry doesn't grow.
