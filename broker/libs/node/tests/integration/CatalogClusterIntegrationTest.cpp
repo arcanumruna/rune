@@ -2568,3 +2568,135 @@ TEST(ViewReadLeaseRegression, PartitionedExLeaderNeverServesAStaleRowRegression)
 TEST(ViewReadLeaseRegression, PartitionedControllerExLeaderNeverServesAStaleRowRegression) {
     zombieViewReadCase(/*zombieIsController=*/true, "vls_ctrl_zombie");
 }
+
+// ===========================================================================
+// PR #490 adversarial review (#486): a LIVE leader move that drops the old leader from the ISR - here a controlled
+// shutdown of the view source's leader A - while A's metadata apply lags (held).  The controller moves A's leaderships to
+// the survivors and drops A from every ISR in one change, so the new leader B acks acks=all writes WITHOUT A.  A has not
+// applied the move: its worker still sees role Leader and still holds the lease it was handed before the move.  Every
+// read through A after B acked hp 2 must be refused retriably or answer hp 2 - never OK with A's frozen hp 1.
+// ===========================================================================
+TEST(ViewReadLeaseRegression, ControlledShutdownOfALaggingSourceLeaderNeverServesAStaleRowAdversarialRegression) {
+    ThreeNodes c = ThreeNodes::start("vls_cs_lag");
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    Rig rig(c);
+    const int leader = c.settledLeader();
+    ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("src", 3, true), "define src", leader));
+    const auto si = rig.topicInfo(leader, "src", 30s);
+    ASSERT_TRUE(si.has_value());
+    ASSERT_NO_FATAL_FAILURE(rig.must(createViewSender("v", si->id), "create v", leader));
+    const auto vi = rig.topicInfo(leader, "v", 30s);
+    ASSERT_TRUE(vi.has_value());
+    int64_t keys[3];
+    for (int32_t p = 0; p < 3; ++p) {
+        keys[p] = viewKeyFor(p, 3);
+        ASSERT_GT(keys[p], 0);
+        const ProduceIdentity ident = freshIdentity();
+        ASSERT_TRUE(rig.produceFollowing(leader, si->id, p, batchFor(true, keys[p], asString(characterValue(keys[p], 1)), ident),
+                                         60s, ident));
+    }
+    int ctrl = -1, zp = -1, a = -1;
+    for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && a < 0;) {
+        ctrl = -1;
+        for (int n = 1; n <= 3; ++n) if (c.node(n).isLeader()) ctrl = n;
+        for (int32_t p = 0; p < 3 && ctrl > 0 && a < 0; ++p) {
+            const int l = rig.partitionLeader(leader, si->id, p);
+            if (l > 0 && l != ctrl) { zp = p; a = l; }
+        }
+        if (a < 0) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_GT(a, 0) << "no source partition led outside the controller";
+    const int64_t key = keys[zp];
+    const auto warm = rig.viewRowSettled(a, vi->id, static_cast<uint64_t>(key), 30s);
+    ASSERT_TRUE(warm.ok());
+    ASSERT_EQ(rowHp(warm.row), 1);
+    ASSERT_EQ(warm.finalNode, a);
+
+    // A's metadata apply lags from here; then A asks for a controlled shutdown.
+    c.node(a).holdMetadataApplyForTest(true);
+    std::thread shutdown([&c, a] { (void)c.node(a).controlledShutdown(std::chrono::milliseconds{3'000}); });
+    const int survivor = ctrl;
+    int b = -1;
+    for (const auto deadline = Clock::now() + 10s; Clock::now() < deadline;) {
+        const int l = rig.partitionLeader(survivor, si->id, zp);
+        if (l > 0 && l != a) { b = l; break; }
+        std::this_thread::sleep_for(1ms);
+    }
+    bool acked = false;
+    int stale = 0, reads = 0;
+    if (b > 0) {
+        const ProduceIdentity ident = freshIdentity();
+        acked = rig.produceFollowing(b, si->id, zp, batchFor(true, key, asString(characterValue(key, 2)), ident), 10s, ident);
+        for (const auto until = Clock::now() + 300ms; acked && Clock::now() < until; ++reads) {
+            const auto r = rig.viewRowFollowing(a, vi->id, static_cast<uint64_t>(key));
+            if (r.ok() && rowHp(r.row) != 2) {
+                ++stale;
+                ADD_FAILURE() << "read " << reads << " through the shutting-down ex-leader " << a << " answered OK hp "
+                              << rowHp(r.row) << " (node " << r.finalNode << ") after the new leader " << b << " acked hp 2";
+            }
+        }
+    }
+    c.node(a).holdMetadataApplyForTest(false);
+    shutdown.join();
+    ASSERT_GT(b, 0) << "the controlled shutdown moved partition " << zp << " off node " << a;
+    ASSERT_TRUE(acked) << "the new leader acks hp 2";
+    EXPECT_EQ(stale, 0) << stale << " of " << reads << " reads through the ex-leader were stale";
+}
+
+// PR #490 adversarial review: a lease renewal that stalls (here: the source leader's metadata apply is held, so no grant
+// it receives is deliverable - the same as a controller that grants none, e.g. an old-build controller mid-upgrade) never
+// hangs a read.  Within a lease length every read is answered, retriably (NotLeader / Redirect / NotReady) once the lease
+// ran out - never left unanswered - and reads are served again once renewal resumes.
+TEST(ViewReadLeaseRegression, AStalledLeaseRenewalAnswersEveryReadRetriablyAndRecoversAdversarialRegression) {
+    ThreeNodes c = ThreeNodes::start("vls_stall");
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    Rig rig(c);
+    const int leader = c.settledLeader();
+    ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("src", 3, true), "define src", leader));
+    const auto si = rig.topicInfo(leader, "src", 30s);
+    ASSERT_TRUE(si.has_value());
+    ASSERT_NO_FATAL_FAILURE(rig.must(createViewSender("v", si->id), "create v", leader));
+    const auto vi = rig.topicInfo(leader, "v", 30s);
+    ASSERT_TRUE(vi.has_value());
+    int64_t keys[3];
+    for (int32_t p = 0; p < 3; ++p) {
+        keys[p] = viewKeyFor(p, 3);
+        const ProduceIdentity ident = freshIdentity();
+        ASSERT_TRUE(rig.produceFollowing(leader, si->id, p, batchFor(true, keys[p], asString(characterValue(keys[p], 1)), ident),
+                                         60s, ident));
+    }
+    int ctrl = -1, zp = -1, a = -1;
+    for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && a < 0;) {
+        ctrl = -1;
+        for (int n = 1; n <= 3; ++n) if (c.node(n).isLeader()) ctrl = n;
+        for (int32_t p = 0; p < 3 && ctrl > 0 && a < 0; ++p) {
+            const int l = rig.partitionLeader(leader, si->id, p);
+            if (l > 0 && l != ctrl) { zp = p; a = l; }
+        }
+        if (a < 0) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_GT(a, 0);
+    const int64_t key = keys[zp];
+    const auto warm = rig.viewRowSettled(a, vi->id, static_cast<uint64_t>(key), 30s);
+    ASSERT_TRUE(warm.ok());
+
+    // A's metadata apply stalls, and the controller's log moves on (a placement): every grant A receives from now on
+    // covers metadata A has not applied, so none is deliverable - A's lease is not renewed.
+    c.node(a).holdMetadataApplyForTest(true);
+    ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("other", 3, true), "define other", ctrl));
+    std::this_thread::sleep_for(250ms);   // > one lease length
+    int refused = 0;
+    for (int i = 0; i < 10; ++i) {
+        const auto r = rig.viewRowFollowing(a, vi->id, static_cast<uint64_t>(key));
+        ASSERT_TRUE(r.answered) << "read " << i << " with a stalled lease was never answered";
+        EXPECT_TRUE(r.firstIsError ? (r.firstCode == cNotLeader || r.firstCode == cRedirect)
+                                   : r.firstCode == pc::ViewRowResponse::kNotReady)
+            << "read " << i << " without a lease: " << (r.firstIsError ? "error " : "status ") << r.firstCode;
+        refused += r.firstIsError || r.firstCode != pc::ViewRowResponse::kOk;
+    }
+    EXPECT_EQ(refused, 10) << "a broker whose lease ran out served a row";
+    c.node(a).holdMetadataApplyForTest(false);
+    const auto back = rig.viewRowSettled(a, vi->id, static_cast<uint64_t>(key), 30s);
+    ASSERT_TRUE(back.ok()) << "renewal resumed: the row is served again";
+    EXPECT_EQ(rowHp(back.row), 1);
+}

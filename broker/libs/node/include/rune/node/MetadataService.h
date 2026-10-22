@@ -2009,6 +2009,9 @@ public:
     /// every record it would emit, of every topic id - the userDecisionHoldNs_ pattern widened) and no storage record
     /// is drained.  `maxNs` > 0: the hold lapses by itself after that long (control-thread clock).
     void setHoldAllDecisionsForTest(bool on) noexcept { holdAll_ = on; holdAllSinceNs_ = lastNowNs_; }
+    /// PR #490 review: committed metadata records are not applied (the map, the bridge's role ops and the lease fanout
+    /// freeze) until released - a broker whose metadata apply lags the controller.
+    void holdMetadataApplyForTest(bool on) noexcept { applyHeldForTest_ = on; }
     void setHoldAllDecisionsMaxForTest(int64_t maxNs) noexcept { holdAllMaxNs_ = maxNs; }
     [[nodiscard]] bool holdAllDecisionsActiveForTest() const noexcept { return holdAllActive_(); }
     /// Counter sources (kStoragePendingNodesCounterTypeId / kLostCommittedReportsCounterTypeId).
@@ -2515,6 +2518,7 @@ public:
         if (amLeader) maybeConfirmSingleNodeLineages_();   // C1 (single node only)
         if (amLeader) retryUnplaceable_();                  // Task 11 fix round 1 (I1/I2)
         pruneUnservable_(nowNs);                            // Task 11 fix round 4
+        if (applyHeldForTest_) [[unlikely]] return 0;       // PR #490 review seam: a broker whose metadata apply lags
         if (hw <= 0 || hw <= lastApplied_) {
             // Nothing new to apply.  Still call commit() so pending records
             // already decoded in a prior partial cycle get committed.
@@ -3421,6 +3425,7 @@ private:
     uint64_t  lostCommittedReports_ = 0;   ///< Step 11 increments it
     bool      dropNextStorageAppend_ = false;
     bool      holdAll_ = false;                 ///< setHoldAllDecisionsForTest
+    bool      applyHeldForTest_ = false;        ///< PR #490 review: holdMetadataApplyForTest
     int64_t   holdAllSinceNs_ = 0, holdAllMaxNs_ = 0;
     [[nodiscard]] bool holdAllActive_() const noexcept {
         return holdAll_ && holdAllMaxNs_ > 0 && lastNowNs_ < holdAllSinceNs_ + holdAllMaxNs_;

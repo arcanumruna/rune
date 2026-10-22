@@ -448,3 +448,73 @@ TEST(ElectionReadLeaseRegression, ANewControllersFailoverGraceCoversEveryLeaseOf
     n = r.e.eligibleNodeIds(now + w + 1 * kMs, 1 * kMs, out, 8);
     EXPECT_EQ(std::vector<NodeId>(out, out + n), (std::vector<NodeId>{0})) << "past W, silent and lease-less: dropped";
 }
+
+// =====================================================================================================================
+// PR #490 adversarial review: hostile / buggy grant and request values through the pure state machines.
+// =====================================================================================================================
+TEST(ReadLeaseRegression, HolderRefusesOrCapsEveryHostileGrantValueAdversarialRegression) {
+    ReadLeaseHolder h;
+    const int64_t s = 1'000 * kMs;
+    const auto rq = h.nextRequest(s);
+    ASSERT_EQ(rq.reqSeq, 1);
+    // Unknown / never-sent / non-positive request sequences: refused, no lease, no echo.
+    for (const int64_t bad : {int64_t{0}, int64_t{-1}, INT64_MIN, int64_t{2}, int64_t{65}, INT64_MAX}) {
+        EXPECT_FALSE(h.onGrant(bad, 5, 0, 100 * kMs)) << "reqSeq " << bad;
+    }
+    EXPECT_EQ(h.heardGrantSeq(), 0);
+    EXPECT_EQ(h.latestEndNs(), ReadLeaseHolder::kNone);
+    // Non-positive validFor: the echo counts, no lease.
+    for (const int64_t v : {int64_t{0}, int64_t{-1}, INT64_MIN}) EXPECT_TRUE(h.onGrant(1, 3, 0, v));
+    EXPECT_EQ(h.heardGrantSeq(), 3);
+    EXPECT_EQ(h.latestEndNs(), ReadLeaseHolder::kNone);
+    // An oversize validFor (a buggy / skewed grantor) is capped at L, then shrunk by the drift budget.
+    EXPECT_TRUE(h.onGrant(1, 4, 0, INT64_MAX));
+    EXPECT_EQ(h.latestEndNs(), s + leaseShrinkByDrift(kReadLeaseMaxNs));
+    // A replayed grant never extends the lease past its own request's bound; an older grant seq never lowers the echo.
+    EXPECT_TRUE(h.onGrant(1, 2, 0, INT64_MAX));
+    EXPECT_EQ(h.latestEndNs(), s + leaseShrinkByDrift(kReadLeaseMaxNs));
+    EXPECT_EQ(h.heardGrantSeq(), 4);
+    // A request whose ring slot was reused (64 newer requests) is unknown: a very late grant for it is refused.
+    for (int i = 0; i < static_cast<int>(ReadLeaseHolder::kRequestRing); ++i) (void)h.nextRequest(s + (i + 1) * kMs);
+    EXPECT_FALSE(h.onGrant(1, 9, 0, 100 * kMs));
+    // A lease whose commitPos is above what was applied is never deliverable, whatever its length.
+    ReadLeaseHolder g;
+    const auto r2 = g.nextRequest(s);
+    ASSERT_TRUE(g.onGrant(r2.reqSeq, 1, /*commitPos=*/INT64_MAX, 100 * kMs));
+    EXPECT_EQ(g.deliverableEndNs(INT64_MAX - 1), ReadLeaseHolder::kNone);
+    EXPECT_EQ(g.deliverableEndNs(INT64_MAX), s + leaseShrinkByDrift(100 * kMs));
+}
+
+TEST(ReadLeaseRegression, GrantorNeverGrantsPastHUnderAnyEchoPatternAdversarialRegression) {
+    const NodeId ids[] = {0, 1, 2, 3, 4};
+    std::mt19937_64 rng(0x490490);
+    for (int trial = 0; trial < 2'000; ++trial) {
+        SCOPED_TRACE("trial " + std::to_string(trial) + " seed 0x490490");
+        ReadLeaseGrantor gr;
+        const std::size_t n = 3 + 2 * (trial % 2);   // 3 or 5 members
+        gr.configure(std::span<const NodeId>(ids, n), /*self=*/0, kH);
+        int64_t now = 10'000 * kMs;
+        std::vector<int64_t> lastGrant(n, 0);
+        for (int step = 0; step < 200; ++step) {
+            now += static_cast<int64_t>(rng() % (30 * kMs));
+            const auto m = static_cast<NodeId>(1 + rng() % (n - 1));
+            int64_t echo = 0;
+            switch (rng() % 5) {
+                case 0: echo = lastGrant[static_cast<std::size_t>(m)]; break;                  // honest
+                case 1: echo = static_cast<int64_t>(rng());                                    // garbage
+                case 2: echo = -static_cast<int64_t>(rng() % 100);                             // negative
+                case 3: echo = gr.grantSeqForTest() + 1 + static_cast<int64_t>(rng() % 10);   // from the future
+                default: echo = lastGrant[static_cast<std::size_t>(1 + rng() % (n - 1))];      // another member's
+            }
+            const auto g = gr.onRequest(m, echo, now);
+            ASSERT_GE(g.grantSeq, 1);
+            lastGrant[static_cast<std::size_t>(m)] = g.grantSeq;
+            ASSERT_GE(g.validForNs, 0);
+            ASSERT_LE(g.validForNs, leaseShrinkByDrift(kH)) << "a grant longer than H/(1+rho)^2";
+            ASSERT_LE(g.validForNs, kReadLeaseMaxNs);
+        }
+        // Self, unknown and out-of-range members get nothing.
+        for (const NodeId bad : {NodeId{0}, NodeId{-1}, NodeId{31}, NodeId{32}, static_cast<NodeId>(n)})
+            EXPECT_LT(gr.onRequest(bad, 1, now).grantSeq, 0) << "member " << bad;
+    }
+}

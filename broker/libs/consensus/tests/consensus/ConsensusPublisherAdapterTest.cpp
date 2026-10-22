@@ -880,3 +880,29 @@ TEST(ConsensusMessagesRegression, ReadLeaseRequestAndGrantRoundTripThroughPublis
     EXPECT_EQ(static_cast<uint16_t>(ConsensusTemplateId::ReadLeaseRequest), 63);
     EXPECT_EQ(static_cast<uint16_t>(ConsensusTemplateId::ReadLeaseGrant), 64);
 }
+
+// PR #490 adversarial review: both lease templates truncated at EVERY byte offset are ignored (counted, never handed to
+// the handler, never read past the end).
+TEST(ConsensusMessagesRegression, ReadLeaseTemplatesTruncatedAtEveryOffsetAreIgnoredAdversarialRegression) {
+    LoopbackSink sink;
+    SbeConsensusPublisher pub(sink);
+    pub.readLeaseRequest(1, 9, 2, 77, 66);
+    const std::vector<uint8_t> req = sink.last().bytes;
+    pub.readLeaseGrant(2, 9, 1, 2, 77, 88, 123, 456);
+    const std::vector<uint8_t> grant = sink.last().bytes;
+    for (const auto* frame : {&req, &grant}) {
+        for (std::size_t len = 0; len < frame->size(); ++len) {
+            LeaseHandler h;
+            BasicConsensusAdapter<LeaseHandler> adapter{h};
+            std::vector<uint8_t> cut(frame->begin(), frame->begin() + static_cast<std::ptrdiff_t>(len));
+            adapter.onFragment(0, cut.data(), cut.size());
+            EXPECT_EQ(h.req + h.grant, 0) << "template " << (frame == &req ? 63 : 64) << " truncated to " << len << " B";
+        }
+        LeaseHandler h;
+        BasicConsensusAdapter<LeaseHandler> adapter{h};
+        std::vector<uint8_t> longer = *frame;
+        longer.push_back(0xAB);   // trailing byte: still one message
+        adapter.onFragment(0, longer.data(), longer.size());
+        EXPECT_EQ(h.req + h.grant, 1);
+    }
+}
