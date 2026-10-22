@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Materialized views fold only committed data: every projection, aggregate, restart-rebuild and transient fold skips the data batches of aborted transactions, and a persisted view whose checkpoint may already hold aborted rows is refolded from the log start (#537, spec §8.8 last bullet, ruling SD15).
+**Goal:** Materialized views fold only committed data: every projection, aggregate, restart-rebuild and transient fold skips the data batches of aborted transactions, and a persisted view checkpoint written before the fix is refolded once, and only when the retained log proves it may hold aborted rows (#537, spec §8.8 last bullet, ruling R15, which replaces SD15 for this part).
 
-**Architecture:** A new `rune::view::FoldSkip` (contract C9.2) carries a pointer to the source partition's `rune::transaction::AbortedTxnIndex`. The worker reads it from the partition's `RcState` (`RcState::aborted()`, `broker/libs/node/include/rune/node/RcState.h:412`) at the same point it computes the fold bound `rcState->lso(liveHw)` (`Worker.h:6433-6434`), and threads it through `WorkerViewSet::driveFolds` / `driveRebuild` / `driveView_` into `foldBatch` and `foldAggregateBatch`, which skip a transactional batch whose `isAborted(producerId, baseOffset)` is true, exactly as the read_committed fetch does (`broker/libs/transaction/src/ReadCommittedView.cpp:442-450`). At recovery, a persisted instance whose source partition has a non-empty aborted index discards its v1/v2 checkpoint, refolds from offset 0, and first sends a new reset frame on its `ViewSnapshotChannel.deltas` ring so the IO agent truncates the stale checkpoint file before any new delta lands.
+**Architecture:** A new `rune::view::FoldSkip` (contract C9.2) carries a pointer to the source partition's `rune::transaction::AbortedTxnIndex`. The worker reads it from the partition's `RcState` (`RcState::aborted()`, `broker/libs/node/include/rune/node/RcState.h:412`) at the same point it computes the fold bound `rcState->lso(liveHw)` (`Worker.h:6433-6434`), and threads it through `WorkerViewSet::driveFolds` / `driveRebuild` / `driveView_` into `foldBatch` and `foldAggregateBatch`, which skip a transactional batch whose `isAborted(producerId, baseOffset)` is true, exactly as the read_committed fetch does (`broker/libs/transaction/src/ReadCommittedView.cpp:442-450`). Every checkpoint record the fixed code writes carries a marker: the v1/v2 record magic gets an "S" (folded with `FoldSkip`) variant with an identical layout. At recovery, a persisted instance discards its checkpoint only when some of its records are unmarked **and** the partition's aborted index holds a range that starts below the highest unmarked record's offset **and** the log still starts at 0. It then refolds from offset 0, after sending a new reset frame on its `ViewSnapshotChannel.deltas` ring so the IO agent truncates the stale file before any new (marked) delta lands. When the log no longer starts at 0, the checkpoint is kept, a WARN is logged and `checkpointsKeptUnverifiable` is raised: a restart never drops view rows.
 
 **Tech Stack:** C++23, GoogleTest (`TEST_P` for the matrix), Google Benchmark (`broker/benchmark/ViewFoldBench.cpp`), CMake/Ninja, real Aeron, in-process `BrokerNode`s (`ThreeNodes`), docker compose on the shared VM.
 
-**Spec:** `broker/docs/superpowers/specs/2026-10-22-rune-checked-writes-and-view-constraints-design.md` (§8.8 last bullet: "With #537 fixed, records of aborted transactions are skipped"; §16 item 1: "skip aborted-transaction records in the fold, and re-fold"). Contract: `broker/docs/superpowers/plans/2026-10-22-checked-writes-00-overview.md` (C9.2, SD15). Issue: arcanumruna/rune#537. Executors read all three.
+**Spec:** `broker/docs/superpowers/specs/2026-10-22-rune-checked-writes-and-view-constraints-design.md` (§8.8 last bullet: "With #537 fixed, records of aborted transactions are skipped"; §16 item 1: "skip aborted-transaction records in the fold, and re-fold"). Contract: `broker/docs/superpowers/plans/2026-10-22-checked-writes-00-overview.md` (C9.2; its SD15 is replaced for this part by the coordinator's ruling R15, restated below). Issue: arcanumruna/rune#537. Executors read all three.
 
 ## Execution context
 
@@ -80,7 +80,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 ## Rulings this part depends on (restated from Plan 00, binding)
 
 - **C9.2 — `FoldSkip`.** `broker/libs/view/include/rune/view/FoldSkip.h` is created by this part with the member `aborted` only; Part 04 appends `rejected`. `foldBatch` and `foldAggregateBatch` take `const FoldSkip&`, and every caller passes it: `driveView_` (`WorkerViewSet.h:663`), rebuild and transient. `rune_view` gets `target_link_libraries(rune_view PUBLIC rune_transaction)`.
-- **SD15 — #537 refold rule.** No checkpoint format change: Part D owns v3. At recovery, a persisted view whose source partition's `RcState` aborted index is non-empty discards its v1/v2 checkpoint and refolds from the log start.
+- **R15 — #537 refold rule (coordinator ruling 2026-10-22; replaces Plan 00's SD15 for this part).** (1) Checkpoints written by the fixed code carry a marker meaning "folded with FoldSkip", by the smallest format change, compatible with Part 07 owning v3. (2) At recovery a checkpoint is discarded and refolded only when it lacks the marker **and** the partition's aborted index has a range at or below the checkpoint's folded offset. If the log start is above a record the checkpoint covers, it is kept, a WARN is logged, `checkpointsKeptUnverifiable` is raised and the residual is filed as an issue. (3) After a refold the new checkpoint carries the marker, so the next restart does not refold again. Never refold on every restart, and never drop view rows on a restart.
 - **Acceptance for the next part (Plan 00):** "A view over an aborted transaction equals a fresh refold."
 
 ## Decisions (binding for executors; each is an obvious choice recorded so a reviewer can overturn it)
@@ -89,8 +89,21 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 - **AD2 — The bound and the cursor.** An aborted batch is passed like a control batch, except that it honours the pass bound: base ≥ bound → stop before it; last ≥ bound → count the offsets `[max(base, from), bound)` and stop (the next pass resumes inside it and skips the rest); otherwise count `[max(base, from), last + 1)` and move on. The cursor contract of `ViewFold.h:85-90` is unchanged (never past `bound`).
 - **AD3 — `skippedAborted` counts offsets.** `FoldStats::skippedAborted` adds the offsets counted in AD2, so a capped pass sequence counts each aborted offset exactly once. The cleaner removes aborted batches whole (`LogCleaner.cpp:349`, `:419`), so an aborted batch has no internal holes.
 - **AD4 — Where the predicate comes from.** `Worker::driveViews_` builds `const rune::view::FoldSkip skip{.aborted = &rcState->aborted()}` right after the bound. `rcServe_` returns non-null only when the RC state is Ready (`Worker.h:6431-6432`), so the index is complete for `[logStart, LEO)` whenever a fold runs: markers are applied to it in the same call as their append (`RcState.h:470-480`), before the LSO can move past their transaction.
-- **AD5 — SD15 predicate.** `checkpointUntrusted(skip)` is `skip.aborted != nullptr && skip.aborted->size() != 0`, applied to persisted instances only (transient instances have no checkpoint). It runs on all three recovery entry points: `materializeRecoveryInstancesFor` → `installViewForRecovery`, and the lazy `getOrCreate_` → `loadRecoveryCheckpoint_` (the whole-branch "Bug A" path).
-- **AD6 — Discarding a checkpoint resets its file.** The checkpoint file is append-only and replay keeps the last record's O (`WorkerViewSet.cpp:103-124`). New deltas appended after old contaminated records would replay the contaminated rows on a later restart (for example once retention has pruned the aborted range), and could restore a stale O. So a discard enqueues **`ViewSnapshotChannel::kResetMsgType = 4`** (frame `[viewTopicId i32][partition i32]`, no body) on the `deltas` ring before any delta of the instance. The IO agent truncates the file to 0 bytes, fdatasyncs it, and resets the key's `pendingO`, `lastDurableO` (both −1), `dirtySinceSync` and `errored`. This is an in-process IPC message, not a checkpoint format change, so SD15 holds.
+- **AD5 — The marker (R15 (1)).** Two new record magics with byte-for-byte the v1 and v2 layouts: `kViewCheckpointMagicMarked = 0x534B4331u` ("1CKS") beside `kViewCheckpointMagic = 0x564B4331u` (`broker/libs/view/include/rune/view/ViewCheckpoint.h:49`), and `kViewCheckpointMagicV2Marked = 0x534B4332u` ("2CKS") beside `kViewCheckpointMagicV2 = 0x564B4332u` (`ViewCheckpoint.h:116`). Only the first four bytes (and so the CRC) differ. O stays at byte 4, so the IO agent's peek keeps working once it accepts the two values. This is the smallest change: no new field, no new record, no length change. A new enum `enum class CheckpointMark : uint8_t { Unmarked, FoldSkipped };` is passed to `encodeDelta` / `encodeMultiDelta` (default `Unmarked`, so existing callers and goldens stay byte-identical) and returned in `AppliedDelta::mark`. The worker's checkpoint writer (`WorkerViewSet.cpp:688`, `:715`) always passes `FoldSkipped`.
+  - **Part 07 / v3.** Part 07 owns checkpoint v3 and picks its own magic (the `0x564B433x` "nCKV" family; v3 must not use `0x534B433x`). Every v3 record is written by code that folds with `FoldSkip`, so v3 **implies** the marker: Part 07's decoder reports `CheckpointMark::FoldSkipped` for v3 and keeps decoding all four v1/v2 magics. Listed under Contract additions so Part 07 inherits it.
+  - **Rollback.** A pre-fix build stops splitting a file at the first marked record (`WorkerViewSet.cpp:219-222`: unknown magic = end of file). It recovers the unmarked prefix and refolds the rest of the log itself, so a rollback loses nothing.
+- **AD5a — The recovery rule (R15 (2), (3)).** For a **persisted** instance being recovered (all three entry points: `materializeRecoveryInstancesFor` → `installViewForRecovery`, and the lazy `getOrCreate_` → `loadRecoveryCheckpoint_`, the "Bug A" path). Let `U` be the highest O among the split records whose magic is unmarked (−1 when there is none), read from bytes 0..11 of each record before replay. Recovery takes the first matching row:
+
+  | Condition | Action | Counter / log |
+  |---|---|---|
+  | `U < 0` (every record marked, or no file) | replay as today | — |
+  | `skip.aborted == nullptr` (a caller without the index: tests, `kNoSkip`) | replay as today | — |
+  | `sourceLogStart > 0` (retention or delete-records removed records the checkpoint covers; nothing can be verified) | replay as today (keep) | `++checkpointsKeptUnverifiable`; `spdlog::warn("VIEW-CHECKPOINT-UNVERIFIABLE view={} partition={} unmarkedThrough={} logStart={} — written before the #537 fix and the log no longer starts at 0; kept as is (rows are never dropped)", …)` |
+  | some `r` in `skip.aborted->ranges()` with `r.firstOffset < U` | discard: empty tables, `foldCursor = 0`, `lastEncodedO = -1`, `checkpointStream = ResetOwed` | `++checkpointsDiscarded`; `spdlog::info("VIEW-CHECKPOINT-DISCARDED view={} partition={} unmarkedThrough={} — an aborted transaction lies inside a checkpoint written before the #537 fix; refolding from offset 0", …)` |
+  | otherwise (no aborted range below `U`) | replay as today (keep) | — |
+
+  O is the exclusive "resume from" offset (`WorkerViewSet.cpp:577-579`), so the unfixed fold covered `[0, U)` and only a range starting below `U` can have reached it. A file that mixes unmarked records with later marked deltas (kept on an earlier restart) is judged by its unmarked prefix only. After a discard, the reset truncates the file and every new record is marked, so `U = −1` on the next restart: one refold, then none. Compaction never moves the log start: it keeps the latest record of every key, so a refold of a compacted log rebuilds the same rows and is allowed. `sourceLogStart` is `log->logStartOffset()` (disk) or `mem->logStartOffset()` (memory), read in `Worker::driveViews_` next to the bound.
+- **AD6 — Discarding a checkpoint resets its file.** The checkpoint file is append-only and replay keeps the last record's O (`WorkerViewSet.cpp:103-124`). New deltas appended after old contaminated records would replay the contaminated rows on a later restart (for example once retention has pruned the aborted range), and could restore a stale O. So a discard enqueues **`ViewSnapshotChannel::kResetMsgType = 4`** (frame `[viewTopicId i32][partition i32]`, no body) on the `deltas` ring before any delta of the instance. The IO agent truncates the file to 0 bytes, fdatasyncs it, and resets the key's `pendingO`, `lastDurableO` (both −1), `dirtySinceSync` and `errored`. This is an in-process IPC message, not a checkpoint format change.
 - **AD7 — The reset is owed state, not a boolean.** `enum class CheckpointStream : uint8_t { Live, ResetOwed };` on `ViewInstance` (`checkpointStream = CheckpointStream::Live`). `driveView_` flushes an owed reset first, before the held delta and before folding, and holds on ring back-pressure exactly like a held delta (`WorkerViewSet.h:616-619`).
 - **AD8 — No `RcState.h` change.** The file map lists `RcState.h` for "aborted index access". `RcState::aborted()` already exists (`RcState.h:412`), so the file is not modified.
 
@@ -100,7 +113,7 @@ These five inputs are the ones a user is most likely to hit and that the spec do
 
 1. **An aborted batch cut by a capped pass** (`maxRecordsPerPass` of a persisted view, or the LSO bound): it must be skipped whole, counted once, and the cursor must never pass the bound. Test: `CheckedWritesAbortedFoldRegression.AbortedBatchStraddlingThePassBoundIsSkippedOnceRegression` (Task 1) and its aggregate twin (Task 2).
 2. **The same producer aborts and then commits** (its next transaction, same or bumped epoch): the aborted range must not hide the committed batches, and a non-transactional batch of that producer inside the range is folded. Tests: `CheckedWritesAbortedFoldRegression.SameProducerAbortThenCommitRegression`, `…NonTransactionalBatchInsideAnAbortedRangeIsFoldedRegression` (Task 1).
-3. **Recovery of a second partition created lazily** after the view left `recoveryViews_` (the "Bug A" path, `WorkerViewSet.cpp:497-516`) must also discard its checkpoint. Test: `CheckedWritesAbortedFoldViewSetRegression.LazyRecoveryOfASecondPartitionAlsoDiscardsRegression` (Task 7).
+3. **Recovery of a second partition created lazily** after the view left `recoveryViews_` (the "Bug A" path, `WorkerViewSet.cpp:497-516`) must apply the same AD5a rule (here: discard). Test: `CheckedWritesAbortedFoldViewSetRegression.LazyRecoveryOfASecondPartitionAlsoDiscardsRegression` (Task 7).
 4. **The reset frame meets a full `deltas` ring**: it is held, never dropped, and no delta of the instance is ever enqueued before it. Test: `CheckedWritesAbortedFoldViewSetRegression.ResetHeldUnderBackPressurePrecedesEveryDeltaRegression` (Task 7).
 5. **A crash between the reset and the first durable delta**: the file is then empty, which recovery treats as a cold start (refold from 0), and `lastDurableOffset` never reports an O from before the reset. Test: `CheckedWritesAbortedFoldIoAgentRegression.ResetRestartsTheDurableOffsetRegression` (Task 6).
 
@@ -130,14 +143,17 @@ Every cell asserts: (a) every table (view, contributors, groups, blocks) equals,
 | Steady fold, two producers interleaved | `…WorkerRegression.InterleavedCommitAndAbortFromTwoProducersRegression` | covered by the fold matrix |
 | Open transaction pins the fold, then aborts | `…WorkerRegression.OpenTxnThenAbortNeverFoldsItRegression` | `…WorkerRegression.TransientOpenTxnThenAbortNeverFoldsItRegression` |
 | Restart rebuild with no checkpoint | `…WorkerRegression.RestartRebuildSkipsTheAbortedRangeRegression` | n/a (transient views refold the new ring) |
-| Restart with a contaminated checkpoint (SD15) | `…WorkerRegression.ContaminatedCheckpointIsDiscardedAndRefoldedRegression`, `…ContaminatedAggregateCheckpointIsDiscardedAndRefoldedRegression` | n/a |
-| Restart with no aborted range (checkpoint kept) | `…WorkerRegression.CheckpointKeptWhenTheLogHasNoAbortedTxnRegression` | n/a |
+| Restart, unmarked checkpoint over an aborted range (R15) | `…WorkerRegression.ContaminatedCheckpointIsDiscardedAndRefoldedRegression`, `…ContaminatedAggregateCheckpointIsDiscardedAndRefoldedRegression` (each restarts a second time: no refold) | n/a |
+| Restart, unmarked checkpoint, no aborted range (kept) | `…WorkerRegression.CheckpointKeptWhenTheLogHasNoAbortedTxnRegression` | n/a |
+| Restart, marked checkpoint over an aborted range (kept) | `…WorkerRegression.MarkedCheckpointNeverRefoldsAcrossRestartsRegression` | n/a |
+| Restart, unmarked checkpoint, log start moved by retention (kept, WARN, counter) | `…WorkerRegression.RetentionTruncatedLogKeepsTheUnmarkedCheckpointRegression` | n/a |
 | View-set recovery entry points | `…ViewSetRegression.*` (Task 7) | n/a |
+| Checkpoint marker codec | `CheckedWritesCheckpointMarkRegression.*` (Task 6) | n/a |
 | IO agent reset | `…IoAgentRegression.*` (Task 6) | n/a |
 
 **Real brokers (`rune_client_failover_broker_tests`, Task 9), ThreeNodes, shard mode:** abort and commit visible in a projection and a `count(*)` view; full cluster restart over the aborted range; leader failover with an open transaction that later aborts.
 
-**Docker e2e (VM, Task 10):** `broker/docker/view-engine-e2e.sh` gains an aborted-transaction leg in `setup` and its check after the broker restart (`verify_restart`), which exercises the SD15 refold on a real broker.
+**Docker e2e (VM, Task 10):** `broker/docker/view-engine-e2e.sh` gains an aborted-transaction leg in `setup` and its check after the broker restart (`verify_restart`), which exercises recovery of a marked checkpoint over an aborted range on a real broker (kept, no refold, rows exact).
 
 ## File Structure
 
@@ -152,21 +168,24 @@ Every cell asserts: (a) every table (view, contributors, groups, blocks) equals,
 | `broker/libs/view/tests/view/CheckedWritesAbortedFoldMatrixTest.cpp` | C | the 126-cell matrix and the model check (Task 3) |
 | `broker/libs/view/tests/view/{ViewFoldTest,AggFoldTest,AggRetractableTest}.cpp` | M | pass `rune::view::kNoSkip` (Tasks 1, 2) |
 | `broker/benchmark/ViewFoldBench.cpp` | M | callers pass `kNoSkip`; new `BM_ViewFoldReplaceTxn` (Tasks 1–3) |
-| `broker/libs/node/include/rune/node/WorkerViewSet.h`, `src/WorkerViewSet.cpp` | M | thread `FoldSkip`; counters; SD15 discard; owed reset (Tasks 5, 7) |
+| `broker/libs/view/include/rune/view/ViewCheckpoint.h`, `src/ViewCheckpoint.cpp`, `tests/view/ViewCheckpointTest.cpp` | M | marked magics, `CheckpointMark`, `AppliedDelta::mark` (Task 6) |
+| `broker/libs/node/include/rune/node/WorkerViewSet.h`, `src/WorkerViewSet.cpp` | M | thread `FoldSkip`; counters; splitter accepts marked records; marked writes; the AD5a rule; owed reset (Tasks 5, 6, 7) |
 | `broker/libs/node/include/rune/node/Worker.h` | M | `driveViews_` / `driveViewsOf_` build and pass the skip (Task 5) |
-| `broker/libs/node/include/rune/node/ViewSnapshotChannel.h`, `ViewSnapshotIoAgent.h`, `src/ViewSnapshotIoAgent.cpp` | M | `kResetMsgType = 4` and its handling (Task 6) |
+| `broker/libs/node/include/rune/node/ViewSnapshotChannel.h`, `ViewSnapshotIoAgent.h`, `src/ViewSnapshotIoAgent.cpp` | M | `kResetMsgType = 4` and its handling; the peek accepts marked records (Task 6) |
 | `broker/libs/node/tests/support/AbortedFoldRig.h` | C | one shard worker + one leader partition (disk or memory) + views + IO agent (Task 5) |
 | `broker/libs/node/tests/integration/AbortedFoldWorkerRegressionTest.cpp` | C | worker-layer tests (Tasks 5, 7) |
 | `broker/libs/node/tests/node/{WorkerViewSetTest,ViewSnapshotIoAgentTest}.cpp` | M | new view-set and IO-agent tests (Tasks 6, 7); every existing driver call keeps compiling through the defaulted `skip` |
 | `broker/libs/node/CMakeLists.txt` | M | `rune_checked_writes_aborted_fold_tests` (Task 5); broker test source (Task 9) |
 | `broker/libs/node/tests/client/CheckedWritesAbortedFoldBrokerRegressionTest.cpp` | C | ThreeNodes tests (Task 9) |
 | `client-cpp/examples/view_probe.cpp`, `broker/docker/view-engine-e2e.sh` | M | aborted-transaction e2e leg (Task 10) |
-| `docs/api/client-cpp.md`, `docs/operations.md` | M | views fold committed data only; the one-time refold (Task 10) |
+| `docs/api/client-cpp.md`, `docs/operations.md` | M | views fold committed data only; the one-time check of pre-fix checkpoints (Task 10) |
 
 ## Contract additions (none redefines a contract type)
 
 - `[[nodiscard]] inline bool rune::view::isAbortedBatch(const FoldSkip& skip, const rune::protocol::RecordBatchReader& r) noexcept;` in `FoldSkip.h` (AD1). Part 04 may add a per-record sibling for `rejected`.
-- `FoldStats::skippedAborted` (`uint64_t`, appended), `ViewFoldCounters::skippedAborted` and `ViewFoldCounters::checkpointsDiscarded` (`uint64_t`, appended).
+- `FoldStats::skippedAborted` (`uint64_t`, appended), `ViewFoldCounters::skippedAborted`, `ViewFoldCounters::checkpointsDiscarded` and `ViewFoldCounters::checkpointsKeptUnverifiable` (`uint64_t`, appended).
+- Checkpoint marker (AD5): `kViewCheckpointMagicMarked = 0x534B4331u`, `kViewCheckpointMagicV2Marked = 0x534B4332u`, `enum class CheckpointMark : uint8_t { Unmarked, FoldSkipped };`, a trailing `CheckpointMark mark = CheckpointMark::Unmarked` on `encodeDelta` and `encodeMultiDelta`, `AppliedDelta::mark` (appended), and `[[nodiscard]] CheckpointMark checkpointMarkOf(std::span<const uint8_t> record) noexcept` (`CheckpointMark::Unmarked` for anything but a marked magic). **For Part 07:** v3 implies `FoldSkipped`, v3 must not use the `0x534B433x` magics, and the v1/v2 decoders (all four magics) stay.
+- A trailing `int64_t sourceLogStart = 0` after `skip` on `driveFolds`, `materializeRecoveryInstancesFor` and `installViewForRecovery`, and a required one on `getOrCreate_` and `loadRecoveryCheckpoint_` (AD5a).
 - `ViewSnapshotChannel::kResetMsgType = 4` (AD6). `enum class CheckpointStream : uint8_t { Live, ResetOwed };` and `ViewInstance::checkpointStream` (AD7).
 - A trailing `const rune::view::FoldSkip& skip = rune::view::kNoSkip` on `WorkerViewSet::driveFolds`, `driveRebuild`, `materializeRecoveryInstancesFor` and `installViewForRecovery`. A required `const rune::view::FoldSkip& skip` on the private `driveView_`, `getOrCreate_` and `loadRecoveryCheckpoint_`. Part 04 passes `FoldSkip{.aborted = …, .rejected = …}` through the same parameters.
 - `[[nodiscard]] int64_t WorkerViewSet::foldCursorForTest(int32_t viewTopicId, int32_t partition) const noexcept` (−1 when the instance is absent).
@@ -403,7 +422,7 @@ The checkpoint commands below are referred to as **CP-full** from Checkpoints B 
 
 ---
 
-## Phase 2 — Wiring and the SD15 refold
+## Phase 2 — Wiring and the R15 checkpoint check
 
 ### Task 5: Thread `FoldSkip` from the worker to every fold
 
@@ -527,23 +546,56 @@ git commit -m "node: views fold with the partition's aborted-transaction index (
            -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
-### Task 6: The checkpoint reset frame in the IO agent
+### Task 6: The checkpoint marker and the reset frame
 
 **Files:**
-- Modify: `broker/libs/node/include/rune/node/ViewSnapshotChannel.h:39-45` (constant and the wire-format comment at `:16-24`), `broker/libs/node/include/rune/node/ViewSnapshotIoAgent.h:145` (declare `handleResetFrame_`), `broker/libs/node/src/ViewSnapshotIoAgent.cpp:281-292` (drain), new `handleResetFrame_`
-- Test: `broker/libs/node/tests/node/ViewSnapshotIoAgentTest.cpp`
+- Modify: `broker/libs/view/include/rune/view/ViewCheckpoint.h:49` and `:116` (marked magics beside the two existing ones), `:73-76` (`AppliedDelta::mark`), `:83-84` and `:125-126` (encoder signatures), new `CheckpointMark` and `checkpointMarkOf`; `broker/libs/view/src/ViewCheckpoint.cpp:34-38`, `:59-67`, `:138-141`, `:159-167`
+- Modify: `broker/libs/node/src/WorkerViewSet.cpp:219-222` (the splitter accepts the marked magics), `:688` and `:715` (pass `CheckpointMark::FoldSkipped`)
+- Modify: `broker/libs/node/src/ViewSnapshotIoAgent.cpp:55-66` (`peekDeltaOffset` accepts the marked magics), `:281-292` (drain), new `handleResetFrame_`; `broker/libs/node/include/rune/node/ViewSnapshotChannel.h:39-45` (constant and the wire-format comment at `:16-24`); `broker/libs/node/include/rune/node/ViewSnapshotIoAgent.h:145` (declare `handleResetFrame_`)
+- Test: `broker/libs/view/tests/view/ViewCheckpointTest.cpp`, `broker/libs/node/tests/node/ViewSnapshotIoAgentTest.cpp`, `broker/libs/node/tests/node/WorkerViewSetTest.cpp`
 
 **Interfaces:**
+- Produces (`ViewCheckpoint.h`, namespace `rune::view`), per AD5:
+  ```cpp
+  inline constexpr uint32_t kViewCheckpointMagicMarked   = 0x534B4331u; // "1CKS": v1 layout, folded with FoldSkip
+  inline constexpr uint32_t kViewCheckpointMagicV2Marked = 0x534B4332u; // "2CKS": v2 layout, folded with FoldSkip
+  enum class CheckpointMark : uint8_t { Unmarked, FoldSkipped };
+  struct AppliedDelta { int64_t O; uint32_t count; CheckpointMark mark = CheckpointMark::Unmarked; };
+  size_t encodeDelta(std::span<const DirtyEntry> entries, int64_t O, uint32_t rowLen,
+                     std::vector<uint8_t>& out, CheckpointMark mark = CheckpointMark::Unmarked);
+  size_t encodeMultiDelta(std::span<const TableDelta> tables, int64_t O,
+                          std::vector<uint8_t>& out, CheckpointMark mark = CheckpointMark::Unmarked);
+  [[nodiscard]] CheckpointMark checkpointMarkOf(std::span<const uint8_t> record) noexcept;
+  ```
+  `applyDelta` accepts both v1 magics and `applyMultiDelta` both v2 magics; each sets `mark` from the magic.
 - Produces: `static constexpr int32_t kResetMsgType = 4;` in `ViewSnapshotChannel` (frame `[viewTopicId i32][partition i32]`, exactly `kDeltaHeaderBytes`). `void ViewSnapshotIoAgent::handleResetFrame_(const uint8_t* p, std::size_t len, int channelIdx);` (private).
 
-- [ ] **Step 1: Write the failing tests** (suite `CheckedWritesAbortedFoldIoAgentRegression`, reusing the file's `TempDir`, `frameDelta`, `testLayout`, `readFile` and `ManualNanoClock` helpers, `ViewSnapshotIoAgentTest.cpp:20-96`):
+- [ ] **Step 1: Write the failing marker tests** (`ViewCheckpointTest.cpp`, suite `CheckedWritesCheckpointMarkRegression`, reusing that file's layout and entry fixtures):
+
+```cpp
+TEST(CheckedWritesCheckpointMarkRegression, UnmarkedEncodingIsByteIdenticalToBefore)
+    // encodeDelta(..., O=7) with the default mark -> first 4 bytes LE == 0x564B4331; the same for encodeMultiDelta
+    // -> 0x564B4332 (existing goldens and old readers unchanged)
+TEST(CheckedWritesCheckpointMarkRegression, MarkedV1RoundTripsAndReportsTheMark)
+    // encodeDelta(..., FoldSkipped) -> magic 0x534B4331; applyDelta -> O == 7, count == 1, mark == FoldSkipped,
+    // the row equals the unmarked round trip; checkpointMarkOf(record) == FoldSkipped
+TEST(CheckedWritesCheckpointMarkRegression, MarkedV2RoundTripsAndReportsTheMark)   // same for encodeMultiDelta / applyMultiDelta, 0x534B4332
+TEST(CheckedWritesCheckpointMarkRegression, MarkIsTheOnlyDifferenceBesideTheCrc)
+    // marked vs unmarked bytes of the same entries: equal length, differ only in bytes [0,4) and the last 4 (CRC)
+TEST(CheckedWritesCheckpointMarkRegression, UnmarkedRecordDecodesAsUnmarked)       // applyDelta of a default record -> mark == Unmarked
+TEST(CheckedWritesCheckpointMarkRegression, CorruptMarkedRecordIsRejected)          // flip a body byte of a marked record -> nullopt
+```
+
+  And in `WorkerViewSetTest.cpp`: `CheckedWritesCheckpointMarkRegression.SplitterReturnsMarkedAndUnmarkedRecordsInFileOrder` (unmarked v1 O=3, marked v1 O=5, marked v2 O=6 concatenated → 3 spans, in order, `checkpointMarkOf` = U, S, S) and `CheckedWritesCheckpointMarkRegression.NewCheckpointsAreMarked` (a persisted Replace and a persisted aggregate view fold one record; the first `kDeltaMsgType` frame's delta bytes start with `0x534B4331` / `0x534B4332`). In `ViewSnapshotIoAgentTest.cpp`: `CheckedWritesCheckpointMarkRegression.MarkedDeltaIsPersisted` (a marked frame O=10 → `lastDurableOffset == 10`, the file replays with `mark == FoldSkipped`).
+
+- [ ] **Step 2: Write the failing reset tests** (`ViewSnapshotIoAgentTest.cpp`, suite `CheckedWritesAbortedFoldIoAgentRegression`, reusing the file's `TempDir`, `frameDelta`, `testLayout`, `readFile` and `ManualNanoClock` helpers, `:20-96`):
 
 ```cpp
 TEST(CheckedWritesAbortedFoldIoAgentRegression, ResetTruncatesTheFileRegression)
     // delta O=10 hp 42, durable; reset frame; doWork -> file size 0, lastDurableOffset == -1
 TEST(CheckedWritesAbortedFoldIoAgentRegression, ResetThenDeltaReplaysOnlyTheNewDeltaRegression)
-    // delta O=10 hp 42; reset; delta O=3 hp 7; drive to durable ->
-    // replay(file): exactly one record, O == 3, row 1 hp == 7; lastDurableOffset == 3 (never 10)
+    // delta O=10 hp 42; reset; marked delta O=3 hp 7; drive to durable ->
+    // replay(file): exactly one record, O == 3, mark == FoldSkipped, row 1 hp == 7; lastDurableOffset == 3 (never 10)
 TEST(CheckedWritesAbortedFoldIoAgentRegression, ResetRestartsTheDurableOffsetRegression)
     // delta O=10 durable; reset + delta O=3 written in one drain but the fsync window not yet due ->
     // lastDurableOffset == -1 (never 10) until the next grouped fsync, then 3
@@ -555,130 +607,171 @@ TEST(CheckedWritesAbortedFoldIoAgentRegression, ShortResetFrameIsDropped)
     // a 4-byte frame of type 4 -> no file, no crash
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [ ] **Step 3: Run to verify they fail**
 
-Run: `cmake --build build/root -j14 --target rune_node_tests && ctest --test-dir build/root -R CheckedWritesAbortedFoldIoAgent -j14 --output-on-failure`
-Expected: compile FAIL (`kResetMsgType`), then assertion FAIL (the drain ignores type 4).
+Run: `cmake --build build/root -j14 --target rune_view_tests rune_node_tests && ctest --test-dir build/root -R 'CheckedWritesCheckpointMark|CheckedWritesAbortedFoldIoAgent' -j14 --output-on-failure`
+Expected: compile FAIL (`CheckpointMark`, `kResetMsgType`), then assertion FAIL.
 
-- [ ] **Step 3: Implement.** The drain lambda (`:285-290`) dispatches type 4 to `handleResetFrame_`. `handleResetFrame_`: drop a frame shorter than `kDeltaHeaderBytes`; take the key's `FileState` through `fileFor_` (opens with `O_CREAT | O_WRONLY | O_APPEND`, so a reset of a new key creates an empty file), set `channelIdx`, then `::ftruncate(fd, 0)` and `rune::node::detail::platformFdatasync(fd)`. On success set `pendingO = lastDurableO = -1`, `dirtySinceSync = false`, `errored = false`, and log `spdlog::info("ViewSnapshotIoAgent: checkpoint reset viewTopicId={} partition={} (#537 refold)", …)`. On failure mark `errored = true` and log at error level with `std::strerror(errno)`, as the write-failure path does (`:184-196`). Writes after the truncation land at offset 0 because the fd is `O_APPEND`. Document the frame in the header comment of `ViewSnapshotChannel.h`.
+- [ ] **Step 4: Implement the marker** per AD5: the encoders write the magic chosen by `mark`; `applyDelta` / `applyMultiDelta` accept their two magics and set `AppliedDelta::mark`; `checkpointMarkOf` reads bytes 0..3 (fewer than 4 bytes → `Unmarked`); the splitter (`WorkerViewSet.cpp:219-222`) maps both v1 magics to `v1End` and both v2 magics to `v2End`; `peekDeltaOffset` (`ViewSnapshotIoAgent.cpp:55-66`) accepts the same pairs; `buildAndPushCheckpoint_` passes `CheckpointMark::FoldSkipped` (`WorkerViewSet.cpp:688`, `:715`). Update the format comments at `ViewCheckpoint.h:13-46` and `:108-115` ("a record whose magic is the `…Marked` value was written by a fold that skips aborted transactions (#537)").
 
-- [ ] **Step 4: Run the tests**
+- [ ] **Step 5: Implement the reset.** The drain lambda (`:285-290`) dispatches type 4 to `handleResetFrame_`. `handleResetFrame_`: drop a frame shorter than `kDeltaHeaderBytes`; take the key's `FileState` through `fileFor_` (opens with `O_CREAT | O_WRONLY | O_APPEND`, so a reset of a new key creates an empty file), set `channelIdx`, then `::ftruncate(fd, 0)` and `rune::node::detail::platformFdatasync(fd)`. On success set `pendingO = lastDurableO = -1`, `dirtySinceSync = false`, `errored = false`, and log `spdlog::info("ViewSnapshotIoAgent: checkpoint reset viewTopicId={} partition={} (#537 refold)", …)`. On failure mark `errored = true` and log at error level with `std::strerror(errno)`, as the write-failure path does (`:184-196`). Writes after the truncation land at offset 0 because the fd is `O_APPEND`. Document the frame in the header comment of `ViewSnapshotChannel.h`.
 
-Run: `ctest --test-dir build/root -R 'CheckedWritesAbortedFoldIoAgent|ViewSnapshotIoAgent' -j14 --output-on-failure`
-Expected: PASS.
+- [ ] **Step 6: Run the tests**
 
-- [ ] **Step 5: Commit**
+Run: `ctest --test-dir build/root -R 'CheckedWritesCheckpointMark|CheckedWritesAbortedFoldIoAgent|ViewSnapshotIoAgent|ViewCheckpoint|WorkerViewSet|ViewRecovery' -j14 --output-on-failure`
+Expected: PASS, every pre-existing checkpoint, splitter and recovery test unchanged.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add broker/libs/node/include/rune/node/ViewSnapshotChannel.h broker/libs/node/include/rune/node/ViewSnapshotIoAgent.h \
+git add broker/libs/view/include/rune/view/ViewCheckpoint.h broker/libs/view/src/ViewCheckpoint.cpp \
+        broker/libs/view/tests/view/ViewCheckpointTest.cpp broker/libs/node/src/WorkerViewSet.cpp \
+        broker/libs/node/tests/node/WorkerViewSetTest.cpp \
+        broker/libs/node/include/rune/node/ViewSnapshotChannel.h broker/libs/node/include/rune/node/ViewSnapshotIoAgent.h \
         broker/libs/node/src/ViewSnapshotIoAgent.cpp broker/libs/node/tests/node/ViewSnapshotIoAgentTest.cpp
-git commit -m "node: view snapshot IO agent truncates a checkpoint on a reset frame (#537)" \
+git commit -m "view, node: mark checkpoints folded with FoldSkip; reset frame truncates a checkpoint (#537)" \
            -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
-### Task 7: SD15 — discard and refold an untrusted checkpoint
+### Task 7: R15 — check a pre-fix checkpoint once, refold only when proven necessary
 
 **Files:**
-- Modify: `broker/libs/node/include/rune/node/WorkerViewSet.h:130-139` (`checkpointsDiscarded`), `:191-247` (`CheckpointStream`, `ViewInstance::checkpointStream`), `:312-313`, `:331-337` (public signatures), `:583-584` (`loadRecoveryCheckpoint_`), `:612-619` (flush an owed reset in `driveView_`), private `tryPushReset_`
+- Modify: `broker/libs/node/include/rune/node/WorkerViewSet.h:130-139` (`checkpointsDiscarded`, `checkpointsKeptUnverifiable`), `:191-247` (`CheckpointStream`, `ViewInstance::checkpointStream`), `:312-313`, `:331-337`, `:417-420` (public signatures), `:575`, `:583-584` (private signatures), `:612-619` (flush an owed reset in `driveView_`), private `tryPushReset_`, `applyRecovered_`
 - Modify: `broker/libs/node/src/WorkerViewSet.cpp:333-364`, `:442-517`, `:519-537`, `:539-591`, after `:741` (`tryPushReset_`)
-- Modify: `broker/libs/node/include/rune/node/Worker.h:6489` (pass `skip` to `materializeRecoveryInstancesFor`)
+- Modify: `broker/libs/node/include/rune/node/Worker.h:6422-6493` (read `sourceLogStart`; pass `skip` and it to `materializeRecoveryInstancesFor` and `driveFolds`)
+- Modify: `broker/libs/node/tests/support/AbortedFoldRig.h` (option `segmentBytes` for the disk log; `log()` accessor; `writeCheckpointFile(view, bytes)`)
 - Test: `broker/libs/node/tests/node/WorkerViewSetTest.cpp` (suite `CheckedWritesAbortedFoldViewSetRegression`), `broker/libs/node/tests/integration/AbortedFoldWorkerRegressionTest.cpp`
 
 **Interfaces:**
-- Consumes: `kResetMsgType` (Task 6); the threaded skip (Task 5).
+- Consumes: `CheckpointMark`, `checkpointMarkOf`, `kResetMsgType` (Task 6); the threaded skip (Task 5).
 - Produces:
   ```cpp
   enum class CheckpointStream : uint8_t { Live, ResetOwed };   // WorkerViewSet.h, before ViewInstance
   // ViewInstance: CheckpointStream checkpointStream = CheckpointStream::Live;
-  // ViewFoldCounters: uint64_t checkpointsDiscarded = 0;   // SD15: v1/v2 checkpoint discarded (aborted txns in the source log)
+  // ViewFoldCounters: uint64_t checkpointsDiscarded = 0;          // R15: unmarked checkpoint over an aborted range, refolded
+  //                   uint64_t checkpointsKeptUnverifiable = 0;   // R15: unmarked checkpoint kept, log start above 0 (WARN)
   void materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t partition, int64_t committedTail,
-                                       const rune::view::FoldSkip& skip = rune::view::kNoSkip);
+                                       const rune::view::FoldSkip& skip = rune::view::kNoSkip,
+                                       int64_t sourceLogStart = 0);
   void installViewForRecovery(rune::view::CompiledViewPlan plan, rune::view::RowLayout layout,
                               rune::codec::Descriptor evolvingSrc, bool persisted, int32_t partition,
                               std::span<const uint8_t> base,
                               std::span<const std::span<const uint8_t>> deltasInOrder, int64_t committedTail,
-                              const rune::view::FoldSkip& skip = rune::view::kNoSkip);
+                              const rune::view::FoldSkip& skip = rune::view::kNoSkip, int64_t sourceLogStart = 0);
+  template <class ReadRangeFn>
+  int driveFolds(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange, int64_t bound, int64_t nowNs,
+                 const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0, bool leaderHwConfirmed = true,
+                 const rune::view::FoldSkip& skip = rune::view::kNoSkip, int64_t sourceLogStart = 0);
   // private:
+  ViewInstance* getOrCreate_(int32_t viewTopicId, int32_t partition, int64_t committedTail,
+                             const rune::view::FoldSkip& skip, int64_t sourceLogStart);
   void loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopicId, int32_t partition,
-                               int64_t committedTail, const rune::view::FoldSkip& skip);
-  [[nodiscard]] bool tryPushReset_(ViewInstance& inst);   // false = ring full: hold, never drop
+                               int64_t committedTail, const rune::view::FoldSkip& skip, int64_t sourceLogStart);
   void applyRecovered_(ViewInstance& inst, std::span<const uint8_t> base,
                        std::span<const std::span<const uint8_t>> deltasInOrder, int64_t committedTail,
-                       const rune::view::FoldSkip& skip);   // the one recovery body (Step 4)
+                       const rune::view::FoldSkip& skip, int64_t sourceLogStart);   // the one recovery body (Step 4)
+  [[nodiscard]] bool tryPushReset_(ViewInstance& inst);   // false = ring full: hold, never drop
   ```
-  Test helpers (file-local in `WorkerViewSetTest.cpp`): `records(bytes)` splits a checkpoint with `splitViewCheckpointRecords`; `firstFrameType(OneToOneByteRing&)` drains exactly one frame (`limit = 1`) and returns its type, or −1 when the ring is empty; `drive(expr)` repeats a driver call until it returns 0, hard cap 64.
+  Test helpers (file-local in `WorkerViewSetTest.cpp`): `records(bytes)` splits a checkpoint with `splitViewCheckpointRecords`; `firstFrameType(OneToOneByteRing&)` drains exactly one frame (`limit = 1`) and returns its type, or −1 when the ring is empty; `drive(expr)` repeats a driver call until it returns 0, hard cap 64; `warnLines()` captures spdlog output with the sink pattern of `WorkerViewSetRegression.RecoveryLogsViewRecoveredLineRegression`.
 
-- [ ] **Step 1: Write the failing view-set tests** (`WorkerViewSetTest.cpp`, reusing its `tmpDir`, plan and `readRange` fixtures, `:150-200`). `idx` is a test-owned `rune::transaction::AbortedTxnIndex` with one range `onAbortMarker(7, 1, 2)`; `contaminated` is a v1 checkpoint record (`encodeDelta`) at O = 3 holding row key 2 hp 99, which the clean log (key 1 hp 5 @0, aborted txn key 2 @1, marker @2) never produces.
+- [ ] **Step 1: Write the failing view-set tests** (`WorkerViewSetTest.cpp`, reusing its `tmpDir`, plan and `readRange` fixtures, `:150-200`). The log is key 1 hp 5 @0, an aborted transaction writing key 2 @1, its abort marker @2. `idx` is a test-owned `rune::transaction::AbortedTxnIndex` with `onAbortMarker(7, 1, 2)`. `unmarked` is a default (`Unmarked`) v1 record at O = 3 holding key 1 hp 5 and key 2 hp 99 (what the pre-fix fold wrote); `marked` is the same entries with `CheckpointMark::FoldSkipped`.
 
 ```cpp
-TEST(CheckedWritesAbortedFoldViewSetRegression, UntrustedCheckpointIsDiscardedAndRefoldedRegression) {
-    vs.installViewForRecovery(plan, layout, src, /*persisted*/ true, 0, {}, records(contaminated), /*tail*/ 3,
-                              rune::view::FoldSkip{.aborted = &idx});
+TEST(CheckedWritesAbortedFoldViewSetRegression, UnmarkedCheckpointOverAnAbortedRangeIsDiscardedAndRefoldedRegression) {
+    vs.installViewForRecovery(plan, layout, src, /*persisted*/ true, 0, {}, records(unmarked), /*tail*/ 3,
+                              rune::view::FoldSkip{.aborted = &idx}, /*sourceLogStart*/ 0);
     EXPECT_EQ(vs.foldCursorForTest(kView, 0), 0) << "refold from the log start";
     EXPECT_EQ(vs.readiness(kView, 0), ViewReadiness::RebuildingViews);
     EXPECT_EQ(vs.foldCounters(kView, 0)->checkpointsDiscarded, 1u);
     drive(vs.driveRebuild(5, 0, readRange, 3, 0, nullptr, 0, true, rune::view::FoldSkip{.aborted = &idx}));
     EXPECT_EQ(slotOf(vs, kView, 0, 1, 1).i, 5);
-    EXPECT_EQ(rowOf(vs, kView, 0, 2), nullptr) << "the contaminated row survived the refold";
+    EXPECT_EQ(rowOf(vs, kView, 0, 2), nullptr) << "the aborted row survived the refold";
     EXPECT_EQ(firstFrameType(ch.deltas), ViewSnapshotChannel::kResetMsgType) << "reset precedes every delta";
 }
-TEST(CheckedWritesAbortedFoldViewSetRegression, CheckpointKeptWhenTheAbortedIndexIsEmptyRegression)
-    // empty index -> foldCursorForTest == 3, row 2 hp 99 kept (no discard), checkpointsDiscarded == 0, no reset frame
+TEST(CheckedWritesAbortedFoldViewSetRegression, MarkedCheckpointIsKeptEvenOverAnAbortedRangeRegression)
+    // records(marked), idx, logStart 0 -> foldCursorForTest == 3, checkpointsDiscarded == 0, no reset frame,
+    // rows replayed as stored (the marked writer never stores an aborted row; the fixture proves only "no refold")
+TEST(CheckedWritesAbortedFoldViewSetRegression, UnmarkedCheckpointWithoutAnAbortedRangeIsKeptRegression)
+    // records(unmarked), empty index -> foldCursorForTest == 3, checkpointsDiscarded == 0, no reset frame
+TEST(CheckedWritesAbortedFoldViewSetRegression, AbortedRangeAtOrAboveTheCheckpointOffsetKeepsItRegression)
+    // records(unmarked) at O = 3, idx = onAbortMarker(7, 3, 4) (the range starts at U) -> kept, no reset
+TEST(CheckedWritesAbortedFoldViewSetRegression, TruncatedLogKeepsTheCheckpointWarnsAndCountsRegression)
+    // records(unmarked), idx (range below U), sourceLogStart 1 -> foldCursorForTest == 3, rows 1 and 2 kept,
+    // checkpointsKeptUnverifiable == 1, checkpointsDiscarded == 0, no reset frame,
+    // exactly one warnLines() entry containing "VIEW-CHECKPOINT-UNVERIFIABLE" and "logStart=1"
+TEST(CheckedWritesAbortedFoldViewSetRegression, MixedFileIsJudgedByItsUnmarkedPrefixRegression)
+    // unmarked O=3 then marked O=6: idx range starting at 4 -> kept (foldCursorForTest == 6);
+    // idx range starting at 1 -> discarded
+TEST(CheckedWritesAbortedFoldViewSetRegression, OneRefoldThenNoneRegression)
+    // the discard case; run a ViewSnapshotIoAgent over the channel until lastDurableOffset == 3; a fresh view set
+    // recovers the file with the SAME idx and logStart 0 -> checkpointsDiscarded == 0, foldCursorForTest == 3,
+    // row 1 hp 5, row 2 absent, every split record has checkpointMarkOf == FoldSkipped
 TEST(CheckedWritesAbortedFoldViewSetRegression, TransientInstanceNeverDiscardsRegression)
-    // persisted=false, non-empty index -> no reset frame ever, checkpointsDiscarded == 0
+    // persisted=false, records(unmarked), idx -> no reset frame ever, checkpointsDiscarded == 0
 TEST(CheckedWritesAbortedFoldViewSetRegression, MaterializeFromFileDiscardsRegression)
-    // the contaminated record written to deltaFilePath(dir, kView, 0); recovery-flagged install on the install ring;
-    // materializeRecoveryInstancesFor(5, 0, 3, skip) -> as UntrustedCheckpoint…
+    // `unmarked` written to deltaFilePath(dir, kView, 0); recovery-flagged install on the install ring;
+    // materializeRecoveryInstancesFor(5, 0, 3, skip, 0) -> as the first test
 TEST(CheckedWritesAbortedFoldViewSetRegression, LazyRecoveryOfASecondPartitionAlsoDiscardsRegression)
-    // the ViewRecoveryRegressionTest.cpp:345 Bug-A ordering over partitions {0,1}, both files contaminated:
-    // partition 0 rebuilt to Ready (prunes recoveryViews_), partition 1 created by driveFolds(…, skip) only ->
-    // partition 1 discarded (checkpointsDiscarded == 1), its contaminated row absent once caught up
-TEST(CheckedWritesAbortedFoldViewSetRegression, AggregateUntrustedCheckpointIsDiscardedRegression)
-    // a v2 (encodeMultiDelta) contaminated record for a Count(*) view -> all four tables refolded, group of key 2 absent
+    // the ViewRecoveryRegressionTest.cpp:345 Bug-A ordering over partitions {0,1}, both files `unmarked`:
+    // partition 0 rebuilt to Ready (prunes recoveryViews_), partition 1 created by driveFolds(…, skip, 0) only ->
+    // partition 1 discarded (checkpointsDiscarded == 1), its aborted row absent once caught up
+TEST(CheckedWritesAbortedFoldViewSetRegression, AggregateUnmarkedCheckpointIsDiscardedRegression)
+    // an unmarked v2 (encodeMultiDelta) record for a Count(*) view counting the aborted record -> all four tables
+    // refolded, the aborted record's group absent
 TEST(CheckedWritesAbortedFoldViewSetRegression, ResetHeldUnderBackPressurePrecedesEveryDeltaRegression)
     // fill ch.deltas with filler frames until tryClaim fails; drive 4 passes -> foldCursorForTest == 0 (nothing folded
-    // while the reset is held); drain the ring; drive -> the first frame for (kView,0) is type 4, then deltas
-TEST(CheckedWritesAbortedFoldViewSetRegression, RefoldedFileReplaysCleanWithoutTheIndexRegression)
-    // after the refold, run a ViewSnapshotIoAgent over the channel to durable; then a fresh view set recovers the
-    // file with kNoSkip (retention pruned the range) -> row 2 absent, row 1 hp 5, foldCursorForTest == 3
+    // while the reset is held); drain the ring; drive -> the first frame for (kView,0) is type 4, then marked deltas
 ```
 
 - [ ] **Step 2: Write the failing worker tests** (`AbortedFoldWorkerRegressionTest.cpp`):
 
 ```cpp
 TEST(CheckedWritesAbortedFoldWorkerRegression, ContaminatedCheckpointIsDiscardedAndRefoldedRegression)
-    // Disk: put(1,5); txnPut(7,{2,9}); abort(7); caught up; stop the rig; overwrite the projection's checkpoint file
-    // (io().deltaFilePathForTest) with a v1 record at O = leo() holding key 2 hp 9 (what the pre-fix fold wrote);
-    // new Rig over the dir with a recovery install; caught up ->
-    // hp(2)==nullopt, hp(1)==5, foldCounters->checkpointsDiscarded==1, the file replays to the same table
+    // Disk: put(1,5); txnPut(7,{2,9}); abort(7); caught up; stop the rig; writeCheckpointFile(kProj, an UNMARKED v1
+    // record at O = leo() holding key 1 hp 5 and key 2 hp 9 — what the pre-fix fold wrote); new Rig over the dir
+    // with a recovery install; caught up -> hp(2)==nullopt, hp(1)==5, checkpointsDiscarded==1.
+    // Stop and restart once more -> checkpointsDiscarded==0, the recovered cursor == leo() before any fold,
+    // hp(2)==nullopt (one refold, then none)
 TEST(CheckedWritesAbortedFoldWorkerRegression, ContaminatedAggregateCheckpointIsDiscardedAndRefoldedRegression)
-    // the same for installCountByHp with a v2 record counting the aborted record -> count(9)==nullopt, count(5)==1
+    // the same for installCountByHp with an unmarked v2 record counting the aborted record ->
+    // count(9)==nullopt, count(5)==1; the second restart refolds nothing
 TEST(CheckedWritesAbortedFoldWorkerRegression, CheckpointKeptWhenTheLogHasNoAbortedTxnRegression)
-    // Disk, only commits; restart -> checkpointsDiscarded==0 and the recovered foldCursorForTest equals the
-    // pre-restart cursor before any new fold (checkpoint used, nothing refolded)
+    // Disk, only commits; writeCheckpointFile(an unmarked record equal to the real state at O = leo()); restart ->
+    // checkpointsDiscarded==0, recovered cursor == leo() before any fold
+TEST(CheckedWritesAbortedFoldWorkerRegression, MarkedCheckpointNeverRefoldsAcrossRestartsRegression)
+    // Disk: put(1,5); txnPut(7,{2,9}); abort(7); put(3,5); caught up (the fixed code writes marked records);
+    // restart twice -> each time checkpointsDiscarded==0 and the recovered cursor == leo() before any fold;
+    // hp(2)==nullopt, count(5)==2
+TEST(CheckedWritesAbortedFoldWorkerRegression, RetentionTruncatedLogKeepsTheUnmarkedCheckpointRegression)
+    // Disk with segmentBytes small enough that every batch rolls a segment: put(1,5); txnPut(7,{2,9}); abort(7);
+    // put(3,5); caught up; stop; writeCheckpointFile(unmarked record at O = leo() holding keys 1, 2, 3);
+    // reopen the log and log().deleteOldSegments(/*retainBytes*/ 0, leo()) so logStartOffset() > 0; restart ->
+    // checkpointsKeptUnverifiable==1, checkpointsDiscarded==0, hp(1)==5 and hp(3)==5 kept (no row dropped by the
+    // restart), hp(2)==9 (the unverifiable residual, filed in Task 11)
 ```
 
 - [ ] **Step 3: Run to verify they fail**
 
 Run: `cmake --build build/root -j14 --target rune_node_tests rune_checked_writes_aborted_fold_tests && ctest --test-dir build/root -R 'CheckedWritesAbortedFold(ViewSet|Worker)' -j14 --output-on-failure`
-Expected: compile FAIL on the new parameters and members, then FAIL on `checkpointsDiscarded` and the contaminated-row assertions.
+Expected: compile FAIL on the new parameters and members, then FAIL on the counters and the aborted-row assertions.
 
-- [ ] **Step 4: Implement the discard.** One private helper `void applyRecovered_(ViewInstance& inst, std::span<const uint8_t> base, std::span<const std::span<const uint8_t>> deltas, int64_t committedTail, const rune::view::FoldSkip& skip)` replaces the two identical bodies (`WorkerViewSet.cpp:524-536` and `:580-590`). When `inst.persisted && skip.aborted != nullptr && skip.aborted->size() != 0` (AD5) it skips `replayInstance`, keeps the empty tables, sets `foldCursor = 0`, `lastEncodedO = -1`, `transientCursor` unchanged (`CursorFresh`), `checkpointStream = CheckpointStream::ResetOwed`, `++counters.checkpointsDiscarded`, and logs once `spdlog::info("VIEW-CHECKPOINT-DISCARDED view={} partition={} abortedRanges={} — the source log holds aborted transactions; refolding from the log start (#537)", …)`. Otherwise it runs today's replay path. Both paths end with today's readiness rule (`foldCursor >= committedTail` → Ready, else RebuildingViews). `materializeRecoveryInstancesFor` and `installViewForRecovery` forward `skip`; `getOrCreate_` passes its `skip` to `loadRecoveryCheckpoint_`; `Worker::driveViewsOf_` passes `skip` to `materializeRecoveryInstancesFor` (`Worker.h:6489`).
+- [ ] **Step 4: Implement the AD5a rule.** One private `applyRecovered_` replaces the two identical bodies (`WorkerViewSet.cpp:524-536` and `:580-590`). For a persisted instance it first computes `U` (the highest O of the records whose `checkpointMarkOf` is `Unmarked`, O read at byte 4; −1 if none), then takes the first matching row of the AD5a table: replay as today, keep with the WARN and `++counters.checkpointsKeptUnverifiable`, or discard (skip `replayInstance`, keep the empty tables, `foldCursor = 0`, `lastEncodedO = -1`, `transientCursor` unchanged (`CursorFresh`), `checkpointStream = CheckpointStream::ResetOwed`, `++counters.checkpointsDiscarded`, the INFO line). Transient instances always replay as today. Every path ends with today's readiness rule (`foldCursor >= committedTail` → Ready, else RebuildingViews). `materializeRecoveryInstancesFor` and `installViewForRecovery` forward `skip` and `sourceLogStart`; `driveFolds` passes them to `getOrCreate_`, which passes them to `loadRecoveryCheckpoint_`. In `Worker::driveViews_` read `sourceLogStart` next to the bound (`log->logStartOffset()` in the disk branch, `mem->logStartOffset()` in the memory branch) and pass `skip, sourceLogStart` through `driveViewsOf_` to `materializeRecoveryInstancesFor` (`:6489`) and `driveFolds` (`:6492`).
 
 - [ ] **Step 5: Implement the owed reset.** In `driveView_`, before step 1 (`:616`): `if (inst.checkpointStream == CheckpointStream::ResetOwed) { ++work; if (!tryPushReset_(inst)) return work; inst.checkpointStream = CheckpointStream::Live; }`. `tryPushReset_` claims `kDeltaHeaderBytes` with `kResetMsgType` on `channel_.deltas`, writes the two ids as `tryPushDelta_` does (`WorkerViewSet.cpp:724-741`), commits, and returns false on a failed claim. No allocation.
 
 - [ ] **Step 6: Run the tests**
 
-Run: `ctest --test-dir build/root -R 'CheckedWritesAbortedFold|WorkerViewSet|ViewRecovery|ViewReadiness|ViewSnapshotIoAgent|WorkerRegression|GetViewRow|CreateView' -j14 --output-on-failure`
-Expected: PASS. Mutation check (do it, then revert): make the AD5 predicate `false` → `UntrustedCheckpoint…`, `MaterializeFromFile…`, `LazyRecovery…`, `Aggregate…` and both `Contaminated…` tests turn red; drop the reset push → `ResetHeld…` and `RefoldedFileReplaysClean…` turn red.
+Run: `ctest --test-dir build/root -R 'CheckedWritesAbortedFold|CheckedWritesCheckpointMark|WorkerViewSet|ViewRecovery|ViewReadiness|ViewSnapshotIoAgent|WorkerRegression|GetViewRow|CreateView' -j14 --output-on-failure`
+Expected: PASS. Mutation checks (do each, then revert): drop the `U < 0` row (treat marked records as unmarked) → `MarkedCheckpointIsKept…`, `OneRefoldThenNone…` and `MarkedCheckpointNeverRefolds…` turn red; drop the `sourceLogStart > 0` row → `TruncatedLog…` and `RetentionTruncatedLog…` turn red; make the discard row never match → `UnmarkedCheckpointOverAnAbortedRange…`, `MaterializeFromFile…`, `LazyRecovery…`, `Aggregate…` and both `Contaminated…` turn red; drop the reset push → `ResetHeld…` and `OneRefoldThenNone…` turn red.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add broker/libs/node/include/rune/node/WorkerViewSet.h broker/libs/node/src/WorkerViewSet.cpp \
         broker/libs/node/include/rune/node/Worker.h broker/libs/node/tests/node/WorkerViewSetTest.cpp \
+        broker/libs/node/tests/support/AbortedFoldRig.h \
         broker/libs/node/tests/integration/AbortedFoldWorkerRegressionTest.cpp
-git commit -m "node: SD15 - discard and refold a view checkpoint over aborted transactions (#537)" \
+git commit -m "node: refold a pre-fix view checkpoint once, only over a proven aborted range (#537)" \
            -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
@@ -710,7 +803,8 @@ TEST(CheckedWritesAbortedFoldBrokerRegression, AbortedTransactionNeverReachesPro
     //    getViewRow(n_by_hp,5).n == 1
 TEST(CheckedWritesAbortedFoldBrokerRegression, FullClusterRestartRebuildSkipsTheAbortedRangeRegression)
     // the writes above; stop(1..3); startNode(1..3); await the catalog leader and the partition leader ->
-    // the same three reads, through a fresh client (rebuild + SD15 refold on the new leader)
+    // the same three reads, through a fresh client (rebuild on the new leader; its checkpoint is marked, so it is
+    // kept and only the tail is folded)
 TEST(CheckedWritesAbortedFoldBrokerRegression, LeaderFailoverWithAnOpenTransactionThatLaterAbortsRegression)
     // the client is seeded on a broker other than the source leader; producer "a2": begin, send (7,9),
     // flushAndWait (the record is on the log, the txn open); crash(source leader);
@@ -746,7 +840,7 @@ git commit -m "test: aborted transactions never reach views on three real broker
 - Produces (probe, file-local): `static bool txnCharacters(Client&, const TopicHandle&, const std::string& txnId, std::span<const std::pair<int64_t,int64_t>> idHp, bool commit, int timeoutMs)` and `static bool txnOrders(Client&, const TopicHandle&, const std::string& txnId, std::span<const std::array<int64_t,3>> orderUserAmount, bool commit, int timeoutMs)`. Exit codes **170–175** (setup) and **176–179** (`verify_restart`); confirm they are unused with `grep -n "return 17[0-9];" client-cpp/examples/view_probe.cpp` (0 hits today).
 
 - [ ] **Step 1: Add the setup leg "8. #537: views skip aborted transactions".** On `character`: `txnCharacters("e2e-537-abort", {(5370, 1), (4242, 999)}, abort)` (170), `txnCharacters("e2e-537-commit", {(5371, 7)}, commit)` (171); `waitForHp(char_persisted, 5371, 7)` and `waitForHp(char_transient, 5371, 7)` (172); then `char_persisted` and `char_transient` keep `4242 → hp 100` and answer `kAbsentKey` for 5370 (173). On `order`: `txnOrders("e2e-537-orders", {(9, 100, 1000), (1, 100, 9999)}, abort)` (174), then the committed witness `sendOrder(c, ordTh, 10, 300, 1)` and `waitForTotals(u300, {1, 1, 1.0, 1, 1, 1})`, followed by `waitForTotals(u100, {3, 85, 85.0 / 3, 50, 5, 5})` (175). The witness goes to a new user on purpose: any committed write to u100 would change its `Last` column, which `verify_restart` check 41 pins at 5. Print `ABORTED-FOLD: OK` on stdout before `VIEW-PROBE-SETUP: OK`.
-- [ ] **Step 2: Add the `verify_restart` checks** right after the `user_totals` recovery check (`:1471-1473`) and before the post-restart writes: `char_persisted` 5370 → `kAbsentKey` and 5371 → hp 7 (176), `char_persisted` 4242 → hp 100 is already check (a); `user_totals` u100 is already check 41 (the SD15 refold must reproduce it exactly). Print `ABORTED-FOLD-RESTART: OK` before `VIEW-ENGINE-E2E: OK`.
+- [ ] **Step 2: Add the `verify_restart` checks** right after the `user_totals` recovery check (`:1471-1473`) and before the post-restart writes: `char_persisted` 5370 → `kAbsentKey` and 5371 → hp 7 (176), `char_persisted` 4242 → hp 100 is already check (a); `user_totals` u100 is already check 41. The checkpoints were written by the fixed code, so they are marked and kept (no refold); these checks prove a marked checkpoint over an aborted range recovers exact rows. Print `ABORTED-FOLD-RESTART: OK` before `VIEW-ENGINE-E2E: OK`.
 - [ ] **Step 3: Assert the sentinels in the script**: `grep -q "ABORTED-FOLD: OK"` on `setup_out` (fail message "setup client did not print the 'ABORTED-FOLD: OK' sentinel") and `grep -q "ABORTED-FOLD-RESTART: OK"` on `restart_out`. Add both legs to the header comment.
 - [ ] **Step 4: Build the probe locally**
 
@@ -755,7 +849,7 @@ Expected: builds clean.
 
 - [ ] **Step 5: Docs.**
   - `docs/api/client-cpp.md`, new bullet: "- Views fold committed data only. The records of an aborted transaction never reach a view (a row, a `count(*)`, a `Min`/`Max`), on the live fold, after a restart and after a failover."
-  - `docs/operations.md`, "Upgrades", new bullet: "- **Views over partitions with aborted transactions.** On the first start of a build with the #537 fix (and on every restart while the source log still holds an aborted transaction), a persisted view whose source partition holds an aborted transaction discards its checkpoint and rebuilds from the log start. Its reads answer `NotReady` until the rebuild ends. The rebuilt view equals a fresh fold of the retained log, so rows whose source records retention already deleted are gone afterwards."
+  - `docs/operations.md`, "Upgrades", new bullet: "- **View checkpoints written before the #537 fix.** Checkpoints written by a build with the fix are marked. On the first start of such a build, a persisted view whose checkpoint is unmarked is checked once against its source partition. If the log still starts at offset 0 and holds an aborted transaction inside what the checkpoint covers, the view discards the checkpoint and rebuilds from the log start; its reads answer `NotReady` until the rebuild ends, and its new checkpoint is marked, so later restarts never rebuild it. If the log no longer starts at 0 (retention or delete-records removed its start), the checkpoint is kept as it is, the broker logs the WARN `VIEW-CHECKPOINT-UNVERIFIABLE` and raises the view's `checkpointsKeptUnverifiable` counter: a restart never drops view rows. Such a view may still hold rows of a transaction that aborted before the upgrade. Rolling back to an older build is safe: it reads a checkpoint up to the first marked record and refolds the rest from the log."
 - [ ] **Step 6: Commit**
 
 ```bash
@@ -772,16 +866,15 @@ git commit -m "e2e, docs: views skip aborted transactions across a restart (#537
 - [ ] **Step 4: Latency gates** on an idle host: `ctest --test-dir build/rel -L latency --output-on-failure`. Expected: PASS.
 - [ ] **Step 5: Docker e2e on the VM**: in your own directory, `flock /root/vm.lock bash broker/docker/view-engine-e2e.sh`, checking `df` before and after and removing only your own containers and images. Expected: `ABORTED-FOLD: OK`, `ABORTED-FOLD-RESTART: OK` and `VIEW-ENGINE-E2E: OK`, exit 0.
 - [ ] **Step 6: File the deferred items** as labelled issues on `arcanumruna/rune` (dedupe with `gh issue list --search` first; one summary at the end):
-  1. `bug`, `sev:medium`, `area:views`: a pre-fix v1/v2 checkpoint is still trusted when retention or compaction removed the whole aborted range (data and marker) before the first restart on a fixed build; the checkpoint's aborted rows survive. Closed by Part 07's checkpoint v3 if v3 lets recovery tell pre-fix checkpoints apart. Test reference: `CheckedWritesAbortedFoldViewSetRegression.RefoldedFileReplaysCleanWithoutTheIndexRegression` (the clean case); Origin: Part 01 plan, SD15.
-  2. `enhancement`, `sev:low`, `area:views`: SD15 refolds a persisted view from the log start on **every** restart while its source log holds any aborted transaction; with checkpoint v3 provenance the refold is needed once. Origin: Part 01 plan, SD15.
+  1. `bug`, `sev:medium`, `area:views`: an unmarked (pre-fix) checkpoint is kept unverified when the log no longer starts at 0 (`checkpointsKeptUnverifiable`, WARN `VIEW-CHECKPOINT-UNVERIFIABLE`), and also when the cleaner has removed an aborted transaction's data and marker, so the aborted index no longer shows the range. Such a view may still show rows of a transaction that aborted before the upgrade. A fix needs a per-key re-verification or an operator-run refold command. Test reference: `CheckedWritesAbortedFoldWorkerRegression.RetentionTruncatedLogKeepsTheUnmarkedCheckpointRegression` (`broker/libs/node/tests/integration/AbortedFoldWorkerRegressionTest.cpp`); Origin: Part 01 plan, ruling R15 (2).
 - [ ] **Step 7: Open the PR** from `feature/checked-writes-01-aborted-fold` to `main` (only once the owner has agreed to pushes for this program; never push otherwise). Body: summary, "Fixes #537", the bench table, the e2e output lines, the deviations list (empty if none), and the trailer `🤖 Generated with [Claude Code](https://claude.com/claude-code)`. The reviewer (most capable model) reviews the whole views fold area, approves, merges and closes #537 with `gh issue close 537 -c "Fixed in <sha>: views skip aborted transactions and refold untrusted checkpoints (regression: CheckedWritesAbortedFold*)"`.
 
 ---
 
 ## Self-review (done while writing)
 
-- **Spec coverage.** §8.8 last bullet → Tasks 1, 2, 5. §16 item 1 "and re-fold" → Task 7 (SD15). #537 fix direction: the predicate from the source partition's `RcState` → Task 5 (AD4); projection, aggregate, rebuild and transient folds → Tasks 1, 2, 5 (one `driveView_` serves all four); tests for commit and abort, two interleaved producers, an abort spanning a capped pass, restart rebuild over an aborted range, leader failover with an open transaction that later aborts → Tasks 1–3, 5, 7, 9; "existing persisted views may need a re-fold" → Task 7 and the docs in Task 10. C9.2 (header, member, `kNoSkip`, link) → Task 1. Hand-over "a view over an aborted transaction equals a fresh refold" → the matrix and model invariants (Task 3) and `RefoldedFileReplaysClean…` (Task 7).
+- **Spec coverage.** §8.8 last bullet → Tasks 1, 2, 5. §16 item 1 "and re-fold" → Tasks 6 and 7 (R15: the marker, the once-only check, no refold on a truncated log). #537 fix direction: the predicate from the source partition's `RcState` → Task 5 (AD4); projection, aggregate, rebuild and transient folds → Tasks 1, 2, 5 (one `driveView_` serves all four); tests for commit and abort, two interleaved producers, an abort spanning a capped pass, restart rebuild over an aborted range, leader failover with an open transaction that later aborts → Tasks 1–3, 5, 7, 9; "existing persisted views may need a re-fold" → Task 7 and the docs in Task 10. C9.2 (header, member, `kNoSkip`, link) → Task 1. Hand-over "a view over an aborted transaction equals a fresh refold" → the matrix and model invariants (Task 3) and `RefoldedFileReplaysClean…` (Task 7).
 - **Step scan.** Every code step names the file, the signature and the values (AD1–AD7); bodies are left to the implementer except the AD2 branch rules and the CMake block. Test steps carry the assertions with values. Task 10 Step 1 records one real open question (the probe's MRU expectations) with both options and how to decide.
-- **Type consistency.** `FoldSkip`, `kNoSkip`, `isAbortedBatch`, `skippedAborted`, `checkpointsDiscarded`, `CheckpointStream::{Live, ResetOwed}`, `kResetMsgType`, `foldCursorForTest`, `tryPushReset_`, `applyRecovered_` are spelled the same in every task. The skip parameter is last everywhere, defaulted only on the four public `WorkerViewSet` entry points.
+- **Type consistency.** `FoldSkip`, `kNoSkip`, `isAbortedBatch`, `skippedAborted`, `checkpointsDiscarded`, `checkpointsKeptUnverifiable`, `CheckpointMark::{Unmarked, FoldSkipped}`, `kViewCheckpointMagicMarked`, `kViewCheckpointMagicV2Marked`, `checkpointMarkOf`, `sourceLogStart`, `CheckpointStream::{Live, ResetOwed}`, `kResetMsgType`, `foldCursorForTest`, `tryPushReset_`, `applyRecovered_` are spelled the same in every task. The skip parameter is last everywhere, defaulted only on the four public `WorkerViewSet` entry points.
 - **Review Focus.** Five lines, each with its test added to the owning task (1, 2, 6, 7).
-- **Proportion.** About 790 lines (the spec is about 1000) for a three-phase part touching two fold loops, the view-set recovery and one IO message; code blocks are signatures, test assertions and one CMake block.
+- **Proportion.** About 880 lines (the spec is about 1000) for a three-phase part touching two fold loops, the view-set recovery and one IO message; code blocks are signatures, test assertions and one CMake block.
