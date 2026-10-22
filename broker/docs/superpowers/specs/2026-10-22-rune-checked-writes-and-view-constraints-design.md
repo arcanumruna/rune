@@ -769,6 +769,11 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 - a predicate failing on a row that is already over its limit: a rename passes, a create fails, a delete passes
 - a transactional and an atomic batch on a constrained source are refused; on an unconstrained source they work as today
 - verdict lag while a constraint view builds: delivery waits, writes don't
+- failover right after a constraint-set change record: the new leader judges every offset with the same set as the old one
+- a new leader that hasn't installed the view named by a change record waits rather than judging
+- a delete that would break `check (balance >= 0)` is rejected; a delete in a group already over its limit passes
+- a batch mixing key-0 creates with other records is refused
+- a retry after failover and compaction still returns its ids
 
 **Autoincrement:**
 - 1 record and k records per batch
