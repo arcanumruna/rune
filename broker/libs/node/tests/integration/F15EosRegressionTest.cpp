@@ -948,6 +948,50 @@ TEST(MarkerRetryRegression, EndTxnWaitingForItsPrepareRecordIsAnsweredOkWhenTheR
     EXPECT_EQ(T.controlFrames.size(), 1u) << "the EndTxn was answered more than once";
 }
 
+// #556: a Prepare* append refused (__transaction_state ISR < minIsr) used to leave the EndTxn unanswered (gate pushed,
+// return 0).  Now it is answered NotCoordinator (retriable) like every refused put, the coordinator keeps appending the
+// decision and dispatches the markers once it commits; retries see 27 until the markers land, then the idempotent OK.
+static void endTxnWithRefusedPrepareIsAnsweredRetriably(bool commit) {
+    TxnRig T(/*minIsr=*/1, /*withStore=*/true);
+    const int64_t rcSub = T.m.subscribe(T.sid, /*read_committed*/1);
+    ASSERT_GT(rcSub, 0);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
+    T.stateReplica->setMinIsrForTest(2);                     // ISR {1} < 2: every __transaction_state append refused
+    const tx::TxnState prepare = commit ? tx::TxnState::PrepareCommit : tx::TxnState::PrepareAbort;
+    const tx::TxnState complete = commit ? tx::TxnState::CompleteCommit : tx::TxnState::CompleteAbort;
+    ASSERT_EQ(T.endTxn(commit), kNotCoordinator) << "a refused Prepare* append must be answered NotCoordinator, not deferred";
+    int64_t now = 10;
+    for (int i = 0; i < 300; ++i, now += 10'000'000) { (void)T.tcs->doWork(now); T.m.runWorker(now); }   // 3 s
+    EXPECT_TRUE(T.controlFrames.empty()) << "an unsolicited EndTxn frame was sent while the append is refused";
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), prepare);
+    EXPECT_EQ(T.endTxn(commit), kConcurrent) << "a same-direction retry sees ConcurrentTransactions";
+
+    T.stateReplica->setMinIsrForTest(1);                     // the decision can be made durable now
+    int i = 0;
+    for (; i < 400 && T.tcs->txnStateForTest(T.txnId) != complete; ++i, now += 50'000'000) {
+        (void)T.tcs->doWork(now);
+        T.m.runWorker(now);
+    }
+    ASSERT_LT(i, 400) << "the markers never landed once the Prepare* append could commit";
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), complete);
+    EXPECT_EQ(T.endTxn(commit), 0) << "the retry is answered with the idempotent OK";
+    T.m.push(16, now);
+    EXPECT_EQ(T.m.delivered(rcSub, 0), commit) << "read_committed visibility of the batch";
+    EXPECT_TRUE(T.controlFrames.empty()) << "an unsolicited EndTxn frame for the original request";
+}
+
+TEST(MarkerRetryRegression, EndTxnWhosePrepareAppendIsRefusedIsAnsweredRetriablyRegression) {
+    endTxnWithRefusedPrepareIsAnsweredRetriably(/*commit=*/true);
+}
+
+TEST(MarkerRetryRegression, EndTxnAbortWhosePrepareAppendIsRefusedIsAnsweredRetriablyRegression) {
+    endTxnWithRefusedPrepareIsAnsweredRetriably(/*commit=*/false);
+}
+
 // ============================================================================
 // I4 (+m3, m4) — coordinator failover, durable completion, EndTxn table.
 // ============================================================================
@@ -6450,4 +6494,252 @@ TEST(TxnCoordinatorLoadRegression, ReloadBetweenTheEarlyOkAndTheMarkerRedrivesIt
     EXPECT_EQ(T.m.r->log()->logEndOffset(), 2) << "exactly one COMMIT marker";
     EXPECT_TRUE(T.controlFrames.empty());
     EXPECT_EQ(T.endTxn(/*commit=*/true), 0);
+}
+
+// ============================================================================
+// Adversarial review of PR #561 (#556): an EndTxn whose Prepare* append to __transaction_state is refused (ISR <
+// minIsr) is answered NotCoordinator at once and its gate stays queued (respond=false) so the coordinator keeps
+// driving the decision.  Every sibling refused-put path is answered, a coordinator unload before durability answers
+// nothing twice and re-decides from the log, and every decision writes exactly one marker.
+// ============================================================================
+namespace {
+// An Ongoing transaction with one data batch at offset 0 of the data partition; returns the read_committed sub.
+int64_t ongoingWithOneBatch556(TxnRig& T) {
+    const int64_t rcSub = T.m.subscribe(T.sid, /*read_committed*/1);
+    EXPECT_GT(rcSub, 0);
+    EXPECT_EQ(T.initPid(), 0);
+    EXPECT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 1);
+    return rcSub;
+}
+int64_t drivePasses556(TxnRig& T, int64_t now, int passes) {
+    for (int i = 0; i < passes; ++i, now += 10'000'000) { (void)T.tcs->doWork(now); T.m.runWorker(now); }
+    return now;
+}
+}  // namespace
+
+// Coordinator unload (leadership lost) while the respond=false gate of a refused PrepareCommit is queued: nothing is
+// answered a second time, no marker is written, and the reload folds the durable log - the transaction is Ongoing
+// again (the decision was never durable), so the client's retried EndTxn decides afresh, in either direction.
+static void unloadBeforeTheRefusedPrepareIsDurable556(bool retryCommit) {
+    TxnRig T(/*minIsr=*/1, /*withStore=*/true);
+    const int64_t rcSub = ongoingWithOneBatch556(T);
+    T.stateReplica->setMinIsrForTest(2);                     // ISR {1} < 2: every __transaction_state append refused
+    ASSERT_EQ(T.endTxn(/*commit=*/true), kNotCoordinator) << "the refused PrepareCommit must be answered at once";
+    ASSERT_EQ(T.tcs->prepareGates(), 1u) << "precondition: the decision is still driven by the coordinator";
+    int64_t now = drivePasses556(T, 10, 20);
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 1) << "a marker was written ahead of a durable PrepareCommit";
+
+    T.leader = false;                                        // deposed before the decision was durable
+    now = drivePasses556(T, now, 2);
+    EXPECT_EQ(T.tcs->prepareGates(), 0u) << "the unload kept the gate";
+    EXPECT_TRUE(T.controlFrames.empty()) << "the unload answered the already-answered EndTxn a second time";
+
+    T.stateReplica->setMinIsrForTest(1);
+    T.leader = true;                                         // re-elected over the same (durable) log
+    now = drivePasses556(T, now, 2);
+    ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::Ongoing)
+        << "the reload must fold the durable state: the refused PrepareCommit never reached the log";
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 1) << "the reload wrote a marker for an undecided transaction";
+
+    EXPECT_EQ(T.endTxn(retryCommit), 0) << "the retried EndTxn decides again";
+    now = driveUntilCompleted(T, now);
+    const auto complete = retryCommit ? tx::TxnState::CompleteCommit : tx::TxnState::CompleteAbort;
+    ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), complete);
+    const auto* meta = T.store->get(T.txnId);
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(meta->state, complete) << "the completion is durable";
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 2) << "exactly one marker for the decision";
+    T.m.push(16, now);
+    EXPECT_EQ(T.m.delivered(rcSub, 0), retryCommit) << "read_committed visibility follows the RETRIED decision";
+    EXPECT_EQ(T.endTxn(retryCommit), 0) << "the same-direction retry after completion is the idempotent OK";
+    EXPECT_EQ(T.endTxn(!retryCommit), kInvalidTxnState) << "the opposite direction after completion";
+    EXPECT_TRUE(T.controlFrames.empty()) << "an unsolicited EndTxn frame";
+}
+
+TEST(EndTxnRefusedPrepareRegression, UnloadBeforeDurableThenSameDirectionRetryCommitsAdversarialRegression) {
+    unloadBeforeTheRefusedPrepareIsDurable556(/*retryCommit=*/true);
+}
+
+TEST(EndTxnRefusedPrepareRegression, UnloadBeforeDurableThenOppositeDirectionRetryAbortsAdversarialRegression) {
+    unloadBeforeTheRefusedPrepareIsDurable556(/*retryCommit=*/false);
+}
+
+// The gate's own re-append is ACCEPTED but not committed yet when the coordinator is deposed; the follower holds it,
+// so the next load finds PrepareCommit and re-drives the SAME decision: the client (told NotCoordinator) sees 27
+// then the idempotent OK, an abort retry is refused 19, and exactly one COMMIT marker is written.
+TEST(EndTxnRefusedPrepareRegression, GateAppendAcceptedThenFailoverRedrivesTheSameDecisionAdversarialRegression) {
+    TxnRig T(/*minIsr=*/1, /*withStore=*/true, {}, /*isr=*/{1}, /*stateIsr=*/{1, 2});
+    const int64_t rcSub = T.m.subscribe(T.sid, /*read_committed*/1);
+    ASSERT_GT(rcSub, 0);
+    int64_t now = 1;
+    (void)T.tcs->doWork(now);
+    int16_t ipErr = T.initPid();
+    for (int i = 0; i < 4 && ipErr == kConcurrent; ++i) {    // the pid ceiling commits first
+        T.commitState(++now);
+        (void)T.tcs->doWork(++now);
+        ipErr = T.initPid();
+    }
+    ASSERT_EQ(ipErr, -1) << "precondition: the InitProducerId answer waits for its record";
+    T.controlFrames.clear();
+    T.commitState(++now);
+    (void)T.tcs->doWork(++now);
+    ASSERT_EQ(T.controlFrames.size(), 1u);
+    const auto ip = pc::InitProducerIdResponse::decode(T.controlFrames[0].data(), T.controlFrames[0].size());
+    ASSERT_TRUE(ip && ip->errorCode == 0);
+    T.pid = ip->producerId; T.epoch = ip->producerEpoch;
+    ASSERT_EQ(T.addPartition(), -1);
+    T.commitState(++now);
+    (void)T.tcs->doWork(++now);
+    ASSERT_EQ(T.controlFrames.size(), 2u);
+    T.controlFrames.clear();
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(++now);
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
+
+    T.stateReplica->setMinIsrForTest(3);                     // ISR {1, 2} < 3: refused
+    ASSERT_EQ(T.endTxn(/*commit=*/true), kNotCoordinator);
+    ASSERT_EQ(T.tcs->prepareGates(), 1u);
+    const int64_t leoBefore = T.stateReplica->logEndOffset();
+    T.stateReplica->setMinIsrForTest(2);                     // the gate's re-append is accepted ...
+    (void)T.tcs->doWork(++now);
+    ASSERT_GT(T.stateReplica->logEndOffset(), leoBefore) << "precondition: the gate re-appended the PrepareCommit";
+    for (int i = 0; i < 4; ++i) { (void)T.tcs->doWork(++now); T.m.runWorker(now); }
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 1) << "... but no marker before it commits";
+    EXPECT_TRUE(T.controlFrames.empty());
+
+    T.leader = false;                                        // deposed before the record committed
+    (void)T.tcs->doWork(++now);
+    EXPECT_EQ(T.tcs->prepareGates(), 0u);
+    EXPECT_TRUE(T.controlFrames.empty()) << "the unload answered the EndTxn a second time";
+    T.commitState(++now);                                    // the follower holds it: it commits
+    T.leader = true;
+    (void)T.tcs->doWork(++now);
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::PrepareCommit) << "the reload lost the decision";
+    EXPECT_EQ(T.endTxn(/*commit=*/false), kInvalidTxnState) << "the opposite retry cannot reverse it";
+    for (int i = 0; i < 128 && T.tcs->txnStateForTest(T.txnId) != tx::TxnState::CompleteCommit; ++i) {
+        now += 50'000'000;
+        (void)T.tcs->doWork(now);
+        T.m.runWorker(now);
+        T.commitState(now);
+    }
+    ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit) << "the re-driven COMMIT never landed";
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 2) << "exactly one COMMIT marker";
+    EXPECT_EQ(T.endTxn(/*commit=*/true), 0) << "the retried commit is the idempotent OK";
+    T.m.push(16, now);
+    EXPECT_TRUE(T.m.delivered(rcSub, 0));
+    EXPECT_TRUE(T.controlFrames.empty()) << "an unsolicited EndTxn frame";
+}
+
+// Opposite-direction retry on the SAME coordinator while the PrepareCommit is still refused: the in-memory decision
+// already stands (19), adds no second gate and no ABORT marker; once the append commits the commit lands once.
+TEST(EndTxnRefusedPrepareRegression, OppositeRetryWhileRefusedNeitherReversesNorDuplicatesAdversarialRegression) {
+    TxnRig T(/*minIsr=*/1, /*withStore=*/true);
+    const int64_t rcSub = ongoingWithOneBatch556(T);
+    T.stateReplica->setMinIsrForTest(2);
+    ASSERT_EQ(T.endTxn(/*commit=*/true), kNotCoordinator);
+    int64_t now = drivePasses556(T, 10, 4);
+    EXPECT_EQ(T.endTxn(/*commit=*/false), kInvalidTxnState) << "an abort cannot reverse the commit being driven";
+    EXPECT_EQ(T.endTxn(/*commit=*/true), kConcurrent) << "the same-direction retry is retriable";
+    EXPECT_EQ(T.tcs->prepareGates(), 1u) << "a retry queued a second gate";
+    now = drivePasses556(T, now, 4);
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 1);
+
+    T.stateReplica->setMinIsrForTest(1);
+    for (int i = 0; i < 128 && T.tcs->txnStateForTest(T.txnId) != tx::TxnState::CompleteCommit; ++i)
+        now = drivePasses556(T, now, 1);
+    ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit);
+    now = drivePasses556(T, now, 8);
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 2) << "exactly one marker, and it is the COMMIT";
+    T.m.push(16, now);
+    EXPECT_TRUE(T.m.delivered(rcSub, 0)) << "the batch is committed";
+    EXPECT_EQ(T.endTxn(/*commit=*/false), kInvalidTxnState);
+    EXPECT_EQ(T.endTxn(/*commit=*/true), 0);
+    EXPECT_TRUE(T.controlFrames.empty()) << "an unsolicited EndTxn frame";
+}
+
+// Sibling: a timeout abort whose PrepareAbort append is refused.  No request waits on it (respond=false); the gate
+// keeps appending it, no ABORT marker is written before it is durable, and exactly one lands once it is.
+TEST(EndTxnRefusedPrepareRegression, TimeoutAbortWithRefusedPrepareWritesOneMarkerOnlyOnceDurableAdversarialRegression) {
+    TxnRig T(/*minIsr=*/1, /*withStore=*/true);
+    const int64_t rcSub = ongoingWithOneBatch556(T);
+    T.stateReplica->setMinIsrForTest(2);
+    int64_t now = 61'000'000'000;                            // past the 60 s transaction timeout
+    now = drivePasses556(T, now, 20);
+    ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::PrepareAbort) << "precondition: the timeout fired";
+    EXPECT_EQ(T.tcs->prepareGates(), 1u) << "the refused timeout abort is no longer driven";
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 1) << "an ABORT marker ahead of a durable PrepareAbort";
+    EXPECT_EQ(T.endTxn(/*commit=*/true), kInvalidTxnState) << "a commit after the timeout abort";
+    EXPECT_TRUE(T.controlFrames.empty()) << "an EndTxn frame for a coordinator-initiated abort";
+
+    T.stateReplica->setMinIsrForTest(1);
+    for (int i = 0; i < 128 && T.tcs->txnStateForTest(T.txnId) != tx::TxnState::CompleteAbort; ++i)
+        now = drivePasses556(T, now, 1);
+    ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteAbort);
+    now = drivePasses556(T, now, 8);
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 2) << "exactly one ABORT marker";
+    T.m.push(16, now);
+    EXPECT_FALSE(T.m.delivered(rcSub, 0)) << "read_committed received a timed-out (aborted) batch";
+    EXPECT_TRUE(T.controlFrames.empty());
+}
+
+// Sibling: a fencing InitProducerId over an Ongoing transaction whose PrepareAbort append is refused is answered
+// NotCoordinator (never an OK with an epoch that is not durable); the abort is still driven to exactly one marker,
+// and the client's retry then gets the bumped epoch.
+TEST(EndTxnRefusedPrepareRegression, FencingInitProducerIdWithRefusedPrepareAbortAdversarialRegression) {
+    TxnRig T(/*minIsr=*/1, /*withStore=*/true);
+    const int64_t rcSub = ongoingWithOneBatch556(T);
+    const int64_t pid0 = T.pid; const int16_t epoch0 = T.epoch;
+    T.stateReplica->setMinIsrForTest(2);
+    ASSERT_EQ(T.initPid(), kNotCoordinator) << "a fencing InitProducerId over a refused append";
+    EXPECT_EQ(T.pid, pid0); EXPECT_EQ(T.epoch, epoch0);
+    int64_t now = drivePasses556(T, 10, 20);
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::PrepareAbort);
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 1) << "an ABORT marker ahead of a durable PrepareAbort";
+    EXPECT_EQ(T.initPid(), kConcurrent) << "the retry while the abort is still being driven";
+
+    T.stateReplica->setMinIsrForTest(1);
+    for (int i = 0; i < 128 && T.tcs->txnStateForTest(T.txnId) != tx::TxnState::CompleteAbort; ++i)
+        now = drivePasses556(T, now, 1);
+    ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteAbort);
+    now = drivePasses556(T, now, 8);
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 2) << "exactly one ABORT marker";
+    T.m.push(16, now);
+    EXPECT_FALSE(T.m.delivered(rcSub, 0));
+    ASSERT_EQ(T.initPid(), 0) << "the retried InitProducerId once the abort completed";
+    EXPECT_EQ(T.pid, pid0);
+    EXPECT_GT(T.epoch, epoch0) << "the fenced epoch was not bumped";
+    EXPECT_TRUE(T.controlFrames.empty());
+}
+
+// Every request whose __transaction_state append is refused is answered NotCoordinator synchronously - never a 0
+// ("deferred") that nothing answers later - and a retry once the ISR recovers succeeds.
+TEST(EndTxnRefusedPrepareRegression, EveryRefusedPutIsAnsweredNotCoordinatorThenRetriesSucceedAdversarialRegression) {
+    TxnRig T(/*minIsr=*/1, /*withStore=*/true);
+    ASSERT_EQ(T.initPid(), 0);
+    T.stateReplica->setMinIsrForTest(2);
+    EXPECT_EQ(T.addPartition(), kNotCoordinator) << "AddPartitionsToTxn";
+    EXPECT_EQ(addOffsets(T, "g"), kNotCoordinator) << "AddOffsetsToTxn";
+    EXPECT_EQ(T.endTxn(/*commit=*/true), kNotCoordinator) << "EndTxn(commit)";
+    T.txnId = "tx-f15-other";
+    EXPECT_EQ(T.initPid(), kNotCoordinator) << "InitProducerId of a new transactional id";
+    T.txnId = "tx-f15-abort";
+    T.stateReplica->setMinIsrForTest(1);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.stateReplica->setMinIsrForTest(2);
+    EXPECT_EQ(T.endTxn(/*commit=*/false), kNotCoordinator) << "EndTxn(abort)";
+    int64_t now = drivePasses556(T, 10, 20);
+    EXPECT_TRUE(T.controlFrames.empty()) << "a refused request was answered a second time";
+
+    T.stateReplica->setMinIsrForTest(1);
+    for (int i = 0; i < 128 && T.tcs->awaitingMarkerTxnsForTest() + T.tcs->prepareGates() > 0; ++i)
+        now = drivePasses556(T, now, 1);
+    EXPECT_EQ(T.tcs->txnStateForTest("tx-f15"), tx::TxnState::CompleteCommit);
+    EXPECT_EQ(T.tcs->txnStateForTest("tx-f15-abort"), tx::TxnState::CompleteAbort);
+    T.txnId = "tx-f15-other";
+    EXPECT_EQ(T.initPid(), 0) << "the retried InitProducerId";
+    EXPECT_TRUE(T.controlFrames.empty());
 }
