@@ -310,3 +310,67 @@ TEST(AeronTransportRegression, StartWithAnUnusableIngressChannelThrowsNeverAbort
     EXPECT_NO_THROW(ok.start());
     ok.stop();
 }
+
+// ---------------------------------------------------------------------------
+// #432 adversarial (M4 review of PR 509): the failure branch over the whole
+// matrix — which side is unusable (ingress publication or egress subscription:
+// the OTHER handle is the one that resolved and must be released first) x both
+// driver modes (Invoker: the caller pumps the conductor; Thread: a live
+// conductor thread).  An unusable EGRESS leaves a resolved ExclusivePublication
+// whose ~ExclusivePublication locks the conductor's mutex — the sibling of the
+// issue's ~Subscription.  Each failed start must throw the clear error naming
+// the channel, never abort, and leave nothing behind: a healthy transport on a
+// fresh dir then starts and loops a frame back.  M_PERTURB scribbles freed
+// memory so a stale mutex is seen (glibc); repeated per cell (whether the other
+// handle resolved before the rejection is a race per attempt).
+// RED by mutation: drop the Resolution resets in start()'s failure branch.
+// ---------------------------------------------------------------------------
+TEST(AeronTransportRegression, StartFailureEitherSideEitherDriverModeThrowsNeverAbortsAdversarialRegression) {
+    using rune::client::transport::DriverMode;
+    struct Cell { DriverMode mode; bool badIngress; };
+    const Cell cells[] = {{DriverMode::Invoker, true}, {DriverMode::Invoker, false},
+                          {DriverMode::Thread, true},  {DriverMode::Thread, false}};
+    int stream = 1100;
+    ::mallopt(M_PERTURB, 0xA5);
+    for (const Cell& cell : cells) {
+        for (int attempt = 0; attempt < 6; ++attempt) {
+            Config cfg = makeLoopbackConfig(stream++);
+            cfg.driverMode = cell.mode;
+            std::string& bad = cell.badIngress ? cfg.ingressChannel : cfg.egressChannel;
+            bad = "127.0.0.1:1";  // not an Aeron channel URI
+            const std::string needle =
+                std::string(cell.badIngress ? "ingressChannel=" : "egressChannel=") + "127.0.0.1:1";
+            Transport t{cfg};
+            bool threw = false;
+            try {
+                t.start();
+            } catch (const std::runtime_error& e) {
+                threw = true;
+                EXPECT_NE(std::string(e.what()).find(needle), std::string::npos) << e.what();
+                EXPECT_NE(std::string(e.what()).find("rejected by the driver"), std::string::npos) << e.what();
+            }
+            EXPECT_TRUE(threw) << "mode=" << static_cast<int>(cell.mode) << " badIngress=" << cell.badIngress;
+            EXPECT_FALSE(t.ingressConnected());
+            EXPECT_FALSE(t.egressConnected());
+            uint8_t frame[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+            EXPECT_FALSE(t.offer(frame, sizeof frame)) << "a failed start never offers";
+            EXPECT_NO_THROW(t.stop());
+            EXPECT_NO_THROW(t.stop());  // idempotent after a failed start
+        }
+    }
+    ::mallopt(M_PERTURB, 0);
+
+    // Nothing leaked into the process: a healthy transport starts and loops back.
+    Transport ok{makeLoopbackConfig(1199)};
+    ASSERT_NO_THROW(ok.start());
+    awaitConnected(ok);
+    const uint8_t frame[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+    ASSERT_TRUE(boundedOffer(ok, frame, sizeof frame));
+    std::vector<uint8_t> got;
+    for (int i = 0; i < kPollPumpMax && got.empty(); ++i) {
+        ok.poll([&](const uint8_t* b, std::size_t n) { got.assign(b, b + n); }, 10);
+        if (got.empty()) std::this_thread::sleep_for(kPumpSleep);
+    }
+    EXPECT_EQ(got, std::vector<uint8_t>(frame, frame + sizeof frame));
+    ok.stop();
+}
