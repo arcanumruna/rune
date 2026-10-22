@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include "../support/TestCompletions.h"
+#include <malloc.h>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -1421,4 +1422,135 @@ TEST(HubCommandClient, SubscriptionScopedErrorFailsThatSubscriptionRegression) {
     auto p = r.pingOp(rc::Bytes{1, 2});
     ASSERT_TRUE(r.drive([&] { return p.ready(); }));
     EXPECT_TRUE(p.ok()) << "the session survives a subscription-scoped error";
+}
+
+// #355: the void commit() never drops a refused submit silently.  Its submit is
+// the HubCommand path (never an OpResult): a full ring is waited out where that
+// is safe and THROWS where it is not, so a dropped commit always reaches the
+// caller.  Pinned here: off the Invoker owner thread a full ring throws (the
+// thread may not pump the duty cycle); on the owner it is pumped and accepted;
+// once closed, commit() is the documented no-op (nothing left to commit).
+// RED by mutation: catch and swallow the trampoline's refusal in commit().
+TEST(HubCommandClient, VoidCommitRefusedOnAFullRingThrowsNeverDropsRegression) {
+    rc::ClientConfig c = hubCfg(4098, 4099, rc::RunnerMode::Invoker);
+    rc::Client client(c);
+    auto gc = client.subscribeGroup("g", {"t"});
+
+    client.testFillCommandRing();
+    bool offOwnerThrew = false;
+    std::thread other([&] {
+        try {
+            gc.commit();
+        } catch (const std::logic_error&) {
+            offOwnerThrew = true;
+        }
+    });
+    other.join();
+    EXPECT_TRUE(offOwnerThrew) << "a commit() refused off the owner thread must throw, never return silently";
+
+    // The owner pumps the full ring and the commit is accepted.
+    EXPECT_NO_THROW(gc.commit());
+    EXPECT_TRUE(gc.active());
+
+    gc.close();
+    EXPECT_NO_THROW(gc.commit()) << "closed: nothing to commit (documented no-op)";
+}
+
+// #432 adversarial (M4 review of PR 509), through the public API: a Client whose
+// transport cannot start — an unusable gateway (ingress) OR egress channel, in
+// either runner mode — throws ONE clear error from its constructor and the
+// process keeps running; the half-built Client's members unwind cleanly (no
+// runner thread, nothing left on the aeron dir) and a healthy Client on a fresh
+// dir then constructs, accepts a group consumer and closes.  M_PERTURB makes a
+// handle released after its conductor visible (glibc).
+// RED by mutation: drop the Resolution resets in AeronTransport::start()'s
+// failure branch (std::terminate from ~Subscription / ~ExclusivePublication).
+TEST(ClientTransportStartAdversarial, CtorWithAnUnusableChannelThrowsNeverAbortsAdversarialRegression) {
+    int32_t stream = 4200;
+    ::mallopt(M_PERTURB, 0xA5);
+    for (const rc::RunnerMode mode : {rc::RunnerMode::Invoker, rc::RunnerMode::Thread}) {
+        for (const bool badGateway : {true, false}) {
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                rc::ClientConfig c = hubCfg(stream, stream + 1, mode);
+                stream += 2;
+                (badGateway ? c.gatewayChannel : c.egressChannel) = "127.0.0.1:1";
+                bool threw = false;
+                try {
+                    rc::Client client(c);
+                } catch (const std::runtime_error& e) {
+                    threw = true;
+                    EXPECT_NE(std::string(e.what()).find("127.0.0.1:1"), std::string::npos) << e.what();
+                }
+                EXPECT_TRUE(threw) << modeName(mode) << " badGateway=" << badGateway;
+            }
+        }
+    }
+    ::mallopt(M_PERTURB, 0);
+    for (const rc::RunnerMode mode : {rc::RunnerMode::Invoker, rc::RunnerMode::Thread}) {
+        rc::Client healthy(hubCfg(stream, stream + 1, mode));
+        stream += 2;
+        auto gc = healthy.subscribeGroup("g", {"t"});
+        EXPECT_TRUE(gc.active()) << modeName(mode);
+        gc.close();
+        healthy.close();
+    }
+}
+
+// #355 adversarial (M4 review of PR 509): the void commit()'s whole refusal
+// matrix through the public API.  (a) Invoker, ring FULL, off the owner thread:
+// throws logic_error (never a silent return) — the issue's WrongThread case.
+// (b) Same, after the GroupConsumer handle was closed: the documented no-op.
+// (c) Same, after the Client closed: the ring's closed bit wins over the full
+// ring — Closed (nothing left to commit), never a throw, never a hang.
+// (d) Thread mode, ring FULL, from two app threads at once: the runner drains,
+// both commits are accepted (no throw within the bounded wait), consumer active.
+// RED by mutation: catch and swallow the trampoline's refusal in commit()  -> (a).
+TEST(HubCommandClient, VoidCommitRefusalMatrixThrowsOrNoOpNeverDropsAdversarialRegression) {
+    auto offOwner = [](auto&& fn) {
+        int outcome = 0;  // 0 = returned, 1 = logic_error, 2 = other exception
+        std::thread t([&] {
+            try {
+                fn();
+            } catch (const std::logic_error&) {
+                outcome = 1;
+            } catch (...) {
+                outcome = 2;
+            }
+        });
+        t.join();
+        return outcome;
+    };
+    {  // (a) + (b)
+        rc::Client client(hubCfg(4230, 4231, rc::RunnerMode::Invoker));
+        auto gc = client.subscribeGroup("g", {"t"});
+        client.testFillCommandRing();
+        EXPECT_EQ(offOwner([&] { gc.commit(); }), 1) << "(a) a refused off-owner commit throws";
+        EXPECT_EQ(offOwner([&] { gc.commit(); }), 1) << "(a) every time, not only the first";
+        EXPECT_TRUE(gc.active());
+        gc.close();  // owner: the lifecycle path never needs the ring
+        client.testFillCommandRing();
+        EXPECT_EQ(offOwner([&] { gc.commit(); }), 0) << "(b) closed handle: documented no-op";
+    }
+    {  // (c)
+        rc::Client client(hubCfg(4232, 4233, rc::RunnerMode::Invoker));
+        auto gc = client.subscribeGroup("g", {"t"});
+        client.testFillCommandRing();
+        client.close();
+        EXPECT_EQ(offOwner([&] { gc.commit(); }), 0) << "(c) client closed: Closed, never a throw";
+        EXPECT_FALSE(gc.active());
+    }
+    {  // (d)
+        rc::Client client(hubCfg(4234, 4235, rc::RunnerMode::Thread));
+        auto gc = client.subscribeGroup("g", {"t"});
+        client.testFillCommandRing();
+        int a = -1, b = -1;
+        std::thread t1([&] { a = 0; try { gc.commit(); } catch (...) { a = 1; } });
+        std::thread t2([&] { b = 0; try { gc.commit(); } catch (...) { b = 1; } });
+        t1.join();
+        t2.join();
+        EXPECT_EQ(a, 0) << "(d) Thread mode: the runner drains, the commit is accepted";
+        EXPECT_EQ(b, 0);
+        EXPECT_TRUE(gc.active());
+        client.close();
+    }
 }
