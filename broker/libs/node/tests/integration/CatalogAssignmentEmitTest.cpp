@@ -4767,6 +4767,30 @@ TEST(StorageRegistrationRegression, BelowCommittedReportForAStaleEpochIsAnswered
     EXPECT_EQ(c.svc->lostCommittedReports(), 0u);
 }
 
+// #93: a below-committed report for a negative (internal) topic that is NOT a coordinator key was dropped without an
+// answer, so the follower re-sent every 50 ms forever.  It is answered (moot: the internal-ISR store owns the partition)
+// so the follower slows to its 1 s cadence.  RED: answer == false.
+TEST(MetadataBelowCommittedRegression, ReportForANonCoordinatorInternalPartitionIsAnsweredRegression) {
+    CtlRig c;
+    leaderTwoWithFullIsr(c);
+    const int32_t e = c.pa().leaderEpoch;
+    constexpr int32_t kInternalTopic = -9;
+    for (int round = 0; round < 2; ++round) {
+        SCOPED_TRACE(round);
+        auto m = belowCommittedReport(1, e, kInternalTopic);
+        m.leaderId = 1; m.leaderEpoch = e; m.proposalId = 0x1234u + static_cast<uint32_t>(round);
+        rune::replication::AlterIsrResponseMsg resp{};
+        bool answer = false;
+        const bool recorded = c.svc->onAlterIsr(m, &resp, &answer);
+        EXPECT_FALSE(recorded);
+        ASSERT_TRUE(answer) << "the follower would re-send every 50 ms forever";
+        EXPECT_EQ(resp.errorCode, rune::replication::kAlterIsrFencedLeaderEpoch);
+        EXPECT_EQ(resp.partitionEpoch, -1);
+        EXPECT_EQ(resp.proposalId, m.proposalId);
+        EXPECT_EQ(c.svc->lostCommittedReports(), 0u);
+    }
+}
+
 // A-I4: the request survives an unrelated partitionEpoch change: the refusing follower re-sends, the newer report
 // OVERWRITES the dropped one.  RED: record the request without overwriting it (the second report is ignored).
 TEST(StorageRegistrationRegression, BelowCommittedBumpSurvivesAPartitionEpochChangeRegression) {
