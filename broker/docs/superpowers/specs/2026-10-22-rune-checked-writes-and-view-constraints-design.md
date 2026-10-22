@@ -741,6 +741,10 @@ Each part ships on its own:
 - An `IMPORT` above the reservation appends a new reservation first.
 - A conflict rejection carries the conflicting offset, and reads accept `minOffset`.
 - The autoincrement scratch copy (copy into a per-worker buffer, patch the ids, append from the buffer). **Owner-confirmed, 2026-10-22.**
+  - **Follow-up: patch in place where the bytes are already Rune's.**
+    - On the gateway-routed path the batch has already been copied once into the worker's SPSC op ring (`ClientGateway.cpp:4030-4061`). The worker owns that slot, so it could patch it in place if `handleProduceBatch` took a mutable span on this path.
+    - On the shard-ingress path the bytes sit in Aeron's term buffer, which must not be modified, so the scratch copy stays there.
+    - The builder should measure the copy first. In-place patching is worth doing only if the copy shows up in the budget.
 - The key field encodes to at most 16 bytes, and `Key` truncation becomes an error.
 - A source key held by another open transaction is locked until that transaction ends (`ConcurrentTransactions`).
 - Untyped topics stay as raw logs: no field list means untyped. Every database feature needs a typed topic.
