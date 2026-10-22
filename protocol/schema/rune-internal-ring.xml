@@ -104,7 +104,7 @@
       <validValue name="ENFORCE_FENCE">23</validValue>
       <!-- Phase 2c (subscription filters): control -> EVERY worker on the worker ingress ring: install / replace
            a typed topic's filter schema (the filterable fields: tag, primitive type, offset, width).
-           topicId = the topic, tail (TailKind = FILTER) = the encoded schema.  Append-only value. -->
+           topicId = the topic, tail (TailKind = DESCRIPTOR_BLOB) = the evolving descriptor blob, clientVersion = the schema version.  Append-only value. -->
       <validValue name="FILTER_SCHEMA">24</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
@@ -132,8 +132,8 @@
       <validValue name="PEER_KEYS">9</validValue>
       <!-- Issue #109: an ending UNSUBSCRIBE's terminal ErrorResponse message text (UTF-8 bytes). -->
       <validValue name="END_DETAIL">10</validValue>
-      <!-- Phase 2c: FILTER_SCHEMA tail (the encoded schema) and the Subscribe op's filter bytes
-           (rune/codec/FilterWire.h canonical format). -->
+      <!-- Phase 2c: the Subscribe op's filter bytes (rune/codec/FilterWire.h canonical format).
+           (FILTER_SCHEMA's tail is DESCRIPTOR_BLOB, not FILTER.) -->
       <validValue name="FILTER">11</validValue>
     </enum>
 

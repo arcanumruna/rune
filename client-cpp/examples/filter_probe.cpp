@@ -915,13 +915,13 @@ int runErrors(const Env& env) {
             for (std::size_t i = 0; i + 1 < subs.size(); ++i)
                 if (subs[i]->finished()) { ++bad; fail(tag, "E8: an admitted subscription ended after the refusal"); break; }
             subs.front()->unsubscribe();   // capacity returns
-            pumpUntil({&c}, [&] { return subs.front()->finished(); }, 30);
+            if (!pumpUntil({&c}, [&] { return subs.front()->finished(); }, 30)) { ++bad; fail(tag, "E8: the unsubscribe never finished"); }
             auto again = settle(th, 0, E::Filter{.worldId = 151u}.encode());
             if (again->finished() || again->subscriptionId() == 0) { ++bad; fail(tag, "E8: capacity did not return after an unsubscribe"); }
             subs.push_back(std::move(again));
         }
         for (auto& s : subs) s->unsubscribe();
-        pumpUntil({&c}, [&] { for (auto& s : subs) if (!s->finished()) return false; return true; }, 60);
+        if (!pumpUntil({&c}, [&] { for (auto& s : subs) if (!s->finished()) return false; return true; }, 60)) { ++bad; fail(tag, "E8: the subscriptions never all finished after unsubscribe"); }
     }
 
     // E10: a second member of the same group with another filter.
@@ -1052,7 +1052,8 @@ struct World {
     int64_t  records = 0, foreign = 0;
     std::vector<uint32_t> latUs;
     std::size_t oneRecordBytes = 0;
-    std::size_t keyValueBytes = 0;      // key + value of one record: the physical floor of a delivered record's bytes     // a one-record batch of this world's record shape (the ideal per record)
+    std::size_t keyValueBytes = 0;      // key + value of one record: the physical floor of a delivered record's bytes
+                                        // (oneRecordBytes above: a one-record batch of this world's record shape, the ideal per record)
     std::optional<SubscriptionSet> set;
     uint64_t bytesAtStart = 0;
 };

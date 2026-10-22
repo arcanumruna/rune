@@ -53,7 +53,7 @@ struct TopicPartition32 {
 //   [..+2]    subscribedTopicIds count : uint16
 //   [..+count*4]  subscribedTopicIds entries (each int32 LE)
 //
-//   Client version 10: [..+2] filter length : uint16, [..] filter bytes (rune/codec/FilterWire.h) - one filter
+//   Client version 11: [..+2] filter length : uint16, [..] filter bytes (rune/codec/FilterWire.h) - one filter
 //   per group; OMITTED when empty (the frame is then byte-identical to version 9).
 //
 // Total = 24 + 4 + 2 + groupId.size() + 2 + memberId.size() + 2 + 4*topicCount [+ 2 + filter.size()]
@@ -68,7 +68,7 @@ struct JoinGroup {
     // Decoded: zero-copy view — buf must outlive this.  Not usable on encode path.
     Int32ArrayView subscribedTopicIds;
 
-    std::span<const uint8_t> filter;           // client version 10: group filter; empty = none (omitted on the wire)
+    std::span<const uint8_t> filter;           // client version 11: group filter; empty = none (omitted on the wire)
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::JoinGroup); // 32
     static constexpr uint16_t BODY_FIXED  = 4;  // sessionTimeoutMs(4)
@@ -135,7 +135,7 @@ struct JoinGroup {
             pos += 4;
         }
 
-        // client version 10: optional group filter, omitted when empty
+        // client version 11: optional group filter, omitted when empty
         if (!filter.empty()) {
             pos += putVarBytes(buf + pos, filter.data(), static_cast<uint16_t>(filter.size()));
         }
@@ -188,7 +188,7 @@ struct JoinGroup {
         msg.subscribedTopicIds = Int32ArrayView(buf + pos, count);
         pos += static_cast<std::size_t>(count) * 4u;
 
-        // client version 10: optional group filter; any byte left starts the trailer, so a half length
+        // client version 11: optional group filter; any byte left starts the trailer, so a half length
         // prefix or a length past the end is a clean decode failure.
         if (clientUnderstandsFilters(clientVersion) && avail > pos) {
             const uint8_t* fData = nullptr;
@@ -217,7 +217,7 @@ struct JoinGroup {
 //
 // Total = 24 + 7 + 2 + memberId.size()
 //
-// Client version 10: a refused join (e.g. a filter mismatch) carries a trailing
+// Client version 11: a refused join (e.g. a filter mismatch) carries a trailing
 //   [..+2] detail length : uint16, [..] detail bytes (utf-8)
 // after memberId, written only by encodeFor(buf, clientVersion, capacity) and only when `detail` is non-empty AND
 // the session is >= kClientVersionFilter.  encode(buf) never writes it.
@@ -233,7 +233,7 @@ struct JoinGroupResponse {
     int32_t  generationId  = 0;
     uint8_t  isLeader      = 0;         // 1 = this member is the group leader
     int16_t  errorCode     = 0;         // ErrorCode value; 0 = OK
-    std::string_view detail;            // client version 10: refusal text; empty = none (view)
+    std::string_view detail;            // client version 11: refusal text; empty = none (view)
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::JoinGroupResponse); // 33
     static constexpr uint16_t BODY_FIXED  = 7;  // generationId(4) + isLeader(1) + errorCode(2)
@@ -317,7 +317,7 @@ struct JoinGroupResponse {
         if (!getVarBytes(buf, avail, pos, memberIdData, memberIdLen)) return std::nullopt;
         msg.memberId = std::span<const uint8_t>(memberIdData, memberIdLen);
 
-        // client version 10: optional trailing detail; a truncated one is a clean failure
+        // client version 11: optional trailing detail; a truncated one is a clean failure
         if (avail > pos) {
             const uint8_t* dData = nullptr;
             uint16_t       dLen  = 0;

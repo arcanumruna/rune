@@ -343,7 +343,7 @@ struct Subscribe {
     int64_t  fromOffset     = 0;
     uint8_t  isolation      = 0;   // 0=read_uncommitted, 1=read_committed
     std::span<const uint8_t> key;  // zero-copy view; empty when partitionKnown==1
-    // Client version 10: optional trailing filter [u16 len][bytes] (canonical format: rune/codec/FilterWire.h).
+    // Client version 11: optional trailing filter [u16 len][bytes] (canonical format: rune/codec/FilterWire.h).
     // OMITTED from the frame when empty, so an unfiltered Subscribe is byte-identical to version 9.  Decoded only
     // for a session >= kClientVersionFilter (see decode); the length is a u16, so a filter is at most 65535 bytes
     // (the largest valid one is 8,234).
@@ -391,7 +391,7 @@ struct Subscribe {
                            key.data(),
                            static_cast<uint16_t>(key.size()));
 
-        // client version 10: optional filter trailer, omitted when empty
+        // client version 11: optional filter trailer, omitted when empty
         if (!filter.empty()) {
             pos += putVarBytes(buf + pos, filter.data(), static_cast<uint16_t>(filter.size()));
         }
@@ -436,7 +436,7 @@ struct Subscribe {
         if (!getVarBytes(buf, avail, pos, keyData, keyLen)) return std::nullopt;
         msg.key = std::span<const uint8_t>(keyData, keyLen);
 
-        // client version 10: optional trailing filter.  ANY byte left after the key starts the trailer, so a
+        // client version 11: optional trailing filter.  ANY byte left after the key starts the trailer, so a
         // half length prefix or a length past the end is a clean decode failure, never an over-read.
         if (clientUnderstandsFilters(clientVersion) && avail > pos) {
             const uint8_t* fData = nullptr;
@@ -463,7 +463,7 @@ struct Subscribe {
 //
 // Total = 24 + 14 = 38 bytes (no var fields)
 //
-// Client version 10: a refused filter is answered {InvalidRequest, detail}, the detail in a trailing
+// Client version 11: a refused filter is answered {InvalidRequest, detail}, the detail in a trailing
 //   [38..39]  detail length : uint16
 //   [40..]    detail bytes (utf-8)
 // written only by encodeFor(buf, clientVersion, capacity), and only when `detail` is non-empty AND the session is
@@ -477,7 +477,7 @@ struct SubscribeResponse {
     int16_t errorCode      = 0;   // rune::protocol::client::ErrorCode value
     int32_t partition      = 0;
     int64_t subscriptionId = 0;
-    std::string_view detail;      // client version 10: refusal text; empty = none (view, must outlive encode)
+    std::string_view detail;      // client version 11: refusal text; empty = none (view, must outlive encode)
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::SubscribeResponse); // 19
     static constexpr uint16_t BODY_FIXED  = 14; // errorCode(2)+partition(4)+subscriptionId(8)
@@ -543,7 +543,7 @@ struct SubscribeResponse {
         msg.partition      = detail::getLE32 (buf, fixedBase + 2);
         msg.subscriptionId = detail::getLE64 (buf, fixedBase + 6);
 
-        // client version 10: optional trailing detail; a truncated one is a clean failure
+        // client version 11: optional trailing detail; a truncated one is a clean failure
         std::size_t pos = ENCODED_SIZE;
         if (avail > pos) {
             const uint8_t* dData = nullptr;
