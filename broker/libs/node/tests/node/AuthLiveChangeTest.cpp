@@ -813,3 +813,84 @@ TEST(AuthLiveChangeAdversarialRegression, ARevokeEndingManySubscriptionsEndsEach
     }
     EXPECT_EQ(t.b().node().onWorkerThreadForTest(0, [](Worker& w) { return static_cast<int>(w.subscriptionEndsOwedForTest()); }), 0);
 }
+
+// ── PR #567 adversarial review (#212): every sibling path to "a session's member may no longer read its topic" ──────
+// Auth: the topic READ held through a ROLE is lost by revoking it from the role, or by dropping the role - the member
+// leaves its group at once like a direct revoke.  Both the default (gateway) and the shard configuration.
+TEST(AuthLiveChangeAdversarialRegression, ATopicReadLostThroughARoleEvictsTheGroupMemberAdversarialRegression) {
+    for (const bool shard : {false, true})
+        for (const bool dropTheRole : {false, true}) {
+            SCOPED_TRACE(std::string(shard ? "shard" : "gateway") + (dropTheRole ? " DROP ROLE" : " REVOKE FROM ROLE"));
+            Live t(dropTheRole ? "adv212droprole" : "adv212rolerevoke", shard ? shardOptions() : AuthBroker::Options{});
+            ASSERT_EQ(t.createRole("readers"), 0);
+            ASSERT_EQ(t.grantRoleOp("readers", SO::Read, ST::Topic, SP::Exact, "orders"), 0);
+            std::string name;
+            const int64_t s = t.r.newUser({exact(SO::Read, ST::Group, "cg")}, &name);
+            ASSERT_EQ(t.grantRole(name, "readers"), 0);
+            const int64_t s2 = t.r.newUser({exact(SO::Read, ST::Group, "cg"), exact(SO::Read, ST::Topic, "orders")});
+            const Pair p = joinPair(t, s, s2, {t.r.orders});
+            ASSERT_GT(p.gen, 0) << "precondition: two live members, Stable (READ on orders through the role)";
+            if (dropTheRole) ASSERT_EQ(t.dropRole("readers"), 0);
+            else ASSERT_EQ(t.revoke("readers", /*role=*/true, SO::Read, ST::Topic, SP::Exact, "orders"), 0);
+            EXPECT_EQ(t.r.heartbeatAt(s, "cg", p.m1, p.gen), kUnknownMember) << "removed by the role change";
+            EXPECT_PRED1(rebalanced, t.r.heartbeatAt(s2, "cg", p.m2, p.gen)) << "the group rebalances at once";
+            EXPECT_EQ(t.r.joinGroup(s, "cg", {t.r.orders}), 45) << "and a re-join naming the topic is refused";
+        }
+}
+
+// Auth (no false eviction): a READ grant swapped for a WIDER prefix trips the conservative grant-lost check, but the
+// re-check against the new table keeps the member and its group Stable (no rebalance).
+TEST(AuthLiveChangeAdversarialRegression, ATopicReadSwappedForAWiderPrefixKeepsTheMemberAdversarialRegression) {
+    Live t("adv212widen");
+    std::string name;
+    const int64_t s = t.r.newUser({exact(SO::Read, ST::Group, "cg"), exact(SO::Read, ST::Topic, "orders")}, &name);
+    const int64_t s2 = t.r.newUser({exact(SO::Read, ST::Group, "cg"), exact(SO::Read, ST::Topic, "orders")});
+    const Pair p = joinPair(t, s, s2, {t.r.orders});
+    ASSERT_GT(p.gen, 0);
+    ASSERT_EQ(t.b().admin().grant(t.ch(), t.adminSid(), name, false, SO::Read, ST::Topic, SP::Prefix, "ord").errorCode, 0);
+    ASSERT_EQ(t.revokeExact(name, SO::Read, ST::Topic, "orders"), 0);   // READ still held through the prefix
+    EXPECT_EQ(t.r.heartbeatAt(s, "cg", p.m1, p.gen), 0) << "the member stays";
+    EXPECT_EQ(t.r.heartbeatAt(s2, "cg", p.m2, p.gen), 0) << "no rebalance";
+}
+
+// Concurrency / scope: a session that is a member of two groups loses READ on the topic of one: only that group's
+// member leaves; the member of the other group (another topic) stays Stable at its generation.
+TEST(AuthLiveChangeAdversarialRegression, ATopicReadLossEvictsOnlyTheMemberOnThatTopicAdversarialRegression) {
+    Live t("adv212twogroups");
+    std::string name;
+    const int64_t s = t.r.newUser({exact(SO::Read, ST::Group, "cg"), exact(SO::Read, ST::Group, "cg2"),
+                                   exact(SO::Read, ST::Topic, "orders"), exact(SO::Read, ST::Topic, "secret")}, &name);
+    const int64_t s2 = t.r.newUser({exact(SO::Read, ST::Group, "cg"), exact(SO::Read, ST::Topic, "orders")});
+    const Pair p = joinPair(t, s, s2, {t.r.orders});
+    ASSERT_GT(p.gen, 0);
+    const auto [other, otherGen] = t.r.joinStable(s, "cg2", {t.r.secret});
+    ASSERT_GT(otherGen, 0);
+    int hb = -1;
+    for (int i = 0; i < 200 && hb != 0; ++i) hb = t.r.heartbeatAt(s, "cg2", other, otherGen);
+    ASSERT_EQ(hb, 0) << "precondition: the cg2 member is Stable";
+    ASSERT_EQ(t.revokeExact(name, SO::Read, ST::Topic, "orders"), 0);
+    EXPECT_EQ(t.r.heartbeatAt(s, "cg", p.m1, p.gen), kUnknownMember) << "the orders member leaves";
+    EXPECT_EQ(t.r.heartbeatAt(s, "cg2", other, otherGen), 0) << "the secret member of cg2 stays, no rebalance there";
+}
+
+// Auth: TERMINATE SESSIONS (SET PASSWORD ... terminate) is the third revoke path: the member leaves at once.  A plain
+// SET PASSWORD (sessions kept) leaves the member in place.
+TEST(AuthLiveChangeAdversarialRegression, TerminateSessionsLeavesItsGroupsAtOnceAdversarialRegression) {
+    for (const bool terminate : {false, true}) {
+        SCOPED_TRACE(terminate ? "terminate" : "keep sessions");
+        Live t(terminate ? "adv212terminate" : "adv212setpw");
+        std::string name;
+        const int64_t s = t.r.newUser({exact(SO::Read, ST::Group, "cg"), exact(SO::Read, ST::Topic, "orders")}, &name);
+        const int64_t s2 = t.r.newUser({exact(SO::Read, ST::Group, "cg"), exact(SO::Read, ST::Topic, "orders")});
+        const Pair p = joinPair(t, s, s2, {t.r.orders});
+        ASSERT_GT(p.gen, 0);
+        ASSERT_EQ(t.alter(name, pc::UserChangeKind::SetPassword, "another-password-24680", terminate), 0);
+        if (terminate) {
+            EXPECT_EQ(t.errorOn(0, s), kRevoked);
+            EXPECT_PRED1(rebalanced, t.r.heartbeatAt(s2, "cg", p.m2, p.gen)) << "the terminated member left at once";
+        } else {
+            EXPECT_EQ(t.r.heartbeatAt(s, "cg", p.m1, p.gen), 0) << "the member stays";
+            EXPECT_EQ(t.r.heartbeatAt(s2, "cg", p.m2, p.gen), 0) << "no rebalance";
+        }
+    }
+}

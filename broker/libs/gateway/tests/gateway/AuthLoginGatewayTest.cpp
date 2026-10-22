@@ -1962,3 +1962,30 @@ TEST(AuthLoginRegression, AHaltEndsLiveSessionsRetriablyNotRevokedRegression) {
         EXPECT_FALSE(rig.gw.hasSessionForTest(sid));
     }
 }
+
+// PR #567 adversarial review (#206), protocol state: a session REVOKED first (its 46 still spilled, Closing) is not
+// ended a second time by a halt that follows - its terminal 46 stays its last word (a 48 after it would tell the client
+// to retry an account that was dropped), and nothing is counted as ended-unavailable.  A live session beside it is
+// ended retriably as usual.
+TEST(AuthLoginRegression, AHaltAfterARevokeNeverSendsA48AfterThe46AdversarialRegression) {
+    Rig rig;
+    rig.reliable = true;
+    const int64_t revoked = authedSession(rig);
+    rig.refuse = true;
+    const std::size_t mark = rig.seen.size();
+    rig.gw.revokeAllSessionsForTest("user dropped");
+    ASSERT_EQ(rig.gw.spillStateForTest(revoked), SpillState::Closing) << "precondition: the 46 is still spilled";
+    rig.refuse = false;
+    const int64_t live = authedSession(rig);
+    const std::size_t liveMark = rig.seen.size();
+    rig.gw.onSecurityHalted(0);
+    EXPECT_EQ(rig.gw.sessionsEndedUnavailable(), 1u) << "only the live session is ended by the halt";
+    EXPECT_EQ(rig.gw.sessionsRevoked(), 1u);
+    EXPECT_EQ(errorsFrom(rig, live, liveMark), (std::vector<std::pair<int64_t, int16_t>>{{0, kUnavailable}}));
+    rig.gw.drainPendingResponses(1);
+    EXPECT_EQ(errorsFrom(rig, revoked, mark),
+              (std::vector<std::pair<int64_t, int16_t>>{{0, static_cast<int16_t>(pc::ErrorCode::SessionRevoked)}}))
+        << "the revoked session's last word stays its 46";
+    EXPECT_FALSE(rig.gw.hasSessionForTest(revoked));
+    EXPECT_FALSE(rig.gw.hasSessionForTest(live));
+}

@@ -3587,3 +3587,42 @@ TEST_F(GroupAuthRegression, RemoveSessionMembersEvictsEveryMemberOfTheRevokedSes
     service_->removeSessionMembers(1, clock_);   // idempotent
     EXPECT_EQ(service_->coordinator("g-rev-a").memberCount(), 1u);
 }
+
+// PR #567 adversarial review (#212), timing: the topic-READ eviction lands MID-REBALANCE, on a member that has not
+// re-joined yet.  The rebalance must complete once the members left re-join - never wait for the evicted member until
+// the rebalance timeout - and the evicted member is unknown afterwards.
+TEST_F(GroupAuthRegression, ATopicReadEvictionMidRebalanceCompletesItWithoutTheMemberAdversarialRegression) {
+    const std::string groupId = "g-topic-mid";
+    auto join = [&](int64_t sid, int64_t corr, const std::string& member) {
+        const auto n = encodeJoinAs(req_, sid, corr, groupId, member, kTestTopicId);
+        const auto o = service_->handleJoinGroup(req_, n, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
+        const auto r = pc::JoinGroupResponse::decode(out_, o);
+        EXPECT_TRUE(r.has_value() && r->errorCode == 0);
+        return r.has_value() ? std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size())
+                             : std::string{};
+    };
+    const std::string m1 = join(1, 1980, "");
+    const std::string m2 = join(2, 1981, "");
+    (void)join(1, 1982, m1);
+    (void)join(2, 1983, m2);
+    ASSERT_TRUE(driveUntil([&] { return service_->coordinator(groupId).state() == GroupState::Stable; }, 10));
+    const int32_t genBefore = service_->coordinator(groupId).generationId();
+    // A third member joins: the group rebalances; m1 re-joins, m2 has not yet.
+    const std::string m3 = join(3, 1984, "");
+    ASSERT_NE(service_->coordinator(groupId).state(), GroupState::Stable);
+    (void)join(1, 1985, m1);
+    // Session 2 loses READ on the topic now, between the rebalance's start and its own re-join.
+    std::string_view refused = kTestTopic;
+    EXPECT_EQ(service_->removeUnauthorizedMembers(2, clock_, {&readAnyGroup, &refused, &readAllTopicsBut}), 1);
+    // The leave restarts the rebalance (a new generation, as a LeaveGroup does): the members left re-join once more.
+    (void)join(1, 1986, m1);
+    (void)join(3, 1988, m3);
+    EXPECT_TRUE(driveUntil([&] { return service_->coordinator(groupId).state() == GroupState::Stable; }, 10))
+        << "the rebalance completes with m1 + m3, it never waits for the evicted m2";
+    EXPECT_EQ(service_->coordinator(groupId).memberCount(), 2u);
+    EXPECT_GT(service_->coordinator(groupId).generationId(), genBefore);
+    const auto n = encodeHeartbeat(req_, 2, 1987, groupId, m2, service_->coordinator(groupId).generationId());
+    const auto o = service_->handleHeartbeat(req_, n, clock_, out_, kBufSize);
+    ASSERT_GT(o, 0u);
+    EXPECT_EQ(decodeHBErrorCode(out_, o), static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+}
