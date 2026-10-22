@@ -230,7 +230,14 @@ differs from the text above:
     coordinator-partition bump), and the records behind it wait in order;
   - grants after the append carry a commitPos above it, so FIFO keeps them behind the demotion.
   A move that keeps A in the ISR (preferred-leader move, `electionExcluded`, coordinator steer) never waits: the new
-  leader's HW needs A's fetch at the new epoch, which A sends only after it applied the demotion.  With every leader
+  leader's HW needs A's fetch at the new epoch, which A sends only after it applied the demotion.  A LATER record that
+  removes A from the ISR (the new leader's ISR shrink, a controlled shutdown of A, the election after a leaderless step)
+  goes through the same fence: the controller remembers per partition the last real leader before its latest leader
+  change and when it was appended, and fences any removal of it until W after that append (then every lease granted
+  before the move has ended; the entry is dropped).  One entry per partition, cleared on a controller step-down.
+- **ISR right after a takeover (#493).** A new leader's offset-lag gate counts only fetches made at its own
+  leadership, and a member with no fetch state is timed from the takeover: a leader change never collapses the ISR to
+  the new leader (which also made the case above reachable on the default config).  With every leader
   change thus ordered after the predecessor's lease (or its demotion), the new leader cannot serve state the old one
   lacks while the old one still serves, so the new-leader wait W of A.5.3 is redundant and is not implemented (#487).
   Cost: a controlled shutdown or exclusion move commits up to about 120 ms later (within W of a controller's
