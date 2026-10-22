@@ -29,7 +29,9 @@ class TlsSession {
   static TlsSession makeServer(const char* certPem, const char* keyPem) noexcept;
   // Client side. trustPemOrNull: nullptr = trust the system store; "" = trust nothing
   // (explicitly untrusted, for tests); non-empty = PEM bundle of CA certs to trust.
-  // expectHost is matched against the server cert's SAN (SNI + hostname verification).
+  // expectHost is matched against the server cert's SAN: a DNS name (SNI + hostname verification) or an IP literal
+  // (iPAddress SAN, no SNI).  "" installs no name check, which only a pinned bundle allows: system trust with no
+  // expectHost returns an invalid session (issue #115 - any public certificate for any name would pass).
   static TlsSession makeClient(const char* trustPemOrNull, const char* expectHost) noexcept;
 
   ~TlsSession();

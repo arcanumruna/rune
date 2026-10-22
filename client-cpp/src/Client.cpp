@@ -64,6 +64,22 @@ ClientConfig validatedConfig(ClientConfig c) {
         while (!pw.empty() && (pw.back() == '\n' || pw.back() == '\r')) pw.pop_back();
         c.password = std::move(pw);
     }
+    // Issues #14 / #113: credentials (a SCRAM proof, a verifier in security DDL) and the bootstrap material travel
+    // only over TLS.  Without offerCrypto that is impossible: refused, never silently plaintext.
+    const bool credentialed = !c.username.empty() || !c.password.empty() || c.securityBootstrapOnly;
+    if (credentialed && !c.insecurePlaintextAuth) {
+        if (!c.offerCrypto)
+            throw std::invalid_argument("ClientConfig: credentials (username / password / securityBootstrapOnly) are "
+                                        "sent only over TLS: set offerCrypto (with tlsTrustPem and / or tlsExpectHost) "
+                                        "- insecurePlaintextAuth is for tests only");
+        c.requireCrypto = true;
+    }
+    // Issue #115: the system store with no name check accepts any public certificate for any name.
+    if (c.offerCrypto && !c.tlsTrustPem && c.tlsExpectHost.empty() &&
+        session::tlsHostOfChannel(c.gatewayChannel).empty())
+        throw std::invalid_argument("ClientConfig: offerCrypto with the system trust store needs a certificate name: "
+                                    "set tlsExpectHost (the gateway channel '" + c.gatewayChannel + "' names no host), "
+                                    "or pin a CA bundle with tlsTrustPem");
     return c;
 }
 // F8c C8: the runner start latch (spec §3.4) — one empty record on a
@@ -2273,11 +2289,23 @@ void Client::sweepControl_(int64_t nowNs) {
     // (connect() moves the machine out of Disconnected before the op is pending;
     // Backoff — reconnect-forever — keeps trying and stays deadline-bounded.)
     if (hasPendingConnect_ &&
-        agent_.seedMachine().state() == session::SessionState::Disconnected) [[unlikely]] {
+        (agent_.seedMachine().state() == session::SessionState::Disconnected ||
+         // PR #476 review: a machine that is not reconnect-forever enters Backoff only after unproven TLS final-leg
+         // failures exhausted their retries - the pending connect has failed too.
+         (agent_.seedMachine().state() == session::SessionState::Backoff && !cfg_.reconnectForeverAfterLive))) [[unlikely]] {
         static constexpr std::string_view kGaveUp =
             "connect() gave up (redirect budget exhausted or connect refused): not connected";
-        completeConnect_(OpStatus::NotConnected, 0, 0, kGaveUp);
-        if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(kGaveUp)); });
+        // Issue #13 / #14: a session that requires TLS and never got it says why (the refusals were unauthenticated,
+        // so they were retried, not reported as a verdict).
+        static constexpr std::string_view kNoTls =
+            "connect() gave up: no TLS session (HandshakeFailed, 29) - the broker's certificate is not trusted or does "
+            "not name its host (ClientConfig tlsTrustPem / tlsExpectHost; the CLI's --tls-ca / --tls-host), or the "
+            "broker answered without TLS";
+        const int16_t last = agent_.seedMachine().lastConnectError();
+        const bool noTls = last == static_cast<int16_t>(static_cast<uint16_t>(rune::protocol::client::ErrorCode::HandshakeFailed));
+        const std::string_view why = noTls ? kNoTls : kGaveUp;
+        completeConnect_(OpStatus::NotConnected, 0, last > 0 ? static_cast<uint16_t>(last) : 0, why);
+        if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(why)); });
     }
     if (hasPendingConnect_ && nowNs >= pendingConnect_.deadlineNs) {
         completeConnect_(OpStatus::Timeout, 0, 0, {});
@@ -2329,7 +2357,10 @@ void Client::throwForStatus_(const char* what, const Completion& c, std::span<co
     case OpStatus::Ok:             return;
     case OpStatus::Timeout:        msg += ": timed out"; break;
     case OpStatus::Closed:         msg += ": client closed"; break;
-    case OpStatus::NotConnected:   msg += ": not connected (state != Connected)"; break;
+    case OpStatus::NotConnected:
+        msg += ": not connected (state != Connected)";
+        if (!payload.empty()) msg += ": " + std::string(reinterpret_cast<const char*>(payload.data()), payload.size());
+        break;
     case OpStatus::SessionLost:    msg += ": session lost before the answer"; break;
     case OpStatus::InvalidArgument:
         msg += ": invalid argument";
@@ -6014,6 +6045,10 @@ int Client::driveSeedFailover_(int64_t nowNs) noexcept {
     const bool     newLoss = losses != seedFailoverLossesSeen_;
     seedFailoverLossesSeen_ = losses;
     if (auto* f = std::get_if<SeedFailingOver>(&seedFailover_)) [[unlikely]] {
+        // PR #476 review: a TLS session is Connected optimistically once the client sent its Finished; only a sealed
+        // frame proves the broker holds the keys (its final leg may still fail).  Until then the failover neither ends
+        // (its growing gaps survive a broker that fails every final leg - no reconnect storm) nor moves on.
+        if (st == session::SessionState::Connected && m.cryptoState().encrypted && !m.brokerKeysProven()) return 0;
         if (st == session::SessionState::Connected) {
             std::fprintf(stderr, "rune-client: seed reconnected on %s after %u failover attempt(s)\n",
                          agent_.seedChannel().c_str(), f->attempt);

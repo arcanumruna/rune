@@ -51,6 +51,7 @@ struct AuthNode {
         std::filesystem::permissions(keyFile, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
         NodeConfig cfg = makeConfig(1, dir.path, ports, 1, Mode::Shard);
         cfg.authMode = AuthMode::Enabled;
+        cfg.clientTransport = ClientTransport::PlaintextForTest;   // issue #10: plaintext client sessions, test only
         cfg.clusterKeyFile = keyFile.string();
         if (tweak) tweak(cfg);
         node = std::make_unique<BrokerNode>(cfg);

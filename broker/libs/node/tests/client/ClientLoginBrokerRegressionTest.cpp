@@ -31,6 +31,8 @@ std::unique_ptr<rc::Client> makeClient(AuthBroker& b, const std::string& user, c
     c.dataDir         = b.clientDir().string();
     c.username        = user;
     c.password        = password;
+    c.offerCrypto     = true;                      // issue #14: credentials only over TLS
+    c.tlsTrustPem     = AuthBroker::tlsCaPem();   // the rig's test CA (the certificate names 127.0.0.1)
     return std::make_unique<rc::Client>(c);
 }
 

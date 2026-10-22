@@ -263,7 +263,10 @@ TEST(AuthLoginRegression, DevModeSessionsAreAnonymousAndNeverAskForCredentials) 
     EXPECT_TRUE(b.node().gatewayHasSessionForTest(sid));
 }
 
-TEST(AuthLoginRegression, ResumedSessionKeepsItsAuthentication) {
+// Issue #10: a Connect never resumes an authenticated session by naming its id - the plaintext resume-by-id (D11) let
+// any UDP sender that knows a session id and its reply endpoint take it over.  Even from the same endpoint the hint is
+// a fresh session that must log in, and the original session is untouched.  RED: restore resumeAuthenticated_.
+TEST(AuthLoginRegression, AResumeHintNeverResumesAnAuthenticatedSessionRegression) {
     AuthBroker b("resume");
     b.bootstrapAdmin();
     b.createUser("ws1", kPwA);
@@ -271,27 +274,18 @@ TEST(AuthLoginRegression, ResumedSessionKeepsItsAuthentication) {
     const int64_t sid = w.connect(b.channel());
     ASSERT_GT(sid, 0);
     ASSERT_TRUE(w.login(b.channel(), sid, "ws1", {kPwA, kPwA}).ok());
-    // The same client reconnecting with its session id as the resume hint: answered ResumedAuthenticated, same session.
     w.raw().setConnectHint(sid);
     const int64_t again = w.connect(b.channel());
-    EXPECT_EQ(again, sid) << "no new session";
+    ASSERT_GT(again, 0);
+    EXPECT_NE(again, sid) << "a new session, never the authenticated one";
     ASSERT_TRUE(w.lastConnect().has_value());
     EXPECT_EQ(w.lastConnect()->authMode, pc::AuthMode::Required);
-    EXPECT_EQ(w.lastConnect()->authState, pc::AuthState::ResumedAuthenticated);
-    // The resumed session is still authenticated: a DefineTopic is not refused for authentication.
-    const auto def = w.raw().defineTopicUntil(b.channel(), AuthWireClient::kClientStream, sid, "t-resume", 1, false, {},
+    EXPECT_EQ(w.lastConnect()->authState, pc::AuthState::MustAuthenticate) << "it must log in";
+    const auto def = w.raw().defineTopicUntil(b.channel(), AuthWireClient::kClientStream, again, "t-resume", 1, false, {},
                                               std::chrono::steady_clock::now() + 20s);
     ASSERT_TRUE(def.has_value());
-    EXPECT_NE(def->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
-    // A hint naming a session that never logged in (or of another endpoint) is a fresh, unauthenticated session.
-    w.raw().setConnectHint(0);
-    const int64_t fresh = w.connect(b.channel());
-    ASSERT_GT(fresh, 0);
-    w.raw().setConnectHint(fresh);
-    const int64_t notResumed = w.connect(b.channel());
-    ASSERT_GT(notResumed, 0);
-    EXPECT_NE(notResumed, fresh) << "a session that never authenticated is not resumable";
-    EXPECT_EQ(w.lastConnect()->authState, pc::AuthState::MustAuthenticate);
+    EXPECT_EQ(def->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed)) << "not authenticated";
+    EXPECT_TRUE(b.node().gatewayHasSessionForTest(sid)) << "the original session is untouched";
 }
 
 TEST(AuthLoginRegression, LoginLogsNameTheReasonButTheWireDoesNot) {

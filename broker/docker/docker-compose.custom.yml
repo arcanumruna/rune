@@ -41,6 +41,10 @@ services:
       RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-}"
       # Authentication is ON by default: the same cluster key file on every node (see CLUSTER_KEY_FILE).
       RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
+      # Issue #10: every client session of an authenticating broker is TLS - the broker certificate (and key)
+      # sit next to the cluster key (docker/lib/auth.sh rune_gen_cluster_key writes all three).
+      RUNE_TLS_CERT_FILE: /run/secrets/tls.pem
+      RUNE_TLS_KEY_FILE: /run/secrets/tls.key
       # Container /dev/shm budget: 48 MiB per log at the 16 MiB default term.
       RUNE_AERON_TERM_BUFFER_BYTES: "${RUNE_AERON_TERM_BUFFER_BYTES:-4194304}"
       # --- optional (defaults shown) ---
@@ -57,6 +61,18 @@ services:
         read_only: true
         bind:
           create_host_path: false   # a missing key file fails the start; never a directory
+      - type: bind
+        source: ${TLS_CERT_FILE:-./secrets/tls.pem}
+        target: /run/secrets/tls.pem
+        read_only: true
+        bind:
+          create_host_path: false   # issue #10: a missing TLS file fails the start
+      - type: bind
+        source: ${TLS_KEY_FILE:-./secrets/tls.key}
+        target: /run/secrets/tls.key
+        read_only: true
+        bind:
+          create_host_path: false   # issue #10: a missing TLS file fails the start
     ports:
       - "${CLIENT_HOST_PORT_1:-40201}:${CLIENT_PORT:-40200}/udp"
     healthcheck:
@@ -86,6 +102,10 @@ services:
       RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-}"
       # Authentication is ON by default: the same cluster key file on every node (see CLUSTER_KEY_FILE).
       RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
+      # Issue #10: every client session of an authenticating broker is TLS - the broker certificate (and key)
+      # sit next to the cluster key (docker/lib/auth.sh rune_gen_cluster_key writes all three).
+      RUNE_TLS_CERT_FILE: /run/secrets/tls.pem
+      RUNE_TLS_KEY_FILE: /run/secrets/tls.key
       RUNE_CLIENT_STREAM_ID: "${RUNE_CLIENT_STREAM_ID:-1}"
       RUNE_CONSENSUS_STREAM_ID: "${RUNE_CONSENSUS_STREAM_ID:-10}"
       RUNE_ELECTION_TIMEOUT_MS: "${RUNE_ELECTION_TIMEOUT_MS:-150}"
@@ -99,6 +119,18 @@ services:
         read_only: true
         bind:
           create_host_path: false   # a missing key file fails the start; never a directory
+      - type: bind
+        source: ${TLS_CERT_FILE:-./secrets/tls.pem}
+        target: /run/secrets/tls.pem
+        read_only: true
+        bind:
+          create_host_path: false   # issue #10: a missing TLS file fails the start
+      - type: bind
+        source: ${TLS_KEY_FILE:-./secrets/tls.key}
+        target: /run/secrets/tls.key
+        read_only: true
+        bind:
+          create_host_path: false   # issue #10: a missing TLS file fails the start
     ports:
       - "${CLIENT_HOST_PORT_2:-40202}:${CLIENT_PORT:-40200}/udp"
     healthcheck:
@@ -128,6 +160,10 @@ services:
       RUNE_STORAGE_FORMAT: "${RUNE_STORAGE_FORMAT:-}"
       # Authentication is ON by default: the same cluster key file on every node (see CLUSTER_KEY_FILE).
       RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
+      # Issue #10: every client session of an authenticating broker is TLS - the broker certificate (and key)
+      # sit next to the cluster key (docker/lib/auth.sh rune_gen_cluster_key writes all three).
+      RUNE_TLS_CERT_FILE: /run/secrets/tls.pem
+      RUNE_TLS_KEY_FILE: /run/secrets/tls.key
       RUNE_CLIENT_STREAM_ID: "${RUNE_CLIENT_STREAM_ID:-1}"
       RUNE_CONSENSUS_STREAM_ID: "${RUNE_CONSENSUS_STREAM_ID:-10}"
       RUNE_ELECTION_TIMEOUT_MS: "${RUNE_ELECTION_TIMEOUT_MS:-150}"
@@ -141,6 +177,18 @@ services:
         read_only: true
         bind:
           create_host_path: false   # a missing key file fails the start; never a directory
+      - type: bind
+        source: ${TLS_CERT_FILE:-./secrets/tls.pem}
+        target: /run/secrets/tls.pem
+        read_only: true
+        bind:
+          create_host_path: false   # issue #10: a missing TLS file fails the start
+      - type: bind
+        source: ${TLS_KEY_FILE:-./secrets/tls.key}
+        target: /run/secrets/tls.key
+        read_only: true
+        bind:
+          create_host_path: false   # issue #10: a missing TLS file fails the start
     ports:
       - "${CLIENT_HOST_PORT_3:-40203}:${CLIENT_PORT:-40200}/udp"
     healthcheck:

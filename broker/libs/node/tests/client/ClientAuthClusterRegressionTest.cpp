@@ -45,6 +45,8 @@ rc::ClientConfig configFor(AuthTrio& t, int id, const std::string& user, const s
     c.dataDir         = (t.cluster().clientsDir->path / ("rc" + std::to_string(id) + "_" + std::to_string(seq))).string();
     c.username        = user;
     c.password        = password;
+    c.offerCrypto     = true;                      // issue #14: credentials only over TLS
+    c.tlsTrustPem     = AuthTrio::tlsCaPem();      // the trio's test CA (the certificate names 127.0.0.1)
     return c;
 }
 

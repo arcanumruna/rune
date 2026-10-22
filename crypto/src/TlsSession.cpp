@@ -7,6 +7,8 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include <arpa/inet.h>
+
 #include <cstring>
 #include <utility>
 
@@ -47,6 +49,12 @@ bool loadTrustBundle(SSL_CTX* ctx, const char* trustPem) {
   }
   BIO_free(bio);
   return loadedAny;
+}
+
+// An IPv4 or IPv6 address literal (no brackets), as X509_VERIFY_PARAM_set1_ip_asc parses it.
+bool isIpLiteral(const char* host) {
+  unsigned char buf[16];
+  return inet_pton(AF_INET, host, buf) == 1 || inet_pton(AF_INET6, host, buf) == 1;
 }
 
 // Attaches fresh memory BIOs to `ssl`. On success ssl_ owns both (freed by SSL_free).
@@ -148,15 +156,27 @@ TlsSession TlsSession::makeClient(const char* trustPemOrNull, const char* expect
     s.release();
     return s;
   }
-  if (expectHost && expectHost[0]) {
-    // Hostname pinning against the cert SAN. Must fail CLOSED: if this doesn't install
-    // (e.g. OOM), SSL_VERIFY_PEER alone would still accept any chain-valid cert for ANY
-    // host, which is a hostname-check bypass — so refuse to hand back a usable session.
-    if (SSL_set1_host(s.ssl_, expectHost) != 1) {
+  const bool haveHost = expectHost && expectHost[0];
+  if (!haveHost && trustPemOrNull == nullptr) {
+    // Issue #115: the system store with no name check accepts ANY publicly trusted certificate for ANY name - a
+    // TLS-terminating relay with a certificate for its own domain would pass.  Refused (fail closed).
+    s.release();
+    return s;
+  }
+  if (haveHost) {
+    // Name pinning against the cert SAN. Must fail CLOSED: if this doesn't install (e.g. OOM), SSL_VERIFY_PEER
+    // alone would still accept any chain-valid cert for ANY host, which is a name-check bypass — so refuse to hand
+    // back a usable session.  An IP literal is checked against the iPAddress SANs (a DNS-name check never matches
+    // one) and sends no SNI (RFC 6066: SNI carries DNS names only).
+    if (isIpLiteral(expectHost)) {
+      if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(s.ssl_), expectHost) != 1) {
+        s.release();
+        return s;
+      }
+    } else if (SSL_set1_host(s.ssl_, expectHost) != 1 || SSL_set_tlsext_host_name(s.ssl_, expectHost) != 1) {
       s.release();
       return s;
     }
-    SSL_set_tlsext_host_name(s.ssl_, expectHost);  // SNI
   }
   if (!attachMemoryBios(s.ssl_, s.rbio_, s.wbio_)) {
     s.release();

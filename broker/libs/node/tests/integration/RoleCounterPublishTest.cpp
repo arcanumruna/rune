@@ -358,6 +358,7 @@ TEST(SecurityAtRestRegression, SecurityLogFilesAreOwnerOnlyRegression) {
     fs::permissions(key, fs::perms::owner_read | fs::perms::owner_write);
     NodeConfig cfg = makeSingleNodeConfig(tmp.path);
     cfg.authMode = AuthMode::Enabled;
+    cfg.clientTransport = ClientTransport::PlaintextForTest;   // issue #10: plaintext client sessions, test only
     cfg.clusterKeyFile = key.string();
     BrokerNode node{cfg};
     node.start();
@@ -388,6 +389,7 @@ TEST(SecurityAtRestRegression, AGroupOrWorldReadableClusterKeyRefusesToStartRegr
     { std::ofstream(key) << std::string(40, 'k') << "\n"; }
     NodeConfig cfg = makeSingleNodeConfig(tmp.path);
     cfg.authMode = AuthMode::Enabled;
+    cfg.clientTransport = ClientTransport::PlaintextForTest;   // issue #10: plaintext client sessions, test only
     cfg.clusterKeyFile = key.string();
     for (const auto bad : {fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read,
                            fs::perms::owner_read | fs::perms::owner_write | fs::perms::others_read,
@@ -416,6 +418,7 @@ TEST(NodeConfigRegression, EnabledModeNeedsAUsableClusterKeyFileAtStartRegressio
     {
         NodeConfig cfg = makeSingleNodeConfig(tmp.path);
         cfg.authMode = AuthMode::Enabled;
+        cfg.clientTransport = ClientTransport::PlaintextForTest;   // issue #10: plaintext client sessions, test only
         cfg.clusterKeyFile = bad.string();
         BrokerNode node{cfg};
         try {
@@ -430,6 +433,7 @@ TEST(NodeConfigRegression, EnabledModeNeedsAUsableClusterKeyFileAtStartRegressio
     TempDir tmp2{"enabled2_"};
     NodeConfig cfg = makeSingleNodeConfig(tmp2.path);
     cfg.authMode = AuthMode::Enabled;
+    cfg.clientTransport = ClientTransport::PlaintextForTest;   // issue #10: plaintext client sessions, test only
     cfg.clusterKeyFile = good.string();
     BrokerNode node{cfg};
     node.start();
@@ -453,6 +457,7 @@ TEST(RoleCounterRegression, PeerLinkCountersArePublishedRegression) {
         fs::permissions(keyDir / n, fs::perms::owner_read | fs::perms::owner_write);
     ThreeNodes c = ThreeNodes::startWith("plctr", [&](NodeConfig& k) {
         k.authMode = AuthMode::Enabled;
+        k.clientTransport = ClientTransport::PlaintextForTest;   // issue #10: plaintext client sessions, test only
         k.clusterKeyFile = ((k.nodeId == 3) ? keyDir / "x.key" : keyDir / "k.key").string();
     });
     auto aeronDir = [&](int id) { return c.dirs[static_cast<std::size_t>(id - 1)]->path / "aeron"; };

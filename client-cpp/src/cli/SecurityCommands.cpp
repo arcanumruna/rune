@@ -195,7 +195,11 @@ void printSecurityUsage(std::ostream& err) {
         << "  rune security gen-cluster-key --out <path>\n"
         << "      Writes a new cluster key (64 hex characters, mode 0600; an existing file is never overwritten).\n"
         << "  Credentials for every command that connects: --user <u> (or RUNE_USER) and --password-file <path>\n"
-        << "      (or RUNE_PASSWORD_FILE).  A password is never accepted on the command line or from the environment.\n";
+        << "      (or RUNE_PASSWORD_FILE).  A password is never accepted on the command line or from the environment.\n"
+        << "  TLS for every command that connects (a UDP broker is always reached over TLS): --tls-ca <pem> (or\n"
+        << "      RUNE_TLS_CA_FILE) trusts that CA instead of the system store; --tls-host <name> (or RUNE_TLS_HOST) is the\n"
+        << "      certificate name to check (default: the broker's host).  --insecure-plaintext connects without TLS and\n"
+        << "      never sends credentials or the bootstrap (dev-mode brokers only).\n";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

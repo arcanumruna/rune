@@ -31,6 +31,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -79,6 +80,11 @@ public:
         int64_t  authTimeoutMs = 10'000;
         std::string keyContents = std::string(48, 'K') + "\n";
         bool shard = false;   ///< shard worker mode (clients can produce straight to the worker ingress; Task 13)
+        /// Issues #10 / #137: the broker always serves the generated test certificate (a client offering TLS gets an
+        /// encrypted session).  tlsOnly = the DEFAULT transport of an authenticating broker: every client session TLS,
+        /// a plaintext Connect HandshakeFailed.  false = ClientTransport::PlaintextForTest, so the raw-frame helpers
+        /// (bootstrapAdmin, wire()) still drive plaintext sessions.
+        bool tlsOnly = false;
     };
     static constexpr const char* kBootstrapPassword = "bootstrap-otp-123456";
     static constexpr const char* kAdminPassword     = "admin-password-1234";
@@ -129,6 +135,9 @@ public:
         }
         cfg.authMode = opts_.mode;
         cfg.authTimeoutMs = opts_.authTimeoutMs;
+        cfg.tlsCertFile = tlsCaFile().parent_path().string() + "/server.pem";
+        cfg.tlsKeyFile  = tlsCaFile().parent_path().string() + "/server.key";
+        if (!opts_.tlsOnly) cfg.clientTransport = ClientTransport::PlaintextForTest;
         if (opts_.mode == AuthMode::Enabled) {
             keyFile_ = dir_ / "cluster.key";
             { std::ofstream f(keyFile_, std::ios::binary); f << opts_.keyContents; }
@@ -179,6 +188,13 @@ public:
     [[nodiscard]] std::string endpoint() const { return "127.0.0.1:" + std::to_string(clientPort_); }
     [[nodiscard]] const std::string& keyContents() const noexcept { return opts_.keyContents; }
     [[nodiscard]] const std::filesystem::path& keyFile() const noexcept { return keyFile_; }
+    /// The CA that signed the broker's test certificate (names localhost and 127.0.0.1): the CLI's --tls-ca, a
+    /// client's tlsTrustPem.
+    [[nodiscard]] static std::filesystem::path tlsCaFile() { return std::filesystem::path(RUNE_CRYPTO_TESTDATA_DIR) / "ca.pem"; }
+    [[nodiscard]] static std::string tlsCaPem() {
+        std::ifstream f(tlsCaFile(), std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    }
     [[nodiscard]] const std::filesystem::path& dir() const noexcept { return dir_; }
     /// A fresh directory for a client's own Aeron driver / data.
     [[nodiscard]] std::filesystem::path clientDir() { return dir_ / ("client" + std::to_string(clientDirs_++)); }

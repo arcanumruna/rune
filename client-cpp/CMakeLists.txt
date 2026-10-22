@@ -24,20 +24,10 @@ find_package(spdlog REQUIRED)
 # client<->broker TLS/AEAD (Task 5): TLS 1.3 handshake + AEAD (rune-crypto, below).
 find_package(OpenSSL REQUIRED)
 
-# Task 9 / spec §11: RUNE_TLS — the client<->broker TLS/AEAD enablement gate,
-# mirroring the broker's RUNE_TLS CMake option for a consistent build matrix.
-# Unlike the broker, the client has no env-driven TLS config to gate: its
-# crypto core (Tasks 5-8/8b) is already always compiled in, and
-# offerCrypto/tlsTrustPem/tlsExpectHost/authToken/requireCrypto
-# (ClientConfig, mapped into session::SessionConfig by Client.cpp's
-# toAgentConfig()) are plain programmatic fields an application sets in code
-# — they default to false/empty regardless of this option, so a caller who
-# never touches them gets today's byte-identical plaintext connect either
-# way. This option exists so RUNE_TLS=ON/OFF can be passed uniformly across
-# both repos' build scripts; it does not currently change this repo's compiled
-# output (reserved for a future env-var-driven default, symmetric with the
-# broker's RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE/RUNE_REQUIRE_TLS).
-option(RUNE_TLS "Enable the RUNE_TLS client<->broker TLS/AEAD config path (build-matrix parity with the broker; no effect on this repo's compiled output today)" OFF)
+# Task 9 / spec §11: RUNE_TLS — build-matrix parity with the broker's RUNE_TLS option (default ON there).  The
+# client's TLS is programmatic (ClientConfig offerCrypto / tlsTrustPem / tlsExpectHost; a credentialed client sends its
+# credentials only over TLS - issue #14) and always compiled in; this option does not change this repo's output.
+option(RUNE_TLS "Build-matrix parity with the broker's RUNE_TLS option (no effect on this repo's compiled output)" ON)
 
 option(ENABLE_COVERAGE "Enable coverage instrumentation" OFF)
 if(ENABLE_COVERAGE)
@@ -1565,6 +1555,8 @@ if(BUILD_TESTING)
         )
         target_include_directories(rune_client_auth_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
         target_link_libraries(rune_client_auth_tests PRIVATE rune_client_api GTest::gtest_main)
+        # Issue #14: the fake broker serves TLS with the generated test certificate (credentials only over TLS).
+        target_compile_definitions(rune_client_auth_tests PRIVATE RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_TESTDATA_GEN}")
         if(UNIX AND NOT APPLE AND UUID_LIB_INVOKER)
             target_link_libraries(rune_client_auth_tests PRIVATE ${UUID_LIB_INVOKER})
         endif()
@@ -1750,6 +1742,8 @@ if(BUILD_TESTING AND aeron_FOUND)
     )
     target_include_directories(rune_cli_security_live_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${RUNE_CODEC_ROOT}/include ${RUNE_QL_ROOT}/include)
     target_link_libraries(rune_cli_security_live_tests PRIVATE rune_cli_lib rune_client_api GTest::gtest_main)
+    # Issue #13: the CLI sends credentials only over TLS - the fake broker serves the generated test certificate.
+    target_compile_definitions(rune_cli_security_live_tests PRIVATE RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_TESTDATA_GEN}")
     target_compile_features(rune_cli_security_live_tests PRIVATE cxx_std_23)
     if(UNIX AND NOT APPLE)
         find_library(UUID_LIB_SECLIVE uuid)

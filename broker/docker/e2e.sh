@@ -23,7 +23,8 @@
 #
 # Authentication (Task 20): every launcher now runs an AUTHENTICATED cluster.  The script generates a cluster key
 # before `up` (docker/lib/auth.sh), bootstraps the first admin and creates the e2e user once a leader exists, and
-# create-topics.sh logs in as that user.  The raw-Aeron ping probe needs no login (Ping is a session-level frame).
+# create-topics.sh logs in as that user.  The raw-Aeron ping probe needs no login (Ping is a session-level frame);
+# it runs its session over TLS (issue #10: an authenticating broker serves only TLS sessions), trusting the run's CA.
 #
 # Constraints (brief):
 #   - All channels aeron:udp.

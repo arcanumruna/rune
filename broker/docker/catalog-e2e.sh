@@ -169,7 +169,7 @@ docker rm -f "${TOOLS}" >/dev/null 2>&1 || true
 docker run -d --name "${TOOLS}" --hostname "${TOOLS}" --platform linux/amd64 --shm-size=256m \
     --security-opt seccomp=unconfined \
     -v "${WORK_DIR}:/work" -v "${SCRIPT_DIR}/topics:/topics:ro" -v "${RUNE_SECRETS_DIR}:/run/secrets:ro" \
-    -e RUNE_USER="${RUNE_AUTH_E2E_USER}" -e RUNE_PASSWORD_FILE=/work/e2e.pw \
+    -e RUNE_USER="${RUNE_AUTH_E2E_USER}" -e RUNE_PASSWORD_FILE=/work/e2e.pw -e RUNE_TLS_CA_FILE=/run/secrets/ca.pem \
     "${QL_IMAGE}" sleep infinity >/dev/null || fail "could not start the client container"
 set +e
 out=$(tx cmake --build /build/build --target view_probe rune_produce_subscribe -j2 2>&1); rc=$?

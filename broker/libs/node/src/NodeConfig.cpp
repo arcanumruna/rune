@@ -293,6 +293,17 @@ std::optional<std::string> NodeConfig::validateCatalogStream() const {
 }
 
 // ---------------------------------------------------------------------------
+// tlsBuild  (issue #11): the RUNE_TLS CMake option, seen by rune_node only (RUNE_TLS_ENABLED is PRIVATE to it)
+// ---------------------------------------------------------------------------
+bool tlsBuild() noexcept {
+#ifdef RUNE_TLS_ENABLED
+    return true;
+#else
+    return false;
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // NodeConfig::validateAuthTopology  (combined fix program M4: X012, X082, X083)
 // ---------------------------------------------------------------------------
 std::optional<std::string> NodeConfig::validateAuthTopology() const {
@@ -351,6 +362,11 @@ std::optional<std::string> NodeConfig::validateAuth(std::optional<rune::peerlink
                    static_cast<unsigned>(st.st_mode & 0777)); return std::string(b); }() +
                    "); restrict it to the broker's user (chmod 0400) - refusing to start";
     }
+    // Issue #10 (M1): every client session of an authenticating broker is TLS - it needs its certificate.
+    if (mustRefuseRequiredTlsWithoutCertificate(requiresClientTls(), tlsConfigured(tlsCertFile, tlsKeyFile)))
+        return std::string("authentication is enabled and every client session is TLS, but no certificate is "
+                           "configured: set RUNE_TLS_CERT_FILE and RUNE_TLS_KEY_FILE (PEM), or RUNE_AUTH=disabled for "
+                           "single-node development");
     return std::nullopt;
 }
 
@@ -894,22 +910,23 @@ ConfigResult parseNodeConfig(
         }
     }
 
-    // Task 9 (RUNE_TLS toggle, spec §11): cert/key file paths + require_tls.
-    // Only consulted in a RUNE_TLS build (RUNE_TLS_ENABLED) — a RUNE_TLS=OFF
-    // build never reads these env vars, so it stays byte-identical plaintext
-    // no matter what an operator sets (the CMake gate, not just a runtime
-    // default, is the safety net here).
-#ifdef RUNE_TLS_ENABLED
-    if (const char* cf = getenv_fn("RUNE_TLS_CERT_FILE"); cf && *cf) cfg.tlsCertFile = cf;
-    if (const char* kf = getenv_fn("RUNE_TLS_KEY_FILE");  kf && *kf) cfg.tlsKeyFile  = kf;
-    {
-        const char* raw = getenv_fn("RUNE_REQUIRE_TLS");
-        if (raw) {
-            const std::string_view sv(raw);
-            cfg.requireTls = (sv == "1" || sv == "true" || sv == "TRUE");
+    // Task 9 (RUNE_TLS toggle, spec §11): cert/key file paths + require_tls.  Only a RUNE_TLS build reads them;
+    // issue #11 (M1): a non-TLS build REFUSES any of them (below, with RUNE_AUTH) instead of silently starting
+    // plaintext - an operator who asked for TLS never gets a plaintext broker.
+    const char* rawTlsCert    = getenv_fn("RUNE_TLS_CERT_FILE");
+    const char* rawTlsKey     = getenv_fn("RUNE_TLS_KEY_FILE");
+    const char* rawRequireTls = getenv_fn("RUNE_REQUIRE_TLS");
+    bool requireTlsFalse = false;   // RUNE_REQUIRE_TLS given and false: refused with authentication (below)
+    if (tlsBuild()) {
+        if (rawTlsCert && *rawTlsCert) cfg.tlsCertFile = rawTlsCert;
+        if (rawTlsKey && *rawTlsKey)   cfg.tlsKeyFile  = rawTlsKey;
+        if (rawRequireTls && *rawRequireTls) {
+            const std::string_view sv(rawRequireTls);
+            if (sv == "1" || sv == "true" || sv == "TRUE") cfg.clientTransport = ClientTransport::RequireTls;
+            else if (sv == "0" || sv == "false" || sv == "FALSE") requireTlsFalse = true;
+            else return {{}, std::string("RUNE_REQUIRE_TLS must be 'true' or 'false', got: ") + rawRequireTls};
         }
     }
-#endif
 
     // --- Authentication (authentication plan Task 9): RUNE_AUTH default ON; dev mode is explicit and single-node.
     if (const char* raw = getenv_fn("RUNE_AUTH"); raw && *raw) {
@@ -1468,6 +1485,15 @@ ConfigResult parseNodeConfig(
     if (auto err = cfg.validateCatalogStream()) return {{}, *err};
 
     // Authentication (Task 9): last, so every other parse error keeps naming itself first.
+    // Issues #10 / #11 (M1): authentication needs a TLS build and TLS on every client session.
+    if (auto err = tlsBuildRefusal(tlsBuild(), (rawTlsCert && *rawTlsCert) || (rawTlsKey && *rawTlsKey) ||
+                                                   (rawRequireTls && *rawRequireTls),
+                                   cfg.authMode == AuthMode::Enabled))
+        return {{}, *err};
+    if (requireTlsFalse && cfg.authMode == AuthMode::Enabled)
+        return {{}, "RUNE_REQUIRE_TLS=false refuses to start with authentication enabled: every client session of an "
+                    "authenticating broker is TLS (a plaintext session can be taken over by any UDP sender); unset it, "
+                    "or set RUNE_AUTH=disabled for single-node development"};
     if (cfg.authMode == AuthMode::DevDisabled && cfg.peers.size() > 1)
         return {{}, "RUNE_AUTH=disabled (dev mode) refuses to start as part of a multi-broker cluster (RUNE_PEERS lists " +
                         std::to_string(cfg.peers.size()) + " brokers); enable authentication"};
