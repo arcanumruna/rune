@@ -1,6 +1,6 @@
 # Checked writes: typed topics, write intents, broker-assigned ids, wide view keys and view constraints
 
-Status: design, 2026-10-22. Not yet approved. Revised the same day to design B: records are judged at fold (§3).
+Status: approved by the owner, 2026-10-22. Design B: records are judged at fold (§3); transactions vote before commit (§9b).
 
 ## 1. Why
 
