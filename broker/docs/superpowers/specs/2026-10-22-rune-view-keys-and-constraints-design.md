@@ -244,6 +244,40 @@ Restart and view rebuild (`RebuildingViews`) use the same gate.
   - Drop then create does leave a window, and the docs say so.
 - **Drop.** The constraint is removed when the drop is installed on the leader.
 
+**6.7 Write intents and typed delete**
+
+Today every write is an upsert, and a delete is a record with an empty value. Rune treats an empty value as a tombstone (`LogCleaner::isTombstone`, the view fold), where Kafka uses a null value. A create and an update can't be told apart.
+
+- **Wire.** Each record has an `attributes` byte (`RecordBatch.h:146`). It is always 0 today. Readers skip it, and compaction copies it unchanged (`BatchRebuild.h`). Bits 0–1 of that byte carry the intent:
+
+  | Intent | Bits | Value | Broker rule | Rejection (definite) |
+  |---|---|---|---|---|
+  | upsert | 0 | row | none (today's behavior; the default) | — |
+  | insert | 1 | row | key must not exist | `KeyExists` (new code 53) |
+  | update | 2 | row | key must exist | `KeyNotFound` (new code 54) |
+  | delete | 0 | empty | none (idempotent, as today) | — |
+  | delete existing | 2 | empty | key must exist | `KeyNotFound` |
+
+  Bit pattern 3 is reserved and rejected with `InvalidRequest`.
+- **Key index.** A per-partition set of the keys that exist, enabled per topic with `with (key.index = on)`.
+  - It uses the same machinery as a projection view keyed by the source key, without the columns, at about 16 bytes per key.
+  - The intent check runs in the §6.2 hook against the key index plus the overlay, under the same §6.4 counting rules: a pending insert counts at once, and a pending delete counts only under (a), (b) or (c).
+  - It is subject to the same readiness gate (§6.5).
+  - An intent other than 0 sent to a topic without a key index is refused with a definite `InvalidRequest`.
+- **What the log says.** A write whose intent fails is never appended, so the intents in the log are what actually happened. `insert` was a create, `update` was an update, and a tombstone with intent 2 deleted an existing key.
+  - Compaction only removes superseded records, so a key's original `insert` record disappears once a later update replaces it.
+  - A consumer reading compacted history must therefore treat records as upserts. The intent is exact only for records read before compaction.
+- **Compatibility.** The client sends a non-zero intent only when the cluster feature level (`kViewKeysConstraints`) supports it. An older broker ignores the bits and would silently upsert, so against an old cluster the client fails the call locally.
+- **Client API.**
+  - Raw producer: `send(topic, key, value, WriteIntent)`, with the intent defaulting to `Upsert`.
+  - Typed (`TypedTopic<T>`):
+    - `insert(rec)`, `update(rec)`, `upsert(rec)` (alias of today's `send`)
+    - `remove(key)`: a tombstone
+    - `removeExisting(key)`: a tombstone with intent 2
+    - each of these also has an `…AndWait` form
+  - `remove` and `removeExisting` take the topic's C++ key type, so the key bytes are always encoded exactly as `send(rec)` routes them. Today a delete needs the raw producer and a hand-encoded `Key`, and a wrong key width silently deletes the wrong key or nothing.
+- **Consumer.** `record.op()` returns `Insert`, `Update`, `Upsert` or `Delete`.
+
 ## 7. Errors and the client
 
 **7.1 Broker**
@@ -423,6 +457,9 @@ Every cell is a test (unit, integration or e2e, wherever it can first be seen). 
 - a committed transactional release followed by a reuse before the fold catches up
 - a non-idempotent, `acks=leader` or version-11 client writing to a constrained topic
 - a coalesced batch with one violating record among valid ones
+- every intent × {key absent, key present, key pending insert, key pending delete (transactional and not)}
+- `remove` / `removeExisting` through the typed API for every key type width (u16/u32/u64/i64/string(N)), checking that the routed key bytes match `send(rec)`
+- an intent sent to a topic without a key index, and to an old-feature-level cluster
 - error 51 inside a transaction
 
 **Reads**
@@ -452,7 +489,8 @@ Each part can be shipped on its own:
 2. Keys: wide and derived keys, the owner map, the seeded hash and checkpoint v3. Covers §4 and §5 apart from §5.4.
 3. Composite keys, the prefix index, `GetViewRowK`, `ScanViewRows` and the client read API. Covers §5.4 and §8.
 4. Rune QL `create view` (plan v2, the feature level) and `select`, plus the CLI. Covers §9.
-5. Constraints: the hook, the overlay, the gate, error 51 and the client's definite-reject and split path. Covers §6 and §7.
+5. Constraints: the hook, the overlay, the gate, error 51 and the client's definite-reject and split path. Covers §6.1–§6.6 and §7.
+5b. Write intents, the key index, and the typed `insert` / `update` / `remove` / `removeExisting` API. Covers §6.7. It reuses the part-5 hook.
 6. Docs: `ql.md`, `wire-protocol.md`, `client-cpp.md`, `admin-cli.md`, `CATALOG.md`, the root and client `CLAUDE.md`, and the site's views section, corrected to the shipped syntax.
 
 ## 15. Calls made in this design (owner to check)
