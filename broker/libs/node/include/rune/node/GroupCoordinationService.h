@@ -505,6 +505,21 @@ private:
     /// group -> (topicId, partition, new lineage) it was already rebalanced for.
     struct SupersededMark { int32_t topicId; int32_t partition; uint64_t lineage; };
     std::unordered_map<std::string, std::vector<SupersededMark>> supersededHandled_;
+    // #549: per group, topic ids a JoinGroup named that were not assignable then (unknown here yet, or not placed).
+    // On the coordinator only, doWork forces one rebalance once any becomes assignable while the group is Stable and
+    // no member holds it, or arrives as a view sink (the re-join then gets #19's refusal).  An id found assignable is
+    // dropped; an emptied or Dead group forgets its ids.
+    // Bounded: at most kMaxUnassignedJoinTopics ids per group (cold control-plane state).
+public:
+    static constexpr std::size_t kMaxUnassignedJoinTopics = 64;
+    [[nodiscard]] std::size_t unassignedJoinTopicsForTest(const std::string& g) const {
+        const auto it = unassignedJoinTopics_.find(g);
+        return it == unassignedJoinTopics_.end() ? 0 : it->second.size();
+    }
+private:
+    std::unordered_map<std::string, std::vector<int32_t>> unassignedJoinTopics_;
+    /// The one "can this topic id be assigned now" predicate (registry-known, not a view sink, placed).
+    [[nodiscard]] bool topicIdAssignable_(int32_t tid) const;
     void sweepSupersededLineages_(int64_t nowNs);
     /// Rebalance `groupId` once for (topicId, partition)'s new lineage `now`;
     /// true when this call forced it (false: already handled / empty group).

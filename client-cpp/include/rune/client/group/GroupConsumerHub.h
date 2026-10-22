@@ -476,6 +476,15 @@ private:
     /// Task 10: move a pending rewind forward (AwaitFetch -> Resubscribe -> Ok) or end it
     /// (Rejoined: the generation changed / the group left Stable; Timeout).  Once per duty cycle.
     void advanceRewind_(GroupConsumerImpl& impl, int64_t nowNs);
+    /// #494: a rewind that has STARTED (OffsetFetch / resubscribe sent) and so dies with its session; a parked
+    /// RewindAwaitSession (issued while the session was down) is not in flight.
+    [[nodiscard]] static bool rewindInFlight_(const GroupConsumerImpl& impl) noexcept;
+    /// The checks a rewind passes before starting (at issue, and again when a parked one is applied).
+    [[nodiscard]] bool rewindAdmissible_(const GroupConsumerImpl& impl, bool isSeek, const TopicPartition& seekTp,
+                                         OpStatus& st, std::string_view& text) const;
+    /// Start an admitted rewind: supersede the pending one, restart the partitions, arm AwaitFetch / Resubscribe.
+    void startRewind_(GroupConsumerImpl* impl, OpKind kind, const detail::OpTarget& target, Token token,
+                      const TopicPartition& seekTp, int64_t seekOffset, int64_t deadlineNs);
     detail::CompletionSink completions_{};
     int drainCommit_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn);
     static void closeStatus_(GroupConsumerImpl& impl);

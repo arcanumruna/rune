@@ -143,19 +143,22 @@ void GroupCoordinationService::drainDeparted_(std::string_view groupId, coord::G
 // ---------------------------------------------------------------------------
 // buildTopicPartitionCounts — cold path; called only on join-timeout transition.
 // ---------------------------------------------------------------------------
+bool GroupCoordinationService::topicIdAssignable_(int32_t tid) const {
+    // C1 (catalog history Task 9 fix round 1): a catalog topic applied but not PLACED yet is not assignable (the
+    // gateway would refuse its partitions NotPlaced) — it joins the next rebalance once placed.
+    return topics_ != nullptr && topics_->topic(tid) != nullptr && !topics_->isViewSink(tid) &&
+           (gateway_ == nullptr || gateway_->topicAssignable(tid));
+}
+
 coord::TopicPartitionCounts GroupCoordinationService::buildTopicPartitionCounts() const {
     coord::TopicPartitionCounts counts;
     if (!topics_) return counts;
 
     const int32_t n = topics_->topicCount();
     for (int32_t tid = 0; tid < n; ++tid) {
+        if (!topicIdAssignable_(tid)) continue;
         const rune::node::TopicSpec* spec = topics_->topic(tid);
-        // C1 (catalog history Task 9 fix round 1): a catalog topic applied but not
-        // PLACED yet is not assignable (the gateway would refuse its partitions
-        // NotPlaced) — it joins the next rebalance once placed.
-        if (spec && (gateway_ == nullptr || gateway_->topicAssignable(tid))) {
-            counts[spec->name] = spec->partitionCount;
-        }
+        counts[spec->name] = spec->partitionCount;
     }
     return counts;
 }
@@ -268,6 +271,39 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
             }
             ++work;
         }
+
+        // #549: a topic a JoinGroup named before it was assignable here (catalog create not applied yet, or not
+        // placed) was left out of the member's subscription.  Once it is assignable and no member holds it, force
+        // one rebalance: the members re-join and resolve it.  State-driven, no timer (rule 16).
+        // PR #564 review: only the coordinator rebalances (a stale group on an ex-coordinator must never revoke its
+        // members), an emptied / Dead group forgets its ids, an id that arrives as a view sink rebalances too (the
+        // re-join gets #19's refusal, never a silently empty assignment), and an id already held is resolved.
+        if (!unassignedJoinTopics_.empty()) {
+            if (const auto it = unassignedJoinTopics_.find(groupId); it != unassignedJoinTopics_.end()) {
+                if (coord.isEmpty() || coord.state() == coord::GroupState::Dead) {
+                    unassignedJoinTopics_.erase(it);
+                } else if (coord.state() == coord::GroupState::Stable && isLocalCoordinator()) {
+                    bool ready = false;
+                    std::erase_if(it->second, [&](int32_t tid) {
+                        if (topics_ != nullptr && topics_->isViewSink(tid)) { ready = true; return true; }
+                        if (!topicIdAssignable_(tid)) return false;   // still waiting
+                        const std::string& name = topics_->topic(tid)->name;
+                        bool held = false;
+                        for (const auto& m : coord.members())
+                            for (const auto& tp : m.assignment) held = held || tp.topic == name;
+                        ready = ready || !held;
+                        return true;   // assignable: resolved by this check either way
+                    });
+                    if (ready || it->second.empty()) unassignedJoinTopics_.erase(it);   // re-joins re-record
+                    if (ready && coord.forceRebalance(nowNs)) {
+                        onEnterPreparingRebalance(groupId, coord);
+                        spdlog::info("GroupCoordinationService: group '{}' — a topic its members joined for became "
+                                     "assignable; rebalancing (generation {}) (#549)", groupId, coord.generationId());
+                        ++work;
+                    }
+                }
+            }
+        }
     }
     return work;
 }
@@ -353,6 +389,7 @@ void GroupCoordinationService::recordGenLineages_(const GroupId& groupId, const 
 
 void GroupCoordinationService::pruneGroupLineageState_(const std::string& groupId) {
     supersededHandled_.erase(groupId);
+    unassignedJoinTopics_.erase(groupId);   // #549: an empty group has nothing to assign
     genLineages_.erase(groupId);
     std::erase_if(pendingChecks_, [&](const PendingCheck& p) { return p.groupId == groupId; });
 }
@@ -608,6 +645,19 @@ size_t GroupCoordinationService::handleJoinGroup(
     // coord.doWork(); for join-triggered rebalances the state is already
     // PreparingRebalance by the time doWork() next runs — so we must fire here.
     const coord::GroupState stateBefore = gc.state();
+
+    // #549: remember the ids this join named that are not assignable now; doWork rebalances once one becomes so.
+    bool pendingCapHit = false;
+    for (const int32_t tid : msg.subscribedTopicIds) {
+        if (topicIdAssignable_(tid)) continue;
+        auto& pending = unassignedJoinTopics_[groupIdStr];
+        if (std::find(pending.begin(), pending.end(), tid) != pending.end()) continue;
+        if (pending.size() >= kMaxUnassignedJoinTopics) { pendingCapHit = true; continue; }
+        pending.push_back(tid);
+    }
+    if (pendingCapHit)   // once per join, never per id
+        spdlog::warn("GroupCoordinationService: group '{}' names more than {} not-yet-assignable topics; the rest "
+                     "are not tracked (#549)", groupIdStr, kMaxUnassignedJoinTopics);
 
     coord::JoinResult jr = gc.join(memberIdStr,
                                    sessionMs,
