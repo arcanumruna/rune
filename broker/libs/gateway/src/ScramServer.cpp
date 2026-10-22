@@ -97,16 +97,20 @@ ServerFirstPlan scramServerFirst(const rune::security::SecurityState& state, con
     const auto& seed = state.fakeSaltSeed() ? *state.fakeSaltSeed() : zeroSeed;
 
     if (fakeIterations < pc::kAuthIterationsMin || fakeIterations > pc::kAuthIterationsMax) fakeIterations = rs::kDefaultIterations;
+    // Issue #132: BOTH fake slots are computed for every name - unknown, one password, two passwords - and then
+    // selected, so the first leg's work (two HMACs + the random keys) never depends on whether the account exists.
+    rs::Verifier fake0 = fakeSlot(seed, "rune-fake-salt|", cf.username, fakeIterations);
+    rs::Verifier fake1 = fakeSlot(seed, "rune-fake-salt2|", cf.username, fakeIterations);
+    plan.fakeSlotsComputed = 2;
     const rune::security::UserObject* user = cf.username.empty() ? nullptr : state.user(cf.username);
     if (user != nullptr && !user->verifiers.empty()) {
         st.userId = user->objectId;
         st.verifiers[0] = fromStored(user->verifiers[0]);
-        st.verifiers[1] = user->verifiers.size() > 1 ? fromStored(user->verifiers[1])
-                                                     : fakeSlot(seed, "rune-fake-salt2|", cf.username, fakeIterations);   // the pad
+        st.verifiers[1] = user->verifiers.size() > 1 ? fromStored(user->verifiers[1]) : std::move(fake1);   // the pad
     } else {
         st.userId = 0;
-        st.verifiers[0] = fakeSlot(seed, "rune-fake-salt|", cf.username, fakeIterations);
-        st.verifiers[1] = fakeSlot(seed, "rune-fake-salt2|", cf.username, fakeIterations);
+        st.verifiers[0] = std::move(fake0);
+        st.verifiers[1] = std::move(fake1);
     }
     st.count = AuthAwaitingFinal::kSlots;
 

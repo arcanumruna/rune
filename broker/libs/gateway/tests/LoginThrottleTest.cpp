@@ -28,9 +28,56 @@ TEST(LoginThrottleRegression, TheFirstTwoFailuresAreFreeThenTheDelayDoublesToThe
 
 TEST(LoginThrottleRegression, AttackerAtOneAddressNeverDelaysTheUserAtAnotherRegression) {
     LoginThrottle t;
+    t.onSuccess("ws1", "10.0.0.9", 0);   // the user's own address: a known pair
     for (int i = 0; i < 1000; ++i) t.onFailure("ws1", "203.0.113.7", 0);
     EXPECT_FALSE(t.check("ws1", "203.0.113.7", 0).allowed);
-    EXPECT_TRUE(t.check("ws1", "10.0.0.9", 0).allowed) << "no hard lockout (spec §5)";
+    EXPECT_TRUE(t.check("ws1", "10.0.0.9", 0).allowed) << "no hard lockout (spec §5): a known pair is never delayed";
+    // #131: from an address the user never logged in from, the per-user component delays it - by its low cap only.
+    const auto fresh = t.check("ws1", "192.0.2.1", 0);
+    EXPECT_FALSE(fresh.allowed);
+    EXPECT_LE(fresh.retryAfterMs, 2'000u);
+}
+
+// Issue #131: the source host is attacker-influenced (an IPv6 /64, a forged reply endpoint), so (user, host) and host
+// alone gave every address its own free guesses and its own exponential schedule against one user.
+TEST(LoginThrottleRegression, PerUserBackoffAppliesAcrossSourceHostsRegression) {
+    LoginThrottle t;
+    t.onSuccess("u", "10.0.0.9", 0);   // the real user's own address
+    for (int h = 0; h < 100; ++h)
+        for (int k = 0; k < 3; ++k) t.onFailure("u", "2001:db8::" + std::to_string(h), 0);
+    const auto v = t.check("u", "2001:db8::fresh", 0);
+    ASSERT_FALSE(v.allowed) << "100 hosts x 3 guesses: the next attempt from a fresh host is delayed";
+    EXPECT_GT(v.retryAfterMs, 0u);
+    EXPECT_LE(v.retryAfterMs, static_cast<uint32_t>(LoginThrottle::kMaxUserDelayNs / ms)) << "a low ceiling, not a lockout";
+    EXPECT_TRUE(t.check("u", "2001:db8::fresh", LoginThrottle::kMaxUserDelayNs).allowed) << "waiting the cap out works";
+    EXPECT_TRUE(t.check("u", "10.0.0.9", 0).allowed) << "a success from a known (user, host) pair bypasses it";
+    EXPECT_TRUE(t.check("other", "2001:db8::fresh", 0).allowed) << "per user: another user is untouched";
+    // The first kFreeUserFailures of a user are free across hosts.
+    LoginThrottle f;
+    for (uint32_t i = 0; i < LoginThrottle::kFreeUserFailures; ++i) f.onFailure("v", "198.51.100." + std::to_string(i), 0);
+    EXPECT_TRUE(f.check("v", "192.0.2.200", 0).allowed);
+    f.onFailure("v", "198.51.100.250", 0);
+    EXPECT_FALSE(f.check("v", "192.0.2.200", 0).allowed);
+}
+
+// Issue #131: the tables were keyed by an unkeyed FNV, so an attacker could grind names into one 8-slot probe window
+// and evict its own entries (a fresh schedule).  The hash is keyed per process: two throttles place names differently.
+TEST(LoginThrottleRegression, TableKeysAreNotPredictableRegression) {
+    LoginThrottle a, b;
+    int differ = 0;
+    for (int i = 0; i < 32; ++i) {
+        const std::string u = "user" + std::to_string(i);
+        differ += a.pairSlotForTest(u, "10.0.0.9") != b.pairSlotForTest(u, "10.0.0.9");
+    }
+    EXPECT_GE(differ, 28) << "random keys: the same names land in unrelated slots (a 1/4096 chance each to agree)";
+    // A fixed key is deterministic, and the two parts of a key never run into each other.
+    LoginThrottle::HashKey k{};
+    k[0] = 1;
+    LoginThrottle c(k), d(k);
+    EXPECT_EQ(c.pairSlotForTest("ws1", "10.0.0.9"), d.pairSlotForTest("ws1", "10.0.0.9"));
+    for (int i = 0; i < 3; ++i) c.onFailure("ab", "c", 0);
+    EXPECT_FALSE(c.check("ab", "c", 0).allowed);
+    EXPECT_TRUE(c.check("a", "bc", 0).allowed) << "user|host is not ambiguous";
 }
 
 TEST(LoginThrottleRegression, ManyUsersFromOneAddressAreThrottledPerAddress) {
@@ -44,7 +91,7 @@ TEST(LoginThrottleRegression, ManyUsersFromOneAddressAreThrottledPerAddress) {
 TEST(LoginThrottleRegression, SuccessResetsThePairAndIdleEntriesAreForgotten) {
     LoginThrottle t;
     for (int i = 0; i < 5; ++i) t.onFailure("ws1", "h", 0);
-    t.onSuccess("ws1", "h");
+    t.onSuccess("ws1", "h", 0);
     EXPECT_TRUE(t.check("ws1", "h", 0).allowed);
     for (int i = 0; i < 5; ++i) t.onFailure("ws2", "h2", 0);
     EXPECT_FALSE(t.check("ws2", "h2", 0).allowed);

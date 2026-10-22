@@ -7,6 +7,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 
 using namespace rune::gateway;
@@ -104,6 +106,36 @@ TEST(ScramRegression, EveryServerFirstListsTwoSaltsOfTheSameShapeWhoeverTheUserI
     ASSERT_TRUE(empty.first.has_value());
     EXPECT_EQ(empty.first->count, 2);
     EXPECT_EQ(empty.frame.size(), size);
+}
+
+// Issue #132: the first leg ran no fake slot for a two-password user, one for a one-password user and two for an
+// unknown or empty name (each an HMAC + random keys): the AuthServerFirst latency told real accounts from fake ones.
+TEST(ScramRegression, FirstLegWorkIsIndependentOfUserExistenceRegression) {
+    const auto s = makeState();
+    pc::AuthClientFirst cf;
+    cf.sessionId = 7; cf.correlationId = 9; cf.clientNonce = "clientNonce0123456789";
+    for (const char* user : {"ws1", "ws2", "off", "nobody", ""}) {
+        cf.username = user;
+        EXPECT_EQ(scramServerFirst(s, cf, 123).fakeSlotsComputed, 2) << "'" << user << "': the same work for everyone";
+    }
+    // And the time, with a wide margin: interleaved samples, medians, a two-password user (no fake slot needed) against
+    // an unknown name (two needed).  Before the fix the unknown name cost several times more.
+    using Clock = std::chrono::steady_clock;
+    std::vector<int64_t> known, unknown;
+    for (int i = 0; i < 301; ++i)
+        for (const bool isKnown : {true, false}) {
+            cf.username = isKnown ? "ws1" : "nobody";
+            const auto t0 = Clock::now();
+            const auto plan = scramServerFirst(s, cf, 123);
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+            ASSERT_FALSE(plan.frame.empty());
+            (isKnown ? known : unknown).push_back(ns);
+        }
+    std::nth_element(known.begin(), known.begin() + 150, known.end());
+    std::nth_element(unknown.begin(), unknown.begin() + 150, unknown.end());
+    const double ratio = static_cast<double>(unknown[150]) / static_cast<double>(std::max<int64_t>(known[150], 1));
+    EXPECT_LT(ratio, 1.6) << "median unknown " << unknown[150] << " ns vs known " << known[150] << " ns";
+    EXPECT_GT(ratio, 1 / 1.6) << "median unknown " << unknown[150] << " ns vs known " << known[150] << " ns";
 }
 
 TEST(ScramRegression, TheFakeSaltsAreDeterministicPerNameAndPerClusterSeed) {

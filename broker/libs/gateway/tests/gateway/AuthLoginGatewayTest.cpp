@@ -630,8 +630,10 @@ TEST(AuthLoginRegression, LoginLegsRefuseOutOfOrderReplayedMalformedAndLateFrame
         EXPECT_FALSE(f.first.has_value());
         EXPECT_FALSE(rig.gw.hasSessionForTest(f.sid));
     }
-    // A valid final replayed on its own (now authenticated) session: answered, the session stays authenticated.
-    const FirstLeg okLeg = sendFirst(rig, "ws1");
+    // A valid final replayed on its own (now authenticated) session: answered, the session stays authenticated.  From
+    // its own address: the episodes above charged (ws1, 10.0.0.9) three failures (#132: the second first leg is an
+    // abandoned one), so that pair is inside its delay now.
+    const FirstLeg okLeg = sendFirst(rig, "ws1", "10.0.0.40");
     ASSERT_TRUE(okLeg.first.has_value());
     const std::vector<uint8_t> okFinal = finalFor(okLeg, "ws1", {kTestPasswordA, ""});
     rig.send(okFinal);
@@ -641,7 +643,7 @@ TEST(AuthLoginRegression, LoginLegsRefuseOutOfOrderReplayedMalformedAndLateFrame
     EXPECT_TRUE(std::holds_alternative<AuthAuthenticated>(*rig.gw.sessionAuthForTest(okLeg.sid)));
     // ... and on ANOTHER session awaiting its final: its nonce differs, the proof fails.
     {
-        const FirstLeg other = sendFirst(rig, "ws1");
+        const FirstLeg other = sendFirst(rig, "ws1", "10.0.0.40");
         ASSERT_TRUE(other.first.has_value());
         std::vector<uint8_t> stolen = okFinal;
         pc::detail::putLE64(stolen.data(), 8, other.sid);
@@ -764,6 +766,43 @@ TEST(LoginThrottleRegression, ParkedFinalsGetOneGuessPerDelayWindowAdversarialRe
     EXPECT_EQ(verified, 1) << "one guess per delay window, not one per parked session";
     EXPECT_EQ(limited, kSessions - 4);
     EXPECT_EQ(rig.gw.loginsFailed(), 4u);
+}
+
+// Issue #132: a session that sent AuthClientFirst (and so learned the salts) and never sent the final was free - an
+// attacker could probe names by first-leg latency without the throttle ever seeing it.  Every first leg left without a
+// final (the deadline, a disconnect, any close) is charged as a failure, exactly once.
+TEST(LoginThrottleRegression, AbandonedFirstLegsAreChargedToTheThrottleRegression) {
+    Rig rig;
+    std::vector<int64_t> sids;
+    for (int i = 0; i < 3; ++i) {
+        const FirstLeg f = sendFirst(rig, "ws2");
+        ASSERT_TRUE(f.first.has_value()) << i;
+        sids.push_back(f.sid);
+    }
+    rig.gw_now = 1'000'000'001; rig.gw.setNowNsForTest(rig.gw_now);
+    rig.gw.reapExpiredForTest(rig.gw_now);
+    for (const int64_t sid : sids) EXPECT_FALSE(rig.gw.hasSessionForTest(sid));
+    EXPECT_EQ(rig.gw.loginsAbandoned(), 3u);
+    // Three abandoned first legs = three failures of the (ws2, host) pair: 2 free, the 3rd starts the 250 ms delay.
+    const auto limited = rig.login("ws2", {kTestPasswordA, ""});
+    ASSERT_TRUE(limited.fin.has_value());
+    EXPECT_EQ(limited.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+    EXPECT_GT(limited.fin->retryAfterMs, 0u) << "first-leg-only probes are charged";
+    EXPECT_TRUE(limited.firstBytes.empty());
+    // A final leg is its own charge: a wrong proof is one failure, never a second one as abandoned at the close.
+    rig.gw_now += 60'000'000'000; rig.gw.setNowNsForTest(rig.gw_now);
+    const uint64_t failedBefore = rig.gw.loginsFailed();
+    const FirstLeg w = sendFirst(rig, "ws1", "10.0.0.50", rig.gw_now);
+    ASSERT_TRUE(w.first.has_value());
+    rig.send(finalFor(w, "ws1", {"a wrong guess", "another wrong guess"}));
+    EXPECT_FALSE(rig.gw.hasSessionForTest(w.sid));
+    EXPECT_EQ(rig.gw.loginsFailed(), failedBefore + 1);
+    EXPECT_EQ(rig.gw.loginsAbandoned(), 3u) << "the closing final is not an abandoned first leg";
+    // A successful login is not charged at all.
+    const FirstLeg ok = sendFirst(rig, "ws1", "10.0.0.51", rig.gw_now);
+    rig.send(finalFor(ok, "ws1", {kTestPasswordA, ""}));
+    ASSERT_EQ(lastFinal(rig, ok.sid)->errorCode, 0);
+    EXPECT_EQ(rig.gw.loginsAbandoned(), 3u);
 }
 
 // The SecurityDdl trailer under version skew and garbage, at the gateway: an OLD client's own change (no trailer) and

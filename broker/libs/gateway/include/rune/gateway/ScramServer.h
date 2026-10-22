@@ -34,6 +34,7 @@ namespace rune::gateway {
 struct ServerFirstPlan {
     AuthAwaitingFinal next;
     std::vector<uint8_t> frame;     ///< the encoded AuthServerFirst; EMPTY = local failure (no randomness): answer 44
+    uint8_t fakeSlotsComputed = 0;  ///< issue #132 test seam: always 2, whoever the user is (equal first-leg work)
 };
 /// Always succeeds in shape: a known user (enabled or not - a disabled account fails at the final leg, Review Focus 1)
 /// gets its 1-2 verifiers (+ a fake second slot for one), an unknown / empty name gets two fake slots.
