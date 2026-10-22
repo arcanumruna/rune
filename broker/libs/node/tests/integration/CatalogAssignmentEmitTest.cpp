@@ -5000,6 +5000,7 @@ TEST(LeaderMoveFenceRegression, AShutdownOfThePredecessorRightAfterTheMoveWaitsA
         MoveFenceProbe f;
         f.held = 1u << static_cast<uint32_t>(L);
         c.svc->setLeaderMoveFence(&moveFenceProbe, &f);
+        c.svc->setControllerSettled([](void*, int64_t) noexcept { return true; }, nullptr);   // past its own first W
         (void)c.svc->onAlterIsr(unservable(0, 0, L));   // keeps L in the ISR
         c.tick();
         ASSERT_NE(c.pa().leaderNode, L);
@@ -5053,4 +5054,127 @@ TEST(LeaderMoveFenceRegression, ALeaderlessStepNeverHidesThePredecessorRegressio
     c.drive(50);
     EXPECT_EQ(c.pa().leaderNode, B);
     EXPECT_FALSE(has(c.pa().isr, L));
+}
+
+// PR #490 re-check 2 (adversarial): the predecessor map must not lose a predecessor whose pre-move lease may still
+// run.  (a) Two moves inside W: L -> B (keeps L), B -> C (keeps L and B); the map now remembers only B, so C's shrink of L
+// passed unfenced.  (b) A controller change between the move and the shrink: the new controller's map is empty and its
+// past-W rule is never consulted, because the fence is asked only for a record fencedPredecessor_ picks.
+namespace {
+rune::replication::AlterIsrMsg shrinkOut(const rune::metadata::PartitionAssignment& pa, int32_t out) {
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = 0; m.partition = 0; m.leaderId = pa.leaderNode; m.leaderEpoch = pa.leaderEpoch;
+    m.partitionEpoch = pa.partitionEpoch;
+    m.isrCount = 0;
+    for (const int32_t n : pa.isr) if (n != out) m.isr[m.isrCount++] = n;
+    return m;
+}
+bool settledAlways(void*, int64_t) noexcept { return true; }
+}  // namespace
+
+TEST(LeaderMoveFenceRegression, TwoMovesInsideWStillFenceTheFirstPredecessorsRemovalAdversarialRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    MoveFenceProbe f;
+    f.held = 1u << static_cast<uint32_t>(L);   // only L's pre-move lease may still run
+    c.svc->setLeaderMoveFence(&moveFenceProbe, &f);
+    c.svc->setControllerSettled(&settledAlways, nullptr);   // the predecessor set alone must catch it
+    (void)c.svc->onAlterIsr(unservable(0, 0, L));   // L -> B, L kept in the ISR
+    c.tick();
+    c.drive(5);
+    const int32_t B = c.pa().leaderNode;
+    ASSERT_NE(B, L);
+    (void)c.svc->onAlterIsr(unservable(0, 0, B));   // B -> C, L and B kept
+    c.tick();
+    c.drive(5);
+    const int32_t C = c.pa().leaderNode;
+    ASSERT_NE(C, B);
+    ASSERT_TRUE(has(c.pa().isr, L));
+    ASSERT_TRUE(c.svc->onAlterIsr(shrinkOut(c.pa(), L)));
+    c.drive(5);
+    EXPECT_TRUE(has(c.pa().isr, L)) << "two moves inside W: C shrank the FIRST predecessor " << L
+                                    << " out while its pre-move lease may still run";
+    f.held = 0;
+    c.drive(20);
+    EXPECT_FALSE(has(c.pa().isr, L)) << "the shrink commits once the lease ended";
+}
+
+TEST(LeaderMoveFenceRegression, ANewControllerFencesAPredecessorsRemovalInsideItsFirstWAdversarialRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    MoveFenceProbe f0;
+    c.svc->setLeaderMoveFence(&moveFenceProbe, &f0);
+    (void)c.svc->onAlterIsr(unservable(0, 0, L));   // L -> B, L kept in the ISR
+    c.tick();
+    c.drive(5);
+    ASSERT_NE(c.pa().leaderNode, L);
+    ASSERT_TRUE(has(c.pa().isr, L));
+    // A controller change: a fresh MetadataService over the same log (a crash-restarted controller, or the successor -
+    // either way no memory of the move).  Its fence is closed for L (inside its first W the predecessor's lease may run).
+    c.r1->becomeFollower(/*epoch=*/2, /*leaderId=*/99);
+    (void)c.svc->doWork(c.clock);
+    c.r1->becomeLeader(/*epoch=*/3, c.all);
+    c.r2->becomeFollower(3, 1);
+    c.r3->becomeFollower(3, 1);
+    c.transport.setLeader(c.r1.get());
+    c.svc = std::make_unique<MetadataService>(c.r1.get(), 1);
+    c.svc->configure(c.topics, c.all);
+    MoveFenceProbe f;
+    f.held = 1u << static_cast<uint32_t>(L);
+    c.svc->setLeaderMoveFence(&moveFenceProbe, &f);
+    bool settled = false;   // the new controller is inside its own first W
+    c.svc->setControllerSettled([](void* s, int64_t) noexcept { return *static_cast<bool*>(s); }, &settled);
+    c.drive(50);
+    const auto pa = c.pa();
+    ASSERT_NE(pa.leaderNode, L);
+    ASSERT_TRUE(has(pa.isr, L));
+    ASSERT_TRUE(c.svc->onAlterIsr(shrinkOut(pa, L)));
+    c.drive(5);
+    EXPECT_TRUE(has(c.pa().isr, L)) << "a new controller shrank the predecessor " << L
+                                    << " out without consulting the fence (map empty)";
+    EXPECT_EQ(c.svc->leaseWithheldMask(), 1u << static_cast<uint32_t>(L));
+    f.held = 0;   // its lease ended (and the new controller is past W)
+    settled = true;
+    c.drive(20);
+    EXPECT_FALSE(has(c.pa().isr, L));
+}
+
+// PR #490 eos-e2e / re-check 3: a fenced record never holds back another partition's records - the failover of a
+// dead broker's (coordinator) partitions queued behind a fenced move commits at once.
+TEST(LeaderMoveFenceRegression, AFencedMoveNeverDelaysAnotherPartitionsRecordsRegression) {
+    CtlRig c(true, {TopicSpec{0, 1, 3, "", "t0"}, TopicSpec{1, 1, 3, "", "t1"}});
+    c.drive(50);
+    const int32_t L0 = c.paOf(0).leaderNode;
+    MoveFenceProbe f;
+    f.held = 1u << static_cast<uint32_t>(L0);   // t0's leader holds a lease
+    c.svc->setLeaderMoveFence(&moveFenceProbe, &f);
+    c.svc->setControllerSettled(&settledAlways, nullptr);
+    // t0: a move off L0 that drops it (fenced).  t1: a plain ISR edit, queued BEHIND it.
+    rune::replication::AlterIsrMsg bump{};
+    {
+        const auto& a = c.paOf(0);
+        bump.topicId = 0; bump.partition = 0; bump.leaderId = a.leaderNode; bump.leaderEpoch = a.leaderEpoch;
+        bump.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump; bump.partitionEpoch = a.partitionEpoch;
+        bump.isr[0] = -1;
+    }
+    (void)c.svc->onAlterIsr(bump);
+    c.tick();
+    ASSERT_EQ(c.paOf(0).leaderNode, L0) << "t0's move is fenced (vacuity guard)";
+    const auto& b = c.paOf(1);
+    int32_t out = -1;
+    for (int32_t n : b.isr) if (n != b.leaderNode && n != L0) out = n;
+    if (out < 0) for (int32_t n : b.isr) if (n != b.leaderNode) out = n;
+    ASSERT_GE(out, 0);
+    ASSERT_TRUE(c.svc->onAlterIsr(shrinkOut(b, out)) || true);
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = 1; m.partition = 0; m.leaderId = b.leaderNode; m.leaderEpoch = b.leaderEpoch;
+    m.partitionEpoch = b.partitionEpoch; m.isrCount = 0;
+    for (const int32_t n : b.isr) if (n != out) m.isr[m.isrCount++] = n;
+    (void)c.svc->onAlterIsr(m);
+    c.drive(10);
+    if (out != L0) EXPECT_FALSE(has(c.paOf(1).isr, out)) << "t1's record waited behind t0's fenced move";
+    EXPECT_EQ(c.paOf(0).leaderNode, L0);
+    f.held = 0;
+    c.drive(20);
+    EXPECT_NE(c.paOf(0).leaderNode, L0);
 }

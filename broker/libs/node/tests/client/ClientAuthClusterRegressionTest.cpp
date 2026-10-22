@@ -13,6 +13,8 @@
 #include <rune/codec/Serialize.h>
 #include <rune/client/Completions.h>
 #include <rune/client/producer/Producer.h>
+#include <rune/client/group/GroupConsumer.h>
+#include <rune/client/Key.h>
 #include <rune/client/subscriber/Subscription.h>
 #include <rune/ql/Backends.h>
 #include <rune/ql/Parser.h>
@@ -283,4 +285,137 @@ TEST(ClientAuthClusterRegression, AnOwnPasswordChangeRedirectedToTheSecurityLead
         EXPECT_TRUE(AuthTrio::until(30s, [&] {
             try { (void)t.login(id, "ws1", "ws1-redirected-pw-123"); return true; } catch (const std::exception&) { return false; }
         })) << "node " << id;
+}
+
+// =====================================================================================================================
+// PR #490 eos-e2e step 3a on an AUTHENTICATED cluster (the docker default): a consume -> transform -> produce pipeline
+// (GroupConsumer read_committed, manual offsets in the transaction, abort + seekToCommitted on any failure - exactly
+// eos_probe's loop) seeded on a broker that is NOT the controller; the controller (= the transaction coordinator) is
+// killed mid-pipeline.  The pipeline must resume and commit every input record.
+// =====================================================================================================================
+TEST(ClientAuthClusterRegression, EosPipelineSurvivesTheCoordinatorCrashOnAnAuthenticatedClusterRegression) {
+    constexpr int kParts = 4, kInput = 3'000, kBatch = 100;
+    AuthTrio t("eosauthcrash");
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "eos-user", "eos-user-password-1");
+    for (SO op : {SO::Create, SO::Describe, SO::Write, SO::Read}) t.grant(1, "eos-user", op, ST::Topic, SP::Prefix, "eos.");
+    t.grant(1, "eos-user", SO::Read, ST::Group, SP::Prefix, "eos-");
+    t.grant(1, "eos-user", SO::Write, ST::TransactionalId, SP::Prefix, "eos-");
+    t.grant(1, "eos-user", SO::Describe, ST::TransactionalId, SP::Prefix, "eos-");
+    ThreeNodes& c = t.cluster();
+    int ctl = -1;
+    ASSERT_TRUE(AuthTrio::until(30s, [&] {
+        for (BrokerNode* n : c.live()) if (n->isLeader()) ctl = n->nodeIdForTest();
+        return ctl > 0;
+    }));
+    const int seed = ctl == 1 ? 2 : 1;
+    int seq = 0;
+    auto client = [&](int id, std::vector<rc::TopicSpec> topics) {
+        std::unique_ptr<rc::Client> cl;
+        auto cfg = configFor(t, id, "eos-user", "eos-user-password-1", seq++);
+        cfg.topics = std::move(topics);
+        EXPECT_TRUE(AuthTrio::until(60s, [&] {
+            try { cl = std::make_unique<rc::Client>(cfg); cl->connectAndWait(30s); return true; }
+            catch (const std::exception&) { cl.reset(); return false; }
+        })) << "client on broker " << id;
+        return cl;
+    };
+    rc::TopicSpec in, out;
+    {
+        auto admin = client(ctl, {});
+        ASSERT_TRUE(admin);
+        rc::TopicOptions to;
+        to.replicationFactor = 3;
+        rc::DefineTopicResult a{}, b{};   // the grants reach the broker asynchronously: retry
+        ASSERT_TRUE(AuthTrio::until(60s, [&] { a = admin->defineTopicAndWait("eos.in", kParts, "", {}, false, rc::Persistence::Disk, to, {}, 60s); return a.errorCode == 0; })) << a.detail;
+        ASSERT_TRUE(AuthTrio::until(60s, [&] { b = admin->defineTopicAndWait("eos.out", kParts, "", {}, false, rc::Persistence::Disk, to, {}, 60s); return b.errorCode == 0; })) << b.detail;
+        in = rc::TopicSpec{"eos.in", a.topicId, kParts};
+        out = rc::TopicSpec{"eos.out", b.topicId, kParts};
+        admin->close();
+    }
+    {
+        auto pc = client(seed, {in});
+        ASSERT_TRUE(pc);
+        rc::ProducerConfig cfg;
+        cfg.acks = rc::Acks::All;
+        rc::Producer p = pc->producer(cfg);
+        const rc::TopicHandle th = pc->topic("eos.in");
+        for (int i = 0; i < kInput; ++i) {
+            const std::string v = "id=" + std::to_string(i);
+            p.send(th, rc::Key(static_cast<int64_t>(i)), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()));
+        }
+        ASSERT_EQ(p.closeAndWait(60s), rc::OpStatus::Ok) << "the input acks";
+        pc->close();
+    }
+    struct Item { int32_t partition; int64_t offset; };
+    std::mutex mu;
+    std::vector<Item> pending;
+    auto cl = client(seed, {in, out});
+    ASSERT_TRUE(cl);
+    rc::GroupConfig gcfg;
+    gcfg.autoCommit       = false;
+    gcfg.autoOffsetReset  = rc::OffsetReset::Earliest;
+    gcfg.isolation        = rc::IsolationLevel::ReadCommitted;
+    gcfg.sessionTimeoutMs = 10'000;   // eos_probe's
+    rc::GroupConsumer gc = cl->subscribeGroup("eos-auth-g", {"eos.in"}, gcfg);
+    gc.onRecords([&](const rc::RecordSet& rs) {
+        std::lock_guard<std::mutex> lk(mu);
+        rs.forEachRecord([&](std::string_view, std::string_view, int64_t off, int64_t) { pending.push_back(Item{rs.partition, off}); });
+    });
+    rc::ProducerConfig tcfg;
+    tcfg.acks = rc::Acks::All;
+    tcfg.transactionalId = "eos-auth-worker";
+    rc::Producer tp = cl->producer(tcfg);
+    tp.initTransactionsAndWait(60s);
+    const rc::TopicHandle oth = cl->topic("eos.out");
+    int committed = 0, failures = 0, rewindFailures = 0;
+    bool crashed = false;
+    std::string lastError;
+    const auto deadline = std::chrono::steady_clock::now() + 240s;
+    while (committed < kInput && std::chrono::steady_clock::now() < deadline) {
+        std::vector<Item> take;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            const std::size_t n = std::min<std::size_t>(kBatch, pending.size());
+            take.assign(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(n));
+            pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(n));
+        }
+        if (take.empty()) { std::this_thread::sleep_for(5ms); continue; }
+        std::map<int32_t, int64_t> next;
+        try {
+            tp.beginTransaction();
+            for (const Item& it : take) {
+                const std::string v = "out-" + std::to_string(it.partition) + "-" + std::to_string(it.offset);
+                tp.send(oth, rc::Key(it.offset * 16 + it.partition), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()));
+                next[it.partition] = std::max(next[it.partition], it.offset + 1);
+            }
+            if (!crashed && committed >= kInput * 30 / 100) { c.crash(ctl); crashed = true; }   // mid-transaction
+            std::vector<rc::OffsetEntry> offs;
+            for (const auto& [part, off] : next) offs.push_back(rc::OffsetEntry{in.topicId, part, off});
+            tp.sendOffsetsToTransactionAndWait(offs, "eos-auth-g", 30s);
+            tp.commitTransactionAndWait(30s);
+            committed += static_cast<int>(take.size());
+            continue;
+        } catch (const std::exception& ex) {
+            ++failures;
+            lastError = ex.what();
+        }
+        try { tp.abortTransactionAndWait(30s); } catch (const std::exception&) {}
+        { std::lock_guard<std::mutex> lk(mu); pending.clear(); }
+        try {
+            gc.seekToCommittedAndWait(30s);
+        } catch (const std::exception& ex) {
+            ++rewindFailures;
+            lastError = ex.what();
+            std::this_thread::sleep_for(200ms);   // eos_probe pumps 200 ms between attempts
+            ASSERT_LT(rewindFailures, 20) << "the pipeline cannot rewind after the coordinator crash: " << lastError;
+        }
+    }
+    EXPECT_TRUE(crashed);
+    EXPECT_EQ(committed, kInput) << "the pipeline stalled after the coordinator crash (failures " << failures
+                                 << ", rewind failures " << rewindFailures << ": " << lastError << ")";
+    gc.close();
+    tp.close();
+    cl->close();
 }

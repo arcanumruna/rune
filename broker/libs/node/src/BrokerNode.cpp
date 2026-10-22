@@ -2906,6 +2906,11 @@ void BrokerNode::buildGateway() {
                     return static_cast<const rune::consensus::Election*>(e)->readLeaseMoveFenceOpen(old, nowNs);
                 }, election_.get());
         if (metadataService_)
+            metadataService_->setControllerSettled(
+                [](void* e, int64_t nowNs) noexcept {
+                    return static_cast<const rune::consensus::Election*>(e)->readLeaseControllerSettled(nowNs);
+                }, election_.get());
+        if (metadataService_)
             election_->setReadLeaseCommitPosSource(
                 [](void* m) noexcept { return static_cast<MetadataService*>(m)->logEndForLease(); }, metadataService_.get());
     }

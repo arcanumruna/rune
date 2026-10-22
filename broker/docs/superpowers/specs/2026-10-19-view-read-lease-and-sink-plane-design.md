@@ -232,9 +232,12 @@ differs from the text above:
   A move that keeps A in the ISR (preferred-leader move, `electionExcluded`, coordinator steer) never waits: the new
   leader's HW needs A's fetch at the new epoch, which A sends only after it applied the demotion.  A LATER record that
   removes A from the ISR (the new leader's ISR shrink, a controlled shutdown of A, the election after a leaderless step)
-  goes through the same fence: the controller remembers per partition the last real leader before its latest leader
-  change and when it was appended, and fences any removal of it until W after that append (then every lease granted
-  before the move has ended; the entry is dropped).  One entry per partition, cleared on a controller step-down.
+  goes through the same fence: the controller remembers per partition every real leader it replaced within the last W
+  (a bounded set, at most 4 per partition, pruned on expiry; on overflow every removal from that partition's ISR is
+  fenced until W after the overflowing move), and fences any removal of one of them.  A controller inside W of its own
+  takeover knows none of the moves before it, so it fences every removal from any ISR (cleared on step-down for the same
+  reason).  A fenced record waits only with the later records of its own partition: it never delays another
+  partition's records (a dead broker's coordinator-partition failover queued behind it included).
 - **ISR right after a takeover (#493).** A new leader's offset-lag gate counts only fetches made at its own
   leadership, and a member with no fetch state is timed from the takeover: a leader change never collapses the ISR to
   the new leader (which also made the case above reachable on the default config).  With every leader

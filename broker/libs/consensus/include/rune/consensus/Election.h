@@ -341,6 +341,9 @@ public:
     /// it from the ISR?  Only once no lease anyone granted it can still run: this node is the CLOSED leader past W
     /// since its own leadership began (a predecessor's grants have ended) and no lease THIS node granted it may run.
     [[nodiscard]] bool readLeaseMoveFenceOpen(NodeId oldLeader, int64_t nowNs) const noexcept;
+    /// Issue #486 (PR #490 re-check 2): this node is the CLOSED leader past W since its leadership began - every lease
+    /// a predecessor controller granted has ended (a single node: always).
+    [[nodiscard]] bool readLeaseControllerSettled(int64_t nowNs) const noexcept;
     [[nodiscard]] bool     preBallotActiveForTest() const noexcept { return preBallot_.active; }
     [[nodiscard]] Term     preBallotTermForTest() const noexcept { return preBallot_.term; }
     [[nodiscard]] uint64_t preBallotsLostForTest() const noexcept { return preBallotsLost_; }
