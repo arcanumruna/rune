@@ -202,18 +202,27 @@ The hook is a template policy parameter, not a virtual call or a `std::function`
   - An entry is marked aborted when its transaction's abort marker is applied (`rc->onMarker`), and stops counting at once.
   - Entries at or above a truncation point are dropped from the back.
   - **An entry is never released when its ack times out.** The record is already in the log.
-- **Capacity.** If the overlay is full, the batch gets a retriable refusal (`TransientLogFull`, which existing clients already retry with the same identity). Size it from the in-flight bound, `maxOwedReturns_` plus the strict-tier pending queue. A full overlay is a stat and a log line.
+- **Capacity.**
+  - The capacity is fixed per constrained view: a sizing knob, pre-allocated when the view is installed. The default is 65 536 entries (my call).
+  - The in-flight ack bound does not bound it. One open transaction pins the LSO, so every later write stays in the overlay until that transaction ends.
+  - The transaction timeout bounds how long that can last. For a topic like `character`, which sees a few creates a second, the default capacity covers far more than any timeout.
+  - If the overlay is full, the batch gets a retriable refusal, `TransientLogFull`, which clients already retry with the same identity. A full overlay is also a stat and a log line.
 
-**6.4 When a pending release may be counted.** A pending tombstone or rename frees a name or a slot for a later write only if one of these holds:
+**6.4 What a pending entry may be counted for.** The rule: a definite rejection or acceptance may depend only on state that can no longer vanish without the dependent write vanishing too.
 
-- (a) The releasing record is not transactional.
-- (b) It belongs to the same open transaction as the later write.
+- **Increments always count.** That covers a pending claim of a name or a slot, whether it is non-transactional, from an open transaction, or committed. So two open transactions can't both take the 12th slot.
+- **A pending release counts in three cases.** A release is a tombstone, a rename freeing a name, or a move out of a group. It counts when:
+  - (a) the releasing record is not transactional,
+  - (b) its transaction has applied a commit marker, or
+  - (c) it belongs to the same open transaction as the later write.
 
-This is safe because the log is one ordered sequence. A truncation removes a suffix, so if the releasing record is cut, the later record above it is cut too.
+  Case (a) is safe because the log is one ordered sequence. A truncation removes a suffix, so if the releasing record is cut, any later record that relied on it is cut too.
 
-An abort is the one case where an earlier record vanishes while a later one survives. That is why a transactional release counts only within its own transaction.
-
-Pending increments always count: transactional increments from open transactions, and non-transactional increments. So two open transactions cannot both take the 12th slot.
+  An abort is the only way an earlier record vanishes while a later one survives. That is why a release from another transaction that is still open never counts.
+- **Source keys locked by another transaction.** A write to a source key that has a pending entry from a different, still-open transaction is refused retriably: `ConcurrentTransaction`, an existing retriable code; if none fits, a new retriable code 52 (the builder checks which).
+  - Without this, the effect of the later write (update rather than create, same group) would be computed against a record that may be aborted. A missed increment would break the cap.
+  - It works like a row lock held until the transaction ends. Non-transactional writers and same-transaction writers don't conflict with it.
+- When an abort marker is applied, its entries are marked aborted and stop counting. Rule (c) and the lock mean no other pending entry can depend on them, so nothing needs to be recomputed.
 
 **6.5 Readiness gate.** A constrained write gets retriable `NotLeader` until all of the following hold under the current leadership generation:
 
@@ -239,21 +248,35 @@ Restart and view rebuild (`RebuildingViews`) use the same gate.
 
 **7.1 Broker**
 
-- New `ErrorCode::ConstraintViolation = 51`. It is definite: nothing was stored.
-- It is gated on a new client version (12). An older client receives `SchemaValidationFailed` (24), which it already treats as a definite reject.
+- New `ErrorCode::ConstraintViolation = 51`.
+  - It means: not stored, because when the check ran, accepting the write would have broken the rule.
+  - A pending claim that is later truncated or aborted can make that conflict disappear. A retry is then a legitimate client choice. The guarantee is only "not stored", never "the rule would still be broken now".
 - The violated constraint is sent as a u64 id in the `logStartOffset` slot of `ProduceResponse`. This is the same trick D6 uses, so the fixed frame does not grow.
   - The id is `viewObjectId << 16 | constraintOrdinal`. Ordinal 0 means the view's `unique` rule.
-- `docs/api/wire-protocol.md` documents the code, its gate and the meaning of the slot.
+- **Who may write to a constrained topic.** The partition answers a definite `InvalidRequest` (or the nearest existing definite code; the builder checks) to:
+  - a non-idempotent producer (pid −1). Such writes skip dedupe and `rcGate_`, so neither the "after dedupe" argument nor the readiness gate covers them;
+  - acks other than `all`. Today an `acks=leader` write is acked before the HW is reached and before the views fold, which breaks the owner's rule that success means the views reflect the write;
+  - a client below version 12. Older clients treat an unknown code as "outcome unknown" and bump their epoch, so they can't use these topics safely.
+- `docs/api/wire-protocol.md` documents the code, the version gate, the slot and these refusals.
 
-**7.2 Producer** (`ProducerImpl::onProduceResponse`)
+**7.2 Producer**
 
-- A new definite-reject branch, modeled on the existing "definitely not stored" branch (C4):
-  - The batch fails.
-  - There is no `markUnresolved_` and no epoch bump.
-  - The sequence is not consumed, because the hook runs before the producer-state update.
-- **Batches holding more than one record.** Tier-1 `send()` coalescing can mix unrelated records into one batch. On error 51, the producer resends those records one at a time, in their original order, with the same sequences. Each record then gets its own result. A record that fails alone gets `ConstraintViolation`, and the others succeed.
-  - This keeps per-record semantics even though the broker rejects whole batches.
-  - `p.batch(...)` (an explicit atomic batch) is never split. The whole batch fails.
+Today's producer can't take a definite reject cleanly:
+
+- Any unknown code, and code 24, goes to "outcome unknown": `markUnresolved_` plus an epoch bump.
+- The out-of-order-sequence branch (C4) resequences and bumps the epoch as well.
+- Batches already in flight behind a rejected one arrive out of order.
+
+So for partitions of constrained topics:
+
+- **One batch in flight per partition.** The client learns a topic is constrained from topic metadata, using a new flag set when a constrained view is installed.
+  - With nothing in flight behind it, a rejected batch leaves the producer's next sequence unchanged. The next batch reuses that sequence, with no epoch bump and no resequence.
+  - The cost is throughput on these partitions, not latency. Constrained writes are low-rate control-plane writes such as creates and renames.
+- **Tier-1 `send()` coalescing.** If a coalesced batch of unrelated records is rejected with 51, the producer resends its records one at a time, in their original order, still one in flight.
+  - The failing record's sequence isn't consumed, so the next record reuses it.
+  - Each record then gets its own result: the one that breaks the rule gets `ConstraintViolation`, and the others succeed.
+- **Explicit atomic batches (`p.batch(...)`)** are never split. The whole batch fails.
+- **Inside a transaction,** error 51 aborts the transaction, the same way a constraint violation does in Postgres. The caller sees the transaction fail with the constraint id.
 - **Result type.** The result exposes `constraintId`. A helper on `Client` resolves it to a `(viewName, constraintName)` pair from the catalog.
 
 **7.3 CLI.** Fix `errorCodeName`: codes 48–50 are missing today. Add 51. Print the name of the violated constraint.
@@ -396,6 +419,11 @@ Every cell is a test (unit, integration or e2e, wherever it can first be seen). 
 - `create or replace` while writes run
 - drop while writes run
 - a full overlay
+- a write to a source key held by another open transaction, followed by that transaction committing or aborting
+- a committed transactional release followed by a reuse before the fold catches up
+- a non-idempotent, `acks=leader` or version-11 client writing to a constrained topic
+- a coalesced batch with one violating record among valid ones
+- error 51 inside a transaction
 
 **Reads**
 
@@ -427,7 +455,17 @@ Each part can be shipped on its own:
 5. Constraints: the hook, the overlay, the gate, error 51 and the client's definite-reject and split path. Covers §6 and §7.
 6. Docs: `ql.md`, `wire-protocol.md`, `client-cpp.md`, `admin-cli.md`, `CATALOG.md`, the root and client `CLAUDE.md`, and the site's views section, corrected to the shipped syntax.
 
-## 15. Left to the builder
+## 15. Calls made in this design (owner to check)
+
+- The ack stays at acks=all (HW). Read-your-writes comes from the fold barrier on reads, not from making the produce ack wait for the fold. Every read path a client has goes through that barrier.
+- Constrained topics require idempotent producers, `acks=all` and client version 12 or later (§7.1).
+- One batch in flight per constrained partition (§7.2).
+- A constraint violation inside a transaction aborts the transaction.
+- A source key with a pending entry from another open transaction is locked until that transaction ends (§6.4).
+- `lower()` is ASCII-only. The first users' names are `[A-Za-z0-9]{1,16}`.
+- The default overlay capacity is 65 536 entries per view.
+
+## 16. Left to the builder
 
 - The exact row layout for key bytes and the prefix links.
 - Whether the owner map and prefix index are checkpointed or rebuilt on replay.
