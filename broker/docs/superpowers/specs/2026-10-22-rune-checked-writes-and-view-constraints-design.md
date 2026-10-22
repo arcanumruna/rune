@@ -90,6 +90,7 @@ characters.removeExistingAndWait(id);   // KeyNotFound → 404
 - G5. Point reads by a full key of any width, and prefix reads by the leading key columns (§9).
 - G6. `unique` projection views and `check (count … <= N)` aggregate constraints are enforced before the append (§8).
 - G7. A rejected batch stores no data and changes no view. Its sequences are consumed by a durable reject marker, so no copy of it can ever be stored.
+- G7b. A persisted view may read a transient source. After a restart it keeps its checkpointed rows and has nothing to replay from the source (§9a).
 - G8. Everything is correct under:
   - concurrent writers
   - collisions inside one batch
@@ -563,6 +564,40 @@ ProducerConfig{.acks = Acks::All | Acks::View};
   - A typed key builder from the view's output descriptor, so callers never hand-encode bytes.
   - New `OpKind`s. Results larger than the completion-ring reservation get `ResultTooLarge`, as today.
 
+## 9a. Part F: persisted views over transient sources (owner decision, 2026-10-22)
+
+**Today** `CreateView` refuses a persisted view over a transient topic with `ViewSourceTransient` (37) (`AdminWorker.cpp:1232`). Only a transient view may read a transient source.
+
+**Rule.** Lift that check. Every combination is allowed: a persisted or transient view over a persisted or transient source. Code 37 stays reserved and is no longer sent.
+
+**Meaning.** The view is as durable as its checkpoint; the source is not durable at all. After a restart the view keeps the rows its checkpoint holds and folds whatever the source still has, which may be nothing.
+
+**What already works.**
+- A persisted view checkpoints to its own local file (`ViewSnapshotChannel`, recovery in `installViewForRecovery`). The source's persistence plays no part in that.
+- The transient cursor machine (`WorkerViewSet.h:156-184`, `reconcileTransient_` at `WorkerViewSet.cpp:367`) already handles a checkpoint taken against an earlier incarnation (`CursorRecoveredUnreconciled`): it keeps the rows and re-folds from the ring's start.
+- **Re-folding is idempotent.** A Replace row is keyed by the source's wire key. An aggregate's contribution is keyed by the source's wire key too (`AggState.h`: a contributor is the record's 8-byte wire key), so folding a record twice replaces its contribution instead of counting it twice.
+
+**Cases.**
+
+| Situation | Source after it | View after it |
+|---|---|---|
+| Full cluster restart | empty, new lineage | checkpoint rows kept; cursor moves to the new ring start; nothing to replay |
+| One node restarts, the cluster stays up | that node rejoins empty and re-replicates the ring | its checkpoint, then a re-fold of the ring from the ring's start |
+| Failover to a node whose checkpoint is behind | the ring on the new leader | as above. Records evicted between the checkpoint and the ring's start are never folded on that node. |
+
+**Consequences to document (`ql.md`, `SELF-HOSTING.md`):**
+- **The tail is lost.** Rows folded after the last checkpoint write are lost on a full restart, together with the source records that made them.
+- **Rows can be stale after a failover.** A row whose later updates were evicted from the ring keeps its checkpointed value until its key is written again. That includes a key that was deleted while the node was behind: its tombstone may have been evicted, so the row can reappear.
+- **These are counted, never silent.** The counters are `transientRecordsEvicted` and `transientSourceResets`.
+
+**Changes.**
+- **Admin.** Remove the 37 check. Plan and catalog formats are unchanged, since the view already records its own persistence.
+- **Recovery.** The "invariant breach (a view over a transient source must be transient)" warnings in `reconcileTransient_` become a normal info log plus `transientSourceResets`. Behaviour is unchanged.
+- **Keyed sources only (my call).** A persisted view over a *keyless* transient source is refused (`InvalidRequest`, "a persisted view over a transient source needs a keyed source"), because re-folding keyless records isn't idempotent. A transient view over a keyless transient source is unchanged.
+- **Readiness** is unchanged: Recovering → RebuildingViews → Ready. Reads get `NotReady` while the ring is being re-folded.
+- **The `View` ack** (§8.9) means "folded". On such a view it doesn't mean "checkpointed".
+- **Constraints** over transient sources stay a non-goal (§2): the pending overlay can't be rebuilt from a ring that is gone.
+
 ## 10. Rune QL and the CLI
 
 **10.1 Grammar**
@@ -742,6 +777,13 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 - an untyped topic and a keyless topic each refuse views, filters (untyped only), intents, the key index and `autoincrement` at DDL time, with the right message
 - `TypedTopic<T>` refuses to bind to an untyped topic or to a fingerprint mismatch
 - raw `send` works on untyped topics and is validated on typed ones
+- persisted views over transient sources, each for a Replace view and an aggregate (`count(*)` and `Min`):
+  - a full cluster restart keeps the checkpoint rows, and the cursor restarts at the new ring;
+  - a single-node restart with the ring re-replicated: a re-fold of already-folded records doesn't double count;
+  - failover to a node with an older checkpoint while the ring evicted part of the gap: stale rows stay, and `transientRecordsEvicted` counts the gap;
+  - a keyless transient source is refused for a persisted view;
+  - the `View` ack on a transient source;
+  - code 37 is never sent
 - UTF-8:
   - valid input: ASCII, 2-, 3- and 4-byte sequences;
   - invalid input: overlong forms, surrogates, code points above U+10FFFF, a sequence truncated at the end of the field, and a stray continuation byte;
@@ -804,7 +846,8 @@ Each part ships on its own:
 6. **Part D (§7, §9):** wide and derived keys, the owner map, the seeded hash, checkpoint v3, the prefix index, `GetViewRowK`, `ScanViewRows`, and the client read API.
 7. **QL (§10):** `create view` (plan v2), `select`, and the CLI.
 8. **Part E (§8.1–§8.3, §8.7):** `unique` and `check` on views.
-9. **Docs:**
+9. **Part F (§9a):** persisted views over transient sources.
+10. **Docs:**
    - `ql.md`, `wire-protocol.md`, `client-cpp.md` and `admin-cli.md`
    - `CATALOG.md` and `SECURITY.md` (the `IMPORT` grant)
    - the root and client `CLAUDE.md`
@@ -829,6 +872,7 @@ Each part ships on its own:
 - The key field encodes to at most 16 bytes, and `Key` truncation becomes an error.
 - A source key held by another open transaction is locked until that transaction ends (`ConcurrentTransactions`).
 - Untyped topics stay as raw logs: no field list means untyped. Every database feature needs a typed topic.
+- Persisted views may read transient sources. They keep their checkpointed rows across a restart and have nothing to replay. **Owner-confirmed, 2026-10-22.** A keyless transient source can feed only a transient view. (My call.)
 - Typed strings must be valid UTF-8, and `lower()` is Unicode simple lowercasing with an ASCII fast path, pinned to a Unicode version. There are no collations, and `casefold()` is reserved. **Owner-confirmed, 2026-10-22.**
 - A `lower(string(N))` key component is sized at the largest lowered width, and the 128-byte limit is checked at DDL time. (My call.)
 - View keys are capped at 128 bytes.
