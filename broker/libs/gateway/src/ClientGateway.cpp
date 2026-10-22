@@ -1199,6 +1199,19 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
                         return true;  // scratch exhausted — drop, never crash
                     }
                 }
+                // Issue #116: the gateway is receiver 0.  A receiver-key session's frame naming another receiver (a
+                // frame sealed for a shard worker, replayed here) is dropped before any AEAD and commits nothing.
+                if (s->crypto.receiverKeys && len >= pc::kCryptoHeaderBytes) {
+                    const auto sub = pc::CryptoSubHeader::decode(buf + pc::MessageHeader::ENCODED_SIZE,
+                                                                 len - pc::MessageHeader::ENCODED_SIZE);
+                    if (sub && sub->senderId != 0) [[unlikely]] {
+                        if (c2bWrongReceiverDrops_++ % 1024 == 0)
+                            spdlog::warn("ClientGateway: encrypted frame for receiver {} (not the gateway) on "
+                                         "session {}; dropped (total {})", sub->senderId, hdrOpt->sessionId,
+                                         c2bWrongReceiverDrops_);
+                        return true;
+                    }
+                }
                 uint64_t seq = 0;
                 const std::size_t plainLen = rune::gateway::codec::openIngressFrameUncommitted(
                     s->crypto, buf, len, decryptScratch_.data(), decryptScratch_.size(), seq);
@@ -2783,6 +2796,8 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
     // worker (shard mode only; unread in legacy mode).
     session.crypto.c2b = keys.c2b;
     std::memcpy(session.crypto.c2bPrefix, keys.c2bPrefix, 4);
+    // Issue #116: a client >= 12 binds each c2b frame to one receiver; the gateway (receiver 0) keeps the raw key.
+    session.crypto.receiverKeys = pc::sessionUsesReceiverKeys(pending.clientVersion, pc::kBrokerVersion);
 
     // Task 19 ★: ship the real per-worker key now. Every worker ALREADY has
     // a "parked" entry for this session from the FIRST (announce-before-
@@ -8221,6 +8236,15 @@ void ClientGateway::onCatalogObjectApplied(int32_t id, const std::string& name, 
         const auto w = static_cast<std::size_t>(id) / 64;
         (void)permissionShipper_.patchTable(*workerPool_, tid, w, t.writeBits().subspan(w, 1), t.writeBits().size());
     });
+    // Issue #197: the object's DDL OK must not leave before every worker ring accepted what was queued above (the
+    // worker's grace hold covers an item on its ring, not one still in this queue).  queuedSeq() covers the table
+    // ships and this call's patches; conservative is fine.  Idempotent: an existing entry for `id` is replaced.
+    if (shipping && permissionShipper_.queuedSeq() > permissionShipper_.shippedSeq()) {
+        const uint64_t need = permissionShipper_.queuedSeq();
+        for (auto& en : objectShipSeqs_)
+            if (en.first == id) { en.second = need; return; }
+        objectShipSeqs_.emplace_back(id, need);
+    }
 }
 
 void ClientGateway::onFilterSchema(int32_t topicId, uint16_t version, std::span<const uint8_t> evolvingBlob)
@@ -8261,6 +8285,7 @@ void ClientGateway::onCatalogObjectDropped(int32_t id)
     filterSchemas_.erase(id);
     filterSchemaTooLargeTopics_.erase(id);
     objectIndex_.onDropped(id);
+    std::erase_if(objectShipSeqs_, [id](const auto& e) { return e.first == id; });   // issue #197: it never serves
     syncPermissionTables_();
     const bool shipping = authMode_ == rune::gateway::GatewayAuthMode::Required && shardMode_ && workerPool_;
     permPool_.onObjectDropped(id, [&](uint32_t tid, const PermissionTable& t, bool before, bool) {
@@ -8729,6 +8754,10 @@ int ClientGateway::servicePermissionShippingWork_()
     syncPermissionTables_();   // issue #259: a freed table's drop (after every rebind away from it)
     if (!workerPool_ || !shardMode_) return 0;
     if (permissionShipper_.pendingUpdates() != 0) work += permissionShipper_.retry(*workerPool_);
+    if (!objectShipSeqs_.empty()) {   // issue #197: bounded even when an OK is never offered
+        const uint64_t shipped = permissionShipper_.shippedSeq();
+        std::erase_if(objectShipSeqs_, [shipped](const auto& e) { return e.second <= shipped; });
+    }
     for (std::size_t i = 0; i < heldLoginFinals_.size(); ) {
         HeldLoginFinal& h = heldLoginFinals_[i];
         if (permissionShipper_.shippedSeq() < h.epoch) { ++i; continue; }
@@ -10017,6 +10046,12 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
                     break;
                 }
             }
+            // Issue #116: the receiver a client seals a produce for when it uses the advertised worker route - the
+            // owning worker w (w+1) when that route reaches the worker itself (its own ingress endpoint in shard
+            // mode, or its per-worker stream base + w on this node); 0 = the gateway's own stream.  Sent only to
+            // sessions >= 12 (MetadataResponse::clientVersion below).
+            if (workerPool_ && (!p.ingressEndpoint.empty() || (!shardMode_ && perWorkerIngressActive_)))
+                p.ingressReceiverId = static_cast<uint8_t>(workerPool_->ownerWorkerId(srcTopicId, partition) + 1);
             parts.push_back(p);
             }   // alias
         }
@@ -10030,6 +10065,9 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
     resp.correlationId = req.correlationId;
     resp.brokers       = std::span<const pc::BrokerEntry>(brokers.data(), brokers.size());
     resp.partitions    = std::span<const pc::PartitionEntry>(parts.data(), parts.size());
+    resp.clientVersion = session->clientVersion;   // issue #116: the receiver trailer only for sessions >= 12
+    if (preReceiverKeyMetadataForTest_) [[unlikely]]   // test seam: an old broker's answer (no receiver trailer)
+        resp.clientVersion = std::min(resp.clientVersion, pc::kClientVersionReceiverKeys - 1);
 
     const std::size_t needed = resp.encodedSize();
     if (needed <= scratch_.size()) {

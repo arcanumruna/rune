@@ -1151,6 +1151,7 @@ if(BUILD_TESTING)
     # aeron-free build shape as rune_client_crypto_tests above. ──
     add_executable(rune_client_crypto_regression_tests
         tests/crypto/ClientCryptoRegressionTest.cpp
+        tests/support/AllocCounter.cpp   # PR #528 review: zero-alloc receiver-key seal gate
     )
     target_link_libraries(rune_client_crypto_regression_tests PRIVATE rune_client rune_crypto GTest::gtest_main)
     target_include_directories(rune_client_crypto_regression_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})

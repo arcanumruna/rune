@@ -525,3 +525,99 @@ TEST(MetadataMessagesIngressEndpointRegression, TrailerCountMismatchRejected) {
     buf[trailerPos] = 2;   // claims 2 endpoints for 1 partition
     EXPECT_FALSE(rpc::MetadataResponse::decode(buf.data(), buf.size()).has_value());
 }
+
+// ===========================================================================
+// Issue #116: per-partition ingressReceiverId trailer (after the ingressEndpoint trailer).  A client >= 12 seals a
+// produce bound for the partition's advertised worker route under that worker's receiver key (id w+1); 0 = the gateway.
+// ===========================================================================
+namespace {
+std::vector<uint8_t> encodeRespFor(int32_t clientVersion, const std::vector<rpc::PartitionEntry>& parts) {
+    rpc::MetadataResponse resp;
+    resp.sessionId = 5; resp.correlationId = 6;
+    resp.clientVersion = clientVersion;
+    resp.partitions = std::span<const rpc::PartitionEntry>(parts.data(), parts.size());
+    std::vector<uint8_t> buf(resp.encodedSize());
+    EXPECT_EQ(resp.encode(buf.data()), buf.size());
+    return buf;
+}
+} // namespace
+
+TEST(MetadataMessagesReceiverIdRegression, ReceiverIdTrailerRoundTripsRegression) {
+    rpc::PartitionEntry p0; p0.topicId = 3; p0.partition = 0; p0.ingressEndpoint = "10.0.0.1:40500"; p0.ingressReceiverId = 1;
+    rpc::PartitionEntry p1; p1.topicId = 3; p1.partition = 1; p1.ingressEndpoint = "10.0.0.1:40501"; p1.ingressReceiverId = 2;
+    rpc::PartitionEntry p2; p2.topicId = 4; p2.partition = 0;   // the gateway's own route: 0
+    const auto buf = encodeRespFor(rpc::kClientVersionReceiverKeys, {p0, p1, p2});
+    const auto dec = rpc::MetadataResponse::decode(buf.data(), buf.size());
+    ASSERT_TRUE(dec.has_value());
+    ASSERT_EQ(dec->partitions.size(), 3u);
+    EXPECT_EQ(dec->partitions[0].ingressReceiverId, 1);
+    EXPECT_EQ(dec->partitions[1].ingressReceiverId, 2);
+    EXPECT_EQ(dec->partitions[2].ingressReceiverId, 0);
+    EXPECT_EQ(dec->partitions[1].ingressEndpoint, "10.0.0.1:40501");
+    // Torn receiver trailer (2-byte count + 3 ids): rejected, never a wrong id.  Cutting all 5 bytes = absent.
+    for (std::size_t cut = 1; cut <= 4; ++cut)
+        EXPECT_FALSE(rpc::MetadataResponse::decode(buf.data(), buf.size() - cut).has_value()) << "cut=" << cut;
+}
+
+TEST(MetadataMessagesReceiverIdRegression, ReceiverIdsWithoutEndpointsStillCarryTheEndpointTrailerRegression) {
+    // Non-shard per-worker ingress: ids without endpoints.  The endpoint trailer (empty strings) precedes the receiver
+    // trailer so an older decoder reads the endpoint trailer as before and ignores the rest.
+    rpc::PartitionEntry p; p.topicId = 1; p.ingressStreamId = 112; p.ingressReceiverId = 2;
+    const auto buf = encodeRespFor(rpc::kClientVersionReceiverKeys, {p});
+    const auto dec = rpc::MetadataResponse::decode(buf.data(), buf.size());
+    ASSERT_TRUE(dec.has_value());
+    EXPECT_EQ(dec->partitions[0].ingressReceiverId, 2);
+    EXPECT_TRUE(dec->partitions[0].ingressEndpoint.empty());
+    // The pre-#116 layout ends after the endpoint trailer: header + 2 + 2 + 28 + (2 + 2) — what an old decoder needs.
+    const std::size_t endpointTrailerEnd = rpc::MessageHeader::ENCODED_SIZE + 2u + 2u + 28u + 2u + 2u;
+    ASSERT_EQ(buf.size(), endpointTrailerEnd + 2u + 1u);
+    const auto old = rpc::MetadataResponse::decode(buf.data(), endpointTrailerEnd);
+    ASSERT_TRUE(old.has_value());
+    EXPECT_EQ(old->partitions[0].ingressReceiverId, 0) << "trailer absent: every receiver id is 0 (the gateway)";
+}
+
+TEST(MetadataMessagesReceiverIdRegression, AbsentTrailerDecodesEveryReceiverIdAsZeroRegression) {
+    rpc::PartitionEntry p0; p0.ingressEndpoint = "h:1";
+    rpc::PartitionEntry p1; p1.ingressEndpoint = "h:2";
+    const auto buf = encodeResp({}, {p0, p1});   // no receiver ids at all
+    const auto dec = rpc::MetadataResponse::decode(buf.data(), buf.size());
+    ASSERT_TRUE(dec.has_value());
+    for (const auto& p : dec->partitions) EXPECT_EQ(p.ingressReceiverId, 0);
+}
+
+TEST(MetadataMessagesReceiverIdRegression, TrailerNotEmittedBelowClientVersion12Regression) {
+    rpc::PartitionEntry p; p.topicId = 1; p.ingressEndpoint = "h:1"; p.ingressReceiverId = 3;
+    const auto legacy = encodeRespFor(rpc::kClientVersionReceiverKeys - 1, {p});
+    rpc::PartitionEntry q = p; q.ingressReceiverId = 0;
+    const auto none = encodeRespFor(rpc::kClientVersionReceiverKeys - 1, {q});
+    EXPECT_EQ(legacy, none) << "a session below 12 gets the pre-#116 bytes";
+    const auto dec = rpc::MetadataResponse::decode(legacy.data(), legacy.size());
+    ASSERT_TRUE(dec.has_value());
+    EXPECT_EQ(dec->partitions[0].ingressReceiverId, 0);
+    // All-zero ids are never emitted either (byte-identical default frames).
+    const auto zero = encodeRespFor(rpc::kClientVersionReceiverKeys, {q});
+    EXPECT_EQ(zero, none);
+}
+
+// Adversarial review of PR #528 (issue #116) - input bounds on the receiver trailer: a count that does not parallel
+// partitions[] (0, n-1, n+1, 0xFFFF) is rejected - never a partially applied or shifted id - and bytes after a
+// well-formed receiver trailer (a later additive trailer) are ignored with every id intact; the id byte keeps its full
+// range (255 decodes as 255; the client refuses to seal for it).
+TEST(MetadataMessagesReceiverIdRegression, AReceiverTrailerCountThatDoesNotParallelThePartitionsIsRejectedAdversarialRegression) {
+    rpc::PartitionEntry p0; p0.topicId = 3; p0.partition = 0; p0.ingressEndpoint = "h:1"; p0.ingressReceiverId = 1;
+    rpc::PartitionEntry p1; p1.topicId = 3; p1.partition = 1; p1.ingressEndpoint = "h:2"; p1.ingressReceiverId = 255;
+    const auto buf = encodeRespFor(rpc::kClientVersionReceiverKeys, {p0, p1});
+    const std::size_t countAt = buf.size() - 2u - 2u;   // [u16 count][id][id]
+    ASSERT_EQ(rpc::detail::getLE16(buf.data(), static_cast<int>(countAt)), 2u);
+    for (const uint16_t bad : {uint16_t{0}, uint16_t{1}, uint16_t{3}, uint16_t{0xFFFF}}) {
+        auto b = buf;
+        rpc::detail::putLE16(b.data(), static_cast<int>(countAt), bad);
+        EXPECT_FALSE(rpc::MetadataResponse::decode(b.data(), b.size()).has_value()) << "count " << bad;
+    }
+    auto longer = buf;
+    for (uint8_t x : {uint8_t{0xAA}, uint8_t{0xBB}, uint8_t{0xCC}}) longer.push_back(x);
+    const auto dec = rpc::MetadataResponse::decode(longer.data(), longer.size());
+    ASSERT_TRUE(dec.has_value()) << "a later additive trailer must be ignored";
+    EXPECT_EQ(dec->partitions[0].ingressReceiverId, 1);
+    EXPECT_EQ(dec->partitions[1].ingressReceiverId, 255);
+}

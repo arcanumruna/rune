@@ -5033,6 +5033,17 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             [this, &why](int64_t session, int32_t topicId) {
                 // Task 11 fix round 1 (I2): the held answer is explicit — the
                 // event committed; the topic is not placed / serving yet.
+                if (gateway_ && !gateway_->objectPermissionsShipped(topicId) &&
+                    ddlGatedTopicServes(topicRegistry_.get(), topicId,
+                                        [this](int32_t id) { return catalogTopicServes_(id); })) {
+                    // Issue #197: placed and serving, but a worker's lifecycle ring is full, so the new object's
+                    // permissions have not reached every worker yet.
+                    why = "the DDL committed and topic id=" + std::to_string(topicId) + " serves, but its permissions "
+                          "have not reached every worker after " + std::to_string(kDdlAnswerMaxHoldNs / 1'000'000) +
+                          " ms (a worker's lifecycle ring is full); retry with the same requestId";
+                    const bool v8p = rune::protocol::client::clientUnderstandsCatalogDdl(gateway_->sessionClientVersion(session));
+                    return DdlAnswerGate::Explanation{why, v8p};
+                }
                 why = "the DDL committed but topic id=" + std::to_string(topicId) + " does not serve after " +
                       std::to_string(kDdlAnswerMaxHoldNs / 1'000'000) + " ms";
                 const std::string reason = metadataService_ ? metadataService_->unplaceableReason(topicId) : "";
@@ -5923,8 +5934,11 @@ bool BrokerNode::catalogTopicServes_(int32_t topicId) const noexcept {
 // AlterView whose sink was retired since) — it will never serve, and it need not:
 // it passes at once, never held into an in-doubt Internal.
 bool BrokerNode::ddlTopicServes_(int32_t topicId) const noexcept {
+    // Issue #197: also every worker must hold the object's WRITE bits (a lifecycle-ring item still queued in the
+    // gateway's shipper is not covered by the worker's grace hold) - the login final's rule, for a DDL OK.
     return ddlGatedTopicServes(topicRegistry_.get(), topicId,
-                               [this](int32_t id) { return catalogTopicServes_(id); });
+                               [this](int32_t id) { return catalogTopicServes_(id); }) &&
+           (!gateway_ || gateway_->objectPermissionsShipped(topicId));
 }
 
 // ---------------------------------------------------------------------------

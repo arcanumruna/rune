@@ -455,5 +455,61 @@ TEST(MetadataResponseRegression, MalformedMetadataRequestIsAnsweredInvalidReques
     EXPECT_EQ(err->code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
 }
 
+// ===========================================================================
+// Issue #116: each partition advertises the receiver a produce on its worker route is sealed for (owner + 1), only to
+// sessions >= 12; the gateway's own route (no worker route) is receiver 0.
+// ===========================================================================
+TEST(MetadataResponseReceiverIdRegression, WorkerRoutesAdvertiseTheOwnersReceiverIdToNewClientsOnlyRegression)
+{
+    constexpr int32_t kWorkers = 3;
+    const std::vector<std::pair<int32_t,int32_t>> kParts = {{10, 0}, {10, 1}, {10, 2}, {20, 0}, {20, 1}};
+    md::ShardRouter router(kWorkers);
+    for (const bool shardEndpoints : {true, false}) {
+        auto pool = std::make_unique<rune::node::WorkerPool>(kWorkers, router, 4096, 4096, 16, 16);
+        ClientGateway gw = ClientGateway::makeForTest(acceptAllEgress, 1);
+        gw.setRoutingImageSnapshot(makeImage(kParts, /*leader=*/1));
+        gw.setCommittedMetadataReady(true);
+        gw.setWorkerPool(pool.get());
+        gw.setPerWorkerIngressActive(true);
+        if (shardEndpoints) gw.setShardIngressEndpoints({{1, "10.0.0.2", 40520}});
+        std::vector<uint8_t> frameCopy;
+        gw.setOnEgressFrame([&](int64_t, const uint8_t* buf, std::size_t len) { frameCopy.assign(buf, buf + len); });
+        for (const int32_t cv : {pc::kClientVersion, pc::kClientVersionReceiverKeys - 1}) {
+            const int64_t sid = gw.injectTestSession(0, cv);
+            const auto frame = makeMetadataRequestFrame(sid);
+            frameCopy.clear();
+            gw.applyMetadataForTest(frame.data(), frame.size());
+            auto dec = pc::MetadataResponse::decode(frameCopy.data(), frameCopy.size());
+            ASSERT_TRUE(dec.has_value());
+            for (const auto& [tid, pid] : kParts) {
+                auto e = findEntry(*dec, tid, pid);
+                ASSERT_TRUE(e.has_value());
+                const int expected = cv >= pc::kClientVersionReceiverKeys ? router.workerForPartition(tid, pid) + 1 : 0;
+                EXPECT_EQ(int(e->ingressReceiverId), expected)
+                    << "shardEndpoints=" << shardEndpoints << " clientVersion=" << cv << " topic=" << tid << " part=" << pid;
+            }
+        }
+    }
+}
+
+TEST(MetadataResponseReceiverIdRegression, TheGatewaysOwnRouteIsReceiverZeroRegression)
+{
+    md::ShardRouter router(2);
+    auto pool = std::make_unique<rune::node::WorkerPool>(2, router, 4096, 4096, 16, 16);
+    ClientGateway gw = ClientGateway::makeForTest(acceptAllEgress, 1);
+    gw.setRoutingImageSnapshot(makeImage({{10, 0}, {10, 1}}));
+    gw.setCommittedMetadataReady(true);
+    gw.setWorkerPool(pool.get());   // per-worker ingress NOT active: every produce goes to the gateway
+    std::vector<uint8_t> frameCopy;
+    gw.setOnEgressFrame([&](int64_t, const uint8_t* buf, std::size_t len) { frameCopy.assign(buf, buf + len); });
+    const int64_t sid = gw.injectTestSession(0, pc::kClientVersion);
+    const auto frame = makeMetadataRequestFrame(sid);
+    gw.applyMetadataForTest(frame.data(), frame.size());
+    auto dec = pc::MetadataResponse::decode(frameCopy.data(), frameCopy.size());
+    ASSERT_TRUE(dec.has_value());
+    for (const auto& p : dec->partitions) EXPECT_EQ(p.ingressReceiverId, 0);
+    EXPECT_EQ(frameCopy.size(), rpcLegacySize(dec->brokers, dec->partitions.size())) << "no trailer at all";
+}
+
 } // namespace
 } // namespace rune::gateway

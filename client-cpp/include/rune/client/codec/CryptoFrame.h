@@ -119,6 +119,30 @@ struct RecvSlot {
 
 }  // namespace detail_crypto
 
+/// Issue #116: the {cipher, sendSeq} a c2b frame for `receiverId` is sealed with.  Receiver 0 (the gateway) - and every
+/// frame of a legacy session (!crypto.receiverKeys) - is EXACTLY crypto.send/sendSeq, the pre-#116 fields.  Receiver
+/// k >= 1 (shard worker k-1) is crypto.workerSend[k-1]: its cipher under deriveReceiverKey(c2bKey, k) is built ONCE,
+/// on first use (cold); every later frame is an array-index hit (zero allocation).  A null cipher = refuse (an id above
+/// the broker's max worker count, or a key that failed to derive) - never a fallback to another receiver's key.
+struct SendSlot {
+    rune::crypto::AeadCipher* cipher  = nullptr;
+    uint64_t*                 sendSeq = nullptr;
+    uint8_t                   receiverId = 0;   // what the subheader names (0 for every legacy frame)
+};
+[[nodiscard]] inline SendSlot selectSendSlot(session::CryptoState& crypto, uint8_t receiverId) noexcept {
+    if (!crypto.send.has_value()) return {};
+    if (!crypto.receiverKeys || receiverId == 0) return SendSlot{&*crypto.send, &crypto.sendSeq, 0};
+    const std::size_t idx = static_cast<std::size_t>(receiverId) - 1;
+    if (idx >= session::CryptoState::kMaxShardWorkers) return {};   // above the broker's max workers: refuse
+    auto& slot = crypto.workerSend[idx];
+    if (!slot.cipher.has_value()) {
+        rune::crypto::AeadKey derived{};
+        if (!rune::crypto::deriveReceiverKey(crypto.c2bKey, receiverId, derived)) return {};   // fail closed
+        slot.cipher.emplace(crypto.cipher, derived, crypto.c2bPrefix);
+    }
+    return SendSlot{&*slot.cipher, &slot.sendSeq, receiverId};
+}
+
 /// Seal an outbound client→broker frame.  NOT produce-specific — `plain` is a
 /// generic [24B MessageHeader][body] for ANY non-handshake template (Produce,
 /// Keepalive/Ping, Disconnect, Subscribe, Unsubscribe, Metadata, group/txn,
@@ -129,34 +153,41 @@ struct RecvSlot {
 /// [24B header][12B CryptoSubHeader][sealed body][16B tag] into `scratch`
 /// (caller-owned, reused across calls — needs plainLen +
 /// rune::protocol::client::kCryptoOverhead bytes of capacity).
+/// Issue #116: `receiverId` names the endpoint the frame is offered to - 0 the gateway (the node endpoint), k >= 1 shard
+/// worker k-1 (its own ingress): on a receiver-key session the frame is sealed under that receiver's key and seq space
+/// and the subheader's senderId carries the id; on a legacy session it is ignored (byte-identical pre-#116 frame).
 /// Returns the sealed frame length (== plainLen + kCryptoOverhead), or 0 on
-/// bad input / seal failure — the caller MUST NOT transmit on 0 (AeadCipher's
+/// bad input / an unknown receiver / seal failure — the caller MUST NOT transmit on 0 (AeadCipher's
 /// own contract: a cipher error must never be mistaken for success, which
 /// would risk nonce/keystream reuse under the same key).
 [[nodiscard]] inline std::size_t sealFrame(
     session::CryptoState& crypto,
     const uint8_t* plain, std::size_t plainLen,
-    uint8_t* scratch, std::size_t scratchCap) noexcept {
+    uint8_t* scratch, std::size_t scratchCap, uint8_t receiverId = 0) noexcept {
     namespace rpc = rune::protocol::client;
     if (plainLen < rpc::MessageHeader::ENCODED_SIZE || !crypto.send.has_value()) return 0;
     const std::size_t bodyLen = plainLen - rpc::MessageHeader::ENCODED_SIZE;
     const std::size_t outLen  = plainLen + rpc::kCryptoOverhead;
     if (scratchCap < outLen) return 0;
+    // Issue #116: the receiver's own cipher and seq space (receiver 0 / a legacy session = crypto.send/sendSeq).
+    const SendSlot slot = selectSendSlot(crypto, receiverId);
+    if (slot.cipher == nullptr) return 0;   // unknown / underivable receiver: do not transmit
 
     // [0..23] header, clear — copy unchanged (part of the AAD).
     std::memcpy(scratch, plain, rpc::MessageHeader::ENCODED_SIZE);
 
-    // [24..35] CryptoSubHeader, clear — also part of the AAD.
-    const uint64_t seq = ++crypto.sendSeq;
+    // [24..35] CryptoSubHeader, clear — also part of the AAD.  senderId names the RECEIVER on c2b (issue #116).
+    const uint64_t seq = ++*slot.sendSeq;
     rpc::CryptoSubHeader sub;
-    sub.version = 1;
-    sub.cipher  = static_cast<uint8_t>(crypto.cipher);
-    sub.epoch   = crypto.epoch;
-    sub.seq     = seq;
+    sub.version  = 1;
+    sub.cipher   = static_cast<uint8_t>(crypto.cipher);
+    sub.epoch    = crypto.epoch;
+    sub.senderId = slot.receiverId;
+    sub.seq      = seq;
     sub.encode(scratch + rpc::MessageHeader::ENCODED_SIZE);
 
     // [36..] sealed body || tag.
-    const std::size_t n = crypto.send->seal(
+    const std::size_t n = slot.cipher->seal(
         seq, scratch, rpc::kCryptoHeaderBytes,
         plain + rpc::MessageHeader::ENCODED_SIZE, bodyLen,
         scratch + rpc::kCryptoHeaderBytes);

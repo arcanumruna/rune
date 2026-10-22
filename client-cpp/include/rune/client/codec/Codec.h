@@ -476,6 +476,8 @@ struct PartitionEntryView {
     /// Task 16: "host:port" of the owning worker's ingress ("" = node).  Owned: the
     /// protocol's decoded struct (a view into the frame) is local to the decoder.
     std::string ingressEndpoint;
+    /// Issue #116: the receiver a produce on this partition's advertised worker route is sealed for (0 = gateway).
+    uint8_t ingressReceiverId = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -543,6 +545,7 @@ inline std::optional<MetadataResponseDecoded> decodeMetadataResponse(
         pv.egressControlPort = p.egressControlPort;  // read-rework: per-worker MDC egress
         pv.egressStreamId  = p.egressStreamId;
         pv.ingressEndpoint = std::string(p.ingressEndpoint);  // Task 16 (shard brokers)
+        pv.ingressReceiverId = p.ingressReceiverId;            // issue #116
         result.partitions.push_back(std::move(pv));
     }
 

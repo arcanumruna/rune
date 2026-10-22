@@ -23,6 +23,7 @@
 #include <rune/node/WorkerPool.h>
 #include <rune/crypto/Aead.h>
 #include <rune/crypto/Cipher.h>
+#include <rune/protocol/client/Protocol.h>
 
 #include <spdlog/spdlog.h>
 
@@ -64,6 +65,11 @@ public:
     /// when `sessionEncrypted && keyReady`; `sessionEncrypted=false`
     /// (plaintext, the default) touches nothing — zero bytes added,
     /// byte-identical to every pre-Task-19 call.
+    ///
+    /// Issue #116 (supersedes the "same bytes on every worker" note below for a session whose `clientVersion` >= 12):
+    /// worker w is shipped deriveReceiverKey(c2b, w+1, ...) — its OWN receiver key — so a c2b frame sealed for the
+    /// gateway or for another worker never opens at worker w; `c2bKeyValid` is false when that derivation fails.  A
+    /// legacy session (< 12) keeps the behaviour below.
     ///
     /// Task 22 (shard worker decrypts produce / per-worker ingress): `c2b`/
     /// `c2bPrefix` are the session's RAW client->broker key/prefix — UNLIKE
@@ -116,14 +122,31 @@ public:
             // else: sessionEncrypted && !keyReady (the first wave — no real
             // key exists yet) or plaintext — op.senderKeyValid stays false.
 
-            // Task 22: c2b ingress key — the SAME raw bytes for every worker
-            // (no per-worker derivation; see this function's doc comment).
-            // Gated identically to the b2c branch above: only once the real
-            // handshake keys exist (sessionEncrypted && keyReady).
+            // Task 22: c2b ingress key.  Gated identically to the b2c branch
+            // above: only once the real handshake keys exist (sessionEncrypted
+            // && keyReady).  Issue #116: a session whose client speaks receiver
+            // keys (>= 12; this broker is >= 7) gets worker w's OWN receiver key
+            // deriveReceiverKey(c2b, w+1) - a frame sealed for the gateway or
+            // another worker never opens here.  A legacy session gets the SAME
+            // raw bytes on every worker (pre-#116).
             if (sessionEncrypted && keyReady) {
-                op.c2bKeyValid = true;
-                std::memcpy(op.c2bKeyPrefix, c2bPrefix, 4);
-                std::memcpy(op.c2bKey, c2b.bytes, 32);
+                const bool receiverKeys = rune::protocol::client::sessionUsesReceiverKeys(
+                    clientVersion, rune::protocol::client::kBrokerVersion);
+                rune::crypto::AeadKey ingressKey{};
+                const bool ok = receiverKeys
+                    ? rune::crypto::deriveReceiverKey(c2b, static_cast<uint8_t>(w + 1), ingressKey)
+                    : (std::memcpy(ingressKey.bytes, c2b.bytes, 32), true);
+                op.c2bKeyValid = ok;
+                if (ok) {
+                    std::memcpy(op.c2bKeyPrefix, c2bPrefix, 4);
+                    std::memcpy(op.c2bKey, ingressKey.bytes, 32);
+                } else {
+                    // Fail closed: the worker keeps no ingress key for this
+                    // session and drops its encrypted produce, never plaintext.
+                    spdlog::critical("SessionAnnouncer: deriveReceiverKey failed for session={} "
+                                      "worker={} (receiverId={}) — fail-closed: this worker refuses "
+                                      "the session's encrypted produce ingress", sessionId, w, w + 1);
+                }
             }
             // else: op.c2bKeyValid stays false — fail closed (the worker
             // parks/drops this session's produce ingress, never plaintext).

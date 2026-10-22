@@ -296,9 +296,11 @@ struct WorkerOp {
     // derivation failure — the worker must then park/drop that session's
     // produce ingress, never decode it as plaintext. Cipher is shared with
     // the egress key above (senderCipher) — one cipher per session.
+    // Issue #116: a session whose client is >= 12 is instead shipped THIS
+    // worker's own receiver key deriveReceiverKey(c2b, w+1) (SessionAnnouncer).
     bool    c2bKeyValid       = false;
     uint8_t c2bKeyPrefix[4]   = {};     ///< 4-byte AEAD nonce prefix (the session's c2bPrefix)
-    uint8_t c2bKey[32]        = {};     ///< the session's RAW c2b key (same for every worker)
+    uint8_t c2bKey[32]        = {};     ///< the session's c2b ingress key (raw: legacy; per-worker: issue #116)
 
     // SetOwnership: the ReplicaRegistry generation this owned set reflects
     // (acked back as WorkerReturn::OwnershipAck).  Task 10 fix 3.

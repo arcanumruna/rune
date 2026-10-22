@@ -1635,6 +1635,17 @@ public:
     void holdCatalogAnswersForTest(bool on) {
         onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdAnswersForTest(on); return 0; });
     }
+    /// Issue #197 seam (CONTROL thread): hold / release the gateway's permission shipper (queued, never sent while held;
+    /// releasing ships the backlog at once).
+    template <class = void>   // instantiated after onControlThreadForTest is defined
+    void holdPermissionShippingForTest(bool on) {
+        onControlThreadForTest([this, on]() { if (gateway_) gateway_->holdPermissionShippingForTest(on); return 0; });
+    }
+    /// PR #528 review seam (CONTROL thread): this broker answers MetadataRequests as a pre-receiver-key (< 7) broker.
+    template <class = void>   // instantiated after onControlThreadForTest is defined
+    void emulatePreReceiverKeyMetadataForTest(bool on) {
+        onControlThreadForTest([this, on]() { if (gateway_) gateway_->emulatePreReceiverKeyMetadataForTest(on); return 0; });
+    }
     /// Task 22: hold / release this broker's catalog applier (a promoted leader stays CatchingUp).
     void holdCatalogApplyForTest(bool on) {
         onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdApplyForTest(on); return 0; });

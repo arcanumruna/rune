@@ -89,6 +89,9 @@ public:
     [[nodiscard]] std::size_t pendingUpdates() const noexcept { return queue_.size(); }
     [[nodiscard]] uint64_t chunksSentForTest() const noexcept { return chunksSent_; }
     [[nodiscard]] uint64_t wordsSentForTest() const noexcept { return wordsSent_; }
+    /// Test seam (issue #197): while held, push_ / retry() queue items but send nothing, so shippedSeq() cannot
+    /// advance; the next retry() after the release ships everything.
+    void setHoldForTest(bool on) noexcept { hold_ = on; }
 
 private:
     enum class Kind : uint8_t { Table, Patch, Bind, Drop, Fence };
@@ -154,6 +157,7 @@ private:
 
     /// Worker `w`: send its next ops in queue order until its ring is full or it has every item.
     int pumpWorker_(WorkerPool& pool, int32_t w) {
+        if (hold_) [[unlikely]] return 0;   // test seam only (issue #197)
         Cursor& cur = next_[static_cast<std::size_t>(w)];
         int sent = 0;
         while (cur.nextSeq < endSeq_) {
@@ -177,6 +181,7 @@ private:
     int32_t                             workers_  = 0;
     uint64_t                            chunksSent_ = 0;
     uint64_t                            wordsSent_  = 0;
+    bool                                hold_       = false;   // test seam (issue #197)
 };
 
 } // namespace rune::node

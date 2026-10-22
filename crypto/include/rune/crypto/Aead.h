@@ -47,4 +47,15 @@ private:
 // Fail-closed: returns false (and leaves `out` unspecified -- callers MUST NOT use it) if
 // any EVP_KDF step fails. Never returns true with a key that wasn't actually derived.
 bool deriveSenderKey(const AeadKey& b2c, uint8_t senderId, AeadKey& out) noexcept;
+
+// Issue #116: derive the per-receiver client->broker AEAD key for `receiverId`.  A session whose client and broker both
+// speak receiver keys (client version 12, broker version 7) seals each c2b frame for ONE receiver -- the gateway
+// (receiverId 0) or shard worker w (receiverId w+1) -- so a frame sealed for one receiver never opens at another (each
+// receiver also keeps its own seq space and replay window).
+//   receiverId == 0 -> `out` = `c2b` UNCHANGED (the gateway; byte-identical to the legacy shared key).
+//   receiverId >= 1 -> out = HKDF-Expand(PRK = c2b.bytes, info = "rune-c2b-receiver" || receiverId byte, SHA-256,
+//                      L=32), expand-only, no salt.  The info string differs from deriveSenderKey's, so a receiver key
+//                      never equals a b2c sender key.
+// Deterministic pure function; same fail-closed contract as deriveSenderKey (false = `out` unusable).
+bool deriveReceiverKey(const AeadKey& c2b, uint8_t receiverId, AeadKey& out) noexcept;
 }

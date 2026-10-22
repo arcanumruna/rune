@@ -212,6 +212,39 @@ TEST(AeadRegression, DeriveSenderKeyZeroIdentityAndDistinctPerSender) {
     EXPECT_NE(0, std::memcmp(sender1.bytes, b2c.bytes, sizeof b2c.bytes));
 }
 
+// Issue #116: each client->broker receiver (0 = the gateway, w+1 = worker w) opens c2b frames under its OWN key, so a
+// frame sealed for one receiver never opens at another.  Receiver 0 stays the raw c2b key (legacy byte-identity); every
+// other id is HKDF-expanded under an info string distinct from the b2c sender derivation.
+TEST(AeadRegression, DeriveReceiverKeyRegressionZeroIsRawC2b) {
+    const AeadKey c2b = keyFilledWith(3);
+    AeadKey r0{};
+    ASSERT_TRUE(deriveReceiverKey(c2b, 0, r0));
+    EXPECT_EQ(0, std::memcmp(r0.bytes, c2b.bytes, sizeof c2b.bytes)) << "receiver 0 (the gateway) is the raw c2b key";
+}
+
+TEST(AeadRegression, DeriveReceiverKeyRegressionDistinctPerReceiverAndFromSenderKeys) {
+    const AeadKey c2b = keyFilledWith(3);
+    AeadKey r[4]{};
+    for (uint8_t id = 1; id <= 3; ++id) ASSERT_TRUE(deriveReceiverKey(c2b, id, r[id]));
+    for (uint8_t a = 1; a <= 3; ++a) {
+        EXPECT_NE(0, std::memcmp(r[a].bytes, c2b.bytes, sizeof c2b.bytes)) << "receiver " << int(a);
+        for (uint8_t b = static_cast<uint8_t>(a + 1); b <= 3; ++b)
+            EXPECT_NE(0, std::memcmp(r[a].bytes, r[b].bytes, sizeof c2b.bytes)) << int(a) << " vs " << int(b);
+        AeadKey s{};
+        ASSERT_TRUE(deriveSenderKey(c2b, a, s));
+        EXPECT_NE(0, std::memcmp(r[a].bytes, s.bytes, sizeof s.bytes))
+            << "a receiver key must never equal the sender derivation of the same id (distinct info strings)";
+    }
+}
+
+TEST(AeadRegression, DeriveReceiverKeyRegressionIsDeterministic) {
+    const AeadKey c2b = keyFilledWith(9);
+    AeadKey a{}, b{};
+    ASSERT_TRUE(deriveReceiverKey(c2b, 7, a));
+    ASSERT_TRUE(deriveReceiverKey(c2b, 7, b));
+    EXPECT_EQ(0, std::memcmp(a.bytes, b.bytes, sizeof a.bytes));
+}
+
 // ===========================================================================
 // TlsRegression — handshake server-auth + fail-closed key export.
 // ===========================================================================

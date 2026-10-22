@@ -864,7 +864,9 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             opt->handshakeBytes,
             // Authentication (v9): the machine logs in (Authenticating) when the broker requires it.
             opt->authMode,
-            opt->authState);
+            opt->authState,
+            // Issue #116: with the client's own version, decides per-receiver c2b keys.
+            opt->brokerVersion);
         s.machine.onActivity(nowNs);
         // Task 5: "accepted" now means reached Connected — true immediately for a
         // plaintext connect, true only once the TLS handshake finishes (possibly
@@ -1362,7 +1364,7 @@ void ClientAgent::releaseRoutePub_(transport::AeronTransport::PubHandle h) noexc
 }
 
 bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string& sessionEndpoint,
-                           const std::string& dataChannel) noexcept {
+                           const std::string& dataChannel, uint8_t receiverId) noexcept {
     const int64_t  key  = routeKey(topicId, partition);
     const uint32_t idx  = routeIndex_.find(key);
     // Fix round 1 (C1): where the seed's default publication PHYSICALLY points —
@@ -1383,11 +1385,22 @@ bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string
     }
     try {
         const std::string& data = dataChannel.empty() ? sessionEndpoint : dataChannel;
+        // Issue #116: the route's receiver (cold: once per metadata change; the offer reads two plain fields).
+        const auto fresh = [&] {
+            PartitionRoute nr{sessionEndpoint, data};
+            nr.receiverId = receiverId;
+            nr.dataOnNode = sameEndpoint(data, sessionEndpoint);
+            return nr;
+        };
         if (idx != detail::FlatIndexMap::kNone) {
             PartitionRoute& r = routes_[idx];
-            if (r.sessionEndpoint == sessionEndpoint && r.dataChannel == data) return false;
+            if (r.sessionEndpoint == sessionEndpoint && r.dataChannel == data) {
+                if (r.receiverId == receiverId) return false;
+                r.receiverId = receiverId;   // same endpoint, another receiver: keep the publication
+                return true;
+            }
             const auto oldPub = r.pub;
-            r = PartitionRoute{sessionEndpoint, data};
+            r = fresh();
             releaseRoutePub_(oldPub);  // M4: the old worker publication, once unreferenced
             return true;
         }
@@ -1395,10 +1408,10 @@ bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string
         if (!freeRoutes_.empty()) {
             slot = freeRoutes_.back();
             freeRoutes_.pop_back();
-            routes_[slot] = PartitionRoute{sessionEndpoint, data};
+            routes_[slot] = fresh();
         } else {
             slot = static_cast<uint32_t>(routes_.size());
-            routes_.push_back(PartitionRoute{sessionEndpoint, data});
+            routes_.push_back(fresh());
         }
         routeIndex_.insert(key, slot);
         return true;
@@ -1541,11 +1554,12 @@ namespace {
 /// mechanics for the encrypted path.
 struct SealedFrame { uint8_t* buf; std::size_t len; };
 SealedFrame sealForOffer(transport::AeronTransport& transport, session::CryptoState& crypto,
-                         const uint8_t* buf, std::size_t len) noexcept {
+                         const uint8_t* buf, std::size_t len, uint8_t receiverId = 0) noexcept {
     const std::size_t need = len + rune::protocol::client::kCryptoOverhead;
     uint8_t* scratch = transport.sealScratch(need);
     if (scratch == nullptr) return {nullptr, 0};
-    return {scratch, codec::sealFrame(crypto, buf, len, scratch, need)};
+    // Issue #116: receiverId = the endpoint this frame is offered to (0 = the gateway; every non-produce frame).
+    return {scratch, codec::sealFrame(crypto, buf, len, scratch, need, receiverId)};
 }
 } // namespace
 
@@ -1643,8 +1657,22 @@ bool ClientAgent::offerProduceToLeader_(int32_t topicId, int32_t partition,
                 if (crc.pending()) {
                     transport::sealFrame(const_cast<uint8_t*>(buf), len, crc);
                 }
-                const SealedFrame sealed = sealForOffer(transport_, leader.machine.cryptoState(), buf, len);
+                // Issue #116: sealed for the receiver this offer actually reaches - the route's worker (its own
+                // ingress, or its per-worker stream on the node), or the gateway (0) when the frame goes to the
+                // node on the default ingress stream.  A legacy session ignores it (receiver 0).
+                const uint8_t receiver =
+                    (r.dataOnNode && (ingressStreamId == 0 || ingressStreamId == cfg_.transport.ingressStreamId))
+                        ? uint8_t{0} : r.receiverId;
+                const SealedFrame sealed = sealForOffer(transport_, leader.machine.cryptoState(), buf, len, receiver);
                 if (sealed.len == 0) return false;  // seal failed — DROP, do not transmit
+                // PR #528 review (mixed-version cluster): a worker route with NO receiver id came from a broker that
+                // predates receiver keys (< 7) while this leader's session uses them.  The frame is sealed for the
+                // gateway (receiver 0), so it goes to the leader node's gateway, which relays it - never to the worker,
+                // which would drop it as addressed to another receiver (every such produce would time out).
+                if (receiver == 0 && !r.dataOnNode && leader.machine.cryptoState().receiverKeys) [[unlikely]] {
+                    if (&leader == &seedSession()) return transport_.offer(sealed.buf, sealed.len);
+                    return transport_.offerTo(leader.endpoint, cfg_.transport.ingressStreamId, sealed.buf, sealed.len);
+                }
                 return transport_.offerOn(r.pub, sealed.buf, sealed.len, {});
             }
             return transport_.offerOn(r.pub, buf, len, crc);

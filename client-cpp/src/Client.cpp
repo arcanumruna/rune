@@ -5729,6 +5729,7 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         e.leaderEpoch    = p.leaderEpoch;
         e.ingressStreamId = p.ingressStreamId;  // E5.1: per-worker ingress stream
         e.ingressEndpoint = p.ingressEndpoint;  // Task 16: owning worker's ingress ("" = node)
+        e.ingressReceiverId = p.ingressReceiverId;  // issue #116: who a produce on that route is sealed for
         partitions.push_back(std::move(e));
     }
 
@@ -5790,17 +5791,22 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         const std::string prevSession = agent_.routeEndpointFor(p.topicId, p.partition);
         const bool hadWorker = !prevData.empty() && !agent::ClientAgent::sameEndpoint(prevData, prevSession);
         std::string session, data;
+        // Issue #116: the receiver a produce on this route is sealed for - the advertised worker (its endpoint, or its
+        // per-worker stream on the node) - or 0 (the gateway) once the route is back on the node's gateway.
+        uint8_t receiverId = 0;
         if (!p.ingressEndpoint.empty()) {
             session = ep.empty() ? currentLeaderChannel() : toChannel(ep);
             data    = toChannel(p.ingressEndpoint);
+            receiverId = p.ingressReceiverId;
         } else if (p.ingressStreamId != 0 && !ep.empty()) {
             session = data = toChannel(ep);  // legacy Task-1.3 node route
+            receiverId = p.ingressReceiverId;   // non-zero only for a per-worker stream (the broker decides)
         } else if (hadWorker) {
             session = data = prevSession;    // endpoint withdrawn, no node route: back to the node
         } else {
             continue;
         }
-        const bool changed = agent_.setRoute(p.topicId, p.partition, session, data);
+        const bool changed = agent_.setRoute(p.topicId, p.partition, session, data, receiverId);
         // NEW-4(b): any route change is a new lane for the partition's later
         // offers (even when nothing is re-offered now — a first worker install).
         if (changed) producerHub_.noteRouteChanged(p.topicId, p.partition);

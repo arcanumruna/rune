@@ -320,11 +320,21 @@ inline constexpr int32_t kClientVersionLineageNote                = 7;
 //   `[u16 len][utf-8]` field sent only to sessions >= 11. A broker below 6 would ignore the trailer, so a client sends
 //   a filter only to a session whose `ConnectResponse.brokerVersion >= kBrokerVersionFilter`. A session below 11 never
 //   has a filter trailer parsed (any bytes after the key / topic ids are ignored) and never sees a detail trailer.
+// 12 — issue #116, per-receiver client->broker keys: on a session whose broker is >= 7 (kBrokerVersionReceiverKeys)
+//   the client seals each encrypted client->broker frame for ONE receiver — the gateway (receiver 0) or shard worker w
+//   (receiver w+1) — under rune::crypto::deriveReceiverKey(c2b, receiver), with that receiver's own seq space; the id
+//   rides CryptoSubHeader.senderId (in the AAD).  A frame naming another receiver is dropped by every receiver, so a
+//   frame sealed for one endpoint and replayed to another (the gateway, another worker) never opens there.
+//   MetadataResponse carries each partition's ingressReceiverId (a trailer after the ingressEndpoint trailer, sent
+//   only to sessions >= 12): the receiver a produce sent on that partition's advertised worker route is sealed for.
+//   Either side below the gate keeps the legacy shared c2b key (senderId 0, one seq space): the replay protection
+//   needs BOTH the client and the broker at the new version.
 inline constexpr int32_t kClientVersionCatalog                    = 8;
 inline constexpr int32_t kClientVersionAuth                       = 9;
 inline constexpr int32_t kClientVersionTxnOffsetFence             = 10;
 inline constexpr int32_t kClientVersionFilter                     = 11;  // subscription filters (Phase 2c)
-inline constexpr int32_t kClientVersion                           = 11;  // what this protocol's client announces
+inline constexpr int32_t kClientVersionReceiverKeys               = 12;  // per-receiver c2b keys (issue #116)
+inline constexpr int32_t kClientVersion                           = 12;  // what this protocol's client announces
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h
@@ -353,11 +363,21 @@ enum class AuthState : uint8_t { MustAuthenticate = 0, ResumedAuthenticated = 1,
 //   5 — authentication: ConnectResponse v9 carries authMode / authState (see client version 9).
 //   6 — Phase 2c subscription filters: serves the Subscribe / JoinGroup filter trailer and answers a refused filter with
 //       a detail string to sessions >= 11 (see client version 11).
+//   7 — issue #116: opens client->broker frames per receiver (the gateway with the raw c2b key, shard worker w with
+//       deriveReceiverKey(c2b, w+1)) for sessions >= 12, drops a frame naming another receiver, and advertises each
+//       partition's ingressReceiverId to sessions >= 12 (see client version 12).
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kBrokerVersionExplicitGroupSubscriptions = 3;
 inline constexpr int32_t kBrokerVersionAuth                       = 5;   // authentication (ConnectResponse v9 fields)
 inline constexpr int32_t kBrokerVersionFilter                     = 6;   // subscription filters (Phase 2c)
-inline constexpr int32_t kBrokerVersion                           = 6;   // what this protocol's broker announces
+inline constexpr int32_t kBrokerVersionReceiverKeys               = 7;   // per-receiver c2b keys (issue #116)
+inline constexpr int32_t kBrokerVersion                           = 7;   // what this protocol's broker announces
+
+/// Issue #116: true when a session whose client announced `clientVersion` and whose broker announced
+/// `brokerVersion` binds each encrypted client->broker frame to one receiver (see client version 12).
+[[nodiscard]] constexpr bool sessionUsesReceiverKeys(int32_t clientVersion, int32_t brokerVersion) noexcept {
+    return clientVersion >= kClientVersionReceiverKeys && brokerVersion >= kBrokerVersionReceiverKeys;
+}
 
 /// True when a session that connected with `clientVersion` handles
 /// InvalidRequest (39) as non-retriable on every response type (see version 5).
