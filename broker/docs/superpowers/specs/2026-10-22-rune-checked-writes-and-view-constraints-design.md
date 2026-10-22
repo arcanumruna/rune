@@ -752,6 +752,8 @@ Each part ships on its own:
 - Explicit ids on autoincrement topics need the `IMPORT` grant.
 - Performance budgets: under 1 µs for the hook and under 1 µs for assignment, including the copy. No regression for untyped topics or for typed topics that already validated. The new validation cost on typed topics that didn't validate before is measured and accepted.
 
+**Open for the owner:** do you accept decision 2, "success only once views reflect it", in this form: the write is acked at commit (HW), and every read waits at the fold barrier, so no read can miss it? The alternative is acking after the fold. That makes every write on a checked partition wait behind any open transaction, because the fold stops at the LSO.
+
 ## 18. Left to the builder
 
 - The exact row layout for key bytes and prefix links.
