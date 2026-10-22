@@ -348,3 +348,28 @@ TEST(PermissionPoolAdversarialRegression, ADroppedTopicIdReusedOutsideThePrefixI
     EXPECT_FALSE(r->allows(3, rs::opBit(Operation::Write))) << "the reused id is a different topic";
     EXPECT_FALSE(r->allows(3, rs::opBit(Operation::Read)));
 }
+
+// ── issue #128: GetTopicSchema checks only the grants of the object's own kind ──────────────────────────────────
+TEST(AuthorizerRegression, AViewGrantNeverDescribesATopicRegression) {
+    rg::ObjectIndex idx; idx.onTopic(0, "payments"); idx.onView(1, "payboard");
+    const auto viewOnly  = rg::PermissionTable::compile({{g(Operation::Describe, ResourceType::View, PatternKind::Prefix, "pay")}}, idx);
+    const auto topicOnly = rg::PermissionTable::compile({{g(Operation::Describe, ResourceType::Topic, PatternKind::Prefix, "pay")}}, idx);
+    const auto denied = rg::authorizeTopicOrViewName(viewOnly, "payments", Operation::Describe, idx);
+    ASSERT_TRUE(denied.has_value()) << "a VIEW grant must not describe the topic 'payments'";
+    EXPECT_EQ(denied->code, 45);
+    EXPECT_EQ(denied->detail, "not authorized: DESCRIBE on TOPIC payments") << "the text always says TOPIC (D23)";
+    EXPECT_TRUE(rg::authorizeTopicOrViewName(topicOnly, "payboard", Operation::Describe, idx).has_value())
+        << "a TOPIC grant must not describe the view 'payboard'";
+    EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payboard", Operation::Describe, idx).has_value());
+    EXPECT_FALSE(rg::authorizeTopicOrViewName(topicOnly, "payments", Operation::Describe, idx).has_value());
+}
+
+TEST(AuthorizerRegression, AnUnknownSchemaNameAcceptsEitherKindsGrantRegression) {   // D22 parity: "unknown" follows
+    rg::ObjectIndex idx; idx.onTopic(0, "payments");
+    const auto viewOnly = rg::PermissionTable::compile({{g(Operation::Describe, ResourceType::View, PatternKind::Prefix, "pay")}}, idx);
+    EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payroll", Operation::Describe, idx).has_value());
+    idx.onDropped(0);
+    EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payments", Operation::Describe, idx).has_value())
+        << "a dropped name is unknown again";
+    EXPECT_TRUE(rg::authorizeTopicOrViewName(viewOnly, "orders", Operation::Describe, idx).has_value());
+}

@@ -3428,8 +3428,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     {
         const rune::gateway::PermissionTable& perms = permsOf_(*session);
         if (!perms.allows(msg.topicId, rune::security::opBit(rune::security::Operation::Write))) [[unlikely]]
-            if (deny_(*session, rune::gateway::authorizeTopicId(perms, msg.topicId, rune::security::Operation::Write,
-                                                                 objectIndex_), buf, len))
+            if (deny_(*session, authorizeTopicIdHere_(perms, msg.topicId, rune::security::Operation::Write), buf, len))
                 return true;
     }
     // Issue #122: a producer id is honoured only for the principal it was issued to (the owner tag in the id, see
@@ -4700,7 +4699,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         std::optional<rune::gateway::Denial> d;
         if (msg.topicId == pc::kCatalogTopicId)       d = rune::gateway::authorizeCluster(perms, rsec::Operation::Describe);
         else if (msg.topicId == pc::kSecurityTopicId) d = rune::gateway::authorizeCluster(perms, rsec::Operation::Admin);
-        else                                          d = rune::gateway::authorizeTopicId(perms, msg.topicId, rsec::Operation::Read, objectIndex_);
+        else                                          d = authorizeTopicIdHere_(perms, msg.topicId, rsec::Operation::Read);
         if (deny_(*session, d, buf, len)) return;
     }
     if (refuseViewSink_(buf, len, msg.topicId, "Subscribe to a view sink")) [[unlikely]] return;   // VLS B.3
@@ -7732,7 +7731,7 @@ void ClientGateway::handleGetTopicSchema(const uint8_t* buf, std::size_t len)
     }
     // Authentication Task 12 (D18): DESCRIBE on the name, whether it is a topic or a view (the text always says TOPIC).
     if (deny_(*session, rune::gateway::authorizeTopicOrViewName(permsOf_(*session), m.topicName,
-                                                                 rune::security::Operation::Describe), buf, len))
+                                                                 rune::security::Operation::Describe, objectIndex_), buf, len))
         return;
     if (!adminSink_->submitGetSchema(m.sessionId, m.correlationId, m.topicName,
                                      m.requestedFingerprint)) {
@@ -8070,10 +8069,25 @@ void ClientGateway::noteDenied_(const Session& session, pc::TemplateId tid, cons
     }
 }
 
+std::optional<rune::gateway::Denial> ClientGateway::authorizeTopicIdHere_(const rune::gateway::PermissionTable& perms,
+                                                                       int32_t topicId, rune::security::Operation op,
+                                                                       rune::security::ResourceType shownType) const
+{
+    auto d = rune::gateway::authorizeTopicId(perms, topicId, op, objectIndex_, shownType);
+    if (d && objectIndex_.at(topicId) == nullptr && unappliedTopicCode_(topicId, 0) == pc::ErrorCode::NotLeader)
+        d->code = static_cast<uint16_t>(pc::ErrorCode::NotLeader);
+    return d;
+}
+
 bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::Denial>& denial, const uint8_t* buf, std::size_t len)
 {
     if (!denial) return false;
     const auto hdr = pc::MessageHeader::decode(buf, len);
+    if (denial->code != static_cast<uint16_t>(pc::ErrorCode::NotAuthorized)) {   // #127: a retriable verdict, not a refusal
+        if (hdr && answerRejection_(session, *hdr, denial->code, "topic not applied here yet", buf, len)) return true;
+        noteUnanswerable_(buf, len, "topic not applied here yet");
+        return true;
+    }
     noteDenied_(session, static_cast<pc::TemplateId>(hdr ? hdr->templateId : 0), *denial);
     if (!hdr) return true;   // the caller decoded the body, so this cannot happen; nothing to answer on
     // The DDL family carries the D23 detail text; every other response type has no free-text field.
@@ -8148,7 +8162,7 @@ bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint
     const auto group = [&](std::span<const uint8_t> id) {
         return authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read);
     };
-    const auto topic = [&](int32_t id) { return authorizeTopicId(perms, id, rsec::Operation::Read, objectIndex_); };
+    const auto topic = [&](int32_t id) { return authorizeTopicIdHere_(perms, id, rsec::Operation::Read); };
     std::optional<rune::gateway::Denial> d;
     switch (static_cast<pc::TemplateId>(tid)) {
         case pc::TemplateId::JoinGroup:
@@ -8207,7 +8221,7 @@ bool ClientGateway::denyTxnRequest_(Session& session, uint16_t tid, const uint8_
                 d = txn(m->transactionalId);
                 for (const auto& p : m->partitions) {
                     if (d) break;
-                    d = authorizeTopicId(perms, p.topicId, rsec::Operation::Write, objectIndex_);
+                    d = authorizeTopicIdHere_(perms, p.topicId, rsec::Operation::Write);
                 }
             }
             break;
@@ -8221,7 +8235,7 @@ bool ClientGateway::denyTxnRequest_(Session& session, uint16_t tid, const uint8_
                 if (!d) d = group(m->groupId);
                 for (const auto& e : m->entries) {
                     if (d) break;
-                    d = authorizeTopicId(perms, e.topicId, rsec::Operation::Read, objectIndex_);
+                    d = authorizeTopicIdHere_(perms, e.topicId, rsec::Operation::Read);
                 }
             }
             break;
@@ -9025,7 +9039,7 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
     // Authentication Task 12 (spec §2.1, D22): READ on the view's topic id - one byte load; a hidden and a missing id
     // answer alike.
     if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
-        if (deny_(*session, rune::gateway::authorizeTopicId(perms, m.viewTopicId, rune::security::Operation::Read, objectIndex_,
+        if (deny_(*session, authorizeTopicIdHere_(perms, m.viewTopicId, rune::security::Operation::Read,
                                                              rune::security::ResourceType::View), buf, len))
             return;
 

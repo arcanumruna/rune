@@ -2358,6 +2358,12 @@ private:
     /// true = DENIED here: answered NotAuthorized (45) in the request's own response type (D23 text where the type
     /// carries one) - the caller returns without forwarding anything.
     [[nodiscard]] bool deny_(Session& session, const std::optional<rune::gateway::Denial>& denial, const uint8_t* buf, std::size_t len);
+    /// Issue #127: authorizeTopicId against this broker's ObjectIndex, except that an id this broker has not applied yet
+    /// but already has placed (unappliedTopicCode_ == NotLeader: a CREATE / GRANT racing the catalog apply) answers the
+    /// retriable NotLeader instead of the terminal 45, so the client retries until the apply lands.  Cold (refusals only).
+    [[nodiscard]] std::optional<rune::gateway::Denial> authorizeTopicIdHere_(
+        const rune::gateway::PermissionTable& perms, int32_t topicId, rune::security::Operation op,
+        rune::security::ResourceType shownType = rune::security::ResourceType::Topic) const;
     /// Issue #122: the verdict for a producer id issued to another principal (cold: built only on a refusal).
     [[gnu::cold]] static rune::gateway::Denial refusedProducerIdDenial_(int64_t producerId);
     /// Issue #114: a user's own ADD / DROP / SET PASSWORD without ADMIN - nullopt when it carries a valid proof of a

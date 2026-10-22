@@ -263,6 +263,11 @@ if(BUILD_TESTING)
     target_link_libraries(rune_gateway_topic_servability_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
     gtest_discover_tests(rune_gateway_topic_servability_tests)
 
+    # Issue #127: a placed-but-unapplied id answers NotLeader, never the terminal NotAuthorized - no Aeron.
+    add_executable(rune_gateway_auth_unapplied_tests tests/gateway/AuthUnappliedTopicTest.cpp)
+    target_link_libraries(rune_gateway_auth_unapplied_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_auth_unapplied_tests)
+
     # Catalog history Task 8: C1 generalized (applied AND placed) + dropped topics — no Aeron.
     add_executable(rune_gateway_catalog_tests tests/gateway/CatalogGatewayTest.cpp)
     target_link_libraries(rune_gateway_catalog_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)

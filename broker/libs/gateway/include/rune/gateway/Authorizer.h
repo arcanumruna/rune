@@ -33,9 +33,11 @@ struct Denial {
 /// Name-addressed: `op` on (type, name) - matched against the requested name whether or not the object exists.
 [[nodiscard]] std::optional<Denial> authorizeName(const PermissionTable&, rune::security::ResourceType, std::string_view,
                                                   rune::security::Operation);
-/// GetTopicSchema: a name may be a topic or a view - allowed when either type allows it; the text always says TOPIC.
+/// GetTopicSchema: a name may be a topic or a view.  Issue #128: a live name is checked against its own kind's grants
+/// only (the ObjectIndex knows which); a name not live here is allowed when either type allows it (D22 parity: the
+/// request's own "unknown" answer follows).  The text always says TOPIC.
 [[nodiscard]] std::optional<Denial> authorizeTopicOrViewName(const PermissionTable&, std::string_view,
-                                                             rune::security::Operation);
+                                                             rune::security::Operation, const ObjectIndex&);
 [[nodiscard]] std::optional<Denial> authorizeCluster(const PermissionTable&, rune::security::Operation);
 
 } // namespace rune::gateway

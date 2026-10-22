@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -32,6 +33,13 @@ public:
         if (static_cast<uint32_t>(id) >= entries_.size()) return nullptr;
         const ObjectEntry& e = entries_[static_cast<std::size_t>(id)];
         return e.name.empty() ? nullptr : &e;
+    }
+    /// The live entry named `name`, or nullptr.  Issue #128: a linear scan - cold (GetTopicSchema only); topic and view
+    /// names share one name space, so at most one live entry matches.
+    [[nodiscard]] const ObjectEntry* byName(std::string_view name) const noexcept {
+        for (const ObjectEntry& e : entries_)
+            if (!e.name.empty() && e.name == name) return &e;
+        return nullptr;
     }
     template <class F> void forEach(F&& f) const {
         for (std::size_t i = 0; i < entries_.size(); ++i)
