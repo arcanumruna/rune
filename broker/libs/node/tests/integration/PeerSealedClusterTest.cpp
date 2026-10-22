@@ -4,13 +4,20 @@
 // establishes - and the cluster works exactly as an unsealed one.
 #include "support/SecurityBrokerCluster.h"
 
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/RoleCounter.h>
+#include <rune/peerlink/ClusterKeys.h>
+#include <rune/peerlink/PeerLinkMessages.h>
+
+#include <Aeron.h>
+#include <Context.h>
 
 #include <gtest/gtest.h>
 
 #include <cstdio>
 #include <fstream>
 #include <map>
+#include <random>
 
 using namespace rune::node;
 using namespace rune::node::test;
@@ -291,4 +298,127 @@ TEST(PeerSealedClusterRegression, ARestartRightAfterAReHandshakeRelinksFastRegre
     std::printf("[restart] relinked %lld ms after the restart\n", static_cast<long long>(linkedAfter.count()));
     GoldenAppender g;
     EXPECT_GE(g.appendNext(c, 5s), 0) << "an acks=all __security append after the relink";
+}
+
+// ---- Review of PR #551 (issues #17 / #18), adversarial, END TO END: an off-path attacker on the network (its own Aeron ----
+// driver, no cluster key) sprays the three idle brokers' handshake endpoints for 4 s: a forged NoLink poke naming each
+// responder at each initiator every 20 ms (before #17 only the 30 s cap held these off; now only the sealed keepalives
+// do - the follower pair carries no consensus traffic), and forged HelloV2s under the REAL key id with random nonces /
+// shares at each responder (before #18 they evicted the real initiator's pending slot).  No link may re-handshake under
+// the pokes, and a real re-handshake of every pair forced in the middle of the HelloV2 flood must complete.
+// Mutation: sendIdleKeepalives returning 0 turns the first half red (the idle follower pair is re-keyed by a poke).
+namespace {
+class AttackerDriver {
+public:
+    AttackerDriver() : driver_(makeCfg(dir_.path / "aeron"), DriverMode::Threaded) {}
+    [[nodiscard]] const std::string& aeronDir() const { return driver_.dir(); }
+private:
+    static EmbeddedDriverConfig makeCfg(const fs::path& d) {
+        EmbeddedDriverConfig c;
+        c.dir = d.string(); c.termBufferBytes = 64 * 1024; c.termBufferSparse = true; c.udpGso = false; c.epollPoll = false;
+        return c;
+    }
+    TmpDir         dir_{"pscl_attacker"};
+    EmbeddedDriver driver_;
+};
+} // namespace
+
+TEST(PeerSealedClusterRegression, ForgedNoLinkPokesAndHelloV2FloodsAgainstAnIdleClusterAdversarialRegression) {
+    TmpDir keys{"pscl7"};
+    const fs::path keyFile = keyFileWith(keys.path, "k.key", 'k');
+    ThreeNodes c = ThreeNodes::startWith("psc_attack", [&](NodeConfig& cfg) { enable(cfg, keyFile); });
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    ASSERT_TRUE(awaitSecurityLeader(c, 60s));
+    ASSERT_TRUE(until(30s, [&] {
+        for (BrokerNode* n : c.live()) if (n->peerLinksForTest().established != 2) return false;
+        return true;
+    }));
+    const auto clusterKeys = rune::peerlink::loadClusterKeys(keyFile.string(), "");
+    ASSERT_TRUE(clusterKeys.has_value());
+    const uint64_t keyId = clusterKeys->current.keyId;
+
+    AttackerDriver drv;
+    aeron::Context ctx; ctx.aeronDir(drv.aeronDir());
+    auto aeron = aeron::Aeron::connect(ctx);
+    const NodeConfig cfg1 = makeConfig(1, c.dirs[0]->path, c.ports, 3, Mode::Shard);
+    std::map<int, std::shared_ptr<aeron::Publication>> to;   // the attacker's publication to each node's handshake stream
+    for (const auto& peer : cfg1.peers) {
+        const int64_t reg = aeron->addPublication(peer.consensusChannel(), cfg1.peerAuthStreamId);
+        std::shared_ptr<aeron::Publication> pub;
+        ASSERT_TRUE(until(10s, [&] { pub = aeron->findPublication(reg); return pub != nullptr; }));
+        to[peer.id] = pub;
+    }
+    ASSERT_TRUE(until(10s, [&] { for (auto& [id, p] : to) if (!p->isConnected()) return false; return true; }));
+
+    std::mt19937_64 rng(551);
+    uint64_t offered = 0;
+    auto offer = [&](int node, const uint8_t* b, std::size_t n) {
+        aeron::concurrent::AtomicBuffer buf(const_cast<uint8_t*>(b), static_cast<aeron::util::index_t>(n));
+        if (to[node]->offer(buf, 0, static_cast<aeron::util::index_t>(n)) > 0) ++offered;
+    };
+    const std::vector<std::pair<int, int>> pairs = {{1, 2}, {1, 3}, {2, 3}};   // (initiator = lower id, responder)
+    auto pokeAll = [&] {
+        for (auto [ini, resp] : pairs) {
+            rune::peerlink::PeerRefuse r; r.from = resp; r.to = ini; r.reason = rune::peerlink::RefuseReason::NoLink;
+            uint8_t b[rune::peerlink::PeerRefuse::kSize]; r.encode(b); offer(ini, b, sizeof b);
+        }
+    };
+    auto floodHellos = [&](int perResponder) {
+        for (auto [ini, resp] : pairs) {
+            for (int i = 0; i < perResponder; ++i) {
+                rune::peerlink::PeerHelloV2 h; h.from = ini; h.to = resp; h.keyId = keyId; h.incarnation = rng();
+                for (auto& x : h.nonceA) x = static_cast<uint8_t>(rng());
+                for (auto& x : h.shareA) x = static_cast<uint8_t>(rng());
+                uint8_t b[rune::peerlink::PeerHelloV2::kSize]; h.encode(b); offer(resp, b, sizeof b);
+            }
+        }
+    };
+    std::map<std::pair<int, int>, uint32_t> epochBefore;
+    for (auto [ini, resp] : pairs) epochBefore[{ini, resp}] = c.node(ini).peerLinksForTest().epochOf[resp];
+    auto before = [&](int ini, int resp) { return epochBefore[std::make_pair(ini, resp)]; };
+
+    // The attacker really reaches each broker's handshake agent: a HelloV2 under a key id nobody holds is refused (counted).
+    std::map<int, uint64_t> refusals0;
+    for (int id : {1, 2, 3}) refusals0[id] = c.node(id).peerLinksForTest().refusals;
+    for (auto [ini, resp] : pairs) {
+        rune::peerlink::PeerHelloV2 h; h.from = ini; h.to = resp; h.keyId = keyId ^ 0xFFFF; h.incarnation = 1;
+        uint8_t b[rune::peerlink::PeerHelloV2::kSize]; h.encode(b); offer(resp, b, sizeof b);
+    }
+    EXPECT_TRUE(until(5s, [&] { return c.node(2).peerLinksForTest().refusals > refusals0[2] &&
+                                       c.node(3).peerLinksForTest().refusals > refusals0[3]; }))
+        << "the attacker's frames never reached the responders' handshake agents";
+
+    // Phase 1: 4 s of forged pokes (every 20 ms) at an otherwise idle cluster.
+    const auto pokeEnd = std::chrono::steady_clock::now() + 4s;
+    while (std::chrono::steady_clock::now() < pokeEnd) { pokeAll(); std::this_thread::sleep_for(20ms); }
+    for (auto [ini, resp] : pairs) {
+        EXPECT_EQ(c.node(ini).peerLinksForTest().epochOf[resp], before(ini, resp))
+            << ini << "->" << resp << ": a forged NoLink poke re-keyed a live idle link";
+        EXPECT_EQ(c.node(resp).peerLinksForTest().epochOf[ini], before(ini, resp)) << resp << "->" << ini;
+    }
+
+    // Phase 2: a HelloV2 flood (8 per responder per 2 ms - the old pending table's size) while every pair re-handshakes.
+    for (auto [ini, resp] : pairs) ASSERT_TRUE(c.node(ini).forcePeerRekeyForTest(resp)) << ini << "->" << resp;
+    const auto floodEnd = std::chrono::steady_clock::now() + 3s;
+    bool allDone = false;
+    while (std::chrono::steady_clock::now() < floodEnd) {
+        floodHellos(8);
+        std::this_thread::sleep_for(2ms);
+        if (!allDone) {
+            allDone = true;
+            for (auto [ini, resp] : pairs) {
+                const uint32_t ei = c.node(ini).peerLinksForTest().epochOf[resp], er = c.node(resp).peerLinksForTest().epochOf[ini];
+                if (ei <= before(ini, resp) || ei != er) allDone = false;
+            }
+        }
+    }
+    EXPECT_TRUE(allDone) << "a real re-handshake of every pair completes under the HelloV2 flood";
+    for (auto [ini, resp] : pairs) {
+        const uint32_t ei = c.node(ini).peerLinksForTest().epochOf[resp], er = c.node(resp).peerLinksForTest().epochOf[ini];
+        EXPECT_EQ(ei, er) << ini << "<->" << resp;
+        EXPECT_GT(ei, before(ini, resp)) << ini << "->" << resp;
+    }
+    EXPECT_GT(offered, 3'000u) << "the attack really went out";
+    GoldenAppender g;
+    EXPECT_GE(g.appendNext(c, 30s), 0) << "an acks=all __security append after the attack";
 }

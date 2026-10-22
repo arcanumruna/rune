@@ -23,7 +23,9 @@ extern "C" {
 #include <rune/consensus/UdpMessageSink.h>
 #include <rune/peerlink/PeerFrameCrypto.h>
 
+#include <algorithm>
 #include <atomic>
+#include <random>
 #include <chrono>
 #include <filesystem>
 #include <memory>
@@ -338,4 +340,77 @@ TEST(ConsensusKeepaliveRegression, TheAdapterIgnoresAKeepaliveWithoutCountingItR
     buf[2] = 66;   // control: an unknown template is still counted
     adapter.onFragment(9, buf.data(), buf.size());
     EXPECT_EQ(adapter.ignoredFrameCount(), 1);
+}
+
+// ---- Review of PR #551 (issue #17), adversarial: the keepalive is the ONLY liveness signal a follower pair has, so a ----
+// copy of it must never count twice and a forgery must never count at all.  Over the real frame crypto the consensus
+// ingress uses: keepalives reordered inside the replay window all open once; every one replayed is a Replay; a byte
+// flipped at every offset, a frame truncated at every length, or one sealed under another link's keys never opens -
+// authFrames (the liveness counter BrokerNode::servicePeerLinks_ feeds the handshake) moves only for real, fresh ones.
+// Then the adapter: a keepalive with trailing bytes is still consumed silently, a truncated header is counted, and a
+// keepalive between real frames never disturbs their dispatch.
+TEST(ConsensusKeepaliveRegression, AKeepaliveReplayedReorderedTamperedOrTruncatedNeverCountsAdversarialRegression) {
+    pl::PeerFrameCrypto tx(1, 0), rx(2, 0), stranger(1, 0);
+    ASSERT_TRUE(tx.installLink(2, linkFor(true, 7), 0));
+    ASSERT_TRUE(rx.installLink(1, linkFor(false, 7), 0));
+    ASSERT_TRUE(stranger.installLink(2, linkFor(true, 70), 0));   // another cluster's / an old key holder's link
+    std::array<uint8_t, PeerKeepaliveMsg::TOTAL_SIZE> ka{};
+    ASSERT_EQ(PeerKeepaliveMsg::encode(ka.data(), 0), ka.size());
+    using Wire = std::vector<uint8_t>;
+    auto sealOne = [&](pl::PeerFrameCrypto& c) {
+        Wire w(ka.size() + pl::kPeerFrameOverhead);
+        const auto n = c.seal(2, ka.data(), ka.size(), w.data(), w.size());
+        EXPECT_EQ(n, w.size());
+        return w;
+    };
+    auto openOne = [&](const Wire& w) {
+        uint8_t out[64]; std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
+        const auto r = rx.open(w.data(), w.size(), out, sizeof out, outLen, from, epoch);
+        if (r == pl::PeerFrameCrypto::OpenResult::Ok) {
+            EXPECT_EQ(outLen, ka.size());
+            EXPECT_EQ(peekTemplateId(out, 0), PeerKeepaliveMsg::TEMPLATE_ID);
+        }
+        return r;
+    };
+    std::vector<Wire> sent;
+    for (int i = 0; i < 40; ++i) sent.push_back(sealOne(tx));
+    std::mt19937_64 rng(17);
+    auto shuffled = sent;
+    std::shuffle(shuffled.begin(), shuffled.end(), rng);                  // reordered inside the 64-wide window
+    for (const auto& w : shuffled) EXPECT_EQ(openOne(w), pl::PeerFrameCrypto::OpenResult::Ok);
+    ASSERT_EQ(rx.authFrames(1), 40u);
+    for (const auto& w : sent) EXPECT_EQ(openOne(w), pl::PeerFrameCrypto::OpenResult::Replay) << "a duplicate is a replay";
+    EXPECT_EQ(rx.authFrames(1), 40u) << "duplicated keepalives never count as liveness";
+
+    const Wire fresh = sealOne(tx);
+    for (std::size_t off = 0; off < fresh.size(); ++off) {
+        Wire t = fresh; t[off] ^= 0x01;
+        EXPECT_NE(openOne(t), pl::PeerFrameCrypto::OpenResult::Ok) << "a byte flipped at offset " << off;
+    }
+    for (std::size_t len = 0; len < fresh.size(); ++len) {
+        const Wire t(fresh.begin(), fresh.begin() + static_cast<std::ptrdiff_t>(len));
+        EXPECT_NE(openOne(t), pl::PeerFrameCrypto::OpenResult::Ok) << "truncated to " << len;
+    }
+    for (int i = 0; i < 5; ++i) EXPECT_NE(openOne(sealOne(stranger)), pl::PeerFrameCrypto::OpenResult::Ok) << "another link's keys";
+    EXPECT_EQ(rx.authFrames(1), 40u) << "no forgery counted";
+    EXPECT_EQ(openOne(fresh), pl::PeerFrameCrypto::OpenResult::Ok) << "control: the untouched fresh keepalive opens";
+    EXPECT_EQ(rx.authFrames(1), 41u);
+
+    // The adapter: trailing bytes are tolerated (consumed, not counted); a header cut short is counted; dispatch of the
+    // frames around a keepalive is unchanged.
+    CountingHandler handler;
+    ConsensusAdapter adapter{handler};
+    std::array<uint8_t, 128> big{};
+    ASSERT_EQ(PeerKeepaliveMsg::encode(big.data(), 0), ConsensusMessageHeader::ENCODED_SIZE);
+    for (std::size_t len = ConsensusMessageHeader::ENCODED_SIZE; len <= big.size(); ++len) adapter.onFragment(1, big.data(), len);
+    EXPECT_EQ(adapter.ignoredFrameCount(), 0);
+    for (std::size_t len = 0; len < ConsensusMessageHeader::ENCODED_SIZE; ++len) adapter.onFragment(1, big.data(), len);
+    EXPECT_EQ(adapter.ignoredFrameCount(), static_cast<int64_t>(ConsensusMessageHeader::ENCODED_SIZE));
+    std::array<uint8_t, StandDownMsg::TOTAL_SIZE> sd{};
+    (void)StandDownMsg::encode(sd.data(), 0, /*term=*/1, /*leader=*/2);
+    for (int i = 0; i < 10; ++i) {
+        adapter.onFragment(2, ka.data(), ka.size());
+        adapter.onFragment(2, sd.data(), sd.size());
+    }
+    EXPECT_EQ(handler.calls, 10) << "every StandDown between keepalives dispatched, no keepalive dispatched";
 }

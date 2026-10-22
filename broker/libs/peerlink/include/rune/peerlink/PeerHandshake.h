@@ -40,7 +40,8 @@
 //     Challenge - the one just consumed included - is void, as the pending table is cleared on success;
 //   - forward secrecy: a cookie secret lives at most 2 x kAwaitNs and is scrubbed when it rotates out.  The ephemeral
 //     private key is derivable from it only within that window, the same exposure as the pending slot it replaces.
-// The v1 path (a legacy initiator) still uses the pending-challenge table, so a legacy pair stays floodable.//
+// The v1 path (a legacy initiator) still uses the pending-challenge table, so a legacy pair stays floodable (#553).
+//
 // Version skew (no runtime downgrade path):
 //   - a new RESPONDER still answers a v1 Hello (a legacy initiator) with a v1 Challenge and v1 keys (no forward secrecy):
 //       macB = HMAC-SHA-512(master, "rune-peer-v1|B" || from=B || to=A || nonceA || nonceB || incA || incB || keyId)

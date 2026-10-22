@@ -10,6 +10,10 @@ extern "C" {
 #include <Aeron.h>
 #include <Context.h>
 
+#include <rune/consensus/AeronIngress.h>
+#include <rune/consensus/ConsensusAdapter.h>
+#include <rune/consensus/IngressRing.h>
+#include <rune/consensus/UdpMessageSink.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/peerlink/PeerFrameCrypto.h>
 #include <rune/peerlink/PeerHandshake.h>
@@ -238,4 +242,68 @@ TEST(PeerFrameAllocRegression, SteadySealedReplicationAllocatesNothing) {
     EXPECT_GT(gotReq, req0);
     EXPECT_GT(gotResp, resp0) << "frames really flowed during the armed window";
     EXPECT_EQ(a.peerFrameDrops() + b.peerFrameDrops(), 0u);
+}
+
+// Review of PR #551 (issue #17), hot path: the sealed idle keepalive runs on the control thread every duty cycle.  In
+// steady state, sendIdleKeepalives (the idle check AND the seal + send of a due keepalive) and the receive side (the
+// consensus ingress opening it, the ring, the adapter consuming it) allocate nothing on that thread.
+// Mutation: building the keepalive frame in a std::vector inside sendIdleKeepalives turns this red.
+namespace {
+struct NoopConsensusHandler final : rune::consensus::ConsensusMessageHandler {
+    uint64_t calls = 0;
+    void onCanvassPosition(int64_t, rune::consensus::Term, int64_t, rune::consensus::Term, rune::consensus::NodeId, int32_t) override { ++calls; }
+    void onRequestVote(int64_t, rune::consensus::Term, int64_t, rune::consensus::Term, rune::consensus::NodeId, int32_t) override { ++calls; }
+    void onVote(int64_t, rune::consensus::Term, rune::consensus::Term, int64_t, rune::consensus::NodeId, rune::consensus::NodeId, bool) override { ++calls; }
+    void onNewLeadershipTerm(int64_t, rune::consensus::Term, rune::consensus::Term, int64_t, int64_t, rune::consensus::Term, int64_t, int64_t,
+                             int64_t, int64_t, rune::consensus::NodeId, int32_t, int32_t, bool, int64_t) override { ++calls; }
+    void onAppendPosition(int64_t, rune::consensus::Term, int64_t, rune::consensus::NodeId, uint8_t) override { ++calls; }
+    void onCommitPosition(int64_t, rune::consensus::Term, int64_t, rune::consensus::NodeId) override { ++calls; }
+};
+}  // namespace
+
+TEST(PeerFrameAllocRegression, IdleKeepalivesAllocateNothingAdversarialRegression) {
+    namespace rc = rune::consensus;
+    ASSERT_TRUE(kHooked);
+    MediaDriver driver;
+    aeron::Context ctx; ctx.aeronDir(driver.dir());
+    auto aeron = aeron::Aeron::connect(ctx);
+    constexpr int32_t kStream = 702;
+    rc::IngressRing ring(64 * 1024);
+    rc::AeronIngress ingress(aeron, "aeron:ipc", kStream, ring, rune::aeronutil::AeronPump{}, pl::PeerFrameCrypto(2, 0));
+    std::unordered_map<rc::NodeId, rc::UdpMessageSink::PeerEndpoint> eps{{2, {"aeron:ipc", kStream}}};
+    rc::UdpMessageSink sink(aeron, eps, rune::aeronutil::AeronPump{}, rc::PeerResolutionSource{}, pl::PeerFrameCrypto(1, 0));
+    ASSERT_TRUE(sink.installPeerLink(2, linkFor(true)));
+    ASSERT_TRUE(ingress.installPeerLink(1, linkFor(false)));
+    NoopConsensusHandler handler;
+    rc::ConsensusAdapter adapter{handler};
+    auto drain = [&] {
+        (void)ingress.poll(10);
+        (void)ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len) {
+            adapter.onFragment(0, b.buffer() + off, static_cast<std::size_t>(len));
+        }, 64);
+    };
+    int64_t t = 0;
+    for (int i = 0; i < 5000 && ingress.authFrames(1) == 0; ++i) {   // warm-up: the publication connects, the first opens
+        t += rc::UdpMessageSink::kPeerKeepaliveNs;
+        (void)sink.sendIdleKeepalives(t);
+        drain();
+        std::this_thread::sleep_for(1ms);
+    }
+    ASSERT_GT(ingress.authFrames(1), 0u) << "keepalives never got through";
+    for (int i = 0; i < 50; ++i) { t += rc::UdpMessageSink::kPeerKeepaliveNs; (void)sink.sendIdleKeepalives(t); drain(); }
+    const uint64_t sent0 = sink.keepalivesSent(), opened0 = ingress.authFrames(1);
+    {
+        Armed armed;
+        for (int i = 0; i < 2000; ++i) {
+            t += rc::UdpMessageSink::kPeerKeepaliveNs / 5;   // 4 idle checks, then a due keepalive
+            (void)sink.sendIdleKeepalives(t);
+            drain();
+        }
+    }
+    EXPECT_EQ(gAllocs.load(), 0u) << "the idle keepalive allocated on the control thread in steady state";
+    EXPECT_EQ(sink.keepalivesSent() - sent0, 400u) << "one keepalive per 250 ms of injected time";
+    for (int i = 0; i < 2000 && ingress.authFrames(1) < opened0 + 400; ++i) { drain(); std::this_thread::sleep_for(1ms); }
+    EXPECT_EQ(ingress.authFrames(1), opened0 + 400) << "every keepalive was really sealed, sent and opened";
+    EXPECT_EQ(adapter.ignoredFrameCount(), 0);
+    EXPECT_EQ(handler.calls, 0u);
 }

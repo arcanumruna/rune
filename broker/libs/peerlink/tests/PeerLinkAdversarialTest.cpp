@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <deque>
 #include <random>
 #include <string>
@@ -455,4 +456,322 @@ TEST(PeerLinkAdversarialRegression, ALegacyInitiatorRehandshakeIsPromotedByItsFi
     std::size_t outLen = 0; int32_t from = -1;
     EXPECT_EQ(legacy.open(lateWire, lateLen, out, sizeof out, outLen, from, ep), OR::Ok) << "the late E1 frame still opens";
     EXPECT_EQ(bc.dropsOf(OR::UnknownEpoch) + legacy.dropsOf(OR::UnknownEpoch), 0u);
+}
+
+// =====================================================================================================================
+// Review of PR #551 (issues #18 / #17): the stateless v2 cookie (ProofV2, tag 9) and the removal of the 30 s hint cap.
+// Pure: an injected clock, seeded randomness, no sleeps.
+// =====================================================================================================================
+namespace {
+
+/// One real v2 exchange up to the initiator's ProofV2: `a` Hellos at `t`, `b` answers at `t`, `a` proves at `t`.
+pl::PeerProofV2 realProofV2(pl::PeerHandshake& a, pl::PeerHandshake& b, int64_t t, pl::PeerHelloV2* helloOut = nullptr,
+                            pl::PeerChallengeV2* chOut = nullptr) {
+    auto h = a.tick(t);
+    EXPECT_TRUE(h.frame);
+    pl::PeerHelloV2 hello{};
+    if (h.frame) EXPECT_TRUE(pl::PeerHelloV2::decode(h.frame->data(), h.frame->size(), hello));
+    auto c = b.onHelloV2(hello, t);
+    EXPECT_TRUE(c.frame);
+    pl::PeerChallengeV2 ch{};
+    if (c.frame) EXPECT_TRUE(pl::PeerChallengeV2::decode(c.frame->data(), c.frame->size(), ch));
+    auto p = a.onChallengeV2(ch, t);
+    EXPECT_TRUE(p.frame);
+    pl::PeerProofV2 proof{};
+    if (p.frame) EXPECT_TRUE(pl::PeerProofV2::decode(p.frame->data(), p.frame->size(), proof));
+    if (helloOut) *helloOut = hello;
+    if (chOut) *chOut = ch;
+    return proof;
+}
+
+/// The v1 transcript MAC for initiator 1 (incarnation 10) and responder 2 (incarnation 20), as a legacy broker computes it.
+std::array<uint8_t, 64> v1MacOf(bool isB, const std::array<uint8_t, 32>& nA, const std::array<uint8_t, 32>& nB) {
+    const auto master = keysOf('k').current;
+    std::vector<uint8_t> t;
+    const std::string label = isB ? "rune-peer-v1|B" : "rune-peer-v1|A";
+    t.insert(t.end(), label.begin(), label.end());
+    auto put = [&](uint64_t v, int n) { for (int k = 0; k < n; ++k) t.push_back(static_cast<uint8_t>(v >> (8 * k))); };
+    if (isB) { put(2, 4); put(1, 4); t.insert(t.end(), nA.begin(), nA.end()); t.insert(t.end(), nB.begin(), nB.end()); put(10, 8); put(20, 8); }
+    else     { put(1, 4); put(2, 4); t.insert(t.end(), nB.begin(), nB.end()); t.insert(t.end(), nA.begin(), nA.end()); put(20, 8); put(10, 8); }
+    put(master.keyId, 8);
+    rune::crypto::DigestBytes d;
+    EXPECT_TRUE(rune::crypto::hmac(rune::crypto::Digest::Sha512, {master.master.data(), master.master.size()}, t, d));
+    std::array<uint8_t, 64> out{}; std::copy_n(d.bytes.begin(), 64, out.begin());
+    return out;
+}
+
+const pl::Established* estOf(const pl::PeerHandshake& h) { return std::get_if<pl::Established>(&h.state()); }
+
+/// One cookie-window trial (seeded): the responder's grid is set by duty-cycle ticks at random times, the Challenge is
+/// issued at a random point, more ticks land at random times before the Proof, which arrives `proofDelayNs` after the
+/// Challenge.  The same seed replays the same call times exactly.
+pl::PeerHandshake::Out cookieTrial(uint64_t seed, int64_t proofDelayNs) {
+    std::mt19937_64 rng(seed);
+    auto upTo = [&](int64_t n) { return std::uniform_int_distribution<int64_t>(0, n)(rng); };
+    pl::PeerHandshake a(1, 2, 10, keysOf('k')), b(2, 1, 20, keysOf('k'));
+    int64_t t = upTo(3 * pl::PeerHandshake::kAwaitNs);
+    (void)b.tick(t);                                                   // the grid's origin: some duty cycle
+    const int pre = static_cast<int>(upTo(6));
+    for (int i = 0; i < pre; ++i) { t += upTo(pl::PeerHandshake::kAwaitNs * 3 / 2); (void)b.tick(t); }
+    t += upTo(pl::PeerHandshake::kAwaitNs);                            // the Challenge, anywhere on the grid
+    const int64_t issued = t;
+    const auto proof = realProofV2(a, b, issued);
+    const int mid = static_cast<int>(upTo(4));
+    std::vector<int64_t> ticks;
+    for (int i = 0; i < mid; ++i) ticks.push_back(issued + upTo(proofDelayNs));
+    std::sort(ticks.begin(), ticks.end());
+    for (int64_t x : ticks) (void)b.tick(x);
+    return b.onProofV2(proof, issued + proofDelayNs);
+}
+
+} // namespace
+
+// ---- Protocol state / cookie rotation boundaries (#18): a Challenge stays answerable for at least kAwaitNs and at ----
+// most 2 x kAwaitNs, wherever on the rotation grid it was issued and whenever the responder's duty cycles run.
+// Mutation: checking only cookieCur_ in onProofV2 (dropping cookiePrev_) turns the first half red.
+TEST(PeerLinkAdversarialRegression, ACookieChallengeIsAnswerableForAWholeAwaitWhereverItIsIssuedAdversarialRegression) {
+    int accepted = 0, refused = 0;
+    for (uint64_t seed = 1; seed <= 300; ++seed) {
+        auto ok = cookieTrial(seed, pl::PeerHandshake::kAwaitNs);
+        EXPECT_TRUE(ok.established) << "seed " << seed << ": a Proof exactly kAwaitNs after its Challenge must link: "
+                                    << (ok.log ? ok.log->str() : "");
+        accepted += ok.established ? 1 : 0;
+        auto late = cookieTrial(seed, 2 * pl::PeerHandshake::kAwaitNs);
+        EXPECT_FALSE(late.established) << "seed " << seed << ": 2 x kAwaitNs after its Challenge, both secrets rotated out";
+        EXPECT_FALSE(late.frame) << "seed " << seed;
+        ASSERT_TRUE(late.log) << "seed " << seed;
+        EXPECT_NE(late.log->find("stale or forged cookie"), std::string::npos) << "seed " << seed << ": " << late.log->str();
+        refused += late.established ? 0 : 1;
+    }
+    EXPECT_EQ(accepted, 300);
+    EXPECT_EQ(refused, 300);
+}
+
+// ---- Protocol state: reflection / misaddressing / unknown key (#18).  A ProofV2 reflected to the initiator, one naming ----
+// other nodes, or one under a key id nobody holds computes NO MAC and changes no state; the initiator's own Hello and
+// the responder's own Challenge reflected back are refused or ignored; the real Proof still links afterwards.
+TEST(PeerLinkAdversarialRegression, AReflectedMisaddressedOrUnknownKeyProofV2CostsNothingAdversarialRegression) {
+    pl::PeerHandshake a(1, 2, 10, keysOf('k')), b(2, 1, 20, keysOf('k'));
+    pl::PeerHelloV2 hello; pl::PeerChallengeV2 ch;
+    const auto proof = realProofV2(a, b, 0, &hello, &ch);
+    ASSERT_TRUE(std::holds_alternative<pl::ChallengeSent>(a.state()));
+    const uint64_t macsA = a.macComputations(), macsB = b.macComputations();
+
+    auto r = a.onProofV2(proof, kMs);                                   // reflected to its own sender
+    EXPECT_FALSE(r.frame); EXPECT_FALSE(r.established); EXPECT_FALSE(r.log);
+    auto rh = a.onHelloV2(hello, kMs);                                  // its own Hello reflected: not a peer
+    ASSERT_TRUE(rh.frame);
+    pl::PeerRefuse refuse; ASSERT_TRUE(pl::PeerRefuse::decode(rh.frame->data(), rh.frame->size(), refuse));
+    EXPECT_EQ(refuse.reason, pl::RefuseReason::NotAPeer);
+    EXPECT_FALSE(b.onChallengeV2(ch, kMs).frame) << "the responder's own Challenge reflected: nothing";
+    EXPECT_TRUE(std::holds_alternative<pl::ChallengeSent>(a.state())) << "the initiator's exchange is untouched";
+
+    for (auto [from, to] : {std::pair{3, 2}, std::pair{1, 3}, std::pair{2, 1}, std::pair{-1, 2}}) {
+        auto m = proof; m.from = from; m.to = to;
+        auto o = b.onProofV2(m, kMs);
+        EXPECT_FALSE(o.frame) << from << "->" << to; EXPECT_FALSE(o.established) << from << "->" << to;
+    }
+    auto unknown = proof; unknown.keyId ^= 0x5a5a;
+    auto ou = b.onProofV2(unknown, kMs);
+    EXPECT_FALSE(ou.established); EXPECT_FALSE(ou.frame);
+    ASSERT_TRUE(ou.log); EXPECT_NE(ou.log->find("unknown key id"), std::string::npos) << ou.log->str();
+    EXPECT_EQ(a.macComputations(), macsA) << "nothing reflected at the initiator computed a MAC";
+    EXPECT_EQ(b.macComputations(), macsB) << "no misaddressed / unknown-key ProofV2 computed a MAC";
+    EXPECT_TRUE(std::holds_alternative<pl::LinkIdle>(b.state()));
+
+    auto ok = b.onProofV2(proof, 2 * kMs);
+    EXPECT_TRUE(ok.established) << "control: the real Proof still links";
+}
+
+// ---- Protocol state / replay across versions (#18): a captured Proof of EITHER version is void once the responder ----
+// established through the OTHER version.  Mutation: dropping freshCookie_() from establishAsResponder_ turns the first
+// half red (the v2 Proof would mint a second epoch after a v1 establishment).
+TEST(PeerLinkAdversarialRegression, ACapturedProofIsVoidAfterAnEstablishmentThroughTheOtherVersionAdversarialRegression) {
+    const auto master = keysOf('k').current;
+    {   // A ProofV2 captured in flight; a legacy v1 exchange links first; the ProofV2 delivered later mints nothing.
+        pl::PeerHandshake a(1, 2, 10, keysOf('k')), b(2, 1, 20, keysOf('k'));
+        const auto captured = realProofV2(a, b, 0);
+        pl::PeerHello h1; h1.from = 1; h1.to = 2; h1.keyId = master.keyId; h1.incarnation = 10; h1.nonceA.fill(0x41);
+        auto c1 = b.onHello(h1, kMs); ASSERT_TRUE(c1.frame);
+        pl::PeerChallenge ch1; ASSERT_TRUE(pl::PeerChallenge::decode(c1.frame->data(), c1.frame->size(), ch1));
+        pl::PeerProof p1; p1.from = 1; p1.to = 2; p1.macA = v1MacOf(false, h1.nonceA, ch1.nonceB);
+        ASSERT_TRUE(b.onProof(p1, 2 * kMs).established);
+        ASSERT_NE(estOf(b), nullptr); ASSERT_EQ(estOf(b)->keys.epoch, 1u);
+        auto o = b.onProofV2(captured, 3 * kMs);
+        EXPECT_FALSE(o.established) << "a v2 Proof issued before a v1 establishment is void";
+        ASSERT_TRUE(o.log); EXPECT_NE(o.log->find("stale or forged cookie"), std::string::npos) << o.log->str();
+        ASSERT_NE(estOf(b), nullptr); EXPECT_EQ(estOf(b)->keys.epoch, 1u);
+    }
+    {   // A legacy v1 Proof captured; a v2 exchange links first; the v1 Proof delivered later mints nothing.
+        pl::PeerHandshake a(1, 2, 10, keysOf('k')), b(2, 1, 20, keysOf('k'));
+        pl::PeerHello h1; h1.from = 1; h1.to = 2; h1.keyId = master.keyId; h1.incarnation = 10; h1.nonceA.fill(0x42);
+        auto c1 = b.onHello(h1, 0); ASSERT_TRUE(c1.frame);
+        pl::PeerChallenge ch1; ASSERT_TRUE(pl::PeerChallenge::decode(c1.frame->data(), c1.frame->size(), ch1));
+        pl::PeerProof p1; p1.from = 1; p1.to = 2; p1.macA = v1MacOf(false, h1.nonceA, ch1.nonceB);
+        const auto proof = realProofV2(a, b, kMs);
+        ASSERT_TRUE(b.onProofV2(proof, 2 * kMs).established);
+        ASSERT_NE(estOf(b), nullptr); ASSERT_EQ(estOf(b)->keys.epoch, 1u);
+        auto o = b.onProof(p1, 3 * kMs);
+        EXPECT_FALSE(o.established) << "a v1 Proof issued before a v2 establishment is void";
+        ASSERT_NE(estOf(b), nullptr); EXPECT_EQ(estOf(b)->keys.epoch, 1u);
+    }
+}
+
+// ---- Version skew (#18): a main build between #242 and #18 answers a ChallengeV2 with a PLAIN Proof (tag 3) carrying a ----
+// valid v2 macA.  The new responder never links with it, computes no MAC for it and keeps no state (the documented
+// non-interoperability is a clean refusal, not a half-open link).  A legacy v1 Hello flood beside a v2 exchange does
+// not disturb the v2 exchange (separate paths).
+TEST(PeerLinkAdversarialRegression, APreCookieV2InitiatorsPlainProofIsRefusedCleanlyAdversarialRegression) {
+    pl::PeerHandshake a(1, 2, 10, keysOf('k')), b(2, 1, 20, keysOf('k'));
+    pl::PeerHelloV2 hello; pl::PeerChallengeV2 ch;
+    const auto proofV2 = realProofV2(a, b, 0, &hello, &ch);
+    pl::PeerProof plain; plain.from = 1; plain.to = 2; plain.macA = proofV2.macA;   // the pre-#18 initiator's frame
+    ASSERT_EQ(plain.macA, v2Mac(false, hello.nonceA, ch.nonceB, hello.shareA, ch.shareB, 10, 20)) << "a valid v2 macA";
+    const uint64_t macs = b.macComputations();
+    auto o = b.onProof(plain, kMs);
+    EXPECT_FALSE(o.established);
+    EXPECT_FALSE(o.frame);
+    ASSERT_TRUE(o.log); EXPECT_NE(o.log->find("no pending challenge matches"), std::string::npos) << o.log->str();
+    EXPECT_EQ(b.macComputations(), macs);
+    EXPECT_TRUE(std::holds_alternative<pl::LinkIdle>(b.state()));
+    // 100 legacy v1 Hellos (they churn the v1 table) land before the real ProofV2: it still links.
+    const auto master = keysOf('k').current;
+    for (int i = 0; i < 100; ++i) {
+        pl::PeerHello h; h.from = 1; h.to = 2; h.keyId = master.keyId; h.incarnation = 10;
+        h.nonceA.fill(static_cast<uint8_t>(i)); h.nonceA[31] = 0xEE;
+        ASSERT_TRUE(b.onHello(h, 2 * kMs).frame) << i;
+    }
+    EXPECT_TRUE(b.onProofV2(proofV2, 3 * kMs).established);
+}
+
+// ---- Resources / DoS cost (#18): a forged HelloV2 flood keeps NO per-Hello state and costs exactly one transcript MAC ----
+// per Hello (the Challenge's own macB - the old pending slot also precomputed the expected macA).  A misaddressed one
+// costs none.  An Established responder stays Established with its keys.
+TEST(PeerLinkAdversarialRegression, AForgedHelloV2FloodCostsOneMacEachAndKeepsNoStateAdversarialRegression) {
+    pl::PeerHandshake a(1, 2, 10, keysOf('k')), b(2, 1, 20, keysOf('k'));
+    ASSERT_TRUE(b.onProofV2(realProofV2(a, b, 0), kMs).established);
+    ASSERT_NE(estOf(b), nullptr);
+    const pl::LinkKeys live = estOf(b)->keys;
+    const uint64_t macs = b.macComputations();
+    std::mt19937_64 rng(551);
+    constexpr int kN = 5'000;
+    int misaddressed = 0;
+    for (int i = 0; i < kN; ++i) {
+        pl::PeerHelloV2 f; f.from = 1; f.to = 2; f.keyId = keysOf('k').current.keyId; f.incarnation = rng();
+        for (auto& x : f.nonceA) x = static_cast<uint8_t>(rng());
+        for (auto& x : f.shareA) x = static_cast<uint8_t>(rng());
+        if (i % 10 == 0) { f.from = 7; ++misaddressed; }
+        auto o = b.onHelloV2(f, 2 * kMs + i);
+        ASSERT_TRUE(o.frame) << i;
+        EXPECT_EQ(o.frame->data()[0], static_cast<uint8_t>(i % 10 == 0 ? pl::PeerMsg::Refuse : pl::PeerMsg::ChallengeV2)) << i;
+    }
+    EXPECT_EQ(b.macComputations() - macs, static_cast<uint64_t>(kN - misaddressed)) << "one macB per answered Hello, nothing else";
+    ASSERT_NE(estOf(b), nullptr);
+    EXPECT_EQ(estOf(b)->keys, live) << "the live link is untouched";
+}
+
+// ---- Crash and restart (#18): the responder restarts between its Challenge and the initiator's ProofV2.  The new ----
+// process's cookie secrets are fresh, so the Proof is refused (no link under a dead process's Challenge), and the pair
+// relinks on its own once the initiator's wait expires.
+TEST(PeerLinkAdversarialRegression, AResponderRestartedBetweenChallengeAndProofRelinksAdversarialRegression) {
+    Sim s(551);
+    const auto proof = realProofV2(s.a.hs, s.b.hs, 0);
+    s.b.hs = pl::PeerHandshake(2, 1, 21, keysOf('k'));
+    s.b.crypto = pl::PeerFrameCrypto(2, 0);
+    auto o = s.b.hs.onProofV2(proof, kMs);
+    EXPECT_FALSE(o.established);
+    ASSERT_TRUE(o.log); EXPECT_NE(o.log->find("stale or forged cookie"), std::string::npos) << o.log->str();
+    s.now = 2 * kMs;
+    ASSERT_TRUE(s.converge()) << s.describe();
+    ASSERT_NE(estOf(s.a.hs), nullptr);
+    EXPECT_EQ(estOf(s.a.hs)->peerIncarnation, 21u) << "linked with the restarted responder";
+}
+
+// ---- Network (rUDP) + Auth (#17): a seeded model.  Both ends seal an idle keepalive every 250 ms; each keepalive is ----
+// lost, duplicated or delayed (reordered) at random.  A forged unknown-epoch hint and a forged NoLink poke hit the
+// initiator every 100 ms.  Invariants: (1) the initiator starts a re-handshake ONLY when it opened no authenticated frame
+// for kSilenceNs (no hint cap any more: the silence gate is the whole defence); (2) a duplicated keepalive never opens
+// twice (it would fake liveness); (3) every delivered keepalive opens or is a counted replay - never UnknownEpoch /
+// BadTag, across the re-handshakes loss forces; (4) loss-free runs never re-handshake at all.
+// Mutation: dropping the `nowNs - e->lastAuthNs < kSilenceNs` gate from PeerHandshake::rekey_ turns (1)/(4) red.
+TEST(PeerLinkAdversarialRegression, ForgedHintsNeverRekeyALinkWhoseKeepalivesArriveUnderLossDupReorderAdversarialRegression) {
+    uint64_t rekeysLossy = 0, replays = 0, opened = 0;
+    for (uint64_t seed = 1; seed <= 60; ++seed) {
+        const bool lossy = seed % 3 != 0;
+        const double pLoss = lossy ? 0.35 : 0.0, pDup = 0.2;
+        Sim s(seed);
+        s.link();
+        ASSERT_TRUE(s.a.crypto.hasLink(2) && s.b.crypto.hasLink(1)) << "seed " << seed;
+        struct InFlight { int to; Bytes bytes; int64_t at; uint64_t id; };
+        std::vector<InFlight> net;
+        std::vector<int> openedTimes;
+        uint64_t nextId = 0;
+        ASSERT_NE(estOf(s.a.hs), nullptr);
+        int64_t lastAuthAtA = estOf(s.a.hs)->lastAuthNs;   // the establishment itself counts as heard
+        int rekeys = 0;
+        auto drainHs = [&] {
+            for (int guard = 0; guard < 64 && (!s.hsTo[0].empty() || !s.hsTo[1].empty()); ++guard)
+                for (int to : {0, 1}) if (!s.hsTo[to].empty()) { Bytes f = s.hsTo[to].front(); s.hsTo[to].pop_front(); s.deliverHs(to, f); }
+        };
+        auto inject = [&](pl::PeerHandshake::Out o) {
+            if (o.frame) {
+                ++rekeys;
+                EXPECT_GE(s.now - lastAuthAtA, pl::PeerHandshake::kSilenceNs)
+                    << "seed " << seed << ": a forged hint started a re-handshake of a peer heard " << (s.now - lastAuthAtA) / kMs << " ms ago";
+            }
+            s.absorb(0, std::move(o));
+        };
+        const int64_t start = s.now, end = start + 30'000 * kMs;
+        pl::PeerRefuse poke; poke.from = 2; poke.to = 1; poke.reason = pl::RefuseReason::NoLink;
+        for (; s.now <= end && s.failure.empty(); s.now += 10 * kMs) {
+            const int64_t t = s.now - start;
+            for (int from : {0, 1}) {
+                if (t % (250 * kMs) != (from == 0 ? 0 : 120 * kMs)) continue;
+                End& e = s.at(from);
+                if (!e.crypto.hasLink(e.peer)) continue;
+                Bytes w(8 + pl::kPeerFrameOverhead);
+                const uint8_t ka[8] = {0x00, 0x00, 65, 0x00, 0x00, 0x00, 0x00, 0x00};   // a template-65 header-only frame
+                const auto n = e.crypto.seal(e.peer, ka, sizeof ka, w.data(), w.size());
+                ASSERT_GT(n, 0u);
+                w.resize(n);
+                const uint64_t id = nextId++;
+                openedTimes.push_back(0);
+                if (s.chance(pLoss)) continue;
+                net.push_back({1 - from, w, s.now + std::uniform_int_distribution<int64_t>(0, 120)(s.rng) * kMs, id});
+                if (s.chance(pDup)) net.push_back({1 - from, w, s.now + std::uniform_int_distribution<int64_t>(0, 120)(s.rng) * kMs, id});
+            }
+            // Deliver whatever is due, in a random order (reordering).
+            std::shuffle(net.begin(), net.end(), s.rng);
+            for (std::size_t i = 0; i < net.size();) {
+                if (net[i].at > s.now) { ++i; continue; }
+                InFlight f = std::move(net[i]);
+                net.erase(net.begin() + static_cast<std::ptrdiff_t>(i));
+                End& e = s.at(f.to);
+                uint8_t out[16]; std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
+                const auto r = e.crypto.open(f.bytes.data(), f.bytes.size(), out, sizeof out, outLen, from, epoch);
+                if (r == OR::Replay) { ++replays; EXPECT_GE(openedTimes[f.id], 1) << "seed " << seed << ": a replay of a frame never opened"; continue; }
+                ASSERT_EQ(r, OR::Ok) << "seed " << seed << ": a delivered keepalive was dropped: " << pl::PeerFrameCrypto::name(r);
+                ++opened;
+                EXPECT_EQ(++openedTimes[f.id], 1) << "seed " << seed << ": a keepalive opened twice";
+                e.hs.onAuthenticated(s.now);
+                if (f.to == 0) lastAuthAtA = s.now;
+                int32_t peer = -1; uint32_t used = 0;
+                if (e.crypto.takePeerUsedEpoch(peer, used)) s.absorb(f.to, e.hs.onPeerUsedEpoch(used, s.now));
+            }
+            if (t % (100 * kMs) == 0) {
+                inject(s.a.hs.onUnknownEpoch(static_cast<uint32_t>(1'000 + t / kMs), s.now));
+                inject(s.a.hs.onRefuse(poke, s.now));
+            }
+            s.tick();
+            drainHs();
+        }
+        ASSERT_TRUE(s.failure.empty()) << "seed " << seed << ": " << s.failure;
+        if (!lossy) EXPECT_EQ(rekeys, 0) << "seed " << seed << ": loss-free keepalives: never silent, never re-keyed";
+        else rekeysLossy += static_cast<uint64_t>(rekeys);
+    }
+    EXPECT_GT(replays, 1'000u) << "the model must actually duplicate";
+    EXPECT_GT(opened, 8'000u);
+    std::printf("[keepalive model] opened %llu, replays refused %llu, silence-gated re-handshakes under 35%% loss %llu\n",
+                static_cast<unsigned long long>(opened), static_cast<unsigned long long>(replays),
+                static_cast<unsigned long long>(rekeysLossy));
 }
