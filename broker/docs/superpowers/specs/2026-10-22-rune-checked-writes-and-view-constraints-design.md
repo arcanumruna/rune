@@ -41,7 +41,7 @@ topic character {
   hairSkin uint16, hairSheet uint16, headSkin uint16, /* …the rest of the appearance fields… */
   createdAt int64, lastPlayed int64
 } partitions 1 replicas 3 key characterId
-  with (cleanup.policy = compact, tier = majority);
+  with (cleanup.policy = compact);
 
 create view character_by_id key characterId as select * from character;
 
