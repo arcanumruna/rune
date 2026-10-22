@@ -22,7 +22,7 @@ The RegressorsPath backend is moving off Postgres and Redis onto Rune, one servi
 4. Views are clustered indexes. There are no array or `collect()` columns: a user's characters are rows under a composite key.
 5. The 12-character cap is a `check` constraint on a `count(*)` aggregate view.
 6. Ids are generated in the backend (the broker), safely and fast. The topic key is mandatory where ids are generated, and it can't be altered.
-7. Every topic is typed and every write is validated. There is no topic that accepts a random payload.
+7. Every typed topic validates every write. A topic declared without a field list is untyped: a raw log of opaque bytes with no database features. Every database feature needs a typed topic.
 8. A typed `remove` / `removeExisting` API exists.
 9. Strings: `lower()` is ASCII-only for now. A Unicode `casefold()` is reserved for later (§8.1).
 
@@ -82,7 +82,7 @@ characters.removeExistingAndWait(id);   // KeyNotFound → 404
 
 **Goals**
 
-- G1. Every topic is typed, and the broker validates every record (§4).
+- G1. Typed topics always validate, and the database features exist only on typed topics. Untyped topics stay as raw logs (§4).
 - G2. Write intents (`insert`, `update`, `upsert`, delete, delete-existing) are enforced by the broker, together with a typed delete API (§5).
 - G3. The broker assigns keys (`autoincrement`) with no extra hop and no reuse, ever (§6).
 - G4. View keys up to 128 bytes: composite keys and key expressions (§7).
@@ -141,7 +141,7 @@ Checked topics share these rules:
 - the pending overlay (§8.4)
 - one batch in flight per partition on the client (§11.3)
 
-Validation (§4) runs for every topic in the same single decode pass.
+Validation (§4) runs for every typed topic, in the same single decode pass.
 
 **What the hook does for one batch, in order:**
 1. Decode each record once, using the per-writer-version descriptor cache shared with the fold. That gives validation (§4).
@@ -153,39 +153,39 @@ Validation (§4) runs for every topic in the same single decode pass.
 7. If any record fails a check, reject the whole batch. Nothing is assigned, appended or reserved, and the counter is restored.
 8. Otherwise, merge the scratch into the overlay, tagged with the offsets the append assigns. This happens on the same thread, with nothing interleaved.
 
-## 4. Part A: every topic typed, every write validated
+## 4. Part A: typed topics always validate; untyped topics are raw logs
 
 **Today.**
-- **Untyped topics.** `topic events partitions 3;` has no field list and takes opaque bytes (`Parser.cpp:583`, `Backends.cpp:52`, `docs/api/ql.md:29`).
-- **Typed topics that don't validate.** Validation is opt-in through `--validate` (`CatalogCommands.cpp:250`) and the `validate` argument of `createTopic` (`Client.h:782`). It defaults to false (`CatalogEvent.h:62`). The broker accepts any bytes, and the view fold quietly counts undecodable records as `skippedMalformed`.
+- **Untyped topics.** A topic declared without a field list is untyped (`topic events partitions 3;`, `Parser.cpp:583`, `Backends.cpp:52`, `docs/api/ql.md:29`). It takes opaque bytes.
+- **Typed topics that don't validate.** Validation is opt-in through `--validate` (`CatalogCommands.cpp:250`) and the `validate` argument of `createTopic` (`Client.h:782`), and it defaults to false (`CatalogEvent.h:62`). The broker therefore accepts any bytes on a typed topic. The view fold then quietly counts the undecodable records as `skippedMalformed`.
 
 **Rules**
 
-- **A field list is required.** `topic <name>` must have one. Opaque payloads become an explicit field: `topic events { payload bytes } partitions 3;`.
-- **`key` is optional.** A topic without a key is an append-only event stream. Its records have an empty wire key and are routed sticky or round-robin, like Kafka's null keys.
-  - Compaction, views, intents, `autoincrement` and constraints all need a key.
-  - Subscription filters don't.
-  - Using one of those features on a keyless topic is refused at DDL time.
-- **Validation is always on.** The `validate` flag, `--validate` and the `validate` parameter are removed.
-  - Every data record must decode against a schema version the topic knows (`schemaRejects_` already selects by exact `(topicId, version)`). If not, the whole batch is rejected with `SchemaValidationFailed` and never appended.
+- **A topic's schema determines its kind:**
+  - With a field list, the topic is **typed**.
+  - Without one, it is **untyped**: a raw log of opaque bytes, like a Kafka topic. Nothing else changes; the schema is just absent.
+  - `show topic` and the catalog mark untyped topics as `raw`.
+- **A typed topic always validates.** The `validate` flag, `--validate` and the `validate` parameter are removed.
+  - Every data record must decode against a schema version the topic knows. `schemaRejects_` already selects the validator by the exact `(topicId, version)` pair.
+  - If any record fails, the whole batch is rejected with `SchemaValidationFailed` and never appended.
   - Control batches are exempt.
-- **Wire key = key field.** On a keyed topic, the record's wire key must equal the encoded value of its key field. The only exception is the `autoincrement` placeholder (§6.4), which is 0 in both.
-  - Without this rule, routing, compaction and view identity follow the wire key, while readers and view columns show a different value. The fold already uses the wire key as identity and the value field as a column (`ViewFold.cpp:162-188`).
-- **Raw `send(topic, key, bytes)` stays.** The bytes must be a valid encoded record. The typed API is the normal path.
-- **Internal topics.** `__` topics keep their fixed formats. Users can't create `__` names.
-- **Hot path.** Validation moves from the `validatedTopics_` hash lookup (`Worker.h:3891`) to the §3 per-partition pointer. A `{ payload bytes }` schema costs a header and length check.
+- **On a keyed typed topic, the wire key must equal the key field.** The record's wire key must equal the encoded value of its key field. The only exception is the `autoincrement` placeholder (§6.4), which is 0 in both places.
+  - Without this rule, routing, compaction and view identity follow the wire key, while readers and view columns see a different value.
+  - The fold already uses the wire key as identity and the value field as a column (`ViewFold.cpp:162-188`).
+- **Database features exist only on typed topics.** These are views, subscription filters, intents, the key index, `autoincrement` and constraints.
+  - Every one of them except filters also needs a key.
+  - Using one on an untyped or keyless topic is refused at DDL time with a message that names the missing piece ("view source must be a typed topic", "autoincrement needs a key").
+- **The client.**
+  - `TypedTopic<T>` refuses to bind to an untyped topic, or to a typed topic whose fingerprint differs.
+  - Raw `send(topic, key, bytes)` still works on both kinds. On a typed topic the bytes must be a valid encoded record.
+- **Keyless typed topics** stay allowed: append-only typed event streams, routed sticky or round-robin.
+- **Hot path.**
+  - Validation moves from the `validatedTopics_` hash lookup (`Worker.h:3891`) to the §3 per-partition pointer.
+  - Untyped topics and unchecked typed topics pay one predicted branch.
 - **Existing clusters.**
-  - Behind the new feature level (§12), DDL that creates an untyped topic is refused.
-  - When the level is raised, every untyped topic is converted to `{ payload bytes }` by a catalog `AlterTopic`, and its old records stay readable as the payload. The builder must prove this with a test that reads pre-conversion records.
-  - Validation turns on for every typed topic. A producer that was writing invalid bytes then gets `SchemaValidationFailed`, which is intended.
-- **Repo ripple.** These all move to `{ payload bytes }` or a real schema in this part:
-  - the e2e topic scripts (`broker/docker/topics/*.rql`, `catalog-e2e.sh`)
-  - `broker/bench/kafka-compare/lib.sh`
-  - the DR harness (`broker/dr-e2e/harness/cluster.py`, `test_harness_topics.py`)
-  - the QL, CLI and console tests
-  - the client DDL tests
-  - the protocol conformance vectors
-  - `README.md`, `client-cpp/README.md`, `docs/api/ql.md`, `docs/benchmarks.md`, `SELF-HOSTING.md`, `DOCKERHUB.md`
+  - Behind the new feature level (§12), every existing typed topic starts validating. A producer that was writing invalid bytes to a typed topic then gets `SchemaValidationFailed`, which is the intent.
+  - Untyped topics are unaffected.
+  - No conversion is needed.
 
 ## 5. Part B: write intents, the key index, typed delete
 
@@ -556,7 +556,6 @@ Existing codes reused:
 - **Feature level.** A new cluster level, `MetadataFeature::kCheckedWrites`, sits next to `kStorageIdentity` (`ReplicationMessages.h:464`). Until every broker supports it, the following are refused:
   - DDL that uses `autoincrement`, `key.index`, a plan-v2 view, or `unique`/`check`;
   - non-zero intents;
-  - the untyped-topic conversion.
 - **Version bumps.** Client version 12 covers the new codes, `assignedBase`, `GetViewRowK`, `ScanViewRows` and the checked-topic metadata flag. Plan v2, checkpoint v3, and catalog event formats bump their versions following the existing frozen-format rules. Old formats still decode.
 
 ## 13. Observability
@@ -632,12 +631,12 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 - a batch rejected by a later check, after which the counter must be restored
 
 **Validation (§4):**
-- DDL for an untyped topic is refused
-- a record matching no known schema version
+- a typed-topic record matching no known schema version, including a typed topic that existed before the upgrade
 - a wire key that doesn't match the key field
 - control batches pass
-- a keyless topic refuses views, intents and `autoincrement` at DDL time
-- an untyped topic is converted, and its old records stay readable
+- an untyped topic and a keyless topic each refuse views, filters (untyped only), intents, the key index and `autoincrement` at DDL time, with the right message
+- `TypedTopic<T>` refuses to bind to an untyped topic or to a fingerprint mismatch
+- raw `send` works on untyped topics and is validated on typed ones
 
 **Clients:**
 - a non-idempotent client, an `acks=leader` client, and a v11 client, each writing to a checked topic
@@ -666,7 +665,7 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 Each part ships on its own:
 
 1. **#537:** skip aborted-transaction records in the fold, and re-fold.
-2. **Part A (§4):** every topic typed, validation always on, wire key = key field, the untyped conversion, and the repo ripple.
+2. **Part A (§4):** validation always on for typed topics, wire key = key field, refusing features on untyped and keyless topics, the `raw` marker, and the `TypedTopic` bind check.
 3. **The hook and gate (§3, §8.4–§8.6):** the hook skeleton, the overlay, the readiness gate, the producer changes (§11.2–§11.3), codes 51–55, and the `kCheckedWrites` feature level.
 4. **Part B (§5):** intents, the key index, and the typed `insert` / `update` / `remove` / `removeExisting` API.
 5. **Part C (§6):** `autoincrement`, the modulo partitioner, reservation records and their retention in the cleaner, `assignedBase`, the `IMPORT` grant, and `insertAndWait(...).key()`.
@@ -685,7 +684,7 @@ Each part ships on its own:
 - Checked topics require idempotent producers, acks=all and client version 12 or later, with one batch in flight per partition.
 - Codes 51–54 abort an enclosing transaction.
 - A source key held by another open transaction is locked until that transaction ends (`ConcurrentTransactions`).
-- Keyless typed topics replace untyped ones. Existing untyped topics become `{ payload bytes }`.
+- Untyped topics stay as raw logs: no field list means untyped. Every database feature needs a typed topic.
 - `lower()` is ASCII-only, and `casefold()` is reserved.
 - View keys are capped at 128 bytes.
 - Overlay capacity defaults to 65 536 entries, and a full overlay gets code 55.
