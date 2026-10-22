@@ -401,8 +401,11 @@ public:
     /// node).  Both equal to the seed endpoint (or empty) removes the route so the
     /// partition takes the byte-identical default path.  Cold path (metadata).
     /// Returns true when the route changed.
+    /// Issue #116: `receiverId` = the receiver a produce sent on `dataChannel` is sealed for on a receiver-key session
+    /// (MetadataResponse ingressReceiverId: worker w = w+1; 0 = the gateway).  A produce that goes to the node on the
+    /// default ingress stream is always sealed for the gateway (0), whatever the route says.
     bool setRoute(int32_t topicId, int32_t partition, const std::string& sessionEndpoint,
-                  const std::string& dataChannel) noexcept;
+                  const std::string& dataChannel, uint8_t receiverId = 0) noexcept;
 
     /// Task 1.3: number of currently open sessions (test/observer helper).
     [[nodiscard]] std::size_t sessionCount() const noexcept { return sessions_.size(); }
@@ -946,6 +949,8 @@ private:
         uint32_t    sessionIndex = kNoSession;  // resolved on first offer
         int32_t     streamId     = -1;          // stream `pub` was built for
         transport::AeronTransport::PubHandle pub = transport::AeronTransport::kNoPub;
+        uint8_t     receiverId   = 0;      // issue #116: who a produce on dataChannel is sealed for (0 = gateway)
+        bool        dataOnNode   = true;   // dataChannel == sessionEndpoint (the node, not a worker's own ingress)
     };
     detail::FlatIndexMap        routeIndex_;   // routeKey(t,p) -> routes_ index
     uint64_t                    heldOffers_ = 0;  // DR-7: see heldOffers()

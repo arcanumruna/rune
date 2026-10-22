@@ -45,6 +45,11 @@
 //               partition's ingressEndpoint is non-empty (2026-09-30 self-contained
 //               worker shards); absent for default-config frames, and ignored by
 //               older decoders that stop reading after partitions[].
+//   [after the endpoint trailer] optional receiver trailer (issue #116): uint16 count (== partitionCount) +
+//               count × uint8 ingressReceiverId.  Sent only to sessions >= kClientVersionReceiverKeys and only when
+//               some id is non-zero; whenever it is sent the endpoint trailer is sent too (empty strings when no
+//               partition has an endpoint), so a decoder that reads only the endpoint trailer ignores it.  Absent =
+//               every ingressReceiverId 0.
 // ---------------------------------------------------------------------------
 
 #include <cstddef>
@@ -187,6 +192,11 @@ struct PartitionEntry {
     /// (BrokerEntry host + port).  Carried in an additive trailer after partitions[];
     /// on decode a zero-copy view into the frame buffer.
     std::string_view ingressEndpoint;
+
+    /// Issue #116: the receiver a client (>= kClientVersionReceiverKeys) seals a produce for when it sends it on this
+    /// partition's ADVERTISED worker route (the ingressEndpoint, or the per-worker ingressStreamId on the node): the
+    /// owning worker w's id w+1.  0 = the gateway (no worker route advertised).  Carried in the receiver trailer.
+    uint8_t ingressReceiverId = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -202,6 +212,9 @@ struct MetadataResponse {
     // passes spans into encode().  Tests may also set them directly.
     std::span<const BrokerEntry>    brokers;
     std::span<const PartitionEntry> partitions;
+    /// Encode side (issue #116): the ConnectRequest.clientVersion of the session this response answers - the
+    /// receiver trailer is written only for sessions >= kClientVersionReceiverKeys.  Not on the wire.
+    int32_t clientVersion = 0;
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::MetadataResponse); // 9
     static constexpr uint16_t BODY_FIXED  = 0;
@@ -211,6 +224,13 @@ struct MetadataResponse {
     /// default-config frames (no per-worker ingress) stay byte-identical.
     [[nodiscard]] bool hasIngressEndpoints() const noexcept {
         for (const auto& p : partitions) if (!p.ingressEndpoint.empty()) return true;
+        return false;
+    }
+
+    /// Issue #116: true when the receiver trailer is written (a session >= 12 and some id non-zero).
+    [[nodiscard]] bool emitsReceiverIds() const noexcept {
+        if (clientVersion < kClientVersionReceiverKeys) return false;
+        for (const auto& p : partitions) if (p.ingressReceiverId != 0) return true;
         return false;
     }
 
@@ -273,10 +293,17 @@ struct MetadataResponse {
 
         // Additive trailer: uint16 count (== partitions.size()) + var-str per entry.
         // Written only when some endpoint is non-empty → default frames unchanged.
-        if (hasIngressEndpoints()) {
+        const bool receiverIds = emitsReceiverIds();
+        if (receiverIds || hasIngressEndpoints()) {
             detail::putLE16(buf, static_cast<int>(pos), static_cast<uint16_t>(partitions.size()));
             pos += 2;
             for (const auto& p : partitions) pos += putVarStr(buf + pos, p.ingressEndpoint);
+        }
+        // Issue #116: the receiver trailer, after the endpoint trailer (always present when this is).
+        if (receiverIds) {
+            detail::putLE16(buf, static_cast<int>(pos), static_cast<uint16_t>(partitions.size()));
+            pos += 2;
+            for (const auto& p : partitions) buf[pos++] = p.ingressReceiverId;
         }
         return pos;
     }
@@ -290,10 +317,12 @@ struct MetadataResponse {
         }
         sz += 2u;              // partitionCount
         sz += partitions.size() * 28u;  // read-rework: 28 bytes/entry (E5.1 was 20)
-        if (hasIngressEndpoints()) {
+        const bool receiverIds = emitsReceiverIds();
+        if (receiverIds || hasIngressEndpoints()) {
             sz += 2u;
             for (const auto& p : partitions) sz += 2u + p.ingressEndpoint.size();
         }
+        if (receiverIds) sz += 2u + partitions.size();   // issue #116: count + one byte per partition
         return sz;
     }
 
@@ -370,7 +399,15 @@ struct MetadataResponse {
             if (!getVarStr(buf, avail, pos, result.partitions[i].ingressEndpoint))
                 return std::nullopt;
         }
-        return result;
+        // Issue #116: optional receiver trailer (absent = every ingressReceiverId 0).
+        if (pos == avail) return result;
+        if (pos + 2u > avail) return std::nullopt;       // torn trailer header
+        const uint16_t idCount = detail::getLE16(buf, static_cast<int>(pos));
+        pos += 2;
+        if (idCount != partCount) return std::nullopt;   // must parallel partitions[]
+        if (pos + idCount > avail) return std::nullopt;  // torn ids
+        for (uint16_t i = 0; i < idCount; ++i) result.partitions[i].ingressReceiverId = buf[pos++];
+        return result;   // later additive trailers (none today) are ignored
     }
 };
 

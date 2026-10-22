@@ -57,6 +57,12 @@ struct CryptoState {
     // Zero-valued for every plaintext session.
     rune::crypto::AeadKey                    c2b{};
     uint8_t                                  c2bPrefix[4] = {};
+
+    // Issue #116: the session's client (>= 12) and this broker (>= 7) bind each c2b frame to one receiver
+    // (rune::protocol::client::sessionUsesReceiverKeys).  The gateway is receiver 0: it keeps `recv` (the raw c2b key)
+    // and drops, before any AEAD, a frame whose CryptoSubHeader names another receiver (a frame sealed for a shard
+    // worker, replayed here).  false = legacy: one shared key, the subheader's id is not checked.
+    bool                                     receiverKeys = false;
 };
 
 } // namespace rune::gateway

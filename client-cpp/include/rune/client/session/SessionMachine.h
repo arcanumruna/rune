@@ -291,6 +291,24 @@ struct CryptoState {
     // from NodeConfig — if the broker's max ever changes, mirror it here too.
     static constexpr uint8_t kMaxShardWorkers = 64;
     std::array<WorkerRecv, kMaxShardWorkers> workerRecv{};
+
+    // Issue #116 (per-receiver client->broker keys): true when this session's client (ConnectRequest.clientVersion)
+    // and broker (ConnectResponse.brokerVersion) both speak receiver keys (rpc::sessionUsesReceiverKeys).  Then each
+    // c2b frame is sealed for ONE receiver: receiver 0 (the gateway) uses `send`/`sendSeq` above, unchanged; receiver
+    // k >= 1 (shard worker k-1) uses workerSend[k-1] - its own cipher under deriveReceiverKey(c2bKey, k) and its own
+    // seq space, so a frame sealed for one receiver never opens at another (and a receiver's window never lags behind
+    // a seq another receiver consumed).  false (legacy) = every frame on `send`/`sendSeq` with receiver id 0.
+    bool                  receiverKeys = false;
+    // Retained raw c2b key + nonce prefix: a receiver slot's key is derived from them lazily, on first use (cold, once
+    // per receiver per session).  Populated alongside `send` in finishHandshake_.
+    rune::crypto::AeadKey c2bKey{};
+    uint8_t               c2bPrefix[rune::crypto::kNoncePrefix] = {};
+    struct ReceiverSend {
+        std::optional<rune::crypto::AeadCipher> cipher;
+        uint64_t sendSeq = 0;
+    };
+    // One slot per worker receiver (id k >= 1, indexed k-1); same bound as workerRecv (the broker's max workers).
+    std::array<ReceiverSend, kMaxShardWorkers> workerSend{};
 };
 
 // ---------------------------------------------------------------------------
@@ -571,7 +589,10 @@ public:
                            // Authentication (v9): defaults = a broker without authentication, so every
                            // pre-v9 call site keeps its behaviour (Connected at once).
                            rune::protocol::client::AuthMode  authMode  = rune::protocol::client::AuthMode::InProcess,
-                           rune::protocol::client::AuthState authState = rune::protocol::client::AuthState::Anonymous) noexcept {
+                           rune::protocol::client::AuthState authState = rune::protocol::client::AuthState::Anonymous,
+                           // Issue #116: ConnectResponse.brokerVersion (0 = a broker that predates the field) - with
+                           // this client's own version it decides whether the session uses receiver keys.
+                           int32_t brokerVersion = 0) noexcept {
         // FIX E: remove the redundant Closed guard before the !=Connecting guard.
         if (state_ != SessionState::Connecting) return;  // ignore in wrong state
 
@@ -598,6 +619,7 @@ public:
                 hs_->chosenCipher = static_cast<rune::crypto::Cipher>(chosenCipher);
                 hs_->authMode     = authMode;     // the auth step follows the handshake's done()
                 hs_->authState    = authState;
+                hs_->brokerVersion = brokerVersion;   // issue #116: receiver keys are decided at done()
                 transitionTo(SessionState::Handshaking);
                 onHandshakeBytes(reinterpret_cast<const uint8_t*>(handshakeBytes.data()),
                                   handshakeBytes.size(), nowNs);
@@ -1121,9 +1143,7 @@ private:
                 // Wire gate: crypto fields are dropped on decode if clientVersion <
                 // kClientVersionCrypto — force it when offering crypto regardless
                 // of what cfg_.clientVersion was configured to.
-                (cfg_.clientVersion > rune::protocol::client::kClientVersionCrypto
-                     ? cfg_.clientVersion
-                     : rune::protocol::client::kClientVersionCrypto),
+                announcedClientVersion_(),
                 sessionId_, correlationId_,
                 std::span<const uint8_t>(&cipherByte, 1),
                 hs, std::string_view{});   // ConnectRequest.authToken: reserved, always empty
@@ -1138,6 +1158,14 @@ private:
             sessionId_,
             correlationId_);
         connectSentOk_ = n > 0 && io_.sendFrame(scratch_.data(), n);
+    }
+
+    /// The ConnectRequest.clientVersion a crypto offer announces: crypto fields are dropped on decode below
+    /// kClientVersionCrypto, so an offer always announces at least that (issue #116: the broker gates receiver keys
+    /// on this same value).
+    [[nodiscard]] int32_t announcedClientVersion_() const noexcept {
+        return cfg_.clientVersion > rune::protocol::client::kClientVersionCrypto
+                   ? cfg_.clientVersion : rune::protocol::client::kClientVersionCrypto;
     }
 
     /// client<->broker TLS/AEAD (Task 5): construct a fresh client-role TlsSession
@@ -1261,6 +1289,13 @@ private:
         // senderId — see CryptoState::workerRecv.
         cryptoState_.b2cKey = keys.b2c;
         std::memcpy(cryptoState_.b2cPrefix, keys.b2cPrefix, sizeof(cryptoState_.b2cPrefix));
+        // Issue #116: per-receiver c2b keys when both sides speak them (the version this episode's ConnectRequest
+        // announced - see sendConnectRequest_ - and the broker's ConnectResponse.brokerVersion).  The raw c2b key is
+        // retained to derive each worker receiver's key on first use.
+        cryptoState_.receiverKeys = rune::protocol::client::sessionUsesReceiverKeys(announcedClientVersion_(),
+                                                                                   hs_->brokerVersion);
+        cryptoState_.c2bKey = keys.c2b;
+        std::memcpy(cryptoState_.c2bPrefix, keys.c2bPrefix, sizeof(cryptoState_.c2bPrefix));
         cryptoState_.encrypted = true;
         const auto authMode  = hs_->authMode;
         const auto authState = hs_->authState;
@@ -1751,6 +1786,7 @@ private:
         // Authentication: the first leg's verdict on how this session logs in, applied when done() (D11).
         rune::protocol::client::AuthMode  authMode  = rune::protocol::client::AuthMode::InProcess;
         rune::protocol::client::AuthState authState = rune::protocol::client::AuthState::Anonymous;
+        int32_t                           brokerVersion = 0;   // issue #116: the first leg's ConnectResponse.brokerVersion
         explicit HandshakeEpisode(rune::crypto::TlsSession t) noexcept : tls(std::move(t)) {}
     };
     std::optional<HandshakeEpisode> hs_;

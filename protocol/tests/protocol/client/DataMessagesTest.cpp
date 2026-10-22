@@ -1895,7 +1895,12 @@ TEST(TransientLogFullRegression, OldClientsAreAnsweredNotLeader) {
 // ===========================================================================
 static_assert(rpc::kClientVersionFilter == rpc::kClientVersionTxnOffsetFence + 1);
 static_assert(rpc::kBrokerVersionFilter == rpc::kBrokerVersionAuth + 1);
-static_assert(rpc::kClientVersion == rpc::kClientVersionFilter && rpc::kBrokerVersion == rpc::kBrokerVersionFilter);
+static_assert(rpc::kClientVersion >= rpc::kClientVersionFilter && rpc::kBrokerVersion >= rpc::kBrokerVersionFilter);
+// Issue #116: client 12 / broker 7 (per-receiver c2b keys) is the next gate after filters.
+static_assert(rpc::kClientVersionReceiverKeys == rpc::kClientVersionFilter + 1);
+static_assert(rpc::kBrokerVersionReceiverKeys == rpc::kBrokerVersionFilter + 1);
+static_assert(rpc::kClientVersion == rpc::kClientVersionReceiverKeys && rpc::kBrokerVersion == rpc::kBrokerVersionReceiverKeys);
+static_assert(rpc::sessionUsesReceiverKeys(12, 7) && !rpc::sessionUsesReceiverKeys(11, 7) && !rpc::sessionUsesReceiverKeys(12, 6));
 static_assert(rpc::clientUnderstandsFilters(11) && !rpc::clientUnderstandsFilters(10));
 
 TEST(ProtocolVersions, FilterIsElevenAndBrokerSix) {

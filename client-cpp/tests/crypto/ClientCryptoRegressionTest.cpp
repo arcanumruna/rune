@@ -92,7 +92,8 @@ struct FakeIo final : sm::SessionIo {
 // ClientCryptoRoundTripTest.cpp's driveHandshake exactly, plus the counter.
 template <class Io>   // FakeIo, or the adversarial review's AgentLikeIo
 bool driveHandshake(sm::SessionMachine& m, Io& io, cr::TlsSession& srv,
-                     int64_t sessionId, int64_t nowNs, std::size_t* totalBytes = nullptr) {
+                     int64_t sessionId, int64_t nowNs, std::size_t* totalBytes = nullptr,
+                     int32_t brokerVersion = 0) {   // issue #116: the ConnectResponse.brokerVersion the broker announces
     std::size_t delivered = 0;
     for (int i = 0; i < 20; ++i) {
         if (io.sendCount() <= delivered) break;
@@ -128,7 +129,9 @@ bool driveHandshake(sm::SessionMachine& m, Io& io, cr::TlsSession& srv,
 
         if (isFirst) {
             m.onConnectResponse(/*code=*/0, /*leaderMemberId=*/-1, /*assignedSessionId=*/sessionId,
-                                 corrId, nowNs, chosenCipher, outView);
+                                 corrId, nowNs, chosenCipher, outView,
+                                 rune::protocol::client::AuthMode::InProcess,
+                                 rune::protocol::client::AuthState::Anonymous, brokerVersion);
         } else if (m.state() == sm::SessionState::Handshaking) {
             m.onHandshakeContinueResponse(/*code=*/0, outView, corrId, nowNs);
         }
@@ -190,9 +193,10 @@ struct FrameFixture {
           }())
     {}
 
-    bool established(int64_t nowNs) {
+    bool established(int64_t nowNs, int32_t brokerVersion = 0) {
         m.connect(nowNs);
-        return driveHandshake(m, io, srv, kSessionId, nowNs + 1) && m.cryptoState().encrypted;
+        return driveHandshake(m, io, srv, kSessionId, nowNs + 1, nullptr, brokerVersion) &&
+               m.cryptoState().encrypted;
     }
 };
 
@@ -1350,5 +1354,132 @@ TEST(ClientCryptoRegression, RedirectBindingOverflowFailsClosedToTheAnchorAdvers
         ASSERT_FALSE(io.sends.empty());
         EXPECT_TRUE(helloNames(io.sends.back(), "localhost")) << evil[i];
         EXPECT_FALSE(helloNames(io.sends.back(), "evil")) << evil[i] << ": the attacker's own name is verified";
+    }
+}
+
+// ===========================================================================
+// Issue #116: per-receiver client->broker keys and sequence spaces.  A session whose client (>= 12) and broker (>= 7)
+// both speak receiver keys seals each c2b frame for ONE receiver (0 = the gateway, w+1 = worker w): the receiver id
+// rides CryptoSubHeader.senderId (in the AAD), the key is deriveReceiverKey(c2b, id) and each receiver has its own
+// seq space.  A frame sealed for one receiver never opens at another, so a replay to another endpoint is refused.
+// ===========================================================================
+namespace {
+namespace rpc116 = rune::protocol::client;
+/// Opens `frame` under `key` (AAD = header + subheader) - what a receiver holding exactly that key does.
+bool opensUnder(const cr::AeadKey& key, const uint8_t prefix[4], cr::Cipher c, const std::vector<uint8_t>& frame) {
+    const auto sub = rpc116::CryptoSubHeader::decode(frame.data() + rpc116::MessageHeader::ENCODED_SIZE,
+                                                     frame.size() - rpc116::MessageHeader::ENCODED_SIZE);
+    if (!sub) return false;
+    cr::AeadCipher opener(c, key, prefix);
+    std::vector<uint8_t> out(frame.size());
+    return opener.open(sub->seq, frame.data(), rpc116::kCryptoHeaderBytes, frame.data() + rpc116::kCryptoHeaderBytes,
+                       frame.size() - rpc116::kCryptoHeaderBytes, out.data()) >= 0;
+}
+std::vector<uint8_t> sealFor(sm::CryptoState& c, uint8_t receiverId, int64_t corr) {
+    const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, corr, "receiver-bound");
+    std::vector<uint8_t> out(plain.size() + rpc116::kCryptoOverhead);
+    const std::size_t n = cc::sealFrame(c, plain.data(), plain.size(), out.data(), out.size(), receiverId);
+    out.resize(n);
+    return out;
+}
+rpc116::CryptoSubHeader subOf(const std::vector<uint8_t>& f) {
+    return *rpc116::CryptoSubHeader::decode(f.data() + rpc116::MessageHeader::ENCODED_SIZE,
+                                            f.size() - rpc116::MessageHeader::ENCODED_SIZE);
+}
+}  // namespace
+
+// RED: sealFrame ignores receiverId (every frame senderId 0 under the raw c2b key).
+TEST(ClientCryptoRegression, ASealedFrameNamesItsReceiverAndOpensOnlyUnderItsKeyRegression) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL, rpc116::kBrokerVersionReceiverKeys));
+    ASSERT_TRUE(f.m.cryptoState().receiverKeys) << "client 12 x broker 7: receiver keys";
+    const auto keys = f.srv.exportKeys(f.m.cryptoState().cipher, FrameFixture::kSessionId);
+
+    const auto w1 = sealFor(f.m.cryptoState(), 2, 1);   // worker 1
+    ASSERT_FALSE(w1.empty());
+    EXPECT_EQ(subOf(w1).senderId, 2);
+    cr::AeadKey r1{}, r2{};
+    ASSERT_TRUE(cr::deriveReceiverKey(keys.c2b, 1, r1));
+    ASSERT_TRUE(cr::deriveReceiverKey(keys.c2b, 2, r2));
+    EXPECT_TRUE(opensUnder(r2, keys.c2bPrefix, keys.cipher, w1)) << "worker 1 (receiver 2) opens it";
+    EXPECT_FALSE(opensUnder(keys.c2b, keys.c2bPrefix, keys.cipher, w1)) << "the gateway (raw c2b) never opens it";
+    EXPECT_FALSE(opensUnder(r1, keys.c2bPrefix, keys.cipher, w1)) << "worker 0 (receiver 1) never opens it";
+
+    const auto gw = sealFor(f.m.cryptoState(), 0, 2);
+    EXPECT_EQ(subOf(gw).senderId, 0);
+    EXPECT_TRUE(opensUnder(keys.c2b, keys.c2bPrefix, keys.cipher, gw)) << "receiver 0 stays the raw c2b key";
+    EXPECT_FALSE(opensUnder(r2, keys.c2bPrefix, keys.cipher, gw));
+}
+
+// RED: one shared sendSeq (gateway 1, 2 then worker 3).
+TEST(ClientCryptoRegression, EachReceiverHasItsOwnSeqSpaceRegression) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL, rpc116::kBrokerVersionReceiverKeys));
+    auto& c = f.m.cryptoState();
+    EXPECT_EQ(subOf(sealFor(c, 0, 1)).seq, 1u);
+    EXPECT_EQ(subOf(sealFor(c, 0, 2)).seq, 2u);
+    EXPECT_EQ(subOf(sealFor(c, 1, 3)).seq, 1u) << "worker 0's first frame starts its own seq space";
+    EXPECT_EQ(subOf(sealFor(c, 1, 4)).seq, 2u);
+    EXPECT_EQ(subOf(sealFor(c, 64, 5)).seq, 1u) << "the top worker (64 workers) has a slot";
+    EXPECT_EQ(subOf(sealFor(c, 0, 6)).seq, 3u);
+    EXPECT_TRUE(sealFor(c, 65, 7).empty()) << "a receiver id above the broker's max worker count is refused";
+    EXPECT_TRUE(sealFor(c, 255, 8).empty());
+    EXPECT_EQ(subOf(sealFor(c, 1, 9)).seq, 3u) << "a refused seal consumes no seq anywhere";
+}
+
+// A legacy session (broker below 7, or client below 12) seals exactly as before #116: senderId 0, the raw c2b key and
+// one seq space, whatever receiver id the caller names.
+TEST(ClientCryptoRegression, ALegacySessionSealsByteIdenticallyRegression) {
+    for (const bool oldBroker : {true, false}) {
+        FrameFixture f;
+        ASSERT_TRUE(f.srv.valid());
+        if (oldBroker) {
+            ASSERT_TRUE(f.established(1'000'000'000LL, rpc116::kBrokerVersionReceiverKeys - 1));
+        } else {
+            // A client pinned below 12 against a new broker.
+            sm::SessionConfig cfg;
+            cfg.egressChannel = "aeron:udp?endpoint=client:40456";
+            cfg.offerCrypto   = true;
+            cfg.tlsTrustPem   = f.caPem;
+            cfg.tlsExpectHost = "localhost";
+            cfg.clientVersion = rpc116::kClientVersionReceiverKeys - 1;
+            FakeIo io;
+            sm::SessionMachine m(io, cfg);
+            m.connect(1'000'000'000LL);
+            ASSERT_TRUE(driveHandshake(m, io, f.srv, FrameFixture::kSessionId, 1'000'000'001LL, nullptr,
+                                       rpc116::kBrokerVersionReceiverKeys));
+            EXPECT_FALSE(m.cryptoState().receiverKeys) << "client 11 x broker 7: legacy";
+            const auto keys = f.srv.exportKeys(m.cryptoState().cipher, FrameFixture::kSessionId);
+            const auto a = sealFor(m.cryptoState(), 3, 1);
+            EXPECT_EQ(subOf(a).senderId, 0);
+            EXPECT_EQ(subOf(a).seq, 1u);
+            EXPECT_TRUE(opensUnder(keys.c2b, keys.c2bPrefix, keys.cipher, a));
+            continue;
+        }
+        EXPECT_FALSE(f.m.cryptoState().receiverKeys) << "client 12 x broker 6: legacy";
+        const auto keys = f.srv.exportKeys(f.m.cryptoState().cipher, FrameFixture::kSessionId);
+        // The pre-#116 bytes: senderId 0, seq 1 then 2, sealed under the raw c2b key.
+        const auto a = sealFor(f.m.cryptoState(), 3, 1);
+        const auto b = sealFor(f.m.cryptoState(), 0, 2);
+        cr::AeadCipher ref(keys.cipher, keys.c2b, keys.c2bPrefix);
+        const auto expect = [&](uint64_t seq, int64_t corr) {
+            const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, corr, "receiver-bound");
+            std::vector<uint8_t> out(plain.size() + rpc116::kCryptoOverhead);
+            std::memcpy(out.data(), plain.data(), rpc116::MessageHeader::ENCODED_SIZE);
+            rpc116::CryptoSubHeader sub;
+            sub.cipher = static_cast<uint8_t>(keys.cipher);
+            sub.seq = seq;
+            sub.encode(out.data() + rpc116::MessageHeader::ENCODED_SIZE);
+            const std::size_t n = ref.seal(seq, out.data(), rpc116::kCryptoHeaderBytes,
+                                           plain.data() + rpc116::MessageHeader::ENCODED_SIZE,
+                                           plain.size() - rpc116::MessageHeader::ENCODED_SIZE,
+                                           out.data() + rpc116::kCryptoHeaderBytes);
+            out.resize(rpc116::kCryptoHeaderBytes + n);
+            return out;
+        };
+        EXPECT_EQ(a, expect(1, 1)) << "receiver id ignored: byte-identical to the legacy seal";
+        EXPECT_EQ(b, expect(2, 2));
     }
 }

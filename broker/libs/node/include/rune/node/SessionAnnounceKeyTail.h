@@ -33,6 +33,10 @@
 //     worker opens the client's produce frames under the exact same c2b
 //     key the gateway uses to open the client's control frames (each still
 //     keeps its OWN replay window — see RecordsOpen.h's doc comment).
+//     Issue #116: for a session whose client is >= 12 (receiver keys) this
+//     is instead THIS worker's own receiver key, deriveReceiverKey(c2b,
+//     workerId+1) (SessionAnnouncer::announce) — the raw key above stays the
+//     legacy (< 12) contract.  Same bytes on the wire either way.
 //
 // Zero bytes added for a plaintext session: Worker::enqueueOp only calls
 // encodeSessionAnnounceCryptoTail() when the op is encrypted; a plaintext

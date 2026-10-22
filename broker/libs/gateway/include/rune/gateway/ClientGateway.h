@@ -3153,6 +3153,8 @@ public:
         return i - from;
     }
     bool clientFrameHeldForTest(const uint8_t* buf, std::size_t len) { return produceFrameHeld_(buf, len); }
+    /// Issue #116: encrypted client frames dropped because they name another receiver (a worker-bound frame).
+    [[nodiscard]] uint64_t c2bWrongReceiverDropsForTest() const noexcept { return c2bWrongReceiverDrops_; }
     /// Test-only: a session's crypto state (install a c2b key to drive encrypted ingress); null = unknown.
     [[nodiscard]] CryptoState* sessionCryptoForTest(int64_t sid) noexcept {
         Session* s = sessions_.find(sid);
@@ -3476,6 +3478,7 @@ private:
     // END of the object so no hot member's offset moves.
     uint64_t rejectedRequests_      = 0;       // answered with an error instead of dropped
     uint64_t unanswerableFrames_    = 0;       // dropped: no header / no session / no response type
+    uint64_t c2bWrongReceiverDrops_ = 0;       // issue #116: encrypted frames naming another receiver (control thread)
     uint64_t spillExpiries_         = 0;       // sessions expired because the egress spill was full
     uint64_t spillExpiryDrops_      = 0;       // answers to an expiring session (it gets SessionExpired)
     uint64_t spillExpiryNotified_   = 0;       // ... whose SessionExpired was delivered

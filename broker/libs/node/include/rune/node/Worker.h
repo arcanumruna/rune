@@ -111,6 +111,7 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/Protocol.h>  // E5.1.3: pc::ErrorCode enum (replaces magic literals)
+#include <rune/protocol/client/CryptoEnvelope.h>  // issue #116: CryptoSubHeader (the c2b receiver id)
 #include <rune/codec/Validator.h>
 #include <rune/codec/Serialize.h>
 #include <rune/codec/FilterPredicate.h>   // Phase 2c: CompiledFilter
@@ -746,6 +747,8 @@ public:
 
     /// X103: produce frames this worker dropped because they failed to open, and the log lines the 1/1024 limit swallowed.
     [[nodiscard]] uint64_t decryptFailuresForTest() const noexcept { return decryptFailures_; }
+    /// Issue #116: produce frames dropped because their CryptoSubHeader names another receiver (worker thread).
+    [[nodiscard]] uint64_t c2bWrongReceiverDropsForTest() const noexcept { return c2bWrongReceiverDrops_; }
     [[nodiscard]] uint64_t unauthLogSuppressed() const noexcept { return unauthLog_.suppressed(); }
     [[nodiscard]] bool enforcingForTest() const noexcept { return std::holds_alternative<Enforcing>(enforcement_); }
     /// D8d: per-session direct (worker-ingress) outstanding-ack budget (cold;
@@ -985,9 +988,12 @@ public:
         std::optional<rune::crypto::AeadCipher>  send;      ///< this worker's own per-sender b2c cipher (egress)
         uint64_t                                 sendSeq   = 0;   ///< this worker's OWN counter (independent of the gateway's / other workers')
         uint8_t                                  cipher    = 0;   ///< rune::crypto::Cipher value (shared by both directions)
-        std::optional<rune::crypto::AeadCipher>  recv;      ///< this session's c2b ingress cipher (shared across every worker; one sender)
+        std::optional<rune::crypto::AeadCipher>  recv;      ///< this session's c2b ingress cipher (legacy: the shared raw key; #116: this worker's receiver key)
         uint64_t                                 recvSeq    = 0;  ///< this worker's OWN replay-window high-water seq (ingress)
         uint64_t                                 recvWindow = 0;  ///< this worker's OWN replay-window bitmap (ingress)
+        /// Issue #116: the session's client (>= 12) binds each c2b frame to one receiver: `recv` is keyed
+        /// deriveReceiverKey(c2b, workerId+1) and a frame naming another receiver is dropped before any AEAD.
+        bool                                     receiverKeys = false;
     };
 
     /// Test-only: the worker-local subscription table (worker-thread state).
@@ -2788,6 +2794,10 @@ private:
             cr->recvSeq    = 0;    // fresh replay window for THIS session on THIS worker (ingress)
             cr->recvWindow = 0;
             cr->recv.reset();      // fail closed by default: no cipher until proven valid below
+            // Issue #116: the session binds c2b frames to one receiver (SessionAnnouncer then shipped THIS worker's
+            // own receiver key, deriveReceiverKey(c2b, workerId_+1)).
+            cr->receiverKeys = rune::protocol::client::sessionUsesReceiverKeys(
+                version, rune::protocol::client::kBrokerVersion);
             if (!decoded) [[unlikely]] {
                 // Fail closed: a truncated/garbage tail must never be treated
                 // as "this session is fine, push plaintext" — the entry stays
@@ -2824,8 +2834,9 @@ private:
                 // cr->send empty; the push path parks, never plaintext.
 
                 // Task 22: the session's c2b ingress key — the SAME bytes on
-                // every worker (no per-worker derivation; see
-                // SessionAnnounceKeyTail.h's doc comment). `c2bKeyValid`
+                // every worker for a legacy session; issue #116: this worker's
+                // OWN receiver key for a receiver-key session (see
+                // SessionAnnouncer::announce). `c2bKeyValid`
                 // mirrors `senderKeyValid`'s fail-closed contract.
                 if (c2bKeyValid) {
                     rune::crypto::AeadKey ingressKey{};
@@ -7920,7 +7931,18 @@ private:
     }
     uint64_t controlBatchRefusals_ = 0;
     uint64_t decryptFailures_ = 0;          ///< X103: produce frames dropped for failing to open (worker thread)
+    uint64_t c2bWrongReceiverDrops_ = 0;    ///< issue #116: produce frames naming another receiver (worker thread)
     UnauthLogLimiter unauthLog_;            ///< X103: rate limit of the log lines an unauthenticated sender can drive
+
+    /// Issue #116: does this encrypted c2b frame name THIS worker as its receiver (CryptoSubHeader.senderId ==
+    /// workerId_ + 1)?  A frame too short for a subheader answers true: the open below rejects it as before.
+    [[nodiscard]] bool c2bForThisWorker_(const uint8_t* data, std::size_t len) const noexcept {
+        namespace pc = rune::protocol::client;
+        if (len < pc::kCryptoHeaderBytes) return true;
+        const auto sub = pc::CryptoSubHeader::decode(data + pc::MessageHeader::ENCODED_SIZE,
+                                                     len - pc::MessageHeader::ENCODED_SIZE);
+        return sub && sub->senderId == static_cast<uint8_t>(workerId_ + 1);
+    }
 
     int handleWorkerIngressFrame_(const uint8_t* data, std::size_t len,
                                   int64_t nowNs, uint8_t directAck = 0) {
@@ -7949,6 +7971,18 @@ private:
         if (!sessionCrypto_.empty() && len >= kProduceSessionIdEnd) [[unlikely]] {
             WorkerSessionCrypto* cr = findSessionCrypto_(produceSessionIdOf_(data));
             if (cr) [[unlikely]] {
+                // Issue #116: a receiver-key session's frame names its receiver (CryptoSubHeader.senderId, in the
+                // AAD; clear).  A frame for the gateway or another worker is dropped BEFORE any AEAD and commits no
+                // seq (it was never this worker's to open) - never a trial decrypt under another key.
+                if (cr->receiverKeys && !c2bForThisWorker_(data, len)) [[unlikely]] {
+                    if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
+                    ++c2bWrongReceiverDrops_;
+                    if (unauthLog_.due(0)) [[unlikely]]
+                        spdlog::warn("Worker {}: WorkerIngress: encrypted produce for another receiver (session={}, "
+                                     "len={}); dropping (wrong-receiver drops so far {})",
+                                     workerId_, produceSessionIdOf_(data), len, c2bWrongReceiverDrops_);
+                    return 0;
+                }
                 openCtx.recv       = cr->recv.has_value() ? &*cr->recv : nullptr;
                 openCtx.recvSeq    = &cr->recvSeq;
                 openCtx.recvWindow = &cr->recvWindow;

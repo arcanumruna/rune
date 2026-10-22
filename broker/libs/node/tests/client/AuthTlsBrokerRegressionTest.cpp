@@ -325,11 +325,15 @@ TEST(AuthSessionBindingRegression, APlaintextProduceNamingAnEncryptedSessionIsNe
         ASSERT_TRUE(attacker.raw().produce(b.channel(), AuthWireClient::kClientStream, sid, 9100 + i, orders.topicId, 0,
                                            1, batch));
     }
-    // Event-driven: the worker has seen (and refused to open) every clear frame sent to its ingress.
+    // Event-driven: the worker has seen (and refused to open) every clear frame sent to its ingress.  Issue #116: a
+    // receiver-key session's clear frame is refused before the AEAD when its would-be subheader names another receiver
+    // (counted as a wrong-receiver drop), else by the AEAD itself (a decrypt failure) - either way never opened.
     const auto dl = std::chrono::steady_clock::now() + 20s;
     uint64_t refused = 0;
     while (std::chrono::steady_clock::now() < dl &&
-           (refused = b.node().onWorkerThreadForTest(0, [](Worker& wk) { return wk.decryptFailuresForTest(); })) < 4) {
+           (refused = b.node().onWorkerThreadForTest(0, [](Worker& wk) {
+                return wk.decryptFailuresForTest() + wk.c2bWrongReceiverDropsForTest();
+            })) < 4) {
         ws1->doWork();
     }
     EXPECT_GE(refused, 4u) << "the worker never saw the clear produces (or opened them)";

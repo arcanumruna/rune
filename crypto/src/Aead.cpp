@@ -54,18 +54,16 @@ long AeadCipher::open(uint64_t seq,const uint8_t* aad,size_t aadLen,
 namespace {
 constexpr char kSenderInfoPrefix[] = "rune-b2c-sender"; // 15 ASCII bytes, no NUL
 constexpr size_t kSenderInfoPrefixLen = sizeof(kSenderInfoPrefix) - 1;
-}
+constexpr char kReceiverInfoPrefix[] = "rune-c2b-receiver"; // 17 ASCII bytes, no NUL (issue #116)
+constexpr size_t kReceiverInfoPrefixLen = sizeof(kReceiverInfoPrefix) - 1;
+static_assert(kReceiverInfoPrefixLen == 17);
 
-bool deriveSenderKey(const AeadKey& b2c, uint8_t senderId, AeadKey& out) noexcept {
-  if (senderId == 0) {
-    // senderId 0 is the gateway: byte-identical to the already-shipped b2c key, no KDF.
-    std::memcpy(out.bytes, b2c.bytes, sizeof(out.bytes));
-    return true;
-  }
-
-  uint8_t info[kSenderInfoPrefixLen + 1];
-  std::memcpy(info, kSenderInfoPrefix, kSenderInfoPrefixLen);
-  info[kSenderInfoPrefixLen] = senderId;
+// HKDF-SHA256 expand-only of `key` with info = prefix || id.  Fail closed: false leaves `out` unusable.
+bool expandWithId(const AeadKey& key, const char* prefix, size_t prefixLen, uint8_t id, AeadKey& out) noexcept {
+  uint8_t info[32];
+  if (prefixLen + 1 > sizeof(info)) return false;
+  std::memcpy(info, prefix, prefixLen);
+  info[prefixLen] = id;
 
   EVP_KDF* kdf = EVP_KDF_fetch(nullptr, "HKDF", nullptr);
   if (!kdf) return false;
@@ -78,8 +76,8 @@ bool deriveSenderKey(const AeadKey& b2c, uint8_t senderId, AeadKey& out) noexcep
     OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST, const_cast<char*>("SHA256"), 0),
     OSSL_PARAM_construct_int(OSSL_KDF_PARAM_MODE, &mode),
     OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY,
-        const_cast<uint8_t*>(b2c.bytes), sizeof(b2c.bytes)),
-    OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO, info, sizeof(info)),
+        const_cast<uint8_t*>(key.bytes), sizeof(key.bytes)),
+    OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO, info, prefixLen + 1),
     OSSL_PARAM_construct_end(),
   };
 
@@ -88,5 +86,24 @@ bool deriveSenderKey(const AeadKey& b2c, uint8_t senderId, AeadKey& out) noexcep
   bool ok = EVP_KDF_derive(kctx, out.bytes, sizeof(out.bytes), params) == 1;
   EVP_KDF_CTX_free(kctx);
   return ok;
+}
+}
+
+bool deriveReceiverKey(const AeadKey& c2b, uint8_t receiverId, AeadKey& out) noexcept {
+  if (receiverId == 0) {
+    // receiverId 0 is the gateway: byte-identical to the raw c2b key, no KDF.
+    std::memcpy(out.bytes, c2b.bytes, sizeof(out.bytes));
+    return true;
+  }
+  return expandWithId(c2b, kReceiverInfoPrefix, kReceiverInfoPrefixLen, receiverId, out);
+}
+
+bool deriveSenderKey(const AeadKey& b2c, uint8_t senderId, AeadKey& out) noexcept {
+  if (senderId == 0) {
+    // senderId 0 is the gateway: byte-identical to the already-shipped b2c key, no KDF.
+    std::memcpy(out.bytes, b2c.bytes, sizeof(out.bytes));
+    return true;
+  }
+  return expandWithId(b2c, kSenderInfoPrefix, kSenderInfoPrefixLen, senderId, out);
 }
 }
