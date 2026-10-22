@@ -948,6 +948,50 @@ TEST(MarkerRetryRegression, EndTxnWaitingForItsPrepareRecordIsAnsweredOkWhenTheR
     EXPECT_EQ(T.controlFrames.size(), 1u) << "the EndTxn was answered more than once";
 }
 
+// #556: a Prepare* append refused (__transaction_state ISR < minIsr) used to leave the EndTxn unanswered (gate pushed,
+// return 0).  Now it is answered NotCoordinator (retriable) like every refused put, the coordinator keeps appending the
+// decision and dispatches the markers once it commits; retries see 27 until the markers land, then the idempotent OK.
+static void endTxnWithRefusedPrepareIsAnsweredRetriably(bool commit) {
+    TxnRig T(/*minIsr=*/1, /*withStore=*/true);
+    const int64_t rcSub = T.m.subscribe(T.sid, /*read_committed*/1);
+    ASSERT_GT(rcSub, 0);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
+    T.stateReplica->setMinIsrForTest(2);                     // ISR {1} < 2: every __transaction_state append refused
+    const tx::TxnState prepare = commit ? tx::TxnState::PrepareCommit : tx::TxnState::PrepareAbort;
+    const tx::TxnState complete = commit ? tx::TxnState::CompleteCommit : tx::TxnState::CompleteAbort;
+    ASSERT_EQ(T.endTxn(commit), kNotCoordinator) << "a refused Prepare* append must be answered NotCoordinator, not deferred";
+    int64_t now = 10;
+    for (int i = 0; i < 300; ++i, now += 10'000'000) { (void)T.tcs->doWork(now); T.m.runWorker(now); }   // 3 s
+    EXPECT_TRUE(T.controlFrames.empty()) << "an unsolicited EndTxn frame was sent while the append is refused";
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), prepare);
+    EXPECT_EQ(T.endTxn(commit), kConcurrent) << "a same-direction retry sees ConcurrentTransactions";
+
+    T.stateReplica->setMinIsrForTest(1);                     // the decision can be made durable now
+    int i = 0;
+    for (; i < 400 && T.tcs->txnStateForTest(T.txnId) != complete; ++i, now += 50'000'000) {
+        (void)T.tcs->doWork(now);
+        T.m.runWorker(now);
+    }
+    ASSERT_LT(i, 400) << "the markers never landed once the Prepare* append could commit";
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), complete);
+    EXPECT_EQ(T.endTxn(commit), 0) << "the retry is answered with the idempotent OK";
+    T.m.push(16, now);
+    EXPECT_EQ(T.m.delivered(rcSub, 0), commit) << "read_committed visibility of the batch";
+    EXPECT_TRUE(T.controlFrames.empty()) << "an unsolicited EndTxn frame for the original request";
+}
+
+TEST(MarkerRetryRegression, EndTxnWhosePrepareAppendIsRefusedIsAnsweredRetriablyRegression) {
+    endTxnWithRefusedPrepareIsAnsweredRetriably(/*commit=*/true);
+}
+
+TEST(MarkerRetryRegression, EndTxnAbortWhosePrepareAppendIsRefusedIsAnsweredRetriablyRegression) {
+    endTxnWithRefusedPrepareIsAnsweredRetriably(/*commit=*/false);
+}
+
 // ============================================================================
 // I4 (+m3, m4) — coordinator failover, durable completion, EndTxn table.
 // ============================================================================

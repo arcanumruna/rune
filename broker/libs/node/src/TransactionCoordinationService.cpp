@@ -1014,10 +1014,16 @@ size_t TransactionCoordinationService::handleEndTxn_(
             // #358 class: the markers are written only once the Prepare* record is committed; until then the
             // EndTxn answer waits for that record too (doWork opens the gate and answers OK).
             if (!gateOpen_(g)) {
+                // #556: a refused Prepare* append is answered NotCoordinator now (finishRequest_), like every refused
+                // put; the gate keeps appending it on each doWork and dispatches the markers once it commits.  The
+                // client's retry sees 27 until the markers land, then the idempotent OK.
+                const bool refused = requestPutRefused_;
+                g.respond = !refused;
                 prepareGates_.push_back(std::move(g));
-                return 0;
+                if (!refused) return 0;
+            } else {
+                dispatchMarkers_(g.txnId, g.producerId, g.producerEpoch, g.coordinatorEpoch, g.commit, g.parts);
             }
-            dispatchMarkers_(g.txnId, g.producerId, g.producerEpoch, g.coordinatorEpoch, g.commit, g.parts);
         }
     }
 
