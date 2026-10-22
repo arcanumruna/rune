@@ -691,8 +691,9 @@ int AdminWorker::stepSecurityServing_(int64_t nowNs) {
     const int32_t vEpoch = caughtUp ? securityCatchUp_.verdictEpoch() : -1;
     const bool vLeader = caughtUp && securityCatchUp_.verdictAsLeader();
     // #205: the events this broker knows exist - its own log end (a follower appended them before the leader could
-    // commit them, acks=all) or the leader's HW, whichever is further.  Posted in the pass that appended them, so the
-    // control thread learns of an event before the fetch that acknowledges it can leave this broker.
+    // commit them, acks=all) or the leader's HW, whichever is further.  Posted in the pass that appended them - AFTER a
+    // follower's fast-ack of them has left (it is sent inside the frame dispatch); the gateway also treats a view that
+    // moved between the two login legs as superseded, which covers that window unless a thread stalls in it (#518).
     const int64_t knownEnd = in.present ? std::max<int64_t>(securityReplica_->logEndOffset(), in.highWatermark) : -1;
     const bool verdictSame = securityServingPosted_ == (caughtUp ? 1 : 0) && securityServingPostedEpoch_ == vEpoch &&
                              securityServingPostedLeader_ == vLeader;

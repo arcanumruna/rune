@@ -386,6 +386,33 @@ TEST(SecurityAnswerGateRegression, AMalformedHaltedFrameStillHaltsTheMirrorRegre
     n.stop();
 }
 
+// #203 adversarial review (PR #516): the third admin-to-control security frame.  kA2cSecurityServing is posted only on
+// change, so a skipped one is lost for good - a "not caught up" verdict dropped leaves logins served from a stale view
+// (fail-open).  Every malformed shape halts the mirror: the pre-#205 14-byte frame (no knownEnd), one byte too long, an
+// out-of-range bool.  A well-formed frame after the halt never un-halts it.
+TEST(SecurityAnswerGateRegression, AMalformedServingFrameHaltsTheMirrorAdversarialRegression) {
+    for (const auto& [what, frame] : std::vector<std::pair<const char*, std::vector<uint8_t>>>{
+             {"old 14-byte layout", std::vector<uint8_t>(kSecurityServingWireLen - 8, 0)},
+             {"one byte too long", std::vector<uint8_t>(kSecurityServingWireLen + 1, 0)},
+             {"caughtUp byte 2", [] { std::vector<uint8_t> f(kSecurityServingWireLen, 0); f[0] = 2; return f; }()},
+             {"empty", std::vector<uint8_t>{}}}) {
+        TmpDir dir{"sec_serving_malformed"};
+        const Ports ports = Ports::discover(1);
+        BrokerNode n{makeConfig(1, dir.path, ports, 1, Mode::Shard)};
+        n.start();
+        ASSERT_TRUE(n.awaitLeader(10'000ms)) << what;
+        ASSERT_FALSE(n.securityViewForTest().halted) << what;
+        n.injectSecurityFrameOnControlForTest(static_cast<uint16_t>(kA2cSecurityServing), frame);
+        EXPECT_TRUE(n.securityViewForTest().halted) << what << ": an unparseable verdict fails closed, never skipped";
+        EXPECT_GE(n.securityMetricsForTest().halted, 1) << what;
+        std::vector<uint8_t> good(kSecurityServingWireLen);
+        writeSecurityServing(good.data(), true, 0, 1, true, 0);
+        n.injectSecurityFrameOnControlForTest(static_cast<uint16_t>(kA2cSecurityServing), good);
+        EXPECT_TRUE(n.securityViewForTest().halted) << what << ": a later good verdict never un-halts the mirror";
+        n.stop();
+    }
+}
+
 // Review C (parked item): a `__security` leader whose APPLIER halted (local damage) reports it in its node-control
 // register (kNodeSecurityHalted); the controller steers the (-7, 0) leadership to a healthy broker, so security DDL
 // works again without restarting anything.

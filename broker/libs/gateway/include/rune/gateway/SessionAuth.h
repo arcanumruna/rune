@@ -40,6 +40,11 @@ struct AuthAwaitingFinal {
     static constexpr uint8_t kSlots = 2;
     uint8_t count = kSlots;                   ///< always 2 on the wire (review A)
     std::array<rune::crypto::scram::Verifier, 2> verifiers;   ///< copies (the view may change before the final leg)
+    /// #205 (PR #516 review): the state the verifiers were copied from - the view's applied offset at the first leg and
+    /// whether it was behind events this broker held then.  A failed proof against a state that was behind, or that
+    /// the view has since moved past, is not a verdict (retriable AuthUnavailable, never the terminal 44).
+    int64_t viewAppliedAtFirst = -1;
+    bool    viewBehindAtFirst = false;
 };
 
 // `loginNonce` (issue #114): the SCRAM combined nonce of the login that authenticated this session - what a change of

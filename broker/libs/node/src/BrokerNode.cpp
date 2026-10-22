@@ -3318,8 +3318,12 @@ void BrokerNode::onSecurityServing_(const uint8_t* p, std::size_t n) {
     int32_t epoch = -1;
     int64_t knownEnd = -1;
     if (!decodeSecurityServing(p, n, caughtUp, leaderHw, epoch, asLeader, knownEnd)) [[unlikely]] {
+        // #203 (PR #516 review): the verdict is posted only on change - a skipped "not caught up" would leave logins
+        // served from a stale view (fail-open) and a skipped knownEnd a lagging view's failures terminal.  Fail closed
+        // like its sibling frames.
+        if (securityView_) { haltSecurityMirrorOnMalformed_("kA2cSecurityServing", n); return; }
         if (adminToControlRejects_++ % 1024 == 0)
-            spdlog::error("BrokerNode[{}]: malformed kA2cSecurityServing (len={}) skipped", config_.nodeId, n);
+            spdlog::error("BrokerNode[{}]: malformed kA2cSecurityServing (len={}) skipped (no security mirror)", config_.nodeId, n);
         return;
     }
     if (securityServing_) securityServing_->onAdminCaughtUp(caughtUp, leaderHw, epoch, asLeader);
@@ -3694,6 +3698,7 @@ void BrokerNode::injectSecurityFrameOnControlForTest(uint16_t tid, std::vector<u
     onControlThreadForTest([this, tid, f = std::move(frame)]() {
         const bool held = std::exchange(heldMirror_.on, false);   // straight to the handler, past the hold
         if (tid == kA2cSecurityHalted) onSecurityHalted_(f.data(), f.size());
+        else if (tid == kA2cSecurityServing) onSecurityServing_(f.data(), f.size());
         else onSecurityApplied_(f.data(), f.size());
         heldMirror_.on = held;
         return 0;

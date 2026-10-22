@@ -1536,8 +1536,9 @@ public:
     /// stashed unapplied - the SecurityView, and with it the D24 answer-gate release, stays where it was; on release
     /// they are applied in order.  Proves no OK leaves before THIS broker enforces the event.
     void holdSecurityMirrorForTest(bool on);
-    /// Test-only (#203), CONTROL thread: hand `frame` to the kA2cSecurityApplied (or, for kA2cSecurityHalted, the halt)
-    /// handler as if it came off the admin-to-control ring, past any mirror hold (held frames stay held).
+    /// Test-only (#203), CONTROL thread: hand `frame` to the kA2cSecurityApplied (or, for kA2cSecurityHalted /
+    /// kA2cSecurityServing, that) handler as if it came off the admin-to-control ring, past any mirror hold (held frames
+    /// stay held).
     void injectSecurityFrameOnControlForTest(uint16_t tid, std::vector<uint8_t> frame);
     // ── Authentication Task 15 test hooks (inter-broker links) ───────────────────────────────────────────────
     /// What the CONTROL thread's PeerLinkAgent / distribution holds (read ON the control thread).

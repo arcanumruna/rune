@@ -8515,6 +8515,8 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
         failLogin_(*session, m->correlationId, 0);
         return;
     }
+    plan.next.viewAppliedAtFirst = securityView_->appliedOffset();   // #205: what the verifiers were copied from
+    plan.next.viewBehindAtFirst  = securityViewBehind_();
     session->auth = std::move(plan.next);
     sendAnswer_(*session, plan.frame.data(), plan.frame.size());
 }
@@ -8565,9 +8567,12 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
                          loginFailureName(*failure));
         // #205: a proof that fails against a view behind events this broker already holds (a just-created user, a
         // just-changed password, a just-enabled user) is not a verdict yet - retriable, never the terminal 44.  Still
-        // counted and throttled.
+        // counted and throttled.  The verifiers were copied at the FIRST leg (PR #516 review): a first leg on a lagging
+        // view, or a view that applied an event between the legs, made the proof fail against a superseded state too.
+        // (These three reasons are only reached with a live, unhalted view.)
         if ((*failure == LoginFailure::BadProof || *failure == LoginFailure::UnknownUser || *failure == LoginFailure::Disabled) &&
-            securityViewBehind_()) [[unlikely]] {
+            (securityViewBehind_() || st->viewBehindAtFirst || st->viewAppliedAtFirst != securityView_->appliedOffset()))
+            [[unlikely]] {
             unavailableLogin_(*session, hdr->correlationId, user);
             return;
         }
