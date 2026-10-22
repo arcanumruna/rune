@@ -62,8 +62,13 @@ std::optional<Denial> authorizeName(const PermissionTable& t, rsec::ResourceType
     return deny(op, type, name);
 }
 
-std::optional<Denial> authorizeTopicOrViewName(const PermissionTable& t, std::string_view name, rsec::Operation op)
+std::optional<Denial> authorizeTopicOrViewName(const PermissionTable& t, std::string_view name, rsec::Operation op,
+                                               const ObjectIndex& index)
 {
+    if (const ObjectEntry* e = index.byName(name)) {   // #128: only the object's own kind's grants count
+        if (t.allowsName(e->type, name, rsec::opBit(op))) return std::nullopt;
+        return deny(op, rsec::ResourceType::Topic, name);
+    }
     if (t.allowsName(rsec::ResourceType::Topic, name, rsec::opBit(op)) ||
         t.allowsName(rsec::ResourceType::View, name, rsec::opBit(op)))
         return std::nullopt;
