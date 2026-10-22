@@ -4221,7 +4221,8 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 // direct path (enqueueSubscribeOp_) and the queued retry (trySubOp_) both use
 // it, so neither can drop a field (the retry used to omit the Subscribe's
 // correlationId — every push then carried 0 — and the replica).
-rune::node::WorkerOp ClientGateway::buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub) const
+rune::node::WorkerOp ClientGateway::buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub,
+                                                      std::span<const uint8_t> filter) const
 {
     rune::storage::Log* log = topicRegistry_ ? topicRegistry_->log(s.topicId, s.partition) : nullptr;
     const rune::replication::PartitionReplica* rep =
@@ -4241,9 +4242,8 @@ rune::node::WorkerOp ClientGateway::buildSubscribeOp_(const BufferedSubscribe& s
     op.logPtr               = log;
     op.replica              = const_cast<rune::replication::PartitionReplica*>(rep);
     op.egressPub            = egressPub;
-    // Phase 2c: the filter rides the op's tail (a view valid for the synchronous enqueue - the record outlives it).
-    if (const auto it = subscriptions_.find(s.subId); it != subscriptions_.end() && !it->second.filter.empty())
-        op.filterBytes = std::span<const uint8_t>(it->second.filter);
+    // Phase 2c: the filter rides the op's tail (a view valid for the synchronous enqueue - the caller's bytes outlive it).
+    op.filterBytes          = filter;
     return op;
 }
 
@@ -4277,14 +4277,18 @@ void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egress
         it->second.cursor = Cursor::AtWorker;
         if (it->second.okOwed) sendOwedSubscribeOk_(s.subId);   // F1: the egress exists: the held OK goes first
     }
-    rune::node::WorkerOp op = buildSubscribeOp_(s, egressPub);
+    // The live record's filter (this enqueue is synchronous); a queued retry carries its own copy, taken below.
+    std::span<const uint8_t> filter;
+    if (const auto it = subscriptions_.find(s.subId); it != subscriptions_.end()) filter = std::span<const uint8_t>(it->second.filter);
+    rune::node::WorkerOp op = buildSubscribeOp_(s, egressPub, filter);
 
     // M5: never dropped — a refused Subscribe (or one behind a queued lifecycle
     // op for the same worker) is queued and retried every doWork, in order.
     const auto w = static_cast<std::size_t>(workerPool_->ownerWorkerId(s.topicId, s.partition));
     const bool behind = w < pendingSubOps_.size() && !pendingSubOps_[w].empty();
     if (behind || !workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op))) {
-        queueSubOp_(w, SubOpSubscribe{s, egressPub == nullptr ? EgressRoute::Mdc : EgressRoute::Unicast});
+        queueSubOp_(w, SubOpSubscribe{s, egressPub == nullptr ? EgressRoute::Mdc : EgressRoute::Unicast,
+                                      std::vector<uint8_t>(filter.begin(), filter.end())});
     }
 }
 
@@ -4331,7 +4335,7 @@ bool ClientGateway::trySubOp_(std::size_t w, const PendingSubOp& p)
                 if (it == sess->recordEgressByWorker.end() || !it->second) return true;   // moot
                 egressPub = it->second.get();
             }
-            rune::node::WorkerOp op = g.buildSubscribeOp_(s, egressPub);  // A-MAJOR-1: correlationId + replica included
+            rune::node::WorkerOp op = g.buildSubscribeOp_(s, egressPub, sp.filter);  // A-MAJOR-1: correlationId + replica included; the filter is the queued copy
             return g.workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op));
         }
         bool operator()(const SubOpFence& f) const

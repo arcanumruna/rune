@@ -1748,7 +1748,10 @@ private:
 
     // Build + route a Subscribe WorkerOp with the resolved egress pub (may be null
     // → MDC fallback).
-    rune::node::WorkerOp buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub) const;
+    /// `filter` is the subscription's filter bytes, supplied by the caller (never looked up here): the direct path passes the
+    /// live record's, the queued retry passes the copy captured when the Subscribe was queued (the gateway may have erased
+    /// the record since). The returned op views `filter`.
+    rune::node::WorkerOp buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub, std::span<const uint8_t> filter) const;
     void enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub);
     void parkAwaitingEgress_(const BufferedSubscribe& s);
     /// A buffered Subscribe leaves the waiter list for the worker, unless its subscription ended while it waited.
@@ -2839,7 +2842,9 @@ private:
     // a session gone meanwhile drops it).
     // Phase 2c (fix-on-sight): the op kind is a variant, not a pair of booleans.
     enum class EgressRoute : uint8_t { Unicast, Mdc };   // Mdc: forwarded with the MDC pub (no unicast)
-    struct SubOpSubscribe    { BufferedSubscribe sub; EgressRoute route = EgressRoute::Unicast; };
+    // `filter`: the filter bytes captured when the Subscribe was queued - the queued op is self-contained, so a gateway
+    // erase of the subscription (Unsubscribe, #109 revoke, topic drop) before the pump cannot turn it into an unfiltered bind.
+    struct SubOpSubscribe    { BufferedSubscribe sub; EgressRoute route = EgressRoute::Unicast; std::vector<uint8_t> filter; };
     // Issue #109: an ENDING Unsubscribe (endCode != 0) - the worker sends ErrorResponse{endCode, endDetail} after its
     // last Records.
     struct SubOpUnsubscribe  { int64_t subId = 0; int32_t topicId = 0; int32_t partition = 0;

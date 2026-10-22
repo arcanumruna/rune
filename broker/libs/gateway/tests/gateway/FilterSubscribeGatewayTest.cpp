@@ -3,7 +3,7 @@
 // A filter is read only from a session >= 11; it is validated against the topic's FilterSchema (installed by
 // onFilterSchema), admitted under the per-(topic, partition) caps, and forwarded to the owning worker in the
 // Subscribe op's tail.  The schema reaches every worker BEFORE any filtered Subscribe (FIFO with the queued ops).
-// Every refusal is answered {InvalidRequest, detail} to a version-10 session; older sessions never see a detail.
+// Every refusal is answered {InvalidRequest, detail} to a version-11 session; older sessions never see a detail.
 //
 // Deterministic: no Aeron, no sleeps; the gateway and the one worker are driven by hand, null-egress test sessions
 // are observed through onEgressFrame (same pattern as SubscribeDedupeTest).
@@ -583,4 +583,35 @@ TEST(GatewayFilterRegression, GroupCarrierSubscribeWithAFilterIsRefusedRegressio
     const Answer old = r.subscribe(v9, 3, worldEq(7));
     EXPECT_EQ(old.r.errorCode, kOk);
     EXPECT_EQ(old.r.subscriptionId, g9);
+}
+
+// Final review I1: a QUEUED filtered Subscribe whose gateway record is forgotten before the pump (Unsubscribe / READ
+// revoked) is still forwarded (its ending Unsubscribe needs it) and must keep its filter: the queued op carries its own copy.
+TEST(GatewayFilterRegression, QueuedFilteredSubscribeForwardedAfterForgetKeepsItsFilterRegression) {
+    int straddled = 0, unfilteredOnWorker = 0;
+    for (int k = 0; k < 48; ++k) {
+        Rig r(true, 1 << 12);
+        r.fillRing();
+        for (int j = 0; j < k; ++j) r.gw.forwardSubscribeForTest(5000 + j, 0, 0, 0, 0, 0, false, false);
+        r.typed();
+        const int64_t sid = r.session();
+        const Answer& a = r.subscribe(sid, 1, worldEq(7));
+        ASSERT_EQ(a.r.errorCode, kOk) << a.detail;
+        const int64_t subA = a.r.subscriptionId;
+        r.unsubscribe(sid, subA);   // the gateway forgets A; its U is queued behind its S
+        for (int i = 0; i < 64; ++i) {
+            r.pool->worker(0).doWork(10 + i);
+            bool onWorker = false;
+            for (const auto& s : r.pool->worker(0).subscriptionsForTest()) onWorker |= s.subscriptionId == subA;
+            const std::string kinds = r.gw.pendingSubOpKindsForTest(0);
+            if (onWorker && kinds.find('U') != std::string::npos) {
+                ++straddled;
+                if (r.pool->worker(0).filterGroupOfSubForTest(subA) == nullptr && r.pool->worker(0).filterBindFailuresForTest() == 0)
+                    ++unfilteredOnWorker;
+            }
+            (void)r.gw.pumpRetryQueuesForTest();
+        }
+    }
+    ASSERT_GT(straddled, 0) << "probe never caught S executed with U still queued";
+    EXPECT_EQ(unfilteredOnWorker, 0) << "a FILTERED subscription ran on the worker UNFILTERED (its filter tail was dropped)";
 }
