@@ -314,6 +314,58 @@ TEST(AuthLoginRegression, LoginLogsNameTheReasonButTheWireDoesNot) {
         << "D12: said once per plaintext session";
 }
 
+// Adversarial review of PR #522 (#131 / #132) over real UDP: first legs abandoned by a Disconnect are charged, and
+// first legs whose finals land inside the throttle's delay are charged too (the refused final is no verdict) - so N
+// parked first legs move the schedule by N failures, not by the 3 verified ones.  The known pair stays usable.
+TEST(AuthLoginRegression, AbandonedAndThrottleRefusedFirstLegsAreChargedOnARealBrokerAdversarialRegression) {
+    AuthBroker b("abandoned");
+    b.bootstrapAdmin();
+    b.createUser("ws1", kPwA);
+    b.createUser("ws2", kPwA);
+    AuthWireClient& w = b.wire();
+    // (a) three first legs ended by a Disconnect: the third failure of the (ws1, host) pair starts its delay.
+    for (int i = 0; i < 3; ++i) {
+        const int64_t sid = w.connect(b.channel());
+        ASSERT_GT(sid, 0);
+        const auto l = w.login(b.channel(), sid, "ws1", {kPwA, kPwA}, 0, /*sendFinal=*/false);
+        ASSERT_TRUE(l.first.has_value()) << i;
+        ASSERT_TRUE(w.raw().disconnect(b.channel(), AuthWireClient::kClientStream, sid));
+    }
+    {
+        const int64_t sid = w.connect(b.channel());
+        ASSERT_GT(sid, 0);
+        const auto limited = w.login(b.channel(), sid, "ws1", {kPwA, kPwA});
+        ASSERT_TRUE(limited.fin.has_value());
+        EXPECT_FALSE(limited.first.has_value()) << "three abandoned first legs put the pair inside its delay";
+        EXPECT_GT(limited.fin->retryAfterMs, 0u);
+    }
+    // (b) eight parked first legs for ws2, then eight wrong finals: 3 verified, 5 refused - and charged.
+    std::vector<AuthWireClient::Login> parked;
+    for (int i = 0; i < 8; ++i) {
+        const int64_t sid = w.connect(b.channel());
+        ASSERT_GT(sid, 0);
+        parked.push_back(w.login(b.channel(), sid, "ws2", {kPwA, kPwA}, 0, /*sendFinal=*/false));
+        ASSERT_TRUE(parked.back().first.has_value()) << i;
+    }
+    int verified = 0, limited = 0;
+    for (auto& l : parked) {
+        w.finish(b.channel(), l, "ws2", {"a wrong guess", "another wrong guess"});
+        ASSERT_TRUE(l.fin.has_value());
+        EXPECT_EQ(l.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+        if (l.fin->retryAfterMs > 0) ++limited; else ++verified;
+    }
+    EXPECT_EQ(verified, 3);
+    EXPECT_EQ(limited, 5);
+    const int64_t sid = w.connect(b.channel());
+    ASSERT_GT(sid, 0);
+    const auto after = w.login(b.channel(), sid, "ws2", {kPwA, kPwA});
+    ASSERT_TRUE(after.fin.has_value());
+    EXPECT_FALSE(after.first.has_value());
+    // 8 pair failures: min(250 ms << 5, 30 s) = 8 s from the last charge; 3 failures alone would be 250 ms.
+    EXPECT_GT(after.fin->retryAfterMs, 4'000u) << "the refused finals' first legs were charged";
+    EXPECT_LE(after.fin->retryAfterMs, 8'000u);
+}
+
 TEST(AuthLoginRegression, CountersCountOkFailedAndThrottled) {
     AuthBroker b("counters");
     b.bootstrapAdmin();   // the admin's one-time login = 1 ok

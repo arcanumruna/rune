@@ -429,6 +429,7 @@ public:
     [[nodiscard]] uint64_t loginsOk() const noexcept { return loginsOk_; }
     [[nodiscard]] uint64_t loginsFailed() const noexcept { return loginsFailed_; }
     [[nodiscard]] uint64_t loginsRateLimited() const noexcept { return loginsRateLimited_; }
+    [[nodiscard]] uint64_t loginsAbandoned() const noexcept { return loginsAbandoned_; }   ///< #132: first legs never finished
     /// The SecurityView applied the event at `offset` (BrokerNode calls this right after the view did) - authentication
     /// Task 14, D25: Refresh -> every affected user's authenticated session recompiles its permission table, ends what
     /// lost READ (explicitly, NotAuthorized), ships its WRITE bits and a lifted must-change-password session becomes
@@ -2419,7 +2420,7 @@ private:
                                                                               std::size_t len) const;
     rune::gateway::LoginThrottle loginThrottle_;
     int64_t  authTimeoutNs_ = 10'000'000'000LL;
-    uint64_t loginsOk_ = 0, loginsFailed_ = 0, loginsRateLimited_ = 0;
+    uint64_t loginsOk_ = 0, loginsFailed_ = 0, loginsRateLimited_ = 0, loginsAbandoned_ = 0;
     // ── authentication Task 14: live security changes ──
     uint64_t sessionsRevoked_ = 0;
     int64_t  securityEnforcedOffset_ = -1;       ///< every event <= this is enforced here (see securityEnforcedOffset())

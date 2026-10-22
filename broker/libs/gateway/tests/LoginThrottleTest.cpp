@@ -28,9 +28,56 @@ TEST(LoginThrottleRegression, TheFirstTwoFailuresAreFreeThenTheDelayDoublesToThe
 
 TEST(LoginThrottleRegression, AttackerAtOneAddressNeverDelaysTheUserAtAnotherRegression) {
     LoginThrottle t;
+    t.onSuccess("ws1", "10.0.0.9", 0);   // the user's own address: a known pair
     for (int i = 0; i < 1000; ++i) t.onFailure("ws1", "203.0.113.7", 0);
     EXPECT_FALSE(t.check("ws1", "203.0.113.7", 0).allowed);
-    EXPECT_TRUE(t.check("ws1", "10.0.0.9", 0).allowed) << "no hard lockout (spec §5)";
+    EXPECT_TRUE(t.check("ws1", "10.0.0.9", 0).allowed) << "no hard lockout (spec §5): a known pair is never delayed";
+    // #131: from an address the user never logged in from, the per-user component delays it - by its low cap only.
+    const auto fresh = t.check("ws1", "192.0.2.1", 0);
+    EXPECT_FALSE(fresh.allowed);
+    EXPECT_LE(fresh.retryAfterMs, 2'000u);
+}
+
+// Issue #131: the source host is attacker-influenced (an IPv6 /64, a forged reply endpoint), so (user, host) and host
+// alone gave every address its own free guesses and its own exponential schedule against one user.
+TEST(LoginThrottleRegression, PerUserBackoffAppliesAcrossSourceHostsRegression) {
+    LoginThrottle t;
+    t.onSuccess("u", "10.0.0.9", 0);   // the real user's own address
+    for (int h = 0; h < 100; ++h)
+        for (int k = 0; k < 3; ++k) t.onFailure("u", "2001:db8::" + std::to_string(h), 0);
+    const auto v = t.check("u", "2001:db8::fresh", 0);
+    ASSERT_FALSE(v.allowed) << "100 hosts x 3 guesses: the next attempt from a fresh host is delayed";
+    EXPECT_GT(v.retryAfterMs, 0u);
+    EXPECT_LE(v.retryAfterMs, static_cast<uint32_t>(LoginThrottle::kMaxUserDelayNs / ms)) << "a low ceiling, not a lockout";
+    EXPECT_TRUE(t.check("u", "2001:db8::fresh", LoginThrottle::kMaxUserDelayNs).allowed) << "waiting the cap out works";
+    EXPECT_TRUE(t.check("u", "10.0.0.9", 0).allowed) << "a success from a known (user, host) pair bypasses it";
+    EXPECT_TRUE(t.check("other", "2001:db8::fresh", 0).allowed) << "per user: another user is untouched";
+    // The first kFreeUserFailures of a user are free across hosts.
+    LoginThrottle f;
+    for (uint32_t i = 0; i < LoginThrottle::kFreeUserFailures; ++i) f.onFailure("v", "198.51.100." + std::to_string(i), 0);
+    EXPECT_TRUE(f.check("v", "192.0.2.200", 0).allowed);
+    f.onFailure("v", "198.51.100.250", 0);
+    EXPECT_FALSE(f.check("v", "192.0.2.200", 0).allowed);
+}
+
+// Issue #131: the tables were keyed by an unkeyed FNV, so an attacker could grind names into one 8-slot probe window
+// and evict its own entries (a fresh schedule).  The hash is keyed per process: two throttles place names differently.
+TEST(LoginThrottleRegression, TableKeysAreNotPredictableRegression) {
+    LoginThrottle a, b;
+    int differ = 0;
+    for (int i = 0; i < 32; ++i) {
+        const std::string u = "user" + std::to_string(i);
+        differ += a.pairSlotForTest(u, "10.0.0.9") != b.pairSlotForTest(u, "10.0.0.9");
+    }
+    EXPECT_GE(differ, 28) << "random keys: the same names land in unrelated slots (a 1/4096 chance each to agree)";
+    // A fixed key is deterministic, and the two parts of a key never run into each other.
+    LoginThrottle::HashKey k{};
+    k[0] = 1;
+    LoginThrottle c(k), d(k);
+    EXPECT_EQ(c.pairSlotForTest("ws1", "10.0.0.9"), d.pairSlotForTest("ws1", "10.0.0.9"));
+    for (int i = 0; i < 3; ++i) c.onFailure("ab", "c", 0);
+    EXPECT_FALSE(c.check("ab", "c", 0).allowed);
+    EXPECT_TRUE(c.check("a", "bc", 0).allowed) << "user|host is not ambiguous";
 }
 
 TEST(LoginThrottleRegression, ManyUsersFromOneAddressAreThrottledPerAddress) {
@@ -44,7 +91,7 @@ TEST(LoginThrottleRegression, ManyUsersFromOneAddressAreThrottledPerAddress) {
 TEST(LoginThrottleRegression, SuccessResetsThePairAndIdleEntriesAreForgotten) {
     LoginThrottle t;
     for (int i = 0; i < 5; ++i) t.onFailure("ws1", "h", 0);
-    t.onSuccess("ws1", "h");
+    t.onSuccess("ws1", "h", 0);
     EXPECT_TRUE(t.check("ws1", "h", 0).allowed);
     for (int i = 0; i < 5; ++i) t.onFailure("ws2", "h2", 0);
     EXPECT_FALSE(t.check("ws2", "h2", 0).allowed);
@@ -101,4 +148,60 @@ TEST(LoginThrottleRegression, SourceHostOfAnAeronImageIsTheHostNeverGarbageRegre
     }
     EXPECT_EQ(host, "192.168.7.7");
     EXPECT_EQ(hostOfSourceIdentity(std::string("203.0.113.5:1")), "203.0.113.5");   // a temporary argument
+}
+
+// ── Adversarial review of PR #522 (#131) ───────────────────────────────────────────────────────────────────────────
+// The user component is capped at 2 s whatever the campaign's size (100 000 failures over 100 000 hosts: the shift
+// saturates, never overflows), a known pair stays exempt, and a known pair idle past kForgetAfterNs is no longer known
+// (it falls back to the capped user component - still never a lockout).
+TEST(LoginThrottleRegression, TheUserComponentNeverExceedsItsCapAndAKnownPairIsForgottenWhenIdleAdversarialRegression) {
+    LoginThrottle t;
+    t.onSuccess("victim", "10.0.0.9", 0);
+    for (int i = 0; i < 100'000; ++i)
+        t.onFailure("victim", "2001:db8::" + std::to_string(i), 0);
+    const auto fresh = t.check("victim", "192.0.2.1", 0);
+    ASSERT_FALSE(fresh.allowed);
+    EXPECT_EQ(fresh.retryAfterMs, static_cast<uint32_t>(LoginThrottle::kMaxUserDelayNs / ms));
+    EXPECT_TRUE(t.check("victim", "10.0.0.9", 0).allowed) << "known pair";
+    // The campaign goes on just before the known pair is forgotten ...
+    const int64_t late = LoginThrottle::kForgetAfterNs + 1;
+    t.onFailure("victim", "2001:db8::ffff:1", late - 1);
+    const auto home = t.check("victim", "10.0.0.9", late);
+    EXPECT_FALSE(home.allowed) << "a known pair is forgotten after kForgetAfterNs without a success";
+    EXPECT_LE(home.retryAfterMs, static_cast<uint32_t>(LoginThrottle::kMaxUserDelayNs / ms));
+    // ... and a success at home makes it known again at once.
+    t.onSuccess("victim", "10.0.0.9", late);
+    EXPECT_TRUE(t.check("victim", "10.0.0.9", late).allowed);
+}
+
+// Table pressure (the known-pair table is 4096 entries, oldest-of-window eviction): an attacker with its OWN account
+// logging in from 20 000 hosts can push the victim's known pair out.  The damage is bounded by the user cap: the victim
+// at home is delayed 2 s at most, never locked out, and its own next success restores the exemption.  (The eviction
+// itself is filed as a hardening issue; this test pins the bound.)
+TEST(LoginThrottleRegression, KnownPairTablePressureBoundsTheVictimByTheUserCapAdversarialRegression) {
+    LoginThrottle t;
+    int64_t now = 1;
+    t.onSuccess("victim", "10.0.0.9", now);
+    for (int i = 0; i < 20'000; ++i) t.onSuccess("attacker", "2001:db8::" + std::to_string(i), ++now);
+    for (int i = 0; i < 50; ++i) t.onFailure("victim", "198.51.100." + std::to_string(i), now);
+    const auto home = t.check("victim", "10.0.0.9", now);
+    if (!home.allowed) EXPECT_LE(home.retryAfterMs, static_cast<uint32_t>(LoginThrottle::kMaxUserDelayNs / ms));
+    EXPECT_TRUE(t.check("victim", "10.0.0.9", now + LoginThrottle::kMaxUserDelayNs).allowed) << "never a lockout";
+    t.onSuccess("victim", "10.0.0.9", now + LoginThrottle::kMaxUserDelayNs);
+    t.onFailure("victim", "198.51.100.200", now + LoginThrottle::kMaxUserDelayNs);
+    EXPECT_TRUE(t.check("victim", "10.0.0.9", now + LoginThrottle::kMaxUserDelayNs).allowed) << "known again";
+}
+
+// Input bounds of the keys: an empty user, an empty host (IPC), a 1 MiB name and a name with an embedded NUL are all
+// distinct keys and none of them aliases another's schedule.
+TEST(LoginThrottleRegression, EmptyHugeAndNulKeysNeverAliasAdversarialRegression) {
+    LoginThrottle t;
+    const std::string huge(1u << 20, 'u'), nul("a\0b", 3);
+    for (int k = 0; k < 3; ++k) { t.onFailure("", "", 0); t.onFailure(huge, "h1", 0); t.onFailure(nul, "h2", 0); }
+    EXPECT_FALSE(t.check("", "", 0).allowed);
+    EXPECT_FALSE(t.check(huge, "h1", 0).allowed);
+    EXPECT_FALSE(t.check(nul, "h2", 0).allowed);
+    EXPECT_TRUE(t.check("a", "h2", 0).allowed) << "the NUL is part of the name";
+    EXPECT_TRUE(t.check(huge.substr(1), "h1", 0).allowed) << "one byte shorter is another name";
+    EXPECT_TRUE(t.check("", "h3", 0).allowed) << "the empty user's pair is per host";
 }

@@ -1490,6 +1490,14 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
 {
     Session* s = sessions_.find(sid);
     if (!s) return false;                     // m4: unknown → no worker traffic
+    // Issue #132: a first leg answered (a salt revealed) and never followed by a final is a failed attempt - whatever
+    // ends the session (the auth deadline, a disconnect, an eviction).  Charged once: a final leg sets finalLegSeen.
+    if (auto* awaitingFinal = std::get_if<rune::gateway::AuthAwaitingFinal>(&s->auth);
+        awaitingFinal != nullptr && !awaitingFinal->finalLegSeen) [[unlikely]] {
+        awaitingFinal->finalLegSeen = true;
+        ++loginsAbandoned_;
+        loginThrottle_.onFailure(awaitingFinal->user, s->sourceHost, nowNs_);
+    }
     // Fix round 2 (finding 2): tell the client before its publication goes —
     // the rune client reconnects only on SessionExpired / UnknownSession.
     if (notifyExpired) sendSessionExpired_(nullptr, s, sid);
@@ -8528,7 +8536,7 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     if (!hdr) { noteUnanswerable_(buf, len, "AuthClientFinal: no decodable header"); return; }
     Session* session = sessions_.find(hdr->sessionId);
     if (!session) { noteUnanswerable_(buf, len, "AuthClientFinal for unknown session"); return; }
-    const auto* st = std::get_if<AuthAwaitingFinal>(&session->auth);
+    auto* const st = std::get_if<AuthAwaitingFinal>(&session->auth);
     if (st == nullptr) {
         pc::AuthServerFinal f;
         f.sessionId = hdr->sessionId; f.correlationId = hdr->correlationId;
@@ -8540,8 +8548,9 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     const std::string user = st->user;
     // Issue #130: the throttle gates every proof VERIFICATION, not only the first leg - otherwise N sessions that all
     // sent AuthClientFirst before any final get N verified guesses per delay.  The control thread handles the finals
-    // one at a time, so each one sees the failure the previous one recorded.  Refused here: not counted (as at the
-    // first leg), the proof is never looked at.
+    // one at a time, so each one sees the failure the previous one recorded.  Refused here: the proof is never looked
+    // at and the final is no verdict - so finalLegSeen stays false and the close below charges the episode's (allowed,
+    // salt-revealing) first leg as abandoned, once (PR #522 review: otherwise N parked first legs cost 3 failures).
     if (const LoginThrottle::Verdict v = loginThrottle_.check(user, session->sourceHost, nowNs_); !v.allowed) {
         ++loginsRateLimited_;
         if (unauthLog_.due(1)) [[unlikely]]
@@ -8549,6 +8558,9 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         failLogin_(*session, hdr->correlationId, v.retryAfterMs);
         return;
     }
+    // #132: from here the episode is settled at this final - a verdict charges it, a stale view (retriable, not the
+    // client's doing) does not - never again as an abandoned first leg at the close.
+    st->finalLegSeen = true;
     if (securityUnavailable_()) [[unlikely]] {   // issues #15 / #111: the view went stale between the two legs
         unavailableLogin_(*session, hdr->correlationId, user);
         return;
@@ -8582,7 +8594,7 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     const LoginOk& ok = std::get<LoginOk>(verdict);
     std::string loginNonce = st->combinedNonce;   // issue #114: before session->auth (which owns *st) is replaced
     ++loginsOk_;
-    loginThrottle_.onSuccess(user, session->sourceHost);
+    loginThrottle_.onSuccess(user, session->sourceHost, nowNs_);
     spdlog::info("auth: login ok user={} source={} session={}", ok.user, session->sourceHost, session->sessionId);
     if (!session->crypto.encrypted)   // only under ClientTransport::PlaintextForTest (M1, issue #10) - said once per session
         spdlog::warn("auth: session {} authenticated over plaintext (no TLS): frames are not integrity-protected",
@@ -9041,7 +9053,7 @@ std::optional<rune::gateway::Denial> ClientGateway::verifyOwnCredentialChange_(S
                          self, session.sessionId, session.sourceHost);
         return refused;
     }
-    if (chargeThrottle) loginThrottle_.onSuccess(self, session.sourceHost);
+    if (chargeThrottle) loginThrottle_.onSuccess(self, session.sourceHost, nowNs_);
     return std::nullopt;
 }
 

@@ -45,6 +45,11 @@ struct AuthAwaitingFinal {
     /// the view has since moved past, is not a verdict (retriable AuthUnavailable, never the terminal 44).
     int64_t viewAppliedAtFirst = -1;
     bool    viewBehindAtFirst = false;
+    /// Issue #132: an AuthClientFinal passed the throttle (its verdict is the episode's charge; a stale view answers it
+    /// retriable, uncharged).  A session that leaves this state WITHOUT one (the deadline, a disconnect, a final the
+    /// throttle refused, any close) abandoned the first leg and is charged to the login throttle as a failure, once:
+    /// first-leg probes are never free.
+    bool    finalLegSeen = false;
 };
 
 // `loginNonce` (issue #114): the SCRAM combined nonce of the login that authenticated this session - what a change of
