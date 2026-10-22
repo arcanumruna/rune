@@ -439,6 +439,95 @@ TEST(ClientAuthErrorsRegression, APlainSubscriptionHomedOnALoginRefusedNodeEndsA
     EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
 }
 
+// ---- PR #513 adversarial review (#290 area): sibling entry points to a Rejected node session -------------------
+namespace {
+const test_support::InvokerGateway::Subscribed* subscribedAt(const test_support::InvokerGateway& gw, int ep) {
+    for (auto it = gw.subscribed.rbegin(); it != gw.subscribed.rend(); ++it) if (it->endpoint == ep) return &*it;
+    return nullptr;
+}
+} // namespace
+
+// Network x auth: a BOUND plain subscription whose node session is revoked while the per-subscription
+// SessionRevoked answers are lost (only the session-level notice arrives).  Its own refusal never comes: the
+// Rejected(46) session alone must end it at once — never re-armed toward a session that can never carry it.
+TEST(ClientAuthErrorsRegression, ABoundSubscriptionOnARevokedNodeWithItsAnswerLostEndsAtOnceAdversarialRegression) {
+    TwoNodeRig r(3850);
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    r.gw.subscribeLeader[0] = r.n1;
+    rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return subscribedAt(r.gw, r.n1) != nullptr && sub.active(); }));
+    const int64_t sid = subscribedAt(r.gw, r.n1)->sessionId;
+    r.gw.subscribed.clear();                         // the per-subscription answers are lost
+    r.gw.revokeSession(sid, r.n1);
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); })) << "the bound subscription waited on a Rejected session";
+    EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::SessionRevoked);
+    EXPECT_EQ(sub.brokerErrorCode(), 46);
+    EXPECT_TRUE(r.gw.subscribed.empty()) << "re-subscribed after the revoke";
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+// Sibling routed control op: GetViewRow shares the DDL driver (isRoutedCtlOp).  Redirected to a node whose login
+// is refused, it ends at once with 44 and is never sent there.
+TEST(ClientAuthErrorsRegression, AGetViewRowRedirectedToALoginRefusedNodeFailsAtOnceAdversarialRegression) {
+    TwoNodeRig r(3852);
+    r.gw.rejectLoginsAt.insert(r.n1);
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    int atNode1 = 0;
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        const auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        if (ep == 0) r.gw.sendError(0, static_cast<int16_t>(pc::ErrorCode::Redirect), r.node1, m->sessionId,
+                                    m->correlationId);
+        else ++atNode1;
+    };
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::BrokerError) << f.describe();
+    EXPECT_EQ(f.outcome().c.errorCode, 44);
+    EXPECT_EQ(atNode1, 0);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+// Network x auth x group: a STABLE member whose fetch node session is revoked, its fetch's own SessionRevoked
+// answer lost.  The member is refused SessionRevoked at once (the session went Connected -> Rejected).
+TEST(ClientAuthErrorsRegression, AStableMembersFetchNodeRevokedWithItsAnswerLostRefusesAtOnceAdversarialRegression) {
+    TwoNodeRig r(3854);
+    r.gw.groupProtocol   = true;
+    r.gw.groupAssignment = {{1, 0}};                 // p0, led by node 1
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    ASSERT_TRUE(r.drive([&] { return subscribedAt(r.gw, r.n1) != nullptr; })) << "the fetch reached node 1";
+    r.passes(64);
+    const int64_t sid = subscribedAt(r.gw, r.n1)->sessionId;
+    r.gw.subscribed.clear();                         // the fetch's own answer is lost
+    r.gw.revokeSession(sid, r.n1);
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); })) << "the member waited on a Rejected fetch session";
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::SessionRevoked) << static_cast<int>(gc.failReason());
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+// Sibling named in #290 itself: the group COORDINATOR is on a node whose login is refused.  The member must end
+// at once with the refusal, not cycle seed -> NotCoordinator -> Rejected node until a join budget runs out.
+TEST(ClientAuthErrorsRegression, AMemberWhoseCoordinatorNodeRefusesItsLoginEndsAtOnceAdversarialRegression) {
+    TwoNodeRig r(3856);
+    r.gw.rejectLoginsAt.insert(r.n1);
+    r.gw.groupProtocol         = true;
+    r.gw.groupAssignment       = {{1, 1}};           // p1, led by the seed
+    r.gw.coordinatorEndpoint   = r.n1;
+    r.gw.coordinatorRedirectTo = r.node1.substr(r.node1.find("endpoint=") + 9);
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    const auto t0 = std::chrono::steady_clock::now();
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); })) << "the member waited on a Rejected coordinator session";
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker) << static_cast<int>(gc.failReason());
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2));
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
 // Review B I5: against a Required broker with no security admin yet, a credential-less client's session is Anonymous
 // and may carry ONLY the bootstrap: no keepalive, no connect-time metadata request (the strict fake ends a session
 // that sends anything else).  The bootstrap itself — MAC checked, accepted once — creates the admin.

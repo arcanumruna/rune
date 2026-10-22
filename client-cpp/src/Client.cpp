@@ -5878,6 +5878,11 @@ void Client::syncCoordinatorSession_() noexcept {
                 coordRejectedChannel_ = coordinatorChannel_;   // r2 LOW-3
                 coordRejectedMeta_    = metadataResponses_;
             }
+            // #290 (PR #513 review): a Rejected coordinator session (its user revoked there, its login
+            // refused) never carries a join / commit: the members end now with its code, as a fetch homed on a
+            // Rejected node session does — never cycling seed -> NotCoordinator -> that node.
+            if (st == session::SessionState::Rejected && m.rejectCode() != 0) [[unlikely]]
+                groupConsumerHub_.onCoordinatorRejected(m.rejectCode());
             coordinatorChannel_.clear();
             coordIdx_ = 0;
             coordDownSinceNs_ = 0;

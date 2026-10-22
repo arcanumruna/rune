@@ -1990,6 +1990,15 @@ void GroupConsumerHub::refuse_(GroupConsumerImpl& impl, GroupFailReason why)
     finish_(impl);
 }
 
+void GroupConsumerHub::onCoordinatorRejected(int16_t code)
+{
+    const GroupFailReason why = refusalFor_(static_cast<rpc::ErrorCode>(static_cast<uint16_t>(code)));
+    for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
+        GroupConsumerImpl* const impl = impls_[ix];
+        if (impl->active) refuse_(*impl, why);
+    }
+}
+
 void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
 {
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)

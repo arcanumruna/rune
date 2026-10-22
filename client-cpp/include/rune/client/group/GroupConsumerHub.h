@@ -180,6 +180,12 @@ public:
     /// route moved): every joined / joining member re-joins there (at once when
     /// it is connected, else on its connect).
     void onCoordinatorMoved();
+    /// #290 (PR #513 review): the coordinator node's session was Rejected (its
+    /// user revoked there, its login refused): no member can join or commit
+    /// there, so every active one is refused with that code at once
+    /// (46 SessionRevoked, 45 NotAuthorized, else RefusedByBroker) — never left
+    /// cycling seed -> NotCoordinator -> that node until a budget runs out.
+    void onCoordinatorRejected(int16_t code);
 
     // ---- Shutdown -----------------------------------------------------------
 
