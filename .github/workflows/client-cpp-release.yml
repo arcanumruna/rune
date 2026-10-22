@@ -1,0 +1,139 @@
+# Builds the C++ client as a Conan library package when a client release tag (client-cpp-vX.Y.Z, made by
+# client-cpp/release.sh) is pushed, then uploads the package (recipe + Linux binary, plus the dependency binaries
+# built in the run) to the Conan remote and publishes a GitHub Release with a self-contained source tarball.
+# Release tags are the only trigger.
+#
+# Repository settings it needs:
+#   vars.CONAN_REMOTE_URL          the full Conan API URL of the repository, e.g. https://<host>/artifactory/api/conan/<repo>
+#   secrets.CONAN_LOGIN_USERNAME   the Conan remote user
+#   secrets.CONAN_PASSWORD         that user's password or access token
+name: client-cpp-release
+
+on:
+  push:
+    tags: ['client-cpp-v*']
+
+permissions:
+  contents: write   # the GitHub Release
+
+concurrency:
+  group: client-cpp-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: '4'
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+
+      # flight-recorder is its own repo; the client pins the commit it compiles (FLIGHT_RECORDER_GIT_TAG).
+      - name: Read the flight-recorder pin
+        id: pin
+        run: |
+          PIN=$(sed -nE 's/^set\(FLIGHT_RECORDER_GIT_TAG "([0-9a-f]{40})".*/\1/p' client-cpp/CMakeLists.txt)
+          if [[ -z $PIN ]]; then
+            echo "::error::FLIGHT_RECORDER_GIT_TAG not found in client-cpp/CMakeLists.txt"
+            exit 1
+          fi
+          echo "ref=$PIN" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository_owner }}/flight-recorder
+          ref: ${{ steps.pin.outputs.ref }}
+          path: flight-recorder
+
+      - name: Check tag matches VERSION.txt
+        run: |
+          VERSION=$(< client-cpp/VERSION.txt)
+          if [[ ${GITHUB_REF_NAME#client-cpp-v} != "$VERSION" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match client-cpp/VERSION.txt ($VERSION)"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Check Conan remote settings
+        env:
+          CONAN_REMOTE_URL: ${{ vars.CONAN_REMOTE_URL }}
+          CONAN_LOGIN_USERNAME: ${{ secrets.CONAN_LOGIN_USERNAME }}
+          CONAN_PASSWORD: ${{ secrets.CONAN_PASSWORD }}
+        run: |
+          if [[ -z $CONAN_REMOTE_URL ]]; then
+            echo "::error::set the CONAN_REMOTE_URL repository variable (full Conan API URL incl. repository) to publish a release"
+            exit 1
+          fi
+          if [[ -z $CONAN_LOGIN_USERNAME || -z $CONAN_PASSWORD ]]; then
+            echo "::error::set the CONAN_LOGIN_USERNAME and CONAN_PASSWORD repository secrets to publish a release"
+            exit 1
+          fi
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends uuid-dev
+          python3 -m pip install --user "conan>=2,<3" "cmake>=3.31"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # aeron and OpenSSL are built from source: keep them between runs.
+      - uses: actions/cache@v5
+        with:
+          path: ~/.conan2/p
+          key: conan-client-cpp-${{ runner.os }}-${{ hashFiles('client-cpp/conandata.yml') }}
+          restore-keys: conan-client-cpp-${{ runner.os }}-
+
+      # Dependencies already uploaded to the remote (aeron, OpenSSL, ...) are downloaded instead of rebuilt.
+      - name: Add the Conan remote
+        env:
+          CONAN_REMOTE_URL: ${{ vars.CONAN_REMOTE_URL }}
+          CONAN_LOGIN_USERNAME_ARTIFACTORY: ${{ secrets.CONAN_LOGIN_USERNAME }}
+          CONAN_PASSWORD_ARTIFACTORY: ${{ secrets.CONAN_PASSWORD }}
+        run: |
+          conan profile detect --force
+          conan remote add artifactory "$CONAN_REMOTE_URL"
+          conan remote login artifactory
+
+      # Builds the package and runs test_package (a consumer linking the library). The test suites run on the
+      # checkpoint hosts, not in the release.
+      - name: Build and test the package
+        env:
+          FLIGHT_RECORDER_DIR: ${{ github.workspace }}/flight-recorder
+        run: conan create client-cpp --build=missing -c tools.build:jobs=4 -c tools.build:skip_test=True --format=json > graph.json
+
+      # A separate consumer, outside the package build: install from the local cache, find_package, link, run.
+      - name: Consume the package
+        run: |
+          CONSUMER="$RUNNER_TEMP/consumer"
+          mkdir -p "$CONSUMER"
+          cp client-cpp/test_package/CMakeLists.txt client-cpp/test_package/consumer.cpp "$CONSUMER"
+          cd "$CONSUMER"
+          conan install --requires="rune-client-cpp/$VERSION" -g CMakeDeps -g CMakeToolchain -s build_type=Release
+          cmake -S . -B out -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
+          cmake --build out
+          ./out/consumer
+
+      - name: Upload to the Conan remote
+        run: |
+          # the dependency binaries built in this run, then the package itself
+          conan list --graph=graph.json --graph-binaries=build --format=json > pkglist.json
+          conan upload --list=pkglist.json --remote=artifactory -c
+          conan upload "rune-client-cpp/$VERSION" --remote=artifactory -c
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # the release notes are the annotated tag's message (actions/checkout leaves the tag object out)
+          git fetch --force origin "+refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          # Self-contained sources: the client, the sibling sources it compiles and flight-recorder.
+          STAGE="rune-client-cpp-$VERSION"
+          mkdir -p "dist/$STAGE/flight-recorder"
+          git archive --format=tar HEAD client-cpp protocol codec crypto ql LICENSE | tar -x -C "dist/$STAGE"
+          git -C flight-recorder archive --format=tar HEAD src include | tar -x -C "dist/$STAGE/flight-recorder"
+          tar -C dist -czf "dist/$STAGE.tar.gz" "$STAGE"
+          (cd dist && sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256")
+          gh release create "$GITHUB_REF_NAME" "dist/$STAGE.tar.gz" "dist/$STAGE.tar.gz.sha256" \
+            --title "rune-client-cpp $VERSION" --notes-from-tag --verify-tag
