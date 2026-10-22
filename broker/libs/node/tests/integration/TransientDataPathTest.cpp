@@ -541,6 +541,71 @@ TEST(TransientDataPathRegression, RcRingBuildRestartsWhenTheRingEvictsPastItsCur
     EXPECT_EQ(rc.lso(INT64_MAX), INT64_MAX) << "the LSO is pinned by a transaction that committed";
 }
 
+// #37: a partition that appends (and so evicts) more bytes per worker pass than the build's budget overtakes every
+// restarted build of the same budget: read_committed never became Ready and the restarts never stopped.  Each restart
+// of a build doubles its per-step slice, so once the slice covers the (bounded) ring the next step applies the whole
+// [cursor, target) in one pass - nothing evicts during it (single writer).
+// RED (mutation: no boost): never Ready within the cap.
+namespace {
+// The ring filled to eviction with 200-B pads; `tail` batches appended last (newest, evicted last).
+void fillRingToEviction(rune::storage::InMemoryLog& mem, const std::vector<std::vector<uint8_t>>& tail) {
+    const auto pad = batchOf(1, 200);
+    while (mem.logStartOffset() == 0) ringPut(mem, pad);
+    for (const auto& b : tail) ringPut(mem, b);
+}
+// Advance the build (budget 512) then append 8 pads (~1.6 KB > the budget) per pass, up to `cap` passes.
+int advanceUnderSustainedEviction(rune::node::RcState& rc, rune::storage::InMemoryLog& mem, int cap) {
+    const auto pad = batchOf(1, 200);
+    rune::node::RcFacts f;
+    f.leader = true; f.epoch = 1;
+    int passes = 0;
+    for (; passes < cap && !rc.ready(); ++passes) {
+        (void)rc.advance(f, nullptr, /*budget=*/512, &mem);
+        if (rc.ready()) break;
+        for (int i = 0; i < 8; ++i) ringPut(mem, pad);
+    }
+    return passes;
+}
+}  // namespace
+
+TEST(TransientDataPathRegression, RcRingBuildConvergesUnderSustainedEvictionFasterThanItsBudgetRegression) {
+    rune::storage::InMemoryLog mem(64 * 1024, 100'000);   // DropOldest: evicts as needed
+    fillRingToEviction(mem, {});
+    ASSERT_GT(mem.logStartOffset(), 0) << "precondition: the ring evicts";
+    rune::node::RcState rc;
+    rc.reserve(64);
+    rc.reserveRingRebuild();
+    const int passes = advanceUnderSustainedEviction(rc, mem, /*cap=*/64);
+    ASSERT_TRUE(rc.ready()) << "read_committed never became Ready in " << passes << " passes (restarts="
+                            << rc.ringScanRestarts() << ")";
+    EXPECT_GE(rc.ringScanRestarts(), 1u) << "precondition: the eviction overtook the unboosted build";
+    EXPECT_LE(rc.ringScanRestarts(), 10u) << "log2(64K / 512) = 7 restarts at most, plus slack";
+}
+
+TEST(TransientDataPathRegression, RcRingBuildConvergedUnderSustainedEvictionIsExactRegression) {
+    rune::storage::InMemoryLog mem(64 * 1024, 100'000);
+    constexpr int64_t kCommitted = 51, kAborted = 52;
+    fillRingToEviction(mem, {batchOf(1, 50, kCommitted, 0, 0, /*txn=*/true), batchOf(1, 50, kAborted, 0, 0, true),
+                             markerOf(kCommitted, /*commit=*/true), markerOf(kAborted, /*commit=*/false)});
+    rune::node::RcState rc;
+    rc.reserve(64);
+    rc.reserveRingRebuild();
+    (void)advanceUnderSustainedEviction(rc, mem, /*cap=*/64);
+    ASSERT_TRUE(rc.ready());
+    ASSERT_GE(rc.ringScanRestarts(), 1u) << "precondition: a boosted (restarted) build computed the state";
+    EXPECT_TRUE(rc.tracker().empty()) << "a transaction closed by its marker in the ring stayed open";
+    EXPECT_LT(rc.tracker().firstOffsetOf(kCommitted), 0);
+    EXPECT_LT(rc.tracker().firstOffsetOf(kAborted), 0);
+    EXPECT_EQ(rc.lso(INT64_MAX), INT64_MAX) << "the LSO is pinned although every transaction ended";
+    bool abortedIndexed = false, committedIndexed = false;
+    for (const auto& r : rc.aborted().ranges()) {
+        abortedIndexed   |= r.producerId == kAborted;
+        committedIndexed |= r.producerId == kCommitted;
+    }
+    EXPECT_TRUE(abortedIndexed) << "the aborted transaction is missing from the aborted index";
+    EXPECT_FALSE(committedIndexed) << "the committed transaction was indexed as aborted";
+}
+
 TEST(TransientDataPathRegression, OpenTxnWithItsFirstBatchEvictedSurvivesAnOwnershipChangeRegression) {
     Rig rig(/*ringBytes=*/8 * 1024, /*maxBatches=*/1000);   // single node: HW = LEO, the ring evicts freely
     constexpr int64_t kPid = 7;
