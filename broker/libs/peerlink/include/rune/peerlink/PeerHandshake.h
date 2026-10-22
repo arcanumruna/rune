@@ -5,17 +5,35 @@
 // instance per peer, owned by the control thread's PeerLinkAgent.  The lower node id initiates:
 //
 //   A (initiator)                                   B (responder)
-//   Hello{keyId, incA, nonceA}          ------->    holds keyId (current or next)? else Refuse{NoCommonKey}
-//                                       <-------    Challenge{keyId, incB, nonceB, macB}
-//   verify macB; Proof{macA}            ------->    verify macA; epoch = counter + 1
+//   HelloV2{keyId, incA, nonceA, shareA} ------>    holds keyId (current or next)? else Refuse{NoCommonKey}
+//                                       <-------    ChallengeV2{keyId, incB, nonceB, macB2, shareB}
+//   verify macB2; Proof{macA2}          ------->    verify macA2; epoch = counter + 1
 //                                       <-------    Accept{epoch, confirm}        (both derive LinkKeys)
 //   Confirm{epoch, confirm}             ------->    (issue #241) promote the receive-only epoch
 //
-//   macB = HMAC-SHA-512(master, "rune-peer-v1|B" || from=B || to=A || nonceA || nonceB || incA || incB || keyId)
-//   macA = HMAC-SHA-512(master, "rune-peer-v1|A" || from=A || to=B || nonceB || nonceA || incB || incA || keyId)
+//   macB2 = HMAC-SHA-512(master, "rune-peer-v2|B" || from=B || to=A || nonceA || nonceB || shareA || shareB || incA || incB || keyId)
+//   macA2 = HMAC-SHA-512(master, "rune-peer-v2|A" || from=A || to=B || nonceB || nonceA || shareB || shareA || incB || incA || keyId)
 //   Accept.confirm  = HMAC(master, "rune-peer-v1|C" || from=B || to=A || nonceA || nonceB || epoch)   (32 bytes)
 //   Confirm.confirm = HMAC(master, "rune-peer-v1|D" || from=A || to=B || nonceA || nonceB || epoch)   (32 bytes)
 // The distinct labels make a reflected MAC useless; both nonces make a replayed Hello or Proof useless.
+//
+// Issue #242, forward secrecy: shareA / shareB are X25519 ephemeral public keys (one keypair per handshake attempt on
+// each side; a repeated Hello / Challenge re-sends the SAME share).  The link keys are HKDF over master || X25519 shared
+// secret (PeerLinkKeys.h), so a recording of the link plus a cluster key stolen later does not yield them.  The MACs
+// cover both shares (a share swapped in transit fails the MAC); the Accept / Confirm MACs are unchanged and bound to the
+// nonces of this v2 exchange.  The ephemeral private keys and the shared secret live only in HelloSent, ChallengeSent
+// and the pending-challenge table, as EphSecret, scrubbed on every state exit; the responder computes the DH only after
+// the Proof's MAC matched, so an unauthenticated Hello costs one keygen (beside its two HMACs).
+//
+// Version skew (no runtime downgrade path):
+//   - a new RESPONDER still answers a v1 Hello (a legacy initiator) with a v1 Challenge and v1 keys (no forward secrecy):
+//       macB = HMAC-SHA-512(master, "rune-peer-v1|B" || from=B || to=A || nonceA || nonceB || incA || incB || keyId)
+//       macA = HMAC-SHA-512(master, "rune-peer-v1|A" || from=A || to=B || nonceB || nonceA || incB || incA || keyId)
+//   - a new INITIATOR only ever sends HelloV2 and refuses a v1 Challenge (logged, rate-limited): falling back would let
+//     an attacker who drops HelloV2 frames strip forward secrecy.  A legacy responder ignores tag 7, so that pair does
+//     not link until the responder is upgraded.
+//   - rolling upgrade: upgrade nodes in DESCENDING node id.  The lower id initiates, so every upgraded initiator then
+//     faces an upgraded responder, and every legacy initiator a responder that still speaks v1.
 //
 // Issue #241: the responder of a re-handshake with the SAME initiator incarnation installs the new epoch RECEIVE-ONLY
 // (Out.established->install) and keeps sealing under the old one until the initiator proves it holds the new epoch:
@@ -39,6 +57,17 @@
 namespace rune::peerlink {
 
 struct LinkIdle      { int64_t retryAtNs = 0; };
+/// Issue #242: an ephemeral X25519 secret (a private key or a DH shared secret).  Scrubbed when its holder dies, so every
+/// state exit - restorePrior_, a timeout, a supersede, the handshake's destructor - wipes it with the variant
+/// alternative that held it.  A copy-assignment overwrites the old bytes.  Copyable (PeerHandshake stays movable).
+struct EphSecret {
+    std::array<uint8_t, 32> bytes{};
+    EphSecret() = default;
+    EphSecret(const EphSecret&) = default;
+    EphSecret& operator=(const EphSecret&) = default;
+    ~EphSecret() { scrub(); }
+    void scrub() noexcept { rune::crypto::secureZero({bytes.data(), bytes.size()}); }
+};
 /// Issue #241 - the receive-first install of a re-handshake:
 ///   responder: `unconfirmedAccept` is the Accept of an epoch installed RECEIVE-ONLY, re-sent every kRetryNs until the
 ///              initiator's Confirm (MAC `wantConfirm`) or an authenticated frame under the epoch promotes it;
@@ -53,13 +82,16 @@ struct Established {
     std::array<uint8_t, 32>    acceptConfirm{};
 };
 /// `prior` is the live link while a rekey is in flight: it keeps sealing and opening until the exchange completes.
+/// `ephPriv` / `ephPub`: this attempt's X25519 keypair (issue #242); a retry re-sends the same Hello (same share).
 struct HelloSent     { std::array<uint8_t, 32> nonceA{}; uint64_t keyId = 0; int64_t sentNs = 0; int64_t startNs = 0;
-                       std::optional<Established> prior; };
+                       std::optional<Established> prior; EphSecret ephPriv; std::array<uint8_t, 32> ephPub{}; };
 /// Initiator: Challenge verified, Proof sent, awaiting Accept.  Responder: Challenge sent, awaiting Proof.  `prior`
 /// is the responder's live link while a re-handshake is in flight (restored if the Proof never comes).
+/// `dhShared` (issue #242): the X25519 shared secret the Accept's link keys are derived with; nullopt = v1.
 struct ChallengeSent {
     std::array<uint8_t, 32> nonceA{}, nonceB{}; uint64_t keyId = 0; uint64_t peerIncarnation = 0; int64_t sentNs = 0;
     std::optional<Established> prior;
+    std::optional<EphSecret> dhShared;
 };
 /// A Challenge the RESPONDER has sent and not yet seen proven.  Fixed table beside the link state: an unauthenticated
 /// Hello never changes the state (an Established responder stays Established).
@@ -67,6 +99,9 @@ struct PendingChallenge {
     bool used = false;
     std::array<uint8_t, 32> nonceA{}, nonceB{}; uint64_t keyId = 0; uint64_t peerIncarnation = 0; int64_t sentNs = 0;
     std::array<uint8_t, 64> wantMacA{};   // the Proof we expect, computed once when the Challenge is issued
+    bool v2 = false;                      // issue #242: a HelloV2 - shareA / shareB / ephPriv are set
+    std::array<uint8_t, 32> shareA{}, shareB{};
+    EphSecret ephPriv;                    // the DH runs only once the Proof matched (onProof)
 };
 using LinkState = std::variant<LinkIdle, HelloSent, ChallengeSent, Established>;
 
@@ -108,7 +143,9 @@ public:
     /// Challenge.  Responder: the NoLink poke while it holds no link; the expiry of an unanswered Challenge.
     Out tick(int64_t nowNs);
     Out onHello(const PeerHello&, int64_t nowNs);          // responder
-    Out onChallenge(const PeerChallenge&, int64_t nowNs);  // initiator
+    Out onChallenge(const PeerChallenge&, int64_t nowNs);  // initiator: always refused (downgrade, issue #242)
+    Out onHelloV2(const PeerHelloV2&, int64_t nowNs);          // responder (issue #242)
+    Out onChallengeV2(const PeerChallengeV2&, int64_t nowNs);  // initiator (issue #242)
     Out onProof(const PeerProof&, int64_t nowNs);          // responder
     Out onAccept(const PeerAccept&, int64_t nowNs);        // initiator
     /// Responder (issue #241): the initiator proved it installed the receive-only epoch - promote it (SendAndReceive).
@@ -137,8 +174,17 @@ public:
     [[nodiscard]] int32_t peer() const noexcept { return peer_; }
 
 private:
+    /// v2 (issue #242) when both shares are given: the "rune-peer-v2|*" transcript, which covers them.
     bool mac_(const ClusterKey& key, bool isB, int32_t idA, int32_t idB, const std::array<uint8_t, 32>& nonceA,
-              const std::array<uint8_t, 32>& nonceB, uint64_t incA, uint64_t incB, uint64_t keyId, std::array<uint8_t, 64>& out);
+              const std::array<uint8_t, 32>& nonceB, uint64_t incA, uint64_t incB, uint64_t keyId, std::array<uint8_t, 64>& out,
+              const std::array<uint8_t, 32>* shareA = nullptr, const std::array<uint8_t, 32>* shareB = nullptr);
+    /// Issue #242: a fresh nonce and X25519 keypair for a new Hello; false when no randomness / key is available.
+    [[nodiscard]] bool freshHello_(HelloSent& hs) const noexcept;
+    [[nodiscard]] PeerHelloV2 helloFrame_(const HelloSent& hs) const noexcept;
+    /// Responder: a v1 (`shareA` null) or v2 Hello - the same pending-slot logic for both.
+    Out answerHello_(int32_t from, int32_t to, uint64_t keyId, uint64_t incarnation, const std::array<uint8_t, 32>& nonceA,
+                     const std::array<uint8_t, 32>* shareA, int64_t nowNs);
+    Out challengeOut_(const ClusterKey& key, const PendingChallenge& c);
     Out refuseOut_(RefuseReason r, uint64_t keyId);
     Out rekey_(int64_t nowNs);
     Out startRekey_(const Established& live, int64_t nowNs);

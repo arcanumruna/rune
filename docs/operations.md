@@ -120,8 +120,10 @@ Type ids are defined in `broker/libs/node/include/rune/node/RoleCounter.h`. Logi
 ## The cluster key
 
 Brokers authenticate each other with one shared file, `RUNE_CLUSTER_KEY_FILE`: a mutual HMAC challenge-response on every
-inter-broker connection, and every inter-broker frame is sealed with a per-link key derived from it (HKDF-SHA-512, one key per
-direction, 32 bytes of overhead per frame). The key never crosses the wire.
+inter-broker connection, and every inter-broker frame is sealed with a per-link key derived from it and an X25519 ephemeral
+secret (HKDF-SHA-512, one key per direction, 32 bytes of overhead per frame, forward secrecy). The key never crosses the wire.
+When upgrading to the forward-secret handshake, upgrade brokers in **descending node id**: an upgraded broker only initiates
+the new handshake, and a broker from before it does not answer that.
 
 - **Generate** with `rune security gen-cluster-key --out <path>`: 64 hex characters, mode `0600`, never overwriting.
   The contents must be at least 32 bytes after trailing whitespace. The broker refuses a file that is group- or

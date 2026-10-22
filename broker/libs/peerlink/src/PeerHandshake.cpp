@@ -1,6 +1,7 @@
 // PeerHandshake.cpp — the mutual HMAC challenge-response state machine (authentication plan Task 15, D33, D35).
 #include <rune/peerlink/PeerHandshake.h>
 
+#include <rune/crypto/Dh.h>
 #include <rune/crypto/Kdf.h>
 
 #include <algorithm>
@@ -20,22 +21,32 @@ constexpr char kLabelB[] = "rune-peer-v1|B";
 constexpr char kLabelA[] = "rune-peer-v1|A";
 constexpr char kLabelC[] = "rune-peer-v1|C";
 constexpr char kLabelD[] = "rune-peer-v1|D";
+constexpr char kLabelB2[] = "rune-peer-v2|B";   // issue #242: distinct from v1, so no MAC is valid across versions
+constexpr char kLabelA2[] = "rune-peer-v2|A";
+static_assert(sizeof kLabelB2 == sizeof kLabelB && sizeof kLabelA2 == sizeof kLabelA && sizeof kLabelA == sizeof kLabelB);
 
-/// macB = HMAC(master, "rune-peer-v1|B" || from=B || to=A || nonceA || nonceB || incA || incB || keyId)
-/// macA = HMAC(master, "rune-peer-v1|A" || from=A || to=B || nonceB || nonceA || incB || incA || keyId)
+/// v1 (shares null, byte-identical to the pre-#242 MACs):
+///   macB = HMAC(master, "rune-peer-v1|B" || from=B || to=A || nonceA || nonceB || incA || incB || keyId)
+///   macA = HMAC(master, "rune-peer-v1|A" || from=A || to=B || nonceB || nonceA || incB || incA || keyId)
+/// v2 (issue #242, both shares given):
+///   macB2 = HMAC(master, "rune-peer-v2|B" || from=B || to=A || nonceA || nonceB || shareA || shareB || incA || incB || keyId)
+///   macA2 = HMAC(master, "rune-peer-v2|A" || from=A || to=B || nonceB || nonceA || shareB || shareA || incB || incA || keyId)
 /// confirm = HMAC(master, "rune-peer-v1|C" || from=B || to=A || nonceA || nonceB || epoch)  (32 bytes)
 bool transcriptMac(const ClusterKey& key, bool isB, int32_t idA, int32_t idB, const std::array<uint8_t, 32>& nonceA,
                    const std::array<uint8_t, 32>& nonceB, uint64_t incA, uint64_t incB, uint64_t keyId,
-                   std::array<uint8_t, 64>& out) {
-    uint8_t buf[sizeof kLabelB - 1 + 4 + 4 + 32 + 32 + 8 + 8 + 8];
+                   std::array<uint8_t, 64>& out, const std::array<uint8_t, 32>* shareA, const std::array<uint8_t, 32>* shareB) {
+    uint8_t buf[sizeof kLabelB - 1 + 4 + 4 + 32 + 32 + 32 + 32 + 8 + 8 + 8];
     uint8_t* p = buf;
-    const char* label = isB ? kLabelB : kLabelA;
+    const bool v2 = shareA != nullptr && shareB != nullptr;
+    const char* label = v2 ? (isB ? kLabelB2 : kLabelA2) : (isB ? kLabelB : kLabelA);
     putN(p, reinterpret_cast<const uint8_t*>(label), sizeof kLabelB - 1);
     if (isB) {
         put32(p, idB); put32(p, idA); putN(p, nonceA.data(), 32); putN(p, nonceB.data(), 32);
+        if (v2) { putN(p, shareA->data(), 32); putN(p, shareB->data(), 32); }
         put64(p, incA); put64(p, incB);
     } else {
         put32(p, idA); put32(p, idB); putN(p, nonceB.data(), 32); putN(p, nonceA.data(), 32);
+        if (v2) { putN(p, shareB->data(), 32); putN(p, shareA->data(), 32); }
         put64(p, incB); put64(p, incA);
     }
     put64(p, keyId);
@@ -119,9 +130,21 @@ PeerHandshake::PeerHandshake(int32_t self, int32_t peer, uint64_t selfIncarnatio
 
 bool PeerHandshake::mac_(const ClusterKey& key, bool isB, int32_t idA, int32_t idB, const std::array<uint8_t, 32>& nonceA,
                          const std::array<uint8_t, 32>& nonceB, uint64_t incA, uint64_t incB, uint64_t keyId,
-                         std::array<uint8_t, 64>& out) {
+                         std::array<uint8_t, 64>& out, const std::array<uint8_t, 32>* shareA,
+                         const std::array<uint8_t, 32>* shareB) {
     ++macOps_;
-    return transcriptMac(key, isB, idA, idB, nonceA, nonceB, incA, incB, keyId, out);
+    return transcriptMac(key, isB, idA, idB, nonceA, nonceB, incA, incB, keyId, out, shareA, shareB);
+}
+
+bool PeerHandshake::freshHello_(HelloSent& hs) const noexcept {
+    return rune::crypto::randomBytes({hs.nonceA.data(), hs.nonceA.size()}) &&
+           rune::crypto::x25519Keypair(hs.ephPriv.bytes, hs.ephPub);
+}
+
+PeerHelloV2 PeerHandshake::helloFrame_(const HelloSent& hs) const noexcept {
+    PeerHelloV2 m; m.from = self_; m.to = peer_; m.keyId = hs.keyId; m.incarnation = incarnation_; m.nonceA = hs.nonceA;
+    m.shareA = hs.ephPub;
+    return m;
 }
 
 PeerHandshake::Out PeerHandshake::refuseOut_(RefuseReason r, uint64_t keyId) {
@@ -163,10 +186,10 @@ PeerHandshake::Out PeerHandshake::rekeyForTest(int64_t nowNs) {
 
 PeerHandshake::Out PeerHandshake::startRekey_(const Established& live, int64_t nowNs) {
     HelloSent hs;
-    if (!rune::crypto::randomBytes({hs.nonceA.data(), hs.nonceA.size()})) return {};
+    if (!freshHello_(hs)) return {};   // the live link stays; the next hint retries
     hs.keyId = keys_.current.keyId; hs.sentNs = nowNs; hs.startNs = nowNs; hs.prior = live;   // a copy, before state_ changes
     lastExchangeNs_ = nowNs;
-    PeerHello m; m.from = self_; m.to = peer_; m.keyId = hs.keyId; m.incarnation = incarnation_; m.nonceA = hs.nonceA;
+    const PeerHelloV2 m = helloFrame_(hs);
     state_ = hs;
     return frameOut(m);
 }
@@ -178,10 +201,9 @@ PeerHandshake::Out PeerHandshake::tick(int64_t nowNs) {
         } else if (auto* h = std::get_if<HelloSent>(&state_)) {
             if (h->prior && nowNs - h->startNs >= kAwaitNs) { restorePrior_(h->prior, nowNs); return {}; }
             if (nowNs - h->sentNs < kRetryNs) return {};
-            // The SAME Hello again: a late Challenge for the first still matches.
-            PeerHello m; m.from = self_; m.to = peer_; m.keyId = h->keyId; m.incarnation = incarnation_; m.nonceA = h->nonceA;
+            // The SAME Hello again (same nonce, same share): a late Challenge for the first still matches.
             h->sentNs = nowNs;
-            return frameOut(m);
+            return frameOut(helloFrame_(*h));
         } else if (auto* c = std::get_if<ChallengeSent>(&state_)) {
             if (nowNs - c->sentNs >= kAwaitNs) restorePrior_(c->prior, nowNs);   // the Proof or the Accept was lost
             return {};
@@ -190,17 +212,19 @@ PeerHandshake::Out PeerHandshake::tick(int64_t nowNs) {
         }
         // LinkIdle and due: a fresh Hello under our CURRENT key (D35).
         HelloSent hs;
-        if (!rune::crypto::randomBytes({hs.nonceA.data(), hs.nonceA.size()})) {
+        if (!freshHello_(hs)) {
             state_ = LinkIdle{nowNs + kRetryNs};
-            return errorOut(logLine("peer link to node %d: no random bytes available", peer_));
+            return errorOut(logLine("peer link to node %d: no random bytes / ephemeral key available", peer_));
         }
         hs.keyId = keys_.current.keyId; hs.sentNs = nowNs; hs.startNs = nowNs;
         lastExchangeNs_ = nowNs;
-        PeerHello m; m.from = self_; m.to = peer_; m.keyId = hs.keyId; m.incarnation = incarnation_; m.nonceA = hs.nonceA;
+        const PeerHelloV2 m = helloFrame_(hs);
         state_ = hs;
         return frameOut(m);
     }
-    // Responder.
+    // Responder.  Issue #242: an expired pending Challenge drops its ephemeral private key now.
+    for (auto& c : pending_)
+        if (c.used && nowNs - c.sentNs >= kAwaitNs) { c.used = false; c.ephPriv.scrub(); }
     if (auto* idle = std::get_if<LinkIdle>(&state_)) {
         if (nowNs < idle->retryAtNs) return {};
         idle->retryAtNs = nowNs + kRetryNs;
@@ -217,18 +241,41 @@ PeerHandshake::Out PeerHandshake::tick(int64_t nowNs) {
 }
 
 PeerHandshake::Out PeerHandshake::onHello(const PeerHello& h, int64_t nowNs) {
-    if (initiator() || h.from != peer_ || h.to != self_) return refuseOut_(RefuseReason::NotAPeer, h.keyId);
-    const ClusterKey* key = keys_.byId(h.keyId);
-    if (!key) return refuseOut_(RefuseReason::NoCommonKey, h.keyId);           // D35
+    return answerHello_(h.from, h.to, h.keyId, h.incarnation, h.nonceA, nullptr, nowNs);   // a legacy initiator: v1
+}
 
-    // The same Hello again (our Challenge may have been lost): the SAME Challenge from its pending slot.
+PeerHandshake::Out PeerHandshake::onHelloV2(const PeerHelloV2& h, int64_t nowNs) {
+    return answerHello_(h.from, h.to, h.keyId, h.incarnation, h.nonceA, &h.shareA, nowNs);
+}
+
+PeerHandshake::Out PeerHandshake::challengeOut_(const ClusterKey& key, const PendingChallenge& c) {
+    std::array<uint8_t, 64> macB{};
+    if (!mac_(key, true, peer_, self_, c.nonceA, c.nonceB, c.peerIncarnation, incarnation_, c.keyId, macB,
+              c.v2 ? &c.shareA : nullptr, c.v2 ? &c.shareB : nullptr))
+        return {};
+    if (c.v2) {
+        PeerChallengeV2 m; m.from = self_; m.to = peer_; m.keyId = c.keyId; m.incarnation = incarnation_; m.nonceB = c.nonceB;
+        m.macB = macB; m.shareB = c.shareB;
+        return frameOut(m);
+    }
+    PeerChallenge m; m.from = self_; m.to = peer_; m.keyId = c.keyId; m.incarnation = incarnation_; m.nonceB = c.nonceB; m.macB = macB;
+    return frameOut(m);
+}
+
+PeerHandshake::Out PeerHandshake::answerHello_(int32_t from, int32_t to, uint64_t keyId, uint64_t incarnation,
+                                               const std::array<uint8_t, 32>& nonceA, const std::array<uint8_t, 32>* shareA,
+                                               int64_t nowNs) {
+    if (initiator() || from != peer_ || to != self_) return refuseOut_(RefuseReason::NotAPeer, keyId);
+    const ClusterKey* key = keys_.byId(keyId);
+    if (!key) return refuseOut_(RefuseReason::NoCommonKey, keyId);           // D35
+    const bool v2 = shareA != nullptr;
+
+    // The same Hello again (our Challenge may have been lost): the SAME Challenge (same nonceB, same shareB) from its
+    // pending slot.  A v1 and a v2 Hello never match each other's slot.
     for (auto& c : pending_) {
-        if (c.used && nowNs - c.sentNs < kAwaitNs && c.nonceA == h.nonceA && c.peerIncarnation == h.incarnation && c.keyId == h.keyId) {
-            PeerChallenge m; m.from = self_; m.to = peer_; m.keyId = c.keyId; m.incarnation = incarnation_; m.nonceB = c.nonceB;
-            if (!mac_(*key, true, peer_, self_, c.nonceA, c.nonceB, c.peerIncarnation, incarnation_, c.keyId, m.macB))
-                return {};
-            return frameOut(m);
-        }
+        if (c.used && nowNs - c.sentNs < kAwaitNs && c.nonceA == nonceA && c.peerIncarnation == incarnation && c.keyId == keyId &&
+            c.v2 == v2 && (!v2 || c.shareA == *shareA))
+            return challengeOut_(*key, c);
     }
     // A NEW nonce: nothing about the link state changes.  It takes a free (or expired) slot, else evicts a RANDOM live
     // one (oldest-first would let a flooder kill the real slot after exactly kPending forgeries; random survives n
@@ -243,33 +290,58 @@ PeerHandshake::Out PeerHandshake::onHello(const PeerHello& h, int64_t nowNs) {
         slot = &pending_[r & (kPending - 1)];
     }
     PendingChallenge cs;
-    cs.used = true; cs.nonceA = h.nonceA; cs.keyId = h.keyId; cs.peerIncarnation = h.incarnation; cs.sentNs = nowNs;
+    cs.used = true; cs.nonceA = nonceA; cs.keyId = keyId; cs.peerIncarnation = incarnation; cs.sentNs = nowNs;
     if (!rune::crypto::randomBytes({cs.nonceB.data(), cs.nonceB.size()}))
         return errorOut(logLine("peer link from node %d: no random bytes available", peer_));
-    PeerChallenge m; m.from = self_; m.to = peer_; m.keyId = h.keyId; m.incarnation = incarnation_; m.nonceB = cs.nonceB;
-    if (!mac_(*key, true, peer_, self_, cs.nonceA, cs.nonceB, cs.peerIncarnation, incarnation_, cs.keyId, m.macB)) return {};
-    if (!mac_(*key, false, peer_, self_, cs.nonceA, cs.nonceB, cs.peerIncarnation, incarnation_, cs.keyId, cs.wantMacA)) return {};
-    *slot = cs;
-    return frameOut(m);
+    if (v2) {   // issue #242: this slot's ephemeral keypair; the DH itself waits for a matching Proof
+        cs.v2 = true; cs.shareA = *shareA;
+        if (!rune::crypto::x25519Keypair(cs.ephPriv.bytes, cs.shareB))
+            return errorOut(logLine("peer link from node %d: no ephemeral key available", peer_));
+    }
+    Out o = challengeOut_(*key, cs);
+    if (!o.frame) return {};
+    if (!mac_(*key, false, peer_, self_, cs.nonceA, cs.nonceB, cs.peerIncarnation, incarnation_, cs.keyId, cs.wantMacA,
+              v2 ? &cs.shareA : nullptr, v2 ? &cs.shareB : nullptr))
+        return {};
+    *slot = cs;   // overwrites (scrubs) an evicted slot's ephemeral key
+    return o;
 }
 
-PeerHandshake::Out PeerHandshake::onChallenge(const PeerChallenge& c, int64_t nowNs) {
+// Issue #242: this initiator only ever sends HelloV2, so a v1 Challenge answering our Hello is a downgrade (an attacker
+// stripping forward secrecy, or a legacy responder that somehow parsed it): refused, logged through the rate-limited
+// refusal path, the state stays.  No MAC is computed for it.
+PeerHandshake::Out PeerHandshake::onChallenge(const PeerChallenge& c, int64_t /*nowNs*/) {
+    if (!initiator() || c.from != peer_ || c.to != self_) return {};
+    const auto* h = std::get_if<HelloSent>(&state_);
+    if (!h || c.keyId != h->keyId) return {};    // unsolicited / for another key: nothing
+    return errorOut(logLine("peer link from node %d REFUSED: %s (a v1 challenge to a v2 hello: downgrade refused, key id %016llx)",
+                            peer_, refuseReasonText(RefuseReason::BadProof), static_cast<unsigned long long>(h->keyId)));
+}
+
+PeerHandshake::Out PeerHandshake::onChallengeV2(const PeerChallengeV2& c, int64_t nowNs) {
     if (!initiator() || c.from != peer_ || c.to != self_) return {};
     auto* h = std::get_if<HelloSent>(&state_);
     if (!h || c.keyId != h->keyId) return {};    // unsolicited / for another key: nothing
     const ClusterKey* key = keys_.byId(h->keyId);
     if (!key) return {};
     std::array<uint8_t, 64> want{};
-    if (!mac_(*key, true, self_, peer_, h->nonceA, c.nonceB, incarnation_, c.incarnation, h->keyId, want)) return {};
-    if (!macEq(want, c.macB))   // not the responder (or a forgery): logged, the state stays, the Hello is retried on its timer
+    if (!mac_(*key, true, self_, peer_, h->nonceA, c.nonceB, incarnation_, c.incarnation, h->keyId, want, &h->ephPub, &c.shareB))
+        return {};
+    if (!macEq(want, c.macB))   // not the responder (or a forgery, or a share swapped in transit): logged, the state stays
         return errorOut(logLine("peer link from node %d REFUSED: %s (key id %016llx)", peer_, refuseReasonText(RefuseReason::BadProof),
                                 static_cast<unsigned long long>(h->keyId)));
+    EphSecret shared;
+    if (!rune::crypto::x25519Shared(h->ephPriv.bytes, c.shareB, shared.bytes))   // a low-order share: as a bad MAC
+        return errorOut(logLine("peer link from node %d REFUSED: %s (key share rejected, key id %016llx)", peer_,
+                                refuseReasonText(RefuseReason::BadProof), static_cast<unsigned long long>(h->keyId)));
     PeerProof p; p.from = self_; p.to = peer_;
-    if (!mac_(*key, false, self_, peer_, h->nonceA, c.nonceB, incarnation_, c.incarnation, h->keyId, p.macA)) return {};
+    if (!mac_(*key, false, self_, peer_, h->nonceA, c.nonceB, incarnation_, c.incarnation, h->keyId, p.macA, &h->ephPub, &c.shareB))
+        return {};
     ChallengeSent cs;
     cs.nonceA = h->nonceA; cs.nonceB = c.nonceB; cs.keyId = h->keyId; cs.peerIncarnation = c.incarnation; cs.sentNs = nowNs;
     cs.prior = h->prior;
-    state_ = cs;
+    cs.dhShared = shared;
+    state_ = cs;   // destroys HelloSent: its ephemeral private key is scrubbed (EphSecret)
     return frameOut(p);
 }
 
@@ -286,8 +358,16 @@ PeerHandshake::Out PeerHandshake::onProof(const PeerProof& p, int64_t nowNs) {
     }
     if (cs == nullptr)   // no pending challenge matches: a forgery or a stale Proof (a Proof names no key id) - logged, nothing changes
         return errorOut(logLine("peer link from node %d REFUSED: %s (no pending challenge matches)", peer_, refuseReasonText(RefuseReason::BadProof)));
+    // Issue #242: a v2 slot runs its DH only now that the Proof matched.  The secret dies (scrubbed) with this scope.
+    std::optional<EphSecret> shared;
+    if (cs->v2) {
+        shared.emplace();
+        if (!rune::crypto::x25519Shared(cs->ephPriv.bytes, cs->shareA, shared->bytes))
+            return errorOut(logLine("peer link from node %d REFUSED: %s (key share rejected)", peer_, refuseReasonText(RefuseReason::BadProof)));
+    }
     const uint32_t epoch = ++epochCounter_;
-    auto keys = deriveLinkKeys(*key, self_, peer_, false, cs->nonceA, cs->nonceB, epoch);
+    auto keys = deriveLinkKeys(*key, self_, peer_, false, cs->nonceA, cs->nonceB, epoch,
+                               shared ? std::optional<std::span<const uint8_t, 32>>(shared->bytes) : std::nullopt);
     PeerAccept a; a.from = self_; a.to = peer_; a.linkEpoch = epoch;
     if (!keys || !confirmMac(*key, peer_, self_, cs->nonceA, cs->nonceB, epoch, a.confirm))
         return errorOut(logLine("peer link with node %d: key derivation failed", peer_));
@@ -306,7 +386,7 @@ PeerHandshake::Out PeerHandshake::onProof(const PeerProof& p, int64_t nowNs) {
         e.acceptSentNs = nowNs;
     }
     const uint64_t id = cs->keyId;
-    for (auto& c : pending_) c.used = false;
+    for (auto& c : pending_) { c.used = false; c.ephPriv.scrub(); }
     state_ = e;
     Out o = frameOut(a);
     o.established = *keys;
@@ -332,7 +412,9 @@ PeerHandshake::Out PeerHandshake::onAccept(const PeerAccept& a, int64_t nowNs) {
     if (!confirmMac(*key, self_, peer_, cs->nonceA, cs->nonceB, a.linkEpoch, want) ||
         !rune::crypto::constantTimeEqual({want.data(), want.size()}, {a.confirm.data(), a.confirm.size()}))
         return {};    // a forged Accept: ignored, the real one may still come
-    auto keys = deriveLinkKeys(*key, self_, peer_, true, cs->nonceA, cs->nonceB, a.linkEpoch);
+    auto keys = deriveLinkKeys(*key, self_, peer_, true, cs->nonceA, cs->nonceB, a.linkEpoch,
+                               cs->dhShared ? std::optional<std::span<const uint8_t, 32>>(cs->dhShared->bytes) : std::nullopt);
+    if (cs->dhShared) cs->dhShared->scrub();   // used once; the rest of ChallengeSent dies with the state change below
     PeerConfirm c; c.from = self_; c.to = peer_; c.linkEpoch = a.linkEpoch;
     if (!keys || !initiatorConfirmMac(*key, self_, peer_, cs->nonceA, cs->nonceB, a.linkEpoch, c.confirm)) {
         restorePrior_(cs->prior, nowNs);

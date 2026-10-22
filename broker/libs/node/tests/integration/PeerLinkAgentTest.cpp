@@ -160,6 +160,9 @@ TEST(PeerLinkAgentRegression, EveryPairEstablishesWithinTwoSeconds) {
             EXPECT_NE(ab.epoch, 0u);
         }
     for (auto& [id, a] : rig.agents) EXPECT_EQ(a->refusals(), 0u);
+    // Issue #242: the handshakes ran over HelloV2 / ChallengeV2 (tags 7 / 8) - the initiators send nothing else, and an
+    // agent that did not route those tags would have counted them malformed and never linked.
+    for (auto& [id, a] : rig.agents) EXPECT_EQ(a->malformedFrames(), 0u) << "tags 7 / 8 are routed, not malformed";
 }
 
 TEST(PeerLinkAgentRegression, AWrongKeyNodeIsRefusedByEveryPeerAndLogsIt) {
@@ -184,6 +187,7 @@ TEST(PeerLinkAgentRegression, AWrongKeyNodeIsRefusedByEveryPeerAndLogsIt) {
     const auto* st = rig.agents[1]->stateOf(3);
     ASSERT_NE(st, nullptr);
     EXPECT_TRUE(std::holds_alternative<pl::HelloSent>(*st));
+    EXPECT_NE(std::get<pl::HelloSent>(*st).ephPub, (std::array<uint8_t, 32>{})) << "issue #242: a v2 Hello carries an ephemeral share";
 }
 
 TEST(PeerLinkAgentRegression, ARestartedResponderIsReestablishedWithNewKeys) {

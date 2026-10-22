@@ -33,6 +33,8 @@ struct DigestBytes {
                         std::span<const uint8_t> info, std::span<uint8_t> out) noexcept;   // extract + expand
 [[nodiscard]] bool randomBytes(std::span<uint8_t> out) noexcept;                // RAND_bytes; false = refuse
 [[nodiscard]] bool constantTimeEqual(std::span<const uint8_t> a, std::span<const uint8_t> b) noexcept;
+/// Overwrites `buf` with zeros in a way the optimiser cannot elide (OPENSSL_cleanse): for key material on the stack.
+void secureZero(std::span<uint8_t> buf) noexcept;
 [[nodiscard]] std::string base64Encode(std::span<const uint8_t> in);
 [[nodiscard]] std::optional<std::vector<uint8_t>> base64Decode(std::string_view in);   // strict, padded
 

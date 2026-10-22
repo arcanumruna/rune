@@ -54,6 +54,8 @@ struct Pair {
             case 4: { pl::PeerAccept m;    ASSERT_TRUE(pl::PeerAccept::decode(f.data(), f.size(), m));    absorb(to, h.onAccept(m, now)); break; }
             case 5: { pl::PeerRefuse m;    ASSERT_TRUE(pl::PeerRefuse::decode(f.data(), f.size(), m));    absorb(to, h.onRefuse(m, now)); break; }
             case 6: { pl::PeerConfirm m;   ASSERT_TRUE(pl::PeerConfirm::decode(f.data(), f.size(), m));   absorb(to, h.onConfirm(m, now)); break; }
+            case 7: { pl::PeerHelloV2 m;   ASSERT_TRUE(pl::PeerHelloV2::decode(f.data(), f.size(), m));   absorb(to, h.onHelloV2(m, now)); break; }
+            case 8: { pl::PeerChallengeV2 m; ASSERT_TRUE(pl::PeerChallengeV2::decode(f.data(), f.size(), m)); absorb(to, h.onChallengeV2(m, now)); break; }
             default: FAIL() << "unknown tag";
         }
     }
@@ -125,14 +127,15 @@ TEST(PeerHandshakeRegression, TheRolledInitiatorIsAcceptedByAResponderHoldingItA
 TEST(PeerHandshakeRegression, AReplayedHelloOrProofNeverEstablishes) {
     Pair p(keys('k'), keys('k')); p.run();
     ASSERT_TRUE(p.ka && p.kb);
-    const auto hello = lastOf<pl::PeerHello>(p, 1);
+    const auto hello = lastOf<pl::PeerHelloV2>(p, 1);
     const auto proof = lastOf<pl::PeerProof>(p, 1);
 
     pl::PeerHandshake fresh(2, 1, 20, keys('k'));        // a fresh responder (same key): new nonceB for the replayed Hello
-    auto c = fresh.onHello(hello, 0);
+    auto c = fresh.onHelloV2(hello, 0);
     ASSERT_TRUE(c.frame);
-    pl::PeerChallenge ch; ASSERT_TRUE(pl::PeerChallenge::decode(c.frame->data(), c.frame->size(), ch));
-    EXPECT_NE(ch.nonceB, lastOf<pl::PeerChallenge>(p, 0).nonceB) << "a replayed Hello meets a new nonceB";
+    pl::PeerChallengeV2 ch; ASSERT_TRUE(pl::PeerChallengeV2::decode(c.frame->data(), c.frame->size(), ch));
+    EXPECT_NE(ch.nonceB, lastOf<pl::PeerChallengeV2>(p, 0).nonceB) << "a replayed Hello meets a new nonceB";
+    EXPECT_NE(ch.shareB, lastOf<pl::PeerChallengeV2>(p, 0).shareB) << "and a new ephemeral share";
     auto r = fresh.onProof(proof, 0);                    // the old Proof is bound to the old nonceB
     EXPECT_FALSE(r.established);
     EXPECT_FALSE(r.frame) << "a bad Proof is logged, never answered";
@@ -144,9 +147,9 @@ TEST(PeerHandshakeRegression, AReplayedHelloOrProofNeverEstablishes) {
 TEST(PeerHandshakeRegression, AReflectedChallengeMacIsNotAValidProof) {
     pl::PeerHandshake a(1, 2, 10, keys('k')), b(2, 1, 20, keys('k'));
     auto h = a.tick(0); ASSERT_TRUE(h.frame);
-    pl::PeerHello hello; ASSERT_TRUE(pl::PeerHello::decode(h.frame->data(), h.frame->size(), hello));
-    auto c = b.onHello(hello, 0); ASSERT_TRUE(c.frame);
-    pl::PeerChallenge ch; ASSERT_TRUE(pl::PeerChallenge::decode(c.frame->data(), c.frame->size(), ch));
+    pl::PeerHelloV2 hello; ASSERT_TRUE(pl::PeerHelloV2::decode(h.frame->data(), h.frame->size(), hello));
+    auto c = b.onHelloV2(hello, 0); ASSERT_TRUE(c.frame);
+    pl::PeerChallengeV2 ch; ASSERT_TRUE(pl::PeerChallengeV2::decode(c.frame->data(), c.frame->size(), ch));
 
     pl::PeerProof reflected; reflected.from = 1; reflected.to = 2; reflected.macA = ch.macB;   // B's own MAC as A's Proof
     auto r = b.onProof(reflected, 0);
@@ -158,8 +161,8 @@ TEST(PeerHandshakeRegression, AReflectedChallengeMacIsNotAValidProof) {
 TEST(PeerHandshakeRegression, ARefusedInitiatorKeepsRetryingTheSameHelloEvery200ms) {
     pl::PeerHandshake a(1, 2, 10, keys('k')), b(2, 1, 20, keys('x'));
     auto h = a.tick(0); ASSERT_TRUE(h.frame);
-    pl::PeerHello first; ASSERT_TRUE(pl::PeerHello::decode(h.frame->data(), h.frame->size(), first));
-    auto r = b.onHello(first, 1 * kMs); ASSERT_TRUE(r.frame);
+    pl::PeerHelloV2 first; ASSERT_TRUE(pl::PeerHelloV2::decode(h.frame->data(), h.frame->size(), first));
+    auto r = b.onHelloV2(first, 1 * kMs); ASSERT_TRUE(r.frame);
     pl::PeerRefuse ref; ASSERT_TRUE(pl::PeerRefuse::decode(r.frame->data(), r.frame->size(), ref));
     auto lg = a.onRefuse(ref, 5 * kMs);
     EXPECT_TRUE(lg.log && lg.logIsError) << "logged";
@@ -213,15 +216,16 @@ TEST(PeerHandshakeRegression, AnInitiatorRestartReestablishesWithAHigherIncarnat
 TEST(PeerHandshakeRegression, AnUnknownEpochFromASilentPeerRekeysWithoutDroppingTheLiveKeys) {
     Pair p(keys('k'), keys('k')); p.run();
     ASSERT_TRUE(p.ka && p.kb);
-    const auto firstHello = lastOf<pl::PeerHello>(p, 1);
+    const auto firstHello = lastOf<pl::PeerHelloV2>(p, 1);
     p.ka.reset(); p.kb.reset();
     auto o = p.a.onUnknownEpoch(7, 5'000 * kMs);   // silent for 5 s: the hint may start an exchange
     ASSERT_TRUE(o.frame) << "a fresh Hello";
     const auto* hs = std::get_if<pl::HelloSent>(&p.a.state());
     ASSERT_NE(hs, nullptr);
     ASSERT_TRUE(hs->prior) << "the old keys stay live until the exchange completes";
-    pl::PeerHello again; ASSERT_TRUE(pl::PeerHello::decode(o.frame->data(), o.frame->size(), again));
+    pl::PeerHelloV2 again; ASSERT_TRUE(pl::PeerHelloV2::decode(o.frame->data(), o.frame->size(), again));
     EXPECT_NE(again.nonceA, firstHello.nonceA);
+    EXPECT_NE(again.shareA, firstHello.shareA) << "a rekey draws a fresh ephemeral keypair";
     p.absorb(0, std::move(o));
     p.run(5'000 * kMs);
     ASSERT_TRUE(p.ka && p.kb);
@@ -239,10 +243,10 @@ TEST(PeerHandshakeRegression, TheCurrentEpochNamedAsUnknownIsIgnored) {
 TEST(PeerHandshakeRegression, AForgedAcceptNeverEstablishesTheInitiator) {
     pl::PeerHandshake a(1, 2, 10, keys('k')), b(2, 1, 20, keys('k'));
     auto h = a.tick(0);
-    pl::PeerHello hello; ASSERT_TRUE(pl::PeerHello::decode(h.frame->data(), h.frame->size(), hello));
-    auto c = b.onHello(hello, 0);
-    pl::PeerChallenge ch; ASSERT_TRUE(pl::PeerChallenge::decode(c.frame->data(), c.frame->size(), ch));
-    auto pr = a.onChallenge(ch, 0); ASSERT_TRUE(pr.frame);
+    pl::PeerHelloV2 hello; ASSERT_TRUE(pl::PeerHelloV2::decode(h.frame->data(), h.frame->size(), hello));
+    auto c = b.onHelloV2(hello, 0);
+    pl::PeerChallengeV2 ch; ASSERT_TRUE(pl::PeerChallengeV2::decode(c.frame->data(), c.frame->size(), ch));
+    auto pr = a.onChallengeV2(ch, 0); ASSERT_TRUE(pr.frame);
     ASSERT_TRUE(std::holds_alternative<pl::ChallengeSent>(a.state()));
     pl::PeerAccept forged; forged.from = 2; forged.to = 1; forged.linkEpoch = 99;     // no valid confirm
     auto f = a.onAccept(forged, 0);
@@ -256,12 +260,16 @@ TEST(PeerHandshakeRegression, ADuplicateHelloGetsTheSameChallengeAndNeverLeavesE
     const auto* before = std::get_if<pl::Established>(&p.b.state());
     ASSERT_NE(before, nullptr);
 
-    pl::PeerHello hello = lastOf<pl::PeerHello>(p, 1);
+    pl::PeerHelloV2 hello = lastOf<pl::PeerHelloV2>(p, 1);
     hello.nonceA.fill(0x42);
-    auto c1 = p.b.onHello(hello, 300 * kMs);
-    auto c2 = p.b.onHello(hello, 350 * kMs);
+    auto c1 = p.b.onHelloV2(hello, 300 * kMs);
+    auto c2 = p.b.onHelloV2(hello, 350 * kMs);
     ASSERT_TRUE(c1.frame && c2.frame);
-    EXPECT_EQ(*c1.frame, *c2.frame) << "idempotent for a repeated Hello";
+    EXPECT_EQ(*c1.frame, *c2.frame) << "idempotent for a repeated Hello (the same nonceB and the same shareB)";
+    hello.shareA[0] ^= 1;
+    auto c3 = p.b.onHelloV2(hello, 360 * kMs);
+    ASSERT_TRUE(c3.frame);
+    EXPECT_FALSE(*c3.frame == *c1.frame) << "another share is another Hello: a new Challenge";
     EXPECT_TRUE(std::holds_alternative<pl::Established>(p.b.state())) << "an unproven Hello never leaves Established";
 }
 
@@ -345,6 +353,8 @@ TEST(PeerLinkRegression, ForgedRefuseChallengeHelloNoLinkNeverDisruptALinkRegres
     }
     pl::PeerChallenge ch; ch.from = 2; ch.to = 1; ch.keyId = keys('k').current.keyId; ch.incarnation = 1;
     (void)p.a.onChallenge(ch, now);
+    pl::PeerChallengeV2 ch2; ch2.from = 2; ch2.to = 1; ch2.keyId = keys('k').current.keyId; ch2.incarnation = 1; ch2.shareB.fill(9);
+    (void)p.a.onChallengeV2(ch2, now);
     EXPECT_TRUE(std::holds_alternative<pl::Established>(p.a.state()));
     EXPECT_EQ(std::get<pl::Established>(p.a.state()).keys, liveA);
 
@@ -355,6 +365,7 @@ TEST(PeerLinkRegression, ForgedRefuseChallengeHelloNoLinkNeverDisruptALinkRegres
     (void)a2.onRefuse(r, 1 * kMs);
     ch.keyId = keys('k').current.keyId;
     (void)a2.onChallenge(ch, 2 * kMs);
+    (void)a2.onChallengeV2(ch2, 2 * kMs);
     EXPECT_TRUE(std::holds_alternative<pl::HelloSent>(a2.state()));
 
     // At the responder: a forged Proof and an unknown-key Hello leave the live link alone.
@@ -386,6 +397,9 @@ TEST(PeerLinkRegression, ARestartedPeerRelinksUnderAFloodRegression) {
         (void)p.a.onRefuse(r, now);
         pl::PeerChallenge ch; ch.from = 2; ch.to = 1; ch.keyId = keys('k').current.keyId; ch.incarnation = 9;
         (void)p.a.onChallenge(ch, now);
+        pl::PeerChallengeV2 ch2; ch2.from = 2; ch2.to = 1; ch2.keyId = keys('k').current.keyId; ch2.incarnation = 9;
+        ch2.shareB.fill(static_cast<uint8_t>(i + 1));
+        (void)p.a.onChallengeV2(ch2, now);
         pl::PeerHello f; f.from = 1; f.to = 2; f.keyId = keys('k').current.keyId; f.incarnation = 3;   // forged Hello at b
         f.nonceA.fill(static_cast<uint8_t>(i + 1));
         (void)p.b.onHello(f, now);
@@ -483,13 +497,13 @@ bool oneTrial(int trial, int forgedBetween) {
     int64_t now = 1'000 * kMs;
     for (std::size_t k = 0; k < pl::PeerHandshake::kPending; ++k) forge(static_cast<int>(k + 1), now);
     auto hello = a.tick(now);
-    pl::PeerHello h;
-    if (!hello.frame || !pl::PeerHello::decode(hello.frame->data(), hello.frame->size(), h)) return false;
-    auto ch = b.onHello(h, now);
-    pl::PeerChallenge c;
-    if (!ch.frame || !pl::PeerChallenge::decode(ch.frame->data(), ch.frame->size(), c)) return false;
+    pl::PeerHelloV2 h;
+    if (!hello.frame || !pl::PeerHelloV2::decode(hello.frame->data(), hello.frame->size(), h)) return false;
+    auto ch = b.onHelloV2(h, now);
+    pl::PeerChallengeV2 c;
+    if (!ch.frame || !pl::PeerChallengeV2::decode(ch.frame->data(), ch.frame->size(), c)) return false;
     for (int k = 0; k < forgedBetween; ++k) forge(100 + k, now);     // the round trip: forgeries keep arriving
-    auto pr = a.onChallenge(c, now + kMs);
+    auto pr = a.onChallengeV2(c, now + kMs);
     pl::PeerProof p;
     if (!pr.frame || !pl::PeerProof::decode(pr.frame->data(), pr.frame->size(), p)) return false;
     return b.onProof(p, now + 2 * kMs).established.has_value();
@@ -664,6 +678,166 @@ TEST(PeerHandshakeRegression, TheConfirmMessageRoundTripsAndRejectsWrongSizesReg
     EXPECT_FALSE(pl::PeerConfirm::decode(buf, pl::PeerConfirm::kSize + 1, d));
     pl::PeerAccept asAccept;
     EXPECT_FALSE(pl::PeerAccept::decode(buf, pl::PeerAccept::kSize, asAccept)) << "same size, other tag";
-    buf[0] = 7;
+    buf[0] = 9;   // 7 / 8 are HelloV2 / ChallengeV2 (issue #242)
     EXPECT_EQ(pl::peekPeerMsg(buf, pl::PeerConfirm::kSize), 0) << "an unknown tag";
+}
+
+// ---- issue #242: forward secrecy - an X25519 ephemeral secret mixed into the link keys ----
+
+namespace {
+/// The v1 transcript MAC exactly as a pre-#242 broker computes it (PeerHandshake.h): lets a test play a legacy peer.
+std::array<uint8_t, 64> v1Mac(const pl::ClusterKey& key, bool isB, int32_t idA, int32_t idB, const std::array<uint8_t, 32>& nonceA,
+                              const std::array<uint8_t, 32>& nonceB, uint64_t incA, uint64_t incB, uint64_t keyId) {
+    std::vector<uint8_t> buf;
+    const std::string label = isB ? "rune-peer-v1|B" : "rune-peer-v1|A";
+    buf.insert(buf.end(), label.begin(), label.end());
+    auto put = [&](uint64_t v, int n) { for (int i = 0; i < n; ++i) buf.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto putN = [&](const std::array<uint8_t, 32>& a) { buf.insert(buf.end(), a.begin(), a.end()); };
+    if (isB) { put(static_cast<uint32_t>(idB), 4); put(static_cast<uint32_t>(idA), 4); putN(nonceA); putN(nonceB); put(incA, 8); put(incB, 8); }
+    else     { put(static_cast<uint32_t>(idA), 4); put(static_cast<uint32_t>(idB), 4); putN(nonceB); putN(nonceA); put(incB, 8); put(incA, 8); }
+    put(keyId, 8);
+    rune::crypto::DigestBytes d;
+    EXPECT_TRUE(rune::crypto::hmac(rune::crypto::Digest::Sha512, {key.master.data(), key.master.size()}, buf, d));
+    std::array<uint8_t, 64> out{};
+    std::copy_n(d.bytes.begin(), 64, out.begin());
+    return out;
+}
+const std::array<uint8_t, 32> kZero32{};
+} // namespace
+
+TEST(PeerHandshakeRegression, AHandshakeCarriesEphemeralSharesCoveredByTheMacsRegression) {
+    {   // The wire: a new pair speaks only v2, with non-zero shares, and links.
+        Pair p(keys('k'), keys('k')); p.run();
+        ASSERT_TRUE(p.ka && p.kb);
+        for (const auto& [to, f] : p.trace) {
+            ASSERT_FALSE(f.empty());
+            EXPECT_NE(f[0], static_cast<uint8_t>(pl::PeerMsg::Hello)) << "no v1 Hello";
+            EXPECT_NE(f[0], static_cast<uint8_t>(pl::PeerMsg::Challenge)) << "no v1 Challenge";
+        }
+        EXPECT_NE(lastOf<pl::PeerHelloV2>(p, 1).shareA, kZero32);
+        EXPECT_NE(lastOf<pl::PeerChallengeV2>(p, 0).shareB, kZero32);
+        EXPECT_NE(lastOf<pl::PeerHelloV2>(p, 1).shareA, lastOf<pl::PeerChallengeV2>(p, 0).shareB);
+    }
+    {   // shareB flipped in transit: macB covers it - the initiator refuses (BadProof), no Proof, no keys.
+        pl::PeerHandshake a(1, 2, 10, keys('k')), b(2, 1, 20, keys('k'));
+        auto h = a.tick(0); ASSERT_TRUE(h.frame);
+        pl::PeerHelloV2 hello; ASSERT_TRUE(pl::PeerHelloV2::decode(h.frame->data(), h.frame->size(), hello));
+        auto c = b.onHelloV2(hello, 0); ASSERT_TRUE(c.frame);
+        pl::PeerChallengeV2 ch; ASSERT_TRUE(pl::PeerChallengeV2::decode(c.frame->data(), c.frame->size(), ch));
+        auto tampered = ch; tampered.shareB[7] ^= 0x01;
+        auto o = a.onChallengeV2(tampered, 0);
+        EXPECT_FALSE(o.frame) << "no Proof for a tampered share";
+        EXPECT_FALSE(o.established);
+        ASSERT_TRUE(o.log); EXPECT_TRUE(o.logIsError);
+        EXPECT_NE(o.log->find("bad proof"), std::string::npos) << o.log->str();
+        EXPECT_TRUE(std::holds_alternative<pl::HelloSent>(a.state())) << "the state stays, as for a bad MAC";
+        auto ok = a.onChallengeV2(ch, 0);
+        EXPECT_TRUE(ok.frame) << "the untouched Challenge is still good";
+    }
+    {   // shareA flipped on the way to the responder: its Challenge MAC covers the flipped share, the initiator refuses.
+        pl::PeerHandshake a(1, 2, 10, keys('k')), b(2, 1, 20, keys('k'));
+        auto h = a.tick(0); ASSERT_TRUE(h.frame);
+        pl::PeerHelloV2 hello; ASSERT_TRUE(pl::PeerHelloV2::decode(h.frame->data(), h.frame->size(), hello));
+        hello.shareA[3] ^= 0x80;
+        auto c = b.onHelloV2(hello, 0); ASSERT_TRUE(c.frame);
+        pl::PeerChallengeV2 ch; ASSERT_TRUE(pl::PeerChallengeV2::decode(c.frame->data(), c.frame->size(), ch));
+        auto o = a.onChallengeV2(ch, 0);
+        EXPECT_FALSE(o.frame);
+        EXPECT_FALSE(o.established);
+        EXPECT_TRUE(o.logIsError);
+        EXPECT_TRUE(std::holds_alternative<pl::HelloSent>(a.state()));
+    }
+}
+
+TEST(PeerHandshakeRegression, RecordedTrafficAndTheMasterDoNotYieldTheLinkKeysRegression) {
+    Pair p(keys('k'), keys('k')); p.run();
+    ASSERT_TRUE(p.ka && p.kb);
+    // Everything a passive recorder saw, plus the cluster key it stole later.
+    const auto hello = lastOf<pl::PeerHelloV2>(p, 1);
+    const auto ch = lastOf<pl::PeerChallengeV2>(p, 0);
+    const auto accept = lastOf<pl::PeerAccept>(p, 0);
+    const auto master = keys('k').current;
+    ASSERT_EQ(accept.linkEpoch, p.ka->epoch);
+    std::vector<std::optional<pl::LinkKeys>> guesses;
+    guesses.push_back(pl::deriveLinkKeys(master, 1, 2, true, hello.nonceA, ch.nonceB, accept.linkEpoch, std::nullopt));
+    guesses.push_back(pl::deriveLinkKeys(master, 1, 2, true, hello.nonceA, ch.nonceB, accept.linkEpoch,
+                                         std::span<const uint8_t, 32>(hello.shareA)));
+    guesses.push_back(pl::deriveLinkKeys(master, 1, 2, true, hello.nonceA, ch.nonceB, accept.linkEpoch,
+                                         std::span<const uint8_t, 32>(ch.shareB)));
+    std::array<uint8_t, 32> x{};
+    for (std::size_t i = 0; i < 32; ++i) x[i] = hello.shareA[i] ^ ch.shareB[i];
+    guesses.push_back(pl::deriveLinkKeys(master, 1, 2, true, hello.nonceA, ch.nonceB, accept.linkEpoch,
+                                         std::span<const uint8_t, 32>(x)));
+    for (std::size_t g = 0; g < guesses.size(); ++g) {
+        ASSERT_TRUE(guesses[g]) << g;
+        EXPECT_NE(guesses[g]->sendMaster, p.ka->sendMaster) << "guess " << g;
+        EXPECT_NE(guesses[g]->recvMaster, p.ka->recvMaster) << "guess " << g;
+        EXPECT_NE(guesses[g]->sendMaster, p.kb->recvMaster) << "guess " << g;
+    }
+    // The real ends still agree with each other.
+    EXPECT_EQ(p.ka->sendMaster, p.kb->recvMaster);
+    EXPECT_EQ(p.ka->recvMaster, p.kb->sendMaster);
+}
+
+TEST(PeerHandshakeRegression, AV1HelloStillLinksWithNoForwardSecrecyRegression) {
+    // A legacy (pre-#242) initiator: a v1 Hello, a v1 Proof.  The new responder answers in v1 and derives v1 keys.
+    const auto master = keys('k').current;
+    pl::PeerHandshake b(2, 1, 20, keys('k'));
+    pl::PeerHello h; h.from = 1; h.to = 2; h.keyId = master.keyId; h.incarnation = 10; h.nonceA.fill(0x5c);
+    auto c = b.onHello(h, 0);
+    ASSERT_TRUE(c.frame);
+    ASSERT_EQ(c.frame->data()[0], static_cast<uint8_t>(pl::PeerMsg::Challenge)) << "a v1 Hello gets a v1 Challenge";
+    pl::PeerChallenge ch; ASSERT_TRUE(pl::PeerChallenge::decode(c.frame->data(), c.frame->size(), ch));
+    EXPECT_EQ(ch.macB, v1Mac(master, true, 1, 2, h.nonceA, ch.nonceB, 10, 20, master.keyId)) << "the v1 macB, byte-identical";
+    auto again = b.onHello(h, kMs);
+    ASSERT_TRUE(again.frame);
+    EXPECT_EQ(*again.frame, *c.frame) << "a repeated v1 Hello gets the same v1 Challenge";
+    pl::PeerProof pr; pr.from = 1; pr.to = 2; pr.macA = v1Mac(master, false, 1, 2, h.nonceA, ch.nonceB, 10, 20, master.keyId);
+    auto acc = b.onProof(pr, 2 * kMs);
+    ASSERT_TRUE(acc.established) << "the legacy initiator links";
+    const auto want = pl::deriveLinkKeys(master, 2, 1, false, h.nonceA, ch.nonceB, acc.established->epoch, std::nullopt);
+    ASSERT_TRUE(want);
+    EXPECT_EQ(acc.established->sendMaster, want->sendMaster) << "v1 keys: no forward secrecy for a legacy peer";
+    EXPECT_EQ(acc.established->recvMaster, want->recvMaster);
+}
+
+TEST(PeerHandshakeRegression, AV1ChallengeToAV2HelloIsRefusedRegression) {
+    const auto master = keys('k').current;
+    pl::PeerHandshake a(1, 2, 10, keys('k'));
+    auto h = a.tick(0); ASSERT_TRUE(h.frame);
+    pl::PeerHelloV2 hello; ASSERT_TRUE(pl::PeerHelloV2::decode(h.frame->data(), h.frame->size(), hello));
+    // A v1 Challenge with a VALID v1 MAC over our nonce (what a stripping attacker holding the master could forge).
+    pl::PeerChallenge ch; ch.from = 2; ch.to = 1; ch.keyId = master.keyId; ch.incarnation = 20; ch.nonceB.fill(0x6d);
+    ch.macB = v1Mac(master, true, 1, 2, hello.nonceA, ch.nonceB, 10, 20, master.keyId);
+    auto o = a.onChallenge(ch, kMs);
+    EXPECT_FALSE(o.frame) << "no v1 Proof: the downgrade is refused";
+    EXPECT_FALSE(o.established);
+    ASSERT_TRUE(o.log);
+    EXPECT_TRUE(o.logIsError) << "logged through the (rate-limited) refusal path";
+    EXPECT_NE(o.log->find("downgrade"), std::string::npos) << o.log->str();
+    EXPECT_TRUE(std::holds_alternative<pl::HelloSent>(a.state()));
+    // The real v2 responder still links afterwards.
+    pl::PeerHandshake b(2, 1, 20, keys('k'));
+    auto c = b.onHelloV2(hello, kMs); ASSERT_TRUE(c.frame);
+    pl::PeerChallengeV2 ch2; ASSERT_TRUE(pl::PeerChallengeV2::decode(c.frame->data(), c.frame->size(), ch2));
+    EXPECT_TRUE(a.onChallengeV2(ch2, 2 * kMs).frame);
+}
+
+TEST(PeerHandshakeRegression, TheV2MessagesRoundTripAndRejectWrongSizesRegression) {
+    pl::PeerHelloV2 h; h.from = 1; h.to = 2; h.keyId = 0x0123456789abcdefULL; h.incarnation = 7; h.nonceA.fill(3); h.shareA.fill(4);
+    pl::PeerChallengeV2 c; c.from = 2; c.to = 1; c.keyId = 9; c.incarnation = 8; c.nonceB.fill(5); c.macB.fill(6); c.shareB.fill(7);
+    static_assert(pl::kMaxPeerLinkFrame == pl::PeerChallengeV2::kSize);
+    static_assert(pl::kMaxPeerLinkFrame <= pl::PeerHandshake::FrameBuf::kCap);
+    uint8_t buf[pl::kMaxPeerLinkFrame];
+    h.encode(buf);
+    EXPECT_EQ(pl::peekPeerMsg(buf, pl::PeerHelloV2::kSize), 7);
+    pl::PeerHelloV2 hd; ASSERT_TRUE(pl::PeerHelloV2::decode(buf, pl::PeerHelloV2::kSize, hd));
+    EXPECT_EQ(hd.keyId, h.keyId); EXPECT_EQ(hd.nonceA, h.nonceA); EXPECT_EQ(hd.shareA, h.shareA); EXPECT_EQ(hd.incarnation, 7u);
+    EXPECT_FALSE(pl::PeerHelloV2::decode(buf, pl::PeerHelloV2::kSize - 1, hd));
+    { pl::PeerHello v1; EXPECT_FALSE(pl::PeerHello::decode(buf, pl::PeerHello::kSize, v1)) << "another tag"; }
+    c.encode(buf);
+    EXPECT_EQ(pl::peekPeerMsg(buf, pl::PeerChallengeV2::kSize), 8);
+    pl::PeerChallengeV2 cd; ASSERT_TRUE(pl::PeerChallengeV2::decode(buf, pl::PeerChallengeV2::kSize, cd));
+    EXPECT_EQ(cd.nonceB, c.nonceB); EXPECT_EQ(cd.macB, c.macB); EXPECT_EQ(cd.shareB, c.shareB); EXPECT_EQ(cd.keyId, 9u);
+    EXPECT_FALSE(pl::PeerChallengeV2::decode(buf, pl::PeerChallengeV2::kSize + 1, cd));
 }
