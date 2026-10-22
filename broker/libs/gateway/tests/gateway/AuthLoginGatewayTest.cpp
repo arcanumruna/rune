@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <limits>
 #include <random>
 
 using namespace rune::gateway;
@@ -1057,4 +1058,160 @@ TEST(AuthRestartRegression, EndingStaleSessionsTwiceTellsEachSessionOnceAdversar
     EXPECT_EQ(endsOf(a.sid), 1);
     EXPECT_EQ(endsOf(b.sid), 1);
     EXPECT_EQ(rig.gw.sessionsEndedUnavailable(), 2u);
+}
+
+// ── #205 adversarial review (PR #516): a login against a view behind events this broker holds ───────────────────────
+namespace {
+constexpr uint16_t kAuthFailed = static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed);
+constexpr uint16_t kAuthUnavailable = static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable);
+
+/// The first leg only: the session, the client nonce and the decoded AuthServerFirst (nullopt = refused there).
+struct SplitFirstLeg { int64_t sid = 0, corr = 0; std::string nonce; std::optional<pc::AuthServerFirst> first; std::vector<uint8_t> bytes; };
+SplitFirstLeg splitFirstLeg(Rig& rig, const std::string& user, const std::string& host = "10.0.0.9") {
+    SplitFirstLeg l;
+    l.sid = rig.newSession(host);
+    l.nonce = "nonce-split-" + std::to_string(++rig.corr);
+    pc::AuthClientFirst cf;
+    cf.sessionId = l.sid; cf.correlationId = ++rig.corr; cf.username = user; cf.clientNonce = l.nonce;
+    l.corr = cf.correlationId;
+    std::vector<uint8_t> b(cf.encodedSize()); b.resize(cf.encode(b.data()));
+    rig.send(b);
+    if (const Frame* f = rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFirst), l.sid)) {
+        l.bytes = f->bytes;
+        l.first = pc::AuthServerFirst::decode(l.bytes.data(), l.bytes.size());
+    }
+    return l;
+}
+std::optional<pc::AuthServerFinal> splitFinalLeg(Rig& rig, const SplitFirstLeg& l, const std::string& user, const std::string& pw) {
+    auto ans = scramAnswer(user, l.nonce, *l.first, {pw, ""}, l.sid, l.corr);
+    std::vector<uint8_t> fb(ans->final.encodedSize()); fb.resize(ans->final.encode(fb.data()));
+    rig.send(fb);
+    const Frame* fin = rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), l.sid);
+    if (fin == nullptr) return std::nullopt;
+    return pc::AuthServerFinal::decode(fin->bytes.data(), fin->bytes.size());
+}
+void applyCreateUser(Rig& rig, const std::string& name, const char* pw, uint8_t seed) {
+    const auto ev = rig.chain.emit(rune::security::CreateUserOps{scramVerifierOf(pw, seed)}, name,
+                                   "CREATE USER " + name + " WITH PASSWORD '<redacted>';");
+    const auto bytes = rune::security::encode(ev);
+    ASSERT_TRUE(bytes.has_value());
+    const int64_t off = static_cast<int64_t>(rig.chain.count()) - 1;
+    auto applied = rig.view.onApplied(off, *bytes);
+    ASSERT_TRUE(applied.has_value()) << applied.error().detail;
+    rig.gw.onSecurityApplied(off, *applied);
+}
+}  // namespace
+
+// The verifiers a final leg is checked against are COPIED at the first leg.  A first leg that ran while the view was
+// behind (the just-created user unknown: fake salt) and a final that arrives after the view caught up (the client spent
+// its PBKDF2 time in between) used to be judged "not behind" and answered the terminal 44 - #205 again, in its most
+// likely timing.  The proof failed against a superseded state: retriable 48; the next login succeeds.
+TEST(AuthLaggingViewRegression, AFirstLegOnALaggingViewAndAFinalAfterItCaughtUpIsRetriableAdversarialRegression) {
+    Rig rig;
+    const int64_t applied = rig.view.appliedOffset();
+    rig.gw.setSecurityKnownEnd(applied + 2);   // this broker holds one event (CREATE USER fresh) it has not applied
+    const SplitFirstLeg l = splitFirstLeg(rig, "fresh");
+    ASSERT_TRUE(l.first.has_value()) << "the unknown user gets the fake salt, never a refusal at the first leg";
+    applyCreateUser(rig, "fresh", kTestPasswordA, 11);
+    ASSERT_EQ(rig.view.appliedOffset(), applied + 1) << "precondition: the view is caught up before the final leg";
+    const auto fin = splitFinalLeg(rig, l, "fresh", kTestPasswordA);
+    ASSERT_TRUE(fin.has_value());
+    EXPECT_EQ(fin->errorCode, kAuthUnavailable) << "checked against the lagging first-leg state: never the terminal 44";
+    EXPECT_FALSE(rig.gw.hasSessionForTest(l.sid));
+    const auto again = rig.login("fresh", {kTestPasswordA, ""});
+    ASSERT_TRUE(again.fin.has_value());
+    EXPECT_EQ(again.fin->errorCode, 0) << "the retry logs in";
+}
+
+// The same with a state change the first leg could not see at all (knownEnd did not cover it yet): the view applied a
+// SET PASSWORD between the legs - the final's verifiers are the OLD ones, so the new password fails against a state
+// that is no longer current.  Retriable, never terminal.
+TEST(AuthLaggingViewRegression, AStateAppliedBetweenTheLegsMakesTheFailureRetriableAdversarialRegression) {
+    Rig rig;
+    const SplitFirstLeg l = splitFirstLeg(rig, "ws2");
+    ASSERT_TRUE(l.first.has_value());
+    const auto ev = rig.chain.emit(rune::security::AlterUserOps{rune::security::SetPassword{scramVerifierOf("brand new password 1", 12), false}},
+                                   "ws2", "ALTER USER ws2 SET PASSWORD '<redacted>';");
+    const int64_t off = static_cast<int64_t>(rig.chain.count()) - 1;
+    auto a = rig.view.onApplied(off, *rune::security::encode(ev));
+    ASSERT_TRUE(a.has_value()) << a.error().detail;
+    rig.gw.onSecurityApplied(off, *a);
+    rig.gw.setSecurityKnownEnd(off + 1);   // caught up
+    const auto fin = splitFinalLeg(rig, l, "ws2", "brand new password 1");
+    ASSERT_TRUE(fin.has_value());
+    EXPECT_EQ(fin->errorCode, kAuthUnavailable);
+    const auto again = rig.login("ws2", {"brand new password 1", ""});
+    ASSERT_TRUE(again.fin.has_value());
+    EXPECT_EQ(again.fin->errorCode, 0);
+    // A wrong password against a state that did not move between the legs is still terminal.
+    const auto wrong = rig.login("ws2", {"not the password 99", ""}, "10.0.0.77");
+    ASSERT_TRUE(wrong.fin.has_value());
+    EXPECT_EQ(wrong.fin->errorCode, kAuthFailed);
+}
+
+// knownEnd bounds: only an end PAST the next event to apply makes the view "behind".  -1 (none posted), 0, the applied
+// offset (a truncated log re-posted lower) and applied+1 (exactly caught up) keep the terminal 44; applied+2 and the
+// i64 max answer 48.  A halted view keeps its own fail-closed 44 however far behind it is, and a correct password is
+// never refused for the lag.
+TEST(AuthLaggingViewRegression, KnownEndBoundsHaltAndSuccessAdversarialRegression) {
+    Rig rig;
+    const int64_t applied = rig.view.appliedOffset();
+    int host = 0;
+    const auto wrongCode = [&](int64_t knownEnd) {
+        rig.gw.setSecurityKnownEnd(knownEnd);
+        const auto o = rig.login("ws1", {"wrong password 000", ""}, "10.1.0." + std::to_string(++host));
+        return o.fin ? o.fin->errorCode : uint16_t{0xFFFF};
+    };
+    for (const int64_t k : {int64_t{-1}, int64_t{0}, applied, applied + 1})
+        EXPECT_EQ(wrongCode(k), kAuthFailed) << "knownEnd " << k;
+    for (const int64_t k : {applied + 2, std::numeric_limits<int64_t>::max()})
+        EXPECT_EQ(wrongCode(k), kAuthUnavailable) << "knownEnd " << k;
+    rig.gw.setSecurityKnownEnd(applied + 5);
+    const auto ok = rig.login("ws1", {kTestPasswordA, ""}, "10.2.0.1");
+    ASSERT_TRUE(ok.fin.has_value());
+    EXPECT_EQ(ok.fin->errorCode, 0) << "behind is never a reason to refuse a valid proof";
+    rune::security::ApplyError err; err.offset = applied + 1; err.detail = "test halt";
+    rig.view.onHalted(err);
+    const auto halted = rig.login("ws1", {kTestPasswordA, ""}, "10.2.0.2");
+    ASSERT_TRUE(halted.fin.has_value());
+    EXPECT_EQ(halted.fin->errorCode, kAuthFailed) << "a halted view fails closed (D28), never retriable";
+}
+
+// Enumeration: while behind, an unknown user, a wrong password and a disabled account answer byte-for-byte alike
+// (apart from the session / correlation ids): 48, the same detail, no signature, no retry hint.
+TEST(AuthLaggingViewRegression, WhileBehindUnknownWrongAndDisabledAnswerAlikeAdversarialRegression) {
+    Rig rig;
+    rig.gw.setSecurityKnownEnd(rig.view.appliedOffset() + 2);
+    const auto unknown  = rig.login("nobody", {kTestPasswordA, ""}, "10.3.0.1");
+    const auto wrong    = rig.login("ws1", {"wrong password 000", ""}, "10.3.0.2");
+    const auto disabled = rig.login("off", {kTestPasswordA, ""}, "10.3.0.3");
+    for (const auto* o : {&unknown, &wrong, &disabled}) {
+        ASSERT_TRUE(o->fin.has_value());
+        EXPECT_EQ(o->fin->errorCode, kAuthUnavailable);
+        EXPECT_TRUE(o->fin->serverSignature.empty());
+        EXPECT_EQ(o->fin->retryAfterMs, 0u);
+        EXPECT_EQ(o->fin->detail, unknown.fin->detail);
+        EXPECT_EQ(o->finBytes.size(), unknown.finBytes.size());
+        EXPECT_EQ(o->firstBytes.size(), unknown.firstBytes.size()) << "the first legs are alike too (fake slots)";
+    }
+}
+
+// Throttle bypass: a 48 for a failed proof is still a verified guess - charged.  The same (user, host) pair gets its
+// two free failures, the third sets the delay, and the next attempt is the rate-limited 44 with retryAfterMs at the
+// FIRST leg, never a fourth verified proof.
+TEST(AuthLaggingViewRegression, FailedProofsWhileBehindAreChargedToTheThrottleAdversarialRegression) {
+    Rig rig;
+    rig.gw.setSecurityKnownEnd(rig.view.appliedOffset() + 2);
+    for (int i = 0; i < 3; ++i) {
+        const auto o = rig.login("ws1", {"guess " + std::to_string(i) + " xxxxxxxx", ""}, "10.4.0.1");
+        ASSERT_TRUE(o.fin.has_value()) << i;
+        EXPECT_EQ(o.fin->errorCode, kAuthUnavailable) << i;
+    }
+    EXPECT_EQ(rig.gw.loginsFailed(), 3u);
+    const auto limited = rig.login("ws1", {kTestPasswordA, ""}, "10.4.0.1");
+    ASSERT_TRUE(limited.fin.has_value());
+    EXPECT_TRUE(limited.firstBytes.empty()) << "refused at the first leg";
+    EXPECT_EQ(limited.fin->errorCode, kAuthFailed);
+    EXPECT_GT(limited.fin->retryAfterMs, 0u);
+    EXPECT_EQ(rig.gw.loginsRateLimited(), 1u);
 }

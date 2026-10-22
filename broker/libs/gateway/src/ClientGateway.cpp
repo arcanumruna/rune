@@ -8203,6 +8203,8 @@ std::optional<rune::gateway::Denial> ClientGateway::authorizeTopicIdHere_(const 
     auto d = rune::gateway::authorizeTopicId(perms, topicId, op, objectIndex_, shownType);
     if (!d || objectIndex_.at(topicId) != nullptr) return d;
     if (partition >= rune::metadata::kMaxGpidPartitions) return d;   // never placed: would alias the next id's gpid
+    // #511: a view sink is placed but never indexed as a topic - it is known here, not waiting to be applied.
+    if (topicRegistry_ != nullptr && topicRegistry_->isViewSink(topicId)) return d;
     if (unappliedTopicCode_(topicId, partition < 0 ? 0 : partition) == pc::ErrorCode::NotLeader)
         d->code = static_cast<uint16_t>(pc::ErrorCode::NotLeader);
     return d;
@@ -8513,6 +8515,8 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
         failLogin_(*session, m->correlationId, 0);
         return;
     }
+    plan.next.viewAppliedAtFirst = securityView_->appliedOffset();   // #205: what the verifiers were copied from
+    plan.next.viewBehindAtFirst  = securityViewBehind_();
     session->auth = std::move(plan.next);
     sendAnswer_(*session, plan.frame.data(), plan.frame.size());
 }
@@ -8561,6 +8565,17 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         if (unauthLog_.due(8 + static_cast<std::size_t>(*failure))) [[unlikely]]   // per reason
             spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost, session->sessionId,
                          loginFailureName(*failure));
+        // #205: a proof that fails against a view behind events this broker already holds (a just-created user, a
+        // just-changed password, a just-enabled user) is not a verdict yet - retriable, never the terminal 44.  Still
+        // counted and throttled.  The verifiers were copied at the FIRST leg (PR #516 review): a first leg on a lagging
+        // view, or a view that applied an event between the legs, made the proof fail against a superseded state too.
+        // (These three reasons are only reached with a live, unhalted view.)
+        if ((*failure == LoginFailure::BadProof || *failure == LoginFailure::UnknownUser || *failure == LoginFailure::Disabled) &&
+            (securityViewBehind_() || st->viewBehindAtFirst || st->viewAppliedAtFirst != securityView_->appliedOffset()))
+            [[unlikely]] {
+            unavailableLogin_(*session, hdr->correlationId, user);
+            return;
+        }
         failLogin_(*session, hdr->correlationId, 0);
         return;
     }

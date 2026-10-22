@@ -27,6 +27,7 @@
 
 #include <climits>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <random>
@@ -292,6 +293,24 @@ TEST(AuthUnappliedTopicRegression, ATopicPlacedButNotAppliedHereIsRetriableNotUn
     }
 }
 
+// #511: a view sink id is placed (its source's placement) but never indexed as a topic, so it looked "placed but not
+// applied here" for good - an ungranted Produce / Subscribe got the retriable NotLeader forever and a hidden sink was
+// distinguishable from a missing id.  A sink the registry knows answers like a missing id: 45, never 2.
+TEST(AuthUnappliedTopicRegression, AnUngrantedViewSinkIdIsNotAuthorizedNeverNotLeaderRegression) {
+    Rig r;
+    rune::node::TopicSpec sink;
+    sink.name = "hidden_sink"; sink.partitionCount = 1; sink.viewSink = true;
+    ASSERT_EQ(r.registry->createTopicAt(kPlaced, sink), kPlaced);
+    ASSERT_TRUE(r.registry->isViewSink(kPlaced));
+    ASSERT_EQ(r.gw.objectIndex().at(kPlaced), nullptr) << "precondition: a sink is never in the object index as a topic";
+    for (const auto& [what, corr] : {std::pair<const char*, int64_t>{"Produce", r.produce(kPlaced)},
+                                     {"Subscribe", r.subscribe(kPlaced)}}) {
+        const auto code = r.codeOf(corr);
+        ASSERT_TRUE(code.has_value()) << what << ": answered, never silent";
+        EXPECT_EQ(*code, kNotAuthorized) << what << ": a hidden sink answers like a missing id (M14 / D22)";
+    }
+}
+
 TEST(AuthUnappliedTopicRegression, AnIdNeitherAppliedNorPlacedKeepsTheD22DenialRegression) {
     Rig r;
     for (const auto& [what, corr] : {std::pair<const char*, int64_t>{"Produce", r.produce(kMissing)},
@@ -479,4 +498,40 @@ TEST(AuthUnappliedTopicRegression, GetTopicSchemaNameBoundsResolveByExactMatchAd
     const std::string huge = "pay" + std::string(65535 - 3, 'x');
     EXPECT_EQ(r.codeOf(r.getTopicSchema(huge)), std::nullopt);
     EXPECT_EQ(r.codeOf(r.getTopicSchema("payments")), kNotAuthorized);
+}
+
+// #511 adversarial review (PR #516): every id-addressed template, on a view sink id, answers EXACTLY like a missing id
+// (D22 / M14) - Produce, Subscribe, GetViewRow, the group templates (JoinGroup, OffsetCommit, OffsetFetch) and the txn
+// templates (AddPartitionsToTxn, TxnOffsetCommit), with a partition known, unknown (-1) and past the gpid range.  A
+// sink is never "placed but not applied here": the retriable NotLeader would retry forever and tell a hidden sink
+// from a missing id.  The coordination services are never reached.
+TEST(AuthUnappliedTopicRegression, AViewSinkIdAnswersLikeAMissingIdOnEveryTemplateAdversarialRegression) {
+    Rig r({}, {{rune::metadata::gpidOf(0, 0), 1, 1}, {rune::metadata::gpidOf(kPlaced, 0), 1, 1}});
+    rune::node::TopicSpec sink;
+    sink.name = "w.sink"; sink.partitionCount = 1; sink.viewSink = true;   // a name a grant prefix could match
+    ASSERT_EQ(r.registry->createTopicAt(kPlaced, sink), kPlaced);
+    ASSERT_TRUE(r.registry->isViewSink(kPlaced));
+    struct Op { const char* what; std::function<int64_t(int32_t)> send; };
+    const std::vector<Op> ops = {
+        {"Produce",            [&](int32_t id) { return r.produce(id); }},
+        {"Subscribe",          [&](int32_t id) { return r.subscribe(id); }},
+        {"Subscribe p=-1",     [&](int32_t id) { return r.subscribe(id, -1); }},
+        {"GetViewRow",         [&](int32_t id) { return r.getViewRow(id); }},
+        {"JoinGroup",          [&](int32_t id) { return r.joinGroup(id); }},
+        {"OffsetCommit",       [&](int32_t id) { return r.offsetCommit(id, 0); }},
+        {"OffsetCommit p=max", [&](int32_t id) { return r.offsetCommit(id, rune::metadata::kMaxGpidPartitions); }},
+        {"OffsetFetch",        [&](int32_t id) { return r.offsetFetch(id, 0); }},
+        {"AddPartitionsToTxn", [&](int32_t id) { return r.addPartitionsToTxn(id, 0); }},
+        {"TxnOffsetCommit",    [&](int32_t id) { return r.txnOffsetCommit(id, 0); }},
+    };
+    for (const Op& op : ops) {
+        const auto sinkCode = r.codeOf(op.send(kPlaced));
+        const auto missingCode = r.codeOf(op.send(kMissing));
+        ASSERT_TRUE(sinkCode.has_value()) << op.what << ": answered, never silent";
+        ASSERT_TRUE(missingCode.has_value()) << op.what;
+        EXPECT_EQ(*sinkCode, *missingCode) << op.what << ": a hidden sink answers like a missing id";
+        EXPECT_NE(*sinkCode, kNotLeader) << op.what << ": never the retriable NotLeader for a sink";
+    }
+    EXPECT_EQ(r.group.calls, 0);
+    EXPECT_EQ(r.txn.calls, 0);
 }

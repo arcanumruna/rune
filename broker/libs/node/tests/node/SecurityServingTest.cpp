@@ -7,6 +7,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 using rune::node::SecurityCatchUp;
 using rune::node::SecurityServing;
 
@@ -295,4 +297,25 @@ TEST(SecurityServingRegression, AFlappingContactNeverMakesItStaleAndEachEpisodeE
         EXPECT_TRUE(s.step(t, true).changed);
         EXPECT_TRUE(s.serving());
     }
+}
+
+// #205 adversarial review (PR #516): the knownEnd field round-trips at its bounds, the epoch / role survive beside it,
+// and the asLeader byte is still range-checked in the full overload.
+TEST(SecurityServingRegression, TheKnownEndFieldRoundTripsAtItsBoundsAdversarialRegression) {
+    for (const int64_t k : {int64_t{-1}, int64_t{0}, int64_t{1}, std::numeric_limits<int64_t>::max(), std::numeric_limits<int64_t>::min()}) {
+        uint8_t buf[rune::node::kSecurityServingWireLen + 4];
+        rune::node::writeSecurityServing(buf, true, 77, 9, true, k);
+        bool up = false, leader = false; int64_t hw = 0, known = 123; int32_t epoch = 0;
+        for (std::size_t n = 0; n <= sizeof buf; ++n)
+            EXPECT_EQ(rune::node::decodeSecurityServing(buf, n, up, hw, epoch, leader, known), n == rune::node::kSecurityServingWireLen) << n;
+        ASSERT_TRUE(rune::node::decodeSecurityServing(buf, rune::node::kSecurityServingWireLen, up, hw, epoch, leader, known));
+        EXPECT_TRUE(up); EXPECT_EQ(hw, 77); EXPECT_EQ(epoch, 9); EXPECT_TRUE(leader); EXPECT_EQ(known, k);
+        buf[13] = 2;
+        EXPECT_FALSE(rune::node::decodeSecurityServing(buf, rune::node::kSecurityServingWireLen, up, hw, epoch, leader, known));
+    }
+    uint8_t d[rune::node::kSecurityServingWireLen];
+    rune::node::writeSecurityServing(d, false, 5);   // the defaulted arguments: knownEnd -1 (never "behind")
+    bool up = true, leader = true; int64_t hw = 0, known = 0; int32_t epoch = 0;
+    ASSERT_TRUE(rune::node::decodeSecurityServing(d, sizeof d, up, hw, epoch, leader, known));
+    EXPECT_EQ(known, -1);
 }

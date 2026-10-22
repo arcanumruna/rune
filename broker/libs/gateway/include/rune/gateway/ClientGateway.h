@@ -441,6 +441,11 @@ public:
     /// broker sets false at boot).
     void setSecurityServing(bool serving) noexcept { securityServing_ = serving; }
     [[nodiscard]] bool securityServing() const noexcept { return securityServing_; }
+    /// #205, control thread: the `__security` offset this broker knows events exist up to (exclusive; its log end or
+    /// the leader's HW).  While the view has applied less, a failed login proof is not a verdict - the user may have
+    /// been created or re-keyed by an event this broker holds but has not applied yet - so it answers the retriable
+    /// AuthUnavailable (48) instead of the terminal AuthenticationFailed (44).
+    void setSecurityKnownEnd(int64_t knownEnd) noexcept { securityKnownEnd_ = knownEnd; }
     /// Issues #15 / #111: this broker stayed stale longer than R - every authenticated / must-change-password session
     /// is told AuthUnavailable at session level (corr 0) and closed; its client reconnects to a current broker.
     void endSessionsSecurityUnavailable();
@@ -2319,6 +2324,11 @@ private:
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
     const rune::gateway::SecurityView* securityView_ = nullptr;   // control thread's own mirror (same thread as the gateway)
     bool     securityServing_ = true;           ///< issues #15 / #111: see setSecurityServing
+    int64_t  securityKnownEnd_ = -1;            ///< #205: see setSecurityKnownEnd
+    /// #205: the view has not applied every event this broker knows exists.
+    [[nodiscard]] bool securityViewBehind_() const noexcept {
+        return securityView_ != nullptr && securityKnownEnd_ > securityView_->appliedOffset() + 1;
+    }
     uint64_t loginsUnavailable_ = 0, sessionsEndedUnavailable_ = 0;
     /// Issues #15 / #111: Required mode and the `__security` state is not provably current (a halted view keeps its own
     /// fail-closed answers, D28).
