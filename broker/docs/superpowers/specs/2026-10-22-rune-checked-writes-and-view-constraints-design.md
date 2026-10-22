@@ -442,6 +442,15 @@ Names can't contain NUL, so padding can't make two names collide. In general, a 
 
 **8.4 The pending overlay.** Views fold only up to the LSO, which is bounded by the HW. The overlay covers what lies between each view's fold cursor and the log end offset (LEO).
 
+**The check-time guarantee.** A check sees exactly the fold of the partition's log up to the record before it: the folded view state up to each cursor, plus the overlay over `[cursor, LEO)`. It never waits for replication or the fold.
+- **Serial per partition.** The check, the append and the overlay merge for one batch happen in one worker step (§3), so each batch is checked against every record stored before it, including those not yet replicated, committed or folded.
+- **Across failover.** A new leader accepts no checked write until it has rebuilt the overlay from its local log (§8.6).
+- **Scope.** One partition. That is why unique, derived-key and composite-key views need a source with one partition (§7.4).
+- **Why not wait for the fold.** The fold runs only after commit, so waiting would put a replication round trip in front of every checked write, in series per partition.
+- **What the overlay may count differently from a later fold** (both on the safe side):
+  - A pending claim counts even though it may still be truncated or aborted. A write rejected because of it stays rejected (§11.1). **Owner-confirmed, 2026-10-22: definite.**
+  - A pending release from another open transaction does not count (§8.5).
+
 - **Shape.** For each checked partition there is one fixed-capacity, offset-ordered structure, pre-allocated at install time.
   - Each entry is `{offset, sourceKey, per-check effect, txn pid or none, aborted flag}`.
   - The effect is:
@@ -831,6 +840,7 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 - No write that was answered with a rejection is ever stored.
 - No rejected write appears anywhere.
 - Every view equals a fresh refold of the log.
+- After every step, including failovers, truncations and aborts, the check-time state (view plus overlay) equals a fresh fold of `[0, LEO)` with aborted records removed, apart from the §8.5 rule that another open transaction's releases don't count.
 
 **Sanitizers:** ASan, UBSan and TSan runs of `*Regression*` at each checkpoint.
 
@@ -858,6 +868,7 @@ Each part ships on its own:
 - Acks are bit flags: `Leader`, `All` and the new `View`, which combine (`Leader | View`, `All | View`). The names stay. **Owner-confirmed.**
 - Wire: bit 0 is `All`, as today, and bit 1 is `View`. `View` alone is refused. With today's fold, `Leader | View` waits for commit, like `All | View`. (My call.)
 - Checked topics require idempotent producers, `All` (with or without `View`), and client version 12 or later, with one batch in flight per partition.
+- A check sees the fold of the whole partition log before it (view plus overlay) and never waits for the fold. A conflict with a claim that isn't committed yet is still a definite rejection. **Owner-confirmed, 2026-10-22.**
 - Codes 51–54 abort an enclosing transaction.
 - A rejection appends a durable reject marker that consumes its sequences.
 - Pre-existing unique conflicts: the smallest source key owns the key, with promotion on delete.
