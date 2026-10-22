@@ -3429,3 +3429,157 @@ TEST(GroupRoutingRegression, ShardClientFailsOverWithinTheStaleThresholdWithDefa
     EXPECT_LT(std::chrono::steady_clock::now() - t0, 8s) << "N-M2: RED is >= 20.4 s (400 ms + 4 x 5 s)";
     (void)n1;
 }
+
+// ===========================================================================
+// #365: plain subscriptions homed on a node that crashed
+// ===========================================================================
+namespace {
+int subscribesAt(const test_support::InvokerGateway& gw, int32_t p, int ep) {
+    int n = 0;
+    for (const auto& s : gw.subscribed) n += (s.partition == p && s.endpoint == ep) ? 1 : 0;
+    return n;
+}
+} // namespace
+
+// A reader created right after p1's leader (node 1) crashed: its Subscribe is
+// sent to node 1's session, which never answers.  When fresh metadata names the
+// new leader (node 2), the pending Subscribe moves there and binds within its
+// deadline, and so does the reader that was already bound on node 1 — both
+// while node 1's session still looks alive.  RED: both stayed homed on node 1's
+// session until it was seen stale (responseTimeoutNs, 10 s: only a session
+// EPOCH change re-routed them), so a reader created within that window of the
+// crash ended TimedOut (subscribeTimeoutMs, 10 s).
+TEST(GroupRoutingRegression, PlainReaderCreatedRightAfterALeaderCrashBindsOnTheNewLeaderRegression) {
+    GroupRig r(4501, 4502);   // default session timeouts: node 1's session is not yet seen stale
+    const auto [n1, p1port] = r.addNode(4501);
+    const auto [n2, p2port] = r.addNode(4501);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4501, ""}, {1, 1, 1, 1, 4501, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.connect();
+    auto bound = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                    [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr && bound.active(); }));
+
+    // Node 1 crashes; a fresh reader subscribes at once (stale metadata).
+    r.gw.deadEndpoints.insert(n1);
+    auto fresh = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                    [](const rc::Record&) {});
+    // Its Subscribe is redirected by the seed (stale view) to node 1, which
+    // never answers (a dead node records nothing: bounded drive, no predicate).
+    (void)r.drive([&] { return fresh.finished(); }, 50'000);
+    ASSERT_FALSE(fresh.finished());
+    ASSERT_EQ(subscribesAt(r.gw, 1, n2), 0);
+
+    // The cluster elects node 2 for p1.
+    r.gw.partitions      = {{1, 0, 0, 1, 4501, ""}, {1, 1, 2, 2, 4501, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n2}};
+    ASSERT_TRUE(r.drive([&] {
+        return subscribesAt(r.gw, 1, n2) >= 2 || fresh.finished() ||
+               r.client.testSessionStateAt(1) != rc::session::SessionState::Connected;
+    }, 40'000'000))
+        << "p1's subscriptions never moved to node 2 (" << subscribesAt(r.gw, 1, n2) << " there)";
+    EXPECT_FALSE(fresh.finished()) << "the fresh reader ended " << static_cast<int>(fresh.failReason());
+    EXPECT_FALSE(bound.finished());
+    // Moved on the fresh metadata, not on node 1's staleness (10 s): its session
+    // still looks Connected.  (RED without the fix: nothing moved until then.)
+    EXPECT_EQ(r.client.testSessionStateAt(1), rc::session::SessionState::Connected);
+}
+
+// ---- PR #513 adversarial review (#365 area) ---------------------------------------------------------------------
+
+// Data integrity: a BOUND reader whose partition fresh metadata moves to node 2 while node 1 is still alive (a
+// clean leadership move) resumes on node 2 from exactly its next offset, releases node 1's instance, and drops the
+// old instance's late records — every offset delivered once, in order, none lost.
+TEST(GroupRoutingRegression, ABoundReaderFollowsALiveLeaderMoveWithoutLossOrDuplicateAdversarialRegression) {
+    GroupRig r(4511, 4512);
+    const auto [n1, p1port] = r.addNode(4511);
+    const auto [n2, p2port] = r.addNode(4511);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4511, ""}, {1, 1, 1, 1, 4511, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.connect();
+    std::vector<int64_t> offsets;
+    auto sub = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                  [&](const rc::Record& rec) { offsets.push_back(rec.offset); });
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr && sub.active(); }));
+    const auto old = *r.subAt(1, n1);
+    r.gw.pushRecordsFrom(old, 0, 5, n1);
+    ASSERT_TRUE(r.drive([&] { return offsets.size() == 5; }));
+
+    // p1 moves to node 2 (node 1 alive); a metadata answer names it.
+    r.gw.partitions      = {{1, 0, 0, 1, 4511, ""}, {1, 1, 2, 2, 4511, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n2}};
+    r.client.testRequestMetadataNow();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n2) != nullptr && sub.active(); })) << "never moved to node 2";
+    EXPECT_EQ(r.subAt(1, n2)->fromOffset, 5) << "resumed from the wrong offset";
+    ASSERT_TRUE(r.drive([&] {
+        for (std::size_t i = 0; i < r.gw.unsubscribed.size(); ++i)
+            if (r.gw.unsubscribed[i] == old.subscriptionId && r.gw.unsubscribedAt[i] == n1) return true;
+        return false;
+    })) << "node 1's instance was never released";
+    // Node 1's late records for the released instance, then node 2's.
+    r.gw.pushRecordsFrom(old, 5, 3, n1);
+    r.gw.pushRecordsFrom(*r.subAt(1, n2), 5, 3, n2);
+    ASSERT_TRUE(r.drive([&] { return offsets.size() >= 8; }));
+    for (int i = 0; i < 2000; ++i) { r.client.doWork(); r.gw.pump(); }
+    const std::vector<int64_t> want{0, 1, 2, 3, 4, 5, 6, 7};
+    EXPECT_EQ(offsets, want);
+    EXPECT_FALSE(sub.finished());
+}
+
+// Route moves to the SEED (routeMovedPending_'s session-0 branch): a reader created right after node 1 crashed,
+// whose Subscribe went to node 1, binds on the seed once fresh metadata names it — before node 1's session is
+// seen stale.
+TEST(GroupRoutingRegression, APendingReaderOnACrashedLeaderFollowsTheRouteToTheSeedAdversarialRegression) {
+    GroupRig r(4513, 4514);
+    const auto [n1, p1port] = r.addNode(4513);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4513, ""}, {1, 1, 1, 1, 4513, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.connect();
+    auto bound = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                    [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr && bound.active(); }));
+    r.gw.deadEndpoints.insert(n1);   // node 1 crashes; its session still looks Connected
+    auto fresh = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                    [](const rc::Record&) {});
+    (void)r.drive([&] { return fresh.finished(); }, 50'000);
+    ASSERT_FALSE(fresh.finished());
+    ASSERT_EQ(subscribesAt(r.gw, 1, 0), 0);
+    // The seed's node is elected for p1.
+    r.gw.partitions      = {{1, 0, 0, 1, 4513, ""}, {1, 1, 0, 2, 4513, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, 0}};
+    ASSERT_TRUE(r.drive([&] {
+        return subscribesAt(r.gw, 1, 0) >= 2 || fresh.finished() || bound.finished() ||
+               r.client.testSessionStateAt(1) != rc::session::SessionState::Connected;
+    }, 40'000'000)) << "p1's subscriptions never moved to the seed (" << subscribesAt(r.gw, 1, 0) << " there)";
+    ASSERT_TRUE(r.drive([&] { return (fresh.active() && bound.active()) || fresh.finished() || bound.finished(); }));
+    EXPECT_TRUE(fresh.active() && bound.active());
+    EXPECT_FALSE(fresh.finished()) << "ended " << static_cast<int>(fresh.failReason());
+    EXPECT_FALSE(bound.finished());
+    EXPECT_EQ(r.client.testSessionStateAt(1), rc::session::SessionState::Connected)
+        << "moved only once node 1 was seen stale (RED without the fix)";
+}
+
+// Resources / no churn: a homed Subscribe a HEALTHY node registered but whose answer is still out keeps a
+// backoff-paced metadata refresh armed (#365) — and the refreshes, naming the same leader, never re-send it.
+TEST(GroupRoutingRegression, AnUnansweredHealthySubscribeIsNeverResentByTheRefreshItArmsAdversarialRegression) {
+    GroupRig r(4515, 4516);
+    const auto [n1, p1port] = r.addNode(4515);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4515, ""}, {1, 1, 1, 1, 4515, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testLeaderFor(1, 1) == 1; }));
+    r.gw.dropSubscribeResponsesNext = 1;   // registered on node 1, its answer lost
+    auto sub = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                  [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return subscribesAt(r.gw, 1, n1) == 1; }));
+    const int metaBefore = r.gw.metadataRequests;
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests >= metaBefore + 2 || sub.finished(); }, 40'000'000))
+        << "no refresh was armed by the unanswered Subscribe";
+    EXPECT_FALSE(sub.finished());
+    EXPECT_EQ(subscribesAt(r.gw, 1, n1), 1) << "the refresh re-sent a Subscribe whose route did not move";
+    EXPECT_EQ(subscribesAt(r.gw, 1, 0), 0);
+}

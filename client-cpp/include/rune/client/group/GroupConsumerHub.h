@@ -185,6 +185,12 @@ public:
     /// route moved): every joined / joining member re-joins there (at once when
     /// it is connected, else on its connect).
     void onCoordinatorMoved();
+    /// #290 (PR #513 review): the coordinator node's session was Rejected (its
+    /// user revoked there, its login refused): no member can join or commit
+    /// there, so every active one is refused with that code at once
+    /// (46 SessionRevoked, 45 NotAuthorized, else RefusedByBroker) — never left
+    /// cycling seed -> NotCoordinator -> that node until a budget runs out.
+    void onCoordinatorRejected(int16_t code);
 
     // ---- Shutdown -----------------------------------------------------------
 
@@ -263,6 +269,10 @@ public:
         /// current).  A partition led by a node below
         /// kBrokerVersionExplicitGroupSubscriptions is parked, logged.
         int32_t (*brokerVersion)(void* ctx, uint32_t session) = nullptr;
+        /// #290: that node session's reject code (46 / 44 ...) when it is
+        /// Rejected, else 0 (optional).  A fetch it would carry can never be
+        /// sent: the consumer is refused with that code at once.
+        int16_t (*rejectCode)(void* ctx, uint32_t session) = nullptr;
     };
     void setFetchRouter(const FetchRouter& r) noexcept { router_ = r; }
 
