@@ -104,6 +104,18 @@ $ docker exec -it rune rune console --broker 127.0.0.1:40200 --tls-ca /run/secre
 rune> ALTER USER admin SET PASSWORD '...';
 ```
 
+The admin manages security only; it has no data access. Give your services their own users (log in again
+after the password change):
+
+```sql
+CREATE ROLE game_server;
+GRANT CREATE ON CLUSTER TO ROLE game_server;
+GRANT READ  ON TOPIC PREFIX 'world_' TO ROLE game_server;
+GRANT WRITE ON TOPIC PREFIX 'world_' TO ROLE game_server;
+CREATE USER gs1 WITH PASSWORD '...';
+GRANT ROLE game_server TO USER gs1;
+```
+
 Clients pass `--user` and `--password-file` (or `RUNE_USER` and `RUNE_PASSWORD_FILE`) and trust the CA with
 `--tls-ca` (or `RUNE_TLS_CA_FILE`). A password is never accepted on the command line or from the environment.
 
