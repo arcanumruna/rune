@@ -3428,8 +3428,8 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     {
         const rune::gateway::PermissionTable& perms = permsOf_(*session);
         if (!perms.allows(msg.topicId, rune::security::opBit(rune::security::Operation::Write))) [[unlikely]]
-            if (deny_(*session, rune::gateway::authorizeTopicId(perms, msg.topicId, rune::security::Operation::Write,
-                                                                 objectIndex_), buf, len))
+            if (deny_(*session, authorizeTopicIdHere_(perms, msg.topicId, msg.partitionKnown != 0 ? msg.partition : -1,
+                                                      rune::security::Operation::Write), buf, len))
                 return true;
     }
     // Issue #122: a producer id is honoured only for the principal it was issued to (the owner tag in the id, see
@@ -4700,7 +4700,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         std::optional<rune::gateway::Denial> d;
         if (msg.topicId == pc::kCatalogTopicId)       d = rune::gateway::authorizeCluster(perms, rsec::Operation::Describe);
         else if (msg.topicId == pc::kSecurityTopicId) d = rune::gateway::authorizeCluster(perms, rsec::Operation::Admin);
-        else                                          d = rune::gateway::authorizeTopicId(perms, msg.topicId, rsec::Operation::Read, objectIndex_);
+        else d = authorizeTopicIdHere_(perms, msg.topicId, msg.partitionKnown != 0 ? msg.partition : -1, rsec::Operation::Read);
         if (deny_(*session, d, buf, len)) return;
     }
     if (refuseViewSink_(buf, len, msg.topicId, "Subscribe to a view sink")) [[unlikely]] return;   // VLS B.3
@@ -7732,7 +7732,7 @@ void ClientGateway::handleGetTopicSchema(const uint8_t* buf, std::size_t len)
     }
     // Authentication Task 12 (D18): DESCRIBE on the name, whether it is a topic or a view (the text always says TOPIC).
     if (deny_(*session, rune::gateway::authorizeTopicOrViewName(permsOf_(*session), m.topicName,
-                                                                 rune::security::Operation::Describe), buf, len))
+                                                                 rune::security::Operation::Describe, objectIndex_), buf, len))
         return;
     if (!adminSink_->submitGetSchema(m.sessionId, m.correlationId, m.topicName,
                                      m.requestedFingerprint)) {
@@ -8070,10 +8070,28 @@ void ClientGateway::noteDenied_(const Session& session, pc::TemplateId tid, cons
     }
 }
 
+std::optional<rune::gateway::Denial> ClientGateway::authorizeTopicIdHere_(const rune::gateway::PermissionTable& perms,
+                                                                       int32_t topicId, int32_t partition,
+                                                                       rune::security::Operation op,
+                                                                       rune::security::ResourceType shownType) const
+{
+    auto d = rune::gateway::authorizeTopicId(perms, topicId, op, objectIndex_, shownType);
+    if (!d || objectIndex_.at(topicId) != nullptr) return d;
+    if (partition >= rune::metadata::kMaxGpidPartitions) return d;   // never placed: would alias the next id's gpid
+    if (unappliedTopicCode_(topicId, partition < 0 ? 0 : partition) == pc::ErrorCode::NotLeader)
+        d->code = static_cast<uint16_t>(pc::ErrorCode::NotLeader);
+    return d;
+}
+
 bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::Denial>& denial, const uint8_t* buf, std::size_t len)
 {
     if (!denial) return false;
     const auto hdr = pc::MessageHeader::decode(buf, len);
+    if (denial->code != static_cast<uint16_t>(pc::ErrorCode::NotAuthorized)) {   // #127: a retriable verdict, not a refusal
+        if (hdr && answerRejection_(session, *hdr, denial->code, "topic not applied here yet", buf, len)) return true;
+        noteUnanswerable_(buf, len, "topic not applied here yet");
+        return true;
+    }
     noteDenied_(session, static_cast<pc::TemplateId>(hdr ? hdr->templateId : 0), *denial);
     if (!hdr) return true;   // the caller decoded the body, so this cannot happen; nothing to answer on
     // The DDL family carries the D23 detail text; every other response type has no free-text field.
@@ -8148,13 +8166,15 @@ bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint
     const auto group = [&](std::span<const uint8_t> id) {
         return authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read);
     };
-    const auto topic = [&](int32_t id) { return authorizeTopicId(perms, id, rsec::Operation::Read, objectIndex_); };
+    const auto topic = [&](int32_t id, int32_t partition) {
+        return authorizeTopicIdHere_(perms, id, partition, rsec::Operation::Read);
+    };
     std::optional<rune::gateway::Denial> d;
     switch (static_cast<pc::TemplateId>(tid)) {
         case pc::TemplateId::JoinGroup:
             if (const auto m = pc::JoinGroup::decode(buf, len)) {
                 d = group(m->groupId);
-                for (const int32_t t : m->subscribedTopicIds) { if (d) break; d = topic(t); }
+                for (const int32_t t : m->subscribedTopicIds) { if (d) break; d = topic(t, 0); }
             }
             break;
         case pc::TemplateId::SyncGroup:
@@ -8166,13 +8186,13 @@ bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint
         case pc::TemplateId::OffsetCommit:
             if (const auto m = pc::OffsetCommit::decode(buf, len)) {
                 d = group(m->groupId);
-                for (const auto& e : m->entries) { if (d) break; d = topic(e.topicId); }
+                for (const auto& e : m->entries) { if (d) break; d = topic(e.topicId, e.partition); }
             }
             break;
         case pc::TemplateId::OffsetFetch:
             if (const auto m = pc::OffsetFetch::decode(buf, len)) {
                 d = group(m->groupId);
-                for (const auto& e : m->entries) { if (d) break; d = topic(e.topicId); }
+                for (const auto& e : m->entries) { if (d) break; d = topic(e.topicId, e.partition); }
             }
             break;
         case pc::TemplateId::LeaveGroup:   // issue #123: READ on the group, like every other group request
@@ -8207,7 +8227,7 @@ bool ClientGateway::denyTxnRequest_(Session& session, uint16_t tid, const uint8_
                 d = txn(m->transactionalId);
                 for (const auto& p : m->partitions) {
                     if (d) break;
-                    d = authorizeTopicId(perms, p.topicId, rsec::Operation::Write, objectIndex_);
+                    d = authorizeTopicIdHere_(perms, p.topicId, p.partition, rsec::Operation::Write);
                 }
             }
             break;
@@ -8221,7 +8241,7 @@ bool ClientGateway::denyTxnRequest_(Session& session, uint16_t tid, const uint8_
                 if (!d) d = group(m->groupId);
                 for (const auto& e : m->entries) {
                     if (d) break;
-                    d = authorizeTopicId(perms, e.topicId, rsec::Operation::Read, objectIndex_);
+                    d = authorizeTopicIdHere_(perms, e.topicId, e.partition, rsec::Operation::Read);
                 }
             }
             break;
@@ -9025,7 +9045,7 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
     // Authentication Task 12 (spec §2.1, D22): READ on the view's topic id - one byte load; a hidden and a missing id
     // answer alike.
     if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
-        if (deny_(*session, rune::gateway::authorizeTopicId(perms, m.viewTopicId, rune::security::Operation::Read, objectIndex_,
+        if (deny_(*session, authorizeTopicIdHere_(perms, m.viewTopicId, 0, rune::security::Operation::Read,
                                                              rune::security::ResourceType::View), buf, len))
             return;
 
