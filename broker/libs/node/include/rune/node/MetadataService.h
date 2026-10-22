@@ -2863,6 +2863,14 @@ public:
     }
     /// This node is the ready controller (it leads the consensus and its map reflects its whole log).
     [[nodiscard]] bool mapControls() const noexcept { return controllerReady_(); }
+    /// Issue #82 (VLS A.5.1): every metadata record below this offset is applied to the committed map (the bridge
+    /// derives the role ops from it).  Control thread.
+    [[nodiscard]] int64_t appliedEnd() const noexcept { return lastApplied_ < 0 ? 0 : static_cast<int64_t>(lastApplied_); }
+    /// Issue #82: this node's metadata log end - on the controller, at or above every committed record (a new controller's
+    /// HW may still lag what its predecessor committed; its log never does), so a lease grant's commitPos.  Control thread.
+    [[nodiscard]] int64_t logEndForLease() const noexcept {
+        return replica_ != nullptr ? static_cast<int64_t>(replica_->logEndOffset()) : 0;
+    }
     /// The metadata leader's answers this node's metadata replica accepted (monotonic).
     [[nodiscard]] uint64_t mapLeaderAnswers() const noexcept { return replica_ != nullptr ? replica_->leaderAnswers() : 0; }
 private:

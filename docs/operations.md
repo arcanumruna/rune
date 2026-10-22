@@ -70,6 +70,11 @@ Never delete or copy `storage.meta` on its own. Details, refusal table and the m
 - **Failover.** Killing a leader triggers re-election among the survivors. An acked `acks=all` produce answered
   `NotLeader` or `Internal`, or not at all, is *in doubt*; the client retries it with the same producer id, epoch and
   sequence and the broker deduplicates.
+- **View reads after a failover.** A view row is served only by the leader of its source partition, and only while that
+  broker holds a read lease from the controller (renewed every 20 ms, about 120 ms long). A leader cut off from the
+  controller stops serving view rows once its lease runs out, before any other broker can take its partitions, and answers
+  `NotLeader` (the client retries). A new source leader serves its views about 150 ms after it takes over. Hosts must keep a
+  boot-time clock that counts suspend: `CLOCK_BOOTTIME` on Linux, which kvmclock keeps current across a VM pause.
 - **Exit codes.** `2` configuration error, `78` storage refusal (empty or damaged data directory), `74` storage failure
   (the broker halts rather than serve from a suspect disk).
 
@@ -175,6 +180,9 @@ partition logs under `topics/`, `__catalog/` and `__security/` (the replicated e
   disk topic.
 - A client older than version 9 is refused at the connect on an authenticated cluster; a client older than version 8 cannot
   follow a DDL redirect.
+- **View reads during a rolling upgrade.** A broker serves view rows only under the controller's read lease. While the
+  controller runs a build without it, it grants none and `getViewRow` answers `NotLeader`; reads resume once the
+  controller runs a build that has it.
 - A data directory from a build without storage ids is adopted as `legacy` on first start. Old
   `dataDir/__topic_schemas` and `dataDir/__views` are ignored and never changed.
 - Release notes: [`broker/docs/release-notes/`](../broker/docs/release-notes) and

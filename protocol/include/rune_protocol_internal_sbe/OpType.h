@@ -57,6 +57,7 @@ public:
         SESSION_PERMISSIONS = static_cast<std::uint8_t>(21),
         PEER_LINK_KEYS = static_cast<std::uint8_t>(22),
         ENFORCE_FENCE = static_cast<std::uint8_t>(23),
+        READ_LEASE = static_cast<std::uint8_t>(24),
         TEST_TASK = static_cast<std::uint8_t>(200),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
@@ -89,6 +90,7 @@ public:
             case static_cast<std::uint8_t>(21): return SESSION_PERMISSIONS;
             case static_cast<std::uint8_t>(22): return PEER_LINK_KEYS;
             case static_cast<std::uint8_t>(23): return ENFORCE_FENCE;
+            case static_cast<std::uint8_t>(24): return READ_LEASE;
             case static_cast<std::uint8_t>(200): return TEST_TASK;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
@@ -124,6 +126,7 @@ public:
             case SESSION_PERMISSIONS: return "SESSION_PERMISSIONS";
             case PEER_LINK_KEYS: return "PEER_LINK_KEYS";
             case ENFORCE_FENCE: return "ENFORCE_FENCE";
+            case READ_LEASE: return "READ_LEASE";
             case TEST_TASK: return "TEST_TASK";
             case NULL_VALUE: return "NULL_VALUE";
         }

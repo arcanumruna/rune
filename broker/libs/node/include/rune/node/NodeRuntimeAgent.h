@@ -28,6 +28,7 @@
 #include <rune/consensus/ConsensusAgent.h>  // defines rune::consensus::Agent
 #include <rune/node/AdminControlPlane.h>
 #include <rune/node/NodeConsensusAgent.h>
+#include <rune/node/ReadLeaseFanout.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/node/GroupCoordinationService.h>
 #include <rune/node/TransactionCoordinationService.h>
@@ -188,6 +189,10 @@ public:
     void setCanvassPublisher(rune::consensus::SbeConsensusPublisher* p) noexcept { canvassPublisher_ = p; }
     /// node-state.dat existed with candidateTermId > 0, or term.log was non-empty, when the consensus objects were built.
     void setBootHistory(bool h) noexcept { bootHistory_ = h; }
+    /// Issue #82 (VLS A.5.1): hand the view read lease to `workers` workers (a multi-node broker).  Before start.
+    void enableReadLeaseFanout(int32_t workers) { readLeaseFanout_.configure(workers); }
+    /// Test-only, this agent's thread.
+    [[nodiscard]] const ReadLeaseFanout& readLeaseFanoutForTest() const noexcept { return readLeaseFanout_; }
     /// CP3 I4: > 0 replaces the failover (broker liveness) timeout, 3 x the leader-heartbeat timeout by default.
     void setFailoverTimeoutOverrideNs(int64_t ns) noexcept { failoverTimeoutOverrideNs_ = ns; }
     /// TEST seams (NodeConfig::testCandidacyHoldAtBoot sets it before start; the tests toggle it through
@@ -325,7 +330,21 @@ private:
             const rune::consensus::NodeId  lid   = election_->leaderMemberId();
             const rune::replication::Epoch epoch =
                 static_cast<rune::replication::Epoch>(election_->leadershipTermId());
+            // Issue #82 (VLS A.5.1): the bridge derives this pass's role ops from the map applied below `derivedPos`.
+            const int64_t derivedPos = metadataService_ ? metadataService_->appliedEnd() : 0;
             work += bridge_->doWork(lid, epoch);
+            // ... and only then may a lease covering that metadata go to a worker, behind those role ops (FIFO).
+            if (readLeaseFanout_.enabled() && workerPool_) [[likely]] {
+                work += readLeaseFanout_.step(
+                    election_->readLease(), derivedPos,
+                    [this](int32_t w) { return bridge_->roleOpsPendingFor(w); },
+                    [this](int32_t w, int64_t endNs) {
+                        WorkerOp op;
+                        op.type       = WorkerOp::Type::ReadLease;
+                        op.nextOffset = endNs;
+                        return workerPool_->worker(w).tryEnqueueOp(std::move(op));
+                    });
+            }
             // AlterIsr proposals route to the CURRENT controller (consensus leader).
             if (transport_) transport_->setControllerId(static_cast<int32_t>(lid), static_cast<int64_t>(election_->leadershipTermId()));
             // M1: an invariant violation caught at the bridge's noexcept
@@ -1144,6 +1163,7 @@ private:
     rune::consensus::SbeConsensusPublisher*            canvassPublisher_  = nullptr;
     bool                                               bootHistory_       = false;
     int64_t                                            failoverTimeoutOverrideNs_ = 0;   ///< CP3 I4 (0 = default)
+    ReadLeaseFanout readLeaseFanout_{};   // issue #82: the view read lease -> every worker
     bool                                               testCandidacyHold_ = false;
     /// R12 flags (every cycle) + the gate evaluation (A-M4: right after the consensus step, before the bridge).
     int serviceStorageGate_(int64_t nowNs) {

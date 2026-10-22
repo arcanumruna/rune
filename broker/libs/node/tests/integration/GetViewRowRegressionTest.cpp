@@ -31,6 +31,8 @@
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerViewSet.h>
+#include <rune/node/ReadLeaseFanout.h>
+#include <rune/consensus/ReadLease.h>
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/metadata/ShardRouter.h>
 
@@ -57,6 +59,7 @@
 #include <rune/protocol/client/DataMessages.h>
 
 #include <atomic>
+#include <deque>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -833,4 +836,377 @@ TEST_F(GetViewRowOpenRegression, OpenViewFingerprintMismatchRejected) {
     // 6. An unknown view name resolves to UnknownView.
     EXPECT_EQ(adminWorker_->openView("no_such_view", /*fp*/ 0, gotId, gotFp),
               static_cast<uint16_t>(pc::ViewRowResponse::kUnknownView));
+}
+
+// =====================================================================================================================
+// Issue #82 (VLS Part A): the view read lease, the new-leader serve gate (W) and the read-your-writes fold barrier, on
+// the REAL worker op/return path.  The cluster repro (a partitioned ex-leader after an acked failover write) is
+// ViewReadLeaseRegression.Partitioned*ExLeaderNeverServesAStaleRowRegression in CatalogClusterIntegrationTest.cpp.
+// =====================================================================================================================
+namespace {
+
+/// A worker over a leader source replica and a Ready transient view holding key 7 (hp `hp`).
+struct LeaseRig {
+    Descriptor src = charSourceV1();
+    rv::CompiledViewPlan plan;
+    rv::RowLayout layout;
+    ViewSnapshotChannel channel;
+    std::unique_ptr<WorkerViewSet> vs;
+    SrcReplica srcRep;
+    std::unique_ptr<Worker> w;
+    int64_t leaseNow = 5'000'000'000;   // the injected lease clock (the duty clock is the doWork argument)
+    std::vector<uint8_t> batch;
+
+    explicit LeaseRig(const std::string& tag, int32_t hp = 1) {
+        const Descriptor* srcs[] = {&src};
+        auto comp = rv::compileView(hpView(), srcs, kViewTopicId).value();
+        plan = comp.plan;
+        layout = comp.rowLayout;
+        vs = std::make_unique<WorkerViewSet>(channel, tmpDir("rune-views-lease-" + tag));
+        vs->installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+        vs->setLeaseClockForTest(&leaseNow);
+        batch = oneUpsert(7, hp);
+        auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
+            return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
+        };
+        vs->driveFolds(kSrcTopicId, 0, readRange, /*bound*/ 1, 0, nullptr, srcRep.gen());
+        w = std::make_unique<Worker>(0);
+        w->setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});
+        w->setViewSet(vs.get());
+        w->setLeaseClockForTest(&leaseNow);
+    }
+    void lease(int64_t endNs) {
+        WorkerOp op;
+        op.type       = WorkerOp::Type::ReadLease;
+        op.nextOffset = endNs;
+        ASSERT_TRUE(w->tryEnqueueOp(std::move(op)));
+    }
+    WorkerReturn read(int64_t dutyNowNs = 1'000'000LL) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::GetViewRow; op.topicId = kViewTopicId; op.partition = 0;
+        op.sessionId = 1; op.correlationId = 42; op.nextOffset = 7; op.hwBound = 0;
+        EXPECT_TRUE(w->tryEnqueueOp(std::move(op)));
+        w->doWork(dutyNowNs);
+        WorkerReturn got{};
+        int n = 0;
+        w->drainReturn([&](WorkerReturn r) { if (r.type == WorkerReturn::Type::ViewRowResult) { got = std::move(r); ++n; } });
+        EXPECT_EQ(n, 1);
+        return got;
+    }
+};
+constexpr int16_t kOkCode = static_cast<int16_t>(pc::ViewRowResponse::kOk);
+
+}  // namespace
+
+// A worker that requires a lease (a multi-node broker's) serves a row only while the lease clock is below the lease end;
+// the end only grows (a late, shorter grant never shortens it); with no lease at all it never serves.
+// RED (the serve check removed): every read answers OK, the expired ones included.
+TEST(ViewReadLeaseRegression, AWorkerServesAViewRowOnlyWhileItHoldsAReadLeaseRegression) {
+    LeaseRig r("serve");
+    EXPECT_EQ(r.read().errorCode, kOkCode) << "the default (single node / unit tests): unbounded";
+    r.w->requireViewReadLease();
+    EXPECT_EQ(r.read().errorCode, kViewRowNotLeaderInternal) << "required, none held yet";
+    r.lease(r.leaseNow + 100'000'000);
+    const WorkerReturn ok = r.read();
+    ASSERT_EQ(ok.errorCode, kOkCode) << "under a lease";
+    EXPECT_EQ(rv::readSlot(ok.chunk.data(), r.layout, 1).i, 1);
+    r.leaseNow += 99'999'999;
+    EXPECT_EQ(r.read().errorCode, kOkCode) << "1 ns before the end";
+    r.lease(r.leaseNow - 50'000'000);   // an older, shorter grant arriving late: the end never moves back
+    r.leaseNow += 1;
+    EXPECT_EQ(r.read().errorCode, kViewRowNotLeaderInternal) << "at the end: not served (a frozen table, never)";
+    EXPECT_EQ(r.w->viewLeaseEndNsForTest(), r.leaseNow);
+    EXPECT_GE(r.w->viewReadsWithoutLeaseForTest(), 2u);
+    r.lease(r.leaseNow + 50'000'000);   // renewed
+    EXPECT_EQ(r.read().errorCode, kOkCode);
+    EXPECT_EQ(r.w->readLeasesSeenForTest(), 3u);
+}
+
+// VLS A.7 LeaseClockSuspendRegression: the lease is measured on the LEASE clock (counts suspend), never on the duty
+// clock: a lease-clock jump (the machine slept) expires it while the duty clock did not move, and a duty-clock jump alone
+// expires nothing.
+// RED (the check reads the duty clock / the pass clock): the first read after the sleep answers OK.
+TEST(ViewReadLeaseRegression, LeaseClockSuspendExpiresTheLeaseTheDutyClockDoesNotRegression) {
+    LeaseRig r("suspend");
+    r.w->requireViewReadLease();
+    r.lease(r.leaseNow + 100'000'000);
+    EXPECT_EQ(r.read(/*duty*/ 1'000'000LL).errorCode, kOkCode);
+    EXPECT_EQ(r.read(/*duty*/ 1'000'000LL + 3'600'000'000'000LL).errorCode, kOkCode)
+        << "an hour on the duty clock alone (e.g. it stopped and resumed elsewhere): the lease clock decides";
+    r.leaseNow += 30'000'000'000LL;   // 30 s asleep: the boot-time clock counts them
+    EXPECT_EQ(r.read(/*duty*/ 1'000'000LL + 3'600'000'000'000LL).errorCode, kViewRowNotLeaderInternal);
+}
+
+// VLS A.7 ViewReadLeaseFifoRegression: the op ring is full when a demotion and a newer lease (issued after the
+// demotion committed) arrive.  The bridge holds the demotion (pending); ReadLeaseFanout holds the lease while it waits,
+// then posts it BEHIND the demotion: the worker applies the demotion first and never serves its table under the newer
+// lease.  RED (fan-out ignores pendingFor): the lease lands first and the read in between answers OK (the stale row).
+TEST(ViewReadLeaseRegression, ALeaseNeverOvertakesADemotionOnAFullOpRingRegression) {
+    auto src = charSourceV1();
+    const Descriptor* srcs[] = {&src};
+    auto comp = rv::compileView(hpView(), srcs, kViewTopicId).value();
+    ViewSnapshotChannel channel;
+    WorkerViewSet vs(channel, tmpDir("rune-views-lease-fifo"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+    const auto batch = oneUpsert(7, 1);
+    auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
+        return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
+    };
+    SrcReplica srcRep;
+    vs.driveFolds(kSrcTopicId, 0, readRange, 1, 0, nullptr, srcRep.gen());
+    // A small op ring so it can be filled.
+    Worker w(/*workerId*/ 0, /*ingressRingBytes*/ 64 * 1024);
+    w.setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});
+    w.setViewSet(&vs);
+    int64_t leaseNow = 1'000'000'000;
+    w.setLeaseClockForTest(&leaseNow);
+    w.requireViewReadLease();
+    // The holder: lease A (commitPos 10) before the demotion committed at 15, lease B (commitPos 20) after it.
+    rune::consensus::ReadLeaseHolder holder;
+    {
+        const auto a = holder.nextRequest(leaseNow);
+        ASSERT_TRUE(holder.onGrant(a.reqSeq, 1, /*commitPos*/ 10, 50'000'000));
+    }
+    ReadLeaseFanout fan;
+    fan.configure(1);
+    std::deque<WorkerOp> pendingRoleOps;   // the bridge's per-worker queue
+    auto enqueueLease = [&](int32_t, int64_t end) {
+        WorkerOp op; op.type = WorkerOp::Type::ReadLease; op.nextOffset = end;
+        return w.tryEnqueueOp(std::move(op));
+    };
+    auto pendingFor = [&](int32_t) { return !pendingRoleOps.empty(); };
+    ASSERT_EQ(fan.step(holder, /*derivedPos*/ 10, pendingFor, enqueueLease), 1) << "lease A delivered";
+    const int64_t endA = fan.deliveredForTest(0);
+    // Serve once under A (the ring is drained).
+    {
+        WorkerOp op; op.type = WorkerOp::Type::GetViewRow; op.topicId = kViewTopicId; op.partition = 0;
+        op.sessionId = 1; op.correlationId = 1; op.nextOffset = 7;
+        ASSERT_TRUE(w.tryEnqueueOp(std::move(op)));
+        w.doWork(1'000'000);
+        int16_t code = -1;
+        w.drainReturn([&](WorkerReturn r) { if (r.type == WorkerReturn::Type::ViewRowResult) code = r.errorCode; });
+        ASSERT_EQ(code, kOkCode);
+    }
+    // Fill the op ring with reads (each would be answered under whatever lease the worker holds when it runs them).
+    int fillers = 0;
+    for (;; ++fillers) {
+        WorkerOp op; op.type = WorkerOp::Type::GetViewRow; op.topicId = kViewTopicId; op.partition = 0;
+        op.sessionId = 1; op.correlationId = 1000 + fillers; op.nextOffset = 7;
+        if (!w.tryEnqueueOp(std::move(op))) break;
+    }
+    ASSERT_GT(fillers, 4);
+    // The demotion (committed at metadata 15): the ring is full, so the bridge keeps it pending.
+    WorkerOp demote;
+    demote.type = WorkerOp::Type::BecomeFollower; demote.topicId = kSrcTopicId; demote.partition = 0;
+    demote.replica = srcRep.replica.get(); demote.roleEpoch = 2; demote.roleLeaderId = 2;
+    if (!w.tryEnqueueOp(WorkerOp(demote))) pendingRoleOps.push_back(demote);
+    ASSERT_EQ(pendingRoleOps.size(), 1u) << "the demotion waits for ring space";
+    // Lease B, issued after the demotion committed, arrives; this broker applied the metadata up to 20.
+    {
+        const auto b = holder.nextRequest(leaseNow + 10'000'000);
+        ASSERT_TRUE(holder.onGrant(b.reqSeq, 2, /*commitPos*/ 20, 150'000'000));
+    }
+    EXPECT_EQ(fan.step(holder, /*derivedPos*/ 20, pendingFor, enqueueLease), 0) << "held behind the pending demotion";
+    EXPECT_EQ(fan.deliveredForTest(0), endA);
+    EXPECT_GE(fan.heldBehindRoleOpsForTest(), 1u);
+    // Control passes / worker passes interleave until both are delivered: the bridge flushes first, then the fan-out.
+    std::vector<int16_t> codes;
+    int lastSeq = 0;
+    for (int pass = 0; pass < 200 && (!pendingRoleOps.empty() || fan.deliveredForTest(0) == endA); ++pass) {
+        w.doWork(2'000'000 + pass);
+        w.drainReturn([&](WorkerReturn r) { if (r.type == WorkerReturn::Type::ViewRowResult) codes.push_back(r.errorCode); });
+        while (!pendingRoleOps.empty() && w.tryEnqueueOp(WorkerOp(pendingRoleOps.front()))) pendingRoleOps.pop_front();
+        (void)fan.step(holder, 20, pendingFor, enqueueLease);
+        ++lastSeq;
+    }
+    ASSERT_TRUE(pendingRoleOps.empty());
+    ASSERT_GT(fan.deliveredForTest(0), endA) << "lease B delivered";
+    // Everything queued after the demotion (the lease B, then this read) runs after it: the ex-leader answers NotLeader.
+    {
+        WorkerOp op; op.type = WorkerOp::Type::GetViewRow; op.topicId = kViewTopicId; op.partition = 0;
+        op.sessionId = 1; op.correlationId = 9; op.nextOffset = 7;
+        ASSERT_TRUE(w.tryEnqueueOp(std::move(op)));
+        for (int i = 0; i < 10; ++i) {
+            w.doWork(9'000'000 + i);
+            w.drainReturn([&](WorkerReturn r) { if (r.type == WorkerReturn::Type::ViewRowResult) codes.push_back(r.errorCode); });
+        }
+    }
+    ASSERT_NE(srcRep.replica->role(), rune::replication::Role::Leader) << "the demotion was applied";
+    ASSERT_FALSE(codes.empty());
+    EXPECT_EQ(codes.back(), kViewRowNotLeaderInternal) << "the read after the newer lease is refused: the demotion came first";
+}
+
+// ReadLeaseFanout alone: a lease goes to a worker only once the metadata its grant covered is applied and none of that
+// worker's role ops waits; each worker independently (one with pending role ops never holds back another); a full ring
+// is retried; a delivered lease is never re-posted.
+TEST(ViewReadLeaseRegression, TheFanoutGatesEachWorkerOnAppliedMetadataAndItsOwnPendingRoleOpsRegression) {
+    rune::consensus::ReadLeaseHolder holder;
+    auto grant = [&](int64_t sendNs, int64_t commitPos, int64_t validFor) {
+        const auto q = holder.nextRequest(sendNs);
+        ASSERT_TRUE(holder.onGrant(q.reqSeq, q.reqSeq, commitPos, validFor));
+    };
+    ReadLeaseFanout fan;
+    fan.configure(3);
+    std::vector<std::pair<int32_t, int64_t>> posted;
+    bool pending[3] = {false, true, false};
+    bool full[3] = {false, false, true};
+    auto pendingFor = [&](int32_t w) { return pending[w]; };
+    auto enqueue = [&](int32_t w, int64_t end) { if (full[w]) return false; posted.emplace_back(w, end); return true; };
+    EXPECT_EQ(fan.step(holder, 100, pendingFor, enqueue), 0) << "nothing granted yet";
+    grant(1'000, 50, 100'000'000);
+    EXPECT_EQ(fan.step(holder, 49, pendingFor, enqueue), 0) << "the grant covers metadata this broker has not applied";
+    EXPECT_EQ(fan.step(holder, 50, pendingFor, enqueue), 1) << "worker 0 only: 1 has pending role ops, 2's ring is full";
+    ASSERT_EQ(posted.size(), 1u);
+    EXPECT_EQ(posted[0].first, 0);
+    const int64_t e1 = posted[0].second;
+    EXPECT_EQ(e1, 1'000 + rune::consensus::leaseShrinkByDrift(100'000'000));
+    EXPECT_EQ(fan.step(holder, 50, pendingFor, enqueue), 0) << "never re-posted";
+    pending[1] = false; full[2] = false;
+    EXPECT_EQ(fan.step(holder, 50, pendingFor, enqueue), 2);
+    EXPECT_EQ(fan.deliveredForTest(1), e1);
+    EXPECT_EQ(fan.deliveredForTest(2), e1);
+    grant(20'000'000, 60, 100'000'000);
+    EXPECT_EQ(fan.step(holder, 55, pendingFor, enqueue), 0) << "the newer grant's metadata is not applied: the older lease stands";
+    EXPECT_EQ(fan.step(holder, 60, pendingFor, enqueue), 3);
+    EXPECT_GT(fan.deliveredForTest(0), e1);
+}
+
+// VLS A.5.3 / A.7 (ViewReadLeaseRebalanceRegression, time path): a broker that just became the source leader serves
+// its view only W after it first drove the table under the new leadership - every lease its predecessor was granted
+// before the change has ended by then.  W = 0 (a single node) serves at once.
+// RED (predecessorFenced_ removed from the Ready flips): OK right after the promotion.
+TEST(ViewReadLeaseRegression, ANewSourceLeaderServesOnlyAfterThePredecessorFenceWaitRegression) {
+    for (const bool persisted : {false, true}) {
+        SCOPED_TRACE(persisted ? "persisted view" : "transient view");
+        LagHarness h(persisted, persisted ? "fwp" : "fwt");
+        int64_t leaseNow = 2'000'000'000;
+        constexpr int64_t kW = 153'015'000;   // leaseFenceWaitNs(150 ms)
+        h.vs->setLeaseClockForTest(&leaseNow);
+        h.vs->setPredecessorFenceWaitNs(kW);
+        ASSERT_NO_FATAL_FAILURE(appendTruth(h.t, 3));
+        ASSERT_NO_FATAL_FAILURE(feed(h.t, h.f, 0, /*hw=*/3, 1));
+        h.f.replica->becomeLeader(/*epoch=*/2, {kNodeF});   // promoted: a one-member ISR commits alone
+        h.passes(10);
+        ASSERT_TRUE(h.vs->instanceLeadership(kViewTopicId, 0).has_value()) << "the fold ran (vacuity guard)";
+        EXPECT_EQ(h.read(1).first, kNotReady) << "inside W: the predecessor may still serve under an older lease";
+        leaseNow += kW - 1;
+        h.passes(2);
+        EXPECT_EQ(h.read(1).first, kNotReady) << "1 ns before W";
+        leaseNow += 1;
+        EXPECT_EQ(h.awaitOk(1), 10) << "W passed: served";
+        // A later leadership of the same broker waits again.
+        h.f.replica->becomeFollower(/*leaderEpoch=*/3, kNodeT);
+        h.f.replica->becomeLeader(/*epoch=*/4, {kNodeF});
+        h.passes(5);
+        EXPECT_EQ(h.read(1).first, kNotReady);
+        leaseNow += kW;
+        EXPECT_EQ(h.awaitOk(1), 10);
+    }
+}
+
+// VLS A.5.5 / A.7 ViewReadYourWriteRegression: a write acked (committed) right before a GetViewRow on the TRUE leader
+// is seen by it, even when the fold lags (a persisted view folds one record per pass here): the read waits for the fold
+// to reach the committed bound at its arrival - never an AbsentKey for the key just written, never an older value.
+// RED (the barrier removed): the first answer is AbsentKey (key 5 not folded yet).
+TEST(ViewReadLeaseRegression, ViewReadYourWriteSeesTheWriteAckedBeforeItRegression) {
+    auto src = charSourceV1();
+    const Descriptor* srcs[] = {&src};
+    auto comp = rv::compileView(hpView(/*persistence*/ 0), srcs, kViewTopicId).value();
+    ViewSnapshotChannel channel{OneToOneByteRing{512}, OneToOneByteRing{4096}, OneToOneByteRing{1 << 20}};
+    WorkerViewSet vs(channel, tmpDir("rune-views-ryw"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    SrcReplica srcRep;
+    Worker w(/*workerId*/ 0);
+    w.setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});
+    w.setViewSet(&vs);
+    auto drainDeltas = [&] {
+        channel.deltas.drain([](int32_t, aeron::concurrent::AtomicBuffer&, aeron::util::index_t, aeron::util::index_t) {},
+                             1 << 20);
+    };
+    auto appendChar = [&](int64_t id, int32_t hp) {
+        const auto k = keyBytes(id);
+        const auto v = encodeCharacter(id, hp, 1);
+        ASSERT_GE(srcRep.replica->appendKeyed(std::span<const uint8_t>(k.data(), k.size()),
+                                              std::span<const uint8_t>(v.data(), v.size()), false), 0);
+    };
+    // A Ready table under this leadership (key 1).
+    ASSERT_NO_FATAL_FAILURE(appendChar(1, 10));
+    bool ready = false;
+    for (int i = 0; i < 200 && !ready; ++i) {
+        w.doWork(1'000'000LL * (i + 1));
+        drainDeltas();
+        ready = vs.instanceLeadership(kViewTopicId, 0).has_value() &&
+                vs.readiness(kViewTopicId, 0) == ViewReadiness::Ready;
+    }
+    ASSERT_TRUE(ready);
+    // Four more writes, committed at once (one-member ISR): the fold folds one per pass.
+    for (int64_t id = 2; id <= 5; ++id) ASSERT_NO_FATAL_FAILURE(appendChar(id, static_cast<int32_t>(10 * id)));
+    ASSERT_GE(srcRep.replica->highWatermark(), 5);
+    WorkerOp op;
+    op.type = WorkerOp::Type::GetViewRow; op.topicId = kViewTopicId; op.partition = 0;
+    op.sessionId = 1; op.correlationId = 55; op.nextOffset = 5;
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(op)));
+    int16_t code = -1;
+    int32_t hp = -1;
+    int passes = 0;
+    for (; passes < 50 && code < 0; ++passes) {
+        w.doWork(500'000'000LL + passes);
+        drainDeltas();
+        w.drainReturn([&](WorkerReturn r) {
+            if (r.type != WorkerReturn::Type::ViewRowResult) return;
+            code = r.errorCode;
+            if (code == kOkCode) hp = static_cast<int32_t>(rv::readSlot(r.chunk.data(), comp.rowLayout, 1).i);
+        });
+    }
+    ASSERT_EQ(code, kOkCode) << "the read after the acked write answered " << code << " (1 = AbsentKey: the fold lagged)";
+    EXPECT_EQ(hp, 50);
+    EXPECT_GE(passes, 2) << "the fold needed more than one pass (the barrier actually held: vacuity guard)";
+    EXPECT_GE(w.viewReadsHeldForTest(), 1u);
+    EXPECT_EQ(w.heldViewReadsForTest(), 0u);
+}
+
+// The barrier never parks a read forever: a fold that cannot progress (here its checkpoint ring is never drained, so it
+// stops after a few deltas) ends the held read with the retriable NotReady at its deadline.
+TEST(ViewReadLeaseRegression, AHeldViewReadEndsNotReadyWhenTheFoldCannotReachItsTargetRegression) {
+    auto src = charSourceV1();
+    const Descriptor* srcs[] = {&src};
+    auto comp = rv::compileView(hpView(/*persistence*/ 0), srcs, kViewTopicId).value();
+    ViewSnapshotChannel channel{OneToOneByteRing{512}, OneToOneByteRing{4096}, OneToOneByteRing{1 << 20}};
+    WorkerViewSet vs(channel, tmpDir("rune-views-ryw-stuck"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    SrcReplica srcRep;
+    Worker w(/*workerId*/ 0);
+    w.setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});
+    w.setViewSet(&vs);
+    auto appendChar = [&](int64_t id, int32_t hp) {
+        const auto k = keyBytes(id);
+        const auto v = encodeCharacter(id, hp, 1);
+        ASSERT_GE(srcRep.replica->appendKeyed(std::span<const uint8_t>(k.data(), k.size()),
+                                              std::span<const uint8_t>(v.data(), v.size()), false), 0);
+    };
+    ASSERT_NO_FATAL_FAILURE(appendChar(1, 10));
+    for (int i = 0; i < 200 && !(vs.instanceLeadership(kViewTopicId, 0).has_value() &&
+                                 vs.readiness(kViewTopicId, 0) == ViewReadiness::Ready); ++i) {
+        w.doWork(1'000'000LL * (i + 1));
+        channel.deltas.drain([](int32_t, aeron::concurrent::AtomicBuffer&, aeron::util::index_t, aeron::util::index_t) {},
+                             1 << 20);
+    }
+    ASSERT_TRUE(vs.instanceLeadership(kViewTopicId, 0).has_value());
+    for (int64_t id = 2; id <= 40; ++id) ASSERT_NO_FATAL_FAILURE(appendChar(id, 1));
+    WorkerOp op;
+    op.type = WorkerOp::Type::GetViewRow; op.topicId = kViewTopicId; op.partition = 0;
+    op.sessionId = 1; op.correlationId = 77; op.nextOffset = 40;
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(op)));
+    int16_t code = -1;
+    int64_t now = 1'000'000'000;
+    int passes = 0;
+    for (; passes < 100 && code < 0; ++passes, now += 5'000'000) {   // 5 ms per pass; nobody drains the deltas
+        w.doWork(now);
+        w.drainReturn([&](WorkerReturn r) { if (r.type == WorkerReturn::Type::ViewRowResult) code = r.errorCode; });
+    }
+    EXPECT_EQ(code, static_cast<int16_t>(pc::ViewRowResponse::kNotReady)) << "a stuck fold ends the read retriably";
+    EXPECT_GE(passes, 19) << "held until its 100 ms deadline (5 ms passes)";
+    EXPECT_LE(passes, 23);
+    EXPECT_EQ(w.viewReadsHeldExpiredForTest(), 1u);
+    EXPECT_EQ(w.heldViewReadsForTest(), 0u);
 }

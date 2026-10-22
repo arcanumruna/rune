@@ -39,6 +39,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/node/BrokerNode.h>
 #include <rune/node/MetadataService.h>
+#include <rune/protocol/PartitionHash.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>
 
@@ -2454,4 +2455,116 @@ TEST(CatalogClusterRegression, SliceDataCheckResendWithTheSameIdentityIsDeduplic
         const auto got = rig.readAll(L, ti->id, 0, 1, 10s, &why);
         EXPECT_EQ(got.size(), 1u) << "the retried record is stored " << got.size() << " times" << why;
     }
+}
+
+// ===========================================================================
+// Issue #82 (VLS Part A, the view read lease): a partitioned ex-leader never serves a stale GetViewRow after a write the
+// new leader acked.  The source has three partitions spread over the three brokers, so one is led by the controller (the
+// stale-controller case: the zombie is the deposed controller too) and another by a plain broker.  The source leader is cut
+// off its peers (consensus and replication; its client link stays up), the majority fails the partition over, the new
+// leader acks key K -> hp 2, and every read of K through the zombie is refused retriably (a bare NotLeader, a Redirect or
+// NotReady), never answered OK with its frozen hp 1.  Healed, reads through it reach hp 2.
+// RED before the fix: the zombie answers OK with hp 1 (its role and its leadership generation never change).
+// ===========================================================================
+namespace {
+/// The smallest key >= 1 a `parts`-partition view routes to partition `p` (the gateway's rune::protocol::partitionForKey).
+int64_t viewKeyFor(int32_t p, int32_t parts) {
+    for (int64_t k = 1; k < 100'000; ++k) {
+        const auto kb = keyBytes(k);
+        if (rune::protocol::partitionForKey(std::span<const uint8_t>(kb.data(), kb.size()), parts) == p) return k;
+    }
+    return -1;
+}
+
+void zombieViewReadCase(bool zombieIsController, const std::string& tag) {
+    ThreeNodes c = ThreeNodes::start(tag);
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    Rig rig(c);
+    const int leader = c.settledLeader();
+    ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("src", 3, true), "define src", leader));
+    const auto si = rig.topicInfo(leader, "src", 30s);
+    ASSERT_TRUE(si.has_value());
+    ASSERT_NO_FATAL_FAILURE(rig.must(createViewSender("v", si->id), "create v", leader));
+    const auto vi = rig.topicInfo(leader, "v", 30s);
+    ASSERT_TRUE(vi.has_value());
+    int64_t keys[3];
+    for (int32_t p = 0; p < 3; ++p) {
+        keys[p] = viewKeyFor(p, 3);
+        ASSERT_GT(keys[p], 0);
+        const ProduceIdentity ident = freshIdentity();
+        ASSERT_TRUE(rig.produceFollowing(leader, si->id, p, batchFor(true, keys[p], asString(characterValue(keys[p], 1)), ident),
+                                         60s, ident)) << "hp 1 for key " << keys[p] << " (p" << p << ") was never acked";
+    }
+    // The controller (the consensus leader) and the partition whose leader is (not) it.
+    int ctrl = -1, zp = -1, zombie = -1;
+    for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && zombie < 0;) {
+        ctrl = -1;
+        for (int n = 1; n <= 3; ++n) if (c.node(n).isLeader()) ctrl = n;
+        for (int32_t p = 0; p < 3 && ctrl > 0 && zombie < 0; ++p) {
+            const int l = rig.partitionLeader(leader, si->id, p);
+            if (l > 0 && (l == ctrl) == zombieIsController) { zp = p; zombie = l; }
+        }
+        if (zombie < 0) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_GT(zombie, 0) << "no source partition is led " << (zombieIsController ? "by" : "outside") << " the controller "
+                         << ctrl << " (the three partitions are expected spread over the three brokers)";
+    const int64_t key = keys[zp];
+    const auto warm = rig.viewRowSettled(zombie, vi->id, static_cast<uint64_t>(key), 30s);
+    ASSERT_TRUE(warm.ok()) << "the source leader serves the row before the partition";
+    ASSERT_EQ(rowHp(warm.row), 1);
+    ASSERT_EQ(warm.finalNode, zombie) << "... itself (it folds the view)";
+
+    c.node(zombie).partitionFromPeersForTest(true);
+    const int survivor = zombie == 1 ? 2 : 1;
+    int newLeader = -1;
+    for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline;) {
+        const int l = rig.partitionLeader(survivor, si->id, zp);
+        if (l > 0 && l != zombie) { newLeader = l; break; }
+        std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_GT(newLeader, 0) << "the majority fails partition " << zp << " over";
+    const ProduceIdentity ident = freshIdentity();
+    ASSERT_TRUE(rig.produceFollowing(newLeader, si->id, zp, batchFor(true, key, asString(characterValue(key, 2)), ident),
+                                     60s, ident)) << "the new leader acks hp 2";
+
+    int refused = 0;
+    for (int i = 0; i < 20; ++i) {
+        const auto r = rig.viewRowFollowing(zombie, vi->id, static_cast<uint64_t>(key));
+        ASSERT_TRUE(r.answered) << "read " << i << " through the partitioned ex-leader was never answered";
+        EXPECT_FALSE(!r.firstIsError && r.firstCode == pc::ViewRowResponse::kOk)
+            << "read " << i << ": the partitioned ex-leader answered OK (hp " << rowHp(r.row)
+            << ") after the new leader acked hp 2 - a stale read";
+        EXPECT_TRUE(r.firstIsError ? (r.firstCode == cNotLeader || r.firstCode == cRedirect)
+                                   : r.firstCode == pc::ViewRowResponse::kNotReady)
+            << "read " << i << ": a retriable refusal (got " << (r.firstIsError ? "error " : "status ") << r.firstCode << ")";
+        if (r.ok()) EXPECT_EQ(rowHp(r.row), 2) << "read " << i << ": a row reached by a redirect is the new one";
+        refused += r.firstIsError || r.firstCode != pc::ViewRowResponse::kOk;
+        std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_EQ(refused, 20);
+    const auto fresh = rig.viewRowSettled(newLeader, vi->id, static_cast<uint64_t>(key), 30s);
+    ASSERT_TRUE(fresh.ok()) << "the new leader serves the row";
+    EXPECT_EQ(rowHp(fresh.row), 2);
+
+    c.node(zombie).partitionFromPeersForTest(false);
+    bool healed = false;
+    for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline && !healed;) {
+        const auto r = rig.viewRowFollowing(zombie, vi->id, static_cast<uint64_t>(key));
+        if (r.ok()) {
+            ASSERT_EQ(rowHp(r.row), 2) << "healed: a read through the old leader is never the stale row";
+            healed = true;
+        } else {
+            std::this_thread::sleep_for(50ms);
+        }
+    }
+    EXPECT_TRUE(healed) << "healed: reads through the old leader reach the new row";
+}
+}  // namespace
+
+TEST(ViewReadLeaseRegression, PartitionedExLeaderNeverServesAStaleRowRegression) {
+    zombieViewReadCase(/*zombieIsController=*/false, "vls_zombie");
+}
+// VLS A.7 ViewReadLeaseStaleControllerRegression: the zombie is the deposed controller as well (it granted its own lease).
+TEST(ViewReadLeaseRegression, PartitionedControllerExLeaderNeverServesAStaleRowRegression) {
+    zombieViewReadCase(/*zombieIsController=*/true, "vls_ctrl_zombie");
 }

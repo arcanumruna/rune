@@ -2894,6 +2894,17 @@ void BrokerNode::buildGateway() {
     runtimeAgent_->setCanvassPublisher(publisher_.get());
     runtimeAgent_->setBootHistory(bootHistory_);
     runtimeAgent_->setFailoverTimeoutOverrideNs(config_.brokerLivenessTimeoutMs * 1'000'000LL);
+    // Issue #82 (VLS Part A): a multi-node broker serves a view row only under a controller-granted read lease, handed
+    // to each worker behind the role ops it covers; a new source leader also waits out W (every lease its predecessor
+    // was granted before the leader change) before its views serve.  A single node leads alone: unbounded, no wait.
+    if (!config_.isSingleNode() && election_ && workerPool_) {
+        for (int32_t i = 0; i < workerPool_->workerCount(); ++i) workerPool_->worker(i).requireViewReadLease();
+        for (auto& vs : workerViewSets_) vs->setPredecessorFenceWaitNs(election_->readLeaseFenceWaitNs());
+        runtimeAgent_->enableReadLeaseFanout(workerPool_->workerCount());
+        if (metadataService_)
+            election_->setReadLeaseCommitPosSource(
+                [](void* m) noexcept { return static_cast<MetadataService*>(m)->logEndForLease(); }, metadataService_.get());
+    }
     if (config_.testCandidacyHoldAtBoot && !config_.isSingleNode()) runtimeAgent_->setTestCandidacyHold(true);   // R-I1
     // Controlled shutdown (Kafka parity): multi-node only — a single node has
     // nobody to hand off to (begin completes at once).  The controller's

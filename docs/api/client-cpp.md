@@ -423,8 +423,12 @@ if (row.status == ViewRowResult::kOk) {
   - All four keep the source field's type as the output type. Create a view that uses one only after every broker runs a build that has them.
 - Rows are fixed-width and decoded positionally against a layout built from the plan's output types. Remember
   `viewTopicId` and `outputFingerprint` from `createView`: a drifted fingerprint is answered `SchemaMismatch`.
-- `ViewRowResult::status`: `kOk`, `kAbsentKey`, `kNotReady` (nothing folded yet), `kSchemaMismatch`, `kUnknownView`,
-  `kInvalidRequest`, `kBusy` (retry), `kRowTooLarge`, `kNotAuthorized`, and the client-side `kNotLeader`.
+- `ViewRowResult::status`: `kOk`, `kAbsentKey`, `kNotReady` (nothing folded yet, or a new source leader still waiting
+  out its predecessor: retry), `kSchemaMismatch`, `kUnknownView`, `kInvalidRequest`, `kBusy` (retry), `kRowTooLarge`,
+  `kNotAuthorized`, and the client-side `kNotLeader`.
+- A row is served only by the source partition's leader, under the controller's read lease, and reflects every write
+  acknowledged before the read was sent. A leader that lost its lease (cut off from the controller) answers `NotLeader`;
+  the client retries it within `ddlRetryBudget`.
 - Rules: an aggregate view needs a **one-partition** source (`ViewNotCoPartitioned` otherwise); a view over a transient
   topic must itself be transient (`ViewSourceTransient`); a view cannot read another view (`ViewSourceIsView`). `READ` on
   the view is needed to read a row and `READ` on each source to create it.

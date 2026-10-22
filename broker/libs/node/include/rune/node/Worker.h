@@ -99,6 +99,7 @@
 #include <rune/replication/ReplicationFrameLimits.h>   // F18 frame limits (maxAcceptableBatchBytes)
 #include <rune/node/WorkerReplicationTransport.h>
 #include <rune/node/IoBackend.h>
+#include <rune/consensus/LeaseClock.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/ProducerStateManager.h>
 #include <rune/storage/ProducePath.h>
@@ -560,6 +561,26 @@ public:
     /// PushRead ops executed by this worker (both answers and refusals).
     [[nodiscard]] uint64_t pushReadsForTest() const noexcept { return pushReads_; }
     [[nodiscard]] uint64_t getViewRowsForTest() const noexcept { return getViewRows_; }
+
+    // -----------------------------------------------------------------------
+    // Issue #82 (VLS A.5.2): the view read lease.  A multi-node broker's worker serves a view row only while it holds a
+    // controller-granted lease (WorkerOp::ReadLease, posted by the control thread's ReadLeaseFanout behind every role op
+    // the grant covered).  One field, monotone: kNoViewLease (none yet) < a lease end (LEASE clock, LeaseClock.h) <
+    // kViewLeaseUnbounded (a single-node broker / unit tests: no other broker can lead).  The serve check is one lease
+    // clock read and one compare (no lock, no ring, no allocation).
+    // -----------------------------------------------------------------------
+    static constexpr int64_t kNoViewLease        = INT64_MIN;
+    static constexpr int64_t kViewLeaseUnbounded = INT64_MAX;
+    /// A multi-node broker: no view row is served until a lease arrives.  Before the runner starts.
+    void requireViewReadLease() noexcept { viewLeaseEndNs_ = kNoViewLease; }
+    /// Test seam: read the lease clock from `*now` instead of LeaseClock (single-threaded drivers only).
+    void setLeaseClockForTest(const int64_t* now) noexcept { leaseNowOverride_ = now; }
+    [[nodiscard]] int64_t viewLeaseEndNsForTest() const noexcept { return viewLeaseEndNs_; }
+    [[nodiscard]] uint64_t viewReadsWithoutLeaseForTest() const noexcept { return viewReadsWithoutLease_; }
+    [[nodiscard]] uint64_t readLeasesSeenForTest() const noexcept { return readLeasesSeen_; }
+    [[nodiscard]] uint64_t viewReadsHeldForTest() const noexcept { return viewReadsHeld_; }
+    [[nodiscard]] uint64_t viewReadsHeldExpiredForTest() const noexcept { return viewReadsHeldExpired_; }
+    [[nodiscard]] std::size_t heldViewReadsForTest() const noexcept { return heldViewReads_.size(); }
 
     // Default acks=all commit-wait timeout: 30 s. Accounts for the extra fetch-
     // handling latency (fetch waits a worker cycle, E5.1.2c Note B) so the
@@ -1742,6 +1763,7 @@ public:
             if (viewSet_ != nullptr) [[unlikely]] {
                 work += viewSet_->drainInstalls();   // Task 19: install runtime-created view plans (own thread)
                 work += driveViews_(nowNs);          // Task 15: view folds, right after RC advance
+                work += serveHeldViewReads_();       // issue #82: reads the fold barrier held, now folded
             }
             if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
             work += serveHeldPushReads_();
@@ -1872,6 +1894,7 @@ private:
             // so every CreateView stayed UnknownView on the live path.
             work += viewSet_->drainInstalls();
             work += driveViews_(nowNs);          // Task 15: view folds, right after RC advance
+            work += serveHeldViewReads_();       // issue #82: reads the fold barrier held, now folded
         }
         if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
         work += serveHeldPushReads_();
@@ -2562,6 +2585,10 @@ private:
             break;
         case WorkerOp::Type::EnforceFence:   // issues #109 / #196: every op before it on the op ring is executed
             ackEnforceFence_(op.correlationId(), /*lifecycleRing=*/false);
+            break;
+        case WorkerOp::Type::ReadLease:      // issue #82: a view read lease (FIFO behind the role ops it covers)
+            ++readLeasesSeen_;
+            if (op.nextOffset() > viewLeaseEndNs_) viewLeaseEndNs_ = op.nextOffset();
             break;
         }
     }
@@ -3453,15 +3480,64 @@ private:
     // -------------------------------------------------------------------
     void executeGetViewRowWire_(sbe::WorkerOp& op) {
         ++getViewRows_;
-        const int32_t  viewTopicId = op.topicId();
-        const int32_t  partition   = op.partition();
-        const uint64_t keyU64      = static_cast<uint64_t>(op.nextOffset());
-        const uint64_t requestedFp = static_cast<uint64_t>(op.hwBound());
+        ViewReadReq r;
+        r.viewTopicId   = op.topicId();
+        r.partition     = op.partition();
+        r.key           = static_cast<uint64_t>(op.nextOffset());
+        r.fingerprint   = static_cast<uint64_t>(op.hwBound());
+        r.sessionId     = op.sessionId();
+        r.correlationId = op.correlationId();
+        if (serveViewRead_(r) == ViewServe::Answered) [[likely]] return;
+        // Issue #82 (VLS A.5.5): the table has not folded what was committed when the read arrived - held (a fixed
+        // list, reserved: never allocates; each held read owes one return, counted in reservedAckSlots_) and served
+        // after this pass's fold, or answered NotReady once its deadline passed.  Full: NotReady now.
+        if (heldViewReads_.size() < kMaxHeldViewReads && owedCapAllows_()) {
+            r.deadlineNs = passNowNs_ + kHeldViewReadMaxNs;
+            heldViewReads_.push_back(r);
+            ++viewReadsHeld_;
+            return;
+        }
+        ++viewReadsHoldRefused_;
+        answerViewRead_(r, static_cast<int16_t>(rune::protocol::client::ViewRowResponse::kNotReady));
+    }
+
+    // Issue #82: one GetViewRow (fresh, or held by the fold barrier).
+    struct ViewReadReq {
+        int64_t  sessionId     = 0;
+        int64_t  correlationId = 0;
+        uint64_t key           = 0;
+        uint64_t fingerprint   = 0;
+        int32_t  viewTopicId   = 0;
+        int32_t  partition     = 0;
+        int64_t  target        = -1;   ///< the fold barrier: the committed bound at arrival (-1: not taken yet)
+        int64_t  deadlineNs    = 0;    ///< a held read: answered NotReady once the pass clock reaches it
+    };
+    static constexpr std::size_t kMaxHeldViewReads  = 256;
+    static constexpr int64_t     kHeldViewReadMaxNs = 100'000'000;   // 100 ms: the fold reaches a fixed target in a pass or two
+    enum class ViewServe : uint8_t { Answered, Hold };
+
+    [[gnu::cold]] void answerViewRead_(const ViewReadReq& r, int16_t code) {
+        WorkerReturn ret;
+        ret.type          = WorkerReturn::Type::ViewRowResult;
+        ret.sessionId     = r.sessionId;
+        ret.correlationId = r.correlationId;
+        ret.readTopicId   = r.viewTopicId;
+        ret.readPartition = r.partition;
+        ret.recordCount   = 0;
+        ret.errorCode     = code;
+        enqueueReturn_(std::move(ret));
+    }
+
+    ViewServe serveViewRead_(ViewReadReq& r) {
+        const int32_t  viewTopicId = r.viewTopicId;
+        const int32_t  partition   = r.partition;
+        const uint64_t keyU64      = r.key;
+        const uint64_t requestedFp = r.fingerprint;
 
         WorkerReturn ret;
         ret.type          = WorkerReturn::Type::ViewRowResult;
-        ret.sessionId     = op.sessionId();
-        ret.correlationId = op.correlationId();
+        ret.sessionId     = r.sessionId;
+        ret.correlationId = r.correlationId;
         ret.readTopicId   = viewTopicId;   // echoed for gateway correlation
         ret.readPartition = partition;
         ret.recordCount   = 0;             // rowLen (informational)
@@ -3480,7 +3556,7 @@ private:
         if (viewSet_ == nullptr || !viewSet_->viewOutputFingerprint(viewTopicId, outputFp)) {
             ret.errorCode = static_cast<int16_t>(RS::kUnknownView);
             enqueueReturn_(std::move(ret));
-            return;
+            return ViewServe::Answered;
         }
 
         // 2. Schema drift: a pinned (non-zero) fingerprint that no longer matches
@@ -3488,7 +3564,7 @@ private:
         if (requestedFp != 0 && requestedFp != outputFp) {
             ret.errorCode = static_cast<int16_t>(RS::kSchemaMismatch);
             enqueueReturn_(std::move(ret));
-            return;
+            return ViewServe::Answered;
         }
 
         // 2b. C1 (Task 22 fix round 1): a view row is served only by the LEADER of
@@ -3500,18 +3576,39 @@ private:
         //     row or a wrong AbsentKey.  A linear scan of the worker-owned vector.
         {
             const int32_t src = viewSet_->viewSourceTopic(viewTopicId);
-            const rune::replication::PartitionReplica* srcRep = findOwnedReplica_(src, partition);
+            rune::replication::PartitionReplica* srcRep = findOwnedReplica_(src, partition);
             if (srcRep == nullptr || srcRep->role() != rune::replication::Role::Leader) {
                 ret.errorCode = kViewRowNotLeaderInternal;
                 enqueueReturn_(std::move(ret));
-                return;
+                return ViewServe::Answered;
             }
-            const auto gen = viewSet_->instanceLeadership(viewTopicId, partition);
-            if (!gen || *gen != srcRep->leadershipGeneration()) {   // not folded under THIS leadership yet
+            // 2c. Issue #82 (VLS A.5.2): ... and only under a READ LEASE.  A leader cut off from the controller keeps
+            //     role Leader until it learns its demotion; its lease ends (lease clock) before any other broker can
+            //     lead this partition, so from then on it answers the not-leader sentinel (the gateway redirects or
+            //     answers a bare NotLeader: the client retries), never its frozen table.
+            if (viewLeaseEndNs_ != kViewLeaseUnbounded && leaseNow_() >= viewLeaseEndNs_) [[unlikely]] {
+                ++viewReadsWithoutLease_;
+                ret.errorCode = kViewRowNotLeaderInternal;
+                enqueueReturn_(std::move(ret));
+                return ViewServe::Answered;
+            }
+            const WorkerViewSet::InstanceServeState st = viewSet_->instanceServeState(viewTopicId, partition);
+            if (!st.hosted || st.leadership != srcRep->leadershipGeneration()) {   // not folded under THIS leadership yet
                 ret.errorCode = static_cast<int16_t>(RS::kNotReady);
                 enqueueReturn_(std::move(ret));
-                return;
+                return ViewServe::Answered;
             }
+            // 2d. Issue #82 (VLS A.5.5): read-your-writes - an acked write is committed (at or below the HW / LSO), but
+            //     the fold may lag it within a pass (a persisted view folds at most maxRecordsPerPass per pass; the ack
+            //     leaves before the next pass folds).  The read waits for the fold to reach the committed bound AT ITS
+            //     ARRIVAL (fixed: bounded).  The common case is one compare.  Only a Ready table waits (one still
+            //     catching up / rebuilding answers NotReady below, at once); while the RC state is not Ready (it
+            //     rebuilds after a leadership / log change - the instance is then CatchingUp anyway) no bound is taken.
+            if (r.target < 0 && st.ready) {
+                if (const RcState* rc = rcServe_(srcRep, rcOf_(srcRep)); rc != nullptr) [[likely]]
+                    r.target = rc->lso(srcRep->highWatermark());
+            }
+            if (r.target >= 0 && st.foldCursor < r.target) [[unlikely]] return ViewServe::Hold;
         }
 
         // 3. Probe the view table.  getRow applies the Task 16 serve-guard
@@ -3523,13 +3620,34 @@ private:
             ret.errorCode   = static_cast<int16_t>(RS::kOk);
             ret.recordCount = static_cast<int32_t>(layout->rowLen);
             enqueueViewRowResult_(ret, row, layout->rowLen);   // zero-copy gather (hot path)
-            return;
+            return ViewServe::Answered;
         } else if (rs == WorkerViewSet::RowStatus::NotReady) {
             ret.errorCode = static_cast<int16_t>(RS::kNotReady);
         } else {
             ret.errorCode = static_cast<int16_t>(RS::kAbsentKey);
         }
         enqueueReturn_(std::move(ret));   // no chunk: a fixed-size answer
+        return ViewServe::Answered;
+    }
+
+    // Issue #82 (VLS A.5.5): per pass, after the view folds: serve the held reads whose fold reached their target;
+    // answer NotReady the ones past their deadline (never held forever: a fold that stopped - back-pressure, a lost
+    // leadership - ends in a retriable answer).  Every re-serve re-runs every check (role, lease, leadership).
+    int serveHeldViewReads_() {
+        if (heldViewReads_.empty()) [[likely]] return 0;
+        int n = 0;
+        for (std::size_t i = 0; i < heldViewReads_.size();) {
+            ViewReadReq& h = heldViewReads_[i];
+            if (serveViewRead_(h) == ViewServe::Hold) {
+                if (passNowNs_ < h.deadlineNs) { ++i; continue; }
+                ++viewReadsHeldExpired_;
+                answerViewRead_(h, static_cast<int16_t>(rune::protocol::client::ViewRowResponse::kNotReady));
+            }
+            heldViewReads_[i] = heldViewReads_.back();
+            heldViewReads_.pop_back();
+            ++n;
+        }
+        return n;
     }
 
     // Zero-alloc OK answer for GetViewRow (Review-focus: no per-query heap alloc
@@ -5228,6 +5346,19 @@ private:
     uint64_t    pushReadOversize_ = 0;
     uint64_t    pushReads_ = 0;            // F15 S4: PushRead ops executed (R-1 / R-3 tests)
     uint64_t    getViewRows_ = 0;          // Task 20: GetViewRow ops executed
+    // Issue #82 (VLS A.5.5): GetViewRows held by the fold barrier (reserved: never allocates).
+    std::vector<ViewReadReq> heldViewReads_ = [] { std::vector<ViewReadReq> v; v.reserve(kMaxHeldViewReads); return v; }();
+    uint64_t viewReadsHeld_        = 0;
+    uint64_t viewReadsHoldRefused_ = 0;
+    uint64_t viewReadsHeldExpired_ = 0;
+    // Issue #82: the view read lease (see requireViewReadLease).  Worker-thread owned (shared-nothing).
+    int64_t        viewLeaseEndNs_        = kViewLeaseUnbounded;
+    const int64_t* leaseNowOverride_      = nullptr;
+    uint64_t       viewReadsWithoutLease_ = 0;
+    uint64_t       readLeasesSeen_        = 0;
+    [[nodiscard]] int64_t leaseNow_() const noexcept {
+        return leaseNowOverride_ == nullptr ? rune::consensus::leaseClockNowNs() : *leaseNowOverride_;
+    }
     // Largest client batch the shard intake stores: min(the gateway's max
     // produce batch, one PushReadResult chunk of this worker's ret_).  Set in
     // the ctor (ret_ is fixed).
@@ -7091,6 +7222,7 @@ private:
         return static_cast<int64_t>(pendingAcksAll_.size()) +
                static_cast<int64_t>(durablePending_.size()) +
                static_cast<int64_t>(heldPushReads_.size()) +   // F15 S4 I-2: held PushReads owe a return
+               static_cast<int64_t>(heldViewReads_.size()) +   // issue #82: so do GetViewRows the fold barrier holds
                static_cast<int64_t>(deferredPushCount_);        // F5: so do budget-deferred ones
     }
 
