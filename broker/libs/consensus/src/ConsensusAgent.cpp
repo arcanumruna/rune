@@ -93,6 +93,18 @@ void ConsensusAgent::onTermFloorNotice(int64_t nowNs, NodeId fromMember, Term fl
     election_.onTermFloorNotice(nowNs, fromMember, floorTermId, refusedTermId);
 }
 
+void ConsensusAgent::onReadLeaseRequest(int64_t nowNs, Term term, NodeId memberId, int64_t reqSeq,
+                                        int64_t heardGrantSeq)
+{
+    election_.onReadLeaseRequest(nowNs, term, memberId, reqSeq, heardGrantSeq);
+}
+
+void ConsensusAgent::onReadLeaseGrant(int64_t nowNs, Term term, NodeId leaderMemberId, NodeId memberId,
+                                      int64_t reqSeq, int64_t grantSeq, int64_t commitPos, int64_t validForNs)
+{
+    election_.onReadLeaseGrant(nowNs, term, leaderMemberId, memberId, reqSeq, grantSeq, commitPos, validForNs);
+}
+
 void ConsensusAgent::onCanvassPosition(
     int64_t nowNs,
     Term    logLeadershipTermId,

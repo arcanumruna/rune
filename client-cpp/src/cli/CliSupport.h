@@ -9,12 +9,14 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
 #include <ostream>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -47,7 +49,10 @@ struct ParsedArgs {
 
 // The test-only overrides the schema commands already accept (not advertised).
 inline constexpr std::string_view kHiddenValueFlags[] = {"--cli-stream-in", "--cli-stream-out", "--cli-data-dir",
-                                                         "--cli-egress", "--user", "--password-file"};   // the global flags too (Task 8)
+                                                         "--cli-egress", "--user", "--password-file",   // the global flags too (Task 8)
+                                                         "--tls-ca", "--tls-host"};                     // issue #13
+/// Issue #13: the global boolean flags every connecting command accepts.
+inline constexpr std::string_view kGlobalBoolFlags[] = {"--insecure-plaintext"};
 
 inline bool parseArgs(std::string_view cmd, const std::vector<std::string>& args, std::initializer_list<std::string_view> valueFlags,
                std::initializer_list<std::string_view> boolFlags, ParsedArgs& out, std::ostream& err) {
@@ -74,7 +79,7 @@ inline bool parseArgs(std::string_view cmd, const std::vector<std::string>& args
                 return false;
             }
             out.values[a] = args[++i];
-        } else if (isIn(a, boolFlags)) {
+        } else if (isIn(a, boolFlags) || isIn(a, kGlobalBoolFlags)) {
             if (out.has(a)) {
                 err << "rune " << cmd << ": " << a << " given twice\n";
                 return false;
@@ -204,6 +209,37 @@ inline std::string envOr(const char* name) {
 inline void applyCredentials(rc::ClientConfig& cfg, const std::string& userFlag, const std::string& passwordFileFlag) {
     cfg.username     = !userFlag.empty() ? userFlag : envOr("RUNE_USER");
     cfg.passwordFile = !passwordFileFlag.empty() ? passwordFileFlag : envOr("RUNE_PASSWORD_FILE");
+}
+
+/// Issue #13: TLS for every command that connects.  `--tls-ca <pem>` (else RUNE_TLS_CA_FILE) trusts that CA bundle
+/// instead of the system store; `--tls-host <name>` (else RUNE_TLS_HOST) is the certificate name to check (default:
+/// each broker's own endpoint host).  A UDP broker is always reached over TLS (offered; required with credentials or
+/// for the bootstrap - the library refuses them in clear).  `--insecure-plaintext` connects without TLS and never
+/// sends credentials: with --user / RUNE_USER / --password-file, or for the bootstrap, it is refused.  Call after
+/// applyCredentials / securityBootstrapOnly.  Throws std::invalid_argument (a usage error) or std::runtime_error (an
+/// unreadable CA file).
+inline void applyTls(rc::ClientConfig& cfg, const std::string& caFlag, const std::string& hostFlag, bool insecure) {
+    const std::string ca   = !caFlag.empty() ? caFlag : envOr("RUNE_TLS_CA_FILE");
+    const std::string host = !hostFlag.empty() ? hostFlag : envOr("RUNE_TLS_HOST");
+    if (insecure) {
+        if (!caFlag.empty() || !hostFlag.empty())
+            throw std::invalid_argument("--insecure-plaintext cannot be combined with --tls-ca / --tls-host");
+        if (!cfg.username.empty() || !cfg.passwordFile.empty() || !cfg.password.empty() || cfg.securityBootstrapOnly)
+            throw std::invalid_argument("--insecure-plaintext never sends credentials or the bootstrap: drop it (an "
+                                        "authenticating broker serves only TLS sessions), or drop --user / "
+                                        "--password-file / RUNE_USER / RUNE_PASSWORD_FILE");
+        cfg.offerCrypto = false;
+        return;
+    }
+    if (!ca.empty()) {
+        std::ifstream in(ca, std::ios::binary);
+        if (!in) throw std::runtime_error("cannot read the TLS CA file '" + ca + "' (--tls-ca / RUNE_TLS_CA_FILE)");
+        cfg.tlsTrustPem = std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    }
+    cfg.tlsExpectHost = host;
+    // A UDP endpoint (another host) or an explicit TLS option: TLS.  aeron:ipc (this host) without one: plaintext,
+    // and the library refuses credentials there.
+    cfg.offerCrypto = !ca.empty() || !host.empty() || !rc::session::tlsHostOfChannel(cfg.gatewayChannel).empty();
 }
 
 /// Review B I6: the dev-mode banner, after any CLI connect (stderr, so it never mixes with a command's output).

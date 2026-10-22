@@ -1310,3 +1310,106 @@ TEST(EosBrokerRegression, TxnOffsetsCarryingTheMemberAreFencedByGenerationAndMem
     pp.close();
     cc->close();
 }
+
+// =========================================================================================================
+// 12. PR #490 eos-e2e step 3a, in process: consume -> transform -> produce with seekToCommitted rewinds, the
+// transaction coordinator (the controller) crashes mid-pipeline under clients seeded on another broker.  Every
+// failed transaction is aborted and rewound (seekToCommitted) like eos_probe does; the pipeline must resume and end
+// with output == input.  (eos-e2e on 493cc253: seekToCommitted kept answering "the session to the broker was lost"
+// and the pipeline gave up.)
+// =========================================================================================================
+TEST(EosBrokerRegression, PipelineSurvivesTheCoordinatorCrashWithSeekToCommittedRewindsRegression) {
+    constexpr int kInput = 4'000;
+    constexpr int kBatch = 100;
+    Env e("eos_pipe_crash");
+    const rc::TopicSpec in  = e.define("eos.in", kParts);
+    const rc::TopicSpec out = e.define("eos.out", kParts);
+    const int seed = e.otherThan(e.ctl);
+    {
+        auto ci = e.open(seed, {in});
+        rc::Producer pi = ci->producer(plainConfig());
+        Writer wi(*ci, pi, ci->topic("eos.in"), kParts);
+        Expected sink;
+        for (int i = 0; i < kInput; ++i) (void)wi.issue(mx::Op::TrySendCq, i, sink);
+        wi.expectAcksOk("input");
+        pi.close();
+        ci->close();
+    }
+    struct Item { int32_t partition; int64_t offset; int64_t id; };
+    std::vector<Item> pending;
+    auto cc = std::make_unique<rc::Client>(e.cfg(seed, {in}));
+    rc::GroupConfig gcfg;
+    gcfg.autoCommit          = false;
+    gcfg.autoOffsetReset     = rc::OffsetReset::Earliest;
+    gcfg.isolation           = rc::IsolationLevel::ReadCommitted;
+    gcfg.sessionTimeoutMs    = 30'000;
+    gcfg.commitSyncTimeoutMs = 30'000;
+    rc::GroupConsumer gc = cc->subscribeGroup("eos-crash-g", {"eos.in"}, gcfg);
+    gc.onRecords([&](const rc::RecordSet& rs) {
+        rs.forEachRecord([&](std::string_view, std::string_view v, int64_t off, int64_t) {
+            pending.push_back(Item{rs.partition, off, idOf(v)});
+        });
+    });
+    cc->connectAndWait(30s);
+    auto cp = e.open(seed, {out});
+    rc::Producer pp = cp->producer(txnConfig("eos-crash"));
+    Writer w(*cp, pp, cp->topic("eos.out"), kParts);
+    w.alsoPump(cc.get());
+    ASSERT_TRUE(w.init().ok());
+
+    Expected want;
+    int committed = 0, failed = 0, rewindFailures = 0;
+    bool crashed = false;
+    std::string lastRewindError;
+    const auto deadline = Clock::now() + 240s;
+    while (committed < kInput && Clock::now() < deadline) {
+        if (!w.until([&] { return static_cast<int>(pending.size()) >= kBatch || committed + static_cast<int>(pending.size()) >= kInput; }, 60s))
+            continue;
+        const auto n = std::min<std::size_t>(kBatch, pending.size());
+        std::vector<Item> take(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(n));
+        pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(n));
+        w.begin();
+        Expected scratch;
+        std::map<int32_t, int64_t> next;
+        for (const Item& it : take) {
+            (void)w.issue(mx::Op::Send, it.id, scratch);
+            next[it.partition] = std::max(next[it.partition], it.offset + 1);
+        }
+        if (!crashed && committed >= kInput * 30 / 100) {
+            e.c.crash(e.ctl);   // the coordinator AND the controller, mid-transaction
+            crashed = true;
+        }
+        std::vector<rc::OffsetEntry> offs;
+        for (const auto& [part, off] : next) offs.push_back(rc::OffsetEntry{in.topicId, part, off});
+        const bool sent = w.sendOffsets(offs, "eos-crash-g", 30s).ok();
+        if (sent && w.commit(30s).ok()) {
+            committed += static_cast<int>(take.size());
+            want.merge(scratch);
+            continue;
+        }
+        ++failed;
+        (void)w.abort(30s);
+        pending.clear();
+        try {
+            gc.seekToCommittedAndWait(30s);
+        } catch (const std::exception& ex) {
+            ++rewindFailures;
+            lastRewindError = ex.what();
+            ASSERT_LT(rewindFailures, 20) << "the pipeline cannot rewind after the coordinator crash: " << lastRewindError;
+        }
+    }
+    ASSERT_TRUE(crashed);
+    ASSERT_EQ(committed, kInput) << "the pipeline stalled after the coordinator crash (failed txns " << failed
+                                 << ", rewind failures " << rewindFailures << ": " << lastRewindError << ")";
+    int64_t cursor = 6'000'000;
+    ASSERT_TRUE(w.sentinel(want, cursor).ok());
+    awaitSettled(e, {out});
+    Reader rcRead(e, seed, {out}, -1, rc::Isolation::ReadCommitted);
+    ASSERT_TRUE(rcRead.await(want, 120s));
+    expectExactlyOnce(rcRead.seen, want, "output == input after the coordinator crash");
+    gc.close();
+    pp.close();
+    cp->close();
+    cc->close();
+}
+

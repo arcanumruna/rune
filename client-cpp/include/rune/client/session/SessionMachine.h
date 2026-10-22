@@ -105,8 +105,32 @@ struct SessionIo {
     /// path.  Default: no-op success.
     virtual bool retargetToLastKnownLeader() noexcept { return true; }
 
+    /// Issue #115: this session's CURRENT ingress channel ("" = unknown).  A connect with no configured
+    /// tlsExpectHost verifies the broker certificate against this channel's host (tlsHostOfChannel).  Cold path
+    /// (once per connect episode).  Default: unknown.
+    [[nodiscard]] virtual std::string ingressChannel() const { return {}; }
+
     virtual ~SessionIo() = default;
 };
+
+/// Issue #115: the host of an Aeron UDP channel ("aeron:udp?endpoint=host:port|..." or a bare "host:port"), without
+/// the port and IPv6 brackets; "" when the channel names no host (aeron:ipc, no endpoint).  The TLS name a session
+/// verifies when ClientConfig::tlsExpectHost is empty.
+[[nodiscard]] inline std::string tlsHostOfChannel(std::string_view ch) {
+    if (ch.rfind("aeron:", 0) == 0) {
+        const auto ep = ch.find("endpoint=");
+        if (ep == std::string_view::npos) return {};
+        ch = ch.substr(ep + 9);
+        if (const auto end = ch.find_first_of("|&"); end != std::string_view::npos) ch = ch.substr(0, end);
+    }
+    if (!ch.empty() && ch.front() == '[') {   // [v6]:port
+        const auto close = ch.find(']');
+        return close == std::string_view::npos ? std::string{} : std::string(ch.substr(1, close - 1));
+    }
+    const auto colon = ch.rfind(':');
+    if (colon != std::string_view::npos && ch.find(':') == colon) ch = ch.substr(0, colon);   // host:port (not a bare v6)
+    return std::string(ch);
+}
 
 // ---------------------------------------------------------------------------
 // SessionConfig — machine configuration with sensible defaults.
@@ -200,10 +224,13 @@ struct SessionConfig {
     // when true, a ConnectResponse{OK} that negotiates NO cipher (chosenCipher
     // == 0 — a plaintext broker, or a MITM that stripped the crypto offer off
     // the wire before the broker saw it) must NOT silently proceed to a
-    // plaintext Connected session.  onConnectResponse instead calls
-    // onHandshakeFailed_() -> terminal Rejected(HandshakeFailed), exactly like
-    // a real TLS handshake failure.  Meaningless (and left false) unless
-    // offerCrypto is also true.  Default false (back-compat).
+    // plaintext Connected session.  Issue #14: every answer before the TLS keys
+    // exist is unauthenticated, so such a refusal (and any pre-TLS ConnectResponse
+    // / HandshakeContinueResponse error or verify failure) is a TRANSIENT connect
+    // failure (onPreTlsRefusal_: retried, then Backoff / Disconnected), never a
+    // terminal Rejected a forged packet could cause.  Meaningless (and left false)
+    // unless offerCrypto is also true.  Default false; Client sets it for a
+    // credentialed client (ClientConfig::insecurePlaintextAuth).
     bool requireCrypto = false;
 };
 
@@ -415,6 +442,15 @@ public:
     /// Fix round 4: this session offers crypto — its negotiated mode is only known
     /// once Connected, so no non-handshake frame may leave it before then.
     [[nodiscard]] bool offersCrypto() const noexcept { return cfg_.offerCrypto; }
+    /// PR #476 review: a frame sealed under this session's keys opened - the broker has proven the keys, so an
+    /// unauthenticated handshake failure naming this session is a forgery from now on (onHandshakeContinueResponse).
+    void onSealedFrameOpened() noexcept {
+        if (brokerKeysProven_) return;
+        brokerKeysProven_ = true;
+        unprovenFinalLegRetries_ = 0;
+        backoff_ = {};   // the connect really succeeded: renew the Backoff schedule (finishConnected_ deferred it)
+    }
+    [[nodiscard]] bool brokerKeysProven() const noexcept { return brokerKeysProven_; }
     /// Fix round 5 (N4-I1): a HandshakeContinueResponse{HandshakeFailed} naming this Connected
     /// session's current id and connect corrId — its final handshake leg failed broker-side.
     [[nodiscard]] bool isFinalLegHandshakeFailure(int16_t code, int64_t corrId, int64_t noticeSessionId) const noexcept {
@@ -629,6 +665,7 @@ public:
         // FIX F8: retarget is noexcept and returns success; a failed retarget
         // keeps the previous ingress endpoint — we still resend (bounded by the
         // redirect cap) rather than crash.
+        notePreTlsRedirect_(newEndpoint);   // issue #115: unauthenticated - the TLS name does not follow it
         (void)io_.retarget(std::string(newEndpoint));
         doConnect(nowNs, /*resetSessionId=*/false, /*freshEpisode=*/false);
     }
@@ -656,8 +693,28 @@ public:
         // success the broker sends nothing more).  The same verdict as on any leg: terminal.
         // Only for THIS session's last handshake: its current id AND connect corrId.
         if (isFinalLegHandshakeFailure(code, incomingCorrelationId, noticeSessionId)) {
-            cryptoState_ = CryptoState{};
-            onHandshakeFailed_(nowNs);    // Rejected(HandshakeFailed)
+            // PR #476 review (issues #14 / #469, supersedes N4-I1): the frame is in clear and names only guessable ids.
+            // Once the broker has PROVEN the session's keys (a sealed frame opened) it is a forgery: ignored.  Before
+            // that it is a transient connect failure, retried within the connect budget - never terminal, so one
+            // packet can never end a session for good.
+            if (brokerKeysProven_) return;
+            // The session reached Connected / Authenticating, which renewed the connect budget: these retries have
+            // their own count, renewed only once a sealed frame proves the keys - a broker that fails every final leg
+            // is retried maxConnectRetries times, then Backoff / Disconnected, never a reconnect storm.
+            hs_.reset();
+            cryptoState_      = CryptoState{};
+            lastConnectError_ = code;
+            ++connectFailures_;
+            if (unprovenFinalLegRetries_ < cfg_.maxConnectRetries) {
+                ++unprovenFinalLegRetries_;
+                doConnect(nowNs, /*resetSessionId=*/true, /*freshEpisode=*/false);
+                return;
+            }
+            // Exhausted: Backoff (never terminal), whose delay keeps growing until a sealed frame proves the keys
+            // (finishConnected_ does not renew it for an unproven TLS session) - a broker failing every final leg is
+            // retried at most once per Backoff delay, and an on-demand revive (Disconnected only) cannot storm.
+            sessionId_ = 0;
+            enterBackoff_(nowNs);
             return;
         }
         if (state_ != SessionState::Handshaking) return;
@@ -873,6 +930,7 @@ public:
                 // FIX F8: retarget is noexcept; a failed retarget keeps the old
                 // endpoint and we still resend (no throw into noexcept dispatch).
                 if (!message.empty()) {
+                    notePreTlsRedirect_(message);   // issue #115: unauthenticated - the TLS name does not follow it
                     (void)io_.retarget(std::string(message));
                 }
                 // Resend ConnectRequest (retargeted if message was an endpoint).
@@ -1093,13 +1151,73 @@ private:
     void beginCryptoHandshake_() noexcept {
         if (!cfg_.offerCrypto) return;  // toggle off — byte-identical pre-Task-5 connect
         cryptoState_ = CryptoState{};   // N-I1: no key of an earlier session survives a fresh episode
+        brokerKeysProven_ = false;      // PR #476 review: proven again only by a sealed frame of THIS episode
         hs_.reset();
+        std::string host;
+        try {
+            host = tlsHostForEpisode_();
+        } catch (...) {
+            return;   // allocation failure (cold): no TLS this episode - requireCrypto fails it, never plaintext creds
+        }
         auto t = rune::crypto::TlsSession::makeClient(cfg_.tlsTrustPem ? cfg_.tlsTrustPem->c_str() : nullptr,
-                                                      cfg_.tlsExpectHost.c_str());
+                                                      host.c_str());
         if (!t.valid()) return;
         hs_.emplace(std::move(t));
         hs_->tls.readInbound(nullptr, 0);  // kick off ClientHello generation
         drainHandshakeOutbound_();
+    }
+
+    /// Issue #115: the certificate name this connect episode verifies.  The configured tlsExpectHost when set; else
+    /// the host of the session's current endpoint - except an endpoint reached by a PRE-TLS redirect (a ConnectResponse
+    /// / ErrorResponse redirect in Connecting is unauthenticated: any UDP sender can forge one).  Such an endpoint is
+    /// bound for the session's whole life to the name of the endpoint it was redirected from, whatever path brings the
+    /// session back to it (the Backoff walk's last-known leader, a resume, a later redirect): a forged redirect to a
+    /// host the attacker holds a certificate for never verifies.  More than kMaxRedirectPins bound endpoints (or an
+    /// allocation failure) fails closed: every unbound endpoint then verifies the session's anchor (the name of the
+    /// first endpoint it ever checked).  Cold path.
+    [[nodiscard]] std::string tlsHostForEpisode_() {
+        if (!cfg_.tlsExpectHost.empty()) return cfg_.tlsExpectHost;
+        const std::string ch = io_.ingressChannel();
+        if (const RedirectPin* pin = findRedirectPin_(ch)) return pin->host;
+        if (!anchorSet_) { anchorHost_ = tlsHostOfChannel(ch); anchorSet_ = true; }
+        if (redirectPinsOverflowed_) return anchorHost_;
+        return tlsHostOfChannel(ch);
+    }
+
+    struct RedirectPin { std::string channel, host; };
+    static constexpr std::size_t kMaxRedirectPins = 16;
+    /// The pin binding `channel`, refreshed to most-recently-used; null when none.
+    RedirectPin* findRedirectPin_(const std::string& channel) {
+        for (std::size_t k = 0; k < redirectPins_.size(); ++k) {
+            if (redirectPins_[k].channel != channel) continue;
+            if (k + 1 != redirectPins_.size()) {
+                RedirectPin p = std::move(redirectPins_[k]);
+                redirectPins_.erase(redirectPins_.begin() + static_cast<std::ptrdiff_t>(k));
+                redirectPins_.push_back(std::move(p));
+            }
+            return &redirectPins_.back();
+        }
+        return nullptr;
+    }
+
+    /// Issue #115: a pre-TLS redirect is about to retarget this session - bind the target endpoint to the name the
+    /// session verifies now (the name its current endpoint is itself bound to, else that endpoint's own host).  A
+    /// target already bound keeps its first binding.
+    void notePreTlsRedirect_(std::string_view newEndpoint) noexcept {
+        if (!cfg_.offerCrypto || !cfg_.tlsExpectHost.empty()) return;
+        try {
+            const std::string host = tlsHostForEpisode_();   // the current endpoint's binding (sets the anchor)
+            std::string target = newEndpoint.rfind("aeron:", 0) == 0 ? std::string(newEndpoint)
+                                                                     : "aeron:udp?endpoint=" + std::string(newEndpoint);
+            if (findRedirectPin_(target) != nullptr) return;
+            if (redirectPins_.size() == kMaxRedirectPins) {
+                redirectPins_.erase(redirectPins_.begin());   // least recently used ...
+                redirectPinsOverflowed_ = true;               // ... and every unbound endpoint verifies the anchor
+            }
+            redirectPins_.push_back(RedirectPin{std::move(target), host});
+        } catch (...) {
+            redirectPinsOverflowed_ = true;   // fail closed: unbound endpoints verify the anchor
+        }
     }
 
     /// Pull every pending outbound handshake byte out of hs_->tls into hs_->outbound
@@ -1283,16 +1401,30 @@ private:
         connectRetryCount_   = 0;
         resumeRetryCount_    = 0;
         everLive_            = true;   // T15a R1 latch
-        backoff_             = {};
+        // PR #476 review: an encrypted session's Backoff is renewed only once a sealed frame proves the keys
+        // (onSealedFrameOpened) - an optimistic Connected followed by a final-leg failure keeps its growing delay.
+        if (!cryptoState_.encrypted) backoff_ = {};
         lastConnectError_    = 0;      // I2: refused attempts are history now
         transitionTo(SessionState::Connected);
     }
 
     /// A TLS handshake failure (verify failure, protocol error, local export
     /// failure, or a broker-sent HandshakeContinueResponse{HandshakeFailed}).
-    /// Non-retriable — Rejected, mirroring onConnectError_'s ProtocolVersion path.
+    /// Non-retriable — Rejected, mirroring onConnectError_'s ProtocolVersion path —
+    /// unless crypto is REQUIRED: then every such answer arrived before the session had
+    /// keys, so nothing authenticates it (issue #14: any UDP sender can forge one) and it is
+    /// a transient connect failure (onPreTlsRefusal_), never a terminal verdict.
     void onHandshakeFailed_(int64_t nowNs) noexcept {
-        (void)nowNs;
+        if (cfg_.offerCrypto && cfg_.requireCrypto) {
+            onPreTlsRefusal_(static_cast<int16_t>(static_cast<uint16_t>(rune::protocol::client::ErrorCode::HandshakeFailed)),
+                             nowNs);
+            return;
+        }
+        rejectHandshake_();
+    }
+
+    /// Terminal Rejected(HandshakeFailed): a TLS failure that retrying cannot change.
+    void rejectHandshake_() noexcept {
         hs_.reset();
         rejectCode_ = static_cast<int16_t>(
             static_cast<uint16_t>(rune::protocol::client::ErrorCode::HandshakeFailed));
@@ -1313,7 +1445,7 @@ private:
 
     void tickConnecting(int64_t nowNs) noexcept {
         if (cfg_.offerCrypto && cfg_.requireCrypto && !hs_) [[unlikely]] {
-            onHandshakeFailed_(nowNs);   // fix round 4: required crypto, no local TLS — a verdict
+            rejectHandshake_();   // fix round 4: required crypto, no local TLS — a local verdict, terminal
             return;
         }
         // Guard: only fast-retry if the full timeout has NOT elapsed yet.
@@ -1415,10 +1547,37 @@ private:
         }
     }
 
+    /// Issue #14: an answer that arrived before this session's TLS keys existed while crypto is REQUIRED - a
+    /// ConnectResponse / ErrorResponse refusal, a plaintext OK (a stripped offer), a HandshakeContinueResponse
+    /// failure, a failed verify of the server's flight.  Nothing authenticates it (any UDP sender can forge one), so
+    /// it is a transient connect failure: retried on a fresh episode within the connect budget, then
+    /// onRetryBudgetExhausted_ (Backoff once Live with reconnectForeverAfterLive, else Disconnected), never terminal
+    /// Rejected.  lastConnectError() reports the code.
+    void onPreTlsRefusal_(int16_t code, int64_t nowNs) noexcept {
+        hs_.reset();
+        cryptoState_      = CryptoState{};
+        lastConnectError_ = code;
+        ++connectFailures_;
+        if (state_ == SessionState::Connecting || state_ == SessionState::Handshaking) {
+            if (connectRetryCount_ < cfg_.maxConnectRetries) {
+                ++connectRetryCount_;
+                doConnect(nowNs, /*resetSessionId=*/true, /*freshEpisode=*/false);
+                return;
+            }
+        }
+        sessionId_ = 0;   // a half-made (or forged-away) session is abandoned: the retry is fresh
+        onRetryBudgetExhausted_(nowNs);
+    }
+
     /// A ConnectResponse / ErrorResponse error while Connecting that is neither
     /// OK nor a redirect.
     void onConnectError_(rune::protocol::client::ErrorCode ec, int64_t nowNs) noexcept {
         namespace rpc = rune::protocol::client;
+        if (cfg_.offerCrypto && cfg_.requireCrypto &&
+            (state_ == SessionState::Connecting || state_ == SessionState::Handshaking)) {
+            onPreTlsRefusal_(static_cast<int16_t>(static_cast<uint16_t>(ec)), nowNs);   // issue #14: unauthenticated
+            return;
+        }
         lastConnectError_ = static_cast<int16_t>(static_cast<uint16_t>(ec));   // I2
         ++connectFailures_;
         if (!cfg_.reconnectForeverAfterLive) {
@@ -1595,6 +1754,14 @@ private:
         explicit HandshakeEpisode(rune::crypto::TlsSession t) noexcept : tls(std::move(t)) {}
     };
     std::optional<HandshakeEpisode> hs_;
+    // Issue #115 (tlsHostForEpisode_): every endpoint a pre-TLS redirect moved this session to, bound to the
+    // certificate name it keeps verifying there (most recently used last); the anchor name, and the fail-closed flag.
+    bool                     brokerKeysProven_ = false;   // PR #476 review: see onSealedFrameOpened
+    int                      unprovenFinalLegRetries_ = 0;   // final-leg failures retried since keys were last proven
+    std::vector<RedirectPin> redirectPins_;
+    std::string              anchorHost_;
+    bool                     anchorSet_ = false;
+    bool                     redirectPinsOverflowed_ = false;
     // Growable frame-encode scratch for any message carrying handshake bytes
     // (kScratchCap=512 is not sized for a TLS flight); capacity persists.
     std::vector<uint8_t> hsFrameBuf_;

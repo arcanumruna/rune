@@ -351,9 +351,14 @@ struct ClientConfig {
     // "" = trust nothing (deliberately untrusted — tests only); non-empty =
     // a PEM CA bundle to trust instead of the system store.
     std::optional<std::string> tlsTrustPem;
-    // tlsExpectHost: the broker's DNS name, checked against its cert's SAN
-    // (hostname verification). "" installs NO hostname check — leave empty
-    // only for loopback/tests; set this in production.
+    // tlsExpectHost: the name checked against the broker certificate's SAN (a DNS
+    // name, or an IP literal against its iPAddress SANs).  "" (the default) = each
+    // session checks the host of ITS endpoint (the gateway channel for the first,
+    // the advertised endpoint for every other broker; a pre-TLS redirect never moves
+    // the name).  Issue #115: offerCrypto with the system store (tlsTrustPem unset),
+    // no tlsExpectHost and a gateway channel naming no host throws
+    // std::invalid_argument - the system store with no name check would accept any
+    // public certificate for any name.
     std::string tlsExpectHost;
     // (authToken, removed — fix-on-sight, authentication Task 7: it was documented as validated
     // "by the broker's existing auth path", but no such path existed.  The wire field stays
@@ -386,12 +391,21 @@ struct ClientConfig {
     uint32_t minPasswordLength = 12;
     uint32_t scramIterations   = 4096;
     // requireCrypto (downgrade safety, spec §11 require_tls's client-side
-    // mirror): when true, a ConnectResponse that negotiates NO cipher makes
-    // connect() fail TERMINALLY (Rejected/HandshakeFailed) rather than
-    // silently proceed plaintext — defeats a MITM that strips the crypto
-    // offer off the wire before the broker ever sees it. Meaningless unless
-    // offerCrypto is also true. Default false (back-compat).
+    // mirror): when true, a session never proceeds without TLS — a ConnectResponse
+    // that negotiates NO cipher (a MITM that stripped the crypto offer) fails the
+    // connect attempt rather than silently going plaintext.  Issue #14: such a
+    // refusal is unauthenticated, so it is retried (connect budget, then Backoff /
+    // Disconnected with lastConnectError HandshakeFailed), never terminal.
+    // Meaningless unless offerCrypto is also true.  Default false; ALWAYS on for a
+    // credentialed client (username, or securityBootstrapOnly) unless
+    // insecurePlaintextAuth.
     bool requireCrypto = false;
+    // insecurePlaintextAuth (issue #14, TESTS ONLY): let a credentialed client log in over a plaintext session.
+    // Default false: a Client with credentials (username / password / passwordFile) or securityBootstrapOnly
+    // requires TLS — construction throws std::invalid_argument without offerCrypto, and requireCrypto is forced on
+    // — so a password proof, a verifier or the bootstrap material never travel in clear (issue #113).  An
+    // authenticating broker refuses plaintext sessions anyway (issue #10).
+    bool insecurePlaintextAuth = false;
 
     // ---- Catalog history (Task 5) — DDL.
     // clientName: carried in every DDL's extension (DdlOptions::clientName

@@ -1,4 +1,5 @@
 #include <rune/node/NodeConfig.h>
+#include <rune/node/TlsStartupPolicy.h>
 #include <rune/node/AuthDevMode.h>
 #include <rune/catalog/TopicName.h>
 #include <rune/node/EmbeddedDriver.h>
@@ -2782,6 +2783,8 @@ TEST(NodeConfigRegression, ShortClusterKeyFileIsRefused) {
     KeyDir d;
     NodeConfig cfg;
     cfg.authMode = AuthMode::Enabled;
+    cfg.tlsCertFile = "/etc/rune/tls.pem";   // issue #10: an authenticating broker needs its certificate (checked last)
+    cfg.tlsKeyFile  = "/etc/rune/tls.key";
     cfg.clusterKeyFile = d.write("k31", std::string(31, 'k'));   // 31 bytes: one short
     auto err = cfg.validateAuth();
     ASSERT_TRUE(err.has_value());
@@ -2808,6 +2811,129 @@ TEST(NodeConfigRegression, ShortClusterKeyFileIsRefused) {
     EXPECT_FALSE(cfg.validateAuth().has_value());
     cfg.authMode = AuthMode::InProcessUnauthenticated;
     EXPECT_FALSE(cfg.validateAuth().has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Issues #10 / #11 (combined fix program M1): authentication => every client session is TLS
+// ---------------------------------------------------------------------------
+
+// Every client session of an authenticating broker is TLS unless a code-built test config opts out; RUNE_REQUIRE_TLS
+// forces it without authentication.  RED: requiresClientTls() ignoring authMode (the pre-#10 requireTls flag).
+TEST(NodeConfigRegression, AuthenticationRequiresTlsOnEveryClientSessionRegression) {
+    struct Case { AuthMode mode; ClientTransport t; bool needsTls; };
+    const Case cases[] = {
+        {AuthMode::Enabled, ClientTransport::TlsOptional, true},
+        {AuthMode::Enabled, ClientTransport::RequireTls, true},
+        {AuthMode::Enabled, ClientTransport::PlaintextForTest, false},
+        {AuthMode::DevDisabled, ClientTransport::TlsOptional, false},
+        {AuthMode::DevDisabled, ClientTransport::RequireTls, true},
+        {AuthMode::InProcessUnauthenticated, ClientTransport::TlsOptional, false},
+        {AuthMode::InProcessUnauthenticated, ClientTransport::RequireTls, true},
+    };
+    for (const Case& c : cases) {
+        NodeConfig cfg;
+        cfg.authMode = c.mode;
+        cfg.clientTransport = c.t;
+        EXPECT_EQ(cfg.requiresClientTls(), c.needsTls)
+            << "mode " << int(c.mode) << " transport " << int(c.t);
+    }
+    // The env parse never yields PlaintextForTest, and the default (RUNE_AUTH unset) requires TLS.
+    auto env = base1node();
+    env["RUNE_TLS_CERT_FILE"] = "/etc/rune/tls.pem";
+    env["RUNE_TLS_KEY_FILE"]  = "/etc/rune/tls.key";
+    for (const char* rt : {"", "true", "1", "TRUE"}) {
+        auto e = env;
+        if (*rt) e["RUNE_REQUIRE_TLS"] = rt;
+        auto r = parseNodeConfig(fakeEnv(e));
+        if (!tlsBuild()) { EXPECT_FALSE(r.config.has_value()); continue; }
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        EXPECT_NE(r.config->clientTransport, ClientTransport::PlaintextForTest);
+        EXPECT_TRUE(r.config->requiresClientTls()) << "RUNE_REQUIRE_TLS='" << rt << "'";
+    }
+}
+
+// M1: RUNE_REQUIRE_TLS=false with authentication refuses to start; a value that is neither true nor false is refused
+// (it used to mean false).  Dev mode may run without required TLS.  RED: delete the requireTlsFalse refusal.
+TEST(NodeConfigRegression, RequireTlsFalseWithAuthRefusesToStartRegression) {
+    if (!tlsBuild()) GTEST_SKIP() << "a non-TLS build refuses RUNE_REQUIRE_TLS outright (TlsVariablesInANonTlsBuild...)";
+    for (const char* f : {"false", "0", "FALSE"}) {
+        auto env = base1node();
+        env["RUNE_REQUIRE_TLS"] = f;
+        auto r = parseNodeConfig(fakeEnv(env));
+        EXPECT_FALSE(r.config.has_value()) << "RUNE_REQUIRE_TLS=" << f << " with authentication must refuse";
+        EXPECT_NE(r.error.find("RUNE_REQUIRE_TLS=false"), std::string::npos) << r.error;
+        env["RUNE_AUTH"] = "disabled";
+        r = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        EXPECT_FALSE(r.config->requiresClientTls()) << "dev mode: TLS stays optional";
+    }
+    auto env = base1node();
+    env["RUNE_REQUIRE_TLS"] = "yes";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.config.has_value());
+    EXPECT_NE(r.error.find("RUNE_REQUIRE_TLS must be"), std::string::npos) << r.error;
+}
+
+// M1 / issue #11: a broker built without RUNE_TLS refuses authentication (the default mode) - it could serve only
+// plaintext sessions.  RED: tlsBuildRefusal returning nullopt for an authenticating non-TLS build.
+TEST(NodeConfigRegression, EnabledWithoutTlsBuildRefusesToStartRegression) {
+    const auto err = tlsBuildRefusal(/*tlsBuild=*/false, /*anyTlsVariableSet=*/false, /*authEnabled=*/true);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("-DRUNE_TLS=ON"), std::string::npos) << *err;
+    EXPECT_NE(err->find("RUNE_AUTH=disabled"), std::string::npos) << *err;
+    EXPECT_FALSE(tlsBuildRefusal(false, false, /*authEnabled=*/false).has_value()) << "dev mode runs plaintext";
+    EXPECT_FALSE(tlsBuildRefusal(/*tlsBuild=*/true, false, true).has_value());
+    if (!tlsBuild()) {   // the real parse of this build
+        auto r = parseNodeConfig(fakeEnv(base1node()));
+        EXPECT_FALSE(r.config.has_value());
+        EXPECT_NE(r.error.find("-DRUNE_TLS=ON"), std::string::npos) << r.error;
+    }
+}
+
+// Issue #11: any RUNE_TLS_* / RUNE_REQUIRE_TLS in a non-TLS build refuses to start (it used to be silently ignored and
+// the broker started plaintext), with or without authentication.  RED: tlsBuildRefusal ignoring anyTlsVariableSet.
+TEST(NodeConfigRegression, TlsVariablesInANonTlsBuildRefuseToStartRegression) {
+    for (const bool auth : {false, true}) {
+        const auto err = tlsBuildRefusal(/*tlsBuild=*/false, /*anyTlsVariableSet=*/true, auth);
+        ASSERT_TRUE(err.has_value());
+        EXPECT_NE(err->find("RUNE_TLS_CERT_FILE"), std::string::npos) << *err;
+        EXPECT_NE(err->find("built without TLS"), std::string::npos) << *err;
+    }
+    EXPECT_FALSE(tlsBuildRefusal(/*tlsBuild=*/true, true, true).has_value());
+    if (!tlsBuild()) {
+        for (const char* var : {"RUNE_TLS_CERT_FILE", "RUNE_TLS_KEY_FILE", "RUNE_REQUIRE_TLS"}) {
+            auto env = base1node();
+            env["RUNE_AUTH"] = "disabled";
+            env[var] = "x";
+            auto r = parseNodeConfig(fakeEnv(env));
+            EXPECT_FALSE(r.config.has_value()) << var;
+            EXPECT_NE(r.error.find("built without TLS"), std::string::npos) << r.error;
+        }
+    }
+}
+
+// Issue #10: an authenticating broker with no certificate refuses to start (validateAuth: main and BrokerNode::start),
+// naming the variables; PlaintextForTest (in-process tests) and dev mode need none.  RED: delete the
+// mustRefuseRequiredTlsWithoutCertificate check in validateAuth.
+TEST(NodeConfigRegression, EnabledWithoutACertificateRefusesToStartRegression) {
+    KeyDir d;
+    NodeConfig cfg;
+    cfg.authMode = AuthMode::Enabled;
+    cfg.clusterKeyFile = d.write("k", std::string(40, 'k'));
+    auto err = cfg.validateAuth();
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("RUNE_TLS_CERT_FILE"), std::string::npos) << *err;
+    EXPECT_NE(err->find("RUNE_TLS_KEY_FILE"), std::string::npos) << *err;
+    cfg.tlsCertFile = "/etc/rune/tls.pem";   // configured (loading is BrokerNode's fail-fast check)
+    cfg.tlsKeyFile  = "/etc/rune/tls.key";
+    EXPECT_FALSE(cfg.validateAuth().has_value());
+    cfg.tlsCertFile.clear();
+    cfg.tlsKeyFile.clear();
+    cfg.clientTransport = ClientTransport::PlaintextForTest;
+    EXPECT_FALSE(cfg.validateAuth().has_value()) << "test-only plaintext sessions need no certificate";
+    cfg.clientTransport = ClientTransport::TlsOptional;
+    cfg.authMode = AuthMode::DevDisabled;
+    EXPECT_FALSE(cfg.validateAuth().has_value()) << "dev mode: TLS optional";
 }
 
 TEST(NodeConfigRegression, DevModeRefusesAMultiBrokerClusterRegression) {

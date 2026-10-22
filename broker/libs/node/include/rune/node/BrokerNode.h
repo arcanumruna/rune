@@ -1816,6 +1816,11 @@ public:
     void setControllerDecisionHoldForTest(bool on) {
         (void)onControlThreadForTest([this, on]() { if (metadataService_) metadataService_->setHoldAllDecisionsForTest(on); return 0; });
     }
+    /// PR #490 review: hold this broker's metadata apply (holdMetadataApplyForTest).
+    template <class = void>
+    void holdMetadataApplyForTest(bool on) {
+        (void)onControlThreadForTest([this, on]() { if (metadataService_) metadataService_->holdMetadataApplyForTest(on); return 0; });
+    }
     /// The consensus leader (this node, if it is) resigns (posted to the control thread).
     template <class = void>
     void resignConsensusForTest() {

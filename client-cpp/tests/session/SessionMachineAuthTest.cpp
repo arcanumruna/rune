@@ -621,7 +621,7 @@ TEST(SessionMachineAuthRegression, OverTlsTheLoginFollowsTheHandshakeAndConnecte
 
 // Review B I2: the broker's final-leg HandshakeFailed arrives while the machine is Authenticating (a TLS 1.3 client is
 // done once it has SENT its Finished): terminal Rejected(HandshakeFailed), not a transient timeout.
-TEST(SessionMachineAuthRegression, AFinalLegHandshakeFailedWhileAuthenticatingIsRejectedHandshakeFailedRegression) {
+TEST(SessionMachineAuthRegression, AFinalLegHandshakeFailedWhileAuthenticatingIsRetriedNotRejectedRegression) {
     const std::string serverPem = slurp(testdata("server.pem")), serverKey = slurp(testdata("server.key")),
                       caPem = slurp(testdata("ca.pem"));
     cr::TlsSession srv = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
@@ -653,10 +653,18 @@ TEST(SessionMachineAuthRegression, AFinalLegHandshakeFailedWhileAuthenticatingIs
         else m.onHandshakeContinueResponse(0, outView, corr, 1);
     }
     ASSERT_EQ(m.state(), sm::SessionState::Authenticating);
+    const std::size_t sentBefore = io.frames.size();
     m.onHandshakeContinueResponse(static_cast<int16_t>(pc::ErrorCode::HandshakeFailed), {}, m.correlationId(), 2, kSid);
-    EXPECT_EQ(m.state(), sm::SessionState::Rejected);
-    EXPECT_EQ(m.rejectCode(), static_cast<int16_t>(pc::ErrorCode::HandshakeFailed));
+    // PR #476 review (supersedes N4-I1): the verdict is in clear, before the broker proved the keys - a transient connect
+    // failure, retried as a fresh TLS episode within the connect budget, never terminal.
+    EXPECT_NE(m.state(), sm::SessionState::Rejected);
+    EXPECT_EQ(m.state(), sm::SessionState::Connecting) << "retried";
+    EXPECT_EQ(m.lastConnectError(), static_cast<int16_t>(pc::ErrorCode::HandshakeFailed));
     EXPECT_FALSE(m.cryptoState().encrypted) << "the keys of the failed episode are gone";
+    ASSERT_GT(io.frames.size(), sentBefore) << "a fresh ConnectRequest";
+    auto again = rune::client::codec::decodeConnectRequest(io.frames.back().data(), io.frames.back().size());
+    ASSERT_TRUE(again.has_value());
+    EXPECT_FALSE(again->cipherList.empty()) << "a fresh TLS offer";
 }
 
 // Issues #15 / #111: AuthUnavailable (48) - the broker cannot vouch for its security state right now (booting, wiped,

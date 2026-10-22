@@ -418,18 +418,20 @@ TEST(TlsConnectEdgeRegression, DirectSendsWaitForTheHandshakeRegression) {
 }
 
 // ===========================================================================
-// Fix round 5 (client-failover-review.md "Fix round 4 check", N4-I1): the broker fails
-// the handshake on its FINAL leg — the client's last flight did not verify, or its key
-// export failed — after the client already went Connected (a TLS 1.3 client is done
-// once it has SENT its Finished; on success the broker sends nothing more).  Ruling:
-// terminal Rejected(HandshakeFailed), the keys cleared, every pending op failed once,
-// onError once, connect() not re-answered.  Acting only on a frame naming the session's
-// current id AND its connect corrId.
+// Fix round 5 (N4-I1), superseded by the PR #476 review (issues #14 / #469): the broker
+// fails the handshake on its FINAL leg - after the client already went Connected (a TLS
+// 1.3 client is done once it has SENT its Finished).  That frame is in clear and names
+// only guessable ids, so it is never terminal: before a sealed frame proved the keys it
+// is a transient connect failure (a fresh TLS episode, maxConnectRetries times, then a
+// growing Backoff - never a reconnect storm, never Rejected); once the keys are proven it
+// is a forgery and ignored (ClientAuthErrorsRegression.AForgedFinalLegFailure...).
+// Acting only on a frame naming the session's current id AND its connect corrId.
 // ===========================================================================
 
-// RED (no final-leg verdict): the seed stays falsely Connected, the ping waits out its
-// deadline, onError never fires, and the client keeps "working" on a session the broker
-// never promoted.
+// A broker that fails EVERY final leg: the seed is never Rejected, reports the failure,
+// retries a bounded number of times and is never reported live.  RED: a terminal Rejected
+// (the old ruling), or an unbounded reconnect storm (the failover treating the optimistic
+// Connected as success).
 TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedFailsTheSeedExplicitlyRegression) {
     Rig r(/*invokerMode=*/true, /*twoLeg=*/false);
     r.gw->failFinalLeg = true;
@@ -439,45 +441,46 @@ TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedFailsTheSeedExplicitlyRegr
     auto conn = cq.issue([&](Completions& q, Token t) { return r.client->connect(q, t); });
     ASSERT_TRUE(r.pumpUntil([&] { return conn.ready(); }));
     EXPECT_NO_THROW(conn.check()) << "connect() completes when the client's TLS is done (optimistically)";
-    auto ping = cq.issue([&](Completions& q, Token t) { return r.client->ping(Bytes(4, 7), q, t); });
-    EXPECT_TRUE(r.pumpWithin(1s, [&] { return r.client->state() == rcs::SessionState::Rejected; }))
-        << "the seed stayed (falsely) Connected after the broker failed its final handshake leg";
-    EXPECT_TRUE(r.pumpWithin(1s, [&] { return ping.ready(); })) << "the pending ping was never failed";
-    if (ping.ready()) EXPECT_EQ(ping.status(), OpStatus::Closed) << ping.describe();   // enterFailed_'s status
+    ASSERT_TRUE(r.pumpWithin(2s, [&] { return r.client->testHandshakeFinalLegFailures() >= 1; }))
+        << "the final-leg verdict was never applied";
     const int connectsAtFailure = r.gw->connectsSeen;
-    r.pumpFor(2s);
-    EXPECT_EQ(r.gw->connectsSeen, connectsAtFailure) << "a terminal verdict, never a reconnect";
-    ASSERT_EQ(errors.size(), 1u) << "onError must fire exactly once";
-    EXPECT_NE(errors[0].find("HandshakeContinueResponse error code: 29"), std::string::npos) << errors[0];
-    EXPECT_EQ(r.gw->finalLegFailuresSent, 1 + r.gw->failRepeats) << "precondition: the failure was re-offered";
-    EXPECT_EQ(r.client->testHandshakeFinalLegFailures(), 1u) << "re-offered failures are applied once";
+    bool everRejected = false;
+    (void)r.pumpWithin(3s, [&] { everRejected |= r.client->state() == rcs::SessionState::Rejected; return false; });
+    EXPECT_FALSE(everRejected) << "an unauthenticated final-leg verdict ended the client for good";
+    EXPECT_GT(r.gw->connectsSeen, connectsAtFailure) << "retried as a fresh TLS episode";
+    EXPECT_LE(r.gw->connectsSeen - connectsAtFailure, 20) << "a reconnect storm (bounded retries, then a doubling Backoff)";
+    ASSERT_FALSE(errors.empty()) << "onError reports the failure";
+    EXPECT_NE(errors[0].find("29"), std::string::npos) << errors[0];
     EXPECT_FALSE(conn.failed()) << "connect() is never re-answered";
+    // Re-check of PR #476 round 1 (non-weakening): work issued to a seed that never proves its keys still completes -
+    // explicitly, by its deadline - never hangs (the old ruling asserted the pending ping was failed).
+    auto ping = cq.issue([&](Completions& q, Token t) { return r.client->ping(Bytes(4, 7), q, t); });
+    EXPECT_TRUE(r.pumpWithin(30s, [&] { return ping.ready(); })) << "a ping on a never-proven TLS seed hung";
+    if (ping.ready()) EXPECT_FALSE(ping.ok()) << "the broker never served it: " << ping.describe();
 }
 
-// Review B I2: with authentication a TLS 1.3 client has sent its Finished and sits in Authenticating (not
-// Connected) when the broker's final-leg HandshakeFailed arrives.  It must be Rejected(HandshakeFailed), terminal,
-// and the pending connect must complete with that code — not time out as a transient failure.  RED (before):
-// the verdict was dropped (`state_ != Connected`), the connect hung until its timeout.
+// Review B I2: with authentication a TLS 1.3 client has sent its Finished and sits in Authenticating when the broker's
+// final-leg HandshakeFailed arrives.  The pending connect must complete with HandshakeFailed once the retries are spent
+// - not hang to its timeout, and never a terminal Rejected.
 TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedWhileAuthenticatingFailsTheConnectRegression) {
     Rig r(/*invokerMode=*/true, /*twoLeg=*/false, /*login=*/true);
     r.gw->failFinalLeg = true;
     r.gw->requireAuth  = true;
     test_support::TestCq cq(*r.client);
     auto conn = cq.issue([&](Completions& q, Token t) { return r.client->connect(q, t); });
-    ASSERT_TRUE(r.pumpWithin(3s, [&] { return conn.ready(); })) << "the connect hung (the verdict was ignored)";
-    EXPECT_EQ(conn.status(), OpStatus::BrokerError) << conn.describe();
-    EXPECT_EQ(conn.outcome().c.errorCode, 29) << "HandshakeFailed";
-    EXPECT_TRUE(r.pumpWithin(1s, [&] { return r.client->state() == rcs::SessionState::Rejected; }));
-    const int connectsAtFailure = r.gw->connectsSeen;
+    ASSERT_TRUE(r.pumpWithin(6s, [&] { return conn.ready(); })) << "the connect hung (the verdict was ignored)";
+    EXPECT_TRUE(conn.failed()) << conn.describe();
+    EXPECT_EQ(conn.outcome().c.errorCode, 29) << "HandshakeFailed: " << conn.describe();
+    EXPECT_NE(r.client->state(), rcs::SessionState::Rejected) << "never terminal";
+    const int connects = r.gw->connectsSeen;
     r.pumpFor(1s);
-    EXPECT_EQ(r.gw->connectsSeen, connectsAtFailure) << "terminal: never a reconnect";
+    EXPECT_LE(r.gw->connectsSeen - connects, 12) << "a reconnect storm (the doubling Backoff paces the retries)";
 }
 
 // A node session (a partition route to another node) fails its final leg: only THAT
-// session is Rejected — the frame is resolved by (session id, connect corrId); the seed
-// stays Connected and keeps answering.  RED (no (sid, corr) resolution): the frame falls
-// back to the seed (sessionForConnectCorrId matches in-flight connects only) and the node
-// session stays falsely Connected.
+// session is affected - the frame is resolved by (session id, connect corrId); the seed
+// stays Connected and keeps answering; the node session is never Rejected and its
+// retries are bounded.  RED (no (sid, corr) resolution): the frame falls back to the seed.
 TEST(TlsConnectEdgeRegression, NodeSessionFinalLegHandshakeFailedRejectsOnlyThatSessionRegression) {
     Rig r(/*invokerMode=*/true, /*twoLeg=*/false);
     r.gw->failFinalLeg = true;
@@ -495,11 +498,13 @@ TEST(TlsConnectEdgeRegression, NodeSessionFinalLegHandshakeFailedRejectsOnlyThat
     auto fut = cq.send(p, r.client->topic("inventory"), Key(uint64_t{42}), std::span<const uint8_t>(val));
     ASSERT_TRUE(r.pumpUntil([&] { return r.client->testSessionStateAt(1) != rcs::SessionState::Disconnected; }))
         << "precondition: the route opened a node session";
-    EXPECT_TRUE(r.pumpWithin(2s, [&] { return r.client->testSessionStateAt(1) == rcs::SessionState::Rejected; }))
-        << "the node session stayed (falsely) Connected (state " << int(r.client->testSessionStateAt(1)) << ")";
+    ASSERT_TRUE(r.pumpWithin(2s, [&] { return r.client->testHandshakeFinalLegFailures() >= 1; }));
+    bool nodeRejected = false;
+    (void)r.pumpWithin(2s, [&] { nodeRejected |= r.client->testSessionStateAt(1) == rcs::SessionState::Rejected; return false; });
+    EXPECT_FALSE(nodeRejected) << "an unauthenticated final-leg verdict ended the node session for good";
+    EXPECT_LE(r.client->testHandshakeFinalLegFailures(), 12u) << "a reconnect storm on the node session";
     EXPECT_EQ(r.client->state(), rcs::SessionState::Connected) << "the seed was hit by the node's verdict";
     auto ping = cq.issue([&](Completions& q, Token t) { return r.client->ping(Bytes(4, 7), q, t); });
     EXPECT_TRUE(r.pumpWithin(2s, [&] { return ping.ready(); }));
     EXPECT_TRUE(ping.ok()) << (ping.ready() ? ping.describe() : std::string("pending"));
-    EXPECT_EQ(r.client->testHandshakeFinalLegFailures(), 1u);
 }

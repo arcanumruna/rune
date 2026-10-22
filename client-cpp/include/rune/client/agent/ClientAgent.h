@@ -116,6 +116,8 @@ struct SessionEndpointIo : session::SessionIo {
     bool retargetToBootstrap() noexcept override;
     /// T15a fix2 A-B1: the seed's return to the last-known leader (leader sessions: no-op).
     bool retargetToLastKnownLeader() noexcept override;
+    /// Issue #115: the seed's current default-publication channel; a leader session's own endpoint.
+    [[nodiscard]] std::string ingressChannel() const override;
 };
 
 struct Session {
@@ -859,6 +861,7 @@ private:
     // -------------------------------------------------------------------------
     bool sendFrame(const uint8_t* buf, std::size_t len) override;
     bool retarget(const std::string& newIngressChannel) noexcept override;
+    [[nodiscard]] std::string ingressChannel() const override { return transport_.ingressChannel(); }   // issue #115
 
     // -------------------------------------------------------------------------
     // Command message type IDs for the ring
@@ -960,6 +963,10 @@ private:
     /// steady-state allocation once warmed up) — same shape as AeronTransport's
     /// cryptoSealScratch_ on the encrypt side.
     std::vector<uint8_t>        egressDecryptScratch_;
+    /// PR #476 review: frames in clear dropped because this client requires crypto (dispatchEgressFrame).
+    uint64_t                    clearFramesDropped_ = 0;
+    /// An ErrorResponse whose correlation id is a session's in-flight ConnectRequest (the connect leg's answer).
+    [[nodiscard]] bool answersAnInFlightConnect_(const uint8_t* buf) const noexcept;
     uint32_t sessionIndexFor_(const std::string& endpoint) noexcept;
     /// DR client bug 1: the seed moved (any retarget of its default publication) —
     /// every route re-resolves its session on its next offer (a route to the node

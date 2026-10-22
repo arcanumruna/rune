@@ -101,6 +101,7 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/SchemaMessages.h>   // DdlExtension (catalog history Task 9)
+#include <rune/protocol/client/OffsetMessages.h>   // OffsetFetchResult (#126 fetch-all filter scratch)
 
 #include <algorithm>
 #include <array>
@@ -235,7 +236,9 @@ public:
     //                                 (plaintext client, no broker cert/key, or a local TLS init
     //                                 failure degrading to plaintext — see shouldEngageCrypto())
     //                                 is hard-rejected with ConnectResponse{HandshakeFailed} —
-    //                                 NEVER served plaintext.  Default false (back-compat).  Task
+    //                                 NEVER served plaintext.  Default false (back-compat); BrokerNode
+    //                                 passes NodeConfig::requiresClientTls(), true whenever
+    //                                 authentication is enabled (issue #10, M1).  Task
     //                                 19: shard mode no longer refuses crypto outright (it seals
     //                                 its own per-worker Records egress now), so it is no longer
     //                                 part of this list.
@@ -2187,6 +2190,7 @@ private:
     //  ProduceResponse=46 B; restamp scratch = max RecordBatch = 65535 B)
     static constexpr std::size_t kScratchSize = 68 * 1024;
     std::array<uint8_t, kScratchSize>    scratch_{};
+    std::vector<rune::protocol::client::OffsetFetchResult> fetchFilterScratch_;   // #126: fetch-all READ filter (reserved on first use)
 
     // client<->broker TLS/AEAD (Task 8): reusable, grow-once scratch buffers
     // for the data-plane AEAD codec (rune/gateway/CryptoFrame.h) — single-
@@ -2356,9 +2360,6 @@ private:
     void failLogin_(Session& session, int64_t correlationId, uint32_t retryAfterMs);
     /// Sessions still awaiting their login past the deadline: AuthServerFinal{44} + end (D13).
     void reapAuthDeadlines_(int64_t nowNs);
-    /// A Connect whose hint names this broker's own authenticated session on the same endpoint (plaintext): answered
-    /// ResumedAuthenticated, no new session.  true = answered.
-    [[nodiscard]] bool resumeAuthenticated_(const rune::protocol::client::ConnectRequest& req);
     /// The throttle key host of a Connect: the Aeron image's source host, else the reply endpoint's host.
     [[nodiscard]] std::string sourceHostOf_(std::string_view egressChannel) const;
     // ── authentication Task 12 ──
@@ -2388,6 +2389,9 @@ private:
     /// thread answers (a forwarded security DDL).
     void noteDenied_(const Session& session, rune::protocol::client::TemplateId tid, const rune::gateway::Denial& denial);
     /// Group / txn / catalog-DDL request authorization (cold paths): true = denied and answered.
+    /// #126: drop the results of topics the session cannot READ from a fetch-all OffsetFetchResponse in scratch_.
+    [[nodiscard]] std::size_t filterFetchAllByRead_(const Session& session, const uint8_t* reqBuf, std::size_t reqLen,
+                                                    std::size_t encoded);
     [[nodiscard]] bool denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
     [[nodiscard]] bool denyTxnRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
     template <class Msg> [[nodiscard]] std::optional<rune::gateway::Denial> authorizeCatalogDdl_(const Session& session, const Msg& m) const;

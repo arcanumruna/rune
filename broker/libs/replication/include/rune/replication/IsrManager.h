@@ -53,6 +53,9 @@ struct FollowerState {
     /// the leader's log end (at the time of a fetch).  The ISR lag check uses it.
     int64_t lastCaughtUpTimeNs = 0;
     Offset  lastFetchLeaderLeo = -1;   ///< leader LEO at this follower's previous fetch
+    /// Issue #493: it fetched since the last takeover (resetLagClock clears it) - only then is lastFetchOffset this
+    /// leadership's view of it.
+    bool    fetchedThisLeadership = false;
 };
 
 /// Pure ISR management — tracks replica set membership and per-follower lag,
@@ -136,6 +139,7 @@ public:
         s.lastFetchLeaderLeo = leaderLeo;
         s.lastFetchOffset    = fetchOffset;
         s.lastFetchTimeNs    = nowNs;
+        s.fetchedThisLeadership = true;
     }
 
     /// DR-BUG-6 — reset the replica-lag TIME clock for every follower to `nowNs`.
@@ -159,10 +163,12 @@ public:
     /// the survivor's probe/fetch the full lag window to land, so it stays in the
     /// ISR and the reverse-reconcile engages.  Bounded, single-writer, no alloc.
     void resetLagClock(int64_t nowNs) {
+        lagClockResetNs_ = nowNs;   // issue #493: a member with no fetch state is timed from here too
         for (auto& [node, s] : followerState_) {
             s.lastFetchTimeNs    = nowNs;
             s.lastCaughtUpTimeNs = nowNs;
             s.lastFetchLeaderLeo = -1;
+            s.fetchedThisLeadership = false;   // issue #493
         }
     }
 
@@ -195,13 +201,19 @@ public:
         std::erase_if(isr_, [&](NodeId node) {
             if (node == leaderId_) return false;   // leader always stays
             const FollowerState* s = followerState(node);
-            const FollowerState  none{};
+            // Issue #493: a member this leadership has no fetch state for has had no chance to fetch either - its
+            // lag window starts at the takeover (resetLagClock), never at 0.
+            FollowerState none{};
+            none.lastFetchTimeNs = none.lastCaughtUpTimeNs = lagClockResetNs_;
             if (s == nullptr) s = &none;
             // Kafka: out of sync when not caught up to the leader's log end
             // within replicaLagMaxMs (a slow-but-fetching follower included —
             // with HW = min over the ISR it would otherwise pin the HW).
             const bool timeLag   = (nowNs - s->lastCaughtUpTimeNs) > maxLagNs;
-            const bool offsetLag = (leaderLeo - s->lastFetchOffset) > replicaLagMaxOffset;
+            // Issue #493: the offset gate counts only a fetch made at THIS leadership (resetLagClock clears the
+            // flag): before it, lastFetchOffset is 0 or an earlier leadership's, and a new leader's first check (10 ms
+            // after the takeover) evicted every member once the log end passed the threshold.
+            const bool offsetLag = s->fetchedThisLeadership && (leaderLeo - s->lastFetchOffset) > replicaLagMaxOffset;
             return timeLag || offsetLag;
         });
         isrChanged_ = isr_.size() != before;
@@ -323,6 +335,7 @@ private:
     NodeId                              leaderId_;
     std::vector<NodeId>                 replicas_;
     std::vector<NodeId>                 isr_;
+    int64_t                             lagClockResetNs_ = 0;   ///< issue #493: the last takeover (resetLagClock)
     std::unordered_map<NodeId, FollowerState> followerState_;
     int64_t                             replicaLagMaxNs_ = 10'000'000'000LL; ///< A-NEW-4 time gate
     bool                                isrChanged_ = false;

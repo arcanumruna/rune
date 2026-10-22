@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -40,7 +41,14 @@ std::string writeTemp(const std::string& name, const std::string& content) {
     return p.string();
 }
 
+// Issue #13: the CLI reaches a UDP broker over TLS and sends credentials only over it; every call trusts the broker's
+// test CA (the broker accepts plaintext too: its raw-frame rig helpers are plaintext).
 int runCli(std::vector<std::string> args, std::string* out = nullptr, std::string* err = nullptr) {
+    if (!args.empty() && std::find(args.begin(), args.end(), "--insecure-plaintext") == args.end() &&
+        std::find(args.begin(), args.end(), "--tls-ca") == args.end()) {
+        args.push_back("--tls-ca");
+        args.push_back(AuthBroker::tlsCaFile().string());
+    }
     std::stringstream o, e;
     const int rc = rune::cli::run(std::move(args), o, e);
     if (out) *out = o.str();
@@ -136,6 +144,8 @@ std::unique_ptr<rune::client::Client> credentialedClient(AuthBroker& b, const st
     c.dataDir         = b.clientDir().string();
     c.username        = user;
     c.password        = pw;
+    c.offerCrypto     = true;                    // issue #14: credentials only over TLS
+    c.tlsTrustPem     = AuthBroker::tlsCaPem();
     return std::make_unique<rune::client::Client>(c);
 }
 }  // namespace

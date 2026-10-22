@@ -1910,9 +1910,10 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
 
     const auto& req = *reqOpt;
 
-    // Authentication Task 11 (D11): a session that already authenticated on THIS broker, reconnecting from the same
-    // endpoint, keeps its authentication (answered ResumedAuthenticated; no new session).
-    if (resumeAuthenticated_(req)) return;
+    // Issue #10 (M1): a Connect never resumes an authenticated session by its id.  The plaintext resume-by-id
+    // (D11) let any UDP sender that names a session id and its reply endpoint take the session over; every client
+    // session of an authenticating broker is TLS now, and an encrypted session is bound to its keys, so a reconnect
+    // is a fresh session that logs in again.
     // Authentication Task 11 (D11 version gate): an authenticating broker refuses a pre-v9 client AT THE HANDSHAKE
     // (ConnectResponse{ProtocolVersion}, non-retriable for every client version) - it could never log in, and it
     // must not be able to reach a gated session at all.  No session is created.
@@ -7481,6 +7482,10 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
         return;
     }
 
+    // #126: a fetch-all (no entries) lists only the topics the caller may READ - a listed entry already needs READ
+    // (denyGroupRequest_).  Sentinels (topicId < 0) stay.
+    if (templateId == pc::TemplateId::OffsetFetch) [[unlikely]] encoded = filterFetchAllByRead_(*session, buf, len, encoded);
+
     // Fix round 4 (item 8, pre-v5 clients): a v4 member stays Stable on a
     // Heartbeat / SyncGroup error outside the rebalance set — Internal (an
     // unknown coordinator result) is answered UnknownMember instead, and the
@@ -8229,6 +8234,35 @@ namespace {
 std::string_view sv(std::span<const uint8_t> b) noexcept { return {reinterpret_cast<const char*>(b.data()), b.size()}; }
 }
 
+/// #126 - see handleGroupMessage.  Rewrites the OffsetFetchResponse in scratch_ without the results of topics the
+/// session cannot READ; returns the new encoded size (unchanged when nothing applies).
+std::size_t ClientGateway::filterFetchAllByRead_(const Session& session, const uint8_t* reqBuf, std::size_t reqLen,
+                                                 std::size_t encoded)
+{
+    const PermissionTable& perms = permsOf_(session);
+    if (perms.isAllowAll()) return encoded;
+    const auto req = pc::OffsetFetch::decode(reqBuf, reqLen);
+    if (!req || !req->entries.empty()) return encoded;   // only a fetch-all; a listed entry was authorized up front
+    const auto resp = pc::OffsetFetchResponse::decode(scratch_.data(), encoded);
+    if (!resp) return encoded;
+    if (fetchFilterScratch_.capacity() == 0) fetchFilterScratch_.reserve(kScratchSize / 18 + 1);   // once
+    fetchFilterScratch_.clear();
+    bool dropped = false;
+    for (const auto res : resp->results) {
+        if (res.topicId >= 0 &&
+            rune::gateway::authorizeTopicId(perms, res.topicId, rune::security::Operation::Read, objectIndex_)) {
+            dropped = true;
+            continue;
+        }
+        fetchFilterScratch_.push_back(pc::OffsetFetchResult{res.topicId, res.partition, res.offset, res.errorCode});
+    }
+    if (!dropped) return encoded;
+    pc::OffsetFetchResponse out;
+    out.sessionId     = resp->sessionId;
+    out.correlationId = resp->correlationId;
+    return out.encode(scratch_.data(), std::span<const pc::OffsetFetchResult>(fetchFilterScratch_));
+}
+
 bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len)
 {
     namespace rsec = rune::security;
@@ -8515,7 +8549,7 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     ++loginsOk_;
     loginThrottle_.onSuccess(user, session->sourceHost);
     spdlog::info("auth: login ok user={} source={} session={}", ok.user, session->sourceHost, session->sessionId);
-    if (!session->crypto.encrypted)   // D12: TLS stays optional - said once per session (a session logs in once)
+    if (!session->crypto.encrypted)   // only under ClientTransport::PlaintextForTest (M1, issue #10) - said once per session
         spdlog::warn("auth: session {} authenticated over plaintext (no TLS): frames are not integrity-protected",
                      session->sessionId);
     if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user, std::move(loginNonce)};
@@ -8846,33 +8880,6 @@ void ClientGateway::onSecurityHalted(int64_t offset)
     });
     for (const int64_t sid : liveScratch_) revokeSession_(sid, "security log halted on this broker");
     (void)offset;
-}
-
-bool ClientGateway::resumeAuthenticated_(const pc::ConnectRequest& req)
-{
-    using namespace rune::gateway;
-    if (authMode_ != GatewayAuthMode::Required || req.sessionId == 0 || !pc::clientUnderstandsAuth(req.clientVersion)) return false;
-    if (!req.cipherList.empty() || !req.handshakeBytes.empty()) return false;   // a crypto offer starts a fresh session
-    Session* s = sessions_.find(req.sessionId);
-    if (s == nullptr || s->crypto.encrypted) return false;
-    if (!std::holds_alternative<AuthAuthenticated>(s->auth) && !std::holds_alternative<AuthPasswordChangeRequired>(s->auth))
-        return false;
-    // The same client: the same reply endpoint AND the same source host.
-    if (s->egressChannel != req.egressChannel || s->egressStreamId != req.egressStreamId ||
-        s->sourceHost != sourceHostOf_(req.egressChannel))
-        return false;
-    pc::ConnectResponse resp;
-    resp.sessionId         = s->sessionId;
-    resp.correlationId     = req.correlationId;
-    resp.code              = static_cast<int16_t>(pc::ErrorCode::OK);
-    resp.leaderMemberId    = thisNodeId_;
-    resp.assignedSessionId = s->sessionId;
-    resp.v9                = true;
-    resp.authMode          = pc::AuthMode::Required;
-    resp.authState         = pc::AuthState::ResumedAuthenticated;
-    sessions_.touch(s->sessionId, nowNs_);
-    sendAnswer_(*s, scratch_.data(), resp.encode(scratch_.data()));
-    return true;
 }
 
 // ---------------------------------------------------------------------------

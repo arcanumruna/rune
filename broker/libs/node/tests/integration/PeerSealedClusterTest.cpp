@@ -26,6 +26,7 @@ fs::path keyFileWith(const fs::path& dir, const std::string& name, char c) {
 
 void enable(NodeConfig& cfg, const fs::path& keyFile) {
     cfg.authMode = AuthMode::Enabled;
+    cfg.clientTransport = ClientTransport::PlaintextForTest;   // issue #10: plaintext client sessions, test only
     cfg.clusterKeyFile = keyFile.string();
 }
 

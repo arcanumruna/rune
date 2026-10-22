@@ -119,7 +119,9 @@ Notes:
   `SetPassword`=2, `Disable`=3, `Enable`=4. A `verifier` is `(salt, iterations, StoredKey, ServerKey)`; the plaintext
   password never reaches a broker, and the statement text is sent with the password replaced by `'<redacted>'`.
 - **`ViewRowResponse.status`**: 0 OK, 1 AbsentKey, 2 NotReady, 3 SchemaMismatch, 4 UnknownView, 5 InvalidRequest,
-  6 Busy, 7 RowTooLarge, 45 NotAuthorized.
+  6 Busy, 7 RowTooLarge, 45 NotAuthorized. A `GetViewRow` on a broker that does not lead the view's source partition, or
+  leads it without the controller's read lease, is answered `ErrorResponse` `Redirect` (3, the leader's endpoint) or
+  `NotLeader` (2); both are retriable.
 - **Internal logs** are read by subscribing to a negative topic id: `__catalog` is `-6` (`kCatalogTopicId`), `__security`
   is `-7` (`kSecurityTopicId`, security admins and brokers only). A stream ends with an 8-byte caught-up marker batch.
 - `Produce.acks`: `0` leader or none (immediate ack), `1` all (deferred until the in-sync replicas hold it).
@@ -158,7 +160,8 @@ Client version 9, frames 12 to 15, defined in
 handshake when one was negotiated) a session whose `authMode` is `Required` runs:
 
 1. `ConnectResponse` carries `authMode` (`Required`=0, `DevDisabled`=1, `InProcess`=2) and `authState`
-   (`MustAuthenticate`=0, `ResumedAuthenticated`=1, `Anonymous`=2).
+   (`MustAuthenticate`=0, `ResumedAuthenticated`=1, `Anonymous`=2).  A broker never answers `ResumedAuthenticated`
+   any more (a Connect does not resume a session by its id); the value stays reserved.
 2. **`AuthClientFirst`**: `mechanism` (1 = SCRAM-SHA-512), `username` (1 to 128 bytes), `clientNonce` (1 to 128 bytes).
 3. **`AuthServerFirst`**: `combinedNonce`, then `count` (1 or 2) pairs of `(salt 16 to 64 bytes, iterations 4096 to
    1 000 000)`. The broker always sends two salts: a user with one password gets a deterministic fake second salt, and an
@@ -189,7 +192,7 @@ canonical format in [`FilterWire.h`](../../codec/include/rune/codec/FilterWire.h
 - **Broker too old.** A broker below version 6 would ignore the trailer and deliver everything, so a client sends a
   filter only to a session whose `ConnectResponse.brokerVersion` is at least 6.
 
-On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (24) and `TailKind::FILTER` (11).
+On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25) and `TailKind::FILTER` (11).
 
 ## Encrypted frames (TLS 1.3 / AEAD)
 
@@ -236,7 +239,7 @@ senderId u8` (0 = gateway, `i+1` = worker `i`) and a `seq u64`
 | 26 | `StorageError` | A log failed an fsync (fail-stop). |  |
 | 27 | `ConcurrentTransactions` | The previous transaction's markers have not all landed. | retried |
 | 28 | `UnknownProducerId` | Producer state evicted; `logStartOffset` tells retention from loss. | re-sequenced |
-| 29 | `HandshakeFailed` | TLS handshake or crypto negotiation failed (including `RUNE_REQUIRE_TLS`). |  |
+| 29 | `HandshakeFailed` | TLS handshake or crypto negotiation failed, or a plaintext Connect to a broker that requires TLS (every authenticating broker). |  |
 | 30 | `SchemaIncompatible` | `alter topic` incompatible with the compatibility mode. |  |
 | 31 | `SchemaConflict` | `expectedVersion` is stale. | re-read the schema, then retry |
 | 32 | `ViewExists` |  |  |

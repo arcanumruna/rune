@@ -136,6 +136,8 @@ struct LiveOptions {
     bool        verbose = false;
     std::string user, passwordFile;  // credentials ("" = RUNE_USER / RUNE_PASSWORD_FILE)
     std::string password;            // an interactively prompted password (never from argv / env); wiped by the caller
+    std::string tlsCa, tlsHost;      // issue #13: --tls-ca / --tls-host ("" = RUNE_TLS_CA_FILE / RUNE_TLS_HOST)
+    bool        insecurePlaintext = false;   // --insecure-plaintext: no TLS, and never credentials
 };
 
 /// The LiveOptions the `--broker` / `--cli-*` / `--user` / `--password-file` flags of `a` describe.

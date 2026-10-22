@@ -50,8 +50,10 @@ AuthStatus a = client.authStatus();                       // Authenticated, Pass
 
 - One session goes to the seed broker; leader redirects and reconnects are handled for you. Callbacks (`onConnected`,
   `onError`, `onDisconnected`) are set before `connect`.
-- TLS 1.3: set `cfg.offerCrypto = true`, `cfg.requireCrypto = true` and `cfg.tlsExpectHost = "node1.example"`. It needs a
-  broker built with `-DRUNE_TLS=ON`.
+- TLS 1.3: set `cfg.offerCrypto = true` (and `cfg.tlsTrustPem` for a private CA). An authenticating broker serves only TLS
+  sessions, and a client with credentials sends them only over TLS: without `offerCrypto` it throws at construction, and
+  `requireCrypto` is forced on. Each session checks the certificate against its own endpoint's host unless
+  `cfg.tlsExpectHost` names one.
 - From a game loop, set `cfg.runnerMode = RunnerMode::Invoker` and call `client.doWork()` once per tick:
 
 ```cpp
@@ -483,8 +485,11 @@ if (row.status == ViewRowResult::kOk) {
   - All four keep the source field's type as the output type. Create a view that uses one only after every broker runs a build that has them.
 - Rows are fixed-width and decoded positionally against a layout built from the plan's output types. Remember
   `viewTopicId` and `outputFingerprint` from `createView`: a drifted fingerprint is answered `SchemaMismatch`.
-- `ViewRowResult::status`: `kOk`, `kAbsentKey`, `kNotReady` (nothing folded yet), `kSchemaMismatch`, `kUnknownView`,
-  `kInvalidRequest`, `kBusy` (retry), `kRowTooLarge`, `kNotAuthorized`, and the client-side `kNotLeader`.
+- `ViewRowResult::status`: `kOk`, `kAbsentKey`, `kNotReady` (nothing folded yet: retry), `kSchemaMismatch`, `kUnknownView`, `kInvalidRequest`, `kBusy` (retry), `kRowTooLarge`,
+  `kNotAuthorized`, and the client-side `kNotLeader`.
+- A row is served only by the source partition's leader, under the controller's read lease, and reflects every write
+  acknowledged before the read was sent. A leader that lost its lease (cut off from the controller) answers `NotLeader`;
+  the client retries it within `ddlRetryBudget`.
 - Rules: an aggregate view needs a **one-partition** source (`ViewNotCoPartitioned` otherwise); a view over a transient
   topic must itself be transient (`ViewSourceTransient`); a view cannot read another view (`ViewSourceIsView`). `READ` on
   the view is needed to read a row and `READ` on each source to create it.

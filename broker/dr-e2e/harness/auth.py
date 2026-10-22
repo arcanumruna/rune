@@ -4,13 +4,17 @@ Every broker now runs with authentication ON (spec §9, D31): a cluster refuses 
 and every client needs credentials.  This module owns the per-process secrets of the harness:
 
     state()          a private temp dir: secrets/cluster.key (RUNE_SECRETS_DIR, the compose mount) and work/ (passwords)
-    ensure_key()     the cluster key (`rune security gen-cluster-key`, once per process) and RUNE_SECRETS_DIR in the
-                     environment, so every `docker compose` call mounts it
+    ensure_key()     the cluster key (`rune security gen-cluster-key`, once per process), the broker TLS certificate
+                     (tls.pem / tls.key) and its ca.pem (docker/lib/gen-tls.sh - issue #10: an authenticating broker
+                     serves only TLS sessions), and RUNE_SECRETS_DIR in the environment, so every `docker compose` call
+                     mounts them
     bootstrap(net)   on a fresh cluster with a leader: bootstrap the first admin, change its one-time password, create
                      the `e2e` role + user (READ/WRITE/CREATE/ALTER/DROP on every topic, READ/CREATE/ALTER/DROP on
                      every view, READ on every group, WRITE on every transactional id, DESCRIBE ON CLUSTER)
-    docker_args()    `-e RUNE_USER ... -e RUNE_PASSWORD_FILE ... -v <work>:/work:ro` for a client container
-    cli_env()        the same as a dict (RUNE_USER / RUNE_PASSWORD_FILE) for a container that already mounts /work
+    docker_args()    `-e RUNE_USER ... -e RUNE_PASSWORD_FILE ... -e RUNE_TLS_CA_FILE ... -v <work>:/work:ro` for a client
+                     container (credentials travel only over TLS, issue #14)
+    cli_env()        the same as a dict (RUNE_USER / RUNE_PASSWORD_FILE / RUNE_TLS_CA_FILE) for a container that already
+                     mounts /work
 
 One key and one set of passwords serve every cluster of the process: each cluster is fresh (`down -v` between tests)
 and is bootstrapped with the same files.  Nothing is written outside the temp dir; it is removed at exit.
@@ -82,7 +86,8 @@ def _cli_base(network: str | None) -> list[str]:
     from .cluster import ql_image
     st = state()
     args = ["docker", "run", "--rm", "--shm-size=256m", "--security-opt", "seccomp=unconfined",
-            "--platform", "linux/amd64", "-v", f"{st.work_dir}:/work", "-v", f"{st.secrets_dir}:/run/secrets:ro"]
+            "--platform", "linux/amd64", "-v", f"{st.work_dir}:/work", "-v", f"{st.secrets_dir}:/run/secrets:ro",
+            "-e", "RUNE_TLS_CA_FILE=/run/secrets/ca.pem"]
     if network:
         args += ["--network", network]
     return args + [ql_image()]
@@ -99,6 +104,12 @@ def ensure_key() -> str:
                    "rune", "security", "gen-cluster-key", "--out", "/out/cluster.key"], timeout=120)
         if not res.ok or not os.path.exists(key):
             raise RuntimeError(f"rune security gen-cluster-key failed:\n{res.stdout}{res.stderr}")
+    if not os.path.exists(os.path.join(st.secrets_dir, "tls.pem")):
+        gen = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "docker", "lib", "gen-tls.sh")
+        res = run(["bash", gen, st.secrets_dir], timeout=60)
+        if not res.ok:
+            raise RuntimeError(f"gen-tls.sh failed:\n{res.stdout}{res.stderr}")
+        shutil.copyfile(os.path.join(st.secrets_dir, "ca.pem"), os.path.join(st.work_dir, "ca.pem"))
     os.environ["RUNE_SECRETS_DIR"] = st.secrets_dir
     return key
 
@@ -114,11 +125,12 @@ def _as(user: str, pwfile: str, network: str, *args: str):
 def docker_args() -> list[str]:
     """`docker run` arguments that log a client container in as the e2e user (empty-safe: the state always exists)."""
     st = state()
-    return ["-e", f"RUNE_USER={E2E_USER}", "-e", "RUNE_PASSWORD_FILE=/work/e2e.pw", "-v", f"{st.work_dir}:/work:ro"]
+    return ["-e", f"RUNE_USER={E2E_USER}", "-e", "RUNE_PASSWORD_FILE=/work/e2e.pw", "-e", "RUNE_TLS_CA_FILE=/work/ca.pem",
+            "-v", f"{st.work_dir}:/work:ro"]
 
 
 def cli_env() -> dict[str, str]:
-    return {"RUNE_USER": E2E_USER, "RUNE_PASSWORD_FILE": "/work/e2e.pw"}
+    return {"RUNE_USER": E2E_USER, "RUNE_PASSWORD_FILE": "/work/e2e.pw", "RUNE_TLS_CA_FILE": "/work/ca.pem"}
 
 
 def bootstrap(network: str, seed: str, *, deadline_s: float | None = None) -> None:

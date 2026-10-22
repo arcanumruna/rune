@@ -63,19 +63,23 @@ workflow by hand builds the image without publishing it.
 
 ## Authentication (on by default)
 
-A broker refuses to start without a cluster key file, and every client logs in. The compose files mount
-`./secrets/cluster.key` (or `$RUNE_SECRETS_DIR/cluster.key`) read-only at `/run/secrets/cluster.key` and set
-`RUNE_CLUSTER_KEY_FILE`; `entrypoint.sh` refuses a missing file with the broker's own message and never generates a key.
-Make one, then bootstrap the first admin once the cluster has a leader:
+A broker refuses to start without a cluster key file and a TLS certificate (every client session of an authenticating
+broker is TLS), and every client logs in over TLS. The compose files mount `./secrets/cluster.key`, `tls.pem` and
+`tls.key` (or the same names in `$RUNE_SECRETS_DIR`) read-only under `/run/secrets/` and set `RUNE_CLUSTER_KEY_FILE`,
+`RUNE_TLS_CERT_FILE` and `RUNE_TLS_KEY_FILE`; `entrypoint.sh` refuses a missing file with the broker's own message and
+never generates one. Make them, then bootstrap the first admin once the cluster has a leader:
 
 ```sh
 rune security gen-cluster-key --out docker/secrets/cluster.key      # mode 0600, never overwritten
-rune security bootstrap --admin admin --cluster-key-file docker/secrets/cluster.key --broker rune-1:40200
+bash docker/lib/gen-tls.sh docker/secrets                           # ca.pem + tls.pem/tls.key naming rune-1..3
+rune security bootstrap --admin admin --cluster-key-file docker/secrets/cluster.key --broker rune-1:40200 \
+    --tls-ca docker/secrets/ca.pem
 ```
 
 The e2e launchers (`e2e.sh`, `schema-e2e.sh`, `schema-evolution-e2e.sh`, `view-engine-e2e.sh`, `transient-failover-e2e.sh`,
 `catalog-e2e.sh`) do both through `docker/lib/auth.sh` (`rune_gen_cluster_key`, `rune_bootstrap`, `rune_create_e2e_user`,
-`rune_auth_prepare`), create an `e2e` role/user, and pass `RUNE_USER` / `RUNE_PASSWORD_FILE` to every probe container.
+`rune_auth_prepare`; `rune_gen_cluster_key` also writes the TLS files), create an `e2e` role/user, and pass `RUNE_USER` /
+`RUNE_PASSWORD_FILE` / `RUNE_TLS_CA_FILE` to every probe container.
 `docker/auth-e2e.sh` is the authentication e2e itself (3 nodes, `docker-compose.auth.yml`): bootstrap, a role + user + grants,
 a world-server-style client producing and consuming 10 000 records, revoke -> explicit failure, and the cluster-key rotation
 across a rolling restart. Reference: [../docs/SECURITY.md](../docs/SECURITY.md).
@@ -89,6 +93,7 @@ default, is [../../docs/configuration.md](../../docs/configuration.md). The vari
 |---------------------------------|----------|-------------|--------------------------------------------------|
 | `RUNE_NODE_ID`                  | yes      | —           | Integer node ID (0-based)                        |
 | `RUNE_CLUSTER_KEY_FILE`         | yes (auth on, the default) | — | Shared cluster key file; the broker refuses to start without it. `RUNE_AUTH=disabled` is single-node development only |
+| `RUNE_TLS_CERT_FILE` / `RUNE_TLS_KEY_FILE` | yes (auth on) | — | The broker's TLS certificate and key (PEM); every client session of an authenticating broker is TLS |
 | `RUNE_PEERS`                    | yes      | —           | Comma-separated `id@host:port` list (all nodes)  |
 | `RUNE_CLIENT_ENDPOINT`          | yes      | —           | Client listen address: `host:port`, e.g. `0.0.0.0:40200` (a full `aeron:udp?endpoint=...` channel is also accepted) |
 | `RUNE_CLIENT_STREAM_ID`         | no       | `1`         | Aeron stream ID for client traffic               |
@@ -132,8 +137,9 @@ Then start it:
 docker run --rm \
   --platform linux/amd64 \
   --shm-size=256m \
-  -v "$PWD/secrets/cluster.key:/run/secrets/cluster.key:ro" \
+  -v "$PWD/secrets:/run/secrets:ro" \
   -e RUNE_CLUSTER_KEY_FILE=/run/secrets/cluster.key \
+  -e RUNE_TLS_CERT_FILE=/run/secrets/tls.pem -e RUNE_TLS_KEY_FILE=/run/secrets/tls.key \
   -e RUNE_NODE_ID=0 \
   -e RUNE_PEERS='0@127.0.0.1:40111' \
   -e RUNE_CLIENT_ENDPOINT='0.0.0.0:40200' \

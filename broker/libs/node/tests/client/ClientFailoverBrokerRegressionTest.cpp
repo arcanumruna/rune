@@ -919,7 +919,7 @@ void tlsFailover(const char* tag, bool shard, bool require) {
     ThreeNodes c = ThreeNodes::startWith(tag, [&](rune::node::NodeConfig& n) {
         n.tlsCertFile = dir + "/server.pem";
         n.tlsKeyFile  = dir + "/server.key";
-        n.requireTls  = require;
+        n.clientTransport = require ? rune::node::ClientTransport::RequireTls : rune::node::ClientTransport::TlsOptional;
     });
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     auto acfg = clientConfigFor(c, c.runningNodes().front());
@@ -1047,7 +1047,7 @@ ThreeNodes tlsNodes(const char* tag, bool require) {
     return ThreeNodes::startWith(tag, [&](rune::node::NodeConfig& n) {
         n.tlsCertFile = dir + "/server.pem";
         n.tlsKeyFile  = dir + "/server.key";
-        n.requireTls  = require;
+        n.clientTransport = require ? rune::node::ClientTransport::RequireTls : rune::node::ClientTransport::TlsOptional;
     });
 }
 

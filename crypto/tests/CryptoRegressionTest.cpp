@@ -248,3 +248,34 @@ TEST(TlsRegression, ExportKeysFailsClosedBeforeDone) {
         << "exportKeys() before done() must return the Cipher::None fail-closed sentinel, "
            "never a derivable (and therefore usable) key";
 }
+
+// ===========================================================================
+// Issue #115: no client TLS session accepts a certificate for another name.
+// ===========================================================================
+
+// The system store with no expected host would accept any publicly trusted certificate for ANY name (a TLS-terminating
+// relay with a certificate for its own domain): refused at construction.  RED: delete the !haveHost && system-trust
+// refusal in makeClient.
+TEST(TlsRegression, SystemTrustWithoutAHostIsRefusedRegression) {
+    EXPECT_FALSE(TlsSession::makeClient(nullptr, "").valid()) << "system trust, no name check";
+    EXPECT_FALSE(TlsSession::makeClient(nullptr, nullptr).valid());
+    EXPECT_TRUE(TlsSession::makeClient(nullptr, "broker.example").valid()) << "system trust WITH a name is fine";
+    const std::string caPem = slurp("testdata/ca.pem");
+    EXPECT_TRUE(TlsSession::makeClient(caPem.c_str(), "").valid()) << "a pinned bundle may skip the name check";
+}
+
+// An IP endpoint is checked against the certificate's iPAddress SANs: the test certificate names 127.0.0.1, so that
+// address passes and any other fails.  Pins the contract the client's endpoint-derived host (an IP endpoint) relies
+// on; no SNI is sent for an IP (RFC 6066).
+TEST(TlsRegression, AnIpHostIsCheckedAgainstTheIpSansRegression) {
+    const std::string caPem = slurp("testdata/ca.pem");
+    for (const auto& [host, ok] : std::vector<std::pair<const char*, bool>>{
+             {"127.0.0.1", true}, {"127.0.0.2", false}, {"::1", false}, {"localhost", true}, {"other.example", false}}) {
+        auto srv = TlsSession::makeServer(slurp("testdata/server.pem").c_str(), slurp("testdata/server.key").c_str());
+        ASSERT_TRUE(srv.valid());
+        auto cli = TlsSession::makeClient(caPem.c_str(), host);
+        ASSERT_TRUE(cli.valid()) << host;
+        cli.readInbound(nullptr, 0);
+        EXPECT_EQ(pump(cli, srv), ok) << host;
+    }
+}

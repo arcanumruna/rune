@@ -102,7 +102,8 @@ constexpr std::string_view kContinuationPrompt = "   ...> ";
 void printConsoleUsage(std::ostream& err) {
     err << "Usage: rune console [--broker <ep>] [--cli-egress <ch>] [-f <script.rql|->] [--dry-run]\n"
            "                    [--validate] [--expected-version N] [--request-id <32 hex>] [--verbose]\n"
-           "                    [--user <u>] [--password-file <p>]\n";
+           "                    [--user <u>] [--password-file <p>] [--tls-ca <pem>] [--tls-host <name>]\n"
+           "                    [--insecure-plaintext]\n";
 }
 
 int usage(std::ostream& err, const std::string& msg) {
@@ -119,6 +120,9 @@ void setLive([[maybe_unused]] ConsoleOptions& o, [[maybe_unused]] std::string_vi
     else if (flag == "--cli-egress") o.live.egress = v;
     else if (flag == "--user") o.live.user = v;
     else if (flag == "--password-file") o.live.passwordFile = v;
+    else if (flag == "--tls-ca") o.live.tlsCa = v;              // issue #13
+    else if (flag == "--tls-host") o.live.tlsHost = v;
+    else if (flag == "--insecure-plaintext") o.live.insecurePlaintext = true;
     else if (flag == "--cli-stream-in") o.live.streamIn = v;
     else if (flag == "--cli-stream-out") o.live.streamOut = v;
     else if (flag == "--cli-data-dir") o.live.dataDir = v;
@@ -129,9 +133,9 @@ void setLive([[maybe_unused]] ConsoleOptions& o, [[maybe_unused]] std::string_vi
 /// Returns 0 when ok, else the usage exit code (2).
 int parseConsoleOptions(const std::vector<std::string>& args, ConsoleOptions& o, std::ostream& err) {
     static constexpr std::string_view kValue[] = {"-f", "--broker", "--cli-egress", "--expected-version", "--request-id",
-                                                  "--user", "--password-file",
+                                                  "--user", "--password-file", "--tls-ca", "--tls-host",
                                                   "--cli-stream-in", "--cli-stream-out", "--cli-data-dir"};   // last 3 hidden
-    static constexpr std::string_view kBool[]  = {"--dry-run", "--validate", "--verbose"};
+    static constexpr std::string_view kBool[]  = {"--dry-run", "--validate", "--verbose", "--insecure-plaintext"};
     auto in = [](std::string_view a, auto& set) {
         for (const auto s : set) if (s == a) return true;
         return false;
@@ -142,7 +146,7 @@ int parseConsoleOptions(const std::vector<std::string>& args, ConsoleOptions& o,
         if (in(a, kBool)) {
             if (a == "--dry-run") o.dryRun = true;
             else if (a == "--validate") o.prep.validate = true;
-            else setLive(o, "--verbose", "");
+            else setLive(o, a, "");   // --verbose / --insecure-plaintext
             continue;
         }
         if (!in(a, kValue)) {
@@ -154,7 +158,7 @@ int parseConsoleOptions(const std::vector<std::string>& args, ConsoleOptions& o,
         else if (a == "--expected-version") expected = v;
         else if (a == "--request-id") requestId = v;
         else if (a == "--broker" || a == "--cli-egress" || a == "--user" || a == "--password-file" || a == "--cli-stream-in" ||
-                 a == "--cli-stream-out" || a == "--cli-data-dir") setLive(o, a, v);
+                 a == "--cli-stream-out" || a == "--cli-data-dir" || a == "--tls-ca" || a == "--tls-host") setLive(o, a, v);
     }
     if (!expected.empty()) {
         int value = -1;

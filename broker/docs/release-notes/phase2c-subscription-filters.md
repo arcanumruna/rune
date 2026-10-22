@@ -37,7 +37,7 @@ reference is in [docs/api/client-cpp.md](../../../docs/api/client-cpp.md#subscri
 - Client version 11 and broker version 6 (`kClientVersionFilter`, `kBrokerVersionFilter`). The filter is a trailing field
   of `Subscribe` and `JoinGroup`, and the refusal detail a trailing field of `SubscribeResponse` and
   `JoinGroupResponse`, all present only at version 11. An unfiltered `Subscribe` is byte-identical to version 10.
-- New append-only values: `OpType::FILTER_SCHEMA = 24`, `TailKind::FILTER = 11`, the admin-to-control `kA2cFilterSchema =
+- New append-only values: `OpType::FILTER_SCHEMA = 25`, `TailKind::FILTER = 11`, the admin-to-control `kA2cFilterSchema =
   25`, `SubscriptionFailReason::BrokerTooOld = 9`, `GroupFailReason::FilterMismatch = 6`; `Record::partition` and
   `SubscriptionStatus::batchBytes` are appended members.
 

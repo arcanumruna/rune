@@ -29,7 +29,8 @@ struct Run { int rc; std::string out, err; };
 
 template <class Broker>
 Run consoleLive(Broker& b, std::vector<std::string> extra, const std::string& input) {
-    std::vector<std::string> args{"console", "--broker", b.endpoint()};
+    // Issue #13: a UDP broker is reached over TLS (credentials only over it); trust the auth rig's test CA.
+    std::vector<std::string> args{"console", "--broker", b.endpoint(), "--tls-ca", AuthBroker::tlsCaFile().string()};
     args.insert(args.end(), extra.begin(), extra.end());
     std::istringstream in(input);
     std::ostringstream out, err;
@@ -248,7 +249,8 @@ TEST(RuneConsoleBrokerRegression, SessionRevokedEndsTheConsoleRegression) {
     b.bootstrapAdmin();
     b.createUser("u", kUserPw, {prefix(SO::Create, ST::Topic, "ok_")});
     const std::string pw = writeFile("revoked.pw", std::string(kUserPw) + "\n");
-    PipeConsole c({"console", "--broker", b.endpoint(), "--user", "u", "--password-file", pw});
+    PipeConsole c({"console", "--broker", b.endpoint(), "--user", "u", "--password-file", pw, "--tls-ca",
+                   AuthBroker::tlsCaFile().string()});   // issue #13: credentials only over TLS
     c.send("topic ok_a partitions 1;\n");
     std::this_thread::sleep_for(500ms);
     b.disableUser("u");

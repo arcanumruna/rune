@@ -180,6 +180,22 @@ struct ClientEndpoint {
 /// DevDisabled (RUNE_AUTH=disabled; single node only); `src/main.cpp` refuses InProcessUnauthenticated.
 enum class AuthMode : uint8_t { InProcessUnauthenticated = 0, Enabled = 1, DevDisabled = 2 };
 
+/// Client transport security (combined fix program M1, issues #10 / #11).  Only per-frame AEAD binds a frame to its
+/// session, so with authentication Enabled every client session is TLS: a plaintext Connect is answered HandshakeFailed
+/// (29) and creates no session.
+///   TlsOptional       a client may offer TLS (served encrypted when this broker has a certificate) or connect in
+///                     plaintext.  Under AuthMode::Enabled it means RequireTls (the parse default; RUNE_REQUIRE_TLS=false
+///                     with authentication refuses to start).
+///   RequireTls        every client session is TLS (RUNE_REQUIRE_TLS=true); a broker without a certificate refuses to
+///                     start.
+///   PlaintextForTest  authentication over plaintext sessions, for in-process tests only.  `parseNodeConfig` never
+///                     yields it and `src/main.cpp` refuses it.
+enum class ClientTransport : uint8_t { TlsOptional = 0, RequireTls = 1, PlaintextForTest = 2 };
+
+/// True when this broker was built with the RUNE_TLS CMake option (the default).  A non-TLS build refuses
+/// authentication and every RUNE_TLS_* / RUNE_REQUIRE_TLS variable (issue #11).
+[[nodiscard]] bool tlsBuild() noexcept;
+
 struct NodeConfig {
     /// "Derive from the host" sentinel for the Aeron transport sizes (mtu, socket
     /// buffer, receive window) — resolved once at BrokerNode::start() by
@@ -475,21 +491,25 @@ struct NodeConfig {
     // wants PEM TEXT, never a path (Task 7's contract); BrokerNode reads
     // these files and passes the text through.  Both empty (the default) =
     // crypto disabled for this node, byte-identical to pre-Task-7/9
-    // behaviour.  Only read from the environment when compiled with the
-    // RUNE_TLS CMake option ON (RUNE_TLS_ENABLED); OFF ⇒ these stay empty
-    // regardless of the environment, so a RUNE_TLS=OFF build can never
-    // negotiate TLS no matter what an operator sets.
+    // behaviour - allowed only without authentication (issue #10: an
+    // authenticating broker needs its certificate).  Read from the environment
+    // by a RUNE_TLS build (the default); a RUNE_TLS=OFF build refuses to start
+    // when any of them is set (issue #11), never silently plaintext.
     //   RUNE_TLS_CERT_FILE — PEM cert file path (RUNE_TLS build only).
     //   RUNE_TLS_KEY_FILE  — PEM private-key file path (RUNE_TLS build only).
     std::string tlsCertFile;
     std::string tlsKeyFile;
 
-    // Task 9 / spec §11 require_tls: when true, the broker's ClientGateway
-    // hard-rejects (ConnectResponse{HandshakeFailed}) any Connect that does
-    // not establish an encrypted session — never silently serves it
-    // plaintext.  Default false (back-compat: plaintext clients are served
-    // plaintext).  RUNE_REQUIRE_TLS env var (RUNE_TLS build only).
-    bool requireTls = false;
+    // Task 9 / spec §11 require_tls, combined fix program M1: the client transport (see ClientTransport).  The
+    // gateway hard-rejects (ConnectResponse{HandshakeFailed}) any Connect that does not establish an encrypted session
+    // whenever requiresClientTls().  RUNE_REQUIRE_TLS=true|false (RUNE_TLS build only; false with authentication
+    // refuses to start).
+    ClientTransport clientTransport = ClientTransport::TlsOptional;
+    /// Every client session must be TLS: RequireTls, or authentication Enabled unless PlaintextForTest (M1).
+    [[nodiscard]] bool requiresClientTls() const noexcept {
+        return clientTransport == ClientTransport::RequireTls ||
+               (authMode == AuthMode::Enabled && clientTransport != ClientTransport::PlaintextForTest);
+    }
 
     // --- Authentication (authentication plan Task 9; spec §8 / §9) ---------------------------------------------
     //   RUNE_AUTH                   — "enabled" (default when unset) | "disabled" (dev mode: single node only; every

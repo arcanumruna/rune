@@ -83,6 +83,10 @@ x-broker-env: &broker-env
   # --out docker/secrets/cluster.key`), mounted read-only at /run/secrets/cluster.key.  RUNE_SECRETS_DIR moves
   # the directory (the e2e launchers generate a per-run one).  Without the file the broker refuses to start.
   RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
+  # Issue #10: every client session of an authenticating broker is TLS - the broker certificate (and key)
+  # sit next to the cluster key (docker/lib/auth.sh rune_gen_cluster_key writes all three).
+  RUNE_TLS_CERT_FILE: /run/secrets/tls.pem
+  RUNE_TLS_KEY_FILE: /run/secrets/tls.key
   # The __catalog replication stream (default 30; the same on every node, outside the per-worker range).
   RUNE_CATALOG_REPL_STREAM_ID: "${RUNE_CATALOG_REPL_STREAM_ID:-30}"
 
@@ -113,6 +117,18 @@ services:
         read_only: true
         bind:
           create_host_path: false   # a missing key file fails the start; never a directory
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/tls.pem
+        target: /run/secrets/tls.pem
+        read_only: true
+        bind:
+          create_host_path: false   # issue #10: a missing TLS file fails the start
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/tls.key
+        target: /run/secrets/tls.key
+        read_only: true
+        bind:
+          create_host_path: false   # issue #10: a missing TLS file fails the start
     healthcheck:
       test: ["CMD", "pgrep", "-x", "rune_broker"]
       interval: 5s
@@ -146,6 +162,18 @@ services:
         read_only: true
         bind:
           create_host_path: false   # a missing key file fails the start; never a directory
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/tls.pem
+        target: /run/secrets/tls.pem
+        read_only: true
+        bind:
+          create_host_path: false   # issue #10: a missing TLS file fails the start
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/tls.key
+        target: /run/secrets/tls.key
+        read_only: true
+        bind:
+          create_host_path: false   # issue #10: a missing TLS file fails the start
     healthcheck:
       test: ["CMD", "pgrep", "-x", "rune_broker"]
       interval: 5s
@@ -179,6 +207,18 @@ services:
         read_only: true
         bind:
           create_host_path: false   # a missing key file fails the start; never a directory
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/tls.pem
+        target: /run/secrets/tls.pem
+        read_only: true
+        bind:
+          create_host_path: false   # issue #10: a missing TLS file fails the start
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/tls.key
+        target: /run/secrets/tls.key
+        read_only: true
+        bind:
+          create_host_path: false   # issue #10: a missing TLS file fails the start
     healthcheck:
       test: ["CMD", "pgrep", "-x", "rune_broker"]
       interval: 5s

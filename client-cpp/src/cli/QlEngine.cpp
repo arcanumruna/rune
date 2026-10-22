@@ -480,6 +480,9 @@ LiveOptions liveOptionsOf(const support::ParsedArgs& a, const std::string& endpo
     o.verbose      = verbose;
     o.user         = a.value("--user");
     o.passwordFile = a.value("--password-file");
+    o.tlsCa        = a.value("--tls-ca");
+    o.tlsHost      = a.value("--tls-host");
+    o.insecurePlaintext = a.has("--insecure-plaintext");
     return o;
 }
 
@@ -533,6 +536,15 @@ bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredenti
     }
     ddlTimeout_ = std::chrono::milliseconds(cfg.ddlTimeoutMs);
     verbose_ = o.verbose;
+    try {
+        applyTls(cfg, o.tlsCa, o.tlsHost, o.insecurePlaintext);   // issue #13: after the credentials / bootstrap mode
+    } catch (const std::exception& e) {
+        lastFailure_ = e.what();
+        if (!quietFailure) err << "rune: " << e.what() << "\n";   // a quiet caller reports lastFailure() itself
+        if (!cfg.password.empty()) rc::detail::secureZero(cfg.password.data(), cfg.password.size());
+        close();
+        return false;
+    }
     try {
         client_ = std::make_unique<rc::Client>(cfg);
         if (!cfg.password.empty()) rc::detail::secureZero(cfg.password.data(), cfg.password.size());

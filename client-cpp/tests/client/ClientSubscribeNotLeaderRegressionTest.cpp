@@ -515,10 +515,12 @@ TEST(SubscribeNotLeaderRegression, RecordEgressUnavailableForeverFailsExplicitly
     const auto t0 = std::chrono::steady_clock::now();
     auto sub = r.subscribe();
     bool failed = false;
-    for (int i = 0; i < 6000 * 3; ++i) {
+    // A progress-driven wait (the test-tree guard: no new sleeps): drive the gateway until the subscription ended AND
+    // onError fired (the client's duty thread reports it right after); the deadline only bounds a failure.
+    for (const auto dl = t0 + 30s; std::chrono::steady_clock::now() < dl;) {
         r.gw->poll(16);
-        if (sub.finished()) { failed = true; break; }
-        std::this_thread::sleep_for(2ms);
+        if (sub.finished() && r.errors.load() >= 1) { failed = true; break; }
+        std::this_thread::yield();
     }
     ASSERT_TRUE(failed) << "gateway saw " << r.gw->subscribesSeen.load() << " Subscribe(s)";
     EXPECT_LT(std::chrono::steady_clock::now() - t0, 20s) << "the budget ends it, not the 60 s clock";

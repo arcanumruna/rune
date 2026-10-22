@@ -10,12 +10,15 @@
 
 #include "AeronTestErrors.h"
 #include <rune/client/codec/Codec.h>
+#include <rune/client/codec/CryptoFrame.h>
+#include <rune/client/session/SessionMachine.h>   // CryptoState (the mirror keys)
 #include <rune/client/codec/DataCodec.h>
 #include <rune/codec/Fingerprint.h>
 #include <rune/codec/Serialize.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/crypto/Kdf.h>
 #include <rune/crypto/Scram.h>
+#include <rune/crypto/TlsSession.h>
 #include <rune/protocol/client/AuthMessages.h>
 #include <rune/protocol/client/SecurityMessages.h>
 #include <rune/protocol/client/Protocol.h>
@@ -35,6 +38,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <optional>
 #include <memory>
 #include <set>
 #include <span>
@@ -245,6 +249,18 @@ struct InvokerGateway {
     int authFirsts = 0, authFinals = 0, authOk = 0, authFailed = 0;
     int unauthenticatedRequests = 0;         // requests that arrived before the login finished (always refused)
     std::vector<int64_t> authSessionIds;     // sessions that completed a login
+    // ---- Issues #13 / #14: TLS as the real gateway serves it -------------------------------------------------
+    // tlsCertPem / tlsKeyPem set: a Connect offering crypto is answered with the server's TLS flight (chosenCipher =
+    // the client's first), HandshakeContinue legs are driven, and once the handshake is done every frame of that
+    // session is opened (client -> gateway) / sealed (gateway -> client) with its AEAD keys - a plaintext frame
+    // naming the session is dropped.  Unset (default): a crypto offer is answered plaintext, as by a broker without
+    // a certificate.
+    std::string tlsCertPem, tlsKeyPem;
+    int tlsSessions = 0;        // sessions whose TLS handshake completed
+    int tlsDroppedFrames = 0;   // inbound frames of an encrypted session that did not open
+    struct TlsPending { std::optional<rune::crypto::TlsSession> srv; rune::crypto::Cipher cipher{}; };
+    std::map<int64_t, TlsPending> tlsPending_;                              // handshakes in progress, by session
+    std::map<int64_t, rune::client::session::CryptoState> tlsKeys_;         // encrypted sessions (mirror keys)
     /// ConnectRequest.authToken of every Connect received (the reserved wire field: must always be empty).
     std::vector<std::string> connectAuthTokens;
     /// D26: revoke `sid`: each live subscription of it is answered SessionRevoked on its Subscribe correlation
@@ -767,7 +783,7 @@ struct InvokerGateway {
     }
 
     void send(int endpoint, const uint8_t* b, std::size_t n) {
-        std::vector<uint8_t> frame(b, b + n);
+        std::vector<uint8_t> frame = sealedForSession_(b, n);
         if (!offerNow(endpoint, frame)) outbox.emplace_back(endpoint, std::move(frame));
     }
 
@@ -867,8 +883,29 @@ struct InvokerGateway {
             send(0, b, n);
             return;
         }
-        std::vector<uint8_t> frame(b, b + n);
+        std::vector<uint8_t> frame = sealedForSession_(b, n);
         if (!offerSession(sessionId, frame)) sessionOutbox.emplace_back(sessionId, std::move(frame));
+    }
+
+    /// Adversarial review (PR #476): a frame put on the client's egress IN CLEAR, never sealed - what any UDP sender
+    /// can do.  false = the publication is not connected yet.
+    bool sendInClear(int endpoint, const std::vector<uint8_t>& frame) { return offerNow(endpoint, frame); }
+
+    /// TLS: a frame to an encrypted session leaves sealed under its keys; anything else (no keys, the handshake's own
+    /// ConnectResponse / HandshakeContinueResponse) as is.
+    std::vector<uint8_t> sealedForSession_(const uint8_t* b, std::size_t n) {
+        namespace rp = rune::protocol::client;
+        if (tlsKeys_.empty() || n < rp::MessageHeader::ENCODED_SIZE) return std::vector<uint8_t>(b, b + n);
+        const uint16_t tid = static_cast<uint16_t>(b[2] | (b[3] << 8));
+        if (tid == static_cast<uint16_t>(rp::TemplateId::ConnectResponse) ||
+            tid == static_cast<uint16_t>(rp::TemplateId::HandshakeContinueResponse))
+            return std::vector<uint8_t>(b, b + n);
+        const auto k = tlsKeys_.find(static_cast<int64_t>(rp::detail::getLE64(b, 8)));
+        if (k == tlsKeys_.end()) return std::vector<uint8_t>(b, b + n);
+        std::vector<uint8_t> out(n + rp::kCryptoOverhead);
+        const std::size_t sn = rune::client::codec::sealFrame(k->second, b, n, out.data(), out.size());
+        out.resize(sn);
+        return out;
     }
 
     /// Push one Records frame of `count` records at baseOffset to a subscription.
@@ -1365,6 +1402,19 @@ private:
         const auto tid = rcc::peekTemplate(buf, len);
         if (!tid) return;
         if (static_cast<rcc::TemplateId>(*tid) == rcc::TemplateId::Connect) ++connectsArrived;   // dead or not
+        // TLS: a frame naming an encrypted session must open under its keys (the header stays clear), else dropped.
+        std::vector<uint8_t> opened;
+        if (!tlsKeys_.empty() && len >= rp::MessageHeader::ENCODED_SIZE &&
+            static_cast<rcc::TemplateId>(*tid) != rcc::TemplateId::Connect &&
+            static_cast<rcc::TemplateId>(*tid) != rcc::TemplateId::HandshakeContinue) {
+            if (const auto k = tlsKeys_.find(static_cast<int64_t>(rp::detail::getLE64(buf, 8))); k != tlsKeys_.end()) {
+                opened.resize(len);
+                const std::size_t on = rcc::openEgressFrame(k->second, buf, len, opened.data(), opened.size());
+                if (on == 0) { ++tlsDroppedFrames; return; }
+                buf = opened.data();
+                len = on;
+            }
+        }
         if (deadEndpoints.count(endpoint) != 0) return;  // a dead node hears nothing
         // Fix round 2 (test vacuity): STRICT sessions, as the real ClientGateway — every frame but
         // Connect / Disconnect must carry a session id this NODE assigned and has not expired; any
@@ -1531,13 +1581,29 @@ private:
                 send(endpoint, ro, rn);
                 return;
             }
-            uint8_t out[64];
+            std::vector<uint8_t> outPlain(64);
             std::vector<uint8_t> outV9;
             const int32_t bv = advertisedBrokerVersionAt.count(endpoint) != 0 ? advertisedBrokerVersionAt[endpoint]
                                                                               : advertisedBrokerVersion;
             const int16_t okCode = connectErrorCode != 0 ? connectErrorCode : static_cast<int16_t>(rcc::ErrorCode::OK);
+            // TLS: the server's first flight rides the ConnectResponse; the session's keys exist once it completes.
+            tlsKeys_.erase(sid);
+            tlsPending_.erase(sid);
+            uint8_t cipher = 0;
+            std::string flight;
+            if (!tlsCertPem.empty() && okCode == 0 && !c->cipherList.empty() && !c->handshakeBytes.empty()) {
+                TlsPending& tp = tlsPending_[sid];
+                tp.srv.emplace(rune::crypto::TlsSession::makeServer(tlsCertPem.c_str(), tlsKeyPem.c_str()));
+                tp.cipher = static_cast<rune::crypto::Cipher>(c->cipherList[0]);
+                (void)tp.srv->readInbound(reinterpret_cast<const uint8_t*>(c->handshakeBytes.data()), c->handshakeBytes.size());
+                uint8_t hs[16384];
+                const std::size_t hn = tp.srv->writeOutbound(hs, sizeof hs);
+                flight.assign(reinterpret_cast<const char*>(hs), hn);
+                cipher = c->cipherList[0];
+                outPlain.resize(64 + flight.size());
+            }
             std::size_t n;
-            const uint8_t* frame = out;
+            const uint8_t* frame = outPlain.data();
             if (authMode != rp::AuthMode::InProcess && clientV9) {
                 // Required: not bootstrapped -> Anonymous (only SecurityBootstrap is accepted, I5); a resumed
                 // authenticated session -> ResumedAuthenticated; else a login is due.
@@ -1547,10 +1613,12 @@ private:
                     else if (!bootstrapped) { st = rp::AuthState::Anonymous; authState_[sid] = AuthAnonymous{}; }
                     else { st = rp::AuthState::MustAuthenticate; authState_[sid] = AuthAwaitingFirst{}; }
                 }
-                n = rcc::encodeConnectResponseV9(outV9, okCode, 0, sid, c->sessionId, c->correlationId, authMode, st, bv);
+                n = rcc::encodeConnectResponseV9(outV9, okCode, 0, sid, c->sessionId, c->correlationId, authMode, st, bv,
+                                                 cipher, flight);
                 frame = outV9.data();
             } else {
-                n = rcc::encodeConnectResponse(out, sizeof out, okCode, 0, sid, c->sessionId, c->correlationId, bv);
+                n = rcc::encodeConnectResponse(outPlain.data(), outPlain.size(), okCode, 0, sid, c->sessionId,
+                                               c->correlationId, bv, cipher, flight);
             }
             if (replyFromArrival && !replyOnAnnouncedEgress) {
                 send(endpoint, frame, n);
@@ -1559,6 +1627,34 @@ private:
             }
             for (const auto& [sub, base] : recordsAfterNextConnect) pushRecords(sub, base, 1);
             recordsAfterNextConnect.clear();
+            return;
+        }
+        case rcc::TemplateId::HandshakeContinue: {
+            const auto hc = rcc::decodeHandshakeContinue(buf, len);
+            if (!hc) return;
+            const auto it = tlsPending_.find(hc->sessionId);
+            if (it == tlsPending_.end() || !it->second.srv) return;
+            TlsPending& tp = it->second;
+            (void)tp.srv->readInbound(reinterpret_cast<const uint8_t*>(hc->handshakeBytes.data()), hc->handshakeBytes.size());
+            uint8_t hs[16384];
+            const std::size_t hn = tp.srv->writeOutbound(hs, sizeof hs);
+            if (hn > 0) {
+                std::vector<uint8_t> resp;
+                const std::size_t rn = rcc::encodeHandshakeContinueResponse(
+                    resp, 0, std::string_view(reinterpret_cast<const char*>(hs), hn), hc->sessionId, hc->correlationId);
+                if (replyFromArrival && !replyOnAnnouncedEgress) send(endpoint, resp.data(), rn);
+                else sendToSession(hc->sessionId, resp.data(), rn);
+            }
+            if (tp.srv->done()) {   // the mirror of the client's keys: send seals b2c, recv opens c2b
+                const auto keys = tp.srv->exportKeys(tp.cipher, hc->sessionId);
+                rune::client::session::CryptoState& k = tlsKeys_[hc->sessionId];
+                k.encrypted = true;
+                k.cipher    = keys.cipher;
+                k.send.emplace(keys.cipher, keys.b2c, keys.b2cPrefix);
+                k.recv.emplace(keys.cipher, keys.c2b, keys.c2bPrefix);
+                tlsPending_.erase(it);
+                ++tlsSessions;
+            }
             return;
         }
         case rcc::TemplateId::AuthClientFirst: onAuthFirst_(endpoint, buf, len); return;

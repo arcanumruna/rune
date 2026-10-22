@@ -435,17 +435,20 @@ docker run --rm -v "$PWD/secrets:/out" <rune-cli-image> rune security gen-cluste
 # or, with the rune CLI installed:  rune security gen-cluster-key --out secrets/cluster.key
 ```
 
-Mount it read-only on each node and point the broker at it (`docker/docker-compose*.yml` do this with
-`./secrets/cluster.key` at `/run/secrets/cluster.key`; `RUNE_SECRETS_DIR` moves the directory):
+Mount it read-only on each node and point the broker at it, with the broker's TLS certificate and key (an
+authenticating broker serves only TLS sessions; `docker/docker-compose*.yml` mount `./secrets/{cluster.key,tls.pem,tls.key}`
+under `/run/secrets/`; `RUNE_SECRETS_DIR` moves the directory, `docker/lib/gen-tls.sh` makes a test CA and certificate):
 
 ```sh
--v "$PWD/secrets/cluster.key:/run/secrets/cluster.key:ro" -e RUNE_CLUSTER_KEY_FILE=/run/secrets/cluster.key
+-v "$PWD/secrets:/run/secrets:ro" -e RUNE_CLUSTER_KEY_FILE=/run/secrets/cluster.key \
+-e RUNE_TLS_CERT_FILE=/run/secrets/tls.pem -e RUNE_TLS_KEY_FILE=/run/secrets/tls.key
 ```
 
 **2. Bootstrap the first admin, once per cluster**, with the same key (it proves you may):
 
 ```sh
-rune security bootstrap --admin admin --cluster-key-file secrets/cluster.key --broker <any-node>:40200
+rune security bootstrap --admin admin --cluster-key-file secrets/cluster.key --broker <any-node>:40200 \
+    --tls-ca secrets/ca.pem               # omit for a certificate from a public CA
 # one-time password for admin: ...        (printed once)
 ```
 
@@ -457,10 +460,24 @@ at first login (`ALTER USER admin SET PASSWORD '...';`); until then every other 
 **3. Give clients credentials.** The client library takes `ClientConfig::username` and `password` (or
 `passwordFile`); the `rune` CLI and the example binaries take `--user` / `--password-file` or the
 environment variables `RUNE_USER` / `RUNE_PASSWORD_FILE`. A password is never accepted on the command line
-or in the environment. A client older than version 9 is refused at the connect.
+or in the environment. A client older than version 9 is refused at the connect. Credentials travel only over TLS: the
+client needs `offerCrypto` (and `tlsTrustPem` for a private CA); the CLI and the examples take `--tls-ca` /
+`RUNE_TLS_CA_FILE`.
 
-**4. Production.** Build with TLS and set `RUNE_REQUIRE_TLS=true` (SCRAM keeps the password off the wire but
-does not protect the data), and alert on the counters in [SECURITY.md](SECURITY.md#metrics).
+**4. TLS.** Every client session of an authenticating broker is TLS. Give each broker a certificate
+(`RUNE_TLS_CERT_FILE` / `RUNE_TLS_KEY_FILE`) that names the host clients use to reach it (or one certificate naming
+every broker); without one the broker refuses to start. Three facts to plan around:
+
+- A plaintext session could be taken over by any UDP sender (session ids are guessable and nothing binds a frame to
+  its session), so the broker refuses plaintext Connects with `HandshakeFailed` (29); `RUNE_REQUIRE_TLS=false` with
+  authentication refuses to start.
+- TLS needs a broker built with `-DRUNE_TLS=ON`. That is the default (and the docker image); a build without it
+  refuses to start with authentication, and refuses `RUNE_TLS_*` / `RUNE_REQUIRE_TLS`, rather than ignore them.
+- The `rune` CLI and the clients connect over TLS: `--tls-ca <pem>` / `RUNE_TLS_CA_FILE` for a private CA,
+  `--tls-host` / `RUNE_TLS_HOST` when the certificate name differs from the address used. The bootstrap and security
+  DDL work only over TLS.
+
+Alert on the counters in [SECURITY.md](SECURITY.md#metrics).
 
 **Dev mode.** `RUNE_AUTH=disabled` switches authentication off for **single-node development only**. The broker
 shouts a warning at start and every 5 minutes, and refuses to start when `RUNE_PEERS` lists more than one broker.
@@ -484,8 +501,9 @@ for throw-away local development add `-e RUNE_AUTH=disabled` instead of the key)
 docker run --rm \
   --platform linux/amd64 \
   --shm-size=256m \
-  -v "$PWD/secrets/cluster.key:/run/secrets/cluster.key:ro" \
+  -v "$PWD/secrets:/run/secrets:ro" \
   -e RUNE_CLUSTER_KEY_FILE=/run/secrets/cluster.key \
+  -e RUNE_TLS_CERT_FILE=/run/secrets/tls.pem -e RUNE_TLS_KEY_FILE=/run/secrets/tls.key \
   -e RUNE_NODE_ID=0 \
   -e RUNE_PEERS='0@127.0.0.1:40111' \
   -e RUNE_CLIENT_ENDPOINT='0.0.0.0:40200' \

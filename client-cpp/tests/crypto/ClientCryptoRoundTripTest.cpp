@@ -280,12 +280,13 @@ TEST(ClientCryptoRoundTrip, OfferCryptoProducesCryptoConnectRequest) {
     EXPECT_FALSE(req->handshakeBytes.empty());
 }
 
-TEST(ClientCryptoRoundTrip, RequireCryptoFailsTerminallyOnNoCipherResponse) {
+TEST(ClientCryptoRoundTrip, RequireCryptoNeverConnectsPlaintextOnNoCipherResponse) {
     // Task 9 (downgrade safety): requireCrypto=true + a ConnectResponse{OK}
     // that negotiates NO cipher (chosenCipher=0 — a plaintext broker, or a
     // MITM that stripped the crypto offer off the wire) must NOT silently
-    // proceed to a plaintext Connected session. It must fail exactly like a
-    // real TLS handshake failure: terminal Rejected(HandshakeFailed).
+    // proceed to a plaintext Connected session.  Issue #14: the answer is
+    // unauthenticated, so it is a transient connect failure (a fresh crypto
+    // offer goes out), never the terminal Rejected a forged packet could cause.
     FakeIo io;
     sm::SessionConfig cfg;
     cfg.egressChannel  = "aeron:udp?endpoint=client:40456";
@@ -302,18 +303,19 @@ TEST(ClientCryptoRoundTrip, RequireCryptoFailsTerminallyOnNoCipherResponse) {
     auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
     ASSERT_TRUE(req.has_value());
     ASSERT_FALSE(req->cipherList.empty()) << "requireCrypto implies offerCrypto's crypto offer";
+    const std::size_t sentBefore = io.sendCount();
 
-    // The broker answers OK but negotiates no cipher (chosenCipher=0,
-    // handshakeBytes empty) — exactly what onConnectResponse's "happy path —
-    // no crypto chosen" branch used to accept unconditionally.
     m.onConnectResponse(/*code=*/0, /*leaderMemberId=*/-1, /*assignedSessionId=*/99,
                          req->correlationId, T0 + 1, /*chosenCipher=*/0, /*handshakeBytes=*/{});
 
-    EXPECT_EQ(m.state(), sm::SessionState::Rejected)
-        << "requireCrypto must fail terminally, never silently proceed plaintext";
-    EXPECT_EQ(m.rejectCode(),
-              static_cast<int16_t>(static_cast<uint16_t>(
-                  rune::protocol::client::ErrorCode::HandshakeFailed)));
+    EXPECT_EQ(m.state(), sm::SessionState::Connecting) << "retried, never plaintext, never Rejected";
+    EXPECT_EQ(m.lastConnectError(), static_cast<int16_t>(static_cast<uint16_t>(
+                                        rune::protocol::client::ErrorCode::HandshakeFailed)));
+    ASSERT_GT(io.sendCount(), sentBefore) << "a fresh ConnectRequest";
+    auto again = cc::decodeConnectRequest(io.last().data(), io.last().size());
+    ASSERT_TRUE(again.has_value());
+    EXPECT_FALSE(again->cipherList.empty()) << "the retry offers crypto again";
+    EXPECT_NE(again->correlationId, req->correlationId);
     EXPECT_FALSE(m.cryptoState().encrypted);
 }
 

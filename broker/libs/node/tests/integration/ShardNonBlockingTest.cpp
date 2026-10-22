@@ -1351,13 +1351,18 @@ struct Reg {
     NullTransport t;
     ReplicaRegistry reg;
     std::vector<std::unique_ptr<Log>> logs;
+    /// Segment size of every log (default 1 MiB, below).  The segment-provisioner cap tests size their caps in 64 MiB
+    /// segments and pass that.
+    int64_t rollBytes = 1LL * 1024 * 1024;
+    Reg() = default;
+    explicit Reg(int64_t roll) : rollBytes(roll) {}
     PartitionReplica* add(int32_t topicId, int32_t part,
                           std::vector<rune::replication::NodeId> replicas = {1}) {
         auto dir = d.path / (std::to_string(topicId) + "_" + std::to_string(part) + "_" + std::to_string(logs.size()));
         fs::create_directories(dir);
         // 1 MiB segments: these replicas hold a few records, and a 64 MiB preallocation per log made the
         // 200-partition churn test reserve ~13 GB on ext4 (fallocate allocates real blocks) - ENOSPC on the VM.
-        logs.push_back(std::make_unique<Log>(dir.string(), 1LL * 1024 * 1024));
+        logs.push_back(std::make_unique<Log>(dir.string(), rollBytes));
         logs.back()->recover();
         auto r = std::make_unique<PartitionReplica>(cfg(1, 1, topicId, part), Role::Leader, 1,
             replicas, std::vector<rune::replication::NodeId>{1},
@@ -3470,7 +3475,7 @@ TEST(SegmentProvisionerRegression, OverTheCapBuildsWithoutFallocateNeverAFailure
     // Re-review N3: over the node-wide reservation cap the provisioner still
     // builds the ready segment (off the owner), only without its fallocate —
     // the owner never rolls inline for the cap.
-    Reg R;
+    Reg R(64LL * 1024 * 1024);   // the cap is sized in 64 MiB segments
     NoopConsensus noop;
     NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
     SegmentProvisionerAgent prov(1, /*capBytes=*/1LL * 1024 * 1024);   // room for ONE 1 MiB segment (Reg's log size)
@@ -3494,7 +3499,7 @@ TEST(SegmentProvisionerRegression, OverTheCapBuildsWithoutFallocateNeverAFailure
 TEST(SegmentProvisionerRegression, DepthBuildNeverOvershootsTheCapRegression) {
     // D19 re-review N6a: the cap was checked once per serve, then up to `depth`
     // segments were fallocated — (depth-1) x rollBytes past the cap.
-    Reg R;
+    Reg R(64LL * 1024 * 1024);   // the cap is sized in 64 MiB segments
     NoopConsensus noop;
     NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
     SegmentProvisionerAgent prov(3, /*capBytes=*/1LL * 1024 * 1024);   // room for ONE 1 MiB segment (Reg's log size)

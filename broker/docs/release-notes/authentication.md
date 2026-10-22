@@ -82,4 +82,8 @@ fails closed; the runbook is in [SECURITY.md](../SECURITY.md#halted-the-__securi
 
 There is no migration: stop the cluster, generate a key, mount it on every node, start the brokers, bootstrap the
 first admin, recreate your services as users with grants, and move the clients to version 9 with credentials.
-Set `RUNE_REQUIRE_TLS=true` in production: SCRAM keeps the password off the wire but does not protect the data.
+Authentication needs TLS: every client session of an authenticating broker is TLS (a plaintext session could be taken
+over by any UDP sender), so give every broker `RUNE_TLS_CERT_FILE` / `RUNE_TLS_KEY_FILE` - without them it refuses to
+start. TLS needs a `-DRUNE_TLS=ON` build (the default and the docker image); a build without it refuses to start rather
+than ignore the TLS variables. Clients with credentials connect only over TLS; the `rune` CLI takes `--tls-ca` and
+`--tls-host` (or `RUNE_TLS_CA_FILE` / `RUNE_TLS_HOST`).

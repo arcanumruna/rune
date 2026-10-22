@@ -91,9 +91,12 @@ clients or peers reach the node through Docker port mappings.
 | `RUNE_SECURITY_MAX_STALENESS_MS` | `1000` | F: a broker whose `__security` leader (or the consensus) has been silent this long answers logins, `__security` reads and security DDL `AuthUnavailable` (48) until it is current again. Must exceed the broker liveness timeout + 500 ms (an explicit smaller value is refused; the default is raised to it). A hard leader failure can still make followers answer 48 briefly (#460). |
 | `RUNE_SECURITY_STALE_SESSION_END_MS` | `10000` | R (> F): a broker stale this long ends its authenticated sessions with a session-level `AuthUnavailable`, so their clients reconnect to a current broker. |
 | `RUNE_SECURITY_GATE_DEADLINE_MS` | `5000` | A security DDL OK whose enforcement on this broker is not confirmed within this is answered `Internal` "committed at offset N; enforcement not confirmed" (retry with the same request id). |
-| `RUNE_TLS_CERT_FILE` | unset | PEM certificate file. Read only by a broker built with `-DRUNE_TLS=ON`; reloaded on SIGHUP. |
+| `RUNE_TLS_CERT_FILE` | unset | PEM certificate file, reloaded on SIGHUP. **Required with authentication**: every client session of an authenticating broker is TLS, and a plaintext Connect is answered `HandshakeFailed` (29). |
 | `RUNE_TLS_KEY_FILE` | unset | PEM private key file. Same conditions. |
-| `RUNE_REQUIRE_TLS` | off | `1`/`true`/`TRUE`: refuse any client that does not establish an encrypted session. Read only in a `RUNE_TLS` build; ignored otherwise. |
+| `RUNE_REQUIRE_TLS` | on with authentication | `true`/`1`: every client session must be TLS (always so with authentication). `false`/`0` is accepted only in dev mode (`RUNE_AUTH=disabled`); with authentication the broker refuses to start. Any other value is refused. |
+
+The TLS variables need a broker built with `-DRUNE_TLS=ON` (the default). A build without it refuses to start with
+authentication enabled, and with any of these variables set, instead of starting plaintext.
 
 ## Aeron transport
 
@@ -238,10 +241,11 @@ Send `SIGUSR1` to a running broker to dump a report; `SIGHUP` reloads the TLS ce
 | `runnerMode` | `Thread` | `Thread` or `Invoker` (no threads; you call `doWork()`). |
 | `runnerCore` | `-1` | Thread mode: pin the runner to this CPU. |
 | `driverOnDutyThread` / `reconnectForeverAfterLive` | `false` | Shard-client behaviour; see the header. |
-| `offerCrypto` | `false` | Offer TLS 1.3 on connect. |
-| `requireCrypto` | `false` | Fail the connect when no cipher is negotiated (needs `offerCrypto`). |
+| `offerCrypto` | `false` | Offer TLS 1.3 on connect. **Required with credentials** (`username`, `password`, `passwordFile`, `securityBootstrapOnly`): construction throws without it. |
+| `requireCrypto` | `false`; on with credentials | Never proceed without TLS (needs `offerCrypto`). An answer that arrives before the session has its keys is unauthenticated, so a refusal is retried (then `Backoff` / `Disconnected`, `lastConnectError` 29), never a terminal `Rejected`. |
 | `tlsTrustPem` | system store | PEM CA bundle to trust instead; `""` trusts nothing. |
-| `tlsExpectHost` | empty | Broker DNS name checked against its certificate. Empty installs no hostname check. |
+| `tlsExpectHost` | empty | Certificate name to check (DNS name or IP). Empty: each session checks the host of its own endpoint; a redirect answered before TLS never changes the name. The system store with no name to check (an `aeron:ipc` gateway) throws at construction. |
+| `insecurePlaintextAuth` | `false` | Tests only: allow credentials over a plaintext session. |
 | `username` | empty | Principal to log in as. |
 | `password` / `passwordFile` | empty | Password, or a file holding it (read once; trailing newline stripped). Setting both throws. |
 | `allowUnauthenticatedBroker` | `false` | Accept a dev-mode broker even with credentials. |

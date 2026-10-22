@@ -266,6 +266,7 @@ public:
     /// CompletingRebalance with whoever has re-joined (others evicted).
     /// Default: 30 000 ms (matching session timeout default).
     void setRebalanceTimeoutMs(int32_t ms) noexcept { rebalanceTimeoutMs_ = ms; }
+    [[nodiscard]] int32_t rebalanceTimeoutMs() const noexcept { return rebalanceTimeoutMs_; }
 
     // -----------------------------------------------------------------------
     // doWork — single-writer periodic step (no spin, no sleep)

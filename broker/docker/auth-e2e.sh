@@ -175,7 +175,8 @@ bg_acks()  { grep -c "^CLIENT: OK produce ws=" "${WORK_DIR}/$1.out" 2>/dev/null 
 # Step 1: build the broker + CLI images; the cluster key; the cluster up; a client container.
 # ---------------------------------------------------------------------------
 mkdir -p "${WORK_DIR}"
-rm -f "${RUNE_SECRETS_DIR}/cluster.key" "${RUNE_SECRETS_DIR}/cluster.next.key"
+rm -f "${RUNE_SECRETS_DIR}/cluster.key" "${RUNE_SECRETS_DIR}/cluster.next.key" "${RUNE_SECRETS_DIR}/tls.pem" \
+      "${RUNE_SECRETS_DIR}/tls.key" "${RUNE_SECRETS_DIR}/ca.pem"
 rune_auth_init   # RUNE_SECRETS_DIR (docker/secrets) is pre-set: the key lives where the brief says
 
 log "Step 1a: building the broker image (tag ${RUNE_IMAGE_TAG}; the three nodes share it)..."
@@ -200,6 +201,7 @@ docker rm -f "${TOOLS}" >/dev/null 2>&1 || true
 docker run -d --name "${TOOLS}" --hostname "${TOOLS}" --network "${NETWORK}" --platform linux/amd64 --shm-size=512m \
     --security-opt seccomp=unconfined \
     -v "${WORK_DIR}:/work" -v "${SCRIPT_DIR}/topics:/topics:ro" -v "${RUNE_SECRETS_DIR}:/run/secrets:ro" \
+    -e RUNE_TLS_CA_FILE=/run/secrets/ca.pem \
     "${QL_IMAGE}" sleep infinity >/dev/null || fail "could not start the client container"
 set +e
 out=$(tx cmake --build /build/build --target rune_produce_subscribe -j2 2>&1); rc=$?

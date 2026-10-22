@@ -46,6 +46,8 @@ enum class ConsensusTemplateId : uint16_t {
     PreVoteRequest     = 60,   // D29 PreVote (Raft §9.6; Rune extension)
     PreVoteResponse    = 61,   // D29
     TermFloorNotice    = 62,   // D29/D24: a member's follow floor is above the leader's term
+    ReadLeaseRequest   = 63,   // issue #82 (VLS A.4): a broker asks the controller for a view read lease
+    ReadLeaseGrant     = 64,   // issue #82: the controller's quorum-capped grant
     TerminationPosition = 75,
     TerminationAck     = 76,
 };
@@ -907,6 +909,112 @@ struct StandDownMsg {
         StandDownMsg m{};
         m.leadershipTermId = detail::read_le<int64_t>(p + 0);
         m.leaderMemberId   = detail::read_le<int32_t>(p + 8);
+        return m;
+    }
+};
+
+
+// ===========================================================================
+// ReadLeaseRequest  (templateId = 63) — issue #82 (VLS Part A, A.4; the spec's
+// 62 is TermFloorNotice).  A Rune extension, sent by a CLOSED follower with
+// every AppendPosition (FollowerLiveness cadence): it asks the controller for a
+// view read lease and echoes the highest grant it heard (the controller's QL).
+// An older controller ignores the unknown template: no grant, so view reads
+// answer NotLeader until the controller is upgraded (documented, like PreVote).
+//    blockLength = 32
+//      term          : int64  @ +0   (the leadership term the sender follows)
+//      reqSeq        : int64  @ +8
+//      heardGrantSeq : int64  @ +16  (0 = none heard from this leader)
+//      memberId      : int32  @ +24  (the sender)
+//      (pad)         : int32  @ +28
+// ===========================================================================
+struct ReadLeaseRequestMsg {
+    int64_t term;
+    int64_t reqSeq;
+    int64_t heardGrantSeq;
+    int32_t memberId;
+
+    static constexpr uint16_t TEMPLATE_ID  = 63;
+    static constexpr uint16_t BLOCK_LENGTH = 32;
+    static constexpr std::size_t TOTAL_SIZE = ConsensusMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    static std::size_t encode(uint8_t* buf, std::size_t offset, int64_t term_, int64_t reqSeq_, int64_t heardGrantSeq_,
+                              int32_t memberId_) noexcept {
+        std::size_t pos = offset;
+        pos += ConsensusMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
+        uint8_t* p = buf + pos;
+        detail::write_le<int64_t>(p +  0, term_);
+        detail::write_le<int64_t>(p +  8, reqSeq_);
+        detail::write_le<int64_t>(p + 16, heardGrantSeq_);
+        detail::write_le<int32_t>(p + 24, memberId_);
+        detail::write_le<int32_t>(p + 28, 0);
+        return TOTAL_SIZE;
+    }
+    static ReadLeaseRequestMsg decode(const uint8_t* buf, std::size_t offset) noexcept {
+        const uint8_t* p = buf + offset + ConsensusMessageHeader::ENCODED_SIZE;
+        ReadLeaseRequestMsg m{};
+        m.term          = detail::read_le<int64_t>(p +  0);
+        m.reqSeq        = detail::read_le<int64_t>(p +  8);
+        m.heardGrantSeq = detail::read_le<int64_t>(p + 16);
+        m.memberId      = detail::read_le<int32_t>(p + 24);
+        return m;
+    }
+};
+
+// ===========================================================================
+// ReadLeaseGrant  (templateId = 64) — issue #82: the controller's answer to one
+// ReadLeaseRequest.  validForNs (controller lease clock) is capped by the quorum
+// lease QL; the broker's lease ends at its request's send time + validForNs /
+// (1+rho)^2.  commitPos = the controller's metadata log end at grant time: the
+// broker hands the lease to a worker only once every role op derived from the
+// metadata below it is on that worker's op ring.  A grant is also a leader
+// heartbeat for the recipient (a C4 "heard" source).
+//    blockLength = 48
+//      term           : int64  @ +0
+//      reqSeq         : int64  @ +8   (the request answered)
+//      grantSeq       : int64  @ +16  (echoed back by the next requests)
+//      commitPos      : int64  @ +24
+//      validForNs     : int64  @ +32  (0 = heard, no lease)
+//      memberId       : int32  @ +40  (the recipient)
+//      leaderMemberId : int32  @ +44  (the sender: the controller)
+// ===========================================================================
+struct ReadLeaseGrantMsg {
+    int64_t term;
+    int64_t reqSeq;
+    int64_t grantSeq;
+    int64_t commitPos;
+    int64_t validForNs;
+    int32_t memberId;
+    int32_t leaderMemberId;
+
+    static constexpr uint16_t TEMPLATE_ID  = 64;
+    static constexpr uint16_t BLOCK_LENGTH = 48;
+    static constexpr std::size_t TOTAL_SIZE = ConsensusMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    static std::size_t encode(uint8_t* buf, std::size_t offset, int64_t term_, int64_t reqSeq_, int64_t grantSeq_,
+                              int64_t commitPos_, int64_t validForNs_, int32_t memberId_, int32_t leaderMemberId_) noexcept {
+        std::size_t pos = offset;
+        pos += ConsensusMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
+        uint8_t* p = buf + pos;
+        detail::write_le<int64_t>(p +  0, term_);
+        detail::write_le<int64_t>(p +  8, reqSeq_);
+        detail::write_le<int64_t>(p + 16, grantSeq_);
+        detail::write_le<int64_t>(p + 24, commitPos_);
+        detail::write_le<int64_t>(p + 32, validForNs_);
+        detail::write_le<int32_t>(p + 40, memberId_);
+        detail::write_le<int32_t>(p + 44, leaderMemberId_);
+        return TOTAL_SIZE;
+    }
+    static ReadLeaseGrantMsg decode(const uint8_t* buf, std::size_t offset) noexcept {
+        const uint8_t* p = buf + offset + ConsensusMessageHeader::ENCODED_SIZE;
+        ReadLeaseGrantMsg m{};
+        m.term           = detail::read_le<int64_t>(p +  0);
+        m.reqSeq         = detail::read_le<int64_t>(p +  8);
+        m.grantSeq       = detail::read_le<int64_t>(p + 16);
+        m.commitPos      = detail::read_le<int64_t>(p + 24);
+        m.validForNs     = detail::read_le<int64_t>(p + 32);
+        m.memberId       = detail::read_le<int32_t>(p + 40);
+        m.leaderMemberId = detail::read_le<int32_t>(p + 44);
         return m;
     }
 };
