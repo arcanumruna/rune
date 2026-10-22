@@ -598,3 +598,26 @@ TEST(MetadataMessagesReceiverIdRegression, TrailerNotEmittedBelowClientVersion12
     const auto zero = encodeRespFor(rpc::kClientVersionReceiverKeys, {q});
     EXPECT_EQ(zero, none);
 }
+
+// Adversarial review of PR #528 (issue #116) - input bounds on the receiver trailer: a count that does not parallel
+// partitions[] (0, n-1, n+1, 0xFFFF) is rejected - never a partially applied or shifted id - and bytes after a
+// well-formed receiver trailer (a later additive trailer) are ignored with every id intact; the id byte keeps its full
+// range (255 decodes as 255; the client refuses to seal for it).
+TEST(MetadataMessagesReceiverIdRegression, AReceiverTrailerCountThatDoesNotParallelThePartitionsIsRejectedAdversarialRegression) {
+    rpc::PartitionEntry p0; p0.topicId = 3; p0.partition = 0; p0.ingressEndpoint = "h:1"; p0.ingressReceiverId = 1;
+    rpc::PartitionEntry p1; p1.topicId = 3; p1.partition = 1; p1.ingressEndpoint = "h:2"; p1.ingressReceiverId = 255;
+    const auto buf = encodeRespFor(rpc::kClientVersionReceiverKeys, {p0, p1});
+    const std::size_t countAt = buf.size() - 2u - 2u;   // [u16 count][id][id]
+    ASSERT_EQ(rpc::detail::getLE16(buf.data(), static_cast<int>(countAt)), 2u);
+    for (const uint16_t bad : {uint16_t{0}, uint16_t{1}, uint16_t{3}, uint16_t{0xFFFF}}) {
+        auto b = buf;
+        rpc::detail::putLE16(b.data(), static_cast<int>(countAt), bad);
+        EXPECT_FALSE(rpc::MetadataResponse::decode(b.data(), b.size()).has_value()) << "count " << bad;
+    }
+    auto longer = buf;
+    for (uint8_t x : {uint8_t{0xAA}, uint8_t{0xBB}, uint8_t{0xCC}}) longer.push_back(x);
+    const auto dec = rpc::MetadataResponse::decode(longer.data(), longer.size());
+    ASSERT_TRUE(dec.has_value()) << "a later additive trailer must be ignored";
+    EXPECT_EQ(dec->partitions[0].ingressReceiverId, 1);
+    EXPECT_EQ(dec->partitions[1].ingressReceiverId, 255);
+}

@@ -209,3 +209,109 @@ TEST(GatewayCryptoRegression, ALegacyClientStillProducesStraightToAWorkerRegress
     EXPECT_EQ(records(r), before + 2) << "the legacy gateway path is unchanged";
     EXPECT_EQ(r.gw.c2bWrongReceiverDropsForTest(), 0u);
 }
+
+// ── Adversarial review of PR #528 (issue #116) ──────────────────────────────────────────────────────────────────────
+
+// Input bounds + window state: frames naming every wrong receiver (the gateway 0, another worker 2, the top worker 64,
+// and the out-of-range 65 / 255), each at seq 1 and sealed under the key it names, are dropped by worker 0 BEFORE any
+// AEAD, append nothing and commit no seq - worker 0's own seq-1 frame is still appended afterwards.  The gateway does
+// the same for frames naming 1, 64, 65, 255, then serves its own seq 1.
+// RED (mutation): drop either receiver check - the frames then go to the AEAD and are counted as decrypt failures.
+TEST(GatewayCryptoRegression, WrongReceiverFramesAtEveryBoundCommitNoWindowStateAdversarialRegression) {
+    ReceiverRig rig;
+    auto& r = rig.r;
+    const int64_t before = records(r);
+    int64_t corr = 400;
+    for (const uint8_t wrong : {uint8_t{0}, uint8_t{2}, uint8_t{64}, uint8_t{65}, uint8_t{255}}) {
+        SCOPED_TRACE(static_cast<int>(wrong));
+        const auto f = sealFor(rig.k.receiverKey(wrong), rig.k.c2bPrefix, wrong, /*seq=*/1, r.produceFrame(++corr));
+        EXPECT_EQ(rig.worker().handleIngressFrameForTest(f.data(), f.size(), r.now), 0);
+        r.pass();
+    }
+    EXPECT_EQ(rig.worker().c2bWrongReceiverDropsForTest(), 5u);
+    EXPECT_EQ(rig.worker().decryptFailuresForTest(), 0u) << "a wrong-receiver frame reached the AEAD";
+    EXPECT_EQ(records(r), before) << "a wrong-receiver frame was appended";
+    const auto mine = sealFor(rig.k.receiverKey(1), rig.k.c2bPrefix, 1, /*seq=*/1, r.produceFrame(++corr));
+    EXPECT_EQ(rig.worker().handleIngressFrameForTest(mine.data(), mine.size(), r.now), 1);
+    r.pass();
+    EXPECT_EQ(records(r), before + 1) << "worker 0's seq 1 must still open: the drops committed no window state";
+
+    for (const uint8_t wrong : {uint8_t{1}, uint8_t{64}, uint8_t{65}, uint8_t{255}}) {
+        const auto f = sealFor(rig.k.receiverKey(wrong), rig.k.c2bPrefix, wrong, /*seq=*/1, r.produceFrame(++corr));
+        (void)r.gw.applyClientFrameForTest(f.data(), f.size());
+        for (int i = 0; i < 4; ++i) r.pass();
+    }
+    EXPECT_EQ(r.gw.c2bWrongReceiverDropsForTest(), 4u);
+    EXPECT_EQ(records(r), before + 1);
+    const auto gw = sealFor(rig.k.c2b, rig.k.c2bPrefix, 0, /*seq=*/1, r.produceFrame(++corr));
+    (void)r.gw.applyClientFrameForTest(gw.data(), gw.size());
+    for (int i = 0; i < 8 && records(r) == before + 1; ++i) r.pass();
+    EXPECT_EQ(records(r), before + 2) << "the gateway's seq 1 must still open";
+}
+
+// AAD binding: a frame sealed for worker 1 (receiver 2) whose clear subheader is rewritten to name worker 0 passes
+// worker 0's pre-AEAD receiver check but never opens (the id is in the AAD and the key is worker 1's), is never
+// appended, and poisons no window: worker 0's own seq-1 frame still opens.  Same for a worker frame rewritten to name
+// the gateway.
+TEST(GatewayCryptoRegression, ASubheaderRewrittenToNameTheTargetNeverOpensAdversarialRegression) {
+    ReceiverRig rig;
+    auto& r = rig.r;
+    const int64_t before = records(r);
+    auto forged = sealFor(rig.k.receiverKey(2), rig.k.c2bPrefix, 2, /*seq=*/1, r.produceFrame(500));
+    auto toGateway = forged;
+    pc::CryptoSubHeader sub = *pc::CryptoSubHeader::decode(forged.data() + pc::MessageHeader::ENCODED_SIZE,
+                                                           forged.size() - pc::MessageHeader::ENCODED_SIZE);
+    sub.senderId = 1;
+    sub.encode(forged.data() + pc::MessageHeader::ENCODED_SIZE);
+    EXPECT_EQ(rig.worker().handleIngressFrameForTest(forged.data(), forged.size(), r.now), 0);
+    r.pass();
+    EXPECT_EQ(rig.worker().decryptFailuresForTest(), 1u) << "the forged id passed the check and failed the AEAD";
+    EXPECT_EQ(records(r), before);
+    const auto mine = sealFor(rig.k.receiverKey(1), rig.k.c2bPrefix, 1, /*seq=*/1, r.produceFrame(501));
+    EXPECT_EQ(rig.worker().handleIngressFrameForTest(mine.data(), mine.size(), r.now), 1);
+    r.pass();
+    EXPECT_EQ(records(r), before + 1);
+
+    sub.senderId = 0;
+    sub.encode(toGateway.data() + pc::MessageHeader::ENCODED_SIZE);
+    (void)r.gw.applyClientFrameForTest(toGateway.data(), toGateway.size());
+    for (int i = 0; i < 8; ++i) r.pass();
+    EXPECT_EQ(records(r), before + 1) << "a worker frame relabelled for the gateway was forwarded";
+    const auto gw = sealFor(rig.k.c2b, rig.k.c2bPrefix, 0, /*seq=*/1, r.produceFrame(502));
+    (void)r.gw.applyClientFrameForTest(gw.data(), gw.size());
+    for (int i = 0; i < 8 && records(r) == before + 1; ++i) r.pass();
+    EXPECT_EQ(records(r), before + 2) << "the failed relabelled frame poisoned the gateway's window";
+}
+
+// Truncation sweep: worker 0's own frame cut at EVERY byte offset is never appended (and never crashes the worker);
+// the full frame is then appended exactly once, and a byte-identical replay is not appended again.  The gateway's own
+// frame gets the same sweep.
+TEST(GatewayCryptoRegression, AReceiverFrameTruncatedAtEveryOffsetNeverAppendsAdversarialRegression) {
+    ReceiverRig rig;
+    auto& r = rig.r;
+    const int64_t before = records(r);
+    const auto full = sealFor(rig.k.receiverKey(1), rig.k.c2bPrefix, 1, /*seq=*/1, r.produceFrame(600));
+    for (std::size_t cut = 0; cut < full.size(); ++cut) {
+        std::vector<uint8_t> part(full.begin(), full.begin() + static_cast<std::ptrdiff_t>(cut));
+        (void)rig.worker().handleIngressFrameForTest(part.empty() ? nullptr : part.data(), part.size(), r.now);
+        r.pass();
+        ASSERT_EQ(records(r), before) << "a frame truncated at " << cut << " was appended";
+    }
+    EXPECT_EQ(rig.worker().handleIngressFrameForTest(full.data(), full.size(), r.now), 1);
+    r.pass();
+    EXPECT_EQ(records(r), before + 1) << "the full frame opens: no truncated copy committed its seq";
+    (void)rig.worker().handleIngressFrameForTest(full.data(), full.size(), r.now);
+    r.pass();
+    EXPECT_EQ(records(r), before + 1) << "a replay to the same worker was appended twice";
+
+    const auto gfull = sealFor(rig.k.c2b, rig.k.c2bPrefix, 0, /*seq=*/1, r.produceFrame(601));
+    for (std::size_t cut = pc::MessageHeader::ENCODED_SIZE; cut < gfull.size(); ++cut) {
+        std::vector<uint8_t> part(gfull.begin(), gfull.begin() + static_cast<std::ptrdiff_t>(cut));
+        (void)r.gw.applyClientFrameForTest(part.data(), part.size());
+        r.pass();
+        ASSERT_EQ(records(r), before + 1) << "a gateway frame truncated at " << cut << " was forwarded";
+    }
+    (void)r.gw.applyClientFrameForTest(gfull.data(), gfull.size());
+    for (int i = 0; i < 8 && records(r) == before + 1; ++i) r.pass();
+    EXPECT_EQ(records(r), before + 2);
+}

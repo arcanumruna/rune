@@ -411,3 +411,28 @@ TEST(SecurityEnforcementFenceRegression, ObjectPermissionsShippedOnlyAfterEveryW
     EXPECT_TRUE(r.gw.objectPermissionsShipped(7)) << "a dropped object never serves: nothing to wait for";
     r.gw.holdPermissionShippingForTest(false);
 }
+
+// Adversarial review of PR #528 (issue #197) - resources: objects applied while a worker ring is backed up (here: the
+// shipper held) are tracked once each, a catalog replay of the same id (boot / catch-up re-applies it) does not add a
+// second entry, and every entry is pruned once the backlog ships - the table never grows with DDL history.
+// RED (mutation): drop the prune in servicePermissionShippingWork_ (or the replace-on-reapply).
+TEST(SecurityEnforcementFenceRegression, ObjectShipSeqsStayBoundedUnderABackedUpShipperAdversarialRegression) {
+    FenceRig r(2);
+    const int64_t sid = r.gw.injectTestSession(0);
+    r.gw.authenticateWithGrantsForTest(sid, 77, {sec::GrantSpec{sec::Operation::Write, sec::ResourcePattern{
+        sec::ResourceType::Topic, sec::PatternKind::Prefix, "w."}}});
+    for (int i = 0; i < 3; ++i) r.runAll(1 + i);
+    r.gw.holdPermissionShippingForTest(true);
+    for (int32_t id = 10; id < 210; ++id) r.gw.onCatalogObjectApplied(id, "w.t" + std::to_string(id), false);
+    EXPECT_EQ(r.gw.objectShipSeqsForTest(), 200u);
+    for (int32_t id = 10; id < 210; ++id) r.gw.onCatalogObjectApplied(id, "w.t" + std::to_string(id), false);
+    EXPECT_EQ(r.gw.objectShipSeqsForTest(), 200u) << "a replayed apply added a second entry";
+    for (int32_t id = 10; id < 210; ++id) ASSERT_FALSE(r.gw.objectPermissionsShipped(id)) << id;
+    r.runAll(20);
+    EXPECT_EQ(r.gw.objectShipSeqsForTest(), 200u) << "held: nothing shipped, nothing pruned";
+    r.gw.holdPermissionShippingForTest(false);
+    r.runAll(21);
+    r.runAll(22);
+    for (int32_t id = 10; id < 210; ++id) EXPECT_TRUE(r.gw.objectPermissionsShipped(id)) << id;
+    EXPECT_EQ(r.gw.objectShipSeqsForTest(), 0u) << "shipped entries must be pruned";
+}
