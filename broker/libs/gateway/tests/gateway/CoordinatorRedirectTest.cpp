@@ -152,7 +152,7 @@ TEST(CoordinatorRedirectRegression, TxnRequestWithoutATxnServiceIsAnsweredIntern
     EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::Internal));
 }
 
-// A txn handler returning 0 DEFERS its answer (EndTxn waits for its markers) —
+// A txn handler returning 0 DEFERS its answer (EndTxn waits for its Prepare* record, #38) —
 // the gateway must not answer for it.
 TEST(CoordinatorRedirectRegression, DeferredTxnAnswerIsNotPreemptedRegression) {
     Rig r(LeaderView{/*isLeader=*/true, ""});

@@ -341,7 +341,8 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
 
 // ---------------------------------------------------------------------------
 // No-hang fix round 2 (I3): a handler returns 0 ONLY for a deferred answer
-// (EndTxn waiting for its markers — ITxnRequestHandler contract).  A response
+// (an answer waiting for its __transaction_state record — EndTxn: its Prepare*
+// record, #38 — ITxnRequestHandler contract).  A response
 // that does not fit the caller's buffer is answered MessageTooLarge (its own
 // response type, encodeRejectionFor) — never a 0 the gateway would read as
 // "deferred" and never answer.
@@ -1236,8 +1237,8 @@ void TransactionCoordinationService::onControlMarkerRefused(int32_t topicId, int
         return;
     }
     // Every other refusal (NotLeader, MinIsrViolation, Internal, StorageError, ...) is retried: the
-    // marker is NOT in the log, so the transaction must stay Prepare* (EndTxn deferred, the next
-    // transaction refused ConcurrentTransactions) until a retry lands.
+    // marker is NOT in the log, so the transaction must stay Prepare* (#38: its EndTxn was answered
+    // OK already; the next transaction is refused ConcurrentTransactions) until a retry lands.
     queueRetry_(it->second, topicId, partition);
 }
 

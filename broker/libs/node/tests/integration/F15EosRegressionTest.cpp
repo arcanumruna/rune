@@ -6275,3 +6275,179 @@ TEST(TxnPidBlockRegression, ACeilingPersistedByAPreBindingCoordinatorDoesNotExha
     const auto t2 = R.initPid("t2");
     EXPECT_EQ(t2.err, 0);
 }
+
+// ============================================================================
+// PR #555 adversarial review (#38): EndTxn is answered OK once its Prepare* record is durable; the markers land
+// later.  Attack the window between that OK and the last marker from every entry point.
+// ============================================================================
+namespace {
+rune::coordination::TxnOffsetApply appliedOffsetSink(void*, const std::string&, const rune::coordination::TopicPartition&,
+                                                     int64_t, int64_t, const rune::coordination::TxnOffsetToken&) {
+    return rune::coordination::TxnOffsetApply::Applied;
+}
+// Drive the coordinator and the worker until no marker is awaited (hard cap).
+int64_t driveUntilCompleted(TxnRig& T, int64_t now) {
+    for (int i = 0; i < 128 && T.tcs->awaitingMarkerTxnsForTest() > 0; ++i, now += 50'000'000) {
+        (void)T.tcs->doWork(now);
+        T.m.runWorker(now);
+    }
+    return now;
+}
+}  // namespace
+
+// Every request of the producer's NEXT transaction, sent after the early OK but before the marker lands, is refused
+// retriably (27) - none opens a transaction that a late marker could close - and the decision itself cannot be
+// reversed (an opposite EndTxn is 19).  Nothing is written twice: once the marker lands the retried EndTxn is the
+// idempotent OK and no second marker is appended.
+TEST(MarkerRetryRegression, EveryNextTxnRequestBeforeTheMarkerLandsIsRetriableAdversarialRegression) {
+    TxnRig T(/*minIsr=*/2);                                  // ISR {1} < minIsr 2: the acks=all marker is refused
+    T.tcs->setTxnOffsetSink(&appliedOffsetSink, nullptr);    // #360: TxnOffsetCommit needs an offset store
+    ASSERT_EQ(T.initPid(), 0);
+    const int64_t pid = T.pid; const int16_t epoch = T.epoch;
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
+    T.runUntilNoMarkerAwaited(10);
+    for (int64_t now = 20'000'000; now < 500'000'000; now += 10'000'000) { (void)T.tcs->doWork(now); T.m.runWorker(now); }
+    ASSERT_GE(T.tcs->controlMarkersRefusedForTest(), 1u) << "precondition: the marker is refused";
+
+    EXPECT_EQ(T.addPartition(), kConcurrent) << "AddPartitionsToTxn";
+    EXPECT_EQ(addOffsets(T, "g"), kConcurrent) << "AddOffsetsToTxn";
+    EXPECT_EQ(txnOffsetCommit(T, "g", 5), kConcurrent) << "TxnOffsetCommit";
+    EXPECT_EQ(T.initPid(), kConcurrent) << "InitProducerId (an epoch bump mid-Prepare*)";
+    EXPECT_EQ(T.pid, pid); EXPECT_EQ(T.epoch, epoch);
+    EXPECT_EQ(T.endTxn(/*commit=*/true), kConcurrent) << "an EndTxn retry after the OK (its answer lost)";
+    EXPECT_EQ(T.endTxn(/*commit=*/false), kInvalidTxnState) << "an abort after the commit OK";
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::PrepareCommit);
+    EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 1u);
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 1) << "something was written for the refused requests";
+    EXPECT_TRUE(T.controlFrames.empty());
+
+    T.m.r->setMinIsrForTest(1);
+    (void)driveUntilCompleted(T, 1'000'000'000);
+    ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit);
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 2) << "exactly one COMMIT marker";
+    EXPECT_EQ(T.endTxn(/*commit=*/true), 0) << "the retried EndTxn is the idempotent OK once complete";
+    for (int i = 0; i < 4; ++i) T.m.runWorker(2'000'000'000 + i);
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 2) << "the retried EndTxn wrote a second marker";
+    EXPECT_TRUE(T.controlFrames.empty()) << "a deferred EndTxn answer was sent";
+    EXPECT_EQ(T.addPartition(), 0) << "the next transaction starts";
+}
+
+// The abort direction: EndTxn(abort) is answered OK before its marker lands; read_committed never sees the batch,
+// neither before the marker (LSO) nor after it (aborted index), and the next txn waits for the marker.
+TEST(MarkerRetryRegression, AbortAnsweredOkBeforeItsMarkerNeverExposesTheDataAdversarialRegression) {
+    TxnRig T(/*minIsr=*/2);
+    const int64_t rcSub = T.m.subscribe(T.sid, /*read_committed*/1);
+    ASSERT_GT(rcSub, 0);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/false));
+    T.runUntilNoMarkerAwaited(10);
+    for (int64_t now = 20'000'000; now < 500'000'000; now += 10'000'000) { (void)T.tcs->doWork(now); T.m.runWorker(now); }
+    EXPECT_EQ(T.addPartition(), kConcurrent);
+    EXPECT_EQ(T.endTxn(/*commit=*/true), kInvalidTxnState) << "a commit after the abort OK";
+    T.m.push(16, 500'000'000);
+    EXPECT_FALSE(T.m.delivered(rcSub, 0)) << "read_committed received the batch before its ABORT marker";
+
+    T.m.r->setMinIsrForTest(1);
+    const int64_t now = driveUntilCompleted(T, 1'000'000'000);
+    ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteAbort);
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 2) << "exactly one ABORT marker";
+    T.m.push(16, now);
+    EXPECT_FALSE(T.m.delivered(rcSub, 0)) << "read_committed received an ABORTED batch";
+    EXPECT_TRUE(T.controlFrames.empty());
+    EXPECT_EQ(T.addPartition(), 0);
+}
+
+// Back-to-back before the reply: an EndTxn waiting for its uncommitted PrepareCommit record is re-sent (27) and an
+// abort is raced in (19).  Once the record commits the FIRST request alone is answered, exactly once, and exactly one
+// COMMIT marker is written.
+TEST(MarkerRetryRegression, GatedEndTxnRetriedAndRacedByAnAbortIsAnsweredOnceAdversarialRegression) {
+    TxnRig T(/*minIsr=*/1, /*withStore=*/true, {}, /*isr=*/{1}, /*stateIsr=*/{1, 2});
+    int64_t now = 1;
+    (void)T.tcs->doWork(now);
+    int16_t ipErr = T.initPid();
+    for (int i = 0; i < 4 && ipErr == kConcurrent; ++i) {
+        T.commitState(++now);
+        (void)T.tcs->doWork(++now);
+        ipErr = T.initPid();
+    }
+    ASSERT_EQ(ipErr, -1) << "precondition: the InitProducerId answer waits for its record";
+    T.controlFrames.clear();
+    T.commitState(++now);
+    (void)T.tcs->doWork(++now);
+    ASSERT_EQ(T.controlFrames.size(), 1u);
+    const auto ip = pc::InitProducerIdResponse::decode(T.controlFrames[0].data(), T.controlFrames[0].size());
+    ASSERT_TRUE(ip && ip->errorCode == 0);
+    T.pid = ip->producerId; T.epoch = ip->producerEpoch;
+    ASSERT_EQ(T.addPartition(), -1);
+    T.commitState(++now);
+    (void)T.tcs->doWork(++now);
+    ASSERT_EQ(T.controlFrames.size(), 2u);
+    T.controlFrames.clear();
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(++now);
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
+
+    ASSERT_EQ(T.endTxn(/*commit=*/true), 999) << "precondition: the EndTxn waits for its PrepareCommit record";
+    const int64_t firstCorr = T.corr;
+    EXPECT_EQ(T.endTxn(/*commit=*/true), kConcurrent) << "the re-sent EndTxn";
+    EXPECT_EQ(T.endTxn(/*commit=*/false), kInvalidTxnState) << "the raced abort";
+    EXPECT_EQ(T.tcs->prepareGates(), 1u) << "a retry opened a second gate";
+    for (int i = 0; i < 4; ++i) { (void)T.tcs->doWork(++now); T.m.runWorker(now); }
+    EXPECT_TRUE(T.controlFrames.empty()) << "answered before the record committed";
+
+    T.commitState(++now);
+    (void)T.tcs->doWork(++now);
+    ASSERT_EQ(T.controlFrames.size(), 1u);
+    const auto r = pc::EndTxnResponse::decode(T.controlFrames[0].data(), T.controlFrames[0].size());
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, 0);
+    EXPECT_EQ(r->correlationId, firstCorr) << "the answer went to a retry, not the gated request";
+    for (int i = 0; i < 16 && T.tcs->awaitingMarkerTxnsForTest() > 0; ++i) { (void)T.tcs->doWork(++now); T.m.runWorker(now); }
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit);
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 2) << "exactly one COMMIT marker";
+    EXPECT_EQ(T.controlFrames.size(), 1u) << "a second EndTxn answer";
+}
+
+// A coordinator reload (epoch change) between the early OK and the marker: the new load re-drives the durable
+// PrepareCommit (no answer to the old EndTxn, nothing completed by the unload), keeps the next txn out while the
+// marker is refused, and completes once it lands - under the new coordinatorEpoch, with one marker.
+TEST(TxnCoordinatorLoadRegression, ReloadBetweenTheEarlyOkAndTheMarkerRedrivesItAdversarialRegression) {
+    TxnRig T(/*minIsr=*/2, /*withStore=*/true);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
+    T.runUntilNoMarkerAwaited(10);
+    ASSERT_GE(T.tcs->controlMarkersRefusedForTest(), 1u) << "precondition: the marker is refused";
+
+    T.stateReplica->becomeLeader(2, {1});                    // the coordinator reloads under a new epoch
+    int64_t now = 50;
+    for (int i = 0; i < 8; ++i, now += 10'000'000) { (void)T.tcs->doWork(now); T.m.runWorker(now); }
+    EXPECT_TRUE(T.controlFrames.empty()) << "the reload answered the old EndTxn";
+    EXPECT_EQ(T.tcs->transactionsCompletedForTest(), 0u) << "completed over a refused marker";
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::PrepareCommit) << "the reload lost the decision";
+    EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 1u) << "the reload did not re-drive the marker";
+    EXPECT_EQ(T.addPartition(), kConcurrent) << "the next txn started over the reload";
+    EXPECT_EQ(T.endTxn(/*commit=*/true), kConcurrent) << "the client's EndTxn retry to the new load";
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 1);
+
+    T.m.r->setMinIsrForTest(1);
+    (void)driveUntilCompleted(T, 2'000'000'000);
+    const auto* meta = T.store->get(T.txnId);
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(meta->state, tx::TxnState::CompleteCommit);
+    EXPECT_EQ(meta->coordinatorEpoch, 2);
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 2) << "exactly one COMMIT marker";
+    EXPECT_TRUE(T.controlFrames.empty());
+    EXPECT_EQ(T.endTxn(/*commit=*/true), 0);
+}
