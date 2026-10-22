@@ -337,6 +337,7 @@ if(BUILD_TESTING)
                 tests/integration/GatewayTimeoutTest.cpp)
             target_link_libraries(rune_gateway_timeout_tests PRIVATE
                 rune_gateway
+                rune_node
                 aeron::aeron
                 GTest::gtest_main)
             gtest_discover_tests(rune_gateway_timeout_tests

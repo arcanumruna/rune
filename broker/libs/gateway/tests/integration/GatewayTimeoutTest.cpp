@@ -18,6 +18,8 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/node/WorkerPool.h>
+#include <rune/metadata/ShardRouter.h>
 #include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/MessageHeader.h>
@@ -99,6 +101,16 @@ public:
         startDriver();
         connectAeron();
 
+        // In invoker mode the gateway's constructor (which blocks on its ingress subscription) needs the conductor
+        // run for it: a helper thread invokes it for exactly that call, then is joined (single caller at a time).
+        std::atomic<bool> ctorDone{false};
+        std::thread invoker;
+        if (useInvoker_) invoker = std::thread([&] {
+            while (!ctorDone.load(std::memory_order_acquire)) {
+                aeron_->conductorAgentInvoker().invoke();
+                std::this_thread::sleep_for(std::chrono::microseconds{100});
+            }
+        });
         // Gateway with a 100 ms session timeout.
         gw_ = std::make_unique<ClientGateway>(
             aeron_,
@@ -106,6 +118,8 @@ public:
             kIngressStream,
             kThisNodeId,
             kTimeoutNs);
+        ctorDone.store(true, std::memory_order_release);
+        if (invoker.joinable()) invoker.join();
     }
 
     void TearDown() override {
@@ -167,6 +181,7 @@ public:
         const auto deadline = clock::now() + std::chrono::seconds{10};
 
         for (int i = 0; i < maxIter && clock::now() < deadline; ++i) {
+            invokeConductor();
             if (gw_) gw_->doWork(wallNowNs());
             if (clientSub && clientAsm)
                 clientSub->poll(clientAsm->handler(), 10);
@@ -219,6 +234,7 @@ public:
         using clock = std::chrono::steady_clock;
         const auto deadline = clock::now() + std::chrono::seconds{10};
         for (int i = 0; i < kPumpIter && clock::now() < deadline; ++i) {
+            invokeConductor();
             if (gw_) gw_->doWork(connectNs == 0 ? wallNowNs() : connectNs);
             client.egressSub->poll(asm_.handler(), 10);
             if (resp.has_value()) break;
@@ -230,6 +246,15 @@ public:
 
     static constexpr std::size_t kScratch = 512;
     uint8_t scratch_[kScratch] = {};
+
+    // A subclass sets this in its ctor to run the Aeron client conductor by hand (AgentInvoker): the client then
+    // learns a driver response only when invokeConductor() runs, so an in-flight registration stays in flight
+    // deterministically.  It also shortens the driver's publication linger so a released publication's counters
+    // disappear within the test.  Default off: every other test here keeps the threaded conductor.
+    bool useInvoker_ = false;
+    void invokeConductor() {
+        if (useInvoker_ && aeron_) aeron_->conductorAgentInvoker().invoke();
+    }
 
     std::unique_ptr<ClientGateway> gw_;
     std::shared_ptr<aeron::Aeron>  aeron_;
@@ -247,6 +272,7 @@ private:
         aeron_driver_context_set_shared_idle_strategy(driverCtx_, "sleep-ns");
         aeron_driver_context_set_term_buffer_sparse_file(driverCtx_, true);
         aeron_driver_context_set_term_buffer_length(driverCtx_, 64 * 1024);
+        if (useInvoker_) aeron_driver_context_set_publication_linger_timeout_ns(driverCtx_, 10'000'000ULL);
 
         ASSERT_EQ(aeron_driver_init(&driver_, driverCtx_), 0)
             << "aeron_driver_init failed: " << aeron_errmsg();
@@ -273,6 +299,7 @@ private:
         const std::string aeronDir = (tmpDir_->path / "aeron").string();
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);
+        if (useInvoker_) ctx.useConductorAgentInvoker(true);
         aeron_ = aeron::Aeron::connect(ctx);
         ASSERT_NE(aeron_, nullptr) << "Aeron::connect failed";
     }
@@ -782,6 +809,94 @@ TEST_F(GatewayTimeoutFixture, GroupHeartbeatRefreshesSessionLivenessRegression) 
     gw_->reapExpired(t0 + kTimeoutNs + 1);
     EXPECT_EQ(gw_->sessionCount(), 1u)
         << "a session that sent a group Heartbeat at t0+Δ must not be reaped at t0+timeout+1";
+}
+
+// ===========================================================================
+// Issue #1 — a record-egress publication registration abandoned while it is still in flight (its session closed, or
+// its resolve timed out) must be RELEASED on the media driver, never leaked.  The Aeron client is run by hand
+// (useInvoker_), so the registration stays AWAITING_MEDIA_DRIVER on the client until invokeConductor(): the
+// in-flight window is deterministic.  The observable is the driver's publisher-limit counter keyed by the
+// registration id: it exists while the registration lives and disappears only once the publication is released.
+// ===========================================================================
+class RecordEgressLifetimeRegression : public GatewayTimeoutFixture {
+protected:
+    RecordEgressLifetimeRegression()
+        : pool_(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16) { useInvoker_ = true; }
+
+    // The driver's publisher-limit counter (type 1) of registration `regId`, if it exists.
+    bool pubLimitCounterExists(int64_t regId) {
+        bool found = false;
+        aeron_->countersReader().forEach(
+            [&](int32_t, int32_t typeId, const aeron::concurrent::AtomicBuffer& key, const std::string&) {
+                if (typeId == 1 && key.getInt64(0) == regId) found = true;
+            });
+        return found;
+    }
+
+    // Connect a session and start its record-egress registration with a Subscribe, in flight.
+    void startInFlightEgress(TestClient& client, int64_t& sid, int64_t& regId) {
+        auto result = doConnect(client, /*corrId=*/60, 1'000'000'000LL);
+        ASSERT_GE(result.resp.assignedSessionId, 1);
+        sid = result.resp.assignedSessionId;
+        gw_->setWorkerPool(&pool_);
+        gw_->forwardSubscribeForTest(/*subId=*/1001, sid, /*topic=*/0, /*partition=*/0, 0, 0, false, false, 7);
+        regId = gw_->recordEgressRegIdForTest(sid, 0);
+        ASSERT_GE(regId, 0) << "the Subscribe must start a record-egress registration";
+        // The driver allocates the registration's counter on its own thread; the client has not been invoked,
+        // so it still believes the registration is in flight.
+        using clock = std::chrono::steady_clock;
+        const auto deadline = clock::now() + std::chrono::seconds{10};
+        while (!pubLimitCounterExists(regId) && clock::now() < deadline) std::this_thread::yield();
+        ASSERT_TRUE(pubLimitCounterExists(regId)) << "the driver never allocated the registration";
+    }
+
+    // Drive gateway + client conductor (bounded) until the abandoned registration is fully released.
+    void expectReleased(int64_t regId, std::size_t pendingBefore) {
+        using clock = std::chrono::steady_clock;
+        const auto deadline = clock::now() + std::chrono::seconds{3};
+        for (int i = 0; i < kPumpIter && clock::now() < deadline; ++i) {
+            invokeConductor();
+            gw_->doWork(wallNowNs());
+            if (gw_->pendingConnectCount() == pendingBefore && !pubLimitCounterExists(regId)) break;
+            std::this_thread::sleep_for(std::chrono::microseconds{100});
+        }
+        EXPECT_EQ(gw_->pendingConnectCount(), pendingBefore) << "the draining registration never resolved";
+        EXPECT_FALSE(pubLimitCounterExists(regId))
+            << "the abandoned record-egress registration " << regId << " is still alive on the media driver (leaked)";
+    }
+
+    rune::node::WorkerPool pool_;
+};
+
+TEST_F(RecordEgressLifetimeRegression, ASessionClosedWhileItsEgressPubResolvesReleasesTheRegistrationRegression) {
+    auto client = makeClient(kEgressBase + 60);
+    const std::size_t before = gw_->pendingConnectCount();
+    int64_t sid = 0, regId = -1;
+    startInFlightEgress(client, sid, regId);
+    ASSERT_FALSE(HasFatalFailure());
+
+    gw_->closeSessionForTest(sid);   // same cycle: the registration is still AWAITING_MEDIA_DRIVER on the client
+
+    EXPECT_EQ(gw_->recordEgressRegIdForTest(sid, 0), -1) << "the close drops the pending entry";
+    EXPECT_GE(gw_->pendingConnectCount(), before + 1)
+        << "the abandoned in-flight registration must be queued for release, not forgotten";
+    expectReleased(regId, before);
+}
+
+TEST_F(RecordEgressLifetimeRegression, ATimedOutEgressPubResolveReleasesTheRegistrationRegression) {
+    auto client = makeClient(kEgressBase + 60);
+    const std::size_t before = gw_->pendingConnectCount();
+    int64_t sid = 0, regId = -1;
+    startInFlightEgress(client, sid, regId);
+    ASSERT_FALSE(HasFatalFailure());
+
+    // The resolve is still in flight when its timeout (default 5 s) is exceeded.
+    gw_->pollPendingRecordEgressForTest(wallNowNs() + 60'000'000'000LL);
+
+    EXPECT_EQ(gw_->recordEgressRegIdForTest(sid, 0), -1) << "the timeout drops the pending entry";
+    EXPECT_GE(gw_->pendingConnectCount(), before + 1)
+        << "the abandoned in-flight registration must be queued for release, not forgotten";
+    expectReleased(regId, before);
 }
 } // namespace
 } // namespace rune::gateway
