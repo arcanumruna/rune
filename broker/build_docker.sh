@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Usage: broker/build_docker.sh [extra docker buildx build args...]
 #
-# Builds the broker image as rune:<VERSION.txt>. With no extra args the image is loaded
+# Builds the published image (the broker plus the `rune` CLI: the Dockerfile's `release` target)
+# as rune:<VERSION.txt>. With no extra args the image is loaded
 # into the local docker; CI passes --push/--tag/--cache-* instead (see .github/workflows/broker-image.yml).
 #
 # Env:
@@ -34,9 +35,12 @@ ARGS=("$@")
 echo "🛠️  Building '$IMAGE_NAME:$VERSION'..."
 docker buildx build \
   --file docker/Dockerfile \
+  --target release \
   --build-context rune-protocol=../protocol \
   --build-context rune-codec=../codec \
   --build-context rune-crypto=../crypto \
+  --build-context rune-client=../client-cpp \
+  --build-context rune-ql=../ql \
   --build-context flight-recorder="$FLIGHT_RECORDER_DIR" \
   --build-arg CMAKE_BUILD_PARALLEL_LEVEL \
   --label org.opencontainers.image.version="$VERSION" \

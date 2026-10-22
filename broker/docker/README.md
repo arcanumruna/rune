@@ -56,8 +56,10 @@ broker/release.sh patch   # or minor / major; run on a clean main in sync with o
 
 The script turns `broker/VERSION.txt` from `X.Y.Z-snapshot` into `X.Y.Z`, tags `broker-vX.Y.Z`, sets the next
 snapshot and pushes the commits and the tag. The tag starts `.github/workflows/broker-image.yml`, which builds
-the image (linux/amd64) and publishes `ghcr.io/arcanumruna/rune:X.Y.Z` and `:latest`. Running the
-workflow by hand builds the image without publishing it.
+the image (linux/amd64, the `release` target: the broker plus the `rune` CLI) and publishes `arcanumruna/rune:X.Y.Z`
+and `:latest` on Docker Hub and `ghcr.io/arcanumruna/rune:X.Y.Z` and `:latest`. It also syncs the Docker Hub page from
+[DOCKERHUB.md](DOCKERHUB.md), again on every change to that file on main. Running the workflow by hand builds the
+image without publishing it.
 
 ---
 
