@@ -33,6 +33,22 @@ void SbeConsensusPublisher::termFloorNotice(NodeId toMember, NodeId fromMember, 
     sink_.send(toMember, buf_.data(), len);
 }
 
+// Issue #82 (VLS A.4).
+void SbeConsensusPublisher::readLeaseRequest(NodeId toMember, Term term, NodeId memberId, int64_t reqSeq,
+                                             int64_t heardGrantSeq)
+{
+    const auto len = ReadLeaseRequestMsg::encode(buf_.data(), 0, term, reqSeq, heardGrantSeq, memberId);
+    sink_.send(toMember, buf_.data(), len);
+}
+
+void SbeConsensusPublisher::readLeaseGrant(NodeId toMember, Term term, NodeId leaderMemberId, NodeId memberId,
+                                           int64_t reqSeq, int64_t grantSeq, int64_t commitPos, int64_t validForNs)
+{
+    const auto len = ReadLeaseGrantMsg::encode(buf_.data(), 0, term, reqSeq, grantSeq, commitPos, validForNs, memberId,
+                                               leaderMemberId);
+    sink_.send(toMember, buf_.data(), len);
+}
+
 void SbeConsensusPublisher::canvassPosition(
     NodeId  toMember,
     Term    logLeadershipTermId,

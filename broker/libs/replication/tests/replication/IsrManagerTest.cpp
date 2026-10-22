@@ -439,3 +439,40 @@ TEST(IsrManagerRegression, StalledFollowerStillShrunkByTimeGate) {
     EXPECT_FALSE(mgr.inIsr(kFollower2)) << "a follower stalled > lag window is still evicted";
     EXPECT_EQ(newIsr.size(), 2u);
 }
+
+// Issue #493 (PR #490): a new leader's first ISR check (10 ms after the takeover) must not count lag against a follower
+// that has not had a chance to fetch at the new epoch.  The offset gate uses the stale lastFetchOffset of an earlier
+// leadership (or 0) - once the log end passes replicaLagMaxOffset (1e9 on every broker) it evicted every follower and
+// the leader acked acks=all writes alone.  RED before the fix: the ISR collapses to {2}.
+TEST(IsrManagerRegression, ANewLeaderNeverOffsetLagEvictsAMemberThatHasNotFetchedSinceTheTakeoverAdversarialRegression) {
+    using rune::replication::IsrManager;
+    using rune::replication::NodeId;
+    IsrManager m({2, 1, 3}, /*leaderId=*/2, /*replicaLagMaxMs=*/10'000);
+    m.setIsr(std::vector<NodeId>{2, 1, 3});
+    const int64_t now = 5'000'000'000LL;
+    m.resetLagClock(now);   // the takeover (PartitionReplica's first leader doWork)
+    const auto& isr = m.maybeShrinkIsr(now + 10'000'000, /*leaderLeo=*/1'000'000'001LL, 10'000,
+                                       /*replicaLagMaxOffset=*/1'000'000'000LL);
+    EXPECT_EQ(isr.size(), 3u) << "a follower that has not fetched since the takeover was offset-lag evicted";
+    // Once it fetched at the new leadership, the offset gate applies again; and the time gate always did.
+    m.onFollowerFetch(1, /*fetchOffset=*/0, now + 20'000'000, /*leaderLeo=*/1'000'000'001LL);
+    const auto& isr2 = m.maybeShrinkIsr(now + 30'000'000, 1'000'000'001LL, 10'000, 1'000'000'000LL);
+    EXPECT_EQ(isr2, (std::vector<NodeId>{2, 3})) << "a fetch 1e9 behind is offset lag";
+    const auto& isr3 = m.maybeShrinkIsr(now + 10'000'000'001LL, 1'000'000'001LL, 10'000, 1'000'000'000LL);
+    EXPECT_EQ(isr3, (std::vector<NodeId>{2})) << "a silent member still leaves after replicaLagMaxMs";
+}
+
+// Issue #493, the same class: a committed ISR member the manager has no fetch state for (not in the replica set it was
+// built with - a reassignment) was timed from 0 and evicted at the first check after the takeover.  Its lag window
+// starts at the takeover like every other member's.
+TEST(IsrManagerRegression, AMemberWithNoFetchStateIsTimedFromTheTakeoverAdversarialRegression) {
+    using rune::replication::IsrManager;
+    using rune::replication::NodeId;
+    IsrManager m({2, 1}, /*leaderId=*/2, /*replicaLagMaxMs=*/10'000);
+    m.setIsr(std::vector<NodeId>{2, 1, 4});   // 4: no state
+    const int64_t now = 50'000'000'000LL;   // 50 s of uptime: a window timed from 0 has long lapsed
+    m.resetLagClock(now);
+    EXPECT_EQ(m.maybeShrinkIsr(now + 10'000'000, 100, 10'000, 1'000'000'000LL).size(), 3u)
+        << "a member never seen was evicted 10 ms after the takeover";
+    EXPECT_EQ(m.maybeShrinkIsr(now + 10'000'000'001LL, 100, 10'000, 1'000'000'000LL), (std::vector<NodeId>{2}));
+}

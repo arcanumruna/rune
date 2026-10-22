@@ -204,6 +204,53 @@ Interaction matrix (op × entity × timing):
 
 The partition cases also run as an e2e on k3s with iptables partitions.
 
+### A.8 Implementation notes (issues #82, #486, #491; 2026-10-22)
+
+Implemented: A.3, A.4, A.5.1, A.5.2 and A.5.5; A.5.3 is replaced by a controller-side move fence (below).  Where the code
+differs from the text above:
+
+- **Templates 63 / 64.** 62 is `TermFloorNotice`; `ReadLeaseRequest` is 63 and `ReadLeaseGrant` 64.
+- **A broker without a lease answers NotLeader, not NotReady** (the worker's not-leader sentinel: the gateway
+  redirects or answers a bare NotLeader).  The client retries NotLeader by itself within `ddlRetryBudget`, while
+  NotReady reaches the application.  A zombie cannot vouch for its own leadership, so NotLeader is the honest answer.
+- **commitPos is the controller's metadata log END**, not its committed position: a new controller's HW can lag what
+  its predecessor committed, and its log never does.
+- **W is a constant, `L(1+rho)^2` (about 204 ms), not `H(1+rho)^2`** (#491).  A holder caps every grant at `L`, so W
+  bounds every lease whatever the grantor's `H`: no per-node config skew can make a lease outlive it.
+- **The move fence (#486), instead of the new-leader gate (A.5.3) and `predecessorFenced`.** A metadata record that
+  takes leadership off broker A and leaves A out of the new ISR is appended only once no lease A holds can run:
+  - the controller is past W since its own leadership began (a predecessor's grants have ended), and no lease this
+    controller granted A may still run (`Election::readLeaseMoveFenceOpen`);
+  - meanwhile A's lease is no longer renewed (its requests are answered `validFor = 0`, the echo still counts, so QL
+    is unaffected; a controller A stops leasing itself), so the wait ends within one lease, about 120 ms;
+  - A keeps leading and acking writes during the wait; a dead A passes at once (it was judged dead only after its
+    lease ended);
+  - the record waits in `MetadataService::drainDynamicQueue`, the one point every decision path goes through
+    (controlled shutdown, untrusted storage, epoch-bump exclusions, LostCommitted and storage resets, failover, the
+    coordinator-partition bump), and the records behind it wait in order;
+  - grants after the append carry a commitPos above it, so FIFO keeps them behind the demotion.
+  A move that keeps A in the ISR (preferred-leader move, `electionExcluded`, coordinator steer) never waits: the new
+  leader's HW needs A's fetch at the new epoch, which A sends only after it applied the demotion.  A LATER record that
+  removes A from the ISR (the new leader's ISR shrink, a controlled shutdown of A, the election after a leaderless step)
+  goes through the same fence: the controller remembers per partition every real leader it replaced within the last W
+  (a bounded set, at most 4 per partition, pruned on expiry; on overflow every removal from that partition's ISR is
+  fenced until W after the overflowing move), and fences any removal of one of them.  A controller inside W of its own
+  takeover knows none of the moves before it, so it fences every removal from any ISR (cleared on step-down for the same
+  reason).  A fenced record waits only with the later records of its own partition: it never delays another
+  partition's records (a dead broker's coordinator-partition failover queued behind it included).
+- **ISR right after a takeover (#493).** A new leader's offset-lag gate counts only fetches made at its own
+  leadership, and a member with no fetch state is timed from the takeover: a leader change never collapses the ISR to
+  the new leader (which also made the case above reachable on the default config).  With every leader
+  change thus ordered after the predecessor's lease (or its demotion), the new leader cannot serve state the old one
+  lacks while the old one still serves, so the new-leader wait W of A.5.3 is redundant and is not implemented (#487).
+  Cost: a controlled shutdown or exclusion move commits up to about 120 ms later (within W of a controller's
+  election, up to W), and the moving broker's view reads answer NotLeader for that wait.
+- **A.5.4 (the client epoch fence) is not implemented**: it needs a client and wire change, and the lease already
+  bounds every stale read: #488.
+- **Fold barrier**: it holds a read only on a Ready table (a table still catching up answers NotReady at once), and a
+  held read is answered NotReady after 100 ms if the fold cannot reach its target.
+- **Rolling upgrade**: a lease needs the controller and a majority of the members on a build that has it.
+
 ---------------------------------------------------------------------------------------------------
 
 ## Part B — View-sink ownership and the explicit refusal

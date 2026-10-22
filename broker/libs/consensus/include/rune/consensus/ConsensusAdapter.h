@@ -109,6 +109,25 @@ public:
             }
             break;
         }
+        case ReadLeaseRequestMsg::TEMPLATE_ID: {   // issue #82
+            if (len < ReadLeaseRequestMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
+            if constexpr (requires(Handler& h) { h.onReadLeaseRequest(int64_t{}, Term{}, NodeId{}, int64_t{}, int64_t{}); }) {
+                const auto m = ReadLeaseRequestMsg::decode(buf, 0);
+                handler_.onReadLeaseRequest(nowNs, m.term, m.memberId, m.reqSeq, m.heardGrantSeq);
+            }
+            break;
+        }
+        case ReadLeaseGrantMsg::TEMPLATE_ID: {   // issue #82
+            if (len < ReadLeaseGrantMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
+            if constexpr (requires(Handler& h) {
+                              h.onReadLeaseGrant(int64_t{}, Term{}, NodeId{}, NodeId{}, int64_t{}, int64_t{}, int64_t{}, int64_t{});
+                          }) {
+                const auto m = ReadLeaseGrantMsg::decode(buf, 0);
+                handler_.onReadLeaseGrant(nowNs, m.term, m.leaderMemberId, m.memberId, m.reqSeq, m.grantSeq, m.commitPos,
+                                          m.validForNs);
+            }
+            break;
+        }
         case CandidacyStateMsg::TEMPLATE_ID: {
             if (len < CandidacyStateMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
             if constexpr (requires(Handler& h, CandidacyState& cs) { h.onCandidacyState(int64_t{}, NodeId{}, cs); }) {
@@ -220,6 +239,8 @@ private:
         case PreVoteResponseMsg::TEMPLATE_ID:   return len >= PreVoteResponseMsg::TOTAL_SIZE ? PreVoteResponseMsg::decode(buf, 0).voterId : -1;
         case TermFloorNoticeMsg::TEMPLATE_ID:   return len >= TermFloorNoticeMsg::TOTAL_SIZE ? TermFloorNoticeMsg::decode(buf, 0).fromMember : -1;
         case CandidacyStateMsg::TEMPLATE_ID:    return len >= CandidacyStateMsg::TOTAL_SIZE ? CandidacyStateMsg::decode(buf, 0).fromMember : -1;
+        case ReadLeaseRequestMsg::TEMPLATE_ID:  return len >= ReadLeaseRequestMsg::TOTAL_SIZE ? ReadLeaseRequestMsg::decode(buf, 0).memberId : -1;
+        case ReadLeaseGrantMsg::TEMPLATE_ID:    return len >= ReadLeaseGrantMsg::TOTAL_SIZE ? ReadLeaseGrantMsg::decode(buf, 0).leaderMemberId : -1;
         case RequestVoteMsg::TEMPLATE_ID:       return len >= RequestVoteMsg::TOTAL_SIZE ? RequestVoteMsg::decode(buf, 0).candidateMemberId : -1;
         case VoteMsg::TEMPLATE_ID:              return len >= VoteMsg::TOTAL_SIZE ? VoteMsg::decode(buf, 0).followerMemberId : -1;
         case NewLeadershipTermMsg::TEMPLATE_ID: return len >= NewLeadershipTermMsg::TOTAL_SIZE ? NewLeadershipTermMsg::decode(buf, 0).leaderMemberId : -1;

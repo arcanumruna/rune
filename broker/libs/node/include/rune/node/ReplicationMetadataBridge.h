@@ -142,6 +142,12 @@ public:
     [[nodiscard]] uint64_t leaderRolesHeldForTest() const noexcept { return leaderRolesHeld_; }
     /// Leader roles routed as HELD (not led) because the storage gate was closed; monotonic.  Step 10.
     [[nodiscard]] uint64_t leaderRolesHeld() const noexcept { return leaderRolesHeld_; }
+    /// Issue #82 (VLS A.5.1): role ops derived for worker `w` that its op ring has not accepted yet.  While any wait, a
+    /// view read lease is not handed to that worker (it would overtake a demotion).  Duty-cycle thread.
+    [[nodiscard]] bool roleOpsPendingFor(int32_t w) const noexcept {
+        return w >= 0 && static_cast<std::size_t>(w) < pendingRoleOps_.size() &&
+               !pendingRoleOps_[static_cast<std::size_t>(w)].empty();
+    }
 
     // -----------------------------------------------------------------------
     // setWorkerPool — wire the WorkerPool so role changes are routed to the

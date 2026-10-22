@@ -348,7 +348,11 @@ TEST(RingSbeRegression, AuthOpTypesAndTailKindsArePinned) {
     EXPECT_EQ(static_cast<int>(sbe::TailKind::Value::END_DETAIL), 10);
     EXPECT_EQ(sbe::TailKind::get(10), sbe::TailKind::Value::END_DETAIL);
     EXPECT_STREQ(sbe::TailKind::c_str(sbe::TailKind::Value::END_DETAIL), "END_DETAIL");
-    EXPECT_THROW((void)sbe::OpType::get(24), std::runtime_error);
+    // Issue #82: the view read lease (op ring, every worker).
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::READ_LEASE), 24);
+    EXPECT_EQ(sbe::OpType::get(24), sbe::OpType::Value::READ_LEASE);
+    EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::READ_LEASE), "READ_LEASE");
+    EXPECT_THROW((void)sbe::OpType::get(25), std::runtime_error);
     EXPECT_THROW((void)sbe::TailKind::get(11), std::runtime_error);
 }
 

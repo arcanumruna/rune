@@ -87,6 +87,7 @@
 #include <map>
 #include <span>
 #include <unordered_map>
+#include <rune/consensus/ReadLease.h>
 #include <unordered_set>
 #include <vector>
 
@@ -2009,6 +2010,9 @@ public:
     /// every record it would emit, of every topic id - the userDecisionHoldNs_ pattern widened) and no storage record
     /// is drained.  `maxNs` > 0: the hold lapses by itself after that long (control-thread clock).
     void setHoldAllDecisionsForTest(bool on) noexcept { holdAll_ = on; holdAllSinceNs_ = lastNowNs_; }
+    /// PR #490 review: committed metadata records are not applied (the map, the bridge's role ops and the lease fanout
+    /// freeze) until released - a broker whose metadata apply lags the controller.
+    void holdMetadataApplyForTest(bool on) noexcept { applyHeldForTest_ = on; }
     void setHoldAllDecisionsMaxForTest(int64_t maxNs) noexcept { holdAllMaxNs_ = maxNs; }
     [[nodiscard]] bool holdAllDecisionsActiveForTest() const noexcept { return holdAllActive_(); }
     /// Counter sources (kStoragePendingNodesCounterTypeId / kLostCommittedReportsCounterTypeId).
@@ -2515,6 +2519,7 @@ public:
         if (amLeader) maybeConfirmSingleNodeLineages_();   // C1 (single node only)
         if (amLeader) retryUnplaceable_();                  // Task 11 fix round 1 (I1/I2)
         pruneUnservable_(nowNs);                            // Task 11 fix round 4
+        if (applyHeldForTest_) [[unlikely]] return 0;       // PR #490 review seam: a broker whose metadata apply lags
         if (hw <= 0 || hw <= lastApplied_) {
             // Nothing new to apply.  Still call commit() so pending records
             // already decoded in a prior partial cycle get committed.
@@ -2824,6 +2829,7 @@ private:
         // leader re-decides from the committed map.
         pendingDynamicRecords_.clear();
         inflight_.clear();
+        predecessors_.clear();   // issue #486: a re-claim's own past-W rule covers the moves before it
         pendingLineageRecords_.clear();   // C1: the next controller re-decides (leaders re-send)
         lineageInflight_.clear();
         pendingRemovalRecords_.clear();   // Task 8: removedTopics_ is kept — the next controller removes
@@ -2863,6 +2869,22 @@ public:
     }
     /// This node is the ready controller (it leads the consensus and its map reflects its whole log).
     [[nodiscard]] bool mapControls() const noexcept { return controllerReady_(); }
+    /// Issue #486 (VLS A.8): the read-lease fence of a leader move.  fn(ctx, oldLeader, nowNs): no lease anyone granted
+    /// `oldLeader` can still run (Election::readLeaseMoveFenceOpen).  nullptr (single node, tests) = always open.
+    using LeaderMoveFence = bool (*)(void* ctx, int32_t oldLeader, int64_t nowNs) noexcept;
+    void setLeaderMoveFence(LeaderMoveFence fn, void* ctx) noexcept { moveFenceFn_ = fn; moveFenceCtx_ = ctx; }
+    /// Issue #486: the nodes a queued move waits on (bit = node id) - the controller stops renewing their lease, so the
+    /// wait ends within one lease (~120 ms).  Recomputed every drain.  Control thread.
+    [[nodiscard]] uint32_t leaseWithheldMask() const noexcept { return leaseWithheldMask_; }
+    [[nodiscard]] uint64_t movesFencedForTest() const noexcept { return movesFenced_; }
+    /// Issue #82 (VLS A.5.1): every metadata record below this offset is applied to the committed map (the bridge
+    /// derives the role ops from it).  Control thread.
+    [[nodiscard]] int64_t appliedEnd() const noexcept { return lastApplied_ < 0 ? 0 : static_cast<int64_t>(lastApplied_); }
+    /// Issue #82: this node's metadata log end - on the controller, at or above every committed record (a new controller's
+    /// HW may still lag what its predecessor committed; its log never does), so a lease grant's commitPos.  Control thread.
+    [[nodiscard]] int64_t logEndForLease() const noexcept {
+        return replica_ != nullptr ? static_cast<int64_t>(replica_->logEndOffset()) : 0;
+    }
     /// The metadata leader's answers this node's metadata replica accepted (monotonic).
     [[nodiscard]] uint64_t mapLeaderAnswers() const noexcept { return replica_ != nullptr ? replica_->leaderAnswers() : 0; }
 private:
@@ -3202,6 +3224,7 @@ private:
     }
 
     void drainDynamicQueue() {
+        leaseWithheldMask_ = 0;   // issue #486: recomputed below (a move that still waits sets its old leader's bit)
         if (pendingDynamicRecords_.empty() && pendingLineageRecords_.empty() && pendingRemovalRecords_.empty() &&
             pendingStorageRecords_.empty() && pendingFeatureLevel_ <= msm_.featureLevel())
             return;
@@ -3249,10 +3272,16 @@ private:
             ++cycleRecords;
         }
 
-        while (!pendingDynamicRecords_.empty()) {
+        // Issue #486 (PR #490 eos-e2e / re-check 3): a fenced record waits with the later records of ITS partition
+        // (per-partition order), never with other partitions' - a fenced move never delays, e.g., the failover of the
+        // coordinator partitions queued behind it.
+        fencedKeys_.clear();
+        for (std::size_t qi = 0; qi < pendingDynamicRecords_.size();) {
             if (cycleRecords >= kMaxRecordsPerBatch) break;
 
-            const auto& br = pendingDynamicRecords_.front();
+            const auto& br = pendingDynamicRecords_[qi];
+            const int64_t key = partitionKey_(br.rec.topicId, br.rec.partition);
+            if (std::find(fencedKeys_.begin(), fencedKeys_.end(), key) != fencedKeys_.end()) { ++qi; continue; }
             std::size_t n = br.rec.encode(encBuf, kEncBufSize);
             if (n != 0 && br.mark.kind != rune::metadata::LeaderlessMark::Kind::None) {
                 // D15: the leaderless mark rides as a trailer older MSMs ignore.
@@ -3261,10 +3290,28 @@ private:
             }
             if (n == 0) {
                 // Encode overflow — skip this record (should not occur at Phase-1 scale).
-                pendingDynamicRecords_.pop_front();
+                pendingDynamicRecords_.erase(pendingDynamicRecords_.begin() + static_cast<std::ptrdiff_t>(qi));
                 continue;
             }
             if (cycleBytes + n > kMaxBatchBytes) break;
+
+            // Issue #486 (VLS A.8): a record that takes leadership off a broker and leaves it out of the ISR, or removes
+            // a recent predecessor from it, lets the new leader commit without that broker - while it, until it applies
+            // the change, may still serve view reads under a lease granted before it.  So such a record is appended only
+            // once no lease that broker holds can run (fencedPredecessor_).  It waits with its partition's later records;
+            // the broker keeps leading / following and acking meanwhile, and its lease is no longer renewed, so the wait
+            // ends within one lease (~120 ms; at once for a dead broker, whose lease ran out before it was judged dead).
+            // Grants after the append carry a commitPos above it: FIFO keeps them behind the demotion.
+            if (moveFenceFn_ != nullptr) {
+                if (const int32_t old = fencedPredecessor_(br); old >= 0) {
+                    if (old < 32) leaseWithheldMask_ |= 1u << static_cast<uint32_t>(old);
+                    ++movesFenced_;
+                    fencedKeys_.push_back(key);
+                    ++qi;
+                    continue;
+                }
+            }
+            const int32_t prevLeader = currentLeader_(br.rec.topicId, br.rec.partition);
 
             // Never ignore the result: a refusal (no longer the leader)
             // keeps the record queued, in order.
@@ -3277,11 +3324,12 @@ private:
                 ir.leader = br.rec.leaderNode;
                 ir.n      = static_cast<uint8_t>(std::min<std::size_t>(br.isr.size(), ir.isr.size()));
                 for (std::size_t i = 0; i < ir.n; ++i) ir.isr[i] = br.isr[i];
-                inflight_[partitionKey_(br.rec.topicId, br.rec.partition)] = ir;
+                inflight_[key] = ir;
             }
+            notePredecessor_(br, prevLeader);
             cycleBytes   += n;
             cycleRecords += 1;
-            pendingDynamicRecords_.pop_front();
+            pendingDynamicRecords_.erase(pendingDynamicRecords_.begin() + static_cast<std::ptrdiff_t>(qi));
         }
 
         // ISR v3 (I-S2): storage records drain AFTER the assignment records of the same pass, so log order puts every
@@ -3328,6 +3376,102 @@ private:
     /// committed) assignment record.
     /// v2-review I4: an appended-not-committed assignment record, with the CONTENT the storage confirmation needs
     /// (a record that adds a node to a leader/ISR blocks that node's confirmation).
+    /// Issue #486: the leader a queued record replaces - the latest appended record's (in flight), else the committed
+    /// one (-1: none / leaderless).
+    [[nodiscard]] int32_t currentLeader_(int32_t topicId, int32_t partition) const noexcept {
+        if (const auto it = inflight_.find(partitionKey_(topicId, partition)); it != inflight_.end()) return it->second.leader;
+        if (const auto* pa = msm_.assignment(topicId, partition)) return pa->leaderNode;
+        return -1;
+    }
+    /// Issue #486 (PR #490 re-checks): per partition, every REAL leader replaced by a leader change this controller
+    /// appended within the last W (never -1: a leaderless step does not hide one), with when.  Until W after its move,
+    /// a lease that predecessor was granted before the move may still run, so any record removing it from the ISR goes
+    /// through the fence - a later ISR shrink by a new leader or a controlled shutdown included, after any number of
+    /// moves.  Bounded: at most kMaxPredecessors per partition, pruned on expiry; on overflow it fails CLOSED (every
+    /// removal from that partition's ISR is fenced until W after the overflowing move).  Cleared on a controller
+    /// step-down: a controller inside W of its own takeover fences every removal anyway (controllerYoung_).
+    static constexpr std::size_t kMaxPredecessors = 4;
+    struct Predecessor { int32_t node = -1; int64_t movedAtNs = 0; };
+    struct Predecessors {
+        std::array<Predecessor, kMaxPredecessors> e{};
+        std::size_t n = 0;
+        int64_t overflowAtNs = INT64_MIN / 2;
+        int32_t lastReal = -1;   ///< the most recent real leader replaced (the leader a leaderless step hides)
+    };
+    std::unordered_map<int64_t, Predecessors> predecessors_;
+    /// The live predecessors of a partition (expired entries pruned); nullptr when none.
+    Predecessors* livePredecessors_(int64_t key) noexcept {
+        const auto it = predecessors_.find(key);
+        if (it == predecessors_.end()) return nullptr;
+        Predecessors& ps = it->second;
+        const int64_t w = rune::consensus::kReadLeaseFenceWaitNs;
+        for (std::size_t i = 0; i < ps.n;) {
+            if (lastNowNs_ - ps.e[i].movedAtNs >= w) ps.e[i] = ps.e[--ps.n]; else ++i;
+        }
+        if (ps.n == 0 && lastNowNs_ - ps.overflowAtNs >= w) { predecessors_.erase(it); return nullptr; }
+        return &ps;
+    }
+    /// Issue #486 (PR #490 re-check 2): a controller inside W of its own takeover does not know the moves before it;
+    /// every removal from an ISR is fenced then.  fn(ctx, nowNs) = past that W.  nullptr (unit tests) = always young.
+public:
+    using ControllerSettled = bool (*)(void* ctx, int64_t nowNs) noexcept;
+    void setControllerSettled(ControllerSettled fn, void* ctx) noexcept { settledFn_ = fn; settledCtx_ = ctx; }
+private:
+    ControllerSettled settledFn_  = nullptr;
+    void*             settledCtx_ = nullptr;
+    [[nodiscard]] bool controllerYoung_() const noexcept {
+        return settledFn_ == nullptr || !settledFn_(settledCtx_, lastNowNs_);
+    }
+    /// The first broker a queued record must wait on whose fence is closed (-1: none).  A member the record removes from
+    /// the ISR (or the leader it replaces, when it leaves that leader out) waits when it is the replaced leader, a live
+    /// predecessor, the partition's predecessors overflowed, or this controller is inside its first W.  A record that
+    /// keeps the old leader in the ISR never waits.
+    [[nodiscard]] int32_t fencedPredecessor_(const rune::metadata::BalancerRecord& br) noexcept {
+        const int64_t key = partitionKey_(br.rec.topicId, br.rec.partition);
+        const auto inNew = [&](int32_t n) { for (const int32_t m : br.isr) if (m == n) return true; return false; };
+        Predecessors* ps = livePredecessors_(key);
+        const bool young = controllerYoung_();
+        const bool overflow = ps != nullptr && lastNowNs_ - ps->overflowAtNs < rune::consensus::kReadLeaseFenceWaitNs;
+        const auto isPredecessor = [&](int32_t n) {
+            if (ps == nullptr) return false;
+            for (std::size_t i = 0; i < ps->n; ++i) if (ps->e[i].node == n) return true;
+            return false;
+        };
+        int32_t old = currentLeader_(br.rec.topicId, br.rec.partition);
+        if (old < 0 && ps != nullptr) old = ps->lastReal;   // a leaderless step: the last real leader
+        const auto check = [&](int32_t n) -> bool {   // true = must wait on n
+            if (n < 0 || n == br.rec.leaderNode || inNew(n)) return false;
+            const bool fenceIt = n == old || isPredecessor(n) || overflow || young;
+            return fenceIt && !moveFenceFn_(moveFenceCtx_, n, lastNowNs_);
+        };
+        if (check(old)) return old;
+        // Every member the record removes from the current (in-flight, else committed) ISR.
+        if (const auto it = inflight_.find(key); it != inflight_.end()) {
+            for (std::size_t i = 0; i < it->second.n; ++i) if (check(it->second.isr[i])) return it->second.isr[i];
+        } else if (const auto* pa = msm_.assignment(br.rec.topicId, br.rec.partition)) {
+            for (const int32_t m : pa->isr) if (check(m)) return m;
+        }
+        return -1;
+    }
+    /// After an append: a leader change remembers the real leader it replaced (a leaderless record included).
+    void notePredecessor_(const rune::metadata::BalancerRecord& br, int32_t prevLeader) {
+        if (prevLeader == br.rec.leaderNode) return;   // no leader change
+        const int64_t key = partitionKey_(br.rec.topicId, br.rec.partition);
+        Predecessors* live = livePredecessors_(key);
+        const int32_t real = prevLeader >= 0 ? prevLeader : (live != nullptr ? live->lastReal : -1);
+        Predecessors& ps = live != nullptr ? *live : predecessors_[key];
+        if (real < 0) return;
+        ps.lastReal = real;
+        for (std::size_t i = 0; i < ps.n; ++i)
+            if (ps.e[i].node == real) { ps.e[i].movedAtNs = lastNowNs_; return; }
+        if (ps.n < kMaxPredecessors) ps.e[ps.n++] = Predecessor{real, lastNowNs_};
+        else ps.overflowAtNs = lastNowNs_;   // fail closed: every removal waits until W after this move
+    }
+    std::vector<int64_t> fencedKeys_;   ///< issue #486: partitions whose head record is fenced this drain (reused)
+    LeaderMoveFence moveFenceFn_  = nullptr;
+    void*           moveFenceCtx_ = nullptr;
+    uint32_t        leaseWithheldMask_ = 0;
+    uint64_t        movesFenced_ = 0;
     struct InflightRec {
         rune::replication::Offset at = 0;                   ///< the metadata-log end offset after its append
         int32_t                   leader = -1;
@@ -3413,6 +3557,7 @@ private:
     uint64_t  lostCommittedReports_ = 0;   ///< Step 11 increments it
     bool      dropNextStorageAppend_ = false;
     bool      holdAll_ = false;                 ///< setHoldAllDecisionsForTest
+    bool      applyHeldForTest_ = false;        ///< PR #490 review: holdMetadataApplyForTest
     int64_t   holdAllSinceNs_ = 0, holdAllMaxNs_ = 0;
     [[nodiscard]] bool holdAllActive_() const noexcept {
         return holdAll_ && holdAllMaxNs_ > 0 && lastNowNs_ < holdAllSinceNs_ + holdAllMaxNs_;

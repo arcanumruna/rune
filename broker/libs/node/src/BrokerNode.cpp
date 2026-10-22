@@ -2894,6 +2894,26 @@ void BrokerNode::buildGateway() {
     runtimeAgent_->setCanvassPublisher(publisher_.get());
     runtimeAgent_->setBootHistory(bootHistory_);
     runtimeAgent_->setFailoverTimeoutOverrideNs(config_.brokerLivenessTimeoutMs * 1'000'000LL);
+    // Issue #82 (VLS Part A): a multi-node broker serves a view row only under a controller-granted read lease, handed
+    // to each worker behind the role ops it covers.  A single node leads alone: unbounded.  Issue #486: the controller
+    // commits a leader move that drops the old leader from the ISR only once that leader's lease has ended.
+    if (!config_.isSingleNode() && election_ && workerPool_) {
+        for (int32_t i = 0; i < workerPool_->workerCount(); ++i) workerPool_->worker(i).requireViewReadLease();
+        runtimeAgent_->enableReadLeaseFanout(workerPool_->workerCount());
+        if (metadataService_)
+            metadataService_->setLeaderMoveFence(
+                [](void* e, int32_t old, int64_t nowNs) noexcept {
+                    return static_cast<const rune::consensus::Election*>(e)->readLeaseMoveFenceOpen(old, nowNs);
+                }, election_.get());
+        if (metadataService_)
+            metadataService_->setControllerSettled(
+                [](void* e, int64_t nowNs) noexcept {
+                    return static_cast<const rune::consensus::Election*>(e)->readLeaseControllerSettled(nowNs);
+                }, election_.get());
+        if (metadataService_)
+            election_->setReadLeaseCommitPosSource(
+                [](void* m) noexcept { return static_cast<MetadataService*>(m)->logEndForLease(); }, metadataService_.get());
+    }
     if (config_.testCandidacyHoldAtBoot && !config_.isSingleNode()) runtimeAgent_->setTestCandidacyHold(true);   // R-I1
     // Controlled shutdown (Kafka parity): multi-node only — a single node has
     // nobody to hand off to (begin completes at once).  The controller's

@@ -138,6 +138,12 @@ struct WorkerOp {
         // pushes nothing more.  Never ownership-gated.  (The lifecycle ring's fence is a SessionPermissions op with
         // kPermFlagFence.)
         EnforceFence              = 23, ///< control → worker: acknowledge every op queued before this one
+        // Issue #82 (VLS A.5.1): control → EVERY worker on its OP ring (cold: at most one per lease grant, ~50/s): the
+        // view read lease.  nextOffset = the lease end on the LEASE clock (rune/consensus/LeaseClock.h); INT64_MAX =
+        // unbounded (single node).  The worker keeps the maximum (Worker::viewLeaseEndNs_).  ReadLeaseFanout enqueues it
+        // only behind every role op derived from the metadata the grant covered (FIFO: a lease never overtakes a
+        // demotion).  Never ownership-gated.
+        ReadLease                 = 24, ///< control → worker: a view read lease (lease-clock end in nextOffset)
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the

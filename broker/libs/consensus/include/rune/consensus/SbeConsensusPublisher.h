@@ -45,6 +45,9 @@ public:
                         NodeId candidateId) override;
     void preVoteResponse(NodeId toMember, Term term, NodeId voterId, bool granted, Term voterTermId) override;
     void termFloorNotice(NodeId toMember, NodeId fromMember, Term floorTermId, Term refusedTermId) override;
+    void readLeaseRequest(NodeId toMember, Term term, NodeId memberId, int64_t reqSeq, int64_t heardGrantSeq) override;
+    void readLeaseGrant(NodeId toMember, Term term, NodeId leaderMemberId, NodeId memberId, int64_t reqSeq,
+                        int64_t grantSeq, int64_t commitPos, int64_t validForNs) override;
 
     void canvassPosition(
         NodeId  toMember,

@@ -469,6 +469,16 @@ public:
         if (it == views_.end()) return std::nullopt;
         return it->second.foldLeadership;
     }
+    /// The serve path's view of one hosted instance (one lookup): the leadership it is caught up under and how far it
+    /// folded (issue #82, the read-your-writes barrier).  nullptr leadership = not hosted.
+    struct InstanceServeState { uint64_t leadership = 0; int64_t foldCursor = 0; bool hosted = false; bool ready = false; };
+    [[nodiscard]] InstanceServeState instanceServeState(int32_t viewTopicId, int32_t partition) const noexcept {
+        const auto it = views_.find(instKey(viewTopicId, partition));
+        if (it == views_.end()) return {};
+        return InstanceServeState{it->second.foldLeadership, it->second.foldCursor, true,
+                                  it->second.readiness == ViewReadiness::Ready};
+    }
+
     /// VLS B.3: is `topicId` a view this worker has the plan of -- i.e. a view SINK id?  Pure read of worker-owned
     /// state (the plan install ring carries every view id to every worker).
     [[nodiscard]] bool isViewSink(int32_t topicId) const noexcept { return templates_.find(topicId) != templates_.end(); }
@@ -741,6 +751,7 @@ private:
     std::vector<uint8_t>                rowScratch_;
 
     uint64_t capacityExceeded_ = 0;
+
 };
 
 } // namespace rune::node
