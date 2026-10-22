@@ -864,7 +864,6 @@ struct LeaseRig {
         layout = comp.rowLayout;
         vs = std::make_unique<WorkerViewSet>(channel, tmpDir("rune-views-lease-" + tag));
         vs->installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
-        vs->setLeaseClockForTest(&leaseNow);
         batch = oneUpsert(7, hp);
         auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
             return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
@@ -1069,39 +1068,6 @@ TEST(ViewReadLeaseRegression, TheFanoutGatesEachWorkerOnAppliedMetadataAndItsOwn
     EXPECT_EQ(fan.step(holder, 55, pendingFor, enqueue), 0) << "the newer grant's metadata is not applied: the older lease stands";
     EXPECT_EQ(fan.step(holder, 60, pendingFor, enqueue), 3);
     EXPECT_GT(fan.deliveredForTest(0), e1);
-}
-
-// VLS A.5.3 / A.7 (ViewReadLeaseRebalanceRegression, time path): a broker that just became the source leader serves
-// its view only W after it first drove the table under the new leadership - every lease its predecessor was granted
-// before the change has ended by then.  W = 0 (a single node) serves at once.
-// RED (predecessorFenced_ removed from the Ready flips): OK right after the promotion.
-TEST(ViewReadLeaseRegression, ANewSourceLeaderServesOnlyAfterThePredecessorFenceWaitRegression) {
-    for (const bool persisted : {false, true}) {
-        SCOPED_TRACE(persisted ? "persisted view" : "transient view");
-        LagHarness h(persisted, persisted ? "fwp" : "fwt");
-        int64_t leaseNow = 2'000'000'000;
-        constexpr int64_t kW = 153'015'000;   // leaseFenceWaitNs(150 ms)
-        h.vs->setLeaseClockForTest(&leaseNow);
-        h.vs->setPredecessorFenceWaitNs(kW);
-        ASSERT_NO_FATAL_FAILURE(appendTruth(h.t, 3));
-        ASSERT_NO_FATAL_FAILURE(feed(h.t, h.f, 0, /*hw=*/3, 1));
-        h.f.replica->becomeLeader(/*epoch=*/2, {kNodeF});   // promoted: a one-member ISR commits alone
-        h.passes(10);
-        ASSERT_TRUE(h.vs->instanceLeadership(kViewTopicId, 0).has_value()) << "the fold ran (vacuity guard)";
-        EXPECT_EQ(h.read(1).first, kNotReady) << "inside W: the predecessor may still serve under an older lease";
-        leaseNow += kW - 1;
-        h.passes(2);
-        EXPECT_EQ(h.read(1).first, kNotReady) << "1 ns before W";
-        leaseNow += 1;
-        EXPECT_EQ(h.awaitOk(1), 10) << "W passed: served";
-        // A later leadership of the same broker waits again.
-        h.f.replica->becomeFollower(/*leaderEpoch=*/3, kNodeT);
-        h.f.replica->becomeLeader(/*epoch=*/4, {kNodeF});
-        h.passes(5);
-        EXPECT_EQ(h.read(1).first, kNotReady);
-        leaseNow += kW;
-        EXPECT_EQ(h.awaitOk(1), 10);
-    }
 }
 
 // VLS A.5.5 / A.7 ViewReadYourWriteRegression: a write acked (committed) right before a GetViewRow on the TRUE leader

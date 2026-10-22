@@ -45,7 +45,8 @@ TEST(ReadLeaseRegression, DriftMathShrinksAndGrowsByOnePlusRhoSquaredRegression)
     EXPECT_EQ(leaseShrinkByDrift(150 * kMs), 147'044'407);   // floor(150e6 * 10000 / 10201)
     EXPECT_EQ(leaseGrowByDrift(10'000), 10'201);
     EXPECT_EQ(leaseGrowByDrift(150 * kMs), 153'015'000);
-    EXPECT_EQ(leaseFenceWaitNs(kH), leaseGrowByDrift(kH));
+    EXPECT_EQ(kReadLeaseFenceWaitNs, leaseGrowByDrift(kReadLeaseMaxNs)) << "#491: W from the wire cap L, never a node's own H";
+    EXPECT_EQ(kReadLeaseFenceWaitNs, 204'020'000);
     // No overflow at the extremes, and shrink(grow(x)) <= x <= grow(shrink(x)) + rounding.
     EXPECT_GT(leaseShrinkByDrift(INT64_MAX), 0);
     for (int64_t x : {int64_t{1}, int64_t{7}, 10'000 * kMs, 123'456'789'012LL}) {
@@ -438,7 +439,7 @@ TEST(ElectionReadLeaseRegression, ANewControllersFailoverGraceCoversEveryLeaseOf
     // A liveness timeout shorter than W (a lease the previous controller granted may still run): the grace is W.
     NodeId out[8];
     const int64_t w = r.e.readLeaseFenceWaitNs();
-    EXPECT_EQ(w, leaseFenceWaitNs(kElectionTimeoutNs));
+    EXPECT_EQ(w, kReadLeaseFenceWaitNs);
     // Inside W of the leadership start every member is eligible, whatever the timeout; after W the silent ones go.
     // (The grace runs from the first leader state, at most a few ms before `now`.)
     std::size_t n = r.e.eligibleNodeIds(now + 2 * kMs, 1 * kMs, out, 8);
@@ -517,4 +518,71 @@ TEST(ReadLeaseRegression, GrantorNeverGrantsPastHUnderAnyEchoPatternAdversarialR
         for (const NodeId bad : {NodeId{0}, NodeId{-1}, NodeId{31}, NodeId{32}, static_cast<NodeId>(n)})
             EXPECT_LT(gr.onRequest(bad, 1, now).grantSeq, 0) << "member " << bad;
     }
+}
+
+// Issue #486 (VLS A.8): the fence a leader move that drops the old leader from the ISR waits on.  Open only when this
+// node is the CLOSED leader, past W since its leadership began (a predecessor's grants have ended), and no lease it
+// granted the old leader may still run.  A withheld member's requests are answered validFor 0 (the echo still counts,
+// so QL keeps advancing); a withheld controller stops leasing itself.  The wait is bounded: with renewal withheld, the
+// last lease ends within L.
+// RED: the W term removed (opens inside the first W); the leaseMayRun term removed (opens under a running lease);
+// setWithheld ignored (the lease keeps being renewed: the fence never opens).
+TEST(ElectionReadLeaseRegression, TheMoveFenceOpensOnlyPastWOnceTheOldLeadersLeaseEndedRegression) {
+    Rig r(0);
+    int64_t now = 1'000 * kMs;
+    EXPECT_FALSE(r.e.readLeaseMoveFenceOpen(1, now)) << "not the leader";
+    ASSERT_NO_FATAL_FAILURE(leaderClosed(r, now));
+    const Term term = r.e.leadershipTermId();
+    EXPECT_FALSE(r.e.readLeaseMoveFenceOpen(2, now)) << "inside W: even a member this controller never leased waits";
+    EXPECT_FALSE(r.e.readLeaseMoveFenceOpen(2, now + kReadLeaseFenceWaitNs - 50 * kMs)) << "the grace began a few ms before now";
+    EXPECT_TRUE(r.e.readLeaseMoveFenceOpen(2, now + kReadLeaseFenceWaitNs + kMs)) << "past W, never leased: open";
+    // Member 1 holds a ~127 ms lease.
+    r.e.onReadLeaseRequest(now, term, 1, 1, 0);
+    r.e.onReadLeaseRequest(now, term, 2, 1, 0);
+    const int64_t g1 = r.pub.grants[0].grantSeq, g2 = r.pub.grants[1].grantSeq;
+    r.leaseNow += 20 * kMs;
+    r.e.onReadLeaseRequest(now, term, 2, 2, g2);
+    r.e.onReadLeaseRequest(now, term, 1, 2, g1);
+    const int64_t valid = r.pub.grants.back().validFor;
+    ASSERT_GT(valid, 100 * kMs);
+    EXPECT_FALSE(r.e.readLeaseMoveFenceOpen(1, now)) << "inside W of this leadership: a predecessor's lease may run";
+    now += kReadLeaseFenceWaitNs;
+    EXPECT_FALSE(r.e.readLeaseMoveFenceOpen(1, now)) << "member 1's lease may still run";
+    // Withheld: member 1's next requests get no lease, but its echo keeps QL moving for everyone else.
+    r.e.setReadLeaseWithheld(1u << 1);
+    r.leaseNow += 20 * kMs;
+    r.e.onReadLeaseRequest(now, term, 1, 3, r.pub.grants.back().grantSeq);
+    EXPECT_EQ(r.pub.grants.back().validFor, 0) << "a withheld member's lease is not renewed";
+    r.e.onReadLeaseRequest(now, term, 2, 3, r.pub.grants[2].grantSeq);
+    EXPECT_GT(r.pub.grants.back().validFor, 0) << "the others are still leased";
+    EXPECT_FALSE(r.e.readLeaseMoveFenceOpen(1, now)) << "its last lease still runs";
+    r.leaseNow += valid;   // past the end of the last lease member 1 was granted
+    EXPECT_TRUE(r.e.readLeaseMoveFenceOpen(1, now)) << "bounded: the last lease ended";
+}
+
+TEST(ElectionReadLeaseRegression, AWithheldControllerStopsLeasingItselfAndItsOwnMoveWaitsRegression) {
+    Rig r(0);
+    int64_t now = 1'000 * kMs;
+    ASSERT_NO_FATAL_FAILURE(leaderClosed(r, now));
+    const Term term = r.e.leadershipTermId();
+    r.e.onReadLeaseRequest(now, term, 1, 1, 0);
+    r.leaseNow += 20 * kMs;
+    r.e.onReadLeaseRequest(now, term, 1, 2, r.pub.grants.back().grantSeq);
+    now += kStatusIntervalNs;
+    r.e.doWork(now);   // the self lease
+    const int64_t selfEnd = r.e.readLease().latestEndNs();
+    ASSERT_GT(selfEnd, r.leaseNow);
+    now += kReadLeaseFenceWaitNs;
+    EXPECT_FALSE(r.e.readLeaseMoveFenceOpen(0, now)) << "the controller's own lease may still run";
+    r.e.setReadLeaseWithheld(1u << 0);
+    for (int i = 0; i < 20; ++i) {
+        now += kStatusIntervalNs;
+        r.e.onAppendPosition(now, term, r.e.appendPosition(), 1, 0);   // the followers stay active
+        r.e.onAppendPosition(now, term, r.e.appendPosition(), 2, 0);
+        r.e.doWork(now);
+    }
+    ASSERT_TRUE(r.e.isClosed());
+    EXPECT_EQ(r.e.readLease().latestEndNs(), selfEnd) << "a withheld controller never renews its own lease";
+    r.leaseNow = selfEnd + kReadLeaseMaxNs;
+    EXPECT_TRUE(r.e.readLeaseMoveFenceOpen(0, now));
 }

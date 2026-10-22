@@ -58,7 +58,6 @@
 #include <rune/view/ViewTable.h>
 
 #include <rune/node/ViewSnapshotChannel.h>
-#include <rune/consensus/LeaseClock.h>
 
 namespace rune::node {
 
@@ -226,10 +225,6 @@ struct ViewInstance {
     // only while it equals the replica's CURRENT generation (an ex-leader's frozen
     // table, or a new leader's not-yet-folded one, is never served).
     uint64_t                           foldLeadership  = 0;
-    // Issue #82 (VLS A.5.3): when THIS worker first drove the table under foldLeadership (lease clock).  A new
-    // leadership is served only W after it (WorkerViewSet::setPredecessorFenceWaitNs): every lease the predecessor was
-    // granted before the leader change has ended by then, so the two never both serve.
-    int64_t                            leaderSinceNs   = 0;
 
     // Cumulative fold-anomaly counters (see ViewFoldCounters).
     ViewFoldCounters                   counters;
@@ -392,9 +387,7 @@ public:
             if (inst.foldCursor >= committedTail) {
                 // N-C1: Ready only once the leader's HW reached its leadership start offset; else CatchingUp
                 // (never left RebuildingViews: that state gates elections).
-                // Issue #82 (VLS A.5.3): and only W after this leadership began here (predecessorFenced_).
-                inst.readiness = leaderHwConfirmed && predecessorFenced_(inst) ? ViewReadiness::Ready
-                                                                               : ViewReadiness::CatchingUp;
+                inst.readiness = leaderHwConfirmed ? ViewReadiness::Ready : ViewReadiness::CatchingUp;
                 // Task 19b: once EVERY hosted instance of this view is Ready, drop
                 // it from recoveryViews_ so hasRecovery() latches back to false —
                 // otherwise driveViews_ would pay the recovery-materialize +
@@ -485,12 +478,7 @@ public:
         return InstanceServeState{it->second.foldLeadership, it->second.foldCursor, true,
                                   it->second.readiness == ViewReadiness::Ready};
     }
-    /// Issue #82 (VLS A.5.3): W - a new source leadership is served only this long (lease clock) after this worker first
-    /// drove the table under it.  0 (default: a single node, unit tests) = no wait.  Before the runner starts.
-    void setPredecessorFenceWaitNs(int64_t ns) noexcept { predecessorFenceWaitNs_ = ns > 0 ? ns : 0; }
-    [[nodiscard]] int64_t predecessorFenceWaitNs() const noexcept { return predecessorFenceWaitNs_; }
-    /// Test seam: read the lease clock from `*now` (single-threaded drivers only).
-    void setLeaseClockForTest(const int64_t* now) noexcept { leaseNowOverride_ = now; }
+
     /// VLS B.3: is `topicId` a view this worker has the plan of -- i.e. a view SINK id?  Pure read of worker-owned
     /// state (the plan install ring carries every view id to every worker).
     [[nodiscard]] bool isViewSink(int32_t topicId) const noexcept { return templates_.find(topicId) != templates_.end(); }
@@ -621,9 +609,6 @@ private:
         if (inst.foldLeadership != leaderGen) {
             inst.foldLeadership = leaderGen;
             if (inst.readiness == ViewReadiness::Ready) inst.readiness = ViewReadiness::CatchingUp;   // N-C1: unconditional
-            // Issue #82 (VLS A.5.3): the new leadership's predecessor may still serve under a lease granted before the
-            // leader change - this table serves only W after now (a fresh lease-clock read: never earlier than now).
-            if (predecessorFenceWaitNs_ > 0) inst.leaderSinceNs = leaseNow_();
         }
         // 1. A delta held from a back-pressured prior pass flushes first.  Held
         //    view work counts as progress (keep the worker hot so it retries the
@@ -644,7 +629,7 @@ private:
         //     independent of which caller (driveFolds vs. driveRebuild) drives
         //     a given pass, and independent of recoveryViews_'s prune timing.
         if (inst.readiness != ViewReadiness::Ready && inst.foldCursor >= bound) {
-            inst.readiness = leaderHwConfirmed && predecessorFenced_(inst) ? ViewReadiness::Ready : ViewReadiness::CatchingUp;
+            inst.readiness = leaderHwConfirmed ? ViewReadiness::Ready : ViewReadiness::CatchingUp;
         }
         // 2. Nothing new committed for this partition — caught up (checked before
         //    the capacity event so capacityExceeded_ counts folds that actually
@@ -695,7 +680,7 @@ private:
         // to `bound` — flip it here too (see 1b's doc comment for why this
         // cannot be left to driveRebuild alone).
         if (inst.readiness != ViewReadiness::Ready && inst.foldCursor >= bound) {
-            inst.readiness = leaderHwConfirmed && predecessorFenced_(inst) ? ViewReadiness::Ready : ViewReadiness::CatchingUp;
+            inst.readiness = leaderHwConfirmed ? ViewReadiness::Ready : ViewReadiness::CatchingUp;
         }
 
         // 4. Transient views stop here — no checkpoint handoff.  Their dirty
@@ -766,17 +751,7 @@ private:
     std::vector<uint8_t>                rowScratch_;
 
     uint64_t capacityExceeded_ = 0;
-    // Issue #82 (VLS A.5.3): W and the lease clock (see setPredecessorFenceWaitNs).  Worker-thread owned.
-    int64_t        predecessorFenceWaitNs_ = 0;
-    const int64_t* leaseNowOverride_       = nullptr;
-    [[nodiscard]] int64_t leaseNow_() const noexcept {
-        return leaseNowOverride_ == nullptr ? rune::consensus::leaseClockNowNs() : *leaseNowOverride_;
-    }
-    /// W has passed since this worker first drove `inst` under its current leadership (cold: read only while the
-    /// instance is not Ready).
-    [[nodiscard]] bool predecessorFenced_(const ViewInstance& inst) const noexcept {
-        return predecessorFenceWaitNs_ == 0 || leaseNow_() - inst.leaderSinceNs >= predecessorFenceWaitNs_;
-    }
+
 };
 
 } // namespace rune::node

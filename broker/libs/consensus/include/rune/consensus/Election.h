@@ -333,8 +333,14 @@ public:
     void setReadLeaseCommitPosSource(CommitPosSource fn, void* ctx) noexcept { commitPosFn_ = fn; commitPosCtx_ = ctx; }
     /// Test seam: an injected lease clock (default: leaseClockNowNs).  Construction time, before the first doWork.
     void setLeaseClockForTest(LeaseClockFn fn, void* ctx) noexcept { leaseClockFn_ = fn; leaseClockCtx_ = ctx; }
-    /// W (ReadLease.h leaseFenceWaitNs): a lease granted before a moment may outlive it by at most this, on any clock.
-    [[nodiscard]] int64_t readLeaseFenceWaitNs() const noexcept { return leaseFenceWaitNs(leaderHeartbeatTimeoutNs_); }
+    /// W (ReadLease.h kReadLeaseFenceWaitNs): a lease granted before a moment has ended W after it, on any clock.
+    [[nodiscard]] static constexpr int64_t readLeaseFenceWaitNs() noexcept { return kReadLeaseFenceWaitNs; }
+    /// Issue #486: the members whose lease the controller stops renewing (a leader move off them waits).  Control thread.
+    void setReadLeaseWithheld(uint32_t mask) noexcept { leaseGrantor_.setWithheld(mask); }
+    /// Issue #486 (VLS A.8): may this controller commit a leader move that takes leadership off `oldLeader` and drops
+    /// it from the ISR?  Only once no lease anyone granted it can still run: this node is the CLOSED leader past W
+    /// since its own leadership began (a predecessor's grants have ended) and no lease THIS node granted it may run.
+    [[nodiscard]] bool readLeaseMoveFenceOpen(NodeId oldLeader, int64_t nowNs) const noexcept;
     [[nodiscard]] bool     preBallotActiveForTest() const noexcept { return preBallot_.active; }
     [[nodiscard]] Term     preBallotTermForTest() const noexcept { return preBallot_.term; }
     [[nodiscard]] uint64_t preBallotsLostForTest() const noexcept { return preBallotsLost_; }

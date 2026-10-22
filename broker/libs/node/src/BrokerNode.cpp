@@ -2895,12 +2895,16 @@ void BrokerNode::buildGateway() {
     runtimeAgent_->setBootHistory(bootHistory_);
     runtimeAgent_->setFailoverTimeoutOverrideNs(config_.brokerLivenessTimeoutMs * 1'000'000LL);
     // Issue #82 (VLS Part A): a multi-node broker serves a view row only under a controller-granted read lease, handed
-    // to each worker behind the role ops it covers; a new source leader also waits out W (every lease its predecessor
-    // was granted before the leader change) before its views serve.  A single node leads alone: unbounded, no wait.
+    // to each worker behind the role ops it covers.  A single node leads alone: unbounded.  Issue #486: the controller
+    // commits a leader move that drops the old leader from the ISR only once that leader's lease has ended.
     if (!config_.isSingleNode() && election_ && workerPool_) {
         for (int32_t i = 0; i < workerPool_->workerCount(); ++i) workerPool_->worker(i).requireViewReadLease();
-        for (auto& vs : workerViewSets_) vs->setPredecessorFenceWaitNs(election_->readLeaseFenceWaitNs());
         runtimeAgent_->enableReadLeaseFanout(workerPool_->workerCount());
+        if (metadataService_)
+            metadataService_->setLeaderMoveFence(
+                [](void* e, int32_t old, int64_t nowNs) noexcept {
+                    return static_cast<const rune::consensus::Election*>(e)->readLeaseMoveFenceOpen(old, nowNs);
+                }, election_.get());
         if (metadataService_)
             election_->setReadLeaseCommitPosSource(
                 [](void* m) noexcept { return static_cast<MetadataService*>(m)->logEndForLease(); }, metadataService_.get());

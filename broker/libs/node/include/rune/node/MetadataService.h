@@ -2867,6 +2867,14 @@ public:
     }
     /// This node is the ready controller (it leads the consensus and its map reflects its whole log).
     [[nodiscard]] bool mapControls() const noexcept { return controllerReady_(); }
+    /// Issue #486 (VLS A.8): the read-lease fence of a leader move.  fn(ctx, oldLeader, nowNs): no lease anyone granted
+    /// `oldLeader` can still run (Election::readLeaseMoveFenceOpen).  nullptr (single node, tests) = always open.
+    using LeaderMoveFence = bool (*)(void* ctx, int32_t oldLeader, int64_t nowNs) noexcept;
+    void setLeaderMoveFence(LeaderMoveFence fn, void* ctx) noexcept { moveFenceFn_ = fn; moveFenceCtx_ = ctx; }
+    /// Issue #486: the nodes a queued move waits on (bit = node id) - the controller stops renewing their lease, so the
+    /// wait ends within one lease (~120 ms).  Recomputed every drain.  Control thread.
+    [[nodiscard]] uint32_t leaseWithheldMask() const noexcept { return leaseWithheldMask_; }
+    [[nodiscard]] uint64_t movesFencedForTest() const noexcept { return movesFenced_; }
     /// Issue #82 (VLS A.5.1): every metadata record below this offset is applied to the committed map (the bridge
     /// derives the role ops from it).  Control thread.
     [[nodiscard]] int64_t appliedEnd() const noexcept { return lastApplied_ < 0 ? 0 : static_cast<int64_t>(lastApplied_); }
@@ -3214,6 +3222,7 @@ private:
     }
 
     void drainDynamicQueue() {
+        leaseWithheldMask_ = 0;   // issue #486: recomputed below (a move that still waits sets its old leader's bit)
         if (pendingDynamicRecords_.empty() && pendingLineageRecords_.empty() && pendingRemovalRecords_.empty() &&
             pendingStorageRecords_.empty() && pendingFeatureLevel_ <= msm_.featureLevel())
             return;
@@ -3278,6 +3287,21 @@ private:
             }
             if (cycleBytes + n > kMaxBatchBytes) break;
 
+            // Issue #486 (VLS A.8): a record that takes leadership off a broker AND leaves it out of the ISR lets the new
+            // leader commit without it - while the old leader, until it applies this record, may still serve view reads
+            // under a lease granted before it.  So such a record is appended only once no lease the old leader holds
+            // can run.  It waits in order (the records behind it too: per-partition order, one bounded wait), the old
+            // leader keeps leading and acking meanwhile, and its lease is no longer renewed, so the wait ends within one
+            // lease (~120 ms; at once for a dead broker, whose lease ran out before it was judged dead).  Grants after
+            // the append carry a commitPos above it: FIFO keeps them behind the demotion.
+            if (moveFenceFn_ != nullptr) {
+                if (const int32_t old = leaderMovedOutOfIsr_(br); old >= 0 && !moveFenceFn_(moveFenceCtx_, old, lastNowNs_)) {
+                    if (old < 32) leaseWithheldMask_ |= 1u << static_cast<uint32_t>(old);
+                    ++movesFenced_;
+                    break;
+                }
+            }
+
             // Never ignore the result: a refusal (no longer the leader)
             // keeps the record queued, in order.
             if (replica_->append(std::span<const uint8_t>(encBuf, n), /*acksAll=*/false) < 0) break;
@@ -3340,6 +3364,23 @@ private:
     /// committed) assignment record.
     /// v2-review I4: an appended-not-committed assignment record, with the CONTENT the storage confirmation needs
     /// (a record that adds a node to a leader/ISR blocks that node's confirmation).
+    /// Issue #486: the broker a queued record takes leadership off while leaving it out of the new ISR (-1: none - a
+    /// placement, the same leader, or an old leader kept in the ISR, whose fetch at the new epoch the new leader's HW
+    /// needs: it applies the demotion before the new leader can commit without it).  The old leader is the latest
+    /// appended record's (in flight), else the committed one.
+    [[nodiscard]] int32_t leaderMovedOutOfIsr_(const rune::metadata::BalancerRecord& br) const noexcept {
+        int32_t old = -1;
+        if (const auto it = inflight_.find(partitionKey_(br.rec.topicId, br.rec.partition)); it != inflight_.end())
+            old = it->second.leader;
+        else if (const auto* pa = msm_.assignment(br.rec.topicId, br.rec.partition)) old = pa->leaderNode;
+        if (old < 0 || old == br.rec.leaderNode) return -1;
+        for (const int32_t m : br.isr) if (m == old) return -1;
+        return old;
+    }
+    LeaderMoveFence moveFenceFn_  = nullptr;
+    void*           moveFenceCtx_ = nullptr;
+    uint32_t        leaseWithheldMask_ = 0;
+    uint64_t        movesFenced_ = 0;
     struct InflightRec {
         rune::replication::Offset at = 0;                   ///< the metadata-log end offset after its append
         int32_t                   leader = -1;

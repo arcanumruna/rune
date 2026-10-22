@@ -61,10 +61,10 @@ inline constexpr int64_t kLeaseDriftDen = 10'000;
                           ((ns % kLeaseDriftDen) * (kLeaseDriftNum - kLeaseDriftDen) + kLeaseDriftDen - 1) / kLeaseDriftDen;
     return ns + extra;
 }
-/// W (A.5.3): how long a broker that just became a source leader waits (its own lease clock) before it may assume every
-/// lease a predecessor held under grants issued before the leader change has ended: Lmax * (1+rho)^2 with Lmax = H (a
-/// grant never exceeds QL - now <= H/(1+rho)^2).
-[[nodiscard]] constexpr int64_t leaseFenceWaitNs(int64_t heardTimeoutNs) noexcept { return leaseGrowByDrift(heardTimeoutNs); }
+/// W: on ANY node's clock, every lease granted before a moment has ended W after it.  A holder caps every grant at L
+/// (whatever the grantor's H - issue #491: the bound never depends on another node's config), so a lease runs at most
+/// L/(1+rho)^2 on its holder's clock = at most L/(1+rho) real; W = L(1+rho)^2 on any clock is at least L(1+rho) real.
+inline constexpr int64_t kReadLeaseFenceWaitNs = leaseGrowByDrift(kReadLeaseMaxNs);
 
 // =====================================================================================================================
 // ReadLeaseGrantor — the controller's side.  Duty-cycle (control) thread only.
@@ -113,12 +113,17 @@ public:
             if (s.seq == heardGrantSeq && s.sendNs > m->echoSendNs) m->echoSendNs = s.sendNs;
         }
         Grant g;
-        g.validForNs = validForNs(nowNs);
+        g.validForNs = withheld_(member) ? 0 : validForNs(nowNs);
         g.grantSeq   = ++grantSeq_;
         m->ring[static_cast<std::size_t>(g.grantSeq) % kGrantRing] = Slot{g.grantSeq, nowNs};
         if (g.validForNs > 0) m->leaseExpiryNs = std::max(m->leaseExpiryNs, nowNs + g.validForNs);
         return g;
     }
+
+    /// Issue #486: members whose lease is NOT renewed (bit = NodeId) while a leader move off them waits for their lease to
+    /// end - their requests are still answered (validFor 0) and echoed, so QL is unaffected.  Self included.
+    void setWithheld(uint32_t mask) noexcept { withheldMask_ = mask; }
+    [[nodiscard]] uint32_t withheld() const noexcept { return withheldMask_; }
 
     /// QL (controller clock): t* + H/(1+rho)^2, t* = the latest echo time a majority (this node at `nowNs`) reached.
     [[nodiscard]] int64_t quorumLeaseEndNs(int64_t nowNs) const noexcept {
@@ -143,7 +148,7 @@ public:
     /// The controller's own lease (it serves view reads as a broker too): valid for validForNs(now) from now, recorded
     /// like a grant (eligibility includes self anyway).
     [[nodiscard]] int64_t selfValidForNs(int64_t nowNs) noexcept {
-        const int64_t v = validForNs(nowNs);
+        const int64_t v = withheld_(self_) ? 0 : validForNs(nowNs);
         if (Member* m = find_(self_); m != nullptr && v > 0) m->leaseExpiryNs = std::max(m->leaseExpiryNs, nowNs + v);
         return v;
     }
@@ -182,8 +187,12 @@ private:
         for (std::size_t i = 0; i < n_; ++i) if (members_[i].id == id) return &members_[i];
         return nullptr;
     }
+    [[nodiscard]] bool withheld_(NodeId m) const noexcept {
+        return m >= 0 && m < 32 && (withheldMask_ & (1u << static_cast<uint32_t>(m))) != 0;
+    }
     std::array<Member, kMaxMembers> members_{};
     std::size_t n_ = 0;
+    uint32_t withheldMask_ = 0;
     NodeId  self_ = -1;
     int64_t heardTimeoutNs_ = 0;
     int64_t maxLeaseNs_ = kReadLeaseMaxNs;

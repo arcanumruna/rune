@@ -1414,6 +1414,14 @@ void Election::refreshSelfLease_() noexcept
     leaseHolder_.onSelfGrant(now, v, leaseCommitPos_());
 }
 
+bool Election::readLeaseMoveFenceOpen(NodeId oldLeader, int64_t nowNs) const noexcept
+{
+    if (clusterMembers_.size() <= 1) return true;   // a single node leads alone: no other lease exists
+    if (state_ != ElectionState::Closed || leaderMember_ == nullptr || leaderMember_->id != thisMemberId_) return false;
+    if (leaderSinceNs_ == INT64_MIN || nowNs - leaderSinceNs_ < kReadLeaseFenceWaitNs) return false;
+    return !leaseGrantor_.leaseMayRun(oldLeader, leaseNow_());
+}
+
 // Issue #82 (VLS A.4): a follower asks for a lease.  Answered only by the CLOSED leader of that term.  The request
 // rides with the member's AppendPosition, so it counts as the member's liveness report too (a lost AppendPosition must
 // not make the member look dead while its lease requests arrive).
