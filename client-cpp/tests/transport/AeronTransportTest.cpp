@@ -22,12 +22,23 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <malloc.h>
+#if defined(__linux__)
+#include <malloc.h>   // mallopt(M_PERTURB): glibc only
+#endif
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
 #include <vector>
+
+// Scribble freed memory (glibc M_PERTURB) so a use-after-free crashes; a no-op where mallopt is unavailable.
+static void perturbFreedMemory(int byte) {
+#if defined(__linux__)
+    ::mallopt(M_PERTURB, byte);
+#else
+    (void)byte;
+#endif
+}
 
 using namespace std::chrono_literals;
 using Transport = rune::client::transport::AeronTransport;
@@ -291,7 +302,7 @@ TEST(AeronTransport, InvalidMtuFailsStartWithClearError) {
 // resets before aeron_.reset() in start() -> std::terminate.
 // ---------------------------------------------------------------------------
 TEST(AeronTransportRegression, StartWithAnUnusableIngressChannelThrowsNeverAbortsRegression) {
-    ::mallopt(M_PERTURB, 0xA5);
+    perturbFreedMemory(0xA5);
     for (int attempt = 0; attempt < 8; ++attempt) {
         Config cfg = makeLoopbackConfig(1030 + attempt);
         cfg.ingressChannel = "127.0.0.1:1";  // not an Aeron channel URI
@@ -304,7 +315,7 @@ TEST(AeronTransportRegression, StartWithAnUnusableIngressChannelThrowsNeverAbort
         }
         EXPECT_NO_THROW(t.stop());
     }
-    ::mallopt(M_PERTURB, 0);
+    perturbFreedMemory(0);
     // The same process can still start a healthy transport afterwards.
     Transport ok{makeLoopbackConfig(1040)};
     EXPECT_NO_THROW(ok.start());
@@ -331,7 +342,7 @@ TEST(AeronTransportRegression, StartFailureEitherSideEitherDriverModeThrowsNever
     const Cell cells[] = {{DriverMode::Invoker, true}, {DriverMode::Invoker, false},
                           {DriverMode::Thread, true},  {DriverMode::Thread, false}};
     int stream = 1100;
-    ::mallopt(M_PERTURB, 0xA5);
+    perturbFreedMemory(0xA5);
     for (const Cell& cell : cells) {
         for (int attempt = 0; attempt < 6; ++attempt) {
             Config cfg = makeLoopbackConfig(stream++);
@@ -358,7 +369,7 @@ TEST(AeronTransportRegression, StartFailureEitherSideEitherDriverModeThrowsNever
             EXPECT_NO_THROW(t.stop());  // idempotent after a failed start
         }
     }
-    ::mallopt(M_PERTURB, 0);
+    perturbFreedMemory(0);
 
     // Nothing leaked into the process: a healthy transport starts and loops back.
     Transport ok{makeLoopbackConfig(1199)};
