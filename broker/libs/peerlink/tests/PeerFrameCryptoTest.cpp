@@ -10,8 +10,9 @@
 namespace pl = rune::peerlink;
 
 namespace {
-pl::LinkKeys linkFor(bool aToB, uint32_t epoch = 1, uint8_t base = 1) {
-    pl::LinkKeys k; k.epoch = epoch;
+pl::LinkKeys linkFor(bool aToB, uint32_t epoch = 1, uint8_t base = 1,
+                     pl::LinkInstall install = pl::LinkInstall::SendAndReceive) {
+    pl::LinkKeys k; k.epoch = epoch; k.install = install;
     k.sendMaster.fill(aToB ? base : static_cast<uint8_t>(base + 1));
     k.recvMaster.fill(aToB ? static_cast<uint8_t>(base + 1) : base);
     return k;
@@ -124,33 +125,10 @@ TEST(PeerFrameRegression, ADeferredCommitReopensUntilCommittedRegression) {
     const auto n = a.seal(2, bytes("fetch"), 5, w.data(), w.size());
     std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
     for (int i = 0; i < 3; ++i)   // dispatch ABORTed: the same frame opens again each time
-        ASSERT_EQ(b.open(w.data(), n, out.data(), out.size(), outLen, from, epoch, pl::PeerFrameCrypto::kClockNow, false),
+        ASSERT_EQ(b.open(w.data(), n, out.data(), out.size(), outLen, from, epoch, false),
                   pl::PeerFrameCrypto::OpenResult::Ok);
     b.commitOpened(from, epoch, 1);
     EXPECT_EQ(b.open(w.data(), n, out.data(), out.size(), outLen, from, epoch), pl::PeerFrameCrypto::OpenResult::Replay);
-}
-
-TEST(PeerFrameRegression, AnOldEpochStaysValidForTwoSecondsThenIsRefused) {
-    pl::PeerFrameCrypto a(1, 0), b(2, 0);
-    ASSERT_TRUE(a.installLink(2, linkFor(true, 1, 1), 0));
-    ASSERT_TRUE(b.installLink(1, linkFor(false, 1, 1), 0));
-    std::vector<uint8_t> w1(40), w2(40), w3(40), out(8);
-    const auto n1 = a.seal(2, bytes("old1"), 4, w1.data(), w1.size());
-    const auto n2 = a.seal(2, bytes("old2"), 4, w2.data(), w2.size());
-    const auto n3 = a.seal(2, bytes("old3"), 4, w3.data(), w3.size());
-    const int64_t t = 10 * kSec;
-    ASSERT_TRUE(b.installLink(1, linkFor(false, 2, 77), t));        // a new epoch with other keys
-    std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
-    EXPECT_EQ(b.currentEpoch(1), 2u);
-    EXPECT_EQ(b.open(w1.data(), n1, out.data(), out.size(), outLen, from, epoch, t + 1'900'000'000),
-              pl::PeerFrameCrypto::OpenResult::Ok) << "in flight under epoch 1";
-    EXPECT_EQ(epoch, 1u);
-    EXPECT_EQ(b.open(w2.data(), n2, out.data(), out.size(), outLen, from, epoch, t + 2'100'000'000),
-              pl::PeerFrameCrypto::OpenResult::UnknownEpoch) << "dropped after 2 s";
-    EXPECT_EQ(epoch, 1u) << "the unknown epoch is reported (the control thread re-handshakes)";
-    EXPECT_EQ(from, 1);
-    EXPECT_EQ(b.open(w3.data(), n3, out.data(), out.size(), outLen, from, epoch, t + 2'200'000'000),
-              pl::PeerFrameCrypto::OpenResult::UnknownEpoch);
 }
 
 TEST(PeerFrameRegression, ANewEpochStartsAFreshSendSequenceAndWindow) {
@@ -201,4 +179,138 @@ TEST(PeerFrameRegression, AnOutOfOrderFrameInsideTheWindowOpensOnceAndAnAncientO
     EXPECT_EQ(open(60), pl::PeerFrameCrypto::OpenResult::Ok);       // seq 61: 39 behind, inside the 64-wide window
     EXPECT_EQ(open(60), pl::PeerFrameCrypto::OpenResult::Replay);
     EXPECT_EQ(open(10), pl::PeerFrameCrypto::OpenResult::Replay);   // seq 11: more than 64 behind
+}
+
+// ---- issue #241: a re-handshaked link is installed receive-first; old epochs live in slots, never on a timer ----
+
+namespace {
+constexpr auto kRecvOnly = pl::LinkInstall::ReceiveOnly;
+constexpr auto kBoth     = pl::LinkInstall::SendAndReceive;
+using OR = pl::PeerFrameCrypto::OpenResult;
+
+/// One sealed frame in flight.
+struct Frame { std::vector<uint8_t> bytes; };
+Frame sealOne(pl::PeerFrameCrypto& from, int32_t to) {
+    Frame f; f.bytes.resize(4 + pl::kPeerFrameOverhead);
+    const auto n = from.seal(to, bytes("abcd"), 4, f.bytes.data(), f.bytes.size());
+    f.bytes.resize(n);
+    return f;
+}
+/// Open `f` at `at`; `epochOut` is the epoch the header named.
+OR openOne(pl::PeerFrameCrypto& at, const Frame& f, uint32_t* epochOut = nullptr) {
+    std::vector<uint8_t> out(8); std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
+    if (f.bytes.empty()) return OR::NotPeerFrame;
+    const auto r = at.open(f.bytes.data(), f.bytes.size(), out.data(), out.size(), outLen, from, epoch);
+    if (epochOut) *epochOut = epoch;
+    return r;
+}
+} // namespace
+
+TEST(PeerFrameCryptoRegression, NoFrameIsDroppedAcrossARehandshakeRegression) {
+    // A = node 1 (initiator), B = node 2 (responder); the same sender id.  B keeps sealing throughout.
+    pl::PeerFrameCrypto a(1, 0), b(2, 0);
+    ASSERT_TRUE(a.installLink(2, linkFor(true, 1, 1), 0)); ASSERT_TRUE(b.installLink(1, linkFor(false, 1, 1), 0));
+    uint32_t ep = 0;
+    const Frame bBefore = sealOne(b, 1);                       // in flight from B across the whole re-handshake
+
+    // 1. B (responder) installs E2 receive-only and emits the Accept: it keeps sealing under E1.
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 2, 9, kRecvOnly), 0));
+    EXPECT_EQ(b.currentEpoch(1), 1u) << "receive-only: the send epoch is unchanged";
+    EXPECT_TRUE(b.holdsEpoch(1, 2));
+    const Frame bStep1 = sealOne(b, 1);
+    EXPECT_EQ(openOne(a, bStep1, &ep), OR::Ok); EXPECT_EQ(ep, 1u) << "A has not seen the Accept yet: E1 opens";
+    const Frame aStep1 = sealOne(a, 2);
+    EXPECT_EQ(openOne(b, aStep1, &ep), OR::Ok); EXPECT_EQ(ep, 1u);
+
+    // 2. A (initiator) processes the Accept: E2 send and receive.  A's frames are E2 and open at B; B's (still E1) at A.
+    ASSERT_TRUE(a.installLink(2, linkFor(true, 2, 9, kBoth), 0));
+    const Frame aStep2 = sealOne(a, 2);
+    EXPECT_EQ(openOne(b, aStep2, &ep), OR::Ok); EXPECT_EQ(ep, 2u);
+    const Frame bStep2 = sealOne(b, 1);
+    EXPECT_EQ(openOne(a, bStep2, &ep), OR::Ok); EXPECT_EQ(ep, 1u) << "A still opens B's E1 frames";
+
+    // 3. B promotes E2 (the Confirm arrived): its frames are E2 and open at A.
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 2, 9, kBoth), 0));
+    EXPECT_EQ(b.currentEpoch(1), 2u);
+    const Frame bStep3 = sealOne(b, 1);
+    EXPECT_EQ(openOne(a, bStep3, &ep), OR::Ok); EXPECT_EQ(ep, 2u);
+    EXPECT_EQ(openOne(a, bBefore, &ep), OR::Ok) << "a frame sealed before the re-handshake still opens"; EXPECT_EQ(ep, 1u);
+    const Frame aStep3 = sealOne(a, 2);
+    EXPECT_EQ(openOne(b, aStep3, &ep), OR::Ok); EXPECT_EQ(ep, 2u);
+
+    EXPECT_EQ(a.dropsOf(OR::UnknownEpoch), 0u);
+    EXPECT_EQ(b.dropsOf(OR::UnknownEpoch), 0u);
+    EXPECT_EQ(a.drops(), 0u);
+    EXPECT_EQ(b.drops(), 0u);
+}
+
+TEST(PeerFrameCryptoRegression, OlderEpochsStillOpenAfterTwoQuickRehandshakesRegression) {
+    pl::PeerFrameCrypto a(1, 0), b(2, 0);
+    ASSERT_TRUE(a.installLink(2, linkFor(true, 1, 1), 0)); ASSERT_TRUE(b.installLink(1, linkFor(false, 1, 1), 0));
+    const Frame e1a = sealOne(a, 2), e1b = sealOne(a, 2);     // E1 frames still in flight to B
+    int64_t now = 0;
+    for (uint32_t e = 2; e <= 3; ++e) {                       // two quick re-handshakes, 10 s between every step
+        const auto base = static_cast<uint8_t>(10 * e);
+        now += 10 * kSec; ASSERT_TRUE(b.installLink(1, linkFor(false, e, base, kRecvOnly), now));
+        now += 10 * kSec; ASSERT_TRUE(a.installLink(2, linkFor(true, e, base, kBoth), now));
+        now += 10 * kSec; ASSERT_TRUE(b.installLink(1, linkFor(false, e, base, kBoth), now));
+    }
+    EXPECT_EQ(b.currentEpoch(1), 3u);
+    uint32_t ep = 0;
+    EXPECT_EQ(openOne(b, e1a, &ep), OR::Ok) << "E1 is still held 60 s and two epochs later"; EXPECT_EQ(ep, 1u);
+    EXPECT_EQ(b.dropsOf(OR::UnknownEpoch), 0u);
+
+    // A 4th epoch needs a slot: the oldest slot that is not the send epoch (E1) is evicted.
+    now += 10 * kSec; ASSERT_TRUE(b.installLink(1, linkFor(false, 4, 40, kRecvOnly), now));
+    EXPECT_FALSE(b.holdsEpoch(1, 1));
+    EXPECT_TRUE(b.holdsEpoch(1, 2)); EXPECT_TRUE(b.holdsEpoch(1, 3)); EXPECT_TRUE(b.holdsEpoch(1, 4));
+    EXPECT_EQ(openOne(b, e1b, &ep), OR::UnknownEpoch) << "only slot pressure drops an epoch";
+    EXPECT_EQ(openOne(b, sealOne(a, 2), &ep), OR::Ok) << "frames under the send epoch still open"; EXPECT_EQ(ep, 3u);
+    EXPECT_EQ(b.currentEpoch(1), 3u) << "the send epoch is never evicted";
+}
+
+TEST(PeerFrameCryptoRegression, APromotionKeepsTheReplayWindowRegression) {
+    pl::PeerFrameCrypto a(1, 0), b(2, 0);
+    ASSERT_TRUE(a.installLink(2, linkFor(true, 1, 1), 0)); ASSERT_TRUE(b.installLink(1, linkFor(false, 1, 1), 0));
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 2, 9, kRecvOnly), 0));
+    ASSERT_TRUE(a.installLink(2, linkFor(true, 2, 9, kBoth), 0));
+    const Frame f = sealOne(a, 2);
+    ASSERT_EQ(openOne(b, f), OR::Ok);
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 2, 9, kBoth), 0));      // the promotion: same epoch, same masters
+    EXPECT_EQ(b.currentEpoch(1), 2u);
+    EXPECT_EQ(openOne(b, f), OR::Replay) << "the promotion kept the receive window";
+    const Frame g = sealOne(a, 2);
+    EXPECT_EQ(openOne(b, g), OR::Ok) << "seq 2 continues the window";
+
+    // The same epoch number with OTHER masters (a restarted responder reusing it) replaces the slot.
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 2, 77, kBoth), 0));
+    pl::PeerFrameCrypto a2(1, 0);
+    ASSERT_TRUE(a2.installLink(2, linkFor(true, 2, 77, kBoth), 0));
+    EXPECT_EQ(openOne(b, sealOne(a2, 2)), OR::Ok) << "seq 1 under the new masters: a fresh window";
+    EXPECT_EQ(openOne(b, sealOne(a, 2)), OR::BadTag) << "the old masters of epoch 2 are gone";
+}
+
+TEST(PeerFrameCryptoRegression, AFrameUnderANewerEpochLatchesPeerUsedEpochRegression) {
+    pl::PeerFrameCrypto a(1, 0), b(2, 0);
+    ASSERT_TRUE(a.installLink(2, linkFor(true, 1, 1), 0)); ASSERT_TRUE(b.installLink(1, linkFor(false, 1, 1), 0));
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 2, 9, kRecvOnly), 0));
+    int32_t peer = -1; uint32_t epoch = 0;
+    EXPECT_FALSE(b.takePeerUsedEpoch(peer, epoch));
+    ASSERT_EQ(openOne(b, sealOne(a, 2)), OR::Ok);                       // E1: the send epoch - nothing to latch
+    EXPECT_FALSE(b.takePeerUsedEpoch(peer, epoch));
+    ASSERT_TRUE(a.installLink(2, linkFor(true, 2, 9, kBoth), 0));
+    ASSERT_EQ(openOne(b, sealOne(a, 2)), OR::Ok);                       // E2 (receive-only at B): the peer holds it
+    ASSERT_TRUE(b.takePeerUsedEpoch(peer, epoch));
+    EXPECT_EQ(peer, 1); EXPECT_EQ(epoch, 2u);
+    EXPECT_FALSE(b.takePeerUsedEpoch(peer, epoch)) << "consumed once";
+    EXPECT_EQ(b.currentEpoch(1), 1u) << "the instance never promotes itself";
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 2, 9, kBoth), 0));
+    ASSERT_EQ(openOne(b, sealOne(a, 2)), OR::Ok);
+    EXPECT_FALSE(b.takePeerUsedEpoch(peer, epoch)) << "the send epoch itself never latches";
+    // A frame that does not authenticate never latches.
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 3, 30, kRecvOnly), 0));
+    pl::PeerFrameCrypto rogue(1, 0);
+    ASSERT_TRUE(rogue.installLink(2, linkFor(true, 3, 31, kBoth), 0));
+    EXPECT_EQ(openOne(b, sealOne(rogue, 2)), OR::BadTag);
+    EXPECT_FALSE(b.takePeerUsedEpoch(peer, epoch));
 }

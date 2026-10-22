@@ -97,6 +97,10 @@ bool constantTimeEqual(std::span<const uint8_t> a, std::span<const uint8_t> b) n
     return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
 }
 
+void secureZero(std::span<uint8_t> buf) noexcept {
+    if (!buf.empty()) OPENSSL_cleanse(buf.data(), buf.size());
+}
+
 std::string base64Encode(std::span<const uint8_t> in) {
     std::string out((in.size() + 2) / 3 * 4 + 1, '\0');   // EVP_EncodeBlock NUL-terminates
     const int n = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(out.data()), ptr(in), static_cast<int>(in.size()));

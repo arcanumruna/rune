@@ -85,25 +85,65 @@ PeerFrameCrypto::PeerSlot* PeerFrameCrypto::slotOf_(int32_t peer) noexcept {
 
 bool PeerFrameCrypto::hasLink(int32_t peer) const noexcept {
     const PeerSlot* s = slotOf_(peer);
-    return s != nullptr && s->current && s->current->send;
+    return s != nullptr && s->sendIdx != kNoSend;
 }
 uint32_t PeerFrameCrypto::currentEpoch(int32_t peer) const noexcept {
     const PeerSlot* s = slotOf_(peer);
-    return (s != nullptr && s->current) ? s->current->keys.epoch : 0u;
+    const EpochState* e = s != nullptr ? sendOf_(*s) : nullptr;
+    return e != nullptr ? e->keys.epoch : 0u;
+}
+bool PeerFrameCrypto::holdsEpoch(int32_t peer, uint32_t epoch) const noexcept {
+    const PeerSlot* s = slotOf_(peer);
+    if (s == nullptr) return false;
+    for (const auto& e : s->epochs) if (e && e->keys.epoch == epoch) return true;
+    return false;
+}
+bool PeerFrameCrypto::takePeerUsedEpoch(int32_t& peer, uint32_t& epoch) noexcept {
+    if (!peerUsed_) return false;
+    peer = peerUsed_->peer; epoch = peerUsed_->epoch;
+    peerUsed_.reset();
+    return true;
 }
 
-bool PeerFrameCrypto::installLink(int32_t peer, const LinkKeys& keys, int64_t nowNs) {
+bool PeerFrameCrypto::installLink(int32_t peer, const LinkKeys& keys, int64_t /*nowNs: unused, see the header*/) {
     if (peer < 0 || peer > 0xFFFF || self_ < 0 || self_ > 0xFFFF || keys.epoch == 0) return false;
+    if (keys.install != LinkInstall::ReceiveOnly && keys.install != LinkInstall::SendAndReceive) return false;
     PeerSlot* s = slotOf_(peer);
     if (s == nullptr) {
         if (used_ == kMaxPeers) return false;
         s = &slots_[used_++];
         s->peer = peer;
     }
+    auto promote = [&](std::size_t i) {
+        if (keys.install != LinkInstall::SendAndReceive) return;
+        s->sendIdx   = static_cast<uint8_t>(i);
+        s->sendOrder = s->epochs[i]->installOrder;
+    };
+    // 1. The epoch is held already.
+    for (std::size_t i = 0; i < kEpochSlots; ++i) {
+        auto& e = s->epochs[i];
+        if (!e || e->keys.epoch != keys.epoch) continue;
+        if (e->keys.sendMaster == keys.sendMaster && e->keys.recvMaster == keys.recvMaster) {
+            promote(i);   // the promotion path: the windows and sequence numbers are kept
+            return true;
+        }
+        // A restarted responder reused the epoch number: replace that slot fresh (below), never mix two key sets.
+        if (s->sendIdx == i) { s->sendIdx = kNoSend; s->sendOrder = 0; }
+        e.reset();
+    }
+    // 2. A free slot, else evict the oldest install that is not the send epoch.
+    std::size_t at = kEpochSlots;
+    for (std::size_t i = 0; i < kEpochSlots && at == kEpochSlots; ++i) if (!s->epochs[i]) at = i;
+    if (at == kEpochSlots) {
+        uint64_t oldest = UINT64_MAX;
+        for (std::size_t i = 0; i < kEpochSlots; ++i)
+            if (i != s->sendIdx && s->epochs[i]->installOrder < oldest) { oldest = s->epochs[i]->installOrder; at = i; }
+    }
     EpochState fresh;
     fresh.keys = keys;
     rune::crypto::AeadKey key{};
     uint8_t prefix[rune::crypto::kNoncePrefix];
+    // BOTH ciphers at install (cold): a promotion is a field store.
     if (!deriveFrameKey(keys.sendMaster, sender_, key, prefix)) return false;
     fresh.send.emplace(kFrameCipher, key, prefix);
     // The symmetric deployment: the peer's transport of the same role sends with the same sender id, and it is the
@@ -111,18 +151,19 @@ bool PeerFrameCrypto::installLink(int32_t peer, const LinkKeys& keys, int64_t no
     if (!deriveFrameKey(keys.recvMaster, sender_, key, prefix)) return false;
     fresh.recv.senderId = sender_;
     fresh.recv.cipher.emplace(kFrameCipher, key, prefix);
-    if (s->current && s->current->keys.epoch != keys.epoch) s->previous = Retired{std::move(*s->current), nowNs + kRetainNs};
-    else if (s->current) s->previous.reset();   // the same epoch number again (a restarted responder): no stale copy
-    s->current.emplace(std::move(fresh));
+    fresh.installOrder = ++installs_;
+    if (s->sendIdx == at) { s->sendIdx = kNoSend; s->sendOrder = 0; }   // unreachable (never evicted); defensive
+    s->epochs[at].emplace(std::move(fresh));
+    promote(at);
     return true;
 }
 
 std::size_t PeerFrameCrypto::sealAt_(int32_t peer, const uint8_t* plain, std::size_t len, uint8_t* frame,
                                      std::size_t cap, bool inPlace) noexcept {
     PeerSlot* s = slotOf_(peer);
-    if (s == nullptr || !s->current || !s->current->send) { ++drops_; ++noLinkDrops_; return 0; }
+    if (s == nullptr || s->sendIdx == kNoSend) { ++drops_; ++noLinkDrops_; return 0; }
     if (cap < len + kPeerFrameOverhead) { ++drops_; return 0; }
-    EpochState& e = *s->current;
+    EpochState& e = *s->epochs[s->sendIdx];
     const uint64_t seq = ++e.sendSeq;
     frame[0] = kPeerFrameMagic;
     frame[1] = sender_;
@@ -145,13 +186,8 @@ std::size_t PeerFrameCrypto::sealInPlace(int32_t peer, uint8_t* frame, std::size
     return sealAt_(peer, frame + kPeerHeaderBytes, plainLen, frame, cap, /*inPlace=*/true);
 }
 
-PeerFrameCrypto::EpochState* PeerFrameCrypto::epochOf_(PeerSlot& s, uint32_t epoch, int64_t nowNs) noexcept {
-    if (!s.current) return nullptr;
-    if (s.current->keys.epoch == epoch) return &*s.current;
-    if (s.previous && s.previous->state.keys.epoch == epoch) {
-        if ((nowNs == kClockNow ? steadyNowNs() : nowNs) < s.previous->untilNs) return &s.previous->state;
-        s.previous.reset();   // the grace period is over: the old keys are dropped
-    }
+PeerFrameCrypto::EpochState* PeerFrameCrypto::epochOf_(PeerSlot& s, uint32_t epoch) noexcept {
+    for (auto& e : s.epochs) if (e && e->keys.epoch == epoch) return &*e;   // kEpochSlots compares, no clock
     return nullptr;
 }
 
@@ -163,13 +199,13 @@ uint64_t PeerFrameCrypto::authFrames(int32_t peer) const noexcept {
 void PeerFrameCrypto::commitOpened(int32_t fromNode, uint32_t epoch, uint64_t seq) noexcept {
     PeerSlot* s = slotOf_(fromNode);
     if (s == nullptr) return;
-    EpochState* e = epochOf_(*s, epoch, kClockNow);
+    EpochState* e = epochOf_(*s, epoch);
     if (e != nullptr) replayWindowCommit(e->recv.seq, e->recv.window, seq);
 }
 
 PeerFrameCrypto::OpenResult PeerFrameCrypto::open(const uint8_t* frame, std::size_t len, uint8_t* out, std::size_t cap,
                                                   std::size_t& outLen, int32_t& fromNode, uint32_t& epoch,
-                                                  int64_t nowNs, bool commitWindow) noexcept {
+                                                  bool commitWindow) noexcept {
     outLen = 0;
     if (len < kPeerFrameOverhead || frame[0] != kPeerFrameMagic) return drop_(OpenResult::NotPeerFrame);
     if (frame[1] != sender_) return drop_(OpenResult::BadSender);   // before any lookup or crypto
@@ -177,8 +213,8 @@ PeerFrameCrypto::OpenResult PeerFrameCrypto::open(const uint8_t* frame, std::siz
     epoch    = static_cast<uint32_t>(getLe(frame + 4, 4));
     const uint64_t seq = getLe(frame + 8, 8);
     PeerSlot* s = slotOf_(fromNode);
-    if (s == nullptr || !s->current) return drop_(OpenResult::UnknownPeer);
-    EpochState* e = epochOf_(*s, epoch, nowNs);
+    if (s == nullptr) return drop_(OpenResult::UnknownPeer);
+    EpochState* e = epochOf_(*s, epoch);
     if (e == nullptr) return drop_(OpenResult::UnknownEpoch);
     RecvSender* r = &e->recv;
     if (seq == 0) return drop_(OpenResult::Replay);   // the seal path pre-increments: 0 is never a real seq
@@ -194,6 +230,8 @@ PeerFrameCrypto::OpenResult PeerFrameCrypto::open(const uint8_t* frame, std::siz
     if (!replayWindowCheck(r->seq, r->window, seq)) return drop_(OpenResult::Replay);
     if (commitWindow) replayWindowCommit(r->seq, r->window, seq);
     ++s->authFrames;
+    // Issue #241: an authenticated frame under an epoch installed after our send epoch proves the peer holds it.
+    if (e->installOrder > s->sendOrder) [[unlikely]] peerUsed_ = PeerEpoch{fromNode, epoch};
     outLen = static_cast<std::size_t>(n);
     return OpenResult::Ok;
 }

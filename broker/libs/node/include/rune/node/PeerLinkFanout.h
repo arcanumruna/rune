@@ -3,8 +3,10 @@
 // keys to every thread that owns an inter-broker transport and is not the control thread: every worker (a
 // WorkerOp::Type::PeerLinkKeys on its lifecycle ring) and the admin thread (kMsgPeerLinkKeys on the control -> admin
 // ring).  Cold (one per link establishment).  Resumable per destination, the SessionAnnouncer way: a full ring is
-// retried on the next duty cycle, a destination already reached is never re-sent; a newer epoch for the same peer
-// SUPERSEDES an undelivered older one (the older epoch is moot — its grace period would be over before it landed).
+// retried on the next duty cycle, a destination already reached is never re-sent; the newest (keys, install mode) for
+// the same peer SUPERSEDES an undelivered older one.  There is no grace period (issue #241: each transport holds its
+// epochs in slots), and a superseded entry is moot because every install carries the full keys: a send-and-receive
+// promotion of an epoch whose receive-only install never landed simply installs it outright.
 // The key bytes are scrubbed from the pending entry the moment every destination has them.
 #include <rune/node/AdminChannels.h>
 #include <rune/node/OneToOneByteRing.h>
@@ -22,7 +24,7 @@ namespace rune::node {
 
 class PeerLinkFanout {
 public:
-    /// Control thread: queue `keys` of `peer` for every worker and the admin thread.
+    /// Control thread: queue `keys` of `peer` (with its install mode) for every worker and the admin thread.
     void post(int32_t peer, const rune::peerlink::LinkKeys& keys) {
         for (auto& p : pending_)
             if (p.peer == peer) { p.keys = keys; p.workersDone = 0; p.adminDone = false; return; }
@@ -40,6 +42,7 @@ public:
                     op.type      = WorkerOp::Type::PeerLinkKeys;
                     op.topicId   = p.peer;
                     op.partition = static_cast<int32_t>(p.keys.epoch);
+                    op.isolation = static_cast<uint8_t>(p.keys.install);   // issue #241: the install mode
                     std::memcpy(op.peerKeys.data(), p.keys.sendMaster.data(), 32);
                     std::memcpy(op.peerKeys.data() + 32, p.keys.recvMaster.data(), 32);
                     const EnqueueResult r = pool->worker(w).enqueueOp(std::move(op));
@@ -57,6 +60,7 @@ public:
                     uint8_t buf[kPeerLinkKeysWireLen];
                     PeerLinkKeysMsg m;
                     m.peer = p.peer; m.epoch = p.keys.epoch; m.sendMaster = p.keys.sendMaster; m.recvMaster = p.keys.recvMaster;
+                    m.install = p.keys.install;
                     writePeerLinkKeys(buf, m);
                     const bool ok = admin->write(buf, sizeof buf, kMsgPeerLinkKeys);
                     scrub_(buf, sizeof buf);

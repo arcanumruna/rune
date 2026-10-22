@@ -31,8 +31,26 @@ void drainAll(WorkerPool& p) {
     for (int pass = 0; pass < 2; ++pass)
         for (int32_t w = 0; w < p.workerCount(); ++w) p.worker(w).doWork(1);
 }
-rune::peerlink::LinkKeys keysAt(uint32_t epoch, uint8_t fill) {
-    rune::peerlink::LinkKeys k; k.epoch = epoch; k.sendMaster.fill(fill); k.recvMaster.fill(static_cast<uint8_t>(fill + 1)); return k;
+rune::peerlink::LinkKeys keysAt(uint32_t epoch, uint8_t fill,
+                                rune::peerlink::LinkInstall install = rune::peerlink::LinkInstall::SendAndReceive) {
+    rune::peerlink::LinkKeys k; k.epoch = epoch; k.sendMaster.fill(fill); k.recvMaster.fill(static_cast<uint8_t>(fill + 1));
+    k.install = install;
+    return k;
+}
+bool workerHolds(WorkerPool& p, int32_t w, int32_t peer, uint32_t epoch) {
+    const auto* t = p.worker(w).replicationTransport();
+    return t != nullptr && t->peerCrypto() != nullptr && t->peerCrypto()->holdsEpoch(peer, epoch);
+}
+/// Every kMsgPeerLinkKeys on the admin ring, decoded.
+std::vector<PeerLinkKeysMsg> adminMsgs(OneToOneByteRing& admin) {
+    std::vector<PeerLinkKeysMsg> v;
+    admin.drain([&](int32_t tid, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len) {
+        EXPECT_EQ(tid, kMsgPeerLinkKeys);
+        PeerLinkKeysMsg m;
+        EXPECT_TRUE(decodePeerLinkKeys(reinterpret_cast<const uint8_t*>(b.buffer() + off), static_cast<std::size_t>(len), m));
+        v.push_back(m);
+    }, 16);
+    return v;
 }
 } // namespace
 
@@ -112,4 +130,88 @@ TEST(PeerLinkFanoutRegression, TheAdminWireRoundTripsAndRejectsGarbage) {
     EXPECT_FALSE(decodePeerLinkKeys(buf, sizeof buf - 1, d));
     m.epoch = 0; writePeerLinkKeys(buf, m);
     EXPECT_FALSE(decodePeerLinkKeys(buf, sizeof buf, d)) << "epoch 0 means no link";
+}
+
+// ---- issue #241: the install mode (receive-only / send-and-receive) reaches every worker and the admin thread ----
+
+TEST(PeerLinkFanoutRegression, TheInstallModeReachesEveryWorkerAndTheAdminMessageRegression) {
+    auto p = pool(2);
+    OneToOneByteRing admin(1 << 12);
+    PeerLinkFanout f;
+    f.post(2, keysAt(4, 10));                                                       // the live link
+    (void)f.pump(p.get(), &admin);
+    drainAll(*p);
+    f.post(2, keysAt(5, 20, rune::peerlink::LinkInstall::ReceiveOnly));             // a re-handshake, receive-first
+    (void)f.pump(p.get(), &admin);
+    drainAll(*p);
+    for (int32_t w = 0; w < 2; ++w) {
+        EXPECT_EQ(p->worker(w).peerLinkEpochForTest(2), 4u) << "worker " << w << ": still SEALS under epoch 4";
+        EXPECT_TRUE(workerHolds(*p, w, 2, 5)) << "worker " << w << ": already OPENS epoch 5";
+    }
+    auto msgs = adminMsgs(admin);
+    ASSERT_EQ(msgs.size(), 2u);
+    EXPECT_EQ(msgs[0].install, rune::peerlink::LinkInstall::SendAndReceive);
+    EXPECT_EQ(msgs[1].epoch, 5u);
+    EXPECT_EQ(msgs[1].install, rune::peerlink::LinkInstall::ReceiveOnly);
+    // The promotion.
+    f.post(2, keysAt(5, 20, rune::peerlink::LinkInstall::SendAndReceive));
+    (void)f.pump(p.get(), &admin);
+    drainAll(*p);
+    for (int32_t w = 0; w < 2; ++w) EXPECT_EQ(p->worker(w).peerLinkEpochForTest(2), 5u) << "worker " << w;
+    msgs = adminMsgs(admin);
+    ASSERT_EQ(msgs.size(), 1u);
+    EXPECT_EQ(msgs[0].install, rune::peerlink::LinkInstall::SendAndReceive);
+}
+
+TEST(PeerLinkFanoutRegression, ASendAndReceiveSupersedesAnUndeliveredReceiveOnlyOfTheSameEpochRegression) {
+    auto p = pool(1, /*ringBytes=*/4096);
+    OneToOneByteRing admin(1 << 12);
+    PeerLinkFanout f;
+    f.post(2, keysAt(1, 1));
+    (void)f.pump(p.get(), &admin);
+    drainAll(*p);
+    (void)adminMsgs(admin);
+    WorkerOp filler; filler.type = WorkerOp::Type::SessionClose; filler.sessionId = 1;
+    while (p->worker(0).tryEnqueueOp(filler)) {}
+    f.post(2, keysAt(2, 7, rune::peerlink::LinkInstall::ReceiveOnly));
+    (void)f.pump(p.get(), &admin);                                                  // the worker ring is full
+    f.post(2, keysAt(2, 7, rune::peerlink::LinkInstall::SendAndReceive));           // promoted before it landed
+    EXPECT_EQ(f.pendingForTest(), 1u);
+    p->worker(0).doWork(1);
+    (void)f.pump(p.get(), &admin);
+    EXPECT_EQ(f.pendingForTest(), 0u);
+    drainAll(*p);
+    EXPECT_EQ(p->worker(0).peerLinkEpochForTest(2), 2u) << "the newer install carries the full keys";
+    EXPECT_TRUE(workerHolds(*p, 0, 2, 1)) << "the old epoch is still held for frames in flight";
+    EXPECT_EQ(p->worker(0).peerLinkKeysSeenForTest(), 2u) << "epoch 1, then epoch 2 once (the receive-only never sent)";
+    const auto msgs = adminMsgs(admin);
+    ASSERT_FALSE(msgs.empty());
+    EXPECT_EQ(msgs.back().epoch, 2u);
+    EXPECT_EQ(msgs.back().install, rune::peerlink::LinkInstall::SendAndReceive);
+}
+
+TEST(PeerLinkFanoutRegression, TheAdminWireCarriesTheModeAndRefusesAnUnknownOneRegression) {
+    EXPECT_EQ(kPeerLinkKeysWireLen, 73u);
+    PeerLinkKeysMsg m; m.peer = 3; m.epoch = 2; m.sendMaster.fill(4); m.recvMaster.fill(5);
+    m.install = rune::peerlink::LinkInstall::ReceiveOnly;
+    uint8_t buf[kPeerLinkKeysWireLen];
+    writePeerLinkKeys(buf, m);
+    PeerLinkKeysMsg d;
+    ASSERT_TRUE(decodePeerLinkKeys(buf, sizeof buf, d));
+    EXPECT_EQ(d.install, rune::peerlink::LinkInstall::ReceiveOnly);
+    buf[kPeerLinkKeysWireLen - 1] = 2;
+    EXPECT_FALSE(decodePeerLinkKeys(buf, sizeof buf, d)) << "an unknown install mode is a malformed message";
+    EXPECT_FALSE(decodePeerLinkKeys(buf, sizeof buf - 1, d)) << "the old 72-byte layout";
+}
+
+TEST(PeerLinkFanoutRegression, AWorkerRefusesAnUnknownInstallModeRegression) {
+    auto p = pool(1);
+    WorkerOp op;
+    op.type = WorkerOp::Type::PeerLinkKeys; op.topicId = 2; op.partition = 3;
+    op.peerKeys.fill(9);
+    op.isolation = 7;                                                               // not a LinkInstall value
+    ASSERT_EQ(p->worker(0).enqueueOp(std::move(op)), EnqueueResult::Enqueued);
+    drainAll(*p);
+    EXPECT_FALSE(workerHolds(*p, 0, 2, 3)) << "refused, never installed";
+    EXPECT_EQ(p->worker(0).peerLinkEpochForTest(2), 0u);
 }

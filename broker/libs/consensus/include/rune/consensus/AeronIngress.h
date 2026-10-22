@@ -150,6 +150,17 @@ public:
         peer = pendingUnknown_.peer; epoch = pendingUnknown_.epoch; pendingUnknown_.valid = false;
         return true;
     }
+    /// Issue #241: the (peer, epoch) of the last authenticated frame under an epoch this ingress holds receive-only -
+    /// consumed once; the PeerLinkAgent (same thread) promotes it (a legacy initiator sends no Confirm).
+    [[nodiscard]] bool takePeerUsedEpoch(int32_t& peer, uint32_t& epoch) noexcept {
+        auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+        return c != nullptr && c->takePeerUsedEpoch(peer, epoch);
+    }
+    /// Frames this ingress dropped as UnknownEpoch (monotonic; 0 when not sealed).
+    [[nodiscard]] uint64_t unknownEpochDrops() const noexcept {
+        const auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+        return c ? c->dropsOf(rune::peerlink::PeerFrameCrypto::OpenResult::UnknownEpoch) : 0u;
+    }
 private:
     void noteOversize_(std::size_t len) noexcept {
         if ((oversizeDrops_++ % 1024) == 0)

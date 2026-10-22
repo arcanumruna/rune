@@ -306,6 +306,8 @@ public:
     [[nodiscard]] uint64_t peerLinkKeysSeenForTest() const noexcept { return peerLinkKeysSeen_; }
     /// Inter-broker frames the admin plane dropped (no link / did not open); admin thread.
     [[nodiscard]] uint64_t peerFrameDrops() const noexcept;
+    /// Issue #241 test probe (admin thread): frames the admin plane dropped as UnknownEpoch.
+    [[nodiscard]] uint64_t peerUnknownEpochDropsForTest() const noexcept;
     /// control → admin: the controller's AlterIsrResponse for (-6, 0), verbatim.
     void onCatalogAlterIsrResponse(const rune::replication::AlterIsrResponseMsg& r);
 

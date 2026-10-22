@@ -1545,11 +1545,19 @@ public:
     struct PeerLinkSnap { bool present = false; int64_t established = 0; uint64_t refusals = 0;
                           uint32_t epochOf[16] = {}; int32_t peerCount = 0; std::vector<int32_t> peers;
                           uint64_t frameDrops = 0; bool sealed = false;
-                          uint64_t workerDropsReported = 0, adminDropsReported = 0; };
+                          uint64_t workerDropsReported = 0, adminDropsReported = 0;
+                          uint64_t unknownEpochDrops = 0;   // issue #241: the control-thread transports' UnknownEpoch drops
+                        };
     [[nodiscard]] PeerLinkSnap peerLinksForTest();
     /// The link epoch worker `w` / the admin thread holds for `peer` (0 = none); read ON that thread.
     [[nodiscard]] uint32_t workerPeerLinkEpochForTest(int32_t w, int32_t peer);
     [[nodiscard]] uint32_t adminPeerLinkEpochForTest(int32_t peer);
+    /// Issue #241: frames worker `w` / the admin plane dropped as UnknownEpoch; read ON that thread.
+    [[nodiscard]] uint64_t workerPeerUnknownEpochDropsForTest(int32_t w);
+    [[nodiscard]] uint64_t adminPeerUnknownEpochDropsForTest();
+    /// Issue #241: this (initiator) node re-handshakes its link to `peer` now, same incarnation (control thread).
+    /// False: no peer links, or not an Established initiator for `peer`.
+    [[nodiscard]] bool forcePeerRekeyForTest(int32_t peer);
     /// Run `f(Worker&)` on worker `w`'s own thread (same contract as onOwnerThreadForTest).
     template <class F>
     auto onWorkerThreadForTest(int32_t w, F&& f, std::chrono::milliseconds timeout = std::chrono::seconds{10}) {

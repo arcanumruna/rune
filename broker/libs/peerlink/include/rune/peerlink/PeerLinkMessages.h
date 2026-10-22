@@ -11,7 +11,14 @@
 
 namespace rune::peerlink {
 
-enum class PeerMsg : uint8_t { Hello = 1, Challenge = 2, Proof = 3, Accept = 4, Refuse = 5 };
+/// Confirm (6, issue #241) is newer than the other five: a broker that predates it sees tag 6 as a malformed frame and
+/// ignores it (counted), which is harmless - the responder then promotes on the initiator's first authenticated frame
+/// under the new epoch instead.
+/// HelloV2 / ChallengeV2 (7, 8, issue #242) carry the X25519 ephemeral shares that give the link keys forward secrecy.
+/// A broker that predates them sees tags 7/8 as malformed frames and ignores them (counted): an old responder never
+/// answers a new initiator, so upgrade in DESCENDING node id (see PeerHandshake.h).
+enum class PeerMsg : uint8_t { Hello = 1, Challenge = 2, Proof = 3, Accept = 4, Refuse = 5, Confirm = 6, HelloV2 = 7,
+                               ChallengeV2 = 8 };
 
 /// Why a handshake was refused.  NoLink (5) is a poke, not a refusal: a responder that holds no link says "start
 /// over" (it restarted) — never logged as a refusal, never counted.
@@ -125,11 +132,72 @@ struct PeerRefuse {
     }
 };
 
-inline constexpr std::size_t kMaxPeerLinkFrame = PeerChallenge::kSize;
+/// Issue #241: the initiator's proof that it installed `linkEpoch` (so the responder may start SEALING under it).
+///   confirm = HMAC-SHA-512(master, "rune-peer-v1|D" || from=A || to=B || nonceA || nonceB || epoch), truncated to 32.
+/// The label differs from the Accept's ("|C", from=B || to=A), so an Accept's confirm is never a valid Confirm.
+struct PeerConfirm {
+    int32_t from = -1, to = -1; uint32_t linkEpoch = 0; std::array<uint8_t, 32> confirm{};
+    static constexpr std::size_t kSize = 1 + 4 + 4 + 4 + 32;
+    void encode(uint8_t* b) const noexcept {
+        b[0] = static_cast<uint8_t>(PeerMsg::Confirm);
+        detail::putLe(b + 1, static_cast<uint32_t>(from), 4); detail::putLe(b + 5, static_cast<uint32_t>(to), 4);
+        detail::putLe(b + 9, linkEpoch, 4); std::memcpy(b + 13, confirm.data(), 32);
+    }
+    [[nodiscard]] static bool decode(const uint8_t* b, std::size_t len, PeerConfirm& m) noexcept {
+        if (len != kSize || b[0] != static_cast<uint8_t>(PeerMsg::Confirm)) return false;
+        m.from = static_cast<int32_t>(detail::getLe(b + 1, 4)); m.to = static_cast<int32_t>(detail::getLe(b + 5, 4));
+        m.linkEpoch = static_cast<uint32_t>(detail::getLe(b + 9, 4)); std::memcpy(m.confirm.data(), b + 13, 32);
+        return true;
+    }
+};
+
+/// Issue #242: PeerHello plus the initiator's X25519 ephemeral public share, appended.
+struct PeerHelloV2 {
+    int32_t from = -1, to = -1; uint64_t keyId = 0; uint64_t incarnation = 0; std::array<uint8_t, 32> nonceA{};
+    std::array<uint8_t, 32> shareA{};
+    static constexpr std::size_t kSize = 1 + 4 + 4 + 8 + 8 + 32 + 32;
+    void encode(uint8_t* b) const noexcept {
+        b[0] = static_cast<uint8_t>(PeerMsg::HelloV2);
+        detail::putLe(b + 1, static_cast<uint32_t>(from), 4); detail::putLe(b + 5, static_cast<uint32_t>(to), 4);
+        detail::putLe(b + 9, keyId, 8); detail::putLe(b + 17, incarnation, 8);
+        std::memcpy(b + 25, nonceA.data(), 32); std::memcpy(b + 57, shareA.data(), 32);
+    }
+    [[nodiscard]] static bool decode(const uint8_t* b, std::size_t len, PeerHelloV2& m) noexcept {
+        if (len != kSize || b[0] != static_cast<uint8_t>(PeerMsg::HelloV2)) return false;
+        m.from = static_cast<int32_t>(detail::getLe(b + 1, 4)); m.to = static_cast<int32_t>(detail::getLe(b + 5, 4));
+        m.keyId = detail::getLe(b + 9, 8); m.incarnation = detail::getLe(b + 17, 8);
+        std::memcpy(m.nonceA.data(), b + 25, 32); std::memcpy(m.shareA.data(), b + 57, 32);
+        return true;
+    }
+};
+
+/// Issue #242: PeerChallenge plus the responder's X25519 ephemeral public share, appended.  Its macB is the v2
+/// transcript MAC, which covers both shares (PeerHandshake.h).
+struct PeerChallengeV2 {
+    int32_t from = -1, to = -1; uint64_t keyId = 0; uint64_t incarnation = 0; std::array<uint8_t, 32> nonceB{};
+    std::array<uint8_t, 64> macB{}; std::array<uint8_t, 32> shareB{};
+    static constexpr std::size_t kSize = 1 + 4 + 4 + 8 + 8 + 32 + 64 + 32;
+    void encode(uint8_t* b) const noexcept {
+        b[0] = static_cast<uint8_t>(PeerMsg::ChallengeV2);
+        detail::putLe(b + 1, static_cast<uint32_t>(from), 4); detail::putLe(b + 5, static_cast<uint32_t>(to), 4);
+        detail::putLe(b + 9, keyId, 8); detail::putLe(b + 17, incarnation, 8);
+        std::memcpy(b + 25, nonceB.data(), 32); std::memcpy(b + 57, macB.data(), 64); std::memcpy(b + 121, shareB.data(), 32);
+    }
+    [[nodiscard]] static bool decode(const uint8_t* b, std::size_t len, PeerChallengeV2& m) noexcept {
+        if (len != kSize || b[0] != static_cast<uint8_t>(PeerMsg::ChallengeV2)) return false;
+        m.from = static_cast<int32_t>(detail::getLe(b + 1, 4)); m.to = static_cast<int32_t>(detail::getLe(b + 5, 4));
+        m.keyId = detail::getLe(b + 9, 8); m.incarnation = detail::getLe(b + 17, 8);
+        std::memcpy(m.nonceB.data(), b + 25, 32); std::memcpy(m.macB.data(), b + 57, 64); std::memcpy(m.shareB.data(), b + 121, 32);
+        return true;
+    }
+};
+
+inline constexpr std::size_t kMaxPeerLinkFrame = PeerChallengeV2::kSize;
+static_assert(kMaxPeerLinkFrame >= PeerChallenge::kSize && kMaxPeerLinkFrame >= PeerHelloV2::kSize);
 
 /// The tag of a frame, or 0 when it is empty / unknown.
 [[nodiscard]] inline uint8_t peekPeerMsg(const uint8_t* b, std::size_t len) noexcept {
-    return (len > 0 && b[0] >= 1 && b[0] <= 5) ? b[0] : uint8_t{0};
+    return (len > 0 && b[0] >= 1 && b[0] <= 8) ? b[0] : uint8_t{0};
 }
 
 } // namespace rune::peerlink

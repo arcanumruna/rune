@@ -558,7 +558,7 @@ bool AdminWorker::updateRole_() {
 // ─── ingress ────────────────────────────────────────────────────────────────
 void AdminWorker::onPeerLinkKeys(const PeerLinkKeysMsg& m) noexcept {
     rune::peerlink::LinkKeys k;
-    k.epoch = m.epoch; k.sendMaster = m.sendMaster; k.recvMaster = m.recvMaster;
+    k.epoch = m.epoch; k.sendMaster = m.sendMaster; k.recvMaster = m.recvMaster; k.install = m.install;
     ++peerLinkKeysSeen_;
     if (catalogPlane_ != nullptr && catalogPlane_->peerSealed() && !catalogPlane_->installPeerLink(m.peer, k)) [[unlikely]]
         spdlog::error("AdminWorker: the link keys of node {} (epoch {}) could not be installed - admin frames "
@@ -567,6 +567,10 @@ void AdminWorker::onPeerLinkKeys(const PeerLinkKeysMsg& m) noexcept {
 
 uint32_t AdminWorker::peerLinkEpochForTest(int32_t peer) const noexcept {
     return catalogPlane_ != nullptr ? catalogPlane_->peerLinkEpoch(peer) : 0u;
+}
+
+uint64_t AdminWorker::peerUnknownEpochDropsForTest() const noexcept {
+    return catalogPlane_ != nullptr ? catalogPlane_->unknownEpochFrames() : 0u;
 }
 
 uint64_t AdminWorker::peerFrameDrops() const noexcept {

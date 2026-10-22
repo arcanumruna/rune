@@ -54,6 +54,12 @@ public:
     /// The consensus ingress saw a frame from `peer` naming an epoch we do not hold (Task 16).  Unauthenticated: it
     /// only matters once the peer has been silent (see PeerHandshake::onUnknownEpoch).
     void onUnknownEpoch(int32_t peer, uint32_t epoch, int64_t nowNs);
+    /// Issue #241: a transport of this thread opened an AUTHENTICATED frame from `peer` under `epoch`, an epoch it holds
+    /// receive-only - the peer holds it, so a responder awaiting the Confirm promotes it (a legacy initiator sends none).
+    void onPeerUsedEpoch(int32_t peer, uint32_t epoch, int64_t nowNs);
+    /// TEST ONLY (issue #241): this initiator re-handshakes the link to `peer` now (same incarnation).  False: not an
+    /// Established initiator for `peer`.
+    bool forceRekeyForTest(int32_t peer, int64_t nowNs);
     /// The transports' authenticated-frame counters for `peer` (monotonic sum); a rise means the peer is alive.
     void observeAuthFrames(int32_t peer, uint64_t total, int64_t nowNs) noexcept;
     [[nodiscard]] std::size_t peerCount() const noexcept { return peers_.size(); }

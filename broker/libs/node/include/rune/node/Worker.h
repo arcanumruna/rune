@@ -2711,8 +2711,17 @@ private:
                           WorkerOp::kPeerKeysBytes);
             return;
         }
+        // Issue #241: the install mode rides the (otherwise unused) isolation byte.
+        const uint8_t mode = op.isolation();
+        if (mode != static_cast<uint8_t>(rune::peerlink::LinkInstall::ReceiveOnly) &&
+            mode != static_cast<uint8_t>(rune::peerlink::LinkInstall::SendAndReceive)) [[unlikely]] {
+            spdlog::error("Worker {}: PeerLinkKeys of node {} carries an unknown install mode {} - refused", workerId_,
+                          op.topicId(), mode);
+            return;
+        }
         rune::peerlink::LinkKeys k;
         k.epoch = static_cast<uint32_t>(op.partition());
+        k.install = static_cast<rune::peerlink::LinkInstall>(mode);
         const int32_t peer = op.topicId();
         const char* tail = op.tail();   // SBE var data: one call (it advances the decode position)
         std::memcpy(k.sendMaster.data(), tail, 32);

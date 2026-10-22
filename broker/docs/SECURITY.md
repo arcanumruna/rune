@@ -231,8 +231,12 @@ The image entrypoint refuses to start without the file and **never generates a k
 inside one container would differ from its peers' and split the cluster).
 
 **Inter-broker encryption.** Every inter-broker frame is sealed with a per-link key derived from
-the cluster key and the handshake nonces (HKDF-SHA-512, one key per direction, a replay window per
-sender). A frame carries 32 bytes of overhead (16-byte header and 16-byte tag); the frame limits
+the cluster key, the handshake nonces and an X25519 ephemeral secret (HKDF-SHA-512, one key per
+direction, a replay window per sender). The ephemeral secret gives forward secrecy: a recording of
+inter-broker traffic plus a cluster key stolen later does not yield the link keys. A broker still
+links with a peer from before this change when that peer initiates (the lower node id initiates),
+without forward secrecy on that link; it never falls back itself. **Upgrade brokers in descending
+node id** so that every upgraded initiator meets an upgraded responder. A frame carries 32 bytes of overhead (16-byte header and 16-byte tag); the frame limits
 subtract them, so the maximum produce batch is 32 bytes smaller than before authentication.
 
 **Rotation (spec section 8, three rolling restarts, no downtime).** `RUNE_CLUSTER_KEY_FILE_NEXT`
