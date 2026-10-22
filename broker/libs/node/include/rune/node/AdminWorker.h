@@ -42,6 +42,7 @@
 #include <rune/peerlink/PeerFrameCrypto.h>
 #include "rune/node/SecurityApplier.h"
 #include "rune/node/SecurityPartition.h"
+#include "rune/node/SecurityServing.h"
 #include "rune/node/SchemaRegistry.h"
 #include "rune/node/TopicDirReconcile.h"
 #include "rune/node/ViewRegistry.h"
@@ -112,6 +113,12 @@ struct AdminDeps {
     /// for the event at that offset, released by the control thread only once THIS broker enforces it (production posts
     /// kMsgEgressFrameGated); -1 = ungated (a refusal / error).  Unset: security answers go nowhere (rigs without one).
     SecurityRespond respondSecurity;
+
+    /// Issues #15 / #111 (M7): this broker's `__security` catch-up verdict changed (SecurityCatchUp) - production posts
+    /// kA2cSecurityServing on the admin→control FIFO.  Unset: not tracked (rigs without a control thread).
+    std::function<void(bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader)> securityServing;
+    /// F (RUNE_SECURITY_MAX_STALENESS_MS, effective): the contact a follower's verdict may lapse for.
+    int64_t securityMaxStalenessNs = 1'000'000'000;
 };
 
 // ---------------------------------------------------------------------------
@@ -477,6 +484,16 @@ private:
     std::optional<SecurityAdmin>          securityAdmin_;
     std::optional<SecurityLiveEffects>    pendingSecurityLive_;   // the booted applier's goLive, owed to the first pass
     bool                                  securityApplyHeldForTest_ = false;
+    // Issues #15 / #111: the catch-up verdict (SecurityServing.h) and the last one posted (none yet: posted on the
+    // first pass).  A refused post is impossible (the effect FIFO backlogs), so the posted value is the control's.
+    SecurityCatchUp                       securityCatchUp_{1'000'000'000};
+    int                                   securityServingPosted_ = -1;   // -1 none, 0 / 1 the verdict
+    int32_t                               securityServingPostedEpoch_ = -1;   // PR #459 F2: and what it is for
+    bool                                  securityServingPostedLeader_ = false;
+    int stepSecurityServing_(int64_t nowNs);
+public:
+    [[nodiscard]] bool securityCaughtUpForTest() const noexcept { return securityCatchUp_.caughtUp(); }
+private:
     CatalogRole                           role_{CatalogFollower{}};
     std::optional<CatalogReadServer>      readServer_;   // set iff catalogReplica_ (Task 12)
     std::optional<CatalogReadServer>      securityReadServer_;   // set iff the security log is attached (auth Task 10)

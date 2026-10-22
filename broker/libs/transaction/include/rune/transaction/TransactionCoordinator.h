@@ -82,6 +82,7 @@
 
 #include <rune/transaction/Types.h>
 #include <rune/transaction/ProducerIdAllocator.h>
+#include <rune/protocol/ProducerIdBinding.h>
 #include <rune/coordination/Types.h>
 
 #include <cassert>
@@ -326,11 +327,18 @@ public:
     /// \param txnTimeoutMs   Transaction timeout; ≤0 uses the default.
     /// \param nowNs          Injected clock (nanoseconds).
     ///
+    /// \param owner          Issue #122: the principal the id is issued to (0 = none).  Set, every id handed out is
+    ///                       in the bound format (rune/protocol/ProducerIdBinding.h) and carries it; a known txnId
+    ///                       whose id is not the caller's (another principal's, or a legacy id) gets a FRESH id
+    ///                       (epoch 0), exactly like the epoch-overflow path - the previous holder is fenced and its
+    ///                       Ongoing transaction aborted under the old id.  Unset (unit rigs): raw counter ids.
+    ///
     /// \returns {producerId, producerEpoch, errorCode}
     ///   errorCode = kInvalidTxnTimeout if txnTimeoutMs is out of range [1, max].
     InitProducerIdResult initProducerId(std::optional<TransactionalId> txnId,
                                         int32_t                        txnTimeoutMs,
-                                        int64_t                        nowNs);
+                                        int64_t                        nowNs,
+                                        std::optional<uint64_t>        owner = std::nullopt);
 
     // -----------------------------------------------------------------------
     // addPartitions
@@ -471,7 +479,7 @@ public:
             if (m.pendingNewProducerId > maxPid) maxPid = m.pendingNewProducerId;
             txnMap_.insert_or_assign(TransactionalId(id), std::move(m));
         }
-        if (maxPid >= 0) allocator_.reseedAtLeast(maxPid);
+        if (maxPid >= 0) allocator_.reseedAtLeast(reseedCounter_(maxPid));
         return maxPid;
     }
 
@@ -555,6 +563,19 @@ private:
 
     /// Map an allocator failure sentinel to the InitProducerId answer.
     static InitProducerIdResult allocationFailure_(ProducerId sentinel) noexcept;
+    /// The next id for `owner` (bound format) or the raw counter (no owner); a negative allocator sentinel as is.
+    [[nodiscard]] ProducerId allocatePid_(const std::optional<uint64_t>& owner) noexcept;
+    /// The allocator counter a recovered id was issued from (issue #122): its counter bits once this coordinator
+    /// issues bound ids, the id itself in a raw-id rig.
+    [[nodiscard]] ProducerId reseedCounter_(ProducerId pid) const noexcept {
+        return boundIds_ ? rune::protocol::producerIdCounter(pid) : pid;
+    }
+    bool boundIds_ = false;
+public:
+    /// Issue #122: this coordinator issues bound ids (the broker's: every InitProducerId names an owner); recovered
+    /// ids then reseed the allocator by their counter bits.  Call before any reload.
+    void setBoundProducerIds(bool on) noexcept { boundIds_ = on; }
+private:
 
     /// Validate epoch and PID match; returns errorCode (0 = ok).
     [[nodiscard]] int validateEpochAndPid(const TransactionMetadata& meta,

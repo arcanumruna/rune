@@ -1814,3 +1814,972 @@ TEST_F(CG3ServiceTest, OverCapJoinGroupFilterIsRefusedAndNeverFixesTheGroupRegre
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
 }
+
+// ===========================================================================
+// Issues #123 / #124 / #169: a member id is bound to the session that obtained it.  Sync, Heartbeat, Leave and
+// OffsetCommit naming another session's member are answered exactly as for a member that does not exist
+// (UnknownMember), and change nothing.
+// ===========================================================================
+namespace {
+struct JoinedMember { std::string id; int32_t generation = -1; };
+}  // namespace
+
+class MemberBindingTest : public CG3ServiceTest {
+protected:
+    std::string memberOf(std::size_t outLen) {
+        const auto r = pc::JoinGroupResponse::decode(out_, outLen);
+        EXPECT_TRUE(r.has_value());
+        return r ? std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size()) : std::string{};
+    }
+    /// Session `sid` joins `group` as a new member and the group reaches Stable with it alone.
+    JoinedMember joinStable(int64_t sid, const std::string& group) {
+        std::size_t n = service_->handleJoinGroup(req_, encodeJoinGroup(req_, sid, ++corr_, group, "", 5000), rune::protocol::client::kClientVersion, clock_,
+                                                  out_, kBufSize);
+        const std::string id = memberOf(n);
+        clock_ += kStep;
+        n = service_->handleJoinGroup(req_, encodeJoinGroup(req_, sid, ++corr_, group, id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
+        EXPECT_EQ(memberOf(n), id);
+        EXPECT_TRUE(driveUntil([&] { return service_->coordinator(group).state() == GroupState::Stable; }, 10));
+        return {id, service_->coordinator(group).generationId()};
+    }
+    int16_t heartbeat(int64_t sid, const std::string& group, const std::string& member, int32_t gen) {
+        return decodeHBErrorCode(out_, service_->handleHeartbeat(req_, encodeHeartbeat(req_, sid, ++corr_, group, member, gen),
+                                                               clock_, out_, kBufSize));
+    }
+    int16_t sync(int64_t sid, const std::string& group, const std::string& member, int32_t gen) {
+        return decodeSyncErrorCode(out_, service_->handleSyncGroup(req_, encodeSyncGroup(req_, sid, ++corr_, group, member, gen),
+                                                                 clock_, out_, kBufSize));
+    }
+    int16_t leave(int64_t sid, const std::string& group, const std::string& member) {
+        return decodeLeaveErrorCode(out_, service_->handleLeaveGroup(req_, encodeLeaveGroup(req_, sid, ++corr_, group, member),
+                                                                   clock_, out_, kBufSize));
+    }
+    int16_t commit(int64_t sid, const std::string& group, const std::string& member, int32_t gen, int64_t offset) {
+        const std::size_t n = service_->handleOffsetCommit(
+            req_, encodeOffsetCommit(req_, sid, ++corr_, group, member, gen, kTestTopicId, 0, offset), clock_, out_, kBufSize);
+        const auto r = pc::OffsetCommitResponse::decode(out_, n);
+        return r && !r->results.empty() ? r->results[0].errorCode : int16_t{-1};
+    }
+    int64_t committed(const std::string& group) {
+        const std::size_t n = service_->handleOffsetFetch(req_, encodeOffsetFetch(req_, 1, ++corr_, group, kTestTopicId, 0),
+                                                          clock_, out_, kBufSize);
+        const auto r = pc::OffsetFetchResponse::decode(out_, n);
+        return r && !r->results.empty() ? r->results[0].offset : int64_t{-999};
+    }
+    static constexpr int16_t kUnknownMember = static_cast<int16_t>(pc::ErrorCode::UnknownMember);
+    static constexpr int16_t kOk            = static_cast<int16_t>(pc::ErrorCode::OK);
+    int64_t corr_ = 10'000;
+};
+
+TEST_F(MemberBindingTest, LeaveGroupOfAnotherSessionsMemberIsRefusedRegression) {
+    const JoinedMember m = joinStable(/*sid=*/1, "world-7");
+    EXPECT_EQ(leave(/*sid=*/2, "world-7", m.id), kUnknownMember) << "another session's member is not this session's to evict";
+    EXPECT_EQ(leave(2, "world-7", "world-7-no-such-member"), kUnknownMember) << "the same answer as a member that does not exist";
+    auto& gc = service_->coordinator("world-7");
+    EXPECT_EQ(gc.memberCount(), 1u);
+    EXPECT_EQ(gc.state(), GroupState::Stable) << "no rebalance";
+    EXPECT_EQ(gc.generationId(), m.generation);
+    EXPECT_EQ(heartbeat(1, "world-7", m.id, m.generation), kOk) << "the owner is still a member";
+    EXPECT_EQ(leave(1, "world-7", m.id), kOk) << "the owner itself may leave";
+    EXPECT_EQ(gc.memberCount(), 0u);
+}
+
+TEST_F(MemberBindingTest, SyncGroupOfAnotherSessionsMemberIsRefusedRegression) {
+    const JoinedMember m = joinStable(1, "g-sync");
+    EXPECT_EQ(sync(2, "g-sync", m.id, m.generation), kUnknownMember) << "another session's assignment is not handed out";
+    EXPECT_EQ(sync(2, "g-sync", "g-sync-no-such-member", m.generation), kUnknownMember);
+    EXPECT_EQ(sync(1, "g-sync", m.id, m.generation), kOk);
+}
+
+TEST_F(MemberBindingTest, HeartbeatOfAnotherSessionsMemberIsRefusedRegression) {
+    const JoinedMember m = joinStable(1, "g-hb");
+    EXPECT_EQ(heartbeat(2, "g-hb", m.id, m.generation), kUnknownMember);
+    EXPECT_EQ(heartbeat(2, "g-hb", "g-hb-no-such-member", m.generation), kUnknownMember);
+    // Only the foreign session heartbeats: the member is not kept alive by it and expires on its own timeout.
+    const int64_t until = clock_ + 6'000 * kStep;
+    while (clock_ < until) {
+        clock_ += 100 * kStep;
+        (void)heartbeat(2, "g-hb", m.id, m.generation);
+        service_->doWork(clock_);
+    }
+    EXPECT_EQ(service_->coordinator("g-hb").memberCount(), 0u) << "a foreign heartbeat refreshed the member";
+}
+
+TEST_F(MemberBindingTest, OffsetCommitOfAnotherSessionsMemberIsRefusedRegression) {
+    const JoinedMember m = joinStable(1, "g-commit");
+    ASSERT_EQ(commit(1, "g-commit", m.id, m.generation, 100), kOk);
+    EXPECT_EQ(commit(2, "g-commit", m.id, m.generation, 500), kUnknownMember);
+    EXPECT_EQ(commit(2, "g-commit", "g-commit-no-such-member", m.generation, 500), kUnknownMember);
+    EXPECT_EQ(committed("g-commit"), 100) << "the foreign commit moved the group's position";
+}
+
+TEST_F(MemberBindingTest, JoinGroupWithAnotherSessionsMemberIdIsRefusedRegression) {
+    const JoinedMember m = joinStable(1, "g-rejoin");
+    // Without a gateway every session is the same (anonymous) principal; a different principal is covered in
+    // AuthEnforcementTest.  Here: an unknown member id never names a member - it gets a fresh one.
+    const std::size_t n = service_->handleJoinGroup(
+        req_, encodeJoinGroup(req_, 2, ++corr_, "g-rejoin", "g-rejoin-chosen-by-the-client", 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
+    const std::string got = memberOf(n);
+    EXPECT_NE(got, "g-rejoin-chosen-by-the-client") << "a client-chosen id is never adopted";
+    EXPECT_NE(got, m.id);
+    EXPECT_FALSE(got.empty());
+}
+
+// Issue #169: generations restart with the coordinator; a commit from a member of the previous coordinator that
+// carries a generation number the new one reuses is refused (the member id is checked, not only the generation).
+TEST_F(MemberBindingTest, OffsetCommitFromAPreRestartMemberIsRefusedRegression) {
+    const JoinedMember old = joinStable(1, "g-restart");
+    ASSERT_EQ(commit(1, "g-restart", old.id, old.generation, 100), kOk);
+    ASSERT_TRUE(pumpHW(1));
+
+    // Restart the coordinator over the same replicated offsets.
+    service_ = std::make_unique<GroupCoordinationService>(store_.get(), registry_.get(), [this] { return isLeader_; },
+                                                          [this] { return leaderNodeId_; });
+    service_->doWork(clock_);
+    ASSERT_EQ(committed("g-restart"), 100);
+    const JoinedMember fresh = joinStable(3, "g-restart");
+    ASSERT_EQ(fresh.generation, old.generation) << "precondition: the new coordinator reuses the generation number";
+
+    EXPECT_EQ(commit(1, "g-restart", old.id, old.generation, 500), kUnknownMember);
+    EXPECT_EQ(commit(3, "g-restart", old.id, old.generation, 500), kUnknownMember) << "the old id, even on a live session";
+    EXPECT_EQ(committed("g-restart"), 100) << "a pre-restart member's late commit moved the position";
+    EXPECT_EQ(commit(3, "g-restart", fresh.id, fresh.generation, 200), kOk);
+}
+
+// Issue #124 (principal binding): sessions 1 and 3 are user 7, session 2 is user 8.  User 8 naming user 7's member
+// in a JoinGroup gets a new member of its own; user 7 re-joining from a new session (a reconnect) takes its member
+// over, and the old session no longer owns it.
+namespace {
+uint64_t principalBySession(void*, int64_t sid) noexcept { return sid == 2 ? 8 : 7; }
+}  // namespace
+
+TEST_F(MemberBindingTest, JoinGroupWithAnotherPrincipalsMemberIdJoinsANewMemberRegression) {
+    service_->setPrincipalResolverForTest(&principalBySession, nullptr);
+    const JoinedMember m = joinStable(/*sid=*/1, "g-principal");
+    const std::string foreign = memberOf(service_->handleJoinGroup(
+        req_, encodeJoinGroup(req_, /*sid=*/2, ++corr_, "g-principal", m.id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
+    EXPECT_NE(foreign, m.id) << "another principal took over the member (and its assignment)";
+    EXPECT_FALSE(foreign.empty());
+    EXPECT_EQ(service_->coordinator("g-principal").memberCount(), 2u);
+
+    // Same principal, new session: a re-join of its own member.
+    const std::string again = memberOf(service_->handleJoinGroup(
+        req_, encodeJoinGroup(req_, /*sid=*/3, ++corr_, "g-principal", m.id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
+    EXPECT_EQ(again, m.id) << "a reconnecting owner keeps its member";
+    const int32_t gen = service_->coordinator("g-principal").generationId();
+    EXPECT_EQ(heartbeat(1, "g-principal", m.id, gen), kUnknownMember) << "the old session no longer owns it";
+    EXPECT_NE(heartbeat(3, "g-principal", m.id, gen), kUnknownMember);
+}
+
+// The member-id table drops a member the coordinator removed on its own (session expiry): its id is unbound, so a
+// re-join naming it - even by the old owner's session - is a fresh member, and nothing accumulates.
+TEST_F(MemberBindingTest, ExpiredMemberLosesItsBindingRegression) {
+    const JoinedMember m = joinStable(1, "g-expire");
+    ASSERT_TRUE(driveUntil([&] { return service_->coordinator("g-expire").memberCount() == 0; }, 10'000));
+    EXPECT_EQ(heartbeat(1, "g-expire", m.id, m.generation), kUnknownMember);
+    EXPECT_EQ(commit(1, "g-expire", m.id, m.generation, 7), kUnknownMember);
+    EXPECT_EQ(leave(1, "g-expire", m.id), kUnknownMember);
+    const std::string next = memberOf(service_->handleJoinGroup(
+        req_, encodeJoinGroup(req_, 1, ++corr_, "g-expire", m.id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
+    EXPECT_NE(next, m.id);
+}
+
+// ===========================================================================
+// Adversarial review of PR #423 (issues #123 / #124 / #169): attack the member-binding area through the service's
+// public handlers (the wire frames the gateway forwards).
+// ===========================================================================
+
+// Protocol state (replay after Leave): a member id that left is never re-adopted - not by its own session, not by
+// another - and every member-scoped request naming it is UnknownMember.
+TEST_F(MemberBindingTest, LeftMemberIdIsNeverReadoptedAdversarialRegression) {
+    const JoinedMember m = joinStable(1, "g-left");
+    ASSERT_EQ(leave(1, "g-left", m.id), kOk);
+    for (const int64_t sid : {int64_t{1}, int64_t{2}}) {
+        EXPECT_EQ(heartbeat(sid, "g-left", m.id, m.generation), kUnknownMember) << "session " << sid;
+        EXPECT_EQ(sync(sid, "g-left", m.id, m.generation),
+                  sync(sid, "g-left", "g-left-9-00000000000000000000000000000000", m.generation)) << "session " << sid;
+        EXPECT_EQ(commit(sid, "g-left", m.id, m.generation, 9), kUnknownMember) << "session " << sid;
+        EXPECT_EQ(leave(sid, "g-left", m.id), kUnknownMember) << "session " << sid;
+        const std::string got = memberOf(service_->handleJoinGroup(
+            req_, encodeJoinGroup(req_, sid, ++corr_, "g-left", m.id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
+        EXPECT_NE(got, m.id) << "session " << sid << ": a departed member id was re-adopted";
+        EXPECT_FALSE(got.empty());
+    }
+}
+
+// Protocol state x group state: requests naming another session's member while the group is PreparingRebalance and
+// then Stable change nothing (no generation bump, no member removed, no position moved) and are answered exactly as
+// for a member that does not exist.
+TEST_F(MemberBindingTest, ForeignRequestsInEveryRebalanceStateChangeNothingAdversarialRegression) {
+    const JoinedMember a = joinStable(1, "g-states");
+    auto& gc = service_->coordinator("g-states");
+    ASSERT_EQ(commit(1, "g-states", a.id, a.generation, 100), kOk);
+    // A second member (session 4) joins: PreparingRebalance.
+    const std::string b = memberOf(service_->handleJoinGroup(
+        req_, encodeJoinGroup(req_, 4, ++corr_, "g-states", "", 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
+    ASSERT_EQ(gc.state(), GroupState::PreparingRebalance);
+    auto attack = [&](const char* where) {
+        const int32_t gen = gc.generationId();
+        const GroupState st = gc.state();
+        const std::size_t members = gc.memberCount();
+        const std::string nobody = "g-states-9-00000000000000000000000000000000";
+        for (const std::string& victim : {a.id, b}) {
+            EXPECT_EQ(heartbeat(2, "g-states", victim, gen), heartbeat(2, "g-states", nobody, gen)) << where;
+            EXPECT_EQ(sync(2, "g-states", victim, gen), sync(2, "g-states", nobody, gen)) << where;
+            EXPECT_EQ(commit(2, "g-states", victim, gen, 777), kUnknownMember) << where;
+            EXPECT_EQ(leave(2, "g-states", victim), kUnknownMember) << where;
+        }
+        EXPECT_EQ(gc.generationId(), gen) << where;
+        EXPECT_EQ(gc.state(), st) << where;
+        EXPECT_EQ(gc.memberCount(), members) << where;
+        EXPECT_EQ(committed("g-states"), 100) << where << ": a foreign commit moved the position";
+    };
+    attack("PreparingRebalance");
+    (void)service_->handleJoinGroup(req_, encodeJoinGroup(req_, 1, ++corr_, "g-states", a.id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
+    (void)service_->handleJoinGroup(req_, encodeJoinGroup(req_, 4, ++corr_, "g-states", b, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
+    ASSERT_TRUE(driveUntil([&] { return gc.state() == GroupState::Stable; }, 10));
+    attack("Stable");
+    EXPECT_EQ(gc.memberCount(), 2u);
+}
+
+// Concurrency / reconnect: the owner re-joins from a new session (same principal) and so moves its member there.  The
+// old session closing afterwards (session reap) must not evict the moved member, and the old session no longer owns it.
+TEST_F(MemberBindingTest, ClosingTheOldSessionDoesNotEvictAMemberItsOwnerMovedAdversarialRegression) {
+    const JoinedMember m = joinStable(1, "g-moved");
+    const std::string again = memberOf(service_->handleJoinGroup(
+        req_, encodeJoinGroup(req_, 3, ++corr_, "g-moved", m.id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
+    ASSERT_EQ(again, m.id) << "a reconnect of the same principal keeps its member";
+    service_->evictSessionMembers(/*sessionId=*/1, clock_);
+    EXPECT_EQ(service_->coordinator("g-moved").memberCount(), 1u) << "the old session's reap evicted the moved member";
+    const int32_t gen = service_->coordinator("g-moved").generationId();
+    EXPECT_EQ(heartbeat(1, "g-moved", m.id, gen), kUnknownMember);
+    EXPECT_EQ(leave(1, "g-moved", m.id), kUnknownMember);
+    EXPECT_NE(heartbeat(3, "g-moved", m.id, gen), kUnknownMember);
+    EXPECT_EQ(leave(3, "g-moved", m.id), kOk);
+}
+
+// Input bounds: the binding key is "<group>:<member>".  A group name and a member id that concatenate to another
+// group's key must never reach that member, and a JoinGroup naming such an id must not adopt it (an id is never taken
+// from the client) nor move the other group's binding.  All sessions are the same (anonymous) principal here, so the
+// principal check does not mask the alias.
+TEST_F(MemberBindingTest, MemberKeySeparatorDoesNotAliasAcrossGroupsAdversarialRegression) {
+    const JoinedMember victim = joinStable(1, "x:y");
+    const int32_t gen = victim.generation;
+    // Group "x" + member "y:<victim id>" builds the victim's key "x:y:<victim id>".
+    const std::string alias = "y:" + victim.id;
+    EXPECT_EQ(heartbeat(2, "x", alias, gen), kUnknownMember);
+    EXPECT_EQ(leave(2, "x", alias), kUnknownMember);
+    EXPECT_EQ(commit(2, "x", alias, gen, 5), kUnknownMember);
+    const std::string got = memberOf(service_->handleJoinGroup(
+        req_, encodeJoinGroup(req_, 2, ++corr_, "x", alias, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
+    EXPECT_NE(got, alias);
+    EXPECT_EQ(service_->coordinator("x:y").memberCount(), 1u);
+    EXPECT_EQ(heartbeat(1, "x:y", victim.id, gen), kOk) << "the victim is untouched";
+}
+
+// Input bounds: an EMPTY member id (a standalone consumer's commit, or an id cleared by a refusal) is never a member:
+// OffsetCommit, Heartbeat, Sync and Leave naming it are UnknownMember and the position does not move.
+TEST_F(MemberBindingTest, EmptyMemberIdIsNeverAMemberAdversarialRegression) {
+    const JoinedMember m = joinStable(1, "g-empty");
+    ASSERT_EQ(commit(1, "g-empty", m.id, m.generation, 100), kOk);
+    for (const int64_t sid : {int64_t{1}, int64_t{2}}) {
+        EXPECT_EQ(commit(sid, "g-empty", "", m.generation, 500), kUnknownMember) << "session " << sid;
+        EXPECT_EQ(heartbeat(sid, "g-empty", "", m.generation), kUnknownMember) << "session " << sid;
+        EXPECT_EQ(sync(sid, "g-empty", "", m.generation), kUnknownMember) << "session " << sid;
+        EXPECT_EQ(leave(sid, "g-empty", ""), kUnknownMember) << "session " << sid;
+    }
+    EXPECT_EQ(committed("g-empty"), 100);
+    EXPECT_EQ(service_->coordinator("g-empty").memberCount(), 1u);
+}
+
+// Input bounds: a LeaveGroup truncated at every byte offset is answered (InvalidRequest, or nothing for a frame too
+// short to carry a header) and never evicts the member.
+TEST_F(MemberBindingTest, LeaveGroupTruncatedAtEveryOffsetAdversarialRegression) {
+    const JoinedMember m = joinStable(1, "g-trunc");
+    const std::size_t full = encodeLeaveGroup(req_, 1, ++corr_, "g-trunc", m.id);
+    std::vector<uint8_t> frame(req_, req_ + full);
+    for (std::size_t cut = 0; cut < full; ++cut) {
+        std::vector<uint8_t> t(frame.begin(), frame.begin() + static_cast<std::ptrdiff_t>(cut));
+        const std::size_t n = service_->handleLeaveGroup(t.data(), t.size(), clock_, out_, kBufSize);
+        if (n > 0) {
+            const auto r = pc::LeaveGroupResponse::decode(out_, n);
+            const auto e = pc::ErrorResponse::decode(out_, n);
+            const int code = r ? r->errorCode : (e ? static_cast<int>(e->code) : -1);
+            EXPECT_NE(code, static_cast<int>(kOk)) << "cut " << cut << ": a truncated Leave succeeded";
+        }
+        ASSERT_EQ(service_->coordinator("g-trunc").memberCount(), 1u) << "cut " << cut << ": the member was evicted";
+    }
+    EXPECT_EQ(heartbeat(1, "g-trunc", m.id, m.generation), kOk);
+}
+
+// ===========================================================================
+// #358: a COMMITTED transaction's offset is Applied only once the __consumer_offsets record is committed (the
+// offsets replica's high watermark passed it).  Until then Replicating - the transaction coordinator keeps the
+// transaction PrepareCommit and asks again - and asking again waits on the same record (never re-appends) unless
+// the offsets replica's leadership changed under it (the record may be gone): then it is appended again.
+// ===========================================================================
+TEST(TxnOffsetApplyRegression, ATransactionalOffsetIsAppliedOnlyOnceTheOffsetsRecordIsCommittedRegression) {
+    using rune::coordination::TxnOffsetApply;
+    TempDir dir("txnoff_hw"), topicDir("txnoff_hw_topics");
+    rune::storage::Log log(dir.path);
+    NullTransport transport;
+    // Leader 1 with follower 2 in the ISR: an acks-all append commits only once 2 has fetched it.
+    PartitionReplica rep(makeSingleNodeConfig(1, /*minIsr=*/1), Role::Leader, /*epoch=*/1,
+                         std::vector<NodeId>{1, 2}, std::vector<NodeId>{1, 2}, &log, &transport);
+    ReplicatedOffsetStore store(&rep);
+    rune::gateway::TopicRegistry registry(std::vector<TopicSpec>{makeTopicSpec(std::string(kTestTopic), 2, kTestTopicId)},
+                                          topicDir.path);
+    GroupCoordinationService svc(&store, &registry, [] { return true; }, [] { return NodeId{1}; });
+    int64_t clock = 0;
+    svc.doWork(clock);   // loads the (empty) offsets
+
+    const auto followerFetches = [&](int64_t upTo) {
+        FetchRequestMsg req{};
+        req.leaderEpoch = rep.epoch(); req.partition = 0; req.followerId = 2; req.fetchOffset = upTo;
+        req.maxBytes = 1 << 20; req.topicId = 0;
+        clock += 1'000'000;
+        (void)rep.onFetchRequest(req, clock);
+        rep.doWork(clock);
+    };
+
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 42, clock), TxnOffsetApply::Replicating)
+        << "appended, not committed: never Applied on the local append alone";
+    const auto leo = rep.logEndOffset();
+    ASSERT_EQ(rep.highWatermark(), 0);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 42, clock), TxnOffsetApply::Replicating);
+    EXPECT_EQ(rep.logEndOffset(), leo) << "asking again waits on the record, it does not append another";
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 1u);
+
+    followerFetches(leo);
+    ASSERT_GT(rep.highWatermark(), leo - 1) << "the follower has the record: committed";
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 42, clock), TxnOffsetApply::Applied);
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 0u);
+    EXPECT_EQ(rep.logEndOffset(), leo);
+    ASSERT_TRUE(store.fetch("g", tp(std::string(kTestTopic), 0)).has_value());
+    EXPECT_EQ(store.fetch("g", tp(std::string(kTestTopic), 0))->offset, 42);
+
+    // A pending record whose leadership changes (it may be truncated away) is appended again by the new leadership.
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 1), 7, clock), TxnOffsetApply::Replicating);
+    const auto leo2 = rep.logEndOffset();
+    rep.becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
+    rep.becomeLeader(/*newEpoch=*/3, std::vector<NodeId>{1, 2});
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 1), 7, clock), TxnOffsetApply::Refused)
+        << "the new leadership has not reloaded the offsets yet";
+    followerFetches(rep.logEndOffset());   // the new leadership commits its log end ...
+    clock += 1'000'000;
+    svc.doWork(clock);                     // ... and the group coordinator reloads the offsets
+    const auto r = svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 1), 7, clock);
+    EXPECT_EQ(r, TxnOffsetApply::Replicating);
+    EXPECT_GT(rep.logEndOffset(), leo2) << "a new leadership appends the offset again";
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 1u) << "the earlier leadership's entry is gone";
+    followerFetches(rep.logEndOffset());
+    EXPECT_EQ(svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 1), 7, clock), TxnOffsetApply::Applied);
+
+    // Not the coordinator: Refused, nothing appended.
+    GroupCoordinationService notCoord(&store, &registry, [] { return false; }, [] { return NodeId{2}; });
+    const auto leo3 = rep.logEndOffset();
+    EXPECT_EQ(notCoord.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 99, clock), TxnOffsetApply::Refused);
+    EXPECT_EQ(rep.logEndOffset(), leo3);
+}
+
+// #358: a single-replica offsets partition commits on the append itself - Applied at once, nothing waits.
+TEST(TxnOffsetApplyRegression, ASingleReplicaOffsetsPartitionAppliesAtOnceRegression) {
+    using rune::coordination::TxnOffsetApply;
+    TempDir dir("txnoff_one"), topicDir("txnoff_one_topics");
+    rune::storage::Log log(dir.path);
+    NullTransport transport;
+    PartitionReplica rep(makeSingleNodeConfig(1, 1), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1},
+                         &log, &transport);
+    ReplicatedOffsetStore store(&rep);
+    rune::gateway::TopicRegistry registry(std::vector<TopicSpec>{makeTopicSpec(std::string(kTestTopic), 2, kTestTopicId)},
+                                          topicDir.path);
+    GroupCoordinationService svc(&store, &registry, [] { return true; }, [] { return NodeId{1}; });
+    svc.doWork(0);
+    auto r = svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 5, 0);
+    if (r == TxnOffsetApply::Replicating) {   // the HW may move on the replica's next duty pass
+        rep.doWork(1'000'000);
+        r = svc.applyTransactionalOffset("g", tp(std::string(kTestTopic), 0), 5, 1'000'000);
+    }
+    EXPECT_EQ(r, TxnOffsetApply::Applied);
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 0u);
+}
+
+// Adversarial review of PR #434 (#358): transactional offsets of several transactions for the same (group, tp),
+// interleaved while they replicate.  A record waited on by a transaction that never asks again (its coordinator
+// moved away) must not stand in for a later transaction that commits the same offset value after another value was
+// committed in between: the later commit must append, and the committed offset must end at its value.
+TEST(TxnOffsetApplyRegression, InterleavedTransactionsOnOneGroupPartitionEndAtTheLastCommitAdversarialRegression) {
+    using rune::coordination::TxnOffsetApply;
+    TempDir dir("txnoff_adv"), topicDir("txnoff_adv_topics");
+    rune::storage::Log log(dir.path);
+    NullTransport transport;
+    PartitionReplica rep(makeSingleNodeConfig(1, /*minIsr=*/1), Role::Leader, /*epoch=*/1,
+                         std::vector<NodeId>{1, 2}, std::vector<NodeId>{1, 2}, &log, &transport);
+    ReplicatedOffsetStore store(&rep);
+    rune::gateway::TopicRegistry registry(std::vector<TopicSpec>{makeTopicSpec(std::string(kTestTopic), 2, kTestTopicId)},
+                                          topicDir.path);
+    GroupCoordinationService svc(&store, &registry, [] { return true; }, [] { return NodeId{1}; });
+    int64_t clock = 0;
+    svc.doWork(clock);
+    const auto followerFetches = [&] {
+        FetchRequestMsg req{};
+        req.leaderEpoch = rep.epoch(); req.partition = 0; req.followerId = 2; req.fetchOffset = rep.logEndOffset();
+        req.maxBytes = 1 << 20; req.topicId = 0;
+        clock += 1'000'000;
+        (void)rep.onFetchRequest(req, clock);
+        rep.doWork(clock);
+    };
+    const auto t0 = tp(std::string(kTestTopic), 0);
+
+    // T1 offers 42 and never asks again (its coordinator moved away); T2 commits 50.
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 42, clock), TxnOffsetApply::Replicating);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock), TxnOffsetApply::Replicating);
+    followerFetches();
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock), TxnOffsetApply::Applied);
+    ASSERT_EQ(store.fetch("g", t0)->offset, 50);
+
+    // T3 commits 42 (the group was rewound).  It must be appended and end as the committed offset.
+    const auto leo = rep.logEndOffset();
+    TxnOffsetApply r = svc.applyTransactionalOffset("g", t0, 42, clock);
+    if (r == TxnOffsetApply::Replicating) {
+        followerFetches();
+        r = svc.applyTransactionalOffset("g", t0, 42, clock);
+    }
+    EXPECT_EQ(r, TxnOffsetApply::Applied);
+    EXPECT_GT(rep.logEndOffset(), leo) << "T3's commit is appended, not answered by T1's older record";
+    EXPECT_EQ(store.fetch("g", t0)->offset, 42) << "the committed offset is the last transaction's";
+}
+
+// PR #434 review F2: two transactions waiting on one (group, tp) never re-append over each other.  The older waiter is
+// superseded by the newer append: it is answered from its own (older) record, never appends again, so the value
+// ends as the last append's - no rewind, no ping-pong.  A later transaction (another token) always appends.
+TEST(TxnOffsetApplyRegression, AnOlderWaiterIsSupersededAndNeverAppendsOverTheNewerValueRegression) {
+    using rune::coordination::TxnOffsetApply;
+    TempDir dir("txnoff_sup"), topicDir("txnoff_sup_topics");
+    rune::storage::Log log(dir.path);
+    NullTransport transport;
+    PartitionReplica rep(makeSingleNodeConfig(1, 1), Role::Leader, 1, std::vector<NodeId>{1, 2},
+                         std::vector<NodeId>{1, 2}, &log, &transport);
+    ReplicatedOffsetStore store(&rep);
+    rune::gateway::TopicRegistry registry(std::vector<TopicSpec>{makeTopicSpec(std::string(kTestTopic), 2, kTestTopicId)},
+                                          topicDir.path);
+    GroupCoordinationService svc(&store, &registry, [] { return true; }, [] { return NodeId{1}; });
+    int64_t clock = 0;
+    svc.doWork(clock);
+    const auto fetch = [&] {
+        FetchRequestMsg req{};
+        req.leaderEpoch = rep.epoch(); req.partition = 0; req.followerId = 2; req.fetchOffset = rep.logEndOffset();
+        req.maxBytes = 1 << 20; req.topicId = 0;
+        clock += 1'000'000;
+        (void)rep.onFetchRequest(req, clock);
+        rep.doWork(clock);
+    };
+    const auto t0 = tp(std::string(kTestTopic), 0);
+    constexpr uint64_t kTx1 = 11, kTx2 = 13, kTx3 = 15;
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 42, clock, kTx1), TxnOffsetApply::Replicating);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock, kTx2), TxnOffsetApply::Replicating);
+    const auto leo = rep.logEndOffset();
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 42, clock, kTx1), TxnOffsetApply::Replicating);
+    EXPECT_EQ(rep.logEndOffset(), leo) << "the superseded waiter waits on its own record";
+    fetch();
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 42, clock, kTx1), TxnOffsetApply::Applied);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock, kTx2), TxnOffsetApply::Applied);
+    EXPECT_EQ(rep.logEndOffset(), leo) << "nothing re-appended";
+    EXPECT_EQ(store.fetch("g", t0)->offset, 50) << "the last append wins";
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 0u);
+    // The same value again by a later transaction: appended, not answered by any earlier record.
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock, kTx3), TxnOffsetApply::Replicating);
+    EXPECT_GT(rep.logEndOffset(), leo);
+    // Bounded without eviction: a full key refuses a NEW transaction (its coordinator retries); no waiter is dropped.
+    std::size_t accepted = svc.txnOffsetsReplicating();
+    for (uint64_t t = 100; t < 200; ++t)
+        if (svc.applyTransactionalOffset("g", t0, static_cast<int64_t>(t), clock, t) == TxnOffsetApply::Replicating) ++accepted;
+    EXPECT_EQ(svc.txnOffsetsReplicating(), accepted);
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 64u);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 999, clock, 999), TxnOffsetApply::Refused);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock, kTx3), TxnOffsetApply::Replicating) << "kept, not evicted";
+    // The coordinator releases a transaction it no longer completes: its waiter leaves.
+    svc.releaseTransactionalOffsets(kTx3);
+    EXPECT_EQ(svc.txnOffsetsReplicating(), 63u);
+}
+
+// PR #434 re-check: after the offsets replica's leadership changed under several waiters, only the NEWEST appends
+// again; the older ones wait for it and are answered by it - the committed offset ends at the newest commit, never
+// at an older value re-appended later.
+TEST(TxnOffsetApplyRegression, AfterALeadershipChangeOnlyTheNewestWaiterAppendsAgainRegression) {
+    using rune::coordination::TxnOffsetApply;
+    TempDir dir("txnoff_lc"), topicDir("txnoff_lc_topics");
+    rune::storage::Log log(dir.path);
+    NullTransport transport;
+    PartitionReplica rep(makeSingleNodeConfig(1, 1), Role::Leader, 1, std::vector<NodeId>{1, 2},
+                         std::vector<NodeId>{1, 2}, &log, &transport);
+    ReplicatedOffsetStore store(&rep);
+    rune::gateway::TopicRegistry registry(std::vector<TopicSpec>{makeTopicSpec(std::string(kTestTopic), 2, kTestTopicId)},
+                                          topicDir.path);
+    GroupCoordinationService svc(&store, &registry, [] { return true; }, [] { return NodeId{1}; });
+    int64_t clock = 0;
+    svc.doWork(clock);
+    const auto fetch = [&] {
+        FetchRequestMsg req{};
+        req.leaderEpoch = rep.epoch(); req.partition = 0; req.followerId = 2; req.fetchOffset = rep.logEndOffset();
+        req.maxBytes = 1 << 20; req.topicId = 0;
+        clock += 1'000'000;
+        (void)rep.onFetchRequest(req, clock);
+        rep.doWork(clock);
+    };
+    const auto t0 = tp(std::string(kTestTopic), 0);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 42, clock, 1), TxnOffsetApply::Replicating);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock, 2), TxnOffsetApply::Replicating);
+    rep.becomeFollower(2, 2);
+    rep.becomeLeader(3, std::vector<NodeId>{1, 2});
+    fetch();
+    clock += 1'000'000;
+    svc.doWork(clock);                          // the offsets are reloaded under the new leadership
+    const auto leo = rep.logEndOffset();
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 42, clock, 1), TxnOffsetApply::Replicating)
+        << "the older waiter waits for the newest";
+    EXPECT_EQ(rep.logEndOffset(), leo) << "an older value is never appended again";
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock, 2), TxnOffsetApply::Replicating);
+    EXPECT_GT(rep.logEndOffset(), leo) << "the newest appends again";
+    fetch();
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 42, clock, 1), TxnOffsetApply::Applied);
+    EXPECT_EQ(svc.applyTransactionalOffset("g", t0, 50, clock, 2), TxnOffsetApply::Applied);
+    EXPECT_EQ(store.fetch("g", t0)->offset, 50);
+}
+
+// Re-check of PR #434 round 1 (F2 redesign): two or more concurrent transactional committers on one (group, tp).
+namespace {
+struct OffRig {
+    TempDir dir{"txnoff_rr"}, topicDir{"txnoff_rr_topics"};
+    rune::storage::Log log{dir.path};
+    NullTransport transport;
+    PartitionReplica rep{makeSingleNodeConfig(1, 1), Role::Leader, 1, std::vector<NodeId>{1, 2},
+                         std::vector<NodeId>{1, 2}, &log, &transport};
+    ReplicatedOffsetStore store{&rep};
+    rune::gateway::TopicRegistry registry{std::vector<TopicSpec>{makeTopicSpec(std::string(kTestTopic), 2, kTestTopicId)},
+                                          topicDir.path};
+    GroupCoordinationService svc{&store, &registry, [] { return true; }, [] { return NodeId{1}; }};
+    int64_t clock = 0;
+    OffRig() { svc.doWork(clock); }
+    void fetch() {
+        FetchRequestMsg req{};
+        req.leaderEpoch = rep.epoch(); req.partition = 0; req.followerId = 2; req.fetchOffset = rep.logEndOffset();
+        req.maxBytes = 1 << 20; req.topicId = 0;
+        clock += 1'000'000;
+        (void)rep.onFetchRequest(req, clock);
+        rep.doWork(clock);
+    }
+};
+}  // namespace
+
+TEST(TxnOffsetApplyRegression, ANewerWaiterAppliedFirstNeverLetsTheOlderOneRewindAdversarialRegression) {
+    using rune::coordination::TxnOffsetApply;
+    OffRig g;
+    const auto t0 = tp(std::string(kTestTopic), 0);
+    EXPECT_EQ(g.svc.applyTransactionalOffset("g", t0, 42, g.clock, 11), TxnOffsetApply::Replicating);
+    EXPECT_EQ(g.svc.applyTransactionalOffset("g", t0, 50, g.clock, 13), TxnOffsetApply::Replicating);
+    g.fetch();
+    EXPECT_EQ(g.svc.applyTransactionalOffset("g", t0, 50, g.clock, 13), TxnOffsetApply::Applied);   // newer first
+    const auto leo = g.rep.logEndOffset();
+    const auto r = g.svc.applyTransactionalOffset("g", t0, 42, g.clock, 11);                        // then older
+    EXPECT_EQ(r, TxnOffsetApply::Applied);
+    EXPECT_EQ(g.rep.logEndOffset(), leo) << "the older waiter re-appended";
+    EXPECT_EQ(g.store.fetch("g", t0)->offset, 50) << "the committed offset was rewound";
+}
+
+TEST(TxnOffsetApplyRegression, ANinthWaiterNeverMakesTheEvictedOldestRewindAdversarialRegression) {
+    using rune::coordination::TxnOffsetApply;
+    OffRig g;
+    const auto t0 = tp(std::string(kTestTopic), 0);
+    for (uint64_t t = 1; t <= 9; ++t)
+        EXPECT_EQ(g.svc.applyTransactionalOffset("g", t0, static_cast<int64_t>(100 + t), g.clock, t), TxnOffsetApply::Replicating);
+    const auto leo = g.rep.logEndOffset();
+    (void)g.svc.applyTransactionalOffset("g", t0, 101, g.clock, 1);   // the evicted oldest asks again
+    EXPECT_EQ(g.rep.logEndOffset(), leo) << "the evicted waiter re-appended its older value";
+    g.fetch();
+    for (uint64_t t = 1; t <= 9; ++t) (void)g.svc.applyTransactionalOffset("g", t0, static_cast<int64_t>(100 + t), g.clock, t);
+    EXPECT_EQ(g.store.fetch("g", t0)->offset, 109) << "the committed offset is the newest commit's";
+}
+
+// ===========================================================================
+// Issue #433: a plain OffsetCommit is answered only once its __consumer_offsets record is COMMITTED (the high
+// watermark passed it), as the transactional path does (#358).  Before the fix the answer left on the local append,
+// and a failover of the offsets partition in that window lost an offset the consumer had been told was committed.
+// Issue #438: a (group, tp) held by an unfinished transaction is neither fetched nor plainly committed (retriable).
+// ===========================================================================
+namespace {
+struct GroupAnswers {
+    std::vector<std::vector<uint8_t>> frames;
+    static void sink(void* ctx, int64_t, const uint8_t* f, std::size_t n) {
+        static_cast<GroupAnswers*>(ctx)->frames.emplace_back(f, f + n);
+    }
+};
+
+/// OffRig (two-replica offsets partition) plus one Stable member of `group` bound to session 1.
+struct CommitRig : OffRig {
+    GroupAnswers answers;
+    uint8_t      req[4096]{};
+    uint8_t      out[4096]{};
+    int64_t      corr = 1;
+    std::string  member;
+    int32_t      gen = -1;
+    explicit CommitRig(const std::string& group) {
+        svc.setAnswerSinkForTest(&GroupAnswers::sink, &answers);
+        std::size_t n = svc.handleJoinGroup(req, encodeJoinGroup(req, 1, corr++, group, ""), rune::protocol::client::kClientVersion, clock, out, sizeof out);
+        const auto j = pc::JoinGroupResponse::decode(out, n);
+        if (j) member.assign(reinterpret_cast<const char*>(j->memberId.data()), j->memberId.size());
+        (void)svc.handleJoinGroup(req, encodeJoinGroup(req, 1, corr++, group, member), rune::protocol::client::kClientVersion, clock, out, sizeof out);
+        for (int i = 0; i < 200 && svc.coordinator(group).state() != GroupState::Stable; ++i) {
+            clock += 10'000'000;
+            svc.doWork(clock);
+        }
+        gen = svc.coordinator(group).generationId();
+    }
+    std::size_t commit(const std::string& group, int64_t offset) {
+        return svc.handleOffsetCommit(req, encodeOffsetCommit(req, 1, corr++, group, member, gen, kTestTopicId, 0, offset),
+                                      clock, out, sizeof out);
+    }
+    static int16_t codeOf(const uint8_t* f, std::size_t n) {
+        const auto r = pc::OffsetCommitResponse::decode(f, n);
+        return r && !r->results.empty() ? r->results[0].errorCode : int16_t{-1};
+    }
+};
+}  // namespace
+
+TEST(OffsetCommitDurabilityRegression, APlainCommitIsAnsweredOnlyOnceItsRecordIsCommittedRegression) {
+    CommitRig g("g433");
+    ASSERT_FALSE(g.member.empty());
+    ASSERT_EQ(g.svc.coordinator("g433").state(), GroupState::Stable);
+    EXPECT_EQ(g.commit("g433", 77), 0u) << "answered on the local append, before the record committed";
+    EXPECT_TRUE(g.answers.frames.empty());
+    EXPECT_EQ(g.svc.parkedOffsetCommits(), 1u);
+    g.svc.doWork(g.clock);
+    EXPECT_TRUE(g.answers.frames.empty()) << "released before the follower had the record";
+    g.fetch();                                   // the follower fetched: the high watermark passes the record
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u);
+    EXPECT_EQ(CommitRig::codeOf(g.answers.frames[0].data(), g.answers.frames[0].size()), 0);
+    EXPECT_EQ(g.svc.parkedOffsetCommits(), 0u);
+    EXPECT_EQ(g.store.fetch("g433", tp(std::string(kTestTopic), 0))->offset, 77);
+}
+
+TEST(OffsetCommitDurabilityRegression, AnOffsetsLeaderChangeUnderAParkedCommitNeverAnswersOkRegression) {
+    CommitRig g("g433lc");
+    ASSERT_EQ(g.commit("g433lc", 88), 0u);
+    g.rep.becomeFollower(2, 2);                  // the record may be gone with the old leadership
+    g.rep.becomeLeader(3, std::vector<NodeId>{1, 2});
+    g.fetch();
+    g.clock += 1'000'000;
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u) << "a parked commit is always answered (no hang)";
+    EXPECT_EQ(CommitRig::codeOf(g.answers.frames[0].data(), g.answers.frames[0].size()),
+              static_cast<int16_t>(pc::ErrorCode::NotCoordinator))
+        << "OK was answered for a record that may not have survived the leader change";
+}
+
+TEST(OffsetCommitDurabilityRegression, AHeldKeyIsNeitherFetchedNorPlainlyCommittedRegression) {
+    CommitRig g("g438");
+    struct Probe {
+        rune::coordination::TxnOffsetHold hold = rune::coordination::TxnOffsetHold::Held;
+        static rune::coordination::TxnOffsetHold of(void* ctx, const std::string&, const TopicPartition&) {
+            return static_cast<Probe*>(ctx)->hold;
+        }
+    } probe;
+    g.svc.setTxnOffsetHoldProbe(&Probe::of, &probe);
+    const auto unstable = static_cast<int16_t>(pc::ErrorCode::UnstableOffsetCommit);
+    std::size_t n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, "g438", kTestTopicId, 0), g.clock,
+                                            g.out, sizeof g.out);
+    auto f = pc::OffsetFetchResponse::decode(g.out, n);
+    ASSERT_TRUE(f && !f->results.empty());
+    EXPECT_EQ(f->results[0].errorCode, unstable) << "a held key's committed offset was handed out";
+    const auto leo = g.rep.logEndOffset();
+    n = g.commit("g438", 5);
+    ASSERT_GT(n, 0u) << "a refusal is answered at once";
+    EXPECT_EQ(CommitRig::codeOf(g.out, n), unstable);
+    EXPECT_EQ(g.rep.logEndOffset(), leo) << "a plain record was appended over a held key";
+    probe.hold = rune::coordination::TxnOffsetHold::Unknown;   // the txn coordinator is not loaded here
+    n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, "g438", kTestTopicId, 0), g.clock, g.out,
+                                sizeof g.out);
+    f = pc::OffsetFetchResponse::decode(g.out, n);
+    ASSERT_TRUE(f && !f->results.empty());
+    EXPECT_EQ(f->results[0].errorCode, unstable) << "unknown hold state must be treated as held";
+    probe.hold = rune::coordination::TxnOffsetHold::Free;
+    n = g.commit("g438", 6);
+    if (n == 0) { g.fetch(); g.svc.doWork(g.clock); }
+    EXPECT_EQ(g.store.fetch("g438", tp(std::string(kTestTopic), 0))->offset, 6);
+}
+
+// ===========================================================================
+// M1 interaction matrix (#433 / #438 / #125): parked OffsetCommit answers, holds × request × client version, and
+// the TxnOffsetCommit member fence.
+// ===========================================================================
+namespace {
+std::size_t encodeTwoEntryCommit(uint8_t* buf, int64_t sessionId, int64_t corr, std::string_view group,
+                                 std::string_view member, int32_t gen, int32_t topicB, int64_t offset) {
+    pc::OffsetCommit msg;
+    msg.sessionId = sessionId; msg.correlationId = corr; msg.generationId = gen;
+    msg.groupId  = {reinterpret_cast<const uint8_t*>(group.data()), group.size()};
+    msg.memberId = {reinterpret_cast<const uint8_t*>(member.data()), member.size()};
+    const std::array<pc::OffsetCommitEntry, 2> entries{
+        pc::OffsetCommitEntry{kTestTopicId, 0, offset, {}}, pc::OffsetCommitEntry{topicB, 0, offset, {}}};
+    return msg.encode(buf, std::span<const pc::OffsetCommitEntry>(entries));
+}
+int64_t corrOf(const std::vector<uint8_t>& f) {
+    const auto r = pc::OffsetCommitResponse::decode(f.data(), f.size());
+    return r ? r->correlationId : -1;
+}
+}  // namespace
+
+TEST(OffsetCommitDurabilityRegression, ParkedAnswersLeaveInRequestOrderEvenWhenALaterOneIsCommittedRegression) {
+    CommitRig g("gorder");
+    const int64_t c1 = g.corr;
+    ASSERT_EQ(g.commit("gorder", 10), 0u);
+    g.fetch();   // the first record commits ...
+    const int64_t c2 = g.corr;
+    // ... but its answer is still parked (doWork has not run): the next commit queues behind it, even though the
+    // follower will have its record at once.
+    ASSERT_EQ(g.commit("gorder", 11), 0u) << "a commit overtook a parked one on the same coordinator";
+    EXPECT_EQ(g.svc.parkedOffsetCommits(), 2u);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 2u);
+    EXPECT_EQ(corrOf(g.answers.frames[0]), c1);
+    EXPECT_EQ(corrOf(g.answers.frames[1]), c2);
+    EXPECT_EQ(CommitRig::codeOf(g.answers.frames[1].data(), g.answers.frames[1].size()), 0);
+}
+
+TEST(OffsetCommitDurabilityRegression, ACoordinatorThatStopsCoordinatingAnswersParkedCommitsNotCoordinatorRegression) {
+    CommitRig g("glost");
+    ASSERT_EQ(g.commit("glost", 5), 0u);
+    g.svc.setLocalLeadership(false);
+    g.fetch();   // the record even commits: this node no longer coordinates the group, so it does not say OK
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u) << "a parked commit is always answered";
+    EXPECT_EQ(CommitRig::codeOf(g.answers.frames[0].data(), g.answers.frames[0].size()),
+              static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    EXPECT_EQ(g.svc.parkedOffsetCommits(), 0u);
+}
+
+TEST(OffsetCommitDurabilityRegression, ALostParkedCommitKeepsItsNonOkEntriesAndRewritesOnlyOkOnesRegression) {
+    CommitRig g("gmixed");
+    const std::size_t n = g.svc.handleOffsetCommit(
+        g.req, encodeTwoEntryCommit(g.req, 1, g.corr++, "gmixed", g.member, g.gen, /*unknown topic*/ 77, 9), g.clock,
+        g.out, sizeof g.out);
+    ASSERT_EQ(n, 0u);
+    g.rep.becomeFollower(2, 2);
+    g.rep.becomeLeader(3, std::vector<NodeId>{1, 2});
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u);
+    const auto r = pc::OffsetCommitResponse::decode(g.answers.frames[0].data(), g.answers.frames[0].size());
+    ASSERT_TRUE(r && r->results.size() == 2u);
+    EXPECT_EQ(r->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    EXPECT_EQ(r->results[1].errorCode, static_cast<int16_t>(pc::ErrorCode::UnknownTopic));
+}
+
+TEST(OffsetCommitDurabilityRegression, AFullParkRefusesNotCoordinatorWithoutAppendingRegression) {
+    CommitRig g("gfull");
+    std::size_t parked = 0;
+    for (int i = 0; i < 1000 && g.commit("gfull", 100 + i) == 0; ++i) ++parked;
+    ASSERT_EQ(parked, g.svc.parkedOffsetCommits());
+    ASSERT_GT(parked, 0u);
+    const auto leo = g.rep.logEndOffset();
+    const std::size_t n = g.commit("gfull", 5000);
+    ASSERT_GT(n, 0u) << "a full park answers at once (never a hang)";
+    EXPECT_EQ(CommitRig::codeOf(g.out, n), static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    EXPECT_EQ(g.rep.logEndOffset(), leo) << "a refused commit was appended";
+    EXPECT_GE(g.svc.parkRefusalsForTest(), 1u);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    EXPECT_EQ(g.answers.frames.size(), parked) << "every parked answer is released once its record commits";
+    EXPECT_EQ(g.svc.parkedOffsetCommits(), 0u);
+    EXPECT_EQ(g.commit("gfull", 6000), 0u) << "room again once the park drained";
+}
+
+// #438 × request kind × client version: Free serves; Held / Unknown answer the retriable code (50 to a client >= 10
+// or of unknown version, NotCoordinator below) and append nothing.
+TEST(OffsetCommitDurabilityRegression, HoldStateByRequestByClientVersionMatrixRegression) {
+    using H = rune::coordination::TxnOffsetHold;
+    struct Probe {
+        H hold = H::Free;
+        static H of(void* ctx, const std::string&, const TopicPartition&) { return static_cast<Probe*>(ctx)->hold; }
+    };
+    struct Version {
+        int32_t v = -1;
+        static int32_t of(void* ctx, int64_t) noexcept { return static_cast<Version*>(ctx)->v; }
+    };
+    const auto unstable = static_cast<int16_t>(pc::ErrorCode::UnstableOffsetCommit);
+    const auto notCoord = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+    int row = 0;
+    for (const H hold : {H::Free, H::Held, H::Unknown}) {
+        for (const int32_t version : {-1, 9, 10}) {
+            const std::string group = "gm" + std::to_string(row++);
+            CommitRig g(group);
+            Probe probe{hold};
+            Version ver{version};
+            g.svc.setClientVersionResolverForTest(&Version::of, &ver);
+            ASSERT_EQ(g.commit(group, 40), 0u);   // a committed offset to (not) hand out: committed while Free
+            g.fetch();
+            g.svc.doWork(g.clock);
+            g.svc.setTxnOffsetHoldProbe(&Probe::of, &probe);
+            const int16_t refused = version == 9 ? notCoord : unstable;
+            SCOPED_TRACE(::testing::Message() << "hold=" << static_cast<int>(hold) << " version=" << version);
+            // OffsetFetch of one entry
+            std::size_t n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, group, kTestTopicId, 0),
+                                                    g.clock, g.out, sizeof g.out);
+            auto f = pc::OffsetFetchResponse::decode(g.out, n);
+            ASSERT_TRUE(f && f->results.size() == 1u);
+            EXPECT_EQ(f->results[0].errorCode, hold == H::Free ? int16_t{0} : refused);
+            EXPECT_EQ(f->results[0].offset, hold == H::Free ? int64_t{40} : int64_t{-1});
+            // OffsetFetch of every committed offset (fetch-all)
+            n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetchAll(g.req, 1, g.corr++, group), g.clock, g.out,
+                                        sizeof g.out);
+            f = pc::OffsetFetchResponse::decode(g.out, n);
+            ASSERT_TRUE(f && f->results.size() == 1u);
+            EXPECT_EQ(f->results[0].errorCode, hold == H::Free ? int16_t{0} : refused);
+            // plain OffsetCommit
+            const auto leo = g.rep.logEndOffset();
+            n = g.commit(group, 41);
+            if (hold == H::Free) {
+                EXPECT_EQ(n, 0u) << "parked until committed";
+                EXPECT_EQ(g.rep.logEndOffset(), leo + 1);
+            } else {
+                ASSERT_GT(n, 0u);
+                EXPECT_EQ(CommitRig::codeOf(g.out, n), refused);
+                EXPECT_EQ(g.rep.logEndOffset(), leo) << "a plain record was appended over a held key";
+            }
+        }
+    }
+}
+
+// #125: GroupCoordinationService::checkTxnOffsetMember applies exactly the OffsetCommit member rules.
+TEST(OffsetCommitDurabilityRegression, TxnOffsetMemberFenceMatrixRegression) {
+    using EC = pc::ErrorCode;
+    CommitRig g("gfence");
+    struct Row { const char* what; std::string group; std::string member; int32_t gen; int64_t session; EC want; };
+    const std::vector<Row> rows = {
+        {"the member at its generation", "gfence", g.member, g.gen, 1, EC::OK},
+        {"a stale generation", "gfence", g.member, g.gen - 1, 1, EC::IllegalGeneration},
+        {"a future generation", "gfence", g.member, g.gen + 1, 1, EC::IllegalGeneration},
+        {"another session's member", "gfence", g.member, g.gen, 2, EC::UnknownMember},
+        {"an unknown member", "gfence", "nobody", g.gen, 1, EC::UnknownMember},
+        {"an empty member", "gfence", "", g.gen, 1, EC::UnknownMember},
+        {"an unknown group", "other", g.member, g.gen, 1, EC::UnknownMember},
+    };
+    for (const Row& r : rows)
+        EXPECT_EQ(g.svc.checkTxnOffsetMember(r.group, r.member, r.gen, r.session), r.want) << r.what;
+    g.svc.setLocalLeadership(false);
+    EXPECT_EQ(g.svc.checkTxnOffsetMember("gfence", g.member, g.gen, 1), EC::NotCoordinator);
+}
+
+// ===========================================================================
+// Adversarial review of PR #466 (#433): the parked-answer pool at its bounds, and a lost parked commit re-sent.
+// ===========================================================================
+namespace {
+/// A plain OffsetCommit of `n` entries: entry i is (kTestTopicId, i % 2, base + i), except every 7th names an unknown
+/// topic (its answer is UnknownTopic - a marker of the entry's position in the parked results ring).
+std::vector<uint8_t> encodeWideCommit(int64_t sessionId, int64_t corr, std::string_view group, std::string_view member,
+                                      int32_t gen, std::size_t n, int64_t base) {
+    std::vector<pc::OffsetCommitEntry> entries(n);
+    for (std::size_t i = 0; i < n; ++i)
+        entries[i] = pc::OffsetCommitEntry{i % 7 == 3 ? 4242 : kTestTopicId, static_cast<int32_t>(i % 2),
+                                           base + static_cast<int64_t>(i), {}};
+    pc::OffsetCommit msg;
+    msg.sessionId = sessionId; msg.correlationId = corr; msg.generationId = gen;
+    msg.groupId  = {reinterpret_cast<const uint8_t*>(group.data()), group.size()};
+    msg.memberId = {reinterpret_cast<const uint8_t*>(member.data()), member.size()};
+    std::vector<uint8_t> buf(64 + group.size() + member.size() + n * 32);
+    buf.resize(msg.encode(buf.data(), std::span<const pc::OffsetCommitEntry>(entries)));
+    return buf;
+}
+void expectWideAnswer(const std::vector<uint8_t>& f, std::size_t n, int16_t okCode, const char* what) {
+    const auto r = pc::OffsetCommitResponse::decode(f.data(), f.size());
+    ASSERT_TRUE(r) << what;
+    ASSERT_EQ(r->results.size(), n) << what;
+    for (std::size_t i = 0; i < n; ++i) {
+        const bool unknown = i % 7 == 3;
+        ASSERT_EQ(r->results[i].topicId, unknown ? 4242 : kTestTopicId) << what << " entry " << i;
+        ASSERT_EQ(r->results[i].partition, static_cast<int32_t>(i % 2)) << what << " entry " << i;
+        ASSERT_EQ(r->results[i].errorCode,
+                  unknown ? static_cast<int16_t>(pc::ErrorCode::UnknownTopic) : okCode) << what << " entry " << i;
+    }
+}
+}  // namespace
+
+// Never a hang, bounded memory: the results ring (8192) refuses a commit that does not fit WITHOUT appending, every
+// parked answer drains, and a commit whose results WRAP the ring is answered entry-for-entry in request order.
+TEST(OffsetCommitDurabilityRegression, TheParkedResultsRingRefusesWhenFullAndWrapsInOrderAdversarialRegression) {
+    CommitRig g("gring");
+    constexpr std::size_t kN = 3000;   // 3 x 3000 > 8192: the third does not fit
+    std::vector<uint8_t> out(kN * 16 + 64);
+    auto commitWide = [&](int64_t base) {
+        const auto req = encodeWideCommit(1, g.corr++, "gring", g.member, g.gen, kN, base);
+        return g.svc.handleOffsetCommit(req.data(), req.size(), g.clock, out.data(), out.size());
+    };
+    ASSERT_EQ(commitWide(1'000), 0u);
+    ASSERT_EQ(commitWide(10'000), 0u);
+    EXPECT_EQ(g.svc.parkedOffsetCommits(), 2u);
+    const auto leo = g.rep.logEndOffset();
+    const std::size_t n = commitWide(20'000);
+    ASSERT_GT(n, 0u) << "a commit that does not fit the results ring was parked (or dropped)";
+    EXPECT_EQ(g.rep.logEndOffset(), leo) << "a refused commit appended records";
+    {
+        const auto r = pc::OffsetCommitResponse::decode(out.data(), n);
+        ASSERT_TRUE(r && r->results.size() == kN);
+        for (const auto& e : r->results)
+            ASSERT_EQ(e.errorCode, static_cast<int16_t>(pc::ErrorCode::NotCoordinator)) << "a refusal must be retriable";
+    }
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 2u);
+    expectWideAnswer(g.answers.frames[0], kN, 0, "first");
+    expectWideAnswer(g.answers.frames[1], kN, 0, "second");
+    g.answers.frames.clear();
+    // The ring's head is now at 6000: this commit's 3000 results wrap past 8192.
+    ASSERT_EQ(commitWide(30'000), 0u);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u);
+    expectWideAnswer(g.answers.frames[0], kN, 0, "wrapped");
+    // The last known-topic entry of each partition is the committed offset (never an older one of the request).
+    // Entry 2999 (partition 1) names the unknown topic (2999 % 7 == 3): partition 1's last is 2997, partition 0's 2998.
+    EXPECT_EQ(g.store.fetch("gring", tp(std::string(kTestTopic), 1))->offset, 30'000 + 2'997);
+    EXPECT_EQ(g.store.fetch("gring", tp(std::string(kTestTopic), 0))->offset, 30'000 + 2'998);
+    EXPECT_EQ(g.svc.parkedOffsetCommits(), 0u);
+}
+
+// The same commit sent twice around a lost park: the first answer is NotCoordinator (the offsets leader changed), the
+// re-sent one is OK only once committed, and the committed offset never moves back to the earlier commit's.
+TEST(OffsetCommitDurabilityRegression, ACommitResentAfterALostParkIsOkOnceCommittedAndNeverMovesBackAdversarialRegression) {
+    CommitRig g("gresend");
+    ASSERT_EQ(g.commit("gresend", 50), 0u);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u);
+    ASSERT_EQ(CommitRig::codeOf(g.answers.frames[0].data(), g.answers.frames[0].size()), 0);
+    g.answers.frames.clear();
+
+    ASSERT_EQ(g.commit("gresend", 88), 0u);
+    ASSERT_EQ(g.commit("gresend", 88), 0u) << "the duplicate queues behind the first";
+    g.rep.becomeFollower(2, 2);
+    g.rep.becomeLeader(3, std::vector<NodeId>{1, 2});
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 2u) << "both parked answers are released on the leader change";
+    for (const auto& f : g.answers.frames)
+        EXPECT_EQ(CommitRig::codeOf(f.data(), f.size()), static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    g.answers.frames.clear();
+    g.fetch();             // the new leadership commits its tail: the coordinator reloads the offsets index
+    g.svc.doWork(g.clock);
+    EXPECT_EQ(g.store.fetch("gresend", tp(std::string(kTestTopic), 0))->offset, 88) << "the reloaded index";
+
+    {
+        const std::size_t n = g.commit("gresend", 88);   // the client's retry
+        ASSERT_EQ(n, 0u) << "answered inline: " << CommitRig::codeOf(g.out, n);
+    }
+    g.svc.doWork(g.clock);
+    EXPECT_TRUE(g.answers.frames.empty()) << "OK before the retried record committed under the new leadership";
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u);
+    EXPECT_EQ(CommitRig::codeOf(g.answers.frames[0].data(), g.answers.frames[0].size()), 0);
+    EXPECT_EQ(g.store.fetch("gresend", tp(std::string(kTestTopic), 0))->offset, 88);
+}

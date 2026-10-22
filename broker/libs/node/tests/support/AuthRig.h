@@ -155,12 +155,46 @@ public:
         const auto a = c().offsetFetch(ch(), stream(), sid, group, topicId, 0);
         return a ? a->second : kNoAnswer;
     }
-    int leaveGroup(int64_t sid, const std::string& group) {
+    int leaveGroup(int64_t sid, const std::string& group, const std::string& member = "nobody") {
         pc::LeaveGroup m;
         m.sessionId = sid; m.correlationId = c().nextCorrelationId();
-        const std::string member = "nobody";   // outlives the encode: the message holds views
+        m.groupId = bytes(group); m.memberId = bytes(member);   // `member` outlives the encode: the message holds views
+        return rawCode(sendRaw(m, 512, m.correlationId));
+    }
+    // ── member-scoped group requests (issues #123 / #124) ──────────────────────────────────────────────────
+    /// Join as a new member and re-join once: a lone member reaches Stable.  Returns (member, generation).
+    std::pair<std::string, int32_t> joinStable(int64_t sid, const std::string& group, std::vector<int32_t> topics) {
+        const auto a = c().joinGroup(ch(), stream(), sid, group, {}, topics);
+        if (!a || a->errorCode != 0) return {{}, -1};
+        const auto b = c().joinGroup(ch(), stream(), sid, group, a->memberId, topics);
+        if (!b || b->errorCode != 0) return {{}, -1};
+        return {b->memberId, b->generation};
+    }
+    /// JoinGroup naming `member`: (errorCode, the member id answered).
+    std::pair<int, std::string> rejoin(int64_t sid, const std::string& group, const std::string& member,
+                                       std::vector<int32_t> topics) {
+        const auto a = c().joinGroup(ch(), stream(), sid, group, member, std::move(topics));
+        return a ? std::pair<int, std::string>{a->errorCode, a->memberId} : std::pair<int, std::string>{kNoAnswer, {}};
+    }
+    int heartbeatAt(int64_t sid, const std::string& group, const std::string& member, int32_t gen) {
+        const auto a = c().heartbeat(ch(), stream(), sid, group, member, gen);
+        return a ? *a : kNoAnswer;
+    }
+    int syncGroup(int64_t sid, const std::string& group, const std::string& member, int32_t gen) {
+        pc::SyncGroup m;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.generationId = gen;
         m.groupId = bytes(group); m.memberId = bytes(member);
-        return rawCode(sendRaw(m, 128, m.correlationId));
+        return rawCode(sendRaw(m, 512, m.correlationId));
+    }
+    int commitAs(int64_t sid, const std::string& group, const std::string& member, int32_t gen, int32_t topicId,
+                 int64_t offset) {
+        const auto a = c().offsetCommit(ch(), stream(), sid, group, member, gen, topicId, 0, offset);
+        return a ? *a : kNoAnswer;
+    }
+    /// The committed offset of (topicId, 0) (or kNoAnswer).
+    int64_t committedOffset(int64_t sid, const std::string& group, int32_t topicId) {
+        const auto a = c().offsetFetch(ch(), stream(), sid, group, topicId, 0);
+        return a && a->second == 0 ? a->first : kNoAnswer;
     }
     int getTopicSchema(int64_t sid, const std::string& name) {
         const auto a = c().awaitSchema(c().sendGetTopicSchema(ch(), stream(), sid, name), dl());
@@ -207,32 +241,68 @@ public:
         m.transactionalId = bytes(txnId);
         return rawCode(sendRaw(m, 256, m.correlationId));
     }
-    int addPartitions(int64_t sid, const std::string& txnId, int32_t topicId) {
+    int addPartitions(int64_t sid, const std::string& txnId, int32_t topicId, int64_t pid = 1, int16_t epoch = 0) {
         pc::AddPartitionsToTxn m;
-        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = 1; m.producerEpoch = 0;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = pid; m.producerEpoch = epoch;
         m.transactionalId = bytes(txnId);
         const pc::TxnTopicPartition tp{topicId, 0};
         return rawCode(sendRaw(m, 256, m.correlationId, std::span<const pc::TxnTopicPartition>(&tp, 1)));
     }
-    int addOffsets(int64_t sid, const std::string& txnId, const std::string& group) {
+    int addOffsets(int64_t sid, const std::string& txnId, const std::string& group, int64_t pid = 1, int16_t epoch = 0) {
         pc::AddOffsetsToTxn m;
-        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = 1; m.producerEpoch = 0;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = pid; m.producerEpoch = epoch;
         m.transactionalId = bytes(txnId); m.groupId = bytes(group);
         return rawCode(sendRaw(m, 256, m.correlationId));
     }
-    int txnOffsetCommit(int64_t sid, const std::string& txnId, const std::string& group, int32_t topicId) {
+    int txnOffsetCommit(int64_t sid, const std::string& txnId, const std::string& group, int32_t topicId, int64_t pid = 1,
+                        int16_t epoch = 0) {
         pc::TxnOffsetCommit m;
-        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = 1; m.producerEpoch = 0;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = pid; m.producerEpoch = epoch;
         m.transactionalId = bytes(txnId); m.groupId = bytes(group);
         pc::TxnOffsetCommitEntry e;
         e.topicId = topicId; e.partition = 0; e.offset = 1; e.metadata = {};
         return rawCode(sendRaw(m, 512, m.correlationId, std::span<const pc::TxnOffsetCommitEntry>(&e, 1)));
     }
-    int endTxn(int64_t sid, const std::string& txnId) {
+    int endTxn(int64_t sid, const std::string& txnId, int64_t pid = 1, int16_t epoch = 0, bool commit = true) {
         pc::EndTxn m;
-        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = 1; m.producerEpoch = 0; m.commit = 1;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = pid; m.producerEpoch = epoch;
+        m.commit = commit ? 1 : 0;
         m.transactionalId = bytes(txnId);
         return rawCode(sendRaw(m, 256, m.correlationId));
+    }
+
+    // ── producer identity (issue #122) ─────────────────────────────────────────────────────────────────────
+    struct ProducerIds { int code = kNoAnswer; int64_t pid = -1; int16_t epoch = -1; };
+    ProducerIds initProducer(int64_t sid, const std::string& txnId = "") {
+        pc::InitProducerId m;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.transactionTimeoutMs = 30'000;
+        m.transactionalId = bytes(txnId);
+        const auto a = sendRaw(m, 256, m.correlationId);
+        const auto r = a.empty() ? std::nullopt : pc::InitProducerIdResponse::decode(a.data(), a.size());
+        return r ? ProducerIds{r->errorCode, r->producerId, r->producerEpoch} : ProducerIds{};
+    }
+    struct ProduceAnswer { int code = kNoAnswer; int64_t baseOffset = -1; };
+    /// An idempotent (or, `transactional`, transactional) produce of one record as (pid, epoch, seq) - the frame and
+    /// the batch header carry the same identity.  Retried while the partition's producer state is being built
+    /// (NotLeader); every other answer is final.  Bounded.
+    ProduceAnswer produceAs(int64_t sid, int32_t topicId, int64_t pid, int16_t epoch, int32_t seq,
+                            bool transactional = false, const std::string& value = "v", const std::string* channel = nullptr) {
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq); b.setTransactional(transactional);
+        b.append("k", value, 1000);
+        const std::vector<uint8_t> batch = b.build();
+        ProduceAnswer out;
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            const int64_t corr = c().nextCorrelationId();
+            if (!c().produceIdempotent(channel ? *channel : ch(), stream(), sid, corr, topicId, 0, 1, pid, epoch, seq, batch))
+                return out;
+            const auto a = c().awaitProduceResponseUntil(corr, dl());
+            out = a ? ProduceAnswer{a->errorCode, a->baseOffset} : ProduceAnswer{};
+            if (out.code != static_cast<int>(pc::ErrorCode::NotLeader) && out.code != static_cast<int>(pc::ErrorCode::UnknownTopic))
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        return out;
     }
 
     /// The topic ids a MetadataRequest{all} lists for the session.
@@ -250,6 +320,25 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(25));
         }
         return false;
+    }
+
+    /// PR #466 review: TxnOffsetCommit of several entries (topic ids, partition 0, offset 1), optionally with the
+    /// version-10 member block (`generation` >= 0).  Returns the FIRST NON-OK entry code (0 = all OK).
+    int txnOffsetCommitMany(int64_t sid, const std::string& txnId, const std::string& group,
+                            const std::vector<int32_t>& topicIds, int64_t pid = 1, int16_t epoch = 0,
+                            int32_t generation = -1, const std::string& member = {}) {
+        pc::TxnOffsetCommit m;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = pid; m.producerEpoch = epoch;
+        m.transactionalId = bytes(txnId); m.groupId = bytes(group);
+        m.generationId = generation; m.memberId = bytes(member);
+        std::vector<pc::TxnOffsetCommitEntry> es;
+        for (const int32_t id : topicIds) es.push_back(pc::TxnOffsetCommitEntry{id, 0, 1, {}});
+        const auto a = sendRaw(m, 1024, m.correlationId, std::span<const pc::TxnOffsetCommitEntry>(es));
+        if (const auto r = a.empty() ? std::nullopt : pc::TxnOffsetCommitResponse::decode(a.data(), a.size())) {
+            for (const auto& e : r->results) if (e.errorCode != 0) return e.errorCode;
+            return 0;
+        }
+        return rawCode(a);
     }
 
     /// The raw answer frame of `corr` (bounded wait); empty = none.
@@ -284,6 +373,7 @@ private:
             case pc::TemplateId::TxnOffsetCommitResponse: { auto r = pc::TxnOffsetCommitResponse::decode(p, n); return r ? (r->results.empty() ? 0 : r->results[0].errorCode) : kNoAnswer; }
             case pc::TemplateId::EndTxnResponse: { auto r = pc::EndTxnResponse::decode(p, n); return r ? r->errorCode : kNoAnswer; }
             case pc::TemplateId::LeaveGroupResponse: { auto r = pc::LeaveGroupResponse::decode(p, n); return r ? r->errorCode : kNoAnswer; }
+            case pc::TemplateId::SyncGroupResponse: { auto r = pc::SyncGroupResponse::decode(p, n); return r ? r->errorCode : kNoAnswer; }
             case pc::TemplateId::ErrorResponse: { auto r = pc::ErrorResponse::decode(p, n); return r ? r->code : kNoAnswer; }
             default: return kNoAnswer;
         }

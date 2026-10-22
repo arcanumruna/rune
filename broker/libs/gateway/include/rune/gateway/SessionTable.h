@@ -171,6 +171,11 @@ struct Session {
     // Cold, bounded (kMaxReadCorrs, oldest dropped); a stale entry (already unsubscribed) only costs one ignored frame.
     static constexpr std::size_t kMaxReadCorrs = 64;
     std::vector<int64_t> catalogReadCorrs, securityReadCorrs;
+    // Issue #117 (X017 part, M10): the admin-log read ends (kEndCatalogReadsOnly / kEndSecurityReadsOnly) the admin
+    // request ring could not take yet - per-session pending state, coalesced, retried every duty cycle, NEVER dropped.
+    static constexpr uint8_t kPendingEndCatalogReads  = 0x01;
+    static constexpr uint8_t kPendingEndSecurityReads = 0x02;
+    uint8_t pendingReadEnds = 0;
 
     // client<->broker TLS/AEAD (Task 7): this session's crypto state.
     // `crypto.encrypted` is false (default CryptoState) for a plaintext

@@ -10,6 +10,7 @@
 #include <rune/gateway/RequestRejection.h>
 
 #include <rune/gateway/ClientGateway.h>  // CG-4: addGroupSubscription / revokeGroupSubscriptions / sendControlFrame
+#include <rune/crypto/Kdf.h>             // issues #123 / #124: the random half of member ids
 
 #include <rune/codec/FilterWire.h>
 #include <rune/protocol/client/GroupMessages.h>
@@ -20,6 +21,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cstring>
 
 namespace rune::node {
@@ -61,6 +63,7 @@ GroupCoordinationService::GroupCoordinationService(
     groupIdScratch_.reserve(64);
     memberIdScratch_.reserve(64);
     memberKeyScratch_.reserve(128);
+    parkedResults_.resize(kParkedResultsCapacity);   // #433: the parked answers' results ring (once)
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +95,49 @@ coord::GroupCoordinator& GroupCoordinationService::coordinator(const GroupId& gr
         std::forward_as_tuple(groupId),
         std::forward_as_tuple(groupId, /*nowNs=*/0));
     (void)ok;
+    inserted->second.setMemberIdEntropy(
+        [](uint8_t* out, std::size_t n) noexcept { return rune::crypto::randomBytes(std::span<uint8_t>(out, n)); });
     return inserted->second;
+}
+
+// ---------------------------------------------------------------------------
+// Issues #123 / #124 / #169: member ownership (see memberSessionMap_).
+// ---------------------------------------------------------------------------
+void GroupCoordinationService::buildMemberKey_(std::string_view groupId, std::string_view memberId) {
+    // PR #423 review F2: "<group length>:<group><member>" - unambiguous for any bytes in either id (a ':' separator
+    // alone let group "x" + member "y:m" alias group "x:y" + member "m").  No allocation once the capacity is reached.
+    char len[8];
+    const auto [end, ec] = std::to_chars(len, len + sizeof len, groupId.size());
+    (void)ec;   // a u16-prefixed wire field: at most 5 digits
+    memberKeyScratch_.clear();
+    memberKeyScratch_.append(len, static_cast<std::size_t>(end - len));
+    memberKeyScratch_ += ':';
+    memberKeyScratch_.append(groupId);
+    memberKeyScratch_.append(memberId);
+}
+
+const GroupCoordinationService::MemberBinding* GroupCoordinationService::bindingOf_(std::string_view groupId,
+                                                                                    std::string_view memberId) {
+    if (memberId.empty()) return nullptr;
+    buildMemberKey_(groupId, memberId);
+    const auto it = memberSessionMap_.find(memberKeyScratch_);
+    return it == memberSessionMap_.end() ? nullptr : &it->second;
+}
+
+uint64_t GroupCoordinationService::principalOf_(int64_t sessionId) const {
+    if (principalFn_ != nullptr) return principalFn_(principalCtx_, sessionId);
+    return gateway_ != nullptr ? gateway_->sessionPrincipalId(sessionId) : 0;
+}
+
+void GroupCoordinationService::drainDeparted_(std::string_view groupId, coord::GroupCoordinator& gc) {
+    if (!gc.hasDeparted()) return;
+    gc.takeDeparted(departedScratch_);
+    for (const std::string& m : departedScratch_) {
+        if (gc.hasMember(m)) continue;   // re-joined since (same id, its owner): keep the binding
+        buildMemberKey_(groupId, m);
+        memberSessionMap_.erase(memberKeyScratch_);
+    }
+    departedScratch_.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -163,16 +208,18 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
         offsetsRebuilt_ = false;
     }
 
-    if (coordinators_.empty()) return 0;
+    int work = parkedCount_ != 0 ? releaseParkedCommits_() : 0;   // #433
+
+    if (coordinators_.empty()) return work;
 
     sweepSupersededLineages_(nowNs);   // R1 (round 5)
 
-    int work = 0;
     for (auto& [groupId, coord] : coordinators_) {
         const coord::GroupState stateBefore = coord.state();
 
         const int w = coord.doWork(nowNs);
         work += w;
+        drainDeparted_(groupId, coord);   // #124: expired / timed-out members lose their binding
 
         // CG-4: detect PreparingRebalance entry (membership change) and eagerly
         // revoke all group push subscriptions + send empty Assign to each member.
@@ -488,7 +535,7 @@ size_t GroupCoordinationService::handleJoinGroup(
     const int32_t ver = clientVersion;
     const std::span<const uint8_t> filter = pc::clientUnderstandsFilters(ver) ? msg.filter : std::span<const uint8_t>{};
     // A refused join: never admitted, no state change.  Old clients get the rule's ProtocolVersion; the detail
-    // (cold; reserved member string) goes to a session >= 10 only.
+    // (cold; reserved member string) goes to a session >= 11 only.
     auto refuseJoin = [&](std::string detail) {
         pc::JoinGroupResponse resp;
         resp.sessionId     = msg.sessionId;
@@ -501,7 +548,7 @@ size_t GroupCoordinationService::handleJoinGroup(
             filterDetailScratch_ = std::move(detail);
             resp.detail = filterDetailScratch_;
         }
-        // encodeFor writes the detail only to a session >= 10 (encode() never does)
+        // encodeFor writes the detail only to a session >= 11 (encode() never does)
         const std::size_t n = resp.encodeFor(out, ver, outCap);
         return n != 0 ? n : resp.encode(out);
     };
@@ -527,6 +574,17 @@ size_t GroupCoordinationService::handleJoinGroup(
             joinTopicsScratch_.push_back(std::move(name));
         }
         // Unknown topicId silently ignored (Assignor ignores topics not in partCounts).
+    }
+
+    // Issues #123 / #124: a non-empty member id is a RE-JOIN only when it is bound to this session's principal (the
+    // same session, or a reconnect of the same principal).  Any other id - another principal's member, a member that
+    // no longer exists, an id the client made up - joins as a NEW member with a fresh id: the answer looks the same
+    // whether or not the id names someone (nothing to enumerate), and an id is never adopted from the client.
+    // PR #423 review F2: and only for a CURRENT member of THIS group (a binding never stands in for membership).
+    const uint64_t principal = principalOf_(msg.sessionId);
+    if (!memberIdScratch_.empty()) {
+        const MemberBinding* b = bindingOf_(groupIdStr, memberIdStr);
+        if (b == nullptr || b->principal != principal || !gc.hasMember(memberIdStr)) memberIdScratch_.clear();
     }
 
     // Set rebalance timeout from the member's sessionTimeout (or a sane default).
@@ -561,11 +619,8 @@ size_t GroupCoordinationService::handleJoinGroup(
     // but from a new TCP session with a different sessionId).
     if (!jr.memberId.empty() && jr.errorCode != coord::JoinResult::kErrDead) {
         // CG-7 zero-alloc: build composite key into pre-reserved scratch.
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupIdStr);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(jr.memberId);
-        memberSessionMap_[memberKeyScratch_] = msg.sessionId;
+        buildMemberKey_(groupIdStr, jr.memberId);
+        memberSessionMap_[memberKeyScratch_] = MemberBinding{msg.sessionId, principal};
         spdlog::debug("GroupCoordinationService: JoinGroup tracking member '{}' sessionId={}",
                       memberKeyScratch_, msg.sessionId);
     }
@@ -668,6 +723,10 @@ size_t GroupCoordinationService::handleSyncGroup(
         return resp.encode(out, {});
     }
 
+    // Issues #124: another session's member is answered as a member that does not exist (an empty id is never a
+    // member): its assignment is never handed out.
+    if (!ownsMember_(groupIdStr, memberIdStr, msg.sessionId)) memberIdScratch_.clear();
+
     // Followers call syncGroup with empty assignment map; they get their assignment
     // from the coordinator once Stable.
     const coord::Assignment emptyAssignment;
@@ -761,6 +820,9 @@ size_t GroupCoordinationService::handleHeartbeat(
         return resp.encode(out);
     }
 
+    // Issue #124: another session's member is answered as a member that does not exist and is not refreshed (a
+    // foreign heartbeat never keeps a dead member alive).
+    if (!ownsMember_(groupIdStr, memberIdStr, msg.sessionId)) memberIdScratch_.clear();
     const coord::HeartbeatResult hr =
         it->second.heartbeat(memberIdStr, msg.generationId, nowNs);
 
@@ -803,51 +865,39 @@ size_t GroupCoordinationService::handleLeaveGroup(
         return resp.encode(out);
     }
 
+    pc::LeaveGroupResponse resp;
+    resp.sessionId     = msg.sessionId;
+    resp.correlationId = msg.correlationId;
+
+    // Issue #123: a member leaves only on the session it is bound to.  Another session's member - and a member that
+    // does not exist, with the same answer - is UnknownMember: nothing is revoked, nothing rebalances.
+    auto it = coordinators_.find(groupIdStr);
+    if (it == coordinators_.end() || !ownsMember_(groupIdStr, memberIdStr, msg.sessionId) ||
+        !it->second.hasMember(memberIdStr)) {
+        resp.errorCode = static_cast<int16_t>(pc::ErrorCode::UnknownMember);
+        return resp.encode(out);
+    }
+
     // CG-4 fix (#3): revoke the leaving member's group push subscriptions BEFORE
     // erasing the session mapping.  This prevents dual-owner: the next
     // PreparingRebalance iterates coord.members() which no longer contains the
     // departed member — so without this explicit revoke the member keeps receiving
     // records for its old partitions until session reap, which can overlap with
     // the reassigned owner (dup delivery, single-owner violation).
-    if (gateway_ && !memberIdStr.empty()) {
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupIdStr);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(memberIdStr);
-        const auto sessIt = memberSessionMap_.find(memberKeyScratch_);
-        if (sessIt != memberSessionMap_.end()) {
-            const int64_t leavingSid = sessIt->second;
-            gateway_->revokeGroupSubscriptions(leavingSid);
-            spdlog::debug("GroupCoordinationService: LeaveGroup revoking subs for "
-                          "member='{}' sessionId={}", memberIdStr, leavingSid);
-        }
+    if (gateway_) {
+        gateway_->revokeGroupSubscriptions(msg.sessionId);
+        spdlog::debug("GroupCoordinationService: LeaveGroup revoking subs for "
+                      "member='{}' sessionId={}", memberIdStr, msg.sessionId);
     }
 
-    auto it = coordinators_.find(groupIdStr);
-    if (it != coordinators_.end()) {
-        // Leave is generation-fenced inside GroupCoordinator::leave.
-        // We need the member's last-known generationId; since the protocol
-        // frame doesn't carry it for LeaveGroup (templateId 38), we pass
-        // the current coordinator generationId (faithful Kafka: leave is
-        // fenced; unknown/stale leaves are no-ops).
-        it->second.leave(memberIdStr, it->second.generationId(), nowNs);
-    }
-    // If group doesn't exist: no-op (treat as already left).
+    // Leave is generation-fenced inside GroupCoordinator::leave.
+    // We need the member's last-known generationId; since the protocol
+    // frame doesn't carry it for LeaveGroup (templateId 38), we pass
+    // the current coordinator generationId (faithful Kafka: leave is
+    // fenced; unknown/stale leaves are no-ops).
+    it->second.leave(memberIdStr, it->second.generationId(), nowNs);
+    drainDeparted_(groupIdStr, it->second);   // CG-4: drop member → session mapping on Leave
 
-    // CG-4: drop member → session mapping on Leave.
-    if (!memberIdStr.empty()) {
-        // memberKeyScratch_ was already built above; rebuild in case the
-        // gateway block was skipped (empty gateway_).
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupIdStr);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(memberIdStr);
-        memberSessionMap_.erase(memberKeyScratch_);
-    }
-
-    pc::LeaveGroupResponse resp;
-    resp.sessionId     = msg.sessionId;
-    resp.correlationId = msg.correlationId;
     resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::OK);
     return resp.encode(out);
 }
@@ -876,21 +926,15 @@ void GroupCoordinationService::evictMember(std::string_view groupId, std::string
     evictScratch_.clear();
     for (const auto& member : coord.members()) {
         if (!memberId.empty() && member.memberId != memberId) continue;
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupId);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(member.memberId);
+        buildMemberKey_(groupId, member.memberId);
         const auto it = memberSessionMap_.find(memberKeyScratch_);
-        if (it != memberSessionMap_.end() && it->second == sessionId) evictScratch_.push_back(member.memberId);
+        if (it != memberSessionMap_.end() && it->second.sessionId == sessionId) evictScratch_.push_back(member.memberId);
     }
     for (const auto& m : evictScratch_) {
         spdlog::warn("GroupCoordinationService: old client (session {}) member '{}' of group '{}' evicted — "
                      "answered UnknownMember instead of an error it would ignore", sessionId, m, groupId);
         coord.leave(m, coord.generationId(), nowNs);
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupId);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(m);
+        buildMemberKey_(groupId, m);
         memberSessionMap_.erase(memberKeyScratch_);
     }
 }
@@ -903,12 +947,9 @@ int GroupCoordinationService::removeUnauthorizedMembers(int64_t sessionId, int64
         if (check.mayRead(check.ctx, groupId)) continue;
         evictScratch_.clear();
         for (const auto& member : coord.members()) {
-            memberKeyScratch_.clear();
-            memberKeyScratch_.append(groupId);
-            memberKeyScratch_ += ':';
-            memberKeyScratch_.append(member.memberId);
+            buildMemberKey_(groupId, member.memberId);
             const auto it = memberSessionMap_.find(memberKeyScratch_);
-            if (it != memberSessionMap_.end() && it->second == sessionId) evictScratch_.push_back(member.memberId);
+            if (it != memberSessionMap_.end() && it->second.sessionId == sessionId) evictScratch_.push_back(member.memberId);
         }
         if (evictScratch_.empty()) continue;
         if (gateway_) gateway_->revokeGroupSubscriptions(sessionId);   // as LeaveGroup: before the mapping goes
@@ -916,10 +957,7 @@ int GroupCoordinationService::removeUnauthorizedMembers(int64_t sessionId, int64
             spdlog::warn("GroupCoordinationService: session {} lost READ on group '{}' - member '{}' removed (its next "
                          "request is answered NotAuthorized)", sessionId, groupId, memberId);
             coord.leave(memberId, coord.generationId(), nowNs);
-            memberKeyScratch_.clear();
-            memberKeyScratch_.append(groupId);
-            memberKeyScratch_ += ':';
-            memberKeyScratch_.append(memberId);
+            buildMemberKey_(groupId, memberId);
             memberSessionMap_.erase(memberKeyScratch_);
             ++removed;
         }
@@ -932,12 +970,9 @@ void GroupCoordinationService::evictSessionMembers(int64_t sessionId, int64_t no
     for (auto& [groupId, coord] : coordinators_) {
         evictScratch_.clear();
         for (const auto& member : coord.members()) {
-            memberKeyScratch_.clear();
-            memberKeyScratch_.append(groupId);
-            memberKeyScratch_ += ':';
-            memberKeyScratch_.append(member.memberId);
+            buildMemberKey_(groupId, member.memberId);
             const auto it = memberSessionMap_.find(memberKeyScratch_);
-            if (it != memberSessionMap_.end() && it->second == sessionId) evictScratch_.push_back(member.memberId);
+            if (it != memberSessionMap_.end() && it->second.sessionId == sessionId) evictScratch_.push_back(member.memberId);
         }
         if (evictScratch_.empty()) continue;
         if (gateway_) gateway_->revokeGroupSubscriptions(sessionId);
@@ -945,10 +980,7 @@ void GroupCoordinationService::evictSessionMembers(int64_t sessionId, int64_t no
             spdlog::warn("GroupCoordinationService: old client (session {}) member '{}' of group '{}' evicted — "
                          "answered UnknownMember instead of an error it would ignore", sessionId, memberId, groupId);
             coord.leave(memberId, coord.generationId(), nowNs);
-            memberKeyScratch_.clear();
-            memberKeyScratch_.append(groupId);
-            memberKeyScratch_ += ':';
-            memberKeyScratch_.append(memberId);
+            buildMemberKey_(groupId, memberId);
             memberSessionMap_.erase(memberKeyScratch_);
         }
     }
@@ -974,18 +1006,104 @@ bool GroupCoordinationService::staleLineage_(const rune::coordination::Committed
 // ---------------------------------------------------------------------------
 // applyTransactionalOffset - an offset of a committed transaction (see the header).
 // ---------------------------------------------------------------------------
-bool GroupCoordinationService::applyTransactionalOffset(const std::string& group, const coord::TopicPartition& tp,
-                                                        int64_t offset, int64_t nowNs)
+coord::TxnOffsetApply GroupCoordinationService::applyTransactionalOffset(const std::string& group,
+                                                                         const coord::TopicPartition& tp,
+                                                                         int64_t offset, int64_t nowNs,
+                                                                         coord::TxnOffsetToken token)
 {
-    if (offsets_ == nullptr || !isLocalCoordinator() || !offsetsLoaded_()) return false;
+    using R = coord::TxnOffsetApply;
+    using Why = coord::TxnOffsetRefusal;
+    if (offsets_ == nullptr || !isLocalCoordinator()) return refuse_(Why::NotCoordinator);
+    if (!offsetsLoaded_()) return refuse_(Why::NotLoaded);
     uint64_t lineage = 0;
     if (topics_ != nullptr) {
         if (const auto id = topics_->topicIdForName(tp.topic)) {
             lineage = lineageOf_(*id, tp.partition);   // C1: 0 for a disk partition
-            if (lineage == kLineagePending) return false;
+            if (lineage == kLineagePending) return refuse_(Why::LineagePending);
         }
     }
-    return offsets_->commit(group, tp, offset, {}, nowNs, lineage);
+    const rune::replication::PartitionReplica* r = offsets_->replica();
+    if (r == nullptr) return offsets_->commit(group, tp, offset, {}, nowNs, lineage) ? R::Applied : refuse_(Why::AppendRefused);
+    // #358: Applied only once a record carrying this offset or a NEWER one of the key is COMMITTED (see the header).
+    const uint64_t leadGen = r->leadershipGeneration(), logGen = r->logGeneration();
+    const int64_t  hw = r->highWatermark();
+    const TxnOffsetKey key{group, tp.topic, tp.partition};
+    auto slot = txnOffsetsInFlight_.find(key);
+    if (slot != txnOffsetsInFlight_.end()) {
+        TxnOffsetKeyState& k = slot->second;
+        // A newest record seen committed survives every later change of leadership or log.
+        if (k.lastRecord >= 0 && k.lastLeadershipGen == leadGen && k.lastLogGen == logGen && hw > k.lastRecord)
+            k.lastCommitted = true;
+        for (std::size_t i = 0; i < k.waiters.size(); ++i) {
+            TxnOffsetWaiter& w = k.waiters[i];
+            if (!(w.token == token) || w.offset != offset) continue;
+            // An anonymous caller (a default token: rigs) cannot tell two transactions apart; it is matched only
+            // as the key's newest waiter (an older anonymous entry is dropped when a newer record is appended).
+            if (token == coord::TxnOffsetToken{} && i + 1 != k.waiters.size()) continue;
+            const auto leave = [&] {
+                k.waiters.erase(k.waiters.begin() + static_cast<std::ptrdiff_t>(i));
+                --txnOffsetsWaiting_;
+                if (k.waiters.empty()) txnOffsetsInFlight_.erase(slot);
+                return R::Applied;
+            };
+            if (k.lastCommitted) return leave();   // its record or a newer one of the key is committed
+            const bool sameGen = k.lastLeadershipGen == leadGen && k.lastLogGen == logGen;
+            if (sameGen) return R::Replicating;    // the newest record of the key is still replicating
+            // Leadership or log changed and the newest record may be gone.  Only the newest waiter appends again;
+            // an older one waits for it (a newer value is never overwritten by an older one).  A plain commit that
+            // was the newest and may be gone hands that role back to the newest waiter.
+            if (i + 1 != k.waiters.size()) return R::Replicating;
+            const int64_t at = offsets_->commitAt(group, tp, offset, {}, nowNs, lineage);
+            if (at < 0) return refuse_(Why::AppendRefused);
+            w.recordOffset = at; w.leadershipGen = leadGen; w.logGen = logGen;
+            k.lastRecord = at; k.lastLeadershipGen = leadGen; k.lastLogGen = logGen;
+            k.lastCommitted = r->highWatermark() > at; k.plainIsLast = false;
+            return k.lastCommitted ? leave() : R::Replicating;
+        }
+        if (k.waiters.size() >= kMaxTxnOffsetWaiters) return refuse_(Why::TooManyWaiters);   // never evict: retried
+    }
+    const int64_t at = offsets_->commitAt(group, tp, offset, {}, nowNs, lineage);
+    if (at < 0) return refuse_(Why::AppendRefused);
+    if (slot == txnOffsetsInFlight_.end()) slot = txnOffsetsInFlight_.try_emplace(key).first;
+    TxnOffsetKeyState& k = slot->second;
+    {   // older anonymous entries can never be asked for again (see above)
+        const std::size_t before = k.waiters.size();
+        std::erase_if(k.waiters, [](const TxnOffsetWaiter& w) { return w.token == coord::TxnOffsetToken{}; });
+        txnOffsetsWaiting_ -= before - k.waiters.size();
+    }
+    k.lastRecord = at; k.lastLeadershipGen = leadGen; k.lastLogGen = logGen;
+    k.lastCommitted = r->highWatermark() > at; k.plainIsLast = false;
+    if (k.lastCommitted) {   // committed on the append (a single-replica offsets partition): nothing waits
+        if (k.waiters.empty()) txnOffsetsInFlight_.erase(slot);
+        return R::Applied;
+    }
+    k.waiters.push_back(TxnOffsetWaiter{token, offset, at, leadGen, logGen});
+    ++txnOffsetsWaiting_;
+    return R::Replicating;
+}
+
+void GroupCoordinationService::releaseTransactionalOffsets(const coord::TxnOffsetToken& token)
+{
+    if (txnOffsetsWaiting_ == 0) return;
+    for (auto it = txnOffsetsInFlight_.begin(); it != txnOffsetsInFlight_.end();) {
+        auto& ws = it->second.waiters;
+        const std::size_t before = ws.size();
+        std::erase_if(ws, [&](const TxnOffsetWaiter& w) { return w.token == token; });
+        txnOffsetsWaiting_ -= before - ws.size();
+        it = ws.empty() ? txnOffsetsInFlight_.erase(it) : std::next(it);
+    }
+}
+
+void GroupCoordinationService::notePlainOffsetCommit_(const std::string& group, const coord::TopicPartition& tp,
+                                                      int64_t at)
+{
+    if (txnOffsetsWaiting_ == 0 || offsets_ == nullptr || offsets_->replica() == nullptr) return;
+    const auto it = txnOffsetsInFlight_.find(TxnOffsetKey{group, tp.topic, tp.partition});
+    if (it == txnOffsetsInFlight_.end()) return;
+    const rune::replication::PartitionReplica* r = offsets_->replica();
+    TxnOffsetKeyState& k = it->second;
+    k.lastRecord = at; k.lastLeadershipGen = r->leadershipGeneration(); k.lastLogGen = r->logGeneration();
+    k.lastCommitted = r->highWatermark() > at; k.plainIsLast = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,13 +1160,33 @@ size_t GroupCoordinationService::handleOffsetCommit(
         return resp.encode(out, std::span<const pc::OffsetCommitResult>(commitResultScratch_));
     }
 
-    // Generation fence: verify the member is in the group at the claimed generation.
+    // Member + generation fence (issues #124 / #169, Kafka parity): the commit is honoured only for a CURRENT member
+    // of the group, bound to THIS session, at the group's generation.  Generations restart with the coordinator, so
+    // the generation alone let a pre-restart member's late commit (or another session's) move the group's position.
+    // Another session's member is answered exactly as a member that does not exist.
     auto it = coordinators_.find(groupIdStr);
     const bool groupExists = (it != coordinators_.end());
-    bool genOk = groupExists && (msg.generationId == it->second.generationId());   // R1: cleared by a forced rebalance
+    memberIdScratch_.assign(reinterpret_cast<const char*>(msg.memberId.data()), msg.memberId.size());
+    const bool memberOk = groupExists && ownsMember_(groupIdStr, memberIdScratch_, msg.sessionId) &&
+                          it->second.hasMember(memberIdScratch_);
+    bool genOk = memberOk && (msg.generationId == it->second.generationId());   // R1: cleared by a forced rebalance
 
     commitResultScratch_.clear();
     const bool loaded = offsetsLoaded_();   // E2 residual round 4
+
+    // #433: a commit whose records may need to wait for the high watermark is parked; it is accepted only when the
+    // park has room for its whole answer - otherwise it is refused NotCoordinator (retriable) with NOTHING appended.
+    const bool mayPark = offsets_ != nullptr && offsets_->replica() != nullptr;
+    const std::size_t maxResults = mayPark ? kMaxParkedResultsPerCommit : SIZE_MAX;
+    const bool parkFull = mayPark && genOk && loaded &&
+                          !parkHasRoomFor_(std::min<std::size_t>(msg.entries.size(), maxResults));
+    if (parkFull) [[unlikely]] {
+        if ((parkRefusals_++ & 1023u) == 0)
+            spdlog::warn("GroupCoordinationService: OffsetCommit refused NotCoordinator (retriable) - {} answers are "
+                         "already waiting for their records to commit ({} refusals so far)", parkedCount_,
+                         parkRefusals_);
+    }
+    int64_t maxRecordAt = -1;   // #433: the newest record this request appended
 
     // Iterate entries defensively (CG-1 note: count can overstate; stop when
     // the view iterator ends, which happens when the frame bytes run out).
@@ -1057,7 +1195,7 @@ size_t GroupCoordinationService::handleOffsetCommit(
         // Stop if adding this result would overrun the output buffer.
         const std::size_t needed =
             pc::OffsetCommitResponse::encodedSizeFor(commitResultScratch_.size() + 1);
-        if (needed > outCap) {
+        if (needed > outCap || commitResultScratch_.size() >= maxResults) {
             spdlog::warn("GroupCoordinationService: OffsetCommit response capped at {} entries "
                          "(outCap={} would be exceeded)", commitResultScratch_.size(), outCap);
             break;
@@ -1067,10 +1205,16 @@ size_t GroupCoordinationService::handleOffsetCommit(
         r.topicId   = e.topicId;
         r.partition = e.partition;
 
+        if (parkFull) [[unlikely]] {
+            r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+            commitResultScratch_.push_back(r);
+            continue;
+        }
+
         if (!genOk) {
             r.errorCode = static_cast<int16_t>(
-                groupExists ? pc::ErrorCode::IllegalGeneration
-                            : pc::ErrorCode::UnknownMember);
+                memberOk ? pc::ErrorCode::IllegalGeneration
+                         : pc::ErrorCode::UnknownMember);
             commitResultScratch_.push_back(r);
             continue;
         }
@@ -1096,6 +1240,16 @@ size_t GroupCoordinationService::handleOffsetCommit(
         const coord::TopicPartition tp{topicName, e.partition};
         const std::string_view meta(
             reinterpret_cast<const char*>(e.metadata.data()), e.metadata.size());
+
+        // #438: an unfinished transaction holds this key (or the transaction coordinator is not loaded here:
+        // unknown = held) - a plain record never races its pending transactional one.  Retriable; nothing appended.
+        // (A deviation from Kafka, which lets a plain commit through: here it would be overwritten - or rewind
+        // the key - when the transaction completes.)
+        if (holdOf_(groupIdStr, tp) != coord::TxnOffsetHold::Free) [[unlikely]] {
+            r.errorCode = unstableFor_(msg.sessionId);
+            commitResultScratch_.push_back(r);
+            continue;
+        }
 
         const uint64_t lineage = lineageOf_(e.topicId, e.partition);   // C1
         if (lineage == kLineagePending) [[unlikely]] {
@@ -1130,16 +1284,107 @@ size_t GroupCoordinationService::handleOffsetCommit(
                 continue;
             }
         }
-        const bool committed = offsets_->commit(groupIdStr, tp, e.offset, meta, nowNs, lineage);
+        const int64_t at = offsets_->commitAt(groupIdStr, tp, e.offset, meta, nowNs, lineage);
+        const bool committed = at >= 0;
+        if (committed) {
+            notePlainOffsetCommit_(groupIdStr, tp, at);   // the newest record of the key (F2)
+            if (at > maxRecordAt) maxRecordAt = at;
+        }
         r.errorCode = committed ? static_cast<int16_t>(pc::ErrorCode::OK)
                                 : static_cast<int16_t>(pc::ErrorCode::MinIsrViolation);
         commitResultScratch_.push_back(r);
+    }
+
+    // #433: OK only once every appended record is committed.  A commit behind parked ones is parked too (answers
+    // leave in request order).  A single-replica offsets partition commits on the append: answered inline.
+    if (mayPark && maxRecordAt >= 0 &&
+        (parkedCount_ != 0 || offsets_->replica()->highWatermark() <= maxRecordAt)) {
+        parkCommit_(msg.sessionId, msg.correlationId, maxRecordAt);
+        return 0;   // sent by releaseParkedCommits_ (the gateway treats a 0 OffsetCommit answer as deferred)
     }
 
     pc::OffsetCommitResponse resp;
     resp.sessionId     = msg.sessionId;
     resp.correlationId = msg.correlationId;
     return resp.encode(out, std::span<const pc::OffsetCommitResult>(commitResultScratch_));
+}
+
+// ---------------------------------------------------------------------------
+// #433: parked OffsetCommit answers (see the header).
+// ---------------------------------------------------------------------------
+void GroupCoordinationService::parkCommit_(int64_t sessionId, int64_t correlationId, int64_t maxRecordAt)
+{
+    // Room was checked before anything was appended (parkFull); the results are the response's, capped alike.
+    const rune::replication::PartitionReplica* r = offsets_->replica();
+    ParkedCommit& p = parked_[(parkedHead_ + parkedCount_) % kMaxParkedCommits];
+    p.sessionId     = sessionId;
+    p.correlationId = correlationId;
+    p.maxRecordAt   = maxRecordAt;
+    p.leadershipGen = r->leadershipGeneration();
+    p.logGen        = r->logGeneration();
+    p.resultsAt     = static_cast<uint32_t>((resultsHead_ + resultsUsed_) % kParkedResultsCapacity);
+    p.count         = static_cast<uint32_t>(commitResultScratch_.size());
+    for (std::size_t i = 0; i < commitResultScratch_.size(); ++i)
+        parkedResults_[(p.resultsAt + i) % kParkedResultsCapacity] = commitResultScratch_[i];
+    resultsUsed_ += p.count;
+    ++parkedCount_;
+}
+
+int GroupCoordinationService::releaseParkedCommits_()
+{
+    // Sent reliably through sendControlFrame like an Assign frame: it always fits the gateway spill's staging buffer.
+    static_assert(kParkedFrameBytes <= rune::gateway::ClientGateway::spillSizing().stage,
+                  "parked OffsetCommit answers must be spillable");
+    const rune::replication::PartitionReplica* r = offsets_ != nullptr ? offsets_->replica() : nullptr;
+    const bool coordinating = isLocalCoordinator();
+    int n = 0;
+    while (parkedCount_ != 0) {
+        ParkedCommit& p = parked_[parkedHead_];
+        const bool sameGen = r != nullptr && r->leadershipGeneration() == p.leadershipGen &&
+                             r->logGeneration() == p.logGen;
+        const bool lost = !sameGen || !coordinating || !r->acceptsProduce();
+        if (!lost && r->highWatermark() <= p.maxRecordAt) break;   // still replicating (later ones are newer)
+        commitResultScratch_.clear();
+        for (uint32_t i = 0; i < p.count; ++i) {
+            pc::OffsetCommitResult res = parkedResults_[(p.resultsAt + i) % kParkedResultsCapacity];
+            // The record may be gone with the old leadership / log: never an OK for it.  Retriable (idempotent).
+            if (lost && res.errorCode == static_cast<int16_t>(pc::ErrorCode::OK))
+                res.errorCode = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+            commitResultScratch_.push_back(res);
+        }
+        if (lost)
+            spdlog::info("GroupCoordinationService: a parked OffsetCommit (session {}, corr {}) answered "
+                         "NotCoordinator - the offsets partition changed before its record {} committed",
+                         p.sessionId, p.correlationId, p.maxRecordAt);
+        pc::OffsetCommitResponse resp;
+        resp.sessionId     = p.sessionId;
+        resp.correlationId = p.correlationId;
+        const std::size_t len = resp.encode(parkedFrame_.data(),
+                                            std::span<const pc::OffsetCommitResult>(commitResultScratch_));
+        sendDeferred_(p.sessionId, parkedFrame_.data(), len);
+        resultsHead_ = (resultsHead_ + p.count) % kParkedResultsCapacity;
+        resultsUsed_ -= p.count;
+        parkedHead_ = (parkedHead_ + 1) % kMaxParkedCommits;
+        --parkedCount_;
+        ++n;
+    }
+    return n;
+}
+
+void GroupCoordinationService::sendDeferred_(int64_t sessionId, const uint8_t* frame, std::size_t n)
+{
+    if (gateway_ != nullptr) (void)gateway_->sendControlFrame(sessionId, frame, n);   // queued, never dropped
+    else if (answerSink_ != nullptr) answerSink_(answerSinkCtx_, sessionId, frame, n);
+}
+
+int16_t GroupCoordinationService::unstableFor_(int64_t sessionId)
+{
+    ++unstableAnswers_;
+    const int32_t v = clientVersionFn_ != nullptr ? clientVersionFn_(clientVersionCtx_, sessionId)
+                    : gateway_ != nullptr        ? gateway_->sessionClientVersion(sessionId)
+                                                 : -1;
+    return static_cast<int16_t>(pc::clientUnderstandsUnstableOffsetCommit(v) ? pc::ErrorCode::UnstableOffsetCommit
+                                                                            : pc::ErrorCode::NotCoordinator);
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,6 +1472,22 @@ size_t GroupCoordinationService::handleOffsetFetch(
     }
 
     if (msg.entries.empty()) {
+        // #438: a fetch-all cannot list a held key that has no committed offset yet: while ANY key of the group is
+        // held (or the hold state is unknown) the whole fetch is answered the retriable sentinel.
+        if (holdOf_(groupIdStr, coord::TopicPartition{std::string{}, -1}) != coord::TxnOffsetHold::Free) [[unlikely]] {
+            if (pc::OffsetFetchResponse::encodedSizeFor(1) <= outCap) {
+                pc::OffsetFetchResult sentinel;
+                sentinel.topicId   = -1;
+                sentinel.partition = -1;
+                sentinel.offset    = -1;
+                sentinel.errorCode = unstableFor_(msg.sessionId);
+                fetchResultScratch_.push_back(sentinel);
+            }
+            pc::OffsetFetchResponse resp;
+            resp.sessionId     = msg.sessionId;
+            resp.correlationId = msg.correlationId;
+            return resp.encode(out, std::span<const pc::OffsetFetchResult>(fetchResultScratch_));
+        }
         // Fetch all committed offsets for the group.
         // Bound-check BEFORE writing each result so a large fetch-all never
         // overruns a fixed scratch buffer.  Results that would exceed outCap
@@ -1287,7 +1548,12 @@ size_t GroupCoordinationService::handleOffsetFetch(
                 r.offset = -1; // no-offset sentinel
             } else {
                 const coord::TopicPartition tp{topicName, e.partition};
-                if (lineageOf_(e.topicId, e.partition) == kLineagePending) [[unlikely]] {
+                if (holdOf_(groupIdStr, tp) != coord::TxnOffsetHold::Free) [[unlikely]] {
+                    // #438: an unfinished transaction holds the key (or unknown = held): its committed offset is
+                    // about to change - neither it nor "none" is answered; retriable.
+                    r.offset    = -1;
+                    r.errorCode = unstableFor_(msg.sessionId);
+                } else if (lineageOf_(e.topicId, e.partition) == kLineagePending) [[unlikely]] {
                     // C1: the current leadership has not confirmed the lineage
                     // yet — neither the offset nor "none" can be answered.
                     ++pendingLineageAnswers_;
@@ -1340,14 +1606,11 @@ void GroupCoordinationService::onEnterPreparingRebalance(
 
     for (const auto& member : coord.members()) {
         // CG-7 zero-alloc: build memberKey into pre-reserved scratch string.
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupId);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(member.memberId);
+        buildMemberKey_(groupId, member.memberId);
         const auto it = memberSessionMap_.find(memberKeyScratch_);
         if (it == memberSessionMap_.end()) continue;  // no session tracked yet (early join)
 
-        const int64_t sessionId = it->second;
+        const int64_t sessionId = it->second.sessionId;
 
         // 1. Eagerly revoke all group push subscriptions for this member.
         gateway_->revokeGroupSubscriptions(sessionId);
@@ -1409,10 +1672,7 @@ void GroupCoordinationService::onReachedStable(
 
     for (const auto& member : coord.members()) {
         // CG-7 zero-alloc: build memberKey into pre-reserved scratch string.
-        memberKeyScratch_.clear();
-        memberKeyScratch_.append(groupId);
-        memberKeyScratch_ += ':';
-        memberKeyScratch_.append(member.memberId);
+        buildMemberKey_(groupId, member.memberId);
         const auto it = memberSessionMap_.find(memberKeyScratch_);
         if (it == memberSessionMap_.end()) {
             spdlog::warn("GroupCoordinationService::onReachedStable: "
@@ -1420,7 +1680,7 @@ void GroupCoordinationService::onReachedStable(
                          member.memberId, groupId);
             continue;
         }
-        const int64_t sessionId = it->second;
+        const int64_t sessionId = it->second.sessionId;
 
         // Build assignment for the Assign frame only (no subscription creation).
         assignFrameTpScratch_.clear();
@@ -1479,3 +1739,21 @@ void GroupCoordinationService::onReachedStable(
 }
 
 } // namespace rune::node
+
+namespace rune::node {
+// ---------------------------------------------------------------------------
+// #125 (KIP-447): the member fence of a TxnOffsetCommit - handleOffsetCommit's member + generation rules.
+// ---------------------------------------------------------------------------
+rune::protocol::client::ErrorCode GroupCoordinationService::checkTxnOffsetMember(const std::string& group,
+                                                                                const std::string& memberId,
+                                                                                int32_t generationId, int64_t sessionId)
+{
+    using EC = rune::protocol::client::ErrorCode;
+    if (!isLocalCoordinator()) return EC::NotCoordinator;
+    const auto it = coordinators_.find(group);
+    const bool memberOk = it != coordinators_.end() && ownsMember_(group, memberId, sessionId) &&
+                          it->second.hasMember(memberId);
+    if (!memberOk) return EC::UnknownMember;   // another session's member: exactly as one that does not exist
+    return generationId == it->second.generationId() ? EC::OK : EC::IllegalGeneration;
+}
+}  // namespace rune::node

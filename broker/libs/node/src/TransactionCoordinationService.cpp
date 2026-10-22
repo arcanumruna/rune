@@ -23,6 +23,8 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/node/TransactionCoordinationService.h>
+#include <rune/protocol/ProducerIdBinding.h>
+#include <rune/replication/ReplicationMessages.h>   // MetadataFeature (#122)
 #include <rune/gateway/RequestRejection.h>
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <cstdlib>
@@ -88,12 +90,14 @@ TransactionCoordinationService::TransactionCoordinationService(
     coordinator_.setCheckedOffsetApplyCallback(
         [this](const std::string& group, const rune::coordination::TopicPartition& tp, rune::coordination::Offset offset,
                int64_t /*timestampNs*/) { return applyTxnOffset_(group, tp, offset); });
+    coordinator_.setBoundProducerIds(true);   // issue #122: every id this service issues carries its owner
     // Pre-reserve scratch containers to avoid steady-state allocation.
     partitionScratch_.reserve(32);
     partResultScratch_.reserve(32);
     topicNameScratch_.reserve(32);  // "topic_<N>" stays well within 32 chars
     pendingByPidScratch_.reserve(16);
     toNotifyScratch_.reserve(32);
+    dueScratch_.reserve(16);
 }
 
 // ---------------------------------------------------------------------------
@@ -103,7 +107,16 @@ bool TransactionCoordinationService::applyTxnOffset_(const std::string& group,
                                                      const rune::coordination::TopicPartition& tp, int64_t offset)
 {
     if (offsetSink_ == nullptr) return true;   // no offset store on this node: nothing to apply to
-    return offsetSink_(offsetSinkCtx_, group, tp, offset, lastNowNs_);   // duty clock, as handleOffsetCommit's nowNs
+    // Duty clock, as handleOffsetCommit's nowNs.  #358: only a COMMITTED offset counts as applied.
+    switch (offsetSink_(offsetSinkCtx_, group, tp, offset, lastNowNs_, completionToken_)) {
+        case rune::coordination::TxnOffsetApply::Applied:     return true;
+        case rune::coordination::TxnOffsetApply::Replicating: return false;
+        case rune::coordination::TxnOffsetApply::Refused:     break;
+    }
+    offsetRefusedThisPass_ = true;
+    refusalThisPass_ = offsetRefusalFn_ != nullptr ? offsetRefusalFn_(offsetSinkCtx_)
+                                                   : rune::coordination::TxnOffsetRefusal::Unknown;   // #359
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +190,12 @@ void TransactionCoordinationService::load_(int64_t nowNs)
     }
     const tx::ProducerId maxPid =
         coordinator_.reload(txnState_ ? txnState_->all() : noSnapshot_, coordinatorEpoch_, nowNs);
+    for (const auto& [pid, a] : awaiting_) releaseOffsets_(a.offsetToken);
     awaiting_.clear();
+    dropDeferred_();       // nothing deferred survives a load (unload answered it)
+    lastPutOffset_.clear();   // the loaded log is committed
+    rebuildHolds_();          // #438: from the loaded (committed) state
+    stuckOffsetTxns_ = 0;     // #359: awaiting_ is empty
     offsetsPendingTxns_ = 0;
     queuedRetries_ = 0;
     stuckMarkers_  = 0;
@@ -188,8 +206,12 @@ void TransactionCoordinationService::load_(int64_t nowNs)
         // I7: the next pid lies at or above every ceiling a previous coordinator
         // persisted (idempotent pids are recorded nowhere else) and above every
         // pid in the log.  Nothing is handed out until a fresh ceiling commits.
-        tx::ProducerId base = txnState_->persistedPidCeiling();
-        if (maxPid + 1 > base) base = maxPid + 1;
+        // #122: a ceiling is in counter units; one persisted by a coordinator that reseeded by a bound id's RAW value
+        // (an older binary over bound ids) is converted like an id, so it never runs the counter past its 38 bits.
+        tx::ProducerId base = rune::protocol::producerIdCounter(txnState_->persistedPidCeiling());
+        // #122: the ceiling is in allocator (counter) units; a recovered id is converted (bound ids carry an owner).
+        const tx::ProducerId maxCounter = rune::protocol::producerIdCounter(maxPid);
+        if (maxCounter + 1 > base) base = maxCounter + 1;
         if (base > 0) coordinator_.allocator().reseedAtLeast(base - 1);
         coordinator_.allocator().resetGate();             // gated; no limit from an earlier load
         pidCeilingPending_       = -1;
@@ -205,6 +227,8 @@ void TransactionCoordinationService::unload_()
     // m3: every deferred EndTxn is answered NotCoordinator (the client
     // re-discovers and retries; the new coordinator answers from the durable
     // state), every marker task is dropped.
+    dropDeferred_();   // #358 class: so is every answer still waiting for its record, and every gated EndTxn
+    for (const auto& [pid, a] : awaiting_) releaseOffsets_(a.offsetToken);   // their offset waiters go
     for (auto& [pid, a] : awaiting_) {
         if (!a.respPending || gateway_ == nullptr) continue;
         pc::EndTxnResponse resp;
@@ -216,6 +240,8 @@ void TransactionCoordinationService::unload_()
         (void)gateway_->sendControlFrame(a.sessionId, buf.data(), n);
     }
     awaiting_.clear();
+    clearHolds_();            // #438: unknown until the next load (the probe answers Unknown)
+    stuckOffsetTxns_ = 0;     // #359
     offsetsPendingTxns_ = 0;
     queuedRetries_ = 0;
     stuckMarkers_  = 0;
@@ -277,8 +303,10 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
     if (!ensureLoaded_(nowNs)) return 0;
 
     lastNowNs_ = nowNs;
+    int work = releaseParked_();   // #358 class: answers whose record committed
+    if (completingHolds_ != 0) work += releaseCommittedHolds_();   // #438
     // Drive coordinator timeout aborts (sets markersPending on timed-out txns).
-    int work = coordinator_.doWork(nowNs);
+    work += coordinator_.doWork(nowNs);
     work += retryRefusedMarkers_(nowNs);
     work += retryDeferredCompletions_(nowNs);
     // Observability only, rate-limited (review LOW-1): never a per-pass walk.
@@ -286,6 +314,8 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
         nextStuckScanNs_ = nowNs + kStuckScanIntervalNs;
         updateStuckMarkers_(nowNs);
     }
+    if (stuckOffsetTxns_ != 0 || stuckOffsetWarned_ || stuckOffsetsPublished_.first > 0) [[unlikely]]
+        updateStuckOffsets_(nowNs);   // #359
 
     // TX-4 Task 8: Resolve pending markers (internally-initiated aborts and the
     // Prepare* re-driven after a load).  Task 10 round 5 (Kafka semantics): the
@@ -299,11 +329,15 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
         const auto pending = coordinator_.pendingMarkerTransactions();
         for (const auto& p : pending) {
             coordinator_.markersDispatched(p.txnId);
-            dispatchMarkers_(p.txnId, p.producerId, p.producerEpoch, coordinatorEpoch_,
-                             p.commit, p.partitions);
+            // #358 class: a timeout abort / fencing abort is persisted and committed before its markers (a loaded
+            // Prepare* is committed already).
+            const auto* meta = coordinator_.metadata(p.txnId);
+            if (meta == nullptr) continue;
+            prepareGates_.push_back(makeGate_(*meta, p.commit, p.partitions, /*respond=*/false, 0, 0));
             ++work;
         }
     }
+    work += processPrepareGates_();
 
     return work;
 }
@@ -339,9 +373,227 @@ static size_t answerCannotFit_(const uint8_t* buf, size_t len, uint8_t* out, siz
 }
 
 // ---------------------------------------------------------------------------
+// Issue #122: producer ids are bound to the principal they were issued to.
+// ---------------------------------------------------------------------------
+bool TransactionCoordinationService::bindsProducerIds() const noexcept
+{
+    return featureLevel_ < 0 || featureLevel_ >= rune::replication::MetadataFeature::kBoundProducerIds;
+}
+
+uint64_t TransactionCoordinationService::principalOf_(int64_t sessionId) const
+{
+    if (principalFn_ != nullptr) return principalFn_(principalCtx_, sessionId);
+    return gateway_ != nullptr ? gateway_->sessionPrincipalId(sessionId) : 0;
+}
+
+int64_t TransactionCoordinationService::requestPid_(int64_t pid, int64_t sessionId) const
+{
+    // Another principal's id acts as an id that matches no transaction: the coordinator answers it exactly like a
+    // wrong producer id (nothing to tell "someone else's" from "nobody's").  Never a valid id (ids are >= 0).
+    constexpr int64_t kNoSuchProducerId = INT64_MIN;
+    return rune::protocol::producerIdUsableBy(pid, principalOf_(sessionId)) ? pid : kNoSuchProducerId;
+}
+
+
+// ---------------------------------------------------------------------------
+// #358 class: answers and markers wait for the __transaction_state records they depend on to COMMIT.
+// ---------------------------------------------------------------------------
+size_t TransactionCoordinationService::handleInitProducerId(const uint8_t* buf, size_t len, int64_t nowNs,
+                                                            uint8_t* out, size_t outCap)
+{
+    beginRequest_();
+    return finishRequest_(buf, len, out, outCap, handleInitProducerId_(buf, len, nowNs, out, outCap));
+}
+size_t TransactionCoordinationService::handleAddPartitions(const uint8_t* buf, size_t len, int64_t nowNs,
+                                                           uint8_t* out, size_t outCap)
+{
+    beginRequest_();
+    return finishRequest_(buf, len, out, outCap, handleAddPartitions_(buf, len, nowNs, out, outCap));
+}
+size_t TransactionCoordinationService::handleAddOffsets(const uint8_t* buf, size_t len, int64_t nowNs,
+                                                        uint8_t* out, size_t outCap)
+{
+    beginRequest_();
+    return finishRequest_(buf, len, out, outCap, handleAddOffsets_(buf, len, nowNs, out, outCap));
+}
+size_t TransactionCoordinationService::handleTxnOffsetCommit(const uint8_t* buf, size_t len, int64_t nowNs,
+                                                             uint8_t* out, size_t outCap)
+{
+    beginRequest_();
+    return finishRequest_(buf, len, out, outCap, handleTxnOffsetCommit_(buf, len, nowNs, out, outCap));
+}
+size_t TransactionCoordinationService::handleEndTxn(const uint8_t* buf, size_t len, int64_t nowNs,
+                                                    uint8_t* out, size_t outCap)
+{
+    beginRequest_();
+    return finishRequest_(buf, len, out, outCap, handleEndTxn_(buf, len, nowNs, out, outCap));
+}
+
+bool TransactionCoordinationService::persist_(const tx::TransactionMetadata& meta)
+{
+    if (txnState_ == nullptr) return true;
+    const int64_t at = txnState_->putAt(meta, coordinatorEpoch_);
+    if (at < 0) {
+        requestPutRefused_ = true;
+        return false;
+    }
+    if (at > requestPutOffset_) requestPutOffset_ = at;
+    lastPutOffset_[meta.txnId] = at;
+    return true;
+}
+
+bool TransactionCoordinationService::committed_(int64_t recordOffset) const
+{
+    return txnState_ == nullptr || txnState_->replica()->highWatermark() > recordOffset;
+}
+
+void TransactionCoordinationService::sendDeferred_(int64_t sessionId, const uint8_t* frame, std::size_t n)
+{
+    if (gateway_ != nullptr) (void)gateway_->sendControlFrame(sessionId, frame, n);
+    else if (answerSink_ != nullptr) answerSink_(answerSinkCtx_, sessionId, frame, n);
+}
+
+void TransactionCoordinationService::sendEndTxnAnswer_(int64_t sessionId, int64_t correlationId, int16_t errorCode)
+{
+    pc::EndTxnResponse resp;
+    resp.sessionId     = sessionId;
+    resp.correlationId = correlationId;
+    resp.errorCode     = errorCode;
+    std::array<uint8_t, pc::EndTxnResponse::ENCODED_SIZE> buf{};
+    const std::size_t n = resp.encode(buf.data());
+    sendDeferred_(sessionId, buf.data(), n);
+}
+
+size_t TransactionCoordinationService::finishRequest_(const uint8_t* buf, size_t len, uint8_t* out, size_t outCap,
+                                                      size_t n)
+{
+    if (n == 0) return 0;   // already deferred (EndTxn)
+    if (requestPutRefused_) [[unlikely]] {
+        // Not durable: never an OK.  NotCoordinator is retriable - the client re-discovers and retries, and the
+        // retry appends the (idempotent) state again.
+        spdlog::warn("TCS: a __transaction_state append was refused (min-ISR) - the request is answered "
+                     "NotCoordinator and retried by the client");
+        const size_t r = rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::NotCoordinator), out, outCap);
+        return r != 0 ? r : n;
+    }
+    if (requestPutOffset_ < 0 || committed_(requestPutOffset_)) return n;
+    const auto hdr = pc::MessageHeader::decode(buf, len);
+    ParkedAnswer pa;
+    pa.recordOffset = requestPutOffset_;
+    pa.sessionId    = hdr ? hdr->sessionId : 0;
+    const auto take = [&](std::vector<uint8_t>& v, const uint8_t* p, std::size_t k) {
+        if (!spareBufs_.empty()) { v = std::move(spareBufs_.back()); spareBufs_.pop_back(); }
+        v.assign(p, p + k);
+    };
+    take(pa.request, buf, len);
+    take(pa.answer, out, n);
+    parked_.push_back(std::move(pa));
+    return 0;   // sent by releaseParked_ once the record is committed
+}
+
+int TransactionCoordinationService::releaseParked_()
+{
+    int n = 0;
+    while (!parked_.empty() && committed_(parked_.front().recordOffset)) {
+        ParkedAnswer& pa = parked_.front();
+        sendDeferred_(pa.sessionId, pa.answer.data(), pa.answer.size());
+        spareBufs_.push_back(std::move(pa.request));
+        spareBufs_.push_back(std::move(pa.answer));
+        parked_.pop_front();
+        ++n;
+    }
+    return n;
+}
+
+TransactionCoordinationService::PrepareGate TransactionCoordinationService::makeGate_(
+    const tx::TransactionMetadata& meta, bool commit, std::vector<tx::TopicPartition> parts, bool respond,
+    int64_t sessionId, int64_t correlationId)
+{
+    PrepareGate g;
+    g.txnId            = meta.txnId;
+    g.producerId       = meta.producerId;
+    g.producerEpoch    = meta.producerEpoch;
+    g.coordinatorEpoch = coordinatorEpoch_;
+    g.commit           = commit;
+    g.parts            = std::move(parts);
+    g.respond          = respond;
+    g.sessionId        = sessionId;
+    g.correlationId    = correlationId;
+    if (txnState_ == nullptr) {
+        g.durable = true;
+        return g;
+    }
+    // The record of THIS Prepare* is the store's last append for the id when it matches the state; a loaded one
+    // (no append since the load) is committed.  Otherwise (a timeout abort is never appended by the coordinator
+    // itself) it is appended by gateOpen_.
+    const auto* stored = txnState_->get(meta.txnId);
+    const bool same = stored != nullptr && stored->state == meta.state && stored->producerId == meta.producerId &&
+                      stored->producerEpoch == meta.producerEpoch;
+    if (same) {
+        const auto it = lastPutOffset_.find(meta.txnId);
+        if (it == lastPutOffset_.end()) g.durable = true;
+        else g.recordOffset = it->second;
+    }
+    return g;
+}
+
+bool TransactionCoordinationService::gateOpen_(PrepareGate& g)
+{
+    if (g.durable) return true;
+    if (g.recordOffset == kNeedsPut) {
+        const auto* meta = coordinator_.metadata(g.txnId);
+        if (meta == nullptr || !persist_(*meta)) return false;   // refused: retried on the next doWork
+        g.recordOffset = lastPutOffset_[g.txnId];
+    }
+    return committed_(g.recordOffset);
+}
+
+int TransactionCoordinationService::processPrepareGates_()
+{
+    int work = 0;
+    for (std::size_t i = 0; i < prepareGates_.size();) {
+        PrepareGate& g = prepareGates_[i];
+        const auto* meta = coordinator_.metadata(g.txnId);
+        const bool stale = meta == nullptr || meta->producerId != g.producerId ||
+                           meta->producerEpoch != g.producerEpoch ||
+                           (meta->state != tx::TxnState::PrepareCommit && meta->state != tx::TxnState::PrepareAbort);
+        if (!stale && !gateOpen_(g)) { ++i; continue; }
+        PrepareGate open = std::move(g);
+        prepareGates_.erase(prepareGates_.begin() + static_cast<std::ptrdiff_t>(i));
+        ++work;
+        if (stale) {   // the transaction moved on meanwhile: nothing to write; a waiting EndTxn retries
+            if (open.respond) sendEndTxnAnswer_(open.sessionId, open.correlationId,
+                                                static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
+            continue;
+        }
+        const bool deferred = dispatchMarkers_(open.txnId, open.producerId, open.producerEpoch, open.coordinatorEpoch,
+                                               open.commit, open.parts, open.respond ? open.sessionId : 0,
+                                               open.respond ? open.correlationId : 0);
+        if (!deferred && open.respond) sendEndTxnAnswer_(open.sessionId, open.correlationId, 0);   // completed now
+    }
+    return work;
+}
+
+void TransactionCoordinationService::dropDeferred_()
+{
+    for (ParkedAnswer& pa : parked_) {
+        std::array<uint8_t, rune::gateway::kMaxRejectionBytes> rej{};
+        const std::size_t n = rune::gateway::encodeRejectionFor(
+            pa.request.data(), pa.request.size(), static_cast<uint16_t>(pc::ErrorCode::NotCoordinator),
+            rej.data(), rej.size());
+        if (n != 0) sendDeferred_(pa.sessionId, rej.data(), n);
+    }
+    parked_.clear();
+    for (const PrepareGate& g : prepareGates_)
+        if (g.respond) sendEndTxnAnswer_(g.sessionId, g.correlationId, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    prepareGates_.clear();
+}
+
+// ---------------------------------------------------------------------------
 // handleInitProducerId (templateId 45)
 // ---------------------------------------------------------------------------
-size_t TransactionCoordinationService::handleInitProducerId(
+size_t TransactionCoordinationService::handleInitProducerId_(
     const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
@@ -388,9 +640,11 @@ size_t TransactionCoordinationService::handleInitProducerId(
         return resp.encode(out);
     }
 
-    // Call coordinator.
+    // Call coordinator.  Issue #122: the id is issued to (bound to) the session's principal - once every member
+    // supports bound ids (below the feature level: a raw id, nothing rebound).
     const auto result = coordinator_.initProducerId(
-        txnIdOpt, msg.transactionTimeoutMs, nowNs);
+        txnIdOpt, msg.transactionTimeoutMs, nowNs,
+        bindsProducerIds() ? std::optional<uint64_t>(principalOf_(msg.sessionId)) : std::nullopt);
 
     // F15 I7: the allocation may have crossed half a block — prefetch the next.
     advancePidBlock_();
@@ -402,7 +656,7 @@ size_t TransactionCoordinationService::handleInitProducerId(
             // Ignore persist failure here: the coordinator already updated
             // in-memory state; a log failure is a degraded-durability condition
             // not a protocol error (minIsr-gate on startup would have prevented this).
-            txnState_->put(*meta, coordinatorEpoch_);
+            (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
         }
     }
 
@@ -416,7 +670,7 @@ size_t TransactionCoordinationService::handleInitProducerId(
 // ---------------------------------------------------------------------------
 // handleAddPartitions (templateId 47)
 // ---------------------------------------------------------------------------
-size_t TransactionCoordinationService::handleAddPartitions(
+size_t TransactionCoordinationService::handleAddPartitions_(
     const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
@@ -489,14 +743,14 @@ size_t TransactionCoordinationService::handleAddPartitions(
     }
 
     const auto result = coordinator_.addPartitions(
-        txnIdScratch_, msg.producerId, msg.producerEpoch,
+        txnIdScratch_, requestPid_(msg.producerId, msg.sessionId), msg.producerEpoch,
         partitionScratch_, nowNs);
 
     // Persist before responding (pass the real coordinatorEpoch, not literal 0).
     if (result.ok()) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, coordinatorEpoch_);
+            (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
         }
     }
 
@@ -521,7 +775,7 @@ size_t TransactionCoordinationService::handleAddPartitions(
 // ---------------------------------------------------------------------------
 // handleAddOffsets (templateId 49)
 // ---------------------------------------------------------------------------
-size_t TransactionCoordinationService::handleAddOffsets(
+size_t TransactionCoordinationService::handleAddOffsets_(
     const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
@@ -560,14 +814,14 @@ size_t TransactionCoordinationService::handleAddOffsets(
     // X-1: AddOffsetsToTxn opens the transaction from Empty / Complete* (Kafka).
     offsetsScratch_.clear();
     const auto result = coordinator_.addOffsetsToTxn(
-        txnIdScratch_, msg.producerId, msg.producerEpoch,
+        txnIdScratch_, requestPid_(msg.producerId, msg.sessionId), msg.producerEpoch,
         groupIdScratch_, offsetsScratch_, nowNs, /*beginsTxn=*/true);
 
     // Persist before responding (pass the real coordinatorEpoch, not literal 0).
     if (result.ok()) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, coordinatorEpoch_);
+            (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
         }
     }
 
@@ -579,7 +833,7 @@ size_t TransactionCoordinationService::handleAddOffsets(
 // ---------------------------------------------------------------------------
 // handleTxnOffsetCommit (templateId 51)
 // ---------------------------------------------------------------------------
-size_t TransactionCoordinationService::handleTxnOffsetCommit(
+size_t TransactionCoordinationService::handleTxnOffsetCommit_(
     const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
@@ -618,6 +872,25 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit(
         reinterpret_cast<const char*>(msg.groupId.data()),
         msg.groupId.size());
 
+    // #125 (KIP-447): a member block is fenced exactly like an OffsetCommit; a refusal adds nothing.  A legacy frame
+    // (no block) has no member to check (Kafka compatibility).
+    const auto answerAll = [&](int16_t code) -> size_t {
+        const size_t needed = pc::TxnOffsetCommitResponse::encodedSizeFor(msg.entries.size());
+        if (outCap < needed) return answerCannotFit_(buf, len, out, outCap);
+        partResultScratch_.clear();
+        for (const auto& e : msg.entries) partResultScratch_.push_back({e.topicId, e.partition, code});
+        pc::TxnOffsetCommitResponse resp;
+        resp.sessionId     = msg.sessionId;
+        resp.correlationId = msg.correlationId;
+        return resp.encode(out, std::span<const pc::TxnPartitionResult>(partResultScratch_));
+    };
+    if (msg.hasMemberBlock && memberFence_ != nullptr) {
+        memberIdScratch_.assign(reinterpret_cast<const char*>(msg.memberId.data()), msg.memberId.size());
+        const pc::ErrorCode fenced =
+            memberFence_(memberFenceCtx_, groupIdScratch_, memberIdScratch_, msg.generationId, msg.sessionId);
+        if (fenced != pc::ErrorCode::OK) return answerAll(static_cast<int16_t>(fenced));
+    }
+
     // Build an offset map from the entries, reusing offsetsScratch_ (member map
     // cleared+refilled each call — no per-call map construction alloc).
     // topicNameScratch_ used for "topic_<id>" fallback (no per-entry temp string).
@@ -644,16 +917,22 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit(
         offsetsScratch_[tp] = e.offset;
     }
 
+    // #438: a key another unfinished transaction holds is not touched - retriable, nothing added (all or nothing:
+    // the client re-sends the whole request).
+    if (heldByOther_(groupIdScratch_, txnIdScratch_))
+        return answerAll(static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
+
     const auto result = coordinator_.addOffsetsToTxn(
-        txnIdScratch_, msg.producerId, msg.producerEpoch,
+        txnIdScratch_, requestPid_(msg.producerId, msg.sessionId), msg.producerEpoch,
         groupIdScratch_, offsetsScratch_, nowNs);
 
     // Persist before responding (pass the real coordinatorEpoch, not literal 0).
     if (result.ok()) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, coordinatorEpoch_);
+            (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
         }
+        for (const auto& [tp, off] : offsetsScratch_) addHold_(groupIdScratch_, tp, txnIdScratch_);   // #438
     }
 
     // Build result entries — all same error code.
@@ -677,7 +956,7 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit(
 // ---------------------------------------------------------------------------
 // handleEndTxn (templateId 53)
 // ---------------------------------------------------------------------------
-size_t TransactionCoordinationService::handleEndTxn(
+size_t TransactionCoordinationService::handleEndTxn_(
     const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
@@ -707,7 +986,7 @@ size_t TransactionCoordinationService::handleEndTxn(
 
     const bool commit = (msg.commit != 0);
     const auto result = coordinator_.endTransaction(
-        txnIdScratch_, msg.producerId, msg.producerEpoch, commit, nowNs);
+        txnIdScratch_, requestPid_(msg.producerId, msg.sessionId), msg.producerEpoch, commit, nowNs);
 
     // F15 §5.4: an OK for a same-direction retry of a COMPLETED transaction is
     // the idempotent answer — no transition, nothing persisted, no markers.
@@ -717,7 +996,7 @@ size_t TransactionCoordinationService::handleEndTxn(
     if (transitioned) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, coordinatorEpoch_);
+            (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
         }
     }
 
@@ -729,11 +1008,18 @@ size_t TransactionCoordinationService::handleEndTxn(
     if (transitioned && gateway_ && topics_) {
         const auto* m = coordinator_.metadata(txnIdScratch_);
         if (m) {
-            const std::vector<tx::TopicPartition> parts(m->partitions.begin(), m->partitions.end());
             const bool isCommit = (m->state == tx::TxnState::PrepareCommit);
-            const tx::TransactionalId txnId = txnIdScratch_;
-            if (dispatchMarkers_(txnId, m->producerId, m->producerEpoch, coordinatorEpoch_,
-                                 isCommit, parts, msg.sessionId, msg.correlationId)) {
+            PrepareGate g = makeGate_(*m, isCommit, std::vector<tx::TopicPartition>(m->partitions.begin(),
+                                                                                   m->partitions.end()),
+                                      /*respond=*/true, msg.sessionId, msg.correlationId);
+            // #358 class: the markers are written only once the Prepare* record is committed; until then the
+            // EndTxn answer waits with them (doWork opens the gate).
+            if (!gateOpen_(g)) {
+                prepareGates_.push_back(std::move(g));
+                return 0;
+            }
+            if (dispatchMarkers_(g.txnId, g.producerId, g.producerEpoch, g.coordinatorEpoch,
+                                 g.commit, g.parts, msg.sessionId, msg.correlationId)) {
                 return 0;   // response sent by completeAwaiting_ when the last marker lands
             }
         }
@@ -831,16 +1117,49 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
     auto it = awaiting_.find(producerId);
     if (it == awaiting_.end()) return true;
     AwaitingMarkers& cur = it->second;
+    offsetRefusedThisPass_ = false;
+    refusalThisPass_ = rune::coordination::TxnOffsetRefusal::Unknown;
+    completionToken_ = {};
+    if (const auto* m = coordinator_.metadata(cur.txnId)) {
+        // F2: one token per transaction (a producer's next transaction starts after this one completed) and per
+        // load (another load re-drives with its own record), compared field by field.
+        completionToken_ = rune::coordination::TxnOffsetToken{m->producerId, m->producerEpoch, m->txnStartNs,
+                                                               coordinatorEpoch_};
+    }
+    cur.offsetToken = completionToken_;
     const auto r = coordinator_.completeTransaction(cur.txnId);
+    if (r.errorCode == tx::CompleteTransactionResult::kOffsetsPending && !offsetRefusedThisPass_) {
+        // #358: every offset is appended, some not committed yet on the offsets replica.  CompleteCommit waits for
+        // them (a failover of the offsets partition could otherwise lose an offset the transaction log says is
+        // committed); re-checked on the next doWork - the wait is on replication, not on a refusal: no backoff.
+        if (!cur.offsetsPending) {
+            cur.offsetsPending = true;
+            ++offsetsPendingTxns_;
+        }
+        if (cur.offsetRefusedSinceNs >= 0) {   // #359: the group coordinator took them - no longer stuck
+            cur.offsetRefusedSinceNs = -1;
+            --stuckOffsetTxns_;
+        }
+        cur.offsetBackoffNs = 0;
+        cur.offsetDueNs     = lastNowNs_;
+        ++offsetReplicationWaits_;
+        return false;
+    }
     if (r.errorCode == tx::CompleteTransactionResult::kOffsetsPending) {
         // The group coordinator refused a committed offset (not loaded after a failover / gated): the txn STAYS
         // PrepareCommit (nothing persisted, EndTxn not answered); retried from doWork with backoff.
-        if (!cur.offsetsPending) {
+        cur.offsetRefusal = refusalThisPass_;   // #359
+        if (cur.offsetRefusedSinceNs < 0) {
+            cur.offsetRefusedSinceNs = lastNowNs_;
+            if (stuckOffsetTxns_++ == 0) nextStuckOffsetWarnNs_ = lastNowNs_ + kStuckTxnOffsetWarnNs;
+        }
+        if (!cur.offsetsPending || cur.offsetBackoffNs == 0) {
+            if (!cur.offsetsPending) ++offsetsPendingTxns_;
             cur.offsetsPending  = true;
             cur.offsetBackoffNs = kOffsetRetryMinNs;
-            ++offsetsPendingTxns_;
-            spdlog::warn("TCS: committed offsets of txn '{}' not applied yet (the group coordinator refused) - the "
-                         "commit stays PrepareCommit and is retried", cur.txnId);
+            spdlog::warn("TCS: committed offsets of txn '{}' not applied yet (the group coordinator refused: {}) - "
+                         "the commit stays PrepareCommit and is retried", cur.txnId,
+                         rune::coordination::toString(cur.offsetRefusal));
         } else {
             cur.offsetBackoffNs = std::min(cur.offsetBackoffNs * 2, kOffsetRetryMaxNs);
         }
@@ -850,14 +1169,31 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
     }
     const AwaitingMarkers a = std::move(cur);
     awaiting_.erase(it);
+    releaseOffsets_(a.offsetToken);   // nothing waits on its offsets any more
     if (a.offsetsPending && offsetsPendingTxns_ > 0) --offsetsPendingTxns_;
+    if (a.offsetRefusedSinceNs >= 0) --stuckOffsetTxns_;   // #359
     ++transactionsCompleted_;
     // F15 m4: persist the resting Complete* (offsets were applied first, inside
     // completeTransaction).  It need not commit before the EndTxn OK: if it is
     // lost, the next coordinator loads Prepare*, re-drives the (idempotent)
     // markers and offsets, and completes again.
-    if (r.ok() && txnState_ != nullptr) {
-        if (const auto* meta = coordinator_.metadata(a.txnId)) (void)txnState_->put(*meta, coordinatorEpoch_);
+    // #438: the transaction's (group, tp) holds are released only once this record IS committed - until then a
+    // reload could still find it Prepare* and re-drive it.
+    if (r.ok()) {
+        int64_t record = -3;   // no store: nothing to wait for
+        int64_t floor  = -1;   // the id's last record before the completion (its Prepare*): never the stand-in
+        if (txnState_ != nullptr) {
+            record = kHoldNeedsPut;
+            if (const auto lp = lastPutOffset_.find(a.txnId); lp != lastPutOffset_.end()) floor = lp->second;
+            if (const auto* meta = coordinator_.metadata(a.txnId)) {
+                const int64_t at = txnState_->putAt(*meta, coordinatorEpoch_);
+                if (at >= 0) {
+                    record = at;
+                    lastPutOffset_[a.txnId] = at;
+                }
+            }
+        }
+        completeHolds_(a.txnId, record, floor);
     }
     if (respond && a.respPending && gateway_) {
         pc::EndTxnResponse resp;
@@ -874,11 +1210,13 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
 int TransactionCoordinationService::retryDeferredCompletions_(int64_t nowNs)
 {
     if (offsetsPendingTxns_ == 0) return 0;
-    std::vector<int64_t> due;   // cold path (refusals only): completing erases from awaiting_
+    // Completing erases from awaiting_, so the due ids are collected first (a reused member: #358 re-checks a
+    // replicating commit on every doWork, which must not allocate per cycle).
+    dueScratch_.clear();
     for (const auto& [pid, a] : awaiting_)
-        if (a.offsetsPending && a.offsetDueNs <= nowNs) due.push_back(pid);
-    for (const int64_t pid : due) (void)completeAwaiting_(pid, /*respond=*/true);
-    return static_cast<int>(due.size());
+        if (a.offsetsPending && a.offsetDueNs <= nowNs) dueScratch_.push_back(pid);
+    for (const int64_t pid : dueScratch_) (void)completeAwaiting_(pid, /*respond=*/true);
+    return static_cast<int>(dueScratch_.size());
 }
 
 void TransactionCoordinationService::onControlMarkerLanded(int32_t topicId, int32_t partition, int64_t producerId,
@@ -1040,3 +1378,188 @@ int TransactionCoordinationService::retryRefusedMarkers_(int64_t nowNs)
 }
 
 } // namespace rune::node
+
+namespace rune::node {
+// ---------------------------------------------------------------------------
+// #438: the (group, tp) hold index (see the header).
+// ---------------------------------------------------------------------------
+rune::coordination::TxnOffsetHold TransactionCoordinationService::txnOffsetHold(
+    const std::string& group, const rune::coordination::TopicPartition& tp) const
+{
+    using H = rune::coordination::TxnOffsetHold;
+    if (loadState_ != LoadState::Loaded || !stillLoaded_()) return H::Unknown;   // not loaded here: unknown = held
+    if (tp.partition < 0) {   // any key of the group (a fetch-all)
+        const auto it = holds_.lower_bound(HoldKeyView{group, std::string_view{}, INT32_MIN});
+        return it != holds_.end() && it->first.group == group ? H::Held : H::Free;
+    }
+    return holds_.find(HoldKeyView{group, tp.topic, tp.partition}) != holds_.end() ? H::Held : H::Free;
+}
+
+bool TransactionCoordinationService::heldByOther_(const std::string& group, const std::string& txnId) const
+{
+    if (holds_.empty()) return false;
+    for (const auto& [tp, off] : offsetsScratch_) {
+        const auto it = holds_.find(HoldKeyView{group, tp.topic, tp.partition});
+        if (it == holds_.end()) continue;
+        // Another transaction - or this id's PREVIOUS transaction, completed but not yet durable as such.
+        if (it->second.txnId != txnId || it->second.completeRecord != kHoldOpen) return true;
+    }
+    return false;
+}
+
+void TransactionCoordinationService::addHold_(const std::string& group, const rune::coordination::TopicPartition& tp,
+                                              const std::string& txnId)
+{
+    if (holds_.find(HoldKeyView{group, tp.topic, tp.partition}) != holds_.end()) return;   // already (its own)
+    if (spareHoldNodes_.empty()) {
+        holds_.emplace(HoldKey{group, tp.topic, tp.partition}, Holder{txnId, kHoldOpen});   // warm-up only
+        return;
+    }
+    HoldMap::node_type n = std::move(spareHoldNodes_.back());   // recycled: strings keep their capacity
+    spareHoldNodes_.pop_back();
+    n.key().group.assign(group);
+    n.key().topic.assign(tp.topic);
+    n.key().partition = tp.partition;
+    n.mapped().txnId.assign(txnId);
+    n.mapped().completeRecord = kHoldOpen;
+    n.mapped().putFloor       = -1;
+    holds_.insert(std::move(n));
+}
+
+void TransactionCoordinationService::eraseHold_(HoldMap::iterator it)
+{
+    if (it->second.completeRecord != kHoldOpen) --completingHolds_;
+    spareHoldNodes_.push_back(holds_.extract(it));
+}
+
+void TransactionCoordinationService::clearHolds_()
+{
+    while (!holds_.empty()) eraseHold_(holds_.begin());
+    completingHolds_ = 0;
+}
+
+void TransactionCoordinationService::rebuildHolds_()
+{
+    clearHolds_();
+    for (const auto& [id, m] : (txnState_ != nullptr ? txnState_->all() : noSnapshot_)) {
+        const bool unfinished = m.state == tx::TxnState::Ongoing || m.state == tx::TxnState::PrepareCommit ||
+                                m.state == tx::TxnState::PrepareAbort || m.state == tx::TxnState::PrepareEpochFence;
+        if (!unfinished) continue;
+        for (const auto& po : m.pendingOffsets) {
+            const auto it = holds_.find(HoldKeyView{po.group, po.tp.topic, po.tp.partition});
+            if (it != holds_.end() && it->second.txnId != id) {
+                // Two unfinished transactions on one key (state written before #438): the first one keeps it; the
+                // other's TxnOffsetCommits are refused until it is free.
+                spdlog::warn("TCS: group '{}' {}-{} has pending offsets of two unfinished transactions ('{}' and "
+                             "'{}') - held by the first", po.group, po.tp.topic, po.tp.partition, it->second.txnId, id);
+                continue;
+            }
+            addHold_(po.group, po.tp, id);
+        }
+    }
+}
+
+void TransactionCoordinationService::completeHolds_(const std::string& txnId, int64_t record, int64_t putFloor)
+{
+    for (auto it = holds_.begin(); it != holds_.end();) {
+        Holder& h = it->second;
+        if (h.txnId != txnId || h.completeRecord != kHoldOpen) { ++it; continue; }
+        if (record == -3) {   // no store: nothing to wait for
+            auto next = std::next(it);
+            eraseHold_(it);
+            it = next;
+            continue;
+        }
+        h.completeRecord = record;
+        h.putFloor       = putFloor;
+        ++completingHolds_;
+        ++it;
+    }
+}
+
+int TransactionCoordinationService::releaseCommittedHolds_()
+{
+    int n = 0;
+    for (auto it = holds_.begin(); it != holds_.end();) {
+        Holder& h = it->second;
+        if (h.completeRecord == kHoldNeedsPut) {
+            // The Complete* append was refused (min-ISR): append it again while the id still rests there; once the
+            // id moved on, its newest record (appended after the completion) stands in for it.  Never the id's
+            // Prepare* record (lastPutOffset_ before the completion, putFloor): that one is committed already, and a
+            // reload would find the transaction Prepare* and re-drive it over the released key (the #438 rewind).
+            const auto* m = coordinator_.metadata(h.txnId);
+            if (m != nullptr && (m->state == tx::TxnState::CompleteCommit || m->state == tx::TxnState::CompleteAbort)) {
+                const int64_t at = txnState_->putAt(*m, coordinatorEpoch_);
+                if (at >= 0) lastPutOffset_[h.txnId] = at;
+            }
+            if (const auto lp = lastPutOffset_.find(h.txnId); lp != lastPutOffset_.end() && lp->second > h.putFloor) {
+                for (auto& [k, other] : holds_)   // every key of that completion waits on the same record
+                    if (other.txnId == h.txnId && other.completeRecord == kHoldNeedsPut) other.completeRecord = lp->second;
+            }
+        }
+        if (h.completeRecord >= 0 && committed_(h.completeRecord)) {
+            auto next = std::next(it);
+            eraseHold_(it);
+            it = next;
+            ++n;
+            continue;
+        }
+        ++it;
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// #359: PrepareCommit transactions stuck on a refused offset apply.
+// ---------------------------------------------------------------------------
+std::size_t TransactionCoordinationService::txnOffsetCommitsStuck() const noexcept { return stuckOffsetTxns_; }
+
+int64_t TransactionCoordinationService::oldestStuckTxnOffsetAgeNs(int64_t nowNs) const noexcept
+{
+    if (stuckOffsetTxns_ == 0) return 0;
+    int64_t oldest = INT64_MAX;
+    for (const auto& [pid, a] : awaiting_)
+        if (a.offsetRefusedSinceNs >= 0 && a.offsetRefusedSinceNs < oldest) oldest = a.offsetRefusedSinceNs;
+    return oldest == INT64_MAX ? 0 : std::max<int64_t>(0, nowNs - oldest);
+}
+
+void TransactionCoordinationService::updateStuckOffsets_(int64_t nowNs)
+{
+    if (stuckOffsetTxns_ == 0) {
+        if (stuckOffsetWarned_) {
+            spdlog::info("TCS: no transaction commit is stuck on a refused consumer-group offset any more");
+            stuckOffsetWarned_ = false;
+        }
+        publishStuckOffsets_(0, 0);
+        return;
+    }
+    if (nowNs >= nextStuckOffsetWarnNs_) {   // at most once per kStuckTxnOffsetWarnNs of the injected clock
+        nextStuckOffsetWarnNs_ = nowNs + kStuckTxnOffsetWarnNs;
+        const AwaitingMarkers* oldest = nullptr;
+        for (const auto& [pid, a] : awaiting_)
+            if (a.offsetRefusedSinceNs >= 0 && (oldest == nullptr || a.offsetRefusedSinceNs < oldest->offsetRefusedSinceNs))
+                oldest = &a;
+        if (oldest != nullptr) {
+            spdlog::warn("TCS: {} transaction commit(s) stuck on a refused consumer-group offset - the oldest, txn "
+                         "'{}', for {} s (last refusal: {}); they stay PrepareCommit and are retried until the group "
+                         "coordinator takes the offsets", stuckOffsetTxns_, oldest->txnId,
+                         (nowNs - oldest->offsetRefusedSinceNs) / 1'000'000'000,
+                         rune::coordination::toString(oldest->offsetRefusal));
+            ++stuckOffsetWarns_;
+            stuckOffsetWarned_ = true;
+        }
+    }
+    if (nowNs >= nextStuckOffsetScanNs_) {   // gauge publication, rate-limited like the stuck markers
+        nextStuckOffsetScanNs_ = nowNs + kStuckScanIntervalNs;
+        publishStuckOffsets_(static_cast<int64_t>(stuckOffsetTxns_), oldestStuckTxnOffsetAgeNs(nowNs) / 1'000'000);
+    }
+}
+
+void TransactionCoordinationService::publishStuckOffsets_(int64_t stuck, int64_t oldestAgeMs)
+{
+    const std::pair<int64_t, int64_t> v{stuck, oldestAgeMs};
+    if (v == stuckOffsetsPublished_) return;
+    if (stuckOffsetsSink_ == nullptr) { stuckOffsetsPublished_ = v; return; }
+    if (stuckOffsetsSink_(stuckOffsetsSinkCtx_, stuck, oldestAgeMs)) stuckOffsetsPublished_ = v;
+}
+}  // namespace rune::node

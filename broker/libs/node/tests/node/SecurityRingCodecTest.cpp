@@ -95,5 +95,5 @@ TEST(AdminChannelsRegression, FilterSchemaMessageRoundTripsRegression) {
     FilterSchemaMsg bad;
     EXPECT_FALSE(decodeFilterSchema(wire.data(), 5, bad)) << "shorter than the 6-byte header";
     EXPECT_NE(kA2cFilterSchema, kA2cSchemaUpdate);
-    EXPECT_EQ(kA2cFilterSchema, 24);
+    EXPECT_EQ(kA2cFilterSchema, 25);
 }

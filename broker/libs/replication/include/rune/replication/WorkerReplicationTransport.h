@@ -1682,6 +1682,7 @@ private:
     // True when constructed via the test-seam constructor (no real Aeron sub).
     bool testMode_ = false;
 
+
     // Shard plane handshake (see enablePlaneHandshake).  Worker-thread only.
     std::array<PeerPlane, kMaxHandshakePeers> hs_{};
     std::size_t               hsCount_           = 0;

@@ -68,7 +68,7 @@ enum class OpStatus : uint8_t {
     InvalidArgument, ///< the duty thread refused the op as malformed before sending it (payload = why)
 };
 
-/// Authentication (codes 44..47, client version 9): the name of an auth-related Completion::errorCode when
+/// Authentication (codes 44..48, client version 9): the name of an auth-related Completion::errorCode when
 /// status == BrokerError, else nullptr.  AuthenticationFailed ends the session (a connect fails with it, every
 /// pending op too); NotAuthorized fails exactly that op and is never re-sent; SessionRevoked completes
 /// everything in flight and is terminal (no reconnect); PasswordChangeRequired fails exactly that op.
@@ -78,6 +78,7 @@ enum class OpStatus : uint8_t {
     case 45: return "NotAuthorized";
     case 46: return "SessionRevoked";
     case 47: return "PasswordChangeRequired";
+    case 48: return "AuthUnavailable";   // issues #15 / #111: this broker cannot vouch for its security state: retriable
     default: return nullptr;
     }
 }

@@ -431,14 +431,52 @@ public:
     /// lost READ (explicitly, NotAuthorized), ships its WRITE bits and a lifted must-change-password session becomes
     /// authenticated; Revoke -> every session of the affected users completes SessionRevoked and closes.  Control thread.
     void onSecurityApplied(int64_t offset, const rune::security::Applied& applied);
+    /// Issues #15 / #111 (decision M7), control thread: whether this broker's `__security` state is provably current
+    /// (BrokerNode's SecurityServing).  While it is not, an authenticating gateway answers every login, `__security`
+    /// read and security DDL / bootstrap the retriable AuthUnavailable (48), and never advertises the bootstrap window.
+    /// Sessions already authenticated keep working (until endSessionsSecurityUnavailable).  Default: serving (rigs; the
+    /// broker sets false at boot).
+    void setSecurityServing(bool serving) noexcept { securityServing_ = serving; }
+    [[nodiscard]] bool securityServing() const noexcept { return securityServing_; }
+    /// Issues #15 / #111: this broker stayed stale longer than R - every authenticated / must-change-password session
+    /// is told AuthUnavailable at session level (corr 0) and closed; its client reconnects to a current broker.
+    void endSessionsSecurityUnavailable();
+    [[nodiscard]] uint64_t loginsUnavailable() const noexcept { return loginsUnavailable_; }
+    [[nodiscard]] uint64_t sessionsEndedUnavailable() const noexcept { return sessionsEndedUnavailable_; }
     /// The view halted (the admin applier's kA2cSecurityHalted, or the mirror's own apply error): fail closed - every
     /// authenticated / must-change-password session is revoked (D28).  Idempotent.
     void onSecurityHalted(int64_t offset);
-    /// The newest security event offset whose refresh EVERY worker has accepted (D24 answer gate); -1 = none yet.
+    /// The newest security event offset this broker ENFORCES (D24 answer gate); -1 = none yet.  Issues #109 / #196:
+    /// with workers, an event is enforced once every worker ACKNOWLEDGED the enforcement fence that followed the
+    /// event's ops on both of its rings (bitmaps, binds and closes installed; ended subscriptions' cursors gone) - never
+    /// on ring acceptance.
     [[nodiscard]] int64_t securityEnforcedOffset() const noexcept { return securityEnforcedOffset_; }
-    /// Test probes (Task 18): the event waiting for the shipper to drain (-1 none) and the shipper's queued updates.
-    [[nodiscard]] int64_t securityPendingEnforceForTest() const noexcept { return securityPendingEnforce_; }
+    /// Test probes (Task 18): the newest event still awaiting its fence acks (-1 none) and the shipper's queued updates.
+    [[nodiscard]] int64_t securityPendingEnforceForTest() const noexcept {
+        return pendingEnforce_.empty() ? -1 : pendingEnforce_.back().offset;
+    }
+    /// Issues #109 / #196 probes: fences issued / the newest acked per worker and ring (0 = op ring, 1 = lifecycle).
+    [[nodiscard]] uint64_t enforceFencesIssuedForTest() const noexcept { return enforceFenceSeq_; }
+    [[nodiscard]] uint64_t enforceFenceAckedForTest(int32_t worker, int ring) const noexcept {
+        if (worker < 0 || worker >= kMaxFenceWorkers) return 0;
+        return (ring == 0 ? opFenceAcked_ : lifeFenceAcked_)[static_cast<std::size_t>(worker)];
+    }
     [[nodiscard]] std::size_t permissionPendingUpdatesForTest() const noexcept { return permissionShipper_.pendingUpdates(); }
+    /// Issue #259 test seam: authenticate `sid` as `userId` holding exactly `grants` (sorted, unique) - through the pool
+    /// and the shipper, as a login does.
+    void authenticateWithGrantsForTest(int64_t sid, uint64_t userId, std::vector<rune::security::GrantSpec> grants) {
+        Session* s = sessions_.find(sid);
+        if (s == nullptr) return;
+        s->auth = rune::gateway::AuthAuthenticated{userId, "u" + std::to_string(userId),
+                                                    permPool_.acquire(std::move(grants), objectIndex_), {}};
+        (void)shipPermissions_(*s);
+    }
+    int servicePermissionShippingForTest() { return servicePermissionShipping_(); }
+    /// Issue #259 probes: tables compiled so far, live pooled tables, and the words / ops shipped to the workers.
+    [[nodiscard]] uint64_t permissionCompilesForTest() const noexcept { return permPool_.compiles(); }
+    [[nodiscard]] std::size_t permissionTablesForTest() const noexcept { return permPool_.liveTables(); }
+    [[nodiscard]] uint64_t permissionWordsShippedForTest() const noexcept { return permissionShipper_.wordsSentForTest(); }
+    [[nodiscard]] uint64_t permissionOpsShippedForTest() const noexcept { return permissionShipper_.chunksSentForTest(); }
     /// Counter 1'000'232: sessions revoked (disabled / dropped / TERMINATE SESSIONS / security halt).
     [[nodiscard]] uint64_t sessionsRevoked() const noexcept { return sessionsRevoked_; }
     // ── authentication Task 12: per-session permission tables and the enforcement of every request type ──
@@ -465,7 +503,7 @@ public:
     [[nodiscard]] const rune::gateway::PermissionTable* sessionPermissionsForTest(int64_t sid) {
         const Session* s = sessions_.find(sid);
         const auto* a = s ? std::get_if<rune::gateway::AuthAuthenticated>(&s->auth) : nullptr;
-        return a ? &a->perms : nullptr;
+        return a ? &a->perms.table() : nullptr;
     }
     /// Test seam: the auth state of an existing session.
     void setSessionAuthForTest(int64_t sid, rune::gateway::SessionAuth a) {
@@ -582,6 +620,15 @@ public:
     [[nodiscard]] int32_t sessionClientVersion(int64_t sessionId) {
         Session* s = sessions_.find(sessionId);
         return s != nullptr ? s->clientVersion : -1;
+    }
+    /// Issues #122 / #123 / #124: the principal (security user object id) a session authenticated as; 0 = none (a dev
+    /// / in-process broker, an anonymous or not yet authenticated session, an unknown session).  Member ids and producer
+    /// ids are bound to it.  Control thread.
+    [[nodiscard]] uint64_t sessionPrincipalId(int64_t sessionId) {
+        Session* s = sessions_.find(sessionId);
+        if (s == nullptr) return 0;
+        const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s->auth);
+        return a != nullptr ? a->userId : 0;
     }
     void setClusterIdNode(int32_t nodeId) noexcept {
         idPrefix_ = nodeId >= 0 ? clusterIdPrefix(nodeId) : 0;
@@ -1457,6 +1504,11 @@ private:
     enum class Cursor : uint8_t { GatewayPushed, AwaitingEgress, AtWorker };
     struct Subscription {
         Cursor  cursor         = Cursor::GatewayPushed;
+        /// PR #441 F1 (issue #118): under authentication the Subscribe's OK waits for the session's own record egress
+        /// (sent when the Subscribe goes to its worker); a failure answers the still-PENDING Subscribe NotLeader, so the
+        /// client's per-request retry budget counts and ends explicitly (an OK then NotLeader was a fresh-budget move).
+        bool    okOwed         = false;
+        bool    okOwedLineage  = false;   ///< the held OK is followed by the transient lineage note
         int64_t subscriptionId = 0;
         int64_t sessionId      = 0;
         // The correlationId of the client's Subscribe that created it: stamped
@@ -1655,7 +1707,20 @@ private:
                                    int32_t partition, int64_t nextOffset, uint8_t isolation,
                                    bool isGroup, bool groupCarrierReceived,
                                    int64_t subscribeCorrId = 0);
-    void forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition);
+    /// Forget subscription `subId` on its owning worker (queued behind its Subscribe, never dropped).  Issue #109:
+    /// `endCode` != 0 ENDS it - the worker emits ErrorResponse{endCode, its Subscribe correlation id, endDetail} after
+    /// its last Records.  Returns true when the worker owns the end (the caller must not answer it); false when the
+    /// subscription never reached a worker (its Subscribe was still waiting for the record egress): nothing was sent
+    /// and the caller answers the end itself.
+    bool forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition, int16_t endCode = 0,
+                                     std::string_view endDetail = {});
+    /// Issue #118 (X020, M10): under authentication a Subscribe without its own record egress is never handed to a
+    /// worker (it would push on the shared MDC egress every joiner receives): retired NotLeader (a group member's:
+    /// the session's members evicted).  Control thread, cold.
+    void retireWithoutRecordEgress_(int64_t subId);
+    /// F1: the held SubscribeResponse{OK} of `subId` (its egress resolved) - and the lineage note it owes.
+    void sendOwedSubscribeOk_(int64_t subId);
+    uint64_t subscribesWithoutRecordEgress_ = 0;   ///< issue #118: subscriptions retired for want of their own egress
 
     // Hybrid egress: a Subscribe deferred until its session's per-consumer UNICAST
     // Records publication resolves (NON-BLOCKING — never sleeps on the control
@@ -2075,6 +2140,9 @@ private:
     /// credits in the episode is never expired.
     static constexpr uint32_t kCapEvictAfterDeferredPolls = 64;
 
+    // Issue #259: ONE compiled table per distinct grant set, shared by the sessions holding it.  Declared BEFORE
+    // sessions_ so it outlives every session's PermissionRef.
+    rune::gateway::PermissionPool        permPool_;
     SessionTable                         sessions_;
     // Retire-on-ack record-egress pubs (see RetiringEgress).  Declared after
     // sessions_ / aeron_ so it is destroyed before them (pubs before client).
@@ -2208,22 +2276,70 @@ private:
     uint64_t catalogSubscribesForwarded_ = 0;
     void forwardCatalogUnsubscribe_(int64_t sid, int64_t subscriptionId);
     int  flushPendingCatalogUnsubs_();
+    // Issue #117: an admin-log read end (-2 / -3) of a live session is the Session's own pending state (never the
+    // capped queue above): one entry per session in sessionsWithReadEnds_ (bounded by the sessions), retried until the
+    // admin ring takes it.  A close supersedes it (-1 ends both servers' reads).
+    void endAdminLogReads_(Session& s, uint8_t bit);
+    [[nodiscard]] bool submitReadEnds_(Session& s);   ///< true = nothing of it is pending any more
+    int  flushPendingReadEnds_();
+    std::vector<int64_t> sessionsWithReadEnds_;
+public:
+    /// Issue #117: may this admin-log read frame (`__catalog` / `__security` Records of subscription `subId`) go to
+    /// the session NOW?  The control thread's own gate, independent of the admin thread having processed an end:
+    /// a `__catalog` read needs DESCRIBE ON CLUSTER, a `__security` read ADMIN ON CLUSTER, and a `__security` frame
+    /// whose events this broker's SecurityView has not applied yet waits (a revoke the admin applied first must not
+    /// let its successors through).  Deliver / Withhold (dropped: the reader lost the grant) / Hold (offered later).
+    enum class AdminLogAdmit : uint8_t { Deliver, Withhold, Hold };
+    [[nodiscard]] AdminLogAdmit admitAdminLogFrame(int64_t sessionId, int64_t subId, const uint8_t* frame, std::size_t len);
+    [[nodiscard]] uint64_t adminLogFramesWithheld() const noexcept { return adminLogFramesWithheld_; }
+    [[nodiscard]] std::size_t sessionsWithPendingReadEndsForTest() const noexcept { return sessionsWithReadEnds_.size(); }
+    int pumpReadEndsForTest() { return flushPendingReadEnds_(); }
+    void endAdminLogReadsForTest(int64_t sid, bool security) {
+        if (Session* s = sessions_.find(sid))
+            endAdminLogReads_(*s, security ? Session::kPendingEndSecurityReads : Session::kPendingEndCatalogReads);
+    }
+private:
+    uint64_t adminLogFramesWithheld_ = 0;
     [[nodiscard]] bool submitCatalogOrSecurityUnsub_(int64_t sid, int64_t subscriptionId);
     /// handleSubscribe for topicId == kCatalogTopicId: answered here or forwarded.
     void handleCatalogSubscribe_(Session& session, const rune::protocol::client::Subscribe& msg);
     /// handleSubscribe for topicId == kSecurityTopicId (authentication Task 10): the same contract on the second server.
     void handleSecuritySubscribe_(Session& session, const rune::protocol::client::Subscribe& msg);
     uint64_t securitySubscribesForwarded_ = 0;
-    rune::node::UnauthLogLimiter unauthLog_;   ///< X103: 1/1024 limiter of the log lines unauthenticated senders drive (kinds: 0 require-TLS, 1 login rate limited, 2 halted login, 3 bad bootstrap proof, 5 client version refusal, 6 malformed first login leg, 8+ login failed per reason)
+    rune::node::UnauthLogLimiter unauthLog_;   ///< X103: 1/1024 limiter of the log lines unauthenticated senders drive (kinds: 0 require-TLS, 1 login rate limited, 2 halted login, 3 bad bootstrap proof, 4 own-password change without a valid proof (#114), 5 client version refusal, 6 malformed first login leg, 7 login refused: security state not current (#15), 8+ login failed per reason)
     uint64_t controlBatchRefusals_ = 0;   ///< X036: Produce frames refused for carrying a client control batch (rate-limited log)
     static void noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr);
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
     const rune::gateway::SecurityView* securityView_ = nullptr;   // control thread's own mirror (same thread as the gateway)
+    bool     securityServing_ = true;           ///< issues #15 / #111: see setSecurityServing
+    uint64_t loginsUnavailable_ = 0, sessionsEndedUnavailable_ = 0;
+    /// Issues #15 / #111: Required mode and the `__security` state is not provably current (a halted view keeps its own
+    /// fail-closed answers, D28).
+    [[nodiscard]] bool securityUnavailable_() const noexcept {
+        return authMode_ == rune::gateway::GatewayAuthMode::Required && !securityServing_ &&
+               !(securityView_ != nullptr && securityView_->halted());
+    }
+    /// The login answer of an unavailable broker: AuthServerFinal{48} + the end of the session (the client retries).
+    void unavailableLogin_(Session& session, int64_t correlationId, std::string_view user);
     /// The auth state a NEW session starts in (D11): AuthAwaitingFirst{now + authTimeout} when authenticating,
     /// AuthAnonymous otherwise.
     [[nodiscard]] rune::gateway::SessionAuth newSessionAuth_(int64_t nowNs, int64_t connectCorrelationId) const;
     /// The bootstrap window (SecurityBootstrap accepted): cached in the SecurityView, O(1).
     [[nodiscard]] bool bootstrapOpen_() const noexcept { return securityView_ != nullptr && securityView_->bootstrapWindowOpen(); }
+    /// Issue #121: the window is open AND no `__security` event was ever applied (a fresh cluster: no user exists, so a
+    /// login cannot succeed) - the only case a connect is told Anonymous.  A REOPENED window answers MustAuthenticate.
+    [[nodiscard]] bool neverBootstrapped_() const noexcept { return bootstrapOpen_() && securityView_->appliedOffset() < 0; }
+    /// Issues #15 (M8): a connect is told Anonymous only while this broker is current - a new / wiped broker whose
+    /// replica is still empty must not advertise the window of a cluster that was bootstrapped long ago.
+    [[nodiscard]] rune::protocol::client::AuthState connectAuthState_() const noexcept {
+        return authMode_ == rune::gateway::GatewayAuthMode::Required && (!neverBootstrapped_() || securityUnavailable_())
+                   ? rune::protocol::client::AuthState::MustAuthenticate
+                   : rune::protocol::client::AuthState::Anonymous;
+    }
+public:
+    /// Test seam: what a v9 Connect to this gateway is told now (the ConnectResponse authState).
+    [[nodiscard]] rune::protocol::client::AuthState connectAuthStateForTest() const noexcept { return connectAuthState_(); }
+private:
     /// true = refused here: the auth gate (gateFor) answered AuthenticationFailed (and ended the session) or
     /// PasswordChangeRequired (the session stays) in the request's own response type.
     [[nodiscard]] bool authGateRefuses_(rune::protocol::client::TemplateId tid, const uint8_t* buf, std::size_t len);
@@ -2250,10 +2366,24 @@ private:
     /// The permission table the session's auth state grants: its compiled one, allow-all (anonymous), else deny-all.
     [[nodiscard]] const rune::gateway::PermissionTable& permsOf_(const Session& s) const noexcept;
     /// Compile the table of `userId` against the live ObjectIndex (login and SET PASSWORD; Task 14 refreshes with it).
-    [[nodiscard]] rune::gateway::PermissionTable compilePerms_(uint64_t userId) const;
+    [[nodiscard]] rune::gateway::PermissionRef compilePerms_(uint64_t userId);
+    /// Issue #259: the pool's table births / deaths to the shard workers (FIFO, before any bind or patch).
+    void syncPermissionTables_();
     /// true = DENIED here: answered NotAuthorized (45) in the request's own response type (D23 text where the type
     /// carries one) - the caller returns without forwarding anything.
     [[nodiscard]] bool deny_(Session& session, const std::optional<rune::gateway::Denial>& denial, const uint8_t* buf, std::size_t len);
+    /// Issue #122: the verdict for a producer id issued to another principal (cold: built only on a refusal).
+    [[gnu::cold]] static rune::gateway::Denial refusedProducerIdDenial_(int64_t producerId);
+    /// Issue #114: a user's own ADD / DROP / SET PASSWORD without ADMIN - nullopt when it carries a valid proof of a
+    /// current password over credentialChangeMessage(the session's login nonce, m); throttled like a login.
+    [[nodiscard]] std::optional<rune::gateway::Denial> verifyOwnCredentialChange_(Session& session,
+                                                                                const rune::protocol::client::SecurityDdl& m,
+                                                                                const std::string& self,
+                                                                                const std::string& loginNonce,
+                                                                                bool chargeThrottle);
+    /// Count and (rate-limited) log one NotAuthorized verdict - deny_'s bookkeeping, also for a verdict the admin
+    /// thread answers (a forwarded security DDL).
+    void noteDenied_(const Session& session, rune::protocol::client::TemplateId tid, const rune::gateway::Denial& denial);
     /// Group / txn / catalog-DDL request authorization (cold paths): true = denied and answered.
     [[nodiscard]] bool denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
     [[nodiscard]] bool denyTxnRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
@@ -2266,8 +2396,28 @@ private:
     uint64_t loginsOk_ = 0, loginsFailed_ = 0, loginsRateLimited_ = 0;
     // ── authentication Task 14: live security changes ──
     uint64_t sessionsRevoked_ = 0;
-    int64_t  securityEnforcedOffset_ = -1;       ///< every event <= this is enforced here (tables refreshed, bitmaps accepted by every worker)
-    int64_t  securityPendingEnforce_ = -1;       ///< applied here, waiting for the permission shipper to drain
+    int64_t  securityEnforcedOffset_ = -1;       ///< every event <= this is enforced here (see securityEnforcedOffset())
+    // Issues #109 / #196: the enforcement fences.  Each applied security event that touches workers gets one fence
+    // sequence number, sent to EVERY worker behind the event's ops - on the lifecycle ring through the permission
+    // shipper's FIFO (bitmaps / binds; a revoked session is bound to deny first) and on the op ring through the
+    // per-worker pendingSubOps_ FIFO (ending Unsubscribes).  The event is enforced once every worker acknowledged its
+    // fence on every ring in use (SessionSignal FenceAck).  Control thread, cold (one entry per security event).
+    static constexpr int kMaxFenceWorkers = 64;   // validateShardConfig
+    /// One applied event still awaiting its fence acks: `opWorkers` = the workers whose OP ring got this event's
+    /// Unsubscribes (only they are fenced there), `lifecycle` = this event shipped permission items (every worker's
+    /// lifecycle ring is fenced).  An event that queued nothing for any worker is enforced at once.
+    struct PendingEnforce { int64_t offset; uint64_t seq; uint64_t opWorkers; bool lifecycle; };
+    std::deque<PendingEnforce>               pendingEnforce_;
+    uint64_t                                 enforceFenceSeq_ = 0;
+    std::array<uint64_t, kMaxFenceWorkers>   opFenceAcked_{};
+    std::array<uint64_t, kMaxFenceWorkers>   lifeFenceAcked_{};
+    [[nodiscard]] bool fencesOpRing_() const noexcept;
+    [[nodiscard]] bool fencesLifecycleRing_() const noexcept;
+    // What the event being applied (onSecurityApplied) queued for the workers - the fences it needs.
+    bool     applyTracking_    = false;
+    uint64_t applyOpWorkers_   = 0;   ///< bit w: an Unsubscribe of this event went to worker w's op ring
+    void onEnforceFenceAck_(int32_t worker, int ring, uint64_t seq) noexcept;
+    void promoteEnforced_() noexcept;
     std::vector<int64_t> liveScratch_;           ///< reused session-id list (capacity persists)
     /// Recompile one session's table, end what lost READ, ship the WRITE bits.
     void refreshSession_(int64_t sid);
@@ -2275,7 +2425,7 @@ private:
     void revokeSession_(int64_t sid, std::string_view reason);
     void executeLiveActions_(Session& s, const rune::gateway::LiveActions& act);
     void sendErrorOn_(Session& s, int64_t corr, uint16_t code, std::string_view message);
-    void noteEnforced_(int64_t offset) noexcept;
+    void noteEnforced_(int64_t offset, uint64_t opWorkers, bool lifecycle);
     int32_t  currentImageSessionId_ = 0;   ///< the Aeron image (publication) session id of the frame being dispatched
     std::vector<int64_t> authReapScratch_; ///< reused by reapAuthDeadlines_ (capacity persists)
     uint64_t authGateRefusals_ = 0;
@@ -2319,7 +2469,8 @@ private:
     uint64_t permEpoch_ = 0;
     struct HeldLoginFinal { int64_t sessionId; uint64_t epoch; std::vector<uint8_t> frame; };
     std::vector<HeldLoginFinal> heldLoginFinals_;     ///< cold: one per login whose grants are still being shipped
-    /// Ship `session`'s WRITE bitmap (Required mode + shard mode only); returns its epoch (0 = nothing to ship).
+    /// Bind `session` to its table on every worker (Required mode + shard mode only; the table itself is shipped once
+    /// per grant set); returns the bind's shipper sequence (0 = nothing to ship).
     uint64_t shipPermissions_(const Session& session);
     /// Release the held AuthServerFinal frames whose epoch every worker has accepted; retry unfinished shipments.
     int servicePermissionShipping_();
@@ -2689,9 +2840,15 @@ private:
     // Phase 2c (fix-on-sight): the op kind is a variant, not a pair of booleans.
     enum class EgressRoute : uint8_t { Unicast, Mdc };   // Mdc: forwarded with the MDC pub (no unicast)
     struct SubOpSubscribe    { BufferedSubscribe sub; EgressRoute route = EgressRoute::Unicast; };
-    struct SubOpUnsubscribe  { int64_t subId = 0; int32_t topicId = 0; int32_t partition = 0; };
+    // Issue #109: an ENDING Unsubscribe (endCode != 0) - the worker sends ErrorResponse{endCode, endDetail} after its
+    // last Records.
+    struct SubOpUnsubscribe  { int64_t subId = 0; int32_t topicId = 0; int32_t partition = 0;
+                               int16_t endCode = 0; std::string endDetail; };
     struct SubOpFilterSchema { int32_t topicId = 0; uint16_t version = 0; std::vector<uint8_t> blob; };
-    using PendingSubOp = std::variant<SubOpSubscribe, SubOpUnsubscribe, SubOpFilterSchema>;
+    // Issues #109 / #196: an enforcement fence for the worker whose queue holds it - acknowledged by the worker once
+    // every op queued before it on its op ring ran.
+    struct SubOpFence        { uint64_t seq = 0; };
+    using PendingSubOp = std::variant<SubOpSubscribe, SubOpUnsubscribe, SubOpFilterSchema, SubOpFence>;
     std::vector<std::deque<PendingSubOp>> pendingSubOps_;   // indexed by owning worker
     bool trySubOp_(std::size_t worker, const PendingSubOp& p);
     void queueSubOp_(std::size_t worker, PendingSubOp p);
@@ -2705,12 +2862,13 @@ public:
         for (const auto& q : pendingSubOps_) n += q.size();
         return n;
     }
-    /// Test-only: the kinds of worker `w`'s queued ops, oldest first: S subscribe, U unsubscribe, F filter schema.
+    /// Test-only: the kinds of worker `w`'s queued ops, oldest first: S subscribe, U unsubscribe, F filter schema, E enforcement fence.
     [[nodiscard]] std::string pendingSubOpKindsForTest(std::size_t w) const {
         std::string out;
         if (w >= pendingSubOps_.size()) return out;
         for (const PendingSubOp& p : pendingSubOps_[w])
-            out.push_back(std::holds_alternative<SubOpSubscribe>(p) ? 'S' : std::holds_alternative<SubOpUnsubscribe>(p) ? 'U' : 'F');
+            out.push_back(std::holds_alternative<SubOpSubscribe>(p) ? 'S' : std::holds_alternative<SubOpUnsubscribe>(p) ? 'U'
+                                                       : std::holds_alternative<SubOpFence>(p) ? 'E' : 'F');
         return out;
     }
     /// Test-only: the filter bytes the gateway holds for a subscription (empty = unfiltered / unknown).
@@ -2766,7 +2924,11 @@ public:
     }
     void closeSessionForTest(int64_t sid) { (void)closeSession_(sid); }
     /// Task 12: the doWork step that retries catalog Unsubscribes the admin ring refused.
-    int pumpCatalogUnsubscribesForTest() { return pendingCatalogUnsubs_.empty() ? 0 : flushPendingCatalogUnsubs_(); }
+    int pumpCatalogUnsubscribesForTest() {   // the doWork retry steps (issue #117: the sessions' read ends too)
+        return (pendingCatalogUnsubs_.empty() ? 0 : flushPendingCatalogUnsubs_()) + flushPendingReadEnds_();
+    }
+    /// Test-only: the admin-log Unsubscribe / end path (kEndCatalogReadsOnly / kEndSecurityReadsOnly / an id / -1).
+    void forwardCatalogUnsubscribeForTest(int64_t sid, int64_t subscriptionId) { forwardCatalogUnsubscribe_(sid, subscriptionId); }
     /// Drive the resolve-completion path for (sid, worker) with `pub` and one
     /// buffered subscribe `subId` on (topicId, partition).
     void resolveRecordEgressForTest(int64_t sid, int32_t worker, std::shared_ptr<aeron::ExclusivePublication> pub,
@@ -2948,6 +3110,16 @@ public:
     void noteControlledImagesForTest(int images) noexcept { noteControlledImages_(images); }
     void injectPendingRecordEgressForTest(int64_t sid, int32_t worker) { pendingRecordEgress_[{sid, worker}]; }
     [[nodiscard]] std::size_t pendingRecordEgressCountForTest() const noexcept { return pendingRecordEgress_.size(); }
+    /// PR #441 F1 probe: the subscription id the session's Subscribe `corr` registered (0 = none) - known to the
+    /// gateway even while its OK is held.
+    [[nodiscard]] int64_t subscriptionIdOfCorrForTest(int64_t sid, int64_t corr) {
+        Session* s = sessions_.find(sid);
+        if (s == nullptr) return 0;
+        for (const auto& [key, subId] : s->subIdByKey) if (key.correlationId == corr) return subId;
+        return 0;
+    }
+    /// Issue #118: subscriptions retired because they had no record egress of their own under authentication.
+    [[nodiscard]] uint64_t subscribesWithoutRecordEgressForTest() const noexcept { return subscribesWithoutRecordEgress_; }
 private:
     int64_t                                 lastFlushNs_ = 0;
 

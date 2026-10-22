@@ -42,16 +42,33 @@ Rules that keep the model small (D15 to D17):
 | `AddOffsetsToTxn` / `TxnOffsetCommit` (D18) | `WRITE` on the transactional id and `READ` on the group |
 | Subscribe (any form) | `READ` on the topic |
 | JoinGroup / SyncGroup / Heartbeat / OffsetFetch / OffsetCommit | `READ` on the group, and `READ` on each topic |
-| LeaveGroup, non-transactional InitProducerId (D18) | nothing (their produces are checked) |
+| LeaveGroup | `READ` on the group |
+| Non-transactional InitProducerId (D18) | nothing (its produces are checked) |
 | GetViewRow / openView | `READ` on the view |
 | Metadata, topic and view listings, `GetTopicSchema` | `DESCRIBE` |
 | `CreateTopic` / `CreateView` / `CreateSchema` | `CREATE` on the name (exact or prefix grant), or on `CLUSTER` |
+| `CreateSchema` on an existing untyped topic (a `DefineTopic` with a descriptor) | `ALTER` on the topic as well: it is a new schema version of a live object |
 | `CreateView` / `AlterView` (D19) | also `READ` on every source topic |
 | `AlterSchema` / `AlterView` / `AlterTopicConfig` / `SetCompatibility` | `ALTER` on the object |
 | `DropTopic` / `DropView` | `DROP` on the object |
 | Catalog history, as-of, diff, export, replay (`__catalog` reads) (D21) | `DESCRIBE` on `CLUSTER` |
 | User, role and grant DDL; every `SHOW USERS|ROLES|GRANTS|SECURITY HISTORY` (D20) | `ADMIN` on `CLUSTER` |
-| `ALTER USER <self> SET|ADD|DROP PASSWORD` (D20) | nothing (a user changes their own password) |
+| `ALTER USER <self> SET|ADD|DROP PASSWORD` (D20) | no grant, but a fresh proof of a current password (the client sends it; a session alone is not enough) |
+
+**Ownership.** A consumer-group member id and a producer id belong to whoever obtained them.
+- A member id is bound to the session and user that joined. SyncGroup, Heartbeat, LeaveGroup and
+  OffsetCommit naming it are honoured only on that session, and are otherwise answered `UnknownMember`,
+  the same answer as for a member that does not exist. A JoinGroup naming it re-joins only for the same
+  user (a reconnect); anyone else joins as a new member with a fresh id. Member ids are random.
+- A producer id carries the user it was issued to. A Produce, AddPartitionsToTxn, AddOffsetsToTxn,
+  TxnOffsetCommit or EndTxn naming another user's producer id is refused (`NotAuthorized` for a Produce, the
+  wrong-producer answer otherwise). Two users sharing `WRITE` on a transactional id each get their own
+  producer id at InitProducerId; the previous holder is fenced.
+- Producer ids are bound only once every broker in the cluster runs a version that supports it (the
+  metadata feature level). During a rolling upgrade, ids are issued unbound, as before. An unbound id
+  carries no owner and is usable by any user with `WRITE`, so a producer that started before the
+  upgrade completed is unprotected until it re-initializes. A transactional id still holding an unbound id
+  gets a bound one at its next InitProducerId.
 
 **Visibility.** Objects the user cannot `DESCRIBE` do not appear in metadata or listings. Direct
 access to such an object answers `NotAuthorized`, whether or not the object exists, so the answer
@@ -63,7 +80,10 @@ always `not authorized: <OP> on <TYPE> <requested name or id>` (D23).
 
 ## Rune QL statements
 
-All security statements need `ADMIN ON CLUSTER`, except a user changing their own password. A
+All security statements need `ADMIN ON CLUSTER`, except a user changing their own password. That
+change carries a SCRAM proof of a current password, bound to the session's login and to the request,
+so a hijacked or leaked session cannot add or replace a password. After a `SET PASSWORD`, log in again
+before the next change of your own password. A
 statement that carries a password literal is always read from a file or stdin with
 `rune ql -f` (`-e` refuses it, so the password never shows in `ps` or the shell history). Passwords
 are turned into SCRAM verifiers by the client library or the CLI before sending: the plaintext
@@ -164,6 +184,10 @@ rune security bootstrap --admin admin \
 - Automation (CI, docker) supplies the one-time password itself with `--password-file <path>`: it is
   never read from an environment variable and never accepted on the command line.
 - A second run refuses: `this cluster is already bootstrapped - it already has a security admin`.
+- The last enabled security admin cannot be removed by accident: `ALTER USER .. DISABLE`, `DROP USER`,
+  `DROP ROLE` or `REVOKE` that would leave no enabled user holding `ADMIN ON CLUSTER` is refused unless
+  the statement ends in `FORCE`. A forced removal reopens the bootstrap window: the other users keep
+  logging in, and the cluster-key holder can run `rune security bootstrap` again (D3 recovery).
 
 ```bash
 rune ql --user admin --password-file otp.txt -f change-password.rql --broker rune-1:40200
@@ -242,11 +266,35 @@ A change takes effect on live sessions. Nothing is silent (D24 to D26).
 | `ADD PASSWORD`, `DROP PASSWORD`, `CREATE *`, `ENABLE` | Nothing for live sessions. |
 
 A security DDL is answered OK once the broker that served the statement enforces it: its control thread
-releases the answer once its view applied the event and every refreshed permission table reached every
-worker of that broker (D24). The OK does not mean every broker enforces it. Other brokers apply the event
-asynchronously (typically within 100 ms on healthy brokers); a lagging or partitioned broker can keep
-enforcing the old grants until it catches up.
+releases the answer once its view applied the event and **every worker of that broker acknowledged** what
+the event changed there (D24): its new permission bitmaps and binds are installed, a revoked session is
+bound to nothing, and an ended subscription's cursor is gone. A subscription a worker pushes is ended by
+that worker: its `NotAuthorized` follows its last `Records` frame, and nothing follows it. An OK whose
+enforcement is not confirmed within `RUNE_SECURITY_GATE_DEADLINE_MS` (default 5 000) is answered `Internal`
+"committed at offset N; enforcement on this broker not confirmed" (the change is committed; a retry with
+the same request id returns its result). The OK does not mean every broker enforces it. Other brokers
+apply the event asynchronously (typically within 100 ms on healthy brokers).
 A revoke ends the affected subscriptions within 100 ms on a 3-node cluster.
+
+### A broker serves only a current security state (`#serving`)
+
+A broker serves logins, `__security` reads and security DDL only while its `__security` state is provably
+current; otherwise it answers the retriable `AuthUnavailable` (48) and the client tries another broker:
+
+- **Catching up.** After a start (a restart, a wiped or a new broker) it serves nothing until it has
+  fetched everything its current `__security` leader has and applied it. A leader serves once its whole
+  log is committed and applied.
+- **Stale.** A follower whose leader has not answered for `RUNE_SECURITY_MAX_STALENESS_MS` (F, default
+  1 000), whose apply lags that long, or any broker that lost contact with the consensus for F (a broker cut
+  off the cluster, including a `__security` leader that does not know it was replaced) is stale. F exceeds
+  the broker liveness timeout, so a planned leadership move does not make a broker stale; a hard leader
+  failure can make the surviving followers answer logins `AuthUnavailable` briefly until the new leader
+  answers them (tracked in #460).
+- A broker stale for `RUNE_SECURITY_STALE_SESSION_END_MS` (R, default 10 000) ends its authenticated
+  sessions with a session-level `AuthUnavailable`; their clients reconnect to a current broker. Until then
+  those sessions keep working on the state the broker last had: what a broker serves is never more than
+  about F behind the cluster.
+- A new or wiped broker never advertises the bootstrap window while it is catching up.
 
 On the hot path an authorization check is one bitmask load from the session's own table (at most 2 ns,
 zero allocation); tables are owned by the thread that owns the session and updated through the rings.
@@ -276,6 +324,7 @@ zero allocation); tables are owned by the thread that owns the session and updat
 | A client older than version 9 against an authenticated cluster | refused at the handshake (`Connect`), never downgraded | version gate |
 | A broker without a valid cluster key | refused at the peer connection, logged on both sides | counter 1 000 234 |
 | `__security` apply halted on this broker | logins `AuthenticationFailed`, sessions `SessionRevoked`, security DDL `Internal` | see `#halted` |
+| This broker's `__security` state is not current (catching up, stale) | logins, `__security` reads and security DDL `AuthUnavailable`; retriable, try another broker. Stale longer than R: a session-level `AuthUnavailable` ends the authenticated sessions | 48, see `#serving` |
 
 ### `#halted`: the `__security` apply halted (D28)
 

@@ -160,10 +160,14 @@ enum : int32_t {
     // Authentication Task 16: the admin plane's cumulative dropped inter-broker frames, [count:u64] (paced, only on a
     // change) - the control thread folds it into counter 1'000'235.
     kA2cPeerFrameDrops      = 23,
+    // Issues #15 / #111 (decision M7): the admin thread's verdict on whether this broker's `__security` state is caught
+    // up and fresh (SecurityCatchUp), posted on change: [caughtUp:u8][leaderHw:i64].  On the SAME FIFO as
+    // kA2cSecurityApplied, behind every applied event of the state it vouches for.
+    kA2cSecurityServing     = 24,
     // Phase 2c (subscription filters): a typed topic's EVOLVING descriptor at its current version, [topicId:i32]
     // [version:u16][blob] (the kA2cSchemaUpdate layout).  The control thread hands it to the gateway, which fans it
     // out to every worker ahead of any filtered Subscribe.
-    kA2cFilterSchema        = 24,
+    kA2cFilterSchema        = 25,
 };
 
 // ---------------------------------------------------------------------------
@@ -235,6 +239,10 @@ struct DefineTopicMsg {
     int16_t                     replicationFactor = 0;
     rune::protocol::TopicConfig config;
     DdlMeta                     meta;
+    /// Issue #129: the gateway's verdict on adopting a schema onto an EXISTING untyped topic (ALTER on it):
+    /// "" = allowed (also every in-process / admin-level submit, which no session authorizes), otherwise the
+    /// NotAuthorized detail the admin thread answers when the name turns out to be such a topic.
+    std::string                 adoptDenial;
 };
 
 /// AlterTopic: the client's CAS expectation (expectedVersion = the topic's SCHEMA
@@ -341,6 +349,12 @@ struct SecurityDdlMsg {
     uint8_t                       granteeKind = 0, op = 0, resourceType = 0, patternKind = 0;   // Grant / Revoke
     std::string                   pattern;
     std::string                   roleName;               // GrantRole / RevokeRole
+    uint8_t                       force = 0;              // issue #121: FORCE - the last security admin may go (0 / 1)
+    /// PR #410 review F1: the gateway's verdict ("" = authorized; otherwise the NotAuthorized detail).  The leader
+    /// answers a retry of an applied request with its original result first, then refuses a denied one 45.
+    std::string                   denial;
+    /// PR #410 review F2: the gateway checked an own-credential proof for this request (whatever the outcome).
+    uint8_t                       proofChecked = 0;
 };
 
 /// SecurityBootstrap: the gateway already verified the MAC with its ClusterKeys; the nonce is kept as the request's
@@ -582,7 +596,7 @@ inline std::span<const uint8_t> span8(const std::vector<uint8_t>& v) noexcept { 
 template <class W> void layout(W& w, const DefineTopicMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.i32(m.partitionCount); w.u8(m.validate ? 1 : 0);
     w.str16(m.name); w.str16(m.keyField); w.bytes32(span8(m.blob)); w.u8(m.persistence);
-    w.i16(m.replicationFactor); layoutConfig(w, m.config); layoutMeta(w, m.meta);
+    w.i16(m.replicationFactor); layoutConfig(w, m.config); layoutMeta(w, m.meta); w.str16(m.adoptDenial);
 }
 template <class W> void layout(W& w, const AlterTopicMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.u16(m.expectedVersion); w.str16(m.topicName);
@@ -620,7 +634,7 @@ template <class W> void layout(W& w, const SecurityDdlMsg& m) {
     w.u8(m.kind); w.str16(m.name); w.u8(m.change); w.u8(m.passwordIndex); w.u8(m.terminateSessions);
     layoutVerifier(w, m.verifier);
     w.u8(m.granteeKind); w.u8(m.op); w.u8(m.resourceType); w.u8(m.patternKind);
-    w.str16(m.pattern); w.str16(m.roleName);
+    w.str16(m.pattern); w.str16(m.roleName); w.u8(m.force); w.str16(m.denial); w.u8(m.proofChecked);
 }
 template <class W> void layout(W& w, const SecurityBootstrapMsg& m) {
     w.i64(m.session); w.i64(m.corr); layoutMeta(w, m.meta);
@@ -695,6 +709,7 @@ inline DdlRequest decodeDefineTopic(const uint8_t* buf, std::size_t len) {
     m.replicationFactor = r.i16();
     admin_wire::readConfig(r, m.config);
     admin_wire::readMeta(r, m.meta);
+    r.str16(m.adoptDenial);
     return admin_wire::finish(r, std::move(m), kTidDefineTopic);
 }
 inline DdlRequest decodeAlterTopic(const uint8_t* buf, std::size_t len) {
@@ -809,8 +824,13 @@ inline SecurityRequest decodeSecurityDdl(const uint8_t* buf, std::size_t len) {
     m.granteeKind = r.u8(); m.op = r.u8(); m.resourceType = r.u8(); m.patternKind = r.u8();
     r.str16(m.pattern);
     r.str16(m.roleName);
+    m.force = r.u8();
+    r.str16(m.denial);
+    m.proofChecked = r.u8();
     if (r.ok) {
         if (m.kind < 1 || m.kind > 9) r.fail("an unknown security op kind");
+        else if (m.force > 1) r.fail("a force flag other than 0/1");
+        else if (m.proofChecked > 1) r.fail("a proof-checked flag other than 0/1");
         else if (m.kind == 2 && m.change > 4) r.fail("an unknown user change");
         else if (m.terminateSessions > 1) r.fail("a terminate flag other than 0/1");
         else if ((m.kind == 6 || m.kind == 7) &&
@@ -1484,6 +1504,29 @@ inline void writeSecurityApplied(uint8_t* p, int64_t offset, std::span<const uin
     bytes  = std::span<const uint8_t>(buf + kSecurityAppliedFixedBytes, len - kSecurityAppliedFixedBytes);
     return offset >= 0;
 }
+//   kA2cSecurityServing : [caughtUp:u8][leaderHw:i64][epoch:i32][asLeader:u8]   (issues #15 / #111; PR #459 F2: the
+//                         epoch / role the verdict is for, compared with the committed assignment on the control thread)
+inline constexpr std::size_t kSecurityServingWireLen = 1 + 8 + 4 + 1;
+inline void writeSecurityServing(uint8_t* p, bool caughtUp, int64_t leaderHw, int32_t epoch = -1,
+                                 bool asLeader = false) noexcept {
+    p[0] = caughtUp ? 1 : 0;
+    admin_wire::putI64(p + 1, leaderHw);
+    std::memcpy(p + 9, &epoch, 4);
+    p[13] = asLeader ? 1 : 0;
+}
+[[nodiscard]] inline bool decodeSecurityServing(const uint8_t* buf, std::size_t len, bool& caughtUp, int64_t& leaderHw) noexcept {
+    if (len != kSecurityServingWireLen || buf[0] > 1 || buf[13] > 1) return false;
+    caughtUp = buf[0] == 1;
+    leaderHw = admin_wire::getI64(buf + 1);
+    return true;
+}
+[[nodiscard]] inline bool decodeSecurityServing(const uint8_t* buf, std::size_t len, bool& caughtUp, int64_t& leaderHw,
+                                                int32_t& epoch, bool& asLeader) noexcept {
+    if (!decodeSecurityServing(buf, len, caughtUp, leaderHw)) return false;
+    std::memcpy(&epoch, buf + 9, 4);
+    asLeader = buf[13] == 1;
+    return true;
+}
 using SecurityHaltedMsg = CatalogHaltedMsg;
 inline constexpr std::size_t kSecurityHaltedFixedBytes = kCatalogHaltedFixedBytes;
 inline void writeSecurityHalted(uint8_t* p, int64_t offset, uint64_t expected, uint64_t actual,
@@ -1514,8 +1557,9 @@ template <typename Write>
 // 6-byte header in front, so every committed descriptor fits.
 // statement(4) + clientName(2) + sourceAddress(2) + authenticated(2, auth Task 10) + sessionId + requestId hi/lo + flag.
 inline constexpr std::size_t kDdlMetaFixedBytes     = 4 + 2 + 2 + 2 + 8 + 8 + 8 + 1;
+// The trailing adoptDenial length prefix (2, issue #129).
 inline constexpr std::size_t kDefineTopicFixedBytes =
-    8 + 8 + 4 + 1 + 2 + 2 + 4 + 1 + 2 + kTopicConfigFixedBytes + 2 + 2 + kDdlMetaFixedBytes;
+    8 + 8 + 4 + 1 + 2 + 2 + 4 + 1 + 2 + kTopicConfigFixedBytes + 2 + 2 + kDdlMetaFixedBytes + 2;
 inline constexpr std::size_t kMaxDescriptorViaRequestRing =
     static_cast<std::size_t>(kAdminRequestRingBytes) / 8 - kDefineTopicFixedBytes;
 static_assert(schemaUpdateWireLen(kMaxDescriptorViaRequestRing) <=

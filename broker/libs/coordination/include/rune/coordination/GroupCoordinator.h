@@ -49,8 +49,16 @@
 //
 // ## No hot-path allocation
 //
-//   Member records are stored in a pre-allocated vector. Generated memberIds
-//   use a monotonic counter. No per-operation heap allocation after construction.
+//   Member records are stored in a pre-allocated vector. No per-operation heap
+//   allocation after construction (a new member's id is built once, cold).
+//
+// ## Member ids (issues #123 / #124)
+//
+//   A generated id is "<groupId>-<seq>-<32 hex digits>": the per-instance join
+//   counter (it keeps the first member the smallest id, so leader election is
+//   unchanged) and 128 random bits, so an id cannot be guessed from another one
+//   and carries no heap address.  The random bits come from setMemberIdEntropy
+//   (the broker wires its CSPRNG); the default is std::random_device.
 // ---------------------------------------------------------------------------
 
 #include <rune/coordination/Types.h>
@@ -297,6 +305,22 @@ public:
     /// True if the group has no members.
     [[nodiscard]] bool isEmpty() const noexcept { return members_.empty(); }
 
+    /// True when `memberId` is a current member.
+    [[nodiscard]] bool hasMember(const std::string& memberId) const noexcept { return findMember(memberId) != nullptr; }
+
+    /// Issues #123 / #124: the random half of generated member ids.  Fills `n` bytes; false = no entropy (the join
+    /// then falls back to std::random_device).  Plain function pointer: no allocation, no virtual call.
+    using EntropyFn = bool (*)(uint8_t* out, std::size_t n) noexcept;
+    void setMemberIdEntropy(EntropyFn fn) noexcept { entropy_ = fn; }
+
+    /// Every member removed since the last call (leave, session expiry, join timeout), moved into `out` (cleared
+    /// first).  The owner of the coordinator drains it to drop what it keeps per member.  Cold.
+    [[nodiscard]] bool hasDeparted() const noexcept { return !departed_.empty(); }
+    void takeDeparted(std::vector<std::string>& out) {
+        out.clear();
+        out.swap(departed_);
+    }
+
     /// Phase 2c (spec 13.3): an EMPTY group adopts `filter` (any, including none); a non-empty one admits
     /// only byte-identical bytes.  The "unfixed" state is exactly isEmpty() - no extra flag.  Cold (JoinGroup).
     [[nodiscard]] bool admitFilter(std::span<const uint8_t> filter);
@@ -317,7 +341,7 @@ private:
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Generate a new unique memberId: "<groupId>-<seq>".
+    /// Generate a new unique, unguessable memberId: "<groupId>-<seq>-<32 hex>".
     std::string generateMemberId();
 
     /// Find a member by id. Returns nullptr if not found.
@@ -352,6 +376,8 @@ private:
     // for every live instance in the process); within an instance, memberSeq_ (a
     // plain single-owner counter) disambiguates successive joins.  No shared state.
     uint64_t memberSeq_{0};                    ///< per-instance counter (single-owner)
+    EntropyFn entropy_ = nullptr;              ///< the random half of member ids (null: std::random_device)
+    std::vector<std::string> departed_;        ///< removed members not yet taken (takeDeparted)
 
     // -----------------------------------------------------------------------
     // P4-3 rebalance state

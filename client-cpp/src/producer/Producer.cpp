@@ -426,7 +426,8 @@ namespace {
 // issues a control op: Thread mode writes it to the producer ring (FIFO with the records before it, FD1),
 // Invoker mode applies it at once on the owner thread (WrongThread elsewhere).  Accepted: exactly one completion.
 OpResult Producer::issueTxn_(std::uint8_t kindByte, const CompletionTarget& target, Token token,
-                             std::span<const OffsetEntry> offsets, std::string_view groupId) {
+                             std::span<const OffsetEntry> offsets, std::string_view groupId,
+                             int32_t generationId, std::string_view memberId) {
     if (!impl_ || !transactional()) return OpResult::InvalidArgument;
     using Kind = producer::TxnControl::Kind;
     const Kind kind = static_cast<Kind>(kindByte);
@@ -435,6 +436,8 @@ OpResult Producer::issueTxn_(std::uint8_t kindByte, const CompletionTarget& targ
     c.token   = token;
     c.offsets = offsets;
     c.groupId = groupId;
+    c.generationId = generationId;   // #125
+    c.memberId     = memberId;
     if (token > kMaxToken) return OpResult::InvalidArgument;
     Completions* q = target.cq;
     if (q == nullptr && target.handler.fn == nullptr) return OpResult::InvalidArgument;
@@ -465,6 +468,12 @@ OpResult Producer::initTransactions(const CompletionTarget& t, Token k) {
 OpResult Producer::sendOffsetsToTransaction(std::span<const OffsetEntry> offsets, std::string_view groupId,
                                             const CompletionTarget& t, Token k) {
     return issueTxn_(static_cast<std::uint8_t>(producer::TxnControl::Kind::SendOffsets), t, k, offsets, groupId);
+}
+
+OpResult Producer::sendOffsetsToTransaction(std::span<const OffsetEntry> offsets, const GroupMetadata& group,
+                                            const CompletionTarget& t, Token k) {
+    return issueTxn_(static_cast<std::uint8_t>(producer::TxnControl::Kind::SendOffsets), t, k, offsets, group.groupId,
+                     group.generationId, group.memberId);
 }
 
 OpResult Producer::commitTransaction(const CompletionTarget& t, Token k) {
@@ -519,7 +528,8 @@ void throwForTxnCompletion(const char* what, const Completion& c, const std::str
 }  // namespace
 
 void Producer::txnAndWait_(const char* what, std::chrono::nanoseconds timeout, std::uint8_t kind,
-                           std::span<const OffsetEntry> offsets, std::string_view groupId) {
+                           std::span<const OffsetEntry> offsets, std::string_view groupId,
+                           int32_t generationId, std::string_view memberId) {
     if (!transactional()) throwNoTransactionalId(what);
     if (impl_->clientClosed()) throw std::runtime_error(std::string(what) + ": producer closed");
     const auto& hk = impl_->hooks();
@@ -531,10 +541,12 @@ void Producer::txnAndWait_(const char* what, std::chrono::nanoseconds timeout, s
         std::uint8_t                 kind;
         std::span<const OffsetEntry> offsets;
         std::string_view             groupId;
-    } ctx{this, kind, offsets, groupId};
+        int32_t                      generationId;
+        std::string_view             memberId;
+    } ctx{this, kind, offsets, groupId, generationId, memberId};
     const detail::AndWaitIssue issue = [](void* x, const CompletionTarget& t, Token k) {
         auto* c = static_cast<Ctx*>(x);
-        return c->self->issueTxn_(c->kind, t, k, c->offsets, c->groupId);
+        return c->self->issueTxn_(c->kind, t, k, c->offsets, c->groupId, c->generationId, c->memberId);
     };
     std::string      text;
     const Completion c = hk.andWait(hk.ctx, what, timeout, issue, &ctx, &text);
@@ -548,6 +560,12 @@ void Producer::initTransactionsAndWait(std::chrono::nanoseconds timeout) {
 void Producer::sendOffsetsToTransactionAndWait(std::span<const OffsetEntry> offsets, std::string_view groupId,
                                                std::chrono::nanoseconds timeout) {
     txnAndWait_("sendOffsetsToTransaction()", timeout, static_cast<std::uint8_t>(producer::TxnControl::Kind::SendOffsets), offsets, groupId);
+}
+
+void Producer::sendOffsetsToTransactionAndWait(std::span<const OffsetEntry> offsets, const GroupMetadata& group,
+                                               std::chrono::nanoseconds timeout) {
+    txnAndWait_("sendOffsetsToTransaction()", timeout, static_cast<std::uint8_t>(producer::TxnControl::Kind::SendOffsets),
+                offsets, group.groupId, group.generationId, group.memberId);
 }
 
 void Producer::commitTransactionAndWait(std::chrono::nanoseconds timeout) {

@@ -203,7 +203,8 @@ add_library(rune_codec STATIC
     ${RUNE_CODEC_ROOT}/src/AlterOps.cpp
     ${RUNE_CODEC_ROOT}/src/Evolve.cpp
     ${RUNE_CODEC_ROOT}/src/FilterSchema.cpp
-    ${RUNE_CODEC_ROOT}/src/FilterBuilder.cpp)
+    ${RUNE_CODEC_ROOT}/src/FilterBuilder.cpp
+    ${RUNE_CODEC_ROOT}/src/Lineage.cpp)   # #418: per-version field placement (generated decoders)
 target_include_directories(rune_codec PUBLIC ${RUNE_CODEC_ROOT}/include)
 target_compile_features(rune_codec PUBLIC cxx_std_23)
 endif()

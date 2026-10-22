@@ -19,7 +19,7 @@ body; all integers are little-endian. The source of truth is the headers:
 Variable-length fields (strings, byte blobs) follow the fixed part, each with a length prefix.
 
 Capability is negotiated with two numbers in `Connect`/`ConnectResponse`: `clientVersion` (this protocol's client
-announces `9`, `kClientVersion`) and `brokerVersion` (`5`, `kBrokerVersion`). A broker answers a client below a
+announces `11`, `kClientVersion`) and `brokerVersion` (`6`, `kBrokerVersion`). A broker answers a client below a
 feature's version in the older way; an authentication-enabled broker answers a `Connect` below 9
 `ConnectResponse{ProtocolVersion}`.
 
@@ -33,6 +33,8 @@ feature's version in the older way; an authentication-enabled broker answers a `
 | 7 | Transient lineage note and claim (`PartitionDataReset`, 43). |
 | 8 | Catalog DDL: the DDL extension, frames 74 to 78, DDL redirects. |
 | 9 | Authentication: frames 12 to 15, 79 and 80, error codes 44 to 47. |
+| 10 | `TxnOffsetCommit` member block (`generationId`, `memberId` after the entries; KIP-447); `UnstableOffsetCommit` (50). An older broker ignores the block; a broker answers a session below 10 `NotCoordinator` instead of 50. |
+| 11 | Subscription filters: the optional filter trailer on `Subscribe` and `JoinGroup`, the refusal `detail` trailer on their responses (broker version 6). |
 
 ## Frame catalogue
 
@@ -62,12 +64,12 @@ security 64 to 95.
 | 15 | `AuthServerFinal` | B→C | `errorCode`, `flags`, `retryAfterMs`, `serverSignature`, `detail` |
 | 16 | `Produce` | C→B | `topicId`, `partition`, `partitionKnown`, `acks`, `producerId`, `producerEpoch`, `baseSequence`, `key`, `recordBatch` |
 | 17 | `ProduceResponse` | B→C | `errorCode`, `partition`, `baseOffset`, `logStartOffset` |
-| 18 | `Subscribe` | C→B | `topicId`, `partition`, `partitionKnown`, `fromOffset`, `isolation`, `key`, `filter` (v10, optional trailer) |
-| 19 | `SubscribeResponse` | B→C | `errorCode`, `partition`, `subscriptionId`, `detail` (v10, optional trailer) |
+| 18 | `Subscribe` | C→B | `topicId`, `partition`, `partitionKnown`, `fromOffset`, `isolation`, `key`, `filter` (v11, optional trailer) |
+| 19 | `SubscribeResponse` | B→C | `errorCode`, `partition`, `subscriptionId`, `detail` (v11, optional trailer) |
 | 20 | `Records` | B→C | `subscriptionId`, `topicId`, `partition`, `baseOffset`, `recordBatch` |
 | 21 | `Unsubscribe` | C→B | `subscriptionId` |
-| 32 | `JoinGroup` | C→B | `sessionTimeoutMs`, `groupId`, `memberId`, `subscribedTopicIds`, `filter` (v10, optional trailer) |
-| 33 | `JoinGroupResponse` | B→C | `memberId`, `generationId`, `isLeader`, `errorCode`, `detail` (v10, optional trailer) |
+| 32 | `JoinGroup` | C→B | `sessionTimeoutMs`, `groupId`, `memberId`, `subscribedTopicIds`, `filter` (v11, optional trailer) |
+| 33 | `JoinGroupResponse` | B→C | `memberId`, `generationId`, `isLeader`, `errorCode`, `detail` (v11, optional trailer) |
 | 34 | `SyncGroup` | C→B | `groupId`, `memberId`, `generationId` |
 | 35 | `SyncGroupResponse` | B→C | `errorCode`, `assignment` |
 | 36 | `Heartbeat` | C→B | `groupId`, `memberId`, `generationId` |
@@ -85,13 +87,13 @@ security 64 to 95.
 | 48 | `AddPartitionsToTxnResponse` | B→C | `results` |
 | 49 | `AddOffsetsToTxn` | C→B | `producerId`, `producerEpoch`, `transactionalId`, `groupId` |
 | 50 | `AddOffsetsToTxnResponse` | B→C | `errorCode` |
-| 51 | `TxnOffsetCommit` | C→B | `producerId`, `producerEpoch`, `transactionalId`, `groupId`, `entries` |
+| 51 | `TxnOffsetCommit` | C→B | `producerId`, `producerEpoch`, `transactionalId`, `groupId`, `entries`, then optionally (client 10) `generationId` i32 + `memberId` |
 | 52 | `TxnOffsetCommitResponse` | B→C | `results` |
 | 53 | `EndTxn` | C→B | `producerId`, `producerEpoch`, `commit`, `transactionalId` |
 | 54 | `EndTxnResponse` | B→C | `errorCode` |
 | 64 | `DefineTopic` | C→B | `topicName`, `partitionCount`, `keyField`, `validate`, `descriptorBlob`, `persistence`, `replicationFactor`, DDL extension |
 | 65 | `DefineTopicResponse` | B→C | `topicId`, `version`, `errorCode` |
-| 66 | `GetTopicSchema` | C→B | `topicName`, `requestedFingerprint` |
+| 66 | `GetTopicSchema` | C→B | `topicName`, `requestedFingerprint` (0 = latest; `~0` = the evolving lineage) |
 | 67 | `TopicSchemaResponse` | B→C | `topicId`, `version`, `errorCode`, `descriptorBlob`, `partitionCount` |
 | 68 | `AlterTopic` | C→B | `topicName`, `expectedVersion`, `opsBlob`, DDL extension |
 | 69 | `AlterTopicResponse` | B→C | `topicId`, `newVersion`, `errorCode` |
@@ -169,25 +171,25 @@ handshake when one was negotiated) a session whose `authMode` is `Required` runs
 Until a session is authenticated, every other request is answered `AuthenticationFailed` (44) and the session ends. See
 [SECURITY.md](../../broker/docs/SECURITY.md) for the throttle, the one-time bootstrap password and revocation.
 
-## Filters (client version 10)
+## Filters (client version 11)
 
 Broker version 6 serves a subscription filter. `Subscribe` and `JoinGroup` may end with one extra variable field,
 `[u16 len][filter bytes]`, after the key (`Subscribe`) or after the topic ids (`JoinGroup`). The filter bytes use the
 canonical format in [`FilterWire.h`](../../codec/include/rune/codec/FilterWire.h) (at most 8,234 bytes).
 
-- **Omitted when empty.** A frame with no filter is byte-identical to version 9.
+- **Omitted when empty.** A frame with no filter is byte-identical to version 10.
 - **A trailer that does not fit is not decodable.** A length prefix cut in half, or a length larger than the bytes left,
   fails the decode, and the broker answers `InvalidRequest`.
 - **Gated on the session's version.** The broker parses the trailer only for a session that connected with
-  `clientVersion >= 10`. For an older session any bytes after the key or topic ids are ignored.
+  `clientVersion >= 11`. For an older session any bytes after the key or topic ids are ignored.
 - **Refusal detail.** A refused filter is answered `{InvalidRequest, detail}`. `SubscribeResponse` and
   `JoinGroupResponse` carry the detail as a trailing `[u16 len][utf-8]` field, written only when it is non-empty and
-  only to a session of version 10 or higher, so an older client never sees a trailer it cannot parse. A
+  only to a session of version 11 or higher, so an older client never sees a trailer it cannot parse. A
   `JoinGroup` whose filter differs from the group's has a detail that starts with `group filter mismatch`.
 - **Broker too old.** A broker below version 6 would ignore the trailer and deliver everything, so a client sends a
   filter only to a session whose `ConnectResponse.brokerVersion` is at least 6.
 
-On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (23) and `TailKind::FILTER` (10).
+On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (24) and `TailKind::FILTER` (11).
 
 ## Encrypted frames (TLS 1.3 / AEAD)
 
@@ -253,6 +255,9 @@ senderId u8` (0 = gateway, `i+1` = worker `i`) and a `seq u64`
 | 45 | `NotAuthorized` | Not granted (default deny), or the object is not visible. Fails exactly that request. | never re-sent |
 | 46 | `SessionRevoked` | The session's user was dropped, disabled or terminated. Terminal for the session. | terminal for the session |
 | 47 | `PasswordChangeRequired` | A one-time-password session may only change its password. | fails that request |
+| 48 | `AuthUnavailable` | The broker's `__security` state is not current (catching up after a start, or stale: cut off its leader or the consensus): no login, `__security` read or security DDL is served. As the session-level `ErrorResponse` (correlation id 0): the broker stayed stale too long and ended the session. Sent to every client version. | retried: back off and reconnect fresh, rotating brokers; never terminal |
+| 49 | `RecordEgressUnavailable` | Authenticating broker only: the session's own record stream for the partition's worker could not be built (there is no shared-stream fallback). Sent in `SubscribeResponse.errorCode` on the pending Subscribe. | retried a few times (a bind resets the count), then fails the subscription or the group consumer with an error |
+| 50 | `UnstableOffsetCommit` | Client 10: `OffsetFetch` / `OffsetCommit` of a partition an unfinished transaction holds a pending offset on (until its completion is durable), or while the transaction coordinator is not loaded. Nothing is appended. | retried after a backoff, never surfaced |
 
 The broker-internal storage errors (`rune::protocol::ErrorCode`, [`Errors.h`](../../protocol/include/rune/protocol/Errors.h))
 are a separate, small enum used inside the log: `OffsetOutOfRange`=1, `CorruptRecord`=2, `InvalidRecordBatch`=3,

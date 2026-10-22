@@ -747,6 +747,44 @@ TEST(NodeConfigTest, ConsensusChannelUnaffectedByClientPort) {
     EXPECT_EQ(r.config->peers[2].consensusChannel(), "aeron:udp?endpoint=rune-3:40111");
 }
 
+// Issues #15 / #111 / #120: the security serving bounds.  F (RUNE_SECURITY_MAX_STALENESS_MS) must exceed the broker
+// liveness + 500 ms and R (RUNE_SECURITY_STALE_SESSION_END_MS) must exceed F - an explicit violation is refused, the
+// defaults are raised to the floor (long election timings / a long liveness never make a broker stale at every
+// failover); the D24 gate deadline is a positive ms count.
+TEST(NodeConfigRegression, SecurityServingBoundsAreParsedAndValidatedRegression) {
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_EQ(r.config->securityMaxStalenessMs, 1'000);
+    EXPECT_EQ(r.config->securityStaleSessionEndMs, 10'000);
+    EXPECT_EQ(r.config->securityGateDeadlineMs, 5'000);
+    EXPECT_EQ(r.config->effectiveSecurityMaxStalenessMs(), 1'000) << "the default liveness is 450 ms";
+    auto env = base1node();
+    env["RUNE_SECURITY_MAX_STALENESS_MS"] = "2000";
+    env["RUNE_SECURITY_STALE_SESSION_END_MS"] = "4000";
+    env["RUNE_SECURITY_GATE_DEADLINE_MS"] = "700";
+    auto r2 = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r2.error.empty()) << r2.error;
+    EXPECT_EQ(r2.config->effectiveSecurityMaxStalenessMs(), 2'000);
+    EXPECT_EQ(r2.config->effectiveSecurityStaleSessionEndMs(), 4'000);
+    EXPECT_EQ(r2.config->securityGateDeadlineMs, 700);
+    env["RUNE_SECURITY_MAX_STALENESS_MS"] = "900";   // <= 450 + 500
+    EXPECT_NE(parseNodeConfig(fakeEnv(env)).error.find("RUNE_SECURITY_MAX_STALENESS_MS"), std::string::npos);
+    env["RUNE_SECURITY_MAX_STALENESS_MS"] = "2000";
+    env["RUNE_SECURITY_STALE_SESSION_END_MS"] = "2000";   // R must exceed F
+    EXPECT_NE(parseNodeConfig(fakeEnv(env)).error.find("RUNE_SECURITY_STALE_SESSION_END_MS"), std::string::npos);
+    env["RUNE_SECURITY_STALE_SESSION_END_MS"] = "soon";
+    EXPECT_FALSE(parseNodeConfig(fakeEnv(env)).error.empty());
+    // A long liveness with the defaults: F and R are raised to their floors, never refused.
+    auto env3 = base1node();
+    env3["RUNE_BROKER_LIVENESS_TIMEOUT_MS"] = "60000";
+    auto r3 = parseNodeConfig(fakeEnv(env3));
+    ASSERT_TRUE(r3.error.empty()) << r3.error;
+    EXPECT_EQ(r3.config->effectiveSecurityMaxStalenessMs(), 60'501);
+    EXPECT_EQ(r3.config->effectiveSecurityStaleSessionEndMs(), 60'502);
+    env3["RUNE_SECURITY_MAX_STALENESS_MS"] = "30000";   // explicit and below the floor
+    EXPECT_FALSE(parseNodeConfig(fakeEnv(env3)).error.empty());
+}
+
 // CP3 I4: RUNE_BROKER_LIVENESS_TIMEOUT_MS — default 0 (the agent uses 3 x the leader-heartbeat timeout); a positive value
 // is carried; garbage is refused.  RED: ignore the variable.
 TEST(NodeConfigRegression, BrokerLivenessTimeoutEnvIsParsedRegression) {

@@ -1,6 +1,6 @@
 // FilterSubscribeGatewayTest.cpp - Phase 2c Task 9: the gateway admits, refuses and forwards filtered Subscribes.
 //
-// A filter is read only from a session >= 10; it is validated against the topic's FilterSchema (installed by
+// A filter is read only from a session >= 11; it is validated against the topic's FilterSchema (installed by
 // onFilterSchema), admitted under the per-(topic, partition) caps, and forwarded to the owning worker in the
 // Subscribe op's tail.  The schema reaches every worker BEFORE any filtered Subscribe (FIFO with the queued ops).
 // Every refusal is answered {InvalidRequest, detail} to a version-10 session; older sessions never see a detail.
@@ -173,7 +173,7 @@ struct Rig {
             gw.setReplicaRegistry(&replicas);
         }
     }
-    int64_t session(int32_t clientVersion = 10) { return gw.injectTestSession(0, clientVersion); }
+    int64_t session(int32_t clientVersion = pc::kClientVersionFilter) { return gw.injectTestSession(0, clientVersion); }
     void typed(uint16_t version = 1) { gw.onFilterSchema(0, version, schemaBlob(version)); }
     const Answer& subscribe(int64_t sid, int64_t corr, std::span<const uint8_t> filter, int32_t partition = 0,
                             int32_t topicId = 0) {
@@ -452,7 +452,7 @@ TEST(GatewayFilterRegression, LegacyModeRefusesFiltersRegression) {
 TEST(GatewayFilterRegression, SessionBelowTenSendingTrailingBytesIsUnfilteredRegression) {
     Rig r;
     r.typed();
-    const int64_t sid = r.session(9);
+    const int64_t sid = r.session(pc::kClientVersionFilter - 1);
     const Answer a = r.subscribe(sid, 1, worldEq(7));   // the same frame: the trailer is ignored for a v9 session
     EXPECT_EQ(a.r.errorCode, kOk);
     EXPECT_EQ(a.len, pc::SubscribeResponse::ENCODED_SIZE);
@@ -461,7 +461,7 @@ TEST(GatewayFilterRegression, SessionBelowTenSendingTrailingBytesIsUnfilteredReg
     r.pool->worker(0).doWork(1);
     EXPECT_EQ(r.pool->worker(0).filterBytesHeldForTest(), 0u);
     EXPECT_EQ(r.pool->worker(0).filterGroupOfSubForTest(a.r.subscriptionId), nullptr);
-    // and garbage that would be refused for a v10 session is still never refused for a v9 one
+    // and garbage that would be refused for a v11 session is still never refused for a v10 one
     const Answer g = r.subscribe(sid, 2, std::vector<uint8_t>{9, 9, 9});
     EXPECT_EQ(g.r.errorCode, kOk);
 }
@@ -469,14 +469,14 @@ TEST(GatewayFilterRegression, SessionBelowTenSendingTrailingBytesIsUnfilteredReg
 TEST(GatewayFilterRegression, RefusalDetailIsSentOnlyToVersionTenSessionsRegression) {
     Rig r;
     r.typed();
-    const int64_t v10 = r.session(10);
-    const int64_t v9  = r.session(9);
+    const int64_t v10 = r.session(pc::kClientVersionFilter);
+    const int64_t v9  = r.session(pc::kClientVersionFilter - 1);
     const Answer a = r.subscribe(v10, 1, worldEq(1), /*partition=*/5);   // an unknown partition, no filter involved
     EXPECT_NE(a.r.errorCode, kOk);
     EXPECT_EQ(a.len, pc::SubscribeResponse::ENCODED_SIZE) << "no detail to give: the frame stays 38 bytes";
     const Answer d = r.subscribe(v10, 2, std::vector<uint8_t>{1, 0});
     EXPECT_EQ(d.r.errorCode, kInvalid);
-    EXPECT_GT(d.len, pc::SubscribeResponse::ENCODED_SIZE) << "a v10 session gets the detail trailer";
+    EXPECT_GT(d.len, pc::SubscribeResponse::ENCODED_SIZE) << "a v11 session gets the detail trailer";
     EXPECT_EQ(d.detail, "filter: term count must be 1..8");
     const Answer b = r.subscribe(v9, 3, worldEq(1), /*partition=*/5);
     EXPECT_NE(b.r.errorCode, kOk);
@@ -489,7 +489,7 @@ TEST(GatewayFilter, UnfilteredSubscribeResponseIsByteIdentical) {
     r.typed();
     std::vector<std::vector<uint8_t>> frames;
     r.gw.setOnEgressFrame([&](int64_t, const uint8_t* b, std::size_t n) { frames.emplace_back(b, b + n); });
-    const int64_t sid = r.session(10);
+    const int64_t sid = r.session(pc::kClientVersionFilter);
     const auto f = subscribeFrame(sid, 77, 0, {});
     r.gw.applySubscribeForTest(f.data(), f.size());
     ASSERT_EQ(frames.size(), 1u);
@@ -562,8 +562,8 @@ TEST(GatewayFilterRegression, OversizedFilterSchemaIsCountedAndFilteredSubscribe
 TEST(GatewayFilterRegression, GroupCarrierSubscribeWithAFilterIsRefusedRegression) {
     Rig r;
     r.typed();
-    const int64_t v10 = r.session(10);
-    const int64_t v9  = r.session(9);
+    const int64_t v10 = r.session(pc::kClientVersionFilter);
+    const int64_t v9  = r.session(pc::kClientVersionFilter - 1);
     const int64_t g10 = r.gw.addGroupSubscription(v10, 0, 0, 0, /*isolation=*/0, /*pendingCarrier=*/true);
     const int64_t g9  = r.gw.addGroupSubscription(v9, 0, 0, 0, /*isolation=*/0, /*pendingCarrier=*/true);
     ASSERT_GT(g10, 0);

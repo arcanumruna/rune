@@ -3256,3 +3256,73 @@ TEST(TxnAddOffsetsRegression, AddOffsetsInPrepareIsRefusedNotReopened) {
 }
 
 } // anonymous namespace
+
+// ===========================================================================
+// Issue #122: producer ids are issued bound to their owner (rune/protocol/ProducerIdBinding.h).
+// ===========================================================================
+namespace rp = rune::protocol;
+
+TEST(ProducerIdBindingRegression, IdsAreIssuedBoundToTheirOwnerRegression)
+{
+    TransactionCoordinator coord;
+    const auto a = coord.initProducerId(std::nullopt, 60'000, 0, /*owner=*/7);
+    const auto b = coord.initProducerId(std::nullopt, 60'000, 0, /*owner=*/8);
+    ASSERT_TRUE(a.ok());
+    ASSERT_TRUE(b.ok());
+    EXPECT_TRUE(rp::isBoundProducerId(a.producerId));
+    EXPECT_TRUE(rp::producerIdOwnedBy(a.producerId, 7));
+    EXPECT_FALSE(rp::producerIdOwnedBy(a.producerId, 8));
+    EXPECT_TRUE(rp::producerIdOwnedBy(b.producerId, 8));
+    EXPECT_GT(rp::producerIdCounter(b.producerId), rp::producerIdCounter(a.producerId)) << "one monotone counter";
+    const auto t = coord.initProducerId("tx", 60'000, 0, /*owner=*/7);
+    ASSERT_TRUE(t.ok());
+    EXPECT_TRUE(rp::producerIdOwnedBy(t.producerId, 7));
+}
+
+TEST(ProducerIdBindingRegression, AnotherOwnerOfATransactionalIdGetsAFreshIdAndFencesTheOldRegression)
+{
+    TransactionCoordinator coord;
+    const auto a1 = coord.initProducerId("tx", 60'000, 0, 7);
+    const auto a2 = coord.initProducerId("tx", 60'000, 0, 7);
+    ASSERT_TRUE(a1.ok());
+    ASSERT_TRUE(a2.ok());
+    EXPECT_EQ(a2.producerId, a1.producerId) << "the same owner: an epoch bump";
+    EXPECT_EQ(a2.producerEpoch, a1.producerEpoch + 1);
+
+    // An open transaction under owner 7's id; owner 8 takes the transactional id over.
+    ASSERT_TRUE(coord.addPartitions("tx", a2.producerId, a2.producerEpoch, {{"t", 0}}, 1).ok());
+    const auto b = coord.initProducerId("tx", 60'000, 2, 8);
+    ASSERT_TRUE(b.ok());
+    EXPECT_NE(b.producerId, a2.producerId) << "owner 8 was handed owner 7's producer id";
+    EXPECT_TRUE(rp::producerIdOwnedBy(b.producerId, 8));
+    EXPECT_EQ(b.producerEpoch, 0);
+    const TransactionMetadata* m = coord.metadata("tx");
+    ASSERT_NE(m, nullptr);
+    EXPECT_EQ(m->state, TxnState::PrepareAbort) << "the previous holder's open transaction is aborted";
+    EXPECT_EQ(m->producerId, a2.producerId) << "... under the OLD id (its batches carry it)";
+    EXPECT_EQ(m->pendingNewProducerId, b.producerId);
+}
+
+TEST(ProducerIdBindingRegression, ALegacyIdOfATransactionalIdIsReboundAtItsNextInitRegression)
+{
+    TransactionCoordinator coord;
+    coord.setBoundProducerIds(true);
+    std::map<std::string, TransactionMetadata> snapshot;
+    TransactionMetadata legacy;
+    legacy.txnId = "tx"; legacy.producerId = 42; legacy.producerEpoch = 3; legacy.state = TxnState::Empty;
+    snapshot.emplace("tx", legacy);
+    TransactionMetadata bound;
+    bound.txnId = "tx2"; bound.producerId = rp::bindProducerId(500, 9); bound.producerEpoch = 0;
+    bound.state = TxnState::Empty;
+    snapshot.emplace("tx2", bound);
+    (void)coord.reload(snapshot, 1, 0);
+
+    const auto r = coord.initProducerId("tx", 60'000, 0, 7);
+    ASSERT_TRUE(r.ok());
+    EXPECT_NE(r.producerId, 42) << "a legacy id carries no owner: it is never handed over";
+    EXPECT_TRUE(rp::producerIdOwnedBy(r.producerId, 7));
+    EXPECT_GT(rp::producerIdCounter(r.producerId), 500) << "the reseed honours a recovered bound id's counter";
+    const auto own = coord.initProducerId("tx2", 60'000, 0, 9);
+    EXPECT_EQ(own.producerId, bound.producerId) << "the owner of a recovered bound id keeps it";
+    EXPECT_EQ(own.producerEpoch, 1);
+}

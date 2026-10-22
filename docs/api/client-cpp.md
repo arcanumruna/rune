@@ -79,7 +79,7 @@ for the exchange and [SECURITY.md](../../broker/docs/SECURITY.md) for the model.
 
 - A client **with** credentials refuses a broker that skips the login (a dev-mode broker, an old broker) with
   `AuthenticationFailed`. Set `allowUnauthenticatedBroker = true` to accept it.
-- `authErrorName(code)` returns the name of codes 44 to 47 for `Completion::errorCode` when the status is `BrokerError`.
+- `authErrorName(code)` returns the name of codes 44 to 48 for `Completion::errorCode` when the status is `BrokerError` (48 `AuthUnavailable` is retriable: try another broker).
 - A password is never logged and never sent; only a proof derived from it. Setting both `password` and `passwordFile`
   throws `std::invalid_argument`.
 
@@ -393,7 +393,7 @@ GroupConsumer gc = client.subscribeGroup("economy", {"orders"}, g);
 tp.beginTransaction();
 try {
     for (auto& r : batch) tp.send(out, Key(r.id), transform(r));
-    tp.sendOffsetsToTransactionAndWait(offsets, "economy");   // next offset to read, per partition
+    tp.sendOffsetsToTransactionAndWait(offsets, gc.groupMetadata());   // next offset to read, per partition
     tp.commitTransactionAndWait();
 } catch (const std::runtime_error&) {
     if (tp.state() == TxnState::FatalError) return;           // fenced
@@ -401,6 +401,14 @@ try {
     gc.seekToCommittedAndWait();                              // re-read the aborted batch, no restart
 }
 ```
+
+Pass `gc.groupMetadata()` (group id, generation, member id) rather than the group id alone: the coordinator then fences
+the offsets by the member and its generation, so a consumer that lost its partitions in a rebalance (a zombie) cannot
+commit them. A stale generation (`IllegalGeneration`, 15) or an unknown member (`UnknownMember`, 12) fails the
+transaction (`AbortableError`): abort, let the consumer rejoin, re-read. The member belongs to the session that joined
+it, so create the transactional producer on the GroupConsumer's own `Client`. While a transaction holds a partition's
+pending offset, the group's `OffsetFetch` and `commitSync` of that partition wait (the broker answers
+`UnstableOffsetCommit`, which the client retries) until the transaction completes.
 
 `GroupConsumer::seekToCommitted()` / `seekToCommittedAndWait()` rewinds every assigned partition to its committed offset;
 `seek(partition, offset)` repositions one partition (`InvalidArgument` for an unassigned one). Records handed to `onRecords`
@@ -438,6 +446,8 @@ players.send(p);                                                       // routed
 - Routing: when `T` has a key field, `send` hashes `T::key()` (at most 16 bytes, never truncated) to the partition. A schema
   without a key sends to partition 0. The partition count comes from the broker (`typedPartitionCount`).
 - `TypedTopic<T>` is move-only; `handle()` returns its `TopicHandle` and `boundVersion()` the schema version.
+- Reading: `T::decode` / `T::Decoder` place each record by its own version. `lineageAndWait<T>(topic)` returns the
+  lineage that also places records written after `T` was generated ([codec.md](codec.md#generate-c-types)).
 
 ## Materialized views
 

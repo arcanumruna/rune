@@ -1,4 +1,5 @@
-// WorkerWriteGrantsTest.cpp - authentication Task 13 (spec §6, D30): the shard worker's per-session WRITE grants.
+// WorkerWriteGrantsTest.cpp - authentication Task 13 (spec §6, D30) / issue #259: the shard worker's WRITE tables and
+// the sessions bound to them.
 // A REAL invoker driver over aeron:ipc (the ShardWorkerAckTest fixture): a client produces straight to the worker's
 // ingress; the answer comes back on the session's own publication.
 #include <rune/node/EmbeddedDriver.h>
@@ -107,13 +108,38 @@ struct Fixture {
         WorkerOp c; c.type = WorkerOp::Type::SessionClose; c.sessionId = sid;
         ASSERT_TRUE(worker->tryEnqueueOp(std::move(c)));
     }
-    /// One SESSION_PERMISSIONS chunk, as the PermissionShipper builds it.
+    std::map<int64_t, int64_t> tableOf_;   // the tests' sessions each own one table (ids < kMaxWritePermTables)
+    int64_t tableOf(int64_t sid) { return tableOf_.try_emplace(sid, static_cast<int64_t>(tableOf_.size())).first->second; }
+    /// One chunk of session `sid`'s own table, as the PermissionShipper builds it; the last one is followed by the
+    /// session's bind to that table (epoch), as the gateway ships a login / refresh.
     void chunk(int64_t sid, uint64_t epoch, uint64_t first, uint64_t total, const std::vector<uint64_t>& words, bool last,
                bool grantAll = false) {
-        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = sid; o.correlationId = static_cast<int64_t>(epoch);
+        tableChunk(tableOf(sid), first, total, words, last, grantAll);
+        if (last) bind(sid, tableOf(sid), epoch);
+    }
+    void tableChunk(int64_t table, uint64_t first, uint64_t total, const std::vector<uint64_t>& words, bool last,
+                    bool grantAll = false) {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = table;
         o.nextOffset = static_cast<int64_t>(first); o.hwBound = static_cast<int64_t>(total);
-        o.isolation = static_cast<uint8_t>((last ? kPermFlagLast : 0u) | (grantAll ? kPermFlagGrantAll : 0u));
+        o.isolation = static_cast<uint8_t>(kPermFlagTable | (last ? kPermFlagLast : 0u) | (grantAll ? kPermFlagGrantAll : 0u));
         o.permWords = words.data(); o.permWordCount = words.size();
+        ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
+    }
+    void bind(int64_t sid, int64_t table, uint64_t epoch, uint64_t owner = 7) {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = sid; o.nextOffset = table;
+        o.correlationId = static_cast<int64_t>(epoch); o.producerId = static_cast<int64_t>(owner);
+        o.isolation = kPermFlagBind | kPermFlagLast;
+        ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
+    }
+    void patch(int64_t table, uint64_t first, uint64_t total, const std::vector<uint64_t>& words) {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = table;
+        o.nextOffset = static_cast<int64_t>(first); o.hwBound = static_cast<int64_t>(total);
+        o.isolation = kPermFlagPatch | kPermFlagLast; o.permWords = words.data(); o.permWordCount = words.size();
+        ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
+    }
+    void dropTable(int64_t table) {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = table;
+        o.isolation = kPermFlagDrop | kPermFlagLast;
         ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
     }
     void produce(int64_t sid, int64_t corr, int32_t topicId = 1) {
@@ -211,11 +237,12 @@ TEST(WorkerWriteGrantRegression, ChunkedUpdateIsInstalledAtomicallyOnTheLastChun
 TEST(WorkerWriteGrantRegression, AnOutOfOrderChunkIsDroppedAndNeverInstallsAPartialTable) {
     Fixture f;
     f.announce(5, false);
-    f.chunk(5, 1, 0, 1024, bitsFor({1}, 512), false);
-    f.chunk(5, 1, 768, 1024, bitsFor({}, 256), true);       // skips words 512..767: must not install
+    f.bind(5, f.tableOf(5), 1);                              // bound to its (still empty) table
+    f.tableChunk(f.tableOf(5), 0, 1024, bitsFor({1}, 512), false);
+    f.tableChunk(f.tableOf(5), 768, 1024, bitsFor({}, 256), true);   // skips words 512..767: must not install
     f.steps(8);
     EXPECT_FALSE(allowsWrite(*f.slot(5), 1)) << "a partial table is never visible";
-    EXPECT_EQ(f.slot(5)->epoch, 0u);
+    EXPECT_EQ(f.slot(5)->epoch, 1u);
 }
 
 TEST(WorkerWriteGrantRegression, GrantAllAllowsEveryTopic) {
@@ -286,13 +313,13 @@ TEST(WorkerWriteGrantRegression, PermissionStagerReusesItsBuffersAfterTheFirstUp
     // No allocation once both buffers reached their peak size: the staging buffer and the slot buffer swap.
     struct FakeSink {
         std::vector<uint64_t> bits;
-        bool installWriteGrants(int64_t, std::vector<uint64_t>& w, bool, uint64_t) noexcept { bits.swap(w); return true; }
+        bool installWriteGrants(int64_t, std::vector<uint64_t>& w, bool, uint64_t, uint64_t) noexcept { bits.swap(w); return true; }
     } sink;
     PermissionStager st;
     std::vector<uint64_t> chunkWords(512, 7);
     auto update = [&] {
-        EXPECT_EQ(st.apply(sink, 1, 0, 1024, 0, 1, reinterpret_cast<const uint8_t*>(chunkWords.data()), 4096), PermissionChunkResult::Staged);
-        EXPECT_EQ(st.apply(sink, 1, 512, 1024, kPermFlagLast, 1, reinterpret_cast<const uint8_t*>(chunkWords.data()), 4096),
+        EXPECT_EQ(st.apply(sink, 1, 0, 1024, 0, 1, reinterpret_cast<const uint8_t*>(chunkWords.data()), 4096, /*owner=*/7), PermissionChunkResult::Staged);
+        EXPECT_EQ(st.apply(sink, 1, 512, 1024, kPermFlagLast, 1, reinterpret_cast<const uint8_t*>(chunkWords.data()), 4096, /*owner=*/7),
                   PermissionChunkResult::Installed);
     };
     update();
@@ -303,4 +330,97 @@ TEST(WorkerWriteGrantRegression, PermissionStagerReusesItsBuffersAfterTheFirstUp
     EXPECT_TRUE(sink.bits.data() == installed || sink.bits.capacity() >= 1024) << "buffers circulate";
     EXPECT_EQ(sink.bits.size(), 1024u);
     EXPECT_EQ(st.droppedChunks(), 0u);
+}
+
+// Issue #259: one table serves every session bound to it - a patch (a created topic a prefix grant covers) reaches all
+// of them at once, a drop (the grant set's last holder left) resets every slot still pointing at it to deny, and a
+// rebind moves one session without touching the others.
+TEST(WorkerWriteGrantRegression, SessionsSharingATableSeeItsPatchAndItsDropRegression) {
+    Fixture f;
+    f.announce(5, false);
+    f.announce(6, false);
+    f.tableChunk(3, 0, 1, bitsFor({1}, 1), true);
+    f.bind(5, 3, 1);
+    f.bind(6, 3, 1);
+    f.steps(8);
+    ASSERT_TRUE(allowsWrite(*f.slot(5), 1));
+    ASSERT_TRUE(allowsWrite(*f.slot(6), 1));
+    constexpr int32_t kNew = 130 * 64 + 5;                   // a topic created later, beyond the table's words
+    f.patch(3, 130, 131, bitsFor({5}, 1));
+    f.steps(8);
+    EXPECT_TRUE(allowsWrite(*f.slot(5), kNew)) << "one patch, every holder";
+    EXPECT_TRUE(allowsWrite(*f.slot(6), kNew));
+    EXPECT_TRUE(allowsWrite(*f.slot(5), 1)) << "the patch keeps the other words";
+    f.tableChunk(4, 0, 1, bitsFor({2}, 1), true);
+    f.bind(6, 4, 2);                                         // session 6 moved to another grant set
+    f.dropTable(3);                                          // ... and 3's last holder left
+    f.steps(8);
+    EXPECT_FALSE(allowsWrite(*f.slot(5), 1)) << "a slot still on a dropped table is denied (fail closed)";
+    EXPECT_TRUE(allowsWrite(*f.slot(6), 2));
+    EXPECT_FALSE(allowsWrite(*f.slot(6), 1));
+    EXPECT_EQ(f.slot(6)->epoch, 2u);
+}
+
+TEST(WorkerWriteGrantRegression, ABindToNoTableDeniesEverythingRegression) {
+    Fixture f;
+    f.announce(5, /*grantAll=*/true);
+    f.steps(2);
+    ASSERT_TRUE(allowsWrite(*f.slot(5), 1));
+    f.bind(5, -1, 1);
+    f.steps(4);
+    EXPECT_FALSE(allowsWrite(*f.slot(5), 1));
+}
+
+// ── PR #441 adversarial review (issue #259 area): the worker's table store under hostile / racing ops ──
+
+// Lifetime: a slot still bound to a table (its session's close not yet seen by the worker) when that table is dropped and
+// its id reused by ANOTHER set must never inherit the new set's WRITE.
+TEST(WorkerWriteGrantRegression, AStaleSlotNeverInheritsATableIdReusedByAnotherSetAdversarialRegression) {
+    Fixture f;
+    f.announce(5, false);
+    f.announce(6, false);
+    f.tableChunk(3, 0, 1, bitsFor({1}, 1), true);
+    f.bind(5, 3, 1);
+    f.steps(8);
+    ASSERT_TRUE(allowsWrite(*f.slot(5), 1));
+    f.dropTable(3);                                  // 5's set freed (its close is still behind)
+    f.tableChunk(3, 0, 1, bitsFor({2}, 1), true);   // the id reused by another set
+    f.bind(6, 3, 2);
+    f.steps(8);
+    EXPECT_FALSE(allowsWrite(*f.slot(5), 1));
+    EXPECT_FALSE(allowsWrite(*f.slot(5), 2)) << "the stale slot was reset at the drop: never the new set's bits";
+    EXPECT_TRUE(allowsWrite(*f.slot(6), 2));
+}
+
+// Input bounds: hostile SESSION_PERMISSIONS ops (ids at / beyond the store, negative ids, a patch past its total, a tail
+// that is not whole words, no variant flag, an unknown session) change nothing and never crash.
+TEST(WorkerWriteGrantRegression, MalformedPermissionOpsChangeNothingAdversarialRegression) {
+    Fixture f;
+    f.announce(5, false);
+    f.tableChunk(3, 0, 1, bitsFor({1}, 1), true);
+    f.bind(5, 3, 1);
+    f.steps(8);
+    ASSERT_TRUE(allowsWrite(*f.slot(5), 1));
+    const int64_t kMax = static_cast<int64_t>(kMaxWritePermTables);
+    f.bind(5, kMax, 2);                                    // beyond the store: refused, the slot keeps table 3
+    f.tableChunk(kMax, 0, 1, bitsFor({1}, 1), true);
+    f.tableChunk(-7, 0, 1, bitsFor({1}, 1), true);
+    f.patch(kMax, 0, 1, bitsFor({4}, 1));
+    f.patch(-1, 0, 1, bitsFor({4}, 1));
+    f.patch(3, 5, 2, bitsFor({4}, 1));                     // first > total
+    f.patch(3, 1, 1, bitsFor({4}, 1));                     // n > total - first
+    f.dropTable(kMax);
+    f.dropTable(-3);
+    f.bind(424242, 3, 3);                                  // unknown session
+    {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = 3;
+        o.isolation = kPermFlagLast;                       // no variant flag
+        const auto w = bitsFor({9}, 1); o.permWords = w.data(); o.permWordCount = w.size();
+        ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(o)));
+    }
+    f.steps(16);
+    EXPECT_TRUE(allowsWrite(*f.slot(5), 1)) << "nothing of it touched table 3 or the slot";
+    EXPECT_FALSE(allowsWrite(*f.slot(5), 4));
+    EXPECT_FALSE(allowsWrite(*f.slot(5), 9));
+    EXPECT_EQ(f.slot(5)->epoch, 1u);
 }

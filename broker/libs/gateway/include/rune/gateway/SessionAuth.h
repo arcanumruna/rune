@@ -15,6 +15,7 @@
 // Replaces the Task 10 SessionAuthGate (open / bootstrap-only / must-authenticate).
 
 #include <rune/crypto/Scram.h>
+#include <rune/gateway/PermissionPool.h>
 #include <rune/gateway/PermissionTable.h>
 #include <rune/protocol/client/Protocol.h>
 
@@ -41,8 +42,11 @@ struct AuthAwaitingFinal {
     std::array<rune::crypto::scram::Verifier, 2> verifiers;   ///< copies (the view may change before the final leg)
 };
 
-struct AuthPasswordChangeRequired { uint64_t userId = 0; std::string user; };
-struct AuthAuthenticated { uint64_t userId = 0; std::string user; PermissionTable perms; };
+// `loginNonce` (issue #114): the SCRAM combined nonce of the login that authenticated this session - what a change of
+// the user's own credential must be proven over (credentialChangeMessage).  "" = none (a test-set state): no such
+// change can be proven.
+struct AuthPasswordChangeRequired { uint64_t userId = 0; std::string user; std::string loginNonce; };
+struct AuthAuthenticated { uint64_t userId = 0; std::string user; PermissionRef perms; std::string loginNonce; };   // #259: a pooled table
 struct AuthAnonymous {};
 
 /// How the broker authenticates sessions (what ConnectResponse.authMode reports).  The gateway's own copy of

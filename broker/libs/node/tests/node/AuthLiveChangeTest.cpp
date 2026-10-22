@@ -338,3 +338,370 @@ TEST(AuthLiveChangeRegression, TheGrantOkIsEnforcedByTheAnsweringBrokerImmediate
         ASSERT_EQ(t.r.produce(s, t.r.orders), 45) << "REVOKE then, with zero delay, a produce: refused (iteration " << i << ")";
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// PR #441 adversarial review (issue #259 area): pooled tables, binds, patches and drops - enforced on the SHARD worker
+// (a real authenticating broker, producing straight to the worker's ingress).
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+/// The worker-ingress produce of `sid` to `topic`: retried through NotLeader / UnknownTopic / no answer while the
+/// partition settles (bounded), else the first definitive code.
+int shardProduceCode(Live& t, int64_t sid, int32_t topic, int attempts = 1) {
+    int code = kNoAnswer;
+    for (int a = 0; a < attempts; ++a) {
+        const int64_t corr = t.r.c().nextCorrelationId();
+        if (!t.r.c().produce(t.b().workerIngressChannel(), AuthRig::stream(), sid, corr, topic, 0, 1, makeBatch(1)))
+            return kNoAnswer;
+        const auto ack = t.r.c().awaitProduceResponseUntil(corr, AuthRig::dl(10));
+        code = ack ? ack->errorCode : kNoAnswer;
+        if (code != static_cast<int>(pc::ErrorCode::NotLeader) && code != static_cast<int>(pc::ErrorCode::UnknownTopic) &&
+            code != kNoAnswer)
+            return code;
+        std::this_thread::sleep_for(25ms);   // the partition settling (pre-existing pattern of this file)
+    }
+    return code;
+}
+AuthBroker::Options shardOptions() { AuthBroker::Options o; o.shard = true; return o; }
+}  // namespace
+
+// Concurrency / auth: one role's members share ONE table on the worker; flipping the role's WRITE repeatedly is enforced
+// on every member's worker slot at the DDL's OK, and a bystander with its own grant set is never touched.
+TEST(AuthLiveChangeAdversarialRegression, ARoleFlippedRepeatedlyIsEnforcedOnEveryMembersWorkerSlotAdversarialRegression) {
+    Live t("adv259flip", shardOptions());
+    ASSERT_EQ(t.createRole("writers"), 0);
+    ASSERT_EQ(t.grantRoleOp("writers", SO::Write, ST::Topic, SP::Exact, "orders"), 0);
+    std::vector<int64_t> members;
+    for (int i = 0; i < 3; ++i) {
+        std::string name;
+        members.push_back(t.r.newUser({}, &name));
+        ASSERT_EQ(t.grantRole(name, "writers"), 0);
+    }
+    const int64_t bystander = t.r.newUser({exact(SO::Write, ST::Topic, "orders"), exact(SO::Write, ST::Topic, "secret")});
+    for (const int64_t s : members) ASSERT_EQ(shardProduceCode(t, s, t.r.orders, 200), 0);
+    ASSERT_EQ(shardProduceCode(t, bystander, t.r.orders, 200), 0);
+    for (int flip = 0; flip < 3; ++flip) {
+        ASSERT_EQ(t.revoke("writers", true, SO::Write, ST::Topic, SP::Exact, "orders"), 0) << flip;
+        for (const int64_t s : members) EXPECT_EQ(shardProduceCode(t, s, t.r.orders), 45) << "flip " << flip;
+        EXPECT_EQ(shardProduceCode(t, bystander, t.r.orders), 0) << "another grant set's table is untouched";
+        ASSERT_EQ(t.grantRoleOp("writers", SO::Write, ST::Topic, SP::Exact, "orders"), 0) << flip;
+        for (const int64_t s : members) EXPECT_EQ(shardProduceCode(t, s, t.r.orders), 0) << "flip " << flip;
+    }
+}
+
+// Lifetime: a grant set whose last session leaves is freed and its id reused by ANOTHER set; the new holder never
+// gets the old set's WRITE on the worker, and the old user logging in again gets its own back.
+TEST(AuthLiveChangeAdversarialRegression, AFreedTableIdReusedByAnotherSetNeverGrantsTheOldWritesAdversarialRegression) {
+    Live t("adv259reuse", shardOptions());
+    std::string a;
+    const int64_t sa = t.r.newUser({exact(SO::Write, ST::Topic, "orders")}, &a);
+    ASSERT_EQ(shardProduceCode(t, sa, t.r.orders, 200), 0);
+    ASSERT_TRUE(t.r.c().disconnect(t.ch(), t.r.stream(), sa));
+    // The Disconnect rides the same client publication as the next user's Connect: the gateway closes `sa` (its table's
+    // last holder: freed) before that login acquires a table - the id is reused.
+    const int64_t sb = t.r.newUser({exact(SO::Write, ST::Topic, "secret")});
+    EXPECT_EQ(shardProduceCode(t, sb, t.r.orders, 1), 45) << "the reused table holds the NEW set only";
+    EXPECT_EQ(shardProduceCode(t, sb, t.r.secret, 200), 0);
+    const int64_t sa2 = t.r.login(a);
+    EXPECT_EQ(shardProduceCode(t, sa2, t.r.orders, 200), 0);
+    EXPECT_EQ(shardProduceCode(t, sa2, t.r.secret, 1), 45);
+}
+
+// Prefix extension through the PATCH path: two sessions of one user share a table; a topic the prefix covers, created
+// after login, becomes writable on the worker for both; one outside the prefix stays refused.
+TEST(AuthLiveChangeAdversarialRegression, ATopicCreatedAfterLoginReachesEverySharerOnTheShardAdversarialRegression) {
+    Live t("adv259patch", shardOptions());
+    std::string w;
+    const int64_t s1 = t.r.newUser({prefix(SO::Write, ST::Topic, "w.")}, &w);
+    const int64_t s2 = t.r.login(w);
+    const int32_t late = t.r.defineTopic(t.r.builder, "w.late");
+    ASSERT_GE(late, 0);
+    ASSERT_TRUE(t.r.awaitListed(late));
+    EXPECT_EQ(shardProduceCode(t, s1, late, 200), 0);
+    EXPECT_EQ(shardProduceCode(t, s2, late, 200), 0);
+    const int32_t other = t.r.defineTopic(t.r.builder, "x.late");
+    ASSERT_GE(other, 0);
+    ASSERT_TRUE(t.r.awaitListed(other));
+    EXPECT_EQ(shardProduceCode(t, s1, other, 200), 45);
+}
+
+// Crash and restart (issue #117 Hold gate): after a restart the control thread's mirror is the booted state plus the
+// live re-applies; an admin reading `__security` from the start must get every event and the caught-up marker (never
+// held forever behind the gate), and a live event after it arrives too.
+TEST(AuthLiveChangeAdversarialRegression, ASecurityHistoryReadAfterARestartIsNeverHeldForeverAdversarialRegression) {
+    Live t("adv117restart");
+    for (int i = 0; i < 3; ++i) (void)t.r.newUser({exact(SO::Read, ST::Topic, "orders")});
+    t.r.restart();
+    auto& c = t.b().admin().raw();
+    const int64_t corr = c.sendSubscribe(t.ch(), AuthRig::stream(), t.adminSid(), pc::kSecurityTopicId, 0);
+    ASSERT_EQ(c.awaitSubscribeCode(corr, AuthRig::dl()).value_or(-1), 0);
+    const int64_t sub = c.subscriptionIdOf(corr).value_or(0);
+    ASSERT_NE(sub, 0);
+    auto markerSeen = [&] {
+        for (const auto& p : c.records()) if (p.subscriptionId == sub && p.bytes.size() == 8 && p.baseOffset >= 0) return true;
+        return false;
+    };
+    auto newest = [&] {
+        int64_t n = -1;
+        for (const auto& p : c.records()) {
+            if (p.subscriptionId != sub || p.bytes.size() <= 8) continue;
+            std::size_t pos = 0;
+            while (pos + 61 <= p.bytes.size()) {
+                rune::protocol::RecordBatchReader rd(p.bytes.data() + pos, p.bytes.size() - pos);
+                if (!rd.ensureValid()) break;
+                n = std::max(n, rd.baseOffset() + static_cast<int64_t>(rd.lastOffsetDelta()));
+                pos += static_cast<std::size_t>(rd.totalLength());
+            }
+        }
+        return n;
+    };
+    ASSERT_TRUE(c.pollUntil(markerSeen)) << "the history read reached its caught-up marker after the restart";
+    const int64_t before = newest();
+    EXPECT_GE(before, 3) << "the bootstrap, the builder and the three users at least";
+    (void)t.r.newUser({});
+    EXPECT_TRUE(c.pollUntil([&] { return newest() > before; })) << "a live event after the restart is not held forever";
+}
+
+// Auth, revoked mid-stream (issue #117 end-to-end): a `__security` reader that loses ADMIN gets 45 and NOT ONE frame of
+// the verifier-bearing events after its revoke, over repeated revoke / re-grant / re-subscribe rounds.
+TEST(AuthLiveChangeAdversarialRegression, ARevokedSecurityReaderGetsNoEventAfterItsRevokeOverRoundsAdversarialRegression) {
+    Live t("adv117rounds");
+    std::string name;
+    const int64_t s = t.r.newUser({cluster(SO::Admin), cluster(SO::Describe)}, &name);
+    for (int round = 0; round < 3; ++round) {
+        const int64_t corr = t.r.c().sendSubscribe(t.ch(), t.r.stream(), s, pc::kSecurityTopicId, 0);
+        ASSERT_EQ(t.r.c().awaitSubscribeCode(corr, AuthRig::dl()).value_or(-1), 0) << round;
+        const int64_t sub = t.r.c().subscriptionIdOf(corr).value_or(0);
+        ASSERT_NE(sub, 0);
+        ASSERT_TRUE(t.r.c().pollUntil([&] {
+            for (const auto& p : t.r.c().records()) if (p.subscriptionId == sub && p.bytes.size() == 8 && p.baseOffset >= 0) return true;
+            return false;
+        })) << "caught up, round " << round;
+        ASSERT_EQ(t.revoke(name, false, SO::Admin, ST::Cluster, SP::Exact, ""), 0) << round;
+        EXPECT_EQ(t.errorOn(corr), 45) << round;
+        const std::size_t seen = t.pushes(sub);
+        (void)t.r.newUser({});   // a CREATE USER: a new verifier in `__security`
+        EXPECT_TRUE(t.quiet(sub, 300ms)) << "no frame after the revoke, round " << round;
+        EXPECT_EQ(t.pushes(sub), seen);
+        ASSERT_EQ(t.b().admin().grant(t.ch(), t.adminSid(), name, false, SO::Admin, ST::Cluster, SP::Exact, "").errorCode, 0);
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Issues #196 / #109: the D24 OK on the SHARD path (the default runtime) is released only once the worker enforces the
+// change - its lifecycle ring installed the revoke (bitmap / bind / close), its op ring ran the ending Unsubscribe - and
+// a worker-pushed subscription's terminal NotAuthorized comes from the worker after its last Records.  The worker is made
+// slow on purpose (its ring is not drained for a while: a test seam on its own thread); nothing is dropped.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+constexpr int64_t kSlowWorkerNs = 400'000'000;   // longer than an OK takes when nothing waits for the worker
+void holdLifecycle(Live& t) {
+    (void)t.b().node().onWorkerThreadForTest(0, [](Worker& w) { w.holdSessionOpsForTest(kSlowWorkerNs); return 0; });
+}
+void holdOpRing(Live& t) {
+    (void)t.b().node().onWorkerThreadForTest(0, [](Worker& w) { w.holdOpRingForTest(kSlowWorkerNs); return 0; });
+}
+int64_t leoOf(Live& t, int32_t topic) {
+    return t.b().node().onOwnerThreadForTest(topic, 0, [](rune::replication::PartitionReplica* r) {
+        return r ? r->logEndOffset() : int64_t{-1};
+    });
+}
+/// One worker-ingress produce, waiting at most `seconds` for its answer (kNoAnswer: none).
+int shardProduceOnce(Live& t, int64_t sid, int32_t topic, int seconds = 3) {
+    const int64_t corr = t.r.c().nextCorrelationId();
+    if (!t.r.c().produce(t.b().workerIngressChannel(), AuthRig::stream(), sid, corr, topic, 0, 1, makeBatch(1)))
+        return kNoAnswer;
+    const auto ack = t.r.c().awaitProduceResponseUntil(corr, AuthRig::dl(seconds));
+    return ack ? ack->errorCode : kNoAnswer;
+}
+}  // namespace
+
+// Issue #196 (RED before the fix: the REVOKE's OK was released once the shipper had HANDED the new bind to the worker's
+// lifecycle ring; the worker had not installed it, and the very next produce on the old permission slot was appended and
+// acked).  Repeated: every round's OK is followed by a refused produce, every re-grant's by an accepted one.
+TEST(AuthLiveChangeRegression, ShardRevokeOkMeansTheWorkerAlreadyRefusesRegression) {
+    Live t("shardfence", shardOptions());
+    std::string writer;
+    const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")}, &writer);
+    ASSERT_EQ(shardProduceCode(t, ws, t.r.orders, 200), 0);
+    for (int round = 0; round < 4; ++round) {
+        holdLifecycle(t);
+        ASSERT_EQ(t.revokeExact(writer, SO::Write, ST::Topic, "orders"), 0) << "round " << round;
+        const int64_t leo = leoOf(t, t.r.orders);
+        EXPECT_EQ(shardProduceOnce(t, ws, t.r.orders), 45) << "round " << round << ": the worker refuses at the OK (D24)";
+        EXPECT_EQ(leoOf(t, t.r.orders), leo) << "round " << round << ": nothing was appended after the revoke's OK";
+        holdLifecycle(t);
+        ASSERT_EQ(t.grantExact(writer, SO::Write, ST::Topic, "orders"), 0);
+        EXPECT_EQ(shardProduceOnce(t, ws, t.r.orders), 0) << "round " << round << ": the re-grant is enforced at its OK";
+    }
+}
+
+// Issue #196, the session-ending kinds: DISABLE / TERMINATE SESSIONS revoke the session; with the worker slow to drain
+// its lifecycle ring the OK still means the worker refuses that session's direct produce (it is bound to nothing ahead
+// of the fence).  RED before the fix: the produce after the OK was appended.
+TEST(AuthLiveChangeRegression, ShardDisableAndTerminateOkMeanTheWorkerAlreadyRefusesRegression) {
+    Live t("shardfencerevoke", shardOptions());
+    for (const bool terminate : {false, true}) {
+        std::string writer;
+        const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")}, &writer);
+        ASSERT_EQ(shardProduceCode(t, ws, t.r.orders, 200), 0);
+        holdLifecycle(t);
+        if (terminate)
+            ASSERT_EQ(t.alter(writer, pc::UserChangeKind::SetPassword, "a brand new password 77", /*terminate=*/true), 0);
+        else
+            ASSERT_EQ(t.alter(writer, pc::UserChangeKind::Disable), 0);
+        const int64_t leo = leoOf(t, t.r.orders);
+        EXPECT_NE(shardProduceOnce(t, ws, t.r.orders, 2), 0) << (terminate ? "TERMINATE" : "DISABLE");
+        EXPECT_EQ(leoOf(t, t.r.orders), leo) << (terminate ? "TERMINATE" : "DISABLE") << ": nothing appended after the OK";
+    }
+}
+
+// Issue #109 (RED before the fix: the gateway sent the 45 at once on its own egress while the ending Unsubscribe waited
+// in the worker's op ring; the worker kept pushing on the subscription's own record egress, so records produced AFTER
+// the REVOKE's OK reached the revoked consumer after its 45).  The worker ends it: the 45 follows its last Records, the
+// OK follows the end, and nothing is delivered afterwards.
+TEST(AuthLiveChangeRegression, NoRecordAfterTheEndOnPerWorkerEgressRegression) {
+    Live t("shardend", shardOptions());
+    std::string reader;
+    const int64_t rs = t.r.newUser({exact(SO::Read, ST::Topic, "orders")}, &reader);
+    const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    const auto sub = t.subscribe(rs, t.r.orders);
+    ASSERT_GT(sub.id, 0);
+    ASSERT_EQ(shardProduceCode(t, ws, t.r.orders, 200), 0);
+    ASSERT_TRUE(t.awaitPushes(sub.id, 1)) << "the worker pushes the live subscription";
+    holdOpRing(t);
+    ASSERT_EQ(t.revokeExact(reader, SO::Read, ST::Topic, "orders"), 0);
+    for (int i = 0; i < 5; ++i) EXPECT_EQ(shardProduceOnce(t, ws, t.r.orders), 0) << "the writer keeps its WRITE";
+    EXPECT_EQ(t.errorOn(sub.corr, rs), 45) << "the end is explicit, on the subscription's correlation id";
+    EXPECT_NE(t.errorTextOn(sub.corr, rs).find("READ on TOPIC"), std::string::npos) << t.errorTextOn(sub.corr, rs);
+    EXPECT_TRUE(t.quiet(sub.id, 500ms));
+    uint64_t endSeq = 0;
+    for (const auto& e : t.r.c().errors()) if (e.correlationId == sub.corr && e.sessionId == rs) { endSeq = e.seq; break; }
+    ASSERT_GT(endSeq, 0u);
+    for (const auto& p : t.r.c().records())
+        EXPECT_FALSE(p.subscriptionId == sub.id && p.seq > endSeq)
+            << "a Records frame (offset " << p.baseOffset << ") arrived after the subscription's 45";
+    EXPECT_EQ(t.r.subscribe(rs, t.r.orders), 45) << "a new Subscribe is refused";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Adversarial review of PR #459 (issues #109 / #196 / #110 / #120): break the ordering of a subscription's end with the
+// worker's pushes, and the D24 OK on the shard path - a revoke racing the Subscribe, a backlog still being pushed, a
+// revoked session (46) instead of a revoked READ (45), many subscriptions ended by one event.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+/// `batches` x `perBatch` records produced to `topic` by `ws` (gateway produce, acked).
+void backlog(Live& t, int64_t ws, int32_t topic, int batches, int perBatch) {
+    for (int i = 0; i < batches; ++i) {
+        const int64_t corr = t.r.c().nextCorrelationId();
+        ASSERT_TRUE(t.r.c().produce(t.ch(), AuthRig::stream(), ws, corr, topic, 0, 1, makeBatch(perBatch)));
+        const auto a = t.r.c().awaitProduceResponseUntil(corr, AuthRig::dl());
+        ASSERT_TRUE(a.has_value() && a->errorCode == 0) << "backlog batch " << i;
+    }
+}
+uint64_t firstErrorSeq(Live& t, int64_t corr, int64_t sid, int code) {
+    for (const auto& e : t.r.c().errors()) if (e.correlationId == corr && e.sessionId == sid && e.code == code) return e.seq;
+    return 0;
+}
+int errorsOn(Live& t, int64_t corr, int64_t sid) {
+    int n = 0;
+    for (const auto& e : t.r.c().errors()) n += e.correlationId == corr && e.sessionId == sid ? 1 : 0;
+    return n;
+}
+std::size_t recordsAfter(Live& t, int64_t subId, uint64_t seq) {
+    std::size_t n = 0;
+    for (const auto& p : t.r.c().records()) n += p.subscriptionId == subId && p.seq > seq ? 1 : 0;
+    return n;
+}
+}  // namespace
+
+// Ordering: the REVOKE READ arrives while the subscription's own Subscribe still waits in the worker's (held) op ring.
+// The Unsubscribe that ends it and the event's fence queue behind it: exactly one 45 (from the worker - never a second
+// one from the gateway), nothing pushed after it, and the OK is released.
+TEST(AuthLiveChangeAdversarialRegression, ARevokeRacingTheSubscribeOnAHeldOpRingEndsItExactlyOnceAdversarialRegression) {
+    Live t("adv109race", shardOptions());
+    std::string reader;
+    const int64_t rs = t.r.newUser({exact(SO::Read, ST::Topic, "orders")}, &reader);
+    const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    ASSERT_EQ(shardProduceCode(t, ws, t.r.orders, 200), 0);
+    holdOpRing(t);
+    const int64_t corr = t.r.c().sendSubscribe(t.ch(), AuthRig::stream(), rs, t.r.orders, 0);
+    ASSERT_EQ(t.revokeExact(reader, SO::Read, ST::Topic, "orders"), 0) << "the OK comes once the worker ran the end";
+    EXPECT_EQ(t.errorOn(corr, rs), 45);
+    for (int i = 0; i < 5; ++i) EXPECT_EQ(shardProduceOnce(t, ws, t.r.orders), 0);
+    t.r.c().pollFor(500ms, [] { return false; });
+    EXPECT_EQ(errorsOn(t, corr, rs), 1) << "one terminal answer on the subscription's correlation id";
+    const auto subId = t.r.c().subscriptionIdOf(corr);
+    if (subId) {
+        const uint64_t endSeq = firstErrorSeq(t, corr, rs, 45);
+        EXPECT_EQ(recordsAfter(t, *subId, endSeq), 0u) << "Records after the 45";
+    }
+}
+
+// Ordering under a backlog: the worker is still pushing a long backlog when the READ is revoked (its op ring held so
+// the end waits): no Records frame of the subscription follows its 45.
+TEST(AuthLiveChangeAdversarialRegression, NoRecordAfterTheEndWhileABacklogIsPushedAdversarialRegression) {
+    Live t("adv109backlog", shardOptions());
+    std::string reader;
+    const int64_t rs = t.r.newUser({exact(SO::Read, ST::Topic, "orders")}, &reader);
+    const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    ASSERT_EQ(shardProduceCode(t, ws, t.r.orders, 200), 0);
+    backlog(t, ws, t.r.orders, 60, 1000);
+    const auto sub = t.subscribe(rs, t.r.orders);
+    ASSERT_GT(sub.id, 0);
+    holdOpRing(t);
+    ASSERT_EQ(t.revokeExact(reader, SO::Read, ST::Topic, "orders"), 0);
+    EXPECT_EQ(t.errorOn(sub.corr, rs), 45);
+    t.r.c().pollFor(500ms, [] { return false; });
+    const uint64_t endSeq = firstErrorSeq(t, sub.corr, rs, 45);
+    ASSERT_GT(endSeq, 0u);
+    EXPECT_EQ(recordsAfter(t, sub.id, endSeq), 0u) << "Records after the 45";
+    EXPECT_EQ(errorsOn(t, sub.corr, rs), 1);
+}
+
+// The same bug class through the sibling end: DISABLE revokes the reader's whole session (SessionRevoked, 46, on each
+// subscription's correlation id).  With the worker still pushing a backlog and its op ring held, no Records frame of the
+// subscription may follow its 46 - the session's end is terminal.
+TEST(AuthLiveChangeAdversarialRegression, NoRecordAfterTheSessionRevokedWhileABacklogIsPushedAdversarialRegression) {
+    Live t("adv109revoked", shardOptions());
+    std::string reader;
+    const int64_t rs = t.r.newUser({exact(SO::Read, ST::Topic, "orders")}, &reader);
+    const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    ASSERT_EQ(shardProduceCode(t, ws, t.r.orders, 200), 0);
+    backlog(t, ws, t.r.orders, 60, 1000);
+    const auto sub = t.subscribe(rs, t.r.orders);
+    ASSERT_GT(sub.id, 0);
+    holdOpRing(t);
+    ASSERT_EQ(t.alter(reader, pc::UserChangeKind::Disable), 0);
+    EXPECT_EQ(t.errorOn(sub.corr, rs), kRevoked);
+    t.r.c().pollFor(500ms, [] { return false; });
+    const uint64_t endSeq = firstErrorSeq(t, sub.corr, rs, kRevoked);
+    ASSERT_GT(endSeq, 0u);
+    EXPECT_EQ(recordsAfter(t, sub.id, endSeq), 0u) << "Records after the subscription's SessionRevoked";
+}
+
+// Resources: one REVOKE ends many worker-pushed subscriptions at once (one session, 32 subscriptions): each gets exactly
+// one 45, the OK is released (no hang, no in-doubt answer), and the worker owes nothing afterwards.
+TEST(AuthLiveChangeAdversarialRegression, ARevokeEndingManySubscriptionsEndsEachExactlyOnceAdversarialRegression) {
+    Live t("adv109many", shardOptions());
+    std::string reader;
+    const int64_t rs = t.r.newUser({exact(SO::Read, ST::Topic, "orders")}, &reader);
+    const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    ASSERT_EQ(shardProduceCode(t, ws, t.r.orders, 200), 0);
+    std::vector<Live::Sub> subs;
+    for (int i = 0; i < 32; ++i) {
+        subs.push_back(t.subscribe(rs, t.r.orders));
+        ASSERT_GT(subs.back().id, 0) << i;
+    }
+    holdOpRing(t);
+    ASSERT_EQ(t.revokeExact(reader, SO::Read, ST::Topic, "orders"), 0);
+    t.r.c().pollUntil([&] {
+        for (const auto& s : subs) if (errorsOn(t, s.corr, rs) == 0) return false;
+        return true;
+    });
+    t.r.c().pollFor(300ms, [] { return false; });
+    for (const auto& s : subs) {
+        EXPECT_EQ(errorsOn(t, s.corr, rs), 1) << "sub " << s.id;
+        EXPECT_EQ(firstErrorSeq(t, s.corr, rs, 45) > 0, true) << "sub " << s.id;
+    }
+    EXPECT_EQ(t.b().node().onWorkerThreadForTest(0, [](Worker& w) { return static_cast<int>(w.subscriptionEndsOwedForTest()); }), 0);
+}

@@ -375,6 +375,11 @@ struct ClientConfig {
     // AuthenticationFailed — a rogue endpoint must not receive a credentialed client's data.  Set true to accept
     // such a broker anyway (authStatus() then reports Anonymous).  A Client without credentials is unaffected.
     bool allowUnauthenticatedBroker = false;
+    // securityBootstrapOnly (issue #121): this Client exists only for bootstrapSecurity() and has no credentials.  On a
+    // cluster whose bootstrap window was reopened (its last admin disabled or dropped; the broker answers
+    // MustAuthenticate because its other users still log in) it skips the login instead of failing it.  Ignored with
+    // credentials.  The CLI's `rune security bootstrap` sets it.
+    bool securityBootstrapOnly = false;
     // minPasswordLength / scramIterations: how this client builds a NEW verifier (ALTER USER ...
     // SET PASSWORD, the CLI's bootstrap) — the broker never sees a password, so the minimum is the
     // client's rule (D9).  Not used by the login itself, which follows the broker's salt and count.
@@ -1053,6 +1058,24 @@ public:
                              r.version);
     }
 
+    /// #418: the run-time lineage of the generated type T for topic `name` (T::Lineage), built from the topic's
+    /// evolving descriptor (GetTopicSchema with kSchemaLineageFingerprint).  A T decodes records of versions
+    /// 1..T::kVersion on its own; a record written at a LATER version (the topic evolved after T was generated)
+    /// needs this:  `auto lin = client.lineageAndWait<T>("chars");  rec.decode(bytes, lin);`  (or T::Decoder(bytes,
+    /// lin)).  Cold: once per topic, then reuse it (re-fetch after the topic evolves again: a record of a version
+    /// the lineage does not know decodes false).  Throws std::runtime_error when the broker answers an error, and
+    /// std::invalid_argument when the topic's schema is not T's.
+    template <class T>
+    [[nodiscard]] typename T::Lineage lineageAndWait(std::string_view name,
+                                                     std::chrono::nanoseconds timeout = kDefaultWaitTimeout) {
+        TopicSchemaResult r = getTopicSchemaAndWait(name, rune::protocol::client::kSchemaLineageFingerprint, timeout);
+        if (r.errorCode != 0) {
+            throw std::runtime_error("lineage: the broker did not serve the schema lineage of '" + std::string(name) +
+                                     "' (error " + std::to_string(r.errorCode) + ")");
+        }
+        return T::lineage(rune::codec::deserialize(std::span<const uint8_t>(r.descriptorBlob)));
+    }
+
     /// Phase 2b F (FD7): the same version-binding open, but the typed topic BORROWS `shared` instead of owning
     /// a producer of its own - its sends and claims go through that producer, inside its transaction when one
     /// is open.  `shared` must outlive the returned topic.
@@ -1698,12 +1721,15 @@ private:
 public:
     [[nodiscard]] uint64_t testStaleSubscribeRedirects() const noexcept { return staleSubscribeRedirects_; }
     [[nodiscard]] uint64_t testRedirectFollowsHeld() const noexcept { return redirectFollowsHeld_; }
+    /// PR #441 F4: re-sends of ONE pending Subscribe answered RecordEgressUnavailable before it fails explicitly.
+    static constexpr int kMaxEgressUnavailableRetriesForTest = 3;
 private:
     std::vector<int64_t>  redirectedSubscribes_;
     int                   redirectMetaSeen_ = 0;
     int64_t               nextRedirectedResendNs_ = 0;
     static constexpr int64_t kRedirectedResendInitNs = 100'000'000LL;     // 100 ms
     static constexpr int64_t kRedirectedResendMaxNs  = 2'000'000'000LL;   // 2 s
+    static constexpr int kMaxEgressUnavailableRetries = kMaxEgressUnavailableRetriesForTest;
     int64_t               redirectedResendBackoffNs_ = kRedirectedResendInitNs;
     uint64_t              unreachableRedirects_ = 0;
     uint64_t groupUpMask_   = 0;  // leader sessions (bit i-1 = session i) Connected last pass

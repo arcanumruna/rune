@@ -106,6 +106,7 @@
 #include <rune/transaction/ControlMarker.h>
 #include <rune/transaction/ReadCommittedView.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/ProducerIdBinding.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/Protocol.h>  // E5.1.3: pc::ErrorCode enum (replaces magic literals)
@@ -699,6 +700,12 @@ public:
     void requireEnforcement() noexcept {
         if (!std::holds_alternative<Enforcing>(enforcement_)) enforcement_ = Enforcing{ackSink_.get()};
     }
+    /// Issue #118 (X020): the broker authenticates - a subscription is pushed ONLY on its session's own record egress,
+    /// never on this worker's shared dynamic-MDC publication (every joiner of the advertised control port receives
+    /// that).  A Subscribe op without an egress pub is refused (the gateway never sends one under authentication; this
+    /// is the worker's own fail-closed check).  Before the runner starts.
+    void requirePerSessionEgress() noexcept { perSessionEgressRequired_ = true; }
+    [[nodiscard]] uint64_t subscribesRefusedWithoutEgressForTest() const noexcept { return subscribesRefusedWithoutEgress_; }
     /// Combined fix program (X036, review I1/I3): true when a client-supplied Produce record-batch span must be REFUSED.
     /// A client produce frame carries EXACTLY ONE batch: the append CRC-checks, producer-checks and offset-restamps only
     /// the first batch yet writes the whole span, so a second batch (or trailing bytes) would land unvalidated and break
@@ -895,7 +902,10 @@ public:
         /// naming the subscription} is owed (retried each pass until sent).
         /// Failed: the error was sent; parked until Unsubscribe (no reads, no
         /// spin).  A same-id re-Subscribe keeps the state (one error per sub).
-        enum class PushState : uint8_t { Live, ErrorOwed, Failed };
+        /// EndOwed (issue #109): an ending Unsubscribe (a revoked READ) arrived - nothing more is read or pushed;
+        /// the terminal ErrorResponse (endsOwed_) is retried each pass until sent on this subscription's egress,
+        /// then the cursor is forgotten.  Ended: sent, removed at the end of the push pass.
+        enum class PushState : uint8_t { Live, ErrorOwed, Failed, EndOwed, Ended };
         PushState pushState = PushState::Live;
         /// ErrorOwed/Failed: the undeliverable Records frame size (named in the error).
         std::size_t failedFrameLen = 0;
@@ -1274,6 +1284,13 @@ public:
             tailSrc  = op.peerKeys.data();
             tailLen  = op.peerKeys.size();
             break;
+        case WorkerOp::Type::Unsubscribe:
+            if (op.endCode != 0) [[unlikely]] {             // issue #109: the terminal frame's text
+                tailKind = sbe::TailKind::Value::END_DETAIL;
+                tailSrc  = reinterpret_cast<const uint8_t*>(op.endDetail.data());
+                tailLen  = op.endDetail.size();
+            }
+            break;
         default:
             break;  // NONE tail
         }
@@ -1378,7 +1395,8 @@ public:
            .targetReplicaId(op.targetReplicaId)
            .incarnation(op.incarnation)
            .minIsr(op.minIsr)
-           .clientVersion(op.clientVersion)   // D6: SessionAnnounce; Task 12: SchemaUpdate's version
+           // D6: SessionAnnounce; Task 12: SchemaUpdate's version; issue #109: an ending Unsubscribe's terminal code
+           .clientVersion(op.type == WorkerOp::Type::Unsubscribe ? static_cast<int32_t>(op.endCode) : op.clientVersion)
            // F27 R1: a FetchRequest op carries the follower's connection
            // generation in ownershipGen (SetOwnership is the field's only other user).
            .ownershipGen(op.type == WorkerOp::Type::FetchRequest
@@ -1600,6 +1618,11 @@ public:
     }
     /// Hold io completions in the backend (no reap) so tests deliver them.
     void setReapPausedForTest(bool on) noexcept { reapPausedForTest_ = on; }
+    /// Test seams (issues #109 / #196), WORKER thread (onWorkerThreadForTest): from this worker's next pass on, its
+    /// session-lifecycle ring / op ring is not drained for `forNs` (its own pass clock) - a worker slow to install a
+    /// revoke or to run an ending Unsubscribe.  Everything stays queued in order; nothing is dropped.
+    void holdSessionOpsForTest(int64_t forNs) noexcept { holdSessionOps_.requestNs = forNs; testHoldArmed_ = true; }
+    void holdOpRingForTest(int64_t forNs) noexcept { holdOpRing_.requestNs = forNs; testHoldArmed_ = true; }
     /// A recovery-point checkpoint is queued (prepared at the next pass's background-disk step).
     [[nodiscard]] bool recoveryPointQueuedForTest() const noexcept { return !rpQueue_.empty(); }
     /// Every reaped completion is rewritten to carry `err` (0 = off).
@@ -2368,6 +2391,7 @@ private:
     // lifecycle ops emit no returns, so no backlog may gate them.
     // -----------------------------------------------------------------------
     int drainSessionOps_() {
+        if (testHoldArmed_) [[unlikely]] { if (heldForTest_(holdSessionOps_)) return 0; }
         auto exec = [this](int32_t, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
                            aeron::util::index_t len) {
             executeFromWire_(reinterpret_cast<const uint8_t*>(buf.buffer()) + off, static_cast<std::size_t>(len));
@@ -2426,6 +2450,7 @@ private:
     }
 
     std::size_t drainIngress_() {
+        if (testHoldArmed_) [[unlikely]] { if (heldForTest_(holdOpRing_)) return 0; }
         // Drain a LARGE batch per tick: the routed replication ops (fetch/apply —
         // the HW-advancing fast-acks) must not queue behind a small per-tick cap.
         // (Default was 16 → under the acks=majority fast-ack storm the ingress ring
@@ -2621,7 +2646,25 @@ private:
         case WorkerOp::Type::SessionPermissions:
             executeSessionPermissionsWire_(op);
             break;
+        case WorkerOp::Type::EnforceFence:   // issues #109 / #196: every op before it on the op ring is executed
+            ackEnforceFence_(op.correlationId(), /*lifecycleRing=*/false);
+            break;
         }
+    }
+
+    // Issues #109 / #196: an enforcement fence was reached on one of this worker's rings - every op queued before it
+    // there is executed (an ended subscription pushes nothing more, a revoked bitmap / bind / SessionClose is
+    // installed).  The ack is never dropped (enqueueSignal_); the control thread's D24 gate releases a security OK
+    // only once every worker acknowledged the fence that followed the event's ops.  Cold: one per security event.
+    [[gnu::cold]] void ackEnforceFence_(int64_t seq, bool lifecycleRing) {
+        ++enforceFencesSeen_;
+        WorkerReturn ack;
+        ack.type       = WorkerReturn::Type::SessionSignal;
+        ack.sessionId  = lifecycleRing ? 1 : 0;
+        ack.partition  = workerId_;
+        ack.lastOffset = static_cast<int64_t>(SessionSignalKind::FenceAck);
+        ack.baseOffset = seq;
+        enqueueSignal_(ack);
     }
 
     // -------------------------------------------------------------------
@@ -2655,20 +2698,39 @@ private:
     // sink adds this worker's own exclusive publication on its next flush.
     // Workers without worker-side acks (legacy, unit rigs) only count it.
     // -------------------------------------------------------------------
-    // Authentication Task 13 (D30): one chunk of a session's WRITE bitmap.  Staged in this worker's one
-    // PermissionStager and swapped into the session's slot on the last chunk (a partial table is never visible).
+    // Authentication Task 13 (D30) / issue #259: the WRITE tables and the sessions' bindings to them (see
+    // WorkerWriteGrants.h for the variants).  A full table is staged in this worker's one PermissionStager and swapped
+    // in on its last chunk (a partial table is never visible); a patch, a bind and a drop are single ops.
     [[gnu::cold]] void executeSessionPermissionsWire_(sbe::WorkerOp& op) {
         ++sessionPermissionChunksSeen_;
+        if ((op.isolation() & kPermFlagFence) != 0) [[unlikely]] {   // issue #196: acknowledged in every worker mode
+            ackEnforceFence_(op.correlationId(), /*lifecycleRing=*/true);
+            return;
+        }
         if (!ackSink_) return;   // a worker without worker-side acks keeps no session table (and enforces nothing)
         const auto first = static_cast<uint64_t>(op.nextOffset());
         const auto total = static_cast<uint64_t>(op.hwBound());
+        const uint8_t flags = op.isolation();
         const std::uint32_t tailLen = op.tailLength();   // SBE var data: the length FIRST, then tail() advances past it
         const auto* tail = reinterpret_cast<const uint8_t*>(op.tail());
-        const PermissionChunkResult r = permStager_.apply(
-            *ackSink_, op.sessionId(), first, total, op.isolation(), static_cast<uint64_t>(op.correlationId()), tail, tailLen);
-        if (r == PermissionChunkResult::Dropped) [[unlikely]]
-            spdlog::debug("Worker {}: permission chunk for session {} dropped (closed session or out-of-order chunk)",
-                          workerId_, op.sessionId());
+        bool ok = true;
+        if ((flags & kPermFlagBind) != 0) {
+            ok = ackSink_->bindWriteGrants(op.sessionId(), op.nextOffset(), static_cast<uint64_t>(op.correlationId()),
+                                           static_cast<uint64_t>(op.producerId()));   // #122: the session's principal
+        } else if ((flags & kPermFlagDrop) != 0) {
+            ok = ackSink_->dropWriteTable(op.sessionId());
+        } else if ((flags & kPermFlagPatch) != 0) {
+            ok = tailLen % 8 == 0 && ackSink_->patchWriteTable(op.sessionId(), first, total, tail, tailLen / 8);
+        } else if ((flags & kPermFlagTable) != 0) {
+            ok = permStager_.apply(*ackSink_, op.sessionId(), first, total, flags,
+                                   static_cast<uint64_t>(op.correlationId()), tail, tailLen,
+                                   static_cast<uint64_t>(op.producerId())) != PermissionChunkResult::Dropped;
+        } else {
+            ok = false;   // no variant flag: not sent by this runtime
+        }
+        if (!ok) [[unlikely]]
+            spdlog::debug("Worker {}: permission op (flags {:#x}) for {} dropped (closed session, bad id or out-of-order "
+                          "chunk)", workerId_, flags, op.sessionId());
     }
 
     [[gnu::cold]] void executeSessionAnnounceWire_(sbe::WorkerOp& op) {
@@ -2796,6 +2858,17 @@ private:
             const std::uint32_t n = op.tailLength();
             filterTail = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(op.tail()), n);
         }
+        if (perSessionEgressRequired_ && op.egressPub() == 0) [[unlikely]] {
+            // Issue #118: never a cursor on the shared egress under authentication; an existing entry of the id is
+            // dropped too (fail closed: its records must not move to the shared publication).
+            for (std::size_t i = 0; i < subs_.size(); ++i)
+                if (subs_[i].subscriptionId == subId) { eraseSub_(i); break; }
+            if ((subscribesRefusedWithoutEgress_++ & 1023) == 0)
+                spdlog::error("Worker {}: Subscribe {:#x} without its own record egress refused - the shared egress "
+                              "carries no Records under authentication (refused so far: {})",
+                              workerId_, subId, subscribesRefusedWithoutEgress_);
+            return;
+        }
         for (std::size_t si = 0; si < subs_.size(); ++si) {
             auto& s = subs_[si];
             if (s.subscriptionId == subId) {
@@ -2851,13 +2924,82 @@ private:
     void executeUnsubscribeWire_(sbe::WorkerOp& op) {
         if (op.egressPub() != 0) [[unlikely]] { executeEgressReleaseWire_(op); return; }
         const int64_t subId = op.subscriptionId();
+        const auto endCode = static_cast<int16_t>(op.clientVersion());   // issue #109: 0 = a plain Unsubscribe
         for (std::size_t i = 0; i < subs_.size(); ++i) {
             if (subs_[i].subscriptionId == subId) {
+                if (endCode != 0) [[unlikely]] {
+                    // Issue #109: the push owner ends it - nothing more is read or pushed from here on, and the
+                    // terminal frame goes out on the same egress after the last Records (pushOwnedSubscriptions_).
+                    // A filtered subscription stays in its group (never deliverable once not Live) until the sweep.
+                    const std::uint32_t tailLen = op.tailLength();   // SBE var data: the length FIRST, then tail()
+                    const char* tail = op.tail();
+                    subs_[i].pushState = WorkerSubscription::PushState::EndOwed;
+                    pushListDirty_ = true;   // the unfiltered pass must visit it (the owed terminal frame)
+                    endsOwed_.push_back(EndOwed{subId, endCode, std::string(tail, tailLen)});
+                    ++subscriptionEndsSeen_;
+                    return;
+                }
+                if (subs_[i].pushState == WorkerSubscription::PushState::EndOwed) [[unlikely]] eraseEndOwed_(subId);
                 eraseSub_(i);
                 return;
             }
         }
     }
+
+    struct TestHold { int64_t requestNs = 0; int64_t untilNs = INT64_MIN; };
+    TestHold holdSessionOps_, holdOpRing_;
+    bool     testHoldArmed_ = false;   // one predicted branch per pass while no test hold was ever set
+    [[gnu::cold]] bool heldForTest_(TestHold& h) noexcept {
+        if (h.requestNs > 0) { h.untilNs = passNowNs_ + h.requestNs; h.requestNs = 0; }
+        return passNowNs_ < h.untilNs;
+    }
+    // Issue #109: the terminal frames owed by ended subscriptions (cold: a revoked READ).
+    struct EndOwed { int64_t subscriptionId = 0; int16_t code = 0; std::string detail; };
+    std::vector<EndOwed> endsOwed_;
+    bool endedSubsPending_ = false;   // a sub reached Ended this pass: swept after the push loop
+    uint64_t subscriptionEndsSeen_ = 0, subscriptionEndsSent_ = 0, enforceFencesSeen_ = 0;
+    uint64_t subscriptionEndsLost_ = 0;   // F3: a release found the egress back-pressured for the terminal frame
+    void eraseEndOwed_(int64_t subId) noexcept {
+        for (std::size_t k = 0; k < endsOwed_.size(); ++k)
+            if (endsOwed_[k].subscriptionId == subId) { endsOwed_[k] = std::move(endsOwed_.back()); endsOwed_.pop_back(); return; }
+    }
+    /// Issue #109: send `s`'s terminal frame on `pub` (sealed like its Records when the session is encrypted); on
+    /// success the subscription is Ended (swept after the pass).  Back-pressure / no key: retried next pass.
+    [[gnu::cold]] [[gnu::noinline]] int sendSubscriptionEnd_(WorkerSubscription& s, aeron::ExclusivePublication* pub,
+                                                             const RecordsSealCtx* seal) {
+        const EndOwed* e = nullptr;
+        for (const auto& x : endsOwed_) if (x.subscriptionId == s.subscriptionId) { e = &x; break; }
+        if (e == nullptr) [[unlikely]] { s.pushState = WorkerSubscription::PushState::Ended; endedSubsPending_ = true; return 1; }
+        static_assert(kPushTooLargeErrorMaxBytes <= kEgressScratchSize);
+        const std::size_t n = encodeSubscriptionEnd(egressScratch_.data(), s.sessionId, s.subscribeCorrId, e->code, e->detail);
+        if (n == 0) [[unlikely]] return 0;
+        if (seal) [[unlikely]] {
+            const std::size_t sn = sealRecordsFrame(*seal, egressScratch_.data(), n,
+                                                    pushTooLargeSealScratch_.data(), pushTooLargeSealScratch_.size());
+            if (sn == 0) [[unlikely]] return 0;   // fail-closed - never transmit, retried next pass
+            if (sendEncodedToPub_(pub, pushTooLargeSealScratch_.data(), sn) <= 0) return 0;
+        } else if (sendEncodedToPub_(pub, egressScratch_.data(), n) <= 0) {
+            return 0;
+        }
+        eraseEndOwed_(s.subscriptionId);
+        s.pushState = WorkerSubscription::PushState::Ended;
+        endedSubsPending_ = true;
+        ++subscriptionEndsSent_;
+        return 1;
+    }
+    void sweepEndedSubs_() {
+        endedSubsPending_ = false;
+        for (std::size_t i = 0; i < subs_.size(); ) {
+            if (subs_[i].pushState == WorkerSubscription::PushState::Ended) eraseSub_(i);   // leaves its filter group too
+            else ++i;
+        }
+    }
+public:
+    [[nodiscard]] uint64_t subscriptionEndsSeenForTest() const noexcept { return subscriptionEndsSeen_; }
+    [[nodiscard]] uint64_t subscriptionEndsSentForTest() const noexcept { return subscriptionEndsSent_; }
+    [[nodiscard]] uint64_t enforceFencesSeenForTest() const noexcept { return enforceFencesSeen_; }
+    [[nodiscard]] std::size_t subscriptionEndsOwedForTest() const noexcept { return endsOwed_.size(); }
+private:
 
     // -------------------------------------------------------------------
     // 2026-10-05 record-egress lifetime (retire-on-ack): an Unsubscribe op
@@ -2871,21 +3013,64 @@ private:
     // -------------------------------------------------------------------
     [[gnu::cold]] [[gnu::noinline]] void executeEgressReleaseWire_(sbe::WorkerOp& op) {
         const auto pub = static_cast<std::uintptr_t>(op.egressPub());
+        bool endsOwed = false;
         for (std::size_t i = 0; i < subs_.size(); ) {
             if (reinterpret_cast<std::uintptr_t>(subs_[i].egressPub) == pub) {
+                // PR #459 F3: a subscription ended just before its session closed (a revoked session) still owes its
+                // terminal frame - kept (it pushes nothing more) until the push pass sent it; the release waits for it.
+                if (subs_[i].pushState == WorkerSubscription::PushState::EndOwed) { endsOwed = true; ++i; continue; }
                 eraseSub_(i);   // swap-and-pop: the moved element is re-examined at the same index
             } else {
                 ++i;
             }
         }
+        if (endsOwed) [[unlikely]] {
+            deferredReleases_.push_back(DeferredRelease{pub, op.sessionId(), op.correlationId(), passNowNs_ + kEndOwedReleaseGraceNs});
+            return;
+        }
+        ackEgressRelease_(op.sessionId(), op.correlationId());
+    }
+    void ackEgressRelease_(int64_t sessionId, int64_t token) {
         WorkerReturn ack;
         ack.type       = WorkerReturn::Type::SessionSignal;
-        ack.sessionId  = op.sessionId();
+        ack.sessionId  = sessionId;
         ack.partition  = workerId_;
         ack.lastOffset = static_cast<int64_t>(SessionSignalKind::EgressReleased);
-        ack.baseOffset = op.correlationId();   // the retire token
+        ack.baseOffset = token;   // the retire token
         enqueueSignal_(ack);
         ++egressReleases_;
+    }
+    // PR #459 F3: releases waiting for an owed terminal frame on their publication (cold: a revoked session's close).
+    // Bounded: past the grace (a client that never reads) the frame is given up, counted, and the release proceeds.
+    static constexpr int64_t kEndOwedReleaseGraceNs = 2'000'000'000;
+    struct DeferredRelease { std::uintptr_t pub; int64_t sessionId; int64_t token; int64_t deadlineNs; };
+    std::vector<DeferredRelease> deferredReleases_;
+    [[gnu::cold]] int serviceDeferredReleases_() {
+        int done = 0;
+        for (std::size_t k = 0; k < deferredReleases_.size(); ) {
+            const DeferredRelease d = deferredReleases_[k];
+            bool owed = false;
+            for (const auto& sub : subs_)
+                if (reinterpret_cast<std::uintptr_t>(sub.egressPub) == d.pub &&
+                    sub.pushState == WorkerSubscription::PushState::EndOwed) { owed = true; break; }
+            if (owed && passNowNs_ < d.deadlineNs) { ++k; continue; }
+            for (std::size_t i = 0; i < subs_.size(); ) {   // everything left on it goes (an end given up is counted)
+                if (reinterpret_cast<std::uintptr_t>(subs_[i].egressPub) == d.pub) {
+                    if (subs_[i].pushState == WorkerSubscription::PushState::EndOwed) {
+                        eraseEndOwed_(subs_[i].subscriptionId);
+                        ++subscriptionEndsLost_;
+                    }
+                    eraseSub_(i);
+                } else {
+                    ++i;
+                }
+            }
+            ackEgressRelease_(d.sessionId, d.token);
+            deferredReleases_[k] = deferredReleases_.back();
+            deferredReleases_.pop_back();
+            ++done;
+        }
+        return done;
     }
 
     // -------------------------------------------------------------------
@@ -3424,7 +3609,7 @@ private:
     int pushOwnedSubscriptionsImpl_(int64_t /*nowNs*/) {
         using namespace rune::protocol::batch;
         namespace pc = rune::protocol::client;
-        if (subs_.empty()) return 0;
+        if (subs_.empty()) return deferredReleases_.empty() ? 0 : serviceDeferredReleases_();
 
         int work = 0;
         // F5: bounded per pass (kPushPassBudgetBytes, shared with PushRead
@@ -3437,13 +3622,22 @@ private:
             const std::size_t si = Listed ? pushList_[lp] : lp;
             auto& s = subs_[si];
             if (pushBudgetLeft_ == 0) { pushRotor_ = lp; break; }
-            if (!s.active) continue;   // parked: partition moved away (E2: the source is resolved below)
+            // Parked: partition moved away (E2: the source is resolved below).  Issue #109: an ended one still owes
+            // its terminal frame (its egress is the session's, not the partition's).
+            if (!s.active && s.pushState != WorkerSubscription::PushState::EndOwed) continue;
 
             // Hybrid egress: prefer this consumer's UNICAST pub (independent
             // per-consumer offsets); fall back to the shared MDC pub (broadcast).
             aeron::ExclusivePublication* egressPub = s.egressPub;
             if (!egressPub && workerEgress_) egressPub = workerEgress_->pub();
-            if (!egressPub) continue;  // nowhere to send yet
+            if (!egressPub) {  // nowhere to send yet
+                if (s.pushState == WorkerSubscription::PushState::EndOwed) [[unlikely]] {   // #109: nobody to tell
+                    eraseEndOwed_(s.subscriptionId);
+                    s.pushState = WorkerSubscription::PushState::Ended;
+                    endedSubsPending_ = true;
+                }
+                continue;
+            }
 
             // Task 19 (per-worker egress crypto addendum): looked up ONCE per
             // subscription-drain call (not per batch) — `cr` is shared across
@@ -3482,8 +3676,10 @@ private:
                         work += trySendFilterBindError_(s) ? 1 : 0;   // Phase 2c: an owed filter-bind error
                     else
                         work += sendPushTooLarge_(s, egressPub, sealPtr, positionOf_(s));
+                } else if (s.pushState == WorkerSubscription::PushState::EndOwed) {   // issue #109: after its last Records
+                    work += sendSubscriptionEnd_(s, egressPub, sealPtr);
                 }
-                continue;   // parked AT the undeliverable batch
+                continue;   // parked AT the undeliverable batch / ended
             }
             // Phase 2c: a FILTERED subscription is served by its FilterGroup (pushFilteredGroups_), never here.
             // One predicted branch per subscription per pass; unfiltered frames are unchanged byte for byte.
@@ -3637,6 +3833,8 @@ private:
                 }
             }
         }
+        if (endedSubsPending_) [[unlikely]] sweepEndedSubs_();   // issue #109: ended subscriptions leave after the walk
+        if (!deferredReleases_.empty()) [[unlikely]] work += serviceDeferredReleases_();   // F3: after the end frames
         return work;
     }
 
@@ -5142,6 +5340,8 @@ private:
     struct Enforcing { SessionAckSink* sink = nullptr; };
     using EnforcementMode = std::variant<NotEnforcing, Enforcing>;
     EnforcementMode enforcement_{NotEnforcing{}};
+    bool     perSessionEgressRequired_       = false;   ///< issue #118: set once before the runner starts
+    uint64_t subscribesRefusedWithoutEgress_ = 0;
     // Fix round 1 (C1b/c) — the session ack queue bound.  A = queued acks, O =
     // owed returns (reservedAckSlots_, <= kMaxOwedReturnsCeiling).  Every intake
     // step is limited by ackRoom_() = kAckCapacity − A − O (op drain:
@@ -7691,6 +7891,13 @@ private:
                     ++intakeGrantHolds_;
                     return kIngressHeld;                             // seq NOT committed: it re-opens
                 }
+                if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (answered)
+                return refuseNotAuthorized_(msg, directAck);
+            }
+            // Issue #122: a producer id is honoured only for the principal it was issued to (its owner tag; the
+            // principal is shipped with the grants) - one mask and one compare on the slot just loaded, refused
+            // whatever the producer's state (nothing to probe).
+            if (!rune::protocol::producerIdUsableByTag(msg.producerId, grants->ownerTag)) [[unlikely]] {
                 if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (answered)
                 return refuseNotAuthorized_(msg, directAck);
             }

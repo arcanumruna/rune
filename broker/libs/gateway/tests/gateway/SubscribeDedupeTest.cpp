@@ -487,7 +487,7 @@ TEST(ClientGatewayRegression, SubscribeToARuntimeTopicNeverReadsTheWorkerOwnedLo
 
 // ---------------------------------------------------------------------------
 // Phase 2c Task 5 fix round 1 (I1): P13 / E13 at the real handler.  The Subscribe filter trailer is parsed only for
-// a session that negotiated client version >= 10; a pre-v10 session's trailing bytes are IGNORED (served as today).
+// a session that negotiated client version >= 11; a pre-v11 session's trailing bytes are IGNORED (served as today).
 // ---------------------------------------------------------------------------
 namespace {
 std::vector<uint8_t> subscribeWithTail(int64_t sid, int64_t corr, const std::vector<uint8_t>& tail) {

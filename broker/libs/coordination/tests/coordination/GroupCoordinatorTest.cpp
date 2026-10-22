@@ -1347,7 +1347,8 @@ TEST(GroupCoordinator, ConcurrentJoinAndTimeout_ConsistentState) {
         << "Generation must advance after a member expires";
 }
 
-// ===========================================================================
+// ====================================================================}
+
 // Phase 2c (spec 13.3): one filter per consumer group
 // ===========================================================================
 namespace {
@@ -1432,4 +1433,48 @@ TEST(GroupCoordinatorFilterRegression, NoFilterIsAFilterValueRegression) {
     ASSERT_TRUE(filtered.admitFilter(kF1));
     (void)filtered.join("a", kDefaultTimeoutMs, kNoTopics, 0);
     EXPECT_FALSE(filtered.admitFilter({})) << "and vice versa";
+}
+
+// Issues #123 / #124: a generated member id is "<group>-<seq>-<32 hex>": 128 random bits, no heap address, unique
+// across coordinators of the same group name, and the first member is still the leader.
+TEST(GroupCoordinatorRegression, GeneratedMemberIdsAreUnguessableAndCarryNoAddressRegression) {
+    GroupCoordinator a("world-7", 0);
+    GroupCoordinator b("world-7", 0);
+    const std::string ra = a.join("", kDefaultTimeoutMs, {}, 0).memberId;
+    const std::string ra2 = a.join("", kDefaultTimeoutMs, {}, 0).memberId;
+    const std::string rb = b.join("", kDefaultTimeoutMs, {}, 0).memberId;
+    const std::string addr = std::to_string(reinterpret_cast<uintptr_t>(&a));
+    EXPECT_EQ(ra.find(addr), std::string::npos) << "the coordinator's address leaks into " << ra;
+    ASSERT_EQ(ra.rfind("world-7-1-", 0), 0u) << ra;
+    ASSERT_EQ(ra2.rfind("world-7-2-", 0), 0u) << ra2;
+    const std::string hexA = ra.substr(std::string("world-7-1-").size());
+    const std::string hexA2 = ra2.substr(std::string("world-7-2-").size());
+    const std::string hexB = rb.substr(std::string("world-7-1-").size());
+    EXPECT_EQ(hexA.size(), 32u);
+    EXPECT_EQ(hexA.find_first_not_of("0123456789abcdef"), std::string::npos);
+    EXPECT_NE(hexA, hexA2) << "successive ids share their random part";
+    EXPECT_NE(hexA, hexB) << "two coordinators of the same group mint the same id";
+    EXPECT_NE(ra, rb);
+    EXPECT_EQ(a.leaderId(), ra) << "the first member stays the leader";
+}
+
+TEST(GroupCoordinatorRegression, MemberIdEntropyIsInjectableAndRemovedMembersAreReportedRegression) {
+    GroupCoordinator gc("g", 0);
+    gc.setMemberIdEntropy([](uint8_t* out, std::size_t n) noexcept {
+        for (std::size_t i = 0; i < n; ++i) out[i] = 0xAB;
+        return true;
+    });
+    const auto r = gc.join("", kDefaultTimeoutMs, {}, 0);
+    std::string expected = "g-1-";
+    for (int i = 0; i < 16; ++i) expected += "ab";
+    EXPECT_EQ(r.memberId, expected);
+    std::vector<std::string> out;
+    gc.takeDeparted(out);
+    EXPECT_TRUE(out.empty());
+    gc.leave(r.memberId, gc.generationId(), 1);
+    EXPECT_TRUE(gc.hasDeparted());
+    gc.takeDeparted(out);
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0], r.memberId);
+    EXPECT_FALSE(gc.hasDeparted());
 }

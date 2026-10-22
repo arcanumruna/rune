@@ -1355,7 +1355,9 @@ struct Reg {
                           std::vector<rune::replication::NodeId> replicas = {1}) {
         auto dir = d.path / (std::to_string(topicId) + "_" + std::to_string(part) + "_" + std::to_string(logs.size()));
         fs::create_directories(dir);
-        logs.push_back(std::make_unique<Log>(dir.string(), 64LL * 1024 * 1024));
+        // 1 MiB segments: these replicas hold a few records, and a 64 MiB preallocation per log made the
+        // 200-partition churn test reserve ~13 GB on ext4 (fallocate allocates real blocks) - ENOSPC on the VM.
+        logs.push_back(std::make_unique<Log>(dir.string(), 1LL * 1024 * 1024));
         logs.back()->recover();
         auto r = std::make_unique<PartitionReplica>(cfg(1, 1, topicId, part), Role::Leader, 1,
             replicas, std::vector<rune::replication::NodeId>{1},
@@ -3471,7 +3473,7 @@ TEST(SegmentProvisionerRegression, OverTheCapBuildsWithoutFallocateNeverAFailure
     Reg R;
     NoopConsensus noop;
     NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
-    SegmentProvisionerAgent prov(1, /*capBytes=*/64LL * 1024 * 1024);   // room for ONE 64 MiB segment
+    SegmentProvisionerAgent prov(1, /*capBytes=*/1LL * 1024 * 1024);   // room for ONE 1 MiB segment (Reg's log size)
     prov.attachViewChannel(rt.enableProvisionerView());
     PartitionReplica* a = R.add(5, 0);
     PartitionReplica* b = R.add(5, 1);
@@ -3484,7 +3486,7 @@ TEST(SegmentProvisionerRegression, OverTheCapBuildsWithoutFallocateNeverAFailure
     EXPECT_EQ(prov.builtForTest(), 2u);
     EXPECT_EQ(prov.unpreallocatedForTest(), 1u);
     EXPECT_EQ(prov.failuresForTest(), 0u);
-    EXPECT_EQ(prov.reservedBytesForTest(), 64LL * 1024 * 1024) << "only A's segment is fallocated";
+    EXPECT_EQ(prov.reservedBytesForTest(), 1LL * 1024 * 1024) << "only A's segment is fallocated";
     EXPECT_EQ(b->log()->readyQueuedApprox(), 1u);
     EXPECT_TRUE(b->log()->readyAvailable()) << "B got a READY segment (not a failure)";
 }
@@ -3495,7 +3497,7 @@ TEST(SegmentProvisionerRegression, DepthBuildNeverOvershootsTheCapRegression) {
     Reg R;
     NoopConsensus noop;
     NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
-    SegmentProvisionerAgent prov(3, /*capBytes=*/64LL * 1024 * 1024);   // room for ONE 64 MiB segment
+    SegmentProvisionerAgent prov(3, /*capBytes=*/1LL * 1024 * 1024);   // room for ONE 1 MiB segment (Reg's log size)
     prov.attachViewChannel(rt.enableProvisionerView());
     PartitionReplica* a = R.add(5, 0);
     rt.doWork(1);
@@ -3503,7 +3505,7 @@ TEST(SegmentProvisionerRegression, DepthBuildNeverOvershootsTheCapRegression) {
     ASSERT_TRUE(postDemandForTest(prov.channel(), a->log(), Log::ProvisionDemand::Threshold));
     prov.doWork(2);
     EXPECT_EQ(prov.builtForTest(), 3u) << "the depth is still built (off the owner)";
-    EXPECT_EQ(prov.reservedBytesForTest(), 64LL * 1024 * 1024) << "only what fits the cap is fallocated";
+    EXPECT_EQ(prov.reservedBytesForTest(), 1LL * 1024 * 1024) << "only what fits the cap is fallocated";
     EXPECT_EQ(prov.unpreallocatedForTest(), 2u);
 }
 

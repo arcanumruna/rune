@@ -262,6 +262,16 @@ int GroupConsumerHub::sweepCommitSyncTimeouts(int64_t nowNs) {
             completeCommitSync_(*impl, OpStatus::Timeout);
             ++n;
         }
+        if (impl->hasCommitSync && impl->commitSync.retryDueNs >= 0) {   // #438: an UnstableOffsetCommit retry
+            GroupConsumerImpl::PendingCommitSync& p = impl->commitSync;
+            if (p.retryDueNs == 0) {
+                p.retryDueNs = nowNs + p.retryBackoffNs;
+            } else if (nowNs >= p.retryDueNs) {
+                p.retryDueNs = -1;
+                impl->commitRequested = true;   // drainCommit_ re-sends it (a fresh correlationId)
+                ++n;
+            }
+        }
     }
     return n;
 }
@@ -289,7 +299,7 @@ void GroupConsumerHub::setSessionConnected(bool connected, int64_t sessionId, in
 void GroupConsumerHub::closeStatus_(GroupConsumerImpl& impl) {
     if (impl.status.producerClosed()) return;
     // Final snapshot (the reserve guarantees it fits), THEN close.
-    (void)impl.status.publishFinal(GroupConsumerStatus{impl.generationId, static_cast<int32_t>(impl.failReason)});
+    (void)impl.status.publishFinal(statusOf_(impl, static_cast<int32_t>(impl.failReason)));
     impl.status.close();
 }
 
@@ -383,8 +393,22 @@ void GroupConsumerHub::toRejoining_(GroupConsumerImpl& impl) {
     completeRewind_(impl, OpStatus::Rejoined);
 }
 
+/*static*/
+GroupConsumerStatus GroupConsumerHub::statusOf_(const GroupConsumerImpl& impl, int32_t reserved) noexcept {
+    GroupConsumerStatus st;
+    st.generationId = impl.generationId;
+    st.reserved     = reserved;
+    // #125: a member id longer than a snapshot carries is published empty (groupMetadata() then names no member and
+    // the coordinator answers UnknownMember) - never truncated into another id.
+    if (impl.memberId.size() <= kMaxGroupMemberIdBytes) {
+        st.memberIdLen = static_cast<uint16_t>(impl.memberId.size());
+        std::memcpy(st.memberId, impl.memberId.data(), impl.memberId.size());
+    }
+    return st;
+}
+
 void GroupConsumerHub::publishGeneration_(GroupConsumerImpl& impl) {
-    if (impl.status.tryPublish(GroupConsumerStatus{impl.generationId, 0})) {
+    if (impl.status.tryPublish(statusOf_(impl, 0))) {
         if (impl.statusDirty) { impl.statusDirty = false; --dirtyCount_; }
     } else if (!impl.status.closed() && !impl.statusDirty) {
         impl.statusDirty = true;
@@ -1083,9 +1107,18 @@ bool GroupConsumerHub::onFetchSubscribeResponse(int64_t corrId, int16_t errorCod
                 refuse_(*impl, GroupFailReason::RefusedByBroker);
                 return true;
             }
+            // PR #441 F4: the broker cannot build this session's record stream (RecordEgressUnavailable): retried
+            // after fresh metadata like any refusal, but within a small budget (reset by a bind), then the consumer
+            // ends explicitly - never an endless re-subscribe.  Routing refusals (NotLeader / Redirect) stay unbounded.
+            if (errorCode == static_cast<int16_t>(rpc::ErrorCode::RecordEgressUnavailable) &&
+                ++fs.egressRefusals > kMaxEgressRefusalsWithoutBind) {
+                refuse_(*impl, GroupFailReason::RetryBudgetExhausted);
+                return true;
+            }
             if (errorCode == 0) {
                 fs.subscriptionId = subscriptionId;
                 fs.redirects      = 0;
+                fs.egressRefusals = 0;   // F4: bound
             } else {
                 fs.epoch        = 0;     // nothing registered (UnknownTopic / UnknownPartition / ...)
                 fs.brokerSid    = 0;
@@ -1499,6 +1532,7 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
                 fs.subscriptionId = rv.subscriptionId;  // bound by its first push
                 fs.corrId         = 0;
                 fs.redirects      = 0;
+                fs.egressRefusals = 0;   // F4: bound
             } else if (rv.subscriptionId != fs.subscriptionId) {
                 continue;
             }
@@ -1825,9 +1859,20 @@ void GroupConsumerHub::onOffsetCommitResponse(const uint8_t* buf, std::size_t le
             continue;
         }
         int16_t err = 0;
+        bool    unstable = false;
         for (std::size_t i = 0; i < opt->results.size(); ++i) {
             const auto r = opt->results[i];
+            if (r.errorCode == static_cast<int16_t>(rpc::ErrorCode::UnstableOffsetCommit)) { unstable = true; continue; }
             if (r.errorCode != 0) { err = r.errorCode; break; }
+        }
+        if (err == 0 && unstable) {
+            // #438: a transaction holds a key of this commit - re-sent after a backoff (20 ms doubling to 1 s, armed
+            // on the duty clock by sweepCommitSyncTimeouts), never surfaced; the commitSync deadline still bounds it.
+            impl->commitSyncCorrId = 0;
+            impl->commitSync.retryBackoffNs = impl->commitSync.retryBackoffNs == 0
+                ? kCommitRetryMinNs : std::min<int64_t>(impl->commitSync.retryBackoffNs * 2, kCommitRetryMaxNs);
+            impl->commitSync.retryDueNs = 0;   // armed by the next sweep
+            break;
         }
         if (err != 0) {
             completeCommitSync_(*impl, OpStatus::BrokerError, static_cast<uint16_t>(err));
@@ -1862,6 +1907,7 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
         GroupFailReason refusedWhy = GroupFailReason::RefusedByBroker;
         bool rejoin = false;
         bool retriableError = false;
+        bool unstable = false;   // #438: an unfinished transaction holds the key - waited out, never a budget
         // (#1a) Seed positions from committed offsets.
         // We seed unconditionally for partitions that are still at the sentinel
         // (-1 = never seeded) OR that haven't received any Records yet (still
@@ -1876,6 +1922,13 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
                 // (paced by retryOffsetFetch) within kMaxOffsetFetchAttempts.
                 const auto ec = static_cast<rpc::ErrorCode>(static_cast<uint16_t>(r.errorCode));
                 const GroupVerdict v = classifyGroupAnswer_(ec);
+                // #438 (client version 10): the committed offset is about to change (a transaction holds the
+                // key until it completes) - re-fetched after the usual pacing; it ends on its own (the
+                // transaction completes or times out), so it is not charged to kMaxOffsetFetchAttempts.
+                if (ec == rpc::ErrorCode::UnstableOffsetCommit && r.topicId >= 0) {
+                    unstable = true;
+                    continue;
+                }
                 if (r.topicId < 0 || v == GroupVerdict::Refuse) {
                     refused = true;
                     if (v == GroupVerdict::Refuse) refusedWhy = refusalFor_(ec);
@@ -1922,6 +1975,7 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
         }
         // The coordinator served this fetch: the NotCoordinator streak ends.
         impl->offsetFetchRejoins = 0;
+        (void)unstable;   // its partitions stay offsetKnown = false: retryOffsetFetch re-sends them, paced
         if (retriableError && impl->offsetFetchCountedCorr != opt->correlationId) {
             // Fix round 3: one budget attempt per OffsetFetch (a duplicate answer
             // of the same fetch is not counted twice; seeding stays idempotent).

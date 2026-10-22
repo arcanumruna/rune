@@ -36,6 +36,10 @@ enum class SessionSignalKind : int64_t {
     /// ::partition = the worker, ::sessionId unused.  Paced (<= one per second, only when it changed).  The runtime
     /// folds the per-worker counts into counter 1'000'235 - the worker owns its crypto, nothing is shared.
     PeerFrameDrops = 9,
+    /// Issues #109 / #196: NOT a session signal - the worker executed an enforcement fence: every op queued before
+    /// it on that ring is done.  WorkerReturn::baseOffset = the fence sequence number, ::partition = the worker,
+    /// ::sessionId = the ring (0 = op ring, 1 = session-lifecycle ring).  Never dropped (enqueueSignal_).
+    FenceAck = 10,
 };
 
 } // namespace rune::node

@@ -124,6 +124,20 @@ The generated struct is named after the schema in PascalCase and has typed membe
 `kBlockLength`, `kVersion`, `kFingerprint`, `kSchemaName`, `descriptor()`. A schema with a key field also gets `key()`,
 which `TypedTopic::send` routes by.
 
+`generateHeader(evolving, version)` takes the topic's evolving descriptor (what `rune schema generate` fetches), so
+the type reads records of **every** version by the record's own version: a Drop moves the fields after it, and each
+field reads right or absent, never shifted. Versions up to `kVersion` need nothing; a record of a later version needs
+the topic's lineage, fetched once:
+
+```cpp
+auto lin = client.lineageAndWait<game::gen::Player>("player");   // T::Lineage, cold
+game::gen::Player p;
+if (!p.decode(record.value, lin)) { /* a version newer than the lineage: fetch it again */ }
+game::gen::Player::Decoder d(record.value, lin);                  // zero-copy; d.known()
+```
+
+`decode` returns false (every member at its default) for a version it cannot place.
+
 ### Filters
 
 For every filterable field the generated struct also gets a nested `Filter` (filter by example) used by

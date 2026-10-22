@@ -2704,3 +2704,229 @@ TEST_F(GroupConsumerHubTest, AFrameWhoseOnlyBatchIsCorruptMovesNothingRegression
     EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, kPartition}), 10);
     EXPECT_EQ(hub_->malformedBatches(), 1u);
 }
+
+// PR #441 F1/F4 (issue #118, the group half): a partition fetch an authenticating broker can NEVER serve (the
+// session's own record egress to this client cannot be built) is answered SubscribeResponse{RecordEgressUnavailable}
+// on every re-subscribe.  The consumer ends explicitly (RetryBudgetExhausted) after a small bounded number of those,
+// instead of parking / re-subscribing forever with no records and no error.  RED before: no bound at all.
+TEST_F(GroupConsumerHubTest, AFetchRefusedForeverWithoutABindEndsTheConsumerExplicitlyRegression) {
+    FakeFetchRouter fr;
+    fr.leader = {{0, 0u}, {1, 0u}};
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+    auto ofr = makeOffsetFetchResponse(kTopicId, 1, 0);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    constexpr auto kEgress = static_cast<int16_t>(rpc::ErrorCode::RecordEgressUnavailable);
+    int refusals = 0;
+    for (int round = 0; round < 1000 && impl_->active; ++round) {
+        std::vector<rune::client::codec::SubscribeView> subs;
+        for (const auto& v : fr.subscribes(0)) if (v.partition == 1) subs.push_back(v);
+        ASSERT_FALSE(subs.empty()) << "round " << round << ": the fetch is re-subscribed after each refusal";
+        ASSERT_TRUE(hub_->onFetchSubscribeResponse(subs.back().correlationId, kEgress, 0));
+        ++refusals;
+        hub_->unparkFetch();          // fresh metadata
+        (void)hub_->reconcileFetch();
+    }
+    EXPECT_FALSE(impl_->active) << "the consumer ends instead of looping";
+    EXPECT_EQ(impl_->failReason, GroupFailReason::RetryBudgetExhausted) << "explicit, visible reason";
+    EXPECT_EQ(refusals, GroupConsumerHub::kMaxEgressRefusalsWithoutBind + 1);
+}
+
+// Positive control: RecordEgressUnavailable answers separated by binds (an egress that recovers) never exhaust it.
+TEST_F(GroupConsumerHubTest, FetchRefusalsSeparatedByABindNeverEndTheConsumerRegression) {
+    FakeFetchRouter fr;
+    fr.leader = {{0, 0u}, {1, 0u}};
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+    auto ofr = makeOffsetFetchResponse(kTopicId, 1, 0);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    constexpr auto kEgress = static_cast<int16_t>(rpc::ErrorCode::RecordEgressUnavailable);
+    for (int round = 0; round < 8 * GroupConsumerHub::kMaxEgressRefusalsWithoutBind; ++round) {
+        std::vector<rune::client::codec::SubscribeView> subs;
+        for (const auto& v : fr.subscribes(0)) if (v.partition == 1) subs.push_back(v);
+        ASSERT_FALSE(subs.empty());
+        const auto sub = subs.back();
+        if (round % 4 == 3) {
+            ASSERT_TRUE(hub_->onFetchSubscribeResponse(sub.correlationId, 0, 900 + round));   // bound
+            int32_t t = -1, p = -1;   // ... then its node stops serving it (a demotion): a routing refusal
+            (void)hub_->onFetchSubscribeRefused(sub.correlationId, /*park=*/true, t, p);
+        } else {
+            ASSERT_TRUE(hub_->onFetchSubscribeResponse(sub.correlationId, kEgress, 0));
+        }
+        hub_->unparkFetch();
+        (void)hub_->reconcileFetch();
+    }
+    EXPECT_TRUE(impl_->active);
+}
+
+// PR #441 re-check adversarial (the 32-refusal bound vs a legitimately slow failover): a partition with NO leader for a
+// while - its only replica's broker restarting, or an election plus the controller's leader move - is answered NotLeader
+// on every fetch re-subscribe.  The client drives one re-subscribe per fresh metadata answer (an urgent ask at most every
+// 100 ms, kUrgentMetadataMinGapNs; the backoff resets on every answer), so a 10 s outage is ~100 refusals of a fetch that
+// has not bound yet.  The consumer must survive it and bind once a leader appears: a failover is not an error.
+TEST_F(GroupConsumerHubTest, ATenSecondLeaderlessFailoverNeverEndsTheConsumerAdversarialRegression) {
+    FakeFetchRouter fr;
+    fr.leader = {{0, 0u}, {1, 0u}};
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+    auto ofr = makeOffsetFetchResponse(kTopicId, 1, 0);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    constexpr int kMetadataAnswersIn10s = 100;   // one per 100 ms
+    for (int answer = 0; answer < kMetadataAnswersIn10s && impl_->active; ++answer) {
+        std::vector<rune::client::codec::SubscribeView> subs;
+        for (const auto& v : fr.subscribes(0)) if (v.partition == 1) subs.push_back(v);
+        ASSERT_FALSE(subs.empty()) << "answer " << answer;
+        int32_t t = -1, p = -1;
+        (void)hub_->onFetchSubscribeRefused(subs.back().correlationId, /*park=*/true, t, p);   // still no leader
+        hub_->unparkFetch();          // the next metadata answer
+        (void)hub_->reconcileFetch();
+    }
+    EXPECT_TRUE(impl_->active) << "a 10 s leaderless failover ended the group consumer (RetryBudgetExhausted)";
+    std::vector<rune::client::codec::SubscribeView> subs;
+    for (const auto& v : fr.subscribes(0)) if (v.partition == 1) subs.push_back(v);
+    ASSERT_FALSE(subs.empty());
+    EXPECT_TRUE(hub_->onFetchSubscribeResponse(subs.back().correlationId, 0, 4242)) << "the new leader binds it";
+}
+
+// PR #441 F4 version skew, the group half: a group hub that does not know a refusal code parks the fetch and retries it
+// after fresh metadata, without a bound (the pre-#441 behaviour for every non-auth code).  An OLDER client therefore
+// re-subscribes forever on RecordEgressUnavailable (noted on the PR and #118; no compatibility gate by ruling); this
+// pins that behaviour for an unknown code, so a change to it is a decision, not an accident.
+TEST_F(GroupConsumerHubTest, AnUnknownFetchRefusalCodeIsParkedAndRetriedWithoutABoundRegression) {
+    FakeFetchRouter fr;
+    fr.leader = {{0, 0u}, {1, 0u}};
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+    auto ofr = makeOffsetFetchResponse(kTopicId, 1, 0);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    for (int round = 0; round < 100; ++round) {
+        std::vector<rune::client::codec::SubscribeView> subs;
+        for (const auto& v : fr.subscribes(0)) if (v.partition == 1) subs.push_back(v);
+        ASSERT_FALSE(subs.empty());
+        ASSERT_TRUE(hub_->onFetchSubscribeResponse(subs.back().correlationId, /*unknown*/ 250, 0));
+        hub_->unparkFetch();
+        (void)hub_->reconcileFetch();
+    }
+    EXPECT_TRUE(impl_->active) << "an unknown code is retried, not bounded (an older client on code 49 loops)";
+}
+
+// ===========================================================================
+// Issue #438 (client version 10): UnstableOffsetCommit - a transaction holds the key - is waited out: an OffsetFetch
+// answered 50 is re-fetched without spending the retry budget, a commitSync answered 50 is re-sent after a backoff on
+// the duty clock; neither is surfaced.  Issue #125: groupMetadata() names the member of the current generation.
+// ===========================================================================
+namespace {
+std::vector<uint8_t> makeOffsetFetchError(int64_t corr, int16_t code) {
+    rpc::OffsetFetchResult r;
+    r.topicId = kTopicId; r.partition = kPartition; r.offset = -1; r.errorCode = code;
+    rpc::OffsetFetchResponse msg;
+    msg.sessionId = kSessionId; msg.correlationId = corr;
+    std::vector<uint8_t> buf(rpc::OffsetFetchResponse::encodedSizeFor(1));
+    msg.encode(buf.data(), std::span<const rpc::OffsetFetchResult>(&r, 1));
+    return buf;
+}
+}  // namespace
+
+TEST_F(GroupConsumerHubTest, UnstableOffsetFetchAnswersNeverSpendTheRetryBudgetRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    for (int i = 0; i < 32; ++i) {   // 4x the budget (kMaxOffsetFetchAttempts = 8)
+        impl_->offsetFetchCorrId = 9'000 + i;   // each answer is to a fresh (re-sent) fetch
+        const auto f = makeOffsetFetchError(impl_->offsetFetchCorrId,
+                                            static_cast<int16_t>(rpc::ErrorCode::UnstableOffsetCommit));
+        hub_->onOffsetFetchResponse(f.data(), f.size());
+        ASSERT_TRUE(impl_->active) << "answer " << i << " ended the consumer: " << static_cast<int>(impl_->failReason);
+    }
+    EXPECT_EQ(impl_->offsetFetchAttempts, 0u);
+    EXPECT_EQ(impl_->state, GroupConsumerState::Stable) << "a held key is not a rebalance";
+    EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, kPartition}), GroupConsumerImpl::kUnseededSentinel)
+        << "an unstable answer seeded a position";
+    // The control: a retriable error that IS budgeted ends the consumer after the budget (the mutation the 50 rule
+    // guards against).
+    for (int i = 0; i <= 8 && impl_->active; ++i) {
+        impl_->offsetFetchCorrId = 19'000 + i;
+        const auto f = makeOffsetFetchError(impl_->offsetFetchCorrId, static_cast<int16_t>(rpc::ErrorCode::NotLeader));
+        hub_->onOffsetFetchResponse(f.data(), f.size());
+    }
+    EXPECT_FALSE(impl_->active);
+    EXPECT_EQ(impl_->failReason, GroupFailReason::RetryBudgetExhausted);
+}
+
+TEST_F(GroupConsumerHubTest, CommitSyncAnsweredUnstableIsResentAfterABackoffOnTheDutyClockRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 7);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    auto op = commitSyncOp(gc);
+    int64_t now = 1'000'000'000;
+    hub_->doWork(now, kSessionId, sink_.fn());
+    const int64_t corr1 = lastCommitCorrId(sink_);
+    ASSERT_NE(corr1, 0);
+    const auto unstable = static_cast<int16_t>(rpc::ErrorCode::UnstableOffsetCommit);
+    auto r1 = makeOffsetCommitResponse(corr1, unstable);
+    hub_->onOffsetCommitResponse(r1.data(), r1.size());
+    EXPECT_FALSE(op.ready()) << "UnstableOffsetCommit was surfaced";
+    (void)hub_->sweepCommitSyncTimeouts(now);              // arms the retry: now + 20 ms
+    hub_->doWork(now, kSessionId, sink_.fn());
+    EXPECT_EQ(lastCommitCorrId(sink_), corr1) << "re-sent without a backoff";
+    now += GroupConsumerHub::kCommitRetryMinNs;
+    (void)hub_->sweepCommitSyncTimeouts(now);
+    hub_->doWork(now, kSessionId, sink_.fn());
+    const int64_t corr2 = lastCommitCorrId(sink_);
+    ASSERT_NE(corr2, corr1) << "never re-sent";
+    // A second 50: the backoff doubles.
+    auto r2 = makeOffsetCommitResponse(corr2, unstable);
+    hub_->onOffsetCommitResponse(r2.data(), r2.size());
+    (void)hub_->sweepCommitSyncTimeouts(now);
+    now += GroupConsumerHub::kCommitRetryMinNs;
+    (void)hub_->sweepCommitSyncTimeouts(now);
+    hub_->doWork(now, kSessionId, sink_.fn());
+    EXPECT_EQ(lastCommitCorrId(sink_), corr2) << "the second retry did not back off further";
+    now += GroupConsumerHub::kCommitRetryMinNs;
+    (void)hub_->sweepCommitSyncTimeouts(now);
+    hub_->doWork(now, kSessionId, sink_.fn());
+    const int64_t corr3 = lastCommitCorrId(sink_);
+    ASSERT_NE(corr3, corr2);
+    auto ok = makeOffsetCommitResponse(corr3);
+    hub_->onOffsetCommitResponse(ok.data(), ok.size());
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::Ok);
+    EXPECT_EQ(op.times(), 1);
+}
+
+TEST_F(GroupConsumerHubTest, CommitSyncAnsweredUnstableStillTimesOutAtItsDeadlineRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 7);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    auto op = commitSyncOp(gc);
+    int64_t now = 1'000'000'000;
+    for (int i = 0; i < 200 && !op.ready(); ++i) {
+        hub_->doWork(now, kSessionId, sink_.fn());
+        const int64_t corr = lastCommitCorrId(sink_);
+        if (corr != 0 && impl_->commitSyncCorrId == corr) {
+            auto r = makeOffsetCommitResponse(corr, static_cast<int16_t>(rpc::ErrorCode::UnstableOffsetCommit));
+            hub_->onOffsetCommitResponse(r.data(), r.size());
+        }
+        now += 500'000'000;   // 0.5 s of duty clock per pass
+        (void)hub_->sweepCommitSyncTimeouts(now);
+    }
+    ASSERT_TRUE(op.ready()) << "a key held for ever left the commitSync pending for ever";
+    EXPECT_EQ(op.status(), OpStatus::Timeout);
+}
+
+TEST_F(GroupConsumerHubTest, GroupMetadataNamesTheMemberOfTheCurrentGenerationRegression) {
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    auto before = gc.groupMetadata();
+    EXPECT_EQ(before.groupId, "test-group");
+    EXPECT_TRUE(before.memberId.empty()) << "a member before the first join";
+    bringToStable(*hub_, sink_, kTopicId, kPartition, /*genId=*/4, "test-group-1-abcdef");
+    const auto m = gc.groupMetadata();   // app side: the published snapshot
+    EXPECT_EQ(m.groupId, "test-group");
+    EXPECT_EQ(m.generationId, 4);
+    EXPECT_EQ(m.memberId, "test-group-1-abcdef");
+    // A rejoin with a new member id and generation is published too.
+    auto jgr = makeJoinGroupResponseOK(5, "test-group-2-012345");
+    impl_->state = GroupConsumerState::Joining;
+    hub_->onJoinGroupResponse(jgr.data(), jgr.size(), kSessionId, sink_.fn());
+    const auto m2 = gc.groupMetadata();
+    EXPECT_EQ(m2.generationId, 5);
+    EXPECT_EQ(m2.memberId, "test-group-2-012345");
+}

@@ -49,6 +49,7 @@
 // the Aeron ClientConductor ARE thread-safe, but resolvePending() is only ever
 // called from send() on that same duty-cycle thread anyway.
 
+#include <rune/consensus/IngressRing.h>   // kMaxConsensusFrameBytes (#254)
 #include <rune/consensus/MessageSink.h>
 #include <rune/consensus/Types.h>
 
@@ -140,13 +141,15 @@ public:
         const auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
         return c ? c->drops() : 0u;
     }
-    /// The largest consensus frame a sealed sink carries (the ingress ring's maximum message is 8 KiB).
-    static constexpr std::size_t kMaxSealedPayload = 16 * 1024;
+    /// The largest consensus frame a sealed sink carries: the receiver's ingress ring maximum (#254).
+    static constexpr std::size_t kMaxSealedPayload = rune::consensus::kMaxConsensusFrameBytes;
 
     /// Test-only: number of peer publications still unresolved (runs one resolve probe).
     [[nodiscard]] int unresolvedForTest() noexcept { return resolvePending(); }
     /// Test-only: registrations issued after the first one per peer.
     [[nodiscard]] uint64_t reAddsForTest() const noexcept { return reAdds_; }
+    /// Test seam (issue #111), the sending thread only: while set nothing is sent to any peer.
+    void setPartitionedForTest(bool on) noexcept { partitionedForTest_ = on; }
 
     UdpMessageSink(const UdpMessageSink&)            = delete;
     UdpMessageSink& operator=(const UdpMessageSink&) = delete;
@@ -158,6 +161,7 @@ public:
               const uint8_t*          buf,
               std::size_t             len) override
     {
+        if (partitionedForTest_) [[unlikely]] return;   // issue #111 seam: this node reaches no peer
         // Self-healing resolution: one non-blocking probe per unresolved peer.
         // Cheap when everything is already resolved (early-outs on peer.pub).
         resolvePending();
@@ -334,6 +338,7 @@ private:
 
     int      unresolved_ = 1;   // > 0 until a resolvePending pass finds every peer resolved
     uint64_t reAdds_     = 0;
+    bool     partitionedForTest_ = false;   // issue #111 test seam (sending thread)
     rune::consensus::PeerResolutionInbox inbox_;   // consensus duty thread: resolution events
 
     std::shared_ptr<aeron::Aeron> aeron_;

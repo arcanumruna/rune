@@ -195,9 +195,10 @@ TEST(CoordinatorRedirectRegression, CoordinatorAnswerIsQueuedUnderBackpressureRe
 }
 
 
-// Fix round 2 (I3): 0 is "deferred" ONLY for EndTxn; a 0 from any other txn
-// handler is answered Internal, never silently treated as deferred.
-TEST(CoordinatorRedirectRegression, NonEndTxnZeroAnswerIsAnsweredInternalRegression) {
+// #358 class (supersedes fix round 2 I3): 0 is "deferred" for EVERY txn handler - the service parks an answer until
+// the __transaction_state record it depends on commits and sends it later (or NotCoordinator on unload).  The gateway
+// therefore never answers it Internal (that would be an answer the coordinator has not given).
+TEST(CoordinatorRedirectRegression, NonEndTxnZeroAnswerIsDeferredNotInternalRegression) {
     Rig r(LeaderView{/*isLeader=*/true, ""});
     pc::AddOffsetsToTxn q; q.sessionId = r.sid; q.correlationId = 47; q.producerId = 1; q.producerEpoch = 0;
     const std::string t = "tx", g = "g";
@@ -205,14 +206,15 @@ TEST(CoordinatorRedirectRegression, NonEndTxnZeroAnswerIsAnsweredInternalRegress
     q.groupId = {reinterpret_cast<const uint8_t*>(g.data()), g.size()};
     std::vector<uint8_t> f(256);
     f.resize(q.encode(f.data()));
+    const std::size_t before = r.out.size();
     r.gw.applyTxnForTest(f.data(), f.size(), static_cast<uint16_t>(pc::TemplateId::AddOffsetsToTxn));
     EXPECT_EQ(r.txn.calls, 1);
-    std::optional<pc::AddOffsetsToTxnResponse> resp;
-    for (auto it = r.out.rbegin(); it != r.out.rend() && !resp; ++it)
-        resp = pc::AddOffsetsToTxnResponse::decode(it->data(), it->size());
-    ASSERT_TRUE(resp.has_value()) << "a non-EndTxn 0 was read as deferred and never answered";
-    EXPECT_EQ(resp->correlationId, 47);
-    EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::Internal));
+    for (std::size_t k = before; k < r.out.size(); ++k) {
+        const auto resp = pc::AddOffsetsToTxnResponse::decode(r.out[k].data(), r.out[k].size());
+        EXPECT_FALSE(resp.has_value()) << "a deferred answer was answered by the gateway itself";
+        const auto e = pc::ErrorResponse::decode(r.out[k].data(), r.out[k].size());
+        EXPECT_FALSE(e.has_value() && e->code == static_cast<int16_t>(pc::ErrorCode::Internal));
+    }
 }
 
 } // namespace

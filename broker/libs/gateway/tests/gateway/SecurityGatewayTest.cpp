@@ -43,7 +43,7 @@ struct RecordingSink final : IAdminRequestSink {
     std::string lastAuthenticated;
     AdminSubmit submitDefineTopic(int64_t, int64_t, std::string_view, uint32_t, std::string_view, bool, const uint8_t*,
                                   uint32_t, uint8_t, int16_t, const rune::protocol::TopicConfigView&,
-                                  const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
+                                  const DdlMetaView&, std::string_view) override { ++otherSubmits; return AdminSubmit::Accepted; }
     bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t) override { return true; }
     AdminSubmit submitAlterTopic(int64_t, int64_t, std::string_view, uint16_t, const uint8_t*, uint32_t,
                                  const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
@@ -57,7 +57,11 @@ struct RecordingSink final : IAdminRequestSink {
                                 uint32_t, const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
     bool submitCatalogSubscribe(int64_t s, int64_t c, int64_t) override { catSubs.push_back({s, c}); return true; }
     bool submitCatalogUnsubscribe(int64_t s, int64_t id) override { catUnsubs.push_back({s, id}); return true; }
-    AdminSubmit submitSecurityDdl(const pc::SecurityDdl&, const DdlMetaView& m) override {
+    /// `securityDdls` counts the AUTHORIZED forwards; a denied one (PR #410 review F1: forwarded with the gateway's
+    /// verdict, which the leader answers) is recorded in `denied` by correlation id.
+    std::map<int64_t, std::string> denied;
+    AdminSubmit submitSecurityDdl(const pc::SecurityDdl& w, const DdlMetaView& m, std::string_view denial, bool) override {
+        if (!denial.empty()) { denied[w.correlationId] = std::string(denial); return AdminSubmit::Accepted; }
         ++securityDdls; lastAuthenticated = std::string(m.authenticated); return AdminSubmit::Accepted;
     }
     AdminSubmit submitSecurityBootstrap(const pc::SecurityBootstrap&, const DdlMetaView&) override { ++bootstraps; return AdminSubmit::Accepted; }
@@ -501,4 +505,31 @@ TEST(AuthLoginRegression, MalformedFirstLegLogLinesAreRateLimitedRegression) {
     for (const std::string& l : rig.logSink->last_formatted()) if (l.find("reason=malformed") != std::string::npos) ++lines;
     EXPECT_EQ(lines, 2) << "first and 1025th only";
     EXPECT_EQ(rig.gw.unauthLogSuppressed(), static_cast<uint64_t>(kFlood - 2));
+}
+
+// Adversarial review of PR #459 (issue #15): a wiped / new broker catching up has an EMPTY replica - its view says
+// "never bootstrapped" - but the cluster may have been bootstrapped long ago.  A valid bootstrap proof (the key is the
+// cluster's) sent through the pre-auth gate must not reach the admin thread while the broker is not current, and a
+// fresh connect is never told Anonymous; once current, the same frame is forwarded.
+TEST(SecurityBootstrapRegression, AValidBootstrapOnACatchingUpBrokerIsNeverForwardedAdversarialRegression) {
+    Rig rig;
+    SecurityView open{rune::security::SecurityState{}};
+    rig.gw.setAuthMode(GatewayAuthMode::Required, &open);
+    rig.gw.setClusterKeys(keysFor(kA));
+    rig.gw.setSecurityServing(false);
+    rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{INT64_MAX});
+    EXPECT_EQ(rig.gw.connectAuthStateForTest(), pc::AuthState::MustAuthenticate);
+    for (int64_t corr : {50, 51}) {   // via the pre-auth gate and via the DDL route
+        const BootFrame good(rig.sid, corr, kA);
+        if (corr == 50) rig.gw.applyClientFrameForTest(good.bytes.data(), good.bytes.size());
+        else rig.gw.applyDdlFrameForTest(good.bytes.data(), good.bytes.size());
+        EXPECT_EQ(rig.admin.bootstraps, 0) << corr << ": never forwarded while not current";
+        const Seen* a = rig.answerFor(corr);
+        ASSERT_NE(a, nullptr) << corr << ": answered, never hung";
+        EXPECT_EQ(a->code, static_cast<int16_t>(pc::ErrorCode::AuthUnavailable)) << corr;
+    }
+    rig.gw.setSecurityServing(true);
+    const BootFrame good(rig.sid, 52, kA);
+    rig.gw.applyClientFrameForTest(good.bytes.data(), good.bytes.size());
+    EXPECT_EQ(rig.admin.bootstraps, 1) << "current again: forwarded";
 }

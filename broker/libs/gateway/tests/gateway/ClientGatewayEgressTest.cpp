@@ -651,7 +651,7 @@ TEST(ClientGatewayEgressRegression, OldClientMalformedJoinGroupIsAnsweredProtoco
 
 // Phase 2c Task 5 fix round 1 (I1, P13 / E13): the JoinGroup filter trailer is parsed only for a session of client
 // version >= 10.  The gateway hands the coordinator the session's negotiated version, and its own old-client
-// decode check (< v5) and authorization decode use it too - a pre-v10 session's trailing bytes are ignored.
+// decode check (< v5) and authorization decode use it too - a pre-v11 session's trailing bytes are ignored.
 TEST(GatewayFilterWireRegression, JoinGroupDecodeIsGatedOnTheSessionsClientVersionRegression)
 {
     struct Recorder final : IGroupRequestHandler {
@@ -717,7 +717,7 @@ TEST(GatewayFilterWireRegression, JoinGroupDecodeIsGatedOnTheSessionsClientVersi
     EXPECT_EQ(svc.calls, 3);
     EXPECT_EQ(svc.lastVersion, 4);
 
-    // A v10 session gets the filter; a v10 stray byte is a decode failure answered InvalidRequest.
+    // A v11 session gets the filter; a v11 stray byte is a decode failure answered InvalidRequest.
     f = frameFor(v10, true, {});
     gw.applyGroupForTest(f.data(), f.size(), pc::JoinGroup::TEMPLATE_ID);
     EXPECT_EQ(svc.calls, 4);

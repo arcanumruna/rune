@@ -913,6 +913,7 @@ struct Parser {
         } else if (isKw("disable")) {
             advance();
             a.change = AlterUserDef::Change::Disable;
+            a.force = acceptForce();
         } else if (isKw("enable")) {
             advance();
             a.change = AlterUserDef::Change::Enable;
@@ -975,10 +976,11 @@ struct Parser {
             if (!u) return std::unexpected(std::move(u.error()));
             auto user = parseName("user name");
             if (!user) return std::unexpected(std::move(user.error()));
+            const bool force = !grant && acceptForce();
             auto semi = expect(TK::Semi, ";");
             if (!semi) return std::unexpected(std::move(semi.error()));
             if (grant) return Statement(std::in_place_type<GrantRoleDef>, GrantRoleDef{std::move(*role), std::move(*user)});
-            return Statement(std::in_place_type<RevokeRoleDef>, RevokeRoleDef{std::move(*role), std::move(*user)});
+            return Statement(std::in_place_type<RevokeRoleDef>, RevokeRoleDef{std::move(*role), std::move(*user), force});
         }
         auto op = parseOperation();
         if (!op) return std::unexpected(std::move(op.error()));
@@ -992,10 +994,18 @@ struct Parser {
         if (!who) return std::unexpected(std::move(who.error()));
         auto n = parseName(*who == Grantee::User ? "user name" : "role name");
         if (!n) return std::unexpected(std::move(n.error()));
+        const bool force = !grant && acceptForce();
         auto semi = expect(TK::Semi, ";");
         if (!semi) return std::unexpected(std::move(semi.error()));
         if (grant) return Statement(std::in_place_type<GrantDef>, GrantDef{*op, std::move(*res), *who, std::move(*n)});
-        return Statement(std::in_place_type<RevokeDef>, RevokeDef{*op, std::move(*res), *who, std::move(*n)});
+        return Statement(std::in_place_type<RevokeDef>, RevokeDef{*op, std::move(*res), *who, std::move(*n), force});
+    }
+
+    /// Issue #121: an optional trailing FORCE (DISABLE / DROP USER / DROP ROLE / REVOKE): consumed when present.
+    bool acceptForce() noexcept {
+        if (!isKw("force")) return false;
+        advance();
+        return true;
     }
 
     // at "grants"
@@ -1070,10 +1080,11 @@ struct Parser {
             advance();
             auto n = parseName(isUser ? "user name" : "role name");
             if (!n) return std::unexpected(std::move(n.error()));
+            const bool force = acceptForce();
             auto semi = expect(TK::Semi, ";");
             if (!semi) return std::unexpected(std::move(semi.error()));
-            if (isUser) return Statement(std::in_place_type<DropUserDef>, DropUserDef{std::move(*n)});
-            return Statement(std::in_place_type<DropRoleDef>, DropRoleDef{std::move(*n)});
+            if (isUser) return Statement(std::in_place_type<DropUserDef>, DropUserDef{std::move(*n), force});
+            return Statement(std::in_place_type<DropRoleDef>, DropRoleDef{std::move(*n), force});
         }
         const bool isTopic = isKw("topic");
         if (!isTopic && !isKw("view")) {

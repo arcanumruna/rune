@@ -8,6 +8,9 @@
 #include <rune/coordination/GroupCoordinator.h>
 
 #include <algorithm>
+#include <array>
+#include <cstring>
+#include <random>
 #include <cassert>
 #include <cctype>
 #include <cstdint>
@@ -277,21 +280,31 @@ int GroupCoordinator::doWork(int64_t nowNs)
 
 std::string GroupCoordinator::generateMemberId()
 {
-    // Incorporate the GLOBAL atomic seq so that memberIds are unique across
-    // multiple GroupCoordinator instances in the same process.  Without this,
-    // two coordinators with the same groupId produce identical ids
-    // ("grp-1", "grp-2", ...).
-    //
-    // Format: "<groupId>-g<globalSeq>-<localSeq>"
-    //   globalSeq: monotonically increasing across ALL coordinators in the process.
-    //   localSeq:  per-instance counter (extra disambiguation + readability).
-    // [[rune-shared-nothing-law]] step 4: no process-global atomic counter.
-    // Cross-instance uniqueness comes from this coordinator's address (distinct
-    // for every live instance in the process, including multiple in-process nodes
-    // on different threads); local disambiguates successive joins within it.
-    uint64_t local          = ++memberSeq_;
-    uintptr_t instanceTag   = reinterpret_cast<uintptr_t>(this);
-    return groupId_ + "-g" + std::to_string(instanceTag) + "-" + std::to_string(local);
+    // Issues #123 / #124: "<groupId>-<seq>-<32 hex digits>".  The per-instance
+    // counter keeps successive joins ordered (the first member stays the
+    // smallest id under memberIdLess, so leader election is unchanged); the 128
+    // random bits make an id unguessable from any other id.  No heap address
+    // and no process-global counter ([[rune-shared-nothing-law]]).
+    std::array<uint8_t, 16> rnd{};
+    if (entropy_ == nullptr || !entropy_(rnd.data(), rnd.size())) {
+        std::random_device rd;
+        for (std::size_t i = 0; i < rnd.size(); i += 4) {
+            const uint32_t w = rd();
+            std::memcpy(rnd.data() + i, &w, 4);
+        }
+    }
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string id;
+    id.reserve(groupId_.size() + 24 + 2 * rnd.size());
+    id.append(groupId_);
+    id += '-';
+    id.append(std::to_string(++memberSeq_));
+    id += '-';
+    for (const uint8_t b : rnd) {
+        id += kHex[b >> 4];
+        id += kHex[b & 0x0F];
+    }
+    return id;
 }
 
 MemberInfo* GroupCoordinator::findMember(const std::string& memberId)
@@ -323,6 +336,7 @@ bool GroupCoordinator::removeMember(const std::string& memberId)
     auto it = std::find_if(members_.begin(), members_.end(),
                            [&](const MemberInfo& m) { return m.memberId == memberId; });
     if (it == members_.end()) return false;
+    departed_.push_back(it->memberId);   // a copy: `memberId` may alias it (cold)
     members_.erase(it);
     // Keep rejoinedMembers_ consistent with live membership (S1 fix).
     rejoinedMembers_.erase(memberId);

@@ -49,7 +49,8 @@ endif()
 
 # Authentication Task 16: three consensus nodes over real UDP, every frame sealed (needs an embedded media driver).
 if(BUILD_TESTING AND aeron_FOUND)
-    add_executable(rune_peer_sealed_consensus_tests tests/consensus/PeerSealedConsensusTest.cpp)
+    add_executable(rune_peer_sealed_consensus_tests tests/consensus/PeerSealedConsensusTest.cpp
+                   tests/consensus/AeronIngressOversizeTest.cpp)   # #254
     target_link_libraries(rune_peer_sealed_consensus_tests PRIVATE rune_consensus aeron::aeron GTest::gtest_main)
     gtest_discover_tests(rune_peer_sealed_consensus_tests
         PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")

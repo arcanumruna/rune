@@ -62,6 +62,7 @@ struct ScramSaltCache {
 struct ScramAnswer {
     rune::protocol::client::AuthClientFinal final;
     std::array<std::array<uint8_t, 64>, 2>  expectedSignature{};   ///< per slot, what the broker must sign with
+    std::array<std::optional<rune::crypto::scram::SaltedPassword>, 2> salted{};   ///< per slot (issue #114 proofs)
 };
 
 /// `passwords[i]` is tried against slot i (""= garbage proof); `count` proofs are sent (normally = first.count).
@@ -98,6 +99,7 @@ struct ScramAnswer {
         if (!proof || !sig) return std::nullopt;
         std::memcpy(out.final.proofs[i].data(), proof->bytes.data(), 64);
         std::memcpy(out.expectedSignature[i].data(), sig->bytes.data(), 64);
+        out.salted[i] = *sp;
     }
     return out;
 }

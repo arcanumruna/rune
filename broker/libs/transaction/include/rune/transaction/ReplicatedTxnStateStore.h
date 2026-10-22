@@ -77,7 +77,11 @@ public:
     ///
     /// \returns true  on success (appended + in-memory map updated).
     /// \returns false if the replica is minIsr-gated (append returned -1).
-    bool put(const TransactionMetadata& meta, int32_t coordinatorEpoch);
+    bool put(const TransactionMetadata& meta, int32_t coordinatorEpoch) { return putAt(meta, coordinatorEpoch) >= 0; }
+    /// #358 class: put(), returning the record's log offset (-1: refused).  The record is durable - it survives a
+    /// failover of the coordinator - once the replica's high watermark has passed it; an acks-all append
+    /// replicates asynchronously, so an answer that depends on the record waits for that.
+    rune::replication::Offset putAt(const TransactionMetadata& meta, int32_t coordinatorEpoch);
 
     // -----------------------------------------------------------------------
     // Read path — O(1) map lookup.

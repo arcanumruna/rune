@@ -108,6 +108,9 @@ struct NotYetSink {
     bool  postPaused(int64_t, int64_t, int64_t, bool) { return true; }
     bool  postResume(int64_t, int64_t) { return true; }
     bool  postSessionGone(int64_t) { return true; }
+    rune::node::CatalogReadFlow::Admit admit(int64_t, int64_t, const uint8_t*, std::size_t) {
+        return rune::node::CatalogReadFlow::Admit::Deliver;
+    }
 };
 }   // namespace
 TEST(CatalogAllocRegression, PausedCatalogReaderAllocatesNothingRegression) {

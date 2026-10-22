@@ -25,8 +25,10 @@ struct IGroupRequestHandler {
     virtual ~IGroupRequestHandler() = default;
 
     // Each method decodes the request from buf[0..len-1], acts, encodes the
-    // response into out[0..outCap-1], and returns the number of bytes written
-    // (0 on decode error or unrecoverable failure).
+    // response into out[0..outCap-1], and returns the number of bytes written.
+    // 0 means "no answer" (the gateway answers Internal) - except for
+    // handleOffsetCommit, where 0 means DEFERRED (#433): the answer waits for its
+    // __consumer_offsets records to commit and the handler sends it itself.
     //
     // buf and out MUST NOT overlap.
     // outCap is the capacity of out[] in bytes.

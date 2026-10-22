@@ -72,14 +72,17 @@ struct AlterUserDef {
     std::string password;              // AddPassword / SetPassword
     uint8_t index = 0;                 // DropPassword: 1 (oldest) or 2
     bool terminateSessions = false;    // SetPassword
+    bool force = false;                // Disable: FORCE (issue #121: the last security admin may go)
 };
-struct DropUserDef   { std::string name; };
+// `force` (issue #121): the statement's trailing FORCE - it may remove the last enabled security admin.
+struct DropUserDef   { std::string name; bool force = false; };
 struct CreateRoleDef { std::string name; };
-struct DropRoleDef   { std::string name; };
+struct DropRoleDef   { std::string name; bool force = false; };
 struct GrantDef      { SecOp op = SecOp::Read; SecPattern resource; Grantee grantee = Grantee::User; std::string granteeName; };
-struct RevokeDef     { SecOp op = SecOp::Read; SecPattern resource; Grantee grantee = Grantee::User; std::string granteeName; };
+struct RevokeDef     { SecOp op = SecOp::Read; SecPattern resource; Grantee grantee = Grantee::User; std::string granteeName;
+                       bool force = false; };
 struct GrantRoleDef  { std::string role; std::string user; };
-struct RevokeRoleDef { std::string role; std::string user; };
+struct RevokeRoleDef { std::string role; std::string user; bool force = false; };
 struct ShowUsersDef {};
 struct ShowRolesDef {};
 struct ShowGrantsDef { Grantee who = Grantee::User; std::string name; std::optional<AsOfPoint> at; };   // at: Offset | Time

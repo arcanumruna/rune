@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -127,6 +128,15 @@ public:
             out.finalBytes = fin->bytes;
             out.fin = pc::AuthServerFinal::decode(out.finalBytes.data(), out.finalBytes.size());
         }
+        // Issue #114: like the real client, keep what proves this session's own credential changes - the login nonce
+        // and the salted password of the slot the broker signed with.
+        if (out.ok() && out.fin->serverSignature.size() == 64)
+            for (uint8_t i = 0; i < out.answer->final.count; ++i)
+                if (out.answer->salted[i] &&
+                    std::memcmp(out.answer->expectedSignature[i].data(), out.fin->serverSignature.data(), 64) == 0) {
+                    creds_[sid] = Credential{user, std::string(out.first->combinedNonce), *out.answer->salted[i]};
+                    break;
+                }
         return out;
     }
 
@@ -145,6 +155,16 @@ public:
         m.ext.clientName = "auth-wire-client";
         m.ext.statement = statement;
         m.ext.requestId = pinnedRid_ ? *pinnedRid_ : rune::protocol::RequestId{0xA07E'0000'0000'0000ull | nonce_, ++requestCounter_};
+        // Issue #114: a change of the session's own credential carries a proof of the login's password (unless a test
+        // turned signing off to send what an attacker without the password could).
+        std::array<uint8_t, pc::kCredentialProofBytes> proof{};
+        if (const auto c = creds_.find(m.sessionId); signOwnChanges_ && c != creds_.end() && pc::isOwnCredentialChange(m, c->second.user)) {
+            const auto p = rune::crypto::scram::clientProof(rune::crypto::Digest::Sha512, c->second.salted,
+                                                            pc::credentialChangeMessage(c->second.loginNonce, m));
+            if (p) std::memcpy(proof.data(), p->bytes.data(), proof.size());
+            m.flags |= pc::kSecurityDdlFlagCredentialProof;
+            m.credentialProof = std::string_view(reinterpret_cast<const char*>(proof.data()), proof.size());
+        }
         const auto deadline = Clock::now() + within;
         m.correlationId = cl_.nextCorrelationId();
         std::vector<uint8_t> b(m.encodedSize());
@@ -213,6 +233,40 @@ public:
         return securityDdl(channel, m, "GRANT ROLE " + role + " TO " + user + ";");
     }
 
+    /// The encoded SecurityBootstrap `bootstrap` would send (a test keeps the bytes to replay them later).
+    std::vector<uint8_t> bootstrapBytes(int64_t sid, const std::string& keyFileContents, const std::string& adminName,
+                                        const std::string& oneTimePassword, uint8_t seed = 0x40) {
+        const Verifier v = verifierOf(oneTimePassword);
+        pc::SecurityBootstrap m;
+        m.sessionId = sid; m.correlationId = cl_.nextCorrelationId(); m.adminName = adminName; m.verifier = v.wire();
+        for (std::size_t i = 0; i < m.fakeSaltSeed.size(); ++i) m.fakeSaltSeed[i] = static_cast<uint8_t>(seed + i);
+        rune::crypto::randomBytes(std::span<uint8_t>(m.nonce.data(), m.nonce.size()));
+        const auto key = rune::crypto::deriveClusterKey(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(keyFileContents.data()), keyFileContents.size()));
+        std::vector<uint8_t> input;
+        pc::bootstrapMacInput(m, input);
+        rune::crypto::DigestBytes mac;
+        if (!key || !rune::crypto::hmac(rune::crypto::Digest::Sha512, key->master, input, mac)) return {};
+        std::memcpy(m.mac.data(), mac.bytes.data(), m.mac.size());
+        std::vector<uint8_t> b(m.encodedSize());
+        b.resize(m.encode(b.data()));
+        return b;
+    }
+    /// Send encoded bootstrap bytes on `sid` (its session id and a fresh correlation id are stamped in); the answer.
+    DdlAnswer sendBootstrapBytes(const std::string& channel, int64_t sid, std::vector<uint8_t> b) {
+        if (b.size() < pc::MessageHeader::ENCODED_SIZE) return {0xFFFF, 0, 0, -1, "no frame"};
+        const int64_t corr = cl_.nextCorrelationId();
+        pc::detail::putLE64(b.data(), 8, sid);
+        pc::detail::putLE64(b.data(), 16, corr);
+        const auto deadline = Clock::now() + std::chrono::seconds{30};
+        if (!cl_.send(channel, kClientStream, b.data(), b.size(), deadline)) return {0xFFFF, 0, 0, -1, "send failed"};
+        const auto a = cl_.awaitAnyDdlAnswer(corr, deadline);
+        if (!a) return {0xFFFF, 0, 0, -1, "no answer"};
+        if (a->responseTemplate == static_cast<uint16_t>(pc::TemplateId::DdlResponse))
+            if (auto d = cl_.awaitDdl(corr, deadline)) return *d;
+        return {static_cast<uint16_t>(a->code), 0, 0, -1, a->message};
+    }
+
     /// SecurityBootstrap with a MAC under the cluster key file's contents (D4).  The answer is a DdlResponse.
     DdlAnswer bootstrap(const std::string& channel, int64_t sid, const std::string& keyFileContents,
                         const std::string& adminName, const std::string& oneTimePassword, uint8_t seed = 0x40) {
@@ -240,12 +294,19 @@ public:
     /// nullopt = a fresh id per DDL again.
     void pinRequestId(std::optional<rune::protocol::RequestId> r) noexcept { pinnedRid_ = r; }
 
+    /// Issue #114: sign a session's own ADD / DROP / SET PASSWORD (the default, as the real client does); false sends it
+    /// with no proof - what a hijacked session without the password can send.
+    void signOwnCredentialChanges(bool on) noexcept { signOwnChanges_ = on; }
+
     /// Cache Hi(password, salt, i) like the real client's ScramCache: only the first login pays PBKDF2.
     void cacheSaltedPasswords(bool on) noexcept { cacheSaltedPasswords_ = on; }
 
     static constexpr int32_t kClientStream = 1;
 
 private:
+    struct Credential { std::string user, loginNonce; rune::crypto::scram::SaltedPassword salted; };
+    std::map<int64_t, Credential> creds_;   ///< per logged-in session id
+    bool signOwnChanges_ = true;
     ShardTestClient cl_;
     ScramSaltCache cache_;
     bool cacheSaltedPasswords_ = false;

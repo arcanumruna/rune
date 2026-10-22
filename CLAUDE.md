@@ -158,6 +158,31 @@ the repo, issues or commits.
 - **Pull requests are reviewed by the most capable model.** The reviewer leaves comments on the PR where needed; the
   implementer resolves each one (fix, or reply with the reason) and pushes. When the reviewer is satisfied it approves,
   merges the PR and closes the linked issues.
+- **Issue-fix PRs: whole-area and adversarial review.** For a PR that fixes GitHub issues, the review covers the
+  entire area each fix touches, not just the diff: the module it lives in, its callers, sibling paths that share the
+  invariant, and their tests. **Once per batch, at the very end** (after every fix is in), the reviewer writes tests
+  meant to break the union of the areas the batch touches, driven through the public API (client API, wire frames,
+  admin/CLI). An area shared by several fixes is attacked once; the implementer does not run a separate pass; after a
+  fix round only the areas the new diff touches are attacked again.
+  - **Mindset:** assume the fix is wrong and prove it with a failing test. Find every sibling entry point to the same
+    state first (gateway, admin channel, replication catch-up, boot recovery, CLI). Re-run the issue's repro at every
+    layer.
+  - **Attack classes — go through every one that applies:** input bounds (0/1/max/max+1, wrap, truncation at every
+    offset); protocol state (before auth, after close, replays, out of order); version skew (old ↔ new, mixed cluster);
+    concurrency (same op twice, racing DDL, leader change, rebalance; under TSan); crash and restart at every durable
+    step; replication and log state (stale-leader fencing, divergent-follower truncation, acks=all with no loss or
+    duplicate, offsets never move back, system topics converge); compaction, retention and schema evolution;
+    rUDP faults (loss, reorder, duplicate, partition); auth (no or wrong credentials, revoked mid-session, escalation
+    through a sibling op); resources (bounded memory and queues, backpressure, never a hang); data integrity (produced
+    = consumed, views = recompute from log); hot path (zero allocations, ABAB bench).
+  - **Test rules:** assert a concrete outcome; mutation check (revert the fix → an attack test turns red); name it
+    `…Adversarial…Regression`; no sleeps, seeded randomness, `--repeat until-fail:20` and one run under `-j` load.
+
+  Passing tests are kept as `Regression` tests. A break in one of the PR's own issues is fixed in the PR. A break that
+  is urgent (a hang, silent loss or a security hole) is fixed at once in its own task. Any other break becomes a labeled
+  GitHub issue whose body carries the failing test as its repro; that test stays out of the suite until the issue is
+  fixed, so the suite stays green.
+  The full playbook with examples per class is `docs/adversarial-review.md`.
 - Commit messages end with the session's `Co-Authored-By:` trailer.
 - **No secrets in the repo:** no emails, passwords, tokens, keys, IPs or local paths. Everything sensitive comes from
   the environment.
@@ -171,6 +196,10 @@ the repo, issues or commits.
 - **Implementers** run on a mid-tier model. They are given an exact recipe: where, what (the algorithm and its
   invariant), every call site, the exact tests (setup, action, expected values, and the mutation that turns each one
   red) and the don'ts. They are never handed design decisions.
+- **Agents on GitHub issues.** Every agent dispatched to review an issue-fix PR is told, in its dispatch, to read
+  `docs/adversarial-review.md` first and to apply every attack class that fits the batch's areas. Its report lists
+  each class with the tests written or why it does not apply, and the issues it filed. Fixers are told the pass
+  happens at review, so they do not repeat it.
 - **Reviewers** run on the most capable model. A review is exhaustive and adversarial in one pass: every path, state
   transition and input class, concurrency, lifetimes, bounds, vacuous tests. It reports every bug, not the first
   few. A small scoped re-review can use a mid-tier model.

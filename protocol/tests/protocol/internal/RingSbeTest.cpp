@@ -341,13 +341,23 @@ TEST(RingSbeRegression, AuthOpTypesAndTailKindsArePinned) {
     EXPECT_EQ(sbe::TailKind::get(9), sbe::TailKind::Value::PEER_KEYS);
     EXPECT_STREQ(sbe::TailKind::c_str(sbe::TailKind::Value::PERMISSION_BITS), "PERMISSION_BITS");
     EXPECT_STREQ(sbe::TailKind::c_str(sbe::TailKind::Value::PEER_KEYS), "PEER_KEYS");
+    // Issues #109 / #196: the enforcement fence (op ring) and an ending Unsubscribe's terminal text.
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::ENFORCE_FENCE), 23);
+    EXPECT_EQ(sbe::OpType::get(23), sbe::OpType::Value::ENFORCE_FENCE);
+    EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::ENFORCE_FENCE), "ENFORCE_FENCE");
+    EXPECT_EQ(static_cast<int>(sbe::TailKind::Value::END_DETAIL), 10);
+    EXPECT_EQ(sbe::TailKind::get(10), sbe::TailKind::Value::END_DETAIL);
+    EXPECT_STREQ(sbe::TailKind::c_str(sbe::TailKind::Value::END_DETAIL), "END_DETAIL");
+    // Phase 2c (filters): appended after main's 23 / 10, never reused.
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::FILTER_SCHEMA), 24);
+    EXPECT_EQ(static_cast<int>(sbe::TailKind::Value::FILTER), 11);
     // Phase 2c (filters): appended, never reused.
-    EXPECT_EQ(sbe::OpType::get(23), sbe::OpType::Value::FILTER_SCHEMA);
-    EXPECT_EQ(sbe::TailKind::get(10), sbe::TailKind::Value::FILTER);
+    EXPECT_EQ(sbe::OpType::get(24), sbe::OpType::Value::FILTER_SCHEMA);
+    EXPECT_EQ(sbe::TailKind::get(11), sbe::TailKind::Value::FILTER);
     EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::FILTER_SCHEMA), "FILTER_SCHEMA");
     EXPECT_STREQ(sbe::TailKind::c_str(sbe::TailKind::Value::FILTER), "FILTER");
-    EXPECT_THROW((void)sbe::OpType::get(24), std::runtime_error);
-    EXPECT_THROW((void)sbe::TailKind::get(11), std::runtime_error);
+    EXPECT_THROW((void)sbe::OpType::get(25), std::runtime_error);
+    EXPECT_THROW((void)sbe::TailKind::get(12), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------

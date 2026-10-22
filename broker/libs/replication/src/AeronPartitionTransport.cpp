@@ -670,6 +670,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
     aeron::Header&                   /*header*/)
 {
     ++txFragsRecv_;
+    if (partitionedForTest_) [[unlikely]] return aeron::ControlledPollAction::CONTINUE;   // issue #111 test seam
     FLIGHT_RECORDER_SPAN_REPLICATION(flight_recorder::Site::ReplOnFragment, 0);
     if (std::holds_alternative<rune::peerlink::PeerFrameCrypto>(crypto_)) [[unlikely]]
         return onSealedFragment_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),

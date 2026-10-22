@@ -44,3 +44,4 @@ libs/replication/tests/integration/AeronPartitionTransportIntegrationTest.cpp | 
 tests/integration/AeronTransportLoopbackTest.cpp | aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_)); | 1
 libs/replication/tests/integration/PeerSealedTransportTest.cpp | thread_ = std::thread([this] { while (running_.load()) aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_)); }); | 1
 libs/consensus/tests/consensus/PeerSealedConsensusTest.cpp | thread_ = std::thread([this] { while (running_.load()) aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_)); }); | 1
+libs/consensus/tests/consensus/AeronIngressOversizeTest.cpp | thread_ = std::thread([this] { while (running_.load()) aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_)); }); | 1

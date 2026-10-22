@@ -50,10 +50,11 @@ public:
                  rune::peerlink::PeerCryptoMode crypto = rune::peerlink::PeerPlain{})
         : aeron_(std::move(aeron))
         , ingressRing_(ingressRing)
+        , maxFrame_(ingressRing.maxMsgLength())
         , crypto_(std::move(crypto))
     {
         if (std::holds_alternative<rune::peerlink::PeerFrameCrypto>(crypto_))
-            recvScratch_.resize(kMaxSealedPayload + rune::peerlink::kPeerFrameOverhead);   // COLD, once
+            recvScratch_.resize(maxFrame_ + rune::peerlink::kPeerFrameOverhead);   // COLD, once
         int64_t regId = aeron_->addSubscription(channel, streamId);
 
         // Until Aeron answers (bounded by Aeron's driverTimeoutMs, default 10 s).  Spec §3.6: an invoker driver/conductor (fused runtime) is
@@ -81,19 +82,27 @@ public:
                 assembler_.onFragment(
                     [this](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
                            aeron::util::index_t length, aeron::Header&) {
+                        if (partitionedForTest_) [[unlikely]] { ++droppedPartitionedForTest_; return; }   // #111 seam
                         const auto* frame = reinterpret_cast<const uint8_t*>(buffer.buffer() + offset);
+                        const auto len = static_cast<std::size_t>(length);
                         if (auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_)) [[unlikely]] {
+                            // #254: a frame whose plaintext cannot fit the ring is dropped before any cipher work.
+                            if (len > maxFrame_ + rune::peerlink::kPeerFrameOverhead) [[unlikely]] { noteOversize_(len); return; }
                             // Task 16 (D34): open AFTER reassembly, BEFORE the ring - a frame that does not open
                             // never reaches the consensus agent (dropped, counted, rate-limited log).
                             std::size_t plainLen = 0; int32_t from = -1; uint32_t epoch = 0;
                             const auto r = c->open(frame, static_cast<std::size_t>(length), recvScratch_.data(),
                                                    recvScratch_.size(), plainLen, from, epoch);
                             if (r != rune::peerlink::PeerFrameCrypto::OpenResult::Ok) [[unlikely]] { noteOpenDrop_(r, from, epoch); return; }
+                            if (plainLen > maxFrame_) [[unlikely]] { noteOversize_(plainLen); return; }
                             ingressRing_.write(recvScratch_.data(), plainLen);
                             return;
                         }
+                        // #254: the ring refuses (throws on) a message above its maximum; peer input never reaches
+                        // it - an oversized frame is dropped, counted and logged rate-limited.
+                        if (len > maxFrame_) [[unlikely]] { noteOversize_(len); return; }
                         // Write the (reassembled) frame into the ingress ring.
-                        ingressRing_.write(frame, static_cast<std::size_t>(length));
+                        ingressRing_.write(frame, len);
                     },
                     b, o, l, h);
             },
@@ -103,6 +112,16 @@ public:
     }
 
     aeron::Subscription& subscription() { return *sub_; }
+
+    /// Test seam (issue #111), the polling thread only: while set, every inbound consensus frame is consumed and
+    /// dropped - this node hears no peer (with UdpMessageSink::setPartitionedForTest: a node cut off the consensus).
+    void setPartitionedForTest(bool on) noexcept { partitionedForTest_ = on; }
+    [[nodiscard]] uint64_t droppedPartitionedForTest() const noexcept { return droppedPartitionedForTest_; }
+
+    /// #254: inbound frames dropped because they exceed the ingress ring's maximum message (monotonic).
+    [[nodiscard]] uint64_t oversizeDrops() const noexcept { return oversizeDrops_; }
+    /// The largest consensus frame (plaintext) this ingress delivers: the ring's maximum message.
+    [[nodiscard]] std::size_t maxFrameLength() const noexcept { return maxFrame_; }
 
     // ----- Authentication Task 16: this ingress's frame crypto (the receive side of the consensus link).  Control
     //       thread only; the PeerLinkAgent's keys are installed here by the same thread. -----
@@ -131,9 +150,12 @@ public:
         peer = pendingUnknown_.peer; epoch = pendingUnknown_.epoch; pendingUnknown_.valid = false;
         return true;
     }
-    static constexpr std::size_t kMaxSealedPayload = 16 * 1024;   // a consensus frame; the ring's maximum message is 8 KiB
-
 private:
+    void noteOversize_(std::size_t len) noexcept {
+        if ((oversizeDrops_++ % 1024) == 0)
+            spdlog::warn("AeronIngress: inbound consensus frame of {} B exceeds the {} B maximum - dropped ({} dropped so far)",
+                         len, maxFrame_, oversizeDrops_);
+    }
     void noteOpenDrop_(rune::peerlink::PeerFrameCrypto::OpenResult r, int32_t from, uint32_t epoch) noexcept {
         if (r == rune::peerlink::PeerFrameCrypto::OpenResult::UnknownEpoch) pendingUnknown_ = PendingUnknown{true, from, epoch};
         if ((openDropsLogged_++ % 1024) == 0)
@@ -145,10 +167,14 @@ private:
     std::shared_ptr<aeron::Aeron>          aeron_;
     std::shared_ptr<aeron::Subscription>   sub_;
     IngressRing&                           ingressRing_;
+    bool                                   partitionedForTest_ = false;   // test seam (polling thread)
+    uint64_t                               droppedPartitionedForTest_ = 0;
+    std::size_t                            maxFrame_;                              // ingressRing_.maxMsgLength()
     rune::peerlink::PeerCryptoMode         crypto_{rune::peerlink::PeerPlain{}};   // Task 16: chosen at construction
     std::vector<uint8_t>                   recvScratch_;                           // an opened frame (preallocated)
     PendingUnknown                         pendingUnknown_{};
     uint64_t                               openDropsLogged_ = 0;
+    uint64_t                               oversizeDrops_ = 0;
     rune::aeronutil::FragmentAssembler     assembler_;
     rune::aeronutil::ImageLossWatch        imageWatch_;
 };

@@ -10,6 +10,7 @@ add_library(rune_codec STATIC
     src/Generator.cpp
     src/Evolve.cpp
     src/AlterOps.cpp
+    src/Lineage.cpp
     src/FilterSchema.cpp
     src/FilterBuilder.cpp)
 target_include_directories(rune_codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -164,6 +165,34 @@ add_custom_command(
 )
 add_custom_target(generate_filter_fixture_headers DEPENDS "${PLAYER_EVENT_GEN_H}" "${NINE_INTS_GEN_H}" "${SHADOW_NAMES_GEN_H}")
 
+# ── #418 fixture: the evo_mix / evo_fix lineages at every version (tests/LineageFixtures.h) -> one generated type
+#    per version, from that version's EVOLVING descriptor (what `rune schema generate` fetches).
+add_executable(make_lineage_blobs tools/make_lineage_blobs.cpp)
+target_link_libraries(make_lineage_blobs PRIVATE rune_codec)
+set(LINEAGE_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/tests/generated")
+set(LINEAGE_BLOBS "")
+set(LINEAGE_HEADERS "")
+foreach(_l evo_mix evo_fix)
+    foreach(_v 1 2 3 4)
+        list(APPEND LINEAGE_BLOBS "${LINEAGE_GEN_DIR}/${_l}_v${_v}.blob")
+    endforeach()
+endforeach()
+add_custom_command(
+    OUTPUT ${LINEAGE_BLOBS}
+    COMMAND $<TARGET_FILE:make_lineage_blobs> "${LINEAGE_GEN_DIR}"
+    DEPENDS make_lineage_blobs
+    COMMENT "Generating the #418 lineage blobs")
+foreach(_b ${LINEAGE_BLOBS})
+    get_filename_component(_n "${_b}" NAME_WE)
+    add_custom_command(
+        OUTPUT "${LINEAGE_GEN_DIR}/${_n}.gen.h"
+        COMMAND $<TARGET_FILE:rune_codec_gen> "${_b}" "${LINEAGE_GEN_DIR}/${_n}.gen.h"
+        DEPENDS rune_codec_gen "${_b}"
+        COMMENT "Generating ${_n}.gen.h")
+    list(APPEND LINEAGE_HEADERS "${LINEAGE_GEN_DIR}/${_n}.gen.h")
+endforeach()
+add_custom_target(generate_lineage_headers DEPENDS ${LINEAGE_HEADERS})
+
 enable_testing()
 add_executable(rune_codec_tests
     tests/SmokeTest.cpp
@@ -191,12 +220,13 @@ add_executable(rune_codec_tests
     tests/FilterSchemaTest.cpp
     tests/FilterPredicateTest.cpp
     tests/FilterBuilderTest.cpp
-    tests/FilterGeneratedTest.cpp)
+    tests/FilterGeneratedTest.cpp
+    tests/LineageDecodeTest.cpp)
 target_include_directories(rune_codec_tests PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")
 target_link_libraries(rune_codec_tests PRIVATE rune_codec GTest::gtest_main)
 add_dependencies(rune_codec_tests generate_characters_header generate_fixedstr_sample_header
-                 generate_str_keyed_header generate_allfixed_sample_header generate_filter_fixture_headers)
+                 generate_str_keyed_header generate_allfixed_sample_header generate_filter_fixture_headers generate_lineage_headers)
 # Designated initializers must follow member order (Clang accepts reordering with a warning; GCC rejects it).
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     target_compile_options(rune_codec_tests PRIVATE -Werror=reorder-init-list)
@@ -230,6 +260,10 @@ if(benchmark_FOUND)
     message(STATUS "rune_codec_bench: Google Benchmark ${benchmark_VERSION} found")
     add_executable(rune_codec_bench benchmark/ValidatorBenchmark.cpp benchmark/CatalogReplayBench.cpp benchmark/SecurityReplayBench.cpp)
     target_link_libraries(rune_codec_bench PRIVATE rune_security benchmark::benchmark)   # rune_catalog + rune_codec come PUBLIC via rune_security
+    # #418: the generated typed readers (decode / Decoder) on the consume path.
+    target_sources(rune_codec_bench PRIVATE benchmark/TypedDecodeBench.cpp)
+    target_include_directories(rune_codec_bench PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_dependencies(rune_codec_bench generate_characters_header generate_allfixed_sample_header)
 else()
     message(STATUS "rune_codec_bench: Google Benchmark NOT found — rune_codec_bench is not built in this build dir")
 endif()

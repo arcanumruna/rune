@@ -175,7 +175,9 @@ TEST(GeneratorRegression, AFieldNamedFilterIsRejectedRegression) {
 }
 
 TEST(Generator, RetiredFieldsGetNoFilterMember) {
-    auto d = DescriptorBuilder("t")
+    // Version 4: "gone" (retired at 3) is not part of the type generated for this version (#418 generates the schema
+    // as of its version), so it has no Filter member and no term.
+    auto d = DescriptorBuilder("t", 4)
                  .addTagged("live", 0, PrimType::UInt32, 1, 0xFFFF, false, {})
                  .addTagged("gone", 1, PrimType::UInt32, 1, 3, false, {})
                  .build();

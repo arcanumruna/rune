@@ -50,6 +50,9 @@ using SendFn = std::function<bool(int32_t, const uint8_t*, std::size_t)>;
 
 class GroupConsumerHub {
 public:
+    /// #438: a commitSync answered UnstableOffsetCommit is re-sent after this backoff (doubling, capped).
+    static constexpr int64_t  kCommitRetryMinNs = 20'000'000;
+    static constexpr int64_t  kCommitRetryMaxNs = 1'000'000'000;
     GroupConsumerHub() = default;
 
     // Non-copyable / non-movable.
@@ -276,6 +279,10 @@ public:
     /// Consecutive Redirects of one partition (no bind in between) after which
     /// it is parked until fresh metadata (no ping-pong storm).
     static constexpr uint8_t kMaxFetchRedirects = 8;
+    /// PR #441 F4: a partition fetch answered RecordEgressUnavailable (the broker cannot build this session's record
+    /// stream) this many times since its last bind ends the consumer explicitly (RetryBudgetExhausted).  Only that
+    /// cause counts: NotLeader / Redirect (a failover, however long) re-route without a bound, as before.
+    static constexpr uint8_t kMaxEgressRefusalsWithoutBind = 8;
 
     /// Bring every Stable consumer's subscriptions in line with the current
     /// leaders and sessions (cold: group / routing events).  Also re-offers
@@ -472,6 +479,7 @@ private:
     /// I2: consecutive OffsetFetch answers with a retriable per-entry error
     /// before the consumer is refused (each re-send is paced by retryOffsetFetch).
     static constexpr uint32_t kMaxOffsetFetchAttempts  = 8;
+
     /// Fix round 4 (item 2): an OffsetFetch answered NotCoordinator (or another
     /// rebalance-set code) re-joins (paced, 20 ms doubling to 1 s); after
     /// kMaxOffsetFetchRejoins consecutive such answers (no fetch served in
@@ -481,6 +489,8 @@ private:
     /// I2: OffsetFetch correlationIds (bit 60 tag; disjoint from fetch ids).
     int64_t nextOffsetFetchCorr_ = 1;
     void publishGeneration_(GroupConsumerImpl& impl);
+    /// The status snapshot of `impl` (generation, `reserved`, member id: #125).
+    static GroupConsumerStatus statusOf_(const GroupConsumerImpl& impl, int32_t reserved) noexcept;
 
     // ---- Internal helpers (runner thread only) ------------------------------
 

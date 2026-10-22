@@ -37,6 +37,7 @@
 #include <rune/client/detail/HubCommand.h>
 #include <rune/client/detail/OpTarget.h>
 #include <rune/client/detail/StatusRing.h>
+#include <rune/client/group/GroupMetadata.h>
 
 #include <rune/protocol/client/OffsetMessages.h>  // OffsetCommitEntry (for commitEntriesScratch)
 
@@ -212,6 +213,9 @@ enum class GroupFailReason : int32_t {
 struct GroupConsumerStatus {
     int32_t generationId = 0;
     int32_t reserved     = 0;  // final snapshot: a GroupFailReason
+    // #125: the member id of that generation (GroupConsumer::groupMetadata()); 0 bytes before the first join.
+    uint16_t memberIdLen = 0;
+    char     memberId[kMaxGroupMemberIdBytes]{};
 };
 
 // ---------------------------------------------------------------------------
@@ -269,6 +273,7 @@ struct GroupConsumerImpl {
         uint32_t rewindEpoch    = 0;      // bumped by every rewind applied to this partition (a delivery callback's seek wins over the post-callback advance)
         bool     rewound        = false;  // Task 10: restarted by a seek, not yet re-bound (the pending Rewind waits on it)
         uint8_t  redirects      = 0;      // consecutive Redirects without a bind
+        uint8_t  egressRefusals = 0;      // PR #441 F4: RecordEgressUnavailable answers since the last bind
     };
     std::map<TopicPartition, FetchSub> fetch;
     // MEDIUM-2: OffsetFetch re-send pacing (duty-clock ns; 0 = due).
@@ -328,6 +333,10 @@ struct GroupConsumerImpl {
         detail::OpTarget target{};
         Token            token = 0;
         int64_t          deadlineNs = 0;  // duty clock (GroupConfig::commitSyncTimeoutMs)
+        // #438: answered UnstableOffsetCommit - re-sent at retryDueNs (-1: no retry pending; 0: armed by the next
+        // sweep on the duty clock), backing off retryBackoffNs.
+        int64_t          retryDueNs     = -1;
+        int64_t          retryBackoffNs = 0;
     };
     bool              hasCommitSync {false};
     PendingCommitSync commitSync{};
@@ -362,7 +371,7 @@ struct GroupConsumerImpl {
     bool    releaseNoted = false;  // duty thread: its release was applied / queued
 
     // ---- Duty thread -> app handle ------------------------------------------------
-    detail::StatusRing<GroupConsumerStatus, 256> status;
+    detail::StatusRing<GroupConsumerStatus, 8192> status;   // #125: a snapshot carries the member id (~530 B)
 
     // ---- Construction --------------------------------------------------------
     GroupConsumerImpl() {
@@ -539,6 +548,14 @@ public:
     /// Why the duty side finished this consumer on its own (None otherwise) —
     /// see GroupFailReason for the client / broker compatibility rule.
     [[nodiscard]] GroupFailReason failReason() const noexcept;
+
+    /// Issue #125 (KIP-447): {groupId, generationId, memberId} of the current membership, for
+    /// Producer::sendOffsetsToTransaction(offsets, groupMetadata(), ...) - the coordinator then fences the
+    /// transaction's offsets by this member and generation (a zombie of an older generation cannot commit them).
+    /// Inside a callback: the duty thread's live values.  On the owning app thread: the latest the duty thread
+    /// published (eventually consistent, like generation()).  Before the first join: generationId 0 and an empty
+    /// memberId (the coordinator answers UnknownMember).  Cold path (allocates the strings).
+    [[nodiscard]] GroupMetadata groupMetadata() const;
 
 private:
     [[nodiscard]] bool onDutyThread_() const noexcept {

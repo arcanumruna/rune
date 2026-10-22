@@ -18,6 +18,7 @@
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerReturnCodec.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/ProducerIdBinding.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/ControlMessages.h>
@@ -1838,6 +1839,7 @@ struct CoordRig {
         tcs = std::make_unique<TransactionCoordinationService>(store.get(), nullptr,
                                                               [this] { return consensusLeader; },
                                                               [] { return NodeId{1}; });
+        tcs->setAnswerSinkForTest(&CoordRig::captureAnswer_, this);   // #358 class: answers parked until committed
         tcs->setAppendFnOverride([this](std::string_view, int32_t, std::span<const uint8_t> b) -> int64_t {
             tx::ControlMarkerPayload p;
             if (tx::ControlMarker::extract(b.data(), 0, p, b.size()))
@@ -1850,7 +1852,22 @@ struct CoordRig {
         q.transactionalId = {reinterpret_cast<const uint8_t*>(txnId.data()), txnId.size()};
         std::vector<uint8_t> f(q.encodedSize()); q.encode(f.data());
         const auto n = tcs->handleInitProducerId(f.data(), f.size(), now, out.data(), out.size());
+        if (n == 0) return Init{kParkedAnswer, -1, -1};   // #358 class: answered once its record commits
         auto r = pc::InitProducerIdResponse::decode(out.data(), n);
+        if (!r) return {};
+        return {r->errorCode, r->producerId, r->producerEpoch};
+    }
+    /// #358 class: the last answer sent after its record committed (tcs->doWork releases parked answers).
+    static constexpr int16_t kParkedAnswer = -2;
+    std::vector<std::vector<uint8_t>> answers;
+    static void captureAnswer_(void* ctx, int64_t, const uint8_t* f, std::size_t n) {
+        static_cast<CoordRig*>(ctx)->answers.emplace_back(f, f + n);
+    }
+    Init releasedInit(int64_t now) {
+        answers.clear();
+        (void)tcs->doWork(now);
+        if (answers.empty()) return Init{kParkedAnswer, -1, -1};
+        auto r = pc::InitProducerIdResponse::decode(answers.back().data(), answers.back().size());
         if (!r) return {};
         return {r->errorCode, r->producerId, r->producerEpoch};
     }
@@ -1896,7 +1913,10 @@ TEST(TxnCoordinatorLoadRegression, NewTxnStateLeaderLoadsAtOnceWhenHwEqualsLeo) 
     EXPECT_NE(R.initPid("t").err, kNotCoordinator) << "a new txn-state leader did not load";
     R.fetchFrom2(R.log->logEndOffset(), 3);                 // the pid-block ceiling commits
     R.fetchFrom(3, R.log->logEndOffset(), 3);
-    EXPECT_EQ(R.initPid("t").err, 0);
+    EXPECT_EQ(R.initPid("t").err, CoordRig::kParkedAnswer) << "#358 class: the epoch is answered once it commits";
+    R.fetchFrom2(R.log->logEndOffset(), 4);
+    R.fetchFrom(3, R.log->logEndOffset(), 4);
+    EXPECT_EQ(R.releasedInit(4).err, 0);
 }
 
 TEST(TxnCoordinatorLoadRegression, NotCoordinatorUntilHwEqualsLeo) {
@@ -2106,8 +2126,11 @@ TEST(TxnPidBlockRegression, AllocationWaitsForCommittedCeiling) {
     EXPECT_EQ(R.log->logEndOffset(), 1) << "only the ceiling record is written";
     EXPECT_EQ(R.initPid("").err, kConcurrent) << "idempotent InitProducerId waits too";
     R.fetchFrom2(R.log->logEndOffset(), 2);
-    const auto ok = R.initPid("t");
-    EXPECT_EQ(ok.err, 0) << "allocates once the ceiling is committed";
+    EXPECT_EQ(R.initPid("t").err, CoordRig::kParkedAnswer) << "allocates once the ceiling is committed; "
+                                                              "#358 class: answered once the epoch commits";
+    R.fetchFrom2(R.log->logEndOffset(), 3);
+    const auto ok = R.releasedInit(3);
+    EXPECT_EQ(ok.err, 0);
     EXPECT_GE(ok.pid, 0);
 }
 
@@ -6100,4 +6123,28 @@ TEST(D4TxnRegression, MalformedEndTxnFramesAreIgnoredRegression) {
     // a halt, never the "deferred" 0 the gateway would never answer.
     EXPECT_DEATH((void)T.tcs->handleEndTxn(f.data(), f.size(), 1, T.out.data(), 1), "kTxnMinOutCap");
     SUCCEED();
+}
+
+// ============================================================================
+// Adversarial review of PR #423 (issue #122), version skew: a rolling upgrade moves the transaction coordinator from
+// an upgraded node to an older one and back.  The older coordinator reloads a BOUND id from __transaction_state,
+// reseeds its allocator past the raw id and persists its next pid block ceiling in raw id units (old load_:
+// base = maxPid + 1, then advancePidBlock_: base + kBlockSize).  The upgraded coordinator that takes over next must
+// keep issuing ids: the ceiling must not exhaust the bound format's 38-bit counter.
+// ============================================================================
+TEST(TxnPidBlockRegression, ACeilingPersistedByAPreBindingCoordinatorDoesNotExhaustPidsVersionSkewAdversarialRegression) {
+    namespace rp = rune::protocol;
+    CoordRig R(Role::Leader, 1, {1}, {1});
+    const auto t = R.initPid("t");
+    ASSERT_EQ(t.err, 0);
+    ASSERT_TRUE(rp::isBoundProducerId(t.pid)) << "precondition: the upgraded coordinator issues bound ids";
+    // The older coordinator's load + first block over this state.
+    ASSERT_GE(R.store->putPidBlockCeiling(t.pid + 1 + tx::ProducerIdAllocator::kBlockSize), 0);
+    R.newCoordinator();   // the upgraded node takes the coordinator back
+    const auto idem = R.initPid("");
+    EXPECT_EQ(idem.err, 0) << "InitProducerId fails for good after an older coordinator ran over bound ids";
+    EXPECT_TRUE(rp::isBoundProducerId(idem.pid));
+    EXPECT_GT(rp::producerIdCounter(idem.pid), rp::producerIdCounter(t.pid));
+    const auto t2 = R.initPid("t2");
+    EXPECT_EQ(t2.err, 0);
 }

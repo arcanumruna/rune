@@ -295,6 +295,8 @@ private:
             if (groupService_) groupService_->setLocalLeadership(leader);   // fix 2 (B1)
             if (txnService_)   txnService_->setLocalLeadership(leader);     // fix 2 (B1)
         }
+        // Issue #122: bound producer ids only once every member supports them (the committed feature level).
+        if (txnService_ && metadataService_) txnService_->setMetadataFeatureLevel(metadataService_->featureLevel());
         // 1a. F9a: publish the leadership view to the observer thread (ring,
         //     only on change) right after the consensus step made it current.
         if (leaderObserver_) leaderObserver_->publishOnControl();

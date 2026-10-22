@@ -1891,15 +1891,15 @@ TEST(TransientLogFullRegression, OldClientsAreAnsweredNotLeader) {
 }
 
 // ===========================================================================
-// Phase 2c (client v10 / broker v6): Subscribe filter trailer, response detail
+// Phase 2c (client v11 / broker v6): Subscribe filter trailer, response detail
 // ===========================================================================
-static_assert(rpc::kClientVersionFilter == rpc::kClientVersionAuth + 1);
+static_assert(rpc::kClientVersionFilter == rpc::kClientVersionTxnOffsetFence + 1);
 static_assert(rpc::kBrokerVersionFilter == rpc::kBrokerVersionAuth + 1);
 static_assert(rpc::kClientVersion == rpc::kClientVersionFilter && rpc::kBrokerVersion == rpc::kBrokerVersionFilter);
-static_assert(rpc::clientUnderstandsFilters(10) && !rpc::clientUnderstandsFilters(9));
+static_assert(rpc::clientUnderstandsFilters(11) && !rpc::clientUnderstandsFilters(10));
 
-TEST(ProtocolVersions, FilterIsTenAndBrokerSix) {
-    EXPECT_EQ(rpc::kClientVersionFilter, 10);
+TEST(ProtocolVersions, FilterIsElevenAndBrokerSix) {
+    EXPECT_EQ(rpc::kClientVersionFilter, 11);
     EXPECT_EQ(rpc::kBrokerVersionFilter, 6);
 }
 

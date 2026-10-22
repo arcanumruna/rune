@@ -1,4 +1,5 @@
 // SecurityAdmin.cpp — the `__security` leadership on the admin thread (authentication plan D39).  See SecurityAdmin.h.
+#include <rune/gateway/SecurityRequestFingerprint.h>
 #include <cctype>
 #include <rune/node/SecurityAdmin.h>
 
@@ -17,7 +18,7 @@
 namespace rune::node {
 
 namespace {
-constexpr uint16_t kOK = 0, kNotLeader = 2, kInternal = 6, kInvalidRequest = 39;
+constexpr uint16_t kOK = 0, kNotLeader = 2, kInternal = 6, kInvalidRequest = 39, kNotAuthorized = 45;
 namespace sec = rune::security;
 namespace pc  = rune::protocol::client;
 
@@ -180,11 +181,11 @@ struct Fnv {
     }
 };
 uint64_t fingerprintOf(const SecurityDdlMsg& m) {
-    Fnv f;
-    f.u(kTidSecurityDdl); f.s(m.meta.statement); f.u(m.kind); f.s(m.name); f.u(m.change); f.u(m.passwordIndex);
-    f.u(m.terminateSessions); f.verifier(m.verifier);
-    f.u(m.granteeKind); f.u(m.op); f.u(m.resourceType); f.u(m.patternKind); f.s(m.pattern); f.s(m.roleName);
-    return f.h;
+    // The ONE definition (PR #410 review F2): the gateway computes the same from the wire request.
+    const rune::gateway::VerifierBytes v{m.verifier.salt, m.verifier.iterations, m.verifier.storedKey, m.verifier.serverKey};
+    return rune::gateway::securityDdlFingerprint(m.meta.statement, m.kind, m.name, m.change, m.passwordIndex,
+                                                 m.terminateSessions, v, m.granteeKind, m.op, m.resourceType,
+                                                 m.patternKind, m.pattern, m.roleName);
 }
 uint64_t fingerprintOf(const SecurityBootstrapMsg& m) {
     Fnv f;
@@ -318,6 +319,18 @@ bool statementHasUnredactedPassword(std::string_view statement) {
     }
     return false;
 }
+/// Issue #121: true when applying `e` to `state` leaves no enabled security admin.  A copy of the state takes the event
+/// (the library's own apply, so every op kind is judged by the rules that will really run); an event that does not
+/// apply is not judged here (appendEvent_'s dry run answers it).
+bool removesLastSecurityAdmin(const sec::SecurityState& state, const sec::SecurityEvent& e) {
+    sec::SecurityState after = state;
+    sec::SecurityEvent probe = e;
+    auto fp = sec::previewFingerprint(state, probe);
+    if (!fp) return false;
+    probe.fingerprint = *fp;
+    if (!sec::apply(after, probe, state.appliedOffset() + 1)) return false;
+    return !after.hasSecurityAdmin();
+}
 } // namespace
 
 void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRequest& req) {
@@ -327,16 +340,28 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
         return;
     }
     const uint64_t fp = fingerprintOf(m);
-    // 1. Dedupe (F14) on (requestId, statement fingerprint).
+    // 1. Dedupe (F14) on (requestId, statement fingerprint).  PR #410 review F1: BEFORE the gateway's verdict - a retry
+    // of an applied request gets its original result even when the gateway now denies it (the first attempt changed
+    // what the check reads: the password the retry is proven with, the ADMIN it needed).
     if (!m.meta.requestId.none()) {
         if (const auto rec = state.request(m.meta.requestId)) {
             if (rec->requestFingerprint == fp) {
                 answer_(req, kOK, {}, rec->objectId, rec->newVersion, rec->offset);   // a retry: its ORIGINAL result
+            } else if (m.proofChecked != 0) {
+                // PR #410 review F2: a reused request id on a proof-checked own change answers the SAME as a bad proof,
+                // right proof or wrong - otherwise "requestId reused" for a right one is a password oracle.
+                answer_(req, kNotAuthorized, rune::gateway::kOwnCredentialProofRefusal);
+            } else if (!m.denial.empty()) {
+                answer_(req, kNotAuthorized, m.denial);
             } else {
                 answer_(req, kInvalidRequest, "requestId reused for a different statement");
             }
             return;
         }
+    }
+    if (!m.denial.empty()) {   // not a retry: the gateway's refusal stands
+        answer_(req, kNotAuthorized, m.denial);
+        return;
     }
     // 2. Build the operation from the wire fields.
     sec::SecurityEvent e;
@@ -412,6 +437,16 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
     e.newVersion = e.prevVersion + 1;
     e.principal = principalOf(m.meta, m.meta.authenticated, fp);
     e.timestampMs = wallClockMs();
+    // Issue #121: the last-admin guard.  Removing the last ENABLED user that effectively holds ADMIN ON CLUSTER (a
+    // DISABLE, a DROP USER, a REVOKE of ADMIN or of the role carrying it, a DROP ROLE ...) reopens the bootstrap window:
+    // only the cluster-key holder can then manage security.  Refused unless the statement says FORCE.  Decided on the
+    // event itself - the same frozen rules every broker applies, dry-run on a copy of the state (cold: DDL rate) - so
+    // every path that can remove the last admin is covered, not a list of statement kinds.
+    if (m.force == 0 && state.hasSecurityAdmin() && removesLastSecurityAdmin(state, e)) {
+        answer_(req, kInvalidRequest, "this removes the last enabled security admin (no enabled user would hold ADMIN ON "
+                                      "CLUSTER): create or enable another admin first, or say FORCE");
+        return;
+    }
     (void)appendEvent_(req, std::move(e), nowNs);
 }
 

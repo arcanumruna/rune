@@ -33,6 +33,7 @@
 #include <rune/crypto/Kdf.h>
 #include <rune/crypto/Scram.h>
 #include <rune/protocol/client/AuthMessages.h>
+#include <rune/protocol/client/SecurityMessages.h>
 
 // client<->broker TLS/AEAD (Task 5) — cold-path handshake drive.  TlsSession/AeadCipher
 // are forward-declared-opaque wrappers around OpenSSL; including them here does NOT
@@ -188,6 +189,12 @@ struct SessionConfig {
     // Required+Anonymous before bootstrap) is refused Rejected(AuthenticationFailed) unless this opt-in is set.
     // Default false.  A client WITHOUT credentials is unaffected.
     bool allowUnauthenticatedBroker = false;
+    // Issue #121: this session exists only to send `rune security bootstrap` (no credentials; the request proves
+    // itself with the cluster-key MAC).  A broker whose bootstrap window was REOPENED (its last admin disabled or
+    // dropped) answers MustAuthenticate, since its other users still log in: such a session then skips the login and
+    // is Connected in the anonymous-bootstrap mode, exactly as on a never-bootstrapped cluster (Required+Anonymous).
+    // Ignored with credentials.  Default false: a credential-less client otherwise starts the (failing) login.
+    bool bootstrapOnly = false;
 
     // Task 9 (downgrade safety, spec §11 require_tls's client-side mirror):
     // when true, a ConnectResponse{OK} that negotiates NO cipher (chosenCipher
@@ -313,6 +320,8 @@ public:
     /// DR-7: connect attempts that ended without a session (timed out / refused);
     /// monotonic — each increment is an event (the owner asks for fresh metadata).
     [[nodiscard]] uint64_t connectFailures() const noexcept { return connectFailures_; }
+    /// Issues #15 / #111: AuthUnavailable (48) answers / session ends seen (each a retriable failure, never Rejected).
+    [[nodiscard]] uint64_t authUnavailableCount() const noexcept { return authUnavailable_; }
     /// No-hang fix round 4 (item 6): Connected → Resuming edges caused by THIS
     /// client's own liveness check (response timeout / own stall) — the session
     /// is treated as lost, exactly as if the broker had sent SessionExpired.
@@ -351,6 +360,33 @@ public:
     /// carry ONLY the bootstrap — the broker answers any other frame AuthenticationFailed and closes it, so the
     /// machine sends no keepalive and the Client no connect-time metadata request on it.
     [[nodiscard]] bool anonymousBootstrap() const noexcept { return authInfo_.anonymousBootstrap; }
+
+    /// Issue #114: sign, in place, a SecurityDdl frame that changes this session's OWN credential (ALTER USER <self>
+    /// ADD / DROP / SET PASSWORD carrying the CredentialProof flag): its last kCredentialProofBytes become the SCRAM
+    /// proof of the password this machine logged in with, over credentialChangeMessage(the login's combined nonce,
+    /// the request) - so it is valid on THIS broker session only.  Called on every offer of the frame, after the
+    /// session id is stamped (a redirect or a reconnect re-signs it for the session it now rides).  Any other frame,
+    /// or a session this machine did not log in on, is left untouched (the broker then refuses the change).  Duty
+    /// thread; cold path (PBKDF2 only if the cache lost the entry).
+    void signOwnCredentialChange(uint8_t* buf, std::size_t len) noexcept {
+        namespace rpc = rune::protocol::client;
+        try {
+            if (!loginCredential_ || loginCredential_->sessionId != sessionId_ || authenticatedSessionId_ != sessionId_) return;
+            const auto m = rpc::SecurityDdl::decode(buf, len);
+            if (!m || (m->flags & rpc::kSecurityDdlFlagCredentialProof) == 0 || !rpc::isOwnCredentialChange(*m, cfg_.username))
+                return;
+            const LoginCredential& c = *loginCredential_;
+            const auto salt = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(c.salt.data()), c.salt.size());
+            const auto* sp = cache_->saltedPassword(cfg_.password, salt, c.iterations);
+            if (sp == nullptr) return;
+            const auto proof = rune::crypto::scram::clientProof(rune::crypto::Digest::Sha512, *sp,
+                                                                rpc::credentialChangeMessage(c.loginNonce, *m));
+            if (!proof || proof->size != rpc::kCredentialProofBytes) return;
+            std::memcpy(buf + len - rpc::kCredentialProofBytes, proof->bytes.data(), rpc::kCredentialProofBytes);
+        } catch (...) {
+            // allocation failure: the frame goes unsigned and the broker refuses the change (explicitly)
+        }
+    }
     /// Why the machine refused the broker (Rejected after an OK ConnectResponse that skipped the login); "" if not.
     [[nodiscard]] const std::string& rejectDetail() const noexcept { return rejectDetail_; }
     /// Review B I4: the session user changed their own password — the next login uses the new one, and a
@@ -359,6 +395,10 @@ public:
         if (!cfg_.password.empty()) detail::secureZero(cfg_.password.data(), cfg_.password.size());
         cfg_.password.assign(newPassword);
         authInfo_.passwordChangeRequired = false;
+        // Issue #114: the login's password may be gone (SET replaces every verifier): this session can no longer prove a
+        // further own-credential change (the broker answers "log in again") - never sign with a stale salt, which
+        // would also cost a PBKDF2 on the duty thread.
+        loginCredential_.reset();
     }
     /// Authentication: the retryAfterMs of the AuthServerFinal{44} that last refused this session (0 = none).
     [[nodiscard]] uint32_t authRetryAfterMs() const noexcept { return authInfo_.retryAfterMs; }
@@ -698,6 +738,7 @@ public:
         const std::string cfwp = rs::clientFinalWithoutProof(combined);
         ScramSentFinal fin;
         fin.count = sf.count;
+        fin.combinedNonce = combined;
         rpc::AuthClientFinal out;
         out.sessionId     = sessionId_;
         out.correlationId = correlationId_;
@@ -714,6 +755,8 @@ public:
             if (!proof || !sig || proof->size != rpc::kScramProofBytes) { failAuthLocal_(); return; }
             std::memcpy(out.proofs[i].data(), proof->bytes.data(), rpc::kScramProofBytes);
             fin.expected[i] = *sig;
+            fin.salts[i].assign(sf.salts[i].salt);
+            fin.iterations[i] = sf.salts[i].iterations;
         }
         hsFrameBuf_.resize(out.encodedSize());
         const std::size_t n = out.encode(hsFrameBuf_.data());
@@ -732,6 +775,7 @@ public:
         if (f.errorCode != 0) {
             const auto ec = static_cast<rpc::ErrorCode>(f.errorCode);
             if (ec == rpc::ErrorCode::AuthenticationFailed) failAuth_(ec, f.retryAfterMs, nowNs);
+            else if (ec == rpc::ErrorCode::AuthUnavailable) onAuthUnavailable_(nowNs);   // issues #15 / #111
             else onConnectError_(ec, nowNs);   // anything else (Internal ...): a connect failure
             return;
         }
@@ -743,8 +787,11 @@ public:
         const auto got = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(f.serverSignature.data()),
                                                   f.serverSignature.size());
         bool match = false;
+        int matched = -1;
         for (uint8_t i = 0; i < fin->count; ++i) {   // no early exit: constant time over the verifiers
-            match |= rune::crypto::constantTimeEqual(fin->expected[i].view(), got);
+            const bool m = rune::crypto::constantTimeEqual(fin->expected[i].view(), got);
+            match |= m;
+            if (m && matched < 0) matched = i;
         }
         if (!match) {
             failAuth_(rpc::ErrorCode::AuthenticationFailed, 0, nowNs);   // "broker failed to prove the password"
@@ -754,6 +801,8 @@ public:
         authInfo_.retryAfterMs           = 0;
         authInfo_.authenticated          = true;
         authenticatedSessionId_          = sessionId_;   // a later resume of THIS id is this machine's own login
+        loginCredential_ = LoginCredential{sessionId_, fin->combinedNonce, fin->salts[static_cast<std::size_t>(matched)],
+                                           fin->iterations[static_cast<std::size_t>(matched)]};
         finishConnected_(nowNs);
     }
 
@@ -779,6 +828,10 @@ public:
                 transitionTo(SessionState::Resuming);
                 // doResume fires on the next tick (FIX D: Resuming is a real waiting state).
                 resumeEntryNs_ = nowNs;
+            } else if (ec == rpc::ErrorCode::AuthUnavailable && incomingCorrelationId == 0) {
+                // Issues #15 / #111: the broker's security state stayed stale and it ended this session - retriable:
+                // reconnect FRESH elsewhere (the seed failover rotates the candidates), never resume here.
+                onAuthUnavailable_(nowNs);
             } else if (ec == rpc::ErrorCode::SessionRevoked && incomingCorrelationId == 0) {
                 // Authentication (D26): the session-level ErrorResponse{SessionRevoked, corr 0} — the user was
                 // dropped / disabled (or the broker's security log halted).  The broker closes the session:
@@ -1106,11 +1159,16 @@ private:
         authInfo_.brokerMode = mode;
         authInfo_.authenticated = false;
         authInfo_.anonymousBootstrap = mode == rpc::AuthMode::Required && state == rpc::AuthState::Anonymous;
+        const bool credentialed = !cfg_.username.empty();
         if (mode == rpc::AuthMode::Required && state == rpc::AuthState::MustAuthenticate) {
+            if (!credentialed && cfg_.bootstrapOnly) {   // issue #121: a reopened bootstrap window
+                authInfo_.anonymousBootstrap = true;
+                finishConnected_(nowNs);
+                return;
+            }
             beginAuth_(nowNs);
             return;
         }
-        const bool credentialed = !cfg_.username.empty();
         // Review B I3: a resume is believed only for a session this machine itself authenticated.
         if (credentialed && mode == rpc::AuthMode::Required && state == rpc::AuthState::ResumedAuthenticated &&
             authenticatedSessionId_ != 0 && sessionId_ == authenticatedSessionId_) {
@@ -1179,6 +1237,18 @@ private:
         }
         rejectCode_ = static_cast<int16_t>(static_cast<uint16_t>(ec));
         transitionTo(SessionState::Rejected);
+    }
+
+    /// Issues #15 / #111: AuthUnavailable (48) - THIS broker cannot vouch for its security state right now (catching
+    /// up, partitioned): never a verdict on the credentials.  The broker closed the session, so the retry is a fresh
+    /// connect; a retriable connect failure (Backoff for a reconnect-forever session that was Live - the seed failover
+    /// moves it to another broker - Disconnected otherwise, the caller's connect retry).
+    void onAuthUnavailable_(int64_t nowNs) noexcept {
+        cryptoState_            = CryptoState{};
+        sessionId_              = 0;
+        authenticatedSessionId_ = 0;
+        ++authUnavailable_;
+        onConnectError_(rune::protocol::client::ErrorCode::AuthUnavailable, nowNs);
     }
 
     /// A LOCAL failure (no randomness, PBKDF2 refused): not the broker's verdict, but never a plaintext login.
@@ -1474,6 +1544,7 @@ private:
     int64_t resumeEntryNs_       = 0;  // FIX D: timestamp when Resuming was entered
     // DR-BUG-2: fast-retry state for the connect path.
     uint64_t connectFailures_ = 0;   // DR-7: see connectFailures()
+    uint64_t authUnavailable_ = 0;   // issues #15 / #111: see authUnavailableCount()
     uint64_t staleSessionLosses_ = 0;   // fix round 4: see staleSessionLosses()
     uint64_t ownStallLosses_     = 0;   // M1: see ownStallLosses()
     int16_t  lastConnectError_   = 0;   // I2: see lastConnectError()
@@ -1544,6 +1615,10 @@ private:
         bool     anonymousBootstrap = false;   // review B I5: Required + Anonymous — only the bootstrap may be sent
     };
     int64_t     authenticatedSessionId_ = 0;   // the broker session id this machine logged in on (0 = none)
+    // Issue #114: the login that authenticated `sessionId` - what signOwnCredentialChange proves with.  Replaced by
+    // every login; used only while that session is the current one.
+    struct LoginCredential { int64_t sessionId = 0; std::string loginNonce; std::string salt; uint32_t iterations = 0; };
+    std::optional<LoginCredential> loginCredential_;
     std::string rejectDetail_;
     AuthInfo     authInfo_{};
     ScramCache   ownCache_;

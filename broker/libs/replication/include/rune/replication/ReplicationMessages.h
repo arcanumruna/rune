@@ -462,8 +462,13 @@ inline constexpr int16_t kLeaderlessMarks = 1;
 /// ISR protocol (storage identity): gates the storage strip, the NodeStorageRecord
 /// confirmation and the StorageReset leaderless mark.
 inline constexpr int16_t kStorageIdentity = 2;
+/// Issue #122: the transaction coordinator issues BOUND producer ids (the owner tag in the id,
+/// rune/protocol/ProducerIdBinding.h) and rebinds a transactional id held by another principal.  An
+/// older coordinator would reseed by a bound id's raw value and issue ids whose bits read as another
+/// principal's, so they are issued only once every member supports this level.
+inline constexpr int16_t kBoundProducerIds = 3;
 /// The level this binary supports.
-inline constexpr int16_t kLatest = kStorageIdentity;
+inline constexpr int16_t kLatest = kBoundProducerIds;
 } // namespace MetadataFeature
 
 struct AlterIsrMsg {

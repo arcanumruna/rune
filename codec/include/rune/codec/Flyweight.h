@@ -59,4 +59,27 @@ inline void storeFixedStr(uint8_t* p, std::string_view s, std::size_t n) noexcep
     return {reinterpret_cast<const char*>(p), n};
 }
 
+/// #418: the var field at var index `target` of a record of `n` bytes at `r`, walking on from the cursor
+/// (`pos`, `at`: the byte position and var index reached so far; a decode reads its var fields in increasing
+/// index order, so one walk serves them all).  False (the cursor stays): truncated or a length past the end.
+[[nodiscard]] inline bool readVar(const uint8_t* r, std::size_t n, std::size_t& pos, uint32_t& at, uint32_t target,
+                                  std::string_view& out) noexcept {
+    std::size_t p = pos;
+    uint32_t    i = at;
+    while (true) {
+        if (p > n || n - p < 4) return false;
+        const uint32_t len = load<uint32_t>(r + p);
+        if (len > n - p - 4) return false;
+        if (i == target) {
+            out = {reinterpret_cast<const char*>(r + p + 4), len};
+            pos = p + 4 + len;
+            at  = i + 1;
+            return true;
+        }
+        if (i > target) return false;
+        p += 4 + static_cast<std::size_t>(len);
+        ++i;
+    }
+}
+
 }  // namespace rune::codec::fly

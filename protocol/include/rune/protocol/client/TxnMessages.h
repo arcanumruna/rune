@@ -849,6 +849,16 @@ struct AddOffsetsToTxnResponse {
 //
 // Total = 24 + 10 + 2 + txnId.size() + 2 + groupId.size() + 2 +
 //         sum_entries(4+4+8+2+meta.size())
+//
+// Client version 10 (issue #125, KIP-447) — an OPTIONAL trailing member block right after the last entry:
+//   [..+4]    generationId   : int32
+//   [..+2]    memberId length : uint16
+//   [..+len]  memberId bytes
+// Present = the consumer-group member the offsets belong to; the coordinator fences it like an OffsetCommit.
+// Absent (the frame ends with the last entry) = legacy: generationId -1, memberId empty, no member check.  The
+// encoder writes the block only when generationId >= 0.  The decoder accepts both; a block truncated at any offset
+// is a malformed frame (nullopt); bytes after a complete block are ignored (forward compatible).  An older
+// decoder reads only `count` entries and ignores the block (a v10 client may send it to any broker).
 // ===========================================================================
 struct TxnOffsetCommit {
     int64_t  sessionId       = 0;
@@ -857,9 +867,16 @@ struct TxnOffsetCommit {
     int16_t  producerEpoch   = 0;
     std::span<const uint8_t> transactionalId;  // zero-copy view
     std::span<const uint8_t> groupId;           // zero-copy view
+    /// KIP-447 member block (version 10): encoded only when generationId >= 0.  Decoded: hasMemberBlock tells
+    /// whether the frame carried it (a present block is always checked, whatever its values).
+    int32_t  generationId    = -1;
+    std::span<const uint8_t> memberId;          // zero-copy view; empty = none
+    bool     hasMemberBlock  = false;           // decode only
 
     // Decoded: zero-copy forward-iterable view — buf must outlive this.
     TxnOffsetCommitEntriesView entries;
+
+    static constexpr std::size_t kMemberBlockFixed = 4u + 2u;   // generationId + memberId length
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::TxnOffsetCommit); // 51
     static constexpr uint16_t BODY_FIXED  = 10;  // producerId(8) + producerEpoch(2)
@@ -877,7 +894,25 @@ struct TxnOffsetCommit {
              + 2u + entriesSize;
     }
 
-    /// Encode the full frame into buf.  buf must be >= encodedSizeFor(...) bytes.
+    /// Bytes the member block adds (0 when generationId < 0: no block).
+    std::size_t memberBlockSize() const noexcept {
+        return generationId >= 0 ? kMemberBlockFixed + memberId.size() : 0u;
+    }
+
+    /// Total encoded size of THIS message (ids, the member block when present) with `entrs`.
+    std::size_t encodedSize(std::span<const TxnOffsetCommitEntry> entrs) const noexcept {
+        return encodedSizeFor(transactionalId, groupId, entrs) + memberBlockSize();
+    }
+
+    /// Write the member block (when generationId >= 0) at buf[pos..]; returns the bytes written.  Exposed for
+    /// encoders that write the entries themselves (the client splits entries across frames).
+    std::size_t encodeMemberBlock(uint8_t* buf, std::size_t pos) const noexcept {
+        if (generationId < 0) return 0;
+        detail::putLE32(buf, static_cast<int>(pos), generationId);
+        return 4u + putVarBytes(buf + pos + 4, memberId.data(), static_cast<uint16_t>(memberId.size()));
+    }
+
+    /// Encode the full frame into buf.  buf must be >= encodedSize(entrs) bytes.
     /// Returns total bytes written.
     std::size_t encode(uint8_t* buf,
                        std::span<const TxnOffsetCommitEntry> entrs) const noexcept {
@@ -915,6 +950,7 @@ struct TxnOffsetCommit {
                                e.metadata.data(),
                                static_cast<uint16_t>(e.metadata.size()));
         }
+        pos += encodeMemberBlock(buf, pos);
 
         return pos;
     }
@@ -960,6 +996,23 @@ struct TxnOffsetCommit {
 
         msg.entries = TxnOffsetCommitEntriesView(buf, pos, avail, count);
 
+        // Walk the entries to their end (bounded: count is u16): an entry that overruns the frame is a truncation,
+        // and the version-10 member block, if any, starts right after the last one.
+        std::size_t end = pos;
+        for (uint16_t i = 0; i < count; ++i) {
+            if (end + 18u > avail) return std::nullopt;
+            end += 18u + detail::getLE16(buf, static_cast<int>(end) + 16);
+            if (end > avail) return std::nullopt;
+        }
+        if (end == avail) return msg;   // legacy: no member block
+        if (end + kMemberBlockFixed > avail) return std::nullopt;   // a truncated block
+        msg.generationId = detail::getLE32(buf, static_cast<int>(end));
+        std::size_t mpos = end + 4u;
+        const uint8_t* memberData = nullptr;
+        uint16_t       memberLen  = 0;
+        if (!getVarBytes(buf, avail, mpos, memberData, memberLen)) return std::nullopt;
+        msg.memberId       = std::span<const uint8_t>(memberData, memberLen);
+        msg.hasMemberBlock = true;
         return msg;
     }
 };

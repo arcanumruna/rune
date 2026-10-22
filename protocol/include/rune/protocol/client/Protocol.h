@@ -194,6 +194,24 @@ enum class ErrorCode : uint16_t {
     SessionRevoked         = 46,  // client version 9: the session's user was dropped / disabled /
                                   // terminated; terminal (corr 0 = the session-level notice)
     PasswordChangeRequired = 47,  // client version 9: a one-time-password session may only change its password
+    AuthUnavailable        = 48,  // issues #15 / #111 (decision M7): this broker's `__security` state is not provably
+                                  // current (catching up after a boot / wipe, partitioned from the leader or the
+                                  // consensus): it serves no login, no `__security` read and no security DDL.  On an
+                                  // AuthServerFinal / DdlResponse / SubscribeResponse: RETRIABLE - back off and try
+                                  // another broker (rotate seeds).  As the session-level ErrorResponse (corr 0): the
+                                  // broker stayed stale too long and ended the session - reconnect elsewhere.  Sent to
+                                  // every client version (an older client treats it as a retriable connect failure).
+    RecordEgressUnavailable = 49, // issue #118 / PR #441: an authenticating broker could not build the session's own
+                                  // record-egress stream for the partition's worker (it never falls back to the shared
+                                  // one).  Answered as SubscribeResponse.errorCode on the still-pending Subscribe (its
+                                  // OK is held until the egress exists).  RETRIABLE a few times (the client's small
+                                  // per-subscription budget, reset by a bind), then a terminal, explicit failure.
+    UnstableOffsetCommit   = 50,  // client version 10 (issue #438): OffsetFetch / OffsetCommit of a (group, partition)
+                                  // an unfinished transaction holds (its TxnOffsetCommit is pending until the
+                                  // transaction's Complete* record commits), or while the transaction coordinator is
+                                  // not loaded on the group coordinator's node (unknown = held).  RETRIABLE: the
+                                  // client re-sends after its backoff; never surfaced as a failure.  Clients below 10
+                                  // are answered NotCoordinator instead (their retriable code).
 };
 
 // ---------------------------------------------------------------------------
@@ -288,16 +306,25 @@ inline constexpr int32_t kClientVersionLineageNote                = 7;
 //   SecurityDdl{AlterUser self SetPassword}.  SecurityDdl (79) / SecurityBootstrap (80) are answered by
 //   DdlResponse (78).  An authentication-enabled broker answers a Connect below 9 ConnectResponse{ProtocolVersion}.
 //   ConnectResponse v9 (blockLength 21) carries authMode and authState.
-// 10 — Phase 2c subscription filters: `Subscribe` and `JoinGroup` may carry a trailing filter (`[u16 len][bytes]`,
+//  10 — consumer-group offsets under transactions (issues #125 / #438, KIP-447):
+//   - TxnOffsetCommit may carry an optional trailing block after its entries: generationId (int32) + memberId
+//     (u16 varbytes) of the consumer-group member the offsets belong to.  The coordinator then fences it exactly
+//     like an OffsetCommit (UnknownMember / IllegalGeneration: the transaction must abort, the member rejoins).
+//     No block = legacy (no member check).  An older broker's decoder ignores the trailing bytes (it reads only
+//     `count` entries), so a v10 client may send it to any broker.
+//   - OffsetFetch / OffsetCommit may be answered UnstableOffsetCommit (50), retriable (see the code).  A broker
+//     answers a session below 10 NotCoordinator instead.
+// 11 — Phase 2c subscription filters: `Subscribe` and `JoinGroup` may carry a trailing filter (`[u16 len][bytes]`,
 //   canonical format in `rune/codec/FilterWire.h`; omitted = no filter). A broker >= 6 serves it and answers a refused
 //   filter `SubscribeResponse` / `JoinGroupResponse` `{InvalidRequest, detail}`, the detail in a trailing
-//   `[u16 len][utf-8]` field sent only to sessions >= 10. A broker below 6 would ignore the trailer, so a client sends
-//   a filter only to a session whose `ConnectResponse.brokerVersion >= kBrokerVersionFilter`. A session below 10 never
+//   `[u16 len][utf-8]` field sent only to sessions >= 11. A broker below 6 would ignore the trailer, so a client sends
+//   a filter only to a session whose `ConnectResponse.brokerVersion >= kBrokerVersionFilter`. A session below 11 never
 //   has a filter trailer parsed (any bytes after the key / topic ids are ignored) and never sees a detail trailer.
 inline constexpr int32_t kClientVersionCatalog                    = 8;
 inline constexpr int32_t kClientVersionAuth                       = 9;
-inline constexpr int32_t kClientVersionFilter                     = 10;  // subscription filters (Phase 2c)
-inline constexpr int32_t kClientVersion                           = 10;  // what this protocol's client announces
+inline constexpr int32_t kClientVersionTxnOffsetFence             = 10;
+inline constexpr int32_t kClientVersionFilter                     = 11;  // subscription filters (Phase 2c)
+inline constexpr int32_t kClientVersion                           = 11;  // what this protocol's client announces
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h
@@ -325,7 +352,7 @@ enum class AuthState : uint8_t { MustAuthenticate = 0, ResumedAuthenticated = 1,
 //       handshake bytes on ConnectResponse. See kBrokerVersionCrypto.
 //   5 — authentication: ConnectResponse v9 carries authMode / authState (see client version 9).
 //   6 — Phase 2c subscription filters: serves the Subscribe / JoinGroup filter trailer and answers a refused filter with
-//       a detail string to sessions >= 10 (see client version 10).
+//       a detail string to sessions >= 11 (see client version 11).
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kBrokerVersionExplicitGroupSubscriptions = 3;
 inline constexpr int32_t kBrokerVersionAuth                       = 5;   // authentication (ConnectResponse v9 fields)
@@ -375,8 +402,15 @@ inline constexpr int32_t kBrokerVersion                           = 6;   // what
     return clientVersion >= kClientVersionAuth;
 }
 
+/// True when a session that connected with `clientVersion` may be answered UnstableOffsetCommit (50) (version 10);
+/// below it the broker answers NotCoordinator (retriable for every client).  A negative version (unknown: rigs) is
+/// treated as current.
+[[nodiscard]] constexpr bool clientUnderstandsUnstableOffsetCommit(int32_t clientVersion) noexcept {
+    return clientVersion < 0 || clientVersion >= kClientVersionTxnOffsetFence;
+}
+
 /// True when a session that connected with `clientVersion` may carry a filter trailer on Subscribe / JoinGroup and
-/// is sent the refusal `detail` trailer on their responses (version 10).  Below 10 the trailer is never parsed or sent.
+/// is sent the refusal `detail` trailer on their responses (version 11).  Below 11 the trailer is never parsed or sent.
 [[nodiscard]] constexpr bool clientUnderstandsFilters(int32_t clientVersion) noexcept {
     return clientVersion >= kClientVersionFilter;
 }

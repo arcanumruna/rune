@@ -101,6 +101,18 @@ inline constexpr std::int32_t kMsmCommitPosTypeId = 1'000'204;
 // still retrying.  Key = the nodeId (same layout as the role counter).
 inline constexpr std::int32_t kStuckMarkersCounterTypeId = 1'000'210;
 
+// Issue #359: transaction commits stuck on a refused consumer-group offset apply (TCS::txnOffsetCommitsStuck()) and
+// the oldest one's age in ms (TCS::oldestStuckTxnOffsetAgeNs / 1e6).  Gauges, control thread.  Key = the nodeId.
+// (236-239 are reserved by the combined auth fix programme.)
+inline constexpr std::int32_t kStuckTxnOffsetCommitsCounterTypeId = 1'000'240;
+inline constexpr std::int32_t kStuckTxnOffsetAgeMsCounterTypeId   = 1'000'241;
+inline std::string stuckTxnOffsetCommitsLabel(std::int32_t nodeId) {
+    return "rune-txn-offset-commits-stuck node=" + std::to_string(nodeId);
+}
+inline std::string stuckTxnOffsetAgeMsLabel(std::int32_t nodeId) {
+    return "rune-txn-offset-stuck-age-ms node=" + std::to_string(nodeId);
+}
+
 // Controlled shutdown review L5 — the rolling-restart readiness gate: the
 // number of partitions this node replicates but is NOT in the committed ISR of
 // (-1 = unknown: no controller known, or the node is stopping).  An operator

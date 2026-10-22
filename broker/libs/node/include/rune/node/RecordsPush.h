@@ -250,4 +250,20 @@ inline std::size_t encodePushTooLargeError(uint8_t* buf, int64_t sessionId, int6
     return err.encode(buf);
 }
 
+/// Issue #109: the terminal frame of a subscription its push owner ENDS (a revoked READ): ErrorResponse{code,
+/// correlationId = the client's Subscribe correlation id, `detail` truncated to 192 bytes}.  The worker that pushes the
+/// subscription's Records sends it on the same record egress after its last Records, so no Records frame can follow
+/// it.  `buf` must hold kPushTooLargeErrorMaxBytes.  No allocation.
+inline std::size_t encodeSubscriptionEnd(uint8_t* buf, int64_t sessionId, int64_t subscribeCorrId, int16_t code,
+                                         std::string_view detail) noexcept
+{
+    namespace pc = rune::protocol::client;
+    pc::ErrorResponse err;
+    err.sessionId     = sessionId;
+    err.correlationId = subscribeCorrId;
+    err.code          = code;
+    err.message       = detail.substr(0, 192);
+    return err.encode(buf);
+}
+
 } // namespace rune::node

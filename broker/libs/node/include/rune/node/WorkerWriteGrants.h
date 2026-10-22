@@ -1,36 +1,65 @@
 #pragma once
-// WorkerWriteGrants.h - a shard worker's per-session WRITE grants (authentication Task 13, spec §6, D30).
+// WorkerWriteGrants.h - a shard worker's WRITE grants (authentication Task 13, spec §6, D30; issue #259).
 //
-// The control thread ships each authenticated session's WRITE bitmap (PermissionTable::writeBits()) to every worker as
-// SESSION_PERMISSIONS chunks on the session-lifecycle ring.  The worker owns the result outright (shared-nothing): one
-// WriteGrantSlot per SessionAckSink slot, checked on every worker-ingress produce with ONE bounds check + ONE load.
+// The control thread compiles ONE table per distinct grant set (gateway PermissionPool) and ships each table's WRITE
+// bitmap ONCE to every worker as SESSION_PERMISSIONS ops on the session-lifecycle ring; a session is BOUND to its
+// table by a one-op bind.  The worker owns the tables outright (shared-nothing): a fixed store of WritePermTable (stable
+// addresses), and one WriteGrantSlot per SessionAckSink slot pointing at its table - checked on every worker-ingress
+// produce with ONE pointer load, ONE bounds check and ONE bit load.
 //
-// Chunked updates are staged in the worker's single Staging buffer and swapped into the slot on the LAST chunk, so a
-// partially delivered table is never visible.  A session announced without grantAll starts with an empty slot: every
-// produce from it is answered NotAuthorized until its permissions arrive (default deny).
+// SESSION_PERMISSIONS variants (the op's `isolation` flags):
+//   kPermFlagTable  a chunk of table `sessionId`'s full bitmap (nextOffset = first word, hwBound = total words);
+//                   staged and swapped in on the LAST chunk (a partial table is never visible);
+//   kPermFlagPatch  words [nextOffset, +n) of table `sessionId`, resized to hwBound words (a created / dropped object);
+//   kPermFlagBind   session `sessionId` now uses table `nextOffset` (-1 = deny everything); correlationId = epoch,
+//                   producerId = the principal (#122);
+//   kPermFlagDrop   table `sessionId` is freed: every slot still pointing at it is reset to deny, its bits cleared.
+// A session announced without grantAll starts denied: every produce from it is answered NotAuthorized until its bind
+// arrives (default deny).
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <variant>
 #include <vector>
 
+#include <rune/protocol/ProducerIdBinding.h>
+
 namespace rune::node {
 
-struct WriteGrantSlot {
+struct WritePermTable {
     std::vector<uint64_t> bits;      ///< bit (id & 63) of word (id >> 6); capacity persists
     bool                  grantAll = false;
-    uint64_t              epoch    = 0;   ///< the shipped epoch these bits belong to
+};
+/// The two fixed tables: nothing (default deny) and everything (dev / in-process announces).
+[[nodiscard]] inline const WritePermTable* denyWriteTable() noexcept { static const WritePermTable t{}; return &t; }
+[[nodiscard]] inline const WritePermTable* allowAllWriteTable() noexcept { static const WritePermTable t{{}, true}; return &t; }
+
+struct WriteGrantSlot {
+    const WritePermTable* table    = denyWriteTable();   ///< never null
+    uint32_t              ownerTag = 0;   ///< issue #122: pidOwnerTag(the session's principal)
+    uint64_t              epoch    = 0;   ///< the bind epoch this slot holds
 };
 
 /// The hot-path check.
 [[nodiscard]] inline bool allowsWrite(const WriteGrantSlot& s, int32_t topicId) noexcept {
+    const WritePermTable& p = *s.table;
     const uint32_t t = static_cast<uint32_t>(topicId);
-    return s.grantAll | ((t >> 6) < s.bits.size() && ((s.bits[t >> 6] >> (t & 63)) & 1u));
+    return p.grantAll | ((t >> 6) < p.bits.size() && ((p.bits[t >> 6] >> (t & 63)) & 1u));
 }
 
 /// SESSION_PERMISSIONS wire flags (the op's `isolation` byte).
 inline constexpr uint8_t kPermFlagLast     = 0x01;
 inline constexpr uint8_t kPermFlagGrantAll = 0x02;
+inline constexpr uint8_t kPermFlagTable    = 0x04;   ///< issue #259: the variants above
+inline constexpr uint8_t kPermFlagPatch    = 0x08;
+inline constexpr uint8_t kPermFlagBind     = 0x10;
+inline constexpr uint8_t kPermFlagDrop     = 0x20;
+/// Issue #196: an enforcement fence on the session-lifecycle ring (correlationId = the fence sequence number): the
+/// worker answers SessionSignal FenceAck{sessionId 1} - every permission item, bind and SessionClose queued before it
+/// on this ring is installed.  Carries no table.
+inline constexpr uint8_t kPermFlagFence    = 0x40;
+/// The worker's table store bound (== gateway PermissionPool::kMaxTables).
+inline constexpr std::size_t kMaxWritePermTables = 4096;
 
 struct NoUpdate {};
 struct Staging {
@@ -43,13 +72,14 @@ using PermissionUpdate = std::variant<NoUpdate, Staging>;
 
 enum class PermissionChunkResult : uint8_t { Staged, Installed, Dropped };
 
-/// The worker's chunk assembler: ONE per worker; the buffer circulates between it, the slots and `spare_` so nothing
-/// allocates once the buffers reached their peak size.  `Sink` provides installWriteGrants(sid, words&, grantAll, epoch).
+/// The worker's chunk assembler of a full TABLE: ONE per worker; the buffer circulates between it, the tables and
+/// `spare_` so nothing allocates once the buffers reached their peak size.  `Sink` provides
+/// installWriteGrants(key, words&, grantAll, epoch, owner) - `key` the table id (issue #259).
 class PermissionStager {
 public:
     template <class Sink>
     PermissionChunkResult apply(Sink& sink, int64_t sessionId, uint64_t firstWord, uint64_t totalWords, uint8_t flags,
-                                uint64_t epoch, const uint8_t* tail, std::size_t tailLen) {
+                                uint64_t epoch, const uint8_t* tail, std::size_t tailLen, uint64_t owner) {
         static_assert(sizeof(uint64_t) == 8);
         if (tailLen % 8 != 0 || firstWord > totalWords || (tailLen / 8) > totalWords - firstWord) return drop_();
         const std::size_t count = tailLen / 8;
@@ -69,7 +99,7 @@ public:
         st->filled = firstWord + count;
         if ((flags & kPermFlagLast) == 0) return PermissionChunkResult::Staged;
         if (st->filled != totalWords) return drop_();
-        const bool ok = sink.installWriteGrants(sessionId, st->words, (flags & kPermFlagGrantAll) != 0, epoch);
+        const bool ok = sink.installWriteGrants(sessionId, st->words, (flags & kPermFlagGrantAll) != 0, epoch, owner);
         spare_ = std::move(st->words);                         // the swapped-out slot buffer: the next staging buffer
         state_ = NoUpdate{};
         return ok ? PermissionChunkResult::Installed : PermissionChunkResult::Dropped;   // unknown / closed session
