@@ -46,6 +46,7 @@
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/node/GroupErrorMapping.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -3502,4 +3503,87 @@ TEST_F(GroupJoinAdversarial, ARefusedSinkJoinNeverFixesTheGroupFilterAdversarial
     EXPECT_EQ(b.code, static_cast<int16_t>(pc::ErrorCode::OK)) << b.detail;
     EXPECT_TRUE(service_->coordinator(g).filterBytes().empty());
     EXPECT_EQ(service_->coordinator(g).memberCount(), 1u);
+}
+
+// Issue #212: removeUnauthorizedMembers also evicts a member whose subscribed TOPIC the session may no longer read
+// (mayReadTopic), even while the group's READ holds - scoped to the session: the same group's member on another session
+// stays, and the group rebalances at once (not at the heartbeat timeout).  A topic the member never subscribed to, or
+// no topic check at all, removes nothing.
+namespace {
+std::size_t encodeJoinAs(uint8_t* buf, int64_t sid, int64_t corr, std::string_view group, std::string_view member,
+                         int32_t topicId) {
+    pc::JoinGroup msg;
+    msg.sessionId = sid; msg.correlationId = corr; msg.sessionTimeoutMs = 60'000;
+    msg.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+    msg.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(member.data()), member.size());
+    const std::array<int32_t, 1> topics{topicId};
+    return msg.encode(buf, std::span<const int32_t>(topics));
+}
+bool readAnyGroup(void*, std::string_view) noexcept { return true; }
+/// ctx: the one topic name refused.
+bool readAllTopicsBut(void* ctx, std::string_view topic) noexcept { return topic != *static_cast<std::string_view*>(ctx); }
+}  // namespace
+
+class GroupAuthRegression : public CG3ServiceTest {};
+
+TEST_F(GroupAuthRegression, RemoveUnauthorizedMembersEvictsOnlyMembersOfTheSessionSubscribedToAnUnreadableTopicRegression) {
+    const std::string groupId = "g-topic-auth";
+    auto join = [&](int64_t sid, int64_t corr, const std::string& member) {
+        const auto n = encodeJoinAs(req_, sid, corr, groupId, member, kTestTopicId);
+        const auto o = service_->handleJoinGroup(req_, n, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
+        const auto r = pc::JoinGroupResponse::decode(out_, o);
+        EXPECT_TRUE(r.has_value() && r->errorCode == 0);
+        return std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size());
+    };
+    auto heartbeat = [&](int64_t sid, const std::string& member, int64_t corr) {
+        const auto n = encodeHeartbeat(req_, sid, corr, groupId, member, service_->coordinator(groupId).generationId());
+        const auto o = service_->handleHeartbeat(req_, n, clock_, out_, kBufSize);
+        EXPECT_GT(o, 0u);
+        return decodeHBErrorCode(out_, o);
+    };
+    const std::string m1 = join(1, 980, "");
+    const std::string m2 = join(2, 981, "");
+    (void)join(1, 982, m1);
+    (void)join(2, 983, m2);
+    ASSERT_TRUE(driveUntil([&] { return service_->coordinator(groupId).state() == GroupState::Stable; }, 10));
+    ASSERT_EQ(service_->coordinator(groupId).memberCount(), 2u);
+    const int32_t genBefore = service_->coordinator(groupId).generationId();
+
+    // No topic check, or a refused topic nobody subscribed to: nothing leaves.
+    std::string_view refused = "another-topic";
+    EXPECT_EQ(service_->removeUnauthorizedMembers(1, clock_, {&readAnyGroup, &refused}), 0);
+    EXPECT_EQ(service_->removeUnauthorizedMembers(1, clock_, {&readAnyGroup, &refused, &readAllTopicsBut}), 0);
+    EXPECT_EQ(service_->coordinator(groupId).memberCount(), 2u);
+    EXPECT_EQ(service_->coordinator(groupId).state(), GroupState::Stable);
+
+    // Session 1 can no longer read the member's topic: only its member leaves, and the group rebalances now.
+    refused = kTestTopic;
+    EXPECT_EQ(service_->removeUnauthorizedMembers(1, clock_, {&readAnyGroup, &refused, &readAllTopicsBut}), 1);
+    EXPECT_EQ(service_->coordinator(groupId).memberCount(), 1u);
+    EXPECT_EQ(service_->coordinator(groupId).state(), GroupState::PreparingRebalance) << "the group rebalances at once";
+    EXPECT_EQ(heartbeat(1, m1, 984), static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+    EXPECT_EQ(heartbeat(2, m2, 985), static_cast<int16_t>(pc::ErrorCode::RebalanceInProgress))
+        << "the other session's member stays, in the rebalance";
+    (void)join(2, 986, m2);
+    ASSERT_TRUE(driveUntil([&] { return service_->coordinator(groupId).state() == GroupState::Stable; }, 10));
+    EXPECT_GT(service_->coordinator(groupId).generationId(), genBefore);
+    EXPECT_EQ(heartbeat(2, m2, 987), static_cast<int16_t>(pc::ErrorCode::OK));
+}
+
+// Issue #212: removeSessionMembers - a revoked session (terminal) takes every member it holds out of every group now.
+TEST_F(GroupAuthRegression, RemoveSessionMembersEvictsEveryMemberOfTheRevokedSessionOnlyRegression) {
+    auto join = [&](const std::string& groupId, int64_t sid, int64_t corr) {
+        const auto n = encodeJoinAs(req_, sid, corr, groupId, "", kTestTopicId);
+        const auto o = service_->handleJoinGroup(req_, n, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
+        const auto r = pc::JoinGroupResponse::decode(out_, o);
+        EXPECT_TRUE(r.has_value() && r->errorCode == 0);
+    };
+    join("g-rev-a", 1, 990);
+    join("g-rev-b", 1, 991);
+    join("g-rev-a", 2, 992);
+    service_->removeSessionMembers(1, clock_);
+    EXPECT_EQ(service_->coordinator("g-rev-a").memberCount(), 1u) << "session 2's member stays";
+    EXPECT_EQ(service_->coordinator("g-rev-b").memberCount(), 0u);
+    service_->removeSessionMembers(1, clock_);   // idempotent
+    EXPECT_EQ(service_->coordinator("g-rev-a").memberCount(), 1u);
 }

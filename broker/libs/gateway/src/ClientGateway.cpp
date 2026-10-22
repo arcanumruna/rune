@@ -8971,30 +8971,23 @@ void ClientGateway::executeLiveActions_(Session& s, const rune::gateway::LiveAct
             sendErrorOn_(s, corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized), d ? std::string_view(d->detail) : std::string_view("not authorized"));
         s.securityReadCorrs.clear();
     }
-    // Group members: a lost group READ removes the member (its next Heartbeat / Commit / Fetch answers 45); a group
-    // partition subscription whose TOPIC lost READ removes the session's members too (the rejoin is then refused by the
-    // join check) - a consumer must not keep receiving a topic it may no longer read.
-    bool groupTopicLost = false;
-    if (const auto it = groupMemberSubs_.find(s.sessionId); it != groupMemberSubs_.end())
-        for (const int64_t subId : it->second)
-            if (const auto sub = subscriptions_.find(subId);
-                sub != subscriptions_.end() && sub->second.topicId >= 0 &&
-                !perms.allows(sub->second.topicId, rune::security::opBit(rune::security::Operation::Read)))
-                groupTopicLost = true;
-    if (groupService_ != nullptr && (act.endGroups || groupTopicLost)) {
-        if (groupTopicLost) {
-            groupService_->evictSessionMembers(s.sessionId, nowNs_);
-        } else {
-            const PermissionTable* table = &perms;
-            groupService_->removeUnauthorizedMembers(
-                s.sessionId, nowNs_,
-                IGroupRequestHandler::GroupReadCheck{
-                    [](void* ctx, std::string_view group) noexcept {
-                        return static_cast<const PermissionTable*>(ctx)->allowsName(
-                            rune::security::ResourceType::Group, group, rune::security::opBit(rune::security::Operation::Read));
-                    },
-                    const_cast<PermissionTable*>(table)});
-        }
+    // Group members: a lost group READ removes the member (its next Heartbeat / Commit / Fetch answers 45); issue #212:
+    // a lost READ on a topic a member subscribed to removes that member too (its group rebalances now; the re-join is
+    // refused by the join check) - a consumer must not keep an assignment of a topic it may no longer read.
+    if (groupService_ != nullptr && (act.endGroups || act.endGroupTopics)) {
+        const PermissionTable* table = &perms;
+        groupService_->removeUnauthorizedMembers(
+            s.sessionId, nowNs_,
+            IGroupRequestHandler::GroupReadCheck{
+                [](void* ctx, std::string_view group) noexcept {
+                    return static_cast<const PermissionTable*>(ctx)->allowsName(
+                        rune::security::ResourceType::Group, group, rune::security::opBit(rune::security::Operation::Read));
+                },
+                const_cast<PermissionTable*>(table),
+                [](void* ctx, std::string_view topic) noexcept {
+                    return static_cast<const PermissionTable*>(ctx)->allowsName(
+                        rune::security::ResourceType::Topic, topic, rune::security::opBit(rune::security::Operation::Read));
+                }});
     }
 }
 
@@ -9030,6 +9023,9 @@ void ClientGateway::revokeSession_(int64_t sid, std::string_view reason)
     for (const int64_t corr : s->securityReadCorrs) sendErrorOn_(*s, corr, code, reason);
     // ... then the session-level frame (corr 0): every other in-flight request of the session completes with it.
     sendErrorOn_(*s, 0, code, reason);
+    // Issue #212: a revoked session is terminal (never resumed): its group members leave now, so their groups
+    // rebalance at once instead of at the members' heartbeat timeout.
+    if (groupService_ != nullptr) groupService_->removeSessionMembers(sid, nowNs_);
     closeAfterAnswers_(sid);   // issue #119: every 46 is delivered first, even when spilled
 }
 

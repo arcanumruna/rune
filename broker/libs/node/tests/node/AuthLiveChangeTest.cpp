@@ -326,6 +326,95 @@ TEST(AuthLiveChangeRegression, GroupMemberLosingGroupReadIsRemovedWithNotAuthori
     EXPECT_EQ(hb, static_cast<int>(pc::ErrorCode::UnknownMember)) << "removed from the group by the revoke";
 }
 
+// ── Issue #212: a member that loses READ on its topic, or whose session is revoked, leaves its group at once ──────────
+// Not at the heartbeat timeout (30 s here; no test waits for it): its partitions are consumed by nobody until then.
+namespace {
+constexpr int kUnknownMember = static_cast<int>(pc::ErrorCode::UnknownMember);
+/// The remaining member's Heartbeat at the old generation once its group rebalanced: RebalanceInProgress, or
+/// StaleGeneration when the coordinator already moved the group to a new generation - never the live OK.
+bool rebalanced(int hb) {
+    return hb == static_cast<int>(pc::ErrorCode::RebalanceInProgress) || hb == static_cast<int>(pc::ErrorCode::StaleGeneration);
+}
+/// Members on sessions `s1` and `s2` of group "cg" over `topics`, both Stable at one generation.
+struct Pair { std::string m1, m2; int32_t gen = -1; };
+Pair joinPair(Live& t, int64_t s1, int64_t s2, const std::vector<int32_t>& topics) {
+    Pair p;
+    const auto a = t.r.c().joinGroup(t.ch(), AuthRig::stream(), s1, "cg", {}, topics);
+    const auto b = t.r.c().joinGroup(t.ch(), AuthRig::stream(), s2, "cg", {}, topics);
+    if (!a || a->errorCode != 0 || !b || b->errorCode != 0) return p;
+    p.m1 = a->memberId; p.m2 = b->memberId;
+    const auto ra = t.r.c().joinGroup(t.ch(), AuthRig::stream(), s1, "cg", p.m1, topics);
+    const auto rb = t.r.c().joinGroup(t.ch(), AuthRig::stream(), s2, "cg", p.m2, topics);
+    if (!ra || ra->errorCode != 0 || !rb || rb->errorCode != 0) return p;
+    p.gen = std::max(ra->generation, rb->generation);
+    // The coordinator assigns on its next duty pass: bounded by the number of round trips, never by wall time.
+    for (int i = 0; i < 200; ++i)
+        if (t.r.heartbeatAt(s1, "cg", p.m1, p.gen) == 0 && t.r.heartbeatAt(s2, "cg", p.m2, p.gen) == 0) return p;
+    p.gen = -1;
+    return p;
+}
+}  // namespace
+
+TEST(AuthLiveChangeRegression, RevokedTopicReadEvictsTheGroupMemberRegression) {
+    Live t("livegrouptopic");
+    std::string name;
+    const int64_t s = t.r.newUser({exact(SO::Read, ST::Group, "cg"), exact(SO::Read, ST::Topic, "orders")}, &name);
+    const int64_t s2 = t.r.newUser({exact(SO::Read, ST::Group, "cg"), exact(SO::Read, ST::Topic, "orders")});
+    const Pair p = joinPair(t, s, s2, {t.r.orders});
+    ASSERT_GT(p.gen, 0) << "precondition: two live members, Stable";
+    ASSERT_EQ(t.revokeExact(name, SO::Read, ST::Topic, "orders"), 0);
+    EXPECT_EQ(t.r.heartbeatAt(s, "cg", p.m1, p.gen), kUnknownMember) << "removed from the group by the topic revoke";
+    EXPECT_PRED1(rebalanced, t.r.heartbeatAt(s2, "cg", p.m2, p.gen)) << "the group rebalances at once";
+    // The other member takes the freed partitions: it re-joins alone and is Stable (a lone member holds every
+    // partition of orders) - the assignment itself is not visible to this wire rig, the lone Stable member is.
+    const auto again = t.r.c().joinGroup(t.ch(), AuthRig::stream(), s2, "cg", p.m2, {t.r.orders});
+    ASSERT_TRUE(again.has_value());
+    ASSERT_EQ(again->errorCode, 0);
+    EXPECT_GT(again->generation, p.gen);
+    int hb = -1;
+    for (int i = 0; i < 200 && hb != 0; ++i) hb = t.r.heartbeatAt(s2, "cg", p.m2, again->generation);
+    EXPECT_EQ(hb, 0) << "the remaining member is Stable alone";
+}
+
+TEST(AuthLiveChangeRegression, RevokedTopicReadOfAnotherTopicKeepsTheMemberRegression) {
+    Live t("livegroupother");
+    std::string name;
+    const int64_t s = t.r.newUser({exact(SO::Read, ST::Group, "cg"), exact(SO::Read, ST::Topic, "orders"),
+                                   exact(SO::Read, ST::Topic, "secret")}, &name);
+    const int64_t s2 = t.r.newUser({exact(SO::Read, ST::Group, "cg"), exact(SO::Read, ST::Topic, "orders")});
+    const Pair p = joinPair(t, s, s2, {t.r.orders});
+    ASSERT_GT(p.gen, 0);
+    ASSERT_EQ(t.revokeExact(name, SO::Read, ST::Topic, "secret"), 0);   // a topic the member never subscribed to
+    EXPECT_EQ(t.r.heartbeatAt(s, "cg", p.m1, p.gen), 0) << "the member stays";
+    EXPECT_EQ(t.r.heartbeatAt(s2, "cg", p.m2, p.gen), 0) << "no rebalance";
+}
+
+TEST(AuthLiveChangeRegression, DisabledUserLeavesItsGroupsAtOnceRegression) {
+    Live t("livegroupdisable");
+    std::string name;
+    const int64_t s = t.r.newUser({exact(SO::Read, ST::Group, "cg"), exact(SO::Read, ST::Topic, "orders")}, &name);
+    const int64_t s2 = t.r.newUser({exact(SO::Read, ST::Group, "cg"), exact(SO::Read, ST::Topic, "orders")});
+    const Pair p = joinPair(t, s, s2, {t.r.orders});
+    ASSERT_GT(p.gen, 0);
+    ASSERT_EQ(t.alter(name, pc::UserChangeKind::Disable), 0);
+    EXPECT_EQ(t.errorOn(0, s), kRevoked);
+    EXPECT_PRED1(rebalanced, t.r.heartbeatAt(s2, "cg", p.m2, p.gen))
+        << "the revoked session's member left at once (no heartbeat timeout): the group rebalances";
+}
+
+TEST(AuthLiveChangeRegression, DropUserLeavesItsGroupsAtOnceRegression) {
+    Live t("livegroupdrop");
+    std::string name;
+    const int64_t s = t.r.newUser({exact(SO::Read, ST::Group, "cg"), exact(SO::Read, ST::Topic, "orders")}, &name);
+    const int64_t s2 = t.r.newUser({exact(SO::Read, ST::Group, "cg"), exact(SO::Read, ST::Topic, "orders")});
+    const Pair p = joinPair(t, s, s2, {t.r.orders});
+    ASSERT_GT(p.gen, 0);
+    ASSERT_EQ(t.dropUser(name), 0);
+    EXPECT_EQ(t.errorOn(0, s), kRevoked);
+    EXPECT_PRED1(rebalanced, t.r.heartbeatAt(s2, "cg", p.m2, p.gen))
+        << "the dropped user's member left at once (no heartbeat timeout): the group rebalances";
+}
+
 TEST(AuthLiveChangeRegression, TheGrantOkIsEnforcedByTheAnsweringBrokerImmediately) {
     Live t("liveimmediate");
     std::string name;

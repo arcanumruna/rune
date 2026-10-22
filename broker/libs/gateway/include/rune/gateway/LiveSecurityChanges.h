@@ -27,7 +27,10 @@ struct LiveActions {
     bool endCatalogReads  = false;              ///< lost DESCRIBE ON CLUSTER while holding `__catalog` reads
     bool endSecurityReads = false;              ///< lost ADMIN ON CLUSTER while holding `__security` reads
     bool endGroups        = false;              ///< lost a group READ grant: the gateway removes the members whose group is no longer readable
-    [[nodiscard]] bool empty() const noexcept { return ends.empty() && !endCatalogReads && !endSecurityReads && !endGroups; }
+    bool endGroupTopics   = false;              ///< lost a topic READ grant: the gateway removes the members subscribed to a topic no longer readable
+    [[nodiscard]] bool empty() const noexcept {
+        return ends.empty() && !endCatalogReads && !endSecurityReads && !endGroups && !endGroupTopics;
+    }
 };
 
 /// What a refresh does to one session: every live subscription whose object lost READ (-6: DESCRIBE CLUSTER, -7: ADMIN

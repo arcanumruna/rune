@@ -1005,18 +1005,31 @@ int GroupCoordinationService::removeUnauthorizedMembers(int64_t sessionId, int64
     if (check.mayRead == nullptr) return 0;
     int removed = 0;
     for (auto& [groupId, coord] : coordinators_) {
-        if (check.mayRead(check.ctx, groupId)) continue;
+        // Issue #212: a group whose READ holds is not skipped wholesale - a member of it subscribed to a topic the
+        // session may no longer read leaves too.
+        const bool groupOk = check.mayRead(check.ctx, groupId);
+        if (groupOk && check.mayReadTopic == nullptr) continue;
         evictScratch_.clear();
         for (const auto& member : coord.members()) {
             buildMemberKey_(groupId, member.memberId);
             const auto it = memberSessionMap_.find(memberKeyScratch_);
-            if (it != memberSessionMap_.end() && it->second.sessionId == sessionId) evictScratch_.push_back(member.memberId);
+            if (it == memberSessionMap_.end() || it->second.sessionId != sessionId) continue;
+            bool topicLost = false;
+            if (check.mayReadTopic != nullptr)
+                for (const std::string& topic : member.subscribedTopics)
+                    if (!check.mayReadTopic(check.ctx, topic)) { topicLost = true; break; }
+            if (!groupOk || topicLost) evictScratch_.push_back(member.memberId);
         }
         if (evictScratch_.empty()) continue;
         if (gateway_) gateway_->revokeGroupSubscriptions(sessionId);   // as LeaveGroup: before the mapping goes
         for (const auto& memberId : evictScratch_) {
-            spdlog::warn("GroupCoordinationService: session {} lost READ on group '{}' - member '{}' removed (its next "
-                         "request is answered NotAuthorized)", sessionId, groupId, memberId);
+            if (!groupOk)
+                spdlog::warn("GroupCoordinationService: session {} lost READ on group '{}' - member '{}' removed (its "
+                             "next request is answered NotAuthorized)", sessionId, groupId, memberId);
+            else
+                spdlog::warn("GroupCoordinationService: session {} lost READ on a topic member '{}' of group '{}' is "
+                             "subscribed to - member removed (the group rebalances; a re-join is refused)",
+                             sessionId, memberId, groupId);
             coord.leave(memberId, coord.generationId(), nowNs);
             buildMemberKey_(groupId, memberId);
             memberSessionMap_.erase(memberKeyScratch_);
@@ -1028,6 +1041,16 @@ int GroupCoordinationService::removeUnauthorizedMembers(int64_t sessionId, int64
 
 void GroupCoordinationService::evictSessionMembers(int64_t sessionId, int64_t nowNs)
 {
+    evictSessionMembers_(sessionId, nowNs, "old client - answered UnknownMember instead of an error it would ignore");
+}
+
+void GroupCoordinationService::removeSessionMembers(int64_t sessionId, int64_t nowNs)
+{
+    evictSessionMembers_(sessionId, nowNs, "session revoked - its members leave their groups");
+}
+
+void GroupCoordinationService::evictSessionMembers_(int64_t sessionId, int64_t nowNs, const char* why)
+{
     for (auto& [groupId, coord] : coordinators_) {
         evictScratch_.clear();
         for (const auto& member : coord.members()) {
@@ -1038,8 +1061,8 @@ void GroupCoordinationService::evictSessionMembers(int64_t sessionId, int64_t no
         if (evictScratch_.empty()) continue;
         if (gateway_) gateway_->revokeGroupSubscriptions(sessionId);
         for (const auto& memberId : evictScratch_) {
-            spdlog::warn("GroupCoordinationService: old client (session {}) member '{}' of group '{}' evicted — "
-                         "answered UnknownMember instead of an error it would ignore", sessionId, memberId, groupId);
+            spdlog::warn("GroupCoordinationService: session {} member '{}' of group '{}' evicted: {}", sessionId,
+                         memberId, groupId, why);
             coord.leave(memberId, coord.generationId(), nowNs);
             buildMemberKey_(groupId, memberId);
             memberSessionMap_.erase(memberKeyScratch_);

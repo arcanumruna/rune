@@ -76,15 +76,22 @@ struct IGroupRequestHandler {
     // Authentication Task 14: a live permission change took a session's READ on some groups away.  Every member of
     // `sessionId` whose group `mayRead(ctx, group)` refuses leaves its group (its subscriptions are revoked, the
     // session mapping dropped) - its next Heartbeat / Commit / Fetch is then answered NotAuthorized by the gateway's
-    // own check.  Returns the number of members removed.  Cold; `mayRead` is a plain function (no allocation).
+    // own check.  Issue #212: so does every member of `sessionId` subscribed to a topic `mayReadTopic(ctx, topic)`
+    // refuses (when set), even while its group stays readable - it must not keep an assignment of a topic it may no
+    // longer read.  Returns the number of members removed.  Cold; both checks are plain functions (no allocation)
+    // sharing `ctx`.
     struct GroupReadCheck {
         bool (*mayRead)(void* ctx, std::string_view groupId) noexcept = nullptr;
         void* ctx = nullptr;
+        bool (*mayReadTopic)(void* ctx, std::string_view topicName) noexcept = nullptr;
     };
     virtual int removeUnauthorizedMembers(int64_t sessionId, int64_t nowNs, GroupReadCheck check) {
         (void)sessionId; (void)nowNs; (void)check;
         return 0;
     }
+    // Issue #212: the session ended for good (revoked: user dropped / disabled, TERMINATE SESSIONS): its members leave
+    // their groups now, so the group rebalances at once instead of at their heartbeat timeout.  Cold.  Default: nothing.
+    virtual void removeSessionMembers(int64_t sessionId, int64_t nowNs) { (void)sessionId; (void)nowNs; }
 };
 
 } // namespace rune::gateway
