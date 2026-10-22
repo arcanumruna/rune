@@ -87,6 +87,7 @@
 #include <map>
 #include <span>
 #include <unordered_map>
+#include <rune/consensus/ReadLease.h>
 #include <unordered_set>
 #include <vector>
 
@@ -2828,6 +2829,7 @@ private:
         // leader re-decides from the committed map.
         pendingDynamicRecords_.clear();
         inflight_.clear();
+        predecessors_.clear();   // issue #486: a re-claim's own past-W rule covers the moves before it
         pendingLineageRecords_.clear();   // C1: the next controller re-decides (leaders re-send)
         lineageInflight_.clear();
         pendingRemovalRecords_.clear();   // Task 8: removedTopics_ is kept — the next controller removes
@@ -3295,12 +3297,13 @@ private:
             // lease (~120 ms; at once for a dead broker, whose lease ran out before it was judged dead).  Grants after
             // the append carry a commitPos above it: FIFO keeps them behind the demotion.
             if (moveFenceFn_ != nullptr) {
-                if (const int32_t old = leaderMovedOutOfIsr_(br); old >= 0 && !moveFenceFn_(moveFenceCtx_, old, lastNowNs_)) {
+                if (const int32_t old = fencedPredecessor_(br); old >= 0 && !moveFenceFn_(moveFenceCtx_, old, lastNowNs_)) {
                     if (old < 32) leaseWithheldMask_ |= 1u << static_cast<uint32_t>(old);
                     ++movesFenced_;
                     break;
                 }
             }
+            const int32_t prevLeader = currentLeader_(br.rec.topicId, br.rec.partition);
 
             // Never ignore the result: a refusal (no longer the leader)
             // keeps the record queued, in order.
@@ -3315,6 +3318,7 @@ private:
                 for (std::size_t i = 0; i < ir.n; ++i) ir.isr[i] = br.isr[i];
                 inflight_[partitionKey_(br.rec.topicId, br.rec.partition)] = ir;
             }
+            notePredecessor_(br, prevLeader);
             cycleBytes   += n;
             cycleRecords += 1;
             pendingDynamicRecords_.pop_front();
@@ -3364,18 +3368,52 @@ private:
     /// committed) assignment record.
     /// v2-review I4: an appended-not-committed assignment record, with the CONTENT the storage confirmation needs
     /// (a record that adds a node to a leader/ISR blocks that node's confirmation).
-    /// Issue #486: the broker a queued record takes leadership off while leaving it out of the new ISR (-1: none - a
-    /// placement, the same leader, or an old leader kept in the ISR, whose fetch at the new epoch the new leader's HW
-    /// needs: it applies the demotion before the new leader can commit without it).  The old leader is the latest
-    /// appended record's (in flight), else the committed one.
-    [[nodiscard]] int32_t leaderMovedOutOfIsr_(const rune::metadata::BalancerRecord& br) const noexcept {
-        int32_t old = -1;
-        if (const auto it = inflight_.find(partitionKey_(br.rec.topicId, br.rec.partition)); it != inflight_.end())
-            old = it->second.leader;
-        else if (const auto* pa = msm_.assignment(br.rec.topicId, br.rec.partition)) old = pa->leaderNode;
-        if (old < 0 || old == br.rec.leaderNode) return -1;
-        for (const int32_t m : br.isr) if (m == old) return -1;
-        return old;
+    /// Issue #486: the leader a queued record replaces - the latest appended record's (in flight), else the committed
+    /// one (-1: none / leaderless).
+    [[nodiscard]] int32_t currentLeader_(int32_t topicId, int32_t partition) const noexcept {
+        if (const auto it = inflight_.find(partitionKey_(topicId, partition)); it != inflight_.end()) return it->second.leader;
+        if (const auto* pa = msm_.assignment(topicId, partition)) return pa->leaderNode;
+        return -1;
+    }
+    /// Issue #486 (PR #490 re-check): per partition, the last REAL leader before the latest leader change this controller
+    /// appended (never -1: a leaderless step in between does not hide it) and when.  Until W after that append, a lease
+    /// that predecessor was granted before the change may still run, so any record removing it from the ISR goes through
+    /// the fence - a later ISR shrink by the new leader or a controlled shutdown included, not only the move itself.
+    /// After W every such lease has ended (and FIFO covers the grants after the append): the entry is dropped.  One
+    /// entry per partition (bounded), cleared on a controller step-down (a new controller's own past-W rule covers it).
+    struct Predecessor { int32_t node = -1; int64_t movedAtNs = 0; };
+    std::unordered_map<int64_t, Predecessor> predecessors_;
+    [[nodiscard]] bool predecessorLive_(int64_t key, Predecessor& out) noexcept {
+        const auto it = predecessors_.find(key);
+        if (it == predecessors_.end()) return false;
+        if (lastNowNs_ - it->second.movedAtNs >= rune::consensus::kReadLeaseFenceWaitNs) { predecessors_.erase(it); return false; }
+        out = it->second;
+        return true;
+    }
+    /// The broker a queued record must wait on (-1: none): the leader it replaces, when the record leaves that leader out
+    /// of the ISR; else the partition's live predecessor, when the record removes it from the ISR.  A record that keeps
+    /// the old leader in the ISR never waits (the new leader's HW needs its fetch at the new epoch, sent only after it
+    /// applied the demotion) - unless a later record takes it out before W passed.
+    [[nodiscard]] int32_t fencedPredecessor_(const rune::metadata::BalancerRecord& br) noexcept {
+        const int64_t key = partitionKey_(br.rec.topicId, br.rec.partition);
+        const auto inIsr = [&](int32_t n) { for (const int32_t m : br.isr) if (m == n) return true; return false; };
+        Predecessor pred;
+        const bool live = predecessorLive_(key, pred);
+        int32_t old = currentLeader_(br.rec.topicId, br.rec.partition);
+        if (old < 0 && live) old = pred.node;   // a leaderless step: the last real leader
+        if (old >= 0 && old != br.rec.leaderNode && !inIsr(old)) return old;
+        if (live && pred.node != br.rec.leaderNode && !inIsr(pred.node)) return pred.node;
+        return -1;
+    }
+    /// After an append: a leader change remembers the last real leader it replaced (a leaderless record included).
+    void notePredecessor_(const rune::metadata::BalancerRecord& br, int32_t prevLeader) {
+        const int64_t key = partitionKey_(br.rec.topicId, br.rec.partition);
+        if (prevLeader == br.rec.leaderNode) return;   // no leader change
+        Predecessor pred;
+        const bool live = predecessorLive_(key, pred);
+        const int32_t real = prevLeader >= 0 ? prevLeader : (live ? pred.node : -1);
+        if (real < 0 || real == br.rec.leaderNode) { predecessors_.erase(key); return; }   // none, or it leads again
+        predecessors_[key] = Predecessor{real, lastNowNs_};
     }
     LeaderMoveFence moveFenceFn_  = nullptr;
     void*           moveFenceCtx_ = nullptr;
