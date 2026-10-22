@@ -103,23 +103,35 @@ public:
 
         // In invoker mode the gateway's constructor (which blocks on its ingress subscription) needs the conductor
         // run for it: a helper thread invokes it for exactly that call, then is joined (single caller at a time).
+        // The helper is bounded (iteration cap + 30 s, above the client's 10 s driver timeout that bounds the ctor's
+        // resolve) and is joined on every exit, a throwing ctor included (a joinable std::thread would terminate).
         std::atomic<bool> ctorDone{false};
         std::thread invoker;
         if (useInvoker_) invoker = std::thread([&] {
-            while (!ctorDone.load(std::memory_order_acquire)) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+            for (int i = 0; i < 300'000 && !ctorDone.load(std::memory_order_acquire) &&
+                            std::chrono::steady_clock::now() < deadline; ++i) {
                 aeron_->conductorAgentInvoker().invoke();
                 std::this_thread::sleep_for(std::chrono::microseconds{100});
             }
         });
-        // Gateway with a 100 ms session timeout.
-        gw_ = std::make_unique<ClientGateway>(
-            aeron_,
-            "aeron:ipc",
-            kIngressStream,
-            kThisNodeId,
-            kTimeoutNs);
-        ctorDone.store(true, std::memory_order_release);
-        if (invoker.joinable()) invoker.join();
+        const auto joinInvoker = [&] {
+            ctorDone.store(true, std::memory_order_release);
+            if (invoker.joinable()) invoker.join();
+        };
+        try {
+            // Gateway with a 100 ms session timeout.
+            gw_ = std::make_unique<ClientGateway>(
+                aeron_,
+                "aeron:ipc",
+                kIngressStream,
+                kThisNodeId,
+                kTimeoutNs);
+        } catch (...) {
+            joinInvoker();
+            throw;
+        }
+        joinInvoker();
     }
 
     void TearDown() override {
@@ -272,7 +284,12 @@ private:
         aeron_driver_context_set_shared_idle_strategy(driverCtx_, "sleep-ns");
         aeron_driver_context_set_term_buffer_sparse_file(driverCtx_, true);
         aeron_driver_context_set_term_buffer_length(driverCtx_, 64 * 1024);
-        if (useInvoker_) aeron_driver_context_set_publication_linger_timeout_ns(driverCtx_, 10'000'000ULL);
+        if (useInvoker_) {
+            aeron_driver_context_set_publication_linger_timeout_ns(driverCtx_, 10'000'000ULL);
+            // The driver reaps a released publication on its housekeeping timer (default 1 s: a release took a fixed
+            // ~2 s, within 1 s of expectReleased's old deadline).  10 ms keeps the release well inside the deadline.
+            aeron_driver_context_set_timer_interval_ns(driverCtx_, 10'000'000ULL);
+        }
 
         ASSERT_EQ(aeron_driver_init(&driver_, driverCtx_), 0)
             << "aeron_driver_init failed: " << aeron_errmsg();
@@ -820,8 +837,8 @@ TEST_F(GatewayTimeoutFixture, GroupHeartbeatRefreshesSessionLivenessRegression) 
 // ===========================================================================
 class RecordEgressLifetimeRegression : public GatewayTimeoutFixture {
 protected:
-    RecordEgressLifetimeRegression()
-        : pool_(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16) { useInvoker_ = true; }
+    explicit RecordEgressLifetimeRegression(int32_t workers = 1)
+        : pool_(workers, rune::metadata::ShardRouter(workers), 1 << 16, 1 << 16, 16, 16) { useInvoker_ = true; }
 
     // The driver's publisher-limit counter (type 1) of registration `regId`, if it exists.
     bool pubLimitCounterExists(int64_t regId) {
@@ -842,18 +859,33 @@ protected:
         gw_->forwardSubscribeForTest(/*subId=*/1001, sid, /*topic=*/0, /*partition=*/0, 0, 0, false, false, 7);
         regId = gw_->recordEgressRegIdForTest(sid, 0);
         ASSERT_GE(regId, 0) << "the Subscribe must start a record-egress registration";
-        // The driver allocates the registration's counter on its own thread; the client has not been invoked,
-        // so it still believes the registration is in flight.
+        waitDriverHolds(regId);
+    }
+
+    // The driver allocates the registration's counter on its own thread; the client conductor is not invoked, so
+    // the client still believes the registration is in flight (bounded: iteration cap + 10 s).
+    void waitDriverHolds(int64_t regId) {
         using clock = std::chrono::steady_clock;
         const auto deadline = clock::now() + std::chrono::seconds{10};
-        while (!pubLimitCounterExists(regId) && clock::now() < deadline) std::this_thread::yield();
-        ASSERT_TRUE(pubLimitCounterExists(regId)) << "the driver never allocated the registration";
+        for (int i = 0; i < kPumpIter && !pubLimitCounterExists(regId) && clock::now() < deadline; ++i)
+            std::this_thread::sleep_for(std::chrono::microseconds{100});
+        ASSERT_TRUE(pubLimitCounterExists(regId)) << "the driver never allocated registration " << regId;
+    }
+
+    // Subscribe `subId` of session `sid` to (topic, partition) and wait until its owner worker's record-egress
+    // registration is held by the driver while still in flight on the client.  Returns that registration id.
+    int64_t subscribeInFlight(int64_t sid, int64_t subId, int32_t topic, int32_t partition) {
+        gw_->forwardSubscribeForTest(subId, sid, topic, partition, 0, 0, false, false, 7);
+        const int64_t regId = gw_->recordEgressRegIdForTest(sid, pool_.ownerWorkerId(topic, partition));
+        EXPECT_GE(regId, 0) << "the Subscribe must start a record-egress registration";
+        if (regId >= 0) waitDriverHolds(regId);
+        return regId;
     }
 
     // Drive gateway + client conductor (bounded) until the abandoned registration is fully released.
     void expectReleased(int64_t regId, std::size_t pendingBefore) {
         using clock = std::chrono::steady_clock;
-        const auto deadline = clock::now() + std::chrono::seconds{3};
+        const auto deadline = clock::now() + std::chrono::seconds{10};
         for (int i = 0; i < kPumpIter && clock::now() < deadline; ++i) {
             invokeConductor();
             gw_->doWork(wallNowNs());
@@ -897,6 +929,175 @@ TEST_F(RecordEgressLifetimeRegression, ATimedOutEgressPubResolveReleasesTheRegis
     EXPECT_GE(gw_->pendingConnectCount(), before + 1)
         << "the abandoned in-flight registration must be queued for release, not forgotten";
     expectReleased(regId, before);
+}
+
+// ===========================================================================
+// Adversarial review of PR #559 (issue #1): every sibling entry point that abandons an in-flight record-egress
+// registration — the session reaper, a Disconnect frame on the wire, a session holding one registration per worker,
+// a re-Subscribe of the same worker while pending, a close after the resolve already timed out, and many sessions
+// at once.  Same deterministic in-flight window as above (client conductor run by hand).  Every test asserts the
+// registration is queued for release, released on the driver, and the drain table back to its starting size
+// (an id queued twice, or a stale one, would never drain).
+// ===========================================================================
+
+// The session REAPER (doWork with the injected clock past the session timeout) is the most common close path.
+TEST_F(RecordEgressLifetimeRegression, ReapedSessionReleasesItsInFlightEgressPubAdversarialRegression) {
+    auto client = makeClient(kEgressBase + 61);
+    const std::size_t before = gw_->pendingConnectCount();
+    int64_t sid = 0, regId = -1;
+    startInFlightEgress(client, sid, regId);
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_EQ(gw_->sessionCount(), 1u);
+
+    // Connected at t=1 s; one doWork just past the 100 ms session timeout (well inside the 5 s resolve timeout, so
+    // only the reaper drops it).  The conductor is not invoked: the registration is still in flight on the client.
+    gw_->doWork(1'000'000'000LL + kTimeoutNs + 1);
+
+    ASSERT_EQ(gw_->sessionCount(), 0u) << "the reaper must close the expired session";
+    EXPECT_EQ(gw_->recordEgressRegIdForTest(sid, 0), -1) << "the reap drops the pending entry";
+    EXPECT_EQ(gw_->pendingConnectCount(), before + 1)
+        << "the reaped session's in-flight registration must be queued for release exactly once";
+    expectReleased(regId, before);
+}
+
+// A client Disconnect frame on the wire (handleDisconnect), driven through the real ingress subscription.
+TEST_F(RecordEgressLifetimeRegression, DisconnectFrameReleasesTheInFlightEgressPubAdversarialRegression) {
+    auto client = makeClient(kEgressBase + 62);
+    const std::size_t before = gw_->pendingConnectCount();
+    int64_t sid = 0, regId = -1;
+    startInFlightEgress(client, sid, regId);
+    ASSERT_FALSE(HasFatalFailure());
+
+    pc::Disconnect d;
+    d.sessionId     = sid;
+    d.correlationId = 61;
+    uint8_t frame[pc::Disconnect::ENCODED_SIZE] = {};
+    offerBounded(*client.ingressPub, frame, d.encode(frame), "Disconnect");
+    ASSERT_FALSE(HasFatalFailure());
+
+    // Same injected clock as the connect (no reap, no resolve timeout), conductor NOT invoked: only the Disconnect
+    // can close the session, and its registration stays in flight on the client.  Bounded drive.
+    using clock = std::chrono::steady_clock;
+    const auto deadline = clock::now() + std::chrono::seconds{10};
+    for (int i = 0; i < kPumpIter && gw_->sessionCount() != 0 && clock::now() < deadline; ++i) {
+        gw_->doWork(1'000'000'000LL);
+        if (gw_->sessionCount() != 0) std::this_thread::sleep_for(std::chrono::microseconds{100});
+    }
+    ASSERT_EQ(gw_->sessionCount(), 0u) << "the Disconnect frame never closed the session";
+    EXPECT_EQ(gw_->recordEgressRegIdForTest(sid, 0), -1) << "the Disconnect drops the pending entry";
+    EXPECT_EQ(gw_->pendingConnectCount(), before + 1)
+        << "the disconnected session's in-flight registration must be queued for release exactly once";
+    expectReleased(regId, before);
+}
+
+// A re-Subscribe on the SAME worker while its resolve is pending joins the one registration (never a second,
+// which the close would then have to release too): exactly one release.
+TEST_F(RecordEgressLifetimeRegression, ResubscribeSameWorkerWhilePendingReleasesOneRegistrationAdversarialRegression) {
+    auto client = makeClient(kEgressBase + 63);
+    const std::size_t before = gw_->pendingConnectCount();
+    int64_t sid = 0, regId = -1;
+    startInFlightEgress(client, sid, regId);
+    ASSERT_FALSE(HasFatalFailure());
+
+    gw_->forwardSubscribeForTest(/*subId=*/1002, sid, /*topic=*/0, /*partition=*/0, 0, 0, false, false, 8);
+    EXPECT_EQ(gw_->recordEgressRegIdForTest(sid, 0), regId) << "a re-Subscribe must join the pending registration";
+    EXPECT_EQ(gw_->pendingRecordEgressCountForTest(), 1u);
+    EXPECT_EQ(gw_->pendingEgressWaitersForTest(), 2) << "both Subscribes wait on the one registration";
+
+    gw_->closeSessionForTest(sid);
+    EXPECT_EQ(gw_->pendingRecordEgressCountForTest(), 0u);
+    EXPECT_EQ(gw_->pendingEgressWaitersForTest(), 0) << "the waiters die with the session";
+    EXPECT_EQ(gw_->pendingConnectCount(), before + 1) << "exactly one registration is queued for release";
+    expectReleased(regId, before);
+}
+
+// A close AFTER the resolve already timed out (the timeout queued it) must not queue the same id again: a second
+// copy could never drain once the first released it (the conductor no longer knows the id).
+TEST_F(RecordEgressLifetimeRegression, CloseAfterEgressResolveTimeoutQueuesTheReleaseOnceAdversarialRegression) {
+    auto client = makeClient(kEgressBase + 64);
+    const std::size_t before = gw_->pendingConnectCount();
+    int64_t sid = 0, regId = -1;
+    startInFlightEgress(client, sid, regId);
+    ASSERT_FALSE(HasFatalFailure());
+
+    gw_->pollPendingRecordEgressForTest(wallNowNs() + 60'000'000'000LL);   // resolve timeout: queued for release
+    ASSERT_EQ(gw_->pendingConnectCount(), before + 1);
+    gw_->closeSessionForTest(sid);                                         // then the session goes
+    gw_->closeSessionForTest(sid);                                         // ... twice (unknown: a no-op)
+    EXPECT_EQ(gw_->pendingConnectCount(), before + 1) << "the close must not queue the timed-out id a second time";
+    expectReleased(regId, before);
+}
+
+// Resources: many sessions, each with an in-flight registration, all closed in one burst — every registration is
+// released and the drain table returns to its starting size (bounded, fully drained).
+TEST_F(RecordEgressLifetimeRegression, ManySessionsClosedWithInFlightEgressReleaseEveryRegistrationAdversarialRegression) {
+    constexpr int kSessions = 6;
+    std::vector<TestClient> clients;
+    for (int i = 0; i < kSessions; ++i) clients.push_back(makeClient(kEgressBase + 70 + i));
+    const std::size_t before = gw_->pendingConnectCount();
+
+    // Sessions stamped an hour ahead of the wall clock the helpers drive doWork with: no session is reaped while the
+    // next one connects (the injected clock, not wall time, decides).
+    const int64_t t0 = wallNowNs() + 3'600'000'000'000LL;
+    std::vector<int64_t> sids;
+    for (int i = 0; i < kSessions; ++i) {
+        auto r = doConnect(clients[static_cast<std::size_t>(i)], /*corrId=*/80 + i, t0);
+        ASSERT_GE(r.resp.assignedSessionId, 1);
+        sids.push_back(r.resp.assignedSessionId);
+    }
+    ASSERT_EQ(gw_->sessionCount(), static_cast<std::size_t>(kSessions));
+    gw_->setWorkerPool(&pool_);
+
+    std::vector<int64_t> regIds;
+    for (int i = 0; i < kSessions; ++i) {
+        regIds.push_back(subscribeInFlight(sids[static_cast<std::size_t>(i)], 2000 + i, 0, 0));
+        ASSERT_FALSE(HasFatalFailure());
+        ASSERT_GE(regIds.back(), 0);
+    }
+    for (const int64_t sid : sids) gw_->closeSessionForTest(sid);
+
+    EXPECT_EQ(gw_->sessionCount(), 0u);
+    EXPECT_EQ(gw_->pendingRecordEgressCountForTest(), 0u);
+    EXPECT_EQ(gw_->pendingConnectCount(), before + kSessions) << "every in-flight registration is queued once";
+    for (const int64_t regId : regIds) expectReleased(regId, before);
+}
+
+// One session, two workers: a registration in flight on EACH worker — the close releases both.
+class RecordEgressLifetimeTwoWorkerRegression : public RecordEgressLifetimeRegression {
+protected:
+    RecordEgressLifetimeTwoWorkerRegression() : RecordEgressLifetimeRegression(2) {}
+};
+
+TEST_F(RecordEgressLifetimeTwoWorkerRegression, CloseReleasesTheInFlightEgressPubOfEveryWorkerAdversarialRegression) {
+    // Two partitions of topic 0 owned by different workers.
+    const int32_t p0 = 0;
+    int32_t p1 = -1;
+    for (int32_t p = 1; p < 64 && p1 < 0; ++p)
+        if (pool_.ownerWorkerId(0, p) != pool_.ownerWorkerId(0, p0)) p1 = p;
+    ASSERT_GE(p1, 0) << "no partition of topic 0 maps to the second worker";
+
+    auto client = makeClient(kEgressBase + 65);
+    const std::size_t before = gw_->pendingConnectCount();
+    auto r = doConnect(client, /*corrId=*/65, 1'000'000'000LL);
+    ASSERT_GE(r.resp.assignedSessionId, 1);
+    const int64_t sid = r.resp.assignedSessionId;
+    gw_->setWorkerPool(&pool_);
+
+    const int64_t reg0 = subscribeInFlight(sid, 3001, 0, p0);
+    ASSERT_FALSE(HasFatalFailure());
+    const int64_t reg1 = subscribeInFlight(sid, 3002, 0, p1);
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_GE(reg0, 0);
+    ASSERT_GE(reg1, 0);
+    ASSERT_NE(reg0, reg1) << "each worker gets its own registration";
+    ASSERT_EQ(gw_->pendingRecordEgressCountForTest(), 2u);
+
+    gw_->closeSessionForTest(sid);
+
+    EXPECT_EQ(gw_->pendingRecordEgressCountForTest(), 0u);
+    EXPECT_EQ(gw_->pendingConnectCount(), before + 2) << "both workers' registrations are queued for release";
+    expectReleased(reg0, before);
+    expectReleased(reg1, before);
 }
 } // namespace
 } // namespace rune::gateway
