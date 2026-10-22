@@ -1,4 +1,4 @@
-# rune-broker Docker image — BR-6
+# rune Docker image (Rune broker) — BR-6
 
 Single-node image for the `rune_broker` runtime. The embedded Aeron media
 driver runs in-process (no separate driver to launch). A single node
@@ -29,7 +29,7 @@ docker build \
   --build-context rune-codec=../codec \
   --build-context rune-crypto=../crypto \
   -f docker/Dockerfile \
-  -t rune-broker:dev \
+  -t rune:dev \
   .
 ```
 
@@ -46,7 +46,7 @@ come from public ConanCenter. `--build=missing` builds any dep lacking a
 prebuilt Linux/amd64 binary from source (aeron pulls a JDK build-requirement
 transiently; the first build is therefore slow but fully self-contained).
 
-`broker/build_docker.sh` wraps the same command and tags the image `rune-broker:<VERSION.txt>`.
+`broker/build_docker.sh` wraps the same command and tags the image `rune:<VERSION.txt>`.
 
 ## Release
 
@@ -56,7 +56,7 @@ broker/release.sh patch   # or minor / major; run on a clean main in sync with o
 
 The script turns `broker/VERSION.txt` from `X.Y.Z-snapshot` into `X.Y.Z`, tags `broker-vX.Y.Z`, sets the next
 snapshot and pushes the commits and the tag. The tag starts `.github/workflows/broker-image.yml`, which builds
-the image (linux/amd64) and publishes `ghcr.io/arcanumruna/rune-broker:X.Y.Z` and `:latest`. Running the
+the image (linux/amd64) and publishes `ghcr.io/arcanumruna/rune:X.Y.Z` and `:latest`. Running the
 workflow by hand builds the image without publishing it.
 
 ---
@@ -128,7 +128,7 @@ Format the data volume once (a broker never formats an empty data dir on its own
 `docs/SELF-HOSTING.md` "Formatting the data directory"):
 
 ```sh
-docker run --rm -v rune-data:/var/lib/rune -e RUNE_DATA_DIR=/var/lib/rune rune-broker:dev rune_broker storage format --new
+docker run --rm -v rune-data:/var/lib/rune -e RUNE_DATA_DIR=/var/lib/rune rune:dev rune_broker storage format --new
 ```
 
 Then start it:
@@ -145,7 +145,7 @@ docker run --rm \
   -e RUNE_CLIENT_ENDPOINT='0.0.0.0:40200' \
   -e RUNE_DATA_DIR=/var/lib/rune \
   -v rune-data:/var/lib/rune \
-  rune-broker:dev
+  rune:dev
 ```
 
 Expected log evidence of self-election (within ~5 s):
