@@ -1,0 +1,53 @@
+# Per-Dockerfile ignore for Dockerfile.filter-probe (Phase 2c Task 17 filter e2e; a copy of the view-probe one).
+# tests/ stays: tests/support/GenClaimSchemas.cpp builds the player_event.gen.h that filter_probe includes.
+# Keep the build context reasonably small, but note: BUILD_EXAMPLES=ON makes
+# CMakeLists.txt configure EVERY example/e2e-probe target unconditionally —
+# including the EXCLUDE_FROM_ALL rune_ql_probe / evo_probe_vN / evo_probe_multi
+# targets under tests/e2e/ — and add_executable()'s listed sources must exist
+# in the build context at CONFIGURE time even for a target we never actually
+# build (`cmake --build build --target view_probe` only builds ITS graph, but
+# configure still walks the whole file). A prior per-Dockerfile ignore here
+# (Dockerfile.schema-probe.dockerignore) excluded tests/e2e/* down to a single
+# un-ignored file and broke configure once the schema-evolution merge added
+# more such targets (see commit 4d4a20a "the DR image context carries the
+# evo_probe sources (cmake configure failed since the schema-evolution
+# merge)") — rather than hand-maintain a glob that silently goes stale again
+# every time a new EXCLUDE_FROM_ALL probe target is added, this ignore keeps
+# tests/e2e/ and tests/generated/ (the characters.blob rune_schema_probe's
+# custom command depends on) UN-ignored entirely.
+
+# Build outputs (large; a leaked host build/ CMakeCache aborts the container build)
+build/
+build_release/
+build_tsan/
+build_asan/
+cov/
+cmake-build-debug/
+cmake-build-release/
+conan-release/
+
+# Version control
+.git/
+.gitignore
+
+# Superpowers / internal docs
+.superpowers/
+
+# Benchmarks (not built in the probe image)
+benchmark/
+bench/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# CI
+.woodpecker/
+
+# Docs
+docs/
+README.md
+CLAUDE.md

@@ -144,6 +144,11 @@ struct WorkerOp {
         // only behind every role op derived from the metadata the grant covered (FIFO: a lease never overtakes a
         // demotion).  Never ownership-gated.
         ReadLease                 = 24, ///< control → worker: a view read lease (lease-clock end in nextOffset)
+        // Phase 2c (subscription filters): control → EVERY worker, on the SAME ingress ring as Subscribe (FIFO order is
+        // what lets a filtered Subscribe find its schema).  Like SchemaUpdate it reuses schemaUpdateBlob (the EVOLVING
+        // descriptor blob, TailKind = DESCRIPTOR_BLOB) and clientVersion (the topic's current schema version); topicId is
+        // the typed topic.  Cold (DDL rate); never ownership-gated.  (25 = FILTER_SCHEMA.)
+        FilterSchema              = 25, ///< control → worker: install/extend a typed topic's filter schema
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -425,6 +430,10 @@ struct WorkerOp {
     // directly — no dedicated schemaUpdateVersion field, so encoding a
     // SchemaUpdate op costs no extra branch on the shared enqueueOp path).
     std::vector<uint8_t> schemaUpdateBlob;
+
+    // Phase 2c: Subscribe only - the client's filter bytes (spec §4 encoding), TailKind::FILTER.  A view valid only
+    // for the synchronous tryEnqueueOp call (copied once into the ring slot); empty = an unfiltered subscription.
+    std::span<const uint8_t> filterBytes;
 
     // Authentication Task 15: a PeerLinkKeys op's key material, [sendMaster 32][recvMaster 32] (the tail on the wire).
     // topicId = the peer node id, partition = the link epoch.

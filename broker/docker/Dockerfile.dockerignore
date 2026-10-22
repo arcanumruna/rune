@@ -56,3 +56,6 @@ dr-e2e/
 
 # eos-e2e.sh's scratch dir (generated passwords live there; a random name would bust the COPY cache)
 .eos-e2e-work*/
+
+# filter-e2e.sh's scratch dir (generated passwords live there; a random name would bust the COPY cache)
+.filter-e2e-work*/

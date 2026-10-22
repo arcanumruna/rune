@@ -352,8 +352,15 @@ TEST(RingSbeRegression, AuthOpTypesAndTailKindsArePinned) {
     EXPECT_EQ(static_cast<int>(sbe::OpType::Value::READ_LEASE), 24);
     EXPECT_EQ(sbe::OpType::get(24), sbe::OpType::Value::READ_LEASE);
     EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::READ_LEASE), "READ_LEASE");
-    EXPECT_THROW((void)sbe::OpType::get(25), std::runtime_error);
-    EXPECT_THROW((void)sbe::TailKind::get(11), std::runtime_error);
+    // Phase 2c (filters): appended after main's 24 / 10, never reused.
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::FILTER_SCHEMA), 25);
+    EXPECT_EQ(static_cast<int>(sbe::TailKind::Value::FILTER), 11);
+    EXPECT_EQ(sbe::OpType::get(25), sbe::OpType::Value::FILTER_SCHEMA);
+    EXPECT_EQ(sbe::TailKind::get(11), sbe::TailKind::Value::FILTER);
+    EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::FILTER_SCHEMA), "FILTER_SCHEMA");
+    EXPECT_STREQ(sbe::TailKind::c_str(sbe::TailKind::Value::FILTER), "FILTER");
+    EXPECT_THROW((void)sbe::OpType::get(26), std::runtime_error);
+    EXPECT_THROW((void)sbe::TailKind::get(12), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------

@@ -32,6 +32,7 @@
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/RecordBatch.h>  // RecordBatchReader (for recordCount in RecordsView)
+#include <rune/codec/FilterWire.h>       // Phase 2c: kMaxFilterBytes (the Subscribe filter trailer)
 
 namespace rune::client::codec {
 
@@ -162,10 +163,16 @@ struct SubscribeView {
     int64_t                  fromOffset     = 0;
     uint8_t                  isolation      = 0;
     std::span<const uint8_t> key;  // zero-copy view into the original buffer
+    std::span<const uint8_t> filter;  // Phase 2c: the trailing filter bytes (empty = unfiltered)
 };
 
+/// The largest Subscribe frame the client encodes: header, fixed body, key (<= 256), and the optional filter
+/// trailer ([u16 len][bytes], at most rune::codec::kMaxFilterBytes).
+inline constexpr std::size_t kMaxSubscribeFrameBytes = 24 + 18 + 2 + 256 + 2 + rune::codec::kMaxFilterBytes;
+
 /// Encode a Subscribe frame into buf[0..cap-1].
-/// key is a zero-copy span into caller-owned data.
+/// key is a zero-copy span into caller-owned data.  `filter` (Phase 2c) is the encoded filter, appended as a
+/// trailer; empty = the frame is byte-identical to an unfiltered one.
 /// Returns total bytes written, or 0 if cap is insufficient.
 inline std::size_t encodeSubscribe(uint8_t*                  buf,
                                     std::size_t               cap,
@@ -176,7 +183,8 @@ inline std::size_t encodeSubscribe(uint8_t*                  buf,
                                     uint8_t                   isolation,
                                     std::span<const uint8_t>  key,
                                     int64_t                   sessionId,
-                                    int64_t                   correlationId) noexcept {
+                                    int64_t                   correlationId,
+                                    std::span<const uint8_t>  filter = {}) noexcept {
     rpc::Subscribe msg;
     msg.sessionId      = sessionId;
     msg.correlationId  = correlationId;
@@ -186,8 +194,9 @@ inline std::size_t encodeSubscribe(uint8_t*                  buf,
     msg.fromOffset     = fromOffset;
     msg.isolation      = isolation;
     msg.key            = key;
+    msg.filter         = filter;
     const std::size_t needed = msg.encodedSize();
-    if (cap < needed) return 0u;
+    if (cap < needed || !msg.fits()) return 0u;
     return msg.encode(buf);
 }
 
@@ -196,7 +205,7 @@ inline std::size_t encodeSubscribe(uint8_t*                  buf,
 /// Returned span is a zero-copy view into buf — buf must outlive the result.
 inline std::optional<SubscribeView> decodeSubscribe(const uint8_t* buf,
                                                      std::size_t    len) noexcept {
-    auto opt = rpc::Subscribe::decode(buf, len);
+    auto opt = rpc::Subscribe::decode(buf, len, rpc::kClientVersion);
     if (!opt) return std::nullopt;
     SubscribeView v;
     v.sessionId      = opt->sessionId;
@@ -207,6 +216,7 @@ inline std::optional<SubscribeView> decodeSubscribe(const uint8_t* buf,
     v.fromOffset     = opt->fromOffset;
     v.isolation      = opt->isolation;
     v.key            = opt->key;
+    v.filter         = opt->filter;
     return v;
 }
 
@@ -219,6 +229,8 @@ struct SubscribeResponseView {
     int16_t errorCode      = 0;  // rpc::ErrorCode value
     int32_t partition      = 0;
     int64_t subscriptionId = 0;
+    std::string_view detail;  // Phase 2c: the refusal text (view into the original buffer; empty = none)
+    bool detailMalformed = false;  // the detail trailer was truncated: dropped, the fixed fields are intact
 };
 
 /// Encode a SubscribeResponse frame (38 bytes) into buf[0..cap-1].
@@ -245,13 +257,21 @@ inline std::size_t encodeSubscribeResponse(uint8_t*    buf,
 inline std::optional<SubscribeResponseView> decodeSubscribeResponse(const uint8_t* buf,
                                                                       std::size_t    len) noexcept {
     auto opt = rpc::SubscribeResponse::decode(buf, len);
+    bool malformedDetail = false;
+    if (!opt && len > rpc::SubscribeResponse::ENCODED_SIZE) {
+        // A mangled detail trailer must not hide the refusal itself: decode the fixed part, drop the detail.
+        opt = rpc::SubscribeResponse::decode(buf, rpc::SubscribeResponse::ENCODED_SIZE);
+        malformedDetail = opt.has_value();
+    }
     if (!opt) return std::nullopt;
     SubscribeResponseView v;
+    v.detailMalformed = malformedDetail;
     v.sessionId      = opt->sessionId;
     v.correlationId  = opt->correlationId;
     v.errorCode      = opt->errorCode;
     v.partition      = opt->partition;
     v.subscriptionId = opt->subscriptionId;
+    v.detail         = opt->detail;
     return v;
 }
 

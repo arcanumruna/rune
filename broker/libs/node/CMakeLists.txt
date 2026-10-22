@@ -192,6 +192,7 @@ if(BUILD_TESTING)
         tests/node/CatalogReadServerTest.cpp
         tests/node/CatalogGatesRegressionTest.cpp
         tests/node/WorkerOwnedIndexRegressionTest.cpp
+        tests/node/WorkerOpWireRegressionTest.cpp
         tests/node/WorkerDroppedTopicRegressionTest.cpp
         tests/node/ReplicationFrameLimitsRegressionTest.cpp
         )
@@ -422,6 +423,24 @@ if(BUILD_TESTING)
         rune_codec
         GTest::gtest_main)
     gtest_discover_tests(rune_worker_tests)
+
+    # Phase 2c Tasks 6-7, 15: FilterIndex (value -> members) and FilterGroup (member state machine, shared scan,
+    # rebuild delivery, position notes). No Aeron. AllocWindow.cpp replaces the global operator new for this
+    # binary (the zero-allocation gates); later filter test binaries link it the same way.
+    add_executable(rune_filter_engine_tests
+        tests/node/FilterIndexTest.cpp
+        tests/node/FilterGroupTest.cpp
+        tests/node/FilterStressRegressionTest.cpp
+        tests/support/AllocWindow.cpp)
+    target_include_directories(rune_filter_engine_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${RUNE_CLIENT_ROOT}/examples)
+    target_link_libraries(rune_filter_engine_tests PRIVATE
+        rune_node
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_filter_engine_tests PROPERTIES LABELS small)
+    rune_regression_batches(rune_filter_engine_tests 2)
 
     # ---------------------------------------------------------------------------
     # E1 Task 3: WorkerPool unit tests — N workers, deterministic single-owner
@@ -1376,6 +1395,59 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_worker_push_tests
             PROPERTIES TIMEOUT 120
             ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+        # Phase 2c Task 8: the Worker serves FILTERED subscriptions through FilterGroups (FilterSchema op, the filter
+        # tail on Subscribe, member binding, the filtered push pass); same rig as rune_worker_push_tests.
+        add_executable(rune_worker_filter_tests
+            tests/node/WorkerFilterPushTest.cpp)
+        target_include_directories(rune_worker_filter_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${RUNE_CLIENT_ROOT}/examples)
+        target_link_libraries(rune_worker_filter_tests PRIVATE
+            rune_node
+            rune_codec
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_worker_filter_tests
+            PROPERTIES TIMEOUT 180
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+        # Phase 2c Task 14: the worker-level filter interaction matrix - 5 ops x 4 entities x 14 timings (232 applicable
+        # cells, 48 skipped by rule), each over a real Worker, a real disk Log or a transient ring, an embedded Aeron
+        # driver and a model client.  AllocWindow.cpp replaces the global operator new (the zero-allocation point).
+        add_executable(rune_worker_filter_matrix_tests
+            tests/node/WorkerFilterMatrixTest.cpp
+            tests/support/AllocWindow.cpp)
+        target_include_directories(rune_worker_filter_matrix_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${RUNE_CLIENT_ROOT}/examples)
+        target_link_libraries(rune_worker_filter_matrix_tests PRIVATE
+            rune_node
+            rune_codec
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_worker_filter_matrix_tests
+            PROPERTIES TIMEOUT 600
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+        rune_regression_batches(rune_worker_filter_matrix_tests 4 TIMEOUT 900 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+        # Phase 2c Task 16 (hard rule 4): 10,000 steady-state filtered batches (50 filtered members + 1 unfiltered, mixed
+        # matches and position notes) allocate nothing on the worker thread.  AllocWindow.cpp replaces the global
+        # operator new (binary-wide) - own binary, like the catalog's.
+        add_executable(rune_filter_alloc_regression_tests
+            tests/node/FilterAllocRegressionTest.cpp
+            tests/support/AllocWindow.cpp)
+        target_include_directories(rune_filter_alloc_regression_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${RUNE_CLIENT_ROOT}/examples)
+        target_link_libraries(rune_filter_alloc_regression_tests PRIVATE
+            rune_node
+            rune_codec
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_filter_alloc_regression_tests
+            PROPERTIES TIMEOUT 300
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 
     # ---------------------------------------------------------------------------
@@ -1737,10 +1809,12 @@ if(BUILD_TESTING)
         # it kills brokers, so it lives here (RUN_SERIAL).  It reads client-cpp's TxnMatrixExpectations.h and the
         # build-time generated all-fixed position.gen.h (typed claim through ProducerRef).
         add_executable(rune_client_failover_broker_tests tests/client/ClientFailoverBrokerRegressionTest.cpp
-                       tests/client/EosBrokerRegressionTest.cpp)
+                       tests/client/EosBrokerRegressionTest.cpp
+                       tests/client/FilterBrokerRegressionTest.cpp)
         add_dependencies(rune_client_failover_broker_tests generate_claim_schema_headers)
         target_include_directories(rune_client_failover_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
-                                   ${RUNE_CLIENT_ROOT}/tests ${CMAKE_BINARY_DIR}/rune-client/claim-gen)
+                                   ${RUNE_CLIENT_ROOT}/tests ${CMAKE_BINARY_DIR}/rune-client/claim-gen
+                                   ${CMAKE_BINARY_DIR}/rune-client/claim-gen/gen ${RUNE_CLIENT_ROOT}/examples)
         target_link_libraries(rune_client_failover_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_client_failover_broker_tests PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)

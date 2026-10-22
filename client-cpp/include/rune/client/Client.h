@@ -1172,6 +1172,23 @@ public:
                            SubscribeOptions  opts,
                            RecordHandler     handler);
 
+    /// Every partition of the topic (spec §3): `topic.partitionCount` subscriptions, partition 0..N-1, each with
+    /// its own copy of `opts` (a filter included) and of `handler`; Record::partition says which partition a
+    /// record came from.  The handlers run on the runner thread, one partition's records in order, partitions
+    /// interleaved.  Throws std::invalid_argument when partitionCount < 1 (nothing submitted).
+    /// The set covers `topic.partitionCount` AS OF THIS CALL: partitions added to the topic later are not
+    /// subscribed (re-subscribe with a fresh handle), and a stale, larger count fails the extra partitions
+    /// individually (RejectedByBroker).
+    ///
+    /// Filters: a SubscribeOptions::filter applies to every partition.  subscribe(topic, key, ...) is
+    /// PARTITION-WIDE: the key only picks the partition, it does not select records — to read one entity's
+    /// records, combine the key (its partition) with a filter on the entity's field:
+    ///   client.subscribe(topic, entityKey, SubscribeOptions{}.filter(EntityEvent::Filter{...entity field...}), h);
+    SubscriptionSet subscribe(TopicHandle       topic,
+                              AllPartitions,
+                              SubscribeOptions  opts,
+                              RecordHandler     handler);
+
     // ---- CB-2: Producer API --------------------------------------------------
 
     /// Look up a topic by name and return its handle (topicId + partitionCount).
@@ -1651,6 +1668,7 @@ private:
     /// rejection ends the Client's work on its own path).
     static int16_t nodeRejectCodeTrampoline_(void* ctx, uint32_t session) noexcept;
     [[nodiscard]] int16_t nodeRejectCode_(uint32_t session) const noexcept;
+    static int32_t subscribeBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept;   // Phase 2c: 0 unless Connected
     /// M1 (duty thread, while a group consumer exists): a leader-node session a
     /// group partition subscribes through was lost (left Connected) or became
     /// terminally Disconnected — ask for metadata (the leader may have moved),
@@ -1861,7 +1879,7 @@ private:
                                 int32_t                  partition,
                                 uint8_t                  partitionKnown,
                                 std::span<const uint8_t> keyBytes,
-                                SubscribeOptions         opts,
+                                SubscribeOptions&        opts,   // the caller's own copy: callbacks are moved out
                                 RecordHandler            handler);
 
     // -------------------------------------------------------------------------

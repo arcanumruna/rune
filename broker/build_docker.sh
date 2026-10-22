@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Usage: broker/build_docker.sh [extra docker buildx build args...]
 #
-# Builds the broker image as rune-broker:<VERSION.txt>. With no extra args the image is loaded
+# Builds the broker image as rune:<VERSION.txt>. With no extra args the image is loaded
 # into the local docker; CI passes --push/--tag/--cache-* instead (see .github/workflows/broker-image.yml).
 #
 # Env:
-#   IMAGE_NAME                 image name (default rune-broker)
+#   IMAGE_NAME                 image name (default rune)
 #   FLIGHT_RECORDER_DIR        flight-recorder checkout (default: sibling of the repo root)
 #   CMAKE_BUILD_PARALLEL_LEVEL cap on compile jobs (each big TU needs ~1.5 GB)
 set -euo pipefail
@@ -21,7 +21,7 @@ if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-snapshot)?$ ]]; then
   exit 1
 fi
 
-IMAGE_NAME="${IMAGE_NAME:-rune-broker}"
+IMAGE_NAME="${IMAGE_NAME:-rune}"
 FLIGHT_RECORDER_DIR="${FLIGHT_RECORDER_DIR:-../../flight-recorder}"
 if [[ ! -d $FLIGHT_RECORDER_DIR/src || ! -d $FLIGHT_RECORDER_DIR/include ]]; then
   echo "❌ flight-recorder not found at '$FLIGHT_RECORDER_DIR' (set FLIGHT_RECORDER_DIR)"

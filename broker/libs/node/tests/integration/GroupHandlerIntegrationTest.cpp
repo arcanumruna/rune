@@ -244,7 +244,7 @@ TEST_F(CG3IntegTest, JoinThenDoWorkReachesStable) {
 
     // Step 1: Initial join → PreparingRebalance + assigned memberId.
     auto j1Len = encJoin(req_, 1, 1, group, "", /*tms=*/5000);
-    auto j1Out = service_->handleJoinGroup(req_, j1Len, clock_, out_, kBuf);
+    auto j1Out = service_->handleJoinGroup(req_, j1Len, rune::protocol::client::kClientVersion, clock_, out_, kBuf);
     ASSERT_GT(j1Out, 0u);
     auto j1 = pc::JoinGroupResponse::decode(out_, j1Out);
     ASSERT_TRUE(j1.has_value());
@@ -256,7 +256,7 @@ TEST_F(CG3IntegTest, JoinThenDoWorkReachesStable) {
     // Step 2: Re-join with assigned memberId → CompletingRebalance.
     clock_ += kStep;
     auto r1Len = encJoin(req_, 1, 2, group, m1Id, /*tms=*/5000);
-    service_->handleJoinGroup(req_, r1Len, clock_, out_, kBuf);
+    service_->handleJoinGroup(req_, r1Len, rune::protocol::client::kClientVersion, clock_, out_, kBuf);
 
     // Step 3: doWork → Stable.
     const bool stable = driveUntil([&] {
@@ -271,7 +271,7 @@ TEST_F(CG3IntegTest, SyncGroupAfterStableReturnsOK) {
 
     // Initial join.
     auto jLen = encJoin(req_, 2, 10, group, "", /*tms=*/5000);
-    auto jOut = service_->handleJoinGroup(req_, jLen, clock_, out_, kBuf);
+    auto jOut = service_->handleJoinGroup(req_, jLen, rune::protocol::client::kClientVersion, clock_, out_, kBuf);
     ASSERT_GT(jOut, 0u);
     auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
     ASSERT_TRUE(jResp.has_value());
@@ -281,7 +281,7 @@ TEST_F(CG3IntegTest, SyncGroupAfterStableReturnsOK) {
 
     // Re-join → CompletingRebalance.
     clock_ += kStep;
-    service_->handleJoinGroup(req_, encJoin(req_, 2, 11, group, memberId, 5000), clock_, out_, kBuf);
+    service_->handleJoinGroup(req_, encJoin(req_, 2, 11, group, memberId, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBuf);
 
     // doWork → Stable.
     const bool stable = driveUntil([&] {
@@ -304,7 +304,7 @@ TEST_F(CG3IntegTest, HeartbeatAfterStableReturnsOK) {
     std::string group = "integ-g3";
 
     auto jLen = encJoin(req_, 3, 20, group, "", /*tms=*/5000);
-    auto jOut = service_->handleJoinGroup(req_, jLen, clock_, out_, kBuf);
+    auto jOut = service_->handleJoinGroup(req_, jLen, rune::protocol::client::kClientVersion, clock_, out_, kBuf);
     ASSERT_GT(jOut, 0u);
     auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
     ASSERT_TRUE(jResp.has_value());
@@ -313,7 +313,7 @@ TEST_F(CG3IntegTest, HeartbeatAfterStableReturnsOK) {
         jResp->memberId.size());
 
     clock_ += kStep;
-    service_->handleJoinGroup(req_, encJoin(req_, 3, 21, group, memberId, 5000), clock_, out_, kBuf);
+    service_->handleJoinGroup(req_, encJoin(req_, 3, 21, group, memberId, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBuf);
 
     const bool stable = driveUntil([&] {
         return service_->coordinator(group).state() == GroupState::Stable;
@@ -337,7 +337,7 @@ TEST_F(CG3IntegTest, OffsetCommitAndFetchRoundTrip) {
 
     // Join so we have a valid generation.
     auto jLen = encJoin(req_, 4, 30, group, "", 5000);
-    auto jOut = service_->handleJoinGroup(req_, jLen, clock_, out_, kBuf);
+    auto jOut = service_->handleJoinGroup(req_, jLen, rune::protocol::client::kClientVersion, clock_, out_, kBuf);
     ASSERT_GT(jOut, 0u);
     auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
     ASSERT_TRUE(jResp.has_value());
@@ -374,7 +374,7 @@ TEST_F(CG3IntegTest, TwoMemberGroupReachesStable) {
 
     // Step 1: m1 initial join.
     auto j1Len = encJoin(req_, 5, 40, group, "", /*tms=*/5000);
-    auto j1Out = service_->handleJoinGroup(req_, j1Len, clock_, out_, kBuf);
+    auto j1Out = service_->handleJoinGroup(req_, j1Len, rune::protocol::client::kClientVersion, clock_, out_, kBuf);
     ASSERT_GT(j1Out, 0u);
     auto j1 = pc::JoinGroupResponse::decode(out_, j1Out);
     ASSERT_TRUE(j1.has_value());
@@ -386,7 +386,7 @@ TEST_F(CG3IntegTest, TwoMemberGroupReachesStable) {
     // Step 2: m2 initial join → triggers new rebalance (gen 2, expectedCount=2).
     clock_ += kStep;
     auto j2Len = encJoin(req_, 5, 41, group, "", /*tms=*/5000);
-    auto j2Out = service_->handleJoinGroup(req_, j2Len, clock_, out_, kBuf);
+    auto j2Out = service_->handleJoinGroup(req_, j2Len, rune::protocol::client::kClientVersion, clock_, out_, kBuf);
     ASSERT_GT(j2Out, 0u);
     auto j2 = pc::JoinGroupResponse::decode(out_, j2Out);
     ASSERT_TRUE(j2.has_value());
@@ -400,11 +400,11 @@ TEST_F(CG3IntegTest, TwoMemberGroupReachesStable) {
 
     // Step 3: m1 explicitly re-joins.
     clock_ += kStep;
-    service_->handleJoinGroup(req_, encJoin(req_, 5, 42, group, m1Id, 5000), clock_, out_, kBuf);
+    service_->handleJoinGroup(req_, encJoin(req_, 5, 42, group, m1Id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBuf);
 
     // Step 4: m2 explicitly re-joins → all expected → CompletingRebalance.
     clock_ += kStep;
-    service_->handleJoinGroup(req_, encJoin(req_, 5, 43, group, m2Id, 5000), clock_, out_, kBuf);
+    service_->handleJoinGroup(req_, encJoin(req_, 5, 43, group, m2Id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBuf);
 
     EXPECT_EQ(service_->coordinator(group).memberCount(), 2u);
 
@@ -439,7 +439,7 @@ TEST_F(CG3IntegTest, DoWorkIdleInSteadyState) {
 
     std::string group = "integ-g7";
     auto jLen = encJoin(req_, 7, 60, group, "", 50);
-    service_->handleJoinGroup(req_, jLen, clock_, out_, kBuf);
+    service_->handleJoinGroup(req_, jLen, rune::protocol::client::kClientVersion, clock_, out_, kBuf);
 
     driveUntil([&] {
         return service_->coordinator(group).state() == GroupState::Stable;
@@ -465,7 +465,7 @@ TEST_F(CG3IntegTest, OffsetFetchFetchAllBoundedByOutCap) {
     const std::string group = "integ-g8";
 
     auto jLen = encJoin(req_, 8, 70, group, "", 5000);
-    auto jOut = service_->handleJoinGroup(req_, jLen, clock_, out_, kBuf);
+    auto jOut = service_->handleJoinGroup(req_, jLen, rune::protocol::client::kClientVersion, clock_, out_, kBuf);
     ASSERT_GT(jOut, 0u);
     auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
     ASSERT_TRUE(jResp.has_value());

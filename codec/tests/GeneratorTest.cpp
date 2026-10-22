@@ -1,4 +1,5 @@
 // tests/GeneratorTest.cpp
+#include "FilterTestSupport.h"
 #include <gtest/gtest.h>
 #include <rune/codec/Generator.h>
 #include <rune/codec/Record.h>
@@ -137,4 +138,56 @@ TEST(Generator, AFieldNamedKeyOnAKeylessSchemaIsAPlainFlyweightSetter) {
     EXPECT_NE(hdr.find("class KvEncoder {"), std::string::npos);
     EXPECT_NE(hdr.find("[[gnu::always_inline]] KvEncoder key(int64_t v) noexcept {"), std::string::npos);
     EXPECT_EQ(hdr.find("KeyType"), std::string::npos);
+}
+
+// ── Phase 2c: the nested E::Filter ───────────────────────────────────────────
+
+namespace {
+Descriptor playerEventForGenerator() { return filtertest::playerEvent(1); }
+std::size_t at(const std::string& h, const std::string& s, std::size_t from = 0) { return h.find(s, from); }
+}  // namespace
+
+TEST(Generator, EmitsAFilterMemberPerEligibleFieldInFieldOrder) {
+    const std::string h = generateHeader(playerEventForGenerator());
+    const auto s = at(h, "    struct Filter {");
+    ASSERT_NE(s, std::string::npos) << h;
+    std::size_t pos = s;
+    for (const char* m : {"::rune::Match<uint64_t> playerId{};", "::rune::Match<uint32_t> worldId{};",
+                          "::rune::Match<int32_t> channel{};", "::rune::Match<std::array<char, 8>> zone{};",
+                          "::rune::Match<int32_t> kind{};", "::rune::Match<bool> alive{};", "::rune::Match<int64_t> hp{};"}) {
+        pos = at(h, m, pos);
+        ASSERT_NE(pos, std::string::npos) << m << "\n" << h;
+    }
+    const auto end = at(h, "    };\n", s);
+    const std::string body = h.substr(s, end - s);
+    EXPECT_EQ(body.find(" name{}"), std::string::npos);
+    EXPECT_EQ(body.find(" pos{}"), std::string::npos);
+    EXPECT_NE(h.find("playerId (tag 0, uint64), worldId (tag 1, uint32), channel (tag 2, int32), zone (tag 3, string(8)), "
+                     "kind (tag 4, enum), alive (tag 5, bool), hp (tag 6, int64).  Not filterable: name (string), pos (float64)."),
+              std::string::npos) << h;
+    EXPECT_NE(h.find("#include <rune/codec/Filter.h>"), std::string::npos);
+    EXPECT_NE(h.find("#include <expected>"), std::string::npos);
+}
+
+TEST(GeneratorRegression, AFieldNamedFilterIsRejectedRegression) {
+    auto d = DescriptorBuilder("t").add("Filter", PrimType::Int64).build();
+    EXPECT_THROW((void)generateHeader(d), std::invalid_argument);
+}
+
+TEST(Generator, RetiredFieldsGetNoFilterMember) {
+    // Version 4: "gone" (retired at 3) is not part of the type generated for this version (#418 generates the schema
+    // as of its version), so it has no Filter member and no term.
+    auto d = DescriptorBuilder("t", 4)
+                 .addTagged("live", 0, PrimType::UInt32, 1, 0xFFFF, false, {})
+                 .addTagged("gone", 1, PrimType::UInt32, 1, 3, false, {})
+                 .build();
+    const std::string h = generateHeader(d);
+    EXPECT_NE(h.find("::rune::Match<uint32_t> live{};"), std::string::npos);
+    EXPECT_EQ(h.find("::rune::Match<uint32_t> gone{};"), std::string::npos);
+    EXPECT_EQ(h.find("w.term(1,"), std::string::npos);
+}
+
+TEST(GeneratorRegression, AFieldNamedEncodeToIsRejectedRegression) {
+    auto d = DescriptorBuilder("t").add("encodeTo", PrimType::Int64).build();
+    EXPECT_THROW((void)generateHeader(d), std::invalid_argument);
 }

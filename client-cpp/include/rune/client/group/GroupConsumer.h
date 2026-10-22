@@ -42,6 +42,7 @@
 #include <rune/protocol/client/OffsetMessages.h>  // OffsetCommitEntry (for commitEntriesScratch)
 
 #include <chrono>
+#include <concepts>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -137,6 +138,17 @@ struct GroupConfig {
     /// F8c C4 (spec Q6): a commitSync that has not completed this long after
     /// it was applied (duty clock) completes OpStatus::Timeout.
     int32_t      commitSyncTimeoutMs  = 30000;
+    /// Phase 2c: the group's filter (spec §13.3), empty = none.  One filter per group: it rides JoinGroup and
+    /// every partition fetch, and the first member fixes it (a member with another filter is refused,
+    /// GroupFailReason::FilterMismatch).  A filtered group needs routed fetch (the Client's own) and brokers
+    /// >= kBrokerVersionFilter.
+    rune::codec::FilterBytes filterBytes;
+    /// A generated E::Filter (or anything with `FilterBytes encode() const`).  Throws std::invalid_argument
+    /// (the encode error) — explicit, before anything is sent.
+    template <class F>
+        requires requires(const F& f) { { f.encode() } -> std::same_as<rune::codec::FilterBytes>; }
+    GroupConfig& filter(const F& f) { filterBytes = f.encode(); return *this; }
+    GroupConfig& filter(const rune::codec::FilterBytes& b) noexcept { filterBytes = b; return *this; }
 };
 
 // ---------------------------------------------------------------------------
@@ -176,9 +188,10 @@ enum class GroupFailReason : int32_t {
     /// partitions whose leader is a not-yet-upgraded node are only skipped
     /// (logged once) until that node is upgraded and reconnects.
     BrokerTooOld = 1,
-    /// The broker coordinator refused this consumer's request non-retriably
-    /// (ProtocolVersion, or InvalidRequest: the broker could not decode it).
-    /// Recreating the consumer will be refused again.
+    /// The broker refused this consumer's request non-retriably: the coordinator (ProtocolVersion, or
+    /// InvalidRequest: it could not decode the request), or — Phase 2c — a partition leader refusing the group's
+    /// FILTER (untyped topic, over its capacity, unknown tag; the detail reaches onError).  Fix the cause (the
+    /// request, the filter or the topic's schema) before recreating the consumer; a plain retry is refused again.
     RefusedByBroker = 2,
     /// No-hang fix round 3: a retriable failure persisted past its retry budget
     /// (Internal / unclassified coordinator answers, OffsetFetch per-entry
@@ -192,6 +205,9 @@ enum class GroupFailReason : int32_t {
     /// Authentication (D26): the session's user was dropped / disabled — everything of the session ends and the
     /// session is not reconnected.
     SessionRevoked = 5,
+    /// Phase 2c: the group already runs with another filter (the first member fixes it), or this client cannot
+    /// apply the group's filter (a non-routed hub).  Not retriable: recreate with the group's filter.
+    FilterMismatch = 6,
 };
 
 struct GroupConsumerStatus {
@@ -359,7 +375,7 @@ struct GroupConsumerImpl {
 
     // ---- Construction --------------------------------------------------------
     GroupConsumerImpl() {
-        sendBuf.resize(4096);  // pre-allocate scratch (avoids per-send allocation)
+        sendBuf.resize(codec::kMaxSubscribeFrameBytes);  // pre-allocate scratch (avoids per-send allocation); fits a filtered Subscribe
     }
     // F8c C7: freed by whichever of {the handle, the duty side} detaches its
     // share of `status`'s ownership word last (see GroupConsumer).

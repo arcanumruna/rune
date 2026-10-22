@@ -6,7 +6,7 @@ Settings are listed in [configuration.md](../configuration.md#client-configurati
 [wire-protocol.md](wire-protocol.md#error-codes).
 
 Contents: [model](#threading-model) · [connect](#connect) · [authentication](#authentication-and-security) ·
-[topics](#topics-and-ddl) · [produce](#produce) · [subscribe](#subscribe) · [groups](#consumer-groups) ·
+[topics](#topics-and-ddl) · [produce](#produce) · [subscribe](#subscribe) · [filters](#subscription-filters) · [groups](#consumer-groups) ·
 [transactions](#transactions) · [typed topics](#typed-topics-and-routing) · [views](#materialized-views) ·
 [catalog reads](#catalog-and-security-reads) · [errors](#errors-and-failure-handling)
 
@@ -267,6 +267,67 @@ sub.unsubscribe();
 - A subscription follows a leader move on its own and resumes from its position. On a transient partition, `dataResets()`
   counts how many times the data was reset under it (records are never skipped silently).
 
+## Subscription filters
+
+The broker can send a subscription only the records whose fields match, so a consumer that wants one world, one player
+or one channel does not receive (or pay for) the rest. The filter is built from the generated `E::Filter` of a typed
+topic and travels in the `Subscribe`.
+
+```cpp
+#include "player_event.gen.h"                      // rune schema generate player_event
+using E = rune::gen::PlayerEvent;
+
+SubscribeOptions o;
+o.from = From::earliest();
+o.filter(E::Filter{.worldId = 7u, .channel = rune::anyOf(1, 2)});   // worldId == 7 and channel in (1, 2)
+SubscriptionSet world = client.subscribe(events, AllPartitions{}, o,
+    [](const Record& r) { /* r.partition, r.offset, r.value: only the matches */ });
+```
+
+- **Filter by example.** `E::Filter` has one `Match` member per filterable field, in schema order. Set a member to a
+  value (equal) or to `rune::anyOf(...)` (up to 64 values); unset members match anything; the terms are ANDed. At most 8
+  terms. An empty `E::Filter{}` is no filter. Filterable fields: `Int32`, `Int64`, `UInt16`, `UInt32`, `UInt64`, `Enum`,
+  `Bool` and `string(N)` up to 16. Not `string`, `bytes` or `float64`: those members do not exist on `E::Filter`.
+- **Checked when you build it.** A value of the wrong kind does not compile; an integer literal outside the field's
+  range (`.worldId = -1` on a `UInt32`) makes `o.filter(...)` throw `std::invalid_argument` before anything is sent.
+- **No generated type?** `rune::codec::FilterBuilder::on(descriptor).field("worldId").eq(7u).build()` builds the same
+  bytes by field name; pass the result to `o.filter(...)`.
+- **Every partition.** `subscribe(topic, AllPartitions{}, opts, handler)` returns a `SubscriptionSet`: one ordinary
+  `Subscription` per partition (`set[p]`, `set.position(p)`, `set.unsubscribe()`), `set.batchBytes()` for the bytes the
+  broker sent, and `Record::partition` on every record. The set covers the partition count at the time of the call.
+- **One entity.** `subscribe(topic, Key(k), opts, h)` picks the partition only. To read one entity's records, add the
+  filter: `o.filter(E::Filter{.playerId = k})`.
+- **Groups.** `GroupConfig::filter(E::Filter{...})` gives the whole group one filter. The first member fixes it; a member
+  with another filter ends with `GroupFailReason::FilterMismatch` and the detail `group filter mismatch`. The group
+  needs the Client's own routed fetch.
+- **Isolation.** The filter applies after isolation: a `read_committed` subscription still sees only committed records.
+- **Positions and notes.** A filtered subscription's `position()` moves past the records the filter skipped, so it
+  reaches the log end even when nothing matches. The broker sends a position note after
+  `RUNE_FILTER_NOTE_INTERVAL_MS` or `RUNE_FILTER_NOTE_RECORDS` skipped records. Records keep their original offsets; a
+  rebuilt batch can have holes. Resume with `From::offset(sub.position())`; a moved subscription does this on its own with
+  the same filter.
+- **Refusals.** The broker answers a filter it cannot serve explicitly, never by sending everything: the subscription
+  ends `RejectedByBroker` with `brokerErrorCode() == 39` (InvalidRequest), and the reason reaches `onError` as
+  `subscribe topic <id> partition <p> refused: InvalidRequest (39): <detail>`:
+
+  | Detail | Cause |
+  |---|---|
+  | `filter needs a typed topic` | the topic has no schema |
+  | `(tag N): unknown tag` / `type mismatch` / `variable-length field` / `float field` | the filter names a field the topic does not have, retyped, or cannot be filtered |
+  | `filter capacity: ...` | `RUNE_FILTER_MAX_SUBS_PER_PARTITION` or `RUNE_FILTER_MAX_INDEX_VALUES_PER_PARTITION` is reached |
+  | `filter needs RUNE_WORKER_MODE=shard` | the broker runs the legacy worker mode |
+
+  A subscription refused while a topic is being altered (a tag the broker has not installed yet) is refused with
+  `unknown tag`; subscribe again after the ALTER completed.
+- **`BrokerTooOld`.** A filtered subscription on a broker older than broker version 6 would be answered with every
+  record, so the client sends nothing and the subscription ends `SubscriptionFailReason::BrokerTooOld`. Upgrade every
+  broker first.
+- **Schema changes.** Tags are durable. A filter on a field that a later version dropped matches nothing in the records
+  written after the drop; the broker counts them and logs the first one per subscription and version
+  (`filtered field absent`). A field added later matches only the records that carry it.
+- **Tombstones and short values.** A record with no value (or one too short to hold the filtered field) never matches
+  and is counted.
+
 ## Consumer groups
 
 ```cpp
@@ -283,7 +344,8 @@ Register the group and its callbacks **before** `connectAndWait()`. Topic names 
 `ClientConfig::topics`; a name not in the list is skipped. Offsets auto-commit every `autoCommitIntervalMs` unless
 `autoCommit` is false; `commit()` commits on demand, `commitSync` / `commitSyncAndWait` waits for the broker.
 `isolation = IsolationLevel::ReadCommitted` reads only committed transactions. A group consumer ends with a
-`GroupFailReason` (`BrokerTooOld`, `RefusedByBroker`, `RetryBudgetExhausted`, `NotAuthorized`, `SessionRevoked`).
+`GroupFailReason` (`BrokerTooOld`, `RefusedByBroker`, `RetryBudgetExhausted`, `NotAuthorized`, `SessionRevoked`,
+`FilterMismatch`).
 
 At-most-once, at-least-once and exactly-once are choices of `Acks` and of when you commit; see
 [Delivery guarantees](#delivery-guarantees).

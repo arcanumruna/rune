@@ -369,7 +369,7 @@ protected:
         std::array<int32_t, 1> topics{kTopicId};
         uint8_t req[kBufSz]{}, out[kBufSz]{};
         const auto reqLen = msg.encode(req, std::span<const int32_t>(topics));
-        const auto outLen = service_->handleJoinGroup(req, reqLen, clock_, out, kBufSz);
+        const auto outLen = service_->handleJoinGroup(req, reqLen, rune::protocol::client::kClientVersion, clock_, out, kBufSz);
         if (outLen == 0) return {};
         const auto resp = pc::JoinGroupResponse::decode(out, outLen);
         if (!resp) return {};
@@ -992,7 +992,7 @@ TEST_F(CG4DeliveryFixture, JoinGroupFromAnOldClientIsRefusedRegression) {
     std::array<int32_t, 1> topics{kTopicId};
     uint8_t req[kBufSz]{}, out[kBufSz]{};
     const auto reqLen = msg.encode(req, std::span<const int32_t>(topics));
-    const auto outLen = service_->handleJoinGroup(req, reqLen, clock_, out, kBufSz);
+    const auto outLen = service_->handleJoinGroup(req, reqLen, rune::protocol::client::kClientVersion, clock_, out, kBufSz);
     const auto resp = pc::JoinGroupResponse::decode(out, outLen);
     ASSERT_TRUE(resp.has_value());
     EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::ProtocolVersion));

@@ -24,6 +24,7 @@ if(BUILD_TESTING)
             tests/protocol/Crc32cTest.cpp
             tests/protocol/VarintTest.cpp
             tests/protocol/RecordBatchTest.cpp
+            tests/protocol/BatchRebuildTest.cpp
             tests/protocol/PartitionHashTest.cpp
             tests/protocol/MetadataRecordsTest.cpp
             tests/protocol/CreateTopicRecordTest.cpp

@@ -16,7 +16,8 @@ add_library(rune_gateway
     src/PermissionPool.cpp
     src/Authorizer.cpp
     src/LiveSecurityChanges.cpp
-    src/ScramServer.cpp)
+    src/ScramServer.cpp
+    src/FilterAdmission.cpp)
 
 target_include_directories(rune_gateway PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
@@ -257,6 +258,12 @@ if(BUILD_TESTING)
     add_executable(rune_gateway_subscribe_dedupe_tests tests/gateway/SubscribeDedupeTest.cpp)
     target_link_libraries(rune_gateway_subscribe_dedupe_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
     gtest_discover_tests(rune_gateway_subscribe_dedupe_tests)
+
+    # Phase 2c Task 9: filtered Subscribe admission, caps, refusal details, ordered schema fan-out - no Aeron.
+    add_executable(rune_gateway_filter_subscribe_tests tests/gateway/FilterSubscribeGatewayTest.cpp)
+    target_link_libraries(rune_gateway_filter_subscribe_tests PRIVATE rune_gateway rune_node rune_codec spdlog::spdlog GTest::gtest_main)
+    target_include_directories(rune_gateway_filter_subscribe_tests PRIVATE ${RUNE_CLIENT_ROOT}/examples)
+    gtest_discover_tests(rune_gateway_filter_subscribe_tests)
 
     # DDL conformance final review C1: an uncommitted runtime topic serves nothing — no Aeron.
     add_executable(rune_gateway_topic_servability_tests tests/gateway/TopicServabilityTest.cpp)

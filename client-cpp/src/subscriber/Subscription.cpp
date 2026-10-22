@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <exception>
+#include <stdexcept>
 #include <utility>
 
 namespace rune::client {
@@ -167,10 +168,52 @@ uint32_t Subscription::dataResets() const {
     return cache_.dataResets;
 }
 
+uint64_t Subscription::batchBytes() const {
+    if (impl_ && onDutyThread_()) return impl_->batchBytes;
+    drainStatus_();
+    return cache_.batchBytes;
+}
+
 uint16_t Subscription::brokerErrorCode() const {
     if (impl_ && onDutyThread_()) return impl_->brokerErrorCode;
     drainStatus_();
     return cache_.brokerErrorCode;
+}
+
+// ---------------------------------------------------------------------------
+// SubscriptionSet (Phase 2c)
+// ---------------------------------------------------------------------------
+
+Subscription& SubscriptionSet::operator[](int32_t partition) {
+    if (partition < 0 || static_cast<std::size_t>(partition) >= subs_.size())
+        throw std::out_of_range("SubscriptionSet: partition out of range");
+    return subs_[static_cast<std::size_t>(partition)];
+}
+
+int64_t SubscriptionSet::position(int32_t partition) const {
+    if (partition < 0 || static_cast<std::size_t>(partition) >= subs_.size())
+        throw std::out_of_range("SubscriptionSet: partition out of range");
+    return subs_[static_cast<std::size_t>(partition)].position();
+}
+
+bool SubscriptionSet::active() const {
+    for (const auto& s : subs_) if (s.active()) return true;
+    return false;
+}
+
+bool SubscriptionSet::finished() const {
+    for (const auto& s : subs_) if (!s.finished()) return false;
+    return true;
+}
+
+uint64_t SubscriptionSet::batchBytes() const {
+    uint64_t sum = 0;
+    for (const auto& s : subs_) sum += s.batchBytes();
+    return sum;
+}
+
+void SubscriptionSet::unsubscribe() {
+    for (auto& s : subs_) s.unsubscribe();
 }
 
 } // namespace rune::client

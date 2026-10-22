@@ -149,6 +149,11 @@ public:
     /// are legitimate (transaction markers, aborted batches, compaction holes).
     void onRecords(const codec::RecordsView& rv);
 
+    /// Phase 2c: a broker position note (an empty Records frame, baseOffset = how far a FILTERED stream has
+    /// scanned) for a filtered group's partition: the position follows it forward (the commit then moves past
+    /// the filtered-out span).  Same instance checks as onRecords; unfiltered groups ignore notes.  No allocation.
+    void onPositionNote(const codec::RecordsView& rv);
+
     /// Called when JoinGroupResponse (tid 33) arrives.
     void onJoinGroupResponse(const uint8_t* buf, std::size_t len,
                              int64_t sessionId, const SendFn& sendFn);
@@ -318,6 +323,10 @@ public:
     /// Subscribe's correlationId (unanswered, or a BOUND instance — a revoked READ): its consumer is finished
     /// with the matching GroupFailReason, never re-armed.  False when not a live group fetch.
     bool onFetchAuthRefused(int64_t corrId, int16_t errorCode);
+    /// Phase 2c: the broker's InvalidRequest on a FILTERED group's fetch Subscribe (unanswered, or its bound
+    /// instance: the stream it can no longer serve): the consumer is finished RefusedByBroker, never re-armed.
+    /// False when not a live filtered group fetch.
+    bool onFetchInvalidRequest(int64_t corrId);
     /// Authentication (D26): the session was revoked — every active consumer is finished SessionRevoked.
     int revokeAll();
     /// M2: Unsubscribes the transport refused, re-offered by the duty cycle
@@ -399,6 +408,7 @@ private:
 
     int32_t brokerVersion_ = rune::protocol::client::kBrokerVersion;
     void refuse_(GroupConsumerImpl& impl, GroupFailReason why);
+    bool filterNeedsRouting_(GroupConsumerImpl& impl);   // Phase 2c: refuses (FilterMismatch) a filtered group on a non-routed hub
 
     // Fetch routing (see FetchRouter).
     FetchRouter router_{};

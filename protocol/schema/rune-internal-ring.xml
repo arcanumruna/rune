@@ -107,6 +107,10 @@
            worker keeps the maximum; it serves a view row only while the lease clock is below it.  FIFO behind every role
            op derived from the metadata the grant covered.  Never ownership-gated. -->
       <validValue name="READ_LEASE">24</validValue>
+      <!-- Phase 2c (subscription filters): control -> EVERY worker on the worker ingress ring: install / replace
+           a typed topic's filter schema (the filterable fields: tag, primitive type, offset, width).
+           topicId = the topic, tail (TailKind = DESCRIPTOR_BLOB) = the evolving descriptor blob, clientVersion = the schema version.  Append-only value. -->
+      <validValue name="FILTER_SCHEMA">25</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica
@@ -133,6 +137,9 @@
       <validValue name="PEER_KEYS">9</validValue>
       <!-- Issue #109: an ending UNSUBSCRIBE's terminal ErrorResponse message text (UTF-8 bytes). -->
       <validValue name="END_DETAIL">10</validValue>
+      <!-- Phase 2c: the Subscribe op's filter bytes (rune/codec/FilterWire.h canonical format).
+           (FILTER_SCHEMA's tail is DESCRIPTOR_BLOB, not FILTER.) -->
+      <validValue name="FILTER">11</validValue>
     </enum>
 
     <!-- WorkerReturn::Type -->

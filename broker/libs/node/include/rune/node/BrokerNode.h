@@ -1115,11 +1115,23 @@ private:
         }
     }
 
+    /// Phase 2c: a typed topic's EVOLVING descriptor at its current version, for the gateway's filter validation and
+    /// the workers' filter engines.  Idempotent (a re-delivery extends to the same schema); cold (DDL / boot only).
+    void postCatalogFilterSchema_(const rune::catalog::TopicObject& t) {
+        if (!t.schema) return;
+        const auto& b = t.schema->evolvingBlob;
+        postCatalog_(kA2cFilterSchema, filterSchemaWireLen(b.size()), [&](uint8_t* p) {
+            writeFilterSchema(p, t.topicId, t.schema->schemaVersion, std::span<const uint8_t>(b.data(), b.size()));
+        });
+    }
+
     CatalogEffects catalogSink_(uint8_t viewInstallRecovery) {
         CatalogEffects fx;
         fx.maxFrameBytes = catalogMaxFrame_();   // C1: the applier sizes every frame against it
         fx.topicApplied = [this](const rune::catalog::TopicObject& t) {
-            // A typed topic's validator follows as schemaChanged (the applier posts both).
+            // A typed topic's validator follows as schemaChanged (the applier posts both).  Its filter schema goes
+            // FIRST: the gateway then validates (and the workers bind) a filter from the moment the topic serves.
+            postCatalogFilterSchema_(t);
             postCatalogTopicApplied_(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence, t.config);
         };
         fx.sinkApplied = [this](const SinkSpec& s) {
@@ -1145,6 +1157,7 @@ private:
         };
         fx.schemaChanged = [this](const rune::catalog::TopicObject& t, uint16_t fromVersion) {
             postCatalogValidator_(t, fromVersion);
+            postCatalogFilterSchema_(t);
         };
         fx.viewInstalled = [this, viewInstallRecovery](const rune::catalog::ViewObject& v) {
             std::vector<uint8_t> src;   // the first source's materialized descriptor (empty: untyped)
@@ -2122,6 +2135,17 @@ private:
     void buildReplication();   // GR-2/GR-3: replicas + transport + bridge
     void buildGateway();
     void buildWorkerPool();    // E1: shard→worker assignment (must call after replicaRegistry_ is fully built)
+    /// Phase 2c: the NodeConfig filter knobs as the workers' FilterConfig.
+    [[nodiscard]] rune::node::filter::FilterConfig filterConfig_() const noexcept {
+        rune::node::filter::FilterConfig c;
+        c.maxSubsPerPartition        = config_.filterMaxSubsPerPartition;
+        c.maxIndexValuesPerPartition = config_.filterMaxIndexValuesPerPartition;
+        c.noteIntervalNs             = static_cast<int64_t>(config_.filterNoteIntervalMs) * 1'000'000;
+        c.noteRecords                = static_cast<uint64_t>(config_.filterNoteRecords);
+        c.versionWaitNs              = static_cast<int64_t>(config_.filterVersionWaitMs) * 1'000'000;
+        c.matchScratch               = config_.filterMatchScratch;
+        return c;
+    }
     void buildAdminWorker();   // Task 6 / 16: the __catalog replica + AdminWorker thread (adopts the booted applier)
     // Catalog history Task 6: dataDir/__catalog Log + replica + its replication
     // plane (admin-thread-owned).  Called from buildAdminWorker before the

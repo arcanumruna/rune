@@ -10,7 +10,9 @@ add_library(rune_codec STATIC
     src/Generator.cpp
     src/Evolve.cpp
     src/AlterOps.cpp
-    src/Lineage.cpp)
+    src/Lineage.cpp
+    src/FilterSchema.cpp
+    src/FilterBuilder.cpp)
 target_include_directories(rune_codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # ── rune_catalog — the shared catalog-history library (spec §6): event model,
@@ -127,6 +129,42 @@ add_custom_command(
 )
 add_custom_target(generate_allfixed_sample_header DEPENDS "${ALLFIXED_SAMPLE_GEN_H}")
 
+# ── Phase 2c: player_event + nine_ints fixtures for FilterGeneratedTest (built, not checked in) ─
+add_executable(make_player_event_blob tools/make_player_event_blob.cpp)
+target_link_libraries(make_player_event_blob PRIVATE rune_codec)
+
+set(PLAYER_EVENT_BLOB  "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/player_event.blob")
+set(NINE_INTS_BLOB     "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/nine_ints.blob")
+set(PLAYER_EVENT_GEN_H "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/player_event.gen.h")
+set(SHADOW_NAMES_BLOB   "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/shadow_names.blob")
+set(SHADOW_NAMES_GEN_H  "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/shadow_names.gen.h")
+set(NINE_INTS_GEN_H    "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/nine_ints.gen.h")
+add_custom_command(
+    OUTPUT  "${PLAYER_EVENT_BLOB}" "${NINE_INTS_BLOB}" "${SHADOW_NAMES_BLOB}"
+    COMMAND make_player_event_blob "${CMAKE_CURRENT_BINARY_DIR}/tests/generated"
+    DEPENDS make_player_event_blob
+    COMMENT "Generating player_event.blob / nine_ints.blob (2c filter fixtures)"
+)
+add_custom_command(
+    OUTPUT  "${PLAYER_EVENT_GEN_H}"
+    COMMAND rune_codec_gen "${PLAYER_EVENT_BLOB}" "${PLAYER_EVENT_GEN_H}"
+    DEPENDS rune_codec_gen "${PLAYER_EVENT_BLOB}"
+    COMMENT "Generating player_event.gen.h from player_event.blob"
+)
+add_custom_command(
+    OUTPUT  "${NINE_INTS_GEN_H}"
+    COMMAND rune_codec_gen "${NINE_INTS_BLOB}" "${NINE_INTS_GEN_H}"
+    DEPENDS rune_codec_gen "${NINE_INTS_BLOB}"
+    COMMENT "Generating nine_ints.gen.h from nine_ints.blob"
+)
+add_custom_command(
+    OUTPUT  "${SHADOW_NAMES_GEN_H}"
+    COMMAND rune_codec_gen "${SHADOW_NAMES_BLOB}" "${SHADOW_NAMES_GEN_H}"
+    DEPENDS rune_codec_gen "${SHADOW_NAMES_BLOB}"
+    COMMENT "Generating shadow_names.gen.h from shadow_names.blob"
+)
+add_custom_target(generate_filter_fixture_headers DEPENDS "${PLAYER_EVENT_GEN_H}" "${NINE_INTS_GEN_H}" "${SHADOW_NAMES_GEN_H}")
+
 # ── #418 fixture: the evo_mix / evo_fix lineages at every version (tests/LineageFixtures.h) -> one generated type
 #    per version, from that version's EVOLVING descriptor (what `rune schema generate` fetches).
 add_executable(make_lineage_blobs tools/make_lineage_blobs.cpp)
@@ -178,12 +216,21 @@ add_executable(rune_codec_tests
     tests/GeneratedKeyTest.cpp
     tests/FlyweightTest.cpp
     tests/FlyweightGeneratedRoundTripTest.cpp
+    tests/FilterWireTest.cpp
+    tests/FilterSchemaTest.cpp
+    tests/FilterPredicateTest.cpp
+    tests/FilterBuilderTest.cpp
+    tests/FilterGeneratedTest.cpp
     tests/LineageDecodeTest.cpp)
 target_include_directories(rune_codec_tests PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")
 target_link_libraries(rune_codec_tests PRIVATE rune_codec GTest::gtest_main)
 add_dependencies(rune_codec_tests generate_characters_header generate_fixedstr_sample_header
-                 generate_str_keyed_header generate_allfixed_sample_header generate_lineage_headers)
+                 generate_str_keyed_header generate_allfixed_sample_header generate_filter_fixture_headers generate_lineage_headers)
+# Designated initializers must follow member order (Clang accepts reordering with a warning; GCC rejects it).
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(rune_codec_tests PRIVATE -Werror=reorder-init-list)
+endif()
 include(GoogleTest)
 gtest_discover_tests(rune_codec_tests)
 

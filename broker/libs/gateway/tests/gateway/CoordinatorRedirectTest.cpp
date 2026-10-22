@@ -22,7 +22,7 @@ namespace pc = rune::protocol::client;
 
 struct CountingGroup final : IGroupRequestHandler {
     int calls = 0;
-    size_t handleJoinGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
+    size_t handleJoinGroup(const uint8_t*, size_t, int32_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
     size_t handleSyncGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
     size_t handleHeartbeat(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
     size_t handleLeaveGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
@@ -65,7 +65,7 @@ struct Rig {
         pc::JoinGroup q; q.sessionId = sid; q.correlationId = corr; q.sessionTimeoutMs = 10'000;
         q.groupId = {reinterpret_cast<const uint8_t*>(g.data()), g.size()};
         const int32_t topics[1] = {2};
-        std::vector<uint8_t> f(pc::JoinGroup::encodedSizeFor(q.groupId, q.memberId, 1));
+        std::vector<uint8_t> f(pc::JoinGroup::encodedSizeFor(q.groupId, q.memberId, 1, 0));
         q.encode(f.data(), std::span<const int32_t>(topics, 1));
         gw.applyGroupForTest(f.data(), f.size(), pc::JoinGroup::TEMPLATE_ID);
     }
@@ -181,7 +181,7 @@ TEST(CoordinatorRedirectRegression, CoordinatorAnswerIsQueuedUnderBackpressureRe
     pc::JoinGroup q; q.sessionId = sid; q.correlationId = 45; q.sessionTimeoutMs = 10'000;
     q.groupId = {reinterpret_cast<const uint8_t*>(g.data()), g.size()};
     const int32_t topics[1] = {2};
-    std::vector<uint8_t> f(pc::JoinGroup::encodedSizeFor(q.groupId, q.memberId, 1));
+    std::vector<uint8_t> f(pc::JoinGroup::encodedSizeFor(q.groupId, q.memberId, 1, 0));
     q.encode(f.data(), std::span<const int32_t>(topics, 1));
     gw.applyGroupForTest(f.data(), f.size(), pc::JoinGroup::TEMPLATE_ID);
     EXPECT_TRUE(out.empty());

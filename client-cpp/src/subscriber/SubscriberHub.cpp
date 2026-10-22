@@ -52,7 +52,7 @@ void SubscriberHub::clearDirty_(SubscriptionImpl& impl) noexcept
 void SubscriberHub::publishStatus_(SubscriptionImpl& impl)
 {
     if (impl.status.tryPublish(
-            SubscriptionStatus{impl.subscriptionId, impl.nextOffset, SubscriptionFailReason::None, 0, impl.dataResets})) {
+            SubscriptionStatus{impl.subscriptionId, impl.nextOffset, SubscriptionFailReason::None, 0, impl.dataResets, impl.batchBytes})) {
         clearDirty_(impl);
     } else if (!impl.status.closed()) {
         markDirty_(impl);
@@ -65,7 +65,7 @@ int SubscriberHub::republishDirty()
     for (SubscriptionImpl* p = dirtyHead_; p != nullptr; ) {
         SubscriptionImpl* next = p->nextDirty;
         if (p->status.tryPublish(
-                SubscriptionStatus{p->subscriptionId, p->nextOffset, SubscriptionFailReason::None, 0, p->dataResets})) {
+                SubscriptionStatus{p->subscriptionId, p->nextOffset, SubscriptionFailReason::None, 0, p->dataResets, p->batchBytes})) {
             clearDirty_(*p);
             ++published;
         } else if (p->status.closed()) {
@@ -84,7 +84,7 @@ void SubscriberHub::closeStatus_(SubscriptionImpl& impl)
     // app thread that observes finished() and drains afterwards sees it.
     (void)impl.status.publishFinal(
         SubscriptionStatus{impl.subscriptionId, impl.nextOffset, impl.failReason, impl.brokerErrorCode,
-                           impl.dataResets});
+                           impl.dataResets, impl.batchBytes});
     impl.status.close();
 }
 
@@ -109,8 +109,8 @@ std::unique_ptr<SubscribeRequest> SubscriberHub::makeSubscribeRequest(
         std::span<const uint8_t>              keyBytes,
         std::chrono::steady_clock::time_point deadline)
 {
-    // Max frame size: header(24) + fixed(~30) + key(≤16) = ~70 bytes.
-    uint8_t frameBuf[256]{};
+    // Max frame size: header(24) + fixed(~30) + key(≤16) + the optional filter trailer.
+    uint8_t frameBuf[codec::kMaxSubscribeFrameBytes];
     const std::size_t frameLen = codec::encodeSubscribe(
         frameBuf, sizeof(frameBuf),
         impl->topicId,
@@ -120,7 +120,8 @@ std::unique_ptr<SubscribeRequest> SubscriberHub::makeSubscribeRequest(
         isolation,
         keyBytes,
         sessionId,
-        impl->correlationId);
+        impl->correlationId,
+        impl->filterSpan());
 
     auto req = std::make_unique<SubscribeRequest>();
     req->impl     = impl;
@@ -205,9 +206,22 @@ void SubscriberHub::adoptSubscribe(std::unique_ptr<SubscribeRequest> req,
     }
 }
 
+bool SubscriberHub::brokerTooOldForFilter_(SubscriptionImpl& impl) noexcept
+{
+    if (!impl.filtered() || brokerVersion_ == nullptr) return false;
+    // 0 = that session is not connected yet: the frame stays pending, as today.
+    const int32_t v = brokerVersion_(brokerVersionCtx_, impl.homeSession);
+    if (v < 1 || v >= rune::protocol::client::kBrokerVersionFilter) return false;
+    impl.failReason = SubscriptionFailReason::BrokerTooOld;   // before the finish: the final snapshot carries it
+    return true;
+}
+
 detail::SendResult SubscriberHub::sendSubscribeFrame_(const SubscribeRequest& req)
 {
     if (req.subscribeFrame.empty()) return detail::SendResult::Accepted;  // nothing to send
+    // Phase 2c (SD3): a broker below kBrokerVersionFilter would ignore the filter and deliver everything — send
+    // nothing; Fatal makes the caller finish the subscription (failReason BrokerTooOld) and forget the request.
+    if (req.impl != nullptr && brokerTooOldForFilter_(*req.impl)) [[unlikely]] return detail::SendResult::Fatal;
     assert(directSend_ != nullptr && "SubscriberHub: direct send not wired");
     if (directSend_ == nullptr) return detail::SendResult::Retry;  // never claim "sent"
     return directSend_(directSendCtx_, req.subscribeFrame.data(), req.subscribeFrame.size());
@@ -446,7 +460,7 @@ void SubscriberHub::onSubscribeResponse(
 
     // Bind: lifecycle snapshot (uses the reserve — always fits).
     (void)impl->status.publishFinal(
-        SubscriptionStatus{impl->subscriptionId, impl->nextOffset, impl->failReason, 0, impl->dataResets});
+        SubscriptionStatus{impl->subscriptionId, impl->nextOffset, impl->failReason, 0, impl->dataResets, impl->batchBytes});
     activeById_.emplace(rsp.subscriptionId, impl);
 }
 
@@ -479,7 +493,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         pi->subscriptionId = rv.subscriptionId;
         pi->boundPartition = rv.partition;
         (void)pi->status.publishFinal(
-            SubscriptionStatus{pi->subscriptionId, pi->nextOffset, pi->failReason, 0, pi->dataResets});
+            SubscriptionStatus{pi->subscriptionId, pi->nextOffset, pi->failReason, 0, pi->dataResets, pi->batchBytes});
         it = activeById_.emplace(rv.subscriptionId, pi).first;
     }
     SubscriptionImpl& impl = *it->second;
@@ -531,6 +545,12 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         // A catalog frame with no epoch is not a version-8 marker: never taken as
         // "caught up" (the reader's deadline ends a read that never gets one).
         if (isEventLogTopic(impl.topicId)) [[unlikely]] { noteMalformed_(); return; }
+        if (impl.filtered()) [[unlikely]] {
+            // Phase 2c (SD11): a filtered subscription's POSITION NOTE — every record below it was evaluated and
+            // every match below it delivered.  Monotonic.
+            if (rv.baseOffset > impl.nextOffset) { impl.nextOffset = rv.baseOffset; publishStatus_(impl); }
+            return;
+        }
         // A POSITION NOTE (client version 6): the broker's cursor for this
         // subscription, sent right before it answers NotLeader (moved).  Kept
         // only while nothing was delivered (rearmMovedAway resumes there).
@@ -542,7 +562,8 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
     // read server coalesces; DataMessages.h): every one is decoded.  A control
     // batch's offsets are consumed, never delivered.  No allocation: the visitor is
     // a template (RecordBatchReader::forEachRecord), never a std::function.
-    const int64_t before = impl.nextOffset;
+    const int32_t partitionOfRecords = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
+    impl.batchBytes += rb.size();   // FD13: egress bytes delivered (the status is published below)
     dispatching_ = &impl;
     std::span<const uint8_t> rest(rb.data(), rb.size());
     bool first = true;
@@ -594,6 +615,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
                 if (absOffset < dropBelow) [[unlikely]] return;   // delivered before the move
 
                 Record rec;
+                rec.partition = partitionOfRecords;
                 rec.offset    = absOffset;
                 rec.timestamp = timestamp;
                 rec.key   = std::span<const uint8_t>(
@@ -620,6 +642,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
 
                 impl.nextOffset = absOffset + 1;
             });
+            if (impl.active && impl.filtered() && last + 1 > impl.nextOffset) [[unlikely]] impl.nextOffset = last + 1;   // the rebuilt batch spans its source; not past records an unsubscribing handler never got
         }
         if (batchLen >= rest.size()) break;
         rest = rest.subspan(batchLen);
@@ -635,7 +658,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         return;
     }
     // One status snapshot per Records frame (not per record).
-    if (impl.nextOffset != before || impl.statusDirty) publishStatus_(impl);
+    publishStatus_(impl);   // rb is non-empty here: batchBytes grew
 }
 
 // A Records frame whose batch (the first, or one after decoded ones) is not a
@@ -773,11 +796,12 @@ bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int
         const int64_t from = impl.nextOffset > 0  ? impl.nextOffset
                            : impl.resumeHint >= 0 ? impl.resumeHint
                                                   : impl.fromWire;
-        uint8_t frameBuf[256]{};
+        uint8_t frameBuf[codec::kMaxSubscribeFrameBytes];
         uint8_t claim[8];
         const std::size_t frameLen = codec::encodeSubscribe(frameBuf, sizeof(frameBuf), impl.topicId, part,
                                                             /*partitionKnown=*/1, from, impl.isolation,
-                                                            lineageClaim_(impl, claim), sessionId, newCorrId);
+                                                            lineageClaim_(impl, claim), sessionId, newCorrId,
+                                                            impl.filterSpan());
         if (frameLen == 0) return false;
         auto req = std::make_unique<SubscribeRequest>();   // cold: once per leadership move
         req->impl     = &impl;
@@ -856,11 +880,12 @@ bool SubscriberHub::restartFromLogStart(int64_t correlationId, int64_t seedSid,
     SubscriptionImpl& impl = *it->second->impl;
     if (!impl.active) return false;
     const int32_t part = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
-    uint8_t frameBuf[256]{};
+    uint8_t frameBuf[codec::kMaxSubscribeFrameBytes];
     constexpr int64_t kFromEarliest = -2;   // From::earliest() on the wire: the log start
     const std::size_t frameLen = codec::encodeSubscribe(frameBuf, sizeof(frameBuf), impl.topicId, part,
                                                         /*partitionKnown=*/1, kFromEarliest, impl.isolation,
-                                                        std::span<const uint8_t>{}, seedSid, correlationId);
+                                                        std::span<const uint8_t>{}, seedSid, correlationId,
+                                                        impl.filterSpan());
     if (frameLen == 0) return false;
     try {
         it->second->subscribeFrame.assign(frameBuf, frameBuf + frameLen);
@@ -951,6 +976,7 @@ void SubscriberHub::sendHomed_(PendingMap::iterator it)
 {
     SubscribeRequest& req  = *it->second;
     SubscriptionImpl& impl = *req.impl;
+    if (brokerTooOldForFilter_(impl)) [[unlikely]] { (void)failRequest_(it); return; }   // SD3: that node's broker
     const int64_t sid = router_.sessionId(router_.ctx, impl.homeSession);
     if (sid == 0) return;   // that node's session is (re)connecting: held, flushed by driveHomed
     stampSession_(req.subscribeFrame, sid);
@@ -1085,11 +1111,12 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
         const int64_t from    = impl.nextOffset > 0  ? impl.nextOffset
                               : impl.resumeHint >= 0 ? impl.resumeHint
                                                      : impl.fromWire;
-        uint8_t frameBuf[256]{};
+        uint8_t frameBuf[codec::kMaxSubscribeFrameBytes];
         uint8_t claim[8];
         const std::size_t frameLen = codec::encodeSubscribe(frameBuf, sizeof(frameBuf), impl.topicId, part,
                                                             /*partitionKnown=*/1, from, impl.isolation,
-                                                            lineageClaim_(impl, claim), seedSid, newCorr);
+                                                            lineageClaim_(impl, claim), seedSid, newCorr,
+                                                            impl.filterSpan());
         if (frameLen == 0) { ++homed; continue; }
         std::unique_ptr<SubscribeRequest> req;
         try {
@@ -1162,6 +1189,29 @@ bool SubscriberHub::failActiveSubscription(int64_t subscriptionId, SubscriptionF
     if (it == activeById_.end() || !it->second->active) return false;
     it->second->failReason = reason;  // before the finish: the final snapshot carries it
     return unsubscribe(it->second->correlationId, unsubCorrId, sessionId, submitFn);
+}
+
+bool SubscriberHub::pendingSubscribeTarget(int64_t correlationId, int32_t& topicId, int32_t& partition) const
+{
+    const auto it = pendingByCorrelation_.find(correlationId);
+    if (it == pendingByCorrelation_.end() || !it->second || it->second->impl == nullptr) return false;
+    topicId   = it->second->impl->topicId;
+    partition = it->second->impl->partition;
+    return true;
+}
+
+bool SubscriberHub::failActiveByCorrelation(int64_t correlationId, SubscriptionFailReason why, uint16_t code,
+                                            int64_t unsubCorrId, int64_t sessionId, const SendFn& submitFn)
+{
+    if (correlationId == 0) return false;
+    for (const auto& [id, impl] : activeById_) {
+        if (impl == nullptr || impl->correlationId != correlationId) continue;
+        if (!impl->active) return false;
+        impl->failReason      = why;   // before the finish: the final snapshot carries them
+        impl->brokerErrorCode = code;
+        return unsubscribe(correlationId, unsubCorrId, sessionId, submitFn);
+    }
+    return false;
 }
 
 void SubscriberHub::failPendingSubscribes(const std::string& reason)

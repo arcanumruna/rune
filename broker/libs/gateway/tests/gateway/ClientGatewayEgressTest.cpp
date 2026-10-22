@@ -621,7 +621,7 @@ TEST(ClientGatewayEgressRegression, UndecodableHandshakeContinueFailsTheHandshak
 TEST(ClientGatewayEgressRegression, OldClientMalformedJoinGroupIsAnsweredProtocolVersionRegression)
 {
     struct NoGroup final : IGroupRequestHandler {
-        size_t handleJoinGroup(const uint8_t* b, size_t n, int64_t, uint8_t* o, size_t c) override {
+        size_t handleJoinGroup(const uint8_t* b, size_t n, int32_t, int64_t, uint8_t* o, size_t c) override {
             return encodeRejectionFor(b, n, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), o, c);
         }
         size_t handleSyncGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
@@ -646,6 +646,87 @@ TEST(ClientGatewayEgressRegression, OldClientMalformedJoinGroupIsAnsweredProtoco
     j = cap.last<pc::JoinGroupResponse>();
     ASSERT_TRUE(j.has_value());
     EXPECT_EQ(j->correlationId, 62);
+    EXPECT_EQ(j->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+}
+
+// Phase 2c Task 5 fix round 1 (I1, P13 / E13): the JoinGroup filter trailer is parsed only for a session of client
+// version >= 10.  The gateway hands the coordinator the session's negotiated version, and its own old-client
+// decode check (< v5) and authorization decode use it too - a pre-v11 session's trailing bytes are ignored.
+TEST(GatewayFilterWireRegression, JoinGroupDecodeIsGatedOnTheSessionsClientVersionRegression)
+{
+    struct Recorder final : IGroupRequestHandler {
+        int calls = 0;
+        int32_t lastVersion = -1;
+        bool    lastDecodedWithFilter = false;
+        size_t handleJoinGroup(const uint8_t* b, size_t n, int32_t v, int64_t, uint8_t* o, size_t c) override {
+            ++calls; lastVersion = v;
+            const auto m = pc::JoinGroup::decode(b, n, v);
+            lastDecodedWithFilter = m && !m->filter.empty();
+            if (!m) return encodeRejectionFor(b, n, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), o, c);
+            pc::JoinGroupResponse ok;   // a successful answer: OK, no detail
+            ok.sessionId = m->sessionId; ok.correlationId = m->correlationId;
+            return c >= ok.encodedSize() ? ok.encode(o) : 0;
+        }
+        size_t handleSyncGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+        size_t handleHeartbeat(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+        size_t handleLeaveGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+        size_t handleOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+        size_t handleOffsetFetch(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+    } svc;
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.setGroupService(&svc);
+    const int64_t v4  = gw.injectReliableTestSessionForTest(0, 4);
+    const int64_t v9  = gw.injectReliableTestSessionForTest(0, pc::kClientVersionAuth);
+    const int64_t v10 = gw.injectReliableTestSessionForTest(0, pc::kClientVersionFilter);
+
+    const std::array<uint8_t, 3> grp{'g', 'r', 'p'};
+    const std::array<int32_t, 1> topics{7};
+    const std::vector<uint8_t> filter{1, 1, 5, 0, 4, 1, 1, 0xAA, 0xBB, 0xCC, 0xDD};
+    auto frameFor = [&](int64_t sid, bool withFilter, std::vector<uint8_t> stray) {
+        pc::JoinGroup m;
+        m.sessionId = sid; m.correlationId = 70; m.sessionTimeoutMs = 1000; m.groupId = grp;
+        if (withFilter) m.filter = filter;
+        std::vector<uint8_t> f(m.encodedSize(topics.size()) + 8);
+        f.resize(m.encode(f.data(), topics));
+        f.insert(f.end(), stray.begin(), stray.end());
+        return f;
+    };
+
+    // A v9 session, one stray byte after the topic ids: served (the coordinator got version 9), no filter.
+    auto f = frameFor(v9, false, {0x7F});
+    gw.applyGroupForTest(f.data(), f.size(), pc::JoinGroup::TEMPLATE_ID);
+    EXPECT_EQ(svc.calls, 1);
+    EXPECT_EQ(svc.lastVersion, pc::kClientVersionAuth);
+    EXPECT_FALSE(svc.lastDecodedWithFilter);
+    {
+        const auto a = cap.last<pc::JoinGroupResponse>();
+        ASSERT_TRUE(a.has_value());
+        EXPECT_EQ(a->errorCode, static_cast<int16_t>(pc::ErrorCode::OK)) << "a v9 stray byte must not be refused";
+    }
+
+    // A v9 session with a WELL-FORMED trailer: still no filter.
+    f = frameFor(v9, true, {});
+    gw.applyGroupForTest(f.data(), f.size(), pc::JoinGroup::TEMPLATE_ID);
+    EXPECT_EQ(svc.calls, 2);
+    EXPECT_FALSE(svc.lastDecodedWithFilter);
+
+    // A pre-v5 session (the gateway's own decode check) with a stray byte: reaches the coordinator, not rejected.
+    f = frameFor(v4, false, {0x7F});
+    gw.applyGroupForTest(f.data(), f.size(), pc::JoinGroup::TEMPLATE_ID);
+    EXPECT_EQ(svc.calls, 3);
+    EXPECT_EQ(svc.lastVersion, 4);
+
+    // A v11 session gets the filter; a v11 stray byte is a decode failure answered InvalidRequest.
+    f = frameFor(v10, true, {});
+    gw.applyGroupForTest(f.data(), f.size(), pc::JoinGroup::TEMPLATE_ID);
+    EXPECT_EQ(svc.calls, 4);
+    EXPECT_EQ(svc.lastVersion, pc::kClientVersionFilter);
+    EXPECT_TRUE(svc.lastDecodedWithFilter);
+    f = frameFor(v10, false, {0x7F});
+    gw.applyGroupForTest(f.data(), f.size(), pc::JoinGroup::TEMPLATE_ID);
+    const auto j = cap.last<pc::JoinGroupResponse>();
+    ASSERT_TRUE(j.has_value());
     EXPECT_EQ(j->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
 }
 
@@ -1458,7 +1539,7 @@ TEST(ClientGatewayEgressRegression, OldClientGroupErrorIsAnsweredUnknownMemberAn
 {
     struct InternalGroup final : IGroupRequestHandler {
         std::vector<std::string> evicted;
-        size_t handleJoinGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+        size_t handleJoinGroup(const uint8_t*, size_t, int32_t, int64_t, uint8_t*, size_t) override { return 0; }
         size_t handleSyncGroup(const uint8_t* b, size_t, int64_t, uint8_t* o, size_t) override {
             const auto h = pc::MessageHeader::decode(b, pc::MessageHeader::ENCODED_SIZE);
             pc::SyncGroupResponse r;

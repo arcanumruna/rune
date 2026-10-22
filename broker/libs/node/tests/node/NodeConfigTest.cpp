@@ -2976,4 +2976,54 @@ TEST(NodeConfigRegression, DevModeWarnsAtStartAndEveryFiveMinutes) {
                                                 "'anonymous' with full access"), std::string::npos);
 }
 
+// Phase 2c Task 9: the six subscription-filter knobs default and parse.
+TEST(NodeConfig, FilterKnobsDefaultAndParse) {
+    {
+        auto r = parseNodeConfig(fakeEnv(base1node()));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        EXPECT_EQ(r.config->filterMaxSubsPerPartition, 4096u);
+        EXPECT_EQ(r.config->filterMaxIndexValuesPerPartition, 4096u);
+        EXPECT_EQ(r.config->filterNoteIntervalMs, 50);
+        EXPECT_EQ(r.config->filterNoteRecords, 65536);
+        EXPECT_EQ(r.config->filterVersionWaitMs, 5000);
+        EXPECT_EQ(r.config->filterMatchScratch, 65536u);
+    }
+    {
+        auto env = base1node();
+        env["RUNE_FILTER_MAX_SUBS_PER_PARTITION"]          = "1";
+        env["RUNE_FILTER_MAX_INDEX_VALUES_PER_PARTITION"]  = "1048576";
+        env["RUNE_FILTER_NOTE_INTERVAL_MS"]                = "60000";
+        env["RUNE_FILTER_NOTE_RECORDS"]                    = "2147483647";
+        env["RUNE_FILTER_VERSION_WAIT_MS"]                 = "0";
+        env["RUNE_FILTER_MATCH_SCRATCH"]                   = "64";
+        auto r = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        EXPECT_EQ(r.config->filterMaxSubsPerPartition, 1u);
+        EXPECT_EQ(r.config->filterMaxIndexValuesPerPartition, 1048576u);
+        EXPECT_EQ(r.config->filterNoteIntervalMs, 60000);
+        EXPECT_EQ(r.config->filterNoteRecords, 2147483647);
+        EXPECT_EQ(r.config->filterVersionWaitMs, 0);
+        EXPECT_EQ(r.config->filterMatchScratch, 64u);
+    }
+}
+
+// A value out of bounds (or not an integer) refuses start with a message naming the knob.
+TEST(NodeConfigRegression, FilterKnobOutOfBoundsRefusesStartRegression) {
+    const std::vector<std::pair<const char*, const char*>> bad = {
+        {"RUNE_FILTER_MAX_SUBS_PER_PARTITION", "0"},         {"RUNE_FILTER_MAX_SUBS_PER_PARTITION", "1048577"},
+        {"RUNE_FILTER_MAX_INDEX_VALUES_PER_PARTITION", "0"}, {"RUNE_FILTER_MAX_INDEX_VALUES_PER_PARTITION", "1048577"},
+        {"RUNE_FILTER_NOTE_INTERVAL_MS", "0"},               {"RUNE_FILTER_NOTE_INTERVAL_MS", "60001"},
+        {"RUNE_FILTER_NOTE_RECORDS", "0"},                   {"RUNE_FILTER_NOTE_RECORDS", "2147483648"},
+        {"RUNE_FILTER_VERSION_WAIT_MS", "-1"},               {"RUNE_FILTER_VERSION_WAIT_MS", "600001"},
+        {"RUNE_FILTER_MATCH_SCRATCH", "63"},                 {"RUNE_FILTER_MATCH_SCRATCH", "16777217"},
+        {"RUNE_FILTER_MATCH_SCRATCH", "lots"}};
+    for (const auto& [knob, value] : bad) {
+        auto env = base1node();
+        env[knob] = value;
+        auto r = parseNodeConfig(fakeEnv(env));
+        EXPECT_FALSE(r.config.has_value()) << knob << "=" << value;
+        EXPECT_NE(r.error.find(knob), std::string::npos) << r.error;
+    }
+}
+
 } // namespace rune::node

@@ -138,6 +138,33 @@ game::gen::Player::Decoder d(record.value, lin);                  // zero-copy; 
 
 `decode` returns false (every member at its default) for a version it cannot place.
 
+### Filters
+
+For every filterable field the generated struct also gets a nested `Filter` (filter by example) used by
+`SubscribeOptions::filter` and `GroupConfig::filter` ([client-cpp.md](client-cpp.md#subscription-filters)):
+
+```cpp
+using E = rune::gen::PlayerEvent;
+E::Filter f{.worldId = 7u, .channel = rune::anyOf(1, 2)};   // members follow the schema's field order
+rune::codec::FilterBytes b = f.encode();                    // throws std::invalid_argument on a bad value
+```
+
+- One `rune::Match<T>` member per filterable field: `Int32`, `Int64`, `UInt16`, `UInt32`, `UInt64`, `Enum`, `Bool`, and
+  `std::array<char, N>` for `string(N)` up to 16 (a string literal of at most N characters is zero-padded like the
+  stored field). No member exists for `string`, `bytes` or `float64`; the comment above `Filter` names them.
+- A `Match` holds one value or `rune::anyOf(...)` (up to 64). Integral literals are accepted for integral fields and
+  range-checked at encode time (an out-of-range value fails, it is never truncated); floats, strings and `bool` against
+  integers do not compile. `encodeTo(span)` is `constexpr`; `encode()` throws.
+- The bytes are canonical (terms sorted by durable tag, `In` values sorted and de-duplicated), at most 8 terms and
+  `kMaxFilterBytes` (8,234) bytes; equal filters encode identically. An empty `Filter{}` encodes to nothing.
+- A schema field named `Filter` makes the generator throw `std::invalid_argument` (it would collide with the nested
+  type, like a field named `key`). The generated `Filter` changes no `kFingerprint`.
+- `rune::codec::FilterBuilder::on(descriptor).field("name").eq(v)` / `.in({...})` / `.build()` builds the same bytes at run
+  time and returns `std::expected<FilterBytes, FilterError>`; `describe(error)` names the term. Use it where only the
+  descriptor is known (CLI, probes, dynamic clients).
+- `rune::codec::FilterSchema` and `CompiledFilter` (`FilterSchema.h`, `FilterPredicate.h`) are what the broker evaluates
+  with; they are standalone in the codec so other consumers can reuse them.
+
 ## Catalog and security libraries
 
 `rune_catalog` and `rune_security` replay an append-only event log into state. Each event carries a fingerprint over the

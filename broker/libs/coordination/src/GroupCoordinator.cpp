@@ -323,6 +323,14 @@ const MemberInfo* GroupCoordinator::findMember(const std::string& memberId) cons
     return nullptr;
 }
 
+bool GroupCoordinator::admitFilter(std::span<const uint8_t> filter) {
+    if (members_.empty()) {   // unfixed: the first member of an empty group sets (or clears) the filter
+        filter_.assign(filter.begin(), filter.end());
+        return true;
+    }
+    return std::equal(filter.begin(), filter.end(), filter_.begin(), filter_.end());
+}
+
 bool GroupCoordinator::removeMember(const std::string& memberId)
 {
     auto it = std::find_if(members_.begin(), members_.end(),

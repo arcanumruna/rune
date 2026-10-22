@@ -271,6 +271,7 @@ Client::Client(ClientConfig cfg)
     // from the duty thread (retried every duty cycle on refusal), never via the
     // command ring.
     subscriberHub_.setDirectSend(&Client::directSendTrampoline_, this);
+    subscriberHub_.setBrokerVersionFn(&Client::subscribeBrokerVersionTrampoline_, this);   // Phase 2c (SD3)
     groupConsumerHub_.setDirectSend(&Client::coordDirectSendTrampoline_, this);  // D4: the coordinator
     // D4: every group frame goes to the COORDINATOR session — the seed's ring
     // path (unchanged) while the coordinator is the seed, else that node's own
@@ -2221,7 +2222,10 @@ void Client::onSeedConnected_(int64_t sessionId, int32_t brokerVersion) {
 
     // MAJOR-2 (round 3): the broker's capability, for every group
     // consumer — present or created later (joinIfConnected).
-    groupConsumerHub_.setBrokerVersion(brokerVersion);
+    // M3 (Phase 2c): the hub judges the COORDINATOR's session.  A seed that reconnected onto another (older)
+    // node while the coordinator lives on a session of its own must not overwrite the coordinator's version
+    // (syncCoordinatorSession_ keeps that one current).
+    if (coordIdx_ == 0) groupConsumerHub_.setBrokerVersion(brokerVersion);
 
     // CG-5: Trigger group consumers to send JoinGroup on connect — only
     // when the SEED (the coordinator's session) connected: a leader
@@ -3538,6 +3542,31 @@ void Client::onEgressFrame(codec::TemplateId tid,
             if (onAuthErrorResponse_(*opt)) break;
         }
 
+        // Phase 2c: the broker's defensive InvalidRequest on a BOUND subscription's Subscribe correlation id (a
+        // filtered stream it can no longer serve): finished with the code, never re-armed.  Cold.
+        if (ec == rpc::ErrorCode::InvalidRequest && opt->correlationId != 0) [[unlikely]] {
+            // A FILTERED group's fetch instance (its leader dropped the stream): the consumer ends, surfaced.
+            if (groupConsumerHub_.onFetchInvalidRequest(opt->correlationId)) {
+                std::string msg(opt->message);
+                if (msg.empty()) msg = "group fetch refused by the broker: InvalidRequest (39)";
+                if (cbError_) invokeUserCallback_("onError", [&] { cbError_(msg); });
+                break;
+            }
+            const auto snap = agent_.stateAndSessionId();
+            const int64_t unsubCorrId = nextCorrId_++;
+            if (subscriberHub_.failActiveByCorrelation(
+                    opt->correlationId, SubscriptionFailReason::RejectedByBroker,
+                    static_cast<uint16_t>(opt->code), unsubCorrId, snap.sessionId,
+                    [this](int32_t, const uint8_t* fbuf, std::size_t flen) -> bool {
+                        return agent_.submitSend(fbuf, flen);
+                    })) {
+                std::string msg(opt->message);
+                if (msg.empty()) msg = "subscription refused by the broker: InvalidRequest (39)";
+                if (cbError_) invokeUserCallback_("onError", [&] { cbError_(msg); });
+                break;
+            }
+        }
+
         // A group member's per-partition Subscribe refused by a non-leader:
         // re-route THAT partition (never a seed-level redirect — the seed
         // session is the group coordinator's).
@@ -4022,6 +4051,16 @@ void Client::onEgressFrame(codec::TemplateId tid,
     case codec::TemplateId::SubscribeResponse: {
         auto opt = codec::decodeSubscribeResponse(buf, len);
         if (!opt) break;
+        // Phase 2c: a leader's refusal of a group fetch carries its detail (e.g. why a filter was rejected): the
+        // application reads it through onError.  Cold: only a refusal with a detail.
+        if (opt->errorCode != 0 && (!opt->detail.empty() || opt->detailMalformed) &&
+            group::GroupConsumerHub::isFetchCorrId(opt->correlationId) && cbError_) {
+            const auto code = static_cast<uint16_t>(opt->errorCode);
+            const std::string msg = "group fetch refused (" + std::to_string(code) + "): " +
+                                    (opt->detailMalformed ? std::string("(detail malformed, dropped)")
+                                                          : std::string(opt->detail));
+            invokeUserCallback_("onError", [&] { cbError_(msg); });
+        }
         // A group member's per-partition Subscribe (tagged correlationId).
         if (groupConsumerHub_.onFetchSubscribeResponse(opt->correlationId, opt->errorCode,
                                                        opt->subscriptionId)) {
@@ -4057,6 +4096,11 @@ void Client::onEgressFrame(codec::TemplateId tid,
         {
             const int64_t unsubCorrId = nextCorrId_++;
             const auto snap = agent_.stateAndSessionId();
+            // Phase 2c: a refusal with a detail (a filter the broker rejected) is surfaced through onError, naming
+            // what was asked for.  The target is read before the hub forgets the pending Subscribe.
+            int32_t refusedTopic = -1, refusedPartition = -1;
+            const bool refusedWithDetail = opt->errorCode != 0 && (!opt->detail.empty() || opt->detailMalformed) &&
+                subscriberHub_.pendingSubscribeTarget(opt->correlationId, refusedTopic, refusedPartition);
             subscriberHub_.onSubscribeResponse(
                 *opt,
                 unsubCorrId,
@@ -4064,6 +4108,18 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 [this](int32_t /*streamId*/, const uint8_t* fbuf, std::size_t flen) -> bool {
                     return agent_.submitSend(fbuf, flen);
                 });
+            if (refusedWithDetail && cbError_) {
+                const auto code = static_cast<uint16_t>(opt->errorCode);
+                const char* name = authErrorName(code) != nullptr ? authErrorName(code)
+                                 : code == static_cast<uint16_t>(rune::protocol::client::ErrorCode::InvalidRequest)
+                                       ? "InvalidRequest" : "Error";
+                const std::string msg = "subscribe topic " + std::to_string(refusedTopic) + " partition " +
+                                        std::to_string(refusedPartition) + " refused: " + name + " (" +
+                                        std::to_string(code) + "): " +
+                                        (opt->detailMalformed ? std::string("(detail malformed, dropped)")
+                                                              : std::string(opt->detail));
+                invokeUserCallback_("onError", [&] { cbError_(msg); });
+            }
         }
         break;
     }
@@ -4080,7 +4136,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // broker POSITION NOTE (an empty batch, client version 6, E2 Task 13):
         // it concerns plain subscriptions; a member resumes from its own
         // position (an empty view would move it as one record).
+        // Phase 2c: a FILTERED group follows it (onPositionNote ignores unfiltered groups).
         if (!opt->recordBatch.empty()) [[likely]] groupConsumerHub_.onRecords(*opt);
+        else groupConsumerHub_.onPositionNote(*opt);
         break;
     }
 
@@ -4088,6 +4146,16 @@ void Client::onEgressFrame(codec::TemplateId tid,
 
     case codec::TemplateId::JoinGroupResponse: {
         if (!groupConsumerHub_.empty()) {
+            // Phase 2c: a refusal's detail (e.g. a group filter mismatch) is the application's to read.  Cold:
+            // only an error answer carries one.
+            if (cbError_) {
+                if (const auto jr = rune::protocol::client::JoinGroupResponse::decode(buf, len);
+                    jr && jr->errorCode != 0 && !jr->detail.empty()) {
+                    const std::string msg = "join group refused (" + std::to_string(jr->errorCode) + "): " +
+                                            std::string(jr->detail);
+                    invokeUserCallback_("onError", [&] { cbError_(msg); });
+                }
+            }
             groupConsumerHub_.onJoinGroupResponse(buf, len, coordSessionId_(), coordSendFn_);  // D4
         }
         break;
@@ -4897,11 +4965,24 @@ Subscription Client::subscribe(TopicHandle      topic,
                          {}, opts, std::move(handler));
 }
 
+SubscriptionSet Client::subscribe(TopicHandle      topic,
+                                  AllPartitions,
+                                  SubscribeOptions opts,
+                                  RecordHandler    handler)
+{
+    if (topic.partitionCount < 1)
+        throw std::invalid_argument("subscribe(AllPartitions): topic has no partitions (partitionCount < 1)");
+    std::vector<Subscription> subs;
+    subs.reserve(static_cast<std::size_t>(topic.partitionCount));   // cold: once per subscribe
+    for (int32_t p = 0; p < topic.partitionCount; ++p) subs.push_back(subscribe(topic, p, opts, handler));
+    return SubscriptionSet(std::move(subs));
+}
+
 Subscription Client::subscribeImpl(TopicHandle              topic,
                                     int32_t                  partition,
                                     uint8_t                  partitionKnown,
                                     std::span<const uint8_t> keyBytes,
-                                    SubscribeOptions         opts,
+                                    SubscribeOptions&        opts,
                                     RecordHandler            handler)
 {
     // Build the impl.  Its immutable fields are written HERE, before the
@@ -4917,6 +4998,7 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
     impl->fromWire      = opts.from.toWire();
     impl->isolation     = static_cast<uint8_t>(opts.isolation);
     impl->handler       = std::move(handler);
+    impl->setFilter(opts.filterBytes);   // Phase 2c: copied once, here; every (re-)send reuses it
     // Catalog history (Task 13): the epoch note / caught-up marker callbacks (TopicHandle::catalog()).
     if (isEventLogTopic(topic.topicId)) {
         impl->onCaughtUp     = std::move(opts.onCaughtUp);
@@ -5035,6 +5117,13 @@ int64_t Client::fetchSessionIdTrampoline_(void* ctx, uint32_t session) noexcept 
 
 uint64_t Client::fetchEpochTrampoline_(void* ctx, uint32_t session) noexcept {
     return static_cast<Client*>(ctx)->agent_.connectedEpoch(session);
+}
+
+// Phase 2c (SD3): the subscribe gate's version — 0 unless the session is Connected NOW.  The agent keeps the last
+// accepted version across a disconnect; a node restarted on a newer broker must not be judged by it.
+int32_t Client::subscribeBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept {
+    auto& agent = static_cast<Client*>(ctx)->agent_;
+    return agent.connectedEpoch(session) != 0 ? agent.sessionBrokerVersion(session) : 0;
 }
 
 int32_t Client::fetchBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept {
@@ -5915,8 +6004,9 @@ void Client::syncCoordinatorSession_() noexcept {
     // A coordinator session of its own (re)connected: its members join there at
     // once (the seed's own connect does this in the ConnectResponse handler; a
     // TLS session connects on a later handshake leg — this level check sees it).
+    // M3: the coordinator's own version, kept current for consumers created later (joinIfConnected) as well.
+    if (connected && sid != 0) groupConsumerHub_.setBrokerVersion(agent_.sessionBrokerVersion(coordIdx_));
     if (coordIdx_ != 0 && connected && !groupConsumerHub_.empty()) {
-        groupConsumerHub_.setBrokerVersion(agent_.sessionBrokerVersion(coordIdx_));
         groupConsumerHub_.onConnected(sid, coordSendFn_);
         (void)groupConsumerHub_.reconcileFetch();
     }

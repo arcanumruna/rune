@@ -11,12 +11,23 @@
 #include <atomic>
 #include <chrono>
 #include "../support/TestCompletions.h"
-#include <malloc.h>
+#if defined(__linux__)
+#include <malloc.h>   // mallopt(M_PERTURB): glibc only
+#endif
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
+
+// Scribble freed memory (glibc M_PERTURB) so a use-after-free crashes; a no-op where mallopt is unavailable.
+static void perturbFreedMemory(int byte) {
+#if defined(__linux__)
+    ::mallopt(M_PERTURB, byte);
+#else
+    (void)byte;
+#endif
+}
 
 namespace rc = rune::client;
 using namespace std::chrono_literals;
@@ -1467,7 +1478,7 @@ TEST(HubCommandClient, VoidCommitRefusedOnAFullRingThrowsNeverDropsRegression) {
 // failure branch (std::terminate from ~Subscription / ~ExclusivePublication).
 TEST(ClientTransportStartAdversarial, CtorWithAnUnusableChannelThrowsNeverAbortsAdversarialRegression) {
     int32_t stream = 4200;
-    ::mallopt(M_PERTURB, 0xA5);
+    perturbFreedMemory(0xA5);
     for (const rc::RunnerMode mode : {rc::RunnerMode::Invoker, rc::RunnerMode::Thread}) {
         for (const bool badGateway : {true, false}) {
             for (int attempt = 0; attempt < 3; ++attempt) {
@@ -1485,7 +1496,7 @@ TEST(ClientTransportStartAdversarial, CtorWithAnUnusableChannelThrowsNeverAborts
             }
         }
     }
-    ::mallopt(M_PERTURB, 0);
+    perturbFreedMemory(0);
     for (const rc::RunnerMode mode : {rc::RunnerMode::Invoker, rc::RunnerMode::Thread}) {
         rc::Client healthy(hubCfg(stream, stream + 1, mode));
         stream += 2;

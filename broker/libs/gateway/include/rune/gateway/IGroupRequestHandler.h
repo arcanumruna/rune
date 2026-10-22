@@ -34,6 +34,7 @@ struct IGroupRequestHandler {
     // outCap is the capacity of out[] in bytes.
     // Never throws.  Never allocates from heap in steady state.
     virtual size_t handleJoinGroup   (const uint8_t* buf, size_t len,
+                                      int32_t clientVersion,   // the session's negotiated version: gates the filter trailer
                                       int64_t nowNs,
                                       uint8_t* out, size_t outCap) = 0;
 

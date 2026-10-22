@@ -890,7 +890,7 @@ TEST(SubscribeCodec, ExplicitPartitionRoundTrip) {
     EXPECT_EQ(leU16(buf.data(), 42), 0u);
 
     // Round-trip decode
-    auto decoded = rpc::Subscribe::decode(buf.data(), written);
+    auto decoded = rpc::Subscribe::decode(buf.data(), written, rpc::kClientVersion);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->sessionId,      msg.sessionId);
     EXPECT_EQ(decoded->correlationId,  msg.correlationId);
@@ -936,7 +936,7 @@ TEST(SubscribeCodec, KeyOnlyRoundTrip) {
     EXPECT_EQ(std::memcmp(buf.data() + 44, kKeyBytes, kKeyLen), 0);
 
     // Round-trip decode
-    auto decoded = rpc::Subscribe::decode(buf.data(), written);
+    auto decoded = rpc::Subscribe::decode(buf.data(), written, rpc::kClientVersion);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->topicId,        99);
     EXPECT_EQ(decoded->partitionKnown, 0u);
@@ -959,7 +959,7 @@ TEST(SubscribeCodec, IsolationValues) {
         std::vector<uint8_t> buf(total, 0u);
         msg.encode(buf.data());
 
-        auto decoded = rpc::Subscribe::decode(buf.data(), total);
+        auto decoded = rpc::Subscribe::decode(buf.data(), total, rpc::kClientVersion);
         return decoded.has_value() && decoded->isolation == isolation;
     };
 
@@ -981,7 +981,7 @@ TEST(SubscribeCodec, FromOffsetInt64Extrema) {
         std::vector<uint8_t> buf(total, 0u);
         msg.encode(buf.data());
 
-        auto decoded = rpc::Subscribe::decode(buf.data(), total);
+        auto decoded = rpc::Subscribe::decode(buf.data(), total, rpc::kClientVersion);
         return decoded.has_value() && decoded->fromOffset == fromOffset;
     };
 
@@ -1068,20 +1068,20 @@ TEST(SubscribeCodec, TruncationAtEveryBoundary) {
     msg.encode(buf.data());
 
     // Header truncations
-    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), 0).has_value());
-    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), 23).has_value());
+    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), 0, rpc::kClientVersion).has_value());
+    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), 23, rpc::kClientVersion).has_value());
 
     // Fixed body incomplete (need 18 bytes at [24..41])
     for (std::size_t a = 24u; a < 42u; ++a) {
-        EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), a).has_value())
+        EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), a, rpc::kClientVersion).has_value())
             << "avail=" << a << " should be nullopt (fixed body incomplete)";
     }
 
     // key prefix: need 2 bytes starting at off 42
-    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), 43).has_value()); // 1 byte of prefix
+    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), 43, rpc::kClientVersion).has_value()); // 1 byte of prefix
 
     // Exact total succeeds
-    EXPECT_TRUE(rpc::Subscribe::decode(buf.data(), total).has_value());
+    EXPECT_TRUE(rpc::Subscribe::decode(buf.data(), total, rpc::kClientVersion).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,7 +1100,7 @@ TEST(SubscribeCodec, KeyPrefixClaimsMoreThanAvail) {
     buf[42] = 200;
     buf[43] = 0;
 
-    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), total).has_value());
+    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), total, rpc::kClientVersion).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,8 +1119,8 @@ TEST(SubscribeCodec, MaxU16KeyExactFit) {
     const std::size_t written = msg.encode(bigBuf.data());
     ASSERT_EQ(written, total);
 
-    EXPECT_TRUE(rpc::Subscribe::decode(bigBuf.data(), total).has_value());
-    EXPECT_FALSE(rpc::Subscribe::decode(bigBuf.data(), total - 1u).has_value());
+    EXPECT_TRUE(rpc::Subscribe::decode(bigBuf.data(), total, rpc::kClientVersion).has_value());
+    EXPECT_FALSE(rpc::Subscribe::decode(bigBuf.data(), total - 1u, rpc::kClientVersion).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -1138,7 +1138,7 @@ TEST(SubscribeCodec, WrongTemplateIdReturnsNullopt) {
     buf[2] = 19;
     buf[3] = 0;
 
-    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), total).has_value());
+    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), total, rpc::kClientVersion).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,7 +1156,7 @@ TEST(SubscribeCodec, SchemaMismatchReturnsNullopt) {
     buf[4] = 111;
     buf[5] = 0;
 
-    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), total).has_value());
+    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), total, rpc::kClientVersion).has_value());
 }
 
 // ===========================================================================
@@ -1708,7 +1708,7 @@ TEST(SubscribeConformance, ExplicitGolden) {
     const std::size_t n = msg.encode(buf.data());
     ASSERT_EQ(n, total);
 
-    auto decoded = rpc::Subscribe::decode(buf.data(), n);
+    auto decoded = rpc::Subscribe::decode(buf.data(), n, rpc::kClientVersion);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->sessionId,      kGoldenSessionId);
     EXPECT_EQ(decoded->correlationId,  kGoldenCorrelationId);
@@ -1749,7 +1749,7 @@ TEST(SubscribeConformance, KeyOnlyGolden) {
     const std::size_t n = msg.encode(buf.data());
     ASSERT_EQ(n, total);
 
-    auto decoded = rpc::Subscribe::decode(buf.data(), n);
+    auto decoded = rpc::Subscribe::decode(buf.data(), n, rpc::kClientVersion);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->topicId,        4004);
     EXPECT_EQ(decoded->partitionKnown, 0u);
@@ -1849,9 +1849,9 @@ TEST(DataMessagesRegression, SubscribeUnknownIsolationByteIsRejectedRegression) 
     s.isolation = 1;
     std::vector<uint8_t> buf(s.encodedSize());
     const std::size_t n = s.encode(buf.data());
-    ASSERT_TRUE(rpc::Subscribe::decode(buf.data(), n).has_value());
+    ASSERT_TRUE(rpc::Subscribe::decode(buf.data(), n, rpc::kClientVersion).has_value());
     buf[rpc::MessageHeader::ENCODED_SIZE + 17] = 2;   // isolation byte
-    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), n).has_value());
+    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), n, rpc::kClientVersion).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -1888,4 +1888,264 @@ TEST(TransientLogFullRegression, OldClientsAreAnsweredNotLeader) {
     auto d6 = rpc::ProduceResponse::decode(buf.data(), n6);
     ASSERT_TRUE(d6.has_value());
     EXPECT_EQ(d6->errorCode, 42);
+}
+
+// ===========================================================================
+// Phase 2c (client v11 / broker v6): Subscribe filter trailer, response detail
+// ===========================================================================
+static_assert(rpc::kClientVersionFilter == rpc::kClientVersionTxnOffsetFence + 1);
+static_assert(rpc::kBrokerVersionFilter == rpc::kBrokerVersionAuth + 1);
+static_assert(rpc::kClientVersion == rpc::kClientVersionFilter && rpc::kBrokerVersion == rpc::kBrokerVersionFilter);
+static_assert(rpc::clientUnderstandsFilters(11) && !rpc::clientUnderstandsFilters(10));
+
+TEST(ProtocolVersions, FilterIsElevenAndBrokerSix) {
+    EXPECT_EQ(rpc::kClientVersionFilter, 11);
+    EXPECT_EQ(rpc::kBrokerVersionFilter, 6);
+}
+
+namespace {
+rpc::Subscribe fixedSubscribe() {
+    rpc::Subscribe msg;
+    msg.sessionId = static_cast<int64_t>(0x1122334455667788ULL);
+    msg.correlationId = static_cast<int64_t>(0x0A0B0C0D0E0F1011ULL);
+    msg.topicId = 1; msg.partition = 2; msg.partitionKnown = 1;
+    msg.fromOffset = static_cast<int64_t>(0x0102030405060708ULL);
+    msg.isolation = 0;
+    return msg;
+}
+// Largest valid filter (8 terms x 64 In values x 16 bytes): 2 + 8 * (5 + 64 * 16).
+constexpr std::size_t kMaxFilterBytesWire = 8234;
+} // namespace
+
+TEST(SubscribeFilterRegression, UnfilteredFrameIsByteIdenticalToV9Regression) {
+    const rpc::Subscribe msg = fixedSubscribe();   // same message as SubscribeCodec.ByteExactness
+    std::array<uint8_t, 64> buf{};
+    ASSERT_EQ(msg.encodedSize(), 44u);
+    ASSERT_EQ(msg.encode(buf.data()), 44u);
+    // The whole v9 frame, hard-coded (same bytes as SubscribeCodec.ByteExactness): nothing after the empty key.
+    static constexpr uint8_t kV9Frame[44] = {
+        0x12, 0x00, 0x12, 0x00, 0x78, 0x00, 0x03, 0x00,
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+        0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,
+        0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+        0x01,
+        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+        0x00,
+        0x00, 0x00,
+    };
+    EXPECT_EQ(std::memcmp(buf.data(), kV9Frame, 44), 0);
+    auto d = rpc::Subscribe::decode(buf.data(), 44, rpc::kClientVersion);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_TRUE(d->filter.empty());
+    // A v10 decode of a v9 frame is the same as a v9 decode.
+    auto d9 = rpc::Subscribe::decode(buf.data(), 44, 9);
+    ASSERT_TRUE(d9.has_value());
+    EXPECT_TRUE(d9->filter.empty());
+}
+
+TEST(SubscribeFilterRegression, FilterRoundTripsRegression) {
+    rpc::Subscribe msg = fixedSubscribe();
+    const std::array<uint8_t, 11> f{1, 1, 0x05, 0x00, 4, 1, 1, 0xAA, 0xBB, 0xCC, 0xDD};
+    msg.filter = f;
+    std::array<uint8_t, 128> buf{};
+    ASSERT_EQ(msg.encodedSize(), 44u + 2u + 11u);
+    ASSERT_EQ(msg.encode(buf.data()), 44u + 2u + 11u);
+    EXPECT_EQ(buf[44], 11); EXPECT_EQ(buf[45], 0);
+    auto d = rpc::Subscribe::decode(buf.data(), 57, rpc::kClientVersion);
+    ASSERT_TRUE(d.has_value());
+    ASSERT_EQ(d->filter.size(), 11u);
+    EXPECT_EQ(std::memcmp(d->filter.data(), f.data(), 11), 0);
+    EXPECT_EQ(d->topicId, 1);
+}
+
+TEST(SubscribeFilterRegression, ZeroLengthTrailerIsNoFilterRegression) {
+    const rpc::Subscribe msg = fixedSubscribe();
+    std::array<uint8_t, 64> buf{};
+    std::size_t n = msg.encode(buf.data());
+    buf[n++] = 0; buf[n++] = 0;
+    auto d = rpc::Subscribe::decode(buf.data(), n, rpc::kClientVersion);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_TRUE(d->filter.empty());
+}
+
+TEST(SubscribeFilterRegression, TruncatedTrailerIsUndecodableRegression) {
+    rpc::Subscribe msg = fixedSubscribe();
+    const std::array<uint8_t, 11> f{};
+    msg.filter = f;
+    std::array<uint8_t, 128> buf{};
+    const std::size_t n = msg.encode(buf.data());
+    ASSERT_EQ(n, 57u);
+    // Every cut inside the trailer (half length prefix: 45; length 11 with 0..10 bytes present) fails cleanly.
+    for (std::size_t cut = 45; cut < n; ++cut) {
+        EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), cut, rpc::kClientVersion).has_value()) << "cut " << cut;
+    }
+    // The explicit case: declared 11, only 5 present.
+    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), 44 + 2 + 5, rpc::kClientVersion).has_value());
+    // A declared length of 65535 with a few bytes present.
+    buf[44] = 0xFF; buf[45] = 0xFF;
+    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), n, rpc::kClientVersion).has_value());
+    // Intact frame still decodes.
+    buf[44] = 11; buf[45] = 0;
+    EXPECT_TRUE(rpc::Subscribe::decode(buf.data(), n, rpc::kClientVersion).has_value());
+}
+
+TEST(SubscribeFilterRegression, PreV10SessionNeverParsesTrailerRegression) {
+    rpc::Subscribe msg = fixedSubscribe();
+    const std::array<uint8_t, 11> f{1, 1, 0x05, 0x00, 4, 1, 1, 0xAA, 0xBB, 0xCC, 0xDD};
+    msg.filter = f;
+    std::array<uint8_t, 128> buf{};
+    const std::size_t n = msg.encode(buf.data());
+    // (a) a v9 session: the trailer is ignored, the filter is empty, the rest decodes.
+    auto d9 = rpc::Subscribe::decode(buf.data(), n, rpc::kClientVersionAuth);
+    ASSERT_TRUE(d9.has_value());
+    EXPECT_TRUE(d9->filter.empty());
+    EXPECT_EQ(d9->topicId, 1);
+    // ... even a truncated or garbage trailer is ignored for it (E13).
+    EXPECT_TRUE(rpc::Subscribe::decode(buf.data(), 45, rpc::kClientVersionAuth).has_value());
+    EXPECT_TRUE(rpc::Subscribe::decode(buf.data(), 50, 1).has_value());
+    // (b) a v10 session gets the exact bytes.
+    auto d10 = rpc::Subscribe::decode(buf.data(), n, rpc::kClientVersionFilter);
+    ASSERT_TRUE(d10.has_value());
+    ASSERT_EQ(d10->filter.size(), 11u);
+    EXPECT_EQ(std::memcmp(d10->filter.data(), f.data(), 11), 0);
+}
+
+TEST(SubscribeFilterRegression, MaxFilterIsAcceptedRegression) {
+    rpc::Subscribe msg = fixedSubscribe();
+    std::vector<uint8_t> f(kMaxFilterBytesWire);
+    for (std::size_t i = 0; i < f.size(); ++i) f[i] = static_cast<uint8_t>(i * 31u);
+    msg.filter = f;
+    std::vector<uint8_t> buf(msg.encodedSize());
+    ASSERT_EQ(msg.encode(buf.data()), 44u + 2u + kMaxFilterBytesWire);
+    auto d = rpc::Subscribe::decode(buf.data(), buf.size(), rpc::kClientVersion);
+    ASSERT_TRUE(d.has_value());
+    ASSERT_EQ(d->filter.size(), kMaxFilterBytesWire);
+    EXPECT_EQ(std::memcmp(d->filter.data(), f.data(), f.size()), 0);
+}
+
+TEST(SubscribeFilterRegression, LineageClaimInKeyAndFilterCoexistRegression) {
+    rpc::Subscribe msg = fixedSubscribe();
+    const std::array<uint8_t, 8> claim{1, 2, 3, 4, 5, 6, 7, 8};
+    const std::array<uint8_t, 4> f{9, 8, 7, 6};
+    msg.key = claim; msg.filter = f;
+    std::array<uint8_t, 128> buf{};
+    const std::size_t n = msg.encode(buf.data());
+    ASSERT_EQ(n, 44u + 8u + 2u + 4u);
+    auto d = rpc::Subscribe::decode(buf.data(), n, rpc::kClientVersion);
+    ASSERT_TRUE(d.has_value());
+    ASSERT_EQ(d->key.size(), 8u);
+    ASSERT_EQ(d->filter.size(), 4u);
+    EXPECT_EQ(std::memcmp(d->key.data(), claim.data(), 8), 0);
+    EXPECT_EQ(std::memcmp(d->filter.data(), f.data(), 4), 0);
+}
+
+TEST(SubscribeResponseDetailRegression, DetailRoundTripsAndOldDecoderIgnoresItRegression) {
+    rpc::SubscribeResponse r;
+    r.sessionId = 5; r.correlationId = 6; r.errorCode = 39; r.partition = 3; r.subscriptionId = 77;
+    r.detail = "filter term 1: unknown tag";
+    std::array<uint8_t, 128> buf{};
+    ASSERT_EQ(r.encodedSizeWithDetail(), 38u + 2u + r.detail.size());
+    const std::size_t n = r.encodeFor(buf.data(), rpc::kClientVersionFilter, buf.size());
+    ASSERT_EQ(n, r.encodedSizeWithDetail());
+    auto d = rpc::SubscribeResponse::decode(buf.data(), n);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->detail, r.detail);
+    EXPECT_EQ(d->errorCode, 39);
+    EXPECT_EQ(d->subscriptionId, 77);
+    // The 38-byte prefix decodes alone (a pre-v10 reader; a decoder that ignores the tail).
+    auto d38 = rpc::SubscribeResponse::decode(buf.data(), 38);
+    ASSERT_TRUE(d38.has_value());
+    EXPECT_TRUE(d38->detail.empty());
+    // A truncated trailer is a clean failure.
+    EXPECT_FALSE(rpc::SubscribeResponse::decode(buf.data(), 39).has_value());
+    EXPECT_FALSE(rpc::SubscribeResponse::decode(buf.data(), n - 1).has_value());
+}
+
+TEST(SubscribeResponseDetailRegression, DetailOnlyForV10SessionsAndEmptyIsOmittedRegression) {
+    rpc::SubscribeResponse r;
+    r.errorCode = 39; r.detail = "filter capacity";
+    std::array<uint8_t, 128> buf{};
+    // I2: encode(buf) NEVER writes the detail - exactly the fixed 38 bytes, identical to the no-detail frame
+    // (safe for the broker's fixed 38-byte stack buffers).
+    std::array<uint8_t, 128> plain{};
+    rpc::SubscribeResponse none = r; none.detail = {};
+    ASSERT_EQ(none.encode(plain.data()), 38u);
+    buf.fill(0xEE);
+    EXPECT_EQ(r.encode(buf.data()), 38u);
+    EXPECT_EQ(std::memcmp(buf.data(), plain.data(), 38), 0);
+    EXPECT_EQ(buf[38], 0xEE);   // nothing past the fixed frame was touched
+    // encodeFor: an old client never sees a trailer it cannot parse.
+    EXPECT_EQ(r.encodeFor(buf.data(), rpc::kClientVersionAuth, buf.size()), 38u);
+    EXPECT_EQ(r.encodeFor(buf.data(), 1, buf.size()), 38u);
+    EXPECT_EQ(r.encodeFor(buf.data(), rpc::kClientVersionFilter, buf.size()), r.encodedSizeWithDetail());
+    // capacity check: too small refuses and writes nothing
+    buf.fill(0xEE);
+    EXPECT_EQ(r.encodeFor(buf.data(), rpc::kClientVersionFilter, r.encodedSizeWithDetail() - 1), 0u);
+    EXPECT_EQ(buf[0], 0xEE);
+    // Empty detail: omitted for every version; the frame is the 38-byte v9 frame.
+    r.detail = {};
+    EXPECT_EQ(r.encodedSizeWithDetail(), 38u);
+    EXPECT_EQ(r.encodeFor(buf.data(), rpc::kClientVersionFilter, buf.size()), 38u);
+    EXPECT_EQ(rpc::SubscribeResponse::ENCODED_SIZE, 38u);
+}
+
+TEST(SubscribeResponseDetailRegression, MaxLengthDetailRoundTripsRegression) {
+    rpc::SubscribeResponse r;
+    r.errorCode = 39;
+    const std::string big(65535, 'x');
+    r.detail = big;
+    std::vector<uint8_t> buf(r.encodedSizeWithDetail());
+    ASSERT_EQ(buf.size(), 38u + 2u + 65535u);
+    ASSERT_EQ(r.encodeFor(buf.data(), rpc::kClientVersion, buf.size()), buf.size());
+    auto d = rpc::SubscribeResponse::decode(buf.data(), buf.size());
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->detail.size(), 65535u);
+    EXPECT_EQ(d->detail, std::string_view(big));
+    // One over the max is clamped, never wrapped: the frame is still well formed.
+    const std::string over(65536, 'y');
+    r.detail = over;
+    buf.assign(r.encodedSizeWithDetail(), 0);
+    ASSERT_EQ(r.encodeFor(buf.data(), rpc::kClientVersion, buf.size()), buf.size());
+    auto d2 = rpc::SubscribeResponse::decode(buf.data(), buf.size());
+    ASSERT_TRUE(d2.has_value());
+    EXPECT_EQ(d2->detail.size(), 65535u);
+}
+
+// M4: a clamped detail never ends mid-code-point.
+TEST(SubscribeResponseDetailRegression, ClampedDetailEndsOnACodePointBoundaryRegression) {
+    // 65534 ASCII bytes, then a 3-byte character (U+20AC) straddling the 65535 limit, then more.
+    std::string text(65534, 'a');
+    text += "\xE2\x82\xAC";
+    text += "tail";
+    rpc::SubscribeResponse r;
+    r.errorCode = 39; r.detail = text;
+    std::vector<uint8_t> buf(r.encodedSizeWithDetail());
+    ASSERT_EQ(r.encodeFor(buf.data(), rpc::kClientVersion, buf.size()), buf.size());
+    auto d = rpc::SubscribeResponse::decode(buf.data(), buf.size());
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->detail.size(), 65534u);                 // the straddling character is dropped whole
+    EXPECT_EQ(d->detail, std::string_view(text).substr(0, 65534));
+    // A boundary exactly at the limit keeps the whole character.
+    std::string ok(65532, 'a'); ok += "\xE2\x82\xAC"; ok += "zz";
+    r.detail = ok;
+    EXPECT_EQ(r.encodedSizeWithDetail(), 38u + 2u + 65535u);
+}
+
+// I2 / M1: oversize filter is refused, never wrapped into "no filter".
+TEST(SubscribeFilterRegression, OversizeFilterIsRefusedNotWrappedRegression) {
+    rpc::Subscribe msg = fixedSubscribe();
+    std::vector<uint8_t> f(65536, 0x11);
+    msg.filter = f;
+    EXPECT_FALSE(msg.fits());
+    std::vector<uint8_t> buf(msg.encodedSize() + 8, 0xEE);
+    EXPECT_EQ(msg.encode(buf.data()), 0u);
+    EXPECT_EQ(buf[0], 0xEE);                              // nothing written
+    f.resize(65535);
+    msg.filter = f;
+    EXPECT_TRUE(msg.fits());
+    buf.assign(msg.encodedSize(), 0);
+    EXPECT_EQ(msg.encode(buf.data()), 44u + 2u + 65535u);
+    auto d = rpc::Subscribe::decode(buf.data(), buf.size(), rpc::kClientVersion);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->filter.size(), 65535u);
 }

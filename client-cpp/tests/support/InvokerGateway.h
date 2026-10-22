@@ -151,11 +151,18 @@ struct InvokerGateway {
         int64_t corrId     = 0;
         uint8_t partitionKnown = 0;       // the Subscribe's wire partitionKnown (0: the broker resolves by key)
         std::vector<uint8_t> key;         // the Subscribe's wire key bytes
+        std::vector<uint8_t> filter;      // Phase 2c: the Subscribe's trailing filter bytes (empty = unfiltered)
     };
     std::vector<Subscribed> subscribed;
+    std::vector<std::vector<uint8_t>> subscribeFrames;   // Phase 2c: every Subscribe frame received, verbatim
     // A nonzero code answers every Subscribe with a SubscribeResponse carrying it (nothing is bound, as the
     // broker does for UnknownTopic / UnknownPartition / InvalidRequest).
     int16_t subscribeErrorCode = 0;
+    int32_t subscribeErrorPartition = -1;   // Phase 2c: >= 0 limits subscribeErrorCode to Subscribes for that partition
+    // Phase 2c: the refusal text sent with subscribeErrorCode (a session >= kClientVersionFilter gets it as the
+    // SubscribeResponse detail trailer; this gateway's sessions always are).
+    std::string subscribeErrorDetail;
+    bool        subscribeBadDetailTrailer = false;   // append a half length prefix after the 38 fixed bytes
     // E2 round 6 (F1): a TRANSIENT partition's current data lineage (partition ->
     // token).  A Subscribe carrying a lineage CLAIM (partitionKnown, 8-byte key)
     // for a partition listed here with another token is answered
@@ -192,6 +199,8 @@ struct InvokerGateway {
     int dropSubscribeResponsesNext = 0;
     // JoinGroup answers carry this error code (0 = the normal answer).
     int16_t joinErrorCode = 0;
+    std::string joinErrorDetail;                          // Phase 2c: sent with joinErrorCode (JoinGroupResponse detail)
+    std::vector<std::vector<uint8_t>> joinFilters;        // Phase 2c: every JoinGroup's filter bytes (empty = none)
     // No-hang fix round 2: SyncGroup / Heartbeat answers carry these codes
     // (0 = normal); OffsetFetch: the code of offsetFetchErrorsNext answers, and
     // the next N OffsetFetch answers are the broker's whole-request rejection
@@ -918,6 +927,17 @@ struct InvokerGateway {
         send(from, out.data(), n);
     }
 
+    /// Phase 2c: a filtered subscription's POSITION NOTE — an empty-batch Records frame whose baseOffset is the
+    /// offset every record below was evaluated up to.
+    void pushNote(const Subscribed& sub, int64_t offset) {
+        namespace rcc = rune::client::codec;
+        std::vector<uint8_t> out(256);
+        const std::size_t n = rcc::encodeRecords(out.data(), out.size(), sub.subscriptionId, sub.topicId,
+                                                 sub.partition, offset, std::span<const uint8_t>{}, sub.sessionId,
+                                                 stampSubscribeCorr ? sub.corrId : 0);
+        send(replyFromArrival ? sub.endpoint : 0, out.data(), n);
+    }
+
     /// E2 round 6: the broker's transient LINEAGE NOTE for `sub` (an 8-byte batch).
     void sendLineageNote(const Subscribed& sub, uint64_t token) {
         namespace rcc = rune::client::codec;
@@ -999,8 +1019,9 @@ private:
         r.memberId      = joinErrorCode != 0 ? std::span<const uint8_t>()
                                              : std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kMember.data()),
                                                                         kMember.size());
-        std::vector<uint8_t> out(r.encodedSize());
-        const std::size_t n = r.encode(out.data());
+        r.detail = joinErrorCode != 0 ? std::string_view(joinErrorDetail) : std::string_view();
+        std::vector<uint8_t> out(r.encodedSizeWithDetail());
+        const std::size_t n = r.encodeFor(out.data(), rp::kClientVersion, out.size());
         send(0, out.data(), n);
     }
 
@@ -1694,6 +1715,7 @@ private:
         case rcc::TemplateId::Subscribe: {
             const auto sv = rcc::decodeSubscribe(buf, len);
             if (!sv) return;
+            subscribeFrames.emplace_back(buf, buf + len);
             subscribeCorrIds.push_back(sv->correlationId);
             if (subscribeRedirectNext > 0) {
                 --subscribeRedirectNext;
@@ -1736,12 +1758,14 @@ private:
                     return;
                 }
             }
-            if (subscribeErrorCode != 0) {
-                uint8_t eout[64];
-                const std::size_t en = rcc::encodeSubscribeResponse(
-                    eout, sizeof eout, subscribeErrorCode, /*partition=*/-1, /*subscriptionId=*/0, sv->sessionId,
-                    sv->correlationId);
-                if (en > 0) send(replyFromArrival ? endpoint : 0, eout, en);
+            if (subscribeErrorCode != 0 && (subscribeErrorPartition < 0 || sv->partition == subscribeErrorPartition)) {
+                rp::SubscribeResponse r;
+                r.sessionId = sv->sessionId; r.correlationId = sv->correlationId; r.errorCode = subscribeErrorCode;
+                r.partition = -1; r.subscriptionId = 0; r.detail = subscribeErrorDetail;
+                std::vector<uint8_t> eout(r.encodedSizeWithDetail() + 1);
+                std::size_t en = r.encodeFor(eout.data(), rp::kClientVersion, eout.size());
+                if (subscribeBadDetailTrailer) { r.detail = {}; en = r.encode(eout.data()); eout[en++] = 0x05; }
+                if (en > 0) send(replyFromArrival ? endpoint : 0, eout.data(), en);
                 return;
             }
             int64_t subId = nextSubscriptionId++;
@@ -1753,7 +1777,8 @@ private:
             }
             const Subscribed sub{subId, sv->topicId, sv->partition, sv->sessionId,
                                  endpoint, sv->fromOffset, sv->correlationId, sv->partitionKnown,
-                                 std::vector<uint8_t>(sv->key.begin(), sv->key.end())};
+                                 std::vector<uint8_t>(sv->key.begin(), sv->key.end()),
+                                 std::vector<uint8_t>(sv->filter.begin(), sv->filter.end())};
             subscribed.push_back(sub);
             uint8_t out[64];
             const std::size_t n = rcc::encodeSubscribeResponse(
@@ -2006,9 +2031,10 @@ private:
             return;
         }
         case rcc::TemplateId::JoinGroup: {
-            const auto j = rp::JoinGroup::decode(buf, len);
+            const auto j = rp::JoinGroup::decode(buf, len, rp::kClientVersion);
             if (!j) return;
             ++joinGroups;
+            joinFilters.emplace_back(j->filter.begin(), j->filter.end());
             groupSessionIds.push_back(j->sessionId);
             groupEndpoints.push_back(endpoint);
             if (!groupProtocol) return;

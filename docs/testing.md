@@ -172,6 +172,7 @@ later builds hit the layer cache. Run from `broker/`. All waits are bounded; eve
 | `docker/schema-evolution-e2e.sh` | 1 node | add, drop, rename and set-compatibility through the CLI with generated probes; a v1-bound binary still opens the evolved topic; concurrent alters give one `SchemaConflict`. | leader 180 s |
 | `docker/view-engine-e2e.sh` | 1 node | Views (persisted and transient), aggregates, typed routing, transient topics, read-committed, and a broker restart leg. | leader 180 s |
 | `docker/transient-failover-e2e.sh` | 3 nodes | A real client's transient-topic subscriptions move off a demoted leader without loss or duplicates. | ready 420 s, done 600 s |
+| `docker/filter-e2e.sh` | 3 nodes | Subscription filters: five selections (all partitions, key + filter, group of two, unfiltered control) exact against a seeded model through a partition-leader kill and a node restart, the refusals, and ALTER under a live filter. `--scenario` runs the MMORPG load (200 world servers) filtered against unfiltered on the prepared box (needs the host lock). | leader 180 s, consume 600 s |
 
 The client repo also ships `client-cpp/docker/e2e-client.sh` (ping through a re-election), `e2e-data.sh` (produce and subscribe
 across a leader kill) and `rune-ql-e2e.sh` (CLI-driven typed round trip). They predate authentication: none has a cluster-key or

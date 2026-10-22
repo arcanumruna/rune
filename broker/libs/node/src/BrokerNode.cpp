@@ -1732,6 +1732,8 @@ void BrokerNode::buildWorkerPool() {
         workerPool_->worker(i).setBackgroundSyncIntervalNs(config_.workerSyncIntervalMs * 1'000'000LL);
         if (!config_.ioWorkerCpus.empty()) workerPool_->worker(i).setIoWorkerCpus(config_.ioWorkerCpus);
         workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);
+        workerPool_->worker(i).setFilterConfig(filterConfig_());
+        // (the gateway's admission caps are set below, once the gateway holds the pool - same values as the workers')
         workerPool_->worker(i).setReturnDrainLimit(config_.workerReturnDrainLimit);
         workerPool_->worker(i).setMaxOwedReturns(static_cast<std::size_t>(config_.workerMaxOwedReturns));
         // F15 S3 (re-review 2 B-1) ⇄ F18 ⇄ F19: ONE client-visible batch limit on
@@ -2823,6 +2825,7 @@ void BrokerNode::buildGateway() {
     // workerPool_ is null, which happens when no topics are configured).
     if (gateway_ && workerPool_) {
         gateway_->setWorkerPool(workerPool_.get());   // narrows the batch limit to the workers'
+        gateway_->setFilterLimits({config_.filterMaxSubsPerPartition, config_.filterMaxIndexValuesPerPartition});
     }
     // Round 5: an incarnation wrap must skip values the F7 owner map still holds.
     if (workerPool_ && replicaRegistry_)
@@ -4929,6 +4932,14 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                 return;
             }
             if (tid == kA2cCatalogTopicConfig) { onCatalogTopicConfig_(p, n); return; }
+            if (tid == kA2cFilterSchema) {   // Phase 2c: a typed topic's filter schema -> the gateway (-> every worker)
+                FilterSchemaMsg m;
+                if (decodeFilterSchema(p, n, m)) {
+                    if (gateway_) gateway_->onFilterSchema(m.topicId, m.version, std::span<const uint8_t>(m.blob));
+                } else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+                    spdlog::error("BrokerNode[{}]: malformed kA2cFilterSchema (len={}) skipped", config_.nodeId, n);
+                return;
+            }
             if (tid == kA2cViewUninstall) {
                 const int32_t viewTopicId = decodeViewUninstall(p, n);
                 if (viewTopicId >= 0) onViewUninstall_(viewTopicId);

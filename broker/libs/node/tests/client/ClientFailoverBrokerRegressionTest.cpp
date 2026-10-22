@@ -47,33 +47,9 @@ namespace {
 constexpr auto    kDisk       = rc::Persistence::Disk;
 constexpr int32_t kPartitions = 3;
 
-/// The leader of (topicId, partition) as broker `n`'s control thread sees it (-1: none / unknown).
-int32_t leaderOn(rune::node::BrokerNode& n, int32_t topicId, int32_t partition) {
-    return n.onControlThreadForTest([&n, topicId, partition]() -> int32_t {
-        const auto* ms = n.metadataServiceForTest();
-        if (ms == nullptr) return -1;
-        const auto* pa = ms->assignment(topicId, partition);
-        return pa != nullptr ? pa->leaderNode : -1;
-    });
-}
-
 /// Every running broker agrees on one live leader for every partition of `topicId` (bounded wait).
 bool awaitLeaders(ThreeNodes& c, int32_t topicId, std::vector<int32_t>& leaders, std::chrono::milliseconds within) {
-    for (const auto deadline = Clock::now() + within; Clock::now() < deadline; std::this_thread::sleep_for(20ms)) {
-        leaders.assign(kPartitions, -1);
-        bool ok = true;
-        const auto running = c.runningNodes();
-        for (int32_t p = 0; p < kPartitions && ok; ++p) {
-            for (int id : running) {
-                const int32_t l = leaderOn(c.node(id), topicId, p);
-                if (l <= 0 || std::find(running.begin(), running.end(), l) == running.end()) { ok = false; break; }
-                if (leaders[static_cast<std::size_t>(p)] == -1) leaders[static_cast<std::size_t>(p)] = l;
-                else if (leaders[static_cast<std::size_t>(p)] != l) { ok = false; break; }
-            }
-        }
-        if (ok) return true;
-    }
-    return false;
+    return rune::node::test::catalog_cluster::awaitLeaders(c, topicId, kPartitions, leaders, within);
 }
 
 std::string valueOf(int seq) { return "seq=" + std::to_string(seq); }
@@ -724,15 +700,6 @@ TEST(ClientFailoverBrokerRegression, SeedCoordinatorCrashedGroupMemberKeepsConsu
 // ---------------------------------------------------------------------------------------------------------
 // Fix round 1 (I7): the remaining sibling paths that ride the seed.
 // ---------------------------------------------------------------------------------------------------------
-namespace {
-int32_t awaitController(ThreeNodes& c) {
-    int32_t ctl = -1;
-    for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && ctl < 0; std::this_thread::sleep_for(20ms))
-        for (rune::node::BrokerNode* n : c.live()) if (n->isLeader()) ctl = n->nodeIdForTest();
-    return ctl;
-}
-}  // namespace
-
 // The transactional producer's coordinator (the consensus leader) is the seed's broker and dies mid-
 // transaction.  The commit answers within the stale threshold + the txn op timeout — OK (the records then
 // visible exactly once to read_committed), or an explicit failure after which a retried transaction

@@ -159,8 +159,8 @@ HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=3 \
     CMD pgrep -x rune_broker > /dev/null || exit 1
 
 # ── Metadata ─────────────────────────────────────────────────────────────────
-LABEL org.opencontainers.image.title="rune-broker" \
-      org.opencontainers.image.description="Rune single-node broker — embedded Aeron media driver, self-elect" \
+LABEL org.opencontainers.image.title="rune" \
+      org.opencontainers.image.description="Rune broker — durable log and database; embedded Aeron media driver, single node or cluster member" \
       org.opencontainers.image.source="https://github.com/arcanumruna/rune"
 
 ENTRYPOINT ["/entrypoint.sh"]

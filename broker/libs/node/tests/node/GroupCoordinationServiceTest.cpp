@@ -130,9 +130,11 @@ static std::size_t encodeJoinGroup(uint8_t* buf,
                                    int64_t corrId,
                                    std::string_view groupId,
                                    std::string_view memberId,
-                                   int32_t sessionTimeoutMs = 5000)
+                                   int32_t sessionTimeoutMs = 5000,
+                                   std::span<const uint8_t> filter = {})
 {
     pc::JoinGroup msg;
+    msg.filter           = filter;
     msg.sessionId        = sessionId;
     msg.correlationId    = corrId;
     msg.sessionTimeoutMs = sessionTimeoutMs;
@@ -400,7 +402,7 @@ TEST_F(CG3ServiceTest, CoordinatorForReturnsLeaderId) {
 // 3. Join → memberId+generationId, state PreparingRebalance.
 TEST_F(CG3ServiceTest, JoinGroupReturnsValidMemberAndGeneration) {
     auto reqLen = encodeJoinGroup(req_, 1, 100, "grp1", "");
-    auto outLen = service_->handleJoinGroup(req_, reqLen, clock_, out_, kBufSize);
+    auto outLen = service_->handleJoinGroup(req_, reqLen, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     EXPECT_GT(outLen, 0u);
 
     auto resp = pc::JoinGroupResponse::decode(out_, outLen);
@@ -433,7 +435,7 @@ TEST_F(CG3ServiceTest, DoWorkAutoAssignsAfterJoinTimeout) {
 
     // Step 1: Initial join with empty memberId → PreparingRebalance.
     auto reqLen = encodeJoinGroup(req_, 1, 101, groupId, "", /*sessionTimeoutMs=*/5000);
-    auto outLen = service_->handleJoinGroup(req_, reqLen, clock_, out_, kBufSize);
+    auto outLen = service_->handleJoinGroup(req_, reqLen, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     ASSERT_GT(outLen, 0u);
     auto joinResp = pc::JoinGroupResponse::decode(out_, outLen);
     ASSERT_TRUE(joinResp.has_value());
@@ -448,7 +450,7 @@ TEST_F(CG3ServiceTest, DoWorkAutoAssignsAfterJoinTimeout) {
     // Step 2: Re-join with the assigned memberId.
     clock_ += kStep;
     auto rejoinLen = encodeJoinGroup(req_, 1, 102, groupId, memberId, /*sessionTimeoutMs=*/5000);
-    auto rejoinOut = service_->handleJoinGroup(req_, rejoinLen, clock_, out_, kBufSize);
+    auto rejoinOut = service_->handleJoinGroup(req_, rejoinLen, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     ASSERT_GT(rejoinOut, 0u);
     auto rejoinResp = pc::JoinGroupResponse::decode(out_, rejoinOut);
     ASSERT_TRUE(rejoinResp.has_value());
@@ -475,7 +477,7 @@ TEST_F(CG3ServiceTest, HeartbeatDuringRebalanceReturnsRebalanceInProgress) {
 
     // Join → PreparingRebalance.
     auto reqLen = encodeJoinGroup(req_, 1, 200, groupId, "", 5000);
-    auto outLen = service_->handleJoinGroup(req_, reqLen, clock_, out_, kBufSize);
+    auto outLen = service_->handleJoinGroup(req_, reqLen, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     ASSERT_GT(outLen, 0u);
 
     auto joinResp = pc::JoinGroupResponse::decode(out_, outLen);
@@ -502,7 +504,7 @@ TEST_F(CG3ServiceTest, HeartbeatStaleGenerationReturnsStaleGeneration) {
     std::string groupId = "g-stale";
 
     auto reqLen = encodeJoinGroup(req_, 1, 300, groupId, "", 5000);
-    auto outLen = service_->handleJoinGroup(req_, reqLen, clock_, out_, kBufSize);
+    auto outLen = service_->handleJoinGroup(req_, reqLen, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     ASSERT_GT(outLen, 0u);
 
     auto joinResp = pc::JoinGroupResponse::decode(out_, outLen);
@@ -527,7 +529,7 @@ TEST_F(CG3ServiceTest, HeartbeatUnknownMemberReturnsUnknownMember) {
 
     // Join so the group exists.
     auto reqLen = encodeJoinGroup(req_, 1, 400, groupId, "", 5000);
-    service_->handleJoinGroup(req_, reqLen, clock_, out_, kBufSize);
+    service_->handleJoinGroup(req_, reqLen, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
 
     const int32_t gen = service_->coordinator(groupId).generationId();
 
@@ -545,7 +547,7 @@ TEST_F(CG3ServiceTest, LeaveGroupTriggersMembershipChange) {
 
     // Step 1: Initial join.
     auto j1Len = encodeJoinGroup(req_, 1, 500, groupId, "", 5000);
-    auto j1Out = service_->handleJoinGroup(req_, j1Len, clock_, out_, kBufSize);
+    auto j1Out = service_->handleJoinGroup(req_, j1Len, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     ASSERT_GT(j1Out, 0u);
     auto j1Resp = pc::JoinGroupResponse::decode(out_, j1Out);
     ASSERT_TRUE(j1Resp.has_value());
@@ -556,7 +558,7 @@ TEST_F(CG3ServiceTest, LeaveGroupTriggersMembershipChange) {
     // Step 2: Re-join → CompletingRebalance internally.
     clock_ += kStep;
     auto r1Len = encodeJoinGroup(req_, 1, 501, groupId, m1, 5000);
-    service_->handleJoinGroup(req_, r1Len, clock_, out_, kBufSize);
+    service_->handleJoinGroup(req_, r1Len, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
 
     // Step 3: doWork → Stable.
     const bool stable = driveUntil([&] {
@@ -587,7 +589,7 @@ TEST_F(CG3ServiceTest, AllHandlersReturnNotCoordinatorWhenNotLeader) {
 
     // JoinGroup.
     auto jLen = encodeJoinGroup(req_, 1, 600, "g", "");
-    auto jOut = service_->handleJoinGroup(req_, jLen, clock_, out_, kBufSize);
+    auto jOut = service_->handleJoinGroup(req_, jLen, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     EXPECT_EQ(decodeJoinErrorCode(out_, jOut),
               static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
 
@@ -671,7 +673,7 @@ TEST_F(CG3ServiceTest, OffsetCommitAndFetchRoundTrip) {
 
     // Join + re-join → Stable so the generation is correct.
     auto jLen = encodeJoinGroup(req_, 1, 700, groupId, "", 5000);
-    auto jOut = service_->handleJoinGroup(req_, jLen, clock_, out_, kBufSize);
+    auto jOut = service_->handleJoinGroup(req_, jLen, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     ASSERT_GT(jOut, 0u);
     auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
     ASSERT_TRUE(jResp.has_value());
@@ -725,7 +727,7 @@ TEST_F(CG3ServiceTest, TransientCommittedOffsetOfAnEndedLineageIsAnsweredAsNoneR
     g_lineage = 0x1111;
     service_->setTransientLineage(&testLineage, nullptr);
     auto jLen = encodeJoinGroup(req_, 1, 950, groupId, "", 5000);
-    auto jOut = service_->handleJoinGroup(req_, jLen, clock_, out_, kBufSize);
+    auto jOut = service_->handleJoinGroup(req_, jLen, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
     ASSERT_TRUE(jResp.has_value());
     const std::string memberId(reinterpret_cast<const char*>(jResp->memberId.data()), jResp->memberId.size());
@@ -787,7 +789,7 @@ TEST_F(CG3ServiceTest, TransientOffsetsAreAnsweredRetriablyWhileTheLineageIsPend
     g_pendingLineage = 0x1111;
     service_->setTransientLineage(&pendingThenKnown, nullptr);
     auto jLen = encodeJoinGroup(req_, 1, 970, groupId, "", 5000);
-    auto jOut = service_->handleJoinGroup(req_, jLen, clock_, out_, kBufSize);
+    auto jOut = service_->handleJoinGroup(req_, jLen, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
     ASSERT_TRUE(jResp.has_value());
     const std::string memberId(reinterpret_cast<const char*>(jResp->memberId.data()), jResp->memberId.size());
@@ -827,7 +829,7 @@ TEST_F(CG3ServiceTest, TransientOffsetsAreAnsweredRetriablyWhileTheLineageIsPend
     // rebalanced; after re-joining, the commit is accepted.
     EXPECT_EQ(commit(3), static_cast<int16_t>(pc::ErrorCode::IllegalGeneration));
     auto rj = encodeJoinGroup(req_, 1, 973, groupId, memberId, 5000);
-    auto rjOut = service_->handleJoinGroup(req_, rj, clock_, out_, kBufSize);
+    auto rjOut = service_->handleJoinGroup(req_, rj, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     auto rjResp = pc::JoinGroupResponse::decode(out_, rjOut);
     ASSERT_TRUE(rjResp.has_value());
     ASSERT_GT(rjResp->generationId, jResp->generationId);
@@ -845,7 +847,7 @@ TEST_F(CG3ServiceTest, OffsetCommitWrongGenerationReturnsIllegalGeneration) {
     std::string groupId = "g-illegalgen";
 
     auto jLen = encodeJoinGroup(req_, 1, 800, groupId, "", 5000);
-    auto jOut = service_->handleJoinGroup(req_, jLen, clock_, out_, kBufSize);
+    auto jOut = service_->handleJoinGroup(req_, jLen, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     ASSERT_GT(jOut, 0u);
     auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
     ASSERT_TRUE(jResp.has_value());
@@ -919,7 +921,7 @@ TEST_F(CG3ServiceTest, OffsetCommitMinIsrViolationWhenReplicaGated) {
     uint8_t out2[64 * 1024]{};
 
     auto jLen = encodeJoinGroup(req2, 1, 1000, groupId, "", 5000);
-    auto jOut = svc2.handleJoinGroup(req2, jLen, 0, out2, sizeof(out2));
+    auto jOut = svc2.handleJoinGroup(req2, jLen, rune::protocol::client::kClientVersion, 0, out2, sizeof(out2));
     ASSERT_GT(jOut, 0u);
     auto jResp = pc::JoinGroupResponse::decode(out2, jOut);
     ASSERT_TRUE(jResp.has_value());
@@ -952,7 +954,7 @@ TEST_F(CG3ServiceTest, OffsetFetchFetchAllReturnAllCommitted) {
     std::string groupId = "g-fetchall";
 
     auto jLen = encodeJoinGroup(req_, 1, 1100, groupId, "", 5000);
-    auto jOut = service_->handleJoinGroup(req_, jLen, clock_, out_, kBufSize);
+    auto jOut = service_->handleJoinGroup(req_, jLen, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     ASSERT_TRUE(pc::JoinGroupResponse::decode(out_, jOut).has_value());
     auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
     ASSERT_TRUE(jResp.has_value());
@@ -1015,7 +1017,7 @@ TEST_F(CG3ServiceTest, OffsetCommitDefensiveIterationTruncatedFrame) {
 
     // Join first so the group exists and gen is valid.
     auto jLen = encodeJoinGroup(req_, 1, 1200, groupId, "", 5000);
-    auto jOut = service_->handleJoinGroup(req_, jLen, clock_, out_, kBufSize);
+    auto jOut = service_->handleJoinGroup(req_, jLen, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     ASSERT_GT(jOut, 0u);
     auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
     ASSERT_TRUE(jResp.has_value());
@@ -1157,7 +1159,7 @@ std::size_t groupHeaderOnly(uint8_t* buf, pc::TemplateId tid, int64_t corr) {
 TEST_F(CG3ServiceTest, MalformedGroupRequestsAreAnsweredInvalidRequestRegression) {
     constexpr auto kInv = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
     std::size_t n = groupHeaderOnly(req_, pc::TemplateId::JoinGroup, 1);
-    std::size_t o = service_->handleJoinGroup(req_, n, clock_, out_, kBufSize);
+    std::size_t o = service_->handleJoinGroup(req_, n, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     auto j = pc::JoinGroupResponse::decode(out_, o);
     ASSERT_TRUE(j.has_value()); EXPECT_EQ(j->correlationId, 1); EXPECT_EQ(j->errorCode, kInv);
 
@@ -1217,7 +1219,7 @@ TEST_F(CG3ServiceTest, EvictSessionMembersMakesUnknownMemberTrueRegression) {
     const std::string groupId = "g-evict";
     auto joinAs = [&](int64_t sid, int64_t corr) {
         const auto n = encodeJoinGroup(req_, sid, corr, groupId, "", 5000);
-        const auto o = service_->handleJoinGroup(req_, n, clock_, out_, kBufSize);
+        const auto o = service_->handleJoinGroup(req_, n, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
         const auto r = pc::JoinGroupResponse::decode(out_, o);
         EXPECT_TRUE(r.has_value());
         return std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size());
@@ -1252,7 +1254,7 @@ TEST_F(CG3ServiceTest, EvictSessionMembersMakesUnknownMemberTrueRegression) {
 TEST_F(CG3ServiceTest, OldClientEvictionIsScopedToTheRequestsGroupRegression) {
     auto joinAs = [&](const std::string& groupId, int64_t sid, int64_t corr) {
         const auto n = encodeJoinGroup(req_, sid, corr, groupId, "", 5000);
-        const auto o = service_->handleJoinGroup(req_, n, clock_, out_, kBufSize);
+        const auto o = service_->handleJoinGroup(req_, n, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
         const auto r = pc::JoinGroupResponse::decode(out_, o);
         EXPECT_TRUE(r.has_value());
         return std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size());
@@ -1341,7 +1343,7 @@ TEST_F(CG3ServiceTest, OffsetFetchBeforeTheOffsetsAreLoadedIsRetriableNeverNoneR
 
     // The member's commit in that window: refused retriably (the load would wipe it).
     auto jLen = encodeJoinGroup(req_, 1, 991, groupId, "", 5000);
-    auto jOut = svc2.handleJoinGroup(req_, jLen, clock_, out_, kBufSize);
+    auto jOut = svc2.handleJoinGroup(req_, jLen, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
     ASSERT_TRUE(jResp.has_value());
     const std::string memberId(reinterpret_cast<const char*>(jResp->memberId.data()), jResp->memberId.size());
@@ -1442,7 +1444,7 @@ TEST_F(CG3ServiceTest, SupersededLineageForcesARebalanceAndFencesOldGenerationCo
     service_->setTransientLineageVersion(&r1Version, nullptr);
     auto join = [&](const std::string& member) {
         auto l = encodeJoinGroup(req_, 1, 1100, groupId, member, 5000);
-        auto n = service_->handleJoinGroup(req_, l, clock_, out_, kBufSize);
+        auto n = service_->handleJoinGroup(req_, l, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
         auto r = pc::JoinGroupResponse::decode(out_, n);
         EXPECT_TRUE(r.has_value());
         return std::make_pair(std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size()),
@@ -1502,7 +1504,7 @@ TEST_F(CG3ServiceTest, PendingLineageIsReCheckedAloneAndEmptyGroupsArePrunedRegr
     service_->setTransientLineageVersion(&f4Version, nullptr);
     auto tick = [&] { clock_ += kStep; replica_->doWork(clock_); service_->doWork(clock_); };
     auto l = encodeJoinGroup(req_, 1, 1300, "g-f4", "", 60'000);
-    auto r = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, l, clock_, out_, kBufSize));
+    auto r = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, l, rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
     ASSERT_TRUE(r.has_value());
     const std::string m(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size());
     l = encodeOffsetCommit(req_, 1, 1301, "g-f4", m, r->generationId, kTestTopicId, 0, 50, "");
@@ -1557,10 +1559,10 @@ TEST_F(CG3ServiceTest, GroupConsumingAPartitionWithoutACommitIsFencedOnANewLinea
     service_->setTransientLineageVersion(&f1Version, nullptr);
     auto stableMember = [&](const std::string& group) {
         auto l = encodeJoinWithTopic(req_, 1200, group, "", kTestTopicId);
-        auto r = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, l, clock_, out_, kBufSize));
+        auto r = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, l, rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
         const std::string m(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size());
         l = encodeJoinWithTopic(req_, 1201, group, m, kTestTopicId);
-        (void)service_->handleJoinGroup(req_, l, clock_, out_, kBufSize);
+        (void)service_->handleJoinGroup(req_, l, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
         EXPECT_TRUE(driveUntil([&] { return service_->coordinator(group).state() == GroupState::Stable; }, 20));
         return m;
     };
@@ -1626,7 +1628,7 @@ TEST_F(CG3ServiceTest, DroppedTopicIsRebalancedAwayFromItsGroupsRegression) {
         msg.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(member.data()), member.size());
         const std::array<int32_t, 1> topics{kTestTopicId};
         auto n = msg.encode(req_, std::span<const int32_t>(topics));
-        auto o = service_->handleJoinGroup(req_, n, clock_, out_, kBufSize);
+        auto o = service_->handleJoinGroup(req_, n, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
         auto r = pc::JoinGroupResponse::decode(out_, o);
         EXPECT_TRUE(r.has_value());
         return r ? std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size()) : std::string{};
@@ -1688,6 +1690,131 @@ TEST_F(CG3ServiceTest, AppliedButNotPlacedTopicIsNotAssignedUntilPlacedRegressio
     service_->setGateway(nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2c (spec 13.3): one filter per consumer group, fixed by the first member.
+// ---------------------------------------------------------------------------
+namespace {
+const std::vector<uint8_t> kGroupFilterA{1, 1, 0xAB};
+const std::vector<uint8_t> kGroupFilterB{1, 1, 0xCD};
+}
+
+TEST_F(CG3ServiceTest, MatchingFilterJoinsAndRebalancesNormally) {
+    constexpr int32_t v10 = rune::protocol::client::kClientVersion;
+    auto n = encodeJoinGroup(req_, 1, 1, "fg", "", 5000, kGroupFilterA);
+    auto r1 = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize));
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(r1->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    const std::string m1(reinterpret_cast<const char*>(r1->memberId.data()), r1->memberId.size());
+
+    n = encodeJoinGroup(req_, 2, 2, "fg", "", 5000, kGroupFilterA);   // a second member, the same bytes
+    auto r2 = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize));
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r2->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(service_->coordinator("fg").memberCount(), 2u);
+    EXPECT_EQ(service_->coordinator("fg").state(), GroupState::PreparingRebalance);
+    EXPECT_GT(r2->generationId, r1->generationId);
+}
+
+TEST_F(CG3ServiceTest, FilterMismatchAnswersInvalidRequestWithDetailRegression) {
+    constexpr int32_t v10 = rune::protocol::client::kClientVersion;
+    auto n = encodeJoinGroup(req_, 1, 1, "fg", "", 5000, kGroupFilterA);
+    (void)service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize);
+    const auto gen0   = service_->coordinator("fg").generationId();
+    const auto state0 = service_->coordinator("fg").state();
+
+    for (const auto* other : {&kGroupFilterB, static_cast<const std::vector<uint8_t>*>(nullptr)}) {
+        n = encodeJoinGroup(req_, 2, 2, "fg", "", 5000, other ? std::span<const uint8_t>(*other) : std::span<const uint8_t>{});
+        const std::size_t o = service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize);
+        auto r = pc::JoinGroupResponse::decode(out_, o);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+        EXPECT_TRUE(r->memberId.empty());
+        EXPECT_EQ(r->detail.substr(0, pc::kGroupFilterMismatchPrefix.size()), pc::kGroupFilterMismatchPrefix);
+        EXPECT_NE(r->detail.find("0101ab"), std::string_view::npos) << r->detail;
+    }
+    EXPECT_EQ(service_->coordinator("fg").memberCount(), 1u) << "the refused joiner is not a member";
+    EXPECT_EQ(service_->coordinator("fg").generationId(), gen0) << "a refusal does not rebalance";
+    EXPECT_EQ(service_->coordinator("fg").state(), state0);
+}
+
+TEST_F(CG3ServiceTest, OldMemberWithoutFilterIsRefusedFromAFilteredGroupRegression) {
+    auto n = encodeJoinGroup(req_, 1, 1, "fg", "", 5000, kGroupFilterA);
+    (void)service_->handleJoinGroup(req_, n, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
+
+    n = encodeJoinGroup(req_, 2, 2, "fg", "");
+    const std::size_t o = service_->handleJoinGroup(req_, n, /*clientVersion=*/9, clock_, out_, kBufSize);
+    auto r = pc::JoinGroupResponse::decode(out_, o);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_TRUE(r->detail.empty());
+    EXPECT_EQ(o, pc::JoinGroupResponse{}.encodedSize()) << "the byte-identical legacy frame";
+    EXPECT_EQ(service_->coordinator("fg").memberCount(), 1u);
+}
+
+TEST_F(CG3ServiceTest, SoleMemberRejoiningWithADifferentFilterIsRefusedAndKeptRegression) {
+    constexpr int32_t v10 = rune::protocol::client::kClientVersion;
+    auto n = encodeJoinGroup(req_, 1, 1, "fg", "", 5000, kGroupFilterA);
+    auto r1 = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize));
+    ASSERT_TRUE(r1.has_value());
+    const std::string m1(reinterpret_cast<const char*>(r1->memberId.data()), r1->memberId.size());
+    const auto gen0 = service_->coordinator("fg").generationId();
+
+    n = encodeJoinGroup(req_, 1, 2, "fg", m1, 5000, kGroupFilterB);
+    auto r2 = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize));
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r2->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(service_->coordinator("fg").memberCount(), 1u) << "the refusal does not remove the member";
+    EXPECT_EQ(service_->coordinator("fg").generationId(), gen0);
+    EXPECT_EQ(std::vector<uint8_t>(service_->coordinator("fg").filterBytes().begin(),
+                                   service_->coordinator("fg").filterBytes().end()), kGroupFilterA);
+}
+
+TEST_F(CG3ServiceTest, FilterJoiningAGroupFixedWithNoFilterNamesNoneRegression) {
+    constexpr int32_t v10 = rune::protocol::client::kClientVersion;
+    auto n = encodeJoinGroup(req_, 1, 1, "fg", "");
+    (void)service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize);
+    n = encodeJoinGroup(req_, 2, 2, "fg", "", 5000, kGroupFilterA);
+    auto r = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_TRUE(r->detail.ends_with("filter none")) << r->detail;
+}
+
+TEST_F(CG3ServiceTest, PreV5MemberIsRefusedWithProtocolVersionFromAFilteredGroupRegression) {
+    auto n = encodeJoinGroup(req_, 1, 1, "fg", "", 5000, kGroupFilterA);
+    (void)service_->handleJoinGroup(req_, n, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
+    for (const int32_t old : {3, 4}) {   // below 5 re-joins forever on InvalidRequest
+        n = encodeJoinGroup(req_, 2, 2, "fg", "");
+        const std::size_t o = service_->handleJoinGroup(req_, n, old, clock_, out_, kBufSize);
+        auto r = pc::JoinGroupResponse::decode(out_, o);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::ProtocolVersion)) << old;
+        EXPECT_TRUE(r->detail.empty());
+        EXPECT_EQ(o, pc::JoinGroupResponse{}.encodedSize());
+    }
+    EXPECT_EQ(service_->coordinator("fg").memberCount(), 1u);
+}
+
+TEST_F(CG3ServiceTest, OverCapJoinGroupFilterIsRefusedAndNeverFixesTheGroupRegression) {
+    constexpr int32_t v10 = rune::protocol::client::kClientVersion;
+    const std::vector<uint8_t> big(rune::codec::kMaxFilterBytes + 1, 0x42);
+    const std::vector<uint8_t> atCap(rune::codec::kMaxFilterBytes, 0x42);
+    auto n = encodeJoinGroup(req_, 1, 1, "fg", "", 5000, big);
+    std::size_t o = service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize);
+    auto r = pc::JoinGroupResponse::decode(out_, o);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_FALSE(r->detail.empty());
+    EXPECT_EQ(service_->coordinator("fg").memberCount(), 0u);
+    EXPECT_TRUE(service_->coordinator("fg").filterBytes().empty());
+
+    // the cap itself is admitted (validation of the bytes is the Subscribe path's job)
+    n = encodeJoinGroup(req_, 1, 2, "fg", "", 5000, atCap);
+    r = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, n, v10, clock_, out_, kBufSize));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+}
+
 // ===========================================================================
 // Issues #123 / #124 / #169: a member id is bound to the session that obtained it.  Sync, Heartbeat, Leave and
 // OffsetCommit naming another session's member are answered exactly as for a member that does not exist
@@ -1706,11 +1833,11 @@ protected:
     }
     /// Session `sid` joins `group` as a new member and the group reaches Stable with it alone.
     JoinedMember joinStable(int64_t sid, const std::string& group) {
-        std::size_t n = service_->handleJoinGroup(req_, encodeJoinGroup(req_, sid, ++corr_, group, "", 5000), clock_,
+        std::size_t n = service_->handleJoinGroup(req_, encodeJoinGroup(req_, sid, ++corr_, group, "", 5000), rune::protocol::client::kClientVersion, clock_,
                                                   out_, kBufSize);
         const std::string id = memberOf(n);
         clock_ += kStep;
-        n = service_->handleJoinGroup(req_, encodeJoinGroup(req_, sid, ++corr_, group, id, 5000), clock_, out_, kBufSize);
+        n = service_->handleJoinGroup(req_, encodeJoinGroup(req_, sid, ++corr_, group, id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
         EXPECT_EQ(memberOf(n), id);
         EXPECT_TRUE(driveUntil([&] { return service_->coordinator(group).state() == GroupState::Stable; }, 10));
         return {id, service_->coordinator(group).generationId()};
@@ -1791,7 +1918,7 @@ TEST_F(MemberBindingTest, JoinGroupWithAnotherSessionsMemberIdIsRefusedRegressio
     // Without a gateway every session is the same (anonymous) principal; a different principal is covered in
     // AuthEnforcementTest.  Here: an unknown member id never names a member - it gets a fresh one.
     const std::size_t n = service_->handleJoinGroup(
-        req_, encodeJoinGroup(req_, 2, ++corr_, "g-rejoin", "g-rejoin-chosen-by-the-client", 5000), clock_, out_, kBufSize);
+        req_, encodeJoinGroup(req_, 2, ++corr_, "g-rejoin", "g-rejoin-chosen-by-the-client", 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     const std::string got = memberOf(n);
     EXPECT_NE(got, "g-rejoin-chosen-by-the-client") << "a client-chosen id is never adopted";
     EXPECT_NE(got, m.id);
@@ -1830,14 +1957,14 @@ TEST_F(MemberBindingTest, JoinGroupWithAnotherPrincipalsMemberIdJoinsANewMemberR
     service_->setPrincipalResolverForTest(&principalBySession, nullptr);
     const JoinedMember m = joinStable(/*sid=*/1, "g-principal");
     const std::string foreign = memberOf(service_->handleJoinGroup(
-        req_, encodeJoinGroup(req_, /*sid=*/2, ++corr_, "g-principal", m.id, 5000), clock_, out_, kBufSize));
+        req_, encodeJoinGroup(req_, /*sid=*/2, ++corr_, "g-principal", m.id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
     EXPECT_NE(foreign, m.id) << "another principal took over the member (and its assignment)";
     EXPECT_FALSE(foreign.empty());
     EXPECT_EQ(service_->coordinator("g-principal").memberCount(), 2u);
 
     // Same principal, new session: a re-join of its own member.
     const std::string again = memberOf(service_->handleJoinGroup(
-        req_, encodeJoinGroup(req_, /*sid=*/3, ++corr_, "g-principal", m.id, 5000), clock_, out_, kBufSize));
+        req_, encodeJoinGroup(req_, /*sid=*/3, ++corr_, "g-principal", m.id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
     EXPECT_EQ(again, m.id) << "a reconnecting owner keeps its member";
     const int32_t gen = service_->coordinator("g-principal").generationId();
     EXPECT_EQ(heartbeat(1, "g-principal", m.id, gen), kUnknownMember) << "the old session no longer owns it";
@@ -1853,7 +1980,7 @@ TEST_F(MemberBindingTest, ExpiredMemberLosesItsBindingRegression) {
     EXPECT_EQ(commit(1, "g-expire", m.id, m.generation, 7), kUnknownMember);
     EXPECT_EQ(leave(1, "g-expire", m.id), kUnknownMember);
     const std::string next = memberOf(service_->handleJoinGroup(
-        req_, encodeJoinGroup(req_, 1, ++corr_, "g-expire", m.id, 5000), clock_, out_, kBufSize));
+        req_, encodeJoinGroup(req_, 1, ++corr_, "g-expire", m.id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
     EXPECT_NE(next, m.id);
 }
 
@@ -1874,7 +2001,7 @@ TEST_F(MemberBindingTest, LeftMemberIdIsNeverReadoptedAdversarialRegression) {
         EXPECT_EQ(commit(sid, "g-left", m.id, m.generation, 9), kUnknownMember) << "session " << sid;
         EXPECT_EQ(leave(sid, "g-left", m.id), kUnknownMember) << "session " << sid;
         const std::string got = memberOf(service_->handleJoinGroup(
-            req_, encodeJoinGroup(req_, sid, ++corr_, "g-left", m.id, 5000), clock_, out_, kBufSize));
+            req_, encodeJoinGroup(req_, sid, ++corr_, "g-left", m.id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
         EXPECT_NE(got, m.id) << "session " << sid << ": a departed member id was re-adopted";
         EXPECT_FALSE(got.empty());
     }
@@ -1889,7 +2016,7 @@ TEST_F(MemberBindingTest, ForeignRequestsInEveryRebalanceStateChangeNothingAdver
     ASSERT_EQ(commit(1, "g-states", a.id, a.generation, 100), kOk);
     // A second member (session 4) joins: PreparingRebalance.
     const std::string b = memberOf(service_->handleJoinGroup(
-        req_, encodeJoinGroup(req_, 4, ++corr_, "g-states", "", 5000), clock_, out_, kBufSize));
+        req_, encodeJoinGroup(req_, 4, ++corr_, "g-states", "", 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
     ASSERT_EQ(gc.state(), GroupState::PreparingRebalance);
     auto attack = [&](const char* where) {
         const int32_t gen = gc.generationId();
@@ -1908,8 +2035,8 @@ TEST_F(MemberBindingTest, ForeignRequestsInEveryRebalanceStateChangeNothingAdver
         EXPECT_EQ(committed("g-states"), 100) << where << ": a foreign commit moved the position";
     };
     attack("PreparingRebalance");
-    (void)service_->handleJoinGroup(req_, encodeJoinGroup(req_, 1, ++corr_, "g-states", a.id, 5000), clock_, out_, kBufSize);
-    (void)service_->handleJoinGroup(req_, encodeJoinGroup(req_, 4, ++corr_, "g-states", b, 5000), clock_, out_, kBufSize);
+    (void)service_->handleJoinGroup(req_, encodeJoinGroup(req_, 1, ++corr_, "g-states", a.id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
+    (void)service_->handleJoinGroup(req_, encodeJoinGroup(req_, 4, ++corr_, "g-states", b, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
     ASSERT_TRUE(driveUntil([&] { return gc.state() == GroupState::Stable; }, 10));
     attack("Stable");
     EXPECT_EQ(gc.memberCount(), 2u);
@@ -1920,7 +2047,7 @@ TEST_F(MemberBindingTest, ForeignRequestsInEveryRebalanceStateChangeNothingAdver
 TEST_F(MemberBindingTest, ClosingTheOldSessionDoesNotEvictAMemberItsOwnerMovedAdversarialRegression) {
     const JoinedMember m = joinStable(1, "g-moved");
     const std::string again = memberOf(service_->handleJoinGroup(
-        req_, encodeJoinGroup(req_, 3, ++corr_, "g-moved", m.id, 5000), clock_, out_, kBufSize));
+        req_, encodeJoinGroup(req_, 3, ++corr_, "g-moved", m.id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
     ASSERT_EQ(again, m.id) << "a reconnect of the same principal keeps its member";
     service_->evictSessionMembers(/*sessionId=*/1, clock_);
     EXPECT_EQ(service_->coordinator("g-moved").memberCount(), 1u) << "the old session's reap evicted the moved member";
@@ -1944,7 +2071,7 @@ TEST_F(MemberBindingTest, MemberKeySeparatorDoesNotAliasAcrossGroupsAdversarialR
     EXPECT_EQ(leave(2, "x", alias), kUnknownMember);
     EXPECT_EQ(commit(2, "x", alias, gen, 5), kUnknownMember);
     const std::string got = memberOf(service_->handleJoinGroup(
-        req_, encodeJoinGroup(req_, 2, ++corr_, "x", alias, 5000), clock_, out_, kBufSize));
+        req_, encodeJoinGroup(req_, 2, ++corr_, "x", alias, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize));
     EXPECT_NE(got, alias);
     EXPECT_EQ(service_->coordinator("x:y").memberCount(), 1u);
     EXPECT_EQ(heartbeat(1, "x:y", victim.id, gen), kOk) << "the victim is untouched";
@@ -2298,10 +2425,10 @@ struct CommitRig : OffRig {
     int32_t      gen = -1;
     explicit CommitRig(const std::string& group) {
         svc.setAnswerSinkForTest(&GroupAnswers::sink, &answers);
-        std::size_t n = svc.handleJoinGroup(req, encodeJoinGroup(req, 1, corr++, group, ""), clock, out, sizeof out);
+        std::size_t n = svc.handleJoinGroup(req, encodeJoinGroup(req, 1, corr++, group, ""), rune::protocol::client::kClientVersion, clock, out, sizeof out);
         const auto j = pc::JoinGroupResponse::decode(out, n);
         if (j) member.assign(reinterpret_cast<const char*>(j->memberId.data()), j->memberId.size());
-        (void)svc.handleJoinGroup(req, encodeJoinGroup(req, 1, corr++, group, member), clock, out, sizeof out);
+        (void)svc.handleJoinGroup(req, encodeJoinGroup(req, 1, corr++, group, member), rune::protocol::client::kClientVersion, clock, out, sizeof out);
         for (int i = 0; i < 200 && svc.coordinator(group).state() != GroupState::Stable; ++i) {
             clock += 10'000'000;
             svc.doWork(clock);
@@ -2710,11 +2837,11 @@ TEST(GroupCoordinationServiceRegression, SessionTimeoutAboveTheMaximumIsClampedR
         g.svc.setMaxSessionTimeoutMs(maxMs);
         uint8_t req[4096]{}, out[4096]{};
         const std::string group = "g213";
-        std::size_t n = g.svc.handleJoinGroup(req, encodeJoinGroup(req, 1, 1, group, "", INT32_MAX), g.clock, out, sizeof out);
+        std::size_t n = g.svc.handleJoinGroup(req, encodeJoinGroup(req, 1, 1, group, "", INT32_MAX), pc::kClientVersion, g.clock, out, sizeof out);
         const auto j = pc::JoinGroupResponse::decode(out, n);
         ASSERT_TRUE(j.has_value());
         const std::string member(reinterpret_cast<const char*>(j->memberId.data()), j->memberId.size());
-        (void)g.svc.handleJoinGroup(req, encodeJoinGroup(req, 1, 2, group, member, INT32_MAX), g.clock, out, sizeof out);
+        (void)g.svc.handleJoinGroup(req, encodeJoinGroup(req, 1, 2, group, member, INT32_MAX), pc::kClientVersion, g.clock, out, sizeof out);
         EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), maxMs) << "an unbounded session timeout set the rebalance timeout";
         for (int i = 0; i < 200 && g.svc.coordinator(group).state() != GroupState::Stable; ++i) {
             g.clock += 10'000'000;
@@ -2835,16 +2962,16 @@ TEST(GroupCoordinationServiceRegression, JoinGroupSessionTimeoutBoundsTableAdver
             g.svc.setMaxSessionTimeoutMs(maxMs);
             uint8_t rq[4096]{}, out[4096]{};
             const std::string group = "g213adv";
-            std::size_t n = g.svc.handleJoinGroup(rq, encodeJoinGroup(rq, 1, 1, group, "", 5'000), g.clock, out, sizeof out);
+            std::size_t n = g.svc.handleJoinGroup(rq, encodeJoinGroup(rq, 1, 1, group, "", 5'000), pc::kClientVersion, g.clock, out, sizeof out);
             const auto j = pc::JoinGroupResponse::decode(out, n);
             ASSERT_TRUE(j.has_value());
             const std::string member(reinterpret_cast<const char*>(j->memberId.data()), j->memberId.size());
             // A brand-new member asking for `req` (another session, same group).
-            n = g.svc.handleJoinGroup(rq, encodeJoinGroup(rq, 2, 2, group, "", req), g.clock, out, sizeof out);
+            n = g.svc.handleJoinGroup(rq, encodeJoinGroup(rq, 2, 2, group, "", req), pc::kClientVersion, g.clock, out, sizeof out);
             ASSERT_TRUE(pc::JoinGroupResponse::decode(out, n).has_value());
             EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), want) << "new member";
             // The first member re-joins asking for `req`.
-            n = g.svc.handleJoinGroup(rq, encodeJoinGroup(rq, 1, 3, group, member, req), g.clock, out, sizeof out);
+            n = g.svc.handleJoinGroup(rq, encodeJoinGroup(rq, 1, 3, group, member, req), pc::kClientVersion, g.clock, out, sizeof out);
             ASSERT_TRUE(pc::JoinGroupResponse::decode(out, n).has_value());
             EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), want) << "re-join";
             for (const auto& m : g.svc.coordinator(group).members()) {
@@ -2864,7 +2991,7 @@ TEST(GroupCoordinationServiceRegression, ANonPositiveMaxSessionTimeoutKeepsTheDe
         g.svc.setMaxSessionTimeoutMs(bad);
         EXPECT_EQ(g.svc.maxSessionTimeoutMs(), GroupCoordinationService::kDefaultMaxSessionTimeoutMs);
         uint8_t rq[4096]{}, out[4096]{};
-        (void)g.svc.handleJoinGroup(rq, encodeJoinGroup(rq, 1, 1, "g213neg", "", 5'000), g.clock, out, sizeof out);
+        (void)g.svc.handleJoinGroup(rq, encodeJoinGroup(rq, 1, 1, "g213neg", "", 5'000), pc::kClientVersion, g.clock, out, sizeof out);
         EXPECT_EQ(g.svc.coordinator("g213neg").rebalanceTimeoutMs(), 5'000);
     }
 }

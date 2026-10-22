@@ -4222,7 +4222,8 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 // direct path (enqueueSubscribeOp_) and the queued retry (trySubOp_) both use
 // it, so neither can drop a field (the retry used to omit the Subscribe's
 // correlationId — every push then carried 0 — and the replica).
-rune::node::WorkerOp ClientGateway::buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub) const
+rune::node::WorkerOp ClientGateway::buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub,
+                                                      std::span<const uint8_t> filter) const
 {
     rune::storage::Log* log = topicRegistry_ ? topicRegistry_->log(s.topicId, s.partition) : nullptr;
     const rune::replication::PartitionReplica* rep =
@@ -4242,6 +4243,8 @@ rune::node::WorkerOp ClientGateway::buildSubscribeOp_(const BufferedSubscribe& s
     op.logPtr               = log;
     op.replica              = const_cast<rune::replication::PartitionReplica*>(rep);
     op.egressPub            = egressPub;
+    // Phase 2c: the filter rides the op's tail (a view valid for the synchronous enqueue - the caller's bytes outlive it).
+    op.filterBytes          = filter;
     return op;
 }
 
@@ -4275,24 +4278,23 @@ void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egress
         it->second.cursor = Cursor::AtWorker;
         if (it->second.okOwed) sendOwedSubscribeOk_(s.subId);   // F1: the egress exists: the held OK goes first
     }
-    rune::node::WorkerOp op = buildSubscribeOp_(s, egressPub);
+    // The live record's filter (this enqueue is synchronous); a queued retry carries its own copy, taken below.
+    std::span<const uint8_t> filter;
+    if (const auto it = subscriptions_.find(s.subId); it != subscriptions_.end()) filter = std::span<const uint8_t>(it->second.filter);
+    rune::node::WorkerOp op = buildSubscribeOp_(s, egressPub, filter);
 
     // M5: never dropped — a refused Subscribe (or one behind a queued lifecycle
     // op for the same worker) is queued and retried every doWork, in order.
     const auto w = static_cast<std::size_t>(workerPool_->ownerWorkerId(s.topicId, s.partition));
     const bool behind = w < pendingSubOps_.size() && !pendingSubOps_[w].empty();
     if (behind || !workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op))) {
-        PendingSubOp p;
-        p.sub = s;
-        p.mdc = egressPub == nullptr;
-        queueSubOp_(std::move(p));
+        queueSubOp_(w, SubOpSubscribe{s, egressPub == nullptr ? EgressRoute::Mdc : EgressRoute::Unicast,
+                                      std::vector<uint8_t>(filter.begin(), filter.end())});
     }
 }
 
-void ClientGateway::queueSubOp_(PendingSubOp p)
+void ClientGateway::queueSubOp_(std::size_t w, PendingSubOp p)
 {
-    const auto w = static_cast<std::size_t>(p.fenceSeq != 0 ? p.fenceWorker
-                                                            : workerPool_->ownerWorkerId(p.sub.topicId, p.sub.partition));
     if (pendingSubOps_.size() <= w) pendingSubOps_.resize(static_cast<std::size_t>(workerPool_->workerCount()));
     pendingSubOps_[w].push_back(std::move(p));
     const std::size_t n = pendingSubOpsForTest();
@@ -4300,49 +4302,72 @@ void ClientGateway::queueSubOp_(PendingSubOp p)
         spdlog::warn("ClientGateway: {} subscription op(s) waiting for worker ring space — retried every cycle", n);
 }
 
-bool ClientGateway::trySubOp_(const PendingSubOp& p)
+bool ClientGateway::trySubOp_(std::size_t w, const PendingSubOp& p)
 {
-    rune::node::WorkerOp op;
-    if (p.fenceSeq != 0) [[unlikely]] {   // issues #109 / #196: behind every op queued before it for this worker
-        op.type          = rune::node::WorkerOp::Type::EnforceFence;
-        op.correlationId = static_cast<int64_t>(p.fenceSeq);
-        return workerPool_->worker(p.fenceWorker).tryEnqueueOp(std::move(op));
-    }
-    if (p.unsubscribe) {
-        op.type           = rune::node::WorkerOp::Type::Unsubscribe;
-        op.subscriptionId = p.sub.subId;
-        op.topicId        = p.sub.topicId;
-        op.partition      = p.sub.partition;
-        op.endCode        = p.endCode;      // issue #109: the worker ends it after its last Records
-        op.endDetail      = p.endDetail;    // a view: valid for this (synchronous) enqueue
-        return workerPool_->tryEnqueueOp(p.sub.topicId, p.sub.partition, std::move(op));
-    }
-    // Re-resolve the egress publication NOW (never a pointer held across cycles).
-    void* egressPub = nullptr;
-    if (p.mdc && authMode_ == rune::gateway::GatewayAuthMode::Required) [[unlikely]] {
-        // Issue #118: never queued under authentication (enqueueSubscribeOp_ retires it); defensive - nothing is sent.
-        retireWithoutRecordEgress_(p.sub.subId);
-        return true;
-    }
-    if (!p.mdc) {
-        rune::gateway::Session* sess = sessions_.find(p.sub.sessionId);
-        if (!sess) return true;   // session gone: the Subscribe is moot (dropped)
-        const int32_t wid = workerPool_->ownerWorkerId(p.sub.topicId, p.sub.partition);
-        auto it = sess->recordEgressByWorker.find(wid);
-        if (it == sess->recordEgressByWorker.end() || !it->second) return true;   // moot
-        egressPub = it->second.get();
-    }
-    const auto& s = p.sub;
-    op = buildSubscribeOp_(s, egressPub);  // A-MAJOR-1: correlationId + replica included
-    return workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op));
+    struct Visitor {
+        ClientGateway& g;
+        std::size_t    w;
+        bool operator()(const SubOpUnsubscribe& u) const
+        {
+            rune::node::WorkerOp op;
+            op.type           = rune::node::WorkerOp::Type::Unsubscribe;
+            op.subscriptionId = u.subId;
+            op.topicId        = u.topicId;
+            op.partition      = u.partition;
+            op.endCode        = u.endCode;      // issue #109: the worker ends it after its last Records
+            op.endDetail      = u.endDetail;    // a view: valid for this (synchronous) enqueue
+            return g.workerPool_->tryEnqueueOp(u.topicId, u.partition, std::move(op));
+        }
+        bool operator()(const SubOpSubscribe& sp) const
+        {
+            const auto& s = sp.sub;
+            // Re-resolve the egress publication NOW (never a pointer held across cycles).
+            void* egressPub = nullptr;
+            if (sp.route == EgressRoute::Mdc && g.authMode_ == rune::gateway::GatewayAuthMode::Required) [[unlikely]] {
+                // Issue #118: never queued under authentication (enqueueSubscribeOp_ retires it); defensive - nothing is sent.
+                g.retireWithoutRecordEgress_(s.subId);
+                return true;
+            }
+            if (sp.route == EgressRoute::Unicast) {
+                rune::gateway::Session* sess = g.sessions_.find(s.sessionId);
+                if (!sess) return true;   // session gone: the Subscribe is moot (dropped)
+                const int32_t wid = g.workerPool_->ownerWorkerId(s.topicId, s.partition);
+                auto it = sess->recordEgressByWorker.find(wid);
+                if (it == sess->recordEgressByWorker.end() || !it->second) return true;   // moot
+                egressPub = it->second.get();
+            }
+            rune::node::WorkerOp op = g.buildSubscribeOp_(s, egressPub, sp.filter);  // A-MAJOR-1: correlationId + replica included; the filter is the queued copy
+            return g.workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op));
+        }
+        bool operator()(const SubOpFence& f) const
+        {
+            // issues #109 / #196: behind every op queued before it for this worker
+            rune::node::WorkerOp op;
+            op.type          = rune::node::WorkerOp::Type::EnforceFence;
+            op.correlationId = static_cast<int64_t>(f.seq);
+            return g.workerPool_->worker(static_cast<int32_t>(w)).tryEnqueueOp(std::move(op));
+        }
+        bool operator()(const SubOpFilterSchema& f) const
+        {
+            rune::node::WorkerOp op;
+            op.type            = rune::node::WorkerOp::Type::FilterSchema;
+            op.topicId         = f.topicId;
+            op.clientVersion   = f.version;
+            op.schemaUpdateBlob = f.blob;
+            // Direct to worker w (the schema is never ownership-gated); TooLarge is not retried (it was counted when queued).
+            return g.workerPool_->worker(static_cast<int32_t>(w)).enqueueOp(std::move(op)) != rune::node::EnqueueResult::Full;
+        }
+    };
+    return std::visit(Visitor{*this, w}, p);
 }
 
 int ClientGateway::pumpSubOps_()
 {
     int done = 0;
-    for (auto& q : pendingSubOps_) {
+    for (std::size_t w = 0; w < pendingSubOps_.size(); ++w) {
+        auto& q = pendingSubOps_[w];
         while (!q.empty()) {
-            if (!trySubOp_(q.front())) break;   // this worker's ring still full; others proceed
+            if (!trySubOp_(w, q.front())) break;   // this worker's ring still full; others proceed
             q.pop_front();
             ++done;
         }
@@ -4509,7 +4534,7 @@ void ClientGateway::retireWithoutRecordEgress_(int64_t subId)
     // member's partition subscription evicts the session's members (the consumer rejoins).  Nothing reaches a worker.
     const auto it = subscriptions_.find(subId);
     if (it == subscriptions_.end()) return;   // ended meanwhile: nothing to answer
-    const Subscription sub = it->second;
+    const Subscription sub = std::move(it->second);   // moved: a filter ticket is move-only (released with `sub`)
     subscriptions_.erase(it);
     ++subscribesWithoutRecordEgress_;
     if ((subscribesWithoutRecordEgress_ & (subscribesWithoutRecordEgress_ - 1)) == 0)   // first + each power of two
@@ -4579,17 +4604,16 @@ bool ClientGateway::forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, 
     // is answered by the caller (the plain Unsubscribe still goes, harmless if the worker never had it).
     const auto sw = subscriptions_.find(subId);
     const bool atWorker = sw != subscriptions_.end() && sw->second.cursor == Cursor::AtWorker;
-    PendingSubOp p;
-    p.unsubscribe   = true;
-    p.sub.subId     = subId;
-    p.sub.topicId   = topicId;
-    p.sub.partition = partition;
-    p.endCode       = atWorker ? endCode : int16_t{0};
-    if (p.endCode != 0) p.endDetail.assign(endDetail.substr(0, 192));   // cold: a revoked READ
+    SubOpUnsubscribe u{subId, topicId, partition};
+    if (atWorker && endCode != 0) {
+        u.endCode = endCode;
+        u.endDetail.assign(endDetail.substr(0, 192));   // cold: a revoked READ
+    }
+    PendingSubOp p = std::move(u);
     const auto w = static_cast<std::size_t>(workerPool_->ownerWorkerId(topicId, partition));
     if (applyTracking_ && w < 64) [[unlikely]] applyOpWorkers_ |= uint64_t{1} << w;   // #109: the event's fence covers it
     const bool behind = w < pendingSubOps_.size() && !pendingSubOps_[w].empty();
-    if (behind || !trySubOp_(p)) queueSubOp_(std::move(p));
+    if (behind || !trySubOp_(w, p)) queueSubOp_(w, std::move(p));
     return atWorker;
 }
 
@@ -4676,8 +4700,14 @@ void ClientGateway::onEgressReleased_(int32_t worker, uint64_t token)
 
 void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
 {
-    // 1. Decode.
-    auto msgOpt = pc::Subscribe::decode(buf, len);
+    // 1. Decode.  P13 / E13: the filter trailer is parsed only for a session that negotiated client version >= 11,
+    // so the session is looked up first.  An unknown session decodes as version 0 (no trailer parsed), which keeps
+    // the existing unknown-session path below exactly as it was.
+    int32_t decodeVersion = 0;
+    if (const auto hdr = pc::MessageHeader::decode(buf, len)) {
+        if (const Session* s0 = sessions_.find(hdr->sessionId)) decodeVersion = s0->clientVersion;
+    }
+    auto msgOpt = pc::Subscribe::decode(buf, len, decodeVersion);
     if (!msgOpt) [[unlikely]] {
         // No-hang (R2): answered SubscribeResponse{InvalidRequest}.
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
@@ -4704,6 +4734,32 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         if (deny_(*session, d, buf, len)) return;
     }
     if (refuseViewSink_(buf, len, msg.topicId, "Subscribe to a view sink")) [[unlikely]] return;   // VLS B.3
+
+    // Helper: send SubscribeResponse on the session egress.  Phase 2c: a refusal's `detail` (<= 256 bytes) is written
+    // only for a session >= 11 (encodeFor); an older session gets the byte-identical 38-byte frame.
+    auto sendResp = [&](pc::ErrorCode ec, int32_t partition, int64_t subId, std::string_view detail = {}) {
+        pc::SubscribeResponse resp;
+        resp.sessionId      = msg.sessionId;
+        resp.correlationId  = msg.correlationId;
+        resp.errorCode      = static_cast<int16_t>(ec);
+        resp.partition      = partition;
+        resp.subscriptionId = subId;
+        resp.detail         = detail.substr(0, 256);
+        static_assert(pc::SubscribeResponse::ENCODED_SIZE + 2 + 256 <= kScratchSize,
+                      "scratch too small for SubscribeResponse with a detail");
+        const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion, kScratchSize);
+        // CG round 3 (MEDIUM-2): queued + retried under back-pressure like the
+        // produce answers - never a best-effort drop of the binding answer.
+        sendAnswer_(*session, scratch_.data(), encoded);
+    };
+
+    // Phase 2c (spec 9, E1): a filter is read only from a session >= 11; `__catalog` / `__security` are untyped.
+    if (pc::clientUnderstandsFilters(session->clientVersion) && !msg.filter.empty() &&
+        (msg.topicId == pc::kCatalogTopicId || msg.topicId == pc::kSecurityTopicId)) [[unlikely]] {
+        sendResp(pc::ErrorCode::InvalidRequest, msg.partition, 0,
+                 rune::codec::describe({rune::codec::FilterErrorKind::UntypedTopic}));
+        return;
+    }
 
     // Catalog history Task 12 (spec §7, F19): `__catalog` is readable from ANY
     // broker — never redirected, never routed by the data-plane image.  The
@@ -4734,22 +4790,6 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
             return;  // engine untouched, no subscription registered
         }
     }
-
-    // Helper: send SubscribeResponse on the session egress.
-    auto sendResp = [&](pc::ErrorCode ec, int32_t partition, int64_t subId) {
-        pc::SubscribeResponse resp;
-        resp.sessionId      = msg.sessionId;
-        resp.correlationId  = msg.correlationId;
-        resp.errorCode      = static_cast<int16_t>(ec);
-        resp.partition      = partition;
-        resp.subscriptionId = subId;
-        static_assert(pc::SubscribeResponse::ENCODED_SIZE <= kScratchSize,
-                      "scratch too small for SubscribeResponse");
-        const std::size_t encoded = resp.encode(scratch_.data());
-        // CG round 3 (MEDIUM-2): queued + retried under back-pressure like the
-        // produce answers — never a best-effort drop of the binding answer.
-        sendAnswer_(*session, scratch_.data(), encoded);
-    };
 
     // 3. Resolve partition.
     int32_t partition = msg.partition;
@@ -5022,6 +5062,13 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
                 Subscription& gsub = subIt->second;
                 if (gsub.isGroup && gsub.topicId == msg.topicId &&
                     gsub.partition == partition) {
+                    // Phase 2c (spec 13.3, M2): carriers never carry filters - a group's filter is set at JoinGroup.
+                    // An older session's trailing bytes were ignored at decode (msg.filter is empty for it).
+                    if (pc::clientUnderstandsFilters(session->clientVersion) && !msg.filter.empty()) [[unlikely]] {
+                        sendResp(pc::ErrorCode::InvalidRequest, partition, 0,
+                                 "group filters are set at JoinGroup, not on a group subscription");
+                        return;
+                    }
                     // TX-6b: Mark carrier received and update isolation.
                     // The push loop stalls pre-carrier group subs at any transactional
                     // batch that would be abort-filtered (so nextOffset has NOT advanced
@@ -5073,6 +5120,47 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         session->subIdByKey.erase(dup);   // stale index entry (sub already gone)
     }
 
+    // Phase 2c (spec 6 step 1, 9, FD1, FD3): a filter is read only from a session >= 11 (older sessions' trailing
+    // bytes were ignored at decode).  Every refusal is answered with its detail; nothing is registered.  Placed after
+    // the group-carrier and dedupe branches: a duplicate Subscribe re-answers its existing subscription (one ticket).
+    std::span<const uint8_t> filterBytes;
+    FilterAdmission::Ticket  ticket;
+    if (pc::clientUnderstandsFilters(session->clientVersion) && !msg.filter.empty()) [[unlikely]] {
+        if (!perWorkerEgressActive_ || !workerPool_) {
+            sendResp(pc::ErrorCode::InvalidRequest, partition, 0, "filter needs RUNE_WORKER_MODE=shard");
+            return;
+        }
+        const rune::codec::FilterSchema* fs = msg.topicId >= 0 ? filterSchemas_.find(msg.topicId) : nullptr;
+        if (fs == nullptr) {
+            sendResp(pc::ErrorCode::InvalidRequest, partition, 0,
+                     rune::codec::describe({rune::codec::FilterErrorKind::UntypedTopic}));
+            return;
+        }
+        if (filterSchemaTooLargeTopics_.contains(msg.topicId)) {
+            sendResp(pc::ErrorCode::InvalidRequest, partition, 0,
+                     "filter schema too large for the worker ring (RUNE_WORKER_INGRESS_RING_BYTES)");
+            return;
+        }
+        if (!workerPool_->fitsIngressTail(msg.filter.size())) {
+            sendResp(pc::ErrorCode::InvalidRequest, partition, 0,
+                     "filter too large for the worker ring (RUNE_WORKER_INGRESS_RING_BYTES)");
+            return;
+        }
+        auto c = rune::codec::CompiledFilter::compile(msg.filter, *fs);
+        if (!c) {
+            sendResp(pc::ErrorCode::InvalidRequest, partition, 0, rune::codec::describe(c.error()));
+            return;
+        }
+        const auto& it = c->term(c->indexTerm());
+        auto t = filterAdmission_.admit(msg.topicId, partition, it.tag, c->values(c->indexTerm()));
+        if (!t) {
+            sendResp(pc::ErrorCode::InvalidRequest, partition, 0, t.error());
+            return;
+        }
+        filterBytes = msg.filter;
+        ticket      = std::move(*t);
+    }
+
     // 6. Allocate subscriptionId and register subscription.
     const int64_t subId = allocSubscriptionId_();
 
@@ -5086,6 +5174,8 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     sub.subscribeCorrId = msg.correlationId;
     sub.hadReplica      = replicaRegistry_ != nullptr &&
                           static_cast<bool>(replicaRegistry_->lookupHandle(msg.topicId, partition));
+    sub.filter.assign(filterBytes.begin(), filterBytes.end());
+    sub.filterTicket = std::move(ticket);
 
     // PR #441 F1 (issue #118): under authentication a worker-pushed partition answers OK only once the session's own
     // record egress for the owning worker exists (now, or when it resolves); a failed resolve then refuses the
@@ -7335,7 +7425,7 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
     // old client gets as UnknownMember (answerRejection_).
     if (!pc::clientUnderstandsInvalidRequest(session->clientVersion)) [[unlikely]] {
         const bool undecodable =
-            (tid == static_cast<uint16_t>(pc::TemplateId::JoinGroup) && !pc::JoinGroup::decode(buf, len)) ||
+            (tid == static_cast<uint16_t>(pc::TemplateId::JoinGroup) && !pc::JoinGroup::decode(buf, len, session->clientVersion)) ||
             (tid == static_cast<uint16_t>(pc::TemplateId::SyncGroup) && !pc::SyncGroup::decode(buf, len)) ||
             (tid == static_cast<uint16_t>(pc::TemplateId::Heartbeat) && !pc::Heartbeat::decode(buf, len)) ||
             (tid == static_cast<uint16_t>(pc::TemplateId::OffsetFetch) && !pc::OffsetFetch::decode(buf, len));
@@ -7354,7 +7444,7 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
     const auto templateId = static_cast<pc::TemplateId>(tid);
     switch (templateId) {
         case pc::TemplateId::JoinGroup:
-            encoded = groupService_->handleJoinGroup(buf, len, nowNs, scratch_.data(), cap);
+            encoded = groupService_->handleJoinGroup(buf, len, session->clientVersion, nowNs, scratch_.data(), cap);
             break;
         case pc::TemplateId::SyncGroup:
             encoded = groupService_->handleSyncGroup(buf, len, nowNs, scratch_.data(), cap);
@@ -8040,8 +8130,43 @@ void ClientGateway::onCatalogObjectApplied(int32_t id, const std::string& name, 
     });
 }
 
+void ClientGateway::onFilterSchema(int32_t topicId, uint16_t version, std::span<const uint8_t> evolvingBlob)
+{
+    filterSchemas_.install(topicId, version, evolvingBlob);
+    if (!workerPool_) return;   // no workers: nothing serves filters (a filtered Subscribe is refused E12)
+    const std::size_t nw = static_cast<std::size_t>(workerPool_->workerCount());
+    if (pendingSubOps_.size() < nw) pendingSubOps_.resize(nw);
+    if (!workerPool_->fitsIngressTail(evolvingBlob.size())) [[unlikely]] {
+        ++filterSchemaTooLarge_;
+        filterSchemaTooLargeTopics_.insert(topicId);
+        spdlog::error("ClientGateway: filter schema of topicId={} ({} B) can never fit the worker ingress ring "
+                      "(max tail {} B) - filtered Subscribes to it are refused; raise RUNE_WORKER_INGRESS_RING_BYTES",
+                      topicId, evolvingBlob.size(), workerPool_->maxIngressTail());
+        return;
+    }
+    filterSchemaTooLargeTopics_.erase(topicId);
+    for (std::size_t w = 0; w < nw; ++w) {
+        // FIFO with the Subscribe / Unsubscribe ops: behind anything already queued for this worker, so it never
+        // overtakes an op queued before it, and a filtered Subscribe arriving later finds the schema first.
+        if (!pendingSubOps_[w].empty()) {
+            queueSubOp_(w, SubOpFilterSchema{topicId, version, std::vector<uint8_t>(evolvingBlob.begin(), evolvingBlob.end())});
+            continue;
+        }
+        rune::node::WorkerOp op;
+        op.type             = rune::node::WorkerOp::Type::FilterSchema;
+        op.topicId          = topicId;
+        op.clientVersion    = version;
+        op.schemaUpdateBlob.assign(evolvingBlob.begin(), evolvingBlob.end());
+        const auto r = workerPool_->worker(static_cast<int32_t>(w)).enqueueOp(std::move(op));
+        if (r == rune::node::EnqueueResult::Full)
+            queueSubOp_(w, SubOpFilterSchema{topicId, version, std::vector<uint8_t>(evolvingBlob.begin(), evolvingBlob.end())});
+    }
+}
+
 void ClientGateway::onCatalogObjectDropped(int32_t id)
 {
+    filterSchemas_.erase(id);
+    filterSchemaTooLargeTopics_.erase(id);
     objectIndex_.onDropped(id);
     syncPermissionTables_();
     const bool shipping = authMode_ == rune::gateway::GatewayAuthMode::Required && shardMode_ && workerPool_;
@@ -8172,7 +8297,7 @@ bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint
     std::optional<rune::gateway::Denial> d;
     switch (static_cast<pc::TemplateId>(tid)) {
         case pc::TemplateId::JoinGroup:
-            if (const auto m = pc::JoinGroup::decode(buf, len)) {
+            if (const auto m = pc::JoinGroup::decode(buf, len, session.clientVersion)) {
                 d = group(m->groupId);
                 for (const int32_t t : m->subscribedTopicIds) { if (d) break; d = topic(t, 0); }
             }
@@ -8568,12 +8693,10 @@ void ClientGateway::noteEnforced_(int64_t offset, uint64_t opWorkers, bool lifec
     const int32_t n = std::min<int32_t>(workerPool_->workerCount(), kMaxFenceWorkers);
     for (int32_t w = 0; w < n; ++w) {
         if ((ops & (uint64_t{1} << w)) == 0) continue;
-        PendingSubOp p;
-        p.fenceSeq    = seq;
-        p.fenceWorker = w;
+        PendingSubOp p = SubOpFence{seq};
         const auto wi = static_cast<std::size_t>(w);
         const bool behind = wi < pendingSubOps_.size() && !pendingSubOps_[wi].empty();   // FIFO behind the ends
-        if (behind || !trySubOp_(p)) queueSubOp_(std::move(p));
+        if (behind || !trySubOp_(wi, p)) queueSubOp_(wi, std::move(p));
     }
     pendingEnforce_.push_back({offset, seq, ops, life});
 }

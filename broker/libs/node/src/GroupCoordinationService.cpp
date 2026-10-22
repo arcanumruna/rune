@@ -12,6 +12,7 @@
 #include <rune/gateway/ClientGateway.h>  // CG-4: addGroupSubscription / revokeGroupSubscriptions / sendControlFrame
 #include <rune/crypto/Kdf.h>             // issues #123 / #124: the random half of member ids
 
+#include <rune/codec/FilterWire.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/Protocol.h>
@@ -433,13 +434,46 @@ static std::string topicNameForId(rune::gateway::TopicRegistry* topics, int32_t 
 // Handlers
 // ===========================================================================
 
+namespace {
+
+// The old-client rule of ClientGateway::answerRejection_: a client below 5 re-joins forever on InvalidRequest.
+pc::ErrorCode rejectionCodeFor(int32_t clientVersion) noexcept {
+    return pc::clientUnderstandsInvalidRequest(clientVersion) ? pc::ErrorCode::InvalidRequest : pc::ErrorCode::ProtocolVersion;
+}
+
+// "group filter mismatch: the group uses filter <hex>" (at most 128 bytes shown, then "... (<n> bytes)"), "none" when empty.
+std::string groupFilterMismatchDetail(std::span<const uint8_t> f) {
+    std::string s(pc::kGroupFilterMismatchPrefix);
+    s += ": the group uses filter ";
+    if (f.empty()) { s += "none"; return s; }
+    static constexpr char kHex[] = "0123456789abcdef";
+    const std::size_t shown = std::min<std::size_t>(f.size(), 128);
+    for (std::size_t i = 0; i < shown; ++i) { s += kHex[f[i] >> 4]; s += kHex[f[i] & 0xF]; }
+    if (shown < f.size()) s += "... (" + std::to_string(f.size()) + " bytes)";
+    return s;
+}
+
+}  // namespace
+
+// Log rate-limit for filter-mismatch refusals: first per (group, session), then every power of two (bounded, cold).
+void GroupCoordinationService::noteFilterMismatch_(const std::string& groupId, int64_t sessionId) {
+    if (filterMismatchRefusals_.size() >= 4096) filterMismatchRefusals_.clear();
+    std::string key = groupId;
+    key += '\x1f';
+    key += std::to_string(sessionId);
+    const uint64_t n = ++filterMismatchRefusals_[key];
+    if ((n & (n - 1)) == 0)
+        spdlog::warn("GroupCoordinationService: JoinGroup from session {} refused — group '{}' uses a different filter "
+                     "(refusal #{})", sessionId, groupId, n);
+}
+
 // ---------------------------------------------------------------------------
 // handleJoinGroup (templateId 32)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleJoinGroup(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
+    const uint8_t* buf, size_t len, int32_t clientVersion, int64_t nowNs, uint8_t* out, size_t outCap)
 {
-    auto msgOpt = pc::JoinGroup::decode(buf, len);
+    auto msgOpt = pc::JoinGroup::decode(buf, len, clientVersion);
     if (!msgOpt) {
         // No-hang (R2): answered JoinGroupResponse{InvalidRequest}, never dropped.
         spdlog::debug("GroupCoordinationService: JoinGroup decode failed — answered InvalidRequest");
@@ -494,6 +528,41 @@ size_t GroupCoordinationService::handleJoinGroup(
         }
     }
 
+    coord::GroupCoordinator& gc = coordinator(groupIdStr);   // only creates the group
+
+    // Phase 2c (spec 13.3): one filter per group, fixed by the first member, changeable once the group is empty.
+    // The session's version is the one the frame was decoded with: an older member carries no filter.
+    const int32_t ver = clientVersion;
+    const std::span<const uint8_t> filter = pc::clientUnderstandsFilters(ver) ? msg.filter : std::span<const uint8_t>{};
+    // A refused join: never admitted, no state change.  Old clients get the rule's ProtocolVersion; the detail
+    // (cold; reserved member string) goes to a session >= 11 only.
+    auto refuseJoin = [&](std::string detail) {
+        pc::JoinGroupResponse resp;
+        resp.sessionId     = msg.sessionId;
+        resp.correlationId = msg.correlationId;
+        resp.errorCode     = static_cast<int16_t>(rejectionCodeFor(ver));
+        resp.generationId  = 0;
+        resp.isLeader      = 0;
+        resp.memberId      = std::span<const uint8_t>();
+        if (pc::clientUnderstandsFilters(ver)) {
+            filterDetailScratch_ = std::move(detail);
+            resp.detail = filterDetailScratch_;
+        }
+        // encodeFor writes the detail only to a session >= 11 (encode() never does)
+        const std::size_t n = resp.encodeFor(out, ver, outCap);
+        return n != 0 ? n : resp.encode(out);
+    };
+    // The same cap the Subscribe filter path enforces (CompiledFilter::compile): no group is fixed to bytes every
+    // Subscribe would refuse.
+    if (filter.size() > rune::codec::kMaxFilterBytes) {
+        return refuseJoin("group filter too large: " + std::to_string(filter.size()) + " bytes, at most " +
+                          std::to_string(rune::codec::kMaxFilterBytes));
+    }
+    if (!gc.admitFilter(filter)) {
+        noteFilterMismatch_(groupIdStr, msg.sessionId);
+        return refuseJoin(groupFilterMismatchDetail(gc.filterBytes()));
+    }
+
     // Collect subscribedTopicIds → topic names.
     // joinTopicsScratch_ is a reused member; clear + refill to avoid per-call
     // vector allocation.  Short topic names benefit from SSO; the vector itself
@@ -513,7 +582,6 @@ size_t GroupCoordinationService::handleJoinGroup(
     // whether or not the id names someone (nothing to enumerate), and an id is never adopted from the client.
     // PR #423 review F2: and only for a CURRENT member of THIS group (a binding never stands in for membership).
     const uint64_t principal = principalOf_(msg.sessionId);
-    coord::GroupCoordinator& gc = coordinator(groupIdStr);
     if (!memberIdScratch_.empty()) {
         const MemberBinding* b = bindingOf_(groupIdStr, memberIdStr);
         if (b == nullptr || b->principal != principal || !gc.hasMember(memberIdStr)) memberIdScratch_.clear();

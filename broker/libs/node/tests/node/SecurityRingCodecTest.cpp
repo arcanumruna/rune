@@ -7,6 +7,8 @@
 
 #include <gtest/gtest.h>
 
+#include <vector>
+
 using namespace rune::node;
 
 namespace {
@@ -75,4 +77,23 @@ TEST(SecurityRingCodecRegression, AnUnreadableFrameIsAMalformedRequestNeverACast
     const uint8_t junk[3] = {1, 2, 3};
     const auto tiny = decodeSecurityDdl(junk, sizeof junk);
     EXPECT_TRUE(std::holds_alternative<MalformedDdl>(tiny));
+}
+
+// Phase 2c Task 9: the kA2cFilterSchema frame (admin -> control) round-trips, and a short frame is refused.
+TEST(AdminChannelsRegression, FilterSchemaMessageRoundTripsRegression) {
+    const std::vector<uint8_t> blob = {1, 2, 3, 4, 5, 250, 0, 7};
+    std::vector<uint8_t> wire(filterSchemaWireLen(blob.size()));
+    writeFilterSchema(wire.data(), -1234567, 0xBEEF, blob);
+    FilterSchemaMsg m;
+    ASSERT_TRUE(decodeFilterSchema(wire.data(), wire.size(), m));
+    EXPECT_EQ(m.topicId, -1234567);
+    EXPECT_EQ(m.version, 0xBEEF);
+    EXPECT_EQ(m.blob, blob);
+    FilterSchemaMsg empty;
+    ASSERT_TRUE(decodeFilterSchema(wire.data(), 6, empty)) << "an empty blob is a (useless but well-formed) frame";
+    EXPECT_TRUE(empty.blob.empty());
+    FilterSchemaMsg bad;
+    EXPECT_FALSE(decodeFilterSchema(wire.data(), 5, bad)) << "shorter than the 6-byte header";
+    EXPECT_NE(kA2cFilterSchema, kA2cSchemaUpdate);
+    EXPECT_EQ(kA2cFilterSchema, 25);
 }
