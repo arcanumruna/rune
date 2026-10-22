@@ -207,6 +207,10 @@ public:
             }
             break;
         }
+        case PeerKeepaliveMsg::TEMPLATE_ID:
+            // Issue #17: a sealed idle keepalive.  Its job (proving the peer alive) was done when AeronIngress opened
+            // it; here it is consumed - neither dispatched nor counted as ignored.
+            break;
         case CommitPositionMsg::TEMPLATE_ID: {
             if (len < CommitPositionMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
             const auto m = CommitPositionMsg::decode(buf, 0);

@@ -3539,6 +3539,12 @@ int BrokerNode::servicePeerLinks_(int64_t nowNs) {
         if (aeronIngress_ && aeronIngress_->takePeerUsedEpoch(peer, epoch)) peerLinkAgent_->onPeerUsedEpoch(peer, epoch, nowNs);
         if (replTransport_ && replTransport_->takePeerUsedEpoch(peer, epoch)) peerLinkAgent_->onPeerUsedEpoch(peer, epoch, nowNs);
     }
+    // Issue #17: a sealed keepalive to every peer this node sealed nothing to for 250 ms.  Consensus only carries
+    // leader <-> follower traffic, so without it two followers never prove each other alive and a forged hint could
+    // rekey their idle link.  Sent before the authFrames below are read (they count what peers sent US).
+    static_assert(UdpMessageSink::kPeerKeepaliveNs * 4 <= rune::peerlink::PeerHandshake::kSilenceNs,
+                  "a keepalive interval must survive three consecutive losses inside the peer link's silence window");
+    if (udpSink_) (void)udpSink_->sendIdleKeepalives(nowNs);
     // An authenticated frame from a peer proves it is alive: only a peer that has been silent for a second can be
     // rekeyed by an unauthenticated hint.
     for (std::size_t i = 0; i < peerLinkAgent_->peerCount(); ++i) {
@@ -3598,7 +3604,10 @@ BrokerNode::PeerLinkSnap BrokerNode::peerLinksForTest() {
         for (const auto& peer : config_.peers) {
             if (peer.id == config_.nodeId) continue;
             v.peers.push_back(peer.id);
-            if (peer.id >= 0 && peer.id < 16) v.epochOf[peer.id] = udpSink_ ? udpSink_->peerLinkEpoch(peer.id) : 0u;
+            if (peer.id >= 0 && peer.id < 16) {
+                v.epochOf[peer.id] = udpSink_ ? udpSink_->peerLinkEpoch(peer.id) : 0u;
+                v.consensusAuthFramesOf[peer.id] = aeronIngress_ ? aeronIngress_->authFrames(peer.id) : 0u;
+            }
         }
         return v;
     });

@@ -20,6 +20,15 @@ bool x25519Keypair(std::array<uint8_t, kX25519Bytes>& priv, std::array<uint8_t, 
     return ok;
 }
 
+bool x25519Public(const std::array<uint8_t, kX25519Bytes>& priv, std::array<uint8_t, kX25519Bytes>& pub) noexcept {
+    EVP_PKEY* key = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, nullptr, priv.data(), priv.size());
+    size_t pubLen = pub.size();
+    const bool ok = key != nullptr && EVP_PKEY_get_raw_public_key(key, pub.data(), &pubLen) == 1 && pubLen == pub.size();
+    EVP_PKEY_free(key);        // OpenSSL clears the key's own private bytes on free
+    if (!ok) secureZero(pub);
+    return ok;
+}
+
 bool x25519Shared(const std::array<uint8_t, kX25519Bytes>& priv, const std::array<uint8_t, kX25519Bytes>& peerPub,
                   std::array<uint8_t, kX25519Bytes>& shared) noexcept {
     EVP_PKEY* own = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, nullptr, priv.data(), priv.size());

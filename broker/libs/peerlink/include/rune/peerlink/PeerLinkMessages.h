@@ -17,8 +17,12 @@ namespace rune::peerlink {
 /// HelloV2 / ChallengeV2 (7, 8, issue #242) carry the X25519 ephemeral shares that give the link keys forward secrecy.
 /// A broker that predates them sees tags 7/8 as malformed frames and ignores them (counted): an old responder never
 /// answers a new initiator, so upgrade in DESCENDING node id (see PeerHandshake.h).
+/// ProofV2 (9, issue #18) is the v2 initiator's Proof: it echoes the Hello's fields and the Challenge's nonceB, so the
+/// responder re-derives its Challenge from a stateless cookie instead of a pending slot.  The v2 handshake is
+/// unreleased (broker-v0.2.0 speaks v1 only); a main build between issue #242 and #18 (HelloV2 answered by a plain
+/// Proof) does not link with this one - accepted, nothing released spoke that combination.
 enum class PeerMsg : uint8_t { Hello = 1, Challenge = 2, Proof = 3, Accept = 4, Refuse = 5, Confirm = 6, HelloV2 = 7,
-                               ChallengeV2 = 8 };
+                               ChallengeV2 = 8, ProofV2 = 9 };
 
 /// Why a handshake was refused.  NoLink (5) is a poke, not a refusal: a responder that holds no link says "start
 /// over" (it restarted) — never logged as a refusal, never counted.
@@ -192,12 +196,38 @@ struct PeerChallengeV2 {
     }
 };
 
-inline constexpr std::size_t kMaxPeerLinkFrame = PeerChallengeV2::kSize;
-static_assert(kMaxPeerLinkFrame >= PeerChallenge::kSize && kMaxPeerLinkFrame >= PeerHelloV2::kSize);
+/// Issue #18: the v2 initiator's Proof.  Beside macA (the v2 transcript MAC) it echoes everything the responder needs to
+/// re-derive its Challenge from its cookie secret: the Hello's keyId, incarnation (the initiator's incA), nonceA and
+/// shareA, and the Challenge's nonceB.  The responder keeps no per-Hello state (PeerHandshake.h).
+struct PeerProofV2 {
+    int32_t from = -1, to = -1; uint64_t keyId = 0; uint64_t incarnation = 0; std::array<uint8_t, 32> nonceA{};
+    std::array<uint8_t, 32> shareA{}, nonceB{}; std::array<uint8_t, 64> macA{};
+    static constexpr std::size_t kSize = 1 + 4 + 4 + 8 + 8 + 32 + 32 + 32 + 64;
+    void encode(uint8_t* b) const noexcept {
+        b[0] = static_cast<uint8_t>(PeerMsg::ProofV2);
+        detail::putLe(b + 1, static_cast<uint32_t>(from), 4); detail::putLe(b + 5, static_cast<uint32_t>(to), 4);
+        detail::putLe(b + 9, keyId, 8); detail::putLe(b + 17, incarnation, 8);
+        std::memcpy(b + 25, nonceA.data(), 32); std::memcpy(b + 57, shareA.data(), 32); std::memcpy(b + 89, nonceB.data(), 32);
+        std::memcpy(b + 121, macA.data(), 64);
+    }
+    [[nodiscard]] static bool decode(const uint8_t* b, std::size_t len, PeerProofV2& m) noexcept {
+        if (len != kSize || b[0] != static_cast<uint8_t>(PeerMsg::ProofV2)) return false;
+        m.from = static_cast<int32_t>(detail::getLe(b + 1, 4)); m.to = static_cast<int32_t>(detail::getLe(b + 5, 4));
+        m.keyId = detail::getLe(b + 9, 8); m.incarnation = detail::getLe(b + 17, 8);
+        std::memcpy(m.nonceA.data(), b + 25, 32); std::memcpy(m.shareA.data(), b + 57, 32); std::memcpy(m.nonceB.data(), b + 89, 32);
+        std::memcpy(m.macA.data(), b + 121, 64);
+        return true;
+    }
+};
+static_assert(PeerProofV2::kSize == 185);
+
+inline constexpr std::size_t kMaxPeerLinkFrame = PeerProofV2::kSize;
+static_assert(kMaxPeerLinkFrame >= PeerChallengeV2::kSize && kMaxPeerLinkFrame >= PeerChallenge::kSize &&
+              kMaxPeerLinkFrame >= PeerHelloV2::kSize);
 
 /// The tag of a frame, or 0 when it is empty / unknown.
 [[nodiscard]] inline uint8_t peekPeerMsg(const uint8_t* b, std::size_t len) noexcept {
-    return (len > 0 && b[0] >= 1 && b[0] <= 8) ? b[0] : uint8_t{0};
+    return (len > 0 && b[0] >= 1 && b[0] <= 9) ? b[0] : uint8_t{0};
 }
 
 } // namespace rune::peerlink

@@ -1547,6 +1547,7 @@ public:
                           uint64_t frameDrops = 0; bool sealed = false;
                           uint64_t workerDropsReported = 0, adminDropsReported = 0;
                           uint64_t unknownEpochDrops = 0;   // issue #241: the control-thread transports' UnknownEpoch drops
+                          uint64_t consensusAuthFramesOf[16] = {};   // issue #17: frames opened per peer on the consensus ingress
                         };
     [[nodiscard]] PeerLinkSnap peerLinksForTest();
     /// The link epoch worker `w` / the admin thread holds for `peer` (0 = none); read ON that thread.

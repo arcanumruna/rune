@@ -86,6 +86,7 @@ void PeerLinkAgent::onFrame_(const uint8_t* b, std::size_t len, int64_t nowNs) {
     case pl::PeerMsg::Confirm:   { pl::PeerConfirm m;   if (pl::PeerConfirm::decode(b, len, m))   absorb_(*p, p->hs.onConfirm(m, nowNs), nowNs);   else ++malformed_; break; }
     case pl::PeerMsg::HelloV2:     { pl::PeerHelloV2 m;     if (pl::PeerHelloV2::decode(b, len, m))     absorb_(*p, p->hs.onHelloV2(m, nowNs), nowNs);     else ++malformed_; break; }
     case pl::PeerMsg::ChallengeV2: { pl::PeerChallengeV2 m; if (pl::PeerChallengeV2::decode(b, len, m)) absorb_(*p, p->hs.onChallengeV2(m, nowNs), nowNs); else ++malformed_; break; }
+    case pl::PeerMsg::ProofV2:     { pl::PeerProofV2 m;     if (pl::PeerProofV2::decode(b, len, m))     absorb_(*p, p->hs.onProofV2(m, nowNs), nowNs);     else ++malformed_; break; }
     }
 }
 

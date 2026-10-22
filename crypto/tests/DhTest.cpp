@@ -26,6 +26,19 @@ TEST(DhRegression, X25519MatchesRfc7748Section61Regression) {
     EXPECT_EQ(k2, want);
 }
 
+// Issue #18: the public key of a given private key, pinned to the RFC 7748 §6.1 vector (Alice and Bob).
+TEST(DhRegression, X25519PublicMatchesRfc7748Section61Regression) {
+    std::array<uint8_t, 32> pub{};
+    ASSERT_TRUE(rc::x25519Public(hex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"), pub));
+    EXPECT_EQ(pub, hex32("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"));
+    ASSERT_TRUE(rc::x25519Public(hex32("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"), pub));
+    EXPECT_EQ(pub, hex32("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"));
+    std::array<uint8_t, 32> priv{}, kpPub{};
+    ASSERT_TRUE(rc::x25519Keypair(priv, kpPub));
+    ASSERT_TRUE(rc::x25519Public(priv, pub));
+    EXPECT_EQ(pub, kpPub) << "the same public key x25519Keypair returned";
+}
+
 TEST(DhRegression, TwoRandomKeypairsAgreeRegression) {
     std::array<uint8_t, 32> aPriv{}, aPub{}, bPriv{}, bPub{}, k1{}, k2{};
     ASSERT_TRUE(rc::x25519Keypair(aPriv, aPub));

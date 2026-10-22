@@ -48,6 +48,7 @@ enum class ConsensusTemplateId : uint16_t {
     TermFloorNotice    = 62,   // D29/D24: a member's follow floor is above the leader's term
     ReadLeaseRequest   = 63,   // issue #82 (VLS A.4): a broker asks the controller for a view read lease
     ReadLeaseGrant     = 64,   // issue #82: the controller's quorum-capped grant
+    PeerKeepalive      = 65,   // issue #17: a sealed idle keepalive between peers (header only)
     TerminationPosition = 75,
     TerminationAck     = 76,
 };
@@ -1017,6 +1018,34 @@ struct ReadLeaseGrantMsg {
         m.leaderMemberId = detail::read_le<int32_t>(p + 44);
         return m;
     }
+};
+
+// ===========================================================================
+// PeerKeepalive  (templateId = 65) — issue #17, a Rune extension.  Sent SEALED
+// by UdpMessageSink::sendIdleKeepalives to a peer it has sealed nothing to for
+// kPeerKeepaliveNs (250 ms): consensus only carries traffic between the leader
+// and each follower, so without it two followers exchange no sealed
+// control-plane frame and look "silent" to the peer link (PeerHandshake), where
+// an unauthenticated hint may rekey a silent link.  The receiving AeronIngress
+// opens it (counted in authFrames - the liveness signal); ConsensusAdapter then
+// consumes it without dispatching or counting it.
+// Header only:  blockLength = 0.
+// Version skew: kSchemaVersion is NOT bumped (no decoder checks the header's
+// version; templates 60-64 were added the same way).  An older broker's
+// AeronIngress still opens the frame and counts it in authFrames; its
+// ConsensusAdapter ignores the unknown template (counted in
+// ignoredFrameCount(), harmless).
+// ===========================================================================
+struct PeerKeepaliveMsg {
+    static constexpr uint16_t TEMPLATE_ID  = 65;
+    static constexpr uint16_t BLOCK_LENGTH = 0;
+    static constexpr std::size_t TOTAL_SIZE = ConsensusMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    static std::size_t encode(uint8_t* buf, std::size_t offset) noexcept {
+        ConsensusMessageHeader::encode(buf, offset, BLOCK_LENGTH, TEMPLATE_ID);
+        return TOTAL_SIZE;
+    }
+    static PeerKeepaliveMsg decode(const uint8_t* /*buf*/, std::size_t /*offset*/) noexcept { return {}; }
 };
 
 } // namespace rune::consensus
