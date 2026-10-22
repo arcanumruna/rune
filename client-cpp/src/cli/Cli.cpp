@@ -116,7 +116,8 @@ void printUsage(std::ostream& err) {
 //                          from RUNE_EGRESS if the flag is absent.
 //
 #ifdef RUNE_CLI_LIVE_ENABLED
-rune::client::ClientConfig buildClientConfig(const std::vector<std::string>& args) {
+// `dir` receives the embedded driver's scratch directory when --cli-data-dir is absent; it must outlive the Client.
+rune::client::ClientConfig buildClientConfig(const std::vector<std::string>& args, rune::cli::support::ScopedDir& dir) {
     rune::client::ClientConfig cfg;
 
     // Broker channel: --broker <ep> or RUNE_BROKER env.
@@ -124,7 +125,7 @@ rune::client::ClientConfig buildClientConfig(const std::vector<std::string>& arg
     if (cfg.gatewayChannel.empty()) {
         if (const char* env = std::getenv("RUNE_BROKER"); env) cfg.gatewayChannel = env;
     }
-    if (cfg.gatewayChannel.empty()) cfg.gatewayChannel = "aeron:ipc";
+    cfg.gatewayChannel = cfg.gatewayChannel.empty() ? "aeron:ipc" : rune::cli::support::toChannel(cfg.gatewayChannel);
 
     // Egress channel: --cli-egress <ch> or RUNE_EGRESS env.  For a UDP gateway
     // this MUST be a client-reachable UDP endpoint so the broker can route
@@ -134,6 +135,14 @@ rune::client::ClientConfig buildClientConfig(const std::vector<std::string>& arg
     if (egress.empty()) {
         if (const char* env = std::getenv("RUNE_EGRESS"); env) egress = env;
     }
+    if (egress.empty()) {   // a UDP gateway answers on the local address that reaches it (as the console does)
+        if (const std::string ep = rune::cli::support::udpEndpointOf(cfg.gatewayChannel); !ep.empty()) {
+            std::string why;
+            const auto local = rune::cli::support::localEgressFor(ep, why);
+            if (!local) throw std::invalid_argument(why + "; set --cli-egress (or RUNE_EGRESS)");
+            egress = *local;
+        }
+    }
     if (!egress.empty()) cfg.egressChannel = egress;
 
     // Stream IDs: hidden test overrides.
@@ -142,9 +151,16 @@ rune::client::ClientConfig buildClientConfig(const std::vector<std::string>& arg
     if (!sIn.empty())  cfg.gatewayStreamId = std::stoi(sIn);
     if (!sOut.empty()) cfg.egressStreamId  = std::stoi(sOut);
 
-    // Aeron data directory: hidden test override.
+    // Aeron data directory: hidden test override, else a private scratch directory removed with `dir`.
     const std::string dataDir = flagValue(args, "--cli-data-dir");
-    if (!dataDir.empty()) cfg.dataDir = dataDir;
+    if (!dataDir.empty()) {
+        cfg.dataDir = dataDir;
+    } else {
+        dir = rune::cli::support::ScopedDir(std::filesystem::temp_directory_path() /
+                                            ("rune-cli-" + std::to_string(::getpid()) + "-" +
+                                             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())));
+        cfg.dataDir = dir.path().string();
+    }
 
     // Review B I6: the credential flags are global (--user / --password-file, RUNE_USER / RUNE_PASSWORD_FILE).
     rune::cli::support::applyCredentials(cfg, flagValue(args, "--user"), flagValue(args, "--password-file"));
@@ -171,7 +187,8 @@ int cmdSchemaGet(const std::vector<std::string>& args,
 
 #ifdef RUNE_CLI_LIVE_ENABLED
     using namespace rune::client;
-    Client client(buildClientConfig(args));
+    rune::cli::support::ScopedDir scratch;
+    Client client(buildClientConfig(args, scratch));
     try {
         if (!connectOrReport(client, err)) return 1;
 
@@ -228,7 +245,8 @@ int cmdSchemaList(const std::vector<std::string>& args,
 
 #ifdef RUNE_CLI_LIVE_ENABLED
     using namespace rune::client;
-    Client client(buildClientConfig(args));
+    rune::cli::support::ScopedDir scratch;
+    Client client(buildClientConfig(args, scratch));
     try {
         if (!connectOrReport(client, err)) return 1;
 
@@ -317,7 +335,8 @@ int cmdSchemaGenerate(const std::vector<std::string>& args,
 
 #ifdef RUNE_CLI_LIVE_ENABLED
     using namespace rune::client;
-    Client client(buildClientConfig(args));
+    rune::cli::support::ScopedDir scratch;
+    Client client(buildClientConfig(args, scratch));
     try {
         if (!connectOrReport(client, err)) return 1;
 
