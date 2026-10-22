@@ -368,3 +368,36 @@ TEST(SecurityStatementTextRegression, MatchesTheClientRedactionForEveryStatement
     EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 0, 5, 0, "t", ""), "");
     EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 0, 1, 2, "t", ""), "");
 }
+
+// Adversarial review of PR #525: a raw wire client's grant pattern is not bound by the QL lexer and may hold a quote.
+// Both renderers double it inside the literal, so the text can never close the literal and read as a second statement;
+// and they still agree byte for byte (statements built directly, as a non-QL front end would).
+TEST(SecurityStatementTextRegression, AQuoteInsideALiteralIsDoubledByBothRenderersAdversarialRegression) {
+    namespace sec = rune::security;
+    const std::string inject = "x' TO ROLE r; GRANT ADMIN ON CLUSTER TO USER mallory; --";
+    for (const bool prefix : {true, false}) {
+        for (const bool revoke : {false, true}) {
+            ql::SecPattern p{ql::SecResource::Group, prefix, inject};
+            ql::Statement st = revoke ? ql::Statement{ql::RevokeDef{ql::SecOp::Read, p, ql::Grantee::Role, "r", true}}
+                                      : ql::Statement{ql::GrantDef{ql::SecOp::Read, p, ql::Grantee::Role, "r"}};
+            const std::string head = std::string(revoke ? "REVOKE" : "GRANT") + " READ ON GROUP " + (prefix ? "PREFIX " : "");
+            const std::string want = head + "'x'' TO ROLE r; GRANT ADMIN ON CLUSTER TO USER mallory; --'" +
+                                     (revoke ? " FROM ROLE r FORCE;" : " TO ROLE r;");
+            EXPECT_EQ(ql::redactedText(st), want);
+            auto plan = ql::applySecurityPlan(st);
+            ASSERT_TRUE(plan.has_value());
+            EXPECT_EQ(sec::securityStatementText(static_cast<uint8_t>(plan->kind), plan->name,
+                                                 static_cast<uint8_t>(plan->change), plan->passwordIndex,
+                                                 plan->terminateSessions, plan->force ? 1 : 0, plan->granteeKind,
+                                                 plan->op, plan->resourceType, plan->patternKind, plan->pattern,
+                                                 plan->roleName),
+                      want);
+        }
+    }
+    // A lone quote, an empty prefix, and a 249-byte pattern of quotes (the wire maximum) - all closed exactly once.
+    EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 0, 3, 0, "'", ""), "GRANT READ ON GROUP '''' TO ROLE r;");
+    EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 0, 3, 1, "", ""), "GRANT READ ON GROUP PREFIX '' TO ROLE r;");
+    const std::string quotes(249, '\'');
+    EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 0, 3, 1, quotes, ""),
+              "GRANT READ ON GROUP PREFIX '" + std::string(498, '\'') + "' TO ROLE r;");
+}

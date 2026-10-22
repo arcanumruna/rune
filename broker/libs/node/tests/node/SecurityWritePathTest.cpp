@@ -439,3 +439,133 @@ TEST(SecurityWritePathRegression, TheRecordedStatementIsRenderedFromTheOpNotTake
         EXPECT_FALSE(events[i].event.replayedFrom.has_value()) << "offset " << events[i].offset;
     }
 }
+
+// ── Adversarial review of PR #525 (issue #228): the recorded statement under a forging client ───────────────────────
+namespace {
+/// Every rig request with the client's statement replaced by a forged one (no password literal, so the D10 guard
+/// passes it through) and a forged replay provenance.
+rune::node::SecurityDdlMsg forged(rune::node::SecurityDdlMsg m) {
+    m.meta.statement = "GRANT ADMIN ON CLUSTER TO USER mallory;";
+    m.meta.replayedFrom = rune::catalog::ReplayedFrom{"x", 7, "mallory"};
+    return m;
+}
+/// The statement with every SQL string literal ('...', a doubled '' inside one) removed: what a reader parses as
+/// keywords, names and statement separators.
+std::string outsideLiterals(const std::string& s) {
+    std::string out;
+    bool in = false;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] != '\'') { if (!in) out += s[i]; continue; }
+        if (in && i + 1 < s.size() && s[i + 1] == '\'') { ++i; continue; }   // an escaped quote inside a literal
+        in = !in;
+    }
+    return out;
+}
+}  // namespace
+
+// Every op kind and every ALTER USER change, each sent with a forged statement: the recorded text is the canonical one
+// for the op that was applied, never the client's.
+TEST(SecurityWritePathRegression, AForgedStatementIsReplacedForEveryOpKindAdversarialRegression) {
+    SecurityDdlRig rig("forged_every_kind");
+    rig.becomeServingLeader();
+    const auto ok = [&](rune::node::SecurityDdlMsg m) {
+        const auto a = rig.ddl(forged(std::move(m)));
+        ASSERT_EQ(a.code, 0) << a.detail;
+    };
+    ok(rig.createRole("world_server"));
+    ok(rig.createUser("svc@eu-1", "a-long-password-1"));
+    ok(rig.grant(false, sec::GranteeKind::Role, "world_server", sec::Operation::Write, sec::ResourceType::Topic,
+                 sec::PatternKind::Prefix, "world."));
+    ok(rig.grant(false, sec::GranteeKind::User, "svc@eu-1", sec::Operation::Read, sec::ResourceType::Group,
+                 sec::PatternKind::Exact, "g-1"));
+    ok(rig.grant(false, sec::GranteeKind::User, "svc@eu-1", sec::Operation::Describe, sec::ResourceType::Cluster,
+                 sec::PatternKind::Exact, ""));
+    ok(rig.grantRole(false, "svc@eu-1", "world_server"));
+    {
+        auto m = rig.alterUser("svc@eu-1", Ch::AddPassword);
+        m.verifier = SecurityDdlRig::verifierFor("another-long-pw-2");
+        ok(std::move(m));
+    }
+    {
+        auto m = rig.alterUser("svc@eu-1", Ch::Disable);
+        m.force = 1;
+        ok(std::move(m));
+    }
+    ok(rig.alterUser("svc@eu-1", Ch::Enable));
+    {
+        auto m = rig.alterUser("svc@eu-1", Ch::DropPassword);
+        m.passwordIndex = 1;
+        ok(std::move(m));
+    }
+    {
+        auto m = rig.alterUser("svc@eu-1", Ch::SetPassword);
+        m.verifier = SecurityDdlRig::verifierFor("third-long-pw-3");
+        m.terminateSessions = 1;
+        ok(std::move(m));
+    }
+    {
+        auto m = rig.grant(true, sec::GranteeKind::Role, "world_server", sec::Operation::Write, sec::ResourceType::Topic,
+                           sec::PatternKind::Prefix, "world.");
+        m.force = 1;
+        ok(std::move(m));
+    }
+    ok(rig.grant(true, sec::GranteeKind::User, "svc@eu-1", sec::Operation::Describe, sec::ResourceType::Cluster,
+                 sec::PatternKind::Exact, ""));
+    ok(rig.grantRole(true, "svc@eu-1", "world_server"));
+    {
+        auto m = rig.simple(Op::DropRole, "world_server", "DROP ROLE world_server;");
+        m.force = 1;
+        ok(std::move(m));
+    }
+    ok(rig.simple(Op::DropUser, "svc@eu-1", "DROP USER svc;"));
+
+    const std::vector<std::string> want = {
+        "CREATE ROLE world_server;",
+        "CREATE USER 'svc@eu-1' WITH PASSWORD '<redacted>';",
+        "GRANT WRITE ON TOPIC PREFIX 'world.' TO ROLE world_server;",
+        "GRANT READ ON GROUP 'g-1' TO USER 'svc@eu-1';",
+        "GRANT DESCRIBE ON CLUSTER TO USER 'svc@eu-1';",
+        "GRANT ROLE world_server TO USER 'svc@eu-1';",
+        "ALTER USER 'svc@eu-1' ADD PASSWORD '<redacted>';",
+        "ALTER USER 'svc@eu-1' DISABLE FORCE;",
+        "ALTER USER 'svc@eu-1' ENABLE;",
+        "ALTER USER 'svc@eu-1' DROP PASSWORD 1;",
+        "ALTER USER 'svc@eu-1' SET PASSWORD '<redacted>' TERMINATE SESSIONS;",
+        "REVOKE WRITE ON TOPIC PREFIX 'world.' FROM ROLE world_server FORCE;",
+        "REVOKE DESCRIBE ON CLUSTER FROM USER 'svc@eu-1';",
+        "REVOKE ROLE world_server FROM USER 'svc@eu-1';",
+        "DROP ROLE world_server FORCE;",
+        "DROP USER 'svc@eu-1';",
+    };
+    const auto events = rig.recordedEvents();
+    ASSERT_EQ(events.size(), want.size());
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        EXPECT_EQ(events[i].event.statement, want[i]) << "offset " << events[i].offset;
+        EXPECT_FALSE(events[i].event.replayedFrom.has_value()) << "offset " << events[i].offset;
+    }
+}
+
+// A raw wire client is not bound by the QL lexer: a grant pattern may hold a quote (only "__" prefixes and > 249 bytes
+// are refused).  Copied raw into the rendered literal, the quote closes it and the audit text then reads as a SECOND
+// statement - GRANT ADMIN ON CLUSTER - that was never applied (the #228 forgery, through the pattern field).
+TEST(SecurityWritePathRegression, AQuoteInAGrantPatternCannotForgeASecondStatementAdversarialRegression) {
+    SecurityDdlRig rig("forged_pattern");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.ddl(rig.createRole("r")).code, 0);
+    const std::string inject = "x' TO ROLE r; GRANT ADMIN ON CLUSTER TO USER mallory; --";
+    auto a = rig.ddl(forged(rig.grant(false, sec::GranteeKind::Role, "r", sec::Operation::Read, sec::ResourceType::Group,
+                                      sec::PatternKind::Prefix, inject)));
+    ASSERT_EQ(a.code, 0) << a.detail;
+    a = rig.ddl(forged(rig.grant(false, sec::GranteeKind::Role, "r", sec::Operation::Read, sec::ResourceType::Group,
+                                 sec::PatternKind::Exact, inject)));
+    ASSERT_EQ(a.code, 0) << a.detail;
+    const auto events = rig.recordedEvents();
+    ASSERT_EQ(events.size(), 3u);
+    EXPECT_EQ(events[1].event.statement,
+              "GRANT READ ON GROUP PREFIX 'x'' TO ROLE r; GRANT ADMIN ON CLUSTER TO USER mallory; --' TO ROLE r;");
+    EXPECT_EQ(events[2].event.statement,
+              "GRANT READ ON GROUP 'x'' TO ROLE r; GRANT ADMIN ON CLUSTER TO USER mallory; --' TO ROLE r;");
+    // Read with SQL quoting, each is ONE statement naming the grant that was applied - nothing outside a literal forges.
+    EXPECT_EQ(outsideLiterals(events[1].event.statement), "GRANT READ ON GROUP PREFIX  TO ROLE r;");
+    EXPECT_EQ(outsideLiterals(events[2].event.statement), "GRANT READ ON GROUP  TO ROLE r;");
+}

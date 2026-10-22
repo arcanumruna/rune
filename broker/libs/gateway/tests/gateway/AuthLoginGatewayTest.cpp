@@ -1583,3 +1583,251 @@ TEST(SessionClosingSpillRegression, NoBackPressureClosesAtOnceAsBeforeRegression
     EXPECT_EQ(rig.gw.closingSessions(), 0u);
     EXPECT_EQ(rig.gw.egressSpillUsedBytesForTest(), 0u);
 }
+
+// ── Adversarial review of PR #525 (issue #119): every event against a Closing session ───────────────────────────────
+namespace {
+/// A spillable answer of about `blobBytes` for `sid` (a TopicSchemaResponse carrying an opaque blob).
+std::vector<uint8_t> bigAnswer(int64_t sid, int64_t corr, std::size_t blobBytes) {
+    std::vector<uint8_t> blob(blobBytes, 0x33);
+    pc::TopicSchemaResponse r;
+    r.sessionId = sid; r.correlationId = corr; r.topicId = 1; r.version = 1;
+    r.descriptorBlob = blob.data(); r.descriptorLen = static_cast<uint32_t>(blob.size());
+    std::vector<uint8_t> f(r.encodedSize());
+    r.encode(f.data());
+    return f;
+}
+std::vector<uint8_t> clientFirstFrame(int64_t sid, int64_t corr) {
+    pc::AuthClientFirst cf;
+    cf.sessionId = sid; cf.correlationId = corr; cf.username = "ws1"; cf.clientNonce = "nonce-closing";
+    std::vector<uint8_t> b(cf.encodedSize()); b.resize(cf.encode(b.data()));
+    return b;
+}
+std::vector<uint8_t> subscribeFrame(int64_t sid, int64_t corr) {
+    pc::Subscribe s;
+    s.sessionId = sid; s.correlationId = corr; s.topicId = 0; s.partition = 0; s.partitionKnown = 1; s.fromOffset = -1;
+    std::vector<uint8_t> b(s.encodedSize()); b.resize(s.encode(b.data()));
+    return b;
+}
+std::vector<uint8_t> disconnectFrame(int64_t sid, int64_t corr) {
+    pc::Disconnect d; d.sessionId = sid; d.correlationId = corr;
+    std::vector<uint8_t> b(pc::Disconnect::ENCODED_SIZE); b.resize(d.encode(b.data()));
+    return b;
+}
+}  // namespace
+
+// The auth-deadline reaper walks every session still AwaitingFirst / AwaitingFinal.  A login that failed under
+// back-pressure stays in the table (Closing) in that auth state: each later reap pass must not count it failed again.
+TEST(SessionClosingSpillRegression, TheAuthDeadlineReaperNeverRecountsAClosingLoginAdversarialRegression) {
+    Rig rig;
+    rig.reliable = true;
+    rig.refuse = true;
+    const auto o = rig.login("ws1", {kTestPasswordA, ""});   // the AuthServerFirst is spilled: no final is ever sent
+    ASSERT_EQ(rig.gw.spillStateForTest(o.sid), SpillState::Spilled);
+    const uint64_t failedBefore = rig.gw.loginsFailed();
+    constexpr int64_t kPastAuthDeadline = 2'000'000'000;     // the rig's auth deadline is 1 s; the lease is 10 s
+    rig.gw.reapExpiredForTest(kPastAuthDeadline);
+    ASSERT_EQ(rig.gw.spillStateForTest(o.sid), SpillState::Closing) << "precondition: the timed-out login's 44 is owed";
+    EXPECT_EQ(rig.gw.loginsFailed(), failedBefore + 1);
+    const std::size_t held = rig.gw.spilledBytesForTest(o.sid);
+    for (int i = 1; i <= 50; ++i) rig.gw.reapExpiredForTest(kPastAuthDeadline + i);
+    EXPECT_EQ(rig.gw.loginsFailed(), failedBefore + 1) << "every reap pass counted the Closing login failed again";
+    EXPECT_EQ(rig.gw.spilledBytesForTest(o.sid), held);
+    EXPECT_EQ(rig.gw.loginsAbandoned(), 0u) << "charged before the session ended";
+
+    rig.refuse = false;
+    rig.gw.drainPendingResponses(kPastAuthDeadline + 100);
+    EXPECT_FALSE(rig.gw.hasSessionForTest(o.sid));
+    const auto fin = lastFinal(rig, o.sid);
+    ASSERT_TRUE(fin.has_value()) << "the timed-out login's 44 was never delivered";
+    EXPECT_EQ(fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+    EXPECT_EQ(rig.gw.loginsAbandoned(), 1u) << "the unanswered first leg is charged once, at the close";
+    EXPECT_EQ(rig.gw.loginsFailed(), failedBefore + 1);
+}
+
+// A login and a Subscribe on a Closing session: consumed, counted, never executed, nothing
+// queued behind its last answer; a second end (stale security) on it sends nothing more.
+TEST(SessionClosingSpillRegression, LoginSubscribeAndASecondEndOnAClosingSessionDoNothingAdversarialRegression) {
+    Rig rig;
+    rig.withTopic(1);
+    rig.reliable = true;
+    const int64_t sid = authedSession(rig);
+    rig.refuse = true;
+    rig.gw.onSecurityHalted(0);
+    ASSERT_EQ(rig.gw.spillStateForTest(sid), SpillState::Closing);
+    const std::size_t held = rig.gw.spilledBytesForTest(sid);
+    const uint64_t answerDrops = rig.gw.closingAnswerDrops();
+    const uint64_t ended = rig.gw.sessionsEndedUnavailable();
+    const uint64_t failed = rig.gw.loginsFailed();
+
+    const auto first = clientFirstFrame(sid, 31);
+    EXPECT_TRUE(rig.gw.applyClientFrameForTest(first.data(), first.size()));
+    const auto sub = subscribeFrame(sid, 32);
+    EXPECT_TRUE(rig.gw.applyClientFrameForTest(sub.data(), sub.size()));
+    EXPECT_EQ(rig.gw.closingIngressDrops(), 2u);
+    EXPECT_EQ(rig.gw.loginsFailed(), failed) << "a login on a Closing session was executed";
+    EXPECT_EQ(rig.gw.spilledBytesForTest(sid), held) << "an answer was queued behind the last one";
+    EXPECT_EQ(rig.gw.closingAnswerDrops(), answerDrops) << "a frame was executed (its answer refused)";
+
+    rig.gw.endSessionsSecurityUnavailable();
+    EXPECT_EQ(rig.gw.sessionsEndedUnavailable(), ended) << "an already-ended session was ended again";
+    EXPECT_EQ(rig.gw.spilledBytesForTest(sid), held);
+    EXPECT_EQ(rig.gw.closingAnswerDrops(), answerDrops) << "a second last answer was sent to a Closing session";
+    EXPECT_EQ(rig.gw.closingSessions(), 1u);
+
+    rig.refuse = false;
+    rig.gw.drainPendingResponses(1);
+    EXPECT_EQ(errorsFrom(rig, sid, 0), (std::vector<std::pair<int64_t, int16_t>>{{0, kRevoked}}))
+        << "exactly the revoke's 46 - no answer to the login, the Subscribe or the stale end";
+    EXPECT_FALSE(rig.gw.hasSessionForTest(sid));
+    for (const Frame& f : rig.seen)
+        EXPECT_FALSE(f.sid == sid && (f.corr == 31 || f.corr == 32)) << "frame " << f.tid << " answered";
+}
+
+// Pool exhaustion: largestSpiller_ picks the Closing session (it holds the most).  It must leave Closing exactly
+// (count, ready list, pool bytes) and become Expiring - SessionExpired is its definite end - while the pusher survives.
+TEST(SessionClosingSpillRegression, PoolExhaustionExpiresTheLargestClosingSessionCleanlyAdversarialRegression) {
+    Rig rig;
+    rig.reliable = true;
+    rig.refuse = true;
+    const std::size_t unit = rune::gateway::SpillPool::bytesFor(bigAnswer(0, 0, 8 * 1024).size());
+    const std::size_t quota = ClientGateway::spillSizing().sessionQuota;
+    const int64_t closing = authedSession(rig);
+    std::vector<int64_t> holders;
+    for (int i = 0; i < 7; ++i) holders.push_back(rig.newSession());   // not authenticated: the halt never ends them
+    const int64_t pusher = rig.newSession();
+    int64_t corr = 0;
+    const auto fill = [&](int64_t sid, std::size_t target) {
+        for (int guard = 0; guard < 100'000 && rig.gw.spilledBytesForTest(sid) + unit <= target; ++guard) {
+            const auto f = bigAnswer(sid, ++corr, 8 * 1024);
+            ASSERT_TRUE(rig.gw.sendControlFrame(sid, f.data(), f.size()));
+        }
+    };
+    fill(closing, quota - 2 * unit);   // the largest holder, under its quota (room for the 46)
+    for (const int64_t h : holders) fill(h, quota - 6 * unit);
+    rig.gw.onSecurityHalted(0);
+    ASSERT_EQ(rig.gw.spillStateForTest(closing), SpillState::Closing);
+    ASSERT_EQ(rig.gw.closingSessions(), 1u);
+    ASSERT_EQ(rig.gw.noHangStats().spillExpiries, 0u) << "precondition: the pool is not full yet";
+
+    for (int k = 0; k < 10 && rig.gw.spillStateForTest(closing) == SpillState::Closing; ++k) {
+        const auto f = bigAnswer(pusher, 9000 + k, 40 * 1024);
+        ASSERT_TRUE(rig.gw.sendControlFrame(pusher, f.data(), f.size()));
+    }
+    EXPECT_EQ(rig.gw.spillStateForTest(closing), SpillState::Expiring) << "the largest (Closing) holder was not expired";
+    EXPECT_EQ(rig.gw.closingSessions(), 0u) << "the Closing count leaked through the expiry";
+    EXPECT_EQ(rig.gw.spilledBytesForTest(closing), 0u);
+    EXPECT_EQ(rig.gw.spillStateForTest(pusher), SpillState::Spilled) << "the pusher was expired instead";
+    EXPECT_EQ(rig.gw.spillReadySessionsForTest(), holders.size() + 1);
+
+    rig.refuse = false;
+    for (int i = 0; i < 4 && rig.gw.spillReadySessionsForTest() != 0; ++i) rig.gw.drainPendingResponses(1 + i);
+    EXPECT_FALSE(rig.gw.hasSessionForTest(closing)) << "the expired session was never closed";
+    const auto errs = errorsFrom(rig, closing, 0);
+    ASSERT_EQ(errs.size(), 1u);
+    EXPECT_EQ(errs[0].second, static_cast<int16_t>(pc::ErrorCode::SessionExpired));
+    EXPECT_TRUE(rig.gw.hasSessionForTest(pusher));
+    EXPECT_EQ(rig.gw.spillReadySessionsForTest(), 0u);
+    EXPECT_EQ(rig.gw.egressSpillUsedBytesForTest(), 0u);
+    EXPECT_EQ(rig.gw.noHangStats().spillExpiring, 0u);
+}
+
+// Every way out of Closing - the lease reaper, an explicit close, the drain - leaves the count, the ready list and the
+// pool exact (a missed decrement would keep every later frame on the slow admit path forever).
+TEST(SessionClosingSpillRegression, EveryExitFromClosingLeavesNoStateBehindAdversarialRegression) {
+    Rig rig;
+    rig.reliable = true;
+    constexpr int64_t kLater = 5'000'000'000;
+    const int64_t reaped = authedSession(rig);                 // last seen at 0
+    const int64_t closed = rig.newSession("10.0.0.9", kLater);  // last seen at kLater
+    rig.gw.setSessionAuthForTest(closed, AuthAuthenticated{7, "u", PermissionTable::allowAll(), {}});
+    const int64_t drained = rig.newSession("10.0.0.9", kLater);
+    rig.gw.setSessionAuthForTest(drained, AuthAuthenticated{7, "u", PermissionTable::allowAll(), {}});
+    rig.gw.setNowNsForTest(kLater);
+    rig.refuse = true;
+    rig.gw.onSecurityHalted(0);
+    ASSERT_EQ(rig.gw.closingSessions(), 3u);
+
+    rig.gw.reapExpiredForTest(ClientGateway::kDefaultSessionTimeoutNs + 1);   // only `reaped` is past its lease
+    EXPECT_FALSE(rig.gw.hasSessionForTest(reaped));
+    EXPECT_TRUE(rig.gw.hasSessionForTest(closed));
+    EXPECT_EQ(rig.gw.closingSessions(), 2u);
+    EXPECT_EQ(rig.gw.spillReadySessionsForTest(), 2u);
+
+    rig.gw.closeSessionForTest(closed);
+    EXPECT_EQ(rig.gw.closingSessions(), 1u);
+    EXPECT_EQ(rig.gw.spillReadySessionsForTest(), 1u);
+
+    rig.refuse = false;
+    rig.gw.drainPendingResponses(kLater + 1);
+    EXPECT_FALSE(rig.gw.hasSessionForTest(drained));
+    EXPECT_EQ(errorsFrom(rig, drained, 0), (std::vector<std::pair<int64_t, int16_t>>{{0, kRevoked}}));
+    EXPECT_EQ(rig.gw.closingSessions(), 0u);
+    EXPECT_EQ(rig.gw.spillReadySessionsForTest(), 0u);
+    EXPECT_EQ(rig.gw.egressSpillUsedBytesForTest(), 0u);
+    EXPECT_EQ(rig.gw.closingDeadlineCloses(), 0u);
+}
+
+// One drain pass whose ready list is [Closing, Spilled, Closing]: both Closing sessions are closed inside the walk
+// (head and tail of the list), the Spilled one in between is delivered and stays open - the walk never loses `next`.
+TEST(SessionClosingSpillRegression, OneDrainPassClosesClosingSessionsAroundASpilledOneAdversarialRegression) {
+    Rig rig;
+    rig.reliable = true;
+    rig.refuse = true;
+    const int64_t c1 = authedSession(rig);
+    const int64_t mid = rig.newSession();   // awaiting login: the halt leaves it alone
+    const int64_t c2 = authedSession(rig);
+    const auto f1 = bigAnswer(c1, 1, 64);
+    ASSERT_TRUE(rig.gw.sendControlFrame(c1, f1.data(), f1.size()));      // c1 joins the ready list first
+    const auto fm = bigAnswer(mid, 2, 64);
+    ASSERT_TRUE(rig.gw.sendControlFrame(mid, fm.data(), fm.size()));
+    rig.gw.onSecurityHalted(0);                                           // c2 joins last
+    ASSERT_EQ(rig.gw.spillStateForTest(c1), SpillState::Closing);
+    ASSERT_EQ(rig.gw.spillStateForTest(mid), SpillState::Spilled);
+    ASSERT_EQ(rig.gw.spillStateForTest(c2), SpillState::Closing);
+    ASSERT_EQ(rig.gw.spillReadySessionsForTest(), 3u);
+
+    rig.refuse = false;
+    EXPECT_EQ(rig.gw.drainPendingResponses(1), 4) << "c1: its answer + 46, mid: 1, c2: 46";
+    EXPECT_FALSE(rig.gw.hasSessionForTest(c1));
+    EXPECT_FALSE(rig.gw.hasSessionForTest(c2));
+    ASSERT_TRUE(rig.gw.hasSessionForTest(mid));
+    EXPECT_EQ(rig.gw.spillStateForTest(mid), SpillState::Normal);
+    EXPECT_EQ(rig.gw.closingSessions(), 0u);
+    EXPECT_EQ(rig.gw.spillReadySessionsForTest(), 0u);
+    EXPECT_EQ(rig.gw.egressSpillUsedBytesForTest(), 0u);
+    // The list is intact afterwards: a new spill is linked and drained normally.
+    rig.refuse = true;
+    ASSERT_TRUE(rig.gw.sendControlFrame(mid, fm.data(), fm.size()));
+    EXPECT_EQ(rig.gw.spillReadySessionsForTest(), 1u);
+    rig.refuse = false;
+    EXPECT_EQ(rig.gw.drainPendingResponses(2), 1);
+    EXPECT_EQ(rig.gw.spillReadySessionsForTest(), 0u);
+}
+
+// An encrypted Closing session: a plaintext Disconnect is unauthenticated at the gate (session ids are guessable) and
+// must not end it; it ends at its deadline - exactly once, and at the deadline, never before.
+TEST(SessionClosingSpillRegression, ASpoofedDisconnectNeverEndsAnEncryptedClosingSessionAdversarialRegression) {
+    Rig rig;
+    rig.reliable = true;
+    constexpr int64_t t0 = 7'000;
+    rig.gw.setNowNsForTest(t0);
+    const int64_t sid = authedSession(rig);
+    rig.refuse = true;
+    rig.gw.onSecurityHalted(0);
+    ASSERT_EQ(rig.gw.spillStateForTest(sid), SpillState::Closing);
+    rig.gw.sessionCryptoForTest(sid)->encrypted = true;
+    const auto d = disconnectFrame(sid, 77);
+    EXPECT_TRUE(rig.gw.applyClientFrameForTest(d.data(), d.size())) << "consumed (dropped), not deferred";
+    EXPECT_TRUE(rig.gw.hasSessionForTest(sid)) << "a forged plaintext Disconnect ended an encrypted session";
+    EXPECT_EQ(rig.gw.closingIngressDrops(), 1u);
+    EXPECT_EQ(rig.gw.closingSessions(), 1u);
+    const int64_t deadline = t0 + ClientGateway::kDefaultSessionTimeoutNs;
+    for (int i = 0; i < 3; ++i) rig.gw.drainPendingResponses(deadline - 1);
+    EXPECT_TRUE(rig.gw.hasSessionForTest(sid)) << "closed before its deadline";
+    rig.gw.drainPendingResponses(deadline);
+    EXPECT_FALSE(rig.gw.hasSessionForTest(sid));
+    rig.gw.drainPendingResponses(deadline + 1);
+    EXPECT_EQ(rig.gw.closingDeadlineCloses(), 1u);
+    EXPECT_EQ(rig.gw.closingSessions(), 0u);
+    EXPECT_EQ(rig.gw.egressSpillUsedBytesForTest(), 0u);
+}

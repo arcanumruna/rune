@@ -15,7 +15,14 @@ bool plainIdent(std::string_view n) noexcept {
     }
     return true;
 }
-std::string ident(std::string_view n) { return plainIdent(n) ? std::string(n) : "'" + std::string(n) + "'"; }
+// A string literal: a quote inside is doubled (SQL), so no name or pattern can close the literal and make the recorded
+// text read as another statement (PR #525 review: a raw wire client's pattern is not bound by the QL lexer).
+std::string quoted(std::string_view n) {
+    std::string out = "'";
+    for (const char c : n) { out += c; if (c == '\'') out += '\''; }
+    return out + "'";
+}
+std::string ident(std::string_view n) { return plainIdent(n) ? std::string(n) : quoted(n); }
 
 // SecurityOperation: Read 0, Write 1, Create 2, Alter 3, Drop 4, Describe 5, Admin 6.
 const char* opText(uint8_t o) noexcept {
@@ -38,7 +45,7 @@ bool resource(uint8_t type, uint8_t patternKind, std::string_view pattern, std::
         case 4: t = "TRANSACTIONAL_ID"; break;
         default: return false;
     }
-    out = std::string(t) + (patternKind == 1 ? " PREFIX '" + std::string(pattern) + "'" : " " + ident(pattern));
+    out = std::string(t) + (patternKind == 1 ? " PREFIX " + quoted(pattern) : " " + ident(pattern));
     return true;
 }
 

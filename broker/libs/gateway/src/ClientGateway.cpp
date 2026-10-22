@@ -8753,6 +8753,8 @@ void ClientGateway::reapAuthDeadlines_(int64_t nowNs)
     if (authMode_ != GatewayAuthMode::Required) return;
     authReapScratch_.clear();
     sessions_.forEach([&](Session& s) {
+        // PR #525 review: a Closing session already failed its login (its 44 is owed): never failed - and counted - again.
+        if (s.spill.state == SpillState::Closing) [[unlikely]] return;
         int64_t deadline = INT64_MAX;
         if (const auto* a = std::get_if<AuthAwaitingFirst>(&s.auth)) deadline = a->deadlineNs;
         else if (const auto* b = std::get_if<AuthAwaitingFinal>(&s.auth)) deadline = b->deadlineNs;
