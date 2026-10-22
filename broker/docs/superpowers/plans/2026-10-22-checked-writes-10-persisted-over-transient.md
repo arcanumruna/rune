@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A persisted view may read a transient topic. `CreateView` and `AlterView` stop sending `ViewSourceTransient` (37). A persisted view over a keyless transient source is refused with `InvalidRequest`. After a restart the view keeps its checkpointed rows and folds whatever the ring still holds. Every source reset and every eviction is counted, never silent (spec §9a, G7b).
+**Goal:** A persisted view may read a transient topic. `CreateView` and `AlterView` stop sending `ViewSourceTransient` (37). A view over a keyless topic stays refused by Part 02's rule (§4, P6: `ViewKeyInvalid` (35) "view source needs a key"), so this part adds no keyless refusal of its own. After a restart the view keeps its checkpointed rows and folds whatever the ring still holds. Every source reset and every eviction is counted, never silent (spec §9a, G7b).
 
 **Architecture:** This is mostly a DDL change. The admin rule at `AdminWorker::viewDef_` (`broker/libs/node/src/AdminWorker.cpp:1230-1233`) changes from "transient source ⇒ transient view" to "transient source and persisted view ⇒ the source must be keyed". `viewDef_` is shared by create and alter, so one edit covers both. The worker side already works:
 - A persisted view checkpoints to its own file, whatever its source's persistence.
@@ -13,21 +13,23 @@ The only worker change is in that function's two "invariant breach" warnings. Ea
 
 **Tech Stack:** C++23, GoogleTest (`TEST_P` for the matrices), CMake/Ninja, real Aeron with in-process `BrokerNode`s (`OneBroker` in shard mode, `ThreeNodes`), and docker compose on the shared VM.
 
-**Spec:** `broker/docs/superpowers/specs/2026-10-22-rune-checked-writes-and-view-constraints-design.md`. This part implements §9a (Part F), the six §15 "persisted views over transient sources" bullets and G7b. The binding cross-part contract is `broker/docs/superpowers/plans/2026-10-22-checked-writes-00-overview.md`: index row 10, SD9, C16 stat 36. The interfaces it consumes come from Part 01 (`broker/docs/superpowers/plans/2026-10-22-checked-writes-01-aborted-fold.md`): `FoldSkip`, the checkpoint marker (AD5), the AD5a recovery rule (which replaces the overview's SD15) and `foldCursorForTest`. Executors read all three.
+**Spec:** `broker/docs/superpowers/specs/2026-10-22-rune-checked-writes-and-view-constraints-design.md`. This part implements §9a (Part F), the six §15 "persisted views over transient sources" bullets and G7b. The binding cross-part contract is `broker/docs/superpowers/plans/2026-10-22-checked-writes-00-overview.md`: index row 10, SD9, C16 stat 36, and the controller rulings R10a–R10e. The interfaces it consumes come from Part 01 (`broker/docs/superpowers/plans/2026-10-22-checked-writes-01-aborted-fold.md`): `FoldSkip`, the checkpoint marker (AD5), the AD5a recovery rule (which replaces the overview's SD15) and `foldCursorForTest`. Executors read all three.
 
 ---
 
 ## Execution context
 
 - **Repo and paths.** Every path is relative to the monorepo root, and every command runs from it.
-- **Branch.** `feature/checked-writes-10-persisted-over-transient`. Cut it from the latest `main` (`git fetch && git switch -c feature/checked-writes-10-persisted-over-transient origin/main`) **after Part 01 has merged**. Merge `main` in again before review. Parts 02 and 03 may land before or after this part; the steps say what changes in each case.
+- **Branch.** `feature/checked-writes-10-persisted-over-transient`. Cut it from the latest `main` (`git fetch && git switch -c feature/checked-writes-10-persisted-over-transient origin/main`) **after Parts 01 and 03 have merged** (ruling R10c; 03 implies 02). Merge `main` in again before review.
 - **Preconditions.** Each must hit before Task 1; otherwise stop and tell the controller.
   - `grep -n "return Rejected(reject(kViewSourceTransient));" broker/libs/node/src/AdminWorker.cpp`: 1 hit, today line 1233.
   - `grep -c "invariant breach" broker/libs/node/src/WorkerViewSet.cpp`: 2.
   - `grep -n "foldCursorForTest" broker/libs/node/include/rune/node/WorkerViewSet.h`: 1 hit, from Part 01.
   - `grep -n "enum class CheckpointMark" broker/libs/view/include/rune/view/ViewCheckpoint.h`: 1 hit, from Part 01.
+  - `grep -n "kAcksWireView" protocol/include/rune/protocol/client/DataMessages.h`: 1 hit, from Part 03.
+  - `grep -n "featureRefusal" broker/libs/node/include/rune/node/TopicFeatureRules.h`: ≥ 1 hit, from Part 02.
   - `grep -n "kViewSourceTransient" broker/libs/node/tests/node/DdlOccupantMatrixRegressionTest.cpp`: 1 hit, line 442.
-- **Line numbers** are cited against `main` before Part 01. Part 01 edits `WorkerViewSet.{h,cpp}`, so locate each edit by the quoted text or by the function name.
+- **Line numbers** are cited against `main` before Parts 01–03. Those parts edit `WorkerViewSet.{h,cpp}`, `AdminWorker.cpp` and `Worker.h`, so locate each edit by the quoted text or by the function name.
 - **Builds.** These are already configured. If one is missing, stop and tell the controller.
   - `build/root`: Ninja, Debug, `BUILD_TESTING=ON`. Build with `cmake --build build/root -j14 --target <t>`. Test with `ctest --test-dir build/root -R <filter> -j14 --output-on-failure`.
   - `build/sub-client-cpp`: examples on.
@@ -93,8 +95,9 @@ These are copied verbatim from the overview (Plan 00). Every task implicitly inc
 
 ## Rulings this part depends on (restated from Plan 00 and Part 01, binding)
 
-- **Index row 10.** "37 lifted; the keyless-source refusal; the `reconcileTransient_` logging change (`WorkerViewSet.cpp:367`); docs." The part depends on 01 only.
-- **SD9 — Transient topics.** `key.index`, intents and `autoincrement` are refused at DDL time on transient topics with `InvalidRequest`, "<feature> needs a persisted topic". Constraints over transient sources stay a non-goal (§2, §9a last bullet). This part lifts 37, so a *persisted* view over a transient source becomes legal, but it adds none of those features. Each refusal ships with the DDL that introduces its feature: 05 (key index; intents need it), 06 (`autoincrement`) and 09 (`unique` / `check` over a transient source). This part only records the boundary in the docs (Task 7). See Gaps.
+- **Index row 10.** "37 lifted; the keyless-source refusal; the `reconcileTransient_` logging change (`WorkerViewSet.cpp:367`); docs." Ruling R10c: the part runs after 01 **and** 03. R10b: "the keyless-source refusal" is Part 02's (below).
+- **SD9 — Transient topics (ruling R10a).** `key.index`, intents and `autoincrement` are refused at DDL time on transient topics with `InvalidRequest`, "<feature> needs a persisted topic". Constraints over transient sources stay a non-goal (§2, §9a last bullet). The refusals are owned by Part 02's `featureRefusal` table (`broker/libs/node/include/rune/node/TopicFeatureRules.h`: `KeyIndex`, `AutoIncrement` and `Constraint` × transient). 05 calls it for `key.index` (intents need a key index, so they are refused with it), 06 for `autoincrement`, and 09 for `unique` / `check` over a transient source. This part lifts 37, adds none of those features, and only records the boundary in the docs (Task 7).
+- **R10b — Keyless sources.** Spec §4 (Part 02, P6) refuses every view over a keyless typed topic with `ViewKeyInvalid` (35) "view source needs a key". That wins over §9a's "a transient view over a keyless transient source is unchanged" and over §9a's own keyless refusal (`InvalidRequest`), which can no longer be reached and is not built. This is spec wording the owner has to settle (Gaps).
 - **SD13 / C16.** Stat 35 is `transientRecordsEvicted` and stat 36 is `transientSourceResets`. Both exist today (`broker/libs/node/include/rune/node/WorkerViewSet.h:137-138`), and Part 08 serves them over `GetStats`. Part 10 widens what 36 counts (PD3).
 - **Part 01, AD5 and AD5a (replace SD15).**
   - Every checkpoint record written by a build with Part 01 carries the `…Marked` magic.
@@ -107,12 +110,9 @@ These are copied verbatim from the overview (Plan 00). Every task implicitly inc
 
 ## Decisions (binding for executors; each is an obvious choice recorded so a reviewer can overturn it)
 
-- **PD1 — The keyless refusal.**
-  - **Where.** `viewDef_` replaces the 37 check, inside the per-source loop, at the same position: after `ViewSourceIsView` and `ViewSourceNotFound`.
-  - **The rule.** If the source topic is `cat::Persistence::Transient`, the requested `persistence == 0` (persisted), and `t->schema->keyField.empty()`, then `Rejected(reject(kInvalidRequest, "a persisted view over a transient source needs a keyed source"))`.
-  - **Scope.** `buildCreateView_` and `buildAlterView_` both call `viewDef_`, so the rule covers create, and alter towards persisted.
-  - **Exempt cases.** A transient view over a keyless transient source is unchanged. So is any view over a keyless disk source (§9a: "A transient view over a keyless transient source is unchanged").
-  - **Part 02's keyless refusal (§4).** If Part 02 has already merged a refusal of views over keyless topics, both rules apply to a persisted view over a keyless transient source. This part's check stays first in the loop, so the message names the transient cause. The Gaps section records the conflict.
+- **PD1 — Lifting 37; keyless sources left to Part 02.**
+  - **What changes.** The 37 check in `viewDef_`'s per-source loop (`if (t->persistence == cat::Persistence::Transient && persistence == 0) return Rejected(reject(kViewSourceTransient));`) is deleted. Nothing replaces it. `buildCreateView_` and `buildAlterView_` both call `viewDef_`, so create and alter towards persisted are both lifted.
+  - **Keyless sources (R10b).** Part 02's §4 refusal answers `ViewKeyInvalid` (35) "view source needs a key" for every view over a keyless typed topic, disk or transient, persisted or transient. This part adds no rule and must not change that order or message. Its tests pin that a keyless transient source still gets 35, never 37.
 - **PD2 — Code 37 becomes reserved.**
   - **AdminWorker.** The file-local constant `kViewSourceTransient` (`AdminWorker.cpp:53`) is deleted. A one-line comment takes its place: `// 37 (ViewSourceTransient) is reserved and never sent: a persisted view may read a transient source (checked writes Part 10)`.
   - **Kept as is.** The protocol enum value `ErrorCode::ViewSourceTransient = 37` (`protocol/include/rune/protocol/client/Protocol.h:165`), its CLI name (`client-cpp/src/cli/QlEngine.cpp:142`) and its pin (`protocol/tests/protocol/client/ViewMessagesTest.cpp:198`) stay, because the enum is append-only. Only the comments change.
@@ -140,9 +140,7 @@ These are copied verbatim from the overview (Plan 00). Every task implicitly inc
   - The two changed branches run once per source reset.
   - The admin check is control plane.
   - No bench is rerun and no allocation gate is added (Task 9 records this).
-- **PD8 — The `View` ack cell needs Part 03.** "The `View` ack on a transient source" uses `Acks::View` (C4, Part 03).
-  - **03 merged when this branch is cut** (precondition: `grep -n "kAcksWireView" protocol/include/rune/protocol/client/DataMessages.h` hits): Task 6 runs.
-  - **Otherwise:** Task 6 is skipped and the controller reassigns the cell (Gaps).
+- **PD8 — The `View` ack cell.** "The `View` ack on a transient source" uses `Acks::View` (C4, Part 03). Part 03 has merged (R10c), so Task 6 always runs.
 
 ## Review Focus
 
@@ -160,7 +158,7 @@ These five inputs are the ones most likely to bite a user, and the spec does not
 
 ## Interaction matrix
 
-Plan 00 assigns Part 10 the six §15 bullets "persisted views over transient sources". It reserves no `Op`/`Entity` id range for Part 10 in `CheckedWritesMatrixExpectations.h` (Gaps). No verdict view is involved, so this part's matrices live in their own binaries.
+Plan 00 assigns Part 10 the six §15 bullets "persisted views over transient sources". It reserves no `Op`/`Entity` id range for Part 10 in `CheckedWritesMatrixExpectations.h` (ruling R10e). No verdict view is involved, so this part's matrices live in their own binaries.
 
 **§15 bullet → test:**
 
@@ -169,12 +167,12 @@ Plan 00 assigns Part 10 the six §15 bullets "persisted views over transient sou
 | a full cluster restart keeps the checkpoint rows, and the cursor restarts at the new ring (Replace, `count(*)`, `Min`) | matrix timings `FullRestartEmptyRing`, `FullRestartRingBelowOldCursor`, `FullRestartRingPastOldCursor`, `SecondFullRestart` (Task 3); `CheckedWritesTransientViewBrokerRegression.FullRestartKeepsTheCheckpointRowsAndFoldsTheNewRingRegression` (Task 5); docker leg (Task 8) |
 | a single-node restart with the ring re-replicated: a re-fold of already-folded records doesn't double count | matrix timing `NodeRestartReReplicatedRing` (Task 3); Review Focus 3 (Task 2) |
 | failover to a node with an older checkpoint while the ring evicted part of the gap: stale rows stay, and `transientRecordsEvicted` counts the gap | matrix timings `FailoverLiveCursorEvicted`, `NodeRestartRingStartAboveCheckpoint` (Task 3); Review Focus 2 (Task 2); `CheckedWritesTransientViewFailoverBrokerRegression.LeaderCrashServesTheRowsFromTheNewLeadersRingRegression` (Task 5) |
-| a keyless transient source is refused for a persisted view | DDL matrix (Task 1); `…BrokerRegression.PersistedViewOverAKeylessTransientTopicIsRefusedRegression` (Task 5) |
-| the `View` ack on a transient source | `…BrokerRegression.ViewAckOnAPersistedViewOverATransientTopicMeansFoldedRegression` (Task 6, PD8) |
+| a keyless transient source is refused for a persisted view | refused for every view by Part 02 (R10b, code 35): DDL matrix (Task 1); `…BrokerRegression.ViewsOverAKeylessTransientTopicAreRefusedRegression` (Task 5) |
+| the `View` ack on a transient source | `…BrokerRegression.ViewAckOnAPersistedViewOverATransientTopicMeansFoldedRegression` (Task 6) |
 | code 37 is never sent | every DDL matrix cell (Task 1); the DDL and catalog stress models (Task 1); the docker leg (Task 8) |
 
-**DDL matrix (`rune_ddl_conformance_tests`, Task 1):** source × op. There are 4 sources: `TransientKeyed`, `TransientKeyless`, `DiskKeyed` and `DiskKeyless`. There are 4 ops: `CreatePersisted`, `CreateTransient`, `AlterTransientToPersisted` and `AlterPersistedToTransient`. That gives 16 combinations, less the one not-applicable cell (`TransientKeyless × AlterPersistedToTransient`: its persisted view cannot be created), so **15 cells**. The count is pinned by `CheckedWritesTransientViewDdlCountRegression.CellCountIsPinned`.
-- **Expected answer.** `InvalidRequest` with the PD1 detail for `TransientKeyless × {CreatePersisted, AlterTransientToPersisted}`. `Ok` everywhere else.
+**DDL matrix (`rune_ddl_conformance_tests`, Task 1):** source × op. There are 4 sources: `TransientKeyed`, `TransientKeyless`, `DiskKeyed` and `DiskKeyless`. There are 4 ops: `CreatePersisted`, `CreateTransient`, `AlterTransientToPersisted` and `AlterPersistedToTransient`. That gives 16 combinations. The four `Alter*` cells over a keyless source are not applicable, because no view over a keyless topic can be created (R10b). That leaves **12 cells**. The count is pinned by `CheckedWritesTransientViewDdlCountRegression.CellCountIsPinned`.
+- **Expected answer.** `ViewKeyInvalid` (35) with detail "view source needs a key" for `{TransientKeyless, DiskKeyless} × {CreatePersisted, CreateTransient}` (Part 02's rule, R10b). `Ok` everywhere else.
 - **Every cell asserts:**
   - the answer is never 37;
   - a refusal appends no event and leaves the catalog unchanged;
@@ -206,7 +204,7 @@ Each cell writes H1, which is 6 records over keys 1–4 and groups 10, 20 and 30
 **Model check (Task 3):** `CheckedWritesTransientViewModelRegression.RandomHistoriesMatchThePerKeyModel` runs seeds 1–200. Each seed is 40 random steps drawn from: write a batch of 1–3 records (upsert, overwrite, tombstone or group move over keys 1–8); full restart; node restart (same lineage, with 0–3 evicted); failover (0–3 evicted); ring recreated; ring cut below the cursor (generation + 1). All three views are installed together. Invariants (a), (c) and (e) are checked after every step, and the summed counters are checked against the model's count of resets and evictions. A failure prints the seed and the step list.
 
 **Real brokers and e2e:**
-- `rune_client_broker_tests` (Task 5, plus Task 6 under PD8): `OneBroker`, shard mode.
+- `rune_client_broker_tests` (Tasks 5 and 6): `OneBroker`, shard mode.
 - `rune_client_failover_broker_tests` (Task 5): `ThreeNodes`.
 - `broker/docker/view-engine-e2e.sh` (Task 8): two persisted views over `presence_t` across the broker restart.
 
@@ -214,10 +212,10 @@ Each cell writes H1, which is 6 records over keys 1–4 and groups 10, 20 and 30
 
 | File | C/M | Responsibility |
 |---|---|---|
-| `broker/libs/node/src/AdminWorker.cpp:53`, `:1230-1233` | M | 37 lifted, PD1 refusal, PD2 constant (Task 1) |
+| `broker/libs/node/src/AdminWorker.cpp:53`, `:1230-1233` | M | 37 lifted (PD1), PD2 constant (Task 1) |
 | `broker/libs/node/include/rune/node/AdminWorker.h:65` | M | code list comment (Task 1) |
 | `broker/libs/node/tests/integration/CreateViewRegressionTest.cpp:492-528` | M | the 37 test becomes the accepted and refused tests (Task 1) |
-| `broker/libs/node/tests/node/DdlOccupantMatrixRegressionTest.cpp:436-484` | M | `kSourceCases` rows, detail check, the 15-cell DDL matrix (Task 1) |
+| `broker/libs/node/tests/node/DdlOccupantMatrixRegressionTest.cpp:436-484` | M | `kSourceCases` rows, detail check, the 12-cell DDL matrix (Task 1) |
 | `broker/libs/node/tests/node/DdlStressRegressionTest.cpp:163`, `broker/libs/node/tests/support/CatalogModel.h:425-435` | M | the models drop the 37 rule (Task 1) |
 | `broker/libs/node/src/WorkerViewSet.cpp:367-439`, `broker/libs/node/include/rune/node/WorkerViewSet.h:156-184` | M | PD3 (Task 2) |
 | `broker/libs/node/tests/node/WorkerViewSetTest.cpp:1009-1043` | M | the above-end test renamed and its counter asserted (Task 2) |
@@ -236,21 +234,20 @@ Each cell writes H1, which is 6 records over keys 1–4 and groups 10, 20 and 30
 - **Test binary** `rune_checked_writes_transient_view_tests` (`broker/libs/node/tests/integration/PersistedOverTransientViewTest.cpp`). It sits outside `tests/node/CheckedWrites*Test.cpp`, so it never joins Part 02's `rune_checked_writes_tests`.
 - **Test support** `broker/libs/node/tests/support/TransientViewRig.h` (namespace `transient_view_rig`, test-only; Task 2 Interfaces).
 - **`view_probe` exit codes 180–189** (setup 180–185, `verify_restart` 186–189) and the sentinels `PERSISTED-OVER-TRANSIENT: OK` and `PERSISTED-OVER-TRANSIENT-RESTART: OK` (Task 8). Part 01 holds 170–179.
-- **The admin detail string** "a persisted view over a transient source needs a keyed source" (PD1). It is the client-visible `detail`.
 
 ---
 
 ## Phase 1 — The rule and the recovery semantics
 
-### Task 1: Lift 37 and refuse a persisted view over a keyless transient source
+### Task 1: Lift 37 (keyless sources stay Part 02's)
 
 **Files:**
 - Modify: `broker/libs/node/src/AdminWorker.cpp:53`, `:1230-1233`; `broker/libs/node/include/rune/node/AdminWorker.h:65`
 - Modify (tests): `broker/libs/node/tests/integration/CreateViewRegressionTest.cpp:492-528`, `broker/libs/node/tests/node/DdlOccupantMatrixRegressionTest.cpp:436-484`, `broker/libs/node/tests/node/DdlStressRegressionTest.cpp:163`, `broker/libs/node/tests/support/CatalogModel.h:425-435`
 
 **Interfaces:**
-- Consumes: `AdminWorker::viewDef_` (`AdminWorker.cpp:1212`), `reject(kInvalidRequest, std::string)`, `DdlHarness::submit`, `submitRawDefine`, `submitRawView`, `submitRawAlterView`, `response(corr)->detail`, `views().byName`, `restart()` (`broker/libs/node/tests/support/DdlHarness.h`).
-- Produces: the PD1 rule and detail string. Every later task relies on "a persisted view over a keyed transient topic is accepted".
+- Consumes: `AdminWorker::viewDef_` (`AdminWorker.cpp:1212`), Part 02's keyless refusal (35, "view source needs a key"), `DdlHarness::submit`, `submitRawDefine`, `submitRawView`, `submitRawAlterView`, `response(corr)->detail`, `views().byName`, `restart()` (`broker/libs/node/tests/support/DdlHarness.h`).
+- Produces: the lifted rule (PD1). Every later task relies on "a persisted view over a keyed transient topic is accepted".
 
 - [ ] **Step 1: Write the failing tests.**
 
@@ -270,43 +267,44 @@ TEST_F(CheckedWritesTransientViewCreateRegression, PersistedViewOverTransientSou
     ASSERT_NE(viewRegistry_->byName("char_hp"), nullptr) << "the view survives the boot replay";
     EXPECT_EQ(viewRegistry_->byName("char_hp")->persistence, 0u);
 }
-TEST_F(CheckedWritesTransientViewCreateRegression, PersistedViewOverKeylessTransientSourceIsRefusedRegression) {
+TEST_F(CheckedWritesTransientViewCreateRegression, PersistedViewOverKeylessTransientSourceIsStill35Regression) {
     // define "events_t": persistence 1, keyField "" (blob = characterBlob()); CreateView persisted over it
-    EXPECT_EQ(lastViewError_, 39u);
+    EXPECT_EQ(lastViewError_, 35u) << "Part 02's keyless rule (R10b), never 37";
     EXPECT_EQ(lastViewTopicId_, -1);
     EXPECT_EQ(viewRegistry_->byName("ev_view"), nullptr);
     EXPECT_EQ(events(), eventsBefore) << "a refused view appends nothing";
     EXPECT_EQ(viewSet_.drainInstalls(), 0);
 }
-TEST_F(CheckedWritesTransientViewCreateRegression, TransientViewOverKeylessTransientSourceIsUnchangedRegression)
-    // same source; CreateView persistence 1 -> lastViewError_ == 0, one install
+TEST_F(CheckedWritesTransientViewCreateRegression, TransientViewOverKeylessTransientSourceIsStill35Regression)
+    // same source; CreateView persistence 1 -> lastViewError_ == 35, no event, no install (R10b)
 ```
 
   `DdlOccupantMatrixRegressionTest.cpp`:
   - `SourceCase` appends `const char* detail = nullptr;`.
   - The row `TransientSource_PersistedView` becomes `kOk`.
   - Rows are added for the sources `ktsrc` (transient, keyless) and `kdsrc` (disk, keyless), both created with `submitRawDefine` (keyField `""`, `charBlob()`, persistence 1 and 0) in the `ViewOverSource` setup:
-    - `{"KeylessTransientSource_PersistedView", "ktsrc", Op::ViewPersisted, kInvalidRequest, "a persisted view over a transient source needs a keyed source"}`
-    - `{"KeylessTransientSource_TransientView", "ktsrc", Op::ViewTransient, kOk}`
-    - `{"KeylessDiskSource_PersistedView", "kdsrc", Op::ViewPersisted, kOk}`
-    - `{"KeylessDiskSource_TransientView", "kdsrc", Op::ViewTransient, kOk}`
-  - `ViewOverSource` gains `if (c.detail) EXPECT_EQ(h.response(corr)->detail, c.detail);` and `EXPECT_NE(h.response(corr)->err, kViewSourceTransient) << "37 is never sent";`. Its after-restart re-check (`:474-480`) also runs for `c.want == kInvalidRequest`.
+    - `{"KeylessTransientSource_PersistedView", "ktsrc", Op::ViewPersisted, 35, "view source needs a key"}`
+    - `{"KeylessTransientSource_TransientView", "ktsrc", Op::ViewTransient, 35, "view source needs a key"}`
+    - `{"KeylessDiskSource_PersistedView", "kdsrc", Op::ViewPersisted, 35, "view source needs a key"}`
+    - `{"KeylessDiskSource_TransientView", "kdsrc", Op::ViewTransient, 35, "view source needs a key"}`
+    - If Part 02 already added keyless rows to `kSourceCases`, keep its rows and add only the missing ones.
+  - `ViewOverSource` gains `if (c.detail) EXPECT_EQ(h.response(corr)->detail, c.detail);` and `EXPECT_NE(h.response(corr)->err, kViewSourceTransient) << "37 is never sent";`. Its after-restart re-check (`:474-480`) also runs for `c.want == 35`.
 
-  Then add the 15-cell DDL matrix in the same file:
+  Then add the 12-cell DDL matrix in the same file:
 
 ```cpp
 enum class TvSource : uint8_t { TransientKeyed, TransientKeyless, DiskKeyed, DiskKeyless };
 enum class TvOp : uint8_t { CreatePersisted, CreateTransient, AlterTransientToPersisted, AlterPersistedToTransient };
 struct TvCell { TvSource source; TvOp op; };
-std::vector<TvCell> tvCells();   // 4 x 4 minus {TransientKeyless, AlterPersistedToTransient}
-uint16_t tvExpected(const TvCell&);   // kInvalidRequest for TransientKeyless x {CreatePersisted, AlterTransientToPersisted}, else kOk
-TEST(CheckedWritesTransientViewDdlCountRegression, CellCountIsPinned) { EXPECT_EQ(tvCells().size(), 15u); }
+std::vector<TvCell> tvCells();   // 4 x 4 minus the 4 Alter* cells over a keyless source
+uint16_t tvExpected(const TvCell&);   // 35 (detail "view source needs a key") for a keyless source, else kOk
+TEST(CheckedWritesTransientViewDdlCountRegression, CellCountIsPinned) { EXPECT_EQ(tvCells().size(), 12u); }
 class CheckedWritesTransientViewDdlRegression : public ::testing::TestWithParam<TvCell> {};
 TEST_P(CheckedWritesTransientViewDdlRegression, Cell) {
     // DdlHarness h; source by submitRawDefine (keyed: keyField "id"; keyless: ""); an Alter* op first creates the view
     // with the other persistence (submitView), then submitRawAlterView(AlterViewMsg{.persistence = target,
     // .expectedVersion = 1, planBlob = viewPlanBlob(name, {src}, target, /*extraColumn=*/true)});
-    // assertions: err == tvExpected(cell); err != 37; refused -> events unchanged and h.catalog() == before;
+    // assertions: err == tvExpected(cell) (and the detail for 35); err != 37; refused -> events unchanged and h.catalog() == before;
     // accepted -> one event and h.views().byName(name)->persistence == target;
     // h.restart(); the same op on name + "_2" -> the same err
 }
@@ -314,19 +312,19 @@ TEST_P(CheckedWritesTransientViewDdlRegression, Cell) {
 
   The models:
   - `DdlStressRegressionTest.cpp:163`: delete the line `if (o == Occupant::TypedTransient && s.persistedView) return kViewSourceTransient;`.
-  - `CatalogModel.h:434`: replace the 37 line with the PD1 rule. Push `Code::InvalidRequest` when the source is transient, `!r.transient`, and `it->second.keyField.empty()`. Every typed topic in this model is keyed `"id"` today, so it never fires there. It keeps the model equal to production.
-  - Update both doc comments (`DdlStressRegressionTest.cpp:152-155`, `CatalogModel.h:425-428`) to "a persisted view over a keyless transient source -> InvalidRequest (checked writes Part 10); 37 is never sent".
+  - `CatalogModel.h:434`: delete the 37 line. Part 02's keyless rule (35) stays as Part 02 left it.
+  - Update both doc comments (`DdlStressRegressionTest.cpp:152-155`, `CatalogModel.h:425-428`): drop the 37 clause and add "37 is never sent (checked writes Part 10)".
 
 - [ ] **Step 2: Run them to verify they fail.**
 
   Run: `cmake --build build/root -j14 --target rune_create_view_tests rune_ddl_conformance_tests && ctest --test-dir build/root -R 'CheckedWritesTransientView|DdlViewSourceRegression' -j14 --output-on-failure`
 
-  Expected: FAIL. `…IsAcceptedRegression` gets 37. `TransientSource_PersistedView` gets 37. The keyless persisted cells get 37 instead of 39, and the 15-cell matrix fails on every cell that expects `Ok` for a persisted view over a transient source.
+  Expected: FAIL. `…IsAcceptedRegression` gets 37. `TransientSource_PersistedView` gets 37. The keyless cells already get 35 and pass (Part 02's rule runs first). The 12-cell matrix fails on every cell that expects `Ok` for a persisted view over a transient source.
 
 - [ ] **Step 3: Implement PD1 and PD2 in `AdminWorker.cpp`.**
-  - Edit the loop body at `:1230-1233` per PD1.
+  - Delete the 37 check at `:1230-1233` per PD1.
   - Delete the constant at `:53` per PD2, leaving its comment.
-  - Update the source-rule comment at `:1231` to "Checked writes Part 10 (spec §9a): any view may read a transient topic; a persisted one needs a keyed source (re-folding keyless records is not idempotent)".
+  - Update the source-rule comment at `:1231` to "Checked writes Part 10 (spec §9a): any view may read a transient topic (a keyless source is refused above, §4)".
   - In `AdminWorker.h:65`, change `ViewSourceTransient 37` to `ViewSourceTransient 37 (reserved, never sent)`.
 
 - [ ] **Step 4: Run the tests and the affected DDL suites.**
@@ -342,7 +340,7 @@ git add broker/libs/node/src/AdminWorker.cpp broker/libs/node/include/rune/node/
         broker/libs/node/tests/integration/CreateViewRegressionTest.cpp \
         broker/libs/node/tests/node/DdlOccupantMatrixRegressionTest.cpp \
         broker/libs/node/tests/node/DdlStressRegressionTest.cpp broker/libs/node/tests/support/CatalogModel.h
-git commit -m "admin: a persisted view may read a transient topic; a keyless one is refused (Part F)" \
+git commit -m "admin: a persisted view may read a transient topic (Part F)" \
            -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
@@ -548,7 +546,7 @@ The checkpoint commands below are referred to as **CP-full** from Task 9.
   - `std::vector<uint8_t> presenceTotalsBlob(const std::string& name, int32_t srcTopicId)`: an authored plan with key `"hp"`, source `{srcTopicId, "hp"}`, outputs `{hp Int64 Replace "hp"}`, `{n Int64 CountAll ""}` and `{minId Int64 Min "id"}`, persistence 0.
   - `std::vector<uint8_t> charValue(int64_t id, int64_t hp)`: `[16 u16][1 u16][id i64][hp i64]`.
   - `bool awaitCheckpointO(const std::filesystem::path& dataDir, int32_t viewTopicId, int64_t wantO, std::chrono::seconds bound)`: polls `<dataDir>/__view_snapshots/view-<uint32 id>-p0.delta` in 20 ms steps until the file's last record has O (bytes 4..11, LE) ≥ `wantO`.
-- **Part 02 note.** If Part 02 has merged, `defineTopicAndWait` no longer takes `validate`. Use its signature as it stands on `main`.
+- **Part 02 note.** Part 02 has merged (R10c), so `defineTopicAndWait` no longer takes `validate`. Use its signature as it stands on `main`.
 
 - [ ] **Step 1: Write the tests.**
 
@@ -569,10 +567,10 @@ TEST(CheckedWritesTransientViewBrokerRegression, FullRestartKeepsTheCheckpointRo
     //   p_totals hp 5 -> n 2
     // produce (4,5) at offset 0 and (1,7) at offset 1 -> p_rows 4 -> hp 5, 1 -> hp 7;
     //   p_totals hp 5 -> n 2 (keys 2,4: key 1 moved out, nothing double counted), hp 7 -> n 2, minId 1
-TEST(CheckedWritesTransientViewBrokerRegression, PersistedViewOverAKeylessTransientTopicIsRefusedRegression)
-    // define "events_t" transient, keyField "", charBlob(); createViewAndWait(persisted) -> errorCode 39,
-    // detail == "a persisted view over a transient source needs a keyed source"; createViewAndWait(transient,
-    // another name) -> 0; getTopicSchemaAndWait(first name) -> UnknownTopic (7): no sink was created
+TEST(CheckedWritesTransientViewBrokerRegression, ViewsOverAKeylessTransientTopicAreRefusedRegression)
+    // define "events_t" transient, keyField "", charBlob(); createViewAndWait(persisted) and (transient, another
+    // name) -> errorCode 35, detail == "view source needs a key" (R10b; never 37);
+    // getTopicSchemaAndWait(each name) -> UnknownTopic (7): no sink was created
 ```
 
 ```cpp
@@ -603,9 +601,7 @@ git commit -m "test: persisted views over a transient topic on real brokers: ser
            -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
-### Task 6: The `View` ack on a persisted view over a transient source (only with Part 03, PD8)
-
-**Precondition.** `grep -n "kAcksWireView" protocol/include/rune/protocol/client/DataMessages.h` hits. If it does not, skip this task and tell the controller that the cell is unowned (Gaps).
+### Task 6: The `View` ack on a persisted view over a transient source
 
 **Files:**
 - Modify: `broker/libs/node/tests/client/CheckedWritesTransientViewBrokerRegressionTest.cpp`
@@ -639,8 +635,8 @@ TEST(CheckedWritesTransientViewBrokerRegression, ViewAckOnAPersistedViewOverATra
 
 ```markdown
 - Any view may read a transient topic, persisted or transient. A persisted view over a transient topic needs a keyed
-  topic; over a keyless one `Client::createView(...)` answers `InvalidRequest` (39) "a persisted view over a transient
-  source needs a keyed source" (a transient view over it is fine). Code 37 (`ViewSourceTransient`) is no longer sent.
+  topic, like every view: over a keyless one `Client::createView(...)` answers `ViewKeyInvalid` (35) "view source needs
+  a key". Code 37 (`ViewSourceTransient`) is no longer sent.
 - A persisted view over a transient topic is as durable as its checkpoint; the topic is not durable at all:
   - **After a full-cluster restart** the view keeps the rows of its last checkpoint and folds the empty ring from
     offset 0. Rows folded after the last checkpoint write are lost, with the records that made them.
@@ -659,7 +655,7 @@ TEST(CheckedWritesTransientViewBrokerRegression, ViewAckOnAPersistedViewOverATra
 
 - [ ] **Step 2: `docs/api/ql.md`.** After the bullet at `:32`, add: "- A persisted view may read a transient topic (a keyed one). It keeps its checkpointed rows across a restart and folds what the ring still holds; see `SELF-HOSTING.md`, Transient topics."
 
-- [ ] **Step 3: `docs/api/client-cpp.md:493-494`.** Replace "a view over a transient topic must itself be transient (`ViewSourceTransient`)" with "a persisted view over a transient topic needs a keyed topic (`InvalidRequest` otherwise) and keeps its checkpointed rows across a restart".
+- [ ] **Step 3: `docs/api/client-cpp.md:493-494`.** Replace "a view over a transient topic must itself be transient (`ViewSourceTransient`)" with "a persisted view may read a transient topic; it keeps its checkpointed rows across a restart".
 
 - [ ] **Step 4: The code table and the catalog.**
   - In `docs/api/wire-protocol.md:250`, the row becomes `| 37 | `ViewSourceTransient` | Reserved; no longer sent (a persisted view may read a transient source). |  |`.
@@ -667,7 +663,7 @@ TEST(CheckedWritesTransientViewBrokerRegression, ViewAckOnAPersistedViewOverATra
 
 - [ ] **Step 5: The comments.**
   - `Protocol.h:165-166`: `// reserved, never sent (checked writes Part 10): a persisted view may read a transient source`.
-  - `Client.h:183-187`: replace the 37 clause with "ViewSourceTransient=37 is no longer sent; a persisted view over a keyless transient topic is InvalidRequest".
+  - `Client.h:183-187`: replace the 37 clause with "ViewSourceTransient=37 is no longer sent: a persisted view may read a transient topic".
   - `Client.h:927-930`: replace the example list's 37 clause the same way.
 
 - [ ] **Step 6: Check.**
@@ -759,7 +755,6 @@ git commit -m "e2e: persisted views over a transient topic keep their rows acros
   1. `enhancement`, `sev:low`, `area:views`. A restarted node cannot tell whether its checkpoint cursor is in the current lineage of its transient source. So records evicted between its checkpoint and its ring's start are counted as one `transientSourceResets`, not as `transientRecordsEvicted` (PD5). A fix needs the source lineage (the committed `TransientLineageRecord`) stored with the checkpoint: a format change for Part 07's v3 or later.
      - Test reference: `CheckedWritesTransientViewRegression.NodeRestartAboveTheCheckpointCountsAResetNotAnEvictionRegression` (`broker/libs/node/tests/integration/PersistedOverTransientViewTest.cpp`).
      - Origin: Part 10 plan, PD5.
-  2. Only if Task 6 was skipped: `test`, `sev:medium`, `area:views`. "The View ack on a persisted view over a transient source has no test (Part 10 ran before Part 03)". Origin: Part 10 plan, PD8.
 - [ ] **Step 7: Open the PR.** Open it from `feature/checked-writes-10-persisted-over-transient` to `main`, only once the owner has agreed to pushes for this program; never push otherwise.
   - **The body:** a summary, the §15 bullet → test table, the e2e output lines, "no bench: no hot-path change", and the deviations list (empty if none).
   - **Not a deviation.** The changed expectation in `DdlViewSourceRegression/TransientSource_PersistedView` (37 → Ok) is mandated by spec §9a. It is listed under "changed by spec", not as a weakened test.
@@ -770,14 +765,11 @@ git commit -m "e2e: persisted views over a transient topic keep their rows acros
 
 ## Gaps (spec and contract; for the controller)
 
-- **SD9 has no owning part.** Part 10 cannot implement it: the `key.index`, `autoincrement` and constraint DDL arrive in 05, 06 and 09. Proposal:
-  - 05 refuses `key.index` (and so intents) on a transient topic;
-  - 06 refuses `autoincrement`;
-  - 09 refuses `unique` / `check` views over a transient source. This is now reachable, because 37 is lifted.
-- **§4 vs §9a on keyless topics.** §4 (Part 02) refuses views on keyless topics. §9a keeps "a transient view over a keyless transient source unchanged". Part 10 implements §9a. Whichever of 02 and 10 merges second must reconcile the two rules and update `TransientViewOverKeylessTransientSourceIsUnchangedRegression` and the `Keyless*` DDL rows.
+- **SD9** is owned by Part 02's `featureRefusal` table, called by 05, 06 and 09 (ruling R10a). No gap remains.
+- **§4 vs §9a on keyless topics (owner to settle).** Ruling R10b: §4's refusal (35, "view source needs a key") wins over §9a's "a transient view over a keyless transient source is unchanged" and §9a's `InvalidRequest` keyless refusal. Part 10 builds neither §9a rule. The owner has to settle the spec wording. If the owner keeps §9a, the `Keyless*` DDL rows, `…IsStill35Regression` and `ViewsOverAKeylessTransientTopicAreRefusedRegression` change with it.
 - **§15 "failover to a node with an older checkpoint … `transientRecordsEvicted` counts the gap".** This holds when the node kept its instance in memory. After a restart the gap is one `transientSourceResets` (PD5), because checkpoints carry no lineage and §9a freezes the formats. The deferred issue in Task 9 tracks it.
-- **The `View` ack cell.** It needs Part 03 (C4), but index row 10 depends on 01 only. Either cut 10 after 03, or move the cell to 03 (PD8).
-- **No matrix id range.** `CheckedWritesMatrixExpectations.h` reserves no `Op`/`Entity` id range for Part 10. Part 10's matrices use their own enums in their own binary, with no verdict views.
+  Accepted by ruling R10d; filed as the deferred issue in Task 9.
+- **No matrix id range.** `CheckedWritesMatrixExpectations.h` reserves no `Op`/`Entity` id range for Part 10. Part 10's matrices use their own enums in their own binary, with no verdict views. Accepted by ruling R10e.
 
 ## Self-review (done while writing)
 
@@ -786,14 +778,14 @@ git commit -m "e2e: persisted views over a transient topic keep their rows acros
   - "Meaning" and the "Cases" table: Tasks 2, 3 and 5.
   - "What already works" (checkpoint file, cursor machine, idempotent re-fold): pinned by Tasks 2 and 3.
   - "Consequences to document": Task 7.
-  - "Changes": Admin → Task 1; Recovery → Task 2 (PD3); keyed sources only → Task 1; Readiness → Task 2 (PD4); `View` ack → Task 6 (PD8); constraints stay a non-goal → Gaps (SD9) and the doc line in Task 7.
+  - "Changes": Admin → Task 1; Recovery → Task 2 (PD3); keyed sources only → Part 02's §4 rule (R10b), pinned by Task 1; Readiness → Task 2 (PD4); `View` ack → Task 6; constraints stay a non-goal → Part 02's `featureRefusal` (R10a) and the doc line in Task 7.
   - G7b → Tasks 2, 3, 5 and 8.
   - The six §15 bullets → the Interaction matrix table.
   - Index row 10 deliverables → Tasks 1, 2 and 7.
 - **Step scan.**
-  - Every code step names the file, the anchor text and the exact strings (PD1, PD3); no function body is given.
+  - Every code step names the file, the anchor text and the exact strings (PD2, PD3); no function body is given.
   - Every test step names its suite and test and carries the values.
-  - The only conditional steps are PD4's fallback (decided by a named test) and Task 6 (decided by a grep).
+  - The only conditional step is PD4's fallback, decided by a named test.
 - **Type consistency.** These names are spelled the same in every task:
   - `ViewSetRig`, `TransientViewModel`, `Kind::{Replace, CountByGrp, MinByGrp}`, `Rec`;
   - `TvFoldCell`, `TvTiming`, `TvCell`, `TvSource`, `TvOp`;
