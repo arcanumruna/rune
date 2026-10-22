@@ -12,7 +12,7 @@ using ST = rune::protocol::SecurityResourceType;
 using SO = rune::protocol::SecurityOperation;
 using namespace std::chrono_literals;
 
-TEST(SecurityHaltRegression, HaltRevokesEverySessionAndRefusesLoginsRegression) {
+TEST(SecurityHaltRegression, HaltEndsEverySessionRetriablyAndRefusesLoginsRegression) {
     LogCapture log;
     AuthRig r("halt");
     AuthBroker& b = r.broker();
@@ -36,8 +36,9 @@ TEST(SecurityHaltRegression, HaltRevokesEverySessionAndRefusesLoginsRegression) 
     while (!n.securityViewForTest().halted && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(10ms);
     ASSERT_TRUE(n.securityViewForTest().halted);
 
-    // Every authenticated session is revoked: its live subscription, then the session-level frame with the halt detail.
-    const int revoked = static_cast<int>(pc::ErrorCode::SessionRevoked);
+    // #206: every authenticated session is ended RETRIABLY - one session-level AuthUnavailable (48) with the halt detail,
+    // no SessionRevoked on its subscription - so its client reconnects to another broker.  Still fail-closed.
+    const int unavailable = static_cast<int>(pc::ErrorCode::AuthUnavailable);
     int onSub = -1, onSession = -1;
     std::string detail;
     r.c().pollUntil([&] {
@@ -45,23 +46,21 @@ TEST(SecurityHaltRegression, HaltRevokesEverySessionAndRefusesLoginsRegression) 
             if (e.correlationId == corr) onSub = e.code;
             if (e.correlationId == 0 && e.sessionId == user) { onSession = e.code; detail = e.message; }
         }
-        return onSub != -1 && onSession != -1;
+        return onSession != -1;
     });
-    EXPECT_EQ(onSub, revoked);
-    EXPECT_EQ(onSession, revoked);
-    EXPECT_EQ(detail, "security log halted on this broker");
+    EXPECT_EQ(onSession, unavailable);
+    EXPECT_EQ(onSub, -1) << "no SessionRevoked on the subscription's correlation id";
+    EXPECT_EQ(detail, "security log halted on this broker - reconnect to another broker");
     EXPECT_FALSE(r.c().pingError(r.ch(), r.stream(), user, AuthRig::dl(1)).has_value()) << "the session is gone";
 
-    // New logins are refused (AuthenticationFailed), the broker itself stays up.
+    // New logins are refused retriably (AuthUnavailable: try another broker), the broker itself stays up.
     const int64_t s2 = r.wire().connect(r.ch());
     ASSERT_GT(s2, 0) << "the broker still accepts a Connect";
-    EXPECT_EQ(r.wire().login(r.ch(), s2, name, {AuthRig::kPw, AuthRig::kPw}).errorCode(), 44);
+    EXPECT_EQ(r.wire().login(r.ch(), s2, name, {AuthRig::kPw, AuthRig::kPw}).errorCode(), unavailable);
     const auto halted = b.counter(kSecurityApplyHaltedCounterTypeId);
     ASSERT_TRUE(halted.has_value());
     EXPECT_GT(*halted, 0) << "counter 1'000'226 is raised";
-    const auto revokedCount = b.counter(kSessionsRevokedCounterTypeId);
-    ASSERT_TRUE(revokedCount.has_value());
-    EXPECT_GE(*revokedCount, 2) << "the user's and the admin's sessions (counter 232)";
+    EXPECT_EQ(b.counter(kSessionsRevokedCounterTypeId).value_or(0), 0) << "a halt revokes nothing (counter 232)";
     EXPECT_GE(log.count("SECURITY APPLY HALTED"), 1);
     EXPECT_GE(log.count("docs/SECURITY.md#halted"), 1);
 }

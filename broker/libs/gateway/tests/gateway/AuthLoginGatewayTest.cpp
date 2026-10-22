@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <random>
 
@@ -404,7 +405,8 @@ TEST(AuthLoginRegression, ALoginAgainstAHaltedSecurityLogFailsClosedRegression) 
     rig.view.onHalted(err);
     const auto o = rig.login("ws1", {kTestPasswordA, ""});
     ASSERT_TRUE(o.fin.has_value());
-    EXPECT_EQ(o.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+    // #206: fail closed (no session) but retriable - this broker cannot vouch for its security state.
+    EXPECT_EQ(o.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable));
     EXPECT_TRUE(rig.logContains("reason=security-halted"));
     EXPECT_FALSE(rig.gw.hasSessionForTest(o.sid));
 }
@@ -1330,8 +1332,8 @@ TEST(AuthLaggingViewRegression, AStateAppliedBetweenTheLegsMakesTheFailureRetria
 
 // knownEnd bounds: only an end PAST the next event to apply makes the view "behind".  -1 (none posted), 0, the applied
 // offset (a truncated log re-posted lower) and applied+1 (exactly caught up) keep the terminal 44; applied+2 and the
-// i64 max answer 48.  A halted view keeps its own fail-closed 44 however far behind it is, and a correct password is
-// never refused for the lag.
+// i64 max answer 48.  A halted view fails closed but retriably (48, #206) however far behind it is, and a correct
+// password is never refused for the lag.
 TEST(AuthLaggingViewRegression, KnownEndBoundsHaltAndSuccessAdversarialRegression) {
     Rig rig;
     const int64_t applied = rig.view.appliedOffset();
@@ -1353,7 +1355,7 @@ TEST(AuthLaggingViewRegression, KnownEndBoundsHaltAndSuccessAdversarialRegressio
     rig.view.onHalted(err);
     const auto halted = rig.login("ws1", {kTestPasswordA, ""}, "10.2.0.2");
     ASSERT_TRUE(halted.fin.has_value());
-    EXPECT_EQ(halted.fin->errorCode, kAuthFailed) << "a halted view fails closed (D28), never retriable";
+    EXPECT_EQ(halted.fin->errorCode, kAuthUnavailable) << "a halted view fails closed but retriable (#206)";
 }
 
 // Enumeration: while behind, an unknown user, a wrong password and a disabled account answer byte-for-byte alike
@@ -1454,7 +1456,7 @@ TEST(SessionClosingSpillRegression, RevokedSessionUnderBackPressureStillGetsSess
 
     rig.refuse = true;
     const std::size_t mark = rig.seen.size();
-    rig.gw.onSecurityHalted(0);   // revokes every authenticated session
+    rig.gw.revokeAllSessionsForTest("test revoke");   // revokes every authenticated session
     EXPECT_EQ(rig.gw.sessionsRevoked(), 1u);
     ASSERT_TRUE(rig.gw.hasSessionForTest(sid)) << "the revoke freed its spilled 46s with the session";
     EXPECT_EQ(rig.gw.spillStateForTest(sid), SpillState::Closing);
@@ -1506,7 +1508,7 @@ TEST(SessionClosingSpillRegression, AClosingSessionThatNeverDrainsIsClosedAtItsD
     const std::size_t usedBefore = rig.gw.egressSpillUsedBytesForTest();
     const int64_t sid = authedSession(rig);
     rig.refuse = true;   // forever
-    rig.gw.onSecurityHalted(0);
+    rig.gw.revokeAllSessionsForTest("test revoke");
     ASSERT_TRUE(rig.gw.hasSessionForTest(sid));
     ASSERT_EQ(rig.gw.spillStateForTest(sid), SpillState::Closing);
     EXPECT_GT(rig.gw.egressSpillUsedBytesForTest(), usedBefore);
@@ -1528,7 +1530,7 @@ TEST(SessionClosingSpillRegression, AClosingSessionExecutesNoFrameAndAcceptsNoNe
     rig.reliable = true;
     const int64_t sid = authedSession(rig);
     rig.refuse = true;
-    rig.gw.onSecurityHalted(0);
+    rig.gw.revokeAllSessionsForTest("test revoke");
     ASSERT_EQ(rig.gw.spillStateForTest(sid), SpillState::Closing);
     const uint64_t revoked = rig.gw.sessionsRevoked();
     const std::size_t held = rig.gw.spilledBytesForTest(sid);
@@ -1546,7 +1548,7 @@ TEST(SessionClosingSpillRegression, AClosingSessionExecutesNoFrameAndAcceptsNoNe
     EXPECT_EQ(rig.gw.closingAnswerDrops(), answerDrops) << "a frame was executed (its answer refused)";
 
     // (b) A second revoke sends nothing more and is not counted again.
-    rig.gw.onSecurityHalted(0);
+    rig.gw.revokeAllSessionsForTest("test revoke");
     EXPECT_EQ(rig.gw.sessionsRevoked(), revoked);
     EXPECT_EQ(rig.gw.spilledBytesForTest(sid), held);
     EXPECT_EQ(rig.gw.closingAnswerDrops(), answerDrops);
@@ -1566,7 +1568,7 @@ TEST(SessionClosingSpillRegression, NoBackPressureClosesAtOnceAsBeforeRegression
     Rig rig;
     rig.reliable = true;
     const int64_t sid = authedSession(rig);
-    rig.gw.onSecurityHalted(0);
+    rig.gw.revokeAllSessionsForTest("test revoke");
     EXPECT_FALSE(rig.gw.hasSessionForTest(sid)) << "revoke: closed in the same call";
     EXPECT_EQ(errorsFrom(rig, sid, 0), (std::vector<std::pair<int64_t, int16_t>>{{0, kRevoked}}));
     const auto o = rig.login("ws2", {"wrong password", ""});
@@ -1652,7 +1654,7 @@ TEST(SessionClosingSpillRegression, LoginSubscribeAndASecondEndOnAClosingSession
     rig.reliable = true;
     const int64_t sid = authedSession(rig);
     rig.refuse = true;
-    rig.gw.onSecurityHalted(0);
+    rig.gw.revokeAllSessionsForTest("test revoke");
     ASSERT_EQ(rig.gw.spillStateForTest(sid), SpillState::Closing);
     const std::size_t held = rig.gw.spilledBytesForTest(sid);
     const uint64_t answerDrops = rig.gw.closingAnswerDrops();
@@ -1693,7 +1695,7 @@ TEST(SessionClosingSpillRegression, PoolExhaustionExpiresTheLargestClosingSessio
     const std::size_t quota = ClientGateway::spillSizing().sessionQuota;
     const int64_t closing = authedSession(rig);
     std::vector<int64_t> holders;
-    for (int i = 0; i < 7; ++i) holders.push_back(rig.newSession());   // not authenticated: the halt never ends them
+    for (int i = 0; i < 7; ++i) holders.push_back(rig.newSession());   // not authenticated: the revoke never ends them
     const int64_t pusher = rig.newSession();
     int64_t corr = 0;
     const auto fill = [&](int64_t sid, std::size_t target) {
@@ -1704,7 +1706,7 @@ TEST(SessionClosingSpillRegression, PoolExhaustionExpiresTheLargestClosingSessio
     };
     fill(closing, quota - 2 * unit);   // the largest holder, under its quota (room for the 46)
     for (const int64_t h : holders) fill(h, quota - 6 * unit);
-    rig.gw.onSecurityHalted(0);
+    rig.gw.revokeAllSessionsForTest("test revoke");
     ASSERT_EQ(rig.gw.spillStateForTest(closing), SpillState::Closing);
     ASSERT_EQ(rig.gw.closingSessions(), 1u);
     ASSERT_EQ(rig.gw.noHangStats().spillExpiries, 0u) << "precondition: the pool is not full yet";
@@ -1744,7 +1746,7 @@ TEST(SessionClosingSpillRegression, EveryExitFromClosingLeavesNoStateBehindAdver
     rig.gw.setSessionAuthForTest(drained, AuthAuthenticated{7, "u", PermissionTable::allowAll(), {}});
     rig.gw.setNowNsForTest(kLater);
     rig.refuse = true;
-    rig.gw.onSecurityHalted(0);
+    rig.gw.revokeAllSessionsForTest("test revoke");
     ASSERT_EQ(rig.gw.closingSessions(), 3u);
 
     rig.gw.reapExpiredForTest(ClientGateway::kDefaultSessionTimeoutNs + 1);   // only `reaped` is past its lease
@@ -1774,13 +1776,13 @@ TEST(SessionClosingSpillRegression, OneDrainPassClosesClosingSessionsAroundASpil
     rig.reliable = true;
     rig.refuse = true;
     const int64_t c1 = authedSession(rig);
-    const int64_t mid = rig.newSession();   // awaiting login: the halt leaves it alone
+    const int64_t mid = rig.newSession();   // awaiting login: the revoke leaves it alone
     const int64_t c2 = authedSession(rig);
     const auto f1 = bigAnswer(c1, 1, 64);
     ASSERT_TRUE(rig.gw.sendControlFrame(c1, f1.data(), f1.size()));      // c1 joins the ready list first
     const auto fm = bigAnswer(mid, 2, 64);
     ASSERT_TRUE(rig.gw.sendControlFrame(mid, fm.data(), fm.size()));
-    rig.gw.onSecurityHalted(0);                                           // c2 joins last
+    rig.gw.revokeAllSessionsForTest("test revoke");                       // c2 joins last
     ASSERT_EQ(rig.gw.spillStateForTest(c1), SpillState::Closing);
     ASSERT_EQ(rig.gw.spillStateForTest(mid), SpillState::Spilled);
     ASSERT_EQ(rig.gw.spillStateForTest(c2), SpillState::Closing);
@@ -1813,7 +1815,7 @@ TEST(SessionClosingSpillRegression, ASpoofedDisconnectNeverEndsAnEncryptedClosin
     rig.gw.setNowNsForTest(t0);
     const int64_t sid = authedSession(rig);
     rig.refuse = true;
-    rig.gw.onSecurityHalted(0);
+    rig.gw.revokeAllSessionsForTest("test revoke");
     ASSERT_EQ(rig.gw.spillStateForTest(sid), SpillState::Closing);
     rig.gw.sessionCryptoForTest(sid)->encrypted = true;
     const auto d = disconnectFrame(sid, 77);
@@ -1830,4 +1832,133 @@ TEST(SessionClosingSpillRegression, ASpoofedDisconnectNeverEndsAnEncryptedClosin
     EXPECT_EQ(rig.gw.closingDeadlineCloses(), 1u);
     EXPECT_EQ(rig.gw.closingSessions(), 0u);
     EXPECT_EQ(rig.gw.egressSpillUsedBytesForTest(), 0u);
+}
+
+// ── Issue #206: a halted broker sends the client to another broker, it never rejects it for good ──────────────────────
+// A halted `__security` view means THIS broker cannot vouch for its security state: the retriable AuthUnavailable (48),
+// never the terminal AuthenticationFailed (44) / SessionRevoked (46).  Still fail-closed: nothing is granted here.
+namespace {
+/// One SCRAM login whose `betweenLegs` runs after the AuthServerFirst and before the AuthClientFinal is sent.
+std::optional<pc::AuthServerFinal> loginWithBetweenLegs(Rig& rig, int64_t sid, const std::string& user, const std::string& pw,
+                                                        const std::function<void()>& betweenLegs) {
+    const std::string nonce = "nonce-" + std::to_string(++rig.corr);
+    pc::AuthClientFirst cf;
+    cf.sessionId = sid; cf.correlationId = ++rig.corr; cf.username = user; cf.clientNonce = nonce;
+    std::vector<uint8_t> b(cf.encodedSize()); b.resize(cf.encode(b.data()));
+    const std::size_t before = rig.seen.size();
+    rig.send(b);
+    const Frame* f1 = nullptr;
+    for (std::size_t i = before; i < rig.seen.size(); ++i)
+        if (rig.seen[i].tid == static_cast<uint16_t>(pc::TemplateId::AuthServerFirst)) f1 = &rig.seen[i];
+    if (f1 == nullptr) return std::nullopt;
+    const auto first = pc::AuthServerFirst::decode(f1->bytes.data(), f1->bytes.size());
+    auto ans = scramAnswer(user, nonce, *first, {pw, ""}, sid, cf.correlationId);
+    std::vector<uint8_t> fb(ans->final.encodedSize()); fb.resize(ans->final.encode(fb.data()));
+    betweenLegs();
+    const std::size_t mid = rig.seen.size();
+    rig.send(fb);
+    for (std::size_t i = mid; i < rig.seen.size(); ++i)
+        if (rig.seen[i].tid == static_cast<uint16_t>(pc::TemplateId::AuthServerFinal))
+            return pc::AuthServerFinal::decode(rig.seen[i].bytes.data(), rig.seen[i].bytes.size());
+    return std::nullopt;
+}
+constexpr int16_t kUnavailable = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
+}  // namespace
+
+TEST(AuthLoginRegression, AHaltedBrokerAnswersBothLoginLegsRetriablyRegression) {
+    // (a) Halted before the first leg: AuthServerFinal 48, no retry hint, the session ends; not a failed login.
+    {
+        Rig rig;
+        rune::security::ApplyError err; err.offset = 3; err.detail = "test halt";
+        rig.view.onHalted(err);
+        const auto o = rig.login("ws1", {kTestPasswordA, ""});
+        ASSERT_TRUE(o.fin.has_value());
+        EXPECT_TRUE(o.firstBytes.empty()) << "answered at the first leg";
+        EXPECT_EQ(o.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable));
+        EXPECT_EQ(o.fin->retryAfterMs, 0u);
+        EXPECT_FALSE(rig.gw.hasSessionForTest(o.sid));
+        EXPECT_EQ(rig.gw.loginsFailed(), 0u) << "a halt is no verdict on the credentials";
+        EXPECT_EQ(rig.gw.loginsUnavailable(), 1u);
+        EXPECT_TRUE(rig.logContains("reason=security-halted"));
+    }
+    // (b) Halted between the legs, repeatedly from the same (user, host): 48 each time, the throttle is never charged -
+    // the same user from the same host logs in at once on a serving view afterwards (3 charged failures would make that
+    // attempt the rate-limited 44).
+    {
+        Rig rig;
+        std::vector<std::unique_ptr<SecurityView>> views;
+        for (int i = 0; i < 4; ++i) {
+            views.push_back(std::make_unique<SecurityView>(rig.chain.state()));
+            SecurityView* v = views.back().get();
+            rig.gw.setAuthMode(GatewayAuthMode::Required, v);
+            const int64_t sid = rig.newSession("10.6.0.1");
+            const auto fin = loginWithBetweenLegs(rig, sid, "ws1", kTestPasswordA, [v] {
+                rune::security::ApplyError err; err.offset = 3; err.detail = "test halt between the legs";
+                v->onHalted(err);
+            });
+            ASSERT_TRUE(fin.has_value()) << i;
+            EXPECT_EQ(fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable)) << i;
+            EXPECT_EQ(fin->retryAfterMs, 0u) << i;
+            EXPECT_TRUE(fin->serverSignature.empty()) << i;
+            EXPECT_FALSE(rig.gw.hasSessionForTest(sid)) << i;
+        }
+        EXPECT_EQ(rig.gw.loginsFailed(), 0u);
+        EXPECT_EQ(rig.gw.loginsUnavailable(), 4u);
+        EXPECT_TRUE(rig.logContains("reason=security-halted"));
+        views.push_back(std::make_unique<SecurityView>(rig.chain.state()));   // "un-halted": a serving view again
+        rig.gw.setAuthMode(GatewayAuthMode::Required, views.back().get());
+        const auto ok = rig.login("ws1", {kTestPasswordA, ""}, "10.6.0.1");
+        ASSERT_TRUE(ok.fin.has_value());
+        EXPECT_EQ(ok.fin->errorCode, 0) << "the halted finals were charged to the throttle";
+        EXPECT_EQ(rig.gw.loginsRateLimited(), 0u);
+    }
+}
+
+TEST(AuthLoginRegression, AHaltEndsLiveSessionsRetriablyNotRevokedRegression) {
+    // (a) Authenticated (with a gateway subscription) and must-change-password sessions: exactly one session-level 48
+    // each, no 46 on any correlation id, counted as ended-unavailable (never revoked), closed.
+    {
+        Rig rig;
+        rig.withTopic(1);
+        const int64_t sid = authedSession(rig);
+        subscribe(rig, sid, 11, 0);
+        ASSERT_NE(rig.last(static_cast<uint16_t>(pc::TemplateId::SubscribeResponse), sid), nullptr);
+        const int64_t pcr = rig.newSession();
+        rig.gw.setSessionAuthForTest(pcr, AuthPasswordChangeRequired{8, "v"});
+        const int64_t waiting = rig.newSession();   // awaiting its login: left alone
+        const std::size_t mark = rig.seen.size();
+        rig.gw.onSecurityHalted(0);
+        using Errs = std::vector<std::pair<int64_t, int16_t>>;
+        EXPECT_EQ(errorsFrom(rig, sid, mark), (Errs{{0, kUnavailable}})) << "no SessionRevoked on the subscription";
+        EXPECT_EQ(errorsFrom(rig, pcr, mark), (Errs{{0, kUnavailable}}));
+        EXPECT_TRUE(errorsFrom(rig, waiting, mark).empty());
+        EXPECT_EQ(rig.gw.sessionsRevoked(), 0u);
+        EXPECT_EQ(rig.gw.sessionsEndedUnavailable(), 2u);
+        EXPECT_FALSE(rig.gw.hasSessionForTest(sid));
+        EXPECT_FALSE(rig.gw.hasSessionForTest(pcr));
+        EXPECT_TRUE(rig.gw.hasSessionForTest(waiting));
+        const std::size_t after = rig.seen.size();
+        rig.gw.onSecurityHalted(0);
+        EXPECT_EQ(rig.seen.size(), after) << "a second halt sends nothing";
+        EXPECT_EQ(rig.gw.sessionsEndedUnavailable(), 2u);
+    }
+    // (b) Idempotent while the 48 is still spilled (Closing): a second halt queues and counts nothing more.
+    {
+        Rig rig;
+        rig.reliable = true;
+        const int64_t sid = authedSession(rig);
+        rig.refuse = true;
+        const std::size_t mark = rig.seen.size();
+        rig.gw.onSecurityHalted(0);
+        ASSERT_EQ(rig.gw.spillStateForTest(sid), SpillState::Closing);
+        const std::size_t held = rig.gw.spilledBytesForTest(sid);
+        rig.gw.onSecurityHalted(0);
+        EXPECT_EQ(rig.gw.spilledBytesForTest(sid), held);
+        EXPECT_EQ(rig.gw.sessionsEndedUnavailable(), 1u);
+        EXPECT_EQ(rig.gw.sessionsRevoked(), 0u);
+        rig.refuse = false;
+        rig.gw.drainPendingResponses(1);
+        EXPECT_EQ(errorsFrom(rig, sid, mark), (std::vector<std::pair<int64_t, int16_t>>{{0, kUnavailable}}));
+        EXPECT_FALSE(rig.gw.hasSessionForTest(sid));
+    }
 }

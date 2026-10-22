@@ -8562,14 +8562,18 @@ void ClientGateway::endSessionsSecurityUnavailable()
         Session* s = sessions_.find(sid);
         if (s == nullptr) continue;
         if (s->spill.state == SpillState::Closing) continue;   // issue #119: already sent its last answer
-        ++sessionsEndedUnavailable_;
-        // Session level (corr 0): every in-flight request of the session ends with it; the client reconnects elsewhere.
-        sendErrorOn_(*s, 0, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable),
-                     "this broker's security state is stale - reconnect to another broker");
-        closeAfterAnswers_(sid);   // issue #119: the AuthUnavailable is delivered first
+        endSessionUnavailable_(*s, "this broker's security state is stale - reconnect to another broker");
     }
     if (!liveScratch_.empty())
         spdlog::warn("auth: {} authenticated session(s) ended: this broker's security state stayed stale", liveScratch_.size());
+}
+
+void ClientGateway::endSessionUnavailable_(Session& s, std::string_view reason)
+{
+    ++sessionsEndedUnavailable_;
+    // Session level (corr 0): every in-flight request of the session ends with it; the client reconnects elsewhere.
+    sendErrorOn_(s, 0, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable), reason);
+    closeAfterAnswers_(s.sessionId);   // issue #119: the AuthUnavailable is delivered first
 }
 
 void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
@@ -8607,12 +8611,11 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
         failLogin_(*session, m->correlationId, v.retryAfterMs);
         return;
     }
-    if (securityView_ == nullptr || securityView_->halted()) {
-        ++loginsFailed_;
+    if (securityView_ == nullptr || securityView_->halted()) {   // #206: not a verdict - retriable (fails closed all the same)
         if (unauthLog_.due(2)) [[unlikely]]
             spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost, session->sessionId,
                          loginFailureName(LoginFailure::SecurityHalted));
-        failLogin_(*session, m->correlationId, 0);
+        unavailableLogin_(*session, m->correlationId, user);
         return;
     }
     if (securityUnavailable_()) [[unlikely]] {   // issues #15 / #111: never verified against a stale view
@@ -8668,11 +8671,17 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         unavailableLogin_(*session, hdr->correlationId, user);
         return;
     }
+    if (securityView_ == nullptr || securityView_->halted()) [[unlikely]] {   // #206: not a verdict - retriable
+        if (unauthLog_.due(8 + static_cast<std::size_t>(LoginFailure::SecurityHalted))) [[unlikely]]
+            spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost,
+                         session->sessionId, loginFailureName(LoginFailure::SecurityHalted));
+        unavailableLogin_(*session, hdr->correlationId, user);   // #132: the throttle is not charged
+        return;
+    }
     const auto fin = pc::AuthClientFinal::decode(buf, len);
     std::variant<LoginOk, LoginFailure> verdict = LoginFailure::BadProof;
-    if (securityView_ == nullptr || securityView_->halted()) verdict = LoginFailure::SecurityHalted;
-    else if (nowNs_ > st->deadlineNs)                         verdict = LoginFailure::Timeout;
-    else if (fin)                                             verdict = scramServerFinal(securityView_->state(), *st, *fin);
+    if (nowNs_ > st->deadlineNs) verdict = LoginFailure::Timeout;
+    else if (fin)                verdict = scramServerFinal(securityView_->state(), *st, *fin);
 
     if (const LoginFailure* failure = std::get_if<LoginFailure>(&verdict)) {
         ++loginsFailed_;
@@ -9006,12 +9015,7 @@ void ClientGateway::revokeSession_(int64_t sid, std::string_view reason)
     // processed, and the close may queue behind a full lifecycle ring on its own (announcer) FIFO.  Bind the session
     // to nothing FIRST, on the permission shipper's FIFO: the event's lifecycle fence follows it, so the DDL's OK is
     // released only once every worker refuses this session's produce, whatever the close's progress.
-    if (fencesLifecycleRing_()) {
-        uint64_t owner = 0;
-        if (const auto* a = std::get_if<AuthAuthenticated>(&s->auth)) owner = a->userId;
-        else if (const auto* p = std::get_if<AuthPasswordChangeRequired>(&s->auth)) owner = p->userId;
-        (void)permissionShipper_.bind(*workerPool_, sid, rune::node::PermissionShipper::kDenyTable, ++permEpoch_, owner);
-    }
+    bindDenyTable_(*s);
     const auto code = static_cast<uint16_t>(pc::ErrorCode::SessionRevoked);
     // Each live subscription (and admin-log read) completes SessionRevoked on its correlation id.  PR #459 F3 (the #109
     // class): a subscription a WORKER pushes is ended by that worker - its 46 follows its last Records on the same
@@ -9029,6 +9033,16 @@ void ClientGateway::revokeSession_(int64_t sid, std::string_view reason)
     closeAfterAnswers_(sid);   // issue #119: every 46 is delivered first, even when spilled
 }
 
+void ClientGateway::bindDenyTable_(Session& s)
+{
+    using namespace rune::gateway;
+    if (!fencesLifecycleRing_()) return;
+    uint64_t owner = 0;
+    if (const auto* a = std::get_if<AuthAuthenticated>(&s.auth)) owner = a->userId;
+    else if (const auto* p = std::get_if<AuthPasswordChangeRequired>(&s.auth)) owner = p->userId;
+    (void)permissionShipper_.bind(*workerPool_, s.sessionId, rune::node::PermissionShipper::kDenyTable, ++permEpoch_, owner);
+}
+
 void ClientGateway::onSecurityHalted(int64_t offset)
 {
     using namespace rune::gateway;
@@ -9037,8 +9051,30 @@ void ClientGateway::onSecurityHalted(int64_t offset)
         if (std::holds_alternative<AuthAuthenticated>(s.auth) || std::holds_alternative<AuthPasswordChangeRequired>(s.auth))
             liveScratch_.push_back(s.sessionId);
     });
-    for (const int64_t sid : liveScratch_) revokeSession_(sid, "security log halted on this broker");
-    (void)offset;
+    // #206: this broker can no longer vouch for its security state - the meaning of the retriable AuthUnavailable, not
+    // a verdict on the user (SessionRevoked would be terminal and the client would never fail over).  Still fail-closed:
+    // each session is bound to nothing on the workers first (#196), then ended.  A Closing session (already ended) is
+    // skipped, so a second halt sends and counts nothing.
+    for (const int64_t sid : liveScratch_) {
+        Session* s = sessions_.find(sid);
+        if (s == nullptr || s->spill.state == SpillState::Closing) continue;
+        bindDenyTable_(*s);
+        endSessionUnavailable_(*s, "security log halted on this broker - reconnect to another broker");
+    }
+    if (!liveScratch_.empty())
+        spdlog::warn("auth: {} authenticated session(s) ended (AuthUnavailable): the security log halted on this broker at "
+                     "offset {}", liveScratch_.size(), offset);
+}
+
+void ClientGateway::revokeAllSessionsForTest(std::string_view reason)
+{
+    using namespace rune::gateway;
+    liveScratch_.clear();
+    sessions_.forEach([&](Session& s) {
+        if (std::holds_alternative<AuthAuthenticated>(s.auth) || std::holds_alternative<AuthPasswordChangeRequired>(s.auth))
+            liveScratch_.push_back(s.sessionId);
+    });
+    for (const int64_t sid : liveScratch_) revokeSession_(sid, reason);
 }
 
 // ---------------------------------------------------------------------------

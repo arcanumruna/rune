@@ -3,6 +3,8 @@
 // / SessionRevoked on the correlation ids), never silently - and the DDL's OK means "this broker already enforces it".
 #include "support/AuthRig.h"
 
+#include <rune/node/AdminChannels.h>
+
 using namespace rune::node;
 using namespace rune::node::test;
 using namespace rune::node::test::grants;
@@ -553,6 +555,23 @@ TEST(AuthLiveChangeRegression, ShardDisableAndTerminateOkMeanTheWorkerAlreadyRef
         EXPECT_NE(shardProduceOnce(t, ws, t.r.orders, 2), 0) << (terminate ? "TERMINATE" : "DISABLE");
         EXPECT_EQ(leoOf(t, t.r.orders), leo) << (terminate ? "TERMINATE" : "DISABLE") << ": nothing appended after the OK";
     }
+}
+
+// Issue #206: a halted broker ends its live sessions with the retriable AuthUnavailable (corr 0), never SessionRevoked,
+// and binds each one to nothing first (#196): a direct produce the client sends after its 48 is refused by the worker
+// and nothing is appended - the halt stays fail-closed.  (No lifecycle hold here: unlike a DDL, a halt has no OK that
+// waits for the workers' enforcement fence, so a held ring would delay the bind itself.)
+TEST(AuthLiveChangeRegression, AHaltedBrokersWorkersRefuseTheEndedSessionsProduceRegression) {
+    Live t("shardhalt", shardOptions());
+    std::string writer;
+    const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")}, &writer);
+    ASSERT_EQ(shardProduceCode(t, ws, t.r.orders, 200), 0);
+    // A malformed halt frame halts the mirror (#203) - the cheapest real halt, through the broker's own fail-closed path.
+    t.b().node().injectSecurityFrameOnControlForTest(static_cast<uint16_t>(kA2cSecurityHalted), std::vector<uint8_t>{9});
+    EXPECT_EQ(t.errorOn(0, ws), static_cast<int>(pc::ErrorCode::AuthUnavailable)) << "ended retriably, never revoked";
+    const int64_t leo = leoOf(t, t.r.orders);
+    EXPECT_NE(shardProduceOnce(t, ws, t.r.orders, 2), 0) << "the worker refuses the ended session's produce";
+    EXPECT_EQ(leoOf(t, t.r.orders), leo) << "nothing appended after the halt";
 }
 
 // Issue #109 (RED before the fix: the gateway sent the 45 at once on its own egress while the ending Unsubscribe waited

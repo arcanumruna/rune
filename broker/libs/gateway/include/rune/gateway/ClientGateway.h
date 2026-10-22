@@ -452,9 +452,14 @@ public:
     void endSessionsSecurityUnavailable();
     [[nodiscard]] uint64_t loginsUnavailable() const noexcept { return loginsUnavailable_; }
     [[nodiscard]] uint64_t sessionsEndedUnavailable() const noexcept { return sessionsEndedUnavailable_; }
-    /// The view halted (the admin applier's kA2cSecurityHalted, or the mirror's own apply error): fail closed - every
-    /// authenticated / must-change-password session is revoked (D28).  Idempotent.
+    /// The view halted (the admin applier's kA2cSecurityHalted, or the mirror's own apply error): fail closed (D28) -
+    /// every authenticated / must-change-password session is bound to nothing on the workers, then told the retriable
+    /// AuthUnavailable at session level (corr 0) and closed, so its client reconnects to another broker (#206; counted
+    /// in sessionsEndedUnavailable, never sessionsRevoked).  Idempotent: an already-ending session is skipped.
     void onSecurityHalted(int64_t offset);
+    /// Test seam: revoke every authenticated / must-change-password session with `reason` (SessionRevoked on each live
+    /// subscription, then session level) - the revoke path the spill tests drive for every live session at once.
+    void revokeAllSessionsForTest(std::string_view reason);
     /// The newest security event offset this broker ENFORCES (D24 answer gate); -1 = none yet.  Issues #109 / #196:
     /// with workers, an event is enforced once every worker ACKNOWLEDGED the enforcement fence that followed the
     /// event's ops on both of its rings (bitmaps, binds and closes installed; ended subscriptions' cursors gone) - never
@@ -2370,14 +2375,17 @@ private:
         return securityView_ != nullptr && securityKnownEnd_ > securityView_->appliedOffset() + 1;
     }
     uint64_t loginsUnavailable_ = 0, sessionsEndedUnavailable_ = 0;
-    /// Issues #15 / #111: Required mode and the `__security` state is not provably current (a halted view keeps its own
-    /// fail-closed answers, D28).
+    /// Issues #15 / #111: Required mode and the `__security` state is not provably current (a halted view has its own
+    /// fail-closed, retriable answers: D28, #206).
     [[nodiscard]] bool securityUnavailable_() const noexcept {
         return authMode_ == rune::gateway::GatewayAuthMode::Required && !securityServing_ &&
                !(securityView_ != nullptr && securityView_->halted());
     }
     /// The login answer of an unavailable broker: AuthServerFinal{48} + the end of the session (the client retries).
     void unavailableLogin_(Session& session, int64_t correlationId, std::string_view user);
+    /// End one live session retriably: a session-level (corr 0) AuthUnavailable with `reason`, then close after its
+    /// answers.  Counted in sessionsEndedUnavailable.  The caller skips a Closing session.
+    void endSessionUnavailable_(Session& s, std::string_view reason);
     /// The auth state a NEW session starts in (D11): AuthAwaitingFirst{now + authTimeout} when authenticating,
     /// AuthAnonymous otherwise.
     [[nodiscard]] rune::gateway::SessionAuth newSessionAuth_(int64_t nowNs, int64_t connectCorrelationId) const;
@@ -2489,6 +2497,9 @@ private:
     void refreshSession_(int64_t sid);
     /// Revoke one session: SessionRevoked on every live subscription, then session-level (corr 0) with `reason`, then close.
     void revokeSession_(int64_t sid, std::string_view reason);
+    /// Issue #196: on the shard path, bind `s` to the deny table on the permission shipper's FIFO, so the workers refuse
+    /// its direct produce whatever its close's progress.  No-op off the shard path.
+    void bindDenyTable_(Session& s);
     void executeLiveActions_(Session& s, const rune::gateway::LiveActions& act);
     void sendErrorOn_(Session& s, int64_t corr, uint16_t code, std::string_view message);
     void noteEnforced_(int64_t offset, uint64_t opWorkers, bool lifecycle);
