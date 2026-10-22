@@ -569,6 +569,11 @@ size_t GroupCoordinationService::handleJoinGroup(
     // is amortized (only grows on first large-subscribe, cold path).
     joinTopicsScratch_.clear();
     for (const int32_t tid : msg.subscribedTopicIds) {
+        // #19: a view sink is in the registry but holds no partitions to consume: refuse, never an empty assignment.
+        if (topics_ != nullptr && topics_->isViewSink(tid)) {
+            return refuseJoin("topic id " + std::to_string(tid) +
+                              " is a view sink: it holds no records to consume; read the view with the view read API");
+        }
         std::string name = topicNameForId(topics_, tid);
         if (!name.empty()) {
             joinTopicsScratch_.push_back(std::move(name));

@@ -2995,3 +2995,65 @@ TEST(GroupCoordinationServiceRegression, ANonPositiveMaxSessionTimeoutKeepsTheDe
         EXPECT_EQ(g.svc.coordinator("g213neg").rebalanceTimeoutMs(), 5'000);
     }
 }
+
+// ===========================================================================
+// #19: a group subscribe naming a view sink.  The sink is in the registry but holds no partitions, so the member used
+// to join and get an EMPTY assignment with no error.  It is refused InvalidRequest instead.
+// ===========================================================================
+class GroupJoinRegression : public CG3ServiceTest {
+protected:
+    static constexpr int32_t kSinkId = 5;
+    static constexpr int32_t kRealId = 6;
+
+    void SetUp() override {
+        CG3ServiceTest::SetUp();
+        TopicSpec sink = makeTopicSpec("m11-sink", /*partitions=*/2, kSinkId);
+        sink.viewSink  = true;
+        ASSERT_EQ(registry_->createTopicAt(kSinkId, sink), kSinkId);
+        ASSERT_TRUE(registry_->isViewSink(kSinkId));
+    }
+
+    pc::JoinGroupResponse join(std::initializer_list<int32_t> topicIds, std::string_view group) {
+        const std::vector<int32_t> ids(topicIds);
+        pc::JoinGroup msg;
+        msg.sessionId        = 1;
+        msg.correlationId    = 7;
+        msg.sessionTimeoutMs = 5000;
+        msg.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+        msg.memberId = std::span<const uint8_t>();
+        const std::size_t n = msg.encode(req_, std::span<const int32_t>(ids));
+        const std::size_t o = service_->handleJoinGroup(req_, n, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
+        auto r = pc::JoinGroupResponse::decode(out_, o);
+        EXPECT_TRUE(r.has_value());
+        if (!r) std::abort();
+        detail_.assign(r->detail);
+        r->detail = detail_;   // the decoded view points into out_, which the next call overwrites
+        return *r;
+    }
+    std::string detail_;
+};
+
+TEST_F(GroupJoinRegression, AGroupSubscribeToAViewSinkIsRefusedInvalidRequestRegression) {
+    const auto r = join({kSinkId}, "g19a");
+    EXPECT_EQ(r.errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_TRUE(r.memberId.empty());
+    EXPECT_NE(r.detail.find("view sink"), std::string_view::npos) << r.detail;
+    EXPECT_EQ(service_->coordinator("g19a").memberCount(), 0u);
+}
+
+TEST_F(GroupJoinRegression, AGroupSubscribeToASinkAndARealTopicIsRefusedWholeRegression) {
+    for (const auto& ids : {std::initializer_list<int32_t>{kTestTopicId, kSinkId},
+                            std::initializer_list<int32_t>{kSinkId, kTestTopicId}}) {
+        const auto r = join(ids, "g19b");
+        EXPECT_EQ(r.errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+        EXPECT_TRUE(r.memberId.empty());
+        EXPECT_EQ(service_->coordinator("g19b").memberCount(), 0u) << "the real topic must not admit the member";
+    }
+}
+
+TEST_F(GroupJoinRegression, AGroupSubscribeToARealTopicStillJoinsRegression) {
+    const auto r = join({kTestTopicId}, "g19c");
+    EXPECT_EQ(r.errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_FALSE(r.memberId.empty());
+    EXPECT_EQ(service_->coordinator("g19c").memberCount(), 1u);
+}
