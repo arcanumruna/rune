@@ -45,15 +45,19 @@ namespace rune::gateway {
 struct Session;
 
 /// No-hang fix round 4 (N19): the explicit egress-spill state of a Session.
-enum class SpillState : uint8_t { Normal = 0, Spilled = 1, Expiring = 2 };
+///   Closing — issue #119: the session sent its LAST answer (a revoke's 46s, a failed login's 44, ...) and some of
+///             its answers are still spilled.  The chain drains in order, nothing new is accepted, and the session is
+///             closed once the chain is empty or at closeDeadlineNs, whichever comes first.
+enum class SpillState : uint8_t { Normal = 0, Spilled = 1, Expiring = 2, Closing = 3 };
 
 /// The variables of Session's spill state machine (see Session::spill).
 struct SessionSpill {
     SpillState       state     = SpillState::Normal;
-    uint32_t         bytes     = 0;          // Spilled: SpillPool bytes held (quota unit)
-    SpillPool::Chain chain;                  // Spilled: this session's records, oldest first
-    Session*         prevReady = nullptr;    // Spilled: the gateway's ready list (intrusive)
+    uint32_t         bytes     = 0;          // Spilled / Closing: SpillPool bytes held (quota unit)
+    SpillPool::Chain chain;                  // Spilled / Closing: this session's records, oldest first
+    Session*         prevReady = nullptr;    // Spilled / Closing: the gateway's ready list (intrusive)
     Session*         nextReady = nullptr;
+    int64_t          closeDeadlineNs = 0;    // Closing: close at this time even if undelivered
 };
 
 // ---------------------------------------------------------------------------

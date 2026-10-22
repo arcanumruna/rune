@@ -17,8 +17,13 @@ bool plainIdent(const std::string& n) noexcept {
     }
     return true;
 }
-std::string name(const std::string& n) { return plainIdent(n) ? n : "'" + n + "'"; }
-std::string quoted(const std::string& n) { return "'" + n + "'"; }
+// A quote inside a literal is doubled (SQL) - the same rule as the leader's rune::security::securityStatementText.
+std::string quoted(const std::string& n) {
+    std::string out = "'";
+    for (const char c : n) { out += c; if (c == '\'') out += '\''; }
+    return out + "'";
+}
+std::string name(const std::string& n) { return plainIdent(n) ? n : quoted(n); }
 
 const char* opText(SecOp o) noexcept {
     switch (o) {

@@ -1319,6 +1319,12 @@ public:
         return s ? s->spill.bytes : 0;
     }
     [[nodiscard]] std::size_t spillReadySessionsForTest() const noexcept { return spillReadySessions_; }
+    /// Issue #119: sessions Closing (their last answers still spilled), the answers a Closing session refused, the
+    /// Closing sessions closed at their deadline with answers undelivered, and the frames of a Closing session dropped.
+    [[nodiscard]] std::size_t closingSessions() const noexcept { return closingSessions_; }
+    [[nodiscard]] uint64_t closingAnswerDrops() const noexcept { return closingAnswerDrops_; }
+    [[nodiscard]] uint64_t closingDeadlineCloses() const noexcept { return closingDeadlineCloses_; }
+    [[nodiscard]] uint64_t closingIngressDrops() const noexcept { return closingIngressDrops_; }
     /// Fix round 4 (N12): the reply-host string a pending connect still owns (null once the ring took it).
     [[nodiscard]] const void* pendingResolveHostForTest(std::size_t i) const noexcept {
         return i < pendingConnects_.size() ? pendingConnects_[i].resolveHost.get() : nullptr;
@@ -1949,6 +1955,11 @@ private:
     /// Close an accepted session (Disconnect / SessionFailed): table, workers,
     /// subscriptions, group-member tracking.  False = unknown session (no-op).
     bool closeSession_(int64_t sid, bool notifyExpired = false);
+    /// Issue #119: close a session that has just been sent its LAST answer(s).  Delivered (Normal) or Expiring: closed
+    /// now, as closeSession_.  Some answers still spilled (Spilled): the session enters SpillState::Closing - its chain
+    /// drains in order, nothing new is accepted, and it is closed once the chain is empty or at its deadline - so the
+    /// client still gets its 46 / 44 / 48 (and retryAfterMs) under egress back-pressure.  Idempotent on Closing.
+    void closeAfterAnswers_(int64_t sid);
     /// Fix round 2 (finding 1) + D8c: a Produce frame of a session some worker
     /// holds acks for (Held) or that has no produce credit left — the
     /// shard-mode poll ABORTs it (that client's image only).
@@ -2127,6 +2138,7 @@ private:
     std::size_t                                  creditBlockedSessions_ = 0;   // sessions with produceInFlight >= budget
     std::size_t                                  capDeferredSessions_ = 0;     // sessions with capDeferredOn >= 0 (R3)
     std::size_t                                  expiringSessions_ = 0;        // fix round 4/5 (N9, N20): sessions Expiring (exact)
+    std::size_t                                  closingSessions_ = 0;         // issue #119: sessions Closing (exact)
     uint64_t                                     creditProduceAborts_   = 0;   // ABORTs for want of credit
     uint64_t                                     produceCreditUnderflows_ = 0; // Credit beyond in-flight (invariant breach; clamped)
     // D8c fix round 1 (MAJOR-1): forwarded, unclaimed produces per worker (all sessions).
@@ -3457,6 +3469,9 @@ private:
     uint64_t oldClientUnknownMemberAnswers_ = 0;   // fix round 4 (item 8): pre-v5 group errors → UnknownMember
     uint64_t oldClientSessionWideEvictions_ = 0;   // fix round 5 (N23): ... of them with an undecodable body
     uint64_t spillExpiryClientLeft_         = 0;   // fix round 5: Expiring sessions the client Disconnected
+    uint64_t closingAnswerDrops_            = 0;   // issue #119: answers refused by a Closing session
+    uint64_t closingDeadlineCloses_         = 0;   // issue #119: Closing sessions closed at the deadline, undelivered
+    uint64_t closingIngressDrops_           = 0;   // issue #119: frames of a Closing session dropped
     NoHangStats lastNoHangStats_{};            // fix round 4 (N11): the last logged counters
 
     // G0.1: Private test constructor (skips Aeron setup).
