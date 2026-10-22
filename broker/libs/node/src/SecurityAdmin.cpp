@@ -7,6 +7,7 @@
 #include <rune/protocol/client/SecurityMessages.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/security/SecurityState.h>
+#include <rune/security/SecurityStatementText.h>
 
 #include <spdlog/spdlog.h>
 
@@ -412,7 +413,9 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
     e.kind = sec::kindOf(ops);
     e.ops = std::move(ops);
     e.objectName = m.name;
-    e.statement = m.meta.statement;
+    // Issue #228: rendered from the op, never the client's text (the audit log cannot be made to lie).
+    e.statement = sec::securityStatementText(m.kind, m.name, m.change, m.passwordIndex, m.terminateSessions, m.force,
+                                             m.granteeKind, m.op, m.resourceType, m.patternKind, m.pattern, m.roleName);
     // 3. The target object: ids and versions come from the applied state (the leader's serialization).
     if (create) {
         e.objectId = state.nextObjectId();

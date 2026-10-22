@@ -2,6 +2,7 @@
 #include <type_traits>
 #include <rune/ql/Backends.h>
 #include <rune/ql/Parser.h>
+#include <rune/security/SecurityStatementText.h>
 #include <gtest/gtest.h>
 namespace ql = rune::ql;
 namespace pc = rune::protocol::client;
@@ -294,4 +295,76 @@ TEST(SecurityStatementsRegression, ForceAtTheEdgesOfTheGrammarAdversarialRegress
     const auto rr = ql::parse("revoke role force from user force;");
     ASSERT_TRUE(rr.has_value()) << "a role and a user named force";
     EXPECT_FALSE(std::get<ql::RevokeRoleDef>(*rr).force);
+}
+
+// Issue #228: the leader renders the recorded statement from the op (rune::security::securityStatementText); it must be
+// byte-identical to what the client's redactedText sends, for every statement kind.
+TEST(SecurityStatementTextRegression, MatchesTheClientRedactionForEveryStatementKindRegression) {
+    const char* cases[] = {
+        "CREATE USER ws1 WITH PASSWORD 'correct horse battery';",
+        "CREATE USER 'a-b' WITH PASSWORD 'correct horse battery';",
+        "CREATE USER 'svc@eu-1' WITH PASSWORD 'correct horse battery';",
+        "CREATE USER _u9 WITH PASSWORD 'correct horse battery';",
+        "ALTER USER ws1 ADD PASSWORD 'second password 123';",
+        "ALTER USER 'a-b' ADD PASSWORD 'second password 123';",
+        "ALTER USER ws1 DROP PASSWORD 1;",
+        "ALTER USER ws1 DROP PASSWORD 2;",
+        "ALTER USER ws1 SET PASSWORD 'new password 1234';",
+        "ALTER USER ws1 SET PASSWORD 'new password 1234' TERMINATE SESSIONS;",
+        "ALTER USER ws1 DISABLE;",
+        "ALTER USER ws1 DISABLE FORCE;",
+        "ALTER USER ws1 ENABLE;",
+        "DROP USER ws1;",
+        "DROP USER ws1 FORCE;",
+        "DROP USER 'a-b' FORCE;",
+        "CREATE ROLE world_server;",
+        "CREATE ROLE 'world-server';",
+        "DROP ROLE world_server;",
+        "DROP ROLE world_server FORCE;",
+        "GRANT READ ON TOPIC player_events TO ROLE world_server;",
+        "GRANT WRITE ON TOPIC PREFIX 'world.' TO ROLE world_server;",
+        "GRANT READ ON GROUP PREFIX 'world-' TO ROLE world_server;",
+        "GRANT READ ON GROUP g1 TO USER ws1;",
+        "GRANT ALTER ON VIEW v1 TO USER ws1;",
+        "GRANT DROP ON VIEW PREFIX 'v.' TO ROLE 'a-b';",
+        "GRANT DESCRIBE ON TOPIC 'world.zone-1' TO USER 'svc@eu-1';",
+        "GRANT CREATE ON CLUSTER TO USER ops;",
+        "GRANT ADMIN ON CLUSTER TO ROLE admins;",
+        "GRANT WRITE ON TRANSACTIONAL_ID 'ws-1' TO USER ws1;",
+        "GRANT WRITE ON TRANSACTIONAL_ID PREFIX 'ws-' TO ROLE r;",
+        "REVOKE WRITE ON TOPIC PREFIX 'world.' FROM ROLE world_server;",
+        "REVOKE WRITE ON TOPIC PREFIX 'world.' FROM ROLE world_server FORCE;",
+        "REVOKE ADMIN ON CLUSTER FROM USER ops;",
+        "REVOKE ADMIN ON CLUSTER FROM USER ops FORCE;",
+        "REVOKE READ ON TOPIC 'a-b' FROM USER 'c-d' FORCE;",
+        "GRANT ROLE world_server TO USER ws1;",
+        "GRANT ROLE 'world-server' TO USER 'a-b';",
+        "REVOKE ROLE world_server FROM USER ws1;",
+        "REVOKE ROLE world_server FROM USER ws1 FORCE;",
+        "REVOKE ROLE 'world-server' FROM USER 'a-b' FORCE;",
+    };
+    static_assert(sizeof(cases) / sizeof(cases[0]) >= 20);
+    for (const char* text : cases) {
+        auto st = ql::parse(text);
+        ASSERT_TRUE(st.has_value()) << text;
+        auto plan = ql::applySecurityPlan(*st);
+        ASSERT_TRUE(plan.has_value()) << text;
+        const std::string want = ql::redactedText(*st);
+        EXPECT_EQ(plan->statement, want) << text;
+        EXPECT_EQ(rune::security::securityStatementText(static_cast<uint8_t>(plan->kind), plan->name,
+                                                        static_cast<uint8_t>(plan->change), plan->passwordIndex,
+                                                        plan->terminateSessions, plan->force ? 1 : 0, plan->granteeKind,
+                                                        plan->op, plan->resourceType, plan->patternKind, plan->pattern,
+                                                        plan->roleName),
+                  want) << text;
+    }
+    // An unknown kind / change / enum renders nothing.
+    namespace sec = rune::security;
+    EXPECT_EQ(sec::securityStatementText(0, "u", 0, 0, 0, 0, 0, 0, 0, 0, "", ""), "");
+    EXPECT_EQ(sec::securityStatementText(10, "u", 0, 0, 0, 0, 0, 0, 0, 0, "", ""), "");
+    EXPECT_EQ(sec::securityStatementText(2, "u", 5, 0, 0, 0, 0, 0, 0, 0, "", ""), "");
+    EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 7, 1, 0, "t", ""), "");
+    EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 2, 0, 1, 0, "t", ""), "");
+    EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 0, 5, 0, "t", ""), "");
+    EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 0, 1, 2, "t", ""), "");
 }

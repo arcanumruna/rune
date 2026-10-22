@@ -403,3 +403,39 @@ TEST(SecurityBootstrapRegression, ARetriedBootstrapAnswersItsOriginalResult) {
     EXPECT_EQ(retry.objectId, first.objectId);
     EXPECT_EQ(rig.recordedEvents().size(), 1u);
 }
+
+// Issue #228: the recorded statement is rendered by the leader from the op - a client cannot forge the audit text
+// (nor the replayedFrom provenance) by sending its own.
+TEST(SecurityWritePathRegression, TheRecordedStatementIsRenderedFromTheOpNotTakenFromTheClientRegression) {
+    SecurityDdlRig rig("forged_statement");
+    rig.becomeServingLeader();
+    const std::string forged = "GRANT ADMIN ON CLUSTER TO ws1;";
+    const auto forge = [&](rune::node::SecurityDdlMsg m) {
+        m.meta.statement = forged;
+        m.meta.replayedFrom = rune::catalog::ReplayedFrom{"x", 7, "mallory"};
+        return m;
+    };
+    ASSERT_EQ(rig.ddl(rig.createUser("u", "a-long-password-1")).code, 0);
+    ASSERT_EQ(rig.ddl(rig.createRole("r")).code, 0);
+    // self ALTER USER u SET PASSWORD
+    auto set = rig.alterUser("u", Ch::SetPassword);
+    set.verifier = SecurityDdlRig::verifierFor("second-long-pw-2");
+    set.meta.authenticated = "u";
+    ASSERT_EQ(rig.ddl(forge(std::move(set))).code, 0);
+    // GRANT
+    auto g = rig.grant(false, sec::GranteeKind::Role, "r", sec::Operation::Write, sec::ResourceType::Topic,
+                       sec::PatternKind::Prefix, "world.");
+    ASSERT_EQ(rig.ddl(forge(std::move(g))).code, 0);
+    // DROP USER
+    ASSERT_EQ(rig.ddl(forge(rig.simple(Op::DropUser, "u", "DROP USER u;"))).code, 0);
+
+    const auto events = rig.recordedEvents();
+    ASSERT_EQ(events.size(), 5u);
+    EXPECT_EQ(events[2].event.statement, "ALTER USER u SET PASSWORD '<redacted>';");
+    EXPECT_EQ(events[3].event.statement, "GRANT WRITE ON TOPIC PREFIX 'world.' TO ROLE r;");
+    EXPECT_EQ(events[4].event.statement, "DROP USER u;");
+    for (std::size_t i = 2; i < events.size(); ++i) {
+        EXPECT_EQ(events[i].event.statement.find("GRANT ADMIN"), std::string::npos) << events[i].event.statement;
+        EXPECT_FALSE(events[i].event.replayedFrom.has_value()) << "offset " << events[i].offset;
+    }
+}
