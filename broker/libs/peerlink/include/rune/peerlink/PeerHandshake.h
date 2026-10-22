@@ -7,7 +7,9 @@
 //   A (initiator)                                   B (responder)
 //   HelloV2{keyId, incA, nonceA, shareA} ------>    holds keyId (current or next)? else Refuse{NoCommonKey}
 //                                       <-------    ChallengeV2{keyId, incB, nonceB, macB2, shareB}
-//   verify macB2; Proof{macA2}          ------->    verify macA2; epoch = counter + 1
+//   verify macB2;                                   (issue #18: nonceB / shareB come from a cookie, nothing stored)
+//   ProofV2{keyId, incA, nonceA, shareA,
+//           nonceB, macA2}              ------->    re-derive the cookie; verify macA2; epoch = counter + 1
 //                                       <-------    Accept{epoch, confirm}        (both derive LinkKeys)
 //   Confirm{epoch, confirm}             ------->    (issue #241) promote the receive-only epoch
 //
@@ -22,9 +24,23 @@
 // secret (PeerLinkKeys.h), so a recording of the link plus a cluster key stolen later does not yield them.  The MACs
 // cover both shares (a share swapped in transit fails the MAC); the Accept / Confirm MACs are unchanged and bound to the
 // nonces of this v2 exchange.  The ephemeral private keys and the shared secret live only in HelloSent, ChallengeSent
-// and the pending-challenge table, as EphSecret, scrubbed on every state exit; the responder computes the DH only after
-// the Proof's MAC matched, so an unauthenticated Hello costs one keygen (beside its two HMACs).
+// and (responder) the scope of one onHelloV2 / onProofV2 call, as EphSecret, scrubbed on every exit; the responder
+// computes the DH only after the ProofV2's macA matched.
 //
+// Issue #18, a stateless cookie for the v2 responder.  A pending-challenge table was floodable: unauthenticated
+// HelloV2s evicted the real initiator's slot.  The responder now keeps NO per-Hello state for v2:
+//   d = HMAC-SHA-512(cookieSecret, "rune-peer-cookie-v2|" || from(LE4) || to(LE4) || keyId(LE8) || incA(LE8) || nonceA || shareA)
+//   nonceB = d[0..32), ephPriv = d[32..64) (X25519 clamps it), shareB = X25519(ephPriv, 9)
+// The ProofV2 echoes keyId, incA, nonceA, shareA and nonceB; the responder re-derives d, checks nonceB (constant time)
+// and only then computes macA2 and the DH.  So a forged ProofV2 costs one or two cookie HMACs and NO transcript MAC, and
+// the same HelloV2 again gets the same Challenge while the secret lives.
+//   - two secrets, cookieCur_ / cookiePrev_, rotated on a kAwaitNs grid of the injected clock (tick, onHelloV2,
+//     onProofV2): a Challenge stays answerable for at least kAwaitNs and at most 2 x kAwaitNs;
+//   - replay: every successful establishment (v1 or v2) drops BOTH secrets and draws a fresh one, so every outstanding
+//     Challenge - the one just consumed included - is void, as the pending table is cleared on success;
+//   - forward secrecy: a cookie secret lives at most 2 x kAwaitNs and is scrubbed when it rotates out.  The ephemeral
+//     private key is derivable from it only within that window, the same exposure as the pending slot it replaces.
+// The v1 path (a legacy initiator) still uses the pending-challenge table, so a legacy pair stays floodable.//
 // Version skew (no runtime downgrade path):
 //   - a new RESPONDER still answers a v1 Hello (a legacy initiator) with a v1 Challenge and v1 keys (no forward secrecy):
 //       macB = HMAC-SHA-512(master, "rune-peer-v1|B" || from=B || to=A || nonceA || nonceB || incA || incB || keyId)
@@ -94,14 +110,15 @@ struct ChallengeSent {
     std::optional<EphSecret> dhShared;
 };
 /// A Challenge the RESPONDER has sent and not yet seen proven.  Fixed table beside the link state: an unauthenticated
-/// Hello never changes the state (an Established responder stays Established).
+/// Hello never changes the state (an Established responder stays Established).  Issue #18: only v1 Challenges are
+/// stored; a v2 Challenge is built in a temporary PendingChallenge from the cookie and never kept.
 struct PendingChallenge {
     bool used = false;
     std::array<uint8_t, 32> nonceA{}, nonceB{}; uint64_t keyId = 0; uint64_t peerIncarnation = 0; int64_t sentNs = 0;
     std::array<uint8_t, 64> wantMacA{};   // the Proof we expect, computed once when the Challenge is issued
     bool v2 = false;                      // issue #242: a HelloV2 - shareA / shareB / ephPriv are set
     std::array<uint8_t, 32> shareA{}, shareB{};
-    EphSecret ephPriv;                    // the DH runs only once the Proof matched (onProof)
+    EphSecret ephPriv;                    // v2 temporary only: the cookie-derived key, scrubbed with the temporary
 };
 using LinkState = std::variant<LinkIdle, HelloSent, ChallengeSent, Established>;
 
@@ -146,7 +163,8 @@ public:
     Out onChallenge(const PeerChallenge&, int64_t nowNs);  // initiator: always refused (downgrade, issue #242)
     Out onHelloV2(const PeerHelloV2&, int64_t nowNs);          // responder (issue #242)
     Out onChallengeV2(const PeerChallengeV2&, int64_t nowNs);  // initiator (issue #242)
-    Out onProof(const PeerProof&, int64_t nowNs);          // responder
+    Out onProof(const PeerProof&, int64_t nowNs);          // responder: a legacy (v1) initiator
+    Out onProofV2(const PeerProofV2&, int64_t nowNs);      // responder (issue #18): checked against the cookie
     Out onAccept(const PeerAccept&, int64_t nowNs);        // initiator
     /// Responder (issue #241): the initiator proved it installed the receive-only epoch - promote it (SendAndReceive).
     /// A forged, stale or duplicate Confirm changes nothing.
@@ -181,9 +199,25 @@ private:
     /// Issue #242: a fresh nonce and X25519 keypair for a new Hello; false when no randomness / key is available.
     [[nodiscard]] bool freshHello_(HelloSent& hs) const noexcept;
     [[nodiscard]] PeerHelloV2 helloFrame_(const HelloSent& hs) const noexcept;
-    /// Responder: a v1 (`shareA` null) or v2 Hello - the same pending-slot logic for both.
+    /// Responder: a v1 Hello - the pending-slot table.
     Out answerHello_(int32_t from, int32_t to, uint64_t keyId, uint64_t incarnation, const std::array<uint8_t, 32>& nonceA,
-                     const std::array<uint8_t, 32>* shareA, int64_t nowNs);
+                     int64_t nowNs);
+    /// Responder (issue #18): a v2 Hello - answered from the cookie, nothing stored.
+    Out answerHelloV2_(const PeerHelloV2& h, int64_t nowNs);
+    /// Issue #18: rotate the cookie secrets on the kAwaitNs grid (fail closed: no randomness, no cookieCur_).
+    void rotateCookie_(int64_t nowNs) noexcept;
+    /// Issue #18: drop both cookie secrets and draw a fresh one (after an establishment: every Challenge is void).
+    void freshCookie_(int64_t nowNs) noexcept;
+    /// Issue #18: nonceB and the ephemeral private key of a v2 Challenge, from cookie secret `k` (NOT a transcript MAC:
+    /// not counted in macOps_).
+    [[nodiscard]] static bool cookie_(const EphSecret& k, int32_t from, int32_t to, uint64_t keyId, uint64_t incA,
+                                      const std::array<uint8_t, 32>& nonceA, const std::array<uint8_t, 32>& shareA,
+                                      std::array<uint8_t, 32>& nonceB, EphSecret& ephPriv) noexcept;
+    /// The responder's establishment once a Proof (v1) or ProofV2 matched: the epoch, the link keys (`shared` = the
+    /// X25519 secret, null = v1), the Accept, issue #241's receive-first decision, and the reset of every outstanding
+    /// Challenge (the v1 pending table and, issue #18, both cookie secrets).
+    Out establishAsResponder_(const ClusterKey& key, const std::array<uint8_t, 32>& nonceA, const std::array<uint8_t, 32>& nonceB,
+                              uint64_t peerIncarnation, uint64_t keyId, const EphSecret* shared, int64_t nowNs);
     Out challengeOut_(const ClusterKey& key, const PendingChallenge& c);
     Out refuseOut_(RefuseReason r, uint64_t keyId);
     Out rekey_(int64_t nowNs);
@@ -198,7 +232,9 @@ private:
     uint64_t    incarnation_;
     ClusterKeys keys_;
     uint32_t    epochCounter_ = 0;      // the responder's link epochs (Accept{epoch = counter + 1})
-    std::array<PendingChallenge, kPending> pending_{};
+    std::array<PendingChallenge, kPending> pending_{};   // v1 only (issue #18)
+    std::optional<EphSecret> cookieCur_, cookiePrev_;     // issue #18: the v2 cookie secrets
+    int64_t     cookieRotatedNs_ = 0;                     // the grid point cookieCur_ belongs to
     uint64_t    macOps_ = 0;
     int64_t     lastHintRekeyNs_ = -1'000'000'000'000;
     int64_t     lastExchangeNs_ = -1'000'000'000'000;   // start of the last NEW exchange (<= 1 per kRetryNs)

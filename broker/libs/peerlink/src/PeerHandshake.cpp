@@ -21,6 +21,7 @@ constexpr char kLabelB[] = "rune-peer-v1|B";
 constexpr char kLabelA[] = "rune-peer-v1|A";
 constexpr char kLabelC[] = "rune-peer-v1|C";
 constexpr char kLabelD[] = "rune-peer-v1|D";
+constexpr char kLabelCookie[] = "rune-peer-cookie-v2|";   // issue #18: the responder's stateless Challenge
 constexpr char kLabelB2[] = "rune-peer-v2|B";   // issue #242: distinct from v1, so no MAC is valid across versions
 constexpr char kLabelA2[] = "rune-peer-v2|A";
 static_assert(sizeof kLabelB2 == sizeof kLabelB && sizeof kLabelA2 == sizeof kLabelA && sizeof kLabelA == sizeof kLabelB);
@@ -222,7 +223,9 @@ PeerHandshake::Out PeerHandshake::tick(int64_t nowNs) {
         state_ = hs;
         return frameOut(m);
     }
-    // Responder.  Issue #242: an expired pending Challenge drops its ephemeral private key now.
+    // Responder.  Issue #18: the cookie secrets rotate on the injected clock even while no Hello arrives.
+    rotateCookie_(nowNs);
+    // Issue #242: an expired pending (v1) Challenge drops its ephemeral private key now.
     for (auto& c : pending_)
         if (c.used && nowNs - c.sentNs >= kAwaitNs) { c.used = false; c.ephPriv.scrub(); }
     if (auto* idle = std::get_if<LinkIdle>(&state_)) {
@@ -241,11 +244,49 @@ PeerHandshake::Out PeerHandshake::tick(int64_t nowNs) {
 }
 
 PeerHandshake::Out PeerHandshake::onHello(const PeerHello& h, int64_t nowNs) {
-    return answerHello_(h.from, h.to, h.keyId, h.incarnation, h.nonceA, nullptr, nowNs);   // a legacy initiator: v1
+    return answerHello_(h.from, h.to, h.keyId, h.incarnation, h.nonceA, nowNs);   // a legacy initiator: v1
 }
 
 PeerHandshake::Out PeerHandshake::onHelloV2(const PeerHelloV2& h, int64_t nowNs) {
-    return answerHello_(h.from, h.to, h.keyId, h.incarnation, h.nonceA, &h.shareA, nowNs);
+    return answerHelloV2_(h, nowNs);
+}
+
+// Issue #18: the secrets live on a kAwaitNs grid of the injected clock.  A secret drawn at grid point g becomes the
+// previous one at the first call in [g + kAwaitNs, g + 2 kAwaitNs) and is dropped at the first call at or after
+// g + 2 kAwaitNs, so a Challenge issued at t in [g, g + kAwaitNs) is answerable until g + 2 kAwaitNs: more than kAwaitNs,
+// at most 2 kAwaitNs - whenever the calls come.
+void PeerHandshake::rotateCookie_(int64_t nowNs) noexcept {
+    if (!cookieCur_ || nowNs - cookieRotatedNs_ >= 2 * kAwaitNs) { freshCookie_(nowNs); return; }
+    if (nowNs - cookieRotatedNs_ < kAwaitNs) return;
+    cookiePrev_ = cookieCur_;   // a copy-assignment overwrites the old previous secret's bytes
+    cookieCur_.emplace();
+    if (!rune::crypto::randomBytes({cookieCur_->bytes.data(), cookieCur_->bytes.size()})) cookieCur_.reset();   // fail closed
+    cookieRotatedNs_ += kAwaitNs;
+}
+
+void PeerHandshake::freshCookie_(int64_t nowNs) noexcept {
+    cookiePrev_.reset();        // EphSecret scrubs on destruction
+    cookieCur_.emplace();
+    if (!rune::crypto::randomBytes({cookieCur_->bytes.data(), cookieCur_->bytes.size()})) cookieCur_.reset();   // fail closed
+    cookieRotatedNs_ = nowNs;
+}
+
+bool PeerHandshake::cookie_(const EphSecret& k, int32_t from, int32_t to, uint64_t keyId, uint64_t incA,
+                            const std::array<uint8_t, 32>& nonceA, const std::array<uint8_t, 32>& shareA,
+                            std::array<uint8_t, 32>& nonceB, EphSecret& ephPriv) noexcept {
+    uint8_t buf[sizeof kLabelCookie - 1 + 4 + 4 + 8 + 8 + 32 + 32];
+    uint8_t* p = buf;
+    putN(p, reinterpret_cast<const uint8_t*>(kLabelCookie), sizeof kLabelCookie - 1);
+    put32(p, from); put32(p, to); put64(p, keyId); put64(p, incA); putN(p, nonceA.data(), 32); putN(p, shareA.data(), 32);
+    rune::crypto::DigestBytes d;
+    const bool ok = rune::crypto::hmac(rune::crypto::Digest::Sha512, {k.bytes.data(), k.bytes.size()},
+                                       {buf, static_cast<std::size_t>(p - buf)}, d) && d.size == 64;
+    if (ok) {
+        std::memcpy(nonceB.data(), d.bytes.data(), 32);
+        std::memcpy(ephPriv.bytes.data(), d.bytes.data() + 32, 32);
+    }
+    rune::crypto::secureZero({d.bytes.data(), d.bytes.size()});
+    return ok;
 }
 
 PeerHandshake::Out PeerHandshake::challengeOut_(const ClusterKey& key, const PendingChallenge& c) {
@@ -263,18 +304,15 @@ PeerHandshake::Out PeerHandshake::challengeOut_(const ClusterKey& key, const Pen
 }
 
 PeerHandshake::Out PeerHandshake::answerHello_(int32_t from, int32_t to, uint64_t keyId, uint64_t incarnation,
-                                               const std::array<uint8_t, 32>& nonceA, const std::array<uint8_t, 32>* shareA,
-                                               int64_t nowNs) {
+                                               const std::array<uint8_t, 32>& nonceA, int64_t nowNs) {
     if (initiator() || from != peer_ || to != self_) return refuseOut_(RefuseReason::NotAPeer, keyId);
     const ClusterKey* key = keys_.byId(keyId);
     if (!key) return refuseOut_(RefuseReason::NoCommonKey, keyId);           // D35
-    const bool v2 = shareA != nullptr;
 
-    // The same Hello again (our Challenge may have been lost): the SAME Challenge (same nonceB, same shareB) from its
-    // pending slot.  A v1 and a v2 Hello never match each other's slot.
+    // The same Hello again (our Challenge may have been lost): the SAME Challenge (same nonceB) from its pending slot.
+    // Issue #18: only v1 Hellos are stored here.
     for (auto& c : pending_) {
-        if (c.used && nowNs - c.sentNs < kAwaitNs && c.nonceA == nonceA && c.peerIncarnation == incarnation && c.keyId == keyId &&
-            c.v2 == v2 && (!v2 || c.shareA == *shareA))
+        if (c.used && nowNs - c.sentNs < kAwaitNs && c.nonceA == nonceA && c.peerIncarnation == incarnation && c.keyId == keyId)
             return challengeOut_(*key, c);
     }
     // A NEW nonce: nothing about the link state changes.  It takes a free (or expired) slot, else evicts a RANDOM live
@@ -293,18 +331,29 @@ PeerHandshake::Out PeerHandshake::answerHello_(int32_t from, int32_t to, uint64_
     cs.used = true; cs.nonceA = nonceA; cs.keyId = keyId; cs.peerIncarnation = incarnation; cs.sentNs = nowNs;
     if (!rune::crypto::randomBytes({cs.nonceB.data(), cs.nonceB.size()}))
         return errorOut(logLine("peer link from node %d: no random bytes available", peer_));
-    if (v2) {   // issue #242: this slot's ephemeral keypair; the DH itself waits for a matching Proof
-        cs.v2 = true; cs.shareA = *shareA;
-        if (!rune::crypto::x25519Keypair(cs.ephPriv.bytes, cs.shareB))
-            return errorOut(logLine("peer link from node %d: no ephemeral key available", peer_));
-    }
     Out o = challengeOut_(*key, cs);
     if (!o.frame) return {};
-    if (!mac_(*key, false, peer_, self_, cs.nonceA, cs.nonceB, cs.peerIncarnation, incarnation_, cs.keyId, cs.wantMacA,
-              v2 ? &cs.shareA : nullptr, v2 ? &cs.shareB : nullptr))
+    if (!mac_(*key, false, peer_, self_, cs.nonceA, cs.nonceB, cs.peerIncarnation, incarnation_, cs.keyId, cs.wantMacA))
         return {};
-    *slot = cs;   // overwrites (scrubs) an evicted slot's ephemeral key
+    *slot = cs;
     return o;
+}
+
+// Issue #18: a v2 Hello is answered from the cookie - nonceB and the ephemeral keypair are a function of the cookie
+// secret and the Hello, so nothing is stored and a flood of forged Hellos cannot evict the real one.  The same Hello
+// again gets the same Challenge while the secret lives.  The temporary's ephemeral key is scrubbed with it.
+PeerHandshake::Out PeerHandshake::answerHelloV2_(const PeerHelloV2& h, int64_t nowNs) {
+    if (initiator() || h.from != peer_ || h.to != self_) return refuseOut_(RefuseReason::NotAPeer, h.keyId);
+    const ClusterKey* key = keys_.byId(h.keyId);
+    if (!key) return refuseOut_(RefuseReason::NoCommonKey, h.keyId);         // D35
+    rotateCookie_(nowNs);
+    if (!cookieCur_) return errorOut(logLine("peer link from node %d: no random bytes available", peer_));
+    PendingChallenge c;
+    c.nonceA = h.nonceA; c.keyId = h.keyId; c.peerIncarnation = h.incarnation; c.sentNs = nowNs; c.v2 = true; c.shareA = h.shareA;
+    if (!cookie_(*cookieCur_, peer_, self_, h.keyId, h.incarnation, h.nonceA, h.shareA, c.nonceB, c.ephPriv) ||
+        !rune::crypto::x25519Public(c.ephPriv.bytes, c.shareB))
+        return errorOut(logLine("peer link from node %d: no ephemeral key available", peer_));
+    return challengeOut_(*key, c);
 }
 
 // Issue #242: this initiator only ever sends HelloV2, so a v1 Challenge answering our Hello is a downgrade (an attacker
@@ -334,7 +383,8 @@ PeerHandshake::Out PeerHandshake::onChallengeV2(const PeerChallengeV2& c, int64_
     if (!rune::crypto::x25519Shared(h->ephPriv.bytes, c.shareB, shared.bytes))   // a low-order share: as a bad MAC
         return errorOut(logLine("peer link from node %d REFUSED: %s (key share rejected, key id %016llx)", peer_,
                                 refuseReasonText(RefuseReason::BadProof), static_cast<unsigned long long>(h->keyId)));
-    PeerProof p; p.from = self_; p.to = peer_;
+    PeerProofV2 p; p.from = self_; p.to = peer_;   // issue #18: the echoes let the responder re-derive its cookie
+    p.keyId = h->keyId; p.incarnation = incarnation_; p.nonceA = h->nonceA; p.shareA = h->ephPub; p.nonceB = c.nonceB;
     if (!mac_(*key, false, self_, peer_, h->nonceA, c.nonceB, incarnation_, c.incarnation, h->keyId, p.macA, &h->ephPub, &c.shareB))
         return {};
     ChallengeSent cs;
@@ -358,18 +408,55 @@ PeerHandshake::Out PeerHandshake::onProof(const PeerProof& p, int64_t nowNs) {
     }
     if (cs == nullptr)   // no pending challenge matches: a forgery or a stale Proof (a Proof names no key id) - logged, nothing changes
         return errorOut(logLine("peer link from node %d REFUSED: %s (no pending challenge matches)", peer_, refuseReasonText(RefuseReason::BadProof)));
-    // Issue #242: a v2 slot runs its DH only now that the Proof matched.  The secret dies (scrubbed) with this scope.
-    std::optional<EphSecret> shared;
-    if (cs->v2) {
-        shared.emplace();
-        if (!rune::crypto::x25519Shared(cs->ephPriv.bytes, cs->shareA, shared->bytes))
-            return errorOut(logLine("peer link from node %d REFUSED: %s (key share rejected)", peer_, refuseReasonText(RefuseReason::BadProof)));
+    // Copies: establishAsResponder_ clears the table the slot lives in.  Only v1 slots exist (issue #18): no DH.
+    const std::array<uint8_t, 32> nonceA = cs->nonceA, nonceB = cs->nonceB;
+    return establishAsResponder_(*key, nonceA, nonceB, cs->peerIncarnation, cs->keyId, nullptr, nowNs);
+}
+
+// Issue #18: a v2 Proof is checked against the cookie.  The nonceB it echoes must be the one the cookie derives from the
+// echoed Hello fields (under the current or the previous secret): until then no transcript MAC and no DH is computed.
+PeerHandshake::Out PeerHandshake::onProofV2(const PeerProofV2& p, int64_t nowNs) {
+    if (initiator() || p.from != peer_ || p.to != self_) return {};
+    const ClusterKey* key = keys_.byId(p.keyId);
+    if (!key)
+        return errorOut(logLine("peer link from node %d REFUSED: %s (unknown key id %016llx)", peer_,
+                                refuseReasonText(RefuseReason::BadProof), static_cast<unsigned long long>(p.keyId)));
+    rotateCookie_(nowNs);
+    EphSecret ephPriv;
+    bool matched = false;
+    for (const std::optional<EphSecret>* k : {&cookieCur_, &cookiePrev_}) {   // both derivations always run: constant work
+        if (!k->has_value()) continue;
+        std::array<uint8_t, 32> nonceB{};
+        EphSecret priv;
+        if (!cookie_(**k, peer_, self_, p.keyId, p.incarnation, p.nonceA, p.shareA, nonceB, priv)) continue;
+        const bool match = mac32Eq(nonceB, p.nonceB);
+        if (match && !matched) { matched = true; ephPriv = priv; }
     }
+    if (!matched)   // a forgery, a replay after an establishment, or a Challenge older than two rotations: logged, nothing changes
+        return errorOut(logLine("peer link from node %d REFUSED: %s (stale or forged cookie)", peer_, refuseReasonText(RefuseReason::BadProof)));
+    std::array<uint8_t, 32> shareB{};
+    if (!rune::crypto::x25519Public(ephPriv.bytes, shareB))
+        return errorOut(logLine("peer link from node %d: no ephemeral key available", peer_));
+    std::array<uint8_t, 64> wantMacA{};
+    if (!mac_(*key, false, peer_, self_, p.nonceA, p.nonceB, p.incarnation, incarnation_, p.keyId, wantMacA, &p.shareA, &shareB))
+        return {};
+    if (!macEq(wantMacA, p.macA))
+        return errorOut(logLine("peer link from node %d REFUSED: %s (key id %016llx)", peer_, refuseReasonText(RefuseReason::BadProof),
+                                static_cast<unsigned long long>(p.keyId)));
+    EphSecret shared;   // the DH runs only now that macA matched; scrubbed with this scope
+    if (!rune::crypto::x25519Shared(ephPriv.bytes, p.shareA, shared.bytes))
+        return errorOut(logLine("peer link from node %d REFUSED: %s (key share rejected)", peer_, refuseReasonText(RefuseReason::BadProof)));
+    return establishAsResponder_(*key, p.nonceA, p.nonceB, p.incarnation, p.keyId, &shared, nowNs);
+}
+
+PeerHandshake::Out PeerHandshake::establishAsResponder_(const ClusterKey& key, const std::array<uint8_t, 32>& nonceA,
+                                                        const std::array<uint8_t, 32>& nonceB, uint64_t peerIncarnation,
+                                                        uint64_t keyId, const EphSecret* shared, int64_t nowNs) {
     const uint32_t epoch = ++epochCounter_;
-    auto keys = deriveLinkKeys(*key, self_, peer_, false, cs->nonceA, cs->nonceB, epoch,
+    auto keys = deriveLinkKeys(key, self_, peer_, false, nonceA, nonceB, epoch,
                                shared ? std::optional<std::span<const uint8_t, 32>>(shared->bytes) : std::nullopt);
     PeerAccept a; a.from = self_; a.to = peer_; a.linkEpoch = epoch;
-    if (!keys || !confirmMac(*key, peer_, self_, cs->nonceA, cs->nonceB, epoch, a.confirm))
+    if (!keys || !confirmMac(key, peer_, self_, nonceA, nonceB, epoch, a.confirm))
         return errorOut(logLine("peer link with node %d: key derivation failed", peer_));
     // Issue #241: a re-handshake with the SAME initiator incarnation is installed receive-first - that initiator holds
     // the old epoch and keeps opening it, while it cannot open the new one before it processed this Accept (which
@@ -377,22 +464,24 @@ PeerHandshake::Out PeerHandshake::onProof(const PeerProof& p, int64_t nowNs) {
     // initiator (a new incarnation holds no old epoch), installs send-and-receive at once: holding back would only
     // drop frames the new initiator cannot open either way.
     const Established* live = liveLink_();
-    const bool receiveFirst = live != nullptr && live->peerIncarnation == cs->peerIncarnation;
-    Established e{*keys, cs->peerIncarnation, nowNs, nowNs};
+    const bool receiveFirst = live != nullptr && live->peerIncarnation == peerIncarnation;
+    Established e{*keys, peerIncarnation, nowNs, nowNs};
     if (receiveFirst) {
-        if (!initiatorConfirmMac(*key, peer_, self_, cs->nonceA, cs->nonceB, epoch, e.wantConfirm))
+        if (!initiatorConfirmMac(key, peer_, self_, nonceA, nonceB, epoch, e.wantConfirm))
             return errorOut(logLine("peer link with node %d: key derivation failed", peer_));
         e.unconfirmedAccept = a;
         e.acceptSentNs = nowNs;
     }
-    const uint64_t id = cs->keyId;
+    // Every outstanding Challenge is void now: the v1 table is cleared and (issue #18) both cookie secrets are replaced,
+    // so the Proof just consumed - or any other - replayed later matches nothing.
     for (auto& c : pending_) { c.used = false; c.ephPriv.scrub(); }
+    freshCookie_(nowNs);
     state_ = e;
     Out o = frameOut(a);
     o.established = *keys;
     o.established->install = receiveFirst ? LinkInstall::ReceiveOnly : LinkInstall::SendAndReceive;
     o.log = logLine("peer link with node %d established (epoch %u, key id %016llx%s)", peer_, epoch,
-                    static_cast<unsigned long long>(id), receiveFirst ? ", receive-first" : "");
+                    static_cast<unsigned long long>(keyId), receiveFirst ? ", receive-first" : "");
     return o;
 }
 

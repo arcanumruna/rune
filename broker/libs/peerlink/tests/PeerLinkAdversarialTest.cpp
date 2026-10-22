@@ -74,6 +74,7 @@ struct Sim {
             case 6: { pl::PeerConfirm m;   if (pl::PeerConfirm::decode(f.data(), f.size(), m))   absorb(to, e.hs.onConfirm(m, now)); break; }
             case 7: { pl::PeerHelloV2 m;   if (pl::PeerHelloV2::decode(f.data(), f.size(), m))   absorb(to, e.hs.onHelloV2(m, now)); break; }
             case 8: { pl::PeerChallengeV2 m; if (pl::PeerChallengeV2::decode(f.data(), f.size(), m)) absorb(to, e.hs.onChallengeV2(m, now)); break; }
+            case 9: { pl::PeerProofV2 m;   if (pl::PeerProofV2::decode(f.data(), f.size(), m))   absorb(to, e.hs.onProofV2(m, now)); break; }
             default: failure = "unexpected handshake tag " + std::to_string(f.empty() ? -1 : f[0]);
         }
     }
@@ -200,6 +201,11 @@ TEST(PeerLinkAdversarialRegression, NewMessagesTruncatedAtEveryOffsetNeverDecode
     sweep(h, pl::PeerHelloV2::kSize, [](const uint8_t* b, std::size_t n, pl::PeerHelloV2& m) { return pl::PeerHelloV2::decode(b, n, m); });
     pl::PeerChallengeV2 ch; ch.from = 2; ch.to = 1; ch.shareB.fill(5);
     sweep(ch, pl::PeerChallengeV2::kSize, [](const uint8_t* b, std::size_t n, pl::PeerChallengeV2& m) { return pl::PeerChallengeV2::decode(b, n, m); });
+    pl::PeerProofV2 pv; pv.from = 1; pv.to = 2; pv.nonceB.fill(6); pv.macA.fill(7);   // issue #18
+    sweep(pv, pl::PeerProofV2::kSize, [](const uint8_t* b, std::size_t n, pl::PeerProofV2& m) { return pl::PeerProofV2::decode(b, n, m); });
+    pl::PeerProof v1p; v1p.encode(buf); buf[0] = static_cast<uint8_t>(pl::PeerMsg::ProofV2);
+    pl::PeerProofV2 asProofV2;
+    EXPECT_FALSE(pl::PeerProofV2::decode(buf, pl::PeerProof::kSize, asProofV2)) << "a v1 Proof relabelled v2 is too short";
     // A v1 body under a v2 tag (and the reverse) never decodes, whatever its length.
     pl::PeerHello v1; v1.encode(buf); buf[0] = static_cast<uint8_t>(pl::PeerMsg::HelloV2);
     pl::PeerHelloV2 asV2;
@@ -209,7 +215,7 @@ TEST(PeerLinkAdversarialRegression, NewMessagesTruncatedAtEveryOffsetNeverDecode
     EXPECT_FALSE(pl::PeerHello::decode(buf, pl::PeerHelloV2::kSize, asV1)) << "a v2 Hello relabelled v1 is too long";
     for (int tag = 0; tag < 256; ++tag) {
         buf[0] = static_cast<uint8_t>(tag);
-        EXPECT_EQ(pl::peekPeerMsg(buf, 1), (tag >= 1 && tag <= 8) ? tag : 0) << tag;
+        EXPECT_EQ(pl::peekPeerMsg(buf, 1), (tag >= 1 && tag <= 9) ? tag : 0) << tag;
     }
 }
 
@@ -251,9 +257,10 @@ TEST(PeerLinkAdversarialRegression, ALowOrderShareUnderAValidMacNeverLinksAdvers
             hello.nonceA.fill(0x31); hello.shareA = lowOrder[i];
             auto c = b.onHelloV2(hello, kMs); ASSERT_TRUE(c.frame) << i;
             pl::PeerChallengeV2 ch; ASSERT_TRUE(pl::PeerChallengeV2::decode(c.frame->data(), c.frame->size(), ch));
-            pl::PeerProof pr; pr.from = 1; pr.to = 2;
+            pl::PeerProofV2 pr; pr.from = 1; pr.to = 2;   // issue #18: the echoes re-derive the responder's cookie
+            pr.keyId = keyId; pr.incarnation = 10; pr.nonceA = hello.nonceA; pr.shareA = hello.shareA; pr.nonceB = ch.nonceB;
             pr.macA = v2Mac(false, hello.nonceA, ch.nonceB, hello.shareA, ch.shareB, 10, 20);
-            auto o = b.onProof(pr, 2 * kMs);
+            auto o = b.onProofV2(pr, 2 * kMs);
             EXPECT_FALSE(o.established) << "no link keys from a low-order share " << i;
             EXPECT_FALSE(o.frame) << "no Accept";
             ASSERT_TRUE(o.log) << i;
@@ -266,8 +273,9 @@ TEST(PeerLinkAdversarialRegression, ALowOrderShareUnderAValidMacNeverLinksAdvers
             hello.shareA = pub;
             auto c2 = b2.onHelloV2(hello, kMs); ASSERT_TRUE(c2.frame);
             ASSERT_TRUE(pl::PeerChallengeV2::decode(c2.frame->data(), c2.frame->size(), ch));
+            pr.shareA = hello.shareA; pr.nonceB = ch.nonceB;
             pr.macA = v2Mac(false, hello.nonceA, ch.nonceB, hello.shareA, ch.shareB, 10, 20);
-            EXPECT_TRUE(b2.onProof(pr, 2 * kMs).established) << "control";
+            EXPECT_TRUE(b2.onProofV2(pr, 2 * kMs).established) << "control";
         }
         {   // The initiator: a ChallengeV2 with a low-order shareB under a VALID v2 macB -> no Proof, the state stays.
             pl::PeerHandshake a(1, 2, 10, keysOf('k'));
