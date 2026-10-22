@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <deque>
 #include <string>
 
@@ -22,6 +23,8 @@ constexpr int64_t kMs = 1'000'000;
 struct Pair {
     pl::PeerHandshake a, b;                       // a = node 1 (initiator), b = node 2 (responder)
     std::optional<pl::LinkKeys> ka, kb;
+    std::vector<pl::LinkKeys> estA, estB;                      // every established Out, in order (issue #241)
+    std::vector<std::pair<int, uint8_t>> dropOnce;             // (destination side, tag): the next such frame is lost
     std::vector<std::string> logsA, logsB;
     std::vector<std::pair<int, std::vector<uint8_t>>> trace;   // (destination side, frame): 0 -> a, 1 -> b
     std::deque<std::pair<int, std::vector<uint8_t>>> q;
@@ -32,7 +35,10 @@ struct Pair {
     void absorb(int producedBy, pl::PeerHandshake::Out o) {
         auto& logs = producedBy == 0 ? logsA : logsB;
         if (o.log) logs.push_back(o.log->str());
-        if (o.established) (producedBy == 0 ? ka : kb) = o.established;
+        if (o.established) {
+            (producedBy == 0 ? ka : kb) = o.established;
+            (producedBy == 0 ? estA : estB).push_back(*o.established);
+        }
         if (o.frame) {
             std::vector<uint8_t> v(o.frame->data(), o.frame->data() + o.frame->size());
             q.emplace_back(1 - producedBy, v); trace.emplace_back(1 - producedBy, v);
@@ -47,6 +53,7 @@ struct Pair {
             case 3: { pl::PeerProof m;     ASSERT_TRUE(pl::PeerProof::decode(f.data(), f.size(), m));     absorb(to, h.onProof(m, now)); break; }
             case 4: { pl::PeerAccept m;    ASSERT_TRUE(pl::PeerAccept::decode(f.data(), f.size(), m));    absorb(to, h.onAccept(m, now)); break; }
             case 5: { pl::PeerRefuse m;    ASSERT_TRUE(pl::PeerRefuse::decode(f.data(), f.size(), m));    absorb(to, h.onRefuse(m, now)); break; }
+            case 6: { pl::PeerConfirm m;   ASSERT_TRUE(pl::PeerConfirm::decode(f.data(), f.size(), m));   absorb(to, h.onConfirm(m, now)); break; }
             default: FAIL() << "unknown tag";
         }
     }
@@ -56,6 +63,8 @@ struct Pair {
         absorb(1, b.tick(now));
         for (int guard = 0; !q.empty() && guard < 64; ++guard) {
             auto [to, f] = q.front(); q.pop_front();
+            const auto lost = std::find(dropOnce.begin(), dropOnce.end(), std::make_pair(to, f.empty() ? uint8_t{0} : f[0]));
+            if (lost != dropOnce.end()) { dropOnce.erase(lost); continue; }
             deliver(to, f, now);
         }
     }
@@ -508,4 +517,153 @@ TEST(PeerLinkRegression, ATimedOutHintRekeyDoesNotDelayTheNextOneRegression) {
     pl::PeerRefuse poke; poke.from = 2; poke.to = 1; poke.reason = pl::RefuseReason::NoLink;
     auto again = p.a.onRefuse(poke, 3'000 * kMs + pl::PeerHandshake::kAwaitNs + pl::PeerHandshake::kRetryNs);
     EXPECT_TRUE(again.frame);
+}
+
+// ---- issue #241: a re-handshake with the same initiator incarnation installs the new epoch receive-first ----
+
+namespace {
+constexpr auto kRecvOnly = pl::LinkInstall::ReceiveOnly;
+constexpr auto kBoth     = pl::LinkInstall::SendAndReceive;
+
+/// A linked pair, then a same-incarnation re-handshake (a hint from a silent peer) started at `now` - not yet delivered.
+Pair rehandshaking(int64_t now) {
+    Pair p(keys('k'), keys('k')); p.run();
+    EXPECT_TRUE(p.ka && p.kb);
+    p.estA.clear(); p.estB.clear(); p.trace.clear();
+    auto o = p.a.onUnknownEpoch(7, now);
+    EXPECT_TRUE(o.frame);
+    p.absorb(0, std::move(o));
+    return p;
+}
+const pl::Established* est(const pl::PeerHandshake& h) { return std::get_if<pl::Established>(&h.state()); }
+} // namespace
+
+TEST(PeerHandshakeRegression, ASameIncarnationRehandshakeIsReceiveFirstUntilTheConfirmRegression) {
+    const int64_t now = 5'000 * kMs;
+    Pair p = rehandshaking(now);
+    p.run(now);
+    ASSERT_EQ(p.estB.size(), 2u) << "receive-only at the Proof, then the promotion at the Confirm";
+    EXPECT_EQ(p.estB[0].epoch, 2u);
+    EXPECT_EQ(p.estB[0].install, kRecvOnly) << "the responder must not seal under E2 before the initiator holds it";
+    EXPECT_EQ(p.estB[1].epoch, 2u);
+    EXPECT_EQ(p.estB[1].install, kBoth);
+    EXPECT_EQ(p.estB[1].sendMaster, p.estB[0].sendMaster);
+    ASSERT_EQ(p.estA.size(), 1u);
+    EXPECT_EQ(p.estA[0].install, kBoth) << "the initiator seals at once: the responder already holds E2";
+    EXPECT_EQ(p.estA[0].sendMaster, p.estB[1].recvMaster);
+    const auto confirm = lastOf<pl::PeerConfirm>(p, 1);
+    EXPECT_EQ(confirm.linkEpoch, 2u);
+    EXPECT_EQ(confirm.from, 1); EXPECT_EQ(confirm.to, 2);
+    ASSERT_NE(est(p.b), nullptr);
+    EXPECT_FALSE(est(p.b)->unconfirmedAccept) << "confirmed";
+}
+
+TEST(PeerHandshakeRegression, ALostConfirmIsRecoveredByTheResentAcceptRegression) {
+    const int64_t now = 5'000 * kMs;
+    Pair p = rehandshaking(now);
+    p.dropOnce.push_back({1, static_cast<uint8_t>(pl::PeerMsg::Confirm)});
+    p.run(now);
+    ASSERT_EQ(p.estB.size(), 1u);
+    EXPECT_EQ(p.estB[0].install, kRecvOnly);
+    ASSERT_NE(est(p.b), nullptr);
+    ASSERT_TRUE(est(p.b)->unconfirmedAccept) << "still awaiting the Confirm";
+    ASSERT_NE(est(p.a), nullptr);
+    EXPECT_EQ(est(p.a)->keys.epoch, 2u);
+    p.run(now + pl::PeerHandshake::kRetryNs - 1);
+    EXPECT_EQ(p.estB.size(), 1u) << "nothing re-sent before kRetryNs";
+    p.run(now + pl::PeerHandshake::kRetryNs);     // the Accept again -> the Established initiator re-sends its Confirm
+    ASSERT_EQ(p.estB.size(), 2u);
+    EXPECT_EQ(p.estB[1].install, kBoth);
+    EXPECT_EQ(p.estB[1].epoch, 2u);
+    EXPECT_EQ(p.estA.size(), 1u) << "the re-sent Accept changes nothing at the initiator but the Confirm";
+    EXPECT_FALSE(est(p.b)->unconfirmedAccept);
+    p.run(now + 3 * pl::PeerHandshake::kRetryNs);
+    EXPECT_EQ(p.estB.size(), 2u) << "confirmed: no more Accepts";
+}
+
+TEST(PeerHandshakeRegression, AForgedStaleOrMisaddressedConfirmPromotesNothingRegression) {
+    const int64_t now = 5'000 * kMs;
+    Pair p = rehandshaking(now);
+    p.dropOnce.push_back({1, static_cast<uint8_t>(pl::PeerMsg::Confirm)});
+    p.run(now);
+    const auto real = lastOf<pl::PeerConfirm>(p, 1);
+    ASSERT_EQ(real.linkEpoch, 2u);
+    auto forged = real; forged.confirm[0] ^= 1;
+    EXPECT_FALSE(p.b.onConfirm(forged, now).established) << "wrong MAC";
+    auto stale = real; stale.linkEpoch = 1;
+    EXPECT_FALSE(p.b.onConfirm(stale, now).established) << "wrong epoch";
+    auto future = real; future.linkEpoch = 3;
+    EXPECT_FALSE(p.b.onConfirm(future, now).established) << "wrong epoch";
+    auto other = real; other.from = 3;
+    EXPECT_FALSE(p.b.onConfirm(other, now).established) << "from another node";
+    auto misaddressed = real; misaddressed.to = 5;
+    EXPECT_FALSE(p.b.onConfirm(misaddressed, now).established) << "to another node";
+    EXPECT_FALSE(p.a.onConfirm(real, now).established) << "the initiator never takes a Confirm";
+    ASSERT_TRUE(est(p.b)->unconfirmedAccept) << "nothing changed";
+    const auto ok = p.b.onConfirm(real, now);
+    ASSERT_TRUE(ok.established);
+    EXPECT_EQ(ok.established->install, kBoth);
+    EXPECT_FALSE(p.b.onConfirm(real, now).established) << "a duplicate Confirm is a no-op";
+}
+
+TEST(PeerHandshakeRegression, AFirstLinkAndANewInitiatorIncarnationInstallSendAndReceiveAtOnceRegression) {
+    Pair p(keys('k'), keys('k')); p.run();
+    ASSERT_EQ(p.estB.size(), 1u);
+    EXPECT_EQ(p.estB[0].install, kBoth) << "a first link: nothing to protect";
+    ASSERT_NE(est(p.b), nullptr);
+    EXPECT_FALSE(est(p.b)->unconfirmedAccept);
+    // The initiator restarts (a new incarnation holds no old epoch): immediate install, as before.
+    p.a = pl::PeerHandshake(1, 2, 11, keys('k'));
+    p.estA.clear(); p.estB.clear();
+    p.run(1'000 * kMs);
+    ASSERT_EQ(p.estB.size(), 1u);
+    EXPECT_EQ(p.estB[0].epoch, 2u);
+    EXPECT_EQ(p.estB[0].install, kBoth);
+    EXPECT_FALSE(est(p.b)->unconfirmedAccept);
+}
+
+TEST(PeerHandshakeRegression, AnAuthenticatedFrameUnderTheUnconfirmedEpochPromotesItRegression) {
+    const int64_t now = 5'000 * kMs;
+    Pair p = rehandshaking(now);
+    p.dropOnce.push_back({1, static_cast<uint8_t>(pl::PeerMsg::Confirm)});   // a legacy initiator sends none
+    p.run(now);
+    ASSERT_TRUE(est(p.b) && est(p.b)->unconfirmedAccept);
+    EXPECT_FALSE(p.b.onPeerUsedEpoch(1, now).established) << "the old epoch proves nothing";
+    EXPECT_FALSE(p.b.onPeerUsedEpoch(3, now).established);
+    EXPECT_FALSE(p.a.onPeerUsedEpoch(2, now).established) << "the initiator has nothing unconfirmed";
+    const auto o = p.b.onPeerUsedEpoch(2, now);
+    ASSERT_TRUE(o.established);
+    EXPECT_EQ(o.established->epoch, 2u);
+    EXPECT_EQ(o.established->install, kBoth);
+    EXPECT_FALSE(est(p.b)->unconfirmedAccept);
+    EXPECT_FALSE(p.b.onPeerUsedEpoch(2, now).established) << "promoted once";
+}
+
+TEST(PeerHandshakeRegression, AnAcceptMacIsNeverAValidConfirmRegression) {
+    const int64_t now = 5'000 * kMs;
+    Pair p = rehandshaking(now);
+    p.dropOnce.push_back({1, static_cast<uint8_t>(pl::PeerMsg::Confirm)});
+    p.run(now);
+    const auto accept = lastOf<pl::PeerAccept>(p, 0);
+    ASSERT_EQ(accept.linkEpoch, 2u);
+    pl::PeerConfirm reflected; reflected.from = 1; reflected.to = 2; reflected.linkEpoch = accept.linkEpoch;
+    reflected.confirm = accept.confirm;
+    EXPECT_FALSE(p.b.onConfirm(reflected, now).established) << "the Accept's MAC reflected as a Confirm";
+    ASSERT_TRUE(est(p.b)->unconfirmedAccept);
+}
+
+TEST(PeerHandshakeRegression, TheConfirmMessageRoundTripsAndRejectsWrongSizesRegression) {
+    pl::PeerConfirm c; c.from = 1; c.to = 2; c.linkEpoch = 0xA1B2C3D4u; c.confirm.fill(0x5A);
+    uint8_t buf[pl::kMaxPeerLinkFrame];
+    c.encode(buf);
+    EXPECT_EQ(pl::peekPeerMsg(buf, pl::PeerConfirm::kSize), 6);
+    pl::PeerConfirm d;
+    ASSERT_TRUE(pl::PeerConfirm::decode(buf, pl::PeerConfirm::kSize, d));
+    EXPECT_EQ(d.from, 1); EXPECT_EQ(d.to, 2); EXPECT_EQ(d.linkEpoch, 0xA1B2C3D4u); EXPECT_EQ(d.confirm, c.confirm);
+    EXPECT_FALSE(pl::PeerConfirm::decode(buf, pl::PeerConfirm::kSize - 1, d));
+    EXPECT_FALSE(pl::PeerConfirm::decode(buf, pl::PeerConfirm::kSize + 1, d));
+    pl::PeerAccept asAccept;
+    EXPECT_FALSE(pl::PeerAccept::decode(buf, pl::PeerAccept::kSize, asAccept)) << "same size, other tag";
+    buf[0] = 7;
+    EXPECT_EQ(pl::peekPeerMsg(buf, pl::PeerConfirm::kSize), 0) << "an unknown tag";
 }

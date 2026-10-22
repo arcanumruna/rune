@@ -12,9 +12,15 @@
 // per-direction master, so no two senders ever share a (key, nonce) space; the receiver keeps a 64-wide replay
 // window per (peer, epoch, senderId).
 //
-// Hot path: seal / open never allocate.  The cipher contexts are built in installLink (cold) and — for a sender id
-// not seen before — on the first frame from it (the receiving side derives lazily; the owner's OWN sender id is
-// derived at install time, so the steady state of the symmetric deployment never builds one).
+// Hot path: seal / open never allocate.  The cipher contexts are built in installLink (cold).
+//
+// Epochs (issue #241): each peer holds up to kEpochSlots link epochs, each with BOTH its ciphers, and ONE of them is
+// the send epoch.  A re-handshaked epoch is installed RECEIVE-ONLY first (the responder keeps sealing under the old
+// epoch until the initiator proved it holds the new one) and promoted by a second install of the same epoch.  An older
+// epoch is never dropped on a timer or on an event: one instance receives one peer sender over several Aeron streams
+// that are not ordered against each other, so "a newer epoch was seen" never proves no older frame is in flight.  A
+// slot is evicted only under slot pressure (the oldest one that is not the send epoch), which the handshake's
+// exchange rate limit makes rare.
 #include <rune/crypto/Aead.h>
 #include <rune/peerlink/PeerLinkKeys.h>
 
@@ -22,7 +28,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <optional>
 #include <variant>
 
@@ -32,7 +37,7 @@ inline constexpr std::size_t kPeerHeaderBytes   = 16;
 inline constexpr std::size_t kPeerFrameOverhead = kPeerHeaderBytes + rune::crypto::kTagSize;   // 32
 inline constexpr uint8_t     kPeerFrameMagic    = 0xB7;
 
-/// The steady clock in ns - the ONE clock install / open measure the old epoch's grace period with.
+/// The steady clock in ns (callers pass it to installLink's unused `nowNs`; kept for its call sites).
 [[nodiscard]] inline int64_t steadyNowNs() noexcept {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -44,8 +49,7 @@ struct PeerPlain {};
 class PeerFrameCrypto {
 public:
     static constexpr std::size_t kMaxPeers       = 16;   // == FollowerSlots::kMaxReplicas
-    static constexpr int64_t     kRetainNs       = 2'000'000'000;   // the old epoch's grace period (D33)
-    static constexpr int64_t     kClockNow       = std::numeric_limits<int64_t>::min();   // "read the clock yourself"
+    static constexpr std::size_t kEpochSlots     = 3;    // epochs held per peer (issue #241): no timer, slot pressure only
 
     PeerFrameCrypto(int32_t selfNode, uint8_t senderId);
     PeerFrameCrypto(PeerFrameCrypto&&) noexcept            = default;
@@ -53,14 +57,27 @@ public:
     PeerFrameCrypto(const PeerFrameCrypto&)                = delete;
     PeerFrameCrypto& operator=(const PeerFrameCrypto&)     = delete;
 
-    /// COLD.  A link to `peer` was established (a new epoch replaces the current one; the old one stays valid at
-    /// this receiver for kRetainNs).  False: the table is full, a node id does not fit the u16 header field, or a
-    /// cipher could not be built - the link is then not usable (frames to `peer` drop, counted).
+    /// COLD.  Install `keys.epoch` of the link to `peer` (issue #241):
+    ///   - a slot already holding that epoch with the same masters keeps its windows and sequence numbers (the
+    ///     promotion of a receive-only epoch);
+    ///   - the same epoch number with other masters (a restarted responder reused it) replaces that slot fresh;
+    ///   - otherwise a free slot, else the slot with the oldest install that is not the send epoch.
+    /// keys.install == SendAndReceive then makes it the send epoch; ReceiveOnly leaves the send epoch alone.
+    /// `nowNs` is unused (epochs never expire on a timer); kept for its many call sites.  False: the table is full, a
+    /// node id does not fit the u16 header field, or a cipher could not be built - the link is then not usable
+    /// (frames to `peer` drop, counted).
     bool installLink(int32_t peer, const LinkKeys& keys, int64_t nowNs);
 
+    /// A send epoch is set for `peer`.
     [[nodiscard]] bool hasLink(int32_t peer) const noexcept;
-    /// The current epoch of the link to `peer` (0 = none).
+    /// The SEND epoch of the link to `peer` (0 = none).
     [[nodiscard]] uint32_t currentEpoch(int32_t peer) const noexcept;
+    /// Test-visible: `epoch` of `peer` is held in a slot (it opens frames).
+    [[nodiscard]] bool holdsEpoch(int32_t peer, uint32_t epoch) const noexcept;
+    /// The (peer, epoch) of the last authenticated frame under an epoch installed AFTER the peer's send epoch - the peer
+    /// proved it holds an epoch we hold receive-only.  Consumed once.  The instance never promotes itself: the owner
+    /// hands it to the PeerLinkAgent, whose promotion comes back through installLink(SendAndReceive).
+    [[nodiscard]] bool takePeerUsedEpoch(int32_t& peer, uint32_t& epoch) noexcept;
 
     /// Seal `plain` for `peer` into `out` (cap >= len + kPeerFrameOverhead).  Returns the frame length, or 0 = no
     /// established link / too small / cipher error: the caller sends NOTHING (the drop is counted here).
@@ -75,11 +92,11 @@ public:
     enum class OpenResult : uint8_t { Ok, NotPeerFrame, UnknownPeer, UnknownEpoch, BadTag, Replay, BadSender };
     /// Open into `out` (never in place: AES-GCM writes unauthenticated plaintext before it checks the tag).  Never
     /// dispatches anything that did not verify.  `fromNode` / `epoch` are reported from the header as soon as it
-    /// parsed (UnknownEpoch included, so the control thread can re-handshake).  `nowNs` is only read for a frame
-    /// of a non-current epoch; kClockNow = the steady clock.
+    /// parsed (UnknownEpoch included, so the control thread can re-handshake).  The epoch is looked up among the
+    /// peer's slots (a scan of kEpochSlots).
     [[nodiscard]] OpenResult open(const uint8_t* frame, std::size_t len, uint8_t* out, std::size_t cap,
                                   std::size_t& outLen, int32_t& fromNode, uint32_t& epoch,
-                                  int64_t nowNs = kClockNow, bool commitWindow = true) noexcept;
+                                  bool commitWindow = true) noexcept;
     /// For a caller that opened with commitWindow = false: commit the replay window once the frame was DISPATCHED
     /// (not ABORTed), so a redelivery after back-pressure re-opens instead of reading as a replay.
     void commitOpened(int32_t fromNode, uint32_t epoch, uint64_t seq) noexcept;
@@ -108,18 +125,24 @@ private:
         std::optional<rune::crypto::AeadCipher>  send;                    // THIS sender's key for this direction
         uint64_t                                 sendSeq = 0;
         RecvSender                               recv;                    // the ONE sender id this receiver's role accepts
+        uint64_t                                 installOrder = 0;        // from installs_ (the eviction order)
     };
-    struct Retired { EpochState state; int64_t untilNs = 0; };
+    static constexpr uint8_t kNoSend = 0xFF;
     struct PeerSlot {
-        int32_t                  peer = -1;
-        std::optional<EpochState> current;
-        std::optional<Retired>    previous;
-        uint64_t                  authFrames = 0;
+        int32_t                                             peer = -1;
+        std::array<std::optional<EpochState>, kEpochSlots>  epochs;
+        uint8_t                                             sendIdx = kNoSend;   // the send epoch's slot
+        uint64_t                                            sendOrder = 0;       // its installOrder (0 = none)
+        uint64_t                                            authFrames = 0;
     };
+    struct PeerEpoch { int32_t peer = -1; uint32_t epoch = 0; };
 
     [[nodiscard]] const PeerSlot* slotOf_(int32_t peer) const noexcept;
     [[nodiscard]] PeerSlot* slotOf_(int32_t peer) noexcept;
-    [[nodiscard]] EpochState* epochOf_(PeerSlot& s, uint32_t epoch, int64_t nowNs) noexcept;
+    [[nodiscard]] static EpochState* epochOf_(PeerSlot& s, uint32_t epoch) noexcept;
+    [[nodiscard]] static const EpochState* sendOf_(const PeerSlot& s) noexcept {
+        return s.sendIdx == kNoSend ? nullptr : &*s.epochs[s.sendIdx];
+    }
     [[nodiscard]] std::size_t sealAt_(int32_t peer, const uint8_t* plain, std::size_t len, uint8_t* frame,
                                       std::size_t cap, bool inPlace) noexcept;
     OpenResult drop_(OpenResult r) noexcept { ++drops_; ++openDrops_[static_cast<std::size_t>(r)]; return r; }
@@ -130,6 +153,8 @@ private:
     std::size_t                used_ = 0;
     uint64_t                   drops_ = 0, noLinkDrops_ = 0;
     std::array<uint64_t, 7>    openDrops_{};
+    uint64_t                   installs_ = 0;
+    std::optional<PeerEpoch>   peerUsed_;          // takePeerUsedEpoch's single-slot latch
 };
 
 /// Chosen at transport construction (Rule 3): PeerPlain = today's bytes, PeerFrameCrypto = sealed.

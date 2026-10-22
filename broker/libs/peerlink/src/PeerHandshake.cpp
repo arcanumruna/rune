@@ -19,6 +19,7 @@ void putN(uint8_t*& p, const uint8_t* s, std::size_t n) { std::memcpy(p, s, n); 
 constexpr char kLabelB[] = "rune-peer-v1|B";
 constexpr char kLabelA[] = "rune-peer-v1|A";
 constexpr char kLabelC[] = "rune-peer-v1|C";
+constexpr char kLabelD[] = "rune-peer-v1|D";
 
 /// macB = HMAC(master, "rune-peer-v1|B" || from=B || to=A || nonceA || nonceB || incA || incB || keyId)
 /// macA = HMAC(master, "rune-peer-v1|A" || from=A || to=B || nonceB || nonceA || incB || incA || keyId)
@@ -57,6 +58,26 @@ bool confirmMac(const ClusterKey& key, int32_t idA, int32_t idB, const std::arra
                             {buf, static_cast<std::size_t>(p - buf)}, d) || d.size != 64) return false;
     std::memcpy(out.data(), d.bytes.data(), 32);
     return true;
+}
+
+/// Issue #241 - the initiator's Confirm: HMAC(master, "rune-peer-v1|D" || from=A || to=B || nonceA || nonceB || epoch),
+/// 32 bytes.  The sibling of confirmMac with its own label and the direction reversed: an Accept's MAC is never a Confirm.
+bool initiatorConfirmMac(const ClusterKey& key, int32_t idA, int32_t idB, const std::array<uint8_t, 32>& nonceA,
+                         const std::array<uint8_t, 32>& nonceB, uint32_t epoch, std::array<uint8_t, 32>& out) {
+    uint8_t buf[sizeof kLabelD - 1 + 4 + 4 + 32 + 32 + 4];
+    uint8_t* p = buf;
+    putN(p, reinterpret_cast<const uint8_t*>(kLabelD), sizeof kLabelD - 1);
+    put32(p, idA); put32(p, idB); putN(p, nonceA.data(), 32); putN(p, nonceB.data(), 32);
+    detail::putLe(p, epoch, 4); p += 4;
+    rune::crypto::DigestBytes d;
+    if (!rune::crypto::hmac(rune::crypto::Digest::Sha512, {key.master.data(), key.master.size()},
+                            {buf, static_cast<std::size_t>(p - buf)}, d) || d.size != 64) return false;
+    std::memcpy(out.data(), d.bytes.data(), 32);
+    return true;
+}
+
+bool mac32Eq(const std::array<uint8_t, 32>& a, const std::array<uint8_t, 32>& b) {
+    return rune::crypto::constantTimeEqual({a.data(), a.size()}, {b.data(), b.size()});
 }
 
 bool macEq(const std::array<uint8_t, 64>& a, const std::array<uint8_t, 64>& b) {
@@ -131,9 +152,19 @@ PeerHandshake::Out PeerHandshake::rekey_(int64_t nowNs) {
     auto* e = std::get_if<Established>(&state_);
     if (!e || nowNs - e->lastAuthNs < kSilenceNs || nowNs - lastExchangeNs_ < kRetryNs ||
         nowNs - lastHintRekeyNs_ < kHintRekeyGapNs) return {};
+    return startRekey_(*e, nowNs);
+}
+
+PeerHandshake::Out PeerHandshake::rekeyForTest(int64_t nowNs) {
+    auto* e = std::get_if<Established>(&state_);
+    if (!initiator() || !e) return {};
+    return startRekey_(*e, nowNs);
+}
+
+PeerHandshake::Out PeerHandshake::startRekey_(const Established& live, int64_t nowNs) {
     HelloSent hs;
     if (!rune::crypto::randomBytes({hs.nonceA.data(), hs.nonceA.size()})) return {};
-    hs.keyId = keys_.current.keyId; hs.sentNs = nowNs; hs.startNs = nowNs; hs.prior = *e;
+    hs.keyId = keys_.current.keyId; hs.sentNs = nowNs; hs.startNs = nowNs; hs.prior = live;   // a copy, before state_ changes
     lastExchangeNs_ = nowNs;
     PeerHello m; m.from = self_; m.to = peer_; m.keyId = hs.keyId; m.incarnation = incarnation_; m.nonceA = hs.nonceA;
     state_ = hs;
@@ -175,6 +206,12 @@ PeerHandshake::Out PeerHandshake::tick(int64_t nowNs) {
         idle->retryAtNs = nowNs + kRetryNs;
         PeerRefuse m; m.from = self_; m.to = peer_; m.reason = RefuseReason::NoLink;     // "start over": a poke, not a refusal
         return frameOut(m);
+    }
+    // Issue #241: an Accept not yet confirmed is re-sent (the same bytes) - retransmission only; the promotion waits for
+    // the Confirm or for an authenticated frame under the epoch, never for a timer.
+    if (auto* e = std::get_if<Established>(&state_); e && e->unconfirmedAccept && nowNs - e->acceptSentNs >= kRetryNs) {
+        e->acceptSentNs = nowNs;
+        return frameOut(*e->unconfirmedAccept);
     }
     return {};
 }
@@ -254,18 +291,39 @@ PeerHandshake::Out PeerHandshake::onProof(const PeerProof& p, int64_t nowNs) {
     PeerAccept a; a.from = self_; a.to = peer_; a.linkEpoch = epoch;
     if (!keys || !confirmMac(*key, peer_, self_, cs->nonceA, cs->nonceB, epoch, a.confirm))
         return errorOut(logLine("peer link with node %d: key derivation failed", peer_));
+    // Issue #241: a re-handshake with the SAME initiator incarnation is installed receive-first - that initiator holds
+    // the old epoch and keeps opening it, while it cannot open the new one before it processed this Accept (which
+    // travels on another stream, so nothing orders it before our next sealed frame).  A first link, or a restarted
+    // initiator (a new incarnation holds no old epoch), installs send-and-receive at once: holding back would only
+    // drop frames the new initiator cannot open either way.
+    const Established* live = liveLink_();
+    const bool receiveFirst = live != nullptr && live->peerIncarnation == cs->peerIncarnation;
     Established e{*keys, cs->peerIncarnation, nowNs, nowNs};
+    if (receiveFirst) {
+        if (!initiatorConfirmMac(*key, peer_, self_, cs->nonceA, cs->nonceB, epoch, e.wantConfirm))
+            return errorOut(logLine("peer link with node %d: key derivation failed", peer_));
+        e.unconfirmedAccept = a;
+        e.acceptSentNs = nowNs;
+    }
     const uint64_t id = cs->keyId;
     for (auto& c : pending_) c.used = false;
     state_ = e;
     Out o = frameOut(a);
     o.established = *keys;
-    o.log = logLine("peer link with node %d established (epoch %u, key id %016llx)", peer_, epoch, static_cast<unsigned long long>(id));
+    o.established->install = receiveFirst ? LinkInstall::ReceiveOnly : LinkInstall::SendAndReceive;
+    o.log = logLine("peer link with node %d established (epoch %u, key id %016llx%s)", peer_, epoch,
+                    static_cast<unsigned long long>(id), receiveFirst ? ", receive-first" : "");
     return o;
 }
 
 PeerHandshake::Out PeerHandshake::onAccept(const PeerAccept& a, int64_t nowNs) {
     if (!initiator() || a.from != peer_ || a.to != self_) return {};
+    // Issue #241: the responder re-sent the Accept of the epoch we hold (our Confirm was lost): the Confirm again,
+    // nothing else changes.  Any other Accept while Established is ignored.
+    if (auto* e = std::get_if<Established>(&state_)) {
+        if (e->confirm && a.linkEpoch == e->keys.epoch && mac32Eq(a.confirm, e->acceptConfirm)) return frameOut(*e->confirm);
+        return {};
+    }
     auto* cs = std::get_if<ChallengeSent>(&state_);
     if (!cs) return {};
     const ClusterKey* key = keys_.byId(cs->keyId);
@@ -275,15 +333,23 @@ PeerHandshake::Out PeerHandshake::onAccept(const PeerAccept& a, int64_t nowNs) {
         !rune::crypto::constantTimeEqual({want.data(), want.size()}, {a.confirm.data(), a.confirm.size()}))
         return {};    // a forged Accept: ignored, the real one may still come
     auto keys = deriveLinkKeys(*key, self_, peer_, true, cs->nonceA, cs->nonceB, a.linkEpoch);
-    if (!keys) { restorePrior_(cs->prior, nowNs); return {}; }
+    PeerConfirm c; c.from = self_; c.to = peer_; c.linkEpoch = a.linkEpoch;
+    if (!keys || !initiatorConfirmMac(*key, self_, peer_, cs->nonceA, cs->nonceB, a.linkEpoch, c.confirm)) {
+        restorePrior_(cs->prior, nowNs);
+        return {};
+    }
     Established e{*keys, cs->peerIncarnation, nowNs, nowNs};
+    e.confirm = c;
+    e.acceptConfirm = a.confirm;
     const uint64_t id = cs->keyId;
     // The hint-rekey cap is armed only by a rekey that COMPLETED against the same incarnation (the hint was false):
     // an attempt that timed out (a restarted responder not yet answering) must not delay the next one.
     if (cs->prior && cs->prior->peerIncarnation == cs->peerIncarnation) lastHintRekeyNs_ = nowNs;
     state_ = e;
-    Out o;
-    o.established = *keys;
+    // The initiator seals under the new epoch at once (the responder already holds it receive-only) and tells the
+    // responder so: the Confirm.  A legacy responder ignores it as a malformed frame.
+    Out o = frameOut(c);
+    o.established = *keys;   // SendAndReceive
     o.log = logLine("peer link with node %d established (epoch %u, key id %016llx)", peer_, a.linkEpoch, static_cast<unsigned long long>(id));
     return o;
 }
@@ -300,6 +366,37 @@ PeerHandshake::Out PeerHandshake::onUnknownEpoch(uint32_t epoch, int64_t nowNs) 
     const auto* e = std::get_if<Established>(&state_);
     if (!e || e->keys.epoch == epoch) return {};
     return rekey_(nowNs);
+}
+
+const Established* PeerHandshake::liveLink_() const noexcept {
+    if (const auto* e = std::get_if<Established>(&state_)) return e;
+    if (const auto* h = std::get_if<HelloSent>(&state_)) return h->prior ? &*h->prior : nullptr;
+    if (const auto* c = std::get_if<ChallengeSent>(&state_)) return c->prior ? &*c->prior : nullptr;
+    return nullptr;
+}
+
+PeerHandshake::Out PeerHandshake::promote_(Established& e, const char* why) {
+    e.unconfirmedAccept.reset();
+    Out o;
+    o.established = e.keys;
+    o.established->install = LinkInstall::SendAndReceive;
+    o.log = logLine("peer link with node %d: epoch %u confirmed (%s), sealing under it", peer_, e.keys.epoch, why);
+    return o;
+}
+
+PeerHandshake::Out PeerHandshake::onConfirm(const PeerConfirm& c, int64_t /*nowNs*/) {
+    if (initiator() || c.from != peer_ || c.to != self_) return {};
+    auto* e = std::get_if<Established>(&state_);
+    // A forged, stale or duplicate Confirm: silently nothing (like a forged Accept).  The MAC compare is constant time.
+    if (!e || !e->unconfirmedAccept || c.linkEpoch != e->keys.epoch || !mac32Eq(c.confirm, e->wantConfirm)) return {};
+    return promote_(*e, "confirm");
+}
+
+PeerHandshake::Out PeerHandshake::onPeerUsedEpoch(uint32_t epoch, int64_t /*nowNs*/) {
+    if (initiator()) return {};
+    auto* e = std::get_if<Established>(&state_);
+    if (!e || !e->unconfirmedAccept || epoch != e->keys.epoch) return {};
+    return promote_(*e, "authenticated frame");
 }
 
 } // namespace rune::peerlink

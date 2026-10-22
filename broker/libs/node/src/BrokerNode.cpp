@@ -3520,8 +3520,10 @@ void BrokerNode::onPeerLinkEstablished_(int32_t peer, const rune::peerlink::Link
                            "control-thread transport - its frames are dropped until the next handshake",
                            config_.nodeId, peer, k.epoch);
     peerLinkFanout_.post(peer, k);
-    // Frames sent under the previous epoch before the peer installed the new keys are simply dropped by it (counted).
-    spdlog::debug("BrokerNode[{}]: peer link with node {} installed (epoch {})", config_.nodeId, peer, k.epoch);
+    // Issue #241: a re-handshake's responder installs receive-only (it keeps sealing under the old epoch) and promotes on
+    // the Confirm; every transport keeps its older epochs in slots, so no frame in flight under either one is dropped.
+    spdlog::debug("BrokerNode[{}]: peer link with node {} installed (epoch {}, {})", config_.nodeId, peer, k.epoch,
+                  k.install == rune::peerlink::LinkInstall::ReceiveOnly ? "receive-only" : "send-and-receive");
 }
 
 int BrokerNode::servicePeerLinks_(int64_t nowNs) {
@@ -3532,6 +3534,10 @@ int BrokerNode::servicePeerLinks_(int64_t nowNs) {
         int32_t peer = -1; uint32_t epoch = 0;
         if (aeronIngress_ && aeronIngress_->takeUnknownEpoch(peer, epoch)) peerLinkAgent_->onUnknownEpoch(peer, epoch, nowNs);
         if (replTransport_ && replTransport_->takeUnknownEpoch(peer, epoch)) peerLinkAgent_->onUnknownEpoch(peer, epoch, nowNs);
+        // Issue #241: an authenticated frame under an epoch held receive-only: the peer holds it (the promotion
+        // trigger for a legacy initiator that sends no Confirm).
+        if (aeronIngress_ && aeronIngress_->takePeerUsedEpoch(peer, epoch)) peerLinkAgent_->onPeerUsedEpoch(peer, epoch, nowNs);
+        if (replTransport_ && replTransport_->takePeerUsedEpoch(peer, epoch)) peerLinkAgent_->onPeerUsedEpoch(peer, epoch, nowNs);
     }
     // An authenticated frame from a peer proves it is alive: only a peer that has been silent for a second can be
     // rekeyed by an unauthenticated hint.
@@ -3587,6 +3593,8 @@ BrokerNode::PeerLinkSnap BrokerNode::peerLinksForTest() {
         for (const uint64_t w : workerPeerDrops_) v.workerDropsReported += w;
         v.adminDropsReported = adminPeerDrops_;
         v.sealed      = udpSink_ && udpSink_->peerSealed();
+        v.unknownEpochDrops = (aeronIngress_ ? aeronIngress_->unknownEpochDrops() : 0u) +
+                              (replTransport_ ? replTransport_->unknownEpochFrames() : 0u);
         for (const auto& peer : config_.peers) {
             if (peer.id == config_.nodeId) continue;
             v.peers.push_back(peer.id);
@@ -3598,6 +3606,25 @@ BrokerNode::PeerLinkSnap BrokerNode::peerLinksForTest() {
 
 uint32_t BrokerNode::workerPeerLinkEpochForTest(int32_t w, int32_t peer) {
     return onWorkerThreadForTest(w, [peer](Worker& wk) -> uint32_t { return wk.peerLinkEpochForTest(peer); });
+}
+
+uint64_t BrokerNode::workerPeerUnknownEpochDropsForTest(int32_t w) {
+    return onWorkerThreadForTest(w, [](Worker& wk) -> uint64_t {
+        const auto* t = wk.replicationTransport();
+        return t != nullptr ? t->unknownEpochFrames() : 0u;
+    });
+}
+
+uint64_t BrokerNode::adminPeerUnknownEpochDropsForTest() {
+    return onAdminThreadForTest([this]() -> uint64_t {
+        return adminWorkerAgent_ ? adminWorkerAgent_->worker().peerUnknownEpochDropsForTest() : 0u;
+    });
+}
+
+bool BrokerNode::forcePeerRekeyForTest(int32_t peer) {
+    return onControlThreadForTest([this, peer]() -> bool {
+        return peerLinkAgent_ && peerLinkAgent_->forceRekeyForTest(peer, clock_.nowNs());
+    });
 }
 
 uint32_t BrokerNode::adminPeerLinkEpochForTest(int32_t peer) {

@@ -1439,7 +1439,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onSealedFragment_(const uin
     // after another image's fragments) and simply opens again - "ABORT is never a drop", whatever the image count.
     std::size_t plainLen = 0; int32_t from = -1; uint32_t epoch = 0;
     const auto r = c.open(frame, len, recvScratch_.data(), recvScratch_.size(), plainLen, from, epoch,
-                          rune::peerlink::PeerFrameCrypto::kClockNow, /*commitWindow=*/false);
+                          /*commitWindow=*/false);
     if (r != rune::peerlink::PeerFrameCrypto::OpenResult::Ok) [[unlikely]] {
         noteOpenDrop_(r, from, epoch);
         return aeron::ControlledPollAction::CONTINUE;   // dropped and counted, never dispatched

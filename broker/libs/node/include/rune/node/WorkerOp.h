@@ -129,8 +129,9 @@ struct WorkerOp {
         SessionPermissions        = 21, ///< control → worker: a chunk of a session's WRITE bitmap
         // Authentication Task 15 (D33): control → EVERY worker on the session-lifecycle ring: the keys of an
         // established inter-broker link.  topicId = peer node id, partition = link epoch, tail (TailKind = PEER_KEYS) =
-        // [sendMaster 32][recvMaster 32] (WorkerOp::peerKeys).  Cold (one per link establishment); never
-        // ownership-gated.  (21 = SESSION_PERMISSIONS, Task 12.)
+        // [sendMaster 32][recvMaster 32] (WorkerOp::peerKeys), isolation = the rune::peerlink::LinkInstall (issue
+        // #241: receive-only / send-and-receive; an unknown value is refused).  Cold (one per link establishment or
+        // promotion); never ownership-gated.  (21 = SESSION_PERMISSIONS, Task 12.)
         PeerLinkKeys              = 22, ///< control → worker: install an established peer link's keys
         // Issues #109 / #196: control → ONE worker on its OP ring (cold, one per security event): an enforcement
         // fence.  correlationId = the fence sequence number.  The worker answers SessionSignal FenceAck (sessionId 0 =

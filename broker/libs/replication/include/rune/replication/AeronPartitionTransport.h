@@ -474,6 +474,12 @@ public:
         peer = pendingUnknown_.peer; epoch = pendingUnknown_.epoch; pendingUnknown_.valid = false;
         return true;
     }
+    /// Issue #241: the (peer, epoch) of the last authenticated frame under an epoch this transport holds receive-only,
+    /// consumed once (the PeerLinkAgent, same thread, promotes it).
+    [[nodiscard]] bool takePeerUsedEpoch(int32_t& peer, uint32_t& epoch) noexcept {
+        auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+        return c != nullptr && c->takePeerUsedEpoch(peer, epoch);
+    }
 
 private:
     // -----------------------------------------------------------------------

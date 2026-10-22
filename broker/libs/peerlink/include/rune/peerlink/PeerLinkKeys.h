@@ -14,9 +14,16 @@
 
 namespace rune::peerlink {
 
+/// How a transport installs a link's keys (issue #241).  ReceiveOnly: the epoch opens frames but this side keeps
+/// SEALING under its current send epoch - the responder of a re-handshake installs the new epoch so until the initiator
+/// proved (PeerConfirm, or an authenticated frame under it) that it holds the epoch too.  SendAndReceive: the epoch
+/// also becomes the send epoch (a first link, a restarted initiator, the initiator itself, the promotion).
+enum class LinkInstall : uint8_t { ReceiveOnly = 0, SendAndReceive = 1 };
+
 struct LinkKeys {
     uint32_t                epoch = 0;
     std::array<uint8_t, 32> sendMaster{}, recvMaster{};
+    LinkInstall             install = LinkInstall::SendAndReceive;
     bool operator==(const LinkKeys&) const = default;
 };
 

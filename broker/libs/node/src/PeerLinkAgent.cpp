@@ -83,6 +83,7 @@ void PeerLinkAgent::onFrame_(const uint8_t* b, std::size_t len, int64_t nowNs) {
     case pl::PeerMsg::Proof:     { pl::PeerProof m;     if (pl::PeerProof::decode(b, len, m))     absorb_(*p, p->hs.onProof(m, nowNs), nowNs);     else ++malformed_; break; }
     case pl::PeerMsg::Accept:    { pl::PeerAccept m;    if (pl::PeerAccept::decode(b, len, m))    absorb_(*p, p->hs.onAccept(m, nowNs), nowNs);    else ++malformed_; break; }
     case pl::PeerMsg::Refuse:    { pl::PeerRefuse m;    if (pl::PeerRefuse::decode(b, len, m))    absorb_(*p, p->hs.onRefuse(m, nowNs), nowNs);    else ++malformed_; break; }
+    case pl::PeerMsg::Confirm:   { pl::PeerConfirm m;   if (pl::PeerConfirm::decode(b, len, m))   absorb_(*p, p->hs.onConfirm(m, nowNs), nowNs);   else ++malformed_; break; }
     }
 }
 
@@ -101,6 +102,19 @@ int PeerLinkAgent::doWork(int64_t nowNs) {
 
 void PeerLinkAgent::onUnknownEpoch(int32_t peer, uint32_t epoch, int64_t nowNs) {
     if (PeerSlot* p = slot_(peer)) absorb_(*p, p->hs.onUnknownEpoch(epoch, nowNs), nowNs);
+}
+
+void PeerLinkAgent::onPeerUsedEpoch(int32_t peer, uint32_t epoch, int64_t nowNs) {
+    if (PeerSlot* p = slot_(peer)) absorb_(*p, p->hs.onPeerUsedEpoch(epoch, nowNs), nowNs);
+}
+
+bool PeerLinkAgent::forceRekeyForTest(int32_t peer, int64_t nowNs) {
+    PeerSlot* p = slot_(peer);
+    if (p == nullptr) return false;
+    auto o = p->hs.rekeyForTest(nowNs);
+    const bool started = o.frame.has_value();
+    absorb_(*p, std::move(o), nowNs);
+    return started;
 }
 
 void PeerLinkAgent::observeAuthFrames(int32_t peer, uint64_t total, int64_t nowNs) noexcept {

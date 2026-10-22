@@ -11,7 +11,10 @@
 
 namespace rune::peerlink {
 
-enum class PeerMsg : uint8_t { Hello = 1, Challenge = 2, Proof = 3, Accept = 4, Refuse = 5 };
+/// Confirm (6, issue #241) is newer than the other five: a broker that predates it sees tag 6 as a malformed frame and
+/// ignores it (counted), which is harmless - the responder then promotes on the initiator's first authenticated frame
+/// under the new epoch instead.
+enum class PeerMsg : uint8_t { Hello = 1, Challenge = 2, Proof = 3, Accept = 4, Refuse = 5, Confirm = 6 };
 
 /// Why a handshake was refused.  NoLink (5) is a poke, not a refusal: a responder that holds no link says "start
 /// over" (it restarted) — never logged as a refusal, never counted.
@@ -125,11 +128,30 @@ struct PeerRefuse {
     }
 };
 
+/// Issue #241: the initiator's proof that it installed `linkEpoch` (so the responder may start SEALING under it).
+///   confirm = HMAC-SHA-512(master, "rune-peer-v1|D" || from=A || to=B || nonceA || nonceB || epoch), truncated to 32.
+/// The label differs from the Accept's ("|C", from=B || to=A), so an Accept's confirm is never a valid Confirm.
+struct PeerConfirm {
+    int32_t from = -1, to = -1; uint32_t linkEpoch = 0; std::array<uint8_t, 32> confirm{};
+    static constexpr std::size_t kSize = 1 + 4 + 4 + 4 + 32;
+    void encode(uint8_t* b) const noexcept {
+        b[0] = static_cast<uint8_t>(PeerMsg::Confirm);
+        detail::putLe(b + 1, static_cast<uint32_t>(from), 4); detail::putLe(b + 5, static_cast<uint32_t>(to), 4);
+        detail::putLe(b + 9, linkEpoch, 4); std::memcpy(b + 13, confirm.data(), 32);
+    }
+    [[nodiscard]] static bool decode(const uint8_t* b, std::size_t len, PeerConfirm& m) noexcept {
+        if (len != kSize || b[0] != static_cast<uint8_t>(PeerMsg::Confirm)) return false;
+        m.from = static_cast<int32_t>(detail::getLe(b + 1, 4)); m.to = static_cast<int32_t>(detail::getLe(b + 5, 4));
+        m.linkEpoch = static_cast<uint32_t>(detail::getLe(b + 9, 4)); std::memcpy(m.confirm.data(), b + 13, 32);
+        return true;
+    }
+};
+
 inline constexpr std::size_t kMaxPeerLinkFrame = PeerChallenge::kSize;
 
 /// The tag of a frame, or 0 when it is empty / unknown.
 [[nodiscard]] inline uint8_t peekPeerMsg(const uint8_t* b, std::size_t len) noexcept {
-    return (len > 0 && b[0] >= 1 && b[0] <= 5) ? b[0] : uint8_t{0};
+    return (len > 0 && b[0] >= 1 && b[0] <= 6) ? b[0] : uint8_t{0};
 }
 
 } // namespace rune::peerlink

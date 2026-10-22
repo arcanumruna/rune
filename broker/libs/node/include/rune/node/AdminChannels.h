@@ -26,6 +26,7 @@
 #include <rune/catalog/CatalogEvent.h>   // rune::catalog::ConfigChange (AlterTopicConfig)
 #include <rune/protocol/SecurityTypes.h>
 #include <rune/security/SecurityEvent.h>   // ScramVerifier (the security DDL messages, authentication Task 10)
+#include <rune/peerlink/PeerLinkKeys.h>      // LinkInstall (kMsgPeerLinkKeys, issue #241)
 
 #include <concurrent/AtomicBuffer.h>
 
@@ -1421,18 +1422,21 @@ inline void writePlacementView(uint8_t* p, const PlacementViewMsg& m) noexcept {
 }
 
 /// kMsgPeerLinkKeys (Task 15, control -> admin on controlToAdminRing): the keys of an established inter-broker link,
-/// [peer:i32][epoch:u32][sendMaster 32][recvMaster 32].  Cold: one per link establishment.
-inline constexpr std::size_t kPeerLinkKeysWireLen = 4 + 4 + 32 + 32;
+/// [peer:i32][epoch:u32][sendMaster 32][recvMaster 32][install:u8] (issue #241: LinkInstall, receive-only or
+/// send-and-receive; an unknown value is a malformed message).  Cold: one per link establishment / promotion.
+inline constexpr std::size_t kPeerLinkKeysWireLen = 4 + 4 + 32 + 32 + 1;
 struct PeerLinkKeysMsg {
     int32_t  peer  = -1;
     uint32_t epoch = 0;
     std::array<uint8_t, 32> sendMaster{}, recvMaster{};
+    rune::peerlink::LinkInstall install = rune::peerlink::LinkInstall::SendAndReceive;
 };
 inline void writePeerLinkKeys(uint8_t* p, const PeerLinkKeysMsg& m) noexcept {
     admin_wire::putI32(p, m.peer);
     admin_wire::putI32(p + 4, static_cast<int32_t>(m.epoch));
     std::memcpy(p + 8, m.sendMaster.data(), 32);
     std::memcpy(p + 40, m.recvMaster.data(), 32);
+    p[72] = static_cast<uint8_t>(m.install);
 }
 [[nodiscard]] inline bool decodePeerLinkKeys(const uint8_t* buf, std::size_t len, PeerLinkKeysMsg& m) noexcept {
     if (len != kPeerLinkKeysWireLen) return false;
@@ -1440,6 +1444,9 @@ inline void writePeerLinkKeys(uint8_t* p, const PeerLinkKeysMsg& m) noexcept {
     m.epoch = static_cast<uint32_t>(admin_wire::getI32(buf + 4));
     std::memcpy(m.sendMaster.data(), buf + 8, 32);
     std::memcpy(m.recvMaster.data(), buf + 40, 32);
+    if (buf[72] != static_cast<uint8_t>(rune::peerlink::LinkInstall::ReceiveOnly) &&
+        buf[72] != static_cast<uint8_t>(rune::peerlink::LinkInstall::SendAndReceive)) return false;
+    m.install = static_cast<rune::peerlink::LinkInstall>(buf[72]);
     return m.peer >= 0 && m.epoch != 0;
 }
 
