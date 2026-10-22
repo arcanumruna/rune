@@ -90,10 +90,12 @@ characters.removeExistingAndWait(id);   // KeyNotFound → 404
 - G5. Point reads by a full key of any width, and prefix reads by the leading key columns (§9).
 - G6. `unique` views and `check` predicates are enforced when the views fold each record, against a view that has folded every record before it (§3, §8).
 - G7. A rejected record changes no view and is never delivered to a consumer. Its verdict is durable (verdict markers), the same everywhere, and compaction removes it (§8.5).
+- G7a. Transactions are validated atomically across topics and views, and become visible in one step on each partition (Part G, §9b).
 - G7b. A persisted view may read a transient source. After a restart it keeps its checkpointed rows and has nothing to replay from the source (§9a).
 - G8. Everything is correct under:
   - concurrent writers
   - collisions inside one batch
+  - transactions that commit, abort or fail their vote
   - ack timeouts and retries
   - leader failover
   - restart
@@ -110,7 +112,7 @@ characters.removeExistingAndWait(id);   // KeyNotFound → 404
 - `where` inside a view definition.
 - `check` predicates across rows, over other views, or with non-constant operands.
 - Constrained views over several topics. A view has exactly one source today (`PlanCompiler.cpp:112-127`), and judging across topics would need one deterministic order over them.
-- Transactions and explicit atomic batches on sources of constrained views (§11.2). A follow-up can judge a whole transaction at once.
+- Atomic visibility of a transaction across partitions (snapshot reads). It belongs with the native query API (§9b).
 - Constraints over transient sources: their verdict markers and bitmap would live in a ring that a restart loses. RegressorsPath doesn't need them.
 - Standalone sequences not tied to a topic key (`create sequence`, `nextId`).
 - Collations, locale-aware case rules (Turkish, Lithuanian and so on), Unicode normalization, and full case folding (`casefold()` is reserved, §8.1).
@@ -608,6 +610,64 @@ ProducerConfig{.acks = Acks::All | Acks::View};
 - **The `View` ack** (§8.9) means "folded". On such a view it doesn't mean "checkpointed".
 - **Constraints** over transient sources stay a non-goal (§2).
 
+## 9b. Part G: transactions and atomic batches on verdict sources (owner decision, 2026-10-22)
+
+**What transactions guarantee, by level:**
+
+| Level | Guarantee | Where |
+|---|---|---|
+| 1. Atomic writes across topics | All of a transaction's records commit, or none do. | Today (Kafka-style), with #537 fixed |
+| 2. Atomic validation across topics and views | Every constraint on every partition the transaction touches passes, or nothing commits, and `commitTransaction()` fails with the reason. | **This part** |
+| 3a. Atomic visibility within a partition | No read or consumer on a partition ever sees part of a transaction. | **This part** |
+| 3b. Atomic visibility across partitions | Reads across views on different partitions see a transaction entirely or not at all. | Non-goal. It needs snapshot reads (MVCC with commit timestamps), which belong with the native query API. |
+
+Until this part ships, the §11.2 refusals apply.
+
+**G.1 Why there is a vote.** The coordinator decides a commit (`PrepareCommit`, durable in the transaction log) before any commit marker exists. The fold can only judge records after that. So validation has to move before the decision.
+
+**G.2 The protocol.**
+1. The client calls `commitTransaction()`. Its sends to the transaction's partitions are already acked (`All`), as today.
+2. The coordinator, still `Ongoing`, sends a `TxnVote { transactionalId, producerId, epoch }` to the leader of each of the transaction's partitions that might vote. These are the partitions whose topic feeds a constrained view or has a key index, in the catalog either at the transaction's first `AddPartitions` or at commit. Asking both times covers a constraint created or dropped while the transaction is open.
+   - **Which partitions actually vote is decided by the partition**, from the constraint set active at the transaction's first record there (§8.7). A partition votes if that set has a constrained view, or if the transaction sent an explicit-key intent there. A partition that doesn't vote answers yes at once, without writing anything.
+   - Transactions that touch none of these partitions run exactly as today, with no extra round trip.
+3. The voting leader:
+   1. waits until its HW covers the transaction's last record on the partition;
+   2. appends a `TxnJudge { producerId, epoch }` control record at offset J (§G.3);
+   3. once the fold reaches J, judges **all** of the transaction's records on the partition together, in their offset order, against the view state at J;
+   4. if they pass, applies them **provisionally**, keeps the before-image of every row they touch, and locks those rows (§G.4);
+   5. answers yes, or no with the first failing `(code, constraintId, offset)`. On no, it puts the before-images back at once.
+4. If every vote is yes, the coordinator writes `PrepareCommit` and the markers, as today. If any vote is no, or a voter times out, it writes `PrepareAbort`, and `commitTransaction()` fails with that code and constraint id. The transaction is aborted, as in Postgres.
+5. The commit marker makes the provisional rows final in **one worker step**, and the abort marker restores the before-images in one worker step. Either way the rows unlock.
+
+- **Votes are idempotent.** A repeated `TxnVote` for the same producer and epoch is answered from the `TxnJudge` already in the log, so a retried `commitTransaction()` or a new coordinator gets the same answer. If the coordinator fails while votes are out, it recovers the transaction as `Ongoing`: the client retries the commit, or the transaction timeout aborts it. No new durable coordinator state is needed.
+
+**G.3 The judging order.** On a verdict source, a record outside a transaction is judged at its own offset. A transaction's records are judged together at their `TxnJudge` record.
+- **The fold no longer stops at an open transaction's first record.** It judges and applies other records past it, and defers the transaction's records to its `TxnJudge`. The order comes entirely from the log, so every leader and every refold uses the same one, as §8.4 requires.
+- **A commit marker with no `TxnJudge`** for a transaction that should have voted means a coordinator bug. The leader judges the transaction's records at the marker, all or nothing on that partition, counts `txnMarkerWithoutVote` and logs an error. Rules still hold on the partition. Only atomicity across partitions is lost in that case.
+- **Failover.**
+  - If the `TxnJudge` record committed, a new leader judges at it and reaches the same vote.
+  - If it didn't, it was truncated, and the coordinator's retried vote appends a new one.
+- **The verdict watermark** `W` (§8.5) never passes a `TxnJudge` whose transaction is undecided, so the cleaner never compacts across one.
+
+**G.4 Locks between the vote and the marker.** A provisionally applied row is locked from the vote until the marker, which is normally one coordinator round trip.
+- Judging is in log order, so the fold **pauses at the next record that touches a locked row** until that transaction's marker arrives. Judging it against provisional state would let an abort turn a final verdict wrong, for example a name the transaction released being claimed and then reappearing.
+- Records that don't touch locked rows are still behind the paused record, in log order. The pause is bounded by the transaction timeout and counted in `foldPausedOnTxnLock` (§13).
+
+**G.5 What readers see.**
+- **View reads** of a provisional row return its before-image until the commit marker. Then the transaction's rows change in one worker step, so no read sees part of it (level 3a).
+- **Consumers** on a verdict source stay bounded as in §8.6. They never pass a deferred transaction's records until its marker, which is what `read_committed` gives today. On these partitions, `read_uncommitted` behaves the same way.
+- **Partitions that aren't verdict sources** get level 3a too. The fold never ends a step between a committed transaction's first record and its commit marker, so a committed transaction becomes visible in one step.
+
+**G.6 Atomic batches** (`p.batch(...)`) on a verdict source are judged as a unit at their own offset, all records passing or none. They reuse the before-images: the fold applies the batch's records one by one within one worker step, and puts the before-images back if any record fails. No vote is needed, because a batch lives on one partition and in one append. The `View` ack carries a single verdict for the whole batch.
+
+**G.7 Limits and the client.**
+- **Size.** A transaction may write at most `txn.judged.records.max` records (default 4096, my call) to one voting partition. Beyond that, the vote is no with the new code `TxnTooLarge` (55). Before-images are pre-allocated per worker within that bound.
+- **The client.**
+  - `commitTransaction()` and `commitTransactionAndWait()` return the code and the `constraintId` on a no vote.
+  - A transactional producer whose acks include `View` also waits, on commit, until every voting partition has made the rows final.
+  - Inside a transaction, sends are acked as `All`. The verdict comes from the commit, so `View` on a single send is ignored.
+- **Cost.** One extra coordinator round trip on commit, only for transactions that touch a voting partition, plus the `TxnJudge` record and the lock pause.
+
 ## 10. Rune QL and the CLI
 
 **10.1 Grammar**
@@ -647,7 +707,7 @@ ProducerConfig{.acks = Acks::All | Acks::View};
 - **CLI.**
   - `rune ql "select …"` decodes rows using the view's output descriptor from the catalog.
   - `show view` prints the constraints and the stats from §13.
-  - `errorCodeName` (`QlEngine.cpp:134`) gains the missing codes 48–50 and the new 51–54.
+  - `errorCodeName` (`QlEngine.cpp:134`) gains the missing codes 48–50 and the new 51–55.
 
 ## 11. Errors and producer behavior
 
@@ -659,6 +719,9 @@ ProducerConfig{.acks = Acks::All | Acks::View};
 | 52 | `KeyExists` | `insert` on a key that exists | fold, per record | definite |
 | 53 | `KeyNotFound` | `update` or delete-existing on a key that's absent | fold, per record | definite |
 | 54 | `AutoIncrementExhausted` | The counter has reached `autoincrement.max`. The batch isn't stored. | write | definite |
+| 55 | `TxnTooLarge` | A transaction wrote more than `txn.judged.records.max` records to one voting partition. The transaction aborts. | vote | definite |
+
+A no vote (51–53, 55) is returned by `commitTransaction()`, with the constraint id, and the transaction is aborted.
 
 Existing codes reused:
 - `NotLeader` (2, retriable) while the autoincrement reservation is being found (§6.5).
@@ -676,14 +739,14 @@ Existing codes reused:
 | Intent (`insert`, `update`, `removeExisting`) | an idempotent producer, and acks including `View` (`All \| View` or `Leader \| View`) | `InvalidRequest`. The client refuses locally first. |
 | `autoincrement` create (key 0) on a topic **without** a constrained view | an idempotent producer, and `All` (with or without `View`). It can't be rejected: its id is unique by construction and skips the key index (§6.4). | `InvalidRequest` |
 | `autoincrement` create (key 0) on a topic **with** a constrained view | an idempotent producer, and `All \| View`, so the id is returned only together with the verdict | `InvalidRequest` |
-| Transactional or explicit atomic batch (`p.batch`) on a source of a constrained view | refused (non-goal, §2) | `InvalidRequest` |
-| An explicit-key intent (`insert` with a key, `update`, `removeExisting`) inside a transaction or atomic batch, on any topic | refused, because the key index could reject it after commit | `InvalidRequest` |
+| Transactional or explicit atomic batch (`p.batch`) on a source of a constrained view | allowed once Part G (§9b) ships; refused before that | `InvalidRequest` before Part G |
+| An explicit-key intent (`insert` with a key, `update`, `removeExisting`) inside a transaction or atomic batch, on any topic | the same: judged by the Part G vote, refused before it | `InvalidRequest` before Part G |
 
 A key-0 create is not an explicit-key intent. On a topic with only a key index, it is allowed in transactions, as in §6.6.
 
 - **Why intents need `View`.** Their verdict exists only after the fold, so without `View` the writer could never learn it. **Why idempotent:** a non-idempotent retry would store a second copy, which would fail with `KeyExists` against the first.
 - **Why autoincrement creates need `All`.** With a `Leader` ack, an id handed out could be cut by a failover and given to another record. Where a constraint can reject the create, they also need `View`; otherwise the client would get an id for a record that never becomes visible.
-- **Why transactions and atomic batches are refused on constrained sources.** A record is judged only after its transaction commits. If one record of a committed transaction were then rejected, the transaction would be half applied. Supporting them needs the fold to judge a whole transaction before applying any of it; that is a follow-up (§17).
+- **Why transactions and atomic batches are refused on constrained sources.** A record is judged only after its transaction commits. If one record of a committed transaction were then rejected, the transaction would be half applied. Part G (§9b) makes the partitions vote before the commit is decided, which removes the refusal.
 - **Old clients** (version 11 and earlier) never send `View`, so they never receive 51–53. Their writes are judged like any other, and a rejected one simply never becomes visible. The rejection count is in the stats (§13).
 
 **11.3 Producer** (`ProducerImpl`)
@@ -708,6 +771,7 @@ A key-0 create is not an explicit-key intent. On a topic with only a key index, 
 
 - **Per verdict source:**
   - rejections for each constraint and for each intent code;
+  - Part G: votes (yes, no, by code), vote latency, `foldPausedOnTxnLock` time, and `txnMarkerWithoutVote`;
   - verdict lag, which is the LEO minus the minimum fold cursor of the verdict views, and so the delay consumers see;
   - the verdict watermark `W`, markers written, and rejected records not yet compacted;
   - autoincrement: the current counter, the reservation R, and ids burned (including ids of rejected creates).
@@ -766,8 +830,20 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 - a refold below `W` doesn't judge, and a constraint changed since gives the same view
 - a new leader judging past `W` reaches the same verdicts and writes the markers
 - several verdict views, where one rejects: no view changes
+- Part G:
+  - a two-partition transaction where one partition votes no: nothing commits, and `commitTransaction()` returns the code and constraint id;
+  - all votes yes: both partitions become visible, each in one step, and no read sees part of the transaction;
+  - an abort after a yes vote restores the before-images;
+  - a record outside the transaction that touches a locked row pauses the fold until the marker, then is judged against the final state;
+  - two transactions racing for the same name or the last slot;
+  - failover of a voter before and after its `TxnJudge` commits;
+  - coordinator failover with votes out, then a client retry: same answer;
+  - a constraint created or dropped while a transaction is open;
+  - a transaction over `txn.judged.records.max` gets `TxnTooLarge`;
+  - an atomic batch with one bad record: the whole batch is rejected and no view changes;
+  - the transaction timeout while rows are locked
 - a predicate failing on a row that is already over its limit: a rename passes, a create fails, a delete passes
-- a transactional and an atomic batch on a constrained source are refused; on an unconstrained source they work as today
+- before Part G, a transactional and an atomic batch on a constrained source are refused; on an unconstrained source they work as today
 - verdict lag while a constraint view builds: delivery waits, writes don't
 - failover right after a constraint-set change record: the new leader judges every offset with the same set as the old one
 - a new leader that hasn't installed the view named by a change record waits rather than judging
@@ -852,6 +928,7 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 - Every record has the same verdict on every leader and in every refold.
 - Every view equals a fresh refold of the log.
 - Compaction never removes an accepted value in favor of a rejected one.
+- A transaction is either applied on every partition it touched or on none, and no read ever sees part of it within a partition.
 
 **Sanitizers:** ASan, UBSan and TSan runs of `*Regression*` at each checkpoint.
 
@@ -869,7 +946,8 @@ Each part ships on its own:
 8. **QL (§10):** `create view` (plan v2), `select`, and the CLI.
 9. **Part E (§8.1–§8.3, §8.7):** `unique` and `check` on views.
 10. **Part F (§9a):** persisted views over transient sources.
-11. **Docs:**
+11. **Part G (§9b):** the transaction vote, `TxnJudge`, judging in log order with deferred transactions, before-images and row locks, atomic batches, one-step visibility, and `TxnTooLarge`.
+12. **Docs:**
    - `ql.md`, `wire-protocol.md`, `client-cpp.md` and `admin-cli.md`
    - `CATALOG.md` and `SECURITY.md` (the `IMPORT` grant)
    - the root and client `CLAUDE.md`
@@ -881,7 +959,11 @@ Each part ships on its own:
 - Acks are bit flags: `Leader`, `All` and the new `View`, which combine (`Leader | View`, `All | View`). The names stay. **Owner-confirmed.**
 - Wire: bit 0 is `All`, as today, and bit 1 is `View`. `View` alone is refused. With today's fold, `Leader | View` waits for commit, like `All | View`. (My call.)
 - Requirements are per write, not per topic: none for plain writes; intents need an idempotent producer and `View`; autoincrement creates need an idempotent producer and `All`. (My call, following the owner's objection to constraining every producer of a topic.)
-- **Transactions and explicit atomic batches are refused on sources of constrained views** (my call). Follow-up: let the fold judge a whole transaction before applying any of it, with the before-images of the rows it touches, so it can be rejected as a unit. This matters if a producer of such a topic uses transactions today.
+- **Transactions get level 2 (atomic validation) and level 3a (atomic visibility within a partition)** through a vote before the commit (Part G, §9b). Level 3b, across partitions, is left for the query API. **Owner-confirmed, 2026-10-22.**
+  - A voting partition judges a transaction's records together at a `TxnJudge` record. The fold pauses at a record that touches a row locked between the vote and the marker. (My call.)
+  - A voting partition takes at most 4096 records per transaction (`TxnTooLarge`). (My call.)
+  - A commit marker with no vote is judged at the marker, all or nothing on that partition, and counted as a bug. (My call.)
+  - Until Part G ships, transactions and atomic batches are refused on constrained sources.
 - Deletes are judged like any record, so a delete can fail a `check` it would break (`balance >= 0`). A row that already broke its rule, which is possible only for pre-existing data, accepts deletes and any change that doesn't touch the checked columns. (My call.)
 - Every constraint-set change takes effect at a control record in the source log, so every leader judges each offset with the same rules. (My call.)
 - A key-0 create needs `All | View` where a constraint could reject it, and `All` otherwise. A batch with key-0 creates contains only key-0 creates. (My call.)
@@ -915,6 +997,8 @@ Each part ships on its own:
 - Whether the owner map, prefix index and key index are checkpointed or rebuilt on replay.
 - The choice of seeded hash.
 - How a verdict view computes prospective rows without writing them, within the no-allocation rule.
+- The layout of before-images and row locks, within the `txn.judged.records.max` bound.
+- The wire format of `TxnVote` and its response, and of the `TxnJudge` record.
 - The encodings of the verdict marker and the reservation control record. Both must be distinct from transaction markers and skipped by every reader.
 - The on-disk form of the rejected-offset bitmap, following `TxnCleanState`.
 - The page row cap and the resume-token format.
