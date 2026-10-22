@@ -3478,7 +3478,7 @@ TEST(SegmentProvisionerRegression, OverTheCapBuildsWithoutFallocateNeverAFailure
     Reg R(64LL * 1024 * 1024);   // the cap is sized in 64 MiB segments
     NoopConsensus noop;
     NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
-    SegmentProvisionerAgent prov(1, /*capBytes=*/1LL * 1024 * 1024);   // room for ONE 1 MiB segment (Reg's log size)
+    SegmentProvisionerAgent prov(1, /*capBytes=*/64LL * 1024 * 1024);   // room for ONE 64 MiB segment
     prov.attachViewChannel(rt.enableProvisionerView());
     PartitionReplica* a = R.add(5, 0);
     PartitionReplica* b = R.add(5, 1);
@@ -3491,7 +3491,7 @@ TEST(SegmentProvisionerRegression, OverTheCapBuildsWithoutFallocateNeverAFailure
     EXPECT_EQ(prov.builtForTest(), 2u);
     EXPECT_EQ(prov.unpreallocatedForTest(), 1u);
     EXPECT_EQ(prov.failuresForTest(), 0u);
-    EXPECT_EQ(prov.reservedBytesForTest(), 1LL * 1024 * 1024) << "only A's segment is fallocated";
+    EXPECT_EQ(prov.reservedBytesForTest(), 64LL * 1024 * 1024) << "only A's segment is fallocated";
     EXPECT_EQ(b->log()->readyQueuedApprox(), 1u);
     EXPECT_TRUE(b->log()->readyAvailable()) << "B got a READY segment (not a failure)";
 }
@@ -3502,7 +3502,7 @@ TEST(SegmentProvisionerRegression, DepthBuildNeverOvershootsTheCapRegression) {
     Reg R(64LL * 1024 * 1024);   // the cap is sized in 64 MiB segments
     NoopConsensus noop;
     NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
-    SegmentProvisionerAgent prov(3, /*capBytes=*/1LL * 1024 * 1024);   // room for ONE 1 MiB segment (Reg's log size)
+    SegmentProvisionerAgent prov(3, /*capBytes=*/64LL * 1024 * 1024);   // room for ONE 64 MiB segment
     prov.attachViewChannel(rt.enableProvisionerView());
     PartitionReplica* a = R.add(5, 0);
     rt.doWork(1);
@@ -3510,7 +3510,7 @@ TEST(SegmentProvisionerRegression, DepthBuildNeverOvershootsTheCapRegression) {
     ASSERT_TRUE(postDemandForTest(prov.channel(), a->log(), Log::ProvisionDemand::Threshold));
     prov.doWork(2);
     EXPECT_EQ(prov.builtForTest(), 3u) << "the depth is still built (off the owner)";
-    EXPECT_EQ(prov.reservedBytesForTest(), 1LL * 1024 * 1024) << "only what fits the cap is fallocated";
+    EXPECT_EQ(prov.reservedBytesForTest(), 64LL * 1024 * 1024) << "only what fits the cap is fallocated";
     EXPECT_EQ(prov.unpreallocatedForTest(), 2u);
 }
 
