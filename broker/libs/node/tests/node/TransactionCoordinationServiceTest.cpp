@@ -1497,6 +1497,67 @@ TEST_F(TransactionCoordinationServiceTest, APreparedCommitWithNoOffsetSinkStaysS
     EXPECT_EQ(svc_->txnOffsetCommitsStuck(), 0u);
 }
 
+// #360 adversarial: an ABORT of a transaction whose offsets were accepted completes on a node with no offset sink -
+// aborted offsets are never applied, so nothing may hold the abort (no stuck gauge, no NoOffsetSink refusal).
+TEST_F(TransactionCoordinationServiceTest, AnAbortWithOffsetsCompletesWithNoOffsetSinkAdversarialRegression) {
+    RefusingSink first;
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &first);
+    const OffsetsTxn t = beginOffsetsTxn(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), "tx360a", "cg360a", 0);
+    ASSERT_EQ(txnOffsetCommit(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), t, 7, 0), 0);
+    const std::size_t n = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 1, 5, t.pid, t.epoch, /*commit=*/false, t.txn);
+    ASSERT_EQ(pc::EndTxnResponse::decode(outBuf_.data(), svc_->handleEndTxn(reqBuf_.data(), n, 0, outBuf_.data(),
+                                                                            outBuf_.size()))->errorCode, 0);
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [this] { return leaderNodeId_; });
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    int64_t now = 1'000'000'000;
+    (void)svc_->doWork(now);
+    svc_->onControlMarkerLanded(0, 0, t.pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    for (int i = 0; i < 50 && svc_->txnStateForTest(t.txn) != tx::TxnState::CompleteAbort; ++i) {
+        now += 100'000'000;
+        (void)svc_->doWork(now);
+    }
+    EXPECT_EQ(svc_->txnStateForTest(t.txn), tx::TxnState::CompleteAbort) << "an abort was held by the missing sink";
+    EXPECT_EQ(svc_->txnOffsetCommitsStuck(), 0u);
+    EXPECT_EQ(svc_->txnOffsetRefusalForTest(t.pid), rune::coordination::TxnOffsetRefusal::Unknown);
+    EXPECT_EQ(first.calls, 0) << "an aborted offset was applied";
+}
+
+// #360 adversarial: TxnOffsetCommit retried against a node with no sink is refused (retriable) every time and never
+// adds an offset; once a sink is wired the same retry is accepted and the commit applies exactly that offset once.
+TEST_F(TransactionCoordinationServiceTest, TxnOffsetCommitRetriedUntilASinkIsWiredAppliesOnceAdversarialRegression) {
+    svc_->setTxnOffsetSink(nullptr, nullptr);
+    const OffsetsTxn t = beginOffsetsTxn(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), "tx360r", "cg360r", 0);
+    ASSERT_GE(t.pid, 0);
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_EQ(txnOffsetCommit(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), t, 9, 0),
+                  static_cast<int16_t>(pc::ErrorCode::NotCoordinator)) << "retry " << i;
+        EXPECT_TRUE(svc_->pendingOffsetsForTest("tx360r").empty()) << "retry " << i;
+    }
+    RefusingSink sink;
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    ASSERT_EQ(txnOffsetCommit(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), t, 9, 0), 0);
+    ASSERT_EQ(svc_->pendingOffsetsForTest("tx360r").size(), 1u);
+    const std::size_t n = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 1, 5, t.pid, t.epoch, /*commit=*/true, t.txn);
+    ASSERT_EQ(pc::EndTxnResponse::decode(outBuf_.data(), svc_->handleEndTxn(reqBuf_.data(), n, 0, outBuf_.data(),
+                                                                            outBuf_.size()))->errorCode, 0);
+    RefusingSink reloaded;   // the coordinator reloads (the rig's marker path) with its sink wired
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [this] { return leaderNodeId_; });
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &reloaded);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    int64_t now = 1'000'000'000;
+    (void)svc_->doWork(now);
+    svc_->onControlMarkerLanded(0, 0, t.pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    for (int i = 0; i < 50 && svc_->txnStateForTest(t.txn) != tx::TxnState::CompleteCommit; ++i) {
+        now += 100'000'000;
+        (void)svc_->doWork(now);
+    }
+    EXPECT_EQ(svc_->txnStateForTest(t.txn), tx::TxnState::CompleteCommit);
+    EXPECT_EQ(reloaded.acceptedOffsets, (std::vector<int64_t>{9})) << "the retried offset was not applied exactly once";
+    EXPECT_EQ(svc_->txnOffsetCommitsStuck(), 0u);
+}
+
 // Issue #359: a commit stuck on a refused offset apply is visible - a gauge of stuck commits, the oldest one's age,
 // and a periodic WARN - instead of a silent retry loop.
 TEST_F(TransactionCoordinationServiceTest, AStuckOffsetApplyIsCountedAgedAndReportedRegression) {

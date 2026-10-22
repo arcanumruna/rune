@@ -2731,3 +2731,140 @@ TEST(GroupCoordinationServiceRegression, SessionTimeoutAboveTheMaximumIsClampedR
         EXPECT_EQ(g.svc.coordinator(group).memberCount(), 0u) << "the silent member outlived the maximum session timeout";
     }
 }
+
+// ===========================================================================
+// Adversarial review of PR #497 (#471 / #213)
+// ===========================================================================
+namespace {
+std::size_t encodeOffsetFetchTwo(uint8_t* buf, int64_t corr, std::string_view group, int32_t p0, int32_t p1) {
+    pc::OffsetFetch msg;
+    msg.sessionId     = 1;
+    msg.correlationId = corr;
+    msg.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+    const std::array<pc::OffsetFetchEntry, 2> entries{pc::OffsetFetchEntry{kTestTopicId, p0},
+                                                      pc::OffsetFetchEntry{kTestTopicId, p1}};
+    return msg.encode(buf, std::span<const pc::OffsetFetchEntry>(entries));
+}
+}  // namespace
+
+// #471: a committed value overwritten by a parked commit is never served as the new value (nor the old one as OK),
+// a sibling key that IS committed is still served, and a fetch-all with one unstable key is the retriable sentinel.
+TEST(OffsetCommitDurabilityRegression, AParkedOverwriteIsNeverServedButItsCommittedSiblingIsAdversarialRegression) {
+    const std::string group = "g471adv";
+    CommitRig g(group);
+    const auto unstable = static_cast<int16_t>(pc::ErrorCode::UnstableOffsetCommit);
+    ASSERT_EQ(g.commit(group, 50), 0u);
+    ASSERT_EQ(g.svc.handleOffsetCommit(g.req, encodeOffsetCommit(g.req, 1, g.corr++, group, g.member, g.gen,
+                                                                 kTestTopicId, 1, 60),
+                                       g.clock, g.out, sizeof g.out), 0u);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.svc.parkedOffsetCommits(), 0u);
+    ASSERT_EQ(g.commit(group, 88), 0u);   // overwrite of p0: parked, its record above the high watermark
+    ASSERT_EQ(g.svc.parkedOffsetCommits(), 1u);
+
+    std::size_t n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetchTwo(g.req, g.corr++, group, 0, 1), g.clock, g.out,
+                                            sizeof g.out);
+    auto f = pc::OffsetFetchResponse::decode(g.out, n);
+    ASSERT_TRUE(f && f->results.size() == 2u);
+    EXPECT_EQ(f->results[0].partition, 0);
+    EXPECT_EQ(f->results[0].errorCode, unstable) << "the parked overwrite (or the superseded value) was served";
+    EXPECT_EQ(f->results[0].offset, -1);
+    EXPECT_EQ(f->results[1].partition, 1);
+    EXPECT_EQ(f->results[1].errorCode, int16_t{0}) << "a committed sibling key was refused";
+    EXPECT_EQ(f->results[1].offset, 60);
+
+    n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetchAll(g.req, 1, g.corr++, group), g.clock, g.out, sizeof g.out);
+    f = pc::OffsetFetchResponse::decode(g.out, n);
+    ASSERT_TRUE(f && f->results.size() == 1u) << "a fetch-all listed keys while one of them was unstable";
+    EXPECT_EQ(f->results[0].topicId, -1);
+    EXPECT_EQ(f->results[0].errorCode, unstable);
+
+    g.fetch();
+    g.svc.doWork(g.clock);
+    n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetchAll(g.req, 1, g.corr++, group), g.clock, g.out, sizeof g.out);
+    f = pc::OffsetFetchResponse::decode(g.out, n);
+    ASSERT_TRUE(f && f->results.size() == 2u);
+    for (const auto r : f->results) {
+        EXPECT_EQ(r.errorCode, int16_t{0});
+        EXPECT_EQ(r.offset, r.partition == 0 ? 88 : 60);
+    }
+}
+
+// #471: the offsets partition changes leader between the commit's append and its high-watermark advance.  Until the
+// new leadership has rebuilt its index from a committed log, the key is never served; once it has, the surviving
+// record's value is served as committed.
+TEST(OffsetCommitDurabilityRegression, ALeaderChangeBeforeTheHighWatermarkNeverServesTheParkedValueAdversarialRegression) {
+    const std::string group = "g471lc";
+    CommitRig g(group);
+    ASSERT_EQ(g.commit(group, 50), 0u);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.commit(group, 88), 0u);
+    g.rep.becomeFollower(2, 2);
+    g.rep.becomeLeader(3, std::vector<NodeId>{1, 2});
+    g.clock += 1'000'000;
+    g.svc.doWork(g.clock);
+    for (const bool all : {false, true}) {
+        const std::size_t len = all ? encodeOffsetFetchAll(g.req, 1, g.corr++, group)
+                                    : encodeOffsetFetch(g.req, 1, g.corr++, group, kTestTopicId, 0);
+        const std::size_t n = g.svc.handleOffsetFetch(g.req, len, g.clock, g.out, sizeof g.out);
+        const auto f = pc::OffsetFetchResponse::decode(g.out, n);
+        ASSERT_TRUE(f && f->results.size() == 1u);
+        EXPECT_NE(f->results[0].errorCode, int16_t{0}) << (all ? "fetch-all" : "fetch") << " served before the rebuild";
+        EXPECT_EQ(f->results[0].offset, -1);
+    }
+    for (int i = 0; i < 20; ++i) { g.fetch(); g.svc.doWork(g.clock); }
+    const std::size_t n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, group, kTestTopicId, 0),
+                                                  g.clock, g.out, sizeof g.out);
+    const auto f = pc::OffsetFetchResponse::decode(g.out, n);
+    ASSERT_TRUE(f && f->results.size() == 1u);
+    EXPECT_EQ(f->results[0].errorCode, int16_t{0});
+    EXPECT_EQ(f->results[0].offset, 88) << "the record survived the leader change and is committed now";
+}
+
+// #213: every bound of a JoinGroup's sessionTimeoutMs, for a new member and a re-joining one, against the default
+// maximum and one below the 30 s default: the member's session timeout and the group's rebalance timeout never exceed
+// the maximum, and a missing (<= 0) value takes the default, itself clamped.
+TEST(GroupCoordinationServiceRegression, JoinGroupSessionTimeoutBoundsTableAdversarialRegression) {
+    for (const int32_t maxMs : {GroupCoordinationService::kDefaultMaxSessionTimeoutMs, 10'000}) {
+        for (const int32_t req : {INT32_MIN, -1, 0, 1, maxMs - 1, maxMs, maxMs + 1, INT32_MAX}) {
+            SCOPED_TRACE(::testing::Message() << "max=" << maxMs << " requested=" << req);
+            const int32_t want = req <= 0 ? std::min(30'000, maxMs) : std::min(req, maxMs);
+            OffRig g;
+            g.svc.setMaxSessionTimeoutMs(maxMs);
+            uint8_t rq[4096]{}, out[4096]{};
+            const std::string group = "g213adv";
+            std::size_t n = g.svc.handleJoinGroup(rq, encodeJoinGroup(rq, 1, 1, group, "", 5'000), g.clock, out, sizeof out);
+            const auto j = pc::JoinGroupResponse::decode(out, n);
+            ASSERT_TRUE(j.has_value());
+            const std::string member(reinterpret_cast<const char*>(j->memberId.data()), j->memberId.size());
+            // A brand-new member asking for `req` (another session, same group).
+            n = g.svc.handleJoinGroup(rq, encodeJoinGroup(rq, 2, 2, group, "", req), g.clock, out, sizeof out);
+            ASSERT_TRUE(pc::JoinGroupResponse::decode(out, n).has_value());
+            EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), want) << "new member";
+            // The first member re-joins asking for `req`.
+            n = g.svc.handleJoinGroup(rq, encodeJoinGroup(rq, 1, 3, group, member, req), g.clock, out, sizeof out);
+            ASSERT_TRUE(pc::JoinGroupResponse::decode(out, n).has_value());
+            EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), want) << "re-join";
+            for (const auto& m : g.svc.coordinator(group).members()) {
+                EXPECT_LE(m.sessionTimeoutMs, maxMs) << m.memberId;
+                EXPECT_GT(m.sessionTimeoutMs, 0) << m.memberId;
+                if (m.memberId == member) EXPECT_EQ(m.sessionTimeoutMs, want) << "re-joined member";
+            }
+        }
+    }
+}
+
+// #213: a coordinator maximum of 0 or below is no maximum at all - it never turns every join into a 0 ms session.
+TEST(GroupCoordinationServiceRegression, ANonPositiveMaxSessionTimeoutKeepsTheDefaultAdversarialRegression) {
+    for (const int32_t bad : {0, -1, INT32_MIN}) {
+        SCOPED_TRACE(::testing::Message() << "max=" << bad);
+        OffRig g;
+        g.svc.setMaxSessionTimeoutMs(bad);
+        EXPECT_EQ(g.svc.maxSessionTimeoutMs(), GroupCoordinationService::kDefaultMaxSessionTimeoutMs);
+        uint8_t rq[4096]{}, out[4096]{};
+        (void)g.svc.handleJoinGroup(rq, encodeJoinGroup(rq, 1, 1, "g213neg", "", 5'000), g.clock, out, sizeof out);
+        EXPECT_EQ(g.svc.coordinator("g213neg").rebalanceTimeoutMs(), 5'000);
+    }
+}

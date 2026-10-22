@@ -522,7 +522,8 @@ size_t GroupCoordinationService::handleJoinGroup(
     // Set rebalance timeout from the member's sessionTimeout (or a sane default).  #213: the request is CLAMPED to the
     // coordinator's maximum (Kafka: group.max.session.timeout.ms) - the value is also the group's rebalance timeout,
     // so an unbounded one would let one member stall every rebalance and outlive its death for weeks.
-    const int32_t sessionMs = msg.sessionTimeoutMs > 0 ? std::min(msg.sessionTimeoutMs, maxSessionTimeoutMs_) : 30'000;
+    // The 30 s default for an absent (<= 0) value is clamped too: a maximum below it is still the maximum.
+    const int32_t sessionMs = std::min(msg.sessionTimeoutMs > 0 ? msg.sessionTimeoutMs : 30'000, maxSessionTimeoutMs_);
     if (msg.sessionTimeoutMs > sessionMs) [[unlikely]]
         spdlog::debug("GroupCoordinationService: JoinGroup sessionTimeoutMs {} clamped to {} (group max)",
                       msg.sessionTimeoutMs, sessionMs);

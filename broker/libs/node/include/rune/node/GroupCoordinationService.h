@@ -394,7 +394,8 @@ public:
     /// larger request is CLAMPED to it - the value also sets the group's rebalance timeout, so an unbounded one would
     /// let a single member stall every rebalance (and keep a dead member) for ~24 days.
     static constexpr int32_t kDefaultMaxSessionTimeoutMs = 1'800'000;
-    void setMaxSessionTimeoutMs(int32_t ms) noexcept { maxSessionTimeoutMs_ = ms; }
+    /// A non-positive maximum is no maximum: it keeps the default (never a 0 ms session for every member).
+    void setMaxSessionTimeoutMs(int32_t ms) noexcept { maxSessionTimeoutMs_ = ms > 0 ? ms : kDefaultMaxSessionTimeoutMs; }
     [[nodiscard]] int32_t maxSessionTimeoutMs() const noexcept { return maxSessionTimeoutMs_; }
     /// Test seam: resolve a session's client version without a gateway (-1 = unknown: treated as current).
     void setClientVersionResolverForTest(ClientVersionFn fn, void* ctx) noexcept {

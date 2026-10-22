@@ -156,3 +156,38 @@ TEST(AuthVisibilityRegression, OffsetFetchAllHidesTopicsTheCallerCannotReadRegre
     ASSERT_TRUE(ok);
     EXPECT_EQ(seenByAll.size(), 2u);
 }
+
+// ── Adversarial review of PR #497 (#126) ─────────────────────────────────────────────────────────────────────────
+// A caller with the group but no READ on any committed topic - including a DESCRIBE-ON-CLUSTER holder (the D22
+// pass-through covers only ids the gateway has not indexed) - gets an empty fetch-all, and a listed fetch of the
+// hidden topic is still refused; a grant revoked mid-session hides the topic on the next fetch-all.
+TEST(AuthVisibilityRegression, OffsetFetchAllHidesEveryUnreadableTopicAndFollowsARevokeAdversarialRegression) {
+    AuthRig r;
+    std::string revokedName;
+    const int64_t writer = r.newUser({exact(SO::Read, ST::Group, "g126x"), exact(SO::Read, ST::Topic, "orders"),
+                                      exact(SO::Read, ST::Topic, "secret")}, &revokedName);
+    const int64_t groupOnly = r.newUser({exact(SO::Read, ST::Group, "g126x")});
+    const int64_t describer = r.newUser({exact(SO::Read, ST::Group, "g126x"), cluster(SO::Describe)});
+    const auto [member, gen] = r.joinStable(writer, "g126x", {r.orders, r.secret});
+    ASSERT_FALSE(member.empty());
+    ASSERT_EQ(r.commitAs(writer, "g126x", member, gen, r.orders, 11), 0);
+    ASSERT_EQ(r.commitAs(writer, "g126x", member, gen, r.secret, 22), 0);
+
+    bool ok = false;
+    for (const int64_t sid : {groupOnly, describer}) {
+        SCOPED_TRACE(::testing::Message() << "session " << sid);
+        EXPECT_TRUE(fetchAllTopics(r, sid, "g126x", &ok).empty()) << "an unreadable topic's offset was listed";
+        EXPECT_TRUE(ok) << "the filtered fetch-all was not answered";
+        EXPECT_EQ(r.offsetFetch(sid, "g126x", r.secret), kNotAuthorized);
+    }
+    // The writer can see both, then loses READ on "secret" while its session stays open.
+    auto both = fetchAllTopics(r, writer, "g126x", &ok);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(both.size(), 2u);
+    const auto rv = r.broker().admin().revoke(r.ch(), r.broker().adminSession(), revokedName, false, SO::Read,
+                                              ST::Topic, SP::Exact, "secret");
+    ASSERT_EQ(rv.errorCode, 0) << rv.detail;
+    const auto after = fetchAllTopics(r, writer, "g126x", &ok);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(after, std::vector<int32_t>{r.orders}) << "a revoked topic stayed visible to an open session";
+}
