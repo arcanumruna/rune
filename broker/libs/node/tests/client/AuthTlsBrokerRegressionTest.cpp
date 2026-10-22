@@ -244,6 +244,67 @@ TEST(AuthTlsRegression, ShardProduceDecryptsThenChecksWriteRegression) {
     ws1->closeImmediately();
 }
 
+// Adversarial review of PR #528 (issue #116) - version skew, a mixed-version cluster mid rolling upgrade: the client's
+// metadata comes from a broker that predates receiver keys (< 7: the worker ingressEndpoint, no receiver-id trailer)
+// while the partition's leader already speaks them (its session uses receiver keys).  The client knows the worker's
+// endpoint but not its receiver id, so it must not seal the produce for the gateway and send it to the worker (which
+// drops every such frame as addressed to another receiver - each produce would time out, forever): it sends it to
+// the leader node's gateway (receiver 0), which relays it.  The seam makes this one broker answer metadata as an old
+// broker would.  RED (before the review fix): the produce is dropped at the worker as a wrong-receiver frame and
+// times out.
+TEST(AuthTlsRegression, AWorkerRouteWithoutAReceiverIdFromAnOldBrokerStillProducesAdversarialRegression) {
+    AuthBroker b("tlsmixed", tlsOnly(/*shard=*/true));
+    bootstrapOverTls(b, std::string("create user ws1 with password '") + kWs1Pw + "';\n"
+                        "grant create on topic prefix '' to user admin;\n"
+                        "grant write on topic 'orders' to user ws1;\n"
+                        "grant describe on cluster to user ws1;\n");
+    auto admin = tlsClient(b, "admin", kAdminPw);
+    ASSERT_EQ(connectError(*admin), "");
+    const auto orders = admin->defineTopicAndWait("orders", 1, "", false, {}, 20s);
+    ASSERT_EQ(orders.errorCode, 0) << orders.detail;
+    admin->closeImmediately();
+
+    b.node().emulatePreReceiverKeyMetadataForTest(true);
+    auto ws1 = tlsClient(b, "ws1", kWs1Pw);
+    ASSERT_EQ(connectError(*ws1), "");
+    rc::ProducerConfig pcfg;
+    pcfg.acks = rc::Acks::All;
+    pcfg.lingerUs = 1;
+    pcfg.batchBytes = 1;
+    pcfg.produceTimeoutMs = 4'000;
+    pcfg.deliveryTimeoutMs = 8'000;
+    auto producer = ws1->producer(pcfg);
+    rc::Completions cq(*ws1);
+    std::map<rc::Token, rc::Completion> done;
+    auto poll = [&] { (void)cq.poll([&](const rc::Completion& d, std::span<const uint8_t>) { done[d.token] = d; }); };
+    const std::vector<uint8_t> value{5, 2, 8};
+    constexpr int kSends = 3;
+    for (int i = 1; i <= kSends; ++i) {
+        bool sent = false;
+        for (const auto dl = std::chrono::steady_clock::now() + 20s; !sent && std::chrono::steady_clock::now() < dl;) {
+            sent = producer.trySend(rc::TopicHandle{orders.topicId, 1}, rc::Key(uint64_t(i)), value, cq,
+                                    static_cast<rc::Token>(i)) == rc::SendResult::Ok;
+            if (!sent) { poll(); std::this_thread::sleep_for(1ms); }
+        }
+        ASSERT_TRUE(sent) << i;
+    }
+    for (const auto dl = std::chrono::steady_clock::now() + 30s;
+         std::chrono::steady_clock::now() < dl && done.size() < static_cast<std::size_t>(kSends);) {
+        poll();
+        std::this_thread::sleep_for(2ms);
+    }
+    ASSERT_EQ(done.size(), static_cast<std::size_t>(kSends));
+    for (int i = 1; i <= kSends; ++i)
+        EXPECT_EQ(done[static_cast<rc::Token>(i)].status, rc::OpStatus::Ok)
+            << i << ": errorCode " << done[static_cast<rc::Token>(i)].errorCode;
+    uint64_t wrongReceiver = 0;
+    for (int32_t w = 0; w < b.node().workerCountForTest(); ++w)
+        wrongReceiver += b.node().onWorkerThreadForTest(w, [](Worker& wk) { return wk.c2bWrongReceiverDropsForTest(); });
+    EXPECT_EQ(wrongReceiver, 0u) << "a produce was sealed for the gateway and sent to a worker";
+    producer.close();
+    ws1->closeImmediately();
+}
+
 // Issue #13: the bootstrap, a password change, security DDL and a __security read, all with the shipped CLI over TLS
 // to a broker that serves only TLS.  Without --tls-ca the system store does not trust the test CA: the CLI fails the
 // connect (it never falls back to plaintext).  RED: drop applyTls from LiveBroker::open (the CLI connects in plaintext

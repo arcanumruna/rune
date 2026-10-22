@@ -1665,6 +1665,14 @@ bool ClientAgent::offerProduceToLeader_(int32_t topicId, int32_t partition,
                         ? uint8_t{0} : r.receiverId;
                 const SealedFrame sealed = sealForOffer(transport_, leader.machine.cryptoState(), buf, len, receiver);
                 if (sealed.len == 0) return false;  // seal failed — DROP, do not transmit
+                // PR #528 review (mixed-version cluster): a worker route with NO receiver id came from a broker that
+                // predates receiver keys (< 7) while this leader's session uses them.  The frame is sealed for the
+                // gateway (receiver 0), so it goes to the leader node's gateway, which relays it - never to the worker,
+                // which would drop it as addressed to another receiver (every such produce would time out).
+                if (receiver == 0 && !r.dataOnNode && leader.machine.cryptoState().receiverKeys) [[unlikely]] {
+                    if (&leader == &seedSession()) return transport_.offer(sealed.buf, sealed.len);
+                    return transport_.offerTo(leader.endpoint, cfg_.transport.ingressStreamId, sealed.buf, sealed.len);
+                }
                 return transport_.offerOn(r.pub, sealed.buf, sealed.len, {});
             }
             return transport_.offerOn(r.pub, buf, len, crc);

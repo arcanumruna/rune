@@ -471,6 +471,8 @@ public:
         return (ring == 0 ? opFenceAcked_ : lifeFenceAcked_)[static_cast<std::size_t>(worker)];
     }
     [[nodiscard]] std::size_t permissionPendingUpdatesForTest() const noexcept { return permissionShipper_.pendingUpdates(); }
+    /// PR #528 review (issue #197): how many objects still owe a permission ship before their DDL OK (bounded).
+    [[nodiscard]] std::size_t objectShipSeqsForTest() const noexcept { return objectShipSeqs_.size(); }
     /// Issue #197 test seam: hold the permission shipper (queue, send nothing); releasing ships the backlog at once.
     void holdPermissionShippingForTest(bool on) {
         permissionShipper_.setHoldForTest(on);
@@ -3155,6 +3157,9 @@ public:
     bool clientFrameHeldForTest(const uint8_t* buf, std::size_t len) { return produceFrameHeld_(buf, len); }
     /// Issue #116: encrypted client frames dropped because they name another receiver (a worker-bound frame).
     [[nodiscard]] uint64_t c2bWrongReceiverDropsForTest() const noexcept { return c2bWrongReceiverDrops_; }
+    /// PR #528 review (issue #116, mixed-version cluster): answer MetadataRequests as a broker below
+    /// kBrokerVersionReceiverKeys does - the worker ingressEndpoint without the receiver-id trailer.
+    void emulatePreReceiverKeyMetadataForTest(bool on) noexcept { preReceiverKeyMetadataForTest_ = on; }
     /// Test-only: a session's crypto state (install a c2b key to drive encrypted ingress); null = unknown.
     [[nodiscard]] CryptoState* sessionCryptoForTest(int64_t sid) noexcept {
         Session* s = sessions_.find(sid);
@@ -3479,6 +3484,7 @@ private:
     uint64_t rejectedRequests_      = 0;       // answered with an error instead of dropped
     uint64_t unanswerableFrames_    = 0;       // dropped: no header / no session / no response type
     uint64_t c2bWrongReceiverDrops_ = 0;       // issue #116: encrypted frames naming another receiver (control thread)
+    bool     preReceiverKeyMetadataForTest_ = false;   // test seam: metadata as a broker < 7 sends it (cold)
     uint64_t spillExpiries_         = 0;       // sessions expired because the egress spill was full
     uint64_t spillExpiryDrops_      = 0;       // answers to an expiring session (it gets SessionExpired)
     uint64_t spillExpiryNotified_   = 0;       // ... whose SessionExpired was delivered

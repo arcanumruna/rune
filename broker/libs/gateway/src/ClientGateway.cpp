@@ -10066,6 +10066,8 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
     resp.brokers       = std::span<const pc::BrokerEntry>(brokers.data(), brokers.size());
     resp.partitions    = std::span<const pc::PartitionEntry>(parts.data(), parts.size());
     resp.clientVersion = session->clientVersion;   // issue #116: the receiver trailer only for sessions >= 12
+    if (preReceiverKeyMetadataForTest_) [[unlikely]]   // test seam: an old broker's answer (no receiver trailer)
+        resp.clientVersion = std::min(resp.clientVersion, pc::kClientVersionReceiverKeys - 1);
 
     const std::size_t needed = resp.encodedSize();
     if (needed <= scratch_.size()) {
