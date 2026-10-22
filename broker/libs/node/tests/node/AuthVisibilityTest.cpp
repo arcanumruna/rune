@@ -107,3 +107,52 @@ TEST(AuthVisibilityRegression, MetadataListsOnlyDescribableTopics) {
     EXPECT_NE(std::find(all.begin(), all.end(), r.orders), all.end());
     EXPECT_NE(std::find(all.begin(), all.end(), r.secret), all.end());
 }
+
+// #126: a fetch-all lists only the committed offsets of topics the caller may READ (a listed entry already needs READ).
+namespace {
+std::vector<int32_t> fetchAllTopics(AuthRig& r, int64_t sid, const std::string& group, bool* ok = nullptr) {
+    pc::OffsetFetch m;
+    m.sessionId = sid; m.correlationId = r.c().nextCorrelationId();
+    m.groupId = {reinterpret_cast<const uint8_t*>(group.data()), group.size()};
+    std::vector<uint8_t> buf(512);
+    const std::size_t len = m.encode(buf.data(), std::span<const pc::OffsetFetchEntry>{});
+    std::vector<int32_t> ids;
+    if (ok) *ok = false;
+    if (len == 0 || !r.c().send(r.ch(), r.stream(), buf.data(), len)) return ids;
+    const auto a = r.rawAnswer(m.correlationId);
+    const auto resp = a.empty() ? std::nullopt : pc::OffsetFetchResponse::decode(a.data(), a.size());
+    if (!resp) return ids;
+    if (ok) *ok = true;
+    for (const auto res : resp->results) {
+        EXPECT_EQ(res.errorCode, 0) << "topic " << res.topicId;
+        ids.push_back(res.topicId);
+    }
+    return ids;
+}
+}  // namespace
+
+TEST(AuthVisibilityRegression, OffsetFetchAllHidesTopicsTheCallerCannotReadRegression) {
+    AuthRig r;
+    const int64_t a = r.newUser({exact(SO::Read, ST::Group, "g126"), exact(SO::Read, ST::Topic, "orders")});
+    const int64_t b = r.newUser({exact(SO::Read, ST::Group, "g126"), exact(SO::Read, ST::Topic, "orders"),
+                                 exact(SO::Read, ST::Topic, "secret")});
+    const int64_t all = r.newUser({exact(SO::Read, ST::Group, "g126"), prefix(SO::Read, ST::Topic, "")});
+    const auto [member, gen] = r.joinStable(b, "g126", {r.orders, r.secret});
+    ASSERT_FALSE(member.empty());
+    ASSERT_EQ(r.commitAs(b, "g126", member, gen, r.orders, 11), 0);
+    ASSERT_EQ(r.commitAs(b, "g126", member, gen, r.secret, 22), 0);
+
+    bool ok = false;
+    auto seenByB = fetchAllTopics(r, b, "g126", &ok);
+    ASSERT_TRUE(ok);
+    std::sort(seenByB.begin(), seenByB.end());
+    EXPECT_EQ(seenByB, (std::vector<int32_t>{std::min(r.orders, r.secret), std::max(r.orders, r.secret)}));
+
+    const auto seenByA = fetchAllTopics(r, a, "g126", &ok);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(seenByA, std::vector<int32_t>{r.orders}) << "a topic the caller cannot READ was listed";
+
+    auto seenByAll = fetchAllTopics(r, all, "g126", &ok);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(seenByAll.size(), 2u);
+}

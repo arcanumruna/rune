@@ -2336,6 +2336,51 @@ TEST(OffsetCommitDurabilityRegression, APlainCommitIsAnsweredOnlyOnceItsRecordIs
     EXPECT_EQ(g.store.fetch("g433", tp(std::string(kTestTopic), 0))->offset, 77);
 }
 
+// #471: OffsetFetch must not serve an offset whose __consumer_offsets record is not committed yet.
+TEST(OffsetCommitDurabilityRegression, AFetchOfAParkedCommitIsRetriableUntilItsRecordCommitsRegression) {
+    struct Version {
+        int32_t v = 10;
+        static int32_t of(void* ctx, int64_t) noexcept { return static_cast<Version*>(ctx)->v; }
+    };
+    const auto unstable = static_cast<int16_t>(pc::ErrorCode::UnstableOffsetCommit);
+    const auto notCoord = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+    for (const int32_t version : {10, 9}) {
+        SCOPED_TRACE(::testing::Message() << "version=" << version);
+        const std::string group = "g471v" + std::to_string(version);
+        CommitRig g(group);
+        Version ver{version};
+        g.svc.setClientVersionResolverForTest(&Version::of, &ver);
+        const int16_t refused = version == 9 ? notCoord : unstable;
+        ASSERT_EQ(g.commit(group, 88), 0u);
+        ASSERT_EQ(g.svc.parkedOffsetCommits(), 1u);
+        std::size_t n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, group, kTestTopicId, 0),
+                                                g.clock, g.out, sizeof g.out);
+        auto f = pc::OffsetFetchResponse::decode(g.out, n);
+        ASSERT_TRUE(f && f->results.size() == 1u);
+        EXPECT_EQ(f->results[0].errorCode, refused) << "an uncommitted offset was handed out";
+        EXPECT_EQ(f->results[0].offset, -1);
+        n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetchAll(g.req, 1, g.corr++, group), g.clock, g.out, sizeof g.out);
+        f = pc::OffsetFetchResponse::decode(g.out, n);
+        ASSERT_TRUE(f && f->results.size() == 1u);
+        EXPECT_EQ(f->results[0].errorCode, refused);
+        EXPECT_EQ(f->results[0].topicId, -1);
+        EXPECT_EQ(f->results[0].offset, -1);
+        g.fetch();   // the follower has the record: the high watermark passes it
+        g.svc.doWork(g.clock);
+        n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, group, kTestTopicId, 0), g.clock,
+                                    g.out, sizeof g.out);
+        f = pc::OffsetFetchResponse::decode(g.out, n);
+        ASSERT_TRUE(f && f->results.size() == 1u);
+        EXPECT_EQ(f->results[0].errorCode, int16_t{0});
+        EXPECT_EQ(f->results[0].offset, 88);
+        n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetchAll(g.req, 1, g.corr++, group), g.clock, g.out, sizeof g.out);
+        f = pc::OffsetFetchResponse::decode(g.out, n);
+        ASSERT_TRUE(f && f->results.size() == 1u);
+        EXPECT_EQ(f->results[0].errorCode, int16_t{0});
+        EXPECT_EQ(f->results[0].offset, 88);
+    }
+}
+
 TEST(OffsetCommitDurabilityRegression, AnOffsetsLeaderChangeUnderAParkedCommitNeverAnswersOkRegression) {
     CommitRig g("g433lc");
     ASSERT_EQ(g.commit("g433lc", 88), 0u);
@@ -2655,4 +2700,34 @@ TEST(OffsetCommitDurabilityRegression, ACommitResentAfterALostParkIsOkOnceCommit
     ASSERT_EQ(g.answers.frames.size(), 1u);
     EXPECT_EQ(CommitRig::codeOf(g.answers.frames[0].data(), g.answers.frames[0].size()), 0);
     EXPECT_EQ(g.store.fetch("gresend", tp(std::string(kTestTopic), 0))->offset, 88);
+}
+
+// #213: a JoinGroup's sessionTimeoutMs is clamped to the coordinator's maximum; it also sets the rebalance timeout.
+TEST(GroupCoordinationServiceRegression, SessionTimeoutAboveTheMaximumIsClampedRegression) {
+    for (const int32_t maxMs : {GroupCoordinationService::kDefaultMaxSessionTimeoutMs, 10'000}) {
+        SCOPED_TRACE(::testing::Message() << "max=" << maxMs);
+        OffRig g;
+        g.svc.setMaxSessionTimeoutMs(maxMs);
+        uint8_t req[4096]{}, out[4096]{};
+        const std::string group = "g213";
+        std::size_t n = g.svc.handleJoinGroup(req, encodeJoinGroup(req, 1, 1, group, "", INT32_MAX), g.clock, out, sizeof out);
+        const auto j = pc::JoinGroupResponse::decode(out, n);
+        ASSERT_TRUE(j.has_value());
+        const std::string member(reinterpret_cast<const char*>(j->memberId.data()), j->memberId.size());
+        (void)g.svc.handleJoinGroup(req, encodeJoinGroup(req, 1, 2, group, member, INT32_MAX), g.clock, out, sizeof out);
+        EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), maxMs) << "an unbounded session timeout set the rebalance timeout";
+        for (int i = 0; i < 200 && g.svc.coordinator(group).state() != GroupState::Stable; ++i) {
+            g.clock += 10'000'000;
+            g.svc.doWork(g.clock);
+        }
+        ASSERT_EQ(g.svc.coordinator(group).state(), GroupState::Stable);
+        ASSERT_EQ(g.svc.coordinator(group).memberCount(), 1u);
+        const int64_t t0 = g.clock;
+        g.clock = t0 + (static_cast<int64_t>(maxMs) - 1'000) * 1'000'000;   // just before the deadline, no heartbeat
+        g.svc.doWork(g.clock);
+        EXPECT_EQ(g.svc.coordinator(group).memberCount(), 1u);
+        g.clock = t0 + (static_cast<int64_t>(maxMs) + 1'000) * 1'000'000;   // just past it
+        g.svc.doWork(g.clock);
+        EXPECT_EQ(g.svc.coordinator(group).memberCount(), 0u) << "the silent member outlived the maximum session timeout";
+    }
 }

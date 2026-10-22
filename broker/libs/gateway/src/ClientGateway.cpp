@@ -7391,6 +7391,10 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
         return;
     }
 
+    // #126: a fetch-all (no entries) lists only the topics the caller may READ - a listed entry already needs READ
+    // (denyGroupRequest_).  Sentinels (topicId < 0) stay.
+    if (templateId == pc::TemplateId::OffsetFetch) [[unlikely]] encoded = filterFetchAllByRead_(*session, buf, len, encoded);
+
     // Fix round 4 (item 8, pre-v5 clients): a v4 member stays Stable on a
     // Heartbeat / SyncGroup error outside the rebalance set — Internal (an
     // unknown coordinator result) is answered UnknownMember instead, and the
@@ -8102,6 +8106,35 @@ bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::D
 
 namespace {
 std::string_view sv(std::span<const uint8_t> b) noexcept { return {reinterpret_cast<const char*>(b.data()), b.size()}; }
+}
+
+/// #126 - see handleGroupMessage.  Rewrites the OffsetFetchResponse in scratch_ without the results of topics the
+/// session cannot READ; returns the new encoded size (unchanged when nothing applies).
+std::size_t ClientGateway::filterFetchAllByRead_(const Session& session, const uint8_t* reqBuf, std::size_t reqLen,
+                                                 std::size_t encoded)
+{
+    const PermissionTable& perms = permsOf_(session);
+    if (perms.isAllowAll()) return encoded;
+    const auto req = pc::OffsetFetch::decode(reqBuf, reqLen);
+    if (!req || !req->entries.empty()) return encoded;   // only a fetch-all; a listed entry was authorized up front
+    const auto resp = pc::OffsetFetchResponse::decode(scratch_.data(), encoded);
+    if (!resp) return encoded;
+    if (fetchFilterScratch_.capacity() == 0) fetchFilterScratch_.reserve(kScratchSize / 18 + 1);   // once
+    fetchFilterScratch_.clear();
+    bool dropped = false;
+    for (const auto res : resp->results) {
+        if (res.topicId >= 0 &&
+            rune::gateway::authorizeTopicId(perms, res.topicId, rune::security::Operation::Read, objectIndex_)) {
+            dropped = true;
+            continue;
+        }
+        fetchFilterScratch_.push_back(pc::OffsetFetchResult{res.topicId, res.partition, res.offset, res.errorCode});
+    }
+    if (!dropped) return encoded;
+    pc::OffsetFetchResponse out;
+    out.sessionId     = resp->sessionId;
+    out.correlationId = resp->correlationId;
+    return out.encode(scratch_.data(), std::span<const pc::OffsetFetchResult>(fetchFilterScratch_));
 }
 
 bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len)

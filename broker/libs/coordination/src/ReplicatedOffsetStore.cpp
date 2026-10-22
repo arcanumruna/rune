@@ -186,6 +186,7 @@ rune::replication::Offset ReplicatedOffsetStore::commitAt(const GroupId&        
     co.metadata          = std::string(metadata);
     co.commitTimestampNs = tsNs;
     co.lineage           = lineage;
+    co.recordAt          = base;   // #471: not served by OffsetFetch until the high watermark passes it
     index_[group][tp]    = std::move(co);
     return base;
 }

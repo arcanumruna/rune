@@ -100,6 +100,7 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/SchemaMessages.h>   // DdlExtension (catalog history Task 9)
+#include <rune/protocol/client/OffsetMessages.h>   // OffsetFetchResult (#126 fetch-all filter scratch)
 
 #include <algorithm>
 #include <array>
@@ -2169,6 +2170,7 @@ private:
     //  ProduceResponse=46 B; restamp scratch = max RecordBatch = 65535 B)
     static constexpr std::size_t kScratchSize = 68 * 1024;
     std::array<uint8_t, kScratchSize>    scratch_{};
+    std::vector<rune::protocol::client::OffsetFetchResult> fetchFilterScratch_;   // #126: fetch-all READ filter (reserved on first use)
 
     // client<->broker TLS/AEAD (Task 8): reusable, grow-once scratch buffers
     // for the data-plane AEAD codec (rune/gateway/CryptoFrame.h) — single-
@@ -2370,6 +2372,9 @@ private:
     /// thread answers (a forwarded security DDL).
     void noteDenied_(const Session& session, rune::protocol::client::TemplateId tid, const rune::gateway::Denial& denial);
     /// Group / txn / catalog-DDL request authorization (cold paths): true = denied and answered.
+    /// #126: drop the results of topics the session cannot READ from a fetch-all OffsetFetchResponse in scratch_.
+    [[nodiscard]] std::size_t filterFetchAllByRead_(const Session& session, const uint8_t* reqBuf, std::size_t reqLen,
+                                                    std::size_t encoded);
     [[nodiscard]] bool denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
     [[nodiscard]] bool denyTxnRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
     template <class Msg> [[nodiscard]] std::optional<rune::gateway::Denial> authorizeCatalogDdl_(const Session& session, const Msg& m) const;

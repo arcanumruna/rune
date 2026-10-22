@@ -386,9 +386,16 @@ private:
     int  releaseParkedCommits_();
     void sendDeferred_(int64_t sessionId, const uint8_t* frame, std::size_t n);
     using ClientVersionFn = int32_t (*)(void* ctx, int64_t sessionId) noexcept;
+    int32_t         maxSessionTimeoutMs_ = kDefaultMaxSessionTimeoutMs;
     ClientVersionFn clientVersionFn_  = nullptr;
     void*           clientVersionCtx_ = nullptr;
 public:
+    /// #213: the upper bound on a JoinGroup's sessionTimeoutMs (Kafka's group.max.session.timeout.ms default).  A
+    /// larger request is CLAMPED to it - the value also sets the group's rebalance timeout, so an unbounded one would
+    /// let a single member stall every rebalance (and keep a dead member) for ~24 days.
+    static constexpr int32_t kDefaultMaxSessionTimeoutMs = 1'800'000;
+    void setMaxSessionTimeoutMs(int32_t ms) noexcept { maxSessionTimeoutMs_ = ms; }
+    [[nodiscard]] int32_t maxSessionTimeoutMs() const noexcept { return maxSessionTimeoutMs_; }
     /// Test seam: resolve a session's client version without a gateway (-1 = unknown: treated as current).
     void setClientVersionResolverForTest(ClientVersionFn fn, void* ctx) noexcept {
         clientVersionFn_ = fn; clientVersionCtx_ = ctx;

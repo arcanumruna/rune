@@ -13,7 +13,7 @@ enum class TxnOffsetApply : uint8_t { Applied, Replicating, Refused };
 
 /// Issue #359: why an apply was Refused (the group coordinator reports its last refusal; the transaction
 /// coordinator logs it with the stuck-commit WARN).  Unknown: the sink gave no reason (rigs).
-enum class TxnOffsetRefusal : uint8_t { Unknown, NotCoordinator, NotLoaded, LineagePending, AppendRefused, TooManyWaiters };
+enum class TxnOffsetRefusal : uint8_t { Unknown, NotCoordinator, NotLoaded, LineagePending, AppendRefused, TooManyWaiters, NoOffsetSink };
 
 [[nodiscard]] constexpr const char* toString(TxnOffsetRefusal r) noexcept {
     switch (r) {
@@ -22,6 +22,7 @@ enum class TxnOffsetRefusal : uint8_t { Unknown, NotCoordinator, NotLoaded, Line
         case TxnOffsetRefusal::LineagePending: return "LineagePending";
         case TxnOffsetRefusal::AppendRefused:  return "AppendRefused";
         case TxnOffsetRefusal::TooManyWaiters: return "TooManyWaiters";
+        case TxnOffsetRefusal::NoOffsetSink:   return "NoOffsetSink";   // #360
         case TxnOffsetRefusal::Unknown:        break;
     }
     return "Unknown";

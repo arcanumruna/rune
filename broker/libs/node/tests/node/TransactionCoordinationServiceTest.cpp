@@ -149,6 +149,16 @@ static std::size_t encodeAddPartitions(uint8_t* buf, std::size_t cap,
 // ===========================================================================
 // Fixture
 // ===========================================================================
+
+namespace {
+/// #360: a node without a group offset sink refuses transactional offsets; fixtures that commit offsets wire this
+/// trivial sink (every offset Applied) so they exercise the rest of the transaction path.
+rune::coordination::TxnOffsetApply appliedSink(void*, const std::string&, const rune::coordination::TopicPartition&,
+                                               int64_t, int64_t, const rune::coordination::TxnOffsetToken&) {
+    return rune::coordination::TxnOffsetApply::Applied;
+}
+}  // namespace
+
 class TransactionCoordinationServiceTest : public ::testing::Test {
 protected:
     TransactionCoordinationServiceTest()
@@ -170,6 +180,7 @@ protected:
             /*topics=*/nullptr,
             /*isLeader=*/[this] { return isLeader_; },
             /*leaderId=*/[this] { return leaderNodeId_; });
+        svc_->setTxnOffsetSink(&appliedSink, nullptr);   // #360
     }
 
     TmpDir dir_;
@@ -1046,6 +1057,7 @@ protected:
         txnStore_ = std::make_unique<tx::ReplicatedTxnStateStore>(replica_.get());
         svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
             txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [] { return rune::node::NodeId{1}; });
+        svc_->setTxnOffsetSink(&appliedSink, nullptr);   // #360
         svc_->setAnswerSinkForTest(&CapturedAnswers::sink, &answers_);
         (void)svc_->doWork(now_);                  // loads; requests the first pid block ceiling
         followerFetches();
@@ -1428,6 +1440,63 @@ TEST_F(TransactionCoordinationServiceTest, OneGroupPartitionIsHeldByOneTransacti
         << "after the reload another transaction could commit the held key (the #438 rewind)";
 }
 
+// #360: a node with no group offset sink must not accept transactional offsets (it would drop them at commit).
+TEST_F(TransactionCoordinationServiceTest, ATxnOffsetCommitWithNoOffsetSinkIsRefusedRetriablyRegression) {
+    svc_->setTxnOffsetSink(nullptr, nullptr);   // this node has no group offset sink
+    const OffsetsTxn t = beginOffsetsTxn(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), "tx360", "cg360", 0);
+    ASSERT_GE(t.pid, 0);
+    EXPECT_EQ(txnOffsetCommit(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), t, 7, 0),
+              static_cast<int16_t>(pc::ErrorCode::NotCoordinator))
+        << "offsets were accepted on a node that cannot apply them";
+    EXPECT_TRUE(svc_->pendingOffsetsForTest("tx360").empty());
+    const std::size_t n = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 1, 5, t.pid, t.epoch, /*commit=*/true, t.txn);
+    ASSERT_EQ(pc::EndTxnResponse::decode(outBuf_.data(), svc_->handleEndTxn(reqBuf_.data(), n, 0, outBuf_.data(),
+                                                                            outBuf_.size()))->errorCode, 0);
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [this] { return leaderNodeId_; });
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    int64_t now = 1'000'000'000;
+    (void)svc_->doWork(now);
+    svc_->onControlMarkerLanded(0, 0, t.pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    for (int i = 0; i < 50 && svc_->txnStateForTest(t.txn) != tx::TxnState::CompleteCommit; ++i) {
+        now += 100'000'000;
+        (void)svc_->doWork(now);
+    }
+    EXPECT_EQ(svc_->txnStateForTest(t.txn), tx::TxnState::CompleteCommit) << "a commit with no offsets must complete";
+    EXPECT_EQ(svc_->txnOffsetCommitsStuck(), 0u);
+}
+
+TEST_F(TransactionCoordinationServiceTest, APreparedCommitWithNoOffsetSinkStaysStuckAndIsReportedRegression) {
+    RefusingSink first;
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &first);   // offsets accepted while a sink is wired
+    const OffsetsTxn t = beginOffsetsTxn(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), "tx360b", "cg360b", 0);
+    ASSERT_EQ(txnOffsetCommit(*svc_, reqBuf_.data(), outBuf_.data(), outBuf_.size(), t, 7, 0), 0);
+    ASSERT_EQ(svc_->pendingOffsetsForTest("tx360b").size(), 1u);
+    const std::size_t n = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 1, 5, t.pid, t.epoch, /*commit=*/true, t.txn);
+    ASSERT_EQ(pc::EndTxnResponse::decode(outBuf_.data(), svc_->handleEndTxn(reqBuf_.data(), n, 0, outBuf_.data(),
+                                                                            outBuf_.size()))->errorCode, 0);
+    // The coordinator reloads on a node whose group offset sink is not wired.
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [this] { return leaderNodeId_; });
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    int64_t now = 1'000'000'000;
+    (void)svc_->doWork(now);
+    svc_->onControlMarkerLanded(0, 0, t.pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    for (int i = 0; i < 20; ++i) { now += 100'000'000; (void)svc_->doWork(now); }
+    EXPECT_EQ(svc_->txnStateForTest(t.txn), tx::TxnState::PrepareCommit) << "offsets were dropped and the commit completed";
+    EXPECT_EQ(svc_->txnOffsetCommitsStuck(), 1u);
+    EXPECT_EQ(svc_->txnOffsetRefusalForTest(t.pid), rune::coordination::TxnOffsetRefusal::NoOffsetSink);
+    RefusingSink second;
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &second);
+    for (int i = 0; i < 400 && svc_->txnStateForTest(t.txn) != tx::TxnState::CompleteCommit; ++i) {
+        now += 100'000'000;
+        (void)svc_->doWork(now);
+    }
+    EXPECT_EQ(svc_->txnStateForTest(t.txn), tx::TxnState::CompleteCommit);
+    EXPECT_EQ(second.accepted, 1);
+    EXPECT_EQ(svc_->txnOffsetCommitsStuck(), 0u);
+}
+
 // Issue #359: a commit stuck on a refused offset apply is visible - a gauge of stuck commits, the oldest one's age,
 // and a periodic WARN - instead of a silent retry loop.
 TEST_F(TransactionCoordinationServiceTest, AStuckOffsetApplyIsCountedAgedAndReportedRegression) {
@@ -1540,6 +1609,7 @@ TEST_F(TxnStateReplicationTest, AHoldOutlivesTheCompletionUntilItsCompleteRecord
     svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
         txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [] { return rune::node::NodeId{1}; });
     svc_->setAnswerSinkForTest(&CapturedAnswers::sink, &answers_);
+    svc_->setTxnOffsetSink(&appliedSink, nullptr);   // #360
     svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
     t.svc = svc_.get();
     (void)svc_->doWork(now_);
@@ -1703,6 +1773,7 @@ TEST_F(TxnStateReplicationTest, AnOngoingHoldersKeysStayHeldAcrossACoordinatorRe
     svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
         txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [] { return rune::node::NodeId{1}; });
     svc_->setAnswerSinkForTest(&CapturedAnswers::sink, &answers_);
+    svc_->setTxnOffsetSink(&appliedSink, nullptr);   // #360
     t.svc = svc_.get();
     (void)svc_->doWork(now_);
     ASSERT_TRUE(svc_->isLoaded());

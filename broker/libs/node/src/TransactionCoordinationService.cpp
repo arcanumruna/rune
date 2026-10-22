@@ -106,7 +106,14 @@ TransactionCoordinationService::TransactionCoordinationService(
 bool TransactionCoordinationService::applyTxnOffset_(const std::string& group,
                                                      const rune::coordination::TopicPartition& tp, int64_t offset)
 {
-    if (offsetSink_ == nullptr) return true;   // no offset store on this node: nothing to apply to
+    if (offsetSink_ == nullptr) [[unlikely]] {
+        // #360: no offset store wired on this node - the offset cannot be applied, so it must not count as applied
+        // (it would be dropped and the commit completed without it).  Refused: the commit stays PrepareCommit,
+        // retries, and is reported by the #359 stuck gauges / WARN.
+        offsetRefusedThisPass_ = true;
+        refusalThisPass_       = rune::coordination::TxnOffsetRefusal::NoOffsetSink;
+        return false;
+    }
     // Duty clock, as handleOffsetCommit's nowNs.  #358: only a COMMITTED offset counts as applied.
     switch (offsetSink_(offsetSinkCtx_, group, tp, offset, lastNowNs_, completionToken_)) {
         case rune::coordination::TxnOffsetApply::Applied:     return true;
@@ -884,6 +891,9 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit_(
         resp.correlationId = msg.correlationId;
         return resp.encode(out, std::span<const pc::TxnPartitionResult>(partResultScratch_));
     };
+    // #360: with no offset sink on this node nothing could apply these offsets at commit: refused (retriable), nothing
+    // added to the transaction.
+    if (offsetSink_ == nullptr) [[unlikely]] return answerAll(static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
     if (msg.hasMemberBlock && memberFence_ != nullptr) {
         memberIdScratch_.assign(reinterpret_cast<const char*>(msg.memberId.data()), msg.memberId.size());
         const pc::ErrorCode fenced =

@@ -297,6 +297,11 @@ public:
     /// #359: the sink's last refusal reason (GroupCoordinationService::lastTxnOffsetRefusal), read after a Refused.
     using TxnOffsetRefusalFn = rune::coordination::TxnOffsetRefusal (*)(void* ctx);
     void setTxnOffsetRefusalReason(TxnOffsetRefusalFn fn) noexcept { offsetRefusalFn_ = fn; }
+    /// #360: why the commit of `producerId` is stuck (Unknown when it is not awaiting its offsets).
+    [[nodiscard]] rune::coordination::TxnOffsetRefusal txnOffsetRefusalForTest(int64_t producerId) const noexcept {
+        const auto it = awaiting_.find(producerId);
+        return it != awaiting_.end() ? it->second.offsetRefusal : rune::coordination::TxnOffsetRefusal::Unknown;
+    }
 
 private:
     // ----- #358 class: nothing that depends on a __transaction_state record happens before it is COMMITTED -----
