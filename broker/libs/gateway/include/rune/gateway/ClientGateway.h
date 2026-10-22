@@ -471,6 +471,11 @@ public:
         return (ring == 0 ? opFenceAcked_ : lifeFenceAcked_)[static_cast<std::size_t>(worker)];
     }
     [[nodiscard]] std::size_t permissionPendingUpdatesForTest() const noexcept { return permissionShipper_.pendingUpdates(); }
+    /// Issue #197 test seam: hold the permission shipper (queue, send nothing); releasing ships the backlog at once.
+    void holdPermissionShippingForTest(bool on) {
+        permissionShipper_.setHoldForTest(on);
+        if (!on) (void)servicePermissionShippingWork_();
+    }
     /// Issue #259 test seam: authenticate `sid` as `userId` holding exactly `grants` (sorted, unique) - through the pool
     /// and the shipper, as a login does.
     void authenticateWithGrantsForTest(int64_t sid, uint64_t userId, std::vector<rune::security::GrantSpec> grants) {
@@ -496,6 +501,15 @@ public:
     void onCatalogObjectApplied(int32_t id, const std::string& name, bool isView);
     /// kA2cCatalogTopicDropped: the id is gone; every table's bits for it are cleared.  Idempotent.
     void onCatalogObjectDropped(int32_t id);
+    /// Issue #197 (control thread): true once every shipper item queued when object `id` was applied (new permission
+    /// tables, WRITE-bit patches) was accepted by EVERY worker's lifecycle ring - or when nothing was owed.  The DDL
+    /// answer gate holds a DefineTopic / CreateView / AlterView OK on it, exactly as a login's final waits on its
+    /// epoch (`heldLoginFinals_`): the worker's grace hold covers an item on its ring, not one still queued here.
+    [[nodiscard]] bool objectPermissionsShipped(int32_t id) const noexcept {
+        for (const auto& e : objectShipSeqs_)
+            if (e.first == id) return e.second <= permissionShipper_.shippedSeq();
+        return true;
+    }
 
     /// Phase 2c (control thread): kA2cFilterSchema - a typed topic's EVOLVING descriptor at `version`.  Installed in
     /// the gateway's registry (filters are validated against it) and fanned out to every worker, in order with the
@@ -2507,6 +2521,8 @@ private:
     rune::node::PermissionShipper permissionShipper_;
     uint64_t permEpoch_ = 0;
     struct HeldLoginFinal { int64_t sessionId; uint64_t epoch; std::vector<uint8_t> frame; };
+    /// Issue #197: (object id, the shipper seq that must be shipped before that object's DDL OK may leave).  Cold, DDL rate.
+    std::vector<std::pair<int32_t, uint64_t>> objectShipSeqs_;
     std::vector<HeldLoginFinal> heldLoginFinals_;     ///< cold: one per login whose grants are still being shipped
     /// Bind `session` to its table on every worker (Required mode + shard mode only; the table itself is shipped once
     /// per grant set); returns the bind's shipper sequence (0 = nothing to ship).

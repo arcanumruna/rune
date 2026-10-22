@@ -8221,6 +8221,15 @@ void ClientGateway::onCatalogObjectApplied(int32_t id, const std::string& name, 
         const auto w = static_cast<std::size_t>(id) / 64;
         (void)permissionShipper_.patchTable(*workerPool_, tid, w, t.writeBits().subspan(w, 1), t.writeBits().size());
     });
+    // Issue #197: the object's DDL OK must not leave before every worker ring accepted what was queued above (the
+    // worker's grace hold covers an item on its ring, not one still in this queue).  queuedSeq() covers the table
+    // ships and this call's patches; conservative is fine.  Idempotent: an existing entry for `id` is replaced.
+    if (shipping && permissionShipper_.queuedSeq() > permissionShipper_.shippedSeq()) {
+        const uint64_t need = permissionShipper_.queuedSeq();
+        for (auto& en : objectShipSeqs_)
+            if (en.first == id) { en.second = need; return; }
+        objectShipSeqs_.emplace_back(id, need);
+    }
 }
 
 void ClientGateway::onFilterSchema(int32_t topicId, uint16_t version, std::span<const uint8_t> evolvingBlob)
@@ -8261,6 +8270,7 @@ void ClientGateway::onCatalogObjectDropped(int32_t id)
     filterSchemas_.erase(id);
     filterSchemaTooLargeTopics_.erase(id);
     objectIndex_.onDropped(id);
+    std::erase_if(objectShipSeqs_, [id](const auto& e) { return e.first == id; });   // issue #197: it never serves
     syncPermissionTables_();
     const bool shipping = authMode_ == rune::gateway::GatewayAuthMode::Required && shardMode_ && workerPool_;
     permPool_.onObjectDropped(id, [&](uint32_t tid, const PermissionTable& t, bool before, bool) {
@@ -8729,6 +8739,10 @@ int ClientGateway::servicePermissionShippingWork_()
     syncPermissionTables_();   // issue #259: a freed table's drop (after every rebind away from it)
     if (!workerPool_ || !shardMode_) return 0;
     if (permissionShipper_.pendingUpdates() != 0) work += permissionShipper_.retry(*workerPool_);
+    if (!objectShipSeqs_.empty()) {   // issue #197: bounded even when an OK is never offered
+        const uint64_t shipped = permissionShipper_.shippedSeq();
+        std::erase_if(objectShipSeqs_, [shipped](const auto& e) { return e.second <= shipped; });
+    }
     for (std::size_t i = 0; i < heldLoginFinals_.size(); ) {
         HeldLoginFinal& h = heldLoginFinals_[i];
         if (permissionShipper_.shippedSeq() < h.epoch) { ++i; continue; }
