@@ -946,6 +946,15 @@ int GroupConsumerHub::reconcileImpl_(GroupConsumerImpl& impl)
         const uint64_t ep  = router_.epoch(router_.ctx, target);
         const int64_t  sid = router_.sessionId(router_.ctx, target);
         if (ep == 0 || sid == 0) {
+            // #290: a Rejected node session (its user revoked there, its login
+            // refused) never carries this fetch: refused now with its code, as
+            // the fetch's own 46 / 44 answer would — never left to wait.
+            if (target != 0 && router_.rejectCode != nullptr) {
+                if (const int16_t code = router_.rejectCode(router_.ctx, target); code != 0) {
+                    refuse_(impl, refusalFor_(static_cast<rpc::ErrorCode>(static_cast<uint16_t>(code))));
+                    return sent;
+                }
+            }
             // Not Connected: its ConnectResponse re-drives.  A terminally
             // Disconnected one (however it got there) is re-driven now.
             if (router_.revive != nullptr) router_.revive(router_.ctx, target);
@@ -2072,6 +2081,15 @@ void GroupConsumerHub::refuse_(GroupConsumerImpl& impl, GroupFailReason why)
     if (routed_()) dropAllFetch_(impl);
     impl.failReason = why;
     finish_(impl);
+}
+
+void GroupConsumerHub::onCoordinatorRejected(int16_t code)
+{
+    const GroupFailReason why = refusalFor_(static_cast<rpc::ErrorCode>(static_cast<uint16_t>(code)));
+    for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
+        GroupConsumerImpl* const impl = impls_[ix];
+        if (impl->active) refuse_(*impl, why);
+    }
 }
 
 void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
