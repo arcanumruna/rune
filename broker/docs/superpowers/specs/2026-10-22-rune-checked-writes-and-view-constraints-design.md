@@ -740,7 +740,7 @@ Each part ships on its own:
 - `autoincrement` topics are compact-only, with no retention.
 - An `IMPORT` above the reservation appends a new reservation first.
 - A conflict rejection carries the conflicting offset, and reads accept `minOffset`.
-- The autoincrement scratch copy happens on the write path; Rune can't patch the ring in place.
+- The autoincrement scratch copy (copy into a per-worker buffer, patch the ids, append from the buffer). **Owner-confirmed, 2026-10-22.**
 - The key field encodes to at most 16 bytes, and `Key` truncation becomes an error.
 - A source key held by another open transaction is locked until that transaction ends (`ConcurrentTransactions`).
 - Untyped topics stay as raw logs: no field list means untyped. Every database feature needs a typed topic.
