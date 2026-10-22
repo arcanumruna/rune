@@ -8,7 +8,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── BUILDER ───────────────────────────────────────────────────────────────────
-FROM gcc:13 AS builder
+FROM gcc:13 AS toolchain
 
 ARG CMAKE_VERSION=3.31.5
 
@@ -40,8 +40,11 @@ RUN case "${TARGETARCH}" in \
     && rm cmake-${CMAKE_VERSION}-linux-${CMAKE_ARCH}.tar.gz \
     && cmake --version
 
-WORKDIR /build
 RUN conan profile detect --force
+
+# ── Broker build ──────────────────────────────────────────────────────────────
+FROM toolchain AS builder
+WORKDIR /build
 
 # ── Conan install (public ConanCenter only — the private `common` dep was dropped)
 # Copy ONLY the conan metadata first so this expensive layer (aeron builds from
@@ -116,7 +119,7 @@ RUN cp -L /usr/local/lib64/libstdc++.so.6 /build/libstdc++.so.6
 # ── RUNTIME ───────────────────────────────────────────────────────────────────
 # debian:bookworm-slim shares the gcc:13 builder's glibc (2.36). Only the binary,
 # the newer libstdc++, and the entrypoint land here — no toolchain, no conan cache.
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim AS base
 
 # Runtime shared libs: libgcc/atomic + libuuid1 (the binary dynamically links
 # libuuid for aeron's embedded driver) + procps for the healthcheck. libstdc++6
@@ -165,3 +168,44 @@ LABEL org.opencontainers.image.title="rune" \
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/usr/local/bin/rune_broker"]
+
+# ── rune CLI (release image only) ─────────────────────────────────────────────
+# The published image also ships the `rune` CLI (cluster key, admin bootstrap, Rune QL shell), the
+# way a database image ships its client. Built only for `--target release` (broker/build_docker.sh),
+# so the default target below needs none of these extra build contexts:
+#   --build-context rune-client=../client-cpp --build-context rune-ql=../ql
+FROM toolchain AS cli-builder
+WORKDIR /cli
+COPY --from=rune-client conanfile.py conandata.yml VERSION.txt ./
+RUN conan install . --output-folder=conan-release --build=missing -s build_type=Release
+COPY --from=rune-protocol include /rune-protocol/include
+COPY --from=rune-protocol src     /rune-protocol/src
+COPY --from=rune-codec src     /rune-codec/src
+COPY --from=rune-codec include /rune-codec/include
+COPY --from=rune-codec tools   /rune-codec/tools
+COPY --from=rune-ql src     /rune-ql/src
+COPY --from=rune-ql include /rune-ql/include
+COPY --from=flight-recorder src     /flight-recorder/src
+COPY --from=flight-recorder include /flight-recorder/include
+COPY --from=rune-crypto src     /rune-crypto/src
+COPY --from=rune-crypto include /rune-crypto/include
+COPY --from=rune-client . .
+ARG CMAKE_BUILD_PARALLEL_LEVEL
+RUN cmake -S . -B build -G Ninja \
+        -DCMAKE_TOOLCHAIN_FILE=conan-release/build/Release/generators/conan_toolchain.cmake \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_BENCHMARKS=OFF \
+        -DBUILD_EXAMPLES=OFF \
+        -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
+        -DRUNE_CODEC_ROOT=/rune-codec \
+        -DRUNE_QL_ROOT=/rune-ql \
+        -DFLIGHT_RECORDER_DIR=/flight-recorder \
+        -DRUNE_CRYPTO_ROOT=/rune-crypto \
+    && cmake --build build --target rune
+
+FROM base AS release
+COPY --from=cli-builder /cli/build/rune /usr/local/bin/rune
+
+# ── Default target: the broker alone (compose files and the e2e suites build this) ──
+FROM base AS runtime
