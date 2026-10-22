@@ -17,7 +17,7 @@ The RegressorsPath backend is moving off Postgres and Redis onto Rune, one servi
 **The owner's decisions (2026-10-22).** These are binding.
 
 1. Uniqueness and limits are enforced through materialized views, and definitions are written in Rune QL.
-2. A write reports success only once the views reflect it. A write that would break a rule fails and leaves no trace.
+2. A write that would break a rule fails and leaves no trace. A writer that needs "success only once the views reflect it" asks for it with the new `AllView` ack level. Plain `All` stays available (owner decision, 2026-10-22; §8.9).
 3. A delete is a tombstone. Views follow tombstones automatically, so nothing filters on `isDelete`.
 4. Views are clustered indexes. There are no array or `collect()` columns: a user's characters are rows under a composite key.
 5. The 12-character cap is a `check` constraint on a `count(*)` aggregate view.
@@ -477,8 +477,25 @@ Like `RcState`, the overlay is rebuilt when `leadershipGeneration` or `logGenera
 **8.8 Folding (Phase 1–2 rules that still apply).**
 - Views fold on the leader only, after commit, bounded by the LSO.
 - Read-your-writes comes from the fold barrier (#82): a read waits until the fold has passed the reader's acked writes.
-- The produce ack stays at acks=all (HW), not "after fold", because every client read path goes through that barrier. **This needs the owner's confirmation; see §17.** Acking after the fold would make every write wait behind any open transaction, because the fold stops at the LSO.
+- `All` acks at commit (HW), and reads still wait at the fold barrier. `AllView` (§8.9) acks only after the fold.
 - With #537 fixed, records of aborted transactions are skipped.
+
+**8.9 Ack levels (owner decision, 2026-10-22)**
+
+| Level | Wire `acks` | Ack is sent when |
+|---|---|---|
+| `None` | — | never |
+| `Leader` | 0 | the leader has appended the batch |
+| `All` | 1 | the HW has passed the batch (majority commit) |
+| `AllView` (new) | 2 (client version 12) | the batch is committed **and** every view whose source is this partition has folded past its last offset |
+
+- **No `LeaderView` level.** Views fold only up to the LSO, which is never above the HW. So "leader + view" can't be acked before commit and would behave exactly like `AllView`.
+- **On the leader.** An `AllView` ack is parked like an `All` ack (`pendingAcksAll_`). `flushOwedAcksAll_` releases it once `HW > lastOffset` *and* the minimum fold cursor over the partition's views is greater than `lastOffset`. Views fold in the same duty cycle, right after `rcAdvanceAll_`, so this normally adds no more than one pass.
+- **Open transactions.** A fold stops at the LSO. An `AllView` write behind an open transaction therefore waits for that transaction to resolve, bounded by the transaction timeout. Only `AllView` writers wait; `All` writers on the same partition don't.
+- **Failures.** These match `All`: NotLeader on a lost leadership, and Internal on the ack deadline, with the outcome unknown. A partition with no views treats `AllView` as `All`.
+- **Checked topics** accept `All` and `AllView`. `Leader` and `None` get a definite `InvalidRequest` (§11.2).
+- **Reads are unchanged.** The fold barrier still holds every read until it covers the reader's acked writes, so `All` writers read their own writes too.
+- **RegressorsPath** auth-server and character-server use `AllView` on their create, rename and delete paths.
 
 ## 9. Reads
 
@@ -567,7 +584,7 @@ Existing codes reused:
 
 **11.2 Who may write to a checked topic.** Everything else gets a definite `InvalidRequest`:
 - **Idempotent producers only.** Writes with pid −1 skip dedupe and `rcGate_`, so the hook's guarantees wouldn't cover them.
-- **acks=all only.** An `acks=leader` write is acked before the HW, which breaks decision 2 and could hand out an id that is then truncated.
+- **`All` or `AllView` only.** An `acks=leader` write is acked before the HW, so it could hand out an id that a failover then truncates.
 - **Client version 12 or later.** Older clients treat unknown codes as "outcome unknown" and bump their epoch.
 
 **11.3 Producer** (`ProducerImpl`). Today any unknown code, and code 24, goes to "outcome unknown", which means `markUnresolved_` and an epoch bump (rule D, `ProducerImpl.cpp:2503`). The out-of-order branch (C4) also resequences and bumps the epoch. Batches already in flight behind a rejected batch arrive out of order. So, for checked partitions:
@@ -687,6 +704,7 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 - a non-idempotent client, an `acks=leader` client, and a v11 client, each writing to a checked topic
 - a coalesced batch with one bad record
 - codes 51–54 inside a transaction
+- `AllView`: acked only after every view has folded the write; behind an open transaction (waits until it resolves); on a partition with no views (behaves as `All`); leader loss while parked (NotLeader); deadline exceeded (Internal); and an old client sending `acks` = 2 is refused
 - a delayed earlier attempt of a rejected batch arriving after the rejection, before and after a failover: it gets the same rejection, is never stored, and the next batch is not deduped against it
 - a login race: the loser's `minOffset` read sees the winner, including when the winner is pending, committed but not yet folded, or in an open transaction
 - intents sent to an older cluster
@@ -732,8 +750,8 @@ Each part ships on its own:
 
 ## 17. Calls made in this design (owner to check)
 
-- The ack stays at acks=all (HW). Read-your-writes comes from the fold barrier on reads.
-- Checked topics require idempotent producers, acks=all and client version 12 or later, with one batch in flight per partition.
+- Ack levels: `All` (HW) and the new `AllView` (HW plus every view folded). There is no `LeaderView`. **Owner-confirmed.**
+- Checked topics require idempotent producers, `All` or `AllView`, and client version 12 or later, with one batch in flight per partition.
 - Codes 51–54 abort an enclosing transaction.
 - A rejection appends a durable reject marker that consumes its sequences.
 - Pre-existing unique conflicts: the smallest source key owns the key, with promotion on delete.
@@ -755,8 +773,6 @@ Each part ships on its own:
 - A dedupe retry returns its ids by reading the stored batch back.
 - Explicit ids on autoincrement topics need the `IMPORT` grant.
 - Performance budgets: under 1 µs for the hook and under 1 µs for assignment, including the copy. No regression for untyped topics or for typed topics that already validated. The new validation cost on typed topics that didn't validate before is measured and accepted.
-
-**Open for the owner:** do you accept decision 2, "success only once views reflect it", in this form: the write is acked at commit (HW), and every read waits at the fold barrier, so no read can miss it? The alternative is acking after the fold. That makes every write on a checked partition wait behind any open transaction, because the fold stops at the LSO.
 
 ## 18. Left to the builder
 
