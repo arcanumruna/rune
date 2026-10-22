@@ -268,6 +268,8 @@ void ClientGateway::sendAnswer_(Session& session, const uint8_t* buf, std::size_
 //   Spilled  — earlier answers still wait: this one is appended behind them
 //              (per-session FIFO), re-offered by drainPendingResponses.
 //   Expiring — refused and counted (the session's SessionExpired is owed).
+//   Closing  — issue #119: refused and counted; the session's LAST answer is
+//              already queued, and nothing may overtake or follow it.
 // Over the per-session quota, or a record larger than the staging buffer: the
 // session itself is EXPIRED.  Pool full: the session holding the most pool
 // bytes is expired (possibly this one) — never a best-effort send, never a
@@ -286,6 +288,9 @@ void ClientGateway::sendReliable_(Session&       session,
         if (offerBytes_(&session, buf, len) > 0) return;   // delivered
     } else if (session.spill.state == SpillState::Expiring) [[unlikely]] {
         ++spillExpiryDrops_;   // the session is being expired: SessionExpired tells the client
+        return;
+    } else if (session.spill.state == SpillState::Closing) [[unlikely]] {
+        ++closingAnswerDrops_;   // issue #119: its last answer is queued - never appended to, never overtaken
         return;
     }
     // Fix round 3 (I1 fairness) / round 4 (N10): the quota counts POOL bytes; the
@@ -367,6 +372,13 @@ void ClientGateway::expireForSpill_(Session& session)
     if (session.spill.state == SpillState::Spilled) {
         (void)egressSpill_.freeAll(session.spill.chain);
         unlinkSpillReady_(session);
+    } else if (session.spill.state == SpillState::Closing) {
+        // Issue #119: largestSpiller_ may pick a Closing session when the pool is full.  Its owed last answers are
+        // released like a Spilled session's and it is expired: under pool exhaustion the client gets SessionExpired
+        // instead of its 46 / 44 / 48 - still a definite end (it reconnects), never a silent vanish.
+        (void)egressSpill_.freeAll(session.spill.chain);
+        unlinkSpillReady_(session);
+        --closingSessions_;
     }
     session.spill = SessionSpill{};
     session.spill.state = SpillState::Expiring;
@@ -439,7 +451,20 @@ bool ClientGateway::dropExpiringFrame_(const uint8_t* buf, std::size_t len)
     uint64_t sid = 0;
     for (int i = 7; i >= 0; --i) sid = (sid << 8) | buf[8 + i];
     const Session* s = sessions_.find(static_cast<int64_t>(sid));
-    if (s == nullptr || s->spill.state != SpillState::Expiring) return false;
+    if (s == nullptr) return false;
+    if (s->spill.state == SpillState::Closing) [[unlikely]] {
+        // Issue #119: the session was sent its last answer - none of its frames is executed.  Only a PLAINTEXT
+        // Disconnect closes it now (nobody waits for the rest); on an encrypted session the frame is unauthenticated
+        // here (see below) and is dropped like any other.
+        const uint16_t ctid = static_cast<uint16_t>(buf[2] | (buf[3] << 8));
+        if (ctid == static_cast<uint16_t>(pc::TemplateId::Disconnect) && !s->crypto.encrypted) {
+            (void)closeSession_(static_cast<int64_t>(sid), /*notifyExpired=*/false);
+            return true;
+        }
+        ++closingIngressDrops_;
+        return true;
+    }
+    if (s->spill.state != SpillState::Expiring) return false;
     const uint16_t tid = static_cast<uint16_t>(buf[2] | (buf[3] << 8));
     // Only a PLAINTEXT session's Disconnect finalizes: this probe runs before
     // the AEAD check, so on an encrypted session the frame is unauthenticated
@@ -492,6 +517,8 @@ rune::node::RecordsSendResult ClientGateway::pushRecords_(Session& session, cons
     // Fix round 4 (N9): an Expiring session receives no Records (its cursor is
     // not advanced; the subscription ends with the session).
     if (session.spill.state == SpillState::Expiring) [[unlikely]] return {rune::node::RecordsSendKind::Retry, -1};
+    // Issue #119: nor does a Closing one (its subscriptions ended; no Records overtake its owed last answers).
+    if (session.spill.state == SpillState::Closing) [[unlikely]] return {rune::node::RecordsSendKind::Retry, -1};
     if (session.egress) [[likely]] {
         if (session.crypto.encrypted) {
             rune::node::RecordsSealCtx seal;
@@ -636,11 +663,12 @@ int ClientGateway::drainPendingResponses(int64_t nowNs)
     if ((spillExpiringCount_ | spillExpiringOverflow_) != 0) [[unlikely]]
         serviceSpillExpiring_(nowNs != 0 ? nowNs : nowNs_);
     if (spillReadyHead_ == nullptr) [[likely]] return 0;
+    const int64_t now = nowNs != 0 ? nowNs : nowNs_;
     int delivered = 0;
     for (Session* s = spillReadyHead_; s != nullptr;) {
         Session* const next = s->spill.nextReady;
+        SessionSpill& sp = s->spill;
         if (spillWritable_(*s)) {
-            SessionSpill& sp = s->spill;
             while (!sp.chain.empty()) {
                 const std::size_t len = egressSpill_.headLen(sp.chain);
                 const uint8_t* data = egressSpill_.headData(sp.chain, spillStage_.data());
@@ -651,8 +679,21 @@ int ClientGateway::drainPendingResponses(int64_t nowNs)
             }
             if (sp.chain.empty()) {
                 unlinkSpillReady_(*s);
+                const bool closing = sp.state == SpillState::Closing;
+                if (closing) --closingSessions_;
                 sp = SessionSpill{};   // back to Normal
+                // Issue #119: a Closing session's last answers are delivered - it ends now (closeSession_ removes
+                // only this session; `next` stays valid).
+                if (closing) (void)closeSession_(s->sessionId);
+                s = next;
+                continue;
             }
+        }
+        // Issue #119: a Closing session that cannot drain is closed at its deadline (the session lease - a resource
+        // bound, not a convergence timer); closeSession_ frees the rest of its chain.
+        if (sp.state == SpillState::Closing && now >= sp.closeDeadlineNs) [[unlikely]] {
+            ++closingDeadlineCloses_;
+            (void)closeSession_(s->sessionId);
         }
         s = next;
     }
@@ -1107,7 +1148,8 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
     // Fix round 4 (N9): an Expiring session's frames are never executed — no
     // Produce append, DDL, commit or txn op after the broker decided the
     // session is dead.  One compare while no session is Expiring.
-    if (expiringSessions_ != 0) [[unlikely]] {
+    // Issue #119: a Closing session's frames likewise (it was sent its last answer).
+    if ((expiringSessions_ | closingSessions_) != 0) [[unlikely]] {
         if (dropExpiringFrame_(buf, len)) return true;   // consumed, not executed
     }
     // client<->broker TLS/AEAD (Task 8): decrypt BEFORE checkFrame — mirrors
@@ -1508,6 +1550,12 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     if (s->spill.state == SpillState::Spilled) {
         (void)egressSpill_.freeAll(s->spill.chain);
         unlinkSpillReady_(*s);
+    } else if (s->spill.state == SpillState::Closing) {
+        // Issue #119: closed at its deadline, on a Disconnect or by the reaper (a drained one is Normal again by
+        // then): whatever is still spilled dies with it.
+        (void)egressSpill_.freeAll(s->spill.chain);
+        unlinkSpillReady_(*s);
+        --closingSessions_;
     } else if (s->spill.state == SpillState::Expiring) {
         --expiringSessions_;
     }
@@ -1554,6 +1602,39 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
 // forever; queued, never dropped, ordered behind queued Subscribes).  Called on
 // close, and (fix round 4, N9) once an Expiring session is first serviced —
 // never from inside a subscriptions_ walk.
+// ---------------------------------------------------------------------------
+// Issue #119: closeAfterAnswers_ - end a session that has just been sent its
+// LAST answer(s) (a revoke's 46s, a failed / unavailable login's 44 / 48, the
+// auth gate's 44, the stale-security AuthUnavailable).  Under egress
+// back-pressure those answers were spilled, and an immediate closeSession_
+// freed them: the client saw the session vanish, never got its 46 / 44 and
+// lost retryAfterMs.  A session with answers still spilled enters the explicit
+// Closing state instead: its chain drains in order (drainPendingResponses),
+// nothing new is accepted (sendReliable_ refuses, the ingress gate drops), and
+// it is closed once the chain is empty or at closeDeadlineNs.
+// ---------------------------------------------------------------------------
+void ClientGateway::closeAfterAnswers_(int64_t sid)
+{
+    Session* s = sessions_.find(sid);
+    if (s == nullptr) return;
+    switch (s->spill.state) {
+    case SpillState::Normal:     // everything was delivered
+        (void)closeSession_(sid);
+        return;
+    case SpillState::Expiring:   // exactly as before: the expiry path owns the notice
+        (void)closeSession_(sid);
+        return;
+    case SpillState::Closing:    // idempotent
+        return;
+    case SpillState::Spilled:
+        s->spill.state           = SpillState::Closing;   // chain, bytes and ready-list links carry over
+        s->spill.closeDeadlineNs = nowNs_ + sessionTimeoutNs_;   // the lease bound expireForSpill_ uses
+        ++closingSessions_;
+        dropSessionSubscriptions_(sid);   // no Records compete with the owed answers
+        return;
+    }
+}
+
 void ClientGateway::dropSessionSubscriptions_(int64_t sid)
 {
     const bool workerSubs = perWorkerEgressActive_ && workerPool_;
@@ -1633,16 +1714,17 @@ void ClientGateway::logProducePauseStats() const
 
 bool ClientGateway::admitClientFrame_(const uint8_t* buf, std::size_t len)
 {
-    if ((heldSessions_ | creditBlockedSessions_ | capDeferredSessions_ | expiringSessions_) == 0) [[likely]]
+    if ((heldSessions_ | creditBlockedSessions_ | capDeferredSessions_ | expiringSessions_ | closingSessions_) == 0) [[likely]]
         return true;
     // Fix round 4/5 (N9 / N20): a frame of an Expiring session is checked FIRST
     // and CONSUMED (admitted; onClientFrame_ drops it, counted) — never
     // ABORTed by a credit / cap pause it can no longer clear.
-    if (expiringSessions_ != 0 && len >= pc::MessageHeader::ENCODED_SIZE) [[unlikely]] {
+    // Issue #119: a Closing session's frame likewise (onClientFrame_ drops it).
+    if ((expiringSessions_ | closingSessions_) != 0 && len >= pc::MessageHeader::ENCODED_SIZE) [[unlikely]] {
         uint64_t sid = 0;
         for (int i = 7; i >= 0; --i) sid = (sid << 8) | buf[8 + i];
         if (const Session* s = sessions_.find(static_cast<int64_t>(sid));
-            s != nullptr && s->spill.state == SpillState::Expiring)
+            s != nullptr && (s->spill.state == SpillState::Expiring || s->spill.state == SpillState::Closing))
             return true;
         if ((heldSessions_ | creditBlockedSessions_ | capDeferredSessions_) == 0) return true;
     }
@@ -5893,6 +5975,7 @@ void ClientGateway::pushSubscriptionsPass_()
         // subscriptions end when its Expiring state is serviced) — checked only
         // when there is something to push (the idle pass reads nothing more).
         if (session->spill.state == SpillState::Expiring) [[unlikely]] continue;
+        if (session->spill.state == SpillState::Closing) [[unlikely]] continue;   // issue #119: its subscriptions ended
 
         // E2 inc2a: When a WorkerPool is wired, route the log read through the
         // owning worker's SPSC ingress ring.  The chunk is returned via the
@@ -8066,6 +8149,8 @@ void ClientGateway::answerGate_(Session& sessionRef, const pc::MessageHeader& hd
     using namespace rune::gateway;
     Session* session = &sessionRef;
     const pc::MessageHeader* hdr = &hdrRef;
+    // Issue #119: a Closing session was already sent its last answer (its frames never get here; defensive).
+    if (session->spill.state == SpillState::Closing) [[unlikely]] return;
     const bool end = gate == AuthGate::AnswerAuthFailedAndEnd;
     const auto code = end ? pc::ErrorCode::AuthenticationFailed : pc::ErrorCode::PasswordChangeRequired;
     ++authGateRefusals_;
@@ -8084,7 +8169,7 @@ void ClientGateway::answerGate_(Session& sessionRef, const pc::MessageHeader& hd
         const std::size_t n = er.encode(scratch_.data());
         sendAnswer_(*session, scratch_.data(), n);
     }
-    if (end) (void)closeSession_(hdr->sessionId);
+    if (end) closeAfterAnswers_(hdr->sessionId);   // issue #119: its 44 is delivered first, even when spilled
 }
 
 
@@ -8421,6 +8506,7 @@ std::optional<rune::gateway::Denial> ClientGateway::authorizeCatalogDdl_(const S
 
 void ClientGateway::failLogin_(Session& session, int64_t correlationId, uint32_t retryAfterMs)
 {
+    if (session.spill.state == SpillState::Closing) [[unlikely]] return;   // issue #119: its last answer is queued
     pc::AuthServerFinal f;
     f.sessionId     = session.sessionId;
     f.correlationId = correlationId;
@@ -8429,11 +8515,12 @@ void ClientGateway::failLogin_(Session& session, int64_t correlationId, uint32_t
     f.detail        = "authentication failed";   // the ONLY failure text (Review Focus 1)
     const std::size_t n = f.encode(scratch_.data());
     sendAnswer_(session, scratch_.data(), n);
-    (void)closeSession_(session.sessionId);
+    closeAfterAnswers_(session.sessionId);   // issue #119: the 44 (and its retryAfterMs) is delivered first
 }
 
 void ClientGateway::unavailableLogin_(Session& session, int64_t correlationId, std::string_view user)
 {
+    if (session.spill.state == SpillState::Closing) [[unlikely]] return;   // issue #119: its last answer is queued
     ++loginsUnavailable_;
     if (unauthLog_.due(7)) [[unlikely]]
         spdlog::warn("auth: login refused user={} source={} session={} reason=security-not-current (AuthUnavailable; "
@@ -8445,7 +8532,7 @@ void ClientGateway::unavailableLogin_(Session& session, int64_t correlationId, s
     f.detail        = "this broker's security state is not current - retry on another broker";
     const std::size_t n = f.encode(scratch_.data());
     sendAnswer_(session, scratch_.data(), n);
-    (void)closeSession_(session.sessionId);
+    closeAfterAnswers_(session.sessionId);   // issue #119: the 48 is delivered first
 }
 
 void ClientGateway::endSessionsSecurityUnavailable()
@@ -8459,11 +8546,12 @@ void ClientGateway::endSessionsSecurityUnavailable()
     for (const int64_t sid : liveScratch_) {
         Session* s = sessions_.find(sid);
         if (s == nullptr) continue;
+        if (s->spill.state == SpillState::Closing) continue;   // issue #119: already sent its last answer
         ++sessionsEndedUnavailable_;
         // Session level (corr 0): every in-flight request of the session ends with it; the client reconnects elsewhere.
         sendErrorOn_(*s, 0, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable),
                      "this broker's security state is stale - reconnect to another broker");
-        (void)closeSession_(sid);
+        closeAfterAnswers_(sid);   // issue #119: the AuthUnavailable is delivered first
     }
     if (!liveScratch_.empty())
         spdlog::warn("auth: {} authenticated session(s) ended: this broker's security state stayed stale", liveScratch_.size());
@@ -8885,6 +8973,9 @@ void ClientGateway::revokeSession_(int64_t sid, std::string_view reason)
     using namespace rune::gateway;
     Session* s = sessions_.find(sid);
     if (s == nullptr) return;
+    // Issue #119: already revoked (or otherwise ended) and draining its last answers - the first revoke counted it,
+    // bound it to the deny table and queued its 46s; nothing more is sent.
+    if (s->spill.state == SpillState::Closing) return;
     std::string user = "<unknown>";
     if (const auto* a = std::get_if<AuthAuthenticated>(&s->auth)) user = a->user;
     else if (const auto* p = std::get_if<AuthPasswordChangeRequired>(&s->auth)) user = p->user;
@@ -8914,7 +9005,7 @@ void ClientGateway::revokeSession_(int64_t sid, std::string_view reason)
     for (const int64_t corr : s->securityReadCorrs) sendErrorOn_(*s, corr, code, reason);
     // ... then the session-level frame (corr 0): every other in-flight request of the session completes with it.
     sendErrorOn_(*s, 0, code, reason);
-    (void)closeSession_(sid);
+    closeAfterAnswers_(sid);   // issue #119: every 46 is delivered first, even when spilled
 }
 
 void ClientGateway::onSecurityHalted(int64_t offset)

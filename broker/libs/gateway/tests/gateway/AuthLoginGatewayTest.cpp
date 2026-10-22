@@ -78,7 +78,11 @@ struct Rig {
 
     explicit Rig(SecurityEventChain c = makeAuthTestChain())
         : chain(std::move(c)), view(chain.state()),
-          gw(ClientGateway::makeForTest([this](const uint8_t* b, std::size_t n) -> int64_t { onFrame(b, n); return 1; }, 1)) {
+          gw(ClientGateway::makeForTest([this](const uint8_t* b, std::size_t n) -> int64_t {
+                 if (refuse) return -2;   // issue #119: egress back-pressure (reliable sessions only)
+                 onFrame(b, n);
+                 return 1;
+             }, 1)) {
         registry = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{}, dir.path.string());
         gw.setTopicRegistry(registry.get());
         gw.setNodeIdForTest(1);
@@ -102,9 +106,24 @@ struct Rig {
         if (!h) return;
         seen.push_back(Frame{h->templateId, h->sessionId, h->correlationId, std::vector<uint8_t>(b, b + n)});
     }
+    /// Issue #119: `reliable` sessions answer through the production spill path (a placeholder egress the rig's
+    /// TestEgressFn intercepts); `refuse` back-pressures their egress.
+    bool reliable = false;
+    bool refuse = false;
+    /// Issue #119: replace the (empty) registry by one holding topic 0 "events" with `partitions` partitions.
+    void withTopic(int32_t partitions) {
+        rune::node::TopicSpec ts;
+        ts.name = "events"; ts.partitionCount = partitions; ts.topicId = 0;
+        const fs::path d = dir.path / "topics";
+        fs::create_directories(d);
+        auto next = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{ts}, d.string());
+        gw.setTopicRegistry(next.get());
+        registry = std::move(next);
+    }
     /// A new session awaiting its login from `host`.
     int64_t newSession(const std::string& host = "10.0.0.9", int64_t now = 0) {
-        const int64_t sid = gw.injectTestSession(now, pc::kClientVersionAuth);
+        const int64_t sid = reliable ? gw.injectReliableTestSessionForTest(now, pc::kClientVersionAuth)
+                                     : gw.injectTestSession(now, pc::kClientVersionAuth);
         gw.setSessionAuthForTest(sid, AuthAwaitingFirst{now + 1'000'000'000, 50});
         gw.setSessionSourceHostForTest(sid, host);
         return sid;
@@ -1374,4 +1393,193 @@ TEST(AuthLaggingViewRegression, FailedProofsWhileBehindAreChargedToTheThrottleAd
     EXPECT_EQ(limited.fin->errorCode, kAuthFailed);
     EXPECT_GT(limited.fin->retryAfterMs, 0u);
     EXPECT_EQ(rig.gw.loginsRateLimited(), 1u);
+}
+
+// ── Issue #119: a session's final answers are never freed with its spill on close ───────────────────────────────────
+// Revoke, a failed / unavailable login, the auth-gate end and the stale-security end send a session its LAST answer
+// and end it.  Under egress back-pressure that answer was spilled, and the immediate closeSession_ freed it: the client
+// saw the session vanish without its 46 / 44 (and lost retryAfterMs).  The session now enters SpillState::Closing: its
+// chain drains in order, nothing new is accepted, and it is closed once drained or at its deadline.
+namespace {
+/// An authenticated (allow-all) session on the rig's current session kind.
+int64_t authedSession(Rig& rig) {
+    const int64_t sid = rig.newSession();
+    rig.gw.setSessionAuthForTest(sid, AuthAuthenticated{7, "u", PermissionTable::allowAll(), {}});
+    return sid;
+}
+void subscribe(Rig& rig, int64_t sid, int64_t corr, int32_t partition) {
+    pc::Subscribe s;
+    s.sessionId = sid; s.correlationId = corr; s.topicId = 0; s.partition = partition; s.partitionKnown = 1;
+    s.fromOffset = -1;
+    std::vector<uint8_t> b(s.encodedSize()); b.resize(s.encode(b.data()));
+    rig.gw.applySubscribeForTest(b.data(), b.size());
+}
+/// The ErrorResponses `sid` received from index `from` on: (correlation id, code), in delivery order.
+std::vector<std::pair<int64_t, int16_t>> errorsFrom(const Rig& rig, int64_t sid, std::size_t from) {
+    std::vector<std::pair<int64_t, int16_t>> out;
+    for (std::size_t i = from; i < rig.seen.size(); ++i) {
+        if (rig.seen[i].sid != sid || rig.seen[i].tid != static_cast<uint16_t>(pc::TemplateId::ErrorResponse)) continue;
+        const auto e = pc::ErrorResponse::decode(rig.seen[i].bytes.data(), rig.seen[i].bytes.size());
+        if (e) out.emplace_back(e->correlationId, e->code);
+    }
+    return out;
+}
+std::vector<uint8_t> produceFrame(int64_t sid, int64_t corr) {
+    pc::Produce m;
+    m.sessionId = sid; m.correlationId = corr; m.topicId = 0; m.partition = 0; m.partitionKnown = 1; m.acks = 1;
+    m.producerId = -1; m.baseSequence = -1;
+    rune::protocol::RecordBatchBuilder rb(0, 1000);
+    rb.append("k", "v", 1000);
+    std::vector<uint8_t> batch = rb.build();
+    m.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+    std::vector<uint8_t> b(m.encodedSize()); b.resize(m.encode(b.data()));
+    return b;
+}
+constexpr int16_t kRevoked = static_cast<int16_t>(pc::ErrorCode::SessionRevoked);
+}  // namespace
+
+TEST(SessionClosingSpillRegression, RevokedSessionUnderBackPressureStillGetsSessionRevokedRegression) {
+    Rig rig;
+    rig.withTopic(2);
+    rig.reliable = true;
+    const int64_t sid = authedSession(rig);
+    subscribe(rig, sid, 11, 0);
+    subscribe(rig, sid, 12, 1);
+    std::vector<int64_t> subscribed;
+    for (const Frame& f : rig.seen)
+        if (f.sid == sid && f.tid == static_cast<uint16_t>(pc::TemplateId::SubscribeResponse))
+            if (const auto r = pc::SubscribeResponse::decode(f.bytes.data(), f.bytes.size()); r && r->errorCode == 0)
+                subscribed.push_back(f.corr);
+    ASSERT_EQ(subscribed, (std::vector<int64_t>{11, 12})) << "precondition: two gateway-pushed subscriptions";
+
+    rig.refuse = true;
+    const std::size_t mark = rig.seen.size();
+    rig.gw.onSecurityHalted(0);   // revokes every authenticated session
+    EXPECT_EQ(rig.gw.sessionsRevoked(), 1u);
+    ASSERT_TRUE(rig.gw.hasSessionForTest(sid)) << "the revoke freed its spilled 46s with the session";
+    EXPECT_EQ(rig.gw.spillStateForTest(sid), SpillState::Closing);
+    EXPECT_EQ(rig.gw.closingSessions(), 1u);
+    EXPECT_EQ(rig.seen.size(), mark) << "precondition: every 46 was back-pressured";
+
+    rig.refuse = false;
+    rig.gw.drainPendingResponses(1);
+    const auto errs = errorsFrom(rig, sid, mark);
+    ASSERT_EQ(errs.size(), 3u) << "one 46 per subscription, then the session-level 46";
+    EXPECT_EQ(std::min(errs[0].first, errs[1].first), 11);
+    EXPECT_EQ(std::max(errs[0].first, errs[1].first), 12);
+    EXPECT_EQ(errs[2].first, 0) << "the session-level 46 comes last";
+    for (const auto& [corr, code] : errs) EXPECT_EQ(code, kRevoked) << "corr " << corr;
+    EXPECT_FALSE(rig.gw.hasSessionForTest(sid)) << "closed once its answers were delivered";
+    EXPECT_EQ(rig.gw.closingSessions(), 0u);
+    EXPECT_EQ(rig.gw.egressSpillUsedBytesForTest(), 0u);
+    EXPECT_EQ(rig.gw.spillReadySessionsForTest(), 0u);
+    EXPECT_EQ(rig.gw.closingDeadlineCloses(), 0u);
+}
+
+TEST(SessionClosingSpillRegression, ThrottledLoginFailureUnderBackPressureKeepsItsRetryAfterRegression) {
+    Rig rig;
+    for (int i = 0; i < 3; ++i) (void)rig.login("ws2", {"wrong password", ""});
+    ASSERT_EQ(rig.gw.loginsFailed(), 3u) << "precondition: the throttle delay is active";
+    rig.reliable = true;
+    rig.refuse = true;
+    const auto limited = rig.login("ws2", {kTestPasswordA, ""});
+    EXPECT_FALSE(limited.fin.has_value()) << "precondition: the 44 was back-pressured";
+    ASSERT_TRUE(rig.gw.hasSessionForTest(limited.sid)) << "the failed login freed its spilled 44 with the session";
+    EXPECT_EQ(rig.gw.spillStateForTest(limited.sid), SpillState::Closing);
+
+    rig.refuse = false;
+    rig.gw.drainPendingResponses(1);
+    const auto fin = lastFinal(rig, limited.sid);
+    ASSERT_TRUE(fin.has_value()) << "the client never got its 44";
+    EXPECT_EQ(fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+    EXPECT_GT(fin->retryAfterMs, 0u) << "retryAfterMs was lost";
+    EXPECT_FALSE(rig.gw.hasSessionForTest(limited.sid));
+    EXPECT_EQ(rig.gw.closingSessions(), 0u);
+    EXPECT_EQ(rig.gw.egressSpillUsedBytesForTest(), 0u);
+}
+
+TEST(SessionClosingSpillRegression, AClosingSessionThatNeverDrainsIsClosedAtItsDeadlineRegression) {
+    Rig rig;
+    rig.reliable = true;
+    constexpr int64_t t0 = 5'000;
+    rig.gw.setNowNsForTest(t0);
+    const std::size_t usedBefore = rig.gw.egressSpillUsedBytesForTest();
+    const int64_t sid = authedSession(rig);
+    rig.refuse = true;   // forever
+    rig.gw.onSecurityHalted(0);
+    ASSERT_TRUE(rig.gw.hasSessionForTest(sid));
+    ASSERT_EQ(rig.gw.spillStateForTest(sid), SpillState::Closing);
+    EXPECT_GT(rig.gw.egressSpillUsedBytesForTest(), usedBefore);
+    const int64_t deadline = t0 + ClientGateway::kDefaultSessionTimeoutNs;
+    rig.gw.drainPendingResponses(deadline - 1);
+    EXPECT_TRUE(rig.gw.hasSessionForTest(sid)) << "closed before its deadline";
+    EXPECT_EQ(rig.gw.closingDeadlineCloses(), 0u);
+    for (int i = 0; i < 8 && rig.gw.hasSessionForTest(sid); ++i) rig.gw.drainPendingResponses(deadline);
+    EXPECT_FALSE(rig.gw.hasSessionForTest(sid)) << "a Closing session that never drains is never closed";
+    EXPECT_EQ(rig.gw.closingDeadlineCloses(), 1u);
+    EXPECT_EQ(rig.gw.closingSessions(), 0u);
+    EXPECT_EQ(rig.gw.egressSpillUsedBytesForTest(), usedBefore) << "the spill pool got its bytes back";
+    EXPECT_EQ(rig.gw.spillReadySessionsForTest(), 0u);
+}
+
+TEST(SessionClosingSpillRegression, AClosingSessionExecutesNoFrameAndAcceptsNoNewAnswerRegression) {
+    Rig rig;
+    rig.withTopic(1);
+    rig.reliable = true;
+    const int64_t sid = authedSession(rig);
+    rig.refuse = true;
+    rig.gw.onSecurityHalted(0);
+    ASSERT_EQ(rig.gw.spillStateForTest(sid), SpillState::Closing);
+    const uint64_t revoked = rig.gw.sessionsRevoked();
+    const std::size_t held = rig.gw.spilledBytesForTest(sid);
+    const uint64_t answerDrops = rig.gw.closingAnswerDrops();
+
+    // (a) A Produce and a DDL are consumed, counted and never executed.
+    const auto pf = produceFrame(sid, 21);
+    EXPECT_TRUE(rig.gw.applyClientFrameForTest(pf.data(), pf.size()));
+    const auto df = defineTopicFrame(sid, 22);
+    EXPECT_TRUE(rig.gw.applyClientFrameForTest(df.data(), df.size()));
+    EXPECT_EQ(rig.gw.closingIngressDrops(), 2u);
+    EXPECT_EQ(rig.registry->log(0, 0)->logEndOffset(), 0) << "a Closing session's Produce was appended";
+    EXPECT_EQ(rig.admin.otherSubmits, 0) << "a Closing session's DDL was submitted";
+    EXPECT_EQ(rig.gw.spilledBytesForTest(sid), held) << "an answer was queued behind the last one";
+    EXPECT_EQ(rig.gw.closingAnswerDrops(), answerDrops) << "a frame was executed (its answer refused)";
+
+    // (b) A second revoke sends nothing more and is not counted again.
+    rig.gw.onSecurityHalted(0);
+    EXPECT_EQ(rig.gw.sessionsRevoked(), revoked);
+    EXPECT_EQ(rig.gw.spilledBytesForTest(sid), held);
+    EXPECT_EQ(rig.gw.closingAnswerDrops(), answerDrops);
+    EXPECT_EQ(rig.gw.spillStateForTest(sid), SpillState::Closing);
+
+    // (c) A plaintext Disconnect closes it at once.
+    pc::Disconnect d; d.sessionId = sid; d.correlationId = ++rig.corr;
+    std::vector<uint8_t> b(pc::Disconnect::ENCODED_SIZE); b.resize(d.encode(b.data()));
+    EXPECT_TRUE(rig.gw.applyClientFrameForTest(b.data(), b.size()));
+    EXPECT_FALSE(rig.gw.hasSessionForTest(sid));
+    EXPECT_EQ(rig.gw.closingSessions(), 0u);
+    EXPECT_EQ(rig.gw.egressSpillUsedBytesForTest(), 0u);
+    EXPECT_EQ(rig.gw.spillReadySessionsForTest(), 0u);
+}
+
+TEST(SessionClosingSpillRegression, NoBackPressureClosesAtOnceAsBeforeRegression) {
+    Rig rig;
+    rig.reliable = true;
+    const int64_t sid = authedSession(rig);
+    rig.gw.onSecurityHalted(0);
+    EXPECT_FALSE(rig.gw.hasSessionForTest(sid)) << "revoke: closed in the same call";
+    EXPECT_EQ(errorsFrom(rig, sid, 0), (std::vector<std::pair<int64_t, int16_t>>{{0, kRevoked}}));
+    const auto o = rig.login("ws2", {"wrong password", ""});
+    ASSERT_TRUE(o.fin.has_value());
+    EXPECT_EQ(o.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+    EXPECT_FALSE(rig.gw.hasSessionForTest(o.sid)) << "failed login: closed in the same call";
+    const int64_t gated = rig.newSession();
+    const int64_t gateCorr = ++rig.corr;
+    rig.send(defineTopicFrame(gated, gateCorr));
+    EXPECT_FALSE(rig.gw.hasSessionForTest(gated)) << "auth-gate end: closed in the same call";
+    EXPECT_TRUE(std::any_of(rig.seen.begin(), rig.seen.end(),
+                            [&](const Frame& f) { return f.sid == gated && f.corr == gateCorr; }))
+        << "the gate's 44 was delivered";
+    EXPECT_EQ(rig.gw.closingSessions(), 0u);
+    EXPECT_EQ(rig.gw.egressSpillUsedBytesForTest(), 0u);
 }
