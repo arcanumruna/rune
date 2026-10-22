@@ -1,6 +1,6 @@
 # Checked writes: typed topics, write intents, broker-assigned ids, wide view keys and view constraints
 
-Status: design, 2026-10-22. Not yet approved.
+Status: design, 2026-10-22. Not yet approved. Revised the same day to design B: records are judged at fold (§3).
 
 ## 1. Why
 
@@ -17,7 +17,7 @@ The RegressorsPath backend is moving off Postgres and Redis onto Rune, one servi
 **The owner's decisions (2026-10-22).** These are binding.
 
 1. Uniqueness and limits are enforced through materialized views, and definitions are written in Rune QL.
-2. A write that would break a rule fails and leaves no trace. A writer that needs "success only once the views reflect it" adds the new `View` ack flag, as in `Acks::All | Acks::View`. Acks become flags that combine; plain `All` stays (owner decision, 2026-10-22; §8.9).
+2. A write that breaks a rule is rejected and never becomes visible: no view folds it, no consumer receives it, and compaction removes it from the log. It is judged when the views fold it, after it is stored (design B, owner decision 2026-10-22; §3). A writer that needs "success only once the views reflect it" adds the new `View` ack flag, as in `Acks::All | Acks::View`. Acks become flags that combine; plain `All` stays (owner decision, 2026-10-22; §8.9).
 3. A delete is a tombstone. Views follow tombstones automatically, so nothing filters on `isDelete`.
 4. Views are clustered indexes. There are no array or `collect()` columns: a user's characters are rows under a composite key.
 5. The 12-character cap is a `check` constraint on a `count(*)` aggregate view.
@@ -66,8 +66,8 @@ select characterId from character_name where nameKey = lower('Foo');  -- point r
 auto found = userIdentity.getAndWait({provider, subject});
 uint64_t userId = found ? found->userId
                         : users.insertAndWait({.provider = provider, .subject = subject, .createdAt = now}).key();
-// If two first logins race, one gets ConstraintViolation(user_identity, conflictOffset). It re-reads with
-// getAndWait(key, {.minOffset = conflictOffset}) and uses the winner's userId; that read can't miss the winner.
+// If two first logins race, one gets ConstraintViolation(user_identity). The winner is already folded when the
+// loser is judged, so the loser's getAndWait(key) finds the winner's userId.
 
 // character-server, POST /character   (u comes from the verified JWT, never the request body)
 auto r = characters.insertAndWait({.userId = u, .name = req.name, …});
@@ -88,13 +88,12 @@ characters.removeExistingAndWait(id);   // KeyNotFound → 404
 - G3. The broker assigns keys (`autoincrement`) with no extra hop and no reuse, ever (§6).
 - G4. View keys up to 128 bytes: composite keys and key expressions (§7).
 - G5. Point reads by a full key of any width, and prefix reads by the leading key columns (§9).
-- G6. `unique` projection views and `check (count … <= N)` aggregate constraints are enforced before the append (§8).
-- G7. A rejected batch stores no data and changes no view. Its sequences are consumed by a durable reject marker, so no copy of it can ever be stored.
+- G6. `unique` views and `check` predicates are enforced when the views fold each record, against a view that has folded every record before it (§3, §8).
+- G7. A rejected record changes no view and is never delivered to a consumer. Its verdict is durable (verdict markers), the same everywhere, and compaction removes it (§8.5).
 - G7b. A persisted view may read a transient source. After a restart it keeps its checkpointed rows and has nothing to replay from the source (§9a).
 - G8. Everything is correct under:
   - concurrent writers
   - collisions inside one batch
-  - transactions that commit or abort
   - ack timeouts and retries
   - leader failover
   - restart
@@ -109,8 +108,10 @@ characters.removeExistingAndWait(id);   // KeyNotFound → 404
 - Unique views, derived keys or composite keys over sources with more than one partition. These need partition-key alignment.
 - Joins, cascades across topics, and views over views.
 - `where` inside a view definition.
-- `check` on anything other than an upper bound on `count`.
-- Constraints over transient sources: a transient ring doesn't survive failover, so the overlay couldn't be rebuilt.
+- `check` predicates across rows, over other views, or with non-constant operands.
+- Constrained views over several topics. A view has exactly one source today (`PlanCompiler.cpp:112-127`), and judging across topics would need one deterministic order over them.
+- Transactions and explicit atomic batches on sources of constrained views (§11.2). A follow-up can judge a whole transaction at once.
+- Constraints over transient sources: their verdict markers and bitmap would live in a ring that a restart loses. RegressorsPath doesn't need them.
 - Standalone sequences not tied to a topic key (`create sequence`, `nextId`).
 - Collations, locale-aware case rules (Turkish, Lithuanian and so on), Unicode normalization, and full case folding (`casefold()` is reserved, §8.1).
 - Folding views ahead of commit (rows a failover could lose). The `Leader | View` ack is accepted, but it waits for commit (§8.9).
@@ -118,43 +119,43 @@ characters.removeExistingAndWait(id);   // KeyNotFound → 404
 **Anti-goals.** Any of these makes the work a failure even if the rest works:
 
 - Any interleaving the system allows lets a rule be broken, even for a moment.
-- A client is told a write failed when it was stored, or the reverse.
+- A client is told a write was rejected when it is visible, or accepted when it never will be.
 - An id is handed out twice, or reused after a delete.
 - A topic without these features gets slower.
 - The hot path allocates, takes a lock or makes a virtual call.
 
-## 3. Shape: one check point on the write path
+## 3. Shape: records are judged when the views fold them
 
-Every new rule runs in **one hook** on the partition leader. It sits in `handleProduceBatch`, after idempotent dedupe (`producerState.validate`, `ProducePath.cpp:205`) and before the min-ISR gate and the append. That point covers both ingress routes, gateway-routed and shard ingress, because both reach `produceCore_` and then `handleProduceBatch`.
+**Owner decision (2026-10-22, design B).** A record is stored first and judged when the views fold it. A check is the view engine evaluating a rule on the row the record would produce, against a view that has already folded every record before it. Nothing outside the view holds, counts or recomputes view state, so a rule can be anything the view engine can compute (§8.2).
 
-- **Why after dedupe.** If the hook ran first, a retry of a batch that was already stored could be rejected (create X, delete X, retry the create) even though the original succeeded.
-- **Why before the append.** A rejected batch's data is never stored. Its sequences are consumed by a durable reject marker (§11.3), so a delayed copy of the same batch can never be stored later.
-- **How it's built.** The hook is a template policy, with no virtual call and no `std::function`.
-  - Its state is reached through a pointer stored next to the partition's `RcSlot`. A partition with no checks has `nullptr`, and the hook is one `[[unlikely]]` branch.
-  - Installs and removals are cold control-to-worker ops, like `SchemaUpdate` and `CreateView`. They may allocate on the worker thread.
+**Terms.**
+- A **verdict view** is a constrained view (`unique` or `check`) or the key index (§5.2). Only verdict views can reject a record.
+- A **verdict source** is a partition whose topic feeds at least one verdict view. Only verdict sources carry the reader bound (§8.6), the verdict markers (§8.5) and the transaction rule (§11.2). Other partitions are unchanged.
 
-**A checked topic** is a topic with any of the following:
-- `autoincrement`
-- `key.index = on`
-- a constrained view (`unique`, or a `check`)
-
-Checked topics share these rules:
-- the producer requirements (§11.2)
-- the readiness gate (§8.6)
-- the pending overlay (§8.4)
-- one batch in flight per partition on the client (§11.3)
-
-Validation (§4) runs for every typed topic, in the same single decode pass.
-
-**What the hook does for one batch, in order:**
+**The write path does only what must happen before the bytes are stored.** One hook on the partition leader sits in `handleProduceBatch`, after idempotent dedupe (`producerState.validate`, `ProducePath.cpp:205`) and before the min-ISR gate and the append. Both ingress routes, gateway-routed and shard ingress, reach it through `produceCore_`. For one batch, in order:
 1. Decode each record once, using the per-writer-version descriptor cache shared with the fold. That gives validation (§4).
 2. Check the wire key against the key field (§4).
-3. Assign `autoincrement` ids and patch them into the record (§6).
-4. Check the intent against the key index plus the overlay (§5).
-5. Check each constrained view against the view state plus the overlay (§8).
-6. Records are processed in order against a scratch overlay, so a batch can collide with itself.
-7. If any record fails a check, reject the whole batch. No data is appended, nothing is reserved, and the counter is restored. Only the §11.3 reject marker is appended, so the rejection is durable.
-8. Otherwise, merge the scratch into the overlay, tagged with the offsets the append assigns. This happens on the same thread, with nothing interleaved.
+3. Assign `autoincrement` ids and patch them into the record (§6). An exhausted counter refuses the batch with code 54 before the append.
+4. Apply the per-write requirements (§11.2).
+
+- **Why after dedupe.** A retry of a stored batch must get the stored batch's answer, never a second id or a second judgment.
+- **How it's built.** The hook is a template policy, with no virtual call and no `std::function`.
+  - Its state is reached through a pointer stored next to the partition's `RcSlot`. A partition with none of these features has `nullptr`, and the hook is one `[[unlikely]]` branch.
+  - Installs and removals are cold control-to-worker ops, like `SchemaUpdate` and `CreateView`. They may allocate on the worker thread.
+
+**The fold judges.** Views fold on the leader, after commit, in offset order (§8.8). For each record:
+1. Every verdict view on the partition computes the rows the record would produce (its **prospective rows**) with the same code that applies them, without writing them.
+2. The rules are evaluated on the prospective rows (§8.2), and intents against the key index (§5.2).
+3. If everything passes, every view on the partition applies the record. If anything fails, the record is **rejected**: no view applies it, and the rejection goes into the next verdict marker (§8.5).
+
+Views that aren't verdict views fold after the verdict views in the same duty cycle and skip rejected records.
+
+**Why the verdict is exact.** The fold is serial per partition and in log order. Each record is judged against the fold of every accepted record before it: nothing is pending and nothing is counted outside the view. The scope is one partition. The key index is partition-local by nature; unique views and aggregates need a source with one partition (§7.4).
+
+**What a rejected record is.** It stays in the log and replicates like any other record, but:
+- no view folds it;
+- no consumer ever receives it (§8.6);
+- the cleaner removes it, and it never counts as the latest record for its key (§8.5).
 
 ## 4. Part A: typed topics always validate; untyped topics are raw logs
 
@@ -226,11 +227,11 @@ Bit pattern 3 and the other attribute bits are reserved and rejected with `Inval
 
 - **What it is.** A per-partition set of the keys that exist, enabled by `with (key.index = on)` and implied by `autoincrement`.
   - It is the same machinery as a projection view keyed by the source key, without the columns: about 16 bytes per key, plus the checkpoint and the leader-only rebuild.
-- **The check.** Intents are checked in the §3 hook against the key index plus the overlay, under the §8.5 counting rules. A pending insert counts at once. A pending delete counts only in the cases §8.5 allows.
+- **The check.** The key index is a verdict view (§3). An intent is judged when the key index folds the record, against every record before it.
 - **Not enabled.** A non-zero intent sent to a topic without a key index is refused with a definite `InvalidRequest`.
 
 **5.3 The log says what happened.**
-- A write whose intent fails is never appended. So in the log, an `insert` really was a create, an `update` really was an update, and a tombstone with intent 2 really deleted an existing key.
+- A record whose intent fails is never visible (§8.6). So in what readers see, an `insert` really was a create, an `update` really was an update, and a tombstone with intent 2 really deleted an existing key.
 - Compaction removes superseded records, so a key's original `insert` disappears once a later update replaces it. A consumer reading compacted history therefore treats records as upserts. Intents are exact only for records that compaction hasn't touched.
 
 **5.4 Client API**
@@ -300,13 +301,13 @@ topic character { characterId uint64 autoincrement, … } partitions 1 replicas 
   - No allocation, no lookup, and no extra hop.
   - Target: under 1 µs p50 for a batch of up to 4 KiB, including the copy, on `ProduceValidateBench` (my call).
   - A record with an assigned id skips the key-index existence check, since it is unique by construction.
-- **Rejection.** If a later check rejects the batch (§3 step 7), the counter goes back to where it was.
+- **Rejection at fold.** A create rejected by a constraint keeps its id, which is burned and never reused.
 
 **6.5 Durability: reservation records**
 
 - **Reserve.** Before using an id above the current reservation, the leader appends a control record to the same partition log: "reserved through n = R". It goes in on the same thread, immediately before the data batch. The step is `autoincrement.reserve`, default 4096.
 - **Replication.** The reservation replicates like any record. It sits below the data batch that relies on it, so it is committed first. Nothing new is needed: no sequence store and no separate replication path.
-- **Failover and restart.** The new leader finds the latest reservation in its log and resumes at R+1. The unused part of the block becomes a gap. Until it has found its reservation, autoincrement writes get retriable `NotLeader` (§8.6).
+- **Failover and restart.** The new leader finds the latest reservation in its log and resumes at R+1. The unused part of the block becomes a gap. Until it has found its reservation, autoincrement writes get retriable `NotLeader`.
 - **Truncation.** Truncation cuts a suffix. If a reservation is cut, every data record above it is cut too, so no surviving record's id is ever handed out again.
 - **Compaction.** The cleaner keeps the latest reservation record per partition. Otherwise the highest id could disappear once its record is tombstoned and compacted away, and a deleted record's id would be reused.
 - **Retention.** An `autoincrement` topic must be `cleanup.policy = compact`.
@@ -329,9 +330,9 @@ topic character { characterId uint64 autoincrement, … } partitions 1 replicas 
   - Each `autoincrement` partition keeps a side window `(producerId → last 32 batches' assigned base ids)`, in step with the producer-state retry window. Only these partitions have it.
   - It is rebuilt from the log on failover, alongside the producer-state rebuild, from the keys in the stored batches.
   - Nothing is read back, so compaction rewriting the batch doesn't matter.
-  - Checked partitions keep one batch in flight (§11.3), so a retry is always the newest batch and always in the window.
+  - The producer never has more batches in flight than the window holds, so a retry is always in the window.
   - A duplicate outside the window is answered `DuplicateSequence` with no id. The client reports "stored; id unknown" as its own definite error. It should be unreachable, and the stress run asserts that.
-- **Transactions.** Ids taken inside a transaction that aborts are burned, leaving a gap.
+- **Transactions.** On a topic with no constrained view, ids taken inside a transaction that aborts are burned, leaving a gap. On a constrained one, transactions are refused (§11.2).
 - **The ack.** It carries the ids only once the write is committed (acks=all, §11.2), so a truncated record never gave its id to anyone.
 
 **6.7 Client**
@@ -421,13 +422,16 @@ Names can't contain NUL, so padding can't make two names collide. In general, a 
 
 **8.2 What is checked**
 
-- **A `unique` view.** A record whose derived key is already owned by a different source key, in the view or in the overlay, is a violation.
-- **`check (c <= N)` or `check (c < N)`** on a `count(*)` / `count(col)` aggregate view. After the record is applied, the group's folded contributor count plus its pending increments, minus its countable pending releases (§8.5), must stay within the bound.
-  - An increment means the record adds a new contributor to the group. An update to an existing member is not an increment.
-  - A move between groups is an increment for the new group and a release for the old one.
-- **Never rejected.** A retraction (a tombstone, or a move out of a group) is never rejected. A group already over its limit may shrink.
-- **Anything else.** Any other check form is refused at compile time with "check supports count(…) <= / < constant".
+- **A `unique` view.** A record is rejected if its derived key is already owned by a different source key in the view.
+- **`check (<predicate>)`** on any view, projection or aggregate.
+  - The predicate is over the view row's own columns, whether key, projected or aggregate (`count`, `sum`, `avg`, `min`, `max`, `last`). It compares them with constants using `=`, `<>`, `<`, `<=`, `>` and `>=`, combined with `and`, `or` and `not`. Examples: `check (characters <= 12)`, `check (balance >= 0)`.
+  - It is evaluated on each prospective row the record would produce (§8.4).
+  - A record is rejected if some prospective row fails the predicate **and** the record changes a column the predicate reads.
+    - So a rename inside a group that is already over its limit passes, because it doesn't change `count`. A create into that group fails, so the group can't grow.
+    - Deletes are never rejected (§8.4), so such a group can always shrink.
+  - A row the record removes entirely (the last contributor of a group leaves) isn't checked.
 - **Several views.** One record may be checked against several views, for example `character_name` and `account_stats`, and must pass all of them.
+- **Refused at compile time:** predicates across rows, subqueries, columns of other views, and non-constant operands ("check compares this view's columns with constants").
 
 **8.3 Unique conflicts at fold time.** These can come only from data written before the unique view existed, because the write-time check prevents new ones.
 
@@ -440,73 +444,65 @@ Names can't contain NUL, so padding can't make two names collide. In general, a 
 - **Writes.** A write claiming a key that already has any live owner is rejected (§8.2), so the conflict set can only shrink.
 - **Back-fills.** They should still remove duplicates first, as Postgres migration V14 did.
 
-**8.4 The pending overlay.** Views fold only up to the LSO, which is bounded by the HW. The overlay covers what lies between each view's fold cursor and the log end offset (LEO).
+**8.4 Verdicts at fold**
 
-**The check-time guarantee.** A check sees exactly the fold of the partition's log up to the record before it: the folded view state up to each cursor, plus the overlay over `[cursor, LEO)`. It never waits for replication or the fold.
-- **Exactly once, per view.** For a view V with fold cursor `Cv`, the check reads V's state plus the overlay entries at offsets **≥ `Cv`** only. An entry leaves the overlay only once every checked view has folded past it. So every stored record counts exactly once for each view: it isn't lost before the slowest view folds it, and a faster view doesn't count it twice. How far behind a view is doesn't matter; the overlay holds exactly that gap, up to its capacity (code 55 beyond it).
-- **One effect function.** The check and the fold compute a record's effect (claimed key, released key, old and new group) with the same code, from the same decode. So a record that passed its check can't break the rule when it's folded. The only conflicts a fold meets are pre-existing ones (§8.3).
-- **Serial per partition.** The check, the append and the overlay merge for one batch happen in one worker step (§3), so each batch is checked against every record stored before it, including those not yet replicated, committed or folded.
-- **Across failover.** A new leader accepts no checked write until it has rebuilt the overlay from its local log (§8.6).
-- **Scope.** One partition. That is why unique, derived-key and composite-key views need a source with one partition (§7.4).
-- **Why not wait for the fold.** The fold runs only after commit, so waiting would put a replication round trip in front of every checked write, in series per partition.
-- **What the overlay may count differently from a later fold** (both on the safe side):
-  - A pending claim counts even though it may still be truncated or aborted. A write rejected because of it stays rejected (§11.1). **Owner-confirmed, 2026-10-22: definite.**
-  - A pending release from another open transaction does not count (§8.5).
+- **Prospective rows.** For each record, every verdict view computes the rows the record would produce, using the same code that applies them, and holds them without writing. For example:
+  - `account_stats` (count by `userId`): user 7's row would go from 11 to 12, so `characters <= 12` is evaluated on 12;
+  - `character_name`: the owner map says whether `lower(name)` is owned by a different source key.
+- **Several verdict views.** A record must pass all of them. All prospective rows are computed before any view applies anything, so a record rejected by one view changes none.
+- **Within a batch.** Records are judged one at a time, in order. Each sees the effect of the accepted records before it, including those in the same batch. Each record gets its own verdict (§11.3).
+- **Deletes are never rejected.** A tombstone always passes, so a key can always be removed.
+- **Deterministic.** A verdict depends only on the view state, the record and the constraint set active at its offset (§8.7). The same log gives the same verdicts on every leader, every restart and every refold.
+- **Nothing pending.** A record is judged only once every record before it has been committed and judged. No state about uncommitted records exists anywhere.
 
-- **Shape.** For each checked partition there is one fixed-capacity, offset-ordered structure, pre-allocated at install time.
-  - Each entry is `{offset, sourceKey, per-check effect, txn pid or none, aborted flag}`.
-  - The effect is:
-    - for a unique view, the key it claims and the key it releases;
-    - for a check view, the old group and the new group;
-    - for the key index, an insert or a delete.
-  - Lookups are by key hash and by source key. That way a later write sees an earlier pending write to the same record (create then rename, or create, delete, create).
-- **Release.**
-  - An entry leaves from the front once **every** checked view and the key index on the partition have folded past its offset.
-  - An abort marker (`rc->onMarker`) marks its entries aborted, and they stop counting at once.
-  - A truncation drops every entry at or above the cut, from the back.
-  - An entry is **never** released because its ack timed out. The record is already in the log.
-- **Capacity.**
-  - It is a sizing knob, default 65 536 entries (my call).
-  - Ack in-flight limits do *not* bound it. One open transaction pins the LSO, so later writes stay in the overlay until it ends, and the transaction timeout limits how long that is.
-  - When the overlay is full, the batch gets the new retriable `CheckBacklogFull` (55). It is also exported as a stat and logged.
+**8.5 Verdict markers and the cleaner**
 
-**8.5 What a pending entry may be counted for.** The principle: a definite verdict may depend only on state that can't vanish unless the write depending on it vanishes too.
+- **The marker.** A control record on the verdict source: `VerdictMarker { finalThrough, constraintSetId, [(offsetDelta, code, constraintId)] }`.
+  - Offsets, not segment references, because offsets never change and segments are rewritten by compaction.
+  - One marker covers many rejected records.
+  - `constraintSetId` names the constraint set its verdicts used (§8.7).
+- **When it's written.** The leader appends a marker in the fold step:
+  - whenever that step rejects anything;
+  - otherwise, when `finalThrough` has moved and `verdict.interval` has passed (default 100 ms, my call), so the watermark below stays recent.
+  Acceptance alone writes nothing per record.
+- **Replication.** Markers replicate like any record. Consumers and folds skip them as data, as they skip transaction markers.
+- **The bitmap.** Each replica builds a local index of rejected offsets per segment from the markers, rebuilt at recovery. It follows `TxnCleanState` (`storage/include/rune/storage/TxnCleanState.h`), which already does this for aborted transactions.
+- **The verdict watermark `W`** is the highest `finalThrough` among committed markers. Every verdict below `W` is durable on every replica.
+- **The cleaner** on a verdict source:
+  - compacts only below `W`;
+  - drops rejected records;
+  - never counts a rejected record as the latest for its key, so an accepted value is never removed in favor of a rejected one;
+  - drops a marker once every offset it lists is gone and a later marker carries a higher `finalThrough`, after the same grace period as tombstones.
+  - On a `delete`-retention topic, rejected records and markers age out with everything else.
+- **Refold** (restart, view rebuild, new leader):
+  - Below `W`, records are applied without being judged, skipping the ones the bitmap marks. A constraint change can therefore never overturn an old verdict.
+  - At and above `W`, records are judged as on the live fold. The view state at `W` is exact, because the cleaner never compacts above `W`.
+- **Failover.** A record is judged only after it is committed, so it survives any failover. A new leader that inherits records judged after `W` judges them again, reaches the same verdicts (deterministic, §8.4) and writes the markers itself. This is why the writer can be answered before its marker commits (§11.3).
+- **Truncation** cuts only uncommitted records, which no fold has judged, so verdicts are unaffected.
 
-- **Pending increments (claims) always count:** non-transactional, from an open transaction, or committed. So two open transactions can't both take the 12th slot.
-- **A pending release** (a tombstone, a rename that frees a name, or a move out of a group) counts only if:
-  - (a) it isn't transactional, or
-  - (b) its transaction has applied a commit marker, or
-  - (c) it belongs to the same open transaction as the later write.
+**8.6 Readers**
 
-  Case (a) is safe because truncation always cuts a suffix of the log. If the release is cut, every write that relied on it is cut too. An abort is the only way an earlier record vanishes while a later one survives, so a release from another, still-open transaction never counts.
-- **Source keys held by another transaction.** A write to a source key with a pending entry from a different, still-open transaction gets retriable `ConcurrentTransactions` (27, existing).
-  - Without this, the later write's effect would be computed against a record that may still abort, and a missed increment would break the cap.
-  - It works like a row lock until the transaction ends.
-- **When an abort marker arrives,** its entries stop counting. Rule (c) and the lock guarantee that no other entry depends on them, so nothing needs recomputing.
-
-**8.6 Readiness gate.** A write to a checked partition gets retriable `NotLeader` until, under the current leadership generation:
-
-- RC is Ready, as `rcGate_` requires today;
-- every checked view instance and the key index are Ready: the fold has reached the LSO, and the HW has reached `leadershipStartOffset()`;
-- the autoincrement reservation has been found (§6.5);
-- the overlay has been rebuilt by decoding `[min fold cursor, LEO)` from the local log, with open transactions taken from `RcState`.
-
-Like `RcState`, the overlay is rebuilt when `leadershipGeneration` or `logGeneration` changes, and cleared when the node isn't the leader. It always converges from the log, never on a timer. Restart and view rebuild (`RebuildingViews`) use the same gate.
+- **Consumers.** On a verdict source, a subscription (raw, consumer group or filtered) is bounded by the minimum fold cursor of the partition's verdict views, as well as by today's bound (HW, or LSO under read_committed). Records the bitmap marks are never delivered, and they leave offset gaps as compaction does.
+  - The added delay is the fold's own time on the leader, which is microseconds. Subscriptions are served by the leader only (`ClientGateway.cpp:4932-4948`), and the leader knows its verdicts as soon as it folds.
+- **Other views** on the partition skip rejected records (§3).
+- **View reads** are unchanged: the fold barrier (§8.8).
 
 **8.7 Changing constraints**
 
+- **The constraint set** of a verdict source is the list of its verdict views and their rules. Each change gets a new `constraintSetId`, and the leader writes a marker at the offset where the change takes effect.
 - **Create.**
-  - Writes to the source are refused, retriably, from install until the view is Ready. From then on every write is checked.
-  - Groups already over the limit aren't repaired; they can't grow until they shrink.
-- **`create or replace`.**
-  - The old constraints stay in force until the new instance is Ready. Then the two are swapped in one worker step, so there's never a gap.
-  - Drop followed by create *does* leave a gap. The docs say so.
-- **Drop.** The constraint is removed when the drop is installed on the leader.
+  - The activation offset `A` is the partition's LEO when the install reaches the leader.
+  - The view builds from the log start. Below `A`, it applies records without judging them, which is the pre-existing data of §8.3. From `A` on, records are judged.
+  - Writes are never refused for this. Delivery of records at or above `A` to consumers waits until the view has caught up, because their verdicts aren't known yet (§8.6). Creating a constraint on a large topic therefore pauses delivery of new records for the duration of the build. The docs say so.
+  - Rows that already break a rule aren't repaired (§8.2).
+- **`create or replace`.** The old instance keeps judging until the new one has caught up, at an offset `S`. Then they swap in one worker step: the old instance's verdicts stand below `S`, and the new one judges from `S`. While catching up, the new instance skips records the bitmap marks below `S`. There's never a gap.
+- **Drop.** Judging stops at the fold step where the drop is installed, and the marker records the change. Drop followed by create *does* leave a gap. The docs say so.
 
-**8.8 Folding (Phase 1–2 rules that still apply).**
-- Views fold on the leader only, after commit, bounded by the LSO.
+**8.8 Folding**
+
+- Views fold on the leader only, after commit, bounded by the LSO, in offset order. Verdict views judge first.
 - Read-your-writes comes from the fold barrier (#82): a read waits until the fold has passed the reader's acked writes.
-- `All` acks at commit (HW), and reads still wait at the fold barrier. A write with the `View` flag (§8.9) is acked only after the fold.
+- `All` acks at commit (HW). A write with the `View` flag (§8.9) is acked after the fold, and on a verdict source that ack carries the verdict.
 - With #537 fixed, records of aborted transactions are skipped.
 
 **8.9 Ack flags (owner decision, 2026-10-22)**
@@ -548,9 +544,9 @@ ProducerConfig{.acks = Acks::All | Acks::View};
   - Writes without `View` take exactly today's path, with one extra flag test.
 - **Open transactions.** A fold stops at the LSO, so a `View` write behind an open transaction waits for that transaction to resolve. That wait is bounded by the transaction timeout. Writers without `View` on the same partition don't wait.
 - **Failures** match `All`: `NotLeader` on a lost leadership, and `Internal` on the ack deadline, with the outcome unknown. On a partition with no views, `View` adds nothing.
-- **Checked topics** require `All`, with or without `View`. `Leader`, `Leader | View` and `None` get a definite `InvalidRequest` (§11.2).
+- **On a verdict source,** the `View` ack carries the per-record verdicts (§11.3). Writers that need to know whether a write was accepted use `View`.
 - **Reads are unchanged.** The fold barrier still holds every read until it covers the reader's acked writes, so `All` writers also read their own writes.
-- **RegressorsPath:** auth-server and character-server use `All | View` on their create, rename and delete paths.
+- **RegressorsPath:** auth-server and character-server use `All | View` on their create, rename and delete paths. Every other producer keeps its settings.
 
 ## 9. Reads
 
@@ -559,9 +555,7 @@ ProducerConfig{.acks = Acks::All | Acks::View};
   - The request carries the prefix bytes, a `limit` (capped by the broker) and a resume token.
   - The response carries a status, a row count, length-prefixed rows and the next resume token.
 - **Reading the record that caused a conflict.** Both requests take an optional `minOffset`. The read is held at the fold barrier until the view has folded past it.
-  - A rejection with code 51 or 52 carries the offset of the conflicting record: the overlay entry or the owning row's last offset. It travels in the trailing response field that `assignedBase` uses on success.
-  - The loser of a race can therefore read the winner's row and never loop.
-  - If the winner's record is in an open transaction, the read waits for it to resolve. After 100 ms it answers `NotReady`, as today.
+  - A record is judged only after everything before it is folded, so after a `ConstraintViolation` or `KeyExists` the conflicting row is already in the view. The loser of a race reads the winner's row at once and never loops.
 - **Shared pipeline.** Both run through `viewRowGate_`, READ-on-VIEW authorization, leader-only serving, the read lease, the fold barrier and the restart-readiness gate.
 - **Bounds.**
   - A response fits the 68 KiB egress scratch (`ClientGateway.h:2209`). The worker stops at the limit, the byte budget or a per-op row cap, which bounds leader work.
@@ -607,7 +601,7 @@ ProducerConfig{.acks = Acks::All | Acks::View};
 - **Keyed sources only (my call).** A persisted view over a *keyless* transient source is refused (`InvalidRequest`, "a persisted view over a transient source needs a keyed source"), because re-folding keyless records isn't idempotent. A transient view over a keyless transient source is unchanged.
 - **Readiness** is unchanged: Recovering → RebuildingViews → Ready. Reads get `NotReady` while the ring is being re-folded.
 - **The `View` ack** (§8.9) means "folded". On such a view it doesn't mean "checkpointed".
-- **Constraints** over transient sources stay a non-goal (§2): the pending overlay can't be rebuilt from a ring that is gone.
+- **Constraints** over transient sources stay a non-goal (§2).
 
 ## 10. Rune QL and the CLI
 
@@ -621,7 +615,7 @@ ProducerConfig{.acks = Acks::All | Acks::View};
 - **Views:**
 
   ```
-  create [or replace] [transient] [unique] view <name> key <keyspec> as select <items> from <topic> [group by <cols>] [constraint <name> check (<col> <op> <int>)]*
+  create [or replace] [transient] [unique] view <name> key <keyspec> as select <items> from <topic> [group by <cols>] [constraint <name> check (<predicate>)]*
   ```
 
   - `<keyspec>` is `<col>`, `(<col>, …)`, or `lower(<col>) as <name>`.
@@ -637,7 +631,7 @@ ProducerConfig{.acks = Acks::All | Acks::View};
 - **Plan v2.** It adds:
   - key components: column refs plus a key function, where 0 is none, 1 is `lower`, and 2 is reserved for `casefold`
   - `unique`
-  - constraints `{name, column, op, bound}`
+  - constraints `{name, predicate}`, the predicate as a small expression tree over column refs and constants
 
   The authored and compiled versions both become 2, and v1 blobs still decode.
 - **Catalog.**
@@ -648,72 +642,67 @@ ProducerConfig{.acks = Acks::All | Acks::View};
 - **CLI.**
   - `rune ql "select …"` decodes rows using the view's output descriptor from the catalog.
   - `show view` prints the constraints and the stats from §13.
-  - `errorCodeName` (`QlEngine.cpp:134`) gains the missing codes 48–50 and the new 51–55.
+  - `errorCodeName` (`QlEngine.cpp:134`) gains the missing codes 48–50 and the new 51–54.
 
 ## 11. Errors and producer behavior
 
-**11.1 New codes** (each gated on client version 12):
+**11.1 Codes** (51–53 reach only `View` writers, client version 12):
 
-| Code | Name | Meaning | Kind |
-|---|---|---|---|
-| 51 | `ConstraintViolation` | Not stored: accepting the write would have broken a rule when it was checked. The constraint id (`viewObjectId << 16 \| ordinal`, ordinal 0 = `unique`) is carried in the `ProduceResponse` `logStartOffset` slot, using the D6 trick. | definite |
-| 52 | `KeyExists` | `insert` on a key that exists | definite |
-| 53 | `KeyNotFound` | `update` or delete-existing on a key that's absent | definite |
-| 54 | `AutoIncrementExhausted` | The counter has reached `autoincrement.max` | definite |
-| 55 | `CheckBacklogFull` | The overlay is full | retriable, with the same identity |
+| Code | Name | Meaning | When | Kind |
+|---|---|---|---|---|
+| 51 | `ConstraintViolation` | The record broke a rule when it was folded. The constraint id is `viewObjectId << 16 \| ordinal`, where ordinal 0 = `unique`. | fold, per record | definite |
+| 52 | `KeyExists` | `insert` on a key that exists | fold, per record | definite |
+| 53 | `KeyNotFound` | `update` or delete-existing on a key that's absent | fold, per record | definite |
+| 54 | `AutoIncrementExhausted` | The counter has reached `autoincrement.max`. The batch isn't stored. | write | definite |
 
 Existing codes reused:
-- `ConcurrentTransactions` (27, retriable) for the source-key lock.
-- `NotLeader` (2, retriable) for the readiness gate.
+- `NotLeader` (2, retriable) while the autoincrement reservation is being found (§6.5).
 - `SchemaValidationFailed` (24) for validation.
-- `InvalidRequest` (39) for forbidden writes.
+- `InvalidRequest` (39) for forbidden writes (§11.2).
 - `NotAuthorized` (45) for an explicit id without `IMPORT`.
 
-"Definite" means *not stored*. It never means "the rule would still be broken now": a pending claim that is later truncated or aborted can make the conflict disappear, and retrying is then the client's choice.
+**"Definite" for 51–53 means *never visible*.** The record is stored, but no view folds it and no consumer receives it, and compaction removes it. Verdicts are final: they are the same on every leader and every refold (§8.4, §8.5). A rejection is always true; nothing that might later vanish can cause one, because a record is judged only against committed, judged records.
 
-**11.2 Who may write to a checked topic.** Everything else gets a definite `InvalidRequest`:
-- **Idempotent producers only.** Writes with pid −1 skip dedupe and `rcGate_`, so the hook's guarantees wouldn't cover them.
-- **`All`, optionally with `View`.** An `acks=leader` write (with or without `View`) is acked before the HW, so it could hand out an id that a failover then truncates.
-- **Client version 12 or later.** Older clients treat unknown codes as "outcome unknown" and bump their epoch.
+**11.2 Who may write.** Rules hold for every write, whatever its producer. Requirements apply only to the writes that ask the broker for something:
 
-**11.3 Producer** (`ProducerImpl`). Today any unknown code, and code 24, goes to "outcome unknown", which means `markUnresolved_` and an epoch bump (rule D, `ProducerImpl.cpp:2503`). The out-of-order branch (C4) also resequences and bumps the epoch. Batches already in flight behind a rejected batch arrive out of order. So, for checked partitions:
+| Write | Requirement | Otherwise |
+|---|---|---|
+| Plain upsert or delete, on any topic, including a verdict source | none: any producer, any acks, any client version | — |
+| Intent (`insert`, `update`, `removeExisting`) | an idempotent producer, and acks including `View` (`All \| View` or `Leader \| View`) | `InvalidRequest`. The client refuses locally first. |
+| `autoincrement` create (key 0) | an idempotent producer, and `All` (with or without `View`) | `InvalidRequest` |
+| Transactional or explicit atomic batch (`p.batch`) on a source of a constrained view | refused (non-goal, §2) | `InvalidRequest` |
+| An intent inside a transaction or atomic batch | refused | `InvalidRequest` |
 
-- **One batch in flight per partition.** The client learns that a topic is checked from a new flag in topic metadata.
-  - This keeps a coalesced batch's split resend (below) in order with respect to later writes to the same key.
-  - The cost is throughput on these low-rate partitions, not latency.
-- **Rejections are durable: the reject marker.** Without one, a delayed earlier attempt of a rejected batch could be appended after the client was told it failed, and the next batch, reusing that sequence, would then be deduped as an "OK" without being stored.
-  - So when the hook rejects a batch with 51–54, the leader appends a small control record: **reject marker** `{producerId, epoch, baseSequence, lastSequence}`.
-  - It advances the producer state exactly like a data batch. It replicates and is part of the producer-state rebuild after failover.
-  - The rejection is answered only once the marker is committed (HW), like an acks=all ack.
-  - A later or delayed attempt of the same sequences is a duplicate of the marker, and is answered with the same rejection code. It is never appended.
-  - Rejections are rare, so this costs one small append each.
-  - Readers and folds skip reject markers. The cleaner drops them once the producer-state window has moved past them.
-- **The client's definite-reject branch** for codes 51–54:
-  - the batch fails, with no `markUnresolved_` and no epoch bump;
-  - the sequence counts as consumed, because the marker consumed it, so the next batch continues at `lastSequence + 1`.
-- **Coalesced `send()` batches.** If a coalesced batch of unrelated records is rejected, the producer resends its records one at a time, in order.
-  - Each resend uses fresh sequences after the marker.
-  - Each record gets its own result.
-- **Explicit atomic batches** (`p.batch(...)`) are never split.
-- **Inside a transaction,** codes 51–54 abort the transaction, as a constraint violation does in Postgres.
-- **The result** exposes `constraintId` and the assigned key. A `Client` helper resolves the constraint id to `(viewName, constraintName)` from the catalog.
+- **Why intents need `View`.** Their verdict exists only after the fold, so without `View` the writer could never learn it. **Why idempotent:** a non-idempotent retry would store a second copy, which would fail with `KeyExists` against the first.
+- **Why autoincrement creates need `All`.** With a `Leader` ack, an id handed out could be cut by a failover and given to another record.
+- **Why transactions and atomic batches are refused on constrained sources.** A record is judged only after its transaction commits. If one record of a committed transaction were then rejected, the transaction would be half applied. Supporting them needs the fold to judge a whole transaction before applying any of it; that is a follow-up (§17).
+- **Old clients** (version 11 and earlier) never send `View`, so they never receive 51–53. Their writes are judged like any other, and a rejected one simply never becomes visible. The rejection count is in the stats (§13).
+
+**11.3 Producer** (`ProducerImpl`)
+
+- **Per-record verdicts.** On a verdict source, a `View` ack carries a trailing rejection list: `count u16`, then `(recordIndex u16, code u16, constraintId u32)` per rejected record, gated on client version 12. An empty list means every record was accepted.
+- **When the ack goes out.** As soon as the fold has judged the batch's last record. It doesn't wait for the verdict marker to commit, because a new leader reaches the same verdicts (§8.5).
+- **The client.**
+  - Each record of a coalesced batch gets its own result: `Ok`, or its code and `constraintId`.
+  - The batch was stored, so its sequences were consumed normally. There's no `markUnresolved_`, no epoch bump and no resend.
+  - Pipelining is unchanged: any number of batches can be in flight on a verdict source.
+- **Retries.** A retry that dedupes gets the stored batch's verdicts. If the fold has passed the batch, they come from the bitmap. Otherwise the retry is parked like a `View` ack until it has.
+- **The result** exposes the code, the `constraintId` and the assigned key. A `Client` helper resolves the constraint id to `(viewName, constraintName)` from the catalog.
 
 ## 12. Versions and rolling upgrade
 
 - **Feature level.** A new cluster level, `MetadataFeature::kCheckedWrites`, sits next to `kStorageIdentity` (`ReplicationMessages.h:464`). Until every broker supports it, the following are refused:
   - DDL that uses `autoincrement`, `key.index`, a plan-v2 view, or `unique`/`check`;
-  - non-zero intents;
-- **Version bumps.** Client version 12 covers the `View` ack bit, the new codes, `assignedBase`, `GetViewRowK`, `ScanViewRows` and the checked-topic metadata flag. Plan v2, checkpoint v3, and catalog event formats bump their versions following the existing frozen-format rules. Old formats still decode.
+  - non-zero intents and the `View` ack bit;
+- **Version bumps.** Client version 12 covers the `View` ack bit, the per-record rejection list, the new codes, `assignedBase`, `GetViewRowK` and `ScanViewRows`. Verdict markers are a new control-record type, so `kCheckedWrites` also gates them. Plan v2, checkpoint v3, and catalog event formats bump their versions following the existing frozen-format rules. Old formats still decode.
 
 ## 13. Observability
 
-- **Per checked partition:**
-  - rejects for each constraint and for each intent code;
-  - `KeyExists` and `KeyNotFound` counts;
-  - overlay occupancy and its peak;
-  - `CheckBacklogFull` refusals;
-  - readiness-gate refusals by reason;
-  - autoincrement: the current counter, the reservation R, and ids burned.
+- **Per verdict source:**
+  - rejections for each constraint and for each intent code;
+  - verdict lag, which is the LEO minus the minimum fold cursor of the verdict views, and so the delay consumers see;
+  - the verdict watermark `W`, markers written, and rejected records not yet compacted;
+  - autoincrement: the current counter, the reservation R, and ids burned (including ids of rejected creates).
 - **Per view:** `uniqueConflicts`, and scan rows and pages.
 - All of these appear in `show view` / `show topic` and the metrics export.
 
@@ -721,7 +710,9 @@ Existing codes reused:
 
 - **Untyped topics, and typed topics that already validated.** An ABAB n=3 run of `ProducePathBenchmark` and `WorkerProduceLatencyBench` must show no regression, including the move from the hash-set lookup to the per-partition pointer.
 - **Typed topics that didn't validate before.** These now pay the per-record decode. Measure the added cost per batch with the same benches, budgeted at most 1 µs p50 for a one-record batch (my call). This is a deliberate, owner-approved cost, not a regression.
-- **Constrained produce.** The hook adds at most 1 µs p50 to a one-record batch on `ProduceValidateBench`. Autoincrement assignment, including the scratch copy, stays under 1 µs per batch of up to 4 KiB. Both are my calls, to be revisited with data.
+- **Write hook.** Autoincrement assignment, including the scratch copy, stays under 1 µs per batch of up to 4 KiB (my call).
+- **Judging.** Computing prospective rows and evaluating rules adds at most 1 µs per record to the fold on `ViewFoldBench`, for one unique view plus one count check (my call). Partitions without verdict views fold exactly as today.
+- **Consumers of a verdict source.** End-to-end consume latency rises by no more than the verdict lag. Measure it on `WorkerProduceLatencyBench` with a consumer attached.
 - **Fold.** `ViewFoldBench` with derived keys plus the owner map stays within 10 µs per event batch.
 - **Table.** `ViewTableBench` adds wide-key and prefix-scan cases. Views with K ≤ 8 must not change.
 
@@ -740,7 +731,7 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 - plain upsert
 
 **Entities:**
-- source key: new, existing, pending insert, pending delete (transactional or not)
+- source key: new, existing, or written earlier in the same batch
 - user: the same user or another user
 - group: at 11, at 12, or already over the limit
 - name: free, taken by another record, or taken by the same record
@@ -748,21 +739,28 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 
 **Timing and faults:**
 - a single record
-- writes back to back before the ack
+- writes back to back before the ack, several batches in flight
 - a batch that collides with itself
-- a transaction that commits or aborts
-- two open transactions racing for the last slot or the same name
-- a write to a source key held by another open transaction, then that transaction commits or aborts
-- a transactional release followed by an increment outside the transaction
-- a committed release reused before the fold catches up
-- an ack timeout, then a retry
-- failover between the append and the HW, and between the HW and the fold
-- truncation of a pending tail
+- two writers racing for the last slot or the same name
+- an ack timeout, then a retry, before and after the fold has judged the batch
+- failover between the append and the HW, between the HW and the fold, and between the fold and the marker's commit
+- truncation of an uncommitted tail
 - restart during a view rebuild
-- a view created on a non-empty topic
+- a view created on a non-empty topic, with writes running during its build
 - `create or replace` while writes are running
 - drop while writes are running
-- a full overlay
+
+**Verdicts, markers and readers:**
+- a rejected record is never delivered: raw subscription, consumer group, filtered subscription, and replay from the log start
+- other views on the partition skip a rejected record
+- a rejected record that is the latest for its key: compaction keeps the accepted value
+- the cleaner never compacts above `W`
+- a refold below `W` doesn't judge, and a constraint changed since gives the same view
+- a new leader judging past `W` reaches the same verdicts and writes the markers
+- several verdict views, where one rejects: no view changes
+- a predicate failing on a row that is already over its limit: a rename passes, a create fails, a delete passes
+- a transactional and an atomic batch on a constrained source are refused; on an unconstrained source they work as today
+- verdict lag while a constraint view builds: delivery waits, writes don't
 
 **Autoincrement:**
 - 1 record and k records per batch
@@ -772,11 +770,10 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 - truncation of a reservation together with its data
 - compaction after the highest id is deleted: the id must not be reused
 - a retry that returns the same ids
-- an aborted transaction, whose ids are burned
+- a create rejected at fold: its id is burned and never reused
 - an `IMPORT` id below and above the counter
 - an explicit id without `IMPORT`
 - exhaustion at the maximum
-- a batch rejected by a later check, after which the counter must be restored
 - an `IMPORT` id above the reservation, then failover: there must be no reuse
 - a retry after failover returning the original ids from the rebuilt side window
 - DDL refused for `delete` retention, and for delete-records on an `autoincrement` topic
@@ -808,20 +805,19 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
   - a plan pinned to an unknown Unicode version is refused
 
 **Clients:**
-- a non-idempotent client, an `acks=leader` client, and a v11 client, each writing to a checked topic
-- a coalesced batch with one bad record
-- codes 51–54 inside a transaction
+- a non-idempotent client, an `acks=leader` client, an `acks=none` client and a v11 client, each writing plain records to a verdict source: accepted ones are visible, rejected ones never are
+- intents without `View`, and from a non-idempotent producer, are refused; autoincrement creates without `All` are refused
+- a coalesced batch with one bad record: only that record fails, the others are visible, and the next batch continues
 - the `View` flag, combined with `Leader` and with `All`:
-  - acked only after every view has folded the write;
-  - behind an open transaction, it waits until the transaction resolves;
+  - acked only after every view has folded the write, carrying the verdicts on a verdict source;
+  - behind an open transaction on an unconstrained source, it waits until the transaction resolves;
   - on a partition with no views, it adds nothing;
   - leader loss while parked gives `NotLeader`, and a missed deadline gives `Internal`;
   - `View` alone and `None | View` are refused in `ProducerConfig`;
   - unknown `acks` bits get `InvalidRequest`;
   - a broker without `kCheckedWrites` gets `BrokerTooOld` locally;
   - old `acks` values 0 and 1 behave unchanged
-- a delayed earlier attempt of a rejected batch arriving after the rejection, before and after a failover: it gets the same rejection, is never stored, and the next batch is not deduped against it
-- a login race: the loser's `minOffset` read sees the winner, including when the winner is pending, committed but not yet folded, or in an open transaction
+- a login race: the loser gets `ConstraintViolation` and its read finds the winner's row
 - intents sent to an older cluster
 
 **Reads:**
@@ -834,15 +830,15 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 - binding: a typed handle to an untyped topic, and a raw handle to a typed topic, are both refused
 - key fields wider than 16 bytes refused at DDL time, and `Key` truncation turned into an error
 
-**Invariants checked in the stress run** (racing writers, injected failovers and aborts):
+**Invariants checked in the stress run** (racing writers, injected failovers, restarts and compaction):
 - No user ever has more than 12 live characters.
 - No two live characters share a `lower(name)`.
 - No two records ever receive the same autoincrement id, and no id is ever reused.
-- Every acked write is visible in every view once the fold barrier is passed.
-- No write that was answered with a rejection is ever stored.
-- No rejected write appears anywhere.
+- Every acked write is visible in every view once the fold barrier is passed, unless its verdict was a rejection.
+- No rejected record is ever delivered to a consumer or folded by any view.
+- Every record has the same verdict on every leader and in every refold.
 - Every view equals a fresh refold of the log.
-- After every step, including failovers, truncations and aborts, the check-time state (view plus overlay) equals a fresh fold of `[0, LEO)` with aborted records removed, apart from the §8.5 rule that another open transaction's releases don't count.
+- Compaction never removes an accepted value in favor of a rejected one.
 
 **Sanitizers:** ASan, UBSan and TSan runs of `*Regression*` at each checkpoint.
 
@@ -852,14 +848,15 @@ Each part ships on its own:
 
 1. **#537:** skip aborted-transaction records in the fold, and re-fold.
 2. **Part A (§4):** validation always on for typed topics, wire key = key field, refusing features on untyped and keyless topics, the `raw` marker, and the `TypedTopic` bind check.
-3. **The hook and gate (§3, §8.4–§8.6):** the hook skeleton, the overlay, the readiness gate, the producer changes (§11.2–§11.3), codes 51–55, and the `kCheckedWrites` feature level.
-4. **Part B (§5):** intents, the key index, and the typed `insert` / `update` / `remove` / `removeExisting` API.
-5. **Part C (§6):** `autoincrement`, the modulo partitioner, reservation records and their retention in the cleaner, `assignedBase`, the `IMPORT` grant, and `insertAndWait(...).key()`.
-6. **Part D (§7, §9):** wide and derived keys, the owner map, the seeded hash, checkpoint v3, the prefix index, `GetViewRowK`, `ScanViewRows`, and the client read API.
-7. **QL (§10):** `create view` (plan v2), `select`, and the CLI.
-8. **Part E (§8.1–§8.3, §8.7):** `unique` and `check` on views.
-9. **Part F (§9a):** persisted views over transient sources.
-10. **Docs:**
+3. **The write hook (§3):** the hook skeleton, the per-write requirements (§11.2) and the `kCheckedWrites` feature level.
+4. **The verdict pipeline (§3, §8.4–§8.8, §11):** prospective rows and judging in the fold, verdict markers, the rejected-offset bitmap, the consumer bound and filter, the cleaner rule, refold below `W`, constraint-set changes, and per-record verdicts in the `View` ack.
+5. **Part B (§5):** intents, the key index as a verdict view, and the typed `insert` / `update` / `remove` / `removeExisting` API.
+6. **Part C (§6):** `autoincrement`, the modulo partitioner, reservation records and their retention in the cleaner, `assignedBase`, the `IMPORT` grant, and `insertAndWait(...).key()`.
+7. **Part D (§7, §9):** wide and derived keys, the owner map, the seeded hash, checkpoint v3, the prefix index, `GetViewRowK`, `ScanViewRows`, and the client read API.
+8. **QL (§10):** `create view` (plan v2), `select`, and the CLI.
+9. **Part E (§8.1–§8.3, §8.7):** `unique` and `check` on views.
+10. **Part F (§9a):** persisted views over transient sources.
+11. **Docs:**
    - `ql.md`, `wire-protocol.md`, `client-cpp.md` and `admin-cli.md`
    - `CATALOG.md` and `SECURITY.md` (the `IMPORT` grant)
    - the root and client `CLAUDE.md`
@@ -867,39 +864,40 @@ Each part ships on its own:
 
 ## 17. Calls made in this design (owner to check)
 
+- **Records are judged at fold, after they are stored (design B).** A rejected record is never visible and is removed by compaction. Verdict markers make verdicts durable and tell the cleaner. **Owner-confirmed, 2026-10-22.**
 - Acks are bit flags: `Leader`, `All` and the new `View`, which combine (`Leader | View`, `All | View`). The names stay. **Owner-confirmed.**
 - Wire: bit 0 is `All`, as today, and bit 1 is `View`. `View` alone is refused. With today's fold, `Leader | View` waits for commit, like `All | View`. (My call.)
-- Checked topics require idempotent producers, `All` (with or without `View`), and client version 12 or later, with one batch in flight per partition.
-- A check sees the fold of the whole partition log before it (view plus overlay) and never waits for the fold. A conflict with a claim that isn't committed yet is still a definite rejection. **Owner-confirmed, 2026-10-22.**
-- Codes 51–54 abort an enclosing transaction.
-- A rejection appends a durable reject marker that consumes its sequences.
+- Requirements are per write, not per topic: none for plain writes; intents need an idempotent producer and `View`; autoincrement creates need an idempotent producer and `All`. (My call, following the owner's objection to constraining every producer of a topic.)
+- **Transactions and explicit atomic batches are refused on sources of constrained views** (my call). Follow-up: let the fold judge a whole transaction before applying any of it, with the before-images of the rows it touches, so it can be rejected as a unit. This matters if a producer of such a topic uses transactions today.
+- Deletes are never rejected. A record fails a `check` only if it changes a column the predicate reads. (My call.)
+- `check` takes any predicate over the view row's own columns and constants. (My call, following the owner's point that checks aren't only counts.)
+- A new constraint judges from the LEO at install. Delivery of newer records waits while it builds, and writes don't. (My call.)
+- The verdict marker interval is 100 ms when nothing is rejected. (My call.)
 - Pre-existing unique conflicts: the smallest source key owns the key, with promotion on delete.
 - `autoincrement` topics are compact-only, with no retention.
 - An `IMPORT` above the reservation appends a new reservation first.
-- A conflict rejection carries the conflicting offset, and reads accept `minOffset`.
+- The ids of creates rejected at fold are burned.
 - The autoincrement scratch copy (copy into a per-worker buffer, patch the ids, append from the buffer). **Owner-confirmed, 2026-10-22.**
   - **Follow-up: patch in place where the bytes are already Rune's.**
     - On the gateway-routed path the batch has already been copied once into the worker's SPSC op ring (`ClientGateway.cpp:4030-4061`). The worker owns that slot, so it could patch it in place if `handleProduceBatch` took a mutable span on this path.
     - On the shard-ingress path the bytes sit in Aeron's term buffer, which must not be modified, so the scratch copy stays there.
     - The builder should measure the copy first. In-place patching is worth doing only if the copy shows up in the budget.
 - The key field encodes to at most 16 bytes, and `Key` truncation becomes an error.
-- A source key held by another open transaction is locked until that transaction ends (`ConcurrentTransactions`).
 - Untyped topics stay as raw logs: no field list means untyped. Every database feature needs a typed topic.
 - Persisted views may read transient sources. They keep their checkpointed rows across a restart and have nothing to replay. **Owner-confirmed, 2026-10-22.** A keyless transient source can feed only a transient view. (My call.)
 - Typed strings must be valid UTF-8, and `lower()` is Unicode simple lowercasing with an ASCII fast path, pinned to a Unicode version. There are no collations, and `casefold()` is reserved. **Owner-confirmed, 2026-10-22.**
 - A `lower(string(N))` key component is sized at the largest lowered width, and the 128-byte limit is checked at DDL time. (My call.)
 - View keys are capped at 128 bytes.
-- Overlay capacity defaults to 65 536 entries, and a full overlay gets code 55.
 - Autoincrement topics use the modulo partitioner, with a reservation step of 4096 and an id cap of 2^53 − 1.
-- A dedupe retry returns its ids by reading the stored batch back.
 - Explicit ids on autoincrement topics need the `IMPORT` grant.
-- Performance budgets: under 1 µs for the hook and under 1 µs for assignment, including the copy. No regression for untyped topics or for typed topics that already validated. The new validation cost on typed topics that didn't validate before is measured and accepted.
+- Performance budgets: under 1 µs per record for judging, and under 1 µs for id assignment, including the copy. No regression for untyped topics or for typed topics that already validated. The new validation cost on typed topics that didn't validate before is measured and accepted.
 
 ## 18. Left to the builder
 
 - The exact row layout for key bytes and prefix links.
 - Whether the owner map, prefix index and key index are checkpointed or rebuilt on replay.
 - The choice of seeded hash.
-- The internal structure of the overlay, within the capacity and no-allocation rules.
+- How a verdict view computes prospective rows without writing them, within the no-allocation rule.
+- The encodings of the verdict marker and the reservation control record. Both must be distinct from transaction markers and skipped by every reader.
+- The on-disk form of the rejected-offset bitmap, following `TxnCleanState`.
 - The page row cap and the resume-token format.
-- The encoding of the reservation control record. It must be distinct from transaction markers and skipped by every reader.
