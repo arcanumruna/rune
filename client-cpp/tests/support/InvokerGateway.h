@@ -878,6 +878,10 @@ struct InvokerGateway {
         if (!offerSession(sessionId, frame)) sessionOutbox.emplace_back(sessionId, std::move(frame));
     }
 
+    /// Adversarial review (PR #476): a frame put on the client's egress IN CLEAR, never sealed - what any UDP sender
+    /// can do.  false = the publication is not connected yet.
+    bool sendInClear(int endpoint, const std::vector<uint8_t>& frame) { return offerNow(endpoint, frame); }
+
     /// TLS: a frame to an encrypted session leaves sealed under its keys; anything else (no keys, the handshake's own
     /// ConnectResponse / HandshakeContinueResponse) as is.
     std::vector<uint8_t> sealedForSession_(const uint8_t* b, std::size_t n) {

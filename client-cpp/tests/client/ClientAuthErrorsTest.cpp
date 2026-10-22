@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <optional>
 #include <fstream>
 #include <string>
 #include <unistd.h>
@@ -783,4 +784,106 @@ TEST(ClientCryptoRegression, SystemTrustWithoutAHostIsRefusedRegression) {
         EXPECT_NO_THROW(rc::Client{c});
     }
     EXPECT_NO_THROW(rc::Client{authCfg(3806, "", "")}) << "a pinned CA";
+}
+
+// ---- adversarial review of PR #476 (issues #14 / #115): a TLS session never acts on a frame in clear ----------------
+
+namespace {
+/// Connected over TLS + one produce in flight (its ack held).  Returns the produce's broker-side record.
+test_support::InvokerGateway::Produced produceInFlight(Rig& r, rc::Producer& p, test_support::TestCq& cq,
+                                                       std::optional<test_support::PendingOp>& s) {
+    r.gw.replyAcks = false;
+    const auto topic = r.client.topic("t");
+    s.emplace(cq.send(p, topic, rc::Key(uint64_t{1}), std::vector<uint8_t>(16, 0x5C)));
+    EXPECT_TRUE(s->accepted());
+    p.flush();
+    EXPECT_TRUE(r.drive([&] { return r.gw.produced.size() + r.gw.held.size() >= 1; }));
+    return !r.gw.held.empty() ? r.gw.held.back() : r.gw.produced.back();
+}
+}  // namespace
+
+// Any UDP sender can put a frame on the client's egress (a new Aeron image).  On a TLS session a ProduceResponse in
+// clear must never complete a produce - whatever session id its header names (the session's own, 0, or one nobody
+// holds) - or a forged OK silently loses the record.  Only the sealed ack completes it.
+TEST(ClientAuthErrorsRegression, AForgedPlaintextAckNeverCompletesATlsProduceAdversarialRegression) {
+    Rig r(authCfg(3810, "ws1", kPw));
+    r.connectOk();
+    ASSERT_GE(r.gw.tlsSessions, 1) << "precondition: the session is TLS";
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::Leader; pcfg.lingerUs = 60'000'000;
+    pcfg.produceTimeoutMs = 20'000; pcfg.deliveryTimeoutMs = 60'000;
+    rc::Producer p = r.client.producer(pcfg);
+    test_support::TestCq cq(r.client);
+    std::optional<test_support::PendingOp> s;
+    const auto pr = produceInFlight(r, p, cq, s);
+    for (const int64_t sid : {pr.sessionId, int64_t{0}, int64_t{0x7EAD'BEEF}}) {
+        uint8_t b[64];
+        const std::size_t n = rcc::encodeProduceResponse(b, sizeof b, 0, pr.partition, 777, sid, pr.corrId);
+        ASSERT_TRUE(r.gw.sendInClear(0, std::vector<uint8_t>(b, b + n)));   // raw: never sealed
+        r.passes(50);
+        EXPECT_FALSE(s->ready()) << "a plaintext ack naming session " << sid << " completed a TLS produce";
+    }
+    r.gw.ackAt(pr, 0, 100);   // the real, sealed ack
+    ASSERT_TRUE(r.drive([&] { return s->ready(); }));
+    EXPECT_EQ(s->outcome().c.status, rc::OpStatus::Ok);
+}
+
+// A forged ErrorResponse{Redirect} in clear (session id 0) for an in-flight produce must not move a TLS session to the
+// attacker's endpoint (where the certificate name would follow the endpoint's host).
+TEST(ClientAuthErrorsRegression, AForgedPlaintextRedirectNeverMovesATlsSessionAdversarialRegression) {
+    Rig r(authCfg(3812, "ws1", kPw));
+    r.connectOk();
+    ASSERT_GE(r.gw.tlsSessions, 1);
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::Leader; pcfg.lingerUs = 60'000'000;
+    pcfg.produceTimeoutMs = 20'000; pcfg.deliveryTimeoutMs = 60'000;
+    rc::Producer p = r.client.producer(pcfg);
+    test_support::TestCq cq(r.client);
+    std::optional<test_support::PendingOp> s;
+    const auto pr = produceInFlight(r, p, cq, s);
+    const int connectsBefore = r.gw.connectsArrived;
+    for (const int64_t sid : {int64_t{0}, int64_t{0x7EAD'BEEF}}) {
+        r.gw.sendError(0, static_cast<int16_t>(pc::ErrorCode::Redirect), "127.0.0.1:" + std::to_string(freePort()), sid,
+                       pr.corrId);   // sid not held by the gateway's TLS keys: sent in clear
+        r.passes(100, 1'000'000);
+        EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected) << "sid " << sid;
+    }
+    EXPECT_EQ(r.gw.connectsArrived, connectsBefore) << "no reconnect was started";
+    r.gw.ackAt(pr, 0, 100);
+    ASSERT_TRUE(r.drive([&] { return s->ready(); }));
+    EXPECT_EQ(s->outcome().c.status, rc::OpStatus::Ok) << "the session never left the real broker";
+    // Control (non-vacuity): the same Redirect SEALED under the session's keys is followed.
+    std::optional<test_support::PendingOp> s2;
+    const auto pr2 = produceInFlight(r, p, cq, s2);
+    r.gw.sendError(0, static_cast<int16_t>(pc::ErrorCode::Redirect), "127.0.0.1:" + std::to_string(freePort()),
+                   pr2.sessionId, pr2.corrId);
+    EXPECT_TRUE(r.drive([&] { return r.client.state() != rc::session::SessionState::Connected; }, 1'000'000))
+        << "control: a sealed Redirect moves the session";
+}
+
+// The final-leg HandshakeFailed verdict (ruling N4-I1) is matched by (session id, connect correlation id) - both stay
+// the same for the session's whole life.  Long after the broker has PROVEN its keys (sealed answers opened), a forged
+// HandshakeContinueResponse{29} in clear must not end the live TLS session for good (Rejected: it never reconnects).
+TEST(ClientAuthErrorsRegression, AForgedFinalLegFailureNeverEndsALiveTlsSessionAdversarialRegression) {
+    Rig r(authCfg(3814, "ws1", kPw));
+    r.connectOk();
+    ASSERT_GE(r.gw.tlsSessions, 1);
+    ASSERT_FALSE(r.gw.connectCorrIds.empty());
+    // The broker has proven its keys: a sealed answer completed an op.
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::Leader; pcfg.lingerUs = 60'000'000;
+    pcfg.produceTimeoutMs = 20'000; pcfg.deliveryTimeoutMs = 60'000;
+    rc::Producer p = r.client.producer(pcfg);
+    test_support::TestCq cq(r.client);
+    auto s = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{1}), std::vector<uint8_t>(16, 0x5C));
+    ASSERT_TRUE(s.accepted());
+    p.flush();
+    ASSERT_TRUE(r.drive([&] { return s.ready(); }));
+    ASSERT_EQ(s.outcome().c.status, rc::OpStatus::Ok);
+    // The forgery: the session id and the connect correlation id (both small, sequential) and code 29, in clear.
+    std::vector<uint8_t> f;
+    const std::size_t n = rcc::encodeHandshakeContinueResponse(
+        f, static_cast<int16_t>(pc::ErrorCode::HandshakeFailed), {}, r.gw.assignedSessionId, r.gw.connectCorrIds.back());
+    f.resize(n);
+    ASSERT_TRUE(r.gw.sendInClear(0, f));
+    r.passes(200, 1'000'000);
+    EXPECT_NE(r.client.state(), rc::session::SessionState::Rejected)
+        << "a forged plaintext frame ended a live, key-proven TLS session for good";
 }

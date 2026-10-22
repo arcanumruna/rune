@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -294,4 +295,62 @@ TEST(RuneCliSecurityBrokerRegression, InsecurePlaintextNeverSendsCredentialsRegr
     // The cluster is still bootstrappable over TLS: nothing was consumed.
     bootstrapOverTls(b);
     EXPECT_TRUE(b.node().securityViewForTest().hasSecurityAdmin);
+}
+
+// Adversarial review of PR #476 (issue #10, shard worker ingress): a Produce in clear naming an ENCRYPTED session's id,
+// sent straight to the worker's own ingress and to the gateway, is never appended and never acked - the worker's
+// ingress is a second entry point to the same session state.  The real client's next produce lands at offset 0.
+TEST(AuthSessionBindingRegression, APlaintextProduceNamingAnEncryptedSessionIsNeverAppendedAdversarialRegression) {
+    AuthBroker b("tlsplainproduce", tlsOnly(/*shard=*/true));
+    bootstrapOverTls(b, std::string("create user ws1 with password '") + kWs1Pw + "';\n"
+                        "grant create on topic prefix '' to user admin;\n"
+                        "grant write on topic 'orders' to user ws1;\n"
+                        "grant describe on cluster to user ws1;\n");
+    auto admin = tlsClient(b, "admin", kAdminPw);
+    ASSERT_EQ(connectError(*admin), "");
+    const auto orders = admin->defineTopicAndWait("orders", 1, "", false, {}, 20s);
+    ASSERT_EQ(orders.errorCode, 0) << orders.detail;
+    admin->closeImmediately();
+
+    auto ws1 = tlsClient(b, "ws1", kWs1Pw, rc::RunnerMode::Invoker);
+    ASSERT_EQ(connectError(*ws1), "");
+    const int64_t sid = ws1->testSeedSessionId();
+    ASSERT_GT(sid, 0);
+
+    AuthWireClient& attacker = b.wire();
+    const auto batch = makeBatch(1);
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(attacker.raw().produce(b.workerIngressChannel(), AuthWireClient::kClientStream, sid, 9000 + i,
+                                           orders.topicId, 0, 1, batch));
+        ASSERT_TRUE(attacker.raw().produce(b.channel(), AuthWireClient::kClientStream, sid, 9100 + i, orders.topicId, 0,
+                                           1, batch));
+    }
+    // Event-driven: the worker has seen (and refused to open) every clear frame sent to its ingress.
+    const auto dl = std::chrono::steady_clock::now() + 20s;
+    uint64_t refused = 0;
+    while (std::chrono::steady_clock::now() < dl &&
+           (refused = b.node().onWorkerThreadForTest(0, [](Worker& wk) { return wk.decryptFailuresForTest(); })) < 4) {
+        ws1->doWork();
+    }
+    EXPECT_GE(refused, 4u) << "the worker never saw the clear produces (or opened them)";
+
+    rc::ProducerConfig pcfg;
+    pcfg.acks = rc::Acks::All; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    pcfg.produceTimeoutMs = 20'000; pcfg.deliveryTimeoutMs = 30'000;
+    auto producer = ws1->producer(pcfg);
+    rc::Completions cq(*ws1);
+    std::optional<rc::Completion> done;
+    const std::vector<uint8_t> value{1, 2, 3, 4};
+    bool sent = false;
+    for (const auto d2 = std::chrono::steady_clock::now() + 30s; std::chrono::steady_clock::now() < d2 && !done;) {
+        if (!sent) sent = producer.trySend(rc::TopicHandle{orders.topicId, 1}, rc::Key(uint64_t{7}), value, cq, 1) ==
+                          rc::SendResult::Ok;
+        ws1->doWork();
+        (void)cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) { done = c; });
+    }
+    ASSERT_TRUE(done.has_value());
+    EXPECT_EQ(done->status, rc::OpStatus::Ok) << done->errorCode;
+    EXPECT_EQ(done->value, 0) << "a clear produce naming the encrypted session was appended before it";
+    producer.close();
+    ws1->closeImmediately();
 }

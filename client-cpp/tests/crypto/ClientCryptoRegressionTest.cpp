@@ -90,7 +90,8 @@ struct FakeIo final : sm::SessionIo {
 // non-null, accumulates every handshakeBytes payload transferred in either
 // direction (used by the 512-byte-scratch regression below). Mirrors
 // ClientCryptoRoundTripTest.cpp's driveHandshake exactly, plus the counter.
-bool driveHandshake(sm::SessionMachine& m, FakeIo& io, cr::TlsSession& srv,
+template <class Io>   // FakeIo, or the adversarial review's AgentLikeIo
+bool driveHandshake(sm::SessionMachine& m, Io& io, cr::TlsSession& srv,
                      int64_t sessionId, int64_t nowNs, std::size_t* totalBytes = nullptr) {
     std::size_t delivered = 0;
     for (int i = 0; i < 20; ++i) {
@@ -1026,21 +1027,33 @@ TEST(ClientCryptoRegression, RequiredCryptoWithoutLocalTlsNeverSendsAPlaintextCo
 // DR client bugs fix round 5 (client-failover-review.md "Fix round 4 check").
 // ===========================================================================
 
-// N4-I1: the broker failed the handshake on its FINAL leg after this machine already went
-// Connected (a TLS 1.3 client is done once it has sent its Finished).  Ruling: terminal
-// Rejected(HandshakeFailed), keys cleared — only for a frame naming this session's current
-// id AND its connect corrId with code HandshakeFailed.  RED (before): the machine stays
-// Connected (onHandshakeContinueResponse returns at its Handshaking guard).
-TEST(ClientCryptoRegression, FinalLegHandshakeFailedAfterConnectedIsTerminalRegression) {
+// N4-I1, superseded by the PR #476 review (issues #14 / #469): the broker failed the handshake on its FINAL leg after
+// this machine already went Connected (a TLS 1.3 client is done once it has sent its Finished).  The frame is in clear
+// and names only guessable ids, so: before the broker proved the keys (no sealed frame opened yet) it is a transient
+// connect failure - keys cleared, a fresh TLS episode within the connect budget, never terminal; once a sealed frame
+// opened it is a forgery and ignored.  Only a frame naming this session's current id AND its connect corrId with code
+// HandshakeFailed counts.  RED: a terminal Rejected (the old ruling), or ignoring it before the keys are proven.
+TEST(ClientCryptoRegression, FinalLegHandshakeFailedAfterConnectedIsRetriedThenIgnoredOnceKeysAreProvenRegression) {
     namespace rpc = rune::protocol::client;
     const auto hf = static_cast<int16_t>(rpc::ErrorCode::HandshakeFailed);
     {
         FrameFixture f;
         ASSERT_TRUE(f.established(1'000'000'000LL));
+        const std::size_t sentBefore = f.io.sendCount();
         f.m.onHandshakeContinueResponse(hf, {}, f.m.correlationId(), 1'000'000'100LL, f.m.sessionId());
-        EXPECT_EQ(f.m.state(), sm::SessionState::Rejected) << "a final-leg HandshakeFailed left the session Connected";
-        EXPECT_EQ(f.m.rejectCode(), hf);
+        EXPECT_EQ(f.m.state(), sm::SessionState::Connecting) << "retried as a fresh episode";
+        EXPECT_NE(f.m.state(), sm::SessionState::Rejected);
+        EXPECT_EQ(f.m.lastConnectError(), hf);
         EXPECT_FALSE(f.m.cryptoState().encrypted) << "the keys of a session the broker never promoted survived";
+        EXPECT_GT(f.io.sendCount(), sentBefore);
+    }
+    {
+        FrameFixture f;
+        ASSERT_TRUE(f.established(1'000'000'000LL));
+        f.m.onSealedFrameOpened();   // a sealed answer opened: the broker proved the keys
+        f.m.onHandshakeContinueResponse(hf, {}, f.m.correlationId(), 1'000'000'100LL, f.m.sessionId());
+        EXPECT_EQ(f.m.state(), sm::SessionState::Connected) << "a clear verdict after proven keys is a forgery";
+        EXPECT_TRUE(f.m.cryptoState().encrypted);
     }
     struct Neg { const char* what; int16_t code; int64_t corrDelta; int64_t sid; };
     const Neg negs[] = {
@@ -1212,4 +1225,97 @@ TEST(SessionMachineAuthRegression, APreTlsRefusalNeverRejectsRegression) {
         EXPECT_FALSE(driveHandshake(m, io, srv, 42, T0 + 1));
         EXPECT_NE(m.state(), sm::SessionState::Rejected) << "a forged server flight must not end the client for good";
     }
+}
+
+// ===========================================================================
+// Adversarial review of PR #476 (issue #115): the pre-TLS redirect pin must
+// survive the Backoff walk.  An io that moves exactly as ClientAgent's seed
+// does (SessionEndpointIo::retargetToBootstrap / retargetToLastKnownLeader:
+// leaving a redirected endpoint for the bootstrap stores it as the last-known
+// leader; the next odd attempt >= 3 returns to it from the bootstrap).
+// ===========================================================================
+namespace {
+struct AgentLikeIo final : sm::SessionIo {
+    std::vector<std::vector<uint8_t>> sends;
+    std::string bootstrap, channel, lastKnown;
+    bool sendFrame(const uint8_t* buf, std::size_t len) override { sends.emplace_back(buf, buf + len); return true; }
+    [[nodiscard]] std::size_t sendCount() const { return sends.size(); }
+    bool retarget(const std::string& ep) noexcept override {   // ClientAgent::retargetSeedOnConnectRedirect_
+        channel = ep.rfind("aeron:", 0) == 0 ? ep : "aeron:udp?endpoint=" + ep;
+        return true;
+    }
+    bool retargetToBootstrap() noexcept override {             // ClientAgent::retargetSeedToBootstrap_
+        if (channel == bootstrap) return true;
+        lastKnown = channel;
+        channel = bootstrap;
+        return true;
+    }
+    bool retargetToLastKnownLeader() noexcept override {       // ClientAgent::retargetSeedToLastKnownLeader_
+        if (lastKnown.empty() || channel != bootstrap) return true;
+        channel = lastKnown;
+        return true;
+    }
+    [[nodiscard]] std::string ingressChannel() const override { return channel; }
+};
+bool helloNames(const std::vector<uint8_t>& frame, const std::string& name) {
+    const auto req = cc::decodeConnectRequest(frame.data(), frame.size());
+    return req && req->handshakeBytes.find(name) != std::string_view::npos;   // the SNI rides the ClientHello in clear
+}
+}  // namespace
+
+// A forged pre-TLS redirect moves a Live session to an attacker endpoint (the pin keeps the bootstrap's name there).
+// Its connects fail; Backoff goes back to the bootstrap (which stores the attacker endpoint as the last-known leader)
+// and then, on the next odd attempt, returns to it.  Every ClientHello sent to the attacker endpoint must still name
+// the ORIGINAL host - never the attacker's own, for which it may hold a publicly trusted certificate.
+TEST(ClientCryptoRegression, APreTlsRedirectPinSurvivesTheBackoffWalkAdversarialRegression) {
+    namespace rpc = rune::protocol::client;
+    const std::string ca = slurp(testdataPath("ca.pem"));
+    AgentLikeIo io;
+    io.bootstrap = io.channel = "aeron:udp?endpoint=localhost:40200";
+    sm::SessionConfig cfg = derivedHostCfg(ca);
+    cfg.reconnectForeverAfterLive = true;
+    cfg.maxConnectRetries = 0;
+    sm::SessionMachine m(io, cfg);
+    int64_t now = 1'000'000'000LL;
+
+    // Live once over TLS against the bootstrap (the certificate names localhost).
+    m.connect(now);
+    {
+        auto srv = cr::TlsSession::makeServer(slurp(testdataPath("server.pem")).c_str(),
+                                              slurp(testdataPath("server.key")).c_str());
+        ASSERT_TRUE(driveHandshake(m, io, srv, 42, ++now));
+    }
+    ASSERT_EQ(m.state(), sm::SessionState::Connected);
+
+    // A reconnect episode; the attacker forges the pre-TLS redirect.
+    io.sends.clear();
+    m.forceReconnect(++now);
+    auto req = cc::decodeConnectRequest(io.sends.back().data(), io.sends.back().size());
+    ASSERT_TRUE(req.has_value());
+    m.onConnectResponseRedirect("evil.example:40300", req->correlationId, ++now);
+    ASSERT_EQ(io.channel, "aeron:udp?endpoint=evil.example:40300");
+
+    const std::string evil = "aeron:udp?endpoint=evil.example:40300";
+    int helloesToEvil = 0;
+    std::size_t seen = 0;
+    for (int round = 0; round < 12; ++round) {
+        // Every new ClientHello sent while the session addresses the attacker endpoint must name the bootstrap's host.
+        for (; seen < io.sends.size(); ++seen) {
+            const auto r = cc::decodeConnectRequest(io.sends[seen].data(), io.sends[seen].size());
+            if (!r || r->handshakeBytes.empty() || io.channel != evil) continue;
+            ++helloesToEvil;
+            EXPECT_TRUE(helloNames(io.sends[seen], "localhost")) << "round " << round << ": the pin was dropped";
+            EXPECT_FALSE(helloNames(io.sends[seen], "evil.example"))
+                << "round " << round << ": the ClientHello to the redirect target names the attacker's host";
+        }
+        // Fail this connect (the attacker cannot complete TLS for the pinned name), then let Backoff fire.
+        if (m.state() == sm::SessionState::Connecting && !io.sends.empty()) {
+            const auto r = cc::decodeConnectRequest(io.sends.back().data(), io.sends.back().size());
+            ASSERT_TRUE(r.has_value());
+            m.onConnectResponse(static_cast<int16_t>(rpc::ErrorCode::HandshakeFailed), -1, 0, r->correlationId, ++now);
+        }
+        now += 2'000'000'000LL;   // past any backoff delay (capped at 1 s)
+        m.tick(now);
+    }
+    EXPECT_GE(helloesToEvil, 2) << "the walk returned to the redirect target at least once after the bootstrap";
 }

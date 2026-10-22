@@ -727,6 +727,13 @@ bool ClientAgent::failoverSeedTo(const std::string& channel, int64_t nowNs, bool
 // dispatchEgressFrame — decode + route one reassembled egress frame
 // ---------------------------------------------------------------------------
 
+bool ClientAgent::answersAnInFlightConnect_(const uint8_t* buf) const noexcept {
+    const int64_t corr = rune::protocol::client::detail::getLE64(buf, 16);
+    for (const auto& sp : sessions_)
+        if (sp->machine.state() == session::SessionState::Connecting && sp->machine.correlationId() == corr) return true;
+    return false;
+}
+
 void ClientAgent::dispatchEgressFrame(int64_t nowNs,
                                        const uint8_t* buf,
                                        std::size_t    len) noexcept
@@ -788,6 +795,7 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
                         buf = egressDecryptScratch_.data();
                         len = plainLen;
                         decrypted = true;
+                        cand.machine.onSealedFrameOpened();   // PR #476 review: the broker proved the keys
                         break;
                     }
                     // Wrong candidate (sessionId collision) or genuine tamper —
@@ -796,6 +804,17 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             }
             if (!decrypted && sawEncryptedCandidate) {
                 return;  // every encrypted candidate failed auth — drop
+            }
+            // PR #476 review (issues #14 / #115): with crypto REQUIRED nothing in clear is ever acted on - whatever
+            // session id its header names (0, one nobody holds, a pre-key session's) - except the connect leg itself:
+            // the ConnectResponse / HandshakeContinueResponse above, and an ErrorResponse answering a session's
+            // in-flight ConnectRequest (a pre-TLS Redirect / NotLeader / refusal, handled as unauthenticated by the
+            // session machine).  Any UDP sender can put a frame on this egress; a clear ProduceResponse{OK} would
+            // otherwise complete a produce, a clear Redirect move a TLS session.
+            if (!decrypted && cfg_.session.offerCrypto && cfg_.session.requireCrypto &&
+                !(peekedTid == codec::TemplateId::ErrorResponse && answersAnInFlightConnect_(buf))) [[unlikely]] {
+                ++clearFramesDropped_;
+                return;
             }
         }
     }

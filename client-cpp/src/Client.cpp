@@ -2289,7 +2289,10 @@ void Client::sweepControl_(int64_t nowNs) {
     // (connect() moves the machine out of Disconnected before the op is pending;
     // Backoff — reconnect-forever — keeps trying and stays deadline-bounded.)
     if (hasPendingConnect_ &&
-        agent_.seedMachine().state() == session::SessionState::Disconnected) [[unlikely]] {
+        (agent_.seedMachine().state() == session::SessionState::Disconnected ||
+         // PR #476 review: a machine that is not reconnect-forever enters Backoff only after unproven TLS final-leg
+         // failures exhausted their retries - the pending connect has failed too.
+         (agent_.seedMachine().state() == session::SessionState::Backoff && !cfg_.reconnectForeverAfterLive))) [[unlikely]] {
         static constexpr std::string_view kGaveUp =
             "connect() gave up (redirect budget exhausted or connect refused): not connected";
         // Issue #13 / #14: a session that requires TLS and never got it says why (the refusals were unauthenticated,
@@ -6042,6 +6045,10 @@ int Client::driveSeedFailover_(int64_t nowNs) noexcept {
     const bool     newLoss = losses != seedFailoverLossesSeen_;
     seedFailoverLossesSeen_ = losses;
     if (auto* f = std::get_if<SeedFailingOver>(&seedFailover_)) [[unlikely]] {
+        // PR #476 review: a TLS session is Connected optimistically once the client sent its Finished; only a sealed
+        // frame proves the broker holds the keys (its final leg may still fail).  Until then the failover neither ends
+        // (its growing gaps survive a broker that fails every final leg - no reconnect storm) nor moves on.
+        if (st == session::SessionState::Connected && m.cryptoState().encrypted && !m.brokerKeysProven()) return 0;
         if (st == session::SessionState::Connected) {
             std::fprintf(stderr, "rune-client: seed reconnected on %s after %u failover attempt(s)\n",
                          agent_.seedChannel().c_str(), f->attempt);
