@@ -50,8 +50,10 @@ AuthStatus a = client.authStatus();                       // Authenticated, Pass
 
 - One session goes to the seed broker; leader redirects and reconnects are handled for you. Callbacks (`onConnected`,
   `onError`, `onDisconnected`) are set before `connect`.
-- TLS 1.3: set `cfg.offerCrypto = true`, `cfg.requireCrypto = true` and `cfg.tlsExpectHost = "node1.example"`. It needs a
-  broker built with `-DRUNE_TLS=ON`.
+- TLS 1.3: set `cfg.offerCrypto = true` (and `cfg.tlsTrustPem` for a private CA). An authenticating broker serves only TLS
+  sessions, and a client with credentials sends them only over TLS: without `offerCrypto` it throws at construction, and
+  `requireCrypto` is forced on. Each session checks the certificate against its own endpoint's host unless
+  `cfg.tlsExpectHost` names one.
 - From a game loop, set `cfg.runnerMode = RunnerMode::Invoker` and call `client.doWork()` once per tick:
 
 ```cpp

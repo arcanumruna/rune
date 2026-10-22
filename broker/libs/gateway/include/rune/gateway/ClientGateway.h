@@ -234,7 +234,9 @@ public:
     //                                 (plaintext client, no broker cert/key, or a local TLS init
     //                                 failure degrading to plaintext — see shouldEngageCrypto())
     //                                 is hard-rejected with ConnectResponse{HandshakeFailed} —
-    //                                 NEVER served plaintext.  Default false (back-compat).  Task
+    //                                 NEVER served plaintext.  Default false (back-compat); BrokerNode
+    //                                 passes NodeConfig::requiresClientTls(), true whenever
+    //                                 authentication is enabled (issue #10, M1).  Task
     //                                 19: shard mode no longer refuses crypto outright (it seals
     //                                 its own per-worker Records egress now), so it is no longer
     //                                 part of this list.
@@ -2338,9 +2340,6 @@ private:
     void failLogin_(Session& session, int64_t correlationId, uint32_t retryAfterMs);
     /// Sessions still awaiting their login past the deadline: AuthServerFinal{44} + end (D13).
     void reapAuthDeadlines_(int64_t nowNs);
-    /// A Connect whose hint names this broker's own authenticated session on the same endpoint (plaintext): answered
-    /// ResumedAuthenticated, no new session.  true = answered.
-    [[nodiscard]] bool resumeAuthenticated_(const rune::protocol::client::ConnectRequest& req);
     /// The throttle key host of a Connect: the Aeron image's source host, else the reply endpoint's host.
     [[nodiscard]] std::string sourceHostOf_(std::string_view egressChannel) const;
     // ── authentication Task 12 ──

@@ -13,6 +13,7 @@
 // was removed by Task 19 once shard mode could serve crypto (see its own
 // removal note below).
 
+#include <optional>
 #include <string>
 
 namespace rune::node {
@@ -80,6 +81,29 @@ namespace rune::node {
                                                                  bool perWorkerIngress,
                                                                  bool shardMode) noexcept {
     return authEnabled && perWorkerIngress && !shardMode;
+}
+
+// Issues #10 / #11 (combined fix program M1): authentication is served only over TLS, so a broker built without the
+// RUNE_TLS CMake option refuses authentication (the default mode), and it refuses every RUNE_TLS_* / RUNE_REQUIRE_TLS
+// variable instead of silently ignoring it and starting plaintext.  nullopt = may start.
+[[nodiscard]] inline std::optional<std::string> tlsBuildRefusal(bool tlsBuild, bool anyTlsVariableSet,
+                                                                bool authEnabled) {
+    if (tlsBuild) return std::nullopt;
+    if (anyTlsVariableSet)
+        return std::string("RUNE_TLS_CERT_FILE / RUNE_TLS_KEY_FILE / RUNE_REQUIRE_TLS are set but this broker was built "
+                           "without TLS (CMake -DRUNE_TLS=OFF): refusing to start rather than serve plaintext; rebuild "
+                           "with -DRUNE_TLS=ON (the default)");
+    if (authEnabled)
+        return std::string("authentication is enabled (RUNE_AUTH unset or 'enabled') but this broker was built without "
+                           "TLS (CMake -DRUNE_TLS=OFF), and an authenticating broker serves only TLS sessions: rebuild "
+                           "with -DRUNE_TLS=ON (the default), or set RUNE_AUTH=disabled for single-node development");
+    return std::nullopt;
+}
+
+/// Issue #10 (M1): a broker whose every client session must be TLS (RUNE_REQUIRE_TLS, or authentication) needs a
+/// certificate; without one every Connect would be refused.  true = refuse to start.
+[[nodiscard]] inline bool mustRefuseRequiredTlsWithoutCertificate(bool requiresClientTls, bool tlsConfigured) noexcept {
+    return requiresClientTls && !tlsConfigured;
 }
 
 } // namespace rune::node

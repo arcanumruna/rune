@@ -30,6 +30,8 @@ TEST(ClientSessionRevokedBrokerRegression, InFlightRequestsAndSubscriptionsCompl
     c.dataDir         = b.clientDir().string();
     c.username        = name;
     c.password        = AuthRig::kPw;
+    c.offerCrypto     = true;                      // issue #14: credentials only over TLS
+    c.tlsTrustPem     = AuthBroker::tlsCaPem();   // the rig's test CA (the certificate names 127.0.0.1)
     c.topics          = {rc::TopicSpec{"orders", r.orders, 1}};
     rc::Client client(c);
     client.connectAndWait(20s);

@@ -22,6 +22,7 @@
 
 #include <array>
 #include <fstream>
+#include <iterator>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -45,10 +46,19 @@ public:
         c_.configTweak = [this](NodeConfig& cfg) {
             const auto i = static_cast<std::size_t>(cfg.nodeId - 1);
             cfg.authMode = authMode_;
+            cfg.clientTransport = ClientTransport::PlaintextForTest;   // issue #10: the raw-frame client is plaintext
+            cfg.tlsCertFile = std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.pem";   // ... and TLS clients get TLS
+            cfg.tlsKeyFile  = std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.key";
             cfg.clientEndpoint.streamId = AuthWireClient::kClientStream;   // the raw-frame client speaks stream 1
             cfg.clusterKeyFile = keyPath_[i];
             cfg.clusterKeyFileNext = nextPath_[i];
         };
+    }
+
+    /// The CA of the brokers' test certificate (issue #14: a credentialed client needs TLS).
+    [[nodiscard]] static std::string tlsCaPem() {
+        std::ifstream f(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/ca.pem", std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     }
 
     ThreeNodes& cluster() noexcept { return c_; }

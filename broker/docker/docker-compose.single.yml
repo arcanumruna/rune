@@ -84,6 +84,10 @@ services:
       RUNE_IO_BACKEND: "portable"
       # Authentication stays ON for a single node (RUNE_AUTH=disabled is the explicit dev-only opt-out).
       RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
+      # Issue #10: every client session of an authenticating broker is TLS - the broker certificate (and key)
+      # sit next to the cluster key (docker/lib/auth.sh rune_gen_cluster_key writes all three).
+      RUNE_TLS_CERT_FILE: /run/secrets/tls.pem
+      RUNE_TLS_KEY_FILE: /run/secrets/tls.key
     volumes:
       - rune-data-1:/var/lib/rune
       - type: bind
@@ -92,6 +96,18 @@ services:
         read_only: true
         bind:
           create_host_path: false   # a missing key file fails the start; never a directory
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/tls.pem
+        target: /run/secrets/tls.pem
+        read_only: true
+        bind:
+          create_host_path: false   # issue #10: a missing TLS file fails the start
+      - type: bind
+        source: ${RUNE_SECRETS_DIR:-./secrets}/tls.key
+        target: /run/secrets/tls.key
+        read_only: true
+        bind:
+          create_host_path: false   # issue #10: a missing TLS file fails the start
     healthcheck:
       test: ["CMD", "pgrep", "-x", "rune_broker"]
       interval: 5s

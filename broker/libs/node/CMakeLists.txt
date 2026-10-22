@@ -114,6 +114,9 @@ target_link_libraries(rune_node PUBLIC rune_peer_name_resolver)
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
+    # Issues #10 / #137: every node test may run an authenticating broker over TLS (support/AuthBroker.h's tls option)
+    # with the generated test certificate.
+    add_compile_definitions(RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_TESTDATA_GEN}")
 
     # TSan suppressions for vendored Aeron client internals (conductor↔poll
     # fence-based ordering TSan cannot model). Applied as a CTest ENVIRONMENT to
@@ -1660,6 +1663,7 @@ if(BUILD_TESTING)
                        tests/client/ClientDdlClusterRegressionTest.cpp
                        tests/client/ClientLoginBrokerRegressionTest.cpp
                        tests/client/RuneCliSecurityBrokerRegressionTest.cpp
+                       tests/client/AuthTlsBrokerRegressionTest.cpp
                        tests/client/ClientSessionRevokedBrokerRegressionTest.cpp
                        tests/client/ClientAuthClusterRegressionTest.cpp
                        tests/client/RuneConsoleBrokerRegressionTest.cpp
@@ -1739,8 +1743,6 @@ if(BUILD_TESTING)
                                    ${RUNE_CLIENT_ROOT}/tests ${CMAKE_BINARY_DIR}/rune-client/claim-gen)
         target_link_libraries(rune_client_failover_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api aeron::aeron GTest::gtest_main)
-        target_compile_definitions(rune_client_failover_broker_tests PRIVATE
-            RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_TESTDATA_GEN}")   # fix round 3: TLS failover cells
         gtest_discover_tests(rune_client_failover_broker_tests PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 
         # Catalog history Task 11: the DDL route (Redirect / NotLeader / Internal when

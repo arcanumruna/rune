@@ -6,7 +6,10 @@
 #
 # The macOS system openssl is LibreSSL (no ed25519 keygen); prefer a Homebrew OpenSSL 3.
 function(rune_crypto_generate_test_certs outdir)
-    if(EXISTS "${outdir}/server.key" AND EXISTS "${outdir}/server.pem" AND EXISTS "${outdir}/ca.pem")
+    # v2 (issue #115): the server certificate also names IP 127.0.0.1 - the client checks an IP endpoint against the
+    # iPAddress SANs.  The stamp regenerates an older set.
+    if(EXISTS "${outdir}/server.key" AND EXISTS "${outdir}/server.pem" AND EXISTS "${outdir}/ca.pem"
+       AND EXISTS "${outdir}/san-v2.stamp")
         return()
     endif()
     find_program(RUNE_TEST_OPENSSL openssl
@@ -14,7 +17,7 @@ function(rune_crypto_generate_test_certs outdir)
         NO_DEFAULT_PATH)
     find_program(RUNE_TEST_OPENSSL openssl REQUIRED)
     file(MAKE_DIRECTORY "${outdir}")
-    file(WRITE "${outdir}/san.ext" "subjectAltName=DNS:localhost\n")
+    file(WRITE "${outdir}/san.ext" "subjectAltName=DNS:localhost,IP:127.0.0.1\n")
     set(_o "${RUNE_TEST_OPENSSL}")
     function(_rune_run)
         execute_process(COMMAND ${ARGN} WORKING_DIRECTORY "${outdir}" RESULT_VARIABLE rc
@@ -28,5 +31,6 @@ function(rune_crypto_generate_test_certs outdir)
     _rune_run(${_o} x509 -req -in server.csr -CA ca.pem -CAkey ca.key -out server.pem -days 3650
               -extfile san.ext -CAcreateserial)
     file(REMOVE "${outdir}/ca.key" "${outdir}/server.csr" "${outdir}/san.ext" "${outdir}/ca.srl")
+    file(WRITE "${outdir}/san-v2.stamp" "DNS:localhost,IP:127.0.0.1\n")
     message(STATUS "rune-crypto: generated test TLS certificates in ${outdir}")
 endfunction()

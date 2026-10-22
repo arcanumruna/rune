@@ -148,6 +148,9 @@ rune::client::ClientConfig buildClientConfig(const std::vector<std::string>& arg
 
     // Review B I6: the credential flags are global (--user / --password-file, RUNE_USER / RUNE_PASSWORD_FILE).
     rune::cli::support::applyCredentials(cfg, flagValue(args, "--user"), flagValue(args, "--password-file"));
+    // Issue #13: TLS (--tls-ca / --tls-host / --insecure-plaintext); a usage error throws (cmdSchema reports it).
+    rune::cli::support::applyTls(cfg, flagValue(args, "--tls-ca"), flagValue(args, "--tls-host"),
+                                 hasFlag(args, "--insecure-plaintext"));
 
     return cfg;
 }

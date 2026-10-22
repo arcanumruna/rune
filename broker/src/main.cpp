@@ -154,6 +154,13 @@ int main(int argc, char** argv) {
                      "development)\n";
         return 2;
     }
+    // Issue #10 (M1): authentication over plaintext client sessions exists for in-process tests only; parseNodeConfig
+    // never yields it, and this guards an embedding mistake in this very file.
+    if (cfg->clientTransport == rune::node::ClientTransport::PlaintextForTest) {
+        std::cerr << "rune-broker: configuration error: the broker process refuses ClientTransport::PlaintextForTest "
+                     "(every client session of an authenticating broker is TLS)\n";
+        return 2;
+    }
     // The cluster key file(s) are read here, before any side effect, so a misconfiguration is exit 2 with its cause
     // (BrokerNode::start repeats the check for programmatic configs).
     if (auto authErr = cfg->validateAuth(); authErr.has_value()) {

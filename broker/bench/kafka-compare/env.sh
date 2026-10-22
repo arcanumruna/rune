@@ -38,7 +38,9 @@ data_root() {
 : "${RUNE_BENCH_AUTH_DIR:=$WORK/auth}"
 : "${RUNE_USER:=bench}"
 : "${RUNE_PASSWORD_FILE:=$RUNE_BENCH_AUTH_DIR/bench.pw}"
-export RUNE_BENCH_AUTH_DIR RUNE_USER RUNE_PASSWORD_FILE
+# Issue #10: every client session of an authenticating broker is TLS; the clients and the CLI trust the run's CA.
+: "${RUNE_TLS_CA_FILE:=$RUNE_BENCH_AUTH_DIR/ca.pem}"
+export RUNE_BENCH_AUTH_DIR RUNE_USER RUNE_PASSWORD_FILE RUNE_TLS_CA_FILE
 
 # ---- core pinning (empty = no taskset; set on ccx43) ----------------------
 : "${CORES_BROKER:=}"                        # e.g. "0-7"
