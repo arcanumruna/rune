@@ -204,6 +204,31 @@ Interaction matrix (op × entity × timing):
 
 The partition cases also run as an e2e on k3s with iptables partitions.
 
+### A.8 Implementation notes (issue #82, 2026-10-22)
+
+Implemented: A.3, A.4, A.5.1, A.5.2, A.5.3 (time path) and A.5.5.  Where the code differs from the text above:
+
+- **Templates 63 / 64.** 62 is `TermFloorNotice`; `ReadLeaseRequest` is 63 and `ReadLeaseGrant` 64.
+- **A broker without a lease answers NotLeader, not NotReady** (the worker's not-leader sentinel: the gateway
+  redirects or answers a bare NotLeader).  The client retries NotLeader by itself within `ddlRetryBudget`, while
+  NotReady reaches the application.  A zombie cannot vouch for its own leadership, so NotLeader is the honest answer.
+- **commitPos is the controller's metadata log END**, not its committed position: a new controller's HW can lag what
+  its predecessor committed, and its log never does.
+- **No `predecessorFenced` in LeaderChange records.** The dead-broker failover case is covered instead by the
+  controller: a member holding a lease this controller granted is never judged dead (`eligibleNodeIds`), and a new
+  controller's become-leader grace lasts at least `W`, which covers every lease of a predecessor that stood down.  The
+  new-leader gate therefore always waits `W` after a leader change (about 150 ms of view NotReady on the new leader),
+  failovers included.  The demotion-proof shortcut (A.5.3 "proof") is not implemented either.  Both are availability
+  optimisations: #487.
+- **A.5.4 (the client epoch fence) is not implemented**: it needs a client and wire change, and the lease already
+  bounds every stale read: #488.
+- **Fold barrier**: it holds a read only on a Ready table (a table still catching up answers NotReady at once), and a
+  held read is answered NotReady after 100 ms if the fold cannot reach its target.
+- **Known residual (filed)**: a *live* leader move that also takes the old leader out of the ISR (controlled
+  shutdown, or an offset-lag shrink by the new leader) lets the new leader ack writes while the old leader, which has
+  not applied the move yet, still serves under a lease granted before it.  Closing it needs the new leader's commits
+  (not only its reads) to wait for the predecessor's fence: a design decision, #486.
+
 ---------------------------------------------------------------------------------------------------
 
 ## Part B — View-sink ownership and the explicit refusal
