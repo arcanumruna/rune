@@ -258,6 +258,10 @@ public:
         /// current).  A partition led by a node below
         /// kBrokerVersionExplicitGroupSubscriptions is parked, logged.
         int32_t (*brokerVersion)(void* ctx, uint32_t session) = nullptr;
+        /// #290: that node session's reject code (46 / 44 ...) when it is
+        /// Rejected, else 0 (optional).  A fetch it would carry can never be
+        /// sent: the consumer is refused with that code at once.
+        int16_t (*rejectCode)(void* ctx, uint32_t session) = nullptr;
     };
     void setFetchRouter(const FetchRouter& r) noexcept { router_ = r; }
 

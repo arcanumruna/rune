@@ -247,6 +247,10 @@ public:
         detail::SendResult (*offer)(void* ctx, uint32_t session, const uint8_t* buf, std::size_t len) = nullptr;
         /// A fresh correlationId from the Client's duty-owned counter.
         int64_t (*nextCorrId)(void* ctx) = nullptr;
+        /// #290: that node session's reject code (46 / 44 ...) when it is
+        /// Rejected, else 0 (optional).  A subscription homed there is ended
+        /// with that code at once (it could only wait for its deadline).
+        int16_t (*rejectCode)(void* ctx, uint32_t session) = nullptr;
     };
     void setNodeRouter(const NodeRouter& r) noexcept { router_ = r; }
 
@@ -538,6 +542,10 @@ private:
     /// Mark impl finished: inactive, final snapshot, status ring closed
     /// (deferred to the end of its dispatch if its handler is running).
     void finish_(SubscriptionImpl& impl);
+    /// #290: the reject code of the node session `impl` is homed on, else 0.
+    [[nodiscard]] int16_t homeRejectCode_(const SubscriptionImpl& impl) const noexcept;
+    /// #290: end `impl` with that code (the caller removes its map entry).
+    void endRejected_(SubscriptionImpl& impl, int16_t code);
     /// Publish the final snapshot and close the status ring.
     static void closeStatus_(SubscriptionImpl& impl);
 };

@@ -288,6 +288,7 @@ Client::Client(ClientConfig cfg)
         fr.revive        = &Client::fetchReviveTrampoline_;
         fr.brokerVersion = &Client::fetchBrokerVersionTrampoline_;
         fr.offer         = &Client::fetchOfferTrampoline_;
+        fr.rejectCode    = &Client::nodeRejectCodeTrampoline_;
         groupConsumerHub_.setFetchRouter(fr);
         // E2 final fix wave (I2): a moved plain subscription lives on its
         // partition leader's own node session, reached the same way.
@@ -298,6 +299,7 @@ Client::Client(ClientConfig cfg)
         nr.epoch         = &Client::fetchEpochTrampoline_;
         nr.offer         = &Client::fetchOfferTrampoline_;
         nr.nextCorrId    = &Client::nextCorrTrampoline_;
+        nr.rejectCode    = &Client::nodeRejectCodeTrampoline_;
         subscriberHub_.setNodeRouter(nr);
     }
 
@@ -1888,7 +1890,8 @@ void Client::failControlOnSeedLoss_(uint16_t errorCode, std::span<const uint8_t>
 transport::AeronTransport::OfferResult Client::offerDdl_(DdlPending& d, int64_t nowNs, DdlOfferedOn& on) {
     uint32_t idx = 0;
     const auto r = agent_.offerToEndpoint(d.endpoint, d.frame.data(), d.frame.size(), nowNs, idx);
-    if (r == transport::AeronTransport::OfferResult::Accepted) on = DdlOfferedOn{idx, agent_.connectedEpoch(idx)};
+    // #290: the node session is named on a refusal too (its epoch is 0 then) — a Rejected one ends the DDL.
+    on = DdlOfferedOn{idx, r == transport::AeronTransport::OfferResult::Accepted ? agent_.connectedEpoch(idx) : 0};
     return r;
 }
 
@@ -1904,6 +1907,8 @@ void Client::failDdl_(std::size_t i, uint16_t code, std::string_view detail, int
 
 namespace {
 constexpr int64_t kDdlInitialBackoffNs = 100'000'000;     // 100 ms
+constexpr std::string_view kDdlNodeRejected =
+    "the DDL's node session was rejected (the user was revoked there or its login was refused)";
 constexpr int64_t kDdlMaxBackoffNs     = 1'000'000'000;   // 1 s
 } // namespace
 
@@ -2024,6 +2029,13 @@ int Client::driveDdl_(int64_t nowNs) {
             backoffNs = n->backoffNs;
         }
         if (on != nullptr) {
+            // #290: its node session was Rejected (the user revoked there, a refused login): it is never
+            // answered there, and a resend toward the seed comes back to the same node — ends now with the code.
+            if (const int16_t code = nodeRejectCode_(on->sessionIndex); code != 0) [[unlikely]] {
+                failDdl_(i, static_cast<uint16_t>(code), kDdlNodeRejected, ddlNoValue(p.op));
+                ++work;
+                continue;
+            }
             if (agent_.connectedEpoch(on->sessionIndex) != on->sessionEpoch) [[unlikely]] {
                 d->endpoint.clear();   // toward the seed: it redirects to the current leader
                 setDdlRetry_(*d, DdlAwaitingResend{redirects, budgetEndNs, backoffNs, nowNs,
@@ -2045,6 +2057,11 @@ int Client::driveDdl_(int64_t nowNs) {
                 ++i;
                 break;
             case Offer::Retry:   // refused (its node's session is not up): every cycle, inside the budget
+                if (const int16_t code = nodeRejectCode_(sentOn.sessionIndex); code != 0) {   // #290
+                    failDdl_(i, static_cast<uint16_t>(code), kDdlNodeRejected, ddlNoValue(p.op));
+                    ++work;
+                    break;
+                }
                 // Fix round 2 (I-1): toward a seed that can never reconnect: end now.
                 if (d->endpoint.empty() && seedCannotReconnect_()) {
                     if (due.cause == DdlResendCause::SessionLost) {
@@ -2106,6 +2123,11 @@ int Client::driveDdl_(int64_t nowNs) {
             ++i;
             break;
         case Offer::Retry:
+            if (const int16_t code = nodeRejectCode_(sentOn.sessionIndex); code != 0) {   // #290: held for it
+                failDdl_(i, static_cast<uint16_t>(code), kDdlNodeRejected, ddlNoValue(p.op));
+                ++work;
+                break;
+            }
             // Fix round 2 (I-1): waiting for a seed that can never reconnect: end now.
             if (d->endpoint.empty() && seedCannotReconnect_()) {
                 PendingCtl dead = takeCtl_(i);   // never sent (or held for a node that is the seed)
@@ -5019,6 +5041,16 @@ int32_t Client::fetchBrokerVersionTrampoline_(void* ctx, uint32_t session) noexc
     return static_cast<Client*>(ctx)->agent_.sessionBrokerVersion(session);
 }
 
+int16_t Client::nodeRejectCodeTrampoline_(void* ctx, uint32_t session) noexcept {
+    return static_cast<Client*>(ctx)->nodeRejectCode_(session);
+}
+
+int16_t Client::nodeRejectCode_(uint32_t session) const noexcept {
+    if (session == 0 || session >= agent_.sessionCount()) return 0;
+    const session::SessionMachine& m = agent_.sessionMachineAt(session);
+    return m.state() == session::SessionState::Rejected ? m.rejectCode() : int16_t{0};
+}
+
 void Client::fetchReviveTrampoline_(void* ctx, uint32_t session) noexcept {
     auto* self = static_cast<Client*>(ctx);
     (void)self->agent_.reviveSession(session, self->now());
@@ -5260,17 +5292,20 @@ int Client::retryRedirectedSubscribes_(int64_t nowNs) {
 int Client::watchGroupSessions_(int64_t nowNs) {
     const uint32_t leaders = agent_.leaderSessionCount();
     if (leaders == 0) return 0;
-    uint64_t up = 0, disc = 0;
+    uint64_t up = 0, disc = 0, rej = 0;
     for (uint32_t i = 1; i <= leaders && i <= 64; ++i) {
         const session::SessionState st = agent_.sessionStateAt(i);
         if (st == session::SessionState::Connected) up |= uint64_t{1} << (i - 1);
         else if (st == session::SessionState::Disconnected) disc |= uint64_t{1} << (i - 1);
+        else if (st == session::SessionState::Rejected) rej |= uint64_t{1} << (i - 1);
     }
     const uint64_t lost      = groupUpMask_ & ~up;
     const uint64_t newlyDisc = disc & ~groupDiscMask_;
+    const uint64_t newlyRej  = rej & ~groupRejMask_;   // #290: reconcile refuses the fetches it carried
     groupUpMask_   = up;
     groupDiscMask_ = disc;
-    const uint64_t events = lost | newlyDisc;
+    groupRejMask_  = rej;
+    const uint64_t events = lost | newlyDisc | newlyRej;
     if (events == 0) [[likely]] return 0;
     bool affected = false;
     for (uint32_t i = 1; i <= leaders && i <= 64; ++i) {

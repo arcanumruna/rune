@@ -1647,6 +1647,10 @@ private:
     static uint64_t fetchEpochTrampoline_(void* ctx, uint32_t session) noexcept;
     static void fetchReviveTrampoline_(void* ctx, uint32_t session) noexcept;
     static int32_t fetchBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept;
+    /// #290: a node session's reject code (46 / 44 ...) while it is Rejected, else 0 (0 for the seed, whose
+    /// rejection ends the Client's work on its own path).
+    static int16_t nodeRejectCodeTrampoline_(void* ctx, uint32_t session) noexcept;
+    [[nodiscard]] int16_t nodeRejectCode_(uint32_t session) const noexcept;
     /// M1 (duty thread, while a group consumer exists): a leader-node session a
     /// group partition subscribes through was lost (left Connected) or became
     /// terminally Disconnected — ask for metadata (the leader may have moved),
@@ -1730,6 +1734,7 @@ private:
     uint64_t              unreachableRedirects_ = 0;
     uint64_t groupUpMask_   = 0;  // leader sessions (bit i-1 = session i) Connected last pass
     uint64_t groupDiscMask_ = 0;  // ... terminally Disconnected last pass
+    uint64_t groupRejMask_  = 0;  // #290: ... Rejected last pass (a login refused there is never "lost")
     static detail::SendResult fetchOfferTrampoline_(void* ctx, uint32_t session, const uint8_t* buf,
                                                     std::size_t len) noexcept;
     /// A Redirect / NotLeader answered a group fetch Subscribe (corrId tagged

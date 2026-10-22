@@ -993,6 +993,23 @@ bool SubscriberHub::holdMovedForRetry(int64_t correlationId, std::chrono::steady
     return true;
 }
 
+int16_t SubscriberHub::homeRejectCode_(const SubscriptionImpl& impl) const noexcept
+{
+    if (impl.homeSession == 0 || router_.rejectCode == nullptr) return 0;
+    return router_.rejectCode(router_.ctx, impl.homeSession);
+}
+
+void SubscriberHub::endRejected_(SubscriptionImpl& impl, int16_t code)
+{
+    // As the subscription's own refusal would end it (endRefused): 46 is
+    // SessionRevoked, anything else (44 a refused login, ...) RejectedByBroker.
+    impl.failReason      = code == static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionRevoked)
+                               ? SubscriptionFailReason::SessionRevoked
+                               : SubscriptionFailReason::RejectedByBroker;
+    impl.brokerErrorCode = static_cast<uint16_t>(code);
+    finish_(impl);
+}
+
 int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_point deadline,
                               std::chrono::steady_clock::time_point now)
 {
@@ -1007,6 +1024,14 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
         SubscribeRequest* req = it->second.get();
         if (req != nullptr && req->impl != nullptr && req->impl->active && req->impl->homeSession != 0) {
             SubscriptionImpl& impl = *req->impl;
+            if (const int16_t code = homeRejectCode_(impl); code != 0) {   // #290: never sendable there
+                endRejected_(impl, code);
+                clearUnsent_(*req);
+                pendingByCorrelation_.erase(it);
+                ++work;
+                it = next;
+                continue;
+            }
             const bool held = impl.homeSid == 0;
             const bool lost = !held && router_.epoch(router_.ctx, impl.homeSession) != impl.homeEpoch;
             const bool due  = !held || now >= req->notBefore;   // a NotLeader backoff (holdMovedForRetry)
@@ -1049,6 +1074,12 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
         const auto ait = activeById_.find(id);
         if (ait == activeById_.end()) continue;
         SubscriptionImpl& impl = *ait->second;
+        if (const int16_t code = homeRejectCode_(impl); code != 0) {   // #290: its node session was Rejected
+            endRejected_(impl, code);
+            activeById_.erase(ait);
+            ++work;
+            continue;
+        }
         const int64_t newCorr = router_.nextCorrId(router_.ctx);
         const int32_t part    = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
         const int64_t from    = impl.nextOffset > 0  ? impl.nextOffset

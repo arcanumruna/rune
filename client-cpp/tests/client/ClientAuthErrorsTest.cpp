@@ -354,6 +354,91 @@ TEST(ClientAuthErrorsRegression, ALeaderNodeLoginRefusedFailsItsRequestsAuthenti
     EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
 }
 
+// #290: control ops and group / plain fetches HOMED on a Rejected node session (its user revoked there, or its
+// login refused — a halted broker, D28) end at once with that session's code, as produce batches do (Review B
+// I1).  Each one is told apart from its own deadline by its outcome: a deadline ends a DDL Timeout, a Subscribe
+// TimedOut, and leaves a group member Stable.  RED (before): each waited for that deadline.
+namespace {
+void connectTwoNode(TwoNodeRig& r, test_support::TestCq& cq) {
+    ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+    auto conn = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.connect(q, t); });
+    ASSERT_TRUE(r.drive([&] { return conn.ready(); }));
+    ASSERT_TRUE(conn.ok()) << conn.describe();
+    ASSERT_TRUE(r.drive([&] { return r.client.testLeaderFor(1, 0) == 1; })) << "metadata names node 1";
+}
+} // namespace
+
+TEST(ClientAuthErrorsRegression, ADdlRedirectedToALoginRefusedNodeFailsAtOnceWithItsCodeRegression) {
+    TwoNodeRig r(3840);
+    r.gw.rejectLoginsAt.insert(r.n1);
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    int atNode1 = 0;
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        const auto h = pc::MessageHeader::decode(f, len);
+        ASSERT_TRUE(h.has_value());
+        if (ep == 0) r.gw.sendError(0, static_cast<int16_t>(pc::ErrorCode::Redirect), r.node1, h->sessionId,
+                                    h->correlationId);
+        else ++atNode1;
+    };
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::BrokerError) << f.describe();
+    EXPECT_EQ(f.outcome().c.errorCode, 44);
+    EXPECT_EQ(atNode1, 0);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+TEST(ClientAuthErrorsRegression, ADdlInFlightOnARevokedNodeSessionFailsAtOnceRegression) {
+    TwoNodeRig r(3842);
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    int64_t node1Sid = 0;
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        const auto h = pc::MessageHeader::decode(f, len);
+        ASSERT_TRUE(h.has_value());
+        if (ep == 0) r.gw.sendError(0, static_cast<int16_t>(pc::ErrorCode::Redirect), r.node1, h->sessionId,
+                                    h->correlationId);
+        else node1Sid = h->sessionId;   // node 1 holds it unanswered
+    };
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(r.drive([&] { return node1Sid != 0; })) << "the DDL reached node 1";
+    r.gw.revokeSession(node1Sid, r.n1);
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::BrokerError) << f.describe();
+    EXPECT_EQ(f.outcome().c.errorCode, 46);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+TEST(ClientAuthErrorsRegression, AGroupFetchHomedOnALoginRefusedNodeRefusesTheConsumerAtOnceRegression) {
+    TwoNodeRig r(3844);
+    r.gw.rejectLoginsAt.insert(r.n1);
+    r.gw.groupProtocol   = true;
+    r.gw.groupAssignment = {{1, 0}};                 // p0, led by node 1
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); })) << "the member waited on a Rejected node session"
+        << " gen " << gc.generation() << " joins " << r.gw.joinGroups << " s1 "
+        << static_cast<int>(r.client.testSessionStateAt(1)) << " sessions " << r.client.testSessionCount()
+       ;
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+TEST(ClientAuthErrorsRegression, APlainSubscriptionHomedOnALoginRefusedNodeEndsAtOnceRegression) {
+    TwoNodeRig r(3846);
+    r.gw.rejectLoginsAt.insert(r.n1);
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    r.gw.subscribeLeader[0] = r.n1;                  // the seed redirects the Subscribe to node 1
+    rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); }));
+    EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::RejectedByBroker);
+    EXPECT_EQ(sub.brokerErrorCode(), 44);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
 // Review B I5: against a Required broker with no security admin yet, a credential-less client's session is Anonymous
 // and may carry ONLY the bootstrap: no keepalive, no connect-time metadata request (the strict fake ends a session
 // that sends anything else).  The bootstrap itself — MAC checked, accepted once — creates the admin.
