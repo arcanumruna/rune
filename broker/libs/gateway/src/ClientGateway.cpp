@@ -8546,11 +8546,11 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         return;
     }
     const std::string user = st->user;
-    st->finalLegSeen = true;   // #132: this episode is charged (or refused) here, never again as abandoned at the close
     // Issue #130: the throttle gates every proof VERIFICATION, not only the first leg - otherwise N sessions that all
     // sent AuthClientFirst before any final get N verified guesses per delay.  The control thread handles the finals
-    // one at a time, so each one sees the failure the previous one recorded.  Refused here: not counted (as at the
-    // first leg), the proof is never looked at.
+    // one at a time, so each one sees the failure the previous one recorded.  Refused here: the proof is never looked
+    // at and the final is no verdict - so finalLegSeen stays false and the close below charges the episode's (allowed,
+    // salt-revealing) first leg as abandoned, once (PR #522 review: otherwise N parked first legs cost 3 failures).
     if (const LoginThrottle::Verdict v = loginThrottle_.check(user, session->sourceHost, nowNs_); !v.allowed) {
         ++loginsRateLimited_;
         if (unauthLog_.due(1)) [[unlikely]]
@@ -8558,6 +8558,9 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         failLogin_(*session, hdr->correlationId, v.retryAfterMs);
         return;
     }
+    // #132: from here the episode is settled at this final - a verdict charges it, a stale view (retriable, not the
+    // client's doing) does not - never again as an abandoned first leg at the close.
+    st->finalLegSeen = true;
     if (securityUnavailable_()) [[unlikely]] {   // issues #15 / #111: the view went stale between the two legs
         unavailableLogin_(*session, hdr->correlationId, user);
         return;

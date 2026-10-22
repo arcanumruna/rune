@@ -149,3 +149,59 @@ TEST(LoginThrottleRegression, SourceHostOfAnAeronImageIsTheHostNeverGarbageRegre
     EXPECT_EQ(host, "192.168.7.7");
     EXPECT_EQ(hostOfSourceIdentity(std::string("203.0.113.5:1")), "203.0.113.5");   // a temporary argument
 }
+
+// ── Adversarial review of PR #522 (#131) ───────────────────────────────────────────────────────────────────────────
+// The user component is capped at 2 s whatever the campaign's size (100 000 failures over 100 000 hosts: the shift
+// saturates, never overflows), a known pair stays exempt, and a known pair idle past kForgetAfterNs is no longer known
+// (it falls back to the capped user component - still never a lockout).
+TEST(LoginThrottleRegression, TheUserComponentNeverExceedsItsCapAndAKnownPairIsForgottenWhenIdleAdversarialRegression) {
+    LoginThrottle t;
+    t.onSuccess("victim", "10.0.0.9", 0);
+    for (int i = 0; i < 100'000; ++i)
+        t.onFailure("victim", "2001:db8::" + std::to_string(i), 0);
+    const auto fresh = t.check("victim", "192.0.2.1", 0);
+    ASSERT_FALSE(fresh.allowed);
+    EXPECT_EQ(fresh.retryAfterMs, static_cast<uint32_t>(LoginThrottle::kMaxUserDelayNs / ms));
+    EXPECT_TRUE(t.check("victim", "10.0.0.9", 0).allowed) << "known pair";
+    // The campaign goes on just before the known pair is forgotten ...
+    const int64_t late = LoginThrottle::kForgetAfterNs + 1;
+    t.onFailure("victim", "2001:db8::ffff:1", late - 1);
+    const auto home = t.check("victim", "10.0.0.9", late);
+    EXPECT_FALSE(home.allowed) << "a known pair is forgotten after kForgetAfterNs without a success";
+    EXPECT_LE(home.retryAfterMs, static_cast<uint32_t>(LoginThrottle::kMaxUserDelayNs / ms));
+    // ... and a success at home makes it known again at once.
+    t.onSuccess("victim", "10.0.0.9", late);
+    EXPECT_TRUE(t.check("victim", "10.0.0.9", late).allowed);
+}
+
+// Table pressure (the known-pair table is 4096 entries, oldest-of-window eviction): an attacker with its OWN account
+// logging in from 20 000 hosts can push the victim's known pair out.  The damage is bounded by the user cap: the victim
+// at home is delayed 2 s at most, never locked out, and its own next success restores the exemption.  (The eviction
+// itself is filed as a hardening issue; this test pins the bound.)
+TEST(LoginThrottleRegression, KnownPairTablePressureBoundsTheVictimByTheUserCapAdversarialRegression) {
+    LoginThrottle t;
+    int64_t now = 1;
+    t.onSuccess("victim", "10.0.0.9", now);
+    for (int i = 0; i < 20'000; ++i) t.onSuccess("attacker", "2001:db8::" + std::to_string(i), ++now);
+    for (int i = 0; i < 50; ++i) t.onFailure("victim", "198.51.100." + std::to_string(i), now);
+    const auto home = t.check("victim", "10.0.0.9", now);
+    if (!home.allowed) EXPECT_LE(home.retryAfterMs, static_cast<uint32_t>(LoginThrottle::kMaxUserDelayNs / ms));
+    EXPECT_TRUE(t.check("victim", "10.0.0.9", now + LoginThrottle::kMaxUserDelayNs).allowed) << "never a lockout";
+    t.onSuccess("victim", "10.0.0.9", now + LoginThrottle::kMaxUserDelayNs);
+    t.onFailure("victim", "198.51.100.200", now + LoginThrottle::kMaxUserDelayNs);
+    EXPECT_TRUE(t.check("victim", "10.0.0.9", now + LoginThrottle::kMaxUserDelayNs).allowed) << "known again";
+}
+
+// Input bounds of the keys: an empty user, an empty host (IPC), a 1 MiB name and a name with an embedded NUL are all
+// distinct keys and none of them aliases another's schedule.
+TEST(LoginThrottleRegression, EmptyHugeAndNulKeysNeverAliasAdversarialRegression) {
+    LoginThrottle t;
+    const std::string huge(1u << 20, 'u'), nul("a\0b", 3);
+    for (int k = 0; k < 3; ++k) { t.onFailure("", "", 0); t.onFailure(huge, "h1", 0); t.onFailure(nul, "h2", 0); }
+    EXPECT_FALSE(t.check("", "", 0).allowed);
+    EXPECT_FALSE(t.check(huge, "h1", 0).allowed);
+    EXPECT_FALSE(t.check(nul, "h2", 0).allowed);
+    EXPECT_TRUE(t.check("a", "h2", 0).allowed) << "the NUL is part of the name";
+    EXPECT_TRUE(t.check(huge.substr(1), "h1", 0).allowed) << "one byte shorter is another name";
+    EXPECT_TRUE(t.check("", "h3", 0).allowed) << "the empty user's pair is per host";
+}

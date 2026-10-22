@@ -805,6 +805,127 @@ TEST(LoginThrottleRegression, AbandonedFirstLegsAreChargedToTheThrottleRegressio
     EXPECT_EQ(rig.gw.loginsAbandoned(), 3u);
 }
 
+// ── Adversarial review of PR #522 (#131 / #132) ────────────────────────────────────────────────────────────────────
+// A final refused by the throttle never looks at the proof - so it is no verdict, and the first leg it follows (allowed,
+// its salts revealed) was abandoned.  Before the fix the refused final marked the episode charged: an attacker parked N
+// first legs (all allowed: nothing charged yet), spent 3 wrong finals to open the 250 ms delay, then sent the other N-3
+// finals into it - N first-leg probes for the price of 3 failures, and a 250 ms schedule.
+TEST(LoginThrottleRegression, ThrottleRefusedFinalsStillChargeTheirFirstLegsAdversarialRegression) {
+    Rig rig;
+    constexpr int kSessions = 12;
+    std::vector<FirstLeg> legs;
+    for (int i = 0; i < kSessions; ++i) {
+        legs.push_back(sendFirst(rig, "ws1"));
+        ASSERT_TRUE(legs.back().first.has_value()) << i;
+    }
+    int verified = 0, limited = 0;
+    for (const FirstLeg& f : legs) {
+        rig.send(finalFor(f, "ws1", {"a wrong guess", "another wrong guess"}));
+        const auto fin = lastFinal(rig, f.sid);
+        ASSERT_TRUE(fin.has_value());
+        EXPECT_FALSE(rig.gw.hasSessionForTest(f.sid));
+        if (fin->retryAfterMs > 0) ++limited; else ++verified;
+    }
+    ASSERT_EQ(verified, 3);
+    ASSERT_EQ(limited, kSessions - 3);
+    EXPECT_EQ(rig.gw.loginsFailed(), 3u) << "a refused final is still not a verified guess";
+    EXPECT_EQ(rig.gw.loginsAbandoned(), static_cast<uint64_t>(kSessions - 3)) << "each refused final's first leg is charged";
+    // 12 pair failures: the 10th over the free 2 -> min(250 ms << 9, 30 s) = 30 s, not the 250 ms of 3 failures.
+    rig.gw_now = 1'000'000'000; rig.gw.setNowNsForTest(rig.gw_now);
+    const FirstLeg after = sendFirst(rig, "ws1", "10.0.0.9", rig.gw_now);
+    EXPECT_FALSE(after.first.has_value()) << "the parked probes moved the schedule";
+    ASSERT_TRUE(lastFinal(rig, after.sid).has_value());
+    EXPECT_EQ(lastFinal(rig, after.sid)->retryAfterMs, 29'000u);
+}
+
+// Every way an AuthAwaitingFinal session ends charges its first leg exactly once (closeSession_ is the one funnel):
+// a Disconnect, a request before the final (the gate ends it), the auth deadline.  A session that never sent a first
+// leg, an authenticated one, and a second close of the same session charge nothing.
+TEST(LoginThrottleRegression, EveryCloseOfAnAwaitingFinalSessionChargesItOnceAdversarialRegression) {
+    Rig rig;
+    auto disconnect = [&](int64_t sid) {
+        pc::Disconnect d; d.sessionId = sid; d.correlationId = ++rig.corr;
+        std::vector<uint8_t> b(pc::Disconnect::ENCODED_SIZE); b.resize(d.encode(b.data()));
+        rig.send(b);
+    };
+    uint64_t expected = 0;
+    {   // Disconnect, then the same Disconnect again
+        const FirstLeg f = sendFirst(rig, "ws1", "10.1.0.1");
+        ASSERT_TRUE(f.first.has_value());
+        disconnect(f.sid);
+        EXPECT_FALSE(rig.gw.hasSessionForTest(f.sid));
+        EXPECT_EQ(rig.gw.loginsAbandoned(), ++expected) << "disconnect";
+        disconnect(f.sid);
+        EXPECT_EQ(rig.gw.loginsAbandoned(), expected) << "a second close of a gone session";
+    }
+    {   // a request before the final: the gate answers 44 and ends the session
+        const FirstLeg f = sendFirst(rig, "ws1", "10.1.0.2");
+        ASSERT_TRUE(f.first.has_value());
+        rig.send(defineTopicFrame(f.sid, ++rig.corr));
+        EXPECT_FALSE(rig.gw.hasSessionForTest(f.sid));
+        EXPECT_EQ(rig.gw.loginsAbandoned(), ++expected) << "gate";
+    }
+    {   // never a first leg (no salt revealed): a disconnect is not an abandoned first leg
+        const int64_t sid = rig.newSession("10.1.0.3");
+        disconnect(sid);
+        EXPECT_FALSE(rig.gw.hasSessionForTest(sid));
+        EXPECT_EQ(rig.gw.loginsAbandoned(), expected) << "awaiting first";
+    }
+    {   // authenticated, then disconnected
+        const auto ok = rig.login("ws1", {kTestPasswordA, ""}, "10.1.0.4");
+        ASSERT_EQ(ok.fin->errorCode, 0);
+        disconnect(ok.sid);
+        EXPECT_FALSE(rig.gw.hasSessionForTest(ok.sid));
+        EXPECT_EQ(rig.gw.loginsAbandoned(), expected) << "authenticated";
+    }
+    {   // the auth deadline: charged once although the reap also counts it a failed (timed-out) login
+        const FirstLeg f = sendFirst(rig, "ws1", "10.1.0.5");
+        ASSERT_TRUE(f.first.has_value());
+        const uint64_t failedBefore = rig.gw.loginsFailed();
+        rig.gw_now = 1'000'000'001; rig.gw.setNowNsForTest(rig.gw_now);
+        rig.gw.reapExpiredForTest(rig.gw_now);
+        EXPECT_FALSE(rig.gw.hasSessionForTest(f.sid));
+        EXPECT_EQ(rig.gw.loginsAbandoned(), ++expected) << "deadline";
+        EXPECT_EQ(rig.gw.loginsFailed(), failedBefore + 1);
+        rig.gw.reapExpiredForTest(rig.gw_now + 1);
+        EXPECT_EQ(rig.gw.loginsAbandoned(), expected) << "a second reap";
+    }
+}
+
+// #131 through the gateway: an attacker spreading abandoned first legs and wrong finals for ws1 over 200 source
+// hosts (the host is attacker-influenced) never delays ws1 at a host it logged in from, and delays it at a NEW host
+// by the 2 s user cap at most - never a lockout, gone once the cap has passed.
+TEST(LoginThrottleRegression, ManyHostsAgainstOneUserDelayAKnownPairNeverAndANewHostByTheCapAdversarialRegression) {
+    Rig rig;
+    ASSERT_EQ(rig.login("ws1", {kTestPasswordA, ""}, "10.0.0.9").fin->errorCode, 0) << "the user's own host";
+    for (int h = 0; h < 200; ++h) {
+        const std::string host = "198.51." + std::to_string(h / 250) + "." + std::to_string(h % 250);
+        for (int k = 0; k < 2; ++k) {
+            const FirstLeg f = sendFirst(rig, "ws1", host, rig.gw_now);
+            if (!f.first) continue;   // the user component already refuses this host's legs
+            if (k == 0) {
+                rig.send(finalFor(f, "ws1", {"a wrong guess", "another wrong guess"}));
+            } else {
+                pc::Disconnect d; d.sessionId = f.sid; d.correlationId = ++rig.corr;
+                std::vector<uint8_t> b(pc::Disconnect::ENCODED_SIZE); b.resize(d.encode(b.data()));
+                rig.send(b);
+            }
+        }
+    }
+    EXPECT_GE(rig.gw.loginsFailed() + rig.gw.loginsAbandoned(), 11u) << "the campaign reached the user component";
+    const auto home = rig.login("ws1", {kTestPasswordA, ""}, "10.0.0.9");
+    ASSERT_TRUE(home.fin.has_value());
+    EXPECT_EQ(home.fin->errorCode, 0) << "a known pair bypasses the user component";
+    const FirstLeg fresh = sendFirst(rig, "ws1", "10.0.0.77", rig.gw_now);
+    EXPECT_FALSE(fresh.first.has_value()) << "a new host is delayed by the user component";
+    const auto refused = lastFinal(rig, fresh.sid);
+    ASSERT_TRUE(refused.has_value());
+    EXPECT_GT(refused->retryAfterMs, 0u);
+    EXPECT_LE(refused->retryAfterMs, 2'000u) << "the user cap, never a lockout";
+    rig.gw_now += static_cast<int64_t>(refused->retryAfterMs) * 1'000'000; rig.gw.setNowNsForTest(rig.gw_now);
+    EXPECT_EQ(rig.login("ws1", {kTestPasswordA, ""}, "10.0.0.77").fin->errorCode, 0) << "the cap passed";
+}
+
 // The SecurityDdl trailer under version skew and garbage, at the gateway: an OLD client's own change (no trailer) and
 // a FORCE-only trailer are refused 45 with the fixed text; an explicit zero flags byte, an unknown flag bit and a
 // proof flag with a short proof are malformed (InvalidRequest); none reaches the admin thread.  A NEW client's frame

@@ -74,7 +74,7 @@ public:
     }
 
     struct Login {
-        int64_t sessionId = 0;
+        int64_t sessionId = 0, correlationId = 0;
         std::string clientNonce;
         std::optional<pc::AuthServerFirst> first;
         std::vector<uint8_t> firstBytes, finalBytes;
@@ -104,6 +104,7 @@ public:
         out.clientNonce = rune::crypto::scram::makeNonce();
         pc::AuthClientFirst cf;
         cf.sessionId = sid; cf.correlationId = cl_.nextCorrelationId(); cf.username = user; cf.clientNonce = out.clientNonce;
+        out.correlationId = cf.correlationId;
         std::vector<uint8_t> b(cf.encodedSize());
         b.resize(cf.encode(b.data()));
         if (!cl_.send(channel, kClientStream, b.data(), b.size())) return out;
@@ -141,6 +142,21 @@ public:
     }
 
     /// The real client's shape: one password tried against every listed salt.
+    /// The final leg of a first leg parked by login(..., sendFinal=false): fills `l.fin` (the AuthServerFinal).
+    void finish(const std::string& channel, Login& l, const std::string& user, const std::array<std::string, 2>& passwords,
+                std::chrono::milliseconds within = std::chrono::seconds{20}) {
+        if (!l.first) return;
+        l.answer = scramAnswer(user, l.clientNonce, *l.first, passwords, l.sessionId, l.correlationId, 0, nullptr);
+        if (!l.answer) return;
+        std::vector<uint8_t> fb(l.answer->final.encodedSize());
+        fb.resize(l.answer->final.encode(fb.data()));
+        if (!cl_.send(channel, kClientStream, fb.data(), fb.size())) return;
+        if (const auto fin = cl_.awaitAuthFinal(l.correlationId, Clock::now() + within)) {
+            l.finalBytes = fin->bytes;
+            l.fin = pc::AuthServerFinal::decode(l.finalBytes.data(), l.finalBytes.size());
+        }
+    }
+
     Login connectAndLogin(const std::string& channel, const std::string& user, const std::string& password,
                           int32_t clientVersion = pc::kClientVersionAuth) {
         const int64_t sid = connect(channel, clientVersion);
