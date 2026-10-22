@@ -62,6 +62,7 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -4789,6 +4790,172 @@ TEST(MetadataBelowCommittedRegression, ReportForANonCoordinatorInternalPartition
         EXPECT_EQ(resp.proposalId, m.proposalId);
         EXPECT_EQ(c.svc->lostCommittedReports(), 0u);
     }
+}
+
+// ---------------------------------------------------------------------------
+// PR #548 review (adversarial, #93): the area is every reply path of the below-committed report, on the transport's
+// real entry (MetadataService::onAlterIsrThunk), and the follower that sends it.
+// ---------------------------------------------------------------------------
+namespace {
+struct ThunkAnswer { bool answered; rune::replication::AlterIsrResponseMsg resp; };
+ThunkAnswer viaThunk(CtlRig& c, const rune::replication::AlterIsrMsg& m) {
+    ThunkAnswer a{false, {}};
+    a.answered = MetadataService::onAlterIsrThunk(c.svc.get(), m, a.resp);
+    return a;
+}
+}  // namespace
+
+// Input bounds over the internal key space: a coordinator rig ((-1, 0) on the controller path) answers EVERY
+// non-coordinator internal partition (another partition of a coordinator topic, every other internal id, the extremes)
+// Fenced at partitionEpoch -1 with the correlation ids echoed, records nothing - while the coordinator key itself is
+// still DECIDED (Ok + recorded at its leader epoch, Fenced at its own partitionEpoch for a stale one).
+// RED (revert #93): every non-coordinator row is unanswered.  RED (over-broad fix: answer every negative topic moot):
+// the (-1, 0) rows.
+TEST(MetadataBelowCommittedRegression, EveryNonCoordinatorInternalKeyIsAnsweredMootAndTheCoordinatorKeyDecidedAdversarialRegression) {
+    using namespace rune::replication;
+    CtlRig c(/*userTopics=*/false);
+    ASSERT_TRUE(c.svc->controllerReady());
+    {   // the coordinator key before its first assignment: answered Fenced (nothing to decide yet), never dropped
+        ASSERT_EQ(c.svc->assignment(-1, 0), nullptr);
+        const auto a = viaThunk(c, belowCommittedReport(2, 1, -1));
+        ASSERT_TRUE(a.answered);
+        EXPECT_EQ(a.resp.errorCode, kAlterIsrFencedLeaderEpoch);
+        EXPECT_EQ(a.resp.partitionEpoch, -1);
+    }
+    c.tick();
+    const PartitionAssignment* coord = c.svc->assignment(-1, 0);
+    ASSERT_NE(coord, nullptr) << "the coordinator partition was never assigned";
+    const int32_t le = coord->leaderEpoch, pe = coord->partitionEpoch, leader = coord->leaderNode;
+    ASSERT_GE(leader, 1);
+    const int32_t reporter = leader == 2 ? 3 : 2;
+    struct Row { int32_t topic; int32_t partition; };
+    const Row moot[] = {{-1, 1}, {-1, 0x7fffffff}, {-1, -1}, {-2, 0}, {-3, 0}, {-4, 0}, {-5, 0}, {-6, 0}, {-7, 0},
+                        {-9, 0}, {-99, 0}, {-101, 0}, {std::numeric_limits<int32_t>::min(), 0}};
+    uint32_t pid = 0x5000;
+    for (const Row& row : moot) {
+        SCOPED_TRACE(testing::Message() << "topic " << row.topic << " partition " << row.partition);
+        auto m = belowCommittedReport(reporter, le, row.topic);
+        m.partition = row.partition; m.proposalId = ++pid; m.sendSeq = static_cast<int32_t>(pid);
+        const auto a = viaThunk(c, m);
+        ASSERT_TRUE(a.answered) << "never answered: the follower re-sends every 50 ms forever";
+        EXPECT_EQ(a.resp.errorCode, kAlterIsrFencedLeaderEpoch);
+        EXPECT_EQ(a.resp.partitionEpoch, -1);
+        EXPECT_EQ(a.resp.topicId, row.topic);
+        EXPECT_EQ(a.resp.partition, row.partition);
+        EXPECT_EQ(a.resp.leaderId, reporter);
+        EXPECT_EQ(a.resp.leaderEpoch, m.leaderEpoch);
+        EXPECT_EQ(a.resp.proposalId, m.proposalId);
+        EXPECT_EQ(a.resp.sendSeq, m.sendSeq);
+        EXPECT_EQ(c.svc->lostCommittedReports(), 0u) << "a moot report was recorded";
+    }
+    {   // the coordinator key, stale leader epoch: Fenced at ITS partitionEpoch, nothing recorded
+        auto m = belowCommittedReport(reporter, le - 1, -1);
+        m.proposalId = ++pid;
+        const auto a = viaThunk(c, m);
+        ASSERT_TRUE(a.answered);
+        EXPECT_EQ(a.resp.errorCode, kAlterIsrFencedLeaderEpoch);
+        EXPECT_EQ(a.resp.partitionEpoch, pe) << "a coordinator key is never answered moot";
+        EXPECT_EQ(c.svc->lostCommittedReports(), 0u);
+    }
+    {   // the coordinator key at its leader epoch: decided (Ok, recorded once)
+        auto m = belowCommittedReport(reporter, le, -1);
+        m.proposalId = ++pid;
+        const auto a = viaThunk(c, m);
+        ASSERT_TRUE(a.answered);
+        EXPECT_EQ(a.resp.errorCode, kAlterIsrOk) << "the coordinator partition's report was not decided";
+        EXPECT_EQ(a.resp.partitionEpoch, pe);
+        EXPECT_EQ(c.svc->lostCommittedReports(), 1u);
+    }
+}
+
+// Controller change / not-ready controller: while this controller is not ready the report is NOT answered (by design:
+// the follower keeps the fast cadence and the next ready controller answers it); once it is ready again (a takeover of
+// the same node, MSM rebuilt) it answers the very same report.  RED (revert #93): the post-takeover answer is missing.
+TEST(MetadataBelowCommittedRegression, ANotReadyControllerStaysSilentAndTheNextReadyOneAnswersAdversarialRegression) {
+    using namespace rune::replication;
+    CtlRig c(/*userTopics=*/false);
+    ASSERT_TRUE(c.svc->controllerReady());
+    auto m = belowCommittedReport(2, 7, -9);
+    m.proposalId = 0x93;
+    const int32_t e = c.r1->epoch();
+    c.r1->becomeFollower(e + 1, NodeId{-1});
+    c.drive(5);
+    ASSERT_FALSE(c.svc->controllerReady());
+    for (int i = 0; i < 3; ++i) {
+        const auto a = viaThunk(c, m);
+        EXPECT_FALSE(a.answered) << "a not-ready controller answered (it decides nothing)";
+    }
+    c.r1->becomeLeader(e + 2, c.all);
+    c.r2->becomeFollower(e + 2, 1);
+    c.r3->becomeFollower(e + 2, 1);
+    c.drive(100);
+    ASSERT_TRUE(c.svc->controllerReady());
+    const auto a = viaThunk(c, m);
+    ASSERT_TRUE(a.answered) << "the new ready controller dropped the report";
+    EXPECT_EQ(a.resp.errorCode, kAlterIsrFencedLeaderEpoch);
+    EXPECT_EQ(a.resp.partitionEpoch, -1);
+    EXPECT_EQ(a.resp.proposalId, int64_t{0x93});
+    EXPECT_EQ(a.resp.controllerEpoch, c.svc->controllerEpochForTest()) << "the answer names the new controller epoch";
+    EXPECT_EQ(c.svc->lostCommittedReports(), 0u);
+}
+
+// The issue's symptom end to end: a REAL refusing follower of an internal non-coordinator partition (-9), wired to the
+// real controller through its ISR channel (each report into onAlterIsrThunk, each answer back into onAlterIsrResponse
+// after the duty cycle, as the transport delivers it), reports at most once a second once answered - and keeps
+// reporting (the refusal is never silent).  RED (revert #93): ~40 reports in 2 s (the 50 ms cadence).
+TEST(MetadataBelowCommittedRegression, ARefusingInternalFollowerSlowsToTheOneSecondCadenceEndToEndAdversarialRegression) {
+    using namespace rune::replication;
+    CtlRig c(/*userTopics=*/false);
+    ASSERT_TRUE(c.svc->controllerReady());
+    struct LoopIsr final : InMemoryTransport {
+        MetadataService* ctl = nullptr;
+        std::vector<AlterIsrResponseMsg> answers;
+        int reports = 0;
+        bool sendAlterIsr(const AlterIsrMsg& m) override {
+            if (m.isrCount == AlterIsrMsg::kLeaderEpochBump && (m.isr[1] & AlterIsrMsg::kBumpLeaderBelowCommitted) != 0)
+                ++reports;
+            AlterIsrResponseMsg resp{};
+            if (MetadataService::onAlterIsrThunk(ctl, m, resp)) answers.push_back(resp);
+            return true;
+        }
+        bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+        bool sendFetchRequestTo(NodeId, const FetchRequestMsg&) override { return true; }
+    };
+    SaeTempDir d{"m11rev93"};
+    rune::storage::Log log{d.path};
+    log.recover();
+    LoopIsr t;
+    t.ctl = c.svc.get();
+    PartitionConfig cfg = makeMetaCfg(2);
+    cfg.topicId = -9;
+    cfg.pushOnAppend = false; cfg.fastAckOnApply = false;
+    PartitionReplica r(cfg, Role::Follower, 0, {1, 2, 3}, {1, 2, 3}, &log, &t);
+    r.setIsrChannel(&t);
+    r.becomeFollower(5, 1);
+    for (int i = 0; i < 10; ++i) {   // 10 records applied, HW 10 learned in epoch 5
+        std::vector<uint8_t> p(8, static_cast<uint8_t>(i));
+        FetchResponseMsg dr{};
+        dr.topicId = -9; dr.leaderEpoch = 5; dr.partition = 0; dr.errorCode = kErrNone; dr.highWatermark = i + 1;
+        dr.records = std::span<const uint8_t>(p.data(), p.size());
+        r.applyReplicated(dr);
+    }
+    ASSERT_EQ(r.highWatermark(), 10);
+    FetchResponseMsg div{};
+    div.topicId = -9; div.leaderEpoch = 5; div.partition = 0; div.errorCode = kErrDivergingEpoch;
+    ErrorPayloadBuf b;
+    div.records = b.set(5, 3);   // the leader's lineage ends at 3 < 10 committed
+    r.applyReplicated(div);
+    ASSERT_TRUE(r.truncationRefusedForTest());
+    int64_t now = 1'000'000'000;
+    for (int i = 0; i < 200; ++i) {   // 2 s in 10 ms duty cycles
+        (void)r.doWork(now += 10'000'000);
+        for (const auto& a : t.answers) r.onAlterIsrResponse(a);
+        t.answers.clear();
+    }
+    EXPECT_GE(t.reports, 2) << "the refusal went silent";
+    EXPECT_LE(t.reports, 3) << "the report was never answered: it kept the 50 ms cadence";
+    EXPECT_TRUE(r.truncationRefusedForTest());
+    EXPECT_EQ(c.svc->lostCommittedReports(), 0u);
 }
 
 // A-I4: the request survives an unrelated partitionEpoch change: the refusing follower re-sends, the newer report
