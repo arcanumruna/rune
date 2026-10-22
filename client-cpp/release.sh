@@ -3,7 +3,7 @@
 #
 # Cuts a client-cpp release from main: VERSION.txt X.Y.Z-snapshot -> X.Y.Z, tags client-cpp-vX.Y.Z,
 # sets the next snapshot and pushes both commits and the tag. The tag push triggers
-# .github/workflows/client-cpp-release.yml, which builds and tests the Conan package, uploads it to the
+# .github/workflows/client-cpp-release.yml, which builds the Conan package, uploads it to the
 # Conan remote and publishes a GitHub Release with a source tarball.
 # The "client-cpp-" prefix keeps client tags apart from the other components' tags in this monorepo.
 set -euo pipefail
@@ -58,7 +58,7 @@ echo "$RELEASE_VERSION" > VERSION.txt
 git add VERSION.txt
 git commit -m "release: client-cpp $RELEASE_VERSION"
 
-# 2. Tag with release notes (commits touching the client's sources since the previous broker tag)
+# 2. Tag with release notes (commits touching the client's sources since the previous client tag)
 PREV_TAG=$(git describe --tags --abbrev=0 --match 'client-cpp-v*' HEAD~1 2>/dev/null || echo "")
 RANGE=${PREV_TAG:+$PREV_TAG..}HEAD~1
 NOTES=$(git log "$RANGE" --pretty=format:"- %s" --no-merges \
