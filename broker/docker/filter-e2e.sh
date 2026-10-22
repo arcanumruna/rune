@@ -209,7 +209,7 @@ probe_args() {
     printf -- '-e\nRUNE_DATA_DIR=/tmp/fp\n-e\nRUNE_TIMEOUT_MS=30000\n-e\nRUNE_SEED=%s\n-e\nFILTER_E2E_N=%s\n-e\nFILTER_E2E_RATE=%s\n-e\nFILTER_E2E_CAP=%s\n' "${SEED}" "${N}" "${RATE}" "${CAP}"
     printf -- '-e\nFILTER_E2E_SHARED=/shared\n-v\n%s:/shared\n' "${SHARED}"
     [ -z "${TOPIC_TABLE}" ] || printf -- '-e\nRUNE_CLIENT_TOPIC_TABLE=%s\n' "${TOPIC_TABLE}"
-    printf -- '-e\nRUNE_USER=%s\n-e\nRUNE_PASSWORD_FILE=/work/e2e.pw\n-v\n%s:/work:ro\n' "${RUNE_AUTH_E2E_USER}" "${RUNE_AUTH_WORK_DIR}"
+    printf -- '-e\nRUNE_USER=%s\n-e\nRUNE_PASSWORD_FILE=/work/e2e.pw\n-e\nRUNE_TLS_CA_FILE=/work/ca.pem\n-v\n%s:/work:ro\n' "${RUNE_AUTH_E2E_USER}" "${RUNE_AUTH_WORK_DIR}"
     local kv
     for kv in "$@"; do printf -- '-e\n%s\n' "${kv}"; done
 }
