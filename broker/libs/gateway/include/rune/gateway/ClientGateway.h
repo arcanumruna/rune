@@ -1431,6 +1431,12 @@ public:
         return it == subscriptions_.end() ? -1 : it->second.nextOffset;
     }
 
+    /// Test-only: the in-flight record-egress registration id of (sessionId, worker), or -1 when none.
+    [[nodiscard]] int64_t recordEgressRegIdForTest(int64_t sessionId, int32_t worker) const {
+        const auto it = pendingRecordEgress_.find({sessionId, worker});
+        return it == pendingRecordEgress_.end() ? -1 : it->second.regId;
+    }
+
     // -----------------------------------------------------------------------
     // pendingConnectCount — number of in-flight async egress-resolve entries.
     // Includes both the main pending table and the draining-release table.
@@ -2115,6 +2121,11 @@ private:
     // Never blocks.
     // -----------------------------------------------------------------------
     void drainPendingReleases();
+
+    // abandonRegistration_ — release an addExclusivePublication registration whose owner is dropped while it may still
+    // be in flight (connect timeout / eviction, record-egress session close / resolve timeout).  Resolves and drops it,
+    // or queues it on drainingRegistrations_ until it does (see drainPendingReleases above).  regId < 0 = nothing.
+    void abandonRegistration_(int64_t regId) noexcept;
 
     // -----------------------------------------------------------------------
     // Members

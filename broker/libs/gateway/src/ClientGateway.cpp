@@ -1469,19 +1469,7 @@ void ClientGateway::evictOldestPendingConnect_()
     // worker ack-table slots — close it on every worker (never leaked).
     closeDroppedPendingConnect_(pendingConnects_.front());
     pendingConnects_.pop_front(); // O(1); drops resolvedPub shared_ptr if non-null
-    if (!evictedAlreadyResolved && aeron_) {
-        try {
-            // Attempt immediate release by resolving and dropping the shared_ptr.
-            auto pub = aeron_->findExclusivePublication(evictedRegId);
-            if (!pub) {
-                // Still AWAITING_MEDIA_DRIVER — keep draining until it resolves.
-                drainingRegistrations_.push_back(evictedRegId);
-            }
-            // If pub non-null: drops here → ~ExclusivePublication() releases registration.
-        } catch (...) {
-            // ERRORED_MEDIA_DRIVER: conductor erased the entry and threw — no leak.
-        }
-    }
+    if (!evictedAlreadyResolved && aeron_) abandonRegistration_(evictedRegId);
     // If evictedAlreadyResolved: the drop of resolvedPub in pop_front() already
     // releases the registration — no findExclusivePublication needed, no drain entry.
 }
@@ -1597,7 +1585,9 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     // Hybrid egress: drop any in-flight record-egress resolves for this session
     // (all workers — its buffered subscribes die with the session).
     for (auto pit = pendingRecordEgress_.begin(); pit != pendingRecordEgress_.end(); ) {
-        pit = (pit->first.first == sid) ? pendingRecordEgress_.erase(pit) : std::next(pit);
+        if (pit->first.first != sid) { ++pit; continue; }
+        abandonRegistration_(pit->second.regId);   // a registration still in flight is released, not leaked
+        pit = pendingRecordEgress_.erase(pit);
     }
 
     dropSessionSubscriptions_(sid);
@@ -2377,21 +2367,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             // is closed on every worker — the client never learned its id.
             closeDroppedPendingConnect_(pending);
             it = pendingConnects_.erase(it); // drops resolvedPub shared_ptr if non-null
-            if (!alreadyResolved) {
-                // Publication not yet resolved: enqueue in drain table.
-                // If resolved (non-null shared_ptr): drop immediately.
-                // If throws (ERRORED): conductor already cleaned up.
-                // If nullptr (still AWAITING): enqueue to keep polling until resolved.
-                try {
-                    auto pub = aeron_->findExclusivePublication(timedOutRegId);
-                    if (!pub) {
-                        drainingRegistrations_.push_back(timedOutRegId);
-                    }
-                    // pub non-null: drops here → destructor releases registration.
-                } catch (...) {
-                    // ERRORED_MEDIA_DRIVER: conductor erased the entry — no leak.
-                }
-            }
+            if (!alreadyResolved) abandonRegistration_(timedOutRegId);
             continue;
         }
 
@@ -2818,6 +2794,19 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
     }
 
     pendingConnects_.erase(it);
+}
+
+// abandonRegistration_ — release an addExclusivePublication registration whose owner is dropped while it may still be
+// in flight.  Resolve it and drop the shared_ptr (the destructor releases it), or queue it on drainingRegistrations_
+// until it resolves — see the drainPendingReleases doc below.  A throw means ERRORED_MEDIA_DRIVER: the conductor
+// already cleaned up, nothing leaks.  regId < 0 = nothing was registered.
+void ClientGateway::abandonRegistration_(int64_t regId) noexcept
+{
+    if (regId < 0 || !aeron_) return;
+    try {
+        auto pub = aeron_->findExclusivePublication(regId);
+        if (!pub) drainingRegistrations_.push_back(regId);   // still AWAITING_MEDIA_DRIVER: keep draining
+    } catch (...) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -4594,6 +4583,7 @@ void ClientGateway::pollPendingRecordEgress_(int64_t nowNs)
                              ? "retired NotLeader (no shared-egress fallback under authentication)"
                              : "falling back to MDC");
             for (const auto& w : pend.waiters) releaseAwaiting_(w, nullptr);
+            abandonRegistration_(pend.regId);   // timed out while still in flight: release it (regId < 0 = nothing)
             it = pendingRecordEgress_.erase(it);
             continue;
         }
