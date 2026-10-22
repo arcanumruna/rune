@@ -1,0 +1,436 @@
+# Wide view keys, prefix reads and write-time view constraints
+
+Status: design, 2026-10-22. Not yet approved.
+
+## 1. Why
+
+The RegressorsPath backend is moving off Postgres onto Rune, one service at a time. The first two services, auth-server and character-server, need three things Postgres gives them today and Rune lacks:
+
+- A character name that is unique without regard to case.
+- At most 12 characters per user, with no race between concurrent creates. (Today's Postgres version does race.)
+- A list of one user's characters.
+
+The owner's design rules, as stated:
+
+- Uniqueness and limits are enforced through materialized views. A write returns success only once the views reflect it. A write that would break a rule fails and leaves no trace.
+- Definitions are written in Rune QL, not built in code.
+- A delete is a tombstone. Views follow tombstones automatically, so nothing filters on an `isDelete` field.
+- Views are clustered indexes. There are no array or `collect()` columns: a user's characters are rows under a composite key.
+- The 12-character cap is a `check` constraint on a `count(*)` aggregate view.
+
+Target definitions. Each of these must work end to end when the work is done:
+
+```sql
+topic character {
+  characterId uint64, userId uint64,
+  name string(16), gender uint16,
+  hairSkin uint16, hairSheet uint16, headSkin uint16, /* …the rest of the appearance fields… */
+  createdAt int64, lastPlayed int64
+} partitions 1 replicas 3 key characterId
+  with (cleanup.policy = compact, tier = majority);
+
+create view character_by_id key characterId as select * from character;
+
+create unique view character_name key lower(name) as nameKey as
+  select characterId from character;
+
+create view account_characters key (userId, characterId) as
+  select name, gender, hairSkin, /* … */ lastPlayed from character;
+
+create view account_stats key userId as
+  select count(*) as characters from character group by userId
+  constraint max_characters check (characters <= 12);
+```
+
+```sql
+select * from account_characters where userId = 42;              -- prefix read
+select characterId from character_name where nameKey = lower('Foo');  -- point read
+```
+
+## 2. Goals, non-goals, anti-goals
+
+**Goals**
+
+- G1. View keys of up to 64 bytes: composite keys of several columns, and key expressions (`lower(field)`).
+- G2. Point reads by a full key of any width. Prefix reads by the leading key columns.
+- G3. `unique` projection views. A write that would give a key to a second source record is rejected.
+- G4. `check` constraints on aggregate views. A write that would push a group past the limit is rejected.
+- G5. Rejection happens before the append. A rejected batch takes no offset, uses no producer sequence and has no effect on any view.
+- G6. Correct under:
+  - concurrent writers
+  - writes within one batch
+  - transactions that commit or abort
+  - ack timeouts
+  - leader failover
+  - restart
+  - log truncation
+- G7. Rune QL `create [unique] view … as select …`, `select … from <view> where …`, and CLI output for both.
+- G8. Topics without constraints pay nothing on the produce path, apart from one branch that is never taken.
+
+**Non-goals for this work**
+
+- Ordered indexes and range scans (`between`, `<`, `order by`).
+- Unique or derived-key views over sources with more than one partition. This needs partition-key alignment and comes later.
+- Joins, cascades across topics, and views over views.
+- `where` filters inside a view definition.
+- Check constraints on anything other than `count` with an upper bound.
+- Insert-only writes and server-assigned ids (see §11).
+- Constraints over transient sources. A constrained view needs a persisted source, because a transient ring does not survive failover and the overlay could not be rebuilt from it.
+
+**Anti-goals.** Any of these makes the work a failure even if the features otherwise run:
+
+- A rule can be broken, even for a moment, by any interleaving the system allows.
+- A client is told a write failed when it was in fact stored, or the reverse.
+- Throughput or latency gets worse for topics that have no constraints.
+- The hot path allocates, takes a lock or makes a virtual call.
+
+## 3. Must land first
+
+**#537: views fold records from aborted transactions.** The constraints treat view state as committed truth, so this must be fixed and re-folded first.
+
+## 4. Keys
+
+**4.1 Key forms**
+
+- `key <col>`: a single column. This is today's form.
+- `key (<col>, <col>, …)`: a composite key.
+- `key lower(<col>) as <name>`: a key expression. It is valid only on `string(N)` columns.
+  - The key column appears in the output under `<name>`.
+  - It holds the lowercased bytes.
+- `lower` maps ASCII A–Z to a–z and leaves every other byte unchanged.
+  - Character names are `[A-Za-z0-9]{1,16}`, so this is exact for the first users.
+  - Locale-aware folding is a non-goal, and the docs must say so.
+- Key columns must have fixed width: integers, `bool`, `string(N)`. Var-length `string` and `bytes` are rejected at compile time.
+- The total key width K is at most 64 bytes.
+
+**4.2 Identity rule.** A projection view that is not `unique` must be functionally keyed by the source record: its key must include the source key column. `account_characters` includes `characterId`, so it passes.
+
+A projection whose key could collide across source records must be declared `unique`. The compiler rejects it otherwise, with the message "key does not identify the source record; declare the view unique or include <sourceKey>". This closes the "two records, one view row, last writer wins" hole.
+
+**4.3 Encoding.** Key bytes are order-preserving, so a later ordered index or checkpoint needs no re-encoding:
+
+- Unsigned integers: big-endian.
+- Signed integers: big-endian with the sign bit flipped.
+- `bool`: one byte.
+- `string(N)`: N bytes, zero-padded.
+
+Names cannot contain NUL, so zero padding cannot make two different names collide. In general a collision can only cause a false reject, never a false accept.
+
+**4.4 Partitioning.** Derived keys and composite keys need a one-partition source in this work, the same rule aggregates follow today (`ViewNotCoPartitioned`). Reads for such views always route to partition 0.
+
+## 5. Storage (`ViewTable`)
+
+**5.1 Index slot.** It stays 13 bytes: `tag u8 | word u64 | rid u32`.
+
+- If K ≤ 8, `word` holds the raw key, as today, and the compare is exact with no trip to the arena. Existing views get no slower.
+- If K > 8, `word` holds a cached 64-bit hash of the key bytes.
+  - A lookup matches on tag and then hash, and only then compares the key bytes in the row (`memcmp`).
+  - Growth migration and backward-shift deletes use the cached hash and never touch the arena.
+
+**5.2 Hash.** The index hash is a seeded 64-bit hash, such as rapidhash, with a random seed per worker. Players choose names, so an unseeded hash would let them craft probe chains and stall the leader thread.
+
+The hash never leaves the process. Partition routing keeps its deterministic FNV-1a.
+
+**5.3 Row.** For K > 8 the key bytes are stored once in the arena row, next to the existing null bitmap and slots. The exact layout is the builder's call, but the key bytes must not be stored in a way that can diverge from the key column values.
+
+**5.4 Prefix index.** A composite key of n columns gets exactly one prefix index, over its first n−1 columns. A shorter-prefix read is rejected at compile time with "needs an ordered index".
+
+- The prefix index is a second hash index from prefix hash to the head rid. A match is confirmed by comparing the prefix bytes in the head row, so no prefix bytes are stored separately.
+- Rows sharing a prefix are linked through `prev`/`next` rid fields in the row. Insert and erase are O(1).
+- A scan walks the list. The order is unspecified. The client sorts if it needs an order; character-server sorts by `characterId`.
+
+**5.5 Owner map.** This applies to views whose key is not the source wire key (derived or composite).
+
+- A per-instance table maps the source wire key to the rid of its current view row. A tombstone carries no value, so this map is the only way to find the row to erase.
+- On an update, the fold computes the new view key. If it differs (a rename, say), the fold erases the old row and then inserts the new one.
+- This is the same retraction pattern as the aggregate `contributors` table.
+
+**5.6 Checkpoint v3.**
+
+- A new magic number.
+- Entries carry the K-byte key in place of `key u64`.
+- The owner map and prefix index are a new table id, or are rebuilt on replay. The builder chooses, but replay must reproduce identical lookup behavior.
+- The hash is never persisted; replay recomputes it.
+- v1 and v2 checkpoints still load.
+
+**5.7 Unique conflicts during folding.** After §6 these can only come from data that existed before the unique view was created.
+
+- The fold keeps the first source record by offset as the owner.
+- A later conflicting record is not inserted into the unique view. It is counted in a `uniqueConflicts` stat, which `show view` reports.
+- Other views over the same topic still contain that record.
+- This behavior is deterministic across leaders and restarts.
+- Migration back-fills must remove duplicates first, the same way Postgres migration V14 did.
+
+## 6. Write-time constraints
+
+**6.1 What is checked**
+
+- `unique` view V: a record whose derived key is already owned by a different source key, in V or in the overlay (§6.3), is a violation.
+- `check (c <= N)` or `check (c < N)` on a `count(*)` / `count(col)` aggregate view: the group's folded contributor count plus its pending increments, minus its proven pending decrements (§6.4), must stay within the bound after the record.
+  - A record counts as an increment only if it adds a new contributor to that group.
+  - An update to an existing member of the same group is not an increment.
+  - A move between groups is an increment for the new group and a decrement for the old one.
+- A retraction (a tombstone, or a move out of a group) is never rejected. A group already over its limit may shrink.
+- Any other check form fails at compile time with "check supports count(…) <= / < constant".
+
+**6.2 Where it runs**
+
+The check runs on the partition leader's produce path, after idempotent dedupe and before the append. Concretely, it sits in `handleProduceBatch` between `producerState.validate` (`ProducePath.cpp:205`) and the min-ISR gate and append.
+
+It must come after dedupe. Otherwise, a retry of a batch that was already stored could be rejected (create X, delete X, retry the create) even though the original write succeeded.
+
+The hook is a template policy parameter, not a virtual call or a `std::function`.
+
+- **Zero cost when unused.** The constraint state is reached through a pointer stored next to the partition's `RcSlot`. A partition without constraints has `nullptr`, so the hook is one `[[unlikely]]` branch.
+- **When the hook runs:**
+  1. Decode only the fields that feed keys or groups, using the fold's per-writer-version descriptor cache.
+  2. Compute each key's hash once and probe both the view table and the overlay with it.
+  3. Check every record of the batch in order against a scratch overlay, so a batch can collide with itself (13 creates, or two names that collide).
+  4. If any record violates a rule, reject the whole batch. Nothing is appended and nothing is reserved.
+  5. If the batch passes, merge the scratch entries into the overlay, tagged with the offsets the append assigns. This happens on the same thread, with nothing interleaved.
+- **Several views.** One record can be checked against several constrained views (`character_name` and `account_stats`). It must pass all of them.
+
+**6.3 The pending overlay.** Views fold only up to the LSO, which is bounded by the HW. The overlay covers records between the fold cursor and the log end offset (LEO).
+
+- It is a fixed-capacity, pre-sized, offset-ordered structure for each constrained source partition.
+- Each entry is `{offset, sourceKey, per-view effect, txn pid or none, aborted flag}`.
+  - For a unique view, the effect is the key it claims and the key it releases.
+  - For a check view, it is the old group and the new group.
+- Lookups are by key hash, and also by source key, so that a later pending write sees an earlier pending write to the same record (create then rename, or create then delete then create).
+- **Release:**
+  - Entries leave from the front once the view's fold cursor has passed their offset. Fold cursors are per view; an entry leaves only when every constrained view on the partition has passed it.
+  - An entry is marked aborted when its transaction's abort marker is applied (`rc->onMarker`), and stops counting at once.
+  - Entries at or above a truncation point are dropped from the back.
+  - **An entry is never released when its ack times out.** The record is already in the log.
+- **Capacity.** If the overlay is full, the batch gets a retriable refusal (`TransientLogFull`, which existing clients already retry with the same identity). Size it from the in-flight bound, `maxOwedReturns_` plus the strict-tier pending queue. A full overlay is a stat and a log line.
+
+**6.4 When a pending release may be counted.** A pending tombstone or rename frees a name or a slot for a later write only if one of these holds:
+
+- (a) The releasing record is not transactional.
+- (b) It belongs to the same open transaction as the later write.
+
+This is safe because the log is one ordered sequence. A truncation removes a suffix, so if the releasing record is cut, the later record above it is cut too.
+
+An abort is the one case where an earlier record vanishes while a later one survives. That is why a transactional release counts only within its own transaction.
+
+Pending increments always count: transactional increments from open transactions, and non-transactional increments. So two open transactions cannot both take the 12th slot.
+
+**6.5 Readiness gate.** A constrained write gets retriable `NotLeader` until all of the following hold under the current leadership generation:
+
+- RC is Ready (as `rcGate_` requires today).
+- Every constrained view instance on the partition is Ready: its fold cursor has reached the LSO bound, and the HW has reached `leadershipStartOffset()`.
+- The overlay has been rebuilt by decoding `[foldCursor, LEO)` from the local log. Records of open transactions come from `RcState`.
+
+The overlay is rebuilt whenever `leadershipGeneration` or `logGeneration` changes, and cleared when the node is not the leader. This follows the `RcState` model: convergence from the log with an idempotent restore, never a grace timer.
+
+Restart and view rebuild (`RebuildingViews`) use the same gate.
+
+**6.6 Changing constraints**
+
+- **Create a constrained view.** Writes to the source are refused, retriably, from the moment the view is installed on the leader until it is Ready. After that, enforcement applies to every write. Groups already over the limit are not repaired; they cannot grow until they shrink below it.
+- **Alter (`create or replace`).**
+  - The old view's constraints stay in force until the new instance is Ready.
+  - Then both are swapped in one worker step.
+  - There is never a window with no constraint.
+  - Drop then create does leave a window, and the docs say so.
+- **Drop.** The constraint is removed when the drop is installed on the leader.
+
+## 7. Errors and the client
+
+**7.1 Broker**
+
+- New `ErrorCode::ConstraintViolation = 51`. It is definite: nothing was stored.
+- It is gated on a new client version (12). An older client receives `SchemaValidationFailed` (24), which it already treats as a definite reject.
+- The violated constraint is sent as a u64 id in the `logStartOffset` slot of `ProduceResponse`. This is the same trick D6 uses, so the fixed frame does not grow.
+  - The id is `viewObjectId << 16 | constraintOrdinal`. Ordinal 0 means the view's `unique` rule.
+- `docs/api/wire-protocol.md` documents the code, its gate and the meaning of the slot.
+
+**7.2 Producer** (`ProducerImpl::onProduceResponse`)
+
+- A new definite-reject branch, modeled on the existing "definitely not stored" branch (C4):
+  - The batch fails.
+  - There is no `markUnresolved_` and no epoch bump.
+  - The sequence is not consumed, because the hook runs before the producer-state update.
+- **Batches holding more than one record.** Tier-1 `send()` coalescing can mix unrelated records into one batch. On error 51, the producer resends those records one at a time, in their original order, with the same sequences. Each record then gets its own result. A record that fails alone gets `ConstraintViolation`, and the others succeed.
+  - This keeps per-record semantics even though the broker rejects whole batches.
+  - `p.batch(...)` (an explicit atomic batch) is never split. The whole batch fails.
+- **Result type.** The result exposes `constraintId`. A helper on `Client` resolves it to a `(viewName, constraintName)` pair from the catalog.
+
+**7.3 CLI.** Fix `errorCodeName`: codes 48–50 are missing today. Add 51. Print the name of the violated constraint.
+
+## 8. Reads
+
+**8.1 Messages**
+
+- **`GetViewRowK`** (template 81): a full key of any width as length-prefixed bytes, plus `requestedFingerprint`.
+- **`ScanViewRows`** (82) and **`ScanViewRowsResponse`** (83):
+  - Request: the prefix bytes, a `limit` capped by the broker, and a resume token.
+  - Response: a status, a row count, length-prefixed rows and the next resume token.
+- Both run through the existing pipeline:
+  - the gate in `viewRowGate_`
+  - READ on VIEW authorization
+  - leader-only serving
+  - the read lease
+  - the fold barrier (#82), so a client reads its own acked writes
+  - the restart-readiness gate
+- `GetViewRow` (72) stays for views with K ≤ 8.
+
+**8.2 Bounds**
+
+- A scan response stays under the 68 KiB egress scratch. The worker stops at whichever comes first: `limit`, the byte budget, or a fixed maximum number of rows per op. This bounds work on the leader thread.
+- A single row that doesn't fit still returns `kRowTooLarge`.
+
+**8.3 Consistency**
+
+- **One page is atomic.** It is served in one worker step, so it reflects one fold position.
+- **Across pages there is no snapshot.** The resume token is the last returned key.
+  - If that key is gone when the next page is requested, the response is `kCursorInvalidated` (a new status), and the client restarts the scan.
+  - A user's character list (≤ 12 rows) always fits in one page.
+
+**8.4 Client**
+
+- `getViewRowAndWait(view, keyBytes)` and `scanViewAndWait(view, prefixBytes, limit)`.
+- A typed key builder that encodes values per §4.3 from the view's output descriptor, so callers never hand-encode bytes.
+- New `OpKind`s. Results larger than the completion-ring reservation get `ResultTooLarge`, as today.
+
+## 9. Rune QL and the CLI
+
+**9.1 Grammar additions**
+
+- New tokens: `*`, `<`, `<=`, `>`, `>=`.
+- `create [or replace] [transient] [unique] view <name> key <keyspec> as select <items> from <topic> [group by <cols>] [constraint <name> check (<col> <op> <int>)]*`
+  - `<keyspec>` is `<col>`, `(<col>, …)` or `lower(<col>) as <name>`.
+  - `<items>` is `*`, `<col> [as <name>]`, or an aggregate: `count(*)`, `count(col)`, `sum`, `avg`, `min`, `max` or `last`, with `as`.
+- `select <cols | *> from <view> where <keycol> = <lit> [and …] [limit n]`
+  - All key columns: a point read.
+  - The leading n−1 columns: a scan.
+  - Anything else: a parse-time error.
+  - Literals may be wrapped in `lower('…')`, which applies the same rule as §4.1.
+- The constraint is enforced as soon as the view is Ready, so the DDL has no separate enforcement switch.
+
+**9.2 Pipeline**
+
+- **AST.** `CreateViewDef` and `SelectDef`, appended to the `Statement` variant.
+- **Plan.** `prepare` resolves the source descriptor from the catalog and produces the authored `ViewPlan` v2. The author type moves to a library that both `ql` and the client can include.
+- **Plan v2 adds:** key components (column refs plus an optional `lower`), `unique`, and constraints `{name, column, op, bound}`. The authored and compiled versions both go to 2. Old v1 blobs still decode.
+- **Catalog.** The new fields live in `normalizedPlanBlob`, so they affect the fingerprint. Update the golden catalog logs.
+- **Rolling upgrade.** DDL that uses any v2 feature is refused until the cluster feature level (`MetadataFeature`) reaches a new `kViewKeysConstraints` level. Brokers on the old version never see a plan they can't compile.
+- **Compile errors.** They get explicit codes: new `kViewKeyExpressionInvalid`, `kViewConstraintInvalid` and `kViewUniqueInvalid`. The current mapping searches the message for "key"; that goes away.
+
+**9.3 CLI.** `rune ql "select …"` decodes rows using the view's output descriptor, read from the catalog. It also supports the existing table, kv and json output formats if they exist; otherwise just table.
+
+## 10. Observability
+
+Per constrained view:
+
+- `constraintRejects` for each constraint
+- overlay occupancy and its peak
+- overlay-full refusals
+- gate refusals by reason
+- `uniqueConflicts` (§5.7)
+
+Per scan: rows returned and pages returned.
+
+All of these show in `show view` and the metrics export.
+
+## 11. Open: allocating ids
+
+Today `BIGSERIAL` assigns `characterId` and `userId`. In Rune, two creates with the same id are both treated as updates of the same record, and no constraint can tell an insert from an update.
+
+The options:
+
+- **(a) The service generates a 53-bit id.**
+  - The layout is 32 bits of seconds since 2026-01-01, a 10-bit instance id from configuration, and an 11-bit counter per second.
+  - It needs no Rune feature, and the id stays exact as a JavaScript number.
+  - The risk is a misconfigured instance id.
+- **(b) Insert-only writes.** A produce flag would say "fail if this source key exists", checked by the same hook against `character_by_id` plus the overlay.
+- **(c) Both.** (a) for generation, and (b) as the guard.
+
+This decision belongs to the owner. §6.2 can host (b) at little extra cost.
+
+## 12. Hot-path budget and benchmarks
+
+- **Topics without constraints.** Run an ABAB n=3 A/B of `ProducePathBenchmark` and `WorkerProduceLatencyBench`. It must show no regression.
+- **Topics with constraints.** The hook adds at most 1 µs p50 to a one-record batch on `ProduceValidateBench` (my call; revisit with data).
+- **Folding.** A `ViewFoldBench` case with derived keys plus the owner map stays inside the existing budget of 10 µs per event batch.
+- **Table.** `ViewTableBench` gains wide-key and prefix-scan cases. K ≤ 8 views must not change.
+
+## 13. Interaction matrix
+
+Every cell is a test (unit, integration or e2e, wherever it can first be seen). The stress layer model-checks the invariants.
+
+**Operations**
+
+- create
+- update of a non-key field
+- rename (the derived key changes)
+- move between groups (`userId` changes)
+- delete (tombstone)
+- delete then reuse the name
+- duplicate retry
+
+**Entities**
+
+- a new source key
+- an existing source key
+- the same user
+- another user
+- a group at 11, at 12, or over the limit (pre-existing)
+- a name that is free, taken by another record, or taken by the same record
+
+**Timing and fault**
+
+- one record
+- back to back before the ack
+- several records in one batch, including one that collides with another in the same batch
+- inside a transaction that commits
+- inside a transaction that aborts
+- two open transactions racing for the last slot or the same name
+- a release in a transaction followed by an increase outside it
+- an ack timeout, then a retry
+- leader failover between the append and the HW
+- leader failover between the HW and the fold
+- truncation of a pending tail
+- restart while the view rebuilds
+- the view created on a non-empty topic
+- `create or replace` while writes run
+- drop while writes run
+- a full overlay
+
+**Reads**
+
+- a point read and a prefix read immediately after an acked write (read your writes)
+- a scan across pages with an erase between pages (`kCursorInvalidated`)
+- a scan of an empty prefix
+- a hash-collision forcing test using a fixed seed and a test hook
+
+**Invariants for the model-checked stress run**
+
+The stress run has racing writers, injected failovers and aborts. At every observable point:
+
+- No user has more than 12 live characters.
+- No two live characters share a `lower(name)`.
+- Every acked write is visible in every view after the fold barrier.
+- No rejected write appears anywhere.
+- Every view equals a fresh refold of the log.
+
+**Sanitizers.** ASan, UBSan and TSan runs of `*Regression*` at the checkpoints, as usual.
+
+## 14. Work order
+
+Each part can be shipped on its own:
+
+1. #537, the fix for aborted-transaction folding.
+2. Keys: wide and derived keys, the owner map, the seeded hash and checkpoint v3. Covers §4 and §5 apart from §5.4.
+3. Composite keys, the prefix index, `GetViewRowK`, `ScanViewRows` and the client read API. Covers §5.4 and §8.
+4. Rune QL `create view` (plan v2, the feature level) and `select`, plus the CLI. Covers §9.
+5. Constraints: the hook, the overlay, the gate, error 51 and the client's definite-reject and split path. Covers §6 and §7.
+6. Docs: `ql.md`, `wire-protocol.md`, `client-cpp.md`, `admin-cli.md`, `CATALOG.md`, the root and client `CLAUDE.md`, and the site's views section, corrected to the shipped syntax.
+
+## 15. Left to the builder
+
+- The exact row layout for key bytes and the prefix links.
+- Whether the owner map and prefix index are checkpointed or rebuilt on replay.
+- The choice of seeded hash.
+- How the overlay is structured internally, within the capacity and no-allocation rules.
+- The page row cap and the resume token format.
