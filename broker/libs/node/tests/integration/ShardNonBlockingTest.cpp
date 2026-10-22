@@ -2578,6 +2578,7 @@ struct TxnRig {
         return (r && r->results.size() == 1) ? r->results[0].errorCode : int16_t{-1};
     }
     // Returns the EndTxn error code if answered synchronously, or 999 if deferred.
+    // (#38: answered OK once Prepare* is durable - no store here, so always synchronously.)
     int16_t endTxn(bool commit) {
         pc::EndTxn q; q.sessionId = 1; q.correlationId = ++corr; q.producerId = pid;
         q.producerEpoch = epoch; q.commit = commit ? 1 : 0; q.transactionalId = tid();
@@ -2607,14 +2608,16 @@ constexpr int16_t kConcurrent = static_cast<int16_t>(pc::ErrorCode::ConcurrentTr
 } // namespace
 
 TEST(ReplicaLifetimeRegression, MarkerAppendedBeforeTxnCompletesRegression) {
-    // The EndTxn response and the producer's next transaction are held until
-    // every participant's marker has LANDED (Kafka CONCURRENT_TRANSACTIONS).
+    // #38: the EndTxn is answered OK once PrepareCommit is durable; the txn stays PrepareCommit and the
+    // producer's next transaction is held until every participant's marker has LANDED (Kafka
+    // CONCURRENT_TRANSACTIONS).
     TxnRig t;
     t.sid = t.m.gw.injectTestSession();
     ASSERT_EQ(t.initPid(), 0);
     ASSERT_EQ(t.addPartition(), 0);
     t.produceTxn("a");
-    EXPECT_EQ(t.endTxn(/*commit=*/true), 999) << "EndTxn response deferred while the marker is in flight";
+    EXPECT_EQ(t.endTxn(/*commit=*/true), 0) << "EndTxn OK once PrepareCommit is durable (#38)";
+    EXPECT_EQ(t.tcs.txnStateForTest(t.txnId), rune::transaction::TxnState::PrepareCommit) << "the marker is in flight";
     EXPECT_EQ(t.tcs.awaitingMarkerTxnsForTest(), 1u);
     EXPECT_EQ(t.addPartition(), kConcurrent) << "next txn refused (retriable) until the marker lands";
     EXPECT_EQ(t.endTxn(true), kConcurrent);
@@ -2622,10 +2625,9 @@ TEST(ReplicaLifetimeRegression, MarkerAppendedBeforeTxnCompletesRegression) {
     EXPECT_TRUE(t.controlFrames.empty());
     for (int i = 0; i < 64 && t.tcs.awaitingMarkerTxnsForTest() > 0; ++i) t.m.runWorker(1 + i);   // bounded
     ASSERT_EQ(t.tcs.awaitingMarkerTxnsForTest(), 0u) << "completed when the last marker landed";
-    ASSERT_EQ(t.controlFrames.size(), 1u) << "the deferred EndTxn response is sent now";
-    auto r = pc::EndTxnResponse::decode(t.controlFrames[0].data(), t.controlFrames[0].size());
-    ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->errorCode, 0);
+    EXPECT_EQ(t.tcs.txnStateForTest(t.txnId), rune::transaction::TxnState::CompleteCommit)
+        << "CompleteCommit once the marker landed";
+    EXPECT_TRUE(t.controlFrames.empty()) << "a second EndTxn answer was sent when the marker landed";
     EXPECT_EQ(t.addPartition(), 0) << "the next transaction may start now";
 }
 
@@ -2675,7 +2677,8 @@ TEST(ReplicaLifetimeRegression, AbortedTxnRangeNeverCoversNextTxnRegression) {
     ASSERT_EQ(t.initPid(), 0);
     ASSERT_EQ(t.addPartition(), 0);
     t.produceTxn("txn1");
-    ASSERT_EQ(t.endTxn(/*commit=*/false), 999);
+    ASSERT_EQ(t.endTxn(/*commit=*/false), 0) << "OK once PrepareAbort is durable (#38)";
+    ASSERT_EQ(t.tcs.txnStateForTest(t.txnId), rune::transaction::TxnState::PrepareAbort) << "the marker is in flight";
     // The producer retries its next transaction (ConcurrentTransactions is
     // retriable) — it can only begin once txn1's marker landed.
     int tries = 0;
@@ -2683,7 +2686,8 @@ TEST(ReplicaLifetimeRegression, AbortedTxnRangeNeverCoversNextTxnRegression) {
     ASSERT_LT(tries, 64);
     t.produceTxn("txn2");
     for (int i = 0; i < 8; ++i) t.m.runWorker(100 + i);
-    ASSERT_EQ(t.endTxn(false), 999);
+    ASSERT_EQ(t.endTxn(false), 0) << "OK once PrepareAbort is durable (#38)";
+    ASSERT_EQ(t.tcs.txnStateForTest(t.txnId), rune::transaction::TxnState::PrepareAbort) << "the marker is in flight";
     for (int i = 0; i < 64 && t.tcs.awaitingMarkerTxnsForTest() > 0; ++i) t.m.runWorker(200 + i);
     ASSERT_EQ(t.tcs.awaitingMarkerTxnsForTest(), 0u);
     // Log: [0]=txn1 data, [1]=ABORT marker, [2]=txn2 data, [3]=ABORT marker.

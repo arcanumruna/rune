@@ -7,6 +7,10 @@
 #include <rune/node/RcState.h>
 #include <rune/storage/ProducerStateManager.h>
 
+#include <array>
+#include <limits>
+#include <random>
+
 using namespace transient_rig;
 
 namespace {
@@ -541,6 +545,71 @@ TEST(TransientDataPathRegression, RcRingBuildRestartsWhenTheRingEvictsPastItsCur
     EXPECT_EQ(rc.lso(INT64_MAX), INT64_MAX) << "the LSO is pinned by a transaction that committed";
 }
 
+// #37: a partition that appends (and so evicts) more bytes per worker pass than the build's budget overtakes every
+// restarted build of the same budget: read_committed never became Ready and the restarts never stopped.  Each restart
+// of a build doubles its per-step slice, so once the slice covers the (bounded) ring the next step applies the whole
+// [cursor, target) in one pass - nothing evicts during it (single writer).
+// RED (mutation: no boost): never Ready within the cap.
+namespace {
+// The ring filled to eviction with 200-B pads; `tail` batches appended last (newest, evicted last).
+void fillRingToEviction(rune::storage::InMemoryLog& mem, const std::vector<std::vector<uint8_t>>& tail) {
+    const auto pad = batchOf(1, 200);
+    while (mem.logStartOffset() == 0) ringPut(mem, pad);
+    for (const auto& b : tail) ringPut(mem, b);
+}
+// Advance the build (budget 512) then append 8 pads (~1.6 KB > the budget) per pass, up to `cap` passes.
+int advanceUnderSustainedEviction(rune::node::RcState& rc, rune::storage::InMemoryLog& mem, int cap) {
+    const auto pad = batchOf(1, 200);
+    rune::node::RcFacts f;
+    f.leader = true; f.epoch = 1;
+    int passes = 0;
+    for (; passes < cap && !rc.ready(); ++passes) {
+        (void)rc.advance(f, nullptr, /*budget=*/512, &mem);
+        if (rc.ready()) break;
+        for (int i = 0; i < 8; ++i) ringPut(mem, pad);
+    }
+    return passes;
+}
+}  // namespace
+
+TEST(TransientDataPathRegression, RcRingBuildConvergesUnderSustainedEvictionFasterThanItsBudgetRegression) {
+    rune::storage::InMemoryLog mem(64 * 1024, 100'000);   // DropOldest: evicts as needed
+    fillRingToEviction(mem, {});
+    ASSERT_GT(mem.logStartOffset(), 0) << "precondition: the ring evicts";
+    rune::node::RcState rc;
+    rc.reserve(64);
+    rc.reserveRingRebuild();
+    const int passes = advanceUnderSustainedEviction(rc, mem, /*cap=*/64);
+    ASSERT_TRUE(rc.ready()) << "read_committed never became Ready in " << passes << " passes (restarts="
+                            << rc.ringScanRestarts() << ")";
+    EXPECT_GE(rc.ringScanRestarts(), 1u) << "precondition: the eviction overtook the unboosted build";
+    EXPECT_LE(rc.ringScanRestarts(), 10u) << "log2(64K / 512) = 7 restarts at most, plus slack";
+}
+
+TEST(TransientDataPathRegression, RcRingBuildConvergedUnderSustainedEvictionIsExactRegression) {
+    rune::storage::InMemoryLog mem(64 * 1024, 100'000);
+    constexpr int64_t kCommitted = 51, kAborted = 52;
+    fillRingToEviction(mem, {batchOf(1, 50, kCommitted, 0, 0, /*txn=*/true), batchOf(1, 50, kAborted, 0, 0, true),
+                             markerOf(kCommitted, /*commit=*/true), markerOf(kAborted, /*commit=*/false)});
+    rune::node::RcState rc;
+    rc.reserve(64);
+    rc.reserveRingRebuild();
+    (void)advanceUnderSustainedEviction(rc, mem, /*cap=*/64);
+    ASSERT_TRUE(rc.ready());
+    ASSERT_GE(rc.ringScanRestarts(), 1u) << "precondition: a boosted (restarted) build computed the state";
+    EXPECT_TRUE(rc.tracker().empty()) << "a transaction closed by its marker in the ring stayed open";
+    EXPECT_LT(rc.tracker().firstOffsetOf(kCommitted), 0);
+    EXPECT_LT(rc.tracker().firstOffsetOf(kAborted), 0);
+    EXPECT_EQ(rc.lso(INT64_MAX), INT64_MAX) << "the LSO is pinned although every transaction ended";
+    bool abortedIndexed = false, committedIndexed = false;
+    for (const auto& r : rc.aborted().ranges()) {
+        abortedIndexed   |= r.producerId == kAborted;
+        committedIndexed |= r.producerId == kCommitted;
+    }
+    EXPECT_TRUE(abortedIndexed) << "the aborted transaction is missing from the aborted index";
+    EXPECT_FALSE(committedIndexed) << "the committed transaction was indexed as aborted";
+}
+
 TEST(TransientDataPathRegression, OpenTxnWithItsFirstBatchEvictedSurvivesAnOwnershipChangeRegression) {
     Rig rig(/*ringBytes=*/8 * 1024, /*maxBatches=*/1000);   // single node: HW = LEO, the ring evicts freely
     constexpr int64_t kPid = 7;
@@ -570,4 +639,144 @@ TEST(TransientDataPathRegression, OpenTxnWithItsFirstBatchEvictedSurvivesAnOwner
     ASSERT_FALSE(committed->chunk.empty()) << "the COMMIT did not resolve the pinned transaction";
     EXPECT_EQ(rune::protocol::RecordBatchReader(committed->chunk.data(), committed->chunk.size()).baseOffset(),
               rig.mem.logStartOffset()) << "delivery resumes at the (current) ring start";
+}
+
+// ---------------------------------------------------------------------------
+// PR #555 adversarial review (#37): the boosted (restarted) ring build.
+// ---------------------------------------------------------------------------
+namespace {
+// Advance (budget) then append `perPass` pads per pass until Ready or `cap` passes; returns the passes.
+int advanceEvicting(rune::node::RcState& rc, rune::storage::InMemoryLog& mem, const rune::node::RcFacts& f,
+                    int32_t budget, int perPass, int cap) {
+    const auto pad = batchOf(1, 200);
+    int passes = 0;
+    for (; passes < cap && !rc.ready(); ++passes) {
+        (void)rc.advance(f, nullptr, budget, &mem);
+        if (rc.ready()) break;
+        for (int i = 0; i < perPass; ++i) ringPut(mem, pad);
+    }
+    return passes;
+}
+rune::node::RcFacts leaderFacts(uint64_t leadGen = 0) {
+    rune::node::RcFacts f;
+    f.leader = true; f.epoch = 1; f.leadershipGeneration = leadGen;
+    return f;
+}
+}  // namespace
+
+// Input bound: budget 0 (and 1) - the smallest slice, one batch per step - still converges under eviction, within
+// ceil(log2(ring bytes)) + slack restarts, never an endless restart loop.
+TEST(TransientDataPathRegression, RcRingBuildWithAZeroOrOneByteBudgetConvergesUnderEvictionAdversarialRegression) {
+    for (const int32_t budget : {0, 1}) {
+        rune::storage::InMemoryLog mem(64 * 1024, 100'000);
+        fillRingToEviction(mem, {});
+        rune::node::RcState rc;
+        rc.reserve(64);
+        rc.reserveRingRebuild();
+        const int passes = advanceEvicting(rc, mem, leaderFacts(), budget, /*perPass=*/8, /*cap=*/256);
+        ASSERT_TRUE(rc.ready()) << "budget " << budget << ": never Ready in " << passes << " passes (restarts="
+                                << rc.ringScanRestarts() << ")";
+        EXPECT_GE(rc.ringScanRestarts(), 1u) << "precondition: eviction overtook the unboosted build";
+        EXPECT_LE(rc.ringScanRestarts(), 24u) << "budget " << budget << ": log2(64 KiB) = 16 restarts, plus slack";
+    }
+}
+
+// Input bound: the maximum budget - one step covers the ring, no restart, no overflow of the slice.
+TEST(TransientDataPathRegression, RcRingBuildWithTheMaxBudgetIsReadyInOneStepAdversarialRegression) {
+    rune::storage::InMemoryLog mem(64 * 1024, 100'000);
+    fillRingToEviction(mem, {batchOf(1, 50, 5, 0, 0, /*txn=*/true)});   // pid 5 open at the ring tail
+    rune::node::RcState rc;
+    rc.reserve(64);
+    rc.reserveRingRebuild();
+    const std::size_t bytes = rc.advance(leaderFacts(), nullptr, std::numeric_limits<int32_t>::max(), &mem);
+    ASSERT_TRUE(rc.ready());
+    EXPECT_GT(bytes, 0u);
+    EXPECT_EQ(rc.ringScanRestarts(), 0u);
+    EXPECT_GE(rc.tracker().firstOffsetOf(5), mem.logStartOffset()) << "the open txn was lost";
+}
+
+// A boosted build abandoned on an ownership change: the NEXT build (another leadership generation) starts unboosted
+// - its first step parses about one budget, not the boosted slice - and itself converges exactly.
+TEST(TransientDataPathRegression, RcRingBuildAfterAnOwnershipChangeStartsUnboostedAdversarialRegression) {
+    rune::storage::InMemoryLog mem(256 * 1024, 100'000);
+    fillRingToEviction(mem, {});
+    rune::node::RcState rc;
+    rc.reserve(64);
+    rc.reserveRingRebuild();
+    const auto pad = batchOf(1, 200);
+    const auto f1 = leaderFacts(/*leadGen=*/1);
+    std::size_t lastStep = 0;
+    for (int i = 0; i < 64 && rc.ringScanRestarts() < 3; ++i) {
+        lastStep = rc.advance(f1, nullptr, /*budget=*/512, &mem);
+        ASSERT_FALSE(rc.ready()) << "precondition: still building";
+        for (int k = 0; k < 32; ++k) ringPut(mem, pad);   // ~8 KiB evicted per pass: needs a boost of 4+
+    }
+    ASSERT_GE(rc.ringScanRestarts(), 3u) << "precondition: a boosted build";
+    ASSERT_GT(lastStep, 512u * 4) << "precondition: the boosted slice (budget << 3)";
+    const uint64_t restartsBefore = rc.ringScanRestarts();
+    const auto f2 = leaderFacts(/*leadGen=*/2);              // ownership changed: the build is reset
+    const std::size_t first = rc.advance(f2, nullptr, /*budget=*/512, &mem);
+    EXPECT_EQ(rc.ringScanRestarts(), restartsBefore) << "the reset counted as an eviction restart";
+    EXPECT_LE(first, 512u + pad.size()) << "the new build inherited the old build's boost";
+    EXPECT_GT(first, 0u);
+    const int passes = advanceEvicting(rc, mem, f2, 512, 32, 256);
+    EXPECT_TRUE(rc.ready()) << "the new build never converged in " << passes << " passes";
+}
+
+// Exact state (model check, seeded): a build boosted by sustained eviction of random transactional traffic (open /
+// committed / aborted txns of several producers, markers) equals a one-step rebuild of the same ring from the same
+// ring start: same LSO, same open txns, same aborted index.
+TEST(TransientDataPathRegression, RcRingBuildBoostedEqualsAOneStepRebuildSeededAdversarialRegression) {
+    int compared = 0;
+    for (uint32_t seed = 1; seed <= 40; ++seed) {
+        std::mt19937 rng(seed);
+        rune::storage::InMemoryLog mem(32 * 1024, 100'000);
+        std::array<bool, 6> open{};
+        auto putRandom = [&] {
+            const int64_t pid = 10 + static_cast<int64_t>(rng() % open.size());
+            switch (rng() % 4) {
+                case 0: ringPut(mem, batchOf(1, 150)); break;
+                case 1: ringPut(mem, batchOf(1, 120, pid, 0, 0, /*txn=*/true)); open[pid - 10] = true; break;
+                default:
+                    if (open[pid - 10]) { ringPut(mem, markerOf(pid, rng() % 2 == 0)); open[pid - 10] = false; }
+                    else ringPut(mem, batchOf(1, 150));
+            }
+        };
+        while (mem.logStartOffset() == 0) putRandom();
+        rune::node::RcState rc;
+        rc.reserve(64);
+        rc.reserveRingRebuild();
+        const auto f = leaderFacts();
+        // Sustained eviction until a step restarts the build a second time (boost >= 2); from that step on nothing
+        // is appended, so the boosted build finishes from exactly the ring start the reference starts from.
+        bool frozen = false;
+        for (int pass = 0; pass < 256 && !rc.ready(); ++pass) {
+            const uint64_t before = rc.ringScanRestarts();
+            (void)rc.advance(f, nullptr, /*budget=*/256, &mem);
+            if (rc.ringScanRestarts() != before && rc.ringScanRestarts() >= 2) frozen = true;
+            if (rc.ready() || frozen) continue;
+            const int n = 6 + static_cast<int>(rng() % 6);
+            for (int i = 0; i < n; ++i) putRandom();
+        }
+        ASSERT_TRUE(rc.ready()) << "seed " << seed << ": never Ready (restarts=" << rc.ringScanRestarts() << ")";
+        if (!frozen) continue;   // converged before a second restart: built from an older ring start
+        ++compared;
+        rune::node::RcState ref;
+        ref.reserve(64);
+        ref.reserveRingRebuild();
+        (void)ref.advance(f, nullptr, std::numeric_limits<int32_t>::max(), &mem);
+        ASSERT_TRUE(ref.ready());
+        EXPECT_EQ(rc.lso(INT64_MAX), ref.lso(INT64_MAX)) << "seed " << seed;
+        for (int64_t pid = 10; pid < 16; ++pid)
+            EXPECT_EQ(rc.tracker().firstOffsetOf(pid), ref.tracker().firstOffsetOf(pid)) << "seed " << seed << " pid " << pid;
+        const auto& a = rc.aborted().ranges();
+        const auto& b = ref.aborted().ranges();
+        ASSERT_EQ(a.size(), b.size()) << "seed " << seed;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            EXPECT_EQ(a[i].producerId, b[i].producerId) << "seed " << seed;
+            EXPECT_EQ(a[i].firstOffset, b[i].firstOffset) << "seed " << seed;
+            EXPECT_EQ(a[i].lastOffset, b[i].lastOffset) << "seed " << seed;
+        }
+    }
+    EXPECT_GT(compared, 10) << "too few seeds converged on a restart step to check exactness";
 }

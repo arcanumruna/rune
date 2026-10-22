@@ -12,7 +12,8 @@
 //       Scanning{cursor, target, epoch, gens,      building [logStart, target)
 //                segment byte cursor}              (a DISK log)
 //       RingScanning{cursor, target, ringStart,    building [ringStart, target)
-//                    epoch, gens}                  (a memory ring; E2 final fix wave I3)
+//                    epoch, gens, boost}           (a memory ring; E2 final fix wave I3;
+//                                                  #37: boost doubles the slice per restart)
 //       Ready{epoch, gens}                         serving; append-time updates live
 //
 //     gens = (logGeneration, leadershipGeneration) the state was built for.
@@ -231,6 +232,10 @@ public:
         int32_t  epoch     = 0;
         uint64_t logGen    = 0;
         uint64_t leadGen   = 0;
+        /// #37: restarts of this build so far; each doubles its per-step slice, so a build overtaken by eviction
+        /// outpaces it (once the slice covers the bounded ring, one step applies [cursor, target) whole - nothing
+        /// evicts during a step: eviction happens only on append, on this same worker).
+        uint32_t boost     = 0;
     };
     struct TailEvent {
         int64_t producerId = -1;
@@ -719,20 +724,26 @@ private:
             // The ring evicted batches this build had not read: restart it from
             // the new ring start (state, tail and producer state all rebuilt).
             ++ringScanRestarts_;
+            const uint32_t boost = rs.boost + 1;   // #37: the restarted build's slice doubles
             if ((ringScanRestarts_ & (ringScanRestarts_ - 1)) == 0)
                 spdlog::warn("RcState: the transient ring evicted past the read_committed build's cursor {} "
-                             "(ring start {}) — build restarted from the ring start (restarts={})",
-                             rs.cursor, ring.logStartOffset(), ringScanRestarts_);
+                             "(ring start {}) — build restarted from the ring start (restarts={}, boost={})",
+                             rs.cursor, ring.logStartOffset(), ringScanRestarts_, boost);
             tracker_.clear();
             aborted_.clear();
             tail_.clear();
             if (psm_ != nullptr) psm_->clearPartition(psmTopic_, psmPartition_);
             const RcFacts f{true, rs.logGen, rs.leadGen, rs.epoch};
             beginRingScan_(f, ring);   // the same alternative: `rs` now holds the restarted build
+            rs.boost = boost;
         }
         RingScanning& cur = rs;
         rune::transaction::RcBuilder builder(&tracker_, &aborted_);
-        const std::size_t want = static_cast<std::size_t>(budget > 0 ? budget : 1);
+        // #37: base << min(boost, 40), saturating (an unboosted build keeps the plain budget).
+        const std::size_t base  = static_cast<std::size_t>(budget > 0 ? budget : 1);
+        const unsigned    shift = std::min<uint32_t>(cur.boost, 40u);
+        const std::size_t want  = base > (std::numeric_limits<std::size_t>::max() >> shift)
+                                      ? std::numeric_limits<std::size_t>::max() : base << shift;
         std::size_t bytes = 0;
         while (cur.cursor < cur.target && bytes < want) {
             const auto v = ring.readView(cur.cursor, /*maxBytes=*/1);   // exactly one whole batch

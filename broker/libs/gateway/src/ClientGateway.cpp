@@ -7715,9 +7715,9 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
             return;
     }
 
-    // 0 = the answer is DEFERRED (ITxnRequestHandler contract): EndTxn waits for
-    // its markers, and (#358) any answer that depends on a __transaction_state
-    // record waits for that record to commit - the service sends it later (or
+    // 0 = the answer is DEFERRED (ITxnRequestHandler contract): (#358) any answer
+    // that depends on a __transaction_state record, EndTxn's Prepare* record
+    // included (#38: not its markers), waits for that record to commit - the service sends it later (or
     // answers NotCoordinator when it unloads first).  The service answers decode
     // failures (InvalidRequest) and responses that do not fit (MessageTooLarge)
     // itself.
