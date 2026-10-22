@@ -130,7 +130,7 @@ characters.removeExistingAndWait(id);   // KeyNotFound → 404
 
 **Terms.**
 - A **verdict view** is a constrained view (`unique` or `check`) or the key index (§5.2). Only verdict views can reject a record.
-- A **verdict source** is a partition whose topic feeds at least one verdict view. Only verdict sources carry the reader bound (§8.6), the verdict markers (§8.5) and the transaction rule (§11.2). Other partitions are unchanged.
+- A **verdict source** is a partition whose topic feeds at least one verdict view. Only verdict sources carry the reader bound (§8.6) and the verdict markers (§8.5). The transaction rule (§11.2) applies to sources of constrained views, and to explicit-key intents. Other partitions are unchanged.
 
 **The write path does only what must happen before the bytes are stored.** One hook on the partition leader sits in `handleProduceBatch`, after idempotent dedupe (`producerState.validate`, `ProducePath.cpp:205`) and before the min-ISR gate and the append. Both ingress routes, gateway-routed and shard ingress, reach it through `produceCore_`. For one batch, in order:
 1. Decode each record once, using the per-writer-version descriptor cache shared with the fold. That gives validation (§4).
@@ -284,7 +284,7 @@ topic character { characterId uint64 autoincrement, … } partitions 1 replicas 
   - Ids are small and dense across the topic.
   - With one partition they are 1, 2, 3, …, increasing globally.
 - **Limit.** The broker refuses to assign above `2^53 − 1`, so ids are always exact in JavaScript. A topic can set a lower `autoincrement.max`.
-- **Batches.** A batch of k new records gets `base, base+P, …, base+(k−1)·P`.
+- **Batches.** A batch that contains a key-0 create must contain only key-0 creates; otherwise it gets `InvalidRequest`. The client keeps them in their own batches. A batch of k creates gets `base, base+P, …, base+(k−1)·P`, so record i gets `base + i·P`.
 
 **6.4 Assignment**
 
@@ -328,8 +328,8 @@ topic character { characterId uint64 autoincrement, … } partitions 1 replicas 
 
 - **Retries.** An idempotent retry that dedupes returns the original offsets *and* the original base id.
   - Each `autoincrement` partition keeps a side window `(producerId → last 32 batches' assigned base ids)`, in step with the producer-state retry window. Only these partitions have it.
-  - It is rebuilt from the log on failover, alongside the producer-state rebuild, from the keys in the stored batches.
-  - Nothing is read back, so compaction rewriting the batch doesn't matter.
+  - It is rebuilt from the log on failover, alongside the producer-state rebuild, from the first key of each stored batch, which is its base id because key-0 batches are homogeneous (§6.3).
+  - So that those batches are still there, the cleaner on an `autoincrement` topic never removes records from the last 32 batches of a producer that is still in the producer-state table. This is the same idea as Kafka's cleaner keeping each producer's last batch. Rejected records in those batches are kept too, but they stay invisible.
   - The producer never has more batches in flight than the window holds, so a retry is always in the window.
   - A duplicate outside the window is answered `DuplicateSequence` with no id. The client reports "stored; id unknown" as its own definite error. It should be unreachable, and the stress run asserts that.
 - **Transactions.** On a topic with no constrained view, ids taken inside a transaction that aborts are burned, leaving a gap. On a constrained one, transactions are refused (§11.2).
@@ -426,14 +426,15 @@ Names can't contain NUL, so padding can't make two names collide. In general, a 
 - **`check (<predicate>)`** on any view, projection or aggregate.
   - The predicate is over the view row's own columns, whether key, projected or aggregate (`count`, `sum`, `avg`, `min`, `max`, `last`). It compares them with constants using `=`, `<>`, `<`, `<=`, `>` and `>=`, combined with `and`, `or` and `not`. Examples: `check (characters <= 12)`, `check (balance >= 0)`.
   - It is evaluated on each prospective row the record would produce (§8.4).
-  - A record is rejected if some prospective row fails the predicate **and** the record changes a column the predicate reads.
-    - So a rename inside a group that is already over its limit passes, because it doesn't change `count`. A create into that group fails, so the group can't grow.
-    - Deletes are never rejected (§8.4), so such a group can always shrink.
+  - **A row that satisfies the predicate now** (or doesn't exist yet): the record is rejected if the prospective row fails it. Deletes are judged too: under `check (balance >= 0)`, deleting a positive contributor that would make the sum negative is rejected.
+  - **A row that already fails it,** which is possible only for data from before the constraint (§8.7): the record is rejected if it changes a column the predicate reads, unless it is a delete.
+    - So in a group already over its limit, a rename passes because it doesn't change `count`, a create fails, and a delete passes. The group can shrink, never grow.
   - A row the record removes entirely (the last contributor of a group leaves) isn't checked.
+  - A `unique` view never rejects a delete, since a delete only releases a key.
 - **Several views.** One record may be checked against several views, for example `character_name` and `account_stats`, and must pass all of them.
 - **Refused at compile time:** predicates across rows, subqueries, columns of other views, and non-constant operands ("check compares this view's columns with constants").
 
-**8.3 Unique conflicts at fold time.** These can come only from data written before the unique view existed, because the write-time check prevents new ones.
+**8.3 Unique conflicts at fold time.** These can come only from data written before the unique view existed, because judging at fold prevents new ones.
 
 - **Rule.** Where several live source records share a unique key, the view row belongs to the one with the **smallest source key**.
   - A rule based on "first by offset" would not be deterministic, because compaction and deletes change which offsets survive.
@@ -451,8 +452,9 @@ Names can't contain NUL, so padding can't make two names collide. In general, a 
   - `character_name`: the owner map says whether `lower(name)` is owned by a different source key.
 - **Several verdict views.** A record must pass all of them. All prospective rows are computed before any view applies anything, so a record rejected by one view changes none.
 - **Within a batch.** Records are judged one at a time, in order. Each sees the effect of the accepted records before it, including those in the same batch. Each record gets its own verdict (§11.3).
-- **Deletes are never rejected.** A tombstone always passes, so a key can always be removed.
+- **Deletes are judged like any record** (§8.2). A delete fails only a `check` that the removal would break. It never fails a `unique` view, and it passes on a row that already broke its rule.
 - **Deterministic.** A verdict depends only on the view state, the record and the constraint set active at its offset (§8.7). The same log gives the same verdicts on every leader, every restart and every refold.
+- **No resource-dependent verdicts.** A verdict view never rejects for capacity reasons (row cap, arena). Exhausting capacity stops that partition's fold with an alert, which pauses its delivery and `View` acks, and is never turned into a verdict that another node might not reach.
 - **Nothing pending.** A record is judged only once every record before it has been committed and judged. No state about uncommitted records exists anywhere.
 
 **8.5 Verdict markers and the cleaner**
@@ -489,14 +491,17 @@ Names can't contain NUL, so padding can't make two names collide. In general, a 
 
 **8.7 Changing constraints**
 
-- **The constraint set** of a verdict source is the list of its verdict views and their rules. Each change gets a new `constraintSetId`, and the leader writes a marker at the offset where the change takes effect.
+- **The constraint set** of a verdict source is the list of its verdict views and their rules. Each change gets a new `constraintSetId`.
+- **Change records.** Every change takes effect at a control record in the source log, a `ConstraintSetChange { constraintSetId }` that the leader appends. The new set judges records at offsets above that record's own offset. The old set judges those below it.
+  - Records are committed in order, so any record judged under the new set is committed *after* its change record. Every leader that judges it therefore already has the change record, and judges with the same set. That's the same argument as for reservation records (§6.5).
+  - On failover, a new leader takes the set for each offset from the change records in its log, never from local timing. It refuses to judge past a change record whose view it hasn't installed yet, and waits for the catalog.
 - **Create.**
-  - The activation offset `A` is the partition's LEO when the install reaches the leader.
+  - When the install reaches the leader, it appends the change record. Its offset is the activation offset `A`.
   - The view builds from the log start. Below `A`, it applies records without judging them, which is the pre-existing data of §8.3. From `A` on, records are judged.
   - Writes are never refused for this. Delivery of records at or above `A` to consumers waits until the view has caught up, because their verdicts aren't known yet (§8.6). Creating a constraint on a large topic therefore pauses delivery of new records for the duration of the build. The docs say so.
   - Rows that already break a rule aren't repaired (§8.2).
-- **`create or replace`.** The old instance keeps judging until the new one has caught up, at an offset `S`. Then they swap in one worker step: the old instance's verdicts stand below `S`, and the new one judges from `S`. While catching up, the new instance skips records the bitmap marks below `S`. There's never a gap.
-- **Drop.** Judging stops at the fold step where the drop is installed, and the marker records the change. Drop followed by create *does* leave a gap. The docs say so.
+- **`create or replace`.** The old instance keeps judging until the new one has caught up. The leader then appends the change record at `S` and swaps the instances in the same worker step. The old instance's verdicts stand below `S`, and the new one judges above it. While catching up, the new instance skips records the bitmap marks below `S`. There's never a gap.
+- **Drop.** The leader appends a change record without the dropped view, and judging by it stops above that offset. Drop followed by create *does* leave a gap. The docs say so.
 
 **8.8 Folding**
 
@@ -669,12 +674,15 @@ Existing codes reused:
 |---|---|---|
 | Plain upsert or delete, on any topic, including a verdict source | none: any producer, any acks, any client version | — |
 | Intent (`insert`, `update`, `removeExisting`) | an idempotent producer, and acks including `View` (`All \| View` or `Leader \| View`) | `InvalidRequest`. The client refuses locally first. |
-| `autoincrement` create (key 0) | an idempotent producer, and `All` (with or without `View`) | `InvalidRequest` |
+| `autoincrement` create (key 0) on a topic **without** a constrained view | an idempotent producer, and `All` (with or without `View`). It can't be rejected: its id is unique by construction and skips the key index (§6.4). | `InvalidRequest` |
+| `autoincrement` create (key 0) on a topic **with** a constrained view | an idempotent producer, and `All \| View`, so the id is returned only together with the verdict | `InvalidRequest` |
 | Transactional or explicit atomic batch (`p.batch`) on a source of a constrained view | refused (non-goal, §2) | `InvalidRequest` |
-| An intent inside a transaction or atomic batch | refused | `InvalidRequest` |
+| An explicit-key intent (`insert` with a key, `update`, `removeExisting`) inside a transaction or atomic batch, on any topic | refused, because the key index could reject it after commit | `InvalidRequest` |
+
+A key-0 create is not an explicit-key intent. On a topic with only a key index, it is allowed in transactions, as in §6.6.
 
 - **Why intents need `View`.** Their verdict exists only after the fold, so without `View` the writer could never learn it. **Why idempotent:** a non-idempotent retry would store a second copy, which would fail with `KeyExists` against the first.
-- **Why autoincrement creates need `All`.** With a `Leader` ack, an id handed out could be cut by a failover and given to another record.
+- **Why autoincrement creates need `All`.** With a `Leader` ack, an id handed out could be cut by a failover and given to another record. Where a constraint can reject the create, they also need `View`; otherwise the client would get an id for a record that never becomes visible.
 - **Why transactions and atomic batches are refused on constrained sources.** A record is judged only after its transaction commits. If one record of a committed transaction were then rejected, the transaction would be half applied. Supporting them needs the fold to judge a whole transaction before applying any of it; that is a follow-up (§17).
 - **Old clients** (version 11 and earlier) never send `View`, so they never receive 51–53. Their writes are judged like any other, and a rejected one simply never becomes visible. The rejection count is in the stats (§13).
 
@@ -869,7 +877,11 @@ Each part ships on its own:
 - Wire: bit 0 is `All`, as today, and bit 1 is `View`. `View` alone is refused. With today's fold, `Leader | View` waits for commit, like `All | View`. (My call.)
 - Requirements are per write, not per topic: none for plain writes; intents need an idempotent producer and `View`; autoincrement creates need an idempotent producer and `All`. (My call, following the owner's objection to constraining every producer of a topic.)
 - **Transactions and explicit atomic batches are refused on sources of constrained views** (my call). Follow-up: let the fold judge a whole transaction before applying any of it, with the before-images of the rows it touches, so it can be rejected as a unit. This matters if a producer of such a topic uses transactions today.
-- Deletes are never rejected. A record fails a `check` only if it changes a column the predicate reads. (My call.)
+- Deletes are judged like any record, so a delete can fail a `check` it would break (`balance >= 0`). A row that already broke its rule, which is possible only for pre-existing data, accepts deletes and any change that doesn't touch the checked columns. (My call.)
+- Every constraint-set change takes effect at a control record in the source log, so every leader judges each offset with the same rules. (My call.)
+- A key-0 create needs `All | View` where a constraint could reject it, and `All` otherwise. A batch with key-0 creates contains only key-0 creates. (My call.)
+- On `autoincrement` topics, the cleaner keeps each live producer's last 32 batches, so retries after failover can return their ids. (My call.)
+- A verdict view never rejects for capacity reasons. Exhaustion stops the fold with an alert. (My call.)
 - `check` takes any predicate over the view row's own columns and constants. (My call, following the owner's point that checks aren't only counts.)
 - A new constraint judges from the LEO at install. Delivery of newer records waits while it builds, and writes don't. (My call.)
 - The verdict marker interval is 100 ms when nothing is rejected. (My call.)
