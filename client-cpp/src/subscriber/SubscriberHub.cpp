@@ -996,9 +996,10 @@ bool SubscriberHub::holdMovedForRetry(int64_t correlationId, std::chrono::steady
 int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_point deadline,
                               std::chrono::steady_clock::time_point now)
 {
-    if (!routed_()) { homedCount_ = 0; return 0; }
+    if (!routed_()) { homedCount_ = 0; unansweredHomed_ = 0; return 0; }
     int work = 0;
     std::size_t homed = 0;
+    std::size_t unanswered = 0;
     // Pending ones: held (not sent) -> re-resolve the leader and send; sent but
     // their session changed under them (reconnect / drop) -> route again.
     for (auto it = pendingByCorrelation_.begin(); it != pendingByCorrelation_.end();) {
@@ -1009,23 +1010,35 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
             const bool held = impl.homeSid == 0;
             const bool lost = !held && router_.epoch(router_.ctx, impl.homeSession) != impl.homeEpoch;
             const bool due  = !held || now >= req->notBefore;   // a NotLeader backoff (holdMovedForRetry)
-            if ((held && due) || lost) {
+            // #365: fresh metadata moved the partition off its home session (a
+            // crashed leader's session is not yet seen lost): follow the route.
+            const int32_t part = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
+            const bool moved = !held && router_.leaderSession(router_.ctx, impl.topicId, part) != impl.homeSession;
+            if ((held && due) || lost || moved) {
                 if (lost) ++homedSessionsLost_;
                 routeMovedPending_(it, seedSid);   // homedCount_ is recounted below
                 ++work;
             }
             if (pendingByCorrelation_.find(impl.correlationId) != pendingByCorrelation_.end() &&
-                impl.homeSession != 0)
+                impl.homeSession != 0) {
                 ++homed;
+                if (impl.homeSid != 0) ++unanswered;   // sent there, no answer yet
+            }
         }
         it = next;
     }
-    // Bound ones whose node session was lost: the broker ended the
-    // subscription with that session — re-arm from the position.
+    // Bound ones whose node session was lost (the broker ended the
+    // subscription with that session), or whose partition fresh metadata moved
+    // to another node (#365: a crashed leader) — re-arm from the position.
     homedScratch_.clear();
     for (const auto& [id, impl] : activeById_) {
         if (impl->homeSession == 0 || !impl->active || impl->unsubPending || impl == dispatching_) continue;
-        if (router_.epoch(router_.ctx, impl->homeSession) == impl->homeEpoch) { ++homed; continue; }
+        const int32_t part = impl->boundPartition >= 0 ? impl->boundPartition : impl->partition;
+        if (router_.epoch(router_.ctx, impl->homeSession) == impl->homeEpoch &&
+            router_.leaderSession(router_.ctx, impl->topicId, part) == impl->homeSession) {   // #365: route moved
+            ++homed;
+            continue;
+        }
         try {
             homedScratch_.push_back(id);
         } catch (...) {
@@ -1057,6 +1070,14 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
         }
         req->impl     = &impl;
         req->deadline = deadline;
+        if (router_.epoch(router_.ctx, impl.homeSession) == impl.homeEpoch) {
+            // #365: its session is still up (only the route moved): release the
+            // old instance there, best-effort as on a NotLeader move.
+            uint8_t unsubBuf[64]{};
+            const std::size_t unsubLen = codec::encodeUnsubscribe(unsubBuf, sizeof(unsubBuf), impl.subscriptionId,
+                                                                  impl.homeSid, router_.nextCorrId(router_.ctx));
+            if (unsubLen > 0) (void)router_.offer(router_.ctx, impl.homeSession, unsubBuf, unsubLen);
+        }
         ++homedSessionsLost_;
         activeById_.erase(ait);
         impl.correlationId  = newCorr;
@@ -1074,7 +1095,8 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
         if (impl.homeSession != 0) ++homed;
         ++work;
     }
-    homedCount_ = homed;
+    homedCount_      = homed;
+    unansweredHomed_ = unanswered;
     return work;
 }
 

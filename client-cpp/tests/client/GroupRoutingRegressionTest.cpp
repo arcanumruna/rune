@@ -3429,3 +3429,59 @@ TEST(GroupRoutingRegression, ShardClientFailsOverWithinTheStaleThresholdWithDefa
     EXPECT_LT(std::chrono::steady_clock::now() - t0, 8s) << "N-M2: RED is >= 20.4 s (400 ms + 4 x 5 s)";
     (void)n1;
 }
+
+// ===========================================================================
+// #365: plain subscriptions homed on a node that crashed
+// ===========================================================================
+namespace {
+int subscribesAt(const test_support::InvokerGateway& gw, int32_t p, int ep) {
+    int n = 0;
+    for (const auto& s : gw.subscribed) n += (s.partition == p && s.endpoint == ep) ? 1 : 0;
+    return n;
+}
+} // namespace
+
+// A reader created right after p1's leader (node 1) crashed: its Subscribe is
+// sent to node 1's session, which never answers.  When fresh metadata names the
+// new leader (node 2), the pending Subscribe moves there and binds within its
+// deadline, and so does the reader that was already bound on node 1 — both
+// while node 1's session still looks alive.  RED: both stayed homed on node 1's
+// session until it was seen stale (responseTimeoutNs, 10 s: only a session
+// EPOCH change re-routed them), so a reader created within that window of the
+// crash ended TimedOut (subscribeTimeoutMs, 10 s).
+TEST(GroupRoutingRegression, PlainReaderCreatedRightAfterALeaderCrashBindsOnTheNewLeaderRegression) {
+    GroupRig r(4501, 4502);   // default session timeouts: node 1's session is not yet seen stale
+    const auto [n1, p1port] = r.addNode(4501);
+    const auto [n2, p2port] = r.addNode(4501);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4501, ""}, {1, 1, 1, 1, 4501, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.connect();
+    auto bound = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                    [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr && bound.active(); }));
+
+    // Node 1 crashes; a fresh reader subscribes at once (stale metadata).
+    r.gw.deadEndpoints.insert(n1);
+    auto fresh = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                    [](const rc::Record&) {});
+    // Its Subscribe is redirected by the seed (stale view) to node 1, which
+    // never answers (a dead node records nothing: bounded drive, no predicate).
+    (void)r.drive([&] { return fresh.finished(); }, 50'000);
+    ASSERT_FALSE(fresh.finished());
+    ASSERT_EQ(subscribesAt(r.gw, 1, n2), 0);
+
+    // The cluster elects node 2 for p1.
+    r.gw.partitions      = {{1, 0, 0, 1, 4501, ""}, {1, 1, 2, 2, 4501, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n2}};
+    ASSERT_TRUE(r.drive([&] {
+        return subscribesAt(r.gw, 1, n2) >= 2 || fresh.finished() ||
+               r.client.testSessionStateAt(1) != rc::session::SessionState::Connected;
+    }, 40'000'000))
+        << "p1's subscriptions never moved to node 2 (" << subscribesAt(r.gw, 1, n2) << " there)";
+    EXPECT_FALSE(fresh.finished()) << "the fresh reader ended " << static_cast<int>(fresh.failReason());
+    EXPECT_FALSE(bound.finished());
+    // Moved on the fresh metadata, not on node 1's staleness (10 s): its session
+    // still looks Connected.  (RED without the fix: nothing moved until then.)
+    EXPECT_EQ(r.client.testSessionStateAt(1), rc::session::SessionState::Connected);
+}

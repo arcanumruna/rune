@@ -282,6 +282,11 @@ public:
     /// recounted by every driveHomed pass; the duty cycle calls driveHomed
     /// only while non-zero — one branch otherwise).
     [[nodiscard]] std::size_t homedCount() const noexcept { return homedCount_; }
+    /// #365: moved Subscribes sent on a node session and not answered yet (as of
+    /// the last driveHomed).  While nonzero the Client keeps a backoff-paced
+    /// metadata refresh armed: a leader that crashed under them is only seen
+    /// stale after responseTimeoutNs, fresh metadata moves them sooner.
+    [[nodiscard]] std::size_t unansweredHomed() const noexcept { return unansweredHomed_; }
     /// Duty cycle (while homedCount() != 0): flush held moved Subscribes whose
     /// node session is Connected (re-resolving the leader each attempt); a
     /// moved subscription whose node session was LOST (dropped / reconnected:
@@ -504,6 +509,7 @@ private:
     // E2 final fix wave (I2): moved subscriptions homed on leader node sessions.
     NodeRouter  router_{};
     std::size_t homedCount_        = 0;
+    std::size_t unansweredHomed_   = 0;   // #365: see unansweredHomed()
     uint64_t    homedSessionsLost_ = 0;
     uint64_t    seedBoundEnded_    = 0;   ///< E2 FU1: ended by endSeedBound (SessionLost)
     std::vector<int64_t> homedScratch_;   // driveHomed: lost bound ones (cold; capacity reused)

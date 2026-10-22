@@ -2925,6 +2925,10 @@ int Client::dutyCycle(int64_t nowNs) {
         work += subscriberHub_.driveHomed(
             agent_.seedSession().machine.sessionId(),
             std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg_.subscribeTimeoutMs));
+        // #365: an unanswered Subscribe on a node session keeps the backoff-paced
+        // refresh armed (idempotent while armed) — its leader may have crashed;
+        // the answer re-routes it (driveHomed follows a moved route).
+        if (subscriberHub_.unansweredHomed() != 0) [[unlikely]] scheduleMetadataRefresh();
     }
 
     // 3b'. F8c C3: control frames the transport refused (Retry), in order.
