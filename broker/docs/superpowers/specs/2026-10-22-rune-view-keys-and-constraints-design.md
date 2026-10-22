@@ -565,8 +565,8 @@ Each part can be shipped on its own:
 3. Composite keys, the prefix index, `GetViewRowK`, `ScanViewRows` and the client read API. Covers §5.4 and §8.
 4. Rune QL `create view` (plan v2, the feature level) and `select`, plus the CLI. Covers §9.
 5. Constraints: the hook, the overlay, the gate, error 51 and the client's definite-reject and split path. Covers §6.1–§6.6 and §7.
-5c. `autoincrement`: the modulo partitioner, assignment in the hook, reservation records with cleaner retention, the `assignedBase` ack field, the `IMPORT` grant and the typed `insertAndWait` key result. Covers §11.
 5b. Write intents, the key index, and the typed `insert` / `update` / `remove` / `removeExisting` API. Covers §6.7. It reuses the part-5 hook.
+5c. `autoincrement`: the modulo partitioner, assignment in the hook, reservation records with cleaner retention, the `assignedBase` ack field, the `IMPORT` grant and the typed `insertAndWait` key result. Covers §11.
 6. Docs: `ql.md`, `wire-protocol.md`, `client-cpp.md`, `admin-cli.md`, `CATALOG.md`, the root and client `CLAUDE.md`, and the site's views section, corrected to the shipped syntax.
 
 ## 15. Calls made in this design (owner to check)
