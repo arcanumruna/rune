@@ -6,6 +6,9 @@
 
 #include <bit>
 #include <rune/consensus/Election.h>
+
+#include <array>
+#include <span>
 #include <rune/consensus/ClusterMember.h>
 #include <flight_recorder/FlightRecorder.h>
 #include <algorithm>
@@ -88,6 +91,15 @@ Election::Election(bool             isNodeStartup,
     // detect a dead leader after leaderHeartbeatTimeoutNs_.
     followerLiveness_.configure(electionStatusIntervalNs_, leaderHeartbeatTimeoutNs_);
 
+    // Issue #82 (VLS A.4): the controller side of the view read lease (QL from the members' echoes, H = the stickiness
+    // window every voter honours).  Fixed arrays: no allocation after this.
+    {
+        std::array<NodeId, ReadLeaseGrantor::kMaxMembers> ids{};
+        std::size_t n = 0;
+        for (const ClusterMember& m : clusterMembers_) if (n < ids.size()) ids[n++] = m.id;
+        leaseGrantor_.configure(std::span<const NodeId>(ids.data(), n), thisMemberId_, leaderHeartbeatTimeoutNs_);
+    }
+
     // Pre-allocate rankedPositions for quorumPosition — no alloc in the hot path.
     const int threshold = ClusterMember::quorumThreshold(
         static_cast<int>(clusterMembers_.size()));
@@ -139,11 +151,19 @@ std::size_t Election::eligibleNodeIds(int64_t nowNs, int64_t timeoutNs,
     // clocks were reset at canvass) — for one window from its first leader
     // state every peer counts as live, so it never fails partitions over to
     // itself with ISR={self}.  A dead peer is dropped after the window.
-    const bool leaderGrace = selfLeads && leaderSinceNs_ != INT64_MIN && nowNs - leaderSinceNs_ < timeoutNs;
+    // Issue #82 (VLS A.6): the grace lasts at least W - a lease the previous controller granted (it may have stood down:
+    // StandDown / TermFloorNotice drop the voters' stickiness, so QL did not bound the successor's election) has ended
+    // before this controller fails any of that broker's partitions over.
+    const int64_t graceNs = std::max(timeoutNs, readLeaseFenceWaitNs());
+    const bool leaderGrace = selfLeads && leaderSinceNs_ != INT64_MIN && nowNs - leaderSinceNs_ < graceNs;
+    // Issue #82: a member holding a lease THIS controller granted is never judged dead (a configured liveness timeout
+    // shorter than a lease must not fail a partition over while its old leader may still serve view reads).
+    const int64_t leaseNow = selfLeads ? leaseNow_() : 0;
     std::size_t n = 0;
     for (const ClusterMember& m : clusterMembers_) {
         const bool isSelfLeaderEntry = selfLeads && (m.id == selfId);
-        if (isSelfLeaderEntry || leaderGrace || m.isActive(nowNs, timeoutNs)) {
+        if (isSelfLeaderEntry || leaderGrace || m.isActive(nowNs, timeoutNs) ||
+            (selfLeads && leaseGrantor_.leaseMayRun(m.id, leaseNow))) {
             if (n < cap) out[n++] = m.id;
         }
     }
@@ -1347,6 +1367,11 @@ int Election::closedLeaderHeartbeat(int64_t nowNs)
         if (act.sendAppendPosition) {
             publisher_.appendPosition(leaderMember_->id, leadershipTermId_,
                                       logPosition_, thisMemberId_, /*flags=*/0);
+            // Issue #82 (VLS A.4): the view read lease request rides the same cadence (its send time is the lease's
+            // start on THIS node's lease clock, recorded before the send).
+            const ReadLeaseHolder::Request rq = leaseHolder_.nextRequest(leaseNow_());
+            publisher_.readLeaseRequest(leaderMember_->id, leadershipTermId_, thisMemberId_, rq.reqSeq,
+                                        rq.heardGrantSeq);
             return 1;
         }
         return 0;
@@ -1376,7 +1401,47 @@ int Election::closedLeaderHeartbeat(int64_t nowNs)
 
     timeOfLastUpdateNs_ = nowNs;
     publishNewLeadershipTermToAll(nowNs);
+    refreshSelfLease_();   // issue #82: the controller's own view read lease (QL-capped like every grant)
     return 1;
+}
+
+// Issue #82 (VLS A.4): the CLOSED leader grants itself a lease every heartbeat interval - capped by the same QL as every
+// grant, so a controller cut off from its majority stops serving view reads before a successor can exist (C4).
+void Election::refreshSelfLease_() noexcept
+{
+    const int64_t now = leaseNow_();
+    const int64_t v   = leaseGrantor_.selfValidForNs(now);
+    leaseHolder_.onSelfGrant(now, v, leaseCommitPos_());
+}
+
+// Issue #82 (VLS A.4): a follower asks for a lease.  Answered only by the CLOSED leader of that term.  The request
+// rides with the member's AppendPosition, so it counts as the member's liveness report too (a lost AppendPosition must
+// not make the member look dead while its lease requests arrive).
+void Election::onReadLeaseRequest(int64_t nowNs, Term term, NodeId memberId, int64_t reqSeq, int64_t heardGrantSeq)
+{
+    if (state_ != ElectionState::Closed || leaderMember_ == nullptr || leaderMember_->id != thisMemberId_) return;
+    if (term != leadershipTermId_ || memberId == thisMemberId_) return;
+    ClusterMember* m = memberById(memberId);
+    if (m == nullptr) return;
+    noteHeard_(memberId);
+    m->timeOfLastAppendPositionNs = nowNs;
+    const ReadLeaseGrantor::Grant g = leaseGrantor_.onRequest(memberId, heardGrantSeq, leaseNow_());
+    if (g.grantSeq < 0) return;
+    publisher_.readLeaseGrant(memberId, leadershipTermId_, thisMemberId_, memberId, reqSeq, g.grantSeq,
+                              leaseCommitPos_(), g.validForNs);
+}
+
+// Issue #82 (VLS A.4): the leader this CLOSED follower follows answered a request.  A grant is a leader heartbeat
+// (C4: the stickiness that bounds QL runs from here) and, when validForNs > 0, a lease.
+void Election::onReadLeaseGrant(int64_t nowNs, Term term, NodeId leaderMemberId, NodeId memberId, int64_t reqSeq,
+                                int64_t grantSeq, int64_t commitPos, int64_t validForNs)
+{
+    if (memberId != thisMemberId_ || state_ != ElectionState::Closed) return;
+    if (leaderMember_ == nullptr || leaderMember_->id != leaderMemberId || leaderMemberId == thisMemberId_) return;
+    if (term != leadershipTermId_) return;
+    noteLeaderHeard_(leaderMemberId, term, nowNs);
+    followerLiveness_.onLeaderHeartbeat(nowNs);
+    (void)leaseHolder_.onGrant(reqSeq, grantSeq, commitPos, validForNs);
 }
 
 // ClosedLeaderStepDownRegression: the leader itself is always active
@@ -1702,8 +1767,10 @@ void Election::electionComplete(int64_t nowNs)
     // a leader (or a not-yet-following node) from being force-re-canvassed.
     if (leaderMember_ != nullptr && leaderMember_->id != thisMemberId_) {
         followerLiveness_.onBecomeFollower(nowNs);  // arm liveness + schedule 1st send
+        leaseHolder_.onNewLeader();                 // issue #82: its grant sequence numbers are its own
     } else {
         followerLiveness_.reset();                  // leader / not-yet-following: disarm
+        if (leaderMember_ != nullptr) leaseGrantor_.onLeadership();   // issue #82: echoes of an earlier leadership
     }
 
     // BECOME-LEADER liveness grace (Aeron ConsensusModuleAgent.becomeLeader):

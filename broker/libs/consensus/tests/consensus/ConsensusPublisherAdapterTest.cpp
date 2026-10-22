@@ -818,3 +818,65 @@ TEST(ConsensusMessagesRegression, PreVoteAndFloorNoticeRoundTripThroughPublisher
     adapter.onFragment(0, sink.last().bytes.data(), sink.last().bytes.size() - 1);   // truncated: ignored
     EXPECT_EQ(h.notice, 1);
 }
+
+// Issue #82 (VLS A.4): ReadLeaseRequest (63) / ReadLeaseGrant (64) through the production SBE publisher and adapter - a
+// missing override anywhere (publisher, adapter, agent) would leave every view read answering NotLeader.  Truncated
+// frames are ignored; an adapter whose handler has no lease handlers (an older broker) ignores both.
+namespace {
+struct LeaseHandler {
+    int req = 0, grant = 0;
+    Term term = 0; NodeId member = -1, leader = -1; int64_t reqSeq = 0, heard = 0, grantSeq = 0, commitPos = 0, validFor = 0;
+    void onCanvassPosition(int64_t, Term, int64_t, Term, NodeId, int32_t) {}
+    void onRequestVote(int64_t, Term, int64_t, Term, NodeId, int32_t) {}
+    void onVote(int64_t, Term, Term, int64_t, NodeId, NodeId, bool) {}
+    void onNewLeadershipTerm(int64_t, Term, Term, int64_t, int64_t, Term, int64_t, int64_t, int64_t,
+                             int64_t, NodeId, int32_t, int32_t, bool, int64_t) {}
+    void onAppendPosition(int64_t, Term, int64_t, NodeId, uint8_t) {}
+    void onCommitPosition(int64_t, Term, int64_t, NodeId) {}
+    void onReadLeaseRequest(int64_t, Term t, NodeId m, int64_t rs, int64_t h) { ++req; term = t; member = m; reqSeq = rs; heard = h; }
+    void onReadLeaseGrant(int64_t, Term t, NodeId l, NodeId m, int64_t rs, int64_t gs, int64_t cp, int64_t v) {
+        ++grant; term = t; leader = l; member = m; reqSeq = rs; grantSeq = gs; commitPos = cp; validFor = v;
+    }
+};
+struct OldHandler {   // a pre-#82 broker: no lease handlers
+    int calls = 0;
+    void onCanvassPosition(int64_t, Term, int64_t, Term, NodeId, int32_t) { ++calls; }
+    void onRequestVote(int64_t, Term, int64_t, Term, NodeId, int32_t) { ++calls; }
+    void onVote(int64_t, Term, Term, int64_t, NodeId, NodeId, bool) { ++calls; }
+    void onNewLeadershipTerm(int64_t, Term, Term, int64_t, int64_t, Term, int64_t, int64_t, int64_t,
+                             int64_t, NodeId, int32_t, int32_t, bool, int64_t) { ++calls; }
+    void onAppendPosition(int64_t, Term, int64_t, NodeId, uint8_t) { ++calls; }
+    void onCommitPosition(int64_t, Term, int64_t, NodeId) { ++calls; }
+};
+}
+TEST(ConsensusMessagesRegression, ReadLeaseRequestAndGrantRoundTripThroughPublisherAndAdapterRegression) {
+    LoopbackSink sink;
+    SbeConsensusPublisher pub(sink);
+    LeaseHandler h;
+    BasicConsensusAdapter<LeaseHandler> adapter{h};
+    pub.readLeaseRequest(/*to=*/1, /*term=*/9, /*member=*/2, /*reqSeq=*/77, /*heard=*/66);
+    EXPECT_EQ(sink.last().toMember, 1);
+    EXPECT_EQ(sink.last().bytes.size(), ReadLeaseRequestMsg::TOTAL_SIZE);
+    adapter.onFragment(0, sink.last().bytes.data(), sink.last().bytes.size());
+    ASSERT_EQ(h.req, 1);
+    EXPECT_EQ(h.term, 9); EXPECT_EQ(h.member, 2); EXPECT_EQ(h.reqSeq, 77); EXPECT_EQ(h.heard, 66);
+    adapter.onFragment(0, sink.last().bytes.data(), sink.last().bytes.size() - 1);   // truncated: ignored
+    EXPECT_EQ(h.req, 1);
+    pub.readLeaseGrant(/*to=*/2, /*term=*/9, /*leader=*/1, /*member=*/2, /*reqSeq=*/77, /*grantSeq=*/88,
+                       /*commitPos=*/123456789, /*validFor=*/111'222'333);
+    EXPECT_EQ(sink.last().toMember, 2);
+    EXPECT_EQ(sink.last().bytes.size(), ReadLeaseGrantMsg::TOTAL_SIZE);
+    adapter.onFragment(0, sink.last().bytes.data(), sink.last().bytes.size());
+    ASSERT_EQ(h.grant, 1);
+    EXPECT_EQ(h.term, 9); EXPECT_EQ(h.leader, 1); EXPECT_EQ(h.member, 2); EXPECT_EQ(h.reqSeq, 77);
+    EXPECT_EQ(h.grantSeq, 88); EXPECT_EQ(h.commitPos, 123456789); EXPECT_EQ(h.validFor, 111'222'333);
+    adapter.onFragment(0, sink.last().bytes.data(), sink.last().bytes.size() - 1);
+    EXPECT_EQ(h.grant, 1);
+    OldHandler o;
+    BasicConsensusAdapter<OldHandler> old{o};
+    old.onFragment(0, sink.last().bytes.data(), sink.last().bytes.size());
+    EXPECT_EQ(o.calls, 0) << "an older broker ignores the lease templates";
+    EXPECT_EQ(peekTemplateId(sink.last().bytes.data()), 64);
+    EXPECT_EQ(static_cast<uint16_t>(ConsensusTemplateId::ReadLeaseRequest), 63);
+    EXPECT_EQ(static_cast<uint16_t>(ConsensusTemplateId::ReadLeaseGrant), 64);
+}

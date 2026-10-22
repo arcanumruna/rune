@@ -41,6 +41,8 @@
 #include <rune/consensus/Types.h>
 #include <rune/consensus/AckTerm.h>
 #include <rune/consensus/CandidacyState.h>
+#include <rune/consensus/LeaseClock.h>
+#include <rune/consensus/ReadLease.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -313,6 +315,26 @@ public:
     /// D29/D24: a member refused our NewLeadershipTerm for `refusedTermId` because its
     /// follow floor `floorTermId` is above it — the leader steps down (template 62).
     void onTermFloorNotice(int64_t nowNs, NodeId fromMember, Term floorTermId, Term refusedTermId);
+
+    // -----------------------------------------------------------------------
+    // Issue #82 (VLS Part A): the view read lease (ReadLease.h).  A CLOSED follower sends ReadLeaseRequest (63) with
+    // every AppendPosition; the CLOSED leader answers each with a quorum-capped ReadLeaseGrant (64) and grants itself
+    // one every heartbeat.  A grant is a leader heartbeat for its recipient (a C4 "heard" source).  Every lease bound is
+    // measured on the LEASE clock (LeaseClock.h: counts suspend), never on the duty clock `nowNs`.
+    // -----------------------------------------------------------------------
+    void onReadLeaseRequest(int64_t nowNs, Term term, NodeId memberId, int64_t reqSeq, int64_t heardGrantSeq);
+    void onReadLeaseGrant(int64_t nowNs, Term term, NodeId leaderMemberId, NodeId memberId, int64_t reqSeq,
+                          int64_t grantSeq, int64_t commitPos, int64_t validForNs);
+    /// The leases this node holds (its own as a controller included).  Duty-cycle thread.
+    [[nodiscard]] const ReadLeaseHolder& readLease() const noexcept { return leaseHolder_; }
+    [[nodiscard]] const ReadLeaseGrantor& readLeaseGrantorForTest() const noexcept { return leaseGrantor_; }
+    /// The controller's metadata log end (the grant's commitPos), read when a grant is sent.  nullptr = 0 (tests).
+    using CommitPosSource = int64_t (*)(void* ctx) noexcept;
+    void setReadLeaseCommitPosSource(CommitPosSource fn, void* ctx) noexcept { commitPosFn_ = fn; commitPosCtx_ = ctx; }
+    /// Test seam: an injected lease clock (default: leaseClockNowNs).  Construction time, before the first doWork.
+    void setLeaseClockForTest(LeaseClockFn fn, void* ctx) noexcept { leaseClockFn_ = fn; leaseClockCtx_ = ctx; }
+    /// W (ReadLease.h leaseFenceWaitNs): a lease granted before a moment may outlive it by at most this, on any clock.
+    [[nodiscard]] int64_t readLeaseFenceWaitNs() const noexcept { return leaseFenceWaitNs(leaderHeartbeatTimeoutNs_); }
     [[nodiscard]] bool     preBallotActiveForTest() const noexcept { return preBallot_.active; }
     [[nodiscard]] Term     preBallotTermForTest() const noexcept { return preBallot_.term; }
     [[nodiscard]] uint64_t preBallotsLostForTest() const noexcept { return preBallotsLost_; }
@@ -461,6 +483,8 @@ private:
         RUNE_ELECTION_PUB_FWD(preVoteRequest)
         RUNE_ELECTION_PUB_FWD(preVoteResponse)
         RUNE_ELECTION_PUB_FWD(termFloorNotice)
+        RUNE_ELECTION_PUB_FWD(readLeaseRequest)
+        RUNE_ELECTION_PUB_FWD(readLeaseGrant)
 #undef RUNE_ELECTION_PUB_FWD
     };
     static_assert(std::is_final_v<SbeConsensusPublisher>);
@@ -672,6 +696,20 @@ private:
     /// CRITICAL-R3: the candidate's own vote counts only if its own durable
     /// knowledge admits it (re-evaluated every ballot step).
     void gateSelfVote_() noexcept;
+
+    // Issue #82 (VLS Part A): the view read lease.
+    ReadLeaseGrantor leaseGrantor_{};
+    ReadLeaseHolder  leaseHolder_{};
+    CommitPosSource  commitPosFn_   = nullptr;
+    void*            commitPosCtx_  = nullptr;
+    LeaseClockFn     leaseClockFn_  = nullptr;
+    void*            leaseClockCtx_ = nullptr;
+    [[nodiscard]] int64_t leaseNow_() const noexcept {
+        return leaseClockFn_ != nullptr ? leaseClockFn_(leaseClockCtx_) : leaseClockNowNs();
+    }
+    [[nodiscard]] int64_t leaseCommitPos_() const noexcept { return commitPosFn_ != nullptr ? commitPosFn_(commitPosCtx_) : 0; }
+    /// The CLOSED leader's own lease, refreshed every heartbeat interval.
+    void refreshSelfLease_() noexcept;
 };
 
 } // namespace rune::consensus

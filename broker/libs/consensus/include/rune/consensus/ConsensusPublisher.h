@@ -34,6 +34,11 @@ struct ConsensusPublisher {
                                  Term /*voterTermId*/) {}
     virtual void termFloorNotice(NodeId /*toMember*/, NodeId /*fromMember*/,
                                  Term /*floorTermId*/, Term /*refusedTermId*/) {}
+    // Issue #82 (VLS A.4): ReadLeaseRequest (63) / ReadLeaseGrant (64).  Default: not sent (test doubles).
+    virtual void readLeaseRequest(NodeId /*toMember*/, Term /*term*/, NodeId /*memberId*/, int64_t /*reqSeq*/,
+                                  int64_t /*heardGrantSeq*/) {}
+    virtual void readLeaseGrant(NodeId /*toMember*/, Term /*term*/, NodeId /*leaderMemberId*/, NodeId /*memberId*/,
+                                int64_t /*reqSeq*/, int64_t /*grantSeq*/, int64_t /*commitPos*/, int64_t /*validForNs*/) {}
 
 
     /// Controlled shutdown (Raft leadership transfer / Aeron graceful leader

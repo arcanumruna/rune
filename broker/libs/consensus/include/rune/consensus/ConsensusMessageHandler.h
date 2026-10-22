@@ -26,6 +26,12 @@ struct ConsensusMessageHandler {
                                    Term /*voterTermId*/) {}
     virtual void onTermFloorNotice(int64_t /*nowNs*/, NodeId /*fromMember*/,
                                    Term /*floorTermId*/, Term /*refusedTermId*/) {}
+    // Issue #82 (VLS A.4): templates 63 (ReadLeaseRequest) and 64 (ReadLeaseGrant).  Default: ignored.
+    virtual void onReadLeaseRequest(int64_t /*nowNs*/, Term /*term*/, NodeId /*memberId*/, int64_t /*reqSeq*/,
+                                    int64_t /*heardGrantSeq*/) {}
+    virtual void onReadLeaseGrant(int64_t /*nowNs*/, Term /*term*/, NodeId /*leaderMemberId*/, NodeId /*memberId*/,
+                                  int64_t /*reqSeq*/, int64_t /*grantSeq*/, int64_t /*commitPos*/,
+                                  int64_t /*validForNs*/) {}
 
     // Dispatched from templateId=50 (CanvassPosition)
     virtual void onCanvassPosition(

@@ -83,6 +83,9 @@ public:
                           NodeId candidateId) override;
     void onPreVoteResponse(int64_t nowNs, Term term, NodeId voterId, bool granted, Term voterTermId) override;
     void onTermFloorNotice(int64_t nowNs, NodeId fromMember, Term floorTermId, Term refusedTermId) override;
+    void onReadLeaseRequest(int64_t nowNs, Term term, NodeId memberId, int64_t reqSeq, int64_t heardGrantSeq) override;
+    void onReadLeaseGrant(int64_t nowNs, Term term, NodeId leaderMemberId, NodeId memberId, int64_t reqSeq,
+                          int64_t grantSeq, int64_t commitPos, int64_t validForNs) override;
 
     void onCanvassPosition(
         int64_t nowNs,
