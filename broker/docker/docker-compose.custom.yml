@@ -15,13 +15,13 @@
 #   (cd broker && docker build --platform linux/amd64 \
 #       --build-context rune-protocol=../protocol --build-context flight-recorder=${FLIGHT_RECORDER_DIR:-../../flight-recorder} \
 #       --build-context rune-codec=../codec --build-context rune-crypto=../crypto \
-#       -f docker/Dockerfile -t rune-broker:latest .)
+#       -f docker/Dockerfile -t rune:latest .)
 
 name: rune-cluster
 
 services:
   rune-1:
-    image: ${RUNE_IMAGE:-rune-broker:latest}
+    image: ${RUNE_IMAGE:-rune:latest}
     platform: linux/amd64
     hostname: rune-1
     # DR-BUG-RESTART-BIND: these fixed ports lie inside Linux's ephemeral range (32768-60999); reserved (a
@@ -84,7 +84,7 @@ services:
     restart: unless-stopped
 
   rune-2:
-    image: ${RUNE_IMAGE:-rune-broker:latest}
+    image: ${RUNE_IMAGE:-rune:latest}
     platform: linux/amd64
     hostname: rune-2
     # DR-BUG-RESTART-BIND: these fixed ports lie inside Linux's ephemeral range (32768-60999); reserved (a
@@ -142,7 +142,7 @@ services:
     restart: unless-stopped
 
   rune-3:
-    image: ${RUNE_IMAGE:-rune-broker:latest}
+    image: ${RUNE_IMAGE:-rune:latest}
     platform: linux/amd64
     hostname: rune-3
     # DR-BUG-RESTART-BIND: these fixed ports lie inside Linux's ephemeral range (32768-60999); reserved (a

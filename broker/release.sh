@@ -3,7 +3,7 @@
 #
 # Cuts a broker release from main: VERSION.txt X.Y.Z-snapshot -> X.Y.Z, tags broker-vX.Y.Z,
 # sets the next snapshot and pushes both commits and the tag. The tag push triggers
-# .github/workflows/broker-image.yml, which builds and publishes ghcr.io/<owner>/rune-broker:X.Y.Z.
+# .github/workflows/broker-image.yml, which builds and publishes ghcr.io/<owner>/rune:X.Y.Z.
 # The "broker-" prefix keeps broker tags apart from the other components' tags in this monorepo.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"

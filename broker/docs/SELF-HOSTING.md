@@ -23,7 +23,7 @@ docker build \
   --build-context rune-codec=../codec \
   --build-context rune-crypto=../crypto \
   -f docker/Dockerfile \
-  -t rune-broker:latest \
+  -t rune:latest \
   .
 ```
 
@@ -91,7 +91,7 @@ code 78) and prints the command to run. Format once, before the first start:
 With Docker, run the command against the volume before starting the broker:
 
 ```sh
-docker run --rm -v rune-data:/var/lib/rune -e RUNE_DATA_DIR=/var/lib/rune rune-broker:latest \
+docker run --rm -v rune-data:/var/lib/rune -e RUNE_DATA_DIR=/var/lib/rune rune:latest \
     rune_broker storage format --new
 ```
 
@@ -491,7 +491,7 @@ single-box deployments.
 Format the data volume once (see "Formatting the data directory"):
 
 ```sh
-docker run --rm -v rune-data:/var/lib/rune -e RUNE_DATA_DIR=/var/lib/rune rune-broker:latest rune_broker storage format --new
+docker run --rm -v rune-data:/var/lib/rune -e RUNE_DATA_DIR=/var/lib/rune rune:latest rune_broker storage format --new
 ```
 
 Then start the broker (with the cluster key of [Authentication is on by default](#authentication-is-on-by-default);
@@ -509,7 +509,7 @@ docker run --rm \
   -e RUNE_CLIENT_ENDPOINT='0.0.0.0:40200' \
   -e RUNE_DATA_DIR=/var/lib/rune \
   -v rune-data:/var/lib/rune \
-  rune-broker:latest
+  rune:latest
 ```
 
 Expected within a few seconds:
@@ -669,7 +669,7 @@ volumes, no host ports, `build:` from source). For your own deployment use the
 # 1. Build (or pull) the image once (see "Build the image" above for the four build contexts)
 docker build --platform linux/amd64 --build-context rune-protocol=../protocol \
     --build-context flight-recorder="$FLIGHT_RECORDER_DIR" --build-context rune-codec=../codec \
-    --build-context rune-crypto=../crypto -f docker/Dockerfile -t rune-broker:latest .
+    --build-context rune-crypto=../crypto -f docker/Dockerfile -t rune:latest .
 
 # 2. Copy + edit the env file
 cp docker/rune-cluster.env.example docker/rune-cluster.env
@@ -714,13 +714,13 @@ docker run -d --name rune-0 --platform linux/amd64 --shm-size=256m \
   -e RUNE_ELECTION_STATUS_INTERVAL_MS=200 \
   -e RUNE_STARTUP_CANVASS_TIMEOUT_MS=2000 \
   -v /srv/rune/node0:/var/lib/rune \
-  rune-broker:latest
+  rune:latest
 ```
 
 Also publish the per-worker UDP ports, which shard mode derives from the node id (`8200 + 192 × id` and the next 191 ports;
 see [Derived ports](../../docs/configuration.md#derived-ports)).
 
 Before the first start, format `/srv/rune/node0` once on each host (`docker run --rm -v /srv/rune/node0:/var/lib/rune
--e RUNE_DATA_DIR=/var/lib/rune rune-broker:latest rune_broker storage format --new`; see "Formatting the data
+-e RUNE_DATA_DIR=/var/lib/rune rune:latest rune_broker storage format --new`; see "Formatting the data
 directory"). Repeat on `hostB` (`RUNE_NODE_ID=1`) and `hostC` (`RUNE_NODE_ID=2`) with the **same**
 `RUNE_PEERS`. Raise the election timings for WAN latency (shown above).
