@@ -138,6 +138,7 @@ void GroupConsumerHub::completeRewind_(GroupConsumerImpl& impl, OpStatus st, std
     Token token = 0;
     if (const auto* a = std::get_if<R::RewindAwaitFetch>(&impl.rewind)) { kind = a->kind; target = a->target; token = a->token; }
     else if (const auto* b = std::get_if<R::RewindResubscribe>(&impl.rewind)) { kind = b->kind; target = b->target; token = b->token; }
+    else if (const auto* c = std::get_if<R::RewindAwaitSession>(&impl.rewind)) { kind = c->kind; target = c->target; token = c->token; }
     else return;
     // Cleared BEFORE delivery: a handler may issue a new rewind (applied directly on this
     // thread) — it must find none pending to supersede.
@@ -151,9 +152,56 @@ void GroupConsumerHub::completeRewind_(GroupConsumerImpl& impl, OpStatus st, std
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
 }
 
+/*static*/
+bool GroupConsumerHub::rewindInFlight_(const GroupConsumerImpl& impl) noexcept {
+    using R = GroupConsumerImpl;
+    // A parked rewind (RewindAwaitSession) is waiting for a session: nothing of it was sent, so nothing is lost
+    // when a session goes away.
+    return !std::holds_alternative<R::NoRewind>(impl.rewind) && !std::holds_alternative<R::RewindAwaitSession>(impl.rewind);
+}
+
+// The one set of checks a rewind passes before it starts (at issue, and again when a parked rewind is applied).
+// Returns false and fills `st` / `text` when it is refused.
+bool GroupConsumerHub::rewindAdmissible_(const GroupConsumerImpl& impl, bool isSeek, const TopicPartition& seekTp,
+                                         OpStatus& st, std::string_view& text) const {
+    if (!impl.active) { st = OpStatus::Closed; return false; }
+    if (isSeek) {
+        if (impl.state != GroupConsumerState::Stable || impl.assignment.find(seekTp) == impl.assignment.end()) {
+            st = OpStatus::InvalidArgument; text = "partition not assigned"; return false;
+        }
+    } else if (impl.state != GroupConsumerState::Stable) {
+        // The (re)join re-seeds every position from the committed offsets anyway.
+        st = OpStatus::Rejoined; return false;
+    }
+    if (!routed_()) { st = OpStatus::InvalidArgument; text = "fetch routing unavailable"; return false; }
+    return true;
+}
+
 void GroupConsumerHub::advanceRewind_(GroupConsumerImpl& impl, int64_t nowNs) {
     using R = GroupConsumerImpl;
     if (std::holds_alternative<R::NoRewind>(impl.rewind)) return;
+    if (const auto* parked = std::get_if<R::RewindAwaitSession>(&impl.rewind)) {
+        // #494: issued while the coordinator session was down.  Never started, so the generation / Stable check of
+        // the started states does not apply: it ends at its deadline, or is applied once a session is back.
+        if (nowNs >= parked->deadlineNs) { completeRewind_(impl, OpStatus::Timeout); return; }
+        if (!sessionConnected_) return;   // keep waiting
+        const R::RewindAwaitSession p = *parked;
+        impl.rewind = R::NoRewind{};
+        const bool isSeek = p.kind == OpKind::Seek;
+        OpStatus st{};
+        std::string_view text;
+        if (!rewindAdmissible_(impl, isSeek, p.seekTp, st, text)) {
+            Completion c;
+            c.token  = p.token;
+            c.op     = p.kind;
+            c.status = st;
+            completions_.deliver(p.target, c,
+                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
+            return;
+        }
+        startRewind_(&impl, p.kind, p.target, p.token, p.seekTp, p.seekOffset, p.deadlineNs);
+        return;
+    }
     auto deadline = [&] {
         if (const auto* a = std::get_if<R::RewindAwaitFetch>(&impl.rewind)) return a->deadlineNs;
         return std::get<R::RewindResubscribe>(impl.rewind).deadlineNs;
@@ -206,17 +254,33 @@ void GroupConsumerHub::applyRewind_(const detail::HubCommand& cmd, GroupConsumer
     if (isSeek) {
         seekTp = TopicPartition{static_cast<int32_t>(static_cast<uint64_t>(cmd.e) >> 32),
                                 static_cast<int32_t>(static_cast<uint32_t>(cmd.e))};
-        if (impl->state != GroupConsumerState::Stable || impl->assignment.find(seekTp) == impl->assignment.end()) {
-            reply(OpStatus::InvalidArgument, "partition not assigned");
-            return;
-        }
-    } else if (impl->state != GroupConsumerState::Stable) {
-        // The (re)join re-seeds every position from the committed offsets anyway.
-        reply(OpStatus::Rejoined);
+    }
+    OpStatus refusal{};
+    std::string_view refusalText;
+    if (!rewindAdmissible_(*impl, isSeek, seekTp, refusal, refusalText)) { reply(refusal, refusalText); return; }
+    // The deadline is fixed ONCE, at issue, and carried through a wait for the session.
+    const int64_t deadlineNs = nowNs + static_cast<int64_t>(impl->cfg.commitSyncTimeoutMs) * 1'000'000LL;
+    if (!sessionConnected_) {   // #494: wait for the coordinator session, bounded by the op's own deadline
+        // A rewind already pending is superseded (exactly once) and replaced.
+        completeRewind_(*impl, OpStatus::Superseded);
+        if (!impl->active) { reply(OpStatus::Closed); return; }   // its handler closed the consumer
+        impl->rewind = R::RewindAwaitSession{kind, target, token, deadlineNs, seekTp, cmd.d};
         return;
     }
-    if (!routed_()) { reply(OpStatus::InvalidArgument, "fetch routing unavailable"); return; }
-    if (!sessionConnected_) { reply(OpStatus::SessionLost); return; }
+    startRewind_(impl, kind, target, token, seekTp, cmd.d, deadlineNs);
+}
+
+void GroupConsumerHub::startRewind_(GroupConsumerImpl* impl, OpKind kind, const detail::OpTarget& target, Token token,
+                                    const TopicPartition& seekTp, int64_t seekOffset, int64_t deadlineNs) {
+    using R = GroupConsumerImpl;
+    const bool isSeek = kind == OpKind::Seek;
+    auto reply = [&](OpStatus st) {
+        Completion c;
+        c.token  = token;
+        c.op     = kind;
+        c.status = st;
+        completions_.deliver(target, c, {});
+    };
     // A rewind already pending is superseded (exactly once) and replaced.
     completeRewind_(*impl, OpStatus::Superseded);
     if (!impl->active) { reply(OpStatus::Closed); return; }   // its handler closed the consumer
@@ -231,9 +295,8 @@ void GroupConsumerHub::applyRewind_(const detail::HubCommand& cmd, GroupConsumer
         fs.parked       = false;
         fs.redirects    = 0;
     };
-    const int64_t deadlineNs = nowNs + static_cast<int64_t>(impl->cfg.commitSyncTimeoutMs) * 1'000'000LL;
     if (isSeek) {
-        restart(seekTp, impl->assignment.find(seekTp)->second, cmd.d, /*known=*/true);
+        restart(seekTp, impl->assignment.find(seekTp)->second, seekOffset, /*known=*/true);
         impl->rewind = R::RewindResubscribe{kind, target, token, deadlineNs, impl->generationId};
     } else {
         if (impl->assignment.empty()) { reply(OpStatus::Ok); return; }
@@ -287,7 +350,7 @@ void GroupConsumerHub::setSessionConnected(bool connected, int64_t sessionId, in
         // inside a hub walk).
         for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {
             completeCommitSync_(*impls_[ix], OpStatus::SessionLost);
-            completeRewind_(*impls_[ix], OpStatus::SessionLost);
+            if (rewindInFlight_(*impls_[ix])) completeRewind_(*impls_[ix], OpStatus::SessionLost);   // #494
         }
     }
     sessionConnected_ = connected;
@@ -1489,7 +1552,7 @@ int GroupConsumerHub::flushRequestedCommits(int64_t sessionId)
 bool GroupConsumerHub::hasPendingCommitSync() const noexcept
 {
     for (const auto& impl : impls_) {
-        if (impl->hasCommitSync || !std::holds_alternative<GroupConsumerImpl::NoRewind>(impl->rewind)) return true;
+        if (impl->hasCommitSync || rewindInFlight_(*impl)) return true;   // #494: a parked rewind does not count
     }
     return false;
 }
@@ -1500,7 +1563,7 @@ void GroupConsumerHub::onSessionDown()
         GroupConsumerImpl* const impl = impls_[ix];
         if (impl->active) {
             completeCommitSync_(*impl, OpStatus::SessionLost);
-            completeRewind_(*impl, OpStatus::SessionLost);
+            if (rewindInFlight_(*impl)) completeRewind_(*impl, OpStatus::SessionLost);   // #494
         }
     }
 }

@@ -343,7 +343,8 @@ struct GroupConsumerImpl {
     int64_t commitSyncCorrId {0};   // 0 = its OffsetCommit not sent yet
 
     // Phase 2b F (Task 10): the pending rewind (seekToCommitted / seek) — at most one,
-    // each state holds exactly what it needs (duty thread only).  Completed exactly once
+    // each state holds exactly what it needs (duty thread only; RewindAwaitSession: issued while the coordinator
+    // session is down, waiting for one).  Completed exactly once
     // (Ok when every rewound partition is re-subscribed; Superseded / Rejoined / Closed /
     // SessionLost / Timeout otherwise).
     struct NoRewind {};
@@ -352,7 +353,11 @@ struct GroupConsumerImpl {
     /// Every rewound partition has its start offset (seekToCommitted: fetched; seek: given): waiting
     /// for each one's new subscription to bind.
     struct RewindResubscribe { OpKind kind = OpKind::SeekToCommitted; detail::OpTarget target{}; Token token = 0; int64_t deadlineNs = 0; int32_t generation = 0; };
-    using Rewind = std::variant<NoRewind, RewindAwaitFetch, RewindResubscribe>;
+    /// #494: issued while the coordinator session is down: waits for a session (bounded by deadlineNs), then is
+    /// applied as if issued then.  Holds the request itself (seek: the partition and offset).  Nothing of it was
+    /// sent, so a session loss does not touch it.
+    struct RewindAwaitSession { OpKind kind = OpKind::SeekToCommitted; detail::OpTarget target{}; Token token = 0; int64_t deadlineNs = 0; TopicPartition seekTp{}; int64_t seekOffset = 0; };
+    using Rewind = std::variant<NoRewind, RewindAwaitFetch, RewindResubscribe, RewindAwaitSession>;
     Rewind rewind{};
 
     // A generation snapshot the near-full status ring refused (fix1 I4).

@@ -1413,3 +1413,43 @@ TEST(EosBrokerRegression, PipelineSurvivesTheCoordinatorCrashWithSeekToCommitted
     cc->close();
 }
 
+
+// =========================================================================================================
+// #494: eos-e2e step 3a's failure, isolated: right after the group / transaction coordinator (the controller)
+// crashes, a rewind (seekToCommitted) issued the way eos_probe retries it - up to 20 attempts, 200 ms apart -
+// must succeed.  The client gives a crashed coordinator's session up only after kCoordDownFallbackNs (5 s); until
+// then every seekToCommitted used to complete SessionLost at once, so a caller with a ~4 s retry budget gave up.
+// =========================================================================================================
+TEST(EosBrokerRegression, SeekToCommittedRightAfterTheCoordinatorCrashSucceedsWithinTheProbesRetryBudgetRegression) {
+    Env e("eos_seek_crash");
+    const rc::TopicSpec in = e.define("eos.in", kParts);
+    const int seed = e.otherThan(e.ctl);
+    auto cc = std::make_unique<rc::Client>(e.cfg(seed, {in}));
+    rc::GroupConfig gcfg;
+    gcfg.autoCommit       = false;
+    gcfg.autoOffsetReset  = rc::OffsetReset::Earliest;
+    gcfg.sessionTimeoutMs = 10'000;
+    rc::GroupConsumer gc = cc->subscribeGroup("eos-seek-g", {"eos.in"}, gcfg);
+    gc.onRecords([](const rc::RecordSet&) {});
+    cc->connectAndWait(30s);
+    // Stable in the group (a rewind needs it): pump until seekToCommitted succeeds once.
+    bool stable = false;
+    for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline && !stable;) {
+        try { gc.seekToCommittedAndWait(5s); stable = true; } catch (const std::exception&) { (void)cc->doWork(); }
+    }
+    ASSERT_TRUE(stable) << "the consumer never reached Stable";
+    e.c.crash(e.ctl);
+    int failures = 0;
+    std::string last;
+    bool ok = false;
+    for (int attempt = 0; attempt < 20 && !ok; ++attempt) {
+        try { gc.seekToCommittedAndWait(30s); ok = true; }
+        catch (const std::exception& ex) {
+            ++failures; last = ex.what();
+            for (const auto until = Clock::now() + 200ms; Clock::now() < until;) (void)cc->doWork();   // eos_probe: pumpFor(200)
+        }
+    }
+    EXPECT_TRUE(ok) << "seekToCommitted failed " << failures << " times after the coordinator crash: " << last;
+    gc.close();
+    cc->close();
+}
