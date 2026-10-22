@@ -51,6 +51,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <limits>
 #include <unistd.h>
 #include <vector>
 
@@ -1839,7 +1840,7 @@ protected:
         clock_ += kStep;
         n = service_->handleJoinGroup(req_, encodeJoinGroup(req_, sid, ++corr_, group, id, 5000), rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
         EXPECT_EQ(memberOf(n), id);
-        EXPECT_TRUE(driveUntil([&] { return service_->coordinator(group).state() == GroupState::Stable; }, 10));
+        EXPECT_TRUE(driveUntil([&] { return service_->coordinator(std::string(group)).state() == GroupState::Stable; }, 10));
         return {id, service_->coordinator(group).generationId()};
     }
     int16_t heartbeat(int64_t sid, const std::string& group, const std::string& member, int32_t gen) {
@@ -2994,4 +2995,230 @@ TEST(GroupCoordinationServiceRegression, ANonPositiveMaxSessionTimeoutKeepsTheDe
         (void)g.svc.handleJoinGroup(rq, encodeJoinGroup(rq, 1, 1, "g213neg", "", 5'000), pc::kClientVersion, g.clock, out, sizeof out);
         EXPECT_EQ(g.svc.coordinator("g213neg").rebalanceTimeoutMs(), 5'000);
     }
+}
+
+// ===========================================================================
+// #19: a group subscribe naming a view sink.  The sink is in the registry but holds no partitions, so the member used
+// to join and get an EMPTY assignment with no error.  It is refused InvalidRequest instead.
+// ===========================================================================
+class GroupJoinRegression : public CG3ServiceTest {
+protected:
+    static constexpr int32_t kSinkId = 5;
+    static constexpr int32_t kRealId = 6;
+
+    void SetUp() override {
+        CG3ServiceTest::SetUp();
+        TopicSpec sink = makeTopicSpec("m11-sink", /*partitions=*/2, kSinkId);
+        sink.viewSink  = true;
+        ASSERT_EQ(registry_->createTopicAt(kSinkId, sink), kSinkId);
+        ASSERT_TRUE(registry_->isViewSink(kSinkId));
+    }
+
+    pc::JoinGroupResponse join(std::initializer_list<int32_t> topicIds, std::string_view group) {
+        const std::vector<int32_t> ids(topicIds);
+        pc::JoinGroup msg;
+        msg.sessionId        = 1;
+        msg.correlationId    = 7;
+        msg.sessionTimeoutMs = 5000;
+        msg.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+        msg.memberId = std::span<const uint8_t>();
+        const std::size_t n = msg.encode(req_, std::span<const int32_t>(ids));
+        const std::size_t o = service_->handleJoinGroup(req_, n, rune::protocol::client::kClientVersion, clock_, out_, kBufSize);
+        auto r = pc::JoinGroupResponse::decode(out_, o);
+        EXPECT_TRUE(r.has_value());
+        if (!r) std::abort();
+        detail_.assign(r->detail);
+        r->detail = detail_;   // the decoded view points into out_, which the next call overwrites
+        return *r;
+    }
+    std::string detail_;
+};
+
+TEST_F(GroupJoinRegression, AGroupSubscribeToAViewSinkIsRefusedInvalidRequestRegression) {
+    const auto r = join({kSinkId}, "g19a");
+    EXPECT_EQ(r.errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_TRUE(r.memberId.empty());
+    EXPECT_NE(r.detail.find("view sink"), std::string_view::npos) << r.detail;
+    EXPECT_EQ(service_->coordinator("g19a").memberCount(), 0u);
+}
+
+TEST_F(GroupJoinRegression, AGroupSubscribeToASinkAndARealTopicIsRefusedWholeRegression) {
+    for (const auto& ids : {std::initializer_list<int32_t>{kTestTopicId, kSinkId},
+                            std::initializer_list<int32_t>{kSinkId, kTestTopicId}}) {
+        const auto r = join(ids, "g19b");
+        EXPECT_EQ(r.errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+        EXPECT_TRUE(r.memberId.empty());
+        EXPECT_EQ(service_->coordinator("g19b").memberCount(), 0u) << "the real topic must not admit the member";
+    }
+}
+
+TEST_F(GroupJoinRegression, AGroupSubscribeToARealTopicStillJoinsRegression) {
+    const auto r = join({kTestTopicId}, "g19c");
+    EXPECT_EQ(r.errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_FALSE(r.memberId.empty());
+    EXPECT_EQ(service_->coordinator("g19c").memberCount(), 1u);
+}
+
+// ===========================================================================
+// PR #548 review (adversarial, #19): the JoinGroup entry point (the frame the gateway hands over, with the session's
+// client version) attacked across version skew, input bounds, a live group's rebalance, a sink created and dropped
+// while the group lives, and the group filter.  The sibling entry points (plain / assign Subscribe, Produce, the
+// worker ingress, auth) are covered by ViewSinkRefusalRegression.* and
+// AuthUnappliedTopicRegression.AViewSinkIdAnswersLikeAMissingIdOnEveryTemplateAdversarialRegression.
+// ===========================================================================
+class GroupJoinAdversarial : public GroupJoinRegression {
+protected:
+    struct Answer { int16_t code; std::string memberId; std::string detail; int32_t generation; };
+    Answer joinAs(const std::vector<int32_t>& ids, std::string_view group, std::string_view memberId = {},
+                  int32_t version = pc::kClientVersion, std::span<const uint8_t> filter = {}) {
+        pc::JoinGroup msg;
+        msg.sessionId        = 1;
+        msg.correlationId    = ++corr_;
+        msg.sessionTimeoutMs = 5000;
+        msg.filter   = filter;
+        msg.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+        msg.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(memberId.data()), memberId.size());
+        const std::size_t n = msg.encode(req_, std::span<const int32_t>(ids));
+        EXPECT_GT(n, 0u);
+        const std::size_t o = service_->handleJoinGroup(req_, n, version, clock_, out_, kBufSize);
+        const auto r = pc::JoinGroupResponse::decode(out_, o);
+        EXPECT_TRUE(r.has_value());
+        if (!r) return {-1, {}, {}, -1};
+        EXPECT_EQ(r->correlationId, corr_) << "the refusal must answer THIS request";
+        return {r->errorCode, std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size()),
+                std::string(r->detail), r->generationId};
+    }
+    /// One member joined to the real topic and driven to Stable; returns its member id.
+    std::string stableMember(std::string_view group) {
+        const auto first = joinAs({kTestTopicId}, group);
+        EXPECT_EQ(first.code, static_cast<int16_t>(pc::ErrorCode::OK));
+        clock_ += kStep;
+        const auto again = joinAs({kTestTopicId}, group, first.memberId);
+        EXPECT_EQ(again.code, static_cast<int16_t>(pc::ErrorCode::OK));
+        EXPECT_TRUE(driveUntil([&] { return service_->coordinator(std::string(group)).state() == GroupState::Stable; }, 10));
+        return first.memberId;
+    }
+    int64_t corr_ = 100;
+};
+
+// Version skew: a client below kClientVersionInvalidRequest gets ProtocolVersion (it would re-join forever on
+// InvalidRequest), every newer one InvalidRequest; the detail trailer only for a session >= kClientVersionFilter.
+// No version is ever admitted.  RED (revert #19): every row answers OK with a member id.
+TEST_F(GroupJoinAdversarial, EveryClientVersionIsRefusedWithItsOwnCodeAndNeverAdmittedAdversarialRegression) {
+    const int32_t versions[] = {pc::kClientVersionExplicitGroupSubscriptions, pc::kClientVersionInvalidRequest - 1,
+                                pc::kClientVersionInvalidRequest, pc::kClientVersionFilter - 1,
+                                pc::kClientVersionFilter, pc::kClientVersion};
+    int i = 0;
+    for (const int32_t v : versions) {
+        SCOPED_TRACE(testing::Message() << "client version " << v);
+        const std::string group = "g19v" + std::to_string(i++);
+        const auto a = joinAs({kSinkId}, group, {}, v);
+        const auto want = v >= pc::kClientVersionInvalidRequest ? pc::ErrorCode::InvalidRequest
+                                                                : pc::ErrorCode::ProtocolVersion;
+        EXPECT_EQ(a.code, static_cast<int16_t>(want));
+        EXPECT_TRUE(a.memberId.empty());
+        EXPECT_EQ(a.generation, 0);
+        if (v >= pc::kClientVersionFilter) EXPECT_NE(a.detail.find("view sink"), std::string::npos) << a.detail;
+        else EXPECT_TRUE(a.detail.empty()) << "an old session must get the byte-identical frame: " << a.detail;
+        EXPECT_EQ(service_->coordinator(group).memberCount(), 0u);
+    }
+}
+
+// Input bounds on the id list: a duplicated sink, the sink behind unknown / internal / extreme ids, the sink last of a
+// long list - all refused whole; lists without a sink keep the old contract (unknown ids ignored, the member joins).
+// RED (revert #19): every sink row joins.
+TEST_F(GroupJoinAdversarial, ASinkAnywhereInTheIdListRefusesTheWholeJoinAdversarialRegression) {
+    std::vector<int32_t> longList;
+    for (int32_t t = 1000; t < 1063; ++t) longList.push_back(t);
+    longList.push_back(kSinkId);
+    const std::vector<std::vector<int32_t>> refused = {
+        {kSinkId, kSinkId},
+        {999, -6, std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max(), kTestTopicId, kSinkId},
+        longList,
+    };
+    int i = 0;
+    for (const auto& ids : refused) {
+        SCOPED_TRACE(testing::Message() << "refused row " << i);
+        const std::string group = "g19r" + std::to_string(i++);
+        const auto a = joinAs(ids, group);
+        EXPECT_EQ(a.code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+        EXPECT_TRUE(a.memberId.empty());
+        EXPECT_EQ(service_->coordinator(group).memberCount(), 0u);
+    }
+    const std::vector<std::vector<int32_t>> admitted = {
+        {}, {999}, {std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max(), -1}, {kTestTopicId, 999},
+    };
+    for (const auto& ids : admitted) {
+        SCOPED_TRACE(testing::Message() << "admitted row " << i);
+        const std::string group = "g19a" + std::to_string(i++);
+        const auto a = joinAs(ids, group);
+        EXPECT_EQ(a.code, static_cast<int16_t>(pc::ErrorCode::OK));
+        EXPECT_FALSE(a.memberId.empty());
+        EXPECT_EQ(service_->coordinator(group).memberCount(), 1u);
+    }
+}
+
+// Rebalance: a STABLE member re-joining with a sink added is refused and changes nothing - it stays a member of the
+// same generation, the group stays Stable (no rebalance is started by a refusal), its heartbeat is still OK, and its
+// next valid re-join keeps its member id.  RED (revert #19): the re-join is admitted and starts a rebalance.
+TEST_F(GroupJoinAdversarial, AStableMemberRejoiningWithASinkIsRefusedAndTheGroupIsUndisturbedAdversarialRegression) {
+    const std::string g = "g19s";
+    const std::string member = stableMember(g);
+    ASSERT_FALSE(member.empty());
+    auto& gc = service_->coordinator(g);
+    const int32_t gen = gc.generationId();
+    clock_ += kStep;
+    const auto a = joinAs({kTestTopicId, kSinkId}, g, member);
+    EXPECT_EQ(a.code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(gc.state(), GroupState::Stable) << "a refused re-join started a rebalance";
+    EXPECT_EQ(gc.generationId(), gen);
+    EXPECT_EQ(gc.memberCount(), 1u);
+    EXPECT_TRUE(gc.hasMember(member));
+    const std::size_t hb = encodeHeartbeat(req_, 1, 900, g, member, gen);
+    const std::size_t ho = service_->handleHeartbeat(req_, hb, clock_, out_, kBufSize);
+    const auto hr = pc::HeartbeatResponse::decode(out_, ho);
+    ASSERT_TRUE(hr.has_value());
+    EXPECT_EQ(hr->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    const auto again = joinAs({kTestTopicId}, g, member);
+    EXPECT_EQ(again.code, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(again.memberId, member) << "the refusal unbound the member";
+}
+
+// A sink created while a group is live is refused at once (the registry is read per join, nothing is cached); once the
+// sink is dropped its id is an ordinary dropped id again (ignored, as before #19).  The live group is untouched
+// throughout.  RED (revert #19): the join naming the new sink is admitted.
+TEST_F(GroupJoinAdversarial, ASinkCreatedThenDroppedWhileTheGroupLivesIsRefusedThenIgnoredAdversarialRegression) {
+    const std::string g = "g19l";
+    const std::string member = stableMember(g);
+    auto& gc = service_->coordinator(g);
+    const int32_t gen = gc.generationId();
+    constexpr int32_t kLateSink = 7;
+    TopicSpec late = makeTopicSpec("m11-late-sink", 1, kLateSink);
+    late.viewSink = true;
+    ASSERT_EQ(registry_->createTopicAt(kLateSink, late), kLateSink);
+    ASSERT_TRUE(registry_->isViewSink(kLateSink));
+    const auto refused = joinAs({kLateSink}, "g19l-b");
+    EXPECT_EQ(refused.code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(service_->coordinator("g19l-b").memberCount(), 0u);
+    ASSERT_TRUE(registry_->dropTopic(kLateSink));
+    ASSERT_FALSE(registry_->isViewSink(kLateSink));
+    const auto ignored = joinAs({kLateSink}, "g19l-c");
+    EXPECT_EQ(ignored.code, static_cast<int16_t>(pc::ErrorCode::OK)) << "a dropped id keeps the unknown-id contract";
+    EXPECT_EQ(gc.state(), GroupState::Stable);
+    EXPECT_EQ(gc.generationId(), gen);
+    EXPECT_TRUE(gc.hasMember(member));
+}
+
+// The group filter: a refused join into an EMPTY group never fixes the group's filter - the next member joins with
+// another filter (here none) and is admitted.  RED (revert #19): the sink join is admitted and fixes filter F, so the
+// second join is refused filter-mismatch.
+TEST_F(GroupJoinAdversarial, ARefusedSinkJoinNeverFixesTheGroupFilterAdversarialRegression) {
+    const std::string g = "g19f";
+    const std::vector<uint8_t> f{0x01, 0x02, 0x03};
+    const auto a = joinAs({kSinkId}, g, {}, pc::kClientVersion, f);
+    EXPECT_EQ(a.code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    const auto b = joinAs({kTestTopicId}, g);
+    EXPECT_EQ(b.code, static_cast<int16_t>(pc::ErrorCode::OK)) << b.detail;
+    EXPECT_TRUE(service_->coordinator(g).filterBytes().empty());
+    EXPECT_EQ(service_->coordinator(g).memberCount(), 1u);
 }

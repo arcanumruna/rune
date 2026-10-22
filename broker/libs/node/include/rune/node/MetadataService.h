@@ -744,7 +744,11 @@ public:
     bool onBelowCommittedReport_(const rune::replication::AlterIsrMsg& m, Reply& reply) {
         namespace rr = rune::replication;
         if (!controllerReady_()) return false;
-        if (m.topicId < 0 && !coordinatorKey_(m.topicId, m.partition)) return false;
+        if (m.topicId < 0 && !coordinatorKey_(m.topicId, m.partition)) {
+            // #93: answered (moot: the internal-ISR store owns this partition), so the follower slows to its 1 s cadence
+            reply(rr::kAlterIsrFencedLeaderEpoch, -1);
+            return false;
+        }
         const rune::metadata::PartitionAssignment* pa = msm_.assignment(m.topicId, m.partition);
         if (pa == nullptr) { reply(rr::kAlterIsrFencedLeaderEpoch, -1); return false; }
         if (pa->leaderNode >= 0 && pa->leaderNode != m.leaderId && pa->leaderEpoch == static_cast<int32_t>(m.leaderEpoch)) {
