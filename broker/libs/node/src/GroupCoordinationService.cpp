@@ -519,9 +519,15 @@ size_t GroupCoordinationService::handleJoinGroup(
         if (b == nullptr || b->principal != principal || !gc.hasMember(memberIdStr)) memberIdScratch_.clear();
     }
 
-    // Set rebalance timeout from the member's sessionTimeout (or a sane default).
-    gc.setRebalanceTimeoutMs(
-        (msg.sessionTimeoutMs > 0) ? msg.sessionTimeoutMs : 30'000);
+    // Set rebalance timeout from the member's sessionTimeout (or a sane default).  #213: the request is CLAMPED to the
+    // coordinator's maximum (Kafka: group.max.session.timeout.ms) - the value is also the group's rebalance timeout,
+    // so an unbounded one would let one member stall every rebalance and outlive its death for weeks.
+    // The 30 s default for an absent (<= 0) value is clamped too: a maximum below it is still the maximum.
+    const int32_t sessionMs = std::min(msg.sessionTimeoutMs > 0 ? msg.sessionTimeoutMs : 30'000, maxSessionTimeoutMs_);
+    if (msg.sessionTimeoutMs > sessionMs) [[unlikely]]
+        spdlog::debug("GroupCoordinationService: JoinGroup sessionTimeoutMs {} clamped to {} (group max)",
+                      msg.sessionTimeoutMs, sessionMs);
+    gc.setRebalanceTimeoutMs(sessionMs);
 
     // CG-4: capture state BEFORE join so we can detect a Stable→PreparingRebalance
     // transition triggered directly by gc.join() (new member arriving while Stable).
@@ -531,7 +537,7 @@ size_t GroupCoordinationService::handleJoinGroup(
     const coord::GroupState stateBefore = gc.state();
 
     coord::JoinResult jr = gc.join(memberIdStr,
-                                   msg.sessionTimeoutMs > 0 ? msg.sessionTimeoutMs : 30'000,
+                                   sessionMs,
                                    joinTopicsScratch_,
                                    nowNs);
 
@@ -1403,28 +1409,42 @@ size_t GroupCoordinationService::handleOffsetFetch(
         return resp.encode(out, std::span<const pc::OffsetFetchResult>(fetchResultScratch_));
     }
 
+    // #471: a key whose __consumer_offsets record is not committed yet (above the replica's high watermark) must
+    // not be served: the record may still be lost on a leader change.
+    const rune::replication::PartitionReplica* const offsetsReplica = offsets_ != nullptr ? offsets_->replica() : nullptr;
+    auto isUnstable = [&](const coord::CommittedOffset& co) noexcept {
+        return co.recordAt >= 0 && offsetsReplica != nullptr && co.recordAt >= offsetsReplica->highWatermark();
+    };
+    auto answerRetriableSentinel = [&]() {
+        fetchResultScratch_.clear();
+        if (pc::OffsetFetchResponse::encodedSizeFor(1) <= outCap) {
+            pc::OffsetFetchResult sentinel;
+            sentinel.topicId   = -1;
+            sentinel.partition = -1;
+            sentinel.offset    = -1;
+            sentinel.errorCode = unstableFor_(msg.sessionId);
+            fetchResultScratch_.push_back(sentinel);
+        }
+        pc::OffsetFetchResponse resp;
+        resp.sessionId     = msg.sessionId;
+        resp.correlationId = msg.correlationId;
+        return resp.encode(out, std::span<const pc::OffsetFetchResult>(fetchResultScratch_));
+    };
+
     if (msg.entries.empty()) {
         // #438: a fetch-all cannot list a held key that has no committed offset yet: while ANY key of the group is
         // held (or the hold state is unknown) the whole fetch is answered the retriable sentinel.
         if (holdOf_(groupIdStr, coord::TopicPartition{std::string{}, -1}) != coord::TxnOffsetHold::Free) [[unlikely]] {
-            if (pc::OffsetFetchResponse::encodedSizeFor(1) <= outCap) {
-                pc::OffsetFetchResult sentinel;
-                sentinel.topicId   = -1;
-                sentinel.partition = -1;
-                sentinel.offset    = -1;
-                sentinel.errorCode = unstableFor_(msg.sessionId);
-                fetchResultScratch_.push_back(sentinel);
-            }
-            pc::OffsetFetchResponse resp;
-            resp.sessionId     = msg.sessionId;
-            resp.correlationId = msg.correlationId;
-            return resp.encode(out, std::span<const pc::OffsetFetchResult>(fetchResultScratch_));
+            return answerRetriableSentinel();
         }
         // Fetch all committed offsets for the group.
         // Bound-check BEFORE writing each result so a large fetch-all never
         // overruns a fixed scratch buffer.  Results that would exceed outCap
         // are silently dropped (the response is capped but never overruns).
         const auto all = offsets_->fetchAll(groupIdStr);
+        for (const auto& [tp, co] : all) {
+            if (isUnstable(co)) [[unlikely]] return answerRetriableSentinel();   // #471
+        }
         for (const auto& [tp, co] : all) {
             // Bound-check before each push.
             const std::size_t needed =
@@ -1493,8 +1513,14 @@ size_t GroupCoordinationService::handleOffsetFetch(
                     r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
                 } else {
                     const auto co = offsets_->fetch(groupIdStr, tp);
-                    r.offset = co.has_value() && !staleLineage_(*co, e.topicId, e.partition) ? co->offset
-                                                                                             : int64_t{-1};
+                    if (co.has_value() && isUnstable(*co)) [[unlikely]] {
+                        // #471: the record that set this value is not committed yet; retriable.
+                        r.offset    = -1;
+                        r.errorCode = unstableFor_(msg.sessionId);
+                    } else {
+                        r.offset = co.has_value() && !staleLineage_(*co, e.topicId, e.partition) ? co->offset
+                                                                                                 : int64_t{-1};
+                    }
                 }
             }
             fetchResultScratch_.push_back(r);

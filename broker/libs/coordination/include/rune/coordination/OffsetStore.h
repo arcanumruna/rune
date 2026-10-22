@@ -41,6 +41,9 @@ struct CommittedOffset {
     /// transient partition it means nothing once the ring's data did not
     /// survive (a restart) — the coordinator then answers "no committed offset".
     uint64_t    lineage{0};
+    /// #471: the `__consumer_offsets` log offset of the record that set this value; -1 = known committed (replayed
+    /// below the high watermark, or a store with no replica).
+    int64_t     recordAt{-1};
 };
 
 // ---------------------------------------------------------------------------

@@ -107,3 +107,87 @@ TEST(AuthVisibilityRegression, MetadataListsOnlyDescribableTopics) {
     EXPECT_NE(std::find(all.begin(), all.end(), r.orders), all.end());
     EXPECT_NE(std::find(all.begin(), all.end(), r.secret), all.end());
 }
+
+// #126: a fetch-all lists only the committed offsets of topics the caller may READ (a listed entry already needs READ).
+namespace {
+std::vector<int32_t> fetchAllTopics(AuthRig& r, int64_t sid, const std::string& group, bool* ok = nullptr) {
+    pc::OffsetFetch m;
+    m.sessionId = sid; m.correlationId = r.c().nextCorrelationId();
+    m.groupId = {reinterpret_cast<const uint8_t*>(group.data()), group.size()};
+    std::vector<uint8_t> buf(512);
+    const std::size_t len = m.encode(buf.data(), std::span<const pc::OffsetFetchEntry>{});
+    std::vector<int32_t> ids;
+    if (ok) *ok = false;
+    if (len == 0 || !r.c().send(r.ch(), r.stream(), buf.data(), len)) return ids;
+    const auto a = r.rawAnswer(m.correlationId);
+    const auto resp = a.empty() ? std::nullopt : pc::OffsetFetchResponse::decode(a.data(), a.size());
+    if (!resp) return ids;
+    if (ok) *ok = true;
+    for (const auto res : resp->results) {
+        EXPECT_EQ(res.errorCode, 0) << "topic " << res.topicId;
+        ids.push_back(res.topicId);
+    }
+    return ids;
+}
+}  // namespace
+
+TEST(AuthVisibilityRegression, OffsetFetchAllHidesTopicsTheCallerCannotReadRegression) {
+    AuthRig r;
+    const int64_t a = r.newUser({exact(SO::Read, ST::Group, "g126"), exact(SO::Read, ST::Topic, "orders")});
+    const int64_t b = r.newUser({exact(SO::Read, ST::Group, "g126"), exact(SO::Read, ST::Topic, "orders"),
+                                 exact(SO::Read, ST::Topic, "secret")});
+    const int64_t all = r.newUser({exact(SO::Read, ST::Group, "g126"), prefix(SO::Read, ST::Topic, "")});
+    const auto [member, gen] = r.joinStable(b, "g126", {r.orders, r.secret});
+    ASSERT_FALSE(member.empty());
+    ASSERT_EQ(r.commitAs(b, "g126", member, gen, r.orders, 11), 0);
+    ASSERT_EQ(r.commitAs(b, "g126", member, gen, r.secret, 22), 0);
+
+    bool ok = false;
+    auto seenByB = fetchAllTopics(r, b, "g126", &ok);
+    ASSERT_TRUE(ok);
+    std::sort(seenByB.begin(), seenByB.end());
+    EXPECT_EQ(seenByB, (std::vector<int32_t>{std::min(r.orders, r.secret), std::max(r.orders, r.secret)}));
+
+    const auto seenByA = fetchAllTopics(r, a, "g126", &ok);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(seenByA, std::vector<int32_t>{r.orders}) << "a topic the caller cannot READ was listed";
+
+    auto seenByAll = fetchAllTopics(r, all, "g126", &ok);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(seenByAll.size(), 2u);
+}
+
+// ── Adversarial review of PR #497 (#126) ─────────────────────────────────────────────────────────────────────────
+// A caller with the group but no READ on any committed topic - including a DESCRIBE-ON-CLUSTER holder (the D22
+// pass-through covers only ids the gateway has not indexed) - gets an empty fetch-all, and a listed fetch of the
+// hidden topic is still refused; a grant revoked mid-session hides the topic on the next fetch-all.
+TEST(AuthVisibilityRegression, OffsetFetchAllHidesEveryUnreadableTopicAndFollowsARevokeAdversarialRegression) {
+    AuthRig r;
+    std::string revokedName;
+    const int64_t writer = r.newUser({exact(SO::Read, ST::Group, "g126x"), exact(SO::Read, ST::Topic, "orders"),
+                                      exact(SO::Read, ST::Topic, "secret")}, &revokedName);
+    const int64_t groupOnly = r.newUser({exact(SO::Read, ST::Group, "g126x")});
+    const int64_t describer = r.newUser({exact(SO::Read, ST::Group, "g126x"), cluster(SO::Describe)});
+    const auto [member, gen] = r.joinStable(writer, "g126x", {r.orders, r.secret});
+    ASSERT_FALSE(member.empty());
+    ASSERT_EQ(r.commitAs(writer, "g126x", member, gen, r.orders, 11), 0);
+    ASSERT_EQ(r.commitAs(writer, "g126x", member, gen, r.secret, 22), 0);
+
+    bool ok = false;
+    for (const int64_t sid : {groupOnly, describer}) {
+        SCOPED_TRACE(::testing::Message() << "session " << sid);
+        EXPECT_TRUE(fetchAllTopics(r, sid, "g126x", &ok).empty()) << "an unreadable topic's offset was listed";
+        EXPECT_TRUE(ok) << "the filtered fetch-all was not answered";
+        EXPECT_EQ(r.offsetFetch(sid, "g126x", r.secret), kNotAuthorized);
+    }
+    // The writer can see both, then loses READ on "secret" while its session stays open.
+    auto both = fetchAllTopics(r, writer, "g126x", &ok);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(both.size(), 2u);
+    const auto rv = r.broker().admin().revoke(r.ch(), r.broker().adminSession(), revokedName, false, SO::Read,
+                                              ST::Topic, SP::Exact, "secret");
+    ASSERT_EQ(rv.errorCode, 0) << rv.detail;
+    const auto after = fetchAllTopics(r, writer, "g126x", &ok);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(after, std::vector<int32_t>{r.orders}) << "a revoked topic stayed visible to an open session";
+}
