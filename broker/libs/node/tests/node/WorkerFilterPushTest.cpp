@@ -1096,4 +1096,200 @@ TEST_F(WorkerFilterRegression, FilteredTooLargeOwedErrorIsRetriedUnderBackPressu
     std::filesystem::remove_all(dirB);
 }
 
+
+// ===== Final review M2: a FILTERED subscription ended by the push owner (issue #109) =====
+/// Every frame in arrival order: (subId or -corr for an error, code, record offsets).
+struct OrderedCollector {
+    struct Ev { bool isErr; int64_t subId; int64_t corr; int16_t code; std::vector<int64_t> offs; };
+    std::vector<Ev> evs;
+    aeron::FragmentAssembler fa;
+    OrderedCollector()
+        : fa([this](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off, aeron::util::index_t len, aeron::Header&) {
+              const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+              const auto n = static_cast<std::size_t>(len);
+              if (auto r = pc::Records::decode(p, n)) {
+                  Ev e{false, r->subscriptionId, r->correlationId, 0, {}};
+                  if (!r->recordBatch.empty()) {
+                      rune::protocol::RecordBatchReader rd(r->recordBatch.data(), r->recordBatch.size());
+                      rd.forEachRecord([&](std::string_view, std::string_view, int64_t o, int64_t) { e.offs.push_back(o); });
+                  }
+                  evs.push_back(std::move(e));
+              } else if (auto er = pc::ErrorResponse::decode(p, n)) {
+                  evs.push_back(Ev{true, 0, er->correlationId, er->code, {}});
+              }
+          }) {}
+    std::vector<int64_t> offsets(int64_t sub) const {
+        std::vector<int64_t> v;
+        for (const auto& e : evs) if (!e.isErr && e.subId == sub) v.insert(v.end(), e.offs.begin(), e.offs.end());
+        return v;
+    }
+    int endIndex(int64_t corr, int16_t code) const {
+        for (std::size_t i = 0; i < evs.size(); ++i) if (evs[i].isErr && evs[i].corr == corr && evs[i].code == code) return static_cast<int>(i);
+        return -1;
+    }
+    int lastRecordsIndex(int64_t sub) const {
+        int k = -1;
+        for (std::size_t i = 0; i < evs.size(); ++i) if (!evs[i].isErr && evs[i].subId == sub) k = static_cast<int>(i);
+        return k;
+    }
+};
+
+class WorkerFilterEndedRegression : public WorkerFilterFixture {
+protected:
+    void ostep(Worker& w, OrderedCollector& c) { w.doWork(nowNs()); sub_->poll(c.fa.handler(), 64); }
+    template <typename P> bool opump(Worker& w, OrderedCollector& c, P p, std::chrono::milliseconds t = 10s) {
+        const auto d = std::chrono::steady_clock::now() + t;
+        while (std::chrono::steady_clock::now() < d) { ostep(w, c); if (p()) return true; }
+        ostep(w, c); return p();
+    }
+    static WorkerOp endOp(int64_t subId, int16_t code) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::Unsubscribe;
+        op.subscriptionId = subId;
+        op.endCode = code;
+        op.endDetail = "probe: READ revoked";
+        return op;
+    }
+};
+
+// End the FIRST of three filtered members (index 0): the sweep's swap-and-pop moves sub 3 into slot 0.
+TEST_F(WorkerFilterEndedRegression, EndedFilteredSubSendsEndAfterLastRecordsLeavesGroupNoMisdeliveryRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    auto model = [](int64_t from, int64_t to, uint32_t world) {
+        std::vector<int64_t> v;
+        for (int64_t o = from; o < to; ++o) if (static_cast<uint32_t>(o % 3) + 1 == world) v.push_back(o);
+        return v;
+    };
+    for (int i = 0; i < 10; ++i) appendRows(log, worlds({1, 2, 3}));
+    openEgress(3491);
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(eg_.get());
+    const Fb f1 = worldEq(1), f2 = worldEq(2), f3 = worldEq(3);
+    ASSERT_TRUE(w.tryEnqueueOp(schemaOp(kTopic, 2)));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(1, kTopic, 0, 0, &log, f1)));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(2, kTopic, 0, 0, &log, f2)));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(3, kTopic, 0, 0, &log, f3)));
+    OrderedCollector c;
+    const int64_t end1 = log.logEndOffset();
+    ASSERT_TRUE(opump(w, c, [&] { return c.offsets(1).size() == model(0, end1, 1).size() && c.offsets(2).size() == model(0, end1, 2).size() &&
+                                         c.offsets(3).size() == model(0, end1, 3).size(); }));
+    // More data is in the log when the end arrives (the member is InSync and has matches pending).
+    for (int i = 0; i < 5; ++i) appendRows(log, worlds({1, 2, 3}));
+    ASSERT_TRUE(w.tryEnqueueOp(endOp(1, 46)));
+    for (int i = 0; i < 5; ++i) appendRows(log, worlds({1, 2, 3}));
+    const int64_t end2 = log.logEndOffset();
+    ASSERT_TRUE(opump(w, c, [&] { return c.endIndex(9001, 46) >= 0 && c.offsets(2).size() == model(0, end2, 2).size() &&
+                                         c.offsets(3).size() == model(0, end2, 3).size(); }))
+        << "end=" << c.endIndex(9001, 46) << " sub2=" << c.offsets(2).size() << " sub3=" << c.offsets(3).size();
+    for (int i = 0; i < 50; ++i) { ostep(w, c); std::this_thread::sleep_for(200us); }
+    EXPECT_GT(c.endIndex(9001, 46), c.lastRecordsIndex(1)) << "Records for sub 1 after its terminal frame";
+    EXPECT_EQ(w.subscriptionEndsSentForTest(), 1u);
+    EXPECT_EQ(w.subscriptionEndsOwedForTest(), 0u);
+    ASSERT_EQ(w.subscriptionsForTest().size(), 2u) << "the ended filtered subscription is swept";
+    ASSERT_NE(w.filterGroupForTest(kTopic, 0, 0), nullptr);
+    EXPECT_EQ(w.filterGroupForTest(kTopic, 0, 0)->memberCount(), 2u) << "the ended member left its filter group";
+    // sub 1's records are a prefix of its model (nothing out of order, nothing foreign).
+    const auto got1 = c.offsets(1);
+    const auto all1 = model(0, end2, 1);
+    ASSERT_LE(got1.size(), all1.size());
+    EXPECT_TRUE(std::equal(got1.begin(), got1.end(), all1.begin())) << "sub 1 got a non-prefix";
+    // After the sweep moved sub 3 into slot 0: new data, exact delivery to 2 and 3, nothing to 1.
+    for (int i = 0; i < 6; ++i) appendRows(log, worlds({1, 2, 3}));
+    const int64_t end3 = log.logEndOffset();
+    ASSERT_TRUE(opump(w, c, [&] { return c.offsets(2).size() == model(0, end3, 2).size() && c.offsets(3).size() == model(0, end3, 3).size(); }));
+    for (int i = 0; i < 50; ++i) { ostep(w, c); std::this_thread::sleep_for(200us); }
+    EXPECT_EQ(c.offsets(2), model(0, end3, 2));
+    EXPECT_EQ(c.offsets(3), model(0, end3, 3));
+    EXPECT_EQ(c.offsets(1), got1) << "nothing more for the ended subscription";
+    std::filesystem::remove_all(dir);
+}
+
+// The SOLE filtered member ends: the group is released and the worker returns to the unfiltered-only push path.
+TEST_F(WorkerFilterEndedRegression, EndedSoleFilteredMemberReleasesTheGroupRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    for (int i = 0; i < 4; ++i) appendRows(log, worlds({7, 1}));
+    openEgress(3492);
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(eg_.get());
+    const Fb f = worldEq(7);
+    ASSERT_TRUE(w.tryEnqueueOp(schemaOp(kTopic, 2)));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(1, kTopic, 0, 0, &log, f)));
+    OrderedCollector c;
+    ASSERT_TRUE(opump(w, c, [&] { return c.offsets(1).size() == 4; }));
+    ASSERT_TRUE(w.tryEnqueueOp(endOp(1, 45)));
+    ASSERT_TRUE(opump(w, c, [&] { return c.endIndex(9001, 45) >= 0 && w.subscriptionsForTest().empty(); }));
+    EXPECT_EQ(w.filterGroupCountForTest(), 0u) << "the empty group is released";
+    ASSERT_TRUE(w.tryEnqueueOp(plainSubscribeOp(2, kTopic, 0, 0, &log)));
+    ASSERT_TRUE(opump(w, c, [&] { return c.offsets(2).size() == 8; }));
+    std::filesystem::remove_all(dir);
+}
+
+// End + the session's egress release in the same op batch (a revoked session's close): the end is still sent, the
+// release proceeds, and the filtered member is gone from its group.
+TEST_F(WorkerFilterEndedRegression, EndedFilteredSubThenEgressReleaseLeavesTheGroupRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    for (int i = 0; i < 4; ++i) appendRows(log, worlds({7, 1}));
+    openEgress(3493);
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(eg_.get());
+    const Fb f = worldEq(7), f1 = worldEq(1);
+    ASSERT_TRUE(w.tryEnqueueOp(schemaOp(kTopic, 2)));
+    WorkerOp a = filteredSubscribeOp(1, kTopic, 0, 0, &log, f);
+    a.egressPub = eg_->pub();
+    ASSERT_TRUE(w.tryEnqueueOp(a));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(2, kTopic, 0, 0, &log, f1)));   // keeps the group alive
+    OrderedCollector c;
+    ASSERT_TRUE(opump(w, c, [&] { return c.offsets(1).size() == 4 && c.offsets(2).size() == 4; }));
+    ASSERT_TRUE(w.tryEnqueueOp(endOp(1, 46)));
+    WorkerOp rel;
+    rel.type = WorkerOp::Type::Unsubscribe;
+    rel.egressPub = eg_->pub();
+    rel.sessionId = 4201;
+    rel.correlationId = 5;
+    ASSERT_TRUE(w.tryEnqueueOp(rel));
+    ASSERT_TRUE(opump(w, c, [&] { return w.egressReleasesForTest() == 1u && w.subscriptionsForTest().size() == 1u; }))
+        << "releases=" << w.egressReleasesForTest() << " subs=" << w.subscriptionsForTest().size();
+    EXPECT_EQ(w.subscriptionEndsSentForTest(), 1u) << "sent=" << w.subscriptionEndsSentForTest();
+    EXPECT_TRUE(opump(w, c, [&] { return c.endIndex(9001, 46) >= 0; }, 3s)) << "the owed end frame never arrived";
+    ASSERT_NE(w.filterGroupForTest(kTopic, 0, 0), nullptr);
+    EXPECT_EQ(w.filterGroupForTest(kTopic, 0, 0)->memberCount(), 1u);
+    for (int i = 0; i < 3; ++i) appendRows(log, worlds({7, 1}));
+    ASSERT_TRUE(opump(w, c, [&] { return c.offsets(2).size() == 7; }));
+    EXPECT_EQ(c.offsets(1).size(), 4u);
+    std::filesystem::remove_all(dir);
+}
+
+// Final review M1: an ended filtered member frees its filter-group slot when the ending op executes (the gateway releases
+// its admission count at the same point), so a Subscribe queued right behind it is admitted at the 4,096 cap.
+TEST_F(WorkerFilterEndedRegression, EndedFilteredMemberFreesItsSlotAtTheCapForTheNextSubscribeRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    appendRows(log, worlds({1}));   // world 7 never matches: nothing is pushed
+    openEgress(3494);
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(eg_.get());
+    const Fb f = worldEq(7);
+    constexpr int kCap = 4096;
+    ASSERT_TRUE(w.tryEnqueueOp(schemaOp(kTopic, 2)));
+    OrderedCollector c;
+    for (int base = 1; base <= kCap; base += 128) {
+        for (int id = base; id < base + 128; ++id) ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(id, kTopic, 0, 0, &log, f)));
+        ostep(w, c);
+    }
+    ASSERT_NE(w.filterGroupForTest(kTopic, 0, 0), nullptr);
+    ASSERT_EQ(w.filterGroupForTest(kTopic, 0, 0)->memberCount(), static_cast<uint32_t>(kCap));
+    ASSERT_EQ(w.filterBindFailuresForTest(), 0u);
+    // One op batch: the end of sub 1, then a new filtered Subscribe (FIFO: the end runs first).
+    ASSERT_TRUE(w.tryEnqueueOp(endOp(1, 46)));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(kCap + 1, kTopic, 0, 0, &log, f)));
+    w.doWork(nowNs());
+    EXPECT_EQ(w.filterBindFailuresForTest(), 0u) << "the new Subscribe hit the cap: the ended member still held a slot";
+    EXPECT_EQ(w.filterGroupForTest(kTopic, 0, 0)->memberCount(), static_cast<uint32_t>(kCap));
+    EXPECT_EQ(w.subscriptionEndsSeenForTest(), 1u);
+    std::filesystem::remove_all(dir);
+}
+
 }  // namespace

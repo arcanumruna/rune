@@ -2930,10 +2930,13 @@ private:
                 if (endCode != 0) [[unlikely]] {
                     // Issue #109: the push owner ends it - nothing more is read or pushed from here on, and the
                     // terminal frame goes out on the same egress after the last Records (pushOwnedSubscriptions_).
-                    // A filtered subscription stays in its group (never deliverable once not Live) until the sweep.
+                    // A filtered subscription leaves its group NOW (the gateway releases its admission count at this same
+                    // point, so the two caps agree): once not Live it is never delivered again, and the unfiltered pass
+                    // only sends its terminal frame. leaveFilter_ writes its cursor back and keeps the bytes for the sweep.
                     const std::uint32_t tailLen = op.tailLength();   // SBE var data: the length FIRST, then tail()
                     const char* tail = op.tail();
                     subs_[i].pushState = WorkerSubscription::PushState::EndOwed;
+                    if (!std::holds_alternative<SubUnfiltered>(subs_[i].filter)) [[unlikely]] leaveFilter_(i);
                     pushListDirty_ = true;   // the unfiltered pass must visit it (the owed terminal frame)
                     endsOwed_.push_back(EndOwed{subId, endCode, std::string(tail, tailLen)});
                     ++subscriptionEndsSeen_;
