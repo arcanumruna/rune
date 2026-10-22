@@ -428,8 +428,10 @@ Names can't contain NUL, so padding can't make two names collide. In general, a 
 - **`check (<predicate>)`** on any view, projection or aggregate.
   - The predicate is over the view row's own columns, whether key, projected or aggregate (`count`, `sum`, `avg`, `min`, `max`, `last`). It compares them with constants using `=`, `<>`, `<`, `<=`, `>` and `>=`, combined with `and`, `or` and `not`. Examples: `check (characters <= 12)`, `check (balance >= 0)`.
   - It is evaluated on each prospective row the record would produce (§8.4).
-  - **A row that satisfies the predicate now** (or doesn't exist yet): the record is rejected if the prospective row fails it. Deletes are judged too: under `check (balance >= 0)`, deleting a positive contributor that would make the sum negative is rejected.
-  - **A row that already fails it,** which is possible only for data from before the constraint (§8.7): the record is rejected if it changes a column the predicate reads, unless it is a delete.
+  - **Deletes are never rejected (owner decision, 2026-10-22).** A key can always be removed. The consequence: a delete can leave a row failing a predicate that a removal can break, for example deleting a positive contributor under `check (balance >= 0)`. The docs say so: model ledgers as appended entries, not as deletable ones.
+  - **Any other record** is rejected if a prospective row fails the predicate **and** the record changes a column the predicate reads.
+    - On a row that satisfies the predicate, that simply means the record would break it.
+    - On a row that already fails it (data from before the constraint, §8.7, or after a delete), a change that doesn't touch the checked columns passes (a rename in a group over its limit). A change that repairs the row passes (a credit that makes the balance non-negative). A change that leaves it failing is rejected (a create into the over-limit group).
     - So in a group already over its limit, a rename passes because it doesn't change `count`, a create fails, and a delete passes. The group can shrink, never grow.
   - A row the record removes entirely (the last contributor of a group leaves) isn't checked.
   - A `unique` view never rejects a delete, since a delete only releases a key.
@@ -454,7 +456,7 @@ Names can't contain NUL, so padding can't make two names collide. In general, a 
   - `character_name`: the owner map says whether `lower(name)` is owned by a different source key.
 - **Several verdict views.** A record must pass all of them. All prospective rows are computed before any view applies anything, so a record rejected by one view changes none.
 - **Within a batch.** Records are judged one at a time, in order. Each sees the effect of the accepted records before it, including those in the same batch. Each record gets its own verdict (§11.3).
-- **Deletes are judged like any record** (§8.2). A delete fails only a `check` that the removal would break. It never fails a `unique` view, and it passes on a row that already broke its rule.
+- **Deletes are never rejected** (§8.2), so a key can always be removed.
 - **Deterministic.** A verdict depends only on the view state, the record and the constraint set active at its offset (§8.7). The same log gives the same verdicts on every leader, every restart and every refold.
 - **No resource-dependent verdicts.** A verdict view never rejects for capacity reasons (row cap, arena). Exhausting capacity stops that partition's fold with an alert, which pauses its delivery and `View` acks, and is never turned into a verdict that another node might not reach.
 - **Nothing pending.** A record is judged only once every record before it has been committed and judged. No state about uncommitted records exists anywhere.
@@ -847,7 +849,7 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 - verdict lag while a constraint view builds: delivery waits, writes don't
 - failover right after a constraint-set change record: the new leader judges every offset with the same set as the old one
 - a new leader that hasn't installed the view named by a change record waits rather than judging
-- a delete that would break `check (balance >= 0)` is rejected; a delete in a group already over its limit passes
+- a delete always passes, including one that leaves `check (balance >= 0)` failing. Afterwards a debit is rejected, a credit that repairs the balance passes, and a rename passes
 - a batch mixing key-0 creates with other records is refused
 - a retry after failover and compaction still returns its ids
 
@@ -964,7 +966,7 @@ Each part ships on its own:
   - A voting partition takes at most 4096 records per transaction (`TxnTooLarge`). (My call.)
   - A commit marker with no vote is judged at the marker, all or nothing on that partition, and counted as a bug. (My call.)
   - Until Part G ships, transactions and atomic batches are refused on constrained sources.
-- Deletes are judged like any record, so a delete can fail a `check` it would break (`balance >= 0`). A row that already broke its rule, which is possible only for pre-existing data, accepts deletes and any change that doesn't touch the checked columns. (My call.)
+- Deletes are never rejected, even when the removal breaks a `check`. Any other record is rejected only if it leaves a row failing and changes a checked column. **Owner-confirmed, 2026-10-22.**
 - Every constraint-set change takes effect at a control record in the source log, so every leader judges each offset with the same rules. (My call.)
 - A key-0 create needs `All | View` where a constraint could reject it, and `All` otherwise. A batch with key-0 creates contains only key-0 creates. (My call.)
 - On `autoincrement` topics, the cleaner keeps each live producer's last 32 batches, so retries after failover can return their ids. (My call.)
