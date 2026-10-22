@@ -460,20 +460,9 @@ TEST(PeerLinkRegression, AForgedHelloFloodAtTheResponderNeverHoldsARestartedPeer
     EXPECT_TRUE(relinked) << "the real Hello is answered and its Proof matches its own pending slot";
 }
 
-TEST(PeerLinkRegression, ForgedHintsRekeyAnIdleLinkAtMostOncePer30sRegression) {
-    Pair p(keys('k'), keys('k')); p.run();
-    ASSERT_TRUE(p.ka);
-    pl::PeerRefuse poke; poke.from = 2; poke.to = 1; poke.reason = pl::RefuseReason::NoLink;
-    int rekeys = 0;
-    for (int i = 1; i <= 100; ++i) {   // 10 s of forged hints on a link with no authenticated traffic
-        const int64_t now = (2'000 + i * 100) * kMs;
-        auto o = p.a.onRefuse(poke, now);
-        if (!o.frame) o = p.a.onUnknownEpoch(500 + i, now);
-        if (o.frame) { ++rekeys; p.absorb(0, std::move(o)); }
-        p.run(now);   // the real responder answers: the exchange completes at once
-    }
-    EXPECT_EQ(rekeys, 1);
-}
+// Issue #17 removed the 30 s hint-rekey cap this section once pinned (ForgedHintsRekeyAnIdleLinkAtMostOncePer30s): a
+// live peer now proves itself every 250 ms (the sealed keepalive), see
+// ForgedHintsNeverRekeyAPeerThatKeepsSendingKeepalivesRegression.
 
 TEST(PeerLinkRegression, AForgedProofAgainstAFullTablePerformsNoMacComputationRegression) {
     pl::PeerHandshake b(2, 1, 20, keys('k'));
@@ -1059,4 +1048,53 @@ TEST(PeerHandshakeRegression, X25519PublicMatchesRfc7748InThePeerlinkBuildRegres
     EXPECT_EQ(pub, hex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"));
     ASSERT_TRUE(rune::crypto::x25519Public(hex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"), pub));
     EXPECT_EQ(pub, hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"));
+}
+
+// ---- issue #17: no hint-rekey cap - a live peer is never silent (the sealed keepalive), so a real restart relinks ----
+
+TEST(PeerHandshakeRegression, ARestartedResponderRelinksWithoutWaitingOutAFalseHintRegression) {
+    Pair p(keys('k'), keys('k')); p.run(1'000 * kMs);
+    ASSERT_TRUE(p.ka && p.kb);
+    // A false hint after a second of silence: a same-incarnation rekey that completes (this armed the old 30 s cap).
+    const int64_t hint = 2'100 * kMs;
+    auto o = p.a.onUnknownEpoch(99, hint);
+    ASSERT_TRUE(o.frame);
+    p.absorb(0, std::move(o));
+    p.run(hint);
+    ASSERT_NE(est(p.a), nullptr);
+    ASSERT_EQ(est(p.a)->keys.epoch, 2u);
+    ASSERT_EQ(est(p.a)->peerIncarnation, 20u);
+    // The responder restarts right away: a new incarnation, no link, its NoLink poke every kRetryNs.
+    p.b = pl::PeerHandshake(2, 1, 21, keys('k'));
+    p.ka.reset(); p.kb.reset(); p.q.clear();
+    const int64_t restart = hint + 10 * kMs;
+    bool relinked = false;
+    int64_t at = 0;
+    for (int64_t t = restart; t <= restart + 2'000 * kMs && !relinked; t += 50 * kMs) {
+        p.run(t);
+        relinked = p.ka && p.kb && est(p.a) && est(p.a)->peerIncarnation == 21u;
+        at = t;
+    }
+    EXPECT_TRUE(relinked) << "the initiator re-handshakes once the peer has been silent for kSilenceNs, not after 30 s";
+    EXPECT_LE(at - restart, 2'000 * kMs);
+}
+
+TEST(PeerHandshakeRegression, ForgedHintsNeverRekeyAPeerThatKeepsSendingKeepalivesRegression) {
+    Pair p(keys('k'), keys('k')); p.run(1'000 * kMs);
+    ASSERT_TRUE(p.ka && p.kb);
+    ASSERT_NE(est(p.a), nullptr);
+    const pl::LinkKeys live = est(p.a)->keys;
+    pl::PeerRefuse poke; poke.from = 2; poke.to = 1; poke.reason = pl::RefuseReason::NoLink;
+    int hellos = 0;
+    // 60 s: an authenticated keepalive every 250 ms; a forged unknown-epoch hint and a forged NoLink poke every 200 ms.
+    for (int64_t t = 1'000 * kMs; t <= 61'000 * kMs; t += 50 * kMs) {
+        if (t % (250 * kMs) == 0) p.a.onAuthenticated(t);
+        if (t % (200 * kMs) == 0) {
+            hellos += p.a.onUnknownEpoch(static_cast<uint32_t>(1'000 + t / kMs), t).frame ? 1 : 0;
+            hellos += p.a.onRefuse(poke, t).frame ? 1 : 0;
+        }
+        ASSERT_NE(est(p.a), nullptr) << t;
+        ASSERT_EQ(est(p.a)->keys, live) << t;
+    }
+    EXPECT_EQ(hellos, 0) << "a peer whose keepalives keep arriving is never silent: no forged hint rekeys it";
 }

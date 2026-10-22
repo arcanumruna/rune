@@ -365,8 +365,8 @@ TEST(PeerLinkAdversarialRegression, ARestartWhileARehandshakeIsUnconfirmedRelink
         else                { s.a.hs = pl::PeerHandshake(1, 2, 11, keysOf('k')); s.a.crypto = pl::PeerFrameCrypto(1, 0); }
         s.data.clear();
         // The survivor goes silent for the restarted side (it was down), then the relink runs.  A restarted RESPONDER is
-        // relinked by its NoLink poke, which the initiator honours at most once per kHintRekeyGapNs (30 s) after the
-        // re-handshake it just completed (the pre-existing forged-hint cap): the loop runs 45 s of simulated time.
+        // relinked by its NoLink poke once the initiator has heard nothing from it for kSilenceNs (issue #17: no hint
+        // cap any more); the loop allows 45 s of simulated time and exits as soon as the link converged.
         for (int i = 0; i < 150 && !(s.a.crypto.hasLink(2) && s.b.crypto.hasLink(1) &&
                                     s.a.crypto.currentEpoch(2) == s.b.crypto.currentEpoch(1) &&
                                     std::holds_alternative<pl::Established>(s.a.hs.state())); ++i) {

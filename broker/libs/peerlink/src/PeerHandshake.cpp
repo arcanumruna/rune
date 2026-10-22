@@ -170,12 +170,12 @@ void PeerHandshake::onAuthenticated(int64_t nowNs) noexcept {
 }
 
 // A rekey: a fresh Hello while the live link keeps its keys.  Only the initiator, only when the peer has been silent,
-// at most one new exchange per kRetryNs.
+// at most one new exchange per kRetryNs.  Issue #17: no longer capped per completed rekey - a live peer is never silent
+// (the sealed idle keepalive), so a false hint cannot trigger this, and a real restart is not held back.
 PeerHandshake::Out PeerHandshake::rekey_(int64_t nowNs) {
     if (!initiator()) return {};
     auto* e = std::get_if<Established>(&state_);
-    if (!e || nowNs - e->lastAuthNs < kSilenceNs || nowNs - lastExchangeNs_ < kRetryNs ||
-        nowNs - lastHintRekeyNs_ < kHintRekeyGapNs) return {};
+    if (!e || nowNs - e->lastAuthNs < kSilenceNs || nowNs - lastExchangeNs_ < kRetryNs) return {};
     return startRekey_(*e, nowNs);
 }
 
@@ -513,9 +513,6 @@ PeerHandshake::Out PeerHandshake::onAccept(const PeerAccept& a, int64_t nowNs) {
     e.confirm = c;
     e.acceptConfirm = a.confirm;
     const uint64_t id = cs->keyId;
-    // The hint-rekey cap is armed only by a rekey that COMPLETED against the same incarnation (the hint was false):
-    // an attempt that timed out (a restarted responder not yet answering) must not delay the next one.
-    if (cs->prior && cs->prior->peerIncarnation == cs->peerIncarnation) lastHintRekeyNs_ = nowNs;
     state_ = e;
     // The initiator seals under the new epoch at once (the responder already holds it receive-only) and tells the
     // responder so: the Confirm.  A legacy responder ignores it as a malformed frame.
@@ -527,7 +524,7 @@ PeerHandshake::Out PeerHandshake::onAccept(const PeerAccept& a, int64_t nowNs) {
 
 PeerHandshake::Out PeerHandshake::onRefuse(const PeerRefuse& r, int64_t nowNs) {
     if (r.from != peer_ || r.to != self_) return {};
-    if (r.reason == RefuseReason::NoLink) return rekey_(nowNs);   // the responder restarted - or a forgery: rekey_ is rate limited
+    if (r.reason == RefuseReason::NoLink) return rekey_(nowNs);   // the responder restarted - or a forgery: rekey_ needs a silent peer
     // A refusal carries no MAC: it is logged (counted) and nothing else changes - not the state, not the keys.
     return errorOut(logLine("peer link to node %d REFUSED by %d: %s", peer_, peer_, refuseReasonText(r.reason)));
 }

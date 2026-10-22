@@ -127,7 +127,6 @@ public:
     static constexpr int64_t kRetryNs        = 200'000'000;     // Hello retry / refusal retry / NoLink poke
     static constexpr int64_t kAwaitNs        = 1'000'000'000;   // a Challenge / Proof awaiting its answer
     static constexpr std::size_t kPending     = 8;               // responder: challenges awaiting their Proof
-    static constexpr int64_t kHintRekeyGapNs  = 30'000'000'000;  // unauthenticated hints rekey a link at most this often
     static constexpr int64_t kSilenceNs      = 1'000'000'000;   // no authenticated frame this long: an unauthenticated hint may rekey
 
     PeerHandshake(int32_t self, int32_t peer, uint64_t selfIncarnation, const ClusterKeys& keys);
@@ -175,14 +174,16 @@ public:
     /// Only logs, except a NoLink poke (see rekey).  A Refuse carries no MAC, so it never changes the link state.
     Out onRefuse(const PeerRefuse&, int64_t nowNs);
     /// A frame named an epoch we do not hold.  UNAUTHENTICATED: it changes nothing unless the peer has been silent
-    /// (no authenticated frame) for kSilenceNs and the exchange rate limit allows; then (initiator, Established) a
-    /// rekey Hello goes out while the old keys stay live.
+    /// (no authenticated frame) for kSilenceNs and the exchange rate limit (kRetryNs) allows; then (initiator,
+    /// Established) a rekey Hello goes out while the old keys stay live.  Issue #17: a live peer is never silent - every
+    /// broker seals a keepalive to each idle peer every 250 ms on the consensus plane (UdpMessageSink) - so a forged
+    /// hint cannot rekey a live link, and there is no further cap: a restarted peer relinks after kSilenceNs.
     Out onUnknownEpoch(uint32_t epoch, int64_t nowNs);
     /// An authenticated frame from this peer arrived on a sealed transport.
     void onAuthenticated(int64_t nowNs) noexcept;
 
     /// TEST ONLY (issue #241): an Established initiator starts a same-incarnation rekey now, bypassing the silence and
-    /// hint-rate gates (the exchange itself is the real one).  {} when not an Established initiator.
+    /// retry gates (the exchange itself is the real one).  {} when not an Established initiator.
     Out rekeyForTest(int64_t nowNs);
 
     /// Test-visible: HMAC transcript computations performed so far (pins that a forged Proof costs none).
@@ -236,7 +237,6 @@ private:
     std::optional<EphSecret> cookieCur_, cookiePrev_;     // issue #18: the v2 cookie secrets
     int64_t     cookieRotatedNs_ = 0;                     // the grid point cookieCur_ belongs to
     uint64_t    macOps_ = 0;
-    int64_t     lastHintRekeyNs_ = -1'000'000'000'000;
     int64_t     lastExchangeNs_ = -1'000'000'000'000;   // start of the last NEW exchange (<= 1 per kRetryNs)
     LinkState   state_{LinkIdle{0}};
 };

@@ -226,3 +226,69 @@ TEST(PeerSealedClusterRegression, BackToBackRehandshakesUnderLoadConvergeWithNoL
                     static_cast<unsigned long long>(allDrops(c.node(id)) - allBefore[id]));
     }
 }
+
+// ---- issue #17: the sealed idle keepalive.  Consensus only carries traffic between the leader and each follower, so ----
+// before #17 two followers exchanged no sealed control-plane frame and looked "silent" (a forged hint could rekey them,
+// which is why a 30 s hint-rekey cap existed).  Every ordered pair now keeps opening sealed consensus frames while idle.
+namespace {
+bool allLinked(ThreeNodes& c) {
+    for (BrokerNode* n : c.live()) if (n->peerLinksForTest().established != 2) return false;
+    return true;
+}
+} // namespace
+
+TEST(PeerSealedClusterRegression, AnIdleFollowerPairStaysAuthenticatedRegression) {
+    TmpDir keys{"pscl5"};
+    const fs::path keyFile = keyFileWith(keys.path, "k.key", 'k');
+    ThreeNodes c = ThreeNodes::startWith("psc_idle", [&](NodeConfig& cfg) { enable(cfg, keyFile); });
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    ASSERT_TRUE(until(30s, [&] { return allLinked(c); }));
+    std::this_thread::sleep_for(500ms);   // past the election: the cluster is idle from here
+    std::map<int, BrokerNode::PeerLinkSnap> first;
+    for (int id : {1, 2, 3}) first[id] = c.node(id).peerLinksForTest();
+    std::map<int, BrokerNode::PeerLinkSnap> prev = first;
+    // Sampled every 750 ms (< kSilenceNs) for 3 s: each node opened at least one sealed consensus frame from EACH peer
+    // in every window - the follower <-> follower pair included.
+    for (int window = 1; window <= 4; ++window) {
+        std::this_thread::sleep_for(750ms);
+        for (int id : {1, 2, 3}) {
+            const auto now = c.node(id).peerLinksForTest();
+            for (int peer : {1, 2, 3}) {
+                if (peer == id) continue;
+                EXPECT_GT(now.consensusAuthFramesOf[peer], prev[id].consensusAuthFramesOf[peer])
+                    << "window " << window << ": node " << id << " opened no sealed consensus frame from node " << peer;
+            }
+            prev[id] = now;
+        }
+    }
+    for (int id : {1, 2, 3})
+        for (int peer : {1, 2, 3})
+            if (peer != id) EXPECT_EQ(prev[id].epochOf[peer], first[id].epochOf[peer]) << id << "->" << peer << ": no re-handshake";
+}
+
+// A responder restarted right after a completed re-handshake relinks within seconds (before #17: the initiator ignored
+// its NoLink poke for 30 s after that re-handshake).
+TEST(PeerSealedClusterRegression, ARestartRightAfterAReHandshakeRelinksFastRegression) {
+    TmpDir keys{"pscl6"};
+    const fs::path keyFile = keyFileWith(keys.path, "k.key", 'k');
+    ThreeNodes c = ThreeNodes::startWith("psc_restart", [&](NodeConfig& cfg) { enable(cfg, keyFile); });
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    ASSERT_TRUE(awaitSecurityLeader(c, 60s));
+    ASSERT_TRUE(until(30s, [&] { return allLinked(c); }));
+    // Node 1 initiates both its links; the responder restarted is a node that leads nothing.
+    const int32_t leader = c.settledLeader();
+    const int b = leader == 2 ? 3 : 2;
+    const uint32_t was = c.node(1).peerLinksForTest().epochOf[b];
+    ASSERT_TRUE(c.node(1).forcePeerRekeyForTest(b));
+    ASSERT_TRUE(until(10s, [&] {
+        return c.node(1).peerLinksForTest().epochOf[b] > was && c.node(b).peerLinksForTest().epochOf[1] == c.node(1).peerLinksForTest().epochOf[b];
+    })) << "the re-handshake completes";
+    c.stop(b);
+    c.startNode(b);
+    const auto restarted = std::chrono::steady_clock::now();
+    EXPECT_TRUE(until(5s, [&] { return allLinked(c); })) << "every link is re-established within 5 s of the restart";
+    const auto linkedAfter = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - restarted);
+    std::printf("[restart] relinked %lld ms after the restart\n", static_cast<long long>(linkedAfter.count()));
+    GoldenAppender g;
+    EXPECT_GE(g.appendNext(c, 5s), 0) << "an acks=all __security append after the relink";
+}

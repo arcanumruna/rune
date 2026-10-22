@@ -49,6 +49,7 @@
 // the Aeron ClientConductor ARE thread-safe, but resolvePending() is only ever
 // called from send() on that same duty-cycle thread anyway.
 
+#include <rune/consensus/ConsensusMessages.h>   // PeerKeepaliveMsg (#17)
 #include <rune/consensus/IngressRing.h>   // kMaxConsensusFrameBytes (#254)
 #include <rune/consensus/MessageSink.h>
 #include <rune/consensus/Types.h>
@@ -144,6 +145,39 @@ public:
     /// The largest consensus frame a sealed sink carries: the receiver's ingress ring maximum (#254).
     static constexpr std::size_t kMaxSealedPayload = rune::consensus::kMaxConsensusFrameBytes;
 
+    /// Issue #17: an idle sealed peer gets a keepalive after this long without a sealed frame - a quarter of the peer
+    /// link's silence window (PeerHandshake::kSilenceNs, static_assert in BrokerNode.cpp), so three consecutive losses
+    /// still leave the peer "alive".
+    static constexpr int64_t kPeerKeepaliveNs = 250'000'000;
+
+    /// Issue #17, the sending (control) thread: one sealed PeerKeepalive to every member that holds a send epoch and
+    /// was sent no sealed frame for kPeerKeepaliveNs.  A member that WAS sealed to since the last call only has its
+    /// activity time refreshed.  Per-member state lives in the peer slots built at construction: no allocation.
+    /// Returns the keepalives sealed.  A PeerPlain sink sends nothing.
+    int sendIdleKeepalives(int64_t nowNs) noexcept {
+        auto* c = std::get_if<rune::peerlink::PeerFrameCrypto>(&crypto_);
+        if (c == nullptr) return 0;
+        int sent = 0;
+        for (auto& [nodeId, slot] : peers_) {
+            if (slot.sealedSends != slot.sealedSeen) {          // consensus traffic flowed to it: no keepalive needed
+                slot.sealedSeen = slot.sealedSends;
+                slot.lastActivityNs = nowNs;
+                continue;
+            }
+            if (!c->hasLink(nodeId) || nowNs - slot.lastActivityNs < kPeerKeepaliveNs) continue;
+            uint8_t frame[PeerKeepaliveMsg::TOTAL_SIZE];
+            (void)PeerKeepaliveMsg::encode(frame, 0);
+            send(nodeId, frame, sizeof frame);
+            if (slot.sealedSends != slot.sealedSeen) ++sent;
+            slot.sealedSeen = slot.sealedSends;
+            slot.lastActivityNs = nowNs;                         // sent or not (unresolved / unconnected): retry in 250 ms
+        }
+        keepalivesSent_ += static_cast<uint64_t>(sent);
+        return sent;
+    }
+    /// Issue #17: keepalives sealed so far (test-visible).
+    [[nodiscard]] uint64_t keepalivesSent() const noexcept { return keepalivesSent_; }
+
     /// Test-only: number of peer publications still unresolved (runs one resolve probe).
     [[nodiscard]] int unresolvedForTest() noexcept { return resolvePending(); }
     /// Test-only: registrations issued after the first one per peer.
@@ -190,6 +224,7 @@ public:
             }
             const std::size_t n = c->seal(toMember, buf, len, sealScratch_.data(), sealScratch_.size());
             if (n == 0) [[unlikely]] return;   // a cipher error: never transmitted
+            ++it->second.sealedSends;          // issue #17: this member is not idle (sendIdleKeepalives)
             buf = sealScratch_.data();
             len = n;
         }
@@ -231,6 +266,9 @@ private:
         uint32_t    boundIp        = 0;        // the host's address at the last add (network order)
         bool        boundKnown     = false;    // boundIp valid (the host had resolved at that add)
         std::shared_ptr<aeron::ExclusivePublication> pub; // null until resolved
+        uint64_t    sealedSends    = 0;        // issue #17: frames sealed to this member (send())
+        uint64_t    sealedSeen     = 0;        // issue #17: sealedSends at the last sendIdleKeepalives look
+        int64_t     lastActivityNs = 0;        // issue #17: the last sealed frame / keepalive (sendIdleKeepalives clock)
     };
 
     // Issue addExclusivePublication for a peer slot (async; does not resolve).
@@ -345,6 +383,7 @@ private:
     rune::peerlink::PeerCryptoMode crypto_{rune::peerlink::PeerPlain{}};   // Task 16: chosen at construction
     std::vector<uint8_t>           sealScratch_;                            // sealed frame (preallocated, sealed only)
     uint64_t                       noLinkLogged_ = 0;
+    uint64_t                       keepalivesSent_ = 0;                     // issue #17
     std::unordered_map<rune::consensus::NodeId, PeerSlot> peers_;
 };
 
