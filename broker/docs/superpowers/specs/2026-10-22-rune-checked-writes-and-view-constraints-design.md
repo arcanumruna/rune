@@ -443,6 +443,8 @@ Names can't contain NUL, so padding can't make two names collide. In general, a 
 **8.4 The pending overlay.** Views fold only up to the LSO, which is bounded by the HW. The overlay covers what lies between each view's fold cursor and the log end offset (LEO).
 
 **The check-time guarantee.** A check sees exactly the fold of the partition's log up to the record before it: the folded view state up to each cursor, plus the overlay over `[cursor, LEO)`. It never waits for replication or the fold.
+- **Exactly once, per view.** For a view V with fold cursor `Cv`, the check reads V's state plus the overlay entries at offsets **≥ `Cv`** only. An entry leaves the overlay only once every checked view has folded past it. So every stored record counts exactly once for each view: it isn't lost before the slowest view folds it, and a faster view doesn't count it twice. How far behind a view is doesn't matter; the overlay holds exactly that gap, up to its capacity (code 55 beyond it).
+- **One effect function.** The check and the fold compute a record's effect (claimed key, released key, old and new group) with the same code, from the same decode. So a record that passed its check can't break the rule when it's folded. The only conflicts a fold meets are pre-existing ones (§8.3).
 - **Serial per partition.** The check, the append and the overlay merge for one batch happen in one worker step (§3), so each batch is checked against every record stored before it, including those not yet replicated, committed or folded.
 - **Across failover.** A new leader accepts no checked write until it has rebuilt the overlay from its local log (§8.6).
 - **Scope.** One partition. That is why unique, derived-key and composite-key views need a source with one partition (§7.4).
