@@ -118,9 +118,23 @@ The embedded Aeron media driver maps its CnC file and log buffers into
 ```sh
 docker run --rm \
   --platform linux/amd64 \
+  --network host \
   --shm-size=256m \
   ...
 ```
+
+## Networking: use `--network host`
+
+Host networking is the low-latency mode. On the benchmark VM Docker's bridge adds about 35 µs at p50 for one node
+and about 60% for three; published ports (`-p`) make p99 about 10x worse. `--network host` measures the same as bare
+metal. It is Linux only in practice; on Docker Desktop (macOS, Windows) it goes through Desktop's VM.
+
+Each node binds, per node id `n`: the consensus, client and replication ports from `RUNE_PEERS` and
+`RUNE_CLIENT_ENDPOINT`, and a derived shard block `8200 + 192n` to `8200 + 192n + 191` (ingress at the base,
+replication at base + 64, egress control at base + 128). Clients reach the shard ingress ports too. Under bridge or
+published ports, publish the client port **and** the node's whole shard block. The default ports (`40111`, `40200`,
+`40222`) lie in Linux's ephemeral range; reserve them with
+`sysctl -w net.ipv4.ip_local_reserved_ports=40111,40200,40222`.
 
 ---
 
@@ -138,6 +152,7 @@ Then start it:
 ```sh
 docker run --rm \
   --platform linux/amd64 \
+  --network host \
   --shm-size=256m \
   -v "$PWD/secrets:/run/secrets:ro" \
   -e RUNE_CLUSTER_KEY_FILE=/run/secrets/cluster.key \
@@ -180,7 +195,10 @@ introduced in BR-7 (3-node compose + UDP peer wiring).
 A 3-node Raft/consensus cluster over `aeron:udp` is defined in
 `docker/docker-compose.yml`. Nodes communicate on consensus port 40111; clients
 connect on port 40200 per node. All nodes share the same compose network so DNS
-names (`rune-1`, `rune-2`, `rune-3`) resolve automatically.
+names (`rune-1`, `rune-2`, `rune-3`) resolve automatically. This bridge-network file is the build-and-test setup
+(the e2e scripts use it). For a deployment, run the three nodes with `network_mode: host` and distinct ports per node,
+as in the three-node example of the
+[Docker Hub page](DOCKERHUB.md#three-node-cluster).
 
 ### Bring up the cluster
 

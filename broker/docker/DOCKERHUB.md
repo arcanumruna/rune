@@ -25,19 +25,32 @@ admin and runs Rune QL.
 
 # How to use this image
 
-Every example uses three settings that every Rune container needs:
+Run Rune with **`--network host`**. It is the low-latency mode: Docker's bridge adds tens of microseconds to p50,
+and published ports (`-p`) make p99 about 10x worse. Host networking measures the same as bare metal. It is Linux
+only in practice; on Docker Desktop (macOS, Windows) it goes through Desktop's VM.
 
+Every example uses these settings:
+
+- `--network host`: the container shares the host's network stack, so clients reach the broker on the host's UDP ports.
 - `--shm-size=256m`: the broker's embedded media driver maps its buffers into `/dev/shm`, and Docker's 64 MB
   default is too small.
-- `-p 40200:40200/udp`: clients reach the broker over **UDP**.
 - `-v rune-data:/var/lib/rune`: the broker's data directory. Keep it on a volume.
 
-## Start a development broker
+The default ports `40111`, `40200` and `40222` lie in Linux's ephemeral range, so the broker logs a startup warning.
+Reserve them on the host once:
+
+```console
+$ sudo sysctl -w net.ipv4.ip_local_reserved_ports=40111,40200,40222
+```
+
+## Single node
+
+### Start a development broker
 
 No authentication, single node, data formatted on first start. Never use this mode for anything you want to keep:
 
 ```console
-$ docker run -d --name rune --shm-size=256m -p 40200:40200/udp \
+$ docker run -d --name rune --network host --shm-size=256m \
     -e RUNE_AUTH=disabled -e RUNE_STORAGE_FORMAT=auto \
     -e RUNE_NODE_ID=0 -e RUNE_PEERS=0@127.0.0.1:40111 -e RUNE_CLIENT_ENDPOINT=0.0.0.0:40200 \
     -v rune-data:/var/lib/rune \
@@ -51,7 +64,7 @@ $ docker exec -it rune rune console --broker 127.0.0.1:40200 --insecure-plaintex
 rune> topic events partitions 1;
 ```
 
-## Start a secured broker
+### Start a secured broker
 
 Authentication is on by default. It needs a cluster key, a TLS certificate and a first admin.
 
@@ -81,7 +94,7 @@ $ docker run --rm -v rune-data:/var/lib/rune arcanumruna/rune rune_broker storag
 **3. Start the broker:**
 
 ```console
-$ docker run -d --name rune --shm-size=256m -p 40200:40200/udp \
+$ docker run -d --name rune --network host --shm-size=256m \
     -v "$PWD/secrets:/run/secrets:ro" \
     -e RUNE_CLUSTER_KEY_FILE=/run/secrets/cluster.key \
     -e RUNE_TLS_CERT_FILE=/run/secrets/tls.pem -e RUNE_TLS_KEY_FILE=/run/secrets/tls.key \
@@ -121,20 +134,19 @@ GRANT ROLE game_server TO USER gs1;
 Clients pass `--user` and `--password-file` (or `RUNE_USER` and `RUNE_PASSWORD_FILE`) and trust the CA with
 `--tls-ca` (or `RUNE_TLS_CA_FILE`). A password is never accepted on the command line or from the environment.
 
-## Run a three-node cluster with `docker compose`
+## Three-node cluster
 
-Make `./secrets` as in step 1, with every node's name in the certificate
-(`subjectAltName=DNS:rune-1,DNS:rune-2,DNS:rune-3,DNS:localhost,IP:127.0.0.1`), then:
+Three nodes on one host, each in its own container on the host network. Each node gets its own ports, and `RUNE_PEERS`
+is identical on every node. Make `./secrets` as in step 1 of the secured broker, then:
 
 ```yaml
 x-rune: &rune
   image: arcanumruna/rune
+  network_mode: host
   shm_size: 256m
   ulimits: { nofile: { soft: 1048576, hard: 1048576 } }
-  volumes: [ "./secrets:/run/secrets:ro" ]
   environment: &env
-    RUNE_PEERS: "0@rune-1:40111:40200:40222,1@rune-2:40111:40200:40222,2@rune-3:40111:40200:40222"
-    RUNE_CLIENT_ENDPOINT: "0.0.0.0:40200"
+    RUNE_PEERS: "0@127.0.0.1:40111:40200:40222,1@127.0.0.1:40112:40201:40223,2@127.0.0.1:40113:40202:40224"
     RUNE_STORAGE_FORMAT: new           # first start only; remove it afterwards
     RUNE_CLUSTER_KEY_FILE: /run/secrets/cluster.key
     RUNE_TLS_CERT_FILE: /run/secrets/tls.pem
@@ -143,33 +155,36 @@ x-rune: &rune
 services:
   rune-1:
     <<: *rune
-    hostname: rune-1
-    environment: { <<: *env, RUNE_NODE_ID: "0" }
+    environment: { <<: *env, RUNE_NODE_ID: "0", RUNE_CLIENT_ENDPOINT: "0.0.0.0:40200" }
     volumes: [ "./secrets:/run/secrets:ro", "rune-data-1:/var/lib/rune" ]
   rune-2:
     <<: *rune
-    hostname: rune-2
-    environment: { <<: *env, RUNE_NODE_ID: "1" }
+    environment: { <<: *env, RUNE_NODE_ID: "1", RUNE_CLIENT_ENDPOINT: "0.0.0.0:40201" }
     volumes: [ "./secrets:/run/secrets:ro", "rune-data-2:/var/lib/rune" ]
   rune-3:
     <<: *rune
-    hostname: rune-3
-    environment: { <<: *env, RUNE_NODE_ID: "2" }
+    environment: { <<: *env, RUNE_NODE_ID: "2", RUNE_CLIENT_ENDPOINT: "0.0.0.0:40202" }
     volumes: [ "./secrets:/run/secrets:ro", "rune-data-3:/var/lib/rune" ]
 
 volumes: { rune-data-1: {}, rune-data-2: {}, rune-data-3: {} }
 ```
 
 ```console
+$ sudo sysctl -w net.ipv4.ip_local_reserved_ports=40111-40113,40200-40202,40222-40224
 $ docker compose up -d
 $ docker compose logs -f        # exactly one node logs "is LEADER"
 $ docker compose exec rune-1 rune security bootstrap --admin admin \
-    --cluster-key-file /run/secrets/cluster.key --broker rune-1:40200 --tls-ca /run/secrets/ca.pem
+    --cluster-key-file /run/secrets/cluster.key --broker 127.0.0.1:40200 --tls-ca /run/secrets/ca.pem
 ```
 
-`RUNE_PEERS` is identical on every node; only `RUNE_NODE_ID` differs. Clients may connect to any node. When the
-leader dies, the survivors elect a new one. For nodes on separate hosts, see
+`RUNE_PEERS` is identical on every node; only `RUNE_NODE_ID` and the client port differ. Clients may connect to any
+node (`127.0.0.1:40200`, `:40201`, `:40202`). When the leader dies, the survivors elect a new one. For one node per
+host, use the same ports on every host and real addresses in `RUNE_PEERS`; see
 [Multi-host](https://github.com/arcanumruna/rune/blob/main/broker/docs/SELF-HOSTING.md#multi-host-nodes-on-separate-machines).
+
+**Bridge or published ports** work but add latency. If you use them, publish the client port **and** the node's
+shard port block (`8200 + 192n` to `8200 + 192n + 191` for node id `n`), because clients reach the shard ports
+too.
 
 # Environment variables
 
@@ -189,14 +204,17 @@ The complete list, including transport and tuning variables, is in the
 
 # Ports
 
-| Port | Protocol | Use |
-|---|---|---|
-| `40200` | UDP | Clients |
-| `40111` | UDP | Consensus between nodes |
-| `40222` | UDP | Partition replication between nodes |
+All UDP. With `--network host` they are the host's ports.
 
-Publish `40200/udp` to reach clients outside Docker. Nodes reach each other's consensus and replication ports
-over a shared network.
+| Port | Use |
+|---|---|
+| `40200` | Clients (`RUNE_CLIENT_ENDPOINT`) |
+| `40111` | Consensus between nodes |
+| `40222` | Partition replication between nodes |
+| `8200 + 192n` to `8200 + 192n + 191` | Shard block of node id `n`: ingress at the base, replication at base + 64, egress control at base + 128. Clients reach the ingress ports. |
+
+Nodes on one host use distinct ports (see the cluster example) and never collide on shard blocks. Under bridge
+networking, publish the client port and the node's whole shard block.
 
 # Where to store data
 
