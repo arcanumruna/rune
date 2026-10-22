@@ -74,7 +74,6 @@ select characterId from character_name where nameKey = lower('Foo');  -- point r
 - Joins, cascades across topics, and views over views.
 - `where` filters inside a view definition.
 - Check constraints on anything other than `count` with an upper bound.
-- Insert-only writes and server-assigned ids (see §11).
 - Constraints over transient sources. A constrained view needs a persisted source, because a transient ring does not survive failover and the overlay could not be rebuilt from it.
 
 **Anti-goals.** Any of these makes the work a failure even if the features otherwise run:
@@ -390,20 +389,95 @@ Per scan: rows returned and pages returned.
 
 All of these show in `show view` and the metrics export.
 
-## 11. Open: allocating ids
+## 11. Broker-assigned keys (`autoincrement`)
 
-Today `BIGSERIAL` assigns `characterId` and `userId`. In Rune, two creates with the same id are both treated as updates of the same record, and no constraint can tell an insert from an update.
+The owner's requirement: ids are generated in the backend, safely and fast.
 
-The options:
+**11.1 How the six databases surveyed do it** (Vitess, Citus, TiDB, CockroachDB and YugabyteDB from source, Spanner from docs):
 
-- **(a) The service generates a 53-bit id.**
-  - The layout is 32 bits of seconds since 2026-01-01, a 10-bit instance id from configuration, and an 11-bit counter per second.
-  - It needs no Rune feature, and the id stays exact as a JavaScript number.
-  - The risk is a misconfigured instance id.
-- **(b) Insert-only writes.** A produce flag would say "fail if this source key exists", checked by the same hook against `character_by_id` plus the overlay.
-- **(c) Both.** (a) for generation, and (b) as the guard.
+- **A central counter that hands out cached blocks.** Vitess (`execNextval`, `next_id` + `cache`), TiDB (`HInc` on the meta key, 30 000-id windows), YugabyteDB (`sequences_data`, blocks of 100) and CockroachDB SQL sequences.
+- **A disjoint high-bit range per node.** Citus (`groupId << 48`) and TiDB `AUTO_RANDOM`.
+- **A stride per writer.** MySQL `compute_next_insert_id` (`offset + N×increment`), which Group Replication sets automatically.
+- **Time plus node id.** CockroachDB `unique_rowid()`.
+- **Bit-reversed ids.** Spanner and CockroachDB `unordered_rowid` use these to avoid hot ranges in range-partitioned stores. Rune hash-partitions, so it doesn't need them.
 
-This decision belongs to the owner. §6.2 can host (b) at little extra cost.
+All of them accept gaps and give no global ordering across nodes. None makes explicit ids collision-proof. The id is always assigned in a trusted server tier, never by the application.
+
+Rune combines the MySQL stride with the durable block reservation of Vitess, TiDB and YugabyteDB, and puts both on the partition leader. This is possible because Rune's partition count is immutable, which a range-partitioned or reshardable store cannot assume.
+
+**11.2 Declaration**
+
+```sql
+topic character {
+  characterId uint64 autoincrement, userId uint64, name string(16), …
+} partitions 1 replicas 3 key characterId
+  with (cleanup.policy = compact, key.index = on);
+```
+
+- **What it applies to.** `autoincrement` is valid only on the key field, typed `uint64`, `int64` or `uint32`, and the key is mandatory.
+- **Implied settings.** It implies `key.index = on` and a modulo partitioner (§11.3).
+- **Immutable.** The key field, its type, `autoincrement` and the partition count are all immutable. Today's rules already prevent dropping the key (`Evolve.cpp:100`) and retyping it, and partitions can't be altered (`alter topic … set partitions` is a parse error).
+
+**11.3 Routing: the modulo partitioner**
+
+- An autoincrement topic routes a key by `id % P`, not by `fnv1a(key) % P`. The partitioner is a topic property, so producers, the gateway and the read path all use it.
+- Partition `p` assigns only ids `≡ p (mod P)`:
+  - The n-th id is `n·P + p`, where `n` is the partition's counter.
+  - `n` starts at 1, so id 0 is never assigned.
+- Ids stay small and dense across the whole topic, and are JavaScript-safe. The broker refuses to assign above `2^53 − 1`, and the topic can set a lower `autoincrement.max`.
+- A batch of k new records gets `base, base+P, …, base+(k−1)P`, so the ack only needs to carry `base`.
+- With `partitions 1` the ids are just 1, 2, 3, … and increase globally.
+
+**11.4 Assignment on the write path**
+
+- **The client's part.** The client sends a create as `insert` with key **0** (an 8-byte placeholder), and the key field in the value also set to 0. It routes the batch with a sticky partitioner per producer, as Kafka does for null keys, so each batch targets one partition.
+- **The leader's part.** It runs in the §6.2 hook: after dedupe, before the append, on the leader thread.
+  1. Take k ids from the in-memory counter.
+  2. Overwrite the 8 placeholder bytes of each record's key, and the key field in its value. The value field's offset comes from the writer-version descriptor cache shared with the fold. Lengths don't change, so the batch is never re-encoded.
+  3. Recompute the batch CRC32C (hardware-accelerated).
+- **Cost.** Nothing is allocated, nothing is looked up, and there is no extra hop.
+  - The target is under 200 ns per batch on `ProduceValidateBench` (my call).
+  - Topics without `autoincrement` pay only the §6.2 null-pointer branch.
+  - A record auto-assigned an id skips the key-index existence check, because the counter makes it unique by construction.
+
+**11.5 Durability: reservation records**
+
+- **Reserving.** Before an id above the current reservation is used, the leader appends a control record to the same partition log, "reserved through n = R". It goes in on the same thread, immediately before the data batch. Its step is `autoincrement.reserve`, default 4096.
+- **Replication.** The reservation replicates like any record. The data batch is committed only once the HW passes it, and the reservation sits below it, so it is committed first. No separate sequence store or replication path is needed.
+- **Failover and restart.** The new leader reads the latest reservation in its log and resumes at R+1. The unused rest of the block becomes a gap.
+- **Truncation.** It cuts a suffix of the log. If a reservation is cut, every data record above it is cut too, so no surviving record's id is ever reassigned.
+- **Compaction.** The cleaner keeps the latest reservation record per partition. Otherwise the highest id could disappear once its record is tombstoned and compacted away, and a deleted record's id would be reused.
+- **Readiness.** Until the new leader has found its reservation, autoincrement writes are refused with retriable `NotLeader`, as part of the §6.5 gate.
+
+**11.6 Safety rules**
+
+- **Producer requirements.** Writes must come from an idempotent producer with `acks=all`, the same as constrained topics (§7.1). The ack, and so the id, is returned only once the write is committed. A truncated record therefore never gave its id to anyone.
+- **Retries.** An idempotent retry that dedupes returns the original offsets and the original `base` id. The broker reads the first key of the stored batch at its base offset. This is a cold path, retries only, from the page cache or the ring, so the producer-state entry doesn't grow.
+- **Transactions.** Ids assigned inside a transaction that aborts are burned, leaving a gap, and are never reused.
+- **Accepted writes:**
+  - `insert` with key 0: assigned by the broker.
+  - `insert` with an explicit id: allowed only for a principal with the new `IMPORT` grant on the topic, such as the Postgres back-fill. The broker checks the id against the key index (`KeyExists`), routes it to its owning partition by modulo, and moves that partition's counter past it (`n = id div P`), all on the one leader that could ever assign that id. This is exact, unlike MySQL and TiDB, where explicit ids can still collide.
+  - `update`, `remove` and `removeExisting` with an explicit id: always allowed, checked against the key index.
+- **Refused writes:**
+  - A plain upsert: it could create an id the counter never accounted for (`InvalidRequest`).
+  - `insert` with an explicit id from a principal without `IMPORT` (`NotAuthorized`).
+  - Assignment past the maximum (`AutoIncrementExhausted`, new code 55, definite).
+
+**11.7 Client API**
+
+```cpp
+auto r  = characters.insertAndWait({.userId = u, .name = "Foo", …});   // characterId left 0
+auto id = r.key();                                                     // the assigned id
+// Writes that depend on the id, e.g. in the same transaction:
+skills.insert({id, 98, …}); skills.insert({id, 99, …});
+```
+
+- **Reporting the ids.** `ProduceResponse` gets a trailing `assignedBase u64`, gated on client version 12. Older decoders accept the longer block. The fixed scratch arrays in the sink, the gateway and the return carrier each grow by 8 bytes.
+- **Per-record ids.** The client works out each record's id as `base + i·P`, and the completion carries it.
+- **Async.** `insert(rec)` reports the id in its completion.
+- **Writes that depend on a new id** wait for that id's ack. That is one sequential round trip, the same as Postgres `INSERT … RETURNING` followed by the child inserts. Creates are rare control-plane writes, so this is accepted.
+
+**11.8 If the partition count ever becomes mutable.** Changing it remaps every key, autoincrement or not. Before an autoincrement topic changes P, every partition's counter must be raised so that `n·P_new + p` lies above the highest id reserved under P_old. MySQL has the same rule when `auto_increment_increment` changes.
 
 ## 12. Hot-path budget and benchmarks
 
@@ -460,6 +534,7 @@ Every cell is a test (unit, integration or e2e, wherever it can first be seen). 
 - every intent × {key absent, key present, key pending insert, key pending delete (transactional and not)}
 - `remove` / `removeExisting` through the typed API for every key type width (u16/u32/u64/i64/string(N)), checking that the routed key bytes match `send(rec)`
 - an intent sent to a topic without a key index, and to an old-feature-level cluster
+- autoincrement: 1 record and k records per batch, P = 1 and P > 1, a batch crossing a reservation boundary, failover right after a reservation and right before one, truncation of a reservation together with its data, compaction after the highest id is deleted (no reuse), an idempotent retry returning the same ids, an aborted transaction (ids burned), an explicit `IMPORT` id below and above the counter, an explicit id without `IMPORT`, a plain upsert refused, exhaustion at the maximum, and an old client (v11) refused
 - error 51 inside a transaction
 
 **Reads**
@@ -490,6 +565,7 @@ Each part can be shipped on its own:
 3. Composite keys, the prefix index, `GetViewRowK`, `ScanViewRows` and the client read API. Covers §5.4 and §8.
 4. Rune QL `create view` (plan v2, the feature level) and `select`, plus the CLI. Covers §9.
 5. Constraints: the hook, the overlay, the gate, error 51 and the client's definite-reject and split path. Covers §6.1–§6.6 and §7.
+5c. `autoincrement`: the modulo partitioner, assignment in the hook, reservation records with cleaner retention, the `assignedBase` ack field, the `IMPORT` grant and the typed `insertAndWait` key result. Covers §11.
 5b. Write intents, the key index, and the typed `insert` / `update` / `remove` / `removeExisting` API. Covers §6.7. It reuses the part-5 hook.
 6. Docs: `ql.md`, `wire-protocol.md`, `client-cpp.md`, `admin-cli.md`, `CATALOG.md`, the root and client `CLAUDE.md`, and the site's views section, corrected to the shipped syntax.
 
@@ -502,6 +578,7 @@ Each part can be shipped on its own:
 - A source key with a pending entry from another open transaction is locked until that transaction ends (§6.4).
 - `lower()` is ASCII-only. The first users' names are `[A-Za-z0-9]{1,16}`.
 - The default overlay capacity is 65 536 entries per view.
+- Autoincrement topics use a modulo partitioner (`id % P`). Reservation step 4096. Assignment budget under 200 ns per batch. Dedupe returns ids by reading the stored batch back, so the producer-state entry doesn't grow.
 
 ## 16. Left to the builder
 
