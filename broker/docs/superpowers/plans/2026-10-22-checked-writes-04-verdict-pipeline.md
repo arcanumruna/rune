@@ -142,7 +142,10 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
   - **Fast path.** One `[[unlikely]]` branch on `rejected.size() != 0` per batch, then one `nextRejectedAtOrAfter(base)` binary search.
 - **P4-8 — Ack trailer (§11.3, C5).**
   - **`recordIndex`** is the record's `offsetDelta` (`offset − baseOffset`). Rune's `BatchBuilder` writes `offsetDelta = ordinal`, so for every Rune client it is the record's ordinal. The wire docs say so.
-  - **Known-old duplicate.** A duplicate answered "offset unknown" (`baseOffset = −1`, `Worker.h:8323-8329`) with `View` on a verdict source is answered `DuplicateSequence` (21) with no trailer, because its verdicts cannot be looked up. The client then completes each record `BrokerError`/21 for a `View` producer instead of today's `Ok −1` (`ProducerImpl.cpp:2363-2370`). It is counted (`verdictUnknownDuplicates`), and the stress run asserts it stays 0.
+  - **Duplicate replay (R04e).** The dedupe window already keeps every in-window batch's base offset. `ProducerStateEntry::baseOffsets` (`broker/libs/storage/include/rune/storage/ProducerStateManager.h:104-151`, `push` at `:144-150`) holds 32 slots = `kRetryWindowSize` (`:81`). An exact match returns `ValidationResult::dup(off, off + (last − base))` (`broker/libs/storage/src/ProducerStateManager.cpp:196-204`), and `handleProduceBatch` copies it into `ProduceOutcome::baseOffset` / `lastOffset` (`broker/libs/storage/src/ProducePath.cpp:209-225`). No new state is needed.
+    - **In-window duplicate with `View` on a verdict source.** It parks in `pendingAcksView_` with the original `baseOffset` / `lastOffset`. It is released when the usual C4 condition holds **and** `state->rejected.watermark() > lastOffset` (W, the committed coverage). The trailer is then built from `rejected.forEachIn(baseOffset, lastOffset + 1)` exactly as for the original. So a retry after a lost ack (`insertAndWait`) gets the original's per-record verdicts and the same rejected indexes. Counted `verdictReplays`.
+    - **Later parts extend the replay.** Part 06 adds the original `assignedBase` (its side window). Part 09 adds the constraint names (`Client::constraintName` on the replayed `constraintId`s). Neither changes this rule.
+    - **Known-old duplicate.** A duplicate outside the window (`baseOffset = −1`, `ProducerStateManager.cpp:206-216`, `Worker.h:8323-8329`) with `View` on a verdict source cannot have its verdicts looked up. It is answered `DuplicateSequence` (21) with no trailer, after the same HW and fold wait. The client reports **one** `OpStatus::VerdictUnknown` for the whole batch (every record's completion carries it, `errorCode 21`), never per-record errors. Without `View`, or on a partition that is not a verdict source, today's answer (`OK −1`, `ProducerImpl.cpp:2363-2370`) is unchanged. Counted `verdictUnknownDuplicates`; the stress run asserts it stays 0, because the client never has more than 32 batches in flight.
 - **P4-9 — Large acks (R03a).** `AeronSessionPubPolicy::claim` (`SessionAckSink.h:1189-1201`) encodes into a policy-owned `std::array<uint8_t, kMaxEncodedSize + kCryptoOverhead>` and calls `pub->offer(…)` when `len > pub->maxPayloadLength()`. Otherwise it keeps `tryClaim`. The return codes are mapped as today.
 - **P4-10 — Arena back-pressure keeps order.** When `VerdictAckArena::reserveVerdicts` fails, `flushOwedAcksView_` keeps the entry. It also keeps every later entry of the **same partition** for this sweep (a fixed 16-slot list of deferred partition keys; overflow defers the whole sweep). Pipelined acks of one partition therefore never leave out of order. Nothing is dropped.
 - **P4-11 — Index capacity.** `RejectedOffsetIndex` reserves **65,536** entries at creation. A cold maintenance step (`Worker::maintainVerdictIndexes_()`, once per 1,024 passes and whenever an `add` crosses 75 %) doubles it. The cap is **2²⁴** entries. When the index is full, `add` returns false, the judge stalls with an alert (`VerdictSource::stalled()`), and delivery and `View` acks pause. It is never a verdict (§8.4 "no resource-dependent verdicts"). `dropBelow(logStart)` runs where `RcState::advance` already prunes the aborted index (`RcState.h:352-356`).
@@ -163,7 +166,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
     - Rejected records never enter the offset map and are dropped by both rewrite engines (`rewriteSegmentImpl`, `LogCleaner.cpp:435`, `mergeGroupWithMap`, `:1386`).
     - `kConstraintSetChange` records are always kept.
     - A marker is removable only when every offset it lists is below the pass's clean boundary, a later marker below the scan end has a higher `finalThrough`, and the marker is below `markerRemovalBound` (every assigned replica fetched it). It is then horizon-stamped and dropped like a txn marker (`markerAction`, `:261-268`).
-- **P4-15 — Matrix fold-in (R03d).** Part 03's local enums move into `CheckedWritesMatrixExpectations.h`, with `Op` and `Entity` values 120–139. Part 03's six timings that §15 does not list are appended to `Timing` after the §15 list: `TxnCommitBehind, TxnAbortBehind, LeaderLossParked, AckDeadline, StrictTier, GatewayRouted`. Nothing is renumbered.
+- **P4-15 — Matrix fold-in (R03d).** Part 03's local enums move into `CheckedWritesMatrixExpectations.h`, with `Op` and `Entity` values 120–139. Part 03's six timings that §15 does not list are appended to `Timing` after the §15 list: `TxnCommitBehind, TxnAbortBehind, LeaderLossParked, AckDeadline, StrictTier, GatewayRouted`, then Part 04's own `RetryAfterWindow` (R04e). Nothing is renumbered; later parts only append (R04d).
 - **P4-16 — `rejectedNotCompacted`** (StatId 7) is `rejected.countAtOrAfter(log->firstDirtyOffset())`: the cleaner drops every rejected record below its clean watermark. On a non-compacted topic it is the count at or after `logStart`.
 
 ## Contract additions (none redefines a contract type)
@@ -216,9 +219,14 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 13. **Client:**
     - `ClientAgent::ProduceAck` (`ClientAgent.h:571-576`) appends `uint32_t verdictOff = 0; uint16_t verdictCount = 0; bool hasVerdicts = false;`, with the entries copied into an agent-owned `std::vector<uint8_t> verdictBytes_`. It is reserved to 65,536 × 8 B, grow-once, cleared with the acks, and its growth is counted;
     - `ProducerHub::onProduceResponse` / `ProducerImpl::onProduceResponse` gain a trailing `std::span<const uint8_t> verdicts = {}, bool hasVerdicts = false`.
-14. **Matrix** (P4-15): the `Timing` values appended for Part 03; `enum class Part : uint8_t { P03 = 3, P04 = 4, P05 = 5, P06 = 6, P07 = 7, P09 = 9, P11 = 11 };`; `std::vector<Cell> cellsFor(Part)`.
+14. **Matrix** (P4-15, R04d): the `Timing` values appended for Part 03, then `RetryAfterWindow` (R04e); `enum class Part : uint8_t { P03 = 3, P04 = 4, P05 = 5, P06 = 6, P07 = 7, P09 = 9, P11 = 11 };`; `std::vector<Cell> cellsFor(Part)`.
 15. **Knob:** `NodeConfig::verdictIntervalMs` (env `RUNE_VERDICT_INTERVAL_MS`, default 100, SD14) and `void Worker::setVerdictIntervalNs(int64_t) noexcept`.
 16. **`ViewKey::asU64()`** (C9.1 appended; `len ≤ 8` only, until Part 07), and the `FoldStats::skippedRejected` counter (appended).
+17. **Duplicate replay (R04e, P4-8):**
+    - `OpStatus::VerdictUnknown = 14` is appended to `client-cpp/include/rune/client/Completion.h:54`. It follows Part 06's reserved `StoredIdUnknown = 13`, which is not renumbered. "Stored; its verdicts are unknown (the retry fell outside the dedupe window)."
+    - `VerdictSourceStats` appends `uint64_t verdictReplays = 0;`.
+    - `PendingAcksView` appends `uint8_t replay = 0;`: a duplicate whose release also waits for `W > lastOffset`.
+    - Parts 06 and 09 add the assigned keys and constraint names to the replayed answer; the release rule is fixed here.
 
 ## Contract gaps (flagged to the controller)
 
@@ -273,7 +281,8 @@ Built on `CheckedWritesRig.h` (one real shard-mode `Worker`, a disk `Log` behind
 | 6 | `ViewAckWriter` | an idempotent v12 producer with `All \| View` |
 | 7 | `OldWriters` | the same records from a v11 session, `acks=leader`, `acks=none` and a non-idempotent `acks=all` producer |
 
-**Timings:** the 14 §15 values (`Single … DropDuringWrites`). In the rig:
+**Timings:** the 14 §15 values (`Single … DropDuringWrites`) plus the appended `RetryAfterWindow` (R04e), in which the idempotent producer sends 33 further batches and then re-sends the op's batch. In the rig:
+- `RetryBeforeJudge` / `RetryAfterJudge`: the duplicate's ack (for `ViewAckWriter`) equals the original's: the same base offset, trailer and rejected indexes, released only once `W > lastOffset`.
 - `FailoverAppendHw`: append, then `failover()` before `followerFetch()`. The tail is cut, the `View` ack is `NotLeader`, the writer re-sends.
 - `FailoverHwFold`: HW passed, `failover()` before any driven fold.
 - `FailoverFoldMarker`: judged, marker appended above the HW, then `failover()` (the marker is cut).
@@ -281,11 +290,12 @@ Built on `CheckedWritesRig.h` (one real shard-mode `Worker`, a disk `Log` behind
 - `CreateOnNonEmpty` / `ReplaceDuringWrites` / `DropDuringWrites`: the `TestReject` member is installed, replaced (`TagEquals{9}` → `TagEquals{1}`) or dropped between the op's second and third record.
 
 **Not applicable (top-down; the first rule matching names the reason):**
-1. `OldWriters × {RetryBeforeJudge, RetryAfterJudge}`: these writers make no idempotent retry (10 cells).
+1. `OldWriters × {RetryBeforeJudge, RetryAfterJudge, RetryAfterWindow}`: these writers make no idempotent retry (15 cells).
 
-**Cell count:** 5 × 8 × 14 = 560. 550 are applicable and 10 skipped, pinned by `CheckedWritesMatrixCountRegression.CellCountsArePinned` (row 04).
+**Cell count:** 5 × 8 × 15 = 600. 585 are applicable and 15 skipped, pinned by `CheckedWritesMatrixCountRegression.CellCountsArePinned` (row 04).
 
 **`expect04(cell)`, top-down.** The verdicts themselves always come from `CheckedWritesModel` (the reference judge, Task 10). `expect04` names what the cell checks:
+0. `RetryAfterWindow × ViewAckWriter` → the retry's answer is `DuplicateSequence` (21) with no trailer (54 B), `verdictUnknownDuplicates == 1`. Under the other entities the retry is stored once and changes nothing.
 1. `FailoverAppendHw` → the first `View` ack is `NotLeader`; the re-sent batch's ack (for `ViewAckWriter`) carries the model's verdicts.
 2. `ViewAckWriter` → one OK ack, 54 + 2 + 8n bytes, whose trailer is exactly the model's rejections `(offsetDelta, 51, constraintIdOf(objectId, 1))` in ascending order.
 3. `OldWriters` → the v11 session's frame is 46 B with no trailer; `acks=none` gets nothing; the others get their 03 frames.
@@ -1063,9 +1073,9 @@ A failure prints `seed=<n> step=<k> action=<name>`.
   - `AeronSessionPubPolicy::claim` (`:1189-1201`): P4-9.
 - Modify: `broker/libs/node/include/rune/node/Worker.h`:
   - `flushOwedAcksView_` (03): the condition `state->verdicts->judgedThrough() > lastOffset` on a verdict source (C4); the trailer reserve and fill (`rejected.forEachIn(baseOffset, lastOffset + 1)` → `(offset − baseOffset, code, cid)`); P4-10;
-  - the known-old duplicate answer (P4-8);
+  - the duplicate answers (P4-8, R04e): an in-window duplicate with `View` on a verdict source parks with `replay = 1` and is released only once `W > lastOffset`, with the trailer rebuilt from the index; a known-old one is answered `DuplicateSequence` without a trailer;
   - `emitProduceAck_` (`:2132-2149`) copies `verdictRun` / `verdictCount` / `hasVerdicts`.
-- Modify (client): `client-cpp/include/rune/client/agent/ClientAgent.h:571-580`, `client-cpp/src/agent/ClientAgent.cpp:1101-1113` (copy the trailer; `codec::decodeProduceResponse` v12 fields from 03), `client-cpp/src/Client.cpp:3152-3163`, `ProducerHub.{h,cpp}:81-88`, `ProducerImpl.{h,cpp}` (`onProduceResponse` `:2350-2390`, `completeSlice_` `:2761-2782`: a per-record override from the trailer; `completeHandle_` takes `reserved0 = constraintId`)
+- Modify (client): `client-cpp/include/rune/client/Completion.h:54` (`OpStatus::VerdictUnknown = 14`), `client-cpp/include/rune/client/agent/ClientAgent.h:571-580`, `client-cpp/src/agent/ClientAgent.cpp:1101-1113` (copy the trailer; `codec::decodeProduceResponse` v12 fields from 03), `client-cpp/src/Client.cpp:3152-3163`, `ProducerHub.{h,cpp}:81-88`, `ProducerImpl.{h,cpp}` (`onProduceResponse` `:2350-2390`, `completeSlice_` `:2761-2782`: a per-record override from the trailer; `completeHandle_` takes `reserved0 = constraintId`)
 - Create: `broker/libs/node/tests/node/CheckedWritesVerdictAckTest.cpp` (in `rune_checked_writes_verdict_tests`), `client-cpp/tests/producer/ProducerVerdictsTest.cpp` (in `rune_invoker_tests`, `client-cpp/CMakeLists.txt`)
 - Modify: `broker/libs/node/tests/node/SessionAckSinkTest.cpp`, `broker/libs/node/tests/support/CheckedWritesRig.h` (`ack(corr)`)
 
@@ -1090,15 +1100,19 @@ A failure prints `seed=<n> step=<k> action=<name>`.
     - an accepted record → `Ok` with its offset;
     - a rejected record → `BrokerError`, `errorCode` 51–53, `reserved0 = constraintId` (C6);
     - a Tier-2 batch → one completion carrying the first rejection;
-    - `DuplicateSequence` for a `View` producer → `BrokerError`/21 per record (P4-8).
+    - `DuplicateSequence` for a `View` producer → `OpStatus::VerdictUnknown` for the whole batch, never per-record errors (P4-8, R04e).
 
 - [ ] **Step 1: Write the failing tests.**
   - `CheckedWritesVerdictAckTest.cpp` (rig, `TagEquals{9}`, v12 session):
     - `CheckedWritesVerdictAck.TrailerCarriesExactlyTheRejections`: tags 1, 9, 1, 9 with `acks 3` → one OK ack, frame 54 + 2 + 16 = 72 B, verdicts `{(1, 51, 0x00070001), (3, 51, 0x00070001)}`.
     - `CheckedWritesVerdictAck.AllAcceptedIsAnEmptyTrailer`: tags 1, 1 → 56 B, `hasVerdicts`, count 0.
     - `CheckedWritesVerdictAck.WaitsForTheJudgeNotTheMarker`: hold the follower so the marker cannot commit → the ack is sent at the step `judgedThrough() > lastOffset` with the HW past the batch but below the marker.
-    - `CheckedWritesVerdictAck.RetryBeforeJudgeIsParkedThenAnswered` / `…RetryAfterJudgeAnswersFromTheIndex` (§11.3): an idempotent duplicate → the same base offset and identical verdicts; `hookChecksForTest()` unchanged by the retry.
-    - `CheckedWritesVerdictAckRegression.KnownOldDuplicateIsDuplicateSequenceWithoutTrailerRegression` (P4-8): `verdictUnknownDuplicates == 1`, `errorCode 21`, frame 54 B.
+    - `CheckedWritesVerdictAckRegression.ViewRetryInTheWindowReplaysTheOriginalVerdictsRegression` (R04e). Tags 1, 9, 1, 9 with `acks 3`; the original ack is dropped by the rig (a lost ack). The idempotent retry of the same batch (same pid, epoch, sequence) then:
+      - is answered with the same `baseOffset` and a byte-identical trailer `{(1, 51, 0x00070001), (3, 51, 0x00070001)}`, so the rejected indexes are the same;
+      - is not answered before `state().rejected.watermark() > lastOffset` (hold the follower: no answer while W is below; `followerFetch()` → answered);
+      - leaves `hookChecksForTest()` and the LEO unchanged, and gives `verdictReplays == 1`.
+      This is run twice: the retry before the judge reaches the batch (parked) and after it (from the index).
+    - `CheckedWritesVerdictAckRegression.ViewRetryOutsideTheWindowIsDuplicateSequenceRegression` (R04e). The original batch, then 33 more batches from the producer, then the original re-sent: `errorCode 21`, frame 54 B with no trailer, `verdictUnknownDuplicates == 1`, nothing appended.
     - `CheckedWritesVerdictAckRegression.FourThousandRejectionsAckIsOfferedRegression` (R03a, Review Focus 5): a 4096-record batch, all tag 9 → one ack of 32,824 B through the real Aeron sink; decodes to 4096 entries in order; `offerFramesForTest() == 1`, `claimFramesForTest()` unchanged for that ack.
     - `CheckedWritesVerdictAckRegression.ArenaFullDefersInPartitionOrderRegression` (P4-10): the arena sized 4096 (rig option); batch A (4096 rejections) then B (1 rejection) on one partition, A's session publication back-pressured → B is not acked before A; once A is claimed, B follows; nothing dropped.
     - `CheckedWritesVerdictAck.PlainAllOnAVerdictSourceHasNoTrailer`: `acks 1` → 54 B, `!hasVerdicts`.
@@ -1110,7 +1124,8 @@ A failure prints `seed=<n> step=<k> action=<name>`.
   - `ProducerVerdictsTest.cpp` (client, fake session feeding v12 `ProduceResponse` frames):
     - `ProducerVerdicts.CoalescedBatchWithOneBadRecord`: 8 records, the trailer `{(3, 51, 0x00070001)}` → 7 completions `Ok` with `value = base + i`, record 3 `BrokerError`, `errorCode 51`, `constraintIdOf(c) == 0x00070001`; the next batch is sent and acked normally; no epoch bump, no resend.
     - `ProducerVerdicts.Tier2BatchCarriesTheFirstRejection`.
-    - `ProducerVerdicts.DuplicateSequenceOnAViewProducerIsAnError`: `BrokerError`/21 per record. For an `All` producer → today's `Ok −1`.
+    - `ProducerVerdicts.ReplayedVerdictsCompleteEachRecordAsTheOriginal` (R04e): the first ack is lost and the retry's ack carries the trailer `{(3, 51, 0x00070001)}` → the same per-record completions as `CoalescedBatchWithOneBadRecord`, each exactly once.
+    - `ProducerVerdicts.DuplicateSequenceOnAViewProducerIsVerdictUnknown` (R04e): 8 records → 8 completions, each `OpStatus::VerdictUnknown` with `errorCode 21`; none is `BrokerError` or `Ok`. For an `All` producer → today's `Ok −1`.
     - `ProducerVerdicts.VerdictArenaGrowsOnceAndIsCounted`.
 - [ ] **Step 2: Run to verify they fail.** `cmake --build build/root -j14 --target rune_checked_writes_verdict_tests rune_session_ack_sink_tests` and `cmake --build build/sub-client-cpp -j14 --target rune_invoker_tests`. Expected: FAIL (no trailer).
 - [ ] **Step 3: Implement** as specified. In `flushOwedAcksView_`, for an entry of a verdict source:
@@ -1157,7 +1172,8 @@ A failure prints `seed=<n> step=<k> action=<name>`.
   enum class Timing : uint16_t { Single, BackToBack, SelfCollidingBatch, Racing, RetryBeforeJudge, RetryAfterJudge,
                                  FailoverAppendHw, FailoverHwFold, FailoverFoldMarker, TruncateTail, RestartDuringRebuild,
                                  CreateOnNonEmpty, ReplaceDuringWrites, DropDuringWrites,
-                                 TxnCommitBehind, TxnAbortBehind, LeaderLossParked, AckDeadline, StrictTier, GatewayRouted };
+                                 TxnCommitBehind, TxnAbortBehind, LeaderLossParked, AckDeadline, StrictTier, GatewayRouted,
+                                 RetryAfterWindow /* 04, R04e */ };
   enum class Part : uint8_t { P03 = 3, P04 = 4, P05 = 5, P06 = 6, P07 = 7, P09 = 9, P11 = 11 };
   struct Cell { Op op; Entity entity; Timing timing; };
   struct Expected { bool applicable = true; const char* naReason = nullptr; /* per-part fields */ };
@@ -1185,12 +1201,12 @@ A failure prints `seed=<n> step=<k> action=<name>`.
     ```cpp
     TEST(CheckedWritesMatrixCountRegression, CellCountsArePinned) {
         EXPECT_EQ(applicable(cellsFor(Part::P03)), 78u); EXPECT_EQ(skipped(cellsFor(Part::P03)), 2u);
-        EXPECT_EQ(applicable(cellsFor(Part::P04)), 550u); EXPECT_EQ(skipped(cellsFor(Part::P04)), 10u);
+        EXPECT_EQ(applicable(cellsFor(Part::P04)), 585u); EXPECT_EQ(skipped(cellsFor(Part::P04)), 15u);
     }
     ```
   - `CheckedWritesModel.ReferenceJudgeIsIndependent`: a hand-built log of 12 records with two change records → the expected verdict map is written out in the test.
 - [ ] **Step 2: Rewire Part 03's matrix** onto `cellsFor(Part::P03)` and `expect03` (moved unchanged). Run: `ctest --test-dir build/root -R 'CheckedWritesViewAckMatrix' -j14 --output-on-failure`. Expected: the same 78 pass and 2 skip.
-- [ ] **Step 3: Run.** `cmake --build build/root -j14 --target rune_checked_writes_matrix_tests && ctest --test-dir build/root -R 'CheckedWritesMatrix|CheckedWritesModel\.' -j14 --output-on-failure`. Expected: 550 pass, 10 skip, the pin and the model test pass. Mutation checks (do each, then revert):
+- [ ] **Step 3: Run.** `cmake --build build/root -j14 --target rune_checked_writes_matrix_tests && ctest --test-dir build/root -R 'CheckedWritesMatrix|CheckedWritesModel\.' -j14 --output-on-failure`. Expected: 585 pass, 15 skip, the pin and the model test pass. Mutation checks (do each, then revert):
   - drop the cut in `pushOwnedSubscriptions_` → every `RejectedWrite × RawSubscription` cell is red;
   - make `isRejectedRecord` return false → every `OtherViews` cell with a rejection is red;
   - skip the map skip in the cleaner → every `RejectedOverAccepted` cell's (e) is red.
@@ -1199,7 +1215,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
   git add broker/libs/node/tests/support/CheckedWritesMatrixExpectations.h broker/libs/node/tests/support/CheckedWritesModel.h \
           broker/libs/node/tests/node/CheckedWritesMatrixTest.cpp broker/libs/node/tests/node/CheckedWritesViewAckMatrixTest.cpp \
           broker/libs/node/tests/support/CheckedWritesAckRig.h broker/libs/node/CMakeLists.txt
-  git commit -m "test(node): shared checked-writes matrix (04: 550 cells; 03 folded in at 120-139) and the reference model" \
+  git commit -m "test(node): shared checked-writes matrix (04: 585 cells; 03 folded in at 120-139) and the reference model" \
              -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   ```
 
@@ -1295,8 +1311,8 @@ A failure prints `seed=<n> step=<k> action=<name>`.
   - **`wire-protocol.md`**, a section "Control records 16–19":
     - the batch form and both payloads of C10, with byte tables;
     - "consumers never receive them";
-    - the `View` ack trailer: `recordIndex` = the record's `offsetDelta` (= ordinal for Rune clients), the 4096 cap, `DuplicateSequence` for an unknown-verdict duplicate on a verdict source.
-  - **`client-cpp.md`:** per-record results on `View` acks (`errorCode` 51–53, `constraintIdOf`, Tier-2 first rejection, `DuplicateSequence` → `BrokerError`/21 for `View` producers).
+    - the `View` ack trailer: `recordIndex` = the record's `offsetDelta` (= ordinal for Rune clients), the 4096 cap, an in-window `View` retry replays the original's verdicts once W passes it; `DuplicateSequence` for a retry outside the window on a verdict source.
+  - **`client-cpp.md`:** per-record results on `View` acks (`errorCode` 51–53, `constraintIdOf`, Tier-2 first rejection, a `View` retry replays the original verdicts; `OpStatus::VerdictUnknown` when the retry fell outside the dedupe window).
   - **`operations.md`**, a section "Verdict sources":
     - markers and `W`;
     - the cleaner compacts only below `W`;
