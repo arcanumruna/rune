@@ -24,7 +24,7 @@ The RegressorsPath backend is moving off Postgres and Redis onto Rune, one servi
 6. Ids are generated in the backend (the broker), safely and fast. The topic key is mandatory where ids are generated, and it can't be altered.
 7. Every typed topic validates every write. A topic declared without a field list is untyped: a raw log of opaque bytes with no database features. Every database feature needs a typed topic.
 8. A typed `remove` / `removeExisting` API exists.
-9. Strings: `lower()` is ASCII-only for now. A Unicode `casefold()` is reserved for later (§8.1).
+9. Strings are UTF-8. A typed `string` field must hold valid UTF-8. `lower()` is Unicode simple lowercasing. There are no collations yet, and `casefold()` is reserved for later (§4, §8.1).
 
 **Target.** All of the following must work end to end:
 
@@ -111,7 +111,7 @@ characters.removeExistingAndWait(id);   // KeyNotFound → 404
 - `check` on anything other than an upper bound on `count`.
 - Constraints over transient sources: a transient ring doesn't survive failover, so the overlay couldn't be rebuilt.
 - Standalone sequences not tied to a topic key (`create sequence`, `nextId`).
-- Locale-aware or Unicode case folding.
+- Collations, locale-aware case rules (Turkish, Lithuanian and so on), Unicode normalization, and full case folding (`casefold()` is reserved, §8.1).
 - Folding views ahead of commit (rows a failover could lose). The `Leader | View` ack is accepted, but it waits for commit (§8.9).
 
 **Anti-goals.** Any of these makes the work a failure even if the rest works:
@@ -189,6 +189,11 @@ Validation (§4) runs for every typed topic, in the same single decode pass.
   - A raw (untyped) topic handle refuses to bind to a typed topic. The raw `send(topic, key, bytes)` path is for untyped topics only.
   - The broker backs this up. A typed topic still validates every record, so bytes from a misused raw path are rejected anyway.
 - **`partitions` is optional, defaulting to 1 (owner decision).** `topic x { … } key id;` and `topic events;` both create one partition. Explicit `partitions n` is unchanged.
+- **Strings are UTF-8 (owner decision).** Every `string` and `string(N)` field of a typed topic must be valid UTF-8, otherwise the batch gets `SchemaValidationFailed`.
+  - This uses the standard well-formedness rules: no overlong forms, no surrogates, nothing above U+10FFFF.
+  - The check runs in the validator, with an ASCII fast path, and the padding of a `string(N)` is skipped.
+  - `string(N)` means N **bytes**, not characters. Arbitrary binary goes in `bytes`, which is never checked.
+  - Existing typed topics start checking behind the feature level (§12), like the rest of validation.
 - **Keyless typed topics** stay allowed: append-only typed event streams, routed sticky or round-robin.
 - **Hot path.**
   - Validation moves from the `validatedTopics_` hash lookup (`Worker.h:3891`) to the §3 per-partition pointer.
@@ -393,7 +398,18 @@ Names can't contain NUL, so padding can't make two names collide. In general, a 
 
 **8.1 Strings and `lower()`**
 
-- `lower` maps ASCII A–Z to a–z and leaves every other byte unchanged. That is exact for today's names, `[A-Za-z0-9]{1,16}` (the `persistence` package's `ALLOWED_NAME_CHARS`).
+- **`lower` is Unicode simple lowercasing (owner decision).** Each code point maps to the one-code-point `Simple_Lowercase_Mapping` from `UnicodeData.txt`.
+  - It is locale-independent, so Turkish `I` and German `ß` get no special rules.
+  - It is the same mapping Postgres (with ICU), CockroachDB and Spanner apply in `lower()`.
+  - **ASCII fast path.** A–Z → a–z inline. Only bytes ≥ 0x80 go through a static table, which is generated at build time and allocates nothing.
+  - **Pinned.** The Unicode version is stored in the view plan, so a broker upgrade can't change existing keys. A broker that lacks the plan's version refuses to install the view.
+  - **Width.** Lowercasing can grow a string (Ⱥ is 2 bytes, ⱥ is 3).
+    - A `lower(string(N))` key component is sized at the largest lowered width of any N-byte input, at the pinned version. That is ⌈3N/2⌉ at Unicode 15/16, and the builder recomputes it from the table.
+    - The 128-byte key limit is checked against that width at DDL time, so no write fails at run time for key width.
+    - The lowered bytes are zero-padded.
+  - **Input** is already valid UTF-8 (§4). Nothing is normalized: `é` and `e`+U+0301 stay different, as with the databases above, and clients should send NFC.
+  - **The same table runs everywhere.** Literals in `lower('…')` (§10) and the client's typed key builder use the codec's own table, so a reader's key always matches the broker's.
+  - **Today's names** are `[A-Za-z0-9]{1,16}` (the `persistence` package's `ALLOWED_NAME_CHARS`). They stay on the fast path. The `character_name` key component, `lower(string(16))`, is 24 bytes wide, well under the limit.
 - **Reserved for later: `casefold()`**, Unicode simple case folding (`CaseFolding.txt`, statuses C and S). It would be:
   - locale-independent;
   - pinned to the Unicode version stored in the view plan, so a broker upgrade can't change existing keys;
@@ -726,6 +742,17 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 - an untyped topic and a keyless topic each refuse views, filters (untyped only), intents, the key index and `autoincrement` at DDL time, with the right message
 - `TypedTopic<T>` refuses to bind to an untyped topic or to a fingerprint mismatch
 - raw `send` works on untyped topics and is validated on typed ones
+- UTF-8:
+  - valid input: ASCII, 2-, 3- and 4-byte sequences;
+  - invalid input: overlong forms, surrogates, code points above U+10FFFF, a sequence truncated at the end of the field, and a stray continuation byte;
+  - the zero padding of `string(N)`;
+  - `bytes` fields are never checked
+- `lower()`:
+  - a reference table cross-checked against `UnicodeData.txt`;
+  - growing characters (Ⱥ → ⱥ) at the maximum width;
+  - shrinking characters (İ → i);
+  - `lower('Foo')` from QL and from the client key builder equals the broker's key;
+  - a plan pinned to an unknown Unicode version is refused
 
 **Clients:**
 - a non-idempotent client, an `acks=leader` client, and a v11 client, each writing to a checked topic
@@ -802,7 +829,8 @@ Each part ships on its own:
 - The key field encodes to at most 16 bytes, and `Key` truncation becomes an error.
 - A source key held by another open transaction is locked until that transaction ends (`ConcurrentTransactions`).
 - Untyped topics stay as raw logs: no field list means untyped. Every database feature needs a typed topic.
-- `lower()` is ASCII-only, and `casefold()` is reserved.
+- Typed strings must be valid UTF-8, and `lower()` is Unicode simple lowercasing with an ASCII fast path, pinned to a Unicode version. There are no collations, and `casefold()` is reserved. **Owner-confirmed, 2026-10-22.**
+- A `lower(string(N))` key component is sized at the largest lowered width, and the 128-byte limit is checked at DDL time. (My call.)
 - View keys are capped at 128 bytes.
 - Overlay capacity defaults to 65 536 entries, and a full overlay gets code 55.
 - Autoincrement topics use the modulo partitioner, with a reservation step of 4096 and an id cap of 2^53 − 1.
