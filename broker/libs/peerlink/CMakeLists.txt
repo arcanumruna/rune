@@ -8,7 +8,8 @@ target_compile_features(rune_peerlink PUBLIC cxx_std_23)
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
-    add_executable(rune_peerlink_tests tests/ClusterKeysTest.cpp tests/PeerLinkKeysTest.cpp tests/PeerHandshakeTest.cpp tests/PeerFrameCryptoTest.cpp)
+    add_executable(rune_peerlink_tests tests/ClusterKeysTest.cpp tests/PeerLinkKeysTest.cpp tests/PeerHandshakeTest.cpp tests/PeerFrameCryptoTest.cpp
+        tests/PeerLinkAdversarialTest.cpp)
     target_link_libraries(rune_peerlink_tests PRIVATE rune_peerlink GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_peerlink_tests PROPERTIES TIMEOUT 120)

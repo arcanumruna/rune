@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdio>
 #include <fstream>
 #include <map>
 
@@ -158,4 +159,70 @@ TEST(PeerSealedClusterRegression, NoFrameIsDroppedAcrossARehandshakeUnderLoadReg
     }
     for (int id : {1, 2, 3})
         EXPECT_EQ(unknownEpochDrops(c.node(id)) - before[id], 0u) << "node " << id << " dropped frames as UnknownEpoch";
+}
+
+// Review of PR #538, adversarial (concurrency: the same operation twice / back to back).  A re-handshake requested while
+// one is in flight is refused (no second exchange); then a storm: each initiator re-handshakes again as soon as it holds
+// the previous epoch - before its responder promoted it - under acks=all load.  Every pair converges on one send
+// epoch, produced == consumed with no duplicate, and the control-thread transports (installed synchronously with the
+// handshake) drop nothing as UnknownEpoch.  Mutation: the responder installing SendAndReceive at the Proof drops frames.
+TEST(PeerSealedClusterRegression, BackToBackRehandshakesUnderLoadConvergeWithNoLossAdversarialRegression) {
+    TmpDir keys{"pscl4"};
+    const fs::path keyFile = keyFileWith(keys.path, "k.key", 'k');
+    ThreeNodes c = ThreeNodes::startWith("psc_storm", [&](NodeConfig& cfg) { enable(cfg, keyFile); });
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    ASSERT_TRUE(awaitSecurityLeader(c, 60s));
+    ASSERT_TRUE(until(30s, [&] {
+        for (BrokerNode* n : c.live()) if (n->peerLinksForTest().established != 2) return false;
+        return true;
+    }));
+    auto controlDrops = [&](BrokerNode& n) { return n.peerLinksForTest().unknownEpochDrops; };
+    auto allDrops = [&](BrokerNode& n) {
+        uint64_t d = n.peerLinksForTest().unknownEpochDrops + n.adminPeerUnknownEpochDropsForTest();
+        for (int32_t w = 0; w < n.workerCountForTest(); ++w) d += n.workerPeerUnknownEpochDropsForTest(w);
+        return d;
+    };
+    std::map<int, uint64_t> ctlBefore, allBefore;
+    for (int id : {1, 2, 3}) { ctlBefore[id] = controlDrops(c.node(id)); allBefore[id] = allDrops(c.node(id)); }
+
+    const std::vector<std::pair<int, int>> pairs = {{1, 2}, {1, 3}, {2, 3}};
+    GoldenAppender g;
+    constexpr int kRounds = 6;
+    for (int round = 0; round < kRounds; ++round) {
+        std::map<std::pair<int, int>, uint32_t> was;
+        for (auto [a, b] : pairs) {
+            was[{a, b}] = c.node(a).peerLinksForTest().epochOf[b];
+            ASSERT_TRUE(c.node(a).forcePeerRekeyForTest(b)) << "round " << round << " " << a << "->" << b;
+            EXPECT_FALSE(c.node(a).forcePeerRekeyForTest(b)) << "a second re-handshake while one is in flight is refused";
+            EXPECT_FALSE(c.node(b).forcePeerRekeyForTest(a)) << "the responder never starts one";
+        }
+        ASSERT_GE(g.appendNext(c, 60s), 0) << "round " << round;
+        // Only the INITIATOR's new epoch is awaited: the next round starts before the responder necessarily promoted.
+        for (auto [a, b] : pairs)
+            ASSERT_TRUE(until(30s, [&] { return c.node(a).peerLinksForTest().epochOf[b] > was[{a, b}]; }))
+                << "round " << round << " " << a << "->" << b;
+    }
+    for (auto [a, b] : pairs) {
+        uint32_t ea = 0, eb = 0;
+        EXPECT_TRUE(until(30s, [&] {
+            ea = c.node(a).peerLinksForTest().epochOf[b];
+            eb = c.node(b).peerLinksForTest().epochOf[a];
+            return ea == eb && ea != 0;
+        })) << a << "<->" << b << ": " << ea << " / " << eb;
+    }
+    for (int i = 0; i < 3; ++i) ASSERT_GE(g.appendNext(c, 60s), 0) << "after the storm, event " << i;
+    const auto n = static_cast<int64_t>(g.appended());
+    ASSERT_EQ(n, kRounds + 3);
+    ASSERT_TRUE(awaitViewsAt(c, n - 1, 30s));
+    for (BrokerNode* node : c.live()) {
+        EXPECT_EQ(node->securityViewForTest().appliedOffset, n - 1) << "node " << node->nodeIdForTest() << ": no duplicate";
+        EXPECT_EQ(node->securityViewForTest().digest, g.digestOfFirst(static_cast<std::size_t>(n)))
+            << "node " << node->nodeIdForTest() << ": produced == consumed";
+    }
+    for (int id : {1, 2, 3}) {
+        EXPECT_EQ(controlDrops(c.node(id)) - ctlBefore[id], 0u) << "node " << id << ": control-thread UnknownEpoch drops";
+        // Workers / admin plane get their installs over rings (a known limit of #241): reported, not asserted.
+        std::printf("[storm] node %d: UnknownEpoch drops on every plane during the storm: %llu\n", id,
+                    static_cast<unsigned long long>(allDrops(c.node(id)) - allBefore[id]));
+    }
 }
