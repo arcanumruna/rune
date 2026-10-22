@@ -66,7 +66,8 @@ select characterId from character_name where nameKey = lower('Foo');  -- point r
 auto found = userIdentity.getAndWait({provider, subject});
 uint64_t userId = found ? found->userId
                         : users.insertAndWait({.provider = provider, .subject = subject, .createdAt = now}).key();
-// If two first logins race, one gets ConstraintViolation(user_identity), re-reads, and uses the winner's userId.
+// If two first logins race, one gets ConstraintViolation(user_identity, conflictOffset). It re-reads with
+// getAndWait(key, {.minOffset = conflictOffset}) and uses the winner's userId; that read can't miss the winner.
 
 // character-server, POST /character   (u comes from the verified JWT, never the request body)
 auto r = characters.insertAndWait({.userId = u, .name = req.name, …});
@@ -88,7 +89,7 @@ characters.removeExistingAndWait(id);   // KeyNotFound → 404
 - G4. View keys up to 128 bytes: composite keys and key expressions (§7).
 - G5. Point reads by a full key of any width, and prefix reads by the leading key columns (§9).
 - G6. `unique` projection views and `check (count … <= N)` aggregate constraints are enforced before the append (§8).
-- G7. A rejected batch takes no offset, uses no producer sequence and changes no view.
+- G7. A rejected batch stores no data and changes no view. Its sequences are consumed by a durable reject marker, so no copy of it can ever be stored.
 - G8. Everything is correct under:
   - concurrent writers
   - collisions inside one batch
@@ -125,7 +126,7 @@ characters.removeExistingAndWait(id);   // KeyNotFound → 404
 Every new rule runs in **one hook** on the partition leader. It sits in `handleProduceBatch`, after idempotent dedupe (`producerState.validate`, `ProducePath.cpp:205`) and before the min-ISR gate and the append. That point covers both ingress routes, gateway-routed and shard ingress, because both reach `produceCore_` and then `handleProduceBatch`.
 
 - **Why after dedupe.** If the hook ran first, a retry of a batch that was already stored could be rejected (create X, delete X, retry the create) even though the original succeeded.
-- **Why before the append.** A rejection leaves nothing behind: no offset, no producer-state update, no parked ack.
+- **Why before the append.** A rejected batch's data is never stored. Its sequences are consumed by a durable reject marker (§11.3), so a delayed copy of the same batch can never be stored later.
 - **How it's built.** The hook is a template policy, with no virtual call and no `std::function`.
   - Its state is reached through a pointer stored next to the partition's `RcSlot`. A partition with no checks has `nullptr`, and the hook is one `[[unlikely]]` branch.
   - Installs and removals are cold control-to-worker ops, like `SchemaUpdate` and `CreateView`. They may allocate on the worker thread.
@@ -150,7 +151,7 @@ Validation (§4) runs for every typed topic, in the same single decode pass.
 4. Check the intent against the key index plus the overlay (§5).
 5. Check each constrained view against the view state plus the overlay (§8).
 6. Records are processed in order against a scratch overlay, so a batch can collide with itself.
-7. If any record fails a check, reject the whole batch. Nothing is assigned, appended or reserved, and the counter is restored.
+7. If any record fails a check, reject the whole batch. No data is appended, nothing is reserved, and the counter is restored. Only the §11.3 reject marker is appended, so the rejection is durable.
 8. Otherwise, merge the scratch into the overlay, tagged with the offsets the append assigns. This happens on the same thread, with nothing interleaved.
 
 ## 4. Part A: typed topics always validate; untyped topics are raw logs
@@ -169,15 +170,24 @@ Validation (§4) runs for every typed topic, in the same single decode pass.
   - Every data record must decode against a schema version the topic knows. `schemaRejects_` already selects the validator by the exact `(topicId, version)` pair.
   - If any record fails, the whole batch is rejected with `SchemaValidationFailed` and never appended.
   - Control batches are exempt.
-- **On a keyed typed topic, the wire key must equal the key field.** The record's wire key must equal the encoded value of its key field. The only exception is the `autoincrement` placeholder (§6.4), which is 0 in both places.
+- **On a keyed typed topic, the wire key must equal the key field.** The record's wire key must be byte-identical to the key field's canonical encoding. That encoding is what `TypedTopic` already sends (`TypedTopic::recordKey_`, `claim`):
+  - An integer key is its native little-endian bytes at the field's own width: 2, 4 or 8 bytes.
+  - A `string(N)` key is the N zero-padded field bytes.
+
+  The validator compares those bytes with `memcmp`. The only exception is the `autoincrement` placeholder (§6.4): all-zero bytes at the field's width in both places.
+  - **Width limit.** A key field must encode in at most `Key::kMaxInline` (16) bytes, so integers and `string(N ≤ 16)`. A topic with a wider key field is refused at DDL time.
+  - **No more truncation.** `Key(span)` and `Key(pod)` silently truncate today (`Key.h:57-63`). That becomes a hard error.
+  - **Two encodings, kept separate.** The view key encoding (§7.3, big-endian, order-preserving) is internal to the view table. It never appears on the wire key.
   - Without this rule, routing, compaction and view identity follow the wire key, while readers and view columns see a different value.
   - The fold already uses the wire key as identity and the value field as a column (`ViewFold.cpp:162-188`).
 - **Database features exist only on typed topics.** These are views, subscription filters, intents, the key index, `autoincrement` and constraints.
   - Every one of them except filters also needs a key.
   - Using one on an untyped or keyless topic is refused at DDL time with a message that names the missing piece ("view source must be a typed topic", "autoincrement needs a key").
-- **The client.**
+- **Binding is strict in both directions (owner decision):**
   - `TypedTopic<T>` refuses to bind to an untyped topic, or to a typed topic whose fingerprint differs.
-  - Raw `send(topic, key, bytes)` still works on both kinds. On a typed topic the bytes must be a valid encoded record.
+  - A raw (untyped) topic handle refuses to bind to a typed topic. The raw `send(topic, key, bytes)` path is for untyped topics only.
+  - The broker backs this up. A typed topic still validates every record, so bytes from a misused raw path are rejected anyway.
+- **`partitions` is optional, defaulting to 1 (owner decision).** `topic x { … } key id;` and `topic events;` both create one partition. Explicit `partitions n` is unchanged.
 - **Keyless typed topics** stay allowed: append-only typed event streams, routed sticky or round-robin.
 - **Hot path.**
   - Validation moves from the `validatedTopics_` hash lookup (`Worker.h:3891`) to the §3 per-partition pointer.
@@ -270,14 +280,18 @@ topic character { characterId uint64 autoincrement, … } partitions 1 replicas 
 
 **6.4 Assignment**
 
-- **Client.** A create is sent as `insert` with key **0** (an 8-byte placeholder) and the key field in the value also 0. The client routes such a batch with a per-producer sticky partitioner, so one batch targets one partition.
+- **Client.** A create is sent as `insert` with key **0**: zero bytes at the key field's width (4 for `uint32`, 8 for `uint64` and `int64`), with the key field in the value also 0. The client routes such a batch with a per-producer sticky partitioner, so one batch targets one partition.
 - **Leader (the §3 hook, step 3):**
   1. Take k ids from the in-memory counter.
-  2. Overwrite the 8 placeholder bytes in each record's key, and the key field in its value. The field's offset comes from the writer-version descriptor cache, and validation has already decoded the record. Lengths are unchanged, so the batch is never re-encoded.
-  3. Recompute the batch CRC32C (hardware-accelerated).
+  2. Copy the batch into a pre-sized per-worker scratch buffer.
+     - `handleProduceBatch` takes `const uint8_t*` and appends zero-copy with `pwritev` from the ingress or op ring, so the ring bytes can't be patched in place.
+     - The scratch is sized to the topic's maximum batch size and allocated at install time.
+     - Only `autoincrement` topics take this path.
+  3. Overwrite the placeholder bytes in each record's key, and the key field in its value. The field's offset comes from the writer-version descriptor cache, and validation has already decoded the record. Lengths don't change, so the batch is never re-encoded.
+  4. Recompute the batch CRC32C (hardware-accelerated), and append from the scratch buffer.
 - **Performance.**
   - No allocation, no lookup, and no extra hop.
-  - Target: under 200 ns per batch on `ProduceValidateBench` (my call).
+  - Target: under 1 µs p50 for a batch of up to 4 KiB, including the copy, on `ProduceValidateBench` (my call).
   - A record with an assigned id skips the key-index existence check, since it is unique by construction.
 - **Rejection.** If a later check rejects the batch (§3 step 7), the counter goes back to where it was.
 
@@ -288,6 +302,10 @@ topic character { characterId uint64 autoincrement, … } partitions 1 replicas 
 - **Failover and restart.** The new leader finds the latest reservation in its log and resumes at R+1. The unused part of the block becomes a gap. Until it has found its reservation, autoincrement writes get retriable `NotLeader` (§8.6).
 - **Truncation.** Truncation cuts a suffix. If a reservation is cut, every data record above it is cut too, so no surviving record's id is ever handed out again.
 - **Compaction.** The cleaner keeps the latest reservation record per partition. Otherwise the highest id could disappear once its record is tombstoned and compacted away, and a deleted record's id would be reused.
+- **Retention.** An `autoincrement` topic must be `cleanup.policy = compact`.
+  - `delete` and `compact,delete` are refused at DDL time.
+  - So are moves of the log start (delete-records, and retention by time or size).
+  - The latest reservation therefore always survives. A new leader never needs to scan further back than the last reservation, which the cleaner moves forward as it rewrites segments.
 - **Reading the log.** Reservation records are control records. Consumers and folds skip them, as they skip transaction markers.
 
 **6.6 Write rules on an autoincrement topic**
@@ -295,12 +313,17 @@ topic character { characterId uint64 autoincrement, … } partitions 1 replicas 
 | Write | Rule |
 |---|---|
 | `insert` with key 0 | The broker assigns the id. |
-| `insert` with an explicit id | Only for a principal with the new `IMPORT` grant on the topic (the Postgres back-fill). The broker checks `KeyExists`. The id routes by modulo to the one partition that could ever assign it, and that partition moves its counter past it (`n = id div P`). This is exact, unlike MySQL and TiDB. Without `IMPORT` it is refused with `NotAuthorized`. |
+| `insert` with an explicit id | Only for a principal with the new `IMPORT` grant on the topic (the Postgres back-fill). The broker checks `KeyExists`. The id routes by modulo to the one partition that could ever assign it, and that partition moves its counter past it (`n = id div P`). If that puts the counter above the current reservation R, the leader first appends a new reservation through `id div P` (§6.5), so a failover can never resume at or below an imported id. This is exact, unlike MySQL and TiDB. Without `IMPORT` it is refused with `NotAuthorized`. |
 | `update`, `remove`, `removeExisting` | Explicit id, checked against the key index. |
 | plain upsert | Refused with `InvalidRequest`, because it could create an id the counter never accounted for. |
 | assigning past the maximum | `AutoIncrementExhausted` (54), definite. |
 
-- **Retries.** An idempotent retry that dedupes returns the original offsets *and* the original base id. The broker reads the first key of the stored batch at its base offset. This is the cold path (retries only), served from the page cache or ring, so the producer-state entry doesn't grow.
+- **Retries.** An idempotent retry that dedupes returns the original offsets *and* the original base id.
+  - Each `autoincrement` partition keeps a side window `(producerId → last 32 batches' assigned base ids)`, in step with the producer-state retry window. Only these partitions have it.
+  - It is rebuilt from the log on failover, alongside the producer-state rebuild, from the keys in the stored batches.
+  - Nothing is read back, so compaction rewriting the batch doesn't matter.
+  - Checked partitions keep one batch in flight (§11.3), so a retry is always the newest batch and always in the window.
+  - A duplicate outside the window is answered `DuplicateSequence` with no id. The client reports "stored; id unknown" as its own definite error. It should be unreachable, and the stress run asserts that.
 - **Transactions.** Ids taken inside a transaction that aborts are burned, leaving a gap.
 - **The ack.** It carries the ids only once the write is committed (acks=all, §11.2), so a truncated record never gave its id to anyone.
 
@@ -388,11 +411,16 @@ Names can't contain NUL, so padding can't make two names collide. In general, a 
 - **Anything else.** Any other check form is refused at compile time with "check supports count(…) <= / < constant".
 - **Several views.** One record may be checked against several views, for example `character_name` and `account_stats`, and must pass all of them.
 
-**8.3 Unique conflicts at fold time.** These can come only from data written before the unique view existed.
-- The first source record by offset keeps the key.
-- A later conflicting record is left out of the unique view and counted in `uniqueConflicts`. Other views still contain it.
-- This is deterministic across leaders and restarts.
-- Back-fills must remove duplicates first, as Postgres migration V14 did.
+**8.3 Unique conflicts at fold time.** These can come only from data written before the unique view existed, because the write-time check prevents new ones.
+
+- **Rule.** Where several live source records share a unique key, the view row belongs to the one with the **smallest source key**.
+  - A rule based on "first by offset" would not be deterministic, because compaction and deletes change which offsets survive.
+  - The smallest source key is the same for every leader, every restart and every refold, so "view = fresh refold" holds.
+- **Promotion.** When the owner is deleted or renamed, the next-smallest live record is promoted.
+  - The fold tracks the conflicting contributors of each such key, using the retractable Min machinery that aggregates already use (value blocks plus rescan, `AggFold.cpp`).
+- **Accounting.** Each extra contributor is counted in `uniqueConflicts`. Other views over the topic still contain those records.
+- **Writes.** A write claiming a key that already has any live owner is rejected (§8.2), so the conflict set can only shrink.
+- **Back-fills.** They should still remove duplicates first, as Postgres migration V14 did.
 
 **8.4 The pending overlay.** Views fold only up to the LSO, which is bounded by the HW. The overlay covers what lies between each view's fold cursor and the log end offset (LEO).
 
@@ -449,7 +477,7 @@ Like `RcState`, the overlay is rebuilt when `leadershipGeneration` or `logGenera
 **8.8 Folding (Phase 1–2 rules that still apply).**
 - Views fold on the leader only, after commit, bounded by the LSO.
 - Read-your-writes comes from the fold barrier (#82): a read waits until the fold has passed the reader's acked writes.
-- The produce ack stays at acks=all (HW), not "after fold", because every client read path goes through that barrier.
+- The produce ack stays at acks=all (HW), not "after fold", because every client read path goes through that barrier. **This needs the owner's confirmation; see §17.** Acking after the fold would make every write wait behind any open transaction, because the fold stops at the LSO.
 - With #537 fixed, records of aborted transactions are skipped.
 
 ## 9. Reads
@@ -458,6 +486,10 @@ Like `RcState`, the overlay is rebuilt when `leadershipGeneration` or `logGenera
 - **`ScanViewRows` (82) and `ScanViewRowsResponse` (83).**
   - The request carries the prefix bytes, a `limit` (capped by the broker) and a resume token.
   - The response carries a status, a row count, length-prefixed rows and the next resume token.
+- **Reading the record that caused a conflict.** Both requests take an optional `minOffset`. The read is held at the fold barrier until the view has folded past it.
+  - A rejection with code 51 or 52 carries the offset of the conflicting record: the overlay entry or the owning row's last offset. It travels in the trailing response field that `assignedBase` uses on success.
+  - The loser of a race can therefore read the winner's row and never loop.
+  - If the winner's record is in an open transaction, the read waits for it to resolve. After 100 ms it answers `NotReady`, as today.
 - **Shared pipeline.** Both run through `viewRowGate_`, READ-on-VIEW authorization, leader-only serving, the read lease, the fold barrier and the restart-readiness gate.
 - **Bounds.**
   - A response fits the 68 KiB egress scratch (`ClientGateway.h:2209`). The worker stops at the limit, the byte budget or a per-op row cap, which bounds leader work.
@@ -541,11 +573,20 @@ Existing codes reused:
 **11.3 Producer** (`ProducerImpl`). Today any unknown code, and code 24, goes to "outcome unknown", which means `markUnresolved_` and an epoch bump (rule D, `ProducerImpl.cpp:2503`). The out-of-order branch (C4) also resequences and bumps the epoch. Batches already in flight behind a rejected batch arrive out of order. So, for checked partitions:
 
 - **One batch in flight per partition.** The client learns that a topic is checked from a new flag in topic metadata.
-  - A rejected batch leaves the next sequence unchanged, and the next batch reuses it, with no epoch bump and no resequencing.
+  - This keeps a coalesced batch's split resend (below) in order with respect to later writes to the same key.
   - The cost is throughput on these low-rate partitions, not latency.
-- **A definite-reject branch** handles codes 51–54: the batch fails, with no `markUnresolved_` and no epoch bump.
+- **Rejections are durable: the reject marker.** Without one, a delayed earlier attempt of a rejected batch could be appended after the client was told it failed, and the next batch, reusing that sequence, would then be deduped as an "OK" without being stored.
+  - So when the hook rejects a batch with 51–54, the leader appends a small control record: **reject marker** `{producerId, epoch, baseSequence, lastSequence}`.
+  - It advances the producer state exactly like a data batch. It replicates and is part of the producer-state rebuild after failover.
+  - The rejection is answered only once the marker is committed (HW), like an acks=all ack.
+  - A later or delayed attempt of the same sequences is a duplicate of the marker, and is answered with the same rejection code. It is never appended.
+  - Rejections are rare, so this costs one small append each.
+  - Readers and folds skip reject markers. The cleaner drops them once the producer-state window has moved past them.
+- **The client's definite-reject branch** for codes 51–54:
+  - the batch fails, with no `markUnresolved_` and no epoch bump;
+  - the sequence counts as consumed, because the marker consumed it, so the next batch continues at `lastSequence + 1`.
 - **Coalesced `send()` batches.** If a coalesced batch of unrelated records is rejected, the producer resends its records one at a time, in order.
-  - The failing record's sequence isn't consumed, so the next record reuses it.
+  - Each resend uses fresh sequences after the marker.
   - Each record gets its own result.
 - **Explicit atomic batches** (`p.batch(...)`) are never split.
 - **Inside a transaction,** codes 51–54 abort the transaction, as a constraint violation does in Postgres.
@@ -572,8 +613,9 @@ Existing codes reused:
 
 ## 14. Hot path and benchmarks
 
-- **Topics without checks.** An ABAB n=3 run of `ProducePathBenchmark` and `WorkerProduceLatencyBench` must show no regression. That includes the validation move in §4.
-- **Constrained produce.** The hook adds at most 1 µs p50 to a one-record batch on `ProduceValidateBench`. Autoincrement assignment stays under 200 ns per batch. Both are my calls, to be revisited with data.
+- **Untyped topics, and typed topics that already validated.** An ABAB n=3 run of `ProducePathBenchmark` and `WorkerProduceLatencyBench` must show no regression, including the move from the hash-set lookup to the per-partition pointer.
+- **Typed topics that didn't validate before.** These now pay the per-record decode. Measure the added cost per batch with the same benches, budgeted at most 1 µs p50 for a one-record batch (my call). This is a deliberate, owner-approved cost, not a regression.
+- **Constrained produce.** The hook adds at most 1 µs p50 to a one-record batch on `ProduceValidateBench`. Autoincrement assignment, including the scratch copy, stays under 1 µs per batch of up to 4 KiB. Both are my calls, to be revisited with data.
 - **Fold.** `ViewFoldBench` with derived keys plus the owner map stays within 10 µs per event batch.
 - **Table.** `ViewTableBench` adds wide-key and prefix-scan cases. Views with K ≤ 8 must not change.
 
@@ -629,6 +671,9 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 - an explicit id without `IMPORT`
 - exhaustion at the maximum
 - a batch rejected by a later check, after which the counter must be restored
+- an `IMPORT` id above the reservation, then failover: there must be no reuse
+- a retry after failover returning the original ids from the rebuilt side window
+- DDL refused for `delete` retention, and for delete-records on an `autoincrement` topic
 
 **Validation (§4):**
 - a typed-topic record matching no known schema version, including a typed topic that existed before the upgrade
@@ -642,6 +687,8 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 - a non-idempotent client, an `acks=leader` client, and a v11 client, each writing to a checked topic
 - a coalesced batch with one bad record
 - codes 51–54 inside a transaction
+- a delayed earlier attempt of a rejected batch arriving after the rejection, before and after a failover: it gets the same rejection, is never stored, and the next batch is not deduped against it
+- a login race: the loser's `minOffset` read sees the winner, including when the winner is pending, committed but not yet folded, or in an open transaction
 - intents sent to an older cluster
 
 **Reads:**
@@ -649,12 +696,17 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 - a scan across pages with an erase between them (`kCursorInvalidated`)
 - a scan of an empty prefix
 - a forced hash collision, using a fixed seed through a test hook
+- pre-existing duplicate names: the smallest source key owns the row, it is promoted correctly on delete and on rename, and a compaction followed by a refold gives the same owner
+- `partitions` omitted gives 1 partition
+- binding: a typed handle to an untyped topic, and a raw handle to a typed topic, are both refused
+- key fields wider than 16 bytes refused at DDL time, and `Key` truncation turned into an error
 
 **Invariants checked in the stress run** (racing writers, injected failovers and aborts):
 - No user ever has more than 12 live characters.
 - No two live characters share a `lower(name)`.
 - No two records ever receive the same autoincrement id, and no id is ever reused.
 - Every acked write is visible in every view once the fold barrier is passed.
+- No write that was answered with a rejection is ever stored.
 - No rejected write appears anywhere.
 - Every view equals a fresh refold of the log.
 
@@ -683,6 +735,13 @@ Each part ships on its own:
 - The ack stays at acks=all (HW). Read-your-writes comes from the fold barrier on reads.
 - Checked topics require idempotent producers, acks=all and client version 12 or later, with one batch in flight per partition.
 - Codes 51–54 abort an enclosing transaction.
+- A rejection appends a durable reject marker that consumes its sequences.
+- Pre-existing unique conflicts: the smallest source key owns the key, with promotion on delete.
+- `autoincrement` topics are compact-only, with no retention.
+- An `IMPORT` above the reservation appends a new reservation first.
+- A conflict rejection carries the conflicting offset, and reads accept `minOffset`.
+- The autoincrement scratch copy happens on the write path; Rune can't patch the ring in place.
+- The key field encodes to at most 16 bytes, and `Key` truncation becomes an error.
 - A source key held by another open transaction is locked until that transaction ends (`ConcurrentTransactions`).
 - Untyped topics stay as raw logs: no field list means untyped. Every database feature needs a typed topic.
 - `lower()` is ASCII-only, and `casefold()` is reserved.
@@ -691,7 +750,7 @@ Each part ships on its own:
 - Autoincrement topics use the modulo partitioner, with a reservation step of 4096 and an id cap of 2^53 − 1.
 - A dedupe retry returns its ids by reading the stored batch back.
 - Explicit ids on autoincrement topics need the `IMPORT` grant.
-- Performance budgets: under 1 µs for the hook, under 200 ns for assignment, and no regression for topics without checks.
+- Performance budgets: under 1 µs for the hook and under 1 µs for assignment, including the copy. No regression for untyped topics or for typed topics that already validated. The new validation cost on typed topics that didn't validate before is measured and accepted.
 
 ## 18. Left to the builder
 
