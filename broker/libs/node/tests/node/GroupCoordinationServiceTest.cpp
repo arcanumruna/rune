@@ -3309,6 +3309,187 @@ TEST_F(GroupJoinLateTopic, UnassignedJoinTopicsAreBoundedPerGroupRegression) {
     EXPECT_EQ(service_->unassignedJoinTopicsForTest("g-late-cap"), GroupCoordinationService::kMaxUnassignedJoinTopics);
 }
 
+// ---------------------------------------------------------------------------
+// PR #564 review — adversarial pass over #549 (join, rebalance, assignment; topic create / place / drop; failover).
+// ---------------------------------------------------------------------------
+
+// Coordinator failover: a node that is no longer the coordinator keeps its stale in-memory group; a late topic
+// becoming assignable there must not rebalance it (that would revoke members the new coordinator serves).
+// RED (PR head): the ex-coordinator bumps the generation.
+TEST_F(GroupJoinLateTopic, ALateTopicOnANodeNoLongerCoordinatorNeverRebalancesAdversarialRegression) {
+    const std::string g = "g-late-excoord";
+    (void)stableWithUnknownLate(g);
+    auto& gc = service_->coordinator(g);
+    const int32_t gen = gc.generationId();
+    isLeader_     = false;
+    leaderNodeId_ = 42;
+    createLate();
+    for (int i = 0; i < 50; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    EXPECT_EQ(gc.generationId(), gen) << "only the coordinator may rebalance a group";
+    EXPECT_EQ(gc.state(), GroupState::Stable);
+}
+
+// #19 sibling (catalog lag): the id a join named arrives here as a VIEW SINK.  The group must rebalance so the
+// re-join gets #19's refusal - never a member silently holding nothing for it.  RED (PR head): no rebalance.
+TEST_F(GroupJoinLateTopic, ALateIdThatArrivesAsAViewSinkRebalancesAndTheRejoinIsRefusedAdversarialRegression) {
+    const std::string g = "g-late-sink";
+    const std::string member = stableWithUnknownLate(g);
+    auto& gc = service_->coordinator(g);
+    const int32_t gen = gc.generationId();
+    TopicSpec sink = makeTopicSpec("m16-late-sink", 2, kLate);
+    sink.viewSink = true;
+    ASSERT_EQ(registry_->createTopicAt(kLate, sink), kLate);
+    ASSERT_TRUE(registry_->isViewSink(kLate));
+    for (int i = 0; i < 50 && gc.generationId() == gen; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    ASSERT_GT(gc.generationId(), gen) << "the group must learn the sink (a rebalance), not stay silently empty";
+    const auto r = joinAs({kTestTopicId, kLate}, g, member);
+    EXPECT_EQ(r.code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest)) << "#19: the re-join is refused";
+    EXPECT_NE(r.detail.find("view sink"), std::string::npos) << r.detail;
+    EXPECT_EQ(service_->unassignedJoinTopicsForTest(g), 0u);
+}
+
+// An emptied group forgets its ids (no lineage event needed); a later member with another subscription never gets a
+// spurious rebalance from the old member's late id.  RED (PR head): the entry survives the empty group and forces
+// a rebalance on the new member.
+TEST_F(GroupJoinLateTopic, AnEmptiedGroupForgetsItsLateIdsAndNeverRebalancesANewMemberAdversarialRegression) {
+    const std::string g = "g-late-empty";
+    const std::string member = stableWithUnknownLate(g);
+    const std::size_t ll = encodeLeaveGroup(req_, 1, ++corr_, g, member);
+    ASSERT_EQ(decodeLeaveErrorCode(out_, service_->handleLeaveGroup(req_, ll, clock_, out_, kBufSize)),
+              static_cast<int16_t>(pc::ErrorCode::OK));
+    auto& gc = service_->coordinator(g);
+    ASSERT_EQ(gc.state(), GroupState::Empty);
+    for (int i = 0; i < 5; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    EXPECT_EQ(service_->unassignedJoinTopicsForTest(g), 0u) << "an empty group has nothing to assign";
+    (void)stableMember(g);   // a new member, only the real topic
+    const int32_t gen = gc.generationId();
+    createLate();
+    for (int i = 0; i < 200; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    EXPECT_EQ(gc.generationId(), gen) << "no member named the late topic: no rebalance";
+    EXPECT_EQ(gc.state(), GroupState::Stable);
+}
+
+// Rebalance-loop guard: the member that named the late id left; the remaining member never subscribes it, so the
+// topic stays deliberately unassigned.  At most one rebalance, then the group stays Stable for good.
+TEST_F(GroupJoinLateTopic, ALateTopicNobodyKeepsSubscribingRebalancesAtMostOnceAdversarialRegression) {
+    const std::string g = "g-late-loop";
+    const std::string a = stableWithUnknownLate(g);
+    auto& gc = service_->coordinator(g);
+    const auto b = joinAs({kTestTopicId}, g);   // a second member joins: rebalance
+    ASSERT_EQ(b.code, static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_EQ(joinAs({kTestTopicId}, g, b.memberId).code, static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_EQ(joinAs({kTestTopicId, kLate}, g, a).code, static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_TRUE(driveUntil([&] { return gc.state() == GroupState::Stable; }, 50));
+    const std::size_t ll = encodeLeaveGroup(req_, 1, ++corr_, g, a);
+    ASSERT_EQ(decodeLeaveErrorCode(out_, service_->handleLeaveGroup(req_, ll, clock_, out_, kBufSize)),
+              static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_EQ(joinAs({kTestTopicId}, g, b.memberId).code, static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_TRUE(driveUntil([&] { return gc.state() == GroupState::Stable; }, 50));
+    const int32_t gen = gc.generationId();
+    createLate();
+    for (int round = 0; round < 5; ++round) {
+        for (int i = 0; i < 50; ++i) { clock_ += kStep; service_->doWork(clock_); }
+        if (gc.state() != GroupState::Stable) {
+            ASSERT_EQ(joinAs({kTestTopicId}, g, b.memberId).code, static_cast<int16_t>(pc::ErrorCode::OK));
+            ASSERT_TRUE(driveUntil([&] { return gc.state() == GroupState::Stable; }, 50));
+        }
+    }
+    EXPECT_LE(gc.generationId(), gen + 1) << "a deliberately unassigned topic must never loop rebalances";
+    EXPECT_EQ(gc.state(), GroupState::Stable);
+    EXPECT_FALSE(lateHeld(g));
+    EXPECT_EQ(service_->unassignedJoinTopicsForTest(g), 0u);
+}
+
+// The id became known and was resolved by an unrelated rebalance before doWork saw it (it is held): the id leaves
+// the pending set instead of being re-scanned every duty cycle.  RED (PR head): it stays pending forever.
+TEST_F(GroupJoinLateTopic, ALateIdResolvedByAnUnrelatedRebalanceLeavesThePendingSetAdversarialRegression) {
+    const std::string g = "g-late-resolved";
+    const std::string a = stableWithUnknownLate(g);
+    auto& gc = service_->coordinator(g);
+    createLate();   // no doWork yet: a second member's join rebalances first
+    const auto b = joinAs({kTestTopicId, kLate}, g);
+    ASSERT_EQ(b.code, static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_EQ(joinAs({kTestTopicId, kLate}, g, b.memberId).code, static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_EQ(joinAs({kTestTopicId, kLate}, g, a).code, static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_TRUE(driveUntil([&] { return gc.state() == GroupState::Stable; }, 50));
+    ASSERT_EQ(lateParts(g), 2u);
+    const int32_t gen = gc.generationId();
+    for (int i = 0; i < 100; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    EXPECT_EQ(gc.generationId(), gen);
+    EXPECT_EQ(service_->unassignedJoinTopicsForTest(g), 0u) << "a held id is resolved";
+}
+
+// Input bounds: extreme, negative and duplicated ids are tracked once each, never dereferenced, never rebalance.
+TEST_F(GroupJoinLateTopic, ExtremeAndDuplicateIdsAreTrackedOnceAndNeverRebalanceAdversarialRegression) {
+    const std::string g = "g-late-bounds";
+    const std::vector<int32_t> ids = {std::numeric_limits<int32_t>::min(), -1, std::numeric_limits<int32_t>::max(),
+                                      999, 999, kTestTopicId, -1};
+    const auto first = joinAs(ids, g);
+    ASSERT_EQ(first.code, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(service_->unassignedJoinTopicsForTest(g), 4u);
+    ASSERT_EQ(joinAs(ids, g, first.memberId).code, static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_TRUE(driveUntil([&] { return service_->coordinator(g).state() == GroupState::Stable; }, 50));
+    const int32_t gen = service_->coordinator(g).generationId();
+    for (int i = 0; i < 200; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    EXPECT_EQ(service_->coordinator(g).generationId(), gen);
+    EXPECT_EQ(service_->unassignedJoinTopicsForTest(g), 4u);
+}
+
+// Topic drop (onTopicDropped) racing the pending set: the drop rebalances the held topic away, the re-join records
+// the dropped id (ids are never reused), and that id never becomes assignable: no rebalance loop.
+TEST_F(GroupJoinLateTopic, ALateTopicDroppedAfterItsAssignmentNeverLoopsRebalancesAdversarialRegression) {
+    const std::string g = "g-late-drop";
+    const std::string member = stableWithUnknownLate(g);
+    auto& gc = service_->coordinator(g);
+    createLate();
+    ASSERT_TRUE(driveUntil([&] { return gc.state() != GroupState::Stable; }, 50));
+    rejoinToStable(g, member);
+    ASSERT_EQ(lateParts(g), 2u);
+    ASSERT_TRUE(registry_->dropTopic(kLate));
+    EXPECT_EQ(service_->onTopicDropped("m16-late", clock_), 1u);
+    rejoinToStable(g, member);
+    EXPECT_EQ(lateParts(g), 0u);
+    EXPECT_EQ(service_->unassignedJoinTopicsForTest(g), 1u) << "the re-join named the dropped id again";
+    const int32_t gen = gc.generationId();
+    for (int i = 0; i < 200; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    EXPECT_EQ(gc.generationId(), gen);
+    EXPECT_EQ(gc.state(), GroupState::Stable);
+}
+
+// Placement sibling path (C1): a topic APPLIED here at join time but not PLACED is in the member's subscription yet
+// unassignable; once its placement commits the group rebalances and the member gets its partitions.
+TEST_F(GroupJoinLateTopic, ATopicPlacedAfterTheJoinIsAssignedWithoutARejoinAdversarialRegression) {
+    createLate();   // applied, not placed
+    rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(
+        [](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    gw.setTopicRegistry(registry_.get());
+    gw.setNodeIdForTest(kLeader);
+    auto route = [&](bool placed) {
+        std::vector<rune::metadata::RoutingImage::BuildEntry> img;
+        for (int32_t p = 0; p < 2; ++p) img.push_back({rune::metadata::gpidOf(kTestTopicId, p), kLeader, 1});
+        if (placed)
+            for (int32_t p = 0; p < 2; ++p) img.push_back({rune::metadata::gpidOf(kLate, p), kLeader, 1});
+        gw.setRoutingImageSnapshot(
+            rune::metadata::RoutingImage::build(img, rune::metadata::RoutingImage::Source::Committed));
+    };
+    route(/*placed=*/false);
+    ASSERT_FALSE(gw.topicAssignable(kLate)) << "non-vacuous: applied but not placed";
+    service_->setGateway(&gw);
+    const std::string g = "g-late-place";
+    const std::string member = stableWithUnknownLate(g);
+    auto& gc = service_->coordinator(g);
+    EXPECT_FALSE(lateHeld(g));
+    EXPECT_EQ(service_->unassignedJoinTopicsForTest(g), 1u);
+    const int32_t gen = gc.generationId();
+    for (int i = 0; i < 50; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    EXPECT_EQ(gc.generationId(), gen) << "not placed yet: nothing to rebalance for";
+    route(/*placed=*/true);
+    ASSERT_TRUE(driveUntil([&] { return gc.generationId() > gen; }, 50)) << "the placement must rebalance the group";
+    rejoinToStable(g, member);
+    EXPECT_EQ(lateParts(g), 2u);
+    service_->setGateway(nullptr);
+}
+
 // The group filter: a refused join into an EMPTY group never fixes the group's filter - the next member joins with
 // another filter (here none) and is admitted.  RED (revert #19): the sink join is admitted and fixes filter F, so the
 // second join is refused filter-mismatch.

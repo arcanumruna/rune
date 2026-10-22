@@ -506,7 +506,9 @@ private:
     struct SupersededMark { int32_t topicId; int32_t partition; uint64_t lineage; };
     std::unordered_map<std::string, std::vector<SupersededMark>> supersededHandled_;
     // #549: per group, topic ids a JoinGroup named that were not assignable then (unknown here yet, or not placed).
-    // doWork forces one rebalance once any becomes assignable while the group is Stable and no member holds it.
+    // On the coordinator only, doWork forces one rebalance once any becomes assignable while the group is Stable and
+    // no member holds it, or arrives as a view sink (the re-join then gets #19's refusal).  An id found assignable is
+    // dropped; an emptied or Dead group forgets its ids.
     // Bounded: at most kMaxUnassignedJoinTopics ids per group (cold control-plane state).
 public:
     static constexpr std::size_t kMaxUnassignedJoinTopics = 64;

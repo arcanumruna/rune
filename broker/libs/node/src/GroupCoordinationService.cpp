@@ -275,20 +275,27 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
         // #549: a topic a JoinGroup named before it was assignable here (catalog create not applied yet, or not
         // placed) was left out of the member's subscription.  Once it is assignable and no member holds it, force
         // one rebalance: the members re-join and resolve it.  State-driven, no timer (rule 16).
-        if (!unassignedJoinTopics_.empty() && coord.state() == coord::GroupState::Stable) {
+        // PR #564 review: only the coordinator rebalances (a stale group on an ex-coordinator must never revoke its
+        // members), an emptied / Dead group forgets its ids, an id that arrives as a view sink rebalances too (the
+        // re-join gets #19's refusal, never a silently empty assignment), and an id already held is resolved.
+        if (!unassignedJoinTopics_.empty()) {
             if (const auto it = unassignedJoinTopics_.find(groupId); it != unassignedJoinTopics_.end()) {
-                bool ready = false;
-                for (const int32_t tid : it->second) {
-                    if (!topicIdAssignable_(tid)) continue;
-                    const std::string& name = topics_->topic(tid)->name;
-                    bool held = false;
-                    for (const auto& m : coord.members())
-                        for (const auto& tp : m.assignment) held = held || tp.topic == name;
-                    ready = ready || !held;
-                }
-                if (ready) {
-                    unassignedJoinTopics_.erase(it);   // the re-joins re-record whatever is still not assignable
-                    if (coord.forceRebalance(nowNs)) {
+                if (coord.isEmpty() || coord.state() == coord::GroupState::Dead) {
+                    unassignedJoinTopics_.erase(it);
+                } else if (coord.state() == coord::GroupState::Stable && isLocalCoordinator()) {
+                    bool ready = false;
+                    std::erase_if(it->second, [&](int32_t tid) {
+                        if (topics_ != nullptr && topics_->isViewSink(tid)) { ready = true; return true; }
+                        if (!topicIdAssignable_(tid)) return false;   // still waiting
+                        const std::string& name = topics_->topic(tid)->name;
+                        bool held = false;
+                        for (const auto& m : coord.members())
+                            for (const auto& tp : m.assignment) held = held || tp.topic == name;
+                        ready = ready || !held;
+                        return true;   // assignable: resolved by this check either way
+                    });
+                    if (ready || it->second.empty()) unassignedJoinTopics_.erase(it);   // re-joins re-record
+                    if (ready && coord.forceRebalance(nowNs)) {
                         onEnterPreparingRebalance(groupId, coord);
                         spdlog::info("GroupCoordinationService: group '{}' — a topic its members joined for became "
                                      "assignable; rebalancing (generation {}) (#549)", groupId, coord.generationId());

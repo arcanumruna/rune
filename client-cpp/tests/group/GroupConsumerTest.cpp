@@ -3082,3 +3082,179 @@ TEST_F(GroupSeekSessionRegression, ARewindInFlightWhenTheSessionDropsStillFailsS
     hub_->onSessionDown();
     EXPECT_EQ(fut.times(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// PR #564 review — adversarial pass over #494 (the hub's rewind state machine; session loss and reconnect;
+// coordinator failover).  Every rewind completes exactly once, whatever happens while it waits for the session.
+// ---------------------------------------------------------------------------
+
+// Coordinator failover: the session comes back as ANOTHER session / connect episode (a new coordinator).  The parked
+// rewind starts there, and from then on it is in flight: losing that session fails it SessionLost, exactly once.
+// RED (revert #494): the issue fails SessionLost at once, before any session is back.
+TEST_F(GroupSeekSessionRegression, AWaitingRewindStartsOnANewSessionThenDiesWithItExactlyOnceAdversarialRegression) {
+    hub_->setSessionConnected(false);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    auto fut = seekToCommittedOp(gc);
+    ASSERT_EQ(fut.r, OpResult::Accepted);
+    ASSERT_FALSE(fut.ready());
+    constexpr int64_t kOtherSession = kSessionId + 17;
+    hub_->setSessionConnected(true, kOtherSession, 9);
+    (void)sweep(1'000'000);
+    ASSERT_TRUE(std::holds_alternative<GroupConsumerImpl::RewindAwaitFetch>(impl_->rewind));
+    EXPECT_TRUE(hub_->hasPendingCommitSync()) << "a started rewind is in flight (Client step 3c must see it)";
+    (void)hub_->retryOffsetFetch(g_hubNowNs, kOtherSession, sink_.fn());
+    EXPECT_EQ(offsetFetchFrames(sink_, fr_), 1) << "fetched on the new session";
+    hub_->setSessionConnected(false);
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::SessionLost);
+    hub_->onSessionDown();
+    hub_->setSessionConnected(true, kSessionId, 10);
+    (void)sweep(2'000'000);
+    (void)sweep(3'000'000'000);
+    EXPECT_EQ(fut.times(), 1);
+    EXPECT_TRUE(std::holds_alternative<GroupConsumerImpl::NoRewind>(impl_->rewind));
+}
+
+// Session flap inside one duty cycle (up then down before the sweep runs): the parked rewind never started, so it
+// is not lost; it keeps waiting and starts on the next session.  RED (revert #494): SessionLost at issue.
+TEST_F(GroupSeekSessionRegression, ASessionFlapBeforeTheSweepLeavesAWaitingRewindParkedAdversarialRegression) {
+    hub_->setSessionConnected(false);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    auto fut = seekToCommittedOp(gc);
+    ASSERT_FALSE(fut.ready());
+    hub_->setSessionConnected(true, kSessionId, 1);
+    hub_->setSessionConnected(false);
+    hub_->onSessionDown();
+    (void)sweep(1'000'000);
+    EXPECT_FALSE(fut.ready());
+    EXPECT_TRUE(std::holds_alternative<GroupConsumerImpl::RewindAwaitSession>(impl_->rewind));
+    EXPECT_EQ(offsetFetchFrames(sink_, fr_), 0);
+    hub_->setSessionConnected(true, kSessionId, 2);
+    (void)sweep(2'000'000);
+    EXPECT_TRUE(std::holds_alternative<GroupConsumerImpl::RewindAwaitFetch>(impl_->rewind));
+    gc.close();
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::Closed);
+    (void)sweep(3'000'000'000);
+    EXPECT_EQ(fut.times(), 1);
+}
+
+// The group rebalances while the rewind waits (heartbeat RebalanceInProgress -> Rejoining): it completes Rejoined at
+// once, exactly once, and the later reconnect starts nothing.  RED (revert #494): SessionLost at issue.
+TEST_F(GroupSeekSessionRegression, ARebalanceWhileARewindWaitsCompletesItRejoinedOnceAdversarialRegression) {
+    hub_->setSessionConnected(false);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    auto fut = seekToCommittedOp(gc);
+    ASSERT_FALSE(fut.ready());
+    auto hbr = makeHeartbeatResponse(static_cast<int16_t>(rpc::ErrorCode::RebalanceInProgress));
+    hub_->onHeartbeatResponse(hbr.data(), hbr.size(), kSessionId, sink_.fn());
+    ASSERT_EQ(impl_->state, GroupConsumerState::Rejoining);
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::Rejoined);
+    hub_->setSessionConnected(true, kSessionId, 1);
+    (void)sweep(1'000'000);
+    (void)sweep(3'000'000'000);
+    EXPECT_EQ(fut.times(), 1);
+    EXPECT_TRUE(std::holds_alternative<GroupConsumerImpl::NoRewind>(impl_->rewind));
+    EXPECT_EQ(offsetFetchFrames(sink_, fr_), 0) << "an ended rewind fetches nothing";
+}
+
+// A coordinator refusal (non-retriable) finishes the consumer while the rewind waits: Closed, exactly once.
+TEST_F(GroupSeekSessionRegression, ACoordinatorRefusalWhileARewindWaitsCompletesItClosedOnceAdversarialRegression) {
+    hub_->setSessionConnected(false);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    auto fut = seekToCommittedOp(gc);
+    ASSERT_FALSE(fut.ready());
+    hub_->onCoordinatorRejected(static_cast<int16_t>(rpc::ErrorCode::NotAuthorized));
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::Closed);
+    hub_->setSessionConnected(true, kSessionId, 1);
+    (void)sweep(1'000'000);
+    (void)sweep(3'000'000'000);
+    EXPECT_EQ(fut.times(), 1);
+}
+
+// A parked seek whose partition was revoked meanwhile is re-admitted on reconnect and refused InvalidArgument (never
+// applied to a partition the member no longer owns), exactly once.  RED (revert #494): SessionLost at issue.
+TEST_F(GroupSeekSessionRegression, AWaitingSeekOfARevokedPartitionIsRefusedOnReconnectAdversarialRegression) {
+    hub_->setSessionConnected(false);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    const Token t = ++g_ledger.next;
+    ASSERT_EQ(gc.seek(TopicPartition{kTopicId, kPartition}, 3, g_ledger.handler(), t), OpResult::Accepted);
+    SyncOp fut{t, OpResult::Accepted};
+    ASSERT_FALSE(fut.ready());
+    impl_->assignment.erase(TopicPartition{kTopicId, kPartition});
+    hub_->setSessionConnected(true, kSessionId, 1);
+    (void)sweep(1'000'000);
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::InvalidArgument);
+    (void)sweep(3'000'000'000);
+    EXPECT_EQ(fut.times(), 1);
+}
+
+// Starvation check (hasPendingCommitSync excludes a parked rewind): a pending commitSync still fails SessionLost when
+// the session drops; a rewind issued afterwards parks, is invisible to Client step 3c (hasPendingCommitSync), is not
+// hit by its onSessionDown, and starts on reconnect.  RED (revert #494): the rewind fails SessionLost at issue.
+TEST_F(GroupSeekSessionRegression, AParkedRewindIsNotHitByStep3cAndACommitSyncStillFailsSessionLostAdversarialRegression) {
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    auto commit = commitSyncOp(gc);
+    ASSERT_EQ(commit.r, OpResult::Accepted);
+    ASSERT_FALSE(commit.ready()) << "non-vacuous: the commitSync is pending";
+    EXPECT_TRUE(hub_->hasPendingCommitSync());
+    hub_->setSessionConnected(false);
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::SessionLost);
+    auto rew = seekToCommittedOp(gc);
+    ASSERT_FALSE(rew.ready());
+    EXPECT_FALSE(hub_->hasPendingCommitSync()) << "step 3c must not fire for a parked rewind";
+    for (int i = 0; i < 3; ++i) hub_->onSessionDown();   // step 3c, every cycle the session is down
+    EXPECT_FALSE(rew.ready());
+    hub_->setSessionConnected(true, kSessionId, 1);
+    (void)sweep(1'000'000);
+    EXPECT_TRUE(std::holds_alternative<GroupConsumerImpl::RewindAwaitFetch>(impl_->rewind));
+    EXPECT_TRUE(hub_->hasPendingCommitSync()) << "started: now in flight";
+    gc.close();
+    EXPECT_EQ(rew.times(), 1);
+    EXPECT_EQ(rew.status(), OpStatus::Closed);
+    EXPECT_EQ(commit.times(), 1);
+}
+
+// Deadline bounds: the deadline is fixed at issue.  A reconnect in the same sweep that reaches the deadline times
+// it out (never started: no OffsetFetch), one ns earlier it starts.
+TEST_F(GroupSeekSessionRegression, AWaitingRewindReachingItsDeadlineAtReconnectTimesOutUnstartedAdversarialRegression) {
+    g_hubNowNs = 7'000'000;
+    hub_->setSessionConnected(false);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    auto fut = seekToCommittedOp(gc);
+    ASSERT_FALSE(fut.ready());
+    const int64_t deadline = 7'000'000 + 1000LL * 1'000'000;
+    (void)sweep(deadline - 1);
+    EXPECT_FALSE(fut.ready());
+    hub_->setSessionConnected(true, kSessionId, 1);
+    (void)sweep(deadline);
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::Timeout);
+    (void)hub_->retryOffsetFetch(g_hubNowNs, kSessionId, sink_.fn());
+    EXPECT_EQ(offsetFetchFrames(sink_, fr_), 0) << "a timed-out rewind never starts";
+    EXPECT_EQ(fut.times(), 1);
+}
+
+// A rewind issued once the session is back but BEFORE the sweep applied the parked one: the parked one is
+// Superseded (once), the new one starts at once.  RED (revert #494): the first fails SessionLost at issue.
+TEST_F(GroupSeekSessionRegression, ARewindIssuedAfterReconnectSupersedesTheParkedOneOnceAdversarialRegression) {
+    hub_->setSessionConnected(false);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    auto first = seekToCommittedOp(gc);
+    ASSERT_FALSE(first.ready());
+    hub_->setSessionConnected(true, kSessionId, 1);
+    auto second = seekToCommittedOp(gc);
+    ASSERT_TRUE(first.ready());
+    EXPECT_EQ(first.status(), OpStatus::Superseded);
+    EXPECT_FALSE(second.ready());
+    EXPECT_TRUE(std::holds_alternative<GroupConsumerImpl::RewindAwaitFetch>(impl_->rewind));
+    (void)sweep(1'000'000);
+    (void)sweep(3'000'000'000);
+    ASSERT_TRUE(second.ready());
+    EXPECT_EQ(first.times(), 1);
+    EXPECT_EQ(second.times(), 1);
+}
