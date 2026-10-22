@@ -1100,7 +1100,7 @@ struct Cluster {
         if (!r || r->results.size() != 2) return -1;
         return r->results[0].errorCode != 0 ? r->results[0].errorCode : r->results[1].errorCode;
     }
-    // EndTxn: the error if answered synchronously, 999 when deferred (markers in flight).
+    // EndTxn: the error if answered synchronously, 999 when deferred (its Prepare* record not committed yet).
     int16_t endTxn(bool commit) {
         pc::EndTxn q; q.sessionId = coord().sid; q.correlationId = ++corr; q.producerId = pid;
         q.producerEpoch = epoch; q.commit = commit ? 1 : 0; q.transactionalId = tid();
@@ -1110,6 +1110,9 @@ struct Cluster {
         auto r = pc::EndTxnResponse::decode(out.data(), n);
         return r ? r->errorCode : -1;
     }
+    // #38: the EndTxn is answered inline once Prepare* is durable; the txn's progress is its coordinator state.
+    rune::transaction::TxnState txnState() { return coord().tcs->txnStateForTest(txnId); }
+    // A deferred (second) EndTxn answer: none is ever sent for an EndTxn answered inline (#38).
     std::optional<int16_t> deferredEndTxnError() {
         for (const auto& f : coord().controlFrames)
             if (auto r = pc::EndTxnResponse::decode(f.data(), f.size())) return r->errorCode;
@@ -1142,11 +1145,14 @@ TEST(D9CrossNodeMarkerIntegrationRegression, CommitAcrossTwoRemoteLeadersComplet
     EXPECT_EQ(C.node(1).deliveredCount(sub0, 0), 0) << "read_committed saw an OPEN transaction's data";
     EXPECT_EQ(C.node(2).deliveredCount(sub1, 0), 0);
 
-    ASSERT_EQ(C.endTxn(/*commit=*/true), 999) << "EndTxn deferred while the markers are in flight";
-    ASSERT_TRUE(C.passUntil([&] { return C.deferredEndTxnError().has_value(); }))
-        << "EndTxn never completed: a marker for a remotely led partition did not land (refused="
+    ASSERT_EQ(C.endTxn(/*commit=*/true), 0) << "EndTxn(commit) OK once PrepareCommit is durable (#38)";
+    ASSERT_EQ(C.txnState(), rune::transaction::TxnState::PrepareCommit) << "the markers are still in flight";
+    EXPECT_EQ(C.addPartitions(), static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions))
+        << "the next txn may not start before the markers land";
+    ASSERT_TRUE(C.passUntil([&] { return C.txnState() == rune::transaction::TxnState::CompleteCommit; }))
+        << "the txn never completed: a marker for a remotely led partition did not land (refused="
         << C.coord().tcs->controlMarkersRefusedForTest() << ")";
-    EXPECT_EQ(C.deferredEndTxnError().value_or(-1), 0) << "EndTxn(commit) OK";
+    EXPECT_FALSE(C.deferredEndTxnError().has_value()) << "a second EndTxn answer was sent when the markers landed";
     EXPECT_EQ(controlBatchCount(C.node(1).log(0)), 1) << "one COMMIT marker on p0's leader";
     EXPECT_EQ(controlBatchCount(C.node(2).log(1)), 1) << "one COMMIT marker on p1's leader";
     EXPECT_EQ(C.coord().tcs->awaitingMarkerTxnsForTest(), 0u);
@@ -1169,10 +1175,11 @@ TEST(D9CrossNodeMarkerIntegrationRegression, AbortAcrossTwoRemoteLeadersHidesThe
     C.node(1).produce(0, txnBatch(C.pid, C.epoch, 0), C.pid, C.epoch, 0, ++C.corr);
     C.node(2).produce(1, txnBatch(C.pid, C.epoch, 0), C.pid, C.epoch, 0, ++C.corr);
     ASSERT_TRUE(C.passUntil([&] { return C.replicated(0, 1, 1) && C.replicated(1, 1, 2); }));
-    ASSERT_EQ(C.endTxn(/*commit=*/false), 999);
-    ASSERT_TRUE(C.passUntil([&] { return C.deferredEndTxnError().has_value(); }))
-        << "EndTxn(abort) never completed (refused=" << C.coord().tcs->controlMarkersRefusedForTest() << ")";
-    EXPECT_EQ(C.deferredEndTxnError().value_or(-1), 0);
+    ASSERT_EQ(C.endTxn(/*commit=*/false), 0) << "EndTxn(abort) OK once PrepareAbort is durable (#38)";
+    ASSERT_EQ(C.txnState(), rune::transaction::TxnState::PrepareAbort) << "the markers are still in flight";
+    ASSERT_TRUE(C.passUntil([&] { return C.txnState() == rune::transaction::TxnState::CompleteAbort; }))
+        << "the abort never completed (refused=" << C.coord().tcs->controlMarkersRefusedForTest() << ")";
+    EXPECT_FALSE(C.deferredEndTxnError().has_value()) << "a second EndTxn answer was sent when the markers landed";
     ASSERT_EQ(controlBatchOffset(C.node(1).log(0)), 1) << "the ABORT marker landed on p0's leader after the data";
     ASSERT_EQ(controlBatchOffset(C.node(2).log(1)), 1) << "the ABORT marker landed on p1's leader after the data";
     C.node(1).produce(0, plainBatch(), -1, 0, -1, ++C.corr);
@@ -1199,11 +1206,15 @@ TEST(D9CrossNodeMarkerIntegrationRegression, LeaderKilledMidEndTxnMarkerLandsOnT
         << "precondition: p0's followers know the data is committed";
 
     C.node(1).alive = false;                                 // p0's leader dies (stops answering)
-    ASSERT_EQ(C.endTxn(/*commit=*/true), 999);
+    ASSERT_EQ(C.endTxn(/*commit=*/true), 0) << "OK once PrepareCommit is durable (#38)";
+    ASSERT_EQ(C.txnState(), rune::transaction::TxnState::PrepareCommit);
     ASSERT_TRUE(C.passUntil([&] { return controlBatchCount(C.node(2).log(1)) == 1; }))
         << "p1's marker (live leader) landed";
     for (int i = 0; i < 200; ++i) C.pass();
-    ASSERT_FALSE(C.deferredEndTxnError().has_value()) << "precondition: p0's marker is stuck on the dead leader";
+    ASSERT_EQ(C.txnState(), rune::transaction::TxnState::PrepareCommit)
+        << "precondition: p0's marker is stuck on the dead leader, so the txn has not completed";
+    EXPECT_EQ(C.addPartitions(), static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions))
+        << "the next txn may not start while p0's marker is unwritten";
     EXPECT_EQ(C.coord().gw.remoteMarkersInFlightForTest(), 1u) << "precondition: p0's marker in flight to node 1";
 
     // Leadership of p0 moves to node 2 (epoch 2, ISR {2,3}); node 3 follows it.
@@ -1224,10 +1235,10 @@ TEST(D9CrossNodeMarkerIntegrationRegression, LeaderKilledMidEndTxnMarkerLandsOnT
         << "the leader change must complete the in-flight marker at once (no timeout)";
     const int64_t sub0 = C.node(2).subscribe(0, 1);
     ASSERT_GT(sub0, 0);
-    ASSERT_TRUE(C.passUntil([&] { return C.deferredEndTxnError().has_value(); }, 5'000))
-        << "EndTxn never completed after p0's leadership moved (refused="
+    ASSERT_TRUE(C.passUntil([&] { return C.txnState() == rune::transaction::TxnState::CompleteCommit; }, 5'000))
+        << "the txn never completed after p0's leadership moved (refused="
         << C.coord().tcs->controlMarkersRefusedForTest() << ")";
-    EXPECT_EQ(C.deferredEndTxnError().value_or(-1), 0);
+    EXPECT_FALSE(C.deferredEndTxnError().has_value()) << "a second EndTxn answer was sent when the markers landed";
     EXPECT_EQ(controlBatchCount(C.node(2).log(0)), 1) << "exactly one COMMIT marker on p0's new leader";
     EXPECT_EQ(controlBatchOffset(C.node(2).log(0)), 1) << "after the data";
     ASSERT_TRUE(C.passUntil([&] { return C.node(2).deliveredCount(sub0, 0) > 0; }))

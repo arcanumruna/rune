@@ -266,14 +266,15 @@ struct TxnRig {
     std::string txnId = "tx-f15";
     int64_t pid = -1; int16_t epoch = 0; int32_t seq = 0; int64_t corr = 100; int64_t sid = 0;
     std::array<uint8_t, 4096> out{};
+    // stateIsr: the __transaction_state replica's ISR; {1, 2} holds every record uncommitted until commitState().
     explicit TxnRig(int minIsr = 1, bool withStore = false, std::vector<NodeId> replicas = {},
-                    std::vector<NodeId> isr = {1})
+                    std::vector<NodeId> isr = {1}, std::vector<NodeId> stateIsr = {1})
         : m(std::move(isr), 1, minIsr, std::move(replicas)) {
         if (withStore) {
             stateLog = std::make_unique<Log>(sd.path.string(), 64LL * 1024 * 1024);
             stateLog->recover();
             stateReplica = std::make_unique<PartitionReplica>(cfg(1, 1, 99, 0), Role::Leader, 1,
-                std::vector<NodeId>{1}, std::vector<NodeId>{1}, stateLog.get(), &m.t);
+                stateIsr, stateIsr, stateLog.get(), &m.t);
             store = std::make_unique<tx::ReplicatedTxnStateStore>(stateReplica.get());
         }
         tcs = std::make_unique<TransactionCoordinationService>(store.get(), &m.topics,
@@ -314,6 +315,18 @@ struct TxnRig {
         auto r = pc::EndTxnResponse::decode(out.data(), n);
         return r ? r->errorCode : -1;
     }
+    // #38: EndTxn is answered OK once its Prepare* record is durable, and the txn STAYS Prepare* (not completed
+    // early) while its markers are in flight.  Replaces the old "999 = deferred until the markers land".
+    ::testing::AssertionResult endTxnOkPreparing(bool commit) {
+        const int16_t e = endTxn(commit);
+        if (e != 0) return ::testing::AssertionFailure() << "EndTxn answered " << e << ", not OK";
+        const auto st = tcs->txnStateForTest(txnId);
+        const auto want = commit ? tx::TxnState::PrepareCommit : tx::TxnState::PrepareAbort;
+        if (st != want)
+            return ::testing::AssertionFailure() << "txn state " << static_cast<int>(st) << " is not Prepare*";
+        if (tcs->awaitingMarkerTxnsForTest() != 1u) return ::testing::AssertionFailure() << "no marker task in flight";
+        return ::testing::AssertionSuccess();
+    }
     // A transactional data batch through the REAL gateway produce path.
     void produceTxn() {
         const auto batch = txnBatch(pid, epoch, seq);
@@ -327,6 +340,14 @@ struct TxnRig {
     }
     void runUntilNoMarkerAwaited(int64_t now) {
         for (int i = 0; i < 64 && tcs->awaitingMarkerTxnsForTest() > 0; ++i) m.runWorker(now + i);
+    }
+    // Follower 2 of a stateIsr {1, 2} store fetches up to the log end: every __transaction_state record commits.
+    void commitState(int64_t now) {
+        rune::replication::FetchRequestMsg req{};
+        req.leaderEpoch = stateReplica->epoch(); req.partition = 0; req.followerId = 2;
+        req.fetchOffset = stateReplica->logEndOffset(); req.maxBytes = 1 << 20; req.topicId = 99;
+        (void)stateReplica->onFetchRequest(req, now);
+        stateReplica->doWork(now);
     }
     std::optional<int16_t> endTxnFrameError(std::size_t i) const {
         if (i >= controlFrames.size()) return std::nullopt;
@@ -601,11 +622,13 @@ TEST(TxnRoleGateRegression, DemotionFailsParkedStrictAckNotLeader) {
 
 // ============================================================================
 // I3 — a refused / retriable marker is NOT "landed": the txn must not complete
-// (no EndTxn OK, next txn refused) until the marker is really in the log.
+// (it stays Prepare*, next txn refused) until the marker is really in the log.
+// #38: the EndTxn itself is answered OK once the Prepare* record is durable.
 // ============================================================================
 
 // A RETRIABLE marker refusal is retried (Kafka TransactionMarkerChannelManager parity): once the
-// partition can take it again the marker lands, and only then the txn completes and EndTxn answers OK.
+// partition can take it again the marker lands, and only then the txn completes (#38: its EndTxn was answered OK
+// as soon as PrepareCommit was durable; there is no second answer).
 TEST(MarkerRetryRegression, RefusedMarkerIsRetriedAndCompletesTheTxnOnceItLands) {
     TxnRig T(/*minIsr=*/2);                                  // ISR {1} < minIsr 2: the marker is refused
     ASSERT_EQ(T.initPid(), 0);
@@ -613,10 +636,12 @@ TEST(MarkerRetryRegression, RefusedMarkerIsRetriedAndCompletesTheTxnOnceItLands)
     T.produceTxn();
     for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
     ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
-    ASSERT_EQ(T.endTxn(/*commit=*/true), 999) << "EndTxn deferred while the marker is in flight";
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true)) << "OK once PrepareCommit is durable, marker in flight";
     T.runUntilNoMarkerAwaited(10);
     ASSERT_GE(T.tcs->controlMarkersRefusedForTest(), 1u) << "precondition: the first marker attempt was refused";
     ASSERT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 1u);
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::PrepareCommit) << "completed over a refused marker";
+    EXPECT_EQ(T.addPartition(), kConcurrent) << "the next txn may not start before the marker lands";
     T.m.r->setMinIsrForTest(1);                              // the partition can take acks=all again
     int64_t now = 1'000'000'000;                             // past every retry backoff
     for (int i = 0; i < 64 && T.tcs->awaitingMarkerTxnsForTest() > 0; ++i) {
@@ -626,8 +651,9 @@ TEST(MarkerRetryRegression, RefusedMarkerIsRetriedAndCompletesTheTxnOnceItLands)
     }
     EXPECT_EQ(T.m.r->log()->logEndOffset(), 2) << "the retried COMMIT marker landed";
     EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 0u) << "the txn completes once its marker landed";
-    ASSERT_EQ(T.controlFrames.size(), 1u) << "exactly one deferred EndTxn response";
-    EXPECT_EQ(T.endTxnFrameError(0).value_or(-1), 0) << "EndTxn OK only after the marker is in the log";
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit)
+        << "CompleteCommit only after the marker is in the log";
+    EXPECT_TRUE(T.controlFrames.empty()) << "a second EndTxn answer was sent when the marker landed";
     EXPECT_EQ(T.addPartition(), 0) << "the next txn may start";
 }
 
@@ -639,7 +665,7 @@ TEST(MarkerRetryRegression, RefusedMarkerRetriesBackOffExponentially) {
     ASSERT_EQ(T.addPartition(), 0);
     T.produceTxn();
     for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
-    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
     T.runUntilNoMarkerAwaited(10);
     for (int64_t now = 20'000'000; now < 4'000'000'000; now += 1'000'000) {     // 4 s, coordinator every 1 ms
         (void)T.tcs->doWork(now);
@@ -659,7 +685,7 @@ TEST(MarkerRetryRegression, MarkerForADeletedPartitionIsDroppedAndTheTxnComplete
     ASSERT_EQ(T.addPartition(), 0);
     T.produceTxn();
     for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
-    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
     T.runUntilNoMarkerAwaited(10);
     ASSERT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 1u) << "precondition: the marker was refused and is pending";
     T.tcs->onControlMarkerRefused(0, 0, T.pid, static_cast<int16_t>(pc::ErrorCode::UnknownPartition),
@@ -677,7 +703,7 @@ TEST(MarkerRetryRegression, StuckMarkerGaugeCountsLongRefusedMarkersAndClearsOnL
     ASSERT_EQ(T.addPartition(), 0);
     T.produceTxn();
     for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
-    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
     (void)T.tcs->doWork(10);
     T.runUntilNoMarkerAwaited(10);
     ASSERT_GE(T.tcs->controlMarkersRefusedForTest(), 1u) << "precondition: the marker was refused";
@@ -711,7 +737,7 @@ TEST(MarkerRetryRegression, StuckMarkerGaugeIsPublishedToItsSinkOnChange) {
     T.produceTxn();
     for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
     (void)T.tcs->doWork(10);
-    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
     T.runUntilNoMarkerAwaited(10);
     int64_t now = 20'000'000;
     for (; now < TransactionCoordinationService::kStuckMarkerNs + 2'000'000'000; now += 10'000'000) {
@@ -734,7 +760,7 @@ TEST(MarkerRetryRegression, MarkerWaitingForTheHwCountsAsStuckPastTheWindow) {
     T.produceTxn();
     for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
     (void)T.tcs->doWork(10);
-    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
     int64_t now = 20'000'000;
     for (int i = 0; i < 8; ++i, now += 10'000'000) { (void)T.tcs->doWork(now); T.m.runWorker(now); }
     ASSERT_EQ(T.m.r->log()->logEndOffset(), 2) << "precondition: the marker is appended";
@@ -760,7 +786,7 @@ TEST(MarkerRetryRegression, RefusalBeforeTheFirstPassIsNotInstantlyStuck) {
     ASSERT_EQ(T.addPartition(), 0);
     T.produceTxn();
     for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
-    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);               // dispatched before any doWork
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));       // dispatched before any doWork
     T.runUntilNoMarkerAwaited(10);
     ASSERT_GE(T.tcs->controlMarkersRefusedForTest(), 1u);
     const int64_t start = 100'000'000'000;                   // the clock starts far from 0
@@ -774,7 +800,7 @@ TEST(MarkerRetryRegression, FencedMarkerIsNotRetriedAndDoesNotCompleteTheTxn) {
     ASSERT_EQ(T.addPartition(), 0);
     T.produceTxn();
     for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
-    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
     (void)T.tcs->doWork(10);
     T.runUntilNoMarkerAwaited(10);
     ASSERT_EQ(T.tcs->queuedMarkerRetriesForTest(), 1u) << "precondition: a retry is queued";
@@ -800,7 +826,7 @@ TEST(MarkerRetryRegression, MinIsrRefusedMarkerNeverCompletesTheTxn) {
     for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
     ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
     ASSERT_EQ(T.m.w().rcOpenTxnsForTest(0, 0), 1u) << "S4 retarget precondition: the open txn is registered at append";
-    ASSERT_EQ(T.endTxn(/*commit=*/true), 999) << "EndTxn deferred while the marker is in flight";
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true)) << "OK once PrepareCommit is durable, marker in flight";
     T.runUntilNoMarkerAwaited(10);
     for (int64_t now = 20'000'000; now < 3'000'000'000; now += 10'000'000) {   // 3 s of coordinator retries
         (void)T.tcs->doWork(now);
@@ -811,8 +837,10 @@ TEST(MarkerRetryRegression, MinIsrRefusedMarkerNeverCompletesTheTxn) {
     EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 1u)
         << "the txn completed although its only marker was refused (controlMarkersRefused="
         << T.tcs->controlMarkersRefusedForTest() << ")";
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::PrepareCommit)
+        << "completed while no COMMIT marker exists";
     EXPECT_TRUE(T.controlFrames.empty())
-        << "an EndTxn response was sent (error=" << T.endTxnFrameError(0).value_or(-1)
+        << "a second EndTxn response was sent (error=" << T.endTxnFrameError(0).value_or(-1)
         << ") while no COMMIT marker exists";
     EXPECT_EQ(T.addPartition(), kConcurrent) << "the next txn may not start while the marker is unwritten";
     EXPECT_EQ(T.m.w().rcOpenTxnsForTest(0, 0), 1u) << "the LSO stays pinned at the open txn (correct)";
@@ -825,6 +853,99 @@ TEST(MarkerRetryRegression, MinIsrRefusedMarkerNeverCompletesTheTxn) {
     EXPECT_EQ(T.m.r->highWatermark(), 0) << "min-ISR no longer pins the HW: make the egress check non-vacuous";
     EXPECT_FALSE(T.m.delivered(rcSub, 0)) << "read_committed received the open txn's batch";
     EXPECT_EQ(T.m.deliveredCount(rcSub), 0u);
+}
+
+// #38: the EndTxn is answered OK once the Prepare* record is durable (Kafka's model), not when the markers land.
+// A marker refused while ISR < minIsr never lands, so the deferred answer left the client with only its own
+// timeout.  The decision is irrevocable once durable (a reload re-drives the markers); the next transaction is
+// still refused ConcurrentTransactions and read_committed still sees nothing until the marker lands.
+TEST(MarkerRetryRegression, EndTxnIsAnsweredOkOnceTheDecisionIsDurableWhileTheMarkerIsRefusedRegression) {
+    TxnRig T(/*minIsr=*/2);                                  // ISR {1} < minIsr 2: acks=all marker refused
+    const int64_t rcSub = T.m.subscribe(T.sid, /*read_committed*/1);
+    ASSERT_GT(rcSub, 0);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();                                          // acks=0: no ISR gate, lands at 0
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
+    ASSERT_EQ(T.endTxn(/*commit=*/true), 0) << "EndTxn must be answered OK once PrepareCommit is durable";
+    T.runUntilNoMarkerAwaited(10);
+    for (int64_t now = 20'000'000; now < 3'000'000'000; now += 10'000'000) {   // 3 s of coordinator retries
+        (void)T.tcs->doWork(now);
+        T.m.runWorker(now);
+    }
+    ASSERT_GE(T.tcs->controlMarkersRefusedForTest(), 1u) << "precondition: the marker is refused";
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 1) << "no marker in the log";
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::PrepareCommit) << "completed over a refused marker";
+    EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 1u);
+    EXPECT_EQ(T.addPartition(), kConcurrent) << "the next txn may not start while the marker is unwritten";
+    T.m.push(16, 3'000'000'000);
+    EXPECT_FALSE(T.m.delivered(rcSub, 0)) << "read_committed received the txn's batch before its marker";
+    EXPECT_TRUE(T.controlFrames.empty()) << "a second (deferred) EndTxn answer was sent";
+
+    T.m.r->setMinIsrForTest(1);                              // the partition can take acks=all again
+    int64_t now = 4'000'000'000;                             // past every retry backoff
+    for (int i = 0; i < 64 && T.tcs->awaitingMarkerTxnsForTest() > 0; ++i) {
+        (void)T.tcs->doWork(now);
+        T.m.runWorker(now);
+        now += 50'000'000;
+    }
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 2) << "the retried COMMIT marker landed";
+    EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 0u);
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit);
+    EXPECT_EQ(T.addPartition(), 0) << "the next txn may start once the marker landed";
+    T.m.push(16, now);
+    EXPECT_TRUE(T.m.delivered(rcSub, 0)) << "read_committed never received the committed batch";
+    EXPECT_TRUE(T.controlFrames.empty()) << "the EndTxn was answered a second time when the marker landed";
+}
+
+// #38, the gated path: an EndTxn whose PrepareCommit record is not committed yet still waits for it (never an OK
+// for a decision a failover could lose).  Once the HW passes the record it is answered OK exactly once on the next
+// doWork, although its marker is refused (ISR {1} < minIsr 2 on the data partition) and never lands.
+TEST(MarkerRetryRegression, EndTxnWaitingForItsPrepareRecordIsAnsweredOkWhenTheRecordCommitsRegression) {
+    TxnRig T(/*minIsr=*/2, /*withStore=*/true, {}, /*isr=*/{1}, /*stateIsr=*/{1, 2});
+    int64_t now = 1;
+    (void)T.tcs->doWork(now);                                // the coordinator loads
+    int16_t ipErr = T.initPid();
+    for (int i = 0; i < 4 && ipErr == kConcurrent; ++i) {    // the pid ceiling commits first (retriable until then)
+        T.commitState(++now);
+        (void)T.tcs->doWork(++now);
+        ipErr = T.initPid();
+    }
+    ASSERT_EQ(ipErr, -1) << "precondition: the InitProducerId answer waits for its record";
+    T.controlFrames.clear();
+    T.commitState(++now);
+    (void)T.tcs->doWork(++now);
+    ASSERT_EQ(T.controlFrames.size(), 1u);
+    const auto ip = pc::InitProducerIdResponse::decode(T.controlFrames[0].data(), T.controlFrames[0].size());
+    ASSERT_TRUE(ip && ip->errorCode == 0);
+    T.pid = ip->producerId; T.epoch = ip->producerEpoch;
+    ASSERT_EQ(T.addPartition(), -1) << "precondition: the registration waits for its record";
+    T.commitState(++now);
+    (void)T.tcs->doWork(++now);
+    ASSERT_EQ(T.controlFrames.size(), 2u);
+    T.controlFrames.clear();
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(++now);
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
+
+    ASSERT_EQ(T.endTxn(/*commit=*/true), 999) << "the EndTxn must wait for its uncommitted PrepareCommit record";
+    ASSERT_EQ(T.tcs->prepareGates(), 1u);
+    for (int i = 0; i < 4; ++i) { (void)T.tcs->doWork(++now); T.m.runWorker(now); }
+    EXPECT_TRUE(T.controlFrames.empty()) << "answered before the PrepareCommit record committed";
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 1) << "a marker was written ahead of its PrepareCommit record";
+
+    T.commitState(++now);
+    (void)T.tcs->doWork(++now);
+    ASSERT_EQ(T.controlFrames.size(), 1u) << "the EndTxn is answered on the doWork after its record committed";
+    EXPECT_EQ(T.endTxnFrameError(0).value_or(-1), 0);
+    EXPECT_EQ(T.tcs->prepareGates(), 0u);
+    T.runUntilNoMarkerAwaited(++now);
+    for (now = 20'000'000; now < 3'000'000'000; now += 10'000'000) { (void)T.tcs->doWork(now); T.m.runWorker(now); }
+    EXPECT_GE(T.tcs->controlMarkersRefusedForTest(), 1u) << "precondition: the marker is refused";
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::PrepareCommit);
+    EXPECT_EQ(T.addPartition(), kConcurrent) << "the next txn may not start while the marker is unwritten";
+    EXPECT_EQ(T.controlFrames.size(), 1u) << "the EndTxn was answered more than once";
 }
 
 // ============================================================================
@@ -880,7 +1001,7 @@ TEST(TxnCoordinatorFailoverRegression, CompletionIsPersisted) {
     ASSERT_EQ(T.initPid(), 0);
     ASSERT_EQ(T.addPartition(), 0);
     T.produceTxn();
-    ASSERT_EQ(T.endTxn(true), 999);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
     T.runUntilNoMarkerAwaited(10);
     ASSERT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 0u) << "precondition: completed";
     const auto* meta = T.store->get(T.txnId);
@@ -895,10 +1016,10 @@ TEST(TxnCoordinatorFailoverRegression, EndTxnRetryAfterCompleteSameDirectionIsOk
     ASSERT_EQ(T.initPid(), 0);
     ASSERT_EQ(T.addPartition(), 0);
     T.produceTxn();
-    ASSERT_EQ(T.endTxn(true), 999);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
     T.runUntilNoMarkerAwaited(10);
-    ASSERT_EQ(T.controlFrames.size(), 1u);
-    ASSERT_EQ(T.endTxnFrameError(0).value_or(-1), 0) << "precondition: committed";
+    ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit) << "precondition: committed";
+    ASSERT_TRUE(T.controlFrames.empty()) << "a second EndTxn answer was sent when the marker landed";
     // The client lost that response and retries the same EndTxn.
     EXPECT_EQ(T.endTxn(true), 0) << "Kafka: a same-direction retry after completion is OK";
 }
@@ -908,24 +1029,27 @@ TEST(TxnCoordinatorFailoverRegression, EndTxnOppositeDirectionIsInvalidTxnState)
     ASSERT_EQ(T.initPid(), 0);
     ASSERT_EQ(T.addPartition(), 0);
     T.produceTxn();
-    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);              // PrepareCommit, marker in flight
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));      // PrepareCommit, marker in flight
     EXPECT_EQ(T.endTxn(/*commit=*/false), kInvalidTxnState)
         << "an ABORT while PrepareCommit is a client bug (InvalidTxnState), not retriable";
     EXPECT_EQ(T.endTxn(/*commit=*/true), kConcurrent) << "a same-direction retry IS retriable";
 }
 
-TEST(TxnCoordinatorFailoverRegression, LossOfLeadershipAnswersNotCoordinatorAndClearsTasks) {
+// #38: the EndTxn was answered OK once PrepareCommit was durable (the next coordinator re-drives it), so a loss of
+// leadership drops the marker tasks without a second answer and without completing the txn.  An EndTxn still
+// waiting for its Prepare* record is answered NotCoordinator on unload (TransactionCoordinationServiceTest).
+TEST(TxnCoordinatorFailoverRegression, LossOfLeadershipClearsMarkerTasksWithoutASecondEndTxnAnswer) {
     TxnRig T;
     ASSERT_EQ(T.initPid(), 0);
     ASSERT_EQ(T.addPartition(), 0);
     T.produceTxn();
-    ASSERT_EQ(T.endTxn(true), 999);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
     ASSERT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 1u);
     T.leader = false;                                        // coordinator deposed before the marker landed
     (void)T.tcs->doWork(50);
     EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 0u) << "marker tasks of a deposed coordinator must be dropped";
-    ASSERT_EQ(T.controlFrames.size(), 1u) << "the deferred EndTxn must be answered on unload";
-    EXPECT_EQ(T.endTxnFrameError(0).value_or(-1), kNotCoordinator);
+    EXPECT_EQ(T.tcs->transactionsCompletedForTest(), 0u) << "a deposed coordinator completed the txn";
+    EXPECT_TRUE(T.controlFrames.empty()) << "a second EndTxn answer was sent on unload";
 }
 
 // ============================================================================
@@ -2077,25 +2201,25 @@ TEST(TxnCoordinatorLoadRegression, CoordinatorRoutedToTxnStateLeader) {
 }
 
 TEST(TxnCoordinatorLoadRegression, EpochChangeUnloadsAndReloads) {
-    // m3: an epoch change while still leader = unload (deferred EndTxn answered
-    // NotCoordinator, marker tasks dropped) then load under the new epoch, which
-    // re-drives the committed PrepareCommit and persists its completion.
+    // m3: an epoch change while still leader = unload (marker tasks dropped; #38: the
+    // EndTxn was answered OK once PrepareCommit was durable, so no second answer) then load
+    // under the new epoch, which re-drives the committed PrepareCommit and persists its completion.
     TxnRig T(1, /*withStore=*/true);
     ASSERT_EQ(T.initPid(), 0);
     ASSERT_EQ(T.addPartition(), 0);
     T.produceTxn();
-    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
     T.stateReplica->becomeLeader(2, {1});
     (void)T.tcs->doWork(50);
-    ASSERT_EQ(T.controlFrames.size(), 1u) << "the deferred EndTxn must be answered on unload";
-    EXPECT_EQ(T.endTxnFrameError(0).value_or(-1), kNotCoordinator);
+    EXPECT_TRUE(T.controlFrames.empty()) << "a second EndTxn answer was sent on unload";
+    EXPECT_EQ(T.tcs->transactionsCompletedForTest(), 0u) << "the unload completed the txn";
     T.runUntilNoMarkerAwaited(60);
     EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 0u);
     const auto* meta = T.store->get(T.txnId);
     ASSERT_NE(meta, nullptr);
     EXPECT_EQ(meta->state, tx::TxnState::CompleteCommit) << "the reloaded PrepareCommit completes";
     EXPECT_EQ(meta->coordinatorEpoch, 2) << "under the new coordinatorEpoch";
-    EXPECT_EQ(T.controlFrames.size(), 1u) << "no second answer to the old EndTxn";
+    EXPECT_TRUE(T.controlFrames.empty()) << "no second answer to the old EndTxn";
 }
 
 // ============================================================================
@@ -3478,7 +3602,7 @@ TEST(TxnRcRegression, InternalPartitionsNeverCarryTxnBatches) {
     ASSERT_EQ(T.addPartition(), 0);
     T.produceTxn();
     for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
-    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
     T.runUntilNoMarkerAwaited(10);
     ASSERT_GT(T.stateLog->logEndOffset(), 0) << "precondition: the coordinator wrote __transaction_state";
     const auto raw = T.stateLog->read(0, 1 << 24);
@@ -3962,7 +4086,7 @@ TEST(TxnRcRegression, MinIsrPinnedOpenTxnHoldsRcAfterIsrRestore) {
     T.produceTxn();                                          // acks=0: lands at 0
     for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
     ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
-    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
     T.runUntilNoMarkerAwaited(10);
     ASSERT_EQ(T.m.r->log()->logEndOffset(), 1) << "precondition: the marker was refused (min-ISR)";
     ASSERT_EQ(T.m.r->highWatermark(), 0) << "precondition: min-ISR pins the HW";
@@ -4602,11 +4726,10 @@ TEST(TxnAddOffsetsRegression, AddOffsetsFirstTxnCommits) {
     ASSERT_EQ(T.addPartition(), 0);
     T.produceTxn();
     T.m.runWorker(2);
-    EXPECT_EQ(T.endTxn(/*commit=*/true), 999) << "deferred until the marker lands";
+    EXPECT_TRUE(T.endTxnOkPreparing(/*commit=*/true)) << "OK once PrepareCommit is durable, marker in flight";
     T.runUntilNoMarkerAwaited(10);
-    const auto err = T.endTxnFrameError(0);
-    ASSERT_TRUE(err.has_value()) << "the EndTxn response was never sent";
-    EXPECT_EQ(*err, 0);
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit);
+    EXPECT_TRUE(T.controlFrames.empty()) << "a second EndTxn answer was sent when the marker landed";
     EXPECT_EQ(T.tcs->transactionsCompletedForTest(), 1u) << "the transaction never completed";
 }
 
@@ -4627,7 +4750,7 @@ TEST(TxnAddOffsetsRegression, AddOffsetsWhilePreparingIsConcurrentTransactions) 
     ASSERT_EQ(T.addPartition(), 0);
     T.produceTxn();
     T.m.runWorker(2);
-    ASSERT_EQ(T.endTxn(/*commit=*/true), 999) << "precondition: PrepareCommit, marker in flight";
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true)) << "precondition: PrepareCommit, marker in flight";
     EXPECT_EQ(addOffsets(T, "g"), kConcurrent) << "AddOffsets on a txn in Prepare* must be retriable 27";
 }
 
@@ -6012,10 +6135,11 @@ TEST(D4TxnRegression, PipelinedTxnBatchesThroughTheGatewayAreNeverOutOfOrderRegr
         ASSERT_EQ(T.m.cap.produceErrors.size(), before + kBatches) << "every pipelined batch answered, txn " << t;
         ASSERT_EQ(nonZero(T.m.cap.produceErrors), 0) << "no OutOfOrderSequence / error in txn " << t;
         const bool commit = (t % 3) != 2;
-        ASSERT_EQ(T.endTxn(commit), 999) << "markers dispatched, response deferred";
+        ASSERT_TRUE(T.endTxnOkPreparing(commit)) << "markers dispatched, txn " << t << " Prepare*";
         T.runUntilNoMarkerAwaited(now); now += 64;
-        ASSERT_EQ(T.controlFrames.size(), static_cast<std::size_t>(t + 1));
-        ASSERT_EQ(T.endTxnFrameError(static_cast<std::size_t>(t)).value_or(-1), 0) << "txn " << t << " completed";
+        ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), commit ? tx::TxnState::CompleteCommit : tx::TxnState::CompleteAbort)
+            << "txn " << t << " completed";
+        ASSERT_TRUE(T.controlFrames.empty()) << "a second EndTxn answer, txn " << t;
     }
     EXPECT_EQ(T.m.r->log()->logEndOffset(), static_cast<int64_t>(kTxns) * (kBatches + 1))
         << "every data batch + exactly one marker per transaction";
@@ -6033,9 +6157,10 @@ TEST(D4TxnRegression, PipelinedTxnBatchesOnTheShardIngressAreNeverOutOfOrderRegr
             ++T.seq;
         }
         for (int i = 0; i < 8; ++i) T.m.runWorker(now++);
-        ASSERT_EQ(T.endTxn(true), 999);
+        ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true)) << "txn " << t;
         T.runUntilNoMarkerAwaited(now); now += 64;
-        ASSERT_EQ(T.endTxnFrameError(static_cast<std::size_t>(t)).value_or(-1), 0);
+        ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit) << "txn " << t << " completed";
+        ASSERT_TRUE(T.controlFrames.empty()) << "a second EndTxn answer, txn " << t;
     }
     EXPECT_EQ(nonZero(T.m.cap.produceErrors), 0);
     EXPECT_EQ(T.m.r->log()->logEndOffset(), 6 * 33);
@@ -6059,10 +6184,10 @@ TEST(D4TxnRegression, EndTxnWithNoPartitionsNeitherCrashesNorWedgesTheProducerRe
     // The producer still runs a normal transaction afterwards.
     ASSERT_EQ(T.addPartition(), 0);
     T.produceTxn();
-    ASSERT_EQ(T.endTxn(true), 999);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
     T.runUntilNoMarkerAwaited(100);
-    ASSERT_FALSE(T.controlFrames.empty());
-    EXPECT_EQ(T.endTxnFrameError(T.controlFrames.size() - 1).value_or(-1), 0);
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit) << "the normal txn completes";
+    EXPECT_TRUE(T.controlFrames.empty()) << "a second EndTxn answer was sent when the marker landed";
 }
 
 TEST(D4TxnRegression, EndTxnRetriedWhileMarkersAreOutstandingNeverDispatchesTwiceRegression) {
@@ -6072,7 +6197,7 @@ TEST(D4TxnRegression, EndTxnRetriedWhileMarkersAreOutstandingNeverDispatchesTwic
     T.produceTxn();
     for (int i = 0; i < 4; ++i) T.m.runWorker(10 + i);
     const int64_t leoBefore = T.m.r->log()->logEndOffset();
-    ASSERT_EQ(T.endTxn(true), 999);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
     // Client timeout -> same-direction retry, then a confused opposite-direction one,
     // both BEFORE the first EndTxn's marker landed (worker not run).
     const int16_t same = T.endTxn(true);
@@ -6082,8 +6207,9 @@ TEST(D4TxnRegression, EndTxnRetriedWhileMarkersAreOutstandingNeverDispatchesTwic
     EXPECT_EQ(opposite, static_cast<int16_t>(pc::ErrorCode::InvalidTxnState));
     T.runUntilNoMarkerAwaited(20);
     EXPECT_EQ(T.m.r->log()->logEndOffset(), leoBefore + 1) << "exactly one marker appended";
-    ASSERT_EQ(T.controlFrames.size(), 1u) << "the original EndTxn answered exactly once";
-    EXPECT_EQ(T.endTxnFrameError(0).value_or(-1), 0);
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit);
+    EXPECT_TRUE(T.controlFrames.empty())
+        << "the original EndTxn answered exactly once (inline): no deferred second answer";
     EXPECT_EQ(T.endTxn(true), 0) << "after completion the same-direction retry is the idempotent OK";
 }
 
@@ -6102,9 +6228,10 @@ TEST(D4TxnRegression, EndTxnWithAStaleEpochIsFencedWithoutMarkersRegression) {
                 e == static_cast<int16_t>(pc::ErrorCode::InvalidProducerEpoch)) << "got " << e;
     EXPECT_EQ(T.m.r->log()->logEndOffset(), leoBefore) << "a fenced EndTxn writes no marker";
     T.epoch = liveEpoch;
-    ASSERT_EQ(T.endTxn(true), 999) << "the live instance still commits";
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true)) << "the live instance still commits";
     T.runUntilNoMarkerAwaited(30);
-    EXPECT_EQ(T.endTxnFrameError(0).value_or(-1), 0);
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit);
+    EXPECT_TRUE(T.controlFrames.empty()) << "a second EndTxn answer was sent when the marker landed";
 }
 
 TEST(D4TxnRegression, MalformedEndTxnFramesAreIgnoredRegression) {

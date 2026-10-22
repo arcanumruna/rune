@@ -223,12 +223,12 @@ public:
     /// Phase 2b F Task 11: where a COMMITTED transaction's consumer-group offsets (TxnOffsetCommit) are applied -
     /// the group coordinator's offset store (BrokerNode wires GroupCoordinationService::applyTransactionalOffset).
     /// Refused when it cannot apply NOW (not the group coordinator / offsets not loaded yet / gated): the
-    /// transaction then stays PrepareCommit, its EndTxn answer stays deferred, and the completion is retried from
-    /// doWork with backoff (duty clock) until the sink accepts - a refused apply never completes the commit.
-    /// #358: Replicating while the offset record is appended but not yet committed on the offsets replica: the
-    /// transaction likewise stays PrepareCommit (CompleteCommit is not persisted, EndTxn not answered) and the
-    /// completion is re-checked on every doWork (no backoff: it waits on replication, not on a refusal) until every
-    /// offset is Applied.  No sink wired = no offset store on this node (unit rigs): offsets are accepted and
+    /// transaction then stays PrepareCommit (its next txn is refused ConcurrentTransactions), and the completion is
+    /// retried from doWork with backoff (duty clock) until the sink accepts - a refused apply never completes the
+    /// commit.  #358: Replicating while the offset record is appended but not yet committed on the offsets replica:
+    /// the transaction likewise stays PrepareCommit (CompleteCommit is not persisted) and the completion is
+    /// re-checked on every doWork (no backoff: it waits on replication, not on a refusal) until every offset is
+    /// Applied.  No sink wired = no offset store on this node (unit rigs): offsets are accepted and
     /// dropped.  Called on the control thread; the apply is an overwrite, so re-drives are idempotent.
     /// `token` (PR #434 review F2): one value per committing transaction (producer id, epoch, start), so the sink
     /// answers a transaction only from the offset record THAT transaction appended.
@@ -347,7 +347,7 @@ private:
     void sendDeferred_(int64_t sessionId, const uint8_t* frame, std::size_t n);
     void sendEndTxnAnswer_(int64_t sessionId, int64_t correlationId, int16_t errorCode);
     int  releaseParked_();
-    /// The gate for `meta`'s markers (respond: the EndTxn answer waits on them).
+    /// The gate for `meta`'s markers (respond: the EndTxn is answered OK once it opens).
     [[nodiscard]] PrepareGate makeGate_(const rune::transaction::TransactionMetadata& meta, bool commit,
                                         std::vector<rune::transaction::TopicPartition> parts, bool respond,
                                         int64_t sessionId, int64_t correlationId);
@@ -443,7 +443,7 @@ private:
     static constexpr int64_t kOffsetRetryMinNs = 10'000'000;     // 10 ms
     static constexpr int64_t kOffsetRetryMaxNs = 1'000'000'000;  // 1 s
     bool applyTxnOffset_(const std::string& group, const rune::coordination::TopicPartition& tp, int64_t offset);
-    bool completeAwaiting_(int64_t producerId, bool respond);   // true: completed (entry erased)
+    bool completeAwaiting_(int64_t producerId);   // true: completed (entry erased)
     int  retryDeferredCompletions_(int64_t nowNs);
     // Task 10 round 5: Prepare* transactions whose markers are still in flight,
     // keyed by the markers' producerId (one transaction per producer at a time:
@@ -462,9 +462,6 @@ private:
     struct AwaitingMarkers {
         rune::transaction::TransactionalId txnId;
         int     outstanding      = 0;
-        bool    respPending      = false;   // a deferred EndTxn response
-        int64_t sessionId        = 0;
-        int64_t correlationId    = 0;
         int16_t producerEpoch    = 0;       // to rebuild a retried marker
         int32_t coordinatorEpoch = -1;
         bool    commit           = false;
@@ -496,10 +493,9 @@ private:
     bool dropRetry_(AwaitingMarkers& a, int32_t topicId, int32_t partition);
     [[nodiscard]] bool partitionExists_(int32_t topicId, int32_t partition) const;
     std::unordered_map<int64_t, AwaitingMarkers> awaiting_;
-    bool dispatchMarkers_(const rune::transaction::TransactionalId& txnId, int64_t producerId,
+    void dispatchMarkers_(const rune::transaction::TransactionalId& txnId, int64_t producerId,
                           int16_t producerEpoch, int32_t coordinatorEpoch, bool commit,
-                          const std::vector<rune::transaction::TopicPartition>& parts,
-                          int64_t respSessionId = 0, int64_t respCorrelationId = 0);
+                          const std::vector<rune::transaction::TopicPartition>& parts);
     void resolveMarker_(int64_t producerId);
     [[nodiscard]] int concurrentIfPreparing_(int err) const;
 

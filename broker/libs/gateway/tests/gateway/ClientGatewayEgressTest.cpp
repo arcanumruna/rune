@@ -526,8 +526,10 @@ TEST(ClientGatewayEgressRegression, CheckFrameRejectIsAnsweredProtocolVersionReg
     EXPECT_EQ(jr->errorCode, static_cast<int16_t>(pc::ErrorCode::ProtocolVersion));
 }
 
-// Fix round 2 (I3): a txn handler returning 0 for anything but EndTxn (its only
-// legal "deferred") is answered Internal, never read as "deferred".
+// Fix round 2 (I3): a txn handler returning 0 for anything but EndTxn (then its only
+// legal "deferred"; since #358 any answer waiting for its __transaction_state record,
+// and since #38 EndTxn waits only for its Prepare* record, not its markers) is answered
+// Internal, never read as "deferred".
 // (CoordinatorRedirectTest's CountingTxn returns 0 for every request.)
 
 // Fix round 2 (I4): a ViewRowResult whose response would exceed the egress
@@ -730,7 +732,7 @@ TEST(GatewayFilterWireRegression, JoinGroupDecodeIsGatedOnTheSessionsClientVersi
     EXPECT_EQ(j->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
 }
 
-// sendControlFrame (DDL answers from the admin thread, deferred EndTxn, Assign)
+// sendControlFrame (DDL answers from the admin thread, deferred txn answers, Assign)
 // is queued under back-pressure — it used a best-effort send that lost it.
 TEST(ClientGatewayEgressRegression, ControlFrameIsQueuedUnderBackpressureRegression)
 {

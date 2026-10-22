@@ -741,8 +741,8 @@ TEST_F(TransactionCoordinationServiceTest, RefusedOffsetApplyKeepsPrepareCommitA
     // The sink refuses 3 times: PrepareCommit holds, the commit is not completed, the offset is not applied.
     for (int i = 0; i < 3; ++i) {
         EXPECT_EQ(svc_->txnStateForTest(txn), tx::TxnState::PrepareCommit) << "refusal " << i;
-        EXPECT_EQ(svc_->transactionsCompletedForTest(), 0u) << "EndTxn is not answered while the apply is refused";
-        EXPECT_EQ(svc_->awaitingMarkerTxnsForTest(), 1u) << "the deferred EndTxn is still awaiting";
+        EXPECT_EQ(svc_->transactionsCompletedForTest(), 0u) << "the commit is not completed while the apply is refused";
+        EXPECT_EQ(svc_->awaitingMarkerTxnsForTest(), 1u) << "the txn is still awaiting its completion";
         EXPECT_EQ(sink.accepted, 0);
         now += 1'100'000'000;   // beyond the 1 s backoff cap
         (void)svc_->doWork(now);

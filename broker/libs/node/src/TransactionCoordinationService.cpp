@@ -231,21 +231,11 @@ void TransactionCoordinationService::load_(int64_t nowNs)
 
 void TransactionCoordinationService::unload_()
 {
-    // m3: every deferred EndTxn is answered NotCoordinator (the client
-    // re-discovers and retries; the new coordinator answers from the durable
-    // state), every marker task is dropped.
-    dropDeferred_();   // #358 class: so is every answer still waiting for its record, and every gated EndTxn
+    // m3: every answer still waiting for its record, and every EndTxn waiting for its Prepare* record (a gate), is
+    // answered NotCoordinator (the client re-discovers and retries; the new coordinator answers from the durable
+    // state); every marker task is dropped (#38: their EndTxn was answered once the Prepare* record committed).
+    dropDeferred_();
     for (const auto& [pid, a] : awaiting_) releaseOffsets_(a.offsetToken);   // their offset waiters go
-    for (auto& [pid, a] : awaiting_) {
-        if (!a.respPending || gateway_ == nullptr) continue;
-        pc::EndTxnResponse resp;
-        resp.sessionId     = a.sessionId;
-        resp.correlationId = a.correlationId;
-        resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
-        std::array<uint8_t, pc::EndTxnResponse::ENCODED_SIZE> buf{};
-        const std::size_t n = resp.encode(buf.data());
-        (void)gateway_->sendControlFrame(a.sessionId, buf.data(), n);
-    }
     awaiting_.clear();
     clearHolds_();            // #438: unknown until the next load (the probe answers Unknown)
     stuckOffsetTxns_ = 0;     // #359
@@ -574,10 +564,10 @@ int TransactionCoordinationService::processPrepareGates_()
                                                 static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
             continue;
         }
-        const bool deferred = dispatchMarkers_(open.txnId, open.producerId, open.producerEpoch, open.coordinatorEpoch,
-                                               open.commit, open.parts, open.respond ? open.sessionId : 0,
-                                               open.respond ? open.correlationId : 0);
-        if (!deferred && open.respond) sendEndTxnAnswer_(open.sessionId, open.correlationId, 0);   // completed now
+        dispatchMarkers_(open.txnId, open.producerId, open.producerEpoch, open.coordinatorEpoch, open.commit,
+                         open.parts);
+        // #38: the decision is durable - OK now; the markers land asynchronously.
+        if (open.respond) sendEndTxnAnswer_(open.sessionId, open.correlationId, 0);
     }
     return work;
 }
@@ -1010,11 +1000,9 @@ size_t TransactionCoordinationService::handleEndTxn_(
         }
     }
 
-    // TX-4 Task 8 / Task 10 round 5: write the control markers for a client-
-    // driven commit/abort.  The txn stays Prepare* and the EndTxn RESPONSE IS
-    // DEFERRED until every marker has landed — the producer cannot start its
-    // next transaction (whose batches could otherwise land ahead of a marker, or
-    // be closed by it in the LSO bookkeeping) before then.
+    // TX-4 Task 8 / #38 (Kafka's model): once the Prepare* record is durable the decision is irrevocable (a reload
+    // re-drives the markers), so EndTxn answers OK then; the markers are written asynchronously, and until the last
+    // one lands the txn stays Prepare* and the producer's next txn is refused ConcurrentTransactions.
     if (transitioned && gateway_ && topics_) {
         const auto* m = coordinator_.metadata(txnIdScratch_);
         if (m) {
@@ -1023,15 +1011,12 @@ size_t TransactionCoordinationService::handleEndTxn_(
                                                                                    m->partitions.end()),
                                       /*respond=*/true, msg.sessionId, msg.correlationId);
             // #358 class: the markers are written only once the Prepare* record is committed; until then the
-            // EndTxn answer waits with them (doWork opens the gate).
+            // EndTxn answer waits for that record too (doWork opens the gate and answers OK).
             if (!gateOpen_(g)) {
                 prepareGates_.push_back(std::move(g));
                 return 0;
             }
-            if (dispatchMarkers_(g.txnId, g.producerId, g.producerEpoch, g.coordinatorEpoch,
-                                 g.commit, g.parts, msg.sessionId, msg.correlationId)) {
-                return 0;   // response sent by completeAwaiting_ when the last marker lands
-            }
+            dispatchMarkers_(g.txnId, g.producerId, g.producerEpoch, g.coordinatorEpoch, g.commit, g.parts);
         }
     }
 
@@ -1059,10 +1044,9 @@ int TransactionCoordinationService::concurrentIfPreparing_(int err) const
     return err;
 }
 
-bool TransactionCoordinationService::dispatchMarkers_(
+void TransactionCoordinationService::dispatchMarkers_(
     const tx::TransactionalId& txnId, int64_t producerId, int16_t producerEpoch,
-    int32_t coordinatorEpoch, bool commit, const std::vector<tx::TopicPartition>& parts,
-    int64_t respSessionId, int64_t respCorrelationId)
+    int32_t coordinatorEpoch, bool commit, const std::vector<tx::TopicPartition>& parts)
 {
     AwaitingMarkers& a = awaiting_[producerId];
     a.txnId = txnId;
@@ -1104,25 +1088,18 @@ bool TransactionCoordinationService::dispatchMarkers_(
             ++a.outstanding;
         }
     }
-    if (respSessionId != 0 || respCorrelationId != 0) {
-        a.respPending   = true;
-        a.sessionId     = respSessionId;
-        a.correlationId = respCorrelationId;
-    }
-    if (a.outstanding == 0 && completeAwaiting_(producerId, /*respond=*/false)) {
-        return false;                                  // completed synchronously
-    }
-    return true;   // markers outstanding, or the completion deferred on a refused offset apply: answered later
+    if (a.outstanding == 0) (void)completeAwaiting_(producerId);   // nothing in flight: completes now (or defers on
+                                                                    // a refused offset apply, retried from doWork)
 }
 
 void TransactionCoordinationService::resolveMarker_(int64_t producerId)
 {
     auto it = awaiting_.find(producerId);
     if (it == awaiting_.end() || it->second.outstanding <= 0) return;
-    if (--it->second.outstanding == 0) completeAwaiting_(producerId, /*respond=*/true);
+    if (--it->second.outstanding == 0) (void)completeAwaiting_(producerId);
 }
 
-bool TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool respond)
+bool TransactionCoordinationService::completeAwaiting_(int64_t producerId)
 {
     auto it = awaiting_.find(producerId);
     if (it == awaiting_.end()) return true;
@@ -1157,7 +1134,8 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
     }
     if (r.errorCode == tx::CompleteTransactionResult::kOffsetsPending) {
         // The group coordinator refused a committed offset (not loaded after a failover / gated): the txn STAYS
-        // PrepareCommit (nothing persisted, EndTxn not answered); retried from doWork with backoff.
+        // PrepareCommit (nothing persisted, the next txn refused ConcurrentTransactions); retried from doWork with
+        // backoff.
         cur.offsetRefusal = refusalThisPass_;   // #359
         if (cur.offsetRefusedSinceNs < 0) {
             cur.offsetRefusedSinceNs = lastNowNs_;
@@ -1184,7 +1162,7 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
     if (a.offsetRefusedSinceNs >= 0) --stuckOffsetTxns_;   // #359
     ++transactionsCompleted_;
     // F15 m4: persist the resting Complete* (offsets were applied first, inside
-    // completeTransaction).  It need not commit before the EndTxn OK: if it is
+    // completeTransaction).  It need not commit before the next txn starts: if it is
     // lost, the next coordinator loads Prepare*, re-drives the (idempotent)
     // markers and offsets, and completes again.
     // #438: the transaction's (group, tp) holds are released only once this record IS committed - until then a
@@ -1205,15 +1183,6 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
         }
         completeHolds_(a.txnId, record, floor);
     }
-    if (respond && a.respPending && gateway_) {
-        pc::EndTxnResponse resp;
-        resp.sessionId     = a.sessionId;
-        resp.correlationId = a.correlationId;
-        resp.errorCode     = txnErrorToProtocol(r.errorCode);
-        std::array<uint8_t, pc::EndTxnResponse::ENCODED_SIZE> buf{};
-        const std::size_t n = resp.encode(buf.data());
-        (void)gateway_->sendControlFrame(a.sessionId, buf.data(), n);
-    }
     return true;
 }
 
@@ -1225,7 +1194,7 @@ int TransactionCoordinationService::retryDeferredCompletions_(int64_t nowNs)
     dueScratch_.clear();
     for (const auto& [pid, a] : awaiting_)
         if (a.offsetsPending && a.offsetDueNs <= nowNs) dueScratch_.push_back(pid);
-    for (const int64_t pid : dueScratch_) (void)completeAwaiting_(pid, /*respond=*/true);
+    for (const int64_t pid : dueScratch_) (void)completeAwaiting_(pid);
     return static_cast<int>(dueScratch_.size());
 }
 
