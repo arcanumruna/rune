@@ -1422,3 +1422,35 @@ TEST(HubCommandClient, SubscriptionScopedErrorFailsThatSubscriptionRegression) {
     ASSERT_TRUE(r.drive([&] { return p.ready(); }));
     EXPECT_TRUE(p.ok()) << "the session survives a subscription-scoped error";
 }
+
+// #355: the void commit() never drops a refused submit silently.  Its submit is
+// the HubCommand path (never an OpResult): a full ring is waited out where that
+// is safe and THROWS where it is not, so a dropped commit always reaches the
+// caller.  Pinned here: off the Invoker owner thread a full ring throws (the
+// thread may not pump the duty cycle); on the owner it is pumped and accepted;
+// once closed, commit() is the documented no-op (nothing left to commit).
+// RED by mutation: catch and swallow the trampoline's refusal in commit().
+TEST(HubCommandClient, VoidCommitRefusedOnAFullRingThrowsNeverDropsRegression) {
+    rc::ClientConfig c = hubCfg(4098, 4099, rc::RunnerMode::Invoker);
+    rc::Client client(c);
+    auto gc = client.subscribeGroup("g", {"t"});
+
+    client.testFillCommandRing();
+    bool offOwnerThrew = false;
+    std::thread other([&] {
+        try {
+            gc.commit();
+        } catch (const std::logic_error&) {
+            offOwnerThrew = true;
+        }
+    });
+    other.join();
+    EXPECT_TRUE(offOwnerThrew) << "a commit() refused off the owner thread must throw, never return silently";
+
+    // The owner pumps the full ring and the commit is accepted.
+    EXPECT_NO_THROW(gc.commit());
+    EXPECT_TRUE(gc.active());
+
+    gc.close();
+    EXPECT_NO_THROW(gc.commit()) << "closed: nothing to commit (documented no-op)";
+}

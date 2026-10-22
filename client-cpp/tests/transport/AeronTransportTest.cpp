@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <malloc.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -276,4 +277,36 @@ TEST(AeronTransport, InvalidMtuFailsStartWithClearError) {
     } catch (const std::invalid_argument& e) {
         EXPECT_NE(std::string(e.what()).find("multiple of 32"), std::string::npos);
     }
+}
+
+// ---------------------------------------------------------------------------
+// #432: a start() that fails to resolve its ingress publication (an unusable
+// channel) while the egress subscription already resolved used to unwind the
+// ready Resolution<aeron::Subscription> AFTER aeron_.reset(): ~Subscription
+// locked the destroyed conductor's recursive_mutex and the process aborted
+// (std::system_error during unwinding).  glibc only notices the stale mutex
+// once the freed memory is scribbled, so the test turns on M_PERTURB and
+// repeats the failing start (whether the subscription resolved before the
+// rejection is a race per attempt).  RED by mutation: drop the Resolution
+// resets before aeron_.reset() in start() -> std::terminate.
+// ---------------------------------------------------------------------------
+TEST(AeronTransportRegression, StartWithAnUnusableIngressChannelThrowsNeverAbortsRegression) {
+    ::mallopt(M_PERTURB, 0xA5);
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        Config cfg = makeLoopbackConfig(1030 + attempt);
+        cfg.ingressChannel = "127.0.0.1:1";  // not an Aeron channel URI
+        Transport t{cfg};
+        try {
+            t.start();
+            ADD_FAILURE() << "start() must reject an unusable ingress channel";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("ingressChannel=127.0.0.1:1"), std::string::npos) << e.what();
+        }
+        EXPECT_NO_THROW(t.stop());
+    }
+    ::mallopt(M_PERTURB, 0);
+    // The same process can still start a healthy transport afterwards.
+    Transport ok{makeLoopbackConfig(1040)};
+    EXPECT_NO_THROW(ok.start());
+    ok.stop();
 }
