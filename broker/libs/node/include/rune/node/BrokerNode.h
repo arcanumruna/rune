@@ -828,9 +828,9 @@ public:
     [[nodiscard]] SecurityLiveEffects securityLiveEffects() { return SecurityLiveEffects{securitySink_()}; }
     /// Issues #15 / #111 - ADMIN thread only (deps.securityServing): kA2cSecurityServing on the effect FIFO (never
     /// dropped: the backlog keeps it in order behind the applied events).
-    void postSecurityServing(bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader) {
+    void postSecurityServing(bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader, int64_t knownEnd) {
         postCatalog_(kA2cSecurityServing, kSecurityServingWireLen,
-                     [&](uint8_t* p) { writeSecurityServing(p, caughtUp, leaderHw, epoch, asLeader); });
+                     [&](uint8_t* p) { writeSecurityServing(p, caughtUp, leaderHw, epoch, asLeader, knownEnd); });
     }
     [[nodiscard]] SecurityBootEffects securityBootEffects() const { return SecurityBootEffects{}; }
     [[nodiscard]] SecurityEffects securitySinkForBootStash() { return securitySink_(); }
@@ -1536,6 +1536,9 @@ public:
     /// stashed unapplied - the SecurityView, and with it the D24 answer-gate release, stays where it was; on release
     /// they are applied in order.  Proves no OK leaves before THIS broker enforces the event.
     void holdSecurityMirrorForTest(bool on);
+    /// Test-only (#203), CONTROL thread: hand `frame` to the kA2cSecurityApplied (or, for kA2cSecurityHalted, the halt)
+    /// handler as if it came off the admin-to-control ring, past any mirror hold (held frames stay held).
+    void injectSecurityFrameOnControlForTest(uint16_t tid, std::vector<uint8_t> frame);
     // ── Authentication Task 15 test hooks (inter-broker links) ───────────────────────────────────────────────
     /// What the CONTROL thread's PeerLinkAgent / distribution holds (read ON the control thread).
     struct PeerLinkSnap { bool present = false; int64_t established = 0; uint64_t refusals = 0;
@@ -2161,6 +2164,7 @@ private:
     static bool onAdminLogAlterIsrResponseThunk_(void* self, const rune::replication::AlterIsrResponseMsg& r) noexcept;
     void onSecurityApplied_(const uint8_t* p, std::size_t n);
     void failSecurityClosed_(int64_t offset, const std::string& describe);   // Task 14 (D28)
+    void haltSecurityMirrorOnMalformed_(const char* what, std::size_t n);   // #203: an unparseable frame fails closed
     void onSecurityHalted_(const uint8_t* p, std::size_t n);
     // Issues #15 / #111 (decision M7): the SecurityServing state (control thread).  kA2cSecurityServing feeds the admin
     // thread's catch-up verdict; every control pass steps it with the consensus contact (the election CLOSED); a change

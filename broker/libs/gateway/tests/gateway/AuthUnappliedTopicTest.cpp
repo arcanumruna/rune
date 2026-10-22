@@ -292,6 +292,24 @@ TEST(AuthUnappliedTopicRegression, ATopicPlacedButNotAppliedHereIsRetriableNotUn
     }
 }
 
+// #511: a view sink id is placed (its source's placement) but never indexed as a topic, so it looked "placed but not
+// applied here" for good - an ungranted Produce / Subscribe got the retriable NotLeader forever and a hidden sink was
+// distinguishable from a missing id.  A sink the registry knows answers like a missing id: 45, never 2.
+TEST(AuthUnappliedTopicRegression, AnUngrantedViewSinkIdIsNotAuthorizedNeverNotLeaderRegression) {
+    Rig r;
+    rune::node::TopicSpec sink;
+    sink.name = "hidden_sink"; sink.partitionCount = 1; sink.viewSink = true;
+    ASSERT_EQ(r.registry->createTopicAt(kPlaced, sink), kPlaced);
+    ASSERT_TRUE(r.registry->isViewSink(kPlaced));
+    ASSERT_EQ(r.gw.objectIndex().at(kPlaced), nullptr) << "precondition: a sink is never in the object index as a topic";
+    for (const auto& [what, corr] : {std::pair<const char*, int64_t>{"Produce", r.produce(kPlaced)},
+                                     {"Subscribe", r.subscribe(kPlaced)}}) {
+        const auto code = r.codeOf(corr);
+        ASSERT_TRUE(code.has_value()) << what << ": answered, never silent";
+        EXPECT_EQ(*code, kNotAuthorized) << what << ": a hidden sink answers like a missing id (M14 / D22)";
+    }
+}
+
 TEST(AuthUnappliedTopicRegression, AnIdNeitherAppliedNorPlacedKeepsTheD22DenialRegression) {
     Rig r;
     for (const auto& [what, corr] : {std::pair<const char*, int64_t>{"Produce", r.produce(kMissing)},

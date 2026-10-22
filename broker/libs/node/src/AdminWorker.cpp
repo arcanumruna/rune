@@ -690,15 +690,22 @@ int AdminWorker::stepSecurityServing_(int64_t nowNs) {
     const bool caughtUp = securityCatchUp_.step(in);
     const int32_t vEpoch = caughtUp ? securityCatchUp_.verdictEpoch() : -1;
     const bool vLeader = caughtUp && securityCatchUp_.verdictAsLeader();
-    if (securityServingPosted_ == (caughtUp ? 1 : 0) && securityServingPostedEpoch_ == vEpoch &&
-        securityServingPostedLeader_ == vLeader) [[likely]] return 0;
+    // #205: the events this broker knows exist - its own log end (a follower appended them before the leader could
+    // commit them, acks=all) or the leader's HW, whichever is further.  Posted in the pass that appended them, so the
+    // control thread learns of an event before the fetch that acknowledges it can leave this broker.
+    const int64_t knownEnd = in.present ? std::max<int64_t>(securityReplica_->logEndOffset(), in.highWatermark) : -1;
+    const bool verdictSame = securityServingPosted_ == (caughtUp ? 1 : 0) && securityServingPostedEpoch_ == vEpoch &&
+                             securityServingPostedLeader_ == vLeader;
+    if (verdictSame && securityServingPostedKnownEnd_ == knownEnd) [[likely]] return 0;
     securityServingPosted_ = caughtUp ? 1 : 0;
     securityServingPostedEpoch_ = vEpoch;
     securityServingPostedLeader_ = vLeader;
+    securityServingPostedKnownEnd_ = knownEnd;
+    deps_.securityServing(caughtUp, in.highWatermark, vEpoch, vLeader, knownEnd);
+    if (verdictSame) return 1;   // only the known end moved: not worth a log line
     spdlog::info("AdminWorker: __security {} (role {}, epoch {}, applied {} / hw {})",
                  caughtUp ? "caught up - logins served" : "not caught up - logins answer AuthUnavailable",
                  in.leader ? "leader" : "follower", in.epoch, in.appliedNext, in.highWatermark);
-    deps_.securityServing(caughtUp, in.highWatermark, vEpoch, vLeader);
     return 1;
 }
 

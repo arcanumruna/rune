@@ -3287,9 +3287,9 @@ void BrokerNode::onSecurityApplied_(const uint8_t* p, std::size_t n) {
     }
     int64_t offset = -1;
     std::span<const uint8_t> bytes;
-    if (!decodeSecurityApplied(p, n, offset, bytes) || !securityView_) [[unlikely]] {
-        if (adminToControlRejects_++ % 1024 == 0)
-            spdlog::error("BrokerNode[{}]: malformed kA2cSecurityApplied (len={}) skipped", config_.nodeId, n);
+    if (!securityView_) [[unlikely]] return;   // no mirror (auth off): nothing to apply
+    if (!decodeSecurityApplied(p, n, offset, bytes)) [[unlikely]] {
+        haltSecurityMirrorOnMalformed_("kA2cSecurityApplied", n);
         return;
     }
     // The mirror applies the SAME event with the SAME library; a gap or an apply error halts it (fail closed -
@@ -3316,12 +3316,14 @@ void BrokerNode::onSecurityServing_(const uint8_t* p, std::size_t n) {
     bool caughtUp = false, asLeader = false;
     int64_t leaderHw = -1;
     int32_t epoch = -1;
-    if (!decodeSecurityServing(p, n, caughtUp, leaderHw, epoch, asLeader)) [[unlikely]] {
+    int64_t knownEnd = -1;
+    if (!decodeSecurityServing(p, n, caughtUp, leaderHw, epoch, asLeader, knownEnd)) [[unlikely]] {
         if (adminToControlRejects_++ % 1024 == 0)
             spdlog::error("BrokerNode[{}]: malformed kA2cSecurityServing (len={}) skipped", config_.nodeId, n);
         return;
     }
     if (securityServing_) securityServing_->onAdminCaughtUp(caughtUp, leaderHw, epoch, asLeader);
+    if (gateway_) gateway_->setSecurityKnownEnd(knownEnd);   // #205
 }
 
 // Issues #15 / #111: one control pass of SecurityServing.  The consensus contact is the election being CLOSED (a
@@ -3363,10 +3365,10 @@ int BrokerNode::stepSecurityServing_(int64_t nowNs) {
 }
 
 void BrokerNode::onSecurityHalted_(const uint8_t* p, std::size_t n) {
+    if (!securityView_) [[unlikely]] return;   // no mirror (auth off): nothing to halt
     SecurityHaltedMsg m;
-    if (!decodeSecurityHalted(p, n, m) || !securityView_) [[unlikely]] {
-        if (adminToControlRejects_++ % 1024 == 0)
-            spdlog::error("BrokerNode[{}]: malformed kA2cSecurityHalted (len={}) skipped", config_.nodeId, n);
+    if (!decodeSecurityHalted(p, n, m)) [[unlikely]] {
+        haltSecurityMirrorOnMalformed_("kA2cSecurityHalted", n);
         return;
     }
     rune::security::ApplyError err;
@@ -3379,6 +3381,21 @@ void BrokerNode::onSecurityHalted_(const uint8_t* p, std::size_t n) {
     securityHaltedValue_ = m.offset + 1;
     publishSecurityMetrics_();
     failSecurityClosed_(m.offset, m.detail);
+}
+
+// #203: an admin-to-control security frame this thread cannot parse may carry the latest event (a REVOKE, a DISABLE);
+// skipping it would leave the mirror stale - fail-open - and hold that event's DDL OK forever.  It halts the mirror at
+// the next offset it would have applied, exactly like an apply error: fail closed.
+void BrokerNode::haltSecurityMirrorOnMalformed_(const char* what, std::size_t n) {
+    ++adminToControlRejects_;
+    rune::security::ApplyError err;
+    err.offset = securityView_->appliedOffset() + 1;
+    err.code   = rune::security::ApplyError::Code::UnsupportedFormat;
+    err.detail = std::string("malformed ") + what + " frame (len=" + std::to_string(n) + ") from the admin thread";
+    if (!securityView_->halted()) securityView_->onHalted(err);
+    securityHaltedValue_ = err.offset + 1;
+    publishSecurityMetrics_();
+    failSecurityClosed_(err.offset, err.detail);
 }
 
 // Authentication Task 14 (D28): a halted `__security` apply FAILS CLOSED.  The held DDL OKs are answered Internal first
@@ -3669,6 +3686,16 @@ void BrokerNode::holdSecurityMirrorForTest(bool on) {
                 else onSecurityApplied_(f.data(), f.size());
             }
         }
+        return 0;
+    });
+}
+
+void BrokerNode::injectSecurityFrameOnControlForTest(uint16_t tid, std::vector<uint8_t> frame) {
+    onControlThreadForTest([this, tid, f = std::move(frame)]() {
+        const bool held = std::exchange(heldMirror_.on, false);   // straight to the handler, past the hold
+        if (tid == kA2cSecurityHalted) onSecurityHalted_(f.data(), f.size());
+        else onSecurityApplied_(f.data(), f.size());
+        heldMirror_.on = held;
         return 0;
     });
 }
@@ -4257,8 +4284,8 @@ void BrokerNode::buildAdminWorker() {
             adminWorkerAgent_->postErrorResponse(session, corr, code, message);
         };
         // Issues #15 / #111: the `__security` catch-up verdict -> the control thread's SecurityServing.
-        deps.securityServing = [this](bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader) {
-            if (adminWorkerAgent_) adminWorkerAgent_->postSecurityServing(caughtUp, leaderHw, epoch, asLeader);
+        deps.securityServing = [this](bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader, int64_t knownEnd) {
+            if (adminWorkerAgent_) adminWorkerAgent_->postSecurityServing(caughtUp, leaderHw, epoch, asLeader, knownEnd);
         };
         deps.securityMaxStalenessNs = config_.effectiveSecurityMaxStalenessMs() * 1'000'000LL;
         // Catalog history Task 12: the catalog read server's frames (admin thread)

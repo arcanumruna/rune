@@ -7,6 +7,7 @@
 #include "support/SecurityEventChain.h"
 
 #include <rune/node/CatalogCheckpoint.h>
+#include <rune/node/AdminChannels.h>
 #include <rune/node/SecurityPartition.h>
 
 #include <gtest/gtest.h>
@@ -319,6 +320,69 @@ TEST(SecurityAnswerGateRegression, TheBrokerHoldsTheOkUntilItsOwnViewAppliedTheE
     ASSERT_TRUE(again.has_value());
     EXPECT_EQ(again->errorCode, 0);
     EXPECT_EQ(again->objectId, ok->objectId);
+    n.stop();
+}
+
+// #203: a kA2cSecurityApplied frame the control thread cannot parse may carry the latest event (a REVOKE, a DISABLE).
+// It used to be counted and skipped: the mirror stayed stale (fail-open) and that event's held DDL OK waited forever.
+// Now it halts the mirror fail-closed: the held OK is answered Internal at once and the view reports halted.
+TEST(SecurityAnswerGateRegression, AMalformedAppliedFrameHaltsTheMirrorAndAnswersTheHeldOkRegression) {
+    TmpDir dir{"sec_gate_malformed"};
+    const Ports ports = Ports::discover(1);
+    BrokerNode n{makeConfig(1, dir.path, ports, 1, Mode::Shard)};
+    n.start();
+    ASSERT_TRUE(n.awaitLeader(10'000ms));
+    const auto ready = std::chrono::steady_clock::now() + 20s;
+    while (securityOf(n).role != rune::replication::Role::Leader && std::chrono::steady_clock::now() < ready)
+        std::this_thread::sleep_for(20ms);
+    TmpDir cdir{"sec_gate_malformed_client"};
+    ShardTestClient cl(cdir.path / "wire");
+    cl.keepSessionsAlive(true);
+    cl.setClientVersion(pc::kClientVersionAuth);
+    int64_t sid = -1;
+    for (const auto dl = std::chrono::steady_clock::now() + 30s; sid < 0 && std::chrono::steady_clock::now() < dl;) {
+        sid = cl.connect("aeron:udp?endpoint=127.0.0.1:" + std::to_string(ports.client[0]), kClientStream);
+        if (sid < 0) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_GT(sid, 0);
+    const std::string ch = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(ports.client[0]);
+    n.holdSecurityMirrorForTest(true);
+    const int64_t corr = cl.nextCorrelationId();
+    const auto f = createRoleFrame(sid, corr, "malformed_role", 78);
+    ASSERT_TRUE(cl.send(ch, kClientStream, f.data(), f.size()));
+    const auto deadline = std::chrono::steady_clock::now() + 20s;
+    auto adminApplied = [&] {
+        return n.onAdminThreadForTest([&n]() { return n.adminWorkerAgentForTest()->worker().securityApplier()->state().appliedOffset(); });
+    };
+    while (adminApplied() < 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(10ms);
+    ASSERT_EQ(adminApplied(), 0);
+    ASSERT_FALSE(n.securityViewForTest().halted);
+    // The event's frame stays held; a truncated one (shorter than its offset field) reaches the handler instead.
+    n.injectSecurityFrameOnControlForTest(static_cast<uint16_t>(kA2cSecurityApplied), std::vector<uint8_t>{1, 2, 3});
+    const auto v = n.securityViewForTest();
+    EXPECT_TRUE(v.halted) << "an unparseable security frame fails closed, never skipped";
+    EXPECT_EQ(v.appliedOffset, -1);
+    EXPECT_EQ(n.securityMetricsForTest().halted, 1) << "halted at the next offset the mirror would apply (0) + 1";
+    const auto ans = cl.awaitDdl(corr, std::chrono::steady_clock::now() + 20s);
+    ASSERT_TRUE(ans.has_value()) << "the held OK is answered, never held forever";
+    EXPECT_EQ(ans->errorCode, static_cast<uint16_t>(pc::ErrorCode::Internal)) << ans->detail;
+    n.holdSecurityMirrorForTest(false);   // the held event reaches a halted view: it stays halted
+    EXPECT_TRUE(n.securityViewForTest().halted);
+    n.stop();
+}
+
+// #203, the halt frame itself: a malformed kA2cSecurityHalted still halts the mirror (it was skipped, leaving the view
+// serving after the admin applier had already stopped).
+TEST(SecurityAnswerGateRegression, AMalformedHaltedFrameStillHaltsTheMirrorRegression) {
+    TmpDir dir{"sec_halt_malformed"};
+    const Ports ports = Ports::discover(1);
+    BrokerNode n{makeConfig(1, dir.path, ports, 1, Mode::Shard)};
+    n.start();
+    ASSERT_TRUE(n.awaitLeader(10'000ms));
+    ASSERT_FALSE(n.securityViewForTest().halted);
+    n.injectSecurityFrameOnControlForTest(static_cast<uint16_t>(kA2cSecurityHalted), std::vector<uint8_t>{9});
+    EXPECT_TRUE(n.securityViewForTest().halted);
+    EXPECT_GE(n.securityMetricsForTest().halted, 1);
     n.stop();
 }
 

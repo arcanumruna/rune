@@ -375,6 +375,35 @@ TEST(AuthClusterRegression, DevModeRefusesMultiNode) {
 
 // Task 22 seam: the __security leader appends a CREATE USER and is killed before answering; the client retries the SAME
 // request id on the new leader: OK, and exactly one CreateUser for it in every broker's log.
+// #205: CREATE USER is answered OK once the `__security` LEADER enforces it (D24).  A follower holds the event in its log
+// (acks=all) but its view may not have applied it yet: a login there used to fail with the terminal AuthenticationFailed
+// (44), and the client stops for good.  While a broker's view is behind events it holds, a failed proof is answered the
+// retriable AuthUnavailable (48); once applied, the login succeeds.
+TEST(AuthClusterRegression, AJustCreatedUserCanLogInThroughALaggingFollowerRegression) {
+    AuthTrio t("lagfollower");
+    t.start();
+    t.bootstrapAdmin();
+    const int32_t leader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(leader, 0);
+    const int follower = leader == 1 ? 2 : 1;
+    ASSERT_TRUE(t.awaitDigestsAgree(0, 30s));
+    t.node(follower).holdSecurityApplyForTest(true);   // it replicates, its view applies nothing
+    t.createUser(leader, "lagged");                    // answered OK: the leader enforces it
+    AuthWireClient& w = t.wire();
+    const int64_t sid = w.connect(t.channel(follower));
+    ASSERT_GT(sid, 0);
+    EXPECT_EQ(w.login(t.channel(follower), sid, "lagged", {AuthTrio::kPw, AuthTrio::kPw}).errorCode(), 48)
+        << "a view behind events this broker holds answers retriable, never the terminal 44";
+    t.node(follower).holdSecurityApplyForTest(false);
+    ASSERT_TRUE(AuthTrio::until(20s, [&] { try { (void)t.login(follower, "lagged"); return true; } catch (...) { return false; } }))
+        << "once applied, the same login succeeds on the follower";
+    // A wrong password against a caught-up view is still the terminal 44 (only the lag is retriable).
+    const int64_t sid2 = w.connect(t.channel(follower));
+    ASSERT_GT(sid2, 0);
+    EXPECT_EQ(w.login(t.channel(follower), sid2, "lagged", {"wrong-password-1", "wrong-password-1"}).errorCode(), 44)
+        << "a caught-up view's failed proof stays terminal";
+}
+
 TEST(AuthClusterRegression, SecurityDdlRetryAfterLeaderKillAppliesOnceRegression) {
     AuthTrio t("leaderkill");
     t.start();
