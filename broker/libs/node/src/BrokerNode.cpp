@@ -3403,11 +3403,12 @@ void BrokerNode::haltSecurityMirrorOnMalformed_(const char* what, std::size_t n)
 }
 
 // Authentication Task 14 (D28): a halted `__security` apply FAILS CLOSED.  The held DDL OKs are answered Internal first
-// (they would claim an enforcement this broker can no longer give), then every authenticated session is revoked; new
-// logins are refused by the halted view (AuthServerFinal 44) and security DDL answers Internal.
+// (they would claim an enforcement this broker can no longer give), then every authenticated session is ended with the
+// retriable AuthUnavailable (#206: this broker cannot vouch for its security state, so the client reconnects to another
+// broker); new logins are refused by the halted view (AuthServerFinal 48, likewise) and security DDL answers Internal.
 void BrokerNode::failSecurityClosed_(int64_t offset, const std::string& describe) {
     spdlog::critical("BrokerNode[{}]: SECURITY APPLY HALTED at offset {}: {}; this broker refuses logins until repaired "
-                     "(docs/SECURITY.md#halted) - authenticated sessions are revoked, security changes refused "
+                     "(docs/SECURITY.md#halted) - authenticated sessions are ended (AuthUnavailable), security changes refused "
                      "(move dataDir/__security aside and restart)",
                      config_.nodeId, offset, describe);
     if (!securityGate_.empty()) (void)pumpSecurityGate_();

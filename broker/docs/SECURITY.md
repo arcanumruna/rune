@@ -327,7 +327,7 @@ zero allocation); tables are owned by the thread that owns the session and updat
 | First login before the one-time password is changed | `PasswordChangeRequired`; fails exactly that request | 47 |
 | A client older than version 9 against an authenticated cluster | refused at the handshake (`Connect`), never downgraded | version gate |
 | A broker without a valid cluster key | refused at the peer connection, logged on both sides | counter 1 000 234 |
-| `__security` apply halted on this broker | logins `AuthenticationFailed`, sessions `SessionRevoked`, security DDL `Internal` | see `#halted` |
+| `__security` apply halted on this broker | logins `AuthUnavailable`, sessions end with a session-level `AuthUnavailable` (retriable: the client reconnects to another broker), security DDL `Internal` | 48, see `#halted` |
 | This broker's `__security` state is not current (catching up, stale) | logins, `__security` reads and security DDL `AuthUnavailable`; retriable, try another broker. Stale longer than R: a session-level `AuthUnavailable` ends the authenticated sessions | 48, see `#serving` |
 
 ### `#halted`: the `__security` apply halted (D28)
@@ -336,8 +336,9 @@ Each broker applies `__security` in offset order and checks every event's finger
 catalog. If a fingerprint differs or an event cannot be applied, that broker's apply **halts**, and
 because a security log that stops applying stops enforcing revocations, it **fails closed**:
 
-- it revokes every authenticated session (`SessionRevoked`, detail `security log halted on this broker`),
-- refuses new logins (`AuthenticationFailed`),
+- it ends every authenticated session with a session-level `AuthUnavailable` (detail `security log halted on this
+  broker - reconnect to another broker`); it is retriable, so the client reconnects to a healthy broker,
+- refuses new logins with `AuthUnavailable` (retriable, likewise),
 - answers security DDL `Internal`,
 - raises counter `rune-security-apply-halted` (1 000 226: 0 while applying, the halted offset plus 1 after a halt),
 - and logs a critical line `SecurityApplier: apply HALTED at offset N ...`.
@@ -366,7 +367,7 @@ Aeron counters of the broker's media driver (`dataDir/aeron` unless `RUNE_AERON_
 | `rune-logins-ok node=<id>` | 1 000 229 | successful logins |
 | `rune-logins-failed node=<id>` | 1 000 230 | failed logins |
 | `rune-logins-rate-limited node=<id>` | 1 000 231 | logins answered inside a throttle delay |
-| `rune-sessions-revoked node=<id>` | 1 000 232 | sessions ended by a drop, disable, `TERMINATE SESSIONS` or a security halt |
+| `rune-sessions-revoked node=<id>` | 1 000 232 | sessions ended by a drop, disable or `TERMINATE SESSIONS` |
 | `rune-peer-links-established node=<id>` | 1 000 233 | peers whose link is currently established |
 | `rune-peer-link-refusals node=<id>` | 1 000 234 | peer-link refusals logged by this broker, both directions |
 | `rune-peer-frame-drops node=<id>` | 1 000 235 | inter-broker frames dropped for want of a link or because they did not open |

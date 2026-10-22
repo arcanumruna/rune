@@ -763,3 +763,42 @@ TEST(ClientAuthUnavailableRegression, AStaleNoticeNeverEndsTheNewSessionAndRepea
         EXPECT_EQ(t.m->rejectCode(), 0);
     }
 }
+
+// Issue #206: a broker whose `__security` log halted answers the retriable AuthUnavailable (48) - to a login and, at
+// session level (corr 0), to a live session - and the client fails over to another broker: Disconnected (the caller's
+// connect retry) or Backoff (a reconnect-forever session that was Live), never the terminal Rejected.
+TEST(SessionMachineAuthRegression, AHaltedBrokerAnswerFailsOverInsteadOfRejectingRegression) {
+    constexpr int16_t kUnavailable = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
+    {   // a first login answered 48
+        Rig t; t.connectAuthRequired();
+        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, 3);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Disconnected);
+        EXPECT_EQ(t.m->rejectCode(), 0);
+        EXPECT_EQ(t.m->lastConnectError(), kUnavailable);
+    }
+    {   // a re-login of a reconnect-forever session answered 48: Backoff, then a fresh attempt
+        Rig t("ws1", "correct horse battery", /*forever=*/true, /*allowUnauthenticated=*/true);
+        t.m->connect(0);
+        t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), 1);
+        t.m->forceReconnect(10);
+        auto r = authRequired(t.io.lastCorrelation());
+        t.m->onConnectResponse(r.code, -1, 43, t.io.lastCorrelation(), 11, 0, {}, r.authMode, r.authState);
+        ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating);
+        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, 20);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Backoff);
+        EXPECT_EQ(t.m->rejectCode(), 0);
+        t.m->tick(t.m->nextAttemptNs());
+        EXPECT_EQ(t.m->state(), sm::SessionState::Connecting) << "a fresh attempt (the seed failover picks the broker)";
+    }
+    for (const bool forever : {true, false}) {   // a Connected session ended by the halt: ErrorResponse{48, corr 0}
+        Rig t("ws1", "correct horse battery", forever, /*allowUnauthenticated=*/true);
+        t.m->connect(0);
+        t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), 1);
+        ASSERT_EQ(t.m->state(), sm::SessionState::Connected);
+        t.m->onErrorResponse(kUnavailable, "security log halted on this broker - reconnect to another broker",
+                             /*corr=*/0, 50, /*noticeSessionId=*/42);
+        EXPECT_EQ(t.m->state(), forever ? sm::SessionState::Backoff : sm::SessionState::Disconnected) << forever;
+        EXPECT_EQ(t.m->rejectCode(), 0) << forever;
+        EXPECT_EQ(t.m->sessionId(), 0) << forever << ": reconnect fresh, never resume the ended session";
+    }
+}

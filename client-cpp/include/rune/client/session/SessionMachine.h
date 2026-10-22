@@ -913,7 +913,7 @@ public:
                 onAuthUnavailable_(nowNs);
             } else if (ec == rpc::ErrorCode::SessionRevoked && incomingCorrelationId == 0) {
                 // Authentication (D26): the session-level ErrorResponse{SessionRevoked, corr 0} — the user was
-                // dropped / disabled (or the broker's security log halted).  The broker closes the session:
+                // dropped / disabled.  The broker closes the session:
                 // terminal, never resumed or reconnected (a reconnect is AuthenticationFailed anyway).
                 rejectCode_       = static_cast<int16_t>(static_cast<uint16_t>(ec));
                 lastConnectError_ = rejectCode_;

@@ -107,7 +107,7 @@ Aeron's counter tools or `rune_role`. Labels end with `node=<id>`.
 | `rune-security-applied-offset` | 1 000 227 | Last applied `__security` offset. |
 | `rune-auth-mode` | 1 000 228 | `0` authentication enabled, `1` dev mode. Alert on `1` in production. |
 | `rune-logins-ok` / `-failed` / `-rate-limited` | 1 000 229 to 231 | Login tallies. Alert on rising failures. |
-| `rune-sessions-revoked` | 1 000 232 | Sessions ended by drop, disable, `TERMINATE SESSIONS` or a security halt. |
+| `rune-sessions-revoked` | 1 000 232 | Sessions ended by drop, disable or `TERMINATE SESSIONS`. |
 | `rune-peer-links-established` | 1 000 233 | Peers whose link is currently established. |
 | `rune-peer-link-refusals` | 1 000 234 | Peer-link refusals logged by this broker. Alert on a rising count. |
 | `rune-peer-frame-drops` | 1 000 235 | Inter-broker frames dropped for want of a link or because they did not open. |
@@ -170,7 +170,8 @@ partition logs under `topics/`, `__catalog/` and `__security/` (the replicated e
   --from prod.rcat --into fresh:40200` rebuilds it on another cluster and `rune catalog diff` proves the two equal
   (exit 0). `docker/catalog-e2e.sh` runs this end to end. Do not delete `dataDir/__catalog` to repair a broker: restore it.
 - **Security log.** There is no export command; the `__security` history is read with `SHOW SECURITY HISTORY`. A broker
-  whose apply halted fails **closed** (it revokes sessions and refuses logins); see the runbook in SECURITY.md.
+  whose apply halted fails **closed**: it ends sessions and refuses logins with the retriable `AuthUnavailable`, so
+  clients reconnect to another broker; see the runbook in SECURITY.md.
 - **Losing most disks.** If a majority of brokers lost their disks the cluster stays unavailable; set
   `RUNE_STORAGE_RECOVERY_VOTE=1` on the replaced nodes to elect the one intact broker. This can lose what only the lost disks
   held, and is logged at critical level.
