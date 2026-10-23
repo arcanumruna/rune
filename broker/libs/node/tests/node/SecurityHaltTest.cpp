@@ -5,6 +5,8 @@
 #include <rune/node/AdminChannels.h>
 #include <rune/node/AdminWorker.h>
 
+#include <functional>
+
 using namespace rune::node;
 using namespace rune::node::test;
 using namespace rune::node::test::grants;
@@ -162,7 +164,7 @@ TEST(SecurityAppliedRegression, MalformedOrSkippedAppliedFramesNeverAdvanceTheEn
         const auto v = node.securityViewForTest();
         EXPECT_TRUE(v.halted) << "the control thread's view kept serving after a frame it cannot apply in order";
         EXPECT_EQ(v.appliedOffset, before) << "the view's applied offset moved";
-        EXPECT_LE(node.securityGateForTest().gatewayEnforced, enforcedBefore) << "the gateway's enforced offset moved";
+        EXPECT_EQ(node.securityGateForTest().gatewayEnforced, enforcedBefore) << "the gateway's enforced offset moved";
         EXPECT_EQ(sessionLevelCode(r, ws), static_cast<int>(pc::ErrorCode::AuthUnavailable))
             << "a live session was not ended (fail closed, retriably)";
         EXPECT_TRUE(r.awaitSessionGone(ws));
@@ -171,5 +173,58 @@ TEST(SecurityAppliedRegression, MalformedOrSkippedAppliedFramesNeverAdvanceTheEn
             EXPECT_TRUE(node.securityViewForTest().halted) << "a later in-order frame un-halted the view";
             EXPECT_EQ(node.securityViewForTest().appliedOffset, before);
         }
+    }
+}
+
+// PR #604 adversarial review (input bounds, the in-order frame): the cases above reach the halt through the frame's offset
+// (a decode failure, a gap, a repeat).  Here the offset is exactly the NEXT one - the gap check passes - and the event
+// bytes are the real next event's, truncated at a sweep of byte offsets (1, 2, 4, 8, half, all but two, all but one).
+// The view can only reject the event itself: it must not apply a prefix of it.  Each: the view halts at the same applied
+// offset, the gateway's enforced offset does not move, and the live session is ended retriably (48).
+// RED: answer a SecurityView::onApplied error in BrokerNode::onSecurityApplied_ without failSecurityClosed_ (the live
+// session is never ended: the broker keeps serving a view that skipped an event).
+TEST(SecurityAppliedAdversarialRegression, AnInOrderFrameTruncatedInsideItsEventFailsClosedAdversarialRegression) {
+    // The truncation points, resolved against the next event's length once it is known.
+    const std::vector<std::pair<const char*, std::function<std::size_t(std::size_t)>>> cuts = {
+        {"1 byte", [](std::size_t) { return std::size_t{1}; }},
+        {"2 bytes", [](std::size_t) { return std::size_t{2}; }},
+        {"4 bytes", [](std::size_t) { return std::size_t{4}; }},
+        {"8 bytes", [](std::size_t) { return std::size_t{8}; }},
+        {"half", [](std::size_t n) { return n / 2; }},
+        {"all but two", [](std::size_t n) { return n - 2; }},
+        {"all but one", [](std::size_t n) { return n - 1; }},
+    };
+    int n = 0;
+    for (const auto& [name, cut] : cuts) {
+        SCOPED_TRACE(name);
+        AuthRig r("secappliedcut" + std::to_string(n++));
+        BrokerNode& node = r.broker().node();
+        const int64_t ws = r.newUser({exact(SO::Write, ST::Topic, "orders")});
+        ASSERT_EQ(r.produce(ws, r.orders, /*untilOk=*/true), 0);
+        const int64_t before = node.securityAppliedOffsetOnControlForTest();
+        ASSERT_GE(before, 1);
+        const int64_t enforcedBefore = node.securityGateForTest().gatewayEnforced;
+        node.holdSecurityMirrorForTest(true);
+        pc::SecurityDdl m;
+        m.sessionId = r.broker().adminSession(); m.kind = pc::SecurityOpKind::CreateRole; m.name = "next-event";
+        (void)r.broker().admin().securityDdl(r.ch(), m, "CREATE ROLE next-event;", 1s);
+        std::vector<uint8_t> next;
+        ASSERT_TRUE(r.c().pollFor(10s, [&] { next = securityEventBytes(node, before + 1); return !next.empty(); }))
+            << "the next event was not appended";
+        ASSERT_GE(next.size(), 16u) << "an event shorter than the sweep";
+        ASSERT_EQ(node.securityAppliedOffsetOnControlForTest(), before) << "precondition: the mirror frame is held";
+        next.resize(cut(next.size()));
+        node.injectSecurityFrameOnControlForTest(static_cast<uint16_t>(kA2cSecurityApplied), appliedFrame(before + 1, next));
+
+        const auto v = node.securityViewForTest();
+        EXPECT_TRUE(v.halted) << "a truncated in-order event was not refused (" << next.size() << " bytes)";
+        EXPECT_EQ(v.appliedOffset, before) << "the view applied a truncated event";
+        EXPECT_EQ(node.securityGateForTest().gatewayEnforced, enforcedBefore) << "the gateway's enforced offset moved";
+        EXPECT_EQ(sessionLevelCode(r, ws), static_cast<int>(pc::ErrorCode::AuthUnavailable))
+            << "a live session was not ended (fail closed, retriably)";
+        EXPECT_TRUE(r.awaitSessionGone(ws));
+        node.holdSecurityMirrorForTest(false);   // the held, intact frame now meets the halted view
+        EXPECT_TRUE(node.securityViewForTest().halted) << "the intact frame un-halted the view";
+        EXPECT_EQ(node.securityViewForTest().appliedOffset, before);
     }
 }

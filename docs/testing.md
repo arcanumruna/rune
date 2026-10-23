@@ -99,6 +99,8 @@ RUNE_LATENCY_GATES=1 ctest --test-dir build -R KeyRotationAcrossARollingRestart 
 A few correctness tests also measure a latency (for example `AuthClusterRegression.KeyRotationAcrossARollingRestart…`:
 the time from a broker's restart to the first acknowledged record). They always print it, but assert the bound only
 with `RUNE_LATENCY_GATES=1`, on an idle host; otherwise they print that the bound was not enforced.
+Timing assertions that are the whole point of a test (the login median gate and the first-leg timing parity in
+`AuthGatesRegression`) are instead labelled `latency` and `RUN_SERIAL`, so they run in the latency stage only.
 
 The produce-to-ack latency itself is measured by the benchmarks ([benchmarks.md](benchmarks.md)); the AEAD benchmark carries
 its own gate (`RUNE_CRYPTO_BENCH_BUDGET_NS`).

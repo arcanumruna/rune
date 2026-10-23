@@ -639,8 +639,6 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
     const std::string k2 = t.makeKeyFile("k2.key", 'Q');
     const std::array<std::string, 3> channels{t.channel(1), t.channel(2), t.channel(3)};
     std::promise<int64_t> target;
-    std::jthread producer;
-    std::jthread consumer;
     std::promise<ProducerResult> pOut;
     std::promise<ConsumerResult> cOut;
     auto pFut = pOut.get_future();
@@ -648,6 +646,10 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
     // everything the threads need is copied BEFORE they start: they never touch the trio while it restarts nodes
     const std::filesystem::path prodDir = t.cluster().clientsDir->path / "rot_prod", consDir = t.cluster().clientsDir->path / "rot_cons";
     LastAck lastAck{0};
+    // PR #604 review: the threads are declared AFTER everything they reference (lastAck, pOut, cOut, target) - an
+    // early ASSERT return destroys locals in reverse order, so each jthread is stopped and joined before them.
+    std::jthread producer;
+    std::jthread consumer;
     producer = std::jthread([&pOut, &lastAck, ch = channels, prodDir, topic](std::stop_token st) {
         try { pOut.set_value(runProducer(st, ch, prodDir, topic, &lastAck)); }
         catch (...) { pOut.set_exception(std::current_exception()); }

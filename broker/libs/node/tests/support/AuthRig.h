@@ -388,6 +388,16 @@ public:
         e.topicId = topicId; e.partition = 0; e.offset = 1; e.metadata = {};
         return rawCode(sendRaw(m, 512, m.correlationId, std::span<const pc::TxnOffsetCommitEntry>(&e, 1)));
     }
+    /// A TxnOffsetCommit carrying the KIP-447 member block (`member` at `gen`): one entry (topicId, 0) at `offset`.
+    int txnOffsetCommitAsMember(int64_t sid, const std::string& txnId, const std::string& group, int32_t topicId,
+                                int64_t pid, int16_t epoch, int32_t gen, const std::string& member, int64_t offset) {
+        pc::TxnOffsetCommit m;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = pid; m.producerEpoch = epoch;
+        m.transactionalId = bytes(txnId); m.groupId = bytes(group); m.generationId = gen; m.memberId = bytes(member);
+        pc::TxnOffsetCommitEntry e;
+        e.topicId = topicId; e.partition = 0; e.offset = offset; e.metadata = {};
+        return rawCode(sendRaw(m, 512, m.correlationId, std::span<const pc::TxnOffsetCommitEntry>(&e, 1)));
+    }
     int endTxn(int64_t sid, const std::string& txnId, int64_t pid = 1, int16_t epoch = 0, bool commit = true) {
         pc::EndTxn m;
         m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.producerId = pid; m.producerEpoch = epoch;

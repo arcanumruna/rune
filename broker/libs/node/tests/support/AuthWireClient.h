@@ -191,6 +191,9 @@ public:
         if (a->responseTemplate == static_cast<uint16_t>(pc::TemplateId::DdlResponse))
             if (auto d = cl_.awaitDdl(m.correlationId, deadline)) return *d;
         // Any other response type (PasswordChangeRequired answers in the DdlResponse; an ErrorResponse carries a message).
+        // An ErrorResponse never means success: one that carries code 0 (malformed) must not read as a bootstrap OK.
+        if (a->responseTemplate != static_cast<uint16_t>(pc::TemplateId::DdlResponse) && a->code == 0)
+            return {0xFFFE, 0, 0, -1, "an ErrorResponse with code 0: " + a->message};
         return {static_cast<uint16_t>(a->code), 0, 0, -1, a->message};
     }
     DdlAnswer createRole(const std::string& channel, int64_t sid, const std::string& name) {

@@ -200,3 +200,34 @@ TEST(AuthOwnershipRegression, ForeignIdsAreRefusedAndLeaveTheOwnerUntouchedRegre
         row.run(r);
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// PR #604 adversarial review (ownership, sibling entry point): the KIP-447 member block of a TxnOffsetCommit is the one
+// member-scoped request the table above does not name.  B, fully granted (its OWN transactional id, READ on A's group and
+// topic), opens its own transaction and sends a TxnOffsetCommit carrying A's member id at A's generation: answered
+// exactly as a member that does not exist (UnknownMember - no existence oracle), and once B COMMITS its transaction A's
+// committed position is unmoved.  RED: drop the ownsMember_ term of GroupCoordinationService::checkTxnOffsetMember (B's
+// offset is accepted and committed over A's).
+TEST(AuthOwnershipAdversarialRegression, ATxnOffsetCommitNamingAnotherSessionsMemberIsRefusedAdversarialRegression) {
+    AuthRig r("ownadvtxo");
+    const std::vector<AuthGrant> g{exact(SO::Read, ST::Group, "own-g"), exact(SO::Read, ST::Topic, "orders"),
+                                   exact(SO::Write, ST::Topic, "orders"), prefix(SO::Write, ST::TransactionalId, "tx-")};
+    const int64_t a = r.newUser(g);
+    const int64_t b = r.newUser(g);
+    const auto [member, gen] = r.joinStable(a, "own-g", {r.orders});
+    ASSERT_FALSE(member.empty());
+    ASSERT_EQ(r.commitAs(a, "own-g", member, gen, r.orders, 100), kOk);
+    const auto pb = r.initProducer(b, "tx-b");
+    ASSERT_EQ(pb.code, kOk);
+    ASSERT_EQ(r.addOffsets(b, "tx-b", "own-g", pb.pid, pb.epoch), kOk) << "B's own transaction takes the group";
+    auto txnCommit = [&](const std::string& who) {
+        return r.txnOffsetCommitAsMember(b, "tx-b", "own-g", r.orders, pb.pid, pb.epoch, gen, who, 500);
+    };
+    const std::string nobody = "member-nobody-holds";
+    const int absent = txnCommit(nobody);
+    EXPECT_EQ(absent, kUnknownMember) << "the control: a member that does not exist";
+    EXPECT_EQ(txnCommit(member), absent) << "B's TxnOffsetCommit naming A's member at A's generation";
+    EXPECT_EQ(r.endTxn(b, "tx-b", pb.pid, pb.epoch, /*commit=*/true), kOk) << "B commits its own transaction";
+    EXPECT_EQ(r.committedOffset(a, "own-g", r.orders), 100) << "B's transactional commit moved A's group position";
+    EXPECT_EQ(r.heartbeatAt(a, "own-g", member, gen), kOk) << "A's member left its group or its generation moved";
+}
