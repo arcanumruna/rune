@@ -164,7 +164,7 @@ This part owns the overview's §15 cells listed for **03**:
 - Every `View`-flag bullet.
 - "Before Part G, a transactional and an atomic batch on a constrained source are refused while unconstrained ones work."
 
-Constrained sources do not exist before Part 04, so that row is pinned as a rule (matrix B) and its positive half on a real unconstrained source (A, B, D). The atomic-batch half cannot be sent before Part 11 defines the atomic header bit (R05b): `WriteFacts::atomicBatch` stays false until then, so its broker cell is Part 11's. The cells live in four matrices.
+Constrained sources do not exist before Part 04, so that row is pinned as a rule (matrix B) and its positive half on a real unconstrained source (A, B, D). The atomic-batch half cannot be sent before Part 11 defines the atomic header bit (R05b): `WriteFacts::atomicBatch` stays false until then, so it stays a rule cell (row 15); Part 11 ships the bit and lifts the rule together, so no broker cell exists. The cells live in four matrices.
 
 ### A. The `View` ack matrix (`CheckedWritesViewAckMatrix`, Task 9; 2 × 4 × 10 = 80 cells)
 

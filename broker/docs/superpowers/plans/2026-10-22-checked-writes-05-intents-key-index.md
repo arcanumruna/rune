@@ -266,7 +266,7 @@ Built on 04's `CheckedWritesRig` with `createKeyIndex()` (topic `{id uint64 key,
 | 24 | `KeyRejectedEarlier` | `insert k tag 9`, rejected 51 by `TestReject` (so `k` is absent) |
 | 25 | `KeyBeforeIndex` | `createKeyIndex(…, enabled = false)`, an upsert of `k`, then `enableKeyIndex()`: the key predates the change record (the adoption path) |
 
-**Timings:** every value of the shared `Timing` enum: the 14 §15 values, 03's six appended values, and 04's `RetryAfterWindow` (21 in all). Their rig meaning is 04's and 03's. In this part:
+**Timings:** the 21 `Timing` values through `RetryAfterWindow` (the 14 §15 values, 03's six appended values, and 04's `RetryAfterWindow`), listed explicitly in `cellsFor(Part::P05)`. Values appended later (Part 11) are not this part's. Their rig meaning is 04's and 03's. In this part:
 - `Racing`: two producers send the op on `k` in the same pass.
 - `CreateOnNonEmpty`: 500 upserts of other keys, then `enableKeyIndex()`, then the op while the key index replays.
 - `TxnCommitBehind` / `TxnAbortBehind`: a third producer's open transaction upserts `k` before the op and later commits or aborts.

@@ -842,7 +842,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
         void installPlainProjection(int32_t viewTopicId, bool persisted = true);   // {id -> v, tag}
         void installCountByTag(int32_t viewTopicId, bool persisted = true);       // key tag, n = count(*)
         int64_t appendBatch(std::span<const Rec>, uint8_t wireAcks, int64_t pid = -1, int32_t seq = -1, bool txn = false);   // -> corr
-        void commitTxn(int64_t pid); void abortTxn(int64_t pid);
+        void commitTxn(int64_t pid); void abortTxn(int64_t pid);  // Part 11 changes commitTxn to return TxnEnd and vote first
         void followerFetch();                                 // the follower acknowledges LEO: HW := LEO
         [[nodiscard]] bool driveUntilJudged(int64_t offset, int cap = 2000);
         void demotePromote();                                 // leadership + 2, memory kept
@@ -1032,7 +1032,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
   - every listed offset < the pass boundary;
   - a later marker below the scan end has a higher `finalThrough`;
   - `m < markerRemovalBound`.
-  It is then stamped and dropped through `markerAction`'s horizon path. Type 18 is always kept. Type 16 is kept iff `keepsReservation` (06). Type 19 is always kept (11).
+  It is then stamped and dropped through `markerAction`'s horizon path. Type 18 is always kept. Type 16 is kept iff `keepsReservation` (06). Type 19 is always kept until Part 11 replaces the rule with `offset >= txnJudgeBound` (11 P11-8 (c)).
 
 - [ ] **Step 1: Write the failing tests.**
   - `CheckedWritesVerdictCleanerTest.cpp` (storage, on a real `Log` with small segments built through `appendNoSync` of data batches and `appendControlBatch`-equivalent control batches):

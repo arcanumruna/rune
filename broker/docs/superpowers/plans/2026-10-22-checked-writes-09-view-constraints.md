@@ -241,7 +241,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 - **A move out of an over-limit group is rejected** (P9-4, the literal owner-confirmed rule). A reasonable reader might expect it to pass, since it shrinks the group.
 - **NULL in a check is Unknown and passes** (P9-4). The spec is silent.
 - **R04a needs a durable plan.** The catalog forgets a dropped or replaced plan at once, so a restarted replica would wait forever. This part adds control record type 20 (`kVerdictPlan`, P9-8), always kept by the cleaner. GC of type-20 records is a follow-up issue.
-- **§15 "before Part G, an atomic batch on a constrained source is refused".** No atomic-batch header bit exists before Part 11 defines it (R05b), so this part tests only the transactional half (`ConstrainedSourceRefusesTransactions`). The atomic half is a Part 11 cell.
+- **§15 "before Part G, an atomic batch on a constrained source is refused".** No atomic-batch header bit exists before Part 11 defines it (R05b), so this part tests only the transactional half (`ConstrainedSourceRefusesTransactions`). The atomic half is a rule cell only (03's pinned row 15); Part 11 ships the bit and the lift together (11 matrix B).
 - **`Client::constraintName` may block** for one catalog refresh (≤ 5 s) on a miss (P9-12). C15 gives it no timeout parameter, so a second overload takes one.
 - **`VerdictSourceStats::perConstraint`** (04) holds 256 entries per source. A source with more distinct constraint ids keeps the first 256 and counts the rest only in `rejectionsConstraint`. That is 04's bound, noted here, unchanged.
 
@@ -346,7 +346,7 @@ Applicable op × entity pairs: `CCreate` 7, `CUpdateNonKey` 5, `CRename` 11, `CM
 | `create or replace` while writes are running | `CheckedWritesConstraintWorker.ReplaceSwapsAtSWithoutAGap` (5), matrix `ReplaceDuringWrites` |
 | drop while writes are running | `CheckedWritesConstraintWorker.DropStopsJudgingAboveD` (5), `CheckedWritesConstraintChangeRegression.FailoverDuringDropFinishesTheDropRegression` (6), matrix `DropDuringWrites` |
 | two writers racing for the last slot or the same name | matrix `Racing`; `TheWholeScenarioThreeNodesRegression` step 6 (10) |
-| before Part G, a transactional and an atomic batch on a constrained source are refused | transactional half: `CheckedWritesConstraintWorker.ConstrainedSourceRefusesTransactions` (5). The atomic half is a Part 11 cell: the atomic-batch bit doesn't exist before Part 11 (R05b) |
+| before Part G, a transactional and an atomic batch on a constrained source are refused | transactional half: `CheckedWritesConstraintWorker.ConstrainedSourceRefusesTransactions` (5). The atomic half is a rule cell only (03's pinned row 15); Part 11 ships the bit and the lift together (11 matrix B) |
 | a create rejected at fold: its id is burned | `TheWholeScenarioThreeNodesRegression` step 6 (10) |
 
 ### C. The model check (`CheckedWritesModelRegression.SeededConstraintsMatchTheModel`, `rune_checked_writes_matrix_tests`, Task 9)

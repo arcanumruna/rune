@@ -182,6 +182,8 @@ Every cell asserts: (a) every table (view, contributors, groups, blocks) equals,
 
 ## Contract additions (none redefines a contract type)
 
+- **Forward note (Part 11, R11b):** from Part 11, committed transactions apply at their commit marker on every fold path (live, refold, rebuild, leadership scan); `FoldSkip.aborted` stays as a defensive skip.
+
 - `[[nodiscard]] inline bool rune::view::isAbortedBatch(const FoldSkip& skip, const rune::protocol::RecordBatchReader& r) noexcept;` in `FoldSkip.h` (AD1). Part 04 may add a per-record sibling for `rejected`.
 - `FoldStats::skippedAborted` (`uint64_t`, appended), `ViewFoldCounters::skippedAborted`, `ViewFoldCounters::checkpointsDiscarded` and `ViewFoldCounters::checkpointsKeptUnverifiable` (`uint64_t`, appended).
 - Checkpoint marker (AD5): `kViewCheckpointMagicMarked = 0x534B4331u`, `kViewCheckpointMagicV2Marked = 0x534B4332u`, `enum class CheckpointMark : uint8_t { Unmarked, FoldSkipped };`, a trailing `CheckpointMark mark = CheckpointMark::Unmarked` on `encodeDelta` and `encodeMultiDelta`, `AppliedDelta::mark` (appended), and `[[nodiscard]] CheckpointMark checkpointMarkOf(std::span<const uint8_t> record) noexcept` (`CheckpointMark::Unmarked` for anything but a marked magic). **For Part 07:** v3 implies `FoldSkipped`, v3 must not use the `0x534B433x` magics, and the v1/v2 decoders (all four magics) stay.

@@ -368,7 +368,7 @@ Built on 04's `CheckedWritesRig` with `createAutoIncTopic(shape)`. Every op is s
 | 45 | `NearMax` | P = 1, `max = 10`; 7 creates (next n = 8) |
 | 46 | `Constrained` | P = 1 plus `TestReject{TagEquals{9}}` objectId 7; 3 creates with tag 1 |
 
-**Timings:** every value of the shared `Timing` enum (21). Their rig meaning is 04's and 03's. In this part:
+**Timings:** the 21 `Timing` values through `RetryAfterWindow`, listed explicitly in `cellsFor(Part::P06)`. Values appended later (Part 11) are not this part's. Their rig meaning is 04's and 03's. In this part:
 - `Racing`: two producers send the op in the same pass.
 - `CreateOnNonEmpty` / `ReplaceDuringWrites` / `DropDuringWrites`: the op is sent as two batches. Between them a `TestReject{TagEquals{9}}` member is created (CreateOnNonEmpty), replaced by `TagEquals{1}`, or dropped.
 - `TxnCommitBehind` / `TxnAbortBehind`: a third producer's open transaction of 2 key-0 creates sits before the op, and commits or aborts after the op's ack.
