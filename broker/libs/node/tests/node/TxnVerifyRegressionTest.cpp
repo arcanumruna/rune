@@ -273,3 +273,46 @@ TEST(TxnVerifyStateRegression, ManyRefusedProducersNeverExhaustTheSetAdversarial
     }
     EXPECT_LE(s.rc.verifySet().size(), RcState::kTxnVerifyCapacity);
 }
+
+// ---- PR #589 re-check 1 (adversarial, epoch ordering) ------------------------------------------------------------
+
+// A Rejected entry of a bogus NEWER epoch never locks the real (older-epoch) producer out: it is superseded and the
+// real producer verifies; a Verified entry stays intact after a zombie is fenced against it; a zombie against a
+// Pending entry is refused retriably without a second ask, even with no room to ask.
+TEST(TxnVerifyStateRegression, EpochOrderingAgainstEveryEntryStateAdversarialRegression) {
+    {   // Rejected (bogus higher epoch) -> superseded by the real one
+        Rc s;
+        const TxnAdmission bogus = s.admit(11, 900);
+        ASSERT_EQ(bogus.kind, K::RequestVerify);
+        s.rc.onVerifyAnswer(11, 900, bogus.reqId, code(pc::ErrorCode::InvalidProducerEpoch));
+        const TxnAdmission real = s.admit(11, 3);
+        ASSERT_EQ(real.kind, K::RequestVerify) << "a Rejected bogus epoch locked the real producer out";
+        s.rc.onVerifyAnswer(11, 3, real.reqId, 0);
+        EXPECT_EQ(s.admit(11, 3).kind, K::Admit);
+    }
+    {   // Verified: zombie fenced, the live admission intact (twice)
+        Rc s;
+        const TxnAdmission live = s.admit(12, 5);
+        s.rc.onVerifyAnswer(12, 5, live.reqId, 0);
+        for (int i = 0; i < 2; ++i) {
+            const TxnAdmission z = s.admit(12, 4);
+            EXPECT_EQ(z.kind, K::Refuse);
+            EXPECT_EQ(z.code, code(pc::ErrorCode::ProducerFenced));
+        }
+        EXPECT_EQ(s.admit(12, 5).kind, K::Admit);
+    }
+    {   // Pending: zombie Retry, no ask (also with no room), no capacity counter; the live answer still applies
+        Rc s;
+        const TxnAdmission live = s.admit(13, 5);
+        EXPECT_EQ(s.admit(13, 4).kind, K::Retry);
+        EXPECT_EQ(s.admit(13, 4, /*canRequest=*/false).kind, K::Retry);
+        EXPECT_EQ(s.rc.verifyRequests(), 1u) << "the zombie sent an ask";
+        s.rc.onVerifyAnswer(13, 5, live.reqId, 0);
+        EXPECT_EQ(s.admit(13, 5).kind, K::Admit);
+        // The live entry answered retriably instead: the zombie may then ask (the coordinator fences it).
+        Rc t;
+        const TxnAdmission l2 = t.admit(14, 5);
+        t.rc.onVerifyAnswer(14, 5, l2.reqId, code(pc::ErrorCode::NotCoordinator));
+        EXPECT_EQ(t.admit(14, 4).kind, K::RequestVerify);
+    }
+}

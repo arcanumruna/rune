@@ -7090,3 +7090,49 @@ TEST(TxnVerifyRegression, UnappliedTopicIsRefusedRetriablyByEveryTxnRequestRegre
     EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, kLate, 0, 20), 0);
     EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, 0, 0, 20), 0);
 }
+
+// ---- PR #589 re-check 1 (adversarial, the shared topic lookup) ---------------------------------------------------
+
+// TxnOffsetCommit naming a known AND an unapplied topic is refused whole: the known entry staged before the unknown
+// one must never be recorded, so a later COMMIT applies no offset of the refused request.
+TEST(TxnVerifyRegression, TxnOffsetCommitWithOneUnappliedTopicRecordsNothingAdversarialRegression) {
+    VerifyRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    static std::vector<int64_t> applied;
+    applied.clear();
+    T.tcs->setTxnOffsetSink(
+        [](void*, const std::string&, const rune::coordination::TopicPartition&, int64_t off, int64_t,
+           const rune::coordination::TxnOffsetToken&) { applied.push_back(off); return rune::coordination::TxnOffsetApply::Applied; },
+        nullptr, [](void*, const rune::coordination::TxnOffsetToken&) {});
+    ASSERT_EQ(addOffsets(T, "g"), 0);
+    pc::TxnOffsetCommit oc; oc.sessionId = 1; oc.correlationId = ++T.corr; oc.producerId = T.pid;
+    oc.producerEpoch = T.epoch; oc.transactionalId = T.tid();
+    const std::string g = "g";
+    oc.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(g.data()), g.size());
+    const pc::TxnOffsetCommitEntry es[2] = {{0, 0, 5, {}}, {9, 0, 6, {}}};   // known first, then unapplied
+    const std::span<const pc::TxnOffsetCommitEntry> sp(es, 2);
+    std::vector<uint8_t> of(pc::TxnOffsetCommit::encodedSizeFor(oc.transactionalId, oc.groupId, sp));
+    oc.encode(of.data(), sp);
+    auto orr = pc::TxnOffsetCommitResponse::decode(
+        T.out.data(), T.tcs->handleTxnOffsetCommit(of.data(), of.size(), 1, T.out.data(), T.out.size()));
+    ASSERT_TRUE(orr && orr->results.size() == 2);
+    for (const auto& rr : orr->results) EXPECT_EQ(rr.errorCode, kConcurrentTxns);
+    // Positive control: a valid TxnOffsetCommit on another partition of the known topic IS applied at commit.
+    {
+        pc::TxnOffsetCommit ok = oc; ok.correlationId = ++T.corr;
+        const pc::TxnOffsetCommitEntry good{0, 1, 7, {}};
+        const std::span<const pc::TxnOffsetCommitEntry> gs(&good, 1);
+        std::vector<uint8_t> gf(pc::TxnOffsetCommit::encodedSizeFor(ok.transactionalId, ok.groupId, gs));
+        ok.encode(gf.data(), gs);
+        auto gr = pc::TxnOffsetCommitResponse::decode(
+            T.out.data(), T.tcs->handleTxnOffsetCommit(gf.data(), gf.size(), 1, T.out.data(), T.out.size()));
+        ASSERT_TRUE(gr && gr->results.size() == 1);
+        ASSERT_EQ(gr->results[0].errorCode, 0);
+    }
+    const int16_t end = T.endTxn(/*commit=*/true);
+    ASSERT_TRUE(end == 0 || end == 999) << "EndTxn answered " << end;
+    T.runUntilNoMarkerAwaited(100);
+    EXPECT_NE(T.tcs->txnStateForTest(T.txnId), tx::TxnState::Ongoing) << "the commit never ran";
+    EXPECT_EQ(applied, (std::vector<int64_t>{7})) << "an offset of a refused TxnOffsetCommit was applied at commit "
+                                                      "(or the valid one was not: the test is vacuous)";
+}
