@@ -136,6 +136,30 @@ TEST(AuthEnforcementRegression, SyncGroupIsDeniedWithoutGroupReadRegression) {
 // InvalidRequest even for a principal holding WRITE on the topic, and nothing is appended - the next ordinary batch
 // lands at the offset right after the previous one.  RED: delete the refusesClientBatches check in
 // ClientGateway::handleProduce (the marker is appended: answer 0, and the next batch's offset moves by 2).
+// PR #569 adversarial review (#276, input bounds on the group name): group READ is matched on the request's OWN group
+// name for every group request - a prefix grant opens only names under it (case-sensitive, no shorter name, no name
+// that merely contains it), and an empty group name is never served.  The owner's own requests stay served.
+// RED: delete the SyncGroup case of ClientGateway::denyGroupRequest_ (the out-of-grant SyncGroups reach the
+// coordinator and are answered UnknownMember, not 45).
+TEST(AuthEnforcementRegression, GroupReadIsMatchedOnTheRequestsOwnGroupNameForEveryGroupRequestAdversarialRegression) {
+    AuthRig r;
+    const int64_t owner = r.newUser({prefix(SO::Read, ST::Group, "cg27"), exact(SO::Read, ST::Topic, "orders")});
+    const auto [member, gen] = r.joinStable(owner, "cg276", {r.orders});
+    ASSERT_FALSE(member.empty());
+    for (const char* g : {"cg2", "CG276", "Cg276", "xcg276", "c", "cg2 76"}) {
+        EXPECT_EQ(r.syncGroup(owner, g, member, gen), kNotAuthorized) << "SyncGroup " << g;
+        EXPECT_EQ(r.heartbeatAt(owner, g, member, gen), kNotAuthorized) << "Heartbeat " << g;
+        EXPECT_EQ(r.leaveGroup(owner, g, member), kNotAuthorized) << "LeaveGroup " << g;
+        EXPECT_EQ(r.commitAs(owner, g, member, gen, r.orders, 3), kNotAuthorized) << "OffsetCommit " << g;
+        EXPECT_EQ(r.offsetFetch(owner, g, r.orders), kNotAuthorized) << "OffsetFetch " << g;
+        EXPECT_EQ(r.joinGroup(owner, g, {r.orders}), kNotAuthorized) << "JoinGroup " << g;
+    }
+    EXPECT_NE(r.syncGroup(owner, "", member, gen), kOk) << "an empty group name was served";
+    EXPECT_NE(r.heartbeatAt(owner, "", member, gen), kOk) << "an empty group name was served";
+    EXPECT_EQ(r.syncGroup(owner, "cg276", member, gen), kOk) << "the owner's own group stays served";
+    EXPECT_EQ(r.heartbeatAt(owner, "cg276", member, gen), kOk);
+}
+
 TEST(AuthEnforcementRegression, AClientControlBatchIsRefusedForAnAuthorizedWriterRegression) {
     AuthRig r;
     const int64_t w = r.newUser({exact(SO::Write, ST::Topic, "orders")});
