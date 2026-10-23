@@ -7,7 +7,7 @@
 **Architecture:**
 - **Storage.** `handleProduceBatch<LogT, HookT>` calls `check()` between the dedupe gate and the min-ISR gate, `stage()` before the append, and `onAppended()` after the PSM update. Each call sits under `if constexpr (HookT::kActive)`. The existing signature forwards with `NoWriteHook`, so untyped topics compile to today's code.
 - **Node.** `rune::node::CheckedWriteHook` is a per-call object built in `Worker::produceCore_` from the partition's `PartitionWriteState*` (Part 02, C7).
-  - It does validation (moved in from Part 02's pre-append call site, SD2), the wire-key check, the record intent scan and one pure requirement table, `evaluateRequirements`.
+  - It does validation and the wire-key check through Part 02's `checkTypedRecord` (moved in from Part 02's pre-append call site, SD2, R-X1), the record intent scan and one pure requirement table, `evaluateRequirements`.
   - Later parts fill the table's topic facts (key index, autoincrement, constrained, verdict source).
 - **View acks.** `View` waiters park in their own `OrderedWaitQueue<PendingAcksView>` (SD16).
   - `flushOwedAcksView_` releases one when the HW is above `lastOffset`, the ISR still meets the admission minimum for `All`, and `WorkerViewSet::minFoldCursor` over the current leadership is above `lastOffset`.
@@ -83,6 +83,10 @@ These lines are verbatim from the overview's Global Constraints, restricted to w
 - **SD11.** The client gates `View`, intents and key-0 creates on `ConnectResponse.brokerVersion >= kBrokerVersionCheckedWrites`. Below that it fails locally with `OpStatus::BrokerTooOld`. A v7 broker whose committed level is below 4 answers those writes `InvalidRequest`, and nothing is appended.
 - **SD12.** The gateway (`msg.acks == 1`, `ClientGateway.cpp:3872`) and the worker (`msg.acks != 0`, `Worker.h:8082`) both move to the one decoder in C4.
 - **SD16.** A `View` waiter behind an open transaction waits for the LSO. `View` waiters live in their own queue, so `All` acks never queue behind them.
+- **R-X1.** Part 02 factors `TypedCheck checkTypedRecord(const TopicWriteSpec&, const RecordSpan&, int16_t level)` into `WriteState.h`, carrying all of 02's rules (P1–P5). This part's single walk calls it per record and adds `HookRefusal::VersionAhead` → `NotLeader`. 02's `typedRejects_` / `typedVersionAhead_` counters and test seams stay, and no 02 rule or test is lost.
+- **R02a.** `RecordSpan::key` and the bounds-checked `forEachRecordSpan` are Part 02's (its P9). This part consumes them and adds only `attributes` and `index`.
+- **R02b / R03e.** Tombstones skip value validation at every level; on a keyed topic the key must be exactly `keyWidth` bytes. Part 02's P1 is the rule, applied through `checkTypedRecord`.
+- **R03a–R03d.** Large acks are offered by Part 04 (R03a); untyped topics store intent bits opaquely and the client refuses intents, key-0 creates and `View` there locally with `SendResult::WriteNotAllowed` (R03b as amended by R05a); the client never sets `View` on a transactional send and the broker ignores it (R03c); this part's matrix ids are 120–139 in Part 04's shared matrix (R03d).
 
 ## Part rulings (P3; binding for executors, recorded so the reviewer can overturn any)
 
@@ -92,8 +96,8 @@ These lines are verbatim from the overview's Global Constraints, restricted to w
     - below the level (`!checkedWritesEnabled_()`, SD11);
     - with no replica wired (a rig-only path; nothing can fold).
   - **Record checks, typed topics only.** Intents, reserved bits and key-0 creates are checked by `CheckedWriteHook`, which runs only for typed topics.
-  - **Untyped topics.** An untyped topic (`writeOf_ == nullptr`) never has its record attributes scanned: G10 allows "one branch that is never taken". Untyped topics have no key index, so a raw producer's intent bits there are stored as sent and mean nothing. *Flagged for the owner.*
-- **P3-2 — `View` is ignored on transactional batches.** The client never sets bit 1 on a transactional producer's batches. The broker clears it from a batch whose header has `kAttrTransactional` before any other check (spec G.7: "View on a single send is ignored").
+  - **Untyped topics.** An untyped topic (`writeOf_ == nullptr`) never has its record attributes scanned: G10 allows "one branch that is never taken". Untyped topics have no key index, so a raw producer's intent bits there are stored as sent and mean nothing (R03b). The client refuses intents, key-0 creates and `View` on a raw handle locally with `SendResult::WriteNotAllowed` (R05a; Part 05 builds that client check).
+- **P3-2 — `View` is ignored on transactional batches (R03c).** The client never sets bit 1 on a transactional producer's batches. Transactions get verdicts through Part 11's vote (`commitTransactionAndWait`). The broker clears it from a batch whose header has `kAttrTransactional` before any other check (spec G.7: "View on a single send is ignored").
   - Without this, the `View` ack of a transactional send waits for the LSO, the LSO waits for `EndTxn`, and `commitTransaction()` waits for the send's ack: a deadlock until the 30 s ack deadline.
 - **P3-3 — Leadership-scoped fold cursor.** `minFoldCursor` takes a leadership generation. An instance folded under another leadership counts as 0. The waiter uses `replica->leadershipGeneration()`. This mirrors the read barrier (`Worker.h:4100-4103`), so an ex-leader's frozen table can never release a `View` ack.
 - **P3-4 — Client gate source.** The client's SD11 gate reads the **seed** session's `brokerVersion` (`Client::onSeedConnected_`, `Client.cpp:2167`). That is the same source `GroupConsumerHub::setBrokerVersion` uses (`Client.cpp:2228`).
@@ -108,12 +112,12 @@ These lines are verbatim from the overview's Global Constraints, restricted to w
 - **P3-7 — `flushOwedAcksView_` placement.** It runs right after the `if (viewSet_ != nullptr) { … serveHeldViewReads_(); }` block in both duty loops (`Worker.h:1846-1849`, `:1975-1980`), not inside it. A worker without a view set must still release and time out `View` waiters: no views means the cursor is `INT64_MAX`.
 - **P3-8 — Order of refusals inside `check()`.** `check()` walks the records once, in order.
   - A record with reserved attribute bits or intent 3 ends the walk with `InvalidRequest`.
-  - A record failing validation or the wire-key check ends it with `SchemaValidationFailed`.
+  - A record that `checkTypedRecord` rejects (validation or the wire-key check) ends it with `SchemaValidationFailed`; one it reports `VersionAhead` ends it with a retriable `NotLeader` (02 P2, R-X1).
   - After a clean walk, `evaluateRequirements` applies C8 rules 2–9 in order.
   - A batch that is both invalid and forbidden is therefore answered by its first bad record. The answer is deterministic.
 - **P3-9 — Strict durability with `View`.** The fsync, then the HW, then the fold: `DurablePending` hands a `View` entry to `pendingAcksView_`, not to `pendingAcksAll_`.
-- **P3-10 — Tombstones.** A record with an empty or null value (C3) skips the value validation. On a keyed typed topic its wire key must still be exactly `keyWidth` bytes. That is the only key check a valueless record allows. *If Part 02 shipped a different tombstone rule, keep 02's and record a deviation.*
-- **P3-11 — Large acks.** At 4096 entries, a v12 ack (32,824 B) exceeds an Aeron publication's `maxPayloadLength`, so `tryClaim` throws. In 03 the trailer is always empty (≤ 56 B). *Flagged to Part 04:* its arena path must `offer` a frame above `maxPayloadLength` instead of claiming it.
+- **P3-10 — Tombstones (R02b, R03e).** Part 02's P1 is the rule, applied through `checkTypedRecord`: a record with an empty or null value (C3) skips the value validation; on a keyed typed topic with a checkable key its wire key must be exactly `keyWidth` bytes (level 4); on a keyless typed topic it is rejected (24).
+- **P3-11 — Large acks (R03a).** At 4096 entries, a v12 ack (32,824 B) exceeds an Aeron publication's `maxPayloadLength`, so `tryClaim` throws. In 03 the trailer is always empty (≤ 56 B). Part 04's ack path `offer`s any frame above `maxPayloadLength` and claims the rest (04 P4-9).
 
 ## Contract additions (this part adds them; the overview stays the authority for everything else)
 
@@ -125,7 +129,7 @@ These lines are verbatim from the overview's Global Constraints, restricted to w
    - The existing one-argument `encodedSizeFor(clientVersion)` stays (no trailer).
 3. `WriteFacts` (C8) appends `bool levelCheckedWrites = false;` (the rule 3 input). Its other members get default initializers: `uint8_t acks = 0; bool idempotent = false; …`.
 4. An active hook policy has a fourth member, `[[nodiscard]] uint64_t assignedBase() const noexcept`. `handleProduceBatch` reads it right after `onAppended` into `ProduceOutcome::assignedBase`. `NoWriteHook` leaves 0.
-5. `broker/libs/node/include/rune/node/CheckedWriteHook.h` adds the requirement seam that 04, 05, 06, 09 and 11 extend: `struct TopicHookFacts`, `[[nodiscard]] TopicHookFacts topicHookFactsOf(const PartitionWriteState&) noexcept`, `struct BatchIntents`, `[[nodiscard]] constexpr rune::protocol::client::ErrorCode evaluateRequirements(const BatchIntents&, const WriteFacts&, const TopicHookFacts&) noexcept`, and `enum class HookRefusal : uint8_t`. Exact definitions are in Task 6.
+5. `broker/libs/node/include/rune/node/CheckedWriteHook.h` adds the requirement seam that 04, 05, 06, 09 and 11 extend: `struct TopicHookFacts`, `[[nodiscard]] TopicHookFacts topicHookFactsOf(const PartitionWriteState&) noexcept`, `struct BatchIntents`, `struct RequirementVerdict { rune::protocol::client::ErrorCode code{}; HookRefusal why = HookRefusal::None; }`, `[[nodiscard]] constexpr RequirementVerdict evaluateRequirements(const BatchIntents&, const WriteFacts&, const TopicHookFacts&) noexcept`, and `enum class HookRefusal : uint8_t`. Later parts append `HookRefusal` values before `Count_` and may return a code other than `InvalidRequest` (05: `{NotLeader, KeyIndexActivating}`). Exact definitions are in Task 6.
 6. `WorkerViewSet::minFoldCursor(int32_t srcTopicId, int32_t partition, uint64_t leadership = 0) const noexcept`. With `leadership != 0`, an instance whose `foldLeadership != leadership` counts as 0 (P3-3). The C4 two-argument call is unchanged.
 7. `broker/libs/node/include/rune/node/SessionAckSink.h`: `inline constexpr uint32_t kNoVerdictRun = 0xFFFF'FFFFu;`.
 8. Client:
@@ -133,7 +137,7 @@ These lines are verbatim from the overview's Global Constraints, restricted to w
    - `void ProducerImpl::setBrokerVersion(int32_t) noexcept`;
    - `void ProducerHub::setBrokerVersion(int32_t) noexcept`, which forwards to every registered producer and to every later one.
 9. Test seams on `Worker`: `[[nodiscard]] uint64_t hookChecksForTest() const noexcept` (how many times `check()` ran) and `[[nodiscard]] uint64_t hookRefusalsForTest(HookRefusal) const noexcept`.
-10. Matrix ids: the overview reserves no `Op` / `Entity` range for 03, because 03's matrix predates Part 04's shared binary. 03's matrix lives in its own file with local enums. If Part 04 folds it into `CheckedWritesMatrixExpectations.h`, it uses **120–139** for both enums. *Flagged to the controller as a contract gap.*
+10. Matrix ids (R03d): 03's matrix lives in its own file with local enums until Part 04 folds it into `CheckedWritesMatrixExpectations.h`, with **120–139** for both `Op` and `Entity`.
 
 ## Review Focus
 
@@ -160,7 +164,7 @@ This part owns the overview's §15 cells listed for **03**:
 - Every `View`-flag bullet.
 - "Before Part G, a transactional and an atomic batch on a constrained source are refused while unconstrained ones work."
 
-Constrained sources do not exist before Part 04, so that row is pinned as a rule (matrix B) and its positive half on a real unconstrained source (A, B, D). The cells live in four matrices.
+Constrained sources do not exist before Part 04, so that row is pinned as a rule (matrix B) and its positive half on a real unconstrained source (A, B, D). The atomic-batch half cannot be sent before Part 11 defines the atomic header bit (R05b): `WriteFacts::atomicBatch` stays false until then, so its broker cell is Part 11's. The cells live in four matrices.
 
 ### A. The `View` ack matrix (`CheckedWritesViewAckMatrix`, Task 9; 2 × 4 × 10 = 80 cells)
 
@@ -249,7 +253,7 @@ The overview assigns no stress invariant to 03 (04 owns the shared driver). This
 | `protocol/include/rune/protocol/client/Protocol.h` | M | Codes 51–58, versions 12 / 7, `clientUnderstandsCheckedWrites`, the `produceErrorForClient` mapping (P3-5), version comments |
 | `protocol/include/rune/protocol/client/DataMessages.h` | M | `Produce` acks bits (C4 wire), `ProduceResponse` v12 + trailer (C5), `kMaxJudgedBatchRecords` |
 | `protocol/include/rune/protocol/RecordBatch.h` | M | `rune::protocol::record` intent constants, builder `attributes` parameter (C3) |
-| `protocol/include/rune/protocol/BatchRebuild.h` | M | `RecordSpan::attributes / key / index`, filled by `forEachRecordSpan` (C3) |
+| `protocol/include/rune/protocol/BatchRebuild.h` | M | `RecordSpan::attributes / index`, filled by `forEachRecordSpan` (C3); `key` and the bounded walk are Part 02's (R02a) |
 | `protocol/conformance/{gen_vectors.cpp,manifest.md,vectors/produce_response_v12.bin,vectors/produce_response_v12_verdicts.bin,vectors/produce_acks_all_view.bin}` | M/C | v12 golden frames |
 | `protocol/tests/protocol/{RecordBatchTest.cpp,BatchRebuildTest.cpp,client/DataMessagesTest.cpp,client/ConformanceTest.cpp}` | M | Protocol tests |
 | `broker/libs/storage/include/rune/storage/WriteHookPolicy.h` | C | `HookStaged`, `NoWriteHook` (C8) |
@@ -349,7 +353,7 @@ git commit -m "feat(protocol): checked writes - codes 51-58, client v12 / broker
 
 ---
 
-### Task 2: Record intent bits and the extended `RecordSpan` (C3)
+### Task 2: Record intent bits and the extended `RecordSpan` (C3; `key` is Part 02's, R02a)
 
 **Files:**
 - Modify: `protocol/include/rune/protocol/RecordBatch.h`:
@@ -368,12 +372,12 @@ git commit -m "feat(protocol): checked writes - codes 51-58, client v12 / broker
   [[nodiscard]] constexpr uint8_t intentOf(uint8_t attributes) noexcept { return attributes & kAttrIntentMask; }
   }
   void RecordBatchBuilder::append(std::string_view key, std::string_view value, int64_t timestamp, uint8_t attributes = 0);
-  struct RecordSpan { /* existing members */ uint8_t attributes = 0; std::string_view key; uint32_t index = 0; };
+  struct RecordSpan { /* existing members, plus Part 02's std::string_view key (02 P9) */ uint8_t attributes = 0; uint32_t index = 0; };
   ```
-- `forEachRecordSpan` fills the new members:
+- `forEachRecordSpan` (bounded since Part 02) fills the new members:
   - `attributes`: the byte it skips at `BatchRebuild.h:58`;
-  - `key`: a view into the batch for `klen ≥ 0`, empty for `klen < 0`;
   - `index`: the loop's `i`.
+- **Deviation note (R02a).** C3 lists `key` under this part. Part 02 already appended `key` and the bounded walk (its P9), so this task consumes them and adds only `attributes` and `index`. Record it as a deviation in the task report.
 - `RecordBatchReader::forEachRecord` is unchanged. C3 says the hook and the folds use only `forEachRecordSpan`.
 
 - [ ] **Step 1: Write the failing tests.**
@@ -383,20 +387,20 @@ git commit -m "feat(protocol): checked writes - codes 51-58, client v12 / broker
   - `BatchRebuildTest.cpp`:
     - `CheckedWritesRecordSpan.CarriesAttributesKeyAndIndex`:
       - build `append("a","1",0,0); append("bb","",0,1); append("ccc","3",0,2)`;
-      - `forEachRecordSpan` yields `attributes` {0, 1, 2}, `key` {"a", "bb", "ccc"} and `index` {0, 1, 2};
+      - `forEachRecordSpan` yields `attributes` {0, 1, 2} and `index` {0, 1, 2}, beside Part 02's `key` {"a", "bb", "ccc"};
       - the second record has `value.empty()` and `nullValue == false`;
       - each `key.data()` lies inside `[batch, batch + len)`;
       - `RecordBatchReader::forEachRecord` still yields the same keys and values;
       - `ensureValid()` holds (the CRC covers the attributes byte).
     - `CheckedWritesRecordSpanRegression.RebuildKeepsAttributesVerbatimRegression`: `rebuildBatch` keeping {0, 2} of the batch above yields spans with attributes {0, 2} and a valid CRC.
 - [ ] **Step 2: Run to verify they fail.** `cmake --build build/root -j14 --target rune_protocol_tests`. Expected: `no member named 'record' in namespace 'rune::protocol'`.
-- [ ] **Step 3: Implement** as specified: `records_.push_back(attributes)` at `:150`, and in `forEachRecordSpan` read the attributes byte before `++pos` and record `key` before skipping it.
+- [ ] **Step 3: Implement** as specified: `records_.push_back(attributes)` at `:150`, and in `forEachRecordSpan` read the attributes byte before `++pos` and set `index`. Part 02's `key` assignment and bounds checks stay as 02 left them.
 - [ ] **Step 4: Run.** `cmake --build build/root -j14 --target rune_protocol_tests rune_worker_filter_tests rune_filter_engine_tests && ctest --test-dir build/root -R 'CheckedWritesRecord|BatchRebuild|RecordBatch|Filter' -j14 --output-on-failure`. Expected: PASS. The Phase 2c filter suites use `RecordSpan` and must stay green.
 - [ ] **Step 5: Commit.**
 ```bash
 git add protocol/include/rune/protocol/RecordBatch.h protocol/include/rune/protocol/BatchRebuild.h \
         protocol/tests/protocol/RecordBatchTest.cpp protocol/tests/protocol/BatchRebuildTest.cpp
-git commit -m "feat(protocol): record intent bits (attributes 0-1), builder attributes, RecordSpan attributes/key/index" \
+git commit -m "feat(protocol): record intent bits (attributes 0-1), builder attributes, RecordSpan attributes/index" \
            -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
@@ -664,8 +668,8 @@ git commit -m "feat(storage): handleProduceBatch<LogT, HookT> - check after dedu
 
 **Interfaces:**
 - Consumes:
-  - `PartitionWriteState`, `TopicWriteSpec::{validatorFor, descriptorFor, keyFieldId, keyWidth}` and Part 02's wire-key comparison helper in `codec/include/rune/codec/Validator.h` (C7);
-  - `rune::protocol::forEachRecordSpan` and `RecordSpan::{attributes, key, index}` (Task 2);
+  - `PartitionWriteState` and `TopicWriteSpec` (C7), and Part 02's `TypedCheck checkTypedRecord(const TopicWriteSpec&, const RecordSpan&, int16_t level)` in `broker/libs/node/include/rune/node/WriteState.h` (R-X1; it holds the version lookup, the validator call and the `keyValueOffset` + `memcmp` wire-key rule);
+  - `rune::protocol::forEachRecordSpan` and `RecordSpan::key` (Part 02, R02a), `RecordSpan::{attributes, index}` (Task 2);
   - `kMaxJudgedBatchRecords` (Task 3).
 - Produces (exact; contract additions 3 and 5):
   ```cpp
@@ -677,7 +681,7 @@ git commit -m "feat(storage): handleProduceBatch<LogT, HookT> - check after dedu
   };
   struct TopicHookFacts { bool keyIndex = false; bool autoIncrement = false; bool constrainedSource = false; bool verdictSource = false; };
   /// 03: every member false.  04 sets verdictSource (state.verdicts != nullptr), 05 keyIndex (spec->keyIndex),
-  /// 06 autoIncrement (spec->autoIncrement), 09 constrainedSource.
+  /// 06 autoIncrement (spec->autoIncrement), 04 (TestReject) / 09 constrainedSource.
   [[nodiscard]] TopicHookFacts topicHookFactsOf(const PartitionWriteState& state) noexcept;
   struct BatchIntents {
       bool    reservedBits      = false;   // a record with attributes & kAttrReservedMask, or intent 3
@@ -688,7 +692,7 @@ git commit -m "feat(storage): handleProduceBatch<LogT, HookT> - check after dedu
       int32_t records           = 0;
   };
   enum class HookRefusal : uint8_t {
-      None, ReservedBits, ValidationFailed, KeyMismatch, LegacyMode, LevelTooLow, NoKeyIndex,
+      None, ReservedBits, ValidationFailed, VersionAhead, LegacyMode, LevelTooLow, NoKeyIndex,
       ExplicitKeyNeedsIdempotentAndView, IntentInTxnOrAtomicBatch, TxnOnConstrainedSource,
       KeyZeroCreateNeedsIdempotentAll, KeyZeroCreateNeedsView, MixedKeyZeroBatch, ViewBatchTooLarge,
       ViewWithoutReplica, Count_
@@ -728,10 +732,9 @@ git commit -m "feat(storage): handleProduceBatch<LogT, HookT> - check after dedu
 - **`check()`**: one `forEachRecordSpan` walk.
   - Per record, in this order (P3-8):
     - the attribute rules (`reservedBits` → stop, `InvalidRequest`);
-    - if the value is non-empty and non-null, Part 02's version lookup and `validatorFor(v)->validate(value)` (unknown version or failure → stop, `SchemaValidationFailed`, `ValidationFailed`);
-    - on a keyed spec, Part 02's wire-key comparison against the key field of the decoded value; for a tombstone, `key.size() == keyWidth` (P3-10) (failure → stop, `SchemaValidationFailed`, `KeyMismatch`);
+    - `checkTypedRecord(*state_.spec, r, level)` with `level = facts_.levelCheckedWrites ? kCheckedWrites : kBase` (R-X1): `Reject` → stop, `SchemaValidationFailed`, `ValidationFailed`; `VersionAhead` → stop, `NotLeader`, `VersionAhead` (02 P2). The worker adds these two to 02's `typedRejects_` / `typedVersionAhead_` (Task 7). It covers the version lookup, the validator, the wire key and the tombstone rule (P3-10);
     - intent bookkeeping into `BatchIntents`.
-  - A walk that `forEachRecordSpan` reports as structurally bad → `SchemaValidationFailed` (`ValidationFailed`). Today's `schemaRejects_` answer for an unparseable record is the same.
+  - A walk that `forEachRecordSpan` reports as structurally bad → `SchemaValidationFailed` (`ValidationFailed`), as Part 02's `checkTypedBatch` answers it. One case keeps 02's P5: below the level on a topic without `legacyValidate`, 02 never walks the batch, so a bad walk there passes unchecked (no intent or `View` means anything below the level, rules 2–3).
   - After the walk: `evaluateRequirements(intents, facts_, topicHookFactsOf(state_))`.
   - The walk never allocates. The validators and descriptors are materialized at install (C7).
 - `stage()` returns `{OK, batch, len}` unchanged (06 adds the copy and patch). `onAppended` is empty in 03.
@@ -772,13 +775,15 @@ git commit -m "feat(storage): handleProduceBatch<LogT, HookT> - check after dedu
     - **(i)** `!anyIntent && !reservedBits && !acksView(acks)` → `OK`, whatever the facts. The only exception is rule 7 (`transactional`/`atomic` on a constrained source).
     - **(ii)** `reservedBits` → `ReservedBits` always.
     - **(iii)** `legacyMode && (anyIntent || acksView)` → `LegacyMode` unless `reservedBits`.
-    - **(iv)** every non-`OK` code is `InvalidRequest`.
+    - **(iv)** every non-`OK` code is `InvalidRequest` (05 adds the R05e exception: `KeyIndexActivating` answers `NotLeader`).
     - **(v)** flipping any single fact can change the result only to the rule that fact feeds (a monotonicity check per rule).
   - **Hook `check()` on real bytes**, a `PartitionWriteState` built with Part 02's spec builder for the `characters` descriptor (`id i64 key`, `type enum`, `name string`):
     - `CheckedWritesHook.ValidUpsertBatchPasses` (3 records): `OK`, `refusal() == None`.
-    - `CheckedWritesHook.UnknownVersionIsSchemaValidationFailed`: `SchemaValidationFailed` / `ValidationFailed`.
-    - `CheckedWritesHook.WireKeyMismatchIsSchemaValidationFailed`: key 8 B ≠ `id` → `KeyMismatch`.
-    - `CheckedWritesHook.TombstoneSkipsValueValidation`: empty value with an 8 B key → `OK`; a 7 B key → `KeyMismatch`.
+    - `CheckedWritesHook.UnknownVersionIsSchemaValidationFailed`: version 0, and a version below the highest installed one with no entry → `SchemaValidationFailed` / `ValidationFailed`.
+    - `CheckedWritesHookRegression.VersionAboveTheInstalledMaxIsRetriableNotLeaderRegression` (02 P2, R-X1): a record at `maxVersion() + 1` → `NotLeader` / `VersionAhead`, `typedVersionAheadForTest()` counts it, LEO 0; once that version is installed the same batch → `OK`.
+    - `CheckedWritesHook.WireKeyMismatchIsSchemaValidationFailed`: key 8 B ≠ `id` → `SchemaValidationFailed` / `ValidationFailed`.
+    - `CheckedWritesHook.TombstoneSkipsValueValidation` (02 P1): empty value with an 8 B key → `OK`; a 7 B key → `ValidationFailed`; a tombstone on a keyless typed topic → `ValidationFailed`.
+    - `CheckedWritesHookRegression.BelowTheLevelKeepsPartTwosLegacyRuleRegression` (02 P5): level 3, a non-`legacyValidate` spec, invalid UTF-8 → `OK`; the same with `legacyValidate` and a valid record → `OK`, with an unknown version → `SchemaValidationFailed`.
     - `CheckedWritesHook.ReservedAttributeBitIsInvalidRequest`: record 2 with attributes 0x04 → `InvalidRequest` / `ReservedBits`; with attributes 0x03 → same.
     - `CheckedWritesHookRegression.InvalidRecordBeforeAReservedBitAnswersSchemaValidationFailedRegression` (P3-8 order): record 0 invalid, record 1 reserved → `SchemaValidationFailed`. Records swapped → `InvalidRequest`.
     - `CheckedWritesHook.AnyIntentIsRefusedUntilAKeyIndexExists`: insert intent (1) on a valid record, `acks 3`, idempotent, level on → `InvalidRequest` / `NoKeyIndex` (the 03 handover: "has key index" false).
@@ -803,7 +808,7 @@ git commit -m "feat(node): CheckedWriteHook - one record walk (attributes, valid
   - `ProduceFields` (`:8119-8134`): `bool acksAll` becomes `uint8_t acks` plus `acksAll()` / `acksView()`;
   - `handleWorkerIngressFrame_` (`:8082`): `f.acks = msg.acks`;
   - `executeProduceWire_` (`:3944-3961`): `f.acks` from `op.acks()` and the deferAck flag (below);
-  - `produceCore_` (`:8136-8439`): the P3-2 strip, the P3-1 frame checks, the hook dispatch at `:8310-8321`; Part 02's pre-append validation call (which replaced `schemaRejects_` at `:8255`) is deleted;
+  - `produceCore_` (`:8136-8439`): the P3-2 strip, the P3-1 frame checks, the hook dispatch at `:8310-8321`; Part 02's pre-append `checkTypedBatch` call (which replaced `schemaRejects_` at `:8255`) is deleted;
   - the reservation predicate (`:8286`, `acksAll || asyncStrict` → `acksAll || acksView || asyncStrict`);
   - counters and test seams next to `identityMismatchRejects_`.
 - Modify: `broker/libs/node/include/rune/node/WorkerOp.h:202` (the `acks` comment: "the wire byte: bit 0 All, bit 1 View")
@@ -840,7 +845,7 @@ git commit -m "feat(node): CheckedWriteHook - one record walk (attributes, valid
     - `CheckedWriteHook hook(*ws, facts, {})`;
     - dispatch `rune::storage::handleProduceBatch(…, crcPreverified, hook)` on `*log` or `*mem`, else today's call.
     - `if (hook.checked()) ++hookChecks_;`.
-    - A refusal increments `hookRefusals_[hook.refusal()]` and is logged rate-limited (first, then every 1024th, like `identityMismatchRejects_`).
+    - A refusal increments `hookRefusals_[hook.refusal()]` and is logged rate-limited (first, then every 1024th, like `identityMismatchRejects_`). `ValidationFailed` also increments 02's `typedRejects_` and `VersionAhead` 02's `typedVersionAhead_`, so `typedRejectsForTest()` / `typedVersionAheadForTest()` keep their meaning (R-X1).
 - `hookRefusals_` is a `std::array<uint64_t, std::to_underlying(HookRefusal::Count_)>`, a worker-owned plain member.
 
 - [ ] **Step 1: Write the failing tests.**
@@ -864,7 +869,7 @@ git commit -m "feat(node): CheckedWriteHook - one record walk (attributes, valid
     - `acks = 1` behaves as before;
     - `acks = 2` with `!committedMetadataReady_` → `InvalidRequest` (legacy). In shard mode it is routed with `op.acks == 2`, `op.deferAck == false`.
 - [ ] **Step 2: Run to verify they fail.** `cmake --build build/root -j14 --target rune_checked_writes_ack_tests rune_produce_validation_tests`. Expected: `no member named 'hookChecksForTest'`.
-- [ ] **Step 3: Implement** as specified. Delete Part 02's pre-append validation call in `produceCore_`; its per-record logic now lives in `CheckedWriteHook::check` (Task 6). Keep 02's helpers where 02 put them.
+- [ ] **Step 3: Implement** as specified. Delete Part 02's pre-append `checkTypedBatch` call in `produceCore_`; `CheckedWriteHook::check` now calls 02's `checkTypedRecord` per record (Task 6, R-X1). Keep 02's helpers where 02 put them (`checkTypedBatch` stays for 02's matrices, fuzz test and bench). Part 02's worker tests (`CheckedWritesWorkerRegression.VersionAheadIsRetriableUntilInstalledRegression`, `…LevelRaiseStartsFullValidationRegression`, `…TombstoneOnValidatedTopicIsAcceptedRegression`) must pass unchanged.
 - [ ] **Step 4: Run.** `cmake --build build/root -j14 --target rune_checked_writes_tests rune_checked_writes_ack_tests rune_produce_validation_tests rune_shard_worker_ack_tests rune_produce_path_tests rune_worker_tests && ctest --test-dir build/root -R 'CheckedWrites|ProduceValidation|ShardWorkerAck|ProducePath|GatewayAcksAll|WorkerRegression' -j14 --output-on-failure`. Expected: PASS.
 - [ ] **Step 5: Commit.**
 ```bash
@@ -1008,7 +1013,7 @@ git commit -m "feat(views): WorkerViewSet::minFoldCursor, leadership-scoped (an 
     - `CheckedWritesViewAck.DuplicateBeforeAndAfterTheFoldIsAnsweredOnceEach`: an idempotent `acks 3` batch and its retry before the fold → both answered OK with the same `baseOffset` after the fold. A retry after the ack → answered OK at once (the condition holds). LEO 1.
   - `CheckedWritesViewAckMatrixTest.cpp`:
     - `CheckedWritesViewAckMatrix.Cell` (`TEST_P` over matrix A's 80 cells; the N/A cells `GTEST_SKIP()` with the rule's reason) and `expect03`, as the Interaction matrix section states.
-    - `CheckedWritesViewAckMatrixCountRegression.CellCountsArePinned`: `applicable == 78`, `skipped == 2`.
+    - `CheckedWritesViewAckMatrixCountRegression.CellCountsArePinned`: `applicable == 78`, `skipped == 2`. Part 04 Task 10 deletes this pin when it folds the matrix in; its row moves to the shared `CheckedWritesMatrixCountRegression.CellCountsArePinned` (R03d).
     - `CheckedWritesViewAckStressRegression.SeededWaitersMatchTheModel`: as in the Interaction matrix section. Failure messages print `seed=<n> step=<k>`.
 - [ ] **Step 2: Run to verify they fail.** `cmake --build build/root -j14 --target rune_checked_writes_ack_tests rune_session_ack_sink_tests`. Expected: `no member named 'assignedBase' in 'rune::node::AckEntry'`.
 - [ ] **Step 3: Implement** as specified. Keep `flushOwedAcksView_` a sibling of `flushOwedAcksAll_` (`Worker.h:7576-7623`), with the same flight-recorder marks and the `ShWaiterFire` code value.
@@ -1077,7 +1082,9 @@ git commit -m "test(e2e): View acks on real brokers - behind an open transaction
 - Modify: `broker/benchmark/ProduceValidateBench.cpp` (after the existing registrations, `:318-330`)
 - Modify: `docs/api/wire-protocol.md`:
   - frame-catalogue rows 16 and 17: `acks` "(bit 0 All, bit 1 View, v12)", and `assignedBase (v12)`, `verdicts (v12, optional trailer)`;
-  - a new section "Checked writes (client version 12)" with the `acks` bits, the v12 `ProduceResponse` layout table, the trailer, the 4096 cap and the legacy/level refusals.
+  - a new section "Checked writes (client version 12)" with the `acks` bits, the v12 `ProduceResponse` layout table, the trailer, the 4096 cap and the legacy/level refusals;
+  - one line in that section (R03b): "On an untyped (raw) topic the broker stores the record intent bits as sent and does not interpret them."
+- Modify: `docs/api/client-cpp.md` (the producer section): the same line, plus "a raw handle refuses intents, key-0 creates and `View` locally with `SendResult::WriteNotAllowed`" (R05a; the check itself ships with Part 05).
 
 **Interfaces:**
 - Consumes: `CheckedWritesAckRig.h` (Task 9).
@@ -1104,7 +1111,7 @@ git commit -m "test(e2e): View acks on real brokers - behind an open transaction
 - [ ] **Step 5: Commit.**
 ```bash
 git add broker/libs/node/tests/node/CheckedWritesAllocRegressionTest.cpp broker/libs/node/CMakeLists.txt \
-        broker/benchmark/ProduceValidateBench.cpp docs/api/wire-protocol.md
+        broker/benchmark/ProduceValidateBench.cpp docs/api/wire-protocol.md docs/api/client-cpp.md
 git commit -m "bench(node): BM_CheckedWriteHook (hook check, typed produce, View ack); zero-allocation gate; wire docs for client v12" \
            -m "<baseline vs tip medians>" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1149,7 +1156,8 @@ git commit -m "bench(node): BM_CheckedWriteHook (hook check, typed produce, View
   - §6.7 "scratch arrays grow": Task 9 (`SessionAckSink.h`), Task 7 (`ClientGateway.cpp:596`), Task 9 (`WorkerReturn`).
 - **Step scan.** Every test step names its test and its assertions with the spec values (4096, 32,824, 54, 30, 12, 7, 51–58). Every code step names its file, its signature and its placement. No function body is transcribed except the order of rules in `evaluateRequirements` and the fire rule, which the tests alone do not determine.
 - **Type consistency.**
-  - `WriteFacts`, `TopicHookFacts`, `BatchIntents`, `HookRefusal` and `RequirementVerdict`: defined in Task 6, used in Tasks 7 and 11.
+  - `WriteFacts`, `TopicHookFacts`, `BatchIntents`, `HookRefusal` and `RequirementVerdict`: defined in Task 6 (contract addition 5 lists `RequirementVerdict` as the return of `evaluateRequirements`), used in Tasks 7 and 11.
+  - Part 02's `checkTypedRecord` / `TypedCheck` (R-X1): used in Task 6 only; `HookRefusal::VersionAhead` maps its `VersionAhead`.
   - `ProduceFields::acks`: Task 7, used in Task 9.
   - `PendingAcksView`, `flushOwedAcksView_`, `DurablePending::thenAwaitAcks`: Task 9 only.
   - `minFoldCursor(…, leadership)`: Task 8, used in Task 9.
