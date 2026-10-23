@@ -75,9 +75,12 @@ Copied verbatim from the overview (Plan 00), restricted to what this part touche
 
 ## Rulings this part depends on (restated; binding)
 
-- **SD8.** The key index is built for wire keys of at most 8 bytes. `key.index` on a key field wider than 8 bytes is refused at DDL with `InvalidRequest`, "key.index needs a key of at most 8 bytes", until Part 07 lifts it (Part 07 Task 15 greps for this exact text in `broker/libs/node`).
+- **SD8.** The key index is built for wire keys of at most 8 bytes. `key.index` on a key field wider than 8 bytes is refused at DDL with `InvalidRequest`, "key.index needs a key of at most 8 bytes", until Part 07 lifts it (Part 07's precondition greps for this exact text in `broker/libs/node`, and its Task 16 removes it).
 - **SD9 / R10a / R02e.** `key.index` on a transient topic is refused through Part 02's `featureRefusal(DbFeature::KeyIndex, shape)` (`broker/libs/node/include/rune/node/TopicFeatureRules.h`). Intents need a key index, so they are refused with it.
-- **R03b.** On an untyped topic the broker never scans record attributes (G10: one branch). Intent bits there are stored as opaque bytes. The client refuses intents locally on a topic it knows is untyped. The docs say the bits are not interpreted on raw topics.
+- **R03b / R05a.** On an untyped topic the broker never scans record attributes (G10: one branch). Intent bits there are stored as opaque bytes. The client refuses intents, key-0 creates and `View` locally on a topic it knows is untyped, with `SendResult::WriteNotAllowed`, synchronously and with no completion (R05a amends R03b's `OpStatus::InvalidRequest`, which doesn't exist). The docs say the bits are not interpreted on raw topics.
+- **R05c (amended).** The key index is never checkpointed. Each new leadership rebuilds it from the local log. While it rebuilds, intents are **not** refused: they are accepted, judged at fold once the rebuild finishes, and their `View` acks wait meanwhile (P5-1). `HookRefusal::KeyIndexActivating` (`NotLeader`) covers only the window before the key index's `ConstraintSetChange` record is committed (P5-4).
+- **R05b.** Part 11 defines the C8 atomic-batch header bit. This part does not.
+- **R07d (reworded).** `ViewKey::fromU64` / `asU64` are Part 04's (`ViewKey.h`). This part takes them from 04; Part 07 later extends `ViewKey` without renaming them.
 - **R02b / R03e.** A tombstone skips value validation; only its key width (exactly `keyWidth`) is checked.
 - **R04e.** An in-window idempotent duplicate with `View` on a verdict source is answered with the original's verdicts once `W > lastOffset`. Outside the window it gets `DuplicateSequence` (21), which the client reports as one `OpStatus::VerdictUnknown` for the whole batch. So a retried `insert` gets its own original `Ok`, never `KeyExists` against itself.
 - **R04d / R04f.** Part 04's contract additions bind this part: `ConstraintSet`, `ConstraintSetMember`, `ConstraintSetTimeline`, `kMaxVerdictViewsPerSource = 32`, `MarkerLedger`, `RcVerdictHooks`, the `TestReject` seam. Matrix enums are append-only.
@@ -99,7 +102,7 @@ Copied verbatim from the overview (Plan 00), restricted to what this part touche
   - **Replay pace.** The replay folds at most `kKeyIndexReplayRecordsPerPass = 65536` records per duty pass. Delivery and `View` acks wait meanwhile (04: the judge starts only when every member is at its cursor). Consumers still get every offset below K.
 - **P5-2 — The key word.**
   - **Mapping.** The key index keys its table by `keyIndexWord(wireKey)`: the wire key's bytes packed little-endian into a `uint64_t`, after an exact check that `wireKey.size() == spec.keyWidth`. With `keyWidth ≤ 8` (SD8) and one width per topic, the mapping is injective for every topic key type, including `string(N ≤ 8)`. `decodeWireKey` (`ViewFold.cpp:73-110`) handles integers only, which is why the key index has its own fold (Task 6).
-  - **Probes.** Every probe goes through `rune::view::ViewKey::fromU64(word).asU64()`. That is the one place Part 07 replaces with `ViewKey::fromBytes` when it widens the index to 16 bytes.
+  - **Probes.** Every probe goes through `rune::view::ViewKey::fromU64(word).asU64()` (Part 04's `ViewKey.h`, R07d). That is the one place Part 07 replaces with `ViewKey::fromBytes` when it widens the index to 16 bytes.
 - **P5-3 — Intent rules at fold** (§5.1). The key state is taken from the prospect, computed before any member applies.
 
   | Record | Intent | Key exists | Key absent |
@@ -139,10 +142,11 @@ Copied verbatim from the overview (Plan 00), restricted to what this part touche
   - **Client exposure.** The client decodes the response block. Exposing it in `TopicSchemaResult` is Part 06's job, because the partitioner is its first consumer.
 - **P5-9 — Client local refusals (§11.2 "the client refuses locally first", R03b).** Each is a synchronous `SendResult::WriteNotAllowed`: nothing is queued and no completion follows. The blocking forms throw `std::invalid_argument` naming the rule.
   - `intent != Upsert` on a `TopicHandle` whose `kind == TopicKind::Raw` ("intents need a typed topic").
+  - `View` in the producer's acks on a `TopicHandle` whose `kind == TopicKind::Raw`, for any intent ("acks View needs a typed topic"; R05a). This check runs on every send of a `View` producer, behind the same handle-kind branch, so a non-`View` producer pays nothing new.
   - `intent != Upsert` without `View` in the producer's acks ("intents need acks including View").
   - `intent != Upsert` on a transactional producer ("intents inside a transaction need Part G").
   - `Insert` with an empty value (P5-5).
-  - **Not checked locally.** A typed topic without a key index (the broker's definite `InvalidRequest` is the answer), and the broker version (03's `View` gate gives `BrokerTooOld` at seal).
+  - **Not checked locally.** A typed topic without a key index (the broker's definite `InvalidRequest` is the answer), the broker version (03's `View` gate gives `BrokerTooOld` at seal), and a handle of kind `Unknown` (a hand-built `TopicHandle`).
   - **What carries no intent.** Tier-2 batches (`Producer::batch`, `BatchBuilder`) and claims are upsert-only in this part. That is a follow-up issue. No intent can therefore appear inside an explicit atomic batch from a Rune client.
 - **P5-10 — The typed API (C15).** For each op X ∈ {`insert`, `update`, `upsert`, `remove`, `removeExisting`}, `TypedTopic<T>` gets:
   - `void X(arg, Completions& cq, Token token)`, which follows `Producer::send(…, cq, token)`'s rules;
@@ -207,11 +211,13 @@ Copied verbatim from the overview (Plan 00), restricted to what this part touche
    - `CheckedWritesModel`: `void addKeyIndexRule();` and `[[nodiscard]] bool isLiveAtJudge(uint64_t id) const;`;
    - matrix `Op` 20–24, `Entity` 20–25, `expect05`, pin row 05.
 
+10. **`NodeConfig` test knob:** `int32_t testAdvertisedBrokerVersion = 0;` (`NodeConfig.h`, beside `testSupportedFeatureLevel` at `:321`; TEST-ONLY, 0 = `kBrokerVersion`). `BrokerNode` passes it to the gateway at start, and the OK `ConnectResponse` built at `ClientGateway.cpp:2544` sets `resp.brokerVersion` from it when it is above 0. It lets a real-broker test present an older broker to the client's SD11 gate. Task 10 adds it.
+
 ## Contract gaps (flagged to the controller)
 
-- **R03b names `OpStatus::InvalidRequest`, which doesn't exist** (`Completion.h:54-69`). A `TypedTopic` can't bind to an untyped topic (Part 02), so the local refusal only ever meets a raw handle. This part answers it with the C6 value `SendResult::WriteNotAllowed`, synchronously and with no completion. No new `OpStatus` is added.
-- **C8 says "05/11 define" the `atomicBatch` header bit.** This part needs none (P5-9: Tier-2 batches carry no intent). Part 09's rule 7 and Part 11 must define it.
-- **The spec's §5.2 mentions "the checkpoint" of the key index.** This part rebuilds it on every activation and never checkpoints it (P5-1). The reason is correctness under compaction. The cost is a replay of the local log per leadership. This is flagged for the owner, with a follow-up issue "checkpoint the key index once restart rebuild time matters".
+- **R03b's `OpStatus::InvalidRequest` doesn't exist** (`Completion.h:54-69`). Resolved by R05a: a `TypedTopic` can't bind to an untyped topic (Part 02), so the local refusal only ever meets a raw handle, and it is answered with the C6 value `SendResult::WriteNotAllowed`, synchronously and with no completion. No new `OpStatus` is added.
+- **C8 says "05/11 define" the `atomicBatch` header bit.** This part needs none (P5-9: Tier-2 batches carry no intent). Part 11 defines it (R05b).
+- **The spec's §5.2 mentions "the checkpoint" of the key index.** This part rebuilds it on every activation and never checkpoints it (P5-1, R05c). The reason is correctness under compaction. The cost is a replay of the local log per leadership. This is flagged for the owner, with the follow-up issue "checkpoint the key index, guarded by a cleaner 'tombstones removed through' watermark".
 - **`TopicHandle` field order.** 05 appends `kind`, then Part 06 appends `partitioner`.
 - **03's requirement sweep.** Invariant (iv) gains its one exception (contract addition 5), and the sweep doubles to 172,032 cells (the new fact bit).
 - **`ApplyV2` stays open until the release.** Part 06 appends autoincrement apply rules (P5-7).
@@ -496,7 +502,7 @@ Built on 04's `CheckedWritesRig` with `createKeyIndex()` (topic `{id uint64 key,
   struct Record { /* existing */ uint8_t attributes = 0; [[nodiscard]] RecordOp op() const noexcept; };
   enum class TopicKind : uint8_t { Unknown = 0, Raw = 1, Typed = 2 };
   ```
-  - **The local refusals (P5-9)** run in `Producer::trySend` / `trySendTo` (the handle is known there) before `trySubmit`. They sit behind one `[[unlikely]] if (intent != WriteIntent::Upsert)`, so an upsert pays a single predicted branch.
+  - **The local refusals (P5-9)** run in `Producer::trySend` / `trySendTo` (the handle is known there) before `trySubmit`. They sit behind one `[[unlikely]] if (intent != WriteIntent::Upsert || (viewAcks_ && topic.kind == TopicKind::Raw))`, where `viewAcks_` is the producer's constant `has(acks, View)`, so an upsert pays a single predicted branch.
   - **The intent rides the ring flags byte as bits 1–2** (`flags |= intentBits(intent) << kFlagIntentShift`). Direct mode passes the same flags to `appendRecord_`. Deferred records keep their flags. `appendRecord_` passes `(flags & kFlagIntentMask) >> kFlagIntentShift` as the record's `attributes`.
   - **`sendAndWait`** goes through `impl_->hooks().andWait` exactly as `txnAndWait_` does (`Producer.cpp:530-554`). The issue lambda calls `trySend(topic, key, value, *target.cq, token, intent)`, then `flush()`. It maps `SendResult::Ok` to an accepted issue, and every other result to a thrown `std::invalid_argument` (P5-9 refusals, `KeyTooLong`, `MessageTooLarge`) or `std::runtime_error` (back-pressure past the timeout). It returns the `Send` completion unchanged.
   - **`defineTopic`** sets `msg.hasKeyFeatures = topic.keyFeatures != TopicKeyFeatures{}` and `msg.keyFeatures`. When `hasKeyFeatures` and the seed's `brokerVersion` (the value P3-4 reads at `Client.cpp:2228`) is in `[1, kBrokerVersionCheckedWrites)`, the op completes `OpStatus::BrokerTooOld` locally and nothing is sent.
@@ -508,11 +514,12 @@ Built on 04's `CheckedWritesRig` with `createKeyIndex()` (topic `{id uint64 key,
     - `CheckedWritesIntents.LocalRefusalsAreWriteNotAllowed`:
       - `TopicHandle{.topicId = 3, .partitionCount = 1, .kind = TopicKind::Raw}` + `Insert` → `SendResult::WriteNotAllowed`;
       - an `All` producer (no `View`) + `Update` → `WriteNotAllowed`;
+      - an `All | View` producer on the `Raw` handle + `Upsert` → `WriteNotAllowed` (R05a: `View` on an untyped topic);
       - a transactional `All | View` producer + `Insert` → `WriteNotAllowed`;
       - `Insert` with an empty value → `WriteNotAllowed`;
       - in every case nothing is queued (`cap.frames.empty()` after a flush) and no completion arrives in the cq.
-      - The blocking `send` throws `std::invalid_argument` whose `what()` contains, respectively, "intents need a typed topic", "intents need acks including View", "intents inside a transaction need Part G", "an insert needs a value".
-    - `CheckedWritesIntents.UpsertOnARawHandleIsUnchecked`: `kind = Raw` + `Upsert` → `Ok`.
+      - The blocking `send` throws `std::invalid_argument` whose `what()` contains, respectively, "intents need a typed topic", "intents need acks including View", "acks View needs a typed topic", "intents inside a transaction need Part G", "an insert needs a value".
+    - `CheckedWritesIntents.UpsertOnARawHandleIsUnchecked`: an `All` producer (no `View`), `kind = Raw` + `Upsert` → `Ok` and one frame.
     - `CheckedWritesIntents.IntentOnAnOldBrokerIsBrokerTooOld`: `setBrokerVersion(6)`, `All | View`, `Insert` → no frame, and one completion `OpStatus::BrokerTooOld` (03's gate, unchanged).
     - `CheckedWritesIntents.DirectModeAndDeferredRecordsKeepTheirIntent`: an Invoker `Direct` producer sends an `Insert` from inside its own ack callback (the deferred arena path, `ProducerImpl.cpp:497`). The applied record's attribute is 1.
     - `CheckedWritesIntents.SendAndWaitReturnsThePerRecordVerdict`: a fake session answers the v12 `ProduceResponse` with the trailer `{(0, 52, 0)}` → `sendAndWait(…, Insert, 1s)` returns `BrokerError`, `errorCode 52`, `constraintIdOf == 0`. An empty trailer → `Ok`, `value == baseOffset`.
@@ -667,9 +674,10 @@ Built on 04's `CheckedWritesRig` with `createKeyIndex()` (topic `{id uint64 key,
   - the `switch (kind)` cases for `VerdictViewKind::KeyIndex` in prepare, evaluate, apply and the member replay of `driveJudge`;
   - the stats.
 - Create: `broker/libs/node/tests/node/CheckedWritesKeyIndexTest.cpp` (in `rune_checked_writes_tests`)
+- Modify: `broker/libs/node/CMakeLists.txt`: add `broker/libs/view/tests` to the include directories of `rune_checked_writes_tests`, so the test can include Part 01's `view/AbortedFoldLog.h` (`TxnLog`). Part 01 exports no include path for it.
 
 **Interfaces:**
-- Consumes: 04's `SourceRecord`, `Prospect`, `ProspectOp`, `PrepareStatus`, `Verdict`, `FoldSkip`, `isAbortedBatch`, `isRejectedRecord`, `ViewKey::fromU64` / `asU64`, `VerdictSource::judge` / `driveJudge` / `addVerdictView`, and the `installTestVerdictViewForTest` unit harness (04 Task 5's fake `readRange` over `InMemoryLog` batches).
+- Consumes: 01's `FoldSkip` and `isAbortedBatch` (`FoldSkip.h`); 04's `SourceRecord`, `Prospect`, `ProspectOp`, `PrepareStatus`, `Verdict`, `isRejectedRecord`, `ViewKey::fromU64` / `asU64` (R07d), `VerdictSource::judge` / `driveJudge` / `addVerdictView`, and the `installTestVerdictViewForTest` unit harness (04 Task 5's fake `readRange` over `InMemoryLog` batches).
 - Produces (contract addition 6):
   - **`prepareKeyIndex`** sets `p.op = rec.value.empty() ? Erase : Upsert`, `p.rowCount = 1`, `rows[0].key = ViewKey::fromU64(keyIndexWord(rec.key))`, `rows[0].existed = table.get(word) != nullptr` and `rows[0].removed = rec.value.empty()`. A key whose size isn't `keyWidth` → `Malformed`.
   - **`evaluateIntent`** is the P5-3 table. A `Malformed` prospect → accepted.
@@ -849,6 +857,7 @@ Built on 04's `CheckedWritesRig` with `createKeyIndex()` (topic `{id uint64 key,
 
 **Files:**
 - Modify: `broker/libs/node/tests/client/CheckedWritesBrokerRegressionTest.cpp` (in `rune_client_broker_tests`)
+- Modify: `broker/libs/node/include/rune/node/NodeConfig.h:321` (`testAdvertisedBrokerVersion`), `broker/libs/node/src/BrokerNode.cpp` (passes it to the gateway at start), `broker/libs/gateway/include/rune/gateway/ClientGateway.h` and `broker/libs/gateway/src/ClientGateway.cpp:2544` (the OK `ConnectResponse` takes it) (contract addition 10)
 
 **Interfaces:**
 - Consumes: everything above; `KeyIndexRecords.h` (Task 9); `OneBroker(tag, Runtime::Shard, tweak)`, `ThreeNodes`; `defineTopicAndWait(…, TopicOptions{.keyFeatures = {.keyIndex = true}})`; `openTopicAndWait<KiAccount>`; `rawTopicAndWait`.
@@ -869,11 +878,11 @@ Built on 04's `CheckedWritesRig` with `createKeyIndex()` (topic `{id uint64 key,
     - after the cleaner pass (`onCleanerThreadForTest`, as `BrokerNodeTest.cpp:523` does) no key is live.
   - `CheckedWritesBrokerRegression.IntentsToAnOlderClusterAreRefusedShardRegression` (§15):
     - a broker with `testSupportedFeatureLevel = 3`: `insertAndWait` → `status() == BrokerError`, `code() == 39`, and the LEO is unchanged. The `key.index` DDL → 39 "key.index needs every broker at feature level 4".
-    - a client whose seed reports `brokerVersion 6` (the `testBrokerVersion` tweak 03 uses) → `status() == BrokerTooOld`, and nothing is sent.
+    - a broker started with `NodeConfig::testAdvertisedBrokerVersion = 6` (contract addition 10), so its `ConnectResponse.brokerVersion` is 6 → `status() == BrokerTooOld`, and nothing is sent.
   - `CheckedWritesKeyIndexRegression.RawIntentShapesAreRefusedOrOpaqueRegression` (Review Focus 5). A raw `Producer` with `All | View`:
     - on the `ki` topic handle (`kind = Unknown`, so no local check), hand-built records `attributes = 3` → 39; an insert with an empty value → 39; LEO unchanged both times;
     - on a typed topic without a key index, intent 1 → 39 (`NoKeyIndex`);
-    - on `rawTopicAndWait("raw")` with `kind = Raw`, `Insert` → `SendResult::WriteNotAllowed`;
+    - on `rawTopicAndWait("raw")` with `kind = Raw`, `Insert` → `SendResult::WriteNotAllowed`, and a plain `Upsert` from the `All | View` producer → `WriteNotAllowed` too (R05a);
     - a handle `TopicHandle{rawId, 1}` (Unknown) with intent 2 → accepted and stored; a subscriber sees `attributes == 2` and `op() == Update` (R03b: opaque).
   - `CheckedWritesBrokerRegression.LoginRaceOnAKeyIndexThreeNodesRegression`:
     - `ThreeNodes::start("cw05")`, `replicas 3`;
@@ -885,7 +894,9 @@ Built on 04's `CheckedWritesRig` with `createKeyIndex()` (topic `{id uint64 key,
 - [ ] **Step 2: Run.** `cmake --build build/root -j14 --target rune_client_broker_tests && ctest --test-dir build/root -R 'CheckedWritesBrokerRegression|CheckedWritesKeyIndexRegression' --output-on-failure`, then `--repeat until-fail:3 -j4`. Expected: PASS every round. A failure here is a defect in Tasks 1–9: fix it there with its own `Regression` test, never by relaxing the cell.
 - [ ] **Step 3: Commit.**
   ```bash
-  git add broker/libs/node/tests/client/CheckedWritesBrokerRegressionTest.cpp
+  git add broker/libs/node/tests/client/CheckedWritesBrokerRegressionTest.cpp broker/libs/node/include/rune/node/NodeConfig.h \
+          broker/libs/node/src/BrokerNode.cpp broker/libs/gateway/include/rune/gateway/ClientGateway.h \
+          broker/libs/gateway/src/ClientGateway.cpp
   git commit -m "test(e2e): intents and the key index on real brokers - typed API, DDL refusals, remove routing, older clusters, login race, restart" \
              -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   ```
@@ -965,7 +976,7 @@ Built on 04's `CheckedWritesRig` with `createKeyIndex()` (topic `{id uint64 key,
     - that it rebuilds from the log on each leadership and restart, with delivery and `View` acks waiting meanwhile;
     - `keyIndexRebuilds` and the rejection stats (C16 ids 1 and 2);
     - the 8-byte key limit until wide keys ship.
-  - **`client-cpp/CLAUDE.md` §2.1:** "intents ride record attributes bits 0–1; the client refuses them locally without `View`, inside a transaction, or on a raw handle".
+  - **`client-cpp/CLAUDE.md` §2.1:** "intents ride record attributes bits 0–1; the client refuses them locally without `View`, inside a transaction, or on a raw handle, and refuses any `View` send on a raw handle (R05a)".
 - [ ] **Step 6: Commit.**
   ```bash
   git add broker/libs/node/tests/node/CheckedWritesAllocRegressionTest.cpp broker/benchmark/ViewFoldBench.cpp \
@@ -988,7 +999,7 @@ Built on 04's `CheckedWritesRig` with `createKeyIndex()` (topic `{id uint64 key,
 - [ ] Checkpoint C green.
 - [ ] Whole-branch review by the most capable model. The reviewer leaves PR comments, and the implementer resolves each one.
 - [ ] File the deferred items as labelled GitHub issues on `arcanumruna/rune`, in one batch with one summary at the end:
-  1. "Checkpoint the key index (today rebuilt from the log on every leadership)", `enhancement`, `sev:low`, `area:broker` (P5-1).
+  1. "Checkpoint the key index, guarded by a cleaner 'tombstones removed through' watermark (today rebuilt from the log on every leadership)", `enhancement`, `sev:low`, `area:broker` (P5-1, R05c).
   2. "Intents on Tier-2 batches and claims (`BatchBuilder`, `tryClaim`)", `enhancement`, `sev:low`, `area:client` (P5-9).
   3. "Expose `TopicKeyFeatures` from `TopicSchemaResult`", `enhancement`, `sev:low`, `area:client`, for Part 06 (P5-8).
   4. Every recorded deviation that is not urgent.
@@ -1027,6 +1038,7 @@ Built on 04's `CheckedWritesRig` with `createKeyIndex()` (topic `{id uint64 key,
 - **Type consistency.**
   - `TopicKeyFeatures`, `Partitioner`, `WriteIntent`, `RecordOp`, `WriteResult` and `VerdictViewKind::KeyIndex` are spelled as in C9, C13 and C15.
   - `kKeyIndexPlanFingerprint`, `KeyIndexFold`, `prepareKeyIndex`, `evaluateIntent`, `applyKeyIndex`, `foldKeyIndexBatch`, `keyIndexWord`, `keyIndexes_`, `keyIndexActive`, `KeyIndexActivating`, `createKeyIndex(KeyShape, bool)`, `enableKeyIndex()`, `keyIndexKeys()` and `addKeyIndexRule()` are defined once (contract additions 5–9) and used with the same names in Tasks 6–12.
-  - Part 07's preconditions (the SD8 message, `VerdictViewKind::KeyIndex` in `VerdictSource.cpp`, the rig's `createKeyIndex()`, the probes through `ViewKey::fromU64`) match.
+  - Part 07's preconditions (the SD8 message, `VerdictViewKind::KeyIndex` in `VerdictSource.cpp`, the rig's `createKeyIndex()`, the probes through Part 04's `ViewKey::fromU64`) match.
+  - `testAdvertisedBrokerVersion` (contract addition 10) is defined once and used only in Task 10.
 - **Review Focus.** Each of the five has its named test in its owning task: 7, 7, 7, 6/8, 10/3.
 - **Proportion.** The plan fixes decisions, placements, signatures and assertions. The fold body, the DDL checks, the client plumbing, the probe and the rig bodies are left to the implementer within the stated rules.
