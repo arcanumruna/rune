@@ -3089,6 +3089,14 @@ void PartitionReplica::shrinkIsrToLive(std::span<const int32_t> live, int64_t no
     (void)changeIsr_(desired, nowNs);
 }
 
+void PartitionReplica::clearInternalFencing(int64_t nowNs)
+{
+    // #572: only the consensus leader fences (shrinkIsrToLive); a mask left from when this node led is cleared.
+    if (role_ != Role::Leader || !internalQuorum_() || internalFencedMask_ == 0) return;
+    internalFencedMask_ = 0;
+    (void)updateIsr_(nowNs);
+}
+
 bool PartitionReplica::updateIsr_(int64_t nowNs)
 {
     if (role_ != Role::Leader || isrManager_ == nullptr) return false;

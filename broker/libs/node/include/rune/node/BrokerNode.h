@@ -1864,6 +1864,15 @@ public:
             return 0;
         });
     }
+    /// The consensus leader (this node, if it is) stands down for `holdMs` (Election::standDown; posted to the
+    /// control thread).  Unlike a resign it stands again once the hold ends (PR #601 review: leader flap).
+    template <class = void>
+    bool standDownConsensusForTest(int64_t holdMs) {
+        return onControlThreadForTest([this, holdMs]() {
+            return election_ && election_->standDown(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(), holdMs * 1'000'000);
+        });
+    }
     /// CP1-I1: the replication transport (control-thread state; read it through onControlThreadForTest).
     [[nodiscard]] rune::replication::AeronPartitionTransport* replTransportForTest() const noexcept { return replTransport_.get(); }
 

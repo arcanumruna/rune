@@ -108,6 +108,12 @@ tp.commitTransactionAndWait();                            // outputs and offsets
 | At least once | `Acks::Leader` or `Acks::All` (a retry never writes a record twice) | commit after handling |
 | Exactly once | `transactionalId`: outputs and consumed offsets commit together | `ReadCommitted` readers; `seekToCommitted()` after an abort |
 
+Durability of an acknowledged record depends on the ack level. `Acks::Leader` (the default, like Kafka `acks=1`)
+acknowledges once the partition leader has the record: a leader restart or loss before the followers replicate it can
+lose acknowledged records. `Acks::All` waits until the in-sync replicas hold it with at least `minIsr` of them
+(`RUNE_MIN_ISR`, default the cluster majority), so with `minIsr` at least 2 an acknowledged record survives the loss
+of any single broker. Use `Acks::All` for durability.
+
 ## Catalog DDL and history
 
 Topics exist only through DDL; the broker has no boot-topics setting. DDL is sent to any broker: a

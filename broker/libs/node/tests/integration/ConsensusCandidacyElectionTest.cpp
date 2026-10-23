@@ -540,15 +540,19 @@ TEST(StorageGateWiringRegression, JoinerElectionIsHeldFromBootRegression) {
     EXPECT_EQ(gateStateOf(c, X), 1);
 }
 
-// B-I8 + A-C2 (deterministic): a wiped, unconfirmed member never becomes consensus leader while the others hold; the
-// committed metadata survives the real leader's return.  Issue #53: the original premise - X, wiped and restarted as a
-// Joiner, is still in the committed metadata ISR so every vote would go to it - no longer holds.  The broker fences
-// (NodeRuntimeAgent shrinkIsrToLive, Kafka-style, ~450 ms) every internal partition's ISR down to the members the cluster
-// sees as live and eligible, so X is out of the metadata ISR before the test can observe it.  What replaces "the others
-// hold" is that fencing: X is not in the knowledge of L or Y, so no vote goes to it.  RED: removing the internal-
-// partition fencing (NodeRuntimeAgent: shrinkIsrToLive on topicId < 0 leaders) fails the fencing assertion.  This test
-// does NOT pin X's own storage hold any more: with X fenced out, dropping the hold (both setStorageHold sites) stays
-// green here - that hold is pinned by StorageGateWiringRegression.JoinerElectionIsHeldFromBootRegression (PR #574 review).
+// B-I8 + A-C2 (deterministic): a wiped, unconfirmed member never becomes consensus leader while the others hold, nor
+// after they are released; a leader is elected and the committed metadata survives the hand-over.  Issue #53: the
+// original premise - X, wiped and restarted as a Joiner, is still in the committed metadata ISR so every vote would go
+// to it - no longer holds.  The broker fences (NodeRuntimeAgent shrinkIsrToLive, Kafka-style, ~450 ms) every internal
+// partition's ISR down to the members the consensus leader sees as live and eligible, so X is out of the metadata ISR
+// before the test can observe it.  What replaces "the others hold" is that fencing: X is not in the knowledge of L or Y,
+// so no vote goes to it.  After L resigns it no longer fences (#572: only the consensus leader has liveness knowledge) -
+// it clears its fenced mask, but X stays out: it keeps testHoldFollowerFetchesMs, so it never proves a validated position
+// and never re-enters the ISR.  RED: removing the internal-partition fencing (NodeRuntimeAgent: shrinkIsrToLive on
+// topicId < 0 leaders) fails the fencing assertion; fencing on a resigned leader too (#572) leaves Y fenced out and no
+// leader is agreed.  This test does NOT pin X's own storage hold: with X fenced out, dropping the hold (both
+// setStorageHold sites) stays green here - that hold is pinned by
+// StorageGateWiringRegression.JoinerElectionIsHeldFromBootRegression (PR #574 review).
 TEST(ConsensusCandidacyElectionRegression, WipedMemberNeverConsensusLeader_CommittedMetadataSurvivesRegression) {
     Cluster c(3);
     for (int i = 0; i < 3; ++i) c.start(i);
@@ -569,18 +573,21 @@ TEST(ConsensusCandidacyElectionRegression, WipedMemberNeverConsensusLeader_Commi
     c.node(L).setTestCandidacyHold(true);
     c.node(L).resignConsensusForTest();
     // 2 s window: ample to see an unheld X win if it could (it did so within ~0.3 s when it was still in the ISR).
-    const auto until5s = std::chrono::steady_clock::now() + 2s;
+    const auto window = std::chrono::steady_clock::now() + 2s;
     bool xLed = false, agreed = false;
     std::string isrHistory;   // diagnostics only: L's metadata-ISR knowledge over the window
     std::string lastK;
-    while (std::chrono::steady_clock::now() < until5s) {
-        for (int i = 0; i < 3; ++i) if (c.election(i).closedWith(X)) xLed = true;
-        if (c.agreedLeader({0, 1, 2}) != -1) agreed = true;
+    const auto noteKnowledge = [&] {
         if (const std::string k = str(c.knowledge(L)); k != lastK) {
             lastK = k;
             isrHistory += " " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
                               std::chrono::steady_clock::now().time_since_epoch()).count() % 100000) + ":" + k;
         }
+    };
+    while (std::chrono::steady_clock::now() < window) {
+        for (int i = 0; i < 3; ++i) if (c.election(i).closedWith(X)) xLed = true;
+        if (c.agreedLeader({0, 1, 2}) != -1) agreed = true;
+        noteKnowledge();
         std::this_thread::sleep_for(10ms);
     }
     EXPECT_FALSE(xLed) << "the wiped member became consensus leader (L's ISR knowledge over the window:" << isrHistory << ")";
@@ -588,17 +595,130 @@ TEST(ConsensusCandidacyElectionRegression, WipedMemberNeverConsensusLeader_Commi
 
     c.node(Y).setTestCandidacyHold(false);
     c.node(L).setTestCandidacyHold(false);
-    // BLOCKER (#53, step 4 of the recipe): after the resign L fences Y out of the metadata ISR too (knowledge {L}) and
-    // then no node wins - L's pre-votes are denied and the cluster does not converge on L or Y even 20 s after both holds
-    // are released.  That liveness gap is a product issue filed separately, so the test stops short of asserting a
-    // leader: it checks what holds today, that X never leads after the release and the committed log is intact on L.
-    const auto settle = std::chrono::steady_clock::now() + 2s;
-    while (std::chrono::steady_clock::now() < settle) {
+    int32_t leader = -1;
+    const bool elected = until([&] {
         for (int i = 0; i < 3; ++i) if (c.election(i).closedWith(X)) xLed = true;
+        noteKnowledge();
+        leader = c.agreedLeader({L, Y});
+        return leader >= 0;
+    }, 15s);
+    EXPECT_FALSE(xLed) << "the wiped member became consensus leader";
+    ASSERT_TRUE(elected) << "no leader was agreed after both holds were released (L's ISR knowledge:" << isrHistory
+                         << " knowY=" << str(c.knowledge(Y)) << ")";
+    EXPECT_NE(leader, X) << "the wiped member became consensus leader";
+    EXPECT_TRUE(until([&] {
+        for (int i = 0; i < 3; ++i) if (c.election(i).closedWith(X)) xLed = true;
+        const auto m = c.meta(leader);
+        return m.leader && m.leo >= hw;
+    }, 15s)) << "committed metadata was lost across the hand-over to " << leader << " (leo=" << c.meta(leader).leo
+             << " hw=" << hw << ")";
+    EXPECT_FALSE(xLed) << "the wiped member became consensus leader";
+}
+
+// #572: a resigned consensus leader never fences a live peer out of the internal (metadata) ISR.  Only the consensus
+// leader receives AppendPosition, so only it knows who is live; after Election::resign the old leader's liveness decays
+// and - before the fix - the fencing pass (NodeRuntimeAgent, shrinkIsrToLive on every internal partition it still leads)
+// shrank the committed metadata ISR to itself within ~450 ms.  Y acked that, was no longer electable, and with L held
+// no member could win.  RED: shrink on every node regardless of consensus leadership (the leader gate in
+// NodeRuntimeAgent's failover slow tick).
+TEST(ConsensusCandidacyElectionRegression, AResignedLeaderNeverFencesALivePeerOutOfTheMetadataIsrRegression) {
+    Cluster c(3);
+    for (int i = 0; i < 3; ++i) c.start(i);
+    const int32_t L = settledLeader(c, {0, 1, 2}, 20s);
+    ASSERT_GE(L, 0);
+    ASSERT_EQ(c.defineTopic(), 0);
+    const int X = (L + 1) % 3, Y = (L + 2) % 3;
+    const auto allIn = [&](const InternalIsrState& k) { return k.contains(L) && k.contains(X) && k.contains(Y); };
+    ASSERT_TRUE(until([&] { return allIn(c.knowledge(L)) && allIn(c.knowledge(Y)); }, 5s))
+        << "precondition: every member is in the committed metadata ISR (knowL=" << str(c.knowledge(L))
+        << " knowY=" << str(c.knowledge(Y)) << ")";
+    const int64_t hw = c.meta(L).hw;
+
+    c.node(X).setTestCandidacyHold(true);
+    c.node(Y).setTestCandidacyHold(true);
+    c.node(L).setTestCandidacyHold(true);
+    c.node(L).resignConsensusForTest();
+    // 2 s window: more than 3x the failover timeout (3 x leaderHeartbeatTimeout; the issue saw Y fenced at ~450 ms).
+    const auto window = std::chrono::steady_clock::now() + 2s;
+    std::string firstLoss;
+    while (std::chrono::steady_clock::now() < window && firstLoss.empty()) {
+        const auto kl = c.knowledge(L), ky = c.knowledge(Y);
+        if (!kl.contains(X) || !kl.contains(Y) || !ky.contains(X) || !ky.contains(Y))
+            firstLoss = "knowL=" + str(kl) + " knowY=" + str(ky);
         std::this_thread::sleep_for(10ms);
     }
-    EXPECT_FALSE(xLed) << "the wiped member became consensus leader";
-    EXPECT_GE(c.meta(L).leo, hw) << "committed metadata was lost on the real leader";
+    EXPECT_TRUE(firstLoss.empty()) << "the resigned leader fenced a live peer out of the metadata ISR: " << firstLoss;
+
+    c.node(Y).setTestCandidacyHold(false);
+    EXPECT_TRUE(until([&] { return c.agreedLeader({0, 1, 2}) == Y; }, 10s))
+        << "Y never led after its hold was released (knowL=" << str(c.knowledge(L)) << " knowY=" << str(c.knowledge(Y))
+        << " agreed=" << c.agreedLeader({0, 1, 2}) << ")";
+    EXPECT_TRUE(until([&] { const auto m = c.meta(Y); return m.leader && m.leo >= hw; }, 10s))
+        << "committed metadata was lost across the hand-over (leo=" << c.meta(Y).leo << " hw=" << hw << ")";
+}
+
+// PR #601 adversarial review (#572, sibling entry point + leader flap): the consensus leader STANDS DOWN
+// (Election::standDown - the halted-applier path, not resign) twice with the other members held, so each time no node
+// leads for longer than the fencing timeout (3 x leaderHeartbeatTimeout); after each hold it stands again and wins
+// (leader -> not leader -> leader).  No live member may leave ANY node's committed metadata ISR at any point, and after
+// the flaps the metadata log still commits (a second DDL) with every member in the ISR.  Seeded: the hold of each
+// flap is drawn from [2000, 2400) ms (the seed is printed on failure).  RED: drop the consensus-leader gate in
+// NodeRuntimeAgent's failover slow tick (shrink on every node) - the stood-down leader fences X and Y.
+TEST(ConsensusCandidacyElectionRegression, StoodDownLeaderFlapNeverFencesALivePeerAdversarialRegression) {
+    const uint32_t seed = 601u;
+    SCOPED_TRACE("seed=" + std::to_string(seed));
+    uint32_t rng = seed;
+    const auto next = [&] { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+    Cluster c(3);
+    for (int i = 0; i < 3; ++i) c.start(i);
+    const int32_t L = settledLeader(c, {0, 1, 2}, 20s);
+    ASSERT_GE(L, 0);
+    ASSERT_EQ(c.defineTopic(), 0);
+    const int X = (L + 1) % 3, Y = (L + 2) % 3;
+    const auto allIn = [&](const InternalIsrState& k) { return k.contains(L) && k.contains(X) && k.contains(Y); };
+    ASSERT_TRUE(until([&] { return allIn(c.knowledge(L)) && allIn(c.knowledge(X)) && allIn(c.knowledge(Y)); }, 5s))
+        << "precondition: every member is in the committed metadata ISR";
+    const int64_t hw0 = c.meta(L).hw;
+
+    c.node(X).setTestCandidacyHold(true);
+    c.node(Y).setTestCandidacyHold(true);
+    std::string firstLoss;
+    const auto check = [&] {
+        if (!firstLoss.empty()) return;
+        const auto kl = c.knowledge(L), kx = c.knowledge(X), ky = c.knowledge(Y);
+        if (!allIn(kl) || !allIn(kx) || !allIn(ky))
+            firstLoss = "knowL=" + str(kl) + " knowX=" + str(kx) + " knowY=" + str(ky);
+    };
+    for (int flap = 0; flap < 2; ++flap) {
+        SCOPED_TRACE("flap " + std::to_string(flap));
+        const int64_t holdMs = 2000 + static_cast<int64_t>(next() % 400);
+        ASSERT_TRUE(c.node(L).standDownConsensusForTest(holdMs)) << "precondition: L leads and stands down";
+        bool sawHeadless = false;
+        // Never L while held; L wins again once the hold ends (X and Y only vote).
+        const bool releed = until([&] {
+            check();
+            const auto v = c.election(L);
+            if (!v.closedWith(L)) sawHeadless = true;
+            return sawHeadless && c.agreedLeader({0, 1, 2}) == L;
+        }, 20s);
+        ASSERT_TRUE(sawHeadless);
+        ASSERT_TRUE(releed) << "L never led again after its stand-down hold (agreed=" << c.agreedLeader({0, 1, 2})
+                            << " knowL=" << str(c.knowledge(L)) << ")";
+        EXPECT_TRUE(firstLoss.empty()) << "a live member left the committed metadata ISR: " << firstLoss;
+    }
+    c.node(X).setTestCandidacyHold(false);
+    c.node(Y).setTestCandidacyHold(false);
+
+    // The metadata log still commits after the flaps, with every member in its ISR.
+    rune::node::TopicSpec t2 = c.topic();
+    t2.name = "cce2";
+    std::vector<BrokerNode*> up{&c.node(0), &c.node(1), &c.node(2)};
+    EXPECT_GE(rune::node::test::TestCluster(std::move(up)).defineTopic(t2), 0) << "no DDL commits after the flaps";
+    EXPECT_TRUE(until([&] { check(); const auto m = c.meta(L); return m.leader && m.hw > hw0 && m.isr.size() == 3; },
+                      15s))
+        << "the metadata HW did not advance with the full ISR (hw=" << c.meta(L).hw << " hw0=" << hw0
+        << " isr=" << c.meta(L).isr.size() << ")";
+    EXPECT_TRUE(firstLoss.empty()) << "a live member left the committed metadata ISR: " << firstLoss;
 }
 
 // R-I1: three nodes formatted `auto`, all held at boot, decide their storage first; releasing the holds forms the
