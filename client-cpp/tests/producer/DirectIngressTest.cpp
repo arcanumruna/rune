@@ -4,6 +4,7 @@
 // thread, so send() appends straight into the partition builder (no ring hop) and
 // the records of one pass leave as one frame per partition at the end of the pass.
 // Every drive loop is iteration-capped; nothing sleeps.
+#include <filesystem>
 #include "../support/AckLedger.h"
 #include "../support/TestCompletions.h"
 #include "../support/AllocCounter.h"
@@ -60,7 +61,7 @@ rc::ClientConfig invokerCfg(int32_t in, int32_t eg, int32_t partitions) {
     c.gatewayStreamId = in;
     c.egressChannel   = "aeron:ipc";
     c.egressStreamId  = eg;
-    c.dataDir = "/tmp/direct_ingress_" + std::to_string(::getpid()) + "_" +
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/direct_ingress_" + std::to_string(::getpid()) + "_" +
                 std::to_string(g_ctr.fetch_add(1));
     c.runnerMode = rc::RunnerMode::Invoker;
     rc::TopicSpec ts;

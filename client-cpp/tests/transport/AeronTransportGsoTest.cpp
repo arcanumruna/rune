@@ -6,6 +6,7 @@
 // bindings send as one sendmsg(UDP_SEGMENT) per run and receive as GRO-coalesced buffers split back into
 // datagrams.  The totals prove both paths actually ran; udpGso=false proves the stock path is unchanged.
 // Polls with a deadline + sched_yield (tests never sleep).
+#include <filesystem>
 #include <rune/client/transport/AeronTransport.h>
 
 #include <gtest/gtest.h>
@@ -38,7 +39,7 @@ Config udpLoopbackConfig(const char* tag, int32_t streamId) {
     cfg.egressChannel   = ch;
     cfg.egressStreamId  = streamId;
     cfg.mtuLength       = 1408;
-    cfg.dataDir = std::string("/tmp/rune_gso_client_") + tag + "_" + std::to_string(static_cast<long>(::getpid())) +
+    cfg.dataDir = std::string(std::filesystem::temp_directory_path().string() + "/rune_gso_client_") + tag + "_" + std::to_string(static_cast<long>(::getpid())) +
                   "_" + std::to_string(g_seq);
     return cfg;
 }

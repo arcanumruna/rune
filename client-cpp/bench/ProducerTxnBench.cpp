@@ -25,6 +25,7 @@
 // Exit 1 if any steady phase allocated (FD4: zero allocation on every path, transactional or not).
 // Env: TXN_RECORDS (records per run, a multiple of 1000; default 200000), TXN_PATHS (comma list; default all),
 //      TXN_MODES (plain,txn).
+#include <filesystem>
 #include "../tests/support/AllocCounter.h"
 #include "../tests/support/FakeCoordinator.h"
 #include "gen/position.gen.h"
@@ -406,7 +407,7 @@ int main() {
     ccfg.gatewayStreamId = 4711;
     ccfg.egressChannel   = "aeron:ipc";
     ccfg.egressStreamId  = 4712;
-    ccfg.dataDir         = "/tmp/rune_producer_txn_bench_" + std::to_string(::getpid());
+    ccfg.dataDir         = std::filesystem::temp_directory_path().string() + "/rune_producer_txn_bench_" + std::to_string(::getpid());
     ccfg.runnerMode      = RunnerMode::Invoker;
     Client client(ccfg);
     CompletionsConfig qcfg;

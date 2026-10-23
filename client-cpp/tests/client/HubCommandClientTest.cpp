@@ -2,6 +2,7 @@
 // operations are commands on the agent ring, applied by the duty thread (or by
 // close()'s final drain).  Client-level lifecycle regressions, both runner
 // modes.  No sleeps: every wait is a bounded drive loop or an immediate check.
+#include <filesystem>
 #include "../support/InvokerGateway.h"
 
 #include <rune/client/Client.h>
@@ -50,7 +51,7 @@ rc::ClientConfig hubCfg(int32_t in, int32_t eg, rc::RunnerMode mode) {
     c.gatewayStreamId = in;
     c.egressChannel   = "aeron:ipc";
     c.egressStreamId  = eg;
-    c.dataDir = "/tmp/hub_client_" + std::to_string(::getpid()) + "_" +
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/hub_client_" + std::to_string(::getpid()) + "_" +
                 std::to_string(g_hubCtr.fetch_add(1));
     c.runnerMode = mode;
     rc::TopicSpec ts;

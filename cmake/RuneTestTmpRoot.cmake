@@ -50,3 +50,13 @@ function(_rune_test_tmp_root_wire_all)
 endfunction()
 
 cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL _rune_test_tmp_root_wire_all)
+
+# Issue #577: the per-process root covers only paths built from temp_directory_path() / $TMPDIR.  This ctest scans the
+# test sources of every subproject and fails on a literal "/tmp/... (the deliberately host-wide paths are allowlisted
+# in the script, each with a comment at its site).  Registered by whichever top-level project includes this file.
+if(NOT TEST TestTmpRootRegression.NoTestSourceHardCodesTmpRegression)
+    get_filename_component(_rune_repo_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+    add_test(NAME TestTmpRootRegression.NoTestSourceHardCodesTmpRegression
+             COMMAND ${CMAKE_COMMAND} -DRUNE_REPO_ROOT=${_rune_repo_root}
+                     -P ${CMAKE_CURRENT_LIST_DIR}/test_support/NoHardCodedTmp.cmake)
+endif()

@@ -5,6 +5,7 @@
 // Bare-ProducerImpl rigs are single-threaded (the test is the duty thread);
 // Client rigs are Invoker mode against the single-threaded InvokerGateway.
 // Every drive loop is iteration-capped; nothing sleeps.
+#include <filesystem>
 #include "../support/AckLedger.h"
 #include "../support/AllocCounter.h"
 #include "../support/InvokerGateway.h"
@@ -57,7 +58,7 @@ rc::ClientConfig invokerCfg(int32_t in, int32_t eg, int32_t partitions = 1) {
     c.gatewayStreamId = in;
     c.egressChannel   = "aeron:ipc";
     c.egressStreamId  = eg;
-    c.dataDir = "/tmp/ack_token_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/ack_token_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
     c.runnerMode = rc::RunnerMode::Invoker;
     rc::TopicSpec ts;
     ts.name = "t";

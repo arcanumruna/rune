@@ -76,7 +76,7 @@ static std::atomic<int> g_cliDirCtr{0};
 
 std::string cliUniqueDir() {
     const int c = g_cliDirCtr.fetch_add(1, std::memory_order_relaxed);
-    return std::string("/tmp/cc6_cli_test_") +
+    return std::string(std::filesystem::temp_directory_path().string() + "/cc6_cli_test_") +
            std::to_string(static_cast<long>(::getpid())) + "_" +
            std::to_string(c);
 }

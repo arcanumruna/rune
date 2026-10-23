@@ -3,6 +3,7 @@
 // Bare ProducerImpl rigs (Ring ingress, hooks naming an Invoker Client that only registers the Completions
 // queues) for the gate; Client::producer for the creation validation and the plain-producer lifecycle
 // refusals.  Nothing sleeps, no threads, no atomics.
+#include <filesystem>
 #include "../support/AllocCounter.h"
 
 #include <rune/client/Client.h>
@@ -48,7 +49,7 @@ rc::ClientConfig regCfg() {
     c.gatewayStreamId = 4611;
     c.egressChannel   = "aeron:ipc";
     c.egressStreamId  = 4612;
-    c.dataDir = "/tmp/txn_api_test_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/txn_api_test_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     c.runnerMode = rc::RunnerMode::Invoker;
     return c;
 }

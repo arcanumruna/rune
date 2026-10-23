@@ -8,6 +8,7 @@
 // client.doWork() + gw.pump() and the reader's beginRefresh / pollRefresh; the
 // blocking catalogHistory / catalogAsOf / catalogDiff run against a real
 // BrokerNode (rune-broker: ClientCatalogReadBrokerRegressionTest).
+#include <filesystem>
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
 #include <rune/catalog/CatalogEvent.h>
@@ -40,7 +41,7 @@ int g_ctr = 0;                   // test thread only
 rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {   // as Task 5's invokerCfg, plus the clock
     rc::ClientConfig c;
     c.gatewayChannel = "aeron:ipc"; c.gatewayStreamId = in; c.egressChannel = "aeron:ipc"; c.egressStreamId = eg;
-    c.dataDir = "/tmp/catalog_reader_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/catalog_reader_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     c.runnerMode = rc::RunnerMode::Invoker;
     c.nanoClock = &fakeNow;
     return c;

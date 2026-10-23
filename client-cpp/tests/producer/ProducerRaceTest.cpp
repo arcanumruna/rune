@@ -68,7 +68,7 @@ static std::atomic<int> g_raceDirCtr{0};
 
 std::string uniqueRaceDir() {
     const int c = g_raceDirCtr.fetch_add(1, std::memory_order_relaxed);
-    return std::string("/tmp/dr_bug1_test_") +
+    return std::string(std::filesystem::temp_directory_path().string() + "/dr_bug1_test_") +
            std::to_string(static_cast<long>(::getpid())) + "_" +
            std::to_string(c);
 }

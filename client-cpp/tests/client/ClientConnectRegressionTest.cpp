@@ -1,5 +1,6 @@
 // Authentication Task 7 fix-on-sight: ClientConfig::authToken was documented as "validated by the broker's
 // existing auth path" — no such path existed.  It is removed; the wire field stays reserved and is sent empty.
+#include <filesystem>
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
 
@@ -29,7 +30,7 @@ TEST(ClientConnectRegression, NoAuthTokenIsEverSentRegression) {
     static int ctr = 0;
     rc::ClientConfig c;
     c.gatewayChannel = "aeron:ipc"; c.gatewayStreamId = 3740; c.egressChannel = "aeron:ipc"; c.egressStreamId = 3741;
-    c.dataDir = "/tmp/client_connect_reg_" + std::to_string(::getpid()) + "_" + std::to_string(ctr++);
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/client_connect_reg_" + std::to_string(::getpid()) + "_" + std::to_string(ctr++);
     c.runnerMode  = rc::RunnerMode::Invoker;
     c.offerCrypto = true;                 // the crypto ConnectRequest is the one that carried the field
     c.tlsTrustPem = pem("ca.pem");        // issue #115: an ipc channel names no host - the CA is pinned

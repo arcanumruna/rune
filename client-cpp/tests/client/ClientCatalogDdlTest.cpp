@@ -4,6 +4,7 @@
 // 128-bit requestId, replayedFrom) on all seven ops (F14: hi = a random
 // client-instance id, lo = a per-instance counter; an explicit id verbatim).
 // Non-blocking ops on the single-threaded fake (F7).
+#include <filesystem>
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
 #include <rune/client/Client.h>
@@ -25,11 +26,14 @@ using rune::protocol::RequestId;
 
 namespace {
 int g_ctr = 0;   // test thread only
+std::vector<std::string> g_dirs;   // test thread only: every data dir invokerCfg handed out (#577: removed in TearDown)
 
 rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {   // as InvokerClientTest.cpp's invokerCfg
     rc::ClientConfig c;
     c.gatewayChannel = "aeron:ipc"; c.gatewayStreamId = in; c.egressChannel = "aeron:ipc"; c.egressStreamId = eg;
-    c.dataDir = "/tmp/catalog_ddl_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+    c.dataDir = (std::filesystem::temp_directory_path() /
+                 ("catalog_ddl_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++))).string();
+    g_dirs.push_back(c.dataDir);
     c.runnerMode = rc::RunnerMode::Invoker;
     return c;
 }
@@ -75,12 +79,22 @@ struct Rig {   // InvokerClientTest.cpp's Rig: client + fake on the client's emb
     std::map<uint16_t, std::vector<std::vector<uint8_t>>> captured;
 };
 
+/// #577: each test's data dirs are removed when it ends (its Rigs are destroyed by then), pass or fail.
+class ClientCatalogDdl : public ::testing::Test {
+protected:
+    void TearDown() override {
+        std::error_code ec;
+        for (const std::string& d : g_dirs) std::filesystem::remove_all(d, ec);
+        g_dirs.clear();
+    }
+};
+
 const uint8_t kBlob[] = {9, 8, 7};
 const std::span<const uint8_t> blob(kBlob, sizeof kBlob);
 const pc::ConfigChangeWire kChanges[] = {{1, 60'000}, {6, -1}};
 } // namespace
 
-TEST(ClientCatalogDdl, DefineTopicSendsReplicationFactorConfigAndExtension) {
+TEST_F(ClientCatalogDdl, DefineTopicSendsReplicationFactorConfigAndExtension) {
     rc::ClientConfig cfg = invokerCfg(3980, 3981);
     cfg.clientName = "ql-test";
     Rig r(cfg);
@@ -116,7 +130,7 @@ TEST(ClientCatalogDdl, DefineTopicSendsReplicationFactorConfigAndExtension) {
     EXPECT_EQ(m->ext.hasReplayedFrom, 0);
 }
 
-TEST(ClientCatalogDdl, DdlOptionsClientNameOverridesTheConfigAndReplayedFromIsCarried) {
+TEST_F(ClientCatalogDdl, DdlOptionsClientNameOverridesTheConfigAndReplayedFromIsCarried) {
     Rig r(invokerCfg(3982, 3983));
     r.connect();
     auto& frames = r.capture(pc::DropTopic::TEMPLATE_ID);
@@ -142,7 +156,7 @@ TEST(ClientCatalogDdl, DdlOptionsClientNameOverridesTheConfigAndReplayedFromIsCa
     EXPECT_NE(m->ext.requestId.lo, 0u);
 }
 
-TEST(ClientCatalogDdl, AlterViewSendsItsExpectedVersionKeyPersistenceAndPlan) {
+TEST_F(ClientCatalogDdl, AlterViewSendsItsExpectedVersionKeyPersistenceAndPlan) {
     Rig r(invokerCfg(3984, 3985));
     r.connect();
     auto& frames = r.capture(pc::AlterView::TEMPLATE_ID);
@@ -159,7 +173,7 @@ TEST(ClientCatalogDdl, AlterViewSendsItsExpectedVersionKeyPersistenceAndPlan) {
     EXPECT_EQ(m->ext.clientName, "rune-client") << "the ClientConfig default";
 }
 
-TEST(ClientCatalogDdl, AlterTopicConfigSendsEveryChange) {
+TEST_F(ClientCatalogDdl, AlterTopicConfigSendsEveryChange) {
     Rig r(invokerCfg(3986, 3987));
     r.connect();
     auto& frames = r.capture(pc::AlterTopicConfig::TEMPLATE_ID);
@@ -176,7 +190,7 @@ TEST(ClientCatalogDdl, AlterTopicConfigSendsEveryChange) {
     EXPECT_EQ(pc::configChangeAt(m->changes, 1), kChanges[1]);
 }
 
-TEST(ClientCatalogDdl, EveryDdlOpCarriesADistinctRequestIdUnderOneInstanceId) {
+TEST_F(ClientCatalogDdl, EveryDdlOpCarriesADistinctRequestIdUnderOneInstanceId) {
     Rig r(invokerCfg(3988, 3989));
     r.connect();
     std::vector<RequestId> ids;
@@ -215,7 +229,7 @@ TEST(ClientCatalogDdl, EveryDdlOpCarriesADistinctRequestIdUnderOneInstanceId) {
     EXPECT_EQ(distinct.size(), ids.size()) << "every DDL gets its own requestId";
 }
 
-TEST(ClientCatalogDdl, TwoClientsDrawDifferentInstanceIds) {
+TEST_F(ClientCatalogDdl, TwoClientsDrawDifferentInstanceIds) {
     Rig a(invokerCfg(3990, 3991));
     Rig b(invokerCfg(3992, 3993));
     a.connect();
@@ -232,7 +246,7 @@ TEST(ClientCatalogDdl, TwoClientsDrawDifferentInstanceIds) {
     EXPECT_NE(ma->ext.requestId.hi, mb->ext.requestId.hi) << "F14: a random 64-bit instance id per Client";
 }
 
-TEST(ClientCatalogDdl, AnExplicitRequestIdIsSentVerbatim) {
+TEST_F(ClientCatalogDdl, AnExplicitRequestIdIsSentVerbatim) {
     Rig r(invokerCfg(3994, 3995));
     r.connect();
     auto& frames = r.capture(pc::CreateView::TEMPLATE_ID);
@@ -245,7 +259,7 @@ TEST(ClientCatalogDdl, AnExplicitRequestIdIsSentVerbatim) {
     EXPECT_EQ(m->ext.requestId, ddl.requestId);
 }
 
-TEST(ClientCatalogDdl, OversizeFieldsAreRejectedSynchronously) {
+TEST_F(ClientCatalogDdl, OversizeFieldsAreRejectedSynchronously) {
     Rig r(invokerCfg(3996, 3997));
     test_support::TestCq cq(r.client);
     const std::string huge(70'000, 'x');   // > a u16 varstr

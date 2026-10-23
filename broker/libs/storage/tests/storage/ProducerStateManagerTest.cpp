@@ -45,7 +45,7 @@ namespace fs = std::filesystem;
 static std::atomic<int> g_counter{0};
 
 static std::string tmpPath(const char* tag = "psm") {
-    return std::string("/tmp/") + tag + "_" +
+    return std::string(std::filesystem::temp_directory_path().string() + "/") + tag + "_" +
            std::to_string(::getpid()) + "_" +
            std::to_string(g_counter.fetch_add(1, std::memory_order_relaxed));
 }
@@ -437,7 +437,7 @@ TEST(ProducerStateManager, SnapshotAndRecoverMultipleEntries) {
 
 TEST(ProducerStateManager, RecoverFromMissingPathReturnsZero) {
     ProducerStateManager m;
-    int loaded = m.recover("/tmp/no_such_file_psm_xyz_" + std::to_string(::getpid()));
+    int loaded = m.recover(std::filesystem::temp_directory_path().string() + "/no_such_file_psm_xyz_" + std::to_string(::getpid()));
     EXPECT_EQ(loaded, 0);
     EXPECT_EQ(m.size(), 0u);
 }

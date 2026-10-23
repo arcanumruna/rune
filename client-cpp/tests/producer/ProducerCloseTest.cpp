@@ -12,6 +12,7 @@
 // closeImmediately — handed to it through test-side flags, the way the Client's
 // command ring hands it the lifecycle command).  Nothing sleeps; every wait is
 // an event wait or an iteration cap.
+#include <filesystem>
 #include "../support/AckLedger.h"
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
@@ -108,7 +109,7 @@ rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {
     c.gatewayStreamId = in;
     c.egressChannel   = "aeron:ipc";
     c.egressStreamId  = eg;
-    c.dataDir = "/tmp/producer_close_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/producer_close_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
     c.runnerMode = rc::RunnerMode::Invoker;
     rc::TopicSpec ts;
     ts.name = "t";

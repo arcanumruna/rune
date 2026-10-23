@@ -79,7 +79,8 @@ static bool spinReap(UringFlushBackend& be, FlushCompletion& out,
 // Test 1: round-trip a real fd
 // ---------------------------------------------------------------------------
 TEST(UringDurabilityTest, SubmitThenReapCompletesForRealFd) {
-    char path[] = "/tmp/rune_uring_XXXXXX";
+    std::string pathBuf = (std::filesystem::temp_directory_path() / "rune_uring_XXXXXX").string();
+    char* path = pathBuf.data();
     int fd = ::mkstemp(path);
     ASSERT_GE(fd, 0);
     ASSERT_EQ(::write(fd, "hello", 5), 5);
@@ -140,7 +141,8 @@ TEST(UringDurabilityTest, SubmitFullReturnsNoToken) {
 // Test 4: group-commit — N fsyncs, all tokens arrive with correct boundaries
 // ---------------------------------------------------------------------------
 TEST(UringDurabilityTest, GroupCommit) {
-    char path[] = "/tmp/rune_uring_gc_XXXXXX";
+    std::string pathBuf = (std::filesystem::temp_directory_path() / "rune_uring_gc_XXXXXX").string();
+    char* path = pathBuf.data();
     int fd = ::mkstemp(path);
     ASSERT_GE(fd, 0);
 
@@ -201,7 +203,8 @@ TEST(UringDurabilityTest, GroupCommit) {
 // do confirm the completion arrives eventually with the right token.
 // ---------------------------------------------------------------------------
 TEST(UringDurabilityTest, AckOnlyAfterCompletion) {
-    char path[] = "/tmp/rune_uring_ord_XXXXXX";
+    std::string pathBuf = (std::filesystem::temp_directory_path() / "rune_uring_ord_XXXXXX").string();
+    char* path = pathBuf.data();
     int fd = ::mkstemp(path);
     ASSERT_GE(fd, 0);
     ASSERT_EQ(::write(fd, "ordering", 8), 8);
@@ -258,7 +261,8 @@ TEST(UringDurabilityTest, IoWorkerAffinityBindsTheSubmittingThreadsIoWqRegressio
     if (allowedCpuCount() < 2) GTEST_SKIP() << "needs >= 2 allowed CPUs (a 1-CPU mask passes trivially)";
     const int cpu = firstAllowedCpu();
     ASSERT_GE(cpu, 0);
-    char path[] = "/tmp/rune_iowq_aff_XXXXXX";
+    std::string pathBuf = (std::filesystem::temp_directory_path() / "rune_iowq_aff_XXXXXX").string();
+    char* path = pathBuf.data();
     const int fd = ::mkstemp(path);
     ASSERT_GE(fd, 0);
     std::vector<char> data(1 << 20, 'x');
@@ -321,7 +325,8 @@ TEST(UringDurabilityTest, IoWorkerAffinityNopIsDrainedSilentlyAndRespectsTheCapR
     EXPECT_EQ(be.inFlight(), 0u) << "the NOP's slot must be given back";
     EXPECT_EQ(handled, 0) << "reap counts only caller completions";
 
-    char path[] = "/tmp/rune_iowq_cap_XXXXXX";
+    std::string pathBuf = (std::filesystem::temp_directory_path() / "rune_iowq_cap_XXXXXX").string();
+    char* path = pathBuf.data();
     const int fd = ::mkstemp(path);
     ASSERT_GE(fd, 0);
     EXPECT_NE(be.submit(fd, 1), rune::node::kNoToken);
@@ -518,11 +523,11 @@ TEST(UringDurabilityTest, PartialEnterFailedWriteLeaksNoWriteFailureRegression) 
 // ---------------------------------------------------------------------------
 TEST(UringDurabilityTest, QueuedRoundIsOneEnterAndEveryMemberCompletesRegression) {
     constexpr int kN = 4;
-    char paths[kN][32];
+    std::string paths[kN];
     int fds[kN];
     for (int i = 0; i < kN; ++i) {
-        std::snprintf(paths[i], sizeof paths[i], "/tmp/rune_uring_rnd_XXXXXX");
-        fds[i] = ::mkstemp(paths[i]);
+        paths[i] = (std::filesystem::temp_directory_path() / "rune_uring_rnd_XXXXXX").string();
+        fds[i] = ::mkstemp(paths[i].data());
         ASSERT_GE(fds[i], 0);
         ASSERT_EQ(::write(fds[i], "round", 5), 5);
     }
@@ -553,7 +558,7 @@ TEST(UringDurabilityTest, QueuedRoundIsOneEnterAndEveryMemberCompletesRegression
     EXPECT_EQ(ok, kN);
     EXPECT_EQ(bad, 1) << "only the bad member fails";
     EXPECT_EQ(be.inFlight(), 0u);
-    for (int i = 0; i < kN; ++i) { ::close(fds[i]); ::unlink(paths[i]); }
+    for (int i = 0; i < kN; ++i) { ::close(fds[i]); ::unlink(paths[i].c_str()); }
 }
 
 TEST(UringDurabilityTest, QueuedRoundRespectsTheInFlightCapRegression) {
@@ -578,7 +583,8 @@ TEST(UringDurabilityTest, QueuedRoundRespectsTheInFlightCapRegression) {
 // A single submit while a round batch is open must never overwrite a queued SQE: it is refused
 // (back-pressure) and the queued round is submitted intact.
 TEST(UringDurabilityTest, SingleSubmitWhileARoundIsQueuedIsRefusedRegression) {
-    char path[] = "/tmp/rune_uring_mix_XXXXXX";
+    std::string pathBuf = (std::filesystem::temp_directory_path() / "rune_uring_mix_XXXXXX").string();
+    char* path = pathBuf.data();
     const int fd = ::mkstemp(path);
     ASSERT_GE(fd, 0);
     ASSERT_EQ(::write(fd, "x", 1), 1);

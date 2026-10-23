@@ -79,7 +79,7 @@ TEST(SchemaGenToolRegression, OutputFilenameMatchesSchemaName) {
 // Regression: missing blob file must throw, not crash silently.
 TEST(SchemaGenToolRegression, MissingBlobThrows) {
     EXPECT_THROW(
-        (void)rune::tools::generateFromFile("/nonexistent/path/blob.bin", "/tmp"),
+        (void)rune::tools::generateFromFile("/nonexistent/path/blob.bin", std::filesystem::temp_directory_path().string()),
         std::runtime_error);
 }
 

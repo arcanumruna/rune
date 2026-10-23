@@ -8,6 +8,7 @@
 // toward the seed with the SAME requestId; a seed loss never fails a DDL held
 // on another session; the generated requestId is reported.
 // Non-blocking ops on the single-threaded fake (F7).
+#include <filesystem>
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
 #include <rune/client/Client.h>
@@ -51,7 +52,7 @@ std::string udp(int port) { return "aeron:udp?endpoint=127.0.0.1:" + std::to_str
 rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {
     rc::ClientConfig c;
     c.gatewayChannel = "aeron:ipc"; c.gatewayStreamId = in; c.egressChannel = "aeron:ipc"; c.egressStreamId = eg;
-    c.dataDir = "/tmp/ddl_timing_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/ddl_timing_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     c.runnerMode = rc::RunnerMode::Invoker;
     c.nanoClock = &fakeNow;
     c.ddlTimeoutMs = 3'000;

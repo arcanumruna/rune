@@ -8,6 +8,7 @@
 // F15 §5.4 (2026-10-01): Complete* is now the RESTING state (Kafka).  Tests that
 // asserted "Complete* → Empty" (the P5-5 collapse) assert the resting Complete*;
 // the not-wedged intent is unchanged (re-init bumps, addPartitions → Ongoing).
+#include <filesystem>
 #include <rune/transaction/TransactionCoordinator.h>
 #include <rune/transaction/TransactionLog.h>
 #include <rune/transaction/ControlMarker.h>
@@ -35,7 +36,7 @@ namespace {
 static std::atomic<int> g_coord_counter{0};
 
 static std::string coordTmpPath() {
-    return "/tmp/txncoord_" + std::to_string(::getpid())
+    return std::filesystem::temp_directory_path().string() + "/txncoord_" + std::to_string(::getpid())
          + "_" + std::to_string(g_coord_counter.fetch_add(1, std::memory_order_relaxed));
 }
 

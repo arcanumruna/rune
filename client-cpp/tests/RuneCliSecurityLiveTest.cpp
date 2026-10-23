@@ -57,7 +57,7 @@ struct LiveFake {
 
     LiveFake(int32_t i, pc::AuthMode md, const std::function<void(test_support::InvokerGateway&, LiveFake&)>& setup)
         : in(i), out(i + 1) {
-        dir = "/tmp/cli_sec_live_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
+        dir = std::filesystem::temp_directory_path().string() + "/cli_sec_live_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
         fs::create_directories(dir);
         t = std::thread([this, md, setup] {
             const std::string cnc = dir + "/aeron/cnc.dat";

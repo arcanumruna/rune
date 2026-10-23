@@ -53,7 +53,7 @@ static uint32_t testLogCrc32c(const uint8_t* data, std::size_t len) noexcept {
 static std::atomic<int> g_counter{0};
 
 static std::string tmpPath() {
-    return "/tmp/txnlog_" + std::to_string(::getpid())
+    return std::filesystem::temp_directory_path().string() + "/txnlog_" + std::to_string(::getpid())
          + "_" + std::to_string(g_counter.fetch_add(1, std::memory_order_relaxed));
 }
 
