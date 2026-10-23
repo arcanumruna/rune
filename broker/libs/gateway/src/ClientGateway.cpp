@@ -5590,6 +5590,10 @@ ClientGateway::CatalogRoom ClientGateway::catalogEgressRoom(int64_t sessionId)
 {
     Session* s = sessions_.find(sessionId);
     if (s == nullptr) return CatalogRoom::Gone;
+    // #603 review: a subscription paused because this broker's `__security` view is behind (admitAdminLogFrame Hold)
+    // resumes only once it is not - otherwise every pass would resume it, the admin re-read it and the gate hold it
+    // again, a busy loop on the admin thread for as long as the hold lasts.
+    if (securityBehind_) [[unlikely]] return CatalogRoom::NotYet;
     if (catalogBackPressureForTest_ == sessionId) [[unlikely]] return CatalogRoom::NotYet;
     if (s->spill.state != SpillState::Normal) return CatalogRoom::NotYet;
     if (!s->egress) return CatalogRoom::Ready;   // egress-less test session (capture hook)
