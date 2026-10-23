@@ -544,6 +544,11 @@ public:
     /// Expose the full metadata for a txnId (for P5-3 persistence).
     [[nodiscard]] const TransactionMetadata* metadata(const TransactionalId& txnId) const noexcept;
 
+    /// F15-FU1 (#112): the transaction whose CURRENT producer id is `pid`, or nullptr.
+    /// Cold (one scan of the transactional ids): the caller caches the answer
+    /// (TransactionCoordinationService::verifyTxnPartition) and re-validates it.
+    [[nodiscard]] const TransactionMetadata* findByProducerId(ProducerId pid) const noexcept;
+
     /// Number of known transactionalIds.
     [[nodiscard]] std::size_t size() const noexcept { return txnMap_.size(); }
 

@@ -103,7 +103,7 @@ struct Harness {
         const int64_t bound = next + static_cast<int64_t>(recs.size());
         const rune::storage::LogReadView lv{batch.data(), batch.size(), next, bound};
         last = rune::view::foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view,
-                                              contributors, groups, lv, bound, cursor);
+                                              contributors, groups, lv, bound, cursor, rune::view::kNoAbortedTxns);
         next = bound;
     }
     static std::vector<uint8_t> key(int64_t orderId) {
@@ -231,7 +231,7 @@ TEST(AggFold, CursorAdvancesToBoundAndOnlyCommittedRecordsFold) {
     const rune::storage::LogReadView lv{batch.data(), batch.size(), 0, 2};
     int64_t cursor = 0;
     (void)rune::view::foldAggregateBatch(h.comp.plan, h.comp.rowLayout, h.agg, h.vdc, h.view,
-                                         h.contributors, h.groups, lv, /*bound*/ 1, cursor);
+                                         h.contributors, h.groups, lv, /*bound*/ 1, cursor, rune::view::kNoAbortedTxns);
     EXPECT_EQ(cursor, 1);
     EXPECT_EQ(h.col(100, kN).i, 1) << "offset 1 is uncommitted and must not fold";
 }
@@ -261,7 +261,7 @@ TEST(AggFoldRegression, MissingGroupValueRetractsAndSkips) {
         const auto batch = b.build();
         int64_t cur = off;
         return rune::view::foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view, contributors,
-                                              groups, {batch.data(), batch.size(), off, off + 1}, off + 1, cur);
+                                              groups, {batch.data(), batch.size(), off, off + 1}, off + 1, cur, rune::view::kNoAbortedTxns);
     };
     std::vector<uint8_t> v2; le16(v2, 24); le16(v2, 2); le64(v2, 1); le64(v2, 10); le64(v2, 100);
     fold(0, v2);
@@ -374,13 +374,66 @@ TEST(AggFoldRegression, MidBatchCursorSkipsAlreadyFoldedRecordsRegression) {
 
     int64_t cur = 0;
     auto s0 = rune::view::foldAggregateBatch(h.comp.plan, h.comp.rowLayout, h.agg, h.vdc, h.view,
-                                             h.contributors, h.groups, lv, /*bound*/ 1, cur);
+                                             h.contributors, h.groups, lv, /*bound*/ 1, cur, rune::view::kNoAbortedTxns);
     EXPECT_EQ(s0.applied, 1u);
     EXPECT_EQ(cur, 1);
     auto s1 = rune::view::foldAggregateBatch(h.comp.plan, h.comp.rowLayout, h.agg, h.vdc, h.view,
-                                             h.contributors, h.groups, lv, /*bound*/ 2, cur);
+                                             h.contributors, h.groups, lv, /*bound*/ 2, cur, rune::view::kNoAbortedTxns);
     EXPECT_EQ(s1.applied, 1u) << "record 0 (below the cursor) must not be re-folded";
     EXPECT_EQ(cur, 2);
     EXPECT_EQ(h.col(100, kN).i, 2);
     EXPECT_EQ(h.col(100, kTotal).i, 40);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #537: an aggregate never counts an ABORTED transaction's records — not
+// as an insert, and not as an update or delete that would retract a committed
+// contribution — and a bound cutting an aborted batch applies none of it.
+// ---------------------------------------------------------------------------
+namespace {
+struct AbortedPid {   // every batch of `pid` is aborted
+    int64_t pid;
+    [[nodiscard]] rune::view::AbortedTxnFilter filter() const {
+        rune::view::AbortedTxnFilter f;
+        f.ctx = this;
+        f.fn  = [](const void* c, int64_t pid, int64_t) noexcept { return pid == static_cast<const AbortedPid*>(c)->pid; };
+        return f;
+    }
+};
+std::vector<uint8_t> orderBatchAt(int64_t base, const std::vector<std::pair<int64_t, std::vector<uint8_t>>>& recs,
+                                  int64_t pid) {
+    rune::protocol::RecordBatchBuilder b(base, 0);
+    if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(0); b.setTransactional(true); }
+    for (const auto& [id, v] : recs) {
+        std::vector<uint8_t> k; le64(k, uint64_t(id));
+        b.append(std::string_view(reinterpret_cast<const char*>(k.data()), k.size()),
+                 std::string_view(reinterpret_cast<const char*>(v.data()), v.size()), 0);
+    }
+    return b.build();
+}
+} // namespace
+
+TEST(AggFoldRegression, AbortedTxnNeverContributesNorRetractsRegression) {
+    Harness h;
+    const AbortedPid ab{77};
+    std::vector<uint8_t> bytes;
+    auto add = [&](std::vector<uint8_t> b) { bytes.insert(bytes.end(), b.begin(), b.end()); };
+    add(orderBatchAt(0, {{1, orderV1(1, 100, 10)}}, /*committed*/ 5));
+    // An aborted txn: a new contributor, an update of contributor 1, and a delete of it.
+    add(orderBatchAt(1, {{2, orderV1(2, 100, 1000)}, {1, orderV1(1, 200, 7)}, {1, tombstone()}}, 77));
+    add(orderBatchAt(4, {{3, orderV1(3, 100, 5)}}, -1));
+    const rune::storage::LogReadView lv{bytes.data(), bytes.size(), 0, 5};
+    int64_t cur = 0;
+    // A capped first pass whose bound (2) cuts the aborted batch, then the rest.
+    auto st = rune::view::foldAggregateBatch(h.comp.plan, h.comp.rowLayout, h.agg, h.vdc, h.view, h.contributors,
+                                             h.groups, lv, 2, cur, ab.filter());
+    EXPECT_EQ(cur, 2);
+    EXPECT_EQ(st.applied, 1u);
+    st = rune::view::foldAggregateBatch(h.comp.plan, h.comp.rowLayout, h.agg, h.vdc, h.view, h.contributors,
+                                        h.groups, lv, 5, cur, ab.filter());
+    EXPECT_EQ(cur, 5);
+    EXPECT_EQ(st.skippedAborted, 1u);
+    EXPECT_EQ(h.col(100, kN).i, 2) << "contributors 1 and 3 only";
+    EXPECT_EQ(h.col(100, kTotal).i, 15);
+    EXPECT_FALSE(h.hasGroup(200)) << "the aborted update never moved contributor 1";
 }

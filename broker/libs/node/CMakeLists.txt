@@ -424,6 +424,29 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     gtest_discover_tests(rune_worker_tests)
 
+    # Issue #537: views never fold an aborted (or open) transaction — a real Worker + WorkerViewSet over a disk and a
+    # transient leader replica, every batch and marker through the worker's op path.  No Aeron.
+    add_executable(rune_view_aborted_txn_tests
+        tests/integration/ViewAbortedTxnRegressionTest.cpp)
+    target_link_libraries(rune_view_aborted_txn_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_view
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_view_aborted_txn_tests PROPERTIES TIMEOUT 120)
+
+    # Issue #112 (F15-FU1): the partition worker's transaction-registration verification state
+    # (RcState::admitTxnBatch / onVerifyAnswer / onMarker over TxnVerifySet).  No Aeron.
+    add_executable(rune_txn_verify_tests
+        tests/node/TxnVerifyRegressionTest.cpp
+        tests/support/AllocWindow.cpp)
+    target_include_directories(rune_txn_verify_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_txn_verify_tests PRIVATE
+        rune_node
+        GTest::gtest_main)
+    gtest_discover_tests(rune_txn_verify_tests PROPERTIES LABELS small)
+
     # Phase 2c Tasks 6-7, 15: FilterIndex (value -> members) and FilterGroup (member state machine, shared scan,
     # rebuild delivery, position notes). No Aeron. AllocWindow.cpp replaces the global operator new for this
     # binary (the zero-allocation gates); later filter test binaries link it the same way.

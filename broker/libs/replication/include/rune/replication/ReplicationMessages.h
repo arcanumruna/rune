@@ -80,6 +80,8 @@ enum class ReplicationTemplateId : uint16_t {
     InternalIsrAck           = 10,  // replica → internal-partition leader
     WriteTxnMarker           = 11,  // D9: txn coordinator → partition leader (hand-rolled)
     WriteTxnMarkerResponse   = 12,  // D9: partition leader → txn coordinator (hand-rolled)
+    VerifyTxnPartition       = 13,  // #112: partition leader → txn coordinator (hand-rolled)
+    VerifyTxnPartitionResponse = 14,  // #112: txn coordinator → partition leader (hand-rolled)
 };
 
 // DR-BUG-6: reconcile-pull template ids.  The reconcile request/response reuse
@@ -467,8 +469,12 @@ inline constexpr int16_t kStorageIdentity = 2;
 /// older coordinator would reseed by a bound id's raw value and issue ids whose bits read as another
 /// principal's, so they are issued only once every member supports this level.
 inline constexpr int16_t kBoundProducerIds = 3;
+/// Issue #112 (F15-FU1): partition leaders verify a transaction's partition registration with the transaction
+/// coordinator (VerifyTxnPartition, templates 13 / 14).  An older coordinator drops the ask, so a leader forwards
+/// it only once every member supports this level (below it a remote-coordinated batch is admitted as before).
+inline constexpr int16_t kTxnPartitionVerify = 4;
 /// The level this binary supports.
-inline constexpr int16_t kLatest = kBoundProducerIds;
+inline constexpr int16_t kLatest = kTxnPartitionVerify;
 } // namespace MetadataFeature
 
 struct AlterIsrMsg {
@@ -944,6 +950,81 @@ struct WriteTxnMarkerResponseMsg {
         m.errorCode        = detail::read_le<int16_t>(p + 28);
         m.offset           = detail::read_le<int64_t>(p + 32);
         return true;
+    }
+};
+
+// ===========================================================================
+// F15-FU1 (#112) — cross-node transaction-registration verification
+// (templates 13 / 14; KIP-890 part 1).  A partition leader whose transaction
+// coordinator runs on ANOTHER node asks it whether a transactional batch of
+// (producerId, producerEpoch) may open a transaction on (topicId, partition);
+// the coordinator answers with a client ErrorCode (0 = registered and durable).
+// Hand-rolled fixed blocks like D9 — cold control traffic over the same cluster
+// plane, little-endian, no allocation.
+//
+// VerifyTxnPartition (template 13), fixed block 32 bytes:
+//   requesterNodeId : int32 @ +0    the partition leader (the answer goes there)
+//   topicId         : int32 @ +4
+//   token           : int64 @ +8    the requester's token (echoed back)
+//   producerId      : int64 @ +16
+//   partition       : int32 @ +24
+//   producerEpoch   : int16 @ +28   (+30..31 pad)
+//
+// VerifyTxnPartitionResponse (template 14), same block with
+//   errorCode       : int16 @ +30   client ErrorCode (0 = the batch may open the txn)
+// ===========================================================================
+struct VerifyTxnPartitionMsg {
+    static constexpr uint16_t    TEMPLATE_ID  = 13;
+    static constexpr uint16_t    BLOCK_LENGTH = 32;
+    static constexpr std::size_t TOTAL_SIZE   = ReplicationMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    int32_t requesterNodeId = -1;
+    int32_t topicId         = 0;
+    int64_t token           = 0;
+    int64_t producerId      = -1;
+    int32_t partition       = 0;
+    int16_t producerEpoch   = 0;
+    int16_t errorCode       = 0;   ///< the response only (template 14)
+
+    std::size_t encodeAs(uint16_t templateId, uint8_t* buf, std::size_t cap) const noexcept {
+        if (cap < TOTAL_SIZE) return 0;
+        ReplicationMessageHeader::encode(buf, 0, BLOCK_LENGTH, templateId);
+        uint8_t* p = buf + ReplicationMessageHeader::ENCODED_SIZE;
+        detail::write_le<int32_t>(p + 0,  requesterNodeId);
+        detail::write_le<int32_t>(p + 4,  topicId);
+        detail::write_le<int64_t>(p + 8,  token);
+        detail::write_le<int64_t>(p + 16, producerId);
+        detail::write_le<int32_t>(p + 24, partition);
+        detail::write_le<int16_t>(p + 28, producerEpoch);
+        detail::write_le<int16_t>(p + 30, templateId == TEMPLATE_ID ? int16_t{0} : errorCode);
+        return TOTAL_SIZE;
+    }
+    std::size_t encode(uint8_t* buf, std::size_t cap) const noexcept { return encodeAs(TEMPLATE_ID, buf, cap); }
+    [[nodiscard]] static bool decodeAs(uint16_t templateId, const uint8_t* buf, std::size_t len,
+                                       VerifyTxnPartitionMsg& m) noexcept {
+        if (len < TOTAL_SIZE) return false;
+        const auto h = ReplicationMessageHeader::decode(buf, 0);
+        if (h.templateId != templateId || h.blockLength < BLOCK_LENGTH) return false;
+        const uint8_t* p = buf + ReplicationMessageHeader::ENCODED_SIZE;
+        m.requesterNodeId = detail::read_le<int32_t>(p + 0);
+        m.topicId         = detail::read_le<int32_t>(p + 4);
+        m.token           = detail::read_le<int64_t>(p + 8);
+        m.producerId      = detail::read_le<int64_t>(p + 16);
+        m.partition       = detail::read_le<int32_t>(p + 24);
+        m.producerEpoch   = detail::read_le<int16_t>(p + 28);
+        m.errorCode       = templateId == TEMPLATE_ID ? int16_t{0} : detail::read_le<int16_t>(p + 30);
+        return true;
+    }
+    [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, VerifyTxnPartitionMsg& m) noexcept {
+        return decodeAs(TEMPLATE_ID, buf, len, m);
+    }
+};
+/// The answer: the request's fields echoed, plus errorCode.
+struct VerifyTxnPartitionResponseMsg : VerifyTxnPartitionMsg {
+    static constexpr uint16_t TEMPLATE_ID = 14;
+    std::size_t encode(uint8_t* buf, std::size_t cap) const noexcept { return encodeAs(TEMPLATE_ID, buf, cap); }
+    [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, VerifyTxnPartitionResponseMsg& m) noexcept {
+        return decodeAs(TEMPLATE_ID, buf, len, m);
     }
 };
 

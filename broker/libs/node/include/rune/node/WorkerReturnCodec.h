@@ -36,6 +36,10 @@ static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::SessionSignal) ==
 static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::ViewRowResult) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::VIEW_ROW_RESULT),
               "WorkerReturn::ViewRowResult must stay on sbe ReturnType::VIEW_ROW_RESULT");
+// F15-FU1 (#112): TxnVerifyRequest rides sbe ReturnType::TXN_VERIFY_REQUEST (value 8).
+static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::TxnVerifyRequest) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::TXN_VERIFY_REQUEST),
+              "WorkerReturn::TxnVerifyRequest must stay on sbe ReturnType::TXN_VERIFY_REQUEST");
 
 
 // ---------------------------------------------------------------------------

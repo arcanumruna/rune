@@ -118,7 +118,7 @@ TEST(ViewFold, UpsertAndTombstone) {
     const auto b0 = makeBatch(0, asSv(kb), asSv(val0), /*tomb*/ false);
     rune::storage::LogReadView v0{b0.data(), b0.size(), 0, 1};
     int64_t cur = 0;
-    auto s0 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v0, /*bound*/ 1, cur);
+    auto s0 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v0, /*bound*/ 1, cur, rune::view::kNoAbortedTxns);
     EXPECT_EQ(s0.applied, 1u);
     ASSERT_NE(t.get(1001), nullptr);
     EXPECT_EQ(rune::view::readSlot(t.get(1001), comp.rowLayout, 1).i, 50);
@@ -127,7 +127,7 @@ TEST(ViewFold, UpsertAndTombstone) {
     // record 1: tombstone for id=1001
     const auto b1 = makeBatch(1, asSv(kb), std::string_view{}, /*tomb*/ true);
     rune::storage::LogReadView v1{b1.data(), b1.size(), 1, 2};
-    auto s1 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v1, 2, cur);
+    auto s1 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v1, 2, cur, rune::view::kNoAbortedTxns);
     EXPECT_EQ(s1.deleted, 1u);
     EXPECT_EQ(t.get(1001), nullptr);
     EXPECT_EQ(cur, 2);
@@ -149,7 +149,7 @@ TEST(ViewFoldDroppedFieldRegression, FoldDroppedSourceFieldGoesNull) {
     const auto b = makeBatch(0, asSv(kb), asSv(val), /*tomb*/ false);
     rune::storage::LogReadView v{b.data(), b.size(), 0, 1};
     int64_t cur = 0;
-    auto stats = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, 1, cur);
+    auto stats = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, 1, cur, rune::view::kNoAbortedTxns);
 
     EXPECT_EQ(stats.applied, 1u);
     ASSERT_NE(t.get(1001), nullptr);
@@ -183,7 +183,7 @@ TEST(ViewFold, DeterministicAcrossBatchBoundaries) {
     rune::view::ViewTable tableA(comp.rowLayout);
     rune::view::VersionDescriptorCache vdcA(src);
     int64_t curA = 0;
-    auto statsA = rune::view::foldBatch(comp.plan, comp.rowLayout, vdcA, tableA, vA, 3, curA);
+    auto statsA = rune::view::foldBatch(comp.plan, comp.rowLayout, vdcA, tableA, vA, 3, curA, rune::view::kNoAbortedTxns);
 
     // Case B: 3 separate single-record batches, concatenated into one view.
     std::vector<uint8_t> dataB;
@@ -199,7 +199,7 @@ TEST(ViewFold, DeterministicAcrossBatchBoundaries) {
     rune::view::ViewTable tableB(comp.rowLayout);
     rune::view::VersionDescriptorCache vdcB(src);
     int64_t curB = 0;
-    auto statsB = rune::view::foldBatch(comp.plan, comp.rowLayout, vdcB, tableB, vB, 3, curB);
+    auto statsB = rune::view::foldBatch(comp.plan, comp.rowLayout, vdcB, tableB, vB, 3, curB, rune::view::kNoAbortedTxns);
 
     EXPECT_EQ(statsA.applied, statsB.applied);
     EXPECT_EQ(curA, curB);
@@ -237,7 +237,7 @@ TEST(ViewFoldKeyUnificationRegression, TombstoneErasesByWireKeyEvenWhenValueKeyF
     const auto b0 = makeBatch(0, asSv(wireKey), asSv(val), /*tomb*/ false);
     rune::storage::LogReadView v0{b0.data(), b0.size(), 0, 1};
     int64_t cur = 0;
-    auto s0 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v0, 1, cur);
+    auto s0 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v0, 1, cur, rune::view::kNoAbortedTxns);
     EXPECT_EQ(s0.applied, 1u);
 
     // The row must be addressable by the WIRE key -- not by the value's
@@ -252,7 +252,7 @@ TEST(ViewFoldKeyUnificationRegression, TombstoneErasesByWireKeyEvenWhenValueKeyF
     // A tombstone keyed by the SAME wire key must erase exactly that row.
     const auto b1 = makeBatch(1, asSv(wireKey), std::string_view{}, /*tomb*/ true);
     rune::storage::LogReadView v1{b1.data(), b1.size(), 1, 2};
-    auto s1 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v1, 2, cur);
+    auto s1 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v1, 2, cur, rune::view::kNoAbortedTxns);
     EXPECT_EQ(s1.deleted, 1u);
     EXPECT_EQ(t.get(2002), nullptr) << "tombstone keyed by the wire key must erase the row it keys";
     EXPECT_EQ(t.get(9999), nullptr);
@@ -276,7 +276,7 @@ TEST(ViewFoldMalformedKeyRegression, WrongWidthWireKeySkippedNotZeroPadded) {
                               asSv(val), /*tomb*/ false);
     rune::storage::LogReadView v{b.data(), b.size(), 0, 1};
     int64_t cur = 0;
-    auto stats = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, 1, cur);
+    auto stats = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, 1, cur, rune::view::kNoAbortedTxns);
 
     EXPECT_EQ(stats.skippedMalformed, 1u);
     EXPECT_EQ(stats.applied, 0u);
@@ -318,7 +318,7 @@ TEST(ViewFoldCorruptBreakRegression, CursorNeverAdvancesPastAnUnfoldedCorruptBat
     // this guards against is trusting that claim and skipping straight to it.
     rune::storage::LogReadView v{data.data(), data.size(), 0, 5};
     int64_t cur = 0;
-    auto stats = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, /*bound*/ 5, cur);
+    auto stats = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, /*bound*/ 5, cur, rune::view::kNoAbortedTxns);
 
     EXPECT_EQ(stats.applied, 1u);     // only batch 0's record folded
     ASSERT_NE(t.get(1001), nullptr);
@@ -348,15 +348,103 @@ TEST(ViewFoldResumeRegression, MidBatchCursorSkipsAlreadyFoldedRecords) {
     const rune::storage::LogReadView lv{batch.data(), batch.size(), 0, 2};
 
     int64_t cur = 0;
-    auto s0 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, lv, /*bound*/ 1, cur);
+    auto s0 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, lv, /*bound*/ 1, cur, rune::view::kNoAbortedTxns);
     EXPECT_EQ(s0.applied, 1u);
     EXPECT_EQ(cur, 1);
     t.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t) {});
 
-    auto s1 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, lv, /*bound*/ 2, cur);
+    auto s1 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, lv, /*bound*/ 2, cur, rune::view::kNoAbortedTxns);
     EXPECT_EQ(s1.applied, 1u) << "record 0 (below the cursor) must not be re-folded";
     EXPECT_EQ(cur, 2);
     int dirty = 0;
     t.drainDirty([&](uint32_t, const uint8_t*, bool, uint64_t key) { ++dirty; EXPECT_EQ(key, 2u); });
     EXPECT_EQ(dirty, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #537: the fold skips every data batch of an ABORTED transaction (the
+// partition's aborted index, as the read_committed fetch does) and asks the
+// predicate for TRANSACTIONAL batches only.
+// ---------------------------------------------------------------------------
+namespace {
+// One aborted range [first, last] of one producer; counts the predicate calls.
+struct OneAbortedRange {
+    int64_t pid, first, last;
+    mutable int calls = 0;
+    [[nodiscard]] rune::view::AbortedTxnFilter filter() const {
+        rune::view::AbortedTxnFilter f;
+        f.ctx = this;
+        f.fn  = [](const void* c, int64_t pid, int64_t base) noexcept {
+            const auto* r = static_cast<const OneAbortedRange*>(c);
+            ++r->calls;
+            return pid == r->pid && base >= r->first && base <= r->last;
+        };
+        return f;
+    }
+};
+std::vector<uint8_t> charBatch(int64_t base, std::initializer_list<std::pair<int64_t, int32_t>> recs,
+                               int64_t pid = -1) {
+    rune::protocol::RecordBatchBuilder b(base, 0);
+    if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(0); b.setTransactional(true); }
+    for (const auto& [id, hp] : recs) {
+        const auto k = keyBytes(id);
+        const auto v = encodeCharacter(id, hp, 1);
+        b.append(asSv(k), asSv(v), 0);
+    }
+    return b.build();
+}
+std::vector<uint8_t> concatBytes(std::initializer_list<std::vector<uint8_t>> parts) {
+    std::vector<uint8_t> out;
+    for (const auto& p : parts) out.insert(out.end(), p.begin(), p.end());
+    return out;
+}
+} // namespace
+
+TEST(ViewFoldRegression, AbortedTxnBatchesAreSkippedCommittedOnesFoldRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(), srcs, 0x40000007).value();
+    rune::view::ViewTable t(comp.rowLayout);
+    rune::view::VersionDescriptorCache vdc(src);
+    // [0,1] pid 5 (aborted) | [2] plain | [3] pid 6 (committed) | [4] pid 5 again, aborted
+    const auto bytes = concatBytes({charBatch(0, {{1, 10}, {2, 20}}, 5), charBatch(2, {{3, 30}}),
+                                    charBatch(3, {{4, 40}}, 6), charBatch(4, {{5, 50}}, 5)});
+    const OneAbortedRange ab{5, 0, 4};
+    const rune::storage::LogReadView v{bytes.data(), bytes.size(), 0, 5};
+    int64_t cur = 0;
+    const auto st = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, 5, cur, ab.filter());
+    EXPECT_EQ(cur, 5);
+    EXPECT_EQ(st.applied, 2u);
+    EXPECT_EQ(st.skippedAborted, 2u);
+    EXPECT_EQ(t.get(1), nullptr);
+    EXPECT_EQ(t.get(2), nullptr);
+    EXPECT_NE(t.get(3), nullptr) << "a plain record folds";
+    EXPECT_NE(t.get(4), nullptr) << "a committed transactional record folds";
+    EXPECT_EQ(t.get(5), nullptr);
+    EXPECT_EQ(ab.calls, 3) << "the predicate is asked for transactional batches only";
+}
+
+// A capped pass whose bound cuts an aborted batch applies none of it and
+// resumes exactly at the bound; the next pass skips the rest of it.
+TEST(ViewFoldRegression, BoundCuttingAnAbortedBatchAppliesNoneOfItRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(), srcs, 0x40000007).value();
+    rune::view::ViewTable t(comp.rowLayout);
+    rune::view::VersionDescriptorCache vdc(src);
+    const auto bytes = concatBytes({charBatch(0, {{1, 10}, {2, 20}, {3, 30}}, 5), charBatch(3, {{4, 40}})});
+    const OneAbortedRange ab{5, 0, 3};
+    const rune::storage::LogReadView v{bytes.data(), bytes.size(), 0, 4};
+    int64_t cur = 0;
+    auto st = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, /*bound=*/2, cur, ab.filter());
+    EXPECT_EQ(cur, 2);
+    EXPECT_EQ(st.applied, 0u);
+    EXPECT_EQ(t.size(), 0u);
+    st = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, /*bound=*/4, cur, ab.filter());
+    EXPECT_EQ(cur, 4);
+    EXPECT_EQ(st.applied, 1u);
+    EXPECT_EQ(st.skippedAborted, 1u);
+    EXPECT_EQ(t.get(1), nullptr);
+    EXPECT_EQ(t.get(3), nullptr);
+    EXPECT_NE(t.get(4), nullptr);
 }

@@ -2562,10 +2562,16 @@ void BrokerNode::buildGateway() {
                     &rune::gateway::ClientGateway::onWriteTxnMarkerResponseThunk, gateway_.get());
                 replTransport_->setPlaneReconnectHandler(&rune::gateway::ClientGateway::onPlaneReconnectThunk,
                                                          gateway_.get());
+                // F15-FU1 (#112): cross-node partition-registration verification, same plane.
+                replTransport_->setTxnVerifyHandlers(
+                    &rune::gateway::ClientGateway::onVerifyTxnPartitionThunk,
+                    &rune::gateway::ClientGateway::onVerifyTxnPartitionResponseThunk, gateway_.get());
                 gateway_->setTxnMarkerChannel(rune::gateway::ClientGateway::TxnMarkerChannel{
                     &rune::replication::AeronPartitionTransport::sendWriteTxnMarkerThunk,
                     &rune::replication::AeronPartitionTransport::sendWriteTxnMarkerResponseThunk,
-                    replTransport_.get()});
+                    replTransport_.get(),
+                    &rune::replication::AeronPartitionTransport::sendVerifyTxnPartitionThunk,
+                    &rune::replication::AeronPartitionTransport::sendVerifyTxnPartitionResponseThunk});
             }
 
             spdlog::info("BrokerNode[{}]: TransactionCoordinationService wired (txn state at {})",
@@ -2825,6 +2831,10 @@ void BrokerNode::buildGateway() {
     // workerPool_ is null, which happens when no topics are configured).
     if (gateway_ && workerPool_) {
         gateway_->setWorkerPool(workerPool_.get());   // narrows the batch limit to the workers'
+        // F15-FU1 (#112): a transaction coordinator answers the workers' partition-
+        // registration checks, so every worker verifies (runners not started yet).
+        if (txnCoordService_)
+            for (int32_t w = 0; w < workerPool_->workerCount(); ++w) workerPool_->worker(w).setTxnVerification(true);
         gateway_->setFilterLimits({config_.filterMaxSubsPerPartition, config_.filterMaxIndexValuesPerPartition});
     }
     // Round 5: an incarnation wrap must skip values the F7 owner map still holds.
@@ -4620,6 +4630,7 @@ void BrokerNode::stop() {
     // D9: the transport outlives the gateway — drop its marker handlers (ctx = gateway).
     if (replTransport_) {
         replTransport_->setTxnMarkerHandlers(nullptr, nullptr, nullptr);
+        replTransport_->setTxnVerifyHandlers(nullptr, nullptr, nullptr);   // #112
         replTransport_->setPlaneReconnectHandler(nullptr, nullptr);
     }
     gateway_.reset();         // ClientGateway: deregisters Subscription + ExclusivePubs

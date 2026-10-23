@@ -135,7 +135,7 @@ std::vector<uint8_t> makeBaseCheckpoint(const rune::view::CompiledViewPlan& plan
     rune::view::VersionDescriptorCache vdc(src);
     rune::storage::LogReadView v{srcBatch.data(), srcBatch.size(), 0, foldTo};
     int64_t cursor = 0;
-    rune::view::foldBatch(plan, layout, vdc, tmp, v, foldTo, cursor);
+    rune::view::foldBatch(plan, layout, vdc, tmp, v, foldTo, cursor, rune::view::kNoAbortedTxns);
     std::vector<rune::view::DirtyEntry> entries;
     std::vector<uint8_t> rowScratch;
     std::vector<std::size_t> offs;
@@ -202,7 +202,7 @@ TEST(ViewReadinessRegression, GetViewRowNotReadyIsRetriable) {
     // Drive the rebuild under a HARD cap (never unbounded).
     for (int i = 0; i < 64 && !vs.allViewsReady(); ++i)
         vs.driveRebuild(/*srcTopicId*/ 5, /*partition*/ 0, readRange,
-                        /*committedTail*/ 4, /*nowNs*/ i);
+                        /*committedTail*/ 4, rune::view::kNoAbortedTxns, /*nowNs*/ i);
 
     EXPECT_TRUE(vs.allViewsReady());
     EXPECT_EQ(vs.readiness(0x40000007, /*partition*/ 0), rune::node::ViewReadiness::Ready);
@@ -250,7 +250,7 @@ TEST(ViewReadinessRegression, ColdAllNodeRestartReachesReadyFromLocalStateOnly) 
     // state only.
     for (int i = 0; i < 64 && !vs.allViewsReady(); ++i)
         vs.driveRebuild(/*srcTopicId*/ 5, /*partition*/ 0, readRange,
-                        /*committedTail*/ 3, /*nowNs*/ i);
+                        /*committedTail*/ 3, rune::view::kNoAbortedTxns, /*nowNs*/ i);
 
     EXPECT_TRUE(vs.allViewsReady());
     EXPECT_EQ(vs.readiness(0x40000007, /*partition*/ 0), rune::node::ViewReadiness::Ready);
@@ -311,10 +311,10 @@ TEST(ViewReadinessRegression, CapacityExceededEventDoesNotStopFolding) {
                          : rune::storage::LogReadView{b1.data(), b1.size(), 1, 2};
     };
 
-    vs.driveFolds(/*srcTopicId*/ 5, /*partition*/ 0, readRange, /*bound*/ 1, 0);
+    vs.driveFolds(/*srcTopicId*/ 5, /*partition*/ 0, readRange, /*bound*/ 1, rune::view::kNoAbortedTxns, 0);
     EXPECT_EQ(vs.capacityExceededCount(), 0u) << "table was empty at pass 1 start";
 
-    vs.driveFolds(/*srcTopicId*/ 5, /*partition*/ 0, readRange, /*bound*/ 2, 0);
+    vs.driveFolds(/*srcTopicId*/ 5, /*partition*/ 0, readRange, /*bound*/ 2, rune::view::kNoAbortedTxns, 0);
     EXPECT_GE(vs.capacityExceededCount(), 1u)
         << "crossing maxRows must FIRE the capacity-exceeded event";
 
@@ -369,7 +369,7 @@ TEST(ViewReadinessRegression, RecoverAtMaxRowsStillReachesReadyNoStall) {
     // Drive the rebuild under a HARD cap.  Pre-fix this loop exhausts without
     // ever reaching Ready (stall); post-fix it reaches Ready.
     for (int i = 0; i < 64 && !vs.allViewsReady(); ++i)
-        vs.driveRebuild(/*srcTopicId*/ 5, /*partition*/ 0, readRange, /*committedTail*/ 3, i);
+        vs.driveRebuild(/*srcTopicId*/ 5, /*partition*/ 0, readRange, /*committedTail*/ 3, rune::view::kNoAbortedTxns, i);
 
     EXPECT_TRUE(vs.allViewsReady()) << "a view recovered at maxRows must NOT stall in RebuildingViews";
     EXPECT_EQ(vs.readiness(0x40000007, 0), rune::node::ViewReadiness::Ready);

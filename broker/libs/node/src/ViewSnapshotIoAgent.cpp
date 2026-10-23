@@ -124,8 +124,7 @@ ViewSnapshotIoAgent::~ViewSnapshotIoAgent() {
 }
 
 std::string ViewSnapshotIoAgent::deltaFilePath_(const Key& key) const {
-    return viewDataDir_ + "/view-" + std::to_string(static_cast<uint32_t>(key.viewTopicId)) +
-           "-p" + std::to_string(key.partition) + ".delta";
+    return viewCheckpointFilePath(viewDataDir_, key.viewTopicId, key.partition);   // #537: the committed-fold file
 }
 
 std::string ViewSnapshotIoAgent::deltaFilePathForTest(int32_t viewTopicId, int32_t partition) const {

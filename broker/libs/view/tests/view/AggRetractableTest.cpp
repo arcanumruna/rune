@@ -122,7 +122,7 @@ struct Harness {
         const int64_t bound = next + static_cast<int64_t>(recs.size());
         const rune::storage::LogReadView lv{batch.data(), batch.size(), next, bound};
         last = rune::view::foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view,
-                                              contributors, groups, &blocks, lv, bound, cursor);
+                                              contributors, groups, &blocks, lv, bound, cursor, rune::view::kNoAbortedTxns);
         inconsistent += last.aggInconsistent;
         next = bound;
     }
@@ -184,7 +184,7 @@ struct Harness {
         size_t done = 0;
         for (const int64_t bnd : {cap, full}) {
             last = rune::view::foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view,
-                                                  contributors, groups, &blocks, lv, bnd, cursor);
+                                                  contributors, groups, &blocks, lv, bnd, cursor, rune::view::kNoAbortedTxns);
             inconsistent += last.aggInconsistent;
             const size_t inPass = static_cast<size_t>(bnd - next) - done;
             EXPECT_EQ(cursor, bnd) << "each pass must stop exactly at its bound";
@@ -916,7 +916,7 @@ TEST(AggRetractableRegression, NoGroupRewriteUnlinksAndRetractsTheContributorReg
         int64_t cur = off;
         const auto st = rune::view::foldAggregateBatch(
             comp.plan, comp.rowLayout, agg, vdc, view, contributors, groups, &blocks,
-            {batch.data(), batch.size(), off, off + 1}, off + 1, cur);
+            {batch.data(), batch.size(), off, off + 1}, off + 1, cur, rune::view::kNoAbortedTxns);
         ++off;
         return st;
     };
@@ -1014,7 +1014,7 @@ TEST(AggRetractableRegression, NarrowAndSignedTypesMatchBruteForceRegression) {
         const int64_t bound = off + static_cast<int64_t>(n);
         const auto st = rune::view::foldAggregateBatch(
             comp.plan, comp.rowLayout, agg, vdc, view, contributors, groups, &blocks,
-            {batch.data(), batch.size(), off, bound}, bound, cur);
+            {batch.data(), batch.size(), off, bound}, bound, cur, rune::view::kNoAbortedTxns);
         off = bound;
         inconsistent += st.aggInconsistent;
         rescansSeen += st.aggRescans;

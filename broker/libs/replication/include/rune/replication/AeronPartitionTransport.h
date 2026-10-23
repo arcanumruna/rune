@@ -359,6 +359,23 @@ public:
                               void* ctx) noexcept {
         txnMarkerHandler_ = onMarker; txnMarkerRespHandler_ = onResponse; txnMarkerCtx_ = ctx;
     }
+    /// F15-FU1 (#112): cross-node transaction-registration verification — the
+    /// same plane, threads and rules as the D9 marker frames above.
+    bool sendVerifyTxnPartition(NodeId to, const VerifyTxnPartitionMsg& msg);
+    bool sendVerifyTxnPartitionResponse(NodeId to, const VerifyTxnPartitionResponseMsg& msg);
+    using VerifyTxnPartitionHandler         = void (*)(void* ctx, const VerifyTxnPartitionMsg& msg);
+    using VerifyTxnPartitionResponseHandler = void (*)(void* ctx, const VerifyTxnPartitionResponseMsg& msg);
+    void setTxnVerifyHandlers(VerifyTxnPartitionHandler onVerify, VerifyTxnPartitionResponseHandler onResponse,
+                              void* ctx) noexcept {
+        txnVerifyHandler_ = onVerify; txnVerifyRespHandler_ = onResponse; txnVerifyCtx_ = ctx;
+    }
+    static bool sendVerifyTxnPartitionThunk(void* self, int32_t to, const VerifyTxnPartitionMsg& msg) {
+        return static_cast<AeronPartitionTransport*>(self)->sendVerifyTxnPartition(static_cast<NodeId>(to), msg);
+    }
+    static bool sendVerifyTxnPartitionResponseThunk(void* self, int32_t to, const VerifyTxnPartitionResponseMsg& msg) {
+        return static_cast<AeronPartitionTransport*>(self)->sendVerifyTxnPartitionResponse(static_cast<NodeId>(to),
+                                                                                           msg);
+    }
     /// D9 review MAJOR-1: the plane-reconnect event, CONTROL thread (poll):
     /// `peer` >= 0 = this node's link to that peer went down→up (its hold-router
     /// connection generation was bumped — frames to it may have been dropped
@@ -680,6 +697,9 @@ private:
     WriteTxnMarkerHandler                  txnMarkerHandler_     = nullptr;  ///< control thread (D9)
     WriteTxnMarkerResponseHandler          txnMarkerRespHandler_ = nullptr;
     void*                                  txnMarkerCtx_         = nullptr;
+    VerifyTxnPartitionHandler              txnVerifyHandler_     = nullptr;  ///< control thread (#112)
+    VerifyTxnPartitionResponseHandler      txnVerifyRespHandler_ = nullptr;
+    void*                                  txnVerifyCtx_         = nullptr;
     PlaneReconnectHandler                  reconnectHandler_     = nullptr;  ///< control thread (D9)
     void*                                  reconnectCtx_         = nullptr;
     uint64_t                               lastUpEdges_          = 0;

@@ -1008,8 +1008,11 @@ TEST(TxSmoke, EndToEnd_TxnProduce_Commit_ReadCommitted) {
         prodReq.baseSequence   = 0;
         prodReq.recordBatch    = std::span<const uint8_t>(batchBytes.data(), batchBytes.size());
         const std::size_t prodLen = prodReq.encode(scratch.data());
-        offerB(*ingPub, scratch.data(), prodLen, "Produce smoke");
 
+        // Issue #112 (KIP-890 part 1): the transaction's first batch on a partition is
+        // refused retriably while the leader verifies the registration with the
+        // coordinator (ConcurrentTransactions; NotLeader for this v1 session) — a real
+        // client re-sends it unchanged, so does this smoke test (bounded).
         std::optional<pc::ProduceResponse> prodResp;
         aeron::FragmentAssembler prodAsm([&](aeron::concurrent::AtomicBuffer& buf,
                                              aeron::util::index_t off,
@@ -1018,9 +1021,19 @@ TEST(TxSmoke, EndToEnd_TxnProduce_Commit_ReadCommitted) {
             auto dec = pc::ProduceResponse::decode(p, static_cast<std::size_t>(len));
             if (dec && dec->correlationId == 8300 + partition) prodResp = *dec;
         });
-        pump([&]{ return prodResp.has_value(); }, *egrSub, prodAsm, "ProduceResponse smoke");
+        int produceRetries = 0;
+        for (int attempt = 0; attempt < 50; ++attempt) {
+            prodResp.reset();
+            offerB(*ingPub, scratch.data(), prodLen, "Produce smoke");
+            pump([&]{ return prodResp.has_value(); }, *egrSub, prodAsm, "ProduceResponse smoke");
+            if (!prodResp.has_value()) break;
+            const auto ec = static_cast<pc::ErrorCode>(prodResp->errorCode);
+            if (ec != pc::ErrorCode::NotLeader && ec != pc::ErrorCode::ConcurrentTransactions) break;
+            ++produceRetries;
+        }
         ASSERT_TRUE(prodResp.has_value())
             << "[TX-6a Smoke] No ProduceResponse (partition=" << partition << ")";
+        EXPECT_GE(produceRetries, 1) << "#112: the first transactional batch is verified before it is appended";
         ASSERT_EQ(prodResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK))
             << "[TX-6a Smoke] Produce failed (partition=" << partition << ")";
         const int64_t batchOffset = prodResp->baseOffset;

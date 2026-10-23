@@ -610,6 +610,16 @@ TEST(EosBrokerRegression, EveryPathCommittedIsVisibleOnceAbortedNeverRegression)
     int64_t cursor = 500'000;
     ASSERT_TRUE(w.sentinel(committed, cursor).ok());
     w.expectAcksOk("every path");
+    {   // #112: the partitions led away from the coordinator verified their registrations over the cluster plane.
+        uint64_t forwarded = 0, served = 0;
+        for (const int id : e.c.runningNodes()) {
+            rune::node::BrokerNode& n = e.c.node(id);
+            forwarded += n.onControlThreadForTest([&] { return n.gatewayForTest()->txnVerifiesForwardedForTest(); });
+            served += n.onControlThreadForTest([&] { return n.gatewayForTest()->txnVerifiesServedForPeersForTest(); });
+        }
+        EXPECT_GT(forwarded, 0u) << "no partition leader asked a remote coordinator (the cross-node verification)";
+        EXPECT_GT(served, 0u) << "the coordinator never answered a remote leader's verification";
+    }
 
     const int via = e.otherThan(seed);
     {   // read_committed: exactly the committed records, each once - no aborted one.

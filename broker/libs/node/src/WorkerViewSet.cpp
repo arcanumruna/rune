@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <span>
@@ -44,14 +45,6 @@ uint32_t readU32LE(const uint8_t* p) noexcept {
            (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
 }
 
-// Task 19b: this worker's checkpoint delta-file path for (view, partition).
-// MUST match ViewSnapshotIoAgent::deltaFilePath_ exactly (same viewDataDir_,
-// same name) so recovery reopens the very file the IO agent appended to.
-std::string deltaFilePath(const std::string& dir, int32_t viewTopicId, int32_t partition) {
-    return dir + "/view-" + std::to_string(static_cast<uint32_t>(viewTopicId)) +
-           "-p" + std::to_string(partition) + ".delta";
-}
-
 // Read a whole file into a byte vector; returns empty on any error (a missing
 // checkpoint is a valid cold start, not a failure).
 std::vector<uint8_t> readWholeFile(const std::string& path) {
@@ -64,6 +57,24 @@ std::vector<uint8_t> readWholeFile(const std::string& path) {
     f.read(reinterpret_cast<char*>(out.data()), n);
     if (!f) return {};
     return out;
+}
+
+// Task 19b: this (view, partition)'s checkpoint bytes — the very file the IO
+// agent appends to (viewCheckpointFilePath).  Issue #537: a pre-fix checkpoint
+// (legacyViewCheckpointFilePath) may hold aborted-transaction data; it is never
+// replayed — it is removed here, loudly, and the instance cold-starts (foldCursor
+// 0 → RebuildingViews → driveRebuild re-folds the committed log).  Cold: once per
+// instance, on the worker that owns it (the IO agent never touches the legacy name).
+std::vector<uint8_t> readCheckpointFile(const std::string& dir, int32_t viewTopicId, int32_t partition) {
+    const std::string legacy = legacyViewCheckpointFilePath(dir, viewTopicId, partition);
+    std::error_code ec;
+    if (std::filesystem::exists(legacy, ec)) [[unlikely]] {
+        const bool removed = std::filesystem::remove(legacy, ec);
+        spdlog::warn("WorkerViewSet: view {} partition {}: a checkpoint written before aborted transactions were "
+                     "skipped by the fold ({}) may hold aborted data — {}; re-folding the view from the log",
+                     viewTopicId, partition, legacy, removed ? "removed" : "NOT removed (" + ec.message() + ")");
+    }
+    return readWholeFile(viewCheckpointFilePath(dir, viewTopicId, partition));
 }
 
 // Replays checkpoint records into one instance: v1 into the output table for a
@@ -352,7 +363,7 @@ void WorkerViewSet::materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t 
         // cold start — installViewForRecovery then starts at foldCursor 0 and
         // the committed log is replayed in full by driveRebuild.
         const std::vector<uint8_t> file =
-            readWholeFile(deltaFilePath(viewDataDir_, viewTopicId, partition));
+            readCheckpointFile(viewDataDir_, viewTopicId, partition);
         const std::vector<std::span<const uint8_t>> records =
             splitViewCheckpointRecords(std::span<const uint8_t>(file));
 
@@ -519,7 +530,7 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
 void WorkerViewSet::loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopicId,
                                             int32_t partition, int64_t committedTail) {
     const std::vector<uint8_t> file =
-        readWholeFile(deltaFilePath(viewDataDir_, viewTopicId, partition));
+        readCheckpointFile(viewDataDir_, viewTopicId, partition);
     const std::vector<std::span<const uint8_t>> records =
         splitViewCheckpointRecords(std::span<const uint8_t>(file));
 

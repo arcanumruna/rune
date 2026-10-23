@@ -618,6 +618,13 @@ const TransactionMetadata* TransactionCoordinator::metadata(const TransactionalI
     return findMetadata(txnId);
 }
 
+const TransactionMetadata* TransactionCoordinator::findByProducerId(ProducerId pid) const noexcept
+{
+    for (const auto& [id, m] : txnMap_)
+        if (m.producerId == pid) return &m;
+    return nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
