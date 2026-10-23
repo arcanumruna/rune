@@ -385,9 +385,14 @@ Names can't contain NUL, so padding can't make two names collide. In general, a 
 - **Hash.** The index uses a seeded 64-bit hash (for example rapidhash) with a random seed per worker. Players choose names, so an unseeded hash would let them build collision chains that stall the leader thread. The hash never leaves the process. Partition routing keeps its deterministic FNV-1a, or modulo for autoincrement topics (§6.3).
 - **Row.** For K > 8 the key bytes are stored once in the arena row, and they can't drift from the key column values.
 - **Prefix index.** A composite key of n columns gets exactly one prefix index, over its first n−1 columns.
-  - It is a second hash index from the prefix hash to the head rid. A match is confirmed against the head row's bytes.
-  - Rows that share a prefix are linked through `prev`/`next` rids in the row, so insert and erase are O(1).
-  - A scan walks that list, in no particular order.
+  - It maps each prefix to a hashset of the keys of the rows under it. The rows carry no index state: no links, no
+    positions. The view itself stays one flat hashmap.
+  - Insert, erase and lookup in a set are O(1). Updating a row in place doesn't touch the index.
+  - The sets live in fixed-size blocks from a pool, in power-of-two size classes. The pool grows by appending chunks,
+    like the row arena, so blocks never move. A full set takes a block of the next class and migrates a few entries per
+    operation, as the main index grows; it shrinks the same way below 1/8 full and frees its block when empty. No
+    operation rehashes a set whole.
+  - A scan walks one set, in no particular order. Its cost is the set's size, never the view's.
   - A read on a shorter prefix is refused at compile time with "needs an ordered index".
 - **Owner map.** This applies to views keyed on anything other than the source wire key.
   - A per-instance table maps the source key to the rid of its current row. A tombstone has no value, so this is the only way to find the row to erase.
@@ -571,7 +576,10 @@ ProducerConfig{.acks = Acks::All | Acks::View};
   - An oversized single row still gets `kRowTooLarge`.
 - **Consistency.**
   - A page is atomic: it is served in one worker step.
-  - Across pages there is no snapshot. The resume token is the last key, and if that key is gone the response is the new status `kCursorInvalidated`; the client restarts the scan.
+  - Across pages: the resume token is the scan position in the prefix's set plus that set's version. Any insert or
+    erase under the prefix bumps the version (versions never repeat within an incarnation), and a token with a stale
+    version gets the new status `kCursorInvalidated`; the client restarts the scan. So a scan that completes saw the
+    prefix unchanged from its first page to its last.
   - A user's ≤ 12 characters always fit in one page.
 - **Client.**
   - `getViewRowAndWait(view, key)` and `scanViewAndWait(view, prefix, limit)`.
@@ -913,7 +921,8 @@ Every cell is a test at the first layer where the behavior is visible: unit, int
 
 **Reads:**
 - a point read and a prefix read right after an acked write
-- a scan across pages with an erase between them (`kCursorInvalidated`)
+- a scan across pages with an insert or an erase under the prefix between them (`kCursorInvalidated`); a change under
+  another prefix, or an in-place update, does not invalidate it
 - a scan of an empty prefix
 - a forced hash collision, using a fixed seed through a test hook
 - pre-existing duplicate names: the smallest source key owns the row, it is promoted correctly on delete and on rename, and a compaction followed by a refold gives the same owner
