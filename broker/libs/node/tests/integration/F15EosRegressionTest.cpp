@@ -266,6 +266,23 @@ struct TxnRig {
     std::string txnId = "tx-f15";
     int64_t pid = -1; int16_t epoch = 0; int32_t seq = 0; int64_t corr = 100; int64_t sid = 0;
     std::array<uint8_t, 4096> out{};
+    // #508: the group offset store this rig stands in for (#360: a coordinator with no offset sink refuses every
+    // TxnOffsetCommit).  Records every committed (group, tp, offset) it is handed; `refuseOffsets` refuses them.
+    struct AppliedOffset {
+        std::string group, topic;
+        int32_t     partition = 0;
+        int64_t     offset    = -1;
+    };
+    std::vector<AppliedOffset> appliedOffsets;
+    bool refuseOffsets = false;
+    static rune::coordination::TxnOffsetApply recordOffset(void* ctx, const std::string& group,
+                                                           const rune::coordination::TopicPartition& tp, int64_t offset,
+                                                           int64_t, const rune::coordination::TxnOffsetToken&) {
+        auto* self = static_cast<TxnRig*>(ctx);
+        if (self->refuseOffsets) return rune::coordination::TxnOffsetApply::Refused;
+        self->appliedOffsets.push_back(AppliedOffset{group, tp.topic, tp.partition, offset});
+        return rune::coordination::TxnOffsetApply::Applied;
+    }
     // stateIsr: the __transaction_state replica's ISR; {1, 2} holds every record uncommitted until commitState().
     explicit TxnRig(int minIsr = 1, bool withStore = false, std::vector<NodeId> replicas = {},
                     std::vector<NodeId> isr = {1}, std::vector<NodeId> stateIsr = {1})
@@ -280,6 +297,7 @@ struct TxnRig {
         tcs = std::make_unique<TransactionCoordinationService>(store.get(), &m.topics,
                                                               [this] { return leader; }, [] { return NodeId{1}; });
         tcs->setGateway(&m.gw);
+        tcs->setTxnOffsetSink(&TxnRig::recordOffset, this);   // #508
         m.gw.setTxnService(tcs.get());
         m.gw.setCommittedMetadataReady(true);
         m.gw.setOnControlFrame([this](int64_t, const uint8_t* b, std::size_t n) { controlFrames.emplace_back(b, b + n); });
@@ -4771,10 +4789,17 @@ TEST(TxnAddOffsetsRegression, AddOffsetsFirstTxnCommits) {
     T.produceTxn();
     T.m.runWorker(2);
     EXPECT_TRUE(T.endTxnOkPreparing(/*commit=*/true)) << "OK once PrepareCommit is durable, marker in flight";
+    EXPECT_TRUE(T.appliedOffsets.empty()) << "#508: an offset applied before the commit marker landed";
     T.runUntilNoMarkerAwaited(10);
     EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit);
     EXPECT_TRUE(T.controlFrames.empty()) << "a second EndTxn answer was sent when the marker landed";
     EXPECT_EQ(T.tcs->transactionsCompletedForTest(), 1u) << "the transaction never completed";
+    // #508 / #360: the committed offset reached the group's offset store, exactly once - never dropped.
+    ASSERT_EQ(T.appliedOffsets.size(), 1u) << "the committed offset never reached the offset sink";
+    EXPECT_EQ(T.appliedOffsets[0].group, "g");
+    EXPECT_EQ(T.appliedOffsets[0].topic, "t");
+    EXPECT_EQ(T.appliedOffsets[0].partition, 0);
+    EXPECT_EQ(T.appliedOffsets[0].offset, 5);
 }
 
 TEST(TxnAddOffsetsRegression, OffsetsOnlyTxnCommits) {
@@ -4784,8 +4809,15 @@ TEST(TxnAddOffsetsRegression, OffsetsOnlyTxnCommits) {
     ASSERT_EQ(T.initPid(), 0);
     ASSERT_EQ(addOffsets(T, "g"), 0) << "an offsets-only txn can never start";
     ASSERT_EQ(txnOffsetCommit(T, "g", 9), 0);
+    EXPECT_TRUE(T.appliedOffsets.empty()) << "#508: an offset applied before the commit";
     EXPECT_EQ(T.endTxn(/*commit=*/true), 0) << "no partitions: no marker to await";
     EXPECT_EQ(T.tcs->transactionsCompletedForTest(), 1u) << "the transaction never completed";
+    // #508 / #360: the committed offset reached the group's offset store, exactly once - never dropped.
+    ASSERT_EQ(T.appliedOffsets.size(), 1u) << "the committed offset never reached the offset sink";
+    EXPECT_EQ(T.appliedOffsets[0].group, "g");
+    EXPECT_EQ(T.appliedOffsets[0].topic, "t");
+    EXPECT_EQ(T.appliedOffsets[0].partition, 0);
+    EXPECT_EQ(T.appliedOffsets[0].offset, 9);
 }
 
 TEST(TxnAddOffsetsRegression, AddOffsetsWhilePreparingIsConcurrentTransactions) {
