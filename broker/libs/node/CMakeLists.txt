@@ -1803,6 +1803,14 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_auth_matrix_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900 LABELS small)
         rune_regression_batches(rune_auth_matrix_tests 4)   # the 720 cells run in the *Regression* gate as 4 sharded batches
 
+        # Issue #276: the ownership dimension of the matrix (an id that belongs to another principal's session), its own
+        # table so the 720-cell table the stress test, the 3-node slice and the docker e2e share stays unchanged.
+        add_executable(rune_auth_ownership_tests tests/node/AuthOwnershipRegressionTest.cpp)
+        target_include_directories(rune_auth_ownership_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_auth_ownership_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
+                              GTest::gtest_main)
+        gtest_discover_tests(rune_auth_ownership_tests PROPERTIES TIMEOUT 600)
+
         # Authentication Task 13: shard-mode produce straight to the worker ingress against ONE real authenticating
         # broker (the worker's WRITE bitmaps shipped on the lifecycle ring) + the zero-allocation gates.
         add_executable(rune_shard_auth_produce_tests tests/integration/ShardAuthProduceTest.cpp)
