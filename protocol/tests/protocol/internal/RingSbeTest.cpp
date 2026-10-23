@@ -359,7 +359,15 @@ TEST(RingSbeRegression, AuthOpTypesAndTailKindsArePinned) {
     EXPECT_EQ(sbe::TailKind::get(11), sbe::TailKind::Value::FILTER);
     EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::FILTER_SCHEMA), "FILTER_SCHEMA");
     EXPECT_STREQ(sbe::TailKind::c_str(sbe::TailKind::Value::FILTER), "FILTER");
-    EXPECT_THROW((void)sbe::OpType::get(26), std::runtime_error);
+    // Issue #112: the txn partition verification (op 26 / return 8), appended, never reused.
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::TXN_VERIFY_RESULT), 26);
+    EXPECT_EQ(sbe::OpType::get(26), sbe::OpType::Value::TXN_VERIFY_RESULT);
+    EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::TXN_VERIFY_RESULT), "TXN_VERIFY_RESULT");
+    EXPECT_EQ(static_cast<int>(sbe::ReturnType::Value::TXN_VERIFY_REQUEST), 8);
+    EXPECT_EQ(sbe::ReturnType::get(8), sbe::ReturnType::Value::TXN_VERIFY_REQUEST);
+    EXPECT_STREQ(sbe::ReturnType::c_str(sbe::ReturnType::Value::TXN_VERIFY_REQUEST), "TXN_VERIFY_REQUEST");
+    EXPECT_THROW((void)sbe::OpType::get(27), std::runtime_error);
+    EXPECT_THROW((void)sbe::ReturnType::get(9), std::runtime_error);
     EXPECT_THROW((void)sbe::TailKind::get(12), std::runtime_error);
 }
 
