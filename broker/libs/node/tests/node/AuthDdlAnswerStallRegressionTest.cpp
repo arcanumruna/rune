@@ -211,7 +211,11 @@ void endedSubscriptionNeverPushesAgain(bool shard, const char* tag) {
         return n;
     };
     const std::size_t atEnd = delivered();
-    if (shard) EXPECT_EQ(atEnd, 0u) << "the subscription never reached a worker, yet delivered (subscribe answered " << *code << ")";
+    if (shard) {
+        // the broker ends the race by answering the held Subscribe itself (PR #596 review: asserted, not only printed)
+        EXPECT_TRUE(*code == 45 || *code == 46) << "the held Subscribe answered " << *code << ", expected 45/46";
+        EXPECT_EQ(atEnd, 0u) << "the subscription never reached a worker, yet delivered (subscribe answered " << *code << ")";
+    }
     for (int i = 0; i < 3; ++i) ASSERT_EQ(rig.produce(ws, rig.orders), 0);
     c.pollFor(400ms, [] { return false; });
     EXPECT_EQ(delivered(), atEnd) << "the revoked subscription (subscribe answered " << *code << ", sub id " << subId

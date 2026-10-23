@@ -230,14 +230,17 @@ private:
             if (s.sid <= 0) { failWith_("connect"); return; }
             const auto l = s.w->login(rig_.ch(), s.sid, user_(s.user), {AuthRig::kPw, AuthRig::kPw});
             if (l.ok()) { s.alive = true; return; }
-            if (!(l.fin && l.fin->retryAfterMs > 0)) {
+            // AuthUnavailable (48) is no verdict either: the gateway's security view moved between the two legs (or is
+            // stale) and a real client retries it (review of PR #596) - bounded like the throttle retry.
+            const bool unavailable = l.answered() && l.errorCode() == static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable);
+            if (!(l.fin && l.fin->retryAfterMs > 0) && !unavailable) {
                 failWith_("LOGIN REFUSED for enabled user " + user_(s.user) + " (answered=" + (l.answered() ? "yes" : "no") +
                           " code=" + std::to_string(l.errorCode()) + " first=" + (l.first ? "yes" : "no") + ")");
                 return;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(l.fin->retryAfterMs));
+            std::this_thread::sleep_for(unavailable ? std::chrono::milliseconds(20) : std::chrono::milliseconds(l.fin->retryAfterMs));
         }
-        failWith_("login " + user_(s.user) + " stayed throttled for 30 attempts");
+        failWith_("login " + user_(s.user) + " stayed throttled / unavailable for 30 attempts");
     }
     void builderCreate_(const std::string& name) {
         const int32_t id = rig_.defineTopic(rig_.builder, name);
