@@ -732,7 +732,7 @@ git commit -m "feat(storage): handleProduceBatch<LogT, HookT> - check after dedu
 - **`check()`**: one `forEachRecordSpan` walk.
   - Per record, in this order (P3-8):
     - the attribute rules (`reservedBits` → stop, `InvalidRequest`);
-    - `checkTypedRecord(*state_.spec, r, level)` with `level = facts_.levelCheckedWrites ? kCheckedWrites : kBase` (R-X1): `Reject` → stop, `SchemaValidationFailed`, `ValidationFailed`; `VersionAhead` → stop, `NotLeader`, `VersionAhead` (02 P2). The worker adds these two to 02's `typedRejects_` / `typedVersionAhead_` (Task 7). It covers the version lookup, the validator, the wire key and the tombstone rule (P3-10);
+    - `checkTypedRecord(*state_.spec, r, level)` with `level = facts_.levelCheckedWrites ? MetadataFeature::kCheckedWrites : MetadataFeature::kBase` (R-X1): `Reject` → stop, `SchemaValidationFailed`, `ValidationFailed`; `VersionAhead` → stop, `NotLeader`, `VersionAhead` (02 P2). The worker adds these two to 02's `typedRejects_` / `typedVersionAhead_` (Task 7). It covers the version lookup, the validator, the wire key and the tombstone rule (P3-10);
     - intent bookkeeping into `BatchIntents`.
   - A walk that `forEachRecordSpan` reports as structurally bad → `SchemaValidationFailed` (`ValidationFailed`), as Part 02's `checkTypedBatch` answers it. One case keeps 02's P5: below the level on a topic without `legacyValidate`, 02 never walks the batch, so a bad walk there passes unchecked (no intent or `View` means anything below the level, rules 2–3).
   - After the walk: `evaluateRequirements(intents, facts_, topicHookFactsOf(state_))`.
@@ -780,7 +780,7 @@ git commit -m "feat(storage): handleProduceBatch<LogT, HookT> - check after dedu
   - **Hook `check()` on real bytes**, a `PartitionWriteState` built with Part 02's spec builder for the `characters` descriptor (`id i64 key`, `type enum`, `name string`):
     - `CheckedWritesHook.ValidUpsertBatchPasses` (3 records): `OK`, `refusal() == None`.
     - `CheckedWritesHook.UnknownVersionIsSchemaValidationFailed`: version 0, and a version below the highest installed one with no entry → `SchemaValidationFailed` / `ValidationFailed`.
-    - `CheckedWritesHookRegression.VersionAboveTheInstalledMaxIsRetriableNotLeaderRegression` (02 P2, R-X1): a record at `maxVersion() + 1` → `NotLeader` / `VersionAhead`, `typedVersionAheadForTest()` counts it, LEO 0; once that version is installed the same batch → `OK`.
+    - `CheckedWritesHookRegression.VersionAboveTheInstalledMaxIsRetriableNotLeaderRegression` (02 P2, R-X1): a record at `maxVersion() + 1` → `NotLeader` / `VersionAhead`; once that version is installed in the spec, the same batch on a fresh hook → `OK`. (The worker half, counters and LEO, stays pinned by 02's `CheckedWritesWorkerRegression.VersionAheadIsRetriableUntilInstalledRegression`.)
     - `CheckedWritesHook.WireKeyMismatchIsSchemaValidationFailed`: key 8 B ≠ `id` → `SchemaValidationFailed` / `ValidationFailed`.
     - `CheckedWritesHook.TombstoneSkipsValueValidation` (02 P1): empty value with an 8 B key → `OK`; a 7 B key → `ValidationFailed`; a tombstone on a keyless typed topic → `ValidationFailed`.
     - `CheckedWritesHookRegression.BelowTheLevelKeepsPartTwosLegacyRuleRegression` (02 P5): level 3, a non-`legacyValidate` spec, invalid UTF-8 → `OK`; the same with `legacyValidate` and a valid record → `OK`, with an unknown version → `SchemaValidationFailed`.
