@@ -22,7 +22,7 @@
 - §14 (the write-hook budget);
 - the §15 "Autoincrement" block, plus "a batch mixing key-0 creates with other records is refused" and "a retry after failover and compaction still returns its ids".
 
-The binding contract is `broker/docs/superpowers/plans/2026-10-22-checked-writes-00-overview.md`: C1, C5, C6, C7, C8, C10, C11, C13, C15, C16 (ids 8–10), C17, SD4, SD9, SD10, SD11 and the shared test infrastructure. The controller rulings R02e, R04e, R04g, R05a, R05d, R05f, R07d and R10a override the overview where they differ. This part consumes plans 01, 02, 03, 04, 05 and 07 (only `ViewKey::fromU64` / `asU64`) through their Interfaces and Contract additions.
+The binding contract is `broker/docs/superpowers/plans/2026-10-22-checked-writes-00-overview.md`: C1, C5, C6, C7, C8, C10, C11, C13, C15, C16 (ids 8–10), C17, SD4, SD9, SD10, SD11 and the shared test infrastructure. The controller rulings R02e, R04e, R04g, R05a, R05d, R05f, R06a–R06h, R07d (reworded), R08f, R10a, R-ORD and R-X2 override the overview where they differ. This part consumes plans 01, 02, 03, 04 and 05 through their Interfaces and Contract additions; `ViewKey::fromU64` / `asU64` come from Part 04's `ViewKey.h` (R07d). It does not depend on Part 07, which comes after it (R-ORD: 05 → 06 → 07).
 
 ---
 
@@ -41,8 +41,9 @@ The binding contract is `broker/docs/superpowers/plans/2026-10-22-checked-writes
   - `grep -n "kReservation = 16" broker/libs/storage/include/rune/storage/ControlRecordLayout.h` (1 hit, Part 04)
   - `grep -n "keepsReservation" broker/libs/storage/include/rune/storage/VerdictCleanState.h` (1 hit, Part 04)
   - `grep -n "VerdictUnknown = 14" client-cpp/include/rune/client/Completion.h` (1 hit, Part 04)
+  - `grep -n "StoredIdUnknown = 13" client-cpp/include/rune/client/Completion.h` (1 hit: Part 04's reserved placeholder, which this part documents; R-X2)
   - `grep -n "createKeyIndex" broker/libs/node/tests/support/CheckedWritesRig.h` (≥ 1 hit, Part 05)
-  - `grep -n "fromU64" broker/libs/view/include/rune/view/ViewKey.h` (≥ 1 hit)
+  - `grep -n "fromU64\|asU64" broker/libs/view/include/rune/view/ViewKey.h` (≥ 2 hits, Part 04; R07d)
 - **Builds.** These are already configured. If one is missing, stop and tell the controller.
   - `build/root`: Ninja, Debug, `BUILD_TESTING=ON`. Build with `cmake --build build/root -j14 --target <t>`. Test with `ctest --test-dir build/root -R <filter> -j14 --output-on-failure`.
   - Also `build/sub-client-cpp` (the client suites), `build/sub-codec` (`rune_codec_tests`, `rune_catalog_tests`, `rune_security_tests`, CatalogGolden), `build/sub-ql` (`rune_ql_tests`), `build/rel` (Release, `BUILD_BENCHMARKS=ON`), `build/asan`, `build/tsan` and `build/client-tsan`.
@@ -94,7 +95,8 @@ Copied verbatim from the overview (Plan 00), restricted to what this part touche
 - **R05a.** Local refusals are `SendResult::WriteNotAllowed`, synchronous, with no completion.
 - **R05d.** `ApplyV2` (catalog `formatVer` 2) stays open until the first release. This part appends its autoincrement rules to it and leaves 05's v2 golden byte-identical.
 - **R05f.** `TopicHandle` appends `rune::protocol::Partitioner partitioner = Partitioner::Fnv1a;` **after** 05's `kind`.
-- **R07d.** `ViewKey::fromU64(v).asU64() == v`. This part does not touch the key index's word mapping.
+- **R07d (reworded).** Part 04 defines `ViewKey::fromU64` / `asU64` in `ViewKey.h`, with `ViewKey::fromU64(v).asU64() == v`. This part takes them from 04 and does not touch the key index's word mapping. Part 07 later extends `ViewKey` without renaming these.
+- **R-X2.** Part 04 adds `OpStatus::StoredIdUnknown = 13` as a reserved placeholder. This part gives it its meaning and its doc comment (P6-10); it adds no enum value.
 - **P5-4 (05).** An intent sent before the key index's change record is in the log gets a retriable `NotLeader` (`KeyIndexActivating`). That includes key-0 creates.
 - **P5-1 (05).** The key index is rebuilt from the local log at every activation. Assigned ids are folded into it like any insert.
 - **C8 rule 8 (03).** The key-0 rules are in place: `MixedKeyZeroBatch`, `KeyZeroCreateNeedsIdempotentAll` and `KeyZeroCreateNeedsView`. This part appends 8a–8f after them (P6-4).
@@ -110,9 +112,9 @@ Copied verbatim from the overview (Plan 00), restricted to what this part touche
   - **Fnv1a** is exactly `partitionForKey(key, P)`.
   - **Modulo.** For `key.size()` in 1–8 it is the little-endian, zero-extended `uint64` of the key mod P. An empty key, a key wider than 8 bytes, or `P ≤ 1` gives 0.
   - `int64` ids are positive, so their LE bytes equal the `uint64` form.
-- **P6-3 — `assignedBase` of a stored batch.** On an autoincrement partition, `assignedBase` is the first record's key read as `uint64` when that record's intent is `Insert`, and 0 otherwise.
-  - For a key-0 batch it is the base id. For an `IMPORT` batch it is the first imported id. Either way the fresh answer and the answer rebuilt from the log are equal.
-  - The client uses it only for key-0 batches (P6-10).
+- **P6-3 — `assignedBase` of a stored batch.** On an autoincrement partition, the `ProduceResponse.assignedBase` of a key-0 batch is its base id, `autoIncId(firstN, P, p)`. Every other batch, an `IMPORT` batch included, answers 0, fresh and duplicate alike, so a duplicate's ack stays byte-identical to the original's.
+  - **Provenance.** After the patch, a key-0 batch and an import batch look the same in the log: intent `Insert`, and the first key is the first id. Only `onAppended` knows that a batch was key-0, so only the fresh path records it as such (P6-8). The leadership scan can't tell the two apart. It rebuilds an entry for every idempotent batch whose first record is an `Insert`, with the first key as the base and the provenance marked unknown. Only a key-0 duplicate ever looks an entry up (Task 9), and for a key-0 batch the scanned base equals the fresh one.
+  - The client uses `assignedBase` only for key-0 batches (P6-10).
 - **P6-4 — Write rules on an autoincrement topic** (§6.6, §11.2). These are appended to C8 inside `evaluateRequirements`, after 03's rule 8 and before rule 9, in this order:
   - **8a.** A live record with intent 0 (a plain upsert) → `InvalidRequest`, `UpsertOnAutoIncrement`. A tombstone with intent 0 (`remove`) is allowed.
   - **8b.** An explicit-key `insert` without `facts.importGranted` → **`NotAuthorized` (45)**, `ImportNotGranted`.
@@ -166,8 +168,9 @@ Copied verbatim from the overview (Plan 00), restricted to what this part touche
   - **Id of n:** `n·P + p`. Batch record i gets `base + i·P` (§6.3).
 - **P6-8 — The side window** (`AssignedBaseWindow`).
   - **Layout.** An open-addressed table of producer slots `{producerId, head, count, 32 × {baseOffset i64, assignedBase u64}}`, reserved at install at `kAssignedBaseProducersInitial = 1024` slots. It holds 32 entries per producer, in step with `kRetryWindowSize`.
-  - **Fill.** `record` runs in `onAppended` for every batch with `assignedBase != 0` and `producerId >= 0`, transactional or not.
-  - **Lookup.** `find(pid, baseOffset)` answers 0 for unknown.
+  - **Fill.** `record` runs in `onAppended` only for a key-0 batch with `producerId >= 0`, transactional or not. Rule 8f has checked `canAccept` for exactly these batches, so `record`'s precondition always holds. Import batches and all other batches are never recorded on the fresh path.
+  - **Entries.** Each entry is `{baseOffset i64, assignedBase u64, keyZero bool}`. `record` sets `keyZero = true`. `recordScanned` sets it to false, because the log doesn't keep the provenance (P6-3).
+  - **Lookup.** `find(pid, baseOffset)` answers 0 for unknown. `isKeyZeroBatch(pid, baseOffset)` is true only for an entry that `record` wrote.
   - **Growth.** A cold maintenance step, `Worker::maintainAutoIncWindows_()`, runs once per 1,024 passes and whenever the load passes 75 %. It doubles the table, up to `kAssignedBaseProducersMax = 1'048'576`.
   - **Rebuild.** The window is cleared at the scan's `begin` and refilled from every idempotent data batch the scan sees. `recordScanned` may grow, since the scan is a cold recovery path.
   - **Expiry.** It follows the cleaner's producer expiry: an expired producer's batches stop being kept (P6-9), and its slot is cleared at the next scan that does not see them.
@@ -199,7 +202,8 @@ Copied verbatim from the overview (Plan 00), restricted to what this part touche
   - **Not checked locally.** Whether the source is constrained. The broker's `KeyZeroCreateNeedsView` answers it, and the docs tell writers to use `All | View`.
 - **P6-13 — The key index still judges assigned ids** (deviation from §6.4's "skips the key-index existence check").
   - Assigned ids are folded as inserts and judged like any insert. The probe costs one hash lookup and is always absent by construction.
-  - It doubles as a reuse detector. A 52 on a key-0 record would mean a reused id: it is counted `autoIncAssignedKeyExists`, logged `critical`, and asserted 0 by every test and the stress run.
+  - It doubles as a reuse detector (R06c). A 52 on a record of a key-0 batch (`assignedBases.isKeyZeroBatch(pid, baseOffset)`) would mean a reused id. It is counted in `assignedKeyExists`, logged `critical`, and asserted 0 by every test and by the stress run. A 52 on an `IMPORT` batch is the expected answer to an import below the counter, and it is never counted.
+  - **Coverage.** Entries rebuilt by a leadership scan have unknown provenance (P6-3), so the detector covers the batches judged in the leadership that appended them. A record re-judged above W after a failover is still rejected with 52, but it isn't counted. The same rule applies to `idsBurned` (Task 9).
   - *Flagged.*
 - **P6-14 — Import rights.**
   - **The grant.** `IMPORT` (`SecurityOperation::Import = 7`) is a TOPIC operation. `validGrant` allows it on TOPIC patterns only, and nothing implies it: not ADMIN, not CLUSTER grants. Like every grant it implies DESCRIBE (D15).
@@ -213,13 +217,16 @@ Copied verbatim from the overview (Plan 00), restricted to what this part touche
 2. **Client:**
    - `TopicHandle` appends `rune::protocol::Partitioner partitioner = rune::protocol::Partitioner::Fnv1a;` after `kind` (R05f);
    - `TopicSchemaResult` (`Client.h:156`) appends `bool hasKeyFeatures = false; rune::protocol::TopicKeyFeatures keyFeatures{};` (05's deferred exposure);
-   - `OpStatus::StoredIdUnknown = 13` (C6);
+   - the meaning and doc comment of `OpStatus::StoredIdUnknown = 13` (C6), which Part 04 reserved as a placeholder (R-X2); no enum value is added;
    - ring flag `kFlagKeyZero = 0x08` (`ProducerImpl.h`);
    - `InFlightBatch` (`InFlightRing.h:77`) appends `uint32_t idStride = 0;` (0 = not a key-0 batch, else P);
    - `ClientAgent::ProduceAck` appends `uint64_t assignedBase = 0;`;
    - `ProducerHub::onProduceResponse` / `ProducerImpl::onProduceResponse` gain a trailing `uint64_t assignedBase = 0` after 04's `verdicts, hasVerdicts`;
    - `[[nodiscard]] constexpr bool isKeyZeroCreate(const TopicHandle&, const Key&, WriteIntent) noexcept` (`Producer.h`);
-   - `inline constexpr int32_t kKeyZeroStickyRun = 64;`.
+   - `inline constexpr int32_t kKeyZeroStickyRun = 64;`;
+   - two test-only `ClientConfig` knobs (`Client.h:268`), off by default and never set in production:
+     - `bool producePartitionUnknownForTest = false;`: the producer sends `Produce.partitionKnown = 0` (today it is always 1, `ProducerImpl.cpp:1725`), so the gateway resolves the partition through `TopicRegistry::partitionForKey` (`ClientGateway.cpp:3600`);
+     - `uint32_t dropProduceAcksForTest = 0;`: the client agent discards this many first `ProduceResponse` frames, so the producer's retry resends the batch with the same pid, epoch and sequence.
 3. **Broker routing tables:**
    - `rune::node::TopicSpec` (`NodeConfig.h:66`) appends `rune::protocol::Partitioner partitioner = rune::protocol::Partitioner::Fnv1a; bool autoIncrement = false;`;
    - `CatalogTopicAppliedMsg` (`AdminChannels.h:1273`) appends `rune::protocol::TopicKeyFeatures keyFeatures{};`, and its in-process wire appends `[flags u8: bit0 autoIncrement][partitioner u8]`. `catalogTopicAppliedWireLen` adds 2 (a view's message carries its source's);
@@ -257,9 +264,10 @@ Copied verbatim from the overview (Plan 00), restricted to what this part touche
    public:
        void reserve(std::size_t producers);  void clear() noexcept;
        [[nodiscard]] bool canAccept(int64_t producerId) const noexcept;
-       void record(int64_t producerId, int64_t baseOffset, uint64_t assignedBase) noexcept;   // precondition canAccept
-       void recordScanned(int64_t producerId, int64_t baseOffset, uint64_t assignedBase);     // cold; may grow
+       void record(int64_t producerId, int64_t baseOffset, uint64_t assignedBase) noexcept;   // key-0 batches only; precondition canAccept (8f)
+       void recordScanned(int64_t producerId, int64_t baseOffset, uint64_t assignedBase);     // cold; may grow; provenance unknown
        [[nodiscard]] uint64_t find(int64_t producerId, int64_t baseOffset) const noexcept;   // 0 = unknown
+       [[nodiscard]] bool isKeyZeroBatch(int64_t producerId, int64_t baseOffset) const noexcept;   // only entries record() wrote
        [[nodiscard]] std::size_t producers() const noexcept;  [[nodiscard]] std::size_t capacity() const noexcept;
        void grow(std::size_t producers);   // cold
    };
@@ -309,7 +317,8 @@ Copied verbatim from the overview (Plan 00), restricted to what this part touche
 - **§6.4 "skips the key-index existence check".** Not skipped (P6-13). The probe is kept as a reuse detector.
 - **No delete-records API exists.** The §15 cell "delete-records on an autoincrement topic" has nothing to refuse. A follow-up issue requires a future delete-records to refuse autoincrement topics.
 - **§6.6 import reservation "through id div P"** is extended to a full block (P6-7).
-- **`assignedBase` on `IMPORT` batches** is the first imported id (P6-3), so a rebuilt window and a fresh answer always agree.
+- **`assignedBase` on `IMPORT` batches** is 0 on every answer (P6-3). The log can't tell a patched key-0 batch from an import batch, so a window rebuilt by a scan also holds import entries, with unknown provenance. Only key-0 duplicates read them. The reuse detector and `idsBurned` count only fresh key-0 entries (P6-13).
+- **Plain upserts on autoincrement topics (§11.2 vs §6.6).** §11.2 says a plain upsert passes on any topic. On an autoincrement topic this part refuses it (rule 8a), as §6.6 requires. *Flagged to the owner as a spec deviation.*
 - **QL grammar.** The `autoincrement` field modifier and `with (autoincrement.reserve / .max)` are Part 08's. This part exercises them through `TopicOptions::keyFeatures`. Part 08 owns the QL cell `topic … { id uint64 autoincrement … } key id with (cleanup.policy = compact);` with no `partitions`, which must give 1 partition.
 - **Orphaned rows.** An `insertAndWait` that times out with its outcome unknown makes the producer bump its epoch. A stored key-0 batch then keeps ids its writer never learned. That is today's unknown-outcome semantics, documented in `client-cpp.md` ("look the row up through a unique view").
 
@@ -580,7 +589,7 @@ An `AUTOINC` leg in `broker/docker/checked-writes-e2e.sh`. Its legs are listed i
 
 **Interfaces:**
 - Consumes: Task 2; 03's `WriteFacts::importGranted`.
-- Produces: contract addition 10 (broker half) and `WriteFacts::producerId` (contract addition 7). On every produce path the worker knows whether the session may `IMPORT` the topic.
+- Produces: contract addition 10 (broker half), `WriteFacts::producerId` (contract addition 7), and the test seam `[[nodiscard]] WriteFacts Worker::lastWriteFactsForTest() const noexcept` (contract addition 12; created here because this task's test reads it). On every produce path the worker knows whether the session may `IMPORT` the topic.
 
 - [ ] **Step 1: Write the failing tests.**
   - `WorkerWriteGrantsTest.cpp`:
@@ -717,12 +726,12 @@ An `AUTOINC` leg in `broker/docker/checked-writes-e2e.sh`. Its legs are listed i
 ### Task 6: Client acks: `assignedBase`, the id of every record, `StoredIdUnknown`, `WriteResult::key()`
 
 **Files:**
-- Modify: `client-cpp/include/rune/client/Completion.h:54` (`StoredIdUnknown = 13`, doc "stored; its id is unknown (the retry fell outside the dedupe window)"), `client-cpp/include/rune/client/agent/ClientAgent.h` (`ProduceAck::assignedBase`), `client-cpp/src/agent/ClientAgent.cpp` (copy it from 03's decode), `client-cpp/src/Client.cpp` (the ack dispatch), `client-cpp/include/rune/client/producer/ProducerHub.h`, `client-cpp/src/producer/ProducerHub.cpp`, `client-cpp/include/rune/client/producer/ProducerImpl.h`, `client-cpp/src/producer/ProducerImpl.cpp` (`onProduceResponse` `:2350-2390`, `completeSlice_` `:2761-2782`: P6-10)
+- Modify: `client-cpp/include/rune/client/Completion.h:54` (the doc comment of Part 04's reserved `StoredIdUnknown = 13`: "stored; its id is unknown (the retry fell outside the dedupe window)"; R-X2, no new value), `client-cpp/include/rune/client/agent/ClientAgent.h` (`ProduceAck::assignedBase`), `client-cpp/src/agent/ClientAgent.cpp` (copy it from 03's decode; `dropProduceAcksForTest`), `client-cpp/include/rune/client/Client.h:268` (the two test knobs of contract addition 2), `client-cpp/src/producer/ProducerImpl.cpp:1725` (`partitionKnown` from `producePartitionUnknownForTest`), `client-cpp/src/Client.cpp` (the ack dispatch), `client-cpp/include/rune/client/producer/ProducerHub.h`, `client-cpp/src/producer/ProducerHub.cpp`, `client-cpp/include/rune/client/producer/ProducerImpl.h`, `client-cpp/src/producer/ProducerImpl.cpp` (`onProduceResponse` `:2350-2390`, `completeSlice_` `:2761-2782`: P6-10)
 - Modify: `client-cpp/include/rune/client/TypedTopic.h` (no API change: `insert` / `insertAndWait` already send intent 1; a `rec.key() == 0` on a Modulo handle is a key-0 create through Task 5)
 - Create: `client-cpp/tests/client/CheckedWritesAutoIncTypedTest.cpp` (in `rune_client_tests`). Extend `CheckedWritesAutoIncClientTest.cpp`.
 
 **Interfaces:**
-- Consumes: 03's `ProduceResponse::assignedBase` decode, 04's per-record override and `VerdictUnknown` mapping, 05's `WriteResult::fromCompletion` and `assignedKeyOf`.
+- Consumes: 03's `ProduceResponse::assignedBase` decode, 04's per-record override and `VerdictUnknown` mapping, 05's `WriteResult::fromCompletion`, and 03's `assignedKeyOf` (C6).
 - Produces: P6-10. `Completion::aux` is the assigned id for a `Send` of a key-0 batch, and 0 otherwise. `WriteResult::key()` returns it (C6).
 
 - [ ] **Step 1: Write the failing tests.**
@@ -735,16 +744,17 @@ An `AUTOINC` leg in `broker/docker/checked-writes-e2e.sh`. Its legs are listed i
       - `OK, baseOffset −1` on an `All` producer;
       - `OK, assignedBase 0`.
     - `CheckedWritesAutoIncClientRegression.NonKeyZeroBatchesKeepTheirMappingRegression`: an update batch answered `DuplicateSequence` → `VerdictUnknown` (04). `OK −1` on an `All` producer → `Ok −1`. `aux` is 0 throughout.
+    - `CheckedWritesAutoIncClient.TestKnobsAreOffByDefault`: a default `ClientConfig` sends `partitionKnown == 1` and delivers every ack. `producePartitionUnknownForTest` → the captured frame has `partitionKnown == 0`. `dropProduceAcksForTest = 1` → the first ack is discarded and the retry's ack completes the record once.
   - `CheckedWritesAutoIncTypedTest.cpp` (the stub `ProducerT` of 05's typed tests):
     - `CheckedWritesAutoIncTyped.InsertAndWaitKeyIsTheAssignedId`: a scripted completion `{Ok, value 7, aux 42}` → `insertAndWait(rec{.id = 0}).key() == 42`, `offset() == 7`.
     - `CheckedWritesAutoIncTyped.StoredIdUnknownSurfacesAsStatus`: `{StoredIdUnknown}` → `!ok()`, `status() == StoredIdUnknown`, `key() == 0`.
-- [ ] **Step 2: Run to verify they fail.** `cmake --build build/sub-client-cpp -j14 --target rune_invoker_tests rune_client_tests`. Expected: `no member named 'StoredIdUnknown' in 'rune::client::OpStatus'`.
+- [ ] **Step 2: Run to verify they fail.** `cmake --build build/sub-client-cpp -j14 --target rune_invoker_tests rune_client_tests`. Expected: `no member named 'assignedBase' in 'rune::client::ClientAgent::ProduceAck'` (`StoredIdUnknown` already exists as 04's placeholder).
 - [ ] **Step 3: Implement** as specified. The id loop adds one multiply per record on key-0 batches only. Other batches take today's path with one `idStride == 0` test.
 - [ ] **Step 4: Run.** `ctest --test-dir build/sub-client-cpp -R 'CheckedWritesAutoInc|ProducerVerdicts|ProducerAck|ProducerEos|TypedTopic|CheckedWritesTypedTopic' -j14 --output-on-failure`. Expected: PASS.
 - [ ] **Step 5: Commit.**
   ```bash
   git add client-cpp/include/rune/client/Completion.h client-cpp/include/rune/client/agent/ClientAgent.h \
-          client-cpp/src/agent/ClientAgent.cpp client-cpp/src/Client.cpp client-cpp/include/rune/client/producer \
+          client-cpp/src/agent/ClientAgent.cpp client-cpp/include/rune/client/Client.h client-cpp/src/Client.cpp client-cpp/include/rune/client/producer \
           client-cpp/src/producer client-cpp/include/rune/client/TypedTopic.h \
           client-cpp/tests/producer/CheckedWritesAutoIncClientTest.cpp client-cpp/tests/client/CheckedWritesAutoIncTypedTest.cpp \
           client-cpp/CMakeLists.txt
@@ -826,7 +836,7 @@ An `AUTOINC` leg in `broker/docker/checked-writes-e2e.sh`. Its legs are listed i
 - Create: `broker/libs/node/tests/node/CheckedWritesAutoIncHookTest.cpp` (in `rune_checked_writes_tests`)
 
 **Interfaces:**
-- Consumes: Task 7; 02's `SpecVersion::keyValueOffset` and `descriptorFor`; 03's `RecordSpan::{attributes, key, index}`, `HookStaged`, `assignedBase()`; C10's `buildReservation`.
+- Consumes: Task 7; 02's `SpecVersion::keyValueOffset` and `descriptorFor`; 02's `RecordSpan::key` (R02a) and 03's `RecordSpan::{attributes, index}`, `HookStaged`, `assignedBase()`; C10's `buildReservation`.
 - Produces:
   - **`check()`** fills the new `BatchIntents` fields in its one walk:
     - `plainUpsert`: a live record with intent 0 on an autoincrement spec;
@@ -845,7 +855,7 @@ An `AUTOINC` leg in `broker/docker/checked-writes-e2e.sh`. Its legs are listed i
     5. `autoInc.commitNext(plan.newNextN)`, then return `{OK, scratch.data(), len}`.
 
     An import-only batch (`importMaxN > 0`) commits `newNextN` with no copy. `++importsMovedCounter` when it moved the counter.
-  - **`onAppended(base, last)`:** `assignedBase_ = first record's intent == Insert ? u64(firstKey) : 0` (P6-3; for a key-0 batch, `autoIncId(firstN, P, p)`). If `assignedBase_ != 0 && facts.producerId >= 0`, then `assignedBases.record(pid, base, assignedBase_)`. On a key-0 batch, `++keyZeroBatches`.
+  - **`onAppended(base, last)`:** `assignedBase_ = keyZeroCount > 0 ? autoIncId(firstN, P, p) : 0` (P6-3). On a key-0 batch it does `++keyZeroBatches` and, if `facts.producerId >= 0`, `assignedBases.record(pid, base, assignedBase_)` (P6-8; 8f has already checked `canAccept`). No other batch is recorded.
   - **`assignedBase()`** returns `assignedBase_` (03's fourth member). `NoWriteHook` stays 0.
   - A non-autoincrement spec takes none of these branches beyond one `[[unlikely]] if (spec.autoIncrement)` per walk.
 
@@ -879,10 +889,11 @@ An `AUTOINC` leg in `broker/docker/checked-writes-e2e.sh`. Its legs are listed i
     - `CheckedWritesAutoIncHook.StrideAndPartition`: P 4, p 2 → keys 6, 10, 14.
     - `CheckedWritesAutoIncHook.ExhaustedBatchAppendsNothing`: max 2, 3 creates → `check()` returns 54, the LEO and `nextN` are unchanged, and no reservation is appended.
     - `CheckedWritesAutoIncHook.ExplicitInsertWithoutImportIsNotAuthorized`: → 45, LEO unchanged.
-    - `CheckedWritesAutoIncHook.ImportAboveTheReservationAppendsItFirst`: `R 4096`, an import of id 5000 (P 1) → a type-16 record `≥ 5000` right below the data. `nextN 5001`, `assignedBase() == 5000`.
+    - `CheckedWritesAutoIncHook.ImportAboveTheReservationAppendsItFirst`: `R 4096`, an import of id 5000 (P 1) → a type-16 record `≥ 5000` right below the data. `nextN 5001`, `assignedBase() == 0` (P6-3).
     - `CheckedWritesAutoIncHook.ImportBadKeys`: P 2, p 0, id 3 → `ImportOutOfRange`. An `int64` id −5 → `ImportOutOfRange`. Id `2^53` → `ImportOutOfRange`.
     - `CheckedWritesAutoIncHook.KeyZeroWithANonZeroValueKeyIsSchemaValidationFailed`: key `LE8(0)`, value id 7 → 24 (02's placeholder rule).
-    - `CheckedWritesAutoIncHook.WindowRecordsTheBase`: pid 11 → `assignedBases.find(11, base) == 1`.
+    - `CheckedWritesAutoIncHook.WindowRecordsTheBase`: pid 11 → `assignedBases.find(11, base) == 1` and `isKeyZeroBatch(11, base)`.
+    - `CheckedWritesAutoIncHookRegression.ImportBatchIsNeverRecordedRegression`: with the window at capacity 4 and 4 known pids, an import from a fifth pid → accepted, `assignedBase() == 0`, `find(pid5, base) == 0` and `producers() == 4`. A key-0 batch from that pid → `NotLeader` / `AutoIncWindowFull`.
     - `CheckedWritesAutoIncHook.ReservationAppendFailureIsInternalAndAssignsNothing`: the test log throws on its next append → `{Internal}`, `nextN` unchanged.
     - `CheckedWritesAutoIncHookRegression.NonAutoIncSpecIsUntouchedRegression`: a 02 spec without autoincrement → `stage()` returns the input pointer, and `assignedBase() == 0`.
 - [ ] **Step 2: Run to verify they fail.** `cmake --build build/root -j14 --target rune_checked_writes_tests`. Expected: `no member named 'plainUpsert' in 'rune::node::BatchIntents'`.
@@ -904,16 +915,16 @@ An `AUTOINC` leg in `broker/docker/checked-writes-e2e.sh`. Its legs are listed i
 - Modify: `broker/libs/node/include/rune/node/RcState.h:600-720` (`dataBatch` from `feedProducerState_` for data batches with `pid >= 0`, both scans; `end` on the `Ready` edge)
 - Modify: `broker/libs/node/include/rune/node/Worker.h`:
   - `rebuildRcSlots_` (`:6364`) and the `WriteSpecUpdate` apply: an autoincrement spec configures `autoInc` (partition, P, effective max, reserve), reserves `assignedBases` at 1,024, and sizes the worker's `std::vector<uint8_t> autoIncScratch_` to `maxIntakeBatchBytes_` once (cold);
-  - the verdict hooks of 04: `begin` → `autoInc.beginScan()` and `assignedBases.clear()`; `batch` (type 16) → `onReservation`; `dataBatch` → P6-3 on the batch's first record → `recordScanned` and `onAssignedThrough(lastN)`; `end` → `idsBurned += finishScan()`;
+  - the verdict hooks of 04: `begin` → `autoInc.beginScan()` and `assignedBases.clear()`; `batch` (type 16) → `onReservation`; `dataBatch` → for an idempotent batch whose first record is an `Insert`, `recordScanned(pid, base, u64(firstKey))` (provenance unknown, P6-3), and `onAssignedThrough(lastN)`; `end` → `idsBurned += finishScan()`;
   - `executeBecomeFollowerWire_` (`:4703`) → `autoInc.deactivate()`;
   - `produceCore_`: the hook takes `autoIncScratch_` when `spec->autoIncrement`; `ret.assignedBase = outcome.assignedBase`;
   - the duplicate branch (an in-window duplicate on an autoincrement partition whose first record's key is all-zero): `ret.assignedBase = assignedBases.find(pid, outcome.baseOffset)`, and a 0 counts `windowMisses`. This applies to both the `All` park and 04's `View` replay park;
   - `emitProduceAck_` (`:2132-2148`): `a.assignedBase = ret.assignedBase`;
   - `maintainAutoIncWindows_()` (P6-8);
-  - `autoIncStatsForTest`, `autoIncStateForTest`, `lastWriteFactsForTest`.
+  - `autoIncStatsForTest`, `autoIncStateForTest` (`lastWriteFactsForTest` is Task 3's).
 - Modify: `broker/libs/node/src/VerdictSource.cpp`:
-  - in `judge`, on a reject (code ≠ 52) of an intent-1 record on an autoincrement partition → `++autoIncStats.idsBurned`;
-  - a 52 on a record of a batch whose first key is that batch's `assignedBase` → `++assignedKeyExists` and `spdlog::critical("AUTOINC-ID-REUSE topic={} partition={} id={}")` (P6-13).
+  - in `judge`, on a reject (code ≠ 52) of a record of a key-0 batch (`assignedBases.isKeyZeroBatch(batch.producerId, batch.baseOffset)`) → `++autoIncStats.idsBurned`. Rejected imports burn nothing;
+  - a 52 on a record of a key-0 batch, by the same test → `++assignedKeyExists` and `spdlog::critical("AUTOINC-ID-REUSE topic={} partition={} id={}")` (P6-13). A 52 on an import is not counted.
 - Modify: `broker/libs/node/tests/support/CheckedWritesRig.h` (contract addition 13; `appendBatch` with `Rec{.id = 0, .intent = 1}` builds key-0 records; `Ack::assignedBase` decoded)
 - Modify: `broker/libs/node/tests/node/CheckedWritesAutoIncWorkerTest.cpp`
 
@@ -953,7 +964,8 @@ An `AUTOINC` leg in `broker/docker/checked-writes-e2e.sh`. Its legs are listed i
     - `[create, update 1]` → 39 (`MixedKeyZeroBatch`);
     - a create with `acks 0` → 39;
     - a create from a non-idempotent producer → 39.
-  - `CheckedWritesAutoIncWorker.IdOfARejectedCreateIsBurned`: a `TestReject{TagEquals{9}}` member, a 3-create batch with tags 1, 9, 1 → the trailer `{(1, 51, …)}`, `idsBurned 1`, and the next create's id is `base + 3`.
+  - `CheckedWritesAutoIncWorker.IdOfARejectedCreateIsBurned`: a `TestReject{TagEquals{9}}` member, a 3-create batch with tags 1, 9, 1 → the trailer `{(1, 51, …)}`, `idsBurned 1`, and the next create's id is `base + 3`. An import with tag 9 → 51, and `idsBurned` stays 1.
+  - `CheckedWritesAutoIncRegression.ImportBelowTheCounterIsNotAReuseAlarmRegression`: creates 1–3, then an import of id 2 → 52 with `constraintId 0`, `assignedKeyExists == 0`, no `AUTOINC-ID-REUSE` log line, and `idsBurned` unchanged.
   - `CheckedWritesAutoIncWorker.KeyZeroOnAConstrainedSourceNeedsView`: with the member, `acks 1` → 39 (`KeyZeroCreateNeedsView`).
   - `CheckedWritesAutoIncWorker.AbortedTransactionBurnsItsIds`: a transactional producer creates 2 then aborts → ids burned, the next plain create gets the id after them, and the key index has neither.
   - `CheckedWritesAutoIncWorker.WindowFullIsRetriableUntilItGrows`: the window reserved at 4 (rig option) and 5 producers → the fifth gets `NotLeader` (`AutoIncWindowFull`). After `maintainAutoIncWindows_()` (forced by the rig) → accepted.
@@ -1103,13 +1115,13 @@ An `AUTOINC` leg in `broker/docker/checked-writes-e2e.sh`. Its legs are listed i
       - `removeExistingAndWait` of half → ok;
       - a projection view `ai_by_id key id` with `getViewRowAndWait(id)` → found for the live ones;
       - a keyed subscribe (`Client.cpp:4954`) on the id's key → its partition;
-    - a raw produce with `partitionKnown = 0` of an explicit `update` → routed by the gateway to `id % 4`.
+    - an explicit `update` from a client with `producePartitionUnknownForTest = true` (`partitionKnown = 0`) → routed by the gateway to `id % 4`.
   - `CheckedWritesBrokerRegression.ImportNeedsTheGrantShardRegression`:
     - setup: `AuthBroker("ai-import", {.shard = true})`; user `app` with `write on topic 'user'`, user `backfill` with `write` and `import on topic 'user'`;
     - `app`: an explicit-id `insertAndWait({.userId = 500})` → `code() == 45`, LEO unchanged;
     - `backfill`: the same → ok, `key() == 500`;
     - `app`: `insertAndWait` key-0 → `key() == 501`;
-    - `backfill` again on the gateway-routed path (`rune::client::ClientConfig::produceRoute = Gateway`, the 03 rig knob) → 45 / ok exactly as above;
+    - `backfill` again with the gateway resolving the partition (`ClientConfig::producePartitionUnknownForTest = true`, contract addition 2) → 45 / ok exactly as above;
     - `grant import` against a level-3 broker (`testSupportedFeatureLevel = 3`) → `InvalidRequest`, the P6-14 text.
   - `CheckedWritesBrokerRegression.RegressorsPathBackFillThenInsertsNeverCollideThreeNodesRegression` (Review Focus 2, the RegressorsPath migration):
     1. `ThreeNodes::start("cw06")`, with `user` and `character` (P 1, replicas 3, compact, autoincrement).
@@ -1131,7 +1143,7 @@ An `AUTOINC` leg in `broker/docker/checked-writes-e2e.sh`. Its legs are listed i
     - a broker with `testSupportedFeatureLevel = 3` → the autoincrement DDL gets 39 "autoincrement needs every broker at feature level 4";
     - a key-0 create raw-sent to a level-3 broker's existing typed topic → 39;
     - a client whose seed reports `brokerVersion 6` → `status() == BrokerTooOld`, and nothing is sent.
-  - `CheckedWritesBrokerRegression.LostAckRetryAcrossFailoverReturnsTheSameIdsThreeNodesRegression`: the client's first ack is dropped (`ClientConfig::dropProduceAcksForTest = 1`), the leader crashes before the retry, and the retry on the new leader → `key()` equals the id the old leader assigned (read back through the view), with `StoredIdUnknown` never seen.
+  - `CheckedWritesBrokerRegression.LostAckRetryAcrossFailoverReturnsTheSameIdsThreeNodesRegression`: the client's first ack is dropped (`ClientConfig::dropProduceAcksForTest = 1`, contract addition 2), the leader crashes before the retry, and the retry on the new leader → `key()` equals the id the old leader assigned (read back through the view), with `StoredIdUnknown` never seen.
 - [ ] **Step 2: Run.** `cmake --build build/root -j14 --target rune_client_broker_tests && ctest --test-dir build/root -R 'CheckedWritesBrokerRegression' --output-on-failure`, then `--repeat until-fail:3 -j4`. Expected: PASS every round. A failure here is a defect in Tasks 1–12: fix it there with its own `Regression` test, never by relaxing the cell.
 - [ ] **Step 3: Commit.**
   ```bash
@@ -1260,7 +1272,7 @@ An `AUTOINC` leg in `broker/docker/checked-writes-e2e.sh`. Its legs are listed i
   - `assignedBase` and `WriteResult::key()` work;
   - `IMPORT` is enforced;
   - `rune::protocol::partitionFor` exists for 07's `ViewKeyBuilder::partition()`;
-  - Part 08 parses `autoincrement`, `autoincrement.reserve` / `.max` and the default of 1 partition into `TopicKeyFeatures`.
+  - Part 08 parses `autoincrement`, `autoincrement.reserve` and `.max` into `TopicKeyFeatures`, and owns the QL cell "an autoincrement topic with no `partitions` gives 1 partition". The parser change that makes `partitions` optional (default 1) is Part 02's (R08f). `partitions` is not a `TopicKeyFeatures` member.
 - [ ] Do not push or merge without the owner's go-ahead (overview § Sequencing).
 
 ---
@@ -1319,7 +1331,7 @@ An `AUTOINC` leg in `broker/docker/checked-writes-e2e.sh`. Its legs are listed i
   - Small, dense, never reused after a delete: Tasks 9, 10 and 13.
   - Key-0 → next id; IMPORT → counter above max(id): Tasks 8, 9 and 13.
   - Transient refused through `featureRefusal`, and keyless "autoincrement needs a key": `CheckedWritesAutoIncDdl.Refusals`. Untyped follows 02, as listed under gaps.
-  - Partitions default to 1: the P = 1 default path and `partitionCount == 1` in Task 4; the QL default is handed to 08.
+  - Partitions default to 1: the P = 1 default path and `partitionCount == 1` in Task 4. The QL default is Part 02's parser change, and Part 08 owns the autoincrement no-partitions cell (R08f).
   - Retry in the window returns the same key: Task 9, `LostAckRetry…` and `RetryAfterFailover…`.
   - Legacy refusal: Task 13.
   - The `brokerVersion` gate: Task 5.
@@ -1329,7 +1341,7 @@ An `AUTOINC` leg in `broker/docker/checked-writes-e2e.sh`. Its legs are listed i
   - Code steps name files, signatures and placement.
   - Bodies appear only where the signature leaves the algorithm open: the plan/reserve rule (Task 7) and the stage order (Task 8).
 - **Type consistency.**
-  - These are defined once (contract additions) and used with the same spelling in Tasks 5–15: `AutoIncState`, `AutoIncPlan`, `AssignedBaseWindow`, `AutoIncStats`, `autoIncId`, `effectiveAutoIncMax`, `partitionFor`, `kFlagKeyZero`, `idStride`, `isKeyZeroCreate`, `kKeyZeroStickyRun`, `StoredIdUnknown`, `kPermFlagImport`, `kOpFlagImportGranted`, `allowsImport`, `ProducerBatchWindow`, `producerTailDepth`, `createAutoIncTopic(AutoIncShape)`, `autoIncStatsForTest` and `autoIncStateForTest`.
+  - These are defined once (contract additions) and used with the same spelling in Tasks 5–15: `AutoIncState`, `AutoIncPlan`, `AssignedBaseWindow` (with `isKeyZeroBatch`), `AutoIncStats`, `autoIncId`, `effectiveAutoIncMax`, `partitionFor`, `kFlagKeyZero`, `idStride`, `isKeyZeroCreate`, `kKeyZeroStickyRun`, `StoredIdUnknown`, `kPermFlagImport`, `kOpFlagImportGranted`, `allowsImport`, `ProducerBatchWindow`, `producerTailDepth`, `createAutoIncTopic(AutoIncShape)`, `autoIncStatsForTest`, `autoIncStateForTest`, `lastWriteFactsForTest` (Task 3), `producePartitionUnknownForTest` and `dropProduceAcksForTest` (Task 6).
   - C7's member names (`autoInc`, `assignedBases`, `autoIncStats`, `autoIncrement`, `autoIncrementMax`, `autoIncrementReserve`, `partitionCount`, `partitioner`) are verbatim.
   - `TopicHandle::partitioner` follows `kind` (R05f).
 - **Review Focus.** Each of the five has its named test in its owning task: 9, 9/13, 10, 9 and 13.
