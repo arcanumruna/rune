@@ -95,6 +95,10 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 
 ## Rulings this part depends on (restated; binding)
 
+- **R11a (owner-flagged).** `TxnConflict = 59`: a transaction votes no when a newer write to one of its keys lands before its `TxnJudge` (P11-3). Plain writers never wait behind a transaction.
+- **R11b (binding).** Every fold, live, refold, rebuild or leadership scan, applies a transaction's records at its commit marker, in the same order (P11-0).
+- **R11c (binding).** A coordinator failover never loses vote candidates: on recovery every partition of the transaction's persisted partition set is a candidate (P11-11).
+- **R11d.** The recorded calls are accepted (`firstOffset` in `TxnJudge`, after-images, the read fence, 39 for old clients, `TxnCommitResult`, read_uncommitted as read_committed, the `TxnJudge` cleaner bound, the 05/06 matrix edits, the local-only site commit); distributed lock waits resolve by the transaction timeout, and a deadlock-detection follow-up issue is filed (Finish).
 - **R05b.** Part 11 defines the C8 atomic-batch header bit. Parts 05, 06 and 09 do not (P11-6).
 - **R03c / P3-2.** The client never sets `View` on a transactional send. The broker strips `View` from a transactional batch. Transactions get their verdicts through the vote and `commitTransactionAndWait`.
 - **SD14 / SD4.** `txn.judged.records.max` is the broker setting `NodeConfig::txnJudgedRecordsMax` (env `RUNE_TXN_JUDGED_RECORDS_MAX`, default 4096). A `View` batch on a verdict source holds at most 4096 records (`kMaxJudgedBatchRecords`).
@@ -127,19 +131,27 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 - **P11-2 — Judging order, deferral and `judgedThrough()`.**
   - **Classification.** On a verdict source, when the judge reaches the first batch of an undecided transaction T, it classifies T from the committed log:
     - T has a committed `TxnJudge` J: T is **deferred**. The judge records T in `TxnJudgeState`, skips T's batches, and keeps judging other records past them up to J.
-    - T has a committed marker and no J: T is **ordinary**. Its records are judged at their own offsets, in offset order, exactly as today (an aborted T is skipped through Part 01's `FoldSkip.aborted`).
+    - T has a committed marker and no J: T is **ordinary**. The judge defers T to its marker M, runs ahead to M, and judges and applies T's records there, in offset order among themselves, in one step (an aborted T is dropped at its abort marker). Records superseded per P11-3a apply nothing.
     - Neither: the judge **waits** at T's first record, as it waits at the LSO today.
   - **The judge bound** is the HW, no longer the LSO. Waits come only from the classification above, the pause rule (P11-4), overlay exhaustion (P11-5) and Part 04's own waits.
   - **Two positions.**
     - `VerdictSource::judgeCursor()` is where the judge stands. It may run ahead of deferred transactions.
     - `judgedThrough()` becomes `min(judgeCursor, state.txn.earliestUndecidedFirst())`.
   - **What uses `judgedThrough()`.** Everything Part 04 bounds by it is unchanged: consumers, the `View` ack, markers (`[emitFrom, judgedThrough)`), the other views of the partition, and the judge's contribution to K. A deferred transaction therefore holds delivery, markers, W and `View` acks of later writes until it is decided, which is SD16's behaviour.
+- **P11-0 — One fold order everywhere (R11b, binding).** Every fold path applies a committed transaction's records **at its commit marker**, in offset order among themselves, and drops an aborted one's at its abort marker:
+  - the live judge and the live fold of every other view;
+  - a refold (Part 01's discard-and-refold), a rebuild (`driveRebuild`, a joining member, a replace candidate), a checkpoint replay, and a replica's leadership scan and activation replay.
+  - Part 01's `FoldSkip.aborted` stays as a defensive skip; a transactional batch is never applied at its own offset by any path.
+  - A fold that meets a transactional batch records `{pid, first}` in the instance's `TxnSpanFence` (contract addition 13) and skips it; at the pid's commit marker it reads the pid's batches back from `[first, M)` and applies them.
+  - *Consequence.* The view state is a function of the log alone, so `last` / `lastNonNull` and every verdict are identical however the view was built. Pinned by `CheckedWritesTxnDeterminismRegression.LiveEqualsRefoldEqualsRebuildUnderInterleavedTxnsRegression` (Task 8) and the model clause `FoldPathsAgree` (Task 13).
+  - *Checkpoints.* A view or member never pushes a checkpoint at an O that lies inside an open span of its fence (`first < O ≤ M`), except P11-8 (a)'s run-ahead push of a verdict member, which backfills from J's `firstOffset`. Pushes refused this way count `vetoedCheckpointPushes`.
 - **P11-3 — Write-write conflict: `TxnConflict` (59).** When T is judged at J, let `last_T(k)` be T's last record on source key k. T votes no with the new code `TxnConflict = 59` (constraintId 0, failing offset = that outside record) iff some record r of another writer exists such that all of these hold:
   - its source key is a key k that T writes;
   - `offset(r) > last_T(k)`;
   - r is accepted and applied before J in judge order. That means r is non-transactional and judged accepted, or belongs to an ordinary transaction committed below J, or belongs to a deferred transaction whose `TxnJudge` is below J and which committed (the pause rule guarantees its marker is known first).
 
-  *Why.* Without the rule, the view applies T after r while the log, the cleaner and every consumer take r as the key's latest. With it, judge order and offset order agree on every key's latest accepted record, which is all that consumers, compaction and every view except a `last` column depend on (P11-16).
+  *Why.* Without the rule, the view applies T after r while the log, the cleaner and every consumer take r as the key's latest. With it, judge order and offset order agree on every key's latest accepted record, which is what consumers and compaction depend on. (Folds agree with each other by P11-0 regardless.)
+- **P11-3a — Superseded records of a transaction without a vote.** When a transaction is applied at its marker without having voted (an ordinary transaction, on any partition), a record r of it is **superseded** iff an accepted record of another writer on the same source key, with an offset above `last_T(k)`, was applied before M (the same test as P11-3). A superseded record applies nothing. It cannot be rejected (an ordinary transaction has no constrained member and no explicit-key intent), so this only keeps the latest record per key equal to the log's. The marker-without-vote path (P11-7) uses P11-3's no instead.
 
   *Detection.* At J the judge builds T's key set (at most `txnJudgedRecordsMax` keys, a per-worker hash set reserved at `bindTxn`). It then scans `(T.first, J)` for records whose key hits the set, at most `kVoteScanBytesPerPass` per pass. The judge cursor stays at J until the scan and the judgement are complete.
 
@@ -175,14 +187,13 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
   - **(b) While a locked T has J below O, no member checkpoint is pushed.** The tables exclude T, and a replay from O would never revisit J. The pass cap may stall the judge meanwhile, but the marker finalizes T out of cursor order (P11-4), so nothing deadlocks.
   - **(c) The cleaner keeps a `TxnJudge`** while it lies at or above `txnJudgeBound`, the minimum `lastDurableO` over the source's persisted verdict members (published by the worker like W). `VerdictCleanState::keepsControlRecord(offset, 19)` returns `offset >= txnJudgeBound`.
 - **P11-9 — Level 3a everywhere (spec G.5).** The spec's literal mechanism, "the fold never ends a step inside", cannot hold for a persisted view whose pass cap is smaller than the transaction. Two mechanisms give the same guarantee, that no read sees part of a transaction:
-  - **The visibility bound.** `RcState::visibleBound(hw)` is `min(LSO, T.first)` over every committed transaction T whose marker is at or above the LSO. Every non-verdict view folds to it instead of the LSO. A committed transaction whose marker sits past a later open transaction's first record therefore waits whole. Without this, reads would be held for the later transaction's lifetime.
-  - **The span fence.** `ViewInstance::spanFence` tracks transactions (and atomic batches) whose first batch the fold applied but whose marker (or last record) it has not. While it is non-empty, `viewRowGate_` holds the instance's reads (`GetViewRow`, `GetViewRowK`, `ScanViewRows`) like the fold barrier does. It has 16 slots; an overflow fences until the cursor reaches the bound noted at overflow.
-  - **Verdict members** apply a deferred T in one worker step at its marker (P11-4) and ordinary transactions through the same fence.
+  - **Apply at the marker** (P11-0) makes a transaction visible in the step that applies its marker. A committed transaction whose marker lies past a later open transaction's first record simply waits whole below the LSO; reads are never held for the later transaction.
+  - **The read fence.** When a marker's application exceeds the instance's pass cap (a persisted view, a large transaction), or an atomic batch is split by it, the application continues over several passes. Meanwhile `viewRowGate_` holds the instance's reads (`GetViewRow`, `GetViewRowK`, `ScanViewRows`) like the fold barrier does, and no checkpoint is pushed. `TxnSpanFence` has 64 span slots; an overflow makes the fold wait at the transactional batch that does not fit until a span closes (never a skip).
 - **P11-10 — Consumers.** On a verdict source a `read_uncommitted` subscription is served as `read_committed`: the push paths filter aborted batches there too (spec G.5 "On these partitions, read_uncommitted behaves the same way"). `Worker::effectiveIsolation_(const PartitionWriteState*, uint8_t isolation)` sits next to `verdictBound_`.
 - **P11-11 — The coordinator (`TransactionCoordinationService`).**
   - **Candidates.**
-    - **Which partitions.** A partition of T is a vote candidate iff `voteCandidate_(topicId)` (BrokerNode's catalog predicate: the topic has `keyFeatures.keyIndex`, or a live view over it is unique or constrained) holds now, or held at T's first `AddPartitions` for that partition.
-    - **Where the AddPartitions answer lives.** It is kept in memory per producer id (`voteCandidatesAtAdd_`) and is lost on coordinator failover. *Flagged:* the partition-side rule (P11-1 (a)) still votes, and a partition that was never asked takes the P11-7 path.
+    - **Which partitions.** A partition of T is a vote candidate iff `voteCandidate_(topicId)` (BrokerNode's catalog predicate: the topic has `keyFeatures.keyIndex`, or a live view over it is unique or constrained) holds now, or held at T's first `AddPartitions` for that partition (`voteCandidatesAtAdd_`, per producer id).
+    - **Recovery (R11c, binding).** A transaction loaded by `load_` (coordinator failover or restart) has no `voteCandidatesAtAdd_` entry: **every partition of its persisted partition set is a candidate**. A partition with nothing constrained answers yes at once without writing (P11-1), so the cost is one round trip per such partition, only for transactions that span a coordinator failover. No candidate is ever lost.
   - **Vote gate.** `EndTxn(commit)` on an `Ongoing` transaction with at least one candidate:
     - creates a `VoteGate`, sends one `TxnVote` per candidate through `ClientGateway::sendTxnVote`, persists nothing and defers the answer;
     - transactions with no candidate take today's path unchanged, with no extra round trip.
@@ -215,7 +226,6 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
     - 17 `txnVoteLatencyNsMax` and 18 `txnVoteLatencyNsTotal`, measured from vote receipt to answer;
     - 19 `foldPausedOnTxnLockNs` and 20 `txnMarkerWithoutVote`.
   - `votesNoConflict`, `txnOverlayWaits`, `lockPauses`, `checkpointBackfills` and `vetoedCheckpointPushes` are counters without a stat id (C16 has no free id below 32). They are logged, readable through `Worker::txnStatsForTest`, and counted in `votesNo`.
-- **P11-16 — Known limitation: `last` / `lastNonNull` columns of a verdict view.** Under P11-3 a committed voted transaction leaves every key's latest record unchanged between judge order and offset order. But a `last` column takes the group's most recently *applied* contributor. The live fold (judge order) and a refold after a restart (offset order) can then pick different contributors when an outside write to the same group lands between T's write and J. *Flagged* to the owner, with a follow-up issue. Ordinary views and every other aggregate are unaffected.
 - **P11-17 — Requirements per write, restated for transactions and atomic batches.**
   - Plain transactional upserts and deletes on any topic: no requirement beyond today's transactional producer (any client version).
   - Explicit-key intents in a transaction: an idempotent producer (every transactional producer is).
@@ -307,14 +317,14 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
    - `[[nodiscard]] int64_t judgeCursor() const noexcept;`;
    - `judgedThrough()` follows P11-2;
    - `class TxnOverlayPool { public: void reserveFor(std::size_t rows, uint32_t maxRowLen); [[nodiscard]] int32_t acquire(uint64_t sourceKey) noexcept; /* -1 = none */ void release(int32_t) noexcept; TxnOverlay& at(int32_t) noexcept; [[nodiscard]] TxnLockSet lockSetFor(uint64_t sourceKey) const noexcept; };`.
-10. **`RcState`:** `RcVerdictHooks` appends `void (*marker)(void* ctx, int64_t producerId, int64_t offset, bool commit) noexcept = nullptr;`, called from `RcState::onMarker` on the append path and in the leadership scan. The state appends `[[nodiscard]] int64_t visibleBound(int64_t hw) const noexcept;` (P11-9).
+10. **`RcState`:** `RcVerdictHooks` appends `void (*marker)(void* ctx, int64_t producerId, int64_t offset, bool commit) noexcept = nullptr;`, called from `RcState::onMarker` on the append path and in the leadership scan. (No visibility-bound accessor: P11-0 makes it unnecessary.)
 11. **`RejectedOffsetIndex` (C11):** `[[nodiscard]] bool insertRun(std::span<const int64_t> offsets, uint16_t code, uint32_t constraintId);` (cold, out of order; P11-7).
 12. **Cleaner:**
     - `PartitionReplica::publishCleanerTxnJudgeBound(Offset) noexcept` and `[[nodiscard]] Offset cleanerTxnJudgeBound() const noexcept` (an atomic word beside `cleanerVerdictBound`, default `kNoCleanerLso`);
     - `void LogCleaner::setTxnJudgeBound(Offset) noexcept`;
     - `VerdictCleanState::keepsControlRecord(offset, 19)` per P11-8 (c).
 13. **`WorkerViewSet`:**
-    - `ViewInstance` appends `TxnSpanFence spanFence;` with `struct TxnSpanFence { std::array<int64_t, 16> pids{}; uint8_t open = 0; int64_t overflowUntil = -1; void onTxnBatch(int64_t pid) noexcept; void onMarker(int64_t pid) noexcept; void onAtomicBatch(int64_t lastOffset) noexcept; [[nodiscard]] bool fenced(int64_t foldCursor) const noexcept; };`;
+    - `ViewInstance` appends `TxnSpanFence spanFence;` with `struct TxnSpan { int64_t pid = -1; int64_t first = -1; }; struct TxnSpanFence { std::array<TxnSpan, 64> open{}; uint8_t count = 0; int64_t applyingThrough = -1; [[nodiscard]] bool add(int64_t pid, int64_t first) noexcept; /* false = full: wait */ [[nodiscard]] const TxnSpan* find(int64_t pid) const noexcept; void close(int64_t pid) noexcept; [[nodiscard]] bool fenced() const noexcept; /* a marker or atomic batch application in progress */ [[nodiscard]] bool straddles(int64_t o) const noexcept; /* some open first < o */ };` (P11-0, P11-9);
     - `TxnOverlayPool txnOverlays_;`;
     - `[[nodiscard]] bool readFenced(int32_t viewTopicId, int32_t partition) const noexcept;`.
 14. **Hook (C8, 03's seam):** `HookRefusal::AtomicBatchTooLarge` is appended before `Count_`. `WriteFacts::atomicBatch` is set from the bit. Rules 5, 6, 7 and 8 change and rule 10 is added (P11-14).
@@ -359,8 +369,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 - **`TxnJudge` carries `firstOffset`** (C10 lists two fields). It needs no compatibility, because nothing writes type 19 before this part.
 - **Provisional rows are after-images in an overlay**, and the tables hold the before-images (P11-4). This is within §18's latitude, but the spec text describes undo.
 - **Level 3a uses a visibility bound plus a read fence** (P11-9) rather than "the fold never ends a step inside".
-- **`last` / `lastNonNull` columns of a verdict view** can differ between the live fold and a refold (P11-16). It needs an owner decision and a follow-up issue.
-- **The coordinator's AddPartitions-time candidate set is in memory only** (P11-11).
+- **R11b changes every fold path** (Part 01's refold, Part 04's replays and rebuilds, Part 07/09 candidate builds): transactional batches apply at their commit marker (P11-0). Their tests stay green because offset order and marker order differ only under interleaving; Task 8 re-pins any that encoded offset-order application, as a recorded deviation.
 - **Distributed lock waits** resolve only by the transaction timeout (P11-5).
 - **Old sessions get `InvalidRequest`** for a no vote (P11-11).
 - **This part edits the not-applicable rules and pins of rows 05 and 06** (Task 12). "Each part updates its own row" is broken here on purpose, because those rules cite the pre-G refusal.
@@ -375,7 +384,7 @@ These are the five inputs the spec implies but no requirement names, most likely
    - Test: `CheckedWritesTxnWorkerRegression.RunAheadCheckpointBackfillsTheTxnAfterARestartRegression` (Task 7).
 3. **Two transactions locking rows on two partitions in opposite J order.** The waits must resolve by the transaction timeout, never hang past it. The surviving transaction's rows are correct, and the aborted one leaves nothing.
    - Test: `CheckedWritesTxnBrokerRegression.OppositeOrderLocksResolveByTimeoutShardRegression` (Task 14).
-4. **A committed transaction whose marker lies past a later open transaction's first record**, on a partition with ordinary views only. Reads must not be held for the later transaction's lifetime, and the first transaction appears in one step.
+4. **A committed transaction whose marker lies past a later open transaction's first record**, on a partition with ordinary views only. Reads must not be held for the later transaction's lifetime, and the first transaction appears in one step, identically in the live fold, a refold and a rebuild (P11-0).
    - Test: `CheckedWritesTxnVisibilityRegression.CommittedSpanCrossingTheLsoNeverHoldsReadsRegression` (Task 8).
 5. **A v11 transactional client whose commit gets a no vote.** It must get `InvalidRequest`, abort successfully, and run its next transaction. It must never loop on `EndTxn` or turn fatal.
    - Test: `CheckedWritesTxnCoordinatorRegression.OldSessionNoVoteIsInvalidRequestThenAbortSucceedsRegression` (Task 10).
@@ -418,10 +427,11 @@ These are the five inputs the spec implies but no requirement names, most likely
 | 106 | `OutsideWriteLockedRow` | U has 11; after the yes and before the marker, producer 78 creates a character for U (its prospect touches the locked `account_stats` row of U) |
 | 107 | `RacingTxnSameName` | transaction 79 does the same op on another key with the same target (name X, or U's group), votes after 77 |
 
-**Timings.** There are 12. Three are from the shared enum: `Single`, `FailoverHwFold` (failover after the transaction's records are committed, before the judge reached them) and `RestartDuringRebuild` (restart while T is deferred). Nine are appended to `Timing` after `RetryAfterWindow` (R04d):
+**Timings.** There are 13. Three are from the shared enum: `Single`, `FailoverHwFold` (failover after the transaction's records are committed, before the judge reached them) and `RestartDuringRebuild` (restart while T is deferred). Ten are appended to `Timing` after `RetryAfterWindow` (R04d):
 - `CoordinatorFailoverVotesOut`: the first vote's answer is dropped and the vote is re-sent, which is what a reloaded coordinator does. The reply equals the first.
 - `VoterFailoverBeforeJudge`: J is appended, then `failover()` before J is committed. J is cut, and the re-sent vote appends a new J.
 - `VoterFailoverAfterJudge`: J is committed, then `failover()` before it is judged. The new leader judges at the same J and gives the same answer.
+- `CoordinatorFailoverBeforeCommit` (R11c): the coordinator is reloaded from its persisted state between the transaction's `AddPartitions` and its commit. The rig votes on every partition of the persisted set, as a reloaded coordinator does; every vote is collected and the outcome equals `Single`'s.
 - `TimeoutDuringVote`: an abort marker (the timeout abort) is appended while J is not yet judged.
 - `TimeoutWhileLocked`: an abort marker after a yes.
 - `AbortAfterYes`: the rig aborts instead of committing after all votes are yes (the coordinator saw another partition's no).
@@ -430,16 +440,16 @@ These are the five inputs the spec implies but no requirement names, most likely
 - `ConstraintReplacedWhileOpen`: `account_stats` is replaced by `check (characters <= 13)` after the first record.
 
 **Not applicable** (top-down; the first matching rule names the reason):
-1. `AtomicBatch × {CoordinatorFailoverVotesOut, VoterFailoverBeforeJudge, VoterFailoverAfterJudge, TimeoutDuringVote, TimeoutWhileLocked, AbortAfterYes}`: "an atomic batch has no vote and no marker". 1 × 8 × 6 = 48 cells.
+1. `AtomicBatch × {CoordinatorFailoverVotesOut, CoordinatorFailoverBeforeCommit, VoterFailoverBeforeJudge, VoterFailoverAfterJudge, TimeoutDuringVote, TimeoutWhileLocked, AbortAfterYes}`: "an atomic batch has no vote and no marker". 1 × 8 × 7 = 56 cells.
 2. `AtomicBatch × SecondPartitionNo`: "an atomic batch lives on one partition". 1 × 1 × 6 = 6 cells.
-3. `{TxnCreate, TxnSelfCollidingCreates, AtomicBatch} × {KeyAbsent, OutsideWriteSameKey}`: "a key-0 create's id is new; no earlier key and no outside write can hit it". 2 × 2 × 12 + 1 × 2 × 6 = 60 cells.
+3. `{TxnCreate, TxnSelfCollidingCreates, AtomicBatch} × {KeyAbsent, OutsideWriteSameKey}`: "a key-0 create's id is new; no earlier key and no outside write can hit it". 2 × 2 × 13 + 1 × 2 × 6 = 64 cells.
 
-**Cell count:** 7 × 8 × 12 = 672. 558 are applicable and 114 skipped, pinned by `CheckedWritesMatrixCountRegression.CellCountsArePinned` (row 11).
+**Cell count:** 7 × 8 × 13 = 728. 602 are applicable and 126 skipped, pinned by `CheckedWritesMatrixCountRegression.CellCountsArePinned` (row 11).
 
 **`expect11(cell)`, top-down.** The verdicts always come from `CheckedWritesModel` with Part 09's rules plus the transaction semantics (P11-2 to P11-7). `expect11` names what the cell checks:
 
 0. `TimeoutDuringVote`, `TimeoutWhileLocked`, `AbortAfterYes` → the transaction is aborted. Nothing of it is visible anywhere. Producer 78's write (if any) is judged against the state without it. For `TimeoutWhileLocked` the overlay is released at the abort marker.
-1. `VoterFailoverBeforeJudge` → `txnJudgeOffsetsInLog()` holds one surviving J, and the answer equals `Single`'s. `VoterFailoverAfterJudge` and `CoordinatorFailoverVotesOut` → the same J and an identical reply.
+1. `CoordinatorFailoverBeforeCommit` → one vote reply per partition of the persisted set, including the non-constrained ones (yes, no `TxnJudge`), and the outcome equals `Single`'s. `VoterFailoverBeforeJudge` → `txnJudgeOffsetsInLog()` holds one surviving J, and the answer equals `Single`'s. `VoterFailoverAfterJudge` and `CoordinatorFailoverVotesOut` → the same J and an identical reply.
 2. `ConstraintCreatedWhileOpen` → the partition votes (P11-1 (b)) and the transaction is judged under `setAt(J)`. `ConstraintDroppedWhileOpen` → judged under `setAt(J)`, without `character_name`, since the drop record lies below J. `ConstraintReplacedWhileOpen` → judged by the new plan when the swap S lies below J, else by the old one; the model decides from the log.
 3. `Single`, as a check on the model (`CheckedWritesModel.TxnRulesMatchTheTable` asserts the model gives exactly this). N = 51 `character_name` ordinal 0, M = 51 `account_stats` ordinal 1, L = 51 `balances` ordinal 1, K = 53, C = 59; each cell gives `character`'s vote, and in every no cell the transaction aborts on both partitions:
 
@@ -462,6 +472,7 @@ These are the five inputs the spec implies but no requirement names, most likely
 - (d) at every pass, the `onEveryPass` observer reads U's `account_stats` row and the transaction's `character_by_id` rows, and sees all of the transaction's changes on that partition or none (level 3a);
 - (e) `rejected.mismatches() == 0`, `txnMarkerWithoutVote == 0`, and no overlay is held once the transaction is decided;
 - (f) after `compact()`, every key's latest record is the model's latest accepted one in offset order;
+- (f2) every view's tables are byte-identical across the live fold, a `restart()` refold from the log start, and a `driveRebuild` of a freshly installed copy (P11-0);
 - (g) stats 11–20 equal the model's counts.
 
 ### B. Named §15 Part G cells
@@ -502,7 +513,8 @@ These are the five inputs the spec implies but no requirement names, most likely
   - every transaction is fully applied or fully absent on every partition it touched;
   - no pass shows part of it;
   - no consumer received any of an aborted one;
-  - votes match.
+  - votes match;
+  - **`FoldPathsAgree`** (R11b): after every step that ends with no open transaction, the live tables, a refold from the log start, a rebuild of a fresh copy and the model's apply-at-marker refold are byte-identical, including the `last` / `lastNonNull` columns of a `count`, `last(v)`, `lastNonNull(v)` view with `check (lv >= 0)` installed for this model check.
 - **Failure output:** `seed=<n> step=<k> action=<name>`.
 
 ### D. The cluster stress (`rune_checked_writes_stress_tests`, `CheckedWritesStressRegression.SeededTransactionsHoldTheInvariants`, Task 13)
@@ -736,8 +748,9 @@ These are the five inputs the spec implies but no requirement names, most likely
       transactional batch of pid p:
           t = state.txn.find(p) for p's current txn (t.firstOffset <= base)
           if t deferred (its J < HW):          t.records += n; judgeCursor_ = last + 1; continue     // skip, run ahead
-          if p decided (marker < HW, no J):    ordinary: if p should have voted (P11-7) -> defer to the marker
-                                               else judge record by record as 04 does (aborted -> FoldSkip skip)
+          if p decided (marker < HW, no J):    ordinary: defer to the marker M (run ahead to M); at M judge and apply
+                                               p's records in offset order in one step, superseded ones skipped (P11-3a);
+                                               if p should have voted (P11-7): all or nothing at M with P11-3's no
           else:                                stop (wait at p's first record)
       atomic batch (kAttrAtomic, not transactional): judgeAtomic_(batch)                      // Task 6
       other: 04's per-record judge
@@ -749,7 +762,8 @@ These are the five inputs the spec implies but no requirement names, most likely
 - [ ] **Step 1: Write the failing tests** (04's unit harness: a fake `readRange` over `InMemoryLog` batches, members built as in `WorkerViewSetTest.cpp:100-170`, `TestReject{TagEquals{9}}` objectId 7):
   - `CheckedWritesTxnJudge.UndecidedTxnWithoutJudgeRecordWaitsAtItsFirstRecord`: plain records at 10–11, txn 77 at 12–13, plain at 14. Drive → `judgeCursor() == 12`, `judgedThrough() == 12`, and offset 14 is not judged.
   - `CheckedWritesTxnJudge.TxnWithACommittedJudgeIsDeferredAndTheJudgeRunsAhead`: the same log plus J (pid 77, first 12) at 15, HW 16 → plain 14 is judged (a tag-9 record there is rejected). `judgeCursor() == 16`, `judgedThrough() == 12`, and the records 12–13 have no verdict and no view row.
-  - `CheckedWritesTxnJudge.OrdinaryCommittedTxnIsJudgedInOffsetOrder`: txn 77 at 12–13, its commit marker at 15 and no J → records 12–13 judged at their offsets (a tag-9 one rejected), `txnMarkerWithoutVote == 0` (the set is not constrained at 12 and 77 has no intents).
+  - `CheckedWritesTxnJudge.OrdinaryCommittedTxnIsAppliedAtItsMarker`: txn 77 at 12–13, a plain record at 14, its commit marker at 15 and no J (the set is not constrained at 12 and 77 has no intents) → 14 is applied before 12–13, which apply in the step of 15; `txnMarkerWithoutVote == 0`.
+  - `CheckedWritesTxnJudgeRegression.SupersededOrdinaryRecordAppliesNothingRegression` (P11-3a): 77 writes id 4 at 12, a plain upsert of id 4 at 14, marker at 15 → id 4's row is the record at 14, as after `compact()`.
   - `CheckedWritesTxnJudge.AbortedOrdinaryTxnIsSkipped`: an abort marker instead → nothing folded, nothing rejected.
   - `CheckedWritesTxnJudge.MarkersNeverPassAnUndecidedTxn`: deferred 77 at 12 → every marker emitted has `finalThrough <= 12` until 77 is decided.
   - `CheckedWritesTxnJudgeRegression.ActivationKNeverPassesAnUndecidedTxnRegression`: deferred 77, then `bindLeader` with a new generation → K ≤ 12, and the re-judge from K re-defers 77.
@@ -908,32 +922,35 @@ These are the five inputs the spec implies but no requirement names, most likely
              -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   ```
 
-### Task 8: Level 3a on every partition: the visibility bound and the span fence
+### Task 8: One fold order on every path, and level 3a (R11b)
 
 **Files:**
-- Modify: `broker/libs/node/include/rune/node/RcState.h` (`visibleBound`, kept by `onMarker` and the builder: a fixed ring of 64 closed spans `{first, marker}` pruned when `lso > marker`; an overflow returns the oldest pruned first as the bound until it is drained)
-- Modify: `broker/libs/node/{include/rune/node/WorkerViewSet.h,src/WorkerViewSet.cpp}` (`TxnSpanFence` maintained in `driveView_`'s per-batch walk and the judge's apply; `readFenced`), `broker/libs/node/include/rune/node/Worker.h` (`driveViews_` folds non-verdict views to `rc->visibleBound(hw)`; `viewRowGate_` holds a read while `readFenced`)
+- Modify: `broker/libs/view/{include/rune/view/ViewFold.h,src/ViewFold.cpp,include/rune/view/AggFold.h,src/AggFold.cpp}` (`foldBatch` / `foldAggregateBatch` take the instance's `TxnSpanFence*` and a `ReadRangeFn` for read-back: a transactional batch is recorded and skipped; a commit marker reads `[first, M)` for its pid and applies it; an abort marker closes the span)
+- Modify: `broker/libs/node/{include/rune/node/WorkerViewSet.h,src/WorkerViewSet.cpp}` (every caller: `driveView_`, `driveRebuild`, recovery replay, joining members and candidates; the push veto; `readFenced`), `broker/libs/node/src/VerdictSource.cpp` (activation replay uses the same fold), `broker/libs/node/include/rune/node/Worker.h` (`viewRowGate_` holds a read while `readFenced`)
 - Create: `broker/libs/node/tests/node/CheckedWritesTxnVisibilityTest.cpp` (in `rune_checked_writes_verdict_tests`)
 
 **Interfaces:**
 - Consumes: Part 01's `FoldSkip`, Part 07's read ops (`GetViewRowK`, `ScanViewRows`), 04's held-read machinery.
-- Produces: contract additions 10 (`visibleBound`) and 13. The fence's hot cost is one branch per batch on its transactional bit.
+- Produces: P11-0, P11-9 and contract addition 13. The hot cost for non-transactional traffic is the existing per-batch transactional-bit test; 04's legacy identity test is extended to logs with committed transactions against an apply-at-marker reference (`LegacyFoldReference` keeps offset order and is used only for logs without interleaving).
 
 - [ ] **Step 1: Write the failing tests** (Part 03's `CheckedWritesAckRig` on a partition with ordinary views; persisted views with a pass cap forced to 2 records):
   - `CheckedWritesTxnVisibility.CommittedTxnLargerThanThePassCapIsNeverReadHalfApplied`: a committed transaction of 6 records → at every pass, `GetViewRow` of its keys either holds (fenced) or returns all 6 new rows.
-  - `CheckedWritesTxnVisibilityRegression.CommittedSpanCrossingTheLsoNeverHoldsReadsRegression` (Review Focus 4): A's records at 10–12, B opens at 13, A's marker at 20, B open for 10 s of the injected clock → reads are served (not held) the whole time with A's rows absent. `visibleBound == 10`. After B's marker, A and B each appear in one pass.
+  - `CheckedWritesTxnVisibilityRegression.CommittedSpanCrossingTheLsoNeverHoldsReadsRegression` (Review Focus 4): A's records at 10–12, B opens at 13, A's marker at 20, B open for 10 s of the injected clock → reads are served (not held) the whole time with A's rows absent. After B's marker, A and B each appear in one pass.
+  - `CheckedWritesTxnDeterminismRegression.LiveEqualsRefoldEqualsRebuildUnderInterleavedTxnsRegression` (R11b): seeds 1–100. Interleave transactions of 3 producers (commit and abort, 1–8 records, shared keys and groups) with plain writes on the same keys and groups, on a source with a `count(*)`, `last(v)`, `lastNonNull(v)` aggregate by group plus `check (lv >= 0)` over the last column (a verdict member) and the same aggregate without the check (an ordinary view). Then compare byte for byte: (1) the live fold, (2) `restart()` with the checkpoints deleted (refold from 0), (3) a second copy installed after the writes (`driveRebuild`), and (4) a `failover()` leadership scan with activation replay. Every table equal, every verdict in `rejected` equal, `mismatches() == 0`.
+  - `CheckedWritesTxnVisibilityRegression.CheckpointNeverInsideAnOpenSpanRegression`: a persisted view with pass cap 2 and a 6-record transaction → no pushed delta's O satisfies `first < O ≤ M`; a crash at every pass boundary then `restart()` equals the undisturbed tables.
   - `CheckedWritesTxnVisibility.AtomicBatchSplitByThePassCapIsFenced`: a 6-record atomic batch on a plain partition → no read sees part.
-  - `CheckedWritesTxnVisibility.FenceOverflowHoldsUntilTheNotedBound`: 17 concurrent spans → fenced until the cursor reaches the bound noted at overflow, then served.
-  - `CheckedWritesTxnVisibility.NoTransactionsNoFenceNoBoundChange`: plain traffic → `visibleBound == lso` and `readFenced` never true.
+  - `CheckedWritesTxnVisibility.SpanTableFullWaitsNeverSkips`: 65 concurrent open spans → the fold waits at the 65th transactional batch, and applies everything once a span closes.
+  - `CheckedWritesTxnVisibility.NoTransactionsNoFence`: plain traffic → `readFenced` never true and folds byte-identical to before.
 - [ ] **Step 2: Run to verify they fail.** `ctest --test-dir build/root -R CheckedWritesTxnVisibility --output-on-failure`. Expected: FAIL.
 - [ ] **Step 3: Implement** as specified.
-- [ ] **Step 4: Run.** `ctest --test-dir build/root -R 'CheckedWritesTxnVisibility|GetViewRow|ViewRecovery|WorkerViewSet|RcState|CheckedWritesViewAck|CheckedWritesAbortedFold' -j14 --output-on-failure`. Expected: PASS.
+- [ ] **Step 4: Run.** `ctest --test-dir build/root -R 'CheckedWritesTxnVisibility|CheckedWritesTxnDeterminism|GetViewRow|ViewRecovery|WorkerViewSet|RcState|CheckedWritesViewAck|CheckedWritesAbortedFold|CheckedWritesPrepareApply|ViewFold|AggFold' -j14 --output-on-failure`. Expected: PASS. A pre-existing test that pinned offset-order application of an interleaved transaction is re-pinned to marker order and recorded as a deviation (R11b) in the commit body.
 - [ ] **Step 5: Commit.**
   ```bash
-  git add broker/libs/node/include/rune/node/RcState.h broker/libs/node/include/rune/node/WorkerViewSet.h \
-          broker/libs/node/src/WorkerViewSet.cpp broker/libs/node/include/rune/node/Worker.h \
+  git add broker/libs/view/include/rune/view/ViewFold.h broker/libs/view/src/ViewFold.cpp broker/libs/view/include/rune/view/AggFold.h \
+          broker/libs/view/src/AggFold.cpp broker/libs/node/include/rune/node/WorkerViewSet.h broker/libs/node/src/WorkerViewSet.cpp \
+          broker/libs/node/src/VerdictSource.cpp broker/libs/node/include/rune/node/Worker.h \
           broker/libs/node/tests/node/CheckedWritesTxnVisibilityTest.cpp broker/libs/node/CMakeLists.txt
-  git commit -m "node: level 3a on every partition - RcState::visibleBound and the per-instance span fence on reads (P11-9)" \
+  git commit -m "node/view: every fold path applies a transaction at its commit marker; read fence for split applications (R11b, P11-0, P11-9)" \
              -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   ```
 
@@ -982,7 +999,7 @@ These are the five inputs the spec implies but no requirement names, most likely
 ### Task 10: The coordinator's vote gate
 
 **Files:**
-- Modify: `broker/libs/node/include/rune/node/TransactionCoordinationService.h` (`VoteGate`, `voteGates_`, `voteCandidatesAtAdd_`, `lastVoteNo_`, the setters of contract addition 16), `broker/libs/node/src/TransactionCoordinationService.cpp`:
+- Modify: `broker/libs/node/include/rune/node/TransactionCoordinationService.h` (`VoteGate`, `voteGates_`, `voteCandidatesAtAdd_` (in memory; on `load_` every partition of a recovered transaction is a candidate, R11c), `lastVoteNo_`, the setters of contract addition 16), `broker/libs/node/src/TransactionCoordinationService.cpp`:
   - `handleEndTxn_` (`:969-1047`) before `coordinator_.endTransaction`;
   - `handleAddPartitions_` (`:680`), which records candidates and clears `lastVoteNo_`;
   - `doWork` (`:306`), which re-sends due votes and detects stale gates;
@@ -1001,6 +1018,7 @@ These are the five inputs the spec implies but no requirement names, most likely
   - `CheckedWritesTxnCoordinator.FirstNoAbortsAndAnswersTheVote`: one no `{51, 0x00070000, 123}` → PrepareAbort and abort markers. The EndTxn answer, once they land, is `{51, hasVote, 0x00070000, 123}` (a v12 session). A later yes for the other partition changes nothing.
   - `CheckedWritesTxnCoordinator.NoCandidateNoVoteNoRoundTrip`: a non-candidate topic → no vote captured, today's path.
   - `CheckedWritesTxnCoordinator.CandidateAtAddPartitionsIsAskedAfterItsConstraintDropped`.
+  - `CheckedWritesTxnCoordinatorRegression.FailoverBetweenAddPartitionsAndCommitCollectsEveryVoteRegression` (R11c): `AddPartitions` for `cw-0` (constrained) and `plain-0` (not a candidate), then unload and reload (the persisted state only), then `EndTxn(commit)` → one vote captured per partition of the persisted set (both), the gate resolves only after both answers, and a no from `cw-0` aborts as in `FirstNoAbortsAndAnswersTheVote`. With `voteCandidate_` returning false for every topic after the reload (the constraint was dropped meanwhile) both votes are still sent.
   - `CheckedWritesTxnCoordinator.NotLeaderVoteIsResentWithBackoff`: re-sent at 10 ms, then 20 ms.
   - `CheckedWritesTxnCoordinator.TimeoutDuringTheVoteAbortsAndAnswersInvalidTxnState`: the clock advances past `txnTimeoutMs` → PrepareAbort, and the deferred answer is 19.
   - `CheckedWritesTxnCoordinator.RepeatedCommitTakesOverTheGate`: the first request is answered 27, the second gets the final answer.
@@ -1106,7 +1124,7 @@ These are the five inputs the spec implies but no requirement names, most likely
 - [ ] **Step 1: Write the matrix, model and stress** exactly as Interaction matrix A, C and D specify:
   - `CheckedWritesMatrix/Cell11.MatchesTheModel/<n>`;
   - `CheckedWritesModel.TxnRulesMatchTheTable`;
-  - `CheckedWritesMatrixCountRegression.CellCountsArePinned` (row 11: 558 / 114);
+  - `CheckedWritesMatrixCountRegression.CellCountsArePinned` (row 11: 602 / 126);
   - `CheckedWritesModelRegression.SeededTransactionsMatchTheModel`, `…SameSeedSameTraceTxn`;
   - `CheckedWritesStressRegression.SeededTransactionsHoldTheInvariants`.
 - [ ] **Step 2: Run them.** `cmake --build build/root -j14 --target rune_checked_writes_matrix_tests rune_checked_writes_stress_tests && ctest --test-dir build/root -R 'CheckedWritesMatrix|CheckedWritesModel|CheckedWritesStress' -j14 --output-on-failure`. Expected: PASS. A failure prints its cell or `seed=<n> step=<k> action=<name>`; fix the cause with a `*Regression*` test in the owning task's file.
@@ -1115,7 +1133,7 @@ These are the five inputs the spec implies but no requirement names, most likely
   ```bash
   git add broker/libs/node/tests/support broker/libs/node/tests/node/CheckedWritesMatrixTest.cpp \
           broker/libs/node/tests/node/CheckedWritesModelTest.cpp broker/libs/node/tests/integration/CheckedWritesStressTest.cpp
-  git commit -m "test: Part 11 matrix rows (558 cells), the transaction model check and the TxnAllOrNothingAndAtomicPerPartition stress" \
+  git commit -m "test: Part 11 matrix rows (602 cells), the transaction model check and the TxnAllOrNothingAndAtomicPerPartition stress" \
              -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   ```
 
@@ -1182,7 +1200,7 @@ These are the five inputs the spec implies but no requirement names, most likely
     - `TxnConflict` (a write to the same key by another writer between the transaction's write and its commit);
     - locked rows pause other writers' verdicts until the marker;
     - `p.batch(...)` on a verdict source is all or nothing;
-    - the `last` limitation (P11-16).
+    - every way a view is built gives the same rows (P11-0).
   - **`client-cpp.md`:**
     - `commitTransactionAndWait()` returns `TxnCommitResult` (code, `constraintId`, `failingOffset`), resolved with `Client::constraintName`;
     - after a no the transaction is already aborted: begin the next one;
@@ -1263,9 +1281,8 @@ These are the five inputs the spec implies but no requirement names, most likely
 - [ ] Checkpoint C is green.
 - [ ] A whole-branch review by the most capable model. The reviewer leaves PR comments, and the implementer resolves each one.
 - [ ] File the deferred items as labelled GitHub issues on `arcanumruna/rune`, in one batch with one summary at the end:
-  1. "`last` / `lastNonNull` columns of verdict views under interleaved transactions (P11-16)" — `question`, `sev:medium`, `area:broker`, for the owner.
-  2. "Owner check: `TxnConflict` (59) aborts a transaction on a write-write conflict (P11-3)", "the partition votes under its latest set too (P11-1 (b))", "the AddPartitions-time candidate set is in memory only (P11-11)" — `question`, `sev:low`, `area:broker`, one issue each.
-  3. "Distributed lock waits resolve only by the transaction timeout; consider wait-for detection" — `enhancement`, `sev:low`, `area:broker`.
+  1. "Owner check: `TxnConflict` (59) aborts a transaction on a write-write conflict (R11a, P11-3)" and "the partition votes under its latest set too (P11-1 (b))" — `question`, `sev:low`, `area:broker`, one issue each.
+  2. "Deadlock detection for distributed transaction lock waits (today they resolve only by the transaction timeout; R11d)" — `enhancement`, `sev:medium`, `area:broker`.
   4. "GC of `TxnJudge` records whose bound passed and of type-20 plans" (joins 09's issue) — `enhancement`, `sev:low`, `area:broker`.
   5. Every recorded deviation (a re-pinned assertion) that is not urgent.
 - [ ] Program close: hand the overview's acceptance ("10, 11: as their spec sections say") to the controller. Releasing (`kClientVersion = 12`, `kBrokerVersion = 7`, `kCheckedWrites = 4`) is the owner's call. Do not push, merge or deploy the site without the owner's go-ahead (overview § Sequencing; rune-site `CLAUDE.md`).
@@ -1304,7 +1321,7 @@ These are the five inputs the spec implies but no requirement names, most likely
   - Autoincrement: Tasks 7 and 14.
   - Unique and check: the matrix entities and Task 14.
 - **Rulings.** R05b: P11-6 and Task 1. R03c: P11-13 and P11-14. SD14 and SD4: Task 7 and P11-6. R08f: Task 7. R09a: no new type, P11-1. R04a: Task 7. R04d: the matrix timings. R04e: P11-6. P6-13: Task 7.
-- **Step scan.** Each test step names its tests and their values (51, 55, 59, `0x00070000`, 4096, 4097, 8, 16, 558 / 114). Each code step names files, signatures and placement. Bodies appear only for the deferral loop (Task 5), the vote handling on the leader (Task 7) and the conflict scan (Task 6), which the signatures and tests do not fix.
+- **Step scan.** Each test step names its tests and their values (51, 55, 59, `0x00070000`, 4096, 4097, 8, 16, 602 / 126). Each code step names files, signatures and placement. Bodies appear only for the deferral loop (Task 5), the vote handling on the leader (Task 7) and the conflict scan (Task 6), which the signatures and tests do not fix.
 - **Type consistency.**
   - `TxnJudgeState`, `DeferredTxn`, `TxnPhase`, `TxnVoteAnswer`, `TxnJudgeStats` and `ParkedVote` are defined in Task 4 and used in Tasks 5–7.
   - `TxnOverlay`, `TxnLockSet`, `OverlayTable` and `PrepareStatus::Locked` are defined in Task 3 and used in Task 6.
@@ -1312,7 +1329,7 @@ These are the five inputs the spec implies but no requirement names, most likely
   - `TxnVoteMsg`, `TxnVoteResponseMsg`, `TxnJudgeRecord`, `buildTxnJudge`, `parseTxnJudge`, `kAttrAtomic`, `TxnConflict` and `isTxnVoteCode` (Task 1) are used in Tasks 6, 7, 9, 10 and 11.
   - `TxnVoteResult` and `sendTxnVote` (Task 9) are used in Task 10.
   - `TxnCommitResult` and `Verdict::VotedNo` (Task 11) are used in Task 14.
-  - `visibleBound` and `TxnSpanFence` (Task 8).
+  - `TxnSpan` and `TxnSpanFence` (Task 8, used by every fold path and Task 7's push veto).
   - The rig's `sendVote`, `voteReply`, `driveUntilVoted` and `commitTxn` are defined in Task 7 and used in Tasks 12, 13 and 15.
   - Every contract name (`VerdictSource`, `PartitionWriteState`, `RejectedOffsetIndex`, `ConstraintSet`, `Prospect`, `FoldSkip`, `StatsSink`, `WriteFacts`, `HookRefusal`) is used as its owner defines it.
 - **Review Focus.** Each of the five has its named test in its owning task (6, 7, 14, 8, 10).
