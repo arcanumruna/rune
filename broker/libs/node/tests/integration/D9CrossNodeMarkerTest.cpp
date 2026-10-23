@@ -1447,6 +1447,14 @@ struct Cluster {
     }
     // #38: the EndTxn is answered inline once Prepare* is durable; the txn's progress is its coordinator state.
     rune::transaction::TxnState txnState() { return coord().tcs->txnStateForTest(txnId); }
+    // #557: the deferred AddPartitionsToTxn answers (a parked next-txn leg is answered once the markers land).
+    std::vector<int16_t> deferredAddPartitionsErrors() {
+        std::vector<int16_t> v;
+        for (const auto& f : coord().controlFrames)
+            if (auto r = pc::AddPartitionsToTxnResponse::decode(f.data(), f.size()); r && !r->results.empty())
+                v.push_back(r->results[0].errorCode);
+        return v;
+    }
     // A deferred (second) EndTxn answer: none is ever sent for an EndTxn answered inline (#38).
     std::optional<int16_t> deferredEndTxnError() {
         for (const auto& f : coord().controlFrames)
@@ -1482,11 +1490,17 @@ TEST(D9CrossNodeMarkerIntegrationRegression, CommitAcrossTwoRemoteLeadersComplet
 
     ASSERT_EQ(C.endTxn(/*commit=*/true), 0) << "EndTxn(commit) OK once PrepareCommit is durable (#38)";
     ASSERT_EQ(C.txnState(), rune::transaction::TxnState::PrepareCommit) << "the markers are still in flight";
-    EXPECT_EQ(C.addPartitions(), static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions))
-        << "the next txn may not start before the markers land";
-    ASSERT_TRUE(C.passUntil([&] { return C.txnState() == rune::transaction::TxnState::CompleteCommit; }))
+    // #557: the next txn's first leg is parked (before #557: 27) and answered once the markers landed - the txn
+    // completes, then the replayed AddPartitions opens the next one (so the state moves on past CompleteCommit).
+    EXPECT_EQ(C.addPartitions(), -1) << "the next txn may not start before the markers land";
+    EXPECT_EQ(C.coord().tcs->parkedNextTxnRequests(), 1u);
+    ASSERT_TRUE(C.passUntil([&] { return C.coord().tcs->transactionsCompletedForTest() == 1u; }))
         << "the txn never completed: a marker for a remotely led partition did not land (refused="
         << C.coord().tcs->controlMarkersRefusedForTest() << ")";
+    ASSERT_TRUE(C.passUntil([&] { return !C.deferredAddPartitionsErrors().empty(); }))
+        << "the parked next-txn leg was never answered";
+    EXPECT_EQ(C.deferredAddPartitionsErrors(), std::vector<int16_t>{0});
+    EXPECT_EQ(C.txnState(), rune::transaction::TxnState::Ongoing) << "the next txn started";
     EXPECT_FALSE(C.deferredEndTxnError().has_value()) << "a second EndTxn answer was sent when the markers landed";
     EXPECT_EQ(controlBatchCount(C.node(1).log(0)), 1) << "one COMMIT marker on p0's leader";
     EXPECT_EQ(controlBatchCount(C.node(2).log(1)), 1) << "one COMMIT marker on p1's leader";
@@ -1548,8 +1562,8 @@ TEST(D9CrossNodeMarkerIntegrationRegression, LeaderKilledMidEndTxnMarkerLandsOnT
     for (int i = 0; i < 200; ++i) C.pass();
     ASSERT_EQ(C.txnState(), rune::transaction::TxnState::PrepareCommit)
         << "precondition: p0's marker is stuck on the dead leader, so the txn has not completed";
-    EXPECT_EQ(C.addPartitions(), static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions))
-        << "the next txn may not start while p0's marker is unwritten";
+    EXPECT_EQ(C.addPartitions(), -1) << "the next txn may not start while p0's marker is unwritten (#557: parked)";
+    EXPECT_EQ(C.coord().tcs->parkedNextTxnRequests(), 1u);
     EXPECT_EQ(C.coord().gw.remoteMarkersInFlightForTest(), 1u) << "precondition: p0's marker in flight to node 1";
 
     // Leadership of p0 moves to node 2 (epoch 2, ISR {2,3}); node 3 follows it.
@@ -1570,9 +1584,12 @@ TEST(D9CrossNodeMarkerIntegrationRegression, LeaderKilledMidEndTxnMarkerLandsOnT
         << "the leader change must complete the in-flight marker at once (no timeout)";
     const int64_t sub0 = C.node(2).subscribe(0, 1);
     ASSERT_GT(sub0, 0);
-    ASSERT_TRUE(C.passUntil([&] { return C.txnState() == rune::transaction::TxnState::CompleteCommit; }, 5'000))
+    ASSERT_TRUE(C.passUntil([&] { return C.coord().tcs->transactionsCompletedForTest() == 1u; }, 5'000))
         << "the txn never completed after p0's leadership moved (refused="
         << C.coord().tcs->controlMarkersRefusedForTest() << ")";
+    ASSERT_TRUE(C.passUntil([&] { return !C.deferredAddPartitionsErrors().empty(); }))
+        << "#557: the parked next-txn leg was never answered";
+    EXPECT_EQ(C.deferredAddPartitionsErrors(), std::vector<int16_t>{0});
     EXPECT_FALSE(C.deferredEndTxnError().has_value()) << "a second EndTxn answer was sent when the markers landed";
     EXPECT_EQ(controlBatchCount(C.node(2).log(0)), 1) << "exactly one COMMIT marker on p0's new leader";
     EXPECT_EQ(controlBatchOffset(C.node(2).log(0)), 1) << "after the data";

@@ -336,6 +336,7 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
         }
     }
     work += processPrepareGates_();
+    work += replayNextTxn_(nowNs);   // #557: after every completion point of this pass
 
     return work;
 }
@@ -464,18 +465,21 @@ int16_t TransactionCoordinationService::verifyTxnPartition(int64_t producerId, i
 size_t TransactionCoordinationService::handleInitProducerId(const uint8_t* buf, size_t len, int64_t nowNs,
                                                             uint8_t* out, size_t outCap)
 {
+    if (parkNextTxn_(buf, len, pc::TemplateId::InitProducerId, nowNs)) return 0;   // #557: answered by replayNextTxn_
     beginRequest_();
     return finishRequest_(buf, len, out, outCap, handleInitProducerId_(buf, len, nowNs, out, outCap));
 }
 size_t TransactionCoordinationService::handleAddPartitions(const uint8_t* buf, size_t len, int64_t nowNs,
                                                            uint8_t* out, size_t outCap)
 {
+    if (parkNextTxn_(buf, len, pc::TemplateId::AddPartitionsToTxn, nowNs)) return 0;   // #557: answered by replayNextTxn_
     beginRequest_();
     return finishRequest_(buf, len, out, outCap, handleAddPartitions_(buf, len, nowNs, out, outCap));
 }
 size_t TransactionCoordinationService::handleAddOffsets(const uint8_t* buf, size_t len, int64_t nowNs,
                                                         uint8_t* out, size_t outCap)
 {
+    if (parkNextTxn_(buf, len, pc::TemplateId::AddOffsetsToTxn, nowNs)) return 0;   // #557: answered by replayNextTxn_
     beginRequest_();
     return finishRequest_(buf, len, out, outCap, handleAddOffsets_(buf, len, nowNs, out, outCap));
 }
@@ -554,6 +558,87 @@ size_t TransactionCoordinationService::finishRequest_(const uint8_t* buf, size_t
     take(pa.answer, out, n);
     parked_.push_back(std::move(pa));
     return 0;   // sent by releaseParked_ once the record is committed
+}
+
+// ---------------------------------------------------------------------------
+// #557: the next transaction's first leg is parked while the previous one's markers land (see the header).
+// ---------------------------------------------------------------------------
+bool TransactionCoordinationService::parkNextTxn_(const uint8_t* buf, size_t len, pc::TemplateId tid, int64_t nowNs)
+{
+    if (parkedNextTxn_.size() >= maxParkedNextTxn_) return false;   // over the cap: the handler answers 27
+    int64_t                  sessionId = 0, producerId = 0;
+    int16_t                  producerEpoch = 0;
+    bool                     anyProducer = false;   // InitProducerId: the transactional id alone
+    std::span<const uint8_t> id;
+    switch (tid) {
+        case pc::TemplateId::InitProducerId: {
+            const auto m = pc::InitProducerId::decode(buf, len);
+            if (!m) return false;
+            sessionId = m->sessionId; id = m->transactionalId; anyProducer = true;
+            break;
+        }
+        case pc::TemplateId::AddPartitionsToTxn: {
+            const auto m = pc::AddPartitionsToTxn::decode(buf, len);
+            if (!m) return false;
+            sessionId = m->sessionId; id = m->transactionalId; producerId = m->producerId; producerEpoch = m->producerEpoch;
+            break;
+        }
+        case pc::TemplateId::AddOffsetsToTxn: {
+            const auto m = pc::AddOffsetsToTxn::decode(buf, len);
+            if (!m) return false;
+            sessionId = m->sessionId; id = m->transactionalId; producerId = m->producerId; producerEpoch = m->producerEpoch;
+            break;
+        }
+        default: return false;
+    }
+    if (id.empty() || !ensureLoaded_(nowNs)) return false;   // unloaded: the handler answers NotCoordinator
+    txnIdScratch_.assign(reinterpret_cast<const char*>(id.data()), id.size());
+    const auto* meta = coordinator_.metadata(txnIdScratch_);
+    if (meta == nullptr || (meta->state != tx::TxnState::PrepareCommit && meta->state != tx::TxnState::PrepareAbort))
+        return false;
+    if (!anyProducer && (meta->producerId != requestPid_(producerId, sessionId) || meta->producerEpoch != producerEpoch))
+        return false;   // another producer / epoch: its own answer (fenced, wrong id, ...) now
+    if (replayOut_.empty()) replayOut_.resize(kReplayOutBytes);   // once
+    ParkedNextTxn p;
+    p.sessionId  = sessionId;
+    p.templateId = static_cast<uint16_t>(tid);
+    if (!spareBufs_.empty()) { p.request = std::move(spareBufs_.back()); spareBufs_.pop_back(); }
+    p.request.assign(buf, buf + len);
+    parkedNextTxn_.push_back(std::move(p));
+    return true;
+}
+
+int TransactionCoordinationService::replayNextTxn_(int64_t nowNs)
+{
+    if (!nextTxnReplayDue_) return 0;
+    nextTxnReplayDue_ = false;
+    if (parkedNextTxn_.empty()) return 0;
+    // Every parked request goes through its public handler again, in arrival order: one whose id is still Prepare*
+    // parks again (appended to the emptied list, so the order is kept); any other is answered for the current state
+    // (or deferred by its own #358 park).
+    replayScratch_.swap(parkedNextTxn_);
+    int n = 0;
+    for (ParkedNextTxn& p : replayScratch_) {
+        const uint8_t* b = p.request.data();
+        const size_t   k = p.request.size();
+        size_t answered = 0;
+        switch (static_cast<pc::TemplateId>(p.templateId)) {
+            case pc::TemplateId::InitProducerId:
+                answered = handleInitProducerId(b, k, nowNs, replayOut_.data(), replayOut_.size()); break;
+            case pc::TemplateId::AddPartitionsToTxn:
+                answered = handleAddPartitions(b, k, nowNs, replayOut_.data(), replayOut_.size()); break;
+            case pc::TemplateId::AddOffsetsToTxn:
+                answered = handleAddOffsets(b, k, nowNs, replayOut_.data(), replayOut_.size()); break;
+            default: break;   // unreachable: only these three are parked
+        }
+        if (answered != 0) {
+            sendDeferred_(p.sessionId, replayOut_.data(), answered);
+            ++n;
+        }
+        spareBufs_.push_back(std::move(p.request));
+    }
+    replayScratch_.clear();
+    return n;
 }
 
 int TransactionCoordinationService::releaseParked_()
@@ -655,6 +740,16 @@ void TransactionCoordinationService::dropDeferred_()
     for (const PrepareGate& g : prepareGates_)
         if (g.respond) sendEndTxnAnswer_(g.sessionId, g.correlationId, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
     prepareGates_.clear();
+    for (ParkedNextTxn& p : parkedNextTxn_) {   // #557: the client re-discovers and retries at the new coordinator
+        std::array<uint8_t, rune::gateway::kMaxRejectionBytes> rej{};
+        const std::size_t n = rune::gateway::encodeRejectionFor(
+            p.request.data(), p.request.size(), static_cast<uint16_t>(pc::ErrorCode::NotCoordinator), rej.data(),
+            rej.size());
+        if (n != 0) sendDeferred_(p.sessionId, rej.data(), n);
+        spareBufs_.push_back(std::move(p.request));
+    }
+    parkedNextTxn_.clear();
+    nextTxnReplayDue_ = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,7 +1156,8 @@ size_t TransactionCoordinationService::handleEndTxn_(
 
     // TX-4 Task 8 / #38 (Kafka's model): once the Prepare* record is durable the decision is irrevocable (a reload
     // re-drives the markers), so EndTxn answers OK then; the markers are written asynchronously, and until the last
-    // one lands the txn stays Prepare* and the producer's next txn is refused ConcurrentTransactions.
+    // one lands the txn stays Prepare* and the producer's next txn waits (#557: its first leg is parked, replayed once
+    // the txn completes; an EndTxn retry or a TxnOffsetCommit is refused ConcurrentTransactions).
     if (transitioned && gateway_ && topics_) {
         const auto* m = coordinator_.metadata(txnIdScratch_);
         if (m) {
@@ -1199,7 +1295,7 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId)
     }
     if (r.errorCode == tx::CompleteTransactionResult::kOffsetsPending) {
         // The group coordinator refused a committed offset (not loaded after a failover / gated): the txn STAYS
-        // PrepareCommit (nothing persisted, the next txn refused ConcurrentTransactions); retried from doWork with
+        // PrepareCommit (nothing persisted, the next txn parked / refused ConcurrentTransactions); retried from doWork with
         // backoff.
         cur.offsetRefusal = refusalThisPass_;   // #359
         if (cur.offsetRefusedSinceNs < 0) {
@@ -1222,6 +1318,7 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId)
     }
     const AwaitingMarkers a = std::move(cur);
     awaiting_.erase(it);
+    nextTxnReplayDue_ = true;   // #557: the id left Prepare* - its parked next-txn requests replay on the next doWork
     releaseOffsets_(a.offsetToken);   // nothing waits on its offsets any more
     if (a.offsetsPending && offsetsPendingTxns_ > 0) --offsetsPendingTxns_;
     if (a.offsetRefusedSinceNs >= 0) --stuckOffsetTxns_;   // #359
@@ -1306,7 +1403,7 @@ void TransactionCoordinationService::onControlMarkerRefused(int32_t topicId, int
     }
     // Every other refusal (NotLeader, MinIsrViolation, Internal, StorageError, ...) is retried: the
     // marker is NOT in the log, so the transaction must stay Prepare* (#38: its EndTxn was answered
-    // OK already; the next transaction is refused ConcurrentTransactions) until a retry lands.
+    // OK already; the next transaction waits - #557 parked / 27) until a retry lands.
     queueRetry_(it->second, topicId, partition);
 }
 
