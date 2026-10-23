@@ -8,12 +8,12 @@
 
 **Tech Stack:** C++23, GoogleTest (`TEST_P` for the matrix), Google Benchmark (`broker/benchmark/ViewTableBench.cpp`, `ViewFoldBench.cpp`, `GetViewRowServeBench.cpp`), CMake/Ninja, SBE 1.40.2 for the internal ring, real Aeron, in-process `BrokerNode`s (`OneBroker`, `ThreeNodes`).
 
-**Spec:** `broker/docs/superpowers/specs/2026-10-22-rune-checked-writes-and-view-constraints-design.md` — §7 (Part D), §9 (Reads), §8.1 (the `lower()` mechanics, SD7), §14 (Table and Fold budgets), §15 (the cells owned by 07). Contract: `broker/docs/superpowers/plans/2026-10-22-checked-writes-00-overview.md` (C9.1, C14, C15 reads, C16 ids 33/34, SD7, SD8, index row 07). Committed predecessors: plans 01 (checkpoint marker, AD5/AD5a), 02 (`RecordSpan::key`, `TopicWriteSpec`, `Utf8.h`), 03 (versions, codes 56–58, `OpStatus::BrokerTooOld`). Parts 04 and 05 are used only through the overview contract (C9–C13). Executors read the spec sections, the overview and this file.
+**Spec:** `broker/docs/superpowers/specs/2026-10-22-rune-checked-writes-and-view-constraints-design.md` — §7 (Part D), §9 (Reads), §8.1 (the `lower()` mechanics, SD7), §14 (Table and Fold budgets), §15 (the cells owned by 07). Contract: `broker/docs/superpowers/plans/2026-10-22-checked-writes-00-overview.md` (C9.1, C14, C15 reads, C16 ids 33/34, SD7, SD8, index row 07). Committed predecessors: plans 01 (checkpoint marker, AD5/AD5a), 02 (`RecordSpan::key`, `TopicWriteSpec`, `Utf8.h`, the view-source refusals), 03 (versions, codes 56–58, `OpStatus::BrokerTooOld`), 04 (`ViewKey.h` with `fromU64` / `asU64`, R07d), 05 (the key index) and 06 (`rune::protocol::partitionFor`). Parts 04, 05 and 06 are used only through the overview contract (C9–C13) and their contract additions. Dependency order (R-ORD): 05 → 06 → 07. Executors read the spec sections, the overview and this file.
 
 ## Execution context
 
 - **Repo and paths.** Every path is relative to the monorepo root, and every command runs from it.
-- **Branch.** `feature/checked-writes-07-wide-view-keys`, cut from the latest `main` once Part 05 has merged (`git fetch && git switch -c feature/checked-writes-07-wide-view-keys origin/main`). Lane 1 merges 06 before 07; the only 06 name this plan uses is `rune::protocol::partitionFor` (C13), with a fallback in Task 15. Merge `main` in again before review.
+- **Branch.** `feature/checked-writes-07-wide-view-keys`, cut from the latest `main` once Part **06** has merged (`git fetch && git switch -c feature/checked-writes-07-wide-view-keys origin/main`). 07 depends on 06 (R-ORD); the only 06 name this plan uses is `rune::protocol::partitionFor` (C13). Merge `main` in again before review.
 - **Preconditions** (each must hit before Task 1; a miss means a predecessor shipped differently — stop and tell the controller):
   - `grep -n "struct ViewKey" broker/libs/view/include/rune/view/ViewKey.h` (04, C9.1)
   - `grep -n "prepareProjection" broker/libs/view/include/rune/view/ViewFold.h` (04, C9.3)
@@ -22,6 +22,8 @@
   - `grep -n "BrokerTooOld" client-cpp/include/rune/client/Completion.h` (03)
   - `grep -rn "key.index needs a key of at most 8 bytes" broker/libs/node` (05, SD8; one hit)
   - `grep -n "VerdictViewKind::KeyIndex" broker/libs/node/src/VerdictSource.cpp` (05)
+  - `grep -n "fromU64\|asU64" broker/libs/view/include/rune/view/ViewKey.h` (04, R07d; ≥ 2 hits)
+  - `grep -n "partitionFor(" protocol/include/rune/protocol/PartitionHash.h` (06, C13; ≥ 1 hit)
 - **Builds** (already configured; if one is missing, stop and tell the controller): `build/root` (Ninja, Debug, `BUILD_TESTING=ON`; `cmake --build build/root -j14 --target <t>`, `ctest --test-dir build/root -R <filter> -j14 --output-on-failure`), `build/sub-codec` (`rune_codec_tests`, `rune_catalog_tests`, CatalogGolden), `build/sub-client-cpp`, `build/rel` (Release, `BUILD_BENCHMARKS=ON`, binary `build/rel/broker/rune_broker_benchmark`), `build/asan`, `build/tsan`, `build/client-tsan`.
 - **Codec sources are listed three times.** A new `codec/src/*.cpp` goes into `codec/CMakeLists.txt` (`rune_codec`, `:6-15`), `broker/CMakeLists.txt` (its `rune_codec` copy, `:144-157`) and `client-cpp/CMakeLists.txt` (its `if(NOT TARGET rune_codec)` copy, `:194-207`).
 - **SBE.** The internal-ring flyweights under `protocol/include/rune_protocol_internal_sbe/` are generated and committed. Regenerate with a local `sbe-all-1.40.2.jar` given through `$SBE_JAR`. Never commit the jar.
@@ -58,7 +60,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 - The `autoincrement` side window holds **32** batches = `kIdempotentMaxInFlightBatches` (`Protocol.h:16`).
 - Partition `p` assigns `n·P + p` for n = 1, 2, …. Id 0 is never assigned.
 - Index slot **13 bytes** (`tag u8 | word u64 | rid u32`). Plan key functions: 0 none, 1 `lower`, 2 reserved `casefold`.
-- `lower(string(N))` width = the largest lowered width at the pinned Unicode version (⌈3N/2⌉ at Unicode 15/16).
+- `lower(string(N))` width = the largest lowered width at the pinned Unicode version: ⌊3N/2⌋ at Unicode 16.0.0, packed 0x00100000 (R07a).
 - Wire `acks` byte: bit 0 = `All`, bit 1 = `View`. Other bits are refused with `InvalidRequest`.
 - Intent bits: record `attributes` bits 0–1. 0 = upsert/delete, 1 = insert, 2 = update/delete-existing. 3 and the other bits are refused with `InvalidRequest`.
 - `partitions` defaults to 1. Strings are UTF-8, and `lower()` is Unicode simple lowercasing.
@@ -89,7 +91,11 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 - **SD3.** Compile errors get **56, 57, 58**. Part 08 removes the message-search mapping (`AdminWorker.cpp:1241-1244`); this part's new errors never go through it (P7-14).
 - **SD11.** The client gates `GetViewRowK` and `ScanViewRows` on `ConnectResponse.brokerVersion >= kBrokerVersionCheckedWrites`; below that it fails locally with `OpStatus::BrokerTooOld`.
 - **SD13 / C16.** This part keeps `scanRows` (stat id 33) and `scanPages` (34) in `ViewFoldCounters`; Part 08 serves them.
-- **C9.1.** `ViewKey` (Part 04) is `{ std::array<uint8_t, kMaxViewKeyBytes> bytes; uint8_t len; fromU64; span }`. **This part adds `ViewTable::put/get/erase(const ViewKey&)` and the > 8 byte storage.**
+- **C9.1 / R07d (reworded).** `ViewKey` (Part 04's `ViewKey.h`) is `{ std::array<uint8_t, kMaxViewKeyBytes> bytes; uint8_t len; fromU64; asU64; span }`. Part 04 defines `fromU64` and `asU64`, and Parts 05 and 06 already use them. This part owns and extends `ViewKey` (`fromBytes`, `operator==`, wide keys) and never renames those two or changes their meaning. **This part also adds `ViewTable::put/get/erase(const ViewKey&)` and the > 8 byte storage.**
+- **R07a.** A lowered `string(N)` component is ⌊3N/2⌋ bytes wide at Unicode 16.0.0 (packed 0x00100000), the table-computed maximum (P7-2).
+- **R05c (amended).** The key index is never checkpointed; each leadership rebuilds it from the local log (Task 16).
+- **R10b.** Every view over a keyless typed topic is refused with `ViewKeyInvalid` (35), "view source needs a key", by Part 02's view-source check, which runs before the compile (Task 12).
+- **R-X3.** Checkpoint v3 accepts any table id below the record's table count (Part 09 adds tables 6 and 7). A test pins 8 tables (Task 7).
 - **C14.** This part owns the format of every plan v2 field; 08 authors it, 09 evaluates constraints. The authored plan moves to `codec/include/rune/codec/ViewPlanAuthored.h` + `codec/src/ViewPlanAuthored.cpp`, namespace `rune::view`.
 - **R01 (replaces SD15; plan 01 AD5a).** Fixed code writes marked checkpoint magics `0x534B4331` / `0x534B4332`. **Checkpoint v3 must not use `0x534B433x`, and every v3 record counts as marked** (`checkpointMarkOf` returns `CheckpointMark::FoldSkipped` for v3).
 - **R02a.** `RecordSpan::key` and the bounded `forEachRecordSpan` are Part 02's; the fold reads keys only through them.
@@ -100,7 +106,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
   - The source is the UCD 16.0.0 release file `UnicodeData.txt` (the Unicode Consortium's public `Public/16.0.0/ucd/UnicodeData.txt`), committed as `codec/data/UnicodeData-16.0.0.txt`: 2,175,362 bytes, 40,116 lines, SHA-256 `ff58e5823bd095166564a006e47d111130813dcf8bf234ef79fa51a870edb48f`. Its license goes beside it as `codec/data/LICENSE-UNICODE.txt` (the Unicode License v3 text from the same release).
   - Facts of that file that the tests pin (computed from it while writing this plan): **1,460** code points carry a `Simple_Lowercase_Mapping` (field 13): 26 ASCII (A–Z) and **1,434** non-ASCII. By UTF-8 length (source → target): 1→1 ×26, 2→1 ×1 (U+0130 İ → U+0069), 2→2 ×440, **2→3 ×2** (U+023A Ⱥ → U+2C65 ⱥ, U+023E Ⱦ → U+2C66 ⱦ), 3→1 ×1 (U+212A KELVIN SIGN → U+006B), 3→2 ×23 (among them U+1E9E ẞ → U+00DF ß, U+2126 Ω → U+03C9), 3→3 ×685, 4→4 ×282. No mapping target has a mapping of its own. The highest mapped source is U+1E921.
   - The table is **generated** from that file by `codec/tools/gen_unicode_lower.cpp` and the output `codec/src/UnicodeLowerTable.inc` is **committed**, like the SBE flyweights. The spec says "generated at build time"; generating inside three separate CMake trees (codec, broker copy, client copy) would ship the 2 MB data file with every client build. The table is still machine-made, never hand-written, and a cross-check test re-derives every code point from the data file (Task 1). *Flagged to the controller.*
-- **P7-2 — The lowered width.** `maxLoweredWidth(N)` is computed from the table, as the spec asks ("the builder recomputes it from the table"): a knapsack over the largest lowered UTF-8 length per source length (`{1: 1, 2: 3, 3: 3, 4: 4}` at 16.0.0). At 16.0.0 it equals **⌊3N/2⌋**: 1→1, 2→3, 3→4, 4→6, 5→7, 16→**24**, 64→96, 85→127, 128→192. The spec's "⌈3N/2⌉" is the same for even N and one byte larger for odd N; the table value is authoritative and smaller, never too small. *Flagged to the controller as a spec wording gap.*
+- **P7-2 — The lowered width.** `maxLoweredWidth(N)` is computed from the table, as the spec asks ("the builder recomputes it from the table"): a knapsack over the largest lowered UTF-8 length per source length (`{1: 1, 2: 3, 3: 3, 4: 4}` at 16.0.0). At 16.0.0 it equals **⌊3N/2⌋**: 1→1, 2→3, 3→4, 4→6, 5→7, 16→**24**, 64→96, 85→127, 128→192. The spec's "⌈3N/2⌉" is the same for even N and one byte larger for odd N; the table value is authoritative and smaller, never too small. Accepted by R07a.
 - **P7-3 — Two key modes.** `rune::view::ViewKeyMode keyModeOf(const CompiledViewPlan&) noexcept`:
   - **`LegacyU64`**: an aggregate view grouped by exactly one plain `Int64`/`UInt64` column (today's fast path, R07c), or a projection whose key is exactly one plain component on the **source key field**, of an integer type (`Int32`, `Int64`, `UInt16`, `UInt32`, `UInt64`). The table is today's `uint64_t` table (the value `decodeWireKey` produces, `ViewFold.cpp:73-110`), checkpoints stay v1 (projection) / v2 (aggregate), byte for byte. Every view that exists today is `LegacyU64`, and Part 04's three-way byte-identical fold test keeps covering these aggregates unchanged.
   - **`Keyed`**: everything else — composite keys, `lower()`, a `string(N)` source key, a single column that is not the source key, and every aggregate whose group key is not one 8-byte integer (a composite group, an enum, a narrow integer, `string(N)` or `lower(string(N))`, P7-8). `ViewKey` tables of width K = Σ component widths, checkpoint v3.
@@ -131,7 +137,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 
 ## Contract additions (this part adds them; the overview stays the authority for everything else)
 
-1. `broker/libs/view/include/rune/view/ViewKey.h` (ruling R07d: `ViewKey` is Part 07's; Part 04 calls these names): `static ViewKey fromU64(uint64_t v) noexcept` (`len = 8`, the little-endian bytes of `v`), `[[nodiscard]] uint64_t asU64() const noexcept` (precondition `len ≤ 8`; the little-endian load of the first `len` bytes, zero-extended; `fromU64(v).asU64() == v`), `static ViewKey fromBytes(std::span<const uint8_t>) noexcept` (precondition `size ≤ 128`), `bool operator==(const ViewKey&) const noexcept` (compares `len` and the first `len` bytes). No other conversion name exists (no `packed()`).
+1. `broker/libs/view/include/rune/view/ViewKey.h` (R07d, reworded): 07 appends `static ViewKey fromBytes(std::span<const uint8_t>) noexcept` (precondition `size ≤ 128`) and `bool operator==(const ViewKey&) const noexcept` (compares `len` and the first `len` bytes). `fromU64(uint64_t)` (`len = 8`, the little-endian bytes of `v`) and `asU64()` (precondition `len ≤ 8`; the little-endian load of the first `len` bytes, zero-extended; `fromU64(v).asU64() == v`) are Part 04's: 07 verifies they exist as specified and does not redefine them. No other conversion name exists (no `packed()`). `rune::view::kMaxViewKeyBytes` (04, `std::size_t`) becomes an alias of the codec's value, `inline constexpr std::size_t kMaxViewKeyBytes = rune::codec::kMaxViewKeyBytes;`, so one constant (128) exists (Task 5).
 2. `broker/libs/view/include/rune/view/ViewTable.h`: `struct ViewTableKeys { uint8_t keyWidth = 8; uint8_t prefixWidth = 0; uint64_t hashSeed = 0; uint64_t hashMaskForTest = ~uint64_t{0}; };`, a trailing `ViewTableKeys keys = {}` on the constructor, `put/get/erase(const ViewKey&)`, `drainDirtyKeyed`, `scanPrefix`, `enum class PrefixScan : uint8_t { End, Stopped, CursorGone }`, `keyOfRow`, `keyWidth()`, `prefixWidth()`.
 3. `broker/libs/view/include/rune/view/ViewPlan.h`: `CompiledKeyComponent`, `CompiledPredicateNode`, `CompiledConstraint`; `CompiledViewPlan` appends `keyComponents`, `keyWidth`, `unique`, `constraints`, `unicodeVersion`, `viewObjectId`; `ViewKeyMode`, `keyModeOf`, `ownerMappedOf`, `prefixWidthOf`, `needsV2(const CompiledViewPlan&)`; an aggregate's group key is its `keyComponents` (no separate compiled group-by list). `ViewTypes.h`: `kDerivedKeyField = 0xFFFE`. `PlanCompiler.h`: `CompileErrorKind`, `CompileError::kind`.
 4. `ViewCheckpoint.h`: `kViewCheckpointMagicV3 = 0x564B4333u` ("3CKV"), `KeyedDirtyEntry`, `KeyedTableDelta`, `encodeKeyedDelta`, `applyKeyedDelta`, `replayKeyed`, `kCheckpointV3HeaderBytes = 13`, `kCheckpointV3TableHeaderBytes = 10`, table ids `kKeyedTableView = 0`, `kKeyedTableOwners = 1`, `kKeyedTableContributors = 2`, `kKeyedTableGroups = 3`, `kKeyedTableBlocks = 4`, `kKeyedTableGroupIds = 5`. `checkpointMarkOf` (01) returns `FoldSkipped` for v3.
@@ -218,6 +224,7 @@ The two blocks are **610 cells**, pinned in `CheckedWritesMatrixCountRegression.
 | `broker/libs/storage/include/rune/storage/WyHash.h` | C | `wyhash64`, moved unchanged from `SkimpyOffsetMap.h:54-125` |
 | `broker/libs/view/include/rune/view/{ViewPlan.h,ViewTypes.h}`, `src/ViewPlan.cpp` | M | Compiled plan v2; includes the codec authored plan |
 | `broker/libs/view/{include/rune/view/PlanCompiler.h,src/PlanCompiler.cpp}` | M | Key components, key modes, identity rule, constraints (structural) |
+| `broker/libs/view/include/rune/view/ViewKey.h` (04's) | M | `fromBytes`, `operator==`, the `kMaxViewKeyBytes` alias (Task 5) |
 | `broker/libs/view/include/rune/view/ViewKeyHash.h` | C | `viewKeyHash(span, seed)` over `WyHash.h` |
 | `broker/libs/view/{include/rune/view/ViewTable.h,src/ViewTable.cpp}` | M | `ViewKey` overloads, wide slots, prefix index, keyed dirty drain |
 | `broker/libs/view/{include/rune/view/ViewCheckpoint.h,src/ViewCheckpoint.cpp}` | M | Checkpoint v3 |
@@ -490,12 +497,13 @@ git commit -m "feat(view): compiled plan v2 - key components, key modes, identit
 **Files:**
 - Create: `broker/libs/storage/include/rune/storage/WyHash.h` (`rune::storage::detail::wyhash64` and its helpers, moved byte for byte from `SkimpyOffsetMap.h:54-125`; `SkimpyOffsetMap.h` includes it)
 - Create: `broker/libs/view/include/rune/view/ViewKeyHash.h`: `[[nodiscard]] inline uint64_t viewKeyHash(std::span<const uint8_t> bytes, uint64_t seed) noexcept` = `wyhash64(bytes.data(), bytes.size(), seed)`
+- Modify: `broker/libs/view/include/rune/view/ViewKey.h` (contract addition 1: `fromBytes`, `operator==`, `kMaxViewKeyBytes` aliased to `rune::codec::kMaxViewKeyBytes`; 04's `fromU64` / `asU64` untouched)
 - Modify: `broker/libs/view/include/rune/view/ViewTable.h:82-343`, `broker/libs/view/src/ViewTable.cpp`
 - Test: `broker/libs/view/tests/view/CheckedWritesViewTableTest.cpp` (add to `rune_view_tests`); `ViewTableTest.cpp` and `SkimpyOffsetMapTest` pass unchanged
 
 **Interfaces:**
-- Consumes: `ViewKey` with contract addition 1.
-- Produces (`ViewTable`, contract addition 2):
+- Consumes: Part 04's `ViewKey::fromU64` / `asU64` (R07d).
+- Produces: contract addition 1 (`ViewKey::fromBytes`, `operator==`, the `kMaxViewKeyBytes` alias), and (`ViewTable`, contract addition 2):
   ```cpp
   struct ViewTableKeys { uint8_t keyWidth = 8; uint8_t prefixWidth = 0; uint64_t hashSeed = 0; uint64_t hashMaskForTest = ~uint64_t{0}; };
   explicit ViewTable(RowLayout layout, size_t initialIndexSlots = 4096, size_t chunkBytes = 32u << 20, ViewTableKeys keys = {});
@@ -513,7 +521,7 @@ git commit -m "feat(view): compiled plan v2 - key components, key modes, identit
 - **Row** (P7-5): the slab row is `headerLen + layout.rowLen`; `headerLen = (keyWidth > 8 || prefixWidth > 0 ? keyWidth : 0) + (prefixWidth > 0 ? 8 : 0)`; `rowsPerChunk_` uses the full stride (`ViewTable.cpp:45-51`). `put` writes the header key on insert and returns the payload. A deleted wide key is copied into a reserved `deletedKeyBytes_` (K bytes per `deleted_` entry), so `drainDirtyKeyed` never reads a reused row.
 
 - [ ] **Step 1: Write the failing tests:**
-  - `CheckedWritesViewTable.ViewKeyNames` (R07d): `ViewKey::fromU64(v).asU64() == v` for 0, 1, 2^63 and `UINT64_MAX`; `fromBytes` of 6 bytes has `len == 6` and `asU64()` = their little-endian value.
+  - `CheckedWritesViewTable.ViewKeyNames` (R07d): `ViewKey::fromU64(v).asU64() == v` for 0, 1, 2^63 and `UINT64_MAX` (04's names, unchanged); `fromBytes` of 6 bytes has `len == 6` and `asU64()` = their little-endian value; `fromBytes(a) == fromBytes(a)`, and two keys equal except in their length are not equal; `static_assert(rune::view::kMaxViewKeyBytes == rune::codec::kMaxViewKeyBytes)`.
   - `CheckedWritesViewTable.NarrowViewKeyIsTheU64Path`: `put(ViewKey::fromU64(42))` then `get(42)` (u64 API) returns the same pointer; `erase(ViewKey::fromU64(42))` → `get(42) == nullptr`.
   - `CheckedWritesViewTableRegression.SeedZeroIsBitIdenticalRegression`: the same 10,000-op random sequence on a default-constructed table and on `ViewTableKeys{.keyWidth = 8, .hashSeed = 0}` gives identical `size`, `chunkCount`, rid of every key and the same `drainDirty` stream.
   - `CheckedWritesViewTable.WideKeysOfEveryWidth`: K ∈ {9, 16, 24, 66, 74, 120, 128}: 50,000 distinct random keys put / get / erase (half), across at least two grows (`initialIndexSlots = 64`); every survivor's payload pointer is stable since its put; `keyOfRow(get(k))` equals `k`.
@@ -528,6 +536,7 @@ git commit -m "feat(view): compiled plan v2 - key components, key modes, identit
 - [ ] **Step 5: Commit.**
 ```bash
 git add broker/libs/storage/include/rune/storage/WyHash.h broker/libs/storage/include/rune/storage/SkimpyOffsetMap.h \
+        broker/libs/view/include/rune/view/ViewKey.h \
         broker/libs/view/include/rune/view/ViewKeyHash.h broker/libs/view/include/rune/view/ViewTable.h broker/libs/view/src/ViewTable.cpp \
         broker/libs/view/tests/view/CheckedWritesViewTableTest.cpp broker/libs/view/CMakeLists.txt
 git commit -m "feat(view): ViewTable keys up to 128 bytes - 13-byte slots with a cached seeded hash, key in the row, keyed dirty drain" \
@@ -603,11 +612,12 @@ git commit -m "feat(view): prefix index over the first n-1 key columns - head ri
   int64_t replayKeyed(std::span<ViewTable* const> tables, std::span<const uint32_t> rowLens,
                       std::span<const uint8_t> keyLens, std::span<const std::span<const uint8_t>> recordsInOrder);
   ```
-- **Wire:** `[magic3 u32][O i64][tableCount u8]` then per table `[tableId u8][keyLen u8][rowLen u32][count u32]` and `count × {rid u32, flags u8 (0 upsert, 1 delete), key[keyLen], [rowLen bytes iff upsert]}`, then `[crc32c u32]` over every preceding byte. O at byte 4 (the IO agent peek). The row bytes are the payload only (P7-5); prefix links are rebuilt by the replay's `put`s. `applyKeyedDelta` validates everything (bounds per entry against the real buffer, ids `< tables.size()` and each at most once, `rowLen`/`keyLen` equal to the table's, CRC) before mutating any table, exactly like `applyMultiDelta` (`ViewCheckpoint.cpp:159-221`), and returns `mark = CheckpointMark::FoldSkipped` (R01).
+- **Wire:** `[magic3 u32][O i64][tableCount u8]` then per table `[tableId u8][keyLen u8][rowLen u32][count u32]` and `count × {rid u32, flags u8 (0 upsert, 1 delete), key[keyLen], [rowLen bytes iff upsert]}`, then `[crc32c u32]` over every preceding byte. O at byte 4 (the IO agent peek). The row bytes are the payload only (P7-5); prefix links are rebuilt by the replay's `put`s. `applyKeyedDelta` validates everything (bounds per entry against the real buffer, ids `< tables.size()` and each at most once — any id below the table count is accepted, whatever the caller's table count up to the `tableCount u8` limit (R-X3: Part 09 adds tables 6 and 7) — `rowLen`/`keyLen` equal to the table's, CRC) before mutating any table, exactly like `applyMultiDelta` (`ViewCheckpoint.cpp:159-221`), and returns `mark = CheckpointMark::FoldSkipped` (R01).
 
 - [ ] **Step 1: Write the failing tests:**
   - `CheckedWritesViewCheckpointV3.RoundTripTwoTables`: a K = 32 view table (prefix 24) with 1,000 rows and an owner table (key 8, payload 32) → `encodeKeyedDelta` of a base, then a delta with 100 erases and 50 re-puts → `replayKeyed` into fresh tables gives identical contents (every key, every payload byte), identical `scanPrefix` sets, returned O = the delta's O.
-  - `CheckedWritesViewCheckpointV3.SixTablesRoundTrip`: a record with tables 0 (key 40), 2, 3, 4 (key 8) and 5 (key 40) replays into six fresh tables identically; `tables.size()` up to 6 is accepted.
+  - `CheckedWritesViewCheckpointV3.SixTablesRoundTrip`: a record with tables 0 (key 40), 2, 3, 4 (key 8) and 5 (key 40) replays into six fresh tables identically.
+  - `CheckedWritesViewCheckpointV3Regression.EightTablesRoundTripRegression` (R-X3): a record with tables 0–7 (tables 6 and 7 with key 24 and payload 8, the shape Part 09's unique-claim tables use) replays into eight fresh tables identically; the same record given seven tables → nullopt and no table touched; an id 8 in a record replayed into eight tables → nullopt.
   - `CheckedWritesViewCheckpointV3.MagicAndOffsetPlacement`: bytes 0..3 = `33 43 4B 56`, bytes 4..11 = O little-endian; `checkpointMarkOf(record) == CheckpointMark::FoldSkipped`.
   - `CheckedWritesViewCheckpointV3Regression.CorruptOrTruncatedNeverMutatesRegression`: every truncation, a flipped CRC byte, a bogus `count = 0xFFFFFFFF`, a duplicated table id, a wrong `keyLen` and a wrong `rowLen` → nullopt and both tables untouched.
   - `CheckedWritesViewCheckpointV3.DeleteThenReinsertInOneIntervalSurvives`: the `ViewTableDirtyTrackingRegression.DeleteThenReinsertSameKeyWithinIntervalReplaysCorrectly` scenario on K = 16 through `drainDirtyKeyed` → the key is present after replay.
@@ -829,6 +839,7 @@ git commit -m "feat(views): composite group by - ViewKey group keys interned to 
 **Interfaces:**
 - Consumes: `needsV2(ViewPlan)` (Task 3), `CompileErrorKind` and `ownerMappedOf`/`keyModeOf` (Task 4); 02's `clusterFeatureLevel_` and `MetadataFeature::kCheckedWrites`.
 - Produces, in `viewDef_`, in this order (each refusal `Rejected(reject(code, message))`):
+  0. Part 02's view-source refusals (02 P6) run first and are unchanged: an untyped source → 33, "view source must be a typed topic"; a keyless typed source → `ViewKeyInvalid` (35), "view source needs a key" (R10b). So a projection over a keyless typed topic never reaches the compile and never answers 56;
   1. the authored blob decodes (else 34, as today, `:1217`);
   2. `needsV2(*authored) && clusterFeatureLevel_ < MetadataFeature::kCheckedWrites` → `InvalidRequest` (39), "plan v2 needs the checked-writes feature level";
   3. `authored->unique` → `ViewUniqueInvalid` (58), "unique views are not available yet"; non-empty `constraints` → `ViewConstraintInvalid` (57), "check constraints are not available yet" (P7-9; Part 09 removes both lines);
@@ -845,6 +856,7 @@ git commit -m "feat(views): composite group by - ViewKey group keys interned to 
   - `CheckedWritesAdminViewDdl.CompileKindsMapToTheirCodes`: K = 130 → 56; identity rule → 56; `lower(gender)` → 56; an unknown key column → 34; a `groupBy` that differs from the key → 35 with the compiler's detail; a keyed aggregate over a `string(16)`-keyed source → 56.
   - `CheckedWritesAdminViewDdl.UnknownUnicodeVersionIsViewKeyExpressionInvalid` (§15): `unicodeVersion` 17.0.0 → 56, detail "lower() is pinned to Unicode 17.0.0; this broker has 16.0.0".
   - `CheckedWritesAdminViewDdl.KeyedViewsNeedOnePartition`: `account_characters` over a 3-partition source → 36; a source-keyed `u16` view over the same source → OK (P7-10).
+  - `CheckedWritesAdminViewDdlRegression.KeylessSourceIsRefusedBeforeTheCompileRegression` (R10b): a composite `key (a, b)` projection and a single-column projection over a keyless typed topic, each as a v2 plan at level 4 → 35 "view source needs a key", never 56 (the identity rule) or 34.
   - `CheckedWritesAdminViewDdl.AlterViewKeepsTheObjectId`: `alter view account_characters` → the new compiled plan's `viewObjectId` equals the original object id.
 - [ ] **Step 2: Run to verify they fail.** `cmake --build build/root -j14 --target rune_checked_writes_tests`. Expected: assertion failures (the v2 plan is refused with 34/35 by the old path).
 - [ ] **Step 3: Implement** per the Interfaces.
@@ -973,7 +985,7 @@ git commit -m "feat(views): serve GetViewRowK and ScanViewRows through the GetVi
 - Test: `client-cpp/tests/client/CheckedWritesViewKeyBuilderTest.cpp` (add to `rune_schema_codec_smoke_tests`, `client-cpp/CMakeLists.txt:1073-1081`, and link `rune_catalog` there)
 
 **Interfaces:**
-- Consumes: `encodeKeyComponent`, `lowerUtf8` (Tasks 1–2), the authored plan (Task 3), the messages (Task 13); `rune::protocol::partitionFor` (C13, Part 06) — if 06 has not merged, `rune::protocol::partitionForKey(wire, P)` and a recorded deviation.
+- Consumes: `encodeKeyComponent`, `lowerUtf8` (Tasks 1–2), the authored plan (Task 3), the messages (Task 13); `rune::protocol::partitionFor` (C13, Part 06, merged before this part per R-ORD).
 - Produces:
   ```cpp
   // Client.h
@@ -1016,7 +1028,7 @@ git commit -m "feat(views): serve GetViewRowK and ScanViewRows through the GetVi
   - `CheckedWritesViewKeyBuilder.CompositeKeyAndPrefix`: `account_characters`: `setUInt("userId", 42).setUInt("characterId", 7)` → `key()` = 16 bytes `00…2A 00…07`; with only `userId` set → `prefix()` = 8 bytes, `key()` error "characterId is not set".
   - `CheckedWritesViewKeyBuilder.LowerMatchesTheBrokerFoldKey` (§15): `(lower(name) as nameKey, characterId)` with `setString("name", "FoO").setUInt("characterId", 7)` → exactly the 32-byte golden `66 6F 6F` + 21 × `00` + `00 00 00 00 00 00 00 07`, the same golden `CheckedWritesKeyedFold.DerivesTheLoweredKey` (Task 8) pins for the broker's `deriveViewKey`; `setString("nameKey", "FOO")` gives it too. Both sides call `rune::codec::encodeKeyComponent`; Task 17's e2e reads the broker's row with the builder's key.
   - `CheckedWritesViewKeyBuilder.RangeAndLengthAreChecked`: `setInt("provider", -1)` on `u16` → error; `setUInt` 70000 → error; a 17-byte name for `string(16)` → error; invalid UTF-8 → error.
-  - `CheckedWritesViewKeyBuilder.PartitionFollowsTheProducer`: a 4-partition `u16`-keyed source: `partition()` of id 513 equals `partitionForKey(LE(513, 2 bytes), 4)` (the same call `TypedTopic` routes with); a 1-partition source → −1.
+  - `CheckedWritesViewKeyBuilder.PartitionFollowsTheProducer`: a 4-partition `u16`-keyed source: `partition()` of id 513 equals `rune::protocol::partitionFor(LE(513, 2 bytes), 4, Partitioner::Fnv1a)`, the function `TypedTopic` and the producer route with since Part 06; a 4-partition `Modulo` (autoincrement) `u64`-keyed source: `partition()` of id 4097 equals `partitionFor(LE8(4097), 4, Modulo) == 1`; a 1-partition source → −1.
   - `CheckedWritesViewKeyBuilder.FromCatalogFindsTheView`: a `CatalogState` built with `cat::testing` helpers holding `character` and `account_characters` → a builder with 2 components; an unknown name → error.
   - `CheckedWritesViewKeyBuilder.DecodeScanPayload`: a payload of 3 rows + a token → 3 rows and the token; a truncated payload → false.
 - [ ] **Step 2: Run to verify they fail.** `cmake --build build/sub-client-cpp -j14 --target rune_schema_codec_smoke_tests`. Expected: `ViewKeyBuilder.h: No such file or directory`.
@@ -1041,7 +1053,7 @@ git commit -m "feat(client): getViewRowAndWait by key bytes, scanViewAndWait, Vi
 
 **Interfaces:**
 - Consumes: `ViewTable(…, ViewTableKeys{.keyWidth = spec.keyWidth, .hashSeed = seed})`, `ViewKey::fromBytes` (Task 5); `TopicWriteSpec::keyWidth` (02); the worker's `WorkerViewSet::hashSeedForTest()` value as the key index seed.
-- Produces: the key index keyed by the **wire key bytes** at the topic's key width (2–16 bytes); `fromU64` disappears from its probes. Whatever 05 checkpoints for the key index goes through the v3 path when `keyWidth > 8` (Task 7). The DDL line refusing keys wider than 8 bytes is deleted; the refusal test 05 wrote for it is inverted (recorded in the commit body).
+- Produces: the key index keyed by the **wire key bytes** at the topic's key width (2–16 bytes); `fromU64` disappears from its probes. The key index is not checkpointed (R05c); each leadership rebuilds it from the local log with wire-key `ViewKey`s. The DDL line refusing keys wider than 8 bytes is deleted; the refusal test 05 wrote for it is inverted (recorded in the commit body).
 
 - [ ] **Step 1: Write the failing tests:**
   - `CheckedWritesKeyIndexWide.SixteenByteStringKeys`: `tag {name string(16), n u64} key name with (key.index = on)` at level 4 → DDL OK; `insert "alice"` → OK; `insert "alice"` again → 52 `KeyExists`; `update "bob"` → 53; `removeExisting "alice"` → OK, then `update "alice"` → 53.
@@ -1176,6 +1188,6 @@ git commit -m "bench(views): wide keys, prefix scans, derived-key fold, keyed re
   - §15: the Interaction matrix section (A, B, C).
   - SD8: Task 16. Overview acceptance for 07: Tasks 4, 9, 14, 15, 1, 16.
 - **Step scan.** Every test step names its tests and assertions with the spec's values (128, 66, 24, 13 bytes, 16.0.0, 1460, ⌊3N/2⌋, 256 rows, 61,440 bytes, codes 34/36/39/56/57/58, statuses 5/7/8/45). Every code step names its file, signature and placement. No body is transcribed; the layouts (plan v2, checkpoint v3, wire, tail) and the keyed fold rules are spelled out because the tests alone do not fix them.
-- **Type consistency.** `ViewTableKeys`, `PrefixScan`, `drainDirtyKeyed`, `keyOfRow` (Task 5/6) → Tasks 7, 9, 10, 16. `CompiledKeyComponent`, `keyModeOf`, `ownerMappedOf`, `prefixWidthOf`, `needsV2`, `CompileErrorKind` (Task 4) → Tasks 8, 10, 12. `KeyedFoldSpec`, `deriveViewKey`, `DeriveKey` (Task 8) → Tasks 9, 10, 11, 15. `AggLayout::keyed`, `AggInstance::groupIds`, `AggregateFold::keyed` (Task 11) → Task 17. `ViewKey::fromU64`/`asU64` (R07d) → Tasks 5, 9, 16. `KeyedDirtyEntry`, `KeyedTableDelta`, `encodeKeyedDelta`, `applyKeyedDelta`, `replayKeyed` (Task 7) → Task 10. `getRowK`, `scanPage`, `ScanPage`, `RowStatus::BadKey` (Task 10) → Task 14. `GetViewRowK`, `ScanViewRows`, `ScanViewRowsResponse`, `kCursorInvalidated` (Task 13) → Tasks 14, 15. `ViewReadOptions`, `ViewScanOptions`, `ViewScanResult`, `ViewKeyBuilder` (Task 15) → Task 17.
+- **Type consistency.** `ViewTableKeys`, `PrefixScan`, `drainDirtyKeyed`, `keyOfRow` (Task 5/6) → Tasks 7, 9, 10, 16. `CompiledKeyComponent`, `keyModeOf`, `ownerMappedOf`, `prefixWidthOf`, `needsV2`, `CompileErrorKind` (Task 4) → Tasks 8, 10, 12. `KeyedFoldSpec`, `deriveViewKey`, `DeriveKey` (Task 8) → Tasks 9, 10, 11, 15. `AggLayout::keyed`, `AggInstance::groupIds`, `AggregateFold::keyed` (Task 11) → Task 17. `ViewKey::fromU64`/`asU64` (Part 04's, R07d) → Tasks 5, 9, 16; `ViewKey::fromBytes`/`operator==`, the `kMaxViewKeyBytes` alias (Task 5) → Tasks 7, 9, 16. `partitionFor` (06) → Task 15. Checkpoint v3 table ids 0–5 (this part) and any id below the table count (R-X3) → Part 09's 6 and 7. `KeyedDirtyEntry`, `KeyedTableDelta`, `encodeKeyedDelta`, `applyKeyedDelta`, `replayKeyed` (Task 7) → Task 10. `getRowK`, `scanPage`, `ScanPage`, `RowStatus::BadKey` (Task 10) → Task 14. `GetViewRowK`, `ScanViewRows`, `ScanViewRowsResponse`, `kCursorInvalidated` (Task 13) → Tasks 14, 15. `ViewReadOptions`, `ViewScanOptions`, `ViewScanResult`, `ViewKeyBuilder` (Task 15) → Task 17.
 - **Review Focus.** Each of the five lines has its named tests in its owning task (Tasks 1, 2, 6, 9, 10, 14).
 - **Proportion.** The plan fixes decisions, layouts, signatures, placements and assertions; table internals, the fold bodies, the serve code and the rig are left to the implementer within the stated rules.
