@@ -93,7 +93,12 @@ alongside. They are `RUN_SERIAL`, so they never share the CPU with other test pr
 ctest --test-dir build -R Regression -L latency --output-on-failure
 RUNE_LATENCY_GATE_BENCH=1 ctest --test-dir build -R DutyPassLatencyGate -V     # print the numbers, never fail
 RUNE_LATENCY_GATE_SCALE=4 ctest --test-dir build -R DutyPassLatencyGate -V     # multiply the pass counts
+RUNE_LATENCY_GATES=1 ctest --test-dir build -R KeyRotationAcrossARollingRestart -V  # enforce the latency bounds inside correctness tests
 ```
+
+A few correctness tests also measure a latency (for example `AuthClusterRegression.KeyRotationAcrossARollingRestart…`:
+the time from a broker's restart to the first acknowledged record). They always print it, but assert the bound only
+with `RUNE_LATENCY_GATES=1`, on an idle host; otherwise they print that the bound was not enforced.
 
 The produce-to-ack latency itself is measured by the benchmarks ([benchmarks.md](benchmarks.md)); the AEAD benchmark carries
 its own gate (`RUNE_CRYPTO_BENCH_BUDGET_NS`).

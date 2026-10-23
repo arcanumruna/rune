@@ -12,6 +12,7 @@
 #include <atomic>
 #include <map>
 #include <cstdio>
+#include <cstdlib>
 #include <future>
 #include <mutex>
 #include <thread>
@@ -29,20 +30,41 @@ using SP = rune::protocol::SecurityPatternKind;
 
 namespace {
 
+/// Issue #403: latency bounds inside correctness tests are enforced only on an idle host (CLAUDE.md §3), opted in with
+/// RUNE_LATENCY_GATES=1 (docs/testing.md, latency gates).  Always measured and printed.
+bool latencyGatesEnabled() {
+    const char* v = std::getenv("RUNE_LATENCY_GATES");
+    return v != nullptr && std::string(v) == "1";
+}
+
 /// DefineTopic as `s` (a session on any broker); the catalog leader answers, the others redirect: try every broker
-/// the builder has a session on, bounded.  Returns the topic id or -1.
+/// the builder has a session on, bounded.  Returns the topic id or -1.  Issue #403: any answer ends an attempt - a
+/// follower's Redirect is an ErrorResponse, never a DefineTopicResponse (waiting for the latter burnt 15 s per attempt).
 int32_t defineTopicAnywhere(AuthTrio& t, const std::vector<AuthTrio::Session>& sessions, const std::string& name, uint32_t partitions = 1) {
     const auto deadline = Clock3::now() + 60s;
     while (Clock3::now() < deadline) {
         for (const auto& s : sessions) {
             auto& c = s.w->raw();
-            const auto r = c.awaitDefine(c.sendDefineTopic(t.channel(s.node), AuthWireClient::kClientStream, s.sid, name, partitions, authRigCharBlob()),
-                                         Clock3::now() + 15s);
-            if (r && r->errorCode == 0) return r->topicId;
+            const int64_t corr = c.sendDefineTopic(t.channel(s.node), AuthWireClient::kClientStream, s.sid, name, partitions, authRigCharBlob());
+            const auto any = c.awaitAnyDdlAnswer(corr, Clock3::now() + 15s);
+            if (!any || any->code != 0) continue;
+            if (const auto r = c.awaitDefine(corr, Clock3::now() + 15s); r && r->errorCode == 0) return r->topicId;
         }
         std::this_thread::sleep_for(50ms);
     }
     return -1;
+}
+
+/// Issue #403: a session of `user` on EVERY broker (bounded retries while the user reaches each broker): a DDL that a
+/// broker routes to the catalog leader is retried through the leader's own session, wherever leadership moved.
+std::vector<AuthTrio::Session> sessionsOnEveryBroker(AuthTrio& t, const std::string& user) {
+    std::vector<AuthTrio::Session> out;
+    for (int id : {1, 2, 3}) {
+        AuthTrio::Session s;
+        if (!AuthTrio::until(30s, [&] { try { s = t.login(id, user); return true; } catch (...) { return false; } })) return {};
+        out.push_back(s);
+    }
+    return out;
 }
 
 /// One topic with 3 partitions; part[i] = a partition broker i+1 leads (-1 = none).  A subscription / produce binds only
@@ -207,7 +229,10 @@ struct NeedleCapture {
     std::shared_ptr<NeedleSink> sink;
     std::shared_ptr<spdlog::logger> previous = spdlog::default_logger();
     explicit NeedleCapture(std::vector<std::string> needles) : sink(std::make_shared<NeedleSink>(std::move(needles))) {
-        auto l = std::make_shared<spdlog::logger>("needle-capture", sink);
+        std::vector<spdlog::sink_ptr> sinks{sink};
+        // Diagnosing a failure (issue #403): RUNE_DIAG_NEEDLE_FORWARD=1 also forwards every line to the previous logger.
+        if (std::getenv("RUNE_DIAG_NEEDLE_FORWARD") != nullptr) for (const auto& s : previous->sinks()) sinks.push_back(s);
+        auto l = std::make_shared<spdlog::logger>("needle-capture", sinks.begin(), sinks.end());
         l->set_level(spdlog::level::info);
         spdlog::set_default_logger(l);
     }
@@ -274,7 +299,8 @@ TEST(AuthClusterRegression, WrongKeyBrokerNeverJoinsRegression) {
     createBuilder(t);
     t.createUser(1, "writer");
     t.grant(1, "writer", SO::Write, ST::Topic, SP::Prefix, "");
-    std::vector<AuthTrio::Session> bs{t.login(1, "builder")};
+    const std::vector<AuthTrio::Session> bs = sessionsOnEveryBroker(t, "builder");   // bs[0]: node 1
+    ASSERT_EQ(bs.size(), 3u) << "a builder session on every broker";
     const LedTopic led = defineLedTopic(t, bs, "wk.orders");
     ASSERT_GE(led.id, 0);
     ASSERT_TRUE(led.part[0] >= 0 && led.part[1] >= 0);
@@ -345,6 +371,30 @@ TEST(AuthClusterRegression, WrongKeyBrokerNeverJoinsRegression) {
     t.restart(consensusLeader, t.keyContentsPath(consensusLeader));
     EXPECT_TRUE(awaitNodeInIsr(t, 1, 3, 60s, led.id)) << "the right key brings node 3 back into every ISR";
     EXPECT_TRUE(awaitNodeInIsr(t, 2, 3, 60s, led.id));
+}
+
+// Issue #403 (harness): a SecurityBootstrap sent to a broker that does not lead `__security` is answered at once - the
+// follower routes it with an ErrorResponse{Redirect} - and AuthWireClient::bootstrap returns that answer.  RED before
+// the fix: bootstrap() waited for a DdlResponse only, so every attempt on a follower burnt its whole 30 s and
+// AuthTrio::bootstrapAdmin (60 s over the three brokers) ran out of attempts whenever leadership moved under load.
+TEST(AuthClusterRegression, ASecurityBootstrapThroughAFollowerIsAnsweredRedirectRegression) {
+    AuthTrio t("bootredirect");
+    t.start();
+    const int32_t leader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(leader, 0);
+    const int follower = leader == 1 ? 2 : 1;
+    AuthWireClient& w = t.wire();
+    ASSERT_TRUE(AuthTrio::until(30s, [&] {   // the follower's route names the leader (not "no leader known yet": 2)
+        const int64_t s0 = w.connect(t.channel(follower));
+        if (s0 <= 0) return false;
+        const auto b = w.bootstrap(t.channel(follower), s0, t.keyContents(follower), "admin", AuthTrio::kBootstrapPassword);
+        (void)w.raw().disconnect(t.channel(follower), AuthWireClient::kClientStream, s0);
+        EXPECT_NE(b.errorCode, 0xFFFF) << "the follower's answer never reached bootstrap(): " << b.detail;
+        EXPECT_NE(b.errorCode, 0) << "a follower bootstrapped the cluster";
+        return b.errorCode == static_cast<uint16_t>(pc::ErrorCode::Redirect);
+    })) << "the follower answers Redirect";
+    t.bootstrapAdmin();   // and the trio's own bootstrap still lands on the leader
+    EXPECT_TRUE(t.node(leader).securityViewForTest().hasSecurityAdmin);
 }
 
 // D32: Enabled with no cluster key refuses to start, naming the variable.
@@ -468,11 +518,17 @@ namespace {
 int ackOrErrorCode(ShardTestClient& c, int64_t corr, std::chrono::milliseconds within);   // defined with the matrix
 
 struct ProducerResult { std::vector<int64_t> acked; std::vector<Clock3::time_point> ackedAt; int attempts = 0; };
+/// Issue #403: the producer thread publishes the time of its latest ack (steady-clock ns; 0 = none yet) so the test
+/// thread waits for traffic by condition instead of a fixed sleep.  Written by the producer only (release), read by the
+/// test (acquire) - test-harness code.
+using LastAck = std::atomic<int64_t>;
+int64_t steadyNs(Clock3::time_point tp) { return std::chrono::duration_cast<std::chrono::nanoseconds>(tp.time_since_epoch()).count(); }
 struct ConsumerResult { std::map<int64_t, int> deliveries; std::set<int64_t> offsets; bool complete = false; int resubscribes = 0; };
 
 /// A producer that owns its client (own Aeron driver) and its thread: it logs in on whichever broker answers, follows
 /// Redirects, re-logs-in after a restart, and hands its acked offsets back at join.  Shares nothing with the test.
-ProducerResult runProducer(std::stop_token stop, std::array<std::string, 3> channels, std::filesystem::path dir, int32_t topic) {
+ProducerResult runProducer(std::stop_token stop, std::array<std::string, 3> channels, std::filesystem::path dir, int32_t topic,
+                           LastAck* lastAck) {
     ProducerResult out;
     AuthWireClient w(dir);
     std::array<int64_t, 3> sid{};
@@ -489,7 +545,13 @@ ProducerResult runProducer(std::stop_token stop, std::array<std::string, 3> chan
         ++out.attempts;
         if (!c.produce(channels[n], AuthWireClient::kClientStream, sid[n], corr, topic, 0, 1, makeBatch(1))) { sid[n] = 0; ++node; continue; }
         const int code = ackOrErrorCode(c, corr, 1s);
-        if (code == 0) { out.acked.push_back(c.ackFor(corr)->baseOffset); out.ackedAt.push_back(Clock3::now()); std::this_thread::sleep_for(10ms); continue; }
+        if (code == 0) {
+            out.acked.push_back(c.ackFor(corr)->baseOffset);
+            out.ackedAt.push_back(Clock3::now());
+            lastAck->store(steadyNs(out.ackedAt.back()), std::memory_order_release);
+            std::this_thread::sleep_for(10ms);
+            continue;
+        }
         if (code != 3 && code != 2) sid[n] = 0;   // no answer / revoked / refused: this broker's session is gone
         ++node;
         std::this_thread::sleep_for(10ms);
@@ -566,7 +628,8 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
     t.grant(1, "prod", SO::Write, ST::Topic, SP::Prefix, "rot.");
     t.createUser(1, "cons");
     t.grant(1, "cons", SO::Read, ST::Topic, SP::Prefix, "rot.");
-    std::vector<AuthTrio::Session> bs{t.login(1, "builder")};
+    const std::vector<AuthTrio::Session> bs = sessionsOnEveryBroker(t, "builder");   // bs[0]: node 1
+    ASSERT_EQ(bs.size(), 3u) << "a builder session on every broker";
     const int32_t topic = defineTopicAnywhere(t, bs, "rot.t", 1);
     ASSERT_GE(topic, 0);
     ASSERT_TRUE(AuthTrio::until(60s, [&] { const int32_t l = leaderOf(t, bs[0], topic, 0); return l >= 1 && l <= 3; }));
@@ -584,8 +647,9 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
     auto cFut = cOut.get_future();
     // everything the threads need is copied BEFORE they start: they never touch the trio while it restarts nodes
     const std::filesystem::path prodDir = t.cluster().clientsDir->path / "rot_prod", consDir = t.cluster().clientsDir->path / "rot_cons";
-    producer = std::jthread([&pOut, ch = channels, prodDir, topic](std::stop_token st) {
-        try { pOut.set_value(runProducer(st, ch, prodDir, topic)); }
+    LastAck lastAck{0};
+    producer = std::jthread([&pOut, &lastAck, ch = channels, prodDir, topic](std::stop_token st) {
+        try { pOut.set_value(runProducer(st, ch, prodDir, topic, &lastAck)); }
         catch (...) { pOut.set_exception(std::current_exception()); }
     });
     consumer = std::jthread([&cOut, ch = channels, consDir, topic, batchBytes, fut = target.get_future()](std::stop_token st) mutable {
@@ -613,8 +677,13 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
             std::printf("ROTATION step=%s node=%d restart+links-reestablished=%.0f ms\n", st.name, id, ms);
             EXPECT_TRUE(linked) << "step " << st.name << ": links after restarting node " << id;
             EXPECT_TRUE(awaitSecurityLeader(t.cluster(), 60s));
-            restarts.push_back({t0, Clock3::now(), st.name, id});
-            std::this_thread::sleep_for(4s);   // traffic keeps flowing between restarts (the threads never stop)
+            const auto end = Clock3::now();
+            restarts.push_back({t0, end, st.name, id});
+            // Issue #403: traffic keeps flowing between restarts (the threads never stop) - the next restart waits, by
+            // condition, for an ack that landed after this one ended (a fixed 4 s sleep made the "an ack landed after
+            // each restart" check below a race against the load on the host).
+            ASSERT_TRUE(AuthTrio::until(60s, [&] { return lastAck.load(std::memory_order_acquire) > steadyNs(end); }))
+                << "step " << st.name << ": no ack within 60 s after restarting node " << id;
         }
     }
     const auto loopEnd = Clock3::now();
@@ -650,9 +719,16 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
         std::printf("ROTATION recovery step=%s node=%d restart-end-to-first-ack=%.0f ms\n", restarts[k].step, restarts[k].node, firstMs);
         // Floor: a restarted controller defers user-partition elections for one unservable-report TTL, then the
         // producer's 1 s no-answer timeout + re-login; +1 s margin. Derived, so a TTL change moves the bound with it.
+        // Issue #403: a latency bound inside a correctness test - enforced only where latency gates run (CLAUDE.md §3: an
+        // idle host, RUNE_LATENCY_GATES=1); always measured and printed.  The correctness of recovery (an ack after every
+        // restart) is asserted above unconditionally.
         constexpr double kRecoveryBoundMs = rune::node::MetadataService::kUnservableReportTtlNs / 1e6 + 1000.0 + 1000.0;
-        EXPECT_TRUE(firstMs >= 0 && firstMs <= kRecoveryBoundMs) << "step " << restarts[k].step << " node " << restarts[k].node << ": first ack after " << firstMs << " ms (bound " << kRecoveryBoundMs << ")";
+        EXPECT_GE(firstMs, 0) << "step " << restarts[k].step << " node " << restarts[k].node << ": no ack after the restart";
+        if (latencyGatesEnabled())
+            EXPECT_LE(firstMs, kRecoveryBoundMs) << "step " << restarts[k].step << " node " << restarts[k].node << ": first ack after " << firstMs << " ms (bound " << kRecoveryBoundMs << ")";
     }
+    if (!latencyGatesEnabled())
+        std::printf("ROTATION recovery bound not enforced (set RUNE_LATENCY_GATES=1 on an idle host)\n");
 }
 
 // D8: AuthServerFirst for an unknown user carries the same fake salt and iteration count from every broker (derived from
@@ -799,7 +875,8 @@ TEST(AuthClusterRegression, MatrixSliceOpByTimingByViaBrokerRegression) {
     t.start();
     t.bootstrapAdmin();
     createBuilder(t);
-    std::vector<AuthTrio::Session> bs{t.login(1, "builder")};
+    const std::vector<AuthTrio::Session> bs = sessionsOnEveryBroker(t, "builder");   // bs[0]: node 1
+    ASSERT_EQ(bs.size(), 3u) << "a builder session on every broker";
     const LedTopic led = defineLedTopic(t, bs, "mx.t");
     ASSERT_GE(led.id, 0);
     ASSERT_TRUE(led.part[0] >= 0 && led.part[1] >= 0 && led.part[2] >= 0);
