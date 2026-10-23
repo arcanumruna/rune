@@ -126,8 +126,11 @@ std::expected<Staged, ApplyError> dropRole(const Ctx& c) {
     if (!cur) return refuse(c.offset, Refusal::UnknownRole, "unknown role " + c.quoted());
     if (auto bad = c.updateVersion(cur->objectId, cur->version)) return *bad;
     std::vector<uint64_t> members = c.s.membersOf(cur->objectId);
-    return finish(c, StagedRemoveRole{Tombstone{cur->objectId, true, cur->name, c.e.newVersion}, members},
-                  c.applied(SessionEffect::Refresh, std::move(members)));
+    // The staged removal and the answer each get their own list: argument evaluation order is unspecified, so
+    // moving `members` into one argument may empty it before the other copies it (the memberships then survive).
+    std::vector<uint64_t> affected = members;
+    return finish(c, StagedRemoveRole{Tombstone{cur->objectId, true, cur->name, c.e.newVersion}, std::move(members)},
+                  c.applied(SessionEffect::Refresh, std::move(affected)));
 }
 
 std::expected<Staged, ApplyError> grantOrRevoke(const Ctx& c, GranteeKind grantee, const GrantSpec& g, bool grant) {
