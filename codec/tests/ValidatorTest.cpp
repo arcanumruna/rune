@@ -2,6 +2,8 @@
 #include <gtest/gtest.h>
 #include <rune/codec/Validator.h>
 #include <rune/codec/Record.h>
+#include <rune/codec/AlterOps.h>
+#include <rune/codec/Evolve.h>
 using namespace rune::codec;
 
 static Descriptor D() {
@@ -131,4 +133,67 @@ TEST(ValidatorAdversarial, RejectsTruncatedVarSegment) {
     b.push_back('h'); b.push_back('i');
     auto r = v.validate(b);
     EXPECT_FALSE(r.ok);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #149: a Validator built from the cumulative EVOLVING descriptor (it still lists retired fields)
+// validates exactly as one built from materializeAsOf(evolving, evolving.version).  Before the fix the
+// retired var field was walked as live: it consumed the live field's length prefix, the live field then
+// read past the end, and a valid current-version record was falsely rejected.
+// ---------------------------------------------------------------------------
+namespace {
+// v1 {id i64 key, note str, name str}; DROP note at v2 (the Evolve API, as EvolveTest.cpp does).
+Descriptor evolvingWithDroppedVar() {
+    const Descriptor v1 = DescriptorBuilder("c")
+        .add("id", PrimType::Int64, 1, /*isKey=*/true)
+        .add("note", PrimType::String)
+        .add("name", PrimType::String)
+        .build();
+    uint16_t nextTag = 3;
+    auto v2 = applyOps(v1, {{AlterOpType::Drop, "note", "", {}, 0, {}}}, nextTag, 2);
+    EXPECT_TRUE(v2.has_value());
+    return v2.value_or(v1);
+}
+// A v2 record: [blockLength=8][version=2][id i64][len u32][name bytes].
+std::vector<uint8_t> v2Record(int64_t id, std::string_view name) {
+    std::vector<uint8_t> b;
+    auto le = [&](auto v) { for (size_t i = 0; i < sizeof v; i++) b.push_back(uint8_t(v >> (8 * i))); };
+    le(uint16_t{8}); le(uint16_t{2}); le(id);
+    le(uint32_t(name.size()));
+    b.insert(b.end(), name.begin(), name.end());
+    return b;
+}
+}  // namespace
+
+TEST(ValidatorRegression, EvolvingDescriptorWithRetiredFieldsIsHandledRegression) {
+    const Descriptor evolving = evolvingWithDroppedVar();
+    ASSERT_EQ(evolving.version, 2);
+    ASSERT_NE(evolving.find("note"), nullptr);
+    ASSERT_EQ(evolving.find("note")->untilVersion, 2) << "the evolving descriptor still carries the retired field";
+
+    const Validator fromEvolving(evolving);
+    const Validator fromMaterialized(materializeAsOf(evolving, evolving.version));
+
+    const auto good = v2Record(42, "alice");
+    const ValResult a = fromEvolving.validate(good);
+    const ValResult b = fromMaterialized.validate(good);
+    EXPECT_TRUE(a.ok) << "a valid current-version record was rejected: " << (a.reason ? a.reason : "");
+    EXPECT_TRUE(b.ok);
+    EXPECT_EQ(a.ok, b.ok);
+    EXPECT_EQ(a.fieldId, b.fieldId);
+
+    // A corrupt record is still refused, exactly as the materialized validator refuses it.
+    auto truncated = good;
+    truncated.resize(truncated.size() - 2);
+    const ValResult c = fromEvolving.validate(truncated);
+    const ValResult d = fromMaterialized.validate(truncated);
+    EXPECT_FALSE(c.ok) << "a truncated var field was accepted";
+    EXPECT_EQ(c.ok, d.ok);
+    EXPECT_EQ(c.fieldId, d.fieldId);
+    auto badPrefix = good;
+    badPrefix[12] = 0xFF; badPrefix[13] = 0xFF; badPrefix[14] = 0xFF; badPrefix[15] = 0xFF;   // name length 4 GiB
+    EXPECT_FALSE(fromEvolving.validate(badPrefix).ok) << "an absurd var length was accepted";
+    std::vector<uint8_t> wrongBlock = good;
+    wrongBlock[0] = 12;                                                                         // v2's blockLength is 8
+    EXPECT_FALSE(fromEvolving.validate(wrongBlock).ok) << "a blockLength mismatch was accepted";
 }

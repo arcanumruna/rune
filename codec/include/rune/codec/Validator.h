@@ -15,10 +15,15 @@ struct ValResult {
 
 class Validator {
 public:
+    /// `d` may be a per-version (materialized) descriptor or the cumulative "evolving" one that still
+    /// carries retired fields (untilVersion != 0xFFFF, issue #149): the latter is validated as
+    /// materializeAsOf(d, d.version), so retired fields never shift the fixed offsets or the var walk.
     explicit Validator(const Descriptor& d);
     ValResult validate(std::span<const uint8_t> record) const noexcept;
 
 private:
+    void build_(const Descriptor& d);   // fills the tables from a descriptor with no retired field
+
     // Precomputed per-field validation entry
     struct FieldEntry {
         uint16_t             id;
@@ -29,8 +34,8 @@ private:
         std::vector<int32_t> enumValues;  // whitelist for Enum fields; empty = no check
     };
 
-    uint32_t              blockLength_; // descriptor's blockLength (for the current version)
-    uint16_t              version_;     // descriptor's version
+    uint32_t              blockLength_ = 0; // descriptor's blockLength (for the current version)
+    uint16_t              version_     = 0; // descriptor's version
     std::vector<FieldEntry> fixedFields_;
     std::vector<FieldEntry> varFields_;
 };
