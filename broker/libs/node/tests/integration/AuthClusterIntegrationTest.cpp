@@ -1423,3 +1423,112 @@ TEST(AuthRestartAdversarialRegression, AHealedZombieWithASlowApplierNeverServesT
     z.holdSecurityApplyForTest(false);
     EXPECT_TRUE(AuthTrio::until(60s, [&] { return loginCode(t, zombie, "ws1") == 44; })) << "then judged disabled";
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Issues #273 / #136 (follower-not-applied 45; `__security` follower lag).  Node F, a `__security` FOLLOWER, holds its
+// applier (it replicates the events, its view applies none of them), then the admin REVOKEs a user's WRITE through the
+// `__security` leader - answered OK once the LEADER enforces it (D24).  The user has a live session on F, producing to
+// the partition F itself leads (gateway-routed and straight to F's worker ingress).
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+struct LaggingFollower {
+    int f = 0;
+    int32_t secLeader = 0, part = -1;
+    LedTopic led;
+    UserSessions u;
+    PartitionInfo ingress;
+    int64_t appliedBefore = -1;
+};
+/// The trio, the user "lagw" (WRITE on "lag."), a live session of it on a `__security` follower F producing to the
+/// partition F leads (both paths checked OK), then F's applier held and the REVOKE answered OK by the leader.
+void lagFollowerAndRevoke(AuthTrio& t, LaggingFollower& s) {
+    t.start();
+    t.bootstrapAdmin();
+    createBuilder(t);
+    t.createUser(1, "lagw");
+    t.grant(1, "lagw", SO::Write, ST::Topic, SP::Prefix, "lag.");
+    const std::vector<AuthTrio::Session> bs = sessionsOnEveryBroker(t, "builder");   // bs[0]: node 1
+    ASSERT_EQ(bs.size(), 3u) << "a builder session on every broker";
+    s.led = defineLedTopic(t, bs, "lag.t");
+    ASSERT_GE(s.led.id, 0);
+    ASSERT_TRUE(s.led.part[0] >= 0 && s.led.part[1] >= 0 && s.led.part[2] >= 0) << "each broker must lead one partition";
+    s.secLeader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(s.secLeader, 0);
+    s.f = s.secLeader == 3 ? 2 : 3;   // a `__security` follower
+    s.part = s.led.part[static_cast<std::size_t>(s.f - 1)];
+    ASSERT_TRUE(t.awaitDigestsAgree(0, 30s));
+    s.u.name = "lagw";
+    s.u.w = &t.wire();
+    ASSERT_TRUE(AuthTrio::until(30s, [&] {
+        try { s.u.sid[static_cast<std::size_t>(s.f - 1)] = t.login(s.f, "lagw").sid; return true; } catch (...) { return false; }
+    }));
+    ASSERT_TRUE(AuthTrio::until(30s, [&] {
+        for (const PartitionInfo& pi : bs[0].w->raw().metadata(t.channel(bs[0].node), AuthWireClient::kClientStream, bs[0].sid))
+            if (pi.topicId == s.led.id && pi.partition == s.part && pi.leaderId == s.f && !pi.ingressEndpoint.empty()) { s.ingress = pi; return true; }
+        return false;
+    })) << "the worker ingress of the partition node " << s.f << " leads";
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return gatewayProduce(t, s.u, s.f, s.led.id, s.part) == 0; })) << "the grant works on F (routed)";
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return shardProduce(s.u, s.f, s.ingress, s.led.id) == 0; })) << "the grant works on F (worker)";
+    s.appliedBefore = t.node(s.f).securityViewForTest().appliedOffset;
+    t.node(s.f).holdSecurityApplyForTest(true);
+    const auto ok = t.revoke(s.secLeader, "lagw", SO::Write, ST::Topic, SP::Prefix, "lag.");
+    ASSERT_EQ(ok.errorCode, 0) << ok.detail;
+    ASSERT_EQ(t.node(s.f).securityViewForTest().appliedOffset, s.appliedBefore) << "precondition: F has not applied the revoke";
+}
+}  // namespace
+
+// What the broker guarantees today (issues #15 / #111, decision M7: staleness bounded by F, then R): F's applier stuck
+// behind the REVOKE drops its "caught up" verdict F after it last applied at the high watermark, and R later F ends the
+// user's live session with the retriable session-level AuthUnavailable (48); from then on nothing the user sends is
+// appended on F, a new login there is refused 48 (never OK), and once F applies the revoke it answers 45.
+TEST(AuthClusterRegression, AFollowerStuckBehindARevokeEndsTheSessionWithinTheStalenessBoundRegression) {
+    AuthTrio t("lagbound");
+    withStaleSessionEnd(t, 3'000);
+    LaggingFollower s;
+    lagFollowerAndRevoke(t, s);
+    if (HasFatalFailure()) return;
+    AuthTrio::Session live{s.u.w, s.u.sid[static_cast<std::size_t>(s.f - 1)], s.f};
+    const auto revokedAt = std::chrono::steady_clock::now();
+    EXPECT_TRUE(sessionEndedWith(live, static_cast<int16_t>(kAuthUnavailable), 30s))
+        << "F, stuck behind the revoke, never ended the user's session (session-level 48)";
+    std::printf("LAG-BOUND: F=%d ended the lagging session %lld ms after the revoke's OK\n", s.f,
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - revokedAt).count()));
+    EXPECT_FALSE(t.node(s.f).gatewayHasSessionForTest(live.sid));
+    const int64_t leo = partitionLeo(&t.node(s.f), s.led.id, s.part);
+    EXPECT_NE(gatewayProduce(t, s.u, s.f, s.led.id, s.part), 0) << "the ended session's produce (routed)";
+    EXPECT_NE(shardProduce(s.u, s.f, s.ingress, s.led.id), 0) << "the ended session's produce (worker ingress)";
+    EXPECT_EQ(partitionLeo(&t.node(s.f), s.led.id, s.part), leo) << "F appended for the ended session";
+    EXPECT_EQ(loginCode(t, s.f, "lagw"), kAuthUnavailable) << "a lagging F serves no login";
+    EXPECT_EQ(t.node(s.f).securityViewForTest().appliedOffset, s.appliedBefore) << "the hold held for the whole window";
+
+    t.node(s.f).holdSecurityApplyForTest(false);
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return t.node(s.f).securityViewForTest().appliedOffset > s.appliedBefore; }));
+    ASSERT_TRUE(AuthTrio::until(30s, [&] {
+        try { s.u.sid[static_cast<std::size_t>(s.f - 1)] = t.login(s.f, "lagw").sid; return true; } catch (...) { return false; }
+    })) << "F, caught up, serves the login again";
+    EXPECT_EQ(gatewayProduce(t, s.u, s.f, s.led.id, s.part), 45) << "and refuses the revoked WRITE NotAuthorized";
+    EXPECT_EQ(partitionLeo(&t.node(s.f), s.led.id, s.part), leo);
+}
+
+// DEFECT (found by batch M24, not fixed: a design change, see the report) - kept out of the suite (DISABLED_) until it
+// is fixed.  The strict property: F must never serve the grant it has not yet seen revoked - each answer between the
+// revoke's OK and F's apply is a refusal (45 or 48), never OK, and nothing is appended.  Today F keeps serving the
+// revoked WRITE (OK, appended) on both the routed and the worker-ingress path for up to F + R (the staleness bounds of
+// AFollowerStuckBehindARevokeEndsTheSessionWithinTheStalenessBoundRegression): SecurityServing only refuses logins,
+// `__security` reads and security DDL while stale, and ends live sessions only after R (rune/node/SecurityServing.h).
+TEST(AuthClusterRegression, DISABLED_AFollowerThatHasNotAppliedARevokeNeverServesTheOldGrantRegression) {
+    AuthTrio t("lagrevoke");
+    LaggingFollower s;
+    lagFollowerAndRevoke(t, s);
+    if (HasFatalFailure()) return;
+    const int64_t leo = partitionLeo(&t.node(s.f), s.led.id, s.part);
+    for (int i = 0; i < 5; ++i) {
+        const int routed = gatewayProduce(t, s.u, s.f, s.led.id, s.part);
+        EXPECT_TRUE(routed == 45 || routed == 48) << "attempt " << i << ": F served the revoked grant (routed), answer " << routed;
+        const int direct = shardProduce(s.u, s.f, s.ingress, s.led.id);
+        EXPECT_TRUE(direct == 45 || direct == 48 || direct == kNoAnswer)
+            << "attempt " << i << ": F served the revoked grant (worker ingress), answer " << direct;
+    }
+    EXPECT_EQ(partitionLeo(&t.node(s.f), s.led.id, s.part), leo) << "F appended under the revoked grant";
+    t.node(s.f).holdSecurityApplyForTest(false);
+}

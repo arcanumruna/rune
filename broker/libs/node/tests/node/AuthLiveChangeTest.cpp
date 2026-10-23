@@ -947,3 +947,170 @@ TEST(AuthLiveChangeAdversarialRegression, EverySessionEndingChangeRemovesExactly
         EXPECT_EQ(t.r.logEnd(t.r.orders), before + 1) << "the ended session's produce appended nothing";
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Issue #273 residuals (shard rig: per-worker ingress AND per-worker egress, the default runtime).
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+/// Worker 0's cursors as (session, has its OWN record egress) - read on the worker's thread.
+struct WorkerCursor { int64_t session = 0; bool ownEgress = false; };
+std::vector<WorkerCursor> workerCursors(Live& t) {
+    return t.b().node().onWorkerThreadForTest(0, [](Worker& w) {
+        std::vector<WorkerCursor> out;
+        for (const auto& s : w.subscriptionsForTest()) out.push_back({s.sessionId, s.egressPub != nullptr});
+        return out;
+    });
+}
+/// No cursor on worker 0 pushes on the worker's SHARED dynamic-MDC egress (a cursor without its own record egress).
+bool noSharedEgressCursor(Live& t) {
+    for (const WorkerCursor& c : workerCursors(t)) if (!c.ownEgress) return false;
+    return true;
+}
+bool workerHasCursorOf(Live& t, int64_t sid) {
+    for (const WorkerCursor& c : workerCursors(t)) if (c.session == sid) return true;
+    return false;
+}
+/// How many ErrorResponses with `code` arrived for (`corr`, `sid`).
+int errorsWith(Live& t, int64_t corr, int64_t sid, int code) {
+    int n = 0;
+    for (const auto& e : t.r.c().errors()) n += e.correlationId == corr && e.sessionId == sid && e.code == code ? 1 : 0;
+    return n;
+}
+}  // namespace
+
+// Issue #273 (MDC fallback): a shard client has two ways to a partition - the worker's own ingress / record egress, and
+// the gateway's control stream it falls back to (the routed produce; under authentication the shared dynamic-MDC record
+// egress fallback is retired, issue #118).  A REVOKE is enforced on EVERY path at its OK: the revoked WRITE is refused
+// on the worker ingress AND on the control-stream fallback, nothing is appended on either; a revoked READ ends the
+// subscription, and no cursor - before, during or after the end, also for a Subscribe that waited on its record-egress
+// resolve - ever pushes on the worker's shared MDC egress.  RED: delete the WRITE check of ClientGateway::handleProduce
+// (the control-stream fallback appends after the revoke).
+TEST(AuthLiveChangeRegression, RevokeIsEnforcedOnTheMdcFallbackPathRegression) {
+    Live t("mdcfallback", shardOptions());
+    std::string writer, reader;
+    const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")}, &writer);
+    const int64_t rs = t.r.newUser({exact(SO::Read, ST::Topic, "orders")}, &reader);
+    ASSERT_EQ(shardProduceCode(t, ws, t.r.orders, 200), 0) << "worker ingress";
+    ASSERT_EQ(t.r.produce(ws, t.r.orders), 0) << "the control-stream fallback (gateway-routed produce)";
+    const auto sub = t.subscribe(rs, t.r.orders);
+    ASSERT_GT(sub.id, 0);
+    ASSERT_TRUE(t.awaitPushes(sub.id, 1));
+    EXPECT_TRUE(workerHasCursorOf(t, rs)) << "the subscription is served by the worker";
+    EXPECT_TRUE(noSharedEgressCursor(t)) << "a cursor pushes on the shared MDC egress under authentication";
+
+    // WRITE revoked: refused on both paths at the OK, nothing appended.
+    ASSERT_EQ(t.revokeExact(writer, SO::Write, ST::Topic, "orders"), 0);
+    const int64_t leo = leoOf(t, t.r.orders);
+    EXPECT_EQ(shardProduceOnce(t, ws, t.r.orders), 45) << "worker ingress after the revoke's OK";
+    EXPECT_EQ(t.r.produceDenied(ws, t.r.orders), 45) << "the control-stream fallback after the revoke's OK";
+    EXPECT_EQ(leoOf(t, t.r.orders), leo) << "a revoked WRITE was appended through a fallback path";
+
+    // READ revoked: the live subscription ends; no shared-egress cursor at any point.
+    ASSERT_EQ(t.revokeExact(reader, SO::Read, ST::Topic, "orders"), 0);
+    EXPECT_EQ(t.errorOn(sub.corr, rs), 45);
+    EXPECT_FALSE(workerHasCursorOf(t, rs)) << "the worker still holds the revoked reader's cursor after the OK";
+    EXPECT_TRUE(noSharedEgressCursor(t));
+
+    // The deferred window: READ granted back, a fresh session's Subscribe parked on its record-egress resolve, READ
+    // revoked while it waits.  Released, it is answered 45/46 and never reaches the worker - not even on the MDC egress.
+    ASSERT_EQ(t.grantExact(reader, SO::Read, ST::Topic, "orders"), 0);
+    const int64_t rs2 = t.r.login(reader);
+    t.b().node().holdRecordEgressResolveForTest(true);
+    const int64_t corr2 = t.r.c().sendSubscribe(t.ch(), AuthRig::stream(), rs2, t.r.orders, 0);
+    ASSERT_NE(corr2, 0);
+    ASSERT_EQ(t.revokeExact(reader, SO::Read, ST::Topic, "orders"), 0);
+    t.b().node().holdRecordEgressResolveForTest(false);
+    const auto code = t.r.c().awaitSubscribeCode(corr2, AuthRig::dl());
+    ASSERT_TRUE(code.has_value()) << "the held Subscribe was answered";
+    EXPECT_TRUE(*code == 45 || *code == 46) << "the held Subscribe answered " << *code;
+    EXPECT_FALSE(workerHasCursorOf(t, rs2)) << "the revoked reader's held Subscribe reached the worker";
+    EXPECT_TRUE(noSharedEgressCursor(t));
+    // Re-granted WRITE: both paths open again, without a new login (the revoke was not a session end).
+    ASSERT_EQ(t.grantExact(writer, SO::Write, ST::Topic, "orders"), 0);
+    EXPECT_EQ(shardProduceOnce(t, ws, t.r.orders), 0);
+    EXPECT_EQ(t.r.produce(ws, t.r.orders), 0);
+}
+
+// Issue #273 / #136 (46 under back-pressure): a session ended by a live change (DISABLE) while the worker that serves it
+// is back-pressured - its lifecycle ring not drained, its op ring not drained with a backlog still being pushed, or the
+// session's record-egress resolve held - still gets its SessionRevoked (46): the session-level frame exactly once and,
+// on a live subscription, exactly one 46 on the subscription's correlation id with no Records after it.  The DDL's OK is
+// released (no hang) and the session is gone.  (44 - AuthenticationFailed - is a login / pre-login answer the control
+// thread sends synchronously; no worker ring or egress resolve sits on its path, so there is no back-pressured 44.)
+// RED: drop the session-level SessionRevoked frame of ClientGateway's session end (the 46 never arrives).
+TEST(AuthLiveChangeRegression, EndedSessionAnswerSurvivesBackPressureRegression) {
+    enum class Pressure { LifecycleRing, OpRingWithBacklog, RecordEgressResolve };
+    for (const Pressure p : {Pressure::LifecycleRing, Pressure::OpRingWithBacklog, Pressure::RecordEgressResolve}) {
+        const char* what = p == Pressure::LifecycleRing ? "lifecycle ring held"
+                         : p == Pressure::OpRingWithBacklog ? "op ring held with a backlog" : "record-egress resolve held";
+        SCOPED_TRACE(what);
+        Live t(p == Pressure::LifecycleRing ? "bp46life" : p == Pressure::OpRingWithBacklog ? "bp46op" : "bp46egress",
+               shardOptions());
+        std::string reader;
+        const int64_t rs = t.r.newUser({exact(SO::Read, ST::Topic, "orders")}, &reader);
+        const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")});
+        ASSERT_EQ(shardProduceCode(t, ws, t.r.orders, 200), 0);
+        if (p == Pressure::OpRingWithBacklog) backlog(t, ws, t.r.orders, 60, 1000);
+        int64_t corr = 0, subId = 0;
+        if (p == Pressure::RecordEgressResolve) {
+            t.b().node().holdRecordEgressResolveForTest(true);
+            corr = t.r.c().sendSubscribe(t.ch(), AuthRig::stream(), rs, t.r.orders, 0);
+            ASSERT_NE(corr, 0);
+        } else {
+            const auto sub = t.subscribe(rs, t.r.orders);
+            ASSERT_GT(sub.id, 0);
+            corr = sub.corr;
+            subId = sub.id;
+            if (p == Pressure::LifecycleRing) holdLifecycle(t); else holdOpRing(t);
+        }
+        ASSERT_EQ(t.alter(reader, pc::UserChangeKind::Disable), 0) << "the DISABLE's OK is released (no hang)";
+        if (p == Pressure::RecordEgressResolve) t.b().node().holdRecordEgressResolveForTest(false);
+        EXPECT_EQ(t.errorOn(0, rs), kRevoked) << "the session-level SessionRevoked arrived";
+        EXPECT_TRUE(t.r.awaitSessionGone(rs)) << "the gateway ended the session";
+        t.r.c().pollFor(300ms, [] { return false; });   // anything still owed lands now
+        EXPECT_EQ(errorsWith(t, 0, rs, kRevoked), 1) << "exactly one session-level 46";
+        if (subId != 0) {
+            EXPECT_EQ(errorsWith(t, corr, rs, kRevoked), 1) << "exactly one 46 on the subscription";
+            const uint64_t endSeq = firstErrorSeq(t, corr, rs, kRevoked);
+            ASSERT_GT(endSeq, 0u);
+            EXPECT_EQ(recordsAfter(t, subId, endSeq), 0u) << "Records after the subscription's 46";
+        } else {
+            // The parked Subscribe never reached a worker: it is answered 46 (or not at all - the session-level 46 above
+            // ended it), never OK.
+            const auto code = t.r.c().awaitSubscribeCode(corr, AuthRig::dl(1));
+            EXPECT_TRUE(!code.has_value() || *code == kRevoked || *code == 45) << "the parked Subscribe answered " << *code;
+        }
+        EXPECT_EQ(t.b().node().onWorkerThreadForTest(0, [](Worker& w) { return static_cast<int>(w.subscriptionEndsOwedForTest()); }),
+                  0) << "the worker still owes an end";
+    }
+}
+
+// Issue #273 (session spoof over the wire on the shard worker ingress): B (a logged-in writer of its own) sends Produce
+// frames straight to the worker's ingress naming session ids that are not its own: A's id after A's session was ended by
+// a DISABLE, A's id after A disconnected, an id never issued, and 0.  Each is refused - never acked OK - and nothing is
+// appended; B's own produce under its own id still works.  (A LIVE session's id: on this rig's plaintext test transport
+// the session id is the frame's only identity, so a live id is a bearer token by design (#10: an authenticating broker
+// serves TLS only); on TLS a frame naming another session's id never opens -
+// AuthSessionBindingRegression.APlaintextProduceNamingAnEncryptedSessionIsNeverAppendedAdversarialRegression.)
+// RED: keep a session's worker grant slot bound after its end (the ended id's produce is appended).
+TEST(AuthLiveChangeRegression, ShardWorkerIngressRefusesASpoofedSessionIdRegression) {
+    Live t("shardspoof", shardOptions());
+    std::string aName, a2Name;
+    const int64_t a = t.r.newUser({exact(SO::Write, ST::Topic, "orders")}, &aName);
+    const int64_t a2 = t.r.newUser({exact(SO::Write, ST::Topic, "orders")}, &a2Name);
+    const int64_t b = t.r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    ASSERT_EQ(shardProduceCode(t, a, t.r.orders, 200), 0);
+    ASSERT_EQ(shardProduceCode(t, a2, t.r.orders, 200), 0);
+    ASSERT_EQ(shardProduceCode(t, b, t.r.orders, 200), 0);
+    ASSERT_EQ(t.alter(aName, pc::UserChangeKind::Disable), 0);          // A's session ended by a live change
+    ASSERT_TRUE(t.r.awaitSessionGone(a));
+    ASSERT_TRUE(t.r.c().disconnect(t.ch(), AuthRig::stream(), a2));     // A2's session ended by its own Disconnect
+    ASSERT_TRUE(t.r.awaitSessionGone(a2));
+    for (const int64_t spoofed : {a, a2, b + 1'000, int64_t{0}}) {
+        SCOPED_TRACE("spoofed session id " + std::to_string(spoofed));
+        const int64_t leo = leoOf(t, t.r.orders);
+        EXPECT_NE(shardProduceOnce(t, spoofed, t.r.orders, 2), 0) << "a produce naming a session id that is not B's";
+        EXPECT_EQ(leoOf(t, t.r.orders), leo) << "the spoofed produce was appended";
+    }
+    EXPECT_EQ(shardProduceOnce(t, b, t.r.orders), 0) << "B's own session is untouched";
+}
