@@ -23,6 +23,8 @@ option(BUILD_TESTING "Build tests" OFF)
 option(BUILD_BENCHMARKS "Build benchmarks" OFF)
 if(BUILD_TESTING)
     enable_testing()
+    # Issue #375: every gtest binary runs under its own TMPDIR root, removed at exit and swept when its owner is dead.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/RuneTestTmpRoot.cmake)
 endif()
 
 option(RUNE_BUILD_PROTOCOL "Build protocol/ (wire format, header-only + tests)" ON)

@@ -52,6 +52,9 @@ ctest --test-dir build -N | tail -1                      # how many tests are re
 - `broker/scripts/run-broker-tests.sh [build-dir]` is a two-tier runner: a wide `-j` for the fast tests, then the slow
   multi-node suites at `-j2` under a host-wide lock (`/tmp/rune-heavy.flock`), for a machine shared by several agents.
 - Logs: `<build>/Testing/Temporary/LastTest.log`; failing output with `--output-on-failure`.
+- Temp data: every gtest binary runs under its own `$TMPDIR/rune_t<pid>` root (`cmake/test_support/TestTmpRoot.cpp`),
+  removed at exit pass or fail; a killed run's root is swept by the next test binary. `RUNE_TEST_KEEP_TMP=1` keeps it.
+  Fixtures still remove their own `rune_*` / `cp*_` dirs as before; tests that hard-code `/tmp` bypass the root.
 - Expected duration: not recorded in the repository; the full suite is a long run (thousands of real-UDP tests), the
   regression script below prints per-stage wall times.
 

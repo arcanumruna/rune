@@ -161,11 +161,13 @@ public:
         node_->stop();
         node_.reset();
         startNode_();
+        loginsOkDone_ = 0;   // a fresh node: its logins-ok counter starts again at 0
         if (hadAdmin) {
             AuthWireClient& w = wire();
             const int64_t sid = w.connect(channel_);
             require(sid > 0, "admin reconnect");
             require(w.login(channel_, sid, "admin", {kAdminPassword, kAdminPassword}).ok(), "admin login after restart");
+            ++loginsOkDone_;
             admin_ = &w;
             adminSid_ = sid;
         }
@@ -221,6 +223,7 @@ public:
         require(s1 > 0, "admin connect");
         const auto login = w.login(channel_, s1, "admin", {kBootstrapPassword, kBootstrapPassword});
         require(login.ok() && login.mustChangePassword(), "the one-time password logs in and must be changed");
+        ++loginsOkDone_;
         const auto set = w.alterPassword(channel_, s1, "admin", pc::UserChangeKind::SetPassword, adminPassword);
         require(set.errorCode == 0, "admin SET PASSWORD: " + set.detail);
         admin_ = &w;
@@ -252,6 +255,10 @@ public:
         return *admin_;
     }
     [[nodiscard]] int64_t adminSession() const noexcept { return adminSid_; }
+    /// Successful logins the test rig itself performed on THIS node start (admin + AuthRig::login via noteLoginOk).
+    /// The CnC logins-ok counter is published asynchronously, so a rig that needs an exact baseline counts its own.
+    [[nodiscard]] int64_t loginsOkDone() const noexcept { return loginsOkDone_; }
+    void noteLoginOk() noexcept { ++loginsOkDone_; }
 
     // ── CnC counters ─────────────────────────────────────────────────────────────────────────────────────────
     [[nodiscard]] std::optional<int64_t> counter(std::int32_t typeId) const {
@@ -294,6 +301,7 @@ private:
     Options                                      opts_;
     NodeConfig                                   cfg_;
     std::filesystem::path                        dir_;
+    int64_t                                      loginsOkDone_ = 0;
     std::filesystem::path                        keyFile_;
     uint16_t                                     clientPort_ = 0;
     std::string                                  channel_, aeronDir_, ingressChannel_;
