@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 
 using namespace rune::node;
@@ -158,4 +159,46 @@ TEST(AuthGatesRegression, FullScramLoginMedianUnder5msRegression) {
     ::testing::Test::RecordProperty("login_p50_ms", std::to_string(p50));
     ::testing::Test::RecordProperty("login_p99_ms", std::to_string(p99));
     EXPECT_LE(p50, 5.0) << "median login must stay within the plan's 5 ms gate";
+}
+
+// Issue #136 (first-leg timing parity, D8): the first SCRAM leg (AuthClientFirst -> AuthServerFirst) must not reveal
+// whether the user exists - an unknown user is answered a fake salt and iteration count (derived, not looked up late),
+// so its answer takes as long as a known user's.  200 first legs (sendFinal = false), known and unknown interleaved
+// one by one on fresh sessions (each ended right after its leg, so no authentication deadline fires mid-run; the login
+// throttle cleared before each one, outside the timed region); the medians agree within max(20 %, 200 us).  Labelled
+// like the 5 ms gate beside it.
+TEST(AuthGatesRegression, FirstLegTimingDoesNotRevealUserExistenceRegression) {
+    AuthBroker b("firstleg");
+    b.bootstrapAdmin();
+    b.createUser("ws1", kPwA);
+    AuthWireClient& w = b.wire();
+    auto firstLeg = [&](const std::string& user) {
+        // Each abandoned first leg counts against the per-(user, source) login throttle (D14); the throttle is not what
+        // is measured here, so it is cleared before each leg - outside the timed region.
+        b.node().resetLoginThrottleForTest();
+        const int64_t sid = w.connect(b.channel());
+        EXPECT_GT(sid, 0);
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto l = w.login(b.channel(), sid, user, {kPwA, kPwA}, 0, /*sendFinal=*/false);
+        const auto t1 = std::chrono::steady_clock::now();
+        EXPECT_TRUE(l.first.has_value()) << user << ": no AuthServerFirst (AuthServerFinal " << l.errorCode() << ")";
+        (void)w.raw().disconnect(b.channel(), AuthWireClient::kClientStream, sid);
+        return std::chrono::duration<double, std::milli>(t1 - t0).count();
+    };
+    (void)firstLeg("ws1");      // warm the link and both code paths once
+    (void)firstLeg("nobody1");
+    std::vector<double> known, unknown;
+    for (int i = 0; i < 100; ++i) {
+        known.push_back(firstLeg("ws1"));
+        unknown.push_back(firstLeg("nobody" + std::to_string(i)));   // a different absent name each time
+        if (HasFailure()) return;
+    }
+    auto median = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+    const double mk = median(known), mu = median(unknown);
+    const double tolerance = std::max(0.2 * std::max(mk, mu), 0.2);
+    std::cout << "[ login ] 100 + 100 interleaved first legs: known median = " << mk << " ms, unknown median = " << mu
+              << " ms (tolerance " << tolerance << " ms)\n";
+    ::testing::Test::RecordProperty("first_leg_known_p50_ms", std::to_string(mk));
+    ::testing::Test::RecordProperty("first_leg_unknown_p50_ms", std::to_string(mu));
+    EXPECT_LE(std::abs(mk - mu), tolerance) << "the first leg's latency tells a known user from an unknown one";
 }
