@@ -1773,7 +1773,15 @@ if(BUILD_TESTING)
                                    ${CMAKE_BINARY_DIR}/rune-client/claim-gen)
         target_link_libraries(rune_client_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_client_broker_tests PROPERTIES TIMEOUT 600)
+        # The two login-timing measurements (the 5 ms median gate and the #136 first-leg parity) are latency gates:
+        # RUN_SERIAL + LABELS latency (CLAUDE.md §3: they run on an idle host, stage b of scripts/run-regression.sh); the
+        # rest of the binary is functional and runs in parallel.
+        set(RUNE_CLIENT_BROKER_LATENCY_TESTS
+            "AuthGatesRegression.FullScramLoginMedianUnder5msRegression:AuthGatesRegression.FirstLegTimingDoesNotRevealUserExistenceRegression")
+        gtest_discover_tests(rune_client_broker_tests TEST_FILTER "${RUNE_CLIENT_BROKER_LATENCY_TESTS}"
+                             PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE LABELS latency)
+        gtest_discover_tests(rune_client_broker_tests TEST_FILTER "-${RUNE_CLIENT_BROKER_LATENCY_TESTS}"
+                             PROPERTIES TIMEOUT 600)
 
         # Authentication Task 11: the SCRAM login in the session handshake against ONE real authenticating broker
         # (raw frames: AuthWireClient + the rune-crypto SCRAM client).
@@ -1802,6 +1810,14 @@ if(BUILD_TESTING)
                               GTest::gtest_main)
         gtest_discover_tests(rune_auth_matrix_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900 LABELS small)
         rune_regression_batches(rune_auth_matrix_tests 4)   # the 720 cells run in the *Regression* gate as 4 sharded batches
+
+        # Issue #276: the ownership dimension of the matrix (an id that belongs to another principal's session), its own
+        # table so the 720-cell table the stress test, the 3-node slice and the docker e2e share stays unchanged.
+        add_executable(rune_auth_ownership_tests tests/node/AuthOwnershipRegressionTest.cpp)
+        target_include_directories(rune_auth_ownership_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_auth_ownership_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
+                              GTest::gtest_main)
+        gtest_discover_tests(rune_auth_ownership_tests PROPERTIES TIMEOUT 600)
 
         # Authentication Task 13: shard-mode produce straight to the worker ingress against ONE real authenticating
         # broker (the worker's WRITE bitmaps shipped on the lifecycle ring) + the zero-allocation gates.

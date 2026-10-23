@@ -121,20 +121,27 @@ public:
     void bootstrapAdmin() {
         const auto deadline = Clock3::now() + std::chrono::seconds(60);
         bool done = false;
-        std::string lastErr = "none";
+        std::string attempts;   // every attempt (node, answer, when): the failure names the hop that did not answer
+        auto note = [&](int id, const std::string& what) {
+            attempts += " [+" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    Clock3::now() - (deadline - std::chrono::seconds(60))).count()) +
+                        " ms node " + std::to_string(id) + ": " + what + "]";
+        };
         while (!done && Clock3::now() < deadline) {
             for (int id : {1, 2, 3}) {
                 AuthWireClient& w = newWire(id);
                 const int64_t s0 = w.connect(channel(id));
-                if (s0 <= 0) continue;
+                if (s0 <= 0) { note(id, "no connect"); continue; }
                 // the cluster-key MAC is under node `id`'s key contents (all equal at bootstrap)
                 const auto b = w.bootstrap(channel(id), s0, keyContents(id), "admin", kBootstrapPassword);
+                // The bootstrap session never logs in: end it, or its authentication deadline counts a failed login.
+                (void)w.raw().disconnect(channel(id), AuthWireClient::kClientStream, s0);
                 if (b.errorCode == 0) { done = true; break; }
-                lastErr = "node " + std::to_string(id) + " code " + std::to_string(b.errorCode) + " " + b.detail;
+                note(id, "code " + std::to_string(b.errorCode) + " " + b.detail);
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         }
-        if (!done) throw std::runtime_error("AuthTrio: bootstrap never accepted: " + lastErr);
+        if (!done) throw std::runtime_error("AuthTrio: bootstrap never accepted:" + attempts);
         // first login (one-time password) on whichever broker applied it first, then set the real password
         const auto lg = Clock3::now() + std::chrono::seconds(30);
         bool changed = false;

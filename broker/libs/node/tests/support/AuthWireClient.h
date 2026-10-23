@@ -191,6 +191,9 @@ public:
         if (a->responseTemplate == static_cast<uint16_t>(pc::TemplateId::DdlResponse))
             if (auto d = cl_.awaitDdl(m.correlationId, deadline)) return *d;
         // Any other response type (PasswordChangeRequired answers in the DdlResponse; an ErrorResponse carries a message).
+        // An ErrorResponse never means success: one that carries code 0 (malformed) must not read as a bootstrap OK.
+        if (a->responseTemplate != static_cast<uint16_t>(pc::TemplateId::DdlResponse) && a->code == 0)
+            return {0xFFFE, 0, 0, -1, "an ErrorResponse with code 0: " + a->message};
         return {static_cast<uint16_t>(a->code), 0, 0, -1, a->message};
     }
     DdlAnswer createRole(const std::string& channel, int64_t sid, const std::string& name) {
@@ -302,8 +305,14 @@ public:
         b.resize(m.encode(b.data()));
         const auto deadline = Clock::now() + std::chrono::seconds{30};
         if (!cl_.send(channel, kClientStream, b.data(), b.size(), deadline)) return {0xFFFF, 0, 0, -1, "send failed"};
-        const auto d = cl_.awaitDdl(m.correlationId, deadline);
-        return d ? *d : DdlAnswer{0xFFFF, 0, 0, -1, "no answer"};
+        // Issue #403: ANY answer ends the wait - a follower answers the routed request with an ErrorResponse (Redirect /
+        // NotLeader), not a DdlResponse; waiting for a DdlResponse only burnt the whole 30 s on every non-leader, so a
+        // caller trying the brokers in turn (AuthTrio::bootstrapAdmin, 60 s) fitted two attempts when leadership moved.
+        const auto a = cl_.awaitAnyDdlAnswer(m.correlationId, deadline);
+        if (!a) return {0xFFFF, 0, 0, -1, "no answer"};
+        if (a->responseTemplate == static_cast<uint16_t>(pc::TemplateId::DdlResponse))
+            if (auto d = cl_.awaitDdl(m.correlationId, deadline)) return *d;
+        return {static_cast<uint16_t>(a->code), 0, 0, -1, a->message};
     }
 
     /// Task 19: every following securityDdl carries this request id (a retry of the SAME request after a leader kill);
