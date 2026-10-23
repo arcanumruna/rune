@@ -12,6 +12,7 @@
 //     every delivered record, the caught-up markers, ErrorResponses.
 // Single-threaded test fixture: plain members, no atomics.
 
+#include "support/TestNodeConfig.h"
 #include <rune/node/CatalogPartition.h>
 #include <rune/node/SecurityPartition.h>
 #include <rune/node/CatalogReadServer.h>
@@ -258,9 +259,10 @@ private:
                                                                std::unique_ptr<rune::storage::Log>& log, Mode m) {
         std::filesystem::remove_all(dir);
         std::filesystem::create_directories(dir);
-        log = std::make_unique<rune::storage::Log>(dir.string());
+        log = std::make_unique<rune::storage::Log>(dir.string(), kTestSegmentRollBytes);
         log->recover();
         NodeConfig nc;
+        boundTestSegments(nc);
         nc.nodeId = kSelf;
         const bool solo = m == Mode::Leader;
         rune::replication::PartitionConfig cfg = makeAdminLogPartitionConfig(nc, solo ? 1 : 2, topicId_);

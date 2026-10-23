@@ -49,7 +49,7 @@ TEST(ReadLeaseRegression, DriftMathShrinksAndGrowsByOnePlusRhoSquaredRegression)
     EXPECT_EQ(kReadLeaseFenceWaitNs, 204'020'000);
     // No overflow at the extremes, and shrink(grow(x)) <= x <= grow(shrink(x)) + rounding.
     EXPECT_GT(leaseShrinkByDrift(INT64_MAX), 0);
-    for (int64_t x : {int64_t{1}, int64_t{7}, 10'000 * kMs, 123'456'789'012LL}) {
+    for (int64_t x : {int64_t{1}, int64_t{7}, 10'000 * kMs, int64_t{123'456'789'012}}) {
         EXPECT_LE(leaseShrinkByDrift(leaseGrowByDrift(x)), x);
         EXPECT_GE(leaseGrowByDrift(leaseShrinkByDrift(x)) + 2, x);
     }

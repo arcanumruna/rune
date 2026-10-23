@@ -12,6 +12,7 @@
 //
 // Events come from rune::security::testing::goldenScriptV1() (16 events, 0..15).  Single-threaded: plain members.
 
+#include "support/TestNodeConfig.h"
 #include <rune/node/NodeConfig.h>
 #include <rune/node/SecurityApplier.h>
 #include <rune/node/SecurityPartition.h>
@@ -139,9 +140,10 @@ private:
     [[nodiscard]] std::filesystem::path securityDirPath_() const { return root_ / "__security"; }
 
     void open_() {
-        log_ = std::make_unique<rune::storage::Log>(securityDir());
+        log_ = std::make_unique<rune::storage::Log>(securityDir(), kTestSegmentRollBytes);
         log_->recover();
         NodeConfig nc;
+        boundTestSegments(nc);
         nc.nodeId = kSelf;
         rune::replication::PartitionConfig cfg = makeSecurityPartitionConfig(nc, 2);
         replica_ = std::make_unique<rune::replication::PartitionReplica>(

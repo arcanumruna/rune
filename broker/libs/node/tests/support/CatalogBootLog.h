@@ -16,6 +16,7 @@
 //   u/2 DropTopic t<i>   (no view reads them)                                     i in [3u/2, 2u)
 // Final: 3u/2 live topics + u/2 live views -> bootTopics = 2u; topic ids assigned = 4u -> droppedIds = 2u.
 
+#include "support/TestNodeConfig.h"
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/catalog/CatalogState.h>
 #include <rune/catalog/testing/GoldenScript.h>
@@ -88,10 +89,11 @@ inline CatalogBootLogShape writeCatalogBootLog(const std::filesystem::path& data
     const fs::path dir = dataDir / "__catalog";
     fs::create_directories(dir);
     {
-        rune::storage::Log log(dir.string());
+        rune::storage::Log log(dir.string(), kTestSegmentRollBytes);
         log.recover();
         if (log.logEndOffset() != 0) throw std::logic_error("writeCatalogBootLog: " + dir.string() + " is not empty");
         NodeConfig nc;
+        boundTestSegments(nc);
         nc.nodeId = 1;
         rune::replication::NullPartitionTransport transport;
         rune::replication::PartitionReplica rep(makeCatalogPartitionConfig(nc, 1), rune::replication::Role::Follower, 0,

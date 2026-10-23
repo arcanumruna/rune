@@ -97,6 +97,7 @@ public:
         std::filesystem::remove_all(dir_);
         std::filesystem::create_directories(dir_);
         NodeConfig cfg;
+        boundTestSegments(cfg);
         if (!opts_.shard) pinLegacyRuntime(cfg);
         cfg.nodeId = 0;
         cfg.dataDir = (dir_ / "broker").string();
