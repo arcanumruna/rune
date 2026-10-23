@@ -73,6 +73,10 @@ LoginThrottle::HashKey randomHashKey() {
 
 LoginThrottle::LoginThrottle() : LoginThrottle(randomHashKey()) {}
 
+void LoginThrottle::clear() noexcept {
+    for (std::vector<Entry>* t : {&pairs_, &hosts_, &users_, &known_}) std::fill(t->begin(), t->end(), Entry{});
+}
+
 LoginThrottle::Key LoginThrottle::hash_(char tag, std::string_view a, std::string_view b) const noexcept {
     // tag | a | NUL | b: the tag separates the tables, the NUL the two parts ("ab"+"c" never equals "a"+"bc").
     const std::string_view t(&tag, 1), nul("\0", 1);

@@ -1,8 +1,9 @@
 // AuthAllocRegressionTest.cpp - authentication Task 13 (hard rule 4): the authorization check adds ONE bitmask load to
 // the produce hot path and allocates nothing - on the gateway path (PermissionTable::allows) and on the shard worker
 // path (WriteGrantSlot, shipped over the lifecycle ring).  Replaces the global operator new (binary-wide), so it lives in
-// its own binary (rune_auth_alloc_regression_tests).
+// its own binary (rune_auth_alloc_regression_tests).  Issue #134 adds the consume push loop and the GetViewRow path.
 #include "support/GatewayProduceRig.h"
+#include "support/ViewReadRig.h"
 
 #include <rune/gateway/PermissionTable.h>
 #include <rune/gateway/SecurityView.h>
@@ -230,4 +231,103 @@ TEST(AuthAllocRegression, IdleAuthenticatedSessionAllocatesNothing) {
         for (int i = 0; i < 10'000; ++i) g.rig.pass();
     }
     EXPECT_EQ(gArmedAllocs, 0u) << "an idle gateway + worker with an authenticated session allocates nothing";
+}
+
+// Issue #134: the consume push loop of a Required-mode session.  READ is enforced at the Subscribe (gateway, cold) and by
+// the revoke that ends a subscription; the worker's push loop itself consults no permission, and must stay allocation-free
+// for a session that holds a shipped permission table (WorkerAuth: announced, table shipped and bound).  The gateway rig
+// cannot carry this arm: under Required mode a Subscribe without a per-session record egress (the rig has no Aeron) is
+// retired (issue #118), so the push runs over a real IPC egress publication on the worker.
+TEST(AuthAllocRegression, SteadyStateAuthorizedConsumeNeverAllocatesRegression) {
+    constexpr int32_t kRecords = 7503;
+    constexpr int kPushes = 10'000;
+    WorkerAuth w;
+    const int64_t preg = w.client->addExclusivePublication("aeron:ipc?term-length=16777216", kRecords);
+    const int64_t sreg = w.client->addSubscription("aeron:ipc", kRecords);
+    std::shared_ptr<aeron::ExclusivePublication> pub;
+    std::shared_ptr<aeron::Subscription> recs;
+    for (int i = 0; i < 200'000 && (!pub || !recs || !pub->isConnected()); ++i) {
+        w.pump();
+        if (!pub) pub = w.client->findExclusivePublication(preg);
+        if (!recs) recs = w.client->findSubscription(sreg);
+    }
+    ASSERT_TRUE(pub && recs && pub->isConnected()) << "IPC record egress not connected";
+    uint64_t frames = 0;
+    aeron::FragmentAssembler fa([&](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len, aeron::Header&) {
+        const auto r = pc::Records::decode(reinterpret_cast<const uint8_t*>(b.buffer() + off), static_cast<std::size_t>(len));
+        if (r && r->subscriptionId == 11 && !r->recordBatch.empty()) ++frames;
+    });
+    auto handler = fa.handler();
+    auto drain = [&] { w.pump(); while (recs->poll(handler, 256) > 0) {} };
+
+    WorkerOp op;
+    op.type = WorkerOp::Type::Subscribe;
+    op.subscriptionId = 11; op.sessionId = 5; op.correlationId = 77;
+    op.topicId = 1; op.partition = 0; op.nextOffset = 0;
+    op.logPtr = w.log.get(); op.replica = w.replica.get(); op.isolation = 0;
+    op.egressPub = pub.get();
+    ASSERT_TRUE(w.worker->tryEnqueueOp(std::move(op)));
+    for (int i = 0; i < 16; ++i) { w.step(); drain(); }
+
+    std::vector<uint8_t> batch;
+    { rune::protocol::RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000); batch = b.build(); }
+    auto pushStep = [&](uint64_t* allocs) {
+        int64_t base = 0;
+        (void)w.log->appendNoSyncRestamp(batch.data(), batch.size(), 0, base);
+        w.replica->onLeaderLogAppended();
+        if (allocs != nullptr) {
+            Arm arm;
+            (void)w.worker->doWork(w.now += 10'000);
+            *allocs += gArmedAllocs;
+        } else {
+            (void)w.worker->doWork(w.now += 10'000);
+        }
+        drain();
+    };
+    for (int i = 0; i < 64; ++i) pushStep(nullptr);   // warm-up: the cursor is in sync, buffers at their peak
+    const uint64_t warmFrames = frames;
+    ASSERT_GT(warmFrames, 0u) << "the warm-up pushed Records";
+    uint64_t allocs = 0;
+    for (int i = 0; i < kPushes; ++i) pushStep(&allocs);
+    for (int i = 0; i < 64; ++i) { (void)w.worker->doWork(w.now += 10'000); drain(); }
+    EXPECT_EQ(allocs, 0u) << "worker push loop: allocations across 10 000 pushes to an authenticated session";
+    EXPECT_GE(frames - warmFrames, static_cast<uint64_t>(kPushes) / 2) << "the pushes were delivered";
+    EXPECT_EQ(w.log->logEndOffset(), 64 + kPushes) << "every batch was appended";
+    recs.reset(); pub.reset();
+}
+
+// Issue #134: the GetViewRow path through the gateway in Required mode - the gate's session lookup and READ check on
+// the view's topic id (authorizeTopicIdHere_), then the worker serve - allocates nothing in steady state.
+TEST(AuthAllocRegression, SteadyStateAuthorizedViewRowNeverAllocatesRegression) {
+    using rune::node::test::GatewayViewReadRig;
+    constexpr int kReads = 10'000;
+    GatewayViewReadRig rig(GatewayViewReadRig::Mode::ServedHere, /*fillers=*/63);
+    rune::gateway::SecurityView view{rune::security::SecurityState{}};
+    rig.gw.setAuthMode(rune::gateway::GatewayAuthMode::Required, &view);
+    rune::gateway::ObjectIndex idx;
+    for (int32_t i = 0; i < 4096; ++i) idx.onTopic(i, "t" + std::to_string(i));
+    idx.onTopic(GatewayViewReadRig::kViewTopic, "char_hp");
+    const std::vector<rune::security::GrantSpec> grants = {
+        {rune::security::Operation::Read, {rune::security::ResourceType::Topic, rune::security::PatternKind::Exact, "char_hp"}}};
+    rig.gw.setSessionAuthForTest(rig.sid, rune::gateway::AuthAuthenticated{1, "vr1", rune::gateway::PermissionTable::compile(grants, idx)});
+    std::vector<std::vector<uint8_t>> frames;
+    frames.reserve(kReads + 64);
+    for (int i = 0; i < kReads + 64; ++i) frames.push_back(rig.getViewRowFrame(i + 1, /*key=*/7));
+    for (int i = 0; i < 64; ++i) ASSERT_TRUE(rig.readAndAwait(frames[static_cast<std::size_t>(i)])) << "warm-up read " << i;
+    bool all = true;
+    {
+        Arm arm;
+        for (int i = 64; i < kReads + 64; ++i) all = rig.readAndAwait(frames[static_cast<std::size_t>(i)]) && all;
+    }
+    EXPECT_EQ(gArmedAllocs, 0u) << "GetViewRow under Required: " << gArmedBytes << " bytes allocated by 10 000 authorized reads";
+    EXPECT_TRUE(all) << "every read was served OK";
+    EXPECT_EQ(rig.viewOk, static_cast<uint64_t>(kReads) + 64u);
+    EXPECT_EQ(rig.lastHp, 70);
+
+    // non-vacuity: the gate is live - a session without READ on the view is refused
+    rig.gw.setSessionAuthForTest(rig.sid, rune::gateway::AuthAuthenticated{1, "vr1", rune::gateway::PermissionTable::compile({}, idx)});
+    const uint64_t okBefore = rig.viewOk;
+    rig.read(rig.getViewRowFrame(900'000, 7));
+    for (int i = 0; i < 8; ++i) rig.pass();
+    EXPECT_EQ(rig.viewOk, okBefore) << "a session without READ is not served";
 }

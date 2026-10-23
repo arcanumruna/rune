@@ -483,6 +483,15 @@ public:
         permissionShipper_.setHoldForTest(on);
         if (!on) (void)servicePermissionShippingWork_();
     }
+    /// Issue #189 test seam (control thread): forget every login-throttle entry (no allocation).
+    void resetLoginThrottleForTest() noexcept { loginThrottle_.clear(); }
+    /// Issues #188 / #5 test seam (control thread): while held, pending record-egress resolves are not polled (a
+    /// Subscribe stays AwaitingEgress).  Releasing restarts every pending resolve's timeout clock at now, so a held
+    /// resolve never times out to the fallback.
+    void holdRecordEgressResolveForTest(bool on) noexcept {
+        holdRecordEgressResolve_ = on;
+        if (!on) for (auto& [key, pend] : pendingRecordEgress_) pend.requestedAtNs = nowNs_;
+    }
     /// Issue #259 test seam: authenticate `sid` as `userId` holding exactly `grants` (sorted, unique) - through the pool
     /// and the shipper, as a login does.
     void authenticateWithGrantsForTest(int64_t sid, uint64_t userId, std::vector<rune::security::GrantSpec> grants) {
@@ -2466,6 +2475,7 @@ private:
     [[nodiscard]] std::optional<rune::gateway::Denial> authorizeViewSources_(const Session& session, const uint8_t* blob,
                                                                               std::size_t len) const;
     rune::gateway::LoginThrottle loginThrottle_;
+    bool holdRecordEgressResolve_ = false;   ///< test seam (#188 / #5): pollPendingRecordEgress_ skips while set
     int64_t  authTimeoutNs_ = 10'000'000'000LL;
     uint64_t loginsOk_ = 0, loginsFailed_ = 0, loginsRateLimited_ = 0, loginsAbandoned_ = 0;
     // ── authentication Task 14: live security changes ──

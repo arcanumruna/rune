@@ -352,17 +352,7 @@ public:
     /// subscription the broker registered although it refused it).
     [[nodiscard]] std::size_t strayRecords() const {
         std::size_t n = 0;
-        for (const PushedRecords& p : records_) {
-            bool granted = false;
-            for (const auto& [corr, code] : subscribes_) {
-                if (code != 0) continue;
-                if (const auto it = subscribeIds_.find(corr); it != subscribeIds_.end() && it->second == p.subscriptionId) {
-                    granted = true;
-                    break;
-                }
-            }
-            n += granted ? 0 : 1;
-        }
+        for (const PushedRecords& p : records_) n += knowsSubscriptionId(p.subscriptionId) ? 0 : 1;
         return n;
     }
     /// Forget the last ConnectResponse, then wait for the next one (a machine that sent its own ConnectRequest through
@@ -730,6 +720,13 @@ public:
         std::vector<uint8_t> buf(m.encodedSize());
         const std::size_t len = m.encode(buf.data());
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+    /// Issue #188: whether any SubscribeResponse OK this client received carried `subId` (a Record of any other id is a
+    /// subscription the client was never told exists).
+    bool knowsSubscriptionId(int64_t subId) const {
+        for (const auto& [corr, id] : subscribeIds_)
+            if (id == subId) if (const auto c = subscribes_.find(corr); c != subscribes_.end() && c->second == 0) return true;
+        return false;
     }
     /// The subscriptionId a SubscribeResponse on `corr` carried (nullopt: none seen yet).
     std::optional<int64_t> subscriptionIdOf(int64_t corr) const {

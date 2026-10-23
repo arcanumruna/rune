@@ -8,6 +8,9 @@
 //     end-to-end shape.
 #include "support/AuthRig.h"
 
+#include <algorithm>
+#include <random>
+
 using namespace rune::node;
 using namespace rune::node::test;
 using namespace rune::node::test::grants;
@@ -174,3 +177,212 @@ void subscribeRacingRevokeStaysEnded(bool shard, const char* tag) {
 
 TEST(AuthDdlAnswerStallRegression, SubscribeRacingRevokeStaysEndedShard) { subscribeRacingRevokeStaysEnded(true, "racesh"); }
 TEST(AuthDdlAnswerStallRegression, SubscribeRacingRevokeStaysEndedGateway) { subscribeRacingRevokeStaysEnded(false, "racegw"); }
+
+namespace {
+// Issue #188: a Subscribe still AwaitingEgress (the gateway's record-egress resolve is HELD) is ended by a REVOKE READ; once
+// the hold is released, that subscription must never deliver a Record, whatever its offset (a zombie replays from 0, below
+// any log-end bound).  Gateway mode has no worker record egress to wait for: the Subscribe is served at once, so there the
+// check is that nothing arrives after the end (also with new records produced).
+void endedSubscriptionNeverPushesAgain(bool shard, const char* tag) {
+    AuthBroker::Options o; o.shard = shard;
+    AuthRig rig(tag, o);
+    Async a{rig};
+    auto& c = rig.c();
+    const int64_t ws = rig.newUser({exact(SO::Write, ST::Topic, "orders")});
+    for (int i = 0; i < 3; ++i) ASSERT_EQ(rig.produce(ws, rig.orders, i == 0), 0);
+    std::string reader;
+    const int64_t rs = rig.newUser({exact(SO::Read, ST::Topic, "orders")}, &reader);
+    const std::size_t recordsBefore = c.records().size();
+    rig.broker().node().holdRecordEgressResolveForTest(true);
+    const int64_t corr = c.sendSubscribe(rig.ch(), rig.stream(), rs, rig.orders, 0);
+    ASSERT_NE(corr, 0);
+    c.pollFor(100ms, [] { return false; });
+    if (shard) EXPECT_FALSE(c.subscriptionIdOf(corr).has_value()) << "the Subscribe OK waits for the held record egress";
+    pc::SecurityDdl m; m.kind = pc::SecurityOpKind::Revoke; m.name = reader; m.granteeKind = 0;
+    m.op = static_cast<uint8_t>(SO::Read); m.resourceType = static_cast<uint8_t>(ST::Topic);
+    m.patternKind = static_cast<uint8_t>(SP::Exact); m.pattern = "orders";
+    const int64_t rc = a.send(m, "REVOKE ...;");
+    ASSERT_EQ(a.answer(rc), 0);
+    rig.broker().node().holdRecordEgressResolveForTest(false);
+    const auto code = c.awaitSubscribeCode(corr, AuthRig::dl());
+    ASSERT_TRUE(code.has_value()) << "the Subscribe was answered";
+    c.pollFor(200ms, [] { return false; });
+    const int64_t subId = c.subscriptionIdOf(corr).value_or(0);
+    const auto delivered = [&] {   // no other subscription lives on `c`: with no sub id, every new Record counts
+        std::size_t n = 0;
+        for (std::size_t i = recordsBefore; i < c.records().size(); ++i) n += (subId == 0 || c.records()[i].subscriptionId == subId) ? 1 : 0;
+        return n;
+    };
+    const std::size_t atEnd = delivered();
+    if (shard) {
+        // the broker ends the race by answering the held Subscribe itself (PR #596 review: asserted, not only printed)
+        EXPECT_TRUE(*code == 45 || *code == 46) << "the held Subscribe answered " << *code << ", expected 45/46";
+        EXPECT_EQ(atEnd, 0u) << "the subscription never reached a worker, yet delivered (subscribe answered " << *code << ")";
+    }
+    for (int i = 0; i < 3; ++i) ASSERT_EQ(rig.produce(ws, rig.orders), 0);
+    c.pollFor(400ms, [] { return false; });
+    EXPECT_EQ(delivered(), atEnd) << "the revoked subscription (subscribe answered " << *code << ", sub id " << subId
+                                  << ") delivered records after its end";
+}
+}  // namespace
+
+TEST(AuthStressRegression, EndedSubscriptionNeverPushesAgainRegression) {
+    for (const bool shard : {true, false}) {
+        SCOPED_TRACE(shard ? "shard" : "gateway");
+        endedSubscriptionNeverPushesAgain(shard, shard ? "nevsh" : "nevgw");
+        if (HasFatalFailure()) return;
+    }
+}
+
+// ── Adversarial review of PR #596 (issues #188 / #5): a Subscribe parked AwaitingEgress (the gateway's record-egress
+// resolve held) against every way its principal can lose READ before the resolve completes, in a seeded order.  The
+// invariant for every round: the Subscribe is answered; an answer other than OK is 45/46; no Record ever arrives for a
+// subscription id the client never got an OK for (a zombie worker cursor); a subscription answered OK then ended
+// (ErrorResponse 45/46) delivers nothing after its end, also with new records produced.  At the end an unheld
+// Subscribe of a fresh reader delivers (the path stays live, so the silence above is not vacuous).
+namespace {
+enum class HeldVariant { RevokeAnswered, ReleaseBeforeRevokeAnswer, RevokeThenReGrant, SubscribeTwice, Disable, Disconnect };
+const char* variantName(HeldVariant v) {
+    switch (v) {
+        case HeldVariant::RevokeAnswered: return "revoke-answered";
+        case HeldVariant::ReleaseBeforeRevokeAnswer: return "release-before-revoke-answer";
+        case HeldVariant::RevokeThenReGrant: return "revoke-then-regrant";
+        case HeldVariant::SubscribeTwice: return "subscribe-twice";
+        case HeldVariant::Disable: return "disable";
+        case HeldVariant::Disconnect: return "disconnect";
+    }
+    return "?";
+}
+pc::SecurityDdl readDdl(pc::SecurityOpKind k, const std::string& who) {
+    pc::SecurityDdl m; m.kind = k; m.name = who; m.granteeKind = 0;
+    m.op = static_cast<uint8_t>(SO::Read); m.resourceType = static_cast<uint8_t>(ST::Topic);
+    m.patternKind = static_cast<uint8_t>(SP::Exact); m.pattern = "orders";
+    return m;
+}
+}  // namespace
+
+TEST(AuthDdlAnswerStallRegression, HeldSubscribeLosingReadEveryWayNeverPushesAdversarialRegression) {
+    constexpr uint64_t kSeed = 0x596A'D5E1ull;
+    SCOPED_TRACE("seed " + std::to_string(kSeed));
+    std::mt19937_64 rng(kSeed);
+    std::vector<HeldVariant> plan;
+    for (int rep = 0; rep < 2; ++rep)
+        for (HeldVariant v : {HeldVariant::RevokeAnswered, HeldVariant::ReleaseBeforeRevokeAnswer, HeldVariant::RevokeThenReGrant,
+                              HeldVariant::SubscribeTwice, HeldVariant::Disable, HeldVariant::Disconnect})
+            plan.push_back(v);
+    std::shuffle(plan.begin(), plan.end(), rng);
+
+    AuthBroker::Options o; o.shard = true;
+    AuthRig rig("advheld", o);
+    Async a{rig};
+    auto& c = rig.c();
+    auto& node = rig.broker().node();
+    const int64_t ws = rig.newUser({exact(SO::Write, ST::Topic, "orders")});
+    ASSERT_EQ(rig.produce(ws, rig.orders, true), 0);
+    const auto zombies = [&] {   // Records for an id no Subscribe OK of this client named
+        std::size_t n = 0;
+        for (const auto& p : c.records()) n += c.knowsSubscriptionId(p.subscriptionId) ? 0 : 1;
+        return n;
+    };
+    for (std::size_t round = 0; round < plan.size(); ++round) {
+        const HeldVariant v = plan[round];
+        SCOPED_TRACE("round " + std::to_string(round) + " " + variantName(v));
+        std::string reader;
+        const int64_t rs = rig.newUser({exact(SO::Read, ST::Topic, "orders")}, &reader);
+        node.holdRecordEgressResolveForTest(true);
+        std::vector<int64_t> corrs{c.sendSubscribe(rig.ch(), rig.stream(), rs, rig.orders, 0)};
+        if (v == HeldVariant::SubscribeTwice) corrs.push_back(c.sendSubscribe(rig.ch(), rig.stream(), rs, rig.orders, 0));
+        for (int64_t corr : corrs) ASSERT_NE(corr, 0);
+        c.pollFor(50ms, [] { return false; });
+        const bool sessionEnds = v == HeldVariant::Disable || v == HeldVariant::Disconnect;
+        switch (v) {
+            case HeldVariant::RevokeAnswered:
+            case HeldVariant::SubscribeTwice:
+                ASSERT_EQ(a.answer(a.send(readDdl(pc::SecurityOpKind::Revoke, reader), "REVOKE ...;")), 0);
+                node.holdRecordEgressResolveForTest(false);
+                break;
+            case HeldVariant::ReleaseBeforeRevokeAnswer: {
+                const int64_t rc = a.send(readDdl(pc::SecurityOpKind::Revoke, reader), "REVOKE ...;");
+                node.holdRecordEgressResolveForTest(false);   // the resolve completes while the revoke is in flight
+                ASSERT_EQ(a.answer(rc), 0);
+                break;
+            }
+            case HeldVariant::RevokeThenReGrant:
+                ASSERT_EQ(a.answer(a.send(readDdl(pc::SecurityOpKind::Revoke, reader), "REVOKE ...;")), 0);
+                ASSERT_EQ(a.answer(a.send(readDdl(pc::SecurityOpKind::Grant, reader), "GRANT ...;")), 0);
+                node.holdRecordEgressResolveForTest(false);
+                break;
+            case HeldVariant::Disable:
+                ASSERT_EQ(a.answer(a.alter(reader, pc::UserChangeKind::Disable)), 0);
+                node.holdRecordEgressResolveForTest(false);
+                EXPECT_TRUE(rig.awaitSessionGone(rs)) << "a disabled user's session is closed";
+                break;
+            case HeldVariant::Disconnect:
+                ASSERT_TRUE(c.disconnect(rig.ch(), rig.stream(), rs));
+                EXPECT_TRUE(rig.awaitSessionGone(rs)) << "the disconnected session is gone";
+                node.holdRecordEgressResolveForTest(false);
+                break;
+        }
+        std::vector<int64_t> endedIds;
+        for (int64_t corr : corrs) {
+            const auto code = c.awaitSubscribeCode(corr, sessionEnds ? AuthRig::dl(1) : AuthRig::dl());
+            if (!sessionEnds) ASSERT_TRUE(code.has_value()) << "the held Subscribe " << corr << " was answered";
+            if (!code) continue;
+            if (*code != 0) {
+                EXPECT_TRUE(*code == 45 || *code == 46) << "the held Subscribe answered " << *code << ", expected 45/46";
+                continue;
+            }
+            // answered OK: the release won the race; the end must follow, and it must be the last word
+            if (!sessionEnds) {
+                EXPECT_TRUE(c.pollUntil([&] { for (const auto& e : c.errors()) if (e.correlationId == corr && (e.code == 45 || e.code == 46)) return true; return false; }))
+                    << "a subscription answered OK after its READ was revoked was never ended";
+            }
+            endedIds.push_back(c.subscriptionIdOf(corr).value_or(0));
+        }
+        c.pollFor(200ms, [] { return false; });
+        const auto pushesOf = [&](int64_t id) { std::size_t n = 0; for (const auto& p : c.records()) n += p.subscriptionId == id ? 1 : 0; return n; };
+        std::vector<std::size_t> atEnd;
+        for (int64_t id : endedIds) atEnd.push_back(pushesOf(id));
+        for (int i = 0; i < 3; ++i) ASSERT_EQ(rig.produce(ws, rig.orders), 0);
+        c.pollFor(300ms, [] { return false; });
+        EXPECT_EQ(zombies(), 0u) << "Records for a subscription the client never got an OK for (a zombie worker cursor)";
+        for (std::size_t k = 0; k < endedIds.size(); ++k)
+            EXPECT_EQ(pushesOf(endedIds[k]), atEnd[k]) << "ended subscription " << endedIds[k] << " delivered after its end";
+        if (HasFailure()) return;
+    }
+    // liveness (non-vacuity): with nothing held, a fresh reader's subscription is bound and delivers
+    const int64_t live = rig.newUser({exact(SO::Read, ST::Topic, "orders")});
+    const int64_t corr = c.sendSubscribe(rig.ch(), rig.stream(), live, rig.orders, 0);
+    ASSERT_EQ(c.awaitSubscribeCode(corr, AuthRig::dl()).value_or(-1), 0);
+    const int64_t id = c.subscriptionIdOf(corr).value_or(0);
+    EXPECT_TRUE(c.pollUntil([&] { for (const auto& p : c.records()) if (p.subscriptionId == id) return true; return false; }))
+        << "an unheld subscription delivers";
+}
+
+// Adversarial review of PR #596 (#134, the GetViewRow READ gate): READ on a view revoked while the session is open is
+// enforced on that same session from the revoke's answer on, a re-grant restores it, and a DISABLE closes the session -
+// in shard and gateway modes.  (The alloc gate swaps a test-only permission table; this drives the real revoke.)
+namespace {
+void viewReadRevokedMidSession(bool shard, const char* tag) {
+    AuthBroker::Options o; o.shard = shard;
+    AuthRig rig(tag, o);
+    auto& adm = rig.broker().admin();
+    std::string name;
+    const int64_t s = rig.newUser({exact(SO::Read, ST::View, "board")}, &name);
+    for (int round = 0; round < 3; ++round) {
+        SCOPED_TRACE("round " + std::to_string(round));
+        const int before = rig.getViewRow(s, rig.board);
+        ASSERT_NE(before, kNoAnswer);
+        EXPECT_NE(before, kNotAuthorized) << "READ VIEW held: the read is served";
+        ASSERT_EQ(adm.revoke(rig.ch(), rig.broker().adminSession(), name, false, SO::Read, ST::View, SP::Exact, "board").errorCode, 0);
+        EXPECT_EQ(rig.getViewRow(s, rig.board), kNotAuthorized) << "the read after an answered REVOKE READ VIEW is refused";
+        ASSERT_EQ(adm.grant(rig.ch(), rig.broker().adminSession(), name, false, SO::Read, ST::View, SP::Exact, "board").errorCode, 0);
+    }
+    EXPECT_NE(rig.getViewRow(s, rig.board), kNotAuthorized) << "re-granted READ VIEW: the read is served again";
+    ASSERT_EQ(adm.alterPassword(rig.ch(), rig.broker().adminSession(), name, pc::UserChangeKind::Disable).errorCode, 0);
+    EXPECT_TRUE(rig.awaitSessionGone(s)) << "a disabled user's session is closed";
+}
+}  // namespace
+
+TEST(AuthDdlAnswerStallRegression, ViewReadRevokedMidSessionIsRefusedShardAdversarialRegression) { viewReadRevokedMidSession(true, "advvrsh"); }
+TEST(AuthDdlAnswerStallRegression, ViewReadRevokedMidSessionIsRefusedGatewayAdversarialRegression) { viewReadRevokedMidSession(false, "advvrgw"); }
