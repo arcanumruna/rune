@@ -3320,14 +3320,15 @@ TEST_F(GroupJoinLateTopic, UnassignedJoinTopicsAreBoundedPerGroupRegression) {
 TEST_F(GroupJoinLateTopic, ALateTopicOnANodeNoLongerCoordinatorNeverRebalancesAdversarialRegression) {
     const std::string g = "g-late-excoord";
     (void)stableWithUnknownLate(g);
-    auto& gc = service_->coordinator(g);
-    const int32_t gen = gc.generationId();
+    ASSERT_EQ(service_->groupCountForTest(), 1u);
     isLeader_     = false;
     leaderNodeId_ = 42;
     createLate();
+    // #565: an ex-coordinator unloads its groups (the reference to the group dies here), so nothing is left to
+    // rebalance, and the late id's pending state goes with the group.
     for (int i = 0; i < 50; ++i) { clock_ += kStep; service_->doWork(clock_); }
-    EXPECT_EQ(gc.generationId(), gen) << "only the coordinator may rebalance a group";
-    EXPECT_EQ(gc.state(), GroupState::Stable);
+    EXPECT_EQ(service_->groupCountForTest(), 0u) << "only the coordinator may hold (and rebalance) a group";
+    EXPECT_EQ(service_->unassignedJoinTopicsForTest(g), 0u);
 }
 
 // #19 sibling (catalog lag): the id a join named arrives here as a VIEW SINK.  The group must rebalance so the
@@ -3625,4 +3626,333 @@ TEST_F(GroupAuthRegression, ATopicReadEvictionMidRebalanceCompletesItWithoutTheM
     const auto o = service_->handleHeartbeat(req_, n, clock_, out_, kBufSize);
     ASSERT_GT(o, 0u);
     EXPECT_EQ(decodeHBErrorCode(out_, o), static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+}
+
+// ===========================================================================
+// #565: a node that loses the coordinator role keeps no group.  Before the fix its in-memory groups kept ageing on
+// the duty cycle (heartbeats now go to the new coordinator): every member expired, the generation bumped and the
+// members' push subscriptions were revoked with empty Assign frames - from a node that no longer coordinates them.
+// The fix unloads the groups (Kafka-style) the first duty cycle this node is not the coordinator; a regained role
+// rebuilds each group by re-join (membership is never persisted).  RED (remove the unload line in doWork): the
+// stale group stays (groupCountForTest()==1), expires its member and revokes / sends Assign frames.
+// ===========================================================================
+namespace {
+pc::JoinGroupResponse joinOn(GroupCoordinationService& svc, uint8_t* req, uint8_t* out, std::size_t cap, int64_t sid,
+                             int64_t corr, std::string_view group, std::string_view member, int64_t now,
+                             std::string& memberOut) {
+    pc::JoinGroup msg;
+    msg.sessionId = sid; msg.correlationId = corr; msg.sessionTimeoutMs = 5000;
+    msg.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+    msg.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(member.data()), member.size());
+    const std::array<int32_t, 1> topics{kTestTopicId};
+    const std::size_t n = msg.encode(req, std::span<const int32_t>(topics));
+    const std::size_t o = svc.handleJoinGroup(req, n, pc::kClientVersion, now, out, cap);
+    auto r = pc::JoinGroupResponse::decode(out, o);
+    EXPECT_TRUE(r.has_value());
+    if (!r) return {};
+    memberOut.assign(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size());
+    return *r;
+}
+}  // namespace
+
+TEST_F(GroupJoinAdversarial, AStaleGroupOnAnExCoordinatorNeverRebalancesRegression) {
+    const std::string g = "g565";
+    const std::string member = stableMember(g);
+    const int32_t gen = service_->coordinator(g).generationId();
+    ASSERT_EQ(service_->groupCountForTest(), 1u);
+
+    // The role moves to node 42.  The `coordinator(g)` reference is NOT used after this point (unloaded).
+    isLeader_     = false;
+    leaderNodeId_ = 42;
+    for (int i = 0; i < 7000; ++i) { clock_ += kStep; service_->doWork(clock_); }   // > the 5 s session timeout
+    EXPECT_EQ(service_->groupCountForTest(), 0u) << "an ex-coordinator keeps no group";
+
+    // Every handler answers NotCoordinator and creates no group.
+    EXPECT_EQ(joinAs({kTestTopicId}, g, member).code, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    EXPECT_EQ(decodeHBErrorCode(out_, service_->handleHeartbeat(req_, encodeHeartbeat(req_, 1, ++corr_, g, member, gen),
+                                                               clock_, out_, kBufSize)),
+              static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    EXPECT_EQ(decodeSyncErrorCode(out_, service_->handleSyncGroup(req_, encodeSyncGroup(req_, 1, ++corr_, g, member, gen),
+                                                                 clock_, out_, kBufSize)),
+              static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    EXPECT_EQ(decodeLeaveErrorCode(out_, service_->handleLeaveGroup(req_, encodeLeaveGroup(req_, 1, ++corr_, g, member),
+                                                                   clock_, out_, kBufSize)),
+              static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+    (void)service_->handleOffsetFetch(req_, encodeOffsetFetch(req_, 1, ++corr_, g, kTestTopicId, 0), clock_, out_, kBufSize);
+    (void)service_->handleOffsetCommit(req_, encodeOffsetCommit(req_, 1, ++corr_, g, member, gen, kTestTopicId, 0, 1),
+                                       clock_, out_, kBufSize);
+    for (int i = 0; i < 10; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    EXPECT_EQ(service_->groupCountForTest(), 0u) << "a refused request created a group on a non-coordinator";
+
+    // The role comes back: the old member is unknown (its client re-joins) and a re-join rebuilds the group.
+    isLeader_     = true;
+    leaderNodeId_ = kLeader;
+    clock_ += kStep;
+    service_->doWork(clock_);
+    EXPECT_EQ(decodeHBErrorCode(out_, service_->handleHeartbeat(req_, encodeHeartbeat(req_, 1, ++corr_, g, member, gen),
+                                                               clock_, out_, kBufSize)),
+              static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+    const std::string fresh = stableMember(g);
+    EXPECT_NE(fresh, member);
+    EXPECT_EQ(service_->coordinator(g).state(), GroupState::Stable);
+    EXPECT_EQ(service_->coordinator(g).memberCount(), 1u);
+    EXPECT_EQ(service_->coordinator(g).generationId(), gen) << "the group is rebuilt from scratch, not the stale one";
+}
+
+// #565 with the push path wired: the unload ends the bound session's group push subscriptions (stale deliveries stop)
+// and sends NO Assign frame (the member learns NotCoordinator on its next request).  RED (no unload): the subscription
+// survives and, once the stale member expires, an empty Assign frame is sent from the ex-coordinator.
+TEST_F(GroupJoinAdversarial, AnExCoordinatorSendsNoAssignOnUnloadButEndsPushSubscriptionsRegression) {
+    rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(
+        [](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    gw.setTopicRegistry(registry_.get());
+    gw.setNodeIdForTest(kLeader);
+    std::vector<rune::metadata::RoutingImage::BuildEntry> img;
+    for (int32_t p = 0; p < 2; ++p) img.push_back({rune::metadata::gpidOf(kTestTopicId, p), kLeader, 1});
+    gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build(img, rune::metadata::RoutingImage::Source::Committed));
+    int controlFrames = 0;
+    gw.setOnControlFrame([&](int64_t, const uint8_t*, std::size_t) { ++controlFrames; });
+    service_->setGateway(&gw);
+
+    const int64_t sid = gw.injectTestSession(clock_);
+    const std::string g = "g565-push";
+    std::string member;
+    ASSERT_EQ(joinOn(*service_, req_, out_, kBufSize, sid, ++corr_, g, "", clock_, member).errorCode, 0);
+    std::string again;
+    ASSERT_EQ(joinOn(*service_, req_, out_, kBufSize, sid, ++corr_, g, member, clock_, again).errorCode, 0);
+    ASSERT_TRUE(driveUntil([&] { return service_->coordinator(g).state() == GroupState::Stable; }, 10));
+    ASSERT_GT(gw.addGroupSubscription(sid, kTestTopicId, 0, 0, 0), 0) << "the rig needs one group push subscription";
+    ASSERT_EQ(gw.groupMemberSubCount(sid), 1u);
+
+    controlFrames = 0;
+    isLeader_     = false;
+    leaderNodeId_ = 42;
+    for (int i = 0; i < 7000; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    EXPECT_EQ(service_->groupCountForTest(), 0u);
+    EXPECT_EQ(gw.groupMemberSubCount(sid), 0u) << "the stale member's group push subscription must end";
+    EXPECT_EQ(controlFrames, 0) << "an ex-coordinator sends no Assign frame";
+    service_->setGateway(nullptr);
+}
+
+// #565 bug class: the session-revoke / eviction entry points iterate the groups.  On an ex-coordinator (unloaded)
+// they touch nothing and never crash.  RED (no unload): the stale group is still there.
+TEST_F(GroupJoinAdversarial, ASessionRevokeOnAnExCoordinatorTouchesNoGroupRegression) {
+    (void)stableMember("g565-a");
+    (void)stableMember("g565-b");
+    ASSERT_EQ(service_->groupCountForTest(), 2u);
+    isLeader_     = false;
+    leaderNodeId_ = 42;
+    clock_ += kStep;
+    service_->doWork(clock_);
+    ASSERT_EQ(service_->groupCountForTest(), 0u);
+    service_->removeSessionMembers(1, clock_);
+    service_->evictSessionMembers(1, clock_);
+    service_->evictMember("g565-a", "", 1, clock_);
+    std::string_view refused = kTestTopic;
+    EXPECT_EQ(service_->removeUnauthorizedMembers(1, clock_, {&readAnyGroup, &refused, &readAllTopicsBut}), 0);
+    EXPECT_EQ(service_->onTopicDropped(kTestTopic, clock_), 0u);
+    for (int i = 0; i < 100; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    EXPECT_EQ(service_->groupCountForTest(), 0u);
+}
+
+// #565 timing: a leadership flap of ONE duty cycle.  The member's Heartbeat / SyncGroup is UnknownMember (its client
+// re-joins with an empty id) and the re-join converges to Stable within a capped drive.  RED (no unload): the stale
+// group survives the flap and the old member's heartbeat is OK - a group the new term never rebuilt.
+TEST_F(GroupJoinAdversarial, ALeadershipFlapRebuildsTheGroupByRejoinRegression) {
+    const std::string g = "g565-flap";
+    const std::string member = stableMember(g);
+    const int32_t gen = service_->coordinator(g).generationId();
+    isLeader_ = false;
+    clock_ += kStep;
+    service_->doWork(clock_);
+    isLeader_ = true;
+    clock_ += kStep;
+    service_->doWork(clock_);
+    EXPECT_EQ(decodeHBErrorCode(out_, service_->handleHeartbeat(req_, encodeHeartbeat(req_, 1, ++corr_, g, member, gen),
+                                                               clock_, out_, kBufSize)),
+              static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+    EXPECT_EQ(decodeSyncErrorCode(out_, service_->handleSyncGroup(req_, encodeSyncGroup(req_, 1, ++corr_, g, member, gen),
+                                                                 clock_, out_, kBufSize)),
+              static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+    const auto first = joinAs({kTestTopicId}, g);
+    ASSERT_EQ(first.code, static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_EQ(joinAs({kTestTopicId}, g, first.memberId).code, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_TRUE(driveUntil([&] { return service_->coordinator(g).state() == GroupState::Stable; }, 50));
+    EXPECT_EQ(service_->coordinator(g).memberCount(), 1u);
+}
+
+// ===========================================================================
+// PR #569 adversarial review (#565 area: the group coordinator's lifecycle across a leadership change).  Each test
+// drives the public handlers / entry points; RED with the unload line in doWork removed (noted per test).
+// ===========================================================================
+
+// Leadership is lost while the group is mid-rebalance (PreparingRebalance: a second member joined, the first has not
+// re-joined).  On regain no stale member survives: the old ids are unknown, an old id is never adopted on re-join, and
+// both clients' re-joins converge to a fresh Stable group.  RED (no unload): the old member's Heartbeat is answered
+// RebalanceInProgress by the stale group (it was never rebuilt).
+TEST_F(GroupJoinAdversarial, AnUnloadMidPreparingRebalanceRebuildsTheGroupOnRegainAdversarialRegression) {
+    const std::string g = "g565-prep";
+    const std::string m1 = stableMember(g);   // session 1
+    const int32_t gen1 = service_->coordinator(g).generationId();
+    std::string m2;
+    ASSERT_EQ(joinOn(*service_, req_, out_, kBufSize, /*sid=*/2, ++corr_, g, "", clock_, m2).errorCode, 0);
+    ASSERT_EQ(service_->coordinator(g).state(), GroupState::PreparingRebalance);
+    const int32_t gen2 = service_->coordinator(g).generationId();
+
+    isLeader_ = false; leaderNodeId_ = 42;
+    clock_ += kStep;
+    service_->doWork(clock_);
+    ASSERT_EQ(service_->groupCountForTest(), 0u);
+    isLeader_ = true; leaderNodeId_ = kLeader;
+    clock_ += kStep;
+    service_->doWork(clock_);
+
+    for (int32_t gen : {gen1, gen2}) {
+        EXPECT_EQ(decodeHBErrorCode(out_, service_->handleHeartbeat(req_, encodeHeartbeat(req_, 1, ++corr_, g, m1, gen),
+                                                                   clock_, out_, kBufSize)),
+                  static_cast<int16_t>(pc::ErrorCode::UnknownMember)) << "gen " << gen;
+        EXPECT_EQ(decodeSyncErrorCode(out_, service_->handleSyncGroup(req_, encodeSyncGroup(req_, 2, ++corr_, g, m2, gen),
+                                                                     clock_, out_, kBufSize)),
+                  static_cast<int16_t>(pc::ErrorCode::UnknownMember)) << "gen " << gen;
+    }
+    // Both clients re-join with their old ids: each gets a fresh id (an id from the old term is never adopted).
+    std::string n1, n2;
+    ASSERT_EQ(joinOn(*service_, req_, out_, kBufSize, 1, ++corr_, g, m1, clock_, n1).errorCode, 0);
+    ASSERT_EQ(joinOn(*service_, req_, out_, kBufSize, 2, ++corr_, g, m2, clock_, n2).errorCode, 0);
+    EXPECT_NE(n1, m1);
+    EXPECT_NE(n2, m2);
+    std::string again;
+    ASSERT_EQ(joinOn(*service_, req_, out_, kBufSize, 1, ++corr_, g, n1, clock_, again).errorCode, 0);
+    ASSERT_EQ(joinOn(*service_, req_, out_, kBufSize, 2, ++corr_, g, n2, clock_, again).errorCode, 0);
+    ASSERT_TRUE(driveUntil([&] { return service_->coordinator(g).state() == GroupState::Stable; }, 50));
+    EXPECT_EQ(service_->coordinator(g).memberCount(), 2u);
+    EXPECT_TRUE(service_->coordinator(g).hasMember(n1));
+    EXPECT_TRUE(service_->coordinator(g).hasMember(n2));
+    EXPECT_FALSE(service_->coordinator(g).hasMember(m1));
+    EXPECT_FALSE(service_->coordinator(g).hasMember(m2));
+}
+
+// Repeated flaps, each with live group state (a member, a not-yet-assignable join topic): every lost role leaves no
+// group, no pending late topic and no lineage bookkeeping behind (bounded across any number of flaps), and the last
+// regain still converges.  RED (no unload): the groups and their pending state accumulate across the flaps.
+TEST_F(GroupJoinAdversarial, RepeatedFlapsLeaveNoGroupStateBehindAdversarialRegression) {
+    constexpr int32_t kNotYetCreated = 77;
+    for (int round = 0; round < 40; ++round) {
+        const std::string g = "g565-flaps-" + std::to_string(round % 4);
+        const auto first = joinAs({kTestTopicId, kNotYetCreated}, g);
+        ASSERT_EQ(first.code, static_cast<int16_t>(pc::ErrorCode::OK)) << "round " << round;
+        (void)joinAs({kTestTopicId, kNotYetCreated}, g, first.memberId);
+        ASSERT_TRUE(driveUntil([&] { return service_->coordinator(g).state() == GroupState::Stable; }, 20));
+        ASSERT_EQ(service_->unassignedJoinTopicsForTest(g), 1u) << "the rig needs a pending late topic";
+        isLeader_ = false; leaderNodeId_ = 42;
+        for (int i = 0; i < 3; ++i) { clock_ += kStep; service_->doWork(clock_); }
+        ASSERT_EQ(service_->groupCountForTest(), 0u) << "round " << round;
+        ASSERT_EQ(service_->unassignedJoinTopicsForTest(g), 0u) << "round " << round;
+        ASSERT_EQ(service_->pendingLineageChecksForTest(), 0u) << "round " << round;
+        ASSERT_EQ(service_->supersededMarkGroupsForTest(), 0u) << "round " << round;
+        isLeader_ = true; leaderNodeId_ = kLeader;
+        clock_ += kStep;
+        service_->doWork(clock_);
+        ASSERT_EQ(service_->groupCountForTest(), 0u) << "a regain must not resurrect a group";
+    }
+    const std::string fresh = stableMember("g565-flaps-final");
+    EXPECT_FALSE(fresh.empty());
+    EXPECT_EQ(service_->groupCountForTest(), 1u);
+}
+
+// The window between the flip and the next duty cycle: every handler answers NotCoordinator, and the gateway's
+// eviction entry points (session revoke, old-client eviction, READ loss) touch only the stale group, whose unload on
+// the next cycle sends no frame.  The unload ends the group push subscription but never the session's PLAIN
+// subscription.  RED (no unload): the stale group is still held after the duty cycles (and, once its member expires,
+// the ex-coordinator ages it).
+TEST_F(GroupJoinAdversarial, HandlersAndEvictionsBetweenTheFlipAndTheNextDutyCycleSendNoFrameAdversarialRegression) {
+    rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(
+        [](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    gw.setTopicRegistry(registry_.get());
+    gw.setNodeIdForTest(kLeader);
+    std::vector<rune::metadata::RoutingImage::BuildEntry> img;
+    for (int32_t p = 0; p < 2; ++p) img.push_back({rune::metadata::gpidOf(kTestTopicId, p), kLeader, 1});
+    gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build(img, rune::metadata::RoutingImage::Source::Committed));
+    int controlFrames = 0;
+    gw.setOnControlFrame([&](int64_t, const uint8_t*, std::size_t) { ++controlFrames; });
+    service_->setGateway(&gw);
+
+    const int64_t s1 = gw.injectTestSession(clock_);
+    const int64_t s2 = gw.injectTestSession(clock_);
+    const std::string g = "g565-window";
+    std::string a, b, tmp;
+    ASSERT_EQ(joinOn(*service_, req_, out_, kBufSize, s1, ++corr_, g, "", clock_, a).errorCode, 0);
+    ASSERT_EQ(joinOn(*service_, req_, out_, kBufSize, s2, ++corr_, g, "", clock_, b).errorCode, 0);
+    ASSERT_EQ(joinOn(*service_, req_, out_, kBufSize, s1, ++corr_, g, a, clock_, tmp).errorCode, 0);
+    ASSERT_EQ(joinOn(*service_, req_, out_, kBufSize, s2, ++corr_, g, b, clock_, tmp).errorCode, 0);
+    ASSERT_TRUE(driveUntil([&] { return service_->coordinator(g).state() == GroupState::Stable; }, 50));
+    ASSERT_EQ(service_->coordinator(g).memberCount(), 2u);
+    const int32_t gen = service_->coordinator(g).generationId();
+
+    // s1 holds one PLAIN subscription (partition 1) and one group push subscription (partition 0).
+    pc::Subscribe s;
+    s.sessionId = s1; s.correlationId = 9001; s.topicId = kTestTopicId; s.partition = 1; s.partitionKnown = 1;
+    s.fromOffset = 0; s.isolation = 0;
+    std::vector<uint8_t> f(s.encodedSize());
+    f.resize(s.encode(f.data()));
+    gw.applySubscribeForTest(f.data(), f.size());
+    ASSERT_EQ(gw.subscriptionCount(), 1u) << "the rig needs one plain subscription";
+    ASSERT_GT(gw.addGroupSubscription(s1, kTestTopicId, 0, 0, 0), 0);
+    ASSERT_EQ(gw.subscriptionCount(), 2u);
+
+    controlFrames = 0;
+    isLeader_ = false; leaderNodeId_ = 42;
+    // --- the window: no duty cycle yet ---
+    const auto nc = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+    std::string ignored;
+    EXPECT_EQ(joinOn(*service_, req_, out_, kBufSize, s1, ++corr_, g, a, clock_, ignored).errorCode, nc);
+    EXPECT_EQ(decodeHBErrorCode(out_, service_->handleHeartbeat(req_, encodeHeartbeat(req_, s1, ++corr_, g, a, gen),
+                                                               clock_, out_, kBufSize)), nc);
+    EXPECT_EQ(decodeSyncErrorCode(out_, service_->handleSyncGroup(req_, encodeSyncGroup(req_, s1, ++corr_, g, a, gen),
+                                                                 clock_, out_, kBufSize)), nc);
+    EXPECT_EQ(service_->checkTxnOffsetMember(g, a, gen, s1), pc::ErrorCode::NotCoordinator);
+    service_->removeSessionMembers(s2, clock_);   // a revoked session's member leaves the stale group
+    service_->evictMember(g, a, s2, clock_);      // another session's member: never evicted (its binding stays)
+    EXPECT_EQ(controlFrames, 0) << "an eviction on an ex-coordinator sent a frame";
+    // --- the next duty cycles ---
+    for (int i = 0; i < 7000; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    EXPECT_EQ(service_->groupCountForTest(), 0u);
+    EXPECT_EQ(controlFrames, 0) << "an ex-coordinator sent an Assign frame";
+    EXPECT_EQ(gw.groupMemberSubCount(s1), 0u);
+    EXPECT_EQ(gw.subscriptionCount(), 1u) << "the unload ended a PLAIN subscription (only group ones may end)";
+    service_->setGateway(nullptr);
+}
+
+// A zombie commit across a flap: the member committed under the old term; the role moves away and back.  Its late
+// OffsetCommit / TxnOffsetCommit at the old generation is fenced UnknownMember and the committed offset never moves
+// (a new term's group is rebuilt by re-join, so an old-term member can never rewind the group's position).
+// RED (no unload): the stale member is still bound at its generation and the late commit 5 is accepted (rewind).
+TEST(OffsetCommitDurabilityRegression, AnOldTermMembersLateCommitAfterAFlapIsFencedAdversarialRegression) {
+    CommitRig g("g565zombie");
+    ASSERT_FALSE(g.member.empty());
+    ASSERT_EQ(g.commit("g565zombie", 10), 0u);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u);
+    ASSERT_EQ(CommitRig::codeOf(g.answers.frames[0].data(), g.answers.frames[0].size()), 0);
+    const auto t0 = tp(std::string(kTestTopic), 0);
+    ASSERT_EQ(g.store.fetch("g565zombie", t0)->offset, 10);
+
+    g.svc.setLocalLeadership(false);
+    g.clock += 1'000'000;
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.svc.groupCountForTest(), 0u);
+    g.svc.setLocalLeadership(true);
+    g.clock += 1'000'000;
+    g.svc.doWork(g.clock);   // the offsets index is rebuilt for the new term
+
+    const std::size_t leo = static_cast<std::size_t>(g.rep.logEndOffset());
+    const std::size_t n = g.commit("g565zombie", 5);
+    ASSERT_GT(n, 0u) << "a fenced commit is answered at once (nothing appended, nothing parked)";
+    EXPECT_EQ(CommitRig::codeOf(g.out, n), static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+    EXPECT_EQ(static_cast<std::size_t>(g.rep.logEndOffset()), leo) << "a zombie commit record was appended";
+    EXPECT_EQ(g.svc.checkTxnOffsetMember("g565zombie", g.member, g.gen, 1), pc::ErrorCode::UnknownMember);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    EXPECT_EQ(g.store.fetch("g565zombie", t0)->offset, 10) << "the committed offset moved backward";
 }

@@ -116,6 +116,73 @@ TEST(AuthEnforcementRegression, AnotherPrincipalsMemberIdIsRefusedOnEveryGroupRe
     EXPECT_NE(r.heartbeatAt(u1, "g", member, gen), kUnknownMember) << "u1 still owns its member (now rebalancing)";
 }
 
+// Issue #276: SyncGroup needs READ on the group (D18), like every other group request - READ on the topic alone does
+// not hand out a member's assignment, whosever member id the request names.  RED: delete the SyncGroup case of
+// ClientGateway::denyGroupRequest_ (the request reaches the coordinator: UnknownMember / OK, never 45).
+TEST(AuthEnforcementRegression, SyncGroupIsDeniedWithoutGroupReadRegression) {
+    AuthRig r;
+    const int64_t may = r.newUser({exact(SO::Read, ST::Group, "cg276"), exact(SO::Read, ST::Topic, "orders")});
+    const int64_t topicOnly = r.newUser({exact(SO::Read, ST::Topic, "orders")});
+    const int64_t otherGroup = r.newUser({exact(SO::Read, ST::Group, "cg-other"), exact(SO::Read, ST::Topic, "orders")});
+    const auto [member, gen] = r.joinStable(may, "cg276", {r.orders});
+    ASSERT_FALSE(member.empty());
+    EXPECT_EQ(r.syncGroup(topicOnly, "cg276", member, gen), kNotAuthorized) << "topic READ is not group READ";
+    EXPECT_EQ(r.syncGroup(topicOnly, "cg276", "nobody", gen), kNotAuthorized) << "denied before any member lookup";
+    EXPECT_EQ(r.syncGroup(otherGroup, "cg276", member, gen), kNotAuthorized) << "READ on another group";
+    EXPECT_EQ(r.syncGroup(may, "cg276", member, gen), kOk) << "the owner with group READ is served";
+}
+
+// Issue #276 (X036 over an authenticated wire): a client-built CONTROL batch (a forged COMMIT/ABORT marker) is refused
+// InvalidRequest even for a principal holding WRITE on the topic, and nothing is appended - the next ordinary batch
+// lands at the offset right after the previous one.  RED: delete the refusesClientBatches check in
+// ClientGateway::handleProduce (the marker is appended: answer 0, and the next batch's offset moves by 2).
+// PR #569 adversarial review (#276, input bounds on the group name): group READ is matched on the request's OWN group
+// name for every group request - a prefix grant opens only names under it (case-sensitive, no shorter name, no name
+// that merely contains it), and an empty group name is never served.  The owner's own requests stay served.
+// RED: delete the SyncGroup case of ClientGateway::denyGroupRequest_ (the out-of-grant SyncGroups reach the
+// coordinator and are answered UnknownMember, not 45).
+TEST(AuthEnforcementRegression, GroupReadIsMatchedOnTheRequestsOwnGroupNameForEveryGroupRequestAdversarialRegression) {
+    AuthRig r;
+    const int64_t owner = r.newUser({prefix(SO::Read, ST::Group, "cg27"), exact(SO::Read, ST::Topic, "orders")});
+    const auto [member, gen] = r.joinStable(owner, "cg276", {r.orders});
+    ASSERT_FALSE(member.empty());
+    for (const char* g : {"cg2", "CG276", "Cg276", "xcg276", "c", "cg2 76"}) {
+        EXPECT_EQ(r.syncGroup(owner, g, member, gen), kNotAuthorized) << "SyncGroup " << g;
+        EXPECT_EQ(r.heartbeatAt(owner, g, member, gen), kNotAuthorized) << "Heartbeat " << g;
+        EXPECT_EQ(r.leaveGroup(owner, g, member), kNotAuthorized) << "LeaveGroup " << g;
+        EXPECT_EQ(r.commitAs(owner, g, member, gen, r.orders, 3), kNotAuthorized) << "OffsetCommit " << g;
+        EXPECT_EQ(r.offsetFetch(owner, g, r.orders), kNotAuthorized) << "OffsetFetch " << g;
+        EXPECT_EQ(r.joinGroup(owner, g, {r.orders}), kNotAuthorized) << "JoinGroup " << g;
+    }
+    EXPECT_NE(r.syncGroup(owner, "", member, gen), kOk) << "an empty group name was served";
+    EXPECT_NE(r.heartbeatAt(owner, "", member, gen), kOk) << "an empty group name was served";
+    EXPECT_EQ(r.syncGroup(owner, "cg276", member, gen), kOk) << "the owner's own group stays served";
+    EXPECT_EQ(r.heartbeatAt(owner, "cg276", member, gen), kOk);
+}
+
+TEST(AuthEnforcementRegression, AClientControlBatchIsRefusedForAnAuthorizedWriterRegression) {
+    AuthRig r;
+    const int64_t w = r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    ASSERT_EQ(r.produce(w, r.orders, /*untilOk=*/true), kOk);
+    auto produceBatch = [&](const std::vector<uint8_t>& batch) -> std::pair<int, int64_t> {
+        const int64_t corr = r.c().nextCorrelationId();
+        if (!r.c().produce(r.ch(), r.stream(), w, corr, r.orders, 0, 1, batch)) return {kNoAnswer, -1};
+        const auto a = r.c().awaitProduceResponseUntil(corr, AuthRig::dl());
+        return a ? std::pair<int, int64_t>{a->errorCode, a->baseOffset} : std::pair<int, int64_t>{kNoAnswer, -1};
+    };
+    const auto first = produceBatch(makeBatch(1));
+    ASSERT_EQ(first.first, kOk);
+    rune::protocol::RecordBatchBuilder ctl(0, 1000);
+    ctl.setControl(true);
+    ctl.setProducerId(7); ctl.setProducerEpoch(0); ctl.setBaseSequence(0);
+    ctl.append("", "", 1000);
+    EXPECT_EQ(produceBatch(ctl.build()).first, static_cast<int>(pc::ErrorCode::InvalidRequest))
+        << "a client never writes a control batch, whatever its grants";
+    const auto next = produceBatch(makeBatch(1));
+    ASSERT_EQ(next.first, kOk);
+    EXPECT_EQ(next.second, first.second + 1) << "the refused control batch was appended";
+}
+
 TEST(AuthEnforcementRegression, TransactionRowsAllowedAndDenied) {
     AuthRig r;
     // Issue #125 correction (not a weakening): TxnOffsetCommit needs READ on every listed topic, exactly as
@@ -261,6 +328,46 @@ TEST(AuthEnforcementRegression, GetTopicSchemaAllowedAndDenied) {
     EXPECT_EQ(r.getTopicSchema(viewReader, "board"), kOk) << "a view is addressed by name too";
     EXPECT_EQ(r.getTopicSchema(none, "orders"), kNotAuthorized);
     EXPECT_EQ(r.getTopicSchema(may, "secret"), kNotAuthorized);
+}
+
+// Issue #273 item 4: GetTopicSchema across topic kinds - a data topic, a view (its sink) and the system topics.  Only the
+// object's OWN kind's grant answers it (#128): READ on a view named like the topic, or on a topic named like the view,
+// opens nothing; READ on a view's source topic does not open the view.  A system topic is never reachable through a
+// topic / view grant (even READ TOPIC prefix ''), and DESCRIBE ON CLUSTER sees it as missing (UnknownTopic), as any
+// name that is no catalog object.  RED: drop the own-kind branch (#128) of authorizeTopicOrViewName - the wrong-kind
+// grants are served.
+TEST(AuthEnforcementRegression, GetTopicSchemaAnswersPerTheObjectsOwnKindAcrossTopicKindsRegression) {
+    AuthRig r;
+    const int kUnknown = static_cast<int>(pc::ErrorCode::UnknownTopic);
+    const int64_t readOrders = r.newUser({exact(SO::Read, ST::Topic, "orders")});
+    const int64_t viewNamedOrders = r.newUser({exact(SO::Read, ST::View, "orders")});
+    const int64_t readBoard = r.newUser({exact(SO::Read, ST::View, "board")});
+    const int64_t topicNamedBoard = r.newUser({exact(SO::Read, ST::Topic, "board")});
+    const int64_t allTopics = r.newUser({prefix(SO::Read, ST::Topic, "")});
+    const int64_t allViews = r.newUser({prefix(SO::Read, ST::View, "")});
+    const int64_t describeCluster = r.newUser({cluster(SO::Describe)});
+    const int64_t adminCluster = r.newUser({cluster(SO::Admin)});
+
+    // A data topic.
+    EXPECT_EQ(r.getTopicSchema(readOrders, "orders"), kOk);
+    EXPECT_EQ(r.getTopicSchema(allTopics, "orders"), kOk);
+    EXPECT_EQ(r.getTopicSchema(viewNamedOrders, "orders"), kNotAuthorized) << "a VIEW grant on a topic's name";
+    EXPECT_EQ(r.getTopicSchema(allViews, "orders"), kNotAuthorized);
+    // A view (its sink topic is addressed by the view's name).
+    EXPECT_EQ(r.getTopicSchema(readBoard, "board"), kOk);
+    EXPECT_EQ(r.getTopicSchema(allViews, "board"), kOk);
+    EXPECT_EQ(r.getTopicSchema(topicNamedBoard, "board"), kNotAuthorized) << "a TOPIC grant on a view's name";
+    EXPECT_EQ(r.getTopicSchema(allTopics, "board"), kNotAuthorized);
+    EXPECT_EQ(r.getTopicSchema(readOrders, "board"), kNotAuthorized) << "READ on the source is not READ on the view";
+    // The system topics.
+    for (const char* sys : {"__security", "__catalog", "__consumer_offsets", "__transaction_state"}) {
+        EXPECT_EQ(r.getTopicSchema(allTopics, sys), kNotAuthorized) << sys;
+        EXPECT_EQ(r.getTopicSchema(allViews, sys), kNotAuthorized) << sys;
+        EXPECT_EQ(r.getTopicSchema(adminCluster, sys), kNotAuthorized) << sys << ": ADMIN ON CLUSTER is no data grant";
+        EXPECT_EQ(r.getTopicSchema(describeCluster, sys), kUnknown) << sys << ": no catalog object";
+    }
+    EXPECT_EQ(r.getTopicSchema(describeCluster, "orders"), kOk);
+    EXPECT_EQ(r.getTopicSchema(describeCluster, "board"), kOk);
 }
 
 TEST(AuthEnforcementRegression, DefineTopicAndCreateSchemaAllowedAndDenied) {

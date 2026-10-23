@@ -499,7 +499,12 @@ private:
                           bool genEntry, int64_t nowNs);
     void retryPendingChecks_(int64_t nowNs);
     void pruneGroupLineageState_(const std::string& groupId);
+    /// #565: this node is not the group coordinator — drop every in-memory group (Kafka-style unload): end the
+    /// members' group push subscriptions, forget the member bindings and per-group lineage state.  No Assign frame
+    /// (a member learns NotCoordinator on its next request).  Returns the number of groups unloaded.
+    int unloadGroups_();
 public:
+    [[nodiscard]] std::size_t groupCountForTest() const noexcept { return coordinators_.size(); }
     [[nodiscard]] std::size_t pendingLineageChecksForTest() const noexcept { return pendingChecks_.size(); }
     [[nodiscard]] std::size_t supersededMarkGroupsForTest() const noexcept { return supersededHandled_.size(); }
 private:
