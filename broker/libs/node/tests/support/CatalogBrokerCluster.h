@@ -4,6 +4,7 @@
 // 11's CatalogLeadershipBrokerTest.  Polls are bounded (the deadline is the
 // failure, never a hang); the nodes' own threads do the work.
 #include "support/ShardTestClient.h"
+#include "support/TestNodeConfig.h"
 
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/catalog/CatalogReplayer.h>
@@ -88,6 +89,7 @@ inline NodeConfig makeConfig(int nodeId, const fs::path& dataDir, const Ports& p
     const bool shard = mode != Mode::Legacy;
     const int idx = nodeId - 1;
     NodeConfig cfg;
+    boundTestSegments(cfg);
     cfg.nodeId = nodeId;
     cfg.dataDir = dataDir.string();
     cfg.aeronDir = (dataDir / "aeron").string();

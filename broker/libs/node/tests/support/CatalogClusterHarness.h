@@ -40,6 +40,7 @@
 // std::logic_error naming the cell and the stage (gtest reports it as a failure of
 // that cell) — never a hang.
 
+#include "support/TestNodeConfig.h"
 #include "support/CatalogDdlRig.h"            // Answer / descriptor()
 #include "support/CatalogMatrixExpectations.h"
 
@@ -1836,10 +1837,11 @@ private:
         const auto brokerDir = root_ / ("b" + std::to_string(id));
         const auto dir = brokerDir / "__catalog";
         std::filesystem::create_directories(dir);
-        br->log = std::make_unique<rune::storage::Log>(dir.string());
+        br->log = std::make_unique<rune::storage::Log>(dir.string(), kTestSegmentRollBytes);
         br->log->recover();
         br->link = std::make_unique<HoldingLink>(ft_, hold_, id);
         NodeConfig nc;
+        boundTestSegments(nc);
         nc.nodeId = id;
         // ISR changes are the controller's (controllerStep_), never a lag shrink across the clock jumps (the
         // lag rule is out of scope here: the fencing commit is the controller's, see shrinkIsr_).

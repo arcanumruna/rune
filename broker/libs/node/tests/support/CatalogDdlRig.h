@@ -17,6 +17,7 @@
 //
 // Single-threaded test fixture: plain members, no atomics.
 
+#include "support/TestNodeConfig.h"
 #include <rune/node/AdminChannels.h>
 #include <rune/node/AdminWorker.h>
 #include <rune/node/CatalogApplier.h>
@@ -461,9 +462,10 @@ private:
     }
 
     void open_() {
-        log_ = std::make_unique<rune::storage::Log>(catalogDir());
+        log_ = std::make_unique<rune::storage::Log>(catalogDir(), kTestSegmentRollBytes);
         log_->recover();
         NodeConfig nc;
+        boundTestSegments(nc);
         nc.nodeId = kSelf;
         // A silent follower stays in the ISR across the rig's clock jumps (the
         // 30 s DDL timeout): ISR changes are the controller's (Task 6), not a lag.

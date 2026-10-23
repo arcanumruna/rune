@@ -17,6 +17,7 @@
 // Events come from rune::catalog::testing::goldenScriptV1() (23 events, 0..22).
 // Single-threaded test fixture: plain members, no atomics.
 
+#include "support/TestNodeConfig.h"
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/catalog/CatalogState.h>
 #include <rune/catalog/testing/GoldenScript.h>
@@ -172,9 +173,10 @@ private:
     [[nodiscard]] std::filesystem::path catalogDirPath_() const { return root_ / "__catalog"; }
 
     void open_() {
-        log_ = std::make_unique<rune::storage::Log>(catalogDir());
+        log_ = std::make_unique<rune::storage::Log>(catalogDir(), kTestSegmentRollBytes);
         log_->recover();
         NodeConfig nc;
+        boundTestSegments(nc);
         nc.nodeId = kSelf;
         rune::replication::PartitionConfig cfg = makeCatalogPartitionConfig(nc, 2);
         replica_ = std::make_unique<rune::replication::PartitionReplica>(

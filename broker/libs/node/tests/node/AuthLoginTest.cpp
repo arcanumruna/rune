@@ -68,6 +68,77 @@ TEST(AuthLoginRegression, FailureAnswersAreIndistinguishableRegression) {
     EXPECT_EQ(ok.firstBytes.size(), out[0].firstBytes.size()) << "a real user's first leg has the same shape too";
 }
 
+// #136: the same parity for a user with TWO passwords (both slots carry a real salt): a wrong password for it, an
+// unknown user and a disabled two-password user (right password) get byte-identical first-leg shapes and finals.
+TEST(AuthLoginRegression, FailureAnswersAreIndistinguishableForATwoPasswordUserRegression) {
+    AuthBroker b("indist2");
+    b.bootstrapAdmin();
+    b.createUser("two", kPwA);
+    b.addPassword("two", kPwB);
+    b.createUser("off2", kPwA);
+    b.addPassword("off2", kPwB);
+    b.disableUser("off2");
+    AuthWireClient& w = b.wire();
+
+    struct Case { const char* what; std::string user; std::array<std::string, 2> pw; };
+    const std::vector<Case> cases = {{"wrong password, two-password user", "two", {"not the password", "nor this one"}},
+                                     {"unknown user", "nobody", {kPwA, kPwB}},
+                                     {"disabled two-password user (right passwords)", "off2", {kPwA, kPwB}}};
+    std::vector<AuthWireClient::Login> out;
+    for (const Case& c : cases) {
+        const int64_t sid = w.connect(b.channel());
+        ASSERT_GT(sid, 0);
+        out.push_back(w.login(b.channel(), sid, c.user, c.pw));
+        const auto& l = out.back();
+        ASSERT_TRUE(l.first.has_value()) << c.what;
+        EXPECT_EQ(l.first->count, 2) << c.what;
+        for (int slot = 0; slot < 2; ++slot) {
+            EXPECT_EQ(l.first->salts[slot].salt.size(), 16u) << c.what << " slot " << slot;
+            EXPECT_EQ(l.first->salts[slot].iterations, 4096u) << c.what << " slot " << slot;
+        }
+        EXPECT_EQ(l.firstBytes.size(), out[0].firstBytes.size()) << c.what << ": one frame shape";
+        ASSERT_TRUE(l.fin.has_value()) << c.what;
+        EXPECT_EQ(l.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed)) << c.what;
+        EXPECT_EQ(l.fin->retryAfterMs, 0u) << c.what;
+        EXPECT_TRUE(sameBodyDifferentHeader(l.finalBytes, out[0].finalBytes))
+            << c.what << ": the AuthServerFinal is byte-identical except the header ids";
+    }
+    // The control: the enabled two-password user logs in through either password.
+    for (const char* pw : {kPwA, kPwB}) {
+        const auto ok = w.connectAndLogin(b.channel(), "two", pw);
+        EXPECT_TRUE(ok.ok()) << pw;
+        EXPECT_EQ(ok.firstBytes.size(), out[0].firstBytes.size()) << "the real user's first leg has the same shape";
+    }
+}
+
+// #136: the login throttle is keyed on (user, source host), not on the session: six sessions open at once - over two
+// client connections - each make ONE wrong-password attempt for the same user, and together they meet the throttle
+// exactly as six consecutive attempts would: three verified failures, then refusals with a retry-after and no salt.
+TEST(AuthLoginRegression, ParallelSessionsShareTheLoginThrottleRegression) {
+    AuthBroker b("parthrottle");
+    b.bootstrapAdmin();
+    b.createUser("ws1", kPwA);
+    AuthWireClient& w1 = b.wire();
+    AuthWireClient& w2 = b.wire();
+    std::vector<std::pair<AuthWireClient*, int64_t>> sessions;
+    for (int i = 0; i < 6; ++i) {   // every session exists before any attempt
+        AuthWireClient& w = i % 2 == 0 ? w1 : w2;
+        const int64_t sid = w.connect(b.channel());
+        ASSERT_GT(sid, 0) << i;
+        sessions.emplace_back(&w, sid);
+    }
+    std::vector<int> verdicts;   // 0 = verified failure, 1 = throttled
+    for (const auto& [w, sid] : sessions) {
+        const auto l = w->login(b.channel(), sid, "ws1", {"a wrong guess", "a wrong guess"});
+        ASSERT_TRUE(l.fin.has_value()) << "session " << sid;
+        EXPECT_EQ(l.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+        if (l.first.has_value() && l.fin->retryAfterMs == 0) verdicts.push_back(0);
+        else if (!l.first.has_value() && l.fin->retryAfterMs > 0) verdicts.push_back(1);
+        else verdicts.push_back(-1);
+    }
+    EXPECT_EQ(verdicts, (std::vector<int>{0, 0, 0, 1, 1, 1})) << "the sessions share one (user, host) throttle";
+}
+
 TEST(AuthLoginRegression, UnknownUserGetsTheSameFakeSaltEveryTime) {
     AuthBroker b("fakesalt");
     b.bootstrapAdmin();

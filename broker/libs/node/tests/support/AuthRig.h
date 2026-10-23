@@ -19,7 +19,9 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -102,6 +104,7 @@ public:
         w_ = &b_.wire();
         c().captureRawAnswers(true);
         builder = login("builder");
+        if (writer_ != 0) writer_ = login("rigwriter");
     }
 
     // ── users and sessions ──────────────────────────────────────────────────────────────────────────────────
@@ -112,6 +115,25 @@ public:
         if (!l.ok()) throw std::runtime_error("AuthRig: login failed for " + user);
         b_.noteLoginOk();
         return sid;
+    }
+    /// Issue #138: the broker's gateway no longer holds session `sid` within `within` (a bounded poll of the control
+    /// thread's session table).  A ping cannot tell this: the gateway answers nothing to a dead session's ping, and a
+    /// timed-out ping looks the same.  The wait pumps the client (its keepalives), so the rig's OTHER sessions never
+    /// expire while it waits (PR #583 review: a plain sleep let a bystander session time out).
+    bool awaitSessionGone(int64_t sid, std::chrono::milliseconds within = std::chrono::seconds(5)) {
+        return c().pollFor(within, [&] { return !b_.node().gatewayHasSessionForTest(sid); });
+    }
+    /// Issue #277: a login on a fresh session with `pw` in passwords[slot] only - the other slot carries a wrong
+    /// password (a proof that matches no verifier).  The gateway checks every slot's proof against that slot's
+    /// verifier (ScramServer: two slots always, a fake one for a one-password user).  Returns the login legs.
+    AuthWireClient::Login loginSlot(const std::string& user, int slot, const std::string& pw) {
+        const int64_t sid = w_->connect(ch());
+        if (sid <= 0) throw std::runtime_error("AuthRig: connect failed");
+        std::array<std::string, 2> pws{"wrong-password-0", "wrong-password-1"};
+        pws[static_cast<std::size_t>(slot)] = pw;
+        auto l = w_->login(ch(), sid, user, pws);
+        if (l.ok()) b_.noteLoginOk();
+        return l;
     }
     /// A new user with exactly `g`; returns its logged-in session.  `name` (optional) receives the user name.
     int64_t newUser(const std::vector<AuthGrant>& g, std::string* name = nullptr) {
@@ -137,13 +159,92 @@ public:
     int produce(int64_t sid, int32_t topicId, bool untilOk = false) {
         if (untilOk) return c().produceUntilOk(ch(), stream(), sid, topicId, 0, 1, makeBatch(1)) ? 0 : kNoAnswer;
         const int64_t corr = c().nextCorrelationId();
+        lastCorr_ = corr;
         if (!c().produce(ch(), stream(), sid, corr, topicId, 0, 1, makeBatch(1))) return kNoAnswer;
         const auto a = c().awaitProduceResponseUntil(corr, dl());
         return a ? a->errorCode : kNoAnswer;
     }
     int subscribe(int64_t sid, int32_t topicId) {
-        const auto code = c().awaitSubscribeCode(c().sendSubscribe(ch(), stream(), sid, topicId, 0), dl());
+        lastCorr_ = c().sendSubscribe(ch(), stream(), sid, topicId, 0);
+        const auto code = c().awaitSubscribeCode(lastCorr_, dl());
         return code ? *code : kNoAnswer;
+    }
+    /// The correlation id of the last produce() (not untilOk) / subscribe().
+    [[nodiscard]] int64_t lastCorr() const noexcept { return lastCorr_; }
+
+    // ── issue #278: what a refused request must NOT have done ──────────────────────────────────────────────────
+    /// The log end offset of (topicId, partition) on this broker, read on the replica's owner thread (-1: none here).
+    int64_t logEnd(int32_t topicId, int32_t partition = 0) {
+        return b_.node().onOwnerThreadForTest(topicId, partition, [](rune::replication::PartitionReplica* r) {
+            return r != nullptr ? r->logEndOffset() : int64_t{-1};
+        });
+    }
+    /// A Ping on `sid` (same channel and stream as every rig request) and its Pong: the frames of one session's stream
+    /// are ordered, so whatever the broker sent for `corr` before it is here now.  Then: `corr` was answered exactly
+    /// once (its refusal - no later success answer), and no Records frame arrived for a subscription the broker never
+    /// answered OK.
+    void expectNothingDelivered(int64_t sid, int64_t corr) {
+        pc::Ping p;
+        p.sessionId = sid; p.correlationId = c().nextCorrelationId();
+        uint8_t buf[64];
+        const std::size_t len = p.encode(buf);
+        ASSERT_TRUE(c().send(ch(), stream(), buf, len)) << "the Ping was not sent";
+        ASSERT_TRUE(c().awaitRaw(p.correlationId, dl()).has_value()) << "no Pong on session " << sid;
+        EXPECT_EQ(c().framesFor(corr), 1u) << "corr " << corr << " was answered more than once (a success after its refusal)";
+        EXPECT_EQ(c().strayRecords(), 0u) << "Records for a subscription the broker refused";
+    }
+    /// produce() expected refused: when it answers 45, also nothing else was answered for it and the log did not grow.
+    /// Returns the answer code (the caller asserts it).
+    int produceDenied(int64_t sid, int32_t topicId) {
+        const int64_t before = topicId >= 0 ? logEnd(topicId) : -1;
+        const int code = produce(sid, topicId);
+        if (code == kNotAuthorized) {
+            const int64_t corr = lastCorr_;
+            expectNothingDelivered(sid, corr);
+            if (topicId >= 0) EXPECT_EQ(logEnd(topicId), before) << "#278: a refused produce appended to topic " << topicId;
+        }
+        return code;
+    }
+    /// subscribe() expected refused: when it answers 45, also no subscription was registered (on an existing user topic:
+    /// expectSubscribeRegisteredNothing; otherwise nothing delivered).  Returns the answer code (the caller asserts it).
+    int subscribeDenied(int64_t sid, int32_t topicId) {
+        const int code = subscribe(sid, topicId);
+        if (code == kNotAuthorized) {
+            const int64_t corr = lastCorr_;
+            if (topicId >= 0 && logEnd(topicId) >= 0) expectSubscribeRegisteredNothing(sid, corr, topicId);
+            else expectNothingDelivered(sid, corr);
+        }
+        return code;
+    }
+    /// A refused Subscribe (`corr` on `sid`) registered nothing: nothing delivered; then an allowed writer appends one
+    /// record that an allowed reader (a fresh builder session bound at the log end) is pushed - so the fan-out ran -
+    /// and still nothing reached the refused session.
+    void expectSubscribeRegisteredNothing(int64_t sid, int64_t corr, int32_t topicId) {
+        expectNothingDelivered(sid, corr);
+        if (::testing::Test::HasFatalFailure()) return;
+        if (writer_ == 0) {
+            b_.createUser("rigwriter", kPw, {grants::prefix(rune::protocol::SecurityOperation::Write,
+                                                            rune::protocol::SecurityResourceType::Topic, "")});
+            writer_ = login("rigwriter");
+        }
+        const int64_t watcher = login("builder");
+        int64_t watchCorr = 0;
+        for (int i = 0; i < 200; ++i) {   // NotLeader while the partition settles: re-sent (bounded)
+            watchCorr = c().subscribeIsolated(ch(), stream(), watcher, topicId, 0, /*fromOffset=Latest*/ -1, 0);
+            const auto code = c().awaitSubscribeCode(watchCorr, dl());
+            ASSERT_TRUE(code.has_value()) << "the watcher's Subscribe was not answered";
+            if (*code == 0) break;
+            ASSERT_EQ(*code, static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "the watcher's Subscribe";
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        const auto watchId = c().subscriptionIdOf(watchCorr);
+        ASSERT_TRUE(watchId.has_value());
+        ASSERT_EQ(produce(writer_, topicId, /*untilOk=*/true), 0) << "the allowed writer's produce";
+        ASSERT_TRUE(c().pollUntil([&] {
+            for (const auto& r : c().records()) if (r.subscriptionId == *watchId) return true;
+            return false;
+        })) << "the allowed reader was never pushed the new record";
+        expectNothingDelivered(sid, corr);
     }
     int catalogSubscribe(int64_t sid) {
         const auto code = c().awaitSubscribeCode(c().sendCatalogSubscribe(ch(), stream(), sid, 0), dl());
@@ -165,6 +266,18 @@ public:
     int offsetFetch(int64_t sid, const std::string& group, int32_t topicId) {
         const auto a = c().offsetFetch(ch(), stream(), sid, group, topicId, 0);
         return a ? a->second : kNoAnswer;
+    }
+    /// Issue #277: an OffsetFetch with NO topic entries ("all topics" - OffsetFetch::entries empty).  The results the
+    /// answer lists; nullopt = no OffsetFetchResponse (an ErrorResponse / no answer).
+    std::optional<std::vector<pc::OffsetFetchResult>> offsetFetchAll(int64_t sid, const std::string& group) {
+        pc::OffsetFetch m;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.groupId = bytes(group);
+        const auto a = sendRaw(m, 512, m.correlationId, std::span<const pc::OffsetFetchEntry>{});
+        const auto r = a.empty() ? std::nullopt : pc::OffsetFetchResponse::decode(a.data(), a.size());
+        if (!r) return std::nullopt;
+        std::vector<pc::OffsetFetchResult> out;
+        for (const auto res : r->results) out.push_back(pc::OffsetFetchResult{res.topicId, res.partition, res.offset, res.errorCode});
+        return out;
     }
     int leaveGroup(int64_t sid, const std::string& group, const std::string& member = "nobody") {
         pc::LeaveGroup m;
@@ -394,6 +507,8 @@ private:
     AuthBroker b_;
     AuthWireClient* w_ = nullptr;
     int seq_ = 0;
+    int64_t lastCorr_ = 0;
+    int64_t writer_ = 0;   ///< the "rigwriter" session (WRITE on every topic), made on first use
 };
 
 }  // namespace rune::node::test

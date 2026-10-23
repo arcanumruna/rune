@@ -19,6 +19,14 @@
 
 namespace rune::node::test {
 
+/// Test disk footprint: a log preallocates (fallocate) its active segment to its roll size, and the production default
+/// is 64 MiB - per topic partition and per internal log (__consumer_offsets, transactions, metadata, __catalog,
+/// __security), on every broker of a test cluster.  Test fixtures roll at 1 MiB instead.  A test that asserts on
+/// rolling or on segment sizes sets its own value.
+inline constexpr int64_t kTestSegmentRollBytes = 1LL << 20;
+/// The fixtures' broker config: every internal log rolls at kTestSegmentRollBytes.
+inline void boundTestSegments(NodeConfig& c) { c.offsetLogSegmentRollBytes = kTestSegmentRollBytes; }
+
 inline void pinLegacyRuntime(NodeConfig& c) {
     c.workerMode       = NodeConfig::WorkerMode::Legacy;
     c.runtimePlacement = NodeConfig::RuntimePlacement::Thread;

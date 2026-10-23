@@ -42,16 +42,23 @@ TEST(ShardAuthProduceRegression, GrantedProduceSucceedsAndUngrantedIsNotAuthoriz
     const int64_t writer = rig.newUser({exact(SO::Write, ST::Topic, "orders")});
     const int64_t reader = rig.newUser({exact(SO::Read, ST::Topic, "orders")});
     EXPECT_EQ(shardProduce(rig, writer, rig.orders), 0) << "the granted topic is appended";
+    // #278: a refusal is not only the code - the worker consumed the frame and appended nothing.
+    const int64_t orders = rig.logEnd(rig.orders), secret = rig.logEnd(rig.secret);
+    EXPECT_GE(orders, 1) << "the granted produce was appended";
     EXPECT_EQ(shardProduce(rig, writer, rig.secret), kNotAuthorized) << "an ungranted topic is refused at the worker";
     EXPECT_EQ(shardProduce(rig, reader, rig.orders), kNotAuthorized) << "READ is not WRITE";
+    EXPECT_EQ(rig.logEnd(rig.secret), secret) << "#278: the refused produce appended nothing";
+    EXPECT_EQ(rig.logEnd(rig.orders), orders) << "#278: the refused produce appended nothing";
 }
 
 TEST(ShardAuthProduceRegression, ASessionThatNeverLoggedInIsDeniedAtTheWorker) {
     AuthRig rig("shardanon", shardOptions());
     const int64_t sid = rig.wire().connect(rig.ch());                     // connected, SCRAM not even started
     ASSERT_GT(sid, 0);
+    const int64_t before = rig.logEnd(rig.orders);
     EXPECT_EQ(shardProduce(rig, sid, rig.orders, /*attempts=*/3), kNotAuthorized)
         << "default deny: an announced, unauthenticated session has an empty slot";
+    EXPECT_EQ(rig.logEnd(rig.orders), before) << "#278: the refused produce appended nothing";
 }
 
 TEST(ShardAuthProduceRegression, NoProduceCanPrecedeTheLoginsPermissions) {

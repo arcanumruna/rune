@@ -26,6 +26,7 @@
 //
 // Single-threaded test fixture: plain members, no atomics.
 
+#include "support/TestNodeConfig.h"
 #include "support/CatalogDdlRig.h"   // Answer / DefineArgs / descriptor()
 
 #include <rune/node/AdminChannels.h>
@@ -519,7 +520,7 @@ private:
             const auto dir = root_ / ("b" + std::to_string(br.id)) / ("t" + std::to_string(t.topicId) + "-" +
                                                                       std::to_string(p));
             std::filesystem::create_directories(dir);
-            dp->log = std::make_unique<rune::storage::Log>(dir.string());
+            dp->log = std::make_unique<rune::storage::Log>(dir.string(), kTestSegmentRollBytes);
             dp->log->recover();
             rr::PartitionConfig c;
             c.topicId     = t.topicId;
@@ -540,10 +541,11 @@ private:
         br->id = id;
         const auto dir = root_ / ("b" + std::to_string(id)) / "__catalog";
         std::filesystem::create_directories(dir);
-        br->log = std::make_unique<rune::storage::Log>(dir.string());
+        br->log = std::make_unique<rune::storage::Log>(dir.string(), kTestSegmentRollBytes);
         br->log->recover();
         br->link = std::make_unique<TrioLink>(net_, id);
         NodeConfig nc;
+        boundTestSegments(nc);
         nc.nodeId = id;
         // ISR changes are the controller's (the test's), never a lag across the clock jumps.
         nc.replicaLagMaxMs = 3'600'000;

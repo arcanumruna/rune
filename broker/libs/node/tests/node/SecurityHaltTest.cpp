@@ -51,7 +51,7 @@ TEST(SecurityHaltRegression, HaltEndsEverySessionRetriablyAndRefusesLoginsRegres
     EXPECT_EQ(onSession, unavailable);
     EXPECT_EQ(onSub, -1) << "no SessionRevoked on the subscription's correlation id";
     EXPECT_EQ(detail, "security log halted on this broker - reconnect to another broker");
-    EXPECT_FALSE(r.c().pingError(r.ch(), r.stream(), user, AuthRig::dl(1)).has_value()) << "the session is gone";
+    EXPECT_TRUE(r.awaitSessionGone(user)) << "#138: the gateway ended the session";
 
     // New logins are refused retriably (AuthUnavailable: try another broker), the broker itself stays up.
     const int64_t s2 = r.wire().connect(r.ch());

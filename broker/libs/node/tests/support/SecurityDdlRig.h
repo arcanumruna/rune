@@ -9,6 +9,7 @@
 //   * answers by correlation id and recordedEvents() — the events the log holds.
 // Single-threaded: plain members.
 
+#include "support/TestNodeConfig.h"
 #include <rune/node/AdminChannels.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/SecurityAdmin.h>
@@ -262,9 +263,10 @@ private:
     [[nodiscard]] std::string securityDir_() const { return (root_ / "__security").string(); }
 
     void open_() {
-        log_ = std::make_unique<rune::storage::Log>(securityDir_());
+        log_ = std::make_unique<rune::storage::Log>(securityDir_(), kTestSegmentRollBytes);
         log_->recover();
         NodeConfig nc;
+        boundTestSegments(nc);
         nc.nodeId = kSelf;
         std::vector<rune::replication::NodeId> all;
         for (int32_t b = 1; b <= brokers_; ++b) all.push_back(b);

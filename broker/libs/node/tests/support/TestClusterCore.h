@@ -19,6 +19,7 @@
 //
 // Topic ids follow creation order from 0, so a test that defines its topics in its old static-list
 // order keeps its ids.  A failure is `ADD_FAILURE()` + -1 — a deadline is a failure, never a hang.
+#include "TestNodeConfig.h"
 #include "ShardTestClient.h"
 
 #include <rune/node/BrokerNode.h>
@@ -157,7 +158,10 @@ private:
         c.retentionBytes            = s.retentionBytes;
         c.deleteRetentionMs         = s.deleteRetentionMs;
         c.minCleanableDirtyRatioPpm = static_cast<int32_t>(std::llround(s.minCleanableDirtyRatio * 1'000'000.0));
-        c.segmentRollBytes          = s.segmentRollBytes;
+        // Disk footprint: a spec left at the production default (64 MiB, preallocated per partition per replica)
+        // rolls at the fixtures' 1 MiB; a test that asserts on rolling sets its own segmentRollBytes.
+        c.segmentRollBytes          = s.segmentRollBytes == TopicSpec{}.segmentRollBytes ? kTestSegmentRollBytes
+                                                                                         : s.segmentRollBytes;
         c.minCompactionLagMs        = s.minCompactionLagMs;
         c.maxCompactionLagMs        = s.maxCompactionLagMs;
         c.retentionCheckMs          = s.retentionCheckMs;

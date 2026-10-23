@@ -2437,7 +2437,7 @@ void BrokerNode::buildGateway() {
             const fs::path txnDir = fs::path{config_.dataDir} / "__transaction_state";
             fs::create_directories(txnDir);
 
-            txnLog_ = std::make_unique<rune::storage::Log>(txnDir.string());
+            txnLog_ = std::make_unique<rune::storage::Log>(txnDir.string(), config_.offsetLogSegmentRollBytes);
             txnLog_->recover();
 
             const NodeId selfId = static_cast<NodeId>(config_.nodeId);
@@ -2617,7 +2617,7 @@ void BrokerNode::buildGateway() {
             const fs::path metaDir = fs::path{config_.dataDir} / "__cluster_metadata";
             fs::create_directories(metaDir);
 
-            metadataLog_ = std::make_unique<rune::storage::Log>(metaDir.string());
+            metadataLog_ = std::make_unique<rune::storage::Log>(metaDir.string(), config_.offsetLogSegmentRollBytes);
             metadataLog_->recover();
 
             const NodeId selfId = static_cast<NodeId>(config_.nodeId);

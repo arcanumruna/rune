@@ -348,6 +348,23 @@ public:
     [[nodiscard]] int64_t lastCorrelationId() const noexcept { return corr_; }
     /// Authentication Task 17: how many non-Records frames arrived for `corr` (an exactly-one-answer check).
     [[nodiscard]] std::size_t framesFor(int64_t corr) const { auto it = frameCount_.find(corr); return it == frameCount_.end() ? 0 : it->second; }
+    /// Issue #278: Records frames seen for a subscription id no SubscribeResponse{OK} to this client ever named (a
+    /// subscription the broker registered although it refused it).
+    [[nodiscard]] std::size_t strayRecords() const {
+        std::size_t n = 0;
+        for (const PushedRecords& p : records_) {
+            bool granted = false;
+            for (const auto& [corr, code] : subscribes_) {
+                if (code != 0) continue;
+                if (const auto it = subscribeIds_.find(corr); it != subscribeIds_.end() && it->second == p.subscriptionId) {
+                    granted = true;
+                    break;
+                }
+            }
+            n += granted ? 0 : 1;
+        }
+        return n;
+    }
     /// Forget the last ConnectResponse, then wait for the next one (a machine that sent its own ConnectRequest through
     /// send()): nullopt if none by `deadline`.
     void forgetConnectResponse() noexcept { connect_.reset(); }
