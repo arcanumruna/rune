@@ -205,3 +205,31 @@ TEST(LoginThrottleRegression, EmptyHugeAndNulKeysNeverAliasAdversarialRegression
     EXPECT_TRUE(t.check(huge.substr(1), "h1", 0).allowed) << "one byte shorter is another name";
     EXPECT_TRUE(t.check("", "h3", 0).allowed) << "the empty user's pair is per host";
 }
+
+// Adversarial review of PR #596 (#189 test seam): clear() forgets EVERY table - the pair, the host, the user and the
+// known-pair entries - and the curve restarts from its free failures.  A clear that skipped any one table would leave a
+// stress probe's refusal answering a later login with a retry hint (or a stale known pair bypassing the user component).
+TEST(LoginThrottleRegression, ClearForgetsEveryTableAndTheCurveRestartsAdversarialRegression) {
+    LoginThrottle t; const int64_t now = 0;
+    t.onSuccess("victim", "home", now);                                                        // a known pair
+    for (int i = 0; i < 12; ++i) t.onFailure("victim", "src" + std::to_string(i), now);       // the user component only
+    for (int i = 0; i < 12; ++i) t.onFailure("u" + std::to_string(i), "sweeper", now);         // the host component only
+    for (int i = 0; i < 5; ++i) t.onFailure("p", "q", now);                                    // the pair component
+    ASSERT_FALSE(t.check("victim", "elsewhere", now).allowed);
+    ASSERT_TRUE(t.check("victim", "home", now).allowed) << "the known pair bypasses the user component";
+    ASSERT_FALSE(t.check("nobody", "sweeper", now).allowed);
+    ASSERT_FALSE(t.check("p", "q", now).allowed);
+
+    t.clear();
+    EXPECT_TRUE(t.check("victim", "elsewhere", now).allowed) << "user table cleared";
+    EXPECT_TRUE(t.check("nobody", "sweeper", now).allowed) << "host table cleared";
+    EXPECT_TRUE(t.check("p", "q", now).allowed) << "pair table cleared";
+    // the known pair is gone too: the user component (re-armed) now delays the victim at home
+    for (int i = 0; i < 12; ++i) t.onFailure("victim", "again" + std::to_string(i), now);
+    EXPECT_FALSE(t.check("victim", "home", now).allowed) << "known-pair table cleared";
+    // the pair curve restarts: two free failures, then the 250 ms base delay
+    t.onFailure("p", "q", now); t.onFailure("p", "q", now);
+    EXPECT_TRUE(t.check("p", "q", now).allowed);
+    t.onFailure("p", "q", now);
+    EXPECT_EQ(t.check("p", "q", now).retryAfterMs, 250u);
+}
