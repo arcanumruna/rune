@@ -150,6 +150,7 @@ public:
         pc::DefineTopic m;
         m.sessionId = r_.builder; m.correlationId = r_.c().nextCorrelationId(); m.topicName = name; m.partitionCount = 1;
         m.keyField = ""; m.validate = false; m.persistence = 0;
+        m.config = authRigTopicConfig();
         m.hasExt = true; m.ext.clientName = "auth-matrix"; m.ext.requestId = {0xA07E'1700'0000'0000ull, static_cast<uint64_t>(m.correlationId)};
         std::vector<uint8_t> buf(m.encodedSize());
         const std::size_t len = m.encode(buf.data());
@@ -391,9 +392,9 @@ public:
                 break;
             }
             case Op::Metadata: metadata(sid, a); break;
-            case Op::CreateTopic: a.wantTempl = tmpl(TID::DefineTopicResponse); a.corr = r_.c().sendDefineTopic(r_.ch(), r_.stream(), sid, newTopic(), 1, authRigCharBlob()); a.code = ddl(a); okDdl(a, newTopic(), false); break;
+            case Op::CreateTopic: a.wantTempl = tmpl(TID::DefineTopicResponse); a.corr = r_.c().sendDefineTopic(r_.ch(), r_.stream(), sid, newTopic(), 1, authRigCharBlob(), 0, {}, 0, authRigTopicConfig()); a.code = ddl(a); okDdl(a, newTopic(), false); break;
             case Op::CreateView: a.wantTempl = tmpl(TID::CreateViewResponse); a.corr = r_.c().sendCreateView(r_.ch(), r_.stream(), sid, newView(), "id", 0, authRigViewPlan(newView(), {tid_})); a.code = ddl(a); okDdl(a, newView(), false); break;
-            case Op::CreateSchema: a.wantTempl = tmpl(TID::DefineTopicResponse); a.corr = r_.c().sendDefineTopic(r_.ch(), r_.stream(), sid, u(), 1, authRigCharBlob()); a.code = ddl(a); okDdl(a, u(), false); break;
+            case Op::CreateSchema: a.wantTempl = tmpl(TID::DefineTopicResponse); a.corr = r_.c().sendDefineTopic(r_.ch(), r_.stream(), sid, u(), 1, authRigCharBlob(), 0, {}, 0, authRigTopicConfig()); a.code = ddl(a); okDdl(a, u(), false); break;
             case Op::AlterSchema: {
                 rune::codec::AlterOp o{};
                 o.type = rune::codec::AlterOpType::Add; o.name = "extra"; o.primType = rune::codec::PrimType::Int64; o.fixedLen = 0;

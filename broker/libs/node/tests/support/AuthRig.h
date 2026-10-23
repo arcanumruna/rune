@@ -46,6 +46,15 @@ inline std::vector<uint8_t> authRigViewPlan(const std::string& viewName, const s
     return rv::serializeAuthored(p);
 }
 
+/// The rig's topics roll at 1 MiB, not the 64 MiB default: the log preallocates (fallocate) its active segment to
+/// segmentRollBytes, ~67.7 MB per topic, ~35 GB for the 720-cell matrix in one process (#571).
+inline constexpr int64_t kRigSegmentRollBytes = 1LL << 20;
+inline rune::protocol::TopicConfigView authRigTopicConfig() {
+    rune::protocol::TopicConfigView c;
+    c.segmentRollBytes = kRigSegmentRollBytes;
+    return c;
+}
+
 namespace grants {
 using SO = rune::protocol::SecurityOperation;
 using ST = rune::protocol::SecurityResourceType;
@@ -115,7 +124,8 @@ public:
     // ── DDL as the builder (precondition setup) ─────────────────────────────────────────────────────────────
     int32_t defineTopic(int64_t sid, const std::string& name, bool typed = true) {
         const auto r = c().awaitDefine(c().sendDefineTopic(ch(), stream(), sid, name, 1,
-                                                           typed ? authRigCharBlob() : std::vector<uint8_t>{}), dl(20));
+                                                           typed ? authRigCharBlob() : std::vector<uint8_t>{},
+                                                           0, {}, 0, authRigTopicConfig()), dl(20));
         return r && r->errorCode == 0 ? r->topicId : -1;
     }
     int32_t createView(int64_t sid, const std::string& name, int32_t source) {
@@ -211,7 +221,8 @@ public:
         return a ? a->code : kNoAnswer;
     }
     int defineTopicCode(int64_t sid, const std::string& name) {
-        return ddlCode(c().sendDefineTopic(ch(), stream(), sid, name, 1, authRigCharBlob()));
+        return ddlCode(c().sendDefineTopic(ch(), stream(), sid, name, 1, authRigCharBlob(), 0, {}, 0,
+                                              authRigTopicConfig()));
     }
     int createViewCode(int64_t sid, const std::string& name, int32_t source) {
         return ddlCode(c().sendCreateView(ch(), stream(), sid, name, "id", 0, authRigViewPlan(name, {source})));

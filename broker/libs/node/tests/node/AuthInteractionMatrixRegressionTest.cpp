@@ -4,6 +4,10 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/stat.h>
+
+#include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <vector>
 
@@ -32,14 +36,13 @@ namespace {
 bool isStream(Op op) { return op == Op::Subscribe || op == Op::CatalogRead || op == Op::SecurityRead; }
 }  // namespace
 
-TEST_P(AuthMatrixRegression, Cell) {
-    const Cell c = GetParam();
+static void runCell(AuthMatrixRig& rig, const Cell& c) {
     if (const NaRule na = naRule(c.op, c.grant, c.timing); na != NaRule::None) GTEST_SKIP() << name(na);
     const ExpectedCodes want = expectedCodes(c.op, c.grant, c.timing);
     const std::string label = std::string(name(c.op)) + "/" + std::string(name(c.grant)) + "/" + std::string(name(c.timing));
     const bool missing = c.timing == Timing::ObjectMissing;
     const Outcome outcome = expect(c.op, c.grant, c.timing);
-    auto cell = rig_->newCell();
+    auto cell = rig.newCell();
     struct Closer { decltype(cell)& c; ~Closer() { c.close(); } } closer{cell};
 
     if (c.timing != Timing::CreatedAfterLogin) { cell.createObjects(c.op, /*supportingOnly=*/missing); ASSERT_FALSE(::testing::Test::HasFatalFailure()); }
@@ -109,6 +112,8 @@ TEST_P(AuthMatrixRegression, Cell) {
     EXPECT_EQ(cell.principalProblem(), "") << label << ": every-cell assertion 6";
 }
 
+TEST_P(AuthMatrixRegression, Cell) { runCell(*rig_, GetParam()); }
+
 INSTANTIATE_TEST_SUITE_P(All, AuthMatrixRegression, ::testing::ValuesIn(allCells()), [](const auto& info) {
     return std::string(name(info.param.op)) + "_" + std::string(name(info.param.grant)) + "_" + std::string(name(info.param.timing));
 });
@@ -146,6 +151,45 @@ TEST(AuthMatrixRigRegression, CellBaselineIsTheRigTallyNotARacyReadRegression) {
     cell.close();
     auto next = rig.newCell();   // the next cell's baseline includes that login, whatever the publish timing was
     EXPECT_EQ(next.okAtStart(), 5);
+}
+
+namespace {
+// Allocated bytes (st_blocks * 512) under `dir`; symlinks are not followed.
+uint64_t allocatedBytes(const std::filesystem::path& dir) {
+    uint64_t sum = 0;
+    struct stat st{};
+    if (::lstat(dir.c_str(), &st) != 0) return 0;
+    sum += static_cast<uint64_t>(st.st_blocks) * 512;
+    if (!S_ISDIR(st.st_mode)) return sum;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        struct stat cs{};
+        if (::lstat(it->path().c_str(), &cs) != 0 || S_ISLNK(cs.st_mode)) continue;
+        sum += S_ISDIR(cs.st_mode) ? allocatedBytes(it->path()) : static_cast<uint64_t>(cs.st_blocks) * 512;
+    }
+    return sum;
+}
+}  // namespace
+
+// #571: every topic's active log segment is fallocate'd to its segmentRollBytes (64 MiB default), ~67.7 MB per topic and
+// ~35 GB for the 720 cells in one process.  The rig now defines its topics with kRigSegmentRollBytes (1 MiB).  Measured with
+// one shard (65 executed cells): before 3.69 GB allocated at peak (~57 MB per cell); after 449 MB for 64 cells (6 fixed internal topics x 67 MB
+// = ~400 MB of that is the product default, plus ~71 MB of rig topics, ~1.1 MB each).  The budget is
+// min(512 MiB, 4 x 449 MB) = 512 MiB over the first 64 applicable cells; 64 MiB rig topics would exceed 4 GB.
+// Mutation: kRigSegmentRollBytes = 64 MiB turns this red.
+TEST(AuthMatrixDiskRegression, TheMatrixRigStaysUnderADiskBudgetRegression) {
+    AuthMatrixRig rig;
+    int ran = 0;
+    for (const Cell& c : allCells()) {
+        if (naRule(c.op, c.grant, c.timing) != NaRule::None) continue;
+        if (ran++ == 64) break;
+        runCell(rig, c);
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    }
+    const uint64_t bytes = allocatedBytes(rig.rig().broker().dir());
+    GTEST_LOG_(INFO) << "allocated bytes after " << (ran > 64 ? 64 : ran) << " cells: " << bytes;
+    constexpr uint64_t kBudget = 512ull << 20;
+    EXPECT_LT(bytes, kBudget) << "the rig's data dir holds " << bytes << " allocated bytes after 64 cells";
 }
 
 TEST(AuthMatrixCountRegression, CellCountsArePinned) {
