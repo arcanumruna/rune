@@ -3,6 +3,7 @@
 // library — on the SAME EventLogStream the catalog reader runs on.  A fake broker serves the golden formatVer-1
 // script; the blocking Client::security* reads run with the fake pumped from a helper thread (the Invoker owner
 // pumps only the client).
+#include <filesystem>
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
 
@@ -32,7 +33,7 @@ int g_ctr = 0;
 rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {
     rc::ClientConfig c;
     c.gatewayChannel = "aeron:ipc"; c.gatewayStreamId = in; c.egressChannel = "aeron:ipc"; c.egressStreamId = eg;
-    c.dataDir = "/tmp/security_reader_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/security_reader_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     c.runnerMode = rc::RunnerMode::Invoker;
     c.nanoClock = &fakeNow;
     return c;

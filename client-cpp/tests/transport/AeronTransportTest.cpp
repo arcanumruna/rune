@@ -14,6 +14,7 @@
 //   - Multi-frame: payload > Aeron default MTU (4 KiB) forces fragmentation;
 //     FragmentAssembler reassembles it back.
 
+#include <filesystem>
 #include <rune/client/transport/AeronTransport.h>
 
 #include <gtest/gtest.h>
@@ -55,7 +56,7 @@ static std::atomic<int> g_dirCounter{0};
 /// Unique driver dir: /tmp/cc3_test_<pid>_<counter>
 static std::string uniqueDataDir() {
     const int c = g_dirCounter.fetch_add(1, std::memory_order_relaxed);
-    return std::string("/tmp/cc3_test_") +
+    return std::string(std::filesystem::temp_directory_path().string() + "/cc3_test_") +
            std::to_string(static_cast<long>(::getpid())) + "_" +
            std::to_string(c);
 }

@@ -45,7 +45,7 @@ namespace rp  = rune::protocol::client;
 namespace {
 std::atomic<int> g_ctr{0};
 std::string uniqueDir(const char* prefix) {
-    return std::string("/tmp/") + prefix + "_" + std::to_string(static_cast<long>(::getpid())) +
+    return std::string(std::filesystem::temp_directory_path().string() + "/") + prefix + "_" + std::to_string(static_cast<long>(::getpid())) +
            "_" + std::to_string(g_ctr.fetch_add(1));
 }
 

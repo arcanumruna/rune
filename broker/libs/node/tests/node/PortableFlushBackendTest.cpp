@@ -5,6 +5,7 @@
 //   2. BadFdCompletesWithError           — bad fd surfaces EBADF, never OK.
 //   3. SubmitRingFullReturnsNoToken      — back-pressure: small ring floods → kNoToken.
 
+#include <filesystem>
 #include <rune/node/PortableFlushBackend.h>
 
 #include <gtest/gtest.h>
@@ -22,7 +23,8 @@
 // Test 1: round-trip a real fd
 // ---------------------------------------------------------------------------
 TEST(PortableFlushBackend, SubmitThenReapCompletesForRealFd) {
-    char path[] = "/tmp/rune_pfb_XXXXXX";
+    std::string pathBuf = (std::filesystem::temp_directory_path() / "rune_pfb_XXXXXX").string();
+    char* path = pathBuf.data();
     int fd = mkstemp(path);
     ASSERT_GE(fd, 0);
     ASSERT_EQ(::write(fd, "hello", 5), 5);

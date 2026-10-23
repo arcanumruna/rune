@@ -31,6 +31,7 @@
 // transport is not started (no send occurs, no throw), which is exactly the parked
 // state the routing table models.
 
+#include <filesystem>
 #include <rune/client/agent/ClientAgent.h>
 #include <rune/client/metadata/MetadataCache.h>
 
@@ -52,7 +53,7 @@ rca::AgentConfig makeAgentConfig(const std::string& seedChannel) {
     cfg.transport.ingressStreamId = 1;
     cfg.transport.egressChannel   = "aeron:ipc";
     cfg.transport.egressStreamId  = 2;
-    cfg.transport.dataDir         = "/tmp/rune-mn-routing-unused";  // never start()ed
+    cfg.transport.dataDir         = std::filesystem::temp_directory_path().string() + "/rune-mn-routing-unused";  // never start()ed
     return cfg;
 }
 

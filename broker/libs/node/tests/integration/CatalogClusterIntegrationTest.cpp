@@ -2700,3 +2700,240 @@ TEST(ViewReadLeaseRegression, AStalledLeaseRenewalAnswersEveryReadRetriablyAndRe
     ASSERT_TRUE(back.ok()) << "renewal resumed: the row is served again";
     EXPECT_EQ(rowHp(back.row), 1);
 }
+
+// ===========================================================================
+// Issue #141 (VLS Part B at broker level, 3 nodes): a view sink is replica-less and catalog-only (NoMove).  A runtime
+// CREATE VIEW over a typed 4-partition source on three real brokers:
+//   (a) no broker holds a replica or an assignment (the routing image) for any partition of the sink id, and in the
+//       client metadata the sink is only an alias of its source (each sink partition's leader is the source
+//       partition's, VLS B.2) - never a partition leader of its own;
+//   (b) GetViewRow is answered OK with the expected row by EACH source partition's leader (the broker that folds it),
+//       and a read through any other broker is redirected there;
+//   (c) after a real crash of one source partition's leader, a read of a key on that partition is answered OK by the
+//       NEW leader with the row value - never by the dead broker.
+// Mutation (a): CREATE VIEW placing the sink like a topic (BrokerNode::onCatalogTopicApplied_ with spec.viewSink =
+// false) turns (a) red.
+// ===========================================================================
+namespace {
+/// What broker `n` holds of the sink `sinkId` (partitions [0, parts]): empty when nothing, else what it found.
+std::string sinkFootprintOn(ThreeNodes& c, Rig& rig, int n, int32_t sinkId, int32_t parts) {
+    std::string found;
+    BrokerNode& b = c.node(n);
+    for (int32_t p = 0; p <= parts; ++p) {   // one past the source's count, too
+        const bool assigned = b.onControlThreadForTest([&b, sinkId, p]() {
+            const MetadataService* ms = b.metadataServiceForTest();
+            return ms != nullptr && ms->assignment(sinkId, p) != nullptr;
+        });
+        if (assigned) found += " assignment(p" + std::to_string(p) + ")";
+        const bool replica = b.onOwnerThreadForTest(sinkId, p, [](rune::replication::PartitionReplica* r) { return r != nullptr; });
+        if (replica) found += " replica(p" + std::to_string(p) + ")";
+    }
+    return found;
+}
+/// Broker `n`'s client metadata: the sink appears only as an ALIAS of its source (VLS B.2: each sink partition's leader is
+/// synthesised from the source partition's entry in the same answer), never with a leader of its own.  Empty when so.
+std::string sinkMetadataOn(ThreeNodes& c, Rig& rig, int n, int32_t srcId, int32_t sinkId, int32_t parts) {
+    const int64_t sid = rig.session(n);
+    if (sid <= 0) return " (no session for the metadata read)";
+    std::map<int32_t, int32_t> src, sink;
+    for (const auto& pi : rig.cl().metadata(c.clientChannel(n), kClientStream, sid)) {
+        if (pi.topicId == srcId) src[pi.partition] = pi.leaderId;
+        if (pi.topicId == sinkId) sink[pi.partition] = pi.leaderId;
+    }
+    std::string found;
+    if (static_cast<int32_t>(src.size()) != parts) found += " source has " + std::to_string(src.size()) + " entries";
+    for (const auto& [p, l] : sink) {
+        const auto it = src.find(p);
+        if (p >= parts || it == src.end() || it->second != l)
+            found += " sink p" + std::to_string(p) + " names leader " + std::to_string(l) + " (source: " +
+                     (it == src.end() ? std::string("none") : std::to_string(it->second)) + ")";
+    }
+    return found;
+}
+}  // namespace
+
+TEST(ViewSinkPlaneRegression, ThreeBrokersCreateViewHasNoSinkReplicaAndGetViewRowFollowsTheSourceLeaderRegression) {
+    constexpr int32_t kParts = 4;
+    ThreeNodes c = ThreeNodes::start("vsp141");
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    Rig rig(c);
+    const int leader = c.settledLeader();
+    ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("src", kParts, true), "define src", leader));
+    const auto si = rig.topicInfo(leader, "src", 30s);
+    ASSERT_TRUE(si.has_value());
+    ASSERT_EQ(si->partitions, kParts);
+    ASSERT_NO_FATAL_FAILURE(rig.must(createViewSender("v", si->id), "create v", leader));
+    std::optional<TopicInfo> vi;
+    for (int n = 1; n <= 3; ++n) {   // applied on every broker, with one id
+        const auto t = rig.topicInfo(n, "v", 30s);
+        ASSERT_TRUE(t.has_value()) << "view v never applied on node " << n;
+        if (!vi) vi = t;
+        ASSERT_EQ(t->id, vi->id) << "node " << n;
+    }
+    ASSERT_NE(vi->id, si->id);
+
+    // A keyed record per source partition: key k_p routes (the gateway's partitionForKey) to partition p, hp = 10 + p.
+    int64_t keys[kParts];
+    for (int32_t p = 0; p < kParts; ++p) {
+        keys[p] = viewKeyFor(p, kParts);
+        ASSERT_GT(keys[p], 0);
+        const ProduceIdentity ident = freshIdentity();
+        ASSERT_TRUE(rig.produceFollowing(leader, si->id, p,
+                                         batchFor(true, keys[p], asString(characterValue(keys[p], 10 + p)), ident), 60s, ident))
+            << "key " << keys[p] << " (p" << p << ") was never acked";
+    }
+    int leaderOf[kParts];
+    for (int32_t p = 0; p < kParts; ++p) {
+        leaderOf[p] = -1;
+        for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && leaderOf[p] < 0;) {
+            leaderOf[p] = rig.partitionLeader(leader, si->id, p);
+            if (leaderOf[p] < 0) std::this_thread::sleep_for(50ms);
+        }
+        ASSERT_GT(leaderOf[p], 0) << "no leader for src p" << p;
+    }
+
+    // (b) every row is served by its source partition's leader; a read through any broker ends there.
+    for (int32_t p = 0; p < kParts; ++p) {
+        const auto r = rig.viewRowSettled(leaderOf[p], vi->id, static_cast<uint64_t>(keys[p]), 30s);
+        ASSERT_TRUE(r.ok()) << "p" << p << ": GetViewRow through its leader " << leaderOf[p] << " ended "
+                            << (r.finalIsError ? "error " : "status ") << r.finalCode;
+        EXPECT_FALSE(r.firstIsError) << "p" << p << ": the leader answered itself (no redirect)";
+        EXPECT_EQ(r.finalNode, leaderOf[p]);
+        EXPECT_EQ(rowHp(r.row), 10 + p);
+        for (int n = 1; n <= 3; ++n) {
+            const auto via = rig.viewRowSettled(n, vi->id, static_cast<uint64_t>(keys[p]), 30s);
+            ASSERT_TRUE(via.ok()) << "p" << p << " through node " << n;
+            EXPECT_EQ(via.finalNode, leaderOf[p]) << "p" << p << " through node " << n << ": served by the source leader";
+            EXPECT_EQ(rowHp(via.row), 10 + p);
+        }
+    }
+
+    // (a) the sink owns nothing anywhere: no replica, no assignment (the routing image), and in the metadata a client
+    // routes by it is only an alias of its source - never a leader of its own.
+    for (int n = 1; n <= 3; ++n) {
+        const std::string fp = sinkFootprintOn(c, rig, n, vi->id, kParts);
+        EXPECT_TRUE(fp.empty()) << "node " << n << " holds the view sink " << vi->id << ":" << fp;
+        const std::string md = sinkMetadataOn(c, rig, n, si->id, vi->id, kParts);
+        EXPECT_TRUE(md.empty()) << "node " << n << "'s metadata for the view sink " << vi->id << ":" << md;
+    }
+
+    // (c) crash one source partition's leader (preferably not the controller, so the controller fails it over at once).
+    int ctrl = -1;
+    for (int n = 1; n <= 3; ++n) if (c.node(n).isLeader()) ctrl = n;
+    int zp = 0;
+    for (int32_t p = 0; p < kParts; ++p) if (leaderOf[p] != ctrl) { zp = p; break; }
+    const int victim = leaderOf[zp];
+    const int64_t key = keys[zp];
+    rig.pumping([&] { c.crash(victim); });
+    rig.forget(victim);
+    int survivor = -1;
+    for (int n = 1; n <= 3; ++n) if (n != victim) { survivor = n; break; }
+    int newLeader = -1;
+    for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline && newLeader < 0;) {
+        const int l = rig.partitionLeader(survivor, si->id, zp);
+        if (l > 0 && l != victim) newLeader = l;
+        else std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_GT(newLeader, 0) << "src p" << zp << " never failed over off the crashed node " << victim;
+    const auto fresh = rig.viewRowSettled(newLeader, vi->id, static_cast<uint64_t>(key), 30s);
+    ASSERT_TRUE(fresh.ok()) << "the new leader " << newLeader << " serves p" << zp << "'s row: ended "
+                            << (fresh.finalIsError ? "error " : "status ") << fresh.finalCode;
+    EXPECT_EQ(fresh.finalNode, newLeader);
+    EXPECT_NE(fresh.finalNode, victim);
+    EXPECT_EQ(rowHp(fresh.row), 10 + zp);
+    for (int n = 1; n <= 3; ++n) {
+        if (n == victim) continue;
+        const auto via = rig.viewRowSettled(n, vi->id, static_cast<uint64_t>(key), 30s);
+        ASSERT_TRUE(via.ok()) << "p" << zp << " through survivor " << n;
+        EXPECT_EQ(via.finalNode, newLeader) << "through survivor " << n << ": never the dead broker " << victim;
+        EXPECT_EQ(rowHp(via.row), 10 + zp);
+        EXPECT_EQ(sinkFootprintOn(c, rig, n, vi->id, kParts), "") << "node " << n << " after the failover";
+        EXPECT_EQ(sinkMetadataOn(c, rig, n, si->id, vi->id, kParts), "") << "node " << n << " after the failover";
+    }
+}
+
+// ===========================================================================
+// Adversarial review of PR #597 (#141 / #143), sibling entry points of the sink plane on three real brokers: ALTER VIEW
+// moves the view to a FRESH sink id and DROP VIEW removes it.  After the ALTER, on every broker: the fresh sink holds no
+// replica or assignment and is only a metadata alias of its source, its rows are served by each source partition's
+// leader, and a read of the OLD sink id is a permanent UnknownView (never a stale table).  After the DROP, every read of
+// the fresh sink is UnknownView on every broker and it still holds nothing.  Mutation: CREATE/ALTER VIEW placing the
+// sink like a topic (BrokerNode::onCatalogTopicApplied_ with spec.viewSink = false) turns the footprint checks red.
+// ===========================================================================
+TEST(ViewSinkPlaneAdversarial, AlterViewMovesToAFreshReplicaLessSinkAndDropViewRetiresItEverywhereAdversarialRegression) {
+    constexpr int32_t kParts = 4;
+    ThreeNodes c = ThreeNodes::start("vsp597");
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    Rig rig(c);
+    const int leader = c.settledLeader();
+    ASSERT_NO_FATAL_FAILURE(rig.must(defineSender("src", kParts, true), "define src", leader));
+    const auto si = rig.topicInfo(leader, "src", 30s);
+    ASSERT_TRUE(si.has_value());
+    ASSERT_NO_FATAL_FAILURE(rig.must(createViewSender("v", si->id), "create v", leader));
+    const auto v1 = rig.topicInfo(leader, "v", 30s);
+    ASSERT_TRUE(v1.has_value());
+    int64_t keys[kParts];
+    for (int32_t p = 0; p < kParts; ++p) {
+        keys[p] = viewKeyFor(p, kParts);
+        ASSERT_GT(keys[p], 0);
+        const ProduceIdentity ident = freshIdentity();
+        ASSERT_TRUE(rig.produceFollowing(leader, si->id, p,
+                                         batchFor(true, keys[p], asString(characterValue(keys[p], 20 + p)), ident), 60s, ident))
+            << "p" << p;
+    }
+
+    const Sender alterV = [&](ShardTestClient& cl, const std::string& ch, int64_t sid, RequestId rid) {
+        return cl.sendAlterView(ch, kClientStream, sid, "v", "id", 0, 0, viewPlanBlob("v", si->id, 0), rid);
+    };
+    ASSERT_NO_FATAL_FAILURE(rig.must(alterV, "alter v", leader));
+    int32_t freshId = -1;
+    for (int n = 1; n <= 3; ++n) {   // every broker applies the ALTER, with one fresh id
+        std::optional<TopicInfo> t;
+        for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline;) {
+            t = rig.topicInfo(n, "v", 5s);
+            if (t && t->id != v1->id) break;
+        }
+        ASSERT_TRUE(t.has_value() && t->id != v1->id) << "node " << n << " never applied ALTER VIEW v";
+        if (freshId < 0) freshId = t->id;
+        ASSERT_EQ(t->id, freshId) << "node " << n;
+    }
+
+    auto readUntil = [&](int n, int32_t sinkId, int64_t key, int wantCode) {
+        Rig::ViewRead r;
+        for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline;) {
+            r = rig.viewRowFollowing(n, sinkId, static_cast<uint64_t>(key));
+            if (r.answered && !r.finalIsError && r.finalCode == wantCode) return r;
+            std::this_thread::sleep_for(50ms);
+        }
+        return r;
+    };
+    for (int32_t p = 0; p < kParts; ++p) {
+        for (int n = 1; n <= 3; ++n) {
+            const auto fresh = readUntil(n, freshId, keys[p], pc::ViewRowResponse::kOk);
+            ASSERT_TRUE(fresh.ok()) << "p" << p << " fresh sink through node " << n << ": "
+                                    << (fresh.finalIsError ? "error " : "status ") << fresh.finalCode;
+            EXPECT_EQ(rowHp(fresh.row), 20 + p) << "the fresh sink re-folds the source from its start";
+            EXPECT_EQ(fresh.finalNode, rig.partitionLeader(leader, si->id, p)) << "served by the source leader";
+            const auto old = rig.viewRowFollowing(n, v1->id, static_cast<uint64_t>(keys[p]));
+            ASSERT_TRUE(old.answered) << "p" << p << " old sink through node " << n;
+            EXPECT_FALSE(old.finalIsError);
+            EXPECT_EQ(old.finalCode, pc::ViewRowResponse::kUnknownView) << "the retired sink never serves a stale table";
+        }
+    }
+    for (int n = 1; n <= 3; ++n) {
+        EXPECT_EQ(sinkFootprintOn(c, rig, n, freshId, kParts), "") << "node " << n << ": the fresh sink";
+        EXPECT_EQ(sinkFootprintOn(c, rig, n, v1->id, kParts), "") << "node " << n << ": the retired sink";
+        EXPECT_EQ(sinkMetadataOn(c, rig, n, si->id, freshId, kParts), "") << "node " << n;
+    }
+
+    ASSERT_NO_FATAL_FAILURE(rig.must(dropViewSender("v"), "drop v", leader));
+    for (int n = 1; n <= 3; ++n) {
+        for (int32_t p = 0; p < kParts; ++p) {
+            const auto gone = readUntil(n, freshId, keys[p], pc::ViewRowResponse::kUnknownView);
+            ASSERT_TRUE(gone.answered) << "p" << p << " through node " << n;
+            EXPECT_FALSE(gone.finalIsError) << "p" << p << " through node " << n;
+            EXPECT_EQ(gone.finalCode, pc::ViewRowResponse::kUnknownView) << "p" << p << " through node " << n;
+        }
+        EXPECT_EQ(sinkFootprintOn(c, rig, n, freshId, kParts), "") << "node " << n << " after DROP VIEW";
+    }
+}

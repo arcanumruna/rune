@@ -38,7 +38,7 @@ using namespace rune::replication;
 static std::string makeUniq(const std::string& tag) {
     static std::atomic<uint64_t> seq{0};
     auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
-    return std::string("/tmp/rune_apt_") + tag + "_" +
+    return std::string(std::filesystem::temp_directory_path().string() + "/rune_apt_") + tag + "_" +
            std::to_string(::getpid()) + "_" +
            std::to_string(seq.fetch_add(1)) + "_" +
            std::to_string(ts);

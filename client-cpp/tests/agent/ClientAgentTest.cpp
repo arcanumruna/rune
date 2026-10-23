@@ -57,7 +57,7 @@ static std::atomic<int> g_dirCounter{0};
 /// Unique driver dir: /tmp/cc5_test_<pid>_<counter>
 std::string uniqueDir() {
     const int c = g_dirCounter.fetch_add(1, std::memory_order_relaxed);
-    return std::string("/tmp/cc5_test_") +
+    return std::string(std::filesystem::temp_directory_path().string() + "/cc5_test_") +
            std::to_string(static_cast<long>(::getpid())) + "_" +
            std::to_string(c);
 }

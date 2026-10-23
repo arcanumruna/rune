@@ -10,7 +10,9 @@
 //
 // FROZEN with formatVer 1: tests/catalog/golden/v1/basic.rcat was generated from this script
 // and CatalogGoldenRegression.TheGoldenScriptStillProducesTheCheckedInBytes pins it.  Never
-// edit an event; a new formatVer gets a new script beside this one.
+// edit an event; a new formatVer gets a new script beside this one.  (One deliberate exception, #143:
+// the view sinks were made to mirror their first source's partition count when that became an
+// apply rule; basic.rcat and CatalogGoldenPins.h were regenerated with tools/make_catalog_golden.)
 //
 // Offsets (objectId / topicId in brackets):
 //   0 CreateTopic players     typed {id i64 key, hp i32, guild str}, disk, 8 partitions, rf 3,
@@ -23,9 +25,9 @@
 //   6 SetCompatibility players FORWARD
 //   7 AlterTopicConfig events retention.ms 60000
 //   8 AlterTopicConfig events retention.bytes 1 GiB, min.cleanable.dirty.ratio 0.25
-//   9 CreateView top_players  over players, sink 3                                  [4 / 3]
-//  10 AlterView top_players   fresh sink 4 (old 3), transient, 4 partitions, wider output
-//  11 CreateView ev_view      over events, sink 5                                   [5 / 5]
+//   9 CreateView top_players  over players, sink 3, 8 partitions                    [4 / 3]
+//  10 AlterView top_players   fresh sink 4 (old 3), transient, 8 partitions, wider output
+//  11 CreateView ev_view      over events, sink 5, 4 partitions                     [5 / 5]
 //  12 DropView ev_view
 //  13 DropTopic presence
 //  14 CreateTopic presence    reuse: new objectId, transient, untyped               [6 / 6]
@@ -35,9 +37,11 @@
 //  18 CreateSchema presence   {player i64 key, zone fixedstr(8)}  (replayedFrom set)
 //  19 AlterSchema presence    ADD status fixedstr(4), DROP zone, SET COMPATIBILITY BACKWARD
 //  20 SetCompatibility presence FORWARD
-//  21 CreateView ev_view      reuse of a VIEW name: new objectId, over events, sink 8   [8 / 8]
-//  22 AlterView ev_view       fresh sink 9 (old 8), two sources (events, presence) (replayedFrom set)
+//  21 CreateView ev_view      reuse of a VIEW name: new objectId, over events, sink 8, 4 partitions [8 / 8]
+//  22 AlterView ev_view       fresh sink 9 (old 8), two sources (events, presence), 4 partitions
+//                             (replayedFrom set)
 // Every kind appears at least twice; replayedFrom is present on 4, 18, 22 and absent elsewhere.
+// Every view sink has its FIRST source's partition count (#143: the apply rule refuses anything else).
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/catalog/CatalogState.h>
 #include <rune/codec/AlterOps.h>
@@ -250,7 +254,7 @@ inline cd::AlterOp setCompatOp(cd::CompatMode m) {
         cd::DescriptorBuilder out("top_players");
         out.add("id", cd::PrimType::Int64, 1, true).add("health", cd::PrimType::Int32);
         ViewDef v;
-        v.sinkPartitions = 2; v.persistence = Persistence::Disk; v.keyField = "id"; v.sourceNames = {"players"};
+        v.sinkPartitions = 8; v.persistence = Persistence::Disk; v.keyField = "id"; v.sourceNames = {"players"};
         v.normalizedPlanBlob = {0x01, 0x00, 0x00, 0x00, 0x00, 0x10, 0x20};
         v.compiledPlanBlob = {0xC0, 0x00, 0x00, 0x00, 0x00, 0x10, 0x20};
         v.outputDescriptorBlob = cd::serialize(out.build());
@@ -261,7 +265,7 @@ inline cd::AlterOp setCompatOp(cd::CompatMode m) {
         cd::DescriptorBuilder out("top_players");
         out.add("id", cd::PrimType::Int64, 1, true).add("health", cd::PrimType::Int32).add("mana", cd::PrimType::Int32);
         ViewDef v;
-        v.sinkPartitions = 4; v.persistence = Persistence::Transient; v.keyField = "id"; v.sourceNames = {"players"};
+        v.sinkPartitions = 8; v.persistence = Persistence::Transient; v.keyField = "id"; v.sourceNames = {"players"};
         v.normalizedPlanBlob = {0x01, 0x00, 0x00, 0x00, 0x00, 0x10, 0x20, 0x30};
         v.compiledPlanBlob = {0xC1, 0x00, 0x00, 0x00, 0x00, 0x10, 0x20, 0x30};
         v.outputDescriptorBlob = cd::serialize(out.build());
@@ -272,7 +276,7 @@ inline cd::AlterOp setCompatOp(cd::CompatMode m) {
         cd::DescriptorBuilder out("ev_view");
         out.add("kind", cd::PrimType::Enum, 1, false, {1, 2, 3}).add("n", cd::PrimType::UInt64);
         ViewDef v;
-        v.sinkPartitions = 1; v.sourceNames = {"events"};
+        v.sinkPartitions = 4; v.sourceNames = {"events"};
         v.normalizedPlanBlob = {0x02, 0x00, 0x00, 0x00, 0x00};
         v.compiledPlanBlob = {0xC2, 0x01, 0x00, 0x00, 0x00};
         v.outputDescriptorBlob = cd::serialize(out.build());
@@ -311,7 +315,7 @@ inline cd::AlterOp setCompatOp(cd::CompatMode m) {
         cd::DescriptorBuilder out("ev_view");
         out.add("at", cd::PrimType::UInt64, 1, true);
         ViewDef v;
-        v.sinkPartitions = 3; v.keyField = "at"; v.sourceNames = {"events"};
+        v.sinkPartitions = 4; v.keyField = "at"; v.sourceNames = {"events"};
         v.normalizedPlanBlob = {0x03, 0x00, 0x00, 0x00, 0x00};
         v.compiledPlanBlob = {0xC3, 0x01, 0x00, 0x00, 0x00};
         v.outputDescriptorBlob = cd::serialize(out.build());
@@ -321,7 +325,7 @@ inline cd::AlterOp setCompatOp(cd::CompatMode m) {
         cd::DescriptorBuilder out("ev_view");
         out.add("at", cd::PrimType::UInt64, 1, true).add("player", cd::PrimType::Int64);
         ViewDef v;
-        v.sinkPartitions = 3; v.keyField = "at"; v.sourceNames = {"events", "presence"};
+        v.sinkPartitions = 4; v.keyField = "at"; v.sourceNames = {"events", "presence"};
         v.normalizedPlanBlob = {0x04, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00};
         v.compiledPlanBlob = {0xC4, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00};
         v.outputDescriptorBlob = cd::serialize(out.build());

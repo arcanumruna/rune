@@ -4,6 +4,7 @@
 // an acked claim completes; batch-ack credit is exact for committed AND
 // aborted claims.  Drive loops are deadline-bounded (only a failing test
 // reaches the deadline); nothing sleeps.
+#include <filesystem>
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
 
@@ -39,7 +40,7 @@ rc::ClientConfig cfgFor(rc::RunnerMode mode, int32_t in, int32_t eg) {
     c.gatewayStreamId = in;
     c.egressChannel   = "aeron:ipc";
     c.egressStreamId  = eg;
-    c.dataDir = "/tmp/claim_client_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/claim_client_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     c.runnerMode = mode;
     rc::TopicSpec ts;
     ts.name           = "t";

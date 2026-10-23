@@ -5,6 +5,8 @@
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
 #include <gtest/gtest.h>
+#include <limits>
+#include <optional>
 
 namespace rc = rune::catalog;
 namespace cd = rune::codec;
@@ -166,7 +168,7 @@ TEST(CatalogApplyV1Regression, DropAndReuseGetsANewObjectIdAndTopicId) {
 TEST(CatalogApplyV1Regression, DropTopicReadByAViewIsRefused) {
     rc::CatalogState s;
     ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "src", 1, 0, 1), 0));
-    rc::ViewDef v; v.viewTopicId = 1; v.keyField = "id"; v.sourceNames = {"src"};
+    rc::ViewDef v; v.viewTopicId = 1; v.sinkPartitions = 2; v.keyField = "id"; v.sourceNames = {"src"};   // src has 2 (#143)
     v.outputDescriptorBlob = blob2(); v.normalizedPlanBlob = {1};
     ASSERT_TRUE(rc::apply(s, stamped(s, rc::CreateViewOps{v}, "v", 2, 0, 1), 1));
     rc::CatalogEvent e; e.kind = rc::EventKind::DropTopic; e.ops = rc::DropTopicOps{0};
@@ -179,7 +181,7 @@ TEST(CatalogApplyV1Regression, DropTopicReadByAViewIsRefused) {
 TEST(CatalogApplyV1Regression, AlterViewTakesAFreshSinkAndReportsBoth) {
     rc::CatalogState s;
     ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "src", 1, 0, 1), 0));
-    rc::ViewDef v; v.viewTopicId = 1; v.keyField = "id"; v.sourceNames = {"src"};
+    rc::ViewDef v; v.viewTopicId = 1; v.sinkPartitions = 2; v.keyField = "id"; v.sourceNames = {"src"};   // src has 2 (#143)
     v.outputDescriptorBlob = blob2(); v.normalizedPlanBlob = {1};
     ASSERT_TRUE(rc::apply(s, stamped(s, rc::CreateViewOps{v}, "v", 2, 0, 1), 1));
     rc::ViewDef v2 = v; v2.viewTopicId = 2; v2.normalizedPlanBlob = {2};
@@ -240,8 +242,9 @@ TEST(CatalogApplyV1Regression, FingerprintCoversEveryDefinitionField) {
 // ── every rule refuses each invalid precondition explicitly ──────────────────────────
 namespace {
 /// src (typed, obj 1, topic 0), u (untyped, obj 2, topic 1), v (view over src, obj 3, sink 2).
-rc::ViewDef viewOver(std::vector<std::string> sources, int32_t sink) {
-    rc::ViewDef v; v.viewTopicId = sink; v.keyField = "id"; v.sourceNames = std::move(sources);
+/// #143: a sink mirrors its FIRST source's partition count (createOps' topics have 2).
+rc::ViewDef viewOver(std::vector<std::string> sources, int32_t sink, int32_t sinkPartitions = 2) {
+    rc::ViewDef v; v.viewTopicId = sink; v.sinkPartitions = sinkPartitions; v.keyField = "id"; v.sourceNames = std::move(sources);
     v.outputDescriptorBlob = blob2(); v.normalizedPlanBlob = {1};
     return v;
 }
@@ -752,4 +755,224 @@ TEST(CatalogApplyV1Regression, ConfigEnumBoundsAreOneDefinitionForEventValidatio
         }
         EXPECT_EQ(accepted, f == F::Durability ? 2 : 3) << "field " << static_cast<int>(f);
     }
+}
+
+// ── #143: a view sink mirrors its (first) source's partition count, checked at apply ─────────────────
+// AdminWorker writes def.sinkPartitions = the first source's partitions and partition counts are immutable, so a
+// mismatch comes only from a crafted or foreign catalog.  The verified apply refuses it (CreateView and AlterView;
+// sink < source and sink > source; with two sources only the FIRST counts).  Each refused event carries the
+// fingerprint of the object it would create, so without the rule it would apply cleanly.
+namespace {
+struct SinkCase {
+    const char* what;
+    bool        alter;                     // AlterView of v (else CreateView "x")
+    std::vector<std::string> sources;
+    int32_t     sinkPartitions;
+    bool        refused;
+};
+}  // namespace
+
+TEST(CatalogApplyRegression, AViewSinkWhosePartitionCountDiffersFromItsSourceIsRefusedRegression) {
+    const std::vector<SinkCase> cases = {
+        {"create: sink < source",                   false, {"src"},       1, true},
+        {"create: sink > source",                   false, {"src"},       3, true},
+        {"create: sink == source",                  false, {"src"},       2, false},
+        {"create: two sources, sink = the 2nd's",   false, {"src", "w4"}, 4, true},
+        {"create: two sources, sink = the 1st's",   false, {"src", "w4"}, 2, false},
+        {"create: first source has 4",              false, {"w4", "src"}, 2, true},
+        {"create: first source has 4, sink 4",      false, {"w4", "src"}, 4, false},
+        {"alter: sink < source",                    true,  {"src"},       1, true},
+        {"alter: sink > source",                    true,  {"src"},       3, true},
+        {"alter: sink == source",                   true,  {"src"},       2, false},
+        {"alter: two sources, sink = the 2nd's",    true,  {"src", "w4"}, 4, true},
+        {"alter: re-source onto w4 keeping 2",      true,  {"w4"},        2, true},
+        {"alter: re-source onto w4 with 4",         true,  {"w4"},        4, false},
+    };
+    for (const SinkCase& c : cases) {
+        rc::CatalogState s = fixture();                                   // src, u (2 partitions), v over src (sink 2)
+        rc::CreateTopicOps w4 = createOps(3, false);
+        w4.partitions = 4;
+        ASSERT_TRUE(rc::apply(s, stamped(s, w4, "w4", 4, 0, 1), 3)) << c.what;
+        const uint64_t before = s.digest();
+        const rc::ViewDef def = viewOver(c.sources, /*sink=*/4, c.sinkPartitions);   // nextTopicId is 4
+        rc::CatalogEvent e;
+        rc::ViewObject result;
+        if (c.alter) {
+            e = raw(rc::AlterViewOps{def}, "v", 3, 1, 2);
+            result = rc::ViewObject{.objectId = 3, .name = "v", .version = 2, .def = def};
+        } else {
+            e = raw(rc::CreateViewOps{def}, "x", 5, 0, 1);
+            result = rc::ViewObject{.objectId = 5, .name = "x", .version = 1, .def = def};
+        }
+        e.fingerprint = rc::fingerprintOf(result);
+        const std::string first = c.sources.front();
+        const int32_t sourceParts = s.topicByName(first)->partitions;
+        auto a = rc::apply(s, e, 4);
+        if (!c.refused) {
+            EXPECT_TRUE(a.has_value()) << c.what << ": " << (a ? "" : a.error().detail);
+            continue;
+        }
+        if (a.has_value()) { ADD_FAILURE() << c.what << ": a sink of " << c.sinkPartitions << " over '" << first
+                                           << "' (" << sourceParts << ") was applied"; continue; }
+        EXPECT_EQ(a.error().code, rc::ApplyError::Code::Precondition) << c.what << ": " << a.error().detail;
+        EXPECT_EQ(a.error().offset, 4) << c.what;
+        const std::string& d = a.error().detail;
+        EXPECT_NE(d.find(c.alter ? "'v'" : "'x'"), std::string::npos) << c.what << ": names the view: " << d;
+        EXPECT_NE(d.find("sink partitions " + std::to_string(c.sinkPartitions)), std::string::npos) << c.what << ": " << d;
+        EXPECT_NE(d.find("source '" + first + "' has " + std::to_string(sourceParts)), std::string::npos) << c.what << ": " << d;
+        EXPECT_EQ(s.digest(), before) << c.what << ": a refused event changes nothing";
+        auto p = rc::previewFingerprint(s, e);
+        EXPECT_FALSE(p.has_value()) << c.what << ": previewFingerprint agrees with apply";
+    }
+}
+
+// ── Adversarial review of PR #597 (#143): the sink-partition rule at its bounds and over random DDL histories ─────
+namespace {
+/// A CreateView of `name` over `sources` with `sinkPartitions`, fingerprinted as the object it would create (so only
+/// the apply rules can refuse it).
+rc::CatalogEvent craftedCreateView(const rc::CatalogState& s, std::string name, std::vector<std::string> sources,
+                                   int32_t sinkPartitions) {
+    rc::ViewDef def = viewOver(std::move(sources), s.nextTopicId(), sinkPartitions);
+    rc::CatalogEvent e = raw(rc::CreateViewOps{def}, name, s.nextObjectId(), 0, 1);
+    e.fingerprint = rc::fingerprintOf(rc::ViewObject{.objectId = e.objectId, .name = name, .version = 1, .def = def});
+    return e;
+}
+rc::CatalogEvent craftedAlterView(const rc::CatalogState& s, const rc::ViewObject& v, std::vector<std::string> sources,
+                                  int32_t sinkPartitions) {
+    rc::ViewDef def = viewOver(std::move(sources), s.nextTopicId(), sinkPartitions);
+    rc::CatalogEvent e = raw(rc::AlterViewOps{def}, v.name, v.objectId, v.version, v.version + 1);
+    e.fingerprint = rc::fingerprintOf(rc::ViewObject{.objectId = v.objectId, .name = v.name, .version = v.version + 1, .def = def});
+    return e;
+}
+void expectEverySinkMirrorsItsFirstSource(const rc::CatalogState& s, const std::string& when) {
+    for (const rc::ViewObject* v : s.views()) {
+        const rc::TopicObject* first = s.topicByName(v->def.sourceNames.front());
+        ASSERT_NE(first, nullptr) << when << ": view " << v->name << " reads a dead topic";
+        EXPECT_EQ(v->def.sinkPartitions, first->partitions) << when << ": view " << v->name;
+    }
+}
+}  // namespace
+
+// Input bounds: sink partition counts at i32 min, -1, 0, P-1, P+1 and i32 max over sources of 1, 7 and i32 max
+// partitions, at CreateView and AlterView.  Only sink == P applies; every other one is a Precondition that changes
+// nothing, and the leader's previewFingerprint refuses it too.
+TEST(CatalogApplyAdversarial, SinkPartitionBoundsAdversarialRegression) {
+    constexpr int32_t kMax = std::numeric_limits<int32_t>::max();
+    constexpr int32_t kMin = std::numeric_limits<int32_t>::min();
+    for (const int32_t P : {1, 7, kMax}) {
+        std::vector<int32_t> sinks = {kMin, -1, 0, 1, P - 1, P, kMax};
+        if (P < kMax) sinks.push_back(P + 1);
+        for (const bool alter : {false, true}) {
+            for (const int32_t sink : sinks) {
+                const std::string what = std::string(alter ? "alter" : "create") + " source " + std::to_string(P) +
+                                         " sink " + std::to_string(sink);
+                rc::CatalogState s;
+                rc::CreateTopicOps t = createOps(0, true);
+                t.partitions = P;
+                ASSERT_TRUE(rc::apply(s, stamped(s, t, "s", 1, 0, 1), 0)) << what;
+                if (alter) ASSERT_TRUE(rc::apply(s, craftedCreateView(s, "v", {"s"}, P), 1)) << what;
+                const rc::CatalogEvent e =
+                    alter ? craftedAlterView(s, *s.viewByName("v"), {"s"}, sink) : craftedCreateView(s, "v", {"s"}, sink);
+                const uint64_t before = s.digest();
+                const bool expectOk = sink == P;
+                EXPECT_EQ(rc::previewFingerprint(s, e).has_value(), expectOk) << what;
+                auto a = rc::apply(s, e, 2);
+                ASSERT_EQ(a.has_value(), expectOk) << what << (a ? "" : ": " + a.error().detail);
+                if (expectOk) { EXPECT_EQ(s.viewByName("v")->def.sinkPartitions, P) << what; continue; }
+                EXPECT_EQ(a.error().code, rc::ApplyError::Code::Precondition) << what;
+                if (sink >= 1)   // a sink < 1 is refused by the older rule first
+                    EXPECT_NE(a.error().detail.find("sink partitions " + std::to_string(sink)), std::string::npos)
+                        << what << ": " << a.error().detail;
+                EXPECT_EQ(s.digest(), before) << what << ": a refused event changes nothing";
+            }
+        }
+    }
+}
+
+// Data integrity, model-checked: seeded random DDL histories (create topics of 1..4 partitions, create / alter /
+// drop views over 1-2 live sources with a correct or a random sink count, drop unread topics, and reuse dropped
+// topic names with a different partition count).  Every view event applies iff its sink equals its first source's
+// partitions; after every step every live view mirrors its first source; and replaying the applied events into a
+// fresh state gives the same digest (the state is a pure function of the log).
+TEST(CatalogApplyAdversarial, RandomDdlHistoriesKeepEverySinkMirroringItsFirstSourceAdversarialRegression) {
+    const std::string topicNames[] = {"t0", "t1", "t2", "t3"};
+    const std::string viewNames[]  = {"v0", "v1", "v2"};
+    int refusedMismatches = 0, appliedViews = 0;
+    for (uint64_t seed = 1; seed <= 200; ++seed) {
+        SCOPED_TRACE("seed " + std::to_string(seed));
+        uint64_t st = seed * 0x9E3779B97F4A7C15ULL;
+        auto rnd = [&](uint32_t n) { st = st * 6364136223846793005ULL + 1442695040888963407ULL; return uint32_t(st >> 33) % n; };
+        rc::CatalogState s;
+        std::vector<std::pair<rc::CatalogEvent, int64_t>> log;
+        int64_t off = 0;
+        auto liveTopicNames = [&] { std::vector<std::string> v; for (auto* t : s.topics()) v.push_back(t->name); return v; };
+        auto randomSources = [&] {
+            auto live = liveTopicNames();
+            std::vector<std::string> src{live[rnd(uint32_t(live.size()))]};
+            if (live.size() > 1 && rnd(2) == 0) {
+                const std::string& second = live[rnd(uint32_t(live.size()))];
+                if (second != src[0]) src.push_back(second);
+            }
+            return src;
+        };
+        for (int step = 0; step < 60; ++step) {
+            const std::string when = "step " + std::to_string(step);
+            const uint32_t kind = rnd(5);
+            std::optional<rc::CatalogEvent> e;
+            std::optional<bool> expectOk;
+            if (kind == 0) {                                                   // CreateTopic (reuses dropped names)
+                const std::string& n = topicNames[rnd(4)];
+                if (s.nameTaken(n)) continue;
+                rc::CreateTopicOps o = createOps(s.nextTopicId(), true);
+                o.partitions = int32_t(1 + rnd(4));
+                e = stamped(s, o, n, s.nextObjectId(), 0, 1);
+                expectOk = true;
+            } else if (kind == 1 || kind == 2) {                               // CreateView / AlterView
+                if (s.topics().empty()) continue;
+                const auto src = randomSources();
+                const int32_t firstParts = s.topicByName(src[0])->partitions;
+                const int32_t sink = rnd(2) == 0 ? firstParts : int32_t(1 + rnd(4));
+                if (kind == 1) {
+                    const std::string& n = viewNames[rnd(3)];
+                    if (s.nameTaken(n)) continue;
+                    e = craftedCreateView(s, n, src, sink);
+                } else {
+                    const auto views = s.views();
+                    if (views.empty()) continue;
+                    e = craftedAlterView(s, *views[rnd(uint32_t(views.size()))], src, sink);
+                }
+                expectOk = sink == firstParts;
+            } else if (kind == 3) {                                            // DropView
+                const auto views = s.views();
+                if (views.empty()) continue;
+                const rc::ViewObject& v = *views[rnd(uint32_t(views.size()))];
+                e = stamped(s, rc::DropViewOps{v.def.viewTopicId}, v.name, v.objectId, v.version, v.version + 1);
+                expectOk = true;
+            } else {                                                           // DropTopic, when no view reads it
+                const auto topics = s.topics();
+                if (topics.empty()) continue;
+                const rc::TopicObject& t = *topics[rnd(uint32_t(topics.size()))];
+                if (s.viewReading(t.name) != nullptr) continue;
+                e = stamped(s, rc::DropTopicOps{t.topicId}, t.name, t.objectId, t.version, t.version + 1);
+                expectOk = true;
+            }
+            const uint64_t before = s.digest();
+            auto a = rc::apply(s, *e, off);
+            ASSERT_EQ(a.has_value(), *expectOk) << when << " kind " << kind << (a ? "" : ": " + a.error().detail);
+            if (a) {
+                log.emplace_back(*e, off++);
+                appliedViews += (kind == 1 || kind == 2);
+            } else {
+                ++refusedMismatches;
+                EXPECT_EQ(a.error().code, rc::ApplyError::Code::Precondition) << when;
+                EXPECT_EQ(s.digest(), before) << when;
+            }
+            ASSERT_NO_FATAL_FAILURE(expectEverySinkMirrorsItsFirstSource(s, when));
+        }
+        rc::CatalogState replayed;
+        for (const auto& [ev, o] : log) ASSERT_TRUE(rc::apply(replayed, ev, o)) << "replay of offset " << o;
+        EXPECT_EQ(replayed.digest(), s.digest()) << "the state equals a recompute from its log";
+    }
+    EXPECT_GT(refusedMismatches, 300) << "not vacuous: many mismatched sinks were attempted";
+    EXPECT_GT(appliedViews, 300) << "not vacuous: many view events applied";
 }

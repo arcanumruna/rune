@@ -25,7 +25,7 @@ TEST(LeaderEpochCachePersist, RoundTripsThroughFile) {
 
 TEST(LeaderEpochCachePersist, MissingFileReturnsFalse) {
     LeaderEpochCache c;
-    EXPECT_FALSE(c.restoreFromFile("/tmp/lec_does_not_exist_xyz.bin"));
+    EXPECT_FALSE(c.restoreFromFile(std::filesystem::temp_directory_path().string() + "/lec_does_not_exist_xyz.bin"));
 }
 
 TEST(LeaderEpochCachePersist, TruncatedFileReturnsFalse) {
@@ -78,7 +78,7 @@ TEST(LeaderEpochCachePersist, EmptyCacheRoundTrips) {
 // NOT install a partial file and must leave any pre-existing checkpoint intact.
 TEST(LeaderEpochCachePersist, BadPathLeavesNoPollutingFile) {
     // Write into a directory that does not exist — open() will fail → no rename.
-    const std::string badPath = "/tmp/lec_nonexistent_dir_xyz/lec_ckpt.bin";
+    const std::string badPath = std::filesystem::temp_directory_path().string() + "/lec_nonexistent_dir_xyz/lec_ckpt.bin";
     LeaderEpochCache c;
     c.assign(0, 0); c.assign(1, 100);
     // Must not crash; tmp must not remain.

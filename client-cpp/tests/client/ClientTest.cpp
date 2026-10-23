@@ -98,7 +98,7 @@ static std::atomic<int> g_dirCtr{0};
 
 std::string uniqueDir() {
     const int c = g_dirCtr.fetch_add(1, std::memory_order_relaxed);
-    return std::string("/tmp/cc6_test_") +
+    return std::string(std::filesystem::temp_directory_path().string() + "/cc6_test_") +
            std::to_string(static_cast<long>(::getpid())) + "_" +
            std::to_string(c);
 }

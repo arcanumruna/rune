@@ -2,6 +2,7 @@
 // client-side, the statement that travels is the REDACTED one, every plan kind maps to its wire op, the bootstrap
 // MAC verifies under the cluster key file, NotLeader is retried with the same request id.  The fake broker decodes
 // every frame with the protocol's strict decoder (bounds-checked salt / iterations / enums), like the real gateway.
+#include <filesystem>
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
 
@@ -28,7 +29,7 @@ int g_ctr = 0;
 rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {
     rc::ClientConfig c;
     c.gatewayChannel = "aeron:ipc"; c.gatewayStreamId = in; c.egressChannel = "aeron:ipc"; c.egressStreamId = eg;
-    c.dataDir = "/tmp/security_ddl_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/security_ddl_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     c.runnerMode = rc::RunnerMode::Invoker;
     c.nanoClock = &fakeNow;
     c.ddlTimeoutMs = 3'000;

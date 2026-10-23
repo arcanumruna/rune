@@ -10,6 +10,7 @@
 // sample and the median ns/send.  Build the same file against both trees and
 // run them interleaved (A/B/A/B...).
 // Env: ROUTE_SHARDS (2), ROUTE_SENDS (4000), ROUTE_SAMPLES (9), ROUTE_KEY_BYTES (16).
+#include <filesystem>
 #include <rune/client/shard/ClientShard.h>
 
 #include <algorithm>
@@ -47,7 +48,7 @@ int main() {
     std::vector<double> nsPerSend;
     for (int64_t s = 0; s < samples; ++s) {
         rs::ShardGroupConfig g;
-        g.base.dataDir = "/tmp/rune_route_bench_" + std::to_string(::getpid()) + "_" + std::to_string(s);
+        g.base.dataDir = std::filesystem::temp_directory_path().string() + "/rune_route_bench_" + std::to_string(::getpid()) + "_" + std::to_string(s);
         g.base.gatewayStreamId = 5100;
         g.base.egressStreamId  = 5101;
         rc::TopicSpec t;

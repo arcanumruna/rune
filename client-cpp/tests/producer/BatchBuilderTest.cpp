@@ -127,7 +127,7 @@ static std::atomic<int> g_cb3DirCtr{0};
 
 std::string uniqueDir(const char* prefix = "cb3_test") {
     const int c = g_cb3DirCtr.fetch_add(1, std::memory_order_relaxed);
-    return std::string("/tmp/") + prefix + "_" +
+    return std::string(std::filesystem::temp_directory_path().string() + "/") + prefix + "_" +
            std::to_string(static_cast<long>(::getpid())) + "_" +
            std::to_string(c);
 }

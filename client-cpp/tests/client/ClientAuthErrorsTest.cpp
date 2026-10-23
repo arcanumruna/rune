@@ -2,6 +2,7 @@
 // login success/failure, codes 44..47 on every response type, SessionRevoked as a terminal, the salted-password
 // cache.  The fake is as strict as the real broker will be (nothing but the login before it finishes; always two
 // salts; one proof per salt), so a vacuous pass is not possible: each test also asserts what the broker SAW.
+#include <filesystem>
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
 
@@ -52,7 +53,7 @@ std::string testPem(const char* name) {
 rc::ClientConfig authCfg(int32_t in, const std::string& user, const std::string& pw) {
     rc::ClientConfig c;
     c.gatewayChannel = "aeron:ipc"; c.gatewayStreamId = in; c.egressChannel = "aeron:ipc"; c.egressStreamId = in + 1;
-    c.dataDir = "/tmp/client_auth_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/client_auth_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     c.runnerMode = rc::RunnerMode::Invoker;
     c.nanoClock = &fakeNow;
     c.ddlTimeoutMs = 3'000;
@@ -207,7 +208,7 @@ TEST(ClientAuthErrorsRegression, AFakeBrokerRefusesAnyRequestBeforeTheLoginFinis
 }
 
 TEST(ClientAuthErrorsRegression, PasswordFileIsReadOnceAndBothSetIsRefused) {
-    const std::string path = "/tmp/client_auth_pw_" + std::to_string(::getpid());
+    const std::string path = std::filesystem::temp_directory_path().string() + "/client_auth_pw_" + std::to_string(::getpid());
     { std::ofstream(path, std::ios::binary) << kPw << "\n"; }
     {
         rc::ClientConfig c = authCfg(3716, "ws1", "");
@@ -857,7 +858,7 @@ TEST(ClientAuthErrorsRegression, ScramCachePaysPbkdf2OncePerVerifierRegression) 
     cfg.transport.ingressStreamId = 3736;
     cfg.transport.egressChannel   = "aeron:ipc";
     cfg.transport.egressStreamId  = 3737;
-    cfg.transport.dataDir = "/tmp/client_auth_agent_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+    cfg.transport.dataDir = std::filesystem::temp_directory_path().string() + "/client_auth_agent_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     cfg.transport.driverMode = rune::client::transport::DriverMode::Invoker;
     cfg.session.egressChannel  = "aeron:ipc";
     cfg.session.egressStreamId = 3737;

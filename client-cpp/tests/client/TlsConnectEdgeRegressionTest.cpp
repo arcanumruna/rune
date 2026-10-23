@@ -52,7 +52,7 @@ constexpr auto kPumpSleep = 2ms;
 std::atomic<int> g_ctr{0};
 
 std::string uniqueDir() {
-    return "/tmp/tls_edge_" + std::to_string(static_cast<long>(::getpid())) + "_" +
+    return std::filesystem::temp_directory_path().string() + "/tls_edge_" + std::to_string(static_cast<long>(::getpid())) + "_" +
            std::to_string(g_ctr.fetch_add(1, std::memory_order_relaxed));
 }
 std::string slurpFile(const std::string& path) {

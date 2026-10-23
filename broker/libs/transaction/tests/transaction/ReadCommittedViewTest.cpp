@@ -43,7 +43,7 @@ static std::atomic<int> gCounter{0};
 static std::string makeTmpDir()
 {
     int cnt = gCounter.fetch_add(1, std::memory_order_relaxed);
-    std::string dir = "/tmp/rune_rcv_" + std::to_string(::getpid())
+    std::string dir = std::filesystem::temp_directory_path().string() + "/rune_rcv_" + std::to_string(::getpid())
                     + "_" + std::to_string(cnt);
     fs::create_directories(dir);
     return dir;

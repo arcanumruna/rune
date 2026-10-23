@@ -49,6 +49,7 @@ inline constexpr uint32_t kPortRangeBase = 10000;
 inline constexpr uint32_t kPortRangeSpan = 10000;   // 10000..19999
 inline constexpr uint32_t kBlockPorts    = 100;
 inline constexpr uint32_t kBlocks        = kPortRangeSpan / kBlockPorts;   // 100
+// #577: deliberately host-wide (not temp_directory_path()): every test process on the host must share these port locks.
 inline constexpr const char* kLockDir    = "/tmp/rune-test-ports-10000x100";   // geometry in the name: another layout never shares it
 
 inline bool udpPortBindable(uint16_t port) {

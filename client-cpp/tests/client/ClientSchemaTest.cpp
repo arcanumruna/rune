@@ -99,7 +99,7 @@ static std::atomic<int> g_schemaDirCtr{0};
 
 std::string schemaUniqueDir() {
     const int c = g_schemaDirCtr.fetch_add(1, std::memory_order_relaxed);
-    return std::string("/tmp/cc6_schema_test_") +
+    return std::string(std::filesystem::temp_directory_path().string() + "/cc6_schema_test_") +
            std::to_string(static_cast<long>(::getpid())) + "_" +
            std::to_string(c);
 }

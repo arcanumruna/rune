@@ -1,5 +1,7 @@
 // src/Validator.cpp
 #include <rune/codec/Validator.h>
+#include <rune/codec/Evolve.h>
+#include <algorithm>
 #include <cstring>
 
 namespace rune::codec {
@@ -7,9 +9,19 @@ namespace rune::codec {
 // ---------------------------------------------------------------------------
 // Constructor — build precomputed field table once from the descriptor
 // ---------------------------------------------------------------------------
-Validator::Validator(const Descriptor& d)
-    : blockLength_(d.blockLength), version_(d.version)
-{
+Validator::Validator(const Descriptor& d) {
+    // Issue #149: a cumulative (evolving) descriptor still lists its retired fields; taken as live they
+    // shift the fixed offsets and the var-data walk, and valid records are falsely rejected.  Validate
+    // against exactly the fields live at the descriptor's own version (a cold path: construction only).
+    const bool hasRetired = std::any_of(d.fields.begin(), d.fields.end(),
+                                        [](const FieldDescriptor& f) { return f.untilVersion != 0xFFFF; });
+    if (hasRetired) build_(materializeAsOf(d, d.version));
+    else            build_(d);
+}
+
+void Validator::build_(const Descriptor& d) {
+    blockLength_ = d.blockLength;
+    version_     = d.version;
     for (const auto& f : d.fields) {
         FieldEntry e;
         e.id           = f.id;

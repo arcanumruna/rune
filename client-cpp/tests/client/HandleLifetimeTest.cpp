@@ -13,6 +13,7 @@
 // drives doWork() + the gateway with a progress-or-10 s-deadline loop); the
 // Thread-mode tests exercise the real runner (TSan: cross-thread traffic only
 // through rings / the ownership words).  Nothing sleeps to pass time.
+#include <filesystem>
 #include "../support/AckLedger.h"
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
@@ -109,7 +110,7 @@ rc::ClientConfig cfgFor(int32_t in, rc::RunnerMode mode = rc::RunnerMode::Invoke
     c.gatewayStreamId = in;
     c.egressChannel   = "aeron:ipc";
     c.egressStreamId  = in + 1;
-    c.dataDir = "/tmp/handle_life_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/handle_life_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
     c.runnerMode         = mode;
     c.subscribeTimeoutMs = 200;  // an unanswered Subscribe is swept quickly (Thread-mode tests)
     rc::TopicSpec ts;

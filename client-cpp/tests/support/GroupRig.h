@@ -5,6 +5,7 @@
 // once per translation unit.
 #pragma once
 
+#include <filesystem>
 #include "InvokerGateway.h"
 #include "TestCompletions.h"
 
@@ -101,7 +102,7 @@ struct GroupRig {
         c.gatewayStreamId = in;
         c.egressChannel   = egress;
         c.egressStreamId  = eg;
-        c.dataDir = "/tmp/group_routing_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+        c.dataDir = std::filesystem::temp_directory_path().string() + "/group_routing_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
         c.runnerMode = rc::RunnerMode::Invoker;
         c.keepaliveIntervalNs = o.keepaliveNs;
         c.responseTimeoutNs   = o.responseTimeoutNs;

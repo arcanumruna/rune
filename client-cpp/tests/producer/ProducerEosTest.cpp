@@ -63,7 +63,7 @@ struct DirSweeper {
 DirSweeper g_sweeper;
 
 std::string freshDir(const char* tag) {
-    std::string d = std::string("/tmp/eos_") + tag + "_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+    std::string d = std::string(std::filesystem::temp_directory_path().string() + "/eos_") + tag + "_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     g_sweeper.dirs.push_back(d);
     return d;
 }

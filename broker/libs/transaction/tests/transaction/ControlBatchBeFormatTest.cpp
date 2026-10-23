@@ -42,7 +42,7 @@ static std::atomic<int> gSeq{0};
 static std::string makeTmpDir()
 {
     int n = gSeq.fetch_add(1, std::memory_order_relaxed);
-    std::string d = "/tmp/rune_le_fmt_" + std::to_string(::getpid()) + "_" + std::to_string(n);
+    std::string d = std::filesystem::temp_directory_path().string() + "/rune_le_fmt_" + std::to_string(::getpid()) + "_" + std::to_string(n);
     fs::create_directories(d);
     return d;
 }

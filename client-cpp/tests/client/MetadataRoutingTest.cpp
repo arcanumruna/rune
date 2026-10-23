@@ -62,7 +62,7 @@ namespace {
 std::atomic<int> g_ctr{0};
 std::string uniqueDir(const char* prefix) {
     const int c = g_ctr.fetch_add(1, std::memory_order_relaxed);
-    return std::string("/tmp/") + prefix + "_" +
+    return std::string(std::filesystem::temp_directory_path().string() + "/") + prefix + "_" +
            std::to_string(static_cast<long>(::getpid())) + "_" +
            std::to_string(c);
 }

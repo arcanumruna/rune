@@ -51,7 +51,7 @@ rc::ClientConfig cfgFor(int32_t in, rc::RunnerMode mode = rc::RunnerMode::Invoke
     c.gatewayStreamId = in;
     c.egressChannel   = "aeron:ipc";
     c.egressStreamId  = in + 1;
-    c.dataDir = "/tmp/cq_client_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/cq_client_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
     c.runnerMode = mode;
     c.nanoClock  = clock;
     rc::TopicSpec ts;

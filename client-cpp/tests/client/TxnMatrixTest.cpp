@@ -182,7 +182,7 @@ public:
         cfg.gatewayStreamId = 6000 + 2 * cid;
         cfg.egressChannel   = "aeron:ipc";
         cfg.egressStreamId  = 6001 + 2 * cid;
-        cfg.dataDir         = std::string("/tmp/f_txnmx_") + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+        cfg.dataDir         = std::string(std::filesystem::temp_directory_path().string() + "/f_txnmx_") + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
         g_sweeper.dirs.push_back(cfg.dataDir);
         cfg.runnerMode = rc::RunnerMode::Invoker;
         rc::TopicSpec ts;

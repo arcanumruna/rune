@@ -60,7 +60,7 @@ rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {
     c.gatewayStreamId = in;
     c.egressChannel   = "aeron:ipc";
     c.egressStreamId  = eg;
-    c.dataDir = "/tmp/inv_client_" + std::to_string(::getpid()) + "_" +
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/inv_client_" + std::to_string(::getpid()) + "_" +
                 std::to_string(g_ctr.fetch_add(1));
     c.runnerMode = rc::RunnerMode::Invoker;
     rc::TopicSpec ts;

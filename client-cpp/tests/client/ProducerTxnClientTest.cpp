@@ -51,7 +51,7 @@ rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {
     c.gatewayStreamId = in;
     c.egressChannel   = "aeron:ipc";
     c.egressStreamId  = eg;
-    c.dataDir = std::string("/tmp/f_txncl_") + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+    c.dataDir = std::string(std::filesystem::temp_directory_path().string() + "/f_txncl_") + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     g_sweeper.dirs.push_back(c.dataDir);
     c.runnerMode = rc::RunnerMode::Invoker;
     rc::TopicSpec ts;

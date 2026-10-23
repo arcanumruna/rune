@@ -61,7 +61,7 @@ struct DirSweeper {
 DirSweeper g_sweeper;  // test thread only
 
 std::string uniqueDir(const char* prefix) {
-    std::string d = std::string("/tmp/") + prefix + "_" + std::to_string(static_cast<long>(::getpid())) + "_" +
+    std::string d = std::string(std::filesystem::temp_directory_path().string() + "/") + prefix + "_" + std::to_string(static_cast<long>(::getpid())) + "_" +
                     std::to_string(g_ctr++);
     g_sweeper.dirs.push_back(d);
     return d;
@@ -126,13 +126,13 @@ rs::ShardGroupConfig ipcGroup(int32_t in, int32_t eg, uint32_t count, rs::ShardM
 
 TEST(ShardConfigRegression, DerivesDirPortCoreTermAndKeepsMtu1408) {
     rs::ShardGroupConfig g;
-    g.base.dataDir       = "/tmp/x";
+    g.base.dataDir       = std::filesystem::temp_directory_path().string() + "/x";
     g.base.egressChannel = "aeron:udp?endpoint=127.0.0.1:40400";
     g.shardCount         = 4;
 
     // Layout overload: the resolved count + core (assignShardCores' output).
     const rc::ClientConfig c1 = rs::shardClientConfig(g, 1, 4, 3);
-    EXPECT_EQ(c1.dataDir, "/tmp/x/shard-1");
+    EXPECT_EQ(c1.dataDir, std::filesystem::temp_directory_path().string() + "/x/shard-1");
     EXPECT_EQ(c1.egressChannel, "aeron:udp?endpoint=127.0.0.1:40401");
     EXPECT_EQ(c1.runnerMode, rc::RunnerMode::Thread);
     EXPECT_EQ(c1.runnerCore, 3);

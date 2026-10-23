@@ -1,6 +1,7 @@
 // tests/transport/InvokerTransportTest.cpp — AeronTransport in DriverMode::Invoker.
 // Every drive loop is bounded by a 10 s failure deadline and needs no sleep: the
 // test thread IS the driver.
+#include <filesystem>
 #include <rune/client/transport/AeronTransport.h>
 
 #include <Aeron.h>  // aeron::currentTimeMillis — the conductor's own clock (stall test)
@@ -28,7 +29,7 @@ namespace {
 std::atomic<int> g_ctr{0};
 
 std::string uniqueDir(const char* prefix) {
-    return std::string("/tmp/") + prefix + "_" + std::to_string(static_cast<long>(::getpid())) +
+    return std::string(std::filesystem::temp_directory_path().string() + "/") + prefix + "_" + std::to_string(static_cast<long>(::getpid())) +
            "_" + std::to_string(g_ctr.fetch_add(1));
 }
 

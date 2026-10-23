@@ -33,7 +33,8 @@
 //   AlterView         live view: objectId, name agree; versions chain; viewTopicId ==
 //                     nextTopicId (a fresh sink, ruling 4); the definition
 //   DropView          live view: objectId, name, viewTopicId agree; versions chain
-//   view definition   sinkPartitions >= 1; sources non-empty, each a live TOPIC;
+//   view definition   sinkPartitions >= 1; sources non-empty, each a live TOPIC; sinkPartitions ==
+//                     the FIRST source's partitions (#143: the sink mirrors it);
 //                     normalizedPlanBlob non-empty; outputDescriptorBlob deserializes;
 //                     keyField (if any) a live field of the output
 //   every kind        a requestId other than {0,0} not already applied (the leader never
@@ -192,6 +193,11 @@ std::optional<std::string> viewDefError(const CatalogState& s, const CatalogEven
     if (v.sourceNames.empty()) return prefix(e) + "a view reads at least one source";
     for (const auto& src : v.sourceNames)
         if (s.topicByName(src) == nullptr) return prefix(e) + "source " + quoted(src) + " is not a live topic";
+    // #143: the sink is co-partitioned with its FIRST source (AdminWorker writes exactly that, and partition counts
+    // are immutable): a mismatch is a crafted / foreign catalog, refused here so every applier halts on it.
+    if (const TopicObject* first = s.topicByName(v.sourceNames.front()); v.sinkPartitions != first->partitions)
+        return prefix(e) + "view " + quoted(e.objectName) + " sink partitions " + std::to_string(v.sinkPartitions) +
+               " but its first source " + quoted(first->name) + " has " + std::to_string(first->partitions);
     if (v.normalizedPlanBlob.empty()) return prefix(e) + "the normalized plan is empty";
     auto out = parseDescriptor(e, offset, v.outputDescriptorBlob, "the output descriptor");
     if (!out) { badOps = std::move(out.error()); return std::nullopt; }

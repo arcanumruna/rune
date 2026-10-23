@@ -3,6 +3,7 @@
 // Invoker (Direct) ingress: commit / abort / destructor-abort, back-pressure,
 // limits, ordering vs sends and Tier-2 batches, the copy-count proofs, and the
 // zero-allocation gates.  Every drive loop is iteration-capped; nothing sleeps.
+#include <filesystem>
 #include "../support/AckLedger.h"
 #include "../support/AllocCounter.h"
 #include "../support/FrameCapture.h"
@@ -77,7 +78,7 @@ rc::ClientConfig regCfg() {
     c.gatewayStreamId = 4601;
     c.egressChannel   = "aeron:ipc";
     c.egressStreamId  = 4602;
-    c.dataDir = "/tmp/claim_test_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+    c.dataDir = std::filesystem::temp_directory_path().string() + "/claim_test_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     c.runnerMode = rc::RunnerMode::Invoker;
     return c;
 }

@@ -56,7 +56,7 @@ rs::ShardGroupConfig group(int32_t in, int32_t eg, uint32_t count, rs::ShardMode
     g.base.gatewayStreamId = in;
     g.base.egressChannel   = "aeron:ipc";
     g.base.egressStreamId  = eg;
-    g.base.dataDir = "/tmp/shard_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+    g.base.dataDir = std::filesystem::temp_directory_path().string() + "/shard_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     g_sweeper.dirs.push_back(g.base.dataDir);
     rc::TopicSpec ts;
     ts.name           = "t";

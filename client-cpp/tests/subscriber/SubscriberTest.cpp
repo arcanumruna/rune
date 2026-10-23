@@ -51,7 +51,7 @@ namespace {
 int g_dirCtr = 0;  // the gtest main thread only
 
 std::string uniqueDir() {
-    return std::string("/tmp/cb4_test_") + std::to_string(static_cast<long>(::getpid())) + "_" +
+    return std::string(std::filesystem::temp_directory_path().string() + "/cb4_test_") + std::to_string(static_cast<long>(::getpid())) + "_" +
            std::to_string(g_dirCtr++);
 }
 

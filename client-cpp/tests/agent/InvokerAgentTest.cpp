@@ -1,5 +1,6 @@
 // tests/agent/InvokerAgentTest.cpp — ClientAgent in invoker mode against the
 // single-threaded InvokerGateway: no sleeps, iteration-capped drive loops.
+#include <filesystem>
 #include "../support/InvokerGateway.h"
 
 #include <rune/client/agent/ClientAgent.h>
@@ -29,7 +30,7 @@ TEST(InvokerAgent, ProduceResponsesAreBufferedForTheOwnerWhenNoHookIsSet) {
     cfg.transport.ingressStreamId = 3500;
     cfg.transport.egressChannel   = "aeron:ipc";
     cfg.transport.egressStreamId  = 3501;
-    cfg.transport.dataDir = "/tmp/inv_agent_" + std::to_string(::getpid()) + "_" +
+    cfg.transport.dataDir = std::filesystem::temp_directory_path().string() + "/inv_agent_" + std::to_string(::getpid()) + "_" +
                             std::to_string(g_ctr.fetch_add(1));
     cfg.transport.driverMode = rune::client::transport::DriverMode::Invoker;
     cfg.session.egressChannel  = "aeron:ipc";
@@ -72,7 +73,7 @@ TEST(InvokerAgent, AckBurstBeyondReserveDoesNotAllocateRegression) {
     cfg.transport.ingressStreamId = 3510;
     cfg.transport.egressChannel   = "aeron:ipc";
     cfg.transport.egressStreamId  = 3511;
-    cfg.transport.dataDir = "/tmp/inv_agent_" + std::to_string(::getpid()) + "_" +
+    cfg.transport.dataDir = std::filesystem::temp_directory_path().string() + "/inv_agent_" + std::to_string(::getpid()) + "_" +
                             std::to_string(g_ctr.fetch_add(1));
     cfg.transport.driverMode = rune::client::transport::DriverMode::Invoker;
     cfg.session.egressChannel  = "aeron:ipc";
@@ -131,7 +132,7 @@ TEST(InvokerAgent, CloseAdoptsRegistrationPastRingWrapRegression) {
     cfg.transport.ingressStreamId = 3600;
     cfg.transport.egressChannel   = "aeron:ipc";
     cfg.transport.egressStreamId  = 3601;
-    cfg.transport.dataDir = "/tmp/inv_agent_" + std::to_string(::getpid()) + "_" +
+    cfg.transport.dataDir = std::filesystem::temp_directory_path().string() + "/inv_agent_" + std::to_string(::getpid()) + "_" +
                             std::to_string(g_ctr.fetch_add(1));
     cfg.transport.driverMode = rune::client::transport::DriverMode::Invoker;
     cfg.session.egressChannel  = "aeron:ipc";
@@ -188,7 +189,7 @@ TEST(InvokerAgent, CloseDrainWaitsPastUncommittedClaimRegression) {
     cfg.transport.ingressStreamId = 3602;
     cfg.transport.egressChannel   = "aeron:ipc";
     cfg.transport.egressStreamId  = 3603;
-    cfg.transport.dataDir = "/tmp/inv_agent_" + std::to_string(::getpid()) + "_" +
+    cfg.transport.dataDir = std::filesystem::temp_directory_path().string() + "/inv_agent_" + std::to_string(::getpid()) + "_" +
                             std::to_string(g_ctr.fetch_add(1));
     cfg.transport.driverMode = rune::client::transport::DriverMode::Invoker;
     cfg.session.egressChannel  = "aeron:ipc";
@@ -249,7 +250,7 @@ rca::AgentConfig closeDrainCfg(int32_t in, int32_t eg) {
     cfg.transport.ingressStreamId = in;
     cfg.transport.egressChannel   = "aeron:ipc";
     cfg.transport.egressStreamId  = eg;
-    cfg.transport.dataDir = "/tmp/inv_agent_" + std::to_string(::getpid()) + "_" +
+    cfg.transport.dataDir = std::filesystem::temp_directory_path().string() + "/inv_agent_" + std::to_string(::getpid()) + "_" +
                             std::to_string(g_ctr.fetch_add(1));
     cfg.transport.driverMode = rune::client::transport::DriverMode::Invoker;
     cfg.session.egressChannel  = "aeron:ipc";

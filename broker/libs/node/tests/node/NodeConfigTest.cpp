@@ -1426,7 +1426,7 @@ TEST(NodeConfig, ParsesAeronMtuAndRcvWindow) {
     auto env = fakeEnv({{"RUNE_NODE_ID",         "0"},
                         {"RUNE_PEERS",            "0@h:1"},
                         {"RUNE_CLIENT_ENDPOINT",  "h:2"},
-                        {"RUNE_DATA_DIR",         "/tmp/x"},
+                        {"RUNE_DATA_DIR",         std::filesystem::temp_directory_path().string() + "/x"},
                         {"RUNE_AUTH",             "disabled"},
                         {"RUNE_AERON_MTU",        "8192"},
                         {"RUNE_AERON_RCV_WINDOW", "262144"}});
@@ -1438,7 +1438,7 @@ TEST(NodeConfig, ParsesAeronMtuAndRcvWindow) {
 
 TEST(NodeConfig, ParsesAeronSendBatching) {
     std::map<std::string, std::string> base{{"RUNE_NODE_ID","0"},{"RUNE_PEERS","0@h:1"},
-        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"},{"RUNE_AUTH","disabled"}};
+        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR",std::filesystem::temp_directory_path().string() + "/x"},{"RUNE_AUTH","disabled"}};
     {
         auto res = rune::node::parseNodeConfig(fakeEnv(base));
         ASSERT_TRUE(res.config.has_value()) << res.error;
@@ -1460,7 +1460,7 @@ TEST(NodeConfig, ParsesAeronSendBatching) {
 
 TEST(NodeConfig, AeronUdpGsoDefaultsOnAndEnvTurnsItOff) {
     std::map<std::string, std::string> base{{"RUNE_NODE_ID","0"},{"RUNE_PEERS","0@h:1"},
-        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"},{"RUNE_AUTH","disabled"}};
+        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR",std::filesystem::temp_directory_path().string() + "/x"},{"RUNE_AUTH","disabled"}};
     EXPECT_TRUE(rune::node::NodeConfig{}.aeronUdpGso);
     {
         auto res = rune::node::parseNodeConfig(fakeEnv(base));
@@ -1488,20 +1488,20 @@ TEST(NodeConfig, AeronUdpGsoDefaultsOnAndEnvTurnsItOff) {
 // A7: epoll-first transport polling (rune_driver_wake.h rune_driver_epoll_poll_install) — default on, A/B-able.
 TEST(NodeConfig, AeronEpollPollDefaultsOnAndEnvTurnsItOff) {
     std::map<std::string, std::string> base{{"RUNE_NODE_ID","0"},{"RUNE_PEERS","0@h:1"},
-        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"},{"RUNE_AUTH","disabled"}};
+        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR",std::filesystem::temp_directory_path().string() + "/x"},{"RUNE_AUTH","disabled"}};
     EXPECT_TRUE(rune::node::NodeConfig{}.aeronEpollPoll);
     {
         auto res = rune::node::parseNodeConfig(fakeEnv(base));
         ASSERT_TRUE(res.config.has_value()) << res.error;
         EXPECT_TRUE(res.config->aeronEpollPoll);
-        EXPECT_TRUE(rune::node::EmbeddedDriverConfig::fromNode(*res.config, "/tmp/d").epollPoll);
+        EXPECT_TRUE(rune::node::EmbeddedDriverConfig::fromNode(*res.config, std::filesystem::temp_directory_path().string() + "/d").epollPoll);
     }
     for (const char* off : {"0", "false"}) {
         auto kv = base; kv["RUNE_AERON_EPOLL_POLL"] = off;
         auto res = rune::node::parseNodeConfig(fakeEnv(kv));
         ASSERT_TRUE(res.config.has_value()) << res.error;
         EXPECT_FALSE(res.config->aeronEpollPoll) << off;
-        EXPECT_FALSE(rune::node::EmbeddedDriverConfig::fromNode(*res.config, "/tmp/d").epollPoll) << off;
+        EXPECT_FALSE(rune::node::EmbeddedDriverConfig::fromNode(*res.config, std::filesystem::temp_directory_path().string() + "/d").epollPoll) << off;
     }
     auto kv = base; kv["RUNE_AERON_EPOLL_POLL"] = "maybe";
     auto bad = rune::node::parseNodeConfig(fakeEnv(kv));
@@ -1511,7 +1511,7 @@ TEST(NodeConfig, AeronEpollPollDefaultsOnAndEnvTurnsItOff) {
 
 TEST(NodeConfig, ParsesAeronTermSparse) {
     std::map<std::string, std::string> base{{"RUNE_NODE_ID","0"},{"RUNE_PEERS","0@h:1"},
-        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"},{"RUNE_AUTH","disabled"}};
+        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR",std::filesystem::temp_directory_path().string() + "/x"},{"RUNE_AUTH","disabled"}};
     {
         auto res = rune::node::parseNodeConfig(fakeEnv(base));
         ASSERT_TRUE(res.config.has_value()) << res.error;
@@ -1540,7 +1540,7 @@ TEST(NodeConfig, FragmentLimitDefaultAndOverride) {
         auto env = fakeEnv({{"RUNE_NODE_ID",        "0"},
                             {"RUNE_PEERS",           "0@h:1"},
                             {"RUNE_CLIENT_ENDPOINT", "h:2"},
-                            {"RUNE_DATA_DIR",        "/tmp/x"},{"RUNE_AUTH","disabled"}});
+                            {"RUNE_DATA_DIR",        std::filesystem::temp_directory_path().string() + "/x"},{"RUNE_AUTH","disabled"}});
         auto res = rune::node::parseNodeConfig(env);
         ASSERT_TRUE(res.config.has_value()) << res.error;
         EXPECT_EQ(res.config->gatewayFragmentLimit, 256);
@@ -1550,7 +1550,7 @@ TEST(NodeConfig, FragmentLimitDefaultAndOverride) {
         auto env = fakeEnv({{"RUNE_NODE_ID",                 "0"},
                             {"RUNE_PEERS",                   "0@h:1"},
                             {"RUNE_CLIENT_ENDPOINT",         "h:2"},
-                            {"RUNE_DATA_DIR",                "/tmp/x"},
+                            {"RUNE_DATA_DIR",                std::filesystem::temp_directory_path().string() + "/x"},
                             {"RUNE_AUTH",                     "disabled"},
                             {"RUNE_GATEWAY_FRAGMENT_LIMIT",  "1000"}});
         auto res = rune::node::parseNodeConfig(env);
@@ -2344,7 +2344,7 @@ TEST(NodeConfig, NodeDriverIdleDefaultsToBackoffInShardModeRegression) {
     ASSERT_TRUE(res.config.has_value()) << res.error;
     ASSERT_TRUE(res.config->shardMode());
     EXPECT_EQ(res.config->effectiveDriverIdleStrategy(), "backoff");
-    EXPECT_EQ(rune::node::EmbeddedDriverConfig::fromNode(*res.config, "/tmp/x").idleStrategy, "backoff");
+    EXPECT_EQ(rune::node::EmbeddedDriverConfig::fromNode(*res.config, std::filesystem::temp_directory_path().string() + "/x").idleStrategy, "backoff");
     auto legacy = rune::node::base1node();
     legacy["RUNE_WORKER_MODE"] = "legacy";
     auto rl = rune::node::parseNodeConfig(rune::node::fakeEnv(legacy));
@@ -2389,7 +2389,7 @@ TEST(NodeConfig, ControlPlaneIdleParksWithoutYieldsInShardModeRegression) {
     EXPECT_EQ(s.runtimeIdleShape(), (Shape{10, 0, minNs, maxNs}));
     EXPECT_EQ(s.adminIdleShape(), (Shape{10, 0, minNs, maxNs}));
     EXPECT_EQ(s.effectiveDriverIdleArgs(), args);
-    EXPECT_EQ(rune::node::EmbeddedDriverConfig::fromNode(s, "/tmp/x").idleStrategyArgs, args);
+    EXPECT_EQ(rune::node::EmbeddedDriverConfig::fromNode(s, std::filesystem::temp_directory_path().string() + "/x").idleStrategyArgs, args);
 
     auto cap = rune::node::base1node();
     cap["RUNE_CONTROL_IDLE_MAX_PARK_US"] = "4000";

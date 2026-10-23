@@ -10,8 +10,8 @@
 //   2u  AlterSchema t<i>  ADD mana i32                                            i in [0, 2u)
 //   2u  AlterTopicConfig t<i> retention.ms = 60000 + i                            i in [0, 2u)
 //   1u  SetCompatibility t<i> FORWARD                                             i in [0, u)
-//   1u  CreateView v<i> over t<i> (1-partition sink)                              i in [0, u)
-//   1u  AlterView v<i> (a fresh 2-partition sink)                                 i in [0, u)
+//   1u  CreateView v<i> over t<i> (a 4-partition sink: it mirrors t<i>, #143)    i in [0, u)
+//   1u  AlterView v<i> (a fresh 4-partition sink)                                 i in [0, u)
 //   u/2 DropView v<i>                                                             i in [u/2, u)
 //   u/2 DropTopic t<i>   (no view reads them)                                     i in [3u/2, 2u)
 // Final: 3u/2 live topics + u/2 live views -> bootTopics = 2u; topic ids assigned = 4u -> droppedIds = 2u.
@@ -74,8 +74,9 @@ inline CatalogBootScript catalogBootScript(int unit) {
     for (int i = 0; i < 2 * unit; ++i) b.alterSchema(T(i), {addOp("mana", cd::PrimType::Int32)}, "ALTER TOPIC " + T(i) + " ADD mana INT32");
     for (int i = 0; i < 2 * unit; ++i) b.alterConfig(T(i), {{cat::ConfigKey::RetentionMs, 60'000 + i}}, "ALTER TOPIC " + T(i) + " SET retention.ms");
     for (int i = 0; i < unit; ++i)     b.setCompat(T(i), cd::CompatMode::Forward, "ALTER TOPIC " + T(i) + " SET COMPATIBILITY FORWARD");
-    for (int i = 0; i < unit; ++i)     b.createView(V(i), viewDef(V(i), T(i), 1, 0x01), "CREATE VIEW " + V(i));
-    for (int i = 0; i < unit; ++i)     b.alterView(V(i), viewDef(V(i), T(i), 2, 0x02), "ALTER VIEW " + V(i));
+    // #143: a sink mirrors its source's partition count (4), at create and at alter.
+    for (int i = 0; i < unit; ++i)     b.createView(V(i), viewDef(V(i), T(i), 4, 0x01), "CREATE VIEW " + V(i));
+    for (int i = 0; i < unit; ++i)     b.alterView(V(i), viewDef(V(i), T(i), 4, 0x02), "ALTER VIEW " + V(i));
     for (int i = unit / 2; i < unit; ++i)         b.dropView(V(i), "DROP VIEW " + V(i));
     for (int i = 3 * unit / 2; i < 2 * unit; ++i) b.dropTopic(T(i), "DROP TOPIC " + T(i));
     const uint64_t digest = b.state().digest();

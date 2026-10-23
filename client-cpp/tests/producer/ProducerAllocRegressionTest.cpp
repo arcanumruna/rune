@@ -1,4 +1,5 @@
 // tests/producer/ProducerAllocRegressionTest.cpp
+#include <filesystem>
 #include "../support/AllocCounter.h"
 #include "../support/FakeCoordinator.h"
 #include "gen/position.gen.h"
@@ -195,7 +196,7 @@ rc::ClientConfig txnAllocClientCfg() {
     c.gatewayStreamId = 4721;
     c.egressChannel   = "aeron:ipc";
     c.egressStreamId  = 4722;
-    c.dataDir         = "/tmp/txn_alloc_regression_" + std::to_string(::getpid());
+    c.dataDir         = std::filesystem::temp_directory_path().string() + "/txn_alloc_regression_" + std::to_string(::getpid());
     c.runnerMode      = rc::RunnerMode::Invoker;
     return c;
 }

@@ -19,6 +19,7 @@
 #include <rune/node/ViewRegistry.h>
 
 #include <rune/catalog/CatalogEvent.h>
+#include <rune/catalog/CatalogFingerprint.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
 #include <rune/protocol/RecordBatch.h>
@@ -35,6 +36,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include <sys/stat.h>
@@ -222,6 +224,95 @@ TEST(CatalogApplierRegression, ApplyRefusalHaltsAtItsOffsetRegression) {
     EXPECT_EQ(rig.rec.appliedOffsets, (std::vector<int64_t>{0}));
     EXPECT_EQ(std::count(rig.rec.sequence.begin(), rig.rec.sequence.end(), "topicApplied:0"), 1)
         << "the refused event posted no effect";
+}
+
+// #143: a view sink mirrors its first source's partition count; the verified apply (ApplyV1) refuses a CreateView whose
+// sinkPartitions differs, so a crafted / foreign catalog halts the applier LOUDLY at that event's offset - never a view
+// that GetViewRow would later find inconsistent.  The crafted event is golden offset 9 (CreateView top_players over
+// players, 8 partitions) with a 3-partition sink, fingerprinted as the object it would create: without the rule it
+// would apply cleanly.
+TEST(CatalogApplierRegression, ASinkWithAMismatchedPartitionCountHaltsTheApplierRegression) {
+    CatalogRig rig("ap_sink_parts");
+    rig.appendEvents(0, 9);                              // golden 0..8: players (8 partitions), events, presence, ...
+    cat::CatalogEvent bad = rig.golden().at(9);
+    ASSERT_EQ(bad.kind, cat::EventKind::CreateView);
+    auto& ops = std::get<cat::CreateViewOps>(bad.ops);
+    ASSERT_EQ(ops.view.sourceNames.front(), "players");
+    ops.view.sinkPartitions = 3;
+    bad.fingerprint = cat::fingerprintOf(cat::ViewObject{.objectId = bad.objectId, .name = bad.objectName,
+                                                         .version = bad.newVersion, .def = ops.view});
+    rig.appendEventCommitted(bad);                        // offset 9
+    rig.appendEvents(9, 10);                              // offset 10: the golden (valid) CreateView behind it
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 9);
+    ASSERT_TRUE(rig.applier.halted());
+    EXPECT_EQ(rig.applier.stateName(), "Halted");
+    ASSERT_EQ(rig.rec.halts.size(), 1u);
+    EXPECT_EQ(rig.rec.halts[0].offset, 9);
+    EXPECT_EQ(rig.rec.halts[0].code, cat::ApplyError::Code::Precondition);
+    EXPECT_NE(rig.rec.halts[0].detail.find("sink partitions 3"), std::string::npos) << rig.rec.halts[0].detail;
+    EXPECT_NE(rig.rec.halts[0].detail.find("source 'players' has 8"), std::string::npos) << rig.rec.halts[0].detail;
+    ASSERT_NE(rig.applier.haltError(), nullptr);
+    EXPECT_EQ(rig.applier.haltError()->offset, 9);
+    EXPECT_EQ(rig.rec.appliedOffsets, (std::vector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8})) << "never skipped past";
+    EXPECT_EQ(rig.views.byName("top_players"), nullptr) << "the view is never installed";
+    EXPECT_TRUE(rig.rec.liveViewInstalls.empty());
+    for (const std::string& fx : rig.rec.sequence)
+        EXPECT_EQ(fx.rfind("sinkApplied:", 0), std::string::npos) << "no sink effect was posted: " << fx;
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 0) << "halted: no further apply, ever";
+}
+
+// Adversarial review of PR #597 (#143), sibling entry points: the rule must hold at AlterView too (golden offset 10:
+// top_players re-sunk to a fresh sink 4 over players' 8 partitions, crafted with 4), and across a restart: the boot
+// replay stops at the last good checkpoint (9) and going live halts at the SAME offset again - never past it, never
+// with the fresh sink placed or the view re-installed onto it.  Mutation: drop the ApplyV1 sink-partition rule and
+// the AlterView applies (the applier never halts).
+TEST(CatalogApplierAdversarial, AMismatchedAlterViewSinkHaltsLiveAndAgainAfterARestartAdversarialRegression) {
+    CatalogRig rig("ap_sink_alter");
+    rig.appendEvents(0, 10);                              // golden 0..9: ... top_players over players (sink 3, 8 parts)
+    cat::CatalogEvent bad = rig.golden().at(10);
+    ASSERT_EQ(bad.kind, cat::EventKind::AlterView);
+    auto& ops = std::get<cat::AlterViewOps>(bad.ops);
+    ASSERT_EQ(ops.view.sourceNames.front(), "players");
+    ASSERT_EQ(ops.view.sinkPartitions, 8);
+    const int32_t freshSink = ops.view.viewTopicId;
+    ops.view.sinkPartitions = 4;
+    bad.fingerprint = cat::fingerprintOf(cat::ViewObject{.objectId = bad.objectId, .name = bad.objectName,
+                                                         .version = bad.newVersion, .def = ops.view});
+    rig.appendEventCommitted(bad);                        // offset 10
+    rig.appendEvents(11, 12);                             // a valid event behind it
+    const std::string sinkFx = "sinkApplied:" + std::to_string(freshSink);
+    const std::string installFx = "viewInstalled:" + std::to_string(freshSink);
+    auto noFreshSink = [&](const char* when) {
+        for (const std::string& fx : rig.rec.sequence) {
+            EXPECT_NE(fx, sinkFx) << when << ": the mismatched fresh sink was placed";
+            EXPECT_NE(fx, installFx) << when << ": the view was re-installed onto the mismatched sink";
+        }
+    };
+
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 10);
+    ASSERT_TRUE(rig.applier.halted());
+    ASSERT_EQ(rig.rec.halts.size(), 1u);
+    EXPECT_EQ(rig.rec.halts[0].offset, 10);
+    EXPECT_EQ(rig.rec.halts[0].code, cat::ApplyError::Code::Precondition);
+    EXPECT_NE(rig.rec.halts[0].detail.find("sink partitions 4 but its first source 'players' has 8"), std::string::npos)
+        << rig.rec.halts[0].detail;
+    EXPECT_EQ(rune::node::readCatalogCheckpoint(rig.catalogDir())->appliedOffset, 9) << "never checkpointed past 9";
+    ASSERT_NE(rig.views.byName("top_players"), nullptr) << "the view keeps its last good definition";
+    noFreshSink("live");
+
+    rig.restart();
+    rig.rec.clear();
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 10) << "boot replays [0, 9] only";
+    EXPECT_FALSE(rig.applier.halted()) << "the boot replay stops at the checkpoint, before the bad event";
+    ASSERT_TRUE(rig.applier.goLive(rig.rec.liveEffects()));
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 0);
+    ASSERT_TRUE(rig.applier.halted()) << "a restart halts at the same offset again";
+    ASSERT_NE(rig.applier.haltError(), nullptr);
+    EXPECT_EQ(rig.applier.haltError()->offset, 10);
+    EXPECT_EQ(rig.applier.haltError()->code, cat::ApplyError::Code::Precondition);
+    EXPECT_EQ(rune::node::readCatalogCheckpoint(rig.catalogDir())->appliedOffset, 9);
+    noFreshSink("after the restart");
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 0) << "halted: nothing more, ever";
 }
 
 // Fix round 1 (M5): the crash points are SIMULATED, not inferred.
@@ -452,7 +543,7 @@ TEST(CatalogApplierRegression, ProductionSinkEncodesEveryEffectOnTheAdminToContr
     ASSERT_TRUE(decodeCatalogTopicApplied(frames[24].bytes.data(), frames[24].bytes.size(), sink));
     EXPECT_EQ(sink.topicId, 3);
     EXPECT_EQ(sink.name, "top_players");
-    EXPECT_EQ(sink.partitions, 2);
+    EXPECT_EQ(sink.partitions, 8) << "#143: the sink mirrors players' 8 partitions";
     EXPECT_EQ(sink.replicationFactor, 0) << "a view sink lives on every broker";
     EXPECT_EQ(sink.config.cleanupPolicy, 1) << "a view sink is a keyed, compacted table";
     EXPECT_EQ(sink.config.partitionKey, "id");

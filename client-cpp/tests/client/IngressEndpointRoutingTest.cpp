@@ -1,6 +1,7 @@
 // tests/client/IngressEndpointRoutingTest.cpp — per-partition worker ingress
 // endpoints (shard-mode brokers).  Invoker client + InvokerGateway on one thread;
 // the duty-cycle clock is frozen so no retransmit timer can mask a routing bug.
+#include <filesystem>
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
 
@@ -51,7 +52,7 @@ struct Rig {
         c.gatewayStreamId = in;
         c.egressChannel = "aeron:ipc";
         c.egressStreamId = eg;
-        c.dataDir = "/tmp/ingress_ep_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+        c.dataDir = std::filesystem::temp_directory_path().string() + "/ingress_ep_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
         c.runnerMode = rc::RunnerMode::Invoker;
         c.nanoClock = realClock ? nullptr : &frozenNow;
         rc::TopicSpec ts;

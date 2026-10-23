@@ -158,7 +158,7 @@ struct Lines {
 } // namespace
 
 TEST(ShardDrGateRegression, SigstopPast15sThenSigcontRecoversLiveExactlyOnce) {
-    const std::string base = "/tmp/shard_drgate_" + std::to_string(::getpid());
+    const std::string base = std::filesystem::temp_directory_path().string() + "/shard_drgate_" + std::to_string(::getpid());
     int toParent[2], toChild[2];
     ASSERT_EQ(::pipe(toParent), 0);
     ASSERT_EQ(::pipe(toChild), 0);
