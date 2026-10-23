@@ -1477,10 +1477,12 @@ void lagFollowerAndRevoke(AuthTrio& t, LaggingFollower& s) {
 }
 }  // namespace
 
-// What the broker guarantees today (issues #15 / #111, decision M7: staleness bounded by F, then R): F's applier stuck
-// behind the REVOKE drops its "caught up" verdict F after it last applied at the high watermark, and R later F ends the
-// user's live session with the retriable session-level AuthUnavailable (48); from then on nothing the user sends is
-// appended on F, a new login there is refused 48 (never OK), and once F applies the revoke it answers 45.
+// The session-level bound (issues #15 / #111, decision M7: staleness bounded by F, then R), unchanged by #603: F's
+// applier stuck behind the REVOKE drops its "caught up" verdict F after it last applied at the high watermark, and R
+// later F ends the user's live session with the retriable session-level AuthUnavailable (48); from then on nothing the
+// user sends is appended on F, a new login there is refused 48 (never OK), and once F applies the revoke it answers 45.
+// (Since #603 every request of that session was already refused 48 from the moment F knew the revoke committed - see
+// AFollowerThatHasNotAppliedARevokeNeverServesTheOldGrantRegression; this test pins the session end on top of it.)
 TEST(AuthClusterRegression, AFollowerStuckBehindARevokeEndsTheSessionWithinTheStalenessBoundRegression) {
     AuthTrio t("lagbound");
     withStaleSessionEnd(t, 3'000);
@@ -1510,17 +1512,19 @@ TEST(AuthClusterRegression, AFollowerStuckBehindARevokeEndsTheSessionWithinTheSt
     EXPECT_EQ(partitionLeo(&t.node(s.f), s.led.id, s.part), leo);
 }
 
-// DEFECT (found by batch M24, not fixed: a design change, see the report) - kept out of the suite (DISABLED_) until it
-// is fixed.  The strict property: F must never serve the grant it has not yet seen revoked - each answer between the
-// revoke's OK and F's apply is a refusal (45 or 48), never OK, and nothing is appended.  Today F keeps serving the
-// revoked WRITE (OK, appended) on both the routed and the worker-ingress path for up to F + R (the staleness bounds of
-// AFollowerStuckBehindARevokeEndsTheSessionWithinTheStalenessBoundRegression): SecurityServing only refuses logins,
-// `__security` reads and security DDL while stale, and ends live sessions only after R (rune/node/SecurityServing.h).
-TEST(AuthClusterRegression, DISABLED_AFollowerThatHasNotAppliedARevokeNeverServesTheOldGrantRegression) {
+// Issue #603 (found by batch M24; RED before the fix: F kept serving the revoked WRITE - OK, appended - on both the
+// routed and the worker-ingress path for up to F + R).  F must never serve a grant it holds a committed revoke of:
+// from the moment F knows the REVOKE is committed (its leader's HW covers it) every answer is the retriable
+// AuthUnavailable (48) and nothing is appended, until F applied it; then the revoke itself answers (45).  The window
+// before F learns the HW (one leader->follower message) is the F bound of SecurityServing.h, waited out here by
+// condition (F reports itself behind) - never by time.
+TEST(AuthClusterRegression, AFollowerThatHasNotAppliedARevokeNeverServesTheOldGrantRegression) {
     AuthTrio t("lagrevoke");
     LaggingFollower s;
     lagFollowerAndRevoke(t, s);
     if (HasFatalFailure()) return;
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return t.node(s.f).securityBehindForTest().gateway; }))
+        << "F learns that the revoke it holds is committed";
     const int64_t leo = partitionLeo(&t.node(s.f), s.led.id, s.part);
     for (int i = 0; i < 5; ++i) {
         const int routed = gatewayProduce(t, s.u, s.f, s.led.id, s.part);
@@ -1530,5 +1534,100 @@ TEST(AuthClusterRegression, DISABLED_AFollowerThatHasNotAppliedARevokeNeverServe
             << "attempt " << i << ": F served the revoked grant (worker ingress), answer " << direct;
     }
     EXPECT_EQ(partitionLeo(&t.node(s.f), s.led.id, s.part), leo) << "F appended under the revoked grant";
+    EXPECT_EQ(t.node(s.f).securityViewForTest().appliedOffset, s.appliedBefore) << "the hold held for the whole window";
     t.node(s.f).holdSecurityApplyForTest(false);
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return !t.node(s.f).securityBehindForTest().gateway; })) << "F applied it";
+    EXPECT_EQ(gatewayProduce(t, s.u, s.f, s.led.id, s.part), 45) << "then the revoke answers (routed)";
+    EXPECT_EQ(shardProduce(s.u, s.f, s.ingress, s.led.id), 45) << "then the revoke answers (worker ingress)";
+    EXPECT_EQ(partitionLeo(&t.node(s.f), s.led.id, s.part), leo);
+}
+
+// Issue #603, the interaction matrix's cluster slice: node {a `__security` FOLLOWER, the LEADER} x change {REVOKE ROLE,
+// GRANT ROLE} (the role carries WRITE and READ on "lag.") x operation {routed produce, worker-ingress produce,
+// subscribe} x apply {held, released}, on the partition that node leads.  Held: every operation answers 48 and nothing
+// is appended on that node.  Released: the change decides (REVOKE 45, GRANT 0).  The leader-held cells' DDL OK waits for
+// the leader's own enforcement (D24), so it is sent from a background thread on the trio wire while the user works on
+// a wire of its own.
+TEST(AuthClusterRegression, TheBehindRuleAcrossRolesChangesAndOperationsMatrixRegression) {
+    AuthTrio t("lagmatrix");
+    t.start();
+    t.bootstrapAdmin();
+    createBuilder(t);
+    const std::vector<AuthTrio::Session> bs = sessionsOnEveryBroker(t, "builder");
+    ASSERT_EQ(bs.size(), 3u);
+    const LedTopic led = defineLedTopic(t, bs, "lag.m");
+    ASSERT_GE(led.id, 0);
+    ASSERT_TRUE(led.part[0] >= 0 && led.part[1] >= 0 && led.part[2] >= 0) << "each broker must lead one partition";
+    const int32_t secLeader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(secLeader, 0);
+    const int follower = secLeader == 3 ? 2 : 3;
+    t.mustOk(t.ddl(1, [](AuthWireClient& w, const std::string& ch, int64_t sid) { return w.createRole(ch, sid, "lagrole"); }), "CREATE ROLE");
+    t.grant(1, "lagrole", SO::Write, ST::Topic, SP::Prefix, "lag.", /*role=*/true);
+    t.grant(1, "lagrole", SO::Read, ST::Topic, SP::Prefix, "lag.", /*role=*/true);
+    AuthWireClient uw(t.cluster().clientsDir->path / "matrix_user_wire");
+    int cell = 0;
+    for (const int node : {follower, secLeader}) {
+        for (const bool revoke : {true, false}) {
+            const std::string user = "mx" + std::to_string(cell++);
+            SCOPED_TRACE(user + (node == secLeader ? " on the leader " : " on a follower ") + std::to_string(node) +
+                         (revoke ? ", REVOKE ROLE" : ", GRANT ROLE"));
+            t.createUser(1, user);
+            if (revoke)
+                t.mustOk(t.ddl(1, [&](AuthWireClient& w, const std::string& ch, int64_t sid) { return w.grantRole(ch, sid, user, "lagrole"); }), "GRANT ROLE");
+            ASSERT_TRUE(t.awaitDigestsAgree(0, 30s));
+            UserSessions u;
+            u.name = user;
+            u.w = &uw;
+            ASSERT_TRUE(AuthTrio::until(30s, [&] {
+                try { u.sid[static_cast<std::size_t>(node - 1)] = t.loginOn(uw, node, user).sid; return true; } catch (...) { return false; }
+            }));
+            const int32_t part = led.part[static_cast<std::size_t>(node - 1)];
+            PartitionInfo ingress;
+            ASSERT_TRUE(AuthTrio::until(30s, [&] {
+                for (const PartitionInfo& pi : bs[0].w->raw().metadata(t.channel(bs[0].node), AuthWireClient::kClientStream, bs[0].sid))
+                    if (pi.topicId == led.id && pi.partition == part && pi.leaderId == node && !pi.ingressEndpoint.empty()) { ingress = pi; return true; }
+                return false;
+            }));
+            const int before = revoke ? 0 : 45;
+            auto subscribeCode = [&] {
+                auto& c = uw.raw();
+                const int64_t corr = c.sendSubscribe(t.channel(node), AuthWireClient::kClientStream,
+                                                     u.sid[static_cast<std::size_t>(node - 1)], led.id, part);
+                const auto code = c.awaitSubscribeCode(corr, Clock3::now() + 10s);
+                return code ? static_cast<int>(*code) : kNoAnswer;
+            };
+            ASSERT_TRUE(AuthTrio::until(30s, [&] { return gatewayProduce(t, u, node, led.id, part) == before; })) << "routed before";
+            ASSERT_TRUE(AuthTrio::until(30s, [&] { return shardProduce(u, node, ingress, led.id) == before; })) << "worker before";
+            ASSERT_EQ(subscribeCode(), before) << "subscribe before";
+
+            const int64_t applied = t.node(node).securityViewForTest().appliedOffset;
+            t.node(node).holdSecurityApplyForTest(true);
+            auto ddl = std::async(std::launch::async, [&]() -> int {
+                return t.ddl(secLeader, [&](AuthWireClient& w, const std::string& ch, int64_t sid) {
+                    return revoke ? w.revokeRole(ch, sid, user, "lagrole") : w.grantRole(ch, sid, user, "lagrole");
+                }, 60s).errorCode;
+            });
+            ASSERT_TRUE(AuthTrio::until(30s, [&] { return t.node(node).securityBehindForTest().gateway; }))
+                << "node " << node << " knows the change is committed";
+            const int64_t leo = partitionLeo(&t.node(node), led.id, part);
+            for (int i = 0; i < 3; ++i) {
+                EXPECT_EQ(gatewayProduce(t, u, node, led.id, part), kAuthUnavailable) << "routed, held, attempt " << i;
+                EXPECT_EQ(shardProduce(u, node, ingress, led.id), kAuthUnavailable) << "worker, held, attempt " << i;
+                EXPECT_EQ(subscribeCode(), kAuthUnavailable) << "subscribe, held, attempt " << i;
+            }
+            EXPECT_EQ(partitionLeo(&t.node(node), led.id, part), leo) << "nothing appended while behind";
+            EXPECT_EQ(t.node(node).securityViewForTest().appliedOffset, applied) << "the hold held";
+
+            t.node(node).holdSecurityApplyForTest(false);
+            ASSERT_EQ(ddl.wait_for(90s), std::future_status::ready);
+            EXPECT_EQ(ddl.get(), 0);
+            ASSERT_TRUE(AuthTrio::until(30s, [&] { return !t.node(node).securityBehindForTest().gateway; }));
+            ASSERT_TRUE(AuthTrio::until(30s, [&] { return !t.node(node).securityBehindForTest().workers; }));
+            const int after = revoke ? 45 : 0;
+            EXPECT_EQ(gatewayProduce(t, u, node, led.id, part), after) << "routed after";
+            EXPECT_EQ(shardProduce(u, node, ingress, led.id), after) << "worker after";
+            EXPECT_EQ(subscribeCode(), after) << "subscribe after";
+            if (revoke) EXPECT_EQ(partitionLeo(&t.node(node), led.id, part), leo) << "the revoked grant never appended";
+        }
+    }
 }

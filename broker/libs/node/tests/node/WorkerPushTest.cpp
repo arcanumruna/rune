@@ -13,6 +13,7 @@
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/node/WorkerWriteGrants.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/transaction/ControlMarker.h>
 #include <rune/storage/InMemoryLog.h>
@@ -419,6 +420,49 @@ TEST_F(WorkerPushFixture, UnsubscribeStopsFurtherDelivery) {
     for (int i = 5; i < 10; ++i) appendBatch(log, i, 1);
     for (int i = 0; i < 100; ++i) { w.doWork(1); sub->poll(c.fa.handler(), 64); std::this_thread::sleep_for(1ms); }
     EXPECT_EQ(c.baseOffsets.size(), 5u) << "no delivery after unsubscribe";
+    std::filesystem::remove_all(dir);
+}
+
+// Issue #603: while the control thread says its `__security` view is behind committed events this broker holds (the
+// flag op on the session-lifecycle ring), the worker pushes nothing - the held events may revoke the READ the
+// subscription was admitted with; once cleared, it resumes where it stopped: nothing lost, nothing twice.
+// RED (mutation): drop the check in pushSubscriptions_.
+TEST_F(WorkerPushFixture, WhileTheSecurityViewIsBehindNothingIsPushedRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    for (int i = 0; i < 5; ++i) appendBatch(log, i, 1);
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3007);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3007);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &log)));
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() { w.doWork(1); sub->poll(c.fa.handler(), 64); return c.baseOffsets.size() >= 5; }, 10s));
+    ASSERT_EQ(c.baseOffsets.size(), 5u);
+
+    auto behind = [&](bool on) {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = 0;
+        o.nextOffset = on ? 1 : 0; o.isolation = kPermFlagSecurityBehind | kPermFlagLast;
+        ASSERT_TRUE(w.tryEnqueueOp(std::move(o)));
+    };
+    behind(true);
+    w.doWork(1);
+    ASSERT_TRUE(w.securityBehindForTest());
+    for (int i = 5; i < 10; ++i) appendBatch(log, i, 1);
+    for (int i = 0; i < 100; ++i) { w.doWork(1); sub->poll(c.fa.handler(), 64); std::this_thread::sleep_for(1ms); }
+    EXPECT_EQ(c.baseOffsets.size(), 5u) << "nothing pushed while behind";
+
+    behind(false);
+    ASSERT_TRUE(waitFor([&]() { w.doWork(1); sub->poll(c.fa.handler(), 64); return c.baseOffsets.size() >= 10; }, 10s));
+    for (int i = 0; i < 50; ++i) { w.doWork(1); sub->poll(c.fa.handler(), 64); }
+    ASSERT_EQ(c.baseOffsets.size(), 10u) << "resumed: nothing lost, nothing twice";
+    for (int i = 0; i < 10; ++i) EXPECT_EQ(c.baseOffsets[static_cast<std::size_t>(i)], i);
     std::filesystem::remove_all(dir);
 }
 

@@ -14,6 +14,7 @@
 //   kPermFlagBind   session `sessionId` now uses table `nextOffset` (-1 = deny everything); correlationId = epoch,
 //                   producerId = the principal (#122);
 //   kPermFlagDrop   table `sessionId` is freed: every slot still pointing at it is reset to deny, its bits cleared.
+//   kPermFlagFence / kPermFlagSecurityBehind: no table (see below).
 // A session announced without grantAll starts denied: every produce from it is answered NotAuthorized until its bind
 // arrives (default deny).
 #include <cstddef>
@@ -58,6 +59,12 @@ inline constexpr uint8_t kPermFlagDrop     = 0x20;
 /// worker answers SessionSignal FenceAck{sessionId 1} - every permission item, bind and SessionClose queued before it
 /// on this ring is installed.  Carries no table.
 inline constexpr uint8_t kPermFlagFence    = 0x40;
+/// Issue #603: this broker's `__security` view is behind committed events it holds (nextOffset = 1) or no longer is
+/// (nextOffset = 0).  While behind, the worker answers every ingress produce AuthUnavailable (nothing appended) and
+/// pushes no subscription.  The control thread ships the clear only once every applied event's enforcement fence was
+/// acknowledged on both rings, so the revoked bitmaps and the ended subscriptions are installed first.  Carries no
+/// table.
+inline constexpr uint8_t kPermFlagSecurityBehind = 0x80;
 /// The worker's table store bound (== gateway PermissionPool::kMaxTables).
 inline constexpr std::size_t kMaxWritePermTables = 4096;
 

@@ -805,6 +805,10 @@ public:
     [[nodiscard]] std::size_t sessionCryptoCountForTest() const noexcept { return sessionCrypto_.size(); }
     [[nodiscard]] uint64_t workerNotAuthorizedForTest() const noexcept { return workerNotAuthorized_; }
     [[nodiscard]] uint64_t sessionPermissionChunksSeenForTest() const noexcept { return sessionPermissionChunksSeen_; }
+    /// Issue #603 probes: the worker's copy of the "security view behind" flag, the flag ops seen, the produces refused.
+    [[nodiscard]] bool securityBehindForTest() const noexcept { return securityBehind_; }
+    [[nodiscard]] uint64_t securityBehindOpsSeenForTest() const noexcept { return securityBehindOpsSeen_; }
+    [[nodiscard]] uint64_t securityBehindRefusalsForTest() const noexcept { return securityBehindRefusals_; }
     /// Test-only (auth Task 18): the shipped permission epoch this worker holds for `sid` (0 = no slot / not enforcing).
     [[nodiscard]] uint64_t permissionEpochForTest(int64_t sid) const noexcept {
         if (const auto* enf = std::get_if<Enforcing>(&enforcement_); enf != nullptr && enf->sink != nullptr)
@@ -2754,6 +2758,11 @@ private:
             ackEnforceFence_(op.correlationId(), /*lifecycleRing=*/true);
             return;
         }
+        if ((op.isolation() & kPermFlagSecurityBehind) != 0) [[unlikely]] {   // issue #603: in every worker mode
+            securityBehind_ = op.nextOffset() != 0;
+            ++securityBehindOpsSeen_;
+            return;
+        }
         if (!ackSink_) return;   // a worker without worker-side acks keeps no session table (and enforces nothing)
         const auto first = static_cast<uint64_t>(op.nextOffset());
         const auto total = static_cast<uint64_t>(op.hwBound());
@@ -3509,6 +3518,9 @@ private:
     /// Both push passes, in a rotating order, on ONE shared budget (pushBudgetLeft_): neither can starve the other.
     /// With no filtered group this is the unfiltered pass behind one predicted branch.
     int pushSubscriptions_(int64_t nowNs) {
+        // Issue #603: nothing is pushed while this broker's `__security` view is behind committed events it holds (they
+        // may revoke the READ a subscription was admitted with).  One predictable branch on a worker-owned bool.
+        if (securityBehind_) [[unlikely]] return 0;
         if (filterGroupByKey_.empty()) [[likely]] return pushOwnedSubscriptions_(nowNs);
         return pushSubscriptionsMixed_(nowNs);
     }
@@ -7951,6 +7963,23 @@ private:
         return 1;
     }
 
+    /// Issue #603: answer a direct-ingress produce while the `__security` view is behind: ProduceResponse{AuthUnavailable}
+    /// (consumed, never appended), counted, logged rate-limited.
+    [[gnu::cold]] [[gnu::noinline]] int refuseSecurityBehind_(const rune::protocol::client::Produce& msg, uint8_t directAck) {
+        if (securityBehindRefusals_++ % 1024 == 0)
+            spdlog::warn("Worker {}: WorkerIngress: produce refused AuthUnavailable - the __security view is behind "
+                         "(session={}, topic={}); total {}", workerId_, msg.sessionId, msg.topicId, securityBehindRefusals_);
+        WorkerReturn ret = produceAnswer_(ProduceOrigin::WorkerIngress, msg.sessionId, msg.correlationId,
+                                          msg.topicId, msg.partition);
+        ret.directAck = directAck;
+        ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthUnavailable);
+        enqueueReturn_(ret);
+        return 1;
+    }
+    bool     securityBehind_         = false;   ///< #603: worker-owned copy of the control thread's flag
+    uint64_t securityBehindOpsSeen_  = 0;
+    uint64_t securityBehindRefusals_ = 0;
+
     /// X036: answer a direct-ingress Produce frame that carries a client-built control batch InvalidRequest (consumed,
     /// never appended), counted and logged rate-limited (worker-thread-owned counter).
     [[gnu::cold]] [[gnu::noinline]] int refuseControlBatch_(const rune::protocol::client::Produce& msg, uint8_t directAck) {
@@ -8086,6 +8115,12 @@ private:
             if (enf->sink == nullptr) [[unlikely]] {
                 if (openSeq != 0) commitProduceSeq(openCtx, openSeq);   // consumed (answered)
                 return refuseNotAuthorized_(msg, directAck);
+            }
+            // Issue #603: the grants below may already be revoked by committed events this broker holds but has not
+            // applied - answered AuthUnavailable (retriable), nothing appended.  One predictable branch.
+            if (securityBehind_) [[unlikely]] {
+                if (openSeq != 0) commitProduceSeq(openCtx, openSeq);   // consumed (answered)
+                return refuseSecurityBehind_(msg, directAck);
             }
             const WriteGrantSlot* grants = enf->sink->writeGrants(msg.sessionId);
             if (grants == nullptr || !allowsWrite(*grants, msg.topicId)) [[unlikely]] {

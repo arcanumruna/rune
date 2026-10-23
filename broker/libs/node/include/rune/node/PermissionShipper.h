@@ -7,7 +7,7 @@
 // 10k sessions therefore ships at most one table plus 10k binds (instead of 10k full bitmaps), and a CREATE TOPIC one
 // word per live table (instead of one full bitmap per session that gains WRITE).
 //
-// One FIFO of items (Table / Patch / Bind / Drop), each with a sequence number; every worker receives every item, in
+// One FIFO of items (Table / Patch / Bind / Drop / SecurityBehind, issue #603), each with a sequence number; every worker receives every item, in
 // queue order, as SESSION_PERMISSIONS ops (a Table in chunks of <= kChunkWords words, the last flagged; issue #196: a
 // Fence, which each worker acknowledges once it installed everything before it).  A full
 // lifecycle ring stops that worker at its next op and retry() resumes there - an op is never sent twice and never
@@ -70,6 +70,14 @@ public:
         return push_(pool, std::move(it));
     }
 
+    /// Issue #603: this broker's `__security` view is (behind = true) / is no longer behind committed events it holds -
+    /// FIFO behind every item queued so far.
+    uint64_t securityBehind(WorkerPool& pool, bool behind) {
+        Item it{Kind::SecurityBehind};
+        it.first = behind ? 1 : 0;
+        return push_(pool, std::move(it));
+    }
+
     /// Resume every worker; returns how many ops were accepted this call.
     int retry(WorkerPool& pool) {
         int sent = 0;
@@ -94,7 +102,7 @@ public:
     void setHoldForTest(bool on) noexcept { hold_ = on; }
 
 private:
-    enum class Kind : uint8_t { Table, Patch, Bind, Drop, Fence };
+    enum class Kind : uint8_t { Table, Patch, Bind, Drop, Fence, SecurityBehind };
     struct Item {
         Kind                  kind;
         int64_t               key   = 0;   ///< table id (Table / Patch / Drop) or session id (Bind)
@@ -150,6 +158,10 @@ private:
         case Kind::Fence:
             op.isolation     = kPermFlagFence | kPermFlagLast;
             op.correlationId = static_cast<int64_t>(it.epoch);   // the fence sequence number
+            break;
+        case Kind::SecurityBehind:   // issue #603
+            op.isolation     = kPermFlagSecurityBehind | kPermFlagLast;
+            op.nextOffset    = static_cast<int64_t>(it.first);
             break;
         }
         return op;

@@ -20,7 +20,9 @@
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/client/TxnMessages.h>
+#include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/gateway/SecurityView.h>
 #include <rune/security/Permissions.h>
 
 #include <gtest/gtest.h>
@@ -124,6 +126,7 @@ struct Rig {
     int64_t                        sid = 0;
     int64_t                        corr = 100;
     std::vector<std::pair<int64_t, int16_t>> answers;   // (correlation, code)
+    bool dispatch = false;   // #603: send through the gateway's whole client-frame dispatch (the request gate included)
 
     explicit Rig(std::vector<sec::GrantSpec> grants = defaultGrants(),
                  std::vector<rune::metadata::RoutingImage::BuildEntry> img = {{rune::metadata::gpidOf(0, 0), 1, 1},
@@ -183,6 +186,9 @@ struct Rig {
                 if (auto r = pc::TopicSchemaResponse::decode(b, n))
                     answers.emplace_back(r->correlationId, static_cast<int16_t>(r->errorCode));
                 break;
+            case pc::TemplateId::Pong:   // #603: a session-level answer (code 0)
+                answers.emplace_back(h->correlationId, 0);
+                break;
             case pc::TemplateId::ErrorResponse:
                 if (auto r = pc::ErrorResponse::decode(b, n)) answers.emplace_back(r->correlationId, r->code);
                 break;
@@ -203,7 +209,8 @@ struct Rig {
         m.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
         std::vector<uint8_t> buf(m.encodedSize());
         m.encode(buf.data());
-        gw.applyProduceForTest(buf.data(), buf.size());
+        if (dispatch) (void)gw.applyClientFrameForTest(buf.data(), buf.size());
+        else gw.applyProduceForTest(buf.data(), buf.size());
         return m.correlationId;
     }
     int64_t subscribe(int32_t topicId, int32_t partition = 0) {
@@ -212,7 +219,8 @@ struct Rig {
         s.partitionKnown = 1; s.fromOffset = 0; s.isolation = 0;
         std::vector<uint8_t> buf(s.encodedSize());
         buf.resize(s.encode(buf.data()));
-        gw.applySubscribeForTest(buf.data(), buf.size());
+        if (dispatch) (void)gw.applyClientFrameForTest(buf.data(), buf.size());
+        else gw.applySubscribeForTest(buf.data(), buf.size());
         return s.correlationId;
     }
     int64_t getViewRow(int32_t viewId) {
@@ -220,7 +228,8 @@ struct Rig {
         m.sessionId = sid; m.correlationId = ++corr; m.viewTopicId = viewId; m.keyU64 = 1;
         std::vector<uint8_t> buf(64);
         buf.resize(m.encode(buf.data()));
-        gw.applyGetViewRowForTest(buf.data(), buf.size());
+        if (dispatch) (void)gw.applyClientFrameForTest(buf.data(), buf.size());
+        else gw.applyGetViewRowForTest(buf.data(), buf.size());
         return m.correlationId;
     }
     static std::span<const uint8_t> bytes(std::string_view s) { return {reinterpret_cast<const uint8_t*>(s.data()), s.size()}; }
@@ -230,7 +239,8 @@ struct Rig {
         const int32_t ids[] = {topicId};
         std::vector<uint8_t> buf(pc::JoinGroup::encodedSizeFor(m.groupId, m.memberId, 1, 0));
         buf.resize(m.encode(buf.data(), std::span<const int32_t>(ids)));
-        gw.applyGroupForTest(buf.data(), buf.size(), static_cast<uint16_t>(pc::TemplateId::JoinGroup));
+        if (dispatch) (void)gw.applyClientFrameForTest(buf.data(), buf.size());
+        else gw.applyGroupForTest(buf.data(), buf.size(), static_cast<uint16_t>(pc::TemplateId::JoinGroup));
         return m.correlationId;
     }
     int64_t offsetCommit(int32_t topicId, int32_t partition) {
@@ -239,7 +249,8 @@ struct Rig {
         const pc::OffsetCommitEntry e[] = {{topicId, partition, 5, {}}};
         std::vector<uint8_t> buf(pc::OffsetCommit::encodedSizeFor(m.groupId, m.memberId, e));
         buf.resize(m.encode(buf.data(), e));
-        gw.applyGroupForTest(buf.data(), buf.size(), static_cast<uint16_t>(pc::TemplateId::OffsetCommit));
+        if (dispatch) (void)gw.applyClientFrameForTest(buf.data(), buf.size());
+        else gw.applyGroupForTest(buf.data(), buf.size(), static_cast<uint16_t>(pc::TemplateId::OffsetCommit));
         return m.correlationId;
     }
     int64_t offsetFetch(int32_t topicId, int32_t partition) {
@@ -248,7 +259,8 @@ struct Rig {
         const pc::OffsetFetchEntry e[] = {{topicId, partition}};
         std::vector<uint8_t> buf(pc::OffsetFetch::encodedSizeFor(m.groupId, 1));
         buf.resize(m.encode(buf.data(), e));
-        gw.applyGroupForTest(buf.data(), buf.size(), static_cast<uint16_t>(pc::TemplateId::OffsetFetch));
+        if (dispatch) (void)gw.applyClientFrameForTest(buf.data(), buf.size());
+        else gw.applyGroupForTest(buf.data(), buf.size(), static_cast<uint16_t>(pc::TemplateId::OffsetFetch));
         return m.correlationId;
     }
     int64_t addPartitionsToTxn(int32_t topicId, int32_t partition) {
@@ -257,7 +269,8 @@ struct Rig {
         const pc::TxnTopicPartition p[] = {{topicId, partition}};
         std::vector<uint8_t> buf(pc::AddPartitionsToTxn::encodedSizeFor(m.transactionalId, 1));
         buf.resize(m.encode(buf.data(), p));
-        gw.applyTxnForTest(buf.data(), buf.size(), static_cast<uint16_t>(pc::TemplateId::AddPartitionsToTxn));
+        if (dispatch) (void)gw.applyClientFrameForTest(buf.data(), buf.size());
+        else gw.applyTxnForTest(buf.data(), buf.size(), static_cast<uint16_t>(pc::TemplateId::AddPartitionsToTxn));
         return m.correlationId;
     }
     int64_t txnOffsetCommit(int32_t topicId, int32_t partition) {
@@ -266,7 +279,8 @@ struct Rig {
         const pc::TxnOffsetCommitEntry e[] = {{topicId, partition, 5, {}}};
         std::vector<uint8_t> buf(m.encodedSize(e));
         buf.resize(m.encode(buf.data(), e));
-        gw.applyTxnForTest(buf.data(), buf.size(), static_cast<uint16_t>(pc::TemplateId::TxnOffsetCommit));
+        if (dispatch) (void)gw.applyClientFrameForTest(buf.data(), buf.size());
+        else gw.applyTxnForTest(buf.data(), buf.size(), static_cast<uint16_t>(pc::TemplateId::TxnOffsetCommit));
         return m.correlationId;
     }
     int64_t getTopicSchema(std::string_view name) {
@@ -274,7 +288,8 @@ struct Rig {
         m.sessionId = sid; m.correlationId = ++corr; m.topicName = name;
         std::vector<uint8_t> buf(m.encodedSize());
         buf.resize(m.encode(buf.data()));
-        gw.applyGetTopicSchemaForTest(buf.data(), buf.size());
+        if (dispatch) (void)gw.applyClientFrameForTest(buf.data(), buf.size());
+        else gw.applyGetTopicSchemaForTest(buf.data(), buf.size());
         return m.correlationId;
     }
 };
@@ -534,4 +549,84 @@ TEST(AuthUnappliedTopicRegression, AViewSinkIdAnswersLikeAMissingIdOnEveryTempla
     }
     EXPECT_EQ(r.group.calls, 0);
     EXPECT_EQ(r.txn.calls, 0);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Issue #603: while this broker's `__security` view is behind committed events it holds (setSecurityBehind), every
+// grant-checked request - through the gateway's whole client-frame dispatch - answers the retriable AuthUnavailable (48)
+// in its own response type, reaches no service and appends nothing; session-level frames are never refused.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+constexpr int16_t kAuthUnavailable = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
+struct BehindRig : Rig {
+    SecurityView view{rune::security::SecurityState{}};
+    BehindRig() {
+        dispatch = true;
+        gw.setAuthMode(GatewayAuthMode::Required, &view);
+    }
+    int64_t ping() {
+        pc::Ping p;
+        p.sessionId = sid; p.correlationId = ++corr;
+        std::vector<uint8_t> buf(64);
+        buf.resize(p.encode(buf.data()));
+        (void)gw.applyClientFrameForTest(buf.data(), buf.size());
+        return p.correlationId;
+    }
+    std::vector<std::pair<const char*, std::function<int64_t()>>> legs() {
+        return {{"Produce", [this] { return produce(0); }},
+                {"Subscribe", [this] { return subscribe(0); }},
+                {"GetViewRow", [this] { return getViewRow(0); }},
+                {"JoinGroup", [this] { return joinGroup(0); }},
+                {"OffsetCommit", [this] { return offsetCommit(0, 0); }},
+                {"OffsetFetch", [this] { return offsetFetch(0, 0); }},
+                {"AddPartitionsToTxn", [this] { return addPartitionsToTxn(0, 0); }},
+                {"TxnOffsetCommit", [this] { return txnOffsetCommit(0, 0); }},
+                {"GetTopicSchema", [this] { return getTopicSchema("w.boot"); }}};
+    }
+};
+}  // namespace
+
+// RED before #603 (and with either refusal removed): the produce was appended and the other requests reached their
+// services on grants the held events may already have revoked.
+TEST(SecurityBehindGatewayRegression, WhileBehindEveryGrantCheckedRequestAnswersAuthUnavailableRegression) {
+    BehindRig r;
+    const int64_t leo = r.registry->log(0, 0)->logEndOffset();
+    r.gw.setSecurityBehind(true);
+    ASSERT_TRUE(r.gw.securityBehind());
+    const auto legs = r.legs();
+    for (const auto& [what, send] : legs) {
+        const auto code = r.codeOf(send());
+        ASSERT_TRUE(code.has_value()) << what << ": answered, never silent";
+        EXPECT_EQ(*code, kAuthUnavailable) << what << ": retriable, in its own response type";
+    }
+    EXPECT_EQ(r.group.calls, 0) << "no group request reached the coordinator";
+    EXPECT_EQ(r.txn.calls, 0) << "no transaction request reached the coordinator";
+    EXPECT_EQ(r.admin.gets, 0u) << "no schema request reached the admin thread";
+    EXPECT_EQ(r.registry->log(0, 0)->logEndOffset(), leo) << "nothing appended";
+    EXPECT_EQ(r.gw.securityBehindRefusals(), legs.size());
+    const auto pong = r.codeOf(r.ping());
+    ASSERT_TRUE(pong.has_value()) << "a session-level frame is never refused";
+    EXPECT_EQ(*pong, 0);
+    EXPECT_TRUE(r.gw.hasSessionForTest(r.sid)) << "the session stays (only R ends it, SecurityServing)";
+
+    // Applied: served again, judged by the (unchanged) grants.
+    r.gw.setSecurityBehind(false);
+    for (const auto& [what, send] : legs) {
+        const auto code = r.codeOf(send());
+        EXPECT_TRUE(!code.has_value() || *code != kAuthUnavailable) << what << " after the view caught up";
+    }
+    EXPECT_GT(r.group.calls, 0);
+    EXPECT_GT(r.txn.calls, 0);
+    EXPECT_EQ(r.gw.securityBehindRefusals(), legs.size()) << "nothing refused for it after the clear";
+}
+
+// Only an authenticating gateway refuses: an in-process / dev gateway has no `__security` grants to wait for.
+TEST(SecurityBehindGatewayRegression, AnInProcessGatewayIgnoresTheFlagRegression) {
+    Rig r;
+    r.dispatch = true;
+    r.gw.setSecurityBehind(true);
+    EXPECT_FALSE(r.gw.securityBehind());
+    const auto code = r.codeOf(r.produce(0));
+    EXPECT_TRUE(!code.has_value() || *code != kAuthUnavailable);
+    EXPECT_EQ(r.gw.securityBehindRefusals(), 0u);
 }
