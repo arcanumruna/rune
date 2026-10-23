@@ -545,7 +545,10 @@ TEST(StorageGateWiringRegression, JoinerElectionIsHeldFromBootRegression) {
 // Joiner, is still in the committed metadata ISR so every vote would go to it - no longer holds.  The broker fences
 // (NodeRuntimeAgent shrinkIsrToLive, Kafka-style, ~450 ms) every internal partition's ISR down to the members the cluster
 // sees as live and eligible, so X is out of the metadata ISR before the test can observe it.  What replaces "the others
-// hold" is that fencing: X is not in the knowledge of L or Y, so no vote goes to it.  RED: the change-only hold.
+// hold" is that fencing: X is not in the knowledge of L or Y, so no vote goes to it.  RED: removing the internal-
+// partition fencing (NodeRuntimeAgent: shrinkIsrToLive on topicId < 0 leaders) fails the fencing assertion.  This test
+// does NOT pin X's own storage hold any more: with X fenced out, dropping the hold (both setStorageHold sites) stays
+// green here - that hold is pinned by StorageGateWiringRegression.JoinerElectionIsHeldFromBootRegression (PR #574 review).
 TEST(ConsensusCandidacyElectionRegression, WipedMemberNeverConsensusLeader_CommittedMetadataSurvivesRegression) {
     Cluster c(3);
     for (int i = 0; i < 3; ++i) c.start(i);

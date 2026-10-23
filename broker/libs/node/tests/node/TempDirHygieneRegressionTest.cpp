@@ -258,3 +258,307 @@ TEST(TempDirHygieneRegression, AFailingBinaryRemovesItsRootAtExitRegression) {
     fs::remove_all(d);
     fs::remove(marker);
 }
+
+// ── PR #574 adversarial review: attacks on the per-process temp root (#375) ──────────────────────────────────────
+// Each attack runs its children in a private base directory under this process's own root (never the shared TMPDIR),
+// so a concurrent test binary on the host can neither disturb nor be disturbed by the planted entries.
+#include <gtest/gtest-spi.h>
+
+namespace {
+
+// A child of this binary that keeps running: stdin is a pipe the parent closes to release it, stdout a pipe the
+// parent reads its READY line from.  stderr goes to `logPath`.
+struct LiveChild {
+    pid_t pid   = -1;
+    int   inFd  = -1;   // parent's write end of the child's stdin
+    int   outFd = -1;   // parent's read end of the child's stdout
+};
+
+LiveChild spawnSelfLive(const std::vector<std::string>& args, const std::string& tmpdir,
+                        const std::vector<std::string>& extraEnv, const std::string& logPath) {
+    LiveChild c;
+    const std::string exe = selfExe();
+    if (exe.empty()) return c;
+    std::vector<std::string> envStore;
+    for (char** e = environ; *e != nullptr; ++e) {
+        const std::string kv{*e};
+        if (kv.rfind("TMPDIR=", 0) == 0 || kv.rfind("RUNE_TEST_KEEP_TMP=", 0) == 0 || kv.rfind("GTEST_", 0) == 0) continue;
+        envStore.push_back(kv);
+    }
+    envStore.push_back("TMPDIR=" + tmpdir);
+    for (const auto& kv : extraEnv) envStore.push_back(kv);
+    std::vector<char*> envp;
+    for (auto& kv : envStore) envp.push_back(kv.data());
+    envp.push_back(nullptr);
+    std::vector<std::string> argStore{exe};
+    for (const auto& a : args) argStore.push_back(a);
+    std::vector<char*> argv;
+    for (auto& a : argStore) argv.push_back(a.data());
+    argv.push_back(nullptr);
+
+    int in[2], out[2];
+    if (::pipe(in) != 0) return c;
+    if (::pipe(out) != 0) { ::close(in[0]); ::close(in[1]); return c; }
+    ::fcntl(in[1], F_SETFD, FD_CLOEXEC);
+    ::fcntl(out[0], F_SETFD, FD_CLOEXEC);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, in[0], STDIN_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, out[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, logPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    posix_spawn_file_actions_addclose(&fa, in[0]);
+    posix_spawn_file_actions_addclose(&fa, out[1]);
+    pid_t pid = -1;
+    const int rc = ::posix_spawn(&pid, exe.c_str(), &fa, nullptr, argv.data(), envp.data());
+    posix_spawn_file_actions_destroy(&fa);
+    ::close(in[0]);
+    ::close(out[1]);
+    if (rc != 0) { ::close(in[1]); ::close(out[0]); return c; }
+    c.pid = pid; c.inFd = in[1]; c.outFd = out[0];
+    return c;
+}
+
+// Reads lines from the child's stdout (gtest prints its own banner there) until one starts with "READY "; empty on
+// deadline / EOF.
+std::string readLine(int fd, int deadlineMs = kChildDeadlineMs);
+std::string readReady(int fd) {
+    for (int i = 0; i < 64; ++i) {
+        const std::string l = readLine(fd);
+        if (l.rfind("READY ", 0) == 0) return l;
+        if (l.empty()) return {};
+    }
+    return {};
+}
+// Reads one line from the child's stdout with a hard poll() deadline; empty on deadline / EOF.
+std::string readLine(int fd, int deadlineMs) {
+    std::string line;
+    pollfd p{fd, POLLIN, 0};
+    for (int iter = 0; iter < 4096; ++iter) {
+        const int n = ::poll(&p, 1, deadlineMs);
+        if (n == 0) return {};
+        if (n < 0) { if (errno == EINTR) continue; return {}; }
+        char ch;
+        const ssize_t got = ::read(fd, &ch, 1);
+        if (got == 0) return {};
+        if (got < 0) { if (errno == EINTR) continue; return {}; }
+        if (ch == '\n') return line;
+        line.push_back(ch);
+    }
+    return {};
+}
+
+// Releases a LiveChild (EOF on its stdin) and reaps it with a hard deadline (EOF on its stdout = it is gone).
+int releaseAndReap(LiveChild& c) {
+    if (c.inFd >= 0) { ::close(c.inFd); c.inFd = -1; }
+    bool gone = false;
+    pollfd p{c.outFd, POLLIN, 0};
+    for (int iter = 0; iter < 4096 && !gone; ++iter) {
+        const int n = ::poll(&p, 1, kChildDeadlineMs);
+        if (n == 0) break;
+        if (n < 0) { if (errno == EINTR) continue; break; }
+        char ch;
+        const ssize_t got = ::read(c.outFd, &ch, 1);
+        if (got == 0) gone = true;
+        else if (got < 0 && errno != EINTR) break;
+    }
+    ::close(c.outFd); c.outFd = -1;
+    if (!gone) ::kill(c.pid, SIGKILL);
+    int st = 0;
+    while (::waitpid(c.pid, &st, 0) < 0 && errno == EINTR) {}
+    return gone && WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+pid_t deadPid() {
+    const pid_t p = ::fork();
+    if (p == 0) ::_exit(0);
+    int st = 0;
+    if (p > 0) ::waitpid(p, &st, 0);
+    return p;
+}
+
+std::vector<std::string> rootsIn(const fs::path& d) {
+    std::vector<std::string> out;
+    std::error_code ec;
+    for (fs::directory_iterator it{d, ec}, end; !ec && it != end; it.increment(ec)) {
+        const std::string n = it->path().filename().string();
+        if (n.rfind("rune_t", 0) == 0) out.push_back(n);
+    }
+    return out;
+}
+
+const char* kSweeperFilter = "--gtest_filter=TempDirHygieneRegression.TheTestTmpRootIsPerProcessRegression";
+const char* kHolderFilter  = "--gtest_filter=TempDirHygieneChildHelper.HoldsItsRootUntilReleased";
+
+}  // namespace
+
+// Helper body: plants a sentinel in its own root, prints "READY <root>", blocks until its stdin closes, then checks that
+// nothing removed the sentinel meanwhile (a concurrent startup sweep of a LIVE root fails it).
+TEST(TempDirHygieneChildHelper, HoldsItsRootUntilReleased) {
+    if (std::getenv("RUNE_TMP_HYG_HOLD") == nullptr) GTEST_SKIP() << "runs only as a child of the temp-root attacks";
+    const fs::path root = fs::temp_directory_path();
+    ASSERT_EQ(root.filename().string(), ownRootName());
+    fs::create_directories(root / "seg");
+    { std::ofstream{root / "seg" / "sentinel"} << "live"; }
+    std::printf("READY %s\n", root.c_str());
+    std::fflush(stdout);
+    char buf[64];
+    while (::read(STDIN_FILENO, buf, sizeof buf) > 0) {}
+    EXPECT_TRUE(fs::exists(root / "seg" / "sentinel")) << "a live owner's root was swept under it";
+}
+
+// Input bounds + a symlink planted under a dead owner's name: only an exact rune_t<digits> name whose owner is dead is
+// swept; a symlink is removed as a link, never followed into its target.
+TEST(TempDirHygieneRegression, SweepNameAndTypeBoundsAdversarialRegression) {
+    const fs::path root = fs::temp_directory_path();
+    ASSERT_EQ(root.filename().string(), ownRootName()) << "precondition: the per-process root is wired";
+    const fs::path d = root / "hyg_bounds";
+    fs::remove_all(d);
+    fs::create_directories(d);
+    const pid_t dead1 = deadPid(), dead2 = deadPid(), dead3 = deadPid();
+    ASSERT_GT(dead1, 0); ASSERT_GT(dead2, 0); ASSERT_GT(dead3, 0);
+    const auto name = [](long pid) { return "rune_t" + std::to_string(pid); };
+
+    fs::create_directories(d / name(dead1) / "a" / "b");
+    { std::ofstream{d / name(dead1) / "a" / "b" / "f"} << "x"; }
+    { std::ofstream{d / name(dead2)} << "a plain file under a dead owner's name"; }
+    const fs::path victim = root / "hyg_victim";
+    fs::remove_all(victim);
+    fs::create_directories(victim);
+    { std::ofstream{victim / "precious"} << "must survive"; }
+    fs::create_directory_symlink(victim, d / name(dead3));
+
+    const std::vector<std::string> kept = {
+        "rune_t", "rune_t0", "rune_t00", "rune_t-" + std::to_string(dead1), name(dead1) + "x", "x" + name(dead1),
+        "rune_T" + std::to_string(dead1), "rune_t99999999999999999999999", "rune_t" + std::string(4096 / 64, '9'),
+        name(1), name(::getpid())};
+    for (const auto& k : kept) fs::create_directories(d / k / "keep");
+
+    const ChildResult r = runSelf({kSweeperFilter}, d.string(), {}, (root / "hyg_bounds.log").string());
+    ASSERT_TRUE(r.exited) << r.error;
+    EXPECT_EQ(r.exitCode, 0) << slurp((root / "hyg_bounds.log").string());
+
+    EXPECT_FALSE(fs::exists(fs::symlink_status(d / name(dead1)))) << "a dead owner's root survived the sweep";
+    EXPECT_FALSE(fs::exists(fs::symlink_status(d / name(dead2)))) << "a dead owner's plain file survived the sweep";
+    EXPECT_FALSE(fs::exists(fs::symlink_status(d / name(dead3)))) << "a dead owner's symlink survived the sweep";
+    EXPECT_TRUE(fs::exists(victim / "precious")) << "the sweep followed a symlink and removed its target's content";
+    for (const auto& k : kept) EXPECT_TRUE(fs::is_directory(d / k / "keep")) << "touched: " << k;
+    std::size_t keptRoots = 0;
+    for (const auto& k : kept) keptRoots += k.rfind("rune_t", 0) == 0 ? 1 : 0;
+    EXPECT_EQ(rootsIn(d).size(), keptRoots) << "the child's own root was left behind (or a kept entry went)";
+    fs::remove_all(d);
+    fs::remove_all(victim);
+}
+
+// Concurrency: many binaries starting at once in one TMPDIR while others are live - every startup sweeps, none removes
+// a live owner's root, every dead one goes.
+TEST(TempDirHygieneRegression, ConcurrentStartupsNeverSweepALiveRootAdversarialRegression) {
+    const fs::path root = fs::temp_directory_path();
+    ASSERT_EQ(root.filename().string(), ownRootName()) << "precondition: the per-process root is wired";
+    const fs::path d = root / "hyg_conc";
+    fs::remove_all(d);
+    fs::create_directories(d);
+    constexpr int kHolders = 6, kSweepers = 6;
+    std::vector<LiveChild> holders;
+    std::vector<std::string> holderRoots;
+    for (int i = 0; i < kHolders; ++i) {
+        holders.push_back(spawnSelfLive({kHolderFilter}, d.string(), {"RUNE_TMP_HYG_HOLD=1"},
+                                        (root / ("hyg_holder" + std::to_string(i) + ".log")).string()));
+        ASSERT_GT(holders.back().pid, 0) << "spawn failed";
+    }
+    for (int i = 0; i < kHolders; ++i) {
+        const std::string line = readReady(holders[i].outFd);
+        ASSERT_EQ(line.rfind("READY ", 0), 0u) << "holder " << i << " never became ready: '" << line << "'";
+        holderRoots.push_back(line.substr(6));
+    }
+    const pid_t dead = deadPid();
+    fs::create_directories(d / ("rune_t" + std::to_string(dead)) / "old");
+
+    std::vector<LiveChild> sweepers;
+    for (int i = 0; i < kSweepers; ++i) {
+        sweepers.push_back(spawnSelfLive({kSweeperFilter}, d.string(), {},
+                                         (root / ("hyg_sweeper" + std::to_string(i) + ".log")).string()));
+        ASSERT_GT(sweepers.back().pid, 0);
+    }
+    for (int i = 0; i < kSweepers; ++i)
+        EXPECT_EQ(releaseAndReap(sweepers[i]), 0) << slurp((root / ("hyg_sweeper" + std::to_string(i) + ".log")).string());
+    for (int i = 0; i < kHolders; ++i) {
+        EXPECT_TRUE(fs::exists(fs::path(holderRoots[i]) / "seg" / "sentinel")) << "live root swept: " << holderRoots[i];
+        EXPECT_EQ(releaseAndReap(holders[i]), 0) << slurp((root / ("hyg_holder" + std::to_string(i) + ".log")).string());
+        EXPECT_FALSE(fs::exists(holderRoots[i])) << "a holder's root survived its normal exit";
+    }
+    EXPECT_FALSE(fs::exists(d / ("rune_t" + std::to_string(dead)))) << "no concurrent startup swept the dead root";
+    EXPECT_TRUE(rootsIn(d).empty()) << "left behind: " << rootsIn(d).size();
+    fs::remove_all(d);
+}
+
+// Crash: a SIGKILLed binary runs no atexit - its root stays until the next startup in the same TMPDIR sweeps it.
+TEST(TempDirHygieneRegression, ASigkilledBinaryRootIsSweptByTheNextStartupAdversarialRegression) {
+    const fs::path root = fs::temp_directory_path();
+    ASSERT_EQ(root.filename().string(), ownRootName()) << "precondition: the per-process root is wired";
+    const fs::path d = root / "hyg_kill";
+    fs::remove_all(d);
+    fs::create_directories(d);
+    LiveChild h = spawnSelfLive({kHolderFilter}, d.string(), {"RUNE_TMP_HYG_HOLD=1"}, (root / "hyg_kill.log").string());
+    ASSERT_GT(h.pid, 0);
+    const std::string line = readReady(h.outFd);
+    ASSERT_EQ(line.rfind("READY ", 0), 0u) << "holder never became ready: '" << line << "'";
+    const fs::path killedRoot = line.substr(6);
+    ::kill(h.pid, SIGKILL);
+    EXPECT_EQ(releaseAndReap(h), -1);
+    ASSERT_TRUE(fs::exists(killedRoot / "seg" / "sentinel")) << "precondition: a SIGKILLed run leaves its root";
+
+    const ChildResult r = runSelf({kSweeperFilter}, d.string(), {}, (root / "hyg_kill_sweep.log").string());
+    ASSERT_TRUE(r.exited) << r.error;
+    EXPECT_EQ(r.exitCode, 0);
+    EXPECT_FALSE(fs::exists(killedRoot)) << "the next startup did not sweep the killed run's root";
+    EXPECT_TRUE(rootsIn(d).empty());
+    fs::remove_all(d);
+}
+
+// fork without exec (gtest's default "fast" death tests, fork helpers): the child inherits the atexit hook; a normal
+// exit() in it must not remove the parent's root.
+TEST(TempDirHygieneRegression, AForkedChildExitingNormallyKeepsTheOwnersRootAdversarialRegression) {
+    const fs::path root = fs::temp_directory_path();
+    ASSERT_EQ(root.filename().string(), ownRootName()) << "precondition: the per-process root is wired";
+    { std::ofstream{root / "hyg_fork_parent"} << "parent"; }
+    const std::string style = GTEST_FLAG_GET(death_test_style);
+    GTEST_FLAG_SET(death_test_style, "fast");
+    EXPECT_EXIT({ std::ofstream{root / "hyg_fork_child"} << "child"; std::exit(0); }, ::testing::ExitedWithCode(0), "");
+    GTEST_FLAG_SET(death_test_style, style);
+    // A raw fork too (not every forking helper is a gtest death test).
+    const pid_t p = ::fork();
+    ASSERT_GE(p, 0);
+    if (p == 0) std::exit(0);
+    int st = 0;
+    ASSERT_EQ(::waitpid(p, &st, 0), p);
+    EXPECT_TRUE(fs::is_directory(root)) << "a forked child's exit() removed the owner's root";
+    EXPECT_TRUE(fs::exists(root / "hyg_fork_parent"));
+    EXPECT_TRUE(fs::exists(root / "hyg_fork_child")) << "the death-test child's file vanished with the root";
+    fs::remove(root / "hyg_fork_parent");
+    fs::remove(root / "hyg_fork_child");
+}
+
+// exec / posix_spawn of a non-gtest program (a broker, a shell): it inherits the root as its TMPDIR, so whatever it
+// writes lands under the root too.
+TEST(TempDirHygieneRegression, ASpawnedProgramInheritsTheRootAsTmpdirAdversarialRegression) {
+    const fs::path root = fs::temp_directory_path();
+    ASSERT_EQ(root.filename().string(), ownRootName()) << "precondition: the per-process root is wired";
+    int out[2];
+    ASSERT_EQ(::pipe(out), 0);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, out[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&fa, out[0]);
+    char sh[] = "/bin/sh", c[] = "-c", cmd[] = "printf '%s\\n' \"$TMPDIR\"";
+    char* argv[] = {sh, c, cmd, nullptr};
+    pid_t pid = -1;
+    const int rc = ::posix_spawn(&pid, "/bin/sh", &fa, nullptr, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    ::close(out[1]);
+    ASSERT_EQ(rc, 0);
+    const std::string got = readLine(out[0]);
+    ::close(out[0]);
+    int st = 0;
+    while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    EXPECT_EQ(fs::path(got), root) << "a spawned program's TMPDIR is not the owner's root";
+}
