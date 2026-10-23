@@ -245,21 +245,17 @@ TEST(AuthBootstrapWindowRegression, TheWindowReopensWhenTheLastAdminIsDisabledSt
     EXPECT_EQ(cl.awaitDdl(c2, std::chrono::steady_clock::now() + 20s)->errorCode, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest));
 }
 
-// #136: while the window is reopened (the last admin disabled), an existing NON-admin user still logs in with its
-// password - the reopened window only adds SecurityBootstrap, it never takes the login away (issue #121).
-TEST(AuthBootstrapWindowRegression, ACredentialedUserLogsInWhileTheWindowIsReopenedRegression) {
-    AuthNode n;
-    ShardTestClient cl(n.clientDir->path / "wire");
-    cl.keepSessionsAlive(true);
-    cl.setClientVersion(pc::kClientVersionAuth);
+namespace {
+/// Bootstrap `admin` on `n`, then append `CREATE USER ws1` (a real verifier of kTestPasswordA) and `ALTER USER admin
+/// DISABLE` (the bootstrap history rebuilt with the library, as the leader builds it): the window is reopened while a
+/// credentialed non-admin user exists.
+void reopenTheWindowWithAUser(AuthNode& n, ShardTestClient& cl) {
     const int64_t s1 = connect(cl, n.channel());
     ASSERT_GT(s1, 0);
     const int64_t corr = cl.nextCorrelationId();
     const auto f = bootstrapFrame(s1, corr, kKeyFile, 1);
     ASSERT_TRUE(cl.send(n.channel(), kClientStream, f.data(), f.size()));
     ASSERT_EQ(cl.awaitDdl(corr, std::chrono::steady_clock::now() + 20s)->errorCode, 0);
-    // Append `CREATE USER ws1` (a real verifier of kTestPasswordA) and `ALTER USER admin DISABLE` (the bootstrap
-    // history rebuilt with the library, as the leader builds it - see the test above).
     rune::node::test::SecurityEventChain chain;
     rune::security::BootstrapOps b;
     b.verifier.salt.assign(16, 0x11);
@@ -280,42 +276,94 @@ TEST(AuthBootstrapWindowRegression, ACredentialedUserLogsInWhileTheWindowIsReope
     while (n.node->securityViewForTest().hasSecurityAdmin && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(20ms);
     ASSERT_FALSE(n.node->securityViewForTest().hasSecurityAdmin) << "the window is reopened";
+}
 
-    // The SCRAM legs as raw frames on this cluster's client stream (the real client's shape: one password, every slot).
-    const auto login = [&](int64_t sid, const std::string& pw) -> std::optional<pc::AuthServerFinal> {
-        pc::AuthClientFirst cf;
-        const std::string nonce = rune::crypto::scram::makeNonce();
-        cf.sessionId = sid; cf.correlationId = cl.nextCorrelationId(); cf.username = "ws1"; cf.clientNonce = nonce;
-        std::vector<uint8_t> fb(cf.encodedSize());
-        fb.resize(cf.encode(fb.data()));
-        const auto dl = std::chrono::steady_clock::now() + 20s;
-        if (!cl.send(n.channel(), kClientStream, fb.data(), fb.size())) return std::nullopt;
-        const auto first = cl.awaitAuthFrame(cf.correlationId, dl);
-        if (!first || first->templateId != static_cast<uint16_t>(pc::TemplateId::AuthServerFirst)) return std::nullopt;
-        const auto sf = pc::AuthServerFirst::decode(first->bytes.data(), first->bytes.size());
-        if (!sf) return std::nullopt;
-        const auto ans = scramAnswer("ws1", nonce, *sf, {pw, pw}, sid, cf.correlationId);
-        if (!ans) return std::nullopt;
-        std::vector<uint8_t> nb(ans->final.encodedSize());
-        nb.resize(ans->final.encode(nb.data()));
-        if (!cl.send(n.channel(), kClientStream, nb.data(), nb.size())) return std::nullopt;
-        const auto fin = cl.awaitAuthFinal(cf.correlationId, dl);
-        if (!fin) return std::nullopt;
-        return pc::AuthServerFinal::decode(fin->bytes.data(), fin->bytes.size());
-    };
+/// The SCRAM legs as raw frames on `cl` (the real client's shape: one password, every slot); nullopt = not answered.
+std::optional<pc::AuthServerFinal> scramLogin(ShardTestClient& cl, const AuthNode& n, int64_t sid, const std::string& user,
+                                              const std::string& pw) {
+    pc::AuthClientFirst cf;
+    const std::string nonce = rune::crypto::scram::makeNonce();
+    cf.sessionId = sid; cf.correlationId = cl.nextCorrelationId(); cf.username = user; cf.clientNonce = nonce;
+    std::vector<uint8_t> fb(cf.encodedSize());
+    fb.resize(cf.encode(fb.data()));
+    const auto dl = std::chrono::steady_clock::now() + 20s;
+    if (!cl.send(n.channel(), kClientStream, fb.data(), fb.size())) return std::nullopt;
+    const auto first = cl.awaitAuthFrame(cf.correlationId, dl);
+    if (!first || first->templateId != static_cast<uint16_t>(pc::TemplateId::AuthServerFirst)) return std::nullopt;
+    const auto sf = pc::AuthServerFirst::decode(first->bytes.data(), first->bytes.size());
+    if (!sf) return std::nullopt;
+    const auto ans = scramAnswer(user, nonce, *sf, {pw, pw}, sid, cf.correlationId);
+    if (!ans) return std::nullopt;
+    std::vector<uint8_t> nb(ans->final.encodedSize());
+    nb.resize(ans->final.encode(nb.data()));
+    if (!cl.send(n.channel(), kClientStream, nb.data(), nb.size())) return std::nullopt;
+    const auto fin = cl.awaitAuthFinal(cf.correlationId, dl);
+    if (!fin) return std::nullopt;
+    return pc::AuthServerFinal::decode(fin->bytes.data(), fin->bytes.size());
+}
+}  // namespace
+
+// #136: while the window is reopened (the last admin disabled), an existing NON-admin user still logs in with its
+// password - the reopened window only adds SecurityBootstrap, it never takes the login away (issue #121).
+TEST(AuthBootstrapWindowRegression, ACredentialedUserLogsInWhileTheWindowIsReopenedRegression) {
+    AuthNode n;
+    ShardTestClient cl(n.clientDir->path / "wire");
+    cl.keepSessionsAlive(true);
+    cl.setClientVersion(pc::kClientVersionAuth);
+    reopenTheWindowWithAUser(n, cl);
+    if (HasFatalFailure()) return;
     const int64_t sid = connect(cl, n.channel());
     ASSERT_GT(sid, 0);
     EXPECT_EQ(cl.lastConnectResponse()->authState, pc::AuthState::MustAuthenticate);
-    const auto ok = login(sid, kTestPasswordA);
+    const auto ok = scramLogin(cl, n, sid, "ws1", kTestPasswordA);
     ASSERT_TRUE(ok.has_value()) << "the login was not answered";
     EXPECT_EQ(ok->errorCode, 0) << "the existing user logs in while the window is reopened";
     EXPECT_EQ(ok->serverSignature.size(), 64u);
     EXPECT_TRUE(n.node->gatewayHasSessionForTest(sid)) << "and its session stays";
     const int64_t sid2 = connect(cl, n.channel());
     ASSERT_GT(sid2, 0);
-    const auto bad = login(sid2, "not the password");
+    const auto bad = scramLogin(cl, n, sid2, "ws1", "not the password");
     ASSERT_TRUE(bad.has_value());
     EXPECT_EQ(bad->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed)) << "still a real check";
+}
+
+// Adversarial review of PR #583 (#136, escalation through the reopened window): the reopened window gives a session
+// nothing but SecurityBootstrap.  A non-admin user logged in while it is open is refused a security DDL (45, its session
+// kept), and a session that never logged in is refused it as unauthenticated (44) and ended - nothing is applied.
+TEST(AuthBootstrapWindowAdversarialRegression, TheReopenedWindowGrantsNoAdminDdlAdversarialRegression) {
+    AuthNode n;
+    ShardTestClient cl(n.clientDir->path / "wire");
+    cl.keepSessionsAlive(true);
+    cl.setClientVersion(pc::kClientVersionAuth);
+    reopenTheWindowWithAUser(n, cl);
+    if (HasFatalFailure()) return;
+    const int64_t applied = n.node->securityViewForTest().appliedOffset;
+    const int64_t user = connect(cl, n.channel());
+    ASSERT_GT(user, 0);
+    const auto ok = scramLogin(cl, n, user, "ws1", kTestPasswordA);
+    ASSERT_TRUE(ok.has_value());
+    ASSERT_EQ(ok->errorCode, 0);
+    const int64_t c1 = cl.nextCorrelationId();
+    const auto ddl = createRoleFrame(user, c1);
+    ASSERT_TRUE(cl.send(n.channel(), kClientStream, ddl.data(), ddl.size()));
+    const auto refused = cl.awaitDdl(c1, std::chrono::steady_clock::now() + 20s);
+    ASSERT_TRUE(refused.has_value());
+    EXPECT_EQ(refused->errorCode, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized)) << refused->detail;
+    EXPECT_TRUE(n.node->gatewayHasSessionForTest(user)) << "a refusal, not an end";
+
+    const int64_t anon = connect(cl, n.channel());
+    ASSERT_GT(anon, 0);
+    const int64_t c2 = cl.nextCorrelationId();
+    const auto ddl2 = createRoleFrame(anon, c2);
+    ASSERT_TRUE(cl.send(n.channel(), kClientStream, ddl2.data(), ddl2.size()));
+    const auto gated = cl.awaitDdl(c2, std::chrono::steady_clock::now() + 20s);
+    ASSERT_TRUE(gated.has_value());
+    EXPECT_EQ(gated->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed)) << gated->detail;
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (n.node->gatewayHasSessionForTest(anon) && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(5ms);
+    EXPECT_FALSE(n.node->gatewayHasSessionForTest(anon)) << "the unauthenticated session was ended";
+    EXPECT_EQ(n.node->securityViewForTest().appliedOffset, applied) << "nothing was applied";
 }
 
 // Review C I4: the cluster key is loaded ONCE (start()); replacing the file afterwards (a Kubernetes secret update)

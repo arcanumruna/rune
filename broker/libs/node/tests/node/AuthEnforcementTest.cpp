@@ -4,6 +4,9 @@
 #include "support/AuthRig.h"
 #include <rune/protocol/ProducerIdBinding.h>
 
+#include <algorithm>
+#include <sys/stat.h>
+
 using namespace rune::node;
 using namespace rune::node::test;
 using namespace rune::node::test::grants;
@@ -1088,4 +1091,171 @@ TEST(AuthEnforcementRegression, EachVerifierSlotAuthenticatesOnItsOwnRegression)
     EXPECT_TRUE(viaSlot1.serverSignatureValid());
     EXPECT_EQ(r.loginSlot(name, 0, "neither-password-1").errorCode(), 44) << "both proofs wrong";
     EXPECT_EQ(r.loginSlot(name, 0, kSecond).errorCode(), 44) << "a password proves only its own slot";
+}
+
+// ===========================================================================
+// Adversarial review of PR #583 (#278 / #277 / #136): the union of the batch's areas - denial side effects, the
+// fetch-all filter, the two verifier slots and the login throttle - attacked through the wire.
+// ===========================================================================
+
+// #278 on the DEFAULT runtime (shard workers, CLAUDE.md rule 11): every refused produce routed through the gateway
+// appends nothing and every refused Subscribe registers nothing - for no grant, the wrong operation and the wrong
+// topic, and for the same refused request sent twice back to back before its first answer.
+TEST(AuthEnforcementAdversarialRegression, DenialsOnTheShardRuntimeAppendAndRegisterNothingAdversarialRegression) {
+    AuthBroker::Options o;
+    o.shard = true;
+    AuthRig r("adv278shard", o);
+    const int64_t onlyRead = r.newUser({exact(SO::Read, ST::Topic, "orders")});
+    const int64_t onlyWrite = r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    const int64_t none = r.newUser({});
+    ASSERT_EQ(r.produce(onlyWrite, r.orders, /*untilOk=*/true), kOk) << "the control: WRITE is appended";
+    EXPECT_EQ(r.produceDenied(onlyRead, r.orders), kNotAuthorized) << "READ is not WRITE";
+    EXPECT_EQ(r.produceDenied(none, r.orders), kNotAuthorized) << "default deny";
+    EXPECT_EQ(r.produceDenied(onlyWrite, r.secret), kNotAuthorized) << "WRITE on one topic is not WRITE on another";
+    EXPECT_EQ(r.subscribeDenied(onlyWrite, r.orders), kNotAuthorized) << "WRITE is not READ";
+    EXPECT_EQ(r.subscribeDenied(none, r.orders), kNotAuthorized) << "default deny";
+    EXPECT_EQ(r.subscribeDenied(onlyRead, r.secret), kNotAuthorized) << "READ on one topic is not READ on another";
+
+    // Back to back: two refused Subscribes on one session, the second sent before the first is answered.
+    const int64_t c1 = r.c().sendSubscribe(r.ch(), r.stream(), none, r.orders, 0);
+    const int64_t c2 = r.c().sendSubscribe(r.ch(), r.stream(), none, r.orders, 0);
+    EXPECT_EQ(r.c().awaitSubscribeCode(c1, AuthRig::dl()), std::optional<int16_t>(kNotAuthorized));
+    EXPECT_EQ(r.c().awaitSubscribeCode(c2, AuthRig::dl()), std::optional<int16_t>(kNotAuthorized));
+    r.expectNothingDelivered(none, c1);
+    r.expectSubscribeRegisteredNothing(none, c2, r.orders);
+}
+
+// #277 under live grant changes: a fetch-all is filtered by the session's permissions AT THE TIME OF THE FETCH - a
+// prefix grant covers its topics only, a user with READ on the group alone gets an empty (not refused) list, and a
+// READ revoked mid-session drops that topic from the very next fetch-all (while a listed fetch of it is refused 45).
+TEST(AuthEnforcementAdversarialRegression, AFetchAllFollowsPrefixesAndALiveRevokeAdversarialRegression) {
+    AuthRig r("adv277fetch");
+    const auto g = [](SO op, ST t, const char* n) { return exact(op, t, n); };
+    const int64_t committer = r.newUser({g(SO::Read, ST::Group, "gadv"), g(SO::Read, ST::Topic, "orders"),
+                                         g(SO::Read, ST::Topic, "secret")});
+    std::string readerName;
+    const int64_t reader = r.newUser({g(SO::Read, ST::Group, "gadv"), g(SO::Read, ST::Topic, "orders"),
+                                      g(SO::Read, ST::Topic, "secret")}, &readerName);
+    const int64_t byPrefix = r.newUser({g(SO::Read, ST::Group, "gadv"), prefix(SO::Read, ST::Topic, "sec")});
+    const int64_t groupOnly = r.newUser({g(SO::Read, ST::Group, "gadv")});
+    const auto [member, gen] = r.joinStable(committer, "gadv", {r.orders, r.secret});
+    ASSERT_FALSE(member.empty());
+    ASSERT_EQ(r.commitAs(committer, "gadv", member, gen, r.orders, 7), kOk);
+    ASSERT_EQ(r.commitAs(committer, "gadv", member, gen, r.secret, 9), kOk);
+    const auto topicsOf = [](const std::optional<std::vector<pc::OffsetFetchResult>>& v) {
+        std::vector<std::pair<int32_t, int64_t>> out;
+        if (v) for (const auto& e : *v) out.emplace_back(e.topicId, e.offset);
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    using TO = std::vector<std::pair<int32_t, int64_t>>;
+    const auto both = r.offsetFetchAll(reader, "gadv");
+    ASSERT_TRUE(both.has_value());
+    EXPECT_EQ(topicsOf(both), (TO{{r.orders, 7}, {r.secret, 9}}));
+    const auto pre = r.offsetFetchAll(byPrefix, "gadv");
+    ASSERT_TRUE(pre.has_value());
+    EXPECT_EQ(topicsOf(pre), (TO{{r.secret, 9}})) << "a prefix grant covers only its topics";
+    const auto none = r.offsetFetchAll(groupOnly, "gadv");
+    ASSERT_TRUE(none.has_value()) << "READ on the group alone: answered, not refused";
+    EXPECT_TRUE(none->empty()) << "and lists no topic";
+
+    ASSERT_EQ(r.broker().admin().revoke(r.ch(), r.broker().adminSession(), readerName, false, SO::Read, ST::Topic,
+                                        rune::protocol::SecurityPatternKind::Exact, "secret").errorCode, 0);
+    const auto after = r.offsetFetchAll(reader, "gadv");
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(topicsOf(after), (TO{{r.orders, 7}})) << "the revoked topic is gone from the very next fetch-all";
+    EXPECT_EQ(r.offsetFetch(reader, "gadv", r.secret), kNotAuthorized) << "and a listed fetch of it is refused";
+}
+
+// #277 / #136, input bounds and protocol state of the two verifier slots: a one-password user's slot 1 is a pad that
+// no password opens; after the oldest password is dropped the remaining one moves to slot 0 and the dropped one opens
+// nothing; a final that carries fewer proofs than the broker listed is refused even with the right password; and a
+// password dropped between the two legs of a login never logs in with it.
+TEST(AuthEnforcementAdversarialRegression, TheVerifierSlotsAcceptOnlyCurrentPasswordsInTheirOwnSlotAdversarialRegression) {
+    AuthRig r("adv277slots");
+    constexpr const char* kSecond = "second-password-6789";
+    std::string name;
+    (void)r.newUser({}, &name);
+    // Successes between the failures reset the (user, host) pair: no failure here is ever inside the throttle's delay.
+    EXPECT_EQ(r.loginSlot(name, 1, AuthRig::kPw).errorCode(), 44) << "a one-password user's slot 1 is a pad";
+    ASSERT_TRUE(r.loginSlot(name, 0, AuthRig::kPw).ok());
+    {
+        const int64_t sid = r.wire().connect(r.ch());
+        ASSERT_GT(sid, 0);
+        const auto one = r.wire().login(r.ch(), sid, name, {AuthRig::kPw, AuthRig::kPw}, /*count=*/1);
+        ASSERT_TRUE(one.first.has_value());
+        EXPECT_EQ(one.first->count, 2);
+        EXPECT_EQ(one.errorCode(), 44) << "one proof where the broker listed two";
+    }
+    ASSERT_TRUE(r.loginSlot(name, 0, AuthRig::kPw).ok());
+    r.broker().addPassword(name, kSecond);
+    r.broker().dropOldestPassword(name);
+    EXPECT_EQ(r.loginSlot(name, 0, AuthRig::kPw).errorCode(), 44) << "the dropped password";
+    EXPECT_TRUE(r.loginSlot(name, 0, kSecond).ok()) << "the remaining password moved to slot 0";
+    EXPECT_EQ(r.loginSlot(name, 1, kSecond).errorCode(), 44) << "slot 1 is a pad again";
+    EXPECT_TRUE(r.loginSlot(name, 0, kSecond).ok());
+
+    // A first leg parked while the user holds two passwords; the one it will prove is dropped before the final.
+    std::string other;
+    (void)r.newUser({}, &other);
+    r.broker().addPassword(other, kSecond);
+    const int64_t sid = r.wire().connect(r.ch());
+    ASSERT_GT(sid, 0);
+    auto parked = r.wire().login(r.ch(), sid, other, {"wrong-password-0", AuthRig::kPw}, 0, /*sendFinal=*/false);
+    ASSERT_TRUE(parked.first.has_value());
+    r.broker().dropOldestPassword(other);   // drops kPw (slot 0 at the first leg)
+    r.wire().finish(r.ch(), parked, other, {AuthRig::kPw, "wrong-password-1"});
+    ASSERT_TRUE(parked.fin.has_value());
+    EXPECT_NE(parked.fin->errorCode, 0) << "a password dropped between the legs never logs in";
+    EXPECT_TRUE(r.loginSlot(other, 0, kSecond).ok()) << "the control: the current password still does";
+}
+
+// #136, the throttle through a sibling entry point: a change of one's own password proven with a WRONG password is a
+// password guess charged on the same (user, host) throttle as a failed login.  Two failed logins are free; the third
+// failure - a bad own-change proof - starts the pair's delay, so the right password, sent at once, is refused with a
+// retry-after.  (Not charged, the pair would hold only the two free failures and the login would succeed.)
+TEST(AuthEnforcementAdversarialRegression, OwnChangeProofsAndLoginsShareOneThrottleAdversarialRegression) {
+    AuthRig r("adv136throttle");
+    std::string name;
+    const int64_t self = r.newUser({}, &name);
+    for (int i = 0; i < 2; ++i) {
+        const auto l = r.loginSlot(name, 0, "a wrong guess");
+        ASSERT_TRUE(l.first.has_value()) << i << ": a free failure is verified";
+        EXPECT_EQ(l.errorCode(), 44) << i;
+    }
+    const int64_t sid = r.wire().connect(r.ch());   // connected first: the login follows the guess within its delay
+    ASSERT_GT(sid, 0);
+    r.wire().signOwnCredentialChanges(false);   // the attacker on a hijacked session: no password, so no valid proof
+    EXPECT_EQ(r.wire().alterPassword(r.ch(), self, name, pc::UserChangeKind::SetPassword, "attacker-pw-12345").errorCode, 45u);
+    r.wire().signOwnCredentialChanges(true);
+    const auto right = r.wire().login(r.ch(), sid, name, {AuthRig::kPw, AuthRig::kPw});
+    ASSERT_TRUE(right.fin.has_value());
+    EXPECT_FALSE(right.ok()) << "the bad own-change proof was the pair's third failure";
+    EXPECT_FALSE(right.first.has_value()) << "refused at the first leg, no salt";
+    EXPECT_GT(right.fin->retryAfterMs, 0u);
+}
+
+// Adversarial review of PR #583 (test fixture segment sizing): an AuthRig broker - bootstrap, users, two topics, a view -
+// holds its logs in ~7 MiB.  Every log preallocates its active segment to its roll size, so ONE internal log or
+// topic left at the 64 MiB production default (__security, __catalog, __consumer_offsets, transactions, metadata or a
+// rig topic) puts the data dir far above the bound.  Aeron's term buffers (the aeron dir) are not logs and are excluded.
+// RED before the review fix: BrokerNode built the __transaction_state and __cluster_metadata logs at the storage::Log
+// default roll (64 MiB), ignoring NodeConfig::offsetLogSegmentRollBytes that their replicas were configured with.
+TEST(AuthEnforcementAdversarialRegression, TheRigsLogsStayWithinTheTestSegmentBoundAdversarialRegression) {
+    AuthRig r("adv583disk");
+    const std::filesystem::path data = r.broker().dir() / "broker";
+    uintmax_t allocated = 0, largest = 0;
+    std::string largestPath;
+    for (auto it = std::filesystem::recursive_directory_iterator(data); it != std::filesystem::recursive_directory_iterator(); ++it) {
+        if (it->is_directory() && it->path().filename() == "aeron") { it.disable_recursion_pending(); continue; }
+        if (!it->is_regular_file()) continue;
+        struct stat st {};
+        if (::stat(it->path().c_str(), &st) != 0) continue;
+        const auto bytes = static_cast<uintmax_t>(st.st_blocks) * 512u;
+        allocated += bytes;
+        if (bytes > largest) { largest = bytes; largestPath = std::filesystem::relative(it->path(), data).string(); }
+    }
+    EXPECT_LE(largest, static_cast<uintmax_t>(kTestSegmentRollBytes) + (1u << 20))
+        << "a file above the 1 MiB test roll (+ index slack): " << largestPath;
+    EXPECT_LT(allocated, uintmax_t{24} << 20) << "the rig's logs: " << (allocated >> 20) << " MiB";
 }

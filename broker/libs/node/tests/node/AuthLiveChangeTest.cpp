@@ -5,6 +5,8 @@
 
 #include <rune/node/AdminChannels.h>
 
+#include <functional>
+
 using namespace rune::node;
 using namespace rune::node::test;
 using namespace rune::node::test::grants;
@@ -903,5 +905,45 @@ TEST(AuthLiveChangeAdversarialRegression, TerminateSessionsLeavesItsGroupsAtOnce
             EXPECT_EQ(t.r.heartbeatAt(s, "cg", p.m1, p.gen), 0) << "the member stays";
             EXPECT_EQ(t.r.heartbeatAt(s2, "cg", p.m2, p.gen), 0) << "no rebalance";
         }
+    }
+}
+
+// Adversarial review of PR #583 (#138, the whole bug class): every session-ending change - DISABLE, DROP USER, SET
+// PASSWORD ... TERMINATE SESSIONS - removes EACH of the user's sessions from the gateway, the changes that keep
+// sessions (a REVOKE of one grant, a plain SET PASSWORD) keep both, and another user's session is never touched.  A
+// produce sent afterwards on an ended session id (protocol state: a request after the close) appends nothing.
+TEST(AuthLiveChangeAdversarialRegression, EverySessionEndingChangeRemovesExactlyItsSessionsAdversarialRegression) {
+    Live t("adv138ends");
+    const int64_t bystander = t.r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    ASSERT_EQ(t.r.produce(bystander, t.r.orders, /*untilOk=*/true), 0);
+    struct Kind { const char* what; bool ends; std::function<int(const std::string&)> apply; };
+    const std::vector<Kind> kinds = {
+        {"REVOKE WRITE", false, [&](const std::string& u) { return t.revokeExact(u, SO::Write, ST::Topic, "orders"); }},
+        {"SET PASSWORD", false, [&](const std::string& u) { return t.alter(u, pc::UserChangeKind::SetPassword, "kept-sessions-pw-1"); }},
+        {"DISABLE", true, [&](const std::string& u) { return t.alter(u, pc::UserChangeKind::Disable); }},
+        {"TERMINATE SESSIONS", true,
+         [&](const std::string& u) { return t.alter(u, pc::UserChangeKind::SetPassword, "terminated-pw-12", true); }},
+        {"DROP USER", true, [&](const std::string& u) { return t.dropUser(u); }},
+    };
+    for (const Kind& k : kinds) {
+        SCOPED_TRACE(k.what);
+        std::string name;
+        const int64_t s1 = t.r.newUser({exact(SO::Write, ST::Topic, "orders")}, &name);
+        const int64_t s2 = t.r.login(name);
+        ASSERT_EQ(t.r.produce(s1, t.r.orders, /*untilOk=*/true), 0);
+        ASSERT_EQ(k.apply(name), 0);
+        if (!k.ends) {
+            EXPECT_TRUE(t.b().node().gatewayHasSessionForTest(s1)) << "the session is kept";
+            EXPECT_TRUE(t.b().node().gatewayHasSessionForTest(s2)) << "the session is kept";
+            continue;
+        }
+        EXPECT_TRUE(t.r.awaitSessionGone(s1)) << "the gateway ended the first session";
+        EXPECT_TRUE(t.r.awaitSessionGone(s2)) << "the gateway ended the second session";
+        EXPECT_TRUE(t.b().node().gatewayHasSessionForTest(bystander)) << "another user's session is untouched";
+        // A produce on the ended id, then an allowed one on the same stream (ordered after it): exactly one record.
+        const int64_t before = t.r.logEnd(t.r.orders);
+        ASSERT_TRUE(t.r.c().produce(t.ch(), t.r.stream(), s1, t.r.c().nextCorrelationId(), t.r.orders, 0, 1, makeBatch(1)));
+        ASSERT_EQ(t.r.produce(bystander, t.r.orders), 0);
+        EXPECT_EQ(t.r.logEnd(t.r.orders), before + 1) << "the ended session's produce appended nothing";
     }
 }

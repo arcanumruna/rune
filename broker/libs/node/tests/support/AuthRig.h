@@ -118,14 +118,10 @@ public:
     }
     /// Issue #138: the broker's gateway no longer holds session `sid` within `within` (a bounded poll of the control
     /// thread's session table).  A ping cannot tell this: the gateway answers nothing to a dead session's ping, and a
-    /// timed-out ping looks the same.
+    /// timed-out ping looks the same.  The wait pumps the client (its keepalives), so the rig's OTHER sessions never
+    /// expire while it waits (PR #583 review: a plain sleep let a bystander session time out).
     bool awaitSessionGone(int64_t sid, std::chrono::milliseconds within = std::chrono::seconds(5)) {
-        const auto deadline = Clock::now() + within;
-        for (;;) {
-            if (!b_.node().gatewayHasSessionForTest(sid)) return true;
-            if (Clock::now() >= deadline) return false;
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
+        return c().pollFor(within, [&] { return !b_.node().gatewayHasSessionForTest(sid); });
     }
     /// Issue #277: a login on a fresh session with `pw` in passwords[slot] only - the other slot carries a wrong
     /// password (a proof that matches no verifier).  The gateway checks every slot's proof against that slot's
