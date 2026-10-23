@@ -4,7 +4,7 @@
 
 **Goal:** Every typed topic validates every write (decode against a known schema version, UTF-8 strings, wire key = key field) behind the new cluster feature level `kCheckedWrites`, through a per-partition `PartitionWriteState*` next to `RcSlot`; untyped topics stay raw logs with zero added cost; every database feature is refused on untyped and keyless topics; `Key` never truncates; typed and raw handles bind only to their own kind; `partitions` defaults to 1.
 
-**Architecture:** The admin thread posts, for every typed topic and in this order, its per-version descriptors (`kA2cSchemaUpdate`, now for every typed topic), its write spec (new `kA2cWriteSpec`) and only then `kA2cCatalogTopicApplied`. The control thread fans the first two out through one FIFO (`SchemaFanout`, which now carries both `SchemaUpdate` and the new `WriteSpecUpdate` op) and builds the topic's replicas only once that FIFO holds nothing for the topic, so no worker can own a typed partition before it holds the partition's spec. On the worker, `TopicWriteSpec` holds the key facts and one materialized `Validator` + `Descriptor` per version; each owned partition of a typed topic gets a `PartitionWriteState` in its `RcSlot`, reached in O(1) through `writeById_`. `produceCore_` calls the header-only `checkTypedBatch()` at the existing validation call site (before dedupe, SD2). The committed metadata feature level reaches every worker and the AdminWorker through `ClusterFeatureLevelFanout`; below level 4 only topics that were created with `validate` keep validating exactly as before.
+**Architecture:** The admin thread posts, for every typed topic and in this order, its per-version descriptors (`kA2cSchemaUpdate`, now for every typed topic), its write spec (new `kA2cWriteSpec`) and only then `kA2cCatalogTopicApplied`. The control thread fans the first two out through one FIFO (`SchemaFanout`, which now carries both `SchemaUpdate` and the new `WriteSpecUpdate` op) and builds the topic's replicas only once that FIFO holds nothing for the topic, so no worker can own a typed partition before it holds the partition's spec. On the worker, `TopicWriteSpec` holds the key facts and one materialized `Validator` + `Descriptor` per version; each owned partition of a typed topic gets a `PartitionWriteState` in its `RcSlot`, reached in O(1) through `writeById_`. `produceCore_` calls the header-only `checkTypedBatch()` at the existing validation call site (before dedupe, SD2); it walks the batch and applies `checkTypedRecord()`, the one per-record rule set, which Part 03's single hook walk calls after dedupe (R-X1). The committed metadata feature level reaches every worker and the AdminWorker through `ClusterFeatureLevelFanout`; below level 4 only topics that were created with `validate` keep validating exactly as before.
 
 **Tech Stack:** C++23, GoogleTest (`TEST_P` matrices), Google Benchmark with `broker/benchmark/BenchGate.h`, CMake/Ninja (`build/root`, `build/sub-codec`, `build/sub-ql`, `build/sub-client-cpp`, `build/rel`, `build/asan`, `build/tsan`, `build/client-tsan`), SBE 1.40.2 for the internal ring schema, real in-process `BrokerNode`s (`OneBroker`, `ThreeNodes`) over real Aeron.
 
@@ -13,7 +13,7 @@
 ## Execution context
 
 - **Repo and paths.** Every path is relative to the monorepo root; every command runs from it.
-- **Branch.** `feature/checked-writes-02-typed-validation`, cut from the latest `main` (`git fetch` first). Part 02 depends on nothing (overview lane 2: 02 → 03). It may run concurrently with 01 and 10; it touches none of their files except `Worker.h` (02 owns the write-state block; 01 does not edit `produceCore_`).
+- **Branch.** `feature/checked-writes-02-typed-validation`, cut from the latest `main` (`git fetch` first). Part 02 depends on nothing (overview lane 2: 02 → 03). It may run concurrently with 01; it touches none of 01's files except `Worker.h` (02 owns the write-state block; 01 does not edit `produceCore_`). Part 10 runs after 01 and 03 (R10c), so never beside 02.
 - **Preconditions** (each must hit exactly once before Task 1):
   - `grep -n "inline constexpr int16_t kLatest = kBoundProducerIds;" broker/libs/replication/include/rune/replication/ReplicationMessages.h`
   - `grep -n "bool schemaRejects_(int32_t topicId" broker/libs/node/include/rune/node/Worker.h`
@@ -63,8 +63,9 @@ Copied from the overview (each line verbatim from the spec or the repo rules). E
 
 - **SD1.** A topic without a field list stays an untyped raw log (`topic events;`). "The field list is required" only means every database feature needs one.
 - **SD2.** Validation stays at today's call site in `produceCore_` (`broker/libs/node/include/rune/node/Worker.h:8255`, before `producerState.validate`), moved onto the per-partition pointer (C7). Part 03 moves it into the hook after dedupe.
+- **R-X1.** The per-record rules live in one function, `TypedCheck checkTypedRecord(const TopicWriteSpec&, const RecordSpan&, int16_t level)` in `WriteState.h`, carrying P1–P5. `checkTypedBatch` is the bounded walk over it. Part 03's single walk calls `checkTypedRecord` per record, keeps this part's `typedRejects_` / `typedVersionAhead_` counters, and maps `VersionAhead` to `NotLeader` (`HookRefusal::VersionAhead`). No rule or test of this part is lost when 03 deletes the `produceCore_` call.
 - **SD6.** Part 02 defines `kCheckedWrites` and its propagation (C2); Part 03 uses it.
-- **SD9.** `key.index`, intents and `autoincrement` are refused at DDL on transient topics with `InvalidRequest`, "<feature> needs a persisted topic". Part 02 ships the one rule table that holds these messages (Task 6); Parts 05 and 06 call it from their DDL.
+- **SD9.** `key.index`, intents and `autoincrement` are refused at DDL on transient topics with `InvalidRequest`, "<feature> needs a persisted topic". Part 02 ships the one rule table that holds these messages (Task 6); Parts 05, 06 and 09 call it from their DDL (R02e, R10a).
 
 ## Part 02 decisions (binding for executors; flagged to the owner in the return)
 
@@ -100,7 +101,7 @@ Cells owned by 02 (overview §"Interaction matrix: §15 cells by owner"): the "V
 
 - **Ops (15):** V01 valid record; V02 version 0; V03 version = max + 1; V04 blockLength mismatch; V05 truncated var field; V06 enum outside its whitelist; V07 overlong UTF-8 (`C0 AF`) in a `string` field; V08 stray continuation byte (`80`) in a `string(16)` field; V09 dirty `string(16)` padding (`'a',0,'b'`); V10 wire key with the right width and other bytes; V11 wire key 4 bytes on a `uint64` key; V12 tombstone with an 8-byte key; V13 tombstone with a 4-byte key; V14 invalid UTF-8 in a `bytes` field; V15 a key-length varint past the batch end.
 - **Entities (4)**, one descriptor `{id uint64, name string(16), bio string, blob bytes, kind enum{1,2,3}}`: TypedLegacy (`legacyValidate`, key `id`), TypedPreUpgrade (not `legacyValidate`, key `id`), TypedKeyless (`legacyValidate`, no key), TypedUncheckableKey (`legacyValidate`, key `bio`, `keyWidth = 0`). Untyped topics have no state and are covered at the worker layer (W1).
-- **Levels (2):** L3 (`checkedLevel = false`), L4.
+- **Levels (2):** L3 (`level = 3`, below `kCheckedWrites`), L4 (`level = 4`).
 - **Positions (3):** only record; first of 3; last of 3 (the other records valid).
 - **Expected, top-down (first matching rule):**
   1. L3 and TypedPreUpgrade → Accept.
@@ -328,7 +329,7 @@ Intents, `key.index` and `autoincrement` DDL do not exist before Parts 05/06: th
 
 ---
 
-### Task 3: `WriteState.h`: the write spec, `checkTypedBatch`, the matrices and the model
+### Task 3: `WriteState.h`: the write spec, `checkTypedRecord` / `checkTypedBatch`, the matrices and the model
 
 **Files:**
 - Create: `broker/libs/node/include/rune/node/WriteState.h`, `broker/libs/node/tests/node/CheckedWritesWriteStateTest.cpp`, `broker/libs/node/tests/node/CheckedWritesValidationMatrixTest.cpp`, `broker/libs/node/tests/support/CheckedWritesBatches.h`, `broker/libs/node/tests/support/CheckedWritesValidationModel.h`
@@ -366,12 +367,15 @@ Intents, `key.index` and `autoincrement` DDL do not exist before Parts 05/06: th
   };
   struct PartitionWriteState { const TopicWriteSpec* spec = nullptr; };   // 04/06/11 append members (C7)
   enum class TypedCheck : uint8_t { Accept, Reject, VersionAhead };
-  [[nodiscard]] TypedCheck checkTypedBatch(const TopicWriteSpec& spec, std::span<const uint8_t> batch, bool checkedLevel) noexcept;
+  // R-X1: the one per-record rule set (P1–P5); `level` is the cluster feature level (checked = level >= kCheckedWrites).
+  [[nodiscard]] TypedCheck checkTypedRecord(const TopicWriteSpec& spec, const rune::protocol::RecordSpan& r, int16_t level) noexcept;
+  // The bounded walk over checkTypedRecord; the first non-accepted record decides; a structurally bad walk is Reject.
+  [[nodiscard]] TypedCheck checkTypedBatch(const TopicWriteSpec& spec, std::span<const uint8_t> batch, int16_t level) noexcept;
   ```
   `RecordSpan` gains `std::string_view key;` (filled by `forEachRecordSpan`; empty when `klen <= 0`).
 
 - [ ] **Step 1: Write the failing tests.**
-  - `CheckedWritesBatches.h`: `matrixDescriptor()` (the M1 descriptor), `specFor(Entity, bool level4)`, `TypedRecord{key bytes, value bytes}` builders `validRecord(id, version)`, `withVersion`, `withBlockLength`, `withTruncatedVar`, `withEnum`, `withBio(bytes)`, `withName(bytes16)`, `withBlob(bytes)`, `withKey(bytes)`, `tombstone(keyBytes)`, and `batchOf(records)` (a `RecordBatchBuilder` batch, CRC correct) plus `withLyingKeyLength(batch, recordIndex)`.
+  - `CheckedWritesBatches.h`: `matrixDescriptor()` (the M1 descriptor), `specFor(Entity)`, `TypedRecord{key bytes, value bytes}` builders `validRecord(id, version)`, `withVersion`, `withBlockLength`, `withTruncatedVar`, `withEnum`, `withBio(bytes)`, `withName(bytes16)`, `withBlob(bytes)`, `withKey(bytes)`, `tombstone(keyBytes)`, and `batchOf(records)` (a `RecordBatchBuilder` batch, CRC correct) plus `withLyingKeyLength(batch, recordIndex)`.
   - `CheckedWritesWriteStateTest.cpp`:
     - `CheckedWritesWriteState.WireRoundTripsAndRefusesShortInput`: encode → 9 bytes → decode equal; 8 bytes → nullopt; `encodeTopicWriteSpec` into 8 bytes → 0.
     - `CheckedWritesWriteState.SpecOfACatalogTopic`: `writeSpecWireOf` for an untyped `TopicObject` → nullopt; typed key `id uint64` validate=1 → `{keyFieldId = id.tag, UInt64, 8, legacyValidate true}`; key `name string(16)` → width 16; key `bio string` → `keyWidth 0` (P4); keyless → `kNoKeyField`; a renamed key field (ALTER RENAME) still resolves by the catalog's `keyField`.
@@ -382,33 +386,34 @@ Intents, `key.index` and `autoincrement` DDL do not exist before Parts 05/06: th
     - `CheckedWritesWriteState.FirstNonAcceptedRecordDecides`: `[VersionAhead record, malformed record]` → VersionAhead; `[malformed, VersionAhead]` → Reject.
     - `CheckedWritesWriteState.BelowTheLevelWithoutLegacyAcceptsAnything`: TypedPreUpgrade, L3, garbage bytes → Accept without touching the records.
     - `CheckedWritesValidationFuzzRegression.RandomMutationsAgreeWithTheModel`: S1.
-  - `CheckedWritesValidationMatrixTest.cpp`: `CheckedWritesValidationMatrix/Cell` (M1, 360 cells), `CheckedWritesWireKeyMatrix/Cell` (M2, 84 cells), `CheckedWritesValidationMatrixCountRegression.CellCountsArePinned`. Each cell asserts `checkTypedBatch(spec, batch, level4) == expect(cell)` and names itself `V07_TypedLegacy_L4_Last`.
-  - `CheckedWritesValidationModel.h`: `TypedCheck referenceCheck(const TopicWriteSpec&, std::span<const uint8_t>, bool level4)` written independently of `WriteState.h`: its own bounded byte cursor over the batch, a code-point decoder for UTF-8, field reads through `descriptorFor(version)` offsets, rules P1–P5 in the M1 order.
+    - `CheckedWritesWriteState.RecordCheckIsTheBatchCheckPerRecord` (R-X1): for every M1 cell with Position `only` (V15 excluded: its walk fails before any record), `checkTypedRecord` on the record's `forEachRecordSpan` span equals `checkTypedBatch` on the batch, at both levels.
+  - `CheckedWritesValidationMatrixTest.cpp`: `CheckedWritesValidationMatrix/Cell` (M1, 360 cells), `CheckedWritesWireKeyMatrix/Cell` (M2, 84 cells), `CheckedWritesValidationMatrixCountRegression.CellCountsArePinned`. Each cell asserts `checkTypedBatch(spec, batch, level) == expect(cell)` and names itself `V07_TypedLegacy_L4_Last`.
+  - `CheckedWritesValidationModel.h`: `TypedCheck referenceCheck(const TopicWriteSpec&, std::span<const uint8_t>, int16_t level)` written independently of `WriteState.h`: its own bounded byte cursor over the batch, a code-point decoder for UTF-8, field reads through `descriptorFor(version)` offsets, rules P1–P5 in the M1 order.
 - [ ] **Step 2: Run to verify they fail.** `cmake --build build/root -j14 --target rune_checked_writes_tests`. Expected: `rune/node/WriteState.h` not found.
-- [ ] **Step 3: Implement `WriteState.h`.** `writeSpecWireOf` deserializes `t.schema->evolvingBlob`, finds the live field named `t.schema->keyField`, and sets `keyWidth = isTopicKeyType(type, fieldWidth(f)) ? fieldWidth(f) : 0`. `installVersion` builds `Validator(materialized)` and sets `keyValueOffset = 4 + f.offset` for the field whose `id == keyFieldId` (when facts are known). `checkTypedBatch` (hot, `noexcept`, no allocation):
+- [ ] **Step 3: Implement `WriteState.h`.** `writeSpecWireOf` deserializes `t.schema->evolvingBlob`, finds the live field named `t.schema->keyField`, and sets `keyWidth = isTopicKeyType(type, fieldWidth(f)) ? fieldWidth(f) : 0`. `installVersion` builds `Validator(materialized)` and sets `keyValueOffset = 4 + f.offset` for the field whose `id == keyFieldId` (when facts are known). `checkTypedRecord` and `checkTypedBatch` (hot, `noexcept`, no allocation; R-X1):
 
   ```cpp
-  if (!checkedLevel && !spec.legacyValidate) return TypedCheck::Accept;                      // P5
-  const auto check = checkedLevel ? rune::codec::StringCheck::Utf8 : rune::codec::StringCheck::None;
-  const bool keyRule = checkedLevel && spec.keyFieldId != kNoKeyField && spec.keyWidth != 0;
-  TypedCheck verdict = TypedCheck::Accept;
-  const bool walked = rune::protocol::forEachRecordSpan(batch.data(), batch.size(), [&](const rune::protocol::RecordSpan& r) {
-      if (verdict != TypedCheck::Accept) return;                                              // first non-accept decides
-      if (r.value.empty()) {                                                                  // P1: tombstone (empty or null)
-          if (spec.keyFieldId == kNoKeyField) verdict = TypedCheck::Reject;
-          else if (keyRule && r.key.size() != spec.keyWidth) verdict = TypedCheck::Reject;
-          return;
+  TypedCheck checkTypedRecord(const TopicWriteSpec& spec, const rune::protocol::RecordSpan& r, int16_t level) noexcept {
+      const bool checked = level >= rune::replication::MetadataFeature::kCheckedWrites;
+      if (!checked && !spec.legacyValidate) return TypedCheck::Accept;                           // P5
+      const bool keyRule = checked && spec.keyFieldId != kNoKeyField && spec.keyWidth != 0;
+      if (r.value.empty()) {                                                                    // P1: tombstone (empty or null)
+          if (spec.keyFieldId == kNoKeyField) return TypedCheck::Reject;
+          return (keyRule && r.key.size() != spec.keyWidth) ? TypedCheck::Reject : TypedCheck::Accept;
       }
-      if (r.value.size() < 4) { verdict = TypedCheck::Reject; return; }
+      if (r.value.size() < 4) return TypedCheck::Reject;
       const uint16_t v = le16(r.value.data() + 2);
       const SpecVersion* sv = spec.versionFor(v);
-      if (sv == nullptr) { verdict = (v > spec.maxVersion()) ? TypedCheck::VersionAhead : TypedCheck::Reject; return; }   // P2
-      if (!sv->validator.validate(asBytes(r.value), check).ok) { verdict = TypedCheck::Reject; return; }
+      if (sv == nullptr) return (v > spec.maxVersion()) ? TypedCheck::VersionAhead : TypedCheck::Reject;   // P2
+      const auto check = checked ? rune::codec::StringCheck::Utf8 : rune::codec::StringCheck::None;
+      if (!sv->validator.validate(asBytes(r.value), check).ok) return TypedCheck::Reject;
       if (keyRule && (sv->keyValueOffset == kNoKeyOffset || r.key.size() != spec.keyWidth ||
                       std::memcmp(r.key.data(), r.value.data() + sv->keyValueOffset, spec.keyWidth) != 0))
-          verdict = TypedCheck::Reject;
-  });
-  return walked ? verdict : TypedCheck::Reject;
+          return TypedCheck::Reject;
+      return TypedCheck::Accept;
+  }
+  // checkTypedBatch: the P5 early return first (garbage below the level is never walked), then one bounded
+  // forEachRecordSpan walk calling checkTypedRecord; the first non-Accept decides; a failed walk is Reject.
   ```
   `version 0` has no entry and is never above `maxVersion()`, so it is a Reject. `forEachRecordSpan` gains the key view (`s.key = std::string_view(batch + keyStart, klen)` before skipping it).
 - [ ] **Step 4: Run.** `cmake --build build/root -j14 --target rune_checked_writes_tests rune_protocol_tests && ctest --test-dir build/root -R 'CheckedWrites|BatchRebuild|FilterRebuild' -j14 --output-on-failure`. Expected: PASS, 360 + 84 matrix cells.
@@ -417,7 +422,7 @@ Intents, `key.index` and `autoincrement` DDL do not exist before Parts 05/06: th
   git add broker/libs/node/include/rune/node/WriteState.h protocol/include/rune/protocol/BatchRebuild.h broker/libs/node/CMakeLists.txt \
           broker/libs/node/tests/node/CheckedWritesWriteStateTest.cpp broker/libs/node/tests/node/CheckedWritesValidationMatrixTest.cpp \
           broker/libs/node/tests/support/CheckedWritesBatches.h broker/libs/node/tests/support/CheckedWritesValidationModel.h
-  git commit -m "feat(node): TopicWriteSpec / PartitionWriteState and checkTypedBatch (bounded walk, UTF-8, wire key = key field, tombstones, retriable version-ahead); validation matrices and model" \
+  git commit -m "feat(node): TopicWriteSpec / PartitionWriteState, checkTypedRecord and checkTypedBatch (bounded walk, UTF-8, wire key = key field, tombstones, retriable version-ahead); validation matrices and model" \
              -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   ```
 
@@ -476,20 +481,7 @@ Intents, `key.index` and `autoincrement` DDL do not exist before Parts 05/06: th
   - `rebuildRcSlots_`: move `old.write` with `old.rc` (same condition: same replica and incarnation); a new slot gets a state when `writeSpecs_` has the topic and `hasFacts()`; then `rebuildWriteById_()` (same shape as the `rcById_` loop at `:6396-6398`).
   - `writeOf_`: the exact shape of `rcOf_` (`:6350-6357`) over `writeById_` and `sl.write`.
   - `TopicDropped`: after `markTopicDropped_`, null every slot's `write` for that topic, `rebuildWriteById_()`, then erase `writeSpecs_[topicId]` (states first, so no dangling `spec`).
-  - `produceCore_`, replacing `:8252-8259` (same position, before `acksAll`):
-    ```cpp
-    if (PartitionWriteState* ws = writeOf_(replica); ws != nullptr) [[unlikely]] {
-        const TypedCheck c = checkTypedBatch(*ws->spec, rbSpan, checkedWritesEnabled_());
-        if (c != TypedCheck::Accept) [[unlikely]] {
-            if (c == TypedCheck::Reject) ++typedRejects_; else ++typedVersionAhead_;
-            spdlog::debug("Worker {}: typed batch refused ({}) topicId={} partition={}", workerId_,
-                          c == TypedCheck::Reject ? "SchemaValidationFailed" : "version ahead, NotLeader", f.topicId, f.partition);
-            ret.errorCode = static_cast<int16_t>(c == TypedCheck::Reject ? pc::ErrorCode::SchemaValidationFailed : pc::ErrorCode::NotLeader);
-            enqueueReturn_(ret);
-            return 1;
-        }
-    }
-    ```
+  - `produceCore_`, replacing `:8252-8259` (same position, before `acksAll`): `if (PartitionWriteState* ws = writeOf_(replica); ws != nullptr) [[unlikely]]`, call `checkTypedBatch(*ws->spec, rbSpan, clusterFeatureLevel_)`. A `Reject` counts `++typedRejects_` and answers `SchemaValidationFailed`; a `VersionAhead` counts `++typedVersionAhead_` and answers `NotLeader`. Either logs one `spdlog::debug` line (topic, partition, which answer), `enqueueReturn_(ret)` and returns 1, as the `schemaRejects_` branch does today.
     Untyped partitions pay `writeOf_` (one indexed load) and the predicted branch. `spdlog::debug` formats nothing at the default level, so the reject path stays allocation-free.
 - [ ] **Step 4: Run.** `cmake --build build/root -j14 --target rune_checked_writes_tests rune_produce_validation_tests rune_node_tests rune_shard_mode_tests && ctest --test-dir build/root -R 'CheckedWrites|ProduceValidation|WorkerValidator|WorkerOpWire|ShardMode|F15Eos|WorkerDroppedTopic' -j14 --output-on-failure`. Expected: PASS. `grep -n "validatedTopics_\|schemaRejects_\|packValidatorKey_" broker/libs/node/include/rune/node/Worker.h` → no hits.
 - [ ] **Step 5: Commit.**
@@ -664,7 +656,7 @@ Intents, `key.index` and `autoincrement` DDL do not exist before Parts 05/06: th
   template <class T> explicit Key(const T& pod) noexcept;   // static_assert(sizeof(T) <= kMaxInline, "…never truncated")
   [[nodiscard]] bool tooLong() const noexcept;
   static_assert(Key::kMaxInline == rune::codec::kMaxTopicKeyBytes);
-  // Producer.h: SendResult::KeyTooLong = 12 — a key wider than Key::kMaxInline (05 adds "not the key field's width")
+  // Producer.h: SendResult::KeyTooLong = 12 — a key wider than Key::kMaxInline (16 B); TypedTopic always sends the key field's width, so it has no other meaning
   // Client.h
   [[nodiscard]] TopicHandle rawTopicAndWait(std::string_view name, std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
   ```
@@ -747,7 +739,7 @@ Intents, `key.index` and `autoincrement` DDL do not exist before Parts 05/06: th
 
 - [ ] **Step 1: Write the benches.**
   - `SetupOn` also sends a `WriteSpecUpdate` (`legacyValidate = true`) so `BM_ProduceValidate_On` keeps measuring a validated topic (without it the "On" arm silently measures an unvalidated topic).
-  - `BM_CheckedWriteHook/CheckOnly1Record`: a `TopicWriteSpec` for the "characters" descriptor (all-ASCII strings, `uint64` key), level 4; the timed loop calls `checkTypedBatch` on a one-record batch 1 000 times per iteration, recording per-call ns with `std::chrono::steady_clock` into a preallocated vector; after the loop `counters["p50_ns"]`, `counters["p99_ns"]`; `rune::bench::gateCheck(state, p50 <= 1000.0, "p50_ns > 1000 (spec §14: new validation <= 1 us p50 per one-record batch)")`.
+  - `BM_CheckedWriteHook/CheckOnly1Record`: a `TopicWriteSpec` for the "characters" descriptor (all-ASCII strings, `uint64` key), level 4; the timed loop calls `checkTypedBatch(spec, batch, 4)` on a one-record batch 1 000 times per iteration, recording per-call ns with `std::chrono::steady_clock` into a preallocated vector; after the loop `counters["p50_ns"]`, `counters["p99_ns"]`; `rune::bench::gateCheck(state, p50 <= 1000.0, "p50_ns > 1000 (spec §14: new validation <= 1 us p50 per one-record batch)")`.
   - `/CheckOnly64Records`: the same over 64 records; counter `ns_per_record`; no gate (informational).
   - `/UntypedPath`, `/TypedLegacyPath` (level 3, `legacyValidate`), `/TypedCheckedPath` (level 4): the full `tryEnqueueOp → doWork → drainReturn` loop of `BM_ProduceValidate_Off`, with `Repetitions(15)`.
 - [ ] **Step 2: Build and smoke-run locally.** `cmake --build build/rel -j14 --target rune_broker_benchmark && build/rel/broker/rune_broker_benchmark --benchmark_filter='BM_CheckedWriteHook/.*|BM_ProduceValidate_.*' --benchmark_repetitions=1`. Expected: every bench runs, `gate_failed = 0`.
@@ -803,7 +795,7 @@ Intents, `key.index` and `autoincrement` DDL do not exist before Parts 05/06: th
 - `RecordSpan` gains `std::string_view key;` in **Part 02** (P9). C3 keeps `attributes` and `index` for Part 03.
 - `TopicWriteSpec` (C7) gains, in Part 02: `bool legacyValidate`, `const SpecVersion* versionFor(uint16_t) const noexcept`, `uint16_t maxVersion() const noexcept`, `bool hasFacts() const noexcept`, `void installVersion(uint16_t, rune::codec::Descriptor)`, `void setFacts(const TopicWriteSpecWire&)`, and the struct `SpecVersion { Validator validator; Descriptor descriptor; uint32_t keyValueOffset; }`; constants `kNoKeyField = 0xFFFF`, `kNoKeyOffset = 0xFFFFFFFF`.
 - `struct TopicWriteSpecWire` (the `WriteSpecUpdate` tail behind `encodeTopicWriteSpec` / `decodeTopicWriteSpec`, `kTopicWriteSpecWireLen = 9`) and `std::optional<TopicWriteSpecWire> writeSpecWireOf(const rune::catalog::TopicObject&)`.
-- `enum class TypedCheck : uint8_t { Accept, Reject, VersionAhead }` and `TypedCheck checkTypedBatch(const TopicWriteSpec&, std::span<const uint8_t>, bool checkedLevel) noexcept` in `WriteState.h` (Part 03's hook calls it from `check()`).
+- `enum class TypedCheck : uint8_t { Accept, Reject, VersionAhead }`, `TypedCheck checkTypedRecord(const TopicWriteSpec&, const rune::protocol::RecordSpan&, int16_t level) noexcept` and `TypedCheck checkTypedBatch(const TopicWriteSpec&, std::span<const uint8_t>, int16_t level) noexcept` in `WriteState.h` (R-X1: Part 03's single hook walk calls `checkTypedRecord` per record from `check()`; `checkTypedBatch` stays for this part's matrices, fuzz test and bench).
 - `kA2cWriteSpec = 26` (admin → control) and its codec; `SchemaFanout::postWriteSpec(int32_t, std::vector<uint8_t>)`, `SchemaFanout::pendingFor(int32_t) const noexcept`.
 - `ClusterFeatureLevelFanout` (`broker/libs/node/include/rune/node/ClusterFeatureLevelFanout.h`), `AdminWorker::setClusterFeatureLevel(int16_t)` / `clusterFeatureLevel()`, `Worker::clusterFeatureLevelForTest()`, `kClusterFeatureLevelWireLen = 2` with `writeClusterFeatureLevel` / `decodeClusterFeatureLevel`.
 - `broker/libs/node/include/rune/node/TopicFeatureRules.h`: `DbFeature`, `TopicShape`, `featureRefusal`, `topicShapeOf` (05 and 06 call it for `key.index` / `autoincrement`, 09 for constraints).
@@ -814,7 +806,7 @@ Intents, `key.index` and `autoincrement` DDL do not exist before Parts 05/06: th
 ## Self-review (done while writing)
 
 - **Spec coverage (§4, §12, §15 cells owned by 02):** untyped = no field list, `raw` marker → Task 7 (catalog text, plan text); typed always validates, `validate` flag / `--validate` / parameter removed → Tasks 4, 7, 8; every record decodes by exact version, whole batch rejected with 24 → Tasks 3, 4 (P2 refines "version above the highest" to retriable — flagged); control batches exempt → `ControlRecordsAreNeverValidated`, `TransactionOnTypedTopicCommitsRegression`; wire key = key field, `memcmp`, autoincrement placeholder → Task 3 (M2 `ZeroPlaceholderBoth`); key width ≤ 16 refused at DDL → Task 6; `Key` truncation an error → Task 8; the two encodings kept separate → nothing on the wire changes; database features only on typed (and keyed) topics → Task 6 (table + views now, 05/06/09 call it), filters already refused (`FilterBrokerRegression.UntypedTopicRefusedRegression`); binding strict both ways → Task 8, Task 9; `partitions` optional → Task 7; UTF-8 rules, ASCII fast path, padding skipped, `bytes` unchecked → Task 1; existing typed topics start checking behind the level → Tasks 2, 4, 9; keyless typed topics allowed → M1 TypedKeyless; hot path off `validatedTopics_` onto the per-partition pointer, untyped pays one branch → Task 4, gated in Task 10; §12 feature level → Task 2; §14 budgets → Task 10.
-- **Step scan:** each test step names its suite, file and assertions with the spec's values; each code step names the signature, the file and the pinned values; the only code block is `checkTypedBatch`'s rule order, which the tests do not fully determine (first-non-accept, version-ahead vs reject).
-- **Type consistency:** `TopicWriteSpec`, `PartitionWriteState`, `TopicWriteSpecWire`, `checkTypedBatch`, `TypedCheck`, `writeOf_`, `writeById_`, `WriteSpecUpdate = 27`, `ClusterFeatureLevel = 26`, `kA2cWriteSpec = 26`, `kMsgClusterFeatureLevel = 26`, `kSchemaKindFingerprint` are spelled the same in every task and in the contract list.
+- **Step scan:** each test step names its suite, file and assertions with the spec's values; each code step names the signature, the file and the pinned values; the only code block is `checkTypedRecord`'s rule order, which the tests do not fully determine (version-ahead vs reject, tombstones before the version read).
+- **Type consistency:** `TopicWriteSpec`, `PartitionWriteState`, `TopicWriteSpecWire`, `checkTypedRecord`, `checkTypedBatch` (both `int16_t level`), `TypedCheck`, `writeOf_`, `writeById_`, `WriteSpecUpdate = 27`, `ClusterFeatureLevel = 26`, `kA2cWriteSpec = 26`, `kMsgClusterFeatureLevel = 26`, `kSchemaKindFingerprint` are spelled the same in every task and in the contract list.
 - **Review Focus:** each of the five lines has its test in the owning task (Tasks 3, 4, 9).
 - **Proportion:** one algorithm block; the rest is signatures, tables and test assertions.
