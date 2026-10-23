@@ -68,7 +68,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 - The `autoincrement` side window holds **32** batches = `kIdempotentMaxInFlightBatches` (`Protocol.h:16`).
 - Partition `p` assigns `n·P + p` for n = 1, 2, …. Id 0 is never assigned.
 - Index slot **13 bytes** (`tag u8 | word u64 | rid u32`). Plan key functions: 0 none, 1 `lower`, 2 reserved `casefold`.
-- `lower(string(N))` width = the largest lowered width at the pinned Unicode version (⌈3N/2⌉ at Unicode 15/16).
+- `lower(string(N))` width = the largest lowered width at the pinned Unicode version (⌊3N/2⌋ at Unicode 16.0.0, packed 0x00100000; R07a).
 - Wire `acks` byte: bit 0 = `All`, bit 1 = `View`. Other bits are refused with `InvalidRequest`.
 - Intent bits: record `attributes` bits 0–1. 0 = upsert/delete, 1 = insert, 2 = update/delete-existing. 3 and the other bits are refused with `InvalidRequest`.
 - `partitions` defaults to 1. Strings are UTF-8, and `lower()` is Unicode simple lowercasing.
@@ -102,6 +102,12 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 - **R03b / R03c** (context): untyped topics never have a `PartitionWriteState`, so they are never verdict sources; the broker ignores `View` on a transactional batch, so a transactional send never parks a `View` waiter.
 - **Part 01 AD5 / AD6 / AD7.** Checkpoints written by this code are marked (`CheckpointMark::FoldSkipped`); a discarded checkpoint is truncated through `CheckpointStream::ResetOwed` and `ViewSnapshotChannel::kResetMsgType = 4`. This part reuses both for its own discard rule (P4-4).
 - **Part 03 P3-3.** `minFoldCursor(src, partition, leadership)` counts an instance folded under another leadership as 0. Verdict-view instances keep `foldLeadership` current like any view.
+- **R04a / R09b.** Two-phase drop is Part 09's. A dropping or replaced verdict view's plan stays installed on every replica, and keeps its place in the judge, until `W` passes its `ConstraintSetChange` record; only then is it uninstalled (P4-6). Part 09 owns the failover-during-drop test.
+- **R04b.** C11's "follower apply" is the `RcState` leadership scan rebuilding the index from markers (P4-1). Followers hold no verdict state between leaderships. Accepted.
+- **R04c / R04d.** Marker trigger 4 (P4-3) is accepted. The shared `Timing` enum gets the appended values of P4-15; later parts only append.
+- **R04e / R04g / R-X2.** The duplicate replay of P4-8. `OpStatus::StoredIdUnknown = 13` is added here as a reserved placeholder (Part 06 documents and uses it) and `OpStatus::VerdictUnknown = 14`, so the enum has no hole.
+- **R04f.** This part's Contract additions are binding for later parts.
+- **R07d.** This part defines `ViewKey.h` with `fromU64(uint64_t)` and `asU64()`: `ViewKey::fromU64(v).asU64() == v`, and `asU64()` requires `len ≤ 8`. Parts 05 and 06 take them from here. Part 07 owns and extends `ViewKey` (`fromBytes`, `operator==`, wide keys) and never renames them or changes their meaning.
 
 ## Part rulings (P4; binding for executors, recorded so the reviewer can overturn any)
 
@@ -115,7 +121,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
   - **`W` (committed).** The highest `finalThrough` among markers below the HW (the `MarkerLedger`). It bounds the cleaner (§8.5).
   - **`judgedThrough()`.** `max(judgeCursor, K at activation)`. It is the consumer bound and the `View` ack condition.
 - **P4-3 — Marker emission (§8.5, extended).**
-  - **Range.** A marker covers `[emitFrom, judgedThrough)`. `emitFrom` is `W` at the start of a leadership and the `finalThrough` of this leadership's last appended marker afterwards. Markers therefore tile the log contiguously, overlapping only where a new leader re-marks a range an uncommitted old marker covered; the content is identical by determinism.
+  - **Range.** A marker covers `[emitFrom, judgedThrough)`. At the start of a leadership `emitFrom` is `W` extended over the spans whose constraint set is empty (the same extension K gets in P4-2), so the first marker of a source starts at its first change offset + 1, never at 0. Afterwards it is the `finalThrough` of this leadership's last appended marker. Markers therefore tile the log contiguously, overlapping only where a new leader re-marks a range an uncommitted old marker covered; the content is identical by determinism.
   - **Entries.** They come from the index (`forEachIn(emitFrom, judgedThrough)`), so verdicts of an earlier leadership of this node are re-marked and never lost.
   - **Triggers**, checked at the end of each pass:
     1. the pass rejected anything;
@@ -126,15 +132,15 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
   - **Append.** `PartitionReplica::appendControlBatch(span, /*acksAll=*/false)` (`PartitionReplica.h:600`): no min-ISR gate, since a marker carries no data. `kAppendNotLeader` drops the attempt (the next leader re-marks from W). `kAppendBackPressure` and `kAppendMinIsr` retry next pass, and the index keeps every entry, so nothing is lost. Each attempt is counted in `VerdictSourceStats`.
 - **P4-4 — Verdict-view checkpoints never outrun the markers.**
   - **Gate.** A persisted verdict view pushes its checkpoint delta only in a pass that appended (or found in the local log) a marker whose `finalThrough ≥ inst.foldCursor`. The judge pass is capped at `emitFrom + checkpointCap`, so the delta fits one ring message, like today's `maxRecordsPerPass` (`WorkerViewSet.h:592-598`).
-  - **Discard at activation.** If a member's `foldCursor > K` (only possible when a crash lost the log tail holding that marker), the instance is discarded: tables emptied, `foldCursor = logStart`, `checkpointStream = ResetOwed` (Part 01 AD6/AD7). It is refolded, applying unjudged below K and judging from K. Counted `checkpointsDiscarded`. Rows are rebuilt, never dropped.
+  - **Discard at activation.** If a member's `foldCursor > K` (only possible when a crash lost the log tail holding that marker), the instance is discarded: tables emptied, `foldCursor = logStart`, `checkpointStream = ResetOwed` (Part 01 AD6/AD7). It is refolded, applying unjudged below K and judging from K. Counted `verdictCheckpointsDiscarded` (named apart from Part 01's `ViewFoldCounters::checkpointsDiscarded`, which counts unmarked checkpoints). Rows are rebuilt, never dropped.
   - **Other views** on a verdict source checkpoint as today. After a restart they wait at their checkpoint `O` until `judgedThrough > O`.
 - **P4-5 — Set order is judging order.** A `ConstraintSet` lists members in ascending `viewObjectId`; the key index (05) has id 0 and comes first. A record's verdict is the **first failing member's**, in that order. Every member is prepared before any is evaluated, and evaluation stops at the first failure. Nothing applies unless all pass.
 - **P4-6 — Changing the set (C12).**
   - **Desired vs logged.** The desired set is the worker's verdict templates for the source. The logged set is `constraintSets.latest()`. When they differ on a Ready leader, `requestChange(desired)` appends `kConstraintSetChange` at the LEO (activation offset A). The leader does this on install, on uninstall, and once per activation.
   - **Joining member.** It builds from `logStart` unjudged: it applies non-rejected records, skipping index entries, bounded by `min(A + 1, judgedThrough)`. The old set judges up to A. The judge waits at A + 1 until every member of the new set has `foldCursor == A + 1`.
-  - **Leaving member.** It stays registered (its template is `Retiring`, not erased) until the judge has passed its leave offset. Then it is dropped.
+  - **Leaving member** (R09b amends this rule). It judges up to its leave offset D (the drop's change record) and no record after D. It stays registered (its template is `Retiring`, not erased) until `W` passes D, that is until a committed marker covers D. Then it is dropped.
   - **Missing member.** If a member named by the logged set has no installed template with the same `(viewObjectId, planFingerprint)`, the judge **waits** (`judgeWaitsForInstall`, logged once per wait). It never judges with a guessed set.
-  - **Flag for Part 09.** A view dropped from the catalog before a lagging node installed it would make that node wait forever after a failover. Part 09 must keep a dropping verdict view's plan installed until every partition's W passes the drop's change record (a two-phase drop). Listed under Contract gaps.
+  - **Part 09 (R04a).** A view dropped from the catalog before a lagging node installed it would make that node wait forever after a failover. Part 09's two-phase drop keeps a dropping verdict view's plan installed on every replica until `W` passes the drop's change record. It is Part 09's plan work, not an issue.
 - **P4-7 — Consumers (§8.6).**
   - **Bound.** `Worker::verdictBound_(state, bound)` returns `min(bound, state->verdictKnownThrough())`. It fails closed: a partition whose timeline needs verdicts above K but has no `VerdictSource` yet is bounded at K.
   - **Partly rejected batch.** A batch with a rejected record is rebuilt without it (`rune::protocol::rebuildBatch`, `BatchRebuild.h:82`), keeping its offsets.
@@ -204,16 +210,16 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
    - `[[nodiscard]] bool waitingForInstall() const noexcept;`.
 6. **`TestRejectRule`** (`VerdictSource.h`, P4-12): `struct TestRejectRule { enum class Mode : uint8_t { TagEquals, OffsetSet, CapLiveKeys }; Mode mode = Mode::TagEquals; uint8_t tag = 0; uint32_t cap = 0; std::array<int64_t, 16> offsets{}; uint8_t offsetCount = 0; [[nodiscard]] uint64_t fingerprint() const noexcept; };` and `void WorkerViewSet::installTestVerdictViewForTest(rune::view::CompiledViewPlan, rune::view::RowLayout, rune::codec::Descriptor src, bool persisted, uint64_t viewObjectId, TestRejectRule rule);`.
 7. **`WorkerViewSet`:**
-   - `driveFolds` and `driveRebuild` gain a trailing `PartitionWriteState* write = nullptr`, after Part 01's `skip` and `sourceLogStart`;
+   - `driveFolds` and `driveRebuild` gain a trailing `PartitionWriteState* write = nullptr`, after Part 01's `skip` (and, on `driveFolds`, `sourceLogStart`);
    - `uninstallView` of a verdict template marks it `Retiring` (P4-6) and returns true;
    - `[[nodiscard]] std::vector<uint64_t> verdictSourceKeysForTest() const;`.
 8. **`RcState` verdict hooks:** `struct RcVerdictHooks { void (*begin)(void* ctx, int64_t logStart, int64_t target) noexcept = nullptr; void (*batch)(void* ctx, const uint8_t* batch, std::size_t len, int64_t baseOffset) noexcept = nullptr; void* ctx = nullptr; };` and `void RcState::setVerdictHooks(const RcVerdictHooks&) noexcept;` (P4-1).
-9. **`PartitionReplica`:** `void publishCleanerVerdictMarkerEnd(Offset) noexcept;` and `[[nodiscard]] Offset cleanerVerdictMarkerEnd() const noexcept;`. This is an atomic word beside the C11 `cleanerVerdictBound`, published **before** it with release order and read **after** it with acquire order (P4-14).
+9. **`PartitionReplica`:** `void publishCleanerVerdictMarkerEnd(Offset) noexcept;` and `[[nodiscard]] Offset cleanerVerdictMarkerEnd() const noexcept;`. This is an atomic word beside the C11 `cleanerVerdictBound`, published **before** it with release order and read **after** it with acquire order (P4-14). Task 6 adds both atomics (with C11's `publishCleanerVerdictBound` / `cleanerVerdictBound`); Task 8 adds the readers: `cleanerSwapBound` and `LogCleanerAgent` take the min with `cleanerVerdictBound()` (C11).
 10. **Cleaner:**
     - `void LogCleaner::setVerdictBounds(Offset bound, Offset markerEnd) noexcept;`;
     - `VerdictCleanState& verdictState() noexcept` (and `const`) on `OffsetMap` (`OffsetMap.h:49`) and `SkimpyOffsetMap` (`SkimpyOffsetMap.h:250`);
     - `scanTxnState(…)` gains `Offset verdictMarkerEnd, VerdictCleanState& verdicts` after `markerRemovalBound`;
-    - `VerdictCleanState` appends `[[nodiscard]] bool keepsControlRecord(int64_t offset, int16_t type) const noexcept;`.
+    - `VerdictCleanState` appends `[[nodiscard]] bool keepsControlRecord(int64_t offset, int16_t type) const noexcept;` and `void markRemovalsBelow(int64_t cleanBoundary) noexcept;`, and C11's `finish(int64_t toOffset)` becomes `finish(int64_t toOffset, int64_t publishedBound, int64_t markerRemovalBound)`.
 11. **`FilterSource`** concept (`filter/FilterGroup.h:95-101`) gains `{ s.rejected() } -> std::same_as<const rune::storage::RejectedOffsetIndex*>` (nullptr = none).
 12. **`FoldSkip.h`:** `[[nodiscard]] inline bool isRejectedRecord(const FoldSkip& skip, int64_t offset) noexcept;` (the per-record sibling Part 01 anticipated).
 13. **Client:**
@@ -221,19 +227,20 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
     - `ProducerHub::onProduceResponse` / `ProducerImpl::onProduceResponse` gain a trailing `std::span<const uint8_t> verdicts = {}, bool hasVerdicts = false`.
 14. **Matrix** (P4-15, R04d): the `Timing` values appended for Part 03, then `RetryAfterWindow` (R04e); `enum class Part : uint8_t { P03 = 3, P04 = 4, P05 = 5, P06 = 6, P07 = 7, P09 = 9, P11 = 11 };`; `std::vector<Cell> cellsFor(Part)`.
 15. **Knob:** `NodeConfig::verdictIntervalMs` (env `RUNE_VERDICT_INTERVAL_MS`, default 100, SD14) and `void Worker::setVerdictIntervalNs(int64_t) noexcept`.
-16. **`ViewKey::asU64()`** (C9.1 appended; `len ≤ 8` only, until Part 07), and the `FoldStats::skippedRejected` counter (appended).
+16. **`ViewKey::asU64()`** (C9.1 appended, R07d): `fromU64(v).asU64() == v` for every `v`; `asU64()` requires `len ≤ 8` and returns the little-endian value of `bytes[0..len)`. Part 07 keeps both names and their meaning. Also the `FoldStats::skippedRejected` counter (appended).
 17. **Duplicate replay (R04e, P4-8):**
-    - `OpStatus::VerdictUnknown = 14` is appended to `client-cpp/include/rune/client/Completion.h:54`. It follows Part 06's reserved `StoredIdUnknown = 13`, which is not renumbered. "Stored; its verdicts are unknown (the retry fell outside the dedupe window)."
+    - `OpStatus::StoredIdUnknown = 13` and `OpStatus::VerdictUnknown = 14` are appended to `client-cpp/include/rune/client/Completion.h:54` (R-X2). 13 is a reserved placeholder that Part 06 documents and first returns; adding it here keeps the enum without a hole, so exhaustive switches stay valid. 14: "Stored; its verdicts are unknown (the retry fell outside the dedupe window)."
     - `VerdictSourceStats` appends `uint64_t verdictReplays = 0;`.
     - `PendingAcksView` appends `uint8_t replay = 0;`: a duplicate whose release also waits for `W > lastOffset`.
     - Parts 06 and 09 add the assigned keys and constraint names to the replayed answer; the release rule is fixed here.
 
-## Contract gaps (flagged to the controller)
+## Contract gaps (settled by the rulings; recorded for the reviewer)
 
-- **Two-phase drop for Part 09** (P4-6): without it, a node that never installed a dropped verdict view waits forever after a failover. Part 04's judge is safe (it waits) but not live in that corner.
-- **`Timing` is extended** for Part 03's fold-in (P4-15). The overview fixed it as the §15 list.
-- **C11 "follower apply"** is realised through the leadership scan (P4-1).
-- **Marker trigger 4** (P4-3) adds markers beyond the spec's two triggers, only on sources with persisted verdict views. It is needed for restart determinism (P4-4).
+- **Two-phase drop** (P4-6): Part 09's plan work (R04a, R09b). Part 04's judge waits for a missing install, which is safe; Part 09 makes it live.
+- **`Timing` is extended** for Part 03's fold-in (P4-15). Accepted (R04d).
+- **C11 "follower apply"** is realised through the leadership scan (P4-1). Accepted (R04b).
+- **Marker trigger 4** (P4-3) adds markers beyond the spec's two triggers, only on sources with persisted verdict views. It is needed for restart determinism (P4-4). Accepted (R04c).
+- **C9.3 deviation.** C9.3 says `foldBatch` and `foldAggregateBatch` are "re-implemented as the prepare-then-apply loop". Here the ordinary folds run the shared step over the direct store (`projectionStep<DirectStore>`, `AggStep<DirectStore>`), and only the judge runs prepare then apply over the overlay (P4-13). The per-record code is the same template, so "the same code computes and applies" still holds, and the three-way identity tests (Tasks 1, 2) pin it; the direct store keeps today's fold cost (§14).
 
 ## Review Focus
 
@@ -313,7 +320,7 @@ Built on `CheckedWritesRig.h` (one real shard-mode `Worker`, a disk `Log` behind
 
 ### B. Part 03's `View` ack matrix, folded in (R03d, Task 10)
 
-Ops 120 `LV`, 121 `AV`. Entities 120 `NoViews`, 121 `OneView`, 122 `TwoViewsLate`, 123 `TransientSource`. Timings `Single`, `BackToBack` (03's `Pipelined8`), `RetryBeforeJudge` (`DupBeforeFold`), `RetryAfterJudge` (`DupAfterFold`), and the six appended timings. `expect03` moves unchanged into the shared header. The count pin row is 03's: 78 applicable and 2 skipped. `CheckedWritesViewAckMatrixTest.cpp` now takes its cells from `cellsFor(Part::P03)`.
+Ops 120 `ViewAckLV` (03's `LV`), 121 `ViewAckAV` (`AV`). Entities 120 `AckNoViews` (`NoViews`), 121 `AckOneView`, 122 `AckTwoViewsLate`, 123 `AckTransientSource`. Timings `Single`, `BackToBack` (03's `Pipelined8`), `RetryBeforeJudge` (`DupBeforeFold`), `RetryAfterJudge` (`DupAfterFold`), and the six appended timings. `expect03` moves unchanged into the shared header. The count pin row is 03's: 78 applicable and 2 skipped, now in the shared pin; 03's own `CheckedWritesViewAckMatrixCountRegression.CellCountsArePinned` is deleted. `CheckedWritesViewAckMatrixTest.cpp` now takes its cells from `cellsFor(Part::P03)`.
 
 ### C. The model check (`CheckedWritesModelRegression`, `rune_checked_writes_matrix_tests`, Task 11)
 
@@ -355,9 +362,9 @@ A failure prints `seed=<n> step=<k> action=<name>`.
 
 | §15 cell | Test (task) |
 |---|---|
-| verdict lag while a constraint view builds: delivery waits, writes don't | `CheckedWritesVerdictWorker.DeliveryWaitsDuringABuildWritesDoNot` (6) |
+| verdict lag while a constraint view builds: delivery waits, writes don't | `CheckedWritesVerdictWorker.DeliveryWaitsDuringABuildWritesDoNot` (6, the judge and writes), `CheckedWritesConsumer.DeliveryWaitsDuringABuildWritesDoNot` (7, delivery) |
 | failover right after a change record: same set on every offset | `CheckedWritesVerdictWorkerRegression.FailoverRightAfterAChangeRecordJudgesWithTheSameSetRegression` (6) |
-| a new leader without the install waits | `CheckedWritesVerdictWorkerRegression.LeaderWithoutTheInstallWaitsRegression` (6) |
+| a new leader without the install waits | `CheckedWritesVerdictWorkerRegression.LeaderWithoutTheInstallWaitsRegression` (6, the judge), `CheckedWritesConsumerRegression.LeaderWithoutTheInstallDeliversNothingAboveTheJudgeRegression` (7), `CheckedWritesVerdictAckRegression.LeaderWithoutTheInstallParksTheViewAckRegression` (9) |
 | refold below W doesn't judge; a constraint changed since gives the same view | `CheckedWritesVerdictWorkerRegression.RefoldBelowWIgnoresALaterRuleRegression` (6) |
 | a new leader judging past W reaches the same verdicts and writes the markers | `CheckedWritesVerdictWorkerRegression.NewLeaderRejudgesAboveWAndRemarksRegression` (6) |
 | the cleaner never compacts above W | `CheckedWritesVerdictCleanerRegression.NeverCleansAtOrAboveWRegression` (8) |
@@ -371,7 +378,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
 
 | File | C/M | Responsibility |
 |---|---|---|
-| `broker/libs/view/include/rune/view/ViewKey.h` | C | `kMaxViewKeyBytes`, `ViewKey` (C9.1) |
+| `broker/libs/view/include/rune/view/ViewKey.h` | C | `kMaxViewKeyBytes`, `ViewKey` with `fromU64` / `asU64` (C9.1, R07d; Part 07 extends it) |
 | `broker/libs/view/include/rune/view/RecordFold.h` | C | `SourceRecord`, `PrepareStatus`, `ProspectOp`, `Prospect`, `RowOverlay` (C9.3) |
 | `broker/libs/view/include/rune/view/Verdict.h` | C | `Verdict`, `constraintIdOf`, `VerdictViewKind` (C9.4) |
 | `broker/libs/view/include/rune/view/FoldSkip.h` | M | `rejected` member, `isRejectedRecord` |
@@ -422,14 +429,15 @@ A failure prints `seed=<n> step=<k> action=<name>`.
 - Modify: `broker/libs/view/include/rune/view/ViewFold.h:91-94`, `broker/libs/view/src/ViewFold.cpp:114-209` (the record loop), `broker/libs/view/CMakeLists.txt:21-27`
 
 **Interfaces:**
-- Consumes: `FoldSkip`, `isAbortedBatch`, `foldBatch(…, const FoldSkip&)` (Part 01); `rune::protocol::forEachRecordSpan`, `RecordSpan::{attributes, key, index}` (Parts 02/03); `rune::protocol::record::intentOf` (Part 03).
+- Consumes: `FoldSkip`, `isAbortedBatch`, `foldBatch(…, const FoldSkip&)` (Part 01); `rune::protocol::forEachRecordSpan`, `RecordSpan::key` (Part 02), `RecordSpan::{attributes, index}` (Part 03); `rune::protocol::record::intentOf` (Part 03).
 - Produces (exact):
   ```cpp
   // ViewKey.h (C9.1)
   inline constexpr std::size_t kMaxViewKeyBytes = 128;
   struct ViewKey { std::array<uint8_t, kMaxViewKeyBytes> bytes{}; uint8_t len = 0;
-      static ViewKey fromU64(uint64_t) noexcept; std::span<const uint8_t> span() const noexcept;
-      [[nodiscard]] uint64_t asU64() const noexcept; };   // len <= 8 only (until Part 07): little-endian of bytes[0..len)
+      static ViewKey fromU64(uint64_t) noexcept;          // len = 8, the little-endian bytes of v
+      std::span<const uint8_t> span() const noexcept;
+      [[nodiscard]] uint64_t asU64() const noexcept; };   // R07d: requires len <= 8; little-endian of bytes[0..len); fromU64(v).asU64() == v
   // Verdict.h (C9.4, verbatim)
   struct Verdict { uint16_t code = 0; uint32_t constraintId = 0; [[nodiscard]] bool accepted() const noexcept { return code == 0; } };
   [[nodiscard]] constexpr uint32_t constraintIdOf(uint64_t viewObjectId, uint16_t ordinal) noexcept;
@@ -443,7 +451,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
   struct Prospect {                       // reserved once per ViewInstance at install; never grows
       ProspectOp op = ProspectOp::None; uint8_t rowCount = 0; std::array<ProspectRow, 2> rows{};
       std::vector<uint8_t> scratch;       // 2 * rowLen, sized at install (cold)
-      RowOverlay overlay;                 // aggregate state images (Task 2)
+      RowOverlay overlay;                 // aggregate state images: an empty stub here (reserve/clear no-ops), filled by Task 2
       void reserve(uint32_t rowLen, const AggLayout* agg);   // cold
       void clear() noexcept;
   };
@@ -471,7 +479,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
       // seeds 1-200: 64 batches of 1-8 records over 16 keys, 15 % tombstones, control batches and
       // aborted transactions (Part 01's TxnLog), pass caps {1, 3, unbounded}: foldBatch == legacy_fold::foldBatch
       // (table rows byte-equal by key, FoldStats equal, cursor equal)
-  TEST(CheckedWritesPrepareApply, ViewKeyFromU64RoundTrips)             // fromU64(0x0102).len == 8, asU64() == 0x0102
+  TEST(CheckedWritesPrepareApply, ViewKeyFromU64RoundTrips)             // R07d: fromU64(v).len == 8 and asU64() == v for 0, 1, 0x0102, 2^63, UINT64_MAX
   ```
 - [ ] **Step 3: Run to verify they fail.** `cmake --build build/root -j14 --target rune_view_tests`. Expected: `rune/view/RecordFold.h` not found.
 - [ ] **Step 4: Implement.**
@@ -480,7 +488,8 @@ A failure prints `seed=<n> step=<k> action=<name>`.
   - Otherwise the row image goes into `scratch[0, rowLen)`: start from `table.get(k)` bytes when the row exists, else zero, then `writeSlot` every `plan.output` field from `rec.writer` (or `vdc.materializedFor(version)` when `writer == nullptr`). The op is `Upsert`.
   - `applyProjection` does `memcpy(table.put(k), image, rowLen)` or `table.erase(k)`.
   - **One step, two stores (P4-13).** The per-record body becomes `template <class Store> PrepareStatus projectionStep(…)`. `DirectStore` writes the slots straight into `table.put(k)`, exactly as today. `prepareProjection` runs the same step against a row-image store over `Prospect::scratch`.
-  - `foldBatch` keeps its signature. Its record loop becomes `forEachRecordSpan` + `projectionStep<DirectStore>`, plus the rejected skip of Task 4 (`isRejectedRecord(skip, offset)` → count `skippedRejected`, no apply). The batch, bound, cursor and corrupt-tail handling stay as they are, so the ordinary fold never copies a row.
+  - `foldBatch` keeps its signature. Its record loop becomes `forEachRecordSpan` + `projectionStep<DirectStore>` (Task 4 adds the rejected skip). The batch, bound, cursor and corrupt-tail handling stay as they are, so the ordinary fold never copies a row.
+  - `RecordFold.h` declares `struct RowOverlay` as an empty stub with no-op `reserve` / `clear` and `full() == false`, so `Prospect` compiles; Task 2 gives it its slots.
 - [ ] **Step 5: Run.** `cmake --build build/root -j14 --target rune_view_tests && ctest --test-dir build/root -R 'CheckedWritesPrepareApply|ViewFold|CheckedWritesAbortedFold' -j14 --output-on-failure`. Expected: PASS. Every pre-existing `ViewFold*` test and Part 01's fold matrix are unchanged.
 - [ ] **Step 6: Commit.**
   ```bash
@@ -497,7 +506,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
 
 **Files:**
 - Modify: `broker/libs/view/include/rune/view/AggFold.h:22-33`, `broker/libs/view/src/AggFold.cpp:79-547` (`Ctx` → `AggStep<Store>`), `:550-660`
-- Modify: `broker/libs/view/include/rune/view/RecordFold.h` (`RowOverlay`)
+- Modify: `broker/libs/view/include/rune/view/RecordFold.h` (`RowOverlay`: the Task 1 stub gets its slots)
 - Test: `broker/libs/view/tests/view/CheckedWritesPrepareApplyTest.cpp`
 
 **Interfaces:**
@@ -549,7 +558,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
     - `erase` marks the slot erased.
     - A full table kind sets `full()`, and `prepareAggregate` returns `CapacityExhausted`.
   - `applyAggregate` commits the overlay in the order the direct path writes: contributors, groups, blocks, view. Each slot is `put` with `memcpy` or `erase`, and the step's `FoldStats` deltas are added.
-  - `foldAggregateBatch` keeps both signatures and runs `AggStep<DirectStore>` per record, with Task 4's rejected skip.
+  - `foldAggregateBatch` keeps both signatures and runs `AggStep<DirectStore>` per record (Task 4 adds the rejected skip).
 - [ ] **Step 4: Run.** `ctest --test-dir build/root -R 'CheckedWritesPrepareApply|AggFold|AggRetractable|CheckedWritesAbortedFold' -j14 --output-on-failure`. Expected: PASS. Mutation check (do it, then revert): make `OverlayStore::get` ignore the overlay. `AggregateMoveProspectsBothGroups` and the three-way test must turn red.
 - [ ] **Step 5: Commit.**
   ```bash
@@ -602,7 +611,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
     - **(3)** `LogCleaner` `scanTxnState` over a one-segment log holding the batch plus a committed txn: `TxnCleanState` sees no extra marker and `cleanLimit` is unchanged.
     - **(4)** `RcState` advance over a log holding it builds Ready with no open transaction.
     - **(5)** `foldBatch` and `foldAggregateBatch` count `skippedControl == 1` and touch no table.
-    - **(6)** The unfiltered push (Task 7's rig, here a `Worker` from `ShardWorkerAckTest.cpp:56-224`): the subscription receives the data batch after it and never the control batch.
+    - **(6)** The unfiltered push needs an Aeron shard `Worker`, which `rune_checked_writes_tests` does not link, so it is Task 7's `CheckedWritesConsumer.ControlRecordsSixteenToNineteenAreNeverPushed` in `rune_checked_writes_verdict_tests`.
     - **(7)** `rune::protocol::forEachRecordSpan` parses it.
     - **(8)** The client `DataCodec` record walk (`client-cpp/include/rune/client/codec/DataCodec.h:341`) skips it as control.
     - **(9)** The PSM rebuild (`feedProducerState_`, `RcState.h:657-662`) records nothing for `producerId −1`.
@@ -685,7 +694,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
 - Produces (`namespace rune::node`; C9.5 verbatim plus contract additions 3–6):
   ```cpp
   struct VerdictSourceStats { uint64_t rejectionsConstraint = 0, markersWritten = 0, markerAppendRetries = 0,
-      judgeWaitsForInstall = 0, verdictStalls = 0, checkpointsDiscarded = 0, verdictUnknownDuplicates = 0;
+      judgeWaitsForInstall = 0, verdictStalls = 0, verdictCheckpointsDiscarded = 0, verdictUnknownDuplicates = 0;
       struct PerConstraint { uint32_t constraintId = 0; uint64_t rejections = 0; };
       std::array<PerConstraint, 256> perConstraint{}; uint16_t perConstraintCount = 0; };
   class VerdictSource {
@@ -724,7 +733,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
   //   K = extendOverEmptySets(state.rejected.coveredThrough(), state.constraintSets)
   //   for every member of setAt(K) and every joining member: if inst.foldCursor > K -> discard (P4-4)
   //   judgeCursor_ = K ; startKnown_ = K                      // verdicts below K are known: never re-judged
-  //   emitFrom_ = state.markers.committedThrough()
+  //   emitFrom_ = extendOverEmptySets(state.markers.committedThrough(), state.constraintSets)   // P4-3: W, past empty-set spans
   replay every member with foldCursor < judgeCursor_ up to judgeCursor_ via its own fold
   //   (foldBatch / foldAggregateBatch with FoldSkip{.aborted, .rejected = &state.rejected},
   //    pass cap maxRecordsPerPass): unjudged, rejected skipped
@@ -735,7 +744,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
       if judgeCursor_ > A: switch to setAt(A + 1):
           every member installed?            else waitingForInstall_ = true; break
           every joining member's foldCursor == A + 1?   else replay them (bounded by A + 1); break
-          retire leaving members; activeSetFrom_ = A + 1
+          leaving members stop judging (Retiring); activeSetFrom_ = A + 1
       read whole batches from judgeCursor_; for each:
           control batch or Part-01 aborted batch -> judgeCursor_ = last + 1; continue
           for each record with offset in [judgeCursor_, passBound):
@@ -743,6 +752,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
               else v = judge(rec); a CapacityExhausted prepare or a full index -> stalled_ = true; stop
           judgeCursor_ advances to the batch end (or the bound mid-batch, like the fold cursor contract)
   emit markers when a P4-3 trigger holds; push checkpoints of persisted members when a marker covers their cursor
+  drop each Retiring member once state.markers.committedThrough() > its leave offset   // R09b: W passed its change record
   ```
   - **`judge(rec)`:** prepare every member of the active set in set order. Then evaluate in order, stopping at the first failure. Accepted → apply every member. Rejected → `state.rejected.add(offset, code, cid)` and the stats.
   - **`TestReject` evaluation** (P4-12):
@@ -771,7 +781,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
   - `CheckedWritesVerdictSourceRegression.CapacityStallIsNeverAVerdictRegression`: index reserved 1, two rejections → the second judge stalls (`stalled()`), `judgedThrough()` stays at that record, no entry added, no table touched.
   - `CheckedWritesVerdictSource.MarkerTriggers`: cursor moved and 100 ms passed → 1 marker `[emitFrom, judgedThrough)`; a pass with a rejection → a marker at once; 50 ms and nothing rejected → none; 4097 rejections in one pass → 2 markers, the split at the 4097th entry's offset.
   - `CheckedWritesVerdictSource.JoiningMemberBuildsUnjudgedToTheChangeOffset`: member X active; a change at A = 20 adds Y. Y replays [0, 21) skipping the index; records 15–19 are judged by X alone; record 22 waits until `Y.foldCursor == 21` and is then judged by both.
-  - `CheckedWritesVerdictSource.LeavingMemberJudgesUntilItsLeaveOffset`: a drop of Y at D = 30 → records ≤ 29 are judged by both, records > 30 by X only; Y is reported retired after the judge passes 31.
+  - `CheckedWritesVerdictSource.LeavingMemberJudgesUntilItsLeaveOffset` (R09b): a drop of Y at D = 30 → records ≤ 29 are judged by both, records > 30 by X only; Y stays registered (`Retiring`) after the judge passes 31 while `W ≤ 30`, and is dropped at the first pass after a committed marker brings `W` past 30.
   - `CheckedWritesVerdictSourceRegression.MissingMemberWaitsNeverGuessesRegression`: the logged set names (9, TestReject, fp) with no such member → `waitingForInstall()`, the judge cursor does not pass the change offset + 1, `judgeWaitsForInstall == 1`; after `addVerdictView` it proceeds.
   - `CheckedWritesVerdictSource.FeedMergesMarkersAndChanges`: `verdictFeedBatch` with a change (set 1 at 10) and a marker (10..20, {12}) → `setAt(11).id == 1`, `isRejected(12)`, `coveredThrough() == 20`.
   - `CheckedWritesVerdictSource.ActivationExtendsCoverageOverEmptySets`: changes {10: {X}}, {30: {}}, {50: {X}}, markers covering [10, 31) → K = 51 (offsets 31..50 are under the empty set); the judge starts at 51.
@@ -807,6 +817,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
   - new `maintainVerdictIndexes_()` (P4-11);
   - test seams `verdictStatsForTest(int32_t, int32_t)` (C16) and `setVerdictIntervalNs`.
 - Modify: `broker/libs/node/src/CheckedWriteHook.cpp` (`topicHookFactsOf`: `verdictSource = state.isVerdictSource()`, `constrainedSource = state.isConstrainedSource()`)
+- Modify: `broker/libs/replication/include/rune/replication/PartitionReplica.h:866-893`: the two atomic words beside `publishCleanerLso` (`:866`), default `kNoCleanerLso`: C11's `publishCleanerVerdictBound` / `cleanerVerdictBound` and contract addition 9's `publishCleanerVerdictMarkerEnd` / `cleanerVerdictMarkerEnd` (the marker end published before the bound with release order, read after it with acquire order). `publishVerdictCleanerBound_` (below) writes them; Task 8 adds their readers.
 - Modify: `broker/libs/node/include/rune/node/NodeConfig.h` (beside the worker knobs), `broker/libs/node/src/NodeConfig.cpp` (beside `RUNE_ELECTION_TIMEOUT_MS`, `:825`, the same `parseOptionalInt64Ms`), `broker/libs/node/src/BrokerNode.cpp` (pass it to every worker)
 - Create: `broker/libs/node/tests/support/CheckedWritesRig.h` (the parts below), `broker/libs/node/tests/node/CheckedWritesVerdictWorkerTest.cpp`
 - Modify: `broker/libs/node/CMakeLists.txt`: a new `rune_checked_writes_verdict_tests` in the `if(aeron_FOUND)` block next to 03's `rune_checked_writes_ack_tests`, with the same links, `PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}"`
@@ -857,32 +868,18 @@ A failure prints `seed=<n> step=<k> action=<name>`.
     - `[[nodiscard]] const VerdictSourceStats* Worker::verdictStatsForTest(int32_t topicId, int32_t partition) const noexcept` (C16; nullptr = no verdict source);
     - `verdictCutsForTest()` and `verdictScratchGrowthsForTest()` (Task 7);
     - the sink's `offerFramesForTest()` and `claimFramesForTest()` (Task 9).
-    It uses one shard-mode `Worker` with the ack sink, a disk `Log` + leader `PartitionReplica` (the follower's fetches are driven by `followerFetch()` through `replica->onFetchRequest`, `ShardWorkerAckTest.cpp:340`), a `WorkerViewSet` with a `ViewSnapshotChannel` and a `ViewSnapshotIoAgent` (Part 01's `AbortedFoldRig.h:63-176` pattern), level 4, and `now += 1 ms` per pass.
+    It uses one shard-mode `Worker` with the ack sink, a disk `Log` + leader `PartitionReplica` (the follower's fetches are driven by `followerFetch()` through `replica->onFetchRequest`, `ShardWorkerAckTest.cpp:340`), a `WorkerViewSet` with a `ViewSnapshotChannel` and a `ViewSnapshotIoAgent` (the pattern of Part 01's `AbortedFoldRig.h`), level 4, and `now += 1 ms` per pass.
 
 - [ ] **Step 1: Write the failing tests** (`CheckedWritesVerdictWorkerTest.cpp`). The rig sets up typed topic 1, `TestReject{TagEquals{9}}` objectId 7 on view 101 (persisted) and `installPlainProjection(102)`.
-  ```cpp
-  TEST(CheckedWritesVerdictWorker, RejectedRecordNeverReachesAnyView) {
-      CheckedWritesRig rig(tmp("vw-basic"));
-      rig.createTypedTopic(); rig.installTestRejectView(101, 7, tagEquals(9)); rig.installPlainProjection(102);
-      const Rec recs[] = {{1, 10, 1}, {2, 20, 9}, {3, 30, 1}};
-      (void)rig.appendBatch(recs, /*acks*/ 1);
-      rig.followerFetch();
-      ASSERT_TRUE(rig.driveUntilJudged(rig.leo()));
-      EXPECT_TRUE(rig.state().rejected.isRejected(rig.firstDataOffset() + 1));
-      EXPECT_EQ(rig.viewRow(102, 2), std::nullopt) << "another view folded a rejected record";
-      EXPECT_EQ(rig.viewSize(102), 2u);
-      EXPECT_EQ(rig.viewSize(101), 2u);
-      EXPECT_EQ(rig.worker().verdictStatsForTest(1, 0)->rejectionsConstraint, 1u);
-  }
-  ```
+  - `CheckedWritesVerdictWorker.RejectedRecordNeverReachesAnyView`: records `{1, 10, 1}`, `{2, 20, 9}`, `{3, 30, 1}` in one `acks 1` batch, `followerFetch()`, `driveUntilJudged(leo())` → `rejected.isRejected(firstDataOffset() + 1)`; `viewRow(102, 2) == nullopt`; `viewSize(102) == 2` and `viewSize(101) == 2`; `verdictStatsForTest(1, 0)->rejectionsConstraint == 1`.
   - `CheckedWritesVerdictWorker.MarkerIsWrittenAndCommitted`: after the judge and `advanceClock(100 ms)` → one marker in the log `[A + 1, judgedThrough)` with the entry; after `followerFetch()` `state().rejected.watermark() == judgedThrough` (W); the replica's `cleanerVerdictBound()` equals W, and `cleanerVerdictMarkerEnd()` equals the marker offset + 1.
   - `CheckedWritesVerdictWorker.NothingRejectedNoMarkerBeforeTheInterval`: accepted records only, 50 ms → no marker; at 100 ms → one marker, entries empty.
   - `CheckedWritesVerdictWorker.DeliveryWaitsDuringABuildWritesDoNot` (§15):
     - 500 records first, then `installTestRejectView`; the change record lands at A;
     - `appendBatch` of 3 more records → acked OK at the HW (`acks 1`);
     - `state().verdicts->judgedThrough() <= A + 1` until the new member reaches `A + 1`;
-    - a raw subscription from 0 receives records < A as soon as they are committed, and records > A only after the member caught up;
     - pre-A records with tag 9 are accepted (never judged).
+    - The delivery half ("delivery waits") needs Task 7's readers: `CheckedWritesConsumer.DeliveryWaitsDuringABuildWritesDoNot`.
   - `CheckedWritesVerdictWorkerRegression.RefoldBelowWIgnoresALaterRuleRegression` (§15):
     - `TagEquals{9}` rejects a record; the marker commits (W past it);
     - `replaceTestRejectView(101 → 103, objectId 7, TagEquals{1})`;
@@ -901,13 +898,14 @@ A failure prints `seed=<n> step=<k> action=<name>`.
     - records below S are judged with tag 9 and above S with tag 1, exactly as an undisturbed rig.
   - `CheckedWritesVerdictWorkerRegression.LeaderWithoutTheInstallWaitsRegression` (§15):
     - `restart()` without re-installing view 101 (rig option `skipReinstall`);
-    - `verdicts->waitingForInstall()` holds; `judgedThrough()` stays at the first post-change offset; a `View` ack stays parked; a subscription receives nothing above it;
-    - after `installTestRejectView(101, …)` everything proceeds, with the same verdicts.
+    - `verdicts->waitingForInstall()` holds and `judgedThrough()` stays at the first post-change offset;
+    - after `installTestRejectView(101, …)` the judge proceeds, with the same verdicts.
+    - The reader and ack halves need Tasks 7 and 9: `CheckedWritesConsumerRegression.LeaderWithoutTheInstallDeliversNothingAboveTheJudgeRegression` and `CheckedWritesVerdictAckRegression.LeaderWithoutTheInstallParksTheViewAckRegression`.
   - `CheckedWritesVerdictRestartRegression.CheckpointAheadOfLocalMarkersIsDiscardedAndRefoldedRegression` (Review Focus 1):
     - judge and checkpoint view 101 (marker in the log, `O` = its `finalThrough`);
     - truncate the log's local copy of the marker by stopping the rig, cutting the segment file at the marker's position (a crash that lost the unflushed tail; the records below stay), then `restart()`;
-    - `checkpointsDiscarded == 1`; the view refolds from 0; verdicts equal the model; `ViewSnapshotIoAgent` saw a `kResetMsgType` frame before the first new delta.
-  - `CheckedWritesVerdictWorker.RestartWithMarkersKeepsTheCheckpoint`: a normal restart → `checkpointsDiscarded == 0`; view 101 resumes at its checkpoint `O`.
+    - `verdictCheckpointsDiscarded == 1`; the view refolds from 0; verdicts equal the model; `ViewSnapshotIoAgent` saw a `kResetMsgType` frame before the first new delta.
+  - `CheckedWritesVerdictWorker.RestartWithMarkersKeepsTheCheckpoint`: a normal restart → `verdictCheckpointsDiscarded == 0`; view 101 resumes at its checkpoint `O`.
   - `CheckedWritesVerdictWorker.DemotePromoteKeepsOwnVerdicts`: verdicts judged and not yet marked, `demotePromote()` → the first marker of the new leadership covers them from W (entries equal), with no re-judging (`judgeCalls` unchanged for those offsets).
   - `CheckedWritesVerdictWorker.TruncationOfAnUncommittedTailChangesNoVerdict` (timing `TruncateTail`): data above HW, `truncateTo(hw)` → the index and the markers are unchanged.
   - `CheckedWritesVerdictWorker.HookFactsFollowTheTimeline`: before the install, `topicHookFactsOf(state)` has both facts false; after it, `verdictSource` and `constrainedSource` are true; a transactional batch is then refused `InvalidRequest` (03 rule 7), and a 4097-record `View` batch `InvalidRequest` (SD4).
@@ -921,6 +919,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
           broker/libs/node/src/WorkerViewSet.cpp broker/libs/node/include/rune/node/Worker.h \
           broker/libs/node/src/CheckedWriteHook.cpp broker/libs/node/include/rune/node/NodeConfig.h \
           broker/libs/node/src/NodeConfig.cpp broker/libs/node/src/BrokerNode.cpp \
+          broker/libs/replication/include/rune/replication/PartitionReplica.h \
           broker/libs/node/tests/support/CheckedWritesRig.h broker/libs/node/tests/node/CheckedWritesVerdictWorkerTest.cpp \
           broker/libs/node/CMakeLists.txt
   git commit -m "node: verdict sources on the worker - scan feed, judge-first duty order, markers, W, refold below W, failover re-judging, set changes" \
@@ -970,6 +969,9 @@ A failure prints `seed=<n> step=<k> action=<name>`.
   - `CheckedWritesConsumer/Kind.FailsClosedBeforeTheVerdictSourceExists`: after `restart()` and before the activation completes, nothing above K is delivered.
   - Not parameterized:
     - `CheckedWritesConsumer.FilteredGroupNeverZeroCopiesABatchWithARejectedRecord`: 3 filtered members on `tag = 1`, a batch tags 1, 9, 1 → `group_.rebuilt == 1`, `zeroCopy == 0` for that batch, and each member gets 2 records.
+    - `CheckedWritesConsumer.ControlRecordsSixteenToNineteenAreNeverPushed` (Task 3's reader (6)): a control batch of each type 16–19 (Task 3's builders) between two data batches → an unfiltered subscription receives both data batches and never a control batch.
+    - `CheckedWritesConsumer.DeliveryWaitsDuringABuildWritesDoNot` (§15, the delivery half of Task 6's test): 500 records, then `installTestRejectView` (change at A), then 3 more records → a raw subscription from 0 receives records < A as soon as they are committed, and records > A only after the new member reached `A + 1`.
+    - `CheckedWritesConsumerRegression.LeaderWithoutTheInstallDeliversNothingAboveTheJudgeRegression` (§15): `restart()` with `skipReinstall` → a subscription receives nothing above `judgedThrough()` while `waitingForInstall()`; after the install it receives the rest, without the rejected records.
     - `CheckedWritesConsumer.UntypedTopicPaysOneBranch`: 1,000 push passes on an untyped topic → `verdictSpans_` never touched (`verdictCutsForTest() == 0`).
     - `CheckedWritesConsumer.OversizedRebuildGrowsOnceAndIsCounted`: a 600 KiB batch with one rejected record → delivered without it; `verdictScratchGrowthsForTest() == 1`; a second identical batch → still 1.
 - [ ] **Step 2: Run to verify they fail.** `cmake --build build/root -j14 --target rune_checked_writes_verdict_tests && ctest --test-dir build/root -R CheckedWritesConsumer --output-on-failure`. Expected: FAIL (rejected records delivered).
@@ -992,7 +994,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
   - `broker/libs/storage/src/LogCleaner.cpp`: `scanTxnState` (`:216-251`); both `buildOffsetMapFromBases` (`:315`, `:372`), the map skip at `:349` / `:419`, now per record; `markerAction` / `rewriteControlBatch` (`:261-299`); the rewrite drop in `rewriteSegmentImpl` (`:435`, next to the aborted drop at `:543`) and `mergeGroupWithMap` (`:1386`, next to `:1468`); every `cleanLimit()` site (`:443`, `:844`, `:995`, `:1141`, `:1398`, `:1640`) takes `min` with `map.verdictState().cleanLimit()`;
   - `broker/libs/storage/include/rune/storage/LogCleaner.h:79-110` (`setVerdictBounds`);
   - `OffsetMap.h:49`, `SkimpyOffsetMap.h:250` (`verdictState()`);
-  - `broker/libs/replication/include/rune/replication/PartitionReplica.h:866-893` (the two atomics);
+  - `broker/libs/replication/include/rune/replication/PartitionReplica.h:893`: `cleanerSwapBound()` returns `std::min({highWatermark(), cleanerLastStableOffset(), cleanerVerdictBound()})` on a leader (C11; Task 6 added the atomics);
   - `broker/libs/node/include/rune/node/LogCleanerAgent.h:455` (`firstUncleanable = min(firstUncleanable, replica->cleanerVerdictBound())`, and `cleaner.setVerdictBounds(bound, markerEnd)` before the pass).
 - Modify: `broker/libs/node/tests/support/CheckedWritesRig.h` (`compact()`: seal the active segment, then one `LogCleanerAgent`-equivalent pass on the rig thread with the replica's published bounds and `markerRemovalBound`, then `drainCleanerSwapsOnOwner`)
 
@@ -1042,6 +1044,8 @@ A failure prints `seed=<n> step=<k> action=<name>`.
     - `CheckedWritesVerdictCleanerRegression.MarkerKeptUntilEveryReplicaFetchedItRegression` (Review Focus 3): the records gone and a later marker present, but `markerRemovalBound = m` → kept; at `m + 1` → stamped; at the horizon → dropped.
     - `CheckedWritesVerdictCleaner.ChangeRecordsAreAlwaysKept`: a superseded change → present after any number of passes.
     - `CheckedWritesVerdictCleaner.StaleBoundOnlyCleansLess`: published bound 50, own coverage 30 → `cleanLimit == 30`.
+  - `CheckedWritesVerdictWorkerTest.cpp` (rig), C11 swap bound:
+    - `CheckedWritesVerdictCleanerRegression.SwapAboveTheVerdictBoundIsNeverInstalledRegression`: a published verdict bound below a compaction output's member base (HW and LSO above it) → `drainCleanerSwapsOnOwner()` rejects the output and the segment is unchanged; once the bound passes the base the next pass installs it.
   - `CheckedWritesVerdictWorkerTest.cpp` (rig):
     - `CheckedWritesVerdictCleanerRegression.RemovedMarkerNeverStallsCoverageRegression` (Review Focus 4): compact until the first marker is removed, then `failover()` → K comes from the second marker, nothing is re-judged below it, and consumers from 0 receive no rejected record.
     - `CheckedWritesVerdictCleaner.RigCompactionKeepsTheAcceptedLatest`: cell-(e) assertion on 200 random writes.
@@ -1075,7 +1079,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
   - `flushOwedAcksView_` (03): the condition `state->verdicts->judgedThrough() > lastOffset` on a verdict source (C4); the trailer reserve and fill (`rejected.forEachIn(baseOffset, lastOffset + 1)` → `(offset − baseOffset, code, cid)`); P4-10;
   - the duplicate answers (P4-8, R04e): an in-window duplicate with `View` on a verdict source parks with `replay = 1` and is released only once `W > lastOffset`, with the trailer rebuilt from the index; a known-old one is answered `DuplicateSequence` without a trailer;
   - `emitProduceAck_` (`:2132-2149`) copies `verdictRun` / `verdictCount` / `hasVerdicts`.
-- Modify (client): `client-cpp/include/rune/client/Completion.h:54` (`OpStatus::VerdictUnknown = 14`), `client-cpp/include/rune/client/agent/ClientAgent.h:571-580`, `client-cpp/src/agent/ClientAgent.cpp:1101-1113` (copy the trailer; `codec::decodeProduceResponse` v12 fields from 03), `client-cpp/src/Client.cpp:3152-3163`, `ProducerHub.{h,cpp}:81-88`, `ProducerImpl.{h,cpp}` (`onProduceResponse` `:2350-2390`, `completeSlice_` `:2761-2782`: a per-record override from the trailer; `completeHandle_` takes `reserved0 = constraintId`)
+- Modify (client): `client-cpp/include/rune/client/Completion.h:54` (`OpStatus::StoredIdUnknown = 13`, a reserved placeholder for Part 06, and `OpStatus::VerdictUnknown = 14`; R-X2), `client-cpp/include/rune/client/agent/ClientAgent.h:571-580`, `client-cpp/src/agent/ClientAgent.cpp:1101-1113` (copy the trailer; `codec::decodeProduceResponse` v12 fields from 03), `client-cpp/src/Client.cpp:3152-3163`, `ProducerHub.{h,cpp}:81-88`, `ProducerImpl.{h,cpp}` (`onProduceResponse` `:2350-2390`, `completeSlice_` `:2761-2782`: a per-record override from the trailer; `completeHandle_` takes `reserved0 = constraintId`)
 - Create: `broker/libs/node/tests/node/CheckedWritesVerdictAckTest.cpp` (in `rune_checked_writes_verdict_tests`), `client-cpp/tests/producer/ProducerVerdictsTest.cpp` (in `rune_invoker_tests`, `client-cpp/CMakeLists.txt`)
 - Modify: `broker/libs/node/tests/node/SessionAckSinkTest.cpp`, `broker/libs/node/tests/support/CheckedWritesRig.h` (`ack(corr)`)
 
@@ -1115,6 +1119,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
     - `CheckedWritesVerdictAckRegression.ViewRetryOutsideTheWindowIsDuplicateSequenceRegression` (R04e). The original batch, then 33 more batches from the producer, then the original re-sent: `errorCode 21`, frame 54 B with no trailer, `verdictUnknownDuplicates == 1`, nothing appended.
     - `CheckedWritesVerdictAckRegression.FourThousandRejectionsAckIsOfferedRegression` (R03a, Review Focus 5): a 4096-record batch, all tag 9 → one ack of 32,824 B through the real Aeron sink; decodes to 4096 entries in order; `offerFramesForTest() == 1`, `claimFramesForTest()` unchanged for that ack.
     - `CheckedWritesVerdictAckRegression.ArenaFullDefersInPartitionOrderRegression` (P4-10): the arena sized 4096 (rig option); batch A (4096 rejections) then B (1 rejection) on one partition, A's session publication back-pressured → B is not acked before A; once A is claimed, B follows; nothing dropped.
+    - `CheckedWritesVerdictAckRegression.LeaderWithoutTheInstallParksTheViewAckRegression` (§15, the ack half of Task 6's test): `restart()` with `skipReinstall`, an `acks 3` batch above the change → no ack while `waitingForInstall()` (and none before `ackTimeoutNs`); after the install the ack is OK with the model's trailer.
     - `CheckedWritesVerdictAck.PlainAllOnAVerdictSourceHasNoTrailer`: `acks 1` → 54 B, `!hasVerdicts`.
     - `CheckedWritesVerdictAck.OldSessionNeverSeesATrailer`: a v11 session, `acks 1` → 46 B; `acks 3` from v11 is refused by 03 (`InvalidRequest`).
     - `CheckedWritesVerdictAck.LeaderLossWhileParkedIsNotLeader` and `…DeadlineIsInternal` on a verdict source: as 03, with the judge held.
@@ -1127,6 +1132,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
     - `ProducerVerdicts.ReplayedVerdictsCompleteEachRecordAsTheOriginal` (R04e): the first ack is lost and the retry's ack carries the trailer `{(3, 51, 0x00070001)}` → the same per-record completions as `CoalescedBatchWithOneBadRecord`, each exactly once.
     - `ProducerVerdicts.DuplicateSequenceOnAViewProducerIsVerdictUnknown` (R04e): 8 records → 8 completions, each `OpStatus::VerdictUnknown` with `errorCode 21`; none is `BrokerError` or `Ok`. For an `All` producer → today's `Ok −1`.
     - `ProducerVerdicts.VerdictArenaGrowsOnceAndIsCounted`.
+    - `ProducerVerdicts.OpStatusThirteenIsReservedAndVerdictUnknownIsFourteen` (R-X2): `static_cast<int>(OpStatus::StoredIdUnknown) == 13`, `static_cast<int>(OpStatus::VerdictUnknown) == 14`.
 - [ ] **Step 2: Run to verify they fail.** `cmake --build build/root -j14 --target rune_checked_writes_verdict_tests rune_session_ack_sink_tests` and `cmake --build build/sub-client-cpp -j14 --target rune_invoker_tests`. Expected: FAIL (no trailer).
 - [ ] **Step 3: Implement** as specified. In `flushOwedAcksView_`, for an entry of a verdict source:
   - count the index entries in `[baseOffset, lastOffset]` with `forEachIn`;
@@ -1141,6 +1147,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
   git add broker/libs/node/include/rune/node/SessionAckSink.h broker/libs/node/include/rune/node/Worker.h \
           broker/libs/node/tests/node/CheckedWritesVerdictAckTest.cpp broker/libs/node/tests/node/SessionAckSinkTest.cpp \
           broker/libs/node/tests/support/CheckedWritesRig.h \
+          client-cpp/include/rune/client/Completion.h \
           client-cpp/include/rune/client/agent/ClientAgent.h client-cpp/src/agent/ClientAgent.cpp client-cpp/src/Client.cpp \
           client-cpp/include/rune/client/producer/ProducerHub.h client-cpp/src/producer/ProducerHub.cpp \
           client-cpp/include/rune/client/producer/ProducerImpl.h client-cpp/src/producer/ProducerImpl.cpp \
@@ -1205,7 +1212,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
     }
     ```
   - `CheckedWritesModel.ReferenceJudgeIsIndependent`: a hand-built log of 12 records with two change records → the expected verdict map is written out in the test.
-- [ ] **Step 2: Rewire Part 03's matrix** onto `cellsFor(Part::P03)` and `expect03` (moved unchanged). Run: `ctest --test-dir build/root -R 'CheckedWritesViewAckMatrix' -j14 --output-on-failure`. Expected: the same 78 pass and 2 skip.
+- [ ] **Step 2: Rewire Part 03's matrix** onto `cellsFor(Part::P03)` and `expect03` (moved unchanged), and delete 03's own `CheckedWritesViewAckMatrixCountRegression.CellCountsArePinned`: its row is now in the shared pin above. Run: `ctest --test-dir build/root -R 'CheckedWritesViewAckMatrix' -j14 --output-on-failure`. Expected: the same 78 pass and 2 skip.
 - [ ] **Step 3: Run.** `cmake --build build/root -j14 --target rune_checked_writes_matrix_tests && ctest --test-dir build/root -R 'CheckedWritesMatrix|CheckedWritesModel\.' -j14 --output-on-failure`. Expected: 585 pass, 15 skip, the pin and the model test pass. Mutation checks (do each, then revert):
   - drop the cut in `pushOwnedSubscriptions_` → every `RejectedWrite × RawSubscription` cell is red;
   - make `isRejectedRecord` return false → every `OtherViews` cell with a rejection is red;
@@ -1319,7 +1326,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
     - verdict lag;
     - delivery pausing while a constraint view builds;
     - a judge waiting for a missing view install;
-    - a verdict view refolded after a crash that lost the marker tail (`checkpointsDiscarded`);
+    - a verdict view refolded after a crash that lost the marker tail (`verdictCheckpointsDiscarded`);
     - the index capacity and the stall alert.
   - **`configuration.md`:** `RUNE_VERDICT_INTERVAL_MS` (default 100).
   - **`client-cpp/CLAUDE.md` §2.1:** "a `View` ack on a verdict source carries per-record verdicts; no resend, no epoch bump".
@@ -1346,9 +1353,9 @@ A failure prints `seed=<n> step=<k> action=<name>`.
 - [ ] Checkpoint C green.
 - [ ] Whole-branch review by the most capable model. The reviewer leaves PR comments; the implementer resolves each one.
 - [ ] File the deferred items as labelled GitHub issues on `arcanumruna/rune` (one batch, one summary at the end):
-  1. "Two-phase drop of a verdict view (a node that never installed a dropped view waits after failover)" — `bug`, `sev:high`, `area:broker`; assigned to Part 09 (P4-6).
-  2. "Aeron-counter export of verdict-source stats" only if Part 08's SD13 issue does not already cover the C16 ids 3–7.
-  3. Every recorded deviation (weakened or re-pinned assertion) that is not urgent.
+  1. "Aeron-counter export of verdict-source stats" only if Part 08's SD13 issue does not already cover the C16 ids 3–7.
+  2. Every recorded deviation (weakened or re-pinned assertion) that is not urgent.
+  - The two-phase drop is not filed: it is Part 09's plan work (R04a).
 - [ ] Hand over to Part 05 per the overview's acceptance list for 04:
   - a verdict source works end to end with `TestReject`: markers, the index, the consumer filter, other views skipping, the cleaner, refold below W, failover re-judging, `ConstraintSetChange` and the ack trailer;
   - the matrix, the model and the stress harnesses exist with the generic invariants.
@@ -1404,7 +1411,11 @@ A failure prints `seed=<n> step=<k> action=<name>`.
 - **Type consistency.**
   - `VerdictSource`, `ConstraintSet`, `ConstraintSetMember`, `ConstraintSetTimeline`, `MarkerLedger`, `VerdictSourceStats` and `TestRejectRule`: Task 5, used in Tasks 6–13.
   - `RejectedOffsetIndex` (+ additions): Task 4, used in 5–9.
-  - `Prospect`, `RowOverlay`, `ProjectionFold`, `AggregateFold`: Tasks 1–2, used in 5.
+  - `Prospect`, `RowOverlay` (a stub in Task 1, filled in Task 2), `ProjectionFold`, `AggregateFold`: Tasks 1–2, used in 5.
+  - `ViewKey::fromU64` / `asU64` (R07d): Task 1, used by Parts 05 and 06; Part 07 extends `ViewKey` under the same names.
+  - `VerdictSourceStats::verdictCheckpointsDiscarded`: Task 5, asserted in Task 6, documented in Task 13 (never Part 01's `checkpointsDiscarded`).
+  - The cleaner atomics on `PartitionReplica`: written from Task 6 (`publishVerdictCleanerBound_`), read from Task 8 (`cleanerSwapBound`, `LogCleanerAgent`).
+  - `OpStatus::StoredIdUnknown = 13` (reserved) and `VerdictUnknown = 14`: Task 9 (R-X2).
   - `control_record::*`: Task 3, used in 5, 6 and 8.
   - `VerdictCleanState`: Task 8.
   - `VerdictAckArena`: Task 9.
