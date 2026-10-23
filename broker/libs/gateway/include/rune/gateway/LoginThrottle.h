@@ -58,6 +58,9 @@ public:
     void onFailure(std::string_view user, std::string_view host, int64_t nowNs) noexcept;
     void onSuccess(std::string_view user, std::string_view host, int64_t nowNs) noexcept;
 
+    /// Test seam (#189): forget every entry (zero-fills the fixed tables in place; never allocates).
+    void clear() noexcept;
+
     /// Test seam (#131): the home slot of a (user, host) pair key - where its probe window starts.
     [[nodiscard]] std::size_t pairSlotForTest(std::string_view user, std::string_view host) const noexcept {
         return static_cast<std::size_t>(pairKey(user, host).h1) & (kCapacity - 1);

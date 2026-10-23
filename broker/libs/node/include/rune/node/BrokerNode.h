@@ -1650,6 +1650,11 @@ public:
     void holdPermissionShippingForTest(bool on) {
         onControlThreadForTest([this, on]() { if (gateway_) gateway_->holdPermissionShippingForTest(on); return 0; });
     }
+    /// Issue #189 seam (CONTROL thread): forget every login-throttle entry of this broker's gateway.
+    template <class = void>   // instantiated after onControlThreadForTest is defined
+    void resetLoginThrottleForTest() {
+        onControlThreadForTest([this]() { if (gateway_) gateway_->resetLoginThrottleForTest(); return 0; });
+    }
     /// PR #528 review seam (CONTROL thread): this broker answers MetadataRequests as a pre-receiver-key (< 7) broker.
     template <class = void>   // instantiated after onControlThreadForTest is defined
     void emulatePreReceiverKeyMetadataForTest(bool on) {

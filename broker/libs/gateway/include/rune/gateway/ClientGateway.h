@@ -483,6 +483,8 @@ public:
         permissionShipper_.setHoldForTest(on);
         if (!on) (void)servicePermissionShippingWork_();
     }
+    /// Issue #189 test seam (control thread): forget every login-throttle entry (no allocation).
+    void resetLoginThrottleForTest() noexcept { loginThrottle_.clear(); }
     /// Issue #259 test seam: authenticate `sid` as `userId` holding exactly `grants` (sorted, unique) - through the pool
     /// and the shipper, as a login does.
     void authenticateWithGrantsForTest(int64_t sid, uint64_t userId, std::vector<rune::security::GrantSpec> grants) {

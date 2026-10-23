@@ -93,8 +93,9 @@ struct Tally {
     uint64_t mustEndMet = 0, mustEndRacing = 0;                           // invariant 2: ends required and met in 1 s (racing: the revoke raced the Subscribe)
     uint64_t recordsChecked = 0, endedSubsChecked = 0;                    // "no Records after the end"
     uint64_t probes = 0, shardDeniedProbes = 0, routedDeniedProbes = 0, shardOkProbes = 0, routedOkProbes = 0;
-    uint64_t sessionsProbed = 0, disabledLoginsRefused = 0, epochsChecked = 0;
+    uint64_t sessionsProbed = 0, disabledLoginsRefused = 0, disabledUsersAtEnd = 0, epochsChecked = 0;
     void add(const Tally& o) {
+        disabledUsersAtEnd += o.disabledUsersAtEnd;
         shardOk += o.shardOk; routedOk += o.routedOk; subOk += o.subOk; createOk += o.createOk; mustEndMet += o.mustEndMet;
         mustEndRacing += o.mustEndRacing; recordsChecked += o.recordsChecked; endedSubsChecked += o.endedSubsChecked;
         probes += o.probes; shardDeniedProbes += o.shardDeniedProbes; routedDeniedProbes += o.routedDeniedProbes;
@@ -107,7 +108,7 @@ struct Tally {
           << " mustEndMet=" << mustEndMet << " (racing " << mustEndRacing << ") endedSubs=" << endedSubsChecked
           << " records=" << recordsChecked << " probes=" << probes << " (shard denied " << shardDeniedProbes << ", routed denied "
           << routedDeniedProbes << ", shard ok " << shardOkProbes << ", routed ok " << routedOkProbes << ") sessions=" << sessionsProbed
-          << " disabledLoginsRefused=" << disabledLoginsRefused << " epochs=" << epochsChecked;
+          << " disabledLoginsRefused=" << disabledLoginsRefused << "/" << disabledUsersAtEnd << " epochs=" << epochsChecked;
         return o.str();
     }
 };
@@ -210,18 +211,22 @@ private:
     }
     void login_(std::size_t i) {
         Sess& s = sess_[i];
-        // a login the per-source throttle refuses (retry_after hint, spec §5: a refused disabled-user attempt arms it for
-        // this host) is retried like the real client does - bounded
-        std::string lastLogin;
+        // Issue #189: ONLY a login the per-source throttle refuses (an answer carrying a retry_after hint, spec §5) is
+        // retried, after that hint, like the real client - bounded.  Any other refusal of an enabled user (a wrongful
+        // AuthenticationFailed after an answered ENABLE, a missing answer) fails the run at once.
         for (int attempt = 0; attempt < 30; ++attempt) {
             s.sid = s.w->connect(rig_.ch());
             if (s.sid <= 0) { failWith_("connect"); return; }
             const auto l = s.w->login(rig_.ch(), s.sid, user_(s.user), {AuthRig::kPw, AuthRig::kPw});
             if (l.ok()) { s.alive = true; return; }
-            lastLogin = std::string("answered=") + (l.answered() ? "yes" : "no") + " code=" + std::to_string(l.errorCode()) + " first=" + (l.first ? "yes" : "no");
-            std::this_thread::sleep_for(200ms);
+            if (!(l.fin && l.fin->retryAfterMs > 0)) {
+                failWith_("LOGIN REFUSED for enabled user " + user_(s.user) + " (answered=" + (l.answered() ? "yes" : "no") +
+                          " code=" + std::to_string(l.errorCode()) + " first=" + (l.first ? "yes" : "no") + ")");
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(l.fin->retryAfterMs));
         }
-        failWith_("login " + user_(s.user) + " kept failing (" + lastLogin + ")");
+        failWith_("login " + user_(s.user) + " stayed throttled for 30 attempts");
     }
     void builderCreate_(const std::string& name) {
         const int32_t id = rig_.defineTopic(rig_.builder, name);
@@ -596,11 +601,19 @@ private:
                 failWith_("BROKER: the control thread's applied offset probe disagrees with the view snapshot"); return;
             }
         }
-        // a disabled user cannot log in (a fresh login attempt is refused AuthenticationFailed)
+        // a disabled user cannot log in: a fresh login attempt is definitely refused AuthenticationFailed with no retry hint
+        // (issue #189: every seed; the throttle a refusal arms is reset after each probe, so it never answers instead)
         for (int u = 0; u < 2; ++u) {
-            if (fin.isEnabled(user_(u)) || seed_ % 16 != 0) continue;   // each refusal arms the per-source login throttle: sampled
+            if (fin.isEnabled(user_(u))) continue;
+            ++tally_.disabledUsersAtEnd;
             const auto l = uw_[static_cast<std::size_t>(u) * 3]->connectAndLogin(rig_.ch(), user_(u), AuthRig::kPw);
-            if (l.ok()) { failWith_("CONVERGENCE: a disabled user " + user_(u) + " logged in"); return; }
+            rig_.broker().node().resetLoginThrottleForTest();
+            if (!(!l.ok() && l.answered() && l.errorCode() == static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed) && l.fin->retryAfterMs == 0)) {
+                failWith_("CONVERGENCE: the login of disabled user " + user_(u) + " was not definitely refused (answered=" +
+                          (l.answered() ? "yes" : "no") + " code=" + std::to_string(l.errorCode()) + " retryAfterMs=" +
+                          std::to_string(l.fin ? l.fin->retryAfterMs : 0u) + ")");
+                return;
+            }
             ++tally_.disabledLoginsRefused;
         }
         // probes: EVERY alive session x existing topic x BOTH produce paths (worker ingress, gateway-routed) + Subscribe
@@ -700,7 +713,32 @@ TEST(AuthStressRegression, SeededRandomGrantRevokeTrafficHoldsEveryInvariant) {
         EXPECT_GE(tally.routedDeniedProbes, 50u);
         EXPECT_GE(tally.shardOkProbes, 50u);
         EXPECT_GE(tally.routedOkProbes, 50u);
-        EXPECT_GE(tally.disabledLoginsRefused, 1u);
         EXPECT_GE(tally.epochsChecked, 100u);
+    }
+    // issue #189: every disabled user of every seed was probed and definitely refused (no sampling)
+    EXPECT_EQ(tally.disabledLoginsRefused, tally.disabledUsersAtEnd);
+}
+
+// Issue #189, the deterministic shape: DISABLE, a probe that is definitely refused (AuthenticationFailed, no retry hint),
+// ENABLE, and a login that must succeed on its FIRST try (no retry may mask a wrongful refusal after the ENABLE).
+TEST(AuthStressRegression, DisabledLoginIsDefinitelyRefusedOnEverySeedRegression) {
+    AuthRig rig("dislogin");
+    auto& adm = rig.broker().admin();
+    AuthWireClient& w = rig.broker().wire();
+    for (int round = 0; round < 3; ++round) {
+        SCOPED_TRACE("round " + std::to_string(round));
+        std::string user;
+        (void)rig.newUser({}, &user);
+        ASSERT_EQ(adm.alterPassword(rig.ch(), rig.broker().adminSession(), user, pc::UserChangeKind::Disable).errorCode, 0);
+        const auto refused = w.connectAndLogin(rig.ch(), user, AuthRig::kPw);
+        EXPECT_FALSE(refused.ok());
+        ASSERT_TRUE(refused.answered()) << "a disabled user's login is answered";
+        EXPECT_EQ(refused.errorCode(), static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+        EXPECT_EQ(refused.fin->retryAfterMs, 0u) << "the first refusal is not a throttle refusal";
+        rig.broker().node().resetLoginThrottleForTest();
+        ASSERT_EQ(adm.alterPassword(rig.ch(), rig.broker().adminSession(), user, pc::UserChangeKind::Enable).errorCode, 0);
+        const auto ok = w.connectAndLogin(rig.ch(), user, AuthRig::kPw);
+        EXPECT_TRUE(ok.ok()) << "the first login after an answered ENABLE succeeds (answered=" << ok.answered()
+                             << " code=" << ok.errorCode() << " retryAfterMs=" << (ok.fin ? ok.fin->retryAfterMs : 0u) << ")";
     }
 }
