@@ -400,12 +400,37 @@ int64_t TransactionCoordinationService::requestPid_(int64_t pid, int64_t session
 
 
 // ---------------------------------------------------------------------------
+// #112 review: the ONE topic-id -> name resolution of every transactional request.
+// With a TopicRegistry an unknown id resolves to nothing (false: the caller refuses
+// retriably).  Only a coordinator wired without a registry (unit rigs) names topics
+// "topic_<id>" — its markers go through the by-name test seam.  Cold.
+// ---------------------------------------------------------------------------
+bool TransactionCoordinationService::topicNameOf_(int32_t topicId, std::string& out)
+{
+    if (topics_ != nullptr) {
+        const auto* spec = topics_->topic(topicId);
+        if (spec == nullptr) return false;
+        out = spec->name;
+        return true;
+    }
+    char numBuf[32];
+    const int n = std::snprintf(numBuf, sizeof(numBuf), "topic_%d", topicId);
+    out.assign(numBuf, static_cast<size_t>(n > 0 ? n : 0));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // F15-FU1 (#112): partition-registration verification (KIP-890 part 1).
 // ---------------------------------------------------------------------------
 int16_t TransactionCoordinationService::verifyTxnPartition(int64_t producerId, int16_t producerEpoch,
                                                            int32_t topicId, int32_t partition, int64_t nowNs)
 {
     if (!ensureLoaded_(nowNs)) return static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+    tx::TopicPartition tp;
+    tp.partition = partition;
+    // A topic this registry does not know (yet) is never judged: retriable (the
+    // client re-sends; once applied, the name matches what AddPartitions registered).
+    if (!topicNameOf_(topicId, tp.topic)) return static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions);
     const tx::TransactionMetadata* meta = nullptr;
     if (const auto it = pidIndex_.find(producerId); it != pidIndex_.end()) {
         meta = coordinator_.metadata(it->second);
@@ -420,15 +445,6 @@ int16_t TransactionCoordinationService::verifyTxnPartition(int64_t producerId, i
     if (producerEpoch < meta->producerEpoch) return static_cast<int16_t>(pc::ErrorCode::ProducerFenced);
     if (producerEpoch > meta->producerEpoch) return static_cast<int16_t>(pc::ErrorCode::InvalidProducerEpoch);
     if (meta->state != tx::TxnState::Ongoing) return static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);
-    tx::TopicPartition tp;
-    tp.partition = partition;
-    if (const auto* spec = topics_ != nullptr ? topics_->topic(topicId) : nullptr) {
-        tp.topic = spec->name;
-    } else {
-        char numBuf[32];   // the same placeholder handleAddPartitions_ registers an unknown topic under
-        const int n = std::snprintf(numBuf, sizeof(numBuf), "topic_%d", topicId);
-        tp.topic.assign(numBuf, static_cast<size_t>(n > 0 ? n : 0));
-    }
     if (meta->partitions.find(tp) == meta->partitions.end())
         return static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);   // never registered (or not yet)
     // The registration must survive a coordinator failover: its record committed.
@@ -758,33 +774,34 @@ size_t TransactionCoordinationService::handleAddPartitions_(
         msg.transactionalId.size());
 
     // Build partition vector.  Protocol sends topicId (int32) + partition (int32).
-    // TransactionCoordinator needs topic name strings. Resolve via TopicRegistry
-    // if available; otherwise use numeric placeholder (e.g. "topic_<id>").
-    // topicNameScratch_ reused for fallback — avoids per-partition temp string alloc.
+    // TransactionCoordinator needs topic name strings (resolved via TopicRegistry).
+    // #112 review: a topic id this coordinator's registry does not know yet (its catalog
+    // apply lags) is refused RETRIABLY and nothing is registered — a "topic_<id>"
+    // placeholder registration would be verified by the partition leader yet never
+    // get its marker (the marker dispatch resolves names), pinning the LSO forever.
     partitionScratch_.clear();
     const size_t partCount = msg.partitions.size();
+    bool unknownTopic = false;
     for (size_t i = 0; i < partCount; ++i) {
         auto tp = msg.partitions[i];
         tx::TopicPartition txtp;
         txtp.partition = tp.partition;
-        if (topics_) {
-            const auto* spec = topics_->topic(tp.topicId);
-            if (spec) {
-                txtp.topic = spec->name;
-            } else {
-                // Unknown topic: numeric placeholder via scratch (no temp alloc).
-                char numBuf[32];
-                const int n = std::snprintf(numBuf, sizeof(numBuf), "topic_%d", tp.topicId);
-                topicNameScratch_.assign(numBuf, static_cast<size_t>(n > 0 ? n : 0));
-                txtp.topic = topicNameScratch_;
-            }
-        } else {
-            char numBuf[32];
-            const int n = std::snprintf(numBuf, sizeof(numBuf), "topic_%d", tp.topicId);
-            topicNameScratch_.assign(numBuf, static_cast<size_t>(n > 0 ? n : 0));
-            txtp.topic = topicNameScratch_;
-        }
+        if (!topicNameOf_(tp.topicId, txtp.topic)) { unknownTopic = true; break; }
         partitionScratch_.push_back(std::move(txtp));
+    }
+    if (unknownTopic) [[unlikely]] {
+        const size_t needed = pc::AddPartitionsToTxnResponse::encodedSizeFor(partCount);
+        if (outCap < needed) return answerCannotFit_(buf, len, out, outCap);
+        partResultScratch_.clear();
+        for (size_t i = 0; i < partCount; ++i) {
+            auto tp = msg.partitions[i];
+            partResultScratch_.push_back({tp.topicId, tp.partition,
+                                          static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions)});
+        }
+        pc::AddPartitionsToTxnResponse resp;
+        resp.sessionId     = msg.sessionId;
+        resp.correlationId = msg.correlationId;
+        return resp.encode(out, std::span<const pc::TxnPartitionResult>(partResultScratch_));
     }
 
     const auto result = coordinator_.addPartitions(
@@ -942,25 +959,13 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit_(
     // Build an offset map from the entries, reusing offsetsScratch_ (member map
     // cleared+refilled each call — no per-call map construction alloc).
     // topicNameScratch_ used for "topic_<id>" fallback (no per-entry temp string).
+    // #112 review (same class as AddPartitions): an unknown topic id is refused retriably,
+    // never recorded under a "topic_<id>" placeholder the group would never resolve.
     offsetsScratch_.clear();
     for (const auto& e : msg.entries) {
         rune::coordination::TopicPartition tp;
-        if (topics_) {
-            const auto* spec = topics_->topic(e.topicId);
-            if (spec) {
-                tp.topic = spec->name;
-            } else {
-                char numBuf[32];
-                const int n = std::snprintf(numBuf, sizeof(numBuf), "topic_%d", e.topicId);
-                topicNameScratch_.assign(numBuf, static_cast<size_t>(n > 0 ? n : 0));
-                tp.topic = topicNameScratch_;
-            }
-        } else {
-            char numBuf[32];
-            const int n = std::snprintf(numBuf, sizeof(numBuf), "topic_%d", e.topicId);
-            topicNameScratch_.assign(numBuf, static_cast<size_t>(n > 0 ? n : 0));
-            tp.topic = topicNameScratch_;
-        }
+        if (!topicNameOf_(e.topicId, tp.topic)) [[unlikely]]
+            return answerAll(static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
         tp.partition = e.partition;
         offsetsScratch_[tp] = e.offset;
     }
