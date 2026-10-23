@@ -3,6 +3,8 @@
 // / SessionRevoked on the correlation ids), never silently - and the DDL's OK means "this broker already enforces it".
 #include "support/AuthRig.h"
 
+#include <limits>
+
 #include <rune/node/AdminChannels.h>
 
 #include <functional>
@@ -1113,4 +1115,80 @@ TEST(AuthLiveChangeRegression, ShardWorkerIngressRefusesASpoofedSessionIdRegress
         EXPECT_EQ(leoOf(t, t.r.orders), leo) << "the spoofed produce was appended";
     }
     EXPECT_EQ(shardProduceOnce(t, b, t.r.orders), 0) << "B's own session is untouched";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// PR #604 adversarial review (session spoofing on the worker ingress; input bounds).  The worker finds a session's grant
+// slot by an open-addressed probe on the session id (SessionAckSink: Fibonacci hash, linear probe).  B sends worker-ingress
+// Produce frames naming ids that are NOT a live session but land on a live session's probe slot - an id that hashes to
+// B's own slot, one that hashes to a fully granted bystander's slot - and the edge ids -1, INT64_MIN and INT64_MAX.  Each
+// is refused (never acked OK) and nothing is appended; B and the bystander keep producing under their own ids.
+// RED: let SessionAckSink::find_ match a slot by its hash instead of the full session id (the colliding id inherits the
+// slot's grants and is appended).
+namespace {
+/// SessionAckSink's slot hash (kMaxSessions = 4096: 12 bits), reproduced to build colliding ids.
+std::size_t sinkSlotOf(int64_t sid) { return static_cast<std::size_t>((static_cast<uint64_t>(sid) * 0x9E3779B97F4A7C15ULL) >> (64 - 12)); }
+/// The smallest id above `sid` + 1 that hashes to `sid`'s slot (bounded search).
+int64_t collidingId(int64_t sid) {
+    for (int64_t x = sid + 2; x < sid + (int64_t{1} << 24); ++x)
+        if (sinkSlotOf(x) == sinkSlotOf(sid)) return x;
+    return 0;
+}
+}  // namespace
+
+TEST(AuthLiveChangeAdversarialRegression, AWorkerIngressIdThatCollidesWithALiveSlotIsRefusedAdversarialRegression) {
+    Live t("advspoofhash", shardOptions());
+    const int64_t b = t.r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    const int64_t bystander = t.r.newUser({prefix(SO::Write, ST::Topic, "")});
+    ASSERT_EQ(shardProduceCode(t, b, t.r.orders, 200), 0);
+    ASSERT_EQ(shardProduceCode(t, bystander, t.r.orders, 200), 0);
+    const int64_t onB = collidingId(b), onBystander = collidingId(bystander);
+    ASSERT_NE(onB, 0);
+    ASSERT_NE(onBystander, 0);
+    ASSERT_NE(onB, bystander);
+    ASSERT_NE(onBystander, b);
+    for (const int64_t spoofed : {onB, onBystander, int64_t{-1}, std::numeric_limits<int64_t>::min(),
+                                  std::numeric_limits<int64_t>::max()}) {
+        SCOPED_TRACE("spoofed session id " + std::to_string(spoofed));
+        const int64_t leo = leoOf(t, t.r.orders);
+        EXPECT_NE(shardProduceOnce(t, spoofed, t.r.orders, 2), 0) << "a worker-ingress produce naming a non-session id";
+        EXPECT_EQ(leoOf(t, t.r.orders), leo) << "the spoofed produce was appended";
+    }
+    EXPECT_EQ(shardProduceOnce(t, b, t.r.orders), 0) << "B's own session is untouched";
+    EXPECT_EQ(shardProduceOnce(t, bystander, t.r.orders), 0) << "the bystander's session is untouched";
+}
+
+// PR #604 adversarial review (46 under back-pressure, the sibling session ends): EndedSessionAnswerSurvivesBackPressure
+// covers DISABLE; a DROP USER and a password change that terminates sessions end the session through the same gateway
+// end.  With the worker still pushing a backlog and its op ring held, each one: the DDL's OK is released (no hang), the
+// session-level SessionRevoked (46) arrives exactly once, the live subscription gets exactly one 46 and no Records after
+// it, and the worker owes nothing afterwards.  RED: drop the session-level SessionRevoked frame of ClientGateway's
+// session end.
+TEST(AuthLiveChangeAdversarialRegression, EverySessionEndingChangeUnderAHeldOpRingAnswersExactlyOnceAdversarialRegression) {
+    enum class End { DropUser, PasswordTerminate };
+    for (const End e : {End::DropUser, End::PasswordTerminate}) {
+        SCOPED_TRACE(e == End::DropUser ? "DROP USER" : "ALTER PASSWORD ... TERMINATE");
+        Live t(e == End::DropUser ? "advbp46drop" : "advbp46pw", shardOptions());
+        std::string reader;
+        const int64_t rs = t.r.newUser({exact(SO::Read, ST::Topic, "orders")}, &reader);
+        const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")});
+        ASSERT_EQ(shardProduceCode(t, ws, t.r.orders, 200), 0);
+        backlog(t, ws, t.r.orders, 60, 1000);
+        const auto sub = t.subscribe(rs, t.r.orders);
+        ASSERT_GT(sub.id, 0);
+        holdOpRing(t);
+        const int ok = e == End::DropUser ? t.dropUser(reader)
+                                          : t.alter(reader, pc::UserChangeKind::SetPassword, "a-new-password-98765", /*terminate=*/true);
+        ASSERT_EQ(ok, 0) << "the session-ending change's OK is released (no hang)";
+        EXPECT_EQ(t.errorOn(0, rs), kRevoked) << "the session-level SessionRevoked arrived";
+        EXPECT_TRUE(t.r.awaitSessionGone(rs)) << "the gateway ended the session";
+        t.r.c().pollFor(500ms, [] { return false; });   // anything still owed lands now
+        EXPECT_EQ(errorsWith(t, 0, rs, kRevoked), 1) << "exactly one session-level 46";
+        EXPECT_EQ(errorsWith(t, sub.corr, rs, kRevoked), 1) << "exactly one 46 on the subscription";
+        const uint64_t endSeq = firstErrorSeq(t, sub.corr, rs, kRevoked);
+        ASSERT_GT(endSeq, 0u);
+        EXPECT_EQ(recordsAfter(t, sub.id, endSeq), 0u) << "Records after the subscription's 46";
+        EXPECT_EQ(t.b().node().onWorkerThreadForTest(0, [](Worker& w) { return static_cast<int>(w.subscriptionEndsOwedForTest()); }),
+                  0) << "the worker still owes an end";
+    }
 }
