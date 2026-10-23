@@ -114,7 +114,7 @@ bool decodeWireKey(std::string_view key, PrimType keyType, uint64_t& outKey) noe
 FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
                      VersionDescriptorCache& vdc, ViewTable& table,
                      const rune::storage::LogReadView& view, int64_t bound,
-                     int64_t& cursor) {
+                     int64_t& cursor, const AbortedTxnFilter& aborted) {
     FoldStats stats{};
     const PrimType keyType = resolveKeyType(plan);
     // Resume point: a LogReadView is WHOLE batches, so when the caller's cursor
@@ -140,6 +140,17 @@ FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
         }
         if (r.isControl()) {
             ++stats.skippedControl;
+            pos += static_cast<size_t>(r.totalLength());
+            walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1;
+            continue;
+        }
+        if (aborted.skips(r)) [[unlikely]] {
+            // #537: an aborted transaction's batch is never applied.  Below the
+            // bound it is consumed whole, like a control batch; a batch the
+            // bound cuts (a capped pass) stops the walk exactly as a record
+            // past the bound does — the next pass resumes and skips it again.
+            if (r.baseOffset() + r.lastOffsetDelta() >= bound) { stopped = true; break; }
+            ++stats.skippedAborted;
             pos += static_cast<size_t>(r.totalLength());
             walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1;
             continue;

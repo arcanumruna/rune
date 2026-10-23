@@ -551,7 +551,7 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
                              const AggLayout& agg, VersionDescriptorCache& vdc,
                              ViewTable& view, ViewTable& contributors, ViewTable& groups,
                              ViewTable* blocks, const rune::storage::LogReadView& lv,
-                             int64_t bound, int64_t& cursor) {
+                             int64_t bound, int64_t& cursor, const AbortedTxnFilter& aborted) {
     FoldStats stats{};
     Ctx cx{layout, agg, view, contributors, groups, blocks, stats};
     const int64_t from = cursor;   // records below it were folded by a prior (mid-batch) pass
@@ -565,6 +565,13 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
         if (!r.ensureValid()) { corrupt = true; break; }
         if (r.isControl()) {
             ++stats.skippedControl;
+            pos += static_cast<size_t>(r.totalLength());
+            walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1;
+            continue;
+        }
+        if (aborted.skips(r)) [[unlikely]] {   // #537: never applied (see foldBatch)
+            if (r.baseOffset() + r.lastOffsetDelta() >= bound) { stopped = true; break; }
+            ++stats.skippedAborted;
             pos += static_cast<size_t>(r.totalLength());
             walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1;
             continue;
@@ -663,9 +670,9 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& plan, const RowLayout& layo
                              const AggLayout& agg, VersionDescriptorCache& vdc,
                              ViewTable& view, ViewTable& contributors, ViewTable& groups,
                              const rune::storage::LogReadView& lv, int64_t bound,
-                             int64_t& cursor) {
+                             int64_t& cursor, const AbortedTxnFilter& aborted) {
     return foldAggregateBatch(plan, layout, agg, vdc, view, contributors, groups, nullptr, lv,
-                              bound, cursor);
+                              bound, cursor, aborted);
 }
 
 } // namespace rune::view

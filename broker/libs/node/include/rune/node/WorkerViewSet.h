@@ -129,6 +129,7 @@ struct AggInstance {
 // the owning worker thread via WorkerViewSet::foldCounters().
 struct ViewFoldCounters {
     uint64_t skippedMalformed = 0;   // wire key not exactly the view key width
+    uint64_t skippedAborted   = 0;   // #537: data batches of aborted transactions (never folded)
     uint64_t skippedNoGroup   = 0;   // aggregate: live record with a NULL group-by value
     uint64_t aggOverflow      = 0;   // aggregate: Sum emitted NULL (did not fit its type)
     uint64_t aggNonFinite     = 0;   // aggregate: NaN/+-Inf Float input treated as NULL
@@ -371,7 +372,7 @@ public:
     // the loop is driven under a hard cap by the caller, never `while(!ready)`.
     template <class ReadRangeFn>
     int driveRebuild(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
-                     int64_t committedTail, int64_t nowNs,
+                     int64_t committedTail, const rune::view::AbortedTxnFilter& aborted, int64_t nowNs,
                      const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
                      bool leaderHwConfirmed = true) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
@@ -383,7 +384,7 @@ public:
             if (vit == views_.end()) continue;  // not hosted-for-recovery here
             ViewInstance& inst = vit->second;
             if (inst.readiness == ViewReadiness::Ready) continue;  // already caught up
-            work += driveView_(inst, readRange, committedTail, transientSrc, leaderGen, leaderHwConfirmed);
+            work += driveView_(inst, readRange, committedTail, aborted, transientSrc, leaderGen, leaderHwConfirmed);
             if (inst.foldCursor >= committedTail) {
                 // N-C1: Ready only once the leader's HW reached its leadership start offset; else CatchingUp
                 // (never left RebuildingViews: that state gates elections).
@@ -415,7 +416,7 @@ public:
     // pushed/held this pass (0 == genuinely no work).
     template <class ReadRangeFn>
     int driveFolds(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
-                   int64_t bound, int64_t nowNs,
+                   int64_t bound, const rune::view::AbortedTxnFilter& aborted, int64_t nowNs,
                    const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
                      bool leaderHwConfirmed = true) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
@@ -428,7 +429,7 @@ public:
             // driveRebuild/materializeRecoveryInstancesFor already use.
             ViewInstance* inst = getOrCreate_(viewTopicId, partition, bound);
             if (inst == nullptr) continue;  // defensive: template must exist
-            work += driveView_(*inst, readRange, bound, transientSrc, leaderGen, leaderHwConfirmed);
+            work += driveView_(*inst, readRange, bound, aborted, transientSrc, leaderGen, leaderHwConfirmed);
         }
         return work;
     }
@@ -596,6 +597,7 @@ private:
     // progress count for the instance.
     template <class ReadRangeFn>
     int driveView_(ViewInstance& inst, ReadRangeFn&& readRange, int64_t bound,
+                   const rune::view::AbortedTxnFilter& aborted,
                    const TransientBounds* transientSrc, uint64_t leaderGen, bool leaderHwConfirmed) {
         int work = 0;
         // 0. Phase 2b E: a TRANSIENT source — reconcile THIS instance's cursor
@@ -663,12 +665,13 @@ private:
             inst.agg ? rune::view::foldAggregateBatch(inst.plan, inst.layout, inst.agg->layout,
                                                       inst.vdc, inst.table, inst.agg->contributors,
                                                       inst.agg->groups, inst.agg->blocksOrNull(), view,
-                                                      passBound, cursor)
+                                                      passBound, cursor, aborted)
                      : rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view,
-                                             passBound, cursor);
+                                             passBound, cursor, aborted);
         inst.foldCursor = cursor;
-        work += static_cast<int>(st.applied + st.deleted + st.skippedControl +
+        work += static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted +
                                  st.skippedMalformed + st.skippedNoGroup);
+        inst.counters.skippedAborted   += st.skippedAborted;
         inst.counters.skippedMalformed += st.skippedMalformed;
         inst.counters.skippedNoGroup   += st.skippedNoGroup;
         inst.counters.aggOverflow      += st.aggOverflow;

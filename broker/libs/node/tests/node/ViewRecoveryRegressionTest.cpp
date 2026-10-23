@@ -134,7 +134,7 @@ std::vector<uint8_t> makeBaseCheckpoint(const rune::view::CompiledViewPlan& plan
     rune::view::VersionDescriptorCache vdc(src);
     rune::storage::LogReadView v{srcBatch.data(), srcBatch.size(), 0, foldTo};
     int64_t cursor = 0;
-    rune::view::foldBatch(plan, layout, vdc, tmp, v, foldTo, cursor);
+    rune::view::foldBatch(plan, layout, vdc, tmp, v, foldTo, cursor, rune::view::kNoAbortedTxns);
     std::vector<rune::view::DirtyEntry> entries;
     std::vector<uint8_t> rowScratch;
     std::vector<std::size_t> offs;
@@ -240,7 +240,7 @@ TEST(ViewRecoveryRegression, RecoverFromCheckpointFileThenServe) {
     // Write THIS (view, partition)'s checkpoint file: a single base at O=2.
     const auto base = makeBaseCheckpoint(comp.plan, comp.rowLayout, src, upsertRun(7, 10, 2, 0), 2);
     const std::string path =
-        dir + "/view-" + std::to_string(static_cast<uint32_t>(kViewId)) + "-p0.delta";
+        rune::node::viewCheckpointFilePath(dir, kViewId, 0);
     { std::ofstream f(path, std::ios::binary); f.write(reinterpret_cast<const char*>(base.data()),
                                                        static_cast<std::streamsize>(base.size())); }
 
@@ -272,7 +272,7 @@ TEST(ViewRecoveryRegression, RecoverFromCheckpointFileThenServe) {
     };
     EXPECT_TRUE(vs.hasRecovery()) << "still recovering: the extra duty-cycle work is live";
     for (int i = 0; i < 64 && !vs.allViewsReady(); ++i)
-        vs.driveRebuild(kSrcId, 0, readRange, /*committedTail*/ 4, i);
+        vs.driveRebuild(kSrcId, 0, readRange, /*committedTail*/ 4, rune::view::kNoAbortedTxns, i);
 
     EXPECT_TRUE(vs.allViewsReady());
     EXPECT_EQ(vs.readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
@@ -325,8 +325,8 @@ TEST(ViewRecoveryRegression, DutyCycleOrderingReachesReadyAndServes) {
             EXPECT_EQ(vs.getRow(kViewId, 0, 7, L, &status), nullptr);
             EXPECT_EQ(status, rune::node::WorkerViewSet::RowStatus::NotReady);
         }
-        vs.driveRebuild(kSrcId, 0, readRange, /*committedTail*/ 3, i);
-        vs.driveFolds(kSrcId, 0, readRange, /*bound*/ 3, i);
+        vs.driveRebuild(kSrcId, 0, readRange, /*committedTail*/ 3, rune::view::kNoAbortedTxns, i);
+        vs.driveFolds(kSrcId, 0, readRange, /*bound*/ 3, rune::view::kNoAbortedTxns, i);
         everReady = vs.allViewsReady();
     }
     EXPECT_TRUE(everReady);
@@ -356,9 +356,9 @@ TEST(ViewRecoveryRegression, TwoOwnedPartitionsLazyRecoveryNeverServesHalfBuilt)
     // partition-1 table can never be confused with a correct one.
     const auto base1 = makeBaseCheckpoint(comp.plan, comp.rowLayout, src, upsertRun(20, 100, 2, 0), 2);
     const std::string path0 =
-        dir + "/view-" + std::to_string(static_cast<uint32_t>(kViewId)) + "-p0.delta";
+        rune::node::viewCheckpointFilePath(dir, kViewId, 0);
     const std::string path1 =
-        dir + "/view-" + std::to_string(static_cast<uint32_t>(kViewId)) + "-p1.delta";
+        rune::node::viewCheckpointFilePath(dir, kViewId, 1);
     { std::ofstream f(path0, std::ios::binary); f.write(reinterpret_cast<const char*>(base0.data()),
                                                         static_cast<std::streamsize>(base0.size())); }
     { std::ofstream f(path1, std::ios::binary); f.write(reinterpret_cast<const char*>(base1.data()),
@@ -386,7 +386,7 @@ TEST(ViewRecoveryRegression, TwoOwnedPartitionsLazyRecoveryNeverServesHalfBuilt)
     ASSERT_EQ(vs.instanceCount(), 1u);
     ASSERT_EQ(vs.readiness(kViewId, 0), rune::node::ViewReadiness::RebuildingViews);
     for (int i = 0; i < 64 && vs.readiness(kViewId, 0) != rune::node::ViewReadiness::Ready; ++i)
-        vs.driveRebuild(kSrcId, 0, readRange0, /*committedTail*/ 4, i);
+        vs.driveRebuild(kSrcId, 0, readRange0, /*committedTail*/ 4, rune::view::kNoAbortedTxns, i);
     ASSERT_EQ(vs.readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
 
     // The prune fires: partition 0 is the ONLY hosted instance of this view,
@@ -407,7 +407,7 @@ TEST(ViewRecoveryRegression, TwoOwnedPartitionsLazyRecoveryNeverServesHalfBuilt)
     auto readRange1Partial = [&](int64_t, int64_t) -> rune::storage::LogReadView {
         return rune::storage::LogReadView{tail1a.data(), tail1a.size(), 2, 4};
     };
-    vs.driveFolds(kSrcId, /*partition*/ 1, readRange1Partial, /*bound*/ 6, /*nowNs*/ 0);
+    vs.driveFolds(kSrcId, /*partition*/ 1, readRange1Partial, /*bound*/ 6, rune::view::kNoAbortedTxns, /*nowNs*/ 0);
 
     ASSERT_EQ(vs.instanceCount(), 2u) << "driveFolds must have lazily created partition 1";
     // THE Bug A assertion: partition 1 must have loaded ITS OWN checkpoint and
@@ -434,7 +434,7 @@ TEST(ViewRecoveryRegression, TwoOwnedPartitionsLazyRecoveryNeverServesHalfBuilt)
     auto readRange1Rest = [&](int64_t, int64_t) -> rune::storage::LogReadView {
         return rune::storage::LogReadView{tail1b.data(), tail1b.size(), 4, 6};
     };
-    vs.driveFolds(kSrcId, /*partition*/ 1, readRange1Rest, /*bound*/ 6, /*nowNs*/ 1);
+    vs.driveFolds(kSrcId, /*partition*/ 1, readRange1Rest, /*bound*/ 6, rune::view::kNoAbortedTxns, /*nowNs*/ 1);
 
     EXPECT_EQ(vs.readiness(kViewId, 1), rune::node::ViewReadiness::Ready);
     EXPECT_TRUE(vs.allViewsReady());
@@ -458,6 +458,49 @@ TEST(ViewRecoveryRegression, TwoOwnedPartitionsLazyRecoveryNeverServesHalfBuilt)
     ASSERT_NE(row0, nullptr);
     EXPECT_EQ(status, rune::node::WorkerViewSet::RowStatus::Ok);
     EXPECT_EQ(rune::view::readSlot(row0, *L, 1).i, 31);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// Issue #537: a checkpoint written BEFORE the fold skipped aborted transactions
+// (the legacy "view-<id>-p<n>.delta" file) may hold aborted rows.  Recovery never
+// replays it: it removes it, cold-starts the instance (foldCursor 0) and re-folds
+// the view from the log — rows that live only in the legacy file are gone.
+TEST(ViewRecoveryRegression, LegacyCheckpointIsDiscardedAndTheViewRefoldsFromTheLogRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(0), srcs, kViewId).value();
+    const std::string dir = uniqueDir("rune-view-legacy-");
+    // A legacy checkpoint at O=2 holding key 9 (as if folded from an aborted txn).
+    const auto legacyBase = makeBaseCheckpoint(comp.plan, comp.rowLayout, src, upsertRun(9, 10, 2, 0), 2);
+    const std::string legacy = rune::node::legacyViewCheckpointFilePath(dir, kViewId, 0);
+    { std::ofstream f(legacy, std::ios::binary); f.write(reinterpret_cast<const char*>(legacyBase.data()),
+                                                         static_cast<std::streamsize>(legacyBase.size())); }
+
+    rune::node::ViewSnapshotChannel channel;
+    rune::node::WorkerViewSet vs(channel, dir);
+    pushRecoveryInstall(channel, comp.plan, comp.outputDescriptor, src, /*persistence*/ 0);
+    EXPECT_EQ(vs.drainInstalls(), 1);
+    vs.materializeRecoveryInstancesFor(kSrcId, /*partition*/ 0, /*committedTail*/ 4);
+    EXPECT_FALSE(std::filesystem::exists(legacy)) << "the legacy checkpoint is removed";
+    EXPECT_EQ(vs.readiness(kViewId, 0), rune::node::ViewReadiness::RebuildingViews) << "a cold start";
+
+    const auto log = upsertRun(7, 30, 4, /*baseOffset*/ 0);   // the committed log: key 7 only
+    int64_t firstFrom = -1;
+    auto readRange = [&](int64_t from, int64_t) -> rune::storage::LogReadView {
+        if (firstFrom < 0) firstFrom = from;
+        return rune::storage::LogReadView{log.data(), log.size(), 0, 4};
+    };
+    for (int i = 0; i < 64 && !vs.allViewsReady(); ++i)
+        vs.driveRebuild(kSrcId, 0, readRange, /*committedTail*/ 4, rune::view::kNoAbortedTxns, i);
+    ASSERT_TRUE(vs.allViewsReady());
+    EXPECT_EQ(firstFrom, 0) << "the re-fold starts at the log start";
+    const rune::view::RowLayout* L = nullptr;
+    EXPECT_EQ(vs.getRow(kViewId, 0, 9, L), nullptr) << "a row only the legacy checkpoint held is gone";
+    const uint8_t* row = vs.getRow(kViewId, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 33);
 
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);

@@ -6452,6 +6452,11 @@ private:
             if (rcState == nullptr) continue;         // RC not Ready: fail closed, no bound
             const int64_t liveHw = replica->highWatermark();
             const int64_t bound  = rcState->lso(liveHw);
+            // #537: below the LSO every transaction is decided; the fold skips the
+            // batches of the aborted ones by this partition's aborted index (the
+            // read_committed fetch's own predicate) on every path — steady folds,
+            // restart rebuilds, transient sources, capped passes.
+            const rune::view::AbortedTxnFilter aborted = rcAbortedFilter_(*rcState);
             const int32_t partition = static_cast<int32_t>(replica->partitionId());
             // N-C1: right after an election the HW floor can lag what the old leader had committed; a table is
             // Ready under this leadership only once HW has reached the leadership's start offset.
@@ -6462,7 +6467,7 @@ private:
                 auto readRange = [this, log](int64_t from, int64_t to) -> rune::storage::LogReadView {
                     return readNoFault_(log, from, kPushMaxChunkBytes, to);
                 };
-                work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, nullptr,
+                work += driveViewsOf_(topicId, partition, readRange, bound, aborted, nowNs, nullptr,
                                       replica->leadershipGeneration(), hwConfirmed);
             } else {
                 // Phase 2b E: a TRANSIENT source — zero-copy view into the
@@ -6473,11 +6478,22 @@ private:
                 auto readRange = [mem](int64_t from, int64_t /*to*/) -> rune::storage::LogReadView {
                     return mem->readView(from, kPushMaxChunkBytes);
                 };
-                work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, replica,
+                work += driveViewsOf_(topicId, partition, readRange, bound, aborted, nowNs, replica,
                                       replica->leadershipGeneration(), hwConfirmed);
             }
         }
         return work;
+    }
+
+    // #537: the fold's aborted-transaction predicate over THIS worker's RC state of
+    // the source partition (owner thread; the index is read in place, never copied).
+    [[nodiscard]] static rune::view::AbortedTxnFilter rcAbortedFilter_(const RcState& rc) noexcept {
+        rune::view::AbortedTxnFilter f;
+        f.ctx = &rc.aborted();
+        f.fn  = [](const void* ctx, int64_t pid, int64_t base) noexcept {
+            return static_cast<const rune::transaction::AbortedTxnIndex*>(ctx)->isAborted(pid, base);
+        };
+        return f;
     }
 
     // One owned source partition's view work.  Order matters: materialize a
@@ -6490,7 +6506,7 @@ private:
     // are gated on hasRecovery() — a broker with no durable views runs neither.
     template <class ReadRangeFn>
     int driveViewsOf_(int32_t topicId, int32_t partition, ReadRangeFn& readRange,
-                      int64_t bound, int64_t nowNs,
+                      int64_t bound, const rune::view::AbortedTxnFilter& aborted, int64_t nowNs,
                       const rune::replication::PartitionReplica* transientRep,
                       uint64_t leaderGen, bool leaderHwConfirmed) {
         int work = 0;
@@ -6507,9 +6523,11 @@ private:
         }
         if (viewSet_->hasRecovery()) [[unlikely]] {
             viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
-            work += viewSet_->driveRebuild(topicId, partition, readRange, bound, nowNs, tbp, leaderGen, leaderHwConfirmed);
+            work += viewSet_->driveRebuild(topicId, partition, readRange, bound, aborted, nowNs, tbp, leaderGen,
+                                           leaderHwConfirmed);
         }
-        work += viewSet_->driveFolds(topicId, partition, readRange, bound, nowNs, tbp, leaderGen, leaderHwConfirmed);
+        work += viewSet_->driveFolds(topicId, partition, readRange, bound, aborted, nowNs, tbp, leaderGen,
+                                     leaderHwConfirmed);
         return work;
     }
 

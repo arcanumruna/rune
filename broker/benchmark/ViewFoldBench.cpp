@@ -518,7 +518,7 @@ struct AggRig {
         auto lv = s.view(i);
         int64_t cur = 0;
         const auto fs = foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view, contributors,
-                                           groups, blocks ? &*blocks : nullptr, lv, s.bound(i), cur);
+                                           groups, blocks ? &*blocks : nullptr, lv, s.bound(i), cur, rune::view::kNoAbortedTxns);
         rescans += fs.aggRescans;
         return fs;
     }
@@ -564,7 +564,7 @@ static void BM_ViewFoldReplace(benchmark::State& st) {
         auto foldOne = [&](size_t i) {
             auto lv = stream.view(i);
             int64_t cur = 0;
-            return foldBatch(comp.plan, comp.rowLayout, vdc, table, lv, stream.bound(i), cur);
+            return foldBatch(comp.plan, comp.rowLayout, vdc, table, lv, stream.bound(i), cur, rune::view::kNoAbortedTxns);
         };
         // Replace: one drain right before the alloc probe (unchanged from Task 11).
         auto drainAll = [&] { table.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t) {}); };
@@ -738,7 +738,7 @@ static void BM_ViewFoldExtremeRetract(benchmark::State& st) {
             auto lv = s.view(i);
             int64_t cur = 0;
             return foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view, contributors,
-                                      groups, &blocks, lv, s.bound(i), cur);
+                                      groups, &blocks, lv, s.bound(i), cur, rune::view::kNoAbortedTxns);
         };
 
         // Prime (NOT timed): contributors 1..N, amount = id -> max = N.
