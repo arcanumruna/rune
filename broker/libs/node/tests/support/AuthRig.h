@@ -101,6 +101,7 @@ public:
         if (sid <= 0) throw std::runtime_error("AuthRig: connect failed");
         const auto l = w_->login(ch(), sid, user, {pw, pw});
         if (!l.ok()) throw std::runtime_error("AuthRig: login failed for " + user);
+        b_.noteLoginOk();
         return sid;
     }
     /// A new user with exactly `g`; returns its logged-in session.  `name` (optional) receives the user name.

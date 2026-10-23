@@ -124,6 +124,30 @@ TEST(AuthMatrixRigRegression, KeepaliveDoesNotTakeCorrelationIdsFromRequestsRegr
     EXPECT_EQ(r.c().lastCorrelationId(), before) << "a Keepalive consumed a request correlation id";
 }
 
+// #4: a Cell's baseline of the logins counters was a racy read of the CnC counter (published asynchronously by the control
+// thread), taken while the rig's own setup logins were still unpublished: 1-2 low under load, then "logins ok counter is 5,
+// expected 4".  The baseline is now the rig's own tally (admin, builder, the writer's user, the writer = 4 setup logins),
+// after waiting for the counters to catch up.  The end-to-end check that this holds under load is the
+// `ctest -R AuthMatrix -j6` run (the old racy read failed 8-9 of 722 cells there); a delay injection is not deterministic.
+TEST(AuthMatrixRigRegression, CellBaselineIsTheRigTallyNotARacyReadRegression) {
+    AuthMatrixRig rig;
+    EXPECT_EQ(rig.issuedOk(), 4);
+    EXPECT_EQ(rig.issuedFailed(), 0);
+    EXPECT_EQ(rig.issuedRevoked(), 0);
+    auto cell = rig.newCell();
+    EXPECT_EQ(cell.okAtStart(), 4);
+    EXPECT_EQ(cell.failedAtStart(), 0);
+    EXPECT_EQ(cell.revokedAtStart(), 0);
+    cell.grantFor(AuthMatrixRig::Op::Produce, AuthMatrixRig::Grant::None);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    cell.login();
+    EXPECT_EQ(cell.countersProblem(false), "");
+    EXPECT_EQ(rig.issuedOk(), 5);
+    cell.close();
+    auto next = rig.newCell();   // the next cell's baseline includes that login, whatever the publish timing was
+    EXPECT_EQ(next.okAtStart(), 5);
+}
+
 TEST(AuthMatrixCountRegression, CellCountsArePinned) {
     int total = 0, na[7] = {}, outcome[8] = {};
     for (const Cell& c : allCells()) {

@@ -16,6 +16,9 @@
 #include <rune/protocol/RecordBatch.h>
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
+#include <tuple>
 #include <memory>
 #include <string>
 #include <vector>
@@ -54,7 +57,15 @@ public:
         // The writer that makes records flow into the topic a subscription watches (assertion 4).
         (void)rig_.newUser({grants::prefix(SO::Write, ST::Topic, "")}, &writerName_);
         writerSid_ = rig_.login(writerName_);
+        // The exact number of logins this broker has accepted so far (admin, builder, the writer's user, the writer):
+        // counted by the rig, never read from the asynchronously published CnC counter (issue #4).
+        issuedOk_ = rig_.broker().loginsOkDone();
     }
+    /// Cumulative logins the rig knows succeeded / failed / revoked sessions on this broker (the Cells' baselines).
+    int64_t issuedOk() const noexcept { return issuedOk_; }
+    int64_t issuedFailed() const noexcept { return issuedFailed_; }
+    int64_t issuedRevoked() const noexcept { return issuedRevoked_; }
+    void noteLogin(bool ok) noexcept { ++(ok ? issuedOk_ : issuedFailed_); }
     AuthRig& rig() noexcept { return rig_; }
     int64_t writerSession() const noexcept { return writerSid_; }
 
@@ -67,6 +78,7 @@ private:
     int ordinal_ = 0;
     std::string writerName_;
     int64_t writerSid_ = 0;
+    int64_t issuedOk_ = 0, issuedFailed_ = 0, issuedRevoked_ = 0;
     // The catalog / security events read so far (a cursor each: a cell reads only what is new, never the whole log).
     std::vector<rune::catalog::CatalogEvent> catalogEvents_;
     std::vector<rune::security::SecurityEvent> securityEvents_;
@@ -79,10 +91,25 @@ public:
         prefix_ = "c" + std::to_string(ord_) + ".";
         user_ = "u" + std::to_string(1000 + ord_);
         role_ = "r" + std::to_string(ord_);
-        okAtStart_ = counterNow(kLoginsOkCounterTypeId);
-        failedAtStart_ = counterNow(kLoginsFailedCounterTypeId);
-        revokedAtStart_ = counterNow(kSessionsRevokedCounterTypeId);
+        // The CnC counters are published asynchronously (BrokerNode::publishSecurityMetrics_): wait until they have
+        // caught up with every login the rig knows it made, then take the baseline FROM THE TALLY, not from the
+        // counter, so a stray extra login still fails assertion 5 (issue #4).
+        for (const auto& c : {std::make_tuple(kLoginsOkCounterTypeId, m.issuedOk_, "logins ok"),
+                              std::make_tuple(kLoginsFailedCounterTypeId, m.issuedFailed_, "logins failed"),
+                              std::make_tuple(kSessionsRevokedCounterTypeId, m.issuedRevoked_, "sessions revoked")}) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (counterNow(std::get<0>(c)) < std::get<1>(c) && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            if (counterNow(std::get<0>(c)) < std::get<1>(c))
+                ADD_FAILURE() << std::get<2>(c) << " counter is " << counterNow(std::get<0>(c)) << ", expected at least " << std::get<1>(c);
+        }
+        okAtStart_ = m.issuedOk_;
+        failedAtStart_ = m.issuedFailed_;
+        revokedAtStart_ = m.issuedRevoked_;
     }
+    int64_t okAtStart() const noexcept { return okAtStart_; }
+    int64_t failedAtStart() const noexcept { return failedAtStart_; }
+    int64_t revokedAtStart() const noexcept { return revokedAtStart_; }
     const std::string& userName() const noexcept { return user_; }
     int64_t session() const noexcept { return sid_; }
 
@@ -205,6 +232,7 @@ public:
         const auto a = r_.broker().admin().alterPassword(r_.ch(), r_.broker().adminSession(), user_,
                                                         rune::protocol::client::UserChangeKind::Disable);
         ASSERT_EQ(a.errorCode, 0) << a.detail;
+        ++m_.issuedRevoked_;
     }
 
     // ── sessions ────────────────────────────────────────────────────────────────────────────────────────────
@@ -216,13 +244,14 @@ public:
         sid_ = twinSid_ = 0;
         r_.c().clearObserved();
     }
-    void login() { sid_ = r_.login(user_); ++loginsOk_; }
+    void login() { sid_ = r_.login(user_); ++loginsOk_; m_.noteLogin(true); }
     /// A reconnect attempt of the (disabled) user: the AuthServerFinal error code.
     int relogin() {
         const int64_t s = r_.wire().connect(r_.ch());
         if (s <= 0) return kNoAnswer;
         const int code = r_.wire().login(r_.ch(), s, user_, {AuthRig::kPw, AuthRig::kPw}).errorCode();
         if (code == 0) ++loginsOk_; else ++loginsFailed_;
+        m_.noteLogin(code == 0);
         return code;
     }
     /// The session-level frame (corr 0) code after a disable, bounded.
@@ -423,6 +452,7 @@ public:
             if (op == Op::TxnProduce && denied.stage >= 1) grantTo(n, false, SO::Write, ST::TransactionalId, SP::Exact, x());
             twinSid_ = r_.login(n);
             ++loginsOk_;
+            m_.noteLogin(true);
             twinCreated_ = true;
         }
         const Answer twin = issueAs(twinSid_, op, /*missing=*/false, twinTxn_);
