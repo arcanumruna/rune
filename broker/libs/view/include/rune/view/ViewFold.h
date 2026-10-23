@@ -63,11 +63,13 @@ struct AbortedTxnFilter {
     Fn          fn  = nullptr;
     const void* ctx = nullptr;
 
-    // True when `r` is a data batch of an aborted transaction.
-    [[nodiscard]] bool skips(const rune::protocol::RecordBatchReader& r) const noexcept {
-        if ((r.attributes() & rune::protocol::batch::kAttrTransactional) == 0) [[likely]] return false;
+    // True when `r` (attributes `attrs`, already read by the caller) is a data
+    // batch of an aborted transaction.  Callers copy the filter by value into
+    // the walk (two words): no reload through a reference the table writes may alias.
+    [[nodiscard]] bool skips(const rune::protocol::RecordBatchReader& r, int16_t attrs) const noexcept {
+        if ((attrs & rune::protocol::batch::kAttrTransactional) == 0 || fn == nullptr) [[likely]] return false;
         const int64_t pid = r.producerId();
-        return pid >= 0 && fn != nullptr && fn(ctx, pid, r.baseOffset());
+        return pid >= 0 && fn(ctx, pid, r.baseOffset());
     }
 };
 inline constexpr AbortedTxnFilter kNoAbortedTxns{};

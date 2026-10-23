@@ -120,6 +120,7 @@ FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
     // Resume point: a LogReadView is WHOLE batches, so when the caller's cursor
     // sits mid-batch (a capped pass stopped there) the batch's records below it
     // were already folded and must not be re-applied.
+    const AbortedTxnFilter abortedTxns = aborted;   // #537: by value (see AbortedTxnFilter::skips)
     const int64_t from = cursor;
     bool stopped = false;
     bool corrupt = false;
@@ -138,13 +139,14 @@ FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
             corrupt = true; // torn/corrupt tail: stop, do not advance past it
             break;
         }
-        if (r.isControl()) {
+        const int16_t attrs = r.attributes();
+        if ((attrs & rune::protocol::batch::kAttrControl) != 0) {
             ++stats.skippedControl;
             pos += static_cast<size_t>(r.totalLength());
             walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1;
             continue;
         }
-        if (aborted.skips(r)) [[unlikely]] {
+        if (abortedTxns.skips(r, attrs)) [[unlikely]] {
             // #537: an aborted transaction's batch is never applied.  Below the
             // bound it is consumed whole, like a control batch; a batch the
             // bound cuts (a capped pass) stops the walk exactly as a record
