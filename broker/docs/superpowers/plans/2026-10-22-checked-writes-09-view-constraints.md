@@ -12,14 +12,14 @@
 
 **Tech Stack:** C++23, GoogleTest (`TEST_P` matrices, seeded model checks), Google Benchmark (`build/rel/broker/rune_broker_benchmark`), CMake/Ninja, real Aeron for the worker rig, real in-process `BrokerNode`s (`OneBroker`, `ThreeNodes`), docker on the shared VM.
 
-**Spec:** `broker/docs/superpowers/specs/2026-10-22-rune-checked-writes-and-view-constraints-design.md` — §8.2, §8.3, §8.7 (the wiring; Part 04 owns the mechanism), the §1 target block, §11.2 (requirements per write), §13 (`uniqueConflicts`) and the §15 cells the overview gives Part 09. The binding cross-part contract is `broker/docs/superpowers/plans/2026-10-22-checked-writes-00-overview.md` (C6, C9, C10, C12, C14, C15, C16, SD5, SD9). This part consumes the Interfaces and "Contract additions" of plans 01–08 (`2026-10-22-checked-writes-0{1..8}-*.md`) and the controller rulings restated below. Executors read the spec sections, the overview, plans 04, 05, 07 and 08, and this file.
+**Spec:** `broker/docs/superpowers/specs/2026-10-22-rune-checked-writes-and-view-constraints-design.md` — §8.2, §8.3, §8.7 (the wiring; Part 04 owns the mechanism), the §1 target block, §11.2 (requirements per write), §13 (`uniqueConflicts`) and the §15 cells the overview gives Part 09. The binding cross-part contract is `broker/docs/superpowers/plans/2026-10-22-checked-writes-00-overview.md` (C6, C9, C10, C12, C14, C15, C16, SD5, SD9). This part consumes the Interfaces and "Contract additions" of plans 01–08 and 10 (`2026-10-22-checked-writes-{01..08,10}-*.md`) and the controller rulings restated below. Dependency order (R-ORD): 08 → 09, and 10 → 09, because this part's transient-source tests assume Part 10 lifted code 37. Executors read the spec sections, the overview, plans 04, 05, 07 and 08, and this file.
 
 ---
 
 ## Execution context
 
 - **Repo and paths.** Every path is relative to the monorepo root, and every command runs from it.
-- **Branch.** `feature/checked-writes-09-view-constraints`, cut from the latest `main` (`git fetch` first) **after Part 08 has merged** (and with it 01–07). Merge `main` in again before review.
+- **Branch.** `feature/checked-writes-09-view-constraints`, cut from the latest `main` (`git fetch` first) **after Parts 08 and 10 have merged** (and with them 01–07). Merge `main` in again before review.
 - **Preconditions** (run before Task 1; each must match, else stop and tell the controller):
   - `grep -n "Unique = 2" broker/libs/view/include/rune/view/Verdict.h` (1 hit, Part 04)
   - `grep -n "kKeyIndexPlanFingerprint" broker/libs/node/include/rune/node/VerdictSource.h` (1 hit, Part 05)
@@ -28,7 +28,8 @@
   - `grep -n "kKeyedTableGroupIds = 5" broker/libs/view/include/rune/view/ViewCheckpoint.h` (1 hit, Part 07)
   - `grep -n "unique views are not available yet\|check constraints are not available yet" broker/libs/node/src/AdminWorker.cpp` (2 hits, Part 07 P7-9)
   - `grep -n "collectViewPartitionStats" broker/libs/node/include/rune/node/StatsCollect.h` (1 hit, Part 08)
-  - `grep -rln "BeforePart09" broker/libs/node/tests` (≥ 2 files, Part 08 P8-1)
+  - `grep -rln "BeforePart09" broker/libs/node/tests` (2 files, Part 08 P8-1 / R08e: `tests/node/CheckedWritesQlCompileTest.cpp` and `tests/client/CheckedWritesQlBrokerRegressionTest.cpp`), and `grep -n "UniqueViewIsRefusedBeforePart09" broker/libs/node/tests/node/CheckedWritesQlCompileTest.cpp` (1 hit)
+  - `grep -c "return Rejected(reject(kViewSourceTransient));" broker/libs/node/src/AdminWorker.cpp` (0: Part 10 lifted the 37 refusal of a persisted view over a transient source; R-ORD)
   - `test -f ql/tests/golden/regressorspath.rql` (Part 08)
   - `grep -n "Constraint" broker/libs/node/include/rune/node/TopicFeatureRules.h` (≥ 1 hit, Part 02)
 - **Builds.** Already configured; a missing one means stop and tell the controller.
@@ -68,7 +69,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 - The `autoincrement` side window holds **32** batches = `kIdempotentMaxInFlightBatches` (`Protocol.h:16`).
 - Partition `p` assigns `n·P + p` for n = 1, 2, …. Id 0 is never assigned.
 - Index slot **13 bytes** (`tag u8 | word u64 | rid u32`). Plan key functions: 0 none, 1 `lower`, 2 reserved `casefold`.
-- `lower(string(N))` width = the largest lowered width at the pinned Unicode version (⌈3N/2⌉ at Unicode 15/16).
+- `lower(string(N))` width = the largest lowered width at the pinned Unicode version: ⌊3N/2⌋ at Unicode 16.0.0, packed 0x00100000 (R07a).
 - Wire `acks` byte: bit 0 = `All`, bit 1 = `View`. Other bits are refused with `InvalidRequest`.
 - Intent bits: record `attributes` bits 0–1. 0 = upsert/delete, 1 = insert, 2 = update/delete-existing. 3 and the other bits are refused with `InvalidRequest`.
 - `partitions` defaults to 1. Strings are UTF-8, and `lower()` is Unicode simple lowercasing.
@@ -95,6 +96,8 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 ## Rulings this part depends on (restated; binding)
 
 - **R04a — Two-phase drop.** A dropping verdict view's plan stays installed, and keeps judging, on every replica until W passes the drop's `ConstraintSetChange` record. Only then is it uninstalled. This part owns the test: a failover during the drop finishes the drop and nothing waits forever (P9-7, P9-8, Task 6).
+- **R04b / R09b.** Followers hold no verdict state between leaderships: the RcState leadership scan rebuilds it from the log (R04b). A dropped or replaced plan is uninstalled once W passes its change record (R09b, amending 04 P4-6). Unique claims use their own checkpoint v3 tables 6 and 7.
+- **R-X3.** Part 07's checkpoint v3 accepts any table id below the record's table count and pins 8 tables, so tables 6 and 7 need no change to 07's format.
 - **R04e / R04g — Duplicate verdict replay.** An in-window `View` retry on a verdict source replays the original verdicts once `W > lastOffset` (Part 04). This part adds the constraint names to that replay: the replayed `constraintId`s resolve through `Client::constraintName` to the original `(view, constraint)`, also after the view was replaced or dropped (P9-11). Outside the window: `DuplicateSequence` (21) → `OpStatus::VerdictUnknown` (14), or `StoredIdUnknown` (13) for a key-0 batch (06 P6-10).
 - **R08e.** Part 08 parses and authors `unique` / `check`. The refusal lines in the AdminWorker (58 "unique views are not available yet", 57 "check constraints are not available yet", 07 P7-9) are deleted here, and every `…BeforePart09…` test is inverted and renamed (Tasks 3, 10).
 - **R08c / P8-5.** `PredicateNode::constBytes` holds the constant in the compared column's row-slot encoding, zero-padded to 16 B. The evaluator decodes it with `rune::view::decodeSlotValue` (`broker/libs/view/include/rune/view/ViewRow.h:41`) at the column's slot width.
@@ -130,7 +133,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
   - **Create.** A new verdict template joins the desired set at once: `requestChange` appends the change at A, the member builds unjudged below `A + 1`, and delivery above A waits until it has caught up (§8.7 create; 04's mechanism).
   - **Replace** (`create or replace` = `AlterView`: the old sink is uninstalled, a new template with the same `viewObjectId` and a new fingerprint is installed). The new template is a **candidate**: `VerdictSource::addCandidate` replays it unjudged, skipping rejected offsets (`FoldSkip.rejected`), bounded by `judgedThrough()`. The desired set keeps the logged member of that `viewObjectId` (the old fingerprint, kept installed as retiring) until `candidateCaughtUp` holds; then, in the same worker step, `requestChange` names the candidate, which appends the change at S. The old member judges every offset below S, the new one every offset above it, and the candidate follows the judge from `judgedThrough()` to `S + 1` as a joining member. There is never a gap and no long pause (§8.7 replace).
   - **Drop.** The desired set loses the member at once; the change lands at D; judging by it stops above D (§8.7 drop). Drop followed by create leaves the gap `(D, A')` (documented).
-- **P9-6 — When a retiring plan is uninstalled (R04a, phase 2).** A template marked retiring (04: by `uninstallView` of a verdict template) or installed from a retained plan (P9-8) is erased, with its instances, only when for every partition of its source that this worker owns as Ready leader, `state.rejected.watermark()` (W) is above the member's leave offset `L = constraintSets.leaveOffsetOf(member)`, **and** this worker owns no partition of the source as follower. A follower keeps it (it may lead next). This replaces 04's "dropped once the judge has passed its leave offset" (deviation recorded in Task 6's commit body).
+- **P9-6 — When a retiring plan is uninstalled (R04a, phase 2; R09b).** A template marked retiring (04: by `uninstallView` of a verdict template) or installed from a retained plan (P9-8) is erased, with its instances, once for every partition of its source that this worker owns as Ready leader, `state.rejected.watermark()` (W) is above the member's leave offset `L = constraintSets.leaveOffsetOf(member)`. Partitions this worker owns as follower do not hold it: followers hold no verdict state between leaderships (R04b). If this worker later leads such a partition while W < L, its RcState leadership scan feeds the type-20 record into `retainedPlans`, and P9-8 reinstalls the plan when the judge waits for it. This is 04's P4-6 as amended by R09b ("once W passes its change record").
 - **P9-7 — Why phase 2 is durable.** A replica that restarts after the `DropView` (or the `AlterView`) applied has no catalog plan for the leaving member, and one whose catalog lags never had it. If such a replica leads while `W < L`, it must still judge `[K, L)` with that plan. P9-8 gives it the plan from its own log: every leader that judges a record under a member has, below that record, the member's join change record, and the plan record just below that.
 - **P9-8 — The `kVerdictPlan` control record (type 20).**
   - **Payload** (after C10's `[version u8 = 1]`): `[viewObjectId u64][planFingerprint u64][kind u8][planLen u32][plan bytes][outLen u32][output descriptor bytes][srcLen u32][source descriptor bytes]`, all LE. The plan bytes are the catalog's `compiledPlanBlob`, the output descriptor the `outputDescriptorBlob`, the source descriptor the view's evolving source descriptor (`srcDescBlob` of the install message). Batch form, CRC and `producerId −1` exactly as C10.
@@ -144,12 +147,12 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
   2. `constrainedViewRefusal(viewObjectId, constraints.size(), membersAfter, planRecordBytes)` → `ViewConstraintInvalid` (57) with its message:
      - `viewObjectId >= 65536` or `constraints.size() > 65535` → "constraint ids exhausted" (SD5);
      - `membersAfter > kMaxVerdictViewsPerSource` (32), where `membersAfter` = 1 (this view) + 1 if the source has `keyFeatures.keyIndex` + every other live view in `s.views()` over the same source whose compiled plan is unique or constrained → "a topic feeds at most 32 verdict views (the key index counts as one)";
-     - `planRecordBytes = verdictPlanPayloadBytes(compiled, output, source) > kMaxVerdictPlanBytes` → "a constrained view's plan must encode in at most 65536 bytes".
+     - `planRecordBytes = verdictPlanPayloadBytes(compiledPlanBlob.size(), outputDescriptorBlob.size(), sourceDescriptorBlob.size()) > kMaxVerdictPlanBytes`, the three blob sizes of the view being defined → "a constrained view's plan must encode in at most 65536 bytes".
   - The two P7-9 lines are deleted. A transient **view** with constraints over a persisted source is allowed (it is rebuilt from the log on restart; Part 04's checkpoint gate concerns persisted members only).
 - **P9-10 — `uniqueConflicts`** is a gauge: the instance's current number of extra claimants, set after every fold pass and after a checkpoint replay. Stat 32 is present iff the view is unique and owner-mapped. `uniquePromotions` (cumulative) is logged and kept in `ViewFoldCounters`, not a stat.
 - **P9-11 — The replay's constraint names.** The broker side is Part 04's (the index stores each rejection's `constraintId`). A rejected record's completion carries its offset in `value` (= base offset + `recordIndex`), so `WriteResult::offset()` of a 51 is the rejected record's own offset: the loser of a race passes it as `minOffset` and its read finds the winner (§9 "Reading the record that caused a conflict"). If Part 04 already fills `value` there, this is a test only.
 - **P9-12 — `Client::constraintName`.** `constraintId 0` (the key index) → `nullopt`. Else `objectId = id >> 16`, `ordinal = id & 0xFFFF`. The resolver looks in the catalog state first (`viewByObjectId`, the `normalizedPlanBlob` decoded with `deserializeAuthored`): ordinal 0 needs `unique` and names the constraint `"unique"`; ordinal k ≤ `constraints.size()` names `constraints[k − 1].name`. If that fails, it walks the cached events newest first for the latest `CreateView` / `AlterView` of that object id whose plan has the ordinal (the view name is the event's `objectName`): a dropped or replaced view still resolves. A miss refreshes the Client's `CatalogReader` once (bounded by `kConstraintNameRefreshTimeout`, 5 s) and retries; then `nullopt`. Owner thread only, like every catalog read (`Client.h:968-997`).
-- **P9-13 — Nothing new on the write path.** No hook rule is added. A constrained source is already "constrained" for 03's rule 7 and 06's `KeyZeroCreateNeedsView` through 04's `isConstrainedSource()`, which counts `Unique` and `Check` members.
+- **P9-13 — Nothing new on the write path.** No hook rule is added. A constrained source is already "constrained" for 03's rule 7 and 03's `KeyZeroCreateNeedsView` (C8 rule 8) through 04's `isConstrainedSource()`, which counts `Unique` and `Check` members.
 
 ## Contract additions (none redefines a contract type)
 
@@ -188,8 +191,8 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
    - `index`: a `ViewTable` keyed by N (K bytes) with payload `[ownerWire W][extraCount u32][headExtra W][flags u8]`.
    - `extras`: a `ViewTable` keyed by the wire key (W bytes) with payload `[N K][prev W][next W][links u8 (bit0 prev, bit1 next)][image rowLen]`, a doubly linked list per N (O(1) insert and erase; `smallestExtra` walks the list: the O(extras of N) rescan of §8.3).
    - `ProjectionFold` (04/07) appends `UniqueClaims* claims = nullptr;`. `FoldStats` appends `uint64_t uniquePromotions = 0;`. `ViewFoldCounters` appends `uint64_t uniqueConflicts = 0; uint64_t uniquePromotions = 0;`. `ViewInstance` appends `std::optional<rune::view::UniqueClaims> claims;`.
-4. **`ViewCheckpoint.h` (07's v3)** appends table ids `kKeyedTableUniqueIndex = 6`, `kKeyedTableUniqueExtras = 7`.
-5. **`Verdict.h` (04)** appends `[[nodiscard]] std::optional<VerdictViewKind> verdictKindOf(const CompiledViewPlan&) noexcept;` and `[[nodiscard]] uint64_t verdictPlanFingerprint(std::span<const uint8_t> compiledPlanBlob) noexcept;`. `VerdictViewKind::Unique` means "a unique view, with or without checks"; `::Check` "a non-unique view with checks".
+4. **`ViewCheckpoint.h` (07's v3)** appends table ids `kKeyedTableUniqueIndex = 6`, `kKeyedTableUniqueExtras = 7`. 07's `applyKeyedDelta` accepts any id below the table count (R-X3, pinned by 07's 8-table test), so only the ids are new.
+5. **`Verdict.h` (04)** appends, in Task 3 (whose DDL rule is its first caller), `[[nodiscard]] std::optional<VerdictViewKind> verdictKindOf(const CompiledViewPlan&) noexcept;` and `[[nodiscard]] uint64_t verdictPlanFingerprint(std::span<const uint8_t> compiledPlanBlob) noexcept;`. `VerdictViewKind::Unique` means "a unique view, with or without checks"; `::Check` "a non-unique view with checks".
 6. **`VerdictSource.h` (04)** appends:
    ```cpp
    struct ConstraintFold { const rune::view::CompiledViewPlan& plan; const rune::view::RowLayout& layout;
@@ -238,6 +241,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 - **A move out of an over-limit group is rejected** (P9-4, the literal owner-confirmed rule). A reasonable reader might expect it to pass, since it shrinks the group.
 - **NULL in a check is Unknown and passes** (P9-4). The spec is silent.
 - **R04a needs a durable plan.** The catalog forgets a dropped or replaced plan at once, so a restarted replica would wait forever. This part adds control record type 20 (`kVerdictPlan`, P9-8), always kept by the cleaner. GC of type-20 records is a follow-up issue.
+- **§15 "before Part G, an atomic batch on a constrained source is refused".** No atomic-batch header bit exists before Part 11 defines it (R05b), so this part tests only the transactional half (`ConstrainedSourceRefusesTransactions`). The atomic half is a Part 11 cell.
 - **`Client::constraintName` may block** for one catalog refresh (≤ 5 s) on a miss (P9-12). C15 gives it no timeout parameter, so a second overload takes one.
 - **`VerdictSourceStats::perConstraint`** (04) holds 256 entries per source. A source with more distinct constraint ids keeps the first 256 and counts the rest only in `rejectionsConstraint`. That is 04's bound, noted here, unchanged.
 
@@ -342,7 +346,7 @@ Applicable op × entity pairs: `CCreate` 7, `CUpdateNonKey` 5, `CRename` 11, `CM
 | `create or replace` while writes are running | `CheckedWritesConstraintWorker.ReplaceSwapsAtSWithoutAGap` (5), matrix `ReplaceDuringWrites` |
 | drop while writes are running | `CheckedWritesConstraintWorker.DropStopsJudgingAboveD` (5), `CheckedWritesConstraintChangeRegression.FailoverDuringDropFinishesTheDropRegression` (6), matrix `DropDuringWrites` |
 | two writers racing for the last slot or the same name | matrix `Racing`; `TheWholeScenarioThreeNodesRegression` step 6 (10) |
-| before Part G, a transactional and an atomic batch on a constrained source are refused | `CheckedWritesConstraintWorker.ConstrainedSourceRefusesTransactions` (5) |
+| before Part G, a transactional and an atomic batch on a constrained source are refused | transactional half: `CheckedWritesConstraintWorker.ConstrainedSourceRefusesTransactions` (5). The atomic half is a Part 11 cell: the atomic-batch bit doesn't exist before Part 11 (R05b) |
 | a create rejected at fold: its id is burned | `TheWholeScenarioThreeNodesRegression` step 6 (10) |
 
 ### C. The model check (`CheckedWritesModelRegression.SeededConstraintsMatchTheModel`, `rune_checked_writes_matrix_tests`, Task 9)
@@ -500,12 +504,14 @@ The `REGRESSORSPATH` leg of `broker/docker/checked-writes-e2e.sh`: the golden sc
 **Files:**
 - Create: `broker/libs/node/include/rune/node/ConstraintDdlRules.h`, `broker/libs/node/tests/node/CheckedWritesConstraintDdlTest.cpp` (in `rune_checked_writes_tests`, driving `CatalogDdlRig` with `becomeServingLeader()` as 02's `CheckedWritesDdlTest.cpp` does)
 - Modify: `broker/libs/node/src/AdminWorker.cpp` (`viewDef_`, `:1211-1265` before 07: delete 07's step-3 pair; add P9-9 after 07's partition rule), `broker/libs/node/tests/node/CheckedWritesAdminViewDdlTest.cpp` (07), `broker/libs/node/tests/node/CheckedWritesQlCompileTest.cpp` (08's QM2), `broker/libs/node/CMakeLists.txt`
+- Modify: `broker/libs/view/include/rune/view/Verdict.h` (contract addition 5: `verdictKindOf`, `verdictPlanFingerprint`; Step 3 uses `verdictKindOf`, and Task 4 consumes both)
 
 **Interfaces:**
 - Consumes: `featureRefusal`, `topicShapeOf`, `DbFeature::Constraint` (02); `kMaxVerdictViewsPerSource` (04); `verdictPlanPayloadBytes`, `kMaxVerdictPlanBytes` (Task 6 defines them in `ControlRecordLayout.h`; this task adds the two declarations and their trivial bodies there first); `s.views()` (`codec/include/rune/catalog/CatalogState.h:122`).
-- Produces: contract addition 10, P9-9, and every constrained view's compiled plan carrying its `viewObjectId` (07 already sets it).
+- Produces: contract additions 5 and 10, P9-1's two functions, P9-9, and every constrained view's compiled plan carrying its `viewObjectId` (07 already sets it).
 
 - [ ] **Step 1: Write the failing tests.**
+  - `CheckedWritesConstraintDdl.VerdictKindAndFingerprintOfAPlan` (P9-1): a compiled plan with `unique` → `Unique`; one with only constraints → `Check`; a plain one → nullopt; `verdictPlanFingerprint` of a blob equals FNV-1a 64 over its bytes (offset basis `0xcbf29ce484222325`, prime `0x100000001b3`; `verdictPlanFingerprint({}) == 0xcbf29ce484222325`), and two blobs differing in one byte differ.
   - `CheckedWritesConstraintDdl.ConstrainedViewRefusalBoundaries` (pure, `constrainedViewRefusal`): `(65535, 1, 2, 100)` → nullopt; `(65536, 1, 2, 100)` → "constraint ids exhausted"; `(7, 65535, 2, 100)` → nullopt; `(7, 65536, 2, 100)` → "constraint ids exhausted"; `(7, 1, 32, 100)` → nullopt; `(7, 1, 33, 100)` → "a topic feeds at most 32 verdict views (the key index counts as one)"; `(7, 1, 2, 65536)` → nullopt; `(7, 1, 2, 65537)` → "a constrained view's plan must encode in at most 65536 bytes".
   - `CheckedWritesConstraintDdl.RegressorsPathViewsAreCreated`: the golden script's topics and views, authored with `ql::applyViewPlan` (08) and submitted in order → every code 0; `character_name`'s compiled plan has `unique` and `viewObjectId ==` its event's `objectId`; `account_stats` has `constraints[0] == {ordinal 1, "max_characters"}`.
   - `CheckedWritesConstraintDdl.TransientSourceIsRefused` (R10a): a transient typed keyed topic `t` → `create unique view u key lower(name) as k as select id from t` → 39 "constraints need a persisted topic"; a check view over `t` → the same; a plain view over `t` → 0 (Part 10).
@@ -516,7 +522,7 @@ The `REGRESSORSPATH` leg of `broker/docker/checked-writes-e2e.sh`: the golden sc
   - `CheckedWritesConstraintDdl.BelowTheLevelIsInvalidRequest`: level 3 → a unique view is 39 "plan v2 needs the checked-writes feature level" (07's gate, unchanged).
   - Inversions (R08e):
     - `CheckedWritesAdminViewDdl.UniqueAndCheckAreNotAvailableYet` (07) becomes `CheckedWritesAdminViewDdl.UniqueAndCheckAreAccepted`: the same two submits → 0.
-    - 08's `CheckedWritesQlCompileMatrix` unique admin cell (K5 × S1) now expects 0; `CheckedWritesQlCompileMatrixCount.CellCountIsPinned` stays 50.
+    - 08's `CheckedWritesQlCompile.UniqueViewIsRefusedBeforePart09` (QM2's unique admin cell, K5 × S1) becomes `CheckedWritesQlCompile.UniqueViewIsAccepted`: the same submit → 0. `CheckedWritesQlCompileMatrixCount.CellCountIsPinned` stays 49 (the table doesn't hold this cell).
 - [ ] **Step 2: Run to verify they fail.** `cmake --build build/root -j14 --target rune_checked_writes_tests`. Expected: `rune/node/ConstraintDdlRules.h: No such file`, then 58/57 where 0 is expected.
 - [ ] **Step 3: Implement** per P9-9. `membersAfter` decodes each other view's `compiledPlanBlob` with `rune::view::deserializeCompiledViewPlan` (a cold leader build) and counts it when `verdictKindOf` is set and its `sourceNames.front()` equals this view's source. For an alter, the view's own `objectId` is skipped.
 - [ ] **Step 4: Run.**
@@ -526,18 +532,18 @@ The `REGRESSORSPATH` leg of `broker/docker/checked-writes-e2e.sh`: the golden sc
 - [ ] **Step 5: Commit.**
   ```bash
   git add broker/libs/node/include/rune/node/ConstraintDdlRules.h broker/libs/node/src/AdminWorker.cpp \
-          broker/libs/storage/include/rune/storage/ControlRecordLayout.h \
+          broker/libs/view/include/rune/view/Verdict.h broker/libs/storage/include/rune/storage/ControlRecordLayout.h \
           broker/libs/node/tests/node/CheckedWritesConstraintDdlTest.cpp broker/libs/node/tests/node/CheckedWritesAdminViewDdlTest.cpp \
           broker/libs/node/tests/node/CheckedWritesQlCompileTest.cpp broker/libs/node/CMakeLists.txt
   git commit -m "feat(admin): unique and check views accepted - transient sources refused (R10a), constraint id and member limits (SD5)" \
-             -m "R08e: the P7-9 refusal lines are deleted; UniqueAndCheckAreNotAvailableYet and the QM2 unique cell are inverted." \
+             -m "R08e: the P7-9 refusal lines are deleted; UniqueAndCheckAreNotAvailableYet and UniqueViewIsRefusedBeforePart09 are inverted." \
              -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   ```
 
 ### Task 4: `Unique` and `Check` members in the `VerdictSource`
 
 **Files:**
-- Modify: `broker/libs/view/include/rune/view/Verdict.h` (contract addition 5), `broker/libs/node/include/rune/node/VerdictSource.h`, `broker/libs/node/src/VerdictSource.cpp` (the `switch (kind)` cases for `Unique` and `Check` in prepare, evaluate, apply and the member replay of `driveJudge`; `evaluateConstraints`; per-constraint stats)
+- Modify: `broker/libs/node/include/rune/node/VerdictSource.h`, `broker/libs/node/src/VerdictSource.cpp` (the `switch (kind)` cases for `Unique` and `Check` in prepare, evaluate, apply and the member replay of `driveJudge`; `evaluateConstraints`; per-constraint stats)
 - Modify: `broker/libs/node/include/rune/node/WorkerViewSet.h`, `broker/libs/node/src/WorkerViewSet.cpp`:
   - `drainInstalls` (`:278-336` before 07): after `deserializeCompiledViewPlan`, set the template's `verdictKind` / `verdictObjectId` / `verdictFingerprint` (04's members) from `verdictKindOf`, `plan.viewObjectId` and `verdictPlanFingerprint(m.planBlob)`, and build `planRecordPayload` (P9-8) from the message's three blobs;
   - `getOrCreate_` (`:338-422`): a unique owner-mapped instance gets `claims` (seeded like its tables, 07 P7-4) and `ProjectionFold::claims`;
@@ -548,7 +554,8 @@ The `REGRESSORSPATH` leg of `broker/docker/checked-writes-e2e.sh`: the golden sc
 
 **Interfaces:**
 - Consumes: Tasks 1–2; 04's `judge`, `addVerdictView`, `Prospect`, the unit harness of 04 Task 5 (members as `ViewInstance`s built like `WorkerViewSetTest.cpp:100-170`, a fake `readRange` over `InMemoryLog` batches); 05's key index member; 07's keyed and aggregate prepare/apply.
-- Produces: contract additions 5 and 6 (`ConstraintFold`, `evaluateConstraints`). In `judge`, a `Unique` or `Check` member is prepared with its view's own prepare (`prepareProjection` or `prepareAggregate`, with `claims` for unique views), evaluated with `evaluateConstraints(fold, rec, prospect)` (P9-2, P9-3, P9-4: `before` = `fold.table.get(rows[i].key)` when `rows[i].existed`, else nullptr), and applied with its own apply. Its replay below K is its own fold with `FoldSkip{.aborted, .rejected}` (unjudged, claims taken as P9-3's unjudged column). A rejection bumps `rejectionsConstraint` and `perConstraint[constraintId]` (04).
+- Consumes also: contract addition 5 (`verdictKindOf`, `verdictPlanFingerprint`, Task 3).
+- Produces: contract addition 6 (`ConstraintFold`, `evaluateConstraints`). In `judge`, a `Unique` or `Check` member is prepared with its view's own prepare (`prepareProjection` or `prepareAggregate`, with `claims` for unique views), evaluated with `evaluateConstraints(fold, rec, prospect)` (P9-2, P9-3, P9-4: `before` = `fold.table.get(rows[i].key)` when `rows[i].existed`, else nullptr), and applied with its own apply. Its replay below K is its own fold with `FoldSkip{.aborted, .rejected}` (unjudged, claims taken as P9-3's unjudged column). A rejection bumps `rejectionsConstraint` and `perConstraint[constraintId]` (04).
 
 - [ ] **Step 1: Write the failing tests** (`CheckedWritesConstraintVerdictTest.cpp`; compiled plans from Task 3's statements, `character_name` objectId 7 and `account_stats` objectId 8 unless named; the key index (05) is member 0 wherever the topic is the autoincrement `character`):
   - `CheckedWritesConstraintVerdict.FooThenLowerFooIsRejectedByTheUniqueView`: c1 `"Foo"` (user 1) → OK; c2 `"foo"` (user 2) → `{51, 0x00070000}`; `character_name` has 1 row; `account_stats` user 2 absent; `perConstraint` holds `(0x00070000, 1)`.
@@ -568,12 +575,12 @@ The `REGRESSORSPATH` leg of `broker/docker/checked-writes-e2e.sh`: the golden sc
   - `CheckedWritesConstraintVerdict.UnjudgedReplayBelowKNeverRejects`: 30 records with duplicates and user 7 at 14 below the members' change record → the replay applies them all, `claims.extras()` equals the duplicates, no index entry is added.
   - `CheckedWritesViewSet.ConstrainedTemplatesCarryKindObjectIdAndFingerprint` (`CheckedWritesViewSetTest.cpp`): installing `character_name`, `account_stats` and a plain view → kinds `Unique`, `Check`, none; object ids from the plans; fingerprints equal `verdictPlanFingerprint` of the blobs; a replaced plan (new `viewTopicId`) has a different fingerprint.
   - `CheckedWritesKeyedRecoveryRegression.UniqueClaimsSurviveRestartRegression` (`CheckedWritesKeyedRecoveryTest.cpp`): 1,000 records with duplicates folded and checkpointed → `installViewForRecovery` on a fresh set gives byte-equal tables 0, 1, 6 and 7 and the same `uniqueConflicts`; a promotion after the restart picks the same claimant as a fresh refold.
-- [ ] **Step 2: Run to verify they fail.** `cmake --build build/root -j14 --target rune_checked_writes_tests`. Expected: `no member named 'verdictKindOf'`.
+- [ ] **Step 2: Run to verify they fail.** `cmake --build build/root -j14 --target rune_checked_writes_tests`. Expected: `no member named 'evaluateConstraints'`.
 - [ ] **Step 3: Implement** per the Interfaces. Member prospects are reserved at `addVerdictView` (cold) with the view's `rowLen` and aggregate layout, as 04 reserves them; `evaluateConstraints` allocates nothing.
 - [ ] **Step 4: Run.** `ctest --test-dir build/root -R 'CheckedWritesConstraintVerdict|CheckedWritesVerdictSource|CheckedWritesKeyIndex\.|CheckedWritesViewSet|CheckedWritesKeyedRecovery|WorkerViewSet|ViewRecovery' -j14 --output-on-failure`. Expected: PASS.
 - [ ] **Step 5: Commit.**
   ```bash
-  git add broker/libs/view/include/rune/view/Verdict.h broker/libs/node/include/rune/node/VerdictSource.h broker/libs/node/src/VerdictSource.cpp \
+  git add broker/libs/node/include/rune/node/VerdictSource.h broker/libs/node/src/VerdictSource.cpp \
           broker/libs/node/include/rune/node/WorkerViewSet.h broker/libs/node/src/WorkerViewSet.cpp \
           broker/libs/node/tests/node/CheckedWritesConstraintVerdictTest.cpp broker/libs/node/tests/node/CheckedWritesViewSetTest.cpp \
           broker/libs/node/tests/node/CheckedWritesKeyedRecoveryTest.cpp broker/libs/node/CMakeLists.txt
@@ -602,7 +609,7 @@ The `REGRESSORSPATH` leg of `broker/docker/checked-writes-e2e.sh`: the golden sc
   - `CheckedWritesConstraintWorker.DropStopsJudgingAboveD` (§8.7 drop, §15): `"Foo"` taken; `dropConstrainedView(CharacterName)` while a producer writes → records below D stay rejected (index unchanged), and a `"foo"` create above D → OK.
   - `CheckedWritesConstraintWorker.DropThenCreateLeavesAGap`: drop, a `"foo"` duplicate written, then create `character_name` again → the duplicate is accepted (unjudged below A'), `"foo"` is owned by the smaller id, `uniqueConflicts == 1`.
   - `CheckedWritesConstraintWorker.ConstrainedSourceRefusesTransactions` (§15, 03 rule 7 for real): a transactional batch to `character` → `InvalidRequest`; the same to an unconstrained typed topic → OK as today.
-  - `CheckedWritesConstraintWorker.KeyZeroCreateNeedsViewOnAConstrainedSource` (06 `KeyZeroCreateNeedsView` for real): `acks 1` → 39; `All | View` → OK with its id.
+  - `CheckedWritesConstraintWorker.KeyZeroCreateNeedsViewOnAConstrainedSource` (03's `KeyZeroCreateNeedsView` for real): `acks 1` → 39; `All | View` → OK with its id.
   - `CheckedWritesConstraintWorker.PlainWritesFromAnyProducerAreJudged` (§11.2, P5-12): a non-autoincrement topic `pc {id uint64 key, userId uint64, name string(16)}` with a unique `lower(name)` view; a non-idempotent `acks=leader` producer and a v11 session each upsert `"Foo"` then `"foo"` under other ids → their acks are today's (no trailer, no 51); only the first `"Foo"` is in the view and reaches a consumer; `rejectionsConstraint == 2`.
   - `CheckedWritesConstraintWorker.ViewAckCarriesPerRecordVerdicts`: one 8-record batch where record 2 takes a taken name and record 5 is user 7's 13th → one OK ack whose trailer is exactly `{(2, 51, 0x…0000), (5, 51, 0x…0001)}` with the two views' ids; the other 6 are visible.
   - `CheckedWritesConstraintWorkerRegression.ViewRetryReplaysTheOriginalConstraintIdsAfterAReplaceRegression` (R04e / R04g, Review Focus 5): the batch above with its ack dropped; `replaceConstrainedView(AccountStats, 13)`; the retry (same pid, epoch, sequence) → the same base offset and a byte-identical trailer (the original ids), released only once `W > lastOffset`; `verdictReplays == 1`; LEO unchanged.
@@ -664,7 +671,7 @@ The `REGRESSORSPATH` leg of `broker/docker/checked-writes-e2e.sh`: the golden sc
           broker/libs/node/tests/node/CheckedWritesVerdictSourceTest.cpp broker/libs/node/tests/node/CheckedWritesConstraintChangeTest.cpp \
           broker/libs/node/CMakeLists.txt
   git commit -m "feat(node): two-phase drop - plans stay until W passes the change; kVerdictPlan (type 20) makes them durable across restart (R04a)" \
-             -m "Deviation (04 P4-6): a leaving member is uninstalled once W, not the judge, passes its leave offset; followers keep it." \
+             -m "04 P4-6 as amended by R09b: a leaving member is uninstalled once W, not the judge, passes its change record; followers drop it and P9-8 reinstalls it from the log at a later leadership (R04b)." \
              -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   ```
 
@@ -672,11 +679,11 @@ The `REGRESSORSPATH` leg of `broker/docker/checked-writes-e2e.sh`: the golden sc
 
 **Files:**
 - Create: `client-cpp/include/rune/client/ConstraintNames.h`, `client-cpp/src/ConstraintNames.cpp` (in the client library sources of `client-cpp/CMakeLists.txt`), `client-cpp/tests/client/CheckedWritesConstraintNameTest.cpp` (in `rune_client_tests`, `client-cpp/CMakeLists.txt:1059`)
-- Modify: `client-cpp/include/rune/client/WriteResult.h` (contract addition 12), `client-cpp/include/rune/client/Client.h` (beside `catalogReader()`, `:997`), `client-cpp/src/Client.cpp` (beside `catalogReader()`, `:2479`), `client-cpp/src/producer/ProducerImpl.cpp` (04's per-record override in `completeSlice_`: a rejected record keeps `value = base + recordIndex`), `client-cpp/src/cli/CatalogCommands.cpp` (08's `formatStatsText` / `formatStatsJson` take an optional name resolver), `client-cpp/tests/producer/ProducerVerdictsTest.cpp` (04), `client-cpp/tests/CheckedWritesQlCliTest.cpp` (08)
+- Modify: `client-cpp/include/rune/client/WriteResult.h` (contract addition 12), `client-cpp/include/rune/client/Client.h` (beside `catalogReader()`, `:997`), `client-cpp/src/Client.cpp` (beside `catalogReader()`, `:2479`), `client-cpp/src/producer/ProducerImpl.cpp` (04's per-record override in `completeSlice_`: a rejected record keeps `value = base + recordIndex`), `client-cpp/src/cli/CatalogCommands.cpp` (08's `formatStatsText` / `formatStatsJson` keep their signature and format; `cmdStats` and `run(PShowView)` fill each `PartitionStats::constraintLabels` entry through `Client::constraintName`), `client-cpp/tests/producer/ProducerVerdictsTest.cpp` (04), `client-cpp/tests/CheckedWritesQlCliTest.cpp` (08)
 
 **Interfaces:**
 - Consumes: `CatalogReader::state()`, `events()`, `refresh(timeout)` (`client-cpp/include/rune/client/detail/EventLogStream.h:143-151`); `rune::catalog::CatalogState::viewByObjectId`, `RecordedEvent` (`codec/include/rune/catalog/CatalogReplayer.h:26`), `CreateViewOps` / `AlterViewOps`; `rune::view::deserializeAuthored` (07, codec); 05's `WriteResult::offset()`, `fromCompletion`.
-- Produces: contract addition 12, P9-11, P9-12. The CLI prints a constraint as `<view>.<constraint>` (`character_name.unique`, `account_stats.max_characters`), and an unresolved one as its hex id.
+- Produces: contract addition 12, P9-11, P9-12. The CLI's constraint label is `<view>.<constraint>` (`character_name.unique`, `account_stats.max_characters`), or the hex id when it doesn't resolve. It goes into 08's `PartitionStats::constraintLabels`, so 08's printers stay as they are.
 
 - [ ] **Step 1: Write the failing tests.**
   - `CheckedWritesConstraintNameTest.cpp` (catalog states built by replaying hand-made events through `CatalogReplayer`, as `codec/tests/catalog` builds them; `character_name` gets object id X, `account_stats` Y, with constraints `max_characters` and `max_level`):
@@ -684,9 +691,9 @@ The `REGRESSORSPATH` leg of `broker/docker/checked-writes-e2e.sh`: the golden sc
     - `CheckedWritesConstraintName.UnknownIdsAreNone`: `0` (the key index) → nullopt; an object id that is a topic → nullopt; `Y << 16 | 3` → nullopt; `Y << 16` (ordinal 0 on a non-unique view) → nullopt.
     - `CheckedWritesConstraintNameRegression.ReplayedIdResolvesAfterReplaceAndDropRegression` (Review Focus 5): `alter view account_stats` that keeps only `max_level` (now ordinal 1), then `drop view character_name` → `Y << 16 | 1` → `{"account_stats", "max_level"}` (the live definition); `Y << 16 | 2` → `{"account_stats", "max_level"}` from the earlier definition, found in the events; `X << 16` → `{"character_name", "unique"}` from the dropped view's `CreateView` event.
   - `ProducerVerdictsTest.cpp`: `ProducerVerdicts.RejectedRecordCarriesItsOffset`: base 100, trailer `{(3, 51, 0x00070000)}` → record 3's completion has `value == 103`, and `WriteResult::fromCompletion(c).offset() == 103`, `code() == 51`, `constraintId() == 0x00070000`.
-  - `CheckedWritesQlCliTest.cpp`: `CheckedWritesQlCli.StatsTextNamesConstraints`: `formatStatsText` of a `StatsResult` with constraints `{(X << 16, 2), (0x00990001, 1)}` and a resolver knowing X → lines `rejections character_name.unique 2` and `rejections 0x00990001 1`; `formatStatsJson` has `"constraints": [{"id": …, "name": "character_name.unique", "rejections": 2}, …]`.
+  - `CheckedWritesQlCliTest.cpp`: `CheckedWritesQlCli.StatsTextNamesConstraints`: `cmdStats`' label step over a `StatsResult` with constraints `{(X << 16, 2), (0x00990001, 1)}` and a catalog that knows X → `constraintLabels == {"character_name.unique", "0x00990001"}`; then 08's `formatStatsText` prints `    constraint character_name.unique 2` and `    constraint 0x00990001 1`, and `formatStatsJson` has `"constraints": [{"constraintId": …, "label": "character_name.unique", "rejections": 2}, …]` (08's format, unchanged).
 - [ ] **Step 2: Run to verify they fail.** `cmake --build build/sub-client-cpp -j14 --target rune_client_tests rune_invoker_tests rune_cli_catalog_tests`. Expected: `rune/client/ConstraintNames.h: No such file or directory`.
-- [ ] **Step 3: Implement** per P9-12. `Client::constraintName(id)` calls the two-argument form with `kConstraintNameRefreshTimeout`. A call from another thread throws `std::logic_error` (the catalog reader's rule). `cmdStats` passes a resolver that calls `client.constraintName`.
+- [ ] **Step 3: Implement** per P9-12. `Client::constraintName(id)` calls the two-argument form with `kConstraintNameRefreshTimeout`. A call from another thread throws `std::logic_error` (the catalog reader's rule). `cmdStats` and `run(PShowView)` build `constraintLabels` with `client.constraintName`.
 - [ ] **Step 4: Run.** `ctest --test-dir build/sub-client-cpp -R 'CheckedWritesConstraintName|ProducerVerdicts|CheckedWritesQlCli|CatalogReader' -j14 --output-on-failure`. Expected: PASS.
 - [ ] **Step 5: Commit.**
   ```bash
@@ -858,7 +865,7 @@ The `REGRESSORSPATH` leg of `broker/docker/checked-writes-e2e.sh`: the golden sc
     - refused: transient sources, more than 32 verdict views per topic, ids past 65535 (SD5).
   - **`client-cpp.md`**, "Constraint violations": `WriteResult::code() == 51`, `constraintId()`, `Client::constraintName` (owner thread; dropped and replaced views resolve), and the login-race pattern (insert, on 51 read the unique view with `minOffset = r.offset()`), with the §1 auth-server and character-server snippets as they ship.
   - **`wire-protocol.md`**, "Control records 16–19": add type 20 `kVerdictPlan` with its byte table; "consumers never receive it".
-  - **`admin-cli.md`**: `rune stats` prints `rejections <view>.<constraint> <n>`, and `uniqueConflicts` for a unique view.
+  - **`admin-cli.md`**: `rune stats` prints `constraint <view>.<constraint> <n>` (08's format, now with names), and `uniqueConflicts` for a unique view.
   - **`operations.md`**, "Verdict sources" (04's section): constraint create, replace and drop; the two-phase drop (a dropped plan stays installed until W passes its change record); type-20 records are kept by the cleaner; `uniqueConflicts`.
   - **`client-cpp/CLAUDE.md`** §2.1: "`Client::constraintName(id)` resolves a 51's constraint id from the catalog; owner thread only".
 - [ ] **Step 6: Commit.**
@@ -903,6 +910,6 @@ The `REGRESSORSPATH` leg of `broker/docker/checked-writes-e2e.sh`: the golden sc
   - §13 `uniqueConflicts`: P9-10, Task 5. §14 judging budget: Task 12's gate. §15 09 cells: Interaction matrix A and B.
   - Rulings: R04a (Task 6), R04e/R04g (Tasks 5, 7), R08e (Tasks 3, 10), R08c (Task 1), R08f (Task 5), R10a/SD9 (Task 3), SD5 (Task 3), R07c (Tasks 4, 10).
 - **Step scan.** Every test step names its tests with the spec's values (51, `0x00070000`, `0x00080001`, 12, 13, 14, 65,536, 32, 64, 600 / 555). Code steps give files, signatures and placement. Bodies appear only for the unique rule table (Task 2) and the desired-set rule (P9-5), which the signatures and tests do not fix.
-- **Type consistency.** `PredicateResult`, `evaluatePredicate`, `predicateReadsChanged`, `constraintShapeError`, `kMaxPredicateNodes` (Task 1, used in 3, 4); `UniqueClaims`, `compareSourceKeys`, `ProspectRow::ownedByOther` / `promoted`, tables 6 / 7 (Task 2, used in 4, 5, 8, 12); `verdictKindOf`, `verdictPlanFingerprint`, `ConstraintFold`, `evaluateConstraints` (Task 4); `addCandidate`, `candidateCaughtUp` (Task 5); `kVerdictPlan`, `verdictPlanPayloadBytes`, `kMaxVerdictPlanBytes` (declared in Task 3, completed in Task 6), `RetainedVerdictPlans`, `leaveOffsetOf`, `retainedPlanInstalls` (Task 6); `ConstraintName`, `resolveConstraintName`, `constraintName` (Task 7, used in 10, 11); the rig helpers (Task 5, used in 6, 8, 9, 12). Every contract name (`VerdictSource`, `ConstraintSet`, `Prospect`, `CompiledConstraint`, `featureRefusal`, `StatsSink`, `WriteResult`) is used as defined by its owner.
+- **Type consistency.** `PredicateResult`, `evaluatePredicate`, `predicateReadsChanged`, `constraintShapeError`, `kMaxPredicateNodes` (Task 1, used in 3, 4); `UniqueClaims`, `compareSourceKeys`, `ProspectRow::ownedByOther` / `promoted`, tables 6 / 7 (Task 2, used in 4, 5, 8, 12); `verdictKindOf`, `verdictPlanFingerprint` (Task 3, used in 4); `ConstraintFold`, `evaluateConstraints` (Task 4); `addCandidate`, `candidateCaughtUp` (Task 5); `kVerdictPlan`, `verdictPlanPayloadBytes`, `kMaxVerdictPlanBytes` (declared in Task 3, completed in Task 6), `RetainedVerdictPlans`, `leaveOffsetOf`, `retainedPlanInstalls` (Task 6); `ConstraintName`, `resolveConstraintName`, `constraintName` (Task 7, used in 10, 11; the CLI fills 08's `PartitionStats::constraintLabels` with it); `verdictPlanPayloadBytes(planLen, outLen, srcLen)` called with the three blob sizes (P9-9); the rig helpers (Task 5, used in 6, 8, 9, 12). Every contract name (`VerdictSource`, `ConstraintSet`, `Prospect`, `CompiledConstraint`, `featureRefusal`, `StatsSink`, `WriteResult`) is used as defined by its owner.
 - **Review Focus.** Each of the five has its named test in its owning task (2, 6, 1/4, 4, 5/7).
 - **Proportion.** The plan fixes decisions, placements, signatures and assertions. The evaluator, the claims tables, the candidate swap, the retained-plan install and the rig bodies are left to the implementer within the stated rules.
