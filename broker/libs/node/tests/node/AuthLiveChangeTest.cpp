@@ -624,6 +624,16 @@ TEST(AuthLiveChangeRegression, ShardRevokeOkMeansTheWorkerAlreadyRefusesRegressi
         ASSERT_EQ(t.grantExact(writer, SO::Write, ST::Topic, "orders"), 0);
         EXPECT_EQ(shardProduceOnce(t, ws, t.r.orders), 0) << "round " << round << ": the re-grant is enforced at its OK";
     }
+    // Issue #273 item 1: 100 more rounds with no hold - the natural window between the OK and the worker installing the
+    // bind.  Every OK is followed at once by the refused (or accepted) produce, never an append after a revoke's OK.
+    for (int round = 0; round < 100; ++round) {
+        ASSERT_EQ(t.revokeExact(writer, SO::Write, ST::Topic, "orders"), 0) << "unheld round " << round;
+        const int64_t leo = leoOf(t, t.r.orders);
+        ASSERT_EQ(shardProduceOnce(t, ws, t.r.orders), 45) << "unheld round " << round << ": refused at the revoke's OK";
+        ASSERT_EQ(leoOf(t, t.r.orders), leo) << "unheld round " << round << ": appended after the revoke's OK";
+        ASSERT_EQ(t.grantExact(writer, SO::Write, ST::Topic, "orders"), 0) << "unheld round " << round;
+        ASSERT_EQ(shardProduceOnce(t, ws, t.r.orders), 0) << "unheld round " << round << ": accepted at the grant's OK";
+    }
 }
 
 // Issue #196, the session-ending kinds: DISABLE / TERMINATE SESSIONS revoke the session; with the worker slow to drain

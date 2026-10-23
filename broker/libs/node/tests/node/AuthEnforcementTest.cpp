@@ -306,6 +306,46 @@ TEST(AuthEnforcementRegression, GetTopicSchemaAllowedAndDenied) {
     EXPECT_EQ(r.getTopicSchema(may, "secret"), kNotAuthorized);
 }
 
+// Issue #273 item 4: GetTopicSchema across topic kinds - a data topic, a view (its sink) and the system topics.  Only the
+// object's OWN kind's grant answers it (#128): READ on a view named like the topic, or on a topic named like the view,
+// opens nothing; READ on a view's source topic does not open the view.  A system topic is never reachable through a
+// topic / view grant (even READ TOPIC prefix ''), and DESCRIBE ON CLUSTER sees it as missing (UnknownTopic), as any
+// name that is no catalog object.  RED: drop the own-kind branch (#128) of authorizeTopicOrViewName - the wrong-kind
+// grants are served.
+TEST(AuthEnforcementRegression, GetTopicSchemaAnswersPerTheObjectsOwnKindAcrossTopicKindsRegression) {
+    AuthRig r;
+    const int kUnknown = static_cast<int>(pc::ErrorCode::UnknownTopic);
+    const int64_t readOrders = r.newUser({exact(SO::Read, ST::Topic, "orders")});
+    const int64_t viewNamedOrders = r.newUser({exact(SO::Read, ST::View, "orders")});
+    const int64_t readBoard = r.newUser({exact(SO::Read, ST::View, "board")});
+    const int64_t topicNamedBoard = r.newUser({exact(SO::Read, ST::Topic, "board")});
+    const int64_t allTopics = r.newUser({prefix(SO::Read, ST::Topic, "")});
+    const int64_t allViews = r.newUser({prefix(SO::Read, ST::View, "")});
+    const int64_t describeCluster = r.newUser({cluster(SO::Describe)});
+    const int64_t adminCluster = r.newUser({cluster(SO::Admin)});
+
+    // A data topic.
+    EXPECT_EQ(r.getTopicSchema(readOrders, "orders"), kOk);
+    EXPECT_EQ(r.getTopicSchema(allTopics, "orders"), kOk);
+    EXPECT_EQ(r.getTopicSchema(viewNamedOrders, "orders"), kNotAuthorized) << "a VIEW grant on a topic's name";
+    EXPECT_EQ(r.getTopicSchema(allViews, "orders"), kNotAuthorized);
+    // A view (its sink topic is addressed by the view's name).
+    EXPECT_EQ(r.getTopicSchema(readBoard, "board"), kOk);
+    EXPECT_EQ(r.getTopicSchema(allViews, "board"), kOk);
+    EXPECT_EQ(r.getTopicSchema(topicNamedBoard, "board"), kNotAuthorized) << "a TOPIC grant on a view's name";
+    EXPECT_EQ(r.getTopicSchema(allTopics, "board"), kNotAuthorized);
+    EXPECT_EQ(r.getTopicSchema(readOrders, "board"), kNotAuthorized) << "READ on the source is not READ on the view";
+    // The system topics.
+    for (const char* sys : {"__security", "__catalog", "__consumer_offsets", "__transaction_state"}) {
+        EXPECT_EQ(r.getTopicSchema(allTopics, sys), kNotAuthorized) << sys;
+        EXPECT_EQ(r.getTopicSchema(allViews, sys), kNotAuthorized) << sys;
+        EXPECT_EQ(r.getTopicSchema(adminCluster, sys), kNotAuthorized) << sys << ": ADMIN ON CLUSTER is no data grant";
+        EXPECT_EQ(r.getTopicSchema(describeCluster, sys), kUnknown) << sys << ": no catalog object";
+    }
+    EXPECT_EQ(r.getTopicSchema(describeCluster, "orders"), kOk);
+    EXPECT_EQ(r.getTopicSchema(describeCluster, "board"), kOk);
+}
+
 TEST(AuthEnforcementRegression, DefineTopicAndCreateSchemaAllowedAndDenied) {
     AuthRig r;
     const int64_t named = r.newUser({exact(SO::Create, ST::Topic, "fresh1")});
