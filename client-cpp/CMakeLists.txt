@@ -1041,6 +1041,11 @@ endif()
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
     include(GoogleTest)
+    # Issue #375: every gtest binary runs under its own TMPDIR root (removed at exit, swept when its owner is dead).
+    # Only when client-cpp is the top-level project; embedded in the monorepo the root CMakeLists.txt wires it.
+    if(PROJECT_IS_TOP_LEVEL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/RuneTestTmpRoot.cmake")
+        include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/RuneTestTmpRoot.cmake")
+    endif()
     # Discover tests at ctest time, not build time: build-time discovery runs each
     # binary under a 5s DISCOVERY_TIMEOUT that a loaded box can exceed (seen on
     # rune_cli_security_tests / rune_cli_security_live_tests), failing the build.

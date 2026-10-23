@@ -5,7 +5,8 @@ from conan.tools.files import copy
 import os
 
 # The sibling source directories the build compiles (see CMakeLists.txt); they ship inside the recipe.
-SIBLINGS = ("protocol", "codec", "crypto", "ql")
+# cmake/ holds the per-process test temp root (issue #375) the test build links into every gtest binary.
+SIBLINGS = ("protocol", "codec", "crypto", "ql", "cmake")
 # Never exported: build trees, tool caches and VCS metadata.
 EXCLUDES = ["build*/*", "cmake-build*/*", ".cache/*", ".git/*", "Testing/*", "CMakeUserPresets.json", "compile_commands.json"]
 
