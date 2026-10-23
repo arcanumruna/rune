@@ -404,6 +404,13 @@ public:
     /// Cold; called on the control thread for INTERNAL partitions (whose ISR is
     /// leader-local); user partitions are fenced by the controller.
     void shrinkIsrToLive(std::span<const int32_t> live, int64_t nowNs);
+    /// #572: fencing is a controller decision - only the consensus leader receives AppendPosition, so only it knows
+    /// who is live.  On a node that is NOT the consensus leader (resigned, stood down, or never led) the fencing pass
+    /// calls this instead of shrinkIsrToLive: a fenced mask set while this node led is dropped (internal quorum
+    /// leader only), so a stale liveness view never keeps a live member out of the ISR.  A formerly fenced member
+    /// still re-enters only through the normal validated expansion (its `validated` flag is untouched).  Idempotent,
+    /// allocation-free; cold (the control thread's failover slow tick).
+    void clearInternalFencing(int64_t nowNs);
     /// Kafka AlterPartitionResponse (MEDIUM-2): the controller's explicit answer
     /// to our AlterIsr.  A reject (INELIGIBLE_REPLICA / FENCED_LEADER_EPOCH /
     /// INVALID_UPDATE_VERSION / invalid) clears the pending proposal (the HW

@@ -431,10 +431,24 @@ private:
                 // local ISR): a member the cluster considers dead leaves the ISR
                 // at once — with HW = min over the ISR it would otherwise hold the
                 // HW (metadata commits!) for replicaLagMaxMs.
-                if (n > 0 && registry_) {
+                //
+                // #572: fencing is a CONTROLLER decision.  Only the consensus
+                // leader receives AppendPosition, so only its eligible set is
+                // liveness knowledge; on a resigned / stood-down / follower node
+                // it decays to {self} and would fence every live peer out of the
+                // committed metadata ISR (leaving only this node electable).  A
+                // non-leader never shrinks; it clears any mask it set while it led,
+                // so a returned member is not fenced forever by a stale view.
+                if (registry_) {
+                    const bool consensusLeader =
+                        election_->leaderMemberId() == election_->thisMemberId();
                     for (auto* replica : registry_->allReplicas()) {
-                        if (replica && replica->topicId() < 0 &&
-                            replica->role() == rune::replication::Role::Leader)
+                        if (!replica || replica->topicId() >= 0 ||
+                            replica->role() != rune::replication::Role::Leader)
+                            continue;
+                        if (!consensusLeader)
+                            replica->clearInternalFencing(nowNs);
+                        else if (n > 0)
                             replica->shrinkIsrToLive(
                                 std::span<const int32_t>(eligBuf_.data(), n), nowNs);
                     }
