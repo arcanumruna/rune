@@ -75,6 +75,8 @@ struct CompletionTarget;
 
 // ---------------------------------------------------------------------------
 // Acks — acknowledgement policy for produced batches.
+// Leader (like Kafka acks=1): a leader restart or loss before the followers replicate can lose ACKED records.
+// All: acked records survive any single broker failure while the ISR holds minIsr; use it for durability (#41).
 // ---------------------------------------------------------------------------
 enum class Acks : uint8_t {
     None   = 0,  // send without waiting for a response (fully fire-and-forget)

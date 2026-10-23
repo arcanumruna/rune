@@ -173,7 +173,15 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
 ```
 
 - **`Acks`**: `None` (no response, always non-idempotent), `Leader`, `All` (the in-sync replicas hold it). Acked producers
-  are **idempotent**: the broker deduplicates a retry by `(producerId, epoch, sequence)`.
+  are **idempotent**: the broker deduplicates a retry by `(producerId, epoch, sequence)`. The durability contract of
+  each level:
+  - `None`: no acknowledgement; a record can be lost without the producer knowing.
+  - `Leader` (the default, like Kafka `acks=1`): acknowledged once the partition leader has the record. If the leader
+    restarts or is lost before its followers replicate the record, an **acknowledged record can be lost**.
+  - `All`: acknowledged once the in-sync replicas hold the record and the ISR has at least `minIsr` members
+    (`RUNE_MIN_ISR`). An acknowledged record survives any single broker failure while `minIsr` holds.
+
+  Use `Acks::All` whenever a record must not be lost.
 - **`Key`**: up to 16 inline bytes, built from a `uint64_t`/`int64_t`, a trivially-copyable value or a byte span. The key
   picks the partition (`Key::partition(n)`, FNV-1a 64) and is stored with the record.
 - **Record size**: key plus value at most `Producer::kMaxRecordBytes` = 16 KiB. A larger one is rejected at append:
