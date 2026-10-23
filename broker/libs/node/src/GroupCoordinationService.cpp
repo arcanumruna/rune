@@ -213,6 +213,11 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
 
     int work = parkedCount_ != 0 ? releaseParkedCommits_() : 0;   // #433
 
+    // #565: a node that is not the coordinator holds no group: its in-memory groups are stale (heartbeats now go to
+    // the new coordinator) and ageing them would expire members, bump generations and send revoke frames.  Unload
+    // them, Kafka-style; a regained role rebuilds each group by re-join (group membership is never persisted).
+    if (!coordinators_.empty() && !isLocalCoordinator()) return work + unloadGroups_();
+
     if (coordinators_.empty()) return work;
 
     sweepSupersededLineages_(nowNs);   // R1 (round 5)
@@ -385,6 +390,27 @@ void GroupCoordinationService::recordGenLineages_(const GroupId& groupId, const 
             if (!dup) v.push_back(GenLineage{*id, tp.partition, l});
         }
     }
+}
+
+// #565: unload every group on a node that is not the coordinator.  The members' group push subscriptions end (no
+// stale deliveries); no Assign frame is sent - a member learns NotCoordinator on its next request and re-discovers
+// the coordinator.  Parked commits, transactional offsets in flight and the offsets store are left alone (they keep
+// their own NotCoordinator handling).  Cold: once per lost role.
+int GroupCoordinationService::unloadGroups_() {
+    if (gateway_) {
+        int64_t last = -1;
+        for (const auto& [key, binding] : memberSessionMap_) {
+            if (binding.sessionId == last) continue;   // session-wide and idempotent
+            gateway_->revokeGroupSubscriptions(binding.sessionId);
+            last = binding.sessionId;
+        }
+    }
+    memberSessionMap_.clear();
+    for (const auto& [groupId, coord] : coordinators_) pruneGroupLineageState_(groupId);
+    const auto n = coordinators_.size();
+    coordinators_.clear();
+    spdlog::info("GroupCoordinationService: not the group coordinator — unloaded {} group(s) (#565)", n);
+    return static_cast<int>(n);
 }
 
 void GroupCoordinationService::pruneGroupLineageState_(const std::string& groupId) {
