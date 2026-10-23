@@ -6944,3 +6944,149 @@ TEST(TxnVerifyRegression, InlineGatewayPathVerifiesSynchronouslyRegression) {
     EXPECT_EQ(produce(0), 0) << "registered: appended at once";
     EXPECT_EQ(topics.log(0, 0)->logEndOffset(), 1);
 }
+
+// ---- PR #589 adversarial review (#112) --------------------------------------------------------------------------
+
+// Concurrency / fencing: a zombie (older epoch) batch arriving while the CURRENT epoch's verification is pending
+// must not supersede it.  Otherwise the zombie's ask replaces the live producer's Pending entry, the live answer is
+// dropped as stale, and the two keep re-verifying each other away (the zombie never even gets its ProducerFenced).
+TEST(TxnVerifyRegression, ZombieEpochNeverSupersedesThePendingCurrentEpochAdversarialRegression) {
+    VerifyRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    const int64_t pid = T.pid;
+    const int16_t old = T.epoch;
+    ASSERT_EQ(T.initPid(), 0);   // epoch bump: `old` is now a zombie
+    ASSERT_GT(T.epoch, old);
+    ASSERT_EQ(T.addPartition(), 0);
+    // The live producer's first batch asks; the zombie's batch lands before the live retry.
+    EXPECT_EQ(T.produce(pid, T.epoch, 0, 10), kConcurrentTxns);
+    const int16_t z = T.produce(pid, old, 0, 20);
+    EXPECT_NE(z, 0) << "a zombie batch was appended";
+    EXPECT_EQ(T.produce(pid, T.epoch, 0, 40), 0)
+        << "the zombie's batch superseded the live producer's verification (re-verified away)";
+    EXPECT_EQ(T.leo(), 1);
+    const int16_t late = T.produce(pid, old, 1, 60);
+    EXPECT_NE(late, 0) << "a zombie batch was appended";
+    EXPECT_NE(late, kConcurrentTxns) << "the zombie must be fenced, never parked on a retriable code";
+    EXPECT_EQ(T.leo(), 1);
+}
+
+// Identity mismatch (a hostile frame): the frame says "no producer" (pid -1) while the CRC-covered batch header is a
+// transactional batch of a real producer.  The registration check keys on the frame's producer, so it must still
+// never let the batch open a transaction no marker will close.
+TEST(TxnVerifyRegression, FrameWithoutProducerCarryingATransactionalBatchNeverOpensATxnAdversarialRegression) {
+    for (const bool shardIngress : {false, true}) {
+        SCOPED_TRACE(shardIngress ? "shard ingress" : "gateway op path");
+        VerifyRig T;
+        ASSERT_EQ(T.initPid(), 0);   // NO AddPartitions
+        const auto f = produceFrame(T.sid, ++T.corr, txnBatch(T.pid, T.epoch, 0), 0, 0, 0, /*pid=*/-1, 0, -1);
+        if (shardIngress) {
+            (void)T.m.w().handleIngressFrameForTest(f.data(), f.size(), 10);
+        } else {
+            T.m.gw.applyProduceForTest(f.data(), f.size());
+        }
+        for (int i = 0; i < 8; ++i) T.m.runWorker(10 + i);
+        EXPECT_EQ(T.open(), 0u) << "an unregistered transactional batch opened a transaction (the #112 hang)";
+    }
+}
+
+// Ordering: the next transaction of the SAME producer (same epoch) while the previous one's marker is still in
+// flight to the partition.  The previous transaction is still open there, so an "open transaction admits" gate
+// would let the new transaction's first batch join it (and be decided by the OLD marker).  Its registration must
+// be refused until the previous transaction completed.
+TEST(TxnVerifyRegression, NextTxnWhileThePreviousMarkerIsInFlightNeverJoinsItAdversarialRegression) {
+    VerifyRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    EXPECT_EQ(T.produce(T.pid, T.epoch, 0, 10), kConcurrentTxns);
+    EXPECT_EQ(T.produce(T.pid, T.epoch, 0, 30), 0);
+    ASSERT_EQ(T.open(), 1u);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/false));   // markers not driven yet: still open on the partition
+    const int16_t add2 = T.addPartition();
+    EXPECT_NE(add2, 0) << "the next transaction registered while the previous one's marker is in flight";
+    if (add2 == 0) {
+        EXPECT_NE(T.produce(T.pid, T.epoch, 1, 50), 0) << "the next transaction's batch joined the previous one";
+    }
+}
+
+// Topic resolution (the #112 hang class): AddPartitions on a coordinator whose catalog has not applied the topic yet
+// registers it under the placeholder name "topic_<id>", and the marker dispatch later SKIPS a placeholder ("marker
+// for unknown topic ... skipped": topicIdForName never resolves it).  A verification that admits such a registration
+// opens a transaction no marker will ever close — the pinned LSO of #112.  Every registration the coordinator
+// confirms must be one its markers can reach: an unknown topic is refused (retriably) at AddPartitions or at the
+// verification, and once the catalog applies the topic the producer's retry registers and verifies it.
+TEST(TxnVerifyRegression, PlaceholderRegistrationOfAnUnappliedTopicIsNeverVerifiedAdversarialRegression) {
+    VerifyRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    constexpr int32_t kLateTopic = 7;
+    ASSERT_EQ(T.m.topics.topic(kLateTopic), nullptr);
+    auto add = [&] {
+        pc::AddPartitionsToTxn q; q.sessionId = 1; q.correlationId = ++T.corr; q.producerId = T.pid;
+        q.producerEpoch = T.epoch; q.transactionalId = T.tid();
+        const pc::TxnTopicPartition tp{kLateTopic, 0};
+        std::vector<uint8_t> f(pc::AddPartitionsToTxn::encodedSizeFor(T.tid(), 1));
+        q.encode(f.data(), std::span<const pc::TxnTopicPartition>(&tp, 1));
+        auto r = pc::AddPartitionsToTxnResponse::decode(
+            T.out.data(), T.tcs->handleAddPartitions(f.data(), f.size(), 1, T.out.data(), T.out.size()));
+        return (r && r->results.size() == 1) ? r->results[0].errorCode : int16_t{-1};
+    };
+    const int16_t added = add();
+    const int16_t verified = T.tcs->verifyTxnPartition(T.pid, T.epoch, kLateTopic, 0, 100);
+    EXPECT_FALSE(added == 0 && verified == 0)
+        << "a placeholder registration (its marker is skipped) was confirmed: the batch would pin the LSO forever";
+    // The catalog applies the topic: the producer's retry registers and verifies it (never a non-retriable refusal
+    // of a correctly registered partition).
+    ASSERT_EQ(T.m.topics.createTopicAt(kLateTopic, rune::node::TopicSpec{"late-topic", 1}), kLateTopic);
+    if (added != 0) EXPECT_EQ(add(), 0);
+    EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, kLateTopic, 0, 200), 0)
+        << "a registered partition was refused once its topic resolved";
+}
+
+// #112 review, fix round 1 (the placeholder class, every transactional request that names a topic): an id the
+// coordinator's registry does not know yet is refused RETRIABLY and nothing enters the transaction — AddPartitions,
+// TxnOffsetCommit and the leader's verification alike; once the topic is applied every one of them succeeds.
+TEST(TxnVerifyRegression, UnappliedTopicIsRefusedRetriablyByEveryTxnRequestRegression) {
+    VerifyRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    constexpr int32_t kLate = 9;
+    pc::AddPartitionsToTxn q; q.sessionId = 1; q.correlationId = ++T.corr; q.producerId = T.pid;
+    q.producerEpoch = T.epoch; q.transactionalId = T.tid();
+    const pc::TxnTopicPartition tps[2] = {{0, 0}, {kLate, 0}};   // one known, one not: all or nothing
+    std::vector<uint8_t> f(pc::AddPartitionsToTxn::encodedSizeFor(T.tid(), 2));
+    q.encode(f.data(), std::span<const pc::TxnTopicPartition>(tps, 2));
+    auto r = pc::AddPartitionsToTxnResponse::decode(
+        T.out.data(), T.tcs->handleAddPartitions(f.data(), f.size(), 1, T.out.data(), T.out.size()));
+    ASSERT_TRUE(r && r->results.size() == 2);
+    for (const auto& pr : r->results) EXPECT_EQ(pr.errorCode, kConcurrentTxns) << "topic " << pr.topicId;
+    EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, 0, 0, 10), kInvalidTxnState)
+        << "the known partition of a refused request was registered anyway";
+    EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, kLate, 0, 10), kConcurrentTxns)
+        << "an unknown topic must be refused retriably by the verification";
+
+    // TxnOffsetCommit naming an unapplied topic: retriable, nothing recorded under a placeholder.
+    T.tcs->setTxnOffsetSink(
+        [](void*, const std::string&, const rune::coordination::TopicPartition&, int64_t, int64_t,
+           const rune::coordination::TxnOffsetToken&) { return rune::coordination::TxnOffsetApply::Applied; },
+        nullptr, [](void*, const rune::coordination::TxnOffsetToken&) {});
+    ASSERT_EQ(addOffsets(T, "g"), 0);
+    pc::TxnOffsetCommit oc; oc.sessionId = 1; oc.correlationId = ++T.corr; oc.producerId = T.pid;
+    oc.producerEpoch = T.epoch; oc.transactionalId = T.tid();
+    const std::string g = "g";
+    oc.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(g.data()), g.size());
+    const pc::TxnOffsetCommitEntry e{kLate, 0, 5, {}};
+    const std::span<const pc::TxnOffsetCommitEntry> es(&e, 1);
+    std::vector<uint8_t> of(pc::TxnOffsetCommit::encodedSizeFor(oc.transactionalId, oc.groupId, es));
+    oc.encode(of.data(), es);
+    auto orr = pc::TxnOffsetCommitResponse::decode(
+        T.out.data(), T.tcs->handleTxnOffsetCommit(of.data(), of.size(), 1, T.out.data(), T.out.size()));
+    ASSERT_TRUE(orr && orr->results.size() == 1);
+    EXPECT_EQ(orr->results[0].errorCode, kConcurrentTxns);
+
+    ASSERT_EQ(T.m.topics.createTopicAt(kLate, rune::node::TopicSpec{"late", 1}), kLate);
+    r = pc::AddPartitionsToTxnResponse::decode(
+        T.out.data(), T.tcs->handleAddPartitions(f.data(), f.size(), 1, T.out.data(), T.out.size()));
+    ASSERT_TRUE(r && r->results.size() == 2);
+    for (const auto& pr : r->results) EXPECT_EQ(pr.errorCode, 0);
+    EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, kLate, 0, 20), 0);
+    EXPECT_EQ(T.tcs->verifyTxnPartition(T.pid, T.epoch, 0, 0, 20), 0);
+}

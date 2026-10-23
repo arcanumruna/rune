@@ -505,3 +505,47 @@ TEST(ViewRecoveryRegression, LegacyCheckpointIsDiscardedAndTheViewRefoldsFromThe
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
 }
+
+// PR #589 adversarial review (#537, crash and restart / version skew): a data dir holding BOTH the legacy
+// checkpoint and the committed-fold one (an upgrade, a downgrade that wrote the legacy name again, and a second
+// upgrade).  Recovery loads only the committed-fold file, removes the legacy one, and resumes from the committed
+// file's offset — never a row of the legacy file.
+TEST(ViewRecoveryRegression, LegacyAndCommittedCheckpointsBothPresentLoadsOnlyTheCommittedAdversarialRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(0), srcs, kViewId).value();
+    const std::string dir = uniqueDir("rune-view-legacy-both-");
+    const auto legacyBase = makeBaseCheckpoint(comp.plan, comp.rowLayout, src, upsertRun(9, 10, 2, 0), 2);
+    const auto committedBase = makeBaseCheckpoint(comp.plan, comp.rowLayout, src, upsertRun(7, 10, 2, 0), 2);
+    const std::string legacy = rune::node::legacyViewCheckpointFilePath(dir, kViewId, 0);
+    const std::string current = rune::node::viewCheckpointFilePath(dir, kViewId, 0);
+    { std::ofstream f(legacy, std::ios::binary); f.write(reinterpret_cast<const char*>(legacyBase.data()),
+                                                         static_cast<std::streamsize>(legacyBase.size())); }
+    { std::ofstream f(current, std::ios::binary); f.write(reinterpret_cast<const char*>(committedBase.data()),
+                                                          static_cast<std::streamsize>(committedBase.size())); }
+
+    rune::node::ViewSnapshotChannel channel;
+    rune::node::WorkerViewSet vs(channel, dir);
+    pushRecoveryInstall(channel, comp.plan, comp.outputDescriptor, src, /*persistence*/ 0);
+    EXPECT_EQ(vs.drainInstalls(), 1);
+    vs.materializeRecoveryInstancesFor(kSrcId, /*partition*/ 0, /*committedTail*/ 4);
+    EXPECT_FALSE(std::filesystem::exists(legacy)) << "the legacy checkpoint is removed";
+    EXPECT_TRUE(std::filesystem::exists(current)) << "the committed-fold checkpoint is kept";
+
+    const auto log = upsertRun(7, 30, 4, /*baseOffset*/ 0);
+    int64_t firstFrom = -1;
+    auto readRange = [&](int64_t from, int64_t) -> rune::storage::LogReadView {
+        if (firstFrom < 0) firstFrom = from;
+        return rune::storage::LogReadView{log.data(), log.size(), 0, 4};
+    };
+    for (int i = 0; i < 64 && !vs.allViewsReady(); ++i)
+        vs.driveRebuild(kSrcId, 0, readRange, /*committedTail*/ 4, rune::view::kNoAbortedTxns, i);
+    ASSERT_TRUE(vs.allViewsReady());
+    EXPECT_EQ(firstFrom, 2) << "the rebuild resumes at the committed-fold checkpoint's offset";
+    const rune::view::RowLayout* L = nullptr;
+    EXPECT_EQ(vs.getRow(kViewId, 0, 9, L), nullptr) << "a legacy-only row was served";
+    ASSERT_NE(vs.getRow(kViewId, 0, 7, L), nullptr);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}

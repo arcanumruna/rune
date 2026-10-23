@@ -39,7 +39,9 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -420,5 +422,137 @@ TEST_P(ViewAbortedTxnRegression, OpenTxnAcrossFailoverFoldsOnlyIfItCommitsRegres
         const Totals want8 = commits ? Totals{2, 50} : Totals{1, 30};
         EXPECT_EQ(newLeader.userTotals(7), want7);
         EXPECT_EQ(newLeader.userTotals(8), want8);
+    }
+}
+
+// ---- PR #589 adversarial review ---------------------------------------------------------------------------------
+
+// Input bounds / resources: ONE aborted transactional batch holding more records than a persisted view's capped
+// pass covers (maxRecordsPerPass, derived from the 128 KiB delta-ring message: a few thousand projection records,
+// a few hundred aggregate ones).  The pass bound always cuts that batch, so a fold that "stops at a cut aborted
+// batch and skips it whole next pass" never makes progress: the view's cursor freezes before the batch forever
+// (a restart rebuild never reaches Ready, which gates elections).  It must skip the whole batch.
+TEST_P(ViewAbortedTxnRegression, AbortedBatchLargerThanOneCappedPassIsSkippedNotStuckAdversarialRegression) {
+    Source s(GetParam());
+    Host h(s, /*recovery=*/false);
+    constexpr int kRecords = 6000;   // one batch, > maxRecordsPerPass of both views
+    std::vector<Order> recs;
+    for (int i = 0; i < kRecords; ++i) recs.push_back({200'000 + i, 9, 1});
+    ASSERT_EQ(h.produce(orderBatch(recs, kPidA, 0, 0, true), kPidA, 0, 0), 0);
+    h.marker(kPidA, 0, /*commit=*/false);
+    ASSERT_EQ(h.produce(orderBatch({{1, 7, 10}})), 0);   // a plain record after the aborted batch
+    h.passes(400);
+    EXPECT_FALSE(h.hasOrder(200'000));
+    EXPECT_FALSE(h.hasOrder(200'000 + kRecords - 1));
+    EXPECT_EQ(h.userTotals(9).first, -1) << "no aggregate row from an aborted transaction";
+    EXPECT_TRUE(h.hasOrder(1)) << "the projection view is stuck before the oversized aborted batch";
+    EXPECT_EQ(h.userTotals(7), (std::pair<int64_t, int64_t>{1, 10}))
+        << "the aggregate view is stuck before the oversized aborted batch";
+}
+
+// Crash and restart: the same oversized aborted batch met by a RESTART rebuild (recovery install, driveRebuild).
+// The rebuilt views must reach Ready and serve the record after it.
+TEST_P(ViewAbortedTxnRegression, RestartRebuildOverAnOversizedAbortedBatchReachesReadyAdversarialRegression) {
+    Source s(GetParam());
+    constexpr int kRecords = 6000;
+    {
+        Host before(s, /*recovery=*/false);
+        std::vector<Order> recs;
+        for (int i = 0; i < kRecords; ++i) recs.push_back({200'000 + i, 9, 1});
+        ASSERT_EQ(before.produce(orderBatch(recs, kPidA, 0, 0, true), kPidA, 0, 0), 0);
+        before.marker(kPidA, 0, /*commit=*/false);
+        ASSERT_EQ(before.produce(orderBatch({{1, 7, 10}})), 0);
+        before.settle();
+    }
+    if (GetParam() == Backing::Transient) GTEST_SKIP() << "a transient source does not survive a restart";
+    Host after(s, /*recovery=*/true);
+    after.passes(400);
+    EXPECT_EQ(after.vs.readiness(kProj, 0), rune::node::ViewReadiness::Ready) << "projection rebuild stuck";
+    EXPECT_EQ(after.vs.readiness(kAgg, 0), rune::node::ViewReadiness::Ready) << "aggregate rebuild stuck";
+    EXPECT_TRUE(after.hasOrder(1));
+    EXPECT_FALSE(after.hasOrder(200'000));
+    EXPECT_EQ(after.userTotals(7), (std::pair<int64_t, int64_t>{1, 10}));
+}
+
+// Data integrity (model-checked, seeded): four transactional producers and plain writes interleave at random;
+// every transaction ends in a random COMMIT or ABORT.  Both views must equal a recompute over the COMMITTED and
+// plain records only — live, and (disk) again after a restart rebuild over the same log.
+TEST_P(ViewAbortedTxnRegression, RandomInterleavingsEqualACommittedRecomputeAdversarialRegression) {
+    for (const uint64_t seed : {uint64_t{0x537}, uint64_t{0x5370}, uint64_t{0xBEEF}}) {
+        SCOPED_TRACE(::testing::Message() << "seed=0x" << std::hex << seed);
+        std::mt19937_64 rng(seed);
+        Source s(GetParam());
+        struct Prod { int64_t pid; int32_t seq = 0; bool open = false; std::vector<Order> pending; };
+        std::vector<Prod> prods{{3001}, {3002}, {3003}, {3004}};
+        std::vector<Order> committed;   // the recompute's input
+        std::vector<int64_t> abortedIds;
+        int64_t nextOrder = 1;
+        {
+            Host h(s, /*recovery=*/false);
+            for (int op = 0; op < 240; ++op) {
+                const uint64_t r = rng() % 10;
+                if (r < 2) {   // a plain batch
+                    const Order o{nextOrder++, static_cast<int64_t>(rng() % 5), static_cast<int64_t>(rng() % 100 + 1)};
+                    ASSERT_EQ(h.produce(orderBatch({o})), 0);
+                    committed.push_back(o);
+                } else if (r < 7) {   // a transactional batch of 1-3 records
+                    Prod& p = prods[rng() % prods.size()];
+                    std::vector<Order> recs;
+                    const int n = 1 + static_cast<int>(rng() % 3);
+                    for (int i = 0; i < n; ++i)
+                        recs.push_back({nextOrder++, static_cast<int64_t>(rng() % 5), static_cast<int64_t>(rng() % 100 + 1)});
+                    ASSERT_EQ(h.produce(orderBatch(recs, p.pid, 0, p.seq, true), p.pid, 0, p.seq), 0);
+                    p.seq += n;
+                    p.open = true;
+                    p.pending.insert(p.pending.end(), recs.begin(), recs.end());
+                } else {   // end a random open transaction
+                    Prod& p = prods[rng() % prods.size()];
+                    if (!p.open) continue;
+                    const bool commit = (rng() % 2) == 0;
+                    h.marker(p.pid, 0, commit);
+                    for (const auto& o : p.pending) {
+                        if (commit) committed.push_back(o); else abortedIds.push_back(o.orderId);
+                    }
+                    p.pending.clear();
+                    p.open = false;
+                }
+            }
+            for (Prod& p : prods) {
+                if (!p.open) continue;
+                const bool commit = (rng() % 2) == 0;
+                h.marker(p.pid, 0, commit);
+                for (const auto& o : p.pending) {
+                    if (commit) committed.push_back(o); else abortedIds.push_back(o.orderId);
+                }
+                p.pending.clear();
+                p.open = false;
+            }
+            h.passes(200);
+            auto check = [&](Host& v, const char* when) {
+                SCOPED_TRACE(when);
+                std::map<int64_t, std::pair<int64_t, int64_t>> users;
+                for (const auto& o : committed) {
+                    ASSERT_TRUE(v.hasOrder(o.orderId)) << "committed order " << o.orderId << " missing";
+                    auto& u = users[o.userId];
+                    ++u.first;
+                    u.second += o.amount;
+                }
+                for (const int64_t id : abortedIds) ASSERT_FALSE(v.hasOrder(id)) << "aborted order " << id << " folded";
+                for (int64_t u = 0; u < 5; ++u) {
+                    const auto it = users.find(u);
+                    const std::pair<int64_t, int64_t> want = it == users.end() ? std::pair<int64_t, int64_t>{-1, -1}
+                                                                               : it->second;
+                    EXPECT_EQ(v.userTotals(u), want) << "user " << u;
+                }
+            };
+            check(h, "live");
+            if (GetParam() == Backing::Disk) {
+                Host after(s, /*recovery=*/true);
+                after.passes(400);
+                EXPECT_EQ(after.vs.readiness(kProj, 0), rune::node::ViewReadiness::Ready);
+                EXPECT_EQ(after.vs.readiness(kAgg, 0), rune::node::ViewReadiness::Ready);
+                check(after, "after restart rebuild");
+            }
+        }
     }
 }

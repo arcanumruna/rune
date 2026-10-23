@@ -212,3 +212,64 @@ TEST(TxnVerifyStateRegression, AdmissionAnswersAndMarkersAreAllocationFreeRegres
     }
     EXPECT_EQ(w.count(), 0u);
 }
+
+// ---- PR #589 adversarial review ---------------------------------------------------------------------------------
+
+// Fencing: a batch of an OLDER epoch (a zombie after the producer re-initialised) must never supersede the entry of
+// a newer epoch — neither a Pending ask (its answer would be dropped as stale) nor a Verified one (the live
+// producer's admission would be lost).  The zombie is fenced without asking.
+TEST(TxnVerifyStateRegression, OlderEpochNeverSupersedesANewerEntryAdversarialRegression) {
+    for (const bool verified : {false, true}) {
+        SCOPED_TRACE(verified ? "Verified" : "Pending");
+        Rc s;
+        const TxnAdmission live = s.admit(11, 5);
+        ASSERT_EQ(live.kind, K::RequestVerify);
+        if (verified) s.rc.onVerifyAnswer(11, 5, live.reqId, 0);
+        const TxnAdmission zombie = s.admit(11, 4);
+        EXPECT_NE(zombie.kind, K::Admit);
+        EXPECT_NE(zombie.kind, K::RequestVerify) << "the zombie re-opened the verification under its old epoch";
+        if (!verified) s.rc.onVerifyAnswer(11, 5, live.reqId, 0);
+        EXPECT_EQ(s.admit(11, 5).kind, K::Admit) << "the live producer's verification was superseded by a zombie";
+    }
+}
+
+// Replay: an answer delivered twice (a re-sent op, a duplicated plane frame) after its batch was appended and the
+// transaction ended must never re-admit a batch of the ended transaction.
+TEST(TxnVerifyStateRegression, ReplayedConfirmationAfterAppendAndMarkerAdmitsNothingAdversarialRegression) {
+    Rc s;
+    const TxnAdmission a = s.admit(21, 0);
+    ASSERT_EQ(a.kind, K::RequestVerify);
+    s.rc.onVerifyAnswer(21, 0, a.reqId, 0);
+    ASSERT_EQ(s.admit(21, 0).kind, K::Admit);
+    s.rc.onVerifyAnswer(21, 0, a.reqId, 0);   // replay while Verified: no-op
+    s.rc.onMarker(21, 5, /*commit=*/true);
+    s.rc.onVerifyAnswer(21, 0, a.reqId, 0);   // replay after the marker
+    EXPECT_EQ(s.admit(21, 0).kind, K::RequestVerify) << "a replayed confirmation admitted a batch after the marker";
+    EXPECT_GE(s.rc.verifyStaleAnswers(), 2u);
+}
+
+// Input bounds: an answer carrying a code the worker does not know is a refusal (passed through once), never an
+// admission and never a retry loop; epochs at the int16 limits behave like any other.
+TEST(TxnVerifyStateRegression, UnknownAnswerCodeAndEpochLimitsAdversarialRegression) {
+    for (const int16_t epoch : {int16_t{0}, int16_t{32767}, int16_t{-1}}) {
+        Rc s;
+        const TxnAdmission a = s.admit(31, epoch);
+        ASSERT_EQ(a.kind, K::RequestVerify);
+        s.rc.onVerifyAnswer(31, epoch, a.reqId, 999);
+        const TxnAdmission r = s.admit(31, epoch);
+        EXPECT_EQ(r.kind, K::Refuse);
+        EXPECT_EQ(r.code, 999);
+    }
+}
+
+// Resources: the set stays bounded when every producer's ask resolves to a refusal (Rejected entries are evicted
+// for new producers, never leaked), over many more producers than its capacity.
+TEST(TxnVerifyStateRegression, ManyRefusedProducersNeverExhaustTheSetAdversarialRegression) {
+    Rc s;
+    for (int64_t pid = 0; pid < 20 * static_cast<int64_t>(RcState::kTxnVerifyCapacity); ++pid) {
+        const TxnAdmission a = s.admit(pid, 0);
+        ASSERT_EQ(a.kind, K::RequestVerify) << "pid " << pid << " was starved by refused producers";
+        s.rc.onVerifyAnswer(pid, 0, a.reqId, code(pc::ErrorCode::InvalidTxnState));
+    }
+    EXPECT_LE(s.rc.verifySet().size(), RcState::kTxnVerifyCapacity);
+}

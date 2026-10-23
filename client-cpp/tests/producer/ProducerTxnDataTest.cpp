@@ -1500,6 +1500,58 @@ TEST(ProducerTxnDataRegression, ConcurrentTransactionsIsRetriedWithAShortBackoff
     EXPECT_EQ(c.status(), OpStatus::Ok);
 }
 
+// PR #589 adversarial review (#112, concurrency): two pipelined batches of one partition are both answered
+// ConcurrentTransactions, the FIRST one twice (its backoff doubles), so the second one's retry reaches the leader
+// first.  A leader that has verified the partition then answers the second OutOfOrderSequence (its predecessor is
+// not stored yet).  The client must park it behind the first, never fail or abort: both end up stored once, in
+// order, and the transaction commits.
+TEST(ProducerTxnDataRegression, ConcurrentTransactionsBackoffsReorderPipelinedBatchesWithoutAbortingAdversarialRegression) {
+    Rig r;
+    r.initOk(77, 0);
+    sendBatches(r, 2);
+    const int32_t seq0 = r.wire[0].baseSeq, seq1 = r.wire[1].baseSeq;
+    ASSERT_LT(seq0, seq1);
+    constexpr int16_t k27 = static_cast<int16_t>(rpc::ErrorCode::ConcurrentTransactions);
+    answerWire(r, 0, k27);
+    // seq0's first retry: answered 27 again (still verifying) -> its next backoff doubles.
+    for (int i = 0; i < 200 && r.wire.size() == 2; ++i) r.tick(kMs / 10);
+    ASSERT_EQ(r.wire.size(), 3u);
+    ASSERT_EQ(r.wire[2].baseSeq, seq0);
+    answerWire(r, 2, k27);
+    answerWire(r, 1, k27);   // seq1's first refusal: the shorter backoff
+    // The verified leader from here on: in-order sequences are stored, a gap is OutOfOrderSequence.
+    int32_t expected = seq0;
+    int64_t nextOffset = 0;
+    std::size_t answered = 3;
+    bool sawReorder = false;
+    for (int i = 0; i < 4000 && r.impl->hasInFlight(); ++i) {
+        r.tick(kMs / 10);
+        while (answered < r.wire.size()) {
+            const WireBatch& w = r.wire[answered];
+            if (w.baseSeq == expected) {
+                answerWire(r, answered, 0, nextOffset);
+                nextOffset += static_cast<int64_t>(w.tags.size());
+                expected += static_cast<int32_t>(w.tags.size());
+            } else if (w.baseSeq < expected) {
+                answerWire(r, answered, 0, -1);   // a duplicate of a stored batch: OK, offset unknown
+            } else {
+                sawReorder = true;
+                answerWire(r, answered, kOosCode);
+            }
+            ++answered;
+        }
+    }
+    EXPECT_TRUE(sawReorder) << "the attack did not reorder the retries (test is vacuous)";
+    EXPECT_FALSE(r.impl->hasInFlight()) << "a batch never completed";
+    EXPECT_EQ(expected, seq1 + 1) << "both batches stored, in order";
+    EXPECT_EQ(r.state(), TxnState::InTransaction) << "the reorder poisoned the transaction";
+    Op c = r.commit();
+    r.tick();
+    r.endAnswer();
+    ASSERT_TRUE(c.ready());
+    EXPECT_EQ(c.status(), OpStatus::Ok);
+}
+
 // ---- flush ------------------------------------------------------------------------------------------------------
 
 // E3 (DR tx_read_committed): Kafka flush() completes once every record sent so far is ACKED (produced and durable),

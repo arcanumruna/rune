@@ -1128,6 +1128,103 @@ TEST(TxnVerifyRemoteRegression, VerifyFramesRoundTripRegression) {
     EXPECT_FALSE(VerifyTxnPartitionMsg::decode(buf, sizeof buf, d)) << "an answer decoded as an ask";
 }
 
+// ---- PR #589 adversarial review (#112, cross-node verification) -------------------------------------------------
+
+// Input bounds: both frames truncated at EVERY byte offset never decode; a short block length never decodes; a
+// longer block (a newer peer's extension) still decodes the known fields.
+TEST(TxnVerifyRemoteRegression, VerifyFramesTruncatedAtEveryOffsetNeverDecodeAdversarialRegression) {
+    VerifyTxnPartitionResponseMsg r{};
+    r.requesterNodeId = 4; r.topicId = 5; r.token = 77; r.producerId = 1234; r.partition = 6; r.producerEpoch = 3;
+    r.errorCode = 19;
+    uint8_t buf[VerifyTxnPartitionMsg::TOTAL_SIZE + 16]{};
+    for (const bool ask : {true, false}) {
+        SCOPED_TRACE(ask ? "ask" : "answer");
+        const std::size_t n = ask ? static_cast<const VerifyTxnPartitionMsg&>(r).encode(buf, sizeof buf)
+                                  : r.encode(buf, sizeof buf);
+        ASSERT_EQ(n, VerifyTxnPartitionMsg::TOTAL_SIZE);
+        for (std::size_t len = 0; len < n; ++len) {
+            VerifyTxnPartitionMsg d{};
+            VerifyTxnPartitionResponseMsg rd{};
+            EXPECT_FALSE(ask ? VerifyTxnPartitionMsg::decode(buf, len, d) : VerifyTxnPartitionResponseMsg::decode(buf, len, rd))
+                << "decoded at length " << len;
+        }
+    }
+    // Block length below the fixed block: refused.
+    ASSERT_EQ(r.encode(buf, sizeof buf), VerifyTxnPartitionMsg::TOTAL_SIZE);
+    rune::replication::ReplicationMessageHeader::encode(buf, 0, VerifyTxnPartitionMsg::BLOCK_LENGTH - 1,
+                                                        VerifyTxnPartitionResponseMsg::TEMPLATE_ID);
+    VerifyTxnPartitionResponseMsg rd{};
+    EXPECT_FALSE(VerifyTxnPartitionResponseMsg::decode(buf, VerifyTxnPartitionMsg::TOTAL_SIZE, rd));
+    // A longer block with trailing bytes: the known fields decode unchanged.
+    ASSERT_EQ(r.encode(buf, sizeof buf), VerifyTxnPartitionMsg::TOTAL_SIZE);
+    rune::replication::ReplicationMessageHeader::encode(buf, 0, VerifyTxnPartitionMsg::BLOCK_LENGTH + 16,
+                                                        VerifyTxnPartitionResponseMsg::TEMPLATE_ID);
+    ASSERT_TRUE(VerifyTxnPartitionResponseMsg::decode(buf, sizeof buf, rd));
+    EXPECT_EQ(rd.token, 77); EXPECT_EQ(rd.producerId, 1234); EXPECT_EQ(rd.errorCode, 19);
+}
+
+// Replays and forgeries: an answer whose token matches but whose partition / producer / epoch do not is dropped
+// (the ask stays in flight); the real answer then admits; a replay of it afterwards changes nothing.
+TEST(TxnVerifyRemoteRegression, MismatchedAndReplayedAnswersAreDroppedAdversarialRegression) {
+    VerifyGwRig R;
+    R.produceTxnData(77, 0, 1, 10);
+    ASSERT_EQ(R.ch.verifies.size(), 1u);
+    const VerifyTxnPartitionMsg ask = R.ch.verifies[0].second;
+    for (int field = 0; field < 4; ++field) {
+        VerifyTxnPartitionResponseMsg bad{};
+        static_cast<VerifyTxnPartitionMsg&>(bad) = ask;
+        if (field == 0) bad.partition += 1;
+        if (field == 1) bad.topicId += 1;
+        if (field == 2) bad.producerId += 1;
+        if (field == 3) bad.producerEpoch += 1;
+        bad.errorCode = 0;
+        R.gw.onRemoteVerifyTxnPartitionResponse(bad);
+        R.runWorker(11 + field);
+        EXPECT_EQ(R.gw.txnVerifiesInFlightForTest(), 1u) << "a mismatched answer (field " << field << ") was taken";
+    }
+    R.produceTxnData(77, 0, 2, 20);
+    EXPECT_EQ(R.leo(), 0) << "a mismatched answer admitted the batch";
+    R.answer(0, 0, 30);
+    R.answer(0, 0, 31);   // replay
+    R.produceTxnData(77, 0, 3, 40);
+    EXPECT_EQ(R.leo(), 1);
+    R.answer(0, 0, 50);   // replay after the append
+    EXPECT_EQ(R.gw.txnVerifiesInFlightForTest(), 0u);
+    EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 1u);
+}
+
+// Precision of the lost-ask sweep: a reconnect of ANOTHER peer leaves the ask to the coordinator in flight (its
+// answer still admits), and a reconnect of the coordinator while the ask is still QUEUED (never sent) neither
+// fails nor drops it — it is sent once the plane takes it.
+TEST(TxnVerifyRemoteRegression, ReconnectSweepTouchesOnlySentAsksToThatPeerAdversarialRegression) {
+    {
+        VerifyGwRig R;
+        R.produceTxnData(77, 0, 1, 10);
+        ASSERT_EQ(R.ch.verifies.size(), 1u);
+        R.gw.onPlaneReconnect(/*peer=*/3);
+        (void)R.gw.pumpTxnVerifyForTest(11);
+        EXPECT_EQ(R.gw.txnVerifiesInFlightForTest(), 1u) << "another peer's reconnect failed the ask";
+        R.answer(0, 0, 20);
+        R.produceTxnData(77, 0, 2, 30);
+        EXPECT_EQ(R.leo(), 1);
+    }
+    {
+        VerifyGwRig R;
+        R.ch.acceptVerifies = false;
+        R.produceTxnData(77, 0, 1, 10);
+        ASSERT_TRUE(R.ch.verifies.empty());
+        R.gw.onPlaneReconnect(/*peer=*/2);
+        (void)R.gw.pumpTxnVerifyForTest(11);
+        EXPECT_EQ(R.gw.txnVerifiesInFlightForTest(), 1u) << "an unsent ask was failed by a reconnect";
+        R.ch.acceptVerifies = true;
+        (void)R.gw.pumpTxnVerifyForTest(12);
+        ASSERT_EQ(R.ch.verifies.size(), 1u) << "the queued ask was never sent";
+        R.answer(0, 0, 20);
+        R.produceTxnData(77, 0, 2, 30);
+        EXPECT_EQ(R.leo(), 1);
+    }
+}
+
 // ============================================================================
 // Part 2 — integration: three in-process nodes over the REAL cluster-plane
 // transport (one AeronPartitionTransport per node on one embedded driver; real
