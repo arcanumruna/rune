@@ -23,9 +23,9 @@ TEST(AuthEnforcementRegression, ProduceAllowedAndDenied) {
     const int64_t onlyRead = r.newUser({exact(SO::Read, ST::Topic, "orders")});
     const int64_t none = r.newUser({});
     EXPECT_EQ(r.produce(may, r.orders, /*untilOk=*/true), kOk);
-    EXPECT_EQ(r.produce(onlyRead, r.orders), kNotAuthorized) << "READ is not WRITE";
-    EXPECT_EQ(r.produce(none, r.orders), kNotAuthorized) << "default deny";
-    EXPECT_EQ(r.produce(may, r.secret), kNotAuthorized) << "WRITE on one topic is not WRITE on another";
+    EXPECT_EQ(r.produceDenied(onlyRead, r.orders), kNotAuthorized) << "READ is not WRITE";
+    EXPECT_EQ(r.produceDenied(none, r.orders), kNotAuthorized) << "default deny";
+    EXPECT_EQ(r.produceDenied(may, r.secret), kNotAuthorized) << "WRITE on one topic is not WRITE on another";
 }
 
 TEST(AuthEnforcementRegression, SubscribeAllowedAndDenied) {
@@ -33,8 +33,8 @@ TEST(AuthEnforcementRegression, SubscribeAllowedAndDenied) {
     const int64_t may = r.newUser({exact(SO::Read, ST::Topic, "orders")});
     const int64_t none = r.newUser({});
     ASSERT_TRUE(r.c().subscribeUntilBound(r.ch(), r.stream(), may, r.orders, 0, 0, AuthRig::dl(15)));
-    EXPECT_EQ(r.subscribe(none, r.orders), kNotAuthorized);
-    EXPECT_EQ(r.subscribe(may, r.secret), kNotAuthorized);
+    EXPECT_EQ(r.subscribeDenied(none, r.orders), kNotAuthorized);
+    EXPECT_EQ(r.subscribeDenied(may, r.secret), kNotAuthorized);
 }
 
 TEST(AuthEnforcementRegression, CatalogReadsNeedDescribeOnClusterRegression) {
@@ -50,7 +50,7 @@ TEST(AuthEnforcementRegression, SecurityReadsNeedAdminOnClusterRegression) {
     const int64_t admin = r.newUser({cluster(SO::Admin)});
     const int64_t describe = r.newUser({cluster(SO::Describe)});
     EXPECT_EQ(r.subscribe(admin, rune::protocol::client::kSecurityTopicId), kOk);
-    EXPECT_EQ(r.subscribe(describe, rune::protocol::client::kSecurityTopicId), kNotAuthorized);
+    EXPECT_EQ(r.subscribeDenied(describe, rune::protocol::client::kSecurityTopicId), kNotAuthorized);
 }
 
 TEST(AuthEnforcementRegression, GroupRowsAllowedAndDenied) {
@@ -507,8 +507,8 @@ TEST(AuthEnforcementRegression, SelfPasswordChangeNeedsAFreshProofOfTheCurrentPa
 TEST(AuthEnforcementRegression, AdminClusterGrantsNoDataAccess) {
     AuthRig r;
     const int64_t admin = r.newUser({cluster(SO::Admin)});
-    EXPECT_EQ(r.produce(admin, r.orders), kNotAuthorized);
-    EXPECT_EQ(r.subscribe(admin, r.orders), kNotAuthorized);
+    EXPECT_EQ(r.produceDenied(admin, r.orders), kNotAuthorized);
+    EXPECT_EQ(r.subscribeDenied(admin, r.orders), kNotAuthorized);
     EXPECT_EQ(r.getTopicSchema(admin, "orders"), kNotAuthorized);
     EXPECT_EQ(r.catalogSubscribe(admin), kNotAuthorized);
     EXPECT_TRUE(r.metadataTopics(admin).empty());
@@ -521,9 +521,9 @@ TEST(AuthEnforcementRegression, DescribeOnClusterTurnsAMissingIdIntoUnknownTopic
     constexpr int32_t kMissing = 99'999;
     EXPECT_EQ(r.subscribe(describe, kMissing), kUnknownTopic);
     EXPECT_EQ(r.produce(describe, kMissing), kUnknownTopic);
-    EXPECT_EQ(r.subscribe(none, kMissing), kNotAuthorized);
-    EXPECT_EQ(r.produce(none, kMissing), kNotAuthorized);
-    EXPECT_EQ(r.subscribe(describe, r.secret), kNotAuthorized) << "an existing topic it may not READ is still refused";
+    EXPECT_EQ(r.subscribeDenied(none, kMissing), kNotAuthorized);
+    EXPECT_EQ(r.produceDenied(none, kMissing), kNotAuthorized);
+    EXPECT_EQ(r.subscribeDenied(describe, r.secret), kNotAuthorized) << "an existing topic it may not READ is still refused";
 }
 
 TEST(AuthEnforcementRegression, AnObjectCreatedAfterLoginIsCoveredByAPrefixRegression) {
@@ -539,7 +539,7 @@ TEST(AuthEnforcementRegression, AnObjectCreatedAfterLoginIsCoveredByAPrefixRegre
     EXPECT_EQ(r.defineTopicCode(r.builder, "other.zone"), kOk);
     const auto other = r.c().awaitSchema(r.c().sendGetTopicSchema(r.ch(), r.stream(), r.builder, "other.zone"), AuthRig::dl());
     ASSERT_TRUE(other.has_value());
-    EXPECT_EQ(r.produce(world, other->topicId), kNotAuthorized) << "a non-matching name is not covered";
+    EXPECT_EQ(r.produceDenied(world, other->topicId), kNotAuthorized) << "a non-matching name is not covered";
 }
 
 TEST(AuthEnforcementRegression, ADroppedTopicsIdLosesItsBitsRegression) {
@@ -552,14 +552,14 @@ TEST(AuthEnforcementRegression, ADroppedTopicsIdLosesItsBitsRegression) {
     EXPECT_EQ(r.produce(world, id, /*untilOk=*/true), kOk);
     EXPECT_EQ(r.dropTopicCode(r.builder, "world.gone"), kOk);
     EXPECT_NE(r.produce(world, id), kOk);
-    EXPECT_EQ(r.produce(world, id), kNotAuthorized) << "a dropped id is no longer live: D22, no DESCRIBE ON CLUSTER";
+    EXPECT_EQ(r.produceDenied(world, id), kNotAuthorized) << "a dropped id is no longer live: D22, no DESCRIBE ON CLUSTER";
 }
 
 TEST(AuthEnforcementRegression, TheUnauthorizedAnswerCounterAndLogNameTheTextRegression) {
     LogCapture log;
     AuthRig r;
     const int64_t none = r.newUser({});
-    EXPECT_EQ(r.subscribe(none, r.orders), kNotAuthorized);
+    EXPECT_EQ(r.subscribeDenied(none, r.orders), kNotAuthorized);
     EXPECT_GE(log.count("not authorized: READ on TOPIC"), 1) << "the broker says why in its own log (the wire says only the D23 text)";
 }
 
@@ -572,10 +572,10 @@ TEST(AuthEnforcementRegression, ObjectsThatExistedAtBootAreCoveredAfterARestartR
     const int64_t sid = r.login(reader);
     ASSERT_TRUE(r.c().subscribeUntilBound(r.ch(), r.stream(), sid, r.orders, 0, 0, AuthRig::dl(20)))
         << "the boot ObjectIndex reached the gateway: the READ bit of a topic created before the restart";
-    EXPECT_EQ(r.subscribe(sid, r.secret), kNotAuthorized);
+    EXPECT_EQ(r.subscribeDenied(sid, r.secret), kNotAuthorized);
     const int64_t w = r.login("worlder");
     EXPECT_EQ(r.produce(w, r.orders, /*untilOk=*/true), kOk) << "a prefix grant covers a boot topic";
-    EXPECT_EQ(r.produce(w, r.secret), kNotAuthorized);
+    EXPECT_EQ(r.produceDenied(w, r.secret), kNotAuthorized);
     const int64_t viewReader = [&] { r.broker().createUser("vr", AuthRig::kPw, {exact(SO::Read, ST::View, "board")}); return r.login("vr"); }();
     EXPECT_NE(r.getViewRow(viewReader, r.board), kNotAuthorized) << "a boot view sink is typed as a VIEW";
 }
@@ -773,7 +773,7 @@ TEST(AuthEnforcementRegression, TrailerFlagsOnStatementsTheyDoNotGovernChangeNot
     g.patternKind = static_cast<uint8_t>(rune::protocol::SecurityPatternKind::Exact); g.pattern = "orders";
     g.flags = pc::kSecurityDdlFlagForce;
     EXPECT_EQ(r.wire().securityDdl(r.ch(), g, "GRANT READ ON TOPIC orders TO USER " + name + ";").errorCode, 0u);
-    EXPECT_EQ(r.produce(self, r.orders), kNotAuthorized) << "only READ was granted";
+    EXPECT_EQ(r.produceDenied(self, r.orders), kNotAuthorized) << "only READ was granted";
 }
 
 // #129 through a ROLE: ALTER held only through a role adopts the schema; the role revoked mid-session, the very next

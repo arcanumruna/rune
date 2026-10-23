@@ -102,6 +102,7 @@ public:
         w_ = &b_.wire();
         c().captureRawAnswers(true);
         builder = login("builder");
+        if (writer_ != 0) writer_ = login("rigwriter");
     }
 
     // ── users and sessions ──────────────────────────────────────────────────────────────────────────────────
@@ -148,13 +149,92 @@ public:
     int produce(int64_t sid, int32_t topicId, bool untilOk = false) {
         if (untilOk) return c().produceUntilOk(ch(), stream(), sid, topicId, 0, 1, makeBatch(1)) ? 0 : kNoAnswer;
         const int64_t corr = c().nextCorrelationId();
+        lastCorr_ = corr;
         if (!c().produce(ch(), stream(), sid, corr, topicId, 0, 1, makeBatch(1))) return kNoAnswer;
         const auto a = c().awaitProduceResponseUntil(corr, dl());
         return a ? a->errorCode : kNoAnswer;
     }
     int subscribe(int64_t sid, int32_t topicId) {
-        const auto code = c().awaitSubscribeCode(c().sendSubscribe(ch(), stream(), sid, topicId, 0), dl());
+        lastCorr_ = c().sendSubscribe(ch(), stream(), sid, topicId, 0);
+        const auto code = c().awaitSubscribeCode(lastCorr_, dl());
         return code ? *code : kNoAnswer;
+    }
+    /// The correlation id of the last produce() (not untilOk) / subscribe().
+    [[nodiscard]] int64_t lastCorr() const noexcept { return lastCorr_; }
+
+    // ── issue #278: what a refused request must NOT have done ──────────────────────────────────────────────────
+    /// The log end offset of (topicId, partition) on this broker, read on the replica's owner thread (-1: none here).
+    int64_t logEnd(int32_t topicId, int32_t partition = 0) {
+        return b_.node().onOwnerThreadForTest(topicId, partition, [](rune::replication::PartitionReplica* r) {
+            return r != nullptr ? r->logEndOffset() : int64_t{-1};
+        });
+    }
+    /// A Ping on `sid` (same channel and stream as every rig request) and its Pong: the frames of one session's stream
+    /// are ordered, so whatever the broker sent for `corr` before it is here now.  Then: `corr` was answered exactly
+    /// once (its refusal - no later success answer), and no Records frame arrived for a subscription the broker never
+    /// answered OK.
+    void expectNothingDelivered(int64_t sid, int64_t corr) {
+        pc::Ping p;
+        p.sessionId = sid; p.correlationId = c().nextCorrelationId();
+        uint8_t buf[64];
+        const std::size_t len = p.encode(buf);
+        ASSERT_TRUE(c().send(ch(), stream(), buf, len)) << "the Ping was not sent";
+        ASSERT_TRUE(c().awaitRaw(p.correlationId, dl()).has_value()) << "no Pong on session " << sid;
+        EXPECT_EQ(c().framesFor(corr), 1u) << "corr " << corr << " was answered more than once (a success after its refusal)";
+        EXPECT_EQ(c().strayRecords(), 0u) << "Records for a subscription the broker refused";
+    }
+    /// produce() expected refused: when it answers 45, also nothing else was answered for it and the log did not grow.
+    /// Returns the answer code (the caller asserts it).
+    int produceDenied(int64_t sid, int32_t topicId) {
+        const int64_t before = topicId >= 0 ? logEnd(topicId) : -1;
+        const int code = produce(sid, topicId);
+        if (code == kNotAuthorized) {
+            const int64_t corr = lastCorr_;
+            expectNothingDelivered(sid, corr);
+            if (topicId >= 0) EXPECT_EQ(logEnd(topicId), before) << "#278: a refused produce appended to topic " << topicId;
+        }
+        return code;
+    }
+    /// subscribe() expected refused: when it answers 45, also no subscription was registered (on an existing user topic:
+    /// expectSubscribeRegisteredNothing; otherwise nothing delivered).  Returns the answer code (the caller asserts it).
+    int subscribeDenied(int64_t sid, int32_t topicId) {
+        const int code = subscribe(sid, topicId);
+        if (code == kNotAuthorized) {
+            const int64_t corr = lastCorr_;
+            if (topicId >= 0 && logEnd(topicId) >= 0) expectSubscribeRegisteredNothing(sid, corr, topicId);
+            else expectNothingDelivered(sid, corr);
+        }
+        return code;
+    }
+    /// A refused Subscribe (`corr` on `sid`) registered nothing: nothing delivered; then an allowed writer appends one
+    /// record that an allowed reader (a fresh builder session bound at the log end) is pushed - so the fan-out ran -
+    /// and still nothing reached the refused session.
+    void expectSubscribeRegisteredNothing(int64_t sid, int64_t corr, int32_t topicId) {
+        expectNothingDelivered(sid, corr);
+        if (::testing::Test::HasFatalFailure()) return;
+        if (writer_ == 0) {
+            b_.createUser("rigwriter", kPw, {grants::prefix(rune::protocol::SecurityOperation::Write,
+                                                            rune::protocol::SecurityResourceType::Topic, "")});
+            writer_ = login("rigwriter");
+        }
+        const int64_t watcher = login("builder");
+        int64_t watchCorr = 0;
+        for (int i = 0; i < 200; ++i) {   // NotLeader while the partition settles: re-sent (bounded)
+            watchCorr = c().subscribeIsolated(ch(), stream(), watcher, topicId, 0, /*fromOffset=Latest*/ -1, 0);
+            const auto code = c().awaitSubscribeCode(watchCorr, dl());
+            ASSERT_TRUE(code.has_value()) << "the watcher's Subscribe was not answered";
+            if (*code == 0) break;
+            ASSERT_EQ(*code, static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "the watcher's Subscribe";
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        const auto watchId = c().subscriptionIdOf(watchCorr);
+        ASSERT_TRUE(watchId.has_value());
+        ASSERT_EQ(produce(writer_, topicId, /*untilOk=*/true), 0) << "the allowed writer's produce";
+        ASSERT_TRUE(c().pollUntil([&] {
+            for (const auto& r : c().records()) if (r.subscriptionId == *watchId) return true;
+            return false;
+        })) << "the allowed reader was never pushed the new record";
+        expectNothingDelivered(sid, corr);
     }
     int catalogSubscribe(int64_t sid) {
         const auto code = c().awaitSubscribeCode(c().sendCatalogSubscribe(ch(), stream(), sid, 0), dl());
@@ -405,6 +485,8 @@ private:
     AuthBroker b_;
     AuthWireClient* w_ = nullptr;
     int seq_ = 0;
+    int64_t lastCorr_ = 0;
+    int64_t writer_ = 0;   ///< the "rigwriter" session (WRITE on every topic), made on first use
 };
 
 }  // namespace rune::node::test

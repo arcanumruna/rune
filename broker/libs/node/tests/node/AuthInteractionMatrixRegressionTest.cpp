@@ -58,6 +58,7 @@ static void runCell(AuthMatrixRig& rig, const Cell& c) {
     const auto first = cell.issue(c.op, missing);
     EXPECT_EQ(first.code, want.first) << label;
     EXPECT_EQ(first.templ, first.wantTempl) << label << ": the answer is not in the op's own response type";
+    if (want.first == 45) EXPECT_EQ(first.appended, 0) << label << ": #278: a refused produce appended";
     if (c.op == Op::Metadata) EXPECT_EQ(first.present, want.presentFirst) << label;
     if (want.viewStatus != kNone) EXPECT_EQ(first.viewStatus, want.viewStatus) << label;
 
@@ -78,6 +79,7 @@ static void runCell(AuthMatrixRig& rig, const Cell& c) {
             } else {
                 const auto second = cell.issue(c.op, false);
                 EXPECT_EQ(second.code, want.second) << label;
+                if (want.second == 45) EXPECT_EQ(second.appended, 0) << label << ": #278: a refused produce appended";
                 EXPECT_EQ(second.templ, second.wantTempl) << label << ": the second answer is not in the op's own response type";
                 if (c.op == Op::Metadata) EXPECT_EQ(second.present, want.presentSecond) << label;
             }

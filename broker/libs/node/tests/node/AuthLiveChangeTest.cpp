@@ -102,7 +102,7 @@ TEST(AuthLiveChangeRegression, RevokedReadEndsLiveSubscriptionsRegression) {
     ASSERT_EQ(t.r.produce(ws, t.r.orders), 0);
     EXPECT_TRUE(t.quiet(sub.id, 500ms)) << "nothing is delivered after the end";
     EXPECT_EQ(t.pushes(sub.id), seen);
-    EXPECT_EQ(t.r.subscribe(rs, t.r.orders), 45) << "a new Subscribe is refused";
+    EXPECT_EQ(t.r.subscribeDenied(rs, t.r.orders), 45) << "a new Subscribe is refused";
 }
 
 TEST(AuthLiveChangeRegression, RevokedReadKeepsTheUsersOtherSubscriptionsRegression) {
@@ -126,7 +126,7 @@ TEST(AuthLiveChangeRegression, RevokedWriteFailsTheNextGatewayProduceRegression)
     const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")}, &writer);
     ASSERT_EQ(t.r.produce(ws, t.r.orders, /*untilOk=*/true), 0);
     ASSERT_EQ(t.revokeExact(writer, SO::Write, ST::Topic, "orders"), 0);
-    EXPECT_EQ(t.r.produce(ws, t.r.orders), 45) << "the very next produce after the OK";
+    EXPECT_EQ(t.r.produceDenied(ws, t.r.orders), 45) << "the very next produce after the OK";
 }
 
 TEST(AuthLiveChangeRegression, RevokedWriteFailsTheNextShardProduceRegression) {
@@ -152,7 +152,9 @@ TEST(AuthLiveChangeRegression, RevokedWriteFailsTheNextShardProduceRegression) {
     };
     ASSERT_EQ(shardProduce(200), 0);
     ASSERT_EQ(t.revokeExact(writer, SO::Write, ST::Topic, "orders"), 0);
+    const int64_t before = t.r.logEnd(t.r.orders);
     EXPECT_EQ(shardProduce(1), 45) << "the worker's bitmap was replaced before the DDL's OK (D24)";
+    EXPECT_EQ(t.r.logEnd(t.r.orders), before) << "#278: the refused produce appended nothing";
     ASSERT_EQ(t.grantExact(writer, SO::Write, ST::Topic, "orders"), 0);
     EXPECT_EQ(shardProduce(1), 0) << "and a re-grant opens it again, without a new login";
 }
@@ -175,7 +177,7 @@ TEST(AuthLiveChangeRegression, RoleRevokeRefreshesEveryMember) {
     for (const auto& s : subs) ASSERT_TRUE(t.awaitPushes(s.id, 1));
     ASSERT_EQ(t.revoke("readers", true, SO::Read, ST::Topic, SP::Exact, "orders"), 0);
     for (const auto& s : subs) EXPECT_EQ(t.errorOn(s.corr), 45);
-    for (const int64_t s : sessions) EXPECT_EQ(t.r.subscribe(s, t.r.orders), 45);
+    for (const int64_t s : sessions) EXPECT_EQ(t.r.subscribeDenied(s, t.r.orders), 45);
 }
 
 TEST(AuthLiveChangeRegression, DropRoleRefreshesMembers) {
@@ -189,14 +191,14 @@ TEST(AuthLiveChangeRegression, DropRoleRefreshesMembers) {
     ASSERT_GT(sub.id, 0);
     ASSERT_EQ(t.dropRole("readers"), 0);
     EXPECT_EQ(t.errorOn(sub.corr), 45) << "the member loses what the dropped role gave";
-    EXPECT_EQ(t.r.subscribe(s, t.r.orders), 45);
+    EXPECT_EQ(t.r.subscribeDenied(s, t.r.orders), 45);
 }
 
 TEST(AuthLiveChangeRegression, GrantArrivesWithoutReconnect) {
     Live t("livegrant");
     std::string name;
     const int64_t s = t.r.newUser({}, &name);
-    EXPECT_EQ(t.r.subscribe(s, t.r.orders), 45);
+    EXPECT_EQ(t.r.subscribeDenied(s, t.r.orders), 45);
     ASSERT_EQ(t.grantExact(name, SO::Read, ST::Topic, "orders"), 0);
     EXPECT_EQ(t.r.subscribe(s, t.r.orders), 0) << "the same session, no reconnect";
 }
@@ -210,7 +212,7 @@ TEST(AuthLiveChangeRegression, PrefixGrantCoversATopicCreatedAfterLogin) {
     EXPECT_EQ(t.r.subscribe(s, late), 0);
     const int32_t other = t.r.defineTopic(t.r.builder, "x.late");
     ASSERT_GE(other, 0);
-    EXPECT_EQ(t.r.subscribe(s, other), 45) << "a topic outside the prefix";
+    EXPECT_EQ(t.r.subscribeDenied(s, other), 45) << "a topic outside the prefix";
 }
 
 TEST(AuthLiveChangeRegression, DisableRevokesEnableAllowsLogin) {
@@ -425,7 +427,7 @@ TEST(AuthLiveChangeRegression, TheGrantOkIsEnforcedByTheAnsweringBrokerImmediate
         ASSERT_EQ(t.grantExact(name, SO::Write, ST::Topic, "orders"), 0) << i;
         ASSERT_EQ(t.r.produce(s, t.r.orders), 0) << "GRANT then, with zero delay, a produce: OK (iteration " << i << ")";
         ASSERT_EQ(t.revokeExact(name, SO::Write, ST::Topic, "orders"), 0) << i;
-        ASSERT_EQ(t.r.produce(s, t.r.orders), 45) << "REVOKE then, with zero delay, a produce: refused (iteration " << i << ")";
+        ASSERT_EQ(t.r.produceDenied(s, t.r.orders), 45) << "REVOKE then, with zero delay, a produce: refused (iteration " << i << ")";
     }
 }
 
@@ -697,7 +699,7 @@ TEST(AuthLiveChangeRegression, NoRecordAfterTheEndOnPerWorkerEgressRegression) {
     for (const auto& p : t.r.c().records())
         EXPECT_FALSE(p.subscriptionId == sub.id && p.seq > endSeq)
             << "a Records frame (offset " << p.baseOffset << ") arrived after the subscription's 45";
-    EXPECT_EQ(t.r.subscribe(rs, t.r.orders), 45) << "a new Subscribe is refused";
+    EXPECT_EQ(t.r.subscribeDenied(rs, t.r.orders), 45) << "a new Subscribe is refused";
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════

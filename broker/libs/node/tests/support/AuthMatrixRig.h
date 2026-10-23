@@ -49,6 +49,7 @@ public:
         uint16_t templ = 0;          ///< the answer frame's template id
         uint16_t wantTempl = 0;      ///< the template the op's own response type has (at the stage that answered)
         int stage = 0;               ///< TxnProduce: 0 InitProducerId, 1 AddPartitionsToTxn, 2 Produce
+        int64_t appended = 0;        ///< Produce ops on an existing topic: how far its log end moved (issue #278)
     };
     /// One transactional producer of a session (TxnProduce): initialised once, its sequence advanced per produce.
     struct TxnState { bool inited = false; int64_t pid = 1; int16_t epoch = 0; int32_t seq = 0; };
@@ -316,6 +317,9 @@ public:
                                  op == Op::Subscribe || op == Op::ViewRead || op == Op::ViewOpen;
         const int32_t tid = missing && idAddressed ? kMissingId : tid_;
         const int32_t vid = missing && idAddressed ? kMissingId : vid_;
+        // Issue #278: a refused produce appends nothing (the log end of an existing topic, before and after).
+        const bool writes = op == Op::Produce || op == Op::ProduceRouted || op == Op::TxnProduce;
+        const int64_t leoBefore = writes && tid >= 0 ? r_.logEnd(tid) : -1;
         switch (op) {
             case Op::Produce: a.wantTempl = tmpl(TID::ProduceResponse); a.code = produceVia(r_.broker().workerIngressChannel(), sid, tid, makeBatch(1), a); break;
             case Op::ProduceRouted: a.wantTempl = tmpl(TID::ProduceResponse); a.code = produceVia(r_.ch(), sid, tid, makeBatch(1), a); break;
@@ -437,6 +441,7 @@ public:
             }
             case Op::kCount: break;
         }
+        if (leoBefore >= 0) a.appended = r_.logEnd(tid) - leoBefore;
         return a;
     }
 
