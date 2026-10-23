@@ -6744,6 +6744,48 @@ TEST(EndTxnRefusedPrepareRegression, EveryRefusedPutIsAnsweredNotCoordinatorThen
     EXPECT_TRUE(T.controlFrames.empty());
 }
 
+// #562: txn1 commits and its CompleteCommit append is refused (the __transaction_state ISR below minIsr), so the store
+// still holds txn1's COMMITTED PrepareCommit.  txn2, with the same producer id and epoch, registers its partition
+// (append refused, answered NotCoordinator, in memory) and ends with commit (PrepareCommit append refused).  The
+// prepare gate must not take txn1's record - same (state, pid, epoch) - for txn2's: no COMMIT marker is written for
+// txn2 until txn2's OWN PrepareCommit is in the log and committed.  RED (before the fix): the gate opened on txn1's
+// committed record and the marker landed at once (data log end 4).
+TEST(TxnPrepareGateRegression, ARefusedPrepareNeverOpensOnThePreviousTxnsCommittedRecordRegression) {
+    TxnRig T(/*minIsr=*/1, /*withStore=*/true);
+    (void)ongoingWithOneBatch556(T);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
+    T.stateReplica->setMinIsrForTest(2);                     // every __transaction_state append is refused
+    T.runUntilNoMarkerAwaited(10);
+    ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit);
+    ASSERT_EQ(T.store->get(T.txnId)->state, tx::TxnState::PrepareCommit) << "precondition: completion not durable";
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 2) << "txn1's batch + its COMMIT marker";
+
+    EXPECT_EQ(T.addPartition(), kNotCoordinator) << "txn2's registration append is refused";
+    ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::Ongoing) << "precondition: registered in memory";
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(20 + i);
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 3);
+    EXPECT_EQ(T.endTxn(/*commit=*/true), kNotCoordinator) << "txn2's PrepareCommit append is refused";
+    ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::PrepareCommit);
+    for (int i = 0; i < 8; ++i) { (void)T.tcs->doWork(100 + i); T.m.runWorker(100 + i); }
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 3) << "a COMMIT marker was written for a PrepareCommit that is not durable";
+    EXPECT_EQ(T.tcs->prepareGates(), 1u) << "txn2's decision is no longer driven by the coordinator";
+    EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 0u) << "txn2's markers were dispatched";
+
+    // Appends succeed again: the gate appends txn2's PrepareCommit; once it is committed the marker is written.
+    T.stateReplica->setMinIsrForTest(1);
+    const int64_t stateEnd = T.stateReplica->logEndOffset();
+    (void)T.tcs->doWork(200);
+    ASSERT_GT(T.stateReplica->logEndOffset(), stateEnd) << "txn2's PrepareCommit was appended";
+    EXPECT_GE(T.stateReplica->highWatermark(), stateEnd + 1) << "the gate opened before the record committed";
+    EXPECT_EQ(T.tcs->prepareGates(), 0u);
+    for (int i = 0; i < 16 && T.tcs->awaitingMarkerTxnsForTest() > 0; ++i) { (void)T.tcs->doWork(300 + i); T.m.runWorker(300 + i); }
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 4) << "exactly one COMMIT marker for txn2";
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit);
+    EXPECT_EQ(T.store->get(T.txnId)->state, tx::TxnState::CompleteCommit);
+    EXPECT_TRUE(T.controlFrames.empty()) << "an unsolicited answer";
+}
+
 // ============================================================================
 // Issue #112 (F15-FU1, KIP-890 part 1): a transactional batch of a producer with no open transaction on the
 // partition is appended only once the transaction coordinator confirmed the partition is registered in that

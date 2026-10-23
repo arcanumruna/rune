@@ -450,7 +450,9 @@ int16_t TransactionCoordinationService::verifyTxnPartition(int64_t producerId, i
     // The registration must survive a coordinator failover: its record committed.
     // (AddPartitions answers only then, so a client that waits for it never sees this.)
     if (txnState_ != nullptr) {
-        if (const auto it = lastPutOffset_.find(meta->txnId); it != lastPutOffset_.end() && !committed_(it->second))
+        // #562: a refused put (kUnpersisted) leaves the id's OLDER committed record in the index - never durable.
+        if (const auto it = lastPutOffset_.find(meta->txnId);
+            it != lastPutOffset_.end() && (it->second == kUnpersisted || !committed_(it->second)))
             return static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions);
     }
     return 0;
@@ -496,6 +498,7 @@ bool TransactionCoordinationService::persist_(const tx::TransactionMetadata& met
     const int64_t at = txnState_->putAt(meta, coordinatorEpoch_);
     if (at < 0) {
         requestPutRefused_ = true;
+        lastPutOffset_[meta.txnId] = kUnpersisted;   // #562: the id's older record must not stand for this state
         return false;
     }
     if (at > requestPutOffset_) requestPutOffset_ = at;
@@ -587,7 +590,10 @@ TransactionCoordinationService::PrepareGate TransactionCoordinationService::make
     }
     // The record of THIS Prepare* is the store's last append for the id when it matches the state; a loaded one
     // (no append since the load) is committed.  Otherwise (a timeout abort is never appended by the coordinator
-    // itself) it is appended by gateOpen_.
+    // itself) it is appended by gateOpen_.  #562: after a refused put the store still holds the id's PREVIOUS record
+    // - possibly the previous transaction's PrepareCommit with the same (pid, epoch) - so it is never matched then.
+    if (const auto it = lastPutOffset_.find(meta.txnId); it != lastPutOffset_.end() && it->second == kUnpersisted)
+        return g;   // recordOffset = kNeedsPut
     const auto* stored = txnState_->get(meta.txnId);
     const bool same = stored != nullptr && stored->state == meta.state && stored->producerId == meta.producerId &&
                       stored->producerEpoch == meta.producerEpoch;
@@ -1231,12 +1237,16 @@ bool TransactionCoordinationService::completeAwaiting_(int64_t producerId)
         int64_t floor  = -1;   // the id's last record before the completion (its Prepare*): never the stand-in
         if (txnState_ != nullptr) {
             record = kHoldNeedsPut;
-            if (const auto lp = lastPutOffset_.find(a.txnId); lp != lastPutOffset_.end()) floor = lp->second;
+            // #562: a refused previous put names no record (kUnpersisted): no floor.
+            if (const auto lp = lastPutOffset_.find(a.txnId); lp != lastPutOffset_.end() && lp->second != kUnpersisted)
+                floor = lp->second;
             if (const auto* meta = coordinator_.metadata(a.txnId)) {
                 const int64_t at = txnState_->putAt(*meta, coordinatorEpoch_);
                 if (at >= 0) {
                     record = at;
                     lastPutOffset_[a.txnId] = at;
+                } else {
+                    lastPutOffset_[a.txnId] = kUnpersisted;   // #562: the Prepare* record is not this state's
                 }
             }
         }
@@ -1528,9 +1538,11 @@ int TransactionCoordinationService::releaseCommittedHolds_()
             const auto* m = coordinator_.metadata(h.txnId);
             if (m != nullptr && (m->state == tx::TxnState::CompleteCommit || m->state == tx::TxnState::CompleteAbort)) {
                 const int64_t at = txnState_->putAt(*m, coordinatorEpoch_);
-                if (at >= 0) lastPutOffset_[h.txnId] = at;
+                lastPutOffset_[h.txnId] = at >= 0 ? at : kUnpersisted;   // #562
             }
-            if (const auto lp = lastPutOffset_.find(h.txnId); lp != lastPutOffset_.end() && lp->second > h.putFloor) {
+            // #562: only a real record (never kUnpersisted) appended after the Prepare* stands in for the Complete*.
+            if (const auto lp = lastPutOffset_.find(h.txnId);
+                lp != lastPutOffset_.end() && lp->second >= 0 && lp->second > h.putFloor) {
                 for (auto& [k, other] : holds_)   // every key of that completion waits on the same record
                     if (other.txnId == h.txnId && other.completeRecord == kHoldNeedsPut) other.completeRecord = lp->second;
             }

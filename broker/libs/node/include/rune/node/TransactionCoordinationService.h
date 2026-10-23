@@ -332,6 +332,12 @@ private:
     std::deque<ParkedAnswer> parked_;                 ///< in record order (appends are monotone)
     std::vector<std::vector<uint8_t>> spareBufs_;     ///< recycled ParkedAnswer buffers (steady state allocates nothing)
     static constexpr int64_t kNeedsPut = -2;          ///< PrepareGate: the Prepare* record is not appended yet
+    /// #562: lastPutOffset_ value after a REFUSED put (min-ISR): the id's current in-memory state is in no record.
+    /// The store's index (and this map before the refusal) still names the id's PREVIOUS record, which may match the
+    /// current state on (state, pid, epoch) - e.g. the previous transaction's committed PrepareCommit - so nothing may
+    /// take it for the current state's: a gate appends again (kNeedsPut), a registration is not committed, a hold
+    /// floor / stand-in is never this value.  Cleared by the next successful put of the id (or a load).
+    static constexpr int64_t kUnpersisted = -4;
     struct PrepareGate {
         rune::transaction::TransactionalId          txnId;
         int64_t                                     producerId       = -1;
@@ -345,7 +351,8 @@ private:
         int64_t                                     recordOffset     = kNeedsPut;
     };
     std::vector<PrepareGate> prepareGates_;
-    /// The offset of the last record appended per transactional id (cleared on load: the loaded log is committed).
+    /// The offset of the last record appended per transactional id (cleared on load: the loaded log is committed);
+    /// kUnpersisted when the id's last put was refused.  No entry: the id's state is the loaded (committed) one.
     std::map<rune::transaction::TransactionalId, int64_t, std::less<>> lastPutOffset_;
     /// #112: producer id → its transactional id (a cache for verifyTxnPartition; every hit
     /// is re-validated against the coordinator, cleared on load and when it outgrows the map).
