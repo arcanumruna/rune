@@ -23,13 +23,13 @@ The only worker change is in that function's two "invariant breach" warnings. Ea
 - **Branch.** `feature/checked-writes-10-persisted-over-transient`. Cut it from the latest `main` (`git fetch && git switch -c feature/checked-writes-10-persisted-over-transient origin/main`) **after Parts 01 and 03 have merged** (ruling R10c; 03 implies 02). Merge `main` in again before review.
 - **Preconditions.** Each must hit before Task 1; otherwise stop and tell the controller.
   - `grep -n "return Rejected(reject(kViewSourceTransient));" broker/libs/node/src/AdminWorker.cpp`: 1 hit, today line 1233.
-  - `grep -c "invariant breach" broker/libs/node/src/WorkerViewSet.cpp`: 2.
+  - `grep -c "a view over a transient source must" broker/libs/node/src/WorkerViewSet.cpp`: 2 (today `:378` and `:428`; one "invariant breach" literal is split across `:377-378`, so that phrase gives 1).
   - `grep -n "foldCursorForTest" broker/libs/node/include/rune/node/WorkerViewSet.h`: 1 hit, from Part 01.
   - `grep -n "enum class CheckpointMark" broker/libs/view/include/rune/view/ViewCheckpoint.h`: 1 hit, from Part 01.
-  - `grep -n "kAcksWireView" protocol/include/rune/protocol/client/DataMessages.h`: 1 hit, from Part 03.
+  - `grep -n "kAcksWireView" protocol/include/rune/protocol/client/DataMessages.h`: 1 hit, from Part 03. This is only the stop-gate that Part 03 has merged (R10c); the `View` ack cell itself is unconditional (PD8).
   - `grep -n "featureRefusal" broker/libs/node/include/rune/node/TopicFeatureRules.h`: ≥ 1 hit, from Part 02.
   - `grep -n "kViewSourceTransient" broker/libs/node/tests/node/DdlOccupantMatrixRegressionTest.cpp`: 1 hit, line 442.
-- **Line numbers** are cited against `main` before Parts 01–03. Those parts edit `WorkerViewSet.{h,cpp}`, `AdminWorker.cpp` and `Worker.h`, so locate each edit by the quoted text or by the function name.
+- **Line numbers** are cited against `main` before Parts 01–03. Those parts edit `WorkerViewSet.{h,cpp}`, `AdminWorker.cpp` and `Worker.h`, and Part 01 Task 10 inserts its aborted-transaction leg into `client-cpp/examples/view_probe.cpp` and `broker/docker/view-engine-e2e.sh`, so locate each edit by the quoted text, the sentinel or the function name.
 - **Builds.** These are already configured. If one is missing, stop and tell the controller.
   - `build/root`: Ninja, Debug, `BUILD_TESTING=ON`. Build with `cmake --build build/root -j14 --target <t>`. Test with `ctest --test-dir build/root -R <filter> -j14 --output-on-failure`.
   - `build/sub-client-cpp`: examples on.
@@ -69,7 +69,7 @@ These are copied verbatim from the overview (Plan 00). Every task implicitly inc
 - The `autoincrement` side window holds **32** batches = `kIdempotentMaxInFlightBatches` (`Protocol.h:16`).
 - Partition `p` assigns `n·P + p` for n = 1, 2, …. Id 0 is never assigned.
 - Index slot **13 bytes** (`tag u8 | word u64 | rid u32`). Plan key functions: 0 none, 1 `lower`, 2 reserved `casefold`.
-- `lower(string(N))` width = the largest lowered width at the pinned Unicode version (⌈3N/2⌉ at Unicode 15/16).
+- `lower(string(N))` width = the largest lowered width at the pinned Unicode version (⌊3N/2⌋ at Unicode 16.0.0, packed 0x00100000; R07a).
 - Wire `acks` byte: bit 0 = `All`, bit 1 = `View`. Other bits are refused with `InvalidRequest`.
 - Intent bits: record `attributes` bits 0–1. 0 = upsert/delete, 1 = insert, 2 = update/delete-existing. 3 and the other bits are refused with `InvalidRequest`.
 - `partitions` defaults to 1. Strings are UTF-8, and `lower()` is Unicode simple lowercasing.
@@ -253,20 +253,9 @@ Each cell writes H1, which is 6 records over keys 1–4 and groups 10, 20 and 30
 
   `CreateViewRegressionTest.cpp`. Replace `PersistedViewOverTransientSourceIsRejectedRegression` and its header comment (`:492-528`) with a fixture alias `class CheckedWritesTransientViewCreateRegression : public CreateViewRegression {};` and:
 
+  - `PersistedViewOverTransientSourceIsAcceptedRegression`: `defineCharacter()` with persistence 1 (transient, key `id`), `CreateView` persistence 0 → `lastViewError_ == 0`, `lastViewTopicId_ >= 0`, `byName("char_hp")` present with `persistence == 0`, `lastSinkCleanupPolicy_ == 1` (a compacted sink), one event, `drainInstalls() == 1`; after `restartAdmin_()` the view is still there and still persisted.
+
 ```cpp
-TEST_F(CheckedWritesTransientViewCreateRegression, PersistedViewOverTransientSourceIsAcceptedRegression) {
-    // defineCharacter() with persistence = 1 (transient, key "id"); CreateView persistence 0
-    EXPECT_EQ(lastViewError_, 0u);
-    EXPECT_GE(lastViewTopicId_, 0);
-    ASSERT_NE(viewRegistry_->byName("char_hp"), nullptr);
-    EXPECT_EQ(viewRegistry_->byName("char_hp")->persistence, 0u) << "persisted";
-    EXPECT_EQ(lastSinkCleanupPolicy_, 1u) << "a compacted sink was built";
-    EXPECT_EQ(events(), eventsBefore + 1);
-    EXPECT_EQ(viewSet_.drainInstalls(), 1);
-    restartAdmin_();
-    ASSERT_NE(viewRegistry_->byName("char_hp"), nullptr) << "the view survives the boot replay";
-    EXPECT_EQ(viewRegistry_->byName("char_hp")->persistence, 0u);
-}
 TEST_F(CheckedWritesTransientViewCreateRegression, PersistedViewOverKeylessTransientSourceIsStill35Regression) {
     // define "events_t": persistence 1, keyField "" (blob = characterBlob()); CreateView persisted over it
     EXPECT_EQ(lastViewError_, 35u) << "Part 02's keyless rule (R10b), never 37";
@@ -688,11 +677,11 @@ git commit -m "docs: persisted views over transient topics: durability, restarts
 **Files:**
 - Modify: `client-cpp/examples/view_probe.cpp`:
   - mode comment `:14-60`;
-  - setup, after step 7's read_committed check (`:1345-1361`) and before the handoff (`:1363`);
-  - `verify_restart`, after check (e) (`:1486-1510`) and before `VIEW-ENGINE-E2E: OK`.
+  - setup, after Part 01's leg 8 (right after it prints `ABORTED-FOLD: OK`; on today's `main` that leg sits after step 7's read_committed check, `:1345-1361`) and before the handoff (`:1363`) and `VIEW-PROBE-SETUP: OK`;
+  - `verify_restart`, after check (e) (`:1486-1510`) and after Part 01's `ABORTED-FOLD-RESTART: OK`, before `VIEW-ENGINE-E2E: OK`.
 - Modify: `broker/docker/view-engine-e2e.sh`:
   - header `:14-59`;
-  - sentinel and handoff checks next to `:320-340`;
+  - sentinel and handoff checks next to `:320-340`, after Part 01's `ABORTED-FOLD: OK` / `ABORTED-FOLD-RESTART: OK` checks;
   - the pre-restart wait before `:482`;
   - `CATALOG_NAMES` at `:450`;
   - the `verify_restart` env and the sentinel check.
