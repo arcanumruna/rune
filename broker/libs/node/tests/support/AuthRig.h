@@ -19,7 +19,9 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -124,6 +126,18 @@ public:
             if (Clock::now() >= deadline) return false;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
+    }
+    /// Issue #277: a login on a fresh session with `pw` in passwords[slot] only - the other slot carries a wrong
+    /// password (a proof that matches no verifier).  The gateway checks every slot's proof against that slot's
+    /// verifier (ScramServer: two slots always, a fake one for a one-password user).  Returns the login legs.
+    AuthWireClient::Login loginSlot(const std::string& user, int slot, const std::string& pw) {
+        const int64_t sid = w_->connect(ch());
+        if (sid <= 0) throw std::runtime_error("AuthRig: connect failed");
+        std::array<std::string, 2> pws{"wrong-password-0", "wrong-password-1"};
+        pws[static_cast<std::size_t>(slot)] = pw;
+        auto l = w_->login(ch(), sid, user, pws);
+        if (l.ok()) b_.noteLoginOk();
+        return l;
     }
     /// A new user with exactly `g`; returns its logged-in session.  `name` (optional) receives the user name.
     int64_t newUser(const std::vector<AuthGrant>& g, std::string* name = nullptr) {
@@ -256,6 +270,18 @@ public:
     int offsetFetch(int64_t sid, const std::string& group, int32_t topicId) {
         const auto a = c().offsetFetch(ch(), stream(), sid, group, topicId, 0);
         return a ? a->second : kNoAnswer;
+    }
+    /// Issue #277: an OffsetFetch with NO topic entries ("all topics" - OffsetFetch::entries empty).  The results the
+    /// answer lists; nullopt = no OffsetFetchResponse (an ErrorResponse / no answer).
+    std::optional<std::vector<pc::OffsetFetchResult>> offsetFetchAll(int64_t sid, const std::string& group) {
+        pc::OffsetFetch m;
+        m.sessionId = sid; m.correlationId = c().nextCorrelationId(); m.groupId = bytes(group);
+        const auto a = sendRaw(m, 512, m.correlationId, std::span<const pc::OffsetFetchEntry>{});
+        const auto r = a.empty() ? std::nullopt : pc::OffsetFetchResponse::decode(a.data(), a.size());
+        if (!r) return std::nullopt;
+        std::vector<pc::OffsetFetchResult> out;
+        for (const auto res : r->results) out.push_back(pc::OffsetFetchResult{res.topicId, res.partition, res.offset, res.errorCode});
+        return out;
     }
     int leaveGroup(int64_t sid, const std::string& group, const std::string& member = "nobody") {
         pc::LeaveGroup m;

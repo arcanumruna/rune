@@ -206,6 +206,7 @@ TEST(AuthEnforcementRegression, TransactionRowsAllowedAndDenied) {
     EXPECT_EQ(r.endTxn(none, "tx1"), kNotAuthorized);
 }
 
+// #277: intended (design D18) - a non-transactional producer id is unprivileged; every produce made with it is checked for WRITE.
 TEST(AuthEnforcementRegression, NonTransactionalInitProducerIdNeedsNoGrantRegression) {
     AuthRig r;
     const int64_t none = r.newUser({});
@@ -1044,4 +1045,47 @@ TEST(AuthEnforcementRegression, TxnOffsetCommitReadOnEveryEntryAndTheMemberFence
     EXPECT_EQ(r.txnOffsetCommitMany(u, "tx1", "cg", {r.orders}, p.pid, p.epoch), kOk)
         << "a legacy (version-9) frame without a member block was refused";
     EXPECT_EQ(r.txnOffsetCommitMany(u, "tx1", "cg", {r.orders}, p.pid, p.epoch, gen, member), kOk);
+}
+
+// #277: a fetch-all (an OffsetFetch with no topic entries) lists only the topics the caller may READ - here a group
+// with offsets committed for "orders" and "secret", read by a user holding READ on the group and on "orders" only.
+TEST(AuthEnforcementRegression, OffsetFetchAllReturnsOnlyReadableTopicsRegression) {
+    AuthRig r;
+    const int64_t committer = r.newUser({exact(SO::Read, ST::Group, "g277"), exact(SO::Read, ST::Topic, "orders"),
+                                         exact(SO::Read, ST::Topic, "secret")});
+    const int64_t reader = r.newUser({exact(SO::Read, ST::Group, "g277"), exact(SO::Read, ST::Topic, "orders")});
+    const auto [member, gen] = r.joinStable(committer, "g277", {r.orders, r.secret});
+    ASSERT_FALSE(member.empty());
+    ASSERT_EQ(r.commitAs(committer, "g277", member, gen, r.orders, 7), kOk);
+    ASSERT_EQ(r.commitAs(committer, "g277", member, gen, r.secret, 9), kOk);
+
+    const auto both = r.offsetFetchAll(committer, "g277");
+    ASSERT_TRUE(both.has_value()) << "the fetch-all was not answered";
+    ASSERT_EQ(both->size(), 2u) << "the committer reads both topics";
+
+    const auto seen = r.offsetFetchAll(reader, "g277");
+    ASSERT_TRUE(seen.has_value()) << "the filtered fetch-all was not answered";
+    ASSERT_EQ(seen->size(), 1u) << "only the readable topic is listed";
+    EXPECT_EQ(seen->front().topicId, r.orders);
+    EXPECT_EQ(seen->front().offset, 7);
+    EXPECT_EQ(seen->front().errorCode, 0);
+}
+
+// #277: a user with two passwords (ADD PASSWORD: rotation) logs in through EITHER verifier slot on its own - the other
+// slot's proof is wrong - and a login whose two proofs are both wrong fails 44.
+TEST(AuthEnforcementRegression, EachVerifierSlotAuthenticatesOnItsOwnRegression) {
+    AuthRig r;
+    constexpr const char* kSecond = "second-password-6789";
+    std::string name;
+    (void)r.newUser({}, &name);
+    r.broker().addPassword(name, kSecond);
+    // The verifiers are listed oldest first: slot 0 is the original password, slot 1 the added one.
+    const auto viaSlot0 = r.loginSlot(name, 0, AuthRig::kPw);
+    EXPECT_TRUE(viaSlot0.ok()) << "slot 0 alone: " << viaSlot0.errorCode();
+    EXPECT_TRUE(viaSlot0.serverSignatureValid());
+    const auto viaSlot1 = r.loginSlot(name, 1, kSecond);
+    EXPECT_TRUE(viaSlot1.ok()) << "slot 1 alone: " << viaSlot1.errorCode();
+    EXPECT_TRUE(viaSlot1.serverSignatureValid());
+    EXPECT_EQ(r.loginSlot(name, 0, "neither-password-1").errorCode(), 44) << "both proofs wrong";
+    EXPECT_EQ(r.loginSlot(name, 0, kSecond).errorCode(), 44) << "a password proves only its own slot";
 }
