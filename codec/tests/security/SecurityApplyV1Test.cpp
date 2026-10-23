@@ -1,6 +1,7 @@
 // Authentication spec §2/§3/§6: the frozen formatVer-1 rules of __security.
 #include "SecurityScript.h"
 #include <gtest/gtest.h>
+#include <algorithm>
 
 
 TEST(SecurityApplyV1Regression, CreateUserThenTwoPasswordsAtMost) {
@@ -245,4 +246,64 @@ TEST(SecurityApplyV1Regression, GrantsOnInternalNamesAreRefusedRegression) {
         EXPECT_EQ(sc.run(rs::GrantOps{rs::GranteeKind::User, b}, "u").error().refusal, rs::Refusal::InvalidGrant) << b.resource.name.substr(0, 12);
     EXPECT_TRUE(sc.run(rs::GrantOps{rs::GranteeKind::User, g(rs::Operation::Read, rs::ResourceType::Topic, rs::PatternKind::Exact, std::string(249, 'a'))}, "u").has_value());
     EXPECT_TRUE(sc.run(rs::GrantOps{rs::GranteeKind::User, g(rs::Operation::Read, rs::ResourceType::Topic, rs::PatternKind::Prefix, "_x")}, "u").has_value()) << "a single underscore is an ordinary name";
+}
+
+// Adversarial review of PR #597 (the dropRole fix): DROP ROLE with several members must remove EVERY membership from
+// the state (not only report it), so no member keeps the dropped role's grants: an admin role dropped leaves no
+// security admin; a role re-created under the same name is a new object that nobody holds; a GrantRole naming the
+// dropped role's id is UnknownRole; and the state equals a replay of its own events.  Mutation: move `members` into
+// one argument of finish() while copying it into the other (the pre-fix call): under GCC the memberships survive and
+// this test turns red.
+TEST(SecurityApplyV1Adversarial, DropRoleWithManyMembersRemovesEveryMembershipAndItsGrantsAdversarialRegression) {
+    Script sc;
+    std::vector<rs::SecurityEvent> log;
+    auto run = [&](rs::Ops ops, std::string name) {
+        rs::SecurityEvent e = sc.make(std::move(ops), std::move(name));
+        auto a = rs::apply(sc.s, e, sc.offset);
+        if (a) log.push_back(e);
+        ++sc.offset;
+        return a;
+    };
+    for (const char* u : {"m1", "m2", "m3", "outsider"}) ASSERT_TRUE(run(rs::CreateUserOps{v(1)}, u));
+    ASSERT_TRUE(run(rs::CreateRoleOps{}, "ops"));
+    const uint64_t roleId = sc.s.role("ops")->objectId;
+    const rs::GrantSpec admin = g(rs::Operation::Admin, rs::ResourceType::Cluster, rs::PatternKind::Exact, "");
+    const rs::GrantSpec read = g(rs::Operation::Read, rs::ResourceType::Topic, rs::PatternKind::Prefix, "ops.");
+    ASSERT_TRUE(run(rs::GrantOps{rs::GranteeKind::Role, admin}, "ops"));
+    ASSERT_TRUE(run(rs::GrantOps{rs::GranteeKind::Role, read}, "ops"));
+    std::vector<uint64_t> members;
+    for (const char* u : {"m3", "m1", "m2"}) {   // granted out of id order
+        ASSERT_TRUE(run(rs::GrantRoleOps{roleId, "ops"}, u));
+        members.push_back(sc.s.user(u)->objectId);
+    }
+    std::sort(members.begin(), members.end());
+    ASSERT_TRUE(sc.s.hasSecurityAdmin()) << "the role makes its members admins";
+
+    auto dr = run(rs::DropRoleOps{}, "ops");
+    ASSERT_TRUE(dr.has_value());
+    EXPECT_EQ(dr->effect, rs::SessionEffect::Refresh);
+    EXPECT_EQ(dr->affectedUsers, members) << "every member's sessions are refreshed";
+    for (const char* u : {"m1", "m2", "m3", "outsider"}) {
+        EXPECT_FALSE(sc.s.user(u)->roles.contains(roleId)) << u << " still holds the dropped role";
+        const auto eff = rs::effectiveGrants(sc.s, sc.s.user(u)->objectId);
+        EXPECT_EQ(std::find(eff.begin(), eff.end(), admin), eff.end()) << u << " kept the dropped role's ADMIN grant";
+        EXPECT_EQ(std::find(eff.begin(), eff.end(), read), eff.end()) << u << " kept the dropped role's READ grant";
+    }
+    EXPECT_FALSE(sc.s.hasSecurityAdmin()) << "no admin survives the drop of the only admin role";
+
+    ASSERT_TRUE(run(rs::CreateRoleOps{}, "ops"));
+    const uint64_t newRoleId = sc.s.role("ops")->objectId;
+    EXPECT_NE(newRoleId, roleId);
+    for (const char* u : {"m1", "m2", "m3"}) {
+        EXPECT_FALSE(sc.s.user(u)->roles.contains(newRoleId)) << u << " holds the re-created role";
+        EXPECT_TRUE(sc.s.user(u)->roles.empty()) << u;
+    }
+    auto stale = run(rs::GrantRoleOps{roleId, "ops"}, "m1");
+    ASSERT_FALSE(stale.has_value());
+    EXPECT_EQ(stale.error().refusal, rs::Refusal::UnknownRole) << "the dropped role's id never resolves";
+
+    rs::SecurityState replayed;
+    int64_t off = 0;
+    for (const auto& e : log) ASSERT_TRUE(rs::apply(replayed, e, off++).has_value());
+    EXPECT_EQ(replayed.digest(), sc.s.digest()) << "the state equals a replay of its events";
 }

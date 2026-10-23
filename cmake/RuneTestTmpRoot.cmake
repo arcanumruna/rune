@@ -59,4 +59,10 @@ if(NOT TEST TestTmpRootRegression.NoTestSourceHardCodesTmpRegression)
     add_test(NAME TestTmpRootRegression.NoTestSourceHardCodesTmpRegression
              COMMAND ${CMAKE_COMMAND} -DRUNE_REPO_ROOT=${_rune_repo_root}
                      -P ${CMAKE_CURRENT_LIST_DIR}/test_support/NoHardCodedTmp.cmake)
+    # Adversarial review of PR #597: the scan itself catches every literal form (raw strings, every C++ extension,
+    # an allowlisted literal sharing a line with a bad one) and refuses a vacuous tree.
+    add_test(NAME TestTmpRootAdversarial.TheScanCatchesEveryTmpLiteralFormAdversarialRegression
+             COMMAND ${CMAKE_COMMAND} -DSCANNER=${CMAKE_CURRENT_LIST_DIR}/test_support/NoHardCodedTmp.cmake
+                     -DWORK_DIR=${CMAKE_BINARY_DIR}/no-hard-coded-tmp-adversarial
+                     -P ${CMAKE_CURRENT_LIST_DIR}/test_support/NoHardCodedTmpAdversarial.cmake)
 endif()

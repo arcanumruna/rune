@@ -4,9 +4,11 @@
 #
 #   cmake -DRUNE_REPO_ROOT=<repo> -P NoHardCodedTmp.cmake
 #
-# Scans every C++ source under a tests/, bench/, benchmark/ or testing/ directory of the subprojects
-# below and fails (exit != 0) on any line holding the literal "/tmp/ or "/tmp" that is not on the allowlist.
-# The allowlist holds the deliberately HOST-WIDE paths only; each site carries a comment saying why.
+# Scans every C++ source (.cpp .cc .cxx .h .hh .hpp .hxx .ipp .inl .tpp) under a tests/, bench/, benchmark/ or
+# testing/ directory of the subprojects below and fails (exit != 0) on any string literal that starts with /tmp:
+# "/tmp/...", "/tmp", and raw strings R"(/tmp/...)" / R"d(/tmp/...)d".  The allowlist holds the deliberately
+# HOST-WIDE paths only (each site carries a comment saying why); an allowlisted literal is removed from its line
+# before the line is checked again, so it never hides another literal on the same line.
 cmake_minimum_required(VERSION 3.20)
 
 if(NOT RUNE_REPO_ROOT)
@@ -18,11 +20,17 @@ set(_allow
     "\"/tmp/rune-test-ports-")
 
 set(_subprojects broker client-cpp codec protocol ql crypto)
+set(_exts cpp cc cxx h hh hpp hxx ipp inl tpp)
+# A literal that starts with /tmp: an ordinary string ("/tmp/ or "/tmp") or a raw string (R"(/tmp or R"delim(/tmp).
+set(_tmp_re "(\"|R\"[^(\" ]*\\()/tmp[/\")]")
 set(_bad "")
 set(_scanned 0)
 foreach(_sp IN LISTS _subprojects)
-    file(GLOB_RECURSE _files LIST_DIRECTORIES false
-         "${RUNE_REPO_ROOT}/${_sp}/*.cpp" "${RUNE_REPO_ROOT}/${_sp}/*.h" "${RUNE_REPO_ROOT}/${_sp}/*.hpp")
+    set(_globs "")
+    foreach(_e IN LISTS _exts)
+        list(APPEND _globs "${RUNE_REPO_ROOT}/${_sp}/*.${_e}")
+    endforeach()
+    file(GLOB_RECURSE _files LIST_DIRECTORIES false ${_globs})
     foreach(_f IN LISTS _files)
         file(RELATIVE_PATH _rel "${RUNE_REPO_ROOT}" "${_f}")
         # Build trees and fetched dependencies are not sources.
@@ -33,16 +41,13 @@ foreach(_sp IN LISTS _subprojects)
             continue()
         endif()
         math(EXPR _scanned "${_scanned} + 1")
-        file(STRINGS "${_f}" _lines REGEX "\"/tmp[/\"]")
+        file(STRINGS "${_f}" _lines REGEX "${_tmp_re}")
         foreach(_l IN LISTS _lines)
-            set(_ok FALSE)
+            set(_rest "${_l}")
             foreach(_a IN LISTS _allow)
-                string(FIND "${_l}" "${_a}" _pos)
-                if(NOT _pos EQUAL -1)
-                    set(_ok TRUE)
-                endif()
+                string(REPLACE "${_a}" "" _rest "${_rest}")
             endforeach()
-            if(NOT _ok)
+            if(_rest MATCHES "${_tmp_re}")
                 string(STRIP "${_l}" _s)
                 string(APPEND _bad "  ${_rel}: ${_s}\n")
             endif()
