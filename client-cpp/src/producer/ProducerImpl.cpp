@@ -2309,7 +2309,9 @@ int ProducerImpl::flushBatches(
 //  R. Retriable, same identity (no completion, no bump): NotLeader (park,
 //     re-offer on the new owner's route — Task 16 C1) and MinIsrViolation
 //     (re-sent after kRetriableBackoffNs — Kafka NOT_ENOUGH_REPLICAS, N-e)
-//     and TransientLogFull (42, Phase 2b E2: same retry).
+//     and TransientLogFull (42, Phase 2b E2: same retry), and ConcurrentTransactions
+//     (27, issue #112: the leader verifies the partition with the coordinator;
+//     a short doubling backoff).
 //  D. Any other error answer, the delivery timeout, an exhausted redirect
 //     budget, a close: b FAILS with its outcome UNKNOWN (an earlier attempt
 //     may be stored) -> the partition is UNRESOLVED.
@@ -2476,6 +2478,24 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
                          static_cast<long long>(logStartOffset));
         }
         resequence_(ps, kTxnResetUnknownPid);
+        return;
+    }
+    // Issue #112 (client version 13): ConcurrentTransactions (27) — the leader is
+    // verifying with the transaction coordinator that this partition is registered
+    // in the producer's ongoing transaction (KIP-890 part 1).  Definitely not
+    // appended, the route is right: re-sent unchanged (same identity, no metadata,
+    // the transaction stays open) after a SHORT backoff that doubles per attempt
+    // (a local verification completes within a broker pass, a remote one in a
+    // cluster-plane round trip), capped by kRetriableBackoffNs and produceTimeoutMs.
+    if (ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::ConcurrentTransactions)) {
+        FLIGHT_RECORDER_MARK_ARG_VAL_PRODUCE(flight_recorder::Site::ClientRetriable, flight_recorder::foldCorr(correlationId),
+                                     static_cast<uint16_t>(ec), 0.0);
+        const int shift = std::clamp(b->attempts - 1, 0, 16);
+        const int64_t backoffNs = std::min<int64_t>(std::min<int64_t>(kTxnVerifyBackoffNs << shift, kRetriableBackoffNs),
+                                                    cfg_.produceTimeoutMs * 1'000'000LL);
+        b->attemptDeadlineNs = lastNowNs_ + backoffNs;
+        b->retriableBackoff  = true;
+        if (b->attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b->attemptDeadlineNs;
         return;
     }
     // Phase 2b E2 (ruling 2): TransientLogFull (42) — the leader's transient

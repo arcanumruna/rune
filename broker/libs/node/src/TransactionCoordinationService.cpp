@@ -201,6 +201,7 @@ void TransactionCoordinationService::load_(int64_t nowNs)
     awaiting_.clear();
     dropDeferred_();       // nothing deferred survives a load (unload answered it)
     lastPutOffset_.clear();   // the loaded log is committed
+    pidIndex_.clear();        // #112: rebuilt lazily from the loaded state
     rebuildHolds_();          // #438: from the loaded (committed) state
     stuckOffsetTxns_ = 0;     // #359: awaiting_ is empty
     offsetsPendingTxns_ = 0;
@@ -378,6 +379,11 @@ bool TransactionCoordinationService::bindsProducerIds() const noexcept
     return featureLevel_ < 0 || featureLevel_ >= rune::replication::MetadataFeature::kBoundProducerIds;
 }
 
+bool TransactionCoordinationService::clusterVerifiesTxnPartitions() const
+{
+    return featureLevel_ < 0 || featureLevel_ >= rune::replication::MetadataFeature::kTxnPartitionVerify;
+}
+
 uint64_t TransactionCoordinationService::principalOf_(int64_t sessionId) const
 {
     if (principalFn_ != nullptr) return principalFn_(principalCtx_, sessionId);
@@ -392,6 +398,47 @@ int64_t TransactionCoordinationService::requestPid_(int64_t pid, int64_t session
     return rune::protocol::producerIdUsableBy(pid, principalOf_(sessionId)) ? pid : kNoSuchProducerId;
 }
 
+
+// ---------------------------------------------------------------------------
+// F15-FU1 (#112): partition-registration verification (KIP-890 part 1).
+// ---------------------------------------------------------------------------
+int16_t TransactionCoordinationService::verifyTxnPartition(int64_t producerId, int16_t producerEpoch,
+                                                           int32_t topicId, int32_t partition, int64_t nowNs)
+{
+    if (!ensureLoaded_(nowNs)) return static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+    const tx::TransactionMetadata* meta = nullptr;
+    if (const auto it = pidIndex_.find(producerId); it != pidIndex_.end()) {
+        meta = coordinator_.metadata(it->second);
+        if (meta == nullptr || meta->producerId != producerId) { pidIndex_.erase(it); meta = nullptr; }
+    }
+    if (meta == nullptr) {
+        meta = coordinator_.findByProducerId(producerId);   // cold scan, once per producer id
+        if (meta == nullptr) return static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);   // no such transaction
+        if (pidIndex_.size() > 2 * coordinator_.size() + 1024) [[unlikely]] pidIndex_.clear();   // stale ids
+        pidIndex_.emplace(producerId, meta->txnId);
+    }
+    if (producerEpoch < meta->producerEpoch) return static_cast<int16_t>(pc::ErrorCode::ProducerFenced);
+    if (producerEpoch > meta->producerEpoch) return static_cast<int16_t>(pc::ErrorCode::InvalidProducerEpoch);
+    if (meta->state != tx::TxnState::Ongoing) return static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);
+    tx::TopicPartition tp;
+    tp.partition = partition;
+    if (const auto* spec = topics_ != nullptr ? topics_->topic(topicId) : nullptr) {
+        tp.topic = spec->name;
+    } else {
+        char numBuf[32];   // the same placeholder handleAddPartitions_ registers an unknown topic under
+        const int n = std::snprintf(numBuf, sizeof(numBuf), "topic_%d", topicId);
+        tp.topic.assign(numBuf, static_cast<size_t>(n > 0 ? n : 0));
+    }
+    if (meta->partitions.find(tp) == meta->partitions.end())
+        return static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);   // never registered (or not yet)
+    // The registration must survive a coordinator failover: its record committed.
+    // (AddPartitions answers only then, so a client that waits for it never sees this.)
+    if (txnState_ != nullptr) {
+        if (const auto it = lastPutOffset_.find(meta->txnId); it != lastPutOffset_.end() && !committed_(it->second))
+            return static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions);
+    }
+    return 0;
+}
 
 // ---------------------------------------------------------------------------
 // #358 class: answers and markers wait for the __transaction_state records they depend on to COMMIT.

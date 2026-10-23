@@ -6743,3 +6743,204 @@ TEST(EndTxnRefusedPrepareRegression, EveryRefusedPutIsAnsweredNotCoordinatorThen
     EXPECT_EQ(T.initPid(), 0) << "the retried InitProducerId";
     EXPECT_TRUE(T.controlFrames.empty());
 }
+
+// ============================================================================
+// Issue #112 (F15-FU1, KIP-890 part 1): a transactional batch of a producer with no open transaction on the
+// partition is appended only once the transaction coordinator confirmed the partition is registered in that
+// producer's ongoing transaction.  Real gateway + real worker + real TransactionCoordinationService (local).
+// ============================================================================
+namespace {
+// TxnRig with the worker's registration check on (BrokerNode turns it on whenever a coordinator is wired).
+struct VerifyRig : TxnRig {
+    VerifyRig() { m.w().setTxnVerification(true); }
+    // One transactional batch (pid, epoch, seq) through the REAL gateway produce path; the answer it got.
+    int16_t produce(int64_t p, int16_t e, int32_t s, int64_t now) {
+        const auto batch = txnBatch(p, e, s);
+        pc::Produce msg;
+        msg.sessionId = sid; msg.correlationId = ++corr; msg.topicId = 0; msg.partition = 0;
+        msg.partitionKnown = 1; msg.acks = 0; msg.producerId = p; msg.producerEpoch = e;
+        msg.baseSequence = s; msg.recordBatch = std::span<const uint8_t>(batch);
+        std::vector<uint8_t> frame(msg.encodedSize());
+        msg.encode(frame.data());
+        const std::size_t before = m.cap.produceErrors.size();
+        m.gw.applyProduceForTest(frame.data(), frame.size());
+        for (int i = 0; i < 8 && m.cap.produceErrors.size() == before; ++i) m.runWorker(now + i);
+        if (m.cap.produceErrors.size() == before) return -1;
+        m.runWorker(now + 8);   // the verification answer (TxnVerifyResult op) reaches the worker
+        return m.cap.produceErrors.back();
+    }
+    // The same batch on the SHARD's own ingress (direct client → worker).
+    int16_t ingress(int64_t p, int16_t e, int32_t s, int64_t now) {
+        const std::size_t before = m.cap.produceErrors.size();
+        (void)m.ingressTxn(sid, ++corr, p, e, s, /*acks=*/0, now);
+        for (int i = 0; i < 8 && m.cap.produceErrors.size() == before; ++i) m.runWorker(now + i);
+        if (m.cap.produceErrors.size() == before) return -1;
+        m.runWorker(now + 8);
+        return m.cap.produceErrors.back();
+    }
+    int64_t leo() { return m.r->log()->logEndOffset(); }
+    std::size_t open() { return m.w().rcOpenTxnsForTest(0, 0); }
+};
+constexpr int16_t kConcurrentTxns = static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions);
+} // namespace
+
+// The issue's repro: a transactional batch under the caller's own producer id for a partition its transaction
+// never registered.  Before #112 it was appended and pinned the LSO forever (no marker would ever come).  Now:
+// refused retriably while the leader asks, then refused InvalidTxnState (non-retriable) — never appended.
+TEST(TxnVerifyRegression, UnverifiedTransactionalBatchIsRefusedRetriablyRegression) {
+    for (const bool shardIngress : {false, true}) {
+        SCOPED_TRACE(shardIngress ? "shard ingress" : "gateway op path");
+        VerifyRig T;
+        ASSERT_EQ(T.initPid(), 0);   // NO AddPartitions
+        auto send = [&](int32_t s, int64_t now) { return shardIngress ? T.ingress(T.pid, T.epoch, s, now)
+                                                                      : T.produce(T.pid, T.epoch, s, now); };
+        EXPECT_EQ(send(0, 10), kConcurrentTxns) << "the first batch must be refused retriably while verifying";
+        EXPECT_EQ(T.leo(), 0) << "an unverified transactional batch was appended";
+        EXPECT_EQ(send(0, 30), kInvalidTxnState) << "the coordinator's refusal must reach the producer";
+        EXPECT_EQ(T.leo(), 0);
+        EXPECT_EQ(T.open(), 0u) << "an open transaction no marker will ever close pins the LSO (the hang)";
+        EXPECT_EQ(T.m.w().txnVerifyRequestsSentForTest(), 1u);
+    }
+}
+
+// The normal flow: registered first, then the first batch is verified once and appended on the client's retry;
+// the rest of the transaction rides the open transaction (no further ask); the marker closes it.
+TEST(TxnVerifyRegression, RegisteredPartitionFirstBatchIsVerifiedOnceThenAppendedRegression) {
+    for (const bool shardIngress : {false, true}) {
+        SCOPED_TRACE(shardIngress ? "shard ingress" : "gateway op path");
+        VerifyRig T;
+        ASSERT_EQ(T.initPid(), 0);
+        ASSERT_EQ(T.addPartition(), 0);
+        auto send = [&](int32_t s, int64_t now) { return shardIngress ? T.ingress(T.pid, T.epoch, s, now)
+                                                                      : T.produce(T.pid, T.epoch, s, now); };
+        EXPECT_EQ(send(0, 10), kConcurrentTxns);
+        EXPECT_EQ(T.leo(), 0);
+        EXPECT_EQ(send(0, 30), 0) << "the verified registration must admit the client's retry";
+        EXPECT_EQ(T.leo(), 1);
+        EXPECT_EQ(T.open(), 1u);
+        EXPECT_EQ(send(1, 50), 0);
+        EXPECT_EQ(send(2, 70), 0);
+        EXPECT_EQ(T.leo(), 3);
+        EXPECT_EQ(T.m.w().txnVerifyRequestsSentForTest(), 1u) << "an open transaction must not be re-verified";
+        EXPECT_TRUE(T.endTxnOkPreparing(/*commit=*/true));
+        T.runUntilNoMarkerAwaited(100);
+        EXPECT_EQ(T.open(), 0u);
+        EXPECT_EQ(T.leo(), 4) << "the commit marker";
+    }
+}
+
+// Ruling (c): the confirmation is computed, then the transaction ends (abort marker) before the client's retry —
+// the retried (late) batch of the ended transaction must never be appended: it is verified again and refused.
+TEST(TxnVerifyRegression, LateBatchAfterTheMarkerIsNeverAdmittedRegression) {
+    for (const bool commit : {false, true}) {
+        SCOPED_TRACE(commit ? "commit" : "abort");
+        VerifyRig T;
+        ASSERT_EQ(T.initPid(), 0);
+        ASSERT_EQ(T.addPartition(), 0);
+        EXPECT_EQ(T.produce(T.pid, T.epoch, 0, 10), kConcurrentTxns);   // Verified now (the answer was applied)
+        EXPECT_TRUE(T.endTxnOkPreparing(commit));
+        T.runUntilNoMarkerAwaited(40);
+        ASSERT_EQ(T.leo(), 1) << "the marker";
+        EXPECT_EQ(T.produce(T.pid, T.epoch, 0, 100), kConcurrentTxns) << "the marker must clear the verification";
+        EXPECT_EQ(T.produce(T.pid, T.epoch, 0, 120), kInvalidTxnState);
+        EXPECT_EQ(T.leo(), 1) << "a batch of an ended transaction was appended after its marker";
+        EXPECT_EQ(T.open(), 0u) << "the late batch pinned the LSO";
+    }
+}
+
+// A zombie (an older epoch after the producer re-initialised) is refused ProducerFenced, non-retriably.
+TEST(TxnVerifyRegression, StaleEpochBatchIsRefusedNonRetriablyRegression) {
+    VerifyRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    const int64_t pid = T.pid;
+    const int16_t old = T.epoch;
+    ASSERT_EQ(T.initPid(), 0);   // epoch bump (nothing ongoing)
+    ASSERT_EQ(T.pid, pid);
+    ASSERT_GT(T.epoch, old);
+    ASSERT_EQ(T.addPartition(), 0);
+    EXPECT_EQ(T.produce(pid, old, 0, 10), kConcurrentTxns);
+    EXPECT_EQ(T.produce(pid, old, 0, 30), static_cast<int16_t>(pc::ErrorCode::ProducerFenced));
+    EXPECT_EQ(T.leo(), 0);
+    EXPECT_EQ(T.open(), 0u);
+    EXPECT_EQ(T.produce(pid, T.epoch, 0, 50), kConcurrentTxns) << "the current epoch verifies on its own";
+    EXPECT_EQ(T.produce(pid, T.epoch, 0, 70), 0);
+    EXPECT_EQ(T.leo(), 1);
+}
+
+// A coordinator that cannot answer now (not loaded) refuses retriably and admits once it can.
+TEST(TxnVerifyRegression, CoordinatorNotLoadedAnswersRetriablyRegression) {
+    VerifyRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.leader = false;   // the coordinator unloads
+    EXPECT_EQ(T.produce(T.pid, T.epoch, 0, 10), kConcurrentTxns);
+    EXPECT_EQ(T.produce(T.pid, T.epoch, 0, 30), kConcurrentTxns) << "NotCoordinator must stay retriable";
+    EXPECT_EQ(T.leo(), 0);
+    T.leader = true;
+    EXPECT_EQ(T.produce(T.pid, T.epoch, 0, 50), kConcurrentTxns);
+    EXPECT_EQ(T.produce(T.pid, T.epoch, 0, 70), 0);
+    EXPECT_EQ(T.leo(), 1);
+}
+
+// A pre-#112 client (version < 13) is answered NotLeader — its retriable code — never ConcurrentTransactions.
+TEST(TxnVerifyRegression, OldClientIsAnsweredItsRetriableCodeRegression) {
+    VerifyRig T;
+    T.sid = T.m.gw.injectTestSession(0, pc::kClientVersionTxnVerify - 1);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    EXPECT_EQ(T.produce(T.pid, T.epoch, 0, 10), static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_EQ(T.produce(T.pid, T.epoch, 0, 30), 0);
+}
+
+// A non-transactional (plain and idempotent) produce never asks the coordinator.
+TEST(TxnVerifyRegression, NonTransactionalProduceIsNeverVerifiedRegression) {
+    VerifyRig T;
+    for (int i = 0; i < 4; ++i) {
+        const auto b = batchAt(0);
+        const auto f = produceFrame(T.sid, ++T.corr, b, 0, 0, 0);
+        T.m.gw.applyProduceForTest(f.data(), f.size());
+        T.m.runWorker(10 + i);
+    }
+    EXPECT_EQ(T.leo(), 4);
+    EXPECT_EQ(T.m.w().txnVerifyRequestsSentForTest(), 0u);
+    EXPECT_EQ(T.m.w().txnBatchesRefusedUnverifiedForTest(), 0u);
+}
+
+// The inline (no worker pool) gateway path runs the same check synchronously against its own coordinator.
+TEST(TxnVerifyRegression, InlineGatewayPathVerifiesSynchronouslyRegression) {
+    TmpDir d;
+    rune::gateway::TopicRegistry topics{{rune::node::TopicSpec{"t", 1}}, d.path.string()};
+    Captured cap;
+    rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(cap.fn());
+    gw.setTopicRegistry(&topics);
+    TransactionCoordinationService tcs(nullptr, &topics, [] { return true; }, [] { return NodeId{1}; });
+    tcs.setGateway(&gw);
+    gw.setTxnService(&tcs);
+    gw.setCommittedMetadataReady(true);
+    const int64_t sid = gw.injectTestSession();
+    std::array<uint8_t, 4096> out{};
+    const std::string txnId = "tx-inline";
+    const auto tid = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(txnId.data()), txnId.size());
+    pc::InitProducerId ip; ip.sessionId = 1; ip.correlationId = 1; ip.transactionTimeoutMs = 60'000; ip.transactionalId = tid;
+    std::vector<uint8_t> f(ip.encodedSize()); ip.encode(f.data());
+    auto ir = pc::InitProducerIdResponse::decode(out.data(), tcs.handleInitProducerId(f.data(), f.size(), 1, out.data(), out.size()));
+    ASSERT_TRUE(ir && ir->errorCode == 0);
+    auto produce = [&](int32_t s) {
+        const auto b = txnBatch(ir->producerId, ir->producerEpoch, s);
+        const auto fr = produceFrame(sid, 100 + s, b, 0, 0, 0, ir->producerId, ir->producerEpoch, s);
+        const std::size_t before = cap.produceErrors.size();
+        gw.applyProduceForTest(fr.data(), fr.size());
+        return cap.produceErrors.size() > before ? cap.produceErrors.back() : int16_t{-1};
+    };
+    EXPECT_EQ(produce(0), kInvalidTxnState) << "never registered: refused, synchronously";
+    EXPECT_EQ(topics.log(0, 0)->logEndOffset(), 0);
+    pc::AddPartitionsToTxn ap; ap.sessionId = 1; ap.correlationId = 2; ap.producerId = ir->producerId;
+    ap.producerEpoch = ir->producerEpoch; ap.transactionalId = tid;
+    const pc::TxnTopicPartition tp{0, 0};
+    std::vector<uint8_t> af(pc::AddPartitionsToTxn::encodedSizeFor(tid, 1));
+    ap.encode(af.data(), std::span<const pc::TxnTopicPartition>(&tp, 1));
+    auto ar = pc::AddPartitionsToTxnResponse::decode(out.data(), tcs.handleAddPartitions(af.data(), af.size(), 1, out.data(), out.size()));
+    ASSERT_TRUE(ar && ar->results.size() == 1 && ar->results[0].errorCode == 0);
+    EXPECT_EQ(produce(0), 0) << "registered: appended at once";
+    EXPECT_EQ(topics.log(0, 0)->logEndOffset(), 1);
+}

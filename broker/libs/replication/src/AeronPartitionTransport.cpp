@@ -429,6 +429,22 @@ bool AeronPartitionTransport::sendWriteTxnMarkerResponse(NodeId to, const WriteT
     return enqueueOutbound(static_cast<int32_t>(to), wire, len);
 }
 
+bool AeronPartitionTransport::sendVerifyTxnPartition(NodeId to, const VerifyTxnPartitionMsg& msg)
+{
+    uint8_t wire[VerifyTxnPartitionMsg::TOTAL_SIZE];
+    const std::size_t len = msg.encode(wire, sizeof wire);
+    if (len == 0 || to == static_cast<NodeId>(selfId_)) [[unlikely]] return false;   // never re-entrant
+    return enqueueOutbound(static_cast<int32_t>(to), wire, len);
+}
+
+bool AeronPartitionTransport::sendVerifyTxnPartitionResponse(NodeId to, const VerifyTxnPartitionResponseMsg& msg)
+{
+    uint8_t wire[VerifyTxnPartitionResponseMsg::TOTAL_SIZE];
+    const std::size_t len = msg.encode(wire, sizeof wire);
+    if (len == 0 || to == static_cast<NodeId>(selfId_)) [[unlikely]] return false;   // never re-entrant
+    return enqueueOutbound(static_cast<int32_t>(to), wire, len);
+}
+
 int AeronPartitionTransport::notePlaneReconnects_()
 {
     int events = 0;
@@ -732,6 +748,19 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         WriteTxnMarkerResponseMsg r{};
         if (WriteTxnMarkerResponseMsg::decode(buf, len, r) && txnMarkerRespHandler_ != nullptr)
             txnMarkerRespHandler_(txnMarkerCtx_, r);
+        return Action::CONTINUE;
+    }
+    if (tid == VerifyTxnPartitionMsg::TEMPLATE_ID) [[unlikely]] {
+        // #112: a partition leader asks this node's txn coordinator.
+        VerifyTxnPartitionMsg m{};
+        if (VerifyTxnPartitionMsg::decode(buf, len, m) && txnVerifyHandler_ != nullptr) txnVerifyHandler_(txnVerifyCtx_, m);
+        return Action::CONTINUE;
+    }
+    if (tid == VerifyTxnPartitionResponseMsg::TEMPLATE_ID) [[unlikely]] {
+        // #112: the coordinator's answer to a verification this node asked for.
+        VerifyTxnPartitionResponseMsg r{};
+        if (VerifyTxnPartitionResponseMsg::decode(buf, len, r) && txnVerifyRespHandler_ != nullptr)
+            txnVerifyRespHandler_(txnVerifyCtx_, r);
         return Action::CONTINUE;
     }
     if (tid == InternalIsrMsg::TEMPLATE_ID || tid == InternalIsrAckMsg::TEMPLATE_ID) [[unlikely]] {

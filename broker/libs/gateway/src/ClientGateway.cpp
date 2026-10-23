@@ -769,6 +769,7 @@ int ClientGateway::doWork(int64_t nowNs) {
     if (workerPool_) work += pumpSubOps_();
     work += pumpEgressReleases_();   // retire-on-ack release ops a full ring refused (never dropped)
     work += pumpTxnMarkers_();
+    work += pumpTxnVerify_();   // #112: verification answers / forwards / lost-ask sweep
     if (shardMode_) {
         // D8c: ... or a Produce frame of a session with no produce credit left
         // (sessionProduceCredits_ forwarded, not yet claimed by a worker): the
@@ -4159,6 +4160,15 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         }
     }
 
+    // F15-FU1 (#112): the transactional registration check, synchronously against this
+    // node's own coordinator (the inline path runs on the coordinator's thread).
+    if (msg.producerId >= 0) [[unlikely]] {
+        if (const int16_t c = inlineTxnAdmission_(msg.topicId, partition, rbData, batchLen); c != 0) {
+            sendResp(static_cast<pc::ErrorCode>(c), partition, 0);
+            return true;   // log untouched
+        }
+    }
+
     const auto outcome = rune::node::handleProduceBatch(
         rbData, batchLen,
         msg.topicId, partition,
@@ -6751,6 +6761,199 @@ int ClientGateway::pumpTxnMarkers_()
     return work;
 }
 
+// ---------------------------------------------------------------------------
+// F15-FU1 (#112): transaction-registration verification.  Runtime thread, cold
+// (once per transaction and partition); allocation is fine here.
+// ---------------------------------------------------------------------------
+int32_t ClientGateway::verifyCoordinatorNode_() const noexcept
+{
+    if (txnService_ == nullptr || txnMarkerChannel_.sendVerify == nullptr) return -1;
+    const int32_t n = txnService_->coordinatorNode();
+    return (n < 0 || n == thisNodeId_) ? -1 : n;
+}
+
+void ClientGateway::onTxnVerifyRequest_(const rune::node::WorkerReturn& ret)
+{
+    namespace pcl = rune::protocol::client;
+    VerifyAnswer a;
+    a.topicId       = ret.topicId;
+    a.partition     = ret.partition;
+    a.producerId    = ret.producerId;
+    a.producerEpoch = ret.producerEpoch;
+    a.reqId         = ret.correlationId;
+    if (txnService_ != nullptr && txnService_->coordinatesLocally()) {
+        a.code = txnService_->verifyTxnPartition(a.producerId, a.producerEpoch, a.topicId, a.partition, nowNs_);
+        answerVerify_(a);
+        return;
+    }
+    const int32_t coordinator = verifyCoordinatorNode_();
+    if (coordinator < 0) {
+        a.code = static_cast<int16_t>(pcl::ErrorCode::NotCoordinator);   // nobody to ask now: the client retries
+        answerVerify_(a);
+        return;
+    }
+    if (!txnService_->clusterVerifiesTxnPartitions()) {
+        // A member predates the verification: its coordinator would drop the ask.
+        // Admitted exactly as before #112 until every member is upgraded.
+        a.code = 0;
+        answerVerify_(a);
+        return;
+    }
+    const int64_t token = nextVerifyToken_++;
+    // The sweep's reference node: set only when nothing is in flight, so asks still
+    // out to a previous coordinator are swept by the next pump (coordinator changed).
+    if (verifiesInFlight_.empty()) lastVerifyCoordinator_ = coordinator;
+    VerifyInFlight& v = verifiesInFlight_[token];
+    v.req         = a;
+    v.coordinator = coordinator;
+    if (!verifySendQueue_.empty() || !sendRemoteVerify_(token, v)) verifySendQueue_.push_back(token);
+}
+
+bool ClientGateway::sendRemoteVerify_(int64_t token, VerifyInFlight& v)
+{
+    rune::replication::VerifyTxnPartitionMsg m{};
+    m.requesterNodeId = thisNodeId_;
+    m.topicId         = v.req.topicId;
+    m.partition       = v.req.partition;
+    m.token           = token;
+    m.producerId      = v.req.producerId;
+    m.producerEpoch   = v.req.producerEpoch;
+    if (!txnMarkerChannel_.sendVerify(txnMarkerChannel_.ctx, v.coordinator, m)) return false;
+    v.sent = true;
+    ++txnVerifiesForwarded_;
+    return true;
+}
+
+void ClientGateway::failRemoteVerify_(int64_t token, int16_t code)
+{
+    auto it = verifiesInFlight_.find(token);
+    if (it == verifiesInFlight_.end()) return;
+    VerifyAnswer a = it->second.req;
+    verifiesInFlight_.erase(it);
+    a.code = code;
+    answerVerify_(a);
+}
+
+void ClientGateway::onRemoteVerifyTxnPartitionResponse(const rune::replication::VerifyTxnPartitionResponseMsg& r)
+{
+    auto it = verifiesInFlight_.find(r.token);
+    if (it == verifiesInFlight_.end() || it->second.req.topicId != r.topicId ||
+        it->second.req.partition != r.partition || it->second.req.producerId != r.producerId ||
+        it->second.req.producerEpoch != r.producerEpoch) {
+        // Already answered (failed by a reconnect / coordinator change), or not ours.
+        spdlog::debug("ClientGateway: VerifyTxnPartitionResponse for unknown token={} topic={} partition={}",
+                      r.token, r.topicId, r.partition);
+        return;
+    }
+    VerifyAnswer a = it->second.req;
+    verifiesInFlight_.erase(it);
+    a.code = r.errorCode;
+    answerVerify_(a);
+}
+
+void ClientGateway::onRemoteVerifyTxnPartition(const rune::replication::VerifyTxnPartitionMsg& m)
+{
+    namespace pcl = rune::protocol::client;
+    rune::replication::VerifyTxnPartitionResponseMsg r{};
+    static_cast<rune::replication::VerifyTxnPartitionMsg&>(r) = m;
+    const bool local = txnService_ != nullptr && txnService_->coordinatesLocally();
+    r.errorCode = local ? txnService_->verifyTxnPartition(m.producerId, m.producerEpoch, m.topicId, m.partition, nowNs_)
+                        : static_cast<int16_t>(pcl::ErrorCode::NotCoordinator);   // the asker retries
+    if (local) ++txnVerifiesServedForPeers_;
+    if (txnMarkerChannel_.sendVerifyResponse == nullptr) return;   // unreachable: the ask came over the plane
+    // FIFO behind earlier back-pressured answers; never dropped.
+    if (!pendingVerifyResponses_.empty() ||
+        !txnMarkerChannel_.sendVerifyResponse(txnMarkerChannel_.ctx, m.requesterNodeId, r))
+        pendingVerifyResponses_.emplace_back(m.requesterNodeId, r);
+}
+
+bool ClientGateway::tryEnqueueVerifyAnswer_(const VerifyAnswer& a)
+{
+    rune::node::WorkerOp op;
+    op.type                        = rune::node::WorkerOp::Type::TxnVerifyResult;
+    op.topicId                     = a.topicId;
+    op.partition                   = a.partition;
+    op.producerId                  = a.producerId;
+    op.producerEpoch               = a.producerEpoch;
+    op.correlationId               = a.reqId;
+    op.replicatedPayload.errorCode = a.code;
+    // TooLarge cannot happen (no tail); Full = back-pressure, retried in order.
+    return workerPool_->enqueueOp(a.topicId, a.partition, std::move(op)) != rune::node::EnqueueResult::Full;
+}
+
+void ClientGateway::answerVerify_(const VerifyAnswer& a)
+{
+    if (workerPool_ == nullptr) return;   // no worker asked (the inline path verifies synchronously)
+    if (!verifyAnswerQueue_.empty() || !tryEnqueueVerifyAnswer_(a)) verifyAnswerQueue_.push_back(a);
+}
+
+int16_t ClientGateway::inlineTxnAdmission_(int32_t topicId, int32_t partition, const uint8_t* batch, std::size_t len)
+{
+    namespace pcl = rune::protocol::client;
+    if (batch == nullptr || len < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) return 0;
+    const rune::protocol::RecordBatchReader r(batch, len);
+    if ((static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrTransactional)) == 0)
+        return 0;
+    const int64_t pid = r.producerId();
+    if (pid < 0 || txnService_ == nullptr) return 0;   // no coordinator wired (a rig without transactions)
+    if (getTxnState(topicId, partition).lsoTracker.firstOffsetOf(pid) >= 0) return 0;   // open here: verified
+    if (!txnService_->coordinatesLocally()) {
+        // The inline path (a gateway with no worker pool: rigs only — BrokerNode always
+        // builds one) cannot ask a remote coordinator synchronously.  Before every member
+        // supports the verification it admits as before #112; otherwise retriable.
+        if (!txnService_->clusterVerifiesTxnPartitions()) return 0;
+        return static_cast<int16_t>(pcl::ErrorCode::ConcurrentTransactions);
+    }
+    const int16_t c = txnService_->verifyTxnPartition(pid, r.producerEpoch(), topicId, partition, nowNs_);
+    if (c == static_cast<int16_t>(pcl::ErrorCode::NotCoordinator)) return static_cast<int16_t>(pcl::ErrorCode::ConcurrentTransactions);
+    return c;
+}
+
+int ClientGateway::pumpTxnVerify_()
+{
+    namespace pcl = rune::protocol::client;
+    int work = 0;
+    // A forwarded ask (or its answer) may be lost: on a plane reconnect, or when the
+    // coordinator moved.  Answered NotCoordinator — the client's retry asks again.
+    // Swept only on an event (a reconnect, or the coordinator node changed) — never per pass.
+    const int32_t coordinator = verifiesInFlight_.empty() ? -1 : verifyCoordinatorNode_();
+    if (!verifiesInFlight_.empty() &&
+        (failAllRemoteVerifies_ || !verifyReconnectedPeers_.empty() || coordinator != lastVerifyCoordinator_))
+        [[unlikely]] {
+        const bool all = failAllRemoteVerifies_;
+        std::vector<int64_t> lost;   // cold
+        for (const auto& [token, v] : verifiesInFlight_) {
+            const bool reconnected = all || std::find(verifyReconnectedPeers_.begin(), verifyReconnectedPeers_.end(),
+                                                      v.coordinator) != verifyReconnectedPeers_.end();
+            if (v.coordinator != coordinator || (reconnected && v.sent)) lost.push_back(token);
+        }
+        for (const int64_t token : lost) failRemoteVerify_(token, static_cast<int16_t>(pcl::ErrorCode::NotCoordinator));
+        work += static_cast<int>(lost.size());
+    }
+    if (!verifiesInFlight_.empty()) lastVerifyCoordinator_ = coordinator;
+    failAllRemoteVerifies_ = false;
+    verifyReconnectedPeers_.clear();
+    while (!verifySendQueue_.empty()) {
+        const int64_t token = verifySendQueue_.front();
+        auto it = verifiesInFlight_.find(token);
+        if (it != verifiesInFlight_.end() && !it->second.sent && !sendRemoteVerify_(token, it->second)) break;
+        verifySendQueue_.pop_front();
+        ++work;
+    }
+    while (!pendingVerifyResponses_.empty()) {
+        const auto& [to, r] = pendingVerifyResponses_.front();
+        if (!txnMarkerChannel_.sendVerifyResponse(txnMarkerChannel_.ctx, to, r)) break;
+        pendingVerifyResponses_.pop_front();
+        ++work;
+    }
+    while (!verifyAnswerQueue_.empty()) {
+        if (!tryEnqueueVerifyAnswer_(verifyAnswerQueue_.front())) break;
+        verifyAnswerQueue_.pop_front();
+        ++work;
+    }
+    return work;
+}
+
 int ClientGateway::pumpMarkerResponses_()
 {
     int sent = 0;
@@ -6848,6 +7051,11 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
         // Task 10 round 4 (P1): the marker's AUTHORITATIVE offset.
         if (ret.type == rune::node::WorkerReturn::Type::ControlRecordAppended) {
             onControlRecordAppended_(ret);
+            return;
+        }
+        // F15-FU1 (#112): a partition's owning worker asks the transaction coordinator.
+        if (ret.type == rune::node::WorkerReturn::Type::TxnVerifyRequest) [[unlikely]] {
+            onTxnVerifyRequest_(ret);
             return;
         }
 

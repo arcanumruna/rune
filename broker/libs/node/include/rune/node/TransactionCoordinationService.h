@@ -198,6 +198,19 @@ public:
     void onControlMarkerRefused(int32_t topicId, int32_t partition,
                                 int64_t producerId, int16_t errorCode,
                                 int32_t coordinatorEpoch) override;
+
+    /// F15-FU1 (#112): see ITxnRequestHandler::verifyTxnPartition.  Loads the
+    /// coordinator if it can (NotCoordinator otherwise).  0 only when the partition
+    /// is in the producer's ONGOING transaction at the batch's exact epoch and the
+    /// record that registered it is committed (a coordinator failover keeps it, so
+    /// the partition's marker is always written).  Cold: a pid → transaction scan
+    /// on a cache miss (pidIndex_, re-validated on every hit).
+    int16_t verifyTxnPartition(int64_t producerId, int16_t producerEpoch, int32_t topicId, int32_t partition,
+                               int64_t nowNs) override;
+    [[nodiscard]] bool    coordinatesLocally() const override { return isLocalCoordinator(); }
+    [[nodiscard]] int32_t coordinatorNode() const override { return leaderIdFn_ ? leaderIdFn_() : -1; }
+    /// #112: the cluster's metadata feature level (setMetadataFeatureLevel) includes the verification.
+    [[nodiscard]] bool    clusterVerifiesTxnPartitions() const override;
     /// Task 10 round 5: an asynchronously appended marker landed.
     void onControlMarkerLanded(int32_t topicId, int32_t partition, int64_t producerId,
                                int32_t coordinatorEpoch) override;
@@ -334,6 +347,9 @@ private:
     std::vector<PrepareGate> prepareGates_;
     /// The offset of the last record appended per transactional id (cleared on load: the loaded log is committed).
     std::map<rune::transaction::TransactionalId, int64_t, std::less<>> lastPutOffset_;
+    /// #112: producer id → its transactional id (a cache for verifyTxnPartition; every hit
+    /// is re-validated against the coordinator, cleared on load and when it outgrows the map).
+    std::unordered_map<int64_t, rune::transaction::TransactionalId> pidIndex_;
     int64_t requestPutOffset_  = -1;      ///< the newest record the current request appended
     bool    requestPutRefused_ = false;   ///< the current request's append was refused (min-ISR)
     AnswerSinkFn answerSink_    = nullptr;

@@ -980,6 +980,10 @@ public:
         bool (*sendResponse)(void* ctx, int32_t toNode,
                              const rune::replication::WriteTxnMarkerResponseMsg& r) = nullptr;
         void* ctx = nullptr;
+        // F15-FU1 (#112): the cross-node transaction-registration verification (same plane, same ctx).
+        bool (*sendVerify)(void* ctx, int32_t toNode, const rune::replication::VerifyTxnPartitionMsg& m) = nullptr;
+        bool (*sendVerifyResponse)(void* ctx, int32_t toNode,
+                                   const rune::replication::VerifyTxnPartitionResponseMsg& r) = nullptr;
     };
     void setTxnMarkerChannel(const TxnMarkerChannel& ch) noexcept { txnMarkerChannel_ = ch; }
     /// Leader side: a coordinator's marker for a partition this node leads.
@@ -993,15 +997,54 @@ public:
     static void onWriteTxnMarkerResponseThunk(void* self, const rune::replication::WriteTxnMarkerResponseMsg& r) {
         static_cast<ClientGateway*>(self)->onRemoteControlRecordResponse(r);
     }
+    // -----------------------------------------------------------------------
+    // F15-FU1 (#112, KIP-890 part 1): transaction-registration verification.
+    //
+    // A partition's owning worker asks (WorkerReturn TxnVerifyRequest) whether a
+    // transactional batch of (producerId, epoch) — the first of a producer with
+    // no open transaction there — may be appended.  This node answers it from
+    // its own coordinator when it coordinates, else forwards it to the
+    // coordinator node (VerifyTxnPartition over the cluster plane) and relays the
+    // answer.  The worker gets EXACTLY ONE answer per request (op TxnVerifyResult,
+    // queued while its ring is full — never dropped): the coordinator's code, or
+    // the retriable NotCoordinator when there is no coordinator to ask, or when a
+    // forwarded ask is lost to a plane reconnect or a coordinator change (the
+    // client's retry asks again).  No timer.  Runtime thread, cold.
+    // -----------------------------------------------------------------------
+    /// Coordinator side: a partition leader on another node asks.
+    void onRemoteVerifyTxnPartition(const rune::replication::VerifyTxnPartitionMsg& m);
+    /// Leader side: the coordinator's answer to a forwarded ask.
+    void onRemoteVerifyTxnPartitionResponse(const rune::replication::VerifyTxnPartitionResponseMsg& r);
+    static void onVerifyTxnPartitionThunk(void* self, const rune::replication::VerifyTxnPartitionMsg& m) {
+        static_cast<ClientGateway*>(self)->onRemoteVerifyTxnPartition(m);
+    }
+    static void onVerifyTxnPartitionResponseThunk(void* self,
+                                                  const rune::replication::VerifyTxnPartitionResponseMsg& r) {
+        static_cast<ClientGateway*>(self)->onRemoteVerifyTxnPartitionResponse(r);
+    }
+    [[nodiscard]] std::size_t txnVerifiesInFlightForTest() const noexcept { return verifiesInFlight_.size(); }
+    [[nodiscard]] std::size_t txnVerifyAnswersQueuedForTest() const noexcept { return verifyAnswerQueue_.size(); }
+    /// #112: asks forwarded to a remote coordinator / asks this coordinator answered for a remote leader.
+    [[nodiscard]] uint64_t txnVerifiesForwardedForTest() const noexcept { return txnVerifiesForwarded_; }
+    [[nodiscard]] uint64_t txnVerifiesServedForPeersForTest() const noexcept { return txnVerifiesServedForPeers_; }
+    /// Test-only: doWork's verification step at `nowNs`.
+    int pumpTxnVerifyForTest(int64_t nowNs) { nowNs_ = nowNs; return pumpTxnVerify_(); }
+
     /// Review MAJOR-1: the cluster plane's link to `peer` came back (down→up
     /// edge; -1 = a new inbound image whose peer is unknown) — every remote
     /// marker in flight to it (to everyone for -1) is RE-SENT with the SAME
     /// token by the next marker pump.  A remote marker completes only on a real
     /// answer or a leadership change — never on a timer.
+    /// #112: every verification forwarded to that peer (to anyone for -1) is
+    /// answered NotCoordinator (retriable) — its ask or answer may be lost.
     void onPlaneReconnect(int32_t peer) {
         if (peer < 0) resendAllRemoteMarkers_ = true;
         else if (std::find(reconnectedPeers_.begin(), reconnectedPeers_.end(), peer) == reconnectedPeers_.end())
             reconnectedPeers_.push_back(peer);
+        if (peer < 0) failAllRemoteVerifies_ = true;
+        else if (std::find(verifyReconnectedPeers_.begin(), verifyReconnectedPeers_.end(), peer) ==
+                 verifyReconnectedPeers_.end())
+            verifyReconnectedPeers_.push_back(peer);
     }
     static void onPlaneReconnectThunk(void* self, int32_t peer) {
         static_cast<ClientGateway*>(self)->onPlaneReconnect(peer);
@@ -2910,6 +2953,40 @@ private:
     int64_t appendControlRecordInline_(int32_t topicId, int32_t partition, std::span<const uint8_t> marker,
                                        rune::storage::Log* log);
     [[nodiscard]] bool markerQueuedFor_(int32_t topicId, int32_t partition) const noexcept;
+
+    // F15-FU1 (#112): transaction-registration verification (see onRemoteVerifyTxnPartition).
+    struct VerifyAnswer {
+        int32_t topicId = 0; int32_t partition = 0; int64_t producerId = -1; int16_t producerEpoch = 0;
+        int64_t reqId = 0; int16_t code = 0;
+    };
+    struct VerifyInFlight {
+        VerifyAnswer req;            ///< the worker's request (code unset)
+        int32_t      coordinator = -1;
+        bool         sent        = false;
+    };
+    void onTxnVerifyRequest_(const rune::node::WorkerReturn& ret);
+    void answerVerify_(const VerifyAnswer& a);
+    [[nodiscard]] bool tryEnqueueVerifyAnswer_(const VerifyAnswer& a);
+    bool sendRemoteVerify_(int64_t token, VerifyInFlight& v);
+    void failRemoteVerify_(int64_t token, int16_t code);
+    /// The node to forward a verification to (-1: none — answered NotCoordinator).
+    [[nodiscard]] int32_t verifyCoordinatorNode_() const noexcept;
+    /// doWork's verification step: queued answers, queued forwards, queued
+    /// coordinator responses, and the lost-ask sweep (reconnect / coordinator change).
+    int pumpTxnVerify_();
+    /// The inline (no worker pool) produce path's synchronous check: 0 = append.
+    [[nodiscard]] int16_t inlineTxnAdmission_(int32_t topicId, int32_t partition, const uint8_t* batch,
+                                              std::size_t len);
+    std::deque<VerifyAnswer> verifyAnswerQueue_;                 ///< worker ring full: retried, FIFO
+    std::unordered_map<int64_t, VerifyInFlight> verifiesInFlight_;   ///< forwarded asks by token
+    std::deque<int64_t> verifySendQueue_;                        ///< forwards the plane refused
+    std::deque<std::pair<int32_t, rune::replication::VerifyTxnPartitionResponseMsg>> pendingVerifyResponses_;
+    int64_t nextVerifyToken_ = initialMarkerToken_();   ///< per-boot incarnation in the high bits (as markers)
+    bool failAllRemoteVerifies_ = false;
+    int32_t lastVerifyCoordinator_ = -1;   ///< the node the in-flight asks went to (sweep on change)
+    uint64_t txnVerifiesForwarded_      = 0;
+    uint64_t txnVerifiesServedForPeers_ = 0;
+    std::vector<int32_t> verifyReconnectedPeers_;
 
     // M5: subscription lifecycle ops the owning worker ring could not take are
     // queued per worker (FIFO: a Subscribe/Unsubscribe pair keeps its order)

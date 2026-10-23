@@ -90,6 +90,30 @@ struct ITxnRequestHandler {
     // partition's marker landed.  Cold path; default no-op for test doubles.
     virtual void onControlMarkerLanded(int32_t /*topicId*/, int32_t /*partition*/,
                                        int64_t /*producerId*/, int32_t /*coordinatorEpoch*/) {}
+
+    // F15-FU1 (#112, KIP-890 part 1): may a transactional data batch of (producerId,
+    // producerEpoch) open a transaction on (topicId, partition)?  Asked by a partition
+    // leader for the first such batch of a producer with no open transaction there.
+    // Returns a client ErrorCode: 0 = the partition is registered in the producer's
+    // ONGOING transaction and that registration is durable; NotCoordinator /
+    // ConcurrentTransactions = cannot answer now (retriable); ProducerFenced /
+    // InvalidProducerEpoch / InvalidTxnState = never (non-retriable).  Synchronous,
+    // control thread, cold (once per transaction and partition).  Default (test
+    // doubles): NotCoordinator.
+    static constexpr int16_t kVerifyNotCoordinator = 14;   // pc::ErrorCode::NotCoordinator
+    virtual int16_t verifyTxnPartition(int64_t /*producerId*/, int16_t /*producerEpoch*/, int32_t /*topicId*/,
+                                       int32_t /*partition*/, int64_t /*nowNs*/) {
+        return kVerifyNotCoordinator;
+    }
+    // #112: true when this node coordinates transactions (verifyTxnPartition answers
+    // here); otherwise coordinatorNode() names the node that does (-1 = unknown).
+    virtual bool    coordinatesLocally() const { return false; }
+    virtual int32_t coordinatorNode() const { return -1; }
+    // #112: false while the cluster's metadata feature level predates the
+    // verification (an older coordinator would never answer a forwarded ask): a
+    // partition led here whose coordinator is REMOTE then admits the batch as
+    // before #112.  A local coordinator always verifies.
+    virtual bool    clusterVerifiesTxnPartitions() const { return true; }
 };
 
 } // namespace rune::gateway

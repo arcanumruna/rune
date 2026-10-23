@@ -334,7 +334,14 @@ inline constexpr int32_t kClientVersionAuth                       = 9;
 inline constexpr int32_t kClientVersionTxnOffsetFence             = 10;
 inline constexpr int32_t kClientVersionFilter                     = 11;  // subscription filters (Phase 2c)
 inline constexpr int32_t kClientVersionReceiverKeys               = 12;  // per-receiver c2b keys (issue #116)
-inline constexpr int32_t kClientVersion                           = 12;  // what this protocol's client announces
+// 13 — issue #112 (F15-FU1, KIP-890 part 1): a transactional ProduceResponse may be ConcurrentTransactions (27): the
+//   partition leader is verifying with the transaction coordinator that the partition is registered in the
+//   producer's ongoing transaction (the first batch of a transaction on a partition).  NOTHING was appended; the
+//   client re-sends the batch unchanged (same identity, no metadata refresh, the transaction stays open) after a short
+//   backoff.  A refused verification answers the batch InvalidTxnState / ProducerFenced / InvalidProducerEpoch
+//   (non-retriable).  A broker answers a session below 13 NotLeader instead of 27 (their retriable code).
+inline constexpr int32_t kClientVersionTxnVerify                  = 13;  // produce ConcurrentTransactions (issue #112)
+inline constexpr int32_t kClientVersion                           = 13;  // what this protocol's client announces
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h
@@ -397,6 +404,13 @@ inline constexpr int32_t kBrokerVersion                           = 7;   // what
     return clientVersion >= kClientVersionTransientLogFull;
 }
 
+/// True when a session that connected with `clientVersion` may be answered ConcurrentTransactions (27) on a
+/// ProduceResponse (issue #112, see version 13); below it the broker answers NotLeader.  A negative version
+/// (unknown: rigs) is treated as current.
+[[nodiscard]] constexpr bool clientUnderstandsProduceTxnVerify(int32_t clientVersion) noexcept {
+    return clientVersion < 0 || clientVersion >= kClientVersionTxnVerify;
+}
+
 /// True when a session that connected with `clientVersion` may be sent the
 /// moved-subscription position note (an empty-batch Records frame; see 6).
 [[nodiscard]] constexpr bool clientUnderstandsMovedPositionNote(int32_t clientVersion) noexcept {
@@ -437,14 +451,17 @@ inline constexpr int32_t kBrokerVersion                           = 7;   // what
 
 /// The produce error code a session that connected with `clientVersion` is
 /// answered: UnknownProducerId becomes OutOfOrderSequence (the pre-D6 answer)
-/// for clients below kClientVersionUnknownProducerId, and TransientLogFull becomes
-/// NotLeader for clients below kClientVersionTransientLogFull; every other code
+/// for clients below kClientVersionUnknownProducerId, TransientLogFull becomes
+/// NotLeader for clients below kClientVersionTransientLogFull, and ConcurrentTransactions
+/// becomes NotLeader for clients below kClientVersionTxnVerify; every other code
 /// passes through.  The ONE definition every broker answer site uses (review L4).
 [[nodiscard]] constexpr ErrorCode produceErrorForClient(ErrorCode ec, int32_t clientVersion) noexcept {
     if (ec == ErrorCode::UnknownProducerId && !clientUnderstandsUnknownProducerId(clientVersion)) [[unlikely]]
         return ErrorCode::OutOfOrderSequence;
     if (ec == ErrorCode::TransientLogFull && !clientUnderstandsTransientLogFull(clientVersion)) [[unlikely]]
         return ErrorCode::NotLeader;   // Phase 2b E2: a pre-v6 client's retriable code
+    if (ec == ErrorCode::ConcurrentTransactions && !clientUnderstandsProduceTxnVerify(clientVersion)) [[unlikely]]
+        return ErrorCode::NotLeader;   // issue #112: a pre-v13 client's retriable code
     return ec;
 }
 

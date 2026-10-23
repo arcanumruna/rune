@@ -615,6 +615,7 @@ public:
         , io_(ioSubmitDepth, ioComplDepth)
     {
         durablePending_.reserve(kMaxOwedReturns);   // F15 S3: capped → never grows
+        nextTxnVerifyReqId_ = static_cast<uint64_t>(static_cast<uint32_t>(workerId)) << 40;   // #112: per-worker space
         initRoutes_(ioSubmitDepth > ioComplDepth ? ioSubmitDepth : ioComplDepth);
         dirtyThisCycle_.reserve(kDirtySetReserve);
         roundMembers_.reserve(pow2AtLeast_(ioSubmitDepth < 2 ? 2 : ioSubmitDepth));   // A10: members <= io depth
@@ -2637,6 +2638,10 @@ private:
         // Task #13: AppendControlRecord — worker appends txn control marker
         case WorkerOp::Type::AppendControlRecord:
             executeAppendControlRecordWire_(op);
+            break;
+        // F15-FU1 (#112): the coordinator's answer to this worker's TxnVerifyRequest.
+        case WorkerOp::Type::TxnVerifyResult:
+            executeTxnVerifyResultWire_(op);
             break;
         // read-rework T3/T4: subscription lifecycle (worker owns the push cursor)
         case WorkerOp::Type::Subscribe:
@@ -6195,6 +6200,7 @@ private:
         case WorkerOp::Type::ReconcileFetchReq:
         case WorkerOp::Type::AlterIsrResponse:
         case WorkerOp::Type::AppendControlRecord:
+        case WorkerOp::Type::TxnVerifyResult:   // #112: a stale answer is dropped (the client's retry re-verifies)
         case WorkerOp::Type::Subscribe:
             return true;
         default:
@@ -7597,6 +7603,8 @@ private:
             retFifo_.popFront();
             ++flushed;
         }
+        // #112: unsent verification requests follow (they never enter the FIFO).
+        if (verifyOutHead_ != verifyOutTail_ && retFifo_.empty()) [[unlikely]] flushed += flushTxnVerifyOutbox_();
         return flushed;
     }
 
@@ -8177,6 +8185,115 @@ private:
         return ret;
     }
 
+    // F15-FU1 (#112): the transactional produce gate.  True = refused (the answer was
+    // enqueued in `ret`'s shell; nothing appended).  Admit → false.  A pending or a
+    // newly requested verification answers ConcurrentTransactions (27, retriable —
+    // the client re-sends the batch unchanged); a coordinator refusal answers its
+    // code.  One open-transaction lookup for a producer already open here (the
+    // common case); no allocation.  The request rides the fixed verify outbox, never
+    // the return FIFO: one op still emits at most kMaxReturnsPerOp (= 1) FIFO return
+    // (its answer), so the FIFO's static bound holds; a full outbox answers Retry
+    // without opening a verification (nothing is left Pending without a request).
+    [[nodiscard]] bool txnAdmissionRefuses_(RcState& rc, rune::replication::PartitionReplica* replica,
+                                            std::span<const uint8_t> rbSpan, WorkerReturn& ret) {
+        namespace pc = rune::protocol::client;
+        const rune::protocol::RecordBatchReader r(rbSpan.data(), rbSpan.size());
+        if ((static_cast<uint16_t>(r.attributes()) & kTxnAttrBit) == 0) [[likely]] return false;   // idempotent only
+        if (!txnVerification_) [[unlikely]] return false;                               // test rigs without a coordinator
+        const int64_t pid = r.producerId();
+        if (pid < 0) return false;   // not a producer batch: the produce helper refuses the identity
+        const int16_t epoch = r.producerEpoch();
+        const TxnAdmission a = rc.admitTxnBatch(pid, epoch, nextTxnVerifyReqId_, !verifyOutboxFull_());
+        if (a.kind == TxnAdmission::Kind::Admit) [[likely]] return false;
+        if (a.kind == TxnAdmission::Kind::RequestVerify) {
+            TxnVerifyOut& q = verifyOutbox_[verifyOutTail_ & (kTxnVerifyOutboxCapacity - 1)];
+            q.topicId     = ret.topicId;
+            q.partition   = ret.partition;
+            q.producerId  = pid;
+            q.epoch       = epoch;
+            q.reqId       = a.reqId;
+            q.replicaId   = replica != nullptr ? replica->registryId() : 0;
+            q.incarnation = replica != nullptr ? replica->incarnation() : 0;
+            ++verifyOutTail_;
+            ++txnVerifyRequestsSent_;
+            if (retFifo_.empty()) (void)flushTxnVerifyOutbox_();
+        }
+        ret.errorCode = a.kind == TxnAdmission::Kind::Refuse
+                            ? a.code : static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions);
+        ++txnBatchesRefusedUnverified_;
+        enqueueReturn_(ret);
+        return true;
+    }
+    // F15-FU1 (#112): the verify outbox → the return ring, oldest first, only while the
+    // return FIFO is empty (flushRetFifo_); stops at the first refused claim.
+    int flushTxnVerifyOutbox_() {
+        int flushed = 0;
+        while (verifyOutHead_ != verifyOutTail_) {
+            const TxnVerifyOut& o = verifyOutbox_[verifyOutHead_ & (kTxnVerifyOutboxCapacity - 1)];
+            WorkerReturn q;
+            q.type            = WorkerReturn::Type::TxnVerifyRequest;
+            q.topicId         = o.topicId;
+            q.partition       = o.partition;
+            q.producerId      = o.producerId;
+            q.producerEpoch   = o.epoch;
+            q.correlationId   = static_cast<int64_t>(o.reqId);
+            q.targetReplicaId = o.replicaId;
+            q.incarnation     = o.incarnation;
+            if (!tryWriteReturn_(q)) break;
+            ++verifyOutHead_;
+            ++flushed;
+        }
+        return flushed;
+    }
+    [[nodiscard]] bool verifyOutboxFull_() const noexcept {
+        return verifyOutTail_ - verifyOutHead_ >= kTxnVerifyOutboxCapacity;
+    }
+    // F15-FU1 (#112): the coordinator's answer (TxnVerifyResult op) — applied to the
+    // partition's RC state (ownership-gated by the op guard; a demoted / rebuilt state
+    // holds no matching Pending entry and drops it).
+    void executeTxnVerifyResultWire_(sbe::WorkerOp& op) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+        RcState* rc = replica != nullptr ? rcOf_(replica) : nullptr;
+        if (rc == nullptr || !rc->ready()) { ++txnVerifyAnswersDropped_; return; }
+        rc->onVerifyAnswer(op.producerId(), op.producerEpoch(), static_cast<uint64_t>(op.correlationId()),
+                           op.replErrorCode());
+    }
+public:
+    /// F15-FU1 (#112): the partition-registration check is on only when the runtime
+    /// has a transaction coordinator to answer TxnVerifyRequest: BrokerNode turns it on
+    /// for every worker at build (before the runners start) — it always wires one.
+    /// Off (the default) = a rig with no coordinator (every transactional batch is
+    /// admitted, as before #112).  Cold; before the worker thread runs.
+    void setTxnVerification(bool on) noexcept { txnVerification_ = on; }
+    [[nodiscard]] bool txnVerification() const noexcept { return txnVerification_; }
+    [[nodiscard]] uint64_t txnVerifyRequestsSentForTest() const noexcept { return txnVerifyRequestsSent_; }
+    [[nodiscard]] uint64_t txnBatchesRefusedUnverifiedForTest() const noexcept { return txnBatchesRefusedUnverified_; }
+    [[nodiscard]] uint64_t txnVerifyAnswersDroppedForTest() const noexcept { return txnVerifyAnswersDropped_; }
+    /// #112: verification requests most one worker holds unsent (the ring was full).
+    static constexpr std::size_t kTxnVerifyOutboxCapacity = 256;
+private:
+    struct TxnVerifyOut {
+        int32_t  topicId     = 0;
+        int32_t  partition   = 0;
+        int64_t  producerId  = -1;
+        uint64_t reqId       = 0;
+        uint32_t replicaId   = 0;
+        uint32_t incarnation = 0;
+        int16_t  epoch       = 0;
+    };
+    static_assert((kTxnVerifyOutboxCapacity & (kTxnVerifyOutboxCapacity - 1)) == 0, "power of two");
+    std::array<TxnVerifyOut, kTxnVerifyOutboxCapacity> verifyOutbox_{};
+    uint64_t verifyOutHead_               = 0;
+    uint64_t verifyOutTail_               = 0;
+    bool     txnVerification_             = false;
+    /// Worker-wide request ids, the worker id in the high bits: never reused across
+    /// partitions, RC incarnations or workers (an answer routed to a partition's new
+    /// owner never matches a request that owner issued).
+    uint64_t nextTxnVerifyReqId_          = 0;
+    uint64_t txnVerifyRequestsSent_       = 0;
+    uint64_t txnBatchesRefusedUnverified_ = 0;
+    uint64_t txnVerifyAnswersDropped_     = 0;
+
     struct ProduceFields {
         int64_t sessionId     = 0;
         int64_t correlationId = 0;
@@ -8356,6 +8473,15 @@ private:
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
             enqueueReturn_(ret);
             return 1;
+        }
+
+        // F15-FU1 (#112): a transactional batch of a producer with no open transaction
+        // here is appended only once the coordinator verified the partition is in that
+        // producer's ongoing transaction (txnAdmissionRefuses_; a non-transactional
+        // produce never gets here: rc is set only for producerId >= 0).
+        if (rc != nullptr && rbSpan.size() >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
+            [[unlikely]] {
+            if (txnAdmissionRefuses_(*rc, replica, rbSpan, ret)) return 1;
         }
 
         // Call the shared produce helper — over the disk Log, or (Phase 2b E2) a

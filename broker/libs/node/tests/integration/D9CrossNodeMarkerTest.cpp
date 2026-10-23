@@ -140,8 +140,26 @@ struct FakeChannel {
         f->responses.emplace_back(to, r);
         return true;
     }
+    // #112: cross-node registration verification frames.
+    std::vector<std::pair<int32_t, rune::replication::VerifyTxnPartitionMsg>> verifies;
+    std::vector<std::pair<int32_t, rune::replication::VerifyTxnPartitionResponseMsg>> verifyResponses;
+    bool acceptVerifies = true;
+    bool acceptVerifyResponses = true;
+    static bool sendVerify(void* self, int32_t to, const rune::replication::VerifyTxnPartitionMsg& m) {
+        auto* f = static_cast<FakeChannel*>(self);
+        if (!f->acceptVerifies) return false;
+        f->verifies.emplace_back(to, m);
+        return true;
+    }
+    static bool sendVerifyResponse(void* self, int32_t to, const rune::replication::VerifyTxnPartitionResponseMsg& r) {
+        auto* f = static_cast<FakeChannel*>(self);
+        if (!f->acceptVerifyResponses) return false;
+        f->verifyResponses.emplace_back(to, r);
+        return true;
+    }
     rune::gateway::ClientGateway::TxnMarkerChannel channel() {
-        return {&FakeChannel::sendMarker, &FakeChannel::sendResponse, this};
+        return {&FakeChannel::sendMarker, &FakeChannel::sendResponse, this, &FakeChannel::sendVerify,
+                &FakeChannel::sendVerifyResponse};
     }
 };
 
@@ -160,6 +178,16 @@ struct FakeTcs final : rune::gateway::ITxnRequestHandler {
     void onControlMarkerLanded(int32_t t, int32_t p, int64_t pid, int32_t epoch) override {
         done.push_back({t, p, pid, 0, epoch, true});
     }
+    // #112: the coordinator's side of the registration verification.
+    bool    local           = false;
+    int32_t coordNode       = -1;
+    int16_t verifyCode      = 0;
+    bool    clusterVerifies = true;
+    int     verifyCalls     = 0;
+    int16_t verifyTxnPartition(int64_t, int16_t, int32_t, int32_t, int64_t) override { ++verifyCalls; return verifyCode; }
+    bool    coordinatesLocally() const override { return local; }
+    int32_t coordinatorNode() const override { return coordNode; }
+    bool    clusterVerifiesTxnPartitions() const override { return clusterVerifies; }
 };
 
 // One node: topic 0 with 1 partition, its replica (Leader) on worker 0 of a
@@ -888,6 +916,216 @@ TEST(D9RemoteMarkerRegression, LocalStaleCoordinatorEpochMarkerIsFenced) {
     ASSERT_EQ(R.marker(77, true, /*epoch=*/5), rune::gateway::ClientGateway::kControlRecordAsync);   // equal epoch: OK
     for (int i = 0; i < 16 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(30 + i);
     EXPECT_EQ(controlBatchCount(*R.r->log()), 2);
+}
+
+// ============================================================================
+// Issue #112 (F15-FU1) — the registration verification when the transaction
+// coordinator runs on ANOTHER node: the leader's gateway forwards the worker's
+// ask over the cluster plane (VerifyTxnPartition) and relays the answer; every
+// ask gets exactly one answer (a lost one: NotCoordinator, retriable).
+// ============================================================================
+namespace {
+using rune::replication::VerifyTxnPartitionMsg;
+using rune::replication::VerifyTxnPartitionResponseMsg;
+constexpr int16_t kNotCoordinator = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+constexpr int16_t kInvalidTxnStateCode = static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);
+struct VerifyGwRig : GwRig {
+    explicit VerifyGwRig(int32_t self = 1, int32_t coordinator = 2) : GwRig(self) {
+        w().setTxnVerification(true);
+        tcs.coordNode = coordinator;
+    }
+    int64_t leo() { return r->log()->logEndOffset(); }
+    uint64_t refused() { return w().txnBatchesRefusedUnverifiedForTest(); }
+    void answer(std::size_t i, int16_t code, int64_t now) {
+        VerifyTxnPartitionResponseMsg resp{};
+        static_cast<VerifyTxnPartitionMsg&>(resp) = ch.verifies.at(i).second;
+        resp.errorCode = code;
+        gw.onRemoteVerifyTxnPartitionResponse(resp);
+        runWorker(now);
+    }
+};
+} // namespace
+
+TEST(TxnVerifyRemoteRegression, AskIsForwardedToTheRemoteCoordinatorAndItsConfirmationAdmitsRegression) {
+    VerifyGwRig R;
+    R.produceTxnData(/*pid=*/77, /*seq=*/0, /*corr=*/1, 10);
+    EXPECT_EQ(R.leo(), 0) << "appended before the coordinator confirmed the registration";
+    ASSERT_EQ(R.ch.verifies.size(), 1u) << "the ask was not forwarded to the coordinator node";
+    const auto& [to, m] = R.ch.verifies[0];
+    EXPECT_EQ(to, 2);
+    EXPECT_EQ(m.requesterNodeId, 1);
+    EXPECT_EQ(m.topicId, 0); EXPECT_EQ(m.partition, 0);
+    EXPECT_EQ(m.producerId, 77); EXPECT_EQ(m.producerEpoch, 0);
+    EXPECT_EQ(R.tcs.verifyCalls, 0) << "a remote coordinator is never asked locally";
+    EXPECT_EQ(R.gw.txnVerifiesInFlightForTest(), 1u);
+    R.answer(0, 0, 20);
+    EXPECT_EQ(R.gw.txnVerifiesInFlightForTest(), 0u);
+    R.produceTxnData(77, 0, 2, 30);   // the client's retry
+    EXPECT_EQ(R.leo(), 1);
+    R.produceTxnData(77, 1, 3, 40);
+    EXPECT_EQ(R.leo(), 2);
+    EXPECT_EQ(R.ch.verifies.size(), 1u) << "an open transaction is never re-verified";
+}
+
+TEST(TxnVerifyRemoteRegression, RemoteRefusalIsNeverAppendedRegression) {
+    VerifyGwRig R;
+    R.produceTxnData(77, 0, 1, 10);
+    ASSERT_EQ(R.ch.verifies.size(), 1u);
+    R.answer(0, kInvalidTxnStateCode, 20);
+    R.produceTxnData(77, 0, 2, 30);
+    EXPECT_EQ(R.leo(), 0);
+    EXPECT_EQ(R.refused(), 2u);
+    EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 0u) << "the LSO is pinned by a transaction no marker will close";
+}
+
+// A plane reconnect may lose the ask or its answer: the ask is answered NotCoordinator (retriable) at once, the
+// client's retry asks again, and a late answer to the lost ask admits nothing.
+TEST(TxnVerifyRemoteRegression, PlaneReconnectAnswersTheInFlightAskRetriablyRegression) {
+    for (const int32_t peer : {2, -1}) {
+        SCOPED_TRACE(peer);
+        VerifyGwRig R;
+        R.produceTxnData(77, 0, 1, 10);
+        ASSERT_EQ(R.ch.verifies.size(), 1u);
+        R.gw.onPlaneReconnect(peer);
+        (void)R.gw.pumpTxnVerifyForTest(11);
+        EXPECT_EQ(R.gw.txnVerifiesInFlightForTest(), 0u) << "a lost ask must never wait forever";
+        R.runWorker(12);
+        R.produceTxnData(77, 0, 2, 20);
+        ASSERT_EQ(R.ch.verifies.size(), 2u) << "the retry must ask again";
+        EXPECT_NE(R.ch.verifies[1].second.token, R.ch.verifies[0].second.token);
+        R.answer(0, 0, 30);   // the late answer to the lost ask
+        R.produceTxnData(77, 0, 3, 40);
+        EXPECT_EQ(R.leo(), 0) << "a stale confirmation admitted the batch";
+        R.answer(1, 0, 50);
+        R.produceTxnData(77, 0, 4, 60);
+        EXPECT_EQ(R.leo(), 1);
+    }
+}
+
+TEST(TxnVerifyRemoteRegression, CoordinatorMoveAnswersTheInFlightAskRetriablyRegression) {
+    VerifyGwRig R;
+    R.produceTxnData(77, 0, 1, 10);
+    ASSERT_EQ(R.ch.verifies.size(), 1u);
+    R.tcs.coordNode = 3;
+    (void)R.gw.pumpTxnVerifyForTest(11);
+    EXPECT_EQ(R.gw.txnVerifiesInFlightForTest(), 0u);
+    R.runWorker(12);
+    R.produceTxnData(77, 0, 2, 20);
+    ASSERT_EQ(R.ch.verifies.size(), 2u);
+    EXPECT_EQ(R.ch.verifies[1].first, 3) << "the retry asks the new coordinator";
+    R.answer(1, 0, 30);
+    R.produceTxnData(77, 0, 3, 40);
+    EXPECT_EQ(R.leo(), 1);
+}
+
+// The coordinator moves and a NEW ask goes to the new node before the next pump: the ask still out to the old
+// node is answered NotCoordinator by the sweep (never left waiting on a node that may never answer).
+TEST(TxnVerifyRemoteRegression, AskToTheOldCoordinatorIsSweptAfterANewAskWentToTheNewOneRegression) {
+    VerifyGwRig R;
+    R.produceTxnData(77, 0, 1, 10);
+    ASSERT_EQ(R.ch.verifies.size(), 1u);
+    R.tcs.coordNode = 3;
+    R.produceTxnData(78, 0, 2, 11);   // another producer's ask, to node 3, before any pump
+    ASSERT_EQ(R.ch.verifies.size(), 2u);
+    EXPECT_EQ(R.ch.verifies[1].first, 3);
+    EXPECT_EQ(R.gw.txnVerifiesInFlightForTest(), 2u);
+    (void)R.gw.pumpTxnVerifyForTest(12);
+    EXPECT_EQ(R.gw.txnVerifiesInFlightForTest(), 1u) << "the ask to the old coordinator was never swept";
+    R.runWorker(13);
+    R.produceTxnData(77, 0, 3, 20);
+    ASSERT_EQ(R.ch.verifies.size(), 3u) << "pid 77's retry must ask the new coordinator";
+    EXPECT_EQ(R.ch.verifies[2].first, 3);
+}
+
+TEST(TxnVerifyRemoteRegression, BackPressuredAskIsQueuedAndSentLaterRegression) {
+    VerifyGwRig R;
+    R.ch.acceptVerifies = false;
+    R.produceTxnData(77, 0, 1, 10);
+    EXPECT_TRUE(R.ch.verifies.empty());
+    EXPECT_EQ(R.gw.txnVerifiesInFlightForTest(), 1u) << "a refused send was dropped";
+    (void)R.gw.pumpTxnVerifyForTest(11);
+    EXPECT_TRUE(R.ch.verifies.empty());
+    R.ch.acceptVerifies = true;
+    (void)R.gw.pumpTxnVerifyForTest(12);
+    ASSERT_EQ(R.ch.verifies.size(), 1u);
+    R.answer(0, 0, 20);
+    R.produceTxnData(77, 0, 2, 30);
+    EXPECT_EQ(R.leo(), 1);
+}
+
+// No coordinator known (election): retriable; a cluster with a member older than the verification admits the
+// batch exactly as before #112 (an older coordinator would never answer the ask).
+TEST(TxnVerifyRemoteRegression, UnknownCoordinatorRetriesAndAnOlderClusterAdmitsRegression) {
+    VerifyGwRig R(1, /*coordinator=*/-1);
+    R.produceTxnData(77, 0, 1, 10);
+    R.produceTxnData(77, 0, 2, 20);
+    EXPECT_EQ(R.leo(), 0);
+    EXPECT_TRUE(R.ch.verifies.empty());
+    EXPECT_EQ(R.w().txnVerifyRequestsSentForTest(), 2u) << "NotCoordinator must let the retry ask again";
+    R.tcs.coordNode = 2;
+    R.tcs.clusterVerifies = false;
+    R.produceTxnData(77, 0, 3, 30);
+    R.produceTxnData(77, 0, 4, 40);
+    EXPECT_EQ(R.leo(), 1);
+    EXPECT_TRUE(R.ch.verifies.empty()) << "an older cluster's coordinator was asked";
+}
+
+// The coordinator node's side: an ask from a partition leader is answered to that leader with the coordinator's
+// code and the leader's token echoed; a node that does not coordinate answers NotCoordinator; a back-pressured
+// answer is kept and sent later, in order.
+TEST(TxnVerifyRemoteRegression, CoordinatorAnswersTheAskerRegression) {
+    VerifyGwRig R(/*self=*/2, /*coordinator=*/2);
+    R.tcs.local = true;
+    R.tcs.verifyCode = kInvalidTxnStateCode;
+    VerifyTxnPartitionMsg m{};
+    m.requesterNodeId = 3; m.topicId = 0; m.partition = 1; m.token = 4242; m.producerId = 9; m.producerEpoch = 2;
+    R.gw.onRemoteVerifyTxnPartition(m);
+    ASSERT_EQ(R.ch.verifyResponses.size(), 1u);
+    EXPECT_EQ(R.ch.verifyResponses[0].first, 3);
+    const auto& a = R.ch.verifyResponses[0].second;
+    EXPECT_EQ(a.token, 4242); EXPECT_EQ(a.producerId, 9); EXPECT_EQ(a.producerEpoch, 2);
+    EXPECT_EQ(a.topicId, 0); EXPECT_EQ(a.partition, 1);
+    EXPECT_EQ(a.errorCode, kInvalidTxnStateCode);
+    EXPECT_EQ(R.tcs.verifyCalls, 1);
+    R.tcs.local = false;
+    R.ch.acceptVerifyResponses = false;
+    m.token = 4243;
+    R.gw.onRemoteVerifyTxnPartition(m);
+    m.token = 4244;
+    R.gw.onRemoteVerifyTxnPartition(m);
+    EXPECT_EQ(R.ch.verifyResponses.size(), 1u);
+    EXPECT_EQ(R.tcs.verifyCalls, 1) << "a node that does not coordinate must not answer from its own state";
+    R.ch.acceptVerifyResponses = true;
+    (void)R.gw.pumpTxnVerifyForTest(5);
+    ASSERT_EQ(R.ch.verifyResponses.size(), 3u) << "a back-pressured answer was lost";
+    EXPECT_EQ(R.ch.verifyResponses[1].second.token, 4243);
+    EXPECT_EQ(R.ch.verifyResponses[2].second.token, 4244);
+    EXPECT_EQ(R.ch.verifyResponses[1].second.errorCode, kNotCoordinator);
+}
+
+// Wire round trip of both frames (templates 13 / 14), fixed 32-byte block, little-endian.
+TEST(TxnVerifyRemoteRegression, VerifyFramesRoundTripRegression) {
+    VerifyTxnPartitionMsg m{};
+    m.requesterNodeId = 7; m.topicId = -3; m.token = 0x0102030405060708LL; m.producerId = 1LL << 40;
+    m.partition = 65535; m.producerEpoch = 32767; m.errorCode = 99;   // ignored on the ask
+    uint8_t buf[VerifyTxnPartitionMsg::TOTAL_SIZE];
+    ASSERT_EQ(m.encode(buf, sizeof buf), VerifyTxnPartitionMsg::TOTAL_SIZE);
+    EXPECT_EQ(m.encode(buf, sizeof buf - 1), 0u);
+    VerifyTxnPartitionMsg d{};
+    ASSERT_TRUE(VerifyTxnPartitionMsg::decode(buf, sizeof buf, d));
+    EXPECT_EQ(d.requesterNodeId, 7); EXPECT_EQ(d.topicId, -3); EXPECT_EQ(d.token, m.token);
+    EXPECT_EQ(d.producerId, m.producerId); EXPECT_EQ(d.partition, 65535); EXPECT_EQ(d.producerEpoch, 32767);
+    EXPECT_EQ(d.errorCode, 0);
+    VerifyTxnPartitionResponseMsg rd{};
+    EXPECT_FALSE(VerifyTxnPartitionResponseMsg::decode(buf, sizeof buf, rd)) << "an ask decoded as an answer";
+    EXPECT_FALSE(VerifyTxnPartitionMsg::decode(buf, sizeof buf - 1, d)) << "a truncated frame decoded";
+    VerifyTxnPartitionResponseMsg r{};
+    static_cast<VerifyTxnPartitionMsg&>(r) = m;
+    r.errorCode = 19;
+    ASSERT_EQ(r.encode(buf, sizeof buf), VerifyTxnPartitionMsg::TOTAL_SIZE);
+    ASSERT_TRUE(VerifyTxnPartitionResponseMsg::decode(buf, sizeof buf, rd));
+    EXPECT_EQ(rd.errorCode, 19); EXPECT_EQ(rd.token, m.token);
+    EXPECT_FALSE(VerifyTxnPartitionMsg::decode(buf, sizeof buf, d)) << "an answer decoded as an ask";
 }
 
 // ============================================================================

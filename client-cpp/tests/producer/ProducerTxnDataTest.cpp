@@ -1464,6 +1464,42 @@ TEST(ProducerTxnDataRegression, TransientLogFullBacksOffWithoutSpendingRetriesRe
     EXPECT_FALSE(r.impl->hasInFlight());
 }
 
+// Issue #112 (client version 13): ConcurrentTransactions (27) on a produce = the leader is verifying the
+// partition's registration with the coordinator (KIP-890 part 1): nothing was appended.  Re-sent unchanged
+// (same identity) after a SHORT backoff that grows per attempt (capped), never spending the retry budget, never
+// aborting the transaction.  Before the fix 27 was a broker error: the transaction became abortable.
+TEST(ProducerTxnDataRegression, ConcurrentTransactionsIsRetriedWithAShortBackoffNeverAbortingRegression) {
+    Rig r;
+    r.initOk(77, 0);
+    sendBatches(r, 1);
+    const int32_t seq0 = r.wire[0].baseSeq;
+    const int16_t epoch0 = r.wire[0].epoch;
+    int firstWait = -1;
+    for (int round = 0; round < 3 * 5 /* > kMaxRetries */; ++round) {
+        SCOPED_TRACE(round);
+        const std::size_t before = r.wire.size();
+        r.hub.onProduceResponse(r.wire.back().corrId, -1, static_cast<int16_t>(rpc::ErrorCode::ConcurrentTransactions));
+        ASSERT_EQ(r.state(), TxnState::InTransaction) << "27 poisoned the transaction";
+        int waited = 0;   // 1 ms duty-clock steps
+        while (r.wire.size() == before) {
+            r.tick(kMs);
+            ASSERT_LE(++waited, 200) << "never re-sent (the backoff is capped by the retriable backoff)";
+        }
+        if (round == 0) firstWait = waited;
+        EXPECT_EQ(r.wire.back().baseSeq, seq0) << "same identity";
+        EXPECT_EQ(r.wire.back().epoch, epoch0);
+    }
+    EXPECT_LE(firstWait, 2) << "the first retry must follow within a broker pass or a plane round trip";
+    answerWire(r, r.wire.size() - 1, 0, 7);
+    EXPECT_EQ(r.state(), TxnState::InTransaction);
+    EXPECT_FALSE(r.impl->hasInFlight());
+    Op c = r.commit();
+    r.tick();
+    r.endAnswer();
+    ASSERT_TRUE(c.ready());
+    EXPECT_EQ(c.status(), OpStatus::Ok);
+}
+
 // ---- flush ------------------------------------------------------------------------------------------------------
 
 // E3 (DR tx_read_committed): Kafka flush() completes once every record sent so far is ACKED (produced and durable),

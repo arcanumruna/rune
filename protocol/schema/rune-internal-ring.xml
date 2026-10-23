@@ -111,6 +111,11 @@
            a typed topic's filter schema (the filterable fields: tag, primitive type, offset, width).
            topicId = the topic, tail (TailKind = DESCRIPTOR_BLOB) = the evolving descriptor blob, clientVersion = the schema version.  Append-only value. -->
       <validValue name="FILTER_SCHEMA">25</validValue>
+      <!-- F15-FU1 (#112): control -> the partition's owning worker: the transaction coordinator's answer to a
+           TXN_VERIFY_REQUEST return.  topicId / partition = the partition, producerId / producerEpoch = the producer,
+           correlationId = the worker's request id, replErrorCode = the client ErrorCode (0 = the partition is
+           registered in the producer's ongoing transaction).  Ownership-gated. -->
+      <validValue name="TXN_VERIFY_RESULT">26</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica
@@ -174,6 +179,10 @@
            recordCount = rowLen (informational), readTopicId = viewTopicId;
            the chunk tail carries the row bytes on OK. -->
       <validValue name="VIEW_ROW_RESULT">7</validValue>
+      <!-- F15-FU1 (#112): the owning worker asks the transaction coordinator whether a transactional batch of
+           (producerId, producerEpoch) may open a transaction on topicId / partition.  correlationId = the worker's
+           request id (echoed by TXN_VERIFY_RESULT); targetReplicaId / incarnation = the partition replica. -->
+      <validValue name="TXN_VERIFY_REQUEST">8</validValue>
     </enum>
 
     <!-- F15: TxnReturn::kind -->
