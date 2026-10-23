@@ -113,11 +113,100 @@ Each ruling is a decision that the part plans must follow. The owner can overtur
 - **SD15 — #537 refold rule. Replaced by ruling R01 (plan 01 AD5a) for all parts; the text below is not binding.** ~~No checkpoint format change: Part D owns v3. At recovery, a persisted view whose source partition's `RcState` aborted index is non-empty discards its v1/v2 checkpoint and refolds from the log start.~~ R01: checkpoints written by the fixed code use the marked magics 0x534B4331 / 0x534B4332; an unmarked checkpoint is refolded once, only when an aborted range starts below its unmarked coverage and the log still starts at 0; every v3 record counts as marked.
 - **SD16 — The `View` ack and open transactions.** A `View` waiter on a partition behind an open transaction waits for the LSO (§8.9). Waiters live in their own queue (C4), so `All` acks never queue behind them.
 
+## Rulings register (binding; they override this file where they differ)
+
+Each ruling below was decided by the controller while the part plans were written. Every part plan restates the ones it depends on. The gist here is complete enough to act on.
+
+- **R01:** Checkpoints written by the fixed code use the marked magics 0x534B4331 / 0x534B4332 (replaces SD15 for all parts). An unmarked checkpoint is refolded once, only when an aborted range starts below its coverage and the log still starts at 0. Part 07's v3 never uses 0x534B433x and counts as marked.
+- **R02a:** `RecordSpan::key` and the bounds-checked `forEachRecordSpan` belong to Part 02. Part 03 consumes them.
+- **R02b:** Tombstones skip value validation at every level. Only the key width is checked.
+- **R02c:** A record whose schema version is above the worker's max gets a retriable `NotLeader`, not 24.
+- **R02d:** Keyless typed topics in QL (`key` optional) belong to Part 08.
+- **R02e:** Part 02's `TopicFeatureRules.h` (`featureRefusal`, `topicShapeOf`) is the DDL refusal helper that 05, 06 and 09 call.
+- **R03a:** An ack longer than an Aeron publication's `maxPayloadLength` (a v12 ack reaches 32,824 B) goes out with `offer` (fragmented); a shorter one uses `tryClaim`. The 4096-record batch tests it.
+- **R03b:** On untyped topics the broker stores intent bits as opaque bytes, and the client refuses intents, key-0 creates and `View` there locally (amended by R05a).
+- **R03c:** The client never sets `View` on a transactional send, and the broker ignores it there. Transactions get their verdicts through Part 11's vote (`commitTransactionAndWait`).
+- **R03d:** Part 03's matrix ids are 120–139, folded into Part 04's shared matrix.
+- **R03e:** Tombstones need a key of exactly `keyWidth` bytes. Part 02's rule wins if they differ.
+- **R04a:** The two-phase drop belongs to Part 09. A dropping verdict view's plan stays installed, and keeps judging, on every replica until W passes the drop's change record; only then is it uninstalled. A failover during the drop finishes it.
+- **R04b:** C11's "follower apply" is the `RcState` leadership scan rebuilding the rejected-offset index from markers. Followers hold no verdict state between leaderships.
+- **R04c:** A fourth marker trigger: judged records reaching a persisted verdict view's checkpoint cap force a marker, so a checkpoint never outruns the markers.
+- **R04d (amended):** Part 04 appends 7 `Timing` values (03's six plus `RetryAfterWindow`). Later parts only append.
+- **R04e:** A known duplicate with `View` on a verdict source replays the original verdicts once W passes the original batch (06 and 09 add the assigned keys and constraint names). Outside the dedupe window it is `DuplicateSequence` (21), which the client reports as one `OpStatus::VerdictUnknown` for the batch, never per record.
+- **R04f:** Part 04's contract additions are binding: `RejectedOffsetIndex`, `ConstraintSet` / `ConstraintSetTimeline`, `kMaxVerdictViewsPerSource = 32`, `MarkerLedger`, the `TestReject` seam, `RcVerdictHooks` and the cleaner bounds.
+- **R04g:** `OpStatus::VerdictUnknown = 14` (13 = `StoredIdUnknown`). The 32-slot dedupe window keeps the original base offset, so a `View` retry inside it replays the original verdicts.
+- **R05a:** Local refusals on an untyped topic (intents, key-0 creates, `View`) are a synchronous `SendResult::WriteNotAllowed` with no completion.
+- **R05b:** Part 11 defines the C8 atomic-batch header bit. Parts 05, 06 and 09 do not.
+- **R05c (amended):** The key index is not checkpointed; each new leadership rebuilds it from the local log. Intents during the rebuild are accepted, judged once it finishes, and their `View` acks wait. `KeyIndexActivating` (retriable `NotLeader`) applies only before the key index's change record is committed. Follow-up issue: checkpoint the key index, guarded by a cleaner "tombstones removed through" watermark.
+- **R05d:** `ApplyV2` (catalog `formatVer` 2) stays open until the first release. Part 06 appends its rules to it rather than adding a v3.
+- **R05e:** Part 03's sweep invariant (iv) has one exception: `KeyIndexActivating` answers `NotLeader`.
+- **R05f:** Part 05's contract additions are binding: the 14-byte `TopicKeyFeatures` block, `TopicWriteSpecWire::keyIndex` (flags bit 1), the key-index API of `VerdictSource`, client `WriteIntent` / `WriteResult` / `TopicKind` / `kDefaultWriteWait`, and matrix ids 20–24 / 20–25. Part 06 places `partitioner` after `TopicHandle::kind`.
+- **R06a:** Autoincrement on an untyped topic is refused with "autoincrement needs a typed topic"; "autoincrement needs a key" is for keyless typed topics.
+- **R06b (owner-flagged):** The cleaner keeps a tombstone while the producer batch that created its id is still kept (the last 32 per live producer), so a dedupe replay never brings a deleted id back.
+- **R06c (owner-flagged):** The key index still checks broker-assigned ids as a reused-id detector. A hit rejects the record with 52 and counts a determinism alarm.
+- **R06d:** No delete-records API exists, so that §15 cell is not applicable; a follow-up issue is filed.
+- **R06e:** An `IMPORT` reservation extends to a full block.
+- **R06f:** Part 08 owns the QL `autoincrement` column modifier (the `partitions` default is refined by R08f).
+- **R06g:** A timed-out `insertAndWait` is an unknown outcome. `StoredIdUnknown = 13` is for a stored batch whose ids can't be returned.
+- **R06h:** Autoincrement is allowed only on compacted topics with no time or size retention. Part 06's contract additions are binding: `partitionFor`, the 26-B `TopicWriteSpecWire` (flags bit 2), `AutoInc.h`, `Import = 7`, `kPermFlagImport = 0x80`, `kFlagKeyZero = 0x08`, `ProduceAck::assignedBase`, matrix ids 40–45 / 40–46, stat ids 8–10.
+- **R07a:** A lowered `string(N)` key component is ⌊3N/2⌋ bytes, the table-computed maximum at Unicode 16.0.0, packed 0x00100000.
+- **R07b:** The `lower()` table is generated by a tool and committed, and a test cross-checks it against UnicodeData.txt.
+- **R07c:** Composite `group by` is in Part 07. Group-by columns form a composite `ViewKey` with the same order-preserving encoding as `key (a, b)` and must equal the view's key spec. Single 8-byte integer aggregates keep today's path.
+- **R07d (reworded):** Part 04 defines `ViewKey.h` with `fromU64` / `asU64` (`fromU64(v).asU64() == v`, `asU64` needs width ≤ 8); 05 and 06 use them. Part 07 owns and extends `ViewKey` (`fromBytes`, `operator==`, wide keys) and never renames them or changes their meaning.
+- **R07e:** `GetViewRowK` carries a client-computed partition. The old `GetViewRow` (72) on a new-style view answers `InvalidRequest`. The AdminWorker refuses `unique` / `check` until Part 09. Encoders write v1 bytes when no v2 field is used.
+- **R07f:** Part 07 takes op types 29 and 30, tail kind 13, return type 9, view-read status 8 and matrix ids 60–68. Part 08 starts return types at 10 and owns the QL half of the `lower('Foo')` cell.
+- **R07g:** A keyed aggregate needs an integer source key of at most 8 bytes, otherwise it is refused with 56; a follow-up issue is filed.
+- **R08a:** Aggregates see only the latest record per source key, so RegressorsPath's `device_login` gets a per-login key (`loginId uint64 autoincrement`). The golden, the e2e and the migration doc match.
+- **R08b:** The golden adds spec §1's `character` topic, and the golden e2e runs on `ThreeNodes`.
+- **R08c:** Part 08 defines `PredicateNode::constBytes` (the row-slot encoding, padded to 16 B), Part 09 decodes it the same way, and `aggregateOutputType` moves to the codec's `ViewPlanAuthored.h`.
+- **R08d:** The `select` key check runs at plan time. `GetStats` is served by the leader only and needs `DESCRIBE`.
+- **R08e:** Part 08 parses and plans `unique` / `check`; the AdminWorker refuses them (58, 57) until Part 09 deletes those lines and inverts the `…BeforePart09…` tests.
+- **R08f:** Part 02 owns the parser change that makes `partitions` optional; 08 owns the autoincrement no-partitions cell. `isSecurityStatement` becomes exact. `GetStats` = op 31, `StatsResult` = return 10. Part 09 adds stat 32 and Part 11 stats 11–20 through `StatsCollect.h`.
+- **R09a:** Control record type 20 (`kVerdictPlan`) holds the installed plan of a dropping or replaced verdict view, so the two-phase drop survives a restart or a lagging catalog. The cleaner always keeps it. Part 11 would start new types at 21.
+- **R09b:** A dropped or replaced plan is uninstalled once W passes its change record (amends 04 P4-6). Unique claims use their own tables (checkpoint v3 tables 6 and 7).
+- **R09c (owner-flagged):** The literal rule is kept. An existing duplicate that only updates a non-key column is accepted, a move out of a group already over its limit is rejected, and a NULL or non-finite column makes a check unknown, so the record passes.
+- **R09d:** Caps: 32 verdict views per topic (the key index counts as one), a 64 KiB constrained plan, 64 predicate nodes, and checks over fixed-width columns of at most 16 B. Matrix ids 80–86 / 80–90. `Client::constraintName` has a timeout overload. A rejected record's completion carries its offset in `value`.
+- **R10a:** Part 02's `featureRefusal` table holds KeyIndex, AutoIncrement and Constraint × transient; 05, 06 and 09 call it.
+- **R10b (owner-flagged wording):** Every view over a keyless topic is refused with 35 ("view source needs a key"); spec §4 wins over §9a. Part 10 has no keyless refusal of its own.
+- **R10c:** Part 10 runs after 01 and 03. Its `View`-ack cell stays in 10.
+- **R10d:** After a restart a gap counts as one `transientSourceResets` instead of `transientRecordsEvicted`; a deferred issue is filed.
+- **R10e:** Part 10's matrices live in their own binary with their own enums; no id range is reserved.
+- **R11a (owner-flagged; recommended accept):** New code `TxnConflict = 59`. A transaction votes no when a newer plain write to one of its keys lands before its `TxnJudge` (optimistic concurrency). Plain writers never wait behind a transaction.
+- **R11b:** Every fold (live, refold, rebuild, a replica's leadership scan) applies a transaction's records at its commit marker, in the same order, so every view and verdict is identical however the view was built.
+- **R11c:** A coordinator failover never loses vote candidates: on recovery every partition of the transaction's persisted partition set is a candidate, and a partition with nothing constrained answers yes at once.
+- **R11d:** Distributed lock waits resolve through the transaction timeout (a deadlock-detection issue is filed). The `TxnJudge` payload carries `firstOffset`. The overlay holds after-images. One-step visibility comes from a visibility bound (the commit marker, R11b) plus a read fence. Clients below v12 get 39 on a no vote. `commitTransactionAndWait` returns `TxnCommitResult`. `read_uncommitted` on a verdict source is served as `read_committed`. The cleaner keeps a `TxnJudge` while it lies at or above the `txnJudgeBound`. Part 11 edits matrix rows 05 and 06 for the pre-G refusals. Part 11's rune-site change is a local commit only, follows the site's copy rules, and is never pushed or deployed without the owner's go-ahead.
+- **R-ORD:** Dependency order 01, 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 11. 07 depends on 06 (`partitionFor`). 10 runs after 01 and 03, and 09 depends on 10 (its transient-source tests need 37 lifted).
+- **R-X1:** Part 02's `checkTypedRecord(const TopicWriteSpec&, const RecordSpan&, int16_t level)` in `WriteState.h` carries all of Part 02's rules and counters. Part 03's single walk calls it and adds `HookRefusal::VersionAhead` → `NotLeader`.
+- **R-X2:** `OpStatus`: 04 adds `StoredIdUnknown = 13` as a reserved placeholder (06 documents it) and `VerdictUnknown = 14`.
+- **R-X3:** Checkpoint v3 accepts any table id below its table count; a test pins 8 tables.
+- **R-X4:** The first marker starts at W, extended past spans whose constraint set is empty. K includes this node's own unmarked verdicts.
+- **R-X5:** `checkTypedBatch` and `checkTypedRecord` take `int16_t level`. Below level 4 a topic created without `validate` stays unchecked. `HookRefusal::KeyMismatch` is replaced by `VersionAhead`, and key mismatches count as `ValidationFailed`.
+- **R-X6:** This overview's contract, number registry, test table and file map are brought in line with all part plans in one pass after Part 11's plan (done).
+- **R-X7:** Import batches answer `assignedBase = 0`. The reuse alarm and `idsBurned` count only batches judged in the leadership that appended them. Test knobs: `NodeConfig::testAdvertisedBrokerVersion`, `ClientConfig::producePartitionUnknownForTest`, `ClientConfig::dropProduceAcksForTest`. A local `View` refusal on a raw handle says "acks View needs a typed topic".
+
+## Owner decisions pending
+
+Each item is implemented as the plans say until the owner overturns it.
+
+1. **`TxnConflict` (59)**, a new error code beyond §11.1 that aborts a transaction on a write-write conflict (R11a, 11 P11-3).
+2. **A partition also votes under its latest constraint set** (11 P11-1 (b)), beyond §G.2's "set active at the transaction's first record".
+3. **The key index is not checkpointed** (R05c): a failover pauses intents' verdicts for a rebuild proportional to the log, against the spec's mention of a checkpoint.
+4. **Tombstone retention for autoincrement ids** (R06b), a reading of §6.6.
+5. **Broker-assigned ids still go through the key index** as a reuse detector (R06c), against §6.4's "skip".
+6. **Plain upserts are refused on autoincrement topics** (06 rule 8a, §6.6), against §11.2's "a plain upsert passes on any topic".
+7. **The literal constraint rule** for duplicates, over-limit groups and NULL checks (R09c).
+8. **Spec wording:** views over keyless topics are refused with 35 (R10b); the lowered width is ⌊3N/2⌋, not ⌈3N/2⌉ (R07a).
+9. **Part 02's stricter validation:** a version above the worker's max answers retriable `NotLeader` instead of 24 (R02c), and dirty `string(N)` padding is rejected.
+10. **Constraint ids exhausted** at `objectId ≥ 65536` (SD5) and **no Aeron-counter export of stats** (SD13).
+11. **`TxnVoteMsg` carries no transactional id** (11 contract addition 4), against §G.2's message sketch.
+12. **Tier-2 batches carry no intent** (05 P5-9, follow-up issue): a Rune client cannot send an atomic batch of intents or key-0 creates.
+13. **Merging this plan set to `main`, every push, the release** (`kClientVersion = 12`, `kBrokerVersion = 7`, `kCheckedWrites = 4`) after Part 11, and **any rune-site deploy**.
+
 ## Review Focus (program level; each part adds its own five)
 
 1. **A dedupe retry of a stored batch on a verdict source.** This covers a retry before the fold judged the batch, one after, and one after failover plus compaction. It must get the original offsets, the original `assignedBase` and the same per-record verdicts. It must never get a second id or a second judgment (§6.6, §11.3).
-2. **Every reader of a log meets control records of types 16–19.** These readers are `RcBuilder::step` (`ReadCommittedView.cpp:315`), the PSM rebuild (`RcState.h:660`), `LogCleaner::scanTxnState` (`LogCleaner.cpp:229`), the push and filter paths, `forEachRecordSpan`, the folds, `SubscriberHub` (`SubscriberHub.cpp:600`) and `DataCodec` (`DataCodec.h:341`). Each must skip the records and must never take one for a COMMIT or ABORT marker.
-3. **Mixed versions.** A v11 broker receiving `acks` 2 or 3 answers `InvalidRequest` (`DataMessages.h:141`). A v11 client never receives a v12 `ProduceResponse` layout, codes 51–58 or `assignedBase`. A v12 client facing a v6 broker fails locally with `BrokerTooOld`.
+2. **Every reader of a log meets control records of types 16–20.** These readers are `RcBuilder::step` (`ReadCommittedView.cpp:315`), the PSM rebuild (`RcState.h:660`), `LogCleaner::scanTxnState` (`LogCleaner.cpp:229`), the push and filter paths, `forEachRecordSpan`, the folds, `SubscriberHub` (`SubscriberHub.cpp:600`) and `DataCodec` (`DataCodec.h:341`). Each must skip the records and must never take one for a COMMIT or ABORT marker.
+3. **Mixed versions.** A v11 broker receiving `acks` 2 or 3 answers `InvalidRequest` (`DataMessages.h:141`). A v11 client never receives a v12 `ProduceResponse` or `EndTxnResponse` layout, codes 51–59 or `assignedBase`. A v12 client facing a v6 broker fails locally with `BrokerTooOld`.
 4. **Consumers of a verdict source while a constraint view builds, or while the fold is stalled.** Delivery waits, never hangs past the build, never delivers an unjudged record, and the `View` ack deadline still answers `Internal`.
 5. **A `View` batch of more than 4096 records on a verdict source.** The client splits it, a raw producer gets `InvalidRequest`, and no ack ever exceeds `kMaxEncodedSize` (SD4).
 
@@ -128,16 +217,16 @@ Each ruling is a decision that the part plans must follow. The owner can overtur
 | NN | File | Spec | Depends on (merged first) | Delivers to later parts |
 |---|---|---|---|---|
 | 01 | `2026-10-22-checked-writes-01-aborted-fold.md` | #537, §8.8 last bullet | — | `rune::view::FoldSkip` (C9.2) threaded through `foldBatch` / `foldAggregateBatch`, rebuild and transient folds; the R01 refold rule (plan 01 AD5a; replaces SD15) |
-| 02 | `2026-10-22-checked-writes-02-typed-validation.md` | §4 (Part A), §12 level | — | `kCheckedWrites` and its propagation (C2); `TopicWriteSpec`, `PartitionWriteState`, the RcSlot pointer and `WriteSpecUpdate` (C7); always-on validation, wire key = key field, UTF-8 (`codec/include/rune/codec/Utf8.h`); `Key` truncation turned into an error; the bind checks, the `raw` marker, `partitions` defaulting to 1, DDL refusals on untyped and keyless topics |
-| 03 | `2026-10-22-checked-writes-03-write-hook.md` | §3 write path, §8.9, §11.2, §12 wire | 02 | The hook policy (C8); the `Acks` flags and `View` waiters (C4); the v12 wire skeleton (C1, C5); codes 51–58 with `errorCodeName`; intent constants and the `RecordSpan` extension (C3); `WriteNotAllowed`, `BrokerTooOld`; the per-write requirement table; SD10, SD11; the alloc-gate binary |
-| 04 | `2026-10-22-checked-writes-04-verdict-pipeline.md` | §3 fold, §8.4–§8.8, §11.3 | 01, 03 | `SourceRecord` / `Prospect` and prepare/apply (C9); `VerdictSource`; control-record layout and types (C10); `RejectedOffsetIndex`, `VerdictCleanState` and the cleaner bound (C11); `ConstraintSetChange` timeline (C12); consumer bound and filter; ack verdict trailer; the shared matrix and stress harness (§ Shared test infrastructure) |
+| 02 | `2026-10-22-checked-writes-02-typed-validation.md` | §4 (Part A), §12 level | — | `kCheckedWrites` and its propagation (C2); `TopicWriteSpec`, `PartitionWriteState`, the RcSlot pointer and `WriteSpecUpdate` (C7); `checkTypedRecord` / `checkTypedBatch` (R-X1, R-X5); `RecordSpan::key` and the bounds-checked `forEachRecordSpan` (R02a); `TopicFeatureRules.h` `featureRefusal` (R02e, R10a); always-on validation, wire key = key field, UTF-8 (`codec/include/rune/codec/Utf8.h`); `Key` truncation turned into an error; the bind checks, the `raw` marker, `partitions` defaulting to 1, DDL refusals on untyped and keyless topics |
+| 03 | `2026-10-22-checked-writes-03-write-hook.md` | §3 write path, §8.9, §11.2, §12 wire | 02 | The hook policy (C8); the `Acks` flags and `View` waiters (C4); the v12 wire skeleton (C1, C5); codes 51–58 with `errorCodeName`; intent constants and the `RecordSpan` `attributes` / `index` members (C3; `key` is 02's); the requirement seam `evaluateRequirements` / `HookRefusal`; `WriteNotAllowed`, `BrokerTooOld`; the per-write requirement table; SD10, SD11; the alloc-gate binary |
+| 04 | `2026-10-22-checked-writes-04-verdict-pipeline.md` | §3 fold, §8.4–§8.8, §11.3 | 01, 03 | `ViewKey` with `fromU64` / `asU64` (C9.1, R07d); `SourceRecord` / `Prospect` and prepare/apply (C9); `VerdictSource`; control-record layout and types (C10); `RejectedOffsetIndex`, `VerdictCleanState` and the cleaner bound (C11); `ConstraintSetChange` timeline (C12); consumer bound and filter; ack verdict trailer; the duplicate replay and `OpStatus` 13 (reserved) / 14 `VerdictUnknown` (R04e, R-X2); the shared matrix, model and stress harness (§ Shared test infrastructure) |
 | 05 | `2026-10-22-checked-writes-05-intents-key-index.md` | §5 (Part B) | 04 | The key index as `VerdictViewKind::KeyIndex`; intents 52/53; catalog `formatVer` 2 with `TopicKeyFeatures` and the DefineTopic / TopicSchemaResponse fields (C13); `WriteIntent`, `RecordOp`, `WriteResult`, typed `insert`/`update`/`upsert`/`remove`/`removeExisting` (C15); the first docker e2e |
-| 06 | `2026-10-22-checked-writes-06-autoincrement.md` | §6 (Part C) | 05 | The modulo partitioner; `AutoIncState`, reservations, side window and cleaner retention; `IMPORT` (C17); `assignedBase` filled; `insertAndWait(...).key()`; `OpStatus::StoredIdUnknown` |
+| 06 | `2026-10-22-checked-writes-06-autoincrement.md` | §6 (Part C) | 05 | The modulo partitioner; `AutoIncState`, reservations, side window and cleaner retention; `IMPORT` (C17); `assignedBase` filled; `insertAndWait(...).key()`; the meaning of `OpStatus::StoredIdUnknown` (13, reserved by 04) |
 | 07 | `2026-10-22-checked-writes-07-wide-view-keys.md` | §7, §9 (Part D), §8.1 mechanics (SD7) | 06 (it uses `partitionFor`; R-ORD) | `ViewKey` tables, seeded hash, owner map, prefix index, checkpoint v3; plan v2 format with every field (C14), and the authored plan moved to codec; codec `lower` and the key encoding; `GetViewRowK` 81 and `ScanViewRows` 82/83; client read API and key builder; key index widened to 16 bytes (SD8) |
-| 08 | `2026-10-22-checked-writes-08-ql.md` | §10 | 06, 07 | Grammar (topics, `create view`, `select`), prepare to plan v2, CLI decode, `show topic` / `show view`; `GetStats` 84/85 and the stat ids (C16); removal of the message-search mapping (SD3) |
-| 09 | `2026-10-22-checked-writes-09-view-constraints.md` | §8.2, §8.3, §8.7 (Part E) | 08, 10 (its transient-source tests need 37 lifted; R-ORD) | `unique` and `check` (`VerdictViewKind::Unique` / `Check`), predicate evaluation on `Prospect`, unique conflicts and promotion, constraint create / replace / drop through C12; `Client::constraintName`; the RegressorsPath e2e scenario |
+| 08 | `2026-10-22-checked-writes-08-ql.md` | §10 | 06, 07 | Grammar (topics, `create view`, `select`), prepare to plan v2, CLI decode, `show topic` / `show view`; `GetStats` 84/85, the stat ids (C16) and `StatsCollect.h`; removal of the message-search mapping (SD3) |
+| 09 | `2026-10-22-checked-writes-09-view-constraints.md` | §8.2, §8.3, §8.7 (Part E) | 08, 10 (its transient-source tests need 37 lifted; R-ORD) | `unique` and `check` (`VerdictViewKind::Unique` / `Check`), predicate evaluation on `Prospect`, unique conflicts and promotion, constraint create / replace / drop through C12, with the two-phase drop and control type 20 `kVerdictPlan` (R04a, R09a); stat 32; `Client::constraintName`; the RegressorsPath e2e scenario |
 | 10 | `2026-10-22-checked-writes-10-persisted-over-transient.md` | §9a (Part F) | 01, 03 (R10c) | 37 lifted; keyless sources stay refused by Part 02's §4 rule (35, R10b), no refusal of its own; the `reconcileTransient_` logging change (`WorkerViewSet.cpp:367`); docs |
-| 11 | `2026-10-22-checked-writes-11-txn-vote.md` | §9b (Part G) | 06, 09 | `TxnVote` wire and ops (C18), `TxnJudge`, deferred judging, before-images and row locks, atomic batches, one-step visibility, `TxnTooLarge`; lifting the pre-G refusals of Part 3 |
+| 11 | `2026-10-22-checked-writes-11-txn-vote.md` | §9b (Part G), §16.12 | 09, 10 (every part 01–10 merged; R-ORD) | `TxnVote` wire and ops (C18), the `TxnJudge` record with `firstOffset`, deferred judging, after-image overlays and row locks, `TxnConflict` 59 (R11a), apply-at-marker on every fold path (R11b), atomic batches (`kAttrAtomic`), one-step visibility, `TxnTooLarge`, `TxnCommitResult`, stats 11–20; lifting the pre-G refusals of Part 03; the §16.12 docs cross-check |
 
 **Docs (§16.12)** are not a separate plan. Each part updates the doc sections its file-map rows name. Part 11 ends with a cross-check of the whole §16.12 list. The site's views section lives in the separate `rune-site` repo and needs the owner's explicit go-ahead before any deploy.
 
@@ -164,11 +253,13 @@ Each item names the owning part. Other parts use the name exactly as given.
 
 - **`ErrorCode`, owned by Part 03.** Append after `UnstableOffsetCommit = 50` (`Protocol.h:209`): `ConstraintViolation = 51`, `KeyExists = 52`, `KeyNotFound = 53`, `AutoIncrementExhausted = 54`, `TxnTooLarge = 55`, `ViewKeyExpressionInvalid = 56`, `ViewConstraintInvalid = 57`, `ViewUniqueInvalid = 58`.
   - Part 03 also extends `errorCodeName` (`client-cpp/src/cli/QlEngine.cpp:133`) with names 48–58 and moves its `static_assert` to `ViewUniqueInvalid`.
-  - Part 03 adds `[[nodiscard]] constexpr bool clientUnderstandsCheckedWrites(int32_t clientVersion) noexcept` (≥ 12).
+  - Part 03 adds `[[nodiscard]] constexpr bool clientUnderstandsCheckedWrites(int32_t clientVersion) noexcept` (≥ 12), and `produceErrorForClient` maps 51–58 to `InvalidRequest` below 12 (P3-5).
+  - **Part 11 appends `TxnConflict = 59`** (R11a): a vote-time write-write conflict. `errorCodeName` and its `static_assert` move to 59, `produceErrorForClient` covers 51–59, and `[[nodiscard]] constexpr bool isTxnVoteCode(uint16_t) noexcept` is true for 51, 52, 53, 55 and 59.
 - **Versions, owned by Part 03.** `kClientVersionCheckedWrites = 12`, `kClientVersion = 12`, `kBrokerVersionCheckedWrites = 7`, `kBrokerVersion = 7`. All later v12 wire (07, 08, 11) is gated on the same constants.
 - **`TemplateId`** (view range 64–95, `Protocol.h:90-102`): `GetViewRowK = 81` (07), `ScanViewRows = 82` (07), `ScanViewRowsResponse = 83` (07), `GetStats = 84` (08), `StatsResponse = 85` (08).
   - `GetViewRowK` is answered by the existing `ViewRowResponse` (73).
   - Each owner extends `Dispatch.h::isKnownTemplate()` and the conformance vectors.
+  - `EndTxnResponse` (54) gains a v12 body (11, C18).
 
 ### C2. Cluster feature level (Part 02)
 
@@ -231,12 +322,18 @@ Each item names the owning part. Other parts use the name exactly as given.
 
 ### C6. Client results (Parts 03, 05, 06, 09, 11)
 
-- **`SendResult`** (`Producer.h:302`), append-only: `KeyTooLong = 12` (02: a key wider than `Key::kMaxInline` or not the key field's width) and `WriteNotAllowed = 13` (03: a §11.2 requirement the client checks locally).
-- **`OpStatus`** (`client-cpp/include/rune/client/Completion.h:54`), append-only: `BrokerTooOld = 12` (03, SD11) and `StoredIdUnknown = 13` (06: "stored; id unknown").
+- **`SendResult`** (`Producer.h:302`), append-only: `KeyTooLong = 12` (02: a key wider than `Key::kMaxInline`, 16 B; `TypedTopic` always sends the key field's width, so it has no other meaning) and `WriteNotAllowed = 13` (03: a §11.2 requirement the client checks locally; 05's local refusals, R05a).
+- **`OpStatus`** (`client-cpp/include/rune/client/Completion.h:54`), append-only (R-X2):
+  - `BrokerTooOld = 12` (03, SD11);
+  - `StoredIdUnknown = 13`: added by 04 as a reserved placeholder so the enum has no hole; 06 documents it ("stored; id unknown") and first returns it;
+  - `VerdictUnknown = 14` (04, R04e/R04g): a `View` duplicate outside the dedupe window; one status for the whole batch.
 - **`Completion` for `OpKind::Send`** on a checked write:
   - `status = BrokerError` with `errorCode` 51–53 for a rejected record, otherwise `Ok`.
   - `reserved0` = `constraintId`.
+  - `value` = the record's offset, also for a rejected record (05 `WriteResult::offset()`, 09 P9-11).
   - `aux` = the assigned id (06; 0 = none).
+  - A rejected atomic batch (11) completes once: `BrokerError` with the first failing record's code, `reserved0` and `value`.
+- **`Completion` of a commit (11)** on a no vote: `BrokerError`, `errorCode` = the vote code (51, 52, 53, 55, 59), `reserved0` = `constraintId`, `value` = the failing offset; the producer is `Ready`. `commitTransactionAndWait` returns `struct TxnCommitResult { bool ok; uint16_t code; uint32_t constraintId; int64_t failingOffset; }` (`Producer.h`).
   - Accessors in `Completion.h` (03): `[[nodiscard]] constexpr uint32_t constraintIdOf(const Completion&) noexcept` and `[[nodiscard]] constexpr uint64_t assignedKeyOf(const Completion&) noexcept`.
 - **`WriteResult`** (05, new file `client-cpp/include/rune/client/WriteResult.h`), returned by every `…AndWait` write of `TypedTopic`:
   - `[[nodiscard]] bool ok() const noexcept;`
@@ -244,19 +341,23 @@ Each item names the owning part. Other parts use the name exactly as given.
   - `[[nodiscard]] uint32_t constraintId() const noexcept;`
   - `[[nodiscard]] uint64_t key() const noexcept;` (06 fills it; 0 = none)
   - `[[nodiscard]] OpStatus status() const noexcept;`
+  - `[[nodiscard]] int64_t offset() const noexcept;` and `static WriteResult fromCompletion(const Completion&) noexcept;` (05).
 
 ### C7. Per-partition write state, next to `RcSlot` (Part 02 creates; later parts append members)
 
 - **New header `broker/libs/node/include/rune/node/WriteState.h`.**
   - **`struct TopicWriteSpec`**, one per typed topic per worker. Members by part:
-    - **02:** `int32_t topicId; uint16_t keyFieldId = kNoKeyField /*0xFFFF*/; rune::codec::PrimType keyType; uint8_t keyWidth = 0;`, plus the per-version validators and materialized descriptors. Every version is materialized when it is installed, so the produce path never allocates. Lookup is `[[nodiscard]] const rune::codec::Validator* validatorFor(uint16_t version) const noexcept` and `const rune::codec::Descriptor* descriptorFor(uint16_t version) const noexcept`, with nullptr meaning an unknown version, which is rejected.
+    - **02:** `int32_t topicId; uint16_t keyFieldId = kNoKeyField /*0xFFFF*/; rune::codec::PrimType keyType; uint8_t keyWidth = 0; bool legacyValidate;`, plus the per-version `SpecVersion { Validator; Descriptor; uint32_t keyValueOffset; }` (`versionFor`, `maxVersion`, `installVersion`, `setFacts`). Every version is materialized when it is installed, so the produce path never allocates. Lookup is `[[nodiscard]] const rune::codec::Validator* validatorFor(uint16_t version) const noexcept` and `const rune::codec::Descriptor* descriptorFor(uint16_t version) const noexcept`, with nullptr meaning an unknown version, which is rejected.
     - **05:** `bool keyIndex = false;`.
     - **06:** `bool autoIncrement = false; uint64_t autoIncrementMax; uint32_t autoIncrementReserve; int32_t partitionCount; rune::protocol::Partitioner partitioner;`.
   - **`struct PartitionWriteState`**, one per owned partition of a typed topic. Members by part:
     - **02:** `const TopicWriteSpec* spec;`.
-    - **04:** `RejectedOffsetIndex rejected; ConstraintSetTimeline constraintSets; VerdictSource* verdicts = nullptr; VerdictSourceStats stats;`.
-    - **06:** `AutoIncState autoInc; AssignedBaseWindow assignedBases; AutoIncStats autoIncStats;`.
+    - **04:** `RejectedOffsetIndex rejected; ConstraintSetTimeline constraintSets; VerdictSource* verdicts = nullptr; VerdictSourceStats stats; MarkerLedger markers;`, with `isVerdictSource()`, `isConstrainedSource()` and `verdictKnownThrough()`.
+    - **06:** `AutoIncState autoInc; AssignedBaseWindow assignedBases; AutoIncStats autoIncStats;` (`AutoInc.h`).
+    - **09:** `RetainedVerdictPlans retainedPlans;`.
     - **11:** `TxnJudgeState txn;`.
+  - **Checks (02, R-X1, R-X5):** `TypedCheck checkTypedRecord(const TopicWriteSpec&, const RecordSpan&, int16_t level) noexcept` and `checkTypedBatch(…, int16_t level)` live in `WriteState.h`. 03's hook calls `checkTypedRecord` per record.
+  - **`TopicWriteSpecWire`** (the `WriteSpecUpdate` tail): 9 B (02; flags bit 1 `keyIndex`, 05), then 26 B (06; flags bit 2 `autoIncrement`, partitioner, max, reserve, partition count).
 - **Ownership.**
   - The worker owns the specs: `std::unordered_map<int32_t, std::unique_ptr<TopicWriteSpec>> writeSpecs_` (stable addresses).
   - `RcSlot` (`Worker.h:6206`) appends `std::unique_ptr<PartitionWriteState> write;`. `rebuildRcSlots_` (`Worker.h:6364`) carries it like `rc`, creates it for a newly owned partition whose topic has a spec, and keeps it across role changes (followers need `rejected`).
@@ -287,22 +388,27 @@ Each item names the owning part. Other parts use the name exactly as given.
   - A duplicate never calls the hook. Its `assignedBase` and verdicts are resolved by the worker (06, 04).
 - **Node policy.** `rune::node::CheckedWriteHook` lives in `broker/libs/node/include/rune/node/CheckedWriteHook.h`. It is a per-call object built in `produceCore_` from `PartitionWriteState&`, `const WriteFacts&` and the worker's scratch.
   - It is instantiated explicitly in `broker/libs/node/src/CheckedWriteHook.cpp`, for `Log` and `InMemoryLog`, with `extern template` in the header.
-  - `struct WriteFacts { uint8_t acks; bool idempotent; bool transactional; bool atomicBatch; bool importGranted; bool legacyMode; };`. `transactional` comes from the batch header attrs, `atomicBatch` from the header (05/11 define the bit use), and `importGranted` from C17.
+  - `struct WriteFacts { uint8_t acks = 0; bool idempotent = false; bool transactional = false; bool atomicBatch = false; bool importGranted = false; bool legacyMode = false; bool levelCheckedWrites = false /*03*/; int64_t producerId = -1 /*06*/; };`. `transactional` comes from the batch header attrs. `atomicBatch` comes from the header bit `rune::protocol::batch::kAttrAtomic = 0x0080` (bit 7) on a non-transactional batch; **Part 11 defines the bit** (R05b) and sets the fact, and it is false until then. `importGranted` comes from C17.
+  - The seam (03): `TopicHookFacts`, `topicHookFactsOf`, `BatchIntents`, `RequirementVerdict { ErrorCode code; HookRefusal why; }`, `constexpr evaluateRequirements(…)` and `enum class HookRefusal` (parts append values before `Count_`).
 - **Requirements (§11.2) are checked in `check()`, in this order.** Each failure is `InvalidRequest` unless noted:
   1. reserved attribute bits or intent 3;
   2. legacy mode (SD10);
   3. level < 4 for any non-zero intent or `View`;
   4. a non-zero intent on a topic without a key index;
-  5. an explicit-key intent (`insert` with a non-zero key, `update`, `removeExisting`) without idempotence, or without the `View` bit;
-  6. the same inside a transaction or atomic batch, until 11;
-  7. a transactional or atomic batch on a constrained source, until 11;
-  8. for key-0 creates, the C-rules (06);
-  9. `View` and > 4096 records on a verdict source (SD4).
-  Plain upserts and deletes pass with no requirement.
+  5. an explicit-key intent (`insert` with a non-zero key, `update`, `removeExisting`) without idempotence, or without the `View` bit (from 11: the `View` bit is not needed inside a transaction);
+  6. the same inside a transaction or atomic batch, until 11 (11 deletes the rule);
+     - 6b (05): an intent before the key index's `ConstraintSetChange` is committed → `NotLeader`, `KeyIndexActivating` (R05c, R05e);
+  7. a transactional or atomic batch on a constrained source, until 11 (11 deletes the rule);
+  8. for key-0 creates: mixed batches, idempotent + `All`, and `View` on a constrained source (03; from 11 not inside a transaction); then 06's 8a–8f (plain upsert on an autoincrement topic, `IMPORT`, import range, activation `NotLeader`, `AutoIncrementExhausted` 54, side window full `NotLeader`);
+  9. `View` and > 4096 records on a verdict source (SD4);
+  10. (11) an atomic batch of more than `txnJudgedRecordsMax` records on a verdict source → `AtomicBatchTooLarge`.
+  Plain upserts and deletes pass with no requirement (06's 8a refuses plain upserts on autoincrement topics, §6.6).
 
 ### C9. Verdict-view interface inside the view engine (Part 04 unless stated)
 
-1. **`broker/libs/view/include/rune/view/ViewKey.h`:** `inline constexpr std::size_t kMaxViewKeyBytes = 128;` and `struct ViewKey { std::array<uint8_t, kMaxViewKeyBytes> bytes{}; uint8_t len = 0; static ViewKey fromU64(uint64_t) noexcept; std::span<const uint8_t> span() const noexcept; };`. Part 07 adds `ViewTable` overloads `put/get/erase(const ViewKey&)` and the `> 8` byte storage. Until then a `ViewKey` with `len ≤ 8` maps to today's `uint64_t` API.
+1. **`broker/libs/view/include/rune/view/ViewKey.h`** (04 defines it; 07 owns and extends it, R07d): `inline constexpr std::size_t kMaxViewKeyBytes = 128;` and `struct ViewKey { std::array<uint8_t, kMaxViewKeyBytes> bytes{}; uint8_t len = 0; static ViewKey fromU64(uint64_t) noexcept; [[nodiscard]] uint64_t asU64() const noexcept; std::span<const uint8_t> span() const noexcept; };`.
+   - `fromU64(v)` gives `len = 8`, the little-endian bytes of `v`. `asU64()` requires `len ≤ 8` and returns the zero-extended little-endian load of the first `len` bytes, so `fromU64(v).asU64() == v`. 05 and 06 use both from 04. No other conversion name exists (no `packed()`).
+   - Part 07 appends `static ViewKey fromBytes(std::span<const uint8_t>) noexcept` and `bool operator==(const ViewKey&) const noexcept`, makes `rune::view::kMaxViewKeyBytes` an alias of `rune::codec::kMaxViewKeyBytes` (one constant, 128), and adds `ViewTable` overloads `put/get/erase(const ViewKey&)` and the `> 8` byte storage. Until then a `ViewKey` with `len ≤ 8` maps to today's `uint64_t` API.
 2. **`broker/libs/view/include/rune/view/FoldSkip.h`** (01 creates it; 04 appends `rejected`):
    ```cpp
    struct FoldSkip {
@@ -321,7 +427,7 @@ Each item names the owning part. Other parts use the name exactly as given.
        uint8_t          intent = 0;                // rune::protocol::record::intentOf(attributes)
        const rune::codec::Descriptor* writer = nullptr;   // materialized writer version; nullptr for a tombstone
    };
-   enum class PrepareStatus : uint8_t { Ok, Malformed, CapacityExhausted };
+   enum class PrepareStatus : uint8_t { Ok, Malformed, CapacityExhausted, Locked /*11*/ };
    struct Prospect;   // fixed-capacity, per-instance scratch reserved at install: the op (None/Upsert/Erase/Move),
                       // up to 2 prospective rows (new; old group for a Move) as row images, and the view keys touched.
    ```
@@ -329,7 +435,9 @@ Each item names the owning part. Other parts use the name exactly as given.
    - In `AggFold.h`: `prepareAggregate(AggregateFold&, …)` and `applyAggregate(AggregateFold&, …)`.
    - `ProjectionFold` and `AggregateFold` are reference bundles that `ViewInstance` (`WorkerViewSet.h:191`) builds once.
    - `foldBatch` and `foldAggregateBatch` keep their signatures plus `const FoldSkip&`. They are re-implemented as the prepare-then-apply loop, so "the same code" computes and applies.
-   - Invariant, tested by 04: on random logs, the loop produces state byte-identical to the pre-04 fold.
+   - Invariant, tested by 04: on random logs, the loop produces state byte-identical to the pre-04 fold (04's `LegacyFoldReference`). The folds run 04's `projectionStep<DirectStore>` / `AggStep<DirectStore>`; prepare runs the same template body over `OverlayStore`.
+   - Part 11 appends a trailing `TxnOverlay* chain = nullptr` to `prepareProjection`, `prepareAggregate`, 05's `prepareKeyIndex` and 09's claims prepare, and `uint8_t member; const TxnLockSet* locks` to the fold bundles (`TxnOverlay.h`, chained after-images and row locks). With both null, 04's path is unchanged.
+   - Part 11 (R11b): every fold path (live, refold, rebuild, checkpoint replay, leadership scan) applies a committed transaction's records at its commit marker, in offset order; Part 01's `FoldSkip.aborted` stays as a defensive skip.
 4. **`broker/libs/view/include/rune/view/Verdict.h`:**
    ```cpp
    struct Verdict { uint16_t code = 0; uint32_t constraintId = 0; [[nodiscard]] bool accepted() const noexcept { return code == 0; } };
@@ -340,30 +448,31 @@ Each item names the owning part. Other parts use the name exactly as given.
    - **Public API:**
      - `[[nodiscard]] Verdict judge(const SourceRecord&) noexcept;`. It prepares every verdict view, evaluates the intents (05) and rules (09) on the prospects, applies every verdict view on accept or none on reject, and appends the rejection to the pending marker list and to `PartitionWriteState::rejected`.
      - `template <class ReadRangeFn> int driveJudge(ReadRangeFn&&, int64_t bound, int64_t nowNs, PartitionWriteState&)`.
-     - `[[nodiscard]] int64_t judgedThrough() const noexcept;` and `[[nodiscard]] bool stalled() const noexcept;` (capacity: the fold stops with an alert, never a verdict).
+     - `[[nodiscard]] int64_t judgedThrough() const noexcept;` and `[[nodiscard]] bool stalled() const noexcept;` (capacity: the fold stops with an alert, never a verdict). From Part 11, `judgedThrough() = min(judgeCursor(), txn.earliestUndecidedFirst())`, with `[[nodiscard]] int64_t judgeCursor() const noexcept` and the cold `bindTxn(…)`; the judge bound is the HW instead of the LSO.
      - `void addVerdictView(ViewInstance*, VerdictViewKind, uint64_t viewObjectId)`, `void removeVerdictView(...)` (cold).
      - Test seam `installTestVerdictViewForTest(…)`, which builds a `TestReject` view rejecting offsets chosen by a predicate.
-   - **Order within one duty pass for a verdict source:** `driveJudge` first; then the other views of the partition with `FoldSkip{.rejected = &state.rejected}`, bounded by `judgedThrough()`; then marker emission (C10). Part 04 wires this into `WorkerViewSet::driveFolds` (`WorkerViewSet.h:417`).
+   - **Order within one duty pass for a verdict source:** (11) finalize locked transactions whose marker is below the HW; then `driveJudge`; then the other views of the partition with `FoldSkip{.rejected = &state.rejected}`, bounded by `judgedThrough()`; then marker emission (C10). Part 04 wires this into `WorkerViewSet::driveFolds` (`WorkerViewSet.h:417`).
    - `WorkerViewSet` gets `[[nodiscard]] VerdictSource* verdictSource(int32_t srcTopicId, int32_t partition) noexcept`. After every install, uninstall and ownership change, the worker re-resolves `PartitionWriteState::verdicts` (`Worker::rebindVerdictSources_()`). Hot paths only read `state->verdicts`.
 6. **The consumer bound.** `[[nodiscard]] int64_t Worker::verdictBound_(const PartitionWriteState*, int64_t bound) const noexcept` returns `min(bound, verdicts->judgedThrough())`, or `bound` for a non-source. It is applied at `pushOwnedSubscriptions_` (`Worker.h:3736-3744`), `servePushRead_` (`Worker.h:4312`) and the filtered push. Rejected records are cut with `rune::protocol::rebuildBatch` (`BatchRebuild.h:82`), which keeps their offsets.
 
-### C10. Control records (Part 04 creates the header and all type ids; 06 and 11 add builders and parsers)
+### C10. Control records (Part 04 creates the header and types 16–19; 09 adds type 20; 06, 09 and 11 add builders and parsers)
 
 - **New header** `broker/libs/storage/include/rune/storage/ControlRecordLayout.h` (namespace `rune::storage::control_record`, header-only, builders write into a caller buffer and never allocate).
 - **Batch form.** A control batch with `attributes = kAttrControl` (0x0020) only, **`kAttrTransactional` clear**, `producerId = -1`, `producerEpoch = -1`, `baseSequence = -1`, and one record. The record key is an int16 LE **type**. The value is `[version u8 = 1][payload]`. `producerId -1` keeps it out of `TxnCleanState` (`LogCleaner.cpp:229`) and the PSM feed (`RcState.h:660`).
-- **Types.** `inline constexpr int16_t kReservation = 16; kVerdictMarker = 17; kConstraintSetChange = 18; kTxnJudge = 19;`. Transaction markers use 0 and 1 (`ControlMarkerLayout.h:30-31`).
+- **Types.** `inline constexpr int16_t kReservation = 16; kVerdictMarker = 17; kConstraintSetChange = 18; kTxnJudge = 19;` (04) and `kVerdictPlan = 20` (09, R09a). Transaction markers use 0 and 1 (`ControlMarkerLayout.h:30-31`). Types 16–20 are taken; a new type starts at 21. Part 11 adds none: it fills 04's reserved 19.
 - **Parser.** `[[nodiscard]] int recordType(const uint8_t* batch, std::size_t len) noexcept` returns the type or `kUnparseable` (−1).
 - **Hardening (04).** `ControlMarker::extract` (`broker/libs/transaction/src/ControlMarker.cpp:289-296`) and `RcBuilder::step` (`ReadCommittedView.cpp:315`) accept only types 0 and 1. A regression test feeds a batch of each new type to every reader listed in Review Focus 2.
 - **Payloads:**
   - `kVerdictMarker` (04): `[fromOffset i64][finalThrough i64][constraintSetId u32][count u32] count × [offsetDelta u32 (offset − fromOffset)][code u16][constraintId u32]`. It covers the judged range `[fromOffset, finalThrough)`. `kMaxMarkerEntries = 4096`; more rejections in one step means several markers.
   - `kConstraintSetChange` (04): `[constraintSetId u32][count u16] count × [viewObjectId u64][kind u8 (VerdictViewKind)][planFingerprint u64]`. The key index appears with `viewObjectId = 0`.
   - `kReservation` (06): `[reservedThroughN u64]` (the last `n` reserved; ids are `n·P + p`).
-  - `kTxnJudge` (11): `[producerId i64][producerEpoch i16]`.
-- **Who appends.** The partition leader's worker appends these records through the replica's control append, the path `AppendControlRecord` already uses (`WorkerOp.h:86`). Reservations are the exception: they are appended inside `CheckedWriteHook::stage` through `log`.
+  - `kVerdictPlan` (09): a `VerdictPlanHeader { viewObjectId u64, planFingerprint u64, kind u8 }` plus the plan, output and source descriptor blobs (byte layout in 09 P9-8), at most `kMaxVerdictPlanBytes = 65536` (`buildVerdictPlan` / `parseVerdictPlan`). It holds the installed plan of a dropping or replaced verdict view, so the two-phase drop (R04a) survives a restart.
+  - `kTxnJudge` (11): `[producerId i64][producerEpoch i16][firstOffset i64]` (`TxnJudgeRecord`, `buildTxnJudge`, `parseTxnJudge`; R11d). Nothing writes type 19 before Part 11, so `firstOffset` needs no compatibility.
+- **Who appends.** The partition leader's worker appends these records through the replica's control append, the path `AppendControlRecord` already uses (`WorkerOp.h:86`). Reservations are the exception: they are appended inside `CheckedWriteHook::stage` through `log`. A `TxnJudge` is appended by the leader's `TxnVote` op (11) once the HW is above the transaction's last record.
 
 ### C11. Rejected-offset index, cleaner state and the cleaner bound (Part 04)
 
-- **`broker/libs/storage/include/rune/storage/RejectedOffsetIndex.h`** has one instance per partition replica, in `PartitionWriteState::rejected`. It is worker-owned. It is filled by the leader's judge, by follower apply of replicated markers, and by recovery scans of markers. It is reserved at creation and never allocates on the hot path.
+- **`broker/libs/storage/include/rune/storage/RejectedOffsetIndex.h`** has one instance per partition replica, in `PartitionWriteState::rejected`. It is worker-owned. It is filled by the leader's judge and, on every replica, by the `RcState` leadership scan, which rebuilds it from the markers in the log (R04b; followers hold no verdict state between leaderships). It is reserved at creation and never allocates on the hot path.
   ```cpp
   class RejectedOffsetIndex {
   public:
@@ -382,13 +491,17 @@ Each item names the owning part. Other parts use the name exactly as given.
       [[nodiscard]] std::size_t size() const noexcept;
   };
   ```
+  04 appends `coveredThrough()` / `noteCovered()` (K), `mismatches()`, `countAtOrAfter()`, `capacity()` and `grow()` (cold). 11 appends `[[nodiscard]] bool insertRun(std::span<const int64_t> offsets, uint16_t code, uint32_t constraintId);` (cold, out of order; the marker-without-vote path).
 - **`broker/libs/storage/include/rune/storage/VerdictCleanState.h`** is cleaner-thread only, cold, and modeled on `TxnCleanState` (`TxnCleanState.h:40`).
-  - API: `clear()`, `onVerdictMarker(int64_t markerOffset, int64_t fromOffset, int64_t finalThrough, std::span<const RejectedOffsetIndex::Entry>)`, `onConstraintSetChange(int64_t offset, bool nonEmpty)`, `onReservation(int64_t offset)` (06), `finish(int64_t toOffset)`, `isRejected(int64_t)`, `cleanLimit()`, `markerRemovable(int64_t)` and `keepsReservation(int64_t)` (06).
+  - API: `clear()`, `onVerdictMarker(int64_t markerOffset, int64_t fromOffset, int64_t finalThrough, std::span<const RejectedOffsetIndex::Entry>)`, `onConstraintSetChange(int64_t offset, bool nonEmpty)`, `onReservation(int64_t offset)` (06), **`finish(int64_t toOffset, int64_t publishedBound, int64_t markerRemovalBound)`** (04's signature; it replaces the one-argument form), `void markRemovalsBelow(int64_t cleanBoundary) noexcept` (04), `isRejected(int64_t)`, `cleanLimit()`, `markerRemovable(int64_t)`, `keepsReservation(int64_t)` (06) and `[[nodiscard]] bool keepsControlRecord(int64_t offset, int16_t type) const noexcept` (04).
+  - `keepsControlRecord`: type 18 always kept; 16 iff `keepsReservation` (06); 20 always kept (09, R09a); 19 kept while `offset >= txnJudgeBound`, the minimum `lastDurableO` over the source's persisted verdict members (11; 04 keeps 19 always until then).
   - It is fed by the `scanTxnState` pre-pass (`LogCleaner.cpp:212`) for control batches with `pid == -1`.
 - **Cleaner bound.**
   - `PartitionReplica::publishCleanerVerdictBound(Offset)` and `[[nodiscard]] Offset cleanerVerdictBound() const noexcept` are an atomic word beside `publishCleanerLso` (`PartitionReplica.h:866`). The default is `kNoCleanerLso`, meaning not a verdict source.
   - The worker publishes `W` from `PartitionWriteState::rejected.watermark()`.
-  - `LogCleanerAgent.h:455` and `PartitionReplica::cleanerSwapBound` (`PartitionReplica.h:893`) take the min with it.
+  - 04 adds `publishCleanerVerdictMarkerEnd(Offset)` / `cleanerVerdictMarkerEnd()`, published before the bound with release order and read after it with acquire order, and `LogCleaner::setVerdictBounds(Offset bound, Offset markerEnd)`.
+  - 11 adds `publishCleanerTxnJudgeBound(Offset)` / `cleanerTxnJudgeBound()` (default `kNoCleanerLso`) and `LogCleaner::setTxnJudgeBound(Offset)`.
+  - `LogCleanerAgent.h:455` and `PartitionReplica::cleanerSwapBound` (`PartitionReplica.h:893`) take the min with it: on a leader `cleanerSwapBound()` is `min(HW, cleanerLastStableOffset(), cleanerVerdictBound())` (04 Task 8).
 
 ### C12. Constraint ids and constraint sets (Part 04 mechanism; 05 and 09 use it)
 
@@ -423,7 +536,7 @@ Each item names the owning part. Other parts use the name exactly as given.
   - `SchemaDef` (`CatalogEvent.h:60`) appends `rune::protocol::TopicKeyFeatures keyFeatures{};`. It is encoded only in `formatVer ≥ 2` events and fingerprinted in v2.
   - New apply rules live in `codec/src/catalog/ApplyV2.cpp`, which carries the immutability rules of §6.2. `SchemaDef::validate` is ignored (02).
   - A v2 golden log is added (`codec/tests/catalog/golden`, `codec/tools/make_catalog_golden.cpp`). The v1 goldens stay unchanged.
-- **Wire.** `DefineTopic` (`protocol/include/rune/protocol/client/SchemaMessages.h:181`) and `TopicSchemaResponse` take a v12 trailing block after their existing tail: `[flags u8: bit0 keyIndex, bit1 autoIncrement][partitioner u8][autoIncrementMax u64][autoIncrementReserve u32]`. The client exposes it on its `createTopic` options. `TopicHandle` (`client-cpp/include/rune/client/TopicHandle.h:34`) appends `rune::protocol::Partitioner partitioner = Partitioner::Fnv1a;` (06).
+- **Wire.** `DefineTopic` (`protocol/include/rune/protocol/client/SchemaMessages.h:181`) and `TopicSchemaResponse` take a v12 trailing block after their existing tail: `[flags u8: bit0 keyIndex, bit1 autoIncrement][partitioner u8][autoIncrementMax u64][autoIncrementReserve u32]`, `kTopicKeyFeaturesWireLen = 14` (05, `putTopicKeyFeatures` / `getTopicKeyFeatures`). The client exposes it on its `createTopic` options. `TopicHandle` (`client-cpp/include/rune/client/TopicHandle.h:34`) appends `TopicKind kind = TopicKind::Unknown;` (05) and then `rune::protocol::Partitioner partitioner = Partitioner::Fnv1a;` (06, R05f).
 - **Routing.** `rune::protocol::partitionFor(std::span<const uint8_t> key, int32_t partitions, Partitioner)` is added to `protocol/include/rune/protocol/PartitionHash.h` (06). The client, `TopicRegistry::partitionForKey` and the view-read path call it.
 
 ### C14. Plan v2 (Part 07 owns the format of every field; 08 authors; 09 evaluates)
@@ -436,20 +549,20 @@ Each item names the owning part. Other parts use the name exactly as given.
   - `std::vector<KeyComponent> keyComponents;` with `struct KeyComponent { std::string column; uint8_t keyFunction = 0; std::string outName; };` (0 none, 1 lower, 2 reserved).
   - `bool unique = false;`
   - `std::vector<AuthoredConstraint> constraints;` with `struct AuthoredConstraint { std::string name; std::vector<PredicateNode> predicate; };`.
-  - `uint32_t unicodeVersion = 0;` packed as `major << 16 | minor << 8 | update`.
-- **Predicate.** `struct PredicateNode { PredicateOp op; uint16_t a = 0, b = 0; std::string column; rune::codec::PrimType constType{}; std::array<uint8_t, 16> constBytes{}; };`. The tree is a flat vector, root last. Its operator enum is `enum class PredicateOp : uint8_t { Column = 1, Const = 2, Eq = 3, Ne = 4, Lt = 5, Le = 6, Gt = 7, Ge = 8, And = 9, Or = 10, Not = 11 };`.
+  - `uint32_t unicodeVersion = 0;` packed as `major << 16 | minor << 8 | update`; Unicode is pinned to 16.0.0 = `0x00100000` (R07a). A lowered `string(N)` component is ⌊3N/2⌋ bytes wide, computed from the table.
+- **Predicate.** `struct PredicateNode { PredicateOp op; uint16_t a = 0, b = 0; std::string column; rune::codec::PrimType constType{}; std::array<uint8_t, 16> constBytes{}; };`. `constBytes` holds the row-slot encoding of the constant, padded to 16 B (08 P8-5, R08c); 09 decodes it the same way. `aggregateOutputType` lives in `ViewPlanAuthored.h` (08). The tree is a flat vector, root last. Its operator enum is `enum class PredicateOp : uint8_t { Column = 1, Const = 2, Eq = 3, Ne = 4, Lt = 5, Le = 6, Gt = 7, Ge = 8, And = 9, Or = 10, Not = 11 };`.
 - **Compiled plan v2** (`ViewPlan.h`) adds resolved key components (`srcFieldId`, `keyFunction`, `width`, `outSlot`), `keyWidth`, `unique`, compiled constraints (`ordinal`, predicate over out-slots), `unicodeVersion` and `viewObjectId`.
 - **Versions.** `kAuthoredVersion` and `kCompiledVersion` become 2 (`broker/libs/view/src/ViewPlan.cpp:14-15`). v1 blobs still decode.
 - **Codec key encoding** (07, `codec/include/rune/codec/ViewKeyEncoding.h`): `encodeKeyComponent(...)`. Unsigned integers are big-endian. Signed integers are big-endian with the sign bit flipped. `bool` is one byte. `string(N)` is zero-padded. `lower` goes through `codec/include/rune/codec/UnicodeLower.h` (`kUnicodeVersion`, `lowerUtf8`, `maxLoweredWidth(N)`). The fold, the client key builder and QL literals all use it.
 
 ### C15. Client write and read API names (owners in brackets)
 
-- **Raw producer:** `send(topic, key, value, WriteIntent intent = WriteIntent::Upsert)` and the `trySend` counterparts. `enum class WriteIntent : uint8_t { Upsert = 0, Insert = 1, Update = 2 };` [05]. An empty value with `Update` means delete-existing.
+- **Raw producer:** `send(topic, key, value, WriteIntent intent = WriteIntent::Upsert)` and the `trySend` counterparts. `enum class WriteIntent : uint8_t { Upsert = 0, Insert = 1, Update = 2 };` [05]. An empty value with `Update` means delete-existing. Tier-2 batches (`Producer::batch`, `BatchBuilder`) carry no intent [05, follow-up issue] and set `kAttrAtomic` [11].
 - **`TypedTopic<T>`:** `insert`, `update`, `upsert`, `remove(const KeyT&)` and `removeExisting(const KeyT&)`, each with an `…AndWait` form returning `WriteResult` [05]. `insertAndWait(rec).key()` [06].
 - **Consumer.** `Record` (`client-cpp/include/rune/client/subscriber/Subscription.h:117`) appends `uint8_t attributes`, and `[[nodiscard]] RecordOp op() const noexcept` with `enum class RecordOp : uint8_t { Upsert, Insert, Update, Delete };` [05].
 - **Reads [07].** `getViewRowAndWait(view, key)` (any width) and `scanViewAndWait(view, prefix, limit)`. `ViewKeyBuilder` comes from the view's output descriptor. New `OpKind` values are appended after `Seek` (`Completion.h:51`): `GetViewRowK`, `ScanViewRows`. Part 08 appends `GetStats`.
 - **Constraints.** `Client::constraintName(uint32_t constraintId) -> std::optional<ConstraintName>` with `struct ConstraintName { std::string view; std::string constraint; };` [09].
-- **Transactions.** `commitTransaction()` and `commitTransactionAndWait()` report `code` and `constraintId` on a no vote, using the same completion fields as C6 [11].
+- **Transactions.** `commitTransaction()` completes with the no vote's `code`, `constraintId` and failing offset, using the C6 completion fields, and `commitTransactionAndWait()` returns `TxnCommitResult` (it still throws for every other failure) [11]. The client never sets `View` on a transactional send (R03c); `Verdict::VotedNo` classifies a no.
 
 ### C16. Stats (Part 08 wire; earlier parts keep the counters)
 
@@ -487,7 +600,8 @@ Each item names the owning part. Other parts use the name exactly as given.
   | 35 | `transientRecordsEvicted` | exists |
   | 36 | `transientSourceResets` | exists, 10 |
 
-  Ids 1–31 are topic-partition scope and 32+ are view-partition scope. Per-constraint rejections ride the trailing list (04 keeps them in `VerdictSourceStats`).
+  Ids 1–31 are topic-partition scope and 32+ are view-partition scope. Per-constraint rejections ride the trailing list (04 keeps them in `VerdictSourceStats`). Id 36 also counts each reconcile of a checkpoint recovered over a transient source (10). Part 11's `votesNoConflict` (59), `txnOverlayWaits`, `lockPauses`, `checkpointBackfills` and `vetoedCheckpointPushes` have no stat id; they are logged and counted in id 12.
+- **Extension point (08).** `broker/libs/node/include/rune/node/StatsCollect.h`: `StatsSink`, `collectTopicPartitionStats` (11 appends 11–20) and `collectViewPartitionStats` (09 appends 32 through a trailing `bool uniqueView`). `GetStats` is served by the leader only and needs `DESCRIBE` (R08d).
 - **Where the counters live.** `VerdictSourceStats` is in `VerdictSource.h` (04), `AutoIncStats` is in `WriteState.h` (06), and `ViewFoldCounters` (`WorkerViewSet.h:130`) appends `uniqueConflicts`, `scanRows` and `scanPages`.
 - **Test access before 08.** `Worker::verdictStatsForTest(int32_t topicId, int32_t partition)`.
 
@@ -496,14 +610,51 @@ Each item names the owning part. Other parts use the name exactly as given.
 - `SecurityOperation::Import = 7` (`protocol/include/rune/protocol/SecurityTypes.h:10`). `validSecurityOperation` is extended accordingly.
 - The `opsOn` bit 7 (`codec/include/rune/security/Permissions.h:18`).
 - The QL grammar is `grant import on topic <pattern> to …`.
-- The worker side is `WritePermTable::importBits` (`broker/libs/node/include/rune/node/WorkerWriteGrants.h:28`), shipped by `SESSION_PERMISSIONS` with a new flag `kPermFlagImport`. It is read into `WriteFacts::importGranted`.
+- The worker side is `WritePermTable::importBits` (`broker/libs/node/include/rune/node/WorkerWriteGrants.h:28`), shipped by `SESSION_PERMISSIONS` with a new flag `kPermFlagImport = 0x80`. The produce op carries `kOpFlagImportGranted = 0x10` (`WorkerOp.h:657`). It is read into `WriteFacts::importGranted`.
 
 ### C18. The transaction vote (Part 11)
 
 - **Cluster plane** (`ReplicationMessages.h`, schema 112): `TxnVoteMsg` with `TEMPLATE_ID = 13` and `TxnVoteResponseMsg` with `TEMPLATE_ID = 14`. Ids 1–4 and 7–12 are used today. Both are routed like `WriteTxnMarkerMsg` (`ReplicationMessages.h:837`), through the gateway's `TxnMarkerChannel` (`ClientGateway.h:957`).
 - **Worker.** `WorkerOp::Type::TxnVote = 28` (SBE `TXN_VOTE = 28`) and `WorkerReturn::Type::TxnVoteResult = 8` (SBE `ReturnType` `TXN_VOTE_RESULT = 8`).
-- **`EndTxnResponse`** (client template 54) takes a v12 trailing `[constraintId u32][failingOffset i64]`.
-- **Before-images and row locks** are pre-allocated per worker at `NodeConfig::txnJudgedRecordsMax` (SD14).
+- **Layouts.** `TxnVoteMsg` (`BLOCK_LENGTH = 40`) and `TxnVoteResponseMsg` (48) as in 11's contract addition 4. The transactional id is not carried.
+- **`EndTxnResponse`** (client template 54) takes a v12 trailing `[constraintId u32][failingOffset i64]`: `ENCODED_SIZE_V12 = 38`, written only for a v12 session with a vote. A session below 12 gets `InvalidRequest` (39) for every no-vote code, with no trailer (R11d).
+- **The record and the vote.** The leader appends `TxnJudge` (type 19, with `firstOffset`, C10) and answers once it is committed and judged. Candidates are the partitions that might vote at the first `AddPartitions` or at commit; after a coordinator recovery every partition of the persisted set is a candidate (R11c).
+- **Write-write conflicts.** A newer accepted write by another writer to one of the transaction's keys before its `TxnJudge` makes the vote no with `TxnConflict` (59, R11a).
+- **After-images and row locks** (R11d: the overlay holds after-images; tables keep the before-images) are pre-allocated per worker at `NodeConfig::txnJudgedRecordsMax` (env `RUNE_TXN_JUDGED_RECORDS_MAX`, default 4096, range 1–1,048,576; SD14). Distributed lock waits resolve through the transaction timeout (R11d).
+- **Atomic batches.** `rune::protocol::batch::kAttrAtomic = 0x0080` (bit 7). On a verdict source an atomic batch is judged as a unit at its own offset; its `View` ack carries at most one trailer entry.
+
+
+### Code and number registry (every number the program takes)
+
+Each row gives the number, its name and its owning part. A part takes a new number only from the next free value of its row and adds it here first.
+
+| Space | Taken (owner) | Next free |
+|---|---|---|
+| `ErrorCode` (`Protocol.h`) | 51 `ConstraintViolation`, 52 `KeyExists`, 53 `KeyNotFound`, 54 `AutoIncrementExhausted`, 55 `TxnTooLarge`, 56–58 compile errors (03); 59 `TxnConflict` (11, R11a) | 60 |
+| Client `TemplateId` (view range 64–95) | 81 `GetViewRowK`, 82 `ScanViewRows`, 83 `ScanViewRowsResponse` (07); 84 `GetStats`, 85 `StatsResponse` (08); 54 `EndTxnResponse` gains a v12 body (11) | 86 |
+| Cluster-plane templates (schema 112) | 13 `TxnVoteMsg`, 14 `TxnVoteResponseMsg` (11) | 15 |
+| `WorkerOp::Type` / SBE `OpType` | 26 `ClusterFeatureLevel`, 27 `WriteSpecUpdate` (02); 28 `TxnVote` (11); 29 `GetViewRowK`, 30 `ScanViewRows` (07); 31 `GetStats` (08) | 32 |
+| `WorkerReturn::Type` / SBE `ReturnType` | 8 `TxnVoteResult` (11); 9 `ViewScanResult` (07); 10 `StatsResult` (08) | 11 |
+| SBE `TailKind` | 12 `WRITE_SPEC` (02); 13 `VIEW_READ` (07) | 14 |
+| Admin channels | `kMsgClusterFeatureLevel = 26` (control → admin) and `kA2cWriteSpec = 26` (admin → control), separate rings (02) | 27 on each ring |
+| Control record types | 16 `kReservation`, 17 `kVerdictMarker`, 18 `kConstraintSetChange`, 19 `kTxnJudge` (04; 19's payload is 11's); 20 `kVerdictPlan` (09) | 21 |
+| Batch attribute bits | bit 7 `kAttrAtomic = 0x0080` (11) | bit 8 |
+| Record attribute bits | bits 0–1 intent (03); bits 2–7 reserved and refused | — |
+| Client ring flags (`ProducerImpl.h`) | `kFlagIntentMask = 0x06`, `kFlagIntentShift = 1` (05); `kFlagKeyZero = 0x08` (06) | 0x10 |
+| `SendResult` | 12 `KeyTooLong` (02); 13 `WriteNotAllowed` (03) | 14 |
+| `OpStatus` | 12 `BrokerTooOld` (03); 13 `StoredIdUnknown` (reserved by 04, meaning and use 06); 14 `VerdictUnknown` (04) | 15 |
+| View-read status | 8 `kCursorInvalidated` (07); `StatsResult::kNotLeader = 8` (08) is a separate struct's status, not a wire clash | 9 |
+| `StatId` | 1–2 (05); 3–7 (04); 8–10 (06); 11–20 (11); 32 (09); 33–34 (07); 35–36 (existing; 36 extended by 10) | 21 (topic scope), 37 (view scope) |
+| Security | `SecurityOperation::Import = 7`, `kPermFlagImport = 0x80`, `kOpFlagImportGranted = 0x10` (06) | operation 8 |
+| `DefineTopic` / `TopicSchemaResponse` key-feature flags | bit 0 `keyIndex`, bit 1 `autoIncrement` (05, 06); block of 14 B | bit 2 |
+| `TopicWriteSpecWire` flags | bit 1 `keyIndex` (05); bit 2 `autoIncrement` (06); 9 B, then 26 B (06) | bit 3 |
+| Checkpoint magics | `0x534B4331`, `0x534B4332` marked v1/v2 (01, R01); `0x564B4333` v3 (07) | — |
+| Checkpoint v3 table ids | 0 view, 1 owners, 2 contributors, 3 groups, 4 blocks, 5 group ids (07); 6 unique index, 7 unique extras (09) | 8 |
+| `ViewSnapshotChannel` message | `kResetMsgType = 4` (01) | 5 |
+| Matrix `Op` / `Entity` | 04 0–19; 05 20–24 / 20–25; 06 40–45 / 40–46; 07 60–68; 09 80–86 / 80–90; 11 100–106 / 100–107; 03 120–139 | per-part range |
+| Matrix `Timing` | 14 §15 values; 03's six and `RetryAfterWindow` (04); ten Part G values (11) | append only |
+| `view_probe` exit codes | 170–179 (01); 180–189 (10) | 190 |
+| Caps | `kMaxJudgedBatchRecords = 4096` (03, SD4); `kMaxVerdictViewsPerSource = 32` (04; the key index counts as one, R09d); `kMaxVerdictPlanBytes = 65536`, `kMaxPredicateNodes = 64`, checks over fixed-width columns ≤ 16 B (09); `kTxnOverlaysPerWorker = 8`, `TxnJudgeState::kMaxTxns = 1024` (11) | — |
 
 ---
 
@@ -514,50 +665,65 @@ C = create, M = modify. Line numbers are where the change attaches today.
 | File | C/M | Owner(s) |
 |---|---|---|
 | `broker/libs/view/include/rune/view/FoldSkip.h` | C | 01 (+04) |
-| `broker/libs/view/{include/rune/view/ViewFold.h,src/ViewFold.cpp}`, `AggFold.{h,cpp}` | M | 01, 04, 07, 09 |
-| `broker/libs/view/CMakeLists.txt` (link `rune_transaction`; new tests) | M | 01, 04, 07 |
-| `broker/libs/node/{include/rune/node/WorkerViewSet.h,src/WorkerViewSet.cpp}` | M | 01, 03 (`minFoldCursor`), 04, 07, 09, 10, 11 |
-| `broker/libs/node/include/rune/node/RcState.h` (aborted index access) | M | 01 |
-| `broker/libs/node/include/rune/node/WriteState.h` | C | 02 (+04, 05, 06, 11) |
-| `broker/libs/node/include/rune/node/Worker.h` | M | 02, 03, 04, 05, 06, 07, 08, 11 |
-| `broker/libs/node/include/rune/node/WorkerOp.h`, `WorkerReturnCodec.h`, `protocol/schema/rune-internal-ring.xml`, `protocol/include/rune_protocol_internal_sbe/*` | M | 02 (26/27, `WRITE_SPEC`), 03, 11 (28, return 8) |
-| `broker/libs/node/include/rune/node/AdminChannels.h`, `AdminWorker.h`, `src/AdminWorker.cpp` | M | 02, 05, 06, 07, 08, 09, 10 |
-| `broker/libs/node/include/rune/node/BrokerNode.h`, `src/BrokerNode.cpp`, `NodeConfig.h`, `src/NodeConfig.cpp` | M | 02, 04 (`verdictIntervalMs`), 11 (`txnJudgedRecordsMax`) |
+| `broker/libs/view/{include/rune/view/ViewFold.h,src/ViewFold.cpp}`, `AggFold.{h,cpp}` | M | 01, 04, 07, 09, 11 |
+| `broker/libs/view/{include/rune/view/AggState.h,src/AggState.cpp}` (composite group keys) | M | 07 |
+| `broker/libs/view/CMakeLists.txt` (link `rune_transaction`; new sources and tests) | M | 01, 04, 07, 09, 11 |
+| `broker/libs/node/{include/rune/node/WorkerViewSet.h,src/WorkerViewSet.cpp}` | M | 01, 03 (`minFoldCursor`), 04, 05, 07, 09, 10, 11 |
+| `broker/libs/node/include/rune/node/RcState.h` (`RcVerdictHooks`, the leadership scan) | M | 04, 06, 11 |
+| `broker/libs/node/include/rune/node/WriteState.h` | C | 02 (+04, 05, 06, 09, 11) |
+| `broker/libs/node/include/rune/node/AutoInc.h` | C | 06 |
+| `broker/libs/node/include/rune/node/TopicFeatureRules.h`, `ClusterFeatureLevelFanout.h` | C | 02 |
+| `broker/libs/node/include/rune/node/Worker.h` | M | 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11 |
+| `broker/libs/node/include/rune/node/WorkerOp.h`, `WorkerReturnCodec.h`, `protocol/schema/rune-internal-ring.xml`, `protocol/include/rune_protocol_internal_sbe/*` | M | 02 (26/27, `WRITE_SPEC`), 03, 06 (`kOpFlagImportGranted`), 07 (29/30, tail 13, return 9), 08 (31, return 10), 11 (28, return 8) |
+| `broker/libs/node/include/rune/node/AdminChannels.h`, `AdminWorker.h`, `src/AdminWorker.cpp` | M | 02, 05, 06, 07, 08, 09, 10 (`AdminChannels.h`: 02, 05, 06) |
+| `broker/libs/node/include/rune/node/BrokerNode.h`, `src/BrokerNode.cpp`, `NodeConfig.h`, `src/NodeConfig.cpp` | M | 02, 04 (`verdictIntervalMs`), 05 (`testAdvertisedBrokerVersion`), 06, 07 (`viewHashSeedForTest`), 11 (`txnJudgedRecordsMax`) |
+| `broker/libs/node/include/rune/node/StatsCollect.h` | C | 08 (+09, 11) |
+| `broker/libs/node/include/rune/node/ConstraintDdlRules.h` | C | 09 |
 | `broker/libs/replication/include/rune/replication/ReplicationMessages.h` | M | 02 (level), 11 (13/14) |
+| `broker/libs/replication/{include/rune/replication/AeronPartitionTransport.h,src/AeronPartitionTransport.cpp}` | M | 11 |
 | `codec/include/rune/codec/Utf8.h` (+`codec/src/Utf8.cpp` if not header-only) | C | 02 |
-| `codec/include/rune/codec/Validator.h`, `codec/src/Validator.cpp` (UTF-8, key check helpers) | M | 02 |
-| `client-cpp/include/rune/client/{Key.h,TypedTopic.h,Client.h}`, `client-cpp/src/cli/CatalogCommands.cpp:250`, `Console.cpp:138` | M | 02 (+05, 06, 07) |
-| `ql/src/Parser.cpp`, `ql/include/rune/ql/Ast.h`, `ql/src/Backends.cpp` | M | 02 (`partitions` optional, untyped marker), 06 (`grant import`), 08 (everything else) |
+| `codec/include/rune/codec/{Validator.h,PrimType.h}`, `codec/src/Validator.cpp` (UTF-8, key types, `StringCheck`) | M | 02 |
+| `client-cpp/include/rune/client/{Key.h,TypedTopic.h,Client.h}`, `client-cpp/src/cli/CatalogCommands.cpp:250`, `Console.cpp:138` | M | 02 (+04, 05, 06, 07, 08, 09, 10) |
+| `ql/src/Parser.cpp` | M | 02 (`partitions` optional, untyped marker), 06 (`grant import`), 08 (everything else) |
+| `ql/include/rune/ql/Ast.h`, `ql/src/Backends.cpp` | M | 08 |
 | `broker/libs/storage/include/rune/storage/WriteHookPolicy.h`, `ProducePathImpl.h` | C | 03 |
 | `broker/libs/storage/{include/rune/storage/ProducePath.h,src/ProducePath.cpp}` | M | 03, 06 |
-| `broker/libs/node/{include/rune/node/CheckedWriteHook.h,src/CheckedWriteHook.cpp}` | C | 03 (+05, 06, 11) |
-| `protocol/include/rune/protocol/client/{Protocol.h,DataMessages.h,Dispatch.h}`, `protocol/conformance/*` | M | 03 (+07, 08, 11) |
-| `protocol/include/rune/protocol/{RecordBatch.h,BatchRebuild.h}` | M | 03 |
+| `broker/libs/node/{include/rune/node/CheckedWriteHook.h,src/CheckedWriteHook.cpp}` | C | 03 (+04, 05, 06, 11) |
+| `protocol/include/rune/protocol/client/{Protocol.h,DataMessages.h,Dispatch.h}`, `protocol/conformance/*` | M | 03 (+07, 08, 10, 11) |
+| `protocol/include/rune/protocol/client/TxnMessages.h` (`EndTxnResponse` v12) | M | 11 |
+| `protocol/include/rune/protocol/{RecordBatch.h,BatchRebuild.h}` | M | 02 (`RecordSpan::key`, bounded walk), 03, 05 (`forEachRecordWithAttributes`), 11 (`kAttrAtomic`) |
 | `broker/libs/node/include/rune/node/SessionAckSink.h` | M | 03, 04 (arena), 06 |
-| `broker/libs/gateway/src/ClientGateway.cpp:3872` (acks decode, SD10 refusals) | M | 03 |
-| `client-cpp/include/rune/client/producer/{Producer.h,ProducerImpl.h,BatchBuilder.h}`, `src/producer/*`, `client-cpp/include/rune/client/Completion.h` | M | 03, 04, 05, 06, 11 |
-| `client-cpp/src/cli/QlEngine.cpp:133` (`errorCodeName`) | M | 03 |
-| `broker/libs/view/include/rune/view/{ViewKey.h,RecordFold.h,Verdict.h}` | C | 04 |
+| `broker/libs/gateway/{include/rune/gateway/ClientGateway.h,src/ClientGateway.cpp}` | M | 03 (acks decode, SD10 refusals), 05, 06, 07 (81–83), 08 (84/85), 11 (`TxnMarkerChannel`, `sendTxnVote`) |
+| `client-cpp/include/rune/client/producer/{Producer.h,ProducerImpl.h,BatchBuilder.h,TxnTypes.h,ProduceFrameBuilder.h}`, `src/producer/*` | M | 02, 03, 04, 05, 06, 09, 11 |
+| `client-cpp/include/rune/client/Completion.h` | M | 03, 04 (`OpStatus` 13/14), 06, 07, 08 |
+| `client-cpp/src/cli/QlEngine.cpp:133` (`errorCodeName`) | M | 02, 03, 08, 11 (59) |
+| `broker/libs/view/include/rune/view/{ViewKey.h,RecordFold.h,Verdict.h}` | C | 04 (+07 `ViewKey`, 09 `RecordFold`/`Verdict`, 11 `PrepareStatus::Locked`) |
+| `broker/libs/view/include/rune/view/{KeyedFold.h,CheckEval.h,UniqueClaims.h,TxnOverlay.h}` (+ their `src/*.cpp`) | C | 07 (`KeyedFold`), 09 (`CheckEval`, `UniqueClaims`), 11 (`TxnOverlay`) |
 | `broker/libs/node/include/rune/node/VerdictSource.h` (+`src/VerdictSource.cpp`) | C | 04 (+05, 09, 11) |
-| `broker/libs/storage/include/rune/storage/{ControlRecordLayout.h,RejectedOffsetIndex.h,VerdictCleanState.h}` | C | 04 (+06, 11) |
-| `broker/libs/storage/{include/rune/storage/LogCleaner.h,src/LogCleaner.cpp}`, `broker/libs/node/include/rune/node/LogCleanerAgent.h:455` | M | 04, 06 |
-| `broker/libs/replication/include/rune/replication/PartitionReplica.h:866,893` | M | 04 |
+| `broker/libs/storage/include/rune/storage/{ControlRecordLayout.h,RejectedOffsetIndex.h,VerdictCleanState.h}` | C | 04 (+06, 09, 11) |
+| `broker/libs/storage/include/rune/storage/ProducerBatchWindow.h` | C | 06 |
+| `broker/libs/storage/{include/rune/storage/LogCleaner.h,src/LogCleaner.cpp}`, `broker/libs/node/include/rune/node/LogCleanerAgent.h:455` | M | 04, 06, 11 |
+| `broker/libs/replication/include/rune/replication/PartitionReplica.h:866,893` | M | 04, 06 (`producerTailDepth`), 11 (`cleanerTxnJudgeBound`) |
 | `broker/libs/transaction/src/{ControlMarker.cpp,ReadCommittedView.cpp}` (type hardening) | M | 04 |
 | `protocol/include/rune/protocol/CatalogTypes.h` (`TopicKeyFeatures`, `Partitioner`) | M | 05 |
-| `codec/include/rune/catalog/{CatalogEvent.h,CatalogState.h}`, `codec/src/catalog/{CatalogEvent.cpp,CatalogFingerprint.cpp,ApplyV2.cpp(C)}`, `codec/tests/catalog/golden/*`, `codec/tools/make_catalog_golden.cpp` | M/C | 05 |
-| `protocol/include/rune/protocol/client/SchemaMessages.h` (DefineTopic / TopicSchemaResponse v12 trailer) | M | 05 |
+| `codec/include/rune/catalog/{CatalogEvent.h,CatalogState.h}`, `codec/src/catalog/{CatalogEvent.cpp,CatalogFingerprint.cpp,ApplyV2.cpp(C)}`, `codec/tests/catalog/golden/*`, `codec/tools/make_catalog_golden.cpp` | M/C | 05 (+06 `ApplyV2`) |
+| `protocol/include/rune/protocol/client/SchemaMessages.h` (DefineTopic / TopicSchemaResponse v12 trailer) | M | 02 (fingerprint kind), 05 |
 | `client-cpp/include/rune/client/WriteResult.h` | C | 05 (+06, 09) |
-| `client-cpp/include/rune/client/subscriber/Subscription.h:117`, `client-cpp/include/rune/client/codec/DataCodec.h`, `src/subscriber/SubscriberHub.cpp` | M | 05 |
-| `protocol/include/rune/protocol/PartitionHash.h`, `client-cpp/include/rune/client/TopicHandle.h`, `client-cpp/include/rune/client/metadata/PartitionRouter.h`, `broker/libs/gateway/include/rune/gateway/TopicRegistry.h` | M | 06 |
+| `client-cpp/include/rune/client/ConstraintNames.h`, `client-cpp/src/ConstraintNames.cpp` | C | 09 |
+| `client-cpp/include/rune/client/subscriber/Subscription.h:117`, `src/subscriber/SubscriberHub.cpp` | M | 05 |
+| `client-cpp/include/rune/client/codec/DataCodec.h` | M | 03 |
+| `protocol/include/rune/protocol/PartitionHash.h`, `client-cpp/include/rune/client/TopicHandle.h`, `client-cpp/include/rune/client/metadata/PartitionRouter.h`, `broker/libs/gateway/include/rune/gateway/TopicRegistry.h` | M | 06 (`TopicHandle.h` also 05) |
 | `protocol/include/rune/protocol/SecurityTypes.h`, `codec/src/security/*`, `broker/libs/node/include/rune/node/WorkerWriteGrants.h`, `PermissionShipper.h` | M | 06 |
-| `broker/libs/view/{include/rune/view/ViewTable.h,src/ViewTable.cpp,include/rune/view/ViewCheckpoint.h,src/ViewCheckpoint.cpp,src/PlanCompiler.cpp,src/ViewPlan.cpp}` | M | 07 (+09) |
-| `codec/include/rune/codec/{ViewPlanAuthored.h,ViewKeyEncoding.h,UnicodeLower.h}`, `codec/src/{ViewPlanAuthored.cpp,UnicodeLower.cpp}`, `codec/tools/gen_unicode_lower.cpp`, `codec/data/UnicodeData-<ver>.txt` | C | 07 |
+| `broker/libs/view/{include/rune/view/ViewTable.h,src/ViewTable.cpp,include/rune/view/ViewCheckpoint.h,src/ViewCheckpoint.cpp,src/PlanCompiler.cpp,src/ViewPlan.cpp}` | M | 07 (+01 checkpoint marks, 08 `aggregateOutputType`, 09) |
+| `codec/include/rune/codec/{ViewPlanAuthored.h,ViewKeyEncoding.h,UnicodeLower.h}`, `codec/src/{ViewPlanAuthored.cpp,UnicodeLower.cpp}`, `codec/tools/gen_unicode_lower.cpp`, `codec/data/UnicodeData-<ver>.txt` | C | 07 (+08 `ViewPlanAuthored`) |
 | `client-cpp/include/rune/client/view/{ViewPlanAuthor.h,ViewKeyBuilder.h(C)}`, client read ops | M/C | 07 |
-| `protocol/include/rune/protocol/client/ViewMessages.h` (or the file holding `GetViewRow` 72; 81–83 added there) | M | 07 |
+| `protocol/include/rune/protocol/client/DataMessages.h` (`GetViewRowK` 81, `ScanViewRows` 82/83) | M | 07 |
 | `protocol/include/rune/protocol/client/StatsMessages.h` | C | 08 |
-| `client-cpp/src/cli/{QlEngine.cpp,CatalogCommands.cpp}` (`select`, `show`, `stats --json`) | M | 08 |
-| `broker/libs/transaction/*`, `broker/libs/node/include/rune/node/TransactionCoordinationService.h`, `src/TransactionCoordinationService.cpp`, `broker/libs/gateway/include/rune/gateway/ClientGateway.h:957` | M | 11 |
-| `docs/api/ql.md`, `docs/wire-protocol.md`, `docs/client-cpp.md`, `docs/admin-cli.md`, `CATALOG.md`, `SECURITY.md`, `SELF-HOSTING.md`, root and client `CLAUDE.md` | M | each part for what it ships; 11 cross-checks |
+| `client-cpp/src/cli/{QlEngine.cpp,CatalogCommands.cpp}` (`select`, `show`, `stats --json`) | M | 08 (+09) |
+| `broker/libs/node/{include/rune/node/TransactionCoordinationService.h,src/TransactionCoordinationService.cpp}` | M | 11 |
+| `broker/docker/checked-writes-e2e.sh`, `docker-compose.checked-writes.yml`, `client-cpp/examples/checked_writes_probe.cpp` | C/M | 05 (+06, 09, 11) |
+| `docs/api/{ql.md,wire-protocol.md,client-cpp.md,admin-cli.md}`, `docs/{operations.md,configuration.md,testing.md}`, `broker/docs/{CATALOG.md,SECURITY.md,SELF-HOSTING.md}`, root, `broker/` and `client-cpp/` `CLAUDE.md` | M | each part for what it ships; 11 cross-checks (§16.12) |
+| The `rune-site` repo's views section (`rune/docs.html`, `rune/index.html`) | M | 11 Task 16: a local commit only; never pushed or deployed without the owner's go-ahead |
 | Tests and support files | C/M | see below |
 
 ---
@@ -568,20 +734,24 @@ C = create, M = modify. Line numbers are where the change attaches today.
 
 | Binary (target) | Location | Created by | Extended by |
 |---|---|---|---|
-| `rune_view_tests` | `broker/libs/view/tests/view/` | exists | 01, 04, 07, 09 |
-| `rune_storage_tests` | `broker/libs/storage/tests/` | exists | 04 (index, layout, cleaner), 06 |
-| `rune_protocol_tests` | `protocol/tests/` | exists | 03, 05, 07, 08, 11 |
-| `rune_codec_tests`, `rune_catalog_tests` (`build/sub-codec`) | `codec/tests/` | exist | 02 (Utf8), 05 (catalog v2, golden), 06 (security op), 07 (lower, key encoding, plan v2) |
+| `rune_view_tests` | `broker/libs/view/tests/view/` | exists | 01, 04, 07, 08, 09, 11 |
+| `rune_storage_tests` | `broker/libs/storage/tests/` | exists | 04 (index, layout, cleaner), 06, 09, 11 |
+| `rune_protocol_tests` | `protocol/tests/` | exists | 02, 03, 05, 06, 07, 08, 10, 11 |
+| `rune_replication_tests` | `broker/libs/replication/tests/` | exists | 11 (templates 13/14) |
+| `rune_codec_tests`, `rune_catalog_tests` (`build/sub-codec`) | `codec/tests/` | exist | 02 (Utf8), 03, 05 (catalog v2, golden), 06 (security op), 07 (lower, key encoding, plan v2) |
 | `rune_produce_validation_tests` | `broker/libs/node/tests/integration/ProduceValidationTest.cpp` | exists | 02, 03 |
-| `rune_checked_writes_tests` | `broker/libs/node/tests/node/CheckedWrites*Test.cpp` | 02 | 03–11: worker-level unit and integration |
-| `rune_checked_writes_matrix_tests` | `broker/libs/node/tests/node/CheckedWritesMatrixTest.cpp` | 04 | 05, 06, 07, 09, 11 |
+| `rune_checked_writes_tests` | the `broker/libs/node/tests/node/CheckedWrites*Test.cpp` files each part lists (an explicit list, no glob) | 02 | 03–11: worker-level unit and integration, no Aeron |
+| `rune_checked_writes_aborted_fold_tests` | `broker/libs/node/tests/integration/AbortedFoldWorkerRegressionTest.cpp` | 01 | — |
+| `rune_checked_writes_ack_tests` | `broker/libs/node/tests/node/CheckedWrites{WorkerHook,ViewAck,ViewAckMatrix}Test.cpp` (Aeron block) | 03 | 04 |
+| `rune_checked_writes_verdict_tests` | `broker/libs/node/tests/node/CheckedWrites{VerdictWorker,Consumer,VerdictAck}Test.cpp` and later rig tests (Aeron block, real shard `Worker`) | 04 | 05, 06, 09, 11 |
+| `rune_checked_writes_matrix_tests` | `broker/libs/node/tests/node/CheckedWritesMatrixTest.cpp`, `CheckedWritesModelTest.cpp` | 04 | 03 (folded in by 04), 05, 06, 07, 09, 11 |
 | `rune_checked_writes_stress_tests` | `broker/libs/node/tests/integration/CheckedWritesStressTest.cpp` | 04 | 05, 06, 09, 11 |
-| `rune_checked_writes_alloc_regression_tests` | `broker/libs/node/tests/node/CheckedWritesAllocRegressionTest.cpp` + `tests/support/AllocWindow.cpp` | 03 | 04, 05, 06, 07, 09, 11 |
-| `rune_client_broker_tests` | add `broker/libs/node/tests/client/CheckedWritesBrokerRegressionTest.cpp` to `broker/libs/node/CMakeLists.txt:1731` | 02 | all parts: real `OneBroker` (`tests/client/OneBroker.h`) / `ThreeNodes` (`tests/support/CatalogBrokerCluster.h:160`) |
-| `rune_compaction_correctness_tests` | exists | — | 04, 06 |
-| `rune_create_view_tests`, `rune_get_view_row_tests` | exist | — | 07, 09, 10 |
-| `rune_transaction_tests`, `rune_txn_coordination_service_tests` | exist | — | 11 |
-| client suites (`build/sub-client-cpp`) | `client-cpp/tests/` | exist | 02, 03, 05, 06, 07, 09, 11 |
+| `rune_checked_writes_alloc_regression_tests` | `broker/libs/node/tests/node/CheckedWritesAllocRegressionTest.cpp` + `tests/support/AllocWindow.cpp` | 03 | 04, 05, 06, 07, 08, 09, 11 |
+| `rune_checked_writes_transient_view_tests` | `broker/libs/node/tests/integration/PersistedOverTransientViewTest.cpp` (own enums, R10e) | 10 | — |
+| `rune_client_broker_tests` | add `broker/libs/node/tests/client/CheckedWrites*RegressionTest.cpp` to `broker/libs/node/CMakeLists.txt:1731` | 02 | all parts: real `OneBroker` (`tests/client/OneBroker.h`) / `ThreeNodes` (`tests/support/CatalogBrokerCluster.h:160`) |
+| `rune_create_view_tests`, `rune_ddl_conformance_tests`, `rune_ddl_stress_tests` | exist | — | 02, 05, 10 |
+| `rune_txn_coordination_service_tests`, `rune_d9_cross_node_marker_tests` | exist (`broker/libs/node/CMakeLists.txt:475`, `:1272`) | — | 11 |
+| client suites (`build/sub-client-cpp`), among them `rune_invoker_tests` and `rune_client_tests` | `client-cpp/tests/` | exist | 02, 03, 04, 05, 06, 07, 08, 09, 11 |
 | ql suites (`build/sub-ql`) | `ql/tests/` | exist | 02, 06, 08 |
 
 **Support headers** (`broker/libs/node/tests/support/`), following the Phase 2c `FilterMatrixRig.h`, `FilterMatrixExpectations.h` and `FilterModel.h` pattern:
@@ -591,24 +761,27 @@ C = create, M = modify. Line numbers are where the change attaches today.
   - `subscribeAndCollect()`;
   - `failover()`, `restart()`, `truncateTo(offset)`, `compact()`;
   - `installTestRejectView(pred)`.
-  Parts add `createKeyIndex()` (05), `createAutoIncTopic(P)` (06), `createView(planV2)` (07) and `createConstrainedView(…)` (09).
+  Parts add `createKeyIndex(KeyShape = {}, bool enabled = true)` (05), `createAutoIncTopic(AutoIncShape = {})` (06), `createView(planV2)` (07), `demote()` and `getStats(…)` (08), `createCharacterTopic()`, `createConstrainedView(…)`, `createLedgerTopic()` and `appendCharacters(…)` (09), and `sendVote`, `voteReply`, `driveUntilVoted`, `viewInt64` and a voting `commitTxn` (11).
+  - Part 03's `CheckedWritesAckRig.h` (shard mode with the ack sink) serves 03's and some of 04's and 11's ack and visibility tests. Part 10 has its own `TransientViewRig.h`.
 - **`CheckedWritesMatrixExpectations.h` (04).**
-  - `enum class Op : uint16_t` with ranges reserved per part: 04 0–19, 05 20–39, 06 40–59, 07 60–79, 09 80–99, 11 100–119.
-  - `enum class Entity : uint16_t` with the same ranges.
-  - `enum class Timing : uint16_t`, fixed here as §15's timing list: `Single, BackToBack, SelfCollidingBatch, Racing, RetryBeforeJudge, RetryAfterJudge, FailoverAppendHw, FailoverHwFold, FailoverFoldMarker, TruncateTail, RestartDuringRebuild, CreateOnNonEmpty, ReplaceDuringWrites, DropDuringWrites`.
+  - `enum class Op : uint16_t` with ranges reserved per part: 04 0–19, 05 20–39, 06 40–59, 07 60–79, 09 80–99, 11 100–119, 03 120–139 (R03d). Used today: 05 20–24, 06 40–45, 07 60–68, 09 80–86, 11 100–106.
+  - `enum class Entity : uint16_t` with the same ranges. Used today: 05 20–25, 06 40–46, 07 60–68, 09 80–90, 11 100–107. Parts 01 and 10 keep their matrices in their own binaries (R10e).
+  - `enum class Timing : uint16_t`, fixed here as §15's timing list: `Single, BackToBack, SelfCollidingBatch, Racing, RetryBeforeJudge, RetryAfterJudge, FailoverAppendHw, FailoverHwFold, FailoverFoldMarker, TruncateTail, RestartDuringRebuild, CreateOnNonEmpty, ReplaceDuringWrites, DropDuringWrites`. Append-only (R04d): 04 appends 03's six values and `RetryAfterWindow` (21 in all), and 11 appends ten more (`CoordinatorFailoverVotesOut` … `ConstraintReplacedWhileOpen`). Each part's `cellsFor` lists the timings it uses, so an appended value never changes an earlier part's pin.
+  - `enum class Part : uint8_t { P03 = 3, P04 = 4, P05 = 5, P06 = 6, P07 = 7, P09 = 9, P11 = 11 };` and `std::vector<Cell> cellsFor(Part)` (04).
   - `struct Cell { Op op; Entity entity; Timing timing; };` and `Expected expect(const Cell&)` chain the per-part `expect04` … `expect11`, each with a top-down not-applicable table.
-- **Cell counts** are pinned by `CheckedWritesMatrixCountRegression.CellCountsArePinned`. Each part updates its own row of the pin.
-- **`CheckedWritesModel.h` (04).** The reference model: per-partition records with their verdicts, views as a fresh refold of the accepted records, and the consumer-visible set. It has extension points for key index (05), ids (06), unique and check (09) and transactions (11).
+- **Cell counts** are pinned by `CheckedWritesMatrixCountRegression.CellCountsArePinned`. Each part updates its own row of the pin. The one exception: Part 11's Task 12 re-pins rows 05 (570 / 60) and 06 (810 / 72) when it lifts the pre-G refusals their not-applicable rules cite (R11d).
+- **`CheckedWritesModel.h` (04).** The reference model: per-partition records with their verdicts, views as a fresh refold of the accepted records, and the consumer-visible set. It has extension points for key index (05), ids (06), unique and check (09) and transactions (11, judge order and the conflict rule). The model check runs 04's six named invariants plus each part's own (09 `AtMostCapLiveCharacters`, 11 `FoldPathsAgree`).
 - **`CheckedWritesStressDriver.h` (04).** Seeded racing writers with injected failovers, restarts, truncation and compaction on `ThreeNodes`. It records the seed on failure. The invariants are named checks, one owner each:
   - 04: `AckedVisibleUnlessRejected`, `NoRejectedDeliveredOrFolded`, `SameVerdictEveryLeaderAndRefold`, `ViewEqualsFreshRefold`, `CompactionKeepsAcceptedValue`;
   - 06: `NoIdTwiceNoReuse`;
   - 09: `AtMostTwelveLiveCharacters`, `LowerNameUnique`;
   - 11: `TxnAllOrNothingAndAtomicPerPartition`.
-- **Docker e2e.** `broker/docker/checked-writes-e2e.sh` and `docker-compose.checked-writes.yml` (VM only) are created by 05 and extended by 06, 09 (the RegressorsPath auth-server and character-server flows from spec §1) and 11.
+- **Docker e2e.** `broker/docker/checked-writes-e2e.sh` and `docker-compose.checked-writes.yml` (VM only) are created by 05 and extended by 06, 09 (the RegressorsPath auth-server and character-server flows from spec §1) and 11 (the `TXN` leg). 01 and 10 extend the view-engine e2e (`view_probe` exit codes 170–179 and 180–189).
 - **Benches** (`build/rel`). ABAB n=3 against the part's base commit:
   - `ProduceValidateBench.cpp`: `BM_CheckedWriteHook/*` (02, 03, 06).
   - `ProducePathBenchmark.cpp` and `WorkerProduceLatencyBench.cpp`: non-regression (02, 03), plus a consumer attached to a verdict source (04).
-  - `ViewFoldBench.cpp`: `BM_ViewFoldVerdict/*` (04, 09) and derived keys plus the owner map (07).
+  - `ViewFoldBench.cpp`: `BM_ViewFoldVerdict/*` (04, 09, 11 `txn_judge_*`) and derived keys plus the owner map (07).
+  - `WorkerProduceLatencyBench.cpp`: `BM_WorkerTxnCommit/voting` and `/non_voting` (11; `non_voting` is a no-regression gate).
   - `ViewTableBench.cpp`: `BM_ViewTableWideKey/*` and `BM_ViewTablePrefixScan` (07).
 - **Names.** Every new test suite name starts with `CheckedWrites`, so `ctest -R CheckedWrites` selects the program. Every fix test carries `Regression` in its suite or name.
 
@@ -618,7 +791,7 @@ C = create, M = modify. Line numbers are where the change attaches today.
 - **03:**
   - "Clients": intents without `View` or from a non-idempotent producer refused; autoincrement creates without `All` refused (the rule only; the ids are 06);
   - every `View`-flag bullet (`Leader|View`, `All|View`, behind an open transaction, no views, `NotLeader`/`Internal`, `View`/`None|View` refused, unknown bits, `BrokerTooOld`, old values 0/1 unchanged);
-  - before Part G, a transactional and an atomic batch on a constrained source are refused while unconstrained ones work. Constrained sources are exercised by 04 with `TestReject` and by 09 for real.
+  - before Part G, a transactional and an atomic batch on a constrained source are refused while unconstrained ones work. Constrained sources are exercised by 04 with `TestReject` and by 09 for real (transactional half). The atomic half is a rule cell only (03's pinned row 15): the bit and its lift both ship in 11.
 - **04 (with `TestReject`):**
   - every "Verdicts, markers and readers" bullet that is not Part-G-specific and not constraint-specific;
   - verdict lag during a build;
@@ -656,7 +829,7 @@ C = create, M = modify. Line numbers are where the change attaches today.
   - §3 → 02/03/04; §4 → 02; §5 → 05; §6 → 06; §7 and §9 → 07; §8.1 → 07 (SD7); §8.2, §8.3 and §8.7 wiring → 09; §8.4–§8.8 → 04; §8.9 → 03.
   - §9a → 10; §9b → 11; §10 → 08; §11.1 → 03; §11.2 → 03 (06 and 11 for their rows); §11.3 → 04; §12 → 02/03; §13 → C16; §14 → benches; §15 → the owner list above; §16 → the index; §18 → left to the part plans within C9–C11.
 - **Type consistency:** each type is defined once, here, with its file. Part plans reference names (`PartitionWriteState`, `VerdictSource`, `RejectedOffsetIndex`, `FoldSkip`, `SourceRecord`, `Prospect`, `Verdict`, `ViewKey`, `TopicKeyFeatures`, `WriteResult`) and never redefine them.
-- **Number collisions checked against the code:**
+- **Number collisions checked against the code** (the registry under C18 lists what the parts take):
   - `ErrorCode` stops at 50 (`Protocol.h:209`);
   - `TemplateId` 81–85 are free (`Protocol.h:90-102`);
   - `WorkerOp::Type` stops at 25, plus 200 (`WorkerOp.h:151-158`);
@@ -666,4 +839,6 @@ C = create, M = modify. Line numbers are where the change attaches today.
   - cluster-plane template ids 13 and 14 are free;
   - `SecurityOperation` stops at 6 (`SecurityTypes.h:10`);
   - `SendResult` stops at 11 and `OpStatus` at 11;
-  - control record types 0 and 1 are used (`ControlMarkerLayout.h:30-31`).
+  - control record types 0 and 1 are used (`ControlMarkerLayout.h:30-31`);
+  - batch attribute bit 7 is unused (`RecordBatch.h:31-36`: bits 4–6 are taken).
+- **R-X6 pass (after Part 11's plan):** C1, C6–C11, C13–C18, the registry, the binaries table, the support headers, the file map, the plan index and the rulings register were re-checked against plans 01–11.
