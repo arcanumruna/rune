@@ -59,6 +59,7 @@ public:
         ENFORCE_FENCE = static_cast<std::uint8_t>(23),
         READ_LEASE = static_cast<std::uint8_t>(24),
         FILTER_SCHEMA = static_cast<std::uint8_t>(25),
+        TXN_VERIFY_RESULT = static_cast<std::uint8_t>(26),
         TEST_TASK = static_cast<std::uint8_t>(200),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
@@ -93,6 +94,7 @@ public:
             case static_cast<std::uint8_t>(23): return ENFORCE_FENCE;
             case static_cast<std::uint8_t>(24): return READ_LEASE;
             case static_cast<std::uint8_t>(25): return FILTER_SCHEMA;
+            case static_cast<std::uint8_t>(26): return TXN_VERIFY_RESULT;
             case static_cast<std::uint8_t>(200): return TEST_TASK;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
@@ -130,6 +132,7 @@ public:
             case ENFORCE_FENCE: return "ENFORCE_FENCE";
             case READ_LEASE: return "READ_LEASE";
             case FILTER_SCHEMA: return "FILTER_SCHEMA";
+            case TXN_VERIFY_RESULT: return "TXN_VERIFY_RESULT";
             case TEST_TASK: return "TEST_TASK";
             case NULL_VALUE: return "NULL_VALUE";
         }

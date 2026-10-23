@@ -150,6 +150,11 @@ struct WorkerOp {
         // descriptor blob, TailKind = DESCRIPTOR_BLOB) and clientVersion (the topic's current schema version); topicId is
         // the typed topic.  Cold (DDL rate); never ownership-gated.  (25 = FILTER_SCHEMA.)
         FilterSchema              = 25, ///< control → worker: install/extend a typed topic's filter schema
+        // F15-FU1 (#112): control → the partition's OWNING worker (ownership-gated): the transaction coordinator's
+        // answer to the worker's TxnVerifyRequest.  topicId / partition = the partition; producerId / producerEpoch =
+        // the producer; correlationId = the worker's request id; replicatedPayload.errorCode = the client ErrorCode
+        // (0 = the partition is registered in the producer's ongoing transaction).  (26 = TXN_VERIFY_RESULT.)
+        TxnVerifyResult           = 26, ///< control → worker: a txn partition verification answer
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -538,6 +543,13 @@ struct WorkerReturn {
         /// tail carries the row bytes on OK (empty otherwise).  sessionId /
         /// correlationId are echoed from the op so the gateway can reply.
         ViewRowResult = 7,
+        /// F15-FU1 (#112): the owning worker asks the transaction coordinator whether a transactional batch of
+        /// (producerId, producerEpoch) — the first one for a producer with no open transaction on this partition —
+        /// may be appended to topicId / partition.  correlationId = the worker's request id (echoed by the
+        /// TxnVerifyResult op), targetReplicaId / incarnation = the replica.  The runtime answers EVERY request
+        /// exactly once (the coordinator's code, or a retriable NotCoordinator when it cannot be asked or a
+        /// remote ask is lost to a reconnect / coordinator change).  Rides sbe ReturnType::TXN_VERIFY_REQUEST.
+        TxnVerifyRequest = 8,
     };
 
     Type    type = Type::ProduceResult;

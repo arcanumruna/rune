@@ -32,8 +32,25 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace rune::node {
+
+// The per-(view, partition) checkpoint file under the view data dir — the ONE
+// name the IO agent appends to and recovery reloads.  Issue #537: since the fold
+// skips aborted transactions the file is "view-<id>-p<n>.committed.delta".  A
+// checkpoint written before that fix ("view-<id>-p<n>.delta",
+// legacyViewCheckpointFilePath) may hold rows / aggregate contributions of
+// ABORTED transactions, so it is never loaded: recovery removes it and re-folds
+// the view from the source log (views = a re-computation from the log).
+inline std::string viewCheckpointFilePath(const std::string& dir, int32_t viewTopicId, int32_t partition) {
+    return dir + "/view-" + std::to_string(static_cast<uint32_t>(viewTopicId)) + "-p" + std::to_string(partition) +
+           ".committed.delta";
+}
+inline std::string legacyViewCheckpointFilePath(const std::string& dir, int32_t viewTopicId, int32_t partition) {
+    return dir + "/view-" + std::to_string(static_cast<uint32_t>(viewTopicId)) + "-p" + std::to_string(partition) +
+           ".delta";
+}
 
 struct ViewSnapshotChannel {
     static constexpr int32_t     kDeltaMsgType     = 1;

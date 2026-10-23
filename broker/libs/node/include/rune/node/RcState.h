@@ -175,6 +175,127 @@ private:
     std::size_t          n_    = 0;
 };
 
+/// F15-FU1 (#112): the per-partition transaction-registration verification state
+/// (KIP-890 part 1).  A transactional data batch of a producer with NO open
+/// transaction on the partition is appended only once the transaction
+/// coordinator confirmed (producerId, epoch, partition) is registered in that
+/// producer's ongoing transaction.  One entry per producer being verified:
+///
+///   Pending{epoch, reqId}  a TxnVerifyRequest is out; batches answered retriably
+///   Verified{epoch}        the next batch of that epoch is appended — the entry
+///                          is consumed by that append (the open transaction then
+///                          admits the rest) or by the producer's marker
+///   Rejected{epoch, code}  the coordinator refused: the next batch of that epoch
+///                          gets `code` (non-retriable) and consumes the entry
+///
+/// The producer's COMMIT/ABORT marker erases its entry in every state, and an
+/// answer applies only to the Pending entry of its exact reqId — so an answer
+/// that was in flight when the marker landed can never admit a batch after it
+/// (the late-batch race).  Fixed capacity, linear probing with backward-shift
+/// deletion, O(1), no allocation after reserve(); a full set evicts a Rejected
+/// entry (Pending and Verified always resolve: every request is answered, and a
+/// verified partition is registered, so its marker comes).  Owner thread only.
+class TxnVerifySet {
+public:
+    enum class State : uint8_t { Pending, Verified, Rejected };
+    struct Entry {
+        int64_t  pid   = kEmpty;
+        uint64_t reqId = 0;
+        int16_t  epoch = 0;
+        int16_t  code  = 0;
+        State    state = State::Pending;
+    };
+    static constexpr int64_t kEmpty = -1;
+
+    void reserve(std::size_t maxPids) {
+        std::size_t slots = 1;
+        while (slots < 2 * maxPids) slots <<= 1;
+        slots_.assign(slots, Entry{});
+        mask_ = slots - 1;
+        max_  = maxPids;
+        n_    = 0;
+    }
+    void clear() noexcept {
+        if (n_ != 0) for (auto& e : slots_) e = Entry{};
+        n_ = 0;
+    }
+    [[nodiscard]] Entry* find(int64_t pid) noexcept {
+        if (max_ == 0) return nullptr;
+        for (std::size_t i = hash_(pid) & mask_;; i = (i + 1) & mask_) {
+            if (slots_[i].pid == pid) return &slots_[i];
+            if (slots_[i].pid == kEmpty) return nullptr;
+        }
+    }
+    /// A fresh entry for `pid` (absent), or nullptr when the set is full and holds
+    /// no Rejected entry to evict.
+    [[nodiscard]] Entry* insert(int64_t pid) noexcept {
+        if (max_ == 0) return nullptr;
+        if (n_ == max_ && !evictRejected_()) return nullptr;
+        std::size_t i = hash_(pid) & mask_;
+        while (slots_[i].pid != kEmpty) i = (i + 1) & mask_;
+        slots_[i] = Entry{};
+        slots_[i].pid = pid;
+        ++n_;
+        return &slots_[i];
+    }
+    void erase(int64_t pid) noexcept {
+        if (max_ == 0) return;
+        std::size_t i = hash_(pid) & mask_;
+        while (slots_[i].pid != pid) {
+            if (slots_[i].pid == kEmpty) return;
+            i = (i + 1) & mask_;
+        }
+        eraseAt_(i);
+    }
+    [[nodiscard]] std::size_t size() const noexcept { return n_; }
+    [[nodiscard]] std::size_t capacity() const noexcept { return max_; }
+
+private:
+    static std::size_t hash_(int64_t pid) noexcept {   // splitmix64 finaliser (as FixedPidSet)
+        uint64_t x = static_cast<uint64_t>(pid) + 0x9E3779B97F4A7C15ull;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        return static_cast<std::size_t>(x ^ (x >> 31));
+    }
+    // Backward-shift deletion: keeps every probe chain unbroken (no tombstones).
+    void eraseAt_(std::size_t i) noexcept {
+        slots_[i] = Entry{};
+        --n_;
+        for (std::size_t j = (i + 1) & mask_; slots_[j].pid != kEmpty; j = (j + 1) & mask_) {
+            const std::size_t home = hash_(slots_[j].pid) & mask_;
+            // slot j may move to the hole i iff its home is not cyclically in (i, j].
+            const bool inRange = i <= j ? (home > i && home <= j) : (home > i || home <= j);
+            if (inRange) continue;
+            slots_[i] = slots_[j];
+            slots_[j] = Entry{};
+            i = j;
+        }
+    }
+    bool evictRejected_() noexcept {   // cold: only on a full set
+        for (std::size_t i = 0; i < slots_.size(); ++i) {
+            if (slots_[i].pid != kEmpty && slots_[i].state == State::Rejected) { eraseAt_(i); return true; }
+        }
+        return false;
+    }
+    std::vector<Entry> slots_;
+    std::size_t        mask_ = 0;
+    std::size_t        max_  = 0;
+    std::size_t        n_    = 0;
+};
+
+/// F15-FU1 (#112): what the produce path does with a transactional data batch.
+struct TxnAdmission {
+    enum class Kind : uint8_t {
+        Admit,           ///< append it (an open transaction, or a verified registration)
+        Retry,           ///< refuse retriably (ConcurrentTransactions): a verification is pending / no room
+        RequestVerify,   ///< refuse retriably AND ask the coordinator (TxnVerifyRequest with `reqId`)
+        Refuse,          ///< refuse with `code` (the coordinator said no: non-retriable)
+    };
+    Kind     kind  = Kind::Admit;
+    int16_t  code  = 0;
+    uint64_t reqId = 0;
+};
+
 class RcState {
 public:
     /// Per-pass build budget (bytes parsed per advance step).  Set from
@@ -191,6 +312,9 @@ public:
     /// budgets beyond the cursor (m7).
     static constexpr std::size_t kReadAheadBudgets        = 8;
     static constexpr int         kExitInvariantViolation  = 70;
+    /// F15-FU1 (#112): producers one partition verifies at once (fixed capacity; past it a
+    /// new producer's first batch is refused retriably until an entry resolves).
+    static constexpr std::size_t kTxnVerifyCapacity       = 128;
 
     struct Unbuilt {};
     struct Scanning {
@@ -250,6 +374,7 @@ public:
         aborted_.reserve(rune::transaction::AbortedTxnIndex::kDefaultReservedRanges);
         tail_.reserve(kTailReserve);
         residency_.reserve(static_cast<std::size_t>(kDefaultScanBytesPerPass) / 4096 + 2);
+        verify_.reserve(kTxnVerifyCapacity);
     }
     /// Cold (ownership apply), MEMORY-BACKED partitions only: the ring rebuild's
     /// fixed-capacity producer set (a disk partition never pays for it).  Without
@@ -302,9 +427,13 @@ public:
         if (!ready()) [[unlikely]]
             haltInvariant_("a producerId >= 0 data batch was appended while the RC state is not Ready");
         tracker_.onProduceBatch(producerId, base);
+        if (verify_.size() != 0) [[unlikely]] verify_.erase(producerId);   // #112: a Verified entry is consumed
     }
     /// A COMMIT / ABORT control batch appended at `offset`.
     void onMarker(int64_t producerId, int64_t offset, bool commit) {
+        // #112: the marker ends whatever verification of this producer was going on
+        // (an answer still in flight finds no Pending entry and is dropped).
+        if (verify_.size() != 0) [[unlikely]] verify_.erase(producerId);
         if (ready()) {
             applyMarker_(producerId, offset, commit);
         } else if (scanning()) {
@@ -313,6 +442,79 @@ public:
         }
         // Unbuilt: nothing — the build starts at LEO > offset and scans it.
     }
+
+    // ---- F15-FU1 (#112): transaction-registration verification -------------
+    /// The produce gate for a TRANSACTIONAL data batch of (producerId, epoch), Ready
+    /// only.  An open transaction of the producer here admits it (it was verified, or
+    /// rebuilt from the log); otherwise the verification state decides.  O(1), no
+    /// allocation.  `nextReqId` is the caller's (worker-wide, never reused) request id
+    /// counter: a request id is never shared by two partitions or RC incarnations.
+    /// `canRequest` false (the caller has no room to send a request now) answers Retry
+    /// instead of opening a verification, so no entry is ever Pending without a request.
+    [[nodiscard]] TxnAdmission admitTxnBatch(int64_t producerId, int16_t epoch, uint64_t& nextReqId,
+                                             bool canRequest = true) noexcept {
+        using K = TxnAdmission::Kind;
+        if (tracker_.firstOffsetOf(producerId) >= 0) [[likely]] return {};
+        TxnVerifySet::Entry* e = verify_.find(producerId);
+        if (e != nullptr && e->epoch == epoch) {
+            switch (e->state) {
+            case TxnVerifySet::State::Verified: return {};
+            case TxnVerifySet::State::Pending:  return {K::Retry, 0, 0};
+            case TxnVerifySet::State::Rejected: {
+                const int16_t code = e->code;
+                verify_.erase(producerId);
+                return {K::Refuse, code, 0};
+            }
+            }
+        }
+        // An OLDER epoch (a zombie of a producer that re-initialised) never supersedes a
+        // live verification: fenced against a Verified entry, retried against a Pending
+        // one (its answer decides; no second ask).  Only a Rejected entry is replaced.
+        if (e != nullptr && epoch < e->epoch && e->state != TxnVerifySet::State::Rejected) [[unlikely]] {
+            if (e->state == TxnVerifySet::State::Verified) return {K::Refuse, kVerifyProducerFenced, 0};
+            return {K::Retry, 0, 0};
+        }
+        if (!canRequest) [[unlikely]] { ++verifyFull_; return {K::Retry, 0, 0}; }
+        if (e == nullptr) e = verify_.insert(producerId);
+        if (e == nullptr) [[unlikely]] { ++verifyFull_; return {K::Retry, 0, 0}; }
+        // A new producer, or a new epoch superseding the entry's: (re)verify.
+        e->epoch = epoch;
+        e->state = TxnVerifySet::State::Pending;
+        e->code  = 0;
+        e->reqId = ++nextReqId;
+        ++verifyRequests_;
+        return {K::RequestVerify, 0, e->reqId};
+    }
+    /// The coordinator's answer to request `reqId`.  Applies only to the Pending entry
+    /// it was issued for: 0 → Verified; a retriable code → the entry is dropped (the
+    /// client's retry verifies again); a refusal (fenced, wrong epoch, not in an
+    /// ongoing transaction, ...) → Rejected{code}.
+    void onVerifyAnswer(int64_t producerId, int16_t epoch, uint64_t reqId, int16_t code) noexcept {
+        TxnVerifySet::Entry* e = verify_.find(producerId);
+        if (e == nullptr || e->state != TxnVerifySet::State::Pending || e->reqId != reqId || e->epoch != epoch) {
+            ++verifyStaleAnswers_;
+            return;
+        }
+        if (code == 0) { e->state = TxnVerifySet::State::Verified; return; }
+        if (verifyRetriable(code)) { verify_.erase(producerId); return; }
+        e->state = TxnVerifySet::State::Rejected;
+        e->code  = code;
+    }
+    /// Client error codes a verification answer may carry that mean "ask again"
+    /// (the coordinator cannot answer now); every other non-zero code is a refusal.
+    [[nodiscard]] static constexpr bool verifyRetriable(int16_t code) noexcept {
+        return code == kVerifyNotLeader || code == kVerifyNotCoordinator || code == kVerifyConcurrentTxns ||
+               code == kVerifyInternal;
+    }
+    static constexpr int16_t kVerifyNotLeader      = 2;    ///< pc::ErrorCode::NotLeader
+    static constexpr int16_t kVerifyInternal       = 6;    ///< pc::ErrorCode::Internal
+    static constexpr int16_t kVerifyNotCoordinator = 14;   ///< pc::ErrorCode::NotCoordinator
+    static constexpr int16_t kVerifyConcurrentTxns = 27;   ///< pc::ErrorCode::ConcurrentTransactions
+    static constexpr int16_t kVerifyProducerFenced = 18;   ///< pc::ErrorCode::ProducerFenced
+    [[nodiscard]] const TxnVerifySet& verifySet() const noexcept { return verify_; }
+    [[nodiscard]] uint64_t verifyRequests() const noexcept { return verifyRequests_; }
+    [[nodiscard]] uint64_t verifyStaleAnswers() const noexcept { return verifyStaleAnswers_; }
+    [[nodiscard]] uint64_t verifyFull() const noexcept { return verifyFull_; }
 
     // ---- D3b: the cleaner's LSO bound ---------------------------------------
     /// The first unstable offset the LogCleanerAgent must not clean at/after
@@ -447,6 +649,7 @@ private:
         tracker_.clear();   // N4: both indexes
         aborted_.clear();
         tail_.clear();
+        verify_.clear();    // #112: a new leadership verifies anew (its open txns come from the log)
         st_ = Unbuilt{};
     }
     void applyMarker_(int64_t producerId, int64_t offset, bool commit) {
@@ -792,6 +995,10 @@ private:
     rune::transaction::LsoTracker      tracker_;
     int64_t cleanerLsoPublished_ = std::numeric_limits<int64_t>::min();   ///< D3b: last value published
     rune::transaction::AbortedTxnIndex aborted_;
+    TxnVerifySet                       verify_;           ///< #112: per-producer registration verification
+    uint64_t                           verifyRequests_     = 0;
+    uint64_t                           verifyStaleAnswers_ = 0;
+    uint64_t                           verifyFull_         = 0;
     std::vector<TailEvent>             tail_;
     FixedPidSet                        ringMarkedPids_;   ///< E2 finding B: pass-local, fixed capacity
 #if defined(__APPLE__)

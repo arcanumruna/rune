@@ -1077,6 +1077,9 @@ public:
     /// N-e: the backoff before a retriable error (MinIsrViolation) is re-sent
     /// (Kafka retry.backoff.ms default), capped by produceTimeoutMs.
     static constexpr int64_t kRetriableBackoffNs = 100'000'000LL;
+    /// Issue #112: the first backoff before a batch answered ConcurrentTransactions (27) — the leader is verifying
+    /// the partition's transaction registration — is re-sent; it doubles per attempt up to kRetriableBackoffNs.
+    static constexpr int64_t kTxnVerifyBackoffNs = 250'000LL;
     /// E2 final fix wave (M3), kept from the transactional producer: a batch answered TransientLogFull (42) is
     /// re-offered after this much DUTY-CLOCK time (capped by produceTimeoutMs) - never a cycle count.
     static constexpr int64_t kTransientLogFullBackoffNs = kRetriableBackoffNs;
