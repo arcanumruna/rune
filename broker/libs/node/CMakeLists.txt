@@ -1773,7 +1773,15 @@ if(BUILD_TESTING)
                                    ${CMAKE_BINARY_DIR}/rune-client/claim-gen)
         target_link_libraries(rune_client_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_client_broker_tests PROPERTIES TIMEOUT 600)
+        # The two login-timing measurements (the 5 ms median gate and the #136 first-leg parity) are latency gates:
+        # RUN_SERIAL + LABELS latency (CLAUDE.md §3: they run on an idle host, stage b of scripts/run-regression.sh); the
+        # rest of the binary is functional and runs in parallel.
+        set(RUNE_CLIENT_BROKER_LATENCY_TESTS
+            "AuthGatesRegression.FullScramLoginMedianUnder5msRegression:AuthGatesRegression.FirstLegTimingDoesNotRevealUserExistenceRegression")
+        gtest_discover_tests(rune_client_broker_tests TEST_FILTER "${RUNE_CLIENT_BROKER_LATENCY_TESTS}"
+                             PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE LABELS latency)
+        gtest_discover_tests(rune_client_broker_tests TEST_FILTER "-${RUNE_CLIENT_BROKER_LATENCY_TESTS}"
+                             PROPERTIES TIMEOUT 600)
 
         # Authentication Task 11: the SCRAM login in the session handshake against ONE real authenticating broker
         # (raw frames: AuthWireClient + the rune-crypto SCRAM client).
