@@ -113,6 +113,17 @@ public:
         b_.noteLoginOk();
         return sid;
     }
+    /// Issue #138: the broker's gateway no longer holds session `sid` within `within` (a bounded poll of the control
+    /// thread's session table).  A ping cannot tell this: the gateway answers nothing to a dead session's ping, and a
+    /// timed-out ping looks the same.
+    bool awaitSessionGone(int64_t sid, std::chrono::milliseconds within = std::chrono::seconds(5)) {
+        const auto deadline = Clock::now() + within;
+        for (;;) {
+            if (!b_.node().gatewayHasSessionForTest(sid)) return true;
+            if (Clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
     /// A new user with exactly `g`; returns its logged-in session.  `name` (optional) receives the user name.
     int64_t newUser(const std::vector<AuthGrant>& g, std::string* name = nullptr) {
         const std::string n = "u" + std::to_string(++seq_);

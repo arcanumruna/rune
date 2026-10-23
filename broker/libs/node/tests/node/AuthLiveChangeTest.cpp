@@ -223,8 +223,7 @@ TEST(AuthLiveChangeRegression, DisableRevokesEnableAllowsLogin) {
     EXPECT_EQ(t.errorOn(sub.corr), kRevoked) << "the live subscription completes SessionRevoked";
     EXPECT_EQ(t.errorOn(0, s), kRevoked) << "then the session-level frame";
     EXPECT_EQ(t.errorTextOn(0, s), "user disabled");
-    // The session is gone: a request on it is dropped as an unknown session (this gateway never answers those).
-    EXPECT_FALSE(t.r.c().pingError(t.ch(), t.r.stream(), s, AuthRig::dl(1)).has_value());
+    EXPECT_TRUE(t.r.awaitSessionGone(s)) << "#138: the gateway ended the session";
     const int64_t s2 = t.r.wire().connect(t.ch());
     ASSERT_GT(s2, 0);
     EXPECT_EQ(t.r.wire().login(t.ch(), s2, name, {AuthRig::kPw, AuthRig::kPw}).errorCode(), 44) << "login while disabled";
