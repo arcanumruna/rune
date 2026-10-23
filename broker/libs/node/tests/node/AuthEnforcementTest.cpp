@@ -116,6 +116,49 @@ TEST(AuthEnforcementRegression, AnotherPrincipalsMemberIdIsRefusedOnEveryGroupRe
     EXPECT_NE(r.heartbeatAt(u1, "g", member, gen), kUnknownMember) << "u1 still owns its member (now rebalancing)";
 }
 
+// Issue #276: SyncGroup needs READ on the group (D18), like every other group request - READ on the topic alone does
+// not hand out a member's assignment, whosever member id the request names.  RED: delete the SyncGroup case of
+// ClientGateway::denyGroupRequest_ (the request reaches the coordinator: UnknownMember / OK, never 45).
+TEST(AuthEnforcementRegression, SyncGroupIsDeniedWithoutGroupReadRegression) {
+    AuthRig r;
+    const int64_t may = r.newUser({exact(SO::Read, ST::Group, "cg276"), exact(SO::Read, ST::Topic, "orders")});
+    const int64_t topicOnly = r.newUser({exact(SO::Read, ST::Topic, "orders")});
+    const int64_t otherGroup = r.newUser({exact(SO::Read, ST::Group, "cg-other"), exact(SO::Read, ST::Topic, "orders")});
+    const auto [member, gen] = r.joinStable(may, "cg276", {r.orders});
+    ASSERT_FALSE(member.empty());
+    EXPECT_EQ(r.syncGroup(topicOnly, "cg276", member, gen), kNotAuthorized) << "topic READ is not group READ";
+    EXPECT_EQ(r.syncGroup(topicOnly, "cg276", "nobody", gen), kNotAuthorized) << "denied before any member lookup";
+    EXPECT_EQ(r.syncGroup(otherGroup, "cg276", member, gen), kNotAuthorized) << "READ on another group";
+    EXPECT_EQ(r.syncGroup(may, "cg276", member, gen), kOk) << "the owner with group READ is served";
+}
+
+// Issue #276 (X036 over an authenticated wire): a client-built CONTROL batch (a forged COMMIT/ABORT marker) is refused
+// InvalidRequest even for a principal holding WRITE on the topic, and nothing is appended - the next ordinary batch
+// lands at the offset right after the previous one.  RED: delete the refusesClientBatches check in
+// ClientGateway::handleProduce (the marker is appended: answer 0, and the next batch's offset moves by 2).
+TEST(AuthEnforcementRegression, AClientControlBatchIsRefusedForAnAuthorizedWriterRegression) {
+    AuthRig r;
+    const int64_t w = r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    ASSERT_EQ(r.produce(w, r.orders, /*untilOk=*/true), kOk);
+    auto produceBatch = [&](const std::vector<uint8_t>& batch) -> std::pair<int, int64_t> {
+        const int64_t corr = r.c().nextCorrelationId();
+        if (!r.c().produce(r.ch(), r.stream(), w, corr, r.orders, 0, 1, batch)) return {kNoAnswer, -1};
+        const auto a = r.c().awaitProduceResponseUntil(corr, AuthRig::dl());
+        return a ? std::pair<int, int64_t>{a->errorCode, a->baseOffset} : std::pair<int, int64_t>{kNoAnswer, -1};
+    };
+    const auto first = produceBatch(makeBatch(1));
+    ASSERT_EQ(first.first, kOk);
+    rune::protocol::RecordBatchBuilder ctl(0, 1000);
+    ctl.setControl(true);
+    ctl.setProducerId(7); ctl.setProducerEpoch(0); ctl.setBaseSequence(0);
+    ctl.append("", "", 1000);
+    EXPECT_EQ(produceBatch(ctl.build()).first, static_cast<int>(pc::ErrorCode::InvalidRequest))
+        << "a client never writes a control batch, whatever its grants";
+    const auto next = produceBatch(makeBatch(1));
+    ASSERT_EQ(next.first, kOk);
+    EXPECT_EQ(next.second, first.second + 1) << "the refused control batch was appended";
+}
+
 TEST(AuthEnforcementRegression, TransactionRowsAllowedAndDenied) {
     AuthRig r;
     // Issue #125 correction (not a weakening): TxnOffsetCommit needs READ on every listed topic, exactly as
