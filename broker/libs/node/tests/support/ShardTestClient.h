@@ -732,6 +732,13 @@ public:
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
     }
     /// The subscriptionId a SubscribeResponse on `corr` carried (nullopt: none seen yet).
+    /// Issue #188: whether any SubscribeResponse OK this client received carried `subId` (a Record of any other id is a
+    /// subscription the client was never told exists).
+    bool knowsSubscriptionId(int64_t subId) const {
+        for (const auto& [corr, id] : subscribeIds_)
+            if (id == subId) if (const auto c = subscribes_.find(corr); c != subscribes_.end() && c->second == 0) return true;
+        return false;
+    }
     std::optional<int64_t> subscriptionIdOf(int64_t corr) const {
         if (auto it = subscribeIds_.find(corr); it != subscribeIds_.end()) return it->second;
         return std::nullopt;

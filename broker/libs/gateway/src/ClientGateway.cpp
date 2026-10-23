@@ -4547,7 +4547,7 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
 // to the MDC fallback so a subscribe is never wedged forever.
 void ClientGateway::pollPendingRecordEgress_(int64_t nowNs)
 {
-    if (pendingRecordEgress_.empty()) return;
+    if (pendingRecordEgress_.empty() || holdRecordEgressResolve_) return;
     for (auto it = pendingRecordEgress_.begin(); it != pendingRecordEgress_.end(); ) {
         const int64_t sessionId = it->first.first;
         const int32_t workerId  = it->first.second;

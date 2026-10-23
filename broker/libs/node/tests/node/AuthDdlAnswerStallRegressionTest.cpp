@@ -174,3 +174,55 @@ void subscribeRacingRevokeStaysEnded(bool shard, const char* tag) {
 
 TEST(AuthDdlAnswerStallRegression, SubscribeRacingRevokeStaysEndedShard) { subscribeRacingRevokeStaysEnded(true, "racesh"); }
 TEST(AuthDdlAnswerStallRegression, SubscribeRacingRevokeStaysEndedGateway) { subscribeRacingRevokeStaysEnded(false, "racegw"); }
+
+namespace {
+// Issue #188: a Subscribe still AwaitingEgress (the gateway's record-egress resolve is HELD) is ended by a REVOKE READ; once
+// the hold is released, that subscription must never deliver a Record, whatever its offset (a zombie replays from 0, below
+// any log-end bound).  Gateway mode has no worker record egress to wait for: the Subscribe is served at once, so there the
+// check is that nothing arrives after the end (also with new records produced).
+void endedSubscriptionNeverPushesAgain(bool shard, const char* tag) {
+    AuthBroker::Options o; o.shard = shard;
+    AuthRig rig(tag, o);
+    Async a{rig};
+    auto& c = rig.c();
+    const int64_t ws = rig.newUser({exact(SO::Write, ST::Topic, "orders")});
+    for (int i = 0; i < 3; ++i) ASSERT_EQ(rig.produce(ws, rig.orders, i == 0), 0);
+    std::string reader;
+    const int64_t rs = rig.newUser({exact(SO::Read, ST::Topic, "orders")}, &reader);
+    const std::size_t recordsBefore = c.records().size();
+    rig.broker().node().holdRecordEgressResolveForTest(true);
+    const int64_t corr = c.sendSubscribe(rig.ch(), rig.stream(), rs, rig.orders, 0);
+    ASSERT_NE(corr, 0);
+    c.pollFor(100ms, [] { return false; });
+    if (shard) EXPECT_FALSE(c.subscriptionIdOf(corr).has_value()) << "the Subscribe OK waits for the held record egress";
+    pc::SecurityDdl m; m.kind = pc::SecurityOpKind::Revoke; m.name = reader; m.granteeKind = 0;
+    m.op = static_cast<uint8_t>(SO::Read); m.resourceType = static_cast<uint8_t>(ST::Topic);
+    m.patternKind = static_cast<uint8_t>(SP::Exact); m.pattern = "orders";
+    const int64_t rc = a.send(m, "REVOKE ...;");
+    ASSERT_EQ(a.answer(rc), 0);
+    rig.broker().node().holdRecordEgressResolveForTest(false);
+    const auto code = c.awaitSubscribeCode(corr, AuthRig::dl());
+    ASSERT_TRUE(code.has_value()) << "the Subscribe was answered";
+    c.pollFor(200ms, [] { return false; });
+    const int64_t subId = c.subscriptionIdOf(corr).value_or(0);
+    const auto delivered = [&] {   // no other subscription lives on `c`: with no sub id, every new Record counts
+        std::size_t n = 0;
+        for (std::size_t i = recordsBefore; i < c.records().size(); ++i) n += (subId == 0 || c.records()[i].subscriptionId == subId) ? 1 : 0;
+        return n;
+    };
+    const std::size_t atEnd = delivered();
+    if (shard) EXPECT_EQ(atEnd, 0u) << "the subscription never reached a worker, yet delivered (subscribe answered " << *code << ")";
+    for (int i = 0; i < 3; ++i) ASSERT_EQ(rig.produce(ws, rig.orders), 0);
+    c.pollFor(400ms, [] { return false; });
+    EXPECT_EQ(delivered(), atEnd) << "the revoked subscription (subscribe answered " << *code << ", sub id " << subId
+                                  << ") delivered records after its end";
+}
+}  // namespace
+
+TEST(AuthStressRegression, EndedSubscriptionNeverPushesAgainRegression) {
+    for (const bool shard : {true, false}) {
+        SCOPED_TRACE(shard ? "shard" : "gateway");
+        endedSubscriptionNeverPushesAgain(shard, shard ? "nevsh" : "nevgw");
+        if (HasFatalFailure()) return;
+    }
+}

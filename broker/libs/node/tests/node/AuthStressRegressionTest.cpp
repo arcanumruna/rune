@@ -6,7 +6,9 @@
 // Invariants: (1) no OK without the model allowing it at SOME instant of [request sent, answer seen] - the changes are
 // applied in log order, so the instants are the prefix states [answered-before-send, sent-before-answer]; (2) every
 // change that (per the model) takes READ from a live subscription ends it with NotAuthorized / SessionRevoked within
-// 1 s of the change's answer (also when the revoke RACED the Subscribe), with no Record at or above the log end seen at the end; (3) every request is answered within 5 s; (4) convergence: with all
+// 1 s of the change's answer (also when the revoke RACED the Subscribe - forced once per seed by holding the gateway's
+// record-egress resolve, issue #5), and no Record at all for it 200 ms after its end is seen, whatever the offset (issue
+// #188); (3) every request is answered within 5 s; (4) convergence: with all
 // changes answered, a probe of every session x topic answers exactly what the model says.
 // RUNE_AUTH_STRESS_SEEDS / RUNE_AUTH_STRESS_STEPS override the 64 seeds x 300 steps.  A failure prints the seed and the
 // step list.
@@ -94,8 +96,10 @@ struct Tally {
     uint64_t recordsChecked = 0, endedSubsChecked = 0;                    // "no Records after the end"
     uint64_t probes = 0, shardDeniedProbes = 0, routedDeniedProbes = 0, shardOkProbes = 0, routedOkProbes = 0;
     uint64_t sessionsProbed = 0, disabledLoginsRefused = 0, disabledUsersAtEnd = 0, epochsChecked = 0;
+    uint64_t forcedRaces = 0, forcedRaceEnded = 0, endedSubsSilent = 0;   // issues #5 / #188
     void add(const Tally& o) {
-        disabledUsersAtEnd += o.disabledUsersAtEnd;
+        disabledUsersAtEnd += o.disabledUsersAtEnd; forcedRaces += o.forcedRaces; forcedRaceEnded += o.forcedRaceEnded;
+        endedSubsSilent += o.endedSubsSilent;
         shardOk += o.shardOk; routedOk += o.routedOk; subOk += o.subOk; createOk += o.createOk; mustEndMet += o.mustEndMet;
         mustEndRacing += o.mustEndRacing; recordsChecked += o.recordsChecked; endedSubsChecked += o.endedSubsChecked;
         probes += o.probes; shardDeniedProbes += o.shardDeniedProbes; routedDeniedProbes += o.routedDeniedProbes;
@@ -108,7 +112,8 @@ struct Tally {
           << " mustEndMet=" << mustEndMet << " (racing " << mustEndRacing << ") endedSubs=" << endedSubsChecked
           << " records=" << recordsChecked << " probes=" << probes << " (shard denied " << shardDeniedProbes << ", routed denied "
           << routedDeniedProbes << ", shard ok " << shardOkProbes << ", routed ok " << routedOkProbes << ") sessions=" << sessionsProbed
-          << " disabledLoginsRefused=" << disabledLoginsRefused << "/" << disabledUsersAtEnd << " epochs=" << epochsChecked;
+          << " disabledLoginsRefused=" << disabledLoginsRefused << "/" << disabledUsersAtEnd << " epochs=" << epochsChecked
+          << " forcedRaces=" << forcedRaces << " forcedRaceEnded=" << forcedRaceEnded << " endedSubsSilent=" << endedSubsSilent;
         return o.str();
     }
 };
@@ -131,6 +136,10 @@ struct Sub {
     Clock::time_point deadline;  // MustEnd: the error is due (1 s after the answer of the change that took READ)
     Clock::time_point liveAt;    // when its SubscribeResponse OK was seen
     bool        racing = false;  // MustEnd found by the revoke-raced-the-Subscribe rule
+    bool        forced = false;  // the once-per-seed forced race (issue #5)
+    Clock::time_point endObservedAt;   // when its end (ErrorResponse 45/46) was seen
+    std::size_t pushesAtEnd = 0;       // its Records seen at endObservedAt + 200 ms: never grows afterwards (#188)
+    bool        settled = false;       // pushesAtEnd taken at endObservedAt + 200 ms
     int         endCode = 0;
     int64_t     bound = 0;       // the partition's log end when the end was seen: a Record at or above it is a violation
     std::size_t sentSteps = 0;
@@ -158,7 +167,9 @@ public:
         : rig_(rig), uw_(std::move(uw)), seed_(seed), steps_(steps), tally_(tally), rng_(static_cast<uint64_t>(seed) * 0x9E3779B97F4A7C15ull + 1) {}
 
     std::string run() {
+        for (AuthWireClient* w : uw_) recordsBase_.push_back(w->raw().records().size());
         setup_();
+        if (fail_.empty()) forcedRace_();
         for (std::size_t s = 0; s < static_cast<std::size_t>(steps_) && fail_.empty(); ++s) {
             step_ = s;
             pump_(2ms);
@@ -326,7 +337,13 @@ private:
                         s.subId = se.c->subscriptionIdOf(s.corr).value_or(0);
                         s.st = Sub::St::Live; s.estSent = hi; s.liveAt = now;
                         ++tally_.subOk;
-                    } else s.st = Sub::St::Ended;
+                    } else {
+                        s.st = Sub::St::Ended;
+                        if (s.forced) {   // the broker ends the forced race by answering the Subscribe itself (#5)
+                            if (*code != 45 && *code != 46) failWith_("forced race: Subscribe answered " + std::to_string(*code) + ", expected 45/46");
+                            ++tally_.forcedRaceEnded;
+                        }
+                    }
                 } else if (revokedFrame_(se)) { s.st = Sub::St::Ended; s.endCode = 46; s.bound = logEndBound_(s); }
                 else if (now - s.sentAt_ > 5s) failWith_("unanswered subscribe (step " + std::to_string(s.sentSteps) + ")");
             }
@@ -346,8 +363,11 @@ private:
                     s.endCode = errs[e].code;
                     if (s.st == Sub::St::MustEnd && s.endCode != 45 && s.endCode != 46)
                         failWith_("subscription on " + s.topic + " ended with code " + std::to_string(s.endCode) + ", expected 45/46");
-                    if (s.st == Sub::St::MustEnd) { ++tally_.mustEndMet; tally_.mustEndRacing += s.racing ? 1 : 0; }
+                    if (s.st == Sub::St::MustEnd) {
+                        ++tally_.mustEndMet; tally_.mustEndRacing += s.racing ? 1 : 0;
+                    }
                     s.st = Sub::St::Ended; s.bound = logEndBound_(s);
+                    s.endObservedAt = now; s.pushesAtEnd = pushes_(se, s.subId);
                     break;
                 }
                 if (s.st == Sub::St::MustEnd && now > s.deadline)
@@ -378,6 +398,68 @@ private:
         std::size_t n = 0;
         for (const auto& p : s.c->records()) n += p.subscriptionId == subId ? 1 : 0;
         return n;
+    }
+    /// Issue #188: an ended subscription (its ErrorResponse seen) delivers nothing once 200 ms have passed since its end,
+    /// whatever the offset (a zombie cursor replays from its start offset, below any log-end bound).
+    void checkEndedSilent_() {
+        const auto now = Clock::now();
+        for (Sub& s : subs_) {
+            if (s.st != Sub::St::Ended || s.subId == 0 || s.endCode == 0 || now < s.endObservedAt + 200ms) continue;
+            Sess& se = sess_[static_cast<std::size_t>(s.sess)];
+            const std::size_t n = pushes_(se, s.subId);
+            if (!s.settled) { s.pushesAtEnd = n; s.settled = true; ++tally_.endedSubsSilent; continue; }
+            if (n > s.pushesAtEnd)
+                failWith_("ENDED SUBSCRIPTION PUSHED on " + s.topic + " of " + user_(se.user) + ": " + std::to_string(n - s.pushesAtEnd) +
+                          " Record(s) more than 200 ms after its ErrorResponse(" + std::to_string(s.endCode) + ") (sub of step " +
+                          std::to_string(s.sentSteps) + ")");
+        }
+    }
+    /// The session's subscriptions, for a failure message.
+    std::string subsOf_(std::size_t i) {
+        std::string o = "; its subscriptions:";
+        for (const Sub& x : subs_)
+            if (x.sess == static_cast<int>(i))
+                o += " {step " + std::to_string(x.sentSteps) + " " + x.topic + " corr " + std::to_string(x.corr) + " st " +
+                     std::to_string(static_cast<int>(x.st)) + " end " + std::to_string(x.endCode) + " id " + std::to_string(x.subId) +
+                     " idOf " + std::to_string(sess_[i].c->subscriptionIdOf(x.corr).value_or(0)) + " code " +
+                     std::to_string(sess_[i].c->awaitSubscribeCode(x.corr, Clock::now()).value_or(-1)) + "}";
+        o += "; session sid " + std::to_string(sess_[i].sid);
+        return o;
+    }
+    /// Issue #5: force the revoke-races-the-Subscribe path once per seed.  READ is granted (and answered), the gateway's
+    /// record-egress resolve is held so the Subscribe waits AwaitingEgress, REVOKE READ is sent and answered, then the
+    /// hold is released.  Both changes go through sendChange_, so the model's states stay exact.
+    void forcedRace_() {
+        const std::string t = topicNames_()[0];   // exists from setup (builder-created)
+        const int u = 0;
+        const auto awaitAnswered = [this](std::size_t idx) {
+            const auto end = Clock::now() + 6s;
+            while (!changes_[idx].answered && Clock::now() < end && fail_.empty()) pump_(2ms);
+            if (fail_.empty() && !changes_[idx].answered) failWith_("forced race: change #" + std::to_string(idx) + " unanswered");
+        };
+        pm::Change g; g.kind = pm::Change::Kind::Grant; g.who = user_(u); g.grant.op = pm::Op::Read; g.grant.text = t;
+        note_("forced race: DDL " + g.str());
+        sendChange_(g);
+        if (!fail_.empty()) return;
+        awaitAnswered(changes_.size() - 1);
+        if (!fail_.empty()) return;
+        std::size_t si = sess_.size();
+        for (std::size_t i = 0; i < sess_.size(); ++i) if (sess_[i].alive && sess_[i].user == u) { si = i; break; }
+        if (si == sess_.size()) { failWith_("forced race: no live session of " + user_(u)); return; }
+        Sess& se = sess_[si];
+        rig_.broker().node().holdRecordEgressResolveForTest(true);
+        Sub sub; sub.sess = static_cast<int>(si); sub.topic = t; sub.topicId = exists_[t]; sub.forced = true;
+        sub.lo_ = answeredPrefix_(); sub.sentAt_ = Clock::now(); sub.sentSteps = step_;
+        sub.corr = se.c->sendSubscribe(rig_.ch(), AuthRig::stream(), se.sid, sub.topicId, 0);
+        note_("forced race: subscribe " + t + " as " + user_(u) + "/" + std::to_string(si) + " (egress resolve held)");
+        if (sub.corr == 0) { rig_.broker().node().holdRecordEgressResolveForTest(false); failWith_("subscribe send"); return; }
+        subs_.push_back(sub);
+        pm::Change r; r.kind = pm::Change::Kind::Revoke; r.who = user_(u); r.grant = g.grant;
+        note_("forced race: DDL " + r.str());
+        sendChange_(r);
+        if (fail_.empty()) awaitAnswered(changes_.size() - 1);
+        rig_.broker().node().holdRecordEgressResolveForTest(false);
+        ++tally_.forcedRaces;
     }
 
     // ── steps ──
@@ -536,6 +618,7 @@ private:
     }
     void check_() {
         observe_();
+        checkEndedSilent_();
         // a disabled user's sessions are dead the moment the DISABLE is answered
         for (const Pending& c : changes_)
             if (c.answered && c.c.kind == pm::Change::Kind::Disable && c.code == 0)
@@ -569,6 +652,29 @@ private:
             }
         }
         if (!fail_.empty()) return;
+        // #188: every ended subscription is watched past its end + 200 ms, then for a further 200 ms
+        {
+            Clock::time_point lastEnd{};
+            for (const Sub& s : subs_) if (s.st == Sub::St::Ended && s.subId != 0 && s.endCode != 0) lastEnd = std::max(lastEnd, s.endObservedAt);
+            const auto quiet = lastEnd + 200ms;
+            while (Clock::now() < quiet && fail_.empty()) { pump_(5ms); checkEndedSilent_(); }
+            const auto watch = Clock::now() + 200ms;
+            while (Clock::now() < watch && fail_.empty()) { pump_(5ms); checkEndedSilent_(); }
+            checkEndedSilent_();
+            if (!fail_.empty()) return;
+            // a subscription the client never learned an id for (its Subscribe was answered 45/46, e.g. the forced race)
+            // must never deliver either: every Record of this seed carries an id some Subscribe OK of the client named
+            // (a previous seed's subscription may still deliver its last in-flight Records after its teardown)
+            for (std::size_t i = 0; i < sess_.size(); ++i) {
+                const auto& recs = sess_[i].c->records();
+                for (std::size_t k = recordsBase_[i]; k < recs.size(); ++k)
+                    if (!sess_[i].c->knowsSubscriptionId(recs[k].subscriptionId)) {
+                        failWith_("ZOMBIE SUBSCRIPTION: session " + std::to_string(i) + " received a Record (offset " + std::to_string(recs[k].baseOffset) +
+                                  ") for subscription id " + std::to_string(recs[k].subscriptionId) + " it never got a Subscribe OK for" + subsOf_(i));
+                        return;
+                    }
+            }
+        }
         // no Records after the end of a subscription: nothing at or above the log end seen when it ended
         for (const Sub& s : subs_) {
             if (s.st != Sub::St::Ended || s.subId == 0 || s.endCode == 0) continue;
@@ -675,6 +781,7 @@ private:
     std::vector<Sess> sess_;
     std::vector<Req> reqs_;
     std::vector<Sub> subs_;
+    std::vector<std::size_t> recordsBase_;   // per wire client: its Records before this seed
     std::map<std::string, int32_t> exists_;
     std::set<std::string> creating_, unknown_;
     uint64_t reqCounter_ = 0;
@@ -717,6 +824,9 @@ TEST(AuthStressRegression, SeededRandomGrantRevokeTrafficHoldsEveryInvariant) {
     }
     // issue #189: every disabled user of every seed was probed and definitely refused (no sampling)
     EXPECT_EQ(tally.disabledLoginsRefused, tally.disabledUsersAtEnd);
+    // issue #5: every seed forced the revoke-races-the-Subscribe path, and every forced race ended
+    EXPECT_EQ(tally.forcedRaces, static_cast<uint64_t>(seeds));
+    EXPECT_EQ(tally.forcedRaceEnded, static_cast<uint64_t>(seeds));
 }
 
 // Issue #189, the deterministic shape: DISABLE, a probe that is definitely refused (AuthenticationFailed, no retry hint),
