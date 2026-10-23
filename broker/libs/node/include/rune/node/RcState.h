@@ -467,6 +467,13 @@ public:
             }
             }
         }
+        // An OLDER epoch (a zombie of a producer that re-initialised) never supersedes a
+        // live verification: fenced against a Verified entry, retried against a Pending
+        // one (its answer decides; no second ask).  Only a Rejected entry is replaced.
+        if (e != nullptr && epoch < e->epoch && e->state != TxnVerifySet::State::Rejected) [[unlikely]] {
+            if (e->state == TxnVerifySet::State::Verified) return {K::Refuse, kVerifyProducerFenced, 0};
+            return {K::Retry, 0, 0};
+        }
         if (!canRequest) [[unlikely]] { ++verifyFull_; return {K::Retry, 0, 0}; }
         if (e == nullptr) e = verify_.insert(producerId);
         if (e == nullptr) [[unlikely]] { ++verifyFull_; return {K::Retry, 0, 0}; }
@@ -503,6 +510,7 @@ public:
     static constexpr int16_t kVerifyInternal       = 6;    ///< pc::ErrorCode::Internal
     static constexpr int16_t kVerifyNotCoordinator = 14;   ///< pc::ErrorCode::NotCoordinator
     static constexpr int16_t kVerifyConcurrentTxns = 27;   ///< pc::ErrorCode::ConcurrentTransactions
+    static constexpr int16_t kVerifyProducerFenced = 18;   ///< pc::ErrorCode::ProducerFenced
     [[nodiscard]] const TxnVerifySet& verifySet() const noexcept { return verify_; }
     [[nodiscard]] uint64_t verifyRequests() const noexcept { return verifyRequests_; }
     [[nodiscard]] uint64_t verifyStaleAnswers() const noexcept { return verifyStaleAnswers_; }
