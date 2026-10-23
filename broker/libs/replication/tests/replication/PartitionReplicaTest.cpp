@@ -5455,3 +5455,82 @@ TEST(CaughtUpWithLeaderRegression, AnEmptyAnswerAdvertisingAHwBeyondTheLogEndIsN
     f.applyReplicated(empty);            // and the next answer is empty at the new log end
     EXPECT_TRUE(f.caughtUpWithLeader());
 }
+
+// ===========================================================================
+// PR #601 adversarial review (#572): PartitionReplica::clearInternalFencing - the call every NON-consensus-leader
+// makes on each internal partition it still leads.  Attacks: a fenced member that is DEAD must never be re-admitted
+// by the clear (it never proved a validated position since it was fenced - `validated` stays false); a fenced member
+// that is LIVE and caught up re-enters through the normal validated expansion; the clear is idempotent (no new
+// proposal) and a no-op on a follower.  Mutations (each turns a case red): the clear marking slots validated (dead
+// member re-admitted), the clear left a no-op (live member fenced forever), the clear re-proposing on every call.
+// ===========================================================================
+TEST(InternalIsrRegression, ClearInternalFencingNeverReadmitsAStaleMemberAdversarialRegression) {
+    for (const bool gReturns : {false, true}) {
+        SCOPED_TRACE(gReturns ? "fenced member returns caught up" : "fenced member stays dead");
+        TempDir lDir("cif_L"), fDir("cif_F"), gDir("cif_G");
+        rune::storage::Log lLog(lDir.path), fLog(fDir.path), gLog(gDir.path);
+        InMemoryTransport transport;
+        constexpr NodeId kL = 1, kF = 2, kG = 3;
+        std::vector<NodeId> all = {kL, kF, kG};
+        auto cfgFor = [&](NodeId id) {
+            PartitionConfig c = makeConfig(id, /*lagMs=*/60'000, /*lagOff=*/1'000'000);   // no lag shrink here
+            c.topicId = -3;
+            return c;
+        };
+        InternalIsrKnowledge kl, kf, kg;
+        PartitionReplica l(cfgFor(kL), Role::Follower, 0, all, all, &lLog, &transport);
+        PartitionReplica f(cfgFor(kF), Role::Follower, 0, all, all, &fLog, &transport);
+        PartitionReplica g(cfgFor(kG), Role::Follower, 0, all, all, &gLog, &transport);
+        l.setInternalIsrKnowledge(&kl); f.setInternalIsrKnowledge(&kf); g.setInternalIsrKnowledge(&kg);
+        l.becomeLeader(1, all);
+        f.becomeFollower(1, kL);
+        g.becomeFollower(1, kL);
+        transport.setLeader(&l);
+        transport.addFollower(kF, &f);
+        transport.addFollower(kG, &g);
+        ASSERT_GE(l.append(makePayload(1)), 0);
+        int64_t clock = 0;
+        auto pump = [&](int steps, bool withG) {
+            for (int i = 0; i < steps; ++i) {
+                clock += 1'000'000LL;
+                l.doWork(clock); f.doWork(clock);
+                if (withG) g.doWork(clock);
+                transport.pump(clock);
+            }
+        };
+        auto settled = [&] { return !l.isrProposalPendingForTest() && !l.internalSeedPendingForTest(); };
+        for (int i = 0; i < 300 && !(settled() && l.isr().size() == 3 && l.highWatermark() == 1); ++i) pump(1, true);
+        ASSERT_TRUE(settled() && l.isr().size() == 3) << "precondition: {L,F,G} committed";
+
+        // The consensus leader (this node) fences G (it sees only L and F live) and G dies.
+        transport.removeFollower(kG);
+        const int32_t live[] = {kL, kF};
+        l.shrinkIsrToLive(std::span<const int32_t>(live, 2), clock);
+        for (int i = 0; i < 300 && !(settled() && l.isr().size() == 2); ++i) pump(1, false);
+        ASSERT_TRUE(settled() && l.isr().size() == 2) << "precondition: the fenced {L,F} committed";
+        ASSERT_FALSE(kf.eligible(kG));
+
+        // Leadership moves on: this node is no longer consensus leader and clears its mask (twice: idempotent).
+        l.clearInternalFencing(clock);
+        EXPECT_FALSE(l.isrProposalPendingForTest()) << "clearing a mask over a dead member proposed a change";
+        l.clearInternalFencing(clock);
+        f.clearInternalFencing(clock);   // a follower: no-op
+        EXPECT_EQ(f.role(), Role::Follower);
+
+        ASSERT_GE(l.append(makePayload(2)), 0);
+        if (!gReturns) {
+            pump(200, false);
+            EXPECT_EQ(std::find(l.isr().begin(), l.isr().end(), kG), l.isr().end())
+                << "the clear re-admitted a dead member that never proved a validated position";
+            EXPECT_FALSE(kl.eligible(kG)) << "a dead, fenced member became electable through the clear";
+            EXPECT_FALSE(kf.eligible(kG));
+            EXPECT_EQ(l.highWatermark(), 2) << "the HW must advance on {L,F} without the dead member";
+        } else {
+            transport.addFollower(kG, &g);   // G returns (live, same log): it must re-enter once caught up
+            for (int i = 0; i < 500 && !(settled() && l.isr().size() == 3); ++i) pump(1, true);
+            EXPECT_EQ(l.isr().size(), 3u) << "a live, caught-up member stayed fenced after the clear";
+            EXPECT_TRUE(kf.eligible(kG)) << "the majority's knowledge never re-admitted the returned member";
+            EXPECT_EQ(l.highWatermark(), 2);
+        }
+    }
+}

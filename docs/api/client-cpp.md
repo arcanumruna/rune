@@ -179,7 +179,9 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
   - `Leader` (the default, like Kafka `acks=1`): acknowledged once the partition leader has the record. If the leader
     restarts or is lost before its followers replicate the record, an **acknowledged record can be lost**.
   - `All`: acknowledged once the in-sync replicas hold the record and the ISR has at least `minIsr` members
-    (`RUNE_MIN_ISR`). An acknowledged record survives any single broker failure while `minIsr` holds.
+    (`RUNE_MIN_ISR`; the default is the cluster majority, 2 on a 3-node cluster). With `minIsr` at least 2, an
+    acknowledged record survives the loss of any single broker. With `minIsr` 1 (a single node, or
+    `RUNE_MIN_ISR=1`) an ISR shrunk to the leader alone still acknowledges, so one broker failure can lose it.
 
   Use `Acks::All` whenever a record must not be lost.
 - **`Key`**: up to 16 inline bytes, built from a `uint64_t`/`int64_t`, a trivially-copyable value or a byte span. The key

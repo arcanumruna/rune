@@ -110,8 +110,9 @@ tp.commitTransactionAndWait();                            // outputs and offsets
 
 Durability of an acknowledged record depends on the ack level. `Acks::Leader` (the default, like Kafka `acks=1`)
 acknowledges once the partition leader has the record: a leader restart or loss before the followers replicate it can
-lose acknowledged records. `Acks::All` waits until the in-sync replicas hold it with at least `minIsr` of them, so an
-acknowledged record survives any single broker failure while `minIsr` holds. Use `Acks::All` for durability.
+lose acknowledged records. `Acks::All` waits until the in-sync replicas hold it with at least `minIsr` of them
+(`RUNE_MIN_ISR`, default the cluster majority), so with `minIsr` at least 2 an acknowledged record survives the loss
+of any single broker. Use `Acks::All` for durability.
 
 ## Catalog DDL and history
 
