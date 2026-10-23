@@ -79,7 +79,7 @@ std::vector<std::vector<uint8_t>> buildLog() {
             break;
         }
         case 3: {
-            rc::ViewDef v; v.viewTopicId = s.nextTopicId(); v.keyField = "id"; v.sourceNames = {name};
+            rc::ViewDef v; v.viewTopicId = s.nextTopicId(); v.sinkPartitions = 4; v.keyField = "id"; v.sourceNames = {name};   // mirrors the source (#143)
             v.normalizedPlanBlob = {1, 0, 0, 0, 0}; v.compiledPlanBlob = {2}; v.outputDescriptorBlob = viewOut;
             emit(rc::CreateViewOps{std::move(v)}, view, s.nextObjectId(), 0);
             break;

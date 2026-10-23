@@ -166,7 +166,7 @@ TEST(CatalogApplyV1Regression, DropAndReuseGetsANewObjectIdAndTopicId) {
 TEST(CatalogApplyV1Regression, DropTopicReadByAViewIsRefused) {
     rc::CatalogState s;
     ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "src", 1, 0, 1), 0));
-    rc::ViewDef v; v.viewTopicId = 1; v.keyField = "id"; v.sourceNames = {"src"};
+    rc::ViewDef v; v.viewTopicId = 1; v.sinkPartitions = 2; v.keyField = "id"; v.sourceNames = {"src"};   // src has 2 (#143)
     v.outputDescriptorBlob = blob2(); v.normalizedPlanBlob = {1};
     ASSERT_TRUE(rc::apply(s, stamped(s, rc::CreateViewOps{v}, "v", 2, 0, 1), 1));
     rc::CatalogEvent e; e.kind = rc::EventKind::DropTopic; e.ops = rc::DropTopicOps{0};
@@ -179,7 +179,7 @@ TEST(CatalogApplyV1Regression, DropTopicReadByAViewIsRefused) {
 TEST(CatalogApplyV1Regression, AlterViewTakesAFreshSinkAndReportsBoth) {
     rc::CatalogState s;
     ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "src", 1, 0, 1), 0));
-    rc::ViewDef v; v.viewTopicId = 1; v.keyField = "id"; v.sourceNames = {"src"};
+    rc::ViewDef v; v.viewTopicId = 1; v.sinkPartitions = 2; v.keyField = "id"; v.sourceNames = {"src"};   // src has 2 (#143)
     v.outputDescriptorBlob = blob2(); v.normalizedPlanBlob = {1};
     ASSERT_TRUE(rc::apply(s, stamped(s, rc::CreateViewOps{v}, "v", 2, 0, 1), 1));
     rc::ViewDef v2 = v; v2.viewTopicId = 2; v2.normalizedPlanBlob = {2};
@@ -240,8 +240,9 @@ TEST(CatalogApplyV1Regression, FingerprintCoversEveryDefinitionField) {
 // ── every rule refuses each invalid precondition explicitly ──────────────────────────
 namespace {
 /// src (typed, obj 1, topic 0), u (untyped, obj 2, topic 1), v (view over src, obj 3, sink 2).
-rc::ViewDef viewOver(std::vector<std::string> sources, int32_t sink) {
-    rc::ViewDef v; v.viewTopicId = sink; v.keyField = "id"; v.sourceNames = std::move(sources);
+/// #143: a sink mirrors its FIRST source's partition count (createOps' topics have 2).
+rc::ViewDef viewOver(std::vector<std::string> sources, int32_t sink, int32_t sinkPartitions = 2) {
+    rc::ViewDef v; v.viewTopicId = sink; v.sinkPartitions = sinkPartitions; v.keyField = "id"; v.sourceNames = std::move(sources);
     v.outputDescriptorBlob = blob2(); v.normalizedPlanBlob = {1};
     return v;
 }
@@ -751,5 +752,74 @@ TEST(CatalogApplyV1Regression, ConfigEnumBoundsAreOneDefinitionForEventValidatio
             accepted += configOk ? 1 : 0;
         }
         EXPECT_EQ(accepted, f == F::Durability ? 2 : 3) << "field " << static_cast<int>(f);
+    }
+}
+
+// ── #143: a view sink mirrors its (first) source's partition count, checked at apply ─────────────────
+// AdminWorker writes def.sinkPartitions = the first source's partitions and partition counts are immutable, so a
+// mismatch comes only from a crafted or foreign catalog.  The verified apply refuses it (CreateView and AlterView;
+// sink < source and sink > source; with two sources only the FIRST counts).  Each refused event carries the
+// fingerprint of the object it would create, so without the rule it would apply cleanly.
+namespace {
+struct SinkCase {
+    const char* what;
+    bool        alter;                     // AlterView of v (else CreateView "x")
+    std::vector<std::string> sources;
+    int32_t     sinkPartitions;
+    bool        refused;
+};
+}  // namespace
+
+TEST(CatalogApplyRegression, AViewSinkWhosePartitionCountDiffersFromItsSourceIsRefusedRegression) {
+    const std::vector<SinkCase> cases = {
+        {"create: sink < source",                   false, {"src"},       1, true},
+        {"create: sink > source",                   false, {"src"},       3, true},
+        {"create: sink == source",                  false, {"src"},       2, false},
+        {"create: two sources, sink = the 2nd's",   false, {"src", "w4"}, 4, true},
+        {"create: two sources, sink = the 1st's",   false, {"src", "w4"}, 2, false},
+        {"create: first source has 4",              false, {"w4", "src"}, 2, true},
+        {"create: first source has 4, sink 4",      false, {"w4", "src"}, 4, false},
+        {"alter: sink < source",                    true,  {"src"},       1, true},
+        {"alter: sink > source",                    true,  {"src"},       3, true},
+        {"alter: sink == source",                   true,  {"src"},       2, false},
+        {"alter: two sources, sink = the 2nd's",    true,  {"src", "w4"}, 4, true},
+        {"alter: re-source onto w4 keeping 2",      true,  {"w4"},        2, true},
+        {"alter: re-source onto w4 with 4",         true,  {"w4"},        4, false},
+    };
+    for (const SinkCase& c : cases) {
+        rc::CatalogState s = fixture();                                   // src, u (2 partitions), v over src (sink 2)
+        rc::CreateTopicOps w4 = createOps(3, false);
+        w4.partitions = 4;
+        ASSERT_TRUE(rc::apply(s, stamped(s, w4, "w4", 4, 0, 1), 3)) << c.what;
+        const uint64_t before = s.digest();
+        const rc::ViewDef def = viewOver(c.sources, /*sink=*/4, c.sinkPartitions);   // nextTopicId is 4
+        rc::CatalogEvent e;
+        rc::ViewObject result;
+        if (c.alter) {
+            e = raw(rc::AlterViewOps{def}, "v", 3, 1, 2);
+            result = rc::ViewObject{.objectId = 3, .name = "v", .version = 2, .def = def};
+        } else {
+            e = raw(rc::CreateViewOps{def}, "x", 5, 0, 1);
+            result = rc::ViewObject{.objectId = 5, .name = "x", .version = 1, .def = def};
+        }
+        e.fingerprint = rc::fingerprintOf(result);
+        const std::string first = c.sources.front();
+        const int32_t sourceParts = s.topicByName(first)->partitions;
+        auto a = rc::apply(s, e, 4);
+        if (!c.refused) {
+            EXPECT_TRUE(a.has_value()) << c.what << ": " << (a ? "" : a.error().detail);
+            continue;
+        }
+        if (a.has_value()) { ADD_FAILURE() << c.what << ": a sink of " << c.sinkPartitions << " over '" << first
+                                           << "' (" << sourceParts << ") was applied"; continue; }
+        EXPECT_EQ(a.error().code, rc::ApplyError::Code::Precondition) << c.what << ": " << a.error().detail;
+        EXPECT_EQ(a.error().offset, 4) << c.what;
+        const std::string& d = a.error().detail;
+        EXPECT_NE(d.find(c.alter ? "'v'" : "'x'"), std::string::npos) << c.what << ": names the view: " << d;
+        EXPECT_NE(d.find("sink partitions " + std::to_string(c.sinkPartitions)), std::string::npos) << c.what << ": " << d;
+        EXPECT_NE(d.find("source '" + first + "' has " + std::to_string(sourceParts)), std::string::npos) << c.what << ": " << d;
+        EXPECT_EQ(s.digest(), before) << c.what << ": a refused event changes nothing";
+        auto p = rc::previewFingerprint(s, e);
+        EXPECT_FALSE(p.has_value()) << c.what << ": previewFingerprint agrees with apply";
     }
 }

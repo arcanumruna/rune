@@ -19,6 +19,7 @@
 #include <rune/node/ViewRegistry.h>
 
 #include <rune/catalog/CatalogEvent.h>
+#include <rune/catalog/CatalogFingerprint.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
 #include <rune/protocol/RecordBatch.h>
@@ -35,6 +36,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include <sys/stat.h>
@@ -222,6 +224,41 @@ TEST(CatalogApplierRegression, ApplyRefusalHaltsAtItsOffsetRegression) {
     EXPECT_EQ(rig.rec.appliedOffsets, (std::vector<int64_t>{0}));
     EXPECT_EQ(std::count(rig.rec.sequence.begin(), rig.rec.sequence.end(), "topicApplied:0"), 1)
         << "the refused event posted no effect";
+}
+
+// #143: a view sink mirrors its first source's partition count; the verified apply (ApplyV1) refuses a CreateView whose
+// sinkPartitions differs, so a crafted / foreign catalog halts the applier LOUDLY at that event's offset - never a view
+// that GetViewRow would later find inconsistent.  The crafted event is golden offset 9 (CreateView top_players over
+// players, 8 partitions) with a 3-partition sink, fingerprinted as the object it would create: without the rule it
+// would apply cleanly.
+TEST(CatalogApplierRegression, ASinkWithAMismatchedPartitionCountHaltsTheApplierRegression) {
+    CatalogRig rig("ap_sink_parts");
+    rig.appendEvents(0, 9);                              // golden 0..8: players (8 partitions), events, presence, ...
+    cat::CatalogEvent bad = rig.golden().at(9);
+    ASSERT_EQ(bad.kind, cat::EventKind::CreateView);
+    auto& ops = std::get<cat::CreateViewOps>(bad.ops);
+    ASSERT_EQ(ops.view.sourceNames.front(), "players");
+    ops.view.sinkPartitions = 3;
+    bad.fingerprint = cat::fingerprintOf(cat::ViewObject{.objectId = bad.objectId, .name = bad.objectName,
+                                                         .version = bad.newVersion, .def = ops.view});
+    rig.appendEventCommitted(bad);                        // offset 9
+    rig.appendEvents(9, 10);                              // offset 10: the golden (valid) CreateView behind it
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 9);
+    ASSERT_TRUE(rig.applier.halted());
+    EXPECT_EQ(rig.applier.stateName(), "Halted");
+    ASSERT_EQ(rig.rec.halts.size(), 1u);
+    EXPECT_EQ(rig.rec.halts[0].offset, 9);
+    EXPECT_EQ(rig.rec.halts[0].code, cat::ApplyError::Code::Precondition);
+    EXPECT_NE(rig.rec.halts[0].detail.find("sink partitions 3"), std::string::npos) << rig.rec.halts[0].detail;
+    EXPECT_NE(rig.rec.halts[0].detail.find("source 'players' has 8"), std::string::npos) << rig.rec.halts[0].detail;
+    ASSERT_NE(rig.applier.haltError(), nullptr);
+    EXPECT_EQ(rig.applier.haltError()->offset, 9);
+    EXPECT_EQ(rig.rec.appliedOffsets, (std::vector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8})) << "never skipped past";
+    EXPECT_EQ(rig.views.byName("top_players"), nullptr) << "the view is never installed";
+    EXPECT_TRUE(rig.rec.liveViewInstalls.empty());
+    for (const std::string& fx : rig.rec.sequence)
+        EXPECT_EQ(fx.rfind("sinkApplied:", 0), std::string::npos) << "no sink effect was posted: " << fx;
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 0) << "halted: no further apply, ever";
 }
 
 // Fix round 1 (M5): the crash points are SIMULATED, not inferred.
@@ -452,7 +489,7 @@ TEST(CatalogApplierRegression, ProductionSinkEncodesEveryEffectOnTheAdminToContr
     ASSERT_TRUE(decodeCatalogTopicApplied(frames[24].bytes.data(), frames[24].bytes.size(), sink));
     EXPECT_EQ(sink.topicId, 3);
     EXPECT_EQ(sink.name, "top_players");
-    EXPECT_EQ(sink.partitions, 2);
+    EXPECT_EQ(sink.partitions, 8) << "#143: the sink mirrors players' 8 partitions";
     EXPECT_EQ(sink.replicationFactor, 0) << "a view sink lives on every broker";
     EXPECT_EQ(sink.config.cleanupPolicy, 1) << "a view sink is a keyed, compacted table";
     EXPECT_EQ(sink.config.partitionKey, "id");
