@@ -90,6 +90,7 @@ coord::GroupCoordinator& GroupCoordinationService::coordinator(const GroupId& gr
         return it->second;
     }
     // Cold path: insert new GroupCoordinator.  One allocation; never in steady state.
+    if (coordinators_.empty()) groupsTerm_ = currentTerm_();   // #570: the first group fixes the groups' term
     auto [inserted, ok] = coordinators_.emplace(
         std::piecewise_construct,
         std::forward_as_tuple(groupId),
@@ -216,7 +217,8 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
     // #565: a node that is not the coordinator holds no group: its in-memory groups are stale (heartbeats now go to
     // the new coordinator) and ageing them would expire members, bump generations and send revoke frames.  Unload
     // them, Kafka-style; a regained role rebuilds each group by re-join (group membership is never persisted).
-    if (!coordinators_.empty() && !isLocalCoordinator()) return work + unloadGroups_();
+    work += syncTerm_();   // #570: a role lost and regained between two cycles still changed the term
+    if (!coordinators_.empty() && !isLocalCoordinator()) return work + unloadGroups_("not the group coordinator");
 
     if (coordinators_.empty()) return work;
 
@@ -225,6 +227,7 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
     for (auto& [groupId, coord] : coordinators_) {
         const coord::GroupState stateBefore = coord.state();
 
+        refreshRebalanceTimeout_(coord);   // #499: a departed long-timeout member stops counting
         const int w = coord.doWork(nowNs);
         work += w;
         drainDeparted_(groupId, coord);   // #124: expired / timed-out members lose their binding
@@ -308,6 +311,27 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
                     }
                 }
             }
+        }
+    }
+
+    // #214: an Empty group holds nothing worth keeping (membership is never persisted; its committed offsets live in
+    // the offsets store; its departed members' bindings were drained above): drop it, with its per-group state.  A
+    // departed member's late request is answered UnknownMember (no group), exactly as for a member-less one.  Cold.
+    for (auto it = coordinators_.begin(); it != coordinators_.end();) {
+        const coord::GroupCoordinator& gc = it->second;
+        if (gc.isEmpty() && gc.state() == coord::GroupState::Empty && !gc.hasDeparted()) {
+            pruneGroupLineageState_(it->first);
+            if (!filterMismatchRefusals_.empty()) {
+                const std::string& g = it->first;
+                std::erase_if(filterMismatchRefusals_, [&](const auto& e) {
+                    return e.first.size() > g.size() && e.first.compare(0, g.size(), g) == 0 && e.first[g.size()] == '\x1f';
+                });
+            }
+            it = coordinators_.erase(it);
+            ++groupsPruned_;
+            ++work;
+        } else {
+            ++it;
         }
     }
     return work;
@@ -396,7 +420,23 @@ void GroupCoordinationService::recordGenLineages_(const GroupId& groupId, const 
 // stale deliveries); no Assign frame is sent - a member learns NotCoordinator on its next request and re-discovers
 // the coordinator.  Parked commits, transactional offsets in flight and the offsets store are left alone (they keep
 // their own NotCoordinator handling).  Cold: once per lost role.
-int GroupCoordinationService::unloadGroups_() {
+// #499: the rebalance window is the largest session timeout among the CURRENT members (each already clamped into the
+// coordinator's bounds).  A member-less group keeps its value (nothing to wait for).  O(members), no allocation.
+void GroupCoordinationService::refreshRebalanceTimeout_(coord::GroupCoordinator& gc) noexcept {
+    int32_t maxMs = 0;
+    for (const auto& m : gc.members()) maxMs = std::max(maxMs, m.sessionTimeoutMs);
+    if (maxMs > 0) gc.setRebalanceTimeoutMs(maxMs);
+}
+
+// #570: the groups belong to the term they were loaded under.  A role lost and regained between two duty cycles is
+// never sampled as lost, but the term moved: unload exactly as on a lost role (members re-join the new term).
+int GroupCoordinationService::syncTerm_() {
+    if (!coordinators_.empty() && currentTerm_() != groupsTerm_)
+        return unloadGroups_("the coordinator term changed since the groups were loaded");
+    return 0;
+}
+
+int GroupCoordinationService::unloadGroups_(const char* why) {
     if (gateway_) {
         int64_t last = -1;
         for (const auto& [key, binding] : memberSessionMap_) {
@@ -409,7 +449,7 @@ int GroupCoordinationService::unloadGroups_() {
     for (const auto& [groupId, coord] : coordinators_) pruneGroupLineageState_(groupId);
     const auto n = coordinators_.size();
     coordinators_.clear();
-    spdlog::info("GroupCoordinationService: not the group coordinator — unloaded {} group(s) (#565)", n);
+    spdlog::info("GroupCoordinationService: {} — unloaded {} group(s) (#565 / #570)", why, n);
     return static_cast<int>(n);
 }
 
@@ -565,6 +605,7 @@ size_t GroupCoordinationService::handleJoinGroup(
         resp.memberId      = std::span<const uint8_t>();
         return resp.encode(out);
     }
+    (void)syncTerm_();   // #570
 
     // CG routing round 3 (MAJOR-2): a member below client version 3 relies on
     // the coordinator-created subscriptions this broker no longer makes (and
@@ -591,8 +632,6 @@ size_t GroupCoordinationService::handleJoinGroup(
         }
     }
 
-    coord::GroupCoordinator& gc = coordinator(groupIdStr);   // only creates the group
-
     // Phase 2c (spec 13.3): one filter per group, fixed by the first member, changeable once the group is empty.
     // The session's version is the one the frame was decoded with: an older member carries no filter.
     const int32_t ver = clientVersion;
@@ -615,15 +654,13 @@ size_t GroupCoordinationService::handleJoinGroup(
         const std::size_t n = resp.encodeFor(out, ver, outCap);
         return n != 0 ? n : resp.encode(out);
     };
+
     // The same cap the Subscribe filter path enforces (CompiledFilter::compile): no group is fixed to bytes every
-    // Subscribe would refuse.
+    // Subscribe would refuse.  #214 review: checked before the group is created - a refused join never holds a
+    // group slot (not even until the next duty cycle).
     if (filter.size() > rune::codec::kMaxFilterBytes) {
         return refuseJoin("group filter too large: " + std::to_string(filter.size()) + " bytes, at most " +
                           std::to_string(rune::codec::kMaxFilterBytes));
-    }
-    if (!gc.admitFilter(filter)) {
-        noteFilterMismatch_(groupIdStr, msg.sessionId);
-        return refuseJoin(groupFilterMismatchDetail(gc.filterBytes()));
     }
 
     // Collect subscribedTopicIds → topic names.
@@ -632,7 +669,8 @@ size_t GroupCoordinationService::handleJoinGroup(
     // is amortized (only grows on first large-subscribe, cold path).
     joinTopicsScratch_.clear();
     for (const int32_t tid : msg.subscribedTopicIds) {
-        // #19: a view sink is in the registry but holds no partitions to consume: refuse, never an empty assignment.
+        // #19: a view sink is in the registry but holds no partitions to consume: refuse, never an empty assignment
+        // (#214 review: before the group is created).
         if (topics_ != nullptr && topics_->isViewSink(tid)) {
             return refuseJoin("topic id " + std::to_string(tid) +
                               " is a view sink: it holds no records to consume; read the view with the view read API");
@@ -642,6 +680,23 @@ size_t GroupCoordinationService::handleJoinGroup(
             joinTopicsScratch_.push_back(std::move(name));
         }
         // Unknown topicId silently ignored (Assignor ignores topics not in partCounts).
+    }
+
+    // #214: the number of coordinated groups is bounded.  Only a join that would CREATE a group is refused (never one
+    // to an existing group); empty groups are dropped by doWork, so the room comes back as groups empty.
+    if (coordinators_.size() >= static_cast<std::size_t>(maxGroups_) &&
+        coordinators_.find(groupIdStr) == coordinators_.end()) [[unlikely]] {
+        const uint64_t n = ++joinsRefusedGroupCap_;
+        if ((n & (n - 1)) == 0)
+            spdlog::warn("GroupCoordinationService: JoinGroup for new group '{}' refused - this broker coordinates its "
+                         "maximum of {} consumer groups (RUNE_GROUP_MAX_GROUPS) (refusal #{})", groupIdStr, maxGroups_, n);
+        return refuseJoin("this broker coordinates its maximum of " + std::to_string(maxGroups_) +
+                          " consumer groups; retry after a group empties or raise RUNE_GROUP_MAX_GROUPS");
+    }
+    coord::GroupCoordinator& gc = coordinator(groupIdStr);   // only creates the group
+    if (!gc.admitFilter(filter)) {
+        noteFilterMismatch_(groupIdStr, msg.sessionId);
+        return refuseJoin(groupFilterMismatchDetail(gc.filterBytes()));
     }
 
     // Issues #123 / #124: a non-empty member id is a RE-JOIN only when it is bound to this session's principal (the
@@ -655,15 +710,18 @@ size_t GroupCoordinationService::handleJoinGroup(
         if (b == nullptr || b->principal != principal || !gc.hasMember(memberIdStr)) memberIdScratch_.clear();
     }
 
-    // Set rebalance timeout from the member's sessionTimeout (or a sane default).  #213: the request is CLAMPED to the
-    // coordinator's maximum (Kafka: group.max.session.timeout.ms) - the value is also the group's rebalance timeout,
-    // so an unbounded one would let one member stall every rebalance and outlive its death for weeks.
-    // The 30 s default for an absent (<= 0) value is clamped too: a maximum below it is still the maximum.
-    const int32_t sessionMs = std::min(msg.sessionTimeoutMs > 0 ? msg.sessionTimeoutMs : 30'000, maxSessionTimeoutMs_);
-    if (msg.sessionTimeoutMs > sessionMs) [[unlikely]]
-        spdlog::debug("GroupCoordinationService: JoinGroup sessionTimeoutMs {} clamped to {} (group max)",
-                      msg.sessionTimeoutMs, sessionMs);
-    gc.setRebalanceTimeoutMs(sessionMs);
+    // The member's session timeout (or a sane default), CLAMPED into [min, max] (Kafka: group.min / group.max
+    // .session.timeout.ms).  #213: an unbounded one would let one member stall every rebalance and outlive its death
+    // for weeks.  #499: a tiny one is raised to the minimum, and the group's rebalance timeout is the LARGEST current
+    // member's (refreshRebalanceTimeout_ after the join), never the last joiner's - one 1 ms joiner no longer
+    // collapses the window and evicts every other member.  The 30 s default for an absent (<= 0) value is clamped too.
+    // A minimum above the maximum: the maximum is the bound (NodeConfig refuses that configuration).
+    const int32_t sessionLo = std::min(minSessionTimeoutMs_, maxSessionTimeoutMs_);
+    const int32_t sessionMs = std::clamp(msg.sessionTimeoutMs > 0 ? msg.sessionTimeoutMs : 30'000, sessionLo,
+                                         maxSessionTimeoutMs_);
+    if (msg.sessionTimeoutMs > 0 && msg.sessionTimeoutMs != sessionMs) [[unlikely]]
+        spdlog::debug("GroupCoordinationService: JoinGroup sessionTimeoutMs {} clamped to {} (group bounds [{}, {}])",
+                      msg.sessionTimeoutMs, sessionMs, sessionLo, maxSessionTimeoutMs_);
 
     // CG-4: capture state BEFORE join so we can detect a Stable→PreparingRebalance
     // transition triggered directly by gc.join() (new member arriving while Stable).
@@ -689,6 +747,7 @@ size_t GroupCoordinationService::handleJoinGroup(
                                    sessionMs,
                                    joinTopicsScratch_,
                                    nowNs);
+    refreshRebalanceTimeout_(gc);   // #499: the largest current member's session timeout
 
     // CG-4: if the join triggered a Stable→PreparingRebalance transition, eagerly
     // revoke all group push subscriptions and send empty Assign (revoke) frames.
@@ -789,6 +848,7 @@ size_t GroupCoordinationService::handleSyncGroup(
         resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
         return resp.encode(out, {});
     }
+    (void)syncTerm_();   // #570
 
     // Fetch the coordinator (if it doesn't exist the member is unknown).
     auto it = coordinators_.find(groupIdStr);
@@ -897,6 +957,7 @@ size_t GroupCoordinationService::handleHeartbeat(
         resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
         return resp.encode(out);
     }
+    (void)syncTerm_();   // #570
 
     auto it = coordinators_.find(groupIdStr);
     if (it == coordinators_.end()) {
@@ -951,6 +1012,7 @@ size_t GroupCoordinationService::handleLeaveGroup(
         resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
         return resp.encode(out);
     }
+    (void)syncTerm_();   // #570
 
     pc::LeaveGroupResponse resp;
     resp.sessionId     = msg.sessionId;
@@ -1269,6 +1331,7 @@ size_t GroupCoordinationService::handleOffsetCommit(
         resp.correlationId = msg.correlationId;
         return resp.encode(out, std::span<const pc::OffsetCommitResult>(commitResultScratch_));
     }
+    (void)syncTerm_();   // #570
 
     // Member + generation fence (issues #124 / #169, Kafka parity): the commit is honoured only for a CURRENT member
     // of the group, bound to THIS session, at the group's generation.  Generations restart with the coordinator, so
@@ -1613,10 +1676,10 @@ size_t GroupCoordinationService::handleOffsetFetch(
         // Bound-check BEFORE writing each result so a large fetch-all never
         // overruns a fixed scratch buffer.  Results that would exceed outCap
         // are silently dropped (the response is capped but never overruns).
+        // #498: an unstable key (#471: its record is above the high watermark) is listed with the retriable code and
+        // no offset - exactly what a specific fetch answers - and every stable key with its offset; steady commits on
+        // one key never starve the listing of the others.  An unstable value is never served.
         const auto all = offsets_->fetchAll(groupIdStr);
-        for (const auto& [tp, co] : all) {
-            if (isUnstable(co)) [[unlikely]] return answerRetriableSentinel();   // #471
-        }
         for (const auto& [tp, co] : all) {
             // Bound-check before each push.
             const std::size_t needed =
@@ -1646,6 +1709,9 @@ size_t GroupCoordinationService::handleOffsetFetch(
                 ++pendingLineageAnswers_;
                 r.offset    = -1;
                 r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            } else if (isUnstable(co)) [[unlikely]] {   // #471 / #498: not committed yet - retriable, never its value
+                r.offset    = -1;
+                r.errorCode = unstableFor_(msg.sessionId);
             }
             fetchResultScratch_.push_back(r);
         }
@@ -1880,6 +1946,7 @@ rune::protocol::client::ErrorCode GroupCoordinationService::checkTxnOffsetMember
 {
     using EC = rune::protocol::client::ErrorCode;
     if (!isLocalCoordinator()) return EC::NotCoordinator;
+    (void)syncTerm_();   // #570
     const auto it = coordinators_.find(group);
     const bool memberOk = it != coordinators_.end() && ownsMember_(group, memberId, sessionId) &&
                           it->second.hasMember(memberId);

@@ -9,7 +9,8 @@
 //
 // ## Responsibilities
 //
-//   - Per-group GroupCoordinator lifecycle: lazy get-or-create on first Join.
+//   - Per-group GroupCoordinator lifecycle: lazy get-or-create on first Join (at most maxGroups(); dropped by
+//     doWork once Empty - #214).
 //   - doWork(nowNs): drives every GroupCoordinator::doWork; on
 //     CompletingRebalance-transition → autoAssignAndSync; returns work count.
 //   - CG-4: on Stable: for each member, seed push subscriptions (one per
@@ -214,6 +215,16 @@ public:
     // Unpushed (-1): the callable is used (service-only tests).
     void setLocalLeadership(bool leader) noexcept { localLeader_ = leader ? 1 : 0; }
 
+    // #570: the coordinator term (the cluster leadership term) the loaded groups belong to.  A leadership lost and
+    // regained between two duty cycles is invisible to the isLocalCoordinator() sample, but it always changes the
+    // term: doWork and every membership handler unload the groups when the term moved since they were loaded
+    // (Kafka: a new coordinator epoch rebuilds its groups; members re-join).  No fn: the term never changes (rigs).
+    // Cold setter; control thread.  Once a term is pushed (setCoordinatorTerm) the fn is never called again.
+    void setCoordinatorTermFn(std::function<int64_t()> fn) { termFn_ = std::move(fn); }
+    // #570 review: this duty cycle's coordinator term, pushed as a VALUE by NodeRuntimeAgent (same thread, right after
+    // consensus, next to setLocalLeadership) - doWork never calls a std::function per cycle (fix 2 / B1 precedent).
+    void setCoordinatorTerm(int64_t term) noexcept { pushedTerm_ = term; termPushed_ = true; }
+
     // -----------------------------------------------------------------------
     // coordinatorFor — returns the cluster-leader nodeId for any group.
     // v1 seam (Milestone-D: will map groupId → owning node).
@@ -390,6 +401,13 @@ private:
     void sendDeferred_(int64_t sessionId, const uint8_t* frame, std::size_t n);
     using ClientVersionFn = int32_t (*)(void* ctx, int64_t sessionId) noexcept;
     int32_t         maxSessionTimeoutMs_ = kDefaultMaxSessionTimeoutMs;
+    int32_t         minSessionTimeoutMs_ = kDefaultMinSessionTimeoutMs;   // #499
+    /// #499: the group's rebalance timeout is the LARGEST session timeout among its current members (Kafka: the max
+    /// rebalance timeout), never the last joiner's.  O(members), no allocation.
+    static void refreshRebalanceTimeout_(rune::coordination::GroupCoordinator& gc) noexcept;
+    int32_t         maxGroups_           = kDefaultMaxGroups;   // #214
+    uint64_t        joinsRefusedGroupCap_ = 0;
+    uint64_t        groupsPruned_         = 0;
     ClientVersionFn clientVersionFn_  = nullptr;
     void*           clientVersionCtx_ = nullptr;
 public:
@@ -400,10 +418,28 @@ public:
     /// A non-positive maximum is no maximum: it keeps the default (never a 0 ms session for every member).
     void setMaxSessionTimeoutMs(int32_t ms) noexcept { maxSessionTimeoutMs_ = ms > 0 ? ms : kDefaultMaxSessionTimeoutMs; }
     [[nodiscard]] int32_t maxSessionTimeoutMs() const noexcept { return maxSessionTimeoutMs_; }
+    /// #499: the lower bound on a JoinGroup's sessionTimeoutMs (Kafka's group.min.session.timeout.ms; 1 s here, not
+    /// Kafka's 6 s: rigs use 5 s sessions - operators raise it).  A smaller request is CLAMPED up to it.  If the
+    /// minimum exceeds the maximum the effective lower bound is the maximum (NodeConfig refuses min > max).
+    static constexpr int32_t kDefaultMinSessionTimeoutMs = 1'000;
+    /// A non-positive minimum keeps the default.
+    void setMinSessionTimeoutMs(int32_t ms) noexcept { minSessionTimeoutMs_ = ms > 0 ? ms : kDefaultMinSessionTimeoutMs; }
+    [[nodiscard]] int32_t minSessionTimeoutMs() const noexcept { return minSessionTimeoutMs_; }
     /// Test seam: resolve a session's client version without a gateway (-1 = unknown: treated as current).
     void setClientVersionResolverForTest(ClientVersionFn fn, void* ctx) noexcept {
         clientVersionFn_ = fn; clientVersionCtx_ = ctx;
     }
+    /// #214: at most this many consumer groups are coordinated at once (RUNE_GROUP_MAX_GROUPS).  A JoinGroup that would
+    /// create one more is refused (InvalidRequest with a detail; ProtocolVersion below 5); a join to an EXISTING group
+    /// is never refused by the cap.  An Empty group holds nothing worth keeping (membership is never persisted, its
+    /// committed offsets live in the offsets store) and is dropped on the next doWork.
+    static constexpr int32_t kDefaultMaxGroups = 10'000;
+    /// A non-positive maximum keeps the default.
+    void setMaxGroups(int32_t n) noexcept { maxGroups_ = n > 0 ? n : kDefaultMaxGroups; }
+    [[nodiscard]] int32_t maxGroups() const noexcept { return maxGroups_; }
+    /// #214: JoinGroups refused because the group cap was reached / empty groups dropped by doWork.
+    [[nodiscard]] uint64_t joinsRefusedGroupCap() const noexcept { return joinsRefusedGroupCap_; }
+    [[nodiscard]] uint64_t groupsPruned() const noexcept { return groupsPruned_; }
     [[nodiscard]] uint64_t parkRefusalsForTest() const noexcept { return parkRefusals_; }
     [[nodiscard]] uint64_t unstableAnswersForTest() const noexcept { return unstableAnswers_; }
 private:
@@ -502,7 +538,18 @@ private:
     /// #565: this node is not the group coordinator — drop every in-memory group (Kafka-style unload): end the
     /// members' group push subscriptions, forget the member bindings and per-group lineage state.  No Assign frame
     /// (a member learns NotCoordinator on its next request).  Returns the number of groups unloaded.
-    int unloadGroups_();
+    int unloadGroups_(const char* why);
+    /// #570: the current coordinator term (0 without a term fn).
+    [[nodiscard]] int64_t currentTerm_() const {
+        if (termPushed_) [[likely]] return pushedTerm_;
+        return termFn_ ? termFn_() : 0;
+    }
+    /// #570: unload the groups when they were loaded under another term.  Returns the number unloaded.
+    int syncTerm_();
+    std::function<int64_t()> termFn_;
+    int64_t                  groupsTerm_ = 0;   ///< the term coordinators_ was (re)populated under
+    int64_t                  pushedTerm_ = 0;   ///< see setCoordinatorTerm()
+    bool                     termPushed_ = false;
 public:
     [[nodiscard]] std::size_t groupCountForTest() const noexcept { return coordinators_.size(); }
     [[nodiscard]] std::size_t pendingLineageChecksForTest() const noexcept { return pendingChecks_.size(); }

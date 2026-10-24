@@ -297,7 +297,11 @@ private:
         if (selfId_ >= 0) {
             const bool leader = isLocalLeader_();
             if (gateway_)      gateway_->setLocalLeadership(leader);
-            if (groupService_) groupService_->setLocalLeadership(leader);   // fix 2 (B1)
+            if (groupService_) {
+                groupService_->setLocalLeadership(leader);   // fix 2 (B1)
+                // #570 review: the coordinator term as a value too (never a per-cycle std::function).
+                if (election_) groupService_->setCoordinatorTerm(static_cast<int64_t>(election_->leadershipTermId()));
+            }
             if (txnService_)   txnService_->setLocalLeadership(leader);     // fix 2 (B1)
         }
         // Issue #122: bound producer ids only once every member supports them (the committed feature level).
