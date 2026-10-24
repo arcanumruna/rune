@@ -5,6 +5,8 @@
 
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/LogSafe.h>
+#include <rune/metadata/ShardRouter.h>
+#include <rune/node/WorkerPool.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -2055,4 +2057,127 @@ TEST(AuthLogRegression, LogSafeNameEscapesEveryNonPrintableByteRegression) {
         }
     }
     EXPECT_EQ(fmt::format("u={}!", LogSafeName{std::string_view("a b\\\x7f", 5)}), "u=a\\x20b\\x5c\\x7f!");
+}
+
+// ── Issue #236: one source host may hold at most N unauthenticated sessions ────────────────────────────────────────
+namespace {
+/// A real Connect through handleConnect + pollPendingConnects (a test gateway's reply publication is a placeholder;
+/// the TestEgressFn takes the ConnectResponse).  The source host of a test gateway is its reply endpoint's host.
+struct ConnectOutcome { int16_t code = -1; int64_t sid = 0; };
+ConnectOutcome connectFrom(Rig& rig, const std::string& host, int64_t now = 0) {
+    pc::ConnectRequest req;
+    req.correlationId = ++rig.corr; req.egressStreamId = 9; req.clientVersion = pc::kClientVersionAuth;
+    const std::string channel = "aeron:udp?endpoint=" + host + ":40123";
+    req.egressChannel = channel;
+    std::vector<uint8_t> f(1024);
+    f.resize(req.encode(f.data()));
+    rig.gw.setNowNsForTest(now);
+    rig.send(f);
+    rig.gw.pollPendingConnectsForTest(now);
+    ConnectOutcome o;
+    for (auto it = rig.seen.rbegin(); it != rig.seen.rend(); ++it) {
+        if (it->tid != static_cast<uint16_t>(pc::TemplateId::ConnectResponse) || it->corr != req.correlationId) continue;
+        const auto r = pc::ConnectResponse::decode(it->bytes.data(), it->bytes.size());
+        if (r) { o.code = r->code; o.sid = r->sessionId; }
+        break;
+    }
+    return o;
+}
+/// Logs `sid` (a Connect-created session) in as `user`; the final's error code (-1: no final).
+int loginOn(Rig& rig, int64_t sid, const std::string& user, const std::string& pw) {
+    const std::string nonce = "cap-" + std::to_string(++rig.corr);
+    pc::AuthClientFirst cf;
+    cf.sessionId = sid; cf.correlationId = ++rig.corr; cf.username = user; cf.clientNonce = nonce;
+    std::vector<uint8_t> b(cf.encodedSize()); b.resize(cf.encode(b.data()));
+    rig.send(b);
+    const Frame* sf = rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFirst), sid);
+    if (sf == nullptr) return -1;
+    const auto first = pc::AuthServerFirst::decode(sf->bytes.data(), sf->bytes.size());
+    auto ans = scramAnswer(user, nonce, *first, {pw, ""}, sid, cf.correlationId);
+    std::vector<uint8_t> fb(ans->final.encodedSize()); fb.resize(ans->final.encode(fb.data()));
+    rig.send(fb);
+    const auto fin = lastFinal(rig, sid);
+    return fin ? fin->errorCode : -1;
+}
+constexpr int16_t kConnectAuthFailed = static_cast<int16_t>(pc::ErrorCode::AuthenticationFailed);
+}  // namespace
+
+TEST(UnauthSessionCapRegression, OneHostCannotHoldMoreThanTheCapOfUnauthenticatedSessionsRegression) {
+    Rig rig;
+    rig.gw.setMaxUnauthenticatedSessionsPerHost(4);
+    for (int i = 0; i < 4; ++i) {
+        const auto o = connectFrom(rig, "10.0.0.21");
+        ASSERT_EQ(o.code, 0) << i;
+        ASSERT_TRUE(rig.gw.hasSessionForTest(o.sid));
+        EXPECT_TRUE(std::holds_alternative<AuthAwaitingFirst>(*rig.gw.sessionAuthForTest(o.sid)));
+    }
+    const std::size_t sessions = rig.gw.sessionCount();
+    const auto refused = connectFrom(rig, "10.0.0.21");
+    EXPECT_EQ(refused.code, kConnectAuthFailed) << "the 5th unauthenticated session of one host is refused at once";
+    EXPECT_EQ(refused.sid, 0);
+    EXPECT_EQ(rig.gw.sessionCount(), sessions) << "a refused Connect creates no session";
+    EXPECT_EQ(rig.gw.pendingConnectCount(), 0u);
+    EXPECT_EQ(rig.gw.connectsRefusedUnauthenticatedCap(), 1u);
+    EXPECT_TRUE(rig.logContains("reason=unauthenticated-sessions-per-host cap=4"));
+    const auto other = connectFrom(rig, "10.0.0.22");
+    EXPECT_EQ(other.code, 0) << "another host is untouched";
+    EXPECT_TRUE(rig.gw.hasSessionForTest(other.sid));
+}
+
+TEST(UnauthSessionCapRegression, ALoggedInSessionFreesItsUnauthenticatedSlotRegression) {
+    Rig rig;
+    rig.gw.setMaxUnauthenticatedSessionsPerHost(2);
+    const auto a = connectFrom(rig, "10.0.0.31");
+    const auto b = connectFrom(rig, "10.0.0.31");
+    ASSERT_EQ(a.code, 0);
+    ASSERT_EQ(b.code, 0);
+    EXPECT_EQ(connectFrom(rig, "10.0.0.31").code, kConnectAuthFailed) << "at the cap";
+    ASSERT_EQ(loginOn(rig, a.sid, "ws1", kTestPasswordA), 0);
+    ASSERT_TRUE(std::holds_alternative<AuthAuthenticated>(*rig.gw.sessionAuthForTest(a.sid)));
+    const auto c = connectFrom(rig, "10.0.0.31");
+    EXPECT_EQ(c.code, 0) << "a logged-in session holds no unauthenticated slot";
+    EXPECT_EQ(connectFrom(rig, "10.0.0.31").code, kConnectAuthFailed);
+    EXPECT_EQ(rig.gw.connectsRefusedUnauthenticatedCap(), 2u);
+}
+
+TEST(UnauthSessionCapRegression, AReapedOrClosedSessionFreesItsSlotRegression) {
+    Rig rig;
+    rig.gw.setMaxUnauthenticatedSessionsPerHost(1);
+    const auto a = connectFrom(rig, "10.0.0.41");
+    ASSERT_EQ(a.code, 0);
+    EXPECT_EQ(connectFrom(rig, "10.0.0.41").code, kConnectAuthFailed);
+    rig.gw.reapExpiredForTest(1'000'000'001);   // past the 1 s auth deadline
+    ASSERT_FALSE(rig.gw.hasSessionForTest(a.sid));
+    const auto b = connectFrom(rig, "10.0.0.41", 1'000'000'002);
+    ASSERT_EQ(b.code, 0) << "a reaped session frees its slot";
+    EXPECT_EQ(connectFrom(rig, "10.0.0.41", 1'000'000'002).code, kConnectAuthFailed);
+    rig.send(disconnectFrame(b.sid, ++rig.corr));
+    ASSERT_FALSE(rig.gw.hasSessionForTest(b.sid));
+    EXPECT_EQ(connectFrom(rig, "10.0.0.41", 1'000'000'003).code, 0) << "a closed session frees its slot";
+}
+
+TEST(UnauthSessionCapRegression, TheDefaultCapIs64Regression) {
+    Rig rig;
+    EXPECT_EQ(ClientGateway::kDefaultMaxUnauthSessionsPerHost, 64u);
+    for (int i = 0; i < 64; ++i) ASSERT_EQ(connectFrom(rig, "10.0.0.51").code, 0) << i;
+    EXPECT_EQ(connectFrom(rig, "10.0.0.51").code, kConnectAuthFailed);
+    EXPECT_EQ(rig.gw.connectsRefusedUnauthenticatedCap(), 1u);
+}
+
+// Shard mode (the issue's case: kShardMaxSessions is one worker ack table): a host at the cap is refused before any
+// announcement, so the worker slots stay available to every other host.
+TEST(UnauthSessionCapRegression, ShardSlotsStayAvailableToOtherHostsRegression) {
+    Rig rig;
+    rune::node::WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16);
+    rig.gw.setWorkerPool(&pool);
+    rig.gw.setShardMode(true);
+    rig.gw.setMaxUnauthenticatedSessionsPerHost(2);
+    ASSERT_EQ(connectFrom(rig, "10.0.0.61").code, 0);
+    ASSERT_EQ(connectFrom(rig, "10.0.0.61").code, 0);
+    for (int i = 0; i < 8; ++i) EXPECT_EQ(connectFrom(rig, "10.0.0.61").code, kConnectAuthFailed) << i;
+    EXPECT_EQ(rig.gw.pendingConnectCount(), 0u) << "a refused Connect is never announced nor held";
+    const auto other = connectFrom(rig, "10.0.0.62");
+    EXPECT_EQ(other.code, 0);
+    EXPECT_TRUE(rig.gw.hasSessionForTest(other.sid));
+    EXPECT_EQ(rig.gw.connectsRefusedUnauthenticatedCap(), 8u);
 }

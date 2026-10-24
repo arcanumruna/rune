@@ -2139,8 +2139,21 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
         pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::InvalidRequest);
     if (refusedForVersion) [[unlikely]]
         pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::ProtocolVersion);   // wins over any other refusal
-    if (authMode_ == rune::gateway::GatewayAuthMode::Required && pc_entry.refuseCode == 0)
+    if (authMode_ == rune::gateway::GatewayAuthMode::Required && pc_entry.refuseCode == 0) {
         pc_entry.sourceHost = sourceHostOf_(pc_entry.egressChannel);   // D14: the throttle key (cold: one Connect)
+        // Issue #236: an unauthenticated session holds its slot until the auth deadline; one source host may hold at
+        // most maxUnauthPerHost_ of them (so it can never fill kShardMaxSessions).  A session that logged in, was
+        // reaped or closed no longer counts.  A redirect creates no session here and is never refused.
+        const bool redirect = !pc_entry.isLeader && !pc_entry.leaderClientEndpoint.empty();
+        if (!redirect && unauthSessionsOf_(pc_entry.sourceHost) >= maxUnauthPerHost_) [[unlikely]] {
+            pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed);   // answered, no session
+            ++connectsRefusedUnauthCap_;
+            if (unauthLog_.due(15)) [[unlikely]]
+                spdlog::warn("auth: connect refused source={} reason=unauthenticated-sessions-per-host cap={} "
+                             "(refused so far: {})", LogSafeName{pc_entry.sourceHost}, maxUnauthPerHost_,
+                             connectsRefusedUnauthCap_);
+        }
+    }
 
     // client<->broker TLS/AEAD (Task 7): drive the server-role handshake's
     // FIRST leg right here, synchronously, off the client's ClientHello
@@ -2264,6 +2277,14 @@ void ClientGateway::drainHandshakeOutbound_(PendingConnect& pending)
 // ---------------------------------------------------------------------------
 bool ClientGateway::registerConnectEgress_(PendingConnect& pending)
 {
+    if (testEgressFn_ && !aeron_) [[unlikely]] {
+        // Test gateways never reach Aeron (issue #236 tests drive real Connects): a placeholder reply publication,
+        // never dereferenced while testEgressFn_ intercepts every pre-session offer (offerOnPub_).
+        static unsigned char placeholder alignas(64)[512];
+        pending.resolvedPub = std::shared_ptr<aeron::ExclusivePublication>(
+            reinterpret_cast<aeron::ExclusivePublication*>(placeholder), [](aeron::ExclusivePublication*) {});
+        return true;
+    }
     try {
         // A10: sparse terms — the gateway runs on a worker thread in fused placement, where a non-sparse
         // term's tmpfs fallocate fails with EINTR while io_uring completions are pending (withSparseTerms).
@@ -2399,7 +2420,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         // Try to find the publication (non-blocking).
         std::shared_ptr<aeron::ExclusivePublication> pub;
         try {
-            pub = aeron_->findExclusivePublication(pending.registrationId);
+            if (aeron_) pub = aeron_->findExclusivePublication(pending.registrationId);   // test gateway: stashed pub
         } catch (...) {
             // ERRORED_MEDIA_DRIVER: conductor signalled an error (bad channel, etc.).
             // The conductor erased its own entry when throwing — no registration leak.
@@ -2563,7 +2584,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             encoded = resp.encode(scratch_.data());
         }
 
-        if (!sendOnPub(*pub, scratch_.data(), encoded)) {
+        if (!offerOnPub_(*pub, scratch_.data(), encoded)) {
             // Publication not yet Aeron-connected (UDP image not yet up) or
             // transient back-pressure.  Keep the PendingConnect alive
             // (resolvedPub is now stashed); retry next doWork() cycle.
@@ -8315,6 +8336,23 @@ rune::gateway::SessionAuth ClientGateway::newSessionAuth_(int64_t nowNs, int64_t
     using namespace rune::gateway;
     if (authMode_ != GatewayAuthMode::Required) return AuthAnonymous{};
     return AuthAwaitingFirst{nowNs + authTimeoutNs_, connectCorrelationId};
+}
+
+// Issue #236: the sessions `host` holds unauthenticated - AuthAwaitingFirst / AuthAwaitingFinal sessions that are not
+// Closing, plus pending Connects that will become one.  O(sessions + pending) per Connect: Connect is control-plane
+// and cold (never the produce / consume / query path).
+std::size_t ClientGateway::unauthSessionsOf_(std::string_view host)
+{
+    using namespace rune::gateway;
+    std::size_t n = 0;
+    sessions_.forEach([&](Session& s) {
+        if (!std::holds_alternative<AuthAwaitingFirst>(s.auth) && !std::holds_alternative<AuthAwaitingFinal>(s.auth)) return;
+        if (s.spill.state == SpillState::Closing) return;
+        if (s.sourceHost == host) ++n;
+    });
+    for (const PendingConnect& p : pendingConnects_)
+        if (p.refuseCode == 0 && !p.cryptoFailed && !(!p.isLeader && !p.leaderClientEndpoint.empty()) && p.sourceHost == host) ++n;
+    return n;
 }
 
 std::string ClientGateway::sourceHostOf_(std::string_view egressChannel) const
