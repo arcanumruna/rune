@@ -9,6 +9,12 @@
 // rings — shared-nothing; nothing here is read by another thread).
 //
 // Runs only for AuthMode::Enabled with more than one peer; InProcessUnauthenticated / DevDisabled build none.
+//
+// Issue #554, a handshake work budget: a Hello / HelloV2 is unauthenticated, yet answering one costs a cookie HMAC, an
+// X25519 base-point multiplication and the Challenge MAC on the CONTROL thread (which also runs consensus).  Each
+// duty cycle answers at most kHelloAnswersPerCycle of them; the rest are dropped BEFORE decode or crypto and counted
+// (helloShed()).  Every other frame is unbudgeted (it is either cheap to refuse or part of an exchange that already
+// passed a Hello).  A real initiator re-sends its Hello every PeerHandshake::kRetryNs, so a shed real Hello is retried.
 #include <rune/aeronutil/AeronPump.h>
 #include <rune/aeronutil/FragmentAssembler.h>
 #include <rune/consensus/PeerResolution.h>
@@ -70,6 +76,10 @@ public:
     /// Refusals logged by this broker, both directions (counter 1'000'234); monotonic.
     [[nodiscard]] uint64_t refusals() const noexcept { return refusals_; }
     [[nodiscard]] uint64_t malformedFrames() const noexcept { return malformed_; }
+    /// Issue #554: Hellos answered within the per-cycle budget / dropped over it (both monotonic).
+    [[nodiscard]] uint64_t helloAnswered() const noexcept { return helloAnswered_; }
+    [[nodiscard]] uint64_t helloShed() const noexcept { return helloShed_; }
+    static constexpr int kHelloAnswersPerCycle = 2;
     [[nodiscard]] const rune::peerlink::LinkState* stateOf(int32_t peer) const noexcept;
 
 private:
@@ -94,6 +104,9 @@ private:
     uint64_t                                 refusals_ = 0;
     uint64_t                                 malformed_ = 0;
     int64_t                                  lastNowNs_ = 0;   // the pass's clock, for the fragment handler
+    int                                      helloBudget_ = 0; // issue #554: reset each doWork, before the poll
+    uint64_t                                 helloAnswered_ = 0;
+    uint64_t                                 helloShed_ = 0;
 };
 
 } // namespace rune::node
