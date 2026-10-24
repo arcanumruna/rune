@@ -52,6 +52,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <random>
 #include <string>
 #include <limits>
 #include <unistd.h>
@@ -4377,4 +4378,512 @@ TEST(OffsetCommitDurabilityRegression, AFetchAllListsStableKeysWhileAnOverwriteI
     ASSERT_EQ(all.count, 2u);
     EXPECT_EQ(at498(all, kTestTopicId, 0), std::make_pair(int16_t{0}, int64_t{99}));
     EXPECT_EQ(at498(all, kTestTopicId, 1), std::make_pair(int16_t{0}, int64_t{22}));
+}
+
+// ===========================================================================
+// PR #616 adversarial review (#570 / #214 / #499 / #498): attacks on the group coordinator's lifecycle, cap, session
+// bounds and fetch-all, driven through the public handlers and entry points.  Each test names the mutation that turns
+// it red.
+// ===========================================================================
+namespace {
+std::size_t joinTopics616(GroupCoordinationService& svc, uint8_t* req, uint8_t* out, std::size_t cap, int64_t sid,
+                          int64_t corr, std::string_view group, std::string_view member, int64_t now,
+                          std::string& memberOut, int16_t& codeOut) {
+    pc::JoinGroup msg;
+    msg.sessionId = sid; msg.correlationId = corr; msg.sessionTimeoutMs = 5000;
+    msg.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+    msg.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(member.data()), member.size());
+    const std::array<int32_t, 1> topics{kTestTopicId};
+    const std::size_t n = msg.encode(req, std::span<const int32_t>(topics));
+    const std::size_t o = svc.handleJoinGroup(req, n, pc::kClientVersion, now, out, cap);
+    const auto r = pc::JoinGroupResponse::decode(out, o);
+    codeOut = r ? r->errorCode : int16_t{-1};
+    memberOut = r ? std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size()) : std::string();
+    return o;
+}
+int16_t commitCode616(CommitRig& g, const std::string& group, const std::string& member, int32_t gen, int32_t partition,
+                      int64_t offset, std::size_t* bytes = nullptr) {
+    const std::size_t n = g.svc.handleOffsetCommit(
+        g.req, encodeOffsetCommit(g.req, 1, g.corr++, group, member, gen, kTestTopicId, partition, offset), g.clock,
+        g.out, sizeof g.out);
+    if (bytes != nullptr) *bytes = n;
+    return n == 0 ? int16_t{0} : CommitRig::codeOf(g.out, n);   // 0 bytes: parked (answered OK once committed)
+}
+std::pair<int16_t, int64_t> fetchOne616(CommitRig& g, const std::string& group, int32_t partition) {
+    const std::size_t n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, group, kTestTopicId,
+                                                                           partition), g.clock, g.out, sizeof g.out);
+    const auto f = pc::OffsetFetchResponse::decode(g.out, n);
+    if (!f || f->results.size() != 1u) return {int16_t{-998}, int64_t{-998}};
+    return {f->results[0].errorCode, f->results[0].offset};
+}
+/// Joins (sid 1) and re-joins `group` until Stable; returns the member id and its generation.
+std::pair<std::string, int32_t> stable616(CommitRig& g, const std::string& group) {
+    std::size_t n = g.svc.handleJoinGroup(g.req, encodeJoinGroup(g.req, 1, g.corr++, group, ""), pc::kClientVersion,
+                                          g.clock, g.out, sizeof g.out);
+    const auto j = pc::JoinGroupResponse::decode(g.out, n);
+    EXPECT_TRUE(j && j->errorCode == 0);
+    if (!j) return {};
+    const std::string m(reinterpret_cast<const char*>(j->memberId.data()), j->memberId.size());
+    n = g.svc.handleJoinGroup(g.req, encodeJoinGroup(g.req, 1, g.corr++, group, m), pc::kClientVersion, g.clock, g.out,
+                              sizeof g.out);
+    for (int i = 0; i < 200 && g.svc.coordinator(group).state() != GroupState::Stable; ++i) {
+        g.clock += 10'000'000;
+        g.svc.doWork(g.clock);
+    }
+    EXPECT_EQ(g.svc.coordinator(group).state(), GroupState::Stable);
+    return {m, g.svc.coordinator(group).generationId()};
+}
+int16_t leave616(CommitRig& g, const std::string& group, const std::string& member) {
+    return decodeLeaveErrorCode(g.out, g.svc.handleLeaveGroup(g.req, encodeLeaveGroup(g.req, 1, g.corr++, group, member),
+                                                              g.clock, g.out, sizeof g.out));
+}
+}  // namespace
+
+// Hot path (#570, rules 4 / 5): once NodeRuntimeAgent pushes the term as a VALUE, neither doWork nor a handler calls the
+// term std::function - and a flap pushed only as a value is still seen, by the next handler and by the next duty
+// cycle.  RED (currentTerm_ ignores the pushed value): the fn is called on every duty cycle while a group is loaded,
+// and the handler serves the previous term's member (the fn still answers the old term).
+TEST(GroupCoordinationServiceRegression, APushedTermReplacesThePerCycleTermCallAndStillUnloadsOnAFlapAdversarialRegression) {
+    OffRig g;
+    struct Calls { int64_t term = 7; int n = 0; };
+    auto calls = std::make_shared<Calls>();
+    g.svc.setCoordinatorTermFn([calls] { ++calls->n; return calls->term; });
+    g.svc.setCoordinatorTerm(7);
+    int64_t corr = 1;
+    const std::string group = "g616term";
+    const std::string m = join499(g, 1, corr++, group, "", 5'000).member;
+    ASSERT_FALSE(m.empty());
+    ASSERT_EQ(join499(g, 1, corr++, group, m, 5'000).code, 0);
+    for (int i = 0; i < 100; ++i) {   // 100 duty cycles with a group loaded, the term re-pushed each cycle
+        g.clock += 1'000'000;
+        g.svc.setCoordinatorTerm(7);
+        g.svc.doWork(g.clock);
+    }
+    ASSERT_EQ(g.svc.groupCountForTest(), 1u);
+    const int32_t gen = g.svc.coordinator(group).generationId();
+    EXPECT_EQ(calls->n, 0) << "the term std::function was called on the duty cycle";
+
+    // Leg 1: a flap pushed as a value only (the fn still says 7), then a handler with no duty cycle in between.
+    g.svc.setCoordinatorTerm(9);
+    uint8_t req[4096]{}, out[4096]{};
+    EXPECT_EQ(decodeHBErrorCode(out, g.svc.handleHeartbeat(req, encodeHeartbeat(req, 1, corr++, group, m, gen), g.clock, out,
+                                                           sizeof out)),
+              static_cast<int16_t>(pc::ErrorCode::UnknownMember)) << "the previous term's member was served";
+    EXPECT_EQ(g.svc.groupCountForTest(), 0u);
+
+    // Leg 2: a group of term 9, then term 11 pushed before the next duty cycle.
+    const std::string m2 = join499(g, 1, corr++, group, "", 5'000).member;
+    ASSERT_FALSE(m2.empty());
+    ASSERT_NE(m2, m);
+    ASSERT_EQ(g.svc.groupCountForTest(), 1u);
+    g.clock += 1'000'000;
+    g.svc.setCoordinatorTerm(11);
+    g.svc.doWork(g.clock);
+    EXPECT_EQ(g.svc.groupCountForTest(), 0u) << "the duty cycle kept the previous term's group";
+    EXPECT_EQ(calls->n, 0);
+}
+
+// Input bounds + protocol state (#214): the cap at 1, a non-positive cap keeps the default, a join to an existing
+// group is never refused, every other group request on an unknown group creates nothing - even with the cap reached -
+// and a thousand refused new names leave the count where it was.  RED (no cap): "g616-b" joins.  RED (a non-join
+// request creates the group): the count rises above 1.
+TEST(GroupCoordinationServiceRegression, TheGroupCapBoundsAndNonJoinRequestsNeverCreateAGroupAdversarialRegression) {
+    CommitRig g("g616-a");   // one Stable group, member bound to session 1
+    for (const int32_t bad : {0, -1, std::numeric_limits<int32_t>::min()}) {
+        g.svc.setMaxGroups(bad);
+        EXPECT_EQ(g.svc.maxGroups(), GroupCoordinationService::kDefaultMaxGroups) << bad;
+    }
+    g.svc.setMaxGroups(std::numeric_limits<int32_t>::max());
+    EXPECT_EQ(g.svc.maxGroups(), std::numeric_limits<int32_t>::max());
+    g.svc.setMaxGroups(1);
+    ASSERT_EQ(g.svc.groupCountForTest(), 1u);
+
+    std::string m;
+    int16_t code = -1;
+    (void)joinTopics616(g.svc, g.req, g.out, sizeof g.out, 2, g.corr++, "g616-b", "", g.clock, m, code);
+    EXPECT_EQ(code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_TRUE(m.empty());
+    (void)joinTopics616(g.svc, g.req, g.out, sizeof g.out, 2, g.corr++, "g616-a", "", g.clock, m, code);
+    EXPECT_EQ(code, 0) << "a join to an existing group was refused by the cap";
+    EXPECT_FALSE(m.empty());
+
+    const std::string none = "g616-none";
+    (void)g.svc.handleHeartbeat(g.req, encodeHeartbeat(g.req, 1, g.corr++, none, g.member, g.gen), g.clock, g.out,
+                                sizeof g.out);
+    (void)g.svc.handleSyncGroup(g.req, encodeSyncGroup(g.req, 1, g.corr++, none, g.member, g.gen), g.clock, g.out,
+                                sizeof g.out);
+    EXPECT_EQ(leave616(g, none, g.member), static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+    EXPECT_EQ(commitCode616(g, none, g.member, g.gen, 0, 5), static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+    (void)fetchOne616(g, none, 0);
+    (void)g.svc.handleOffsetFetch(g.req, encodeOffsetFetchAll(g.req, 1, g.corr++, none), g.clock, g.out, sizeof g.out);
+    EXPECT_EQ(g.svc.checkTxnOffsetMember(none, g.member, g.gen, 1), pc::ErrorCode::UnknownMember);
+    EXPECT_EQ(g.svc.groupCountForTest(), 1u) << "a non-join request created a group";
+
+    const uint64_t refusedBefore = g.svc.joinsRefusedGroupCap();
+    for (int i = 0; i < 1000; ++i) {
+        (void)joinTopics616(g.svc, g.req, g.out, sizeof g.out, 3, g.corr++, "g616-flood-" + std::to_string(i), "",
+                            g.clock, m, code);
+        ASSERT_EQ(code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest)) << i;
+    }
+    EXPECT_EQ(g.svc.joinsRefusedGroupCap(), refusedBefore + 1000);
+    EXPECT_EQ(g.svc.groupCountForTest(), 1u);
+    g.svc.doWork(g.clock);
+    EXPECT_EQ(g.svc.groupCountForTest(), 1u) << "the live group was pruned";
+}
+
+// #214: a join refused for its own content (an oversized filter, a view-sink topic) never takes a group slot, not even
+// until the next duty cycle: a legitimate new group joining right after both refusals, with the cap one above the live
+// count, is admitted.  RED (refusals checked after coordinator()): the refused names hold the slot and the legitimate
+// join is refused by the cap.
+TEST_F(GroupJoinAdversarial, ARefusedJoinNeverHoldsAGroupSlotBeforeTheNextDutyCycleAdversarialRegression) {
+    (void)stableMember("g616-live");
+    const std::size_t live = service_->groupCountForTest();
+    ASSERT_GE(live, 1u);
+    service_->setMaxGroups(static_cast<int32_t>(live) + 1);
+    const std::vector<uint8_t> big(rune::codec::kMaxFilterBytes + 1, 0xAB);
+    const auto tooBig = joinAs({kTestTopicId}, "g616-bigfilter", {}, pc::kClientVersion, std::span<const uint8_t>(big));
+    EXPECT_EQ(tooBig.code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_NE(tooBig.detail.find("too large"), std::string::npos) << tooBig.detail;
+    const auto sink = joinAs({kSinkId}, "g616-sink");
+    EXPECT_EQ(sink.code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_NE(sink.detail.find("view sink"), std::string::npos) << "refused by the cap, not for its topic: " << sink.detail;
+    EXPECT_EQ(service_->groupCountForTest(), live) << "a refused join created a group";
+    const auto next = joinAs({kTestTopicId}, "g616-next");
+    EXPECT_EQ(next.code, static_cast<int16_t>(pc::ErrorCode::OK)) << next.detail;
+    EXPECT_EQ(service_->groupCountForTest(), live + 1);
+}
+
+// Resources (#214): seeded churn of thousands of distinct group names through join / leave / duty cycles never holds
+// more than the cap, is never refused while below it, and drains to zero groups and zero lineage checks.  RED (no
+// prune): the count sticks at the cap, joins are refused for good, and the final count is the cap.
+TEST(GroupCoordinationServiceRegression, ManyDistinctGroupsChurnWithinTheCapAndDrainToZeroSeededAdversarialRegression) {
+    for (const uint32_t seed : {616u, 4242u, 7u}) {
+        SCOPED_TRACE(::testing::Message() << "seed=" << seed);
+        OffRig g;
+        constexpr int32_t kCap = 32;
+        g.svc.setMaxGroups(kCap);
+        std::mt19937 rng(seed);
+        std::map<std::string, std::pair<int64_t, std::string>> live;   // group -> (session, member)
+        uint8_t req[4096]{}, out[4096]{};
+        int64_t corr = 1;
+        std::size_t admitted = 0, refused = 0;
+        for (int i = 0; i < 3000; ++i) {
+            const uint32_t op = rng() % 10;
+            if (op < 5) {
+                const std::string name = "churn-" + std::to_string(i);
+                const int64_t sid = 1 + static_cast<int64_t>(rng() % 8);
+                const std::size_t before = g.svc.groupCountForTest();
+                std::string m;
+                int16_t code = -1;
+                (void)joinTopics616(g.svc, req, out, sizeof out, sid, corr++, name, "", g.clock, m, code);
+                if (before < static_cast<std::size_t>(kCap)) {
+                    ASSERT_EQ(code, 0) << "refused below the cap (" << before << " groups) at step " << i;
+                }
+                if (code == 0) { live[name] = {sid, m}; ++admitted; } else { ++refused; }
+            } else if (op < 8 && !live.empty()) {
+                auto it = live.begin();
+                std::advance(it, static_cast<long>(rng() % live.size()));
+                ASSERT_EQ(decodeLeaveErrorCode(out, g.svc.handleLeaveGroup(
+                              req, encodeLeaveGroup(req, it->second.first, corr++, it->first, it->second.second), g.clock,
+                              out, sizeof out)), 0);
+                live.erase(it);
+            } else {
+                g.clock += 1'000'000;
+                g.svc.doWork(g.clock);
+            }
+            ASSERT_LE(g.svc.groupCountForTest(), static_cast<std::size_t>(kCap)) << "step " << i;
+        }
+        EXPECT_GT(admitted, 500u);
+        for (const auto& [name, sm] : live)
+            ASSERT_EQ(decodeLeaveErrorCode(out, g.svc.handleLeaveGroup(req, encodeLeaveGroup(req, sm.first, corr++, name,
+                                                                                             sm.second), g.clock, out,
+                                                                       sizeof out)), 0);
+        g.clock += 1'000'000;
+        g.svc.doWork(g.clock);
+        EXPECT_EQ(g.svc.groupCountForTest(), 0u) << "empty groups were kept";
+        EXPECT_EQ(g.svc.pendingLineageChecksForTest(), 0u);
+        EXPECT_EQ(g.svc.groupsPruned(), admitted);
+        (void)refused;
+    }
+}
+
+// Data integrity (#214): a group pruned and re-created restarts its generations, so the old incarnation's member id and
+// generation must never be honoured: its re-join gets a fresh id, its commit (at its old generation, and at the new
+// incarnation's) is UnknownMember with nothing appended, and the committed offset survives the prune and only moves on
+// the new member's commit.  RED (a re-join adopts the client's member id even when it is not a current member): the
+// re-join keeps the old id and the old member's commit moves the offset back.
+TEST(GroupCoordinationServiceRegression, APrunedAndRecreatedGroupNeverHonoursTheOldIncarnationsMemberAdversarialRegression) {
+    const std::string group = "g616re";
+    CommitRig g(group);
+    const auto t0 = tp(std::string(kTestTopic), 0);
+    ASSERT_EQ(commitCode616(g, group, g.member, g.gen, 0, 10), 0);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.store.fetch(group, t0)->offset, 10);
+    const std::string oldMember = g.member;
+    const int32_t oldGen = g.gen;
+    ASSERT_EQ(leave616(g, group, oldMember), 0);
+    g.clock += 1'000'000;
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.svc.groupCountForTest(), 0u);
+
+    // The old member re-joins with its old id on its own session: a NEW member with a fresh id.
+    std::size_t n = g.svc.handleJoinGroup(g.req, encodeJoinGroup(g.req, 1, g.corr++, group, oldMember), pc::kClientVersion,
+                                          g.clock, g.out, sizeof g.out);
+    auto j = pc::JoinGroupResponse::decode(g.out, n);
+    ASSERT_TRUE(j && j->errorCode == 0);
+    const std::string fresh(reinterpret_cast<const char*>(j->memberId.data()), j->memberId.size());
+    EXPECT_NE(fresh, oldMember) << "a pruned incarnation's member id was adopted";
+    n = g.svc.handleJoinGroup(g.req, encodeJoinGroup(g.req, 1, g.corr++, group, fresh), pc::kClientVersion, g.clock,
+                              g.out, sizeof g.out);
+    for (int i = 0; i < 200 && g.svc.coordinator(group).state() != GroupState::Stable; ++i) {
+        g.clock += 10'000'000;
+        g.svc.doWork(g.clock);
+    }
+    ASSERT_EQ(g.svc.coordinator(group).state(), GroupState::Stable);
+    const int32_t newGen = g.svc.coordinator(group).generationId();
+
+    const auto leo = g.rep.logEndOffset();
+    const auto unknown = static_cast<int16_t>(pc::ErrorCode::UnknownMember);
+    EXPECT_EQ(commitCode616(g, group, oldMember, oldGen, 0, 3), unknown);
+    EXPECT_EQ(commitCode616(g, group, oldMember, newGen, 0, 4), unknown);
+    EXPECT_EQ(g.svc.checkTxnOffsetMember(group, oldMember, newGen, 1), pc::ErrorCode::UnknownMember);
+    EXPECT_EQ(g.rep.logEndOffset(), leo) << "the old incarnation's commit was appended";
+    EXPECT_EQ(fetchOne616(g, group, 0), std::make_pair(int16_t{0}, int64_t{10})) << "the offset did not survive the prune";
+
+    ASSERT_EQ(commitCode616(g, group, fresh, newGen, 0, 12), 0);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    EXPECT_EQ(fetchOne616(g, group, 0), std::make_pair(int16_t{0}, int64_t{12}));
+}
+
+// Pruning versus a parked commit (#214 x #433): the last member commits (parked: its record is above the high
+// watermark) and leaves; the group is pruned while the commit is parked.  The parked commit is still answered OK once
+// its record commits (never a hang), and the offset is fetchable after the prune.  RED (prune drops the parked
+// answers): no answer frame - the client waits forever.
+TEST(GroupCoordinationServiceRegression, PruningUnderAParkedCommitStillAnswersItAndKeepsTheOffsetAdversarialRegression) {
+    const std::string group = "g616park";
+    CommitRig g(group);
+    ASSERT_EQ(commitCode616(g, group, g.member, g.gen, 0, 77), 0);
+    ASSERT_EQ(g.svc.parkedOffsetCommits(), 1u);
+    ASSERT_EQ(leave616(g, group, g.member), 0);
+    g.clock += 1'000'000;
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.svc.groupCountForTest(), 0u);
+    EXPECT_EQ(g.svc.parkedOffsetCommits(), 1u) << "the prune dropped a parked commit";
+    EXPECT_TRUE(g.answers.frames.empty());
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u) << "a parked commit of a pruned group was never answered";
+    EXPECT_EQ(CommitRig::codeOf(g.answers.frames[0].data(), g.answers.frames[0].size()), 0);
+    EXPECT_EQ(g.store.fetch(group, tp(std::string(kTestTopic), 0))->offset, 77);
+    const auto all = fetchAll498(g, group);
+    EXPECT_EQ(at498(all, kTestTopicId, 0), std::make_pair(int16_t{0}, int64_t{77}));
+    EXPECT_EQ(g.svc.groupCountForTest(), 0u) << "a fetch re-created the group";
+}
+
+// Pruning versus a transactional offset in flight (#214 x #438): the old incarnation's member is fenced into a
+// transaction and leaves; the group is pruned and re-created.  While the transaction holds the key the new member's
+// plain commit is refused retriably with nothing appended (it can never be overwritten - or rewound - by the
+// transaction's offset), the fetch-all is the retriable sentinel, and once the transaction's offset commits it is the
+// committed offset.  RED (the plain-commit hold check removed): the new member's commit is appended under the hold.
+TEST(GroupCoordinationServiceRegression, PruningUnderAnInFlightTxnOffsetNeverLetsAPlainCommitRaceItAdversarialRegression) {
+    const std::string group = "g616txn";
+    CommitRig g(group);
+    struct Probe {
+        rune::coordination::TxnOffsetHold hold = rune::coordination::TxnOffsetHold::Free;
+        static rune::coordination::TxnOffsetHold of(void* ctx, const std::string&, const TopicPartition&) {
+            return static_cast<Probe*>(ctx)->hold;
+        }
+    } probe;
+    g.svc.setTxnOffsetHoldProbe(&Probe::of, &probe);
+    ASSERT_EQ(g.svc.checkTxnOffsetMember(group, g.member, g.gen, 1), pc::ErrorCode::OK);
+    probe.hold = rune::coordination::TxnOffsetHold::Held;   // the transaction now holds (group, t0)
+    ASSERT_EQ(leave616(g, group, g.member), 0);
+    g.clock += 1'000'000;
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.svc.groupCountForTest(), 0u);
+
+    const auto [m2, gen2] = stable616(g, group);
+    ASSERT_FALSE(m2.empty());
+    const auto leo = g.rep.logEndOffset();
+    const auto unstable = static_cast<int16_t>(pc::ErrorCode::UnstableOffsetCommit);
+    EXPECT_EQ(commitCode616(g, group, m2, gen2, 0, 5), unstable);
+    EXPECT_EQ(g.rep.logEndOffset(), leo) << "a plain commit was appended under a transaction's hold";
+    auto all = fetchAll498(g, group);
+    ASSERT_EQ(all.count, 1u);
+    EXPECT_EQ(at498(all, -1, -1), std::make_pair(unstable, int64_t{-1}));
+
+    const auto t0 = tp(std::string(kTestTopic), 0);
+    EXPECT_EQ(g.svc.applyTransactionalOffset(group, t0, 50, g.clock), rune::coordination::TxnOffsetApply::Replicating);
+    g.fetch();
+    EXPECT_EQ(g.svc.applyTransactionalOffset(group, t0, 50, g.clock), rune::coordination::TxnOffsetApply::Applied);
+    probe.hold = rune::coordination::TxnOffsetHold::Free;
+    EXPECT_EQ(fetchOne616(g, group, 0), std::make_pair(int16_t{0}, int64_t{50}));
+    ASSERT_EQ(commitCode616(g, group, m2, gen2, 0, 60), 0);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    EXPECT_EQ(fetchOne616(g, group, 0), std::make_pair(int16_t{0}, int64_t{60}));
+}
+
+// Input bounds (#499): the session timeout clamp across the whole input range and every bounds configuration, and the
+// group's rebalance timeout equals the clamped value.  RED (no lower clamp): 1 / 999 stay below the minimum.
+TEST(GroupCoordinationServiceRegression, SessionTimeoutClampTableAcrossEveryBoundAdversarialRegression) {
+    OffRig g;
+    constexpr int32_t kMin32 = std::numeric_limits<int32_t>::min();
+    constexpr int32_t kMax32 = std::numeric_limits<int32_t>::max();
+    struct Row { int32_t min, max, req, want; };
+    const Row rows[] = {
+        {0, 0, kMin32, 30'000}, {0, 0, -1, 30'000}, {0, 0, 0, 30'000}, {0, 0, 1, 1'000}, {0, 0, 999, 1'000},
+        {0, 0, 1'000, 1'000}, {0, 0, 1'001, 1'001}, {0, 0, 1'799'999, 1'799'999}, {0, 0, 1'800'000, 1'800'000},
+        {0, 0, 1'800'001, 1'800'000}, {0, 0, kMax32, 1'800'000},
+        {5'000, 2'000, 1, 2'000}, {5'000, 2'000, 3'000, 2'000}, {5'000, 2'000, 0, 2'000},   // min > max: max bounds
+        {0, 10'000, 0, 10'000}, {0, 10'000, 20'000, 10'000},                               // the 30 s default clamped
+        {-7, -7, 1, 1'000}, {-7, -7, kMax32, 1'800'000},                                   // non-positive: defaults
+        {1, 1, 0, 1}, {1, 1, kMax32, 1},
+        {kMax32, kMax32, 1, kMax32}, {kMax32, kMax32, 0, kMax32},
+    };
+    int64_t corr = 1;
+    int i = 0;
+    for (const Row& r : rows) {
+        SCOPED_TRACE(::testing::Message() << "row " << i << ": min=" << r.min << " max=" << r.max << " req=" << r.req);
+        g.svc.setMinSessionTimeoutMs(r.min);
+        g.svc.setMaxSessionTimeoutMs(r.max);
+        const std::string group = "g616clamp-" + std::to_string(i++);
+        const auto j = join499(g, 1, corr++, group, "", r.req);
+        ASSERT_EQ(j.code, 0);
+        ASSERT_EQ(g.svc.coordinator(group).members().size(), 1u);
+        EXPECT_EQ(g.svc.coordinator(group).members()[0].sessionTimeoutMs, r.want);
+        EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), r.want);
+    }
+}
+
+// Timing (#499): the largest member leaves in the middle of a rebalance; the window that applies from then on is the
+// largest REMAINING member's - measured from the leave - never the departed member's and never the last joiner's.
+// RED (no refresh in doWork): the departed 20 s member's window still holds at 10.5 s.  RED (the last joiner's value, the
+// pre-fix code): both members are evicted after 5 s.
+TEST(GroupCoordinationServiceRegression, TheLargestMemberLeavingMidRebalanceLeavesTheRemainingMaxWindowAdversarialRegression) {
+    OffRig g;
+    const std::string group = "g616win";
+    int64_t corr = 1;
+    const auto [m1, m2] = twoStable499(g, group, 10'000, 20'000, corr);
+    const std::string m3 = join499(g, 3, corr++, group, "", 5'000).member;   // starts a rebalance
+    ASSERT_FALSE(m3.empty());
+    ASSERT_EQ(g.svc.coordinator(group).state(), GroupState::PreparingRebalance);
+    EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), 20'000);
+    uint8_t req[4096]{}, out[4096]{};
+    ASSERT_EQ(decodeLeaveErrorCode(out, g.svc.handleLeaveGroup(req, encodeLeaveGroup(req, 2, corr++, group, m2), g.clock,
+                                                               out, sizeof out)), 0);   // a new rebalance from here
+    const int64_t t1 = g.clock;
+    auto heartbeats = [&] {   // both stay alive; neither re-joins
+        (void)heartbeat499(g, 1, corr++, group, m1);
+        (void)heartbeat499(g, 3, corr++, group, m3);
+    };
+    while (g.clock < t1 + 9'500'000'000LL) {
+        g.clock += 250'000'000;
+        heartbeats();
+        g.svc.doWork(g.clock);
+        ASSERT_EQ(g.svc.groupCountForTest(), 1u) << "evicted at +" << (g.clock - t1) / 1'000'000 << " ms";
+    }
+    EXPECT_TRUE(g.svc.coordinator(group).hasMember(m1));
+    EXPECT_TRUE(g.svc.coordinator(group).hasMember(m3));
+    EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), 10'000);
+    while (g.clock < t1 + 10'500'000'000LL) {
+        g.clock += 250'000'000;
+        if (g.svc.groupCountForTest() == 1u) heartbeats();
+        g.svc.doWork(g.clock);
+    }
+    EXPECT_EQ(g.svc.groupCountForTest(), 0u) << "the non-re-joined members outlived the remaining 10 s window";
+}
+
+// Version skew (#498): for every client version, a fetch-all lists a stable key with its offset and an unstable key
+// with exactly the code a specific fetch of that key answers (UnstableOffsetCommit from 10, NotCoordinator below), never
+// a value.  RED (UnstableOffsetCommit for every version): the rows below 10 differ from the specific fetch.
+TEST(OffsetCommitDurabilityRegression, AFetchAllAnswersEachUnstableKeyLikeASpecificFetchForEveryClientVersionAdversarialRegression) {
+    for (const int32_t version : {pc::kClientVersion, 10, 9, 5, 4, 1}) {
+        SCOPED_TRACE(::testing::Message() << "version=" << version);
+        const std::string group = "g616ver" + std::to_string(version);
+        CommitRig g(group);
+        FetchVersion498 ver{version};
+        g.svc.setClientVersionResolverForTest(&FetchVersion498::of, &ver);
+        ASSERT_EQ(commitCode616(g, group, g.member, g.gen, 0, 11), 0);
+        g.fetch();
+        g.svc.doWork(g.clock);
+        ASSERT_EQ(commitCode616(g, group, g.member, g.gen, 1, 22), 0);   // parked: above the high watermark
+        const auto want = static_cast<int16_t>(version >= 10 ? pc::ErrorCode::UnstableOffsetCommit
+                                                             : pc::ErrorCode::NotCoordinator);
+        const auto specific = fetchOne616(g, group, 1);
+        EXPECT_EQ(specific, std::make_pair(want, int64_t{-1}));
+        const auto all = fetchAll498(g, group);
+        ASSERT_EQ(all.count, 2u);
+        EXPECT_EQ(at498(all, kTestTopicId, 0), std::make_pair(int16_t{0}, int64_t{11}));
+        EXPECT_EQ(at498(all, kTestTopicId, 1), specific) << "the fetch-all and a specific fetch disagree";
+    }
+}
+
+// Data integrity (#498): seeded random commits, replications and fetches on two keys against a model.  Every fetch-all
+// row is either the key's latest COMMITTED value (no newer commit in flight) or the retriable code with no offset (a
+// newer commit in flight) - never an uncommitted value, never a superseded one as OK, never a missing key.  RED (the
+// pre-#498 sentinel): one {-1, -1} row while any key is in flight.  RED (an unstable row served with its value): the
+// row's offset is the uncommitted one.
+TEST(OffsetCommitDurabilityRegression, AFetchAllNeverServesAnUncommittedOrSupersededValueSeededAdversarialRegression) {
+    for (const uint32_t seed : {1u, 2u, 3u, 616u, 9001u}) {
+        SCOPED_TRACE(::testing::Message() << "seed=" << seed);
+        const std::string group = "g616model" + std::to_string(seed);
+        CommitRig g(group);
+        std::mt19937 rng(seed);
+        std::map<int32_t, int64_t> stable, pending;   // partition -> value
+        const auto unstable = static_cast<int16_t>(pc::ErrorCode::UnstableOffsetCommit);
+        for (int step = 0; step < 300; ++step) {
+            const uint32_t op = rng() % 4;
+            if (op < 2 && pending.size() + g.svc.parkedOffsetCommits() < 64) {
+                const int32_t p = static_cast<int32_t>(rng() % 2);
+                const int64_t v = static_cast<int64_t>(rng() % 1000);
+                ASSERT_EQ(commitCode616(g, group, g.member, g.gen, p, v), 0) << "step " << step;
+                pending[p] = v;
+            } else if (op == 2) {
+                g.fetch();
+                g.svc.doWork(g.clock);
+                for (const auto& [p, v] : pending) stable[p] = v;
+                pending.clear();
+                ASSERT_EQ(g.svc.parkedOffsetCommits(), 0u);
+            }
+            const auto all = fetchAll498(g, group);
+            std::size_t keys = 0;
+            for (int32_t p = 0; p < 2; ++p) {
+                if (!stable.count(p) && !pending.count(p)) continue;
+                ++keys;
+                const auto row = at498(all, kTestTopicId, p);
+                if (pending.count(p)) EXPECT_EQ(row, std::make_pair(unstable, int64_t{-1})) << "step " << step << " p" << p;
+                else EXPECT_EQ(row, std::make_pair(int16_t{0}, stable[p])) << "step " << step << " p" << p;
+            }
+            ASSERT_EQ(all.count, keys) << "step " << step;
+        }
+    }
+}
+
+// Timing (#570): the term changes between a member's JoinGroup and its SyncGroup.  The SyncGroup (and a LeaveGroup)
+// of the previous term's member is UnknownMember, its re-join with the old id gets a fresh id, and the rebuilt group
+// reaches Stable with only the new member.  RED (syncTerm_ returns 0): the SyncGroup is served for the old term's member.
+TEST_F(GroupJoinAdversarial, ATermChangeBetweenJoinAndSyncNeverServesTheOldTermsMemberAdversarialRegression) {
+    const std::string g = "g616-js";
+    const auto first = joinAs({kTestTopicId}, g);
+    ASSERT_EQ(first.code, static_cast<int16_t>(pc::ErrorCode::OK));
+    const int32_t gen = service_->coordinator(g).generationId();
+    ++leaderTerm_;   // a flap: lost and regained before any duty cycle saw it
+    const auto unknown = static_cast<int16_t>(pc::ErrorCode::UnknownMember);
+    EXPECT_EQ(decodeSyncErrorCode(out_, service_->handleSyncGroup(req_, encodeSyncGroup(req_, 1, ++corr_, g, first.memberId,
+                                                                                        gen), clock_, out_, kBufSize)),
+              unknown) << "the previous term's member was synced";
+    EXPECT_EQ(decodeLeaveErrorCode(out_, service_->handleLeaveGroup(req_, encodeLeaveGroup(req_, 1, ++corr_, g,
+                                                                                           first.memberId), clock_, out_,
+                                                                    kBufSize)), unknown);
+    const auto again = joinAs({kTestTopicId}, g, first.memberId);
+    ASSERT_EQ(again.code, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_NE(again.memberId, first.memberId) << "the previous term's member id was adopted";
+    clock_ += kStep;
+    ASSERT_EQ(joinAs({kTestTopicId}, g, again.memberId).code, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_TRUE(driveUntil([&] { return service_->coordinator(g).state() == GroupState::Stable; }, 10));
+    EXPECT_EQ(service_->coordinator(g).memberCount(), 1u);
+    EXPECT_TRUE(service_->coordinator(g).hasMember(again.memberId));
 }

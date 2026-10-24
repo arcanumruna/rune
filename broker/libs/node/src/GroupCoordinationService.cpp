@@ -655,6 +655,33 @@ size_t GroupCoordinationService::handleJoinGroup(
         return n != 0 ? n : resp.encode(out);
     };
 
+    // The same cap the Subscribe filter path enforces (CompiledFilter::compile): no group is fixed to bytes every
+    // Subscribe would refuse.  #214 review: checked before the group is created - a refused join never holds a
+    // group slot (not even until the next duty cycle).
+    if (filter.size() > rune::codec::kMaxFilterBytes) {
+        return refuseJoin("group filter too large: " + std::to_string(filter.size()) + " bytes, at most " +
+                          std::to_string(rune::codec::kMaxFilterBytes));
+    }
+
+    // Collect subscribedTopicIds → topic names.
+    // joinTopicsScratch_ is a reused member; clear + refill to avoid per-call
+    // vector allocation.  Short topic names benefit from SSO; the vector itself
+    // is amortized (only grows on first large-subscribe, cold path).
+    joinTopicsScratch_.clear();
+    for (const int32_t tid : msg.subscribedTopicIds) {
+        // #19: a view sink is in the registry but holds no partitions to consume: refuse, never an empty assignment
+        // (#214 review: before the group is created).
+        if (topics_ != nullptr && topics_->isViewSink(tid)) {
+            return refuseJoin("topic id " + std::to_string(tid) +
+                              " is a view sink: it holds no records to consume; read the view with the view read API");
+        }
+        std::string name = topicNameForId(topics_, tid);
+        if (!name.empty()) {
+            joinTopicsScratch_.push_back(std::move(name));
+        }
+        // Unknown topicId silently ignored (Assignor ignores topics not in partCounts).
+    }
+
     // #214: the number of coordinated groups is bounded.  Only a join that would CREATE a group is refused (never one
     // to an existing group); empty groups are dropped by doWork, so the room comes back as groups empty.
     if (coordinators_.size() >= static_cast<std::size_t>(maxGroups_) &&
@@ -667,33 +694,9 @@ size_t GroupCoordinationService::handleJoinGroup(
                           " consumer groups; retry after a group empties or raise RUNE_GROUP_MAX_GROUPS");
     }
     coord::GroupCoordinator& gc = coordinator(groupIdStr);   // only creates the group
-    // The same cap the Subscribe filter path enforces (CompiledFilter::compile): no group is fixed to bytes every
-    // Subscribe would refuse.
-    if (filter.size() > rune::codec::kMaxFilterBytes) {
-        return refuseJoin("group filter too large: " + std::to_string(filter.size()) + " bytes, at most " +
-                          std::to_string(rune::codec::kMaxFilterBytes));
-    }
     if (!gc.admitFilter(filter)) {
         noteFilterMismatch_(groupIdStr, msg.sessionId);
         return refuseJoin(groupFilterMismatchDetail(gc.filterBytes()));
-    }
-
-    // Collect subscribedTopicIds → topic names.
-    // joinTopicsScratch_ is a reused member; clear + refill to avoid per-call
-    // vector allocation.  Short topic names benefit from SSO; the vector itself
-    // is amortized (only grows on first large-subscribe, cold path).
-    joinTopicsScratch_.clear();
-    for (const int32_t tid : msg.subscribedTopicIds) {
-        // #19: a view sink is in the registry but holds no partitions to consume: refuse, never an empty assignment.
-        if (topics_ != nullptr && topics_->isViewSink(tid)) {
-            return refuseJoin("topic id " + std::to_string(tid) +
-                              " is a view sink: it holds no records to consume; read the view with the view read API");
-        }
-        std::string name = topicNameForId(topics_, tid);
-        if (!name.empty()) {
-            joinTopicsScratch_.push_back(std::move(name));
-        }
-        // Unknown topicId silently ignored (Assignor ignores topics not in partCounts).
     }
 
     // Issues #123 / #124: a non-empty member id is a RE-JOIN only when it is bound to this session's principal (the

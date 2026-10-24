@@ -3085,4 +3085,38 @@ TEST(NodeConfigRegression, GroupSessionTimeoutBoundsEnvAreParsedRegression) {
     EXPECT_NE(r.error.find("RUNE_GROUP_MAX_SESSION_TIMEOUT_MS"), std::string::npos) << r.error;
 }
 
+// PR #616 adversarial review (#214 / #499, input bounds): the group knobs at 1 / int32 max / int32 max + 1 / empty, and
+// the EFFECTIVE session bounds - a minimum above the DEFAULT maximum (max unset) and a maximum below the DEFAULT minimum
+// (min unset) refuse startup like an explicit min > max, never silently clamp.  RED (only both-set compared): a
+// RUNE_GROUP_MIN_SESSION_TIMEOUT_MS of 1800001 alone starts and every session is clamped to 30 min.
+TEST(NodeConfigRegression, GroupKnobBoundsAndEffectiveSessionBoundsAdversarialRegression) {
+    auto base = base1node();
+    base["RUNE_AUTH"] = "disabled";   // #533: a RUNE_TLS=OFF build refuses the default authentication
+    struct Row { const char* knob; const char* value; bool ok; };
+    const Row rows[] = {
+        {"RUNE_GROUP_MAX_GROUPS", "1", true}, {"RUNE_GROUP_MAX_GROUPS", "2147483647", true},
+        {"RUNE_GROUP_MAX_GROUPS", "2147483648", false}, {"RUNE_GROUP_MAX_GROUPS", "", true},
+        {"RUNE_GROUP_MIN_SESSION_TIMEOUT_MS", "1", true}, {"RUNE_GROUP_MIN_SESSION_TIMEOUT_MS", "1800000", true},
+        {"RUNE_GROUP_MIN_SESSION_TIMEOUT_MS", "1800001", false}, {"RUNE_GROUP_MIN_SESSION_TIMEOUT_MS", "2147483647", false},
+        {"RUNE_GROUP_MIN_SESSION_TIMEOUT_MS", "2147483648", false},
+        {"RUNE_GROUP_MAX_SESSION_TIMEOUT_MS", "1000", true}, {"RUNE_GROUP_MAX_SESSION_TIMEOUT_MS", "999", false},
+        {"RUNE_GROUP_MAX_SESSION_TIMEOUT_MS", "2147483647", true}, {"RUNE_GROUP_MAX_SESSION_TIMEOUT_MS", "", true},
+    };
+    for (const Row& r : rows) {
+        auto env = base;
+        env[r.knob] = r.value;
+        const auto res = parseNodeConfig(fakeEnv(env));
+        EXPECT_EQ(res.config.has_value(), r.ok) << r.knob << "=" << r.value << ": " << res.error;
+        if (!r.ok) EXPECT_NE(res.error.find(r.knob), std::string::npos) << r.knob << "=" << r.value << ": " << res.error;
+    }
+    // An explicit maximum below the default minimum is fine once the minimum is lowered with it.
+    auto env = base;
+    env["RUNE_GROUP_MIN_SESSION_TIMEOUT_MS"] = "100";
+    env["RUNE_GROUP_MAX_SESSION_TIMEOUT_MS"] = "500";
+    const auto res = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->groupMinSessionTimeoutMs, 100);
+    EXPECT_EQ(res.config->groupMaxSessionTimeoutMs, 500);
+}
+
 } // namespace rune::node

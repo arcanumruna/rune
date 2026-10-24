@@ -37,7 +37,7 @@
 //   RUNE_GROUP_MIN_SESSION_TIMEOUT_MS — int32 ms > 0, default 1000 (#499).  A smaller JoinGroup session timeout is
 //                                     raised to it.
 //   RUNE_GROUP_MAX_SESSION_TIMEOUT_MS — int32 ms > 0, default 1800000 (#213 / #499).  A larger one is lowered to it.
-//                                     Both set with min > max refuses startup.
+//                                     A min above the max (an unset one is its default) refuses startup.
 //
 // For cross-datacenter deployments set these higher (e.g. 1000/200/2000 ms).
 //

@@ -219,8 +219,11 @@ public:
     // regained between two duty cycles is invisible to the isLocalCoordinator() sample, but it always changes the
     // term: doWork and every membership handler unload the groups when the term moved since they were loaded
     // (Kafka: a new coordinator epoch rebuilds its groups; members re-join).  No fn: the term never changes (rigs).
-    // Cold setter; control thread.
+    // Cold setter; control thread.  Once a term is pushed (setCoordinatorTerm) the fn is never called again.
     void setCoordinatorTermFn(std::function<int64_t()> fn) { termFn_ = std::move(fn); }
+    // #570 review: this duty cycle's coordinator term, pushed as a VALUE by NodeRuntimeAgent (same thread, right after
+    // consensus, next to setLocalLeadership) - doWork never calls a std::function per cycle (fix 2 / B1 precedent).
+    void setCoordinatorTerm(int64_t term) noexcept { pushedTerm_ = term; termPushed_ = true; }
 
     // -----------------------------------------------------------------------
     // coordinatorFor — returns the cluster-leader nodeId for any group.
@@ -537,11 +540,16 @@ private:
     /// (a member learns NotCoordinator on its next request).  Returns the number of groups unloaded.
     int unloadGroups_(const char* why);
     /// #570: the current coordinator term (0 without a term fn).
-    [[nodiscard]] int64_t currentTerm_() const { return termFn_ ? termFn_() : 0; }
+    [[nodiscard]] int64_t currentTerm_() const {
+        if (termPushed_) [[likely]] return pushedTerm_;
+        return termFn_ ? termFn_() : 0;
+    }
     /// #570: unload the groups when they were loaded under another term.  Returns the number unloaded.
     int syncTerm_();
     std::function<int64_t()> termFn_;
     int64_t                  groupsTerm_ = 0;   ///< the term coordinators_ was (re)populated under
+    int64_t                  pushedTerm_ = 0;   ///< see setCoordinatorTerm()
+    bool                     termPushed_ = false;
 public:
     [[nodiscard]] std::size_t groupCountForTest() const noexcept { return coordinators_.size(); }
     [[nodiscard]] std::size_t pendingLineageChecksForTest() const noexcept { return pendingChecks_.size(); }

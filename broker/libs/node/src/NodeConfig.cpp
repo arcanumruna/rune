@@ -1,4 +1,5 @@
 #include <rune/node/NodeConfig.h>
+#include <rune/node/GroupCoordinationService.h>   // the group session-timeout defaults (#499)
 #include <rune/catalog/TopicName.h>
 #include <rune/consensus/PeerResolution.h>
 #include <rune/node/Worker.h>
@@ -897,11 +898,17 @@ ConfigResult parseNodeConfig(
                 return {{}, std::string("RUNE_GROUP_MAX_SESSION_TIMEOUT_MS must be a positive integer, got: ") + rawMax};
             cfg.groupMaxSessionTimeoutMs = v;
         }
-        if (cfg.groupMinSessionTimeoutMs > 0 && cfg.groupMaxSessionTimeoutMs > 0 &&
-            cfg.groupMinSessionTimeoutMs > cfg.groupMaxSessionTimeoutMs)
-            return {{}, "RUNE_GROUP_MIN_SESSION_TIMEOUT_MS (" + std::to_string(cfg.groupMinSessionTimeoutMs) +
-                            ") must not exceed RUNE_GROUP_MAX_SESSION_TIMEOUT_MS (" +
-                            std::to_string(cfg.groupMaxSessionTimeoutMs) + ")"};
+        // #499 review: the EFFECTIVE bounds are compared (an unset one is its default), so a minimum above the
+        // default maximum - or a maximum below the default minimum - is refused too, never silently clamped.
+        const int32_t effMin = cfg.groupMinSessionTimeoutMs > 0 ? cfg.groupMinSessionTimeoutMs
+                                                                : GroupCoordinationService::kDefaultMinSessionTimeoutMs;
+        const int32_t effMax = cfg.groupMaxSessionTimeoutMs > 0 ? cfg.groupMaxSessionTimeoutMs
+                                                                : GroupCoordinationService::kDefaultMaxSessionTimeoutMs;
+        if (effMin > effMax)
+            return {{}, "RUNE_GROUP_MIN_SESSION_TIMEOUT_MS (" + std::to_string(effMin) +
+                            (cfg.groupMinSessionTimeoutMs > 0 ? "" : ", the default") +
+                            ") must not exceed RUNE_GROUP_MAX_SESSION_TIMEOUT_MS (" + std::to_string(effMax) +
+                            (cfg.groupMaxSessionTimeoutMs > 0 ? "" : ", the default") + ")"};
     }
 
     // --- RUNE_SURVIVOR_LEADER_ELECTION (optional, default OFF) — review
