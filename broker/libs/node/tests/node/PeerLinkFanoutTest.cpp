@@ -1,5 +1,5 @@
 // PeerLinkFanoutTest.cpp — authentication plan Task 15 (D33): the control thread hands an established link's keys to
-// every worker (lifecycle ring) and the admin thread (control -> admin ring); resumable, newest epoch wins.
+// every worker (lifecycle ring) and the admin thread (control -> admin ring); resumable, every epoch in order (#540).
 #include <rune/node/PeerLinkFanout.h>
 #include <rune/metadata/ShardRouter.h>
 #include <rune/replication/WorkerReplicationTransport.h>
@@ -96,21 +96,70 @@ TEST(PeerLinkFanoutRegression, AFullWorkerRingIsRetriedAndOnlyTheMissingDestinat
     EXPECT_EQ(f.deliveredForTest(), 3u);
 }
 
-TEST(PeerLinkFanoutRegression, ANewerEpochSupersedesAnUndeliveredOlderOne) {
+// Issue #540: two re-handshakes complete while a worker's ring is full.  The worker must still install EVERY epoch, in
+// order (E2 then E3): the peer's plane may already seal under E2.  Mutation: the old "newest supersedes" post -> the
+// worker never holds E2 -> red.
+TEST(PeerLinkFanoutRegression, EveryEpochReachesAWorkerInOrderAcrossBackPressureRegression) {
+    for (int32_t workers : {1, 2}) {
+        auto p = pool(workers, /*ringBytes=*/4096);
+        OneToOneByteRing admin(1 << 12);
+        PeerLinkFanout f;
+        f.post(2, keysAt(1, 1));
+        (void)f.pump(p.get(), &admin);
+        drainAll(*p);
+        (void)adminMsgs(admin);
+        WorkerOp filler; filler.type = WorkerOp::Type::SessionClose; filler.sessionId = 1;
+        while (p->worker(workers - 1).tryEnqueueOp(filler)) {}
+        f.post(2, keysAt(2, 2));
+        (void)f.pump(p.get(), &admin);           // the last worker's ring is full
+        f.post(2, keysAt(3, 3));
+        (void)f.pump(p.get(), &admin);
+        EXPECT_EQ(f.pendingForTest(), 2u) << workers << " workers: both epochs are pending";
+        for (int i = 0; i < 8 && f.pendingForTest() > 0; ++i) {
+            for (int32_t w = 0; w < workers; ++w) p->worker(w).doWork(1);
+            (void)f.pump(p.get(), &admin);
+        }
+        EXPECT_EQ(f.pendingForTest(), 0u);
+        drainAll(*p);
+        for (int32_t w = 0; w < workers; ++w) {
+            EXPECT_TRUE(workerHolds(*p, w, 2, 2)) << "worker " << w << " skipped E2";
+            EXPECT_TRUE(workerHolds(*p, w, 2, 3)) << "worker " << w;
+            EXPECT_EQ(p->worker(w).peerLinkEpochForTest(2), 3u) << "worker " << w << ": E2 then E3, in order";
+            EXPECT_EQ(p->worker(w).peerLinkKeysSeenForTest(), 3u) << "worker " << w << ": E1, E2, E3 once each";
+        }
+        const auto msgs = adminMsgs(admin);
+        ASSERT_EQ(msgs.size(), 2u);
+        EXPECT_EQ(msgs[0].epoch, 2u);
+        EXPECT_EQ(msgs[1].epoch, 3u);
+    }
+}
+
+// Issue #540: more than kEpochSlots epochs pending for one peer - a destination would evict the oldest anyway, so the
+// fanout drops (scrubs) the oldest pending entry and delivers the newest kEpochSlots in order.
+TEST(PeerLinkFanoutRegression, MoreThanKEpochSlotsPendingDropsTheOldestRegression) {
+    constexpr uint32_t kSlots = static_cast<uint32_t>(rune::peerlink::PeerFrameCrypto::kEpochSlots);
     auto p = pool(1, /*ringBytes=*/4096);
-    OneToOneByteRing admin(1 << 12);
-    WorkerOp filler; filler.type = WorkerOp::Type::SessionClose; filler.sessionId = 1;
-    while (p->worker(0).tryEnqueueOp(filler)) {}
     PeerLinkFanout f;
     f.post(2, keysAt(1, 1));
-    (void)f.pump(p.get(), &admin);
-    f.post(2, keysAt(2, 2));                 // the peer restarted before worker 0 took epoch 1
-    EXPECT_EQ(f.pendingForTest(), 1u);
-    p->worker(0).doWork(1);
-    (void)f.pump(p.get(), &admin);
+    (void)f.pump(p.get(), nullptr);
     drainAll(*p);
-    EXPECT_EQ(p->worker(0).peerLinkEpochForTest(2), 2u);
-    EXPECT_EQ(p->worker(0).peerLinkKeysSeenForTest(), 1u) << "the stale epoch was never sent to the worker";
+    WorkerOp filler; filler.type = WorkerOp::Type::SessionClose; filler.sessionId = 1;
+    while (p->worker(0).tryEnqueueOp(filler)) {}
+    for (uint32_t e = 2; e <= 2 + kSlots; ++e) {
+        f.post(2, keysAt(e, static_cast<uint8_t>(e)));
+        (void)f.pump(p.get(), nullptr);
+    }
+    EXPECT_EQ(f.pendingForTest(), static_cast<std::size_t>(kSlots)) << "capped at kEpochSlots per peer";
+    f.post(3, keysAt(1, 9));                     // another peer is never capped by peer 2's entries
+    EXPECT_EQ(f.pendingForTest(), static_cast<std::size_t>(kSlots) + 1);
+    for (int i = 0; i < 8 && f.pendingForTest() > 0; ++i) { p->worker(0).doWork(1); (void)f.pump(p.get(), nullptr); }
+    EXPECT_EQ(f.pendingForTest(), 0u);
+    drainAll(*p);
+    EXPECT_FALSE(workerHolds(*p, 0, 2, 2)) << "the oldest pending epoch was dropped";
+    for (uint32_t e = 3; e <= 2 + kSlots; ++e) EXPECT_TRUE(workerHolds(*p, 0, 2, e)) << e;
+    EXPECT_EQ(p->worker(0).peerLinkEpochForTest(2), 2 + kSlots);
+    EXPECT_EQ(p->worker(0).peerLinkEpochForTest(3), 1u);
+    EXPECT_EQ(p->worker(0).peerLinkKeysSeenForTest(), 1u + kSlots + 1u);
 }
 
 TEST(PeerLinkFanoutRegression, NoAdminRingNoWorkersStillDrains) {
