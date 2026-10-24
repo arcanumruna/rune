@@ -2619,16 +2619,24 @@ TEST(ReplicaLifetimeRegression, MarkerAppendedBeforeTxnCompletesRegression) {
     EXPECT_EQ(t.endTxn(/*commit=*/true), 0) << "EndTxn OK once PrepareCommit is durable (#38)";
     EXPECT_EQ(t.tcs.txnStateForTest(t.txnId), rune::transaction::TxnState::PrepareCommit) << "the marker is in flight";
     EXPECT_EQ(t.tcs.awaitingMarkerTxnsForTest(), 1u);
-    EXPECT_EQ(t.addPartition(), kConcurrent) << "next txn refused (retriable) until the marker lands";
+    // #557: the next txn's first legs are parked (before #557: 27) until the marker lands; an EndTxn retry is 27.
+    EXPECT_EQ(t.addPartition(), -1) << "next txn held (parked) until the marker lands";
     EXPECT_EQ(t.endTxn(true), kConcurrent);
-    EXPECT_EQ(t.initPid(), kConcurrent);
+    EXPECT_EQ(t.initPid(), -1) << "parked";
+    EXPECT_EQ(t.tcs.parkedNextTxnRequests(), 2u);
     EXPECT_TRUE(t.controlFrames.empty());
     for (int i = 0; i < 64 && t.tcs.awaitingMarkerTxnsForTest() > 0; ++i) t.m.runWorker(1 + i);   // bounded
     ASSERT_EQ(t.tcs.awaitingMarkerTxnsForTest(), 0u) << "completed when the last marker landed";
     EXPECT_EQ(t.tcs.txnStateForTest(t.txnId), rune::transaction::TxnState::CompleteCommit)
         << "CompleteCommit once the marker landed";
-    EXPECT_TRUE(t.controlFrames.empty()) << "a second EndTxn answer was sent when the marker landed";
-    EXPECT_EQ(t.addPartition(), 0) << "the next transaction may start now";
+    EXPECT_TRUE(t.controlFrames.empty()) << "a second EndTxn answer (or a parked leg) was sent inside the completion";
+    (void)t.tcs.doWork(100);                                 // the parked legs are answered, in arrival order
+    ASSERT_EQ(t.controlFrames.size(), 2u);
+    const auto ap = pc::AddPartitionsToTxnResponse::decode(t.controlFrames[0].data(), t.controlFrames[0].size());
+    const auto ip = pc::InitProducerIdResponse::decode(t.controlFrames[1].data(), t.controlFrames[1].size());
+    ASSERT_TRUE(ap && !ap->results.empty() && ip);
+    EXPECT_EQ(ap->results[0].errorCode, 0) << "the next transaction started once the marker landed";
+    EXPECT_EQ(ip->errorCode, 0);
 }
 
 TEST(ReplicaLifetimeRegression, FullReturnRingDoesNotReorderMarkerVsProduceResultRegression) {
@@ -2679,11 +2687,17 @@ TEST(ReplicaLifetimeRegression, AbortedTxnRangeNeverCoversNextTxnRegression) {
     t.produceTxn("txn1");
     ASSERT_EQ(t.endTxn(/*commit=*/false), 0) << "OK once PrepareAbort is durable (#38)";
     ASSERT_EQ(t.tcs.txnStateForTest(t.txnId), rune::transaction::TxnState::PrepareAbort) << "the marker is in flight";
-    // The producer retries its next transaction (ConcurrentTransactions is
-    // retriable) — it can only begin once txn1's marker landed.
-    int tries = 0;
-    for (; tries < 64 && t.addPartition() == kConcurrent; ++tries) t.m.runWorker(1 + tries);
-    ASSERT_LT(tries, 64);
+    // The producer's next transaction can only begin once txn1's marker landed: #557 parks its AddPartitions and
+    // answers it on the coordinator's first pass after the marker landed.
+    ASSERT_EQ(t.addPartition(), -1) << "parked until txn1's marker landed";
+    for (int i = 0; i < 64 && t.tcs.awaitingMarkerTxnsForTest() > 0; ++i) t.m.runWorker(1 + i);
+    ASSERT_EQ(t.tcs.awaitingMarkerTxnsForTest(), 0u);
+    (void)t.tcs.doWork(90);
+    ASSERT_EQ(t.controlFrames.size(), 1u);
+    const auto ap = pc::AddPartitionsToTxnResponse::decode(t.controlFrames[0].data(), t.controlFrames[0].size());
+    ASSERT_TRUE(ap && !ap->results.empty());
+    ASSERT_EQ(ap->results[0].errorCode, 0);
+    t.controlFrames.clear();
     t.produceTxn("txn2");
     for (int i = 0; i < 8; ++i) t.m.runWorker(100 + i);
     ASSERT_EQ(t.endTxn(false), 0) << "OK once PrepareAbort is durable (#38)";

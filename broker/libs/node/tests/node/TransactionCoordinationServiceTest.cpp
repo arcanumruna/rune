@@ -1885,3 +1885,54 @@ TEST_F(TxnStateReplicationTest, AHoldIsKeptWhileTheCompleteRecordAppendIsRefused
     EXPECT_EQ(svc_->txnOffsetHold("cgr", key), H::Free) << "the hold never cleared once the record committed";
     EXPECT_EQ(t.commit("tx-rb", pb, epB, "cgr", 50, now_), 0);
 }
+
+// ===========================================================================
+// #562: a refused __transaction_state put leaves the store's index (and lastPutOffset_) on the id's PREVIOUS record.
+// Nothing may take that older record as the current state's: after a refusal the id's current state is NOT persisted
+// (kUnpersisted) until a put of it succeeds.  The EndTxn / prepare-gate half needs the real gateway's marker path:
+// TxnPrepareGateRegression.ARefusedPrepareNeverOpensOnThePreviousTxnsCommittedRecordRegression in
+// tests/integration/F15EosRegressionTest.cpp.
+// ===========================================================================
+class TxnPrepareGateRegression : public TxnStateReplicationTest {
+protected:
+    /// The request's synchronous answer, or the deferred one released once its record commits.
+    int16_t addPartitions(const std::string& txn, int64_t pid, int16_t ep, int32_t partition) {
+        const pc::TxnTopicPartition tp{0, partition};
+        const std::size_t n = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, pid, ep, txn,
+                                                  std::span<const pc::TxnTopicPartition>(&tp, 1));
+        std::size_t k = svc_->handleAddPartitions(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size());
+        const uint8_t* a = outBuf_.data();
+        if (k == 0) {
+            answers_.frames.clear();
+            followerFetches();
+            (void)svc_->doWork(now_);
+            if (answers_.frames.size() != 1u) return -1;
+            a = answers_.frames[0].data();
+            k = answers_.frames[0].size();
+        }
+        const auto r = pc::AddPartitionsToTxnResponse::decode(a, k);
+        answers_.frames.clear();
+        return r && r->results.size() == 1 ? r->results[0].errorCode : int16_t{-1};
+    }
+};
+
+// The produce-side sibling (verifyTxnPartition): a registration whose put was refused is not durable, so a
+// transactional produce into it is refused retriably (27) - never accepted on the id's OLDER committed record.
+TEST_F(TxnPrepareGateRegression, AProduceIntoARegistrationWhosePutWasRefusedIsRetriableRegression) {
+    constexpr int16_t kNotCoord = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+    constexpr int16_t kConcurrent = static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions);
+    int16_t ep = 0;
+    const int64_t pid = initPid("tx562p", ep);              // its InitProducerId record is committed
+    ASSERT_GE(pid, 0);
+    replica_->setMinIsrForTest(3);
+    ASSERT_EQ(addPartitions("tx562p", pid, ep, 0), kNotCoord);
+    ASSERT_EQ(svc_->txnStateForTest("tx562p"), tx::TxnState::Ongoing) << "precondition: registered in memory";
+    EXPECT_EQ(svc_->verifyTxnPartition(pid, ep, 0, 0, now_), kConcurrent)
+        << "a produce was accepted into a registration that is not in the log";
+    EXPECT_EQ(kConcurrent, 27);
+
+    // The client's retry is appended and commits: the produce is accepted.
+    replica_->setMinIsrForTest(1);
+    ASSERT_EQ(addPartitions("tx562p", pid, ep, 0), 0);
+    EXPECT_EQ(svc_->verifyTxnPartition(pid, ep, 0, 0, now_), 0);
+}

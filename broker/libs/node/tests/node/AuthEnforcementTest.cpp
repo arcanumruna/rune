@@ -209,11 +209,61 @@ TEST(AuthEnforcementRegression, TransactionRowsAllowedAndDenied) {
     EXPECT_EQ(r.endTxn(none, "tx1"), kNotAuthorized);
 }
 
-// #277: intended (design D18) - a non-transactional producer id is unprivileged; every produce made with it is checked for WRITE.
-TEST(AuthEnforcementRegression, NonTransactionalInitProducerIdNeedsNoGrantRegression) {
+// #211 (Kafka's rule; replaces the #277 pin "needs no grant"): a non-transactional InitProducerId needs WRITE on at
+// least one topic - literal, prefixed or wildcard.  A zero-grant (or READ-only) principal is refused 45 and mints no
+// producer id (each id costs pid space; a replicated block commit every 1000), and a live REVOKE of its last WRITE
+// refuses it again at once.  RED: drop the anyTopicWrite check in ClientGateway::denyTxnRequest_ (every call is OK).
+TEST(AuthTxnRegression, NonTransactionalInitProducerIdNeedsAWriteGrantRegression) {
+    using SP = rune::protocol::SecurityPatternKind;
     AuthRig r;
     const int64_t none = r.newUser({});
-    EXPECT_EQ(r.initProducerId(none, ""), kOk) << "D18: its produces are checked, not the id";
+    const int64_t reader = r.newUser({exact(SO::Read, ST::Topic, "orders")});
+    std::string writerName;
+    const int64_t writer = r.newUser({exact(SO::Write, ST::Topic, "orders")}, &writerName);
+    const int64_t prefixed = r.newUser({prefix(SO::Write, ST::Topic, "ord")});
+
+    const auto first = r.initProducer(writer);
+    ASSERT_EQ(first.code, kOk) << "WRITE on one topic";
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(r.initProducerId(none, ""), kNotAuthorized) << "zero grants";
+        EXPECT_EQ(r.initProducerId(reader, ""), kNotAuthorized) << "READ is not WRITE";
+    }
+    const auto second = r.initProducer(prefixed);
+    ASSERT_EQ(second.code, kOk) << "a prefixed WRITE";
+    EXPECT_EQ(rune::protocol::producerIdCounter(second.pid), rune::protocol::producerIdCounter(first.pid) + 1)
+        << "a refused InitProducerId allocated a producer id";
+
+    auto& admin = r.broker().admin();
+    ASSERT_EQ(admin.revoke(r.ch(), r.broker().adminSession(), writerName, false, SO::Write, ST::Topic, SP::Exact,
+                           "orders").errorCode, 0u);
+    EXPECT_EQ(r.initProducerId(writer, ""), kNotAuthorized) << "after a live REVOKE of the last WRITE";
+    EXPECT_EQ(r.initProducer(prefixed).code, kOk) << "the other principal is untouched";
+}
+
+// PR #609 adversarial review (#211, auth class): WRITE on some topic is what counts, however it is held.  Grants of
+// every other kind - WRITE on a transactional id, READ on a group, CREATE/ALTER/DESCRIBE/ADMIN on CLUSTER, CREATE on
+// a topic - never mint a non-transactional producer id; WRITE held only through a ROLE does, and revoking that role
+// mid-session refuses the very next one.  RED: drop the #211 check in ClientGateway::denyTxnRequest_.
+TEST(AuthTxnRegression, NonTransactionalInitProducerIdCountsOnlyTopicWriteHoweverHeldAdversarialRegression) {
+    using SP = rune::protocol::SecurityPatternKind;
+    AuthRig r;
+    const int64_t others = r.newUser({exact(SO::Write, ST::TransactionalId, "tx1"), exact(SO::Read, ST::Group, "cg"),
+                                      exact(SO::Create, ST::Topic, "orders"), exact(SO::Read, ST::Topic, "orders"),
+                                      exact(SO::Create, ST::Cluster, ""), exact(SO::Alter, ST::Cluster, ""),
+                                      exact(SO::Describe, ST::Cluster, ""), exact(SO::Admin, ST::Cluster, "")});
+    EXPECT_EQ(r.initProducerId(others, ""), kNotAuthorized) << "no grant of WRITE on a topic";
+
+    AuthWireClient& aw = r.broker().admin();
+    const int64_t as = r.broker().adminSession();
+    ASSERT_EQ(aw.createRole(r.ch(), as, "writers211").errorCode, 0u);
+    ASSERT_EQ(aw.grant(r.ch(), as, "writers211", true, SO::Write, ST::Topic, SP::Prefix, "ord").errorCode, 0u);
+    std::string name;
+    const int64_t viaRole = r.newUser({}, &name);
+    EXPECT_EQ(r.initProducerId(viaRole, ""), kNotAuthorized) << "precondition: no grant yet";
+    ASSERT_EQ(aw.grantRole(r.ch(), as, name, "writers211").errorCode, 0u);
+    EXPECT_EQ(r.initProducerId(viaRole, ""), kOk) << "WRITE held through a role";
+    ASSERT_EQ(aw.revokeRole(r.ch(), as, name, "writers211").errorCode, 0u);
+    EXPECT_EQ(r.initProducerId(viaRole, ""), kNotAuthorized) << "the role revoked mid-session";
 }
 
 // Issue #122: a producer id is bound to the principal it was issued to.  Users m and ws2 both hold WRITE on the topic;

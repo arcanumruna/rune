@@ -373,3 +373,33 @@ TEST(AuthorizerRegression, AnUnknownSchemaNameAcceptsEitherKindsGrantRegression)
         << "a dropped name is unknown again";
     EXPECT_TRUE(rg::authorizeTopicOrViewName(viewOnly, "orders", Operation::Describe, idx).has_value());
 }
+
+// #211: hasAnyGrant(type, op) - any literal, prefixed or wildcard grant of `op` ON that type, kept at compile time
+// (O(1) per request); allow-all always, deny-all never; READ is not WRITE, a group / transactional-id / CLUSTER grant
+// is not a topic grant.  authorizeAnyGrant denies with 45 and names no resource.
+TEST(PermissionTableRegression, HasAnyGrantCountsEveryPatternOfThatTypeAndOpRegression) {
+    rg::ObjectIndex idx; idx.onTopic(0, "orders");
+    const auto has = [&](std::vector<rs::GrantSpec> gs) {
+        return rg::PermissionTable::compile(gs, idx).hasAnyGrant(ResourceType::Topic, Operation::Write);
+    };
+    EXPECT_TRUE(has({g(Operation::Write, ResourceType::Topic, PatternKind::Exact, "orders")}));
+    EXPECT_TRUE(has({g(Operation::Write, ResourceType::Topic, PatternKind::Exact, "not-created-yet")}));
+    EXPECT_TRUE(has({g(Operation::Write, ResourceType::Topic, PatternKind::Prefix, "ord")}));
+    EXPECT_TRUE(has({g(Operation::Write, ResourceType::Topic, PatternKind::Prefix, "")})) << "wildcard";
+    EXPECT_FALSE(has({}));
+    EXPECT_FALSE(has({g(Operation::Read, ResourceType::Topic, PatternKind::Prefix, "")})) << "READ is not WRITE";
+    EXPECT_FALSE(has({g(Operation::Write, ResourceType::TransactionalId, PatternKind::Prefix, ""),
+                      g(Operation::Read, ResourceType::Group, PatternKind::Prefix, ""),
+                      g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")}));
+    EXPECT_FALSE(has({g(Operation::Write, ResourceType::View, PatternKind::Exact, "orders")}));
+    EXPECT_TRUE(rg::PermissionTable::allowAll().hasAnyGrant(ResourceType::Topic, Operation::Write));
+    EXPECT_FALSE(rg::PermissionTable::denyAll().hasAnyGrant(ResourceType::Topic, Operation::Write));
+
+    const auto none = rg::PermissionTable::compile(std::vector<rs::GrantSpec>{}, idx);
+    const auto d = rg::authorizeAnyGrant(none, ResourceType::Topic, Operation::Write);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->code, 45);
+    EXPECT_EQ(d->detail, "not authorized: WRITE on any TOPIC");
+    const auto w = rg::PermissionTable::compile(std::vector<rs::GrantSpec>{g(Operation::Write, ResourceType::Topic, PatternKind::Prefix, "x")}, idx);
+    EXPECT_FALSE(rg::authorizeAnyGrant(w, ResourceType::Topic, Operation::Write).has_value());
+}

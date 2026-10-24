@@ -11,6 +11,7 @@
 #include <rune/gateway/ObjectIndex.h>
 #include <rune/security/Permissions.h>
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <string_view>
@@ -38,6 +39,14 @@ public:
     /// Name-addressed (groups, transactional ids, DDL names): the retained patterns matched against `name`.  Cold.
     [[nodiscard]] bool allowsName(rune::security::ResourceType, std::string_view name, uint8_t opBits) const noexcept;
     [[nodiscard]] bool isAllowAll() const noexcept { return allowAll_; }
+    /// #211: true when the table holds `op` on at least one resource of `type` - any literal, prefixed or wildcard
+    /// grant ON that type (allow-all: always).  O(1): kept when the table is compiled (a grant change recompiles it).
+    /// Only the type's own grants count (no CLUSTER implication), which is exact for READ / WRITE (a CLUSTER grant
+    /// cannot hold them).
+    [[nodiscard]] bool hasAnyGrant(rune::security::ResourceType type, rune::security::Operation op) const noexcept {
+        const auto t = static_cast<std::size_t>(type);
+        return allowAll_ || (t < anyOps_.size() && (anyOps_[t] & rune::security::opBit(op)) != 0);
+    }
     /// The retained effective grants (sorted, unique) - what Task 14 diffs across a refresh.  Empty for allow-all / deny-all.
     [[nodiscard]] std::span<const rune::security::GrantSpec> grants() const noexcept { return grants_; }
 
@@ -52,6 +61,7 @@ private:
     void setOps_(int32_t id, uint8_t ops);
     bool allowAll_ = false;
     uint8_t clusterOps_ = 0;
+    std::array<uint8_t, 5> anyOps_{};                   // #211: op bits granted on ANY resource, per ResourceType
     std::vector<uint8_t> ops_;                          // by object id; capacity persists
     std::vector<rune::security::GrantSpec> grants_;     // retained for onObjectCreated / allowsName
     std::vector<uint64_t> writeBits_;                   // WRITE bit per id, kept in step with ops_
