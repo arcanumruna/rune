@@ -9,6 +9,7 @@
 // only waits are condition waits with a hard iteration cap.
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/GatewayReplicaView.h>
+#include <rune/gateway/SecurityView.h>
 #include <rune/node/OrderedWaitQueue.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
@@ -7519,13 +7520,14 @@ int16_t addPartitionOn(TxnRig& T, int64_t sessionId, int16_t epoch) {
     const auto a = legAnswer(NextLeg::AddPartitions, T.out.data(), n);
     return a ? a->first : int16_t{-1};
 }
-enum class SessionFate { Kept, GrantsRevoked, Closed, Revoked };
+enum class SessionFate { Kept, GrantsRevoked, Closed, Revoked, SecurityBehind };
 const char* fateName(SessionFate f) {
     switch (f) {
         case SessionFate::Kept:          return "kept";
         case SessionFate::GrantsRevoked: return "grants revoked";
         case SessionFate::Closed:        return "session closed";
         case SessionFate::Revoked:       return "session revoked";
+        case SessionFate::SecurityBehind: return "security view behind";
     }
     return "?";
 }
@@ -7540,7 +7542,7 @@ const char* fateName(SessionFate f) {
 TEST(NextTxnParkRegression, AParkedLegRunsOnlyForALiveSessionThatStillHoldsItsGrantsAdversarialRegression) {
     for (const NextLeg leg : {NextLeg::InitProducerId, NextLeg::AddOffsets}) {
         for (const SessionFate fate : {SessionFate::Kept, SessionFate::GrantsRevoked, SessionFate::Closed,
-                                       SessionFate::Revoked}) {
+                                       SessionFate::Revoked, SessionFate::SecurityBehind}) {
             SCOPED_TRACE(std::string(legName(leg)) + " / " + fateName(fate));
             TxnRig T;
             T.m.cap.keepFrames = true;
@@ -7560,12 +7562,19 @@ TEST(NextTxnParkRegression, AParkedLegRunsOnlyForALiveSessionThatStillHoldsItsGr
             ASSERT_TRUE(answersTo(leg, T.m.cap.frames, corr).empty()) << "precondition: not answered yet";
 
             const uint64_t denied0 = T.m.gw.notAuthorizedAnswers();
+            rune::gateway::SecurityView view{rune::security::SecurityState{}};
             switch (fate) {
                 case SessionFate::Kept: break;
                 case SessionFate::GrantsRevoked: T.m.gw.authenticateWithGrantsForTest(T.sid, 7, {}); break;
                 case SessionFate::Closed:        T.m.gw.closeSessionForTest(T.sid); break;
                 case SessionFate::Revoked:       T.m.gw.revokeAllSessionsForTest("pr609"); break;
+                case SessionFate::SecurityBehind:   // #603: held __security events may revoke the grant: not run now
+                    T.m.gw.setAuthMode(rune::gateway::GatewayAuthMode::Required, &view);
+                    T.m.gw.setSecurityBehind(true);
+                    ASSERT_TRUE(T.m.gw.securityBehind());
+                    break;
             }
+            const uint64_t behind0 = T.m.gw.securityBehindRefusals();
             T.runUntilNoMarkerAwaited(10);
             (void)T.tcs->doWork(20);
             EXPECT_EQ(T.tcs->parkedNextTxnRequests(), 0u) << "left parked";
@@ -7585,6 +7594,8 @@ TEST(NextTxnParkRegression, AParkedLegRunsOnlyForALiveSessionThatStillHoldsItsGr
             for (const int16_t e : egress) EXPECT_NE(e, 0) << "answered OK";
             if (fate == SessionFate::GrantsRevoked)
                 EXPECT_EQ(T.m.gw.notAuthorizedAnswers(), denied0 + 1) << "a revoked grant is answered 45, once";
+            if (fate == SessionFate::SecurityBehind)
+                EXPECT_EQ(T.m.gw.securityBehindRefusals(), behind0 + 1) << "answered AuthUnavailable, once";
         }
     }
 }

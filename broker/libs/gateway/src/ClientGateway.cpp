@@ -8709,6 +8709,15 @@ bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint
     return deny_(session, d, buf, len);
 }
 
+bool ClientGateway::readmitParkedTxnRequest(int64_t sessionId, uint16_t tid, const uint8_t* buf, std::size_t len)
+{
+    Session* s = sessions_.find(sessionId);
+    if (s == nullptr) return false;                                                 // closed while parked
+    if (authGateRefuses_(static_cast<pc::TemplateId>(tid), buf, len)) return false;   // answered by the gate (#603 too)
+    s = sessions_.find(sessionId);                                                  // the gate may have ended it
+    return s != nullptr && !denyTxnRequest_(*s, tid, buf, len);                     // 45 when a grant went meanwhile
+}
+
 bool ClientGateway::denyTxnRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len)
 {
     namespace rsec = rune::security;
