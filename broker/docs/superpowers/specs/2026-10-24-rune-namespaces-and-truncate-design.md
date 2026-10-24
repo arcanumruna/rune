@@ -148,7 +148,7 @@ Only the cluster admin can set these, in one `NamespaceLimits` record per namesp
    - enforcement of counts, storage, memory and control-plane limits;
    - rate token buckets and the bench.
 3. **TruncateTopic:** wire, broker, replication and client, plus the CLI.
-4. **CLI:** rename to `arcanum` with the `rune` subcommand and symlink; `topic truncate`, `topic list` and `namespace` commands. The platform commands in §10.2 come with the control-plane service.
+4. **CLI:** `rune` reads the shared Arcanum login context; `arcanum` plugin dispatch; `topic truncate`, `topic list` and `namespace` commands. The platform commands in §10.2 come with the control-plane service.
 
 ## 8. Interaction matrix
 Operations × entities × timings:
@@ -175,10 +175,15 @@ Required:
 - **Truncate correctness:** the start never moves backwards; followers and views stay correct; the HW clamp holds.
 - **Hot path:** zero allocations and the ABAB bench for the token buckets.
 
-## 10. CLI: `arcanum` with `rune` as a service subcommand
+## 10. CLI: `arcanum` (platform) and `rune` (service)
 The platform CLI is `arcanum`. Rune is one service under it; more services will follow.
 
-**Rename.** The existing `rune` binary becomes `arcanum`. Every existing command moves under `arcanum rune ...` with the same flags and behaviour. A `rune` symlink is kept so that `rune <cmd>` equals `arcanum rune <cmd>`, and existing scripts and the docker e2e keep working. Tests, docs and the docker images are updated to the new name.
+**Two binaries, with one shared login.** The `kubectl`/`gcloud` split.
+- **`arcanum`:** the platform CLI, for accounts, projects, deploy and teardown (§10.2).
+- **`rune`:** the Rune service CLI, the existing binary with every command unchanged: `rune schema list`, `rune console` and so on. You never have to type an `arcanum` prefix.
+- **Shared context:** both read the same login and current project from the Arcanum config directory. `rune` resolves the endpoint and credentials from there, so `--broker` is not needed after `arcanum login`.
+- **Plugins:** `arcanum <service> <args>` runs the service's binary with those args, the way `git` runs its plugins, so `arcanum rune schema list` equals `rune schema list`. Future services ship their own binary the same way.
+- **Self-hosted:** `rune` with no login works exactly as today, using `--broker` and `--user`/`--password-file`.
 
 ### 10.1 Platform model
 - **Account:** owns projects, billing and users. You sign in with `arcanum login`.
@@ -191,7 +196,7 @@ The platform CLI is `arcanum`. Rune is one service under it; more services will 
 | `dev` | paid | A dedicated single-node cluster. The project gets the `default` namespace and its owner is the namespace admin. |
 | `pro` | paid | A dedicated 3-node cluster (acks=all, failover), with higher limits and other benefits. |
 
-The client API and the `arcanum rune` commands are the same on every tier. Only the endpoint and the limits differ.
+The client API and the `rune` commands are the same on every tier. Only the endpoint and the limits differ.
 
 ### 10.2 Platform commands
 These are served by the Arcanum control-plane service, not by the broker. That service is a separate project and comes later; this section fixes the command shape.
@@ -203,7 +208,7 @@ These are served by the Arcanum control-plane service, not by the broker. That s
 | `arcanum whoami` | Shows the account, the current project and the token's expiry. |
 | `arcanum list` | Lists the account's projects, each with its deployments, tier and status. |
 | `arcanum project create\|delete <name>` | Creates or deletes a project. Delete refuses while the project still has deployments. |
-| `arcanum use <project>` | Sets the current project. Every command also takes `--project`. |
+| `arcanum use <project>` | Sets the current project. Every `arcanum` and `rune` command also takes `--project`. |
 | `arcanum deploy rune --tier testing\|dev\|pro` | Provisions Rune for the current project (later). |
 | `arcanum status [rune]` | Shows the deployment's state, endpoint, tier and limit usage. |
 | `arcanum upgrade rune --tier <tier>` | Changes the tier (later). Moving data between `testing` and `dev`/`pro` is a migration job. |
@@ -211,10 +216,8 @@ These are served by the Arcanum control-plane service, not by the broker. That s
 
 Product decision for later: whether teardown is immediate, or keeps a recoverable grace period on paid tiers.
 
-### 10.3 `arcanum rune` commands
-- **Connection:**
-  - When signed in, the endpoint and credentials come from the current project, so `--broker` is not needed. The control plane hands out the namespace-admin SCRAM credential, and the CLI caches it with mode 0600.
-  - Self-hosted use without `login` stays exactly as today, with `--broker` and `--user`/`--password-file`.
+### 10.3 `rune` commands
+- **Connection:** when signed in, the control plane hands out the namespace-admin SCRAM credential for the current project, and `rune` caches it with mode 0600.
 - **Existing commands, unchanged:**
   - `console`;
   - `ql`;
@@ -223,9 +226,9 @@ Product decision for later: whether teardown is immediate, or keeps a recoverabl
   - `security bootstrap|gen-cluster-key`.
   - Self-hosted only: `security bootstrap` and `gen-cluster-key`. On the platform these are run by the control plane.
 - **New commands from this spec:**
-  - `arcanum rune topic truncate <topic> [--partition N] [--before <offset>]`: TruncateTopic (§6).
-  - `arcanum rune namespace create|delete|suspend|resume|list|limits`: cluster admin only, so self-hosted or the control plane.
+  - `rune topic truncate <topic> [--partition N] [--before <offset>]`: TruncateTopic (§6).
+  - `rune namespace create|delete|suspend|resume|list|limits`: cluster admin only, so self-hosted or the control plane.
   - User and grant management is QL through `console` or `ql`, as today; it runs as a namespace admin.
 - **Review notes:**
   - `schema list` actually lists topics. Add `topic list` as the canonical command and keep `schema list` as an alias.
-  - Errors keep the `rune ...:` prefix inside `arcanum rune`.
+  - Error messages keep their existing `rune ...:` prefix.
