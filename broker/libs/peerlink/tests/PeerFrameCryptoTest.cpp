@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -313,4 +314,115 @@ TEST(PeerFrameCryptoRegression, AFrameUnderANewerEpochLatchesPeerUsedEpochRegres
     ASSERT_TRUE(rogue.installLink(2, linkFor(true, 3, 31, kBoth), 0));
     EXPECT_EQ(openOne(b, sealOne(rogue, 2)), OR::BadTag);
     EXPECT_FALSE(b.takePeerUsedEpoch(peer, epoch));
+}
+
+// Issue #584 (the residual): under slot pressure the receiver evicts a never-used receive-only epoch installed BEFORE
+// the send epoch - an exchange that was superseded and never promoted - rather than the oldest epoch, which the peer
+// (a lagging responder) may still seal under.  A former send epoch is never "abandoned": then the oldest rule holds.
+// Mutation: dropping the abandoned-epoch scan from installLink evicts epoch 1 in the first case -> red.
+TEST(PeerFrameCryptoRegression, EvictionPrefersAnAbandonedReceiveOnlyEpochRegression) {
+    using OR = pl::PeerFrameCrypto::OpenResult;
+    constexpr auto RO = pl::LinkInstall::ReceiveOnly;
+    constexpr auto SR = pl::LinkInstall::SendAndReceive;
+    auto baseOf = [](uint32_t e) { return static_cast<uint8_t>(10 * e); };
+    {
+        pl::PeerFrameCrypto b(2, 0), peer(1, 0);
+        ASSERT_TRUE(peer.installLink(2, linkFor(true, 1, baseOf(1)), 0));   // the peer still seals under epoch 1
+        ASSERT_TRUE(b.installLink(1, linkFor(false, 1, baseOf(1), SR), 0));
+        ASSERT_TRUE(b.installLink(1, linkFor(false, 2, baseOf(2), RO), 0));   // abandoned: never promoted, never opened
+        ASSERT_TRUE(b.installLink(1, linkFor(false, 3, baseOf(3), SR), 0));
+        ASSERT_EQ(b.currentEpoch(1), 3u);
+        ASSERT_TRUE(b.installLink(1, linkFor(false, 4, baseOf(4), RO), 0));   // slot pressure
+        EXPECT_FALSE(b.holdsEpoch(1, 2)) << "the abandoned receive-only epoch is the one evicted";
+        EXPECT_TRUE(b.holdsEpoch(1, 1)) << "a former send epoch the peer may still seal under is kept";
+        EXPECT_TRUE(b.holdsEpoch(1, 3));
+        EXPECT_TRUE(b.holdsEpoch(1, 4));
+        EXPECT_EQ(b.currentEpoch(1), 3u);
+        std::vector<uint8_t> wire(64), out(64);
+        const auto n = peer.seal(2, bytes("late"), 4, wire.data(), wire.size());
+        ASSERT_GT(n, 0u);
+        std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
+        EXPECT_EQ(b.open(wire.data(), n, out.data(), out.size(), outLen, from, epoch), OR::Ok);
+        EXPECT_EQ(epoch, 1u);
+    }
+    {   // Every held epoch was the send epoch once: none is abandoned, the oldest goes.
+        pl::PeerFrameCrypto b(2, 0);
+        for (uint32_t e = 1; e <= 4; ++e) ASSERT_TRUE(b.installLink(1, linkFor(false, e, baseOf(e), SR), 0)) << e;
+        EXPECT_FALSE(b.holdsEpoch(1, 1));
+        EXPECT_TRUE(b.holdsEpoch(1, 2));
+        EXPECT_TRUE(b.holdsEpoch(1, 3));
+        EXPECT_TRUE(b.holdsEpoch(1, 4));
+        EXPECT_EQ(b.currentEpoch(1), 4u);
+    }
+    {   // A receive-only epoch the peer already sealed under (opened a frame) is not abandoned either.
+        pl::PeerFrameCrypto b(2, 0), peer(1, 0);
+        ASSERT_TRUE(b.installLink(1, linkFor(false, 1, baseOf(1), SR), 0));
+        ASSERT_TRUE(b.installLink(1, linkFor(false, 2, baseOf(2), RO), 0));
+        ASSERT_TRUE(peer.installLink(2, linkFor(true, 2, baseOf(2)), 0));
+        std::vector<uint8_t> wire(64), out(64);
+        const auto n = peer.seal(2, bytes("e2"), 2, wire.data(), wire.size());
+        std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
+        ASSERT_EQ(b.open(wire.data(), n, out.data(), out.size(), outLen, from, epoch), OR::Ok);
+        ASSERT_TRUE(b.installLink(1, linkFor(false, 3, baseOf(3), SR), 0));
+        ASSERT_TRUE(b.installLink(1, linkFor(false, 4, baseOf(4), RO), 0));
+        EXPECT_FALSE(b.holdsEpoch(1, 1)) << "the oldest rule: epoch 2 opened a frame, so it is not abandoned";
+        EXPECT_TRUE(b.holdsEpoch(1, 2));
+    }
+}
+
+// Issue #546: the link masters are scrubbed when a LinkKeys dies (every evicted / replaced / superseded copy - the
+// handshake's states, Out::established, the transports' epoch slots - goes through this destructor).
+// Mutation: removing ~LinkKeys() leaves the master bytes in place -> red.
+TEST(PeerFrameCryptoRegression, ALinkKeysScrubsItsMastersOnDestructionRegression) {
+    alignas(pl::LinkKeys) unsigned char storage[sizeof(pl::LinkKeys)];
+    auto* k = new (storage) pl::LinkKeys();
+    k->epoch = 7;
+    k->sendMaster.fill(0xA5);
+    k->recvMaster.fill(0x5A);
+    const std::size_t sendOff = reinterpret_cast<unsigned char*>(k->sendMaster.data()) - storage;
+    const std::size_t recvOff = reinterpret_cast<unsigned char*>(k->recvMaster.data()) - storage;
+    ASSERT_EQ(storage[sendOff], 0xA5);
+    k->~LinkKeys();
+    for (std::size_t i = 0; i < 32; ++i) {
+        EXPECT_EQ(storage[sendOff + i], 0) << "sendMaster byte " << i;
+        EXPECT_EQ(storage[recvOff + i], 0) << "recvMaster byte " << i;
+    }
+    // A copy-assignment overwrites in place, and a copy still compares equal (the masters are values, not handles).
+    pl::LinkKeys a, b;
+    a.sendMaster.fill(1); b = a;
+    EXPECT_EQ(a, b);
+    b.scrub();
+    EXPECT_EQ(b.sendMaster, (std::array<uint8_t, 32>{}));
+}
+
+// Adversarial review of PR #619 (#584), Data integrity: the "abandoned" rule must never pick a receive-only epoch
+// installed AFTER the send epoch - that is the pending re-handshake the initiator already seals under, awaiting its
+// promotion.  Slot pressure (a newer install) then evicts the oldest former send epoch, and a frame under the pending
+// epoch still opens and latches its promotion.  Mutation: dropping `installOrder < sendOrder` from the abandoned scan
+// evicts the pending epoch -> red.
+TEST(PeerFrameCryptoRegression, APendingPromotionIsNeverEvictedAsAbandonedAdversarialRegression) {
+    using OR = pl::PeerFrameCrypto::OpenResult;
+    constexpr auto RO = pl::LinkInstall::ReceiveOnly;
+    constexpr auto SR = pl::LinkInstall::SendAndReceive;
+    auto baseOf = [](uint32_t e) { return static_cast<uint8_t>(10 * e); };
+    pl::PeerFrameCrypto b(2, 0), peer(1, 0);
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 1, baseOf(1), SR), 0));
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 2, baseOf(2), SR), 0));
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 3, baseOf(3), RO), 0));   // pending: the initiator seals under it
+    ASSERT_TRUE(peer.installLink(2, linkFor(true, 3, baseOf(3)), 0));
+    ASSERT_EQ(b.currentEpoch(1), 2u);
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 4, baseOf(4), RO), 0));   // slot pressure (a stale-window new exchange)
+    EXPECT_TRUE(b.holdsEpoch(1, 3)) << "the pending promotion is not abandoned";
+    EXPECT_FALSE(b.holdsEpoch(1, 1)) << "the oldest former send epoch goes";
+    EXPECT_TRUE(b.holdsEpoch(1, 2));
+    EXPECT_EQ(b.currentEpoch(1), 2u);
+    std::vector<uint8_t> wire(64), out(64);
+    const auto n = peer.seal(2, bytes("e3"), 2, wire.data(), wire.size());
+    ASSERT_GT(n, 0u);
+    std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
+    EXPECT_EQ(b.open(wire.data(), n, out.data(), out.size(), outLen, from, epoch), OR::Ok);
+    EXPECT_EQ(epoch, 3u);
+    int32_t p = -1; uint32_t used = 0;
+    EXPECT_TRUE(b.takePeerUsedEpoch(p, used));
+    EXPECT_EQ(used, 3u);
 }

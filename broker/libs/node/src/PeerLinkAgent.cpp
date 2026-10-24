@@ -77,6 +77,13 @@ void PeerLinkAgent::onFrame_(const uint8_t* b, std::size_t len, int64_t nowNs) {
             spdlog::warn("BrokerNode[{}]: peer-link frame from unknown node {} ignored", self_, from);
         return;
     }
+    // Issue #554: an unauthenticated Hello costs crypto to answer - at most kHelloAnswersPerCycle per duty cycle; the
+    // rest are dropped here, before decode or crypto, and counted.  A real initiator re-sends its Hello.
+    if (tag == static_cast<uint8_t>(pl::PeerMsg::Hello) || tag == static_cast<uint8_t>(pl::PeerMsg::HelloV2)) {
+        if (helloBudget_ <= 0) { ++helloShed_; return; }
+        --helloBudget_;
+        ++helloAnswered_;
+    }
     switch (static_cast<pl::PeerMsg>(tag)) {
     case pl::PeerMsg::Hello:     { pl::PeerHello m;     if (pl::PeerHello::decode(b, len, m))     absorb_(*p, p->hs.onHello(m, nowNs), nowNs);     else ++malformed_; break; }
     case pl::PeerMsg::Challenge: { pl::PeerChallenge m; if (pl::PeerChallenge::decode(b, len, m)) absorb_(*p, p->hs.onChallenge(m, nowNs), nowNs); else ++malformed_; break; }
@@ -92,6 +99,7 @@ void PeerLinkAgent::onFrame_(const uint8_t* b, std::size_t len, int64_t nowNs) {
 
 int PeerLinkAgent::doWork(int64_t nowNs) {
     lastNowNs_ = nowNs;
+    helloBudget_ = kHelloAnswersPerCycle;
     int work = sub_->poll(
         [this](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off, aeron::util::index_t len, aeron::Header&) {
             onFrame_(reinterpret_cast<const uint8_t*>(buf.buffer()) + off, static_cast<std::size_t>(len), lastNowNs_);

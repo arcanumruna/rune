@@ -24,10 +24,23 @@ namespace rune::peerlink {
 /// also becomes the send epoch (a first link, a restarted initiator, the initiator itself, the promotion).
 enum class LinkInstall : uint8_t { ReceiveOnly = 0, SendAndReceive = 1 };
 
+/// Issue #546: the masters are scrubbed when a LinkKeys dies, like EphSecret - every evicted, replaced or superseded
+/// copy (the handshake's states and Out, the transports' epoch slots, the fanout's pending entries) wipes its bytes.
+/// A copy- or move-assignment overwrites the old bytes in place.
 struct LinkKeys {
     uint32_t                epoch = 0;
     std::array<uint8_t, 32> sendMaster{}, recvMaster{};
     LinkInstall             install = LinkInstall::SendAndReceive;
+    LinkKeys() = default;
+    LinkKeys(const LinkKeys&) = default;
+    LinkKeys(LinkKeys&&) = default;
+    LinkKeys& operator=(const LinkKeys&) = default;
+    LinkKeys& operator=(LinkKeys&&) = default;
+    ~LinkKeys() { scrub(); }
+    void scrub() noexcept {
+        rune::crypto::secureZero({sendMaster.data(), sendMaster.size()});
+        rune::crypto::secureZero({recvMaster.data(), recvMaster.size()});
+    }
     bool operator==(const LinkKeys&) const = default;
 };
 
