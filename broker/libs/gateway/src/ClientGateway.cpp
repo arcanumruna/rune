@@ -1,6 +1,7 @@
 // ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 
 #include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/LogSafe.h>  // issue #232: client-supplied names in log lines
 #include <rune/view/PlanSources.h>
 #include <rune/gateway/ConnectDowngradePolicy.h>
 #include <rune/gateway/CryptoFrame.h>
@@ -1426,19 +1427,32 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
 // The evicted registration must be released: attempt a final
 // findExclusivePublication — see handleConnect.
 // ---------------------------------------------------------------------------
-void ClientGateway::evictOldestPendingConnect_()
+void ClientGateway::evictOldestPendingConnect_(std::string_view incomingHost)
 {
-    spdlog::warn("ClientGateway: pending-connect cap reached; dropping oldest entry");
-    const int64_t evictedRegId      = pendingConnects_.front().registrationId;
-    // DR-BUG-2 FIX: if the oldest entry has a stashed resolvedPub, the
-    // shared_ptr destructor (run by pop_front()) is sufficient to release the
+    // PR #611 review (issue #236's lockout through the pending table): the victim is the OLDEST entry of the source
+    // host holding the most entries, counting the incoming Connect for its host - so a host flooding Connects only
+    // ever evicts its own, and another host's pending Connect is evicted only when every host holds as many.  Hosts
+    // are known under GatewayAuthMode::Required only; otherwise every entry has the same (empty) host and this is the
+    // plain oldest-first eviction.  O(kMaxPendingConnects^2) string compares, no allocation: cold (one Connect).
+    auto victim = pendingConnects_.begin();
+    std::size_t most = 0;
+    for (auto it = pendingConnects_.begin(); it != pendingConnects_.end(); ++it) {
+        std::size_t n = it->sourceHost == incomingHost ? 1 : 0;
+        for (const PendingConnect& p : pendingConnects_) n += p.sourceHost == it->sourceHost ? 1 : 0;
+        if (n > most) { most = n; victim = it; }   // strict: the oldest entry of the largest host wins a tie
+    }
+    spdlog::warn("ClientGateway: pending-connect cap reached; dropping the oldest entry of the busiest source host");
+    PendingConnect& ev0 = *victim;
+    const int64_t evictedRegId      = ev0.registrationId;
+    // DR-BUG-2 FIX: if the evicted entry has a stashed resolvedPub, the
+    // shared_ptr destructor (run by erase()) is sufficient to release the
     // registration.  Do NOT call findExclusivePublication again — that would
     // touch a conductor entry that is already being released, and if it
     // returns nullptr we would push a stale regId to drainingRegistrations_
     // that never drains.  Only push to drain when resolvedPub==nullptr (pub
     // not yet resolved — the conductor still holds it in AWAITING state).
-    const bool evictedAlreadyResolved = (pendingConnects_.front().resolvedPub != nullptr) ||
-                                        pendingConnects_.front().awaitingResolve;   // nothing registered
+    const bool evictedAlreadyResolved = (ev0.resolvedPub != nullptr) ||
+                                        ev0.awaitingResolve;   // nothing registered
     // Fix round 3 (fix-on-sight): an evicted connect whose reply publication is
     // resolved is ANSWERED (ConnectResponse{Internal}, no session) — one offer:
     // the eviction exists to bound this table, so it is not retried (counted).
@@ -1446,7 +1460,7 @@ void ClientGateway::evictOldestPendingConnect_()
     // Handshaking ignores a ConnectResponse; it gets HandshakeContinueResponse:
     // the owed HandshakeFailed for a failing handshake, Internal (retriable)
     // for one still in progress.
-    if (const auto& ev = pendingConnects_.front(); ev.resolvedPub) {
+    if (const auto& ev = ev0; ev.resolvedPub) {
         std::size_t n = 0;
         if (ev.failingHandshake || ev.awaitingHandshake) {
             pc::HandshakeContinueResponse hr;
@@ -1468,10 +1482,10 @@ void ClientGateway::evictOldestPendingConnect_()
     }
     // Fix round 1 (I2): an evicted entry whose announcement began holds
     // worker ack-table slots — close it on every worker (never leaked).
-    closeDroppedPendingConnect_(pendingConnects_.front());
-    pendingConnects_.pop_front(); // O(1); drops resolvedPub shared_ptr if non-null
+    closeDroppedPendingConnect_(ev0);
+    pendingConnects_.erase(victim);   // drops resolvedPub shared_ptr if non-null
     if (!evictedAlreadyResolved && aeron_) abandonRegistration_(evictedRegId);
-    // If evictedAlreadyResolved: the drop of resolvedPub in pop_front() already
+    // If evictedAlreadyResolved: the drop of resolvedPub in erase() already
     // releases the registration — no findExclusivePublication needed, no drain entry.
 }
 
@@ -2120,7 +2134,11 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // ~ExclusivePublication()); if it throws (ERRORED), conductor already cleaned
     // up; if still AWAITING (nullptr returned), enqueue in drainingRegistrations_
     // and keep polling until it resolves.
-    if (pendingConnects_.size() >= kMaxPendingConnects) evictOldestPendingConnect_();
+    // D14: the source host (the throttle key and, issue #236, the unauthenticated-session cap's and the pending
+    // table's fairness key) - known under GatewayAuthMode::Required only (cold: one Connect).
+    std::string connectHost;
+    if (authMode_ == rune::gateway::GatewayAuthMode::Required) connectHost = sourceHostOf_(req.egressChannel);
+    if (pendingConnects_.size() >= kMaxPendingConnects) evictOldestPendingConnect_(connectHost);
 
     // Pre-allocate sessionId now so it is stable across cycles.
     const int64_t sessionId = sessions_.nextSessionId();
@@ -2134,12 +2152,25 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     pc_entry.egressChannel         = std::string(req.egressChannel);
     pc_entry.egressStreamId        = req.egressStreamId;
     pc_entry.clientVersion         = req.clientVersion;   // D6
+    pc_entry.sourceHost            = std::move(connectHost);   // every entry: the eviction's fairness key
     if (channelTooLongForShard) [[unlikely]]
         pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::InvalidRequest);
     if (refusedForVersion) [[unlikely]]
         pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::ProtocolVersion);   // wins over any other refusal
-    if (authMode_ == rune::gateway::GatewayAuthMode::Required && pc_entry.refuseCode == 0)
-        pc_entry.sourceHost = sourceHostOf_(pc_entry.egressChannel);   // D14: the throttle key (cold: one Connect)
+    if (authMode_ == rune::gateway::GatewayAuthMode::Required && pc_entry.refuseCode == 0) {
+        // Issue #236: an unauthenticated session holds its slot until the auth deadline; one source host may hold at
+        // most maxUnauthPerHost_ of them (so it can never fill kShardMaxSessions).  A session that logged in, was
+        // reaped or closed no longer counts.  A redirect creates no session here and is never refused.
+        const bool redirect = !pc_entry.isLeader && !pc_entry.leaderClientEndpoint.empty();
+        if (!redirect && unauthSessionsOf_(pc_entry.sourceHost) >= maxUnauthPerHost_) [[unlikely]] {
+            pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed);   // answered, no session
+            ++connectsRefusedUnauthCap_;
+            if (unauthLog_.due(15)) [[unlikely]]
+                spdlog::warn("auth: connect refused source={} reason=unauthenticated-sessions-per-host cap={} "
+                             "(refused so far: {})", LogSafeName{pc_entry.sourceHost}, maxUnauthPerHost_,
+                             connectsRefusedUnauthCap_);
+        }
+    }
 
     // client<->broker TLS/AEAD (Task 7): drive the server-role handshake's
     // FIRST leg right here, synchronously, off the client's ClientHello
@@ -2263,6 +2294,14 @@ void ClientGateway::drainHandshakeOutbound_(PendingConnect& pending)
 // ---------------------------------------------------------------------------
 bool ClientGateway::registerConnectEgress_(PendingConnect& pending)
 {
+    if (testEgressFn_ && !aeron_) [[unlikely]] {
+        // Test gateways never reach Aeron (issue #236 tests drive real Connects): a placeholder reply publication,
+        // never dereferenced while testEgressFn_ intercepts every pre-session offer (offerOnPub_).
+        static unsigned char placeholder alignas(64)[512];
+        pending.resolvedPub = std::shared_ptr<aeron::ExclusivePublication>(
+            reinterpret_cast<aeron::ExclusivePublication*>(placeholder), [](aeron::ExclusivePublication*) {});
+        return true;
+    }
     try {
         // A10: sparse terms — the gateway runs on a worker thread in fused placement, where a non-sparse
         // term's tmpfs fallocate fails with EINTR while io_uring completions are pending (withSparseTerms).
@@ -2270,8 +2309,8 @@ bool ClientGateway::registerConnectEgress_(PendingConnect& pending)
             rune::node::withSparseTerms(pending.egressChannel), pending.egressStreamId);
     } catch (...) {
         // Bad channel — drop (never crash).
-        spdlog::warn("ClientGateway: addExclusivePublication threw for egress channel '{}'; dropping Connect",
-                     pending.egressChannel);
+        spdlog::warn("ClientGateway: addExclusivePublication threw for egress channel {}; dropping Connect",
+                     LogSafeName{pending.egressChannel});
         return false;
     }
     return true;
@@ -2301,8 +2340,8 @@ int ClientGateway::pollHostResolutions_()
         for (auto it = pendingConnects_.begin(); it != pendingConnects_.end(); ++it) {
             if (it->sessionId != id || !it->awaitingResolve) continue;
             if (type != rune::consensus::kHostResolved) {
-                spdlog::warn("ClientGateway: reply host of channel '{}' does not resolve; session={} dropped "
-                             "(the client retries)", it->egressChannel, it->sessionId);
+                spdlog::warn("ClientGateway: reply host of channel {} does not resolve; session={} dropped "
+                             "(the client retries)", LogSafeName{it->egressChannel}, it->sessionId);
                 closeDroppedPendingConnect_(*it);
                 pendingConnects_.erase(it);
                 return;
@@ -2315,8 +2354,8 @@ int ClientGateway::pollHostResolutions_()
             it->awaitingResolve = false;
             if ((shardMode_ && it->egressChannel.size() > rune::node::SessionAckSink::kMaxChannelBytes) ||
                 !registerConnectEgress_(*it)) {
-                spdlog::warn("ClientGateway: resolved egress channel '{}' unusable; session={} dropped",
-                             it->egressChannel, it->sessionId);
+                spdlog::warn("ClientGateway: resolved egress channel {} unusable; session={} dropped",
+                             LogSafeName{it->egressChannel}, it->sessionId);
                 closeDroppedPendingConnect_(*it);
                 pendingConnects_.erase(it);
             }
@@ -2398,7 +2437,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         // Try to find the publication (non-blocking).
         std::shared_ptr<aeron::ExclusivePublication> pub;
         try {
-            pub = aeron_->findExclusivePublication(pending.registrationId);
+            if (aeron_) pub = aeron_->findExclusivePublication(pending.registrationId);   // test gateway: stashed pub
         } catch (...) {
             // ERRORED_MEDIA_DRIVER: conductor signalled an error (bad channel, etc.).
             // The conductor erased its own entry when throwing — no registration leak.
@@ -2562,7 +2601,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             encoded = resp.encode(scratch_.data());
         }
 
-        if (!sendOnPub(*pub, scratch_.data(), encoded)) {
+        if (!offerOnPub_(*pub, scratch_.data(), encoded)) {
             // Publication not yet Aeron-connected (UDP image not yet up) or
             // transient back-pressure.  Keep the PendingConnect alive
             // (resolvedPub is now stashed); retry next doWork() cycle.
@@ -4538,8 +4577,8 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
             pend.requestedAtNs = nowNs_;
         } catch (...) {
             spdlog::warn("ClientGateway: record-egress pub create threw for session {} "
-                         "worker {} (channel '{}'); Subscribe {}",
-                         sessionId, wid, sess->egressChannel,
+                         "worker {} (channel {}); Subscribe {}",
+                         sessionId, wid, LogSafeName{sess->egressChannel},
                          authRequired ? "retired (no shared-egress fallback under authentication)" : "uses MDC fallback");
             if (authRequired) [[unlikely]] {   // issue #118: answered on the next pass, after the OK
                 pend.regId = -1;
@@ -8316,6 +8355,23 @@ rune::gateway::SessionAuth ClientGateway::newSessionAuth_(int64_t nowNs, int64_t
     return AuthAwaitingFirst{nowNs + authTimeoutNs_, connectCorrelationId};
 }
 
+// Issue #236: the sessions `host` holds unauthenticated - AuthAwaitingFirst / AuthAwaitingFinal sessions that are not
+// Closing, plus pending Connects that will become one.  O(sessions + pending) per Connect: Connect is control-plane
+// and cold (never the produce / consume / query path).
+std::size_t ClientGateway::unauthSessionsOf_(std::string_view host)
+{
+    using namespace rune::gateway;
+    std::size_t n = 0;
+    sessions_.forEach([&](Session& s) {
+        if (!std::holds_alternative<AuthAwaitingFirst>(s.auth) && !std::holds_alternative<AuthAwaitingFinal>(s.auth)) return;
+        if (s.spill.state == SpillState::Closing) return;
+        if (s.sourceHost == host) ++n;
+    });
+    for (const PendingConnect& p : pendingConnects_)
+        if (p.refuseCode == 0 && !p.cryptoFailed && !(!p.isLeader && !p.leaderClientEndpoint.empty()) && p.sourceHost == host) ++n;
+    return n;
+}
+
 std::string ClientGateway::sourceHostOf_(std::string_view egressChannel) const
 {
     // The REAL UDP source of the Connect image ("1.2.3.4:5678" / "[::1]:5678"); IPC images have no host, and a test
@@ -8569,7 +8625,8 @@ void ClientGateway::noteDenied_(const Session& session, pc::TemplateId tid, cons
     if (notAuthorizedAnswers_ % 1024 == 1) {
         const char* user = "<anonymous>";
         if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) user = a->user.c_str();
-        spdlog::warn("auth: request refused user={} session={} template={}: {} (refusals so far: {})", user, session.sessionId,
+        spdlog::warn("auth: request refused user={} session={} template={}: {} (refusals so far: {})",
+                     LogSafeName{user}, session.sessionId,
                      static_cast<uint16_t>(tid), denial.detail, notAuthorizedAnswers_);
     }
 }
@@ -8822,7 +8879,8 @@ void ClientGateway::unavailableLogin_(Session& session, int64_t correlationId, s
     ++loginsUnavailable_;
     if (unauthLog_.due(7)) [[unlikely]]
         spdlog::warn("auth: login refused user={} source={} session={} reason=security-not-current (AuthUnavailable; "
-                     "refused so far: {})", user, session.sourceHost, session.sessionId, loginsUnavailable_);
+                     "refused so far: {})", LogSafeName{user}, LogSafeName{session.sourceHost}, session.sessionId,
+                     loginsUnavailable_);
     pc::AuthServerFinal f;
     f.sessionId     = session.sessionId;
     f.correlationId = correlationId;
@@ -8881,7 +8939,8 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
     if (!m || m->mechanism != pc::kMechanismScramSha512) {
         ++loginsFailed_;
         if (unauthLog_.due(6)) [[unlikely]]
-            spdlog::warn("auth: login failed user=<undecodable> source={} session={} reason=malformed", session->sourceHost, session->sessionId);
+            spdlog::warn("auth: login failed user=<undecodable> source={} session={} reason=malformed",
+                         LogSafeName{session->sourceHost}, session->sessionId);
         failLogin_(*session, hdr->correlationId, 0);
         return;
     }
@@ -8890,13 +8949,15 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
     if (!v.allowed) {
         ++loginsRateLimited_;
         if (unauthLog_.due(1)) [[unlikely]]
-            spdlog::warn("auth: rate limited user={} source={} retry_after_ms={}", user, session->sourceHost, v.retryAfterMs);
+            spdlog::warn("auth: rate limited user={} source={} retry_after_ms={}",
+                         LogSafeName{user}, LogSafeName{session->sourceHost}, v.retryAfterMs);
         failLogin_(*session, m->correlationId, v.retryAfterMs);
         return;
     }
     if (securityView_ == nullptr || securityView_->halted()) {   // #206: not a verdict - retriable (fails closed all the same)
         if (unauthLog_.due(2)) [[unlikely]]
-            spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost, session->sessionId,
+            spdlog::warn("auth: login failed user={} source={} session={} reason={}",
+                         LogSafeName{user}, LogSafeName{session->sourceHost}, session->sessionId,
                          loginFailureName(LoginFailure::SecurityHalted));
         unavailableLogin_(*session, m->correlationId, user);
         return;
@@ -8908,7 +8969,8 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
     ServerFirstPlan plan = scramServerFirst(securityView_->state(), *m, deadline, securityView_->fakeIterations());
     if (plan.frame.empty()) {   // no randomness for the nonce: fail closed
         ++loginsFailed_;
-        spdlog::error("auth: login failed user={} source={} session={} reason=no-randomness", user, session->sourceHost, session->sessionId);
+        spdlog::error("auth: login failed user={} source={} session={} reason=no-randomness",
+                      LogSafeName{user}, LogSafeName{session->sourceHost}, session->sessionId);
         failLogin_(*session, m->correlationId, 0);
         return;
     }
@@ -8943,7 +9005,8 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     if (const LoginThrottle::Verdict v = loginThrottle_.check(user, session->sourceHost, nowNs_); !v.allowed) {
         ++loginsRateLimited_;
         if (unauthLog_.due(1)) [[unlikely]]
-            spdlog::warn("auth: rate limited user={} source={} retry_after_ms={}", user, session->sourceHost, v.retryAfterMs);
+            spdlog::warn("auth: rate limited user={} source={} retry_after_ms={}",
+                         LogSafeName{user}, LogSafeName{session->sourceHost}, v.retryAfterMs);
         failLogin_(*session, hdr->correlationId, v.retryAfterMs);
         return;
     }
@@ -8956,7 +9019,8 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     }
     if (securityView_ == nullptr || securityView_->halted()) [[unlikely]] {   // #206: not a verdict - retriable
         if (unauthLog_.due(8 + static_cast<std::size_t>(LoginFailure::SecurityHalted))) [[unlikely]]
-            spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost,
+            spdlog::warn("auth: login failed user={} source={} session={} reason={}",
+                         LogSafeName{user}, LogSafeName{session->sourceHost},
                          session->sessionId, loginFailureName(LoginFailure::SecurityHalted));
         unavailableLogin_(*session, hdr->correlationId, user);   // #132: the throttle is not charged
         return;
@@ -8970,7 +9034,8 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         ++loginsFailed_;
         loginThrottle_.onFailure(user, session->sourceHost, nowNs_);
         if (unauthLog_.due(8 + static_cast<std::size_t>(*failure))) [[unlikely]]   // per reason
-            spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost, session->sessionId,
+            spdlog::warn("auth: login failed user={} source={} session={} reason={}",
+                         LogSafeName{user}, LogSafeName{session->sourceHost}, session->sessionId,
                          loginFailureName(*failure));
         // #205: a proof that fails against a view behind events this broker already holds (a just-created user, a
         // just-changed password, a just-enabled user) is not a verdict yet - retriable, never the terminal 44.  Still
@@ -8990,7 +9055,8 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     std::string loginNonce = st->combinedNonce;   // issue #114: before session->auth (which owns *st) is replaced
     ++loginsOk_;
     loginThrottle_.onSuccess(user, session->sourceHost, nowNs_);
-    spdlog::info("auth: login ok user={} source={} session={}", ok.user, session->sourceHost, session->sessionId);
+    spdlog::info("auth: login ok user={} source={} session={}",
+                 LogSafeName{ok.user}, LogSafeName{session->sourceHost}, session->sessionId);
     if (!session->crypto.encrypted)   // only under ClientTransport::PlaintextForTest (M1, issue #10) - said once per session
         spdlog::warn("auth: session {} authenticated over plaintext (no TLS): frames are not integrity-protected",
                      session->sessionId);
@@ -9082,7 +9148,8 @@ void ClientGateway::reapAuthDeadlines_(int64_t nowNs)
         else if (const auto* b = std::get_if<AuthAwaitingFinal>(&s->auth)) { corr = b->correlationId; user = b->user; }
         ++loginsFailed_;
         if (unauthLog_.due(8 + static_cast<std::size_t>(LoginFailure::Timeout))) [[unlikely]]
-            spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, s->sourceHost, sid,
+            spdlog::warn("auth: login failed user={} source={} session={} reason={}",
+                         LogSafeName{user}, LogSafeName{s->sourceHost}, sid,
                          loginFailureName(LoginFailure::Timeout));
         failLogin_(*s, corr, 0);
     }
@@ -9288,7 +9355,7 @@ void ClientGateway::revokeSession_(int64_t sid, std::string_view reason)
     if (const auto* a = std::get_if<AuthAuthenticated>(&s->auth)) user = a->user;
     else if (const auto* p = std::get_if<AuthPasswordChangeRequired>(&s->auth)) user = p->user;
     ++sessionsRevoked_;
-    spdlog::warn("auth: session {} of user {} revoked: {}", sid, user, reason);
+    spdlog::warn("auth: session {} of user {} revoked: {}", sid, LogSafeName{user}, reason);
     // Issue #196: on the shard path a worker accepts this session's direct produce until its SessionClose is
     // processed, and the close may queue behind a full lifecycle ring on its own (announcer) FIFO.  Bind the session
     // to nothing FIRST, on the permission shipper's FIFO: the event's lifecycle fence follows it, so the DDL's OK is
@@ -9431,8 +9498,9 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
         }
         if (denial && !knownRetry) noteDenied_(*session, pc::TemplateId::SecurityDdl, *denial);
         if (!denial && ownPassword && m.change == pc::UserChangeKind::AddPassword)   // a second password: worth a line
-            spdlog::warn("security: user {} adds a password to its own account (session {}, source {})", *self,
-                         session->sessionId, session->sourceHost);
+            spdlog::warn("security: user {} adds a password to its own account (session {}, source {})",
+                         LogSafeName{*self},
+                         session->sessionId, LogSafeName{session->sourceHost});
     }
     answerAdminSubmit_(buf, len,
                        adminSink_->submitSecurityDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session),
@@ -9479,7 +9547,7 @@ std::optional<rune::gateway::Denial> ClientGateway::verifyOwnCredentialChange_(S
         loginThrottle_.onFailure(self, session.sourceHost, nowNs_);
         if (unauthLog_.due(4)) [[unlikely]]
             spdlog::warn("security: user {} sent a change of its own password without a valid proof (session {}, source {})",
-                         self, session.sessionId, session.sourceHost);
+                         LogSafeName{self}, session.sessionId, LogSafeName{session.sourceHost});
         return refused;
     }
     if (chargeThrottle) loginThrottle_.onSuccess(self, session.sourceHost, nowNs_);
@@ -9521,7 +9589,7 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
     if (proof != BootstrapProof::Ok) {
         ++bootstrapsRefused_;
         if (unauthLog_.due(3)) [[unlikely]]   // X103: an unauthenticated session drives this
-            spdlog::warn("security: bootstrap refused from {}: bad cluster-key proof{}", session->egressChannel,
+            spdlog::warn("security: bootstrap refused from {}: bad cluster-key proof{}", LogSafeName{session->egressChannel},
                          proof == BootstrapProof::NoKey ? " (this broker holds no cluster key: authentication is not enabled)" : "");
         pc::DdlResponse r;
         r.sessionId     = m.sessionId;

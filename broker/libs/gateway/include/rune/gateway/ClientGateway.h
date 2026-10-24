@@ -205,6 +205,9 @@ public:
     /// Task 13: most concurrent sessions in shard mode — one worker ack table's
     /// capacity (SessionAckSink::kMaxSessions − 1; static_assert in the .cpp).
     static constexpr std::size_t kShardMaxSessions = 4095;
+    /// Issue #236: most sessions one source host may hold unauthenticated (AuthAwaitingFirst / AuthAwaitingFinal, or a
+    /// pending Connect that will become one) under GatewayAuthMode::Required; a Connect beyond it is refused at once.
+    static constexpr std::size_t kDefaultMaxUnauthSessionsPerHost = 64;
     /// Task 13 fix round 3 (re-review 2, finding 2): width of Session::
     /// heldByWorkers — every shard worker must have a bit.  NodeConfig refuses
     /// more shard workers (kMaxShardWorkers; static_assert in BrokerNode.cpp).
@@ -424,6 +427,10 @@ public:
     [[nodiscard]] uint64_t authGateRefusals() const noexcept { return authGateRefusals_; }
     /// How long a session may take to complete its SCRAM login (RUNE_AUTH_TIMEOUT_MS, D13); default 10 s.
     void setAuthTimeoutNs(int64_t ns) noexcept { authTimeoutNs_ = ns; }
+    /// Issue #236: the per-source-host cap of unauthenticated sessions (test seam + config hook).
+    void setMaxUnauthenticatedSessionsPerHost(std::size_t n) noexcept { maxUnauthPerHost_ = n; }
+    /// Issue #236: Connects refused because their source host held the cap of unauthenticated sessions.
+    [[nodiscard]] uint64_t connectsRefusedUnauthenticatedCap() const noexcept { return connectsRefusedUnauthCap_; }
     /// Counters 1'000'229 / 230 / 231 (logins ok / failed / rate-limited): monotonic, control-thread values the
     /// BrokerNode publishes to the CnC file.
     [[nodiscard]] uint64_t loginsOk() const noexcept { return loginsOk_; }
@@ -2110,7 +2117,7 @@ private:
     void*               peerDropCtx_ = nullptr;
     void sendSessionExpired_(aeron::ExclusivePublication* pub, Session* session, int64_t sid);
     /// Evict the oldest pending connect (the kMaxPendingConnects cap).
-    void evictOldestPendingConnect_();
+    void evictOldestPendingConnect_(std::string_view incomingHost = {});
     /// Encode an ErrorResponse{code} into scratch_ and send it reliably.
     void sendErrorResponse_(Session& session, int64_t sessionId, int64_t correlationId,
                             rune::protocol::client::ErrorCode code);
@@ -2432,7 +2439,10 @@ private:
     /// handleSubscribe for topicId == kSecurityTopicId (authentication Task 10): the same contract on the second server.
     void handleSecuritySubscribe_(Session& session, const rune::protocol::client::Subscribe& msg);
     uint64_t securitySubscribesForwarded_ = 0;
-    rune::node::UnauthLogLimiter unauthLog_;   ///< X103: 1/1024 limiter of the log lines unauthenticated senders drive (kinds: 0 require-TLS, 1 login rate limited, 2 halted login, 3 bad bootstrap proof, 4 own-password change without a valid proof (#114), 5 client version refusal, 6 malformed first login leg, 7 login refused: security state not current (#15), 8+ login failed per reason)
+    rune::node::UnauthLogLimiter unauthLog_;   ///< X103: 1/1024 limiter of the log lines unauthenticated senders drive (kinds: 0 require-TLS, 1 login rate limited, 2 halted login, 3 bad bootstrap proof, 4 own-password change without a valid proof (#114), 5 client version refusal, 6 malformed first login leg, 7 login refused: security state not current (#15), 8..14 login failed per reason, 15 connect refused: unauthenticated sessions per host (#236))
+    static_assert(8 + static_cast<std::size_t>(rune::gateway::LoginFailure::SecurityHalted) < 15 &&
+                  15 < rune::node::UnauthLogLimiter::kKinds, "issue #236: limiter kind 15 is free");
+    [[nodiscard]] std::size_t unauthSessionsOf_(std::string_view host);   ///< issue #236 (cold: one Connect)
     uint64_t controlBatchRefusals_ = 0;   ///< X036: Produce frames refused for carrying a client control batch (rate-limited log)
     static void noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr);
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
@@ -2546,6 +2556,8 @@ private:
     rune::gateway::LoginThrottle loginThrottle_;
     bool holdRecordEgressResolve_ = false;   ///< test seam (#188 / #5): pollPendingRecordEgress_ skips while set
     int64_t  authTimeoutNs_ = 10'000'000'000LL;
+    std::size_t maxUnauthPerHost_ = kDefaultMaxUnauthSessionsPerHost;   ///< issue #236
+    uint64_t connectsRefusedUnauthCap_ = 0;                              ///< issue #236
     uint64_t loginsOk_ = 0, loginsFailed_ = 0, loginsRateLimited_ = 0, loginsAbandoned_ = 0;
     // ── authentication Task 14: live security changes ──
     uint64_t sessionsRevoked_ = 0;

@@ -185,6 +185,7 @@ if(BUILD_TESTING)
         tests/node/SecurityReadServerTest.cpp
         tests/node/SecurityWritePathTest.cpp
         tests/node/SecurityAnswerGateTest.cpp
+        tests/node/AdminEgressDrainTest.cpp
         tests/node/SecurityServingTest.cpp
         tests/node/SecurityRingCodecTest.cpp
         tests/node/CatalogWritePathTest.cpp

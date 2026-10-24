@@ -23,6 +23,8 @@
 #include <gtest/gtest.h>
 
 #include <map>
+#include <optional>
+#include <array>
 #include <mutex>
 #include <set>
 
@@ -194,6 +196,23 @@ TEST(ClientAuthClusterRegression, WorldServerClientProducesAndConsumesThroughEve
             }
     }
 
+    // One acked producer per client, made WHILE world-server holds WRITE: since #211 an idempotent producer's
+    // InitProducerId needs WRITE on at least one topic, so a producer made after the REVOKE below never gets an id
+    // (every record fails DeliveryFailed/45 at the id step - checked at the end) and never sends a ProduceRequest.
+    // These already hold their ids, so their records do reach the brokers' per-record WRITE check.
+    rc::ProducerConfig pcfg;
+    pcfg.acks = rc::Acks::All;
+    pcfg.lingerUs = 1;
+    pcfg.batchBytes = 1;
+    pcfg.produceTimeoutMs = 30'000;
+    pcfg.deliveryTimeoutMs = 40'000;
+    std::array<std::optional<rc::Producer>, 3> producers;
+    for (int idx = 0; idx < 3; ++idx) {
+        producers[static_cast<std::size_t>(idx)].emplace(clients[static_cast<std::size_t>(idx)]->producer(pcfg));
+        auto& pr = *producers[static_cast<std::size_t>(idx)];
+        ASSERT_TRUE(AuthTrio::until(30s, [&] { return pr.producerId() >= 0; })) << "producer id through broker " << idx + 1;
+    }
+
     // REVOKE WRITE; every broker must enforce it before the counting starts (probe with a raw session per broker).
     const auto rev = t.revoke(2, "world-server", SO::Write, ST::Topic, SP::Prefix, "world.");
     ASSERT_EQ(rev.errorCode, 0) << rev.detail;
@@ -217,13 +236,7 @@ TEST(ClientAuthClusterRegression, WorldServerClientProducesAndConsumesThroughEve
     constexpr int kFail = 4;
     for (int idx = 0; idx < 3; ++idx) {
         auto& cl = *clients[static_cast<std::size_t>(idx)];
-        rc::ProducerConfig pcfg;
-        pcfg.acks = rc::Acks::All;
-        pcfg.lingerUs = 1;
-        pcfg.batchBytes = 1;
-        pcfg.produceTimeoutMs = 30'000;
-        pcfg.deliveryTimeoutMs = 40'000;
-        auto producer = cl.producer(pcfg);
+        auto& producer = *producers[static_cast<std::size_t>(idx)];
         rc::Completions cq(cl);
         std::map<rc::Token, rc::Completion> done;
         auto poll = [&] { (void)cq.poll([&](const rc::Completion& d, std::span<const uint8_t>) { done[d.token] = d; }); };
@@ -254,6 +267,51 @@ TEST(ClientAuthClusterRegression, WorldServerClientProducesAndConsumesThroughEve
     uint64_t after = 0;
     for (int id : {1, 2, 3}) after += refusals(t.node(id));
     EXPECT_EQ(after - before, static_cast<uint64_t>(3 * kFail)) << "exactly one ProduceRequest (refused) per failed record: no retry storm";
+
+    // #211 through the real client: a producer made AFTER the REVOKE is refused its id (45) - every record completes
+    // DeliveryFailed / NotAuthorized, and no ProduceRequest reaches any broker's per-record check.
+    {
+        auto& cl = *clients[0];
+        auto late = cl.producer(pcfg);
+        rc::Completions cq(cl);
+        std::map<rc::Token, rc::Completion> done;
+        auto poll = [&] { (void)cq.poll([&](const rc::Completion& d, std::span<const uint8_t>) { done[d.token] = d; }); };
+        const uint64_t workerBefore = [&] {
+            uint64_t n = 0;
+            for (int id : {1, 2, 3})
+                for (int32_t w = 0; w < t.node(id).workerCountForTest(); ++w)
+                    n += t.node(id).onWorkerThreadForTest(w, [](Worker& wk) { return wk.workerNotAuthorizedForTest(); });
+            return n;
+        }();
+        for (int i = 0; i < 2; ++i) {
+            const WorldEvent e{900 + i, i, hpOf(900 + i)};
+            std::vector<uint8_t> bytes(e.encodedSize());
+            e.encode(bytes.data());
+            bytes[2] = static_cast<uint8_t>(typed[0].boundVersion() & 0xff);
+            bytes[3] = static_cast<uint8_t>(typed[0].boundVersion() >> 8);
+            for (const auto dl = Clock3::now() + 30s; Clock3::now() < dl;) {
+                if (late.trySend(typed[0].handle(), rc::Key(e.key()), bytes, cq, static_cast<rc::Token>(i + 1)) == rc::SendResult::Ok) break;
+                poll();
+                std::this_thread::yield();
+            }
+        }
+        for (const auto dl = Clock3::now() + 60s; Clock3::now() < dl && done.size() < 2u;) {
+            poll();
+            std::this_thread::sleep_for(2ms);
+        }
+        ASSERT_EQ(done.size(), 2u);
+        for (const auto& [tok, d] : done) {
+            EXPECT_EQ(d.status, rc::OpStatus::DeliveryFailed) << "token " << tok;
+            EXPECT_EQ(d.errorCode, 45) << "NotAuthorized at InitProducerId";
+        }
+        EXPECT_LT(late.producerId(), 0) << "never assigned an id";
+        uint64_t workerAfter = 0;
+        for (int id : {1, 2, 3})
+            for (int32_t w = 0; w < t.node(id).workerCountForTest(); ++w)
+                workerAfter += t.node(id).onWorkerThreadForTest(w, [](Worker& wk) { return wk.workerNotAuthorizedForTest(); });
+        EXPECT_EQ(workerAfter, workerBefore) << "no ProduceRequest reached a worker";
+        late.close();
+    }
 
     for (auto& c : clients) c->close();
 }

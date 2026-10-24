@@ -1,4 +1,5 @@
 #include <rune/node/BrokerNode.h>
+#include <rune/node/AdminEgressDrain.h>
 #include <rune/node/CatalogHaltPolicy.h>
 #include <rune/catalog/TopicName.h>
 #include <rune/node/CatalogCheckpoint.h>
@@ -407,7 +408,7 @@ void BrokerNode::start() {
     {
         std::string fdErr;
         uint64_t need = 0;
-        const bool fdOk = applyFdLimitAtStartup(config_, bootTopics_, fdErr, &need);
+        const bool fdOk = applyFdLimitAtStartup(config_, bootTopics_, fdErr, &need, &fdSoftLimit_);
         fdNeedAtBoot_ = need;                       // the budget actually applied (no second estimate)
         if (!fdOk) {
             spdlog::error("BrokerNode[{}]: {}", config_.nodeId, fdErr);
@@ -4292,6 +4293,10 @@ void BrokerNode::buildAdminWorker() {
         AdminDeps deps;
         deps.brokerCount = static_cast<int32_t>(std::max<std::size_t>(config_.peers.size(), 1));
         deps.topicMinIsr = config_.gatewayMinIsr;
+        // Issue #296: DDL admission against this broker's open-file limit (set by the fd step above, before any
+        // thread starts; immutable after).
+        deps.fdLimit                   = fdSoftLimit_;
+        deps.readySegmentsPerPartition = static_cast<uint64_t>(config_.segmentProvisionDepth);
 
         deps.respondDefine = [this](int64_t session, int64_t corr, int32_t topicId,
                                     uint16_t version, uint16_t errorCode) {
@@ -5086,8 +5091,9 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     // (3) Drain response frames (admin → control) → session egress.
     //     C1 / M7: through the DDL answer gate — a DefineTopic / CreateView OK
     //     leaves only once its topic serves (committed above, in (1b), and its
-    //     assignment routed); FIFO behind it.  The ring is drained only while the
-    //     gate holds nothing, so one drain always fits the gate.
+    //     assignment routed); FIFO behind it.  Issue #209: the ring is always
+    //     drained (a held catalog OK never stalls a gated security OK), each frame
+    //     only while the gate has room for one more (drainAdminEgress).
     auto send = [this](int64_t session, const uint8_t* f, std::size_t n) {
         if (gateway_) (void)gateway_->sendControlFrame(session, f, n);
     };
@@ -5193,38 +5199,14 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                                      catalogSink);
         }, 64);
     if (!catalogReadFlow_.idle()) [[unlikely]] work += catalogReadFlow_.service(catalogSink);
-    if (ddlAnswerGate_.empty()) {
-        work += agent->egressRing().drain(
-            [this, &send, &serves](int32_t tid,
-                                   aeron::concurrent::AtomicBuffer& b,
-                                   aeron::util::index_t off,
-                                   aeron::util::index_t len) {
-                const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
-                const auto n = static_cast<std::size_t>(len);
-                if (n < 8) return;
-                int64_t session;
-                std::memcpy(&session, p, 8);
-                if (tid == kMsgEgressFrameGated) [[unlikely]] {
-                    // Authentication Task 10 (D24): [session][event offset][DdlResponse] - held until this broker's view
-                    // applied the event (pumpSecurityGate_); a full gate answers Internal at once, never drops.
-                    if (n < 16 + rune::protocol::client::MessageHeader::ENCODED_SIZE) return;
-                    const int64_t eventOffset = admin_wire::getI64(p + 8);
-                    // #120: the deadline runs on the control pass's injected clock (PR #459 M2).
-                    securityGate_.hold(session, eventOffset, std::span<const uint8_t>(p + 16, n - 16), send, controlNowNs_);
-                    return;
-                }
-                const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count();
-                switch (ddlAnswerGate_.offer(session, p + 8, n - 8, nowNs, serves)) {
-                    case DdlAnswerGate::Offer::Pass: send(session, p + 8, n - 8); break;
-                    case DdlAnswerGate::Offer::Held: break;
-                    case DdlAnswerGate::Offer::Full:   // impossible by sizing: never dropped silently
-                        spdlog::critical("BrokerNode[{}]: DDL answer gate full — sending the answer ungated",
-                                         config_.nodeId);
-                        send(session, p + 8, n - 8);
-                        break;
-                }
-            }, 16);
+    {   // Issue #209: always drained, routed per frame, bounded by the DDL gate's free room (AdminEgressDrain.h).
+        const int64_t gateNowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        work += drainAdminEgress(agent->egressRing(), ddlAnswerGate_, 16, gateNowNs, serves, send,
+            [this, &send](int64_t session, int64_t eventOffset, std::span<const uint8_t> frame) {
+                // #120: the deadline runs on the control pass's injected clock (PR #459 M2).
+                securityGate_.hold(session, eventOffset, frame, send, controlNowNs_);
+            });
     }
 
     if (!securityGate_.empty()) [[unlikely]] work += pumpSecurityGate_();

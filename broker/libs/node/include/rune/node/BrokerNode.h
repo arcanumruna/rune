@@ -2562,6 +2562,7 @@ private:
     std::vector<int32_t>                                  bootDroppedIds_;       // every topic id the catalog dropped
     std::optional<CatalogApplier>                         bootApplier_;          // Booted; handed to the AdminWorker by buildAdminWorker
     uint64_t                                              fdNeedAtBoot_ = 0;     // estimateFdNeed(bootTopics_) at start()
+    uint64_t                                              fdSoftLimit_ = 0;      // #296: soft RLIMIT_NOFILE after start()'s fd step (0 = unknown)
     int                                                   bootReplays_ = 0;      // replayLocal calls that returned >= 0
     bool                                                  bootReconcileDeferred_ = false;   // B6: the admin thread reconciles after catch-up
     bool                                                  holdCatalogApplyAtBootForTest_ = false;
@@ -2775,8 +2776,13 @@ private:
     // Catalog history Task 12 fix round 0: catalog-read flow control (control
     // thread) — one entry per paused catalog subscription, preallocated.
     CatalogReadFlow catalogReadFlow_{2u * AdminWorker::kMaxCatalogSubscriptions};
-    DdlAnswerGate ddlAnswerGate_{2u * static_cast<std::size_t>(kAdminRequestRingBytes) + 4096u,
-                                 kDdlAnswerMaxHoldNs};
+    static constexpr std::size_t kDdlAnswerGateBytes = 2u * static_cast<std::size_t>(kAdminRequestRingBytes) + 4096u;
+    // PR #611 review (issue #209): drainAdminEgress reads a frame only while the gate holds nothing or has
+    // 2 x (maxMsgLength + 32) bytes free (maxMsgLength = ring capacity / 8).  A gate smaller than that room plus one
+    // frame would stop the drain whenever it held anything - the head-of-line block #209 removed.
+    static_assert(kDdlAnswerGateBytes >= 3u * (static_cast<std::size_t>(kAdminEgressRingBytes) / 8u + 32u),
+                  "the DDL answer gate must hold the drain's room plus a frame");
+    DdlAnswerGate ddlAnswerGate_{kDdlAnswerGateBytes, kDdlAnswerMaxHoldNs};
     uint64_t      ddlAnswersOverdue_ = 0;   // control thread only: held OKs answered Internal (in doubt)
     int64_t       ddlOverdueFirstNs_ = 0, ddlOverdueLastNs_ = 0;   // control thread only: R3-M1 evidence stamps
     [[nodiscard]] bool ddlTopicServes_(int32_t topicId) const noexcept;

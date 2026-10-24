@@ -227,6 +227,9 @@ std::optional<std::string> configChangesError(const CatalogEvent& e, const Alter
     }
     return std::nullopt;
 }
+}  // namespace
+
+// Public (CatalogState.h, issue #296): the broker previews an ALTER's resulting config with the same rule.
 void applyConfigChanges(TopicConfig& c, const AlterTopicConfigOps& o) noexcept {
     for (const ConfigChange& ch : o.changes) {
         switch (ch.key) {
@@ -239,6 +242,8 @@ void applyConfigChanges(TopicConfig& c, const AlterTopicConfigOps& o) noexcept {
         }
     }
 }
+
+namespace {
 
 // ── one rule per kind ─────────────────────────────────────────────────────────
 using Result = std::expected<Staged, ApplyError>;

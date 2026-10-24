@@ -93,9 +93,10 @@ public:
         bool                        preV8       = false;   // no DDL extension (requestId {0,0})
     };
 
+    /// `fdLimit` / `fdReadySegments` (issue #296): AdminDeps::fdLimit / readySegmentsPerPartition (0 = unknown limit).
     explicit CatalogDdlRig(const char* tag, int32_t brokers = 3, int32_t topicMinIsr = 1,
-                           std::size_t effectMaxFrame = 0)
-        : effectMaxFrame_(effectMaxFrame), root_(std::filesystem::temp_directory_path() /
+                           std::size_t effectMaxFrame = 0, uint64_t fdLimit = 0, uint64_t fdReadySegments = 0)
+        : effectMaxFrame_(effectMaxFrame), fdLimit_(fdLimit), fdReadySegments_(fdReadySegments), root_(std::filesystem::temp_directory_path() /
                 (std::string("rune_ddlrig_") + tag + "_" + std::to_string(::getpid()) + "_" +
                  std::to_string(ddl_rig_detail::gSeq++))),
           brokers_(brokers), topicMinIsr_(topicMinIsr) {
@@ -480,6 +481,8 @@ private:
         deps.brokerCount = brokers_;
         deps.topicMinIsr = topicMinIsr_;
         deps.effectMaxFrameBytes = effectMaxFrame_;
+        deps.fdLimit = fdLimit_;
+        deps.readySegmentsPerPartition = fdReadySegments_;
         deps.respondDefine = [this](int64_t, int64_t corr, int32_t topicId, uint16_t version, uint16_t code) {
             record_(corr, Answer{code, topicId, version, {}, 0, -1, 0, Answer::Kind::Define});
         };
@@ -532,6 +535,8 @@ private:
     }
 
     std::size_t                                          effectMaxFrame_ = 0;
+    uint64_t                                             fdLimit_ = 0;
+    uint64_t                                             fdReadySegments_ = 0;
     std::filesystem::path                                root_;
     int32_t                                              brokers_;
     int32_t                                              topicMinIsr_;

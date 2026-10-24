@@ -21,8 +21,9 @@
 // answered Internal (6, "in doubt") instead of the OK — the record committed but
 // the topic is not usable, so an OK would be a silent fallback (concern-4 ruling).
 // The caller is told (log + count).  The gate delays an answer, it never swallows
-// one (no-hang).  The caller drains its ring only while the gate is empty, so one
-// drain's frames always fit.
+// one (no-hang).  Issue #209: the caller drains its ring frame by frame while the
+// gate is empty or has room for one more frame (AdminEgressDrain.h), so offer()
+// never meets a full gate.
 //
 // Control-thread-owned, single-threaded.  The hold buffer is preallocated
 // (SpillFifo); offer / release never allocate.  Cold path (DDL answers only).
@@ -70,10 +71,12 @@ public:
 
     [[nodiscard]] bool empty() const noexcept { return held_.empty(); }
     [[nodiscard]] std::size_t heldCount() const noexcept { return held_.count(); }
+    /// Issue #209: bytes the hold buffer can still take (capacity - used; a wrap's skipped tail counts as used).
+    [[nodiscard]] std::size_t freeBytes() const noexcept { return held_.capacity() - held_.usedBytes(); }
 
     /// Pass: send it now.  Held: queued (FIFO; it, or a frame ahead of it, waits
-    /// for its topic).  Full: not taken — impossible when the caller offers only
-    /// what one drain of an empty gate yields (capacity >= that drain's bytes).
+    /// for its topic).  Full: not taken — impossible when the caller offers a frame
+    /// only while freeBytes() covers it (drainAdminEgress's room check).
     template <class Ready>
     Offer offer(int64_t session, const uint8_t* frame, std::size_t n, int64_t nowNs, Ready&& ready) noexcept {
         if (held_.empty()) {

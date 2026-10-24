@@ -4,6 +4,9 @@
 #include "support/ScramTestClient.h"
 
 #include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/LogSafe.h>
+#include <rune/metadata/ShardRouter.h>
+#include <rune/node/WorkerPool.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -2010,4 +2013,280 @@ TEST(AuthRestartRegression, ABrokerBehindItsHeldEventsJudgesNoLoginRegression) {
     const auto after = rig.login("ws1", {kTestPasswordA, ""});
     ASSERT_TRUE(after.fin.has_value());
     EXPECT_EQ(after.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+}
+
+// Issue #232: a username is client-supplied (up to 128 arbitrary bytes): every login log line writes it escaped, so a
+// `\n` in it can never forge a line ("auth: login ok user=admin").  The failure is the first unknown-user failure of a
+// fresh gateway, so the per-kind rate limiter logs it.
+TEST(AuthLogRegression, AUsernameWithControlBytesIsEscapedInLoginLogLinesRegression) {
+    Rig rig;
+    const std::string forged = "x\nauth: login ok user=admin";
+    const auto o = rig.login(forged, {kTestPasswordA, kTestPasswordA});
+    ASSERT_TRUE(o.fin.has_value());
+    EXPECT_EQ(o.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+    const std::vector<std::string> lines = rig.logSink->last_formatted();
+    bool sawEscaped = false;
+    for (std::string l : lines) {
+        while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+        EXPECT_EQ(l.find('\n'), std::string::npos) << "a log line holds no raw newline: " << l;
+        if (l.find("x\\x0aauth:") != std::string::npos) sawEscaped = true;
+        std::size_t start = 0;
+        for (;;) {   // every physical line a reader would see
+            const std::size_t nl = l.find('\n', start);
+            const std::string_view frag = std::string_view(l).substr(start, nl == std::string::npos ? std::string::npos : nl - start);
+            EXPECT_NE(frag.rfind("auth: login ok user=admin", 0), 0u) << "a forged line: " << l;
+            if (nl == std::string::npos) break;
+            start = nl + 1;
+        }
+    }
+    EXPECT_TRUE(sawEscaped) << "the failure line names the user escaped";
+    EXPECT_TRUE(rig.logContains("user=x\\x0aauth:\\x20login\\x20ok\\x20user=admin source=10.0.0.9"));
+}
+
+TEST(AuthLogRegression, LogSafeNameEscapesEveryNonPrintableByteRegression) {
+    EXPECT_EQ(fmt::format("{}", LogSafeName{}), "\"\"");
+    for (int b = 0; b < 256; ++b) {
+        const char c = static_cast<char>(b);
+        const std::string got = fmt::format("{}", LogSafeName{std::string_view(&c, 1)});
+        if (b >= 0x21 && b <= 0x7e && b != '\\') {
+            EXPECT_EQ(got, std::string(1, c)) << b;
+        } else {
+            char want[5];
+            std::snprintf(want, sizeof want, "\\x%02x", b);
+            EXPECT_EQ(got, want) << b;
+        }
+    }
+    EXPECT_EQ(fmt::format("u={}!", LogSafeName{std::string_view("a b\\\x7f", 5)}), "u=a\\x20b\\x5c\\x7f!");
+}
+
+// ── Issue #236: one source host may hold at most N unauthenticated sessions ────────────────────────────────────────
+namespace {
+/// A real Connect through handleConnect + pollPendingConnects (a test gateway's reply publication is a placeholder;
+/// the TestEgressFn takes the ConnectResponse).  The source host of a test gateway is its reply endpoint's host.
+struct ConnectOutcome { int16_t code = -1; int64_t sid = 0; };
+ConnectOutcome connectFrom(Rig& rig, const std::string& host, int64_t now = 0) {
+    pc::ConnectRequest req;
+    req.correlationId = ++rig.corr; req.egressStreamId = 9; req.clientVersion = pc::kClientVersionAuth;
+    const std::string channel = "aeron:udp?endpoint=" + host + ":40123";
+    req.egressChannel = channel;
+    std::vector<uint8_t> f(1024);
+    f.resize(req.encode(f.data()));
+    rig.gw.setNowNsForTest(now);
+    rig.send(f);
+    rig.gw.pollPendingConnectsForTest(now);
+    ConnectOutcome o;
+    for (auto it = rig.seen.rbegin(); it != rig.seen.rend(); ++it) {
+        if (it->tid != static_cast<uint16_t>(pc::TemplateId::ConnectResponse) || it->corr != req.correlationId) continue;
+        const auto r = pc::ConnectResponse::decode(it->bytes.data(), it->bytes.size());
+        if (r) { o.code = r->code; o.sid = r->sessionId; }
+        break;
+    }
+    return o;
+}
+/// Logs `sid` (a Connect-created session) in as `user`; the final's error code (-1: no final).
+int loginOn(Rig& rig, int64_t sid, const std::string& user, const std::string& pw) {
+    const std::string nonce = "cap-" + std::to_string(++rig.corr);
+    pc::AuthClientFirst cf;
+    cf.sessionId = sid; cf.correlationId = ++rig.corr; cf.username = user; cf.clientNonce = nonce;
+    std::vector<uint8_t> b(cf.encodedSize()); b.resize(cf.encode(b.data()));
+    rig.send(b);
+    const Frame* sf = rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFirst), sid);
+    if (sf == nullptr) return -1;
+    const auto first = pc::AuthServerFirst::decode(sf->bytes.data(), sf->bytes.size());
+    auto ans = scramAnswer(user, nonce, *first, {pw, ""}, sid, cf.correlationId);
+    std::vector<uint8_t> fb(ans->final.encodedSize()); fb.resize(ans->final.encode(fb.data()));
+    rig.send(fb);
+    const auto fin = lastFinal(rig, sid);
+    return fin ? fin->errorCode : -1;
+}
+constexpr int16_t kConnectAuthFailed = static_cast<int16_t>(pc::ErrorCode::AuthenticationFailed);
+}  // namespace
+
+TEST(UnauthSessionCapRegression, OneHostCannotHoldMoreThanTheCapOfUnauthenticatedSessionsRegression) {
+    Rig rig;
+    rig.gw.setMaxUnauthenticatedSessionsPerHost(4);
+    for (int i = 0; i < 4; ++i) {
+        const auto o = connectFrom(rig, "10.0.0.21");
+        ASSERT_EQ(o.code, 0) << i;
+        ASSERT_TRUE(rig.gw.hasSessionForTest(o.sid));
+        EXPECT_TRUE(std::holds_alternative<AuthAwaitingFirst>(*rig.gw.sessionAuthForTest(o.sid)));
+    }
+    const std::size_t sessions = rig.gw.sessionCount();
+    const auto refused = connectFrom(rig, "10.0.0.21");
+    EXPECT_EQ(refused.code, kConnectAuthFailed) << "the 5th unauthenticated session of one host is refused at once";
+    EXPECT_EQ(refused.sid, 0);
+    EXPECT_EQ(rig.gw.sessionCount(), sessions) << "a refused Connect creates no session";
+    EXPECT_EQ(rig.gw.pendingConnectCount(), 0u);
+    EXPECT_EQ(rig.gw.connectsRefusedUnauthenticatedCap(), 1u);
+    EXPECT_TRUE(rig.logContains("reason=unauthenticated-sessions-per-host cap=4"));
+    const auto other = connectFrom(rig, "10.0.0.22");
+    EXPECT_EQ(other.code, 0) << "another host is untouched";
+    EXPECT_TRUE(rig.gw.hasSessionForTest(other.sid));
+}
+
+TEST(UnauthSessionCapRegression, ALoggedInSessionFreesItsUnauthenticatedSlotRegression) {
+    Rig rig;
+    rig.gw.setMaxUnauthenticatedSessionsPerHost(2);
+    const auto a = connectFrom(rig, "10.0.0.31");
+    const auto b = connectFrom(rig, "10.0.0.31");
+    ASSERT_EQ(a.code, 0);
+    ASSERT_EQ(b.code, 0);
+    EXPECT_EQ(connectFrom(rig, "10.0.0.31").code, kConnectAuthFailed) << "at the cap";
+    ASSERT_EQ(loginOn(rig, a.sid, "ws1", kTestPasswordA), 0);
+    ASSERT_TRUE(std::holds_alternative<AuthAuthenticated>(*rig.gw.sessionAuthForTest(a.sid)));
+    const auto c = connectFrom(rig, "10.0.0.31");
+    EXPECT_EQ(c.code, 0) << "a logged-in session holds no unauthenticated slot";
+    EXPECT_EQ(connectFrom(rig, "10.0.0.31").code, kConnectAuthFailed);
+    EXPECT_EQ(rig.gw.connectsRefusedUnauthenticatedCap(), 2u);
+}
+
+TEST(UnauthSessionCapRegression, AReapedOrClosedSessionFreesItsSlotRegression) {
+    Rig rig;
+    rig.gw.setMaxUnauthenticatedSessionsPerHost(1);
+    const auto a = connectFrom(rig, "10.0.0.41");
+    ASSERT_EQ(a.code, 0);
+    EXPECT_EQ(connectFrom(rig, "10.0.0.41").code, kConnectAuthFailed);
+    rig.gw.reapExpiredForTest(1'000'000'001);   // past the 1 s auth deadline
+    ASSERT_FALSE(rig.gw.hasSessionForTest(a.sid));
+    const auto b = connectFrom(rig, "10.0.0.41", 1'000'000'002);
+    ASSERT_EQ(b.code, 0) << "a reaped session frees its slot";
+    EXPECT_EQ(connectFrom(rig, "10.0.0.41", 1'000'000'002).code, kConnectAuthFailed);
+    rig.send(disconnectFrame(b.sid, ++rig.corr));
+    ASSERT_FALSE(rig.gw.hasSessionForTest(b.sid));
+    EXPECT_EQ(connectFrom(rig, "10.0.0.41", 1'000'000'003).code, 0) << "a closed session frees its slot";
+}
+
+TEST(UnauthSessionCapRegression, TheDefaultCapIs64Regression) {
+    Rig rig;
+    EXPECT_EQ(ClientGateway::kDefaultMaxUnauthSessionsPerHost, 64u);
+    for (int i = 0; i < 64; ++i) ASSERT_EQ(connectFrom(rig, "10.0.0.51").code, 0) << i;
+    EXPECT_EQ(connectFrom(rig, "10.0.0.51").code, kConnectAuthFailed);
+    EXPECT_EQ(rig.gw.connectsRefusedUnauthenticatedCap(), 1u);
+}
+
+// Shard mode (the issue's case: kShardMaxSessions is one worker ack table): a host at the cap is refused before any
+// announcement, so the worker slots stay available to every other host.
+TEST(UnauthSessionCapRegression, ShardSlotsStayAvailableToOtherHostsRegression) {
+    Rig rig;
+    rune::node::WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16);
+    rig.gw.setWorkerPool(&pool);
+    rig.gw.setShardMode(true);
+    rig.gw.setMaxUnauthenticatedSessionsPerHost(2);
+    ASSERT_EQ(connectFrom(rig, "10.0.0.61").code, 0);
+    ASSERT_EQ(connectFrom(rig, "10.0.0.61").code, 0);
+    for (int i = 0; i < 8; ++i) EXPECT_EQ(connectFrom(rig, "10.0.0.61").code, kConnectAuthFailed) << i;
+    EXPECT_EQ(rig.gw.pendingConnectCount(), 0u) << "a refused Connect is never announced nor held";
+    const auto other = connectFrom(rig, "10.0.0.62");
+    EXPECT_EQ(other.code, 0);
+    EXPECT_TRUE(rig.gw.hasSessionForTest(other.sid));
+    EXPECT_EQ(rig.gw.connectsRefusedUnauthenticatedCap(), 8u);
+}
+
+// ── PR #611 review, adversarial pass (issue #236 / #232 through real Connect frames) ──────────────────────────────────
+namespace {
+std::vector<uint8_t> connectFrameFrom(Rig& rig, const std::string& host, int port, int64_t* corrOut = nullptr) {
+    pc::ConnectRequest req;
+    req.correlationId = ++rig.corr; req.egressStreamId = 9; req.clientVersion = pc::kClientVersionAuth;
+    const std::string channel = "aeron:udp?endpoint=" + host + ":" + std::to_string(port);
+    req.egressChannel = channel;
+    if (corrOut) *corrOut = req.correlationId;
+    std::vector<uint8_t> f(1024);
+    f.resize(req.encode(f.data()));
+    return f;
+}
+std::optional<pc::ConnectResponse> connectAnswer(const Rig& rig, int64_t corr) {
+    for (auto it = rig.seen.rbegin(); it != rig.seen.rend(); ++it)
+        if (it->tid == static_cast<uint16_t>(pc::TemplateId::ConnectResponse) && it->corr == corr)
+            return pc::ConnectResponse::decode(it->bytes.data(), it->bytes.size());
+    return std::nullopt;
+}
+}  // namespace
+
+// Input class (source key): the cap is per HOST - a flood that varies the source port of every Connect is still one
+// host.
+TEST(UnauthSessionCapRegression, VaryingTheSourcePortStillCountsAsOneHostAdversarialRegression) {
+    Rig rig;
+    rig.gw.setMaxUnauthenticatedSessionsPerHost(3);
+    std::vector<int16_t> codes;
+    for (int i = 0; i < 6; ++i) {
+        int64_t corr = 0;
+        rig.send(connectFrameFrom(rig, "10.0.0.71", 40000 + i, &corr));
+        rig.gw.pollPendingConnectsForTest(0);
+        const auto a = connectAnswer(rig, corr);
+        ASSERT_TRUE(a.has_value()) << i;
+        codes.push_back(a->code);
+    }
+    EXPECT_EQ(codes, (std::vector<int16_t>{0, 0, 0, kConnectAuthFailed, kConnectAuthFailed, kConnectAuthFailed}));
+    EXPECT_EQ(rig.gw.connectsRefusedUnauthenticatedCap(), 3u);
+}
+
+// Timing (back-to-back before any reply): Connects that are still PENDING (their reply publication not yet resolved)
+// count toward the cap, so a burst that lands in one poll can never overshoot it.
+TEST(UnauthSessionCapRegression, ABurstOfConnectsBeforeAnyResolvesIsCappedAdversarialRegression) {
+    Rig rig;
+    rig.gw.setMaxUnauthenticatedSessionsPerHost(4);
+    std::vector<int64_t> corrs(7);
+    for (auto& c : corrs) rig.send(connectFrameFrom(rig, "10.0.0.72", 40123, &c));
+    rig.gw.pollPendingConnectsForTest(0);
+    int ok = 0, refused = 0;
+    for (const int64_t c : corrs) {
+        const auto a = connectAnswer(rig, c);
+        ASSERT_TRUE(a.has_value()) << c;
+        if (a->code == 0) ++ok;
+        else if (a->code == kConnectAuthFailed) ++refused;
+    }
+    EXPECT_EQ(ok, 4);
+    EXPECT_EQ(refused, 3);
+    EXPECT_EQ(rig.gw.sessionCount(), 4u);
+}
+
+// Protocol state: a failed login (44) ends the session, so its slot is free for the host's next Connect.
+TEST(UnauthSessionCapRegression, AFailedLoginFreesItsSlotAdversarialRegression) {
+    Rig rig;
+    rig.gw.setMaxUnauthenticatedSessionsPerHost(1);
+    const auto a = connectFrom(rig, "10.0.0.73");
+    ASSERT_EQ(a.code, 0);
+    EXPECT_EQ(connectFrom(rig, "10.0.0.73").code, kConnectAuthFailed);
+    EXPECT_EQ(loginOn(rig, a.sid, "ws1", "not-the-password-xx"), static_cast<int>(pc::ErrorCode::AuthenticationFailed));
+    rig.gw.pollPendingConnectsForTest(0);
+    EXPECT_EQ(connectFrom(rig, "10.0.0.73").code, 0) << "the failed session holds no slot";
+}
+
+// Resources (the pending-connect table is a SECOND shared, bounded resource): one host flooding Connects - each refused
+// at the cap or not - must never evict ANOTHER host's pending Connect.  The table holds kMaxPendingConnects entries; a
+// flood that fills it would otherwise push every other host's Connect out (answered Internal) before it resolves, which
+// is the issue's lockout through a sibling path.
+TEST(UnauthSessionCapRegression, AFloodFromOneHostNeverEvictsAnotherHostsPendingConnectAdversarialRegression) {
+    Rig rig;
+    for (std::size_t i = 0; i < ClientGateway::kMaxPendingConnects; ++i)
+        rig.send(connectFrameFrom(rig, "10.0.0.74", 40123));
+    int64_t legit = 0;
+    rig.send(connectFrameFrom(rig, "10.0.0.75", 40123, &legit));
+    for (int i = 0; i < 500; ++i) rig.send(connectFrameFrom(rig, "10.0.0.74", 40123));
+    EXPECT_LE(rig.gw.pendingConnectCount(), ClientGateway::kMaxPendingConnects);
+    rig.gw.pollPendingConnectsForTest(0);
+    const auto a = connectAnswer(rig, legit);
+    ASSERT_TRUE(a.has_value()) << "the other host's Connect is answered";
+    EXPECT_EQ(a->code, 0) << "and accepted: the flood evicted only its own entries";
+    EXPECT_TRUE(rig.gw.hasSessionForTest(a->sessionId));
+}
+
+// Issue #232 at the cap refusal: the source host of a test gateway comes from the client's reply endpoint, so the
+// refusal line must write it escaped too.
+TEST(UnauthSessionCapRegression, TheCapRefusalLogsTheSourceHostEscapedAdversarialRegression) {
+    Rig rig;
+    rig.gw.setMaxUnauthenticatedSessionsPerHost(1);
+    const std::string host = "evil\nauth: login ok user=admin x";
+    int64_t c1 = 0, c2 = 0;
+    rig.send(connectFrameFrom(rig, host, 40123, &c1));
+    rig.send(connectFrameFrom(rig, host, 40123, &c2));
+    rig.gw.pollPendingConnectsForTest(0);
+    ASSERT_EQ(rig.gw.connectsRefusedUnauthenticatedCap(), 1u);
+    bool sawLine = false;
+    for (std::string l : rig.logSink->last_formatted()) {
+        while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+        EXPECT_EQ(l.find('\n'), std::string::npos) << "a raw newline in a log line: " << l;
+        if (l.find("connect refused source=evil\\x0aauth:\\x20login") != std::string::npos) sawLine = true;
+    }
+    EXPECT_TRUE(sawLine);
 }
