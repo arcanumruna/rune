@@ -268,3 +268,17 @@ Clients run behind NAT: home routers, cloud NAT gateways, most Kubernetes pods. 
   - security groups or firewalls opened for those ports;
   - client keepalive below typical NAT UDP timeouts (about 30 s).
 - **Tests:** an e2e leg with the client behind a NAT, e.g. a docker network with masquerade, on the default config.
+
+## 11. Rune login and anonymous read access
+Full design: arcanum-site `docs/specs/2026-10-24-arcanum-auth-design.md` §5.
+- **Two separate logins.**
+  - The Arcanum CLI token is used only against the control plane and never reaches the broker.
+  - Rune users log in to the broker with SCRAM via `rune login --user`. The CLI stores the derived `ClientKey`/`ServerKey` for each context, never the password. `rune logout` deletes them, and `rune whoami` shows both identities.
+- **Anonymous access by default.**
+  - Under `GatewayAuthMode::Required`, a client that connects without starting SCRAM gets a new read-only anonymous session state. This is different from today's full-access `AuthAnonymous`, which exists only with `RUNE_AUTH=disabled`.
+  - It runs as the namespace's built-in `anonymous` principal. Its only default grant is schema and catalog read, so `schema list|get|generate` and catalog reads work.
+  - QL, view reads, produce, consume and all DDL return `UNAUTHORIZED`; the CLI adds a "run `rune login`" hint.
+- **Controls:** a namespace admin can revoke the grant, and a `NamespaceLimits` flag lets the cluster admin disable anonymous access.
+- **Scope:** an anonymous session only ever sees its own namespace.
+- **Limits:** anonymous sessions count against the namespace's connection and rate limits, with a separate small cap building on issue #236.
+- **Tests:** adversarial checks that anonymous never passes any gate but schema read, including through a sibling operation, and never sees another namespace.
