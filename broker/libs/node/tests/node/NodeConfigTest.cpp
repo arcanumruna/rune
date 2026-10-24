@@ -3047,4 +3047,42 @@ TEST(NodeConfigRegression, GroupMaxGroupsEnvIsParsedRegression) {
     }
 }
 
+// #499: RUNE_GROUP_MIN_SESSION_TIMEOUT_MS / RUNE_GROUP_MAX_SESSION_TIMEOUT_MS — unset → 0 (the service defaults); a
+// positive int32 is carried; 0, negative and garbage refuse startup; both set with min > max refuses startup naming
+// both (min == max is fine).  RED: ignore the variables.
+TEST(NodeConfigRegression, GroupSessionTimeoutBoundsEnvAreParsedRegression) {
+    auto env = base1node();
+    env["RUNE_AUTH"] = "disabled";   // #533: a RUNE_TLS=OFF build refuses the default authentication
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->groupMinSessionTimeoutMs, 0);
+    EXPECT_EQ(r.config->groupMaxSessionTimeoutMs, 0);
+    for (const char* knob : {"RUNE_GROUP_MIN_SESSION_TIMEOUT_MS", "RUNE_GROUP_MAX_SESSION_TIMEOUT_MS"}) {
+        auto e = env;
+        e[knob] = "6000";
+        r = parseNodeConfig(fakeEnv(e));
+        ASSERT_TRUE(r.config.has_value()) << knob << ": " << r.error;
+        EXPECT_EQ(std::string_view(knob) == "RUNE_GROUP_MIN_SESSION_TIMEOUT_MS" ? r.config->groupMinSessionTimeoutMs
+                                                                                : r.config->groupMaxSessionTimeoutMs,
+                  6000) << knob;
+        for (const char* bad : {"0", "-1", "x", "99999999999"}) {
+            e[knob] = bad;
+            r = parseNodeConfig(fakeEnv(e));
+            EXPECT_FALSE(r.config.has_value()) << knob << "=" << bad;
+            EXPECT_NE(r.error.find(knob), std::string::npos) << knob << "=" << bad << ": " << r.error;
+        }
+    }
+    env["RUNE_GROUP_MIN_SESSION_TIMEOUT_MS"] = "7000";
+    env["RUNE_GROUP_MAX_SESSION_TIMEOUT_MS"] = "7000";
+    r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->groupMinSessionTimeoutMs, 7000);
+    EXPECT_EQ(r.config->groupMaxSessionTimeoutMs, 7000);
+    env["RUNE_GROUP_MAX_SESSION_TIMEOUT_MS"] = "6999";
+    r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.config.has_value()) << "min > max was accepted";
+    EXPECT_NE(r.error.find("RUNE_GROUP_MIN_SESSION_TIMEOUT_MS"), std::string::npos) << r.error;
+    EXPECT_NE(r.error.find("RUNE_GROUP_MAX_SESSION_TIMEOUT_MS"), std::string::npos) << r.error;
+}
+
 } // namespace rune::node

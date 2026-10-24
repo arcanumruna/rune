@@ -880,6 +880,30 @@ ConfigResult parseNodeConfig(
         }
     }
 
+    // --- RUNE_GROUP_MIN_SESSION_TIMEOUT_MS / RUNE_GROUP_MAX_SESSION_TIMEOUT_MS (optional, 0 = the service defaults) —
+    // #499: the bounds a JoinGroup's session timeout is clamped into.  Both set with min > max is refused.
+    {
+        const char* rawMin = getenv_fn("RUNE_GROUP_MIN_SESSION_TIMEOUT_MS");
+        if (rawMin && !std::string_view(rawMin).empty()) {
+            int32_t v{};
+            if (!parseInt32(rawMin, v) || v < 1)
+                return {{}, std::string("RUNE_GROUP_MIN_SESSION_TIMEOUT_MS must be a positive integer, got: ") + rawMin};
+            cfg.groupMinSessionTimeoutMs = v;
+        }
+        const char* rawMax = getenv_fn("RUNE_GROUP_MAX_SESSION_TIMEOUT_MS");
+        if (rawMax && !std::string_view(rawMax).empty()) {
+            int32_t v{};
+            if (!parseInt32(rawMax, v) || v < 1)
+                return {{}, std::string("RUNE_GROUP_MAX_SESSION_TIMEOUT_MS must be a positive integer, got: ") + rawMax};
+            cfg.groupMaxSessionTimeoutMs = v;
+        }
+        if (cfg.groupMinSessionTimeoutMs > 0 && cfg.groupMaxSessionTimeoutMs > 0 &&
+            cfg.groupMinSessionTimeoutMs > cfg.groupMaxSessionTimeoutMs)
+            return {{}, "RUNE_GROUP_MIN_SESSION_TIMEOUT_MS (" + std::to_string(cfg.groupMinSessionTimeoutMs) +
+                            ") must not exceed RUNE_GROUP_MAX_SESSION_TIMEOUT_MS (" +
+                            std::to_string(cfg.groupMaxSessionTimeoutMs) + ")"};
+    }
+
     // --- RUNE_SURVIVOR_LEADER_ELECTION (optional, default OFF) — review
     // 2026-10-04 MEDIUM-3: opt in to the position-proven survivor election (a
     // partition whose committed ISR has no live member elects its most complete

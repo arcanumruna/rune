@@ -398,6 +398,10 @@ private:
     void sendDeferred_(int64_t sessionId, const uint8_t* frame, std::size_t n);
     using ClientVersionFn = int32_t (*)(void* ctx, int64_t sessionId) noexcept;
     int32_t         maxSessionTimeoutMs_ = kDefaultMaxSessionTimeoutMs;
+    int32_t         minSessionTimeoutMs_ = kDefaultMinSessionTimeoutMs;   // #499
+    /// #499: the group's rebalance timeout is the LARGEST session timeout among its current members (Kafka: the max
+    /// rebalance timeout), never the last joiner's.  O(members), no allocation.
+    static void refreshRebalanceTimeout_(rune::coordination::GroupCoordinator& gc) noexcept;
     int32_t         maxGroups_           = kDefaultMaxGroups;   // #214
     uint64_t        joinsRefusedGroupCap_ = 0;
     uint64_t        groupsPruned_         = 0;
@@ -411,6 +415,13 @@ public:
     /// A non-positive maximum is no maximum: it keeps the default (never a 0 ms session for every member).
     void setMaxSessionTimeoutMs(int32_t ms) noexcept { maxSessionTimeoutMs_ = ms > 0 ? ms : kDefaultMaxSessionTimeoutMs; }
     [[nodiscard]] int32_t maxSessionTimeoutMs() const noexcept { return maxSessionTimeoutMs_; }
+    /// #499: the lower bound on a JoinGroup's sessionTimeoutMs (Kafka's group.min.session.timeout.ms; 1 s here, not
+    /// Kafka's 6 s: rigs use 5 s sessions - operators raise it).  A smaller request is CLAMPED up to it.  If the
+    /// minimum exceeds the maximum the effective lower bound is the maximum (NodeConfig refuses min > max).
+    static constexpr int32_t kDefaultMinSessionTimeoutMs = 1'000;
+    /// A non-positive minimum keeps the default.
+    void setMinSessionTimeoutMs(int32_t ms) noexcept { minSessionTimeoutMs_ = ms > 0 ? ms : kDefaultMinSessionTimeoutMs; }
+    [[nodiscard]] int32_t minSessionTimeoutMs() const noexcept { return minSessionTimeoutMs_; }
     /// Test seam: resolve a session's client version without a gateway (-1 = unknown: treated as current).
     void setClientVersionResolverForTest(ClientVersionFn fn, void* ctx) noexcept {
         clientVersionFn_ = fn; clientVersionCtx_ = ctx;

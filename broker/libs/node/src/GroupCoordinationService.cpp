@@ -227,6 +227,7 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
     for (auto& [groupId, coord] : coordinators_) {
         const coord::GroupState stateBefore = coord.state();
 
+        refreshRebalanceTimeout_(coord);   // #499: a departed long-timeout member stops counting
         const int w = coord.doWork(nowNs);
         work += w;
         drainDeparted_(groupId, coord);   // #124: expired / timed-out members lose their binding
@@ -419,6 +420,14 @@ void GroupCoordinationService::recordGenLineages_(const GroupId& groupId, const 
 // stale deliveries); no Assign frame is sent - a member learns NotCoordinator on its next request and re-discovers
 // the coordinator.  Parked commits, transactional offsets in flight and the offsets store are left alone (they keep
 // their own NotCoordinator handling).  Cold: once per lost role.
+// #499: the rebalance window is the largest session timeout among the CURRENT members (each already clamped into the
+// coordinator's bounds).  A member-less group keeps its value (nothing to wait for).  O(members), no allocation.
+void GroupCoordinationService::refreshRebalanceTimeout_(coord::GroupCoordinator& gc) noexcept {
+    int32_t maxMs = 0;
+    for (const auto& m : gc.members()) maxMs = std::max(maxMs, m.sessionTimeoutMs);
+    if (maxMs > 0) gc.setRebalanceTimeoutMs(maxMs);
+}
+
 // #570: the groups belong to the term they were loaded under.  A role lost and regained between two duty cycles is
 // never sampled as lost, but the term moved: unload exactly as on a lost role (members re-join the new term).
 int GroupCoordinationService::syncTerm_() {
@@ -698,15 +707,18 @@ size_t GroupCoordinationService::handleJoinGroup(
         if (b == nullptr || b->principal != principal || !gc.hasMember(memberIdStr)) memberIdScratch_.clear();
     }
 
-    // Set rebalance timeout from the member's sessionTimeout (or a sane default).  #213: the request is CLAMPED to the
-    // coordinator's maximum (Kafka: group.max.session.timeout.ms) - the value is also the group's rebalance timeout,
-    // so an unbounded one would let one member stall every rebalance and outlive its death for weeks.
-    // The 30 s default for an absent (<= 0) value is clamped too: a maximum below it is still the maximum.
-    const int32_t sessionMs = std::min(msg.sessionTimeoutMs > 0 ? msg.sessionTimeoutMs : 30'000, maxSessionTimeoutMs_);
-    if (msg.sessionTimeoutMs > sessionMs) [[unlikely]]
-        spdlog::debug("GroupCoordinationService: JoinGroup sessionTimeoutMs {} clamped to {} (group max)",
-                      msg.sessionTimeoutMs, sessionMs);
-    gc.setRebalanceTimeoutMs(sessionMs);
+    // The member's session timeout (or a sane default), CLAMPED into [min, max] (Kafka: group.min / group.max
+    // .session.timeout.ms).  #213: an unbounded one would let one member stall every rebalance and outlive its death
+    // for weeks.  #499: a tiny one is raised to the minimum, and the group's rebalance timeout is the LARGEST current
+    // member's (refreshRebalanceTimeout_ after the join), never the last joiner's - one 1 ms joiner no longer
+    // collapses the window and evicts every other member.  The 30 s default for an absent (<= 0) value is clamped too.
+    // A minimum above the maximum: the maximum is the bound (NodeConfig refuses that configuration).
+    const int32_t sessionLo = std::min(minSessionTimeoutMs_, maxSessionTimeoutMs_);
+    const int32_t sessionMs = std::clamp(msg.sessionTimeoutMs > 0 ? msg.sessionTimeoutMs : 30'000, sessionLo,
+                                         maxSessionTimeoutMs_);
+    if (msg.sessionTimeoutMs > 0 && msg.sessionTimeoutMs != sessionMs) [[unlikely]]
+        spdlog::debug("GroupCoordinationService: JoinGroup sessionTimeoutMs {} clamped to {} (group bounds [{}, {}])",
+                      msg.sessionTimeoutMs, sessionMs, sessionLo, maxSessionTimeoutMs_);
 
     // CG-4: capture state BEFORE join so we can detect a Stable→PreparingRebalance
     // transition triggered directly by gc.join() (new member arriving while Stable).
@@ -732,6 +744,7 @@ size_t GroupCoordinationService::handleJoinGroup(
                                    sessionMs,
                                    joinTopicsScratch_,
                                    nowNs);
+    refreshRebalanceTimeout_(gc);   // #499: the largest current member's session timeout
 
     // CG-4: if the join triggered a Stable→PreparingRebalance transition, eagerly
     // revoke all group push subscriptions and send empty Assign (revoke) frames.

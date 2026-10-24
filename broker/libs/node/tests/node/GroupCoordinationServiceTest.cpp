@@ -2962,7 +2962,9 @@ TEST(GroupCoordinationServiceRegression, JoinGroupSessionTimeoutBoundsTableAdver
     for (const int32_t maxMs : {GroupCoordinationService::kDefaultMaxSessionTimeoutMs, 10'000}) {
         for (const int32_t req : {INT32_MIN, -1, 0, 1, maxMs - 1, maxMs, maxMs + 1, INT32_MAX}) {
             SCOPED_TRACE(::testing::Message() << "max=" << maxMs << " requested=" << req);
-            const int32_t want = req <= 0 ? std::min(30'000, maxMs) : std::min(req, maxMs);
+            // #499: clamped into [min(1000, max), max]; the rebalance timeout is the largest member's session timeout.
+            const int32_t lo   = std::min(GroupCoordinationService::kDefaultMinSessionTimeoutMs, maxMs);
+            const int32_t want = std::clamp(req <= 0 ? 30'000 : req, lo, maxMs);
             OffRig g;
             g.svc.setMaxSessionTimeoutMs(maxMs);
             uint8_t rq[4096]{}, out[4096]{};
@@ -2974,14 +2976,14 @@ TEST(GroupCoordinationServiceRegression, JoinGroupSessionTimeoutBoundsTableAdver
             // A brand-new member asking for `req` (another session, same group).
             n = g.svc.handleJoinGroup(rq, encodeJoinGroup(rq, 2, 2, group, "", req), pc::kClientVersion, g.clock, out, sizeof out);
             ASSERT_TRUE(pc::JoinGroupResponse::decode(out, n).has_value());
-            EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), want) << "new member";
+            EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), std::max(5'000, want)) << "new member";
             // The first member re-joins asking for `req`.
             n = g.svc.handleJoinGroup(rq, encodeJoinGroup(rq, 1, 3, group, member, req), pc::kClientVersion, g.clock, out, sizeof out);
             ASSERT_TRUE(pc::JoinGroupResponse::decode(out, n).has_value());
             EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), want) << "re-join";
             for (const auto& m : g.svc.coordinator(group).members()) {
                 EXPECT_LE(m.sessionTimeoutMs, maxMs) << m.memberId;
-                EXPECT_GT(m.sessionTimeoutMs, 0) << m.memberId;
+                EXPECT_GE(m.sessionTimeoutMs, lo) << m.memberId;
                 if (m.memberId == member) EXPECT_EQ(m.sessionTimeoutMs, want) << "re-joined member";
             }
         }
@@ -4144,4 +4146,125 @@ TEST(GroupCoordinationServiceRegression, AnExpiredLastMemberPrunesTheGroupAndALa
     g.fetch();
     g.svc.doWork(g.clock);
     EXPECT_EQ(g.store.fetch(group, t0)->offset, 10) << "the committed offset moved";
+}
+
+// ===========================================================================
+// #499: the group's rebalance timeout was the LAST joiner's session timeout, with no lower bound: one member joining
+// with 1 ms collapsed the rebalance window and evicted every other member before it could re-join.  Session timeouts
+// are clamped into [min, max] and the rebalance timeout is the largest current member's.
+// ===========================================================================
+namespace {
+struct Joined499 { int16_t code = -1; std::string member; };
+Joined499 join499(OffRig& g, int64_t sid, int64_t corr, const std::string& group, const std::string& member,
+                  int32_t sessionMs) {
+    uint8_t req[4096]{}, out[4096]{};
+    const std::size_t n = g.svc.handleJoinGroup(req, encodeJoinGroup(req, sid, corr, group, member, sessionMs),
+                                                pc::kClientVersion, g.clock, out, sizeof out);
+    const auto r = pc::JoinGroupResponse::decode(out, n);
+    EXPECT_TRUE(r.has_value());
+    if (!r) return {};
+    return {r->errorCode, std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size())};
+}
+int16_t heartbeat499(OffRig& g, int64_t sid, int64_t corr, const std::string& group, const std::string& member) {
+    uint8_t req[4096]{}, out[4096]{};
+    const int32_t gen = g.svc.coordinator(group).generationId();
+    return decodeHBErrorCode(out, g.svc.handleHeartbeat(req, encodeHeartbeat(req, sid, corr, group, member, gen), g.clock,
+                                                        out, sizeof out));
+}
+/// Two members (sessions 1 and 2) with the given session timeouts, driven to Stable (member 2 joins last).
+std::pair<std::string, std::string> twoStable499(OffRig& g, const std::string& group, int32_t ms1, int32_t ms2,
+                                                 int64_t& corr) {
+    const std::string m1 = join499(g, 1, corr++, group, "", ms1).member;
+    const std::string m2 = join499(g, 2, corr++, group, "", ms2).member;
+    EXPECT_EQ(join499(g, 1, corr++, group, m1, ms1).code, 0);
+    EXPECT_EQ(join499(g, 2, corr++, group, m2, ms2).code, 0);
+    for (int i = 0; i < 50 && g.svc.coordinator(group).state() != GroupState::Stable; ++i) {
+        g.clock += 1'000'000;
+        g.svc.doWork(g.clock);
+    }
+    EXPECT_EQ(g.svc.coordinator(group).state(), GroupState::Stable);
+    EXPECT_EQ(g.svc.coordinator(group).memberCount(), 2u);
+    return {m1, m2};
+}
+}  // namespace
+
+// The issue's repro.  RED (the per-joiner setRebalanceTimeoutMs): the 1 ms joiner sets a 1 ms rebalance window and the
+// two original members are evicted within a few milliseconds for not re-joining.
+TEST(GroupCoordinationServiceRegression, AShortTimeoutJoinerNeverShrinksTheRebalanceWindowRegression) {
+    OffRig g;
+    const std::string group = "g499";
+    int64_t corr = 1;
+    const auto [m1, m2] = twoStable499(g, group, 30'000, 30'000, corr);
+    const std::string m3 = join499(g, 3, corr++, group, "", 1).member;
+    ASSERT_FALSE(m3.empty());
+    ASSERT_EQ(g.svc.coordinator(group).state(), GroupState::PreparingRebalance);
+    EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), 30'000) << "the short joiner shrank the rebalance window";
+    const int64_t t0 = g.clock;
+    for (int i = 0; i < 5; ++i) {   // a few milliseconds: the collapsed window would have evicted both by now
+        g.clock += 1'000'000;
+        (void)heartbeat499(g, 3, corr++, group, m3);
+        g.svc.doWork(g.clock);
+    }
+    EXPECT_TRUE(g.svc.coordinator(group).hasMember(m1)) << "evicted after 5 ms";
+    EXPECT_TRUE(g.svc.coordinator(group).hasMember(m2)) << "evicted after 5 ms";
+    EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), 30'000);
+    // Up to 29 s (the third member keeps its clamped 1 s session alive): the originals are still inside the window.
+    while (g.clock < t0 + 29'000'000'000LL) {
+        g.clock += 250'000'000;
+        (void)heartbeat499(g, 3, corr++, group, m3);
+        g.svc.doWork(g.clock);
+    }
+    EXPECT_TRUE(g.svc.coordinator(group).hasMember(m1)) << "evicted before the 30 s window";
+    EXPECT_TRUE(g.svc.coordinator(group).hasMember(m2)) << "evicted before the 30 s window";
+    EXPECT_TRUE(g.svc.coordinator(group).hasMember(m3));
+    EXPECT_EQ(join499(g, 1, corr++, group, m1, 30'000).code, 0);
+    EXPECT_EQ(join499(g, 2, corr++, group, m2, 30'000).code, 0);
+    EXPECT_EQ(join499(g, 3, corr++, group, m3, 1).code, 0);
+    for (int i = 0; i < 50 && g.svc.coordinator(group).state() != GroupState::Stable; ++i) {
+        g.clock += 1'000'000;
+        g.svc.doWork(g.clock);
+    }
+    EXPECT_EQ(g.svc.coordinator(group).state(), GroupState::Stable);
+    EXPECT_EQ(g.svc.coordinator(group).memberCount(), 3u);
+}
+
+// RED (the last joiner's value): the departed 20 s member's value stays the group's rebalance timeout.
+TEST(GroupCoordinationServiceRegression, ARebalanceTimeoutFollowsTheLargestCurrentMemberRegression) {
+    OffRig g;
+    const std::string group = "g499max";
+    int64_t corr = 1;
+    const auto [m1, m2] = twoStable499(g, group, 10'000, 20'000, corr);
+    EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), 20'000);
+    uint8_t req[4096]{}, out[4096]{};
+    ASSERT_EQ(decodeLeaveErrorCode(out, g.svc.handleLeaveGroup(req, encodeLeaveGroup(req, 2, corr++, group, m2), g.clock,
+                                                               out, sizeof out)), 0);
+    g.clock += 1'000'000;
+    g.svc.doWork(g.clock);
+    ASSERT_TRUE(g.svc.coordinator(group).hasMember(m1));
+    EXPECT_EQ(g.svc.coordinator(group).rebalanceTimeoutMs(), 10'000) << "a departed member's timeout still counts";
+}
+
+// RED (no minimum): the 1 ms session expires on the first duty cycle.
+TEST(GroupCoordinationServiceRegression, SessionTimeoutBelowTheMinimumIsRaisedToItRegression) {
+    OffRig g;
+    g.svc.setMinSessionTimeoutMs(5'000);
+    EXPECT_EQ(g.svc.minSessionTimeoutMs(), 5'000);
+    const std::string group = "g499min";
+    const std::string m = join499(g, 1, 1, group, "", 1).member;
+    ASSERT_FALSE(m.empty());
+    ASSERT_EQ(join499(g, 1, 2, group, m, 1).code, 0);
+    const int64_t t0 = g.clock;   // the member's last join
+    ASSERT_EQ(g.svc.groupCountForTest(), 1u);
+    ASSERT_EQ(g.svc.coordinator(group).members().size(), 1u);
+    EXPECT_EQ(g.svc.coordinator(group).members()[0].sessionTimeoutMs, 5'000);
+    g.clock = t0 + 4'900'000'000LL;
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.svc.groupCountForTest(), 1u);
+    EXPECT_TRUE(g.svc.coordinator(group).hasMember(m)) << "expired before the minimum session timeout";
+    g.clock = t0 + 5'100'000'000LL;
+    g.svc.doWork(g.clock);
+    EXPECT_EQ(g.svc.groupCountForTest(), 0u) << "the silent member outlived its 5 s session";
+    // A non-positive minimum keeps the default.
+    g.svc.setMinSessionTimeoutMs(0);
+    EXPECT_EQ(g.svc.minSessionTimeoutMs(), GroupCoordinationService::kDefaultMinSessionTimeoutMs);
 }

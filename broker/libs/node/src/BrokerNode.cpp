@@ -2408,6 +2408,8 @@ void BrokerNode::buildGateway() {
             groupCoordService_->setCoordinatorTermFn(
                 [this]() -> int64_t { return static_cast<int64_t>(leaderObserver_.computeOnControl().term); });
             groupCoordService_->setMaxGroups(config_.groupMaxGroups);   // #214 (0 = the default)
+            groupCoordService_->setMinSessionTimeoutMs(config_.groupMinSessionTimeoutMs);   // #499 (0 = the default)
+            groupCoordService_->setMaxSessionTimeoutMs(config_.groupMaxSessionTimeoutMs);   // #499 (0 = the default)
             // E2 final fix wave (C1): committed offsets of transient partitions
             // are positions of THIS process's rings (single node) — an offset
             // replayed from an earlier process is answered as none.
