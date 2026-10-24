@@ -22,9 +22,14 @@ extern "C" {
 #include <rune/consensus/TermLog.h>
 #include <rune/consensus/UdpMessageSink.h>
 #include <rune/peerlink/PeerFrameCrypto.h>
+#include <rune/peerlink/PeerHandshake.h>
 
 #include <algorithm>
 #include <atomic>
+#include <deque>
+#include <functional>
+#include <set>
+#include <string>
 #include <random>
 #include <chrono>
 #include <filesystem>
@@ -413,4 +418,156 @@ TEST(ConsensusKeepaliveRegression, AKeepaliveReplayedReorderedTamperedOrTruncate
         adapter.onFragment(2, sd.data(), sd.size());
     }
     EXPECT_EQ(handler.calls, 10) << "every StandDown between keepalives dispatched, no keepalive dispatched";
+}
+
+// ---- Issue #274 (consensus plane): no frame is lost across re-handshakes under traffic.  Two sealed consensus ends ----
+// (UdpMessageSink -> AeronIngress, sender id 0) exchange a numbered StandDown stream both ways (one frame each way per
+// ms) while two REAL PeerHandshakes re-key the link twice within 2 s; every handshake frame is held kHsDelay (another
+// stream: the data wins the race).  Keys go to BOTH the sink and the ingress of a node, as BrokerNode installs them.
+// Every numbered frame arrives exactly once; no UnknownEpoch drop.  Mutation: receiveFirst = false -> red.
+namespace {
+
+pl::ClusterKeys clusterKeys() {
+    const std::string k(48, 'k');
+    return {*rune::crypto::deriveClusterKey({reinterpret_cast<const uint8_t*>(k.data()), k.size()}), std::nullopt};
+}
+
+/// Two real handshakes, index 0 = node 1 (initiator), 1 = node 2; a frame is delivered `delayNs` after it left.
+struct Shake {
+    pl::PeerHandshake hs[2]{pl::PeerHandshake(1, 2, 10, clusterKeys()), pl::PeerHandshake(2, 1, 20, clusterKeys())};
+    struct InFlight { int to; std::vector<uint8_t> f; int64_t dueNs; };
+    std::deque<InFlight> q;
+    std::function<void(int, const pl::LinkKeys&)> install;
+    int64_t delayNs = 10'000'000, nowNs = 0;
+    void absorb(int i, pl::PeerHandshake::Out o) {
+        if (o.established) install(i, *o.established);
+        if (o.frame) q.push_back({1 - i, std::vector<uint8_t>(o.frame->data(), o.frame->data() + o.frame->size()), nowNs + delayNs});
+    }
+    void deliver(int to, const std::vector<uint8_t>& f) {
+        pl::PeerHandshake& h = hs[to];
+        const uint8_t* b = f.data(); const std::size_t n = f.size();
+        switch (static_cast<pl::PeerMsg>(pl::peekPeerMsg(b, n))) {
+            case pl::PeerMsg::HelloV2:     { pl::PeerHelloV2 m;     if (pl::PeerHelloV2::decode(b, n, m))     absorb(to, h.onHelloV2(m, nowNs)); break; }
+            case pl::PeerMsg::ChallengeV2: { pl::PeerChallengeV2 m; if (pl::PeerChallengeV2::decode(b, n, m)) absorb(to, h.onChallengeV2(m, nowNs)); break; }
+            case pl::PeerMsg::ProofV2:     { pl::PeerProofV2 m;     if (pl::PeerProofV2::decode(b, n, m))     absorb(to, h.onProofV2(m, nowNs)); break; }
+            case pl::PeerMsg::Accept:      { pl::PeerAccept m;      if (pl::PeerAccept::decode(b, n, m))      absorb(to, h.onAccept(m, nowNs)); break; }
+            case pl::PeerMsg::Confirm:     { pl::PeerConfirm m;     if (pl::PeerConfirm::decode(b, n, m))     absorb(to, h.onConfirm(m, nowNs)); break; }
+            case pl::PeerMsg::Refuse:      { pl::PeerRefuse m;      if (pl::PeerRefuse::decode(b, n, m))      absorb(to, h.onRefuse(m, nowNs)); break; }
+            default: ADD_FAILURE() << "unexpected handshake frame tag " << int(b[0]);
+        }
+    }
+    void step(int64_t now) {
+        nowNs = now;
+        absorb(0, hs[0].tick(now)); absorb(1, hs[1].tick(now));
+        while (!q.empty() && q.front().dueNs <= now) { InFlight f = std::move(q.front()); q.pop_front(); deliver(f.to, f.f); }
+    }
+    [[nodiscard]] bool established() const {
+        return std::holds_alternative<pl::Established>(hs[0].state()) && std::holds_alternative<pl::Established>(hs[1].state());
+    }
+};
+
+struct Elapsed {
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    [[nodiscard]] int64_t ns() const {
+        return 1 + std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
+} // namespace
+
+TEST(PeerSealedConsensusRegression, NoFrameIsLostAcrossTwoRehandshakesUnderTrafficRegression) {
+    MediaDriver driver;
+    aeron::Context ctx; ctx.aeronDir(driver.dir());
+    auto aeron = aeron::Aeron::connect(ctx);
+    const uint16_t ports[2] = {rune::aeronutil::testing::allocFreeUdpPort(), rune::aeronutil::testing::allocFreeUdpPort()};
+    auto chan = [&](int i) { return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(ports[i]); };
+    struct End {
+        std::unique_ptr<IngressRing> ring; std::unique_ptr<AeronIngress> ingress; std::unique_ptr<UdpMessageSink> sink;
+        std::multiset<int64_t> got;
+    } end[2];
+    for (int i = 0; i < 2; ++i) {
+        end[i].ring = std::make_unique<IngressRing>(64 * 1024);
+        end[i].ingress = std::make_unique<AeronIngress>(aeron, chan(i), kConsensusStream, *end[i].ring, rune::aeronutil::AeronPump{},
+                                                        pl::PeerFrameCrypto(i + 1, 0));
+    }
+    for (int i = 0; i < 2; ++i) {
+        std::unordered_map<NodeId, UdpMessageSink::PeerEndpoint> eps{{2 - i, {chan(1 - i), kConsensusStream}}};
+        end[i].sink = std::make_unique<UdpMessageSink>(aeron, eps, rune::aeronutil::AeronPump{}, PeerResolutionSource{},
+                                                       pl::PeerFrameCrypto(i + 1, 0));
+    }
+    Shake sh;
+    sh.install = [&](int i, const pl::LinkKeys& k) {
+        const int32_t peer = 2 - i;
+        EXPECT_TRUE(end[i].sink->installPeerLink(peer, k)) << "sink of node " << i + 1;
+        EXPECT_TRUE(end[i].ingress->installPeerLink(peer, k)) << "ingress of node " << i + 1;
+    };
+    const Elapsed clock;
+    auto pumpOnce = [&] {
+        const int64_t now = clock.ns();
+        for (int i = 0; i < 2; ++i) {
+            (void)end[i].ingress->poll(10);
+            (void)end[i].ring->drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len) {
+                const auto* f = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+                if (static_cast<std::size_t>(len) >= StandDownMsg::TOTAL_SIZE && peekTemplateId(f, 0) == StandDownMsg::TEMPLATE_ID)
+                    end[i].got.insert(StandDownMsg::decode(f, 0).leadershipTermId);
+            }, 100);
+            int32_t peer = -1; uint32_t ep = 0;
+            if (end[i].ingress->takePeerUsedEpoch(peer, ep)) sh.absorb(i, sh.hs[i].onPeerUsedEpoch(ep, now));
+        }
+        sh.step(now);
+        std::this_thread::yield();
+    };
+    auto send = [&](int from, int64_t seq) {
+        std::array<uint8_t, StandDownMsg::TOTAL_SIZE> f{};
+        (void)StandDownMsg::encode(f.data(), 0, seq, from + 1);
+        end[from].sink->send(2 - from, f.data(), f.size());
+    };
+    for (int i = 0; i < 10'000'000 && !sh.established() && clock.ns() < 5'000'000'000; ++i) pumpOnce();
+    ASSERT_TRUE(sh.established());
+    for (int i = 0; i < 10'000'000 && (end[0].got.count(0) == 0 || end[1].got.count(0) == 0) && clock.ns() < 15'000'000'000; ++i) {
+        if (i % 1000 == 0) { send(0, 0); send(1, 0); }
+        pumpOnce();
+    }
+    ASSERT_TRUE(end[0].got.count(0) > 0 && end[1].got.count(0) > 0) << "the publications never connected";
+
+    constexpr int64_t kN = 400, kPaceNs = 1'000'000;
+    int rekeys = 0;
+    int64_t nextSend = clock.ns();
+    for (int64_t seq = 1; seq <= kN;) {
+        pumpOnce();
+        if (clock.ns() < nextSend) continue;
+        nextSend += kPaceNs;
+        if (seq == 100 || seq == 250) {   // the second re-handshake ~150 ms after the first (< 2 s)
+            ASSERT_TRUE(sh.established()) << "the previous re-handshake had not completed by " << seq;
+            auto o = sh.hs[0].rekeyForTest(clock.ns());
+            ASSERT_TRUE(o.frame) << "rekey at " << seq;
+            sh.absorb(0, std::move(o));
+            ++rekeys;
+        }
+        send(0, seq); send(1, seq);
+        ++seq;
+    }
+    auto numbered = [](const End& e) { return static_cast<int64_t>(e.got.size() - e.got.count(0)); };
+    const int64_t drainBy = clock.ns() + 10'000'000'000;
+    for (int i = 0; i < 10'000'000 && (numbered(end[0]) < kN || numbered(end[1]) < kN || !sh.q.empty()) && clock.ns() < drainBy; ++i)
+        pumpOnce();
+    std::multiset<int64_t> want;
+    for (int64_t s = 1; s <= kN; ++s) want.insert(s);
+    for (auto& e : end) e.got.erase(0);
+    auto diff = [&](const std::multiset<int64_t>& got) {
+        std::string d;
+        for (int64_t s = 1; s <= kN; ++s)
+            if (const auto c = got.count(s); c != 1) d += " " + std::to_string(s) + "x" + std::to_string(c);
+        return d;
+    };
+    EXPECT_EQ(end[1].got, want) << "node 1 -> node 2, seq x count:" << diff(end[1].got);
+    EXPECT_EQ(end[0].got, want) << "node 2 -> node 1, seq x count:" << diff(end[0].got);
+    EXPECT_EQ(rekeys, 2);
+    for (int i = 0; i < 2; ++i) {
+        EXPECT_EQ(end[i].ingress->unknownEpochDrops(), 0u) << "node " << i + 1;
+        EXPECT_EQ(end[i].ingress->peerFrameDrops(), 0u) << "node " << i + 1;
+        EXPECT_EQ(end[i].sink->peerFrameDrops(), 0u) << "node " << i + 1;
+    }
+    EXPECT_EQ(end[0].sink->peerLinkEpoch(2), 3u);
+    EXPECT_EQ(end[1].sink->peerLinkEpoch(1), 3u) << "the responder promoted the last epoch";
 }
