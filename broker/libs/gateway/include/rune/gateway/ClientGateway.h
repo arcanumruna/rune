@@ -669,6 +669,13 @@ public:
         const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s->auth);
         return a != nullptr ? a->userId : 0;
     }
+    /// PR #609 review (#557): a transaction request the coordinator PARKED (authorized on arrival) is re-admitted
+    /// before it runs at replay, as on arrival: false when its session is gone (nothing runs, nobody to answer) or no
+    /// longer holds the grants it needs (answered 45 here, nothing runs).  Control thread; cold.
+    [[nodiscard]] bool readmitParkedTxnRequest(int64_t sessionId, uint16_t tid, const uint8_t* buf, std::size_t len) {
+        Session* s = sessions_.find(sessionId);
+        return s != nullptr && !denyTxnRequest_(*s, tid, buf, len);
+    }
     void setClusterIdNode(int32_t nodeId) noexcept {
         idPrefix_ = nodeId >= 0 ? clusterIdPrefix(nodeId) : 0;
         sessions_.setIdPrefix(idPrefix_);

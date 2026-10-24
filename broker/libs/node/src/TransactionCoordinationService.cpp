@@ -621,6 +621,12 @@ int TransactionCoordinationService::replayNextTxn_(int64_t nowNs)
     for (ParkedNextTxn& p : replayScratch_) {
         const uint8_t* b = p.request.data();
         const size_t   k = p.request.size();
+        // PR #609 review: the gateway authorized the request on ARRIVAL; it may have waited (unboundedly, behind stuck
+        // markers) since.  It runs only if its session still exists and still holds its grants (else: dropped / 45).
+        if (gateway_ != nullptr && !gateway_->readmitParkedTxnRequest(p.sessionId, p.templateId, b, k)) {
+            spareBufs_.push_back(std::move(p.request));
+            continue;
+        }
         size_t answered = 0;
         switch (static_cast<pc::TemplateId>(p.templateId)) {
             case pc::TemplateId::InitProducerId:

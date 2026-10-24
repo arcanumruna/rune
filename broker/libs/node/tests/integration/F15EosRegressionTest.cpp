@@ -149,9 +149,12 @@ bool logHoldsControlBatchAt0(Log& log) {
 }
 struct Captured {
     std::vector<int16_t> produceErrors;
+    bool keepFrames = false;                     // PR #609 review: every egress frame (off by default)
+    std::vector<std::vector<uint8_t>> frames;
     rune::gateway::ClientGateway::TestEgressFn fn() {
         return [this](const uint8_t* b, std::size_t n) -> int64_t {
             if (auto r = pc::ProduceResponse::decode(b, n)) produceErrors.push_back(r->errorCode);
+            if (keepFrames) frames.emplace_back(b, b + n);
             return 1;
         };
     }
@@ -7448,4 +7451,306 @@ TEST(NextTxnParkRegression, ParkedNextTxnOverflowIsAnswered27Regression) {
     ASSERT_EQ(T.controlFrames.size(), 2u) << "the parked ones are still answered";
     EXPECT_EQ(legAnswer(NextLeg::AddPartitions, T.controlFrames[0].data(), T.controlFrames[0].size())->first, 0);
     EXPECT_EQ(legAnswer(NextLeg::AddOffsets, T.controlFrames[1].data(), T.controlFrames[1].size())->first, 0);
+}
+
+// ============================================================================
+// PR #609 adversarial review (#557 / #562 / #211 areas).  Every test drives the REAL gateway (TxnRig) where the
+// attack needs it; each names the attack class it covers.
+// ============================================================================
+namespace {
+uint16_t legTid(NextLeg l) {
+    switch (l) {
+        case NextLeg::AddPartitions:  return static_cast<uint16_t>(pc::TemplateId::AddPartitionsToTxn);
+        case NextLeg::AddOffsets:     return static_cast<uint16_t>(pc::TemplateId::AddOffsetsToTxn);
+        case NextLeg::InitProducerId: return static_cast<uint16_t>(pc::TemplateId::InitProducerId);
+    }
+    return 0;
+}
+/// The leg's request frame on `sessionId` (the producer's pid / epoch / transactional id).
+std::vector<uint8_t> legFrame(TxnRig& T, NextLeg l, int64_t sessionId, int16_t epoch) {
+    std::vector<uint8_t> f;
+    switch (l) {
+        case NextLeg::AddPartitions: {
+            pc::AddPartitionsToTxn q; q.sessionId = sessionId; q.correlationId = ++T.corr; q.producerId = T.pid;
+            q.producerEpoch = epoch; q.transactionalId = T.tid();
+            const pc::TxnTopicPartition tp{0, 0};
+            f.resize(pc::AddPartitionsToTxn::encodedSizeFor(T.tid(), 1));
+            q.encode(f.data(), std::span<const pc::TxnTopicPartition>(&tp, 1));
+            break;
+        }
+        case NextLeg::AddOffsets: {
+            static constexpr std::string_view g = "g557";
+            pc::AddOffsetsToTxn q; q.sessionId = sessionId; q.correlationId = ++T.corr; q.producerId = T.pid;
+            q.producerEpoch = epoch; q.transactionalId = T.tid();
+            q.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(g.data()), g.size());
+            f.resize(q.encodedSize()); q.encode(f.data());
+            break;
+        }
+        case NextLeg::InitProducerId: {
+            pc::InitProducerId q; q.sessionId = sessionId; q.correlationId = ++T.corr; q.transactionTimeoutMs = 60'000;
+            q.transactionalId = T.tid();
+            f.resize(q.encodedSize()); q.encode(f.data());
+            break;
+        }
+    }
+    return f;
+}
+/// Every answer to correlation id `corr` among `frames`, decoded as the leg's own response type.
+std::vector<int16_t> answersTo(NextLeg l, const std::vector<std::vector<uint8_t>>& frames, int64_t corr) {
+    std::vector<int16_t> v;
+    for (const auto& f : frames)
+        if (const auto a = legAnswer(l, f.data(), f.size()); a && a->second == corr) v.push_back(a->first);
+    return v;
+}
+rune::security::GrantSpec grantOf(rune::security::Operation op, rune::security::ResourceType t, std::string name) {
+    return rune::security::GrantSpec{op, rune::security::ResourcePattern{t, rune::security::PatternKind::Exact, std::move(name)}};
+}
+std::vector<rune::security::GrantSpec> producerGrants() {
+    using rune::security::Operation; using rune::security::ResourceType;
+    std::vector<rune::security::GrantSpec> g{grantOf(Operation::Write, ResourceType::TransactionalId, "tx-f15"),
+                                             grantOf(Operation::Read, ResourceType::Group, "g557")};
+    std::sort(g.begin(), g.end());
+    return g;
+}
+/// AddPartitionsToTxn (pid, epoch) straight to the coordinator on `sessionId`: its error code (-1 = not answered).
+int16_t addPartitionOn(TxnRig& T, int64_t sessionId, int16_t epoch) {
+    const auto f = legFrame(T, NextLeg::AddPartitions, sessionId, epoch);
+    const auto n = T.tcs->handleAddPartitions(f.data(), f.size(), 1, T.out.data(), T.out.size());
+    const auto a = legAnswer(NextLeg::AddPartitions, T.out.data(), n);
+    return a ? a->first : int16_t{-1};
+}
+enum class SessionFate { Kept, GrantsRevoked, Closed, Revoked };
+const char* fateName(SessionFate f) {
+    switch (f) {
+        case SessionFate::Kept:          return "kept";
+        case SessionFate::GrantsRevoked: return "grants revoked";
+        case SessionFate::Closed:        return "session closed";
+        case SessionFate::Revoked:       return "session revoked";
+    }
+    return "?";
+}
+}  // namespace
+
+// Auth + protocol state: a next-txn leg is authorized by the gateway on ARRIVAL, then parked - possibly for as long as
+// the previous transaction's markers take (unbounded when they are stuck).  When it is replayed, its session must still
+// exist and still hold the grants the leg needs: a grant revoked meanwhile is answered 45 and the leg never runs; a
+// closed or revoked session's leg never runs (no epoch bump that fences the live producer, no transaction opened for a
+// principal that is gone).  RED (before the review fix): every parked leg ran at replay, whatever happened to its
+// session (the epoch was bumped / the transaction opened, and an OK went out).
+TEST(NextTxnParkRegression, AParkedLegRunsOnlyForALiveSessionThatStillHoldsItsGrantsAdversarialRegression) {
+    for (const NextLeg leg : {NextLeg::InitProducerId, NextLeg::AddOffsets}) {
+        for (const SessionFate fate : {SessionFate::Kept, SessionFate::GrantsRevoked, SessionFate::Closed,
+                                       SessionFate::Revoked}) {
+            SCOPED_TRACE(std::string(legName(leg)) + " / " + fateName(fate));
+            TxnRig T;
+            T.m.cap.keepFrames = true;
+            ASSERT_EQ(T.sid, 1) << "TxnRig's direct legs name session 1";
+            // The coordinator binds producer ids to principal 7 on every session (the gateway's view follows below).
+            T.tcs->setPrincipalResolverForTest([](void*, int64_t) noexcept -> uint64_t { return 7u; }, nullptr);
+            committedMarkerInFlight557(T);
+            T.m.gw.authenticateWithGrantsForTest(T.sid, 7, producerGrants());
+            const int64_t observer = T.m.gw.injectTestSession();   // the same principal on a second session
+            T.m.gw.authenticateWithGrantsForTest(observer, 7, producerGrants());
+            const int16_t epoch0 = T.epoch;
+
+            const auto f = legFrame(T, leg, T.sid, T.epoch);
+            const int64_t corr = T.corr;
+            T.m.gw.applyTxnForTest(f.data(), f.size(), legTid(leg), 2);
+            ASSERT_EQ(T.tcs->parkedNextTxnRequests(), 1u) << "precondition: authorized on arrival and parked";
+            ASSERT_TRUE(answersTo(leg, T.m.cap.frames, corr).empty()) << "precondition: not answered yet";
+
+            const uint64_t denied0 = T.m.gw.notAuthorizedAnswers();
+            switch (fate) {
+                case SessionFate::Kept: break;
+                case SessionFate::GrantsRevoked: T.m.gw.authenticateWithGrantsForTest(T.sid, 7, {}); break;
+                case SessionFate::Closed:        T.m.gw.closeSessionForTest(T.sid); break;
+                case SessionFate::Revoked:       T.m.gw.revokeAllSessionsForTest("pr609"); break;
+            }
+            T.runUntilNoMarkerAwaited(10);
+            (void)T.tcs->doWork(20);
+            EXPECT_EQ(T.tcs->parkedNextTxnRequests(), 0u) << "left parked";
+
+            const auto replayed = answersTo(leg, T.controlFrames, corr);
+            const auto egress   = answersTo(leg, T.m.cap.frames, corr);
+            const bool ran = leg == NextLeg::InitProducerId
+                                 ? addPartitionOn(T, observer, epoch0) != 0   // the old epoch is fenced: it ran
+                                 : T.tcs->txnStateForTest(T.txnId) == tx::TxnState::Ongoing;
+            if (fate == SessionFate::Kept) {
+                EXPECT_EQ(replayed, std::vector<int16_t>{0}) << "the live, authorized leg is answered OK once";
+                EXPECT_TRUE(ran) << "the leg did not run (vacuous)";
+                continue;
+            }
+            EXPECT_FALSE(ran) << "the parked leg ran after its session lost its right to run it";
+            for (const int16_t e : replayed) EXPECT_NE(e, 0) << "answered OK";
+            for (const int16_t e : egress) EXPECT_NE(e, 0) << "answered OK";
+            if (fate == SessionFate::GrantsRevoked)
+                EXPECT_EQ(T.m.gw.notAuthorizedAnswers(), denied0 + 1) << "a revoked grant is answered 45, once";
+        }
+    }
+}
+
+// Protocol state + concurrency (fencing between park and replay): AddPartitions(pid, E), an InitProducerId on the same
+// id (a fencing restart) and AddOffsets(pid, E) are parked in that order.  The replay keeps arrival order: the first
+// runs, the InitProducerId bumps the epoch, and the AddOffsets of the now-fenced epoch is NEVER answered OK.  Every leg
+// is answered exactly once.
+TEST(NextTxnParkRegression, ReplayKeepsArrivalOrderAndALegFencedMeanwhileIsNeverOkAdversarialRegression) {
+    TxnRig T;
+    committedMarkerInFlight557(T);
+    ASSERT_EQ(sendLeg(T, NextLeg::AddPartitions), 0u);
+    const int64_t c1 = T.corr;
+    ASSERT_EQ(sendLeg(T, NextLeg::InitProducerId), 0u);
+    const int64_t c2 = T.corr;
+    ASSERT_EQ(sendLeg(T, NextLeg::AddOffsets), 0u);
+    const int64_t c3 = T.corr;
+    ASSERT_EQ(T.tcs->parkedNextTxnRequests(), 3u);
+    T.runUntilNoMarkerAwaited(10);
+    (void)T.tcs->doWork(20);
+    // The fencing InitProducerId aborts the transaction the first leg opened: let that abort complete too.
+    for (int i = 0; i < 16; ++i) { (void)T.tcs->doWork(30 + i); T.m.runWorker(30 + i); }
+    (void)T.tcs->doWork(60);
+    const auto a1 = answersTo(NextLeg::AddPartitions, T.controlFrames, c1);
+    const auto a2 = answersTo(NextLeg::InitProducerId, T.controlFrames, c2);
+    const auto a3 = answersTo(NextLeg::AddOffsets, T.controlFrames, c3);
+    ASSERT_EQ(a1.size(), 1u);
+    ASSERT_EQ(a2.size(), 1u);
+    ASSERT_EQ(a3.size(), 1u) << "every parked leg is answered exactly once";
+    EXPECT_EQ(a1[0], 0) << "the first leg runs first (arrival order)";
+    EXPECT_NE(a3[0], 0) << "a leg of the epoch the InitProducerId fenced was answered OK";
+    std::size_t i1 = 0, i3 = 0;
+    for (std::size_t i = 0; i < T.controlFrames.size(); ++i) {
+        const auto& fr = T.controlFrames[i];
+        if (auto a = legAnswer(NextLeg::AddPartitions, fr.data(), fr.size()); a && a->second == c1) i1 = i;
+        if (auto a = legAnswer(NextLeg::AddOffsets, fr.data(), fr.size()); a && a->second == c3) i3 = i;
+    }
+    EXPECT_LT(i1, i3) << "replayed out of arrival order";
+    EXPECT_EQ(T.tcs->parkedNextTxnRequests(), 0u);
+}
+
+// Resources + re-entrancy: a replay triggered by ANOTHER transactional id's completion re-parks a leg whose own id is
+// still Prepare* - inside the cap even when the list was full (the replay empties it first), unanswered, and it is
+// answered OK once its own markers land.  Never a 27 for a leg that fit in the list.
+TEST(NextTxnParkRegression, AReplayForAnotherIdReparksAStillPreparingLegWithinTheCapAdversarialRegression) {
+    TxnRig T;
+    committedMarkerInFlight557(T);                          // "tx-f15" Prepare*, its marker not landed
+    T.tcs->setMaxParkedNextTxnForTest(1);
+    ASSERT_EQ(sendLeg(T, NextLeg::AddPartitions), 0u);
+    const int64_t corr = T.corr;
+    ASSERT_EQ(T.tcs->parkedNextTxnRequests(), 1u);
+
+    // Another id: an offsets-only transaction (no partition, no marker) completes in the coordinator's next pass.
+    const std::string first = T.txnId; const int64_t pid1 = T.pid; const int16_t epoch1 = T.epoch;
+    T.txnId = "tx-other";
+    ASSERT_EQ(T.initPid(), 0);
+    const std::size_t n = sendLeg(T, NextLeg::AddOffsets);
+    ASSERT_NE(n, 0u) << "tx-other is not preparing: answered at once";
+    ASSERT_EQ(legAnswer(NextLeg::AddOffsets, T.out.data(), n)->first, 0);
+    const uint64_t done = T.tcs->transactionsCompletedForTest();
+    ASSERT_EQ(T.endTxn(/*commit=*/false), 0);
+    for (int i = 0; i < 4 && T.tcs->transactionsCompletedForTest() == done; ++i) (void)T.tcs->doWork(5 + i);
+    ASSERT_GT(T.tcs->transactionsCompletedForTest(), done) << "precondition: tx-other completed (replay due)";
+    ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteAbort);
+    (void)T.tcs->doWork(9);                                  // the replay pass
+
+    T.txnId = first; T.pid = pid1; T.epoch = epoch1;
+    EXPECT_EQ(T.tcs->parkedNextTxnRequests(), 1u) << "the still-preparing leg was dropped or answered";
+    EXPECT_TRUE(answersTo(NextLeg::AddPartitions, T.controlFrames, corr).empty()) << "answered before its markers";
+    T.runUntilNoMarkerAwaited(10);
+    (void)T.tcs->doWork(20);
+    EXPECT_EQ(answersTo(NextLeg::AddPartitions, T.controlFrames, corr), std::vector<int16_t>{0});
+    EXPECT_EQ(T.tcs->parkedNextTxnRequests(), 0u);
+}
+
+// Input bounds + protocol state: only a well-formed leg of the preparing transaction's OWN producer id and epoch is
+// parked.  A frame truncated at every offset, a stale or future epoch, and another principal's producer id are each
+// answered at once (or, for a frame too short to answer, dropped as before) - never parked behind the markers.
+TEST(NextTxnParkRegression, OnlyAWellFormedLegOfThePreparingProducerIsParkedAdversarialRegression) {
+    TxnRig T;
+    // Bound producer ids: session 1 is principal 7 (the producer), session 2 principal 99 (someone else).
+    T.tcs->setPrincipalResolverForTest([](void*, int64_t s) noexcept -> uint64_t { return s == 2 ? 99u : 7u; }, nullptr);
+    committedMarkerInFlight557(T);
+    ASSERT_TRUE(rune::protocol::producerIdOwnedBy(T.pid, 7)) << "precondition: the id is bound to its principal";
+    for (const NextLeg leg : {NextLeg::AddPartitions, NextLeg::AddOffsets, NextLeg::InitProducerId}) {
+        SCOPED_TRACE(legName(leg));
+        const auto f = legFrame(T, leg, 1, T.epoch);
+        for (std::size_t cut = 0; cut < f.size(); ++cut) {
+            switch (leg) {
+                case NextLeg::AddPartitions:  (void)T.tcs->handleAddPartitions(f.data(), cut, 1, T.out.data(), T.out.size()); break;
+                case NextLeg::AddOffsets:     (void)T.tcs->handleAddOffsets(f.data(), cut, 1, T.out.data(), T.out.size()); break;
+                case NextLeg::InitProducerId: (void)T.tcs->handleInitProducerId(f.data(), cut, 1, T.out.data(), T.out.size()); break;
+            }
+            ASSERT_EQ(T.tcs->parkedNextTxnRequests(), 0u) << "a frame truncated at " << cut << " was parked";
+        }
+    }
+    for (const int16_t e : {static_cast<int16_t>(T.epoch - 1), static_cast<int16_t>(T.epoch + 1)}) {
+        const auto f = legFrame(T, NextLeg::AddPartitions, 1, e);
+        const auto n = T.tcs->handleAddPartitions(f.data(), f.size(), 1, T.out.data(), T.out.size());
+        ASSERT_NE(n, 0u) << "epoch " << e << " was parked behind another epoch's markers";
+        EXPECT_NE(legAnswer(NextLeg::AddPartitions, T.out.data(), n)->first, 0);
+    }
+    // Another principal: the pid is not theirs - answered at once, never parked behind the owner's markers.
+    for (const NextLeg leg : {NextLeg::AddPartitions, NextLeg::AddOffsets}) {
+        const auto f = legFrame(T, leg, 2, T.epoch);
+        const auto n = leg == NextLeg::AddPartitions
+                           ? T.tcs->handleAddPartitions(f.data(), f.size(), 1, T.out.data(), T.out.size())
+                           : T.tcs->handleAddOffsets(f.data(), f.size(), 1, T.out.data(), T.out.size());
+        ASSERT_NE(n, 0u) << legName(leg) << ": another principal's leg was parked";
+        EXPECT_NE(legAnswer(leg, T.out.data(), n)->first, 0) << legName(leg);
+    }
+    EXPECT_EQ(T.tcs->parkedNextTxnRequests(), 0u);
+}
+
+// #562 at the produce layers (gateway op path AND shard ingress): a registration whose __transaction_state put was
+// refused is not durable, so a transactional batch into it is refused retriably (27) and NOT appended; once the
+// client's AddPartitions retry is persisted and committed, the batch is appended.  RED: revert the kUnpersisted check in
+// verifyTxnPartition (the old committed record of the same id let the batch in).
+TEST(TxnPrepareGateRegression, ABatchIntoARefusedRegistrationIsRefusedOnEveryProducePathAdversarialRegression) {
+    for (const bool shardIngress : {false, true}) {
+        SCOPED_TRACE(shardIngress ? "shard ingress" : "gateway op path");
+        struct Rig : TxnRig {
+            Rig() : TxnRig(/*minIsr=*/1, /*withStore=*/true) { m.w().setTxnVerification(true); }
+        } T;
+        int64_t now = 2;
+        // One attempt of the batch (pid, epoch, seq) on the chosen path; its answer (-1 = none).
+        const auto attempt = [&](int32_t seq) -> int16_t {
+            const std::size_t before = T.m.cap.produceErrors.size();
+            now += 100;
+            if (shardIngress) (void)T.m.ingressTxn(T.sid, ++T.corr, T.pid, T.epoch, seq, /*acks=*/0, now);
+            else              { T.seq = seq; T.produceTxn(); }
+            for (int i = 0; i < 16 && T.m.cap.produceErrors.size() == before; ++i) { (void)T.tcs->doWork(now + i); T.m.runWorker(now + i); }
+            for (int i = 0; i < 8; ++i) { (void)T.tcs->doWork(now + 20 + i); T.m.runWorker(now + 20 + i); }
+            return T.m.cap.produceErrors.size() > before ? T.m.cap.produceErrors.back() : int16_t{-1};
+        };
+        // The first batch of a transaction is refused 27 while the leader asks the coordinator; a retry carries the
+        // coordinator's verdict (TxnVerifyRegression).
+        const auto untilOk = [&](int32_t seq) {
+            int16_t e = -1;
+            for (int i = 0; i < 4 && e != 0; ++i) e = attempt(seq);
+            return e;
+        };
+        // txn1 commits fully (its records committed), so the id has an OLDER committed record.
+        ASSERT_EQ(T.initPid(), 0);
+        ASSERT_EQ(T.addPartition(), 0);
+        (void)T.tcs->doWork(now);
+        ASSERT_EQ(untilOk(0), 0);
+        ASSERT_EQ(T.endTxn(/*commit=*/true), 0);
+        T.runUntilNoMarkerAwaited(now + 10);
+        for (int i = 0; i < 4; ++i) (void)T.tcs->doWork(now + 20 + i);
+        ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteCommit);
+        const int64_t leo0 = T.m.r->log()->logEndOffset();
+        ASSERT_EQ(leo0, 2) << "precondition: txn1's batch and its COMMIT marker";
+
+        T.stateReplica->setMinIsrForTest(2);                 // txn2's registration put is refused
+        ASSERT_EQ(T.addPartition(), kNotCoordinator);
+        ASSERT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::Ongoing) << "precondition: registered in memory";
+        for (int i = 0; i < 3; ++i)
+            EXPECT_EQ(attempt(1), kConcurrent) << "attempt " << i << ": a batch into a non-durable registration";
+        EXPECT_EQ(T.m.r->log()->logEndOffset(), leo0) << "a batch into a non-durable registration was appended";
+
+        // Non-vacuous: once the client's AddPartitions retry is durable, the very same batch is appended.
+        T.stateReplica->setMinIsrForTest(1);
+        ASSERT_EQ(T.addPartition(), 0);
+        (void)T.tcs->doWork(now);
+        EXPECT_EQ(untilOk(1), 0) << "the durable registration's batch";
+        EXPECT_EQ(T.m.r->log()->logEndOffset(), leo0 + 1);
+    }
 }
