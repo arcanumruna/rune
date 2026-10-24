@@ -148,6 +148,7 @@ Only the cluster admin can set these, in one `NamespaceLimits` record per namesp
    - enforcement of counts, storage, memory and control-plane limits;
    - rate token buckets and the bench.
 3. **TruncateTopic:** wire, broker, replication and client, plus the CLI.
+4. **CLI:** rename to `arcanum` with the `rune` subcommand and symlink; `topic truncate`, `topic list` and `namespace` commands. The platform commands in §10.2 come with the control-plane service.
 
 ## 8. Interaction matrix
 Operations × entities × timings:
@@ -173,3 +174,58 @@ Required:
 - **Delete convergence:** across crashes, a lagging follower and recreating the same name.
 - **Truncate correctness:** the start never moves backwards; followers and views stay correct; the HW clamp holds.
 - **Hot path:** zero allocations and the ABAB bench for the token buckets.
+
+## 10. CLI: `arcanum` with `rune` as a service subcommand
+The platform CLI is `arcanum`. Rune is one service under it; more services will follow.
+
+**Rename.** The existing `rune` binary becomes `arcanum`. Every existing command moves under `arcanum rune ...` with the same flags and behaviour. A `rune` symlink is kept so that `rune <cmd>` equals `arcanum rune <cmd>`, and existing scripts and the docker e2e keep working. Tests, docs and the docker images are updated to the new name.
+
+### 10.1 Platform model
+- **Account:** owns projects, billing and users. You sign in with `arcanum login`.
+- **Project:** a named group of deployments, one per service.
+- **Deployment:** one service in one project, at one tier:
+
+| Tier | Price | Rune deployment |
+|---|---|---|
+| `testing` | free | A namespace on a shared multi-tenant cluster. This spec covers it: limits are tight and the cluster admin is the platform. |
+| `dev` | paid | A dedicated single-node cluster. The project gets the `default` namespace and its owner is the namespace admin. |
+| `pro` | paid | A dedicated 3-node cluster (acks=all, failover), with higher limits and other benefits. |
+
+The client API and the `arcanum rune` commands are the same on every tier. Only the endpoint and the limits differ.
+
+### 10.2 Platform commands
+These are served by the Arcanum control-plane service, not by the broker. That service is a separate project and comes later; this section fixes the command shape.
+
+| Command | Does |
+|---|---|
+| `arcanum login` | Browser device-code sign-in. Stores a token in the user config directory with mode 0600, or in the OS keychain. |
+| `arcanum logout` | Revokes the token and deletes the local credentials. |
+| `arcanum whoami` | Shows the account, the current project and the token's expiry. |
+| `arcanum list` | Lists the account's projects, each with its deployments, tier and status. |
+| `arcanum project create\|delete <name>` | Creates or deletes a project. Delete refuses while the project still has deployments. |
+| `arcanum use <project>` | Sets the current project. Every command also takes `--project`. |
+| `arcanum deploy rune --tier testing\|dev\|pro` | Provisions Rune for the current project (later). |
+| `arcanum status [rune]` | Shows the deployment's state, endpoint, tier and limit usage. |
+| `arcanum upgrade rune --tier <tier>` | Changes the tier (later). Moving data between `testing` and `dev`/`pro` is a migration job. |
+| `arcanum teardown rune` | Destroys the deployment. You confirm by typing the project name. `testing` runs the namespace delete in §4. `dev`/`pro` destroy the cluster. |
+
+Product decision for later: whether teardown is immediate, or keeps a recoverable grace period on paid tiers.
+
+### 10.3 `arcanum rune` commands
+- **Connection:**
+  - When signed in, the endpoint and credentials come from the current project, so `--broker` is not needed. The control plane hands out the namespace-admin SCRAM credential, and the CLI caches it with mode 0600.
+  - Self-hosted use without `login` stays exactly as today, with `--broker` and `--user`/`--password-file`.
+- **Existing commands, unchanged:**
+  - `console`;
+  - `ql`;
+  - `schema get|list|generate`;
+  - `catalog export|replay|diff`;
+  - `security bootstrap|gen-cluster-key`.
+  - Self-hosted only: `security bootstrap` and `gen-cluster-key`. On the platform these are run by the control plane.
+- **New commands from this spec:**
+  - `arcanum rune topic truncate <topic> [--partition N] [--before <offset>]`: TruncateTopic (§6).
+  - `arcanum rune namespace create|delete|suspend|resume|list|limits`: cluster admin only, so self-hosted or the control plane.
+  - User and grant management is QL through `console` or `ql`, as today; it runs as a namespace admin.
+- **Review notes:**
+  - `schema list` actually lists topics. Add `topic list` as the canonical command and keep `schema list` as an alias.
+  - Errors keep the `rune ...:` prefix inside `arcanum rune`.
