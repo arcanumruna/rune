@@ -142,6 +142,12 @@ struct Fixture {
         o.isolation = kPermFlagDrop | kPermFlagLast;
         ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
     }
+    /// Issue #603: the control thread's "`__security` view behind" flag, as the PermissionShipper ships it.
+    void securityBehind(bool on) {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = 0;
+        o.nextOffset = on ? 1 : 0; o.isolation = kPermFlagSecurityBehind | kPermFlagLast;
+        ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
+    }
     void produce(int64_t sid, int64_t corr, int32_t topicId = 1) {
         rune::protocol::RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);
         const auto batch = b.build();
@@ -423,4 +429,70 @@ TEST(WorkerWriteGrantRegression, MalformedPermissionOpsChangeNothingAdversarialR
     EXPECT_FALSE(allowsWrite(*f.slot(5), 4));
     EXPECT_FALSE(allowsWrite(*f.slot(5), 9));
     EXPECT_EQ(f.slot(5)->epoch, 1u);
+}
+
+// Issue #603: while the control thread says its `__security` view is behind committed events this broker holds, the
+// worker answers every ingress produce AuthUnavailable (48) - whatever the session's table says, grantAll included -
+// and appends nothing; once cleared, the tables decide again.  RED (mutation): drop the check in the WRITE path.
+TEST(WorkerWriteGrantRegression, WhileTheSecurityViewIsBehindEveryIngressProduceIsUnavailableRegression) {
+    Fixture f;
+    f.announce(5, false);
+    f.chunk(5, 1, 0, 1, bitsFor({1}, 1), /*last=*/true);
+    f.announce(6, /*grantAll=*/true);
+    f.produce(5, 1);
+    ASSERT_TRUE(f.awaitAck(1));
+    ASSERT_EQ(f.acks[1].errorCode, 0);
+    ASSERT_EQ(f.log->logEndOffset(), 1);
+
+    f.securityBehind(true);
+    int64_t corr = 10;
+    for (const int64_t sid : {int64_t{5}, int64_t{6}}) {
+        for (int i = 0; i < 3; ++i, ++corr) {
+            f.produce(sid, corr);
+            ASSERT_TRUE(f.awaitAck(corr));
+            EXPECT_EQ(f.acks[corr].errorCode, static_cast<int16_t>(pc::ErrorCode::AuthUnavailable)) << "session " << sid;
+        }
+    }
+    f.produce(5, corr, /*topicId=*/2);   // ungranted too: the behind answer comes first (retriable, not a verdict)
+    ASSERT_TRUE(f.awaitAck(corr));
+    EXPECT_EQ(f.acks[corr].errorCode, static_cast<int16_t>(pc::ErrorCode::AuthUnavailable));
+    EXPECT_EQ(f.log->logEndOffset(), 1) << "nothing appended while behind";
+    EXPECT_TRUE(f.worker->securityBehindForTest());
+    EXPECT_EQ(f.worker->securityBehindRefusalsForTest(), 7u);
+
+    f.securityBehind(false);
+    f.produce(5, ++corr);
+    ASSERT_TRUE(f.awaitAck(corr));
+    EXPECT_EQ(f.acks[corr].errorCode, 0) << "served again";
+    f.produce(5, ++corr, /*topicId=*/2);
+    ASSERT_TRUE(f.awaitAck(corr));
+    EXPECT_EQ(f.acks[corr].errorCode, static_cast<int16_t>(pc::ErrorCode::NotAuthorized)) << "and judged by its table";
+    EXPECT_EQ(f.log->logEndOffset(), 2);
+    EXPECT_FALSE(f.worker->securityBehindForTest());
+}
+
+// Issue #603, a revoke landing mid-stream on the worker: the flag op arrives on the lifecycle ring between produces of
+// a steady stream - every produce answered after it is 48, the log never grows after the first 48, and the revoked
+// table installed behind the clear answers 45 from then on.
+TEST(WorkerWriteGrantRegression, ABehindFlagLandingMidStreamStopsTheStreamAtOnceRegression) {
+    Fixture f;
+    f.announce(5, false);
+    f.chunk(5, 1, 0, 1, bitsFor({1}, 1), true);
+    std::vector<int16_t> codes;
+    int64_t leoAtFirstRefusal = -1;
+    for (int64_t corr = 1; corr <= 60; ++corr) {
+        if (corr == 20) f.securityBehind(true);
+        if (corr == 40) { f.patch(f.tableOf(5), 0, 1, {0}); f.securityBehind(false); }   // the REVOKE, then the clear
+        f.produce(5, corr);
+        ASSERT_TRUE(f.awaitAck(corr)) << corr;
+        codes.push_back(f.acks[corr].errorCode);
+        if (leoAtFirstRefusal < 0 && codes.back() != 0) leoAtFirstRefusal = f.log->logEndOffset();
+    }
+    for (std::size_t i = 0; i < codes.size(); ++i) {
+        const int16_t want = i < 19 ? 0 : i < 39 ? static_cast<int16_t>(pc::ErrorCode::AuthUnavailable)
+                                                 : static_cast<int16_t>(pc::ErrorCode::NotAuthorized);
+        EXPECT_EQ(codes[i], want) << "produce " << i + 1;
+    }
+    EXPECT_EQ(leoAtFirstRefusal, 19);
+    EXPECT_EQ(f.log->logEndOffset(), 19) << "never appended after the first refusal";
 }

@@ -118,7 +118,9 @@ struct AdminDeps {
     /// kA2cSecurityServing on the admin→control FIFO.  Unset: not tracked (rigs without a control thread).
     /// #205: `knownEnd` = max(the replica's log end, the leader's committed HW) - posted on every change too, so the
     /// gateway knows when its view is behind events this broker already holds (a login failure there is retriable).
-    std::function<void(bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader, int64_t knownEnd)> securityServing;
+    /// #603: `behind` = the applier is below the committed HW this broker knows (SecurityBehind) - posted on its edges.
+    std::function<void(bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader, int64_t knownEnd, bool behind)>
+        securityServing;
     /// F (RUNE_SECURITY_MAX_STALENESS_MS, effective): the contact a follower's verdict may lapse for.
     int64_t securityMaxStalenessNs = 1'000'000'000;
 };
@@ -333,6 +335,9 @@ public:
     [[nodiscard]] const SecurityAdmin* securityAdmin() const noexcept { return securityAdmin_ ? &*securityAdmin_ : nullptr; }
     /// Test seam (the 3-node suites): while held, doWork does not run the `__security` applier.
     void holdSecurityApplyForTest(bool on) noexcept { securityApplyHeldForTest_ = on; }
+    /// Issue #603 probes (admin thread): the behind verdict and how many edges were posted.
+    [[nodiscard]] bool securityBehindForTest() const noexcept { return securityBehind_.behind(); }
+    [[nodiscard]] uint64_t securityBehindEdgesForTest() const noexcept { return securityBehindEdges_; }
 
     /// Drive the plane, the replica and the applier; advance / start DDL.
     int doWork(int64_t nowNs);
@@ -491,6 +496,8 @@ private:
     // Issues #15 / #111: the catch-up verdict (SecurityServing.h) and the last one posted (none yet: posted on the
     // first pass).  A refused post is impossible (the effect FIFO backlogs), so the posted value is the control's.
     SecurityCatchUp                       securityCatchUp_{1'000'000'000};
+    SecurityBehind                        securityBehind_;   // issue #603
+    uint64_t                              securityBehindEdges_ = 0;
     int                                   securityServingPosted_ = -1;   // -1 none, 0 / 1 the verdict
     int32_t                               securityServingPostedEpoch_ = -1;   // PR #459 F2: and what it is for
     bool                                  securityServingPostedLeader_ = false;

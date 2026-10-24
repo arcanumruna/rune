@@ -3517,6 +3517,12 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         answerGate_(*session, *hdr, rune::gateway::gateFor(session->auth, pc::TemplateId::Produce, false, false), buf, len);
         return true;
     }
+    // Issue #603: the view is behind committed security events this broker holds - its grants may already be revoked.
+    // One predictable branch on a control-thread bool.
+    if (securityBehind_) [[unlikely]] {
+        answerSecurityBehind_(*session, *pc::MessageHeader::decode(buf, len), buf, len);
+        return true;
+    }
     // Authentication Task 12 (D30, spec §2.1): WRITE on the topic - ONE index test, ONE bounds check, ONE byte load
     // (PermissionTable::allows).  permsOf_ is allow-all only on a dev / in-process broker; an AuthAnonymous session on
     // an authenticating broker gets the deny-all table (X013), so nothing is produced for it.  The denial path is cold.
@@ -5518,6 +5524,7 @@ ClientGateway::AdminLogAdmit ClientGateway::admitAdminLogFrame(int64_t sessionId
     if (authMode_ != rune::gateway::GatewayAuthMode::Required) return AdminLogAdmit::Deliver;
     const Session* s = sessions_.find(sessionId);
     if (s == nullptr) return AdminLogAdmit::Deliver;    // the offer answers NoSession
+    if (securityBehind_) [[unlikely]] return AdminLogAdmit::Hold;   // #603: the grant below may already be revoked
     const bool security = rune::gateway::isSecuritySubscriptionId(subId);
     const PermissionTable& perms = permsOf_(*s);
     if (!perms.allowsCluster(rune::security::opBit(security ? Operation::Admin : Operation::Describe))) {
@@ -5583,6 +5590,10 @@ ClientGateway::CatalogRoom ClientGateway::catalogEgressRoom(int64_t sessionId)
 {
     Session* s = sessions_.find(sessionId);
     if (s == nullptr) return CatalogRoom::Gone;
+    // #603 review: a subscription paused because this broker's `__security` view is behind (admitAdminLogFrame Hold)
+    // resumes only once it is not - otherwise every pass would resume it, the admin re-read it and the gate hold it
+    // again, a busy loop on the admin thread for as long as the hold lasts.
+    if (securityBehind_) [[unlikely]] return CatalogRoom::NotYet;
     if (catalogBackPressureForTest_ == sessionId) [[unlikely]] return CatalogRoom::NotYet;
     if (s->spill.state != SpillState::Normal) return CatalogRoom::NotYet;
     if (!s->egress) return CatalogRoom::Ready;   // egress-less test session (capture hook)
@@ -5903,6 +5914,8 @@ void ClientGateway::pushSubscriptionsPass_()
         // gateway must NOT also push them (that would double-deliver).  Internal
         // partitions (topicId < 0) are not worker-owned, so keep gateway-pushing them.
         if (perWorkerEgressActive_ && sub.topicId >= 0) continue;
+        // Issue #603: nothing is pushed while the view is behind committed security events (they may revoke READ).
+        if (securityBehind_) [[unlikely]] continue;
         // Find the owning session.
         Session* session = sessions_.find(sub.sessionId);
         if (sub.failed) [[unlikely]] {   // F19: parked at an undeliverable batch
@@ -8350,7 +8363,15 @@ bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std
 
     // bootstrapOpen_() walks the account list: evaluated only for the one request that can use it (never per frame).
     const AuthGate gate = gateFor(session->auth, tid, tid == pc::TemplateId::SecurityBootstrap && bootstrapOpen_(), selfSetPassword);
-    if (gate == AuthGate::Allow) return false;
+    if (gate == AuthGate::Allow) {
+        // Issue #603: every grant-checked request waits for the view to apply the committed events this broker holds.
+        // The login legs answer it themselves (securityUnavailable_: AuthServerFinal 48 + the session's end).
+        if (securityBehind_ && tid != pc::TemplateId::AuthClientFirst && tid != pc::TemplateId::AuthClientFinal) [[unlikely]] {
+            answerSecurityBehind_(*session, *hdr, buf, len);
+            return true;
+        }
+        return false;
+    }
 
     answerGate_(*session, *hdr, gate, buf, len);
     return true;
@@ -8385,6 +8406,48 @@ void ClientGateway::answerGate_(Session& sessionRef, const pc::MessageHeader& hd
     if (end) closeAfterAnswers_(hdr->sessionId);   // issue #119: its 44 is delivered first, even when spilled
 }
 
+
+// Issue #603 - see setSecurityBehind.  Cold: one answer per refused request.
+void ClientGateway::answerSecurityBehind_(Session& session, const pc::MessageHeader& hdr, const uint8_t* buf, std::size_t len)
+{
+    if (session.spill.state == rune::gateway::SpillState::Closing) [[unlikely]] return;
+    ++securityBehindRefusals_;
+    if (securityBehindRefusals_ % 1024 == 1)
+        spdlog::warn("ClientGateway: session {} sent template {} while this broker's __security view is behind committed "
+                     "events it holds - answered AuthUnavailable (refusals so far: {})", hdr.sessionId, hdr.templateId,
+                     securityBehindRefusals_);
+    constexpr auto code = static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable);
+    if (answerRejection_(session, hdr, code, "security state behind", buf, len)) return;
+    pc::ErrorResponse er;   // no response type of its own: never left waiting
+    er.sessionId     = hdr.sessionId;
+    er.correlationId = hdr.correlationId;
+    er.code          = static_cast<int16_t>(code);
+    sendAnswer_(session, scratch_.data(), er.encode(scratch_.data()));
+}
+
+void ClientGateway::setSecurityBehind(bool behind)
+{
+    behind = behind && authMode_ == rune::gateway::GatewayAuthMode::Required;
+    if (behind == securityBehind_) return;
+    securityBehind_ = behind;
+    spdlog::warn("ClientGateway: __security view {}", behind
+        ? "BEHIND committed events this broker holds - grant-checked requests answer AuthUnavailable, nothing is pushed"
+        : "applied every committed event this broker holds - grant-checked requests served again");
+    (void)syncWorkersBehind_();
+}
+
+int ClientGateway::syncWorkersBehind_()
+{
+    if (workersBehind_ == securityBehind_) [[likely]] return 0;
+    if (workerPool_ == nullptr) { workersBehind_ = securityBehind_; return 0; }
+    // The clear follows the view's effects: every applied event's ops (revoked bitmaps / binds on the lifecycle ring,
+    // ending Unsubscribes on the op ring) were EXECUTED by every worker (its enforcement fences acknowledged) - until
+    // then a worker could still push to, or accept a produce of, a session the applied events cut off.
+    if (!securityBehind_ && !pendingEnforce_.empty()) return 0;
+    workersBehind_ = securityBehind_;
+    (void)permissionShipper_.securityBehind(*workerPool_, workersBehind_);   // FIFO behind every queued item
+    return 1;
+}
 
 // ---------------------------------------------------------------------------
 // Authentication Task 12: permission tables and the enforcement helpers.  Control thread only.
@@ -8959,8 +9022,10 @@ int ClientGateway::servicePermissionShippingWork_()
 {
     int work = 0;
     syncPermissionTables_();   // issue #259: a freed table's drop (after every rebind away from it)
-    if (!workerPool_ || !shardMode_) return 0;
+    if (!workerPool_) return 0;
+    work += syncWorkersBehind_();   // #603: in every worker mode (worker-pushed subscriptions pause too)
     if (permissionShipper_.pendingUpdates() != 0) work += permissionShipper_.retry(*workerPool_);
+    if (!shardMode_) return work;
     if (!objectShipSeqs_.empty()) {   // issue #197: bounded even when an OK is never offered
         const uint64_t shipped = permissionShipper_.shippedSeq();
         std::erase_if(objectShipSeqs_, [shipped](const auto& e) { return e.second <= shipped; });

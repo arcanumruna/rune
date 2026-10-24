@@ -1796,7 +1796,8 @@ if(BUILD_TESTING)
         # CatalogPrincipal (the catalog / security events record the authenticated user).
         add_executable(rune_auth_enforcement_tests tests/node/AuthEnforcementTest.cpp
                        tests/node/AuthVisibilityTest.cpp tests/node/CatalogPrincipalTest.cpp
-                       tests/node/AuthLiveChangeTest.cpp tests/node/SecurityHaltTest.cpp)
+                       tests/node/AuthLiveChangeTest.cpp tests/node/SecurityHaltTest.cpp
+                       tests/node/AuthSecurityBehindTest.cpp)
         target_include_directories(rune_auth_enforcement_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_auth_enforcement_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
                               GTest::gtest_main)

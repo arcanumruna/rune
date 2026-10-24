@@ -651,6 +651,10 @@ int AdminWorker::doWork(int64_t nowNs) {
         work += securityReplica_->doWork(nowNs);
         if (!securityApplyHeldForTest_) [[likely]] work += securityApplier_->applyCommitted(*securityReplica_);
         work += securityAdmin_->doWork(nowNs);
+        // Issue #603: SecurityAdmin may have appended (a single-node / sole-ISR append commits at once): apply that
+        // too before the verdict, so "behind" never flips for a record committed and applicable in this same pass.
+        // Idle: one compare.
+        if (!securityApplyHeldForTest_) [[likely]] work += securityApplier_->applyCommitted(*securityReplica_);
         work += stepSecurityServing_(nowNs);   // after the applier: the verdict follows every event it posted
     }
     if (catalogReplica_) {
@@ -699,15 +703,24 @@ int AdminWorker::stepSecurityServing_(int64_t nowNs) {
     // follower's fast-ack of them has left (it is sent inside the frame dispatch); the gateway also treats a view that
     // moved between the two login legs as superseded, which covers that window unless a thread stalls in it (#518).
     const int64_t knownEnd = in.present ? std::max<int64_t>(securityReplica_->logEndOffset(), in.highWatermark) : -1;
+    // Issue #603: is the view behind committed records this broker knows of?  Stepped after the applier ran in this
+    // pass (see doWork), so only a held, slow or halted apply leaves it set; posted on its edges only.
+    const bool behindEdge = securityBehind_.step(in.present, in.halted, in.appliedNext, in.highWatermark);
+    const bool behind = securityBehind_.behind();
+    if (behindEdge) [[unlikely]] ++securityBehindEdges_;
+    if (behindEdge) [[unlikely]]
+        spdlog::warn("AdminWorker: __security view {} (applied {} / committed hw {}){}", behind ? "BEHIND" : "caught up",
+                     in.appliedNext, securityBehind_.knownCommittedHw(),
+                     behind ? " - grant-checked operations answer AuthUnavailable until it is applied" : "");
     const bool verdictSame = securityServingPosted_ == (caughtUp ? 1 : 0) && securityServingPostedEpoch_ == vEpoch &&
                              securityServingPostedLeader_ == vLeader;
-    if (verdictSame && securityServingPostedKnownEnd_ == knownEnd) [[likely]] return 0;
+    if (verdictSame && !behindEdge && securityServingPostedKnownEnd_ == knownEnd) [[likely]] return 0;
     securityServingPosted_ = caughtUp ? 1 : 0;
     securityServingPostedEpoch_ = vEpoch;
     securityServingPostedLeader_ = vLeader;
     securityServingPostedKnownEnd_ = knownEnd;
-    deps_.securityServing(caughtUp, in.highWatermark, vEpoch, vLeader, knownEnd);
-    if (verdictSame) return 1;   // only the known end moved: not worth a log line
+    deps_.securityServing(caughtUp, in.highWatermark, vEpoch, vLeader, knownEnd, behind);
+    if (verdictSame) return 1;   // only the known end / the behind edge moved: not worth this log line
     spdlog::info("AdminWorker: __security {} (role {}, epoch {}, applied {} / hw {})",
                  caughtUp ? "caught up - logins served" : "not caught up - logins answer AuthUnavailable",
                  in.leader ? "leader" : "follower", in.epoch, in.appliedNext, in.highWatermark);

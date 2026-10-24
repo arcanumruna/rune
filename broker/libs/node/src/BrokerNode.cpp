@@ -3327,7 +3327,8 @@ void BrokerNode::onSecurityServing_(const uint8_t* p, std::size_t n) {
     int64_t leaderHw = -1;
     int32_t epoch = -1;
     int64_t knownEnd = -1;
-    if (!decodeSecurityServing(p, n, caughtUp, leaderHw, epoch, asLeader, knownEnd)) [[unlikely]] {
+    bool behind = false;
+    if (!decodeSecurityServing(p, n, caughtUp, leaderHw, epoch, asLeader, knownEnd, behind)) [[unlikely]] {
         // #203 (PR #516 review): the verdict is posted only on change - a skipped "not caught up" would leave logins
         // served from a stale view (fail-open) and a skipped knownEnd a lagging view's failures terminal.  Fail closed
         // like its sibling frames.
@@ -3337,7 +3338,12 @@ void BrokerNode::onSecurityServing_(const uint8_t* p, std::size_t n) {
         return;
     }
     if (securityServing_) securityServing_->onAdminCaughtUp(caughtUp, leaderHw, epoch, asLeader);
-    if (gateway_) gateway_->setSecurityKnownEnd(knownEnd);   // #205
+    if (gateway_) {
+        gateway_->setSecurityKnownEnd(knownEnd);   // #205
+        // #603: every kA2cSecurityApplied before this frame is applied to the view (and its effects queued for the
+        // workers) - so a clear here never lets a grant through that the held events change.
+        gateway_->setSecurityBehind(behind);
+    }
 }
 
 // Issues #15 / #111: one control pass of SecurityServing.  The consensus contact is the election being CLOSED (a
@@ -3763,6 +3769,29 @@ void BrokerNode::partitionFromPeersForTest(bool on) {
 
 std::string BrokerNode::securityServingForTest() {
     return onControlThreadForTest([this]() { return std::string(securityServing_ ? securityServing_->name() : "none"); });
+}
+
+BrokerNode::SecurityBehindSnap BrokerNode::securityBehindForTest() {
+    return onControlThreadForTest([this]() {
+        SecurityBehindSnap s;
+        if (gateway_) {
+            s.gateway  = gateway_->securityBehind();
+            s.workers  = gateway_->workersSecurityBehindForTest();
+            s.refusals = gateway_->securityBehindRefusals();
+        }
+        return s;
+    });
+}
+
+BrokerNode::AdminBehindSnap BrokerNode::adminSecurityBehindForTest() {
+    return onAdminThreadForTest([this]() {
+        AdminBehindSnap s;
+        if (adminWorkerAgent_) {
+            s.behind = adminWorkerAgent_->worker().securityBehindForTest();
+            s.edges  = adminWorkerAgent_->worker().securityBehindEdgesForTest();
+        }
+        return s;
+    });
 }
 
 void BrokerNode::holdSecurityApplyForTest(bool on) {
@@ -4336,8 +4365,9 @@ void BrokerNode::buildAdminWorker() {
             adminWorkerAgent_->postErrorResponse(session, corr, code, message);
         };
         // Issues #15 / #111: the `__security` catch-up verdict -> the control thread's SecurityServing.
-        deps.securityServing = [this](bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader, int64_t knownEnd) {
-            if (adminWorkerAgent_) adminWorkerAgent_->postSecurityServing(caughtUp, leaderHw, epoch, asLeader, knownEnd);
+        deps.securityServing = [this](bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader, int64_t knownEnd,
+                                      bool behind) {
+            if (adminWorkerAgent_) adminWorkerAgent_->postSecurityServing(caughtUp, leaderHw, epoch, asLeader, knownEnd, behind);
         };
         deps.securityMaxStalenessNs = config_.effectiveSecurityMaxStalenessMs() * 1'000'000LL;
         // Catalog history Task 12: the catalog read server's frames (admin thread)

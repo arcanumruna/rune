@@ -294,10 +294,15 @@ current; otherwise it answers the retriable `AuthUnavailable` (48) and the clien
   the broker liveness timeout, so a planned leadership move does not make a broker stale; a hard leader
   failure can make the surviving followers answer logins `AuthUnavailable` briefly until the new leader
   answers them (tracked in #460).
+- **Behind.** A broker that holds committed `__security` events it has not applied yet (its leader told it
+  they are committed, or it leads and its own apply lags) refuses every grant-checked request with
+  `AuthUnavailable`: produce (through the gateway and straight to a worker), subscribe, view reads, group
+  and transaction requests, DDL, logins. Nothing is appended and no subscription is pushed until the events
+  are applied; then the new grants decide. A revoke this broker has received is never served around.
 - A broker stale for `RUNE_SECURITY_STALE_SESSION_END_MS` (R, default 10 000) ends its authenticated
-  sessions with a session-level `AuthUnavailable`; their clients reconnect to a current broker. Until then
-  those sessions keep working on the state the broker last had: what a broker serves is never more than
-  about F behind the cluster.
+  sessions with a session-level `AuthUnavailable`; their clients reconnect to a current broker. Only an
+  event the broker has not heard of yet can still be missed by those sessions until then: what a broker
+  serves is never more than about F behind the cluster.
 - A new or wiped broker never advertises the bootstrap window while it is catching up.
 
 On the hot path an authorization check is one bitmask load from the session's own table (at most 2 ns,
@@ -329,6 +334,7 @@ zero allocation); tables are owned by the thread that owns the session and updat
 | A broker without a valid cluster key | refused at the peer connection, logged on both sides | counter 1 000 234 |
 | `__security` apply halted on this broker | logins `AuthUnavailable`, sessions end with a session-level `AuthUnavailable` (retriable: the client reconnects to another broker), security DDL `Internal` | 48, see `#halted` |
 | This broker's `__security` state is not current (catching up, stale) | logins, `__security` reads and security DDL `AuthUnavailable`; retriable, try another broker. Stale longer than R: a session-level `AuthUnavailable` ends the authenticated sessions | 48, see `#serving` |
+| This broker holds committed `__security` events it has not applied yet (behind) | every grant-checked request `AuthUnavailable`, nothing appended or pushed; retriable, served again once applied | 48, see `#serving` |
 
 ### `#halted`: the `__security` apply halted (D28)
 

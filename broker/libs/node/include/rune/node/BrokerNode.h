@@ -828,9 +828,10 @@ public:
     [[nodiscard]] SecurityLiveEffects securityLiveEffects() { return SecurityLiveEffects{securitySink_()}; }
     /// Issues #15 / #111 - ADMIN thread only (deps.securityServing): kA2cSecurityServing on the effect FIFO (never
     /// dropped: the backlog keeps it in order behind the applied events).
-    void postSecurityServing(bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader, int64_t knownEnd) {
+    void postSecurityServing(bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader, int64_t knownEnd,
+                             bool behind) {
         postCatalog_(kA2cSecurityServing, kSecurityServingWireLen,
-                     [&](uint8_t* p) { writeSecurityServing(p, caughtUp, leaderHw, epoch, asLeader, knownEnd); });
+                     [&](uint8_t* p) { writeSecurityServing(p, caughtUp, leaderHw, epoch, asLeader, knownEnd, behind); });
     }
     [[nodiscard]] SecurityBootEffects securityBootEffects() const { return SecurityBootEffects{}; }
     [[nodiscard]] SecurityEffects securitySinkForBootStash() { return securitySink_(); }
@@ -1532,6 +1533,13 @@ public:
     void partitionFromPeersForTest(bool on);
     /// Test-only: the control thread's SecurityServing state ("CatchingUp" / "Serving" / "Stale"; "none" without auth).
     [[nodiscard]] std::string securityServingForTest();
+    /// Test-only (#603), CONTROL thread: the gateway's "`__security` view behind held committed events" flag and the
+    /// value it last shipped to the workers.
+    struct SecurityBehindSnap { bool gateway = false; bool workers = false; uint64_t refusals = 0; };
+    [[nodiscard]] SecurityBehindSnap securityBehindForTest();
+    /// Test-only (#603), ADMIN thread: SecurityBehind's verdict and its posted edges.
+    struct AdminBehindSnap { bool behind = false; uint64_t edges = 0; };
+    [[nodiscard]] AdminBehindSnap adminSecurityBehindForTest();
     /// Test-only (review C I5), CONTROL thread: while held, the mirrored `__security` frames (kA2cSecurityApplied) are
     /// stashed unapplied - the SecurityView, and with it the D24 answer-gate release, stays where it was; on release
     /// they are applied in order.  Proves no OK leaves before THIS broker enforces the event.
