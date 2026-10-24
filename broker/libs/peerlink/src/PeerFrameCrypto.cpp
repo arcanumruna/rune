@@ -118,6 +118,7 @@ bool PeerFrameCrypto::installLink(int32_t peer, const LinkKeys& keys, int64_t /*
         if (keys.install != LinkInstall::SendAndReceive) return;
         s->sendIdx   = static_cast<uint8_t>(i);
         s->sendOrder = s->epochs[i]->installOrder;
+        s->epochs[i]->used = true;
     };
     // 1. The epoch is held already.
     for (std::size_t i = 0; i < kEpochSlots; ++i) {
@@ -131,9 +132,19 @@ bool PeerFrameCrypto::installLink(int32_t peer, const LinkKeys& keys, int64_t /*
         if (s->sendIdx == i) { s->sendIdx = kNoSend; s->sendOrder = 0; }
         e.reset();
     }
-    // 2. A free slot, else evict the oldest install that is not the send epoch.
+    // 2. A free slot, else evict (issue #584) the oldest ABANDONED epoch - installed before the send epoch, never the
+    // send epoch, never opened a frame: a receive-only epoch whose exchange was superseded - and only if there is
+    // none, the oldest install that is not the send epoch.  A former send epoch is never "abandoned": the peer may
+    // still seal under it (a lagging responder).
     std::size_t at = kEpochSlots;
     for (std::size_t i = 0; i < kEpochSlots && at == kEpochSlots; ++i) if (!s->epochs[i]) at = i;
+    if (at == kEpochSlots) {
+        uint64_t oldest = UINT64_MAX;
+        for (std::size_t i = 0; i < kEpochSlots; ++i) {
+            const EpochState& e = *s->epochs[i];
+            if (i != s->sendIdx && !e.used && e.installOrder < s->sendOrder && e.installOrder < oldest) { oldest = e.installOrder; at = i; }
+        }
+    }
     if (at == kEpochSlots) {
         uint64_t oldest = UINT64_MAX;
         for (std::size_t i = 0; i < kEpochSlots; ++i)
@@ -230,6 +241,7 @@ PeerFrameCrypto::OpenResult PeerFrameCrypto::open(const uint8_t* frame, std::siz
     if (!replayWindowCheck(r->seq, r->window, seq)) return drop_(OpenResult::Replay);
     if (commitWindow) replayWindowCommit(r->seq, r->window, seq);
     ++s->authFrames;
+    e->used = true;   // issue #584: the peer sealed under it - never an abandoned epoch
     // Issue #241: an authenticated frame under an epoch installed after our send epoch proves the peer holds it.
     if (e->installOrder > s->sendOrder) [[unlikely]] peerUsed_ = PeerEpoch{fromNode, epoch};
     outLen = static_cast<std::size_t>(n);

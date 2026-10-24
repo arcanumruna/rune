@@ -158,8 +158,12 @@ struct Sim {
             }
             now += pl::PeerHandshake::kRetryNs;
             tick();
+            // Issue #545: the Accept is either confirmed, or abandoned (kAwaitNs old, no longer re-sent) and never
+            // became the send epoch.
             const auto* eb = std::get_if<pl::Established>(&b.hs.state());
-            if (data.empty() && hsTo[0].empty() && hsTo[1].empty() && eb && !eb->unconfirmedAccept &&
+            if (data.empty() && hsTo[0].empty() && hsTo[1].empty() && eb &&
+                (!eb->unconfirmedAccept || (now - eb->sinceNs >= pl::PeerHandshake::kAwaitNs &&
+                                            eb->keys.epoch != b.crypto.currentEpoch(1))) &&
                 std::holds_alternative<pl::Established>(a.hs.state()) && a.crypto.currentEpoch(2) == b.crypto.currentEpoch(1))
                 return true;
         }
@@ -189,6 +193,62 @@ TEST(PeerLinkAdversarialRegression, NoDeliveredFrameIsDroppedAcrossLossyReordere
     }
     EXPECT_GT(rekeys, 1'000u) << "the model must actually re-handshake";
     EXPECT_GT(opened, 20'000u);
+}
+
+namespace {
+const pl::Established* estOf(const pl::PeerHandshake& h);
+/// Pops the next handshake frame queued to `to`, asserts its tag and returns it (empty when the queue is empty).
+Bytes popHs(Sim& s, int to, pl::PeerMsg want) {
+    if (s.hsTo[to].empty()) { ADD_FAILURE() << "no handshake frame queued to " << to; return {}; }
+    Bytes f = s.hsTo[to].front(); s.hsTo[to].pop_front();
+    EXPECT_EQ(f[0], static_cast<uint8_t>(want)) << "to " << to;
+    return f;
+}
+} // namespace
+
+// ---- Issue #545: an unconfirmed Accept whose initiator abandoned the exchange stops being re-sent.  Every Accept is ----
+// lost; the initiator's ChallengeSent gives up after kAwaitNs and restores its prior epoch.  Over 11 s the responder
+// sends at most kAwaitNs / kRetryNs + 1 Accepts, and a later re-handshake still completes with one send epoch.
+// Mutation: dropping the `nowNs - e->sinceNs < kAwaitNs` bound from PeerHandshake::tick (fix 3) -> ~55 Accepts -> red.
+TEST(PeerLinkAdversarialRegression, AnAbandonedUnconfirmedAcceptStopsBeingResentRegression) {
+    Sim s(545);
+    s.link();
+    ASSERT_TRUE(s.a.crypto.hasLink(2) && s.b.crypto.hasLink(1));
+    const uint32_t e0 = s.a.crypto.currentEpoch(2);
+    s.now += 2'000 * kMs;
+    s.absorb(0, s.a.hs.rekeyForTest(s.now));
+    s.deliverHs(1, popHs(s, 1, pl::PeerMsg::HelloV2));
+    s.deliverHs(0, popHs(s, 0, pl::PeerMsg::ChallengeV2));
+    s.deliverHs(1, popHs(s, 1, pl::PeerMsg::ProofV2));
+    ASSERT_TRUE(estOf(s.b.hs) && estOf(s.b.hs)->unconfirmedAccept);
+    int accepts = 0;
+    const int64_t end = s.now + 11'000 * kMs;
+    for (int i = 0; i < 1'000 && s.now < end; ++i) {
+        for (int to : {0, 1}) {
+            while (!s.hsTo[to].empty()) {
+                Bytes f = s.hsTo[to].front(); s.hsTo[to].pop_front();
+                if (to == 0 && f[0] == static_cast<uint8_t>(pl::PeerMsg::Accept)) { ++accepts; continue; }   // lost
+                s.deliverHs(to, f);
+            }
+        }
+        s.now += 50 * kMs;
+        s.tick();
+    }
+    ASSERT_TRUE(s.failure.empty()) << s.failure;
+    ASSERT_TRUE(estOf(s.a.hs)) << "the initiator gave up and restored its prior epoch";
+    EXPECT_EQ(s.a.crypto.currentEpoch(2), e0);
+    EXPECT_LE(accepts, static_cast<int>(pl::PeerHandshake::kAwaitNs / pl::PeerHandshake::kRetryNs) + 1)
+        << "the abandoned Accept must not be re-sent forever";
+    EXPECT_GE(accepts, 1);
+    // A new exchange replaces the stale unconfirmed epoch and both ends converge on it.
+    s.absorb(0, s.a.hs.rekeyForTest(s.now));
+    ASSERT_TRUE(s.converge()) << s.describe();
+    const auto* eb = estOf(s.b.hs);
+    ASSERT_TRUE(eb);
+    EXPECT_FALSE(eb->unconfirmedAccept);
+    EXPECT_GT(s.b.crypto.currentEpoch(1), e0);
+    EXPECT_EQ(s.b.crypto.currentEpoch(1), s.a.crypto.currentEpoch(2));
+    EXPECT_EQ(eb->keys.epoch, s.b.crypto.currentEpoch(1));
 }
 
 // ---- Input bounds: every new wire message truncated / extended at every length, and each tag under another body. ----
