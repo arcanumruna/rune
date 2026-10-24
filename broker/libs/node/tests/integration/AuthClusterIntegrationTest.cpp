@@ -1539,6 +1539,8 @@ TEST(AuthClusterRegression, AFollowerThatHasNotAppliedARevokeNeverServesTheOldGr
     EXPECT_EQ(t.node(s.f).securityViewForTest().appliedOffset, s.appliedBefore) << "the hold held for the whole window";
     t.node(s.f).holdSecurityApplyForTest(false);
     ASSERT_TRUE(AuthTrio::until(30s, [&] { return !t.node(s.f).securityBehindForTest().gateway; })) << "F applied it";
+    // The workers' copy clears only once the REVOKE's enforcement fences are acknowledged (until then 48, never OK).
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return !t.node(s.f).securityBehindForTest().workers; })) << "F's workers too";
     EXPECT_EQ(gatewayProduce(t, s.u, s.f, s.led.id, s.part), 45) << "then the revoke answers (routed)";
     EXPECT_EQ(shardProduce(s.u, s.f, s.ingress, s.led.id), 45) << "then the revoke answers (worker ingress)";
     EXPECT_EQ(partitionLeo(&t.node(s.f), s.led.id, s.part), leo);

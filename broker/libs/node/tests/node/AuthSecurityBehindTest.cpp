@@ -263,9 +263,14 @@ TEST(AuthSecurityBehindRegression, ASecurityReadHeldWhileBehindStaysPausedUntilA
     (void)t.r.newUser({exact(SO::Write, ST::Topic, "orders")}, &writer);
     const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")});
     ASSERT_EQ(t.r.produce(ws, t.r.orders, /*untilOk=*/true), 0);
-    auto& ac = t.b().admin().raw();
+    // The reader is an admin session on a wire of its own: the background DDL drives the admin's wire (one thread per
+    // wire), and this thread polls the reader's.
+    AuthWireClient& rw = t.b().wire();
+    const int64_t as = rw.connect(t.ch());
+    ASSERT_GT(as, 0);
+    ASSERT_TRUE(rw.login(t.ch(), as, "admin", {AuthBroker::kAdminPassword, AuthBroker::kAdminPassword}).ok());
+    auto& ac = rw.raw();
     ac.keepSessionsAlive(true);
-    const int64_t as = t.b().adminSession();
     const int64_t corr = ac.sendSubscribe(t.ch(), AuthRig::stream(), as, pc::kSecurityTopicId, 0);
     ASSERT_EQ(ac.awaitSubscribeCode(corr, AuthRig::dl()).value_or(-1), 0);
     const auto newestPushed = [&] {
