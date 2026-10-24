@@ -4,6 +4,7 @@
 #include "support/ScramTestClient.h"
 
 #include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/LogSafe.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -2010,4 +2011,48 @@ TEST(AuthRestartRegression, ABrokerBehindItsHeldEventsJudgesNoLoginRegression) {
     const auto after = rig.login("ws1", {kTestPasswordA, ""});
     ASSERT_TRUE(after.fin.has_value());
     EXPECT_EQ(after.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+}
+
+// Issue #232: a username is client-supplied (up to 128 arbitrary bytes): every login log line writes it escaped, so a
+// `\n` in it can never forge a line ("auth: login ok user=admin").  The failure is the first unknown-user failure of a
+// fresh gateway, so the per-kind rate limiter logs it.
+TEST(AuthLogRegression, AUsernameWithControlBytesIsEscapedInLoginLogLinesRegression) {
+    Rig rig;
+    const std::string forged = "x\nauth: login ok user=admin";
+    const auto o = rig.login(forged, {kTestPasswordA, kTestPasswordA});
+    ASSERT_TRUE(o.fin.has_value());
+    EXPECT_EQ(o.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+    const std::vector<std::string> lines = rig.logSink->last_formatted();
+    bool sawEscaped = false;
+    for (std::string l : lines) {
+        while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+        EXPECT_EQ(l.find('\n'), std::string::npos) << "a log line holds no raw newline: " << l;
+        if (l.find("x\\x0aauth:") != std::string::npos) sawEscaped = true;
+        std::size_t start = 0;
+        for (;;) {   // every physical line a reader would see
+            const std::size_t nl = l.find('\n', start);
+            const std::string_view frag = std::string_view(l).substr(start, nl == std::string::npos ? std::string::npos : nl - start);
+            EXPECT_NE(frag.rfind("auth: login ok user=admin", 0), 0u) << "a forged line: " << l;
+            if (nl == std::string::npos) break;
+            start = nl + 1;
+        }
+    }
+    EXPECT_TRUE(sawEscaped) << "the failure line names the user escaped";
+    EXPECT_TRUE(rig.logContains("user=x\\x0aauth:\\x20login\\x20ok\\x20user=admin source=10.0.0.9"));
+}
+
+TEST(AuthLogRegression, LogSafeNameEscapesEveryNonPrintableByteRegression) {
+    EXPECT_EQ(fmt::format("{}", LogSafeName{}), "\"\"");
+    for (int b = 0; b < 256; ++b) {
+        const char c = static_cast<char>(b);
+        const std::string got = fmt::format("{}", LogSafeName{std::string_view(&c, 1)});
+        if (b >= 0x21 && b <= 0x7e && b != '\\') {
+            EXPECT_EQ(got, std::string(1, c)) << b;
+        } else {
+            char want[5];
+            std::snprintf(want, sizeof want, "\\x%02x", b);
+            EXPECT_EQ(got, want) << b;
+        }
+    }
+    EXPECT_EQ(fmt::format("u={}!", LogSafeName{std::string_view("a b\\\x7f", 5)}), "u=a\\x20b\\x5c\\x7f!");
 }

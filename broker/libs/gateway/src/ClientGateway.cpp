@@ -1,6 +1,7 @@
 // ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 
 #include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/LogSafe.h>  // issue #232: client-supplied names in log lines
 #include <rune/view/PlanSources.h>
 #include <rune/gateway/ConnectDowngradePolicy.h>
 #include <rune/gateway/CryptoFrame.h>
@@ -2270,8 +2271,8 @@ bool ClientGateway::registerConnectEgress_(PendingConnect& pending)
             rune::node::withSparseTerms(pending.egressChannel), pending.egressStreamId);
     } catch (...) {
         // Bad channel — drop (never crash).
-        spdlog::warn("ClientGateway: addExclusivePublication threw for egress channel '{}'; dropping Connect",
-                     pending.egressChannel);
+        spdlog::warn("ClientGateway: addExclusivePublication threw for egress channel {}; dropping Connect",
+                     LogSafeName{pending.egressChannel});
         return false;
     }
     return true;
@@ -2301,8 +2302,8 @@ int ClientGateway::pollHostResolutions_()
         for (auto it = pendingConnects_.begin(); it != pendingConnects_.end(); ++it) {
             if (it->sessionId != id || !it->awaitingResolve) continue;
             if (type != rune::consensus::kHostResolved) {
-                spdlog::warn("ClientGateway: reply host of channel '{}' does not resolve; session={} dropped "
-                             "(the client retries)", it->egressChannel, it->sessionId);
+                spdlog::warn("ClientGateway: reply host of channel {} does not resolve; session={} dropped "
+                             "(the client retries)", LogSafeName{it->egressChannel}, it->sessionId);
                 closeDroppedPendingConnect_(*it);
                 pendingConnects_.erase(it);
                 return;
@@ -2315,8 +2316,8 @@ int ClientGateway::pollHostResolutions_()
             it->awaitingResolve = false;
             if ((shardMode_ && it->egressChannel.size() > rune::node::SessionAckSink::kMaxChannelBytes) ||
                 !registerConnectEgress_(*it)) {
-                spdlog::warn("ClientGateway: resolved egress channel '{}' unusable; session={} dropped",
-                             it->egressChannel, it->sessionId);
+                spdlog::warn("ClientGateway: resolved egress channel {} unusable; session={} dropped",
+                             LogSafeName{it->egressChannel}, it->sessionId);
                 closeDroppedPendingConnect_(*it);
                 pendingConnects_.erase(it);
             }
@@ -8569,7 +8570,8 @@ void ClientGateway::noteDenied_(const Session& session, pc::TemplateId tid, cons
     if (notAuthorizedAnswers_ % 1024 == 1) {
         const char* user = "<anonymous>";
         if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) user = a->user.c_str();
-        spdlog::warn("auth: request refused user={} session={} template={}: {} (refusals so far: {})", user, session.sessionId,
+        spdlog::warn("auth: request refused user={} session={} template={}: {} (refusals so far: {})",
+                     LogSafeName{user}, session.sessionId,
                      static_cast<uint16_t>(tid), denial.detail, notAuthorizedAnswers_);
     }
 }
@@ -8822,7 +8824,8 @@ void ClientGateway::unavailableLogin_(Session& session, int64_t correlationId, s
     ++loginsUnavailable_;
     if (unauthLog_.due(7)) [[unlikely]]
         spdlog::warn("auth: login refused user={} source={} session={} reason=security-not-current (AuthUnavailable; "
-                     "refused so far: {})", user, session.sourceHost, session.sessionId, loginsUnavailable_);
+                     "refused so far: {})", LogSafeName{user}, LogSafeName{session.sourceHost}, session.sessionId,
+                     loginsUnavailable_);
     pc::AuthServerFinal f;
     f.sessionId     = session.sessionId;
     f.correlationId = correlationId;
@@ -8881,7 +8884,8 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
     if (!m || m->mechanism != pc::kMechanismScramSha512) {
         ++loginsFailed_;
         if (unauthLog_.due(6)) [[unlikely]]
-            spdlog::warn("auth: login failed user=<undecodable> source={} session={} reason=malformed", session->sourceHost, session->sessionId);
+            spdlog::warn("auth: login failed user=<undecodable> source={} session={} reason=malformed",
+                         LogSafeName{session->sourceHost}, session->sessionId);
         failLogin_(*session, hdr->correlationId, 0);
         return;
     }
@@ -8890,13 +8894,15 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
     if (!v.allowed) {
         ++loginsRateLimited_;
         if (unauthLog_.due(1)) [[unlikely]]
-            spdlog::warn("auth: rate limited user={} source={} retry_after_ms={}", user, session->sourceHost, v.retryAfterMs);
+            spdlog::warn("auth: rate limited user={} source={} retry_after_ms={}",
+                         LogSafeName{user}, LogSafeName{session->sourceHost}, v.retryAfterMs);
         failLogin_(*session, m->correlationId, v.retryAfterMs);
         return;
     }
     if (securityView_ == nullptr || securityView_->halted()) {   // #206: not a verdict - retriable (fails closed all the same)
         if (unauthLog_.due(2)) [[unlikely]]
-            spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost, session->sessionId,
+            spdlog::warn("auth: login failed user={} source={} session={} reason={}",
+                         LogSafeName{user}, LogSafeName{session->sourceHost}, session->sessionId,
                          loginFailureName(LoginFailure::SecurityHalted));
         unavailableLogin_(*session, m->correlationId, user);
         return;
@@ -8908,7 +8914,8 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
     ServerFirstPlan plan = scramServerFirst(securityView_->state(), *m, deadline, securityView_->fakeIterations());
     if (plan.frame.empty()) {   // no randomness for the nonce: fail closed
         ++loginsFailed_;
-        spdlog::error("auth: login failed user={} source={} session={} reason=no-randomness", user, session->sourceHost, session->sessionId);
+        spdlog::error("auth: login failed user={} source={} session={} reason=no-randomness",
+                      LogSafeName{user}, LogSafeName{session->sourceHost}, session->sessionId);
         failLogin_(*session, m->correlationId, 0);
         return;
     }
@@ -8943,7 +8950,8 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     if (const LoginThrottle::Verdict v = loginThrottle_.check(user, session->sourceHost, nowNs_); !v.allowed) {
         ++loginsRateLimited_;
         if (unauthLog_.due(1)) [[unlikely]]
-            spdlog::warn("auth: rate limited user={} source={} retry_after_ms={}", user, session->sourceHost, v.retryAfterMs);
+            spdlog::warn("auth: rate limited user={} source={} retry_after_ms={}",
+                         LogSafeName{user}, LogSafeName{session->sourceHost}, v.retryAfterMs);
         failLogin_(*session, hdr->correlationId, v.retryAfterMs);
         return;
     }
@@ -8956,7 +8964,8 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     }
     if (securityView_ == nullptr || securityView_->halted()) [[unlikely]] {   // #206: not a verdict - retriable
         if (unauthLog_.due(8 + static_cast<std::size_t>(LoginFailure::SecurityHalted))) [[unlikely]]
-            spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost,
+            spdlog::warn("auth: login failed user={} source={} session={} reason={}",
+                         LogSafeName{user}, LogSafeName{session->sourceHost},
                          session->sessionId, loginFailureName(LoginFailure::SecurityHalted));
         unavailableLogin_(*session, hdr->correlationId, user);   // #132: the throttle is not charged
         return;
@@ -8970,7 +8979,8 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         ++loginsFailed_;
         loginThrottle_.onFailure(user, session->sourceHost, nowNs_);
         if (unauthLog_.due(8 + static_cast<std::size_t>(*failure))) [[unlikely]]   // per reason
-            spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, session->sourceHost, session->sessionId,
+            spdlog::warn("auth: login failed user={} source={} session={} reason={}",
+                         LogSafeName{user}, LogSafeName{session->sourceHost}, session->sessionId,
                          loginFailureName(*failure));
         // #205: a proof that fails against a view behind events this broker already holds (a just-created user, a
         // just-changed password, a just-enabled user) is not a verdict yet - retriable, never the terminal 44.  Still
@@ -8990,7 +9000,8 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     std::string loginNonce = st->combinedNonce;   // issue #114: before session->auth (which owns *st) is replaced
     ++loginsOk_;
     loginThrottle_.onSuccess(user, session->sourceHost, nowNs_);
-    spdlog::info("auth: login ok user={} source={} session={}", ok.user, session->sourceHost, session->sessionId);
+    spdlog::info("auth: login ok user={} source={} session={}",
+                 LogSafeName{ok.user}, LogSafeName{session->sourceHost}, session->sessionId);
     if (!session->crypto.encrypted)   // only under ClientTransport::PlaintextForTest (M1, issue #10) - said once per session
         spdlog::warn("auth: session {} authenticated over plaintext (no TLS): frames are not integrity-protected",
                      session->sessionId);
@@ -9082,7 +9093,8 @@ void ClientGateway::reapAuthDeadlines_(int64_t nowNs)
         else if (const auto* b = std::get_if<AuthAwaitingFinal>(&s->auth)) { corr = b->correlationId; user = b->user; }
         ++loginsFailed_;
         if (unauthLog_.due(8 + static_cast<std::size_t>(LoginFailure::Timeout))) [[unlikely]]
-            spdlog::warn("auth: login failed user={} source={} session={} reason={}", user, s->sourceHost, sid,
+            spdlog::warn("auth: login failed user={} source={} session={} reason={}",
+                         LogSafeName{user}, LogSafeName{s->sourceHost}, sid,
                          loginFailureName(LoginFailure::Timeout));
         failLogin_(*s, corr, 0);
     }
@@ -9288,7 +9300,7 @@ void ClientGateway::revokeSession_(int64_t sid, std::string_view reason)
     if (const auto* a = std::get_if<AuthAuthenticated>(&s->auth)) user = a->user;
     else if (const auto* p = std::get_if<AuthPasswordChangeRequired>(&s->auth)) user = p->user;
     ++sessionsRevoked_;
-    spdlog::warn("auth: session {} of user {} revoked: {}", sid, user, reason);
+    spdlog::warn("auth: session {} of user {} revoked: {}", sid, LogSafeName{user}, reason);
     // Issue #196: on the shard path a worker accepts this session's direct produce until its SessionClose is
     // processed, and the close may queue behind a full lifecycle ring on its own (announcer) FIFO.  Bind the session
     // to nothing FIRST, on the permission shipper's FIFO: the event's lifecycle fence follows it, so the DDL's OK is
@@ -9431,8 +9443,9 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
         }
         if (denial && !knownRetry) noteDenied_(*session, pc::TemplateId::SecurityDdl, *denial);
         if (!denial && ownPassword && m.change == pc::UserChangeKind::AddPassword)   // a second password: worth a line
-            spdlog::warn("security: user {} adds a password to its own account (session {}, source {})", *self,
-                         session->sessionId, session->sourceHost);
+            spdlog::warn("security: user {} adds a password to its own account (session {}, source {})",
+                         LogSafeName{*self},
+                         session->sessionId, LogSafeName{session->sourceHost});
     }
     answerAdminSubmit_(buf, len,
                        adminSink_->submitSecurityDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session),
@@ -9479,7 +9492,7 @@ std::optional<rune::gateway::Denial> ClientGateway::verifyOwnCredentialChange_(S
         loginThrottle_.onFailure(self, session.sourceHost, nowNs_);
         if (unauthLog_.due(4)) [[unlikely]]
             spdlog::warn("security: user {} sent a change of its own password without a valid proof (session {}, source {})",
-                         self, session.sessionId, session.sourceHost);
+                         LogSafeName{self}, session.sessionId, LogSafeName{session.sourceHost});
         return refused;
     }
     if (chargeThrottle) loginThrottle_.onSuccess(self, session.sourceHost, nowNs_);
