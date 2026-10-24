@@ -39,5 +39,9 @@ struct Denial {
 [[nodiscard]] std::optional<Denial> authorizeTopicOrViewName(const PermissionTable&, std::string_view,
                                                              rune::security::Operation, const ObjectIndex&);
 [[nodiscard]] std::optional<Denial> authorizeCluster(const PermissionTable&, rune::security::Operation);
+/// #211: `op` on at least one resource of `type` (no resource is named: a non-transactional InitProducerId needs
+/// WRITE on some topic, Kafka's rule).  Detail: `not authorized: <OP> on any <TYPE>`.
+[[nodiscard]] std::optional<Denial> authorizeAnyGrant(const PermissionTable&, rune::security::ResourceType,
+                                                      rune::security::Operation);
 
 } // namespace rune::gateway

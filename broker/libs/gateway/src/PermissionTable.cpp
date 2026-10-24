@@ -9,6 +9,10 @@ PermissionTable PermissionTable::compile(std::span<const rsec::GrantSpec> effect
     PermissionTable t;
     t.grants_.assign(effective.begin(), effective.end());
     t.clusterOps_ = rsec::clusterOps(t.grants_);
+    for (const rsec::GrantSpec& g : t.grants_) {   // #211: hasAnyGrant
+        const auto type = static_cast<std::size_t>(g.resource.type);
+        if (type < t.anyOps_.size()) t.anyOps_[type] = static_cast<uint8_t>(t.anyOps_[type] | rsec::opBit(g.op));
+    }
     const auto limit = static_cast<std::size_t>(index.idLimit());
     t.ops_.assign(limit, 0);
     t.writeBits_.assign((limit + 63) / 64, 0);

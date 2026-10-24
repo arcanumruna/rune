@@ -8662,8 +8662,11 @@ bool ClientGateway::denyTxnRequest_(Session& session, uint16_t tid, const uint8_
     std::optional<rune::gateway::Denial> d;
     switch (static_cast<pc::TemplateId>(tid)) {
         case pc::TemplateId::InitProducerId:
-            if (const auto m = pc::InitProducerId::decode(buf, len))
-                if (!m->transactionalId.empty()) d = txn(m->transactionalId);   // none without one (D18)
+            if (const auto m = pc::InitProducerId::decode(buf, len)) {
+                if (!m->transactionalId.empty()) d = txn(m->transactionalId);
+                // #211 (Kafka's rule): without one, WRITE on at least one topic - a zero-grant principal mints no ids.
+                else d = rune::gateway::authorizeAnyGrant(perms, rsec::ResourceType::Topic, rsec::Operation::Write);
+            }
             break;
         case pc::TemplateId::AddPartitionsToTxn:
             if (const auto m = pc::AddPartitionsToTxn::decode(buf, len)) {

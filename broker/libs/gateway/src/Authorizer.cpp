@@ -81,4 +81,12 @@ std::optional<Denial> authorizeCluster(const PermissionTable& t, rsec::Operation
     return deny(op, rsec::ResourceType::Cluster, {});
 }
 
+std::optional<Denial> authorizeAnyGrant(const PermissionTable& t, rsec::ResourceType type, rsec::Operation op)
+{
+    if (t.hasAnyGrant(type, op)) return std::nullopt;
+    Denial d;
+    d.detail = std::string("not authorized: ") + opName(op) + " on any " + typeName(type);
+    return d;
+}
+
 } // namespace rune::gateway

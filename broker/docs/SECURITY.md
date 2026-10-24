@@ -43,7 +43,7 @@ Rules that keep the model small (D15 to D17):
 | Subscribe (any form) | `READ` on the topic |
 | JoinGroup / SyncGroup / Heartbeat / OffsetFetch / OffsetCommit | `READ` on the group, and `READ` on each topic |
 | LeaveGroup | `READ` on the group |
-| Non-transactional InitProducerId (D18) | nothing (its produces are checked) |
+| Non-transactional InitProducerId (#211, Kafka's rule) | `WRITE` on at least one topic (literal, prefix or wildcard grant); its produces are checked as well |
 | GetViewRow / openView | `READ` on the view |
 | Metadata, topic and view listings, `GetTopicSchema` | `DESCRIBE` |
 | `CreateTopic` / `CreateView` / `CreateSchema` | `CREATE` on the name (exact or prefix grant), or on `CLUSTER` |
