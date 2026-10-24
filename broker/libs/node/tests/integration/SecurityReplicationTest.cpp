@@ -392,7 +392,9 @@ TEST(SecurityAnswerGateRegression, AMalformedHaltedFrameStillHaltsTheMirrorRegre
 // out-of-range bool.  A well-formed frame after the halt never un-halts it.
 TEST(SecurityAnswerGateRegression, AMalformedServingFrameHaltsTheMirrorAdversarialRegression) {
     for (const auto& [what, frame] : std::vector<std::pair<const char*, std::vector<uint8_t>>>{
-             {"old 14-byte layout", std::vector<uint8_t>(kSecurityServingWireLen - 8, 0)},
+             {"old 14-byte layout", std::vector<uint8_t>(kSecurityServingWireLen - 9, 0)},
+             {"pre-#603 22-byte layout (no behind byte)", std::vector<uint8_t>(kSecurityServingWireLen - 1, 0)},
+             {"behind byte 2", [] { std::vector<uint8_t> f(kSecurityServingWireLen, 0); f[22] = 2; return f; }()},
              {"one byte too long", std::vector<uint8_t>(kSecurityServingWireLen + 1, 0)},
              {"caughtUp byte 2", [] { std::vector<uint8_t> f(kSecurityServingWireLen, 0); f[0] = 2; return f; }()},
              {"empty", std::vector<uint8_t>{}}}) {

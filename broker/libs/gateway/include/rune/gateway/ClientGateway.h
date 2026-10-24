@@ -447,6 +447,18 @@ public:
     /// been created or re-keyed by an event this broker holds but has not applied yet - so it answers the retriable
     /// AuthUnavailable (48) instead of the terminal AuthenticationFailed (44).
     void setSecurityKnownEnd(int64_t knownEnd) noexcept { securityKnownEnd_ = knownEnd; }
+    /// Issue #603, control thread (kA2cSecurityServing, behind every applied event it vouches for): the admin applier is
+    /// below the committed `__security` HW this broker knows.  While set (Required mode only), every grant-checked
+    /// request - routed Produce, Subscribe, view reads, group / txn / DDL requests, logins, `__security` reads - answers
+    /// the retriable AuthUnavailable (48) and appends nothing, and no subscription is pushed (here or on a worker): the
+    /// held events may revoke what the view still grants.  The workers get the flag on their session-lifecycle ring;
+    /// its CLEAR is shipped only once every applied event's enforcement fence was acknowledged, so the revoked bitmaps
+    /// and the ended subscriptions reach them first.
+    void setSecurityBehind(bool behind);
+    [[nodiscard]] bool securityBehind() const noexcept { return securityBehind_; }
+    /// Test probe (#603): the value last shipped to the workers.
+    [[nodiscard]] bool workersSecurityBehindForTest() const noexcept { return workersBehind_; }
+    [[nodiscard]] uint64_t securityBehindRefusals() const noexcept { return securityBehindRefusals_; }
     /// Issues #15 / #111: this broker stayed stale longer than R - every authenticated / must-change-password session
     /// is told AuthUnavailable at session level (corr 0) and closed; its client reconnects to a current broker.
     void endSessionsSecurityUnavailable();
@@ -2429,6 +2441,15 @@ private:
     const rune::gateway::SecurityView* securityView_ = nullptr;   // control thread's own mirror (same thread as the gateway)
     bool     securityServing_ = true;           ///< issues #15 / #111: see setSecurityServing
     int64_t  securityKnownEnd_ = -1;            ///< #205: see setSecurityKnownEnd
+    bool     securityBehind_ = false;           ///< #603: see setSecurityBehind (Required mode only)
+    bool     workersBehind_  = false;           ///< #603: the value last shipped to the workers
+    uint64_t securityBehindRefusals_ = 0;       ///< #603: requests answered 48 for it
+    /// #603: ship the behind flag to the workers when it changed - a clear only once pendingEnforce_ is empty.
+    int syncWorkersBehind_();
+    /// #603: answer one grant-checked request AuthUnavailable (its own response type, else an ErrorResponse on its
+    /// correlation id).  Cold.
+    void answerSecurityBehind_(Session& session, const rune::protocol::client::MessageHeader& hdr, const uint8_t* buf,
+                               std::size_t len);
     /// #205: the view has not applied every event this broker knows exists.
     [[nodiscard]] bool securityViewBehind_() const noexcept {
         return securityView_ != nullptr && securityKnownEnd_ > securityView_->appliedOffset() + 1;
@@ -2437,7 +2458,7 @@ private:
     /// Issues #15 / #111: Required mode and the `__security` state is not provably current (a halted view has its own
     /// fail-closed, retriable answers: D28, #206).
     [[nodiscard]] bool securityUnavailable_() const noexcept {
-        return authMode_ == rune::gateway::GatewayAuthMode::Required && !securityServing_ &&
+        return authMode_ == rune::gateway::GatewayAuthMode::Required && (!securityServing_ || securityBehind_) &&
                !(securityView_ != nullptr && securityView_->halted());
     }
     /// The login answer of an unavailable broker: AuthServerFinal{48} + the end of the session (the client retries).

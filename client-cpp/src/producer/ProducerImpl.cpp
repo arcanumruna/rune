@@ -2309,7 +2309,8 @@ int ProducerImpl::flushBatches(
 //  R. Retriable, same identity (no completion, no bump): NotLeader (park,
 //     re-offer on the new owner's route — Task 16 C1) and MinIsrViolation
 //     (re-sent after kRetriableBackoffNs — Kafka NOT_ENOUGH_REPLICAS, N-e)
-//     and TransientLogFull (42, Phase 2b E2: same retry), and ConcurrentTransactions
+//     and TransientLogFull (42, Phase 2b E2: same retry) and AuthUnavailable (48, issue #603: a broker whose
+//     `__security` view is behind refuses before the append; same retry), and ConcurrentTransactions
 //     (27, issue #112: the leader verifies the partition with the coordinator;
 //     a short doubling backoff).
 //  D. Any other error answer, the delivery timeout, an exhausted redirect
@@ -2501,8 +2502,12 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
     // Phase 2b E2 (ruling 2): TransientLogFull (42) — the leader's transient
     // ring is full of not-yet-replicated records; definitely not appended, the
     // route is right (no park, no metadata) — exactly MinIsrViolation's retry.
+    // Issue #603 (PR #605 review): AuthUnavailable (48) - the broker's `__security` view is behind committed events it
+    // holds; it refuses BEFORE the append (gateway and worker ingress alike) and serves again once applied: the same
+    // definite non-append, the same retry.
     if (ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::MinIsrViolation) ||
-        ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::TransientLogFull)) {
+        ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::TransientLogFull) ||
+        ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthUnavailable)) {
         // N-e (Kafka NOT_ENOUGH_REPLICAS / _AFTER_APPEND: both retriable): the
         // ISR is below minIsr.  Re-sent unchanged (same identity, a new attempt)
         // after a backoff by the attempt timer — safe whether or not it was

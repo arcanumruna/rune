@@ -319,3 +319,119 @@ TEST(SecurityServingRegression, TheKnownEndFieldRoundTripsAtItsBoundsAdversarial
     ASSERT_TRUE(rune::node::decodeSecurityServing(d, sizeof d, up, hw, epoch, leader, known));
     EXPECT_EQ(known, -1);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Issue #603: SecurityBehind (admin thread) - is the applier below the committed HW this broker knows?  Stepped once per
+// admin pass after the applier ran.  Every case also checks the edges: the verdict is posted on edges only.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+using rune::node::SecurityBehind;
+
+// A held apply: the committed HW moves past what is applied - behind, ONE edge however many passes it lasts; the apply
+// catching up clears it with one edge.  (RED before #603: nothing tracked it - a held follower served the old grants.)
+TEST(SecurityBehindRegression, AHeldApplyIsBehindUntilItAppliedEveryCommittedRecordRegression) {
+    SecurityBehind b;
+    EXPECT_FALSE(b.step(true, false, 10, 10)) << "applied through the HW: current, no edge";
+    EXPECT_FALSE(b.behind());
+    EXPECT_TRUE(b.step(true, false, 10, 11)) << "a committed record the applier holds back: the edge";
+    EXPECT_TRUE(b.behind());
+    int edges = 0;
+    for (int64_t hw = 11; hw < 1'000; ++hw) edges += b.step(true, false, 10, hw) ? 1 : 0;
+    EXPECT_EQ(edges, 0) << "behind is posted once, never per pass";
+    EXPECT_TRUE(b.behind());
+    EXPECT_FALSE(b.step(true, false, 998, 999)) << "still one record short";
+    EXPECT_TRUE(b.step(true, false, 999, 999)) << "applied everything: the clearing edge";
+    EXPECT_FALSE(b.behind());
+}
+
+// Normal operation: a record arrives (the HW moves) and is applied in the SAME pass - the step sees both: never a flip.
+TEST(SecurityBehindRegression, ARecordAppliedInTheSamePassNeverFlipsItRegression) {
+    SecurityBehind b;
+    int edges = 0;
+    for (int64_t off = 0; off < 10'000; ++off) edges += b.step(true, false, off + 1, off + 1) ? 1 : 0;
+    EXPECT_EQ(edges, 0);
+    EXPECT_FALSE(b.behind());
+    // Several records per pass, also applied in it.
+    for (int64_t off = 10'000; off < 20'000; off += 7) edges += b.step(true, false, off, off) ? 1 : 0;
+    EXPECT_EQ(edges, 0);
+}
+
+// A halted applier never applies again (D28): behind whatever the offsets say, and it stays behind.
+TEST(SecurityBehindRegression, AHaltedApplierIsBehindForGoodRegression) {
+    SecurityBehind b;
+    ASSERT_FALSE(b.step(true, false, 5, 5));
+    EXPECT_TRUE(b.step(true, true, -1, 5)) << "halted: behind";
+    EXPECT_FALSE(b.step(true, true, -1, 5));
+    EXPECT_FALSE(b.step(true, true, 5, 5)) << "still halted (a stale appliedNext changes nothing)";
+    EXPECT_TRUE(b.behind());
+}
+
+// A LEADER with an unapplied tail (its own HW past what it applied - a slow apply, or a promotion's previous tail):
+// behind exactly like a follower.
+TEST(SecurityBehindRegression, ALeaderWithAnUnappliedTailIsBehindRegression) {
+    SecurityBehind b;
+    ASSERT_FALSE(b.step(true, false, 20, 20));
+    EXPECT_TRUE(b.step(true, false, 20, 23)) << "its own HW 23, applied 20";
+    EXPECT_FALSE(b.step(true, false, 22, 23));
+    EXPECT_TRUE(b.behind());
+    EXPECT_TRUE(b.step(true, false, 23, 23));
+    EXPECT_FALSE(b.behind());
+}
+
+// A leader change: a follower's leaderCommittedHw reads 0 until its new leader answers.  That is no news that the held
+// records went away (a committed offset never moves back) - it stays behind until it applied them.
+TEST(SecurityBehindRegression, ALeaderChangeResettingTheAdvertisedHwNeverClearsItRegression) {
+    SecurityBehind b;
+    ASSERT_TRUE(b.step(true, false, 10, 12));
+    EXPECT_FALSE(b.step(true, false, 10, 0)) << "the new leader has not answered yet";
+    EXPECT_TRUE(b.behind());
+    EXPECT_EQ(b.knownCommittedHw(), 12);
+    EXPECT_FALSE(b.step(true, false, 11, 12)) << "the new leader's first answer";
+    EXPECT_TRUE(b.step(true, false, 12, 0)) << "applied what it held: cleared even before the new leader answers";
+}
+
+// No `__security` replica / applier (auth off, a rig): never behind.
+TEST(SecurityBehindRegression, NoSecurityReplicaIsNeverBehindRegression) {
+    SecurityBehind b;
+    for (int i = 0; i < 10; ++i) EXPECT_FALSE(b.step(false, false, -1, 100 + i));
+    EXPECT_FALSE(b.behind());
+}
+
+// Table-driven: every (present, halted, applied vs hw) combination from a current start.
+TEST(SecurityBehindRegression, EveryInputCombinationMatchesTheRuleRegression) {
+    for (const bool present : {false, true})
+        for (const bool halted : {false, true})
+            for (const int64_t applied : {int64_t{-1}, int64_t{0}, int64_t{4}, int64_t{5}, int64_t{6}})
+                for (const int64_t hw : {int64_t{0}, int64_t{5}}) {
+                    SecurityBehind b;
+                    const bool want = present && (halted || applied < hw);
+                    EXPECT_EQ(b.step(present, halted, applied, hw), want) << present << halted << applied << hw;
+                    EXPECT_EQ(b.behind(), want) << present << halted << applied << hw;
+                }
+}
+
+// The wire: the behind byte round-trips, defaults to false, and is range-checked; a pre-#603 22-byte frame is refused
+// (the control thread halts its mirror on it: a dropped "behind" would be fail-open).
+TEST(SecurityBehindRegression, TheBehindByteRoundTripsAndIsRangeCheckedAdversarialRegression) {
+    for (const bool behind : {false, true}) {
+        uint8_t buf[rune::node::kSecurityServingWireLen + 4]{};
+        rune::node::writeSecurityServing(buf, true, 7, 3, false, 9, behind);
+        bool up = false, leader = true, got = !behind; int64_t hw = 0, known = 0; int32_t epoch = 0;
+        for (std::size_t n = 0; n <= sizeof buf; ++n)
+            EXPECT_EQ(rune::node::decodeSecurityServing(buf, n, up, hw, epoch, leader, known, got),
+                      n == rune::node::kSecurityServingWireLen) << n;
+        ASSERT_TRUE(rune::node::decodeSecurityServing(buf, rune::node::kSecurityServingWireLen, up, hw, epoch, leader, known, got));
+        EXPECT_EQ(got, behind);
+        EXPECT_EQ(known, 9);
+        for (int v = 2; v < 256; ++v) {
+            buf[22] = static_cast<uint8_t>(v);
+            EXPECT_FALSE(rune::node::decodeSecurityServing(buf, rune::node::kSecurityServingWireLen, up, hw)) << v;
+        }
+    }
+    EXPECT_EQ(rune::node::kSecurityServingWireLen, 23u);
+    uint8_t d[rune::node::kSecurityServingWireLen];
+    rune::node::writeSecurityServing(d, true, 1);
+    bool up = false, leader = false, behind = true; int64_t hw = 0, known = 0; int32_t epoch = 0;
+    ASSERT_TRUE(rune::node::decodeSecurityServing(d, sizeof d, up, hw, epoch, leader, known, behind));
+    EXPECT_FALSE(behind) << "the defaulted argument";
+    EXPECT_FALSE(rune::node::decodeSecurityServing(d, 22, up, hw)) << "the pre-#603 layout";
+}

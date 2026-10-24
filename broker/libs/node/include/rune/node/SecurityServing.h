@@ -23,9 +23,26 @@
 //                       re-canvasses, so neither stays CLOSED.  Stale for longer than R ends the authenticated sessions
 //                       once (they reconnect to a current broker).
 //
+//   SecurityBehind    — ADMIN thread, issue #603: is the applier below the committed high watermark this broker KNOWS
+//                       (the highest leaderCommittedHw it has seen; its own HW when it leads)?  Stepped once per pass
+//                       AFTER the applier ran in that pass, so a record that arrived and was applied in the same pass
+//                       never flips it - only a held, slow or halted apply leaves it set.  Posted on its edges inside
+//                       kA2cSecurityServing (the same FIFO, behind the kA2cSecurityApplied of the state it vouches
+//                       for).  While it is set, every grant-checked operation (the gateway's request gate and routed
+//                       produce, logins, `__security` reads and security DDL, admin-log frames, the workers' ingress
+//                       WRITE check and every subscription push, the gateway's and the workers') answers the retriable
+//                       AuthUnavailable (48) or waits, and nothing is appended or pushed; the control thread clears the
+//                       workers' copy only once every applied event's enforcement fence was acknowledged (the view's
+//                       effects - revoked bitmaps, ended subscriptions - reached them first).  The R session end below
+//                       is unchanged: a broker stuck behind still ends its sessions R after it went Stale.
+//
 // The staleness of what a broker serves is therefore bounded by F everywhere: a follower's state is at most F older
 // than its leader's last answer, and a cut-off leader stops F after its last consensus contact (a new leader can only
-// be elected - and commit a change - after the broker liveness timeout, which F exceeds).
+// be elected - and commit a change - after the broker liveness timeout, which F exceeds).  Issue #603 narrows it: a
+// committed event this broker HOLDS (its leader told it the HW covers it) is never served around - the grants it
+// would change are refused (48) until it is applied.  F remains the bound only for events this broker has not heard
+// of yet (not received, or received but its leader's HW advertisement covering them not arrived yet): nothing local
+// can tell those apart from "nothing happened", which is inherent to a replica that learns of commits by message.
 #include <cstdint>
 #include <variant>
 
@@ -97,6 +114,37 @@ private:
     uint64_t answersSeen_   = 0;
     int64_t  lastAnswerNs_  = INT64_MIN / 2;   // never: always older than F
     int64_t  lastAppliedNs_ = INT64_MIN / 2;
+};
+
+class SecurityBehind {
+public:
+    struct Current {};
+    struct Behind { int64_t appliedNext = -1; int64_t committedHw = 0; };   // what the verdict saw (diagnostics)
+    using State = std::variant<Current, Behind>;
+
+    /// One pass, after the applier: `present` = a `__security` replica + applier exist; `halted` = the applier halted
+    /// (never current again: D28); `appliedNext` = the applier's next offset; `committedHw` = the replica's
+    /// leaderCommittedHw (a follower's is the leader's advertised HW, 0 after a leader change until the new leader
+    /// answers - so the highest seen is kept: a committed offset never moves back).  Returns true on an edge.
+    bool step(bool present, bool halted, int64_t appliedNext, int64_t committedHw) noexcept {
+        if (committedHw > knownCommittedHw_) knownCommittedHw_ = committedHw;
+        const bool behind = present && (halted || appliedNext < knownCommittedHw_);
+        if (behind == std::holds_alternative<Behind>(st_)) {
+            if (auto* b = std::get_if<Behind>(&st_)) { b->appliedNext = appliedNext; b->committedHw = knownCommittedHw_; }
+            return false;
+        }
+        if (behind) st_ = Behind{appliedNext, knownCommittedHw_};
+        else st_ = Current{};
+        return true;
+    }
+
+    [[nodiscard]] bool behind() const noexcept { return std::holds_alternative<Behind>(st_); }
+    [[nodiscard]] int64_t knownCommittedHw() const noexcept { return knownCommittedHw_; }
+    [[nodiscard]] const State& state() const noexcept { return st_; }
+
+private:
+    State   st_{Current{}};
+    int64_t knownCommittedHw_ = 0;
 };
 
 class SecurityServing {

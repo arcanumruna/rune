@@ -162,8 +162,8 @@ enum : int32_t {
     // change) - the control thread folds it into counter 1'000'235.
     kA2cPeerFrameDrops      = 23,
     // Issues #15 / #111 (decision M7): the admin thread's verdict on whether this broker's `__security` state is caught
-    // up and fresh (SecurityCatchUp), posted on change: [caughtUp:u8][leaderHw:i64].  On the SAME FIFO as
-    // kA2cSecurityApplied, behind every applied event of the state it vouches for.
+    // up and fresh (SecurityCatchUp), posted on change (layout below; #603 adds whether its view is behind the committed
+    // HW it knows).  On the SAME FIFO as kA2cSecurityApplied, behind every applied event of the state it vouches for.
     kA2cSecurityServing     = 24,
     // Phase 2c (subscription filters): a typed topic's EVOLVING descriptor at its current version, [topicId:i32]
     // [version:u16][blob] (the kA2cSchemaUpdate layout).  The control thread hands it to the gateway, which fans it
@@ -1511,20 +1511,23 @@ inline void writeSecurityApplied(uint8_t* p, int64_t offset, std::span<const uin
     bytes  = std::span<const uint8_t>(buf + kSecurityAppliedFixedBytes, len - kSecurityAppliedFixedBytes);
     return offset >= 0;
 }
-//   kA2cSecurityServing : [caughtUp:u8][leaderHw:i64][epoch:i32][asLeader:u8][knownEnd:i64]   (issues #15 / #111;
-//                         PR #459 F2: the epoch / role the verdict is for, compared with the committed assignment on the
-//                         control thread; #205: knownEnd = max(log end, leader HW) - the events this broker knows exist)
-inline constexpr std::size_t kSecurityServingWireLen = 1 + 8 + 4 + 1 + 8;
+//   kA2cSecurityServing : [caughtUp:u8][leaderHw:i64][epoch:i32][asLeader:u8][knownEnd:i64][behind:u8]   (issues
+//                         #15 / #111; PR #459 F2: the epoch / role the verdict is for, compared with the committed
+//                         assignment on the control thread; #205: knownEnd = max(log end, leader HW) - the events this
+//                         broker knows exist; #603: behind = the applier is below the committed HW this broker knows -
+//                         every grant-checked operation answers AuthUnavailable until it is not)
+inline constexpr std::size_t kSecurityServingWireLen = 1 + 8 + 4 + 1 + 8 + 1;
 inline void writeSecurityServing(uint8_t* p, bool caughtUp, int64_t leaderHw, int32_t epoch = -1,
-                                 bool asLeader = false, int64_t knownEnd = -1) noexcept {
+                                 bool asLeader = false, int64_t knownEnd = -1, bool behind = false) noexcept {
     p[0] = caughtUp ? 1 : 0;
     admin_wire::putI64(p + 1, leaderHw);
     std::memcpy(p + 9, &epoch, 4);
     p[13] = asLeader ? 1 : 0;
     admin_wire::putI64(p + 14, knownEnd);
+    p[22] = behind ? 1 : 0;
 }
 [[nodiscard]] inline bool decodeSecurityServing(const uint8_t* buf, std::size_t len, bool& caughtUp, int64_t& leaderHw) noexcept {
-    if (len != kSecurityServingWireLen || buf[0] > 1 || buf[13] > 1) return false;
+    if (len != kSecurityServingWireLen || buf[0] > 1 || buf[13] > 1 || buf[22] > 1) return false;
     caughtUp = buf[0] == 1;
     leaderHw = admin_wire::getI64(buf + 1);
     return true;
@@ -1540,6 +1543,12 @@ inline void writeSecurityServing(uint8_t* p, bool caughtUp, int64_t leaderHw, in
                                                 int32_t& epoch, bool& asLeader, int64_t& knownEnd) noexcept {
     if (!decodeSecurityServing(buf, len, caughtUp, leaderHw, epoch, asLeader)) return false;
     knownEnd = admin_wire::getI64(buf + 14);
+    return true;
+}
+[[nodiscard]] inline bool decodeSecurityServing(const uint8_t* buf, std::size_t len, bool& caughtUp, int64_t& leaderHw,
+                                                int32_t& epoch, bool& asLeader, int64_t& knownEnd, bool& behind) noexcept {
+    if (!decodeSecurityServing(buf, len, caughtUp, leaderHw, epoch, asLeader, knownEnd)) return false;
+    behind = buf[22] == 1;
     return true;
 }
 using SecurityHaltedMsg = CatalogHaltedMsg;

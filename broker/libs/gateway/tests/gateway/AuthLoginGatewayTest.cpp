@@ -1989,3 +1989,25 @@ TEST(AuthLoginRegression, AHaltAfterARevokeNeverSendsA48AfterThe46AdversarialReg
     EXPECT_FALSE(rig.gw.hasSessionForTest(revoked));
     EXPECT_FALSE(rig.gw.hasSessionForTest(live));
 }
+
+// Issue #603: a broker whose view is behind committed events it holds (the admin applier's verdict) judges no login -
+// the held events may disable the user or change its password.  The login answers the retriable AuthUnavailable and
+// the session ends; once the view applied them (the DISABLE here) the old password is refused.  SecurityServing stays
+// Serving throughout: the refusal is the behind flag's alone.
+TEST(AuthRestartRegression, ABrokerBehindItsHeldEventsJudgesNoLoginRegression) {
+    Rig rig(chainBeforeDisable());
+    rig.gw.setSecurityBehind(true);
+    ASSERT_TRUE(rig.gw.securityServing());
+    const auto o = rig.login("ws1", {kTestPasswordA, ""});
+    ASSERT_TRUE(o.fin.has_value());
+    EXPECT_EQ(o.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable)) << "never judged against a view behind";
+    EXPECT_FALSE(rig.gw.hasSessionForTest(o.sid));
+    EXPECT_EQ(rig.gw.loginsOk(), 0u);
+    EXPECT_EQ(rig.gw.loginsFailed(), 0u) << "not a failed login (no throttle charge)";
+    const auto dis = rig.chain.emit(rune::security::AlterUserOps{rune::security::DisableUser{}}, "ws1", "ALTER USER ws1 DISABLE;");
+    ASSERT_TRUE(rig.view.onApplied(static_cast<int64_t>(rig.chain.count()) - 1, *rune::security::encode(dis)).has_value());
+    rig.gw.setSecurityBehind(false);
+    const auto after = rig.login("ws1", {kTestPasswordA, ""});
+    ASSERT_TRUE(after.fin.has_value());
+    EXPECT_EQ(after.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+}

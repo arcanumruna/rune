@@ -436,3 +436,59 @@ TEST(SecurityEnforcementFenceRegression, ObjectShipSeqsStayBoundedUnderABackedUp
     for (int32_t id = 10; id < 210; ++id) EXPECT_TRUE(r.gw.objectPermissionsShipped(id)) << id;
     EXPECT_EQ(r.gw.objectShipSeqsForTest(), 0u) << "shipped entries must be pruned";
 }
+
+// Issue #603: the workers' copy of "the `__security` view is behind" rides the session-lifecycle ring.  Set: shipped at
+// once.  Cleared: only once every applied event's enforcement fence was acknowledged - here a REVOKE READ whose ending
+// Unsubscribe still sits in the worker's op ring - so a worker never resumes pushing to (or accepting a produce of) a
+// session the applied events cut off.  RED (mutation): ship the clear without waiting for pendingEnforce_ to drain.
+TEST(SecurityEnforcementFenceRegression, TheWorkersBehindClearWaitsForTheAppliedEventsFencesRegression) {
+    FenceRig r(1);
+    FakePub pub;
+    const int64_t rs = r.login("r");
+    r.gw.injectRecordEgressForTest(rs, 0, pub.make());
+    pc::Subscribe s;
+    s.sessionId = rs; s.correlationId = 91; s.topicId = 0; s.partition = 0; s.partitionKnown = 1; s.fromOffset = 0;
+    std::vector<uint8_t> buf(s.encodedSize());
+    buf.resize(s.encode(buf.data()));
+    r.gw.applySubscribeForTest(buf.data(), buf.size());
+    r.runAll(1);
+    ASSERT_EQ(r.pool.worker(0).subscriptionsForTest().size(), 1u);
+
+    r.gw.setSecurityBehind(true);
+    EXPECT_TRUE(r.gw.securityBehind());
+    EXPECT_TRUE(r.gw.workersSecurityBehindForTest()) << "set: shipped at once";
+    r.runAll(2);
+    EXPECT_TRUE(r.pool.worker(0).securityBehindForTest()) << "the worker installed it";
+
+    const int64_t off = r.revoke(sec::Operation::Read, "r");   // the held event, now applied by the view
+    r.gw.setSecurityBehind(false);
+    EXPECT_FALSE(r.gw.securityBehind()) << "the gateway's own tables were refreshed synchronously";
+    EXPECT_TRUE(r.gw.workersSecurityBehindForTest()) << "the workers' clear waits for the revoke's fences";
+    (void)r.gw.servicePermissionShippingForTest();
+    EXPECT_TRUE(r.gw.workersSecurityBehindForTest()) << "still: nothing acknowledged yet";
+    EXPECT_TRUE(r.pool.worker(0).securityBehindForTest());
+
+    r.runAll(3);   // the worker ends the subscription and acknowledges both fences (its push pass is still paused)
+    EXPECT_EQ(r.gw.securityEnforcedOffset(), off);
+    ASSERT_EQ(r.pool.worker(0).subscriptionsForTest().size(), 1u);
+    EXPECT_EQ(r.pool.worker(0).subscriptionsForTest()[0].pushState, rune::node::Worker::WorkerSubscription::PushState::EndOwed)
+        << "the ended subscription is never Live again before the clear can ship";
+    // The worker is not driven past this point: its next push pass writes the owed terminal frame through the fake
+    // publication (see AWorkerPushedSubscriptionIsEndedByItsWorkerNotByTheGatewayRegression).
+    (void)r.gw.servicePermissionShippingForTest();   // the clear ships behind the acknowledged fences
+    EXPECT_FALSE(r.gw.workersSecurityBehindForTest());
+    EXPECT_TRUE(r.pool.worker(0).securityBehindForTest()) << "(on its ring, not yet installed)";
+}
+
+// Issue #603: edges only - repeated identical verdicts ship nothing; an InProcess / dev gateway never sets it.
+TEST(SecurityEnforcementFenceRegression, TheBehindFlagShipsEdgesOnlyRegression) {
+    FenceRig r(2);
+    for (int i = 0; i < 3; ++i) r.runAll(1 + i);
+    const uint64_t before = r.gw.permissionOpsShippedForTest();
+    for (int i = 0; i < 10; ++i) r.gw.setSecurityBehind(true);
+    EXPECT_EQ(r.gw.permissionOpsShippedForTest() - before, 2u) << "one op per worker for the one edge";
+    for (int i = 0; i < 10; ++i) r.gw.setSecurityBehind(false);
+    for (int i = 0; i < 3; ++i) r.runAll(10 + i);
+    EXPECT_EQ(r.gw.permissionOpsShippedForTest() - before, 4u);
+    for (int32_t w = 0; w < 2; ++w) EXPECT_FALSE(r.pool.worker(w).securityBehindForTest()) << w;
+}

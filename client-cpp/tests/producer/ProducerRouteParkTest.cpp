@@ -576,3 +576,41 @@ TEST(ProducerRoutePark, FollowerOosNeverSkipsTheMinIsrBackoffRegression) {
     ASSERT_GE(w.frames.size(), 3u);
     EXPECT_EQ(batchcorr::base(w.frames[2].corrId), batchcorr::base(w.frames[0].corrId));
 }
+
+// Issue #603 (PR #605 review): a broker whose `__security` view is behind committed events it holds answers a produce
+// AuthUnavailable (48) BEFORE the append, on the gateway and the worker ingress alike, and serves again once it applied
+// them - a definite non-append, so the batch is re-sent with the SAME identity after the backoff, never failed (and no
+// epoch bump).  RED before: D - failed with an unknown outcome on every `__security` change a lagging follower saw.
+TEST(ProducerRoutePark, AuthUnavailableIsRetriedNotFailedAdversarialRegression) {
+    ProducerImpl impl(ackedCfg());
+    Wire w;
+    const auto sink = w.fn();
+    BatchTally t;
+    impl.setOnBatchAck(&BatchTally::on, &t);
+    const std::vector<uint8_t> v(8, 1);
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), v, false, 0));
+    pump(impl, sink);
+    ASSERT_EQ(w.frames.size(), 1u);
+    int64_t now = kNow;
+    for (int refusal = 0; refusal < 3; ++refusal) {   // a hold that lasts several attempts
+        impl.onProduceResponse(w.frames.back().corrId, -1,
+                               static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthUnavailable));
+        EXPECT_EQ(t.failed, 0) << "AuthUnavailable (nothing appended) failed the batch, refusal " << refusal;
+        EXPECT_TRUE(impl.hasInFlight());
+        EXPECT_FALSE(impl.routeParked(1, 0)) << "48 must not park the route";
+        const std::size_t sent = w.frames.size();
+        if (refusal == 0) {   // the backoff runs from the producer's last pass clock (kNow here)
+            impl.retransmitStalled(now + 1'000'000LL, sink);
+            EXPECT_EQ(w.frames.size(), sent) << "re-sent without a backoff";
+        }
+        now += 200'000'000LL;
+        impl.retransmitStalled(now, sink);                   // past it
+        ASSERT_EQ(w.frames.size(), sent + 1);
+        EXPECT_EQ(batchcorr::base(w.frames.back().corrId), batchcorr::base(w.frames[0].corrId));
+        EXPECT_EQ(w.frames.back().epoch, w.frames[0].epoch) << "no epoch bump";
+        EXPECT_EQ(w.frames.back().baseSequence, w.frames[0].baseSequence);
+    }
+    impl.onProduceResponse(w.frames.back().corrId, 100, 0);
+    EXPECT_EQ(t.okRecords, 1);
+    EXPECT_EQ(t.failed, 0);
+}
