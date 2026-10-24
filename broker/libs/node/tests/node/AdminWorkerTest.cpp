@@ -11,6 +11,7 @@
 
 #include <rune/node/AdminChannels.h>
 #include <rune/node/AdminWorker.h>
+#include <rune/node/FdBudget.h>
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/SchemaRegistry.h>
 
@@ -581,4 +582,76 @@ TEST(AdminWorkerRegression, GetSchemaLineageAnswersTheEvolvingDescriptorRegressi
     ASSERT_EQ(latest.code, 0);
     EXPECT_EQ(rune::codec::deserialize(latest.blob).find("userId"), nullptr) << "the plain answer is the materialized v3";
     EXPECT_EQ(rig.getSchema("nope", rune::protocol::client::kSchemaLineageFingerprint).code, 7) << "UnknownTopic";
+}
+
+// ── Issue #296: DDL admission against this broker's open-file limit ─────────────────────────────────────────────────
+namespace {
+CatalogDdlRig::Answer defineWith(CatalogDdlRig& rig, const std::string& name, int32_t partitions,
+                                 int64_t segmentBytes = 64LL << 20, int64_t retentionBytes = -1) {
+    CatalogDdlRig::DefineArgs a;
+    a.name = name; a.partitions = partitions;
+    a.config.segmentRollBytes = segmentBytes;
+    a.config.retentionBytes = retentionBytes;
+    return rig.define(std::move(a));
+}
+}  // namespace
+
+TEST(AdminWorkerRegression, ADdlThatExceedsTheFdBudgetIsRefusedBeforeItIsAppendedRegression) {
+    CatalogDdlRig rig("aw_fd_create", 1, 1, 0, /*fdLimit=*/fdNeedBase() + 100);
+    rig.becomeServingLeader();
+    const std::size_t events = rig.recordedLog().size();
+    const auto big = defineWith(rig, "huge", 1000);
+    EXPECT_EQ(big.code, 39) << "InvalidRequest";
+    EXPECT_NE(big.detail.find("CREATE TOPIC would raise this broker's estimated open-file need to"), std::string::npos)
+        << big.detail;
+    EXPECT_NE(big.detail.find("open-file limit " + std::to_string(fdNeedBase() + 100)), std::string::npos) << big.detail;
+    EXPECT_EQ(rig.recordedLog().size(), events) << "nothing appended";
+    EXPECT_EQ(rig.admin().applier().state().topicByName("huge"), nullptr);
+    EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 1u);
+    EXPECT_EQ(defineWith(rig, "small", 1).code, 0) << "a topic within the budget is admitted";
+    EXPECT_EQ(rig.recordedLog().size(), events + 1);
+}
+
+TEST(AdminWorkerRegression, AnAlterThatShrinksSegmentsPastTheFdBudgetIsRefusedRegression) {
+    // segment.bytes is fixed at CREATE; ALTER changes retention.bytes - with small segments a large retention opens
+    // many segments per partition.
+    CatalogDdlRig rig("aw_fd_alter", 1, 1, 0, /*fdLimit=*/fdNeedBase() + 100);
+    rig.becomeServingLeader();
+    ASSERT_EQ(defineWith(rig, "t", 1, /*segmentBytes=*/1LL << 20).code, 0);
+    const auto* before = rig.admin().applier().state().topicByName("t");
+    ASSERT_NE(before, nullptr);
+    const uint32_t version = before->version;
+    const std::size_t events = rig.recordedLog().size();
+    const auto a = rig.alterConfig("t", {{rc::ConfigKey::RetentionBytes, 1LL << 30}});
+    EXPECT_EQ(a.code, 39);
+    EXPECT_NE(a.detail.find("ALTER TOPIC would raise"), std::string::npos) << a.detail;
+    EXPECT_EQ(rig.recordedLog().size(), events) << "nothing appended";
+    const auto* after = rig.admin().applier().state().topicByName("t");
+    ASSERT_NE(after, nullptr);
+    EXPECT_EQ(after->version, version) << "config unchanged";
+    EXPECT_EQ(after->config.retentionBytes, -1);
+    EXPECT_EQ(rig.alterConfig("t", {{rc::ConfigKey::RetentionBytes, 10LL << 20}}).code, 0) << "within the budget";
+}
+
+TEST(AdminWorkerRegression, ADdlThatLowersTheNeedIsAdmittedWhileOverBudgetRegression) {
+    CatalogDdlRig rig("aw_fd_lower", 1);   // no limit while the topic is made
+    rig.becomeServingLeader();
+    ASSERT_EQ(defineWith(rig, "t", 100, 1LL << 20, 100LL << 20).code, 0);   // 100 x (101 x 2 + 2) fds
+    rig.admin().setFdLimitForTest(fdNeedBase() + 100);   // restarted with a lower limit: over budget now
+    EXPECT_EQ(rig.alterConfig("t", {{rc::ConfigKey::RetentionBytes, 50LL << 20}}).code, 0)
+        << "a smaller retention lowers the need: admitted although still above the limit";
+    EXPECT_EQ(rig.admin().applier().state().topicByName("t")->config.retentionBytes, 50LL << 20);
+    EXPECT_EQ(rig.alterConfig("t", {{rc::ConfigKey::RetentionBytes, 60LL << 20}}).code, 39) << "a raise is refused";
+    EXPECT_EQ(defineWith(rig, "more", 1).code, 39) << "a new topic only raises the need";
+    EXPECT_EQ(rig.dropTopic("t").code, 0) << "a drop only lowers the need";
+    EXPECT_EQ(rig.admin().applier().state().topicByName("t"), nullptr);
+    EXPECT_EQ(defineWith(rig, "more", 1).code, 0) << "back within the budget";
+}
+
+TEST(AdminWorkerRegression, AnUnknownFdLimitNeverRefusesRegression) {
+    CatalogDdlRig rig("aw_fd_unknown", 1);   // fdLimit 0: getrlimit failed / not wired
+    rig.becomeServingLeader();
+    EXPECT_EQ(defineWith(rig, "huge", 1000).code, 0);
+    EXPECT_EQ(rig.alterConfig("huge", {{rc::ConfigKey::RetentionBytes, 1LL << 40}}).code, 0);
+    EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 0u);
 }

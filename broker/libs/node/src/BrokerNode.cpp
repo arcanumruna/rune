@@ -408,7 +408,7 @@ void BrokerNode::start() {
     {
         std::string fdErr;
         uint64_t need = 0;
-        const bool fdOk = applyFdLimitAtStartup(config_, bootTopics_, fdErr, &need);
+        const bool fdOk = applyFdLimitAtStartup(config_, bootTopics_, fdErr, &need, &fdSoftLimit_);
         fdNeedAtBoot_ = need;                       // the budget actually applied (no second estimate)
         if (!fdOk) {
             spdlog::error("BrokerNode[{}]: {}", config_.nodeId, fdErr);
@@ -4293,6 +4293,10 @@ void BrokerNode::buildAdminWorker() {
         AdminDeps deps;
         deps.brokerCount = static_cast<int32_t>(std::max<std::size_t>(config_.peers.size(), 1));
         deps.topicMinIsr = config_.gatewayMinIsr;
+        // Issue #296: DDL admission against this broker's open-file limit (set by the fd step above, before any
+        // thread starts; immutable after).
+        deps.fdLimit                   = fdSoftLimit_;
+        deps.readySegmentsPerPartition = static_cast<uint64_t>(config_.segmentProvisionDepth);
 
         deps.respondDefine = [this](int64_t session, int64_t corr, int32_t topicId,
                                     uint16_t version, uint16_t errorCode) {

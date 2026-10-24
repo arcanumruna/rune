@@ -32,7 +32,9 @@
 // review L5): a retired segment kept open by an in-flight seal flush (M1 pin;
 // only while a truncation / retention races that flush, at most
 // kMaxPendingSeals per log) and recover()'s short-lived .index.tmp /
-// directory-fsync fds.  The estimate only drives the startup WARN.
+// directory-fsync fds.  The estimate drives the startup check and (issue #296)
+// the admin thread's DDL admission: a CreateTopic / AlterTopicConfig that would
+// raise it above the soft open-file limit is refused before it is appended.
 //
 // Deployment: set the hard limit high — systemd `LimitNOFILE=1048576`,
 // Docker `--ulimit nofile=1048576:1048576` (most engines default to ~1M),
@@ -61,6 +63,10 @@ inline constexpr uint64_t kAdminLogs                 = 2;
 /// passes while the provisioner later hits EMFILE.
 [[nodiscard]] uint64_t estimateFdNeed(std::span<const TopicSpec> topics,
                                       uint64_t readySegmentsPerPartition = 0) noexcept;
+/// Issue #296: the two terms of estimateFdNeed (one formula): the base (kBaseFds + internal reserve + admin logs) and
+/// one topic's term (0 for a view sink - it owns no log).  estimateFdNeed = fdNeedBase() + sum of fdNeedOfTopic.
+[[nodiscard]] uint64_t fdNeedBase() noexcept;
+[[nodiscard]] uint64_t fdNeedOfTopic(const TopicSpec& t, uint64_t readySegmentsPerPartition) noexcept;
 
 enum class FdLimitVerdict : uint8_t { Ok, Warn, Refuse };
 struct FdLimitDecision {
@@ -76,7 +82,9 @@ struct FdLimitDecision {
 /// __catalog boot replay produced (BrokerNode::start passes bootTopics_) — topics exist only through DDL.
 /// Returns false (and sets `error`) when the broker must refuse to start.
 /// `needOut` (optional): the estimate this call decided on -- set before anything else, also when getrlimit fails.
+/// `softOut` (optional, issue #296): the soft limit in force after the call (0 = unknown: getrlimit failed) - the
+/// budget the admin thread checks DDL against.
 bool applyFdLimitAtStartup(const NodeConfig& cfg, std::span<const TopicSpec> topics, std::string& error,
-                           uint64_t* needOut = nullptr);
+                           uint64_t* needOut = nullptr, uint64_t* softOut = nullptr);
 
 } // namespace rune::node

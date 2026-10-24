@@ -2562,6 +2562,7 @@ private:
     std::vector<int32_t>                                  bootDroppedIds_;       // every topic id the catalog dropped
     std::optional<CatalogApplier>                         bootApplier_;          // Booted; handed to the AdminWorker by buildAdminWorker
     uint64_t                                              fdNeedAtBoot_ = 0;     // estimateFdNeed(bootTopics_) at start()
+    uint64_t                                              fdSoftLimit_ = 0;      // #296: soft RLIMIT_NOFILE after start()'s fd step (0 = unknown)
     int                                                   bootReplays_ = 0;      // replayLocal calls that returned >= 0
     bool                                                  bootReconcileDeferred_ = false;   // B6: the admin thread reconciles after catch-up
     bool                                                  holdCatalogApplyAtBootForTest_ = false;

@@ -3,6 +3,7 @@
 #include "rune/node/AdminWorker.h"
 
 #include <rune/node/CatalogEffectFrames.h>
+#include <rune/node/FdBudget.h>
 #include <rune/node/PersistenceMode.h>
 
 #include <rune/catalog/CatalogFingerprint.h>
@@ -811,7 +812,52 @@ void AdminWorker::startNext_(int64_t nowNs) {
         return;
     }
     built->principal.requestFingerprint = fp;
+    // Issue #296: a topic the brokers could not open (EMFILE on every replica build) is refused before it commits.
+    if (auto refusal = fdBudgetRefusal_(*built, state)) {
+        ++ddlRefusedFdBudget_;
+        spdlog::warn("AdminWorker: {} (refused so far: {})", *refusal, ddlRefusedFdBudget_);
+        answer_(req, kInvalidRequest, *refusal);
+        return;
+    }
     (void)appendEvent_(req, std::move(*built), nowNs);
+}
+
+namespace {
+/// Issue #296: the fields of a catalog topic the open-file formula reads (FdBudget.h; a TopicObject is never a sink).
+TopicSpec fdSpecOf(int32_t partitions, const rune::protocol::TopicConfig& c) {
+    TopicSpec t;
+    t.partitionCount   = partitions;
+    t.retentionBytes   = c.retentionBytes;
+    t.segmentRollBytes = c.segmentRollBytes;
+    return t;
+}
+}  // namespace
+
+std::optional<std::string> AdminWorker::fdBudgetRefusal_(const cat::CatalogEvent& e, const cat::CatalogState& s) const {
+    if (deps_.fdLimit == 0) return std::nullopt;   // unknown limit: never refuse
+    const bool create = std::holds_alternative<cat::CreateTopicOps>(e.ops);
+    const auto* alter = std::get_if<cat::AlterTopicConfigOps>(&e.ops);
+    if (!create && alter == nullptr) return std::nullopt;   // views own no log; drops only lower the need
+    const uint64_t ready = deps_.readySegmentsPerPartition;
+    uint64_t before = fdNeedBase();
+    for (const cat::TopicObject* t : s.topics()) before += fdNeedOfTopic(fdSpecOf(t->partitions, t->config), ready);
+    uint64_t after = before;
+    if (create) {
+        const auto& o = std::get<cat::CreateTopicOps>(e.ops);
+        after += fdNeedOfTopic(fdSpecOf(o.partitions, o.config), ready);
+    } else {
+        const cat::TopicObject* t = s.topicByName(e.objectName);
+        if (t == nullptr) return std::nullopt;   // the dry run already refused it
+        rune::protocol::TopicConfig next = t->config;
+        cat::applyConfigChanges(next, *alter);   // the resulting config (the apply's own rule)
+        after = after - fdNeedOfTopic(fdSpecOf(t->partitions, t->config), ready) +
+                fdNeedOfTopic(fdSpecOf(t->partitions, next), ready);
+    }
+    if (after <= deps_.fdLimit || after <= before) return std::nullopt;
+    return std::string(create ? "CREATE TOPIC" : "ALTER TOPIC") + " would raise this broker's estimated open-file need to " +
+           std::to_string(after) + ", above its open-file limit " + std::to_string(deps_.fdLimit) + " (now " +
+           std::to_string(before) + "); raise LimitNOFILE / --ulimit nofile, or use fewer partitions, a larger "
+           "segment.bytes or a smaller retention.bytes";
 }
 
 bool AdminWorker::appendEvent_(const DdlRequest& req, cat::CatalogEvent e, int64_t nowNs) {

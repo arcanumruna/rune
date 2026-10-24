@@ -123,6 +123,12 @@ struct AdminDeps {
         securityServing;
     /// F (RUNE_SECURITY_MAX_STALENESS_MS, effective): the contact a follower's verdict may lapse for.
     int64_t securityMaxStalenessNs = 1'000'000'000;
+
+    /// Issue #296: this broker's open-file limit (the soft RLIMIT_NOFILE in force after the startup fd step; 0 =
+    /// unknown -> no check) and the READY segments the provisioner may hold per partition (the boot estimate's value).
+    /// A CreateTopic / AlterTopicConfig that would raise estimateFdNeed above fdLimit is refused before its append.
+    uint64_t fdLimit = 0;
+    uint64_t readySegmentsPerPartition = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -358,6 +364,8 @@ public:
     /// out) although its event commits and applies normally — the leader that is crashed meanwhile dies
     /// with a committed, unanswered DDL (the in-doubt client).  Never set in production.
     void holdAnswersForTest(bool on) noexcept { answersHeldForTest_ = on; }
+    /// Issue #296: the open-file limit DDL is admitted against (a broker restarted with a lower limit).
+    void setFdLimitForTest(uint64_t limit) noexcept { deps_.fdLimit = limit; }
     /// The catalog leader serving DDL.
     [[nodiscard]] bool isLeader() const noexcept { return std::holds_alternative<CatalogLeaderServing>(role_); }
     [[nodiscard]] std::size_t pendingCount() const noexcept { return pending_.size(); }
@@ -398,6 +406,8 @@ public:
     [[nodiscard]] uint64_t preV8Refused() const noexcept { return preV8Refused_; }
     /// DDLs refused because this broker leads __catalog without its (wiped) history (fix round 2, F2).
     [[nodiscard]] uint64_t ddlRefusedUntrustedLeader() const noexcept { return ddlRefusedUntrustedLeader_; }
+    /// Issue #296: DDLs refused because they would raise the estimated open-file need above fdLimit.
+    [[nodiscard]] uint64_t ddlRefusedFdBudget() const noexcept { return ddlRefusedFdBudget_; }
     [[nodiscard]] static constexpr int64_t ddlTimeoutNs() noexcept { return kDdlTimeoutNs; }
 
     // ── The in-flight DDL (rule 3) ──────────────────────────────────────────
@@ -445,6 +455,11 @@ private:
                  const rune::catalog::CatalogState& s) const;
     /// Encode + append `e` (key = objectId LE) — false: answered already.
     bool appendEvent_(const DdlRequest& req, rune::catalog::CatalogEvent e, int64_t nowNs);
+    /// Issue #296: the refusal detail when the CreateTopic / AlterTopicConfig `e` would raise this broker's estimated
+    /// open-file need (estimateFdNeed over `s`'s topics) above deps_.fdLimit; nullopt = admitted (any other kind, an
+    /// unknown limit, or a need that does not grow).  Cold: an O(topics) sum per DDL.
+    [[nodiscard]] std::optional<std::string> fdBudgetRefusal_(const rune::catalog::CatalogEvent& e,
+                                                              const rune::catalog::CatalogState& s) const;
 
     // Answers — every exit of a STARTED DDL goes through answer_(req, Response),
     // the ONE place answeredCount() moves; respond_ only encodes (a queue-overflow
@@ -527,6 +542,7 @@ private:
     }
     uint64_t preV8Refused_      = 0;
     uint64_t ddlRefusedUntrustedLeader_ = 0;
+    uint64_t ddlRefusedFdBudget_ = 0;   ///< issue #296
     bool     applyHeldForTest_  = false;   // holdApplyForTest (test seam only)
     bool     answersHeldForTest_ = false;  // holdAnswersForTest (test seam only)
 

@@ -21,13 +21,19 @@ uint64_t openSegmentsFor(const TopicSpec& t) noexcept {
 }
 } // namespace
 
+uint64_t fdNeedBase() noexcept {
+    return kBaseFds + (kInternalPartitionsReserve + kAdminLogs) * fdsPerPartition(kDefaultOpenSegments);
+}
+
+uint64_t fdNeedOfTopic(const TopicSpec& t, uint64_t readySegmentsPerPartition) noexcept {
+    if (t.viewSink) return 0;   // VLS B.2: a sink owns no log
+    const uint64_t parts = t.partitionCount > 0 ? static_cast<uint64_t>(t.partitionCount) : 0;
+    return parts * (fdsPerPartition(openSegmentsFor(t)) + readySegmentsPerPartition * kFdsPerSegment);
+}
+
 uint64_t estimateFdNeed(std::span<const TopicSpec> topics, uint64_t readySegmentsPerPartition) noexcept {
-    uint64_t need = kBaseFds + (kInternalPartitionsReserve + kAdminLogs) * fdsPerPartition(kDefaultOpenSegments);
-    for (const auto& t : topics) {
-        if (t.viewSink) continue;   // VLS B.2: a sink owns no log
-        const uint64_t parts = t.partitionCount > 0 ? static_cast<uint64_t>(t.partitionCount) : 0;
-        need += parts * (fdsPerPartition(openSegmentsFor(t)) + readySegmentsPerPartition * kFdsPerSegment);
-    }
+    uint64_t need = fdNeedBase();
+    for (const auto& t : topics) need += fdNeedOfTopic(t, readySegmentsPerPartition);
     return need;
 }
 
@@ -66,9 +72,10 @@ FdLimitDecision decideFdLimit(uint64_t soft, uint64_t hard, bool unlimited, uint
 }
 
 bool applyFdLimitAtStartup(const NodeConfig& cfg, std::span<const TopicSpec> topics, std::string& error,
-                           uint64_t* needOut) {
+                           uint64_t* needOut, uint64_t* softOut) {
     const uint64_t need = estimateFdNeed(topics, static_cast<uint64_t>(cfg.segmentProvisionDepth));
     if (needOut) *needOut = need;
+    if (softOut) *softOut = 0;
     struct ::rlimit rl{};
     if (::getrlimit(RLIMIT_NOFILE, &rl) != 0) {
         spdlog::warn("rune-broker: getrlimit(RLIMIT_NOFILE) failed: {} — open-file budget not checked",
@@ -93,7 +100,9 @@ bool applyFdLimitAtStartup(const NodeConfig& cfg, std::span<const TopicSpec> top
         }
     }
     struct ::rlimit now{};
-    (void)::getrlimit(RLIMIT_NOFILE, &now);
+    if (::getrlimit(RLIMIT_NOFILE, &now) != 0) now = rl;
+    // Issue #296: the soft limit in force (setrlimit's target when it succeeded, else the old soft value).
+    if (softOut && now.rlim_cur != RLIM_INFINITY) *softOut = static_cast<uint64_t>(now.rlim_cur);
     if (d.verdict == FdLimitVerdict::Warn) spdlog::warn("rune-broker: {}", d.message);
     else spdlog::info("rune-broker: {}", d.message);
     if (static_cast<uint64_t>(now.rlim_cur) < need)

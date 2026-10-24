@@ -98,6 +98,9 @@ inline constexpr int64_t kMaxSegmentRollBytes = int64_t{INT32_MAX} - (int64_t{64
 ///   [0, 1'000'000] ppm; segment.bytes in [1, kMaxSegmentRollBytes]; retention.check.ms,
 ///   file.delete.delay.ms >= 1; cleanup.policy <= 2, durability <= 1, durability.tier <= 2.
 [[nodiscard]] std::optional<std::string> topicConfigError(const TopicConfig& c);
+/// AlterTopicConfig's resulting config: `o`'s changes written over `c` (the rule the apply runs; issue #296 previews
+/// an ALTER's open-file need with it).  Validate the result with topicConfigError.
+void applyConfigChanges(TopicConfig& c, const AlterTopicConfigOps& o) noexcept;
 
 struct ApplyV1;   // src/catalog/ApplyV1.h — the frozen formatVer-1 rules
 

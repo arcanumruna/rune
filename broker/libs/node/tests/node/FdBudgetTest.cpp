@@ -77,3 +77,20 @@ TEST(FdBudgetRegression, UnlimitedHardNeverRefuses) {
     EXPECT_EQ(d.verdict, FdLimitVerdict::Ok);
     EXPECT_GE(d.targetSoft, 50'000u) << "an unlimited hard limit still raises soft to cover the need";
 }
+
+// Issue #296: the estimate is ONE formula - its base plus a per-topic term - so the admin thread's DDL admission
+// (AdminWorker::fdBudgetRefusal_) and the startup check can never disagree.
+TEST(FdBudgetRegression, EstimateIsTheSumOfPerTopicTermsRegression) {
+    EXPECT_EQ(fdNeedBase(), kBaseFds + kInternal);
+    TopicSpec sink = topic(8);
+    sink.viewSink = true;
+    EXPECT_EQ(fdNeedOfTopic(sink, 2), 0u) << "a view sink owns no log";
+    EXPECT_EQ(fdNeedOfTopic(topic(3, 10LL << 20, 1LL << 20), 2), 3u * ((11 * kFdsPerSegment + kE1dFdsPerLog) + 2 * kFdsPerSegment));
+    EXPECT_EQ(fdNeedOfTopic(topic(0), 2), 0u);
+    const std::vector<TopicSpec> topics{topic(300), topic(3, 10LL << 20, 1LL << 20), sink, topic(1, 1, 1)};
+    for (const uint64_t ready : {uint64_t{0}, uint64_t{1}, uint64_t{4}}) {
+        uint64_t sum = fdNeedBase();
+        for (const TopicSpec& t : topics) sum += fdNeedOfTopic(t, ready);
+        EXPECT_EQ(needOf(topics, ready), sum) << ready;
+    }
+}
