@@ -159,11 +159,22 @@ public:
         }
         if (!changed) throw std::runtime_error("AuthTrio: admin password change never accepted");
         // an admin session on every broker (the new password reaches the others asynchronously)
-        for (int id : {1, 2, 3}) admin_[static_cast<std::size_t>(id - 1)] = loginRetry_(id, "admin", kAdminPassword);
+        for (int id : {1, 2, 3}) {
+            admin_[static_cast<std::size_t>(id - 1)] = loginRetry_(id, "admin", kAdminPassword);
+            adminUsedAt_[static_cast<std::size_t>(id - 1)] = Clock3::now();
+        }
     }
+    /// The admin session on broker `id`.  The raw wire client sends no keepalives, so a broker reaps an idle session
+    /// after its session timeout (ClientGateway::kDefaultSessionTimeoutNs, 10 s) and a frame on it is dropped
+    /// unanswered - each such attempt cost a whole answer deadline (30 s), so a test idle for 10 s+ before a DDL ran
+    /// out of time (ClientAuthClusterRegression.WorldServerClientProducesAndConsumesThroughEveryBroker).  A session
+    /// idle for half the timeout is replaced by a fresh login before it is used.
     Session adminOn(int id) {
         auto& s = admin_[static_cast<std::size_t>(id - 1)];
+        auto& used = adminUsedAt_[static_cast<std::size_t>(id - 1)];
+        if (s.w && Clock3::now() - used > std::chrono::seconds(5)) s = {};
         if (!s.w) s = loginRetry_(id, "admin", kAdminPassword);
+        used = Clock3::now();
         return s;
     }
 
@@ -266,6 +277,7 @@ private:
     std::array<std::string, 3> keyContents_, keyPath_, nextPath_;
     std::unique_ptr<AuthWireClient> wire_;
     std::array<Session, 3> admin_{};
+    std::array<Clock3::time_point, 3> adminUsedAt_{};   ///< last hand-out of admin_[i] (adminOn)
     AuthMode authMode_ = AuthMode::Enabled;
 };
 
