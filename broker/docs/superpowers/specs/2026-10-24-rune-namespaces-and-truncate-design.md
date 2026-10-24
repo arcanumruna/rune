@@ -149,6 +149,7 @@ Only the cluster admin can set these, in one `NamespaceLimits` record per namesp
    - rate token buckets and the bench.
 3. **TruncateTopic:** wire, broker, replication and client, plus the CLI.
 4. **CLI:** `rune` reads the shared Arcanum login context; `arcanum` plugin dispatch; `topic truncate`, `topic list` and `namespace` commands. The platform commands in §10.2 come with the control-plane service.
+5. **NAT-safe egress:** per-session egress on a client-opened flow; per-worker egress on by default; NAT e2e leg (§10.5).
 
 ## 8. Interaction matrix
 Operations × entities × timings:
@@ -232,3 +233,38 @@ Product decision for later: whether teardown is immediate, or keeps a recoverabl
 - **Review notes:**
   - `schema list` actually lists topics. Add `topic list` as the canonical command and keep `schema list` as an alias.
   - Error messages keep their existing `rune ...:` prefix.
+
+### 10.4 Selecting and connecting to a deployment
+- **Context:** (project, environment) picks the Rune deployment. Start with one Rune deployment per project; environments such as `--env dev|prod` can come later.
+  - `arcanum use <project> [--env]` sets the current context.
+  - `--project`/`--env` override it for one command, and `RUNE_PROJECT`/`RUNE_ENV` override it for a shell or CI.
+- **Resolution:** the first time a context is used, `rune` calls the control plane with the `arcanum` token. It gets back:
+  - the bootstrap broker endpoints (the rest of the cluster comes from metadata);
+  - the namespace;
+  - the cluster TLS identity, which the client pins;
+  - a short-lived namespace-admin credential.
+
+  These are cached with mode 0600, per context. On a connect or auth failure, `rune` refreshes once.
+- **Precedence:** `--broker`/`--user` flags, then `RUNE_BROKER`/`RUNE_USER`, then the Arcanum context. Self-hosted use needs only the first two.
+- **Apps:** apps never use a personal login.
+  - `arcanum rune credentials create <name> --grants ...` creates a service user in the namespace and prints `rune://<ns>/<user>@host1:port,host2:port?tls=<fingerprint>` plus a secret.
+  - The client library accepts that connection string.
+  - `credentials revoke <name>` removes the user and fences its sessions.
+
+### 10.5 Reachability through NAT
+Clients run behind NAT: home routers, cloud NAT gateways, most Kubernetes pods. A broker can only reach them over a flow the client opened, the way memcached or DNS replies go to the request's source address.
+- **Records egress is already NAT-safe.** It uses per-worker dynamic-MDC publications (`control-mode=dynamic`, `BrokerNode.cpp`). The client's status messages leave from its receive socket, and the broker sends to that observed source address. This is on in shard+fused mode, or with `perWorkerEgressEnabled`; it is off by default otherwise.
+- **Per-session egress is not NAT-safe.** That covers ConnectResponse, acks, DDL replies, errors, and Records when per-worker egress is off.
+  1. The client declares its own `egressChannel`, defaulting to `aeron:udp?endpoint=localhost:40200`, in ConnectRequest.
+  2. The gateway's `SessionAnnouncer` makes the workers open a publication to that address.
+
+  Behind NAT that address is private or unmapped, so the client never receives the replies.
+- **Fix:**
+  - move per-session egress onto a client-opened flow: dynamic MDC on the session egress, or Aeron response channels (`control-mode=response`);
+  - make per-worker egress the default;
+  - stop sending a declared endpoint in ConnectRequest.
+- **Operations:**
+  - one public UDP endpoint per node, plus each worker's egress control port;
+  - security groups or firewalls opened for those ports;
+  - client keepalive below typical NAT UDP timeouts (about 30 s).
+- **Tests:** an e2e leg with the client behind a NAT, e.g. a docker network with masquerade, on the default config.
