@@ -1673,10 +1673,10 @@ size_t GroupCoordinationService::handleOffsetFetch(
         // Bound-check BEFORE writing each result so a large fetch-all never
         // overruns a fixed scratch buffer.  Results that would exceed outCap
         // are silently dropped (the response is capped but never overruns).
+        // #498: an unstable key (#471: its record is above the high watermark) is listed with the retriable code and
+        // no offset - exactly what a specific fetch answers - and every stable key with its offset; steady commits on
+        // one key never starve the listing of the others.  An unstable value is never served.
         const auto all = offsets_->fetchAll(groupIdStr);
-        for (const auto& [tp, co] : all) {
-            if (isUnstable(co)) [[unlikely]] return answerRetriableSentinel();   // #471
-        }
         for (const auto& [tp, co] : all) {
             // Bound-check before each push.
             const std::size_t needed =
@@ -1706,6 +1706,9 @@ size_t GroupCoordinationService::handleOffsetFetch(
                 ++pendingLineageAnswers_;
                 r.offset    = -1;
                 r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            } else if (isUnstable(co)) [[unlikely]] {   // #471 / #498: not committed yet - retriable, never its value
+                r.offset    = -1;
+                r.errorCode = unstableFor_(msg.sessionId);
             }
             fetchResultScratch_.push_back(r);
         }

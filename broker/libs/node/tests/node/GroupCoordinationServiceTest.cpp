@@ -50,6 +50,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <string>
 #include <limits>
@@ -2495,7 +2496,9 @@ TEST(OffsetCommitDurabilityRegression, AFetchOfAParkedCommitIsRetriableUntilItsR
         f = pc::OffsetFetchResponse::decode(g.out, n);
         ASSERT_TRUE(f && f->results.size() == 1u);
         EXPECT_EQ(f->results[0].errorCode, refused);
-        EXPECT_EQ(f->results[0].topicId, -1);
+        // #498: a fetch-all lists the unstable key itself with the retriable code (no longer a {-1, -1} sentinel).
+        EXPECT_EQ(f->results[0].topicId, kTestTopicId);
+        EXPECT_EQ(f->results[0].partition, 0);
         EXPECT_EQ(f->results[0].offset, -1);
         g.fetch();   // the follower has the record: the high watermark passes it
         g.svc.doWork(g.clock);
@@ -2880,7 +2883,8 @@ std::size_t encodeOffsetFetchTwo(uint8_t* buf, int64_t corr, std::string_view gr
 }  // namespace
 
 // #471: a committed value overwritten by a parked commit is never served as the new value (nor the old one as OK),
-// a sibling key that IS committed is still served, and a fetch-all with one unstable key is the retriable sentinel.
+// a sibling key that IS committed is still served.  #498: a fetch-all lists the unstable key with the retriable code
+// (offset -1) and the committed sibling with its offset (it was a whole-answer retriable sentinel).
 TEST(OffsetCommitDurabilityRegression, AParkedOverwriteIsNeverServedButItsCommittedSiblingIsAdversarialRegression) {
     const std::string group = "g471adv";
     CommitRig g(group);
@@ -2908,9 +2912,18 @@ TEST(OffsetCommitDurabilityRegression, AParkedOverwriteIsNeverServedButItsCommit
 
     n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetchAll(g.req, 1, g.corr++, group), g.clock, g.out, sizeof g.out);
     f = pc::OffsetFetchResponse::decode(g.out, n);
-    ASSERT_TRUE(f && f->results.size() == 1u) << "a fetch-all listed keys while one of them was unstable";
-    EXPECT_EQ(f->results[0].topicId, -1);
-    EXPECT_EQ(f->results[0].errorCode, unstable);
+    ASSERT_TRUE(f && f->results.size() == 2u) << "a fetch-all must list every key, the unstable one retriably";
+    for (const auto r : f->results) {
+        EXPECT_EQ(r.topicId, kTestTopicId);
+        if (r.partition == 0) {
+            EXPECT_EQ(r.errorCode, unstable) << "the parked overwrite (or the superseded value) was served";
+            EXPECT_EQ(r.offset, -1);
+        } else {
+            EXPECT_EQ(r.partition, 1);
+            EXPECT_EQ(r.errorCode, int16_t{0}) << "a committed sibling key was refused";
+            EXPECT_EQ(r.offset, 60);
+        }
+    }
 
     g.fetch();
     g.svc.doWork(g.clock);
@@ -4267,4 +4280,101 @@ TEST(GroupCoordinationServiceRegression, SessionTimeoutBelowTheMinimumIsRaisedTo
     // A non-positive minimum keeps the default.
     g.svc.setMinSessionTimeoutMs(0);
     EXPECT_EQ(g.svc.minSessionTimeoutMs(), GroupCoordinationService::kDefaultMinSessionTimeoutMs);
+}
+
+// ===========================================================================
+// #498: a fetch-all answered only the retriable {-1, -1} sentinel while ANY key of the group had a record above the
+// high watermark, so steady commits on one key starved a listing of all the others.  Each unstable key is now listed
+// with the retriable code (UnstableOffsetCommit from client 10, NotCoordinator below) and offset -1 - exactly as a
+// specific fetch answers it - and every stable key with its offset.  #471 holds: an unstable value is never served.
+// ===========================================================================
+namespace {
+struct FetchVersion498 {
+    int32_t v;
+    static int32_t of(void* ctx, int64_t) noexcept { return static_cast<FetchVersion498*>(ctx)->v; }
+};
+constexpr int32_t kTopic498 = 1;   // a second topic: three keys in all
+struct FetchAll498 {
+    std::map<std::pair<int32_t, int32_t>, std::pair<int16_t, int64_t>> byKey;   // (topicId, partition) -> (code, offset)
+    std::size_t count = 0;
+};
+FetchAll498 fetchAll498(CommitRig& g, const std::string& group) {
+    const std::size_t n = g.svc.handleOffsetFetch(g.req, encodeOffsetFetchAll(g.req, 1, g.corr++, group), g.clock, g.out,
+                                                  sizeof g.out);
+    const auto f = pc::OffsetFetchResponse::decode(g.out, n);
+    EXPECT_TRUE(f.has_value());
+    FetchAll498 out;
+    if (!f) return out;
+    for (const auto r : f->results) out.byKey[{r.topicId, r.partition}] = {r.errorCode, r.offset};
+    out.count = f->results.size();
+    return out;
+}
+std::pair<int16_t, int64_t> at498(const FetchAll498& a, int32_t topicId, int32_t partition) {
+    const auto it = a.byKey.find(std::make_pair(topicId, partition));
+    return it == a.byKey.end() ? std::make_pair(int16_t{-999}, int64_t{-999}) : it->second;   // -999: not listed
+}
+std::size_t commit498(CommitRig& g, const std::string& group, int32_t topicId, int32_t partition, int64_t offset) {
+    return g.svc.handleOffsetCommit(g.req, encodeOffsetCommit(g.req, 1, g.corr++, group, g.member, g.gen, topicId,
+                                                              partition, offset), g.clock, g.out, sizeof g.out);
+}
+}  // namespace
+
+// RED (the pre-scan): the fetch-all is answered one {-1, -1} sentinel - keys 1 and 2 are never listed.
+TEST(OffsetCommitDurabilityRegression, AFetchAllListsStableKeysWhileAnotherKeyIsInFlightRegression) {
+    for (const int32_t version : {10, 9}) {
+        SCOPED_TRACE(::testing::Message() << "version=" << version);
+        const std::string group = "g498v" + std::to_string(version);
+        CommitRig g(group);
+        ASSERT_EQ(g.registry.createTopicAt(kTopic498, makeTopicSpec("t498", 2, kTopic498)), kTopic498);
+        FetchVersion498 ver{version};
+        g.svc.setClientVersionResolverForTest(&FetchVersion498::of, &ver);
+        const auto retriable = static_cast<int16_t>(version >= 10 ? pc::ErrorCode::UnstableOffsetCommit
+                                                                  : pc::ErrorCode::NotCoordinator);
+        ASSERT_EQ(commit498(g, group, kTestTopicId, 0, 11), 0u);
+        ASSERT_EQ(commit498(g, group, kTestTopicId, 1, 22), 0u);
+        g.fetch();
+        g.svc.doWork(g.clock);
+        ASSERT_EQ(g.svc.parkedOffsetCommits(), 0u);
+        ASSERT_EQ(commit498(g, group, kTopic498, 0, 33), 0u);   // key 3: its record above the high watermark
+        ASSERT_EQ(g.svc.parkedOffsetCommits(), 1u);
+
+        auto all = fetchAll498(g, group);
+        ASSERT_EQ(all.count, 3u) << "a fetch-all must list every key";
+        EXPECT_EQ(at498(all, kTestTopicId, 0), std::make_pair(int16_t{0}, int64_t{11}));
+        EXPECT_EQ(at498(all, kTestTopicId, 1), std::make_pair(int16_t{0}, int64_t{22}));
+        EXPECT_EQ(at498(all, kTopic498, 0), std::make_pair(retriable, int64_t{-1})) << "an unstable value was served";
+
+        g.fetch();
+        g.svc.doWork(g.clock);
+        all = fetchAll498(g, group);
+        ASSERT_EQ(all.count, 3u);
+        EXPECT_EQ(at498(all, kTestTopicId, 0), std::make_pair(int16_t{0}, int64_t{11}));
+        EXPECT_EQ(at498(all, kTestTopicId, 1), std::make_pair(int16_t{0}, int64_t{22}));
+        EXPECT_EQ(at498(all, kTopic498, 0), std::make_pair(int16_t{0}, int64_t{33}));
+    }
+}
+
+// An overwrite of key 1 in flight: key 1 is the retriable entry (never its new value, never its old one as OK); key 2 is
+// listed with its offset.  RED (the pre-scan): one {-1, -1} sentinel.
+TEST(OffsetCommitDurabilityRegression, AFetchAllListsStableKeysWhileAnOverwriteIsInFlightRegression) {
+    const std::string group = "g498ow";
+    CommitRig g(group);
+    ASSERT_EQ(commit498(g, group, kTestTopicId, 0, 11), 0u);
+    ASSERT_EQ(commit498(g, group, kTestTopicId, 1, 22), 0u);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(commit498(g, group, kTestTopicId, 0, 99), 0u);   // overwrite of key 1, parked
+    ASSERT_EQ(g.svc.parkedOffsetCommits(), 1u);
+    auto all = fetchAll498(g, group);
+    ASSERT_EQ(all.count, 2u);
+    EXPECT_EQ(at498(all, kTestTopicId, 0),
+              std::make_pair(static_cast<int16_t>(pc::ErrorCode::UnstableOffsetCommit), int64_t{-1}))
+        << "the in-flight overwrite (or the superseded value) was served";
+    EXPECT_EQ(at498(all, kTestTopicId, 1), std::make_pair(int16_t{0}, int64_t{22}));
+    g.fetch();
+    g.svc.doWork(g.clock);
+    all = fetchAll498(g, group);
+    ASSERT_EQ(all.count, 2u);
+    EXPECT_EQ(at498(all, kTestTopicId, 0), std::make_pair(int16_t{0}, int64_t{99}));
+    EXPECT_EQ(at498(all, kTestTopicId, 1), std::make_pair(int16_t{0}, int64_t{22}));
 }
