@@ -117,7 +117,8 @@ struct Cluster {
     std::vector<uint16_t>         ports;
     std::vector<std::unique_ptr<Node>> nodes;
 
-    explicit Cluster(bool sealedAll = true) {
+    /// `plainSinkNode`: that node's SINK is built PeerPlain (it holds no cluster key and sends plaintext frames).
+    explicit Cluster(bool sealedAll = true, int32_t plainSinkNode = -1) {
         aeron::Context ctx; ctx.aeronDir(driver.dir());
         aeron = aeron::Aeron::connect(ctx);
         for (int i = 0; i < 3; ++i) ports.push_back(rune::aeronutil::testing::allocFreeUdpPort());
@@ -131,7 +132,8 @@ struct Cluster {
             std::unordered_map<NodeId, UdpMessageSink::PeerEndpoint> eps;
             for (int32_t o = 1; o <= 3; ++o) if (o != n->id) eps[o] = {chan(o), kConsensusStream};
             n->sink = std::make_unique<UdpMessageSink>(aeron, eps, rune::aeronutil::AeronPump{}, PeerResolutionSource{},
-                                                       sealedAll ? sealed(n->id) : pl::PeerCryptoMode{pl::PeerPlain{}});
+                                                       sealedAll && n->id != plainSinkNode ? sealed(n->id)
+                                                                                           : pl::PeerCryptoMode{pl::PeerPlain{}});
             n->publisher = std::make_unique<SbeConsensusPublisher>(*n->sink);
             n->nsf = std::make_unique<NodeStateFile>((n->dir.dir / "nodestate.nsf").string(), 0);
             n->tl  = std::make_unique<TermLog>((n->dir.dir / "termlog.tl").string());
@@ -209,23 +211,46 @@ TEST(PeerSealedConsensusRegression, SealingStartsOnlyOnceTheLinkExists) {
     ASSERT_TRUE(c.runUntil(15s, [&] { return c.settledOn({1, 2, 3}, leader); })) << "the cluster forms once the links exist";
 }
 
-TEST(PeerSealedConsensusRegression, AKeylessNodeNeverAffectsTheTerm) {
-    Cluster c;
-    c.link(1, 2, 1);                                          // 1 <-> 2 linked; node 3 has no link to anyone
-    int32_t leader = -1;
-    ASSERT_TRUE(c.runUntil(15s, [&] { return c.settledOn({1, 2}, leader); })) << "two linked nodes elect between them";
-    const Term term1 = c.node(1).agent->election().leadershipTermId();
-    const Term cand1 = c.node(1).agent->election().candidateTermId();
-    const Term cand2 = c.node(2).agent->election().candidateTermId();
-    // The keyless node keeps standing for election on its own; none of it reaches the others.
-    c.runFor(1500ms);
-    EXPECT_EQ(c.node(1).agent->election().leadershipTermId(), term1) << "node 3 cannot move the term";
-    EXPECT_EQ(c.node(1).agent->election().candidateTermId(), cand1);
-    EXPECT_EQ(c.node(2).agent->election().candidateTermId(), cand2);
-    EXPECT_NE(c.node(3).agent->election().state(), ElectionState::Closed);
-    EXPECT_GT(c.node(3).sink->peerFrameDrops(), 0u) << "its frames never left";
-    EXPECT_EQ(c.node(1).ingress->peerFrameDrops(), 0u);
-    EXPECT_EQ(c.node(2).ingress->peerFrameDrops(), 0u);
+// Issue #275: node 3 holds no key 1 and 2 accept, yet its frames DO arrive (the old version sent none, so it passed with
+// the ingress check deleted): (a) it seals under a link of its own (1 and 2 hold none for it: UnknownPeer); (b) it holds
+// no key at all and sends plaintext (NotPeerFrame).  Every frame is refused and counted, and the term never moves.
+// Mutation: an ingress that hands a frame that did not open to the ring anyway (deleting the drop after open) -> (b)'s
+// plaintext votes reach the election and move the term -> red.
+TEST(PeerSealedConsensusRegression, AKeylessNodeNeverAffectsTheTermRegression) {
+    for (const bool plaintextNode3 : {false, true}) {
+        SCOPED_TRACE(plaintextNode3 ? "node 3 sends plaintext" : "node 3 seals under a link 1 and 2 do not hold");
+        Cluster c(/*sealedAll=*/true, /*plainSinkNode=*/plaintextNode3 ? 3 : -1);
+        c.link(1, 2, 1);
+        if (!plaintextNode3) {
+            ASSERT_TRUE(c.node(3).sink->installPeerLink(1, linkFor(false, 31)));
+            ASSERT_TRUE(c.node(3).sink->installPeerLink(2, linkFor(false, 32)));
+        }
+        int32_t leader = -1;
+        ASSERT_TRUE(c.runUntil(15s, [&] { return c.settledOn({1, 2}, leader); })) << "two linked nodes elect between them";
+        const Term term1 = c.node(1).agent->election().leadershipTermId();
+        const Term cand1 = c.node(1).agent->election().candidateTermId();
+        const Term cand2 = c.node(2).agent->election().candidateTermId();
+        const uint64_t refused0 = c.node(1).ingress->peerFrameDrops() + c.node(2).ingress->peerFrameDrops();
+        // Node 3 keeps standing for election on its own, and every 50 ms its sink also sends 1 and 2 a RequestVote for a
+        // far higher term with a stale log (one a member would deny - and adopt the candidate term of - if it reached
+        // the election).  Its frames reach 1 and 2 and are refused there.
+        std::array<uint8_t, RequestVoteMsg::TOTAL_SIZE> vote{};
+        (void)RequestVoteMsg::encode(vote.data(), 0, /*logLeadershipTermId=*/-1, /*logPosition=*/0,
+                                     /*candidateTermId=*/cand1 + cand2 + 100, /*candidateMemberId=*/3, /*protocolVersion=*/0);
+        const auto until = std::chrono::steady_clock::now() + 1500ms;
+        for (int i = 0; i < 1'000'000 && std::chrono::steady_clock::now() < until; ++i) {
+            if (i % 100 == 0) { c.node(3).sink->send(1, vote.data(), vote.size()); c.node(3).sink->send(2, vote.data(), vote.size()); }
+            c.step();
+            std::this_thread::sleep_for(500us);
+        }
+        EXPECT_EQ(c.node(1).agent->election().leadershipTermId(), term1) << "node 3 cannot move the term";
+        EXPECT_EQ(c.node(1).agent->election().candidateTermId(), cand1);
+        EXPECT_EQ(c.node(2).agent->election().candidateTermId(), cand2);
+        EXPECT_NE(c.node(3).agent->election().state(), ElectionState::Closed);
+        EXPECT_EQ(c.node(3).sink->peerFrameDrops(), 0u) << "node 3's frames left (they arrive and must be refused)";
+        EXPECT_GT(c.node(1).ingress->peerFrameDrops() + c.node(2).ingress->peerFrameDrops(), refused0)
+            << "node 3's frames arrived and were refused at the ingress";
+    }
 }
 
 TEST(PeerSealedConsensusRegression, FramesThatArriveButDoNotOpenNeverReachTheElection) {
