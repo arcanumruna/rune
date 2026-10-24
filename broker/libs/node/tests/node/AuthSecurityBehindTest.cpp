@@ -5,6 +5,7 @@
 // are judged again - by the NEW grants.  Every wait is bounded; the background DDL runs on the admin's own wire.
 #include "support/AuthRig.h"
 
+#include <atomic>
 #include <future>
 #include <thread>
 
@@ -207,6 +208,7 @@ TEST(AuthSecurityBehindRegression, ARevokeLandingMidStreamForAnActiveProducerNev
         SCOPED_TRACE("round " + std::to_string(round));
         std::vector<int> answers;
         int64_t leoAtFirstRefusal = -1;   // the producer is sequential: nothing of it is in flight at its first refusal
+        std::atomic<int> oks{0}, behinds{0};   // test-only progress counters: the waits below are by condition
         std::thread producer([&] {
             auto& c = pw.raw();
             int revokedInARow = 0;
@@ -216,16 +218,20 @@ TEST(AuthSecurityBehindRegression, ARevokeLandingMidStreamForAnActiveProducerNev
                 if (!c.produce(via, AuthRig::stream(), psid, corr, t.r.orders, 0, 1, makeBatch(1))) continue;
                 const auto a = c.awaitProduceResponseUntil(corr, AuthRig::dl(3));
                 answers.push_back(a ? a->errorCode : kNoAnswer);
+                if (answers.back() == 0) oks.fetch_add(1);
+                if (answers.back() == kUnavailable) behinds.fetch_add(1);
                 if (leoAtFirstRefusal < 0 && (answers.back() == kUnavailable || answers.back() == kNotAuthorized))
                     leoAtFirstRefusal = t.r.logEnd(t.r.orders);
                 revokedInARow = answers.back() == kNotAuthorized ? revokedInARow + 1 : 0;
             }
         });
-        std::this_thread::sleep_for(50ms);   // the stream is running: the revoke lands mid-stream
+        // The stream is running (by condition, PR #605 review: never a sleep): the revoke lands mid-stream.
+        EXPECT_TRUE(t.r.c().pollFor(30s, [&] { return oks.load() >= 20; }));
         t.node().holdSecurityApplyForTest(true);
         auto ddl = t.revokeAsync(writer, SO::Write, ST::Topic, "orders");
         EXPECT_TRUE(t.gatewayBehind(true));
-        std::this_thread::sleep_for(100ms);   // a held window the producer streams through
+        // A held window the producer streams through.
+        EXPECT_TRUE(t.r.c().pollFor(30s, [&] { return behinds.load() >= 10; }));
         t.node().holdSecurityApplyForTest(false);
         EXPECT_EQ(Behind::await(ddl), 0);
         producer.join();
@@ -244,4 +250,84 @@ TEST(AuthSecurityBehindRegression, ARevokeLandingMidStreamForAnActiveProducerNev
         ASSERT_EQ(t.b().admin().grant(t.ch(), t.b().adminSession(), writer, false, SO::Write, ST::Topic, SP::Exact, "orders").errorCode, 0);
         ASSERT_TRUE(pw.raw().produceUntilOk(t.ch(), AuthRig::stream(), psid, t.r.orders, 0, 1, makeBatch(1)));
     }
+}
+
+// PR #605 review (adversarial, resources): an admin streaming `__security` is sent the held event itself (the read server
+// serves up to the HW, not the applier), and the behind Hold pauses that read.  While the broker stays behind it must
+// STAY paused.  RED before the fix: every control pass found the session's egress Ready, resumed it, the admin re-read
+// the log and the gate held it again - a busy pause / resume loop on the admin thread (the thread that has to catch up)
+// for as long as the hold lasted.  Once the view applied the event, the read resumes and delivers it.
+TEST(AuthSecurityBehindRegression, ASecurityReadHeldWhileBehindStaysPausedUntilAppliedAdversarialRegression) {
+    Behind t("behindsecread");
+    std::string writer;
+    (void)t.r.newUser({exact(SO::Write, ST::Topic, "orders")}, &writer);
+    const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")});
+    ASSERT_EQ(t.r.produce(ws, t.r.orders, /*untilOk=*/true), 0);
+    auto& ac = t.b().admin().raw();
+    ac.keepSessionsAlive(true);
+    const int64_t as = t.b().adminSession();
+    const int64_t corr = ac.sendSubscribe(t.ch(), AuthRig::stream(), as, pc::kSecurityTopicId, 0);
+    ASSERT_EQ(ac.awaitSubscribeCode(corr, AuthRig::dl()).value_or(-1), 0);
+    const auto newestPushed = [&] {
+        int64_t newest = -1;
+        for (const auto& p : ac.records()) newest = std::max(newest, p.baseOffset);
+        return newest;
+    };
+    const int64_t applied = t.node().securityViewForTest().appliedOffset;
+    ASSERT_TRUE(ac.pollFor(10s, [&] { return newestPushed() >= 0; })) << "the read streams the log";
+    const auto flow = [&] {
+        return t.node().onControlThreadForTest([&] {
+            const CatalogReadFlow& f = t.node().catalogReadFlowForTest();
+            return std::pair<uint64_t, uint64_t>{f.pauses(), f.resumes()};
+        });
+    };
+    const auto before = flow();
+
+    t.node().holdSecurityApplyForTest(true);
+    auto ddl = t.grantAsync(writer, SO::Write, ST::Topic, "secret");
+    ASSERT_TRUE(t.gatewayBehind(true));
+    ASSERT_TRUE(ac.pollFor(10s, [&] { return flow().first > before.first; })) << "the held event's frame was held";
+    const auto held = flow();
+    // Many control passes while behind (each refused request is a round trip through the control thread).
+    for (int i = 0; i < 40; ++i) EXPECT_EQ(t.r.produce(ws, t.r.orders), kUnavailable) << i;
+    const auto after = flow();
+    EXPECT_LE(after.first - held.first, 1u) << "the held read was resumed and re-held " << (after.first - held.first)
+                                             << " times while the broker stayed behind (a busy loop)";
+    EXPECT_LE(after.second - held.second, 1u) << "resumed while still behind";
+    EXPECT_EQ(t.node().securityViewForTest().appliedOffset, applied) << "the hold held";
+
+    t.node().holdSecurityApplyForTest(false);
+    ASSERT_EQ(Behind::await(ddl), 0);
+    ASSERT_TRUE(t.gatewayBehind(false));
+    EXPECT_TRUE(ac.pollFor(10s, [&] { return newestPushed() > applied; })) << "after the apply the read delivers the event";
+}
+
+// PR #605 review (adversarial, halt): a HALTED applier never applies again (D28), so the broker is behind for good - the
+// flag is set on its halt and never clears, whatever follows (more security DDL, more passes); a producer's session is
+// ended retriably by the halt (D28) and nothing it sends after is appended.
+TEST(AuthSecurityBehindRegression, AHaltedApplierStaysBehindForGoodAdversarialRegression) {
+    Behind t("behindhalt");
+    std::string writer;
+    const int64_t ws = t.r.newUser({exact(SO::Write, ST::Topic, "orders")}, &writer);
+    ASSERT_EQ(t.r.produce(ws, t.r.orders, /*untilOk=*/true), 0);
+    BrokerNode& n = t.node();
+    n.onAdminThreadForTest([&n]() {
+        n.adminWorkerAgentForTest()->worker().securityApplierForTest()->tamperNextFingerprintForTest();
+        return 0;
+    });
+    auto ddl = t.grantAsync(writer, SO::Write, ST::Topic, "secret");
+    ASSERT_TRUE(t.r.c().pollFor(20s, [&] { return n.adminSecurityBehindForTest().behind; })) << "the halt sets it";
+    EXPECT_NE(Behind::await(ddl), 0) << "a halted apply never claims enforcement";
+    ASSERT_TRUE(t.gatewayBehind(true));
+    const int64_t leo = t.r.logEnd(t.r.orders);
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_NE(t.r.produce(ws, t.r.orders), 0) << "routed, halted, attempt " << i;
+        EXPECT_NE(t.shardProduce(ws, t.r.orders), 0) << "worker, halted, attempt " << i;
+    }
+    auto more = t.grantAsync(writer, SO::Write, ST::Topic, "other");
+    (void)Behind::await(more);
+    EXPECT_TRUE(n.adminSecurityBehindForTest().behind) << "a halted applier never reads as caught up";
+    EXPECT_TRUE(n.securityBehindForTest().gateway);
+    EXPECT_EQ(n.adminSecurityBehindForTest().edges, 1u) << "set once, never cleared";
+    EXPECT_EQ(t.r.logEnd(t.r.orders), leo) << "nothing appended after the halt";
 }

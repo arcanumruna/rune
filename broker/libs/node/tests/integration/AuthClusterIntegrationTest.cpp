@@ -1633,3 +1633,273 @@ TEST(AuthClusterRegression, TheBehindRuleAcrossRolesChangesAndOperationsMatrixRe
         }
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Adversarial review of PR #605 (issue #603, the behind rule): try to make a broker serve a grant around a committed
+// `__security` event it holds - across a leader crash, a restart, a long hold under live subscriptions - and try to make
+// the rule refuse an authorized client in ordinary operation (liveness).
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+/// The partition of `led` that broker `node` leads now (from node 1's metadata as the builder), or nullopt.
+std::optional<PartitionInfo> ledBy(AuthTrio& t, const std::vector<AuthTrio::Session>& bs, int32_t topic, int node) {
+    for (const auto& s : bs) {
+        if (s.node == node) continue;   // ask a broker that is not the one being restarted / crashed
+        try {
+            for (const PartitionInfo& pi : s.w->raw().metadata(t.channel(s.node), AuthWireClient::kClientStream, s.sid))
+                if (pi.topicId == topic && pi.leaderId == node && !pi.ingressEndpoint.empty()) return pi;
+        } catch (...) {}
+    }
+    return std::nullopt;
+}
+}  // namespace
+
+// Liveness: ordinary security DDL churn (a user and a grant created per round, answered OK by the leader once IT
+// enforced it) while an authorized user produces on all three brokers between rounds - routed and straight to the
+// worker ingress.  The behind rule must not turn ordinary replication into refusals: the leader never flips; a
+// follower flips only for the replication lag of an event, so every produce is served (any 48 is retried and served
+// within a bound - the producer retries 48 since this review) and the totals are reported.
+TEST(AuthClusterRegression, BehindAdversarialSecurityDdlChurnNeverStarvesAnAuthorizedProducerRegression) {
+    AuthTrio t("lagchurn");
+    t.start();
+    t.bootstrapAdmin();
+    createBuilder(t);
+    t.createUser(1, "churnw");
+    t.grant(1, "churnw", SO::Write, ST::Topic, SP::Prefix, "lag.");
+    const std::vector<AuthTrio::Session> bs = sessionsOnEveryBroker(t, "builder");
+    ASSERT_EQ(bs.size(), 3u);
+    const LedTopic led = defineLedTopic(t, bs, "lag.c");
+    ASSERT_GE(led.id, 0);
+    ASSERT_TRUE(led.part[0] >= 0 && led.part[1] >= 0 && led.part[2] >= 0);
+    const int32_t secLeader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(secLeader, 0);
+    ASSERT_TRUE(t.awaitDigestsAgree(0, 30s));
+    UserSessions u;
+    u.name = "churnw";
+    u.w = &t.wire();
+    std::array<PartitionInfo, 3> ingress{};
+    for (int node : {1, 2, 3}) {
+        ASSERT_TRUE(AuthTrio::until(30s, [&] {
+            try { u.sid[static_cast<std::size_t>(node - 1)] = t.login(node, "churnw").sid; return true; } catch (...) { return false; }
+        }));
+        ASSERT_TRUE(AuthTrio::until(30s, [&] {
+            const auto pi = ledBy(t, bs, led.id, node);
+            if (pi && pi->partition == led.part[static_cast<std::size_t>(node - 1)]) { ingress[static_cast<std::size_t>(node - 1)] = *pi; return true; }
+            return false;
+        }));
+        const int32_t part = led.part[static_cast<std::size_t>(node - 1)];
+        ASSERT_TRUE(AuthTrio::until(30s, [&] { return gatewayProduce(t, u, node, led.id, part) == 0; }));
+        ASSERT_TRUE(AuthTrio::until(30s, [&] { return shardProduce(u, node, ingress[static_cast<std::size_t>(node - 1)], led.id) == 0; }));
+    }
+    std::array<uint64_t, 3> edges0{};
+    for (int node : {1, 2, 3}) edges0[static_cast<std::size_t>(node - 1)] = t.node(node).adminSecurityBehindForTest().edges;
+    int answered48 = 0, other = 0;
+    constexpr int kRounds = 20;
+    for (int round = 0; round < kRounds; ++round) {
+        const std::string user = "churn" + std::to_string(round);
+        t.createUser(secLeader, user);
+        t.grant(secLeader, user, SO::Read, ST::Topic, SP::Prefix, "lag.");
+        for (int node : {1, 2, 3}) {
+            const int32_t part = led.part[static_cast<std::size_t>(node - 1)];
+            for (const bool viaWorker : {false, true}) {
+                int code = viaWorker ? shardProduce(u, node, ingress[static_cast<std::size_t>(node - 1)], led.id)
+                                     : gatewayProduce(t, u, node, led.id, part);
+                for (int retry = 0; code == kAuthUnavailable && retry < 200; ++retry) {   // the client's retry, bounded
+                    ++answered48;
+                    code = viaWorker ? shardProduce(u, node, ingress[static_cast<std::size_t>(node - 1)], led.id)
+                                     : gatewayProduce(t, u, node, led.id, part);
+                }
+                if (code != 0) ++other;
+                EXPECT_EQ(code, 0) << "round " << round << " node " << node << (viaWorker ? " worker" : " routed")
+                                   << ": an authorized produce was not served";
+            }
+        }
+    }
+    std::string report;
+    for (int node : {1, 2, 3}) {
+        const auto e = t.node(node).adminSecurityBehindForTest().edges - edges0[static_cast<std::size_t>(node - 1)];
+        report += " node " + std::to_string(node) + (node == secLeader ? " (leader)" : "") + ": " + std::to_string(e) + " edges";
+        if (node == secLeader) EXPECT_EQ(e, 0u) << "the leader applies every event in the pass it commits";
+    }
+    std::cout << "[churn] " << kRounds << " rounds x 2 DDL; 48 answers seen (retried): " << answered48 << ";" << report << "\n";
+    EXPECT_EQ(other, 0);
+}
+
+// Leader change: a follower F stuck behind a committed REVOKE while the `__security` leader CRASHES.  The new leader's
+// HW restarts from its own view and F's follower HW reads 0 until it answers - the highest HW F has seen is kept, so
+// F stays behind (48, nothing appended) through the failover, and once released it applies the REVOKE and CLEARS
+// (never stuck behind a HW from the dead leadership): then the revoke decides (45).
+TEST(AuthClusterRegression, BehindAdversarialSecurityLeaderCrashWhileAFollowerIsBehindRegression) {
+    AuthTrio t("lagcrash");
+    LaggingFollower s;
+    lagFollowerAndRevoke(t, s);
+    if (HasFatalFailure()) return;
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return t.node(s.f).securityBehindForTest().gateway; }));
+    const int64_t leo = partitionLeo(&t.node(s.f), s.led.id, s.part);
+    t.node(s.secLeader).crashForTest();
+    t.stopNode(s.secLeader);
+    ASSERT_TRUE(AuthTrio::until(60s, [&] { const int32_t l = settledSecurityLeader(t.cluster()); return l > 0 && l != s.secLeader; }))
+        << "a new __security leader";
+    const int32_t newLeader = settledSecurityLeader(t.cluster());
+    SCOPED_TRACE("new __security leader " + std::to_string(newLeader) + (newLeader == s.f ? " (F itself)" : ""));
+    EXPECT_TRUE(t.node(s.f).securityBehindForTest().gateway) << "F still holds the unapplied REVOKE";
+    for (int i = 0; i < 3; ++i) {
+        const int routed = gatewayProduce(t, s.u, s.f, s.led.id, s.part);
+        EXPECT_TRUE(routed == kAuthUnavailable || routed == 45) << "routed, after the failover, answer " << routed;
+        const int direct = shardProduce(s.u, s.f, s.ingress, s.led.id);
+        EXPECT_TRUE(direct == kAuthUnavailable || direct == 45) << "worker, after the failover, answer " << direct;
+    }
+    EXPECT_EQ(partitionLeo(&t.node(s.f), s.led.id, s.part), leo) << "F appended under the revoked grant";
+    t.node(s.f).holdSecurityApplyForTest(false);
+    ASSERT_TRUE(AuthTrio::until(60s, [&] { return !t.node(s.f).securityBehindForTest().gateway; }))
+        << "F cleared after the failover (admin behind " << t.node(s.f).adminSecurityBehindForTest().behind << ")";
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return !t.node(s.f).securityBehindForTest().workers; }));
+    EXPECT_EQ(gatewayProduce(t, s.u, s.f, s.led.id, s.part), 45) << "then the revoke answers (routed)";
+    EXPECT_EQ(shardProduce(s.u, s.f, s.ingress, s.led.id), 45) << "then the revoke answers (worker ingress)";
+    EXPECT_EQ(partitionLeo(&t.node(s.f), s.led.id, s.part), leo);
+}
+
+// Restart: F, stuck behind a committed REVOKE, restarts over the same dir (its log holds the REVOKE, its view applied
+// none of it).  From its first login on, nothing anywhere serves the revoked WRITE: every produce of the user, on every
+// broker, routed and to the worker ingress, answers 45 or 48 - never OK - and nothing is appended.
+TEST(AuthClusterRegression, BehindAdversarialAFollowerRestartedBehindARevokeNeverServesTheOldGrantRegression) {
+    AuthTrio t("lagrestart");
+    LaggingFollower s;
+    lagFollowerAndRevoke(t, s);
+    if (HasFatalFailure()) return;
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return t.node(s.f).securityBehindForTest().gateway; }));
+    std::array<int64_t, 3> leo{};
+    for (int node : {1, 2, 3})
+        leo[static_cast<std::size_t>(node - 1)] = partitionLeo(&t.node(node), s.led.id, s.led.part[static_cast<std::size_t>(node - 1)]);
+    t.restart(s.f, t.keyContentsPath(s.f));   // the hold is a runtime seam: the restarted F applies freely
+    const std::vector<AuthTrio::Session> bs = sessionsOnEveryBroker(t, "builder");
+    ASSERT_EQ(bs.size(), 3u);
+    ASSERT_TRUE(AuthTrio::until(60s, [&] {
+        try { s.u.sid[static_cast<std::size_t>(s.f - 1)] = t.login(s.f, "lagw").sid; return true; } catch (...) { return false; }
+    })) << "the user logs in on the restarted F";
+    int served = 0, revoked = 0;
+    for (int node : {1, 2, 3}) {
+        SCOPED_TRACE("node " + std::to_string(node));
+        if (node != s.f)
+            ASSERT_TRUE(AuthTrio::until(30s, [&] {
+                try { s.u.sid[static_cast<std::size_t>(node - 1)] = t.login(node, "lagw").sid; return true; } catch (...) { return false; }
+            }));
+        // Every partition this broker leads now (the restart may have moved some).
+        for (const PartitionInfo& pi : bs[0].w->raw().metadata(t.channel(bs[0].node), AuthWireClient::kClientStream, bs[0].sid)) {
+            if (pi.topicId != s.led.id || pi.leaderId != node) continue;
+            for (int i = 0; i < 3; ++i) {
+                const int routed = gatewayProduce(t, s.u, node, s.led.id, pi.partition);
+                const int direct = pi.ingressEndpoint.empty() ? 45 : shardProduce(s.u, node, pi, s.led.id);
+                for (const int code : {routed, direct}) {
+                    if (code == 0) ++served;
+                    if (code == 45) ++revoked;
+                    EXPECT_NE(code, 0) << "partition " << pi.partition << ": the revoked WRITE was served";
+                }
+            }
+        }
+    }
+    EXPECT_EQ(served, 0);
+    EXPECT_GT(revoked, 0) << "the revoke decides once applied";
+    for (int node : {1, 2, 3}) {
+        const int32_t part = s.led.part[static_cast<std::size_t>(node - 1)];
+        EXPECT_LE(partitionLeo(&t.node(node), s.led.id, part), leo[static_cast<std::size_t>(node - 1)])
+            << "partition " << part << " grew under the revoked grant";
+    }
+}
+
+// Subscriptions living through a long hold: two users subscribed on F to the partition F leads - "keep" (its grants
+// unchanged) and "cut" (its READ revoked while F is held).  F is held behind until it goes Stale (well past F, short of
+// R), every produce on it answers 48 and nothing is appended.  Released: keep's subscription is still live and receives
+// every record exactly once, in order (no loss, no duplicate across the pause); cut's subscription is ended with 45 and
+// receives nothing produced after the revoke committed.
+TEST(AuthClusterRegression, BehindAdversarialSubscriptionsLiveThroughALongHoldWithoutLossOrDuplicateRegression) {
+    AuthTrio t("lagsubs");
+    t.start();
+    t.bootstrapAdmin();
+    createBuilder(t);
+    for (const char* user : {"keep", "cut"}) {
+        t.createUser(1, user);
+        t.grant(1, user, SO::Write, ST::Topic, SP::Prefix, "lag.");
+        t.grant(1, user, SO::Read, ST::Topic, SP::Prefix, "lag.");
+    }
+    const std::vector<AuthTrio::Session> bs = sessionsOnEveryBroker(t, "builder");
+    ASSERT_EQ(bs.size(), 3u);
+    const LedTopic led = defineLedTopic(t, bs, "lag.s");
+    ASSERT_GE(led.id, 0);
+    ASSERT_TRUE(led.part[0] >= 0 && led.part[1] >= 0 && led.part[2] >= 0);
+    const int32_t secLeader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(secLeader, 0);
+    const int f = secLeader == 3 ? 2 : 3;
+    const int32_t part = led.part[static_cast<std::size_t>(f - 1)];
+    ASSERT_TRUE(t.awaitDigestsAgree(0, 30s));
+    AuthWireClient keepWire(t.cluster().clientsDir->path / "keep_wire");
+    AuthWireClient cutWire(t.cluster().clientsDir->path / "cut_wire");
+    UserSessions keep, cut;
+    keep.name = "keep"; keep.w = &keepWire;
+    cut.name = "cut"; cut.w = &cutWire;
+    for (UserSessions* us : {&keep, &cut})
+        ASSERT_TRUE(AuthTrio::until(30s, [&] {
+            try { us->sid[static_cast<std::size_t>(f - 1)] = t.loginOn(*us->w, f, us->name).sid; return true; } catch (...) { return false; }
+        }));
+    keepWire.raw().keepSessionsAlive(true);
+    cutWire.raw().keepSessionsAlive(true);
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return gatewayProduce(t, keep, f, led.id, part) == 0; }));
+    const int64_t start = partitionLeo(&t.node(f), led.id, part);   // the subscriptions start here
+    auto subscribe = [&](UserSessions& us) -> int64_t {
+        auto& c = us.w->raw();
+        const int64_t corr = c.subscribeIsolated(t.channel(f), AuthWireClient::kClientStream, us.sid[static_cast<std::size_t>(f - 1)],
+                                                 led.id, part, start, /*read_uncommitted*/ 0);
+        const auto code = c.awaitSubscribeCode(corr, Clock3::now() + 10s);
+        return code && *code == 0 ? corr : -1;
+    };
+    const int64_t keepCorr = subscribe(keep), cutCorr = subscribe(cut);
+    ASSERT_GT(keepCorr, 0);
+    ASSERT_GT(cutCorr, 0);
+    const auto keepSub = keepWire.raw().subscriptionIdOf(keepCorr), cutSub = cutWire.raw().subscriptionIdOf(cutCorr);
+    ASSERT_TRUE(keepSub && cutSub);
+    // The offsets one subscription received (every record of every pushed batch).
+    auto offsets = [](ShardTestClient& c, int64_t sub) {
+        std::vector<int64_t> out;
+        for (const auto& p : c.records()) {
+            if (p.subscriptionId != sub) continue;
+            std::size_t pos = 0;
+            while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= p.bytes.size()) {
+                rune::protocol::RecordBatchReader r(p.bytes.data() + pos, p.bytes.size() - pos);
+                if (!r.ensureValid()) break;
+                for (int64_t o = r.baseOffset(); o <= r.baseOffset() + r.lastOffsetDelta(); ++o) out.push_back(o);
+                pos += static_cast<std::size_t>(r.totalLength());
+            }
+        }
+        return out;
+    };
+    for (int i = 0; i < 5; ++i) ASSERT_EQ(gatewayProduce(t, keep, f, led.id, part), 0);
+    ASSERT_TRUE(keepWire.raw().pollFor(10s, [&] { return offsets(keepWire.raw(), *keepSub).size() >= 5; }));
+    ASSERT_TRUE(cutWire.raw().pollFor(10s, [&] { return offsets(cutWire.raw(), *cutSub).size() >= 5; }));
+
+    t.node(f).holdSecurityApplyForTest(true);
+    const auto ok = t.revoke(secLeader, "cut", SO::Read, ST::Topic, SP::Prefix, "lag.");
+    ASSERT_EQ(ok.errorCode, 0) << ok.detail;
+    const int64_t revokedAt = partitionLeo(&t.node(f), led.id, part);
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return t.node(f).securityBehindForTest().gateway; }));
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return t.node(f).securityServingForTest() == "Stale"; }))
+        << "the hold lasts past F (short of R: the sessions live on)";
+    for (int i = 0; i < 5; ++i) EXPECT_EQ(gatewayProduce(t, keep, f, led.id, part), kAuthUnavailable) << "held, attempt " << i;
+    EXPECT_EQ(partitionLeo(&t.node(f), led.id, part), revokedAt) << "nothing appended while behind";
+    t.node(f).holdSecurityApplyForTest(false);
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return !t.node(f).securityBehindForTest().workers; }));
+
+    for (int i = 0; i < 5; ++i)
+        ASSERT_TRUE(AuthTrio::until(10s, [&] { return gatewayProduce(t, keep, f, led.id, part) == 0; })) << "keep, after, " << i;
+    const int64_t end = partitionLeo(&t.node(f), led.id, part);
+    ASSERT_TRUE(keepWire.raw().pollFor(10s, [&] { return static_cast<int64_t>(offsets(keepWire.raw(), *keepSub).size()) >= end - start; }))
+        << "keep's subscription lived through the hold";
+    const std::vector<int64_t> got = offsets(keepWire.raw(), *keepSub);
+    ASSERT_EQ(static_cast<int64_t>(got.size()), end - start) << "loss or duplicate across the pause";
+    for (std::size_t i = 0; i < got.size(); ++i) EXPECT_EQ(got[i], start + static_cast<int64_t>(i)) << "out of order / gap at " << i;
+    bool cutEnded = false;
+    cutWire.raw().pollFor(10s, [&] {
+        for (const auto& e : cutWire.raw().errors()) if (e.correlationId == cutCorr && e.code == 45) cutEnded = true;
+        return cutEnded;
+    });
+    EXPECT_TRUE(cutEnded) << "cut's subscription is ended with 45 once F applied the revoke";
+    for (const int64_t o : offsets(cutWire.raw(), *cutSub)) EXPECT_LT(o, revokedAt) << "cut received a record produced after its revoke";
+}
