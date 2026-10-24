@@ -1427,19 +1427,32 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
 // The evicted registration must be released: attempt a final
 // findExclusivePublication — see handleConnect.
 // ---------------------------------------------------------------------------
-void ClientGateway::evictOldestPendingConnect_()
+void ClientGateway::evictOldestPendingConnect_(std::string_view incomingHost)
 {
-    spdlog::warn("ClientGateway: pending-connect cap reached; dropping oldest entry");
-    const int64_t evictedRegId      = pendingConnects_.front().registrationId;
-    // DR-BUG-2 FIX: if the oldest entry has a stashed resolvedPub, the
-    // shared_ptr destructor (run by pop_front()) is sufficient to release the
+    // PR #611 review (issue #236's lockout through the pending table): the victim is the OLDEST entry of the source
+    // host holding the most entries, counting the incoming Connect for its host - so a host flooding Connects only
+    // ever evicts its own, and another host's pending Connect is evicted only when every host holds as many.  Hosts
+    // are known under GatewayAuthMode::Required only; otherwise every entry has the same (empty) host and this is the
+    // plain oldest-first eviction.  O(kMaxPendingConnects^2) string compares, no allocation: cold (one Connect).
+    auto victim = pendingConnects_.begin();
+    std::size_t most = 0;
+    for (auto it = pendingConnects_.begin(); it != pendingConnects_.end(); ++it) {
+        std::size_t n = it->sourceHost == incomingHost ? 1 : 0;
+        for (const PendingConnect& p : pendingConnects_) n += p.sourceHost == it->sourceHost ? 1 : 0;
+        if (n > most) { most = n; victim = it; }   // strict: the oldest entry of the largest host wins a tie
+    }
+    spdlog::warn("ClientGateway: pending-connect cap reached; dropping the oldest entry of the busiest source host");
+    PendingConnect& ev0 = *victim;
+    const int64_t evictedRegId      = ev0.registrationId;
+    // DR-BUG-2 FIX: if the evicted entry has a stashed resolvedPub, the
+    // shared_ptr destructor (run by erase()) is sufficient to release the
     // registration.  Do NOT call findExclusivePublication again — that would
     // touch a conductor entry that is already being released, and if it
     // returns nullptr we would push a stale regId to drainingRegistrations_
     // that never drains.  Only push to drain when resolvedPub==nullptr (pub
     // not yet resolved — the conductor still holds it in AWAITING state).
-    const bool evictedAlreadyResolved = (pendingConnects_.front().resolvedPub != nullptr) ||
-                                        pendingConnects_.front().awaitingResolve;   // nothing registered
+    const bool evictedAlreadyResolved = (ev0.resolvedPub != nullptr) ||
+                                        ev0.awaitingResolve;   // nothing registered
     // Fix round 3 (fix-on-sight): an evicted connect whose reply publication is
     // resolved is ANSWERED (ConnectResponse{Internal}, no session) — one offer:
     // the eviction exists to bound this table, so it is not retried (counted).
@@ -1447,7 +1460,7 @@ void ClientGateway::evictOldestPendingConnect_()
     // Handshaking ignores a ConnectResponse; it gets HandshakeContinueResponse:
     // the owed HandshakeFailed for a failing handshake, Internal (retriable)
     // for one still in progress.
-    if (const auto& ev = pendingConnects_.front(); ev.resolvedPub) {
+    if (const auto& ev = ev0; ev.resolvedPub) {
         std::size_t n = 0;
         if (ev.failingHandshake || ev.awaitingHandshake) {
             pc::HandshakeContinueResponse hr;
@@ -1469,10 +1482,10 @@ void ClientGateway::evictOldestPendingConnect_()
     }
     // Fix round 1 (I2): an evicted entry whose announcement began holds
     // worker ack-table slots — close it on every worker (never leaked).
-    closeDroppedPendingConnect_(pendingConnects_.front());
-    pendingConnects_.pop_front(); // O(1); drops resolvedPub shared_ptr if non-null
+    closeDroppedPendingConnect_(ev0);
+    pendingConnects_.erase(victim);   // drops resolvedPub shared_ptr if non-null
     if (!evictedAlreadyResolved && aeron_) abandonRegistration_(evictedRegId);
-    // If evictedAlreadyResolved: the drop of resolvedPub in pop_front() already
+    // If evictedAlreadyResolved: the drop of resolvedPub in erase() already
     // releases the registration — no findExclusivePublication needed, no drain entry.
 }
 
@@ -2121,7 +2134,11 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // ~ExclusivePublication()); if it throws (ERRORED), conductor already cleaned
     // up; if still AWAITING (nullptr returned), enqueue in drainingRegistrations_
     // and keep polling until it resolves.
-    if (pendingConnects_.size() >= kMaxPendingConnects) evictOldestPendingConnect_();
+    // D14: the source host (the throttle key and, issue #236, the unauthenticated-session cap's and the pending
+    // table's fairness key) - known under GatewayAuthMode::Required only (cold: one Connect).
+    std::string connectHost;
+    if (authMode_ == rune::gateway::GatewayAuthMode::Required) connectHost = sourceHostOf_(req.egressChannel);
+    if (pendingConnects_.size() >= kMaxPendingConnects) evictOldestPendingConnect_(connectHost);
 
     // Pre-allocate sessionId now so it is stable across cycles.
     const int64_t sessionId = sessions_.nextSessionId();
@@ -2135,12 +2152,12 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     pc_entry.egressChannel         = std::string(req.egressChannel);
     pc_entry.egressStreamId        = req.egressStreamId;
     pc_entry.clientVersion         = req.clientVersion;   // D6
+    pc_entry.sourceHost            = std::move(connectHost);   // every entry: the eviction's fairness key
     if (channelTooLongForShard) [[unlikely]]
         pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::InvalidRequest);
     if (refusedForVersion) [[unlikely]]
         pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::ProtocolVersion);   // wins over any other refusal
     if (authMode_ == rune::gateway::GatewayAuthMode::Required && pc_entry.refuseCode == 0) {
-        pc_entry.sourceHost = sourceHostOf_(pc_entry.egressChannel);   // D14: the throttle key (cold: one Connect)
         // Issue #236: an unauthenticated session holds its slot until the auth deadline; one source host may hold at
         // most maxUnauthPerHost_ of them (so it can never fill kShardMaxSessions).  A session that logged in, was
         // reaped or closed no longer counts.  A redirect creates no session here and is never refused.
@@ -4560,8 +4577,8 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
             pend.requestedAtNs = nowNs_;
         } catch (...) {
             spdlog::warn("ClientGateway: record-egress pub create threw for session {} "
-                         "worker {} (channel '{}'); Subscribe {}",
-                         sessionId, wid, sess->egressChannel,
+                         "worker {} (channel {}); Subscribe {}",
+                         sessionId, wid, LogSafeName{sess->egressChannel},
                          authRequired ? "retired (no shared-egress fallback under authentication)" : "uses MDC fallback");
             if (authRequired) [[unlikely]] {   // issue #118: answered on the next pass, after the OK
                 pend.regId = -1;
@@ -9572,7 +9589,7 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
     if (proof != BootstrapProof::Ok) {
         ++bootstrapsRefused_;
         if (unauthLog_.due(3)) [[unlikely]]   // X103: an unauthenticated session drives this
-            spdlog::warn("security: bootstrap refused from {}: bad cluster-key proof{}", session->egressChannel,
+            spdlog::warn("security: bootstrap refused from {}: bad cluster-key proof{}", LogSafeName{session->egressChannel},
                          proof == BootstrapProof::NoKey ? " (this broker holds no cluster key: authentication is not enabled)" : "");
         pc::DdlResponse r;
         r.sessionId     = m.sessionId;

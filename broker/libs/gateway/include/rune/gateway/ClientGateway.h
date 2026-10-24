@@ -2117,7 +2117,7 @@ private:
     void*               peerDropCtx_ = nullptr;
     void sendSessionExpired_(aeron::ExclusivePublication* pub, Session* session, int64_t sid);
     /// Evict the oldest pending connect (the kMaxPendingConnects cap).
-    void evictOldestPendingConnect_();
+    void evictOldestPendingConnect_(std::string_view incomingHost = {});
     /// Encode an ErrorResponse{code} into scratch_ and send it reliably.
     void sendErrorResponse_(Session& session, int64_t sessionId, int64_t correlationId,
                             rune::protocol::client::ErrorCode code);

@@ -67,6 +67,12 @@ inline constexpr uint64_t kAdminLogs                 = 2;
 /// one topic's term (0 for a view sink - it owns no log).  estimateFdNeed = fdNeedBase() + sum of fdNeedOfTopic.
 [[nodiscard]] uint64_t fdNeedBase() noexcept;
 [[nodiscard]] uint64_t fdNeedOfTopic(const TopicSpec& t, uint64_t readySegmentsPerPartition) noexcept;
+/// PR #611 review: every term and sum SATURATES at UINT64_MAX.  retention.bytes may be up to INT64_MAX and
+/// segment.bytes as small as 1, so a wrapping product would turn an astronomic need into a small one (and admit it).
+[[nodiscard]] constexpr uint64_t fdNeedAdd(uint64_t a, uint64_t b) noexcept { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+[[nodiscard]] constexpr uint64_t fdNeedMul(uint64_t a, uint64_t b) noexcept {
+    return a != 0 && b > UINT64_MAX / a ? UINT64_MAX : a * b;
+}
 
 enum class FdLimitVerdict : uint8_t { Ok, Warn, Refuse };
 struct FdLimitDecision {

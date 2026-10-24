@@ -839,21 +839,30 @@ std::optional<std::string> AdminWorker::fdBudgetRefusal_(const cat::CatalogEvent
     const auto* alter = std::get_if<cat::AlterTopicConfigOps>(&e.ops);
     if (!create && alter == nullptr) return std::nullopt;   // views own no log; drops only lower the need
     const uint64_t ready = deps_.readySegmentsPerPartition;
-    uint64_t before = fdNeedBase();
-    for (const cat::TopicObject* t : s.topics()) before += fdNeedOfTopic(fdSpecOf(t->partitions, t->config), ready);
-    uint64_t after = before;
+    // PR #611 review: the terms saturate (FdBudget.h), so "does it grow" compares the DDL's own term, never a
+    // difference of (possibly saturated) sums.
+    const cat::TopicObject* altered = nullptr;
+    uint64_t oldTerm = 0, newTerm = 0;
     if (create) {
         const auto& o = std::get<cat::CreateTopicOps>(e.ops);
-        after += fdNeedOfTopic(fdSpecOf(o.partitions, o.config), ready);
+        newTerm = fdNeedOfTopic(fdSpecOf(o.partitions, o.config), ready);
     } else {
-        const cat::TopicObject* t = s.topicByName(e.objectName);
-        if (t == nullptr) return std::nullopt;   // the dry run already refused it
-        rune::protocol::TopicConfig next = t->config;
+        altered = s.topicByName(e.objectName);
+        if (altered == nullptr) return std::nullopt;   // the dry run already refused it
+        rune::protocol::TopicConfig next = altered->config;
         cat::applyConfigChanges(next, *alter);   // the resulting config (the apply's own rule)
-        after = after - fdNeedOfTopic(fdSpecOf(t->partitions, t->config), ready) +
-                fdNeedOfTopic(fdSpecOf(t->partitions, next), ready);
+        oldTerm = fdNeedOfTopic(fdSpecOf(altered->partitions, altered->config), ready);
+        newTerm = fdNeedOfTopic(fdSpecOf(altered->partitions, next), ready);
     }
-    if (after <= deps_.fdLimit || after <= before) return std::nullopt;
+    if (newTerm <= oldTerm) return std::nullopt;   // the need does not grow: admitted even while over budget
+    uint64_t before = fdNeedBase(), after = fdNeedBase();
+    for (const cat::TopicObject* t : s.topics()) {
+        const uint64_t term = fdNeedOfTopic(fdSpecOf(t->partitions, t->config), ready);
+        before = fdNeedAdd(before, term);
+        after = fdNeedAdd(after, t == altered ? newTerm : term);
+    }
+    if (create) after = fdNeedAdd(after, newTerm);
+    if (after <= deps_.fdLimit) return std::nullopt;
     return std::string(create ? "CREATE TOPIC" : "ALTER TOPIC") + " would raise this broker's estimated open-file need to " +
            std::to_string(after) + ", above its open-file limit " + std::to_string(deps_.fdLimit) + " (now " +
            std::to_string(before) + "); raise LimitNOFILE / --ulimit nofile, or use fewer partitions, a larger "

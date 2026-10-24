@@ -533,3 +533,22 @@ TEST(SecurityBootstrapRegression, AValidBootstrapOnACatchingUpBrokerIsNeverForwa
     rig.gw.applyClientFrameForTest(good.bytes.data(), good.bytes.size());
     EXPECT_EQ(rig.admin.bootstraps, 1) << "current again: forwarded";
 }
+
+// PR #611 review, adversarial pass (issue #232, sibling entry point): a refused bootstrap is driven by an
+// UNAUTHENTICATED session and logs where it came from - the session's client-supplied egress channel.  A `\n` in that
+// channel must never forge a log line.
+TEST(SecurityBootstrapRegression, ABootstrapFromAChannelWithControlBytesIsLoggedEscapedAdversarialRegression) {
+    Rig rig;
+    rig.gw.setClusterKeys(keysFor(kA));
+    const int64_t sid = rig.gw.injectTestSessionOnChannel("aeron:udp?endpoint=h:1\nauth: login ok user=admin");
+    const BootFrame f(sid, 7, kC);
+    rig.gw.applyDdlFrameForTest(f.bytes.data(), f.bytes.size());
+    ASSERT_EQ(rig.gw.bootstrapsRefused(), 1u);
+    bool sawLine = false;
+    for (std::string l : rig.logSink->last_formatted()) {
+        while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+        EXPECT_EQ(l.find('\n'), std::string::npos) << "a raw newline in a log line: " << l;
+        if (l.find("bootstrap refused from aeron:udp?endpoint=h:1\\x0aauth:\\x20login") != std::string::npos) sawLine = true;
+    }
+    EXPECT_TRUE(sawLine) << "the channel is logged escaped";
+}

@@ -11,7 +11,7 @@ namespace rune::node {
 
 namespace {
 uint64_t fdsPerPartition(uint64_t openSegments) noexcept {
-    return openSegments * kFdsPerSegment + kE1dFdsPerLog;
+    return fdNeedAdd(fdNeedMul(openSegments, kFdsPerSegment), kE1dFdsPerLog);
 }
 uint64_t openSegmentsFor(const TopicSpec& t) noexcept {
     if (t.retentionBytes <= 0 || t.segmentRollBytes <= 0) return kDefaultOpenSegments;
@@ -28,12 +28,12 @@ uint64_t fdNeedBase() noexcept {
 uint64_t fdNeedOfTopic(const TopicSpec& t, uint64_t readySegmentsPerPartition) noexcept {
     if (t.viewSink) return 0;   // VLS B.2: a sink owns no log
     const uint64_t parts = t.partitionCount > 0 ? static_cast<uint64_t>(t.partitionCount) : 0;
-    return parts * (fdsPerPartition(openSegmentsFor(t)) + readySegmentsPerPartition * kFdsPerSegment);
+    return fdNeedMul(parts, fdNeedAdd(fdsPerPartition(openSegmentsFor(t)), fdNeedMul(readySegmentsPerPartition, kFdsPerSegment)));
 }
 
 uint64_t estimateFdNeed(std::span<const TopicSpec> topics, uint64_t readySegmentsPerPartition) noexcept {
     uint64_t need = fdNeedBase();
-    for (const auto& t : topics) need += fdNeedOfTopic(t, readySegmentsPerPartition);
+    for (const auto& t : topics) need = fdNeedAdd(need, fdNeedOfTopic(t, readySegmentsPerPartition));
     return need;
 }
 
@@ -42,7 +42,8 @@ FdLimitDecision decideFdLimit(uint64_t soft, uint64_t hard, bool unlimited, uint
     if (unlimited) {
         // NOFILE cannot be set to infinity (kernel nr_open / maxfilesperproc):
         // raise soft to comfortably cover the need instead.
-        d.targetSoft = soft > 2 * need ? soft : 2 * need;
+        const uint64_t twice = fdNeedMul(need, 2);
+        d.targetSoft = soft > twice ? soft : twice;
         d.verdict = FdLimitVerdict::Ok;
         d.message = "RLIMIT_NOFILE soft " + std::to_string(soft) + " -> " + std::to_string(d.targetSoft) +
                     ", hard unlimited; estimated need " + std::to_string(need);
@@ -60,7 +61,7 @@ FdLimitDecision decideFdLimit(uint64_t soft, uint64_t hard, bool unlimited, uint
                     "refusing to start (a roll / recovery would fail with EMFILE and halt the broker). "
                     "Raise it: systemd LimitNOFILE=1048576, docker --ulimit nofile=1048576:1048576, "
                     "or ulimit -Hn.";
-    } else if (hard < need + need / 4) {
+    } else if (hard < fdNeedAdd(need, need / 4)) {
         d.verdict = FdLimitVerdict::Warn;
         d.message = values + ": the hard open-file limit is within 25% of the estimated need — "
                     "raise LimitNOFILE / --ulimit nofile before adding partitions.";

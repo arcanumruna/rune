@@ -655,3 +655,85 @@ TEST(AdminWorkerRegression, AnUnknownFdLimitNeverRefusesRegression) {
     EXPECT_EQ(rig.alterConfig("huge", {{rc::ConfigKey::RetentionBytes, 1LL << 40}}).code, 0);
     EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 0u);
 }
+
+// ── PR #611 review, adversarial pass (issue #296: DDL admission against the open-file budget) ──────────────────────
+namespace {
+uint64_t needOfOne(int32_t partitions, int64_t segmentBytes, int64_t retentionBytes) {
+    TopicSpec t;
+    t.partitionCount = partitions;
+    t.segmentRollBytes = segmentBytes;
+    t.retentionBytes = retentionBytes;
+    return fdNeedOfTopic(t, 0);
+}
+}  // namespace
+
+// Input bounds: a need of exactly the limit is admitted, one fd more is refused (no off-by-one in either direction).
+TEST(AdminWorkerRegression, TheFdBudgetAdmitsANeedOfExactlyTheLimitAdversarialRegression) {
+    const uint64_t one = needOfOne(3, 64LL << 20, -1);
+    {
+        CatalogDdlRig rig("aw_fd_adv_eq", 1, 1, 0, /*fdLimit=*/fdNeedBase() + one);
+        rig.becomeServingLeader();
+        EXPECT_EQ(defineWith(rig, "t", 3).code, 0) << "need == limit is within the budget";
+    }
+    {
+        CatalogDdlRig rig("aw_fd_adv_gt", 1, 1, 0, /*fdLimit=*/fdNeedBase() + one - 1);
+        rig.becomeServingLeader();
+        EXPECT_EQ(defineWith(rig, "t", 3).code, 39) << "need == limit + 1 is refused";
+        EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 1u);
+    }
+}
+
+// Input bounds / wrap: retention.bytes may be anything up to INT64_MAX and segment.bytes as small as 1, so the per-topic
+// term overflows uint64.  A wrapped (small) estimate must never admit a topic whose true need is astronomically above the
+// limit; the estimate saturates instead.
+TEST(AdminWorkerRegression, AnFdNeedThatWouldOverflowIsRefusedNotWrappedAdversarialRegression) {
+    CatalogDdlRig rig("aw_fd_adv_wrap", 1, 1, 0, /*fdLimit=*/1'000'000);
+    rig.becomeServingLeader();
+    const std::size_t events = rig.recordedLog().size();
+    for (const int32_t parts : {1, 2, 4, 8, 1000}) {
+        const auto a = defineWith(rig, "wrap" + std::to_string(parts), parts, /*segmentBytes=*/1,
+                                  /*retentionBytes=*/int64_t{1} << 62);
+        EXPECT_EQ(a.code, 39) << parts << " partitions: " << a.detail;
+    }
+    const auto max = defineWith(rig, "wrapmax", 7, 1, INT64_MAX);
+    EXPECT_EQ(max.code, 39) << max.detail;
+    EXPECT_EQ(rig.recordedLog().size(), events) << "nothing appended";
+    TopicSpec t;
+    t.partitionCount = 4; t.segmentRollBytes = 1; t.retentionBytes = int64_t{1} << 62;
+    EXPECT_EQ(fdNeedOfTopic(t, 0), UINT64_MAX) << "the term saturates";
+    EXPECT_EQ(estimateFdNeed(std::span<const TopicSpec>(&t, 1), 0), UINT64_MAX) << "and so does the sum";
+}
+
+// Protocol state (replay): a retry of a COMMITTED CREATE (same requestId) gets its original OK even after this broker's
+// limit dropped below the need - dedupe runs before the budget, never a 39 for a topic that exists.
+TEST(AdminWorkerRegression, ARetryOfACommittedCreateKeepsItsOkAfterTheLimitDropsAdversarialRegression) {
+    CatalogDdlRig rig("aw_fd_adv_retry", 1);
+    rig.becomeServingLeader();
+    CatalogDdlRig::DefineArgs a;
+    a.name = "t"; a.partitions = 100; a.requestId = rune::protocol::RequestId{0x5151, 7};
+    a.config.segmentRollBytes = 1LL << 20; a.config.retentionBytes = 100LL << 20;
+    const auto first = rig.define(a);
+    ASSERT_EQ(first.code, 0);
+    rig.admin().setFdLimitForTest(fdNeedBase() + 1);
+    const std::size_t events = rig.recordedLog().size();
+    const auto again = rig.define(a);
+    EXPECT_EQ(again.code, 0) << again.detail;
+    EXPECT_EQ(again.topicId, first.topicId);
+    EXPECT_EQ(rig.recordedLog().size(), events) << "a retry appends nothing";
+    EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 0u);
+}
+
+// Escalation through a sibling op: over budget, an ALTER of a key the estimate does not read (retention.ms) leaves the
+// need unchanged and is admitted; an ALTER that raises retention.bytes on ANOTHER topic is refused (the sum counts
+// every topic, not only the altered one).
+TEST(AdminWorkerRegression, OverBudgetANeutralAlterIsAdmittedAndARaiseOnAnyTopicRefusedAdversarialRegression) {
+    CatalogDdlRig rig("aw_fd_adv_sib", 1);
+    rig.becomeServingLeader();
+    ASSERT_EQ(defineWith(rig, "big", 100, 1LL << 20, 100LL << 20).code, 0);
+    ASSERT_EQ(defineWith(rig, "small", 1, 1LL << 20, -1).code, 0);
+    rig.admin().setFdLimitForTest(fdNeedBase() + 100);
+    EXPECT_EQ(rig.alterConfig("big", {{rc::ConfigKey::RetentionMs, 60'000}}).code, 0) << "need unchanged";
+    EXPECT_EQ(rig.alterConfig("small", {{rc::ConfigKey::RetentionBytes, 100LL << 20}}).code, 39)
+        << "small alone fits, but the broker's total is above the limit and grows";
+    EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 1u);
+}

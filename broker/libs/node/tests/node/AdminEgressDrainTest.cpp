@@ -137,3 +137,73 @@ TEST(AdminEgressRegression, ANearlyFullGateStopsTheDrainWithoutDroppingRegressio
     for (int i = 0; i < 5; ++i) EXPECT_EQ(h.sent[static_cast<std::size_t>(i)].corr, i == 0 ? 10 : 39 + i) << i;
     EXPECT_EQ(h.ringBytes(), 0);
 }
+
+// ── PR #611 review, adversarial pass (issue #209) ────────────────────────────────────────────────────────────────────
+
+// Resources: a burst of 40 gated security OKs (more than one pass's 16-frame budget) behind a catalog OK held for its
+// whole life: every one reaches the security gate within ceil(41 / 16) passes, in ring order, while the catalog OK is
+// still held.
+TEST(AdminEgressRegression, ABurstOfSecurityOksBehindAHeldCatalogAnswerAllPassAdversarialRegression) {
+    Harness h(256 * 1024, 512 * 1024);   // the gate takes 2 x (maxMsgLength 32 KiB + 32) beyond what it holds
+    h.put(withSession(1, defineOk(1, 10, 7)));
+    for (int i = 0; i < 40; ++i) h.put(withSession(100 + i, securityOk(100 + i, 1000 + i), /*offset=*/i), rune::node::kMsgEgressFrameGated);
+    int passes = 0;
+    while (h.ringBytes() > 0 && passes < 10) { (void)h.drain(); ++passes; }
+    EXPECT_EQ(passes, 3) << "16 frames per pass, never stalled by the held OK";
+    ASSERT_EQ(h.security.size(), 40u);
+    for (int i = 0; i < 40; ++i) {
+        EXPECT_EQ(h.security[static_cast<std::size_t>(i)].session, 100 + i) << i;
+        EXPECT_EQ(h.security[static_cast<std::size_t>(i)].offset, i) << i;
+    }
+    EXPECT_EQ(h.gate.heldCount(), 1u);
+    EXPECT_TRUE(h.sent.empty());
+}
+
+// Resources + ordering: a security OK that sits behind catalog frames a nearly full gate cannot take stays in the ring
+// (never dropped, never sent ungated, never reordered ahead of the catalog frames in front of it); after the release
+// the catalog answers leave in FIFO order and the security OK reaches its gate.
+TEST(AdminEgressRegression, ASecurityOkBehindAFullGateWaitsInTheRingAndIsNeverLostAdversarialRegression) {
+    constexpr std::size_t kGate = 2 * (128 + 32) + 40;
+    Harness h(1024, kGate);
+    h.put(withSession(1, defineOk(1, 10, 7)));
+    h.put(withSession(4, errorAnswer(4, 40)));
+    const auto sec = securityOk(5, 50);
+    h.put(withSession(5, sec, /*offset=*/77), rune::node::kMsgEgressFrameGated);
+    EXPECT_EQ(h.drain(), 1);
+    EXPECT_EQ(h.drain(), 0) << "no room: the error answer and the security OK behind it wait";
+    EXPECT_TRUE(h.security.empty());
+    EXPECT_TRUE(h.sent.empty());
+    h.topic7Serves = true;
+    EXPECT_EQ(h.release(), 1);
+    EXPECT_EQ(h.drain(), 2);
+    ASSERT_EQ(h.sent.size(), 2u);
+    EXPECT_EQ(h.sent[0].corr, 10);
+    EXPECT_EQ(h.sent[1].corr, 40);
+    ASSERT_EQ(h.security.size(), 1u);
+    EXPECT_EQ(h.security[0].session, 5);
+    EXPECT_EQ(h.security[0].offset, 77);
+    EXPECT_EQ(h.security[0].n, sec.size());
+    EXPECT_EQ(h.ringBytes(), 0);
+}
+
+// Input bounds: truncated frames (a catalog frame under the 8-byte session prefix, a gated frame without a whole
+// header) are consumed and dropped; they never wedge the ring nor reach either gate, and the frames behind them pass.
+TEST(AdminEgressRegression, TruncatedFramesAreDroppedWithoutBlockingTheRingAdversarialRegression) {
+    Harness h(64 * 1024, 64 * 1024);
+    h.put(withSession(1, defineOk(1, 10, 7)));   // held
+    for (std::size_t n = 1; n < 8; ++n) h.put(std::vector<uint8_t>(n, 0xAB));
+    const auto sec = securityOk(2, 20);
+    for (std::size_t n = 8; n < 16 + pc::MessageHeader::ENCODED_SIZE; ++n) {
+        std::vector<uint8_t> b = withSession(2, sec, /*offset=*/1);
+        b.resize(n);
+        h.put(b, rune::node::kMsgEgressFrameGated);
+    }
+    h.put(withSession(2, sec, /*offset=*/9), rune::node::kMsgEgressFrameGated);
+    int passes = 0;
+    while (h.ringBytes() > 0 && passes < 20) { (void)h.drain(); ++passes; }
+    EXPECT_EQ(h.ringBytes(), 0);
+    ASSERT_EQ(h.security.size(), 1u) << "only the whole gated frame reaches the security gate";
+    EXPECT_EQ(h.security[0].offset, 9);
+    EXPECT_EQ(h.gate.heldCount(), 1u) << "no truncated frame reached the catalog gate";
+    EXPECT_TRUE(h.sent.empty());
+}
