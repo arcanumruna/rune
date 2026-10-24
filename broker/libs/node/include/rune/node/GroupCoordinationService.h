@@ -214,6 +214,13 @@ public:
     // Unpushed (-1): the callable is used (service-only tests).
     void setLocalLeadership(bool leader) noexcept { localLeader_ = leader ? 1 : 0; }
 
+    // #570: the coordinator term (the cluster leadership term) the loaded groups belong to.  A leadership lost and
+    // regained between two duty cycles is invisible to the isLocalCoordinator() sample, but it always changes the
+    // term: doWork and every membership handler unload the groups when the term moved since they were loaded
+    // (Kafka: a new coordinator epoch rebuilds its groups; members re-join).  No fn: the term never changes (rigs).
+    // Cold setter; control thread.
+    void setCoordinatorTermFn(std::function<int64_t()> fn) { termFn_ = std::move(fn); }
+
     // -----------------------------------------------------------------------
     // coordinatorFor — returns the cluster-leader nodeId for any group.
     // v1 seam (Milestone-D: will map groupId → owning node).
@@ -502,7 +509,13 @@ private:
     /// #565: this node is not the group coordinator — drop every in-memory group (Kafka-style unload): end the
     /// members' group push subscriptions, forget the member bindings and per-group lineage state.  No Assign frame
     /// (a member learns NotCoordinator on its next request).  Returns the number of groups unloaded.
-    int unloadGroups_();
+    int unloadGroups_(const char* why);
+    /// #570: the current coordinator term (0 without a term fn).
+    [[nodiscard]] int64_t currentTerm_() const { return termFn_ ? termFn_() : 0; }
+    /// #570: unload the groups when they were loaded under another term.  Returns the number unloaded.
+    int syncTerm_();
+    std::function<int64_t()> termFn_;
+    int64_t                  groupsTerm_ = 0;   ///< the term coordinators_ was (re)populated under
 public:
     [[nodiscard]] std::size_t groupCountForTest() const noexcept { return coordinators_.size(); }
     [[nodiscard]] std::size_t pendingLineageChecksForTest() const noexcept { return pendingChecks_.size(); }

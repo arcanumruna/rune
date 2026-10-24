@@ -335,6 +335,8 @@ protected:
             registry_.get(),
             [this] { return isLeader_; },
             [this] { return leaderNodeId_; });
+        // #570: the coordinator term, as BrokerNode wires the leadership term (a real flap always changes it).
+        service_->setCoordinatorTermFn([this] { return leaderTerm_; });
         // E2 residual round 4: the coordinator serves offsets only once it has
         // loaded them (its first duty pass as coordinator, as in BrokerNode).
         service_->doWork(clock_);
@@ -369,6 +371,7 @@ protected:
 
     bool   isLeader_     = true;
     NodeId leaderNodeId_ = kLeader;
+    int64_t leaderTerm_  = 1;   // #570
     int64_t clock_       = 0;
 
     static constexpr std::size_t kBufSize = 64 * 1024;
@@ -3779,6 +3782,71 @@ TEST_F(GroupJoinAdversarial, ALeadershipFlapRebuildsTheGroupByRejoinRegression) 
     ASSERT_EQ(joinAs({kTestTopicId}, g, first.memberId).code, static_cast<int16_t>(pc::ErrorCode::OK));
     EXPECT_TRUE(driveUntil([&] { return service_->coordinator(g).state() == GroupState::Stable; }, 50));
     EXPECT_EQ(service_->coordinator(g).memberCount(), 1u);
+}
+
+// #570: a leadership flap between two duty cycles (lost and regained, never sampled as lost) still changes the term:
+// the previous term's groups, bindings and generations never survive it.  Leg 1: the next duty cycle unloads.  Leg 2:
+// no duty cycle - the handler itself unloads.  Leg 3: the old member's late OffsetCommit at its old generation is
+// refused and the committed offset never moves.  Leg 4: a steady term unloads nothing.
+// RED (syncTerm_ returns 0): legs 1-3 answer OK - the stale group served a member the new term never admitted.
+TEST_F(GroupJoinAdversarial, AFlapBetweenTwoDutyCyclesStillRebuildsTheGroupAdversarialRegression) {
+    const auto unknown = static_cast<int16_t>(pc::ErrorCode::UnknownMember);
+    auto flap = [&] {
+        isLeader_ = false; leaderNodeId_ = 42; ++leaderTerm_;
+        isLeader_ = true;  leaderNodeId_ = kLeader; ++leaderTerm_;
+    };
+    auto heartbeat = [&](const std::string& g, const std::string& m, int32_t gen) {
+        return decodeHBErrorCode(out_, service_->handleHeartbeat(req_, encodeHeartbeat(req_, 1, ++corr_, g, m, gen),
+                                                                clock_, out_, kBufSize));
+    };
+    auto commit = [&](const std::string& g, const std::string& m, int32_t gen, int64_t off) {
+        const std::size_t n = service_->handleOffsetCommit(
+            req_, encodeOffsetCommit(req_, 1, ++corr_, g, m, gen, kTestTopicId, 0, off), clock_, out_, kBufSize);
+        const auto r = pc::OffsetCommitResponse::decode(out_, n);
+        return r && !r->results.empty() ? r->results[0].errorCode : int16_t{-1};
+    };
+    const auto t0 = tp(std::string(kTestTopic), 0);
+
+    {   // Leg 1: the flap, then a duty cycle.
+        const std::string g = "g565-gap";
+        const std::string m = stableMember(g);
+        const int32_t gen = service_->coordinator(g).generationId();
+        flap();
+        clock_ += kStep;
+        service_->doWork(clock_);
+        EXPECT_EQ(service_->groupCountForTest(), 0u) << "leg 1: the previous term's group survived the flap";
+        EXPECT_EQ(heartbeat(g, m, gen), unknown) << "leg 1";
+    }
+    {   // Leg 2: the flap and NO duty cycle before the request.
+        const std::string g = "g565-gap-2";
+        const std::string m = stableMember(g);
+        const int32_t gen = service_->coordinator(g).generationId();
+        flap();
+        EXPECT_EQ(heartbeat(g, m, gen), unknown) << "leg 2: the handler served the previous term's member";
+        EXPECT_EQ(decodeSyncErrorCode(out_, service_->handleSyncGroup(req_, encodeSyncGroup(req_, 1, ++corr_, g, m, gen),
+                                                                     clock_, out_, kBufSize)), unknown) << "leg 2";
+    }
+    {   // Leg 3: a late OffsetCommit of the old member at its old generation.
+        const std::string g = "g565-gap-3";
+        const std::string m = stableMember(g);
+        const int32_t gen = service_->coordinator(g).generationId();
+        ASSERT_EQ(commit(g, m, gen, 10), int16_t{0});
+        ASSERT_EQ(store_->fetch(g, t0)->offset, 10);
+        flap();
+        EXPECT_NE(commit(g, m, gen, 5), int16_t{0}) << "leg 3: the previous term's member committed";
+        EXPECT_EQ(store_->fetch(g, t0)->offset, 10) << "leg 3: the committed offset moved";
+        EXPECT_EQ(service_->checkTxnOffsetMember(g, m, gen, 1), pc::ErrorCode::UnknownMember) << "leg 3";
+    }
+    {   // Leg 4: no term change - the member is served (the fix never unloads on a steady term).
+        const std::string g = "g565-gap-4";
+        const std::string m = stableMember(g);
+        const int32_t gen = service_->coordinator(g).generationId();
+        clock_ += kStep;
+        service_->doWork(clock_);
+        EXPECT_EQ(heartbeat(g, m, gen), int16_t{0}) << "leg 4";
+        EXPECT_EQ(commit(g, m, gen, 7), int16_t{0}) << "leg 4";
+        EXPECT_EQ(store_->fetch(g, t0)->offset, 7);
+    }
 }
 
 // ===========================================================================

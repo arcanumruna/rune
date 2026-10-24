@@ -2404,6 +2404,9 @@ void BrokerNode::buildGateway() {
             // Wire both directions.
             gateway_->setGroupService(groupCoordService_.get());
             groupCoordService_->setGateway(gateway_.get());
+            // #570: groups belong to the leadership term they were loaded under (a flap between two duty cycles).
+            groupCoordService_->setCoordinatorTermFn(
+                [this]() -> int64_t { return static_cast<int64_t>(leaderObserver_.computeOnControl().term); });
             // E2 final fix wave (C1): committed offsets of transient partitions
             // are positions of THIS process's rings (single node) — an offset
             // replayed from an earlier process is answered as none.

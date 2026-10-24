@@ -90,6 +90,7 @@ coord::GroupCoordinator& GroupCoordinationService::coordinator(const GroupId& gr
         return it->second;
     }
     // Cold path: insert new GroupCoordinator.  One allocation; never in steady state.
+    if (coordinators_.empty()) groupsTerm_ = currentTerm_();   // #570: the first group fixes the groups' term
     auto [inserted, ok] = coordinators_.emplace(
         std::piecewise_construct,
         std::forward_as_tuple(groupId),
@@ -216,7 +217,8 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
     // #565: a node that is not the coordinator holds no group: its in-memory groups are stale (heartbeats now go to
     // the new coordinator) and ageing them would expire members, bump generations and send revoke frames.  Unload
     // them, Kafka-style; a regained role rebuilds each group by re-join (group membership is never persisted).
-    if (!coordinators_.empty() && !isLocalCoordinator()) return work + unloadGroups_();
+    work += syncTerm_();   // #570: a role lost and regained between two cycles still changed the term
+    if (!coordinators_.empty() && !isLocalCoordinator()) return work + unloadGroups_("not the group coordinator");
 
     if (coordinators_.empty()) return work;
 
@@ -396,7 +398,15 @@ void GroupCoordinationService::recordGenLineages_(const GroupId& groupId, const 
 // stale deliveries); no Assign frame is sent - a member learns NotCoordinator on its next request and re-discovers
 // the coordinator.  Parked commits, transactional offsets in flight and the offsets store are left alone (they keep
 // their own NotCoordinator handling).  Cold: once per lost role.
-int GroupCoordinationService::unloadGroups_() {
+// #570: the groups belong to the term they were loaded under.  A role lost and regained between two duty cycles is
+// never sampled as lost, but the term moved: unload exactly as on a lost role (members re-join the new term).
+int GroupCoordinationService::syncTerm_() {
+    if (!coordinators_.empty() && currentTerm_() != groupsTerm_)
+        return unloadGroups_("the coordinator term changed since the groups were loaded");
+    return 0;
+}
+
+int GroupCoordinationService::unloadGroups_(const char* why) {
     if (gateway_) {
         int64_t last = -1;
         for (const auto& [key, binding] : memberSessionMap_) {
@@ -409,7 +419,7 @@ int GroupCoordinationService::unloadGroups_() {
     for (const auto& [groupId, coord] : coordinators_) pruneGroupLineageState_(groupId);
     const auto n = coordinators_.size();
     coordinators_.clear();
-    spdlog::info("GroupCoordinationService: not the group coordinator — unloaded {} group(s) (#565)", n);
+    spdlog::info("GroupCoordinationService: {} — unloaded {} group(s) (#565 / #570)", why, n);
     return static_cast<int>(n);
 }
 
@@ -565,6 +575,7 @@ size_t GroupCoordinationService::handleJoinGroup(
         resp.memberId      = std::span<const uint8_t>();
         return resp.encode(out);
     }
+    (void)syncTerm_();   // #570
 
     // CG routing round 3 (MAJOR-2): a member below client version 3 relies on
     // the coordinator-created subscriptions this broker no longer makes (and
@@ -789,6 +800,7 @@ size_t GroupCoordinationService::handleSyncGroup(
         resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
         return resp.encode(out, {});
     }
+    (void)syncTerm_();   // #570
 
     // Fetch the coordinator (if it doesn't exist the member is unknown).
     auto it = coordinators_.find(groupIdStr);
@@ -897,6 +909,7 @@ size_t GroupCoordinationService::handleHeartbeat(
         resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
         return resp.encode(out);
     }
+    (void)syncTerm_();   // #570
 
     auto it = coordinators_.find(groupIdStr);
     if (it == coordinators_.end()) {
@@ -951,6 +964,7 @@ size_t GroupCoordinationService::handleLeaveGroup(
         resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
         return resp.encode(out);
     }
+    (void)syncTerm_();   // #570
 
     pc::LeaveGroupResponse resp;
     resp.sessionId     = msg.sessionId;
@@ -1269,6 +1283,7 @@ size_t GroupCoordinationService::handleOffsetCommit(
         resp.correlationId = msg.correlationId;
         return resp.encode(out, std::span<const pc::OffsetCommitResult>(commitResultScratch_));
     }
+    (void)syncTerm_();   // #570
 
     // Member + generation fence (issues #124 / #169, Kafka parity): the commit is honoured only for a CURRENT member
     // of the group, bound to THIS session, at the group's generation.  Generations restart with the coordinator, so
@@ -1880,6 +1895,7 @@ rune::protocol::client::ErrorCode GroupCoordinationService::checkTxnOffsetMember
 {
     using EC = rune::protocol::client::ErrorCode;
     if (!isLocalCoordinator()) return EC::NotCoordinator;
+    (void)syncTerm_();   // #570
     const auto it = coordinators_.find(group);
     const bool memberOk = it != coordinators_.end() && ownsMember_(group, memberId, sessionId) &&
                           it->second.hasMember(memberId);
