@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -397,4 +398,29 @@ TEST(PeerFrameCryptoRegression, AnInitiatorNeverEvictsTheEpochItsPeerLastSealedU
     EXPECT_EQ(epoch, 1u);
     EXPECT_EQ(a.dropsOf(OR::UnknownEpoch), unknownBefore);
     EXPECT_TRUE(a.holdsEpoch(2, 1));
+}
+
+// Issue #546: the link masters are scrubbed when a LinkKeys dies (every evicted / replaced / superseded copy - the
+// handshake's states, Out::established, the transports' epoch slots - goes through this destructor).
+// Mutation: removing ~LinkKeys() leaves the master bytes in place -> red.
+TEST(PeerFrameCryptoRegression, ALinkKeysScrubsItsMastersOnDestructionRegression) {
+    alignas(pl::LinkKeys) unsigned char storage[sizeof(pl::LinkKeys)];
+    auto* k = new (storage) pl::LinkKeys();
+    k->epoch = 7;
+    k->sendMaster.fill(0xA5);
+    k->recvMaster.fill(0x5A);
+    const std::size_t sendOff = reinterpret_cast<unsigned char*>(k->sendMaster.data()) - storage;
+    const std::size_t recvOff = reinterpret_cast<unsigned char*>(k->recvMaster.data()) - storage;
+    ASSERT_EQ(storage[sendOff], 0xA5);
+    k->~LinkKeys();
+    for (std::size_t i = 0; i < 32; ++i) {
+        EXPECT_EQ(storage[sendOff + i], 0) << "sendMaster byte " << i;
+        EXPECT_EQ(storage[recvOff + i], 0) << "recvMaster byte " << i;
+    }
+    // A copy-assignment overwrites in place, and a copy still compares equal (the masters are values, not handles).
+    pl::LinkKeys a, b;
+    a.sendMaster.fill(1); b = a;
+    EXPECT_EQ(a, b);
+    b.scrub();
+    EXPECT_EQ(b.sendMaster, (std::array<uint8_t, 32>{}));
 }

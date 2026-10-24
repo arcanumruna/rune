@@ -264,3 +264,30 @@ TEST(PeerLinkFanoutRegression, AWorkerRefusesAnUnknownInstallModeRegression) {
     EXPECT_FALSE(workerHolds(*p, 0, 2, 3)) << "refused, never installed";
     EXPECT_EQ(p->worker(0).peerLinkEpochForTest(2), 0u);
 }
+
+// Issue #546: the ring zeroes every consumed record (O2ORingBuffer::read -> setMemory), so a consumed PeerLinkKeys
+// record leaves no master bytes in the ring; no consumer-side scrub of ring memory is needed.  Non-vacuous: the
+// pattern is in the ring before the consumer reads it.  Mutation: removing the setMemory in O2ORingBuffer::read leaves
+// the masters behind -> red.
+TEST(PeerLinkFanoutRegression, AConsumedKeysRecordLeavesNoMasterBytesInTheRingRegression) {
+    constexpr int kCap = 1 << 12;
+    OneToOneByteRing admin(kCap);
+    PeerLinkFanout f;
+    f.post(2, keysAt(5, 0xC3));          // sendMaster = 32 x 0xC3, recvMaster = 32 x 0xC4
+    (void)f.pump(nullptr, &admin);
+    auto countOf = [&](uint8_t v) {
+        std::size_t run = 0, hits = 0;
+        const uint8_t* b = admin.base();
+        for (int i = 0; i < kCap; ++i) {
+            run = b[i] == v ? run + 1 : 0;
+            if (run == 32) ++hits;
+        }
+        return hits;
+    };
+    EXPECT_EQ(countOf(0xC3), 1u) << "precondition: the send master is in the ring before it is consumed";
+    EXPECT_EQ(countOf(0xC4), 1u) << "precondition: the recv master is in the ring before it is consumed";
+    const auto msgs = adminMsgs(admin);
+    ASSERT_EQ(msgs.size(), 1u);
+    EXPECT_EQ(countOf(0xC3), 0u) << "the consumed record left the send master in the ring";
+    EXPECT_EQ(countOf(0xC4), 0u) << "the consumed record left the recv master in the ring";
+}
