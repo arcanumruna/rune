@@ -893,3 +893,146 @@ TEST(PeerLinkAdversarialRegression, ForgedHintsNeverRekeyALinkWhoseKeepalivesArr
                 static_cast<unsigned long long>(opened), static_cast<unsigned long long>(replays),
                 static_cast<unsigned long long>(rekeysLossy));
 }
+
+// ==== Adversarial review of PR #619 (issues #584 / #545): attacks on the responder's one-unconfirmed-epoch deferral, ====
+// the bounded Accept re-send and the initiator's any-state Confirm.
+
+// ---- Protocol state (replay): an Accept captured from an earlier, CONFIRMED exchange is replayed to an initiator ----
+// that is mid-rekey (HelloSent, then ChallengeSent).  The any-state answer (#584) may only repeat the Confirm of its
+// live epoch: no state change, no install, and the responder ignores that repeated Confirm.  An Accept of an epoch the
+// initiator no longer lives on gets nothing.  The exchange in flight then completes normally with no drop.
+TEST(PeerLinkAdversarialRegression, AnOldAcceptReplayedToARekeyingInitiatorOnlyRepeatsItsConfirmAdversarialRegression) {
+    Sim s(6191);
+    s.link();
+    std::vector<Bytes> accepts;
+    auto rehandshake = [&] {
+        s.now += 2'000 * kMs;
+        s.absorb(0, s.a.hs.rekeyForTest(s.now));
+        for (int guard = 0; guard < 16 && (!s.hsTo[0].empty() || !s.hsTo[1].empty()); ++guard)
+            for (int to : {0, 1}) {
+                if (s.hsTo[to].empty()) continue;
+                Bytes f = s.hsTo[to].front(); s.hsTo[to].pop_front();
+                if (f[0] == static_cast<uint8_t>(pl::PeerMsg::Accept)) accepts.push_back(f);
+                s.deliverHs(to, f);
+            }
+    };
+    rehandshake();   // E2, confirmed
+    rehandshake();   // E3, confirmed
+    ASSERT_TRUE(s.failure.empty()) << s.failure;
+    ASSERT_EQ(accepts.size(), 2u);
+    ASSERT_EQ(s.a.crypto.currentEpoch(2), 3u);
+    ASSERT_EQ(s.b.crypto.currentEpoch(1), 3u);
+    pl::PeerAccept old2, live3;
+    ASSERT_TRUE(pl::PeerAccept::decode(accepts[0].data(), accepts[0].size(), old2));
+    ASSERT_TRUE(pl::PeerAccept::decode(accepts[1].data(), accepts[1].size(), live3));
+
+    s.now += 2'000 * kMs;
+    s.absorb(0, s.a.hs.rekeyForTest(s.now));   // HelloSent, prior = E3
+    ASSERT_TRUE(std::holds_alternative<pl::HelloSent>(s.a.hs.state()));
+    for (int phase = 0; phase < 2; ++phase) {
+        auto o = s.a.hs.onAccept(old2, s.now);
+        EXPECT_FALSE(o.frame) << "phase " << phase << ": an Accept of an epoch no longer live gets nothing";
+        EXPECT_FALSE(o.established);
+        o = s.a.hs.onAccept(live3, s.now);
+        ASSERT_TRUE(o.frame) << "phase " << phase << ": the live epoch's Accept is answered with its Confirm";
+        EXPECT_EQ(o.frame->bytes[0], static_cast<uint8_t>(pl::PeerMsg::Confirm));
+        EXPECT_FALSE(o.established) << "phase " << phase << ": nothing is (re)installed";
+        pl::PeerConfirm c;
+        ASSERT_TRUE(pl::PeerConfirm::decode(o.frame->data(), o.frame->size(), c));
+        EXPECT_EQ(c.linkEpoch, 3u);
+        EXPECT_FALSE(s.b.hs.onConfirm(c, s.now).established) << "phase " << phase << ": a confirmed epoch is not re-promoted";
+        if (phase == 0) {
+            EXPECT_TRUE(std::holds_alternative<pl::HelloSent>(s.a.hs.state())) << "the replay never moves the initiator";
+            s.deliverHs(1, popHs(s, 1, pl::PeerMsg::HelloV2));
+            s.deliverHs(0, popHs(s, 0, pl::PeerMsg::ChallengeV2));
+            ASSERT_TRUE(std::holds_alternative<pl::ChallengeSent>(s.a.hs.state()));
+        } else {
+            EXPECT_TRUE(std::holds_alternative<pl::ChallengeSent>(s.a.hs.state())) << "the replay never moves the initiator";
+        }
+    }
+    EXPECT_EQ(s.a.crypto.currentEpoch(2), 3u);
+    ASSERT_TRUE(s.converge()) << s.describe();
+    EXPECT_EQ(s.a.crypto.currentEpoch(2), 4u) << "the exchange in flight completed";
+    EXPECT_EQ(s.b.crypto.currentEpoch(1), 4u);
+    EXPECT_EQ(s.a.crypto.dropsOf(OR::UnknownEpoch) + s.b.crypto.dropsOf(OR::UnknownEpoch), 0u);
+}
+
+// ---- Network (delay) + Protocol state: the deferral window is measured from the RESPONDER's install, which a delayed ----
+// Proof pushes past the initiator's own give-up.  Every Accept of E is lost; the initiator gives up and starts a new
+// exchange while B still treats E as fresh, so B answers the new Proof with E's Accept, which the initiator (whose live
+// link is E-1) must ignore.  The link must still converge on a newer epoch, B must stop re-sending E, and no frame
+// sealed throughout may be dropped.
+TEST(PeerLinkAdversarialRegression, ADelayedProofPastTheInitiatorsGiveUpStillConvergesAdversarialRegression) {
+    Sim s(6192);
+    s.link();
+    ASSERT_TRUE(s.a.crypto.hasLink(2) && s.b.crypto.hasLink(1));
+    const uint32_t e0 = s.b.crypto.currentEpoch(1);
+    s.now += 2'000 * kMs;
+    s.absorb(0, s.a.hs.rekeyForTest(s.now));
+    s.deliverHs(1, popHs(s, 1, pl::PeerMsg::HelloV2));
+    s.deliverHs(0, popHs(s, 0, pl::PeerMsg::ChallengeV2));
+    const Bytes proof = popHs(s, 1, pl::PeerMsg::ProofV2);
+    s.now += 600 * kMs;   // the Proof is delayed 600 ms
+    s.deliverHs(1, proof);
+    const auto* eb = estOf(s.b.hs);
+    ASSERT_TRUE(eb && eb->unconfirmedAccept);
+    const uint32_t e1 = eb->keys.epoch;
+    int deferredAccepts = 0, acceptsOfE1 = 0;
+    bool secondExchange = false;
+    // Every Accept of E1 is lost; everything else moves at once.  Both ends seal every 50 ms; frames open in reverse.
+    for (int i = 0; i < 200 && s.failure.empty(); ++i) {
+        for (int to : {0, 1})
+            while (!s.hsTo[to].empty()) {
+                Bytes f = s.hsTo[to].front(); s.hsTo[to].pop_front();
+                if (to == 0 && f[0] == static_cast<uint8_t>(pl::PeerMsg::Accept)) {
+                    pl::PeerAccept m; ASSERT_TRUE(pl::PeerAccept::decode(f.data(), f.size(), m));
+                    if (m.linkEpoch == e1) {
+                        ++acceptsOfE1;
+                        if (secondExchange) { ++deferredAccepts; s.deliverHs(0, f); }   // the deferred answer arrives
+                        continue;
+                    }
+                }
+                s.deliverHs(to, f);
+            }
+        s.seal(0); s.seal(1);
+        while (!s.data.empty() && s.failure.empty()) s.open(s.data.size() - 1);
+        s.now += 50 * kMs;
+        s.tick();
+        if (!secondExchange && estOf(s.a.hs) && s.a.crypto.currentEpoch(2) == e0) {
+            secondExchange = true;   // the initiator gave up: a new exchange at once (the gate's rate allows it)
+            s.absorb(0, s.a.hs.rekeyForTest(s.now));
+        }
+    }
+    ASSERT_TRUE(s.failure.empty()) << s.failure;
+    ASSERT_TRUE(secondExchange) << "the initiator gave up on E1";
+    EXPECT_GE(deferredAccepts, 1) << "the second Proof landed inside B's window and was answered with E1's Accept";
+    EXPECT_LE(acceptsOfE1, static_cast<int>(pl::PeerHandshake::kAwaitNs / pl::PeerHandshake::kRetryNs) + 2)
+        << "E1's Accept is not re-sent past its window";
+    ASSERT_TRUE(s.converge()) << s.describe();
+    // A third exchange (the next hint) relinks on a fresh epoch.
+    s.now += 2'000 * kMs;
+    s.absorb(0, s.a.hs.rekeyForTest(s.now));
+    ASSERT_TRUE(s.converge()) << s.describe();
+    EXPECT_GT(s.a.crypto.currentEpoch(2), e1);
+    EXPECT_EQ(s.a.crypto.currentEpoch(2), s.b.crypto.currentEpoch(1));
+    EXPECT_EQ(s.a.crypto.dropsOf(OR::UnknownEpoch) + s.b.crypto.dropsOf(OR::UnknownEpoch), 0u);
+}
+
+// ---- Data integrity / Network: the #241 model under HEAVY handshake loss and long-lived data frames (40% handshake ----
+// loss, frames live 400 ms), where several exchanges overlap an unconfirmed epoch.  Every delivered frame must open
+// and the link must converge.  Mutation: removing the #584 deferral in establishAsResponder_ -> red.
+TEST(PeerLinkAdversarialRegression, NoDeliveredFrameIsDroppedUnderHeavyHandshakeLossAdversarialRegression) {
+    uint64_t rekeys = 0, opened = 0;
+    for (uint64_t seed = 1; seed <= 300; ++seed) {
+        Sim s(0x619'0000 + seed);
+        s.link();
+        ASSERT_TRUE(s.a.crypto.hasLink(2) && s.b.crypto.hasLink(1)) << "seed " << seed;
+        s.now += 2'000 * kMs;
+        for (int i = 0; i < 2'000 && s.failure.empty(); ++i) s.step(/*hsLoss=*/0.40, /*maxDataAgeNs=*/400 * kMs);
+        ASSERT_TRUE(s.failure.empty()) << "seed " << (0x619'0000 + seed) << ": " << s.failure;
+        ASSERT_TRUE(s.converge()) << "seed " << (0x619'0000 + seed) << ": the link never converged: " << s.describe();
+        rekeys += s.rekeys; opened += s.opened;
+    }
+    EXPECT_GT(rekeys, 300u) << "the model must actually re-handshake";
+    EXPECT_GT(opened, 5'000u);
+}

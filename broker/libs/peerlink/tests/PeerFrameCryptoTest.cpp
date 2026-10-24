@@ -394,3 +394,35 @@ TEST(PeerFrameCryptoRegression, ALinkKeysScrubsItsMastersOnDestructionRegression
     b.scrub();
     EXPECT_EQ(b.sendMaster, (std::array<uint8_t, 32>{}));
 }
+
+// Adversarial review of PR #619 (#584), Data integrity: the "abandoned" rule must never pick a receive-only epoch
+// installed AFTER the send epoch - that is the pending re-handshake the initiator already seals under, awaiting its
+// promotion.  Slot pressure (a newer install) then evicts the oldest former send epoch, and a frame under the pending
+// epoch still opens and latches its promotion.  Mutation: dropping `installOrder < sendOrder` from the abandoned scan
+// evicts the pending epoch -> red.
+TEST(PeerFrameCryptoRegression, APendingPromotionIsNeverEvictedAsAbandonedAdversarialRegression) {
+    using OR = pl::PeerFrameCrypto::OpenResult;
+    constexpr auto RO = pl::LinkInstall::ReceiveOnly;
+    constexpr auto SR = pl::LinkInstall::SendAndReceive;
+    auto baseOf = [](uint32_t e) { return static_cast<uint8_t>(10 * e); };
+    pl::PeerFrameCrypto b(2, 0), peer(1, 0);
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 1, baseOf(1), SR), 0));
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 2, baseOf(2), SR), 0));
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 3, baseOf(3), RO), 0));   // pending: the initiator seals under it
+    ASSERT_TRUE(peer.installLink(2, linkFor(true, 3, baseOf(3)), 0));
+    ASSERT_EQ(b.currentEpoch(1), 2u);
+    ASSERT_TRUE(b.installLink(1, linkFor(false, 4, baseOf(4), RO), 0));   // slot pressure (a stale-window new exchange)
+    EXPECT_TRUE(b.holdsEpoch(1, 3)) << "the pending promotion is not abandoned";
+    EXPECT_FALSE(b.holdsEpoch(1, 1)) << "the oldest former send epoch goes";
+    EXPECT_TRUE(b.holdsEpoch(1, 2));
+    EXPECT_EQ(b.currentEpoch(1), 2u);
+    std::vector<uint8_t> wire(64), out(64);
+    const auto n = peer.seal(2, bytes("e3"), 2, wire.data(), wire.size());
+    ASSERT_GT(n, 0u);
+    std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
+    EXPECT_EQ(b.open(wire.data(), n, out.data(), out.size(), outLen, from, epoch), OR::Ok);
+    EXPECT_EQ(epoch, 3u);
+    int32_t p = -1; uint32_t used = 0;
+    EXPECT_TRUE(b.takePeerUsedEpoch(p, used));
+    EXPECT_EQ(used, 3u);
+}
