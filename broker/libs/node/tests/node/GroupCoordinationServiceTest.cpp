@@ -4024,3 +4024,124 @@ TEST(OffsetCommitDurabilityRegression, AnOldTermMembersLateCommitAfterAFlapIsFen
     g.svc.doWork(g.clock);
     EXPECT_EQ(g.store.fetch("g565zombie", t0)->offset, 10) << "the committed offset moved backward";
 }
+
+// ===========================================================================
+// #214: one GroupCoordinator per distinct group name was created and never removed - unbounded memory and O(groups)
+// session walks.  The count is capped (a join that would create one more group is refused; a join to an existing
+// group never is) and an Empty group is dropped on the next duty cycle.
+// ===========================================================================
+namespace {
+pc::JoinGroupResponse joinGroup214(GroupCoordinationService& svc, uint8_t* req, uint8_t* out, std::size_t cap,
+                                   int64_t sid, int64_t corr, std::string_view group, std::string_view member,
+                                   int64_t now, std::string& memberOut, std::string& detailOut,
+                                   std::span<const uint8_t> filter = {}) {
+    pc::JoinGroup msg;
+    msg.sessionId = sid; msg.correlationId = corr; msg.sessionTimeoutMs = 5000; msg.filter = filter;
+    msg.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+    msg.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(member.data()), member.size());
+    const std::array<int32_t, 1> topics{kTestTopicId};
+    const std::size_t n = msg.encode(req, std::span<const int32_t>(topics));
+    const std::size_t o = svc.handleJoinGroup(req, n, pc::kClientVersion, now, out, cap);
+    auto r = pc::JoinGroupResponse::decode(out, o);
+    EXPECT_TRUE(r.has_value());
+    if (!r) return {};
+    memberOut.assign(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size());
+    detailOut.assign(r->detail);
+    return *r;
+}
+}  // namespace
+
+// RED (no cap): g4 joins OK and a 4th coordinator exists.  RED (no prune): g1 stays after its last member left, so the
+// count never drops and g4 is still refused.
+TEST(GroupCoordinationServiceRegression, CoordinatorCountIsCappedAndEmptyOnesArePrunedRegression) {
+    OffRig g;
+    g.svc.setMaxGroups(3);
+    EXPECT_EQ(g.svc.maxGroups(), 3);
+    uint8_t req[4096]{}, out[4096]{};
+    int64_t corr = 1;
+    std::string m1, m, detail;
+    ASSERT_EQ(joinGroup214(g.svc, req, out, sizeof out, 1, corr++, "g1", "", g.clock, m1, detail).errorCode, 0);
+    ASSERT_EQ(joinGroup214(g.svc, req, out, sizeof out, 1, corr++, "g2", "", g.clock, m, detail).errorCode, 0);
+    ASSERT_EQ(joinGroup214(g.svc, req, out, sizeof out, 1, corr++, "g3", "", g.clock, m, detail).errorCode, 0);
+    ASSERT_EQ(g.svc.groupCountForTest(), 3u);
+
+    const auto refused = joinGroup214(g.svc, req, out, sizeof out, 1, corr++, "g4", "", g.clock, m, detail);
+    EXPECT_EQ(refused.errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_TRUE(m.empty()) << "a refused join was admitted";
+    EXPECT_NE(detail.find("maximum of 3"), std::string::npos) << detail;
+    EXPECT_EQ(g.svc.joinsRefusedGroupCap(), 1u);
+    EXPECT_EQ(g.svc.groupCountForTest(), 3u) << "the refused join created a group";
+
+    // A join to an EXISTING group is never refused by the cap.
+    EXPECT_EQ(joinGroup214(g.svc, req, out, sizeof out, 2, corr++, "g2", "", g.clock, m, detail).errorCode, 0);
+    EXPECT_EQ(g.svc.groupCountForTest(), 3u);
+    EXPECT_EQ(g.svc.joinsRefusedGroupCap(), 1u);
+
+    // g1's only member leaves: the next duty cycle drops the empty group, and g4 fits.
+    EXPECT_EQ(decodeLeaveErrorCode(out, g.svc.handleLeaveGroup(req, encodeLeaveGroup(req, 1, corr++, "g1", m1), g.clock,
+                                                               out, sizeof out)), 0);
+    g.clock += 1'000'000;
+    g.svc.doWork(g.clock);
+    EXPECT_EQ(g.svc.groupCountForTest(), 2u) << "the empty group was kept";
+    EXPECT_EQ(g.svc.groupsPruned(), 1u);
+    EXPECT_EQ(joinGroup214(g.svc, req, out, sizeof out, 1, corr++, "g4", "", g.clock, m, detail).errorCode, 0);
+    EXPECT_FALSE(m.empty());
+    EXPECT_EQ(g.svc.groupCountForTest(), 3u);
+}
+
+// A join refused on a NEW group name (an oversized filter) leaves no coordinator behind after the duty cycle.
+// RED (no prune): the refused join's empty coordinator stays forever (one per distinct refused name).
+TEST(GroupCoordinationServiceRegression, ARefusedJoinLeavesNoCoordinatorBehindRegression) {
+    OffRig g;
+    const std::vector<uint8_t> big(rune::codec::kMaxFilterBytes + 1, 0xAB);
+    std::vector<uint8_t> reqBuf(big.size() + 4096);   // the request carries the whole oversized filter
+    uint8_t* req = reqBuf.data();
+    uint8_t out[4096]{};
+    std::string m, detail;
+    ASSERT_EQ(joinGroup214(g.svc, req, out, sizeof out, 1, 1, "g214-live", "", g.clock, m, detail).errorCode, 0);
+    const std::size_t before = g.svc.groupCountForTest();
+    ASSERT_EQ(before, 1u);
+    const auto r = joinGroup214(g.svc, req, out, sizeof out, 1, 2, "g214-refused", "", g.clock, m, detail,
+                                std::span<const uint8_t>(big));
+    EXPECT_EQ(r.errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_TRUE(m.empty());
+    g.clock += 1'000'000;
+    g.svc.doWork(g.clock);
+    EXPECT_EQ(g.svc.groupCountForTest(), before) << "a refused join left a coordinator behind";
+}
+
+// The last member expires: the group is dropped; the departed member's late Heartbeat / OffsetCommit / SyncGroup are
+// UnknownMember and the committed offset never moves.  RED (no prune): the empty group is still held.
+TEST(GroupCoordinationServiceRegression, AnExpiredLastMemberPrunesTheGroupAndALateRequestIsUnknownMemberRegression) {
+    const std::string group = "g214exp";
+    CommitRig g(group);
+    ASSERT_FALSE(g.member.empty());
+    ASSERT_EQ(g.commit(group, 10), 0u);
+    g.fetch();
+    g.svc.doWork(g.clock);
+    ASSERT_EQ(g.answers.frames.size(), 1u);
+    const auto t0 = tp(std::string(kTestTopic), 0);
+    ASSERT_EQ(g.store.fetch(group, t0)->offset, 10);
+
+    g.clock += 6'000'000'000LL;   // past the 5 s session timeout, no heartbeat
+    g.svc.doWork(g.clock);
+    EXPECT_EQ(g.svc.groupCountForTest(), 0u) << "the empty group was kept";
+    EXPECT_EQ(g.svc.groupsPruned(), 1u);
+
+    const auto unknown = static_cast<int16_t>(pc::ErrorCode::UnknownMember);
+    EXPECT_EQ(decodeHBErrorCode(g.out, g.svc.handleHeartbeat(g.req, encodeHeartbeat(g.req, 1, g.corr++, group, g.member,
+                                                                                    g.gen), g.clock, g.out, sizeof g.out)),
+              unknown);
+    const std::size_t leo = static_cast<std::size_t>(g.rep.logEndOffset());
+    const std::size_t n = g.commit(group, 5);
+    ASSERT_GT(n, 0u);
+    EXPECT_EQ(CommitRig::codeOf(g.out, n), unknown);
+    EXPECT_EQ(static_cast<std::size_t>(g.rep.logEndOffset()), leo) << "a departed member's commit was appended";
+    EXPECT_EQ(decodeSyncErrorCode(g.out, g.svc.handleSyncGroup(g.req, encodeSyncGroup(g.req, 1, g.corr++, group, g.member,
+                                                                                      g.gen), g.clock, g.out, sizeof g.out)),
+              unknown);
+    EXPECT_EQ(g.svc.groupCountForTest(), 0u) << "a late request re-created the group";
+    g.fetch();
+    g.svc.doWork(g.clock);
+    EXPECT_EQ(g.store.fetch(group, t0)->offset, 10) << "the committed offset moved";
+}

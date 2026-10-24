@@ -9,7 +9,8 @@
 //
 // ## Responsibilities
 //
-//   - Per-group GroupCoordinator lifecycle: lazy get-or-create on first Join.
+//   - Per-group GroupCoordinator lifecycle: lazy get-or-create on first Join (at most maxGroups(); dropped by
+//     doWork once Empty - #214).
 //   - doWork(nowNs): drives every GroupCoordinator::doWork; on
 //     CompletingRebalance-transition → autoAssignAndSync; returns work count.
 //   - CG-4: on Stable: for each member, seed push subscriptions (one per
@@ -397,6 +398,9 @@ private:
     void sendDeferred_(int64_t sessionId, const uint8_t* frame, std::size_t n);
     using ClientVersionFn = int32_t (*)(void* ctx, int64_t sessionId) noexcept;
     int32_t         maxSessionTimeoutMs_ = kDefaultMaxSessionTimeoutMs;
+    int32_t         maxGroups_           = kDefaultMaxGroups;   // #214
+    uint64_t        joinsRefusedGroupCap_ = 0;
+    uint64_t        groupsPruned_         = 0;
     ClientVersionFn clientVersionFn_  = nullptr;
     void*           clientVersionCtx_ = nullptr;
 public:
@@ -411,6 +415,17 @@ public:
     void setClientVersionResolverForTest(ClientVersionFn fn, void* ctx) noexcept {
         clientVersionFn_ = fn; clientVersionCtx_ = ctx;
     }
+    /// #214: at most this many consumer groups are coordinated at once (RUNE_GROUP_MAX_GROUPS).  A JoinGroup that would
+    /// create one more is refused (InvalidRequest with a detail; ProtocolVersion below 5); a join to an EXISTING group
+    /// is never refused by the cap.  An Empty group holds nothing worth keeping (membership is never persisted, its
+    /// committed offsets live in the offsets store) and is dropped on the next doWork.
+    static constexpr int32_t kDefaultMaxGroups = 10'000;
+    /// A non-positive maximum keeps the default.
+    void setMaxGroups(int32_t n) noexcept { maxGroups_ = n > 0 ? n : kDefaultMaxGroups; }
+    [[nodiscard]] int32_t maxGroups() const noexcept { return maxGroups_; }
+    /// #214: JoinGroups refused because the group cap was reached / empty groups dropped by doWork.
+    [[nodiscard]] uint64_t joinsRefusedGroupCap() const noexcept { return joinsRefusedGroupCap_; }
+    [[nodiscard]] uint64_t groupsPruned() const noexcept { return groupsPruned_; }
     [[nodiscard]] uint64_t parkRefusalsForTest() const noexcept { return parkRefusals_; }
     [[nodiscard]] uint64_t unstableAnswersForTest() const noexcept { return unstableAnswers_; }
 private:

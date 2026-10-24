@@ -312,6 +312,27 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
             }
         }
     }
+
+    // #214: an Empty group holds nothing worth keeping (membership is never persisted; its committed offsets live in
+    // the offsets store; its departed members' bindings were drained above): drop it, with its per-group state.  A
+    // departed member's late request is answered UnknownMember (no group), exactly as for a member-less one.  Cold.
+    for (auto it = coordinators_.begin(); it != coordinators_.end();) {
+        const coord::GroupCoordinator& gc = it->second;
+        if (gc.isEmpty() && gc.state() == coord::GroupState::Empty && !gc.hasDeparted()) {
+            pruneGroupLineageState_(it->first);
+            if (!filterMismatchRefusals_.empty()) {
+                const std::string& g = it->first;
+                std::erase_if(filterMismatchRefusals_, [&](const auto& e) {
+                    return e.first.size() > g.size() && e.first.compare(0, g.size(), g) == 0 && e.first[g.size()] == '\x1f';
+                });
+            }
+            it = coordinators_.erase(it);
+            ++groupsPruned_;
+            ++work;
+        } else {
+            ++it;
+        }
+    }
     return work;
 }
 
@@ -602,8 +623,6 @@ size_t GroupCoordinationService::handleJoinGroup(
         }
     }
 
-    coord::GroupCoordinator& gc = coordinator(groupIdStr);   // only creates the group
-
     // Phase 2c (spec 13.3): one filter per group, fixed by the first member, changeable once the group is empty.
     // The session's version is the one the frame was decoded with: an older member carries no filter.
     const int32_t ver = clientVersion;
@@ -626,6 +645,19 @@ size_t GroupCoordinationService::handleJoinGroup(
         const std::size_t n = resp.encodeFor(out, ver, outCap);
         return n != 0 ? n : resp.encode(out);
     };
+
+    // #214: the number of coordinated groups is bounded.  Only a join that would CREATE a group is refused (never one
+    // to an existing group); empty groups are dropped by doWork, so the room comes back as groups empty.
+    if (coordinators_.size() >= static_cast<std::size_t>(maxGroups_) &&
+        coordinators_.find(groupIdStr) == coordinators_.end()) [[unlikely]] {
+        const uint64_t n = ++joinsRefusedGroupCap_;
+        if ((n & (n - 1)) == 0)
+            spdlog::warn("GroupCoordinationService: JoinGroup for new group '{}' refused - this broker coordinates its "
+                         "maximum of {} consumer groups (RUNE_GROUP_MAX_GROUPS) (refusal #{})", groupIdStr, maxGroups_, n);
+        return refuseJoin("this broker coordinates its maximum of " + std::to_string(maxGroups_) +
+                          " consumer groups; retry after a group empties or raise RUNE_GROUP_MAX_GROUPS");
+    }
+    coord::GroupCoordinator& gc = coordinator(groupIdStr);   // only creates the group
     // The same cap the Subscribe filter path enforces (CompiledFilter::compile): no group is fixed to bytes every
     // Subscribe would refuse.
     if (filter.size() > rune::codec::kMaxFilterBytes) {

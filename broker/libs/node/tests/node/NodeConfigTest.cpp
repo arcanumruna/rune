@@ -3026,4 +3026,25 @@ TEST(NodeConfigRegression, FilterKnobOutOfBoundsRefusesStartRegression) {
     }
 }
 
+
+// #214: RUNE_GROUP_MAX_GROUPS — unset → 0 (the service default); a positive int32 is carried; 0, negative and garbage
+// refuse startup.  (Dev mode: a RUNE_TLS=OFF build refuses the default authentication, #533.)  RED: ignore the variable.
+TEST(NodeConfigRegression, GroupMaxGroupsEnvIsParsedRegression) {
+    auto env = base1node();
+    env["RUNE_AUTH"] = "disabled";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->groupMaxGroups, 0);
+    env["RUNE_GROUP_MAX_GROUPS"] = "5";
+    r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->groupMaxGroups, 5);
+    for (const char* bad : {"0", "-1", "x", "99999999999"}) {
+        env["RUNE_GROUP_MAX_GROUPS"] = bad;
+        r = parseNodeConfig(fakeEnv(env));
+        EXPECT_FALSE(r.config.has_value()) << bad;
+        EXPECT_NE(r.error.find("RUNE_GROUP_MAX_GROUPS"), std::string::npos) << bad << ": " << r.error;
+    }
+}
+
 } // namespace rune::node

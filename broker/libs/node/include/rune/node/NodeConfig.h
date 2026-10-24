@@ -31,6 +31,10 @@
 //
 //   RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND — int64 > 0, the log cleaner's shared I/O throttle. Default unlimited.
 //
+// Consumer groups (all optional):
+//   RUNE_GROUP_MAX_GROUPS           — int32 > 0, the most consumer groups this broker coordinates at once (#214).
+//                                     Default 10000.  A JoinGroup that would create one more group is refused.
+//
 // For cross-datacenter deployments set these higher (e.g. 1000/200/2000 ms).
 //
 // E5.2: Aeron media-driver threading mode (optional):
@@ -459,6 +463,9 @@ struct NodeConfig {
     /// as dead (fails its partitions over).  0 = the default, 3 x the election's leader-heartbeat timeout.  A deterministic
     /// knob for fault tests (a wiped node must boot and find itself the committed leader before it is fenced out).
     int64_t brokerLivenessTimeoutMs = 0;
+    /// RUNE_GROUP_MAX_GROUPS (#214): the most consumer groups coordinated at once.  0 = the default
+    /// (GroupCoordinationService::kDefaultMaxGroups).
+    int32_t groupMaxGroups = 0;
 
     // Review 2026-10-04 MEDIUM-3 (RUNE_SURVIVOR_LEADER_ELECTION, default false):
     // opt-in position-proven survivor election for a partition whose committed
