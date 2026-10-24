@@ -19,8 +19,10 @@
 // epoch until the initiator proved it holds the new one) and promoted by a second install of the same epoch.  An older
 // epoch is never dropped on a timer or on an event: one instance receives one peer sender over several Aeron streams
 // that are not ordered against each other, so "a newer epoch was seen" never proves no older frame is in flight.  A
-// slot is evicted only under slot pressure (the oldest one that is not the send epoch), which the handshake's
-// exchange rate limit makes rare.
+// slot is evicted only under slot pressure, which the handshake's exchange rate limit makes rare: first the oldest
+// ABANDONED epoch (installed before the send epoch, never the send epoch, never opened a frame - a receive-only epoch
+// whose exchange was superseded, issue #584), else the oldest one that is not the send epoch.  A former send epoch is
+// never treated as abandoned: a lagging peer may still seal under it.
 #include <rune/crypto/Aead.h>
 #include <rune/peerlink/PeerLinkKeys.h>
 
@@ -61,7 +63,8 @@ public:
     ///   - a slot already holding that epoch with the same masters keeps its windows and sequence numbers (the
     ///     promotion of a receive-only epoch);
     ///   - the same epoch number with other masters (a restarted responder reused it) replaces that slot fresh;
-    ///   - otherwise a free slot, else the slot with the oldest install that is not the send epoch.
+    ///   - otherwise a free slot, else the oldest abandoned epoch (installed before the send epoch, never the send epoch,
+    ///     never opened a frame; issue #584), else the slot with the oldest install that is not the send epoch.
     /// keys.install == SendAndReceive then makes it the send epoch; ReceiveOnly leaves the send epoch alone.
     /// `nowNs` is unused (epochs never expire on a timer); kept for its many call sites.  False: the table is full, a
     /// node id does not fit the u16 header field, or a cipher could not be built - the link is then not usable
@@ -126,6 +129,7 @@ private:
         uint64_t                                 sendSeq = 0;
         RecvSender                               recv;                    // the ONE sender id this receiver's role accepts
         uint64_t                                 installOrder = 0;        // from installs_ (the eviction order)
+        bool                                     used = false;            // was the send epoch or opened a frame (#584)
     };
     static constexpr uint8_t kNoSend = 0xFF;
     struct PeerSlot {

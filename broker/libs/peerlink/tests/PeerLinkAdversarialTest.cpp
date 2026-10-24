@@ -154,8 +154,9 @@ struct Sim {
             }
             now += pl::PeerHandshake::kRetryNs;
             tick();
-            const auto* eb = std::get_if<pl::Established>(&b.hs.state());
-            if (data.empty() && hsTo[0].empty() && hsTo[1].empty() && eb && !eb->unconfirmedAccept &&
+            // Issue #545: a stale unconfirmed epoch (its exchange abandoned) is legal and no longer re-sent, so quiet
+            // queues after a tick, both ends Established and one send epoch are the convergence.
+            if (data.empty() && hsTo[0].empty() && hsTo[1].empty() && std::holds_alternative<pl::Established>(b.hs.state()) &&
                 std::holds_alternative<pl::Established>(a.hs.state()) && a.crypto.currentEpoch(2) == b.crypto.currentEpoch(1))
                 return true;
         }
@@ -170,9 +171,12 @@ struct Sim {
 // at random; data frames are reordered against them (other streams) and live at most 150 ms.  EVERY data frame that is
 // delivered must open (no UnknownEpoch, no BadTag), and the link must converge to one send epoch once the loss stops.
 // Mutation: the responder installing SendAndReceive at the Proof (receiveFirst = false) turns this red.
+// Issue #584: widened from 200 seeds (the responder starting a second epoch while one was unconfirmed, and the
+// initiator evicting the responder's send epoch, failed ~1 seed in 200).
+constexpr uint64_t kModelSeeds = 1'000;
 TEST(PeerLinkAdversarialRegression, NoDeliveredFrameIsDroppedAcrossLossyReorderedRehandshakesAdversarialRegression) {
     uint64_t rekeys = 0, opened = 0;
-    for (uint64_t seed = 1; seed <= 200; ++seed) {
+    for (uint64_t seed = 1; seed <= kModelSeeds; ++seed) {
         Sim s(seed);
         s.link();
         ASSERT_TRUE(s.a.crypto.hasLink(2) && s.b.crypto.hasLink(1)) << "seed " << seed;
@@ -184,6 +188,120 @@ TEST(PeerLinkAdversarialRegression, NoDeliveredFrameIsDroppedAcrossLossyReordere
     }
     EXPECT_GT(rekeys, 1'000u) << "the model must actually re-handshake";
     EXPECT_GT(opened, 20'000u);
+}
+
+namespace {
+const pl::Established* estOf(const pl::PeerHandshake& h);
+/// Pops the next handshake frame queued to `to`, asserts its tag and returns it (empty when the queue is empty).
+Bytes popHs(Sim& s, int to, pl::PeerMsg want) {
+    if (s.hsTo[to].empty()) { ADD_FAILURE() << "no handshake frame queued to " << to; return {}; }
+    Bytes f = s.hsTo[to].front(); s.hsTo[to].pop_front();
+    EXPECT_EQ(f[0], static_cast<uint8_t>(want)) << "to " << to;
+    return f;
+}
+} // namespace
+
+// ---- Issue #584: a responder holds at most ONE fresh unconfirmed epoch.  A re-handshake whose Confirm was lost, then ----
+// a second same-incarnation exchange: the responder answers the second Proof with the SAME Accept (epoch E, no E+1),
+// the initiator - now in ChallengeSent - answers it from its `prior` with E's Confirm, and the responder promotes E.
+// Mutation: removing the deferral in establishAsResponder_ (fix 1) mints E+1 and leaves the responder sealing under
+// E-1 -> red; removing the any-state answer in onAccept (fix 2) leaves the re-sent Accept unanswered -> red.
+TEST(PeerLinkAdversarialRegression, AResponderNeverStartsASecondEpochWhileOneIsUnconfirmedRegression) {
+    Sim s(584);
+    s.link();
+    ASSERT_TRUE(s.a.crypto.hasLink(2) && s.b.crypto.hasLink(1));
+    const uint32_t e0 = s.b.crypto.currentEpoch(1);
+    s.now += 2'000 * kMs;
+    s.absorb(0, s.a.hs.rekeyForTest(s.now));
+    s.deliverHs(1, popHs(s, 1, pl::PeerMsg::HelloV2));
+    s.deliverHs(0, popHs(s, 0, pl::PeerMsg::ChallengeV2));
+    s.deliverHs(1, popHs(s, 1, pl::PeerMsg::ProofV2));
+    const Bytes accept1 = popHs(s, 0, pl::PeerMsg::Accept);
+    s.deliverHs(0, accept1);
+    (void)popHs(s, 1, pl::PeerMsg::Confirm);   // lost
+    ASSERT_TRUE(s.failure.empty()) << s.failure;
+    const auto* eb = estOf(s.b.hs);
+    ASSERT_TRUE(eb && eb->unconfirmedAccept);
+    const uint32_t e1 = eb->keys.epoch;
+    ASSERT_EQ(e1, e0 + 1);
+    ASSERT_EQ(s.b.crypto.currentEpoch(1), e0) << "receive-first: B still seals under the old epoch";
+    ASSERT_EQ(s.a.crypto.currentEpoch(2), e1);
+
+    s.now += pl::PeerHandshake::kRetryNs;   // a second exchange at the gate's rate, inside B's kAwaitNs
+    s.absorb(0, s.a.hs.rekeyForTest(s.now));
+    s.deliverHs(1, popHs(s, 1, pl::PeerMsg::HelloV2));
+    s.deliverHs(0, popHs(s, 0, pl::PeerMsg::ChallengeV2));
+    ASSERT_TRUE(std::holds_alternative<pl::ChallengeSent>(s.a.hs.state()));
+    pl::PeerProofV2 proof;
+    {
+        const Bytes f = popHs(s, 1, pl::PeerMsg::ProofV2);
+        ASSERT_TRUE(pl::PeerProofV2::decode(f.data(), f.size(), proof));
+    }
+    auto o = s.b.hs.onProofV2(proof, s.now);
+    EXPECT_FALSE(o.established) << "no new epoch while E is unconfirmed";
+    ASSERT_TRUE(o.frame);
+    EXPECT_EQ(Bytes(o.frame->data(), o.frame->data() + o.frame->size()), accept1) << "the SAME Accept (epoch E) again";
+    eb = estOf(s.b.hs);
+    ASSERT_TRUE(eb && eb->unconfirmedAccept);
+    EXPECT_EQ(eb->keys.epoch, e1);
+    s.absorb(1, std::move(o));
+    // The initiator (ChallengeSent, prior = E) answers with E's Confirm and stays in its exchange.
+    s.deliverHs(0, popHs(s, 0, pl::PeerMsg::Accept));
+    EXPECT_TRUE(std::holds_alternative<pl::ChallengeSent>(s.a.hs.state()));
+    s.deliverHs(1, popHs(s, 1, pl::PeerMsg::Confirm));
+    ASSERT_TRUE(s.failure.empty()) << s.failure;
+    EXPECT_EQ(s.b.crypto.currentEpoch(1), e1) << "B promoted E";
+    eb = estOf(s.b.hs);
+    ASSERT_TRUE(eb);
+    EXPECT_FALSE(eb->unconfirmedAccept);
+    EXPECT_EQ(eb->keys.epoch, e1);
+    ASSERT_TRUE(s.converge()) << s.describe();
+    EXPECT_EQ(s.b.crypto.dropsOf(OR::UnknownEpoch) + s.a.crypto.dropsOf(OR::UnknownEpoch), 0u);
+}
+
+// ---- Issue #545: an unconfirmed Accept whose initiator abandoned the exchange stops being re-sent.  Every Accept is ----
+// lost; the initiator's ChallengeSent gives up after kAwaitNs and restores its prior epoch.  Over 11 s the responder
+// sends at most kAwaitNs / kRetryNs + 1 Accepts, and a later re-handshake still completes with one send epoch.
+// Mutation: dropping the `nowNs - e->sinceNs < kAwaitNs` bound from PeerHandshake::tick (fix 3) -> ~55 Accepts -> red.
+TEST(PeerLinkAdversarialRegression, AnAbandonedUnconfirmedAcceptStopsBeingResentRegression) {
+    Sim s(545);
+    s.link();
+    ASSERT_TRUE(s.a.crypto.hasLink(2) && s.b.crypto.hasLink(1));
+    const uint32_t e0 = s.a.crypto.currentEpoch(2);
+    s.now += 2'000 * kMs;
+    s.absorb(0, s.a.hs.rekeyForTest(s.now));
+    s.deliverHs(1, popHs(s, 1, pl::PeerMsg::HelloV2));
+    s.deliverHs(0, popHs(s, 0, pl::PeerMsg::ChallengeV2));
+    s.deliverHs(1, popHs(s, 1, pl::PeerMsg::ProofV2));
+    ASSERT_TRUE(estOf(s.b.hs) && estOf(s.b.hs)->unconfirmedAccept);
+    int accepts = 0;
+    const int64_t end = s.now + 11'000 * kMs;
+    for (int i = 0; i < 1'000 && s.now < end; ++i) {
+        for (int to : {0, 1}) {
+            while (!s.hsTo[to].empty()) {
+                Bytes f = s.hsTo[to].front(); s.hsTo[to].pop_front();
+                if (to == 0 && f[0] == static_cast<uint8_t>(pl::PeerMsg::Accept)) { ++accepts; continue; }   // lost
+                s.deliverHs(to, f);
+            }
+        }
+        s.now += 50 * kMs;
+        s.tick();
+    }
+    ASSERT_TRUE(s.failure.empty()) << s.failure;
+    ASSERT_TRUE(estOf(s.a.hs)) << "the initiator gave up and restored its prior epoch";
+    EXPECT_EQ(s.a.crypto.currentEpoch(2), e0);
+    EXPECT_LE(accepts, static_cast<int>(pl::PeerHandshake::kAwaitNs / pl::PeerHandshake::kRetryNs) + 1)
+        << "the abandoned Accept must not be re-sent forever";
+    EXPECT_GE(accepts, 1);
+    // A new exchange replaces the stale unconfirmed epoch and both ends converge on it.
+    s.absorb(0, s.a.hs.rekeyForTest(s.now));
+    ASSERT_TRUE(s.converge()) << s.describe();
+    const auto* eb = estOf(s.b.hs);
+    ASSERT_TRUE(eb);
+    EXPECT_FALSE(eb->unconfirmedAccept);
+    EXPECT_GT(s.b.crypto.currentEpoch(1), e0);
+    EXPECT_EQ(s.b.crypto.currentEpoch(1), s.a.crypto.currentEpoch(2));
+    EXPECT_EQ(eb->keys.epoch, s.b.crypto.currentEpoch(1));
 }
 
 // ---- Input bounds: every new wire message truncated / extended at every length, and each tag under another body. ----

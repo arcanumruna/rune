@@ -55,7 +55,12 @@
 // Issue #241: the responder of a re-handshake with the SAME initiator incarnation installs the new epoch RECEIVE-ONLY
 // (Out.established->install) and keeps sealing under the old one until the initiator proves it holds the new epoch:
 // its Confirm, or (a legacy initiator) an authenticated frame under it (onPeerUsedEpoch).  The unconfirmed Accept is
-// re-sent every kRetryNs and an Established initiator answers it with its Confirm again.
+// re-sent every kRetryNs while the epoch is fresh (kAwaitNs after its install, the initiator's own give-up; issue #545)
+// and the initiator answers it with its Confirm again from any state whose live link holds that epoch (issue #584).
+// After kAwaitNs the Accept is no longer re-sent but the epoch stays unconfirmed: a late Confirm or authenticated frame
+// still promotes it.  Issue #584: a responder holds at most ONE fresh unconfirmed epoch per peer - a new exchange of the
+// same initiator incarnation completes only once the previous epoch was confirmed or went stale; until then its Proof
+// is answered with the pending Accept again.  A different incarnation (a restarted initiator) is never deferred.
 //
 // Rule 3: the link is ONE variant, each alternative holding exactly what that state needs.
 #include <rune/peerlink/ClusterKeys.h>
@@ -86,8 +91,10 @@ struct EphSecret {
     void scrub() noexcept { rune::crypto::secureZero({bytes.data(), bytes.size()}); }
 };
 /// Issue #241 - the receive-first install of a re-handshake:
-///   responder: `unconfirmedAccept` is the Accept of an epoch installed RECEIVE-ONLY, re-sent every kRetryNs until the
-///              initiator's Confirm (MAC `wantConfirm`) or an authenticated frame under the epoch promotes it;
+///   responder: `unconfirmedAccept` is the Accept of an epoch installed RECEIVE-ONLY, promoted by the initiator's
+///              Confirm (MAC `wantConfirm`) or an authenticated frame under the epoch.  Re-sent every kRetryNs only
+///              while `sinceNs` is less than kAwaitNs ago (#545); kept after that (a late promotion still works).  While
+///              it is fresh, a new same-incarnation exchange is answered with it instead of a new epoch (#584);
 ///   initiator: `confirm` is the Confirm it sent for this epoch (re-sent when the same Accept comes again) and
 ///              `acceptConfirm` the Accept MAC it verified (a re-sent Accept is recognised by a constant-time compare).
 struct Established {
