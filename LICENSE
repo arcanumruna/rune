@@ -1,56 +1,136 @@
 Arcanum Realms Community License Agreement
-Version 1.0
+Version 1.1
 
 Copyright (c) 2026 Arcanum Realms LTD. All rights reserved.
 
 This Arcanum Realms Community License Agreement ("Agreement") applies to Rune, including its source code, object
 code, documentation and other materials published in this repository (the "Software").
 By copying, using, modifying or distributing the Software you ("Licensee") agree to this Agreement. If you do
-not agree, do not use the Software.
+not agree, do not use the Software. If you accept this Agreement on behalf of an organization, "Licensee" means
+that organization and its Affiliates, and you confirm that you have authority to bind it.
 
-1. License Grant.
-   Subject to the terms and conditions of this Agreement, Arcanum Realms LTD ("Licensor") grants Licensee a non-exclusive,
-   royalty-free, worldwide, non-transferable, non-sublicensable license to:
-   (a) use the Software, including in production, for any purpose other than an Excluded Purpose;
-   (b) copy and modify the Software and create derivative works of it for any purpose other than an Excluded
-       Purpose; and
-   (c) distribute the Software, and derivative works of it, in source or object form, for any purpose other
-       than an Excluded Purpose, provided that every copy is accompanied by this Agreement and any NOTICE file
-       included with the Software.
+1. Definitions.
+   (a) "Affiliate" means an entity that controls, is controlled by, or is under common control with a party,
+       where "control" means ownership of more than fifty percent of the voting interests.
+   (b) "Derivative Work" means any modification of the Software, or any work based on or incorporating the
+       Software or a substantial part of it.
+   (c) "Licensee Product" means a game, application, product or service whose primary value to its users is
+       something other than the Rune Functionality, such as gameplay, content or a business application,
+       even if it uses the Software internally.
+   (d) "Rune Functionality" means the durable-log, streaming, messaging, database, key-value,
+       materialized-view, query or schema-registry functionality of the Software, or substantially similar
+       functionality of a Derivative Work.
+   (e) "Service Provider" means a contractor, consultant, cloud or hosting provider, or other third party that
+       acts on Licensee's behalf.
 
-2. Excluded Purpose.
-   An "Excluded Purpose" is making available any software-as-a-service, platform-as-a-service,
-   infrastructure-as-a-service, managed service or other similar online service, or any software product, that
-   competes with Licensor's products or services that provide the Software, including offering the Software's
-   durable-log, streaming, database or materialized-view functionality to third parties as a hosted or managed
-   service, or selling, reselling or relicensing the Software. Using the Software as the backend of games,
-   products and services that Licensee itself operates is not an Excluded Purpose.
+2. License Grant.
+   Subject to this Agreement, Arcanum Realms LTD ("Licensor") grants Licensee a non-exclusive, royalty-free,
+   worldwide license, for any purpose other than an Excluded Purpose, to:
+   (a) use the Software, including in production;
+   (b) copy and modify the Software and create Derivative Works of it; and
+   (c) distribute copies of the Software and Derivative Works, in source or object form, on their own or as
+       part of a Licensee Product, provided that every copy is accompanied by this Agreement and any NOTICE
+       file included with the Software.
+   Licensee may not sublicense or transfer this Agreement, except to a successor of its entire business or of
+   the Licensee Products that use the Software. Each recipient of a copy distributed under section 2(c)
+   receives its license directly from Licensor under this Agreement, and Licensee may not impose further
+   restrictions on that recipient's exercise of these rights.
 
-3. Conditions.
+3. Patent License.
+   Licensor grants Licensee a non-exclusive, royalty-free, worldwide license under the patent claims
+   licensable by Licensor that are necessarily infringed by the Software as published by Licensor, to make,
+   use, sell, offer for sale, import and otherwise exercise the rights in section 2, for any purpose other
+   than an Excluded Purpose. If Licensee or any of its Affiliates starts litigation (including a cross-claim
+   or counterclaim) alleging that the Software infringes a patent, every license granted to Licensee under
+   this Agreement terminates on the date that litigation is filed.
+
+4. Excluded Purpose.
+   An "Excluded Purpose" is any of the following:
+   (a) making the Rune Functionality available to third parties as a hosted, managed, cloud, platform or
+       infrastructure service, including database-as-a-service, streaming-as-a-service or backend-as-a-service,
+       whether or not for a fee;
+   (b) selling, licensing or otherwise commercially distributing the Software or a Derivative Work as a
+       product whose primary value to its users is the Rune Functionality; or
+   (c) providing a commercial support, maintenance or certification program for the Software to third parties
+       that is marketed as a substitute for Licensor's own support or managed offerings.
+
+5. Permitted Uses.
+   For clarity, none of the following is an Excluded Purpose:
+   (a) using the Software as the backend of Licensee Products that Licensee or its Affiliates operate,
+       including Licensee Products that Licensee sells, licenses or provides to its own customers or players;
+   (b) having a Service Provider host, deploy, operate, modify or support the Software for Licensee, on
+       infrastructure controlled by either of them, solely for Licensee's own Licensee Products;
+   (c) a Service Provider performing consulting, integration, development or support work for a specific
+       client that is itself a Licensee, solely for that client's own use permitted by this Agreement;
+   (d) distributing the Software as part of a Licensee Product, including server binaries, tools, editor
+       plugins and development kits for that Licensee Product;
+   (e) evaluation, testing, benchmarking, research, education and publishing the results; and
+   (f) internal use by Licensee and its Affiliates for any purpose.
+   The rights under sections 5(b) and 5(c) are exercised on Licensee's behalf. Licensee is responsible for its
+   Service Providers' compliance with this Agreement in that work.
+
+6. Conditions.
    (a) Licensee must not remove or alter any copyright, license or attribution notices in the Software.
-   (b) Licensee must not use Licensor's names, logos or trademarks (including "Arcanum Realms", "Rune" and the Rune
-       mark) except to accurately identify the origin of the Software.
-   (c) Derivative works must carry prominent notices stating that they were modified, and by whom.
+   (b) Licensee must not use Licensor's names, logos or trademarks (including "Arcanum Realms", "Rune" and the
+       Rune mark) except to accurately identify the origin of the Software. A Derivative Work that changes the
+       Rune Functionality must not be presented as Rune or as endorsed by Licensor.
+   (c) Derivative Works distributed to others must carry prominent notices stating that they were modified.
 
-4. Third-Party Components.
-   Components of the Software that were authored by third parties are licensed under their own terms, listed
-   in the NOTICE file. Nothing in this Agreement limits Licensee's rights under those licenses.
+7. Contributions.
+   Unless Licensor agrees otherwise in writing, by submitting any code, documentation or other material to
+   Licensor for inclusion in the Software (a "Contribution"), the contributor:
+   (a) grants Licensor and its successors a perpetual, worldwide, non-exclusive, royalty-free, irrevocable
+       license to use, copy, modify, distribute, sublicense and relicense the Contribution under any terms,
+       including commercial and other license terms;
+   (b) grants Licensor and every recipient of the Software a patent license on the terms of section 3 for any
+       patent claims licensable by the contributor that are necessarily infringed by the Contribution, alone
+       or combined with the Software; and
+   (c) confirms that it has the right to grant these licenses and that the Contribution is its original work
+       or is clearly identified with its source and license.
 
-5. Termination.
-   This Agreement terminates automatically if Licensee breaches any of its terms. On termination Licensee must
-   stop using, copying, modifying and distributing the Software. Sections 5 to 8 survive termination.
+8. Third-Party Components.
+   Components of the Software that were authored by third parties are licensed under their own terms, listed in
+   the NOTICE file. Nothing in this Agreement limits Licensee's rights under those licenses.
 
-6. Disclaimer of Warranty.
-   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-   TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT AND ACCURACY.
+9. Termination and Cure.
+   (a) If Licensee breaches this Agreement, Licensor may give Licensee written notice describing the breach.
+       If Licensee cures the breach within thirty (30) days of that notice, its license continues as if the
+       breach had not occurred. Licensee's first breach of section 6 that is cured within that period does
+       not affect its license.
+   (b) If Licensee does not cure the breach within that period, or if Licensee uses the Software for an
+       Excluded Purpose (other than through an inadvertent breach that it cures within thirty (30) days of
+       becoming aware of it), Licensor may terminate this Agreement by written notice.
+   (c) Licensee's license terminates automatically under section 3 as stated there.
+   (d) On termination Licensee must stop using, copying, modifying and distributing the Software. Termination
+       does not affect the licenses of recipients who received copies from Licensee and who comply with this
+       Agreement. Sections 7 to 13 survive termination.
 
-7. Limitation of Liability.
-   TO THE MAXIMUM EXTENT PERMITTED BY LAW, IN NO EVENT WILL LICENSOR BE LIABLE FOR ANY DIRECT, INDIRECT,
-   INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES, OR ANY LOSS OF DATA, PROFITS OR GOODWILL, ARISING
-   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THIS AGREEMENT, HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
-   EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+10. Disclaimer of Warranty.
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+    LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT AND
+    ACCURACY.
 
-8. General.
-   Licensor reserves all rights not expressly granted in this Agreement. If any provision of this Agreement is
-   held unenforceable, the remaining provisions remain in effect. For uses that require a different license,
-   including any Excluded Purpose, contact Arcanum Realms LTD for a commercial license.
+11. Limitation of Liability.
+    TO THE MAXIMUM EXTENT PERMITTED BY LAW, IN NO EVENT WILL LICENSOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES, OR ANY LOSS OF DATA, PROFITS OR GOODWILL, ARISING
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THIS AGREEMENT, HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+    EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES. NOTHING IN THIS AGREEMENT LIMITS LIABILITY THAT CANNOT
+    BE LIMITED UNDER APPLICABLE LAW.
+
+12. Versions.
+    Licensor may publish revised versions of this Agreement. Licensee may use each copy of the Software under
+    the version of this Agreement that accompanied it or, at Licensee's option, under any later version
+    published by Licensor. Copies of the Software that Licensor previously published under other license terms
+    remain available under those terms.
+
+13. General.
+    (a) Licensor reserves all rights not expressly granted in this Agreement. No other rights are granted by
+        implication, estoppel or otherwise.
+    (b) If any provision of this Agreement is held unenforceable, it will be enforced to the maximum extent
+        permissible and the remaining provisions remain in effect.
+    (c) This Agreement is governed by the laws of England and Wales, excluding its conflict-of-laws rules, and
+        the courts of England and Wales have exclusive jurisdiction, except that Licensor may seek injunctive
+        relief in any court of competent jurisdiction.
+    (d) Licensor's failure to enforce a provision is not a waiver of it.
+    (e) For uses that require a different license, including any Excluded Purpose, contact Arcanum Realms LTD
+        for a commercial license.
