@@ -23,7 +23,7 @@ std::vector<uint8_t> blob2() {   // {id int64 key, hp int32}
 /// fingerprint the library previews — exactly what AdminWorker does (Task 9).
 rc::CatalogEvent stamped(const rc::CatalogState& s, rc::Ops ops, std::string name, uint64_t objectId,
                          uint32_t prev, uint32_t next) {
-    rc::CatalogEvent e;
+    rc::CatalogEvent e{.formatVer = rc::kFormatV1};
     e.kind = rc::kindOf(ops); e.ops = std::move(ops); e.objectName = std::move(name);
     e.objectId = objectId; e.prevVersion = prev; e.newVersion = next;
     auto fp = rc::previewFingerprint(s, e);
@@ -68,17 +68,17 @@ TEST(CatalogApplyV1Regression, FingerprintMismatchIsAnErrorAndLeavesStateUnchang
 TEST(CatalogApplyV1Regression, EveryPreconditionIsExplicit) {
     rc::CatalogState s;
     ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, false), "t", 1, 0, 1), 0));
-    struct Case { const char* what; rc::CatalogEvent e; };
+    struct Case { const char* what; rc::CatalogEvent e{.formatVer = rc::kFormatV1}; };
     std::vector<Case> cases;
-    { rc::CatalogEvent e; e.kind = rc::EventKind::CreateTopic; e.ops = createOps(1, false); e.objectName = "t";
+    { rc::CatalogEvent e{.formatVer = rc::kFormatV1}; e.kind = rc::EventKind::CreateTopic; e.ops = createOps(1, false); e.objectName = "t";
       e.objectId = 2; e.newVersion = 1; cases.push_back({"name taken", e}); }   // unstamped (F10): no preview of an invalid event
-    { rc::CatalogEvent e; e.kind = rc::EventKind::CreateTopic; e.ops = createOps(7, false); e.objectName = "u";
+    { rc::CatalogEvent e{.formatVer = rc::kFormatV1}; e.kind = rc::EventKind::CreateTopic; e.ops = createOps(7, false); e.objectName = "u";
       e.objectId = 2; e.newVersion = 1; cases.push_back({"topicId != nextTopicId", e}); }
-    { rc::CatalogEvent e; e.kind = rc::EventKind::CreateTopic; e.ops = createOps(1, false); e.objectName = "u";
+    { rc::CatalogEvent e{.formatVer = rc::kFormatV1}; e.kind = rc::EventKind::CreateTopic; e.ops = createOps(1, false); e.objectName = "u";
       e.objectId = 9; e.newVersion = 1; cases.push_back({"objectId != nextObjectId", e}); }
-    { rc::CatalogEvent e; e.kind = rc::EventKind::DropTopic; e.ops = rc::DropTopicOps{0}; e.objectName = "t";
+    { rc::CatalogEvent e{.formatVer = rc::kFormatV1}; e.kind = rc::EventKind::DropTopic; e.ops = rc::DropTopicOps{0}; e.objectName = "t";
       e.objectId = 1; e.prevVersion = 3; e.newVersion = 4; cases.push_back({"version chain broken", e}); }
-    { rc::CatalogEvent e; e.kind = rc::EventKind::AlterSchema;
+    { rc::CatalogEvent e{.formatVer = rc::kFormatV1}; e.kind = rc::EventKind::AlterSchema;
       e.ops = rc::AlterSchemaOps{{rc::ResolvedAlterOp{.type = cd::AlterOpType::Drop, .tag = 0}}}; e.objectName = "t";
       e.objectId = 1; e.prevVersion = 1; e.newVersion = 2; cases.push_back({"alter of an untyped topic", e}); }
     for (auto& c : cases) {
@@ -141,7 +141,7 @@ TEST(CatalogApplyV1Regression, ResolvedOpsNameFieldsByDurableTagAndRoundTrip) {
 TEST(CatalogApplyV1Regression, AlterSchemaWithAStaleAddTagIsAPrecondition) {
     rc::CatalogState s;
     ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "t", 1, 0, 1), 0));
-    rc::CatalogEvent e; e.kind = rc::EventKind::AlterSchema; e.objectName = "t"; e.objectId = 1;
+    rc::CatalogEvent e{.formatVer = rc::kFormatV1}; e.kind = rc::EventKind::AlterSchema; e.objectName = "t"; e.objectId = 1;
     e.prevVersion = 1; e.newVersion = 2;
     e.ops = rc::AlterSchemaOps{{rc::ResolvedAlterOp{.type = cd::AlterOpType::Add, .tag = 7, .name = "mana",
                                                     .primType = cd::PrimType::Int32}}};   // nextTag is 2
@@ -171,7 +171,7 @@ TEST(CatalogApplyV1Regression, DropTopicReadByAViewIsRefused) {
     rc::ViewDef v; v.viewTopicId = 1; v.sinkPartitions = 2; v.keyField = "id"; v.sourceNames = {"src"};   // src has 2 (#143)
     v.outputDescriptorBlob = blob2(); v.normalizedPlanBlob = {1};
     ASSERT_TRUE(rc::apply(s, stamped(s, rc::CreateViewOps{v}, "v", 2, 0, 1), 1));
-    rc::CatalogEvent e; e.kind = rc::EventKind::DropTopic; e.ops = rc::DropTopicOps{0};
+    rc::CatalogEvent e{.formatVer = rc::kFormatV1}; e.kind = rc::EventKind::DropTopic; e.ops = rc::DropTopicOps{0};
     e.objectName = "src"; e.objectId = 1; e.prevVersion = 1; e.newVersion = 2;
     auto a = rc::apply(s, e, 2);
     ASSERT_FALSE(a.has_value());
@@ -256,7 +256,7 @@ rc::CatalogState fixture() {
     return s;
 }
 rc::CatalogEvent raw(rc::Ops ops, std::string name, uint64_t objectId, uint32_t prev, uint32_t next) {
-    rc::CatalogEvent e;
+    rc::CatalogEvent e{.formatVer = rc::kFormatV1};
     e.kind = rc::kindOf(ops); e.ops = std::move(ops); e.objectName = std::move(name);
     e.objectId = objectId; e.prevVersion = prev; e.newVersion = next;
     return e;
@@ -269,7 +269,7 @@ rc::ResolvedAlterOp dropOp(uint16_t tag) { return rc::ResolvedAlterOp{.type = cd
 
 struct RefusalCase {
     const char*          what;
-    rc::CatalogEvent     e;
+    rc::CatalogEvent     e{.formatVer = rc::kFormatV1};
     rc::ApplyError::Code code;
     const char*          detail;   // a substring the error names
 };
@@ -473,7 +473,7 @@ TEST(CatalogApplyV1Regression, OffsetsMustAdvanceAndUnknownFormatsHaveNoRules) {
     auto stale = rc::apply(s, e, 2);
     ASSERT_FALSE(stale.has_value());
     EXPECT_EQ(stale.error().code, rc::ApplyError::Code::Precondition);
-    auto v2 = e; v2.formatVer = 2;
+    auto v2 = e; v2.formatVer = 3;   // 1 and 2 have rules; 3 does not
     auto u = rc::apply(s, v2, 3);
     ASSERT_FALSE(u.has_value());
     EXPECT_EQ(u.error().code, rc::ApplyError::Code::UnsupportedFormat);
@@ -671,7 +671,7 @@ TEST(CatalogApplyV1Regression, ATombstonedObjectIdIsNeverLiveAgain) {
     rc::CatalogState s = fixture();
     ASSERT_TRUE(rc::apply(s, stamped(s, rc::DropViewOps{2}, "v", 3, 1, 2), 3));
     ASSERT_TRUE(rc::apply(s, stamped(s, rc::DropTopicOps{1}, "u", 2, 1, 2), 4));
-    struct Case { const char* what; rc::CatalogEvent e; const char* detail; };
+    struct Case { const char* what; rc::CatalogEvent e{.formatVer = rc::kFormatV1}; const char* detail; };
     const Case cases[] = {
         {"drop a dropped topic", raw(rc::DropTopicOps{1}, "u", 2, 2, 3), "no live topic with objectId 2"},
         {"drop a dropped view", raw(rc::DropViewOps{2}, "v", 3, 2, 3), "no live view with objectId 3"},
@@ -745,7 +745,7 @@ TEST(CatalogApplyV1Regression, ConfigEnumBoundsAreOneDefinitionForEventValidatio
             case F::Durability:     c.durability = static_cast<uint8_t>(v); break;
             case F::DurabilityTier: c.durabilityTier = static_cast<uint8_t>(v); break;
             }
-            rc::CatalogEvent e;
+            rc::CatalogEvent e{.formatVer = rc::kFormatV1};
             rc::CreateTopicOps o; o.topicId = 0; o.config = c;
             e.kind = rc::EventKind::CreateTopic; e.ops = o; e.objectName = "t"; e.objectId = 1; e.newVersion = 1;
             const bool encodes = rc::encode(e).has_value();
@@ -795,7 +795,7 @@ TEST(CatalogApplyRegression, AViewSinkWhosePartitionCountDiffersFromItsSourceIsR
         ASSERT_TRUE(rc::apply(s, stamped(s, w4, "w4", 4, 0, 1), 3)) << c.what;
         const uint64_t before = s.digest();
         const rc::ViewDef def = viewOver(c.sources, /*sink=*/4, c.sinkPartitions);   // nextTopicId is 4
-        rc::CatalogEvent e;
+        rc::CatalogEvent e{.formatVer = rc::kFormatV1};
         rc::ViewObject result;
         if (c.alter) {
             e = raw(rc::AlterViewOps{def}, "v", 3, 1, 2);

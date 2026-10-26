@@ -24,6 +24,7 @@ add_library(rune_catalog STATIC
     src/catalog/CatalogEvent.cpp
     src/catalog/CatalogState.cpp
     src/catalog/CatalogFingerprint.cpp
+    src/catalog/CatalogFingerprintV2.cpp
     src/catalog/ApplyV1.cpp
     src/catalog/CatalogReplayer.cpp
     src/catalog/CatalogQueries.cpp
@@ -241,7 +242,8 @@ add_executable(rune_catalog_tests
     tests/catalog/CatalogFingerprintTest.cpp
     tests/catalog/CatalogReplayerTest.cpp
     tests/catalog/CatalogQueriesTest.cpp
-    tests/catalog/CatalogGoldenTest.cpp)
+    tests/catalog/CatalogGoldenTest.cpp
+    tests/catalog/NamespaceCatalogV2Test.cpp)
 target_link_libraries(rune_catalog_tests PRIVATE rune_catalog GTest::gtest_main)
 target_compile_definitions(rune_catalog_tests PRIVATE
     RUNE_CATALOG_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/catalog/golden")

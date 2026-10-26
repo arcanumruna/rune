@@ -444,7 +444,9 @@ std::expected<Staged, ApplyError> ApplyV1::run(const CatalogState& s, const Cata
         else if constexpr (std::is_same_v<T, SetCompatibilityOps>) return setCompatibility(s, e, offset, o);
         else if constexpr (std::is_same_v<T, CreateViewOps>)       return createView(s, e, offset, o);
         else if constexpr (std::is_same_v<T, AlterViewOps>)        return alterView(s, e, offset, o);
-        else                                                       return dropView(s, e, offset, o);
+        else if constexpr (std::is_same_v<T, DropViewOps>)         return dropView(s, e, offset, o);
+        else   // a namespace kind (formatVer 2): not a rule of this table; ApplyV2 owns them
+            return fail(offset, Code::Precondition, prefix(e) + "namespace kinds have no formatVer-1 rule");
     }, e.ops);
 }
 

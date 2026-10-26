@@ -2,6 +2,7 @@
 // fingerprint verification), the digest, and the F20 resolve / unresolve of ALTER ops.
 #include <rune/catalog/CatalogState.h>
 #include <rune/catalog/CatalogFingerprint.h>
+#include <rune/catalog/CatalogFingerprintV2.h>
 #include <rune/catalog/TopicName.h>
 #include <rune/codec/Fingerprint.h>
 #include <rune/codec/Serialize.h>
@@ -90,17 +91,31 @@ uint64_t CatalogState::digest() const noexcept {
 }
 
 // ── apply ─────────────────────────────────────────────────────────────────────
+namespace {
+bool isNamespaceKind(EventKind k) noexcept { return static_cast<uint16_t>(k) >= kReservedKindFirst; }
+/// The fingerprint a formatVer's events carry for the object their apply produces: v1 the object's own
+/// (CatalogFingerprint.h), v2 mixed with the namespace (CatalogFingerprintV2.h, D4).
+uint64_t expectedFingerprint(const CatalogEvent& e, uint64_t objectFingerprint) noexcept {
+    return e.formatVer == kFormatV1 ? objectFingerprint : objectFingerprintV2(objectFingerprint, e.nsId);
+}
+std::unexpected<ApplyError> unsupported(int64_t offset, const CatalogEvent& e, std::string_view why) {
+    return std::unexpected(ApplyError{offset, ApplyError::Code::UnsupportedFormat, 0, 0,
+                                      "formatVer " + std::to_string(e.formatVer) + " " + std::string(why)});
+}
+} // namespace
+
 std::expected<Applied, ApplyError> apply(CatalogState& s, const CatalogEvent& e, int64_t offset) {
-    if (e.formatVer != kFormatV1)
+    if (e.formatVer != kFormatV1 && e.formatVer != kFormatV2)
         return std::unexpected(ApplyError{offset, ApplyError::Code::UnsupportedFormat, 0, 0,
                                           "formatVer " + std::to_string(e.formatVer) + " has no apply rules"});
     if (offset <= s.appliedOffset())
         return std::unexpected(ApplyError{offset, ApplyError::Code::Precondition, 0, 0,
                                           "offset " + std::to_string(offset) + " is not past the applied offset " +
                                               std::to_string(s.appliedOffset())});
+    if (isNamespaceKind(e.kind) || e.nsId != 0) return unsupported(offset, e, "namespace events have no apply rules yet");
     auto staged = ApplyV1::run(s, e, offset);
     if (!staged) return std::unexpected(std::move(staged.error()));
-    const uint64_t actual = ApplyV1::fingerprintOfStaged(*staged);
+    const uint64_t actual = expectedFingerprint(e, ApplyV1::fingerprintOfStaged(*staged));
     if (actual != e.fingerprint)
         return std::unexpected(ApplyError{offset, ApplyError::Code::FingerprintMismatch, e.fingerprint, actual,
                                           std::string(kindName(e.kind)) + " '" + e.objectName + "'"});
@@ -108,12 +123,13 @@ std::expected<Applied, ApplyError> apply(CatalogState& s, const CatalogEvent& e,
 }
 
 std::expected<uint64_t, ApplyError> previewFingerprint(const CatalogState& s, const CatalogEvent& e) {
-    if (e.formatVer != kFormatV1)
+    if (e.formatVer != kFormatV1 && e.formatVer != kFormatV2)
         return std::unexpected(ApplyError{-1, ApplyError::Code::UnsupportedFormat, 0, 0,
                                           "formatVer " + std::to_string(e.formatVer) + " has no apply rules"});
+    if (isNamespaceKind(e.kind) || e.nsId != 0) return unsupported(-1, e, "namespace events have no apply rules yet");
     auto staged = ApplyV1::run(s, e, -1);
     if (!staged) return std::unexpected(std::move(staged.error()));
-    return ApplyV1::fingerprintOfStaged(*staged);
+    return expectedFingerprint(e, ApplyV1::fingerprintOfStaged(*staged));
 }
 
 std::string_view applyErrorName(ApplyError::Code c) noexcept {

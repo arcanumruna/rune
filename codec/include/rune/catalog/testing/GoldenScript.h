@@ -75,6 +75,7 @@ public:
               std::optional<ReplayedFrom> replayedFrom = std::nullopt, std::string authenticated = {}) {
         const auto i = static_cast<uint64_t>(events_.size());
         CatalogEvent e;
+        e.formatVer   = kFormatV1;   // FROZEN: the v1 script stays a formatVer-1 log (kCurrentFormatVer is 2)
         e.kind        = kindOf(ops);
         e.ops         = std::move(ops);
         e.objectId    = objectId;

@@ -33,6 +33,7 @@ using rune::codec::PrimType;
 namespace {
 rc::CatalogEvent baseEvent(rc::Ops ops) {
     rc::CatalogEvent e;
+    e.formatVer = rc::kFormatV1;   // this file pins the FROZEN v1 layout; NamespaceCatalogV2Test.cpp pins v2
     e.kind = rc::kindOf(ops);
     e.objectId = 7;
     e.objectName = "players";
@@ -92,6 +93,7 @@ rc::ReplayedFrom replay() { return {.clusterId = "src", .offset = 12, .principal
 /// The golden event of a kind: compact non-default header, principal and replayedFrom.
 rc::CatalogEvent goldenEvent(std::size_t i) {
     rc::CatalogEvent e;
+    e.formatVer = rc::kFormatV1;
     e.ops = everyKind().at(i);
     e.kind = rc::kindOf(e.ops);
     e.objectId = 0x0102030405060708ull;
@@ -383,7 +385,7 @@ TEST(CatalogEventRegression, OpsLengthDisagreeingWithItsBodyIsRefused) {
 
 // ── value refusals: encode refuses EXACTLY what decode refuses (one validation) ─
 TEST(CatalogEventRegression, UnknownFormatVersionIsRefusedByEncodeAndDecode) {
-    for (const uint16_t v : {uint16_t{0}, uint16_t{2}, uint16_t{0xFFFF}}) {
+    for (const uint16_t v : {uint16_t{0}, uint16_t{3}, uint16_t{0xFFFF}}) {   // 1 and 2 are the known formats
         auto b = rc::encode(baseEvent(rc::DropTopicOps{.topicId = 1})).value();
         putU16(b, 0, v);
         auto d = rc::decode(b);

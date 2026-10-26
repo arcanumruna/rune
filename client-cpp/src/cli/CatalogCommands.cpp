@@ -564,6 +564,8 @@ std::expected<std::vector<uint8_t>, std::string> remappedViewPlan(const cat::Vie
 std::optional<std::string> issueEvent(rc::Client& c, const cat::CatalogState& st, const cat::RecordedEvent& src,
                                       const rc::DdlOptions& ddl, std::chrono::milliseconds t) {
     const cat::CatalogEvent& e = src.event;
+    if (e.nsId != 0 && static_cast<uint16_t>(e.kind) < cat::kReservedKindFirst)   // the client DDL addresses `default` only
+        return "an event of namespace " + std::to_string(e.nsId) + " cannot be replayed yet";
     return std::visit(
         [&](const auto& o) -> std::optional<std::string> {
             using T = std::decay_t<decltype(o)>;
@@ -627,10 +629,13 @@ std::optional<std::string> issueEvent(rc::Client& c, const cat::CatalogState& st
             } else if constexpr (std::is_same_v<T, cat::DropTopicOps>) {
                 const auto r = c.dropTopicAndWait(e.objectName, ddl, t);
                 return failureOf(r.errorCode, r.detail);
-            } else {
-                static_assert(std::is_same_v<T, cat::DropViewOps>);
+            } else if constexpr (std::is_same_v<T, cat::DropViewOps>) {
                 const auto r = c.dropViewAndWait(e.objectName, ddl, t);
                 return failureOf(r.errorCode, r.detail);
+            } else {   // NamespaceCreated / LimitsSet / StateChanged / Deleted: no client DDL for them yet (plan Task 11)
+                static_assert(std::is_same_v<T, cat::NamespaceCreatedOps> || std::is_same_v<T, cat::NamespaceLimitsSetOps> ||
+                              std::is_same_v<T, cat::NamespaceStateChangedOps> || std::is_same_v<T, cat::NamespaceDeletedOps>);
+                return std::string("a namespace event (") + std::string(cat::kindName(e.kind)) + ") cannot be replayed yet";
             }
         },
         e.ops);
