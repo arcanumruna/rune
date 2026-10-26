@@ -36,6 +36,8 @@ if(BUILD_TESTING)
         tests/consensus/ConsensusDevirtTest.cpp
         tests/consensus/AgentRunnerStopRingTest.cpp)
     target_link_libraries(rune_consensus_tests PRIVATE rune_consensus GTest::gtest_main)
+    # Header-only full-disk rig shared with the storage tests.
+    target_include_directories(rune_consensus_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../storage/include)
     include(GoogleTest)
     gtest_discover_tests(rune_consensus_tests
         PROPERTIES ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")

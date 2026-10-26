@@ -2,6 +2,7 @@
 #include <rune/storage/MappedFile.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
+#include <cstdio>
 #include <filesystem>
 #include <stdexcept>
 #include <atomic>
@@ -377,4 +378,56 @@ TEST(MappedFileRegression, RecoveredActiveSegmentIndexIsPrefaultedRegression) {
     EXPECT_EQ(mappedPages(idx->dataForTest(), pages, page), pages) << "the recovered active index is not prefaulted";
     std::filesystem::remove_all(dir);
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Full disk: a writable map must be backed by real blocks when it is made, so a
+// full filesystem answers with an exception at open/resize instead of a SIGBUS
+// on the first store into a page that has no block behind it.  Mutation: drop
+// the fallocate in MappedFile.cpp → each child dies on SIGBUS.
+// ---------------------------------------------------------------------------
+#include <rune/storage/testing/DiskFullTmpfs.h>
+
+TEST(MappedFileRegression, WritableMapOnAFullDiskThrowsInsteadOfSigbusRegression) {
+    rune::test::runOnTinyTmpfs(64 * 1024, [](const std::string& dir) {
+        try {
+            MappedFile mf(dir + "/big.index", 1 << 20, true, /*prefault=*/true);
+            std::fprintf(stderr, "prefaulted 1 MiB map on a 64 KiB fs did not throw\n");
+            return false;
+        } catch (const std::runtime_error&) {}
+        try {
+            MappedFile mf(dir + "/big2.index", 1 << 20, true, /*prefault=*/false);
+            for (int i = 0; i < (1 << 20); i += 4096) mf.data()[i] = 1;   // SIGBUS without the fix
+            std::fprintf(stderr, "unprefaulted 1 MiB map on a 64 KiB fs did not throw\n");
+            return false;
+        } catch (const std::runtime_error&) {}
+        return true;
+    });
+}
+
+TEST(MappedFileRegression, ResizeGrowthOnAFullDiskThrowsInsteadOfSigbusRegression) {
+    rune::test::runOnTinyTmpfs(64 * 1024, [](const std::string& dir) {
+        MappedFile mf(dir + "/grow.index", 16 * 1024, true);
+        mf.data()[0] = 7;
+        try {
+            mf.resize(1 << 20);
+            for (int i = 0; i < (1 << 20); i += 4096) mf.data()[i] = 1;   // SIGBUS without the fix
+            std::fprintf(stderr, "resize to 1 MiB on a 64 KiB fs did not throw\n");
+            return false;
+        } catch (const std::runtime_error&) {}
+        return true;
+    });
+}
+
+TEST(MappedFileRegression, WritableMapOnAFilledDiskThrowsRegression) {
+    rune::test::runOnTinyTmpfs(64 * 1024, [](const std::string& dir) {
+        if (!rune::test::fillDisk(dir)) { std::fprintf(stderr, "could not fill fs\n"); return false; }
+        try {
+            MappedFile mf(dir + "/small.index", 4096, true);
+            mf.data()[0] = 1;   // SIGBUS without the fix
+            std::fprintf(stderr, "4 KiB map on a full fs did not throw\n");
+            return false;
+        } catch (const std::runtime_error&) {}
+        return true;
+    });
 }
