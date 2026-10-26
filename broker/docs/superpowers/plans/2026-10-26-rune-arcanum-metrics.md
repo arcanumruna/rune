@@ -242,11 +242,13 @@ numbers are hints; use the quoted anchors):
 - **D52. The file layout mirrors Aeron `CountersManager`.**
   - The header is 4 KiB: `i32 layoutVersion` (written last with a release store), `i32 pad`, `i64 pid`,
     `i64 startEpochNs` (passed in by the caller), `i32 maxSlots`, `i32 metadataRecordLength = 512`,
-    `i32 valueRecordLength = 128`, then the user tag bytes.
-  - The metadata area holds `maxSlots × 512 B` records:
-    - `i32 state`, `i32 typeId`, `i64 regId`, `i64 ownerTag`;
-    - `i32 keyLength` plus a 112-byte key;
-    - `i32 labelLength` plus a 380-byte label.
+    `i32 valueRecordLength = 128`, then the user tag bytes from offset 36 to the end of the header (4060 bytes).
+  - The metadata area holds `maxSlots × 512 B` records, filled exactly:
+    - `i32 state` @0, `i32 typeId` @4, `i64 regId` @8, `i64 ownerTag` @16, `i32 kind` @24 (`MetricKind`, D53);
+    - `i32 keyLength` @28 plus a 112-byte key @32..144;
+    - `i32 labelLength` @144 plus a 364-byte label @148..512.
+    - Aeron's record has no regId, ownerTag or keyLength; those 24 extra bytes come out of the label (Aeron's 380).
+      Rune's longest label is far below 364.
   - The value area holds `maxSlots × 128 B` records: an `i64` value at offset 0, padded to two cache lines against
     false sharing (Aeron's `COUNTER_LENGTH`).
   - Little-endian, with `static_assert`s on every offset.
@@ -330,7 +332,7 @@ Operations × entities × timings. Each cell is a row in a table-driven test (Ta
   - the file header.
 - **Inputs at the bounds:**
   - capacity 0, 1, `requiredSlots − 1`, `requiredSlots`, and `max` (the int32 cap / file-size cap);
-  - a label of 0, 379, 380 and 381 bytes, and a key of 0, 112 and 113 bytes;
+  - a label of 0, 363, 364 and 365 bytes, and a key of 0, 112 and 113 bytes;
   - typeId 0, negative and max;
   - a value near `INT64_MAX` for `add` (wraps two's-complement, documented; the reader's rate handles a wrap as one
     Δ).
@@ -399,7 +401,7 @@ inline constexpr int32_t kHeaderLength = 4096;
 inline constexpr int32_t kMetadataRecordLength = 512;
 inline constexpr int32_t kValueRecordLength = 128;
 inline constexpr int32_t kMaxKeyLength = 112;
-inline constexpr int32_t kMaxLabelLength = 380;
+inline constexpr int32_t kMaxLabelLength = 364;
 enum class SlotState : int32_t { Unused = 0, Allocated = 1, Freed = -1 };
 enum class MetricKind : int32_t { Counter = 1, Gauge = 2 };
 struct FileLayout {                     // computed, never stored separately
@@ -514,7 +516,7 @@ the state to `Freed` (release) and pushes the slot. A label is written `"<label>
 their own text (`ns="acme",ns_id="42"` in Phase 2).
 
 - [ ] **Step 1: failing tests:**
-  - `MetricsWriterRegression.ErrorTable/*` (table-driven): capacity 0/1/full; key 0/112/113; label 0/380/381;
+  - `MetricsWriterRegression.ErrorTable/*` (table-driven): capacity 0/1/full; key 0/112/113; label 0/364/365;
     typeId 0, −1 and `INT32_MAX`; regId −1 (auto), 0 and a duplicate (allowed: Phase 2 reuses one regId across a
     block). Each row checks the status, `allocatedCount`, that no metadata byte changed on failure, and zero
     allocations.
