@@ -719,10 +719,10 @@ TEST(DdlFixRegression, B3_CatalogRefusesEveryCaseVariantAndReportsTheExistingTop
         const int64_t a = h.submit(c.existingMode ? Op::DefineTransient : Op::DefineDisk, c.existing);
         h.settle();
         ASSERT_EQ(h.response(a)->err, kOk);
-        const std::string* folds = h.state().liveNameFoldingOnto(c.variant);
+        const std::string* folds = h.state().liveNameFoldingOnto(rune::catalog::kDefaultNsId, c.variant);
         ASSERT_NE(folds, nullptr);
         EXPECT_EQ(*folds, c.existing);
-        EXPECT_EQ(h.state().liveNameFoldingOnto(c.existing), nullptr) << "the exact name is not a conflict";
+        EXPECT_EQ(h.state().liveNameFoldingOnto(rune::catalog::kDefaultNsId, c.existing), nullptr) << "the exact name is not a conflict";
         const int64_t b = h.submit(c.requestMode ? Op::DefineTransient : Op::DefineDisk, c.variant);
         h.settle();
         EXPECT_EQ(h.response(b)->err, kTopicExists);

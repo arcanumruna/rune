@@ -8,6 +8,8 @@
 // Deterministic: timestamps 1'760'000'000'000 + 1000*i, fixed principals, request ids
 // RequestId{0x601D, i+1} with request fingerprints 0xF00D'0000 + i (F14).
 //
+// goldenScriptV2() (below) is the formatVer-2 namespace script, beside this one; it never edits a v1 event.
+//
 // FROZEN with formatVer 1: tests/catalog/golden/v1/basic.rcat was generated from this script
 // and CatalogGoldenRegression.TheGoldenScriptStillProducesTheCheckedInBytes pins it.  Never
 // edit an event; a new formatVer gets a new script beside this one.  (One deliberate exception, #143:
@@ -69,13 +71,18 @@ namespace cd = rune::codec;
 /// does not preview or apply (the script is broken — never silently emitted).
 class ScriptBuilder {
 public:
+    /// formatVer 1 (the frozen v1 script) or 2 (the namespace script).  Object helpers act in the namespace
+    /// set by inNs() (default 0); the namespace helpers name their subject explicitly.
+    explicit ScriptBuilder(uint16_t formatVer = kFormatV1) : formatVer_(formatVer) {}
+    void inNs(uint32_t nsId) { ns_ = nsId; }
     const CatalogState& state() const noexcept { return s_; }
 
     void emit(Ops ops, const std::string& name, uint64_t objectId, uint32_t prev, std::string statement,
               std::optional<ReplayedFrom> replayedFrom = std::nullopt, std::string authenticated = {}) {
         const auto i = static_cast<uint64_t>(events_.size());
         CatalogEvent e;
-        e.formatVer   = kFormatV1;   // FROZEN: the v1 script stays a formatVer-1 log (kCurrentFormatVer is 2)
+        e.formatVer   = formatVer_;   // the v1 script stays a formatVer-1 log (kCurrentFormatVer is 2)
+        e.nsId        = ns_;
         e.kind        = kindOf(ops);
         e.ops         = std::move(ops);
         e.objectId    = objectId;
@@ -143,19 +150,52 @@ public:
         emit(DropViewOps{v.def.viewTopicId}, name, v.objectId, v.version, std::move(stmt));
     }
 
+    // ── namespace helpers (formatVer 2) ──────────────────────────────────────────────────────────────────────
+    void nsCreate(const std::string& name, const rune::protocol::NamespaceLimits& limits, std::string stmt) {
+        NsScope g(*this, s_.namespaces().nextNsId());
+        emit(NamespaceCreatedOps{name, limits}, name, 0, 0, std::move(stmt));
+    }
+    void nsLimits(uint32_t nsId, const rune::protocol::NamespaceLimits& limits, std::string stmt) {
+        const NamespaceRecord& r = record(nsId);
+        NsScope g(*this, nsId);
+        emit(NamespaceLimitsSetOps{limits}, r.name, 0, r.version, std::move(stmt));
+    }
+    void nsState(uint32_t nsId, NsStateTag to, std::string stmt) {
+        const NamespaceRecord& r = record(nsId);
+        NsScope g(*this, nsId);
+        emit(NamespaceStateChangedOps{to}, r.name, 0, r.version, std::move(stmt));
+    }
+    void nsDelete(uint32_t nsId, std::string stmt) {
+        const NamespaceRecord& r = record(nsId);
+        NsScope g(*this, nsId);
+        emit(NamespaceDeletedOps{}, r.name, 0, r.version, std::move(stmt));
+    }
+
     std::vector<CatalogEvent> take() && { return std::move(events_); }
 
 private:
+    struct NsScope {   // the subject namespace of one namespace event
+        ScriptBuilder& b; uint32_t saved;
+        NsScope(ScriptBuilder& builder, uint32_t nsId) : b(builder), saved(builder.ns_) { b.ns_ = nsId; }
+        ~NsScope() { b.ns_ = saved; }
+    };
+    const NamespaceRecord& record(uint32_t nsId) const {
+        const NamespaceRecord* r = s_.namespaces().byId(nsId);
+        if (r == nullptr) throw std::logic_error("golden script: no namespace " + std::to_string(nsId));
+        return *r;
+    }
     const TopicObject& topic(const std::string& n) const {
-        const TopicObject* t = s_.topicByName(n);
+        const TopicObject* t = s_.topicByName(ns_, n);
         if (t == nullptr) throw std::logic_error("golden script: no live topic '" + n + "'");
         return *t;
     }
     const ViewObject& view(const std::string& n) const {
-        const ViewObject* v = s_.viewByName(n);
+        const ViewObject* v = s_.viewByName(ns_, n);
         if (v == nullptr) throw std::logic_error("golden script: no live view '" + n + "'");
         return *v;
     }
+    uint16_t                  formatVer_;
+    uint32_t                  ns_ = 0;
     CatalogState              s_;
     std::vector<CatalogEvent> events_;
 };
@@ -333,6 +373,63 @@ inline cd::AlterOp setCompatOp(cd::CompatMode m) {
         b.alterView("ev_view", std::move(v), "ALTER VIEW ev_view AS SELECT e.at, p.player FROM events e JOIN presence p",
                     ReplayedFrom{.clusterId = "", .offset = 0, .principal = "bob"});
     }
+    return std::move(b).take();
+}
+
+/// The 13 formatVer-2 golden events, offsets 0..12 (tests/catalog/golden/v2/namespaces.rcat):
+///    0 NamespaceCreated alpha (1)   1 NamespaceCreated beta (2)   2 NamespaceCreated gamma (3)
+///    3 CreateTopic t in alpha       4 CreateTopic t in beta  (the same name, two namespaces)
+///    5 NamespaceLimitsSet beta (maxTopics 40)
+///    6 CreateTopic players in default (typed)   7 CreateView v in alpha over t
+///    8 NamespaceStateChanged gamma -> SuspendedReadOnly   9 ... -> Active   10 ... -> Deleting
+///   11 NamespaceDeleted gamma     12 DropTopic t in beta
+[[nodiscard]] inline std::vector<CatalogEvent> goldenScriptV2() {
+    namespace cd = rune::codec;
+    golden_detail::ScriptBuilder b(kFormatV2);
+    auto limits = [](uint64_t maxTopics, uint64_t maxViews, uint64_t maxUsers, uint32_t features) {
+        rune::protocol::NamespaceLimits l;
+        l.maxTopics = maxTopics; l.maxViews = maxViews; l.maxUsers = maxUsers; l.featureBits = features;
+        l.maxPartitionsPerTopic = 64; l.maxMessageBytes = 1 << 20; l.produceBytesPerSec = 50'000'000;
+        return l;
+    };
+    b.nsCreate("alpha", limits(10, 5, 100, 0x0F), "CREATE NAMESPACE alpha");
+    b.nsCreate("beta", limits(20, 5, 100, 0xFF), "CREATE NAMESPACE beta");
+    b.nsCreate("gamma", limits(5, 1, 10, 0x01), "CREATE NAMESPACE gamma");
+    b.inNs(1);
+    b.createTopic("t", CreateTopicOps{}, "CREATE TOPIC t");
+    b.inNs(2);
+    {
+        CreateTopicOps o;
+        o.partitions = 2; o.replicationFactor = 1;
+        b.createTopic("t", std::move(o), "CREATE TOPIC t WITH (partitions=2, replicas=1)");
+    }
+    b.nsLimits(2, limits(40, 8, 200, 0xFF), "ALTER NAMESPACE beta SET LIMITS maxTopics=40");
+    b.inNs(0);
+    {
+        cd::DescriptorBuilder d("players");
+        d.add("id", cd::PrimType::Int64, 1, /*isKey=*/true).add("hp", cd::PrimType::Int32);
+        CreateTopicOps o;
+        o.partitions = 4; o.replicationFactor = 3;
+        o.schema = SchemaDef{.keyField = "id", .validate = true, .descriptorBlob = cd::serialize(d.build()), .nextTag = 2};
+        b.createTopic("players", std::move(o), "CREATE TOPIC players (id INT64 KEY, hp INT32)");
+    }
+    b.inNs(1);
+    {
+        cd::DescriptorBuilder out("v");
+        out.add("id", cd::PrimType::Int64, 1, true);
+        ViewDef v;
+        v.sinkPartitions = 1; v.keyField = "id"; v.sourceNames = {"t"};
+        v.normalizedPlanBlob = {0x05, 0x00, 0x00, 0x00, 0x00};
+        v.compiledPlanBlob = {0xC5, 0x00, 0x00, 0x00, 0x00};
+        v.outputDescriptorBlob = cd::serialize(out.build());
+        b.createView("v", std::move(v), "CREATE VIEW v AS SELECT id FROM t");
+    }
+    b.nsState(3, NsStateTag::SuspendedReadOnly, "SUSPEND NAMESPACE gamma READ ONLY");
+    b.nsState(3, NsStateTag::Active, "RESUME NAMESPACE gamma");
+    b.nsState(3, NsStateTag::Deleting, "DELETE NAMESPACE gamma");
+    b.nsDelete(3, "DELETE NAMESPACE gamma (finalize)");
+    b.inNs(2);
+    b.dropTopic("t", "DROP TOPIC t");
     return std::move(b).take();
 }
 

@@ -551,7 +551,7 @@ std::expected<std::vector<uint8_t>, std::string> remappedViewPlan(const cat::Vie
     if (!plan) return std::unexpected("the event's normalized view plan does not decode");
     std::vector<int32_t> ids;
     for (const std::string& name : def.sourceNames) {
-        const cat::TopicObject* t = target.topicByName(name);
+        const cat::TopicObject* t = target.topicByName(rune::catalog::kDefaultNsId, name);
         if (t == nullptr) return std::unexpected("source topic '" + name + "' does not exist on the target");
         ids.push_back(t->topicId);
     }
@@ -583,7 +583,7 @@ std::optional<std::string> issueEvent(rc::Client& c, const cat::CatalogState& st
                                                     topic, ddl, t);
                 return failureOf(r.errorCode, r.detail);
             } else if constexpr (std::is_same_v<T, cat::CreateSchemaOps>) {
-                const cat::TopicObject* top = st.topicByName(e.objectName);
+                const cat::TopicObject* top = st.topicByName(e.nsId, e.objectName);
                 if (top == nullptr) return "topic '" + e.objectName + "' does not exist on the target";
                 const auto r = c.defineTopicAndWait(
                     e.objectName, static_cast<uint32_t>(top->partitions), o.schema.keyField,
@@ -591,7 +591,7 @@ std::optional<std::string> issueEvent(rc::Client& c, const cat::CatalogState& st
                     o.schema.validate, clientPersistence(top->persistence), {}, ddl, t);
                 return failureOf(r.errorCode, r.detail);
             } else if constexpr (std::is_same_v<T, cat::AlterSchemaOps>) {
-                const cat::TopicObject* top = st.topicByName(e.objectName);
+                const cat::TopicObject* top = st.topicByName(e.nsId, e.objectName);
                 if (top == nullptr || !top->schema) return "topic '" + e.objectName + "' has no schema on the target";
                 // F20: the event stores durable tags; the target holds the same definition, so they map to its names.
                 auto ops = cat::unresolveAlterOps(*top->schema, std::span<const cat::ResolvedAlterOp>(o.ops));

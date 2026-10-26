@@ -432,7 +432,7 @@ TEST(CatalogApplierRegression, GoldenScriptProjectsTheRegistriesAndPostsEveryEff
     ASSERT_NE(presence, nullptr);
     EXPECT_EQ(presence->topicId, 6);
     EXPECT_EQ(presence->compatMode, rune::codec::CompatMode::Forward);
-    EXPECT_EQ(presence->version, rig.applier.state().topicByName("presence")->schema->schemaVersion);
+    EXPECT_EQ(presence->version, rig.applier.state().topicByName(rune::catalog::kDefaultNsId, "presence")->schema->schemaVersion);
     ASSERT_NE(rig.schemas.byName("events"), nullptr);
     EXPECT_EQ(rig.schemas.byName("events")->topicId, 1);
 
@@ -812,7 +812,7 @@ TEST(CatalogApplierRegression, OversizeViewEffectHaltsAtItsOffsetAndNeverAbortsR
     // M1: the halted state names the staged event; nothing of it was effected or made durable.
     EXPECT_EQ(rig.applier.stagedOffset(), 1);
     EXPECT_EQ(rig.applier.lastApplied().offset, 0);
-    EXPECT_NE(rig.applier.state().viewByName("wv"), nullptr) << "staged in state()";
+    EXPECT_NE(rig.applier.state().viewByName(rune::catalog::kDefaultNsId, "wv"), nullptr) << "staged in state()";
     EXPECT_EQ(rig.views.byName("wv"), nullptr) << "never projected";
     EXPECT_EQ(rune::node::readCatalogCheckpoint(rig.catalogDir())->appliedOffset, 0) << "never checkpointed";
     // The metric frame is on the ring, after the topic's effects.
@@ -871,7 +871,7 @@ TEST(CatalogApplierRegression, LeaderDryRunRefusesAnEventWhoseEffectsCannotBePos
     ASSERT_TRUE(refusal.has_value()) << "the oversize view is refused before it is appended";
     EXPECT_NE(refusal->find("CreateView 'wv'"), std::string::npos) << *refusal;
     EXPECT_NE(refusal->find("ViewPlanUpdate"), std::string::npos) << *refusal;
-    EXPECT_EQ(s.viewByName("wv"), nullptr) << "a dry run: the caller's state is untouched";
+    EXPECT_EQ(s.viewByName(rune::catalog::kDefaultNsId, "wv"), nullptr) << "a dry run: the caller's state is untouched";
 
     const auto val = wideScript(3000, true, false);
     EXPECT_TRUE(catalogEventEffectsRefusal(cat::CatalogState{}, val[0]).has_value());
@@ -908,7 +908,7 @@ TEST(CatalogApplierRegression, CoalescedBootSurvivesAHistoryLargerThanTheBacklog
         cat::CatalogState s;
         for (std::size_t i = 0; i < events.size(); ++i) {
             ASSERT_TRUE(cat::apply(s, events[i], static_cast<int64_t>(i)).has_value());
-            naive += schemaUpdateWireLen(materializedDescriptorOf(*s.topicByName("grow")).size());
+            naive += schemaUpdateWireLen(materializedDescriptorOf(*s.topicByName(rune::catalog::kDefaultNsId, "grow")).size());
         }
     }
     ASSERT_GT(naive, static_cast<std::size_t>(kAdminToControlRingBytes) * 5) << "naive volume > ring + 4x-ring backlog";
@@ -999,7 +999,7 @@ TEST(CatalogApplierRegression, TopicFramesSizeEveryVersionBootWillPostRegression
     const auto events = std::move(b).take();
     cat::CatalogState s;
     for (std::size_t i = 0; i < events.size(); ++i) ASSERT_TRUE(cat::apply(s, events[i], static_cast<int64_t>(i)).has_value());
-    const cat::TopicObject& t = *s.topicByName("sh");
+    const cat::TopicObject& t = *s.topicByName(rune::catalog::kDefaultNsId, "sh");
     ASSERT_EQ(t.schema->schemaVersion, 2);
     const std::size_t v1 = schemaUpdateWireLen(materializedDescriptorOf(t, 1).size());
     const std::size_t v2 = schemaUpdateWireLen(materializedDescriptorOf(t, 2).size());
@@ -1057,7 +1057,7 @@ TEST(CatalogApplierRegression, LeaderDryRunRefusesAFilterSchemaFrameThatCannotBe
         const auto events = wideScript(3000, false, false);
         cat::CatalogState s;
         ASSERT_TRUE(cat::apply(s, events.at(0), 0).has_value());
-        EXPECT_TRUE(topicEffectFramesError(*s.topicByName("wide"), catalogEffectMaxFrame(), 1).has_value());
+        EXPECT_TRUE(topicEffectFramesError(*s.topicByName(rune::catalog::kDefaultNsId, "wide"), catalogEffectMaxFrame(), 1).has_value());
     }
 }
 

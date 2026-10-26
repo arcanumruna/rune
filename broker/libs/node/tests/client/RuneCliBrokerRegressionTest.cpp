@@ -246,8 +246,8 @@ TEST(RuneCliBrokerRegression, ReplayRemapsViewSourcesOntoTheTargetsOwnTopicIds) 
     rcat::CatalogReplayer sr, dr;
     for (const auto& e : s) ASSERT_TRUE(sr.feedDecoded(e.offset, e.event).has_value());
     for (const auto& e : d) ASSERT_TRUE(dr.feedDecoded(e.offset, e.event).has_value()) << "the target's log verifies";
-    EXPECT_EQ(dr.state().topicByName("zzz")->topicId, 0);
-    EXPECT_EQ(dr.state().topicByName("events")->topicId, sr.state().topicByName("events")->topicId + 1);
+    EXPECT_EQ(dr.state().topicByName(rune::catalog::kDefaultNsId, "zzz")->topicId, 0);
+    EXPECT_EQ(dr.state().topicByName(rune::catalog::kDefaultNsId, "events")->topicId, sr.state().topicByName(rune::catalog::kDefaultNsId, "events")->topicId + 1);
 }
 
 TEST(RuneCliBrokerRegression, ReplayFromAnExportedFileAndATamperedFileIssuesNothing) {

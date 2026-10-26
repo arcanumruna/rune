@@ -79,7 +79,7 @@ std::optional<std::string> viewEffectFramesError(const cat::ViewObject& v, const
         return e;
     std::size_t src = 0;
     if (!v.def.sourceNames.empty())
-        if (const cat::TopicObject* s = state.topicByName(v.def.sourceNames.front()); s && s->schema) {
+        if (const cat::TopicObject* s = state.topicByName(v.nsId, v.def.sourceNames.front()); s && s->schema) {
             try {
                 src = materializedDescriptorOf(*s).size();
             } catch (const std::exception& ex) {

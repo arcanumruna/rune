@@ -560,7 +560,7 @@ public:
             all = {&viaLeaderOp, &toHalted};
             fillCommon_(run, toHalted);
             {   // the halted broker keeps serving what it applied: the catalog state, the registry AND the placement
-                const auto* base = admin(victim).applier().state().topicByName(kBase);
+                const auto* base = admin(victim).applier().state().topicByName(rune::catalog::kDefaultNsId, kBase);
                 run.haltedBrokerStillServesAppliedTopics =
                     serving(victim, kBase) && base != nullptr && registryHolds_(victim, base->topicId);
                 const auto* he = admin(victim).applier().haltError();
@@ -837,7 +837,7 @@ public:
     }
     ProduceResult produce(int32_t b, const std::string& topic, std::vector<uint8_t> bytes) {
         Broker& br = broker_(b);
-        const rune::catalog::TopicObject* t = br.admin->applier().state().topicByName(topic);
+        const rune::catalog::TopicObject* t = br.admin->applier().state().topicByName(rune::catalog::kDefaultNsId, topic);
         if (t == nullptr) return {7, -1};
         const int code = probe(b, t->topicId);
         if (code != 0) return {code, -1};
@@ -850,7 +850,7 @@ public:
     /// A topic of `b`'s applied catalog serves on `b` (applied + placed).
     [[nodiscard]] bool serving(int32_t b, const std::string& topic) {
         Broker& br = broker_(b);
-        const auto* t = br.admin->applier().state().topicByName(topic);
+        const auto* t = br.admin->applier().state().topicByName(rune::catalog::kDefaultNsId, topic);
         return t != nullptr && serves_(br, t->topicId);
     }
 
@@ -891,20 +891,20 @@ public:
             if (!br->alive || br->admin->applier().halted()) continue;
             const auto& st = br->admin->applier().state();
             auto topicOk = [&](const char* name) {
-                const auto* t = st.topicByName(name);
+                const auto* t = st.topicByName(rune::catalog::kDefaultNsId, name);
                 if (t == nullptr || t->persistence != want) return false;
                 const rune::node::TopicSpec* spec = br->ctl.reg->topic(t->topicId);
                 return spec != nullptr && spec->persistence == wantMode;
             };
             auto viewOk = [&] {
-                const auto* v = st.viewByName(kView);
+                const auto* v = st.viewByName(rune::catalog::kDefaultNsId, kView);
                 if (v == nullptr || v->def.persistence != want) return false;
                 const rune::node::TopicSpec* spec = br->ctl.reg->topic(v->def.viewTopicId);
                 return spec != nullptr && spec->persistence == wantMode;
             };
             switch (kind) {
-            case cm::Kind::DropTopic: if (st.topicByName(kTopic) != nullptr) return false; break;
-            case cm::Kind::DropView:  if (st.viewByName(kView) != nullptr) return false; break;
+            case cm::Kind::DropTopic: if (st.topicByName(rune::catalog::kDefaultNsId, kTopic) != nullptr) return false; break;
+            case cm::Kind::DropView:  if (st.viewByName(rune::catalog::kDefaultNsId, kView) != nullptr) return false; break;
             case cm::Kind::CreateView: case cm::Kind::AlterView:
                 if (!viewOk() || !topicOk(kSource)) return false;
                 break;
@@ -1319,7 +1319,7 @@ private:
         rv::ViewPlan p;
         p.viewName = view;
         p.key      = "id";
-        const rune::catalog::TopicObject* t = leaderState_().topicByName(source);
+        const rune::catalog::TopicObject* t = leaderState_().topicByName(rune::catalog::kDefaultNsId, source);
         p.sources.push_back(rv::SourceSpec{t ? t->topicId : 999'999, "id"});
         p.output.push_back(rv::AuthoredField{"id", rune::codec::PrimType::Int64, 0, "id", rv::MergeRule::Replace});
         p.output.push_back(rv::AuthoredField{"hp", rune::codec::PrimType::Int64, 0, "hp", rv::MergeRule::Replace});
@@ -1349,14 +1349,14 @@ private:
         }
         case DdlWhat::AlterConfig: {
             AlterTopicConfigMsg m; m.session = kSession; m.name = spec.name; m.meta = meta;
-            const auto* t = st.topicByName(spec.name);
+            const auto* t = st.topicByName(rune::catalog::kDefaultNsId, spec.name);
             m.expectedVersion = t != nullptr ? t->version : 0;
             m.changes = {{rune::catalog::ConfigKey::RetentionMs, 60'000}};
             return DdlRequest{std::move(m)};
         }
         case DdlWhat::AlterSchema: case DdlWhat::SetCompat: {
             AlterTopicMsg m; m.session = kSession; m.topicName = spec.name; m.meta = meta;
-            const auto* t = st.topicByName(spec.name);
+            const auto* t = st.topicByName(rune::catalog::kDefaultNsId, spec.name);
             m.expectedVersion = t != nullptr && t->schema ? t->schema->schemaVersion : 0;
             rune::codec::AlterOp op{};
             if (spec.what == DdlWhat::AlterSchema) {
@@ -1378,7 +1378,7 @@ private:
         }
         case DdlWhat::AlterView: {
             AlterViewMsg m; m.session = kSession; m.name = spec.name; m.keyField = "id"; m.persistence = persistence;
-            const auto* v = st.viewByName(spec.name);
+            const auto* v = st.viewByName(rune::catalog::kDefaultNsId, spec.name);
             m.expectedVersion = v != nullptr ? v->version : 0;
             m.planBlob = plan_(spec.name, kSource, true);
             m.meta = meta;
@@ -1414,9 +1414,9 @@ private:
         case cm::Kind::CreateSchema:      topic(false); break;
         case cm::Kind::AlterSchema:       topic(true); break;
         case cm::Kind::SetCompatibility:  topic(true); break;
-        case cm::Kind::CreateView:        if (!leaderState_().topicByName(kSource)) source(); break;
+        case cm::Kind::CreateView:        if (!leaderState_().topicByName(rune::catalog::kDefaultNsId, kSource)) source(); break;
         case cm::Kind::AlterView:
-        case cm::Kind::DropView:          if (!leaderState_().topicByName(kSource)) source(); view(); break;
+        case cm::Kind::DropView:          if (!leaderState_().topicByName(rune::catalog::kDefaultNsId, kSource)) source(); view(); break;
         }
         (void)typedCreate;
     }
@@ -1432,15 +1432,15 @@ private:
         }
     }
     [[nodiscard]] uint64_t targetObjectId_(cm::Kind k) {
-        if (k == cm::Kind::CreateTopic) { const auto* t = leaderState_().topicByName(kTopic); return t ? t->objectId : 0; }
-        if (k == cm::Kind::CreateView) { const auto* v = leaderState_().viewByName(kView); return v ? v->objectId : 0; }
-        if (isViewKind_(k)) { const auto* v = leaderState_().viewByName(kView); return v ? v->objectId : 0; }
-        const auto* t = leaderState_().topicByName(kTopic);
+        if (k == cm::Kind::CreateTopic) { const auto* t = leaderState_().topicByName(rune::catalog::kDefaultNsId, kTopic); return t ? t->objectId : 0; }
+        if (k == cm::Kind::CreateView) { const auto* v = leaderState_().viewByName(rune::catalog::kDefaultNsId, kView); return v ? v->objectId : 0; }
+        if (isViewKind_(k)) { const auto* v = leaderState_().viewByName(rune::catalog::kDefaultNsId, kView); return v ? v->objectId : 0; }
+        const auto* t = leaderState_().topicByName(rune::catalog::kDefaultNsId, kTopic);
         return t ? t->objectId : 0;
     }
     [[nodiscard]] uint32_t targetVersion_(cm::Kind k) {
-        if (isViewKind_(k)) { const auto* v = leaderState_().viewByName(kView); return v ? v->version : 0; }
-        const auto* t = leaderState_().topicByName(kTopic);
+        if (isViewKind_(k)) { const auto* v = leaderState_().viewByName(rune::catalog::kDefaultNsId, kView); return v ? v->version : 0; }
+        const auto* t = leaderState_().topicByName(rune::catalog::kDefaultNsId, kTopic);
         return t ? t->version : 0;
     }
 
@@ -1752,8 +1752,8 @@ private:
     }
     [[nodiscard]] std::optional<int32_t> appliedTopicId_(int32_t b, const std::string& name) {
         const auto& st = broker_(b).admin->applier().state();
-        if (const auto* t = st.topicByName(name)) return t->topicId;
-        if (const auto* v = st.viewByName(name)) return v->def.viewTopicId;
+        if (const auto* t = st.topicByName(rune::catalog::kDefaultNsId, name)) return t->topicId;
+        if (const auto* v = st.viewByName(rune::catalog::kDefaultNsId, name)) return v->def.viewTopicId;
         return std::nullopt;
     }
     void awaitServing_(const std::string& topic) {

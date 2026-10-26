@@ -158,11 +158,11 @@ int64_t wallClockMs() {
 /// The fold-equal live name `n` lands on, and its answer (TopicExists with the
 /// object's topic id).
 std::optional<DdlRejection> foldCollision(const cat::CatalogState& s, std::string_view n) {
-    const std::string* other = s.liveNameFoldingOnto(n);
+    const std::string* other = s.liveNameFoldingOnto(rune::catalog::kDefaultNsId, n);
     if (other == nullptr) return std::nullopt;
     int32_t id = -1;
-    if (const cat::TopicObject* t = s.topicByName(*other)) id = t->topicId;
-    else if (const cat::ViewObject* v = s.viewByName(*other)) id = v->def.viewTopicId;
+    if (const cat::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, *other)) id = t->topicId;
+    else if (const cat::ViewObject* v = s.viewByName(rune::catalog::kDefaultNsId, *other)) id = v->def.viewTopicId;
     return reject(kTopicExists, "name " + quotedName(n) + " differs only in letter case from " + quotedName(*other), id);
 }
 
@@ -847,7 +847,7 @@ std::optional<std::string> AdminWorker::fdBudgetRefusal_(const cat::CatalogEvent
         const auto& o = std::get<cat::CreateTopicOps>(e.ops);
         newTerm = fdNeedOfTopic(fdSpecOf(o.partitions, o.config), ready);
     } else {
-        altered = s.topicByName(e.objectName);
+        altered = s.topicByName(e.nsId, e.objectName);
         if (altered == nullptr) return std::nullopt;   // the dry run already refused it
         rune::protocol::TopicConfig next = altered->config;
         cat::applyConfigChanges(next, *alter);   // the resulting config (the apply's own rule)
@@ -1181,7 +1181,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
 
     cat::CatalogEvent e;
     e.objectName = m.name;
-    if (const cat::TopicObject* t = s.topicByName(m.name)) {
+    if (const cat::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, m.name)) {
         if (t->schema) return Rejected(reject(kTopicExists, {}, t->topicId, t->schema->schemaVersion));
         if (m.blob.empty()) return Rejected(reject(kTopicExists, {}, t->topicId, 0));   // untyped, nothing to adopt
         // Issue #129: adopting a schema is a new version of a LIVE topic (every other producer's records are then
@@ -1199,7 +1199,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         e.ops = cat::CreateSchemaOps{cat::SchemaDef{m.keyField, m.validate, m.blob, nextTag}};
         return e;
     }
-    if (const cat::ViewObject* v = s.viewByName(m.name)) {
+    if (const cat::ViewObject* v = s.viewByName(rune::catalog::kDefaultNsId, m.name)) {
         const RegistryEntry* out = reg_.byId(v->def.viewTopicId);
         return Rejected(reject(kTopicExists, {}, v->def.viewTopicId, out ? out->version : uint16_t{0}));
     }
@@ -1245,8 +1245,8 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
 
 AdminWorker::Built AdminWorker::buildAlter_(const AlterTopicMsg& m, const cat::CatalogState& s) const {
     // U1: a view's output is derived from its plan — never altered directly.
-    if (s.viewByName(m.topicName)) return Rejected(reject(kViewNotAlterable));
-    const cat::TopicObject* t = s.topicByName(m.topicName);
+    if (s.viewByName(rune::catalog::kDefaultNsId, m.topicName)) return Rejected(reject(kViewNotAlterable));
+    const cat::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, m.topicName);
     // F3: an untyped topic has no schema to alter — UnknownTopic, as today.
     if (t == nullptr || !t->schema) return Rejected(reject(kUnknownTopic));
     const int32_t  topicId = t->topicId;
@@ -1339,9 +1339,9 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
 AdminWorker::Built AdminWorker::buildCreateView_(const CreateViewMsg& m, const cat::CatalogState& s) const {
     if (m.persistence > 1) return Rejected(reject(kInvalidSchema));   // a direct submit
     if (!cat::isValidTopicName(m.viewName)) return Rejected(reject(kInvalidTopicName));
-    if (const cat::ViewObject* v = s.viewByName(m.viewName))
+    if (const cat::ViewObject* v = s.viewByName(rune::catalog::kDefaultNsId, m.viewName))
         return Rejected(reject(kViewExists, {}, v->def.viewTopicId));
-    if (const cat::TopicObject* t = s.topicByName(m.viewName)) return Rejected(reject(kTopicExists, {}, t->topicId));
+    if (const cat::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, m.viewName)) return Rejected(reject(kTopicExists, {}, t->topicId));
     if (auto fold = foldCollision(s, m.viewName)) return Rejected(std::move(*fold));
     auto def = viewDef_(m.viewName, m.keyField, m.persistence, m.planBlob, s.nextTopicId(), s);
     if (!def) return Rejected(std::move(def.error()));
@@ -1356,7 +1356,7 @@ AdminWorker::Built AdminWorker::buildCreateView_(const CreateViewMsg& m, const c
 
 AdminWorker::Built AdminWorker::buildAlterView_(const AlterViewMsg& m, const cat::CatalogState& s) const {
     if (m.persistence > 1) return Rejected(reject(kInvalidSchema));   // a direct submit
-    const cat::ViewObject* v = s.viewByName(m.name);
+    const cat::ViewObject* v = s.viewByName(rune::catalog::kDefaultNsId, m.name);
     if (v == nullptr) return Rejected(reject(kUnknownTopic, "no view named " + quotedName(m.name)));
     if (m.expectedVersion != 0 && m.expectedVersion != v->version)
         return Rejected(reject(kSchemaConflict, "view " + quotedName(m.name) + " is at version " + std::to_string(v->version),
@@ -1374,7 +1374,7 @@ AdminWorker::Built AdminWorker::buildAlterView_(const AlterViewMsg& m, const cat
 }
 
 AdminWorker::Built AdminWorker::buildDropView_(const DropViewMsg& m, const cat::CatalogState& s) const {
-    const cat::ViewObject* v = s.viewByName(m.name);
+    const cat::ViewObject* v = s.viewByName(rune::catalog::kDefaultNsId, m.name);
     if (v == nullptr) return Rejected(reject(kUnknownTopic, "no view named " + quotedName(m.name)));
     cat::CatalogEvent e;
     e.objectName  = v->name;
@@ -1386,10 +1386,10 @@ AdminWorker::Built AdminWorker::buildDropView_(const DropViewMsg& m, const cat::
 }
 
 AdminWorker::Built AdminWorker::buildDropTopic_(const DropTopicMsg& m, const cat::CatalogState& s) const {
-    if (s.viewByName(m.name)) return Rejected(reject(kInvalidRequest, quotedName(m.name) + " is a view; use DROP VIEW"));
-    const cat::TopicObject* t = s.topicByName(m.name);
+    if (s.viewByName(rune::catalog::kDefaultNsId, m.name)) return Rejected(reject(kInvalidRequest, quotedName(m.name) + " is a view; use DROP VIEW"));
+    const cat::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, m.name);
     if (t == nullptr) return Rejected(reject(kUnknownTopic, "no topic named " + quotedName(m.name)));
-    if (const cat::ViewObject* v = s.viewReading(m.name))
+    if (const cat::ViewObject* v = s.viewReading(rune::catalog::kDefaultNsId, m.name))
         return Rejected(reject(kInvalidRequest, "topic " + quotedName(m.name) + " is the source of view " + quotedName(v->name)));
     cat::CatalogEvent e;
     e.objectName  = t->name;
@@ -1401,8 +1401,8 @@ AdminWorker::Built AdminWorker::buildDropTopic_(const DropTopicMsg& m, const cat
 }
 
 AdminWorker::Built AdminWorker::buildAlterConfig_(const AlterTopicConfigMsg& m, const cat::CatalogState& s) const {
-    if (s.viewByName(m.name)) return Rejected(reject(kViewNotAlterable));
-    const cat::TopicObject* t = s.topicByName(m.name);
+    if (s.viewByName(rune::catalog::kDefaultNsId, m.name)) return Rejected(reject(kViewNotAlterable));
+    const cat::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, m.name);
     if (t == nullptr) return Rejected(reject(kUnknownTopic, "no topic named " + quotedName(m.name)));
     if (m.expectedVersion != 0 && m.expectedVersion != t->version)
         return Rejected(reject(kSchemaConflict, "topic " + quotedName(m.name) + " is at version " + std::to_string(t->version),

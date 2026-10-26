@@ -773,12 +773,12 @@ bool QlRun::run(const PAsOf& s, const rc::DdlOptions&) {
     const auto r = broker.client().catalogAsOf(s.at, kCatalogWait);
     if (!r) return failRead(catalogReadFailure(r.error()), r.error());
     if (s.kind == cat::ObjectType::View) {
-        const cat::ViewObject* v = r->viewByName(s.name);
+        const cat::ViewObject* v = r->viewByName(rune::catalog::kDefaultNsId, s.name);
         if (v == nullptr) return fail("no view '" + s.name + "' at that point of the catalog");
         out << formatViewDefinition(*v);
         return true;
     }
-    const cat::TopicObject* t = r->topicByName(s.name);
+    const cat::TopicObject* t = r->topicByName(rune::catalog::kDefaultNsId, s.name);
     if (t == nullptr) return fail("no topic '" + s.name + "' at that point of the catalog");
     out << (s.kind == cat::ObjectType::Schema ? formatSchemaDefinition(*t) : formatTopicDefinition(*t));
     return true;

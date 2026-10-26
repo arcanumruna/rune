@@ -25,4 +25,12 @@ uint64_t nsFingerprint(uint32_t nsId, std::string_view name, const rune::protoco
     return cdd::fnv1a_byte(h, static_cast<uint8_t>(state));
 }
 
+uint64_t nsTombstoneFingerprint(uint32_t nsId, std::string_view name, uint32_t finalVersion) noexcept {
+    uint64_t h = cdd::kFnvSeed;
+    h = cdd::fnv1a_byte(h, 'X');
+    h = cdd::fnv1a_u32le(h, nsId);
+    h = detail::fnvBytes(h, name.data(), name.size());
+    return cdd::fnv1a_u32le(h, finalVersion);
+}
+
 } // namespace rune::catalog

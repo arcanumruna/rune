@@ -409,7 +409,7 @@ public:
         rv::ViewPlan p;
         p.viewName = view;
         p.key      = "id";
-        const rune::catalog::TopicObject* t = admin_->applier().state().topicByName(source);
+        const rune::catalog::TopicObject* t = admin_->applier().state().topicByName(rune::catalog::kDefaultNsId, source);
         p.sources.push_back(rv::SourceSpec{t ? t->topicId : 999'999, "id"});
         p.output.push_back(rv::AuthoredField{"id", rune::codec::PrimType::Int64, 0, "id", rv::MergeRule::Replace});
         p.output.push_back(rv::AuthoredField{"hp", rune::codec::PrimType::Int64, 0, "hp", rv::MergeRule::Replace});

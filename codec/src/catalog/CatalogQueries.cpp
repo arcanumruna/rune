@@ -80,7 +80,7 @@ std::optional<uint64_t> latestObject(std::span<const RecordedEvent> log, const A
     std::optional<uint64_t> id;
     for (const RecordedEvent& rec : log) {
         const CatalogEvent& e = rec.event;
-        if (e.objectName != at.name) continue;
+        if (e.objectName != at.name || e.nsId != at.nsId) continue;
         const bool hit = at.type == ObjectType::Topic  ? e.kind == EventKind::CreateTopic
                        : at.type == ObjectType::View   ? e.kind == EventKind::CreateView
                                                        : isSchemaEvent(e);
@@ -184,26 +184,27 @@ bool sameOutput(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
 }
 
 template <class Obj>
-void addPairs(std::map<std::string, std::pair<const Obj*, const Obj*>>& m, const std::vector<const Obj*>& objs, bool isA) {
+void addPairs(std::map<NsKey, std::pair<const Obj*, const Obj*>>& m, const std::vector<const Obj*>& objs, bool isA) {
     for (const Obj* o : objs) {
-        auto& p = m[o->name];
+        auto& p = m[NsKey{o->nsId, o->name}];
         (isA ? p.first : p.second) = o;
     }
 }
 template <class Obj>
 void diffType(ObjectType type, const std::vector<const Obj*>& a, const std::vector<const Obj*>& b,
               std::vector<DiffEntry>& out) {
-    std::map<std::string, std::pair<const Obj*, const Obj*>> byName;   // (type, name) order
+    std::map<NsKey, std::pair<const Obj*, const Obj*>> byName;   // (type, nsId, name) order
     addPairs(byName, a, true);
     addPairs(byName, b, false);
-    for (const auto& [name, p] : byName) {
+    for (const auto& [key, p] : byName) {
         const uint64_t fa = p.first ? fingerprintOf(*p.first) : 0;
         const uint64_t fb = p.second ? fingerprintOf(*p.second) : 0;
         if (p.first && p.second && fa == fb) continue;
         DiffEntry d{.change = !p.first ? DiffEntry::Change::Added
                             : !p.second ? DiffEntry::Change::Removed
                                         : DiffEntry::Change::Changed,
-                    .type = type, .name = name, .fingerprintA = fa, .fingerprintB = fb, .fields = {}};
+                    .type = type, .name = key.name, .fingerprintA = fa, .fingerprintB = fb, .fields = {},
+                    .nsId = key.nsId};
         if (d.change == DiffEntry::Change::Changed) d.fields = changedFields(*p.first, *p.second);
         out.push_back(std::move(d));
     }
@@ -225,6 +226,7 @@ std::vector<const RecordedEvent*> history(std::span<const RecordedEvent> log, co
         const CatalogEvent& e = rec.event;
         if (f.type && !matchesType(e, *f.type)) continue;
         if (!f.name.empty() && e.objectName != f.name) continue;
+        if (f.nsId && e.nsId != *f.nsId) continue;
         if (e.timestampMs < f.sinceMs) continue;
         out.push_back(&rec);
     }

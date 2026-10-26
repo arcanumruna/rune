@@ -1576,7 +1576,7 @@ TEST(SchemaGatewayRegression, CatalogDdlOpsRouteThroughTheGatewayAndAnswerDdlRes
     EXPECT_EQ(ca->errorCode, 0u);
     EXPECT_EQ(ca->newVersion, 2u);
     EXPECT_EQ(ca->gateTopicId, -1);
-    EXPECT_EQ(h.agent->worker().applier().state().topicByName("orders")->config.retentionMs, 1234);
+    EXPECT_EQ(h.agent->worker().applier().state().topicByName(rune::catalog::kDefaultNsId, "orders")->config.retentionMs, 1234);
 
     // DropTopic (74).
     pc::DropTopic dt;
@@ -1589,7 +1589,7 @@ TEST(SchemaGatewayRegression, CatalogDdlOpsRouteThroughTheGatewayAndAnswerDdlRes
     ASSERT_TRUE(da.has_value());
     EXPECT_EQ(da->errorCode, 0u);
     EXPECT_EQ(da->newVersion, 3u);
-    EXPECT_EQ(h.agent->worker().applier().state().topicByName("orders"), nullptr) << "dropped";
+    EXPECT_EQ(h.agent->worker().applier().state().topicByName(rune::catalog::kDefaultNsId, "orders"), nullptr) << "dropped";
 
     // DropView (76) of an unknown view: UnknownTopic with a detail.
     pc::DropView dv;

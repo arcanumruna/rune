@@ -4,6 +4,7 @@
 // the __catalog prefix it has applied").  Single-threaded; owned by whoever replays
 // (the broker's admin thread, a client, the CLI).  Mutated ONLY by apply().
 #include <rune/catalog/CatalogEvent.h>
+#include <rune/catalog/NamespaceRegistry.h>
 #include <rune/codec/AlterOps.h>
 
 #include <cstdint>
@@ -38,6 +39,7 @@ struct TopicObject {
     Persistence                persistence       = Persistence::Disk;
     TopicConfig                config;
     std::optional<SchemaState> schema;
+    uint32_t                   nsId              = 0;    // the namespace that owns this topic (names are per-namespace)
     bool operator==(const TopicObject&) const = default;
 };
 struct ViewObject {
@@ -45,6 +47,7 @@ struct ViewObject {
     std::string name;
     uint32_t    version  = 0;
     ViewDef     def;
+    uint32_t    nsId     = 0;
     bool operator==(const ViewObject&) const = default;
 };
 struct Tombstone {
@@ -52,6 +55,7 @@ struct Tombstone {
     std::string name;
     uint32_t    finalVersion = 0;
     bool        wasView      = false;
+    uint32_t    nsId         = 0;
     bool operator==(const Tombstone&) const = default;
 };
 struct Applied {
@@ -61,6 +65,7 @@ struct Applied {
     uint64_t  fingerprint    = 0;
     int32_t   createdTopicId = -1;   // CreateTopic / CreateView / AlterView: the new (sink) topic id
     int32_t   droppedTopicId = -1;   // DropTopic / DropView / AlterView: the retired (sink) topic id
+    uint32_t  nsId           = 0;    // the event's namespace (the subject, for a namespace kind)
 };
 /// What an applied DDL answered — replayed to a retry with the same requestId (ruling 9).
 struct RequestRecord {
@@ -78,7 +83,9 @@ struct ApplyError {
     /// object hashes differently from e.fingerprint.  BadOps: the event's own content is
     /// malformed (kind/ops disagree, an enum out of range, a blob that does not
     /// deserialize, an ALTER the evolution engine refuses).
-    enum class Code : uint8_t { UnsupportedFormat, Precondition, FingerprintMismatch, BadOps };
+    /// BadNsId (formatVer 2): the event names a namespace id the rules refuse: a NamespaceCreated whose id is not
+    /// nextNsId(), or any other event naming a namespace that does not exist (never created, or Deleted).
+    enum class Code : uint8_t { UnsupportedFormat, Precondition, FingerprintMismatch, BadOps, BadNsId };
     int64_t     offset   = -1;
     Code        code     = Code::Precondition;
     uint64_t    expected = 0;    // FingerprintMismatch: the event's fingerprint
@@ -102,23 +109,34 @@ inline constexpr int64_t kMaxSegmentRollBytes = int64_t{INT32_MAX} - (int64_t{64
 /// an ALTER's open-file need with it).  Validate the result with topicConfigError.
 void applyConfigChanges(TopicConfig& c, const AlterTopicConfigOps& o) noexcept;
 
-struct ApplyV1;   // src/catalog/ApplyV1.h — the frozen formatVer-1 rules
+struct ApplyV1;   // src/catalog/ApplyV1.h — the formatVer-1 rules (object kinds; shared with formatVer 2)
+struct ApplyV2;   // src/catalog/ApplyV2.cpp — formatVer 2: the namespace kinds and the namespace gate
 
 class CatalogState {
 public:
-    [[nodiscard]] const TopicObject* topicByName(std::string_view n) const;
+    CatalogState() = default;
+    /// `defaultNsLimits`: the cluster default limits the predefined `default` namespace carries (resolved at boot).
+    explicit CatalogState(const rune::protocol::NamespaceLimits& defaultNsLimits) : namespaces_(defaultNsLimits) {}
+
+    /// Names are PER NAMESPACE: the same local name may be live in several namespaces, and every name lookup
+    /// takes the nsId (0 = `default`).  Ids (objectId, topicId, viewTopicId) stay global.
+    [[nodiscard]] const TopicObject* topicByName(uint32_t nsId, std::string_view n) const;
     [[nodiscard]] const TopicObject* topicByObjectId(uint64_t id) const;
     [[nodiscard]] const TopicObject* topicByTopicId(int32_t topicId) const;
-    [[nodiscard]] const ViewObject*  viewByName(std::string_view n) const;
+    [[nodiscard]] const ViewObject*  viewByName(uint32_t nsId, std::string_view n) const;
     [[nodiscard]] const ViewObject*  viewByObjectId(uint64_t id) const;
     [[nodiscard]] const ViewObject*  viewByViewTopicId(int32_t topicId) const;
-    /// A live topic or view owns this name.
-    [[nodiscard]] bool nameTaken(std::string_view n) const { return topicByName(n) || viewByName(n); }
-    /// A live topic or view name that differs from `n` only in ASCII letter case (two such
+    /// A live topic or view of namespace `nsId` owns this name.
+    [[nodiscard]] bool nameTaken(uint32_t nsId, std::string_view n) const {
+        return topicByName(nsId, n) || viewByName(nsId, n);
+    }
+    /// A live topic or view name of namespace `nsId` that differs from `n` only in ASCII letter case (two such
     /// names would share one directory on a case-insensitive filesystem); nullptr: none.
-    [[nodiscard]] const std::string* liveNameFoldingOnto(std::string_view n) const;
-    /// A live view whose sources include `topicName` (nullptr: none).
-    [[nodiscard]] const ViewObject* viewReading(std::string_view topicName) const;
+    [[nodiscard]] const std::string* liveNameFoldingOnto(uint32_t nsId, std::string_view n) const;
+    /// A live view of namespace `nsId` whose sources include `topicName` (nullptr: none).
+    [[nodiscard]] const ViewObject* viewReading(uint32_t nsId, std::string_view topicName) const;
+    /// The namespaces (nsId 0 `default` is predefined).  Mutated only by formatVer-2 apply.
+    [[nodiscard]] const NamespaceRegistry& namespaces() const noexcept { return namespaces_; }
     /// Live objects in objectId order.
     [[nodiscard]] std::vector<const TopicObject*> topics() const;
     [[nodiscard]] std::vector<const ViewObject*>  views() const;
@@ -132,22 +150,27 @@ public:
     [[nodiscard]] std::optional<RequestRecord> request(const RequestId& requestId) const;
     /// FNV-1a-64 over exactly: appliedOffset, nextObjectId, nextTopicId, then each live
     /// object's fingerprint (CatalogFingerprint.h) in objectId order, then each tombstone's
-    /// in apply order.  NOT hashed: which objectId / topicId / viewTopicId each object holds,
+    /// in apply order; an object or tombstone of a namespace other than 0 hashes
+    /// objectFingerprintV2(fingerprint, nsId) instead (so a state that only ever used `default` keeps the digest
+    /// it had before namespaces existed).  Then, only when namespaces left a trace: nextNsId (if > 1) and each
+    /// namespace record's fingerprint (every namespace but a never-changed `default`).  NOT hashed: which objectId / topicId / viewTopicId each object holds,
     /// a view's compiledPlanBlob (fingerprints are id-free, ruling 11) and the request
     /// records.  So equal digests at equal offsets mean equal definitions, counters and
     /// drop history — the replicas-agree check — not byte-identical CatalogState values.
     [[nodiscard]] uint64_t digest() const noexcept;
 
 private:
-    friend struct ApplyV1;   // src/catalog/ApplyV1.cpp — the only mutator (via apply())
+    friend struct ApplyV1;   // src/catalog/ApplyV1.cpp — mutators (via apply())
+    friend struct ApplyV2;   // src/catalog/ApplyV2.cpp — the namespace registry
     std::map<uint64_t, TopicObject>               topics_;        // objectId → object (ordered: digest order)
     std::map<uint64_t, ViewObject>                views_;
-    std::map<std::string, uint64_t, std::less<>>  topicNames_;    // live topic name → objectId
-    std::map<std::string, uint64_t, std::less<>>  viewNames_;     // live view name → objectId
+    std::map<NsKey, uint64_t, NsKeyLess>          topicNames_;    // live (nsId, topic name) → objectId
+    std::map<NsKey, uint64_t, NsKeyLess>          viewNames_;     // live (nsId, view name) → objectId
     std::unordered_map<int32_t, uint64_t>         topicIds_;      // topicId → topic objectId
     std::unordered_map<int32_t, uint64_t>         viewTopicIds_;  // sink topicId → view objectId
     std::unordered_map<RequestId, RequestRecord, RequestIdHash> requests_;   // {0,0} never stored
     std::vector<Tombstone>                        tombstones_;
+    NamespaceRegistry                             namespaces_;
     uint64_t nextObjectId_  = 1;
     int32_t  nextTopicId_   = 0;
     int64_t  appliedOffset_ = -1;

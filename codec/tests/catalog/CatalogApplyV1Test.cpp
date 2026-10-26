@@ -43,7 +43,7 @@ TEST(CatalogApplyV1Regression, CreateTopicAssignsDenseIdsAndVersionOne) {
     auto e = stamped(s, createOps(0, true), "players", 1, 0, 1);
     auto a = rc::apply(s, e, 0);
     ASSERT_TRUE(a.has_value()) << a.error().detail;
-    const rc::TopicObject* t = s.topicByName("players");
+    const rc::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, "players");
     ASSERT_NE(t, nullptr);
     EXPECT_EQ(t->topicId, 0); EXPECT_EQ(t->version, 1u); EXPECT_EQ(t->schema->schemaVersion, 1);
     EXPECT_EQ(s.nextObjectId(), 2u); EXPECT_EQ(s.nextTopicId(), 1); EXPECT_EQ(s.appliedOffset(), 0);
@@ -62,7 +62,7 @@ TEST(CatalogApplyV1Regression, FingerprintMismatchIsAnErrorAndLeavesStateUnchang
     EXPECT_EQ(a.error().expected, e.fingerprint);
     EXPECT_NE(a.error().actual, e.fingerprint);
     EXPECT_EQ(s.digest(), before);
-    EXPECT_EQ(s.topicByName("t"), nullptr);
+    EXPECT_EQ(s.topicByName(rune::catalog::kDefaultNsId, "t"), nullptr);
 }
 
 TEST(CatalogApplyV1Regression, EveryPreconditionIsExplicit) {
@@ -96,13 +96,13 @@ TEST(CatalogApplyV1Regression, SchemaLifecycleOnOneObject) {
     ASSERT_TRUE(rc::apply(s, stamped(s, rc::CreateSchemaOps{{.keyField = "id", .validate = false,
         .descriptorBlob = blob2(), .nextTag = 2}}, "t", 1, 1, 2), 1));                     // CreateSchema
     cd::AlterOp add{}; add.type = cd::AlterOpType::Add; add.name = "mana"; add.primType = cd::PrimType::Int32;
-    auto resolved = rc::resolveAlterOps(*s.topicByName("t")->schema, std::vector<cd::AlterOp>{add});
+    auto resolved = rc::resolveAlterOps(*s.topicByName(rune::catalog::kDefaultNsId, "t")->schema, std::vector<cd::AlterOp>{add});
     ASSERT_TRUE(resolved.has_value()) << resolved.error();
     ASSERT_EQ(resolved->size(), 1u);
     EXPECT_EQ((*resolved)[0].tag, 2) << "an ADD is stored with the durable tag it is assigned (F20)";
     ASSERT_TRUE(rc::apply(s, stamped(s, rc::AlterSchemaOps{*resolved}, "t", 1, 2, 3), 2));
     ASSERT_TRUE(rc::apply(s, stamped(s, rc::SetCompatibilityOps{cd::CompatMode::Forward}, "t", 1, 3, 4), 3));
-    const rc::TopicObject* t = s.topicByName("t");
+    const rc::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, "t");
     ASSERT_NE(t, nullptr);
     EXPECT_EQ(t->objectId, 1u); EXPECT_EQ(t->version, 4u);
     EXPECT_EQ(t->schema->schemaVersion, 3);   // create 1, alter 2, set-compat 3
@@ -116,7 +116,7 @@ TEST(CatalogApplyV1Regression, SetCompatibilityBumpsTheEvolvingDescriptorVersion
     rc::CatalogState s;
     ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "t", 1, 0, 1), 0));
     ASSERT_TRUE(rc::apply(s, stamped(s, rc::SetCompatibilityOps{cd::CompatMode::Forward}, "t", 1, 1, 2), 1));
-    const rc::TopicObject* t = s.topicByName("t");
+    const rc::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, "t");
     EXPECT_EQ(t->schema->schemaVersion, 2);
     EXPECT_EQ(cd::deserialize(t->schema->evolvingBlob).version, 2) << "the evolving blob went through applyOps";
 }
@@ -127,7 +127,7 @@ TEST(CatalogApplyV1Regression, ResolvedOpsNameFieldsByDurableTagAndRoundTrip) {
     ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "t", 1, 0, 1), 0));
     cd::AlterOp ren{}; ren.type = cd::AlterOpType::Rename; ren.name = "hp"; ren.newName = "health";
     cd::AlterOp drop{}; drop.type = cd::AlterOpType::Drop; drop.name = "health";   // sees the rename before it
-    const auto& schema = *s.topicByName("t")->schema;
+    const auto& schema = *s.topicByName(rune::catalog::kDefaultNsId, "t")->schema;
     auto r = rc::resolveAlterOps(schema, std::vector<cd::AlterOp>{ren, drop});
     ASSERT_TRUE(r.has_value()) << r.error();
     EXPECT_EQ((*r)[0].tag, 1); EXPECT_EQ((*r)[0].name, "health");
@@ -159,8 +159,8 @@ TEST(CatalogApplyV1Regression, DropAndReuseGetsANewObjectIdAndTopicId) {
     ASSERT_TRUE(d.has_value());
     EXPECT_EQ(d->droppedTopicId, 0);
     ASSERT_TRUE(rc::apply(s, stamped(s, createOps(1, false), "t", 2, 0, 1), 2));
-    EXPECT_EQ(s.topicByName("t")->objectId, 2u);
-    EXPECT_EQ(s.topicByName("t")->topicId, 1);
+    EXPECT_EQ(s.topicByName(rune::catalog::kDefaultNsId, "t")->objectId, 2u);
+    EXPECT_EQ(s.topicByName(rune::catalog::kDefaultNsId, "t")->topicId, 1);
     ASSERT_EQ(s.tombstones().size(), 1u);
     EXPECT_EQ(s.tombstones()[0].objectId, 1u);
 }
@@ -188,7 +188,7 @@ TEST(CatalogApplyV1Regression, AlterViewTakesAFreshSinkAndReportsBoth) {
     auto a = rc::apply(s, stamped(s, rc::AlterViewOps{v2}, "v", 2, 1, 2), 2);
     ASSERT_TRUE(a.has_value()) << a.error().detail;
     EXPECT_EQ(a->createdTopicId, 2); EXPECT_EQ(a->droppedTopicId, 1);
-    EXPECT_EQ(s.viewByName("v")->def.viewTopicId, 2);
+    EXPECT_EQ(s.viewByName(rune::catalog::kDefaultNsId, "v")->def.viewTopicId, 2);
     EXPECT_EQ(s.viewByViewTopicId(1), nullptr);
 }
 
@@ -198,7 +198,7 @@ TEST(CatalogApplyV1Regression, FingerprintsIgnoreIdsSoClustersCompare) {
     // Cluster b already holds another topic: same definition, different ids.
     ASSERT_TRUE(rc::apply(b, stamped(b, createOps(0, false), "other", 1, 0, 1), 0));
     ASSERT_TRUE(rc::apply(b, stamped(b, createOps(1, true), "x", 2, 0, 1), 1));
-    EXPECT_EQ(rc::fingerprintOf(*a.topicByName("x")), rc::fingerprintOf(*b.topicByName("x")));
+    EXPECT_EQ(rc::fingerprintOf(*a.topicByName(rune::catalog::kDefaultNsId, "x")), rc::fingerprintOf(*b.topicByName(rune::catalog::kDefaultNsId, "x")));
 }
 
 TEST(CatalogApplyV1Regression, RequestIdsAreRecordedAndADuplicateIsRefused) {
@@ -224,7 +224,7 @@ TEST(CatalogApplyV1Regression, RequestIdsAreRecordedAndADuplicateIsRefused) {
 TEST(CatalogApplyV1Regression, FingerprintCoversEveryDefinitionField) {
     rc::CatalogState s;
     ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "x", 1, 0, 1), 0));
-    rc::TopicObject t = *s.topicByName("x");
+    rc::TopicObject t = *s.topicByName(rune::catalog::kDefaultNsId, "x");
     const uint64_t base = rc::fingerprintOf(t);
     auto differs = [&](auto mutate) { rc::TopicObject m = t; mutate(m); return rc::fingerprintOf(m) != base; };
     EXPECT_TRUE(differs([](rc::TopicObject& m) { m.name = "y"; }));
@@ -486,13 +486,13 @@ TEST(CatalogApplyV1Regression, OffsetsMustAdvanceAndUnknownFormatsHaveNoRules) {
 // ── effects ───────────────────────────────────────────────────────────────────
 TEST(CatalogApplyV1Regression, AlterTopicConfigSetsOnlyTheNamedKeys) {
     rc::CatalogState s = fixture();
-    const rc::TopicConfig before = s.topicByName("u")->config;
+    const rc::TopicConfig before = s.topicByName(rune::catalog::kDefaultNsId, "u")->config;
     using K = rc::ConfigKey;
     rc::AlterTopicConfigOps o{{{K::RetentionMs, 1000}, {K::RetentionBytes, -1}, {K::DeleteRetentionMs, 5},
                                {K::MinCleanableDirtyRatioPpm, 1'000'000}, {K::MinCompactionLagMs, 0}, {K::MaxCompactionLagMs, 9}}};
     auto a = rc::apply(s, stamped(s, o, "u", 2, 1, 2), 3);
     ASSERT_TRUE(a.has_value()) << a.error().detail;
-    const rc::TopicObject* t = s.topicByName("u");
+    const rc::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, "u");
     EXPECT_EQ(t->version, 2u);
     rc::TopicConfig want = before;
     want.retentionMs = 1000; want.retentionBytes = -1; want.deleteRetentionMs = 5;
@@ -506,11 +506,11 @@ TEST(CatalogApplyV1Regression, RenameOfTheKeyFieldMovesKeyFieldAndAChainEndsAtTh
     ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "t", 1, 0, 1), 0));
     cd::AlterOp r1{}; r1.type = cd::AlterOpType::Rename; r1.name = "id"; r1.newName = "a";
     cd::AlterOp r2{}; r2.type = cd::AlterOpType::Rename; r2.name = "a"; r2.newName = "b";
-    auto ops = rc::resolveAlterOps(*s.topicByName("t")->schema, std::vector<cd::AlterOp>{r1, r2});
+    auto ops = rc::resolveAlterOps(*s.topicByName(rune::catalog::kDefaultNsId, "t")->schema, std::vector<cd::AlterOp>{r1, r2});
     ASSERT_TRUE(ops.has_value()) << ops.error();
     ASSERT_TRUE(rc::apply(s, stamped(s, rc::AlterSchemaOps{*ops}, "t", 1, 1, 2), 1));
-    EXPECT_EQ(s.topicByName("t")->schema->keyField, "b");
-    const cd::Descriptor d = cd::deserialize(s.topicByName("t")->schema->evolvingBlob);
+    EXPECT_EQ(s.topicByName(rune::catalog::kDefaultNsId, "t")->schema->keyField, "b");
+    const cd::Descriptor d = cd::deserialize(s.topicByName(rune::catalog::kDefaultNsId, "t")->schema->evolvingBlob);
     ASSERT_NE(d.find("b"), nullptr);
     EXPECT_EQ(d.find("b")->id, 0);
 }
@@ -518,7 +518,7 @@ TEST(CatalogApplyV1Regression, RenameOfTheKeyFieldMovesKeyFieldAndAChainEndsAtTh
 TEST(CatalogApplyV1Regression, ResolveTracksAddsAndRenamesWithinOneList) {
     rc::CatalogState s;
     ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "t", 1, 0, 1), 0));
-    const auto& schema = *s.topicByName("t")->schema;
+    const auto& schema = *s.topicByName(rune::catalog::kDefaultNsId, "t")->schema;
     cd::AlterOp a1{}; a1.type = cd::AlterOpType::Add; a1.name = "mana"; a1.primType = cd::PrimType::Int32;
     cd::AlterOp a2{}; a2.type = cd::AlterOpType::Add; a2.name = "tag"; a2.primType = cd::PrimType::FixedStr; a2.fixedLen = 8;
     cd::AlterOp rn{}; rn.type = cd::AlterOpType::Rename; rn.name = "mana"; rn.newName = "mp";
@@ -532,7 +532,7 @@ TEST(CatalogApplyV1Regression, ResolveTracksAddsAndRenamesWithinOneList) {
     ASSERT_TRUE(back.has_value()) << back.error();
     EXPECT_EQ((*back)[2].name, "mana"); EXPECT_EQ((*back)[2].newName, "mp");
     ASSERT_TRUE(rc::apply(s, stamped(s, rc::AlterSchemaOps{*r}, "t", 1, 1, 2), 1));
-    const rc::SchemaState& after = *s.topicByName("t")->schema;
+    const rc::SchemaState& after = *s.topicByName(rune::catalog::kDefaultNsId, "t")->schema;
     EXPECT_EQ(after.nextTag, 4); EXPECT_EQ(after.compat, cd::CompatMode::Forward); EXPECT_EQ(after.schemaVersion, 2);
     // Refusals name the field.
     cd::AlterOp ghost{}; ghost.type = cd::AlterOpType::Rename; ghost.name = "ghost"; ghost.newName = "x";
@@ -547,7 +547,7 @@ TEST(CatalogApplyV1Regression, DropViewRemovesItFreesTheNameAndUnblocksTheSource
     auto d = rc::apply(s, stamped(s, rc::DropViewOps{2}, "v", 3, 1, 2), 3);
     ASSERT_TRUE(d.has_value()) << d.error().detail;
     EXPECT_EQ(d->droppedTopicId, 2); EXPECT_EQ(d->createdTopicId, -1);
-    EXPECT_EQ(s.viewByName("v"), nullptr); EXPECT_EQ(s.viewByViewTopicId(2), nullptr);
+    EXPECT_EQ(s.viewByName(rune::catalog::kDefaultNsId, "v"), nullptr); EXPECT_EQ(s.viewByViewTopicId(2), nullptr);
     ASSERT_EQ(s.tombstones().size(), 1u);
     EXPECT_TRUE(s.tombstones()[0].wasView); EXPECT_EQ(s.tombstones()[0].finalVersion, 2u);
     EXPECT_EQ(d->fingerprint, rc::fingerprintOf(s.tombstones()[0]));
@@ -575,7 +575,7 @@ TEST(CatalogApplyV1Regression, RequestRecordsNameTheAnswerOfEveryKind) {
 // ── fingerprints and digest ───────────────────────────────────────────────────────
 TEST(CatalogApplyV1Regression, ViewFingerprintCoversTheDefinitionNeverIds) {
     rc::CatalogState s = fixture();
-    const rc::ViewObject v = *s.viewByName("v");
+    const rc::ViewObject v = *s.viewByName(rune::catalog::kDefaultNsId, "v");
     const uint64_t base = rc::fingerprintOf(v);
     auto differs = [&](auto mutate) { rc::ViewObject m = v; mutate(m); return rc::fingerprintOf(m) != base; };
     EXPECT_TRUE(differs([](rc::ViewObject& m) { m.name = "w"; }));
@@ -624,7 +624,7 @@ TEST(CatalogApplyV1Regression, FieldTagExhaustionIsRefusedNeverWrapped) {
     auto o = createOps(0, true);
     o.schema->nextTag = 0xFFFF;   // legal: past every tag; but no tag is left to assign
     ASSERT_TRUE(rc::apply(s, stamped(s, o, "t", 1, 0, 1), 0));
-    const rc::SchemaState& schema = *s.topicByName("t")->schema;
+    const rc::SchemaState& schema = *s.topicByName(rune::catalog::kDefaultNsId, "t")->schema;
     cd::AlterOp add{}; add.type = cd::AlterOpType::Add; add.name = "mana"; add.primType = cd::PrimType::Int32;
     auto r = rc::resolveAlterOps(schema, std::vector<cd::AlterOp>{add});
     ASSERT_FALSE(r.has_value());
@@ -657,7 +657,7 @@ TEST(CatalogApplyV1Regression, SchemaVersionExhaustionIsRefused) {
         e.fingerprint = *fp;
         ASSERT_TRUE(rc::apply(s, e, off)) << sv;
     }
-    ASSERT_EQ(s.topicByName("t")->schema->schemaVersion, 0xFFFE);
+    ASSERT_EQ(s.topicByName(rune::catalog::kDefaultNsId, "t")->schema->schemaVersion, 0xFFFE);
     for (rc::Ops ops : {rc::Ops{rc::SetCompatibilityOps{cd::CompatMode::Forward}},
                         rc::Ops{rc::AlterSchemaOps{{addOp(2, "mana")}}}}) {
         auto a = rc::apply(s, raw(ops, "t", 1, ver, ver + 1), off);
@@ -693,7 +693,7 @@ TEST(CatalogApplyV1Regression, ATombstonedObjectIdIsNeverLiveAgain) {
 TEST(CatalogApplyV1Regression, ResolveAndUnresolveEscapeNamesInTheirErrors) {
     rc::CatalogState s;
     ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "t", 1, 0, 1), 0));
-    const rc::SchemaState& schema = *s.topicByName("t")->schema;
+    const rc::SchemaState& schema = *s.topicByName(rune::catalog::kDefaultNsId, "t")->schema;
     cd::AlterOp ghost{}; ghost.type = cd::AlterOpType::Drop; ghost.name = "gh\x1b[2Jost\n";
     auto r = rc::resolveAlterOps(schema, std::vector<cd::AlterOp>{ghost});
     ASSERT_FALSE(r.has_value());
@@ -806,7 +806,7 @@ TEST(CatalogApplyRegression, AViewSinkWhosePartitionCountDiffersFromItsSourceIsR
         }
         e.fingerprint = rc::fingerprintOf(result);
         const std::string first = c.sources.front();
-        const int32_t sourceParts = s.topicByName(first)->partitions;
+        const int32_t sourceParts = s.topicByName(rune::catalog::kDefaultNsId, first)->partitions;
         auto a = rc::apply(s, e, 4);
         if (!c.refused) {
             EXPECT_TRUE(a.has_value()) << c.what << ": " << (a ? "" : a.error().detail);
@@ -846,7 +846,7 @@ rc::CatalogEvent craftedAlterView(const rc::CatalogState& s, const rc::ViewObjec
 }
 void expectEverySinkMirrorsItsFirstSource(const rc::CatalogState& s, const std::string& when) {
     for (const rc::ViewObject* v : s.views()) {
-        const rc::TopicObject* first = s.topicByName(v->def.sourceNames.front());
+        const rc::TopicObject* first = s.topicByName(rune::catalog::kDefaultNsId, v->def.sourceNames.front());
         ASSERT_NE(first, nullptr) << when << ": view " << v->name << " reads a dead topic";
         EXPECT_EQ(v->def.sinkPartitions, first->partitions) << when << ": view " << v->name;
     }
@@ -872,13 +872,13 @@ TEST(CatalogApplyAdversarial, SinkPartitionBoundsAdversarialRegression) {
                 ASSERT_TRUE(rc::apply(s, stamped(s, t, "s", 1, 0, 1), 0)) << what;
                 if (alter) ASSERT_TRUE(rc::apply(s, craftedCreateView(s, "v", {"s"}, P), 1)) << what;
                 const rc::CatalogEvent e =
-                    alter ? craftedAlterView(s, *s.viewByName("v"), {"s"}, sink) : craftedCreateView(s, "v", {"s"}, sink);
+                    alter ? craftedAlterView(s, *s.viewByName(rune::catalog::kDefaultNsId, "v"), {"s"}, sink) : craftedCreateView(s, "v", {"s"}, sink);
                 const uint64_t before = s.digest();
                 const bool expectOk = sink == P;
                 EXPECT_EQ(rc::previewFingerprint(s, e).has_value(), expectOk) << what;
                 auto a = rc::apply(s, e, 2);
                 ASSERT_EQ(a.has_value(), expectOk) << what << (a ? "" : ": " + a.error().detail);
-                if (expectOk) { EXPECT_EQ(s.viewByName("v")->def.sinkPartitions, P) << what; continue; }
+                if (expectOk) { EXPECT_EQ(s.viewByName(rune::catalog::kDefaultNsId, "v")->def.sinkPartitions, P) << what; continue; }
                 EXPECT_EQ(a.error().code, rc::ApplyError::Code::Precondition) << what;
                 if (sink >= 1)   // a sink < 1 is refused by the older rule first
                     EXPECT_NE(a.error().detail.find("sink partitions " + std::to_string(sink)), std::string::npos)
@@ -922,7 +922,7 @@ TEST(CatalogApplyAdversarial, RandomDdlHistoriesKeepEverySinkMirroringItsFirstSo
             std::optional<bool> expectOk;
             if (kind == 0) {                                                   // CreateTopic (reuses dropped names)
                 const std::string& n = topicNames[rnd(4)];
-                if (s.nameTaken(n)) continue;
+                if (s.nameTaken(rune::catalog::kDefaultNsId, n)) continue;
                 rc::CreateTopicOps o = createOps(s.nextTopicId(), true);
                 o.partitions = int32_t(1 + rnd(4));
                 e = stamped(s, o, n, s.nextObjectId(), 0, 1);
@@ -930,11 +930,11 @@ TEST(CatalogApplyAdversarial, RandomDdlHistoriesKeepEverySinkMirroringItsFirstSo
             } else if (kind == 1 || kind == 2) {                               // CreateView / AlterView
                 if (s.topics().empty()) continue;
                 const auto src = randomSources();
-                const int32_t firstParts = s.topicByName(src[0])->partitions;
+                const int32_t firstParts = s.topicByName(rune::catalog::kDefaultNsId, src[0])->partitions;
                 const int32_t sink = rnd(2) == 0 ? firstParts : int32_t(1 + rnd(4));
                 if (kind == 1) {
                     const std::string& n = viewNames[rnd(3)];
-                    if (s.nameTaken(n)) continue;
+                    if (s.nameTaken(rune::catalog::kDefaultNsId, n)) continue;
                     e = craftedCreateView(s, n, src, sink);
                 } else {
                     const auto views = s.views();
@@ -952,7 +952,7 @@ TEST(CatalogApplyAdversarial, RandomDdlHistoriesKeepEverySinkMirroringItsFirstSo
                 const auto topics = s.topics();
                 if (topics.empty()) continue;
                 const rc::TopicObject& t = *topics[rnd(uint32_t(topics.size()))];
-                if (s.viewReading(t.name) != nullptr) continue;
+                if (s.viewReading(rune::catalog::kDefaultNsId, t.name) != nullptr) continue;
                 e = stamped(s, rc::DropTopicOps{t.topicId}, t.name, t.objectId, t.version, t.version + 1);
                 expectOk = true;
             }

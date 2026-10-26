@@ -438,7 +438,7 @@ TEST_F(CreateViewRegression, ViewNamedLikeExistingUntypedTopicIsRejectedRegressi
     EXPECT_EQ(viewSet_.drainInstalls(), 0) << "no view plan may be installed";
     EXPECT_EQ(schemaRegistry_->byName("raw_events"), nullptr)
         << "the existing topic must not acquire the view's output schema";
-    const auto* raw = adminWorker_->applier().state().topicByName("raw_events");
+    const auto* raw = adminWorker_->applier().state().topicByName(rune::catalog::kDefaultNsId, "raw_events");
     ASSERT_NE(raw, nullptr);
     EXPECT_EQ(raw->topicId, rawId);
     EXPECT_EQ(raw->config.cleanupPolicy, 0u) << "the existing topic is not turned into a view sink";

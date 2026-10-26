@@ -342,7 +342,7 @@ public:
     /// (acks=leader); nullopt when `b` does not lead it or the append is refused.
     std::optional<int64_t> produce(int32_t b, const std::string& topic, std::vector<uint8_t> bytes) {
         Broker& br = broker_(b);
-        const rune::catalog::TopicObject* t = br.admin->applier().state().topicByName(topic);
+        const rune::catalog::TopicObject* t = br.admin->applier().state().topicByName(rune::catalog::kDefaultNsId, topic);
         if (t == nullptr) return std::nullopt;
         const auto it = br.data.find(t->topicId);
         if (it == br.data.end() || it->second.empty() || it->second[0]->replica->role() != rr::Role::Leader)
@@ -357,7 +357,7 @@ public:
     /// The value of the record at `offset` of `topic` p0 on `b` (empty: none).
     std::vector<uint8_t> consumeFrom(int32_t b, const std::string& topic, int64_t offset) {
         Broker& br = broker_(b);
-        const rune::catalog::TopicObject* t = br.admin->applier().state().topicByName(topic);
+        const rune::catalog::TopicObject* t = br.admin->applier().state().topicByName(rune::catalog::kDefaultNsId, topic);
         if (t == nullptr) return {};
         const auto it = br.data.find(t->topicId);
         if (it == br.data.end() || it->second.empty()) return {};

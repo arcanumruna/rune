@@ -314,3 +314,492 @@ TEST(NsNameRegression, ValidNamespaceNameTableRegression) {
     EXPECT_EQ(rc::kDefaultNsId, 0u);
     EXPECT_EQ(rc::kDefaultNsName, "default");
 }
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Task 3: NamespaceRegistry, (nsId, name) keys, ApplyV2
+// ════════════════════════════════════════════════════════════════════════════════════════════════════════════
+#include <rune/catalog/CatalogFingerprint.h>
+#include <rune/catalog/CatalogState.h>
+#include <rune/catalog/NamespaceRegistry.h>
+#include <rune/catalog/testing/GoldenScript.h>
+#include <rune/codec/Descriptor.h>
+#include <rune/codec/Serialize.h>
+
+#include <variant>
+
+namespace cd = rune::codec;
+
+namespace {
+
+using Res = std::expected<rc::Applied, rc::ApplyError>;
+
+/// The leader's way of building an event (stamp the previewed fingerprint, then apply), over formatVer 2.
+struct Rig {
+    rc::CatalogState s;
+    int64_t          off = 0;
+
+    Res go(rc::CatalogEvent e) {
+        auto fp = rc::previewFingerprint(s, e);
+        if (!fp) return std::unexpected(fp.error());
+        e.fingerprint = *fp;
+        auto a = rc::apply(s, e, off);
+        if (a) ++off;
+        return a;
+    }
+    static rc::CatalogEvent base(rc::Ops ops, std::string name, uint32_t nsId, uint64_t objectId, uint32_t prev) {
+        rc::CatalogEvent e;
+        e.formatVer = rc::kFormatV2;
+        e.nsId = nsId;
+        e.kind = rc::kindOf(ops);
+        e.ops = std::move(ops);
+        e.objectName = std::move(name);
+        e.objectId = objectId;
+        e.prevVersion = prev;
+        e.newVersion = prev + 1;
+        return e;
+    }
+    // ── namespace events ─────────────────────────────────────────────────────────────────────────────────────
+    Res nsCreateAs(uint32_t nsId, const std::string& name, rp::NamespaceLimits l = {}) {
+        return go(base(rc::NamespaceCreatedOps{name, l}, name, nsId, 0, 0));
+    }
+    Res nsCreate(const std::string& name, rp::NamespaceLimits l = {}) {
+        return nsCreateAs(s.namespaces().nextNsId(), name, l);
+    }
+    Res nsLimits(uint32_t nsId, const rp::NamespaceLimits& l) {
+        const rc::NamespaceRecord* r = s.namespaces().byId(nsId);
+        return go(base(rc::NamespaceLimitsSetOps{l}, r ? r->name : "?", nsId, 0, r ? r->version : 0));
+    }
+    Res nsState(uint32_t nsId, rc::NsStateTag to) {
+        const rc::NamespaceRecord* r = s.namespaces().byId(nsId);
+        return go(base(rc::NamespaceStateChangedOps{to}, r ? r->name : "?", nsId, 0, r ? r->version : 0));
+    }
+    Res nsDelete(uint32_t nsId) {
+        const rc::NamespaceRecord* r = s.namespaces().byId(nsId);
+        return go(base(rc::NamespaceDeletedOps{}, r ? r->name : "?", nsId, 0, r ? r->version : 0));
+    }
+    // ── object events ────────────────────────────────────────────────────────────────────────────────────────
+    Res topic(uint32_t nsId, const std::string& name, int32_t partitions = 1) {
+        rc::CreateTopicOps o;
+        o.topicId = s.nextTopicId();
+        o.partitions = partitions;
+        return go(base(std::move(o), name, nsId, s.nextObjectId(), 0));
+    }
+    Res typedTopic(uint32_t nsId, const std::string& name) {
+        rc::CreateTopicOps o;
+        o.topicId = s.nextTopicId();
+        cd::DescriptorBuilder d(name);
+        d.add("id", cd::PrimType::Int64, 1, true).add("hp", cd::PrimType::Int32);
+        o.schema = rc::SchemaDef{.keyField = "id", .validate = true, .descriptorBlob = cd::serialize(d.build()), .nextTag = 2};
+        return go(base(std::move(o), name, nsId, s.nextObjectId(), 0));
+    }
+    Res dropTopic(uint32_t nsId, const std::string& name) {
+        const rc::TopicObject* t = s.topicByName(nsId, name);
+        return go(base(rc::DropTopicOps{t ? t->topicId : -1}, name, nsId, t ? t->objectId : 0, t ? t->version : 0));
+    }
+    Res view(uint32_t nsId, const std::string& name, std::vector<std::string> sources, int32_t sinkPartitions = 1) {
+        cd::DescriptorBuilder out(name);
+        out.add("id", cd::PrimType::Int64, 1, true);
+        rc::ViewDef v;
+        v.viewTopicId = s.nextTopicId();
+        v.sinkPartitions = sinkPartitions;
+        v.keyField = "id";
+        v.sourceNames = std::move(sources);
+        v.normalizedPlanBlob = {1, 2, 3};
+        v.compiledPlanBlob = {9};
+        v.outputDescriptorBlob = cd::serialize(out.build());
+        return go(base(rc::CreateViewOps{std::move(v)}, name, nsId, s.nextObjectId(), 0));
+    }
+    Res createSchemaOn(uint32_t evNsId, const rc::TopicObject& t) {   // evNsId may disagree with t's namespace
+        cd::DescriptorBuilder d(t.name);
+        d.add("id", cd::PrimType::Int64, 1, true);
+        return go(base(rc::CreateSchemaOps{rc::SchemaDef{.keyField = "id", .validate = false,
+                                                         .descriptorBlob = cd::serialize(d.build()), .nextTag = 1}},
+                       t.name, evNsId, t.objectId, t.version));
+    }
+};
+
+rp::NamespaceLimits limitsWith(uint64_t maxTopics) {
+    rp::NamespaceLimits l;
+    l.maxTopics = maxTopics;
+    l.maxViews = maxTopics * 2;
+    l.featureBits = 0x3;
+    return l;
+}
+void expectRefused(const Res& r, rc::ApplyError::Code code, const std::string& what) {
+    ASSERT_FALSE(r.has_value()) << what << ": expected a refusal";
+    EXPECT_EQ(r.error().code, code) << what << ": " << r.error().detail;
+}
+} // namespace
+
+TEST(NamespaceCatalogV2Regression, DefaultPredefinedRegression) {
+    rc::CatalogState s;
+    const rc::NamespaceRecord* d = s.namespaces().byId(0);
+    ASSERT_NE(d, nullptr);
+    EXPECT_EQ(d->name, "default");
+    EXPECT_TRUE(std::holds_alternative<rc::NsActive>(d->state));
+    EXPECT_EQ(s.namespaces().byName("default"), d);
+    EXPECT_EQ(s.namespaces().nextNsId(), 1u);
+    EXPECT_EQ(s.namespaces().liveCount(), 1u);
+    EXPECT_EQ(s.namespaces().byId(1), nullptr);
+    // the boot-resolved cluster default limits are carried by the predefined record
+    const rc::CatalogState withDefaults{limitsWith(77)};
+    EXPECT_EQ(withDefaults.namespaces().byId(0)->limits.maxTopics, 77u);
+    // the fresh state's digest does not depend on the default namespace record (v1 digests stay valid)
+    EXPECT_EQ(rc::CatalogState{}.digest(), rc::CatalogState{limitsWith(5)}.digest());
+}
+
+TEST(NamespaceCatalogV2Regression, CreateAssignsNextIdRegression) {
+    Rig r;
+    ASSERT_TRUE(r.nsCreateAs(1, "a").has_value());
+    EXPECT_EQ(r.s.namespaces().nextNsId(), 2u);
+    expectRefused(r.nsCreateAs(3, "b"), rc::ApplyError::Code::BadNsId, "Created(3, b) skips an id");
+    expectRefused(r.nsCreateAs(2, "a"), rc::ApplyError::Code::Precondition, "Created(2, a) reuses a name");
+    expectRefused(r.nsCreateAs(1, "b"), rc::ApplyError::Code::BadNsId, "Created(1, b) repeats an id");
+    expectRefused(r.nsCreateAs(0, "b"), rc::ApplyError::Code::BadNsId, "Created(0, b) is the default's id");
+    ASSERT_TRUE(r.nsCreateAs(2, "b").has_value());
+    EXPECT_EQ(r.s.namespaces().liveCount(), 3u);
+    EXPECT_EQ(r.s.namespaces().byName("b")->nsId, 2u);
+    EXPECT_EQ(r.s.namespaces().byId(1)->version, 1u);
+}
+
+TEST(NamespaceCatalogV2Regression, CreateDefaultRefusedRegression) {
+    Rig r;
+    expectRefused(r.nsCreateAs(1, "default"), rc::ApplyError::Code::Precondition, "Created(1, default)");
+    expectRefused(r.nsCreateAs(0, "default"), rc::ApplyError::Code::BadNsId, "Created(0, default)");
+    for (const char* bad : {"", "A", "-x", "a/b", "a_b", "__x"})
+        expectRefused(r.nsCreateAs(1, bad), rc::ApplyError::Code::Precondition, std::string("invalid name '") + bad + "'");
+    EXPECT_EQ(r.s.namespaces().liveCount(), 1u);
+    EXPECT_EQ(r.s.namespaces().nextNsId(), 1u);
+}
+
+TEST(NamespaceCatalogV2Regression, NsIdNeverReusedRegression) {
+    Rig r;
+    ASSERT_TRUE(r.nsCreate("one").has_value());   // 1
+    ASSERT_TRUE(r.nsCreate("two").has_value());   // 2
+    ASSERT_TRUE(r.nsState(2, rc::NsStateTag::Deleting).has_value());
+    ASSERT_TRUE(r.nsDelete(2).has_value());
+    EXPECT_EQ(r.s.namespaces().nextNsId(), 3u) << "survives Deleted";
+    EXPECT_EQ(r.s.namespaces().byId(2), nullptr);
+    EXPECT_EQ(r.s.namespaces().byName("two"), nullptr);
+    EXPECT_EQ(r.s.namespaces().liveCount(), 2u);   // default + one
+    expectRefused(r.nsCreateAs(2, "c"), rc::ApplyError::Code::BadNsId, "Created(2, c) reuses a deleted id");
+    ASSERT_TRUE(r.nsCreateAs(3, "two").has_value()) << "the NAME is free again, the id is not";
+    EXPECT_EQ(r.s.namespaces().byName("two")->nsId, 3u);
+    EXPECT_EQ(r.s.namespaces().nextNsId(), 4u);
+}
+
+TEST(NamespaceCatalogV2Regression, StateEdgesTableRegression) {
+    using T = rc::NsStateTag;
+    struct Row { T from; T to; bool ok; };
+    const T states[] = {T::Active, T::SuspendedReadOnly, T::SuspendedRejectAll, T::Deleting};
+    // allowed (D5): ACTIVE <-> SUSPENDED(mode), ACTIVE | SUSPENDED -> DELETING
+    auto allowed = [](T from, T to) {
+        if (from == T::Deleting) return false;
+        if (from == T::Active) return to != T::Active;
+        return to == T::Active || to == T::Deleting;
+    };
+    int rows = 0;
+    for (const T from : states) {
+        for (const T to : states) {
+            Rig r;
+            ASSERT_TRUE(r.nsCreate("n").has_value());
+            if (from != T::Active) ASSERT_TRUE(r.nsState(1, from).has_value());
+            const uint64_t before = r.s.digest();
+            const auto res = r.nsState(1, to);
+            const std::string what = "state " + std::to_string(static_cast<int>(from)) + " -> " + std::to_string(static_cast<int>(to));
+            if (allowed(from, to)) {
+                EXPECT_TRUE(res.has_value()) << what;
+            } else {
+                expectRefused(res, rc::ApplyError::Code::Precondition, what);
+                EXPECT_EQ(r.s.digest(), before) << what << ": a refusal changes nothing";
+            }
+            ++rows;
+        }
+        // Deleted from `from`: only a DELETING namespace may be deleted
+        Rig r;
+        ASSERT_TRUE(r.nsCreate("n").has_value());
+        if (from != T::Active) ASSERT_TRUE(r.nsState(1, from).has_value());
+        const auto res = r.nsDelete(1);
+        if (from == T::Deleting) {
+            EXPECT_TRUE(res.has_value()) << "Deleted from Deleting";
+        } else {
+            expectRefused(res, rc::ApplyError::Code::Precondition, "Deleted from state " + std::to_string(static_cast<int>(from)));
+            EXPECT_NE(r.s.namespaces().byId(1), nullptr);
+        }
+        ++rows;
+    }
+    EXPECT_EQ(rows, 20);
+    // nsId 0 is never deleted (and never enters DELETING, so it can never be deleted)
+    Rig r;
+    expectRefused(r.nsDelete(0), rc::ApplyError::Code::Precondition, "Deleted(0)");
+    expectRefused(r.nsState(0, T::Deleting), rc::ApplyError::Code::Precondition, "StateChanged(0, Deleting)");
+    // a state change or delete of a namespace that does not exist
+    expectRefused(r.nsState(9, T::SuspendedReadOnly), rc::ApplyError::Code::BadNsId, "StateChanged(9)");
+    expectRefused(r.nsDelete(9), rc::ApplyError::Code::BadNsId, "Deleted(9)");
+}
+
+TEST(NamespaceCatalogV2Regression, LimitsSetRegression) {
+    Rig r;
+    ASSERT_TRUE(r.nsCreate("a", limitsWith(5)).has_value());
+    const uint64_t fpBefore = r.s.namespaces().byId(1)->fingerprint;
+    ASSERT_TRUE(r.nsLimits(1, limitsWith(9)).has_value());
+    const rc::NamespaceRecord* rec = r.s.namespaces().byId(1);
+    EXPECT_EQ(rec->limits, limitsWith(9)) << "the FULL record is replaced";
+    EXPECT_EQ(rec->version, 2u) << "the version bumps";
+    EXPECT_NE(rec->fingerprint, fpBefore);
+    EXPECT_EQ(rec->fingerprint, rc::nsFingerprint(1, "a", limitsWith(9), rc::NsStateTag::Active));
+    expectRefused(r.nsLimits(5, limitsWith(1)), rc::ApplyError::Code::BadNsId, "LimitsSet on a missing namespace");
+    // the default namespace's limits can be changed (D1) and then the digest reflects it
+    const uint64_t d0 = r.s.digest();
+    ASSERT_TRUE(r.nsLimits(0, limitsWith(3)).has_value());
+    EXPECT_EQ(r.s.namespaces().byId(0)->limits, limitsWith(3));
+    EXPECT_NE(r.s.digest(), d0);
+    // a stale version chain is refused
+    auto stale = Rig::base(rc::NamespaceLimitsSetOps{limitsWith(4)}, "a", 1, 0, 1);
+    stale.fingerprint = 0;
+    EXPECT_FALSE(rc::previewFingerprint(r.s, stale).has_value());
+}
+
+TEST(NamespaceCatalogV2Regression, SameNameTwoNamespacesRegression) {
+    Rig r;
+    ASSERT_TRUE(r.nsCreate("a").has_value());
+    ASSERT_TRUE(r.typedTopic(0, "t").has_value());
+    ASSERT_TRUE(r.typedTopic(1, "t").has_value());
+    ASSERT_TRUE(r.topic(0, "u").has_value());
+    ASSERT_TRUE(r.topic(1, "u").has_value());
+    ASSERT_TRUE(r.createSchemaOn(0, *r.s.topicByName(0, "u")).has_value());   // a schema "s" on u, in both
+    ASSERT_TRUE(r.createSchemaOn(1, *r.s.topicByName(1, "u")).has_value());
+    ASSERT_TRUE(r.view(0, "v", {"t"}).has_value());
+    ASSERT_TRUE(r.view(1, "v", {"t"}).has_value());
+    const rc::TopicObject* t0 = r.s.topicByName(0, "t");
+    const rc::TopicObject* t1 = r.s.topicByName(1, "t");
+    ASSERT_NE(t0, nullptr); ASSERT_NE(t1, nullptr);
+    EXPECT_NE(t0, t1);
+    EXPECT_NE(t0->objectId, t1->objectId);
+    EXPECT_NE(t0->topicId, t1->topicId);
+    EXPECT_EQ(t0->nsId, 0u); EXPECT_EQ(t1->nsId, 1u);
+    EXPECT_TRUE(r.s.nameTaken(0, "v")); EXPECT_TRUE(r.s.nameTaken(1, "v"));
+    EXPECT_NE(r.s.viewByName(0, "v"), r.s.viewByName(1, "v"));
+    EXPECT_EQ(r.s.viewByName(1, "v")->nsId, 1u);
+    // same definition, different namespace: the v2 object fingerprints differ
+    EXPECT_EQ(rc::fingerprintOf(*t0), rc::fingerprintOf(*t1));
+    EXPECT_NE(rc::objectFingerprintV2(rc::fingerprintOf(*t0), t0->nsId), rc::objectFingerprintV2(rc::fingerprintOf(*t1), t1->nsId));
+    // a view reads ITS namespace's source, and a topic is read only by its own namespace's views
+    EXPECT_EQ(r.s.viewReading(1, "t"), r.s.viewByName(1, "v"));
+    EXPECT_EQ(r.s.viewReading(0, "t"), r.s.viewByName(0, "v"));
+    expectRefused(r.dropTopic(1, "t"), rc::ApplyError::Code::Precondition, "ns-1 t is read by ns-1 v");
+    ASSERT_NE(r.s.topicByName(1, "t"), nullptr);
+    // dropping ns 1's v then t leaves ns 0's untouched
+    {
+        const rc::ViewObject* v1 = r.s.viewByName(1, "v");
+        ASSERT_TRUE(r.go(Rig::base(rc::DropViewOps{v1->def.viewTopicId}, "v", 1, v1->objectId, v1->version)).has_value());
+    }
+    ASSERT_TRUE(r.dropTopic(1, "t").has_value());
+    EXPECT_EQ(r.s.topicByName(1, "t"), nullptr);
+    EXPECT_NE(r.s.topicByName(0, "t"), nullptr);
+    EXPECT_NE(r.s.viewByName(0, "v"), nullptr);
+    // the freed name can be taken again in ns 1, and is a different object
+    ASSERT_TRUE(r.topic(1, "t").has_value());
+    // a name that case-folds onto a live name is a conflict only within ONE namespace
+    EXPECT_TRUE(r.topic(1, "T").has_value() == false);
+    ASSERT_TRUE(r.nsCreate("b").has_value());
+    EXPECT_TRUE(r.topic(2, "T").has_value()) << "ns 2 has no t";
+    // the tombstone remembers its namespace
+    ASSERT_FALSE(r.s.tombstones().empty());
+    EXPECT_EQ(r.s.tombstones().back().nsId, 1u);
+}
+
+TEST(NamespaceCatalogV2Regression, ObjectInMissingOrDeletingNsRefusedRegression) {
+    Rig r;
+    expectRefused(r.topic(9, "t"), rc::ApplyError::Code::BadNsId, "CreateTopic in a missing namespace");
+    expectRefused(r.view(9, "v", {"t"}), rc::ApplyError::Code::BadNsId, "CreateView in a missing namespace");
+    ASSERT_TRUE(r.nsCreate("a").has_value());
+    ASSERT_TRUE(r.topic(1, "t").has_value());
+    ASSERT_TRUE(r.nsState(1, rc::NsStateTag::SuspendedReadOnly).has_value());
+    expectRefused(r.topic(1, "u"), rc::ApplyError::Code::Precondition, "CreateTopic in a suspended namespace");
+    expectRefused(r.dropTopic(1, "t"), rc::ApplyError::Code::Precondition, "DropTopic in a suspended namespace");
+    ASSERT_TRUE(r.nsState(1, rc::NsStateTag::Active).has_value());
+    ASSERT_TRUE(r.topic(1, "u").has_value());
+    ASSERT_TRUE(r.nsState(1, rc::NsStateTag::Deleting).has_value());
+    expectRefused(r.topic(1, "w"), rc::ApplyError::Code::Precondition, "CreateTopic in a deleting namespace");
+    expectRefused(r.dropTopic(1, "u"), rc::ApplyError::Code::Precondition, "DropTopic in a deleting namespace");
+    ASSERT_TRUE(r.nsDelete(1).has_value());
+    expectRefused(r.topic(1, "w"), rc::ApplyError::Code::BadNsId, "CreateTopic in a deleted namespace");
+    EXPECT_TRUE(r.topic(0, "w").has_value()) << "the default namespace is unaffected";
+}
+
+TEST(NamespaceCatalogV2Regression, CrossNsReferenceRefusedRegression) {
+    Rig r;
+    ASSERT_TRUE(r.nsCreate("a").has_value());
+    ASSERT_TRUE(r.topic(0, "src0").has_value());
+    ASSERT_TRUE(r.topic(1, "src1").has_value());
+    // a view in ns 1 over a name that exists only in ns 0
+    expectRefused(r.view(1, "bad", {"src0"}), rc::ApplyError::Code::Precondition, "foreign source");
+    expectRefused(r.view(1, "bad", {"src1", "src0"}), rc::ApplyError::Code::Precondition, "foreign second source");
+    EXPECT_EQ(r.s.viewByName(1, "bad"), nullptr);
+    // the same with the source in ns 1
+    ASSERT_TRUE(r.view(1, "good", {"src1"}).has_value());
+    // and the reverse direction
+    expectRefused(r.view(0, "bad", {"src1"}), rc::ApplyError::Code::Precondition, "ns 0 view over an ns-1 source");
+    // a schema / drop / alter event of ns 1 naming an ns-0 object (by its global objectId) is refused
+    const rc::TopicObject* foreign = r.s.topicByName(0, "src0");
+    ASSERT_NE(foreign, nullptr);
+    expectRefused(r.createSchemaOn(1, *foreign), rc::ApplyError::Code::Precondition, "CreateSchema on a foreign topic");
+    expectRefused(r.go(Rig::base(rc::DropTopicOps{foreign->topicId}, "src0", 1, foreign->objectId, foreign->version)),
+                  rc::ApplyError::Code::Precondition, "DropTopic of a foreign topic");
+    expectRefused(r.go(Rig::base(rc::AlterTopicConfigOps{{{rc::ConfigKey::RetentionMs, 5}}}, "src0", 1, foreign->objectId,
+                                 foreign->version)),
+                  rc::ApplyError::Code::Precondition, "AlterTopicConfig of a foreign topic");
+    EXPECT_NE(r.s.topicByName(0, "src0"), nullptr);
+    EXPECT_EQ(r.s.topicByName(0, "src0")->version, 1u);
+}
+
+TEST(NamespaceCatalogV2Regression, V1KindsApplyIdenticallyRegression) {
+    std::ifstream in(RUNE_CATALOG_GOLDEN_DIR "/v1/basic.rcat", std::ios::binary);
+    ASSERT_TRUE(in);
+    auto records = rc::readRcat(in);
+    ASSERT_TRUE(records.has_value());
+    rc::CatalogState v1, v2;
+    int64_t off = 0;
+    for (const auto& [o, bytes] : *records) {
+        auto e1 = rc::decode(bytes);
+        ASSERT_TRUE(e1.has_value());
+        ASSERT_TRUE(rc::apply(v1, *e1, o).has_value()) << "v1 offset " << o;
+        // the same event re-encoded as formatVer 2 with nsId 0 (the fingerprint is the v2 one)
+        rc::CatalogEvent e2 = *e1;
+        e2.formatVer = rc::kFormatV2;
+        e2.nsId = 0;
+        e2.fingerprint = rc::objectFingerprintV2(e1->fingerprint, 0);
+        auto round = rc::decode(rc::encode(e2).value());
+        ASSERT_TRUE(round.has_value());
+        ASSERT_EQ(*round, e2);
+        auto a2 = rc::apply(v2, *round, o);
+        ASSERT_TRUE(a2.has_value()) << "v2 offset " << o << ": " << a2.error().detail;
+        EXPECT_EQ(v2.digest(), v1.digest()) << "offset " << o;
+        off = o;
+    }
+    EXPECT_EQ(off, 22);
+    // the object sets are equal, object for object
+    ASSERT_EQ(v1.topics().size(), v2.topics().size());
+    for (std::size_t i = 0; i < v1.topics().size(); ++i) EXPECT_EQ(*v1.topics()[i], *v2.topics()[i]);
+    ASSERT_EQ(v1.views().size(), v2.views().size());
+    for (std::size_t i = 0; i < v1.views().size(); ++i) EXPECT_EQ(*v1.views()[i], *v2.views()[i]);
+    EXPECT_EQ(v1.tombstones(), v2.tombstones());
+    EXPECT_EQ(v1.nextObjectId(), v2.nextObjectId());
+    EXPECT_EQ(v1.nextTopicId(), v2.nextTopicId());
+}
+
+TEST(NamespaceCatalogV2Regression, PreviewFingerprintV2Regression) {
+    Rig r;
+    // every namespace kind and some object kinds: preview == what apply accepts, and preview never mutates
+    auto check = [&](rc::CatalogEvent e, const std::string& what) {
+        const uint64_t before = r.s.digest();
+        auto p = rc::previewFingerprint(r.s, e);
+        ASSERT_TRUE(p.has_value()) << what << ": " << p.error().detail;
+        EXPECT_EQ(r.s.digest(), before) << what << ": preview mutated the state";
+        EXPECT_EQ(*p, rc::previewFingerprint(r.s, e).value()) << what << ": repeatable";
+        e.fingerprint = *p ^ 1;
+        auto bad = rc::apply(r.s, e, r.off);
+        ASSERT_FALSE(bad.has_value()) << what;
+        EXPECT_EQ(bad.error().code, rc::ApplyError::Code::FingerprintMismatch) << what;
+        EXPECT_EQ(bad.error().expected, *p ^ 1);
+        EXPECT_EQ(bad.error().actual, *p) << what << ": apply recomputes what preview said";
+        e.fingerprint = *p;
+        ASSERT_TRUE(rc::apply(r.s, e, r.off++).has_value()) << what;
+    };
+    check(Rig::base(rc::NamespaceCreatedOps{"a", limitsWith(2)}, "a", 1, 0, 0), "Created");
+    check(Rig::base(rc::NamespaceLimitsSetOps{limitsWith(3)}, "a", 1, 0, 1), "LimitsSet");
+    check(Rig::base(rc::NamespaceStateChangedOps{rc::NsStateTag::SuspendedRejectAll}, "a", 1, 0, 2), "StateChanged");
+    check(Rig::base(rc::NamespaceStateChangedOps{rc::NsStateTag::Deleting}, "a", 1, 0, 3), "StateChanged->Deleting");
+    check(Rig::base(rc::NamespaceDeletedOps{}, "a", 1, 0, 4), "Deleted");
+    rc::CreateTopicOps o;
+    o.topicId = 0;
+    check(Rig::base(o, "t", 0, 1, 0), "CreateTopic ns 0");
+    // preview refuses where apply refuses
+    EXPECT_FALSE(rc::previewFingerprint(r.s, Rig::base(rc::NamespaceCreatedOps{"a", {}}, "a", 9, 0, 0)).has_value());
+    EXPECT_FALSE(rc::previewFingerprint(r.s, Rig::base(rc::NamespaceDeletedOps{}, "a", 1, 0, 0)).has_value());
+    // an event naming a namespace the v1 rules cannot express is refused under formatVer 1
+    rc::CatalogEvent v1 = Rig::base(o, "u", 0, 2, 0);
+    v1.formatVer = rc::kFormatV1;
+    v1.nsId = 3;
+    EXPECT_FALSE(rc::previewFingerprint(r.s, v1).has_value());
+}
+
+TEST(NamespaceCatalogV2Regression, DigestTracksNamespacesRegression) {
+    Rig a, b;
+    ASSERT_TRUE(a.nsCreate("x").has_value());
+    ASSERT_TRUE(b.nsCreate("y").has_value());
+    EXPECT_NE(a.s.digest(), b.s.digest());
+    Rig c, d;
+    ASSERT_TRUE(c.nsCreate("x", limitsWith(1)).has_value());
+    ASSERT_TRUE(d.nsCreate("x", limitsWith(2)).has_value());
+    EXPECT_NE(c.s.digest(), d.s.digest());
+    // create then delete leaves a trace (the id is never reused) in the digest
+    Rig e;
+    const uint64_t empty = e.s.digest();
+    ASSERT_TRUE(e.nsCreate("x").has_value());
+    ASSERT_TRUE(e.nsState(1, rc::NsStateTag::Deleting).has_value());
+    ASSERT_TRUE(e.nsDelete(1).has_value());
+    EXPECT_NE(e.s.digest(), empty);
+    // same topic name in two namespaces is a different state from two topics in one
+    Rig f, g;
+    ASSERT_TRUE(f.nsCreate("x").has_value()); ASSERT_TRUE(g.nsCreate("x").has_value());
+    ASSERT_TRUE(f.topic(0, "t").has_value()); ASSERT_TRUE(g.topic(1, "t").has_value());
+    EXPECT_NE(f.s.digest(), g.s.digest());
+}
+
+TEST(NamespaceCatalogV2Regression, RequestIdDedupeSpansNamespaceKindsRegression) {
+    Rig r;
+    auto e = Rig::base(rc::NamespaceCreatedOps{"a", {}}, "a", 1, 0, 0);
+    e.principal.requestId = rc::RequestId{7, 8};
+    e.principal.requestFingerprint = 99;
+    ASSERT_TRUE(r.go(e).has_value());
+    const auto rec = r.s.request(rc::RequestId{7, 8});
+    ASSERT_TRUE(rec.has_value());
+    EXPECT_EQ(rec->kind, rc::EventKind::NamespaceCreated);
+    EXPECT_EQ(rec->requestFingerprint, 99u);
+    auto again = Rig::base(rc::NamespaceCreatedOps{"b", {}}, "b", 2, 0, 0);
+    again.principal.requestId = rc::RequestId{7, 8};
+    expectRefused(r.go(again), rc::ApplyError::Code::Precondition, "a request id applied twice");
+}
+
+TEST(CatalogV2GoldenRegression, NamespacesGoldenPinnedRegression) {
+    std::ifstream in(RUNE_CATALOG_GOLDEN_DIR "/v2/namespaces.rcat", std::ios::binary);
+    ASSERT_TRUE(in) << "missing golden log";
+    auto records = rc::readRcat(in);
+    ASSERT_TRUE(records.has_value()) << records.error();
+    ASSERT_EQ(records->size(), std::size(rc::golden::kNamespacesV2Digests));
+    rc::CatalogReplayer r;
+    for (std::size_t i = 0; i < records->size(); ++i) {
+        auto a = r.feed((*records)[i].first, (*records)[i].second);
+        ASSERT_TRUE(a.has_value()) << rc::describe(a.error());
+        EXPECT_EQ(r.state().digest(), rc::golden::kNamespacesV2Digests[i]) << "offset " << i;
+        if (i == 4) {   // both `t`s exist, in different namespaces
+            const auto& s = r.state();
+            ASSERT_EQ(s.namespaces().liveCount(), 4u) << "default + 3 namespaces";
+            ASSERT_NE(s.topicByName(1, "t"), nullptr);
+            ASSERT_NE(s.topicByName(2, "t"), nullptr);
+            EXPECT_NE(s.topicByName(1, "t"), s.topicByName(2, "t"));
+        }
+    }
+    const auto& s = r.state();
+    EXPECT_EQ(s.namespaces().liveCount(), 3u) << "default, alpha, beta (gamma was deleted)";
+    EXPECT_EQ(s.namespaces().nextNsId(), 4u);
+    EXPECT_EQ(s.namespaces().byName("beta")->limits.maxTopics, 40u) << "the limits change";
+    EXPECT_EQ(s.namespaces().byName("beta")->version, 2u);
+}
+
+TEST(CatalogV2GoldenRegression, TheV2GoldenScriptStillProducesTheCheckedInBytesRegression) {
+    std::ifstream in(RUNE_CATALOG_GOLDEN_DIR "/v2/namespaces.rcat", std::ios::binary);
+    auto records = rc::readRcat(in);
+    ASSERT_TRUE(records.has_value());
+    const auto script = rc::testing::goldenScriptV2();
+    ASSERT_EQ(records->size(), script.size());
+    for (std::size_t i = 0; i < script.size(); ++i) {
+        EXPECT_EQ((*records)[i].second, rc::encode(script[i]).value()) << "offset " << i;
+        auto e = rc::decode((*records)[i].second);
+        ASSERT_TRUE(e.has_value());
+        EXPECT_EQ(*e, script[i]) << "offset " << i;
+        EXPECT_EQ(e->formatVer, rc::kFormatV2);
+    }
+}

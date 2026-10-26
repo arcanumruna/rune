@@ -277,7 +277,7 @@ TEST(AdminWorkerRegression, AlterDoesNotPushValidatorWhenValidateOffRegression) 
     rig.becomeServingLeader();
     ASSERT_EQ(define(rig, "characters", 16, /*validate=*/false, charsBlob()).code, 0);
     ASSERT_EQ(rig.alter("characters", {addOp("score", PrimType::Int64)}).code, 0);
-    const auto* t = rig.admin().applier().state().topicByName("characters");
+    const auto* t = rig.admin().applier().state().topicByName(rune::catalog::kDefaultNsId, "characters");
     ASSERT_NE(t, nullptr);
     ASSERT_TRUE(t->schema.has_value());
     EXPECT_FALSE(t->schema->validate) << "validate=false is recorded: the sink posts no validator frame";
@@ -606,7 +606,7 @@ TEST(AdminWorkerRegression, ADdlThatExceedsTheFdBudgetIsRefusedBeforeItIsAppende
         << big.detail;
     EXPECT_NE(big.detail.find("open-file limit " + std::to_string(fdNeedBase() + 100)), std::string::npos) << big.detail;
     EXPECT_EQ(rig.recordedLog().size(), events) << "nothing appended";
-    EXPECT_EQ(rig.admin().applier().state().topicByName("huge"), nullptr);
+    EXPECT_EQ(rig.admin().applier().state().topicByName(rune::catalog::kDefaultNsId, "huge"), nullptr);
     EXPECT_EQ(rig.admin().ddlRefusedFdBudget(), 1u);
     EXPECT_EQ(defineWith(rig, "small", 1).code, 0) << "a topic within the budget is admitted";
     EXPECT_EQ(rig.recordedLog().size(), events + 1);
@@ -618,7 +618,7 @@ TEST(AdminWorkerRegression, AnAlterThatShrinksSegmentsPastTheFdBudgetIsRefusedRe
     CatalogDdlRig rig("aw_fd_alter", 1, 1, 0, /*fdLimit=*/fdNeedBase() + 100);
     rig.becomeServingLeader();
     ASSERT_EQ(defineWith(rig, "t", 1, /*segmentBytes=*/1LL << 20).code, 0);
-    const auto* before = rig.admin().applier().state().topicByName("t");
+    const auto* before = rig.admin().applier().state().topicByName(rune::catalog::kDefaultNsId, "t");
     ASSERT_NE(before, nullptr);
     const uint32_t version = before->version;
     const std::size_t events = rig.recordedLog().size();
@@ -626,7 +626,7 @@ TEST(AdminWorkerRegression, AnAlterThatShrinksSegmentsPastTheFdBudgetIsRefusedRe
     EXPECT_EQ(a.code, 39);
     EXPECT_NE(a.detail.find("ALTER TOPIC would raise"), std::string::npos) << a.detail;
     EXPECT_EQ(rig.recordedLog().size(), events) << "nothing appended";
-    const auto* after = rig.admin().applier().state().topicByName("t");
+    const auto* after = rig.admin().applier().state().topicByName(rune::catalog::kDefaultNsId, "t");
     ASSERT_NE(after, nullptr);
     EXPECT_EQ(after->version, version) << "config unchanged";
     EXPECT_EQ(after->config.retentionBytes, -1);
@@ -640,11 +640,11 @@ TEST(AdminWorkerRegression, ADdlThatLowersTheNeedIsAdmittedWhileOverBudgetRegres
     rig.admin().setFdLimitForTest(fdNeedBase() + 100);   // restarted with a lower limit: over budget now
     EXPECT_EQ(rig.alterConfig("t", {{rc::ConfigKey::RetentionBytes, 50LL << 20}}).code, 0)
         << "a smaller retention lowers the need: admitted although still above the limit";
-    EXPECT_EQ(rig.admin().applier().state().topicByName("t")->config.retentionBytes, 50LL << 20);
+    EXPECT_EQ(rig.admin().applier().state().topicByName(rune::catalog::kDefaultNsId, "t")->config.retentionBytes, 50LL << 20);
     EXPECT_EQ(rig.alterConfig("t", {{rc::ConfigKey::RetentionBytes, 60LL << 20}}).code, 39) << "a raise is refused";
     EXPECT_EQ(defineWith(rig, "more", 1).code, 39) << "a new topic only raises the need";
     EXPECT_EQ(rig.dropTopic("t").code, 0) << "a drop only lowers the need";
-    EXPECT_EQ(rig.admin().applier().state().topicByName("t"), nullptr);
+    EXPECT_EQ(rig.admin().applier().state().topicByName(rune::catalog::kDefaultNsId, "t"), nullptr);
     EXPECT_EQ(defineWith(rig, "more", 1).code, 0) << "back within the budget";
 }
 

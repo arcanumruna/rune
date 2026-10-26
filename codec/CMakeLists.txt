@@ -26,6 +26,8 @@ add_library(rune_catalog STATIC
     src/catalog/CatalogFingerprint.cpp
     src/catalog/CatalogFingerprintV2.cpp
     src/catalog/ApplyV1.cpp
+    src/catalog/ApplyV2.cpp
+    src/catalog/NamespaceRegistry.cpp
     src/catalog/CatalogReplayer.cpp
     src/catalog/CatalogQueries.cpp
     src/catalog/CatalogFile.cpp
