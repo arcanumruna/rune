@@ -1,11 +1,11 @@
 # Rune namespaces (multi-tenancy) and topic truncate: design
 
 **Status:** draft, 2026-10-24.
-**Scope:** namespaces with dynamic create, suspend and delete; namespace-scoped users and grants; per-namespace limits set by the cluster admin; a `TruncateTopic` operation.
+**Scope:** namespaces with dynamic create, suspend and delete; namespace-scoped users and grants; per-namespace limits set by the cluster admin and measured with arcanum-metrics; a `TruncateTopic` operation that also cuts the views over the topic.
 **Out of scope:** CPU caps through dedicated threads or nodes, per-namespace encryption at rest (it is a reserved limit only), and an account level above namespaces.
 
 ## 1. Model
-- **Namespace:** the isolation unit. A platform account owns one or more namespaces.
+- **Namespace:** the isolation unit, created and limited by the cluster admin.
 - **Contents:** topics, views, schemas, consumer groups, transactions and users all belong to exactly one namespace.
 - **Names:** every object is named by the pair (namespace, name).
 - **`default` namespace:** always exists and can never be deleted. A name without a namespace resolves to `default`, so existing clients keep working.
@@ -35,7 +35,7 @@
 
 ## 3. Catalog events
 New event kinds go in `__catalog`; these kinds are already reserved there:
-- `NamespaceCreated(nsId, name)`;
+- `NamespaceCreated(nsId, name, limits)`;
 - `NamespaceLimitsSet(nsId, limits)`;
 - `NamespaceStateChanged(nsId, state)`;
 - `NamespaceDeleted(nsId)`.
@@ -67,57 +67,110 @@ ACTIVE|SUSPENDED → DELETING(pendingTopics, pendingViews, pendingGroups, openTx
 **Internal topics** (`__consumer_offsets`, transaction state) stay shared, and every key starts with `nsId`. `__catalog` and `__security` are cluster-wide.
 
 ## 5. NamespaceLimits
-Only the cluster admin can set these, in one `NamespaceLimits` record per namespace.
-- **Ceilings:** each limit is a ceiling. Namespace admins can set tighter values per user or per topic, never looser.
-- **Unset:** an unset limit falls back to the cluster default.
-- **Lowering a limit:** never removes existing objects or data. New creates are refused, and retention is clamped to the new maximum.
+Rune has no tiers or plans. It knows only the limits a cluster admin puts on a namespace and its users. Whatever
+sells those limits (the Arcanum platform, an operator script) sits outside Rune and acts as the cluster admin.
 
-**Throughput**
-- Produce rate, in bytes/s and records/s.
-- Fetch rate, in bytes/s.
-- Request rate, i.e. operations per second including admin and metadata calls.
-- Query/view read rate and cost (CPU time per query).
+### 5.1 Model
+- **Set at create.** `CreateNamespace(name, limits)` carries the full limit record, and `NamespaceCreated(nsId,
+  name, limits)` stores it. A limit the admin leaves out takes the cluster default *at that moment*, and the
+  resolved value is written into the event. A later change to the cluster default never changes an existing
+  namespace.
+- **Changed by the cluster admin only.** `SetNamespaceLimits(name, limits)` appends `NamespaceLimitsSet(nsId,
+  limits)` with the full resolved record (not a delta). Every node applies it in log order, and applying it twice
+  changes nothing. A namespace admin can read its limits and usage, never change them.
+- **Per-user limits** (connections and sessions per user) are fields of the namespace's record and apply to every
+  user in it. Per-user and per-topic overrides are deferred.
+- **One metric per limit.** Every limit is paired with a usage metric in arcanum-metrics (§5.3). The broker
+  enforces against the same numbers an operator scrapes, so enforcement and monitoring never disagree.
+- **Lowering a limit** never deletes objects or data by itself:
+  - for counts, disk bytes and connections, new creates, produce or logins are refused until usage is back under
+    the limit; existing sessions stay;
+  - for the maximum retention, every topic's effective retention is clamped to the new maximum, so retention then
+    deletes the older segments. This is the one limit whose lowering removes data, and the admin command says so.
 
-**Storage**
-- Total disk bytes for the namespace. When it's reached, produce is rejected; existing data is never deleted.
-- Most retention time and bytes a topic may set.
-- Whether compaction is allowed, and its settings.
-- Largest allowed message size and batch size.
+### 5.2 Limits (v1)
+| Group | Limit | Scope | Usage metric |
+|---|---|---|---|
+| Objects | topics; partitions per topic; total partitions; views; schemas; versions per schema; consumer groups; users | cluster | `rune_ns_objects{ns,ns_id,kind}` |
+| Storage | disk bytes | per node | `rune_ns_disk_bytes{ns,ns_id}` |
+| Storage | max retention time and bytes; compaction allowed; max message and batch size | per topic (checked at DDL / produce) | none (static ceilings) |
+| Throughput | produce bytes/s and records/s; fetch bytes/s; request ops/s; query CPU cycles/s | per node | `rune_ns_*_total{ns,ns_id,thread}` |
+| Connections | connections per namespace and per user; sessions per user; open transactions; max transaction time | per node | `rune_ns_connections{ns,ns_id}`, `rune_ns_open_txns{ns,ns_id}` |
+| Views | materialized memory | per node | `rune_ns_view_bytes{ns,ns_id}` |
+| Durability | min/max replication factor; lowest `acks`; lowest `min.insync` | per topic (DDL, connect) | none |
+| Features | transactions, QL, views, SQL/Redis facades, anonymous read (§11); allowed auth mechanisms | namespace | none |
 
-**Object counts**
-- Topics, partitions per topic and total partitions.
-- Views, plus memory per view (materialized state).
-- Schemas, and the number of versions per schema.
-- Consumer groups.
-- Users.
+Deferred, kept as reserved fields so the record never changes shape: placement (nodes or racks), password policy,
+per-namespace encryption key.
 
-**Connections**
-- Concurrent connections, both per namespace and per user.
-- Sessions per user.
-- Open transactions, and the longest a transaction may run.
+- **Cluster vs node scope.** Object counts are exact and cluster-wide, because every node applies the same
+  `__catalog`. Rates, connections, disk and view memory are enforced per node, like Kafka quotas: each node
+  measures only what it serves or stores, and the admin sets the per-node value. Cluster-wide aggregation of those
+  would need cross-node traffic on every tick and is out of scope.
+- **Disk bytes** count every segment, index and checkpoint the node stores for the namespace, leader and follower
+  replicas alike. Only produce is refused when the node is over; replication into a follower is never refused
+  (it would break the ISR), so a follower can go over by what is in flight.
 
-**Durability and placement**
-- Replication factor, minimum and maximum, so nobody runs RF=1 on a shared cluster or uses up replicas.
-- Lowest allowed `acks` and lowest `min.insync`, if you want a durability floor.
-- Placement: which nodes or racks the namespace may use. This leaves room for dedicated nodes later.
+### 5.3 Metrics (arcanum-metrics)
+All Rune metrics, the limit metrics and every existing Aeron counter in `RoleCounter.h` (type ids
+1'000'201..1'000'241), move to arcanum-metrics. Rune then has one metrics system; `cnc.dat` keeps only the media
+driver's own counters. `docs/operations.md` and every tool that reads the old counters move with it.
 
-**Security and features**
-- Allowed auth mechanisms and the password policy.
-- Feature flags, for example whether the namespace may use transactions, QL, views or SQL/Redis facades.
-- Encryption at rest with its own key per namespace (later).
+**Library changes first** (phase 0, in arcanum-metrics). As it stands the library breaks Rune's rules: shared RMW
+and CAS on slots, a `std::mutex` in the windowed metrics, `steady_clock`, `std::string` and exceptions on
+registration, and no way to free a slot. It gains, mirroring Aeron's `CountersManager`:
+- **Single-writer slots.** Each value slot has exactly one writer thread. It updates with a plain add and a release
+  store (`std::atomic_ref` under TSan); readers use an acquire load. No `fetch_add`, no CAS, no mutex.
+- **Rates from totals.** The hot path only bumps monotonic totals. Rates and windowed max/avg are computed by the
+  reader from successive samples, so no bucket array or lock is written on the hot path.
+- **Injected clock.** Every time-based function takes `nowNs` from the caller's advanceable clock.
+- **Allocate and free with a registration id.** A slot block carries a state word (unused, allocated, freed) and a
+  registration id. Rune uses the `nsId` as the id, and since an `nsId` is never reused a reader can always tell a
+  reused slot from the old one. Allocation and free write the label (`ns="acme",ns_id="42"`) and run only on the
+  control thread, never on the hot path. They return an error code instead of throwing and allocate nothing.
 
-**State**
-- Suspend, which makes the namespace read-only or rejects everything, e.g. when a bill isn't paid. Delete has the same lifecycle but goes further.
+**Capacity is fixed at broker start.**
+- `maxNamespaces` is a cluster setting checked by the catalog: `CreateNamespace` beyond it is refused with
+  `NAMESPACE_LIMIT_EXCEEDED`.
+- Each node sizes its metrics file at start for `maxNamespaces × (per-thread metrics × threads + per-node
+  metrics)` plus the node's own metrics, and refuses to start if that is below the cluster's `maxNamespaces`.
+- The set of metrics is a compile-time enum; nothing is registered by name at runtime.
 
-### Enforcement
-| Kind | Where | How |
+**Ownership.** One writer per slot, always the thread that owns the state:
+| Metric | Writer |
+|---|---|
+| object counts | catalog agent (applies `__catalog`) and security agent (users) |
+| produce/fetch bytes and records, request ops, query cycles | each gateway/worker thread, its own slot per namespace |
+| disk bytes | the worker that owns the partition, its own slot per namespace |
+| connections, sessions, open transactions | the gateway / transaction coordinator that owns them |
+| view bytes | the view's owning worker |
+
+### 5.4 Enforcement
+| Kind | Check | Refusal |
 |---|---|---|
-| Counts, retention, RF, acks, features, auth, placement | DDL, login, connect (control plane) | Checked against the limits; the request is refused with `NAMESPACE_LIMIT_EXCEEDED`. |
-| Disk bytes | A storage agent sums segment sizes off the hot path and publishes a per-namespace over-limit flag to the gateways over the ring buffers. | Produce is rejected while the flag is set. |
-| View memory | Charged when a row is inserted into a view or on view DDL, using the preallocated budget. | The write is refused. |
-| Rates (produce, fetch, request, query CPU) | Each gateway or worker thread holds its own token bucket with a slice of the limit (limit ÷ threads). The bucket is preallocated and the check is branch-only. Query CPU is charged in `rdtsc` cycles. | The response carries a throttle time (backpressure). Data is never dropped. |
+| Object counts, durability, features, static ceilings | at DDL, login or connect, on the thread that owns the count, against the current record | `NAMESPACE_LIMIT_EXCEEDED`; nothing is applied |
+| Connections, sessions, open transactions | at login, connect, `BeginTxn`, by the owning thread | `NAMESPACE_LIMIT_EXCEEDED` |
+| Rates | see below | `THROTTLED(retryAfterNs)` |
+| Disk bytes | the aggregator sets the namespace's over-disk state on each thread | produce gets `NAMESPACE_LIMIT_EXCEEDED` |
+| View memory | the view's worker, when an applied batch would pass the limit | the view moves to `PAUSED(OVER_LIMIT, offset)` (below) |
 
-**Hot-path budget.** The only hot-path addition is the token-bucket check. It must allocate nothing and pass an ABAB bench against the CLAUDE.md latency budgets.
+**Rates.** One aggregator on the node's control agent, driven by `doWork(nowNs)`:
+1. Every tick it acquire-loads each thread's per-namespace totals and computes the rate over the window.
+2. When a namespace is over, it sends `Throttle(nsSlot, untilNs)` to each thread through that thread's ring; when it
+   is back under, `Throttle(nsSlot, 0)`.
+3. Each thread keeps a preallocated `throttleUntilNs[maxNamespaces]` it alone owns. The hot-path check is one compare:
+   `nowNs < throttleUntilNs[nsSlot]`. A throttled produce is refused with `THROTTLED(retryAfterNs)` before
+   anything is appended, so nothing is stored or lost and the client retries after the delay. A client that
+   ignores the delay is refused again at the cost of one branch.
+
+This replaces the earlier per-thread token buckets (limit ÷ threads): the limit is never re-sliced when threads or
+load shift. Overshoot is bounded by one tick's traffic and is covered by a test with a fixed tick and load.
+
+**Views over the memory limit** stop applying instead of dropping rows, so a view always equals a recompute of its
+log. Reads return `VIEW_PAUSED`. When the limit is raised, or the view's memory falls, it resumes from its offset.
+
+**Hot-path budget.** The only hot-path additions are one owned-slot add per request and one throttle compare. Both
+allocate nothing, and they must pass an ABAB bench against the CLAUDE.md latency budgets.
 
 ## 6. TruncateTopic
 - **Wire request:**
@@ -131,12 +184,22 @@ Only the cluster admin can set these, in one `NamespaceLimits` record per namesp
   3. Whole segments below the new start are deleted asynchronously, the same way retention deletes them.
 - **Response:** the new `logStartOffset` for each partition.
 - **Consumers:** a fetch below the start returns `OFFSET_OUT_OF_RANGE`, which the client's reset policy handles, as it does after retention.
-- **Views:** keep the state they have already materialized, as they do after retention. Truncate never rewinds a view.
+- **Views:** truncate cuts every view that reads the topic up to the same offset. Afterwards each view equals a
+  recompute over the remaining log `[newStart, HW)` of its sources, so rows that came only from removed records
+  are gone and aggregates no longer count them. This differs from retention, which leaves a view's state alone; a
+  truncate is an explicit cut.
+  - The view's worker rebuilds into a shadow state from the new start, keeps serving the old state meanwhile, and
+    swaps once the shadow has caught up with the live state's offset. Readers never see a partly rebuilt view.
+  - The shadow counts against the namespace's view memory limit. If it cannot fit, the truncate is refused with
+    `NAMESPACE_LIMIT_EXCEEDED` before anything changes.
+  - View snapshots taken below the new start are discarded, so a restart rebuilds from the new start instead of
+    restoring rows that were cut.
 - **Interactions:**
   - A transaction open across the truncate point keeps its producer state; only the records are gone.
   - On a compacted topic, truncate removes all records below the new start, however recent the key.
 
 ## 7. Phases
+0. **Metrics:** the arcanum-metrics changes in §5.3 (single-writer slots, injected clock, allocate/free with a registration id, no-throw), then every Rune Aeron counter moved onto it, with `docs/operations.md`.
 1. **Namespaces:**
    - catalog events and the `nsId` registry;
    - names and resolution, the `default` namespace, the disk layout and upgrade rename;
@@ -145,15 +208,16 @@ Only the cluster admin can set these, in one `NamespaceLimits` record per namesp
 2. **Lifecycle and limits:**
    - suspend and the crash-safe delete;
    - `nsId`-keyed internal topics;
-   - enforcement of counts, storage, memory and control-plane limits;
-   - rate token buckets and the bench.
-3. **TruncateTopic:** wire, broker, replication and client, plus the CLI.
+   - per-namespace metric blocks, allocated on create and freed on delete;
+   - enforcement of counts, storage, view memory and control-plane limits;
+   - the rate aggregator, `Throttle` over the rings, and the ABAB bench.
+3. **TruncateTopic:** wire, broker, replication and client; view cut and rebuild; the CLI.
 4. **CLI:** `rune` reads the shared Arcanum login context; `arcanum` plugin dispatch; `topic truncate`, `topic list` and `namespace` commands. The platform commands in §10.2 come with the control-plane service.
 5. **NAT-safe egress:** per-session egress on a client-opened flow; per-worker egress on by default; NAT e2e leg (§10.5).
 
 ## 8. Interaction matrix
 Operations × entities × timings:
-- **Operations:** create, suspend, resume, delete, recreate the same name, set limits, truncate.
+- **Operations:** create, suspend, resume, delete, recreate the same name, set limits (raise, lower below usage), truncate.
 - **Entities:** topics, views, groups, open transactions, users and live sessions in the namespace; other namespaces.
 - **Timings:**
   - sequential;
@@ -161,7 +225,9 @@ Operations × entities × timings:
   - mid-delete at each step;
   - leader change mid-operation;
   - restart between steps;
-  - follower offline during the delete or truncate, then catching up.
+  - follower offline during the delete or truncate, then catching up;
+  - truncate during a view rebuild, and a second truncate before the first rebuild swaps;
+  - a limit change between an aggregator tick and the `Throttle` reaching a thread.
 
 Required:
 - table-driven unit tests;
@@ -173,8 +239,9 @@ Required:
 - **Cross-namespace leaks:** in name resolution, the internal-topic keys, grants, metadata responses and error messages.
 - **Escalation through a sibling operation:** a namespace admin reaching cluster-admin, another namespace, or the limits.
 - **Delete convergence:** across crashes, a lagging follower and recreating the same name.
-- **Truncate correctness:** the start never moves backwards; followers and views stay correct; the HW clamp holds.
-- **Hot path:** zero allocations and the ABAB bench for the token buckets.
+- **Truncate correctness:** the start never moves backwards; the HW clamp holds; after the cut every view equals a recompute of `[newStart, HW)`, including after a restart.
+- **Metrics:** one writer per slot; a freed and reused slot never mixes two `nsId`s; usage always equals the owner's state.
+- **Hot path:** zero allocations and the ABAB bench for the slot add and the throttle compare.
 
 ## 10. CLI: `arcanum` (platform) and `rune` (service)
 The platform CLI is `arcanum`. Rune is one service under it; more services will follow.
@@ -187,35 +254,14 @@ The platform CLI is `arcanum`. Rune is one service under it; more services will 
 - **Self-hosted:** `rune` with no login works exactly as today, using `--broker` and `--user`/`--password-file`.
 
 ### 10.1 Platform model
-- **Account:** owns projects, billing and users. You sign in with `arcanum login`.
-- **Project:** a named group of deployments, one per service.
-- **Deployment:** one service in one project, at one tier:
+Rune knows nothing of accounts, projects, tiers or billing. The platform model and its commands (`arcanum login`,
+`deploy`, `teardown` and so on) are specified with the Arcanum control-plane service, a separate project.
 
-| Tier | Price | Rune deployment |
-|---|---|---|
-| `testing` | free | A namespace on a shared multi-tenant cluster. This spec covers it: limits are tight and the cluster admin is the platform. |
-| `dev` | paid | A dedicated single-node cluster. The project gets the `default` namespace and its owner is the namespace admin. |
-| `pro` | paid | A dedicated 3-node cluster (acks=all, failover), with higher limits and other benefits. |
-
-The client API and the `rune` commands are the same on every tier. Only the endpoint and the limits differ.
-
-### 10.2 Platform commands
-These are served by the Arcanum control-plane service, not by the broker. That service is a separate project and comes later; this section fixes the command shape.
-
-| Command | Does |
-|---|---|
-| `arcanum login` | Browser device-code sign-in. Stores a token in the user config directory with mode 0600, or in the OS keychain. |
-| `arcanum logout` | Revokes the token and deletes the local credentials. |
-| `arcanum whoami` | Shows the account, the current project and the token's expiry. |
-| `arcanum list` | Lists the account's projects, each with its deployments, tier and status. |
-| `arcanum project create\|delete <name>` | Creates or deletes a project. Delete refuses while the project still has deployments. |
-| `arcanum use <project>` | Sets the current project. Every `arcanum` and `rune` command also takes `--project`. |
-| `arcanum deploy rune --tier testing\|dev\|pro` | Provisions Rune for the current project (later). |
-| `arcanum status [rune]` | Shows the deployment's state, endpoint, tier and limit usage. |
-| `arcanum upgrade rune --tier <tier>` | Changes the tier (later). Moving data between `testing` and `dev`/`pro` is a migration job. |
-| `arcanum teardown rune` | Destroys the deployment. You confirm by typing the project name. `testing` runs the namespace delete in §4. `dev`/`pro` destroy the cluster. |
-
-Product decision for later: whether teardown is immediate, or keeps a recoverable grace period on paid tiers.
+The contract between them is small:
+- the control plane acts as a cluster admin, through `rune namespace create|limits|suspend|resume|delete` or the
+  same admin requests;
+- whatever a plan sells is expressed only as a `NamespaceLimits` record (§5) or as a separate cluster;
+- usage shown to a customer comes from the namespace's metrics (§5.3).
 
 ### 10.3 `rune` commands
 - **Connection:** when signed in, the control plane hands out the namespace-admin SCRAM credential for the current project, and `rune` caches it with mode 0600.
@@ -228,7 +274,7 @@ Product decision for later: whether teardown is immediate, or keeps a recoverabl
   - Self-hosted only: `security bootstrap` and `gen-cluster-key`. On the platform these are run by the control plane.
 - **New commands from this spec:**
   - `rune topic truncate <topic> [--partition N] [--before <offset>]`: TruncateTopic (§6).
-  - `rune namespace create|delete|suspend|resume|list|limits`: cluster admin only, so self-hosted or the control plane.
+  - `rune namespace create|delete|suspend|resume|list|limits`: cluster admin only, so self-hosted or the control plane. `limits` shows each limit next to its usage metric.
   - User and grant management is QL through `console` or `ql`, as today; it runs as a namespace admin.
 - **Review notes:**
   - `schema list` actually lists topics. Add `topic list` as the canonical command and keep `schema list` as an alias.
@@ -282,3 +328,49 @@ Full design: arcanum-site `docs/specs/2026-10-24-arcanum-auth-design.md` §5.
 - **Scope:** an anonymous session only ever sees its own namespace.
 - **Limits:** anonymous sessions count against the namespace's connection and rate limits, with a separate small cap building on issue #236.
 - **Tests:** adversarial checks that anonymous never passes any gate but schema read, including through a sibling operation, and never sees another namespace.
+
+## 12. Open questions
+Still to decide. Each has the recommended answer; a line is removed when the decision is written into the
+section it belongs to.
+
+**Code facts the spec must match**
+1. Disk layout: the code uses `<data>/topics/<name>/<partition>/`, not `<topic>-<partition>`. Recommended:
+   `<data>/ns-<nsId>/topics/<name>/<partition>/`.
+2. The catalog reserves kinds 32–63 only as a block that formatVer 1 refuses. Recommended: the namespace events
+   bump the catalog to formatVer 2.
+3. `SecurityOperation` and `SecurityResourceType` are frozen enums with no `Truncate` or `Namespace`. Recommended:
+   append `Truncate = 7` and `Namespace = 5`; never renumber.
+4. `Log` already has a log-start-offset checkpoint, and the replication fetch carries `logStartOffset` (the Kafka
+   DeleteRecords path). Recommended: truncate uses that path instead of a new `LogStartAdvanced` control record.
+5. Roles exist (`CreateRole`, `GrantRole`). Recommended: roles are namespaced like users.
+
+**Naming**
+6. A bare name resolves in the session's namespace, not always in `default`. Recommended: yes.
+7. ConnectRequest has no namespace field. Recommended: the namespace comes from the login (`ns/user`); no field.
+8. Namespace name rules. Recommended: `[a-z0-9][a-z0-9-]{0,62}`; `__`-prefixed names are reserved.
+9. `ObjectIndex::byName` is global. Recommended: key it by `(nsId, name)`.
+10. Group and transactional ids. Recommended: keyed by `(nsId, id)`, as the internal-topic keys are.
+
+**Admin**
+11. The cluster admin gets no data access inside a namespace by default. Recommended: yes; it must grant itself
+    explicitly, and that grant is audited.
+12. Existing users become `default/<user>` on upgrade. Recommended: yes.
+13. The security-admin guard stays cluster-wide. Recommended: yes.
+
+**Lifecycle**
+14. `NamespaceDeleted` is the only commit point; every owner then reconciles idempotently. Recommended: yes.
+15. Recreating a name while the old `nsId` is still `DELETING`. Recommended: allowed; the new `nsId` cannot match
+    the old state.
+16. What `ReadOnly` refuses. Recommended: produce, all DDL, transactions and group commits; allows fetch, view and
+    QL reads.
+17. `RejectAll` refuses every login, and `default` can be suspended. Recommended: yes to both.
+
+**Truncate**
+18. Truncate of internal (`__*`) and transient topics. Recommended: refused.
+19. Truncate clamps to the last stable offset as well as the HW on transactional topics. Recommended: yes.
+
+**Scope**
+20. Split NAT egress (§10.5) and the CLI work into their own specs. Recommended: yes.
+21. Anonymous read (§11) is off by default, and CLAUDE.md §8 records it. Recommended: yes.
+22. Version skew: an old node in a mixed cluster cannot apply formatVer 2 events. Recommended: a cluster feature
+    gate that refuses namespace DDL until every node reports support.
