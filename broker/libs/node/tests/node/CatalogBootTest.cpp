@@ -182,7 +182,7 @@ public:
         const auto r = client_->awaitDefine(
             client_->sendDefineTopic(gw(), stream(), sid_, d.name, d.partitions,
                                      d.typed ? charBlob() : std::vector<uint8_t>{}, d.persistence,
-                                     rune::protocol::RequestId{}, 0, rune::protocol::TopicConfigView{}, d.validate),
+                                     rune::protocol::RequestId{}, 0, boundedTestTopicConfig(), d.validate),
             Clock::now() + 10s);
         return {r ? static_cast<int>(r->errorCode) : -1};
     }

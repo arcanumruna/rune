@@ -308,6 +308,17 @@ TEST(AuthMatrixDiskRegression, EveryRigTopicCreatePathRollsAtTheRigSegmentSizeAd
         EXPECT_GT(grew, 0u) << "AuthRig::defineTopicCode: no segment appeared";
         EXPECT_LT(grew, kPerTopicCeiling) << "AuthRig::defineTopicCode";
     }
+    {
+        // The raw test client with NO config argument (AuthStress's user CREATE TOPIC, CatalogBoot and ~35 other
+        // call sites): ShardTestClient::sendDefineTopic defaults to a 1 MiB segment, never the 64 MiB broker default.
+        auto& r = rig.rig();
+        const uint64_t before = allocatedBytes(dir);
+        ASSERT_EQ(r.ddlCode(r.c().sendDefineTopic(r.ch(), r.stream(), r.builder, "adv.rawdefault", 1,
+                                                  rune::node::test::authRigCharBlob())), 0);
+        const uint64_t grew = grownBy(dir, before);
+        EXPECT_GT(grew, 0u) << "ShardTestClient::sendDefineTopic default: no segment appeared";
+        EXPECT_LT(grew, kPerTopicCeiling) << "ShardTestClient::sendDefineTopic default config";
+    }
     for (const AMOp op : {AMOp::CreateTopic, AMOp::CreateSchema, AMOp::CreateView}) {
         const Cell c{op, Grant::Exact, Timing::Steady};
         ASSERT_EQ(naRule(c.op, c.grant, c.timing), NaRule::None);
