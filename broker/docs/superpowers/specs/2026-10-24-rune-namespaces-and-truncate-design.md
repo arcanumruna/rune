@@ -8,15 +8,24 @@
 - **Namespace:** the isolation unit, created and limited by the cluster admin.
 - **Contents:** topics, views, schemas, consumer groups, transactions and users all belong to exactly one namespace.
 - **Names:** every object is named by the pair (namespace, name).
-- **`default` namespace:** always exists and can never be deleted. A name without a namespace resolves to `default`, so existing clients keep working.
+  - A bare name resolves in the session's namespace.
+  - The qualified form is `ns/name`. Topic, view and group names can never contain `/` (`TopicName.h`), so the form
+    is unambiguous. Only the cluster admin may name an object in a namespace other than its session's.
+  - An object in another namespace answers exactly like a missing one: same error code, same message, same timing
+    path. Nothing reveals that a name exists elsewhere.
+- **No cross-namespace references.** A view's sources, a topic's schema and a transaction's partitions all belong to
+  the object's own namespace. DDL that names an object in another namespace is refused, for the cluster admin too.
+- **`default` namespace:** always exists and can never be deleted.
 - **Identity:** each namespace has a `nsId`, a u32 that the catalog assigns and never reuses. It is the namespace's incarnation: deleting `acme` and creating it again gives a new `nsId`, so stale state can never match the new namespace.
 - **Disk layout:** `<data>/ns-<nsId>/topics/<name>/<partition>/...`.
 - **No in-place upgrade.** A cluster with namespaces is a new cluster; existing data, users and grants are not migrated, so there is no upgrade rename and no mixed-version cluster.
 - **Memory layout:** a per-node map from `nsId` to that namespace's objects, owned by the metadata or catalog agent.
-- **Hot path is unchanged:**
-  - Topic and view ids stay globally unique, so the produce, consume and query paths never see `nsId`.
-  - A namespace is resolved once, when a name is turned into an id.
-  - That lookup is checked against the session's namespace grants.
+- **Hot path:**
+  - Topic and view ids stay globally unique, so the produce, consume and query paths never look up a name or an `nsId`.
+  - A namespace is resolved once, when a name is turned into an id, and that lookup is checked against the session's grants.
+  - Each topic and view carries its namespace's metric slot (`nsSlot`, §5.3) next to its id. Usage is charged to the
+    namespace that owns the object, never to the session's, so a cluster admin producing into `acme` counts against `acme`.
+  - The only hot-path additions are the slot add and the throttle compare of §5.4.
 
 ## 2. Roles and users
 | Role | Can do |
@@ -26,6 +35,11 @@
 | User | Whatever its grants allow, within its own namespace. |
 
 - **User names** have the form `ns/user` and live in `__security` (SCRAM). Logging in fixes the session's namespace; `ConnectRequest` gets no namespace field.
+- **Cluster admins** are users of `default` that hold the cluster-admin grant. Suspension never applies to a cluster-admin
+  session, so suspending `default` cannot lock the admin out.
+- **Roles** are namespaced like users (`ns/role`); a grant can only name a role of its own namespace.
+- **Security enums** are frozen and only appended to: `SecurityOperation::Truncate = 7` and
+  `SecurityResourceType::Namespace = 5` (the next free values in `SecurityTypes.h`); nothing is renumbered.
 - **Escalation guards**, each enforced in the security agent and each covered by an adversarial test. A namespace admin can never:
   - grant cluster-admin;
   - grant on, or touch users in, another namespace;
@@ -44,6 +58,10 @@ These events use a new catalog formatVer 2 rule set: v2 accepts the namespace ki
 
 Users and grants for a namespace go in `__security`, tagged with its `nsId`. Every node applies the events in log order, and applying the same event twice changes nothing.
 
+**New error codes**, appended to the wire enum and never renumbered: `NAMESPACE_SUSPENDED`, `NAMESPACE_LIMIT_EXCEEDED`,
+`THROTTLED` (carries `retryAfterNs`) and `VIEW_PAUSED`. A deleted or deleting namespace answers like a missing one
+(§1).
+
 ## 4. Lifecycle
 A rich-state machine, owned by the catalog agent. Every state handles every event.
 
@@ -53,16 +71,30 @@ ACTIVE|SUSPENDED → DELETING(pendingTopics, pendingViews, pendingGroups, openTx
 ```
 
 **Suspend.**
-- In `ReadOnly` mode, the gateway refuses produce, all DDL, transactions and consumer-group offset commits with `NAMESPACE_SUSPENDED`, and allows fetch, view reads and QL reads. Use it to freeze a namespace while its owner can still get data out.
+- In `ReadOnly` mode, the gateway refuses produce, all DDL (TruncateTopic and user and grant changes included), transactions and consumer-group offset commits with `NAMESPACE_SUSPENDED`, and allows fetch, view reads and QL reads. Use it to freeze a namespace while its owner can still get data out.
+  - Transactions open when the suspend applies are aborted by their coordinator, so none is left waiting for a
+    commit it can never make.
 - In `RejectAll` mode, every request and every login fails with `NAMESPACE_SUSPENDED`, and open sessions are closed.
+- Every request type is listed in one table, allowed or refused per mode, and a test walks the whole table; a new
+  request type cannot be added without a row.
+- Neither mode applies to cluster-admin sessions (§2). Resume, delete and limit changes stay open to the cluster admin
+  in every state.
+- Suspending an already suspended namespace changes only its mode. Resuming an `ACTIVE` one changes nothing.
+
+**`DELETING`** refuses every request, login, suspend, resume and limit change for that `nsId`, and answers like a
+missing namespace (§1).
 
 **Delete**, in this order:
 1. Append `NamespaceDeleted`. New requests and logins for the namespace are rejected from then on.
 2. Fence and close its sessions, and revoke its users.
 3. Abort its open transactions.
 4. Delete its topics, views and schemas through the existing `DropTopic` and `DropView` paths.
-5. Purge its keys from `__consumer_offsets` and the transaction state with tombstones.
+5. Purge its keys from `__consumer_offsets` and the transaction state with tombstones, and its users, roles and grants from `__security`.
 6. On each replica, rename `ns-<nsId>` to `ns-<nsId>.deleting` (atomic), then remove it in the background.
+7. Free its metric slots (§5.3). Until then the namespace still counts against `maxNamespaces`.
+
+`NamespaceDeleted` is the only commit point; every owner then reconciles its own part idempotently. The name can be
+created again while the old `nsId` is still `DELETING`: the new `nsId` cannot match any of the old state.
 
 **Crash safety.** On boot, and when a follower catches up, any `ns-*.deleting` directory is removed, and any namespace marked deleted in the catalog has its remaining steps re-run. All steps are idempotent. Convergence comes from the log plus an idempotent restore, never from a timeout (rule 16).
 
@@ -74,7 +106,8 @@ sells those limits (the Arcanum platform, an operator script) sits outside Rune 
 
 ### 5.1 Model
 - **Set at create.** `CreateNamespace(name, limits)` carries the full limit record, and `NamespaceCreated(nsId,
-  name, limits)` stores it. A limit the admin leaves out takes the cluster default *at that moment*, and the
+  name, limits)` stores it. Namespace names match `[a-z0-9][a-z0-9-]{0,62}`; `__`-prefixed names are reserved. A
+  limit the admin leaves out takes the cluster default *at that moment*, and the
   resolved value is written into the event. A later change to the cluster default never changes an existing
   namespace.
 - **Changed by the cluster admin only.** `SetNamespaceLimits(name, limits)` appends `NamespaceLimitsSet(nsId,
@@ -126,6 +159,9 @@ registration, and no way to free a slot. It gains, mirroring Aeron's `CountersMa
 - **Rates from totals.** The hot path only bumps monotonic totals. Rates and windowed max/avg are computed by the
   reader from successive samples, so no bucket array or lock is written on the hot path.
 - **Injected clock.** Every time-based function takes `nowNs` from the caller's advanceable clock.
+- **Slot assignment.** The catalog agent picks a free `nsSlot` (0..`maxNamespaces`−1) when it applies
+  `NamespaceCreated`, and tells every thread of the node `(nsSlot, nsId)` through its ring before any object of the
+  namespace exists. Slots are local to the node; only `nsId` is cluster-wide.
 - **Allocate and free with a registration id.** A slot block carries a state word (unused, allocated, freed) and a
   registration id. Rune uses the `nsId` as the id, and since an `nsId` is never reused a reader can always tell a
   reused slot from the old one. Allocation and free write the label (`ns="acme",ns_id="42"`) and run only on the
@@ -158,8 +194,9 @@ registration, and no way to free a slot. It gains, mirroring Aeron's `CountersMa
 
 **Rates.** One aggregator on the node's control agent, driven by `doWork(nowNs)`:
 1. Every tick it acquire-loads each thread's per-namespace totals and computes the rate over the window.
-2. When a namespace is over, it sends `Throttle(nsSlot, untilNs)` to each thread through that thread's ring; when it
-   is back under, `Throttle(nsSlot, 0)`.
+2. When a namespace is over, it sends `Throttle(nsSlot, nsId, untilNs)` to each thread through that thread's ring;
+   when it is back under, `Throttle(nsSlot, nsId, 0)`. A thread ignores a `Throttle` whose `nsId` is not the one it
+   holds for that slot, so a late message about a deleted namespace never throttles the slot's next owner.
 3. Each thread keeps a preallocated `throttleUntilNs[maxNamespaces]` it alone owns. The hot-path check is one compare:
    `nowNs < throttleUntilNs[nsSlot]`. A throttled produce is refused with `THROTTLED(retryAfterNs)` before
    anything is appended, so nothing is stored or lost and the client retries after the delay. A client that
@@ -179,17 +216,21 @@ allocate nothing, and they must pass an ABAB bench against the CLAUDE.md latency
   - `TruncateTopic(topicName, entries[(partition, beforeOffset)], DdlExtension)`.
   - `beforeOffset = -1` means "as far as is available".
   - It needs the `Truncate` grant on the topic.
+  - An empty `entries` list means every partition. An unknown partition fails that entry only, with `INVALID_REQUEST`;
+    the other entries still apply.
   - Internal (`__*`) topics are refused with `INVALID_REQUEST`, for every caller, the cluster admin included.
 - **What it does:** it advances the partition's `logStartOffset` to the furthest offset available when the
   leader executes the request: `min(beforeOffset, HW, LSO)`, where the LSO (last stable offset) is the HW on a
   topic with no open transactions. Records of a transaction still open stay; everything below them goes. The leader
   resolves the offset once and writes it into the replicated record, so every replica applies that exact offset;
   the response returns it. A retry after a failed request resolves again on the current leader. The start never
-  moves backwards.
+  moves backwards: a `beforeOffset` at or below the current start changes nothing and returns the current start.
+- **Durability:** the reply is sent only once the new start is committed (replicated to the ISR, as for `acks=all`),
+  so a leader change after the reply can never bring truncated records back.
 - **Topic kinds:** user topics, transactional or not, and transient topics can be truncated; only internal (`__*`)
   topics are refused.
 - **Flow:**
-  1. The leader appends a `LogStartAdvanced(partition, offset)` control record.
+  1. The leader appends a `LogStartAdvanced(partition, offset)` control record (see open question 4).
   2. That record replicates through the normal path, so followers apply the same start.
   3. Whole segments below the new start are deleted asynchronously, the same way retention deletes them.
 - **Response:** the new `logStartOffset` for each partition.
@@ -200,8 +241,11 @@ allocate nothing, and they must pass an ABAB bench against the CLAUDE.md latency
   truncate is an explicit cut.
   - The view's worker rebuilds into a shadow state from the new start, keeps serving the old state meanwhile, and
     swaps once the shadow has caught up with the live state's offset. Readers never see a partly rebuilt view.
-  - The shadow counts against the namespace's view memory limit. If it cannot fit, the truncate is refused with
-    `NAMESPACE_LIMIT_EXCEEDED` before anything changes.
+  - Every replica cuts its own views when it applies the new start.
+  - The shadow counts against the namespace's view memory limit. A cut only removes records, so the view's current
+    size bounds the shadow. The leader reserves that much before it resolves the offset; if it cannot, the truncate
+    is refused with `NAMESPACE_LIMIT_EXCEEDED` before anything changes. A follower whose shadow cannot fit moves
+    the view to `PAUSED(OVER_LIMIT, offset)` (§5.4) instead of diverging.
   - View snapshots taken below the new start are discarded, so a restart rebuilds from the new start instead of
     restoring rows that were cut.
 - **Interactions:**
@@ -221,14 +265,15 @@ allocate nothing, and they must pass an ABAB bench against the CLAUDE.md latency
    - per-namespace metric blocks, allocated on create and freed on delete;
    - enforcement of counts, storage, view memory and control-plane limits;
    - the rate aggregator, `Throttle` over the rings, and the ABAB bench.
-3. **TruncateTopic:** wire, broker, replication and client; view cut and rebuild; the CLI.
-4. **CLI:** `rune` reads the shared Arcanum login context; `arcanum` plugin dispatch; `topic truncate`, `topic list` and `namespace` commands. The platform commands in §10.2 come with the control-plane service.
-5. **NAT-safe egress:** per-session egress on a client-opened flow; per-worker egress on by default; NAT e2e leg (§10.5).
+3. **TruncateTopic:** wire, broker, replication and client; view cut and rebuild; `rune topic truncate`.
+4. **CLI:** `rune` reads the shared Arcanum login context; `arcanum` plugin dispatch; `topic list` and `namespace` commands. The platform commands (§10.1) come with the control-plane service.
+5. **NAT-safe egress:** per-session egress on a client-opened flow; per-worker egress on by default; NAT e2e leg (§10.4).
 
 ## 8. Interaction matrix
 Operations × entities × timings:
-- **Operations:** create, suspend, resume, delete, recreate the same name, set limits (raise, lower below usage), truncate.
-- **Entities:** topics, views, groups, open transactions, users and live sessions in the namespace; other namespaces.
+- **Operations:** create, suspend (`ReadOnly`, `RejectAll`, switch mode), resume, delete, recreate the same name, set limits (raise, lower below usage, lower max retention), truncate (`-1`, an explicit offset, below the current start, every partition).
+- **Callers:** cluster admin, namespace admin, plain user, anonymous; in the namespace and in another one.
+- **Entities:** user, transactional, transient and internal (`__*`) topics; views, including ones over several topics and paused ones; groups, open transactions, users, roles and live sessions in the namespace; other namespaces.
 - **Timings:**
   - sequential;
   - back-to-back before the reply;
@@ -237,7 +282,9 @@ Operations × entities × timings:
   - restart between steps;
   - follower offline during the delete or truncate, then catching up;
   - truncate during a view rebuild, and a second truncate before the first rebuild swaps;
-  - a limit change between an aggregator tick and the `Throttle` reaching a thread.
+  - a limit change between an aggregator tick and the `Throttle` reaching a thread;
+  - a delete and recreate between a `Throttle` being sent and arriving (slot reuse);
+  - a suspend while a transaction is open and while a truncate's view rebuild runs.
 
 Required:
 - table-driven unit tests;
@@ -249,15 +296,17 @@ Required:
 - **Cross-namespace leaks:** in name resolution, the internal-topic keys, grants, metadata responses and error messages.
 - **Escalation through a sibling operation:** a namespace admin reaching cluster-admin, another namespace, or the limits.
 - **Delete convergence:** across crashes, a lagging follower and recreating the same name.
-- **Truncate correctness:** the start never moves backwards; the HW clamp holds; after the cut every view equals a recompute of `[newStart, HW)`, including after a restart.
-- **Metrics:** one writer per slot; a freed and reused slot never mixes two `nsId`s; usage always equals the owner's state.
+- **Suspend:** every request type sits in the allowed/refused table for both modes; open transactions are aborted; the cluster admin is never locked out.
+- **Catalog versions:** a formatVer 1 reader still refuses the namespace kinds; a formatVer 2 reader applies every v1 event exactly as v1 does.
+- **Truncate correctness:** the start never moves backwards, including after a leader change following the reply; the HW and LSO clamps hold, and an open transaction's records survive; internal topics are refused for everyone; after the cut every view equals a recompute of `[newStart, HW)`, including after a restart.
+- **Metrics:** one writer per slot; a freed and reused slot never mixes two `nsId`s, in the metrics or in a late `Throttle`; usage is charged to the object's namespace; usage always equals the owner's state.
 - **Hot path:** zero allocations and the ABAB bench for the slot add and the throttle compare.
 
 ## 10. CLI: `arcanum` (platform) and `rune` (service)
 The platform CLI is `arcanum`. Rune is one service under it; more services will follow.
 
 **Two binaries, with one shared login.** The `kubectl`/`gcloud` split.
-- **`arcanum`:** the platform CLI, for accounts, projects, deploy and teardown (§10.2).
+- **`arcanum`:** the platform CLI, for accounts, projects, deploy and teardown (§10.1).
 - **`rune`:** the Rune service CLI, the existing binary with every command unchanged: `rune schema list`, `rune console` and so on. You never have to type an `arcanum` prefix.
 - **Shared context:** both read the same login and current project from the Arcanum config directory. `rune` resolves the endpoint and credentials from there, so `--broker` is not needed after `arcanum login`.
 - **Plugins:** `arcanum <service> <args>` runs the service's binary with those args, the way `git` runs its plugins, so `arcanum rune schema list` equals `rune schema list`. Future services ship their own binary the same way.
@@ -273,7 +322,7 @@ The contract between them is small:
 - whatever a plan sells is expressed only as a `NamespaceLimits` record (§5) or as a separate cluster;
 - usage shown to a customer comes from the namespace's metrics (§5.3).
 
-### 10.3 `rune` commands
+### 10.2 `rune` commands
 - **Connection:** when signed in, the control plane hands out the namespace-admin SCRAM credential for the current project, and `rune` caches it with mode 0600.
 - **Existing commands, unchanged:**
   - `console`;
@@ -290,7 +339,7 @@ The contract between them is small:
   - `schema list` actually lists topics. Add `topic list` as the canonical command and keep `schema list` as an alias.
   - Error messages keep their existing `rune ...:` prefix.
 
-### 10.4 Selecting and connecting to a deployment
+### 10.3 Selecting and connecting to a deployment
 - **Context:** (project, environment) picks the Rune deployment. Start with one Rune deployment per project; environments such as `--env dev|prod` can come later.
   - `arcanum use <project> [--env]` sets the current context.
   - `--project`/`--env` override it for one command, and `RUNE_PROJECT`/`RUNE_ENV` override it for a shell or CI.
@@ -307,7 +356,7 @@ The contract between them is small:
   - The client library accepts that connection string.
   - `credentials revoke <name>` removes the user and fences its sessions.
 
-### 10.5 Reachability through NAT
+### 10.4 Reachability through NAT
 Clients run behind NAT: home routers, cloud NAT gateways, most Kubernetes pods. A broker can only reach them over a flow the client opened, the way memcached or DNS replies go to the request's source address.
 - **Records egress is already NAT-safe.** It uses per-worker dynamic-MDC publications (`control-mode=dynamic`, `BrokerNode.cpp`). The client's status messages leave from its receive socket, and the broker sends to that observed source address. This is on in shard+fused mode, or with `perWorkerEgressEnabled`; it is off by default otherwise.
 - **Per-session egress is not NAT-safe.** That covers ConnectResponse, acks, DDL replies, errors, and Records when per-worker egress is off.
@@ -330,12 +379,13 @@ Full design: arcanum-site `docs/specs/2026-10-24-arcanum-auth-design.md` §5.
 - **Two separate logins.**
   - The Arcanum CLI token is used only against the control plane and never reaches the broker.
   - Rune users log in to the broker with SCRAM via `rune login --user`. The CLI stores the derived `ClientKey`/`ServerKey` for each context, never the password. `rune logout` deletes them, and `rune whoami` shows both identities.
-- **Anonymous access by default.**
+- **Anonymous access** (on or off by default: open question 21).
   - Under `GatewayAuthMode::Required`, a client that connects without starting SCRAM gets a new read-only anonymous session state. This is different from today's full-access `AuthAnonymous`, which exists only with `RUNE_AUTH=disabled`.
   - It runs as the namespace's built-in `anonymous` principal. Its only default grant is schema and catalog read, so `schema list|get|generate` and catalog reads work.
   - QL, view reads, produce, consume and all DDL return `UNAUTHORIZED`; the CLI adds a "run `rune login`" hint.
 - **Controls:** a namespace admin can revoke the grant, and a `NamespaceLimits` flag lets the cluster admin disable anonymous access.
-- **Scope:** an anonymous session only ever sees its own namespace.
+- **Scope:** an anonymous session only ever sees its own namespace. Which namespace that is has no answer yet, because
+  an anonymous client never logs in and `ConnectRequest` has no namespace field (open question 22).
 - **Limits:** anonymous sessions count against the namespace's connection and rate limits, with a separate small cap building on issue #236.
 - **Tests:** adversarial checks that anonymous never passes any gate but schema read, including through a sibling operation, and never sees another namespace.
 
@@ -344,15 +394,16 @@ Still to decide. Each has the recommended answer; a line is removed when the dec
 section it belongs to.
 
 **Code facts the spec must match**
-3. `SecurityOperation` and `SecurityResourceType` are frozen enums with no `Truncate` or `Namespace`. Recommended:
-   append `Truncate = 7` and `Namespace = 5`; never renumber.
-4. `Log` already has a log-start-offset checkpoint, and the replication fetch carries `logStartOffset` (the Kafka
-   DeleteRecords path). Recommended: truncate uses that path instead of a new `LogStartAdvanced` control record.
-5. Roles exist (`CreateRole`, `GrantRole`). Recommended: roles are namespaced like users.
+4. How the new start reaches followers. `Log` has a log-start-offset checkpoint and the replication `FetchResponse`
+   carries `logStartOffset`, but a follower adopts it today only for transient topics
+   (`PartitionReplica::resetTransientLogTo_`); a disk follower never takes the leader's start. Options:
+   - **A. `LogStartAdvanced` control record (recommended):** the start rides the log, so it is committed with the
+     ISR, survives a leader change and converges from the log alone (rule 16). Consumers skip it like a
+     transaction marker.
+   - **B. Kafka DeleteRecords path:** followers adopt the start from fetch and push responses, and the reply waits
+     until every ISR replica reports it. Needs the adoption path for disk logs and a wait on follower watermarks.
 
 **Naming**
-6. A bare name resolves in the session's namespace, not always in `default`. Recommended: yes.
-8. Namespace name rules. Recommended: `[a-z0-9][a-z0-9-]{0,62}`; `__`-prefixed names are reserved.
 9. `ObjectIndex::byName` is global. Recommended: key it by `(nsId, name)`.
 10. Group and transactional ids. Recommended: keyed by `(nsId, id)`, as the internal-topic keys are.
 
@@ -360,11 +411,11 @@ section it belongs to.
 13. The security-admin guard stays cluster-wide. Recommended: yes.
 
 **Lifecycle**
-14. `NamespaceDeleted` is the only commit point; every owner then reconciles idempotently. Recommended: yes.
-15. Recreating a name while the old `nsId` is still `DELETING`. Recommended: allowed; the new `nsId` cannot match
-    the old state.
 17. `default` can be suspended. Recommended: yes.
 
 **Scope**
-20. Split NAT egress (§10.5) and the CLI work into their own specs. Recommended: yes.
+20. Split NAT egress (§10.4) and the CLI work into their own specs. Recommended: yes.
 21. Anonymous read (§11) is off by default, and CLAUDE.md §8 records it. Recommended: yes.
+22. The namespace of an anonymous session. Recommended: anonymous sessions only ever reach `default`; a namespace
+    that wants public reads publishes through `default`. The alternative is an optional namespace field in
+    `ConnectRequest`, read only when no SCRAM login follows.
