@@ -1486,6 +1486,8 @@ public:
         case pc::TemplateId::AlterView:        handleAlterView(buf, len); break;
         case pc::TemplateId::SecurityDdl:      handleSecurityDdl(buf, len); break;
         case pc::TemplateId::SecurityBootstrap: handleSecurityBootstrap(buf, len); break;
+        case pc::TemplateId::NamespaceDdl:     handleNamespaceDdl(buf, len); break;
+        case pc::TemplateId::ListNamespaces:   handleListNamespaces(buf, len); break;
         default: break;
         }
     }
@@ -1957,6 +1959,9 @@ private:
     // Authentication Task 10: SecurityDdl (79) and SecurityBootstrap (80).
     void handleSecurityDdl      (const uint8_t* buf, std::size_t len);
     void handleSecurityBootstrap(const uint8_t* buf, std::size_t len);
+    // Namespaces Task 7: NamespaceDdl (81) and ListNamespaces (82).
+    void handleNamespaceDdl     (const uint8_t* buf, std::size_t len);
+    void handleListNamespaces   (const uint8_t* buf, std::size_t len);
     // Task 20: GetViewRow (72) — build a GetViewRow WorkerOp routed to the
     // owning worker (same op/return plumbing as PushRead); the worker's
     // ViewRowResult is encoded as a ViewRowResponse (73) in drainWorkerReturns_.

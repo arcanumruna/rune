@@ -57,13 +57,15 @@ constexpr uint16_t kInvalidRequest       = 39;
 constexpr uint16_t kInvalidTopicName     = 40;
 constexpr uint16_t kViewSourceIsView     = 41;
 constexpr uint16_t kNotAuthorized        = 45;
+constexpr uint16_t kNamespaceLimitExceeded = 52;   // only to clients >= kClientVersionNamespaces; older get 39
 
 /// A malformed request carries no meta: it is treated as id-less (pre-v8) — it is
 /// answered before the dedupe and never fingerprinted.
 const DdlMeta kNoMeta{};
 const DdlMeta& metaOf(const DdlRequest& req) noexcept {
     return std::visit([](const auto& m) -> const DdlMeta& {
-        if constexpr (std::is_same_v<std::decay_t<decltype(m)>, MalformedDdl>) return kNoMeta;
+        using M = std::decay_t<decltype(m)>;
+        if constexpr (std::is_same_v<M, MalformedDdl> || std::is_same_v<M, ListNamespacesMsg>) return kNoMeta;
         else return m.meta;
     }, req);
 }
@@ -157,12 +159,12 @@ int64_t wallClockMs() {
 
 /// The fold-equal live name `n` lands on, and its answer (TopicExists with the
 /// object's topic id).
-std::optional<DdlRejection> foldCollision(const cat::CatalogState& s, std::string_view n) {
-    const std::string* other = s.liveNameFoldingOnto(rune::catalog::kDefaultNsId, n);
+std::optional<DdlRejection> foldCollision(const cat::CatalogState& s, uint32_t nsId, std::string_view n) {
+    const std::string* other = s.liveNameFoldingOnto(nsId, n);
     if (other == nullptr) return std::nullopt;
     int32_t id = -1;
-    if (const cat::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, *other)) id = t->topicId;
-    else if (const cat::ViewObject* v = s.viewByName(rune::catalog::kDefaultNsId, *other)) id = v->def.viewTopicId;
+    if (const cat::TopicObject* t = s.topicByName(nsId, *other)) id = t->topicId;
+    else if (const cat::ViewObject* v = s.viewByName(nsId, *other)) id = v->def.viewTopicId;
     return reject(kTopicExists, "name " + quotedName(n) + " differs only in letter case from " + quotedName(*other), id);
 }
 
@@ -173,6 +175,7 @@ struct Fnv {
     void s(std::string_view v) noexcept { h = cat::detail::fnvBytes(h, v.data(), v.size()); }
     void b(const std::vector<uint8_t>& v) noexcept { h = cat::detail::fnvBytes(h, v.data(), v.size()); }
 };
+void h_bytes(Fnv& f, const uint8_t* p, std::size_t n) noexcept { f.h = cat::detail::fnvBytes(f.h, p, n); }
 
 } // namespace
 
@@ -186,6 +189,8 @@ uint16_t requestTemplateId(const DdlRequest& req) noexcept {
         else if constexpr (std::is_same_v<M, DropTopicMsg>)   return kTidDropTopic;
         else if constexpr (std::is_same_v<M, DropViewMsg>)    return kTidDropView;
         else if constexpr (std::is_same_v<M, AlterViewMsg>)   return kTidAlterView;
+        else if constexpr (std::is_same_v<M, NamespaceDdlMsg>)   return kTidNamespaceDdl;
+        else if constexpr (std::is_same_v<M, ListNamespacesMsg>) return kTidListNamespaces;
         else if constexpr (std::is_same_v<M, MalformedDdl>)   return m.templateId;
         else                                                  return kTidAlterTopicConfig;
     }, req);
@@ -196,10 +201,20 @@ uint64_t requestFingerprint(const DdlRequest& req) noexcept {
     f.u(requestTemplateId(req));
     std::visit([&f](const auto& m) {
         using M = std::decay_t<decltype(m)>;
-        if constexpr (std::is_same_v<M, MalformedDdl>) {
-            return;   // never deduped: answered before the dedupe (startNext_)
+        if constexpr (std::is_same_v<M, MalformedDdl> || std::is_same_v<M, ListNamespacesMsg>) {
+            return;   // never deduped: answered before the dedupe (startNext_); a list is a pure read
+        } else if constexpr (std::is_same_v<M, NamespaceDdlMsg>) {
+            // The statement as resolved by the client: kind, name, the present mask and the given limits.
+            // Never the denial or the client version (a retry from an upgraded client is the same statement).
+            f.s(m.meta.statement);
+            f.u(m.kind); f.s(m.name);
+            for (uint8_t b : m.mask) f.u(b);
+            uint8_t raw[rune::protocol::kNamespaceLimitsBytes];
+            rune::protocol::encodeLimits(m.limits, raw);
+            h_bytes(f, raw, sizeof raw);
         } else {
         f.s(m.meta.statement);
+        f.u(m.nsId);
         if constexpr (std::is_same_v<M, DefineTopicMsg>) {
             f.s(m.name);
             f.u(static_cast<uint32_t>(m.partitionCount)); f.u(m.validate ? 1 : 0); f.s(m.keyField); f.b(m.blob);
@@ -579,6 +594,12 @@ uint64_t AdminWorker::peerFrameDrops() const noexcept {
 }
 
 void AdminWorker::submit(DdlRequest req) {
+    // Namespaces Task 7: ListNamespaces is a read of the applied registry — answered here on any broker, never
+    // queued, deduped or appended (outside the started/answered pair, like submitGetSchema).
+    if (const auto* list = std::get_if<ListNamespacesMsg>(&req)) {
+        respondList_(*list);
+        return;
+    }
     if (pending_.size() >= kMaxPendingDdl) [[unlikely]] {
         ++pendingDdlRefused_;
         // Not started: answered directly (respond_), outside the started/answered pair.
@@ -591,7 +612,7 @@ void AdminWorker::submit(DdlRequest req) {
 void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     // A pure read of the projected registry.  `requestedFingerprint` 0 = latest;
     // non-zero = the exact historical version with that per-version fingerprint.
-    const auto* named = reg_.byName(rune::catalog::kDefaultNsId, msg.name);   // Task 10: the session's nsId
+    const auto* named = reg_.byName(msg.nsId, msg.name);   // namespaces Task 7: scoped to the request's namespace
     if (!named) {
         deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic);
         return;
@@ -615,6 +636,42 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     // topic's (the latest entry).
     deps_.respondGet(msg.session, msg.corr, e->topicId, e->version, named->partitionCount,
                      rune::codec::serialize(e->descriptor), kOK);
+}
+
+void AdminWorker::respondList_(const ListNamespacesMsg& m) {
+    namespace pc = rune::protocol::client;
+    if (!deps_.respondListNamespaces) return;
+    if (catalogReplica_ == nullptr) {   // no catalog here: nothing to list from
+        if (deps_.respondError) deps_.respondError(m.session, m.corr, kInternal, "no catalog replica on this broker");
+        return;
+    }
+    // D15: the cluster admin sees every namespace; anyone else only its own.  A page is at most 100 entries
+    // (~33 KB); nextAfter = the last id returned when more remain, else 0 (done).  The smallest page is 2, so a
+    // first page never ends on `default` (nextAfter 0 would read as done).
+    constexpr std::size_t kPage = 100;
+    const std::size_t max = m.max == 0 || m.max > kPage ? kPage : std::max<std::size_t>(m.max, 2);
+    pc::ListNamespacesResponse resp;
+    resp.sessionId     = m.session;
+    resp.correlationId = m.corr;
+    bool more = false;
+    applier_.state().namespaces().forEach([&](const cat::NamespaceRecord& rec) {
+        if (more) return;
+        if (m.clusterAdmin == 0 && rec.nsId != m.callerNsId) return;
+        // afterNsId is exclusive; 0 also starts at the beginning, so the predefined `default` (nsId 0) heads the
+        // first page.
+        if (m.afterNsId != 0 && rec.nsId <= m.afterNsId) return;
+        if (resp.namespaces.size() == max) { more = true; return; }
+        pc::NamespaceInfo info;
+        info.nsId   = rec.nsId;
+        info.name   = rec.name;
+        info.state  = static_cast<uint8_t>(cat::tagOf(rec.state));
+        // The untouched predefined default carries this broker's boot defaults (it is never an event).
+        info.limits = (rec.nsId == rune::catalog::kDefaultNsId && rec.version == 0) ? deps_.nsDefaults.limits
+                                                                                      : rec.limits;
+        resp.namespaces.push_back(std::move(info));
+    });
+    resp.nextAfter = more ? resp.namespaces.back().nsId : 0;
+    deps_.respondListNamespaces(m.session, m.corr, resp);
 }
 
 // ─── doWork ─────────────────────────────────────────────────────────────────
@@ -807,6 +864,13 @@ void AdminWorker::startNext_(int64_t nowNs) {
         }
     }
 
+    // 3b. Namespaces Task 7 (D15): the gateway's authorization verdict rides the message — answered after the dedupe,
+    //     so a retry of a committed namespace DDL still gets its original result.
+    if (const auto* ns = std::get_if<NamespaceDdlMsg>(&req); ns != nullptr && !ns->denial.empty()) {
+        answer_(req, kNotAuthorized, ns->denial);
+        return;
+    }
+
     // 4. Build the event against the applied catalog (the dry run is its gate).
     Built built = buildEvent_(req, state);
     if (!built) {
@@ -997,6 +1061,11 @@ std::optional<cat::RequestRecord> AdminWorker::recordOfLastApplied_(int64_t offs
                          .newVersion = la.applied.newVersion, .topicId = -1, .schemaVersion = 0,
                          .requestFingerprint = 0};
     switch (la.applied.kind) {
+    case cat::EventKind::NamespaceCreated:
+    case cat::EventKind::NamespaceLimitsSet:
+    case cat::EventKind::NamespaceStateChanged:
+    case cat::EventKind::NamespaceDeleted:
+        return r;   // namespaces Task 7: objectId is the nsId, never a topic's objectId
     case cat::EventKind::CreateTopic:
     case cat::EventKind::CreateView:
     case cat::EventKind::AlterView:
@@ -1119,6 +1188,8 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
         else if constexpr (std::is_same_v<M, AlterViewMsg>)   return buildAlterView_(m, s);
         else if constexpr (std::is_same_v<M, DropViewMsg>)    return buildDropView_(m, s);
         else if constexpr (std::is_same_v<M, DropTopicMsg>)   return buildDropTopic_(m, s);
+        else if constexpr (std::is_same_v<M, NamespaceDdlMsg>) return buildNamespace_(m, s);
+        else if constexpr (std::is_same_v<M, ListNamespacesMsg>) return Rejected(reject(kInternal));   // answered in submit()
         else if constexpr (std::is_same_v<M, MalformedDdl>)   return Rejected(reject(kInternal));   // answered earlier
         else                                                  return buildAlterConfig_(m, s);
     }, req);
@@ -1182,8 +1253,9 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     }
 
     cat::CatalogEvent e;
+    e.nsId       = m.nsId;
     e.objectName = m.name;
-    if (const cat::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, m.name)) {
+    if (const cat::TopicObject* t = s.topicByName(m.nsId, m.name)) {
         if (t->schema) return Rejected(reject(kTopicExists, {}, t->topicId, t->schema->schemaVersion));
         if (m.blob.empty()) return Rejected(reject(kTopicExists, {}, t->topicId, 0));   // untyped, nothing to adopt
         // Issue #129: adopting a schema is a new version of a LIVE topic (every other producer's records are then
@@ -1201,11 +1273,11 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         e.ops = cat::CreateSchemaOps{cat::SchemaDef{m.keyField, m.validate, m.blob, nextTag}};
         return e;
     }
-    if (const cat::ViewObject* v = s.viewByName(rune::catalog::kDefaultNsId, m.name)) {
+    if (const cat::ViewObject* v = s.viewByName(m.nsId, m.name)) {
         const RegistryEntry* out = reg_.byId(v->def.viewTopicId);
         return Rejected(reject(kTopicExists, {}, v->def.viewTopicId, out ? out->version : uint16_t{0}));
     }
-    if (auto fold = foldCollision(s, m.name)) return Rejected(std::move(*fold));
+    if (auto fold = foldCollision(s, m.nsId, m.name)) return Rejected(std::move(*fold));
 
     // Spec §8: the replication factor is bounded by the brokers and the minIsr.
     const int32_t rf = m.replicationFactor;
@@ -1247,8 +1319,8 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
 
 AdminWorker::Built AdminWorker::buildAlter_(const AlterTopicMsg& m, const cat::CatalogState& s) const {
     // U1: a view's output is derived from its plan — never altered directly.
-    if (s.viewByName(rune::catalog::kDefaultNsId, m.topicName)) return Rejected(reject(kViewNotAlterable));
-    const cat::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, m.topicName);
+    if (s.viewByName(m.nsId, m.topicName)) return Rejected(reject(kViewNotAlterable));
+    const cat::TopicObject* t = s.topicByName(m.nsId, m.topicName);
     // F3: an untyped topic has no schema to alter — UnknownTopic, as today.
     if (t == nullptr || !t->schema) return Rejected(reject(kUnknownTopic));
     const int32_t  topicId = t->topicId;
@@ -1259,6 +1331,7 @@ AdminWorker::Built AdminWorker::buildAlter_(const AlterTopicMsg& m, const cat::C
     if (!ops || ops->empty()) return Rejected(reject(kInvalidSchema, {}, topicId, cur));
 
     cat::CatalogEvent e;
+    e.nsId        = m.nsId;
     e.objectName  = t->name;
     e.objectId    = t->objectId;
     e.prevVersion = t->version;
@@ -1284,7 +1357,8 @@ AdminWorker::Built AdminWorker::buildAlter_(const AlterTopicMsg& m, const cat::C
 
 std::expected<cat::ViewDef, DdlRejection>
 AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint8_t persistence,
-                      const std::vector<uint8_t>& planBlob, int32_t viewTopicId, const cat::CatalogState& s) const {
+                      const std::vector<uint8_t>& planBlob, int32_t viewTopicId, uint32_t nsId,
+                      const cat::CatalogState& s) const {
     namespace rv = rune::view;
     std::optional<rv::ViewPlan> authored =
         rv::deserializeAuthored(std::span<const uint8_t>(planBlob.data(), planBlob.size()));
@@ -1300,6 +1374,10 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
         // would stay silently empty.
         if (s.viewByViewTopicId(src.topicId) != nullptr) return Rejected(reject(kViewSourceIsView));
         const cat::TopicObject* t = s.topicByTopicId(src.topicId);
+        // Namespaces Task 7 (D11): a view reads only its own namespace's topics — for every caller, the cluster
+        // admin included.  The ApplyV2 preview (buildEvent_) is the backstop for anything this misses.
+        if (t != nullptr && t->nsId != nsId) return Rejected(reject(kViewSourceNotFound, "source topic " +
+                                                                    quotedName(t->name) + " is in another namespace"));
         const RegistryEntry* e = t != nullptr && t->schema ? reg_.byId(src.topicId) : nullptr;
         if (e == nullptr) return Rejected(reject(kViewSourceNotFound));
         // Phase 2b E: a view that reads a transient topic must itself be transient.
@@ -1341,13 +1419,14 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
 AdminWorker::Built AdminWorker::buildCreateView_(const CreateViewMsg& m, const cat::CatalogState& s) const {
     if (m.persistence > 1) return Rejected(reject(kInvalidSchema));   // a direct submit
     if (!cat::isValidTopicName(m.viewName)) return Rejected(reject(kInvalidTopicName));
-    if (const cat::ViewObject* v = s.viewByName(rune::catalog::kDefaultNsId, m.viewName))
+    if (const cat::ViewObject* v = s.viewByName(m.nsId, m.viewName))
         return Rejected(reject(kViewExists, {}, v->def.viewTopicId));
-    if (const cat::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, m.viewName)) return Rejected(reject(kTopicExists, {}, t->topicId));
-    if (auto fold = foldCollision(s, m.viewName)) return Rejected(std::move(*fold));
-    auto def = viewDef_(m.viewName, m.keyField, m.persistence, m.planBlob, s.nextTopicId(), s);
+    if (const cat::TopicObject* t = s.topicByName(m.nsId, m.viewName)) return Rejected(reject(kTopicExists, {}, t->topicId));
+    if (auto fold = foldCollision(s, m.nsId, m.viewName)) return Rejected(std::move(*fold));
+    auto def = viewDef_(m.viewName, m.keyField, m.persistence, m.planBlob, s.nextTopicId(), m.nsId, s);
     if (!def) return Rejected(std::move(def.error()));
     cat::CatalogEvent e;
+    e.nsId        = m.nsId;
     e.objectName  = m.viewName;
     e.objectId    = s.nextObjectId();
     e.prevVersion = 0;
@@ -1358,15 +1437,16 @@ AdminWorker::Built AdminWorker::buildCreateView_(const CreateViewMsg& m, const c
 
 AdminWorker::Built AdminWorker::buildAlterView_(const AlterViewMsg& m, const cat::CatalogState& s) const {
     if (m.persistence > 1) return Rejected(reject(kInvalidSchema));   // a direct submit
-    const cat::ViewObject* v = s.viewByName(rune::catalog::kDefaultNsId, m.name);
+    const cat::ViewObject* v = s.viewByName(m.nsId, m.name);
     if (v == nullptr) return Rejected(reject(kUnknownTopic, "no view named " + quotedName(m.name)));
     if (m.expectedVersion != 0 && m.expectedVersion != v->version)
         return Rejected(reject(kSchemaConflict, "view " + quotedName(m.name) + " is at version " + std::to_string(v->version),
                                v->def.viewTopicId, static_cast<uint16_t>(std::min<uint32_t>(v->version, 0xFFFF))));
     // Ruling 4: a FRESH sink under the same objectId.
-    auto def = viewDef_(m.name, m.keyField, m.persistence, m.planBlob, s.nextTopicId(), s);
+    auto def = viewDef_(m.name, m.keyField, m.persistence, m.planBlob, s.nextTopicId(), m.nsId, s);
     if (!def) return Rejected(std::move(def.error()));
     cat::CatalogEvent e;
+    e.nsId        = m.nsId;
     e.objectName  = v->name;
     e.objectId    = v->objectId;
     e.prevVersion = v->version;
@@ -1376,9 +1456,10 @@ AdminWorker::Built AdminWorker::buildAlterView_(const AlterViewMsg& m, const cat
 }
 
 AdminWorker::Built AdminWorker::buildDropView_(const DropViewMsg& m, const cat::CatalogState& s) const {
-    const cat::ViewObject* v = s.viewByName(rune::catalog::kDefaultNsId, m.name);
+    const cat::ViewObject* v = s.viewByName(m.nsId, m.name);
     if (v == nullptr) return Rejected(reject(kUnknownTopic, "no view named " + quotedName(m.name)));
     cat::CatalogEvent e;
+    e.nsId        = m.nsId;
     e.objectName  = v->name;
     e.objectId    = v->objectId;
     e.prevVersion = v->version;
@@ -1388,12 +1469,13 @@ AdminWorker::Built AdminWorker::buildDropView_(const DropViewMsg& m, const cat::
 }
 
 AdminWorker::Built AdminWorker::buildDropTopic_(const DropTopicMsg& m, const cat::CatalogState& s) const {
-    if (s.viewByName(rune::catalog::kDefaultNsId, m.name)) return Rejected(reject(kInvalidRequest, quotedName(m.name) + " is a view; use DROP VIEW"));
-    const cat::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, m.name);
+    if (s.viewByName(m.nsId, m.name)) return Rejected(reject(kInvalidRequest, quotedName(m.name) + " is a view; use DROP VIEW"));
+    const cat::TopicObject* t = s.topicByName(m.nsId, m.name);
     if (t == nullptr) return Rejected(reject(kUnknownTopic, "no topic named " + quotedName(m.name)));
-    if (const cat::ViewObject* v = s.viewReading(rune::catalog::kDefaultNsId, m.name))
+    if (const cat::ViewObject* v = s.viewReading(m.nsId, m.name))
         return Rejected(reject(kInvalidRequest, "topic " + quotedName(m.name) + " is the source of view " + quotedName(v->name)));
     cat::CatalogEvent e;
+    e.nsId        = m.nsId;
     e.objectName  = t->name;
     e.objectId    = t->objectId;
     e.prevVersion = t->version;
@@ -1403,8 +1485,8 @@ AdminWorker::Built AdminWorker::buildDropTopic_(const DropTopicMsg& m, const cat
 }
 
 AdminWorker::Built AdminWorker::buildAlterConfig_(const AlterTopicConfigMsg& m, const cat::CatalogState& s) const {
-    if (s.viewByName(rune::catalog::kDefaultNsId, m.name)) return Rejected(reject(kViewNotAlterable));
-    const cat::TopicObject* t = s.topicByName(rune::catalog::kDefaultNsId, m.name);
+    if (s.viewByName(m.nsId, m.name)) return Rejected(reject(kViewNotAlterable));
+    const cat::TopicObject* t = s.topicByName(m.nsId, m.name);
     if (t == nullptr) return Rejected(reject(kUnknownTopic, "no topic named " + quotedName(m.name)));
     if (m.expectedVersion != 0 && m.expectedVersion != t->version)
         return Rejected(reject(kSchemaConflict, "topic " + quotedName(m.name) + " is at version " + std::to_string(t->version),
@@ -1412,12 +1494,58 @@ AdminWorker::Built AdminWorker::buildAlterConfig_(const AlterTopicConfigMsg& m, 
     // Empty / duplicate keys / out-of-range values: the dry run answers with the
     // library's reason (one validator — the resulting config's topicConfigError).
     cat::CatalogEvent e;
+    e.nsId        = m.nsId;
     e.objectName  = t->name;
     e.objectId    = t->objectId;
     e.prevVersion = t->version;
     e.newVersion  = t->version + 1;
     e.ops         = cat::AlterTopicConfigOps{m.changes};
     return e;
+}
+
+AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const cat::CatalogState& s) const {
+    namespace pc = rune::protocol::client;
+    const cat::NamespaceRegistry& nss = s.namespaces();
+    cat::CatalogEvent e;
+    switch (static_cast<pc::NamespaceDdlKind>(m.kind)) {
+    case pc::NamespaceDdlKind::Create: {
+        if (!rune::catalog::validNamespaceName(m.name))
+            return Rejected(reject(kInvalidRequest, "invalid namespace name " + quotedName(m.name)));
+        if (nss.byName(m.name) != nullptr)
+            return Rejected(reject(kTopicExists, "namespace " + quotedName(m.name) + " already exists"));
+        // RUNE_MAX_NAMESPACES counts every namespace that exists (`default` and DELETING ones included).
+        if (nss.liveCount() >= deps_.maxNamespaces) {
+            const uint16_t code = m.clientVersion >= pc::kClientVersionNamespaces ? kNamespaceLimitExceeded
+                                                                                  : kInvalidRequest;
+            return Rejected(reject(code, "namespace limit reached (" + std::to_string(nss.liveCount()) + " of " +
+                                             std::to_string(deps_.maxNamespaces) + ")"));
+        }
+        const uint32_t nsId = nss.nextNsId();
+        e.nsId        = nsId;
+        e.objectId    = nsId;
+        e.objectName  = m.name;
+        e.prevVersion = 0;
+        e.newVersion  = 1;
+        // The FULL record at request time: absent fields from this broker's current defaults.
+        e.ops = cat::NamespaceCreatedOps{m.name, resolveLimits(m.mask, m.limits, deps_.nsDefaults.limits)};
+        return e;
+    }
+    case pc::NamespaceDdlKind::SetLimits: {
+        const cat::NamespaceRecord* rec = nss.byName(m.name);
+        if (rec == nullptr) return Rejected(reject(kUnknownTopic, "no namespace named " + quotedName(m.name)));
+        // The untouched predefined default holds no event-carried limits: its base is the boot defaults.
+        const rune::protocol::NamespaceLimits& base =
+            rec->nsId == rune::catalog::kDefaultNsId && rec->version == 0 ? deps_.nsDefaults.limits : rec->limits;
+        e.nsId        = rec->nsId;
+        e.objectId    = rec->nsId;
+        e.objectName  = rec->name;
+        e.prevVersion = rec->version;
+        e.newVersion  = rec->version + 1;
+        e.ops = cat::NamespaceLimitsSetOps{resolveLimits(m.mask, m.limits, base)};
+        return e;
+    }
+    }
+    return Rejected(reject(kInvalidRequest, "unknown namespace DDL kind " + std::to_string(m.kind)));
 }
 
 } // namespace rune::node

@@ -64,6 +64,8 @@ struct RecordingSink final : IAdminRequestSink {
         if (!denial.empty()) { denied[w.correlationId] = std::string(denial); return AdminSubmit::Accepted; }
         ++securityDdls; lastAuthenticated = std::string(m.authenticated); return AdminSubmit::Accepted;
     }
+    AdminSubmit submitNamespaceDdl(const pc::NamespaceDdlRequest&, const DdlMetaView&, std::string_view, uint16_t) override { return AdminSubmit::Accepted; }
+    AdminSubmit submitListNamespaces(int64_t, int64_t, uint32_t, uint16_t, uint32_t, bool) override { return AdminSubmit::Accepted; }
     AdminSubmit submitSecurityBootstrap(const pc::SecurityBootstrap&, const DdlMetaView&) override { ++bootstraps; return AdminSubmit::Accepted; }
     bool submitSecuritySubscribe(int64_t s, int64_t c, int64_t) override { secSubs.push_back({s, c}); return true; }
     bool submitSecurityUnsubscribe(int64_t s, int64_t id) override { secUnsubs.push_back({s, id}); return true; }

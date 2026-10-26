@@ -39,6 +39,13 @@
 //   RUNE_GROUP_MAX_SESSION_TIMEOUT_MS — int32 ms > 0, default 1800000 (#213 / #499).  A larger one is lowered to it.
 //                                     A min above the max (an unset one is its default) refuses startup.
 //
+// Namespaces (all optional, namespaces Task 7):
+//   RUNE_MAX_NAMESPACES             — int32 > 0, default 1024: the cluster-wide cap on namespaces that exist
+//                                     (`default` and DELETING ones count).  A CreateNamespace past it is refused.
+//   RUNE_NS_DEFAULT_<FIELD>         — u64 >= 0 (FEATURE_BITS: u32), one per NamespaceLimits field, e.g.
+//                                     RUNE_NS_DEFAULT_MAX_TOPICS.  Read once at boot; a limit a CreateNamespace omits
+//                                     takes this value at request time and is written into the event.  Default 0.
+//
 // For cross-datacenter deployments set these higher (e.g. 1000/200/2000 ms).
 //
 // E5.2: Aeron media-driver threading mode (optional):
@@ -52,6 +59,7 @@
 #include <rune/node/StorageFormat.h>
 #include <rune/node/IdleShape.h>
 #include <rune/node/PersistenceMode.h>
+#include <rune/protocol/NamespaceLimits.h>
 #include <rune/node/PemFile.h>   // Task 9: loadPemFile() — re-exported here for config callers
 
 #include <algorithm>
@@ -485,6 +493,10 @@ struct NodeConfig {
     // ISR design v3 §3.2 (Step 5): how an EMPTY, not yet formatted data dir is formatted at boot.
     // In-process default (rigs): an empty dir formats as founder; the env parser defaults to Required
     // (RUNE_STORAGE_FORMAT unset / "": an empty dir refuses to start).  Ignored once storage.meta exists.
+    /// RUNE_MAX_NAMESPACES (namespaces Task 7): the cluster-wide namespace cap, `default` included.
+    int32_t maxNamespaces = 1024;
+    /// RUNE_NS_DEFAULT_* (namespaces Task 7): the cluster default limits an omitted CreateNamespace field takes.
+    rune::protocol::NamespaceLimits nsDefaultLimits{};
     StorageFormat storageFormat = StorageFormat::TestFounder;
     // RUNE_STORAGE_RECOVERY_VOTE (default false): unsafe, disaster recovery only — lets an unconfirmed
     // (replaced-disk) node vote (read by the storage gate, Step 9).

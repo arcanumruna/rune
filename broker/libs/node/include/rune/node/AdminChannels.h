@@ -23,6 +23,7 @@
 
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/protocol/CatalogTypes.h>
+#include <rune/protocol/NamespaceLimits.h>   // NamespaceDdlMsg (namespaces Task 7)
 #include <rune/catalog/CatalogEvent.h>   // rune::catalog::ConfigChange (AlterTopicConfig)
 #include <rune/protocol/SecurityTypes.h>
 #include <rune/security/SecurityEvent.h>   // ScramVerifier (the security DDL messages, authentication Task 10)
@@ -114,6 +115,9 @@ enum : int32_t {
     kMsgSecurityBootstrap   = 31,
     kMsgSecuritySubscribe   = 32,  // the catalog layout: [session:i64][corr:i64][fromOffset:i64]
     kMsgSecurityUnsubscribe = 33,  // the catalog layout: [session:i64][subscriptionId:i64]; -1 = the session closed
+    // Namespaces Task 7 - gateway -> admin: namespace DDL (81) and ListNamespaces (82).
+    kMsgNamespaceDdl        = 34,
+    kMsgListNamespaces      = 35,
 };
 
 /// kMsgCatalogSubscribe / kMsgCatalogUnsubscribe (fixed layouts).
@@ -195,6 +199,8 @@ inline void putU16(uint8_t* p, uint16_t v){ std::memcpy(p, &v, 2); }
 inline int64_t  getI64(const uint8_t* p){ int64_t v; std::memcpy(&v, p, 8); return v; }
 inline int32_t  getI32(const uint8_t* p){ int32_t v; std::memcpy(&v, p, 4); return v; }
 inline uint16_t getU16(const uint8_t* p){ uint16_t v; std::memcpy(&v, p, 2); return v; }
+inline void putU32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); }
+inline uint32_t getU32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
 
 } // namespace admin_wire
 
@@ -244,6 +250,7 @@ struct DefineTopicMsg {
     /// "" = allowed (also every in-process / admin-level submit, which no session authorizes), otherwise the
     /// NotAuthorized detail the admin thread answers when the name turns out to be such a topic.
     std::string                 adoptDenial;
+    uint32_t                    nsId = 0;   // namespaces Task 7: the namespace the object lives in (0 = default)
 };
 
 /// AlterTopic: the client's CAS expectation (expectedVersion = the topic's SCHEMA
@@ -255,6 +262,7 @@ struct AlterTopicMsg {
     std::string          topicName;
     std::vector<uint8_t> opsBlob;               // encodeAlterOps() wire bytes
     DdlMeta              meta;
+    uint32_t                    nsId = 0;   // namespaces Task 7: the namespace the object lives in (0 = default)
 };
 
 /// CreateView: `planBlob` is the authored rune::view::ViewPlan (serializeAuthored).
@@ -266,6 +274,7 @@ struct CreateViewMsg {
     std::string          keyField;
     std::vector<uint8_t> planBlob;          // authored ViewPlan (serializeAuthored)
     DdlMeta              meta;
+    uint32_t                    nsId = 0;   // namespaces Task 7: the namespace the object lives in (0 = default)
 };
 
 struct DropTopicMsg {
@@ -273,6 +282,7 @@ struct DropTopicMsg {
     int64_t     corr    = 0;
     std::string name;
     DdlMeta     meta;
+    uint32_t    nsId    = 0;
 };
 
 struct DropViewMsg {
@@ -280,6 +290,7 @@ struct DropViewMsg {
     int64_t     corr    = 0;
     std::string name;
     DdlMeta     meta;
+    uint32_t    nsId    = 0;
 };
 
 /// AlterView (ruling 4): the view's plan and output replaced under the same
@@ -293,6 +304,7 @@ struct AlterViewMsg {
     uint32_t             expectedVersion = 0;
     std::vector<uint8_t> planBlob;
     DdlMeta              meta;
+    uint32_t             nsId            = 0;
 };
 
 /// AlterTopicConfig (ruling 5): expectedVersion = the topic's OBJECT version (0 = no check).
@@ -303,6 +315,7 @@ struct AlterTopicConfigMsg {
     uint32_t                                 expectedVersion = 0;
     std::vector<rune::catalog::ConfigChange> changes;
     DdlMeta                                  meta;
+    uint32_t                                 nsId            = 0;
 };
 
 /// The client-protocol template id each DDL request arrived as (TemplateId values).
@@ -313,6 +326,35 @@ inline constexpr uint16_t kTidDropTopic        = 74;
 inline constexpr uint16_t kTidAlterTopicConfig = 75;
 inline constexpr uint16_t kTidDropView         = 76;
 inline constexpr uint16_t kTidAlterView        = 77;
+inline constexpr uint16_t kTidNamespaceDdl     = 81;
+inline constexpr uint16_t kTidListNamespaces   = 82;
+
+/// Namespaces Task 7: NamespaceDdl (81) — Create / SetLimits.  `mask` bit i = limits field i was given (the rest
+/// resolve at the admin thread: Create from the cluster defaults, SetLimits from the current record).  `denial` is
+/// the gateway's verdict ("" = cluster admin authorized); the admin thread answers a dedupe retry first, then 45.
+/// `clientVersion` picks NamespaceLimitExceeded (52, v14+) or InvalidRequest (39) for an older client.
+struct NamespaceDdlMsg {
+    int64_t                          session = 0;
+    int64_t                          corr    = 0;
+    DdlMeta                          meta;            // the request id lives here
+    uint8_t                          kind    = 0;     // rune::protocol::client::NamespaceDdlKind (1 Create, 2 SetLimits)
+    std::string                      name;
+    std::array<uint8_t, 4>           mask{};
+    rune::protocol::NamespaceLimits  limits;
+    std::string                      denial;
+    uint16_t                         clientVersion = 0;
+};
+
+/// Namespaces Task 7: ListNamespaces (82) — a read, answered on the admin thread from its applied registry (no
+/// append).  afterNsId is exclusive; max 0 = 100.  A caller that is not a cluster admin sees only `callerNsId`.
+struct ListNamespacesMsg {
+    int64_t  session      = 0;
+    int64_t  corr         = 0;
+    uint32_t afterNsId    = 0;
+    uint16_t max          = 0;
+    uint32_t callerNsId   = 0;
+    uint8_t  clusterAdmin = 0;   // 0 / 1
+};
 
 /// A DDL frame the ring decode could not read: what can still be answered (the
 /// request's template id, session and correlation id — 0 when even those are
@@ -327,7 +369,7 @@ struct MalformedDdl {
 
 /// One queued DDL: exactly one request message (the alternative IS the kind).
 using DdlRequest = std::variant<DefineTopicMsg, AlterTopicMsg, CreateViewMsg, DropTopicMsg, DropViewMsg,
-                                AlterViewMsg, AlterTopicConfigMsg, MalformedDdl>;
+                                AlterViewMsg, AlterTopicConfigMsg, NamespaceDdlMsg, ListNamespacesMsg, MalformedDdl>;
 
 // ---------------------------------------------------------------------------
 // Authentication Task 10 (D36): the security DDL (79) and the one-time bootstrap (80), gateway → admin on the request
@@ -387,6 +429,7 @@ struct GetSchemaMsg {
     int64_t     corr    = 0;
     std::string name;
     uint64_t    requestedFingerprint = 0;
+    uint32_t    nsId = 0;   // namespaces Task 7: the namespace the name resolves in (0 = default)
 };
 
 
@@ -598,30 +641,42 @@ template <class W> void layout(W& w, const DefineTopicMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.i32(m.partitionCount); w.u8(m.validate ? 1 : 0);
     w.str16(m.name); w.str16(m.keyField); w.bytes32(span8(m.blob)); w.u8(m.persistence);
     w.i16(m.replicationFactor); layoutConfig(w, m.config); layoutMeta(w, m.meta); w.str16(m.adoptDenial);
+    w.u32(m.nsId);
 }
 template <class W> void layout(W& w, const AlterTopicMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.u16(m.expectedVersion); w.str16(m.topicName);
-    w.bytes32(span8(m.opsBlob)); layoutMeta(w, m.meta);
+    w.bytes32(span8(m.opsBlob)); layoutMeta(w, m.meta); w.u32(m.nsId);
 }
 template <class W> void layout(W& w, const CreateViewMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.u8(m.persistence); w.str16(m.viewName); w.str16(m.keyField);
-    w.bytes32(span8(m.planBlob)); layoutMeta(w, m.meta);
+    w.bytes32(span8(m.planBlob)); layoutMeta(w, m.meta); w.u32(m.nsId);
 }
 template <class W> void layout(W& w, const DropTopicMsg& m) {
-    w.i64(m.session); w.i64(m.corr); w.str16(m.name); layoutMeta(w, m.meta);
+    w.i64(m.session); w.i64(m.corr); w.str16(m.name); layoutMeta(w, m.meta); w.u32(m.nsId);
 }
 template <class W> void layout(W& w, const DropViewMsg& m) {
-    w.i64(m.session); w.i64(m.corr); w.str16(m.name); layoutMeta(w, m.meta);
+    w.i64(m.session); w.i64(m.corr); w.str16(m.name); layoutMeta(w, m.meta); w.u32(m.nsId);
 }
 template <class W> void layout(W& w, const AlterViewMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.str16(m.name); w.str16(m.keyField); w.u8(m.persistence);
-    w.u32(m.expectedVersion); w.bytes32(span8(m.planBlob)); layoutMeta(w, m.meta);
+    w.u32(m.expectedVersion); w.bytes32(span8(m.planBlob)); layoutMeta(w, m.meta); w.u32(m.nsId);
 }
 template <class W> void layout(W& w, const AlterTopicConfigMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.str16(m.name); w.u32(m.expectedVersion);
     w.u16(static_cast<uint16_t>(m.changes.size()));
     for (const auto& c : m.changes) { w.u8(static_cast<uint8_t>(c.key)); w.i64(c.value); }
-    layoutMeta(w, m.meta);
+    layoutMeta(w, m.meta); w.u32(m.nsId);
+}
+template <class W> void layout(W& w, const NamespaceDdlMsg& m) {
+    w.i64(m.session); w.i64(m.corr); layoutMeta(w, m.meta); w.u8(m.kind); w.str16(m.name);
+    w.bytes32({m.mask.data(), m.mask.size()});
+    std::array<uint8_t, rune::protocol::kNamespaceLimitsBytes> lim{};
+    rune::protocol::encodeLimits(m.limits, lim.data());
+    w.bytes32({lim.data(), lim.size()});
+    w.str16(m.denial); w.u16(m.clientVersion);
+}
+template <class W> void layout(W& w, const ListNamespacesMsg& m) {
+    w.i64(m.session); w.i64(m.corr); w.u32(m.afterNsId); w.u16(m.max); w.u32(m.callerNsId); w.u8(m.clusterAdmin);
 }
 
 template <class W> void layoutVerifier(W& w, const rune::security::ScramVerifier& v) {
@@ -656,6 +711,8 @@ template <> inline constexpr int32_t kDdlMsgType<DropTopicMsg>        = kMsgDrop
 template <> inline constexpr int32_t kDdlMsgType<DropViewMsg>         = kMsgDropView;
 template <> inline constexpr int32_t kDdlMsgType<AlterViewMsg>        = kMsgAlterView;
 template <> inline constexpr int32_t kDdlMsgType<AlterTopicConfigMsg> = kMsgAlterTopicConfig;
+template <> inline constexpr int32_t kDdlMsgType<NamespaceDdlMsg>     = kMsgNamespaceDdl;
+template <> inline constexpr int32_t kDdlMsgType<ListNamespacesMsg>   = kMsgListNamespaces;
 
 /// The ring frame length of `m`, or 0 when a field does not fit its length prefix.
 template <class M>
@@ -711,6 +768,7 @@ inline DdlRequest decodeDefineTopic(const uint8_t* buf, std::size_t len) {
     admin_wire::readConfig(r, m.config);
     admin_wire::readMeta(r, m.meta);
     r.str16(m.adoptDenial);
+    m.nsId = r.u32();
     return admin_wire::finish(r, std::move(m), kTidDefineTopic);
 }
 inline DdlRequest decodeAlterTopic(const uint8_t* buf, std::size_t len) {
@@ -721,6 +779,7 @@ inline DdlRequest decodeAlterTopic(const uint8_t* buf, std::size_t len) {
     r.str16(m.topicName);
     r.bytes32(m.opsBlob);
     admin_wire::readMeta(r, m.meta);
+    m.nsId = r.u32();
     return admin_wire::finish(r, std::move(m), kTidAlterTopic);
 }
 inline DdlRequest decodeCreateView(const uint8_t* buf, std::size_t len) {
@@ -733,6 +792,7 @@ inline DdlRequest decodeCreateView(const uint8_t* buf, std::size_t len) {
     r.str16(m.keyField);
     r.bytes32(m.planBlob);
     admin_wire::readMeta(r, m.meta);
+    m.nsId = r.u32();
     return admin_wire::finish(r, std::move(m), kTidCreateView);
 }
 inline DdlRequest decodeDropTopic(const uint8_t* buf, std::size_t len) {
@@ -741,6 +801,7 @@ inline DdlRequest decodeDropTopic(const uint8_t* buf, std::size_t len) {
     admin_wire::readHead(r, m);
     r.str16(m.name);
     admin_wire::readMeta(r, m.meta);
+    m.nsId = r.u32();
     return admin_wire::finish(r, std::move(m), kTidDropTopic);
 }
 inline DdlRequest decodeDropView(const uint8_t* buf, std::size_t len) {
@@ -749,6 +810,7 @@ inline DdlRequest decodeDropView(const uint8_t* buf, std::size_t len) {
     admin_wire::readHead(r, m);
     r.str16(m.name);
     admin_wire::readMeta(r, m.meta);
+    m.nsId = r.u32();
     return admin_wire::finish(r, std::move(m), kTidDropView);
 }
 inline DdlRequest decodeAlterView(const uint8_t* buf, std::size_t len) {
@@ -762,6 +824,7 @@ inline DdlRequest decodeAlterView(const uint8_t* buf, std::size_t len) {
     m.expectedVersion = r.u32();
     r.bytes32(m.planBlob);
     admin_wire::readMeta(r, m.meta);
+    m.nsId = r.u32();
     return admin_wire::finish(r, std::move(m), kTidAlterView);
 }
 inline DdlRequest decodeAlterTopicConfig(const uint8_t* buf, std::size_t len) {
@@ -784,7 +847,40 @@ inline DdlRequest decodeAlterTopicConfig(const uint8_t* buf, std::size_t len) {
         m.changes.push_back(rune::catalog::ConfigChange{static_cast<rune::catalog::ConfigKey>(key), value});
     }
     admin_wire::readMeta(r, m.meta);
+    m.nsId = r.u32();
     return admin_wire::finish(r, std::move(m), kTidAlterTopicConfig);
+}
+inline DdlRequest decodeNamespaceDdl(const uint8_t* buf, std::size_t len) {
+    admin_wire::Reader r{buf, len};
+    NamespaceDdlMsg m;
+    admin_wire::readHead(r, m);
+    admin_wire::readMeta(r, m.meta);
+    m.kind = r.u8();
+    r.str16(m.name);
+    std::vector<uint8_t> mask, lim;
+    r.bytes32(mask);
+    r.bytes32(lim);
+    r.str16(m.denial);
+    m.clientVersion = r.u16();
+    if (r.ok) {
+        if (m.kind < 1 || m.kind > 2) r.fail("an unknown namespace DDL kind");   // never cast
+        else if (mask.size() != m.mask.size() || lim.size() != rune::protocol::kNamespaceLimitsBytes ||
+                 !rune::protocol::decodeLimits(lim.data(), lim.size(), m.limits))
+            r.fail("a malformed namespace limits record");
+        else std::memcpy(m.mask.data(), mask.data(), mask.size());
+    }
+    return admin_wire::finish(r, std::move(m), kTidNamespaceDdl);
+}
+inline DdlRequest decodeListNamespaces(const uint8_t* buf, std::size_t len) {
+    admin_wire::Reader r{buf, len};
+    ListNamespacesMsg m;
+    admin_wire::readHead(r, m);
+    m.afterNsId    = r.u32();
+    m.max          = r.u16();
+    m.callerNsId   = r.u32();
+    m.clusterAdmin = r.u8();
+    if (r.ok && m.clusterAdmin > 1) r.fail("a cluster-admin flag other than 0/1");
+    return admin_wire::finish(r, std::move(m), kTidListNamespaces);
 }
 
 // ---- Security DDL decode (authentication Task 10) ----
@@ -966,7 +1062,7 @@ struct CatalogReadResumeMsg { int64_t session = 0; int64_t subscriptionId = 0; }
 // nameLen:u16 + name bytes.
 inline bool encodeGetSchema(OneToOneByteRing& ring, const GetSchemaMsg& m) {
     using namespace admin_wire;
-    const std::size_t len = 8 + 8 + 8 + 2 + m.name.size();
+    const std::size_t len = 8 + 8 + 8 + 2 + m.name.size() + 4;
     const auto idx = ring.tryClaim(kMsgGetSchema, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
@@ -974,7 +1070,8 @@ inline bool encodeGetSchema(OneToOneByteRing& ring, const GetSchemaMsg& m) {
     putI64(p, m.corr);    p += 8;
     putI64(p, static_cast<int64_t>(m.requestedFingerprint)); p += 8;
     putU16(p, static_cast<uint16_t>(m.name.size())); p += 2;
-    std::memcpy(p, m.name.data(), m.name.size());
+    std::memcpy(p, m.name.data(), m.name.size()); p += m.name.size();
+    putU32(p, m.nsId);
     ring.commit(idx);
     return true;
 }
@@ -989,6 +1086,7 @@ inline GetSchemaMsg decodeGetSchema(const uint8_t* buf, std::size_t len) {
     const uint16_t nl = getU16(buf + 24);
     if (26 + static_cast<std::size_t>(nl) <= len)
         m.name.assign(reinterpret_cast<const char*>(buf + 26), nl);
+    if (26 + static_cast<std::size_t>(nl) + 4 <= len) m.nsId = getU32(buf + 26 + nl);
     return m;
 }
 
@@ -1245,8 +1343,6 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
 namespace admin_wire {
 inline void putI16(uint8_t* p, int16_t v) { std::memcpy(p, &v, 2); }
 inline void putU64(uint8_t* p, uint64_t v) { std::memcpy(p, &v, 8); }
-inline void putU32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); }
-inline uint32_t getU32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
 inline int16_t  getI16(const uint8_t* p) { int16_t v; std::memcpy(&v, p, 2); return v; }
 inline uint64_t getU64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
 /// u16-length-prefixed string; the caller sized the buffer (len <= 0xFFFF checked by the WireLen user).

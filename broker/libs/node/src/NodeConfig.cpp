@@ -886,6 +886,49 @@ ConfigResult parseNodeConfig(
     {
         const char* rawMin = getenv_fn("RUNE_GROUP_MIN_SESSION_TIMEOUT_MS");
         if (rawMin && !std::string_view(rawMin).empty()) {
+    // --- RUNE_MAX_NAMESPACES (optional, default 1024) and RUNE_NS_DEFAULT_* (optional, default 0) — namespaces Task 7 ---
+    {
+        const char* raw = getenv_fn("RUNE_MAX_NAMESPACES");
+        if (raw && !std::string_view(raw).empty()) {
+            int32_t v{};
+            if (!parseInt32(raw, v) || v < 1)
+                return {{}, std::string("RUNE_MAX_NAMESPACES must be a positive integer, got: ") + raw};
+            cfg.maxNamespaces = v;
+        }
+        // One env var per NamespaceLimits field, in wire order (field i ↔ mask bit i).
+        static constexpr const char* kNsDefaultVars[rune::protocol::kNamespaceLimitFieldCount] = {
+            "RUNE_NS_DEFAULT_MAX_TOPICS", "RUNE_NS_DEFAULT_MAX_PARTITIONS_PER_TOPIC",
+            "RUNE_NS_DEFAULT_MAX_PARTITIONS_TOTAL", "RUNE_NS_DEFAULT_MAX_VIEWS", "RUNE_NS_DEFAULT_MAX_SCHEMAS",
+            "RUNE_NS_DEFAULT_MAX_VERSIONS_PER_SCHEMA", "RUNE_NS_DEFAULT_MAX_GROUPS", "RUNE_NS_DEFAULT_MAX_USERS",
+            "RUNE_NS_DEFAULT_MAX_DISK_BYTES", "RUNE_NS_DEFAULT_MAX_RETENTION_MS", "RUNE_NS_DEFAULT_MAX_RETENTION_BYTES",
+            "RUNE_NS_DEFAULT_MAX_MESSAGE_BYTES", "RUNE_NS_DEFAULT_MAX_BATCH_BYTES",
+            "RUNE_NS_DEFAULT_PRODUCE_BYTES_PER_SEC", "RUNE_NS_DEFAULT_PRODUCE_RECORDS_PER_SEC",
+            "RUNE_NS_DEFAULT_FETCH_BYTES_PER_SEC", "RUNE_NS_DEFAULT_REQUEST_OPS_PER_SEC",
+            "RUNE_NS_DEFAULT_QUERY_CYCLES_PER_SEC", "RUNE_NS_DEFAULT_MAX_CONNECTIONS",
+            "RUNE_NS_DEFAULT_MAX_CONNECTIONS_PER_USER", "RUNE_NS_DEFAULT_MAX_SESSIONS_PER_USER",
+            "RUNE_NS_DEFAULT_MAX_OPEN_TXNS", "RUNE_NS_DEFAULT_MAX_TXN_TIME_MS", "RUNE_NS_DEFAULT_MAX_VIEW_MEMORY_BYTES",
+            "RUNE_NS_DEFAULT_MIN_REPLICATION_FACTOR", "RUNE_NS_DEFAULT_MAX_REPLICATION_FACTOR",
+            "RUNE_NS_DEFAULT_LOWEST_ACKS", "RUNE_NS_DEFAULT_LOWEST_MIN_INSYNC", "RUNE_NS_DEFAULT_FEATURE_BITS"};
+        uint8_t enc[rune::protocol::kNamespaceLimitsBytes];
+        rune::protocol::encodeLimits(cfg.nsDefaultLimits, enc);
+        for (std::size_t i = 0; i < rune::protocol::kNamespaceLimitFieldCount; ++i) {
+            const char* v = getenv_fn(kNsDefaultVars[i]);
+            if (v == nullptr || std::string_view(v).empty()) continue;
+            const std::string_view sv = trim(v);
+            uint64_t parsed = 0;
+            auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), parsed);
+            const bool isFeatureBits = i == rune::protocol::kNamespaceLimitFieldCount - 1;
+            if (sv.empty() || ec != std::errc{} || ptr != sv.data() + sv.size() ||
+                (isFeatureBits && parsed > UINT32_MAX))
+                return {{}, std::string(kNsDefaultVars[i]) + " must be a non-negative integer" +
+                                (isFeatureBits ? " that fits 32 bits" : "") + ", got: " + v};
+            if (isFeatureBits) rune::protocol::detail::putLimitU32(enc + 28 * 8, static_cast<uint32_t>(parsed));
+            else               rune::protocol::detail::putLimitU64(enc + 8 * i, parsed);
+        }
+        if (!rune::protocol::decodeLimits(enc, sizeof(enc), cfg.nsDefaultLimits))
+            return {{}, "RUNE_NS_DEFAULT_*: internal limits encoding error"};
+    }
+
             int32_t v{};
             if (!parseInt32(rawMin, v) || v < 1)
                 return {{}, std::string("RUNE_GROUP_MIN_SESSION_TIMEOUT_MS must be a positive integer, got: ") + rawMin};

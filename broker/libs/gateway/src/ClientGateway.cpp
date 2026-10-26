@@ -1289,6 +1289,8 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::AlterView:
         case pc::TemplateId::SecurityDdl:
         case pc::TemplateId::SecurityBootstrap:
+        case pc::TemplateId::NamespaceDdl:
+        case pc::TemplateId::ListNamespaces:
         case pc::TemplateId::AuthClientFirst:
         case pc::TemplateId::AuthClientFinal:
         case pc::TemplateId::GetViewRow:
@@ -1394,6 +1396,13 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             break;
         case pc::TemplateId::SecurityBootstrap:
             handleSecurityBootstrap(buf, len);
+            break;
+        // Namespaces Task 7: namespace DDL (81, catalog-routed) and ListNamespaces (82, any broker).
+        case pc::TemplateId::NamespaceDdl:
+            handleNamespaceDdl(buf, len);
+            break;
+        case pc::TemplateId::ListNamespaces:
+            handleListNamespaces(buf, len);
             break;
         // Task 20: point read of a materialized view row — routed to the owning
         // worker via the same op/return plumbing as PushRead.
@@ -8670,7 +8679,8 @@ bool ClientGateway::deny_(Session& session, const std::optional<rune::gateway::D
         case pc::TemplateId::DropView:
         case pc::TemplateId::AlterView:
         case pc::TemplateId::SecurityDdl:
-        case pc::TemplateId::SecurityBootstrap: {
+        case pc::TemplateId::SecurityBootstrap:
+        case pc::TemplateId::NamespaceDdl: {
             pc::DdlResponse r;
             r.sessionId = hdr->sessionId; r.correlationId = hdr->correlationId;
             r.errorCode = denial->code; r.detail = denial->detail;
@@ -9513,6 +9523,80 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
                                                      denial ? std::string_view(denial->detail) : std::string_view{},
                                                      proofChecked),
                        "SecurityDdl: admin ring full", "SecurityDdl: request larger than the admin ring message");
+}
+
+// Namespaces Task 7: NamespaceDdl (81) - the catalog DDL discipline (the `__catalog` route, decode, session, copy and
+// return).  Cluster ADMIN is required (spec: only a cluster admin manages namespaces); like SecurityDdl a denied
+// request that carries a request id is forwarded with the verdict so the leader can answer a retry of an applied
+// request its original result.  Cold path (DDL rate).
+void ClientGateway::handleNamespaceDdl(const uint8_t* buf, std::size_t len)
+{
+    if (ddlRouted_(buf, len)) return;
+    if (!adminSink_) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "NamespaceDdl: admin sink not wired");
+        return;
+    }
+    auto msgOpt = pc::NamespaceDdlRequest::decode(buf, len);
+    if (!msgOpt) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "NamespaceDdl body undecodable");
+        return;
+    }
+    const pc::NamespaceDdlRequest& m = *msgOpt;
+    Session* session = sessions_.find(m.sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, "NamespaceDdl for unknown session");
+        return;
+    }
+    if (session->clientVersion < pc::kClientVersionNamespaces) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                             "NamespaceDdl needs client version 14");
+        return;
+    }
+    std::optional<rune::gateway::Denial> denial =
+        rune::gateway::authorizeCluster(permsOf_(*session), rune::security::Operation::Admin);
+    if (denial && m.ext.requestId.none()) {
+        (void)deny_(*session, denial, buf, len);
+        return;
+    }
+    if (denial) noteDenied_(*session, pc::TemplateId::NamespaceDdl, *denial);
+    answerAdminSubmit_(buf, len,
+                       adminSink_->submitNamespaceDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session),
+                                                      denial ? std::string_view(denial->detail) : std::string_view{},
+                                                      static_cast<uint16_t>(session->clientVersion)),
+                       "NamespaceDdl: admin ring full", "NamespaceDdl: request larger than the admin ring message");
+}
+
+// ListNamespaces (82): a read of the applied catalog, served by ANY broker's admin thread (no route, no append).  A
+// cluster admin sees every namespace; anyone else only its own (Task 9 binds a session to a namespace; until then the
+// caller's namespace is `default`, 0).
+void ClientGateway::handleListNamespaces(const uint8_t* buf, std::size_t len)
+{
+    if (!adminSink_) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "ListNamespaces: admin sink not wired");
+        return;
+    }
+    auto msgOpt = pc::ListNamespaces::decode(buf, len);
+    if (!msgOpt) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "ListNamespaces body undecodable");
+        return;
+    }
+    const pc::ListNamespaces& m = *msgOpt;
+    Session* session = sessions_.find(m.sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, "ListNamespaces for unknown session");
+        return;
+    }
+    if (session->clientVersion < pc::kClientVersionNamespaces) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                             "ListNamespaces needs client version 14");
+        return;
+    }
+    const bool clusterAdmin =
+        !rune::gateway::authorizeCluster(permsOf_(*session), rune::security::Operation::Admin).has_value();
+    answerAdminSubmit_(buf, len,
+                       adminSink_->submitListNamespaces(m.sessionId, m.correlationId, m.afterNsId, m.max,
+                                                        rune::catalog::kDefaultNsId, clusterAdmin),
+                       "ListNamespaces: admin ring full", "ListNamespaces: request larger than the admin ring message");
 }
 
 std::optional<rune::gateway::Denial> ClientGateway::verifyOwnCredentialChange_(Session& session, const pc::SecurityDdl& m,

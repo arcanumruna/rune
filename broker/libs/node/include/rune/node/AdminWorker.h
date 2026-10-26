@@ -38,6 +38,7 @@
 #include "rune/node/CatalogApplier.h"
 #include "rune/node/CatalogPartition.h"
 #include "rune/node/CatalogReadServer.h"
+#include "rune/node/NamespaceLimitDefaults.h"
 #include "rune/node/SecurityAdmin.h"
 #include <rune/peerlink/PeerFrameCrypto.h>
 #include "rune/node/SecurityApplier.h"
@@ -49,6 +50,7 @@
 
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/catalog/CatalogState.h>
+#include <rune/protocol/client/NamespaceMessages.h>
 
 namespace rune::replication {
 class PartitionReplica;
@@ -131,6 +133,16 @@ struct AdminDeps {
     /// A CreateTopic / AlterTopicConfig that would raise estimateFdNeed above fdLimit is refused before its append.
     uint64_t fdLimit = 0;
     uint64_t readySegmentsPerPartition = 0;
+
+    /// Namespaces Task 7: ListNamespacesResponse (83) — answered from the applied catalog on any broker (no append).
+    /// Unset: list requests are answered nowhere.
+    std::function<void(int64_t session, int64_t corr, const rune::protocol::client::ListNamespacesResponse&)>
+        respondListNamespaces;
+    /// The defaults a namespace Create resolves absent limit fields from (NodeConfig, read at boot) — the event
+    /// carries the full record, so a later change of the defaults never alters an existing namespace.
+    NamespaceLimitDefaults nsDefaults;
+    /// RUNE_MAX_NAMESPACES: a Create when the registry holds this many (default included) is refused (52 / 39).
+    uint32_t maxNamespaces = 1024;
 };
 
 // ---------------------------------------------------------------------------
@@ -450,10 +462,14 @@ private:
     [[nodiscard]] Built buildDropView_(const DropViewMsg& m, const rune::catalog::CatalogState& s) const;
     [[nodiscard]] Built buildDropTopic_(const DropTopicMsg& m, const rune::catalog::CatalogState& s) const;
     [[nodiscard]] Built buildAlterConfig_(const AlterTopicConfigMsg& m, const rune::catalog::CatalogState& s) const;
-    /// A view definition (CreateView / AlterView) at `viewTopicId`.
+    /// Namespaces Task 7: Create / SetLimits — the full limits record resolved at request time.
+    [[nodiscard]] Built buildNamespace_(const NamespaceDdlMsg& m, const rune::catalog::CatalogState& s) const;
+    /// ListNamespaces (82): one page of the applied registry (no append, any broker).
+    void respondList_(const ListNamespacesMsg& m);
+    /// A view definition (CreateView / AlterView) at `viewTopicId`; every source must live in namespace `nsId`.
     [[nodiscard]] std::expected<rune::catalog::ViewDef, DdlRejection>
         viewDef_(const std::string& name, const std::string& keyField, uint8_t persistence,
-                 const std::vector<uint8_t>& planBlob, int32_t viewTopicId,
+                 const std::vector<uint8_t>& planBlob, int32_t viewTopicId, uint32_t nsId,
                  const rune::catalog::CatalogState& s) const;
     /// Encode + append `e` (key = objectId LE) — false: answered already.
     bool appendEvent_(const DdlRequest& req, rune::catalog::CatalogEvent e, int64_t nowNs);

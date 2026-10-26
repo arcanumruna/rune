@@ -106,6 +106,8 @@ struct CountingAdminSink final : IAdminRequestSink {
         return true;
     }
     AdminSubmit submitSecurityDdl(const pc::SecurityDdl&, const DdlMetaView&, std::string_view, bool) override { return AdminSubmit::Accepted; }
+    AdminSubmit submitNamespaceDdl(const pc::NamespaceDdlRequest&, const DdlMetaView&, std::string_view, uint16_t) override { return AdminSubmit::Accepted; }
+    AdminSubmit submitListNamespaces(int64_t, int64_t, uint32_t, uint16_t, uint32_t, bool) override { return AdminSubmit::Accepted; }
     AdminSubmit submitSecurityBootstrap(const pc::SecurityBootstrap&, const DdlMetaView&) override { return AdminSubmit::Accepted; }
     bool submitSecuritySubscribe(int64_t, int64_t, int64_t) override { return true; }
     std::vector<CatalogUnsub> securityUnsubs;
