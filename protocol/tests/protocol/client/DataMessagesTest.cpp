@@ -1899,10 +1899,13 @@ static_assert(rpc::kClientVersion >= rpc::kClientVersionFilter && rpc::kBrokerVe
 // Issue #116: client 12 / broker 7 (per-receiver c2b keys) is the next gate after filters.
 static_assert(rpc::kClientVersionReceiverKeys == rpc::kClientVersionFilter + 1);
 static_assert(rpc::kBrokerVersionReceiverKeys == rpc::kBrokerVersionFilter + 1);
-static_assert(rpc::kBrokerVersion == rpc::kBrokerVersionReceiverKeys);
+static_assert(rpc::kBrokerVersion >= rpc::kBrokerVersionReceiverKeys);
 // Issue #112: client 13 (produce ConcurrentTransactions while the leader verifies the txn partition) follows.
 static_assert(rpc::kClientVersionTxnVerify == rpc::kClientVersionReceiverKeys + 1);
-static_assert(rpc::kClientVersion == rpc::kClientVersionTxnVerify);
+// Namespaces: client 14 / broker 8 follow.
+static_assert(rpc::kClientVersionNamespaces == rpc::kClientVersionTxnVerify + 1);
+static_assert(rpc::kBrokerVersionNamespaces == rpc::kBrokerVersionReceiverKeys + 1);
+static_assert(rpc::kClientVersion == rpc::kClientVersionNamespaces && rpc::kBrokerVersion == rpc::kBrokerVersionNamespaces);
 static_assert(rpc::sessionUsesReceiverKeys(12, 7) && !rpc::sessionUsesReceiverKeys(11, 7) && !rpc::sessionUsesReceiverKeys(12, 6));
 static_assert(rpc::clientUnderstandsFilters(11) && !rpc::clientUnderstandsFilters(10));
 

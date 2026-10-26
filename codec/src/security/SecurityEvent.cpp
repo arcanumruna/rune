@@ -267,7 +267,7 @@ std::string_view operationName(Operation o) noexcept {
     switch (o) {
     case Operation::Read: return "READ"; case Operation::Write: return "WRITE"; case Operation::Create: return "CREATE";
     case Operation::Alter: return "ALTER"; case Operation::Drop: return "DROP"; case Operation::Describe: return "DESCRIBE";
-    case Operation::Admin: return "ADMIN";
+    case Operation::Admin: return "ADMIN"; case Operation::Truncate: return "TRUNCATE";
     }
     return "?";
 }
@@ -276,6 +276,7 @@ std::string_view resourceTypeName(ResourceType t) noexcept {
     case ResourceType::Cluster: return "CLUSTER"; case ResourceType::Topic: return "TOPIC";
     case ResourceType::View: return "VIEW"; case ResourceType::Group: return "GROUP";
     case ResourceType::TransactionalId: return "TRANSACTIONAL_ID";
+    case ResourceType::Namespace: return "NAMESPACE";
     }
     return "?";
 }

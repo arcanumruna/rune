@@ -17,6 +17,7 @@ const char* opName(rsec::Operation o) noexcept {
         case rsec::Operation::Drop:     return "DROP";
         case rsec::Operation::Describe: return "DESCRIBE";
         case rsec::Operation::Admin:    return "ADMIN";
+        case rsec::Operation::Truncate: return "TRUNCATE";
     }
     return "?";
 }
@@ -27,6 +28,7 @@ const char* typeName(rsec::ResourceType t) noexcept {
         case rsec::ResourceType::View:            return "VIEW";
         case rsec::ResourceType::Group:           return "GROUP";
         case rsec::ResourceType::TransactionalId: return "TRANSACTIONAL_ID";
+        case rsec::ResourceType::Namespace:       return "NAMESPACE";
     }
     return "?";
 }

@@ -135,6 +135,8 @@ bool validGrant(const GrantSpec& g) noexcept {
     case ResourceType::TransactionalId:
         allowed = opBit(Operation::Write) | opBit(Operation::Describe);
         break;
+    case ResourceType::Namespace:   // grantable only once the v2 security layout lands (namespaces plan, Task 4): none yet
+        break;
     }
     if (!(allowed & opBit(g.op))) return false;
     // I6: internal objects ("__…": __security, __catalog, __consumer_offsets, …) are never grantable by pattern;

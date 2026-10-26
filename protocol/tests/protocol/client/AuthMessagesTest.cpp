@@ -16,7 +16,7 @@ TEST(AuthMessagesRegression, ErrorCodesAndTemplatesArePinned) {
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), 15);
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::SecurityDdl), 79);
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::SecurityBootstrap), 80);
-    EXPECT_EQ(pc::kClientVersion, 13); EXPECT_EQ(pc::kBrokerVersion, 7); EXPECT_EQ(pc::kSecurityTopicId, -7);
+    EXPECT_EQ(pc::kClientVersion, 14); EXPECT_EQ(pc::kBrokerVersion, 8); EXPECT_EQ(pc::kSecurityTopicId, -7);
     EXPECT_EQ(pc::kClientVersionAuth, 9); EXPECT_EQ(pc::kBrokerVersionAuth, 5);
     EXPECT_TRUE(pc::clientUnderstandsAuth(9)); EXPECT_FALSE(pc::clientUnderstandsAuth(8));
     EXPECT_EQ(static_cast<int>(pc::AuthMode::Required), 0);
@@ -26,7 +26,8 @@ TEST(AuthMessagesRegression, ErrorCodesAndTemplatesArePinned) {
     EXPECT_EQ(static_cast<int>(pc::AuthState::ResumedAuthenticated), 1);
     EXPECT_EQ(static_cast<int>(pc::AuthState::Anonymous), 2);
     for (uint16_t t : {12, 13, 14, 15, 79, 80}) EXPECT_TRUE(pc::isKnownTemplate(t)) << t;
-    EXPECT_FALSE(pc::isKnownTemplate(81));
+    for (uint16_t t : {81, 82, 83}) EXPECT_TRUE(pc::isKnownTemplate(t)) << t;   // namespaces (client v14)
+    EXPECT_FALSE(pc::isKnownTemplate(84));
 }
 
 TEST(AuthMessagesRegression, EveryAuthFrameRoundTrips) {
