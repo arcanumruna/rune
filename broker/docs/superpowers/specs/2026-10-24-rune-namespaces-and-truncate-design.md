@@ -1,6 +1,6 @@
 # Rune namespaces (multi-tenancy) and topic truncate: design
 
-**Status:** draft, 2026-10-24.
+**Status:** approved, 2026-10-26 (all open questions decided).
 **Scope:** namespaces with dynamic create, suspend and delete; namespace-scoped users and grants; per-namespace limits set by the cluster admin and measured with arcanum-metrics; a `TruncateTopic` operation that also cuts the views over the topic.
 **Out of scope:** CPU caps through dedicated threads or nodes, per-namespace encryption at rest (it is a reserved limit only), and an account level above namespaces.
 
@@ -13,6 +13,12 @@
     is unambiguous. Only the cluster admin may name an object in a namespace other than its session's.
   - An object in another namespace answers exactly like a missing one: same error code, same message, same timing
     path. Nothing reveals that a name exists elsewhere.
+  - **Indexes are keyed by `(nsId, name)`.** `ObjectIndex::byName` and the schema and view registries, global today,
+    take the pair as their key, so the same name in two namespaces is two entries and a lookup can only find an
+    object of the namespace it was given.
+  - **Consumer group and transactional ids** are keyed by `(nsId, id)` everywhere they are stored or looked up
+    (coordinators, `__consumer_offsets`, transaction state), as the internal-topic keys are (§4). Two namespaces can
+    use the same group or transactional id without sharing a coordinator entry, offsets or producer fencing.
 - **No cross-namespace references.** A view's sources, a topic's schema and a transaction's partitions all belong to
   the object's own namespace. DDL that names an object in another namespace is refused, for the cluster admin too.
 - **`default` namespace:** always exists and can never be deleted.
@@ -46,6 +52,9 @@
   - raise a limit;
   - create or delete a namespace.
 - Grants stay allow-only, and everything is denied by default.
+- **The last-security-admin guard stays cluster-wide** (issue #121, `removesLastSecurityAdmin` in `SecurityAdmin.cpp`):
+  a change is refused only when it would leave the cluster with no enabled cluster admin. A namespace may be left
+  with no namespace admin; the cluster admin can always appoint a new one.
 
 ## 3. Catalog events
 New event kinds go in `__catalog`; these kinds are already reserved there:
@@ -79,6 +88,8 @@ ACTIVE|SUSPENDED → DELETING(pendingTopics, pendingViews, pendingGroups, openTx
   request type cannot be added without a row.
 - Neither mode applies to cluster-admin sessions (§2). Resume, delete and limit changes stay open to the cluster admin
   in every state.
+- **`default` can be suspended** like any namespace. Its users other than the cluster admins are then held to the
+  mode; the cluster admins, who live in `default`, are not (§2), so the cluster stays manageable.
 - Suspending an already suspended namespace changes only its mode. Resuming an `ACTIVE` one changes nothing.
 
 **`DELETING`** refuses every request, login, suspend, resume and limit change for that `nsId`, and answers like a
@@ -133,7 +144,7 @@ sells those limits (the Arcanum platform, an operator script) sits outside Rune 
 | Connections | connections per namespace and per user; sessions per user; open transactions; max transaction time | per node | `rune_ns_connections{ns,ns_id}`, `rune_ns_open_txns{ns,ns_id}` |
 | Views | materialized memory | per node | `rune_ns_view_bytes{ns,ns_id}` |
 | Durability | min/max replication factor; lowest `acks`; lowest `min.insync` | per topic (DDL, connect) | none |
-| Features | transactions, QL, views, SQL/Redis facades, anonymous read (§11); allowed auth mechanisms | namespace | none |
+| Features | transactions, QL, views, SQL/Redis facades, anonymous read (§11, off by default); allowed auth mechanisms | namespace | none |
 
 Deferred, kept as reserved fields so the record never changes shape: placement (nodes or racks), password policy,
 per-namespace encryption key.
@@ -281,7 +292,7 @@ allocate nothing, and they must pass an ABAB bench against the CLAUDE.md latency
    - catalog events and the `nsId` registry;
    - names and resolution, the `default` namespace, the disk layout;
    - `ns/user` users, roles and escalation guards;
-   - CLI and admin commands.
+   - the namespace admin requests and `rune namespace`.
 2. **Lifecycle and limits:**
    - suspend and the crash-safe delete;
    - `nsId`-keyed internal topics;
@@ -289,8 +300,9 @@ allocate nothing, and they must pass an ABAB bench against the CLAUDE.md latency
    - enforcement of counts, storage, view memory and control-plane limits;
    - the rate aggregator, `Throttle` over the rings, and the ABAB bench.
 3. **TruncateTopic:** first the below-start fetch fix (§6 Flow step 4, repro test first); then wire, broker, replication (follower adoption and the low watermark) and client; view cut and rebuild; `rune topic truncate`.
-4. **CLI:** `rune` reads the shared Arcanum login context; `arcanum` plugin dispatch; `topic list` and `namespace` commands. The platform commands (§10.1) come with the control-plane service.
-5. **NAT-safe egress:** per-session egress on a client-opened flow; per-worker egress on by default; NAT e2e leg (§10.4).
+
+Each phase gets its own plan. The `rune namespace` and `rune topic truncate` commands (§10) ship with phases 1–3.
+The Arcanum CLI work and NAT-safe egress have their own specs (§10).
 
 ## 8. Interaction matrix
 Operations × entities × timings:
@@ -328,107 +340,27 @@ Required:
 - **Metrics:** one writer per slot; a freed and reused slot never mixes two `nsId`s, in the metrics or in a late `Throttle`; usage is charged to the object's namespace; usage always equals the owner's state.
 - **Hot path:** zero allocations and the ABAB bench for the slot add and the throttle compare.
 
-## 10. CLI: `arcanum` (platform) and `rune` (service)
-The platform CLI is `arcanum`. Rune is one service under it; more services will follow.
+## 10. Commands
+- `rune topic truncate <topic> [--partition N] [--before <offset>]`: TruncateTopic (§6).
+- `rune namespace create|delete|suspend|resume|list|limits`: cluster admin only. `limits` shows each limit next to
+  its usage metric.
+- User and grant management stays QL through `rune console` or `rune ql`, run as a namespace admin.
 
-**Two binaries, with one shared login.** The `kubectl`/`gcloud` split.
-- **`arcanum`:** the platform CLI, for accounts, projects, deploy and teardown (§10.1).
-- **`rune`:** the Rune service CLI, the existing binary with every command unchanged: `rune schema list`, `rune console` and so on. You never have to type an `arcanum` prefix.
-- **Shared context:** both read the same login and current project from the Arcanum config directory. `rune` resolves the endpoint and credentials from there, so `--broker` is not needed after `arcanum login`.
-- **Plugins:** `arcanum <service> <args>` runs the service's binary with those args, the way `git` runs its plugins, so `arcanum rune schema list` equals `rune schema list`. Future services ship their own binary the same way.
-- **Self-hosted:** `rune` with no login works exactly as today, using `--broker` and `--user`/`--password-file`.
+Split into their own specs:
+- the `arcanum` platform CLI, the shared login context and `rune login`:
+  [2026-10-26-arcanum-cli-design.md](2026-10-26-arcanum-cli-design.md);
+- NAT-safe egress: [2026-10-26-rune-nat-egress-design.md](2026-10-26-rune-nat-egress-design.md).
 
-### 10.1 Platform model
-Rune knows nothing of accounts, projects, tiers or billing. The platform model and its commands (`arcanum login`,
-`deploy`, `teardown` and so on) are specified with the Arcanum control-plane service, a separate project.
-
-The contract between them is small:
-- the control plane acts as a cluster admin, through `rune namespace create|limits|suspend|resume|delete` or the
-  same admin requests;
-- whatever a plan sells is expressed only as a `NamespaceLimits` record (§5) or as a separate cluster;
-- usage shown to a customer comes from the namespace's metrics (§5.3).
-
-### 10.2 `rune` commands
-- **Connection:** when signed in, the control plane hands out the namespace-admin SCRAM credential for the current project, and `rune` caches it with mode 0600.
-- **Existing commands, unchanged:**
-  - `console`;
-  - `ql`;
-  - `schema get|list|generate`;
-  - `catalog export|replay|diff`;
-  - `security bootstrap|gen-cluster-key`.
-  - Self-hosted only: `security bootstrap` and `gen-cluster-key`. On the platform these are run by the control plane.
-- **New commands from this spec:**
-  - `rune topic truncate <topic> [--partition N] [--before <offset>]`: TruncateTopic (§6).
-  - `rune namespace create|delete|suspend|resume|list|limits`: cluster admin only, so self-hosted or the control plane. `limits` shows each limit next to its usage metric.
-  - User and grant management is QL through `console` or `ql`, as today; it runs as a namespace admin.
-- **Review notes:**
-  - `schema list` actually lists topics. Add `topic list` as the canonical command and keep `schema list` as an alias.
-  - Error messages keep their existing `rune ...:` prefix.
-
-### 10.3 Selecting and connecting to a deployment
-- **Context:** (project, environment) picks the Rune deployment. Start with one Rune deployment per project; environments such as `--env dev|prod` can come later.
-  - `arcanum use <project> [--env]` sets the current context.
-  - `--project`/`--env` override it for one command, and `RUNE_PROJECT`/`RUNE_ENV` override it for a shell or CI.
-- **Resolution:** the first time a context is used, `rune` calls the control plane with the `arcanum` token. It gets back:
-  - the bootstrap broker endpoints (the rest of the cluster comes from metadata);
-  - the namespace;
-  - the cluster TLS identity, which the client pins;
-  - a short-lived namespace-admin credential.
-
-  These are cached with mode 0600, per context. On a connect or auth failure, `rune` refreshes once.
-- **Precedence:** `--broker`/`--user` flags, then `RUNE_BROKER`/`RUNE_USER`, then the Arcanum context. Self-hosted use needs only the first two.
-- **Apps:** apps never use a personal login.
-  - `arcanum rune credentials create <name> --grants ...` creates a service user in the namespace and prints `rune://<ns>/<user>@host1:port,host2:port?tls=<fingerprint>` plus a secret.
-  - The client library accepts that connection string.
-  - `credentials revoke <name>` removes the user and fences its sessions.
-
-### 10.4 Reachability through NAT
-Clients run behind NAT: home routers, cloud NAT gateways, most Kubernetes pods. A broker can only reach them over a flow the client opened, the way memcached or DNS replies go to the request's source address.
-- **Records egress is already NAT-safe.** It uses per-worker dynamic-MDC publications (`control-mode=dynamic`, `BrokerNode.cpp`). The client's status messages leave from its receive socket, and the broker sends to that observed source address. This is on in shard+fused mode, or with `perWorkerEgressEnabled`; it is off by default otherwise.
-- **Per-session egress is not NAT-safe.** That covers ConnectResponse, acks, DDL replies, errors, and Records when per-worker egress is off.
-  1. The client declares its own `egressChannel`, defaulting to `aeron:udp?endpoint=localhost:40200`, in ConnectRequest.
-  2. The gateway's `SessionAnnouncer` makes the workers open a publication to that address.
-
-  Behind NAT that address is private or unmapped, so the client never receives the replies.
-- **Fix:**
-  - move per-session egress onto a client-opened flow: dynamic MDC on the session egress, or Aeron response channels (`control-mode=response`);
-  - make per-worker egress the default;
-  - stop sending a declared endpoint in ConnectRequest.
-- **Operations:**
-  - one public UDP endpoint per node, plus each worker's egress control port;
-  - security groups or firewalls opened for those ports;
-  - client keepalive below typical NAT UDP timeouts (about 30 s).
-- **Tests:** an e2e leg with the client behind a NAT, e.g. a docker network with masquerade, on the default config.
-
-## 11. Rune login and anonymous read access
-Full design: arcanum-site `docs/specs/2026-10-24-arcanum-auth-design.md` §5.
-- **Two separate logins.**
-  - The Arcanum CLI token is used only against the control plane and never reaches the broker.
-  - Rune users log in to the broker with SCRAM via `rune login --user`. The CLI stores the derived `ClientKey`/`ServerKey` for each context, never the password. `rune logout` deletes them, and `rune whoami` shows both identities.
-- **Anonymous access** (on or off by default: open question 21).
+## 11. Anonymous read access
+Full design: arcanum-site `docs/specs/2026-10-24-arcanum-auth-design.md` §5. The `rune login` side is in the CLI spec (§10).
+- **Off by default.** The `NamespaceLimits` anonymous-read flag defaults to off, and CLAUDE.md §8 records it. A
+  cluster admin turns it on for `default` explicitly.
+- **Anonymous access**, when on:
   - Under `GatewayAuthMode::Required`, a client that connects without starting SCRAM gets a new read-only anonymous session state. This is different from today's full-access `AuthAnonymous`, which exists only with `RUNE_AUTH=disabled`.
   - It runs as the namespace's built-in `anonymous` principal. Its only default grant is schema and catalog read, so `schema list|get|generate` and catalog reads work.
   - QL, view reads, produce, consume and all DDL return `UNAUTHORIZED`; the CLI adds a "run `rune login`" hint.
-- **Controls:** a namespace admin can revoke the grant, and a `NamespaceLimits` flag lets the cluster admin disable anonymous access.
+- **Controls:** a namespace admin can revoke the grant; the `NamespaceLimits` flag above turns the whole path on or off.
 - **Scope:** an anonymous session only ever reaches `default`, because an anonymous client never logs in and
   `ConnectRequest` has no namespace field. A namespace that wants public reads publishes through `default`.
 - **Limits:** anonymous sessions count against the namespace's connection and rate limits, with a separate small cap building on issue #236.
 - **Tests:** adversarial checks that anonymous never passes any gate but schema read, including through a sibling operation, and never sees another namespace.
-
-## 12. Open questions
-Still to decide. Each has the recommended answer; a line is removed when the decision is written into the
-section it belongs to.
-
-**Naming**
-9. `ObjectIndex::byName` is global. Recommended: key it by `(nsId, name)`.
-10. Group and transactional ids. Recommended: keyed by `(nsId, id)`, as the internal-topic keys are.
-
-**Admin**
-13. The security-admin guard stays cluster-wide. Recommended: yes.
-
-**Lifecycle**
-17. `default` can be suspended. Recommended: yes.
-
-**Scope**
-20. Split NAT egress (§10.4) and the CLI work into their own specs. Recommended: yes.
-21. Anonymous read (§11) is off by default, and CLAUDE.md §8 records it. Recommended: yes.
