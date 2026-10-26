@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <fcntl.h>
 #include <sys/types.h>
@@ -54,8 +55,9 @@ void runOnTinyTmpfs(std::size_t sizeBytes, Body body) {
     (void)sizeBytes; (void)body;
     GTEST_SKIP() << "tiny-tmpfs rig is Linux-only";
 #else
-    char tmpl[] = "/tmp/rune_diskfull_XXXXXX";
-    if (::mkdtemp(tmpl) == nullptr) GTEST_SKIP() << "mkdtemp failed";
+    // Under the per-process test tmp root (#375), not a hard-coded /tmp.
+    std::string tmpl = (std::filesystem::temp_directory_path() / "rune_diskfull_XXXXXX").string();
+    if (::mkdtemp(tmpl.data()) == nullptr) GTEST_SKIP() << "mkdtemp failed";
     const std::string dir = tmpl;
     std::fflush(nullptr);
     const pid_t pid = ::fork();
