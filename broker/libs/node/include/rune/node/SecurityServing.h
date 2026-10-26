@@ -15,6 +15,13 @@
 //                       it (the latch is re-earned from scratch, never resumed): a restarted, wiped, new or partitioned
 //                       follower answers 48 until it caught up again.  Posted to the control thread on change
 //                       (kA2cSecurityServing), ordered behind every kA2cSecurityApplied of the state it vouches for.
+//                       Issue #460, the one exception: when only the LEADER's answer lapses (it crashed or was cut off)
+//                       while every committed record this broker knows is applied, a follower's verdict is HELD
+//                       instead of dropped.  A held verdict counts on the control thread only while this broker is in
+//                       the committed `__security` ISR and the metadata map is current (nothing commits without an ISR
+//                       member: HW = min LEO over the ISR), on top of the consensus-contact rule below - so a leader
+//                       failover (election + reassignment, which together can exceed F) never makes the survivors
+//                       stale, and a cut-off follower loses it when it is shrunk out of the ISR or loses the consensus.
 //   SecurityServing   — CONTROL thread: CatchingUp (boot: never served) | Serving | Stale{sinceNs, sessionsEnded}.
 //                       Current ⇔ the admin thread's latest "caught up" AND the consensus was in contact (the election
 //                       CLOSED with a leader) within F - the second condition is what stops a partitioned ex-leader
@@ -87,29 +94,50 @@ public:
                 st_ = NotCaughtUp{};
                 if (!answered) lastAnswerNs_ = INT64_MIN / 2;   // its own "contact" as leader is no leader answer
             } else if (!fresh) {
-                st_ = NotCaughtUp{};
+                // Issue #460: only the LEADER's answer lapsed (it crashed or was cut off) while this broker's own apply
+                // stayed fresh - hold the verdict through the failover instead of dropping it.  The control thread
+                // counts a held verdict only while this broker stays in the committed `__security` ISR (nothing
+                // commits without it: HW = min LEO over the ISR), so the hold never serves around a commit.
+                // A hold needs every record the broker knows committed to be applied NOW (not merely F ago).
+                if (!c->asLeader && in.appliedNext >= in.highWatermark) st_ = Held{in.epoch};
+                else st_ = NotCaughtUp{};
             } else {
                 c->epoch = in.epoch;
                 return true;
             }
+        }
+        if (auto* h = std::get_if<Held>(&st_)) {
+            // Issue #460: a held verdict ends the moment a commit is known that this broker has not applied (or, above,
+            // the applier is gone / halted); it becomes a full verdict again through the catch-up paths below (the new
+            // leader answered and this broker holds and applied all it has, or it leads and serves itself).
+            if (in.appliedNext < in.highWatermark) st_ = NotCaughtUp{};
+            else h->epoch = in.epoch;
         }
         const bool freshNow = in.nowNs - lastAnswerNs_ <= stalenessNs_ && in.nowNs - lastAppliedNs_ <= stalenessNs_;
         if (!in.leader && freshNow && in.caughtUpWithLeader && in.appliedNext >= in.highWatermark) {
             st_ = CaughtUp{in.epoch, false};
             return true;
         }
-        return false;
+        return std::holds_alternative<Held>(st_);
     }
 
-    [[nodiscard]] bool caughtUp() const noexcept { return std::holds_alternative<CaughtUp>(st_); }
+    /// True while CaughtUp or Held (a held verdict counts only with the control thread's ISR check - see held()).
+    [[nodiscard]] bool caughtUp() const noexcept { return !std::holds_alternative<NotCaughtUp>(st_); }
+    /// Issue #460: the verdict is held through a leader failover (the leader's answer lapsed, the apply is fresh).
+    [[nodiscard]] bool held() const noexcept { return std::holds_alternative<Held>(st_); }
     /// PR #459 F2: the epoch / role the verdict is for (meaningful while caughtUp()).
-    [[nodiscard]] int32_t verdictEpoch() const noexcept { const auto* c = std::get_if<CaughtUp>(&st_); return c ? c->epoch : -1; }
+    [[nodiscard]] int32_t verdictEpoch() const noexcept {
+        if (const auto* c = std::get_if<CaughtUp>(&st_)) return c->epoch;
+        if (const auto* h = std::get_if<Held>(&st_)) return h->epoch;
+        return -1;
+    }
     [[nodiscard]] bool verdictAsLeader() const noexcept { const auto* c = std::get_if<CaughtUp>(&st_); return c && c->asLeader; }
 
 private:
     struct NotCaughtUp {};
     struct CaughtUp { int32_t epoch = 0; bool asLeader = false; };   // what earned it (diagnostics)
-    std::variant<NotCaughtUp, CaughtUp> st_{NotCaughtUp{}};
+    struct Held { int32_t epoch = 0; };   // issue #460: a follower verdict whose leader went silent (diagnostics)
+    std::variant<NotCaughtUp, CaughtUp, Held> st_{NotCaughtUp{}};
     int64_t  stalenessNs_;
     uint64_t answersSeen_   = 0;
     int64_t  lastAnswerNs_  = INT64_MIN / 2;   // never: always older than F
@@ -162,8 +190,12 @@ public:
 
     /// kA2cSecurityServing: the admin thread's latest verdict, for `epoch` of the `__security` replica in the role
     /// `asLeader` (-1: not checked - single node).
-    void onAdminCaughtUp(bool caughtUp, int64_t leaderHw, int32_t epoch = -1, bool asLeader = false) noexcept {
+    /// `held` (issue #460): the verdict is held through a leader failover - it counts only while this broker is in
+    /// the committed `__security` ISR and the map is current (multi-node; single node never holds).
+    void onAdminCaughtUp(bool caughtUp, int64_t leaderHw, int32_t epoch = -1, bool asLeader = false,
+                         bool held = false) noexcept {
         adminCaughtUp_ = caughtUp; leaderHw_ = leaderHw; adminEpoch_ = epoch; adminAsLeader_ = asLeader;
+        adminHeld_ = caughtUp && held;
     }
 
     /// PR #459 F2: the committed `__security` assignment as this broker's metadata knows it, and whether that metadata
@@ -174,7 +206,9 @@ public:
     /// `mapControls`: this node is the ready controller now (it won a majority election after the contact returned:
     /// its log is complete) - its map needs no leader answer.
     struct Committed { int32_t epoch = -1; bool selfLeads = false; bool mapCurrent = true; uint64_t mapAnswers = 0;
-                       bool mapControls = false; };
+                       bool mapControls = false;
+                       bool selfInIsr = false;   ///< issue #460: this node is in the committed `__security` ISR
+    };
 
     /// One control pass: `consensusClosed` = the election is CLOSED with a leader right now; `committed` (multi-node)
     /// = the committed assignment - the admin verdict counts only while it is for that epoch and role, so a healed
@@ -193,7 +227,11 @@ public:
         const bool forCommitted =
             committed == nullptr ||
             (!mapRefreshOwed_ &&
-             (!adminAsLeader_ || (adminEpoch_ == committed->epoch && committed->selfLeads)));
+             (!adminAsLeader_ || (adminEpoch_ == committed->epoch && committed->selfLeads)) &&
+             // Issue #460: a held verdict (its leader went silent) is current only while nothing can commit without
+             // this broker: it is in the committed ISR of a current map.  A cut-off follower is lag-shrunk out of it
+             // through the controller, which ends the hold; a lost consensus ends it F later (below).
+             (!adminHeld_ || (committed->selfInIsr && committed->mapCurrent)));
         const bool current = adminCaughtUp_ && forCommitted && nowNs - lastConsensusNs_ <= stalenessNs_;
         Actions a;
         if (current) {
@@ -228,6 +266,7 @@ private:
     bool     baselineSet_        = false;
     uint64_t mapAnswersBaseline_ = 0;
     bool    adminAsLeader_   = false;
+    bool    adminHeld_       = false;   // issue #460
     int64_t leaderHw_        = -1;
     int64_t lastConsensusNs_ = INT64_MIN / 2;
 };

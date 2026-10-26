@@ -1511,23 +1511,26 @@ inline void writeSecurityApplied(uint8_t* p, int64_t offset, std::span<const uin
     bytes  = std::span<const uint8_t>(buf + kSecurityAppliedFixedBytes, len - kSecurityAppliedFixedBytes);
     return offset >= 0;
 }
-//   kA2cSecurityServing : [caughtUp:u8][leaderHw:i64][epoch:i32][asLeader:u8][knownEnd:i64][behind:u8]   (issues
+//   kA2cSecurityServing : [caughtUp:u8][leaderHw:i64][epoch:i32][asLeader:u8][knownEnd:i64][behind:u8][held:u8]   (issues
 //                         #15 / #111; PR #459 F2: the epoch / role the verdict is for, compared with the committed
 //                         assignment on the control thread; #205: knownEnd = max(log end, leader HW) - the events this
 //                         broker knows exist; #603: behind = the applier is below the committed HW this broker knows -
-//                         every grant-checked operation answers AuthUnavailable until it is not)
-inline constexpr std::size_t kSecurityServingWireLen = 1 + 8 + 4 + 1 + 8 + 1;
+//                         every grant-checked operation answers AuthUnavailable until it is not; #460: held = the verdict is held through a
+//                         leader failover - it counts only while this broker is in the committed ISR)
+inline constexpr std::size_t kSecurityServingWireLen = 1 + 8 + 4 + 1 + 8 + 1 + 1;
 inline void writeSecurityServing(uint8_t* p, bool caughtUp, int64_t leaderHw, int32_t epoch = -1,
-                                 bool asLeader = false, int64_t knownEnd = -1, bool behind = false) noexcept {
+                                 bool asLeader = false, int64_t knownEnd = -1, bool behind = false,
+                                 bool held = false) noexcept {
     p[0] = caughtUp ? 1 : 0;
     admin_wire::putI64(p + 1, leaderHw);
     std::memcpy(p + 9, &epoch, 4);
     p[13] = asLeader ? 1 : 0;
     admin_wire::putI64(p + 14, knownEnd);
     p[22] = behind ? 1 : 0;
+    p[23] = held ? 1 : 0;
 }
 [[nodiscard]] inline bool decodeSecurityServing(const uint8_t* buf, std::size_t len, bool& caughtUp, int64_t& leaderHw) noexcept {
-    if (len != kSecurityServingWireLen || buf[0] > 1 || buf[13] > 1 || buf[22] > 1) return false;
+    if (len != kSecurityServingWireLen || buf[0] > 1 || buf[13] > 1 || buf[22] > 1 || buf[23] > 1) return false;
     caughtUp = buf[0] == 1;
     leaderHw = admin_wire::getI64(buf + 1);
     return true;
@@ -1549,6 +1552,13 @@ inline void writeSecurityServing(uint8_t* p, bool caughtUp, int64_t leaderHw, in
                                                 int32_t& epoch, bool& asLeader, int64_t& knownEnd, bool& behind) noexcept {
     if (!decodeSecurityServing(buf, len, caughtUp, leaderHw, epoch, asLeader, knownEnd)) return false;
     behind = buf[22] == 1;
+    return true;
+}
+[[nodiscard]] inline bool decodeSecurityServing(const uint8_t* buf, std::size_t len, bool& caughtUp, int64_t& leaderHw,
+                                                int32_t& epoch, bool& asLeader, int64_t& knownEnd, bool& behind,
+                                                bool& held) noexcept {
+    if (!decodeSecurityServing(buf, len, caughtUp, leaderHw, epoch, asLeader, knownEnd, behind)) return false;
+    held = buf[23] == 1;
     return true;
 }
 using SecurityHaltedMsg = CatalogHaltedMsg;

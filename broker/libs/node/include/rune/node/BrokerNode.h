@@ -829,9 +829,10 @@ public:
     /// Issues #15 / #111 - ADMIN thread only (deps.securityServing): kA2cSecurityServing on the effect FIFO (never
     /// dropped: the backlog keeps it in order behind the applied events).
     void postSecurityServing(bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader, int64_t knownEnd,
-                             bool behind) {
-        postCatalog_(kA2cSecurityServing, kSecurityServingWireLen,
-                     [&](uint8_t* p) { writeSecurityServing(p, caughtUp, leaderHw, epoch, asLeader, knownEnd, behind); });
+                             bool behind, bool held) {
+        postCatalog_(kA2cSecurityServing, kSecurityServingWireLen, [&](uint8_t* p) {
+            writeSecurityServing(p, caughtUp, leaderHw, epoch, asLeader, knownEnd, behind, held);
+        });
     }
     [[nodiscard]] SecurityBootEffects securityBootEffects() const { return SecurityBootEffects{}; }
     [[nodiscard]] SecurityEffects securitySinkForBootStash() { return securitySink_(); }

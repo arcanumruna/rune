@@ -291,9 +291,12 @@ current; otherwise it answers the retriable `AuthUnavailable` (48) and the clien
 - **Stale.** A follower whose leader has not answered for `RUNE_SECURITY_MAX_STALENESS_MS` (F, default
   1 000), whose apply lags that long, or any broker that lost contact with the consensus for F (a broker cut
   off the cluster, including a `__security` leader that does not know it was replaced) is stale. F exceeds
-  the broker liveness timeout, so a planned leadership move does not make a broker stale; a hard leader
-  failure can make the surviving followers answer logins `AuthUnavailable` briefly until the new leader
-  answers them (tracked in #460).
+  the broker liveness timeout, so a planned leadership move does not make a broker stale. A hard leader
+  failure does not either (#460): a follower that has applied everything it knows committed holds its
+  verdict while its leader is silent, for as long as it stays in the committed `__security` ISR of a current
+  partition map and in contact with the consensus. Nothing commits without an ISR member, so a held follower
+  can miss no committed event; a follower cut off is shrunk out of the ISR and goes stale, and a commit it
+  learns of but has not applied ends the hold at once.
 - **Behind.** A broker that holds committed `__security` events it has not applied yet (its leader told it
   they are committed, or it leads and its own apply lags) refuses every grant-checked request with
   `AuthUnavailable`: produce (through the gateway and straight to a worker), subscribe, view reads, group

@@ -699,6 +699,7 @@ int AdminWorker::stepSecurityServing_(int64_t nowNs) {
     const bool caughtUp = securityCatchUp_.step(in);
     const int32_t vEpoch = caughtUp ? securityCatchUp_.verdictEpoch() : -1;
     const bool vLeader = caughtUp && securityCatchUp_.verdictAsLeader();
+    const bool vHeld = caughtUp && securityCatchUp_.held();   // issue #460
     // #205: the events this broker knows exist - its own log end (a follower appended them before the leader could
     // commit them, acks=all) or the leader's HW, whichever is further.  Posted in the pass that appended them - AFTER a
     // follower's fast-ack of them has left (it is sent inside the frame dispatch); the gateway also treats a view that
@@ -714,13 +715,14 @@ int AdminWorker::stepSecurityServing_(int64_t nowNs) {
                      in.appliedNext, securityBehind_.knownCommittedHw(),
                      behind ? " - grant-checked operations answer AuthUnavailable until it is applied" : "");
     const bool verdictSame = securityServingPosted_ == (caughtUp ? 1 : 0) && securityServingPostedEpoch_ == vEpoch &&
-                             securityServingPostedLeader_ == vLeader;
+                             securityServingPostedLeader_ == vLeader && securityServingPostedHeld_ == vHeld;
     if (verdictSame && !behindEdge && securityServingPostedKnownEnd_ == knownEnd) [[likely]] return 0;
     securityServingPosted_ = caughtUp ? 1 : 0;
     securityServingPostedEpoch_ = vEpoch;
     securityServingPostedLeader_ = vLeader;
+    securityServingPostedHeld_ = vHeld;
     securityServingPostedKnownEnd_ = knownEnd;
-    deps_.securityServing(caughtUp, in.highWatermark, vEpoch, vLeader, knownEnd, behind);
+    deps_.securityServing(caughtUp, in.highWatermark, vEpoch, vLeader, knownEnd, behind, vHeld);
     if (verdictSame) return 1;   // only the known end / the behind edge moved: not worth this log line
     spdlog::info("AdminWorker: __security {} (role {}, epoch {}, applied {} / hw {})",
                  caughtUp ? "caught up - logins served" : "not caught up - logins answer AuthUnavailable",

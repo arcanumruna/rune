@@ -69,8 +69,9 @@ TEST(SecurityServingRegression, APartitionedFollowerLosesItAfterFAndEarnsItBackO
     ASSERT_TRUE(c.step(in));
     in.nowNs = kF;                                  // silent for exactly F: still fresh
     EXPECT_TRUE(c.step(in));
-    in.nowNs = kF + 1;                              // silent past F
-    EXPECT_FALSE(c.step(in));
+    in.nowNs = kF + 1;                              // silent past F: issue #460 holds it (all it knows is applied);
+    EXPECT_TRUE(c.step(in));                        // the control thread counts a hold only inside the ISR
+    EXPECT_TRUE(c.held());
     in.nowNs = kF + 2 * kMs; in.leaderAnswers = 2; in.caughtUpWithLeader = false; in.highWatermark = 9;
     EXPECT_FALSE(c.step(in)) << "the leader answers again, with what we missed: not caught up yet";
     in.nowNs = kF + 4 * kMs; in.leaderAnswers = 3; in.caughtUpWithLeader = true; in.appliedNext = 9;
@@ -117,9 +118,13 @@ TEST(SecurityServingRegression, ALeaderIsCaughtUpWhileItServesAndAFailoverWithin
     in.nowNs = 30 * kMs + kF;
     EXPECT_TRUE(c.step(in));
     in.nowNs = 31 * kMs + kF;
+    EXPECT_TRUE(c.step(in)) << "issue #460: held (the control thread bounds it by the ISR and the consensus)";
+    EXPECT_TRUE(c.held());
+    in.highWatermark = 5;                           // a commit it has not applied: the hold ends
     EXPECT_FALSE(c.step(in));
     in.nowNs = 40 * kMs + kF; in.leaderServing = true;
     EXPECT_TRUE(c.step(in));
+    EXPECT_FALSE(c.held());
 }
 
 // PR #459 F2: multi-node, a verdict counts only for the committed epoch and role - a healed zombie's leader-era verdict
@@ -427,11 +432,180 @@ TEST(SecurityBehindRegression, TheBehindByteRoundTripsAndIsRangeCheckedAdversari
             EXPECT_FALSE(rune::node::decodeSecurityServing(buf, rune::node::kSecurityServingWireLen, up, hw)) << v;
         }
     }
-    EXPECT_EQ(rune::node::kSecurityServingWireLen, 23u);
+    EXPECT_EQ(rune::node::kSecurityServingWireLen, 24u);
     uint8_t d[rune::node::kSecurityServingWireLen];
     rune::node::writeSecurityServing(d, true, 1);
     bool up = false, leader = false, behind = true; int64_t hw = 0, known = 0; int32_t epoch = 0;
     ASSERT_TRUE(rune::node::decodeSecurityServing(d, sizeof d, up, hw, epoch, leader, known, behind));
     EXPECT_FALSE(behind) << "the defaulted argument";
     EXPECT_FALSE(rune::node::decodeSecurityServing(d, 22, up, hw)) << "the pre-#603 layout";
+    EXPECT_FALSE(rune::node::decodeSecurityServing(d, 23, up, hw)) << "the pre-#460 layout";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// Issue #460: a `__security` leader crash must never make the survivors stale - the election plus the reassignment can
+// exceed F, so a follower whose own apply is current HOLDS its verdict while its leader is silent, and the control
+// thread counts a hold only while this broker is in the committed `__security` ISR of a current map.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+namespace {
+SecurityCatchUp::Inputs caughtUpFollower(int64_t now) {
+    SecurityCatchUp::Inputs in;
+    in.present = true; in.nowNs = now; in.epoch = 1; in.leaderAnswers = 1; in.caughtUpWithLeader = true;
+    in.appliedNext = 5; in.highWatermark = 5;
+    return in;
+}
+} // namespace
+
+TEST(SecurityServingRegression, AFollowerHoldsItsVerdictWhileItsLeaderIsSilentAndEverythingIsAppliedRegression) {
+    SecurityCatchUp c(kF);
+    auto in = caughtUpFollower(0);
+    ASSERT_TRUE(c.step(in));
+    ASSERT_FALSE(c.held());
+    for (int64_t t = 10 * kMs; t <= 5 * kF; t += 10 * kMs) {   // the leader is gone for 5F; nothing new committed
+        in.nowNs = t;
+        if (t == 2 * kF) in.epoch = 2;                         // a new leader elected, not answering yet
+        ASSERT_TRUE(c.step(in)) << t;
+        EXPECT_EQ(c.held(), t > kF) << t;
+        EXPECT_FALSE(c.verdictAsLeader());
+        EXPECT_EQ(c.verdictEpoch(), t >= 2 * kF ? 2 : 1) << t;
+    }
+    // The new leader answers with nothing beyond our log: a full verdict again.
+    in.nowNs += kMs; in.leaderAnswers = 2;
+    ASSERT_TRUE(c.step(in));
+    EXPECT_FALSE(c.held());
+    EXPECT_EQ(c.verdictEpoch(), 2);
+}
+
+TEST(SecurityServingRegression, AHoldEndsOnAnUnappliedCommitAHaltOrALostLogRegression) {
+    for (int k = 0; k < 4; ++k) {
+        SecurityCatchUp c(kF);
+        auto in = caughtUpFollower(0);
+        ASSERT_TRUE(c.step(in));
+        in.nowNs = kF + 1;
+        ASSERT_TRUE(c.step(in));
+        ASSERT_TRUE(c.held()) << k;
+        in.nowNs = kF + 2;
+        switch (k) {
+            case 0: in.highWatermark = 6; break;                  // a commit it has not applied (the answer came back)
+            case 1: in.highWatermark = 6; in.leaderAnswers = 2; in.caughtUpWithLeader = false; break;
+            case 2: in.halted = true; break;
+            case 3: in.present = false; break;
+        }
+        EXPECT_FALSE(c.step(in)) << k;
+        EXPECT_FALSE(c.held()) << k;
+        EXPECT_FALSE(c.caughtUp()) << k;
+        // And it is never resumed: the old state back is not a fresh catch-up (no new answer).
+        // The answer counter and the HW are monotonic: keep both (no new answer, nothing un-committed).
+        const uint64_t answers = in.leaderAnswers;
+        const int64_t hw = in.highWatermark;
+        in = caughtUpFollower(kF + 3);
+        in.leaderAnswers = answers;
+        in.highWatermark = hw;
+        EXPECT_FALSE(c.step(in)) << k;
+    }
+}
+
+TEST(SecurityServingRegression, AFollowerBehindWhenItsLeaderGoesSilentIsNeverHeldRegression) {
+    SecurityCatchUp c(kF);
+    auto in = caughtUpFollower(0);
+    ASSERT_TRUE(c.step(in));
+    in.nowNs = kF / 2; in.highWatermark = 7;   // a commit arrives, not applied yet, then the leader goes silent
+    ASSERT_TRUE(c.step(in));
+    in.nowNs = kF + 1;
+    EXPECT_FALSE(c.step(in));
+    EXPECT_FALSE(c.held());
+}
+
+TEST(SecurityServingRegression, ALeaderEraVerdictIsNeverHeldRegression) {
+    SecurityCatchUp c(kF);
+    SecurityCatchUp::Inputs in;
+    in.present = true; in.leader = true; in.leaderServing = true; in.epoch = 1; in.appliedNext = 4; in.highWatermark = 4;
+    ASSERT_TRUE(c.step(in));
+    ASSERT_TRUE(c.verdictAsLeader());
+    in.leaderServing = false;                          // still leads but no longer serves (a zombie losing its quorum)
+    for (int64_t t = kMs; t <= 3 * kF; t += 10 * kMs) {
+        in.nowNs = t;
+        const bool v = c.step(in);
+        EXPECT_FALSE(c.held()) << t;
+        EXPECT_EQ(v, t <= kF) << t;
+    }
+}
+
+// The control thread: a held verdict serves only inside the committed ISR of a current map, within F of the consensus.
+TEST(SecurityServingRegression, AHeldVerdictServesOnlyInTheCommittedIsrOfACurrentMapRegression) {
+    SecurityServing s(kF, kR);
+    SecurityServing::Committed c{1, false, true, 10, false, true};
+    s.onAdminCaughtUp(true, 5, 1, false);
+    ASSERT_TRUE(s.step(0, true, &c).changed);
+    ASSERT_TRUE(s.serving());
+    // The leader crashed: the verdict is held, the epoch moves on, the election is open for less than F.
+    s.onAdminCaughtUp(true, 5, 1, false, /*held=*/true);
+    EXPECT_FALSE(s.step(kF / 2, true, &c).changed);
+    EXPECT_TRUE(s.serving());
+    c.epoch = 2;
+    s.onAdminCaughtUp(true, 5, 2, false, true);
+    for (int64_t t = kF / 2; t <= 5 * kF; t += 50 * kMs) {
+        const bool closed = t < kF / 2 + 800 * kMs ? (t / kMs) % 2 == 0 : true;   // a re-election blip, never > F
+        (void)s.step(t, closed, &c);
+        EXPECT_TRUE(s.serving()) << t;
+    }
+    // Shrunk out of the ISR: stale at once.
+    c.selfInIsr = false;
+    EXPECT_TRUE(s.step(5 * kF + 1, true, &c).changed);
+    EXPECT_FALSE(s.serving());
+    c.selfInIsr = true;
+    EXPECT_TRUE(s.step(5 * kF + 2, true, &c).changed);
+    EXPECT_TRUE(s.serving());
+    // The map not current: stale.
+    c.mapCurrent = false;
+    EXPECT_TRUE(s.step(5 * kF + 3, true, &c).changed);
+    EXPECT_FALSE(s.serving());
+    c.mapCurrent = true;
+    ASSERT_TRUE(s.step(5 * kF + 4, true, &c).changed);
+    // The consensus lost past F: stale (the ISR in a frozen map proves nothing).
+    EXPECT_FALSE(s.step(6 * kF + 4, false, &c).changed);
+    EXPECT_TRUE(s.step(6 * kF + 5, false, &c).changed);
+    EXPECT_FALSE(s.serving());
+    // A full (not held) verdict needs no ISR membership.
+    SecurityServing f(kF, kR);
+    SecurityServing::Committed out{2, false, true, 10, false, false};
+    f.onAdminCaughtUp(true, 5, 2, false);
+    EXPECT_TRUE(f.step(0, true, &out).changed);
+    EXPECT_TRUE(f.serving());
+    f.onAdminCaughtUp(true, 5, 2, false, true);
+    EXPECT_TRUE(f.step(1, true, &out).changed);
+    EXPECT_FALSE(f.serving()) << "held and not in the ISR";
+    // `held` without `caughtUp` is no verdict at all.
+    f.onAdminCaughtUp(false, 5, 2, false, true);
+    out.selfInIsr = true;
+    EXPECT_FALSE(f.step(2, true, &out).changed);
+    EXPECT_FALSE(f.serving());
+}
+
+// The wire: the held byte round-trips, defaults to false and is range-checked; the pre-#460 23-byte frame is refused.
+TEST(SecurityServingRegression, TheHeldByteRoundTripsAndIsRangeCheckedAdversarialRegression) {
+    for (const bool held : {false, true}) {
+        uint8_t buf[rune::node::kSecurityServingWireLen + 4]{};
+        rune::node::writeSecurityServing(buf, true, 7, 3, false, 9, true, held);
+        bool up = false, leader = true, behind = false, got = !held; int64_t hw = 0, known = 0; int32_t epoch = 0;
+        for (std::size_t n = 0; n <= sizeof buf; ++n)
+            EXPECT_EQ(rune::node::decodeSecurityServing(buf, n, up, hw, epoch, leader, known, behind, got),
+                      n == rune::node::kSecurityServingWireLen) << n;
+        ASSERT_TRUE(rune::node::decodeSecurityServing(buf, rune::node::kSecurityServingWireLen, up, hw, epoch, leader, known,
+                                                      behind, got));
+        EXPECT_EQ(got, held);
+        EXPECT_TRUE(behind);
+        EXPECT_EQ(known, 9);
+        EXPECT_EQ(epoch, 3);
+        for (int v = 2; v < 256; ++v) {
+            buf[23] = static_cast<uint8_t>(v);
+            EXPECT_FALSE(rune::node::decodeSecurityServing(buf, rune::node::kSecurityServingWireLen, up, hw)) << v;
+        }
+    }
+    uint8_t d[rune::node::kSecurityServingWireLen];
+    rune::node::writeSecurityServing(d, true, 1);
+    bool up = false, leader = false, behind = true, held = true; int64_t hw = 0, known = 0; int32_t epoch = 0;
+    ASSERT_TRUE(rune::node::decodeSecurityServing(d, sizeof d, up, hw, epoch, leader, known, behind, held));
+    EXPECT_FALSE(held) << "the defaulted argument";
+    EXPECT_FALSE(rune::node::decodeSecurityServing(d, 23, up, hw)) << "the pre-#460 layout";
 }
