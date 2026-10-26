@@ -127,7 +127,7 @@ TEST_P(CompactedTopicRegression, EveryCompactionSettingReachesTheBroker) {
     s.minCompactionLagMs = 1'500;
     s.maxCompactionLagMs = 90'000;
     s.retentionMs = 3'600'000;
-    s.retentionBytes = 1LL << 30;
+    s.retentionBytes = 1LL << 22;  // 4 MiB: 2 partitions x 1024 x 4 KiB segments stay inside the #296 fd budget
     s.retentionCheckMs = 777;
     s.fileDeleteDelayMs = 888;
     s.segmentRollBytes = 4096;
@@ -140,7 +140,7 @@ TEST_P(CompactedTopicRegression, EveryCompactionSettingReachesTheBroker) {
     EXPECT_EQ(got.minCompactionLagMs, 1'500);
     EXPECT_EQ(got.maxCompactionLagMs, 90'000);
     EXPECT_EQ(got.retentionMs, 3'600'000);
-    EXPECT_EQ(got.retentionBytes, 1LL << 30);
+    EXPECT_EQ(got.retentionBytes, 1LL << 22);
     EXPECT_EQ(got.retentionCheckMs, 777);
     EXPECT_EQ(got.fileDeleteDelayMs, 888);
     EXPECT_EQ(got.segmentRollBytes, 4096);

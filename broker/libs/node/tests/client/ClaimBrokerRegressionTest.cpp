@@ -459,7 +459,9 @@ TEST(ClaimBrokerRegression, ClaimToAnUnwritableTopicCompletesNotAuthorizedRegres
             return done.size() == 2;
         })) << "completions " << done.size();
         for (const rc::Token t : {kClaimTok, kSendTok}) {
-            EXPECT_EQ(done[t].status, rc::OpStatus::BrokerError) << "token " << t;
+            // #211: the broker refuses the non-transactional InitProducerId (no WRITE anywhere), so both records
+            // fail at the id step - DeliveryFailed/NotAuthorized, as ClientAuthClusterRegressionTest pins.
+            EXPECT_EQ(done[t].status, rc::OpStatus::DeliveryFailed) << "token " << t;
             EXPECT_EQ(done[t].errorCode, kNotAuthorized) << "token " << t << ": a claim completes exactly like a send";
         }
         EXPECT_TRUE(readTopic(rig.b.node(), tid).empty()) << "nothing was appended";

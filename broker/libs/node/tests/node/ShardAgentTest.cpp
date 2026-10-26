@@ -178,6 +178,7 @@ TEST(ShardAgent, FirstPassLeavesTimerSlackAloneRegression) {
         after = ::prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
     });
     runner.join();
+    s.driver->bindPumpThread();   // the pass bound the pump to the runner: hand it back so ~Shard closes the driver
     EXPECT_EQ(before, 50'000L);
     // A7 re-review MEDIUM-1: the pass itself leaves the slack alone — only the readiness-fd park sets it, so the
     // legacy backoff fallback (RUNE_IDLE_WAKE=0 / RUNE_AERON_EPOLL_POLL=0 / no fds) keeps the kernel default.
