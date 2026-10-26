@@ -2078,7 +2078,15 @@ if(BUILD_TESTING)
     # ARCANUM_METRICS_DIR configure check (a bad checkout fails with a clear message).
     add_executable(rune_broker_metrics_tests tests/BrokerMetricsRegressionTest.cpp)
     target_link_libraries(rune_broker_metrics_tests PRIVATE rune_node GTest::gtest_main)
-    gtest_discover_tests(rune_broker_metrics_tests)
+    # Task 8: the node-level metrics regressions start in-process BrokerNodes (embedded driver).
+    if(aeron_FOUND)
+        target_include_directories(rune_broker_metrics_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_broker_metrics_tests PRIVATE aeron::aeron)
+        target_compile_definitions(rune_broker_metrics_tests PRIVATE RUNE_BROKER_METRICS_NODE_TESTS=1)
+    endif()
+    gtest_discover_tests(rune_broker_metrics_tests
+        PROPERTIES TIMEOUT 180
+        ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     add_test(NAME BrokerMetricsRegression.ConfigureRejectsMissingDirRegression
         COMMAND ${CMAKE_COMMAND}
             -S ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/cmake/arcanum_metrics_dir

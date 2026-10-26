@@ -7,7 +7,7 @@
 //                               session is kept for the helpers below
 //   createUser(name, pw, grants...) / createRole / grant / grantRole / alter*  - security DDL as that admin
 //   wire()                    - a fresh AuthWireClient (its own embedded Aeron driver) for raw-frame work
-//   counter(typeId)           - a CnC counter of this broker (1'000'229-231 = logins ok / failed / rate-limited)
+//   counter(typeId)           - a metric of this broker (its metrics file) (1'000'229-231 = logins ok / failed / rate-limited)
 //   LogCapture                - the broker's control-thread log lines (reason=..., "authenticated over plaintext")
 //
 // Every wait is bounded (the deadline is the failure, never a hang).  Options: DevDisabled mode, a short auth deadline.
@@ -20,6 +20,8 @@
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/RoleCounter.h>
+
+#include "MetricsTestReader.h"
 
 #include <CncFileReader.h>
 #include <concurrent/CountersReader.h>
@@ -146,7 +148,6 @@ public:
             cfg.clusterKeyFile = keyFile_.string();
         }
         channel_ = cfg.clientEndpoint.channel;
-        aeronDir_ = cfg.aeronDir;
         cfg_ = cfg;
         startNode_();
     }
@@ -261,17 +262,9 @@ public:
     [[nodiscard]] int64_t loginsOkDone() const noexcept { return loginsOkDone_; }
     void noteLoginOk() noexcept { ++loginsOkDone_; }
 
-    // ── CnC counters ─────────────────────────────────────────────────────────────────────────────────────────
+    // ── metrics (arcanum-metrics plan Task 8: the node's metrics file, no longer cnc.dat) ─────────────────────
     [[nodiscard]] std::optional<int64_t> counter(std::int32_t typeId) const {
-        try {
-            aeron::CncFileReader reader = aeron::CncFileReader::mapExisting(aeronDir_.c_str());
-            aeron::concurrent::CountersReader counters = reader.countersReader();
-            std::optional<int64_t> found;
-            counters.forEach([&](std::int32_t id, std::int32_t t, const aeron::concurrent::AtomicBuffer&, const std::string&) {
-                if (t == typeId && !found) found = counters.getCounterValue(id);
-            });
-            return found;
-        } catch (...) { return std::nullopt; }
+        return rune::node::test::readRuneMetricAt(cfg_.effectiveMetricsFile(), typeId, cfg_.nodeId);
     }
     /// The counter reaches `want` (bounded); the last value read otherwise.
     [[nodiscard]] bool awaitCounter(std::int32_t typeId, int64_t want, std::chrono::milliseconds within = std::chrono::seconds(10)) const {
@@ -305,7 +298,7 @@ private:
     int64_t                                      loginsOkDone_ = 0;
     std::filesystem::path                        keyFile_;
     uint16_t                                     clientPort_ = 0;
-    std::string                                  channel_, aeronDir_, ingressChannel_;
+    std::string                                  channel_, ingressChannel_;
     std::unique_ptr<BrokerNode>                  node_;
     std::vector<std::unique_ptr<AuthWireClient>> wires_;
     AuthWireClient*                              admin_ = nullptr;

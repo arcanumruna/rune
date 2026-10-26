@@ -388,6 +388,9 @@ void BrokerNode::start() {
                                      config_.effectiveAeronDir() + "': " + ec.message());
         }
     }
+    // 1a'. arcanum-metrics (plan Task 8, D59): create the metrics file, allocate every RuneMetric row and init the
+    //      system metrics BEFORE any agent starts; any failure throws (the node never starts half-instrumented).
+    createMetrics_();
 
     // 1b. Catalog history Task 16 (spec §3, §5.3): the broker BOOTS FROM __catalog.
     //     bootFromCatalog_ opens the local __catalog log, runs the ONE boot replay
@@ -524,59 +527,10 @@ void BrokerNode::start() {
         termCounterRegId_ = aeron_->addCounter(
             kTermCounterTypeId, roleKey, kRoleKeyLength,
             termCounterLabel(config_.nodeId));
-        stuckMarkersCounterRegId_ = aeron_->addCounter(
-            kStuckMarkersCounterTypeId, roleKey, kRoleKeyLength,
-            stuckMarkersLabel(config_.nodeId));
-        stuckTxnOffsetsCounterRegId_ = aeron_->addCounter(
-            kStuckTxnOffsetCommitsCounterTypeId, roleKey, kRoleKeyLength, stuckTxnOffsetCommitsLabel(config_.nodeId));
-        stuckTxnOffsetAgeCounterRegId_ = aeron_->addCounter(
-            kStuckTxnOffsetAgeMsCounterTypeId, roleKey, kRoleKeyLength, stuckTxnOffsetAgeMsLabel(config_.nodeId));
         outOfSyncCounterRegId_ = aeron_->addCounter(
             kOutOfSyncCounterTypeId, roleKey, kRoleKeyLength, outOfSyncLabel(config_.nodeId));
-        catalogHaltedCounterRegId_ = aeron_->addCounter(
-            kCatalogApplyHaltedCounterTypeId, roleKey, kRoleKeyLength, catalogApplyHaltedLabel(config_.nodeId));
-        catalogAppliedCounterRegId_ = aeron_->addCounter(
-            kCatalogAppliedOffsetCounterTypeId, roleKey, kRoleKeyLength, catalogAppliedOffsetLabel(config_.nodeId));
-        // Authentication Task 9: 1'000'226 security apply halted, 227 security applied offset, 228 auth mode.
-        securityHaltedCounterRegId_ = aeron_->addCounter(
-            kSecurityApplyHaltedCounterTypeId, roleKey, kRoleKeyLength, securityApplyHaltedLabel(config_.nodeId));
-        securityAppliedCounterRegId_ = aeron_->addCounter(
-            kSecurityAppliedOffsetCounterTypeId, roleKey, kRoleKeyLength, securityAppliedOffsetLabel(config_.nodeId));
-        authModeCounterRegId_ = aeron_->addCounter(
-            kAuthModeCounterTypeId, roleKey, kRoleKeyLength, authModeLabel(config_.nodeId));
-        // Authentication Task 15: 1'000'233 peer links established, 234 peer-link refusals.
-        peerEstablishedCounterRegId_ = aeron_->addCounter(
-            kPeerLinksEstablishedCounterTypeId, roleKey, kRoleKeyLength, peerLinksEstablishedLabel(config_.nodeId));
-        peerRefusalsCounterRegId_ = aeron_->addCounter(
-            kPeerLinkRefusalsCounterTypeId, roleKey, kRoleKeyLength, peerLinkRefusalsLabel(config_.nodeId));
-        peerDropsCounterRegId_ = aeron_->addCounter(   // Authentication Task 16: 1'000'235 dropped peer frames
-            kPeerFrameDropsCounterTypeId, roleKey, kRoleKeyLength, peerFrameDropsLabel(config_.nodeId));
-        // Authentication Task 11: 1'000'229 logins ok, 230 failed, 231 rate-limited.
-        loginsOkCounterRegId_ = aeron_->addCounter(
-            kLoginsOkCounterTypeId, roleKey, kRoleKeyLength, loginsOkLabel(config_.nodeId));
-        loginsFailedCounterRegId_ = aeron_->addCounter(
-            kLoginsFailedCounterTypeId, roleKey, kRoleKeyLength, loginsFailedLabel(config_.nodeId));
-        loginsRateLimitedCounterRegId_ = aeron_->addCounter(
-            kLoginsRateLimitedCounterTypeId, roleKey, kRoleKeyLength, loginsRateLimitedLabel(config_.nodeId));
-        sessionsRevokedCounterRegId_ = aeron_->addCounter(
-            kSessionsRevokedCounterTypeId, roleKey, kRoleKeyLength, sessionsRevokedLabel(config_.nodeId));
-        unplaceableCounterRegId_ = aeron_->addCounter(
-            kCatalogUnplaceableTopicsCounterTypeId, roleKey, kRoleKeyLength,
-            catalogUnplaceableTopicsLabel(config_.nodeId));
-        blockedCounterRegId_ = aeron_->addCounter(
-            kCatalogBlockedPartitionsCounterTypeId, roleKey, kRoleKeyLength,
-            catalogBlockedPartitionsLabel(config_.nodeId));
-        linkMtuCounterRegId_ = aeron_->addCounter(
-            kLinkMtuDeficitCounterTypeId, roleKey, kRoleKeyLength, linkMtuDeficitLabel(config_.nodeId));
-        // ISR v3 §3.10 (B-I4): the storage counters.
-        storageCounterRegIds_[0] = aeron_->addCounter(kStorageGateStateCounterTypeId, roleKey, kRoleKeyLength,
-                                                      storageGateStateLabel(config_.nodeId));
-        storageCounterRegIds_[1] = aeron_->addCounter(kLeaderRolesHeldCounterTypeId, roleKey, kRoleKeyLength,
-                                                      leaderRolesHeldLabel(config_.nodeId));
-        storageCounterRegIds_[2] = aeron_->addCounter(kStoragePendingNodesCounterTypeId, roleKey, kRoleKeyLength,
-                                                      storagePendingNodesLabel(config_.nodeId));
-        storageCounterRegIds_[3] = aeron_->addCounter(kLostCommittedReportsCounterTypeId, roleKey, kRoleKeyLength,
-                                                      lostCommittedReportsLabel(config_.nodeId));
+        // arcanum-metrics Task 8: every control-thread metric lives in the metrics file (createMetrics_); the
+        // observer (role / term / out-of-sync) and provisioner rows keep their counters here until Task 9.
 
         // Review A-I5: bind every fixed port of the NODE driver before its first publication (consensus /
         // replication / gateway publications auto-bind ephemeral ports; one could take a later fixed bind).
@@ -3214,30 +3168,17 @@ void BrokerNode::publishProvisionMetric_(void* self, int metric, std::int64_t va
 bool BrokerNode::publishStuckTxnOffsets_(void* self, std::int64_t stuck, std::int64_t oldestAgeMs)
 {
     auto* n = static_cast<BrokerNode*>(self);
-    if (!n->aeron_) return false;
-    const auto resolve = [&](std::shared_ptr<aeron::Counter>& c, std::int64_t reg) {
-        if (!c && reg >= 0) {
-            try { c = n->aeron_->findCounter(reg); } catch (...) { c.reset(); }
-        }
-        return static_cast<bool>(c);
-    };
-    if (!resolve(n->stuckTxnOffsetsCounter_, n->stuckTxnOffsetsCounterRegId_) ||
-        !resolve(n->stuckTxnOffsetAgeCounter_, n->stuckTxnOffsetAgeCounterRegId_)) return false;
-    n->stuckTxnOffsetsCounter_->set(stuck);
-    n->stuckTxnOffsetAgeCounter_->set(oldestAgeMs);
+    if (!n->metricsReady_) return false;
+    n->slot_(RuneMetric::StuckTxnOffsetCommits).set(stuck);
+    n->slot_(RuneMetric::StuckTxnOffsetAgeMs).set(oldestAgeMs);
     return true;
 }
 
 bool BrokerNode::publishStuckMarkers_(void* self, std::int64_t value)
 {
     auto* n = static_cast<BrokerNode*>(self);
-    if (!n->aeron_) return false;
-    if (!n->stuckMarkersCounter_ && n->stuckMarkersCounterRegId_ >= 0) {
-        try { n->stuckMarkersCounter_ = n->aeron_->findCounter(n->stuckMarkersCounterRegId_); }
-        catch (...) { n->stuckMarkersCounter_.reset(); }
-    }
-    if (!n->stuckMarkersCounter_) return false;
-    n->stuckMarkersCounter_->set(value);
+    if (!n->metricsReady_) return false;
+    n->slot_(RuneMetric::StuckMarkers).set(value);
     return true;
 }
 
@@ -3276,23 +3217,132 @@ void BrokerNode::publishRole() noexcept {
     if (outOfSyncCounter_) outOfSyncCounter_->set(static_cast<std::int64_t>(outOfSyncPartitions()));
 }
 
+namespace {
+const char* metricsFileStatusName(metrics::FileStatus s) noexcept {
+    switch (s) {
+        case metrics::FileStatus::Ok:               return "Ok";
+        case metrics::FileStatus::PathTooLong:      return "PathTooLong";
+        case metrics::FileStatus::CapacityTooSmall: return "CapacityTooSmall";
+        case metrics::FileStatus::CapacityTooLarge: return "CapacityTooLarge";
+        case metrics::FileStatus::IoError:          return "IoError";
+        case metrics::FileStatus::NotReady:         return "NotReady";
+        case metrics::FileStatus::VersionMismatch:  return "VersionMismatch";
+        case metrics::FileStatus::BadLength:        return "BadLength";
+        case metrics::FileStatus::TooLarge:         return "TooLarge";
+    }
+    return "Unknown";
+}
+const char* metricsAllocStatusName(metrics::AllocStatus s) noexcept {
+    switch (s) {
+        case metrics::AllocStatus::Ok:              return "Ok";
+        case metrics::AllocStatus::Full:            return "Full";
+        case metrics::AllocStatus::KeyTooLong:      return "KeyTooLong";
+        case metrics::AllocStatus::LabelTooLong:    return "LabelTooLong";
+        case metrics::AllocStatus::InvalidType:     return "InvalidType";
+        case metrics::AllocStatus::InvalidOwnerTag: return "InvalidOwnerTag";
+    }
+    return "Unknown";
+}
+const char* metricsWriterStatusName(metrics::WriterStatus s) noexcept {
+    switch (s) {
+        case metrics::WriterStatus::Ok:                return "Ok";
+        case metrics::WriterStatus::FreeStackTooSmall: return "FreeStackTooSmall";
+        case metrics::WriterStatus::ReadOnlyFile:      return "ReadOnlyFile";
+        case metrics::WriterStatus::FileInUse:         return "FileInUse";
+    }
+    return "Unknown";
+}
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// BrokerNode::createMetrics_ — arcanum-metrics plan Task 8 (STARTUP thread, before any agent; D54/D55/D59/D61/D62).
+// Creates ${RUNE_METRICS_FILE} (dir 0750, file 0640), allocates every kRuneMetrics row (key = the 4-byte LE node id,
+// label "<prefix> node=<id>"), seeds the initial values and inits the process metrics.  Any failure throws: the node
+// never starts with a metric missing.  Cold path: the label strings and the free stack allocate here, once.
+// ---------------------------------------------------------------------------
+void BrokerNode::createMetrics_() {
+    namespace fs = std::filesystem;
+    metricsPath_ = config_.effectiveMetricsFile();
+    if (const fs::path dir = fs::path{metricsPath_}.parent_path(); !dir.empty()) {
+        std::error_code ec;
+        const bool made = fs::create_directories(dir, ec);
+        if (ec) {
+            throw std::runtime_error("metrics file " + metricsPath_ + ": cannot create its directory: " + ec.message());
+        }
+        if (made) {
+            fs::permissions(dir, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec,
+                            fs::perm_options::replace, ec);   // D54: 0750 (best effort; the file itself is 0640)
+        }
+    }
+
+    const std::int64_t required = metrics::requiredSlots({kNodeMetricCount, 0, 0, 0, 0, 16});   // D55
+    const std::int32_t maxSlots = config_.metricsMaxSlotsOverrideForTest >= 0
+                                      ? config_.metricsMaxSlotsOverrideForTest
+                                      : static_cast<std::int32_t>(required);
+    const std::int64_t startEpochNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::system_clock::now().time_since_epoch()).count();
+    const metrics::CreateParams params{metricsPath_.c_str(), maxSlots, required, static_cast<std::int64_t>(::getpid()),
+                                       startEpochNs, {}};
+    if (const metrics::FileStatus st = metrics::MetricsFile::create(params, metricsFile_); st != metrics::FileStatus::Ok) {
+        const std::string msg = "metrics file " + metricsPath_ + ": " + metricsFileStatusName(st) + " (need " +
+                                std::to_string(required) + " slots, have " + std::to_string(maxSlots) + ")";
+        spdlog::error("BrokerNode[{}]: {}", config_.nodeId, msg);
+        throw std::runtime_error(msg);
+    }
+    metricsFreeStack_.assign(static_cast<std::size_t>(maxSlots), 0);
+    if (const metrics::WriterStatus ws = metrics::MetricsWriter::create(metricsFile_, metricsFreeStack_, metricsWriter_);
+        ws != metrics::WriterStatus::Ok) {
+        const std::string msg = "metrics file " + metricsPath_ + ": writer refused: " + metricsWriterStatusName(ws);
+        spdlog::error("BrokerNode[{}]: {}", config_.nodeId, msg);
+        throw std::runtime_error(msg);
+    }
+
+    std::uint8_t keyBytes[kRoleKeyLength];
+    encodeRoleKey(keyBytes, config_.nodeId);
+    const std::span<const std::byte> key{reinterpret_cast<const std::byte*>(keyBytes), kRoleKeyLength};
+    const std::string nodeSuffix = " node=" + std::to_string(config_.nodeId);
+    for (std::size_t i = 0; i < kRuneMetrics.size(); ++i) {
+        const RuneMetricDef& d = kRuneMetrics[i];
+        const std::string label = std::string{d.labelPrefix} + nodeSuffix;
+        metrics::AllocResult r = metricsWriter_.allocate(static_cast<std::int32_t>(d.id), d.kind, -1, key, label);
+        if (static_cast<std::int32_t>(i) == config_.metricsFailAllocAtForTest) r.status = metrics::AllocStatus::Full;
+        if (r.status != metrics::AllocStatus::Ok) {
+            const std::string msg = std::string{"metrics allocation failed for "} + d.labelPrefix + " (type " +
+                                    std::to_string(static_cast<std::int32_t>(d.id)) + "): " +
+                                    metricsAllocStatusName(r.status);
+            spdlog::error("BrokerNode[{}]: {}", config_.nodeId, msg);
+            throw std::runtime_error(msg);
+        }
+        slots_[i] = r.writer;
+    }
+    // Initial values: the same "unknown / none" sentinels the publishers use until their first real value.
+    slot_(RuneMetric::Term).set(-1);
+    slot_(RuneMetric::OutOfSyncPartitions).set(-1);
+    slot_(RuneMetric::CatalogAppliedOffset).set(-1);
+    slot_(RuneMetric::SecurityAppliedOffset).set(-1);
+    slot_(RuneMetric::Role).set(static_cast<std::int64_t>(RoleCode::None));
+    slot_(RuneMetric::AuthMode).set(config_.authMode == AuthMode::DevDisabled ? 1 : 0);
+
+    systemMetrics_.emplace();
+    const metrics::SystemMetricsParams sp{config_.metricsSystemIntervalMs * 1'000'000LL, "/proc/self"};
+    if (const auto ss = systemMetrics_->init(metricsWriter_, sp, key); ss != metrics::SystemMetrics::Status::Ok) {
+        const std::string msg = "metrics file " + metricsPath_ + ": system metrics init failed (" +
+                                (ss == metrics::SystemMetrics::Status::OpenFailed ? "OpenFailed" : "AllocFailed") + ")";
+        spdlog::error("BrokerNode[{}]: {}", config_.nodeId, msg);
+        systemMetrics_.reset();
+        throw std::runtime_error(msg);
+    }
+    metricsReady_ = true;
+}
+
 // ---------------------------------------------------------------------------
 // BrokerNode::publishCatalogMetrics_ — catalog history Task 7 (CONTROL thread).
-// Resolves the catalog counters once the driver acked them and sets both; a
-// value that arrived before its counter resolved is re-published every control
-// pass until it lands (catalogMetricsPending_()).
+// Sets both catalog rows of the metrics file (allocated at start, so a value always lands on the first store).
 // ---------------------------------------------------------------------------
 void BrokerNode::publishCatalogMetrics_() noexcept {
-    if (!aeron_) return;
-    auto resolve = [this](std::shared_ptr<aeron::Counter>& c, std::int64_t regId) {
-        if (c || regId < 0) return;
-        try { c = aeron_->findCounter(regId); }
-        catch (...) { c.reset(); }
-    };
-    resolve(catalogHaltedCounter_, catalogHaltedCounterRegId_);
-    resolve(catalogAppliedCounter_, catalogAppliedCounterRegId_);
-    if (catalogHaltedCounter_) catalogHaltedCounter_->set(catalogHaltedValue_);
-    if (catalogAppliedCounter_) catalogAppliedCounter_->set(catalogAppliedValue_);
+    if (!metricsReady_) return;
+    slot_(RuneMetric::CatalogApplyHalted).set(catalogHaltedValue_);
+    slot_(RuneMetric::CatalogAppliedOffset).set(catalogAppliedValue_);
 }
 
 // ---------------------------------------------------------------------------
@@ -3443,47 +3493,28 @@ void BrokerNode::failSecurityClosed_(int64_t offset, const std::string& describe
 }
 
 bool BrokerNode::securityMetricsPending_() const noexcept {
-    return (!securityHaltedCounter_ && securityHaltedCounterRegId_ >= 0) ||
-           (!securityAppliedCounter_ && securityAppliedCounterRegId_ >= 0) ||
-           (!authModeCounter_ && authModeCounterRegId_ >= 0) ||
-           (!loginsOkCounter_ && loginsOkCounterRegId_ >= 0) ||
-           (!loginsFailedCounter_ && loginsFailedCounterRegId_ >= 0) ||
-           (!loginsRateLimitedCounter_ && loginsRateLimitedCounterRegId_ >= 0) ||
-           (!sessionsRevokedCounter_ && sessionsRevokedCounterRegId_ >= 0) ||
-           (gateway_ != nullptr && (gateway_->loginsOk() != publishedLoginsOk_ ||
+    return (gateway_ != nullptr && (gateway_->loginsOk() != publishedLoginsOk_ ||
                                     gateway_->loginsFailed() != publishedLoginsFailed_ ||
                                     gateway_->loginsRateLimited() != publishedLoginsRateLimited_ ||
                                     gateway_->sessionsRevoked() != publishedSessionsRevoked_));
 }
 
 void BrokerNode::publishSecurityMetrics_() noexcept {
-    if (!aeron_) return;
-    auto resolve = [this](std::shared_ptr<aeron::Counter>& c, std::int64_t regId) {
-        if (c || regId < 0) return;
-        try { c = aeron_->findCounter(regId); }
-        catch (...) { c.reset(); }
-    };
-    resolve(securityHaltedCounter_, securityHaltedCounterRegId_);
-    resolve(securityAppliedCounter_, securityAppliedCounterRegId_);
-    resolve(authModeCounter_, authModeCounterRegId_);
-    resolve(loginsOkCounter_, loginsOkCounterRegId_);
-    resolve(loginsFailedCounter_, loginsFailedCounterRegId_);
-    resolve(loginsRateLimitedCounter_, loginsRateLimitedCounterRegId_);
-    resolve(sessionsRevokedCounter_, sessionsRevokedCounterRegId_);
+    if (!metricsReady_) return;
     if (gateway_ != nullptr) {   // control thread: the gateway's tallies are its own
         publishedLoginsOk_ = gateway_->loginsOk();
         publishedLoginsFailed_ = gateway_->loginsFailed();
         publishedLoginsRateLimited_ = gateway_->loginsRateLimited();
         publishedSessionsRevoked_ = gateway_->sessionsRevoked();
     }
-    if (loginsOkCounter_) loginsOkCounter_->set(static_cast<std::int64_t>(publishedLoginsOk_));
-    if (loginsFailedCounter_) loginsFailedCounter_->set(static_cast<std::int64_t>(publishedLoginsFailed_));
-    if (loginsRateLimitedCounter_) loginsRateLimitedCounter_->set(static_cast<std::int64_t>(publishedLoginsRateLimited_));
-    if (sessionsRevokedCounter_) sessionsRevokedCounter_->set(static_cast<std::int64_t>(publishedSessionsRevoked_));
-    if (securityHaltedCounter_) securityHaltedCounter_->set(securityHaltedValue_);
-    if (securityAppliedCounter_) securityAppliedCounter_->set(securityAppliedValue_);
+    slot_(RuneMetric::LoginsOk).set(static_cast<std::int64_t>(publishedLoginsOk_));
+    slot_(RuneMetric::LoginsFailed).set(static_cast<std::int64_t>(publishedLoginsFailed_));
+    slot_(RuneMetric::LoginsRateLimited).set(static_cast<std::int64_t>(publishedLoginsRateLimited_));
+    slot_(RuneMetric::SessionsRevoked).set(static_cast<std::int64_t>(publishedSessionsRevoked_));
+    slot_(RuneMetric::SecurityApplyHalted).set(securityHaltedValue_);
+    slot_(RuneMetric::SecurityAppliedOffset).set(securityAppliedValue_);
     // 1'000'228: 0 = enabled (an in-process config publishes 0 too), 1 = dev-disabled.
-    if (authModeCounter_) authModeCounter_->set(config_.authMode == AuthMode::DevDisabled ? 1 : 0);
+    slot_(RuneMetric::AuthMode).set(config_.authMode == AuthMode::DevDisabled ? 1 : 0);
 }
 
 // Authentication Task 9 (spec §9): dev mode (RUNE_AUTH=disabled) is shouted at start and every five minutes by this
@@ -3587,18 +3618,10 @@ int BrokerNode::servicePeerLinks_(int64_t nowNs) {
 }
 
 void BrokerNode::publishPeerLinkMetrics_() noexcept {
-    if (!aeron_ || !peerLinkAgent_) return;
-    auto resolve = [this](std::shared_ptr<aeron::Counter>& c, std::int64_t regId) {
-        if (c || regId < 0) return;
-        try { c = aeron_->findCounter(regId); }
-        catch (...) { c.reset(); }
-    };
-    resolve(peerEstablishedCounter_, peerEstablishedCounterRegId_);
-    resolve(peerRefusalsCounter_, peerRefusalsCounterRegId_);
-    resolve(peerDropsCounter_, peerDropsCounterRegId_);
-    if (peerDropsCounter_) peerDropsCounter_->set(static_cast<std::int64_t>(peerFrameDropsTotal_()));
-    if (peerEstablishedCounter_) peerEstablishedCounter_->set(peerLinkAgent_->establishedPeers());
-    if (peerRefusalsCounter_) peerRefusalsCounter_->set(static_cast<std::int64_t>(peerLinkAgent_->refusals()));
+    if (!metricsReady_ || !peerLinkAgent_) return;
+    slot_(RuneMetric::PeerFrameDrops).set(static_cast<std::int64_t>(peerFrameDropsTotal_()));
+    slot_(RuneMetric::PeerLinksEstablished).set(peerLinkAgent_->establishedPeers());
+    slot_(RuneMetric::PeerLinkRefusals).set(static_cast<std::int64_t>(peerLinkAgent_->refusals()));
 }
 
 uint64_t BrokerNode::peerFrameDropsTotal_() const noexcept {
@@ -3810,23 +3833,20 @@ void BrokerNode::holdSecurityApplyForTest(bool on) {
 }
 
 // ---------------------------------------------------------------------------
-// BrokerNode::publishStorageMetrics_ — ISR v3 §3.10 (CONTROL thread; the publishCatalogMetrics_ pattern): resolves
-// each counter once the driver acked it and sets all four every pass (a plain store each).
+// BrokerNode::publishStorageMetrics_ — ISR v3 §3.10 (CONTROL thread; the publishCatalogMetrics_ pattern): sets all
+// four metrics-file rows every pass (a plain release store each).
 // ---------------------------------------------------------------------------
 int BrokerNode::publishStorageMetrics_() noexcept {
-    if (!aeron_) return 0;
+    if (!metricsReady_) return 0;
     const std::int64_t values[4] = {
         storageGate_ ? storageGate_->stateCode() : 0,
         replBridge_ ? static_cast<std::int64_t>(replBridge_->leaderRolesHeld()) : 0,
         metadataService_ ? static_cast<std::int64_t>(metadataService_->storagePendingCount()) : 0,
         metadataService_ ? static_cast<std::int64_t>(metadataService_->lostCommittedReports()) : 0};
-    for (std::size_t i = 0; i < 4; ++i) {
-        if (!storageCounters_[i] && storageCounterRegIds_[i] >= 0) {
-            try { storageCounters_[i] = aeron_->findCounter(storageCounterRegIds_[i]); }
-            catch (...) { storageCounters_[i].reset(); }
-        }
-        if (storageCounters_[i]) storageCounters_[i]->set(values[i]);
-    }
+    slot_(RuneMetric::StorageGateState).set(values[0]);
+    slot_(RuneMetric::LeaderRolesHeld).set(values[1]);
+    slot_(RuneMetric::StoragePendingNodes).set(values[2]);
+    slot_(RuneMetric::LostCommittedReports).set(values[3]);
     return 0;
 }
 
@@ -4759,27 +4779,11 @@ void BrokerNode::stop() {
     //     teardown.  Reset these here (not in ~BrokerNode) to fix that ordering.
     roleCounter_.reset();
     termCounter_.reset();
-    stuckMarkersCounter_.reset();   // D9: release before aeron_ (the Counter dtor uses the conductor)
-    stuckTxnOffsetsCounter_.reset();
-    stuckTxnOffsetAgeCounter_.reset();
-    outOfSyncCounter_.reset();      // readiness gate (L5): same rule
-    catalogHaltedCounter_.reset();  // catalog history Task 7: same rule
-    unplaceableCounter_.reset();    // Task 11 fix round 1
-    blockedCounter_.reset();        // Task 11 fix round 5 (M5)
-    linkMtuCounter_.reset();        // B-I2: released before aeron_
-    for (auto& c : storageCounters_) c.reset();   // ISR v3 §3.10: the same rule (the Counter dtor uses the conductor)
+    outOfSyncCounter_.reset();      // readiness gate (L5): release before aeron_ (the Counter dtor uses the conductor)
     if (mtuProbeFd_ >= 0) { ::close(mtuProbeFd_); mtuProbeFd_ = -1; }   // re-check I1
-    catalogAppliedCounter_.reset();
-    securityHaltedCounter_.reset();    // authentication Task 9: the same rule (released before aeron_)
-    securityAppliedCounter_.reset();
-    authModeCounter_.reset();
-    peerEstablishedCounter_.reset();   // Authentication Task 15
-    peerRefusalsCounter_.reset();
-    peerDropsCounter_.reset();
-    loginsOkCounter_.reset();
-    loginsFailedCounter_.reset();
-    loginsRateLimitedCounter_.reset();
-    sessionsRevokedCounter_.reset();
+    // arcanum-metrics Task 8: the metrics file stays mapped (and its values readable) until the node is destroyed;
+    // the system metrics close their /proc fds here.
+    systemMetrics_.reset();
     for (auto& c : provCounters_) c.reset();   // re-review N4: same rule (the provisioner is stopped)
 
     // 4. Close the Aeron client (joins the C++ conductor thread).
@@ -4966,6 +4970,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     work += reportUnbuildableReplicas_();
     work += checkLinkMtu_(nowNs, /*force=*/false);   // re-check I1: the runtime's clock, no per-pass clock read
     work += publishStorageMetrics_();                // ISR v3 §3.10
+    if (systemMetrics_) work += systemMetrics_->doWork(nowNs);   // arcanum-metrics D62: process metrics, own interval
     if (consensusUnmarked_ && nowNs - lastConsensusMarkCheckNs_ >= 1'000'000'000LL) {   // ISR v3 Step 6 (cold: until marked)
         lastConsensusMarkCheckNs_ = nowNs;
         markConsensusWhenPresent_();
@@ -5091,7 +5096,6 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                               tid, n, adminToControlRejects_);
             }
         }, 16);
-    if (catalogMetricsPending_()) [[unlikely]] publishCatalogMetrics_();   // a counter resolved late
     if (securityMetricsPending_()) [[unlikely]] publishSecurityMetrics_();
     // Control (runtime) thread = the single producer of every worker ring.
     if (workerPool_) work += schemaFanout_.pump(*workerPool_);
@@ -5407,10 +5411,7 @@ int BrokerNode::checkLinkMtu_(int64_t nowNs, bool force) {
                      config_.nodeId, m, config_.aeronMtuBytes);
     }
     linkMtuDeficit_ = chk.below ? chk.needed - m : 0;
-    if (!linkMtuCounter_ && linkMtuCounterRegId_ >= 0 && aeron_) {
-        try { linkMtuCounter_ = aeron_->findCounter(linkMtuCounterRegId_); } catch (...) { linkMtuCounter_.reset(); }
-    }
-    if (linkMtuCounter_) linkMtuCounter_->set(linkMtuDeficit_);
+    if (metricsReady_) slot_(RuneMetric::LinkMtuDeficit).set(linkMtuDeficit_);
     return 1;
 }
 
@@ -5554,22 +5555,16 @@ int BrokerNode::publishPlacementView_() {
     // The gauge (no allocation; set on change).
     const auto unplaceable = static_cast<std::int64_t>(metadataService_->unplaceableTopicCount());
     if (unplaceable != unplaceablePublished_) {
-        if (!unplaceableCounter_ && unplaceableCounterRegId_ >= 0 && aeron_) {
-            try { unplaceableCounter_ = aeron_->findCounter(unplaceableCounterRegId_); } catch (...) { unplaceableCounter_.reset(); }
-        }
-        if (unplaceableCounter_) {
-            unplaceableCounter_->set(unplaceable);
+        if (metricsReady_) {
+            slot_(RuneMetric::CatalogUnplaceableTopics).set(unplaceable);
             unplaceablePublished_ = unplaceable;
         }
     }
     // Review M5 (round 5): BLOCKED partitions on their own gauge.
     const auto blockedN = static_cast<std::int64_t>(metadataService_->blockedPartitionCount());
     if (blockedN != blockedPublished_) {
-        if (!blockedCounter_ && blockedCounterRegId_ >= 0 && aeron_) {
-            try { blockedCounter_ = aeron_->findCounter(blockedCounterRegId_); } catch (...) { blockedCounter_.reset(); }
-        }
-        if (blockedCounter_) {
-            blockedCounter_->set(blockedN);
+        if (metricsReady_) {
+            slot_(RuneMetric::CatalogBlockedPartitions).set(blockedN);
             blockedPublished_ = blockedN;
         }
     }

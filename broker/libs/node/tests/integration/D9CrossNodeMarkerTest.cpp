@@ -40,6 +40,7 @@
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/BrokerNode.h>
 #include "support/TestCluster.h"
+#include "MetricsTestReader.h"
 #include <rune/node/NodeConfig.h>
 #include <rune/node/RoleCounter.h>
 #include <CncFileReader.h>
@@ -1791,15 +1792,9 @@ TEST(D9BrokerNodeWiringRegression, MarkerForARemotelyLedPartitionLandsThroughThe
     EXPECT_EQ(C.onControlThreadForTest([&] { return C.gatewayForTest()->remoteMarkersLandedForTest(); }), 1u)
         << "re-review LOW-1: the answer must be a LANDED outcome, not a refusal";
 
-    // MEDIUM-3: the stuck-markers gauge counter is registered in the CnC.
-    bool counter = false;
-    {
-        aeron::CncFileReader reader = aeron::CncFileReader::mapExisting(C.driverForTest()->dir().c_str());
-        aeron::concurrent::CountersReader counters = reader.countersReader();
-        counters.forEach([&](std::int32_t, std::int32_t typeId, const aeron::concurrent::AtomicBuffer&,
-                             const std::string&) { counter = counter || typeId == kStuckMarkersCounterTypeId; });
-    }
-    EXPECT_TRUE(counter) << "the stuck-markers counter is not in the CnC";
+    // MEDIUM-3: the stuck-markers gauge is allocated in the node's metrics file (arcanum-metrics plan Task 8).
+    EXPECT_TRUE(rune::node::test::readRuneMetric(C, RuneMetric::StuckMarkers).has_value())
+        << "the stuck-markers metric is not in the metrics file";
     for (auto& n : nodes) n->stop();
 }
 

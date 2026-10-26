@@ -793,6 +793,11 @@ ConfigResult parseNodeConfig(
     // RUNE_AERON_DIR (optional): Aeron dir override (empty → dataDir/aeron).
     if (const char* ad = getenv_fn("RUNE_AERON_DIR")) cfg.aeronDir = ad;
     if (auto err = cfg.validateAeronDir()) return {{}, *err};
+    // RUNE_METRICS_FILE (optional, D54) and RUNE_METRICS_SYSTEM_INTERVAL_MS (optional, D62, positive ms).
+    if (const char* mf = getenv_fn("RUNE_METRICS_FILE")) cfg.metricsFile = mf;
+    if (auto err = parseOptionalInt64Ms(getenv_fn, "RUNE_METRICS_SYSTEM_INTERVAL_MS", cfg.metricsSystemIntervalMs);
+        !err.empty())
+        return {{}, err};
 
     // E5.1: resolve workerIngressBaseStreamId — default to clientStreamId+1 when unset.
     cfg.workerIngressBaseStreamId = (workerIngressBaseStreamId == 0)

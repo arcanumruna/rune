@@ -85,6 +85,10 @@
 #include <rune/node/ViewSnapshotIoAgent.h>
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/node/LeaderObserver.h>
+#include <rune/node/RuneMetrics.h>
+#include <metrics/MetricsFile.h>
+#include <metrics/MetricsWriter.h>
+#include <metrics/SystemMetrics.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
@@ -1465,6 +1469,9 @@ public:
     /// of scraping logs.
     void publishRole() noexcept;
 
+    /// The metrics file this node publishes every RuneMetric in (D54); empty before start().  Immutable after start().
+    [[nodiscard]] const std::string& metricsFilePath() const noexcept { return metricsPath_; }
+
     /// Return the leader's client Aeron channel for data-op redirect (GB-4).
     /// Observer thread (see above): ring-drained snapshot + immutable peer config.
     /// - If this node IS the leader → returns empty string (no self-redirect).
@@ -2560,21 +2567,6 @@ private:
     uint64_t                                              securityAnswersHeld_    = 0;
     uint64_t                                              securityAnswersDropped_ = 0;
     uint64_t                                              securityAlterIsrRefused_ = 0;
-    std::int64_t                     securityHaltedCounterRegId_  = -1;
-    std::int64_t                     securityAppliedCounterRegId_ = -1;
-    std::int64_t                     authModeCounterRegId_        = -1;
-    std::shared_ptr<aeron::Counter>  securityHaltedCounter_;
-    std::shared_ptr<aeron::Counter>  securityAppliedCounter_;
-    std::shared_ptr<aeron::Counter>  authModeCounter_;
-    // Authentication Task 11: 1'000'229 logins ok, 230 failed, 231 rate-limited (the gateway's control-thread tallies).
-    std::int64_t                     loginsOkCounterRegId_          = -1;
-    std::int64_t                     loginsFailedCounterRegId_      = -1;
-    std::int64_t                     loginsRateLimitedCounterRegId_ = -1;
-    std::shared_ptr<aeron::Counter>  loginsOkCounter_;
-    std::shared_ptr<aeron::Counter>  loginsFailedCounter_;
-    std::shared_ptr<aeron::Counter>  loginsRateLimitedCounter_;
-    std::int64_t                     sessionsRevokedCounterRegId_ = -1;   // Task 14: 1'000'232
-    std::shared_ptr<aeron::Counter>  sessionsRevokedCounter_;
     std::uint64_t                    publishedSessionsRevoked_ = 0;
     std::uint64_t                    publishedLoginsOk_ = 0, publishedLoginsFailed_ = 0, publishedLoginsRateLimited_ = 0;
     std::int64_t                     securityHaltedValue_  = 0;    // control-thread-owned (0 = applying)
@@ -2595,12 +2587,6 @@ private:
     static void onWorkerPeerFrameDropsThunk_(void* self, int32_t worker, uint64_t drops);
     std::vector<uint64_t>            workerPeerDrops_;             // control thread: the workers' last reports
     uint64_t                         adminPeerDrops_ = 0;          // control thread: the admin plane's last report
-    std::int64_t                     peerDropsCounterRegId_ = -1;
-    std::shared_ptr<aeron::Counter>  peerDropsCounter_;
-    std::int64_t                     peerEstablishedCounterRegId_ = -1;
-    std::int64_t                     peerRefusalsCounterRegId_    = -1;
-    std::shared_ptr<aeron::Counter>  peerEstablishedCounter_;
-    std::shared_ptr<aeron::Counter>  peerRefusalsCounter_;
     // Catalog history Task 16 — the boot from __catalog (startup thread; immutable after start()).
     /// Opens/replays the local __catalog on the startup thread and fills the members below.
     void bootFromCatalog_();
@@ -2665,11 +2651,7 @@ private:
     int64_t          haltedSinceNs_ = -1;
     PlacementViewMsg placementPosted_{};
     bool             placementPostedOnce_ = false;
-    std::int64_t     unplaceableCounterRegId_ = -1;
-    std::shared_ptr<aeron::Counter> unplaceableCounter_;
     std::int64_t     unplaceablePublished_ = -1;
-    std::int64_t     blockedCounterRegId_  = -1;   // Task 11 fix round 5 (M5)
-    std::shared_ptr<aeron::Counter> blockedCounter_;
     // DR-bugs fix round 1 (review B-I2): link-MTU watchdog — CONTROL thread only.  The probe host is resolved
     // once at start (empty = every endpoint loopback: the watchdog is off); every kMtuProbePeriodNs the
     // interface MTU of its route is compared with the Aeron MTU; an ERROR on the below edge, a WARN on the
@@ -2687,11 +2669,6 @@ private:
     int32_t          linkMtuDeficit_       = 0;
     uint64_t         mtuBelowEdges_        = 0;
     uint64_t         mtuRestoredEdges_     = 0;
-    std::int64_t     linkMtuCounterRegId_  = -1;
-    std::shared_ptr<aeron::Counter> linkMtuCounter_;
-    // ISR v3 §3.10: the storage counters (registered with the others, published by publishStorageMetrics_).
-    std::array<std::int64_t, 4>                    storageCounterRegIds_{-1, -1, -1, -1};
-    std::array<std::shared_ptr<aeron::Counter>, 4> storageCounters_{};
     std::function<int32_t()> mtuProbeForTest_;   ///< cold test seam (setMtuProbeForTest)
     std::function<void(HostNetFacts&)> hostFactsOverrideForTest_;   ///< cold test seam (B-M5)
     bool holdTransientLineageForTest_ = false;   ///< control thread only (holdTransientLineageForTest)
@@ -2924,35 +2901,32 @@ private:
     std::shared_ptr<aeron::Counter>  termCounter_;
     std::int64_t                     outOfSyncCounterRegId_ = -1;   ///< readiness gate (L5)
     std::shared_ptr<aeron::Counter>  outOfSyncCounter_;
-    // Catalog history Task 7: the CatalogApplier's metrics (RoleCounter.h).
-    // Resolved and set on the CONTROL thread only, from the admin→control drain
-    // (kA2cCatalogHalted / kA2cCatalogApplied); released in stop() before aeron_.
-    std::int64_t                     catalogHaltedCounterRegId_  = -1;
-    std::int64_t                     catalogAppliedCounterRegId_ = -1;
-    std::shared_ptr<aeron::Counter>  catalogHaltedCounter_;
-    std::shared_ptr<aeron::Counter>  catalogAppliedCounter_;
+    // Catalog history Task 7: the CatalogApplier's metrics, set on the CONTROL thread only from the admin→control
+    // drain (kA2cCatalogHalted / kA2cCatalogApplied) into the metrics file.
     std::int64_t                     catalogHaltedValue_  = 0;    // control-thread-owned (0 = applying)
     std::int64_t                     catalogAppliedValue_ = -1;   // control-thread-owned
     void publishCatalogMetrics_() noexcept;
-    /// A value arrived (applied >= 0 or halted) while a registered counter is
-    /// still unresolved — derived from the values and the counter pointers, no
-    /// stored flag (fix round 1, M4).
-    [[nodiscard]] bool catalogMetricsPending_() const noexcept {
-        const bool hasValue = catalogAppliedValue_ >= 0 || catalogHaltedValue_ != 0;
-        return hasValue && ((!catalogHaltedCounter_ && catalogHaltedCounterRegId_ >= 0) ||
-                            (!catalogAppliedCounter_ && catalogAppliedCounterRegId_ >= 0));
-    }
-    // D9 review MEDIUM-3: the TCS stuck-markers gauge counter.  Resolved and
-    // set on the CONTROL (runtime) thread only, from the TCS sink below.
-    std::int64_t                     stuckMarkersCounterRegId_ = -1;
-    std::shared_ptr<aeron::Counter>  stuckMarkersCounter_;
+    // D9 review MEDIUM-3 / #359: the TCS sinks (control thread) - stuck markers, stuck txn offset commits + oldest age.
     static bool publishStuckMarkers_(void* self, std::int64_t value);
-    // #359: stuck transactional offset commits (count, oldest age ms).
-    std::int64_t                     stuckTxnOffsetsCounterRegId_ = -1;
-    std::int64_t                     stuckTxnOffsetAgeCounterRegId_ = -1;
-    std::shared_ptr<aeron::Counter>  stuckTxnOffsetsCounter_;
-    std::shared_ptr<aeron::Counter>  stuckTxnOffsetAgeCounter_;
     static bool publishStuckTxnOffsets_(void* self, std::int64_t stuck, std::int64_t oldestAgeMs);
+
+    // -----------------------------------------------------------------------
+    // arcanum-metrics (plan Task 8): the node's metrics file.  start() creates it, allocates EVERY kRuneMetrics row
+    // (slots_[row]) and inits systemMetrics_ before any agent starts (D59); a failure throws out of start().  Each
+    // slot has ONE writer thread (RuneMetricDef::owner); the control rows are written by the control thread only.
+    // metricsFile_ owns the mapping (unmapped at destruction, after every agent joined).
+    // -----------------------------------------------------------------------
+    metrics::MetricsFile                                  metricsFile_;
+    metrics::MetricsWriter                                metricsWriter_;
+    std::vector<int32_t>                                  metricsFreeStack_;   // sized maxSlots once at start (cold)
+    std::array<metrics::SlotWriter, kNodeMetricCount>     slots_{};
+    std::optional<metrics::SystemMetrics>                 systemMetrics_;      // control thread (D62)
+    bool                                                  metricsReady_ = false;   // set by start(), before agents
+    std::string                                           metricsPath_;
+    void createMetrics_();   // startup thread: steps 1-4 of the plan's start order
+    [[nodiscard]] metrics::SlotWriter& slot_(RuneMetric m) noexcept {
+        return slots_[static_cast<std::size_t>(runeMetricRow(m))];
+    }
 
     // -----------------------------------------------------------------------
     // State flags — CONTROLLER-owned (F9a: no atomics).  Written only by the

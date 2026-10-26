@@ -31,6 +31,8 @@
 #ifndef RUNE_NODE_ROLE_COUNTER_H
 #define RUNE_NODE_ROLE_COUNTER_H
 
+#include <rune/node/RuneMetrics.h>   // RoleCode, kRoleKeyLength, encode/decodeRoleKey (moved there)
+
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -44,52 +46,7 @@ namespace rune::node {
 inline constexpr std::int32_t kRoleCounterTypeId = 1'000'201;
 inline constexpr std::int32_t kTermCounterTypeId = 1'000'203;
 
-// Role codes — mirror Aeron Cluster's Cluster.Role exactly, with an extra
-// NONE sentinel for "this node observes no leader yet" (pre-election / gap).
-enum class RoleCode : std::int64_t {
-    None      = -1,  // no leader observed (election in progress / not ready)
-    Follower  = 0,   // == Aeron Cluster.Role.FOLLOWER
-    Candidate = 1,   // == Aeron Cluster.Role.CANDIDATE
-    Leader    = 2,   // == Aeron Cluster.Role.LEADER
-};
-
-// Fixed key-buffer size (bytes): just the 4-byte LE nodeId.
-inline constexpr std::size_t kRoleKeyLength = 4;
-
-inline const char* roleCodeName(RoleCode r) noexcept {
-    switch (r) {
-        case RoleCode::Leader:    return "LEADER";
-        case RoleCode::Follower:  return "FOLLOWER";
-        case RoleCode::Candidate: return "CANDIDATE";
-        case RoleCode::None:      return "NONE";
-    }
-    return "NONE";
-}
-
-// Map a RoleCode int64 (as read from the counter value) to its enum, defaulting
-// unknown values to None.
-inline RoleCode roleCodeFromValue(std::int64_t v) noexcept {
-    switch (v) {
-        case 0:  return RoleCode::Follower;
-        case 1:  return RoleCode::Candidate;
-        case 2:  return RoleCode::Leader;
-        default: return RoleCode::None;
-    }
-}
-
-// Encode nodeId into the fixed LE key buffer.
-// `out` must have room for kRoleKeyLength bytes.
-inline void encodeRoleKey(std::uint8_t* out, std::int32_t nodeId) noexcept {
-    std::memcpy(out, &nodeId, sizeof(std::int32_t));
-}
-
-// Decode a key buffer back into nodeId.  Returns false if `len` is too small.
-inline bool decodeRoleKey(const std::uint8_t* buf, std::size_t len,
-                          std::int32_t& nodeId) noexcept {
-    if (buf == nullptr || len < kRoleKeyLength) return false;
-    std::memcpy(&nodeId, buf, sizeof(std::int32_t));
-    return true;
-}
+// RoleCode, kRoleKeyLength, roleCodeName, roleCodeFromValue, encodeRoleKey and decodeRoleKey live in RuneMetrics.h.
 
 // MSM commit-position counter type id (mirrors Aeron Cluster's commit-position
 // counter, id 204).  Published by the metadata state machine on the leader node
@@ -223,6 +180,21 @@ inline std::string outOfSyncLabel(std::int32_t nodeId) {
 inline std::string msmCommitPosLabel(std::int32_t nodeId) {
     return "rune-msm-commit-position node=" + std::to_string(nodeId);
 }
+
+// Every Rune counter type id equals its RuneMetric enumerator (D61): tools that match (typeId, key) keep matching.
+static_assert(kRoleCounterTypeId == static_cast<std::int32_t>(RuneMetric::Role));
+static_assert(kTermCounterTypeId == static_cast<std::int32_t>(RuneMetric::Term));
+static_assert(kStuckMarkersCounterTypeId == static_cast<std::int32_t>(RuneMetric::StuckMarkers));
+static_assert(kOutOfSyncCounterTypeId == static_cast<std::int32_t>(RuneMetric::OutOfSyncPartitions));
+static_assert(kProvisionBuildFailuresCounterTypeId == static_cast<std::int32_t>(RuneMetric::ProvisionBuildFailures));
+static_assert(kProvisionReadMapFailuresCounterTypeId == static_cast<std::int32_t>(RuneMetric::ProvisionReadMapFailures));
+static_assert(kCatalogApplyHaltedCounterTypeId == static_cast<std::int32_t>(RuneMetric::CatalogApplyHalted));
+static_assert(kLinkMtuDeficitCounterTypeId == static_cast<std::int32_t>(RuneMetric::LinkMtuDeficit));
+static_assert(kLostCommittedReportsCounterTypeId == static_cast<std::int32_t>(RuneMetric::LostCommittedReports));
+static_assert(kAuthModeCounterTypeId == static_cast<std::int32_t>(RuneMetric::AuthMode));
+static_assert(kPeerFrameDropsCounterTypeId == static_cast<std::int32_t>(RuneMetric::PeerFrameDrops));
+static_assert(kStuckTxnOffsetAgeMsCounterTypeId == static_cast<std::int32_t>(RuneMetric::StuckTxnOffsetAgeMs));
+static_assert(runeMetricRow(kMsmCommitPosTypeId) == -1, "204 is never published, so it has no metrics row");
 
 } // namespace rune::node
 

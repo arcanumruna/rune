@@ -236,6 +236,19 @@ struct NodeConfig {
         return aeronDir.empty() ? (std::filesystem::path{dataDir} / "aeron").string()
                                 : aeronDir;
     }
+    // arcanum-metrics D54: the node's metrics file - RUNE_METRICS_FILE.  Empty → dataDir/metrics/rune-metrics.dat
+    // (the metrics/ dir is created 0750, the file 0640).  Every RuneMetric row is allocated in it at start.
+    std::string         metricsFile;
+    [[nodiscard]] std::string effectiveMetricsFile() const {
+        return metricsFile.empty() ? (std::filesystem::path{dataDir} / "metrics" / "rune-metrics.dat").string()
+                                   : metricsFile;
+    }
+    // D62: SystemMetrics sampling interval (RUNE_METRICS_SYSTEM_INTERVAL_MS, > 0), sampled on the control agent.
+    int64_t             metricsSystemIntervalMs = 1000;
+    // TEST-ONLY seams for the start-refusal tests (never parsed from env): a maxSlots below the required count
+    // (-1 = exactly requiredSlots), and the kRuneMetrics row whose allocation is treated as Full (-1 = none).
+    int32_t             metricsMaxSlotsOverrideForTest = -1;
+    int32_t             metricsFailAllocAtForTest      = -1;
     int32_t             consensusStreamId    = 0;
     int32_t             replicationStreamId  = 20;  // GR-3: stream for per-partition replication
 

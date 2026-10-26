@@ -18,6 +18,7 @@
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/RoleCounter.h>
+#include "MetricsTestReader.h"
 #include "support/TestWorkerCount.h"
 #include "support/CatalogBrokerCluster.h"
 
@@ -194,38 +195,34 @@ TEST(RoleCounterPublishTest, BothCountersPresentWithNodeKey) {
 // kCatalogApplyHaltedCounterTypeId = halted offset + 1, 0 while applying).
 // ===========================================================================
 namespace {
-bool readCatalogCounters(const fs::path& aeronDir, std::int64_t& applied, std::int64_t& halted) {
-    aeron::CncFileReader reader = aeron::CncFileReader::mapExisting(aeronDir.string().c_str());
-    aeron::concurrent::CountersReader counters = reader.countersReader();
-    bool a = false, h = false;
-    counters.forEach([&](std::int32_t id, std::int32_t typeId, const aeron::concurrent::AtomicBuffer&,
-                         const std::string&) {
-        if (typeId == kCatalogAppliedOffsetCounterTypeId) { applied = counters.getCounterValue(id); a = true; }
-        if (typeId == kCatalogApplyHaltedCounterTypeId) { halted = counters.getCounterValue(id); h = true; }
-    });
-    return a && h;
+// arcanum-metrics plan Task 8: the catalog metrics live in the node's metrics file (cnc.dat no longer has them).
+bool readCatalogCounters(const BrokerNode& node, std::int64_t& applied, std::int64_t& halted) {
+    const auto a = rune::node::test::readRuneMetric(node, RuneMetric::CatalogAppliedOffset);
+    const auto h = rune::node::test::readRuneMetric(node, RuneMetric::CatalogApplyHalted);
+    if (a) applied = *a;
+    if (h) halted = *h;
+    return a.has_value() && h.has_value();
 }
 } // namespace
 
-TEST(RoleCounterPublishTest, CatalogApplyMetricsReadableFromCncRegression) {
+TEST(RoleCounterPublishTest, CatalogApplyMetricsReadableFromMetricsFileRegression) {
     TempDir tmp{"catalog_"};
     NodeConfig cfg = makeSingleNodeConfig(tmp.path);
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(3s));
-    const fs::path aeronDir = tmp.path / "aeron";
 
     std::int64_t applied = -2, halted = -2;
     auto await = [&](std::int64_t wantApplied, std::int64_t wantHalted) {
         const auto deadline = std::chrono::steady_clock::now() + 5s;
         while (std::chrono::steady_clock::now() < deadline) {
-            if (readCatalogCounters(aeronDir, applied, halted) && applied == wantApplied && halted == wantHalted)
+            if (readCatalogCounters(node, applied, halted) && applied == wantApplied && halted == wantHalted)
                 return true;
             std::this_thread::sleep_for(20ms);
         }
         return false;
     };
-    ASSERT_TRUE(readCatalogCounters(aeronDir, applied, halted) || await(0, 0)) << "catalog counters registered";
+    ASSERT_TRUE(readCatalogCounters(node, applied, halted) || await(0, 0)) << "catalog counters registered";
 
     AdminWorkerAgent* agent = node.adminWorkerAgentForTest();
     ASSERT_NE(agent, nullptr);
@@ -255,19 +252,17 @@ TEST(RoleCounterPublishTest, CatalogApplyMetricsReadableFromCncRegression) {
 // RED: no publish (the counter never leaves its initial value).
 // ===========================================================================
 namespace {
-// The first counter of `typeId` in the CnC file at `aeronDir`; false when absent.
-bool readCounterByType(const fs::path& aeronDir, std::int32_t typeId, std::int64_t& value) {
-    try {
-        aeron::CncFileReader reader = aeron::CncFileReader::mapExisting(aeronDir.string().c_str());
-        aeron::concurrent::CountersReader counters = reader.countersReader();
-        bool found = false;
-        counters.forEach([&](std::int32_t id, std::int32_t t, const aeron::concurrent::AtomicBuffer&, const std::string&) {
-            if (t == typeId && !found) { value = counters.getCounterValue(id); found = true; }
-        });
-        return found;
-    } catch (...) {
-        return false;
-    }
+// arcanum-metrics plan Task 8: a node's metrics file (default ${dataDir}/metrics/rune-metrics.dat) and its node id.
+struct NodeMetrics {
+    fs::path dataDir;
+    std::int32_t nodeId;
+};
+// The value of `typeId` for this node in its metrics file; false when the file or the metric is absent.
+bool readCounterByType(const NodeMetrics& m, std::int32_t typeId, std::int64_t& value) {
+    const auto v = rune::node::test::readRuneMetricAt((m.dataDir / "metrics" / "rune-metrics.dat").string(), typeId,
+                                                      m.nodeId);
+    if (v) value = *v;
+    return v.has_value();
 }
 }  // namespace
 
@@ -281,12 +276,12 @@ TEST(RoleCounterRegression, StorageGateCountersArePublishedRegression) {
     // The joiner emits no follower fetch for a while, so its UNCONFIRMED state lasts long enough to be observed.
     c.configTweak = [&](NodeConfig& k) { if (k.nodeId == X) k.testHoldFollowerFetchesMs = 2000; };
     c.startNode(X);
-    const fs::path aeronDir = c.dirs[static_cast<std::size_t>(X - 1)]->path / "aeron";
+    const NodeMetrics joiner{c.dirs[static_cast<std::size_t>(X - 1)]->path, X};
     bool sawOne = false, sawZeroAfter = false;
     const auto deadline = std::chrono::steady_clock::now() + 30s;
     while (!sawZeroAfter && std::chrono::steady_clock::now() < deadline) {
         std::int64_t v = -1;
-        if (readCounterByType(aeronDir, kStorageGateStateCounterTypeId, v)) {
+        if (readCounterByType(joiner, kStorageGateStateCounterTypeId, v)) {
             if (v == 1) sawOne = true;
             if (v == 0 && sawOne) sawZeroAfter = true;
         }
@@ -320,11 +315,11 @@ struct WarnCapture {   // RAII: never leaks the capture logger into later tests
     WarnCapture& operator=(const WarnCapture&) = delete;
 };
 
-bool awaitCounter(const fs::path& aeronDir, std::int32_t typeId, std::int64_t want, std::chrono::milliseconds within) {
+bool awaitCounter(const NodeMetrics& m, std::int32_t typeId, std::int64_t want, std::chrono::milliseconds within) {
     const auto deadline = std::chrono::steady_clock::now() + within;
     while (std::chrono::steady_clock::now() < deadline) {
         std::int64_t v = -999;
-        if (readCounterByType(aeronDir, typeId, v) && v == want) return true;
+        if (readCounterByType(m, typeId, v) && v == want) return true;
         std::this_thread::sleep_for(20ms);
     }
     return false;
@@ -341,8 +336,8 @@ TEST(NodeConfigRegression, DevModeSingleNodeStartsAndWarns) {
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(5s));
-    const fs::path aeronDir = tmp.path / "aeron";
-    EXPECT_TRUE(awaitCounter(aeronDir, kAuthModeCounterTypeId, 1, 10s)) << "counter 1'000'228 = 1 in dev mode";
+    const NodeMetrics nm{tmp.path, cfg.nodeId};
+    EXPECT_TRUE(awaitCounter(nm, kAuthModeCounterTypeId, 1, 10s)) << "counter 1'000'228 = 1 in dev mode";
     EXPECT_GE(log.count("AUTHENTICATION DISABLED (RUNE_AUTH=disabled)"), 1) << "the dev-mode warning at start";
     EXPECT_GE(log.count("every request runs as 'anonymous' with full access"), 1);
     node.stop();
@@ -438,7 +433,7 @@ TEST(NodeConfigRegression, EnabledModeNeedsAUsableClusterKeyFileAtStartRegressio
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(5s));
-    EXPECT_TRUE(awaitCounter(tmp2.path / "aeron", kAuthModeCounterTypeId, 0, 10s)) << "counter 1'000'228 = 0 when enabled";
+    EXPECT_TRUE(awaitCounter(NodeMetrics{tmp2.path, cfg.nodeId}, kAuthModeCounterTypeId, 0, 10s)) << "counter 1'000'228 = 0 when enabled";
     node.stop();
     std::error_code ec; fs::remove(good, ec); fs::remove(bad, ec);
 }
@@ -460,7 +455,7 @@ TEST(RoleCounterRegression, PeerLinkCountersArePublishedRegression) {
         k.clientTransport = ClientTransport::PlaintextForTest;   // issue #10: plaintext client sessions, test only
         k.clusterKeyFile = ((k.nodeId == 3) ? keyDir / "x.key" : keyDir / "k.key").string();
     });
-    auto aeronDir = [&](int id) { return c.dirs[static_cast<std::size_t>(id - 1)]->path / "aeron"; };
+    auto aeronDir = [&](int id) { return NodeMetrics{c.dirs[static_cast<std::size_t>(id - 1)]->path, id}; };
     EXPECT_TRUE(awaitCounter(aeronDir(1), kPeerLinksEstablishedCounterTypeId, 1, 20s)) << "node 1 links with node 2 only";
     EXPECT_TRUE(awaitCounter(aeronDir(2), kPeerLinksEstablishedCounterTypeId, 1, 20s));
     EXPECT_TRUE(awaitCounter(aeronDir(3), kPeerLinksEstablishedCounterTypeId, 0, 20s));
@@ -502,15 +497,15 @@ TEST(RoleCounterRegression, PeerLinkCountersArePublishedRegression) {
 
 // The `__security` counters: applied offset follows the mirrored events; a record the rules refuse raises the halt
 // counter to (offset + 1) - the operator alert of D28.
-TEST(RoleCounterTest, SecurityApplyMetricsReadableFromCncRegression) {
+TEST(RoleCounterTest, SecurityApplyMetricsReadableFromMetricsFileRegression) {
     TempDir tmp{"secmetrics_"};
     NodeConfig cfg = makeSingleNodeConfig(tmp.path);
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(5s));
-    const fs::path aeronDir = tmp.path / "aeron";
-    ASSERT_TRUE(awaitCounter(aeronDir, kSecurityAppliedOffsetCounterTypeId, -1, 10s)) << "registered, nothing applied";
-    ASSERT_TRUE(awaitCounter(aeronDir, kSecurityApplyHaltedCounterTypeId, 0, 10s));
+    const NodeMetrics nm{tmp.path, cfg.nodeId};
+    ASSERT_TRUE(awaitCounter(nm, kSecurityAppliedOffsetCounterTypeId, -1, 10s)) << "registered, nothing applied";
+    ASSERT_TRUE(awaitCounter(nm, kSecurityApplyHaltedCounterTypeId, 0, 10s));
 
     auto events = rune::security::testing::goldenScriptV1();
     events[2].fingerprint ^= 1;
@@ -526,10 +521,10 @@ TEST(RoleCounterTest, SecurityApplyMetricsReadableFromCncRegression) {
     };
     ASSERT_EQ(append(0), 0);
     ASSERT_EQ(append(1), 1);
-    EXPECT_TRUE(awaitCounter(aeronDir, kSecurityAppliedOffsetCounterTypeId, 1, 10s));
-    EXPECT_TRUE(awaitCounter(aeronDir, kSecurityApplyHaltedCounterTypeId, 0, 1s));
+    EXPECT_TRUE(awaitCounter(nm, kSecurityAppliedOffsetCounterTypeId, 1, 10s));
+    EXPECT_TRUE(awaitCounter(nm, kSecurityApplyHaltedCounterTypeId, 0, 1s));
     ASSERT_EQ(append(2), 2);   // tampered
-    EXPECT_TRUE(awaitCounter(aeronDir, kSecurityApplyHaltedCounterTypeId, 3, 10s)) << "halted offset 2 -> counter 3";
-    EXPECT_TRUE(awaitCounter(aeronDir, kSecurityAppliedOffsetCounterTypeId, 1, 1s)) << "applied stays at the last good event";
+    EXPECT_TRUE(awaitCounter(nm, kSecurityApplyHaltedCounterTypeId, 3, 10s)) << "halted offset 2 -> counter 3";
+    EXPECT_TRUE(awaitCounter(nm, kSecurityAppliedOffsetCounterTypeId, 1, 1s)) << "applied stays at the last good event";
     node.stop();
 }
