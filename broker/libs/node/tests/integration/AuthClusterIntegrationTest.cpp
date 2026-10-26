@@ -778,22 +778,23 @@ TEST(AuthClusterRegression, HaltedBrokerRefetchesSecurityAfterItsDirIsMovedAside
     });
     t.createUser(1, "bob");   // replicated everywhere; node 3's applier fails its fingerprint check and halts
     ASSERT_TRUE(AuthTrio::until(30s, [&] { return n3.securityViewForTest().halted; })) << "node 3 must halt";
-    // Fails closed: alice's LIVE session on node 3 is revoked (the session-level SessionRevoked frame) and gone.
+    // Fails closed (docs SECURITY.md#halted): alice's LIVE session on node 3 is ended with the session-level
+    // AuthUnavailable (48, retriable: the client reconnects to a healthy broker) and gone.
     {
         auto& c = before.w->raw();
         bool revoked = false;
         c.pollFor(15s, [&] {
-            for (const auto& e : c.errors()) if (e.sessionId == before.sid && e.code == 46) { revoked = true; return true; }
+            for (const auto& e : c.errors()) if (e.sessionId == before.sid && e.code == 48) { revoked = true; return true; }
             return false;
         });
-        EXPECT_TRUE(revoked) << "alice's session on the halted broker must be revoked (46)";
+        EXPECT_TRUE(revoked) << "alice's session on the halted broker must be ended (48)";
         EXPECT_FALSE(n3.gatewayHasSessionForTest(before.sid)) << "and removed from the gateway";
     }
-    // alice's session on node 3 is revoked, new logins there are refused (44), the other brokers serve.
+    // New logins on node 3 are refused with AuthUnavailable (48, retriable), the other brokers serve.
     AuthWireClient& w = t.newWire(3);
     const int64_t sid = w.connect(t.channel(3));
     ASSERT_GT(sid, 0);
-    EXPECT_EQ(w.login(t.channel(3), sid, "alice", {AuthTrio::kPw, AuthTrio::kPw}).errorCode(), 44);
+    EXPECT_EQ(w.login(t.channel(3), sid, "alice", {AuthTrio::kPw, AuthTrio::kPw}).errorCode(), 48);
     EXPECT_NO_THROW(t.login(1, "alice"));
     EXPECT_GT(t.counter(3, kSecurityApplyHaltedCounterTypeId).value_or(0), 0);
 
