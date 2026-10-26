@@ -1156,7 +1156,9 @@ TEST(AuthRestartRegression, APartitionedBrokerGoesStaleThenEndsSessionsRetriably
         n.securityReplicaForTest()->holdFetchesUntilForTest(INT64_MAX);
         return 0;
     });
-    EXPECT_TRUE(AuthTrio::until(10s, [&] { return n.securityServingForTest() == "Stale"; }));
+    // Its leader is alive, so its verdict is held (issue #460): it is current while it is in the committed ISR (no
+    // record commits without it), and stale once the leader shrinks it out after replicaLagMaxMs (10 s by default).
+    EXPECT_TRUE(AuthTrio::until(30s, [&] { return n.securityServingForTest() == "Stale"; }));
     EXPECT_EQ(loginCode(t, cut, "ws1"), kAuthUnavailable) << "a stale broker serves no login";
     EXPECT_TRUE(n.gatewayHasSessionForTest(live.sid)) << "within R the live session keeps working";
     EXPECT_TRUE(sessionEndedWith(live, static_cast<int16_t>(kAuthUnavailable), 15s))
