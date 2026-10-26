@@ -225,14 +225,37 @@ allocate nothing, and they must pass an ABAB bench against the CLAUDE.md latency
   resolves the offset once and writes it into the replicated record, so every replica applies that exact offset;
   the response returns it. A retry after a failed request resolves again on the current leader. The start never
   moves backwards: a `beforeOffset` at or below the current start changes nothing and returns the current start.
-- **Durability:** the reply is sent only once the new start is committed (replicated to the ISR, as for `acks=all`),
-  so a leader change after the reply can never bring truncated records back.
+- **Durability:** the reply is sent only once every ISR replica reports a start at or above the new one (Kafka's
+  DeleteRecords low watermark), so a leader change after the reply can never bring truncated records back: only ISR
+  replicas are electable, and each of them already holds the new start in its checkpoint.
 - **Topic kinds:** user topics, transactional or not, and transient topics can be truncated; only internal (`__*`)
   topics are refused.
-- **Flow:**
-  1. The leader appends a `LogStartAdvanced(partition, offset)` control record (see open question 4).
-  2. That record replicates through the normal path, so followers apply the same start.
-  3. Whole segments below the new start are deleted asynchronously, the same way retention deletes them.
+- **Flow** (the Kafka DeleteRecords path; no new record kind):
+  1. The leader resolves the offset, writes its log-start checkpoint (`writeLogStartCheckpoint_`, as retention does)
+     and only then moves its in-memory start. From then on every `FetchResponse` carries the new `logStartOffset`
+     (the field exists today). A start change completes the fetches parked on that partition, as a HW change does.
+  2. **Follower adoption, disk and transient logs alike** (today only transient logs adopt, via
+     `resetTransientLogTo_`). On any fetch response whose `logStartOffset` is above the follower's own start:
+     - if it is at or below the follower's LEO, the follower checkpoints it and moves its start (as retention does);
+     - if it is above the follower's LEO, the follower holds nothing the leader still has: it checkpoints the new
+       start, drops every segment and resumes empty at that offset (Kafka: a follower out of range below the
+       leader's start truncates fully). Boot recovery treats a checkpoint above every segment as an empty log at
+       that offset, so a crash between the two steps converges.
+  3. **Follower report.** `FetchRequest` gets a `logStartOffset` field (the follower's checkpointed start; no
+     mixed-version clusters exist). The leader keeps it per follower slot; the ISR low watermark is the minimum over
+     the ISR, the leader included. The truncate reply waits until the low watermark reaches the new start. An ISR
+     shrink also completes it, since the replica that left can only come back through the fetch path and adopts the
+     start there. A request timeout returns `REQUEST_TIMED_OUT` and the client retries; the retry resolves again
+     and is idempotent, because a start never moves backwards.
+  4. **A fetch below the leader's start** gets a record-less answer carrying the leader's start, so the follower
+     takes step 2. Today the leader answers this only for transient logs; a disk follower below the first segment
+     gets an empty read and no answer (`PartitionReplica::handleFetchRequest`, the `view.empty()` skip), which looks
+     like an existing hang. Phase 3 starts with a failing repro test for it and fixes it on its own.
+  5. Whole segments below the new start are deleted asynchronously, the same way retention deletes them.
+  6. **Retention** uses the same path: a leader's retention start also reaches followers, as in Kafka.
+  7. **New leader:** a leader elected before the reply may hold a lower start than the one resolved. Nothing was
+     acknowledged, so that is correct; followers never move their start back, and the client's retry resolves on
+     the new leader.
 - **Response:** the new `logStartOffset` for each partition.
 - **Consumers:** a fetch below the start returns `OFFSET_OUT_OF_RANGE`, which the client's reset policy handles, as it does after retention.
 - **Views:** truncate cuts every view that reads the topic up to the same offset. Afterwards each view equals a
@@ -265,7 +288,7 @@ allocate nothing, and they must pass an ABAB bench against the CLAUDE.md latency
    - per-namespace metric blocks, allocated on create and freed on delete;
    - enforcement of counts, storage, view memory and control-plane limits;
    - the rate aggregator, `Throttle` over the rings, and the ABAB bench.
-3. **TruncateTopic:** wire, broker, replication and client; view cut and rebuild; `rune topic truncate`.
+3. **TruncateTopic:** first the below-start fetch fix (§6 Flow step 4, repro test first); then wire, broker, replication (follower adoption and the low watermark) and client; view cut and rebuild; `rune topic truncate`.
 4. **CLI:** `rune` reads the shared Arcanum login context; `arcanum` plugin dispatch; `topic list` and `namespace` commands. The platform commands (§10.1) come with the control-plane service.
 5. **NAT-safe egress:** per-session egress on a client-opened flow; per-worker egress on by default; NAT e2e leg (§10.4).
 
@@ -281,6 +304,8 @@ Operations × entities × timings:
   - leader change mid-operation;
   - restart between steps;
   - follower offline during the delete or truncate, then catching up;
+  - a follower whose LEO is below the new start (disk and transient), and a crash between its checkpoint and its segment drop;
+  - an ISR shrink and a leader change while a truncate waits for the low watermark;
   - truncate during a view rebuild, and a second truncate before the first rebuild swaps;
   - a limit change between an aggregator tick and the `Throttle` reaching a thread;
   - a delete and recreate between a `Throttle` being sent and arriving (slot reuse);
@@ -295,6 +320,7 @@ Required:
 ## 9. Review focus
 - **Cross-namespace leaks:** in name resolution, the internal-topic keys, grants, metadata responses and error messages.
 - **Escalation through a sibling operation:** a namespace admin reaching cluster-admin, another namespace, or the limits.
+- **Truncate durability:** no reply before the ISR low watermark reaches the start; no replica's start ever moves back; a follower below the leader's start always gets an answer.
 - **Delete convergence:** across crashes, a lagging follower and recreating the same name.
 - **Suspend:** every request type sits in the allowed/refused table for both modes; open transactions are aborted; the cluster admin is never locked out.
 - **Catalog versions:** a formatVer 1 reader still refuses the namespace kinds; a formatVer 2 reader applies every v1 event exactly as v1 does.
@@ -384,24 +410,14 @@ Full design: arcanum-site `docs/specs/2026-10-24-arcanum-auth-design.md` §5.
   - It runs as the namespace's built-in `anonymous` principal. Its only default grant is schema and catalog read, so `schema list|get|generate` and catalog reads work.
   - QL, view reads, produce, consume and all DDL return `UNAUTHORIZED`; the CLI adds a "run `rune login`" hint.
 - **Controls:** a namespace admin can revoke the grant, and a `NamespaceLimits` flag lets the cluster admin disable anonymous access.
-- **Scope:** an anonymous session only ever sees its own namespace. Which namespace that is has no answer yet, because
-  an anonymous client never logs in and `ConnectRequest` has no namespace field (open question 22).
+- **Scope:** an anonymous session only ever reaches `default`, because an anonymous client never logs in and
+  `ConnectRequest` has no namespace field. A namespace that wants public reads publishes through `default`.
 - **Limits:** anonymous sessions count against the namespace's connection and rate limits, with a separate small cap building on issue #236.
 - **Tests:** adversarial checks that anonymous never passes any gate but schema read, including through a sibling operation, and never sees another namespace.
 
 ## 12. Open questions
 Still to decide. Each has the recommended answer; a line is removed when the decision is written into the
 section it belongs to.
-
-**Code facts the spec must match**
-4. How the new start reaches followers. `Log` has a log-start-offset checkpoint and the replication `FetchResponse`
-   carries `logStartOffset`, but a follower adopts it today only for transient topics
-   (`PartitionReplica::resetTransientLogTo_`); a disk follower never takes the leader's start. Options:
-   - **A. `LogStartAdvanced` control record (recommended):** the start rides the log, so it is committed with the
-     ISR, survives a leader change and converges from the log alone (rule 16). Consumers skip it like a
-     transaction marker.
-   - **B. Kafka DeleteRecords path:** followers adopt the start from fetch and push responses, and the reply waits
-     until every ISR replica reports it. Needs the adoption path for disk logs and a wait on follower watermarks.
 
 **Naming**
 9. `ObjectIndex::byName` is global. Recommended: key it by `(nsId, name)`.
@@ -416,6 +432,3 @@ section it belongs to.
 **Scope**
 20. Split NAT egress (§10.4) and the CLI work into their own specs. Recommended: yes.
 21. Anonymous read (§11) is off by default, and CLAUDE.md §8 records it. Recommended: yes.
-22. The namespace of an anonymous session. Recommended: anonymous sessions only ever reach `default`; a namespace
-    that wants public reads publishes through `default`. The alternative is an optional namespace field in
-    `ConnectRequest`, read only when no SCRAM login follows.
