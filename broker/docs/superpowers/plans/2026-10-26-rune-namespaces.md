@@ -326,7 +326,7 @@ Phase 1 emits only:
   - ConnectRequest is unchanged.
 - **D13. Namespace DDL wire.**
   - `NamespaceDdl (81)`: `header | DdlExtension | kind u8 (1 = Create, 2 = SetLimits; 3..5 reserved for Phase 2) |
-    name var16 | u8 limitsPresentMask[8] | NamespaceLimits fixed block`. It is answered by `DdlResponse (78)`.
+    name var16 | u8 limitsPresentMask[4] | NamespaceLimits fixed block`. It is answered by `DdlResponse (78)`.
   - `ListNamespaces (82)`: `header | u32 afterNsId | u16 max`.
   - `ListNamespacesResponse (83)`: `header | u16 count | repeated {u32 nsId, name var16, u8 state, NamespaceLimits} |
     u32 nextAfter`.
