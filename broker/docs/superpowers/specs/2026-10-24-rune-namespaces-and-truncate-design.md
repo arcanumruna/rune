@@ -53,8 +53,8 @@ ACTIVE|SUSPENDED → DELETING(pendingTopics, pendingViews, pendingGroups, openTx
 ```
 
 **Suspend.**
-- In `ReadOnly` mode, the gateway rejects produce, DDL and transactional work, and allows fetch and reads.
-- In `RejectAll` mode, every request fails with `NAMESPACE_SUSPENDED`, and open sessions are closed.
+- In `ReadOnly` mode, the gateway refuses produce, all DDL, transactions and consumer-group offset commits with `NAMESPACE_SUSPENDED`, and allows fetch, view reads and QL reads. Use it to freeze a namespace while its owner can still get data out.
+- In `RejectAll` mode, every request and every login fails with `NAMESPACE_SUSPENDED`, and open sessions are closed.
 
 **Delete**, in this order:
 1. Append `NamespaceDeleted`. New requests and logins for the namespace are rejected from then on.
@@ -356,9 +356,7 @@ section it belongs to.
 14. `NamespaceDeleted` is the only commit point; every owner then reconciles idempotently. Recommended: yes.
 15. Recreating a name while the old `nsId` is still `DELETING`. Recommended: allowed; the new `nsId` cannot match
     the old state.
-16. What `ReadOnly` refuses. Recommended: produce, all DDL, transactions and group commits; allows fetch, view and
-    QL reads.
-17. `RejectAll` refuses every login, and `default` can be suspended. Recommended: yes to both.
+17. `default` can be suspended. Recommended: yes.
 
 **Truncate**
 18. Truncate of transient topics. Recommended: refused, as for internal topics.
