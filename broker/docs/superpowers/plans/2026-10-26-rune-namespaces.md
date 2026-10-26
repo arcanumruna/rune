@@ -490,15 +490,15 @@ struct NamespaceLimits {                       // little-endian, written byte-wi
     uint32_t reserved0;                        // placement / password policy / encryption key — zero in Phase 1
     uint64_t reserved1, reserved2, reserved3;
 };
-inline constexpr size_t kNamespaceLimitsBytes = 30 * 8 + 4 + 4 + 3 * 8;   // 272
-inline constexpr size_t kNamespaceLimitFieldCount = 30;
+inline constexpr size_t kNamespaceLimitsBytes = 28 * 8 + 4 + 4 + 3 * 8;   // 256
+inline constexpr size_t kNamespaceLimitFieldCount = 29;               // 28 u64 limits + featureBits
 void encodeLimits(const NamespaceLimits&, uint8_t* out);           // exactly kNamespaceLimitsBytes
 bool decodeLimits(const uint8_t* in, size_t len, NamespaceLimits&); // false on short buffer
 }
 namespace rune::protocol::client {
 enum class NamespaceDdlKind : uint8_t { Create = 1, SetLimits = 2 /* 3 Suspend, 4 Resume, 5 Delete: Phase 2 */ };
 struct NamespaceDdlRequest { DdlExtension ext; NamespaceDdlKind kind; std::string name;
-                             std::array<uint8_t, 4> presentMask; /* bit i = field i given; 30 fields → 4 bytes */
+                             std::array<uint8_t, 4> presentMask; /* bit i = field i given; 29 fields → 4 bytes */
                              NamespaceLimits limits; };
 struct NamespaceInfo { uint32_t nsId; std::string name; uint8_t state; NamespaceLimits limits; };
 // encode*/decode* for 81, 82, 83 in the SecurityMessages.h style (var16 strings, bounds-checked).
@@ -508,7 +508,7 @@ struct NamespaceInfo { uint32_t nsId; std::string name; uint8_t state; Namespace
 - [ ] **Step 1: failing tests** in `NamespaceMessagesTest.cpp`:
   - `NamespaceMessagesRegression.LimitsRoundTripRegression`: fill every field with a distinct value
     (`i * 0x0101010101010101`), encode, decode, compare. The golden first 16 bytes are pinned as a hex literal.
-  - `...LimitsSizePinnedRegression`: `kNamespaceLimitsBytes == 272` and `sizeof` agrees.
+  - `...LimitsSizePinnedRegression`: `kNamespaceLimitsBytes == 256` and `sizeof` agrees.
   - `...DdlRoundTripRegression`: Create and SetLimits with a partial mask.
   - `...DdlTruncatedAtEveryOffsetRegression`: decoding the encoded frame truncated at each offset 0..n-1 returns false
     and never reads past the end (the ASan run checks this).
