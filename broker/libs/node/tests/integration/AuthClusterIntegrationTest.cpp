@@ -1151,6 +1151,10 @@ TEST(AuthRestartRegression, APartitionedBrokerGoesStaleThenEndsSessionsRetriably
     const int cut = leader == 3 ? 2 : 3;   // a follower
     AuthTrio::Session live;
     ASSERT_TRUE(AuthTrio::until(30s, [&] { try { live = t.login(cut, "ws1"); return true; } catch (...) { return false; } }));
+    // The live client keeps its session alive like a real client (a Keepalive every 1 s).  The wait for Stale below
+    // is about replicaLagMaxMs (10 s) - as long as the gateway's lease on a silent session (kDefaultSessionTimeoutNs,
+    // 10 s) - so a silent session would be reaped with SessionExpired (4) before R could end it with 48.
+    live.w->raw().keepSessionsAlive(true);
     BrokerNode& n = t.node(cut);
     n.onAdminThreadForTest([&n]() {   // its `__security` follower hears its leader no more (no fetch, no answer)
         n.securityReplicaForTest()->holdFetchesUntilForTest(INT64_MAX);
@@ -1158,7 +1162,8 @@ TEST(AuthRestartRegression, APartitionedBrokerGoesStaleThenEndsSessionsRetriably
     });
     // Its leader is alive, so its verdict is held (issue #460): it is current while it is in the committed ISR (no
     // record commits without it), and stale once the leader shrinks it out after replicaLagMaxMs (10 s by default).
-    EXPECT_TRUE(AuthTrio::until(30s, [&] { return n.securityServingForTest() == "Stale"; }));
+    // Wait by pumping the live client, so its keepalives flow meanwhile.
+    EXPECT_TRUE(live.w->raw().pollFor(30s, [&] { return n.securityServingForTest() == "Stale"; }));
     EXPECT_EQ(loginCode(t, cut, "ws1"), kAuthUnavailable) << "a stale broker serves no login";
     EXPECT_TRUE(n.gatewayHasSessionForTest(live.sid)) << "within R the live session keeps working";
     EXPECT_TRUE(sessionEndedWith(live, static_cast<int16_t>(kAuthUnavailable), 15s))
