@@ -401,6 +401,7 @@ public:
         m.force = (w.flags & rune::protocol::client::kSecurityDdlFlagForce) != 0 ? 1 : 0;
         m.denial.assign(denial);
         m.proofChecked = proofChecked ? 1 : 0;
+        m.callerNsId   = meta.callerNsId;   // namespaces Task 9: the session's namespace (Task 8's resolution input)
         return submitDdl_(m);
     }
     rune::gateway::AdminSubmit submitSecurityBootstrap(const rune::protocol::client::SecurityBootstrap& w,
@@ -1194,6 +1195,10 @@ private:
             c.partitionKey  = s.keyField;
             postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf*/0, s.persistence, c, s.nsId,
                                      kA2cCatalogSinkApplied);   // Task 12 (N5)
+        };
+        fx.namespaceUpserted = [this](const rune::catalog::NamespaceRecord& r) {   // namespaces Task 9: login mirror
+            postCatalog_(kA2cNamespaceUpserted, namespaceUpsertedWireLen(r.name),
+                         [&](uint8_t* p) { writeNamespaceUpserted(p, r); });
         };
         fx.topicDropped = [this](int32_t topicId, uint32_t nsId, const std::string& name) {
             postCatalog_(kA2cCatalogTopicDropped, catalogTopicDroppedWireLen(name),

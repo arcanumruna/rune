@@ -45,6 +45,7 @@ struct DdlMetaView {
     int64_t                         sessionId = 0;   // the session (gateway-supplied)
     rune::protocol::RequestId       requestId{};     // {0, 0} = a pre-v8 client (F14)
     std::optional<ReplayedFromView> replayedFrom;    // absent unless the DDL is a replay
+    uint32_t                        callerNsId = 0;  // namespaces Task 9: the session's namespace (0 = `default`)
 };
 
 /// The outcome of handing a request to the admin thread.

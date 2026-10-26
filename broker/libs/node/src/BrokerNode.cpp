@@ -2113,6 +2113,10 @@ void BrokerNode::buildGateway() {
             gateway_->setSecurityServing(false);
         }
         gateway_->setBootObjects(std::move(bootObjects_));   // authentication Task 12: the catalog's live topics / views at boot
+        // Namespaces Task 9: the login's namespace mirror starts from the booted catalog (the applier is still on this
+        // startup thread - buildAdminWorker adopts it later); every later change arrives as kA2cNamespaceUpserted.
+        if (bootApplier_) gateway_->setBootNamespaces(bootApplier_->state().namespaces());
+        gateway_->setAnonymousRead(config_.anonymousRead);   // spec §11: RUNE_ANONYMOUS_READ, off by default
         // Authentication Task 10 (D4/D32): the gateway's OWN copy of the cluster keys (loaded on this startup thread,
         // validated by validateAuth) verifies the bootstrap proof.  Dev / in-process configs hold none.
         // Review C I4: the keys validated in start() ARE the keys in use - one load, handed out as copies; Enabled with
@@ -5007,6 +5011,14 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                     if (gateway_) gateway_->onFilterSchema(m.topicId, m.version, std::span<const uint8_t>(m.blob));
                 } else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
                     spdlog::error("BrokerNode[{}]: malformed kA2cFilterSchema (len={}) skipped", config_.nodeId, n);
+                return;
+            }
+            if (tid == kA2cNamespaceUpserted) {   // namespaces Task 9: a namespace record -> the gateway's login mirror
+                rune::catalog::NamespaceRecord rec;
+                if (decodeNamespaceUpserted(p, n, rec)) {
+                    if (gateway_) gateway_->onNamespaceUpserted(rec);
+                } else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+                    spdlog::error("BrokerNode[{}]: malformed kA2cNamespaceUpserted (len={}) skipped", config_.nodeId, n);
                 return;
             }
             if (tid == kA2cViewUninstall) {

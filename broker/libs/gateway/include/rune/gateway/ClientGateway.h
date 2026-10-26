@@ -68,6 +68,7 @@
 #include <rune/gateway/ObjectIndex.h>
 #include <rune/gateway/LoginThrottle.h>
 #include <rune/gateway/ScramServer.h>
+#include <rune/catalog/NamespaceRegistry.h>
 #include <rune/gateway/FilterAdmission.h>
 #include <rune/peerlink/ClusterKeys.h>
 // client<->broker TLS/AEAD (Task 7): server-role handshake driver. SessionTable.h
@@ -531,6 +532,13 @@ public:
     // ── authentication Task 12: per-session permission tables and the enforcement of every request type ──
     /// Boot (startup thread, before any thread runs): the catalog's live topics / views, from the replay.
     void setBootObjects(rune::gateway::ObjectIndex objects) { objectIndex_ = std::move(objects); }
+    /// Namespaces Task 9 (spec §2): the booted catalog's namespaces (startup thread, before any thread runs), then
+    /// the applier's namespaceUpserted effects (kA2cNamespaceUpserted, control drain) - the login lookup's mirror.
+    void setBootNamespaces(const rune::catalog::NamespaceRegistry& r) { namespaces_ = rune::catalog::NamespaceMirror(r); }
+    void onNamespaceUpserted(const rune::catalog::NamespaceRecord& r) { (void)namespaces_.upsert(r); }
+    /// Namespaces Task 9 (spec §11, RUNE_ANONYMOUS_READ, off by default): in Required mode a session that sends a
+    /// request without logging in becomes AuthAnonymousRead (nsId 0, Describe-only) instead of being ended.
+    void setAnonymousRead(bool on) noexcept { anonymousRead_ = on; }
     /// The control drain of kA2cCatalogTopicApplied / kA2cCatalogSinkApplied: a topic / view exists at `id`; every
     /// authenticated session's table is extended from its retained patterns (spec §6).  Idempotent.
     void onCatalogObjectApplied(uint32_t nsId, int32_t id, const std::string& name, bool isView);
@@ -2453,6 +2461,17 @@ private:
     uint64_t controlBatchRefusals_ = 0;   ///< X036: Produce frames refused for carrying a client control batch (rate-limited log)
     static void noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr);
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
+    rune::catalog::NamespaceMirror namespaces_;   ///< namespaces Task 9: control thread's copy (login lookup)
+    bool anonymousRead_ = false;                  ///< namespaces Task 9: RUNE_ANONYMOUS_READ (off by default)
+    /// Namespaces Task 9: the session's namespace (AuthAuthenticated / AuthPasswordChangeRequired; 0 otherwise -
+    /// anonymous and not-yet-logged-in sessions are `default`'s, D12).
+    [[nodiscard]] static uint32_t sessionNsId_(const Session& s) noexcept;
+    /// Namespaces Task 9: the anonymous-read table (Describe on every topic / view of `default`), pooled.
+    [[nodiscard]] rune::gateway::PermissionRef anonPerms_();
+    /// Namespaces Task 9: with RUNE_ANONYMOUS_READ on, an AwaitingFirst session that sends a request other than a login
+    /// leg / the bootstrap becomes the anonymous reader of `default`.  Both entry points (authGateRefuses_ and
+    /// handleProduce's cold branch) call this, so the first request's kind never changes the outcome.
+    void becomeAnonymousIfAllowed_(Session& session, rune::protocol::client::TemplateId tid);
     const rune::gateway::SecurityView* securityView_ = nullptr;   // control thread's own mirror (same thread as the gateway)
     bool     securityServing_ = true;           ///< issues #15 / #111: see setSecurityServing
     int64_t  securityKnownEnd_ = -1;            ///< #205: see setSecurityKnownEnd

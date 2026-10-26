@@ -3562,9 +3562,14 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // joins this spot).  AwaitingFirst / AwaitingFinal / PasswordChangeRequired (variant index < 3) never produce.
     static_assert(std::is_same_v<std::variant_alternative_t<3, rune::gateway::SessionAuth>, rune::gateway::AuthAuthenticated>);
     if (session->auth.index() < 3) [[unlikely]] {
-        const auto hdr = pc::MessageHeader::decode(buf, len);
-        answerGate_(*session, *hdr, rune::gateway::gateFor(session->auth, pc::TemplateId::Produce, false, false), buf, len);
-        return true;
+        // Namespaces Task 9: a first request that is a Produce makes the anonymous reader too (then 45 below, the
+        // session stays) - the same outcome as a Produce after a metadata request.
+        becomeAnonymousIfAllowed_(*session, pc::TemplateId::Produce);
+        if (session->auth.index() < 3) {
+            const auto hdr = pc::MessageHeader::decode(buf, len);
+            answerGate_(*session, *hdr, rune::gateway::gateFor(session->auth, pc::TemplateId::Produce, false, false), buf, len);
+            return true;
+        }
     }
     // Issue #603: the view is behind committed security events this broker holds - its grants may already be revoked.
     // One predictable branch on a control-thread bool.
@@ -8010,6 +8015,7 @@ rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext
     // auth state, copied by the admin ring submit before this frame's handler returns.
     if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) m.authenticated = a->user;
     else if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session.auth)) m.authenticated = p->user;
+    m.callerNsId = sessionNsId_(session);   // namespaces Task 9: the login's namespace (0 = `default` / anonymous)
     if (ext != nullptr) {
         m.statement         = ext->statement;
         m.clientName        = ext->clientName;
@@ -8419,6 +8425,11 @@ bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std
     Session* session = sessions_.find(hdr->sessionId);
     if (!session) return false;                           // the handler notes it (no session to answer)
 
+    // Namespaces Task 9 (spec §11): with RUNE_ANONYMOUS_READ on, a session that sends a request instead of logging in
+    // becomes the anonymous reader of `default` (Describe only) rather than ending.  The login legs and the bootstrap
+    // keep their D13 meaning.  Off (the default): nothing changes.
+    if (anonymousRead_) [[unlikely]] becomeAnonymousIfAllowed_(*session, tid);
+
     // A one-time-password session may send exactly `ALTER USER <self> SET PASSWORD`.
     bool selfSetPassword = false;
     if (tid == pc::TemplateId::SecurityDdl)
@@ -8452,13 +8463,16 @@ void ClientGateway::answerGate_(Session& sessionRef, const pc::MessageHeader& hd
     // Issue #119: a Closing session was already sent its last answer (its frames never get here; defensive).
     if (session->spill.state == SpillState::Closing) [[unlikely]] return;
     const bool end = gate == AuthGate::AnswerAuthFailedAndEnd;
-    const auto code = end ? pc::ErrorCode::AuthenticationFailed : pc::ErrorCode::PasswordChangeRequired;
+    const bool anon = gate == AuthGate::AnswerNotAuthorized;   // namespaces Task 9: the anonymous reader (stays)
+    const auto code = end ? pc::ErrorCode::AuthenticationFailed
+                    : anon ? pc::ErrorCode::NotAuthorized : pc::ErrorCode::PasswordChangeRequired;
     ++authGateRefusals_;
     if (authGateRefusals_ % 1024 == 1)
         spdlog::warn("ClientGateway: session {} sent template {} {} - answered {}{} (D13; refusals so far: {})", hdr->sessionId,
-                     hdr->templateId, end ? "before authenticating" : "while it must change its password",
-                     end ? "AuthenticationFailed and ended" : "PasswordChangeRequired", "", authGateRefusals_);
-    const char* why = end ? "authentication required" : "password change required";
+                     hdr->templateId, end ? "before authenticating" : anon ? "anonymously" : "while it must change its password",
+                     end ? "AuthenticationFailed and ended" : anon ? "NotAuthorized" : "PasswordChangeRequired", "",
+                     authGateRefusals_);
+    const char* why = end ? "authentication required" : anon ? "not authorized (anonymous)" : "password change required";
     if (!rejectRequest_(buf, len, static_cast<uint16_t>(code), why)) {
         // The request has no response type of its own: the session-level ErrorResponse, so the client is never left
         // waiting.
@@ -8521,11 +8535,37 @@ int ClientGateway::syncWorkersBehind_()
 const rune::gateway::PermissionTable& ClientGateway::permsOf_(const Session& s) const noexcept
 {
     if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) return a->perms.table();
+    if (const auto* a = std::get_if<rune::gateway::AuthAnonymousRead>(&s.auth)) return a->perms.table();   // ns Task 9
     // Dev / in-process brokers authenticate nobody: everything is allowed whatever a session's (test-set) state says.
     // On an authenticating broker only AuthAuthenticated holds grants: AuthAnonymous (the state of nobody who logged
     // in) is denied everything (X013).
     if (authMode_ != rune::gateway::GatewayAuthMode::Required) return allowAllPerms_;
     return denyAllPerms_;
+}
+
+uint32_t ClientGateway::sessionNsId_(const Session& s) noexcept
+{
+    if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&s.auth)) return a->nsId;
+    if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&s.auth)) return p->nsId;
+    return 0;   // anonymous (dev / in-process / anonymous read) and not-yet-logged-in sessions: `default` (D12)
+}
+
+void ClientGateway::becomeAnonymousIfAllowed_(Session& session, pc::TemplateId tid)
+{
+    if (anonymousRead_ && authMode_ == GatewayAuthMode::Required && tid != pc::TemplateId::AuthClientFirst &&
+        tid != pc::TemplateId::AuthClientFinal && tid != pc::TemplateId::SecurityBootstrap &&
+        std::holds_alternative<rune::gateway::AuthAwaitingFirst>(session.auth))
+        session.auth = rune::gateway::AuthAnonymousRead{anonPerms_()};
+}
+
+rune::gateway::PermissionRef ClientGateway::anonPerms_()
+{
+    using namespace rune::security;
+    // Sorted (GrantSpec's <=>: Describe on Topic before Describe on View), as PermissionPool::acquire requires.  No
+    // Cluster grant: no __catalog subscribe, no other namespace's catalog; internal objects never match (I6).
+    return permPool_.acquire({GrantSpec{Operation::Describe, ResourcePattern{ResourceType::Topic, PatternKind::Prefix, ""}},
+                              GrantSpec{Operation::Describe, ResourcePattern{ResourceType::View, PatternKind::Prefix, ""}}},
+                             objectIndex_);
 }
 
 rune::gateway::PermissionRef ClientGateway::compilePerms_(uint64_t userId)
@@ -8982,7 +9022,8 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
         unavailableLogin_(*session, m->correlationId, user);
         return;
     }
-    ServerFirstPlan plan = scramServerFirst(securityView_->state(), *m, deadline, securityView_->fakeIterations());
+    ServerFirstPlan plan = scramServerFirst(securityView_->state(), *m, deadline, securityView_->fakeIterations(),
+                                            &namespaces_.registry());   // namespaces Task 9: `ns/user` logins
     if (plan.frame.empty()) {   // no randomness for the nonce: fail closed
         ++loginsFailed_;
         spdlog::error("auth: login failed user={} source={} session={} reason=no-randomness",
@@ -9076,8 +9117,8 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     if (!session->crypto.encrypted)   // only under ClientTransport::PlaintextForTest (M1, issue #10) - said once per session
         spdlog::warn("auth: session {} authenticated over plaintext (no TLS): frames are not integrity-protected",
                      session->sessionId);
-    if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user, std::move(loginNonce)};
-    else session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId), std::move(loginNonce)};
+    if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user, std::move(loginNonce), ok.nsId};
+    else session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId), std::move(loginNonce), ok.nsId};
     // Authentication Task 13: announce-before-accept for permissions - the workers learn this session's WRITE bitmap
     // BEFORE the client learns it is logged in, so it can never produce ahead of its grants.
     const uint64_t shipEpoch = shipPermissions_(*session);
@@ -9288,7 +9329,7 @@ void ClientGateway::refreshSession_(int64_t sid)
         // The Task 11 transition, through this one path: a SET PASSWORD cleared the user's must-change flag.
         const rune::security::UserObject* user = securityView_->state().userById(pcr->userId);
         if (user == nullptr || user->mustChangePassword) return;
-        s->auth = AuthAuthenticated{pcr->userId, pcr->user, compilePerms_(pcr->userId), pcr->loginNonce};
+        s->auth = AuthAuthenticated{pcr->userId, pcr->user, compilePerms_(pcr->userId), pcr->loginNonce, pcr->nsId};
         (void)shipPermissions_(*s);
         return;
     }
@@ -9567,8 +9608,7 @@ void ClientGateway::handleNamespaceDdl(const uint8_t* buf, std::size_t len)
 }
 
 // ListNamespaces (82): a read of the applied catalog, served by ANY broker's admin thread (no route, no append).  A
-// cluster admin sees every namespace; anyone else only its own (Task 9 binds a session to a namespace; until then the
-// caller's namespace is `default`, 0).
+// cluster admin sees every namespace; anyone else only its own - the session's login namespace (namespaces Task 9).
 void ClientGateway::handleListNamespaces(const uint8_t* buf, std::size_t len)
 {
     if (!adminSink_) {
@@ -9595,7 +9635,7 @@ void ClientGateway::handleListNamespaces(const uint8_t* buf, std::size_t len)
         !rune::gateway::authorizeCluster(permsOf_(*session), rune::security::Operation::Admin).has_value();
     answerAdminSubmit_(buf, len,
                        adminSink_->submitListNamespaces(m.sessionId, m.correlationId, m.afterNsId, m.max,
-                                                        rune::catalog::kDefaultNsId, clusterAdmin),
+                                                        sessionNsId_(*session), clusterAdmin),
                        "ListNamespaces: admin ring full", "ListNamespaces: request larger than the admin ring message");
 }
 
@@ -9619,7 +9659,7 @@ std::optional<rune::gateway::Denial> ClientGateway::verifyOwnCredentialChange_(S
     }
     bool ok = false;
     const rune::security::UserObject* user =
-        securityView_ != nullptr && !securityView_->halted() ? securityView_->state().userByName(rune::catalog::kDefaultNsId, self) : nullptr;
+        securityView_ != nullptr && !securityView_->halted() ? securityView_->state().userByName(sessionNsId_(session), self) : nullptr;
     if (user != nullptr && !loginNonce.empty() && (m.flags & pc::kSecurityDdlFlagCredentialProof) != 0 &&
         m.credentialProof.size() == pc::kCredentialProofBytes && !m.ext.requestId.none()) {
         const std::string message = pc::credentialChangeMessage(loginNonce, m);

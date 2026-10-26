@@ -92,10 +92,42 @@ public:
 
 private:
     friend struct ApplyV2;
+    friend class NamespaceMirror;
     std::map<uint32_t, NamespaceRecord>            byId_;
     std::map<std::string, uint32_t, std::less<>>   byName_;
     uint32_t                                       nextNsId_ = 1;
     uint64_t                                       tombstoneFold_ = 0;
+};
+
+/// A read-only COPY of a catalog's namespaces kept by a thread that does not own the CatalogState (namespaces Task 9:
+/// the control thread's, for the login lookup).  Seeded from the booted registry on the startup thread, then fed the
+/// applier's namespaceUpserted effects over the admin -> control ring.  An upsert is idempotent and never moves a
+/// namespace back: a record whose version is below the held one is ignored (a re-posted boot effect behind a live one).
+/// `default` is predefined, so a bare login resolves before any effect arrives.
+class NamespaceMirror {
+public:
+    NamespaceMirror() = default;
+    explicit NamespaceMirror(const NamespaceRegistry& booted) : reg_(booted) {}
+
+    [[nodiscard]] const NamespaceRegistry& registry() const noexcept { return reg_; }
+
+    /// Inserts or replaces `rec` (keyed by nsId; a renamed record drops its old name).  False = ignored (older version).
+    bool upsert(const NamespaceRecord& rec) {
+        auto it = reg_.byId_.find(rec.nsId);
+        if (it != reg_.byId_.end()) {
+            if (rec.version < it->second.version) return false;
+            if (it->second.name != rec.name) reg_.byName_.erase(it->second.name);
+            it->second = rec;
+        } else {
+            reg_.byId_.emplace(rec.nsId, rec);
+        }
+        reg_.byName_.insert_or_assign(rec.name, rec.nsId);
+        if (rec.nsId >= reg_.nextNsId_) reg_.nextNsId_ = rec.nsId + 1;
+        return true;
+    }
+
+private:
+    NamespaceRegistry reg_;
 };
 
 } // namespace rune::catalog

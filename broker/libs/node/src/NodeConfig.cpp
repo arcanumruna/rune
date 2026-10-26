@@ -1029,6 +1029,10 @@ ConfigResult parseNodeConfig(
     }
     if (const char* raw = getenv_fn("RUNE_CLUSTER_KEY_FILE"); raw && *raw) cfg.clusterKeyFile = raw;
     if (const char* raw = getenv_fn("RUNE_CLUSTER_KEY_FILE_NEXT"); raw && *raw) cfg.clusterKeyFileNext = raw;
+    if (const char* raw = getenv_fn("RUNE_ANONYMOUS_READ"); raw && *raw) {   // namespaces Task 9 (spec §11)
+        const std::string_view sv(raw);
+        cfg.anonymousRead = (sv == "1" || sv == "true" || sv == "TRUE");
+    }
     if (const char* raw = getenv_fn("RUNE_AUTH_TIMEOUT_MS"); raw && *raw) {
         int64_t v = 0;
         if (!parseInt64Positive(raw, v))

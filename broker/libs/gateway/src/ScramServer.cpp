@@ -82,8 +82,24 @@ std::optional<pc::AuthClientFirst> decodeClientFirst(const uint8_t* buf, std::si
     return m;
 }
 
+LoginName resolveLoginName(const rune::catalog::NamespaceRegistry* namespaces, std::string_view username) noexcept
+{
+    LoginName r;
+    const auto q = rune::catalog::parseQualified(username);
+    if (!q) return r;                                                    // "" / "a//x" / "/x" / "a/": unknown
+    r.local = q->local;
+    if (q->ns.empty()) { r.nsId = rune::catalog::kDefaultNsId; r.known = true; return r; }   // bare = `default`
+    const rune::catalog::NamespaceRecord* ns = nullptr;
+    if (namespaces != nullptr) ns = namespaces->byName(q->ns);
+    else if (q->ns == rune::catalog::kDefaultNsName) { r.nsId = rune::catalog::kDefaultNsId; r.known = true; return r; }
+    if (ns == nullptr) return r;                                         // unknown namespace (or not yet mirrored)
+    r.nsId = ns->nsId;
+    r.known = true;
+    return r;
+}
+
 ServerFirstPlan scramServerFirst(const rune::security::SecurityState& state, const pc::AuthClientFirst& cf, int64_t deadlineNs,
-                                 uint32_t fakeIterations)
+                                 uint32_t fakeIterations, const rune::catalog::NamespaceRegistry* namespaces)
 {
     ServerFirstPlan plan;
     AuthAwaitingFinal& st = plan.next;
@@ -102,9 +118,14 @@ ServerFirstPlan scramServerFirst(const rune::security::SecurityState& state, con
     rs::Verifier fake0 = fakeSlot(seed, "rune-fake-salt|", cf.username, fakeIterations);
     rs::Verifier fake1 = fakeSlot(seed, "rune-fake-salt2|", cf.username, fakeIterations);
     plan.fakeSlotsComputed = 2;
-    const rune::security::UserObject* user = cf.username.empty() ? nullptr : state.userByName(rune::catalog::kDefaultNsId, cf.username);
+    const LoginName who = resolveLoginName(namespaces, cf.username);
+    // Namespaces Task 9: an unknown / malformed namespace still runs the user lookup (against a namespace id no user
+    // holds) and takes the SAME fake path as an unknown user - the first leg never reveals which part was wrong.
+    const rune::security::UserObject* user = state.userByName(who.nsId, who.local);
+    if (!who.known) user = nullptr;
     if (user != nullptr && !user->verifiers.empty()) {
         st.userId = user->objectId;
+        st.nsId = user->nsId;
         st.verifiers[0] = fromStored(user->verifiers[0]);
         st.verifiers[1] = user->verifiers.size() > 1 ? fromStored(user->verifiers[1]) : std::move(fake1);   // the pad
     } else {
@@ -163,7 +184,7 @@ std::variant<LoginOk, LoginFailure> scramServerFinal(const rune::security::Secur
 
     const auto sig = rs::serverSignature(Digest::Sha512, st.verifiers[matched].serverKey, messages[matched]);
     if (!sig || sig->size != 64) return LoginFailure::BadProof;                  // local crypto failure: fail closed
-    LoginOk ok{user->objectId, user->name, user->mustChangePassword, {}};
+    LoginOk ok{user->objectId, user->name, user->mustChangePassword, {}, user->nsId};
     std::memcpy(ok.serverSignature.data(), sig->bytes.data(), 64);
     return ok;
 }

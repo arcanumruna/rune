@@ -25,6 +25,7 @@
 #include <rune/protocol/CatalogTypes.h>
 #include <rune/protocol/NamespaceLimits.h>   // NamespaceDdlMsg (namespaces Task 7)
 #include <rune/catalog/CatalogEvent.h>   // rune::catalog::ConfigChange (AlterTopicConfig)
+#include <rune/catalog/NamespaceRegistry.h>   // NamespaceRecord (kA2cNamespaceUpserted, namespaces Task 9)
 #include <rune/protocol/SecurityTypes.h>
 #include <rune/security/SecurityEvent.h>   // ScramVerifier (the security DDL messages, authentication Task 10)
 #include <rune/peerlink/PeerLinkKeys.h>      // LinkInstall (kMsgPeerLinkKeys, issue #241)
@@ -173,6 +174,9 @@ enum : int32_t {
     // [version:u16][blob] (the kA2cSchemaUpdate layout).  The control thread hands it to the gateway, which fans it
     // out to every worker ahead of any filtered Subscribe.
     kA2cFilterSchema        = 25,
+    // Namespaces Task 9: a namespace record the applier created or changed (live, and every namespace again at a boot
+    // stash) -> the gateway's NamespaceMirror, which the login resolves `ns/user` against.  Layout below.
+    kA2cNamespaceUpserted   = 26,
 };
 
 // ---------------------------------------------------------------------------
@@ -1220,6 +1224,43 @@ inline void writeFilterSchema(uint8_t* p, int32_t topicId, uint16_t version, std
     m.topicId = getI32(buf);
     m.version = static_cast<uint16_t>(buf[4]) | static_cast<uint16_t>(static_cast<uint16_t>(buf[5]) << 8);
     m.blob.assign(buf + 6, buf + len);
+    return true;
+}
+
+// ---- NamespaceUpserted (admin -> control; namespaces Task 9) ----
+//   [nsId:u32][version:u32][state:u8 NsStateTag][fingerprint:u64][limits: kNamespaceLimitsBytes][nameLen:u16 + name]
+inline constexpr std::size_t kNamespaceUpsertedFixedBytes = 4 + 4 + 1 + 8 + rune::protocol::kNamespaceLimitsBytes + 2;
+[[nodiscard]] inline std::size_t namespaceUpsertedWireLen(std::string_view name) noexcept {
+    return name.size() > 0xFFFF ? 0 : kNamespaceUpsertedFixedBytes + name.size();
+}
+/// Writes exactly namespaceUpsertedWireLen(rec.name) bytes at `p`.
+inline void writeNamespaceUpserted(uint8_t* p, const rune::catalog::NamespaceRecord& rec) noexcept {
+    using namespace admin_wire;
+    putU32(p, rec.nsId);
+    putU32(p + 4, rec.version);
+    p[8] = static_cast<uint8_t>(rune::catalog::tagOf(rec.state));
+    std::memcpy(p + 9, &rec.fingerprint, 8);
+    rune::protocol::encodeLimits(rec.limits, p + 17);
+    uint8_t* q = p + 17 + rune::protocol::kNamespaceLimitsBytes;
+    putU16(q, static_cast<uint16_t>(rec.name.size()));
+    if (!rec.name.empty()) std::memcpy(q + 2, rec.name.data(), rec.name.size());
+}
+/// False on a short / trailing-garbage frame or an unknown state tag (the caller logs it, rate-limited, and skips it).
+[[nodiscard]] inline bool decodeNamespaceUpserted(const uint8_t* buf, std::size_t len, rune::catalog::NamespaceRecord& rec) {
+    using namespace admin_wire;
+    if (buf == nullptr || len < kNamespaceUpsertedFixedBytes) return false;
+    rec.nsId = getU32(buf);
+    rec.version = getU32(buf + 4);
+    const uint8_t tag = buf[8];
+    if (tag > static_cast<uint8_t>(rune::catalog::NsStateTag::Deleting)) return false;
+    rec.state = rune::catalog::stateOf(static_cast<rune::catalog::NsStateTag>(tag));
+    std::memcpy(&rec.fingerprint, buf + 9, 8);
+    if (!rune::protocol::decodeLimits(buf + 17, len - 17, rec.limits)) return false;
+    std::size_t pos = 17 + rune::protocol::kNamespaceLimitsBytes;
+    const uint16_t n = getU16(buf + pos);
+    pos += 2;
+    if (pos + n != len) return false;
+    rec.name.assign(reinterpret_cast<const char*>(buf + pos), n);
     return true;
 }
 
