@@ -177,14 +177,15 @@ allocate nothing, and they must pass an ABAB bench against the CLAUDE.md latency
 ## 6. TruncateTopic
 - **Wire request:**
   - `TruncateTopic(topicName, entries[(partition, beforeOffset)], DdlExtension)`.
-  - `beforeOffset = -1` means "up to the high watermark".
+  - `beforeOffset = -1` means "as far as is available".
   - It needs the `Truncate` grant on the topic.
   - Internal (`__*`) topics are refused with `INVALID_REQUEST`, for every caller, the cluster admin included.
 - **What it does:** it advances the partition's `logStartOffset` to the furthest offset available when the
   leader executes the request: `min(beforeOffset, HW, LSO)`, where the LSO (last stable offset) is the HW on a
-  topic with no open transactions. Records of a transaction still open stay; everything below them goes. The offset
-  is resolved once, at execution, and returned in the response; it is never re-resolved on retry or failover. It
-  never moves the start backwards.
+  topic with no open transactions. Records of a transaction still open stay; everything below them goes. The leader
+  resolves the offset once and writes it into the replicated record, so every replica applies that exact offset;
+  the response returns it. A retry after a failed request resolves again on the current leader. The start never
+  moves backwards.
 - **Topic kinds:** user topics, transactional or not, and transient topics can be truncated; only internal (`__*`)
   topics are refused.
 - **Flow:**
