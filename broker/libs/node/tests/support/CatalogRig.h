@@ -85,7 +85,7 @@ struct Recorder {
             sequence.push_back("sinkApplied:" + std::to_string(s.topicId));
         };
         e.namespaceUpserted = [this](const rune::catalog::NamespaceRecord& r) { nsUpserts.push_back(r); };
-        e.topicDropped = [this](int32_t id, const std::string&) {
+        e.topicDropped = [this](int32_t id, uint32_t, const std::string&) {
             objects.onDropped(id);
             sequence.push_back("topicDropped:" + std::to_string(id));
         };

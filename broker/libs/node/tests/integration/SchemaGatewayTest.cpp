@@ -175,7 +175,7 @@ struct SgHarness {
 
     SgHarness()
         : dataDir(ownedDirs.add(uniqDir("catalog"))), catalogLog(madeDir((fs::path(dataDir) / "__catalog").string())),
-          topicDirPath(ownedDirs.add(uniqDir("topics"))),
+          topicDirPath(ownedDirs.add(uniqDir("topicdata"))),
           gw(rune::gateway::ClientGateway::makeForTest(
                  [c = &egressFnFrames](const uint8_t*, std::size_t){ ++(*c); return int64_t{1}; },
                  /*sessionId=*/1)) {

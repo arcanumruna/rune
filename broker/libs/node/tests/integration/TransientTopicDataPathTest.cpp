@@ -8,6 +8,7 @@
 // once its DDL OK arrives (C1: the OK is held until the topic serves) — through
 // the legacy gateway this answered UnknownPartition (8) before E2.
 #include "support/TestCluster.h"
+#include <rune/node/NamespacePaths.h>
 #include "support/OwnerThreadTestHelpers.h"
 #include "support/ShardTestClient.h"
 #include "support/TransientMatrixExpectations.h"
@@ -291,7 +292,7 @@ TEST(TransientTopicDataPathRegression, RestartKeepsTheTopicAndEmptiesItRegressio
         }
         node.stop();
     }
-    EXPECT_FALSE(fs::exists(dir.path / "topics" / "tt")) << "a transient topic never writes a partition directory";
+    EXPECT_FALSE(fs::exists(rune::node::topicsRoot(dir.path, 0) / "tt")) << "a transient topic never writes a partition directory";
     {
         BrokerNode node{cfg};
         node.start();

@@ -517,7 +517,7 @@ private:
         CatalogEffects fx;
         fx.topicApplied  = [this](const rune::catalog::TopicObject& t) { effects_.push_back("topicApplied:" + std::to_string(t.topicId)); };
         fx.sinkApplied   = [this](const SinkSpec& s) { effects_.push_back("sinkApplied:" + std::to_string(s.topicId)); };
-        fx.topicDropped  = [this](int32_t id, const std::string&) { effects_.push_back("topicDropped:" + std::to_string(id)); };
+        fx.topicDropped  = [this](int32_t id, uint32_t, const std::string&) { effects_.push_back("topicDropped:" + std::to_string(id)); };
         fx.viewInstalled = [this](const rune::catalog::ViewObject& v) { effects_.push_back("viewInstalled:" + std::to_string(v.def.viewTopicId)); };
         fx.schemaChanged = [this](const rune::catalog::TopicObject& t, uint16_t) {
             effects_.push_back("schemaChanged:" + std::to_string(t.topicId) + "@v" +

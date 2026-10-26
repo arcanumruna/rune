@@ -1236,7 +1236,7 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
 //                             fileDeleteDelayMs:i64 durability:u8 durabilityTier:u8
 //                             coPartitionGroupLen:u16 + bytes, partitionKeyLen:u16 + bytes
 //                             [nsId:u32]   (namespaces Task 5: the owning namespace; appended LAST)
-//   kA2cCatalogTopicDropped : [topicId:i32][nameLen:u16 + name]
+//   kA2cCatalogTopicDropped : [topicId:i32][nameLen:u16 + name][nsId:u32]
 //   kA2cCatalogTopicConfig  : [topicId:i32][count:u16][(key:u8, value:i64) * count]
 //   kA2cViewUninstall       : [viewTopicId:i32]
 //   kA2cCatalogHalted       : [offset:i64][expected:u64][actual:u64][detail bytes (rest)]
@@ -1352,19 +1352,24 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
 struct CatalogTopicDroppedMsg {
     int32_t     topicId = -1;
     std::string name;
+    uint32_t    nsId    = 0;   // namespaces plan Task 6: the dropped topic's namespace (its dir is under ns-<nsId>)
 };
 [[nodiscard]] inline std::size_t catalogTopicDroppedWireLen(std::string_view name) noexcept {
-    return name.size() > kMaxStr16 ? 0 : 4 + 2 + name.size();
+    return name.size() > kMaxStr16 ? 0 : 4 + 2 + name.size() + 4;
 }
-inline void writeCatalogTopicDropped(uint8_t* p, int32_t topicId, std::string_view name) {
+inline void writeCatalogTopicDropped(uint8_t* p, int32_t topicId, std::string_view name, uint32_t nsId = 0) {
     admin_wire::putI32(p, topicId);
-    (void)admin_wire::putStr16(p + 4, name);
+    uint8_t* q = admin_wire::putStr16(p + 4, name);
+    admin_wire::putU32(q, nsId);
 }
 [[nodiscard]] inline bool decodeCatalogTopicDropped(const uint8_t* buf, std::size_t len, CatalogTopicDroppedMsg& m) {
     if (len < 4) return false;
     m.topicId = admin_wire::getI32(buf);
     std::size_t pos = 4;
     if (!admin_wire::getStr16(buf, len, pos, m.name)) return false;
+    if (pos + 4 > len) return false;
+    m.nsId = admin_wire::getU32(buf + pos);
+    pos += 4;
     return pos == len && m.topicId >= 0;
 }
 

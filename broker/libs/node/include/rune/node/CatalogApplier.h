@@ -93,7 +93,7 @@ struct CatalogEffects {
     // NamespaceStateChanged): the namespace's record AFTER the event.  Boot posts every namespace once, before any
     // topic.  NamespaceDeleted posts nothing here (Phase 2 owns the delete effects).
     std::function<void(const rune::catalog::NamespaceRecord&)>           namespaceUpserted;
-    std::function<void(int32_t topicId, const std::string& name)>        topicDropped;     // DropTopic, retired sink
+    std::function<void(int32_t topicId, uint32_t nsId, const std::string& name)> topicDropped;   // DropTopic, retired sink
     std::function<void(int32_t topicId, std::span<const rune::catalog::ConfigChange>)> topicConfig;
     // Validators fan-out of versions fromVersion..current: live passes the current version (earlier ones were
     // posted by earlier events), boot passes 1 (workers start empty).

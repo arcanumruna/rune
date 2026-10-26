@@ -1919,6 +1919,13 @@ if(BUILD_TESTING)
         target_link_libraries(rune_catalog_boot_tests PRIVATE rune_node rune_view rune_codec aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_catalog_boot_tests PROPERTIES TIMEOUT 360)
 
+        # Namespaces Task 6 (D14): the disk layout <dataDir>/ns-<nsId>/topics/<name>/ — NamespacePaths, the
+        # per-namespace boot reconcile, and one topic name in two namespaces on a real single-node broker.
+        add_executable(rune_namespace_disk_tests tests/node/NamespaceDiskTest.cpp)
+        target_include_directories(rune_namespace_disk_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_disk_tests PRIVATE rune_node rune_view rune_codec aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_disk_tests PROPERTIES TIMEOUT 360)
+
         # Catalog history Task 17: TestCluster::defineTopic — the in-process way to create a
         # topic now that the static topic list / NodeConfig::topics are gone (DDL over the wire on real
         # single-node and 3-node brokers), and the FD budget counted from the catalog's topics.

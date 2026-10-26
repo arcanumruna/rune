@@ -17,6 +17,7 @@
 // (the TopicServabilityTest rig); "committed placement" = the steady-state
 // routing image (committed metadata ready).
 #include <rune/gateway/ClientGateway.h>
+#include <rune/node/NamespacePaths.h>
 #include <rune/gateway/SecurityView.h>
 #include <rune/gateway/SessionAuth.h>
 #include <rune/gateway/TopicRegistry.h>
@@ -474,7 +475,7 @@ TEST(CatalogGatewayRegression, CreateTopicAtIsIdempotentAndRefusesConflicts) {
     // Task 16 fix round 1 (R1): the dropped incarnation's dir (marker 5) is retired (renamed away) before the
     // name is re-created — the control thread's drop sequence; a create over it would be refused.
     EXPECT_EQ(g.apply(6, 1, "orders"), -1) << "the older incarnation's dir is still in place";
-    std::filesystem::rename(g.dir.path / "topics" / "orders", g.dir.path / "retired-orders");
+    std::filesystem::rename(rune::node::topicsRoot(g.dir.path, 0) / "orders", g.dir.path / "retired-orders");
     EXPECT_EQ(g.apply(6, 1, "orders"), 6) << "a dropped name is free for a NEW id";
     EXPECT_EQ(g.registry->topicIdForName("orders"), 6);
     EXPECT_TRUE(g.registry->releaseDroppedLogs(5));

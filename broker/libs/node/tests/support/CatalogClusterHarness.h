@@ -41,6 +41,7 @@
 // that cell) — never a hang.
 
 #include "support/TestNodeConfig.h"
+#include <rune/node/NamespacePaths.h>
 #include "support/CatalogDdlRig.h"            // Answer / descriptor()
 #include "support/CatalogMatrixExpectations.h"
 
@@ -1620,7 +1621,7 @@ private:
             post_(*self, live, std::move(e));
         };
         if (live) {
-            fx.topicDropped = [this, self](int32_t id, const std::string& name) {
+            fx.topicDropped = [this, self](int32_t id, uint32_t /*nsId*/, const std::string& name) {
                 Effect e; e.kind = Effect::Kind::Drop; e.id = id; e.name = name;
                 post_(*self, true, std::move(e));
             };
@@ -1698,10 +1699,10 @@ private:
         for (auto it = c.retiring.begin(); it != c.retiring.end();) {
             if (it->passesLeft > 0) { ++it; continue; }
             (void)c.reg->releaseDroppedLogs(it->id);
-            const auto dir = std::filesystem::path(c.dataDir) / "topics" / it->name;
+            const auto dir = rune::node::topicsRoot(std::filesystem::path(c.dataDir), 0) / it->name;
             std::error_code ec;
             if (std::filesystem::exists(dir, ec))
-                std::filesystem::rename(dir, std::filesystem::path(c.dataDir) / "topics" / (".retired-" + std::to_string(it->id)), ec);
+                std::filesystem::rename(dir, rune::node::topicsRoot(std::filesystem::path(c.dataDir), 0) / (".retired-" + std::to_string(it->id)), ec);
             it = c.retiring.erase(it);
         }
         for (auto it = c.pending.begin(); it != c.pending.end();) {

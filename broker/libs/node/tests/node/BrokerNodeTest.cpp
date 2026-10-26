@@ -14,6 +14,7 @@
 // Unique temp paths use getpid() + atomic counter.
 
 #include <rune/aeronutil/testing/FreePort.h>
+#include <rune/node/NamespacePaths.h>
 #include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
 #include <rune/gateway/TopicRegistry.h>
@@ -121,7 +122,7 @@ struct TempDir {
 static fs::path makePartitionDir(const fs::path& dataDir,
                                   const std::string& topicName,
                                   int32_t partition = 0) {
-    fs::path d = dataDir / "topics" / topicName / std::to_string(partition);
+    fs::path d = rune::node::topicsRoot(dataDir, 0) / topicName / std::to_string(partition);
     std::error_code ec;
     fs::create_directories(d, ec);
     return d;
@@ -1930,7 +1931,7 @@ TEST(BrokerNodeRegression, CatalogDiskTopicKeepsItsDataAcrossARestartRegression)
         ASSERT_TRUE(node.awaitLeader(30s));
         ASSERT_TRUE(awaitLeaderReplica(node, topicId, Clock::now() + 20s)) << "rebuilt by the boot replay";
         EXPECT_EQ(rune::node::test::leoOnOwner(node, topicId, 0), 1) << "its data survived the restart";
-        EXPECT_FALSE(fs::exists(dir / "quarantine")) << "the catalog topic's dir was claimed, never quarantined";
+        EXPECT_FALSE(fs::exists(rune::node::quarantineRoot(dir, 0))) << "the catalog topic's dir was claimed, never quarantined";
         node.stop();
     }
     std::error_code ec; fs::remove_all(dir, ec);
@@ -1994,7 +1995,7 @@ TEST(BrokerNodeRegression, RuntimeTransientTopicIsInMemoryAndRestartsEmptyRegres
             [](PartitionReplica& r) { return std::pair{r.isMemoryBacked(), r.isDiskBacked()}; });
         EXPECT_TRUE(mem) << "a transient runtime topic must be InMemoryLog-backed";
         EXPECT_FALSE(disk);
-        EXPECT_FALSE(fs::exists(dir / "topics" / "presence"))
+        EXPECT_FALSE(fs::exists(rune::node::topicsRoot(dir, 0) / "presence"))
             << "a transient topic must never create a disk partition directory";
 
         const std::vector<uint8_t> rec(24, 0x5A);
@@ -2012,7 +2013,7 @@ TEST(BrokerNodeRegression, RuntimeTransientTopicIsInMemoryAndRestartsEmptyRegres
             [](PartitionReplica& r) { return std::pair{r.isMemoryBacked(), r.logEndOffset()}; });
         EXPECT_TRUE(mem) << "recovered as TRANSIENT, not as a disk topic";
         EXPECT_EQ(leo, 0) << "a transient topic restarts EMPTY — its data was never on disk";
-        EXPECT_FALSE(fs::exists(dir / "topics" / "presence"));
+        EXPECT_FALSE(fs::exists(rune::node::topicsRoot(dir, 0) / "presence"));
         node.stop();
     }
     std::error_code ec; fs::remove_all(dir, ec);
@@ -2065,9 +2066,9 @@ TEST(BrokerNodeRegression, CatalogDefineTopicBuildsTheTopicAtItsCatalogIdWithIts
 
     EXPECT_EQ(topicId, 0) << "the first catalog id";
     EXPECT_TRUE(rune::node::test::hasReplica(node, topicId, 0)) << "built from the applied event";
-    EXPECT_TRUE(fs::exists(dir / "topics" / "marked" / "0"));
+    EXPECT_TRUE(fs::exists(rune::node::topicsRoot(dir, 0) / "marked" / "0"));
     {   // Task 16 fix round 1 (R1): the dir carries the topic-id marker, written before any partition dir
-        std::ifstream in(dir / "topics" / "marked" / "topic-id");
+        std::ifstream in(rune::node::topicsRoot(dir, 0) / "marked" / "topic-id");
         std::string line((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         EXPECT_EQ(line, std::to_string(topicId) + "\n") << "a catalog topic's dir is marked with its catalog id";
     }

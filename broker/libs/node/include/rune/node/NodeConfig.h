@@ -75,6 +75,8 @@ struct TopicSpec {
     std::string name;
     int32_t     partitionCount = 1;
     int32_t     topicId        = -1;
+    /// Namespaces plan Task 6: the namespace the topic lives in (its dir is topicsRoot(dataDir, nsId)/<name>).
+    uint32_t    nsId           = 0;
     /// VLS B.2: a view's sink -- a replica-less, catalog-only namespace (no log, no dir, no replica); its rows live
     /// in the source owner's WorkerViewSet.  Set by the catalog sink effect (live and boot) only.
     bool        viewSink       = false;

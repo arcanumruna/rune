@@ -11,6 +11,7 @@
 // replicas) are either re-pinned on their catalog-path counterpart (named in each
 // test's comment) or ruled out in the Task 10 report.
 #include <gtest/gtest.h>
+#include <rune/node/NamespacePaths.h>
 #include "support/DdlHarness.h"
 #include "support/DdlHarnessTestHelpers.h"
 
@@ -276,7 +277,7 @@ TEST_P(DdlNameRegression, AdminPathRejectsEveryOpWithInvalidTopicNameAndCreatesN
     EXPECT_EQ(h.eventsAppended(), events) << "never reaches the catalog";
     EXPECT_EQ(h.catalogLogEnd(), logEnd);
     EXPECT_FALSE(fs::exists(h.root() / "escape")) << "nothing written outside the data dir";
-    EXPECT_FALSE(fs::exists(h.root() / "topics")) << "the admin path writes no topic dir at all";
+    EXPECT_FALSE(fs::exists(rune::node::topicsRoot(h.root(), 0))) << "the admin path writes no topic dir at all";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 

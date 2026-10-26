@@ -16,6 +16,7 @@
 //   2. StaleSameEpochTailTruncatedAfterRestartRegression
 //   3. SingleNodeRestartBumpsLeaderEpochRegression
 #include "support/TestCluster.h"
+#include <rune/node/NamespacePaths.h>
 #include "support/OwnerThreadTestHelpers.h"
 #include "support/ShardTestClient.h"
 
@@ -192,7 +193,7 @@ Epoch diskMaxEpoch(const std::vector<fs::path>& dirs, int32_t part) {
         rune::storage::LeaderEpochCache c;
         // Hot-path B F7: leader-epoch-state is authoritative once it exists.
         if (rune::replication::PartitionReplica::readDurableEpochCache(
-                (d / "topics" / kTopic / std::to_string(part)).string(), c))
+                (rune::node::topicsRoot(d, 0) / kTopic / std::to_string(part)).string(), c))
             m = std::max<Epoch>(m, c.latestEpoch());
     }
     return m;
@@ -279,7 +280,7 @@ std::vector<uint8_t> valueBytes(BrokerNode& n, int32_t part, Offset from, Offset
 /// leader epoch `epoch` (fill byte `fill`) at the end of the partition's disk
 /// log — an unreplicated tail of an earlier incarnation.
 Offset appendStaleTail(const fs::path& dataDir, int32_t part, int32_t epoch, uint8_t fill, int count) {
-    rune::storage::Log log((dataDir / "topics" / kTopic / std::to_string(part)).string(), 64LL * 1024 * 1024);
+    rune::storage::Log log((rune::node::topicsRoot(dataDir, 0) / kTopic / std::to_string(part)).string(), 64LL * 1024 * 1024);
     log.recover();
     for (int i = 0; i < count; ++i) {
         const Offset base = log.logEndOffset();

@@ -41,6 +41,7 @@
 #include <rune/node/CatalogEffectFrames.h>
 #include <rune/gateway/TopicDirMarker.h>
 #include <rune/node/TopicDirReconcile.h>
+#include <rune/node/NamespacePaths.h>
 #include <rune/node/FdBudget.h>
 #include <rune/codec/Serialize.h>
 #include <rune/view/ViewPlan.h>   // Task 20: deserializeCompiledViewPlan (view->source co-location)
@@ -3939,9 +3940,10 @@ TopicSpec topicSpecFromCatalog(const CatalogTopicAppliedMsg& m);   // defined wi
 // The TopicSpec the control thread's effect handler built from a CatalogTopicApplied
 // frame — the SAME mapping (a boot topic is byte-for-byte the topic the live effect
 // would have built).
-TopicSpec bootSpecOfFrame(int32_t topicId, const std::string& name, int32_t partitions, int16_t rf,
+TopicSpec bootSpecOfFrame(uint32_t nsId, int32_t topicId, const std::string& name, int32_t partitions, int16_t rf,
                           rune::catalog::Persistence persistence, const rune::protocol::TopicConfig& c) {
     CatalogTopicAppliedMsg m;
+    m.nsId              = nsId;
     m.topicId           = topicId;
     m.name              = name;
     m.partitions        = partitions;
@@ -3951,11 +3953,6 @@ TopicSpec bootSpecOfFrame(int32_t topicId, const std::string& name, int32_t part
     return topicSpecFromCatalog(m);
 }
 
-bool dirHoldsEntries(const fs::path& d) {
-    std::error_code ec;
-    fs::directory_iterator it(d, ec), end;
-    return !ec && it != end;
-}
 } // namespace
 
 void BrokerNode::bootFromCatalog_() {
@@ -3992,7 +3989,7 @@ void BrokerNode::bootFromCatalog_() {
     bootObjects_ = rune::gateway::ObjectIndex{};
     sink.topicApplied = [&catalogTopics, this](const cat::TopicObject& t) {
         bootObjects_.onTopic(t.nsId, t.topicId, t.name);
-        catalogTopics.push_back(bootSpecOfFrame(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence,
+        catalogTopics.push_back(bootSpecOfFrame(t.nsId, t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence,
                                                 t.config));
     };
     sink.sinkApplied = [&catalogTopics, this](const SinkSpec& sp) {   // a view's sink: a keyed, compacted table, every broker
@@ -4000,7 +3997,7 @@ void BrokerNode::bootFromCatalog_() {
         rune::protocol::TopicConfig c;
         c.cleanupPolicy = 1;   // Compact
         c.partitionKey  = sp.keyField;
-        TopicSpec bs = bootSpecOfFrame(sp.topicId, sp.name, sp.partitions, /*rf*/0, sp.persistence, c);
+        TopicSpec bs = bootSpecOfFrame(sp.nsId, sp.topicId, sp.name, sp.partitions, /*rf*/0, sp.persistence, c);
         bs.viewSink = true;   // VLS B.2: catalog-only -- no dir, no log, no replica
         catalogTopics.push_back(std::move(bs));
     };
@@ -4020,7 +4017,7 @@ void BrokerNode::bootFromCatalog_() {
     // boot, after it proved as a follower that it applied the leader's history (the catch-up sentinel).
     const BootReconcile decision = decideBootReconcile(
         halted, bootApplier_->lastApplied().offset, topicsHoldCatalogMarkedDir(config_.dataDir),
-        dirHoldsEntries(fs::path{config_.dataDir} / "dropped"), readCatchUpSentinel(config_.dataDir));
+        droppedHoldsEntries(config_.dataDir), readCatchUpSentinel(config_.dataDir));
     switch (decision) {
     case BootReconcile::Skip:
         spdlog::critical("BrokerNode[{}]: the __catalog boot replay HALTED — the broker boots with the prefix it "
@@ -5049,7 +5046,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                 CatalogTopicDroppedMsg m;
                 if (decodeCatalogTopicDropped(p, n, m)) {
                     if (gateway_) gateway_->onCatalogObjectDropped(m.topicId);   // authentication Task 12: tables lose the id's bits
-                    dropRuntimeTopic_(m.topicId, m.name);
+                    dropRuntimeTopic_(m.topicId, m.nsId, m.name);
                 }
                 else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
                     spdlog::error("BrokerNode[{}]: malformed kA2cCatalogTopicDropped (len={}) skipped",
@@ -5642,6 +5639,7 @@ TopicSpec topicSpecFromCatalog(const CatalogTopicAppliedMsg& m) {
     TopicSpec s;
     s.name                   = m.name;
     s.topicId                = m.topicId;
+    s.nsId                   = m.nsId;
     s.partitionCount         = m.partitions;
     s.replicationFactor      = m.replicationFactor;
     s.persistence            = m.persistence == 1 ? PersistenceMode::Transient : PersistenceMode::Disk;
@@ -5680,11 +5678,12 @@ void BrokerNode::holdDroppedDirPurgeForTest(bool on) {
     onAdminThreadForTest([this, on]() { adminWorkerAgent_->setHoldDroppedDirPurgeForTest(on); });
 }
 
-bool BrokerNode::catalogNameHeldByDrop_(const std::string& name) const noexcept {
+bool BrokerNode::catalogNameHeldByDrop_(uint32_t nsId, const std::string& name) const noexcept {
     // Fix round 1 (M4): ASCII-folded — on a case-insensitive filesystem a
-    // case-variant name shares dataDir/topics/<name>/ with the dropped one.
+    // case-variant name shares topicsRoot(dataDir, nsId)/<name>/ with the dropped one.  Namespaces Task 6: only a
+    // drop in the SAME namespace holds the name (another namespace's dir is another directory).
     for (const auto& d : droppedAwaitingRetire_)
-        if (d.name == name || rune::catalog::topicNamesFoldEqual(d.name, name)) return true;
+        if (d.nsId == nsId && (d.name == name || rune::catalog::topicNamesFoldEqual(d.name, name))) return true;
     return false;
 }
 
@@ -5702,7 +5701,7 @@ void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool is
     spec.viewSink = isView;   // VLS B.2
     // Step 3: a create whose name a dropped topic still holds (its dir not renamed
     // away yet) waits — FIFO per name, behind any create of that name already waiting.
-    bool behind = catalogNameHeldByDrop_(spec.name);
+    bool behind = catalogNameHeldByDrop_(spec.nsId, spec.name);
     // Fix-on-sight (Task 11): an AlterView's fresh sink carries the view's name
     // while the OLD sink — dropped by the same event, whose drop effect the
     // applier posts right after (install before uninstall, F27) — still holds it
@@ -5710,13 +5709,14 @@ void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool is
     // that drop exactly as behind a retiring one (it was refused: the new sink
     // never served and AlterView answered Internal after the gate's hold).
     if (!behind && topicRegistry_) {
-        const auto holder = topicRegistry_->topicIdForName(spec.name);
-        const auto folded = topicRegistry_->topicIdForFoldedName(spec.name);
+        const auto holder = topicRegistry_->topicIdForName(spec.nsId, spec.name);
+        const auto folded = topicRegistry_->topicIdForFoldedName(spec.nsId, spec.name);
         behind = (holder && *holder != spec.topicId) || (folded && *folded != spec.topicId);
     }
     for (const auto& pc : pendingCreatesBehindDrop_) {
         if (pc.spec.topicId == spec.topicId) return;   // the same effect again: already queued (idempotent)
-        behind = behind || pc.spec.name == spec.name || rune::catalog::topicNamesFoldEqual(pc.spec.name, spec.name);
+        behind = behind || (pc.spec.nsId == spec.nsId && (pc.spec.name == spec.name ||
+                                                          rune::catalog::topicNamesFoldEqual(pc.spec.name, spec.name)));
     }
     if (behind) {
         spdlog::info("BrokerNode[{}]: catalog topic '{}' (id={}) waits behind the drop of its name "
@@ -5757,7 +5757,7 @@ void BrokerNode::runCatalogCreate_(const TopicSpec& spec) {
     }
 }
 
-void BrokerNode::dropRuntimeTopic_(int32_t topicId, const std::string& name) {
+void BrokerNode::dropRuntimeTopic_(int32_t topicId, uint32_t nsId, const std::string& name) {
     // R-M1: every worker answers UnknownTopic (not the retriable NotLeader) for this id once the op runs —
     // posted on every path below (pending create, gap id, live topic): the id is dropped on this broker.
     if (workerPool_) topicDroppedFanout_.post(topicId);
@@ -5785,22 +5785,23 @@ void BrokerNode::dropRuntimeTopic_(int32_t topicId, const std::string& name) {
             (void)topicRegistry_->dropTopic(topicId);   // a Gap id: seen now — dropped, never refilled
         // Fix round 2 (F4): a dir marked with THIS dropped id never stays under topics/<name> (a re-create of
         // the name would be refused for a dir no topic uses): the retire sequence renames and purges it.
-        const auto m = rune::gateway::readTopicIdMarker(fs::path(config_.dataDir) / "topics" / name);
+        const auto m = rune::gateway::readTopicIdMarker(topicsRoot(fs::path(config_.dataDir), nsId) / name);
         if (m.kind == rune::gateway::TopicIdMarker::Kind::Valid && m.id == topicId) {
             DroppedTopic d;
-            d.id = topicId; d.name = name; d.diskBacked = true; d.step = drop_step::AwaitingRename{};
+            d.id = topicId; d.nsId = nsId; d.name = name; d.diskBacked = true; d.step = drop_step::AwaitingRename{};
             droppedAwaitingRetire_.push_back(std::move(d));
         }
         return;
     }
     DroppedTopic d;
     d.id         = topicId;
+    d.nsId       = spec->nsId;
     d.name       = spec->name;
     d.diskBacked = spec->persistence != PersistenceMode::Transient;
     const int32_t partitions = spec->partitionCount;
-    if (d.name != name)
-        spdlog::warn("BrokerNode[{}]: catalog drop of id={} names '{}' but the topic is '{}' — dropping by id",
-                     config_.nodeId, topicId, name, d.name);
+    if (d.name != name || d.nsId != nsId)
+        spdlog::warn("BrokerNode[{}]: catalog drop of id={} names '{}' (ns {}) but the topic is '{}' (ns {}) — "
+                     "dropping by id", config_.nodeId, topicId, name, nsId, d.name, d.nsId);
     std::vector<rune::storage::Log*> logs;   // cold: the gateway forgets their addresses (M5)
     for (int32_t part = 0; part < partitions; ++part) logs.push_back(topicRegistry_->log(topicId, part));
     (void)topicRegistry_->dropTopic(topicId);   // serves nothing from now on (`spec` is not used after)
@@ -5810,7 +5811,9 @@ void BrokerNode::dropRuntimeTopic_(int32_t topicId, const std::string& name) {
         (void)gateway_->endTopicSubscriptions(topicId);   // explicit UnknownTopic, never silent
         gateway_->forgetDroppedTopic(topicId, partitions, logs);
     }
-    if (groupCoordService_) (void)groupCoordService_->onTopicDropped(d.name, nowNs);   // groups rebalance it away
+    // Groups resolve topic names in the default namespace only (namespaces Task 6): a drop in another namespace
+    // never rebalances a default-namespace group subscribed to the same name.
+    if (groupCoordService_ && d.nsId == 0) (void)groupCoordService_->onTopicDropped(d.name, nowNs);   // groups rebalance it away
     drop_step::AwaitingRetire retire;
     for (int32_t part = 0; part < partitions; ++part) {
         rune::replication::PartitionReplica* r = replicaRegistry_ ? replicaRegistry_->lookup(topicId, part) : nullptr;
@@ -5844,9 +5847,10 @@ void BrokerNode::runPendingCreatesBehindDrop_() {
         std::vector<PendingCreateBehindDrop> waiting;
         waiting.swap(pendingCreatesBehindDrop_);
         for (auto& pc : waiting) {
-            bool held = catalogNameHeldByDrop_(pc.spec.name);
+            bool held = catalogNameHeldByDrop_(pc.spec.nsId, pc.spec.name);
             for (const auto& q : pendingCreatesBehindDrop_)
-                held = held || q.spec.name == pc.spec.name || rune::catalog::topicNamesFoldEqual(q.spec.name, pc.spec.name);
+                held = held || (q.spec.nsId == pc.spec.nsId &&
+                                (q.spec.name == pc.spec.name || rune::catalog::topicNamesFoldEqual(q.spec.name, pc.spec.name)));
             if (held) pendingCreatesBehindDrop_.push_back(std::move(pc));
             else      runCatalogCreate_(pc.spec);
         }
@@ -5876,12 +5880,12 @@ int BrokerNode::serviceDroppedTopics_() {
         // AwaitingRename: move the data away atomically, then hand it to the admin purge.
         auto& rn = std::get<drop_step::AwaitingRename>(d.step);
         if (nowNs < rn.retryAtNs) { ++i; continue; }   // M2: a failed rename backs off
-        const fs::path from = fs::path(config_.dataDir) / "topics" / d.name;
+        const fs::path from = topicsRoot(fs::path(config_.dataDir), d.nsId) / d.name;
         std::error_code ec;
         if (d.diskBacked && fs::exists(fs::symlink_status(from, ec))) {
-            const fs::path droppedRoot = fs::path(config_.dataDir) / "dropped";
-            const fs::path to = droppedRoot / (std::to_string(d.id) + "." + d.name);
-            fs::create_directories(droppedRoot, ec);
+            const fs::path dropRoot = droppedRoot(fs::path(config_.dataDir), d.nsId);
+            const fs::path to = dropRoot / (std::to_string(d.id) + "." + d.name);
+            fs::create_directories(dropRoot, ec);
             if (!ec) fs::rename(from, to, ec);
             if (ec) {
                 rn.backoffNs = rn.backoffNs == 0 ? kRenameRetryMinNs : std::min(rn.backoffNs * 2, kRenameRetryMaxNs);
@@ -5895,8 +5899,8 @@ int BrokerNode::serviceDroppedTopics_() {
             }
             purgeOutbox_.push_back(to.string());
         }
-        spdlog::info("BrokerNode[{}]: dropped topic '{}' (id={}) retired — its data moved to dropped/",
-                     config_.nodeId, d.name, d.id);
+        spdlog::info("BrokerNode[{}]: dropped topic '{}' (id={}, ns {}) retired — its data moved to dropped/",
+                     config_.nodeId, d.name, d.id, d.nsId);
         droppedAwaitingRetire_.erase(droppedAwaitingRetire_.begin() + static_cast<std::ptrdiff_t>(i));
         renamed = true;
         ++work;

@@ -1,6 +1,7 @@
 // StorageIdentity.cpp — storage.meta: resolve at boot, the format CLI, origin / manifest transitions
 // (ISR design v3 §3.2, Step 5).  Cold path only; every function is static and stateless.
 #include <rune/node/StorageIdentity.h>
+#include <rune/node/NamespacePaths.h>
 
 #include <rune/transaction/detail/Crc32c.h>
 
@@ -244,10 +245,16 @@ std::string missingFilesOf(const fs::path& dir, SI::Class c) {
 
 // ── "Empty" (§3.2): no broker-state entry ────────────────────────────────────────────────────────────────────
 [[nodiscard]] bool isBrokerStateName(const std::string& n) {
-    static constexpr std::array<std::string_view, 9> kNames{
+    static constexpr std::array<std::string_view, 6> kNames{
         "node-state.dat", "term.log", "internal-isr.state", "process-incarnation", ".catalog-catchup",
-        "topics", "quarantine", "dropped", "memory-epoch-fence"};
+        "memory-epoch-fence"};
     for (auto k : kNames) if (n == k) return true;
+    // A namespace root (ns-<u32>, NamespacePaths.h) holds the topic, dropped and quarantine dirs; ns-<u32>.deleting
+    // is a namespace drop in progress.
+    constexpr std::string_view kDeleting = ".deleting";
+    const std::string_view v{n};
+    if (parseNsDir(v)) return true;
+    if (v.ends_with(kDeleting) && parseNsDir(v.substr(0, v.size() - kDeleting.size()))) return true;
     return n.rfind("__", 0) == 0;
 }
 

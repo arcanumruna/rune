@@ -2,6 +2,7 @@
 // session, the pre-authentication gate, the throttle, the auth deadline, the must-change-password rule, the counters
 // and the logs.  makeForTest + the apply*ForTest seams; the "client" is ScramTestClient.
 #include "support/ScramTestClient.h"
+#include <rune/node/NamespacePaths.h>
 
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/LogSafe.h>
@@ -118,7 +119,7 @@ struct Rig {
     void withTopic(int32_t partitions) {
         rune::node::TopicSpec ts;
         ts.name = "events"; ts.partitionCount = partitions; ts.topicId = 0;
-        const fs::path d = dir.path / "topics";
+        const fs::path d = rune::node::topicsRoot(dir.path, 0);
         fs::create_directories(d);
         auto next = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{ts}, d.string());
         gw.setTopicRegistry(next.get());

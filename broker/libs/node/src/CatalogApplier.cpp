@@ -528,7 +528,7 @@ void CatalogApplier::effects_(const CatalogEffects& sink, const cat::CatalogEven
         }
         return;
     case cat::EventKind::DropTopic:
-        if (sink.topicDropped) sink.topicDropped(a.droppedTopicId, e.objectName);
+        if (sink.topicDropped) sink.topicDropped(a.droppedTopicId, e.nsId, e.objectName);
         return;
     case cat::EventKind::AlterTopicConfig: {
         const cat::TopicObject* t = state_.topicByObjectId(e.objectId);
@@ -553,13 +553,13 @@ void CatalogApplier::effects_(const CatalogEffects& sink, const cat::CatalogEven
         if (sink.viewInstalled) sink.viewInstalled(*v);
         if (e.kind == cat::EventKind::AlterView) {
             if (sink.viewUninstalled) sink.viewUninstalled(a.droppedTopicId);
-            if (sink.topicDropped) sink.topicDropped(a.droppedTopicId, e.objectName);
+            if (sink.topicDropped) sink.topicDropped(a.droppedTopicId, e.nsId, e.objectName);
         }
         return;
     }
     case cat::EventKind::DropView:
         if (sink.viewUninstalled) sink.viewUninstalled(a.droppedTopicId);
-        if (sink.topicDropped) sink.topicDropped(a.droppedTopicId, e.objectName);
+        if (sink.topicDropped) sink.topicDropped(a.droppedTopicId, e.nsId, e.objectName);
         return;
     case cat::EventKind::NamespaceCreated:
     case cat::EventKind::NamespaceLimitsSet:

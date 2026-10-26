@@ -1144,9 +1144,9 @@ private:
             postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf*/0, s.persistence, c, s.nsId,
                                      kA2cCatalogSinkApplied);   // Task 12 (N5)
         };
-        fx.topicDropped = [this](int32_t topicId, const std::string& name) {
+        fx.topicDropped = [this](int32_t topicId, uint32_t nsId, const std::string& name) {
             postCatalog_(kA2cCatalogTopicDropped, catalogTopicDroppedWireLen(name),
-                         [&](uint8_t* p) { writeCatalogTopicDropped(p, topicId, name); });
+                         [&](uint8_t* p) { writeCatalogTopicDropped(p, topicId, name, nsId); });
         };
         fx.topicConfig = [this](int32_t topicId, std::span<const rune::catalog::ConfigChange> changes) {
             const std::size_t n = changes.size();
@@ -2269,7 +2269,7 @@ private:
     //   2. serviceDroppedTopics_ (each pass): once every worker and the cleaner /
     //      provisioner acked a generation >= retireGen (collectRetired's bound),
     //      the Logs are closed (releaseDroppedLogs) → AwaitingRename; then
-    //      rename(topics/<name>, dropped/<id>.<name>) — atomic; a failure is
+    //      rename(ns-<nsId>/topics/<name>, ns-<nsId>/dropped/<id>.<name>) — atomic; a failure is
     //      logged and retried next pass, never deleted in place — and the path
     //      is posted to the admin thread (kMsgPurgeDroppedDir), which removes it
     //      (a failure leaves it for the boot purge: reconcileTopicDirs, Task 16).
@@ -2279,12 +2279,12 @@ private:
     // -----------------------------------------------------------------------
     void onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView = false);
     void runCatalogCreate_(const TopicSpec& spec);
-    void dropRuntimeTopic_(int32_t topicId, const std::string& name);
+    void dropRuntimeTopic_(int32_t topicId, uint32_t nsId, const std::string& name);
     void onCatalogTopicConfig_(const uint8_t* p, std::size_t n);
     void onViewUninstall_(int32_t viewTopicId);
     int  serviceDroppedTopics_();
     int  pumpCatalogOutboxes_();
-    [[nodiscard]] bool catalogNameHeldByDrop_(const std::string& name) const noexcept;
+    [[nodiscard]] bool catalogNameHeldByDrop_(uint32_t nsId, const std::string& name) const noexcept;
     [[nodiscard]] bool catalogTopicServes_(int32_t topicId) const noexcept;
 
     // -----------------------------------------------------------------------
@@ -2708,6 +2708,7 @@ private:
     static constexpr int64_t kRenameRetryMaxNs = 10'000'000'000;  // 10 s
     struct DroppedTopic {
         int32_t                                      id = -1;
+        uint32_t                                     nsId = 0;   // namespaces Task 6: its dir is under ns-<nsId>
         std::string                                  name;
         bool                                         diskBacked = true;
         std::variant<drop_step::AwaitingRetire, drop_step::AwaitingRename> step;
