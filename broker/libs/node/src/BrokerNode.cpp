@@ -3263,6 +3263,10 @@ void BrokerNode::createMetrics_() {
     observerSlots_.outOfSync.set(-1, MetricOwner::Observer);
     controlSet_(RuneMetric::CatalogAppliedOffset, -1);
     controlSet_(RuneMetric::SecurityAppliedOffset, -1);
+    // Spec §9 "shouted at start": the first dev-mode warning precedes the AuthMode store (a reader that sees 1 has the
+    // warning in the log).  Start thread, before any agent runs; the same clock_ as the control runner, so the
+    // control-thread timer repeats it five minutes later, never twice at start.
+    serviceAuthMode_(clock_.nowNs());
     controlSet_(RuneMetric::AuthMode, config_.authMode == AuthMode::DevDisabled ? 1 : 0);
 
     systemMetrics_.emplace();
