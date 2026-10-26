@@ -38,16 +38,18 @@ inline CatalogView securityOf(BrokerNode& n) {
 }
 
 /// The same committed security leader on every running broker, iff it is in the committed ISR and its admin-thread
-/// replica is Leader; else -1.
-inline int32_t settledSecurityLeader(ThreeNodes& c) {
+/// replica is Leader; else -1.  `excluded` (a node id, 0 = none): a running but cut-off broker whose map cannot learn
+/// the new assignment until it heals - it is left out of the agreement and never the answer.
+inline int32_t settledSecurityLeader(ThreeNodes& c, int32_t excluded = 0) {
     int32_t leader = rune::metadata::NO_LEADER;
     for (BrokerNode* n : c.live()) {
+        if (excluded != 0 && n == &c.node(excluded)) continue;
         const auto pa = securityAssignmentOf(*n);
         if (!pa || pa->leaderNode == rune::metadata::NO_LEADER) return -1;
         if (leader == rune::metadata::NO_LEADER) leader = pa->leaderNode;
         if (pa->leaderNode != leader || !contains(pa->isr, leader)) return -1;
     }
-    if (leader < 1 || leader > 3 || !c.running(leader)) return -1;
+    if (leader < 1 || leader > 3 || leader == excluded || !c.running(leader)) return -1;
     return securityOf(c.node(leader)).role == rr::Role::Leader ? leader : -1;
 }
 

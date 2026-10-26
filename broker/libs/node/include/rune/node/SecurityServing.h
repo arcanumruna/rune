@@ -216,6 +216,7 @@ public:
     Actions step(int64_t nowNs, bool consensusClosed, const Committed* committed = nullptr) noexcept {
         if (!consensusClosed && nowNs - lastConsensusNs_ > stalenessNs_) { mapRefreshOwed_ = true; baselineSet_ = false; }
         if (consensusClosed) lastConsensusNs_ = nowNs;
+        if (committed != nullptr && committed->mapCurrent) lastMapCurrentNs_ = nowNs;
         if (committed != nullptr && mapRefreshOwed_ && consensusClosed) {
             if (committed->mapControls) mapRefreshOwed_ = false;
             else if (!baselineSet_) { mapAnswersBaseline_ = committed->mapAnswers; baselineSet_ = true; }
@@ -229,9 +230,12 @@ public:
             (!mapRefreshOwed_ &&
              (!adminAsLeader_ || (adminEpoch_ == committed->epoch && committed->selfLeads)) &&
              // Issue #460: a held verdict (its leader went silent) is current only while nothing can commit without
-             // this broker: it is in the committed ISR of a current map.  A cut-off follower is lag-shrunk out of it
-             // through the controller, which ends the hold; a lost consensus ends it F later (below).
-             (!adminHeld_ || (committed->selfInIsr && committed->mapCurrent)));
+             // this broker: it is in the committed ISR of a map that was current within F.  A cut-off follower is
+             // lag-shrunk out of it through the controller, which ends the hold; a lost consensus ends it F later
+             // (below).  The map may be non-current for a moment during a metadata leader change (the new leader has
+             // not answered yet, or a record arrived but is not applied yet) - like every other contact here that is
+             // bounded by F, never a single pass (the survivors of a crashed leader that led both must keep serving).
+             (!adminHeld_ || (committed->selfInIsr && nowNs - lastMapCurrentNs_ <= stalenessNs_)));
         const bool current = adminCaughtUp_ && forCommitted && nowNs - lastConsensusNs_ <= stalenessNs_;
         Actions a;
         if (current) {
@@ -249,6 +253,8 @@ public:
     [[nodiscard]] bool serving() const noexcept { return std::holds_alternative<Serving>(st_); }
     [[nodiscard]] const State& state() const noexcept { return st_; }
     [[nodiscard]] bool adminCaughtUp() const noexcept { return adminCaughtUp_; }
+    [[nodiscard]] bool adminHeld() const noexcept { return adminHeld_; }
+    [[nodiscard]] bool mapRefreshOwed() const noexcept { return mapRefreshOwed_; }
     [[nodiscard]] int64_t leaderHw() const noexcept { return leaderHw_; }
     /// Counter value: 0 CatchingUp, 1 Serving, 2 Stale.
     [[nodiscard]] int64_t code() const noexcept { return static_cast<int64_t>(st_.index()); }
@@ -269,6 +275,7 @@ private:
     bool    adminHeld_       = false;   // issue #460
     int64_t leaderHw_        = -1;
     int64_t lastConsensusNs_ = INT64_MIN / 2;
+    int64_t lastMapCurrentNs_ = INT64_MIN / 2;   // issue #460: the committed map was last current
 };
 
 } // namespace rune::node

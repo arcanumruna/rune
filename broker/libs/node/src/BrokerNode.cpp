@@ -3377,8 +3377,10 @@ int BrokerNode::stepSecurityServing_(int64_t nowNs) {
     }
     const SecurityServing::Actions a = securityServing_->step(nowNs, closed, cp);
     if (a.changed) {
-        spdlog::warn("BrokerNode[{}]: __security serving -> {} (admin caught up: {}, consensus closed: {}){}", config_.nodeId,
-                     securityServing_->name(), securityServing_->adminCaughtUp(), closed,
+        spdlog::warn("BrokerNode[{}]: __security serving -> {} (admin caught up: {}, held: {}, consensus closed: {}, "
+                     "in ISR: {}, map current: {}, map refresh owed: {}){}", config_.nodeId,
+                     securityServing_->name(), securityServing_->adminCaughtUp(), securityServing_->adminHeld(), closed,
+                     committed.selfInIsr, committed.mapCurrent, securityServing_->mapRefreshOwed(),
                      securityServing_->serving() ? "" : " - logins, __security reads and security DDL answer "
                                                          "AuthUnavailable (48) until it is current again");
         gateway_->setSecurityServing(securityServing_->serving());

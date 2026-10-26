@@ -556,12 +556,29 @@ TEST(SecurityServingRegression, AHeldVerdictServesOnlyInTheCommittedIsrOfACurren
     c.selfInIsr = true;
     EXPECT_TRUE(s.step(5 * kF + 2, true, &c).changed);
     EXPECT_TRUE(s.serving());
-    // The map not current: stale.
+    // The map not current (a metadata leader change: the new leader has not answered yet): it keeps serving for F,
+    // like every other contact here, then goes stale; current again, it serves again.
     c.mapCurrent = false;
-    EXPECT_TRUE(s.step(5 * kF + 3, true, &c).changed);
+    EXPECT_FALSE(s.step(5 * kF + 3, true, &c).changed);
+    EXPECT_TRUE(s.serving());
+    EXPECT_FALSE(s.step(6 * kF + 2, true, &c).changed);
+    EXPECT_TRUE(s.serving()) << "exactly F after the map was last current";
+    EXPECT_TRUE(s.step(6 * kF + 3, true, &c).changed);
     EXPECT_FALSE(s.serving());
     c.mapCurrent = true;
+    ASSERT_TRUE(s.step(6 * kF + 4, true, &c).changed);
+    ASSERT_TRUE(s.serving());
+    // A map-currency blip is never stale (issue #460: the survivors of a crashed leader that led the metadata too).
+    for (int64_t t = 6 * kF + 5; t <= 6 * kF + 5 + kF / 2; t += kMs) {
+        c.mapCurrent = (t / kMs) % 3 != 0;
+        (void)s.step(t, true, &c);
+        EXPECT_TRUE(s.serving()) << t;
+    }
+    c.mapCurrent = true;
+    s = SecurityServing(kF, kR);
+    s.onAdminCaughtUp(true, 5, 2, false, /*held=*/true);
     ASSERT_TRUE(s.step(5 * kF + 4, true, &c).changed);
+    ASSERT_TRUE(s.serving());
     // The consensus lost past F: stale (the ISR in a frozen map proves nothing).
     EXPECT_FALSE(s.step(6 * kF + 4, false, &c).changed);
     EXPECT_TRUE(s.step(6 * kF + 5, false, &c).changed);

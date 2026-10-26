@@ -1368,7 +1368,7 @@ TEST(AuthRestartAdversarialRegression, ACutOffSecurityLeaderNeverMakesTheSurvivo
             const std::string s = t.node(id).securityServingForTest();
             if (s != "Serving" && lapses[id].empty()) lapses[id] = s + " at " + std::to_string(msSince(cut)) + " ms";
         }
-        if (!newLeader) { const int32_t l = settledSecurityLeader(t.cluster()); newLeader = l > 0 && l != leader; }
+        if (!newLeader) { const int32_t l = settledSecurityLeader(t.cluster(), leader); newLeader = l > 0 && l != leader; }
         std::this_thread::sleep_for(5ms);
     }
     EXPECT_TRUE(newLeader) << "a new __security leader";
