@@ -3119,4 +3119,30 @@ TEST(NodeConfigRegression, GroupKnobBoundsAndEffectiveSessionBoundsAdversarialRe
     EXPECT_EQ(res.config->groupMaxSessionTimeoutMs, 500);
 }
 
+// Namespaces Task 8 (coordinator note on 8a9cbc5): RUNE_MAX_NAMESPACES and RUNE_NS_DEFAULT_* are read on their own,
+// with no RUNE_GROUP_MIN_SESSION_TIMEOUT_MS set (the block was once nested inside that variable's `if`, so it was
+// read only when the group knob was set).  Unset → the defaults; set → carried; garbage refuses startup.
+// RED: nest the namespaces block back under the group knob.
+TEST(NodeConfigRegression, MaxNamespacesReadWithoutGroupSessionTimeoutRegression) {
+    auto env = base1node();
+    env["RUNE_AUTH"] = "disabled";   // #533: a RUNE_TLS=OFF build refuses the default authentication
+    ASSERT_EQ(env.count("RUNE_GROUP_MIN_SESSION_TIMEOUT_MS"), 0u);
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->maxNamespaces, 1024);
+    EXPECT_EQ(r.config->nsDefaultLimits.maxTopics, 0u);
+    env["RUNE_MAX_NAMESPACES"] = "7";
+    env["RUNE_NS_DEFAULT_MAX_TOPICS"] = "11";
+    env["RUNE_NS_DEFAULT_FEATURE_BITS"] = "5";
+    r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->maxNamespaces, 7);
+    EXPECT_EQ(r.config->nsDefaultLimits.maxTopics, 11u);
+    EXPECT_EQ(r.config->nsDefaultLimits.featureBits, 5u);
+    env["RUNE_MAX_NAMESPACES"] = "x";
+    r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.config.has_value());
+    EXPECT_NE(r.error.find("RUNE_MAX_NAMESPACES"), std::string::npos) << r.error;
+}
+
 } // namespace rune::node

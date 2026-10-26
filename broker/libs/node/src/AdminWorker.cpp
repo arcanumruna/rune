@@ -387,6 +387,9 @@ void AdminWorker::attachSecurity(SecurityApplier booted, rune::replication::Part
     securityApplier_.emplace(std::move(booted));
     securityReplica_ = replica;
     securityAdmin_.emplace(*securityApplier_, replica, deps_.respondSecurity, selfId_);
+    // Namespaces Task 8: `applier_` is a member (move-assigned in place by adoptBootedApplier), so its state's address
+    // is stable for this worker's life.
+    securityAdmin_->bindCatalog(&applier_.state());
     if (replica != nullptr)
         // Authentication Task 10: `__security` reads ride a second CatalogReadServer on the same egress; its ids carry
         // the security id bit so one id names one server.

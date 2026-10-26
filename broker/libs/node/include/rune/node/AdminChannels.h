@@ -398,6 +398,9 @@ struct SecurityDdlMsg {
     std::string                   denial;
     /// PR #410 review F2: the gateway checked an own-credential proof for this request (whatever the outcome).
     uint8_t                       proofChecked = 0;
+    /// Namespaces Task 8: the namespace of the session's user (0 = `default`).  An unqualified `name` / `roleName`
+    /// resolves into it, and the leader's namespace guard judges the caller as a user of it.
+    uint32_t                      callerNsId = 0;
 };
 
 /// SecurityBootstrap: the gateway already verified the MAC with its ClusterKeys; the nonce is kept as the request's
@@ -691,6 +694,7 @@ template <class W> void layout(W& w, const SecurityDdlMsg& m) {
     layoutVerifier(w, m.verifier);
     w.u8(m.granteeKind); w.u8(m.op); w.u8(m.resourceType); w.u8(m.patternKind);
     w.str16(m.pattern); w.str16(m.roleName); w.u8(m.force); w.str16(m.denial); w.u8(m.proofChecked);
+    w.u32(m.callerNsId);
 }
 template <class W> void layout(W& w, const SecurityBootstrapMsg& m) {
     w.i64(m.session); w.i64(m.corr); layoutMeta(w, m.meta);
@@ -924,6 +928,7 @@ inline SecurityRequest decodeSecurityDdl(const uint8_t* buf, std::size_t len) {
     m.force = r.u8();
     r.str16(m.denial);
     m.proofChecked = r.u8();
+    m.callerNsId = r.u32();
     if (r.ok) {
         if (m.kind < 1 || m.kind > 9) r.fail("an unknown security op kind");
         else if (m.force > 1) r.fail("a force flag other than 0/1");

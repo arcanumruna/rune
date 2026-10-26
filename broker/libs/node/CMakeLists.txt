@@ -1929,6 +1929,11 @@ if(BUILD_TESTING)
         target_include_directories(rune_namespace_admin_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_namespace_admin_tests PRIVATE rune_node rune_view rune_replication rune_codec aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_admin_tests PROPERTIES TIMEOUT 360)
+        # Namespaces Task 8 (spec §4): the `__security` leader's namespace resolution and guard (no escalation).
+        add_executable(rune_namespace_escalation_tests tests/node/NamespaceEscalationTest.cpp)
+        target_include_directories(rune_namespace_escalation_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_escalation_tests PRIVATE rune_node rune_view rune_replication rune_codec aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_escalation_tests PROPERTIES TIMEOUT 360)
 
         # Catalog history Task 17: TestCluster::defineTopic — the in-process way to create a
         # topic now that the static topic list / NodeConfig::topics are gone (DDL over the wire on real

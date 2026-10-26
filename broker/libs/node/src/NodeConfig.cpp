@@ -886,11 +886,6 @@ ConfigResult parseNodeConfig(
         }
     }
 
-    // --- RUNE_GROUP_MIN_SESSION_TIMEOUT_MS / RUNE_GROUP_MAX_SESSION_TIMEOUT_MS (optional, 0 = the service defaults) —
-    // #499: the bounds a JoinGroup's session timeout is clamped into.  Both set with min > max is refused.
-    {
-        const char* rawMin = getenv_fn("RUNE_GROUP_MIN_SESSION_TIMEOUT_MS");
-        if (rawMin && !std::string_view(rawMin).empty()) {
     // --- RUNE_MAX_NAMESPACES (optional, default 1024) and RUNE_NS_DEFAULT_* (optional, default 0) — namespaces Task 7 ---
     {
         const char* raw = getenv_fn("RUNE_MAX_NAMESPACES");
@@ -934,6 +929,11 @@ ConfigResult parseNodeConfig(
             return {{}, "RUNE_NS_DEFAULT_*: internal limits encoding error"};
     }
 
+    // --- RUNE_GROUP_MIN_SESSION_TIMEOUT_MS / RUNE_GROUP_MAX_SESSION_TIMEOUT_MS (optional, 0 = the service defaults) —
+    // #499: the bounds a JoinGroup's session timeout is clamped into.  Both set with min > max is refused.
+    {
+        const char* rawMin = getenv_fn("RUNE_GROUP_MIN_SESSION_TIMEOUT_MS");
+        if (rawMin && !std::string_view(rawMin).empty()) {
             int32_t v{};
             if (!parseInt32(rawMin, v) || v < 1)
                 return {{}, std::string("RUNE_GROUP_MIN_SESSION_TIMEOUT_MS must be a positive integer, got: ") + rawMin};
