@@ -40,6 +40,8 @@ New event kinds go in `__catalog`; these kinds are already reserved there:
 - `NamespaceStateChanged(nsId, state)`;
 - `NamespaceDeleted(nsId)`.
 
+The kinds are added to catalog formatVer 1, with no version bump: there are no mixed-version clusters and no in-place upgrade, so no node ever meets an event it cannot apply.
+
 Users and grants for a namespace go in `__security`, tagged with its `nsId`. Every node applies the events in log order, and applying the same event twice changes nothing.
 
 ## 4. Lifecycle
@@ -335,8 +337,6 @@ Still to decide. Each has the recommended answer; a line is removed when the dec
 section it belongs to.
 
 **Code facts the spec must match**
-2. The catalog reserves kinds 32–63 only as a block that formatVer 1 refuses. Recommended: the namespace events
-   bump the catalog to formatVer 2.
 3. `SecurityOperation` and `SecurityResourceType` are frozen enums with no `Truncate` or `Namespace`. Recommended:
    append `Truncate = 7` and `Namespace = 5`; never renumber.
 4. `Log` already has a log-start-offset checkpoint, and the replication fetch carries `logStartOffset` (the Kafka
