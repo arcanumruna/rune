@@ -180,7 +180,13 @@ allocate nothing, and they must pass an ABAB bench against the CLAUDE.md latency
   - `beforeOffset = -1` means "up to the high watermark".
   - It needs the `Truncate` grant on the topic.
   - Internal (`__*`) topics are refused with `INVALID_REQUEST`, for every caller, the cluster admin included.
-- **What it does:** it advances the partition's `logStartOffset` to `min(beforeOffset, HW)`. It never moves the start backwards.
+- **What it does:** it advances the partition's `logStartOffset` to the furthest offset available when the
+  leader executes the request: `min(beforeOffset, HW, LSO)`, where the LSO (last stable offset) is the HW on a
+  topic with no open transactions. Records of a transaction still open stay; everything below them goes. The offset
+  is resolved once, at execution, and returned in the response; it is never re-resolved on retry or failover. It
+  never moves the start backwards.
+- **Topic kinds:** user topics, transactional or not, and transient topics can be truncated; only internal (`__*`)
+  topics are refused.
 - **Flow:**
   1. The leader appends a `LogStartAdvanced(partition, offset)` control record.
   2. That record replicates through the normal path, so followers apply the same start.
@@ -357,10 +363,6 @@ section it belongs to.
 15. Recreating a name while the old `nsId` is still `DELETING`. Recommended: allowed; the new `nsId` cannot match
     the old state.
 17. `default` can be suspended. Recommended: yes.
-
-**Truncate**
-18. Truncate of transient topics. Recommended: refused, as for internal topics.
-19. Truncate clamps to the last stable offset as well as the HW on transactional topics. Recommended: yes.
 
 **Scope**
 20. Split NAT egress (§10.5) and the CLI work into their own specs. Recommended: yes.
