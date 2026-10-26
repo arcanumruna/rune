@@ -5,7 +5,8 @@
 // name the reason and the wire that does not, and the 1'000'229-231 counters.
 #include "support/AuthBroker.h"
 
-#include <rune/node/RoleCounter.h>
+#include <rune/node/RuneMetricSlot.h>
+#include <rune/node/RuneMetrics.h>
 
 #include <gtest/gtest.h>
 
@@ -441,16 +442,151 @@ TEST(AuthLoginRegression, CountersCountOkFailedAndThrottled) {
     AuthBroker b("counters");
     b.bootstrapAdmin();   // the admin's one-time login = 1 ok
     b.createUser("ws1", kPwA);
-    ASSERT_TRUE(b.awaitCounter(kLoginsOkCounterTypeId, 1)) << "registered; the bootstrap flow's one login";
-    ASSERT_TRUE(b.awaitCounter(kLoginsFailedCounterTypeId, 0));
-    ASSERT_TRUE(b.awaitCounter(kLoginsRateLimitedCounterTypeId, 0));
+    ASSERT_TRUE(b.awaitCounter(typeIdOf(RuneMetric::LoginsOk), 1)) << "registered; the bootstrap flow's one login";
+    ASSERT_TRUE(b.awaitCounter(typeIdOf(RuneMetric::LoginsFailed), 0));
+    ASSERT_TRUE(b.awaitCounter(typeIdOf(RuneMetric::LoginsRateLimited), 0));
     AuthWireClient& w = b.wire();
     ASSERT_TRUE(w.connectAndLogin(b.channel(), "ws1", kPwA).ok());
     for (int i = 0; i < 3; ++i) ASSERT_FALSE(w.connectAndLogin(b.channel(), "nobody", "x").ok());
     const int64_t sid = w.connect(b.channel());
     const auto limited = w.login(b.channel(), sid, "nobody", {"x", "x"});
     ASSERT_GT(limited.fin->retryAfterMs, 0u);
-    EXPECT_TRUE(b.awaitCounter(kLoginsOkCounterTypeId, 2));
-    EXPECT_TRUE(b.awaitCounter(kLoginsFailedCounterTypeId, 3));
-    EXPECT_TRUE(b.awaitCounter(kLoginsRateLimitedCounterTypeId, 1));
+    EXPECT_TRUE(b.awaitCounter(typeIdOf(RuneMetric::LoginsOk), 2));
+    EXPECT_TRUE(b.awaitCounter(typeIdOf(RuneMetric::LoginsFailed), 3));
+    EXPECT_TRUE(b.awaitCounter(typeIdOf(RuneMetric::LoginsRateLimited), 1));
+}
+
+// ── arcanum-metrics plan Task 9 (spec §5.3; D58, D59): the three metric writers ────────────────────────────────
+namespace {
+
+/// A broker whose provisioner builds on the first demand: a 1-byte cap makes every build unpreallocated, a 1%
+/// threshold posts a demand after ~10 KiB of a 1 MiB segment.
+AuthBroker::Options provisionOnFirstDemand() {
+    AuthBroker::Options o;
+    o.configure = [](NodeConfig& c) {
+        c.segmentProvisionCapBytes = 1;
+        c.segmentProvisionThresholdPct = 1;
+    };
+    return o;
+}
+
+/// Creates a user that may create and write `topic`, logs it in, defines the 1-partition topic and produces until
+/// the provisioner publishes an unpreallocated build (bounded).  `eachRound` runs after every produce (e.g. an
+/// observer publish).
+template <typename F>
+::testing::AssertionResult driveProvisioner(AuthBroker& b, const std::string& topic, F&& eachRound) {
+    using SO = rune::protocol::SecurityOperation;
+    using ST = rune::protocol::SecurityResourceType;
+    using SP = rune::protocol::SecurityPatternKind;
+    const std::string user = topic + "_writer";
+    b.createUser(user, kPwA, {AuthGrant{SO::Create, ST::Topic, SP::Exact, topic},
+                              AuthGrant{SO::Write, ST::Topic, SP::Exact, topic}});
+    AuthWireClient& w = b.wire();   // one client: wire() makes a fresh one per call
+    const auto login = w.connectAndLogin(b.channel(), user, kPwA);
+    if (!login.ok()) return ::testing::AssertionFailure() << "login " << user << " failed";
+    const int64_t sid = login.sessionId;
+    ShardTestClient& c = w.raw();
+    const auto def = c.defineTopicUntil(b.channel(), AuthWireClient::kClientStream, sid, topic, 1, false, {},
+                                        ShardTestClient::Clock::now() + std::chrono::seconds(20));
+    if (!def || def->errorCode != 0)
+        return ::testing::AssertionFailure() << "define " << topic << " failed: " << (def ? def->errorCode : -1);
+    const auto built = [&] {
+        const auto v = b.counter(typeIdOf(RuneMetric::ProvisionUnpreallocBuilds));
+        return v && *v >= 1;
+    };
+    // ~96 KiB per batch (under the client's 128 KiB message cap): the default 64 MiB roll's 1% threshold (~671 KB)
+    // is crossed within a few produces.
+    const std::string value(4096, 'p');
+    rune::protocol::RecordBatchBuilder bb(0, 1000);
+    for (int i = 0; i < 24; ++i) bb.append("k", value, 1000 + i);
+    const auto batch = bb.build();
+    for (int i = 0; i < 60 && !built(); ++i) {
+        if (!c.produceUntilOk(b.channel(), AuthWireClient::kClientStream, sid, def->topicId, 0, 1, batch))
+            return ::testing::AssertionFailure() << "produce " << i << " failed";
+        eachRound();
+    }
+    for (int i = 0; i < 500 && !built(); ++i) {   // the build itself runs on the provisioner thread
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        eachRound();
+    }
+    if (!built()) return ::testing::AssertionFailure() << "the provisioner never published an unpreallocated build";
+    return ::testing::AssertionSuccess();
+}
+
+}  // namespace
+
+// D58: every kRuneMetrics row is written only by its declared MetricOwner - the control thread, the role observer
+// (publishRole) or the segment provisioner - across a run that moves all three: the election, logins ok and failed,
+// a topic DDL, and produce that drives the provisioner.  The debug owner-tag record holds one bit per writer; a row
+// written by a foreign owner also trips the slot's assert.  (Suite BrokerMetricsRegression so it runs with the
+// metrics regression set; it lives here for the authenticated wire rig.)
+// RED: hand the provisioner the observer's role slot (BrokerNode's provSlots) -> the role row's record gains the
+// Provisioner bit and the assert fires.
+TEST(BrokerMetricsRegression, OwnerTableRegression) {
+#ifdef NDEBUG
+    GTEST_SKIP() << "the owner-tag record is a debug-build check (D58)";
+#else
+    AuthBroker b("owner_table", provisionOnFirstDemand());
+    b.bootstrapAdmin();
+    b.createUser("ot1", kPwA);
+    AuthWireClient& w = b.wire();
+    ASSERT_TRUE(w.connectAndLogin(b.channel(), "ot1", kPwA).ok());
+    ASSERT_FALSE(w.connectAndLogin(b.channel(), "ot1", "not the password").ok());
+    ASSERT_TRUE(driveProvisioner(b, "ottopic", [] {}));
+    b.node().publishRole();
+    ASSERT_TRUE(b.awaitCounter(typeIdOf(RuneMetric::LoginsFailed), 1));
+
+    for (const RuneMetricDef& d : kRuneMetrics) {
+        const std::uint8_t by = b.node().metricWrittenByForTest(d.id);
+        EXPECT_EQ(by & static_cast<std::uint8_t>(~metricOwnerBit(d.owner)), 0)
+            << "row " << typeIdOf(d.id) << " (" << d.labelPrefix << ") written by owners 0x" << std::hex << int(by);
+    }
+    // Not vacuous: each of the three writers wrote its rows in this run.
+    for (RuneMetric m : {RuneMetric::Role, RuneMetric::Term, RuneMetric::OutOfSyncPartitions}) {
+        EXPECT_EQ(b.node().metricWrittenByForTest(m), metricOwnerBit(MetricOwner::Observer)) << typeIdOf(m);
+    }
+    EXPECT_EQ(b.node().metricWrittenByForTest(RuneMetric::ProvisionUnpreallocBuilds),
+              metricOwnerBit(MetricOwner::Provisioner));
+    for (RuneMetric m : {RuneMetric::LoginsOk, RuneMetric::LoginsFailed, RuneMetric::CatalogAppliedOffset}) {
+        EXPECT_EQ(b.node().metricWrittenByForTest(m), metricOwnerBit(MetricOwner::Control)) << typeIdOf(m);
+    }
+    EXPECT_EQ(b.counter(typeIdOf(RuneMetric::Role)), static_cast<std::int64_t>(RoleCode::Leader));
+#endif
+}
+
+// D59: the control thread (logins, DDL), the observer (publishRole on this thread) and the provisioner (builds) write
+// their own rows while a reader thread scans every row of the file.  Each read is a whole, sane value.  The race
+// detector is the point: this runs under TSan at checkpoint B.
+TEST(BrokerMetricsRegression, ThreeWritersUnderTsanRegression) {
+    AuthBroker b("three_writers", provisionOnFirstDemand());
+    b.bootstrapAdmin();
+    const std::string path = b.node().metricsFilePath();
+    const std::int32_t nodeId = b.node().nodeIdForTest();
+    std::atomic<bool> stop{false};
+    std::atomic<int> scans{0};
+    std::atomic<int> bad{0};
+    std::thread reader([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            for (const RuneMetricDef& d : kRuneMetrics) {
+                const auto v = rune::node::test::readRuneMetricAt(path, typeIdOf(d.id), nodeId);
+                if (!v) { bad.fetch_add(1, std::memory_order_relaxed); continue; }
+                if (d.id == RuneMetric::Role && (*v < -1 || *v > 2)) bad.fetch_add(1, std::memory_order_relaxed);
+                if (d.owner == MetricOwner::Provisioner && *v < 0) bad.fetch_add(1, std::memory_order_relaxed);
+            }
+            scans.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    AuthWireClient& w = b.wire();
+    for (int i = 0; i < 2; ++i) EXPECT_FALSE(w.connectAndLogin(b.channel(), "nobody" + std::to_string(i), "x").ok());
+    const auto r = driveProvisioner(b, "twtopic", [&] { b.node().publishRole(); });
+    for (int i = 0; i < 200; ++i) b.node().publishRole();
+    for (int i = 0; i < 1000 && scans.load(std::memory_order_relaxed) < 3; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    stop.store(true, std::memory_order_release);
+    reader.join();
+    ASSERT_TRUE(r);
+    EXPECT_GE(scans.load(), 3);
+    EXPECT_EQ(bad.load(), 0) << "a row was missing or out of range mid-write";
+    EXPECT_EQ(b.counter(typeIdOf(RuneMetric::Role)), static_cast<std::int64_t>(RoleCode::Leader));
+    EXPECT_TRUE(b.awaitCounter(typeIdOf(RuneMetric::LoginsFailed), 2));
 }

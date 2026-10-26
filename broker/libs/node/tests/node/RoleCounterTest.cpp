@@ -1,12 +1,12 @@
 // ---------------------------------------------------------------------------
-// RoleCounterTest — unit tests for the pure RoleCounter wire encoding.
+// RoleCounterTest — unit tests for the pure node-role metric encoding (RuneMetrics.h).
 //
 // Verifies the key encode/decode round-trip and the RoleCode <-> value mapping
-// that the Aeron node-role counter relies on.  No Aeron driver required — this
+// that the node-role metric relies on.  No Aeron driver required — this
 // is the machine-readable leadership contract between BrokerNode (writer) and
 // rune_role (reader), so it must be exactly round-trippable.
 // ---------------------------------------------------------------------------
-#include <rune/node/RoleCounter.h>
+#include <rune/node/RuneMetrics.h>
 
 #include <gtest/gtest.h>
 
@@ -64,13 +64,20 @@ TEST(RoleCounterTest, RoleCodeNameStrings) {
 }
 
 TEST(RoleCounterTest, TypeIdsAreDistinctAndInRuneRange) {
-    EXPECT_NE(kRoleCounterTypeId, kTermCounterTypeId);
+    EXPECT_NE(typeIdOf(RuneMetric::Role), typeIdOf(RuneMetric::Term));
     // In Rune's own application range, not Aeron's reserved 200-221.
-    EXPECT_GE(kRoleCounterTypeId, 1'000'000);
-    EXPECT_GE(kTermCounterTypeId, 1'000'000);
+    EXPECT_GE(typeIdOf(RuneMetric::Role), 1'000'000);
+    EXPECT_GE(typeIdOf(RuneMetric::Term), 1'000'000);
 }
 
-TEST(RoleCounterTest, LabelsIncludeNodeId) {
-    EXPECT_NE(roleCounterLabel(5).find("node=5"), std::string::npos);
-    EXPECT_NE(termCounterLabel(5).find("node=5"), std::string::npos);
+// D61: the type ids and label prefixes a reader of the old cnc.dat counters matched stay the same in the metrics file
+// (the node writes "<labelPrefix> node=<id>").
+TEST(RoleCounterTest, RoleAndTermRowsKeepTheirTypeIdsAndLabels) {
+    EXPECT_EQ(typeIdOf(RuneMetric::Role), 1'000'201);
+    EXPECT_EQ(typeIdOf(RuneMetric::Term), 1'000'203);
+    EXPECT_EQ(typeIdOf(RuneMetric::OutOfSyncPartitions), 1'000'211);
+    EXPECT_STREQ(kRuneMetrics[static_cast<std::size_t>(runeMetricRow(RuneMetric::Role))].labelPrefix, "rune-cluster-node-role");
+    EXPECT_STREQ(kRuneMetrics[static_cast<std::size_t>(runeMetricRow(RuneMetric::Term))].labelPrefix,
+                 "rune-cluster-leadership-term");
+    EXPECT_EQ(kRuneMetrics[static_cast<std::size_t>(runeMetricRow(RuneMetric::Role))].owner, MetricOwner::Observer);
 }

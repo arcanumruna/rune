@@ -1,29 +1,26 @@
 // ---------------------------------------------------------------------------
-// RoleCounterPublishTest — integration test for the Aeron node-role counter.
+// RoleCounterPublishTest — integration test for the node-role metric (the node's metrics file, D59).
 //
 // Proves the full machine-readable-leadership contract WITHOUT Docker:
 //   1. Bring up a single-node BrokerNode (embeds the Aeron media driver).
 //   2. Wait for self-election, then call publishRole() (as main's loop does).
-//   3. Read the counters back out of the driver's CnC file with the SAME API
-//      the standalone rune_role reader uses (CncFileReader + CountersReader),
-//      and assert role=LEADER + term matches leadershipTermId().
+//   3. Read the rows back out of the node's metrics file with a fresh read-only
+//      mapping (MetricsReader, matched by type id + node key), and assert
+//      role=LEADER + term matches leadershipTermId().
 //
 // This is the fast, native reproduction of "can an external observer detect the
 // leader via counters (not logs)?" — it exercises exactly the publish path
-// (BrokerNode) and the read path (CncFileReader) that the dr-e2e harness relies
-// on via `docker exec rune_role`.
+// (BrokerNode) and the read path (MetricsReader) that rune_role uses.
 // ---------------------------------------------------------------------------
 #include <rune/aeronutil/testing/FreePort.h>
 #include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
-#include <rune/node/RoleCounter.h>
+#include <rune/node/RuneMetrics.h>
 #include "MetricsTestReader.h"
 #include "support/TestWorkerCount.h"
 #include "support/CatalogBrokerCluster.h"
 
-#include <CncFileReader.h>
-#include <concurrent/CountersReader.h>
 
 #include <rune/node/AuthDevMode.h>
 #include <rune/node/SecurityPartition.h>
@@ -80,46 +77,36 @@ struct TempDir {
     ~TempDir() { std::error_code ec; fs::remove_all(path, ec); }
 };
 
-// Read (role, term, nodeId) out of the CnC file the same way rune_role does.
-// Returns false if the role counter is not present yet.
-bool readRoleCounter(const fs::path& aeronDir,
-                     RoleCode& role, std::int64_t& term, std::int32_t& nodeId) {
-    aeron::CncFileReader reader =
-        aeron::CncFileReader::mapExisting(aeronDir.string().c_str());
-    aeron::concurrent::CountersReader counters = reader.countersReader();
-
-    bool foundRole = false;
+// Read (role, term, key node id, label) out of the node's metrics file the way an external tool does (a fresh
+// read-only mapping, matched by (typeId, 4-byte LE node key)).  arcanum-metrics D59: the observer writes these rows
+// into the metrics file; cnc.dat holds only the driver's own counters.  Returns false if the role row is absent.
+bool readRoleCounter(const BrokerNode& node,
+                     RoleCode& role, std::int64_t& term, std::int32_t& nodeId, std::string* roleLabel = nullptr) {
     role = RoleCode::None;
     term = -1;
     nodeId = -1;
-
-    counters.forEach(
-        [&](std::int32_t id, std::int32_t typeId,
-            const aeron::concurrent::AtomicBuffer& keyBuffer,
-            const std::string&) {
-            if (typeId == kRoleCounterTypeId) {
-                std::int32_t nid = -1;
-                if (decodeRoleKey(keyBuffer.buffer(),
-                                  static_cast<std::size_t>(keyBuffer.capacity()),
-                                  nid)) {
-                    nodeId = nid;
-                }
-                role = roleCodeFromValue(counters.getCounterValue(id));
-                foundRole = true;
-            } else if (typeId == kTermCounterTypeId) {
-                term = counters.getCounterValue(id);
-            }
-        });
-    return foundRole;
+    const auto r = rune::node::test::readRuneMetricLiveAt(node.metricsFilePath(), typeIdOf(RuneMetric::Role),
+                                                          node.nodeIdForTest());
+    if (!r) return false;
+    std::int32_t nid = -1;
+    if (decodeRoleKey(reinterpret_cast<const std::uint8_t*>(r->keyBytes.data()),
+                      static_cast<std::size_t>(r->keyLength), nid)) {
+        nodeId = nid;
+    }
+    role = roleCodeFromValue(r->value);
+    if (roleLabel != nullptr)
+        roleLabel->assign(reinterpret_cast<const char*>(r->labelBytes.data()), static_cast<std::size_t>(r->labelLength));
+    if (const auto t = rune::node::test::readRuneMetric(node, RuneMetric::Term)) term = *t;
+    return true;
 }
 
 } // namespace
 
 // ===========================================================================
-// Leader publishes role=LEADER + its term into the CnC counters; an external
-// reader (CncFileReader) recovers them — no logs involved.
+// Leader publishes role=LEADER + its term into the metrics file; an external
+// reader (MetricsReader) recovers them — no logs involved.
 // ===========================================================================
-TEST(RoleCounterPublishTest, LeaderRoleAndTermReadableFromCnc) {
+TEST(RoleCounterPublishTest, LeaderRoleAndTermReadableFromMetricsFile) {
     TempDir tmp{"leader_"};
     NodeConfig cfg = makeSingleNodeConfig(tmp.path);
 
@@ -128,10 +115,8 @@ TEST(RoleCounterPublishTest, LeaderRoleAndTermReadableFromCnc) {
     ASSERT_TRUE(node.awaitLeader(3s)) << "single node should self-elect";
     ASSERT_TRUE(node.isLeader());
 
-    const fs::path aeronDir = tmp.path / "aeron";
-
-    // Drive publishRole() and poll the CnC counters until the driver has acked
-    // the counter allocation and the value reflects LEADER (bounded ~5 s).
+    // Drive publishRole() and poll the metrics file until the role reflects LEADER
+    // (bounded ~5 s; the row exists from start(), so this waits only for the election snapshot).
     RoleCode role = RoleCode::None;
     std::int64_t term = -1;
     std::int32_t nodeId = -1;
@@ -139,7 +124,7 @@ TEST(RoleCounterPublishTest, LeaderRoleAndTermReadableFromCnc) {
     const auto deadline = std::chrono::steady_clock::now() + 5s;
     while (std::chrono::steady_clock::now() < deadline) {
         node.publishRole();
-        if (readRoleCounter(aeronDir, role, term, nodeId) &&
+        if (readRoleCounter(node, role, term, nodeId) &&
             role == RoleCode::Leader) {
             sawLeader = true;
             break;
@@ -157,10 +142,11 @@ TEST(RoleCounterPublishTest, LeaderRoleAndTermReadableFromCnc) {
 }
 
 // ===========================================================================
-// The role counter uses Rune's own type ids (not Aeron's reserved range) and
-// both role + term counters are present and attributed to this node.
+// The role row uses Rune's own type ids (not Aeron's reserved range) and both
+// role + term rows are present from start() and attributed to this node (key +
+// label), with no lookup retry: the first read after start() finds them.
 // ===========================================================================
-TEST(RoleCounterPublishTest, BothCountersPresentWithNodeKey) {
+TEST(RoleCounterPublishTest, BothRowsPresentWithNodeKey) {
     TempDir tmp{"both_"};
     NodeConfig cfg = makeSingleNodeConfig(tmp.path);
 
@@ -168,21 +154,14 @@ TEST(RoleCounterPublishTest, BothCountersPresentWithNodeKey) {
     node.start();
     ASSERT_TRUE(node.awaitLeader(3s));
 
-    const fs::path aeronDir = tmp.path / "aeron";
-
     RoleCode role = RoleCode::None;
     std::int64_t term = -1;
     std::int32_t nodeId = -1;
-    bool found = false;
-    const auto deadline = std::chrono::steady_clock::now() + 5s;
-    while (std::chrono::steady_clock::now() < deadline) {
-        node.publishRole();
-        if (readRoleCounter(aeronDir, role, term, nodeId)) { found = true; break; }
-        std::this_thread::sleep_for(50ms);
-    }
-
-    ASSERT_TRUE(found) << "role counter not present in CnC";
+    std::string label;
+    ASSERT_TRUE(readRoleCounter(node, role, term, nodeId, &label)) << "role row not present in the metrics file";
     EXPECT_EQ(nodeId, static_cast<std::int32_t>(cfg.nodeId));
+    EXPECT_EQ(label, "rune-cluster-node-role node=" + std::to_string(cfg.nodeId));
+    ASSERT_TRUE(rune::node::test::readRuneMetric(node, RuneMetric::Term).has_value()) << "term row present";
 
     node.stop();
 }
@@ -191,8 +170,8 @@ TEST(RoleCounterPublishTest, BothCountersPresentWithNodeKey) {
 // Catalog history Task 7: the CatalogApplier's metrics.  The admin thread's
 // production sink posts kA2cCatalogApplied / kA2cCatalogHalted on the
 // admin→control ring; the control thread sets the two counters
-// (kCatalogAppliedOffsetCounterTypeId = last applied offset,
-// kCatalogApplyHaltedCounterTypeId = halted offset + 1, 0 while applying).
+// (typeIdOf(RuneMetric::CatalogAppliedOffset) = last applied offset,
+// typeIdOf(RuneMetric::CatalogApplyHalted) = halted offset + 1, 0 while applying).
 // ===========================================================================
 namespace {
 // arcanum-metrics plan Task 8: the catalog metrics live in the node's metrics file (cnc.dat no longer has them).
@@ -281,7 +260,7 @@ TEST(RoleCounterRegression, StorageGateCountersArePublishedRegression) {
     const auto deadline = std::chrono::steady_clock::now() + 30s;
     while (!sawZeroAfter && std::chrono::steady_clock::now() < deadline) {
         std::int64_t v = -1;
-        if (readCounterByType(joiner, kStorageGateStateCounterTypeId, v)) {
+        if (readCounterByType(joiner, typeIdOf(RuneMetric::StorageGateState), v)) {
             if (v == 1) sawOne = true;
             if (v == 0 && sawOne) sawZeroAfter = true;
         }
@@ -337,7 +316,7 @@ TEST(NodeConfigRegression, DevModeSingleNodeStartsAndWarns) {
     node.start();
     ASSERT_TRUE(node.awaitLeader(5s));
     const NodeMetrics nm{tmp.path, cfg.nodeId};
-    EXPECT_TRUE(awaitCounter(nm, kAuthModeCounterTypeId, 1, 10s)) << "counter 1'000'228 = 1 in dev mode";
+    EXPECT_TRUE(awaitCounter(nm, typeIdOf(RuneMetric::AuthMode), 1, 10s)) << "counter 1'000'228 = 1 in dev mode";
     EXPECT_GE(log.count("AUTHENTICATION DISABLED (RUNE_AUTH=disabled)"), 1) << "the dev-mode warning at start";
     EXPECT_GE(log.count("every request runs as 'anonymous' with full access"), 1);
     node.stop();
@@ -433,7 +412,7 @@ TEST(NodeConfigRegression, EnabledModeNeedsAUsableClusterKeyFileAtStartRegressio
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(5s));
-    EXPECT_TRUE(awaitCounter(NodeMetrics{tmp2.path, cfg.nodeId}, kAuthModeCounterTypeId, 0, 10s)) << "counter 1'000'228 = 0 when enabled";
+    EXPECT_TRUE(awaitCounter(NodeMetrics{tmp2.path, cfg.nodeId}, typeIdOf(RuneMetric::AuthMode), 0, 10s)) << "counter 1'000'228 = 0 when enabled";
     node.stop();
     std::error_code ec; fs::remove(good, ec); fs::remove(bad, ec);
 }
@@ -456,9 +435,9 @@ TEST(RoleCounterRegression, PeerLinkCountersArePublishedRegression) {
         k.clusterKeyFile = ((k.nodeId == 3) ? keyDir / "x.key" : keyDir / "k.key").string();
     });
     auto aeronDir = [&](int id) { return NodeMetrics{c.dirs[static_cast<std::size_t>(id - 1)]->path, id}; };
-    EXPECT_TRUE(awaitCounter(aeronDir(1), kPeerLinksEstablishedCounterTypeId, 1, 20s)) << "node 1 links with node 2 only";
-    EXPECT_TRUE(awaitCounter(aeronDir(2), kPeerLinksEstablishedCounterTypeId, 1, 20s));
-    EXPECT_TRUE(awaitCounter(aeronDir(3), kPeerLinksEstablishedCounterTypeId, 0, 20s));
+    EXPECT_TRUE(awaitCounter(aeronDir(1), typeIdOf(RuneMetric::PeerLinksEstablished), 1, 20s)) << "node 1 links with node 2 only";
+    EXPECT_TRUE(awaitCounter(aeronDir(2), typeIdOf(RuneMetric::PeerLinksEstablished), 1, 20s));
+    EXPECT_TRUE(awaitCounter(aeronDir(3), typeIdOf(RuneMetric::PeerLinksEstablished), 0, 20s));
     // 1'000'235: node 3 has no link at all - every frame it tried to send (consensus, the controller / replication
     // transport, its workers' planes, the admin plane) was dropped and counted; the control thread folds the workers'
     // and the admin plane's paced reports into the one counter.
@@ -476,7 +455,7 @@ TEST(RoleCounterRegression, PeerLinkCountersArePublishedRegression) {
         std::int64_t drops = -1;
         const auto until = std::chrono::steady_clock::now() + 20s;
         while (std::chrono::steady_clock::now() < until) {
-            if (readCounterByType(aeronDir(3), kPeerFrameDropsCounterTypeId, drops) && drops >= 3) break;
+            if (readCounterByType(aeronDir(3), typeIdOf(RuneMetric::PeerFrameDrops), drops) && drops >= 3) break;
             std::this_thread::sleep_for(50ms);
         }
         EXPECT_GE(drops, 3) << "counter 1'000'235 sums every owner's drops";
@@ -487,7 +466,7 @@ TEST(RoleCounterRegression, PeerLinkCountersArePublishedRegression) {
         std::int64_t refusals = -1;
         const auto deadline = std::chrono::steady_clock::now() + 20s;
         while (std::chrono::steady_clock::now() < deadline) {
-            if (readCounterByType(aeronDir(id), kPeerLinkRefusalsCounterTypeId, refusals) && refusals >= 1) break;
+            if (readCounterByType(aeronDir(id), typeIdOf(RuneMetric::PeerLinkRefusals), refusals) && refusals >= 1) break;
             std::this_thread::sleep_for(20ms);
         }
         EXPECT_GE(refusals, 1) << "node " << id << " logged (and counted) a refusal";
@@ -504,8 +483,8 @@ TEST(RoleCounterTest, SecurityApplyMetricsReadableFromMetricsFileRegression) {
     node.start();
     ASSERT_TRUE(node.awaitLeader(5s));
     const NodeMetrics nm{tmp.path, cfg.nodeId};
-    ASSERT_TRUE(awaitCounter(nm, kSecurityAppliedOffsetCounterTypeId, -1, 10s)) << "registered, nothing applied";
-    ASSERT_TRUE(awaitCounter(nm, kSecurityApplyHaltedCounterTypeId, 0, 10s));
+    ASSERT_TRUE(awaitCounter(nm, typeIdOf(RuneMetric::SecurityAppliedOffset), -1, 10s)) << "registered, nothing applied";
+    ASSERT_TRUE(awaitCounter(nm, typeIdOf(RuneMetric::SecurityApplyHalted), 0, 10s));
 
     auto events = rune::security::testing::goldenScriptV1();
     events[2].fingerprint ^= 1;
@@ -521,10 +500,10 @@ TEST(RoleCounterTest, SecurityApplyMetricsReadableFromMetricsFileRegression) {
     };
     ASSERT_EQ(append(0), 0);
     ASSERT_EQ(append(1), 1);
-    EXPECT_TRUE(awaitCounter(nm, kSecurityAppliedOffsetCounterTypeId, 1, 10s));
-    EXPECT_TRUE(awaitCounter(nm, kSecurityApplyHaltedCounterTypeId, 0, 1s));
+    EXPECT_TRUE(awaitCounter(nm, typeIdOf(RuneMetric::SecurityAppliedOffset), 1, 10s));
+    EXPECT_TRUE(awaitCounter(nm, typeIdOf(RuneMetric::SecurityApplyHalted), 0, 1s));
     ASSERT_EQ(append(2), 2);   // tampered
-    EXPECT_TRUE(awaitCounter(nm, kSecurityApplyHaltedCounterTypeId, 3, 10s)) << "halted offset 2 -> counter 3";
-    EXPECT_TRUE(awaitCounter(nm, kSecurityAppliedOffsetCounterTypeId, 1, 1s)) << "applied stays at the last good event";
+    EXPECT_TRUE(awaitCounter(nm, typeIdOf(RuneMetric::SecurityApplyHalted), 3, 10s)) << "halted offset 2 -> counter 3";
+    EXPECT_TRUE(awaitCounter(nm, typeIdOf(RuneMetric::SecurityAppliedOffset), 1, 1s)) << "applied stays at the last good event";
     node.stop();
 }

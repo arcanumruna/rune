@@ -8,7 +8,6 @@
 #include <rune/node/TlsStartupPolicy.h>
 #include <rune/replication/ReplicationFrameLimits.h>
 #include <rune/node/WorkerOp.h>
-#include <rune/node/RoleCounter.h>
 
 #include <spdlog/spdlog.h>
 
@@ -513,25 +512,6 @@ void BrokerNode::start() {
             startupPumpRunner_->start();
         }
 
-        // Allocate the Aeron node-role counter (RoleCounter.h) in the driver's
-        // CnC file.  This is the machine-readable leadership signal (mirrors
-        // Aeron Cluster's node-role counter); the dr-e2e harness reads it via
-        // rune_role instead of scraping logs.  addCounter returns a pending
-        // registration id; the driver acks asynchronously, after which
-        // publishRole() resolves it to the live Counter via findCounter().
-        std::uint8_t roleKey[kRoleKeyLength];
-        encodeRoleKey(roleKey, config_.nodeId);
-        roleCounterRegId_ = aeron_->addCounter(
-            kRoleCounterTypeId, roleKey, kRoleKeyLength,
-            roleCounterLabel(config_.nodeId));
-        termCounterRegId_ = aeron_->addCounter(
-            kTermCounterTypeId, roleKey, kRoleKeyLength,
-            termCounterLabel(config_.nodeId));
-        outOfSyncCounterRegId_ = aeron_->addCounter(
-            kOutOfSyncCounterTypeId, roleKey, kRoleKeyLength, outOfSyncLabel(config_.nodeId));
-        // arcanum-metrics Task 8: every control-thread metric lives in the metrics file (createMetrics_); the
-        // observer (role / term / out-of-sync) and provisioner rows keep their counters here until Task 9.
-
         // Review A-I5: bind every fixed port of the NODE driver before its first publication (consensus /
         // replication / gateway publications auto-bind ephemeral ports; one could take a later fixed bind).
         // Fused shard mode runs worker 0 on this driver: its shard ports are anchored here too.
@@ -570,24 +550,27 @@ void BrokerNode::start() {
 
     // 5b. hotpath-A F2: the segment provisioner exists BEFORE any replica is
     //     built — every worker-driven disk log is wired to its demand hook.
-    provisionerAgent_ = std::make_unique<SegmentProvisionerAgent>(
-        static_cast<std::size_t>(config_.segmentProvisionDepth), config_.segmentProvisionCapBytes,
-        config_.dataDir, config_.segmentProvisionCapFreePct);
-    // Re-review N4: the provisioner's metrics as Aeron counters (CnC file).
-    if (aeron_) {
-        std::uint8_t key[kRoleKeyLength];
-        encodeRoleKey(key, config_.nodeId);
-        static constexpr std::pair<std::int32_t, const char*> kProvCounters[] = {
-            {kProvisionBuildFailuresCounterTypeId, "build-failures"},
-            {kProvisionRollHoldsCounterTypeId, "roll-holds"},
-            {kProvisionUnpreallocCounterTypeId, "unpreallocated-builds"},
-            {kProvisionParkedDroppedCounterTypeId, "parked-demands-dropped"},
-            {kProvisionReadMapFailuresCounterTypeId, "read-map-failures"}};
-        for (std::size_t i = 0; i < provCounterRegIds_.size(); ++i)
-            provCounterRegIds_[i] = aeron_->addCounter(kProvCounters[i].first, key, kRoleKeyLength,
-                                                       provisionMetricLabel(kProvCounters[i].second, config_.nodeId));
+    //     arcanum-metrics Task 9 (D58): it receives its own metric rows (copied from slots_, allocated by
+    //     createMetrics_ above) here, before its runner starts; nothing else writes them.
+    {
+        static_assert(runeMetricRow(RuneMetric::ProvisionRollHolds) ==
+                          runeMetricRow(RuneMetric::ProvisionBuildFailures) + SegmentProvisionerAgent::kMetricRollHolds &&
+                      runeMetricRow(RuneMetric::ProvisionUnpreallocBuilds) ==
+                          runeMetricRow(RuneMetric::ProvisionBuildFailures) +
+                              SegmentProvisionerAgent::kMetricUnpreallocatedBuilds &&
+                      runeMetricRow(RuneMetric::ProvisionParkedDropped) ==
+                          runeMetricRow(RuneMetric::ProvisionBuildFailures) + SegmentProvisionerAgent::kMetricParkedDropped &&
+                      runeMetricRow(RuneMetric::ProvisionReadMapFailures) ==
+                          runeMetricRow(RuneMetric::ProvisionBuildFailures) +
+                              SegmentProvisionerAgent::kMetricReadMapFailures,
+                      "the provisioner's Metric enum must match its kRuneMetrics rows, in order");
+        SegmentProvisionerAgent::MetricSlots provSlots{};
+        const auto base = static_cast<std::size_t>(runeMetricRow(RuneMetric::ProvisionBuildFailures));
+        for (std::size_t i = 0; i < provSlots.size(); ++i) provSlots[i] = slots_[base + i];
+        provisionerAgent_ = std::make_unique<SegmentProvisionerAgent>(
+            static_cast<std::size_t>(config_.segmentProvisionDepth), config_.segmentProvisionCapBytes,
+            config_.dataDir, config_.segmentProvisionCapFreePct, provSlots);
     }
-    provisionerAgent_->setMetricSink(&BrokerNode::publishProvisionMetric_, this);
 
     // 6. Build replication (GR-2/GR-3): PartitionReplicas + AeronPartitionTransport
     //    + ReplicationMetadataBridge.  Requires: topicRegistry_ + aeron_ + consensus objs.
@@ -3130,47 +3113,14 @@ Term BrokerNode::leadershipTermId() const noexcept {
     return leaderObserver_.observe().term;
 }
 
-// ---------------------------------------------------------------------------
-// BrokerNode::publishRole — update the Aeron node-role + leadership-term
-// counters (RoleCounter.h) with this node's current view.
-//
-// Machine-readable leadership signal: the dr-e2e harness reads these counters
-// out of the CnC file via rune_role instead of scraping "is LEADER" log lines
-// (which are log-level dependent and fragile).  Mirrors Aeron Cluster, which
-// publishes node role + leadership term as counters.
-//
-// Resolves the pending addCounter registrations lazily: the embedded driver
-// acks counter allocation asynchronously, so findCounter() may return nullptr
-// for the first few calls — we simply retry on the next poll tick.  Once
-// resolved, the Counter is cached and set() is a single relaxed store.
-//
-// Observer thread: one ring-drained snapshot (role + term together, F9a).
-// Called from main's 100 ms poll loop.
-// ---------------------------------------------------------------------------
-// D9 review MEDIUM-3: TCS stuck-markers sink — CONTROL (runtime) thread only.
-// Resolves the counter registration lazily (the driver acks asynchronously);
-// false = not resolved yet, the TCS retries on its next gauge scan.
-// Re-review N4: provisioner metric sink — PROVISIONER thread only (the only
-// writer of provCounters_; resolved lazily, the driver acks asynchronously; a
-// value set before resolution is re-published with the next change).
-void BrokerNode::publishProvisionMetric_(void* self, int metric, std::int64_t value) noexcept
-{
-    auto* n = static_cast<BrokerNode*>(self);
-    if (!n->aeron_ || metric < 0 || static_cast<std::size_t>(metric) >= n->provCounters_.size()) return;
-    auto& c = n->provCounters_[static_cast<std::size_t>(metric)];
-    const std::int64_t reg = n->provCounterRegIds_[static_cast<std::size_t>(metric)];
-    if (!c && reg >= 0) {
-        try { c = n->aeron_->findCounter(reg); } catch (...) { c.reset(); }
-    }
-    if (c) c->set(value);
-}
-
+// D9 review MEDIUM-3: TCS stuck-markers / stuck-offset-commit sinks — CONTROL (runtime) thread only.  The rows are
+// allocated at start (D59), so the first store lands; false = the metrics file is not ready yet.
 bool BrokerNode::publishStuckTxnOffsets_(void* self, std::int64_t stuck, std::int64_t oldestAgeMs)
 {
     auto* n = static_cast<BrokerNode*>(self);
     if (!n->metricsReady_) return false;
-    n->slot_(RuneMetric::StuckTxnOffsetCommits).set(stuck);
-    n->slot_(RuneMetric::StuckTxnOffsetAgeMs).set(oldestAgeMs);
+    n->controlSet_(RuneMetric::StuckTxnOffsetCommits, stuck);
+    n->controlSet_(RuneMetric::StuckTxnOffsetAgeMs, oldestAgeMs);
     return true;
 }
 
@@ -3178,43 +3128,29 @@ bool BrokerNode::publishStuckMarkers_(void* self, std::int64_t value)
 {
     auto* n = static_cast<BrokerNode*>(self);
     if (!n->metricsReady_) return false;
-    n->slot_(RuneMetric::StuckMarkers).set(value);
+    n->controlSet_(RuneMetric::StuckMarkers, value);
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// BrokerNode::publishRole — OBSERVER thread (main's 100 ms poll loop).  Publishes this node's role, leadership term
+// and out-of-sync partition count into the metrics file (rows owned by MetricOwner::Observer; D59).  rune_role and
+// the dr-e2e harness read them instead of scraping "is LEADER" log lines - mirrors Aeron Cluster, which publishes
+// node role + leadership term as counters.  The observer's slots were copied in createMetrics_ before any agent
+// thread started; nothing else writes them.  One ring-drained snapshot carries role + term together (F9a).
+// ---------------------------------------------------------------------------
 void BrokerNode::publishRole() noexcept {
-    if (!aeron_) return;
+    if (!observerSlots_.role.bound()) return;   // start() has not created the metrics file
 
-    // Resolve pending counter registrations once the driver has acked them.
-    if (!roleCounter_ && roleCounterRegId_ >= 0) {
-        try { roleCounter_ = aeron_->findCounter(roleCounterRegId_); }
-        catch (...) { roleCounter_.reset(); }  // driver error — retry next tick
-    }
-    if (!termCounter_ && termCounterRegId_ >= 0) {
-        try { termCounter_ = aeron_->findCounter(termCounterRegId_); }
-        catch (...) { termCounter_.reset(); }
-    }
-
-    // Determine this node's current role.  We expose Leader vs Follower vs None;
-    // Candidate is not separately observable via the BrokerNode accessors, so a
-    // node that observes no leader yet is reported as None (pre-election gap).
+    // Candidate is not separately observable via the BrokerNode accessors, so a node that observes no leader yet is
+    // reported as None (pre-election gap).
     const LeaderSnapshot v = leaderObserver_.observe();
     const RoleCode role = v.isLeader ? RoleCode::Leader
                         : (v.leaderId >= 0 ? RoleCode::Follower : RoleCode::None);
-
-    if (roleCounter_) {
-        roleCounter_->set(static_cast<std::int64_t>(role));
-    }
-    if (termCounter_) {
-        // Publish the term this node observes (its own leadership term id).
-        termCounter_->set(static_cast<std::int64_t>(v.term));
-    }
+    observerSlots_.role.set(static_cast<std::int64_t>(role), MetricOwner::Observer);
+    observerSlots_.term.set(static_cast<std::int64_t>(v.term), MetricOwner::Observer);
     // Rolling-restart readiness gate (controlled shutdown review L5).
-    if (!outOfSyncCounter_ && outOfSyncCounterRegId_ >= 0) {
-        try { outOfSyncCounter_ = aeron_->findCounter(outOfSyncCounterRegId_); }
-        catch (...) { outOfSyncCounter_.reset(); }
-    }
-    if (outOfSyncCounter_) outOfSyncCounter_->set(static_cast<std::int64_t>(outOfSyncPartitions()));
+    observerSlots_.outOfSync.set(static_cast<std::int64_t>(outOfSyncPartitions()), MetricOwner::Observer);
 }
 
 namespace {
@@ -3313,15 +3249,21 @@ void BrokerNode::createMetrics_() {
             spdlog::error("BrokerNode[{}]: {}", config_.nodeId, msg);
             throw std::runtime_error(msg);
         }
-        slots_[i] = r.writer;
+        slots_[i] = RuneMetricSlot{r.writer, d.owner, &metricWrittenBy_[i]};
     }
-    // Initial values: the same "unknown / none" sentinels the publishers use until their first real value.
-    slot_(RuneMetric::Term).set(-1);
-    slot_(RuneMetric::OutOfSyncPartitions).set(-1);
-    slot_(RuneMetric::CatalogAppliedOffset).set(-1);
-    slot_(RuneMetric::SecurityAppliedOffset).set(-1);
-    slot_(RuneMetric::Role).set(static_cast<std::int64_t>(RoleCode::None));
-    slot_(RuneMetric::AuthMode).set(config_.authMode == AuthMode::DevDisabled ? 1 : 0);
+    // D59: the observer's slots are copied here, on the observer (start) thread, before any agent thread starts;
+    // the provisioner receives its slots in its constructor (start()).  Every other row is the control thread's.
+    observerSlots_ = ObserverSlots{slots_[static_cast<std::size_t>(runeMetricRow(RuneMetric::Role))],
+                                   slots_[static_cast<std::size_t>(runeMetricRow(RuneMetric::Term))],
+                                   slots_[static_cast<std::size_t>(runeMetricRow(RuneMetric::OutOfSyncPartitions))]};
+    // Initial values: the same "unknown / none" sentinels the publishers use until their first real value, each
+    // stored under its row's owner tag.
+    observerSlots_.role.set(static_cast<std::int64_t>(RoleCode::None), MetricOwner::Observer);
+    observerSlots_.term.set(-1, MetricOwner::Observer);
+    observerSlots_.outOfSync.set(-1, MetricOwner::Observer);
+    controlSet_(RuneMetric::CatalogAppliedOffset, -1);
+    controlSet_(RuneMetric::SecurityAppliedOffset, -1);
+    controlSet_(RuneMetric::AuthMode, config_.authMode == AuthMode::DevDisabled ? 1 : 0);
 
     systemMetrics_.emplace();
     const metrics::SystemMetricsParams sp{config_.metricsSystemIntervalMs * 1'000'000LL, "/proc/self"};
@@ -3341,8 +3283,8 @@ void BrokerNode::createMetrics_() {
 // ---------------------------------------------------------------------------
 void BrokerNode::publishCatalogMetrics_() noexcept {
     if (!metricsReady_) return;
-    slot_(RuneMetric::CatalogApplyHalted).set(catalogHaltedValue_);
-    slot_(RuneMetric::CatalogAppliedOffset).set(catalogAppliedValue_);
+    controlSet_(RuneMetric::CatalogApplyHalted, catalogHaltedValue_);
+    controlSet_(RuneMetric::CatalogAppliedOffset, catalogAppliedValue_);
 }
 
 // ---------------------------------------------------------------------------
@@ -3492,29 +3434,27 @@ void BrokerNode::failSecurityClosed_(int64_t offset, const std::string& describe
     if (gateway_) gateway_->onSecurityHalted(offset);
 }
 
-bool BrokerNode::securityMetricsPending_() const noexcept {
-    return (gateway_ != nullptr && (gateway_->loginsOk() != publishedLoginsOk_ ||
-                                    gateway_->loginsFailed() != publishedLoginsFailed_ ||
-                                    gateway_->loginsRateLimited() != publishedLoginsRateLimited_ ||
-                                    gateway_->sessionsRevoked() != publishedSessionsRevoked_));
+// Control thread: the gateway's login / revocation tallies are its own.  Stores only a changed tally (compared with
+// the slot's own last value), so the per-cycle cost is four plain loads.
+void BrokerNode::publishLoginTallies_() noexcept {
+    if (gateway_ == nullptr) return;
+    const auto put = [this](RuneMetric m, std::uint64_t v) noexcept {
+        const auto value = static_cast<std::int64_t>(v);
+        if (value != controlGet_(m)) controlSet_(m, value);
+    };
+    put(RuneMetric::LoginsOk, gateway_->loginsOk());
+    put(RuneMetric::LoginsFailed, gateway_->loginsFailed());
+    put(RuneMetric::LoginsRateLimited, gateway_->loginsRateLimited());
+    put(RuneMetric::SessionsRevoked, gateway_->sessionsRevoked());
 }
 
 void BrokerNode::publishSecurityMetrics_() noexcept {
     if (!metricsReady_) return;
-    if (gateway_ != nullptr) {   // control thread: the gateway's tallies are its own
-        publishedLoginsOk_ = gateway_->loginsOk();
-        publishedLoginsFailed_ = gateway_->loginsFailed();
-        publishedLoginsRateLimited_ = gateway_->loginsRateLimited();
-        publishedSessionsRevoked_ = gateway_->sessionsRevoked();
-    }
-    slot_(RuneMetric::LoginsOk).set(static_cast<std::int64_t>(publishedLoginsOk_));
-    slot_(RuneMetric::LoginsFailed).set(static_cast<std::int64_t>(publishedLoginsFailed_));
-    slot_(RuneMetric::LoginsRateLimited).set(static_cast<std::int64_t>(publishedLoginsRateLimited_));
-    slot_(RuneMetric::SessionsRevoked).set(static_cast<std::int64_t>(publishedSessionsRevoked_));
-    slot_(RuneMetric::SecurityApplyHalted).set(securityHaltedValue_);
-    slot_(RuneMetric::SecurityAppliedOffset).set(securityAppliedValue_);
+    publishLoginTallies_();
+    controlSet_(RuneMetric::SecurityApplyHalted, securityHaltedValue_);
+    controlSet_(RuneMetric::SecurityAppliedOffset, securityAppliedValue_);
     // 1'000'228: 0 = enabled (an in-process config publishes 0 too), 1 = dev-disabled.
-    slot_(RuneMetric::AuthMode).set(config_.authMode == AuthMode::DevDisabled ? 1 : 0);
+    controlSet_(RuneMetric::AuthMode, config_.authMode == AuthMode::DevDisabled ? 1 : 0);
 }
 
 // Authentication Task 9 (spec §9): dev mode (RUNE_AUTH=disabled) is shouted at start and every five minutes by this
@@ -3619,9 +3559,9 @@ int BrokerNode::servicePeerLinks_(int64_t nowNs) {
 
 void BrokerNode::publishPeerLinkMetrics_() noexcept {
     if (!metricsReady_ || !peerLinkAgent_) return;
-    slot_(RuneMetric::PeerFrameDrops).set(static_cast<std::int64_t>(peerFrameDropsTotal_()));
-    slot_(RuneMetric::PeerLinksEstablished).set(peerLinkAgent_->establishedPeers());
-    slot_(RuneMetric::PeerLinkRefusals).set(static_cast<std::int64_t>(peerLinkAgent_->refusals()));
+    controlSet_(RuneMetric::PeerFrameDrops, static_cast<std::int64_t>(peerFrameDropsTotal_()));
+    controlSet_(RuneMetric::PeerLinksEstablished, peerLinkAgent_->establishedPeers());
+    controlSet_(RuneMetric::PeerLinkRefusals, static_cast<std::int64_t>(peerLinkAgent_->refusals()));
 }
 
 uint64_t BrokerNode::peerFrameDropsTotal_() const noexcept {
@@ -3843,10 +3783,10 @@ int BrokerNode::publishStorageMetrics_() noexcept {
         replBridge_ ? static_cast<std::int64_t>(replBridge_->leaderRolesHeld()) : 0,
         metadataService_ ? static_cast<std::int64_t>(metadataService_->storagePendingCount()) : 0,
         metadataService_ ? static_cast<std::int64_t>(metadataService_->lostCommittedReports()) : 0};
-    slot_(RuneMetric::StorageGateState).set(values[0]);
-    slot_(RuneMetric::LeaderRolesHeld).set(values[1]);
-    slot_(RuneMetric::StoragePendingNodes).set(values[2]);
-    slot_(RuneMetric::LostCommittedReports).set(values[3]);
+    controlSet_(RuneMetric::StorageGateState, values[0]);
+    controlSet_(RuneMetric::LeaderRolesHeld, values[1]);
+    controlSet_(RuneMetric::StoragePendingNodes, values[2]);
+    controlSet_(RuneMetric::LostCommittedReports, values[3]);
     return 0;
 }
 
@@ -4772,19 +4712,10 @@ void BrokerNode::stop() {
     nodeStateFile_.reset();
     termLog_.reset();
 
-    // 3b. Release the Aeron node-role/term counters BEFORE closing the client.
-    //     ~Counter deregisters from the conductor, so it must run while the
-    //     conductor thread is still alive — otherwise the Counter dtor locks a
-    //     destroyed conductor mutex (recursive_mutex lock failed) at process
-    //     teardown.  Reset these here (not in ~BrokerNode) to fix that ordering.
-    roleCounter_.reset();
-    termCounter_.reset();
-    outOfSyncCounter_.reset();      // readiness gate (L5): release before aeron_ (the Counter dtor uses the conductor)
     if (mtuProbeFd_ >= 0) { ::close(mtuProbeFd_); mtuProbeFd_ = -1; }   // re-check I1
     // arcanum-metrics Task 8: the metrics file stays mapped (and its values readable) until the node is destroyed;
     // the system metrics close their /proc fds here.
     systemMetrics_.reset();
-    for (auto& c : provCounters_) c.reset();   // re-review N4: same rule (the provisioner is stopped)
 
     // 4. Close the Aeron client (joins the C++ conductor thread).
     //    After aeron_.reset() all "remove publication / subscription / close client"
@@ -5096,7 +5027,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                               tid, n, adminToControlRejects_);
             }
         }, 16);
-    if (securityMetricsPending_()) [[unlikely]] publishSecurityMetrics_();
+    if (metricsReady_) publishLoginTallies_();
     // Control (runtime) thread = the single producer of every worker ring.
     if (workerPool_) work += schemaFanout_.pump(*workerPool_);
     if (workerPool_) work += topicDroppedFanout_.pump(*workerPool_);   // R-M1
@@ -5411,7 +5342,7 @@ int BrokerNode::checkLinkMtu_(int64_t nowNs, bool force) {
                      config_.nodeId, m, config_.aeronMtuBytes);
     }
     linkMtuDeficit_ = chk.below ? chk.needed - m : 0;
-    if (metricsReady_) slot_(RuneMetric::LinkMtuDeficit).set(linkMtuDeficit_);
+    if (metricsReady_) controlSet_(RuneMetric::LinkMtuDeficit, linkMtuDeficit_);
     return 1;
 }
 
@@ -5556,7 +5487,7 @@ int BrokerNode::publishPlacementView_() {
     const auto unplaceable = static_cast<std::int64_t>(metadataService_->unplaceableTopicCount());
     if (unplaceable != unplaceablePublished_) {
         if (metricsReady_) {
-            slot_(RuneMetric::CatalogUnplaceableTopics).set(unplaceable);
+            controlSet_(RuneMetric::CatalogUnplaceableTopics, unplaceable);
             unplaceablePublished_ = unplaceable;
         }
     }
@@ -5564,7 +5495,7 @@ int BrokerNode::publishPlacementView_() {
     const auto blockedN = static_cast<std::int64_t>(metadataService_->blockedPartitionCount());
     if (blockedN != blockedPublished_) {
         if (metricsReady_) {
-            slot_(RuneMetric::CatalogBlockedPartitions).set(blockedN);
+            controlSet_(RuneMetric::CatalogBlockedPartitions, blockedN);
             blockedPublished_ = blockedN;
         }
     }

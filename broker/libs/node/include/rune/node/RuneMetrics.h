@@ -110,6 +110,9 @@ inline constexpr std::array<RuneMetricDef, 30> kRuneMetrics = {{
     {detail::M::StuckTxnOffsetAgeMs,       detail::K::Gauge,   "rune-txn-offset-stuck-age-ms",                 detail::O::Control},
 }};
 
+/// The metric's type id in the metrics file (D61: the enumerator value, equal to the old Aeron counter type id).
+[[nodiscard]] constexpr std::int32_t typeIdOf(RuneMetric m) noexcept { return static_cast<std::int32_t>(m); }
+
 inline constexpr std::int32_t kNodeMetricCount = static_cast<std::int32_t>(kRuneMetrics.size());
 
 /// The kRuneMetrics row of `id`; -1 when `id` has no row.  Constexpr, so a call with a constant id folds to the index.

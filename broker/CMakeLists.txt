@@ -434,10 +434,10 @@ if(BUILD_TESTING)
 endif()
 
 # ── rune_role — standalone Aeron node-role counter reader ────────────────────
-# Reads the machine-readable leadership signal (RoleCounter.h) out of a broker's
+# Reads the machine-readable leadership signal (RuneMetrics.h type ids) out of a broker's
 # CnC file and prints one line.  The dr-e2e harness runs this via `docker exec`
 # to detect the leader WITHOUT scraping "is LEADER" log lines (log-level
-# independent).  Header-only dep on rune/node/RoleCounter.h; links aeron only.
+# independent).  Header-only dep on rune/node/RuneMetrics.h; links aeron only.
 if(aeron_FOUND)
     add_executable(rune_role src/rune_role.cpp)
     target_include_directories(rune_role PRIVATE ${RUNE_NODE_INCLUDE})

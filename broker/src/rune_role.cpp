@@ -2,7 +2,7 @@
 // rune_role — standalone reader for the Aeron cluster node-role counters.
 //
 // Reads the machine-readable leadership signal that BrokerNode publishes into
-// the embedded driver's CnC file (see RoleCounter.h): the node-role counter and
+// the embedded driver's CnC file (type ids: RuneMetrics.h): the node-role counter and
 // the leadership-term counter.  Prints ONE line to stdout:
 //
 //     ROLE nodeId=<n> role=<LEADER|FOLLOWER|CANDIDATE|NONE> term=<t>
@@ -25,7 +25,7 @@
 //   1  CnC file missing / unreadable (driver not up yet)
 //   2  CnC readable but the role counter is not present yet
 // ---------------------------------------------------------------------------
-#include <rune/node/RoleCounter.h>
+#include <rune/node/RuneMetrics.h>
 
 #include <CncFileReader.h>
 #include <concurrent/CountersReader.h>
@@ -35,8 +35,8 @@
 #include <iostream>
 #include <string>
 
-using rune::node::kRoleCounterTypeId;
-using rune::node::kTermCounterTypeId;
+using rune::node::RuneMetric;
+using rune::node::typeIdOf;
 using rune::node::RoleCode;
 using rune::node::roleCodeFromValue;
 using rune::node::roleCodeName;
@@ -85,12 +85,12 @@ int main(int argc, char** argv) {
         [&](std::int32_t id, std::int32_t typeId,
             const aeron::concurrent::AtomicBuffer& keyBuffer,
             const std::string& /*label*/) {
-            if (typeId == rune::node::kStorageGateStateCounterTypeId) gateState = counters.getCounterValue(id);
-            else if (typeId == rune::node::kLeaderRolesHeldCounterTypeId) heldRoles = counters.getCounterValue(id);
-            else if (typeId == rune::node::kStoragePendingNodesCounterTypeId) pendingNodes = counters.getCounterValue(id);
-            else if (typeId == rune::node::kOutOfSyncCounterTypeId) outOfSync = counters.getCounterValue(id);
-            else if (typeId == rune::node::kLostCommittedReportsCounterTypeId) lostCommitted = counters.getCounterValue(id);
-            if (typeId == kRoleCounterTypeId) {
+            if (typeId == rune::node::typeIdOf(rune::node::RuneMetric::StorageGateState)) gateState = counters.getCounterValue(id);
+            else if (typeId == rune::node::typeIdOf(rune::node::RuneMetric::LeaderRolesHeld)) heldRoles = counters.getCounterValue(id);
+            else if (typeId == rune::node::typeIdOf(rune::node::RuneMetric::StoragePendingNodes)) pendingNodes = counters.getCounterValue(id);
+            else if (typeId == rune::node::typeIdOf(rune::node::RuneMetric::OutOfSyncPartitions)) outOfSync = counters.getCounterValue(id);
+            else if (typeId == rune::node::typeIdOf(rune::node::RuneMetric::LostCommittedReports)) lostCommitted = counters.getCounterValue(id);
+            if (typeId == typeIdOf(RuneMetric::Role)) {
                 std::int32_t nid = -1;
                 if (decodeRoleKey(keyBuffer.buffer(),
                                   static_cast<std::size_t>(keyBuffer.capacity()),
@@ -99,14 +99,14 @@ int main(int argc, char** argv) {
                 }
                 role = roleCodeFromValue(counters.getCounterValue(id));
                 foundRole = true;
-            } else if (typeId == kTermCounterTypeId) {
+            } else if (typeId == typeIdOf(RuneMetric::Term)) {
                 term = counters.getCounterValue(id);
                 foundTerm = true;
             }
         });
 
     if (!foundRole) {
-        std::cerr << "rune_role: role counter (typeId=" << kRoleCounterTypeId
+        std::cerr << "rune_role: role counter (typeId=" << typeIdOf(RuneMetric::Role)
                   << ") not present in '" << aeronDir << "' yet\n";
         return 2;
     }

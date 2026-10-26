@@ -218,7 +218,7 @@ void strayLogin(AuthMatrixRig& rig, bool ok) {
     const std::string pw = ok ? rune::node::test::AuthRig::kPw : "not-the-password-000";
     const auto l = rig.rig().wire().login(rig.rig().ch(), sid, "builder", {pw, pw});
     ASSERT_EQ(l.ok(), ok);
-    const std::int32_t id = ok ? rune::node::kLoginsOkCounterTypeId : rune::node::kLoginsFailedCounterTypeId;
+    const std::int32_t id = ok ? rune::node::typeIdOf(rune::node::RuneMetric::LoginsOk) : rune::node::typeIdOf(rune::node::RuneMetric::LoginsFailed);
     ASSERT_TRUE(counterReaches(rig, id, (ok ? rig.issuedOk() : rig.issuedFailed()) + 1))
         << "the stray login never reached the CnC counter";
 }

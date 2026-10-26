@@ -15,7 +15,7 @@
 #include "support/SecurityBrokerCluster.h"
 
 #include <rune/node/PeerLinkAgent.h>
-#include <rune/node/RoleCounter.h>
+#include <rune/node/RuneMetrics.h>
 
 #include "MetricsTestReader.h"
 

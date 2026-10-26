@@ -56,6 +56,7 @@ TEST(BrokerMetricsRegression, LibraryVersionRegression) {
 #include <rune/catalog/CatalogState.h>
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/node/RuneMetricSlot.h>
 #include <rune/node/RuneMetrics.h>
 
 #include <metrics/MetricsReader.h>
@@ -189,11 +190,66 @@ TEST(BrokerMetricsRegression, EveryMetricMovedRegression) {
         return 0;
     });
     EXPECT_TRUE(awaitMetric(node, RuneMetric::CatalogApplyHalted, 43)) << "halted offset 42 -> 43";
+
+    // The observer's rows (Task 9): one publishRole after the election moves role and term off their -1 seeds; the
+    // out-of-sync row publishes the observer's own reading (-1 = "not in a controlled shutdown" on a single node).
+    node.publishRole();
+    EXPECT_EQ(rune::node::test::readRuneMetric(node, RuneMetric::Role),
+              static_cast<std::int64_t>(rune::node::RoleCode::Leader));
+    const auto term = rune::node::test::readRuneMetric(node, RuneMetric::Term);
+    ASSERT_TRUE(term.has_value());
+    EXPECT_GE(*term, 0) << "an elected term replaced the -1 seed";
+    EXPECT_EQ(rune::node::test::readRuneMetric(node, RuneMetric::OutOfSyncPartitions), node.outOfSyncPartitions());
+#ifndef NDEBUG
+    for (RuneMetric m : {RuneMetric::Role, RuneMetric::Term, RuneMetric::OutOfSyncPartitions}) {
+        EXPECT_EQ(node.metricWrittenByForTest(m), rune::node::metricOwnerBit(rune::node::MetricOwner::Observer))
+            << static_cast<std::int32_t>(m);
+    }
+#endif
+    // The provisioner's rows: Live at 0 (no user topic is provisioned here; the write path is
+    // SegmentProvisionerRegression.MetricsArePublishedThroughItsOwnSlotsRegression and the wire rig's
+    // BrokerMetricsRegression.OwnerTableRegression).
+    for (RuneMetric m : {RuneMetric::ProvisionBuildFailures, RuneMetric::ProvisionRollHolds,
+                         RuneMetric::ProvisionUnpreallocBuilds, RuneMetric::ProvisionParkedDropped,
+                         RuneMetric::ProvisionReadMapFailures}) {
+        EXPECT_EQ(rune::node::test::readRuneMetric(node, m), 0) << static_cast<std::int32_t>(m);
+    }
     node.stop();
 }
 
-// cnc.dat holds no control-owned Rune counter any more.  The observer (role / term / out-of-sync) and provisioner
-// rows keep their Aeron counters until plan Task 9 moves their writers; Task 9 tightens this to the whole range.
+// Task 9 (fix on sight: the lazy findCounter resolution): every row is allocated before the first control cycle, so
+// the catalog and security rows hold their values straight after start, and one catalog report lands with that
+// single store - no lookup that can miss on an early cycle and leave the value pending for a later retry.
+TEST(BrokerMetricsRegression, PublishedFromFirstCycleRegression) {
+    MetricsTempDir tmp{"first_"};
+    NodeConfig cfg = singleNode(tmp.path);
+    BrokerNode node{cfg};
+    node.start();
+    // One read each, no polling: the seeds are in the file before start() returns.
+    EXPECT_EQ(rune::node::test::readRuneMetric(node, RuneMetric::CatalogApplyHalted), 0);
+    EXPECT_EQ(rune::node::test::readRuneMetric(node, RuneMetric::CatalogAppliedOffset), -1);
+    EXPECT_EQ(rune::node::test::readRuneMetric(node, RuneMetric::SecurityApplyHalted), 0);
+    EXPECT_EQ(rune::node::test::readRuneMetric(node, RuneMetric::SecurityAppliedOffset), -1);
+    ASSERT_TRUE(node.awaitLeader(5s));
+
+    rune::node::AdminWorkerAgent* agent = node.adminWorkerAgentForTest();
+    ASSERT_NE(agent, nullptr);
+    node.onAdminThreadForTest([agent] {
+        agent->catalogLiveEffects().sink.applied(7, 0x77);
+        return 0;
+    });
+    ASSERT_TRUE(awaitMetric(node, RuneMetric::CatalogAppliedOffset, 7)) << "the one report reached the file";
+    // ...and stays: later control cycles with no new report neither retry nor rewrite it.
+    for (int i = 0; i < 20; ++i) node.onAdminThreadForTest([] { return 0; });
+    EXPECT_EQ(rune::node::test::readRuneMetric(node, RuneMetric::CatalogAppliedOffset), 7);
+    const auto sec = node.securityMetricsForTest();
+    EXPECT_EQ(rune::node::test::readRuneMetric(node, RuneMetric::SecurityAppliedOffset), sec.applied);
+    EXPECT_EQ(rune::node::test::readRuneMetric(node, RuneMetric::SecurityApplyHalted), sec.halted);
+    node.stop();
+}
+
+// cnc.dat holds no Rune counter any more (Task 9 moved the observer and provisioner rows too): no type id in Rune's
+// 1'000'201-1'000'241 range is in the driver's counters file.
 TEST(BrokerMetricsRegression, CncHoldsOnlyDriverCountersRegression) {
     MetricsTempDir tmp{"cnc_"};
     NodeConfig cfg = singleNode(tmp.path);
@@ -205,18 +261,15 @@ TEST(BrokerMetricsRegression, CncHoldsOnlyDriverCountersRegression) {
     aeron::CncFileReader reader = aeron::CncFileReader::mapExisting(cfg.effectiveAeronDir().c_str());
     aeron::concurrent::CountersReader counters = reader.countersReader();
     int driverCounters = 0;
-    std::vector<std::int32_t> controlInCnc;
+    std::vector<std::int32_t> runeInCnc;
     counters.forEach([&](std::int32_t, std::int32_t typeId, const aeron::concurrent::AtomicBuffer&,
                          const std::string&) {
         if (typeId < 1'000'000) ++driverCounters;
-        const std::int32_t row = rune::node::runeMetricRow(typeId);
-        if (typeId >= 1'000'201 && typeId <= 1'000'241 &&
-            (row < 0 || kRuneMetrics[static_cast<std::size_t>(row)].owner == MetricOwner::Control))
-            controlInCnc.push_back(typeId);
+        if (typeId >= 1'000'201 && typeId <= 1'000'241) runeInCnc.push_back(typeId);
     });
     EXPECT_GT(driverCounters, 0) << "the scan saw the driver's own counters (not a vacuous pass)";
-    EXPECT_TRUE(controlInCnc.empty()) << "first control-owned type id still in cnc.dat: "
-                                      << (controlInCnc.empty() ? 0 : controlInCnc.front());
+    EXPECT_TRUE(runeInCnc.empty()) << "first Rune type id still in cnc.dat: "
+                                   << (runeInCnc.empty() ? 0 : runeInCnc.front());
     node.stop();
 }
 

@@ -88,6 +88,7 @@
 #include <rune/node/RuneMetrics.h>
 #include <metrics/MetricsFile.h>
 #include <metrics/MetricsWriter.h>
+#include <rune/node/RuneMetricSlot.h>
 #include <metrics/SystemMetrics.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
@@ -1397,8 +1398,8 @@ public:
     /// this node replicates but is NOT in the committed ISR of; -1 = unknown
     /// (no controller known yet, or the node is stopping).  0 = this node is
     /// fully back in sync — safe to restart the next node.  Also published as
-    /// the Aeron counter kOutOfSyncCounterTypeId by publishRole() (read it
-    /// out-of-band from cnc.dat, like the role counter).  Observer thread
+    /// the RuneMetric::OutOfSyncPartitions row of the metrics file by
+    /// publishRole() (read it out-of-band, like the role row).  Observer thread
     /// (the same single consumer as controlledShutdown()).
     int32_t outOfSyncPartitions() noexcept;
 
@@ -1460,17 +1461,25 @@ public:
     /// current-term announcements (term-aware assert_single_leader).
     rune::consensus::Term leadershipTermId() const noexcept;
 
-    /// Publish this node's current role/term/leaderId into the Aeron node-role
-    /// counter (RoleCounter.h) in the driver's CnC file.  Idempotent + cheap:
-    /// call it from the main poll loop on every tick.  No-op until the driver
-    /// has acked the counter allocation (findCounter returns the live Counter).
-    /// Observer thread (see above): one ring-drained snapshot; the counter is the
+    /// Publish this node's current role, term and out-of-sync count into the
+    /// observer's own rows of the metrics file (RuneMetric::Role / Term /
+    /// OutOfSyncPartitions, owner MetricOwner::Observer).  Idempotent + cheap:
+    /// call it from the main poll loop on every tick.  No-op before start()
+    /// (the rows are allocated there, before any agent thread starts: D59).
+    /// Observer thread (see above): one ring-drained snapshot; the rows are the
     /// machine-readable signal the dr-e2e harness reads (via rune_role) instead
     /// of scraping logs.
     void publishRole() noexcept;
 
     /// The metrics file this node publishes every RuneMetric in (D54); empty before start().  Immutable after start().
     [[nodiscard]] const std::string& metricsFilePath() const noexcept { return metricsPath_; }
+
+    /// Test seam (D58): the owners that have written row `m` so far, one metricOwnerBit per MetricOwner.  Debug
+    /// builds only (a release build compiles the record out: always 0).  Any thread (atomic_ref, relaxed).
+    [[nodiscard]] std::uint8_t metricWrittenByForTest(RuneMetric m) const noexcept {
+        auto& b = const_cast<std::uint8_t&>(metricWrittenBy_[static_cast<std::size_t>(runeMetricRow(m))]);
+        return std::atomic_ref<std::uint8_t>(b).load(std::memory_order_relaxed);
+    }
 
     /// Return the leader's client Aeron channel for data-op redirect (GB-4).
     /// Observer thread (see above): ring-drained snapshot + immutable peer config.
@@ -2277,7 +2286,7 @@ private:
     std::optional<SecurityServing> securityServing_;   // engaged iff the broker authenticates (gateway Required)
     int64_t controlNowNs_ = 0;   // PR #459 M2: the current control pass's clock (serviceAdminControl_), control thread
     void publishSecurityMetrics_() noexcept;
-    [[nodiscard]] bool securityMetricsPending_() const noexcept;
+    void publishLoginTallies_() noexcept;   // control thread, every pass: the gateway's login tallies (D59)
     int  serviceAuthMode_(int64_t nowNs);
     // Authentication Task 15 (D33): the inter-broker link handshakes.  buildPeerLinks_ (startup thread) builds the
     // PeerLinkAgent when authMode == Enabled and there is more than one peer; servicePeerLinks_ (control thread, every
@@ -2567,8 +2576,6 @@ private:
     uint64_t                                              securityAnswersHeld_    = 0;
     uint64_t                                              securityAnswersDropped_ = 0;
     uint64_t                                              securityAlterIsrRefused_ = 0;
-    std::uint64_t                    publishedSessionsRevoked_ = 0;
-    std::uint64_t                    publishedLoginsOk_ = 0, publishedLoginsFailed_ = 0, publishedLoginsRateLimited_ = 0;
     std::int64_t                     securityHaltedValue_  = 0;    // control-thread-owned (0 = applying)
     std::int64_t                     securityAppliedValue_ = -1;   // control-thread-owned
     DevModeWarnTimer                 devModeWarn_;                 // control thread
@@ -2861,9 +2868,6 @@ private:
     std::unique_ptr<ParkUntilWorkIdle>                    provisionerIdleStrategy_;
     rune::consensus::MonotonicNanoClock                   provisionerClock_;
     std::unique_ptr<rune::consensus::AgentRunner>         provisionerRunner_;
-    std::array<std::int64_t, SegmentProvisionerAgent::kMetricCount>                    provCounterRegIds_{-1, -1, -1, -1, -1};
-    std::array<std::shared_ptr<aeron::Counter>, SegmentProvisionerAgent::kMetricCount> provCounters_{};
-    static void publishProvisionMetric_(void* self, int metric, std::int64_t value) noexcept;
     [[nodiscard]] rune::storage::ProvisionChannel* provisionChannel_() noexcept {
         return provisionerAgent_ ? provisionerAgent_->channel() : nullptr;
     }
@@ -2889,18 +2893,6 @@ private:
 
     std::shared_ptr<aeron::Aeron> aeron_;
 
-    // -----------------------------------------------------------------------
-    // Aeron node-role counter (RoleCounter.h) — machine-readable leadership.
-    // Allocated in start() after aeron_ connects; updated by publishRole().
-    // roleCounterRegId_ is the pending registration id until the driver acks
-    // (findCounter returns the live Counter, cached in roleCounter_).
-    // -----------------------------------------------------------------------
-    std::int64_t                     roleCounterRegId_ = -1;
-    std::int64_t                     termCounterRegId_ = -1;
-    std::shared_ptr<aeron::Counter>  roleCounter_;
-    std::shared_ptr<aeron::Counter>  termCounter_;
-    std::int64_t                     outOfSyncCounterRegId_ = -1;   ///< readiness gate (L5)
-    std::shared_ptr<aeron::Counter>  outOfSyncCounter_;
     // Catalog history Task 7: the CatalogApplier's metrics, set on the CONTROL thread only from the admin→control
     // drain (kA2cCatalogHalted / kA2cCatalogApplied) into the metrics file.
     std::int64_t                     catalogHaltedValue_  = 0;    // control-thread-owned (0 = applying)
@@ -2914,18 +2906,28 @@ private:
     // arcanum-metrics (plan Task 8): the node's metrics file.  start() creates it, allocates EVERY kRuneMetrics row
     // (slots_[row]) and inits systemMetrics_ before any agent starts (D59); a failure throws out of start().  Each
     // slot has ONE writer thread (RuneMetricDef::owner); the control rows are written by the control thread only.
+    // Task 9 (D58): the observer's rows are copied into observerSlots_ and the provisioner's into its constructor,
+    // both before any thread starts; nothing else touches them.  Every store carries its writer's owner tag; a debug
+    // build records it in metricWrittenBy_ (one bit per MetricOwner per row) and asserts it is the row's owner.
     // metricsFile_ owns the mapping (unmapped at destruction, after every agent joined).
     // -----------------------------------------------------------------------
     metrics::MetricsFile                                  metricsFile_;
     metrics::MetricsWriter                                metricsWriter_;
     std::vector<int32_t>                                  metricsFreeStack_;   // sized maxSlots once at start (cold)
-    std::array<metrics::SlotWriter, kNodeMetricCount>     slots_{};
+    std::array<RuneMetricSlot, kNodeMetricCount>          slots_{};
+    std::array<std::uint8_t, kNodeMetricCount>            metricWrittenBy_{};   // debug owner-tag record (D58)
+    struct ObserverSlots { RuneMetricSlot role, term, outOfSync; };
+    ObserverSlots                                         observerSlots_{};     // observer thread only (publishRole)
     std::optional<metrics::SystemMetrics>                 systemMetrics_;      // control thread (D62)
     bool                                                  metricsReady_ = false;   // set by start(), before agents
     std::string                                           metricsPath_;
     void createMetrics_();   // startup thread: steps 1-4 of the plan's start order
-    [[nodiscard]] metrics::SlotWriter& slot_(RuneMetric m) noexcept {
-        return slots_[static_cast<std::size_t>(runeMetricRow(m))];
+    /// A control-thread store into a MetricOwner::Control row.
+    void controlSet_(RuneMetric m, std::int64_t v) noexcept {
+        slots_[static_cast<std::size_t>(runeMetricRow(m))].set(v, MetricOwner::Control);
+    }
+    [[nodiscard]] std::int64_t controlGet_(RuneMetric m) const noexcept {
+        return slots_[static_cast<std::size_t>(runeMetricRow(m))].get();
     }
 
     // -----------------------------------------------------------------------

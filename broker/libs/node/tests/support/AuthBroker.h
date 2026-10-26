@@ -19,7 +19,7 @@
 #include <rune/aeronutil/testing/FreePort.h>
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
-#include <rune/node/RoleCounter.h>
+#include <rune/node/RuneMetrics.h>
 
 #include "MetricsTestReader.h"
 
@@ -33,6 +33,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <stdexcept>
@@ -87,6 +88,8 @@ public:
         /// a plaintext Connect HandshakeFailed.  false = ClientTransport::PlaintextForTest, so the raw-frame helpers
         /// (bootstrapAdmin, wire()) still drive plaintext sessions.
         bool tlsOnly = false;
+        /// Applied to the node's config last, before the start (a test's own knobs, e.g. the provisioner cap).
+        std::function<void(NodeConfig&)> configure;
     };
     static constexpr const char* kBootstrapPassword = "bootstrap-otp-123456";
     static constexpr const char* kAdminPassword     = "admin-password-1234";
@@ -147,6 +150,7 @@ public:
             std::filesystem::permissions(keyFile_, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
             cfg.clusterKeyFile = keyFile_.string();
         }
+        if (opts_.configure) opts_.configure(cfg);
         channel_ = cfg.clientEndpoint.channel;
         cfg_ = cfg;
         startNode_();

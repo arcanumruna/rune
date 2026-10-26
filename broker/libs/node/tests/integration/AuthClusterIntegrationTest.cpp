@@ -120,7 +120,7 @@ TEST(AuthClusterRegression, SecurityReplicatesToEveryBrokerAndDigestsAgree) {
         EXPECT_EQ(v.appliedOffset, off) << "node " << n->nodeIdForTest();
     }
     // The applied-offset counter (1'000'227) of every broker followed.
-    for (int id : {1, 2, 3}) EXPECT_EQ(t.counter(id, kSecurityAppliedOffsetCounterTypeId).value_or(-9), off) << "node " << id;
+    for (int id : {1, 2, 3}) EXPECT_EQ(t.counter(id, typeIdOf(RuneMetric::SecurityAppliedOffset)).value_or(-9), off) << "node " << id;
 }
 
 // §12 gate: the user holds one live subscription on each of the 3 brokers; GRANT -> subscribe -> REVOKE x 20; the time
@@ -305,18 +305,18 @@ TEST(AuthClusterRegression, WrongKeyBrokerNeverJoinsRegression) {
     ASSERT_GE(led.id, 0);
     ASSERT_TRUE(led.part[0] >= 0 && led.part[1] >= 0);
     ASSERT_TRUE(awaitNodeInIsr(t, 1, 3, 60s, led.id)) << "node 3 starts in every ISR";
-    ASSERT_TRUE(AuthTrio::until(30s, [&] { return t.counter(3, kPeerLinksEstablishedCounterTypeId).value_or(0) == 2; }));
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return t.counter(3, typeIdOf(RuneMetric::PeerLinksEstablished)).value_or(0) == 2; }));
 
     const std::string bad = t.makeKeyFile("bad.key", 'X');
     const std::string good = t.makeKeyFile("good.key", 'K');
     t.restart(3, bad);
     ASSERT_TRUE(AuthTrio::until(60s, [&] {
         return cap.sink->count(0) > 0 && cap.sink->count(1) > 0 && cap.sink->count(2) > 0 && cap.sink->count(3) > 0 &&
-               t.counter(1, kPeerLinkRefusalsCounterTypeId).value_or(0) > 0 && t.counter(2, kPeerLinkRefusalsCounterTypeId).value_or(0) > 0 &&
-               t.counter(3, kPeerLinkRefusalsCounterTypeId).value_or(0) > 0;
+               t.counter(1, typeIdOf(RuneMetric::PeerLinkRefusals)).value_or(0) > 0 && t.counter(2, typeIdOf(RuneMetric::PeerLinkRefusals)).value_or(0) > 0 &&
+               t.counter(3, typeIdOf(RuneMetric::PeerLinkRefusals)).value_or(0) > 0;
     })) << "refusals: " << cap.sink->count(0) << "," << cap.sink->count(1) << "," << cap.sink->count(2) << "," << cap.sink->count(3)
-        << " counters " << t.counter(1, kPeerLinkRefusalsCounterTypeId).value_or(-1) << "," << t.counter(2, kPeerLinkRefusalsCounterTypeId).value_or(-1)
-        << "," << t.counter(3, kPeerLinkRefusalsCounterTypeId).value_or(-1);
+        << " counters " << t.counter(1, typeIdOf(RuneMetric::PeerLinkRefusals)).value_or(-1) << "," << t.counter(2, typeIdOf(RuneMetric::PeerLinkRefusals)).value_or(-1)
+        << "," << t.counter(3, typeIdOf(RuneMetric::PeerLinkRefusals)).value_or(-1);
     EXPECT_EQ(t.node(3).peerLinksForTest().established, 0);
 
     // Node 3 leaves the ISR of the catalog, __security and EVERY partition of the user topic, and stays out.
@@ -661,7 +661,7 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
 
     auto allLinked = [&] {
         return AuthTrio::until(60s, [&] {
-            for (int id : {1, 2, 3}) if (t.counter(id, kPeerLinksEstablishedCounterTypeId).value_or(0) != 2) return false;
+            for (int id : {1, 2, 3}) if (t.counter(id, typeIdOf(RuneMetric::PeerLinksEstablished)).value_or(0) != 2) return false;
             return true;
         });
     };
@@ -796,7 +796,7 @@ TEST(AuthClusterRegression, HaltedBrokerRefetchesSecurityAfterItsDirIsMovedAside
     ASSERT_GT(sid, 0);
     EXPECT_EQ(w.login(t.channel(3), sid, "alice", {AuthTrio::kPw, AuthTrio::kPw}).errorCode(), 48);
     EXPECT_NO_THROW(t.login(1, "alice"));
-    EXPECT_GT(t.counter(3, kSecurityApplyHaltedCounterTypeId).value_or(0), 0);
+    EXPECT_GT(t.counter(3, typeIdOf(RuneMetric::SecurityApplyHalted)).value_or(0), 0);
 
     t.stopNode(3);
     const fs::path dir = t.cluster().dirs[2]->path / "__security";

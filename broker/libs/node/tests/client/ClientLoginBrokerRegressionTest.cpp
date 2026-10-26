@@ -66,7 +66,7 @@ TEST(ClientLoginBrokerRegression, ConnectsWithUsernameAndPassword) {
     EXPECT_EQ(a.kind, rc::AuthStatus::Kind::Authenticated);
     EXPECT_EQ(a.user, "ws1");
     EXPECT_EQ(a.brokerMode, pc::AuthMode::Required);
-    EXPECT_TRUE(b.awaitCounter(kLoginsOkCounterTypeId, 2)) << "the bootstrap admin's login and this one";
+    EXPECT_TRUE(b.awaitCounter(typeIdOf(RuneMetric::LoginsOk), 2)) << "the bootstrap admin's login and this one";
     client->closeImmediately();
 }
 
@@ -82,7 +82,7 @@ TEST(ClientLoginBrokerRegression, WrongPasswordFailsConnectAuthenticationFailed)
     // An unknown user fails with the very same text.
     auto unknown = makeClient(b, "nobody", kPwA);
     EXPECT_EQ(connectError(*unknown), err);
-    EXPECT_TRUE(b.awaitCounter(kLoginsFailedCounterTypeId, 2));
+    EXPECT_TRUE(b.awaitCounter(typeIdOf(RuneMetric::LoginsFailed), 2));
 }
 
 TEST(ClientLoginBrokerRegression, NoCredentialsFailsAuthenticationFailed) {

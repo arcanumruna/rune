@@ -42,7 +42,7 @@
 #include "support/TestCluster.h"
 #include "MetricsTestReader.h"
 #include <rune/node/NodeConfig.h>
-#include <rune/node/RoleCounter.h>
+#include <rune/node/RuneMetrics.h>
 #include <CncFileReader.h>
 #include <Aeron.h>
 #include <Context.h>

@@ -23,7 +23,7 @@ extern "C" {
 #include <atomic>
 #include <filesystem>
 #include <fstream>
-#include <rune/node/RoleCounter.h>
+#include <rune/node/RuneMetrics.h>
 #include <chrono>
 #include <map>
 #include <sstream>
@@ -266,8 +266,8 @@ TEST(PeerLinkAgentRegression, KeysReachEveryWorkerAndTheAdminThread) {
 }
 
 TEST(PeerLinkAgentRegression, TheCounterIdsAreAssignedOnce) {
-    EXPECT_EQ(kPeerLinksEstablishedCounterTypeId, 1'000'233);
-    EXPECT_EQ(kPeerLinkRefusalsCounterTypeId, 1'000'234);
+    EXPECT_EQ(typeIdOf(RuneMetric::PeerLinksEstablished), 1'000'233);
+    EXPECT_EQ(typeIdOf(RuneMetric::PeerLinkRefusals), 1'000'234);
 }
 
 TEST(PeerLinkAgentRegression, InProcessUnauthenticatedBuildsNoAgent) {
