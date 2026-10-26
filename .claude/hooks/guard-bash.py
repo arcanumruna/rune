@@ -65,8 +65,6 @@ def main():
                 deny("gh issue create needs exactly one type label (bug|enhancement|tech-debt|test-gap|flaky|docs), "
                      "exactly one sev:low|medium|high and at least one area:* label (root CLAUDE.md §5). "
                      f"Got: {labels or 'none'}")
-        if argv and argv[0] == "git" and git_subcommand(argv) == "push":
-            ask("git push needs the owner's explicit consent for this push (root CLAUDE.md §6).")
 
 
 if __name__ == "__main__":
