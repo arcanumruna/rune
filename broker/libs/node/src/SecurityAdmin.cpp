@@ -396,7 +396,7 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
     }
     case pc::SecurityOpKind::GrantRole:
     case pc::SecurityOpKind::RevokeRole: {
-        const sec::RoleObject* r = state.role(m.roleName);
+        const sec::RoleObject* r = state.roleByName(rune::catalog::kDefaultNsId, m.roleName);
         if (r == nullptr) {
             answer_(req, kInvalidRequest, std::string{sec::refusalName(sec::Refusal::UnknownRole)} + ": no role '" +
                                               m.roleName + "'");
@@ -421,7 +421,7 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
         e.objectId = state.nextObjectId();
         e.prevVersion = 0;
     } else if (roleTarget) {
-        const sec::RoleObject* r = state.role(m.name);
+        const sec::RoleObject* r = state.roleByName(rune::catalog::kDefaultNsId, m.name);
         if (r == nullptr) {
             answer_(req, kInvalidRequest, std::string{sec::refusalName(sec::Refusal::UnknownRole)} + ": no role '" + m.name + "'");
             return;
@@ -429,7 +429,7 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
         e.objectId = r->objectId;
         e.prevVersion = r->version;
     } else {
-        const sec::UserObject* u = state.user(m.name);
+        const sec::UserObject* u = state.userByName(rune::catalog::kDefaultNsId, m.name);
         if (u == nullptr) {
             answer_(req, kInvalidRequest, std::string{sec::refusalName(sec::Refusal::UnknownUser)} + ": no user '" + m.name + "'");
             return;

@@ -23,4 +23,21 @@ inline constexpr uint64_t kBasicV1Digests[] = {
     0xd5d7f73dd18010cfull,   // offset 14 DropRole
     0x5d19e16768750af3ull,   // offset 15 DropUser
 };
+
+// tests/security/golden/v2/namespaces.rsec, printed by `make_security_golden <out> v2` when formatVer 2 was
+// introduced (namespaces plan, Task 4).  Frozen like the v1 pins.
+inline constexpr uint64_t kNamespacesV2Digests[] = {
+    0x201b215395d3ef0cull,   // offset 0 Bootstrap
+    0xd24cdcc54970c3b4ull,   // offset 1 CreateUser
+    0x814285f995ccef35ull,   // offset 2 Grant
+    0x71027684b501321cull,   // offset 3 CreateUser
+    0x622f49af5cd0d1d0ull,   // offset 4 CreateRole
+    0x011386ffa34203cbull,   // offset 5 Grant
+    0xf675c90604e5a1e2ull,   // offset 6 Grant
+    0xa90f2a4a5109aca3ull,   // offset 7 GrantRole
+    0x55208d55cce23845ull,   // offset 8 Grant
+    0x4d9021304057b340ull,   // offset 9 AlterUser
+    0xf3a5913d9e467808ull,   // offset 10 RevokeRole
+    0x8953379420a28298ull,   // offset 11 DropUser
+};
 } // namespace rune::security::golden

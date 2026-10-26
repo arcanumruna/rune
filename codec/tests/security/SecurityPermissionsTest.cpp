@@ -41,9 +41,9 @@ TEST(SecurityPermissionsRegression, EffectiveGrantsAreTheUnionOfDirectAndRoles) 
     ASSERT_TRUE(sc.run(rs::GrantOps{rs::GranteeKind::User, g(Operation::Read, ResourceType::Topic, PatternKind::Exact, "t1")}, "u").has_value());
     ASSERT_TRUE(sc.run(rs::GrantOps{rs::GranteeKind::Role, g(Operation::Write, ResourceType::Topic, PatternKind::Exact, "t2")}, "R").has_value());
     ASSERT_TRUE(sc.run(rs::GrantOps{rs::GranteeKind::Role, g(Operation::Read, ResourceType::Topic, PatternKind::Exact, "t1")}, "S").has_value());
-    ASSERT_TRUE(sc.run(rs::GrantRoleOps{sc.s.role("R")->objectId, "R"}, "u").has_value());
-    ASSERT_TRUE(sc.run(rs::GrantRoleOps{sc.s.role("S")->objectId, "S"}, "u").has_value());
-    const auto eff = rs::effectiveGrants(sc.s, sc.s.user("u")->objectId);
+    ASSERT_TRUE(sc.run(rs::GrantRoleOps{sc.s.roleByName(rune::catalog::kDefaultNsId, "R")->objectId, "R"}, "u").has_value());
+    ASSERT_TRUE(sc.run(rs::GrantRoleOps{sc.s.roleByName(rune::catalog::kDefaultNsId, "S")->objectId, "S"}, "u").has_value());
+    const auto eff = rs::effectiveGrants(sc.s, sc.s.userByName(rune::catalog::kDefaultNsId, "u")->objectId);
     const std::vector<rs::GrantSpec> want = {g(Operation::Read, ResourceType::Topic, PatternKind::Exact, "t1"),
                                              g(Operation::Write, ResourceType::Topic, PatternKind::Exact, "t2")};
     EXPECT_EQ(eff, want) << "sorted, unique";
@@ -70,7 +70,7 @@ TEST(SecurityPermissionsRegression, HasSecurityAdminCountsEffectiveAdminViaARole
     EXPECT_FALSE(sc.s.hasSecurityAdmin());
     sc.run(rs::GrantOps{rs::GranteeKind::Role, g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")}, "ops");
     EXPECT_FALSE(sc.s.hasSecurityAdmin()) << "nobody is in the role yet";
-    sc.run(rs::GrantRoleOps{sc.s.role("ops")->objectId, "ops"}, "u");
+    sc.run(rs::GrantRoleOps{sc.s.roleByName(rune::catalog::kDefaultNsId, "ops")->objectId, "ops"}, "u");
     EXPECT_TRUE(sc.s.hasSecurityAdmin());
     sc.run(rs::AlterUserOps{rs::DisableUser{}}, "u");
     EXPECT_FALSE(sc.s.hasSecurityAdmin());

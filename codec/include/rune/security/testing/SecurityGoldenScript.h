@@ -27,4 +27,13 @@ namespace rune::security::testing {
 /// preview or apply (the script is broken — never silently emitted).
 [[nodiscard]] std::vector<SecurityEvent> goldenScriptV1();
 
+/// The formatVer-2 namespace script (tests/security/golden/v2/namespaces.rsec), beside the frozen v1 one:
+///   0 Bootstrap admin (ns 0)   1 CreateUser alice (ns 0)   2 Grant DROP ON CLUSTER -> alice (ns 0)
+///   3 CreateUser alice (ns 1: the same name)   4 CreateRole ops (ns 1)
+///   5 Grant READ TOPIC PREFIX 't' -> ops   6 Grant ADMIN ON NAMESPACE 'arena' -> ops
+///   7 GrantRole ops -> alice   8 Grant TRUNCATE TOPIC 't1' -> alice   9 AlterUser alice AddPassword
+///  10 RevokeRole ops <- alice  11 DropUser alice (ns 1)
+/// Events 3..11 are in namespace 1; the others in the default namespace.
+[[nodiscard]] std::vector<SecurityEvent> goldenScriptV2();
+
 } // namespace rune::security::testing

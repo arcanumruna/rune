@@ -9529,7 +9529,7 @@ std::optional<rune::gateway::Denial> ClientGateway::verifyOwnCredentialChange_(S
     }
     bool ok = false;
     const rune::security::UserObject* user =
-        securityView_ != nullptr && !securityView_->halted() ? securityView_->state().user(self) : nullptr;
+        securityView_ != nullptr && !securityView_->halted() ? securityView_->state().userByName(rune::catalog::kDefaultNsId, self) : nullptr;
     if (user != nullptr && !loginNonce.empty() && (m.flags & pc::kSecurityDdlFlagCredentialProof) != 0 &&
         m.credentialProof.size() == pc::kCredentialProofBytes && !m.ext.requestId.none()) {
         const std::string message = pc::credentialChangeMessage(loginNonce, m);

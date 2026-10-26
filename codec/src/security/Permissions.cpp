@@ -22,6 +22,21 @@ std::vector<GrantSpec> effectiveGrants(const SecurityState& s, uint64_t userId) 
     return out;
 }
 
+EffectivePerms effectivePerms(const SecurityState& s, uint64_t userId, std::string_view nsName) {
+    EffectivePerms p;
+    const UserObject* u = s.userById(userId);
+    if (!u) return p;
+    p.nsId = u->nsId;
+    p.grants = effectiveGrants(s, userId);
+    p.nsAdmin = (opsOn(p.grants, ResourceType::Namespace, nsName) & opBit(Operation::Admin)) != 0;
+    return p;
+}
+
+uint8_t opsOn(const EffectivePerms& perms, ResourceType type, uint32_t objectNsId, std::string_view name) noexcept {
+    if (objectNsId != perms.nsId) return 0;
+    return opsOn(std::span<const GrantSpec>(perms.grants), type, name);
+}
+
 uint8_t clusterOps(std::span<const GrantSpec> grants) noexcept {
     uint8_t bits = 0;
     for (const GrantSpec& g : grants)

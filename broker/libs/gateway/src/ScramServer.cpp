@@ -102,7 +102,7 @@ ServerFirstPlan scramServerFirst(const rune::security::SecurityState& state, con
     rs::Verifier fake0 = fakeSlot(seed, "rune-fake-salt|", cf.username, fakeIterations);
     rs::Verifier fake1 = fakeSlot(seed, "rune-fake-salt2|", cf.username, fakeIterations);
     plan.fakeSlotsComputed = 2;
-    const rune::security::UserObject* user = cf.username.empty() ? nullptr : state.user(cf.username);
+    const rune::security::UserObject* user = cf.username.empty() ? nullptr : state.userByName(rune::catalog::kDefaultNsId, cf.username);
     if (user != nullptr && !user->verifiers.empty()) {
         st.userId = user->objectId;
         st.verifiers[0] = fromStored(user->verifiers[0]);

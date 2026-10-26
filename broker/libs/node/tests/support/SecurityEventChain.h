@@ -43,12 +43,12 @@ public:
             e.objectId = s_.nextObjectId();
             e.prevVersion = 0;
         } else if (roleTarget) {
-            const RoleObject* r = s_.role(name);
+            const RoleObject* r = s_.roleByName(rune::catalog::kDefaultNsId, name);
             if (!r) throw std::logic_error("SecurityEventChain: no role " + name);
             e.objectId = r->objectId;
             e.prevVersion = r->version;
         } else {
-            const UserObject* u = s_.user(name);
+            const UserObject* u = s_.userByName(rune::catalog::kDefaultNsId, name);
             if (!u) throw std::logic_error("SecurityEventChain: no user " + name);
             e.objectId = u->objectId;
             e.prevVersion = u->version;

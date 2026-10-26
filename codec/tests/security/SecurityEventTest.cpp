@@ -16,6 +16,7 @@ rs::ScramVerifier verifier(uint8_t seed) {
 }
 rs::SecurityEvent baseEvent(rs::Ops ops) {
     rs::SecurityEvent e;
+    e.formatVer = rs::kFormatV1;   // this file pins the FROZEN v1 layout; NamespaceSecurityV2Test.cpp pins v2
     e.kind = rs::kindOf(ops); e.objectId = 9; e.objectName = "ws1"; e.prevVersion = 0; e.newVersion = 1;
     e.statement = "CREATE USER ws1 WITH PASSWORD '<redacted>';";
     e.ops = std::move(ops);
@@ -75,7 +76,7 @@ TEST(SecurityEventRegression, TrailingBytesAreRefused) {
 
 TEST(SecurityEventRegression, UnknownFormatVersionAndKindAreErrorsNotSkips) {
     auto b = rs::encode(baseEvent(rs::DropUserOps{})).value();
-    b[0] = 2;
+    b[0] = 3;   // 1 and 2 are the known formats
     EXPECT_EQ(rs::decode(b).error(), rs::DecodeError::UnknownFormatVer);
     b[0] = 1; b[2] = 11;
     EXPECT_EQ(rs::decode(b).error(), rs::DecodeError::UnknownKind);
