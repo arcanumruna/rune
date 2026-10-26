@@ -40,7 +40,7 @@ New event kinds go in `__catalog`; these kinds are already reserved there:
 - `NamespaceStateChanged(nsId, state)`;
 - `NamespaceDeleted(nsId)`.
 
-The kinds are added to catalog formatVer 1, with no version bump: there are no mixed-version clusters and no in-place upgrade, so no node ever meets an event it cannot apply.
+These events use a new catalog formatVer 2 rule set: v2 accepts the namespace kinds and applies every v1 kind exactly as v1 does. The formatVer 1 rules never change and keep refusing the namespace kinds. No version gate is needed: there are no mixed-version clusters and no in-place upgrade.
 
 Users and grants for a namespace go in `__security`, tagged with its `nsId`. Every node applies the events in log order, and applying the same event twice changes nothing.
 
