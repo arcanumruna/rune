@@ -81,6 +81,7 @@ struct SinkSpec {
     int32_t                      partitions = 1;
     rune::catalog::Persistence   persistence = rune::catalog::Persistence::Disk;
     std::string                  keyField;
+    uint32_t                     nsId       = 0;   // the namespace that owns the view (and so its sink)
 };
 
 /// The admin-thread effect sink.  Production = ring encoders (AdminWorkerAgent);
@@ -88,6 +89,10 @@ struct SinkSpec {
 struct CatalogEffects {
     std::function<void(const rune::catalog::TopicObject&)>               topicApplied;     // CreateTopic only
     std::function<void(const SinkSpec&)>                                 sinkApplied;      // sink of Create/AlterView (F27)
+    // A namespace was created, or its limits / state changed (NamespaceCreated, NamespaceLimitsSet,
+    // NamespaceStateChanged): the namespace's record AFTER the event.  Boot posts every namespace once, before any
+    // topic.  NamespaceDeleted posts nothing here (Phase 2 owns the delete effects).
+    std::function<void(const rune::catalog::NamespaceRecord&)>           namespaceUpserted;
     std::function<void(int32_t topicId, const std::string& name)>        topicDropped;     // DropTopic, retired sink
     std::function<void(int32_t topicId, std::span<const rune::catalog::ConfigChange>)> topicConfig;
     // Validators fan-out of versions fromVersion..current: live passes the current version (earlier ones were

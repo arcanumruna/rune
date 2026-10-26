@@ -591,7 +591,7 @@ void AdminWorker::submit(DdlRequest req) {
 void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     // A pure read of the projected registry.  `requestedFingerprint` 0 = latest;
     // non-zero = the exact historical version with that per-version fingerprint.
-    const auto* named = reg_.byName(msg.name);
+    const auto* named = reg_.byName(rune::catalog::kDefaultNsId, msg.name);   // Task 10: the session's nsId
     if (!named) {
         deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic);
         return;

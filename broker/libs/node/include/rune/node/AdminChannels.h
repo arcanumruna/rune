@@ -1235,6 +1235,7 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
 //                             maxCompactionLagMs:i64 retentionCheckMs:i64
 //                             fileDeleteDelayMs:i64 durability:u8 durabilityTier:u8
 //                             coPartitionGroupLen:u16 + bytes, partitionKeyLen:u16 + bytes
+//                             [nsId:u32]   (namespaces Task 5: the owning namespace; appended LAST)
 //   kA2cCatalogTopicDropped : [topicId:i32][nameLen:u16 + name]
 //   kA2cCatalogTopicConfig  : [topicId:i32][count:u16][(key:u8, value:i64) * count]
 //   kA2cViewUninstall       : [viewTopicId:i32]
@@ -1244,6 +1245,8 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
 namespace admin_wire {
 inline void putI16(uint8_t* p, int16_t v) { std::memcpy(p, &v, 2); }
 inline void putU64(uint8_t* p, uint64_t v) { std::memcpy(p, &v, 8); }
+inline void putU32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); }
+inline uint32_t getU32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
 inline int16_t  getI16(const uint8_t* p) { int16_t v; std::memcpy(&v, p, 2); return v; }
 inline uint64_t getU64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
 /// u16-length-prefixed string; the caller sized the buffer (len <= 0xFFFF checked by the WireLen user).
@@ -1278,6 +1281,7 @@ struct CatalogTopicAppliedMsg {
     int16_t                     replicationFactor = 0;
     uint8_t                     persistence       = 0;   // 0 disk, 1 transient
     rune::protocol::TopicConfig config;
+    uint32_t                    nsId              = 0;   // the owning namespace (names are per namespace)
 };
 
 /// 0 = cannot be encoded (a string longer than a u16 prefix holds).
@@ -1285,11 +1289,12 @@ struct CatalogTopicAppliedMsg {
                                                             const rune::protocol::TopicConfig& c) noexcept {
     if (name.size() > kMaxStr16 || c.coPartitionGroup.size() > kMaxStr16 || c.partitionKey.size() > kMaxStr16)
         return 0;
-    return 4 + 2 + name.size() + 4 + 2 + 1 + topicConfigWireLen(c);
+    return 4 + 2 + name.size() + 4 + 2 + 1 + topicConfigWireLen(c) + 4;
 }
 
 inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_view name, int32_t partitions,
-                                     int16_t rf, uint8_t persistence, const rune::protocol::TopicConfig& c) {
+                                     int16_t rf, uint8_t persistence, const rune::protocol::TopicConfig& c,
+                                     uint32_t nsId = 0) {
     using namespace admin_wire;
     putI32(p, topicId); p += 4;
     p = putStr16(p, name);
@@ -1309,7 +1314,8 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
     *p++ = c.durability;
     *p++ = c.durabilityTier;
     p = putStr16(p, c.coPartitionGroup);
-    (void)putStr16(p, c.partitionKey);
+    p = putStr16(p, c.partitionKey);
+    putU32(p, nsId);
 }
 
 [[nodiscard]] inline bool decodeCatalogTopicApplied(const uint8_t* buf, std::size_t len, CatalogTopicAppliedMsg& m) {
@@ -1338,6 +1344,8 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
     c.durabilityTier            = buf[pos++];
     if (!getStr16(buf, len, pos, c.coPartitionGroup)) return false;
     if (!getStr16(buf, len, pos, c.partitionKey)) return false;
+    if (pos + 4 > len) return false;
+    m.nsId = getU32(buf + pos); pos += 4;
     return pos == len && m.topicId >= 0 && m.partitions > 0 && !m.name.empty();
 }
 

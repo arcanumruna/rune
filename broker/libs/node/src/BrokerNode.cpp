@@ -3991,12 +3991,12 @@ void BrokerNode::bootFromCatalog_() {
     sink.maxFrameBytes = catalogEffectMaxFrame();   // an effect that could never be posted halts the boot, as before
     bootObjects_ = rune::gateway::ObjectIndex{};
     sink.topicApplied = [&catalogTopics, this](const cat::TopicObject& t) {
-        bootObjects_.onTopic(t.topicId, t.name);
+        bootObjects_.onTopic(t.nsId, t.topicId, t.name);
         catalogTopics.push_back(bootSpecOfFrame(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence,
                                                 t.config));
     };
     sink.sinkApplied = [&catalogTopics, this](const SinkSpec& sp) {   // a view's sink: a keyed, compacted table, every broker
-        bootObjects_.onView(sp.topicId, sp.name);
+        bootObjects_.onView(sp.nsId, sp.topicId, sp.name);
         rune::protocol::TopicConfig c;
         c.cleanupPolicy = 1;   // Compact
         c.partitionKey  = sp.keyField;
@@ -5697,7 +5697,7 @@ void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool is
     }
     // Authentication Task 12 (spec §6): the gateway's ObjectIndex and every authenticated session's permission table
     // learn the object at the moment the catalog effect is applied here (idempotent), before it is built.
-    if (gateway_) gateway_->onCatalogObjectApplied(m.topicId, m.name, isView);
+    if (gateway_) gateway_->onCatalogObjectApplied(m.nsId, m.topicId, m.name, isView);
     TopicSpec spec = topicSpecFromCatalog(m);
     spec.viewSink = isView;   // VLS B.2
     // Step 3: a create whose name a dropped topic still holds (its dir not renamed

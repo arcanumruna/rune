@@ -181,6 +181,7 @@ if(BUILD_TESTING)
         tests/node/ViewReadinessRegressionTest.cpp
         tests/node/ViewRecoveryRegressionTest.cpp
         tests/node/CatalogApplierTest.cpp
+        tests/node/NamespaceMirrorTest.cpp
         tests/node/ViewSinkRegressionTest.cpp
         tests/node/SecurityApplierTest.cpp
         tests/node/SecurityReadServerTest.cpp

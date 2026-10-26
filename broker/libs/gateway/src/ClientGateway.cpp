@@ -1,5 +1,6 @@
 // ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 
+#include <rune/catalog/NsName.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/LogSafe.h>  // issue #232: client-supplied names in log lines
 #include <rune/view/PlanSources.h>
@@ -8541,7 +8542,12 @@ void ClientGateway::syncPermissionTables_()
 
 void ClientGateway::onCatalogObjectApplied(int32_t id, const std::string& name, bool isView)
 {
-    if (isView) objectIndex_.onView(id, name); else objectIndex_.onTopic(id, name);
+    onCatalogObjectApplied(rune::catalog::kDefaultNsId, id, name, isView);
+}
+
+void ClientGateway::onCatalogObjectApplied(uint32_t nsId, int32_t id, const std::string& name, bool isView)
+{
+    if (isView) objectIndex_.onView(nsId, id, name); else objectIndex_.onTopic(nsId, id, name);
     const rune::gateway::ObjectEntry* e = objectIndex_.at(id);
     if (e == nullptr) return;
     // Issue #259: every LIVE TABLE once (not every session); a table whose WRITE bit of the new object changed (a

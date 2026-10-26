@@ -255,7 +255,7 @@ public:
                                     int32_t& outViewTopicId, uint64_t& outFingerprint) const {
         outViewTopicId = -1;
         outFingerprint = 0;
-        const ViewRecord* vrec = viewRegistry_->byName(name);
+        const ViewRecord* vrec = viewRegistry_->byName(rune::catalog::kDefaultNsId, name);   // Task 10: the session's nsId
         if (vrec == nullptr) return 4;
         outViewTopicId = vrec->viewTopicId;
         const RegistryEntry* latest = reg_.latest(vrec->viewTopicId);

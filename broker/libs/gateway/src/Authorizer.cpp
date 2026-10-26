@@ -67,7 +67,9 @@ std::optional<Denial> authorizeName(const PermissionTable& t, rsec::ResourceType
 std::optional<Denial> authorizeTopicOrViewName(const PermissionTable& t, std::string_view name, rsec::Operation op,
                                                const ObjectIndex& index)
 {
-    if (const ObjectEntry* e = index.byName(name)) {   // #128: only the object's own kind's grants count
+    // Task 10 passes the session's nsId; until then every name is the `default` namespace's.
+    if (const auto id = index.byName(0, name)) {   // #128: only the object's own kind's grants count
+        const ObjectEntry* e = index.at(*id);
         if (t.allowsName(e->type, name, rsec::opBit(op))) return std::nullopt;
         return deny(op, rsec::ResourceType::Topic, name);
     }

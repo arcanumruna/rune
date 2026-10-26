@@ -98,6 +98,20 @@ if(BUILD_TESTING)
     target_link_libraries(rune_gateway_permission_table_tests PRIVATE rune_gateway GTest::gtest_main)
     gtest_discover_tests(rune_gateway_permission_table_tests)
 
+    # Namespaces Task 5 (fixes #128): the (nsId, name) ObjectIndex hash.  AllocWindow.cpp replaces the global operator
+    # new for this binary (the zero-allocation lookup gate).  The linear-scan ratio guard is a timing test: label latency.
+    add_executable(rune_gateway_object_index_tests
+        tests/ObjectIndexTest.cpp
+        ${RUNE_BROKER_DIR}/libs/node/tests/support/AllocWindow.cpp)
+    target_include_directories(rune_gateway_object_index_tests PRIVATE ${RUNE_BROKER_DIR}/libs/node/tests)
+    target_link_libraries(rune_gateway_object_index_tests PRIVATE rune_gateway GTest::gtest_main)
+    set(RUNE_OBJECT_INDEX_LATENCY_TESTS "ObjectIndexRegression.Issue128LinearScanRegression")
+    gtest_discover_tests(rune_gateway_object_index_tests
+        TEST_FILTER "${RUNE_OBJECT_INDEX_LATENCY_TESTS}"
+        PROPERTIES RUN_SERIAL TRUE LABELS latency)
+    gtest_discover_tests(rune_gateway_object_index_tests
+        TEST_FILTER "-${RUNE_OBJECT_INDEX_LATENCY_TESTS}")
+
     # Authentication Task 14: what a permission refresh ends for one session - pure, no Aeron.
     add_executable(rune_gateway_live_security_changes_tests tests/LiveSecurityChangesTest.cpp)
     target_link_libraries(rune_gateway_live_security_changes_tests PRIVATE rune_gateway GTest::gtest_main)

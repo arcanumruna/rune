@@ -1086,11 +1086,11 @@ private:
 
     void postCatalogTopicApplied_(int32_t topicId, std::string_view name, int32_t partitions, int16_t rf,
                                   rune::catalog::Persistence persistence, const rune::protocol::TopicConfig& c,
-                                  int32_t typeId = kA2cCatalogTopicApplied) {
+                                  uint32_t nsId, int32_t typeId = kA2cCatalogTopicApplied) {
         const std::size_t len = catalogTopicAppliedWireLen(name, c);
         const uint8_t pers = persistence == rune::catalog::Persistence::Transient ? 1 : 0;
         postCatalog_(typeId, len, [&](uint8_t* p) {
-            writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c);
+            writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c, nsId);
         });
     }
 
@@ -1134,14 +1134,14 @@ private:
             // A typed topic's validator follows as schemaChanged (the applier posts both).  Its filter schema goes
             // FIRST: the gateway then validates (and the workers bind) a filter from the moment the topic serves.
             postCatalogFilterSchema_(t);
-            postCatalogTopicApplied_(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence, t.config);
+            postCatalogTopicApplied_(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence, t.config, t.nsId);
         };
         fx.sinkApplied = [this](const SinkSpec& s) {
             // A view sink is a keyed, compacted table (Task 19's sink spec), every broker (rf 0).
             rune::protocol::TopicConfig c;
             c.cleanupPolicy = 1;   // Compact
             c.partitionKey  = s.keyField;
-            postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf*/0, s.persistence, c,
+            postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf*/0, s.persistence, c, s.nsId,
                                      kA2cCatalogSinkApplied);   // Task 12 (N5)
         };
         fx.topicDropped = [this](int32_t topicId, const std::string& name) {
@@ -1164,7 +1164,7 @@ private:
         fx.viewInstalled = [this, viewInstallRecovery](const rune::catalog::ViewObject& v) {
             std::vector<uint8_t> src;   // the first source's materialized descriptor (empty: untyped)
             if (!v.def.sourceNames.empty())
-                if (const RegistryEntry* e = catalogSchemas_->byName(v.def.sourceNames.front()))
+                if (const RegistryEntry* e = catalogSchemas_->byName(v.nsId, v.def.sourceNames.front()))
                     src = rune::codec::serialize(e->descriptor);
             const std::span<const uint8_t> plan(v.def.compiledPlanBlob), out(v.def.outputDescriptorBlob), sd(src);
             const uint8_t pers = v.def.persistence == rune::catalog::Persistence::Transient ? 1 : 0;

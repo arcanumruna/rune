@@ -533,6 +533,8 @@ public:
     void setBootObjects(rune::gateway::ObjectIndex objects) { objectIndex_ = std::move(objects); }
     /// The control drain of kA2cCatalogTopicApplied / kA2cCatalogSinkApplied: a topic / view exists at `id`; every
     /// authenticated session's table is extended from its retained patterns (spec §6).  Idempotent.
+    void onCatalogObjectApplied(uint32_t nsId, int32_t id, const std::string& name, bool isView);
+    /// The `default` namespace (nsId 0).
     void onCatalogObjectApplied(int32_t id, const std::string& name, bool isView);
     /// kA2cCatalogTopicDropped: the id is gone; every table's bits for it are cleared.  Idempotent.
     void onCatalogObjectDropped(int32_t id);
