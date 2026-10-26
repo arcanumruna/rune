@@ -10,8 +10,8 @@
 - **Names:** every object is named by the pair (namespace, name).
 - **`default` namespace:** always exists and can never be deleted. A name without a namespace resolves to `default`, so existing clients keep working.
 - **Identity:** each namespace has a `nsId`, a u32 that the catalog assigns and never reuses. It is the namespace's incarnation: deleting `acme` and creating it again gives a new `nsId`, so stale state can never match the new namespace.
-- **Disk layout:** `<data>/ns-<nsId>/<topic>-<partition>/...`.
-  - First boot after upgrade: move the existing data into `ns-<defaultId>/`. Use one idempotent rename per directory, and finish any half-done move on the next boot.
+- **Disk layout:** `<data>/ns-<nsId>/topics/<name>/<partition>/...`.
+- **No in-place upgrade.** A cluster with namespaces is a new cluster; existing data, users and grants are not migrated, so there is no upgrade rename and no mixed-version cluster.
 - **Memory layout:** a per-node map from `nsId` to that namespace's objects, owned by the metadata or catalog agent.
 - **Hot path is unchanged:**
   - Topic and view ids stay globally unique, so the produce, consume and query paths never see `nsId`.
@@ -21,11 +21,11 @@
 ## 2. Roles and users
 | Role | Can do |
 |---|---|
-| Cluster admin | Create, suspend and delete namespaces. Set `NamespaceLimits`. Appoint namespace admins. Everything else. |
+| Cluster admin | Root: every operation in every namespace, data included, with no grant needed. Create, suspend and delete namespaces; set `NamespaceLimits`; appoint namespace admins. |
 | Namespace admin | Within its own namespace: create, delete and change the password of users; grant and revoke permissions; run topic, view and schema DDL. |
 | User | Whatever its grants allow, within its own namespace. |
 
-- **User names** have the form `ns/user` and live in `__security` (SCRAM). Logging in fixes the session's namespace.
+- **User names** have the form `ns/user` and live in `__security` (SCRAM). Logging in fixes the session's namespace; `ConnectRequest` gets no namespace field.
 - **Escalation guards**, each enforced in the security agent and each covered by an adversarial test. A namespace admin can never:
   - grant cluster-admin;
   - grant on, or touch users in, another namespace;
@@ -177,6 +177,7 @@ allocate nothing, and they must pass an ABAB bench against the CLAUDE.md latency
   - `TruncateTopic(topicName, entries[(partition, beforeOffset)], DdlExtension)`.
   - `beforeOffset = -1` means "up to the high watermark".
   - It needs the `Truncate` grant on the topic.
+  - Internal (`__*`) topics are refused with `INVALID_REQUEST`, for every caller, the cluster admin included.
 - **What it does:** it advances the partition's `logStartOffset` to `min(beforeOffset, HW)`. It never moves the start backwards.
 - **Flow:**
   1. The leader appends a `LogStartAdvanced(partition, offset)` control record.
@@ -202,7 +203,7 @@ allocate nothing, and they must pass an ABAB bench against the CLAUDE.md latency
 0. **Metrics:** the arcanum-metrics changes in §5.3 (single-writer slots, injected clock, allocate/free with a registration id, no-throw), then every Rune Aeron counter moved onto it, with `docs/operations.md`.
 1. **Namespaces:**
    - catalog events and the `nsId` registry;
-   - names and resolution, the `default` namespace, the disk layout and upgrade rename;
+   - names and resolution, the `default` namespace, the disk layout;
    - `ns/user` users, roles and escalation guards;
    - CLI and admin commands.
 2. **Lifecycle and limits:**
@@ -334,8 +335,6 @@ Still to decide. Each has the recommended answer; a line is removed when the dec
 section it belongs to.
 
 **Code facts the spec must match**
-1. Disk layout: the code uses `<data>/topics/<name>/<partition>/`, not `<topic>-<partition>`. Recommended:
-   `<data>/ns-<nsId>/topics/<name>/<partition>/`.
 2. The catalog reserves kinds 32–63 only as a block that formatVer 1 refuses. Recommended: the namespace events
    bump the catalog to formatVer 2.
 3. `SecurityOperation` and `SecurityResourceType` are frozen enums with no `Truncate` or `Namespace`. Recommended:
@@ -346,15 +345,11 @@ section it belongs to.
 
 **Naming**
 6. A bare name resolves in the session's namespace, not always in `default`. Recommended: yes.
-7. ConnectRequest has no namespace field. Recommended: the namespace comes from the login (`ns/user`); no field.
 8. Namespace name rules. Recommended: `[a-z0-9][a-z0-9-]{0,62}`; `__`-prefixed names are reserved.
 9. `ObjectIndex::byName` is global. Recommended: key it by `(nsId, name)`.
 10. Group and transactional ids. Recommended: keyed by `(nsId, id)`, as the internal-topic keys are.
 
 **Admin**
-11. The cluster admin gets no data access inside a namespace by default. Recommended: yes; it must grant itself
-    explicitly, and that grant is audited.
-12. Existing users become `default/<user>` on upgrade. Recommended: yes.
 13. The security-admin guard stays cluster-wide. Recommended: yes.
 
 **Lifecycle**
@@ -366,11 +361,9 @@ section it belongs to.
 17. `RejectAll` refuses every login, and `default` can be suspended. Recommended: yes to both.
 
 **Truncate**
-18. Truncate of internal (`__*`) and transient topics. Recommended: refused.
+18. Truncate of transient topics. Recommended: refused, as for internal topics.
 19. Truncate clamps to the last stable offset as well as the HW on transactional topics. Recommended: yes.
 
 **Scope**
 20. Split NAT egress (§10.5) and the CLI work into their own specs. Recommended: yes.
 21. Anonymous read (§11) is off by default, and CLAUDE.md §8 records it. Recommended: yes.
-22. Version skew: an old node in a mixed cluster cannot apply formatVer 2 events. Recommended: a cluster feature
-    gate that refuses namespace DDL until every node reports support.
