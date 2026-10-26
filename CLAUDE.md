@@ -150,8 +150,8 @@ the repo, issues or commits.
 
 ## 6. Git, commits and secrets
 
-- **Never push without the owner's explicit consent for that push.** Consent does not carry over to later pushes. A
-  hook in `.claude/settings.json` makes every `git push` ask first. Never force-push without an explicit request.
+- **Pushes to working branches need no per-push consent** (the owner's standing permission). Never push directly to
+  `main` and never force-push without an explicit request.
 - Work on a branch, never directly on `main`. Create every branch off the latest `main` (`git fetch` first) and keep it
   current by merging `main` in before review.
 - Pull request branches are prefixed by kind: `feature/<topic>` for new functionality, `bugfix/<topic>` for fixes.
