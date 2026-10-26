@@ -417,10 +417,6 @@ public:
         return encodeSecurityUnsubscribe(requestRing_, CatalogUnsubscribeMsg{sessionId, subscriptionId});
     }
 
-    int doWork(int64_t nowNs) noexcept override {
-        int work = 0;
-
-        // 1. Drain role events (control → admin) FIRST so leadership is current
     // ── Namespaces Task 7: NamespaceDdl (81) and ListNamespaces (82) (gateway → admin) ──────────────────────────
     rune::gateway::AdminSubmit submitNamespaceDdl(const rune::protocol::client::NamespaceDdlRequest& w,
                                                   const rune::gateway::DdlMetaView& meta, std::string_view denial,
@@ -449,6 +445,10 @@ public:
         return submitDdl_(m);
     }
 
+    int doWork(int64_t nowNs) noexcept override {
+        int work = 0;
+
+        // 1. Drain role events (control → admin) FIRST so leadership is current
         //    before any DDL runs this tick.
         //    Catalog history Task 6: the same ring carries the __catalog role
         //    (kMsgCatalogRole) and the controller's AlterIsrResponse for (-6, 0)
@@ -601,13 +601,13 @@ public:
             // Authentication Task 10: the security write path and `__security` reads.
             case kMsgSecurityDdl:       worker_.submitSecurity(decodeSecurityDdl(p, n)); break;
             case kMsgSecurityBootstrap: worker_.submitSecurity(decodeSecurityBootstrap(p, n)); break;
+            // Namespaces Task 7.
+            case kMsgNamespaceDdl:      worker_.submit(decodeNamespaceDdl(p, n)); break;
+            case kMsgListNamespaces:    worker_.submit(decodeListNamespaces(p, n)); break;
             case kMsgSecuritySubscribe: {
                 CatalogSubscribeMsg m;
                 if (decodeCatalogSubscribe(p, n, m)) worker_.securitySubscribe(m);
                 else reportBadRequestFrame_(tid, n);
-            // Namespaces Task 7.
-            case kMsgNamespaceDdl:      worker_.submit(decodeNamespaceDdl(p, n)); break;
-            case kMsgListNamespaces:    worker_.submit(decodeListNamespaces(p, n)); break;
                 break;
             }
             case kMsgSecurityUnsubscribe: {
@@ -781,10 +781,6 @@ public:
         [[maybe_unused]] const bool posted = n > 0 && postEgressFrame(session, egressStage_.data(), n);
         assert(posted && "a clamped DdlResponse always fits one admin egress message");
     }
-    /// Catalog history Task 9 — ADMIN thread only (deps.respondError).  An
-    /// ErrorResponse (5) carrying a DDL rejection's detail (InvalidRequest).
-    void postErrorResponse(int64_t session, int64_t corr, uint16_t code, std::string_view message) {
-        namespace pc = rune::protocol::client;
     /// Namespaces Task 7 — ADMIN thread only (deps.respondListNamespaces).  A ListNamespacesResponse (83): a page is
     /// at most 100 entries (~33 KB), well inside one admin egress message (ring/8 = 128 KiB); a page that still
     /// does not fit is answered ErrorResponse MessageTooLarge (never dropped).
@@ -799,6 +795,10 @@ public:
         [[maybe_unused]] const bool posted = n > 0 && postEgressFrame(session, egressStage_.data(), n);
         assert(posted && "a ListNamespaces page within maxEgressFrameBytes always fits one admin egress message");
     }
+    /// Catalog history Task 9 — ADMIN thread only (deps.respondError).  An
+    /// ErrorResponse (5) carrying a DDL rejection's detail (InvalidRequest).
+    void postErrorResponse(int64_t session, int64_t corr, uint16_t code, std::string_view message) {
+        namespace pc = rune::protocol::client;
         pc::ErrorResponse r;
         r.sessionId     = session;
         r.correlationId = corr;

@@ -480,6 +480,10 @@ struct NodeConfig {
     /// RUNE_GROUP_MAX_GROUPS (#214): the most consumer groups coordinated at once.  0 = the default
     /// (GroupCoordinationService::kDefaultMaxGroups).
     int32_t groupMaxGroups = 0;
+    /// RUNE_MAX_NAMESPACES (namespaces Task 7): the cluster-wide namespace cap, `default` included.
+    int32_t maxNamespaces = 1024;
+    /// RUNE_NS_DEFAULT_* (namespaces Task 7): the cluster default limits an omitted CreateNamespace field takes.
+    rune::protocol::NamespaceLimits nsDefaultLimits{};
     /// RUNE_GROUP_MIN_SESSION_TIMEOUT_MS / RUNE_GROUP_MAX_SESSION_TIMEOUT_MS (#499): the bounds a JoinGroup's session
     /// timeout is clamped into.  0 = the GroupCoordinationService default (1 s / 30 min).
     int32_t groupMinSessionTimeoutMs = 0;
@@ -493,10 +497,6 @@ struct NodeConfig {
     // ISR design v3 §3.2 (Step 5): how an EMPTY, not yet formatted data dir is formatted at boot.
     // In-process default (rigs): an empty dir formats as founder; the env parser defaults to Required
     // (RUNE_STORAGE_FORMAT unset / "": an empty dir refuses to start).  Ignored once storage.meta exists.
-    /// RUNE_MAX_NAMESPACES (namespaces Task 7): the cluster-wide namespace cap, `default` included.
-    int32_t maxNamespaces = 1024;
-    /// RUNE_NS_DEFAULT_* (namespaces Task 7): the cluster default limits an omitted CreateNamespace field takes.
-    rune::protocol::NamespaceLimits nsDefaultLimits{};
     StorageFormat storageFormat = StorageFormat::TestFounder;
     // RUNE_STORAGE_RECOVERY_VOTE (default false): unsafe, disaster recovery only — lets an unconfirmed
     // (replaced-disk) node vote (read by the storage gate, Step 9).

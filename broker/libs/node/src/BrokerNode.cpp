@@ -4375,6 +4375,13 @@ void BrokerNode::buildAdminWorker() {
             if (!adminWorkerAgent_) return;
             adminWorkerAgent_->postErrorResponse(session, corr, code, message);
         };
+        // Namespaces Task 7: the ListNamespaces answer, and the Create defaults / count cap read once at boot.
+        deps.respondListNamespaces = [this](int64_t session, int64_t, const rune::protocol::client::ListNamespacesResponse& r) {
+            if (!adminWorkerAgent_) return;
+            adminWorkerAgent_->postListNamespacesResponse(session, r);
+        };
+        deps.nsDefaults.limits = config_.nsDefaultLimits;
+        deps.maxNamespaces     = static_cast<uint32_t>(config_.maxNamespaces);
         // Issues #15 / #111: the `__security` catch-up verdict -> the control thread's SecurityServing.
         deps.securityServing = [this](bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader, int64_t knownEnd,
                                       bool behind, bool held) {
@@ -4395,13 +4402,6 @@ void BrokerNode::buildAdminWorker() {
             catalogReplica_.get(), catalogPlane_.get());
         // Task 16 (F4): the applier the startup phase booted — Booted, never replayed
         // again; the admin thread's first pass makes it Live.
-        // Namespaces Task 7: the ListNamespaces answer, and the Create defaults / count cap read once at boot.
-        deps.respondListNamespaces = [this](int64_t session, int64_t, const rune::protocol::client::ListNamespacesResponse& r) {
-            if (!adminWorkerAgent_) return;
-            adminWorkerAgent_->postListNamespacesResponse(session, r);
-        };
-        deps.nsDefaults.limits = config_.nsDefaultLimits;
-        deps.maxNamespaces     = static_cast<uint32_t>(config_.maxNamespaces);
         adminWorkerAgent_->worker().adoptBootedApplier(std::move(*bootApplier_), adminWorkerAgent_->catalogLiveEffects());
         bootApplier_.reset();
         // Authentication Task 9: the same for the booted SecurityApplier + the `__security` replica.
