@@ -167,6 +167,8 @@ add_library(rune_catalog STATIC ${RUNE_CATALOG_SOURCES})
 target_include_directories(rune_catalog PUBLIC ${RUNE_CODEC_ROOT}/include ${RUNE_PROTOCOL_INCLUDE})
 target_link_libraries(rune_catalog PUBLIC rune_codec)
 target_compile_features(rune_catalog PUBLIC cxx_std_23)
+# Every EventKind / ApplyError switch must name every enumerator (Checkpoint A F1/F2).
+target_compile_options(rune_catalog PRIVATE -Werror=switch)
 
 # ── rune_security — the shared authentication library (auth spec §3, plan D1): event
 #    model, frozen v1 apply rules, fingerprints, permissions, verifying replayer, .rsec.

@@ -1442,3 +1442,94 @@ TEST(CatalogApplierRegression, BootSinkIsReleasedWhenTheReplayEndsRegression) {
     ASSERT_EQ(boot2.replayLocal(empty.log(), bootEffects()), 0);
     EXPECT_EQ(token.use_count(), 1);
 }
+
+// Checkpoint A F2: the namespace kinds (32..35) had no arm in project_/effects_; each must apply without a halt,
+// project nothing into the schema/view registries and post no side effect.
+TEST(CatalogApplierRegression, NamespaceKindsApplyWithoutHaltRegression) {
+    CatalogRig rig("ap_ns_kinds");
+    rig.appendEvents(0, 5);
+    ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 5);
+    const std::vector<std::string> before = rig.rec.sequence;
+
+    // The leader's way: stamp the previewed fingerprint against the applier's own state, then commit.
+    auto commit = [&](cat::Ops ops, uint32_t nsId, uint32_t prev) {
+        cat::CatalogEvent e;
+        e.formatVer   = cat::kFormatV2;
+        e.nsId        = nsId;
+        e.kind        = cat::kindOf(ops);
+        e.ops         = std::move(ops);
+        e.objectName  = "guild";
+        e.prevVersion = prev;
+        e.newVersion  = prev + 1;
+        auto fp = cat::previewFingerprint(rig.applier.state(), e);
+        ASSERT_TRUE(fp.has_value()) << cat::applyErrorName(fp.error().code) << ": " << fp.error().detail;
+        e.fingerprint = *fp;
+        rig.appendEventCommitted(e);
+        const int64_t next = rig.applier.nextOffset();
+        EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 1);
+        ASSERT_FALSE(rig.applier.halted()) << (rig.rec.halts.empty() ? "" : rig.rec.halts.back().detail);
+        EXPECT_EQ(rig.applier.nextOffset(), next + 1);
+    };
+    const uint32_t ns = rig.applier.state().namespaces().nextNsId();
+    commit(cat::NamespaceCreatedOps{"guild", {}}, ns, 0);
+    rune::protocol::NamespaceLimits l{};
+    l.maxTopics = 7;
+    commit(cat::NamespaceLimitsSetOps{l}, ns, 1);
+    commit(cat::NamespaceStateChangedOps{cat::NsStateTag::SuspendedReadOnly}, ns, 2);
+
+    ASSERT_NE(rig.applier.state().namespaces().byId(ns), nullptr);
+    EXPECT_EQ(rig.applier.state().namespaces().byId(ns)->version, 3u);
+    EXPECT_TRUE(rig.rec.halts.empty());
+    EXPECT_EQ(rig.rec.sequence, before) << "namespace kinds post no live effect";
+    EXPECT_EQ(rig.rec.appliedOffsets.back(), 7);
+}
+
+// Checkpoint A F11: namespace state survives a restart.  Live apply of create / limits / a second namespace's full
+// delete, then a fresh applier replays the local log against the durable checkpoint: no FingerprintMismatch halt, the
+// same digest, the live record intact, the deleted id gone and the id counter not rolled back (ids are never reused).
+TEST(CatalogApplierRegression, NamespaceStateSurvivesBootReplayRegression) {
+    CatalogRig rig("ap_ns_boot");
+    rig.appendEvents(0, 3);
+    ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 3);
+
+    auto commit = [&](cat::Ops ops, const std::string& name, uint32_t nsId, uint32_t prev) {
+        cat::CatalogEvent e;
+        e.formatVer   = cat::kFormatV2;
+        e.nsId        = nsId;
+        e.kind        = cat::kindOf(ops);
+        e.ops         = std::move(ops);
+        e.objectName  = name;
+        e.prevVersion = prev;
+        e.newVersion  = prev + 1;
+        auto fp = cat::previewFingerprint(rig.applier.state(), e);
+        ASSERT_TRUE(fp.has_value()) << cat::applyErrorName(fp.error().code) << ": " << fp.error().detail;
+        e.fingerprint = *fp;
+        rig.appendEventCommitted(e);
+        ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 1);
+        ASSERT_FALSE(rig.applier.halted()) << (rig.rec.halts.empty() ? "" : rig.rec.halts.back().detail);
+    };
+    const uint32_t guild = rig.applier.state().namespaces().nextNsId();
+    commit(cat::NamespaceCreatedOps{"guild", {}}, "guild", guild, 0);
+    rune::protocol::NamespaceLimits l{};
+    l.maxTopics = 7;
+    commit(cat::NamespaceLimitsSetOps{l}, "guild", guild, 1);
+    const uint32_t gone = guild + 1;
+    commit(cat::NamespaceCreatedOps{"gone", {}}, "gone", gone, 0);
+    commit(cat::NamespaceStateChangedOps{cat::NsStateTag::Deleting}, "gone", gone, 1);
+    commit(cat::NamespaceDeletedOps{}, "gone", gone, 2);
+
+    const uint64_t digest = rig.applier.state().digest();
+    ASSERT_EQ(rig.applier.nextOffset(), 8);
+    rig.restart();
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 8);
+    ASSERT_FALSE(rig.applier.halted()) << (rig.rec.halts.empty() ? "" : rig.rec.halts.back().detail);
+    EXPECT_EQ(rig.applier.phaseName(), "Booted");
+    EXPECT_EQ(rig.applier.state().digest(), digest);
+    const auto* rec = rig.applier.state().namespaces().byId(guild);
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(rec->name, "guild");
+    EXPECT_EQ(rec->version, 2u);
+    EXPECT_EQ(rec->limits.maxTopics, 7u);
+    EXPECT_EQ(rig.applier.state().namespaces().byId(gone), nullptr);
+    EXPECT_EQ(rig.applier.state().namespaces().nextNsId(), gone + 1) << "a deleted id is never handed out again";
+}

@@ -15,7 +15,9 @@
 #include "ApplyV2.h"
 #include "Wire.h"
 
+#include <rune/catalog/CatalogFingerprint.h>
 #include <rune/catalog/CatalogFingerprintV2.h>
+#include <rune/codec/Fingerprint.h>
 #include <rune/catalog/NsName.h>
 #include <rune/catalog/TopicName.h>
 
@@ -170,6 +172,8 @@ Applied ApplyV2::commit(CatalogState& s, const CatalogEvent& e, int64_t offset, 
         } else if constexpr (std::is_same_v<T, StagedNsDelete>) {
             reg.byName_.erase(x.name);   // nextNsId_ stays: the id is never reused
             reg.byId_.erase(x.nsId);
+            reg.tombstoneFold_ = detail::fnvU64(reg.tombstoneFold_ == 0 ? rune::codec::detail::kFnvSeed : reg.tombstoneFold_,
+                                                fingerprint);
         }
     }, st);
 

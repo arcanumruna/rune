@@ -64,6 +64,7 @@ target_link_libraries(rune_node PUBLIC rune_view)
 # Catalog history Task 7: the CatalogApplier folds __catalog through the shared
 # rune_catalog library (decode / apply / fingerprints — one set of frozen rules).
 target_link_libraries(rune_node PUBLIC rune_catalog)
+target_compile_options(rune_node PRIVATE -Werror=switch)   # every enum switch names every enumerator (Checkpoint A F2)
 # Authentication plan Task 9: the SecurityApplier folds __security through rune_security; cluster keys via rune_peerlink.
 target_link_libraries(rune_node PUBLIC rune_security rune_peerlink)
 if(aeron_FOUND)

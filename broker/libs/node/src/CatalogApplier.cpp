@@ -505,6 +505,12 @@ void CatalogApplier::project_(const cat::CatalogEvent& e, const cat::Applied& a)
         }
         return;
     }
+    // Namespace records live in state_ only: the schema and view registries hold no namespace data.
+    case cat::EventKind::NamespaceCreated:
+    case cat::EventKind::NamespaceLimitsSet:
+    case cat::EventKind::NamespaceStateChanged:
+    case cat::EventKind::NamespaceDeleted:
+        return;
     }
 }
 
@@ -549,6 +555,12 @@ void CatalogApplier::effects_(const CatalogEffects& sink, const cat::CatalogEven
     case cat::EventKind::DropView:
         if (sink.viewUninstalled) sink.viewUninstalled(a.droppedTopicId);
         if (sink.topicDropped) sink.topicDropped(a.droppedTopicId, e.objectName);
+        return;
+    // No live effect yet: Phase 2 (namespace lifecycle) adds the suspend/delete effects.
+    case cat::EventKind::NamespaceCreated:
+    case cat::EventKind::NamespaceLimitsSet:
+    case cat::EventKind::NamespaceStateChanged:
+    case cat::EventKind::NamespaceDeleted:
         return;
     }
 }

@@ -112,6 +112,11 @@ std::optional<std::string> eventEffectFramesError(const cat::CatalogState& after
         if (const cat::ViewObject* v = after.viewByObjectId(e.objectId)) return viewEffectFramesError(*v, after, maxFrame);
         return std::nullopt;
     }
+    case cat::EventKind::NamespaceCreated:      // namespace kinds post no effect frame (Checkpoint A F2)
+    case cat::EventKind::NamespaceLimitsSet:
+    case cat::EventKind::NamespaceStateChanged:
+    case cat::EventKind::NamespaceDeleted:
+        return std::nullopt;
     }
     (void)a;
     return std::nullopt;

@@ -109,6 +109,7 @@ uint64_t CatalogState::digest() const noexcept {
         if (r.nsId == kDefaultNsId && r.version == 0) return;
         h = detail::fnvU64(h, r.fingerprint);
     });
+    if (namespaces_.tombstoneFold() != 0) h = detail::fnvU64(h, namespaces_.tombstoneFold());
     return h;
 }
 
@@ -159,6 +160,7 @@ std::string_view applyErrorName(ApplyError::Code c) noexcept {
     case ApplyError::Code::Precondition:        return "Precondition";
     case ApplyError::Code::FingerprintMismatch: return "FingerprintMismatch";
     case ApplyError::Code::BadOps:              return "BadOps";
+    case ApplyError::Code::BadNsId:             return "BadNsId";
     }
     return "?";
 }

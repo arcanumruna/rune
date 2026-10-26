@@ -47,7 +47,7 @@ inline constexpr uint64_t kNamespacesV2Digests[] = {
     0x375fd0620005f4f0ull,   // offset 8 NamespaceStateChanged
     0xac972125f691c8fdull,   // offset 9 NamespaceStateChanged
     0x18c99adb9b990162ull,   // offset 10 NamespaceStateChanged
-    0x4df1741782482896ull,   // offset 11 NamespaceDeleted
-    0x9a2d7f7e4653dd90ull,   // offset 12 DropTopic
+    0xf2dd7c59594c1763ull,   // offset 11 NamespaceDeleted (tombstone fold, F6)
+    0x5677c3637e380eadull,   // offset 12 DropTopic
 };
 } // namespace rune::catalog::golden

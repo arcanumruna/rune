@@ -35,6 +35,7 @@ add_library(rune_catalog STATIC
 target_include_directories(rune_catalog PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${RUNE_PROTOCOL_INCLUDE})
 target_link_libraries(rune_catalog PUBLIC rune_codec)
 target_compile_features(rune_catalog PUBLIC cxx_std_23)
+target_compile_options(rune_catalog PRIVATE -Werror=switch)   # every EventKind / ApplyError switch names every enumerator
 
 # ── rune_security — the shared authentication library (auth spec §3): event model,
 #    frozen per-formatVer apply rules, fingerprints, permissions, replayer, .rsec.

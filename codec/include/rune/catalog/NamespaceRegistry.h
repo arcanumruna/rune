@@ -86,12 +86,16 @@ public:
     [[nodiscard]] std::size_t liveCount() const noexcept { return byId_.size(); }
     /// In nsId order.
     template <class F> void forEach(F&& f) const { for (const auto& [id, rec] : byId_) f(rec); }
+    /// FNV fold of every NamespaceDeleted tombstone fingerprint, in apply order (0 = none ever): the digest's trace of
+    /// deleted namespaces, as object tombstones are for dropped objects.
+    [[nodiscard]] uint64_t tombstoneFold() const noexcept { return tombstoneFold_; }
 
 private:
     friend struct ApplyV2;
     std::map<uint32_t, NamespaceRecord>            byId_;
     std::map<std::string, uint32_t, std::less<>>   byName_;
     uint32_t                                       nextNsId_ = 1;
+    uint64_t                                       tombstoneFold_ = 0;
 };
 
 } // namespace rune::catalog

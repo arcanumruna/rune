@@ -803,3 +803,31 @@ TEST(CatalogV2GoldenRegression, TheV2GoldenScriptStillProducesTheCheckedInBytesR
         EXPECT_EQ(e->formatVer, rc::kFormatV2);
     }
 }
+
+// Checkpoint A F1: applyErrorName had no arm for BadNsId, so every BadNsId refusal logged as "?".
+TEST(CatalogV2Regression, ApplyErrorNameCoversEveryCodeRegression) {
+    using C = rc::ApplyError::Code;
+    EXPECT_EQ(rc::applyErrorName(C::UnsupportedFormat), "UnsupportedFormat");
+    EXPECT_EQ(rc::applyErrorName(C::Precondition), "Precondition");
+    EXPECT_EQ(rc::applyErrorName(C::FingerprintMismatch), "FingerprintMismatch");
+    EXPECT_EQ(rc::applyErrorName(C::BadOps), "BadOps");
+    EXPECT_EQ(rc::applyErrorName(C::BadNsId), "BadNsId");
+}
+
+// Checkpoint A F6: a deleted namespace must leave a trace in the digest.  Two histories that create and delete a
+// DIFFERENT name at the same nsId reach the same live state and id counter; before the tombstone fold their digests
+// were equal, so a boot replay over a divergent log passed the checkpoint check.  Mutation: drop the fold line in
+// CatalogState::digest() → the first EXPECT_NE turns red.
+TEST(CatalogV2Regression, DeletedNamespaceNameIsInTheDigestRegression) {
+    auto run = [](const std::string& name) {
+        Rig r;
+        EXPECT_TRUE(r.nsCreate(name).has_value());
+        EXPECT_TRUE(r.nsState(1, rc::NsStateTag::Deleting).has_value());
+        EXPECT_TRUE(r.nsDelete(1).has_value());
+        EXPECT_EQ(r.s.namespaces().byId(1), nullptr);
+        EXPECT_EQ(r.s.namespaces().nextNsId(), 2u);
+        return r.s.digest();
+    };
+    EXPECT_NE(run("alpha"), run("beta"));
+    EXPECT_EQ(run("alpha"), run("alpha"));   // deterministic: the same history always gives the same digest
+}
