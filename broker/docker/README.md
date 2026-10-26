@@ -26,6 +26,7 @@ docker build \
   --platform linux/amd64 \
   --build-context rune-protocol=../protocol \
   --build-context flight-recorder=../../flight-recorder \
+  --build-context arcanum-metrics=../../arcanum-metrics \
   --build-context rune-codec=../codec \
   --build-context rune-crypto=../crypto \
   -f docker/Dockerfile \
@@ -33,11 +34,11 @@ docker build \
   .
 ```
 
-Run from `broker/` in the monorepo (the compose files do the same with `context: ..`). The four `--build-context` entries supply the
-sibling subprojects the root `CMakeLists.txt` compiles unconditionally (`flight-recorder` is a separate
-repository, `$FLIGHT_RECORDER_DIR`): `rune-protocol`
-(headers + `src/net`), `flight-recorder`, `rune-codec` (incl. the catalog library) and
-`rune-crypto`. `docker compose` passes the same four contexts for the broker
+Run from `broker/` in the monorepo (the compose files do the same with `context: ..`). The five `--build-context` entries supply the
+sibling subprojects the root `CMakeLists.txt` compiles unconditionally (`flight-recorder` and the header-only
+`arcanum-metrics` are separate repositories, `$FLIGHT_RECORDER_DIR` and `$ARCANUM_METRICS_DIR`): `rune-protocol`
+(headers + `src/net`), `flight-recorder`, `arcanum-metrics` (headers), `rune-codec` (incl. the catalog library) and
+`rune-crypto`. `docker compose` passes the same five contexts for the broker
 image and for the `probe` image (`docker/Dockerfile.probe`), so prefer
 `docker compose -f docker/docker-compose.yml build`.
 

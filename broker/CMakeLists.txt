@@ -83,6 +83,9 @@ else()
     target_compile_definitions(flight_recorder PUBLIC FLIGHT_RECORDER=0)
 endif()
 
+# arcanum-metrics: the `metrics` INTERFACE target, consumed like the flight recorder above.
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/ArcanumMetrics.cmake)
+
 # ── rune-crypto — client<->broker TLS/AEAD (Task 7) ──────────────────────────
 # Consumed as a SIBLING source lib, exactly like flight-recorder/rune-codec above (no
 # conan publish gate yet).  Header-first (TlsSession.h/Aead.h/Cipher.h) + 3
@@ -438,7 +441,7 @@ endif()
 if(aeron_FOUND)
     add_executable(rune_role src/rune_role.cpp)
     target_include_directories(rune_role PRIVATE ${RUNE_NODE_INCLUDE})
-    target_link_libraries(rune_role PRIVATE aeron::aeron)
+    target_link_libraries(rune_role PRIVATE aeron::aeron metrics)
     if(UNIX AND NOT APPLE)
         target_link_libraries(rune_role PRIVATE -Wl,--no-as-needed uuid -Wl,--as-needed)
     endif()

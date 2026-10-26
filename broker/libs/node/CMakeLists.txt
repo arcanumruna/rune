@@ -61,6 +61,8 @@ target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordina
 # (rune::view::kViewCheckpointMagic) -- node -> view is the sanctioned
 # dependency direction (libs/view must NEVER depend on libs/node).
 target_link_libraries(rune_node PUBLIC rune_view)
+# arcanum-metrics plan Task 7: the node publishes its metrics file through the header-only `metrics` lib.
+target_link_libraries(rune_node PUBLIC metrics)
 # Catalog history Task 7: the CatalogApplier folds __catalog through the shared
 # rune_catalog library (decode / apply / fingerprints — one set of frozen rules).
 target_link_libraries(rune_node PUBLIC rune_catalog)
@@ -2061,4 +2063,16 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     gtest_discover_tests(rune_compaction_stress_tests
         PROPERTIES TIMEOUT 180)
+    # arcanum-metrics plan Task 7: the layout version Rune builds against, and the
+    # ARCANUM_METRICS_DIR configure check (a bad checkout fails with a clear message).
+    add_executable(rune_broker_metrics_tests tests/BrokerMetricsRegressionTest.cpp)
+    target_link_libraries(rune_broker_metrics_tests PRIVATE rune_node GTest::gtest_main)
+    gtest_discover_tests(rune_broker_metrics_tests)
+    add_test(NAME BrokerMetricsRegression.ConfigureRejectsMissingDirRegression
+        COMMAND ${CMAKE_COMMAND}
+            -S ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/cmake/arcanum_metrics_dir
+            -B ${CMAKE_CURRENT_BINARY_DIR}/arcanum_metrics_dir_check
+            -DARCANUM_METRICS_DIR=/nonexistent)
+    set_tests_properties(BrokerMetricsRegression.ConfigureRejectsMissingDirRegression PROPERTIES
+        PASS_REGULAR_EXPRESSION "ARCANUM_METRICS_DIR \\(/nonexistent\\) is not an arcanum-metrics checkout")
 endif()

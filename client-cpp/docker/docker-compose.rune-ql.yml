@@ -10,6 +10,7 @@
 #       rune-protocol -> ../../protocol      (main; has SchemaMessages.h)
 #       rune-codec    -> ../../codec      (0c codec: adds FixedStr)
 #       flight-recorder       -> ${FLIGHT_RECORDER_DIR:-../../../flight-recorder}
+#       arcanum-metrics       -> ${ARCANUM_METRICS_DIR:-../../../arcanum-metrics}
 #   and the broker Dockerfile passes -DRUNE_CODEC_ROOT=/rune-codec.
 #
 #   The build `context` is the rune-broker repo; `dockerfile` is the broker's
@@ -36,6 +37,7 @@ services:
         # relative to THIS compose file's dir (rune-client-cpp-0c/docker/):
         rune-protocol: ../../protocol      # main — has SchemaMessages.h
         flight-recorder: ${FLIGHT_RECORDER_DIR:-../../../flight-recorder}                  # flight recorder (compiled sibling)
+        arcanum-metrics: ${ARCANUM_METRICS_DIR:-../../../arcanum-metrics}                  # metrics lib (header-only sibling)
         rune-codec: ../../codec            # sibling checkout (same set as the broker's x-broker-build)
         rune-crypto: ../../crypto
     image: rune-broker-0c-node:${RUNE_IMAGE_TAG:-single}

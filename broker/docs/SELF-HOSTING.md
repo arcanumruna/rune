@@ -9,7 +9,8 @@ All inter-node (consensus) and client traffic is `aeron:udp`.
 - Docker (with BuildKit).
 - The monorepo checkout (`broker/`, `protocol/`, `codec/`, `crypto/` side by side) and a checkout of the
   [flight-recorder](https://github.com/arcanumruna/flight-recorder) repository (`FLIGHT_RECORDER_DIR`, by default next to
-  the monorepo). Their sources reach the image through BuildKit named contexts.
+  the monorepo), and of [arcanum-metrics](https://github.com/arcanumruna/arcanum-metrics) (`ARCANUM_METRICS_DIR`,
+  also next to the monorepo). Their sources reach the image through BuildKit named contexts.
 
 ## Build the image
 
@@ -20,6 +21,7 @@ docker build \
   --platform linux/amd64 \
   --build-context rune-protocol=../protocol \
   --build-context flight-recorder="$FLIGHT_RECORDER_DIR" \
+  --build-context arcanum-metrics="$ARCANUM_METRICS_DIR" \
   --build-context rune-codec=../codec \
   --build-context rune-crypto=../crypto \
   -f docker/Dockerfile \
@@ -677,9 +679,10 @@ volumes, no host ports, `build:` from source). For your own deployment use the
   shm size, stream ids, election timings).
 
 ```sh
-# 1. Build (or pull) the image once (see "Build the image" above for the four build contexts)
+# 1. Build (or pull) the image once (see "Build the image" above for the five build contexts)
 docker build --platform linux/amd64 --build-context rune-protocol=../protocol \
-    --build-context flight-recorder="$FLIGHT_RECORDER_DIR" --build-context rune-codec=../codec \
+    --build-context flight-recorder="$FLIGHT_RECORDER_DIR" --build-context arcanum-metrics="$ARCANUM_METRICS_DIR" \
+    --build-context rune-codec=../codec \
     --build-context rune-crypto=../crypto -f docker/Dockerfile -t rune:latest .
 
 # 2. Copy + edit the env file

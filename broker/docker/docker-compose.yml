@@ -26,6 +26,8 @@ x-broker-build: &broker-build
     # flight-recorder flight recorder: compiled sibling lib wired by the root CMakeLists
     # (add_library(flight_recorder ...) from ${SRC}/../flight-recorder).  Needs src/ AND include/.
     flight-recorder: ${FLIGHT_RECORDER_DIR:-../../../flight-recorder}
+    # arcanum-metrics: header-only metrics lib (include/); the Dockerfile COPYs --from=arcanum-metrics.
+    arcanum-metrics: ${ARCANUM_METRICS_DIR:-../../../arcanum-metrics}
     # rune-codec (0a): compiled sibling codec lib; Dockerfile COPYs --from=rune-codec.
     rune-codec: ../../codec
     # rune-crypto (client<->broker TLS/AEAD): the Dockerfile COPYs --from=rune-crypto.
@@ -240,6 +242,8 @@ services:
         rune-protocol: ${RUNE_PROTOCOL_DIR:-../../protocol}
         # the same sibling set as x-broker-build: the root CMakeLists builds these libraries unconditionally
         flight-recorder: ${FLIGHT_RECORDER_DIR:-../../../flight-recorder}
+        # arcanum-metrics: header-only metrics lib (include/); the Dockerfile COPYs --from=arcanum-metrics.
+        arcanum-metrics: ${ARCANUM_METRICS_DIR:-../../../arcanum-metrics}
         rune-codec: ../../codec
         rune-crypto: ../../crypto
     platform: linux/amd64

@@ -37,6 +37,8 @@ BROKER_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECTS="$(cd "${BROKER_REPO}/.." && pwd)"
 # flight-recorder is its own repo, checked out next to the monorepo (compose additional_contexts read FLIGHT_RECORDER_DIR).
 export FLIGHT_RECORDER_DIR="${FLIGHT_RECORDER_DIR:-${PROJECTS}/../flight-recorder}"
+# arcanum-metrics (header-only) is its own repo too; compose additional_contexts read ARCANUM_METRICS_DIR.
+export ARCANUM_METRICS_DIR="${ARCANUM_METRICS_DIR:-${PROJECTS}/../arcanum-metrics}"
 CLIENT_REPO="${PROJECTS}/client-cpp"
 COMPOSE_PROJECT="rune-auth-e2e"
 NETWORK="${COMPOSE_PROJECT}_default"
@@ -85,6 +87,7 @@ admin_ql() { ql_as admin /work/admin.pw "$@"; }
 now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
 
 [ -d "${FLIGHT_RECORDER_DIR}" ] || fail "missing flight-recorder checkout (set FLIGHT_RECORDER_DIR)"
+[ -d "${ARCANUM_METRICS_DIR}" ] || fail "missing arcanum-metrics checkout (set ARCANUM_METRICS_DIR)"
 for d in protocol codec crypto ql client-cpp; do
     [ -d "${PROJECTS}/${d}" ] || fail "missing ../${d}"
 done
