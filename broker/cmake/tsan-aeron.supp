@@ -95,3 +95,7 @@ race:aeron_client_conductor_async_destination
 # the driver's MPSC command queue; TSan's fd tracking then reports the receiver's epoll_ctl against the socket()
 # (TSan CI: BrokerNodeTest.DedicatedAeronThreadingMode_BootsAndElects).
 race:aeron_udp_transport_poller_add
+# The driver's own MPSC command ring (aeron_mpsc_rb_write on one driver agent, aeron_mpsc_rb_read + its memset on the
+# other) orders through C11 atomics in the uninstrumented Aeron build; Rune never uses this ring itself
+# (TSan CI: BrokerNodeTest.DedicatedAeronThreadingMode_BootsAndElects).
+race:aeron_mpsc_rb_
