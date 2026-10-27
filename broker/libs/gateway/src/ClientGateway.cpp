@@ -9463,9 +9463,24 @@ void ClientGateway::onSecurityApplied(int64_t offset, const rune::security::Appl
         } else {
             const char* reason = "password changed (TERMINATE SESSIONS)";
             if (applied.kind == rune::security::EventKind::DropUser) reason = "user dropped";
+            else if (applied.kind == rune::security::EventKind::NamespacePurged) reason = "namespace deleted";
             else if (const auto* u = securityView_->state().userById(applied.objectId); u != nullptr && !u->enabled) reason = "user disabled";
             for (const int64_t sid : liveScratch_) revokeSession_(sid, reason);
         }
+    }
+    // Namespaces Phase 2 Task 6a: a NamespacePurged also strips the purged namespace's grants from SURVIVING users
+    // (`refreshedUsers`, sorted): their sessions recompile their permissions, whatever the main effect was (and even
+    // when no user was erased, i.e. `affectedUsers` is empty or already the refresh set).
+    if (!applied.refreshedUsers.empty()) {
+        liveScratch_.clear();
+        sessions_.forEach([&](Session& s) {
+            uint64_t uid = 0;
+            if (const auto* a = std::get_if<AuthAuthenticated>(&s.auth)) uid = a->userId;
+            else if (const auto* p = std::get_if<AuthPasswordChangeRequired>(&s.auth)) uid = p->userId;
+            else return;
+            if (std::binary_search(applied.refreshedUsers.begin(), applied.refreshedUsers.end(), uid)) liveScratch_.push_back(s.sessionId);
+        });
+        for (const int64_t sid : liveScratch_) refreshSession_(sid);
     }
     applyTracking_ = false;
     noteEnforced_(offset, applyOpWorkers_, permissionShipper_.queuedSeq() != shippedBefore);

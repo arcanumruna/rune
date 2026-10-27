@@ -94,6 +94,12 @@ if(BUILD_TESTING)
     target_link_libraries(rune_gateway_auth_login_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
     gtest_discover_tests(rune_gateway_auth_login_tests)
 
+    # Namespaces Phase 2 Task 6a: what onSecurityApplied does with a NamespacePurged event - no Aeron.
+    add_executable(rune_gateway_ns_purge_tests tests/gateway/NamespacePurgeGatewayTest.cpp)
+    target_include_directories(rune_gateway_ns_purge_tests PRIVATE ${RUNE_BROKER_DIR}/libs/node/tests)
+    target_link_libraries(rune_gateway_ns_purge_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_ns_purge_tests)
+
     # Authentication Task 12: the per-session permission table, the object index and the Authorizer - pure, no Aeron.
     add_executable(rune_gateway_permission_table_tests tests/PermissionTableTest.cpp)
     target_link_libraries(rune_gateway_permission_table_tests PRIVATE rune_gateway GTest::gtest_main)
