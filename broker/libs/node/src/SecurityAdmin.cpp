@@ -9,6 +9,7 @@
 #include <rune/catalog/NsName.h>
 #include <rune/protocol/client/SecurityMessages.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/security/SecurityQueries.h>
 #include <rune/security/SecurityState.h>
 #include <rune/security/SecurityStatementText.h>
 
@@ -219,6 +220,10 @@ int SecurityAdmin::doWork(int64_t nowNs) {
     int work = 0;
     if (advance_(nowNs)) ++work;
     if (updateRole_()) ++work;
+    if (!hasInFlight() && isLeader() && issuePurge_(nowNs)) {
+        ++work;
+        (void)updateRole_();   // the append is not applied yet: CatchingUp at once, so no DDL starts on the stale state below
+    }
     // Refusals answer at once (nothing in flight): take up to a bounded batch per pass; an accepted request goes in
     // flight and ends the batch.
     for (int i = 0; i < 16 && !hasInFlight() && !pending_.empty(); ++i) {
@@ -639,6 +644,44 @@ void SecurityAdmin::startBootstrap_(const SecurityBootstrapMsg& m, int64_t nowNs
     e.principal.requestId = rid;
     e.timestampMs = wallClockMs();
     (void)appendEvent_(req, std::move(e), nowNs);
+}
+
+bool SecurityAdmin::issuePurge_(int64_t nowNs) {
+    if (catalog_ == nullptr || replica_ == nullptr) return false;
+    const sec::SecurityState& state = applier_.state();
+    const rune::catalog::NamespaceRecord* target = nullptr;
+    catalog_->namespaces().forEach([&](const rune::catalog::NamespaceRecord& rec) {   // nsId order: lowest first
+        if (target != nullptr || rec.nsId == 0 || !std::holds_alternative<rune::catalog::NsDeleting>(rec.state)) return;
+        if (sec::hasNamespaceRecords(state, rec.nsId, rec.name)) target = &rec;
+    });
+    if (target == nullptr) return false;
+    sec::SecurityEvent e;
+    e.formatVer = sec::kFormatV2;
+    e.kind = sec::EventKind::NamespacePurged;
+    e.ops = sec::NamespacePurgedOps{};
+    e.nsId = target->nsId;
+    e.objectName = target->name;
+    e.statement = "PURGE NAMESPACE " + target->name + ";";
+    e.principal.authenticated = "__system";   // not a valid user name: only the broker itself writes it
+    e.principal.clientName = "rune-broker";
+    e.timestampMs = wallClockMs();
+    auto fp = sec::previewFingerprint(state, e);
+    if (!fp) {
+        spdlog::error("AdminWorker: the __security leader's own NamespacePurged for namespace {} does not apply: {}",
+                      target->nsId, refusalText(fp.error()));
+        return false;
+    }
+    e.fingerprint = *fp;
+    if (auto enc = sec::encodeInto(e, eventBuf_); !enc || eventBuf_.size() > kSecurityMaxEventBytes) return false;
+    uint8_t key[8] = {};
+    const rune::replication::Offset base = replica_->appendKeyed(
+        std::span<const uint8_t>(key, 8), std::span<const uint8_t>(eventBuf_.data(), eventBuf_.size()), /*acksAll=*/true);
+    if (base < 0) return false;   // below minIsr: retried on the next pass
+    (void)nowNs;
+    ++eventsAppended_;
+    ++purgesIssued_;
+    replica_->onLeaderLogAppended();
+    return true;
 }
 
 bool SecurityAdmin::appendEvent_(SecurityRequest& req, sec::SecurityEvent e, int64_t nowNs) {

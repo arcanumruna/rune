@@ -36,7 +36,8 @@
 namespace rune::security {
 
 enum class EventKind : uint16_t { CreateUser = 1, AlterUser = 2, DropUser = 3, CreateRole = 4, DropRole = 5,
-                                  Grant = 6, Revoke = 7, GrantRole = 8, RevokeRole = 9, Bootstrap = 10 };
+                                  Grant = 6, Revoke = 7, GrantRole = 8, RevokeRole = 9, Bootstrap = 10,
+                                  NamespacePurged = 11 };   // 11: formatVer 2 only
 inline constexpr uint16_t kFormatV1 = 1, kFormatV2 = 2, kCurrentFormatVer = kFormatV2;
 // The frozen enums are defined ONCE, in rune-protocol (SecurityTypes.h); the wire, this event and rune-ql share them.
 using Operation    = rune::protocol::SecurityOperation;      // Read 0 … Admin 6, Truncate 7 (formatVer 2)
@@ -81,9 +82,13 @@ inline constexpr std::size_t kFakeSaltSeedBytes = 32;
 struct BootstrapOps  { ScramVerifier verifier; std::array<uint8_t, kFakeSaltSeedBytes> fakeSaltSeed{};   // D3, D8
                        bool operator==(const BootstrapOps&) const = default; };
 
+/// formatVer 2 only (kind 11).  nsId = the purged namespace, objectName = its NAME at delete time, objectId 0, versions 0.
+/// Erases every user and role of nsId and every grant (of the remaining users and roles) that names the namespace.
+struct NamespacePurgedOps { bool operator==(const NamespacePurgedOps&) const = default; };
+
 using Ops = std::variant<CreateUserOps, AlterUserOps, DropUserOps, CreateRoleOps, DropRoleOps,
-                         GrantOps, RevokeOps, GrantRoleOps, RevokeRoleOps, BootstrapOps>;
-static_assert(std::variant_size_v<Ops> == 10, "Ops variant order must equal EventKind order (kindOf = index + 1)");
+                         GrantOps, RevokeOps, GrantRoleOps, RevokeRoleOps, BootstrapOps, NamespacePurgedOps>;
+static_assert(std::variant_size_v<Ops> == 11, "Ops variant order must equal EventKind order (kindOf = index + 1)");
 
 using rune::catalog::Principal; using rune::catalog::ReplayedFrom; using rune::catalog::RequestId;
 

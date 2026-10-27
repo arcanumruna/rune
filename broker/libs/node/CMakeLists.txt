@@ -1949,6 +1949,11 @@ if(BUILD_TESTING)
         target_include_directories(rune_namespace_escalation_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_namespace_escalation_tests PRIVATE rune_node rune_view rune_replication rune_codec aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_escalation_tests PROPERTIES TIMEOUT 360)
+        # Namespaces Phase 2 Task 6a: the `__security` leader issues NamespacePurged for a DELETING namespace.
+        add_executable(rune_security_ns_purge_tests tests/node/SecurityNamespacePurgeTest.cpp)
+        target_include_directories(rune_security_ns_purge_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_security_ns_purge_tests PRIVATE rune_node rune_view rune_replication rune_codec aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_security_ns_purge_tests PROPERTIES TIMEOUT 360)
         # Namespaces Task 9 (spec §2, §11): the session's namespace from the login (`ns/user`), anonymous read.
         add_executable(rune_namespace_login_tests tests/node/NamespaceLoginTest.cpp)
         target_include_directories(rune_namespace_login_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)

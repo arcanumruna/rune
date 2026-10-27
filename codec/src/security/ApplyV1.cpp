@@ -60,6 +60,7 @@ std::expected<Staged, ApplyError> finish(const Ctx& c, StagedChange change, Appl
         using T = std::decay_t<decltype(ch)>;
         if constexpr (std::is_same_v<T, StagedPutUser>) return fingerprintOf(ch.obj, c.s);
         else if constexpr (std::is_same_v<T, StagedPutRole>) return fingerprintOf(ch.obj);
+        else if constexpr (std::is_same_v<T, StagedPurge>) return 0;   // unreachable: ApplyV2 builds a purge itself
         else return fingerprintOf(ch.tomb);
     }, change);
     return Staged{std::move(change), std::move(a)};
@@ -207,7 +208,8 @@ std::expected<Staged, ApplyError> ApplyV1::run(const SecurityState& s, const Sec
         else if constexpr (std::is_same_v<T, GrantOps>) return grantOrRevoke(c, o.grantee, o.grant, true);
         else if constexpr (std::is_same_v<T, RevokeOps>) return grantOrRevoke(c, o.grantee, o.grant, false);
         else if constexpr (std::is_same_v<T, GrantRoleOps>) return grantOrRevokeRole(c, o.roleId, o.roleName, true);
-        else return grantOrRevokeRole(c, o.roleId, o.roleName, false);   // RevokeRoleOps
+        else if constexpr (std::is_same_v<T, RevokeRoleOps>) return grantOrRevokeRole(c, o.roleId, o.roleName, false);
+        else return refuse(offset, Refusal::NamespaceMismatch, "NamespacePurged is a formatVer-2 event");   // unreachable (ApplyV2)
     }, e.ops);
 }
 
@@ -224,6 +226,19 @@ Applied ApplyV1::commit(SecurityState& s, const SecurityEvent& e, int64_t offset
             s.users_.erase(ch.tomb.objectId);
             s.userNames_.erase(s.userNames_.find(SecKeyView{ch.tomb.nsId, ch.tomb.name}));
             s.tombstones_.push_back(std::move(ch.tomb));
+        } else if constexpr (std::is_same_v<T, StagedPurge>) {
+            for (uint64_t id : ch.eraseUsers) {
+                const UserObject& u = s.users_.at(id);
+                s.userNames_.erase(s.userNames_.find(SecKeyView{u.nsId, u.name}));
+                s.users_.erase(id);
+            }
+            for (uint64_t id : ch.eraseRoles) {
+                const RoleObject& r = s.roles_.at(id);
+                s.roleNames_.erase(s.roleNames_.find(SecKeyView{r.nsId, r.name}));
+                s.roles_.erase(id);
+            }
+            for (UserObject& u : ch.putUsers) s.users_.insert_or_assign(u.objectId, std::move(u));
+            for (RoleObject& r : ch.putRoles) s.roles_.insert_or_assign(r.objectId, std::move(r));
         } else {   // StagedRemoveRole
             for (uint64_t m : ch.members) s.users_.at(m).roles.erase(ch.tomb.objectId);
             s.roles_.erase(ch.tomb.objectId);

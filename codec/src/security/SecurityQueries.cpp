@@ -66,6 +66,15 @@ std::optional<GrantsView> grantsFor(const SecurityState& s, GranteeKind kind, st
     return v;
 }
 
+bool hasNamespaceRecords(const SecurityState& s, uint32_t nsId, std::string_view nsName) noexcept {
+    const auto names = [&](const std::set<GrantSpec>& gs) {
+        return std::any_of(gs.begin(), gs.end(), [&](const GrantSpec& g) { return grantNamesNamespace(g, nsName); });
+    };
+    for (const auto& [id, u] : s.users()) if (u.nsId == nsId || names(u.grants)) return true;
+    for (const auto& [id, r] : s.roles()) if (r.nsId == nsId || names(r.grants)) return true;
+    return false;
+}
+
 std::vector<UserRow> users(const SecurityState& s) {
     std::vector<UserRow> out;
     for (const auto& [id, u] : s.users()) {

@@ -46,6 +46,10 @@ struct GrantsView { std::vector<GrantSpec> direct; std::vector<std::pair<std::st
 /// nullopt = no such live user / role in namespace `nsId` (default 0).
 [[nodiscard]] std::optional<GrantsView> grantsFor(const SecurityState&, GranteeKind, std::string_view name, uint32_t nsId = 0);
 
+/// True iff applying NamespacePurged(nsId, nsName) to `s` would change anything: a user or role of namespace `nsId`
+/// exists, or a user or role of another namespace holds a grant naming `nsName` (grantNamesNamespace).
+[[nodiscard]] bool hasNamespaceRecords(const SecurityState& s, uint32_t nsId, std::string_view nsName) noexcept;
+
 /// SHOW USERS / SHOW ROLES rows, ordered by (nsId, name).  `passwords` counts the active verifiers; their
 /// bytes are never exposed.
 /// nsId: the namespace of the row (`name` is the local name); rows are ordered by (nsId, name).
