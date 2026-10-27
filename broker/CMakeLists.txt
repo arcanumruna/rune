@@ -433,17 +433,29 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_broker_process_tests)
 endif()
 
-# ── rune_role — standalone Aeron node-role counter reader ────────────────────
+# ── rune_role — standalone node-role metrics reader ─────────────────────────
 # Reads the machine-readable leadership signal (RuneMetrics.h type ids) out of a broker's
-# CnC file and prints one line.  The dr-e2e harness runs this via `docker exec`
-# to detect the leader WITHOUT scraping "is LEADER" log lines (log-level
-# independent).  Header-only dep on rune/node/RuneMetrics.h; links aeron only.
+# arcanum-metrics file and prints the ROLE and STORAGE lines.  The dr-e2e harness runs this via
+# `docker exec` to detect the leader WITHOUT scraping "is LEADER" log lines (log-level
+# independent).  Header-only dep on rune/node/RuneMetrics.h; links the metrics library only.
 if(aeron_FOUND)
     add_executable(rune_role src/rune_role.cpp)
     target_include_directories(rune_role PRIVATE ${RUNE_NODE_INCLUDE})
-    target_link_libraries(rune_role PRIVATE aeron::aeron metrics)
-    if(UNIX AND NOT APPLE)
-        target_link_libraries(rune_role PRIVATE -Wl,--no-as-needed uuid -Wl,--as-needed)
+    target_link_libraries(rune_role PRIVATE metrics)
+
+    # Plan 2026-10-26 Task 10: the real binary against real metrics files (golden output, exit codes, and the
+    # dr-e2e harness parser run on its output).
+    if(BUILD_TESTING)
+        find_package(GTest REQUIRED)
+        add_executable(rune_role_tests tests/RuneRoleRegressionTest.cpp)
+        target_include_directories(rune_role_tests PRIVATE ${RUNE_NODE_INCLUDE})
+        target_link_libraries(rune_role_tests PRIVATE GTest::gtest_main metrics)
+        target_compile_definitions(rune_role_tests PRIVATE
+            RUNE_ROLE_BIN="$<TARGET_FILE:rune_role>"
+            RUNE_DR_E2E_DIR="${CMAKE_CURRENT_SOURCE_DIR}/dr-e2e")
+        add_dependencies(rune_role_tests rune_role)
+        include(GoogleTest)
+        gtest_discover_tests(rune_role_tests)
     endif()
 endif()
 
