@@ -1,0 +1,165 @@
+# Checkpoint sanitizer runs (docs/testing.md, "Sanitizer runs"): the *Regression* suite, latency gates excluded,
+# under AddressSanitizer + UBSan and under ThreadSanitizer. Each job builds the root tree (broker + protocol, with the
+# embedded client) and the standalone client (client-cpp/, its own tests need -DBUILD_TESTING=ON) with the same flags.
+# Conan only installs dependencies here; it never creates, exports or uploads a package.
+name: sanitizers
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sanitizers-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: '4'
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 4G
+  CCACHE_COMPRESS: 'true'
+
+jobs:
+  sanitize:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ASan+UBSan
+            id: asan
+            flags: -fsanitize=address,undefined -fno-omit-frame-pointer
+            link: -fsanitize=address,undefined
+          - name: TSan
+            id: tsan
+            flags: -fsanitize=thread -fno-omit-frame-pointer
+            link: -fsanitize=thread
+    env:
+      UBSAN_OPTIONS: print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v7
+
+      # Sanitizer Debug trees are large: make room on the hosted runner.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # The hosted runner's kernel uses 32 bits of mmap randomisation, which TSan (and at times ASan) cannot map
+      # its shadow memory around ("unexpected memory mapping").
+      - name: Lower mmap randomisation for the sanitizers
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      # Both builds compile the flight recorder from a sibling checkout at the client's pin, and the broker reads
+      # arcanum-metrics (header-only) at the pin in broker/cmake/ArcanumMetrics.cmake.
+      - name: Read the sibling pins
+        id: pin
+        run: |
+          FR=$(sed -nE 's/^set\(FLIGHT_RECORDER_GIT_TAG "([0-9a-f]{40})".*/\1/p' client-cpp/CMakeLists.txt)
+          AM=$(sed -nE 's/^set\(ARCANUM_METRICS_GIT_TAG "([0-9a-f]{40})".*/\1/p' broker/cmake/ArcanumMetrics.cmake)
+          if [[ -z $FR || -z $AM ]]; then
+            echo "::error::FLIGHT_RECORDER_GIT_TAG or ARCANUM_METRICS_GIT_TAG pin not found"
+            exit 1
+          fi
+          echo "fr=$FR" >> "$GITHUB_OUTPUT"
+          echo "am=$AM" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository_owner }}/flight-recorder
+          ref: ${{ steps.pin.outputs.fr }}
+          path: flight-recorder
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository_owner }}/arcanum-metrics
+          ref: ${{ steps.pin.outputs.am }}
+          path: arcanum-metrics
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build ccache uuid-dev zlib1g-dev
+          python3 -m pip install --user "conan>=2,<3" "cmake>=3.31"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # aeron and OpenSSL are built from source: keep them between runs (the dependencies are not sanitized).
+      - uses: actions/cache@v5
+        with:
+          path: ~/.conan2/p
+          key: conan-sanitizers-${{ runner.os }}-${{ hashFiles('conanfile.txt', 'client-cpp/conandata.yml') }}-${{ matrix.id }}
+          restore-keys: |
+            conan-sanitizers-${{ runner.os }}-${{ hashFiles('conanfile.txt', 'client-cpp/conandata.yml') }}-
+            conan-sanitizers-${{ runner.os }}-
+
+      - uses: actions/cache@v5
+        with:
+          path: .ccache
+          key: ccache-sanitizers-${{ matrix.id }}-${{ github.sha }}
+          restore-keys: ccache-sanitizers-${{ matrix.id }}-
+
+      - name: Install dependencies
+        run: |
+          conan profile detect --force
+          conan install . -of "build-${{ matrix.id }}" -s build_type=Debug --build=missing
+          conan install client-cpp -of "build-client-${{ matrix.id }}" -s build_type=Debug --build=missing
+
+      - name: Configure
+        run: |
+          cmake -S . -B "build-${{ matrix.id }}" -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_TOOLCHAIN_FILE="build-${{ matrix.id }}/conan_toolchain.cmake" -DBUILD_TESTING=ON \
+            -DFLIGHT_RECORDER_DIR="$GITHUB_WORKSPACE/flight-recorder" \
+            -DARCANUM_METRICS_DIR="$GITHUB_WORKSPACE/arcanum-metrics" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_FLAGS="${{ matrix.flags }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.link }}"
+          # the client's conan layout puts its generators under a build/<type>/generators subfolder
+          CLIENT_GEN=$(dirname "$(find "build-client-${{ matrix.id }}" -name conan_toolchain.cmake | head -1)")
+          cmake -S client-cpp -B "build-client-${{ matrix.id }}/cmake" -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_TOOLCHAIN_FILE="$CLIENT_GEN/conan_toolchain.cmake" -DCMAKE_PREFIX_PATH="$CLIENT_GEN" \
+            -DBUILD_TESTING=ON \
+            -DFLIGHT_RECORDER_DIR="$GITHUB_WORKSPACE/flight-recorder" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_FLAGS="${{ matrix.flags }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.link }}"
+
+      - name: Build broker
+        run: cmake --build "build-${{ matrix.id }}"
+
+      - name: Build client
+        id: client_build
+        run: cmake --build "build-client-${{ matrix.id }}/cmake"
+
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+      # UdpGsoBindings.Ipv6RoundTrip is a known flake (#628); excluded in case the filter ever selects it.
+      - name: Regression suite (broker)
+        run: |
+          ctest --test-dir "build-${{ matrix.id }}" -R Regression -LE latency \
+            -E 'UdpGsoBindings\.Ipv6RoundTrip' -j4 --output-on-failure
+
+      - name: Regression suite (client)
+        if: ${{ !cancelled() && steps.client_build.outcome == 'success' }}
+        run: |
+          ctest --test-dir "build-client-${{ matrix.id }}/cmake" -R Regression -LE latency \
+            -E 'UdpGsoBindings\.Ipv6RoundTrip' -j4 --output-on-failure
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-logs-${{ matrix.id }}
+          path: |
+            build-${{ matrix.id }}/Testing/Temporary/
+            build-client-${{ matrix.id }}/cmake/Testing/Temporary/
+          if-no-files-found: ignore
+          retention-days: 14

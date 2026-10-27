@@ -149,6 +149,10 @@ Exclude the latency gates under a sanitizer (`-LE latency`): they measure time. 
 TSan target, `rune_group_tsan_tests`, behind `-DENABLE_TSAN=ON`. Sanitizer builds are several times slower and
 larger than a plain Debug build; budget disk and time accordingly.
 
+In CI, `.github/workflows/sanitizers.yml` runs these checkpoint sanitizer suites (ASan+UBSan and TSan, broker and
+client, `-R Regression -LE latency`) on every pull request, on pushes to `main` and on demand, and uploads the test
+logs when a run fails. Use its result for the checkpoint instead of running the sanitizer builds on a shared box.
+
 ## Source guards
 
 Python scripts run as ctest tests (names end in `Regression`) and fail the build when a rule of the engineering philosophy
