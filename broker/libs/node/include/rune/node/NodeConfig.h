@@ -584,6 +584,10 @@ struct NodeConfig {
     int64_t     securityMaxStalenessMs     = 1'000;
     int64_t     securityStaleSessionEndMs  = 10'000;
     int64_t     securityGateDeadlineMs     = 5'000;
+    /// Namespaces Phase 2 Task 6b (D20): RUNE_NS_DELETE_BATCH - how many tombstones the namespace reaper writes per
+    /// doWork when it removes a deleted namespace's offsets and transaction state (default 256, range 1..65536; an
+    /// invalid value refuses to start).
+    uint32_t    nsDeleteBatch              = 256;
     /// F and R as the broker applies them: never below liveness + 501 ms / F + 1 ms (a default raised by long election
     /// timings or RUNE_BROKER_LIVENESS_TIMEOUT_MS; an explicit env value that violates it is refused at parse).
     [[nodiscard]] int64_t effectiveSecurityMaxStalenessMs() const noexcept {

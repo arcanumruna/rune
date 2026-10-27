@@ -786,6 +786,26 @@ TEST(NodeConfigRegression, SecurityServingBoundsAreParsedAndValidatedRegression)
     EXPECT_FALSE(parseNodeConfig(fakeEnv(env3)).error.empty());
 }
 
+// Namespaces Phase 2 Task 6b (D20): RUNE_NS_DELETE_BATCH - default 256, range 1..65536, anything else refuses to start.
+TEST(NodeConfigRegression, NsDeleteBatchIsParsedAndBoundedRegression) {
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_EQ(r.config->nsDeleteBatch, 256u);
+    for (const char* ok : {"1", "256", "65536"}) {
+        auto env = base1node();
+        env["RUNE_NS_DELETE_BATCH"] = ok;
+        auto g = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(g.error.empty()) << ok << ": " << g.error;
+        EXPECT_EQ(g.config->nsDeleteBatch, static_cast<uint32_t>(std::stoul(ok)));
+    }
+    for (const char* bad : {"0", "-1", "65537", "many", "12x", "4294967296"}) {
+        auto env = base1node();
+        env["RUNE_NS_DELETE_BATCH"] = bad;
+        const auto g = parseNodeConfig(fakeEnv(env));
+        EXPECT_NE(g.error.find("RUNE_NS_DELETE_BATCH"), std::string::npos) << bad;
+    }
+}
+
 // CP3 I4: RUNE_BROKER_LIVENESS_TIMEOUT_MS — default 0 (the agent uses 3 x the leader-heartbeat timeout); a positive value
 // is carried; garbage is refused.  RED: ignore the variable.
 TEST(NodeConfigRegression, BrokerLivenessTimeoutEnvIsParsedRegression) {

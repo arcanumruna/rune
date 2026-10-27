@@ -1804,6 +1804,12 @@ if(BUILD_TESTING)
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_ns_keyed_stores_tests PROPERTIES TIMEOUT 600)
 
+        # Namespaces Phase 2 Task 6b (D20): tombstones of a deleted namespace's offsets and transaction state.
+        add_executable(rune_namespace_tombstone_tests tests/node/NamespaceTombstoneRegressionTest.cpp)
+        target_link_libraries(rune_namespace_tombstone_tests PRIVATE rune_node rune_coordination rune_transaction
+                              rune_replication rune_storage GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_tombstone_tests PROPERTIES TIMEOUT 300)
+
         # Namespaces Phase 2 Task 4: open transactions abort on suspend, delete and every session revoke (coordinator
         # unit tests + the REAL client against ONE real broker).
         add_executable(rune_txn_abort_on_suspend_tests tests/client/TxnAbortOnSuspendRegressionTest.cpp tests/support/AllocWindow.cpp)

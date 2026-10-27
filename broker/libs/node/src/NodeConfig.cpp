@@ -1056,6 +1056,12 @@ ConfigResult parseNodeConfig(
             }
         }
     }
+    if (const char* raw = getenv_fn("RUNE_NS_DELETE_BATCH"); raw && *raw) {   // namespaces Phase 2 Task 6b (D20)
+        int32_t v = 0;
+        if (!parseInt32(raw, v) || v < 1 || v > 65536)
+            return {{}, std::string("RUNE_NS_DELETE_BATCH must be an integer in [1, 65536], got: ") + raw};
+        cfg.nsDeleteBatch = static_cast<uint32_t>(v);
+    }
     if (const char* raw = getenv_fn("RUNE_PEER_AUTH_STREAM_ID"); raw && *raw) {
         int32_t v = 0;
         if (!parseInt32(raw, v) || v < 1)
