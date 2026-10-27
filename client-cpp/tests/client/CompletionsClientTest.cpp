@@ -864,6 +864,18 @@ void parkRunnerHook() {
     while (g_parkRunner.load()) std::this_thread::yield();
 }
 void noopHandler(void*, const rc::Completion&, std::span<const uint8_t>) noexcept {}
+
+// The duty-cycle hook is a plain word owned by the duty thread, so a Thread-mode test must not write it from main.
+// This installs it ON the runner: the callable's last copy is destroyed by the runner when a later onError
+// setter (a ring command, applied by the runner) replaces it.
+struct ParkHookInstaller {
+    rc::Client* client;
+    ~ParkHookInstaller() { client->testSetDutyCycleHook(&parkRunnerHook); }
+};
+void installParkHookOnRunner(rc::Client& client) {
+    client.onError([inst = std::make_shared<ParkHookInstaller>(&client)](const std::string&) {});
+    client.onError([](const std::string&) {});  // the runner destroys the installer -> installs the hook
+}
 } // namespace
 
 // I1: a registered Completions whose last owner is a user callable replaced
@@ -876,7 +888,7 @@ TEST(CompletionsClient, QueueReleasedOnTheClosingThreadDuringTheDrainRegression)
     auto cq = std::make_shared<rc::Completions>(client);  // owner: this thread
     g_parkRunner.store(true);
     g_runnerParked.store(false);
-    client.testSetDutyCycleHook(&parkRunnerHook);
+    installParkHookOnRunner(client);
     while (!g_runnerParked.load()) std::this_thread::yield();  // runner parked at the top of a cycle
     for (int i = 0; i < 200; ++i) client.onError([](const std::string&) {});  // > ringDrainLimit
     client.onError([keep = cq](const std::string&) {});  // holds the queue
@@ -1138,7 +1150,7 @@ TEST(CompletionsClient, NonCloserReleaseDuringCloseNeverWaitsRegression) {
         ASSERT_EQ(client.testRegisteredCqs(), 1u);
         g_parkRunner.store(true);
         g_runnerParked.store(false);
-        client.testSetDutyCycleHook(&parkRunnerHook);
+        installParkHookOnRunner(client);
         while (!g_runnerParked.load()) std::this_thread::yield();
         for (int i = 0; i < 200; ++i) client.onError([](const std::string&) {});
         client.onError([keep = w](const std::string&) {});

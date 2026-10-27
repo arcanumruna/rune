@@ -50,18 +50,18 @@ TEST(SecurityWritePathRegression, EveryOpKindCommitsAndAnswersItsObject) {
     a = rig.ddl(rig.grantRole(false, "ws1", "world_server"));
     ASSERT_EQ(a.code, 0) << a.detail;
     EXPECT_EQ(a.objectId, userId);
-    EXPECT_EQ(rig.state().user("ws1")->roles.count(roleId), 1u);
+    EXPECT_EQ(rig.state().userByName(rune::catalog::kDefaultNsId, "ws1")->roles.count(roleId), 1u);
     // 5 AlterUser (AddPassword, then Disable, Enable, DropPassword)
     {
         auto m = rig.alterUser("ws1", Ch::AddPassword);
         m.verifier = SecurityDdlRig::verifierFor("another-long-pw-2");
         a = rig.ddl(std::move(m));
         ASSERT_EQ(a.code, 0) << a.detail;
-        EXPECT_EQ(rig.state().user("ws1")->verifiers.size(), 2u);
+        EXPECT_EQ(rig.state().userByName(rune::catalog::kDefaultNsId, "ws1")->verifiers.size(), 2u);
     }
     a = rig.ddl(rig.alterUser("ws1", Ch::Disable));
     ASSERT_EQ(a.code, 0) << a.detail;
-    EXPECT_FALSE(rig.state().user("ws1")->enabled);
+    EXPECT_FALSE(rig.state().userByName(rune::catalog::kDefaultNsId, "ws1")->enabled);
     a = rig.ddl(rig.alterUser("ws1", Ch::Enable));
     ASSERT_EQ(a.code, 0) << a.detail;
     {
@@ -69,7 +69,7 @@ TEST(SecurityWritePathRegression, EveryOpKindCommitsAndAnswersItsObject) {
         m.passwordIndex = 1;
         a = rig.ddl(std::move(m));
         ASSERT_EQ(a.code, 0) << a.detail;
-        EXPECT_EQ(rig.state().user("ws1")->verifiers.size(), 1u);
+        EXPECT_EQ(rig.state().userByName(rune::catalog::kDefaultNsId, "ws1")->verifiers.size(), 1u);
     }
     {
         auto m = rig.alterUser("ws1", Ch::SetPassword);
@@ -84,14 +84,14 @@ TEST(SecurityWritePathRegression, EveryOpKindCommitsAndAnswersItsObject) {
     ASSERT_EQ(a.code, 0) << a.detail;
     a = rig.ddl(rig.grantRole(true, "ws1", "world_server"));
     ASSERT_EQ(a.code, 0) << a.detail;
-    EXPECT_TRUE(rig.state().user("ws1")->roles.empty());
+    EXPECT_TRUE(rig.state().userByName(rune::catalog::kDefaultNsId, "ws1")->roles.empty());
     // 8 DropRole, 9 DropUser
     a = rig.ddl(rig.simple(Op::DropRole, "world_server", "DROP ROLE world_server;"));
     ASSERT_EQ(a.code, 0) << a.detail;
-    EXPECT_EQ(rig.state().role("world_server"), nullptr);
+    EXPECT_EQ(rig.state().roleByName(rune::catalog::kDefaultNsId, "world_server"), nullptr);
     a = rig.ddl(rig.simple(Op::DropUser, "ws1", "DROP USER ws1;"));
     ASSERT_EQ(a.code, 0) << a.detail;
-    EXPECT_EQ(rig.state().user("ws1"), nullptr);
+    EXPECT_EQ(rig.state().userByName(rune::catalog::kDefaultNsId, "ws1"), nullptr);
     // Every event is in the log, in offset order, and started == answered.
     const auto events = rig.recordedEvents();
     EXPECT_EQ(events.size(), 13u);
@@ -201,7 +201,7 @@ TEST(SecurityWritePathRegression, ReusedRequestIdWithAnotherStatementIsInvalidRe
     const auto a = rig.ddl(other);
     EXPECT_EQ(a.code, kInvalidRequest);
     EXPECT_NE(a.detail.find("requestId reused for a different statement"), std::string::npos) << a.detail;
-    EXPECT_EQ(rig.state().user("u2"), nullptr);
+    EXPECT_EQ(rig.state().userByName(rune::catalog::kDefaultNsId, "u2"), nullptr);
 }
 
 TEST(SecurityWritePathRegression, DemotionAnswersTheInFlightDdlNotLeaderRegression) {
@@ -231,7 +231,7 @@ TEST(SecurityWritePathRegression, CatchingUpLeaderAnswersNotLeader) {
     const auto a = rig.answerFor(corr);
     ASSERT_TRUE(a.has_value());
     EXPECT_EQ(a->code, kNotLeader);
-    EXPECT_EQ(rig.state().user("u2"), nullptr);
+    EXPECT_EQ(rig.state().userByName(rune::catalog::kDefaultNsId, "u2"), nullptr);
 }
 
 TEST(SecurityWritePathRegression, FollowerAnswersNotLeader) {
@@ -258,7 +258,7 @@ TEST(SecurityWritePathRegression, CommitTimeoutAnswersNotLeaderAndTheRetryDedupe
     // The followers return: the event commits and applies; the retry answers its original result.
     rig.unsilence(2); rig.unsilence(3);
     for (int i = 0; i < 20; ++i) rig.pump();
-    ASSERT_NE(rig.state().user("u1"), nullptr);
+    ASSERT_NE(rig.state().userByName(rune::catalog::kDefaultNsId, "u1"), nullptr);
     m.corr = rig.nextCorr();
     const auto retry = rig.ddl(m);
     EXPECT_EQ(retry.code, 0) << retry.detail;
@@ -356,7 +356,7 @@ TEST(SecurityBootstrapRegression, FirstBootstrapCreatesAMustChangeAdminWithAdmin
     const auto a = rig.bootstrap(rig.bootstrapMsg("admin", "initial-one-time-pw"));
     ASSERT_EQ(a.code, 0) << a.detail;
     EXPECT_EQ(a.gateOffset, 0);
-    const auto* u = rig.state().user("admin");
+    const auto* u = rig.state().userByName(rune::catalog::kDefaultNsId, "admin");
     ASSERT_NE(u, nullptr);
     EXPECT_TRUE(u->mustChangePassword) << "the one-time password must be changed first";
     EXPECT_TRUE(rig.state().hasSecurityAdmin()) << "ADMIN ON CLUSTER, directly granted";
@@ -374,7 +374,7 @@ TEST(SecurityBootstrapRegression, SecondBootstrapIsRefusedExplicitly) {
     EXPECT_EQ(a.code, kInvalidRequest);
     EXPECT_EQ(a.detail, "security is already bootstrapped (a security admin exists)");
     EXPECT_EQ(rig.recordedEvents().size(), 1u);
-    EXPECT_EQ(rig.state().user("admin2"), nullptr);
+    EXPECT_EQ(rig.state().userByName(rune::catalog::kDefaultNsId, "admin2"), nullptr);
 }
 
 TEST(SecurityBootstrapRegression, BootstrapIsTheFirstEventWithPrincipalBootstrap) {

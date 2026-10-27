@@ -6,6 +6,7 @@
 #include "HotPathBRig.h"
 #include <execinfo.h>
 #include <cstdio>
+#include <new>
 
 // The same-address replacement test: the block of one deleted object is kept
 // (not freed) so the next object is built at the SAME address (deterministic
@@ -17,6 +18,17 @@ void operator delete(void* p) noexcept {
     std::free(p);
 }
 void operator delete(void* p, std::size_t) noexcept { ::operator delete(p); }
+// The nothrow forms route through the replaced throwing forms. Otherwise a nothrow allocation (libstdc++'s
+// get_temporary_buffer under std::stable_sort, e.g. in gtest) comes from the default/ASan allocator but is released
+// by the replaced delete: ASan alloc-dealloc-mismatch, and the allocation goes uncounted.
+void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
+    try { return ::operator new(n); } catch (...) { return nullptr; }
+}
+void* operator new[](std::size_t n, const std::nothrow_t&) noexcept {
+    try { return ::operator new[](n); } catch (...) { return nullptr; }
+}
+void operator delete(void* p, const std::nothrow_t&) noexcept { ::operator delete(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { ::operator delete[](p); }
 // D28b: heap allocations made while armed (the worker's duty pass); the first
 // few print a backtrace so the culprit is named.  Plain single-thread globals
 // (E2 final fix wave — hard rule 1, as TransientDataPathAllocTest): the worker

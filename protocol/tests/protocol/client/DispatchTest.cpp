@@ -648,7 +648,7 @@ TEST(DispatchCheckFrame, UnsupportedVersionDataTemplate) {
 }
 
 // ===========================================================================
-// 5. UnknownTemplate — ids 0, 22, 45(*), 81, 99, 65535 (8, 12..15, 64 are known)
+// 5. UnknownTemplate — ids 0, 22, 45(*), 84, 99, 65535 (8, 12..15, 64 are known)
 //    (valid schema + version but unknown id)
 //    Note: 16-21 (Produce..Unsubscribe) are KNOWN (PB-1/PB-2/PB-3).
 //          32-44 (JoinGroup..Assign) are KNOWN (CG-1).
@@ -776,12 +776,22 @@ TEST(DispatchCheckFrame, KnownTemplatesSeventyNineAndEighty) {
     }
 }
 
-TEST(DispatchCheckFrame, UnknownTemplateEightyOne) {
-    // 81 = first unassigned id in schema/view range after SecurityBootstrap=80
-    auto buf = makeValidHeaderBuf(81);
+TEST(DispatchCheckFrame, KnownTemplatesEightyOneToEightyThree) {
+    // 81 = NamespaceDdl, 82 = ListNamespaces, 83 = ListNamespacesResponse (client version 14)
+    for (uint16_t tid = 81; tid <= 83; ++tid) {
+        auto buf = makeValidHeaderBuf(tid);
+        const auto fc = rpc::checkFrame(buf.data(), buf.size());
+        EXPECT_EQ(fc.status, rpc::FrameStatus::Ok) << "tid=" << tid;
+        EXPECT_EQ(fc.templateId, tid);
+    }
+}
+
+TEST(DispatchCheckFrame, UnknownTemplateEightyFour) {
+    // 84 = first unassigned id in schema/view range after ListNamespacesResponse=83
+    auto buf = makeValidHeaderBuf(84);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
-    EXPECT_EQ(fc.templateId, 81u);
+    EXPECT_EQ(fc.templateId, 84u);
 }
 
 TEST(DispatchCheckFrame, UnknownTemplateNinetyNine) {
@@ -965,6 +975,8 @@ TEST(DispatchIsKnownTemplate, KnownBoundaries) {
     for (uint16_t tid = 74; tid <= 78; ++tid) {
         EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
     }
-    EXPECT_FALSE(rpc::isKnownTemplate(81));
+    EXPECT_TRUE(rpc::isKnownTemplate(83));
+    EXPECT_FALSE(rpc::isKnownTemplate(84));
+    EXPECT_FALSE(rpc::isKnownTemplate(95));
     EXPECT_FALSE(rpc::isKnownTemplate(65535));
 }

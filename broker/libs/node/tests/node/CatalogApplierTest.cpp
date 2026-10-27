@@ -432,7 +432,7 @@ TEST(CatalogApplierRegression, GoldenScriptProjectsTheRegistriesAndPostsEveryEff
     ASSERT_NE(presence, nullptr);
     EXPECT_EQ(presence->topicId, 6);
     EXPECT_EQ(presence->compatMode, rune::codec::CompatMode::Forward);
-    EXPECT_EQ(presence->version, rig.applier.state().topicByName("presence")->schema->schemaVersion);
+    EXPECT_EQ(presence->version, rig.applier.state().topicByName(rune::catalog::kDefaultNsId, "presence")->schema->schemaVersion);
     ASSERT_NE(rig.schemas.byName("events"), nullptr);
     EXPECT_EQ(rig.schemas.byName("events")->topicId, 1);
 
@@ -812,7 +812,7 @@ TEST(CatalogApplierRegression, OversizeViewEffectHaltsAtItsOffsetAndNeverAbortsR
     // M1: the halted state names the staged event; nothing of it was effected or made durable.
     EXPECT_EQ(rig.applier.stagedOffset(), 1);
     EXPECT_EQ(rig.applier.lastApplied().offset, 0);
-    EXPECT_NE(rig.applier.state().viewByName("wv"), nullptr) << "staged in state()";
+    EXPECT_NE(rig.applier.state().viewByName(rune::catalog::kDefaultNsId, "wv"), nullptr) << "staged in state()";
     EXPECT_EQ(rig.views.byName("wv"), nullptr) << "never projected";
     EXPECT_EQ(rune::node::readCatalogCheckpoint(rig.catalogDir())->appliedOffset, 0) << "never checkpointed";
     // The metric frame is on the ring, after the topic's effects.
@@ -871,7 +871,7 @@ TEST(CatalogApplierRegression, LeaderDryRunRefusesAnEventWhoseEffectsCannotBePos
     ASSERT_TRUE(refusal.has_value()) << "the oversize view is refused before it is appended";
     EXPECT_NE(refusal->find("CreateView 'wv'"), std::string::npos) << *refusal;
     EXPECT_NE(refusal->find("ViewPlanUpdate"), std::string::npos) << *refusal;
-    EXPECT_EQ(s.viewByName("wv"), nullptr) << "a dry run: the caller's state is untouched";
+    EXPECT_EQ(s.viewByName(rune::catalog::kDefaultNsId, "wv"), nullptr) << "a dry run: the caller's state is untouched";
 
     const auto val = wideScript(3000, true, false);
     EXPECT_TRUE(catalogEventEffectsRefusal(cat::CatalogState{}, val[0]).has_value());
@@ -908,7 +908,7 @@ TEST(CatalogApplierRegression, CoalescedBootSurvivesAHistoryLargerThanTheBacklog
         cat::CatalogState s;
         for (std::size_t i = 0; i < events.size(); ++i) {
             ASSERT_TRUE(cat::apply(s, events[i], static_cast<int64_t>(i)).has_value());
-            naive += schemaUpdateWireLen(materializedDescriptorOf(*s.topicByName("grow")).size());
+            naive += schemaUpdateWireLen(materializedDescriptorOf(*s.topicByName(rune::catalog::kDefaultNsId, "grow")).size());
         }
     }
     ASSERT_GT(naive, static_cast<std::size_t>(kAdminToControlRingBytes) * 5) << "naive volume > ring + 4x-ring backlog";
@@ -929,15 +929,17 @@ TEST(CatalogApplierRegression, CoalescedBootSurvivesAHistoryLargerThanTheBacklog
     }
     for (auto& f : drainFailureRing(agent)) frames.push_back(std::move(f));
     ASSERT_EQ(agent.catalogBacklogForTest(), 0u);
-    ASSERT_EQ(frames.size(), 405u) << "one topic: its filter schema (before the topic, and again after the validators), "
-                                      "its 401 versions' validators, one applied";
-    EXPECT_EQ(frames[0].type, kA2cFilterSchema);
-    EXPECT_EQ(frames[1].type, kA2cCatalogTopicApplied);
-    EXPECT_EQ(frames[403].type, kA2cFilterSchema);
+    // Namespaces Task 9: the boot posts every namespace (here only `default`) before any object.
+    ASSERT_EQ(frames.size(), 406u) << "the default namespace; one topic: its filter schema (before the topic, and again "
+                                      "after the validators), its 401 versions' validators, one applied";
+    EXPECT_EQ(frames[0].type, kA2cNamespaceUpserted);
+    EXPECT_EQ(frames[1].type, kA2cFilterSchema);
+    EXPECT_EQ(frames[2].type, kA2cCatalogTopicApplied);
+    EXPECT_EQ(frames[404].type, kA2cFilterSchema);
     EXPECT_EQ(frames.back().type, kA2cCatalogApplied);
     for (std::size_t i = 0; i < 401; ++i) {
-        ASSERT_EQ(frames[2 + i].type, kA2cSchemaUpdate) << i;
-        EXPECT_EQ(decodeSchemaUpdate(frames[2 + i].bytes.data(), frames[2 + i].bytes.size()).version, i + 1)
+        ASSERT_EQ(frames[3 + i].type, kA2cSchemaUpdate) << i;
+        EXPECT_EQ(decodeSchemaUpdate(frames[3 + i].bytes.data(), frames[3 + i].bytes.size()).version, i + 1)
             << "ascending versions";
     }
 }
@@ -999,7 +1001,7 @@ TEST(CatalogApplierRegression, TopicFramesSizeEveryVersionBootWillPostRegression
     const auto events = std::move(b).take();
     cat::CatalogState s;
     for (std::size_t i = 0; i < events.size(); ++i) ASSERT_TRUE(cat::apply(s, events[i], static_cast<int64_t>(i)).has_value());
-    const cat::TopicObject& t = *s.topicByName("sh");
+    const cat::TopicObject& t = *s.topicByName(rune::catalog::kDefaultNsId, "sh");
     ASSERT_EQ(t.schema->schemaVersion, 2);
     const std::size_t v1 = schemaUpdateWireLen(materializedDescriptorOf(t, 1).size());
     const std::size_t v2 = schemaUpdateWireLen(materializedDescriptorOf(t, 2).size());
@@ -1057,7 +1059,7 @@ TEST(CatalogApplierRegression, LeaderDryRunRefusesAFilterSchemaFrameThatCannotBe
         const auto events = wideScript(3000, false, false);
         cat::CatalogState s;
         ASSERT_TRUE(cat::apply(s, events.at(0), 0).has_value());
-        EXPECT_TRUE(topicEffectFramesError(*s.topicByName("wide"), catalogEffectMaxFrame(), 1).has_value());
+        EXPECT_TRUE(topicEffectFramesError(*s.topicByName(rune::catalog::kDefaultNsId, "wide"), catalogEffectMaxFrame(), 1).has_value());
     }
 }
 
@@ -1441,4 +1443,95 @@ TEST(CatalogApplierRegression, BootSinkIsReleasedWhenTheReplayEndsRegression) {
     rune::node::CatalogApplier boot2(empty.catalogDir(), s2, v2);
     ASSERT_EQ(boot2.replayLocal(empty.log(), bootEffects()), 0);
     EXPECT_EQ(token.use_count(), 1);
+}
+
+// Checkpoint A F2: the namespace kinds (32..35) had no arm in project_/effects_; each must apply without a halt,
+// project nothing into the schema/view registries and post no side effect.
+TEST(CatalogApplierRegression, NamespaceKindsApplyWithoutHaltRegression) {
+    CatalogRig rig("ap_ns_kinds");
+    rig.appendEvents(0, 5);
+    ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 5);
+    const std::vector<std::string> before = rig.rec.sequence;
+
+    // The leader's way: stamp the previewed fingerprint against the applier's own state, then commit.
+    auto commit = [&](cat::Ops ops, uint32_t nsId, uint32_t prev) {
+        cat::CatalogEvent e;
+        e.formatVer   = cat::kFormatV2;
+        e.nsId        = nsId;
+        e.kind        = cat::kindOf(ops);
+        e.ops         = std::move(ops);
+        e.objectName  = "guild";
+        e.prevVersion = prev;
+        e.newVersion  = prev + 1;
+        auto fp = cat::previewFingerprint(rig.applier.state(), e);
+        ASSERT_TRUE(fp.has_value()) << cat::applyErrorName(fp.error().code) << ": " << fp.error().detail;
+        e.fingerprint = *fp;
+        rig.appendEventCommitted(e);
+        const int64_t next = rig.applier.nextOffset();
+        EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 1);
+        ASSERT_FALSE(rig.applier.halted()) << (rig.rec.halts.empty() ? "" : rig.rec.halts.back().detail);
+        EXPECT_EQ(rig.applier.nextOffset(), next + 1);
+    };
+    const uint32_t ns = rig.applier.state().namespaces().nextNsId();
+    commit(cat::NamespaceCreatedOps{"guild", {}}, ns, 0);
+    rune::protocol::NamespaceLimits l{};
+    l.maxTopics = 7;
+    commit(cat::NamespaceLimitsSetOps{l}, ns, 1);
+    commit(cat::NamespaceStateChangedOps{cat::NsStateTag::SuspendedReadOnly}, ns, 2);
+
+    ASSERT_NE(rig.applier.state().namespaces().byId(ns), nullptr);
+    EXPECT_EQ(rig.applier.state().namespaces().byId(ns)->version, 3u);
+    EXPECT_TRUE(rig.rec.halts.empty());
+    EXPECT_EQ(rig.rec.sequence, before) << "namespace kinds post no live effect";
+    EXPECT_EQ(rig.rec.appliedOffsets.back(), 7);
+}
+
+// Checkpoint A F11: namespace state survives a restart.  Live apply of create / limits / a second namespace's full
+// delete, then a fresh applier replays the local log against the durable checkpoint: no FingerprintMismatch halt, the
+// same digest, the live record intact, the deleted id gone and the id counter not rolled back (ids are never reused).
+TEST(CatalogApplierRegression, NamespaceStateSurvivesBootReplayRegression) {
+    CatalogRig rig("ap_ns_boot");
+    rig.appendEvents(0, 3);
+    ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 3);
+
+    auto commit = [&](cat::Ops ops, const std::string& name, uint32_t nsId, uint32_t prev) {
+        cat::CatalogEvent e;
+        e.formatVer   = cat::kFormatV2;
+        e.nsId        = nsId;
+        e.kind        = cat::kindOf(ops);
+        e.ops         = std::move(ops);
+        e.objectName  = name;
+        e.prevVersion = prev;
+        e.newVersion  = prev + 1;
+        auto fp = cat::previewFingerprint(rig.applier.state(), e);
+        ASSERT_TRUE(fp.has_value()) << cat::applyErrorName(fp.error().code) << ": " << fp.error().detail;
+        e.fingerprint = *fp;
+        rig.appendEventCommitted(e);
+        ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 1);
+        ASSERT_FALSE(rig.applier.halted()) << (rig.rec.halts.empty() ? "" : rig.rec.halts.back().detail);
+    };
+    const uint32_t guild = rig.applier.state().namespaces().nextNsId();
+    commit(cat::NamespaceCreatedOps{"guild", {}}, "guild", guild, 0);
+    rune::protocol::NamespaceLimits l{};
+    l.maxTopics = 7;
+    commit(cat::NamespaceLimitsSetOps{l}, "guild", guild, 1);
+    const uint32_t gone = guild + 1;
+    commit(cat::NamespaceCreatedOps{"gone", {}}, "gone", gone, 0);
+    commit(cat::NamespaceStateChangedOps{cat::NsStateTag::Deleting}, "gone", gone, 1);
+    commit(cat::NamespaceDeletedOps{}, "gone", gone, 2);
+
+    const uint64_t digest = rig.applier.state().digest();
+    ASSERT_EQ(rig.applier.nextOffset(), 8);
+    rig.restart();
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 8);
+    ASSERT_FALSE(rig.applier.halted()) << (rig.rec.halts.empty() ? "" : rig.rec.halts.back().detail);
+    EXPECT_EQ(rig.applier.phaseName(), "Booted");
+    EXPECT_EQ(rig.applier.state().digest(), digest);
+    const auto* rec = rig.applier.state().namespaces().byId(guild);
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(rec->name, "guild");
+    EXPECT_EQ(rec->version, 2u);
+    EXPECT_EQ(rec->limits.maxTopics, 7u);
+    EXPECT_EQ(rig.applier.state().namespaces().byId(gone), nullptr);
+    EXPECT_EQ(rig.applier.state().namespaces().nextNsId(), gone + 1) << "a deleted id is never handed out again";
 }

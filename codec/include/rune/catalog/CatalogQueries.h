@@ -26,10 +26,12 @@ enum class ObjectType : uint8_t { Topic, View, Schema };
 /// name: matches objectName — every object EVER named so (a drop-and-reuse shows both,
 ///       told apart by objectId); empty = every name.
 /// sinceMs: timestampMs >= sinceMs.
+/// nsId: only events of that namespace (formatVer 2; a formatVer-1 event is namespace 0); nullopt = every namespace.
 struct HistoryFilter {
     std::optional<ObjectType> type;
     std::string               name;
     int64_t                   sinceMs = INT64_MIN;
+    std::optional<uint32_t>   nsId;
 };
 /// The matching events, in log (offset) order; pointers into `log`.
 [[nodiscard]] std::vector<const RecordedEvent*> history(std::span<const RecordedEvent> log, const HistoryFilter& f);
@@ -47,12 +49,13 @@ struct AsOf {
     int64_t     value = 0;
     ObjectType  type  = ObjectType::Topic;   // Version only
     std::string name;                        // Version only
+    uint32_t    nsId  = 0;                   // Version only: the namespace `name` lives in (0 = default)
 };
 /// Replays `log` (which must start at offset 0, gap-free) through a fresh CatalogReplayer
 /// up to the as-of point — so an as-of point past a bad event surfaces that event's error.
 [[nodiscard]] std::expected<CatalogState, ReplayError> stateAsOf(std::span<const RecordedEvent> log, const AsOf& at);
 
-/// One object that differs between two states, paired by (type, name) — type Topic or View.
+/// One object that differs between two states, paired by (type, nsId, name) — type Topic or View.
 /// Added: in b only (fingerprintA = 0).  Removed: in a only (fingerprintB = 0).
 /// Changed: both, fingerprints differ; `fields` names every differing definition field.
 struct DiffEntry {
@@ -63,8 +66,9 @@ struct DiffEntry {
     uint64_t                 fingerprintA = 0;
     uint64_t                 fingerprintB = 0;
     std::vector<std::string> fields;
+    uint32_t                 nsId = 0;       // the namespace of the object (name is the local name)
 };
-/// Ordered by (type, name).  Empty when every live definition is equal (ids never count,
+/// Ordered by (type, nsId, name).  Empty when every live definition is equal (ids never count,
 /// ruling 11: a dropped-and-recreated identical object is no change).
 [[nodiscard]] std::vector<DiffEntry> diff(const CatalogState& a, const CatalogState& b);
 

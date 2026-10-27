@@ -29,8 +29,16 @@ public:
     }
     /// Nothing at all (a session that must not touch the data plane, e.g. a one-time-password session).
     [[nodiscard]] static PermissionTable denyAll() { return PermissionTable{}; }
-    /// Cold.  `effective` = rune::security::effectiveGrants(state, userId).
-    [[nodiscard]] static PermissionTable compile(std::span<const rune::security::GrantSpec> effective, const ObjectIndex&);
+    /// Cold.  `effective` = rune::security::effectiveGrants(state, userId); `nsId` = the session's namespace (plan D9:
+    /// an object of another namespace gets no bits - unless the grants are root, ADMIN ON CLUSTER, issue #626).
+    /// `nsName` = that namespace's name (plan D11): ADMIN ON NAMESPACE `nsName` is the namespace admin and holds
+    /// CREATE / ALTER / DROP / DESCRIBE on every non-internal topic and view of its own namespace.  Empty: no implication.
+    [[nodiscard]] static PermissionTable compile(std::span<const rune::security::GrantSpec> effective, uint32_t nsId,
+                                                 const ObjectIndex&, std::string_view nsName = {});
+    /// The `default` namespace (nsId 0).
+    [[nodiscard]] static PermissionTable compile(std::span<const rune::security::GrantSpec> effective, const ObjectIndex& index) {
+        return compile(effective, 0, index);
+    }
 
     [[nodiscard]] bool allows(int32_t objectId, uint8_t opBits) const noexcept {   // ONE bounds check + ONE load
         return allowAll_ || (static_cast<uint32_t>(objectId) < ops_.size() && (ops_[static_cast<std::size_t>(objectId)] & opBits) == opBits);
@@ -39,10 +47,14 @@ public:
     /// Name-addressed (groups, transactional ids, DDL names): the retained patterns matched against `name`.  Cold.
     [[nodiscard]] bool allowsName(rune::security::ResourceType, std::string_view name, uint8_t opBits) const noexcept;
     [[nodiscard]] bool isAllowAll() const noexcept { return allowAll_; }
+    /// The namespace this table was compiled for (0 for allow-all / deny-all).
+    [[nodiscard]] uint32_t nsId() const noexcept { return nsId_; }
+    /// Root (ADMIN ON CLUSTER) or allow-all: reaches every namespace (spec §2, issue #626).
+    [[nodiscard]] bool isRoot() const noexcept { return allowAll_ || root_; }
     /// #211: true when the table holds `op` on at least one resource of `type` - any literal, prefixed or wildcard
     /// grant ON that type (allow-all: always).  O(1): kept when the table is compiled (a grant change recompiles it).
-    /// Only the type's own grants count (no CLUSTER implication), which is exact for READ / WRITE (a CLUSTER grant
-    /// cannot hold them).
+    /// Only the type's own grants count, plus root: ADMIN ON CLUSTER holds every op on every type but NAMESPACE.  The
+    /// other CLUSTER grants give no implication here, which is exact for READ / WRITE (only root holds them).
     [[nodiscard]] bool hasAnyGrant(rune::security::ResourceType type, rune::security::Operation op) const noexcept {
         const auto t = static_cast<std::size_t>(type);
         return allowAll_ || (t < anyOps_.size() && (anyOps_[t] & rune::security::opBit(op)) != 0);
@@ -59,8 +71,12 @@ public:
 
 private:
     void setOps_(int32_t id, uint8_t ops);
+    [[nodiscard]] uint8_t opsOf_(const ObjectEntry& e) const noexcept;   // 0 on a foreign object unless root
     bool allowAll_ = false;
+    bool root_ = false;
+    uint32_t nsId_ = 0;
     uint8_t clusterOps_ = 0;
+    uint8_t nsAdminOps_ = 0;                            // D11: the DDL bits a namespace admin holds on own topics / views
     std::array<uint8_t, 5> anyOps_{};                   // #211: op bits granted on ANY resource, per ResourceType
     std::vector<uint8_t> ops_;                          // by object id; capacity persists
     std::vector<rune::security::GrantSpec> grants_;     // retained for onObjectCreated / allowsName

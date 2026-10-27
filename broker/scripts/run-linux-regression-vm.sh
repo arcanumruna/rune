@@ -5,7 +5,7 @@
 #     jobs       default 3 (the VM has 4 cores, shared with k3s)
 #     build-dir  default $RUNE_BUILD_DIR, else build-fast under broker/, else build/root at the monorepo root.
 #                Either a broker-only build (cmake -S broker) or the monorepo root build (cmake -S . -B build/root):
-#                both cache the same RUNE_*_ROOT / FLIGHT_RECORDER_DIR variables that name the trees to copy.  A
+#                both cache the same RUNE_*_ROOT / FLIGHT_RECORDER_DIR / ARCANUM_METRICS_DIR variables that name the trees to copy.  A
 #                relative path is tried against the cwd, broker/ and the monorepo root, in that order.
 #     ctest-filter  default empty.  ISR v3 Step 10 (CP2): a ctest -R regex.  When set, the stage also configures
 #                BUILD_INTEGRATION_TESTING=ON, builds rune_consensus_candidacy_tests, rune_client_broker_tests and
@@ -52,9 +52,9 @@ done
 [ -n "$CACHE" ] || { echo "run-linux-regression-vm: no CMakeCache.txt in any of: ${cands[*]} (pass the build dir or set RUNE_BUILD_DIR)" >&2; exit 2; }
 val() { grep -E "^$1:" "$CACHE" | head -1 | cut -d= -f2-; }
 PROTO="$(cd "$(val RUNE_PROTOCOL_INCLUDE)/.." && pwd)"
-declare -a NAMES=(broker protocol client-cpp codec flight-recorder ql crypto)
+declare -a NAMES=(broker protocol client-cpp codec flight-recorder ql crypto arcanum-metrics)
 declare -a TREES=("$HERE" "$PROTO" "$(val RUNE_CLIENT_ROOT)" "$(val RUNE_CODEC_ROOT)" "$(val FLIGHT_RECORDER_DIR)" \
-                  "$(val RUNE_QL_ROOT)" "$(val RUNE_CRYPTO_ROOT)")
+                  "$(val RUNE_QL_ROOT)" "$(val RUNE_CRYPTO_ROOT)" "$(val ARCANUM_METRICS_DIR)")
 for i in "${!TREES[@]}"; do
     t="${TREES[$i]}"
     [ -d "$t" ] || { echo "run-linux-regression-vm: ${NAMES[$i]} tree '$t' missing" >&2; exit 2; }
@@ -85,13 +85,14 @@ set -u
 cd "$RUN/broker" || exit 2
 DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -f docker/Dockerfile --target builder \\
     --build-context rune-protocol=../protocol --build-context flight-recorder=../flight-recorder \\
+    --build-context arcanum-metrics=../arcanum-metrics \\
     --build-context rune-codec=../codec --build-context rune-crypto=../crypto \\
     --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$J -t "$IMG" . > "$RUN/builder.log" 2>&1 \\
     || { echo "builder stage failed:"; tail -30 "$RUN/builder.log"; exit 2; }
 CFG='cmake -S /src/broker -B /src/_build -G Ninja -DCMAKE_TOOLCHAIN_FILE=/build/conan-release/build/Release/generators/conan_toolchain.cmake \\
   -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DBUILD_BENCHMARKS=OFF -DBUILD_INTEGRATION_TESTING=$ITEG \\
   -DRUNE_PROTOCOL_INCLUDE=/src/protocol/include -DRUNE_CODEC_ROOT=/src/codec -DRUNE_CRYPTO_ROOT=/src/crypto \\
-  -DFLIGHT_RECORDER_DIR=/src/flight-recorder -DRUNE_CLIENT_ROOT=/src/client-cpp -DRUNE_QL_ROOT=/src/ql -DRUNE_TLS=ON > /src/cmake.log 2>&1'
+  -DFLIGHT_RECORDER_DIR=/src/flight-recorder -DARCANUM_METRICS_DIR=/src/arcanum-metrics -DRUNE_CLIENT_ROOT=/src/client-cpp -DRUNE_QL_ROOT=/src/ql -DRUNE_TLS=ON > /src/cmake.log 2>&1'
 docker run --rm --name "rune-linux-gate-build-$RID" -v "$RUN:/src" "$IMG" bash -c "\$CFG && for t in $XT; do ninja -C /src/_build -t targets all | grep -q \"^\\\$t:\" || { echo \"missing target \\\$t (the ctest filter needs it)\" >&2; exit 2; }; done && cmake --build /src/_build -j$J --target rune_udp_gso_tests rune_catalog_replication_tests $XT > /src/ninja.log 2>&1" \\
     || { echo "build failed:"; tail -20 "$RUN/cmake.log" "$RUN/ninja.log"; exit 2; }
 echo "== linux-only (CAP_NET_ADMIN, RUNE_LINUX_GATE=1)"

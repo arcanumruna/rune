@@ -15,10 +15,9 @@
 #include "support/SecurityBrokerCluster.h"
 
 #include <rune/node/PeerLinkAgent.h>
-#include <rune/node/RoleCounter.h>
+#include <rune/node/RuneMetrics.h>
 
-#include <CncFileReader.h>
-#include <concurrent/CountersReader.h>
+#include "MetricsTestReader.h"
 
 #include <array>
 #include <fstream>
@@ -216,18 +215,11 @@ public:
     }
 
     // ── observation ──────────────────────────────────────────────────────────────────────────────────────────
-    /// The aeron CnC counter of broker `id` (type id), nullopt = absent.
+    /// Metric `typeId` of broker `id` in its metrics file (default ${dataDir}/metrics/rune-metrics.dat; arcanum-metrics
+    /// plan Task 8), nullopt = absent.
     [[nodiscard]] std::optional<int64_t> counter(int id, std::int32_t typeId) const {
-        try {
-            const std::string dir = (c_.dirs[static_cast<std::size_t>(id - 1)]->path / "aeron").string();
-            aeron::CncFileReader reader = aeron::CncFileReader::mapExisting(dir.c_str());
-            aeron::concurrent::CountersReader counters = reader.countersReader();
-            std::optional<int64_t> found;
-            counters.forEach([&](std::int32_t cid, std::int32_t t, const aeron::concurrent::AtomicBuffer&, const std::string&) {
-                if (t == typeId && !found) found = counters.getCounterValue(cid);
-            });
-            return found;
-        } catch (...) { return std::nullopt; }
+        const auto file = c_.dirs[static_cast<std::size_t>(id - 1)]->path / "metrics" / "rune-metrics.dat";
+        return rune::node::test::readRuneMetricAt(file.string(), typeId, id);
     }
     /// Every running broker's SecurityView is at the same applied offset (>= `atLeast`) with the same digest.
     bool awaitDigestsAgree(int64_t atLeast, std::chrono::milliseconds within, uint64_t* digestOut = nullptr) {

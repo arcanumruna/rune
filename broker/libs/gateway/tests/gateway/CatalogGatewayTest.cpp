@@ -17,6 +17,7 @@
 // (the TopicServabilityTest rig); "committed placement" = the steady-state
 // routing image (committed metadata ready).
 #include <rune/gateway/ClientGateway.h>
+#include <rune/node/NamespacePaths.h>
 #include <rune/gateway/SecurityView.h>
 #include <rune/gateway/SessionAuth.h>
 #include <rune/gateway/TopicRegistry.h>
@@ -68,7 +69,7 @@ struct CountingAdminSink final : IAdminRequestSink {
     AdminSubmit submitDefineTopic(int64_t, int64_t, std::string_view, uint32_t, std::string_view, bool,
                                   const uint8_t*, uint32_t, uint8_t, int16_t, const rune::protocol::TopicConfigView&,
                                   const DdlMetaView&, std::string_view) override { ++submits; return AdminSubmit::Accepted; }
-    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t) override { ++gets; return true; }
+    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t, uint32_t) override { ++gets; return true; }
     AdminSubmit submitAlterTopic(int64_t, int64_t, std::string_view, uint16_t, const uint8_t*, uint32_t,
                                  const DdlMetaView&) override { ++submits; return AdminSubmit::Accepted; }
     AdminSubmit submitCreateView(int64_t, int64_t, std::string_view, std::string_view, uint8_t, const uint8_t*,
@@ -105,6 +106,8 @@ struct CountingAdminSink final : IAdminRequestSink {
         return true;
     }
     AdminSubmit submitSecurityDdl(const pc::SecurityDdl&, const DdlMetaView&, std::string_view, bool) override { return AdminSubmit::Accepted; }
+    AdminSubmit submitNamespaceDdl(const pc::NamespaceDdlRequest&, const DdlMetaView&, std::string_view, uint16_t) override { return AdminSubmit::Accepted; }
+    AdminSubmit submitListNamespaces(int64_t, int64_t, uint32_t, uint16_t, uint32_t, bool) override { return AdminSubmit::Accepted; }
     AdminSubmit submitSecurityBootstrap(const pc::SecurityBootstrap&, const DdlMetaView&) override { return AdminSubmit::Accepted; }
     bool submitSecuritySubscribe(int64_t, int64_t, int64_t) override { return true; }
     std::vector<CatalogUnsub> securityUnsubs;
@@ -474,7 +477,7 @@ TEST(CatalogGatewayRegression, CreateTopicAtIsIdempotentAndRefusesConflicts) {
     // Task 16 fix round 1 (R1): the dropped incarnation's dir (marker 5) is retired (renamed away) before the
     // name is re-created — the control thread's drop sequence; a create over it would be refused.
     EXPECT_EQ(g.apply(6, 1, "orders"), -1) << "the older incarnation's dir is still in place";
-    std::filesystem::rename(g.dir.path / "topics" / "orders", g.dir.path / "retired-orders");
+    std::filesystem::rename(rune::node::topicsRoot(g.dir.path, 0) / "orders", g.dir.path / "retired-orders");
     EXPECT_EQ(g.apply(6, 1, "orders"), 6) << "a dropped name is free for a NEW id";
     EXPECT_EQ(g.registry->topicIdForName("orders"), 6);
     EXPECT_TRUE(g.registry->releaseDroppedLogs(5));
@@ -965,9 +968,11 @@ TEST(AuthLiveChangeRegression, AdminLogFramesNeedTheReadersGrantAtSendTimeRegres
         << "an event this broker has not applied yet waits (it may follow a revoke of this very reader)";
     EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, ctrl0.data(), ctrl0.size()), A::Deliver)
         << "a control batch is no event (the applier never mirrors it): never held";
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size()), A::Deliver)
+        << "ADMIN ON CLUSTER is root: it holds DESCRIBE ON CLUSTER, so the catalog streams";
+    g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", clusterTable({rune::security::Operation::Create}), {}});
     EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size()), A::Withhold)
-        << "ADMIN does not give DESCRIBE ON CLUSTER here (no implied cluster ops in this table)"
-           " - unless the table says so";
+        << "CREATE ON CLUSTER does not give DESCRIBE ON CLUSTER";
 
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", clusterTable({rune::security::Operation::Describe}), {}});
     EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, ctrl0.data(), ctrl0.size()), A::Withhold)

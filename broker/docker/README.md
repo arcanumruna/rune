@@ -26,6 +26,7 @@ docker build \
   --platform linux/amd64 \
   --build-context rune-protocol=../protocol \
   --build-context flight-recorder=../../flight-recorder \
+  --build-context arcanum-metrics=../../arcanum-metrics \
   --build-context rune-codec=../codec \
   --build-context rune-crypto=../crypto \
   -f docker/Dockerfile \
@@ -33,11 +34,11 @@ docker build \
   .
 ```
 
-Run from `broker/` in the monorepo (the compose files do the same with `context: ..`). The four `--build-context` entries supply the
-sibling subprojects the root `CMakeLists.txt` compiles unconditionally (`flight-recorder` is a separate
-repository, `$FLIGHT_RECORDER_DIR`): `rune-protocol`
-(headers + `src/net`), `flight-recorder`, `rune-codec` (incl. the catalog library) and
-`rune-crypto`. `docker compose` passes the same four contexts for the broker
+Run from `broker/` in the monorepo (the compose files do the same with `context: ..`). The five `--build-context` entries supply the
+sibling subprojects the root `CMakeLists.txt` compiles unconditionally (`flight-recorder` and the header-only
+`arcanum-metrics` are separate repositories, `$FLIGHT_RECORDER_DIR` and `$ARCANUM_METRICS_DIR`): `rune-protocol`
+(headers + `src/net`), `flight-recorder`, `arcanum-metrics` (headers), `rune-codec` (incl. the catalog library) and
+`rune-crypto`. `docker compose` passes the same five contexts for the broker
 image and for the `probe` image (`docker/Dockerfile.probe`), so prefer
 `docker compose -f docker/docker-compose.yml build`.
 
@@ -101,6 +102,7 @@ default, is [../../docs/configuration.md](../../docs/configuration.md). The vari
 | `RUNE_CLIENT_STREAM_ID`         | no       | `1`         | Aeron stream ID for client traffic               |
 | `RUNE_CONSENSUS_STREAM_ID`      | no       | `10`        | Aeron stream ID for consensus traffic            |
 | `RUNE_DATA_DIR`                 | no       | `/var/lib/rune` | Writable data directory (mount a volume here) |
+| `RUNE_METRICS_FILE`             | no       | `$RUNE_DATA_DIR/metrics/rune-metrics.dat` | The broker's metrics file; `docker exec <c> rune_role` reads it (see `docs/operations.md` "Metrics") |
 | `RUNE_STORAGE_FORMAT`           | no       | (unset: never format) | `new` / `join` / `auto`; read **only** when the data dir is empty and not formatted. Unset: an empty dir refuses to start (exit 78) and prints the command to run. `auto` is development only. See `docs/SELF-HOSTING.md` "Formatting the data directory" |
 | `RUNE_STORAGE_RECOVERY_VOTE`    | no       | `0`         | Unsafe, disaster recovery only (see `docs/SELF-HOSTING.md`) |
 | `RUNE_ELECTION_TIMEOUT_MS`      | no       | `150`       | Maximum wait per election round, in ms           |

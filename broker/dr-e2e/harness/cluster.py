@@ -163,7 +163,7 @@ def _request_id(script: str) -> str:
     return hashlib.sha256(script.encode()).hexdigest()[:28] + "0000"
 
 # Legacy log-scrape pattern — kept ONLY as a fallback for images that predate
-# the Aeron role counter (see _read_role below).  Primary detection is
+# the node-role metric (see _read_role below).  Primary detection is
 # counter-based and does NOT depend on RUNE_LOG_LEVEL.
 _LEADER_RE = re.compile(r"node (\d+) is LEADER")
 
@@ -400,12 +400,12 @@ class Cluster:
     # ---- leadership -------------------------------------------------------
 
     def _read_role(self, service: str) -> tuple[str, int, int] | None:
-        """Read (role, nodeId, term) from a service's Aeron role counter.
+        """Read (role, nodeId, term) from a service's node-role metric.
 
         Runs `rune_role` inside the container (docker compose exec), which reads
-        the machine-readable node-role + leadership-term counters out of the
-        driver's CnC file — the Aeron-faithful leadership signal, independent of
-        RUNE_LOG_LEVEL and of any log line.
+        the machine-readable node-role + leadership-term metrics out of the
+        node's metrics file (rune-metrics.dat) — the Aeron-faithful leadership
+        signal, independent of RUNE_LOG_LEVEL and of any log line.
 
         Returns None if the container is not running, rune_role isn't present, or
         the counter isn't allocated yet (rune_role exits non-zero) — callers poll.

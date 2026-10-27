@@ -5,9 +5,27 @@
 #include <unistd.h>
 #include <stdexcept>
 #include <cerrno>
+#include <cstring>
+#include <string>
 namespace rune::storage {
 
 namespace {
+
+// Back every byte of a writable map with real blocks before it is mapped.  A
+// sparse ftruncate'd file maps fine, but the first store into a page with no
+// block behind it raises SIGBUS when the filesystem is full; allocating up front
+// turns that into an exception at open/resize, where callers already handle it.
+// Off the hot path: maps are made at segment/index creation (the provisioner).
+void allocateBacking(int fd, size_t bytes, const std::string& path) {
+#if defined(__linux__)
+    int rc;
+    do { rc = ::posix_fallocate(fd, 0, static_cast<off_t>(bytes)); } while (rc == EINTR);
+    if (rc != 0)
+        throw std::runtime_error("fallocate failed: " + path + ": " + std::strerror(rc));
+#else
+    (void)fd; (void)bytes; (void)path;   // macOS: no posix_fallocate; dev-only platform
+#endif
+}
 // F3 fix-round-1: RAII guard that closes (and resets to -1) the referenced fd
 // unless dismissed.  Used by the ctor and by resize()'s read-only reopen so
 // that a throw AFTER a successful open() (ftruncate/mmap failure) never
@@ -37,6 +55,7 @@ MappedFile::MappedFile(std::string path, size_t initialBytes, bool writable, boo
     }
     if (writable && ::ftruncate(fd_, static_cast<off_t>(size_)) != 0)
         throw std::runtime_error("ftruncate failed: " + path_);  // fdGuard closes fd_
+    if (writable) allocateBacking(fd_, size_, path_);
     mapNow();                                                    // fdGuard closes fd_ on throw
     fdGuard.dismissed = true;   // success: everything past this point is non-throwing
     if (prefault && writable_ && data_) prefaultWrite();
@@ -86,6 +105,7 @@ void MappedFile::resize(size_t newBytes) {
         if (writable_) {
             if (::ftruncate(fd_, static_cast<off_t>(newBytes)) != 0)
                 throw std::runtime_error("ftruncate failed: " + path_);
+            allocateBacking(fd_, newBytes, path_);
             size_ = newBytes;
             mapNow();
         } else if (borrowed_) {

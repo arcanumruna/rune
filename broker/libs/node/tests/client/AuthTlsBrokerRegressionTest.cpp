@@ -352,7 +352,7 @@ TEST(RuneCliSecurityBrokerRegression, InsecurePlaintextNeverSendsCredentialsRegr
     EXPECT_NE(runCli({"ql", "--broker", b.endpoint(), "-e", "show history;", "--insecure-plaintext", "--tls-ca",
                       AuthBroker::tlsCaFile().string()}, &out, &err), 0);
     EXPECT_NE(err.find("cannot be combined"), std::string::npos) << err;
-    EXPECT_TRUE(b.awaitCounter(kLoginsOkCounterTypeId, 0)) << "nothing logged in";
+    EXPECT_TRUE(b.awaitCounter(typeIdOf(RuneMetric::LoginsOk), 0)) << "nothing logged in";
     // The cluster is still bootstrappable over TLS: nothing was consumed.
     bootstrapOverTls(b);
     EXPECT_TRUE(b.node().securityViewForTest().hasSecurityAdmin);

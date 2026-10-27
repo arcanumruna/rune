@@ -129,7 +129,7 @@ def assert_single_leader(cluster, timeout_s: int = 30) -> int:
     """At most one node claims leadership at the current (highest) term.
 
     Counter-based, term-aware algorithm (Aeron-faithful; replaces log scraping):
-      1. Read each RUNNING node's Aeron role + leadership-term counters via
+      1. Read each RUNNING node's role + leadership-term metrics (metrics file) via
          rune_role (cluster._read_role → docker exec).  The role counter mirrors
          Aeron Cluster's node-role counter (LEADER/FOLLOWER/CANDIDATE/NONE); the
          term counter carries that node's observed leadership term.

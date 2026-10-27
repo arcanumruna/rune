@@ -330,6 +330,16 @@ public:
 // ---------------------------------------------------------------------------
 class PartitionReplica {
 public:
+    /// The follower's DATA-keepalive cadence: replicaLagMaxMs / 4, raised to at least `fetchIntervalNs` and capped at
+    /// 20 ms (the cap wins when the fetch interval is above it - a test that parks fetches at 1 s still rediscovers a
+    /// lost push within 20 ms).  Was std::clamp(lag / 4, fetchIntervalNs, 20 ms): undefined behaviour (and an abort
+    /// under _GLIBCXX_ASSERTIONS, GCC 15's debug default) for a fetch interval above 20 ms; this keeps the values the
+    /// old call produced everywhere it was defined.
+    [[nodiscard]] static constexpr int64_t followerKeepaliveNs(int64_t replicaLagMaxMs, int64_t fetchIntervalNs) noexcept {
+        constexpr int64_t kCapNs = 20'000'000LL;
+        const int64_t v = (replicaLagMaxMs * 1'000'000LL) / 4;
+        return v < fetchIntervalNs ? fetchIntervalNs : (v < kCapNs ? v : kCapNs);
+    }
     /// Transport arm chosen at construction (spec §3.5a.1).
     [[nodiscard]] TransportKind transportKindForTest() const noexcept { return tkind_; }
     /// Test-only: the transport this replica was built with (non-owning; set once in the ctor).

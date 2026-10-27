@@ -3,6 +3,8 @@
 #include <rune/protocol/client/SecurityMessages.h>
 #include <gtest/gtest.h>
 #include <array>
+#include <initializer_list>
+#include <string_view>
 #include <string>
 #include <vector>
 namespace pc = rune::protocol::client;
@@ -16,7 +18,7 @@ TEST(AuthMessagesRegression, ErrorCodesAndTemplatesArePinned) {
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), 15);
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::SecurityDdl), 79);
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::SecurityBootstrap), 80);
-    EXPECT_EQ(pc::kClientVersion, pc::kClientVersionRecordEgressUnavailable); EXPECT_EQ(pc::kBrokerVersion, 7); EXPECT_EQ(pc::kSecurityTopicId, -7);
+    EXPECT_EQ(pc::kClientVersion, pc::kClientVersionRecordEgressUnavailable); EXPECT_EQ(pc::kBrokerVersion, 8); EXPECT_EQ(pc::kSecurityTopicId, -7);
     EXPECT_EQ(pc::kClientVersionAuth, 9); EXPECT_EQ(pc::kBrokerVersionAuth, 5);
     EXPECT_TRUE(pc::clientUnderstandsAuth(9)); EXPECT_FALSE(pc::clientUnderstandsAuth(8));
     EXPECT_EQ(static_cast<int>(pc::AuthMode::Required), 0);
@@ -26,7 +28,8 @@ TEST(AuthMessagesRegression, ErrorCodesAndTemplatesArePinned) {
     EXPECT_EQ(static_cast<int>(pc::AuthState::ResumedAuthenticated), 1);
     EXPECT_EQ(static_cast<int>(pc::AuthState::Anonymous), 2);
     for (uint16_t t : {12, 13, 14, 15, 79, 80}) EXPECT_TRUE(pc::isKnownTemplate(t)) << t;
-    EXPECT_FALSE(pc::isKnownTemplate(81));
+    for (uint16_t t : {81, 82, 83}) EXPECT_TRUE(pc::isKnownTemplate(t)) << t;   // namespaces (client v14)
+    EXPECT_FALSE(pc::isKnownTemplate(84));
 }
 
 TEST(AuthMessagesRegression, EveryAuthFrameRoundTrips) {
@@ -237,4 +240,20 @@ TEST(AuthMessagesRegression, CredentialChangeMessageCoversExactlyTheWireFieldsRe
     EXPECT_FALSE(pc::isOwnCredentialChange(c.m, ""));
     c.m.change = pc::UserChangeKind::Disable;
     EXPECT_FALSE(pc::isOwnCredentialChange(c.m, "ws1")) << "DISABLE is not a credential change";
+}
+
+// PR #642 review F1 / F2: the own-account rule compares the RESOLVED (namespace, local) pair - the client (login name)
+// and the broker agree on it.  Mutation: compare name == login -> the qualified / default rows flip.
+TEST(AuthMessagesRegression, OwnUserNameResolvedRegression) {
+    struct Row { std::string_view name, login; bool own; };
+    for (const Row& r : std::initializer_list<Row>{
+             {"alice", "alpha/alice", true},          {"alpha/alice", "alpha/alice", true},
+             {"bravo/alice", "alpha/alice", false},   {"alice", "alice", true},
+             {"default/alice", "alice", true},        {"alice", "default/alice", true},
+             {"alpha/alice", "alice", false},         {"bob", "alpha/alice", false},
+             {"alpha/", "alpha/alice", false},        {"/alice", "alpha/alice", false},
+             {"a/b/alice", "alpha/alice", false},     {"", "alice", false},
+             {"alice", "", false},                    {"alpha/alicex", "alpha/alice", false}}) {
+        EXPECT_EQ(pc::isOwnUserName(r.name, r.login), r.own) << r.name << " vs login " << r.login;
+    }
 }

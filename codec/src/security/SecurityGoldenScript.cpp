@@ -25,10 +25,14 @@ GrantSpec spec(Operation op, ResourceType t, PatternKind k, std::string name) { 
 
 class Builder {
 public:
+    explicit Builder(uint16_t formatVer = kFormatV1) : formatVer_(formatVer) {}
+    /// formatVer 2: the namespace the following events act in.
+    void inNs(uint32_t nsId) { ns_ = nsId; }
     /// Targets are named by their CURRENT live name; ids and versions come from the state.
     void emit(Ops ops, const std::string& name, std::string statement) {
         const auto i = static_cast<uint64_t>(events_.size());
         SecurityEvent e;
+        e.formatVer = formatVer_; e.nsId = ns_;
         e.kind = kindOf(ops); e.ops = std::move(ops); e.objectName = name; e.statement = std::move(statement);
         const bool roleTarget = e.kind == EventKind::CreateRole || e.kind == EventKind::DropRole ||
             (e.kind == EventKind::Grant && std::get<GrantOps>(e.ops).grantee == GranteeKind::Role) ||
@@ -37,11 +41,11 @@ public:
         if (create) {
             e.objectId = s_.nextObjectId(); e.prevVersion = 0;
         } else if (roleTarget) {
-            const RoleObject* r = s_.role(name);
+            const RoleObject* r = s_.roleByName(ns_, name);
             if (!r) throw std::logic_error("golden script step " + std::to_string(i) + ": no role " + name);
             e.objectId = r->objectId; e.prevVersion = r->version;
         } else {
-            const UserObject* u = s_.user(name);
+            const UserObject* u = s_.userByName(ns_, name);
             if (!u) throw std::logic_error("golden script step " + std::to_string(i) + ": no user " + name);
             e.objectId = u->objectId; e.prevVersion = u->version;
         }
@@ -59,10 +63,12 @@ public:
             throw std::logic_error("golden script step " + std::to_string(i) + ": " + a.error().detail);
         events_.push_back(std::move(e));
     }
-    uint64_t roleId(const std::string& n) const { return s_.role(n)->objectId; }
+    uint64_t roleId(const std::string& n) const { return s_.roleByName(ns_, n)->objectId; }
     uint64_t next() const { return events_.size(); }
     std::vector<SecurityEvent> take() { return std::move(events_); }
 private:
+    uint16_t formatVer_;
+    uint32_t ns_ = 0;
     SecurityState s_;
     std::vector<SecurityEvent> events_;
 };
@@ -92,6 +98,30 @@ std::vector<SecurityEvent> goldenScriptV1() {
     b.emit(RevokeRoleOps{b.roleId("world_server"), "world_server"}, "ws1", "REVOKE ROLE world_server FROM ws1;");
     b.emit(DropRoleOps{}, "world_server", "DROP ROLE world_server;");
     b.emit(DropUserOps{}, "ws1", "DROP USER ws1;");
+    return b.take();
+}
+
+std::vector<SecurityEvent> goldenScriptV2() {
+    Builder b(kFormatV2);
+    const GrantSpec readT      = spec(Operation::Read, ResourceType::Topic, PatternKind::Prefix, "t");
+    const GrantSpec truncT     = spec(Operation::Truncate, ResourceType::Topic, PatternKind::Exact, "t1");
+    const GrantSpec adminNs    = spec(Operation::Admin, ResourceType::Namespace, PatternKind::Exact, "arena");
+    const GrantSpec dropCluster = spec(Operation::Drop, ResourceType::Cluster, PatternKind::Exact, "");
+    BootstrapOps boot{verifierAt(b.next())};
+    for (std::size_t i = 0; i < boot.fakeSaltSeed.size(); ++i) boot.fakeSaltSeed[i] = static_cast<uint8_t>(0x60 + i);
+    b.emit(boot, "admin", "BOOTSTRAP USER admin WITH PASSWORD '<redacted>';");                      // 0  (default)
+    b.emit(CreateUserOps{verifierAt(b.next())}, "alice", "CREATE USER alice WITH PASSWORD '<redacted>';");   // 1  (default)
+    b.emit(GrantOps{GranteeKind::User, dropCluster}, "alice", "GRANT DROP ON CLUSTER TO alice;");   // 2  (default)
+    b.inNs(1);
+    b.emit(CreateUserOps{verifierAt(b.next())}, "alice", "CREATE USER alice WITH PASSWORD '<redacted>';");   // 3  the same name, namespace 1
+    b.emit(CreateRoleOps{}, "ops", "CREATE ROLE ops;");                                              // 4
+    b.emit(GrantOps{GranteeKind::Role, readT}, "ops", "GRANT READ ON TOPIC PREFIX 't' TO ROLE ops;");   // 5
+    b.emit(GrantOps{GranteeKind::Role, adminNs}, "ops", "GRANT ADMIN ON NAMESPACE 'arena' TO ROLE ops;");   // 6
+    b.emit(GrantRoleOps{b.roleId("ops"), "ops"}, "alice", "GRANT ROLE ops TO alice;");               // 7
+    b.emit(GrantOps{GranteeKind::User, truncT}, "alice", "GRANT TRUNCATE ON TOPIC 't1' TO alice;");   // 8
+    b.emit(AlterUserOps{AddPassword{verifierAt(b.next())}}, "alice", "ALTER USER alice ADD PASSWORD '<redacted>';");   // 9
+    b.emit(RevokeRoleOps{b.roleId("ops"), "ops"}, "alice", "REVOKE ROLE ops FROM alice;");           // 10
+    b.emit(DropUserOps{}, "alice", "DROP USER alice;");                                              // 11
     return b.take();
 }
 

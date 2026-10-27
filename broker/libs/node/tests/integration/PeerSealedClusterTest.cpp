@@ -5,7 +5,7 @@
 #include "support/SecurityBrokerCluster.h"
 
 #include <rune/node/EmbeddedDriver.h>
-#include <rune/node/RoleCounter.h>
+#include <rune/node/RuneMetrics.h>
 #include <rune/peerlink/ClusterKeys.h>
 #include <rune/peerlink/PeerLinkMessages.h>
 

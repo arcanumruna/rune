@@ -2645,9 +2645,7 @@ int PartitionReplica::doWork(int64_t nowNs)
             // ~keepaliveNs (else the follower stalls behind a dropped push until ISR
             // eviction — the InSync-stall collapse), yet not so fast it spins an idle
             // follower.  Capped at 20 ms and always << replicaLagMaxMs (ISR-safe).
-            const int64_t keepaliveNs = std::clamp<int64_t>(
-                (cfg_.replicaLagMaxMs * 1'000'000LL) / 4,
-                cfg_.fetchIntervalNs, 20'000'000LL);
+            const int64_t keepaliveNs = followerKeepaliveNs(cfg_.replicaLagMaxMs, cfg_.fetchIntervalNs);
             const bool wedged = wedgedAtOffset_ >= 0 ||
                                 std::holds_alternative<Refused>(divergenceGuard_);   // (wedge cleared above if LEO moved)
             const FollowerSync::State fsPrev = followerSync_.state();

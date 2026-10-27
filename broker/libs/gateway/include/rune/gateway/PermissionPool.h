@@ -93,7 +93,15 @@ public:
 
     /// The shared table of `grants` (sorted, unique - rune::security::effectiveGrants), compiled against `index` only
     /// when no live entry has that exact set.  Full pool (kMaxTables distinct live sets): a deny-all ref (fail closed).
-    [[nodiscard]] PermissionRef acquire(std::vector<rune::security::GrantSpec> grants, const ObjectIndex& index);
+    /// `nsId`: the session's namespace - part of the key (the same grants in two namespaces are two tables).
+    /// `nsName`: that namespace's name, for the namespace-admin implication (PermissionTable::compile, plan D11).  A
+    /// namespace's name never changes, so it is a function of `nsId` and needs no place in the key.
+    [[nodiscard]] PermissionRef acquire(std::vector<rune::security::GrantSpec> grants, uint32_t nsId, const ObjectIndex& index,
+                                        std::string_view nsName = {});
+    /// The `default` namespace (nsId 0).
+    [[nodiscard]] PermissionRef acquire(std::vector<rune::security::GrantSpec> grants, const ObjectIndex& index) {
+        return acquire(std::move(grants), 0, index);
+    }
 
     /// A topic / view appeared / disappeared: every LIVE table once.  `f(id, table, beforeWrite, afterWrite)` sees
     /// each table's WRITE bit of `objectId` before and after (the shipping hook patches the ones that changed).
@@ -126,10 +134,11 @@ private:
     struct Entry {
         std::vector<rune::security::GrantSpec> key;
         uint64_t        hash = 0;
+        uint32_t        nsId = 0;
         PermissionTable table;
         uint32_t        refs = 0;
     };
-    static uint64_t hashOf_(std::span<const rune::security::GrantSpec>) noexcept;
+    static uint64_t hashOf_(std::span<const rune::security::GrantSpec>, uint32_t nsId) noexcept;
     void addRef_(uint32_t id) noexcept { ++entries_[id]->refs; }
     void release_(uint32_t id) noexcept;
 

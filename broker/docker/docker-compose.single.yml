@@ -39,6 +39,8 @@ services:
         # part of this feature, so it is NOT worktreed under se-worktrees/ —
         # ../../flight-recorder resolves via a local symlink to the canonical checkout.
         flight-recorder: ${FLIGHT_RECORDER_DIR:-../../../flight-recorder}
+        # arcanum-metrics: header-only metrics lib (include/); the Dockerfile COPYs --from=arcanum-metrics.
+        arcanum-metrics: ${ARCANUM_METRICS_DIR:-../../../arcanum-metrics}
         # rune-codec (0a): compiled sibling lib (src/ + include/) linked into rune_node
         rune-codec: ../../codec
         # rune-crypto (client<->broker TLS/AEAD, Task 5/7): compiled sibling lib

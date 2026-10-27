@@ -24,20 +24,20 @@ namespace cd = rune::codec;
 namespace {
 
 // ── field-count pins: a structured binding must name EVERY member ──────────────────
-constexpr std::size_t kTopicObjectFields = 9;
+constexpr std::size_t kTopicObjectFields = 10;   // + nsId (namespaces): not in the frozen v1 fingerprint, mixed in by CatalogFingerprintV2
 constexpr std::size_t kTopicConfigFields = 14;
 constexpr std::size_t kSchemaStateFields = 6;
-constexpr std::size_t kViewObjectFields  = 4;
+constexpr std::size_t kViewObjectFields  = 5;
 constexpr std::size_t kViewDefFields     = 8;
-constexpr std::size_t kTombstoneFields   = 4;
+constexpr std::size_t kTombstoneFields   = 5;
 [[maybe_unused]] void pinFieldCounts(const rc::TopicObject& t, const rc::TopicConfig& c, const rc::SchemaState& s,
                                      const rc::ViewObject& v, const rc::ViewDef& d, const rc::Tombstone& x) {
-    [[maybe_unused]] const auto& [t1, t2, t3, t4, t5, t6, t7, t8, t9] = t;                              // 9
+    [[maybe_unused]] const auto& [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10] = t;                      // 10
     [[maybe_unused]] const auto& [c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14] = c;     // 14
     [[maybe_unused]] const auto& [s1, s2, s3, s4, s5, s6] = s;                                          // 6
-    [[maybe_unused]] const auto& [v1, v2, v3, v4] = v;                                                  // 4
+    [[maybe_unused]] const auto& [v1, v2, v3, v4, v5] = v;                                           // 5
     [[maybe_unused]] const auto& [d1, d2, d3, d4, d5, d6, d7, d8] = d;                                  // 8
-    [[maybe_unused]] const auto& [x1, x2, x3, x4] = x;                                                  // 4
+    [[maybe_unused]] const auto& [x1, x2, x3, x4, x5] = x;                                           // 5
 }
 
 /// Definition: the field is part of what the object IS — changing it changes the fingerprint.
@@ -132,6 +132,7 @@ TEST(CatalogFingerprintRegression, TopicObjectEveryFieldIsCoveredAndIdsAreNot) {
         {"name", Role::Definition, [](rc::TopicObject& t) { t.name = "npcs"; }},
         {"version", Role::Definition, [](rc::TopicObject& t) { t.version = 4; }},
         {"topicId", Role::Id, [](rc::TopicObject& t) { t.topicId = 42; }},
+        {"nsId", Role::Id, [](rc::TopicObject& t) { t.nsId = 7; }},   // the v1 fingerprint is frozen; v2 mixes the nsId in
         {"partitions", Role::Definition, [](rc::TopicObject& t) { t.partitions = 5; }},
         {"replicationFactor", Role::Definition, [](rc::TopicObject& t) { t.replicationFactor = 1; }},
         {"persistence", Role::Definition, [](rc::TopicObject& t) { t.persistence = rc::Persistence::Transient; }},
@@ -194,6 +195,7 @@ TEST(CatalogFingerprintRegression, EveryAttributeOfTheEvolvingDescriptorIsCovere
 TEST(CatalogFingerprintRegression, ViewObjectEveryFieldIsCoveredAndIdsAreNot) {
     const std::vector<Row<rc::ViewObject>> rows = {
         {"objectId", Role::Id, [](rc::ViewObject& v) { v.objectId = 99; }},
+        {"nsId", Role::Id, [](rc::ViewObject& v) { v.nsId = 7; }},
         {"name", Role::Definition, [](rc::ViewObject& v) { v.name = "sums"; }},
         {"version", Role::Definition, [](rc::ViewObject& v) { v.version = 3; }},
         {"def", Role::Definition, [](rc::ViewObject& v) { v.def.sinkPartitions = 7; }},   // per field: below
@@ -239,6 +241,7 @@ TEST(CatalogFingerprintRegression, EveryAttributeOfTheViewOutputDescriptorIsCove
 TEST(CatalogFingerprintRegression, TombstoneEveryFieldIsCoveredAndIdsAreNot) {
     const std::vector<Row<rc::Tombstone>> rows = {
         {"objectId", Role::Id, [](rc::Tombstone& t) { t.objectId = 99; }},
+        {"nsId", Role::Id, [](rc::Tombstone& t) { t.nsId = 7; }},
         {"name", Role::Definition, [](rc::Tombstone& t) { t.name = "y"; }},
         {"finalVersion", Role::Definition, [](rc::Tombstone& t) { t.finalVersion = 4; }},
         {"wasView", Role::Definition, [](rc::Tombstone& t) { t.wasView = true; }},

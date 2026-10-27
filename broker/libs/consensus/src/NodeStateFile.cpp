@@ -49,6 +49,19 @@ NodeStateFile::NodeStateFile(std::string path, int fileSyncLevel)
         throw std::system_error(errno, std::system_category(),
                                 "NodeStateFile: ftruncate " + path_);
     }
+#if defined(__linux__)
+    // Back the page with a real block before mapping it: on a full filesystem a
+    // sparse page faults with SIGBUS on the first store; this fails the open instead.
+    {
+        int rc;
+        do { rc = ::posix_fallocate(fd_, 0, static_cast<off_t>(kFileSize)); } while (rc == EINTR);
+        if (rc != 0) {
+            ::close(fd_);
+            throw std::system_error(rc, std::system_category(),
+                                    "NodeStateFile: fallocate " + path_);
+        }
+    }
+#endif
 
     // Map the region.
     void* p = ::mmap(nullptr, kFileSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);

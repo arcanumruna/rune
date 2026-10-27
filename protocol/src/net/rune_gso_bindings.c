@@ -57,7 +57,10 @@
  * a full cache evicts the entry closest to expiry. */
 #define RUNE_GSO_PMTU_CACHE   8
 #define RUNE_GSO_PMTU_HOLD_NS (10LL * 1000 * 1000 * 1000)
-#define RUNE_GSO_PATH_MTU_COUNTER_TYPE_ID 1000222   /* Aeron counter "rune_gso_path_mtu_fallbacks" (review B-I2) */
+/* Aeron counter "rune_gso_path_mtu_fallbacks" (review B-I2), a driver counter in cnc.dat.  Its id stays outside
+ * the Rune metric ids 1000201-1000241 (rune/node/RuneMetrics.h): it used to be 1000222, the storage-gate id, so a
+ * reader matching on type id alone could take one for the other. */
+#define RUNE_GSO_PATH_MTU_COUNTER_TYPE_ID 1000301
 
 struct rune_gso_bindings_stct
 {

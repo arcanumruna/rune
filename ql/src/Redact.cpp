@@ -30,7 +30,7 @@ const char* opText(SecOp o) noexcept {
         case SecOp::Read: return "READ";       case SecOp::Write: return "WRITE";
         case SecOp::Create: return "CREATE";   case SecOp::Alter: return "ALTER";
         case SecOp::Drop: return "DROP";       case SecOp::Describe: return "DESCRIBE";
-        case SecOp::Admin: return "ADMIN";
+        case SecOp::Admin: return "ADMIN";     case SecOp::Truncate: return "TRUNCATE";
     }
     return "?";
 }
@@ -43,9 +43,11 @@ std::string resource(const SecPattern& p) {
         case SecResource::View: break;
         case SecResource::Group: break;
         case SecResource::TransactionalId: break;
+        case SecResource::Namespace: break;
     }
     const char* t = p.type == SecResource::Topic ? "TOPIC" : p.type == SecResource::View ? "VIEW"
-                  : p.type == SecResource::Group ? "GROUP" : "TRANSACTIONAL_ID";
+                  : p.type == SecResource::Group ? "GROUP" : p.type == SecResource::Namespace ? "NAMESPACE"
+                  : "TRANSACTIONAL_ID";
     return std::string(t) + (p.prefix ? " PREFIX " + quoted(p.name) : " " + name(p.name));
 }
 

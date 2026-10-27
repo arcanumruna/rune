@@ -11,15 +11,15 @@ TEST(SecurityApplyV1Regression, CreateUserThenTwoPasswordsAtMost) {
     auto third = sc.run(rs::AlterUserOps{rs::AddPassword{v(3)}}, "ws1");
     ASSERT_FALSE(third.has_value());
     EXPECT_EQ(third.error().refusal, rs::Refusal::TooManyPasswords);
-    EXPECT_EQ(sc.s.user("ws1")->verifiers.size(), 2u);
-    EXPECT_EQ(sc.s.user("ws1")->version, 2u) << "a refused event changes nothing";
+    EXPECT_EQ(sc.s.userByName(rune::catalog::kDefaultNsId, "ws1")->verifiers.size(), 2u);
+    EXPECT_EQ(sc.s.userByName(rune::catalog::kDefaultNsId, "ws1")->version, 2u) << "a refused event changes nothing";
 }
 
 TEST(SecurityApplyV1Regression, DropPasswordNumbersByAgeAndNeverDropsTheLast) {
     Script sc;
     sc.run(rs::CreateUserOps{v(1)}, "ws1"); sc.run(rs::AlterUserOps{rs::AddPassword{v(2)}}, "ws1");
     ASSERT_TRUE(sc.run(rs::AlterUserOps{rs::DropPassword{1}}, "ws1").has_value());
-    EXPECT_EQ(sc.s.user("ws1")->verifiers.front().salt.front(), 2) << "1 = the oldest (D6)";
+    EXPECT_EQ(sc.s.userByName(rune::catalog::kDefaultNsId, "ws1")->verifiers.front().salt.front(), 2) << "1 = the oldest (D6)";
     auto last = sc.run(rs::AlterUserOps{rs::DropPassword{1}}, "ws1");
     EXPECT_EQ(last.error().refusal, rs::Refusal::LastPassword);
     EXPECT_EQ(sc.run(rs::AlterUserOps{rs::DropPassword{2}}, "ws1").error().refusal, rs::Refusal::NoSuchPassword);
@@ -29,8 +29,8 @@ TEST(SecurityApplyV1Regression, SessionEffectPerKindIsTheDecisionTable) {
     Script sc;
     EXPECT_EQ(sc.run(rs::CreateUserOps{v(1)}, "ws1")->effect, rs::SessionEffect::None);
     EXPECT_EQ(sc.run(rs::CreateRoleOps{}, "world")->effect, rs::SessionEffect::None);
-    const auto& ws1 = *sc.s.user("ws1");
-    auto gr = sc.run(rs::GrantRoleOps{sc.s.role("world")->objectId, "world"}, "ws1");
+    const auto& ws1 = *sc.s.userByName(rune::catalog::kDefaultNsId, "ws1");
+    auto gr = sc.run(rs::GrantRoleOps{sc.s.roleByName(rune::catalog::kDefaultNsId, "world")->objectId, "world"}, "ws1");
     EXPECT_EQ(gr->effect, rs::SessionEffect::Refresh);
     EXPECT_EQ(gr->affectedUsers, std::vector<uint64_t>{ws1.objectId});
     auto grant = sc.run(rs::GrantOps{rs::GranteeKind::Role, g(rs::Operation::Read, rs::ResourceType::Topic, rs::PatternKind::Prefix, "world.")}, "world");
@@ -42,7 +42,7 @@ TEST(SecurityApplyV1Regression, SessionEffectPerKindIsTheDecisionTable) {
     EXPECT_EQ(sc.run(rs::AlterUserOps{rs::EnableUser{}}, "ws1")->effect, rs::SessionEffect::None);
     auto dropRole = sc.run(rs::DropRoleOps{}, "world");
     EXPECT_EQ(dropRole->effect, rs::SessionEffect::Refresh);
-    EXPECT_TRUE(sc.s.user("ws1")->roles.empty()) << "membership removed with the role";
+    EXPECT_TRUE(sc.s.userByName(rune::catalog::kDefaultNsId, "ws1")->roles.empty()) << "membership removed with the role";
     EXPECT_EQ(sc.run(rs::DropUserOps{}, "ws1")->effect, rs::SessionEffect::Revoke);
 }
 
@@ -69,7 +69,7 @@ TEST(SecurityApplyV1Regression, BootstrapOnlyWhileNoEnabledAdminExists) {
     Script sc;
     auto b = sc.run(rs::BootstrapOps{v(1)}, "admin");
     ASSERT_TRUE(b.has_value());
-    EXPECT_TRUE(sc.s.user("admin")->mustChangePassword);
+    EXPECT_TRUE(sc.s.userByName(rune::catalog::kDefaultNsId, "admin")->mustChangePassword);
     EXPECT_TRUE(sc.s.hasSecurityAdmin());
     EXPECT_EQ(sc.run(rs::BootstrapOps{v(2)}, "admin2").error().refusal, rs::Refusal::AlreadyBootstrapped);
     sc.run(rs::AlterUserOps{rs::DisableUser{}}, "admin");
@@ -86,7 +86,7 @@ TEST(SecurityApplyV1Regression, FingerprintMismatchIsRefusedAndLeavesTheStateUnt
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().code, rs::ApplyError::Code::FingerprintMismatch);
     EXPECT_EQ(sc.s.digest(), before);
-    EXPECT_EQ(sc.s.user("ws1"), nullptr);
+    EXPECT_EQ(sc.s.userByName(rune::catalog::kDefaultNsId, "ws1"), nullptr);
 }
 
 TEST(SecurityApplyV1Regression, VersionsAndOffsetsAreChecked) {
@@ -111,10 +111,10 @@ TEST(SecurityApplyV1Regression, NamesAreValidatedAndNamespacesAreSeparate) {
 TEST(SecurityApplyV1Regression, ReusedNameGetsANewObjectId) {
     Script sc;
     sc.run(rs::CreateUserOps{v(1)}, "ws1");
-    const uint64_t first = sc.s.user("ws1")->objectId;
+    const uint64_t first = sc.s.userByName(rune::catalog::kDefaultNsId, "ws1")->objectId;
     sc.run(rs::DropUserOps{}, "ws1");
     sc.run(rs::CreateUserOps{v(1)}, "ws1");
-    EXPECT_NE(sc.s.user("ws1")->objectId, first);
+    EXPECT_NE(sc.s.userByName(rune::catalog::kDefaultNsId, "ws1")->objectId, first);
     EXPECT_EQ(sc.s.tombstones().size(), 1u);
 }
 TEST(SecurityApplyV1Regression, RefusedEventsNeverTouchTheStateNorTheOffset) {
@@ -130,9 +130,9 @@ TEST(SecurityApplyV1Regression, RefusedEventsNeverTouchTheStateNorTheOffset) {
 TEST(SecurityApplyV1Regression, UnsupportedFormatAndMalformedEventsAreRefusedByCode) {
     Script sc;
     auto e = sc.make(rs::CreateUserOps{v(1)}, "ws1");
-    e.formatVer = 2;
+    e.formatVer = 3;   // 1 and 2 have rules; 3 does not
     EXPECT_EQ(rs::apply(sc.s, e, 0).error().code, rs::ApplyError::Code::UnsupportedFormat);
-    e.formatVer = 1; e.kind = rs::EventKind::DropUser;   // kind disagrees with the ops
+    e.formatVer = 2; e.kind = rs::EventKind::DropUser;   // kind disagrees with the ops
     EXPECT_EQ(rs::apply(sc.s, e, 0).error().code, rs::ApplyError::Code::BadOps);
     EXPECT_EQ(sc.s.appliedOffset(), -1);
 }
@@ -140,11 +140,11 @@ TEST(SecurityApplyV1Regression, UnsupportedFormatAndMalformedEventsAreRefusedByC
 TEST(SecurityApplyV1Regression, RoleGrantAndMembershipLifecycle) {
     Script sc;
     sc.run(rs::CreateUserOps{v(1)}, "ws1"); sc.run(rs::CreateRoleOps{}, "world");
-    const uint64_t rid = sc.s.role("world")->objectId;
+    const uint64_t rid = sc.s.roleByName(rune::catalog::kDefaultNsId, "world")->objectId;
     EXPECT_EQ(sc.run(rs::GrantRoleOps{rid, "wrong"}, "ws1").error().refusal, rs::Refusal::UnknownRole) << "name must match the id";
     ASSERT_TRUE(sc.run(rs::GrantRoleOps{rid, "world"}, "ws1").has_value());
     EXPECT_EQ(sc.run(rs::GrantRoleOps{rid, "world"}, "ws1").error().refusal, rs::Refusal::AlreadyMember);
-    EXPECT_EQ(sc.s.membersOf(rid), std::vector<uint64_t>{sc.s.user("ws1")->objectId});
+    EXPECT_EQ(sc.s.membersOf(rid), std::vector<uint64_t>{sc.s.userByName(rune::catalog::kDefaultNsId, "ws1")->objectId});
     ASSERT_TRUE(sc.run(rs::RevokeRoleOps{rid, "world"}, "ws1").has_value());
     EXPECT_EQ(sc.run(rs::RevokeRoleOps{rid, "world"}, "ws1").error().refusal, rs::Refusal::NotMember);
     const auto rg = g(rs::Operation::Read, rs::ResourceType::Topic, rs::PatternKind::Exact, "t");
@@ -158,14 +158,14 @@ TEST(SecurityApplyV1Regression, RoleGrantAndMembershipLifecycle) {
 TEST(SecurityApplyV1Regression, DropRoleChangesMemberFingerprintsThroughTheDigestNotTheirVersions) {
     Script sc;
     sc.run(rs::CreateUserOps{v(1)}, "ws1"); sc.run(rs::CreateRoleOps{}, "world");
-    sc.run(rs::GrantRoleOps{sc.s.role("world")->objectId, "world"}, "ws1");
-    const uint32_t ver = sc.s.user("ws1")->version;
-    const uint64_t fpBefore = rs::fingerprintOf(*sc.s.user("ws1"), sc.s);
+    sc.run(rs::GrantRoleOps{sc.s.roleByName(rune::catalog::kDefaultNsId, "world")->objectId, "world"}, "ws1");
+    const uint32_t ver = sc.s.userByName(rune::catalog::kDefaultNsId, "ws1")->version;
+    const uint64_t fpBefore = rs::fingerprintOf(*sc.s.userByName(rune::catalog::kDefaultNsId, "ws1"), sc.s);
     auto dr = sc.run(rs::DropRoleOps{}, "world");
     ASSERT_TRUE(dr.has_value());
-    EXPECT_EQ(dr->affectedUsers, std::vector<uint64_t>{sc.s.user("ws1")->objectId});
-    EXPECT_EQ(sc.s.user("ws1")->version, ver);
-    EXPECT_NE(rs::fingerprintOf(*sc.s.user("ws1"), sc.s), fpBefore);
+    EXPECT_EQ(dr->affectedUsers, std::vector<uint64_t>{sc.s.userByName(rune::catalog::kDefaultNsId, "ws1")->objectId});
+    EXPECT_EQ(sc.s.userByName(rune::catalog::kDefaultNsId, "ws1")->version, ver);
+    EXPECT_NE(rs::fingerprintOf(*sc.s.userByName(rune::catalog::kDefaultNsId, "ws1"), sc.s), fpBefore);
     ASSERT_EQ(sc.s.tombstones().size(), 1u);
     EXPECT_TRUE(sc.s.tombstones()[0].wasRole);
 }
@@ -225,7 +225,7 @@ TEST(SecurityApplyV1Regression, FakeSaltSeedIsSetOnceByTheFirstBootstrapRegressi
     Script a, b;
     rs::BootstrapOps x{v(1)}, y{v(1)}; x.fakeSaltSeed.fill(1); y.fakeSaltSeed.fill(2);
     a.run(x, "admin"); b.run(y, "admin");
-    EXPECT_EQ(rs::fingerprintOf(*a.s.user("admin"), a.s), rs::fingerprintOf(*b.s.user("admin"), b.s));
+    EXPECT_EQ(rs::fingerprintOf(*a.s.userByName(rune::catalog::kDefaultNsId, "admin"), a.s), rs::fingerprintOf(*b.s.userByName(rune::catalog::kDefaultNsId, "admin"), b.s));
     EXPECT_NE(a.s.digest(), b.s.digest());
     EXPECT_NE(a.s.digest(), emptyDigest);
 }
@@ -266,7 +266,7 @@ TEST(SecurityApplyV1Adversarial, DropRoleWithManyMembersRemovesEveryMembershipAn
     };
     for (const char* u : {"m1", "m2", "m3", "outsider"}) ASSERT_TRUE(run(rs::CreateUserOps{v(1)}, u));
     ASSERT_TRUE(run(rs::CreateRoleOps{}, "ops"));
-    const uint64_t roleId = sc.s.role("ops")->objectId;
+    const uint64_t roleId = sc.s.roleByName(rune::catalog::kDefaultNsId, "ops")->objectId;
     const rs::GrantSpec admin = g(rs::Operation::Admin, rs::ResourceType::Cluster, rs::PatternKind::Exact, "");
     const rs::GrantSpec read = g(rs::Operation::Read, rs::ResourceType::Topic, rs::PatternKind::Prefix, "ops.");
     ASSERT_TRUE(run(rs::GrantOps{rs::GranteeKind::Role, admin}, "ops"));
@@ -274,7 +274,7 @@ TEST(SecurityApplyV1Adversarial, DropRoleWithManyMembersRemovesEveryMembershipAn
     std::vector<uint64_t> members;
     for (const char* u : {"m3", "m1", "m2"}) {   // granted out of id order
         ASSERT_TRUE(run(rs::GrantRoleOps{roleId, "ops"}, u));
-        members.push_back(sc.s.user(u)->objectId);
+        members.push_back(sc.s.userByName(rune::catalog::kDefaultNsId, u)->objectId);
     }
     std::sort(members.begin(), members.end());
     ASSERT_TRUE(sc.s.hasSecurityAdmin()) << "the role makes its members admins";
@@ -284,19 +284,19 @@ TEST(SecurityApplyV1Adversarial, DropRoleWithManyMembersRemovesEveryMembershipAn
     EXPECT_EQ(dr->effect, rs::SessionEffect::Refresh);
     EXPECT_EQ(dr->affectedUsers, members) << "every member's sessions are refreshed";
     for (const char* u : {"m1", "m2", "m3", "outsider"}) {
-        EXPECT_FALSE(sc.s.user(u)->roles.contains(roleId)) << u << " still holds the dropped role";
-        const auto eff = rs::effectiveGrants(sc.s, sc.s.user(u)->objectId);
+        EXPECT_FALSE(sc.s.userByName(rune::catalog::kDefaultNsId, u)->roles.contains(roleId)) << u << " still holds the dropped role";
+        const auto eff = rs::effectiveGrants(sc.s, sc.s.userByName(rune::catalog::kDefaultNsId, u)->objectId);
         EXPECT_EQ(std::find(eff.begin(), eff.end(), admin), eff.end()) << u << " kept the dropped role's ADMIN grant";
         EXPECT_EQ(std::find(eff.begin(), eff.end(), read), eff.end()) << u << " kept the dropped role's READ grant";
     }
     EXPECT_FALSE(sc.s.hasSecurityAdmin()) << "no admin survives the drop of the only admin role";
 
     ASSERT_TRUE(run(rs::CreateRoleOps{}, "ops"));
-    const uint64_t newRoleId = sc.s.role("ops")->objectId;
+    const uint64_t newRoleId = sc.s.roleByName(rune::catalog::kDefaultNsId, "ops")->objectId;
     EXPECT_NE(newRoleId, roleId);
     for (const char* u : {"m1", "m2", "m3"}) {
-        EXPECT_FALSE(sc.s.user(u)->roles.contains(newRoleId)) << u << " holds the re-created role";
-        EXPECT_TRUE(sc.s.user(u)->roles.empty()) << u;
+        EXPECT_FALSE(sc.s.userByName(rune::catalog::kDefaultNsId, u)->roles.contains(newRoleId)) << u << " holds the re-created role";
+        EXPECT_TRUE(sc.s.userByName(rune::catalog::kDefaultNsId, u)->roles.empty()) << u;
     }
     auto stale = run(rs::GrantRoleOps{roleId, "ops"}, "m1");
     ASSERT_FALSE(stale.has_value());

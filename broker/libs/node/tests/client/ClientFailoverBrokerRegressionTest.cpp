@@ -350,9 +350,11 @@ DrClientResult runDrClient(ThreeNodes& c, rc::ClientConfig cfg, const rc::TopicS
         }
     }
     std::vector<std::atomic<int>> seen(static_cast<std::size_t>(records));   // delivery count per seq (agent thread)
+    // Function scope: the handler may still run after unsubscribe() until finished() (Subscription.h), so all it
+    // captures outlives closeBounded() below, which ends the duty thread.
+    std::atomic<int> mine{0};
+    const std::string tag = "cid=" + std::to_string(cid) + ";";
     {
-        std::atomic<int> mine{0};
-        const std::string tag = "cid=" + std::to_string(cid) + ";";
         std::vector<rc::Subscription> subs;
         rc::SubscribeOptions o;
         o.from = rc::From::earliest();
@@ -369,6 +371,12 @@ DrClientResult runDrClient(ThreeNodes& c, rc::ClientConfig cfg, const rc::TopicS
             std::this_thread::sleep_for(2ms);
         res.delivered = mine.load();
         for (auto& s : subs) s.unsubscribe();
+        for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline;) {
+            bool all = true;
+            for (const auto& s : subs) all = all && s.finished();
+            if (all) break;
+            std::this_thread::sleep_for(2ms);
+        }
     }
     if (res.produced != records || res.delivered != records) {
         std::ostringstream d;

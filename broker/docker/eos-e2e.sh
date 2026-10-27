@@ -25,6 +25,7 @@
 # Usage:  bash broker/docker/eos-e2e.sh      (from any directory; the monorepo is found from this file's location)
 # Environment (all optional):
 #   FLIGHT_RECORDER_DIR   the flight-recorder checkout (default: <monorepo>/../flight-recorder)
+#   ARCANUM_METRICS_DIR   the arcanum-metrics checkout (default: <monorepo>/../arcanum-metrics)
 #   EOS_E2E_N             records (default 200000)
 #   E2E_LOG_DIR           when set, the brokers' and the probes' logs are kept there at teardown
 #   E2E_WORK_DIR          scratch dir shared with the client container as /work (default: a mktemp dir under <broker>, removed at teardown; yours is kept)
@@ -42,6 +43,8 @@ BROKER_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECTS="$(cd "${BROKER_REPO}/.." && pwd)"
 # flight-recorder is its own repo, checked out next to the monorepo (compose additional_contexts read FLIGHT_RECORDER_DIR).
 export FLIGHT_RECORDER_DIR="${FLIGHT_RECORDER_DIR:-${PROJECTS}/../flight-recorder}"
+# arcanum-metrics (header-only) is its own repo too; compose additional_contexts read ARCANUM_METRICS_DIR.
+export ARCANUM_METRICS_DIR="${ARCANUM_METRICS_DIR:-${PROJECTS}/../arcanum-metrics}"
 CLIENT_REPO="${PROJECTS}/client-cpp"
 COMPOSE_PROJECT="rune-eos-e2e"
 NETWORK="${COMPOSE_PROJECT}_default"
@@ -90,6 +93,7 @@ txt()  { local t="$1"; shift; docker exec "${TOOLS}" timeout "${t}" "$@"; }
 now_s() { date +%s; }
 
 [ -d "${FLIGHT_RECORDER_DIR}" ] || fail "missing flight-recorder checkout (set FLIGHT_RECORDER_DIR)"
+[ -d "${ARCANUM_METRICS_DIR}" ] || fail "missing arcanum-metrics checkout (set ARCANUM_METRICS_DIR)"
 for d in protocol codec crypto ql client-cpp; do
     [ -d "${PROJECTS}/${d}" ] || fail "missing ../${d}"
 done

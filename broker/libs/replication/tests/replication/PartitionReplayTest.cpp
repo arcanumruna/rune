@@ -41,6 +41,7 @@ static std::string makeUniqSuffix() {
            std::to_string(ts);
 }
 
+namespace {   // internal linkage: other TUs of rune_replication_tests define TempDir/TempFile (ODR)
 struct TempDir {
     std::string path;
     explicit TempDir(const std::string& suffix) {
@@ -67,6 +68,7 @@ struct TempFile {
         std::filesystem::remove(path, ec);
     }
 };
+}  // namespace
 
 // Build a proper RecordBatch for a given offset and fill byte.
 static std::vector<uint8_t> makeBatch(int64_t offset, uint8_t fill,

@@ -551,7 +551,7 @@ std::expected<std::vector<uint8_t>, std::string> remappedViewPlan(const cat::Vie
     if (!plan) return std::unexpected("the event's normalized view plan does not decode");
     std::vector<int32_t> ids;
     for (const std::string& name : def.sourceNames) {
-        const cat::TopicObject* t = target.topicByName(name);
+        const cat::TopicObject* t = target.topicByName(rune::catalog::kDefaultNsId, name);
         if (t == nullptr) return std::unexpected("source topic '" + name + "' does not exist on the target");
         ids.push_back(t->topicId);
     }
@@ -564,6 +564,8 @@ std::expected<std::vector<uint8_t>, std::string> remappedViewPlan(const cat::Vie
 std::optional<std::string> issueEvent(rc::Client& c, const cat::CatalogState& st, const cat::RecordedEvent& src,
                                       const rc::DdlOptions& ddl, std::chrono::milliseconds t) {
     const cat::CatalogEvent& e = src.event;
+    if (e.nsId != 0 && static_cast<uint16_t>(e.kind) < cat::kReservedKindFirst)   // the client DDL addresses `default` only
+        return "an event of namespace " + std::to_string(e.nsId) + " cannot be replayed yet";
     return std::visit(
         [&](const auto& o) -> std::optional<std::string> {
             using T = std::decay_t<decltype(o)>;
@@ -581,7 +583,7 @@ std::optional<std::string> issueEvent(rc::Client& c, const cat::CatalogState& st
                                                     topic, ddl, t);
                 return failureOf(r.errorCode, r.detail);
             } else if constexpr (std::is_same_v<T, cat::CreateSchemaOps>) {
-                const cat::TopicObject* top = st.topicByName(e.objectName);
+                const cat::TopicObject* top = st.topicByName(e.nsId, e.objectName);
                 if (top == nullptr) return "topic '" + e.objectName + "' does not exist on the target";
                 const auto r = c.defineTopicAndWait(
                     e.objectName, static_cast<uint32_t>(top->partitions), o.schema.keyField,
@@ -589,7 +591,7 @@ std::optional<std::string> issueEvent(rc::Client& c, const cat::CatalogState& st
                     o.schema.validate, clientPersistence(top->persistence), {}, ddl, t);
                 return failureOf(r.errorCode, r.detail);
             } else if constexpr (std::is_same_v<T, cat::AlterSchemaOps>) {
-                const cat::TopicObject* top = st.topicByName(e.objectName);
+                const cat::TopicObject* top = st.topicByName(e.nsId, e.objectName);
                 if (top == nullptr || !top->schema) return "topic '" + e.objectName + "' has no schema on the target";
                 // F20: the event stores durable tags; the target holds the same definition, so they map to its names.
                 auto ops = cat::unresolveAlterOps(*top->schema, std::span<const cat::ResolvedAlterOp>(o.ops));
@@ -627,10 +629,13 @@ std::optional<std::string> issueEvent(rc::Client& c, const cat::CatalogState& st
             } else if constexpr (std::is_same_v<T, cat::DropTopicOps>) {
                 const auto r = c.dropTopicAndWait(e.objectName, ddl, t);
                 return failureOf(r.errorCode, r.detail);
-            } else {
-                static_assert(std::is_same_v<T, cat::DropViewOps>);
+            } else if constexpr (std::is_same_v<T, cat::DropViewOps>) {
                 const auto r = c.dropViewAndWait(e.objectName, ddl, t);
                 return failureOf(r.errorCode, r.detail);
+            } else {   // Namespace events are not replayed: namespace DDL is cluster-admin only, issued with `rune namespace`
+                static_assert(std::is_same_v<T, cat::NamespaceCreatedOps> || std::is_same_v<T, cat::NamespaceLimitsSetOps> ||
+                              std::is_same_v<T, cat::NamespaceStateChangedOps> || std::is_same_v<T, cat::NamespaceDeletedOps>);
+                return std::string("a namespace event (") + std::string(cat::kindName(e.kind)) + ") cannot be replayed yet";
             }
         },
         e.ops);

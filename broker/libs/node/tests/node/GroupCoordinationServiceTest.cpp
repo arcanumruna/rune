@@ -3378,11 +3378,14 @@ TEST_F(GroupJoinLateTopic, AnEmptiedGroupForgetsItsLateIdsAndNeverRebalancesANew
     const std::size_t ll = encodeLeaveGroup(req_, 1, ++corr_, g, member);
     ASSERT_EQ(decodeLeaveErrorCode(out_, service_->handleLeaveGroup(req_, ll, clock_, out_, kBufSize)),
               static_cast<int16_t>(pc::ErrorCode::OK));
-    auto& gc = service_->coordinator(g);
-    ASSERT_EQ(gc.state(), GroupState::Empty);
+    ASSERT_EQ(service_->coordinator(g).state(), GroupState::Empty);
+    const uint64_t pruned = service_->groupsPruned();
     for (int i = 0; i < 5; ++i) { clock_ += kStep; service_->doWork(clock_); }
+    // #214 prunes the Empty group (its coordinator is destroyed), so no reference to it may be held across doWork.
+    EXPECT_EQ(service_->groupsPruned(), pruned + 1) << "the emptied group is dropped";
     EXPECT_EQ(service_->unassignedJoinTopicsForTest(g), 0u) << "an empty group has nothing to assign";
-    (void)stableMember(g);   // a new member, only the real topic
+    (void)stableMember(g);   // a new member, only the real topic: a fresh coordinator
+    auto& gc = service_->coordinator(g);
     const int32_t gen = gc.generationId();
     createLate();
     for (int i = 0; i < 200; ++i) { clock_ += kStep; service_->doWork(clock_); }

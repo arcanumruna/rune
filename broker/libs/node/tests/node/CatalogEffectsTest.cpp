@@ -17,6 +17,7 @@
 //   - BINDING (Task 7 review): every effect applied TWICE leaves the same final
 //     state — never a duplicate, an error or a double placement.
 #include <rune/aeronutil/testing/FreePort.h>
+#include <rune/node/NamespacePaths.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
 #include <rune/view/PlanCompiler.h>
@@ -339,7 +340,7 @@ TEST_P(CatalogEffectsRegression, CreateBehindDropWaitsForTheDirRenameAndStartsEm
     ASSERT_TRUE(n.awaitServes(1, 10s));
     EXPECT_EQ(n.topicIdForName("t"), 1) << "the reused name names the NEW object id";
     EXPECT_EQ(n.topicState(0), rune::gateway::TopicRegistry::TopicState::Dropped);
-    EXPECT_TRUE(fs::exists(n.dataDir() / "dropped" / "0.t"))
+    EXPECT_TRUE(fs::exists(rune::node::droppedRoot(n.dataDir(), 0) / "0.t"))
         << "the old data was renamed away before the reused name was created";
     EXPECT_EQ(n.logEndOffset(1, 0), 0) << "the reused name starts EMPTY";
     EXPECT_TRUE(n.consumeFromEarliest(1, 0, 500ms).empty()) << "the old record is unreadable under the reused name";
@@ -347,8 +348,8 @@ TEST_P(CatalogEffectsRegression, CreateBehindDropWaitsForTheDirRenameAndStartsEm
     ASSERT_TRUE(n.produceSync(1, 0, "new-record"));
     EXPECT_EQ(n.logEndOffset(1, 0), 1);
     n.node()->holdDroppedDirPurgeForTest(false);
-    EXPECT_TRUE(n.awaitPathGone(n.dataDir() / "dropped" / "0.t", 10s)) << "purged by the admin thread";
-    EXPECT_TRUE(fs::exists(n.dataDir() / "topics" / "t" / "0")) << "the new topic's dir is untouched";
+    EXPECT_TRUE(n.awaitPathGone(rune::node::droppedRoot(n.dataDir(), 0) / "0.t", 10s)) << "purged by the admin thread";
+    EXPECT_TRUE(fs::exists(rune::node::topicsRoot(n.dataDir(), 0) / "t" / "0")) << "the new topic's dir is untouched";
 }
 
 // Fix-on-sight (Task 11, found by the over-the-wire AlterView): an AlterView posts
@@ -409,7 +410,7 @@ TEST_P(CatalogEffectsRegression, DropRemovesEveryPartitionsPlacementRegression) 
         << "every partition's placement is removed at commit";
     EXPECT_TRUE(SingleNode::awaitTrue([&] { return n.removalsPending() == 0; }, 10s))
         << "the removal committed: nothing left in flight (nothing stranded)";
-    EXPECT_TRUE(n.awaitPathGone(n.dataDir() / "topics" / "t", 10s)) << "its data was moved away (dropped/)";
+    EXPECT_TRUE(n.awaitPathGone(rune::node::topicsRoot(n.dataDir(), 0) / "t", 10s)) << "its data was moved away (dropped/)";
 }
 
 TEST_P(CatalogEffectsRegression, ConfigChangeReachesTheCleanerNotTheReplica) {
@@ -461,7 +462,7 @@ TEST_P(CatalogEffectsRegression, EveryEffectKindAppliedTwiceLeavesTheSameFinalSt
     n.applyDropTopic(0, "a");
     n.applyDropTopic(0, "a");
     ASSERT_TRUE(n.awaitTopicState(0, rune::gateway::TopicRegistry::TopicState::Dropped, 10s));
-    EXPECT_TRUE(SingleNode::awaitTrue([&] { return fs::exists(n.dataDir() / "dropped" / "0.a"); }, 10s));
+    EXPECT_TRUE(SingleNode::awaitTrue([&] { return fs::exists(rune::node::droppedRoot(n.dataDir(), 0) / "0.a"); }, 10s));
     EXPECT_TRUE(SingleNode::awaitTrue([&] { return n.placementsOf(0) == 0 && n.removalsPending() == 0; }, 10s));
     EXPECT_EQ(n.produceErrorCode(0, 0), kUnknownTopic);
     // A create re-posted after the drop (a stale effect) never resurrects the id.
@@ -471,8 +472,8 @@ TEST_P(CatalogEffectsRegression, EveryEffectKindAppliedTwiceLeavesTheSameFinalSt
     EXPECT_EQ(n.topicState(0), rune::gateway::TopicRegistry::TopicState::Dropped);
     EXPECT_EQ(n.placementsOf(0), 0u) << "a dropped id is never placed again";
     n.node()->holdDroppedDirPurgeForTest(false);
-    EXPECT_TRUE(n.awaitPathGone(n.dataDir() / "dropped" / "0.a", 10s));
-    EXPECT_FALSE(fs::exists(n.dataDir() / "topics" / "a")) << "renamed once, never re-created";
+    EXPECT_TRUE(n.awaitPathGone(rune::node::droppedRoot(n.dataDir(), 0) / "0.a", 10s));
+    EXPECT_FALSE(fs::exists(rune::node::topicsRoot(n.dataDir(), 0) / "a")) << "renamed once, never re-created";
 }
 
 // Fix round 1 (C1) + review I2 (the retire gate).  The cleaner HOLDS its view
@@ -496,8 +497,8 @@ TEST_P(CatalogEffectsRegression, CreateBehindDropSurvivesAHigherIdAndWaitsForThe
     // The gate holds while the cleaner has not acked the generation dropping t.
     for (int i = 0; i < 20; ++i) {
         std::this_thread::sleep_for(20ms);
-        ASSERT_TRUE(fs::exists(n.dataDir() / "topics" / "t" / "0")) << "renamed before every holder acked";
-        ASSERT_FALSE(fs::exists(n.dataDir() / "dropped" / "0.t"));
+        ASSERT_TRUE(fs::exists(rune::node::topicsRoot(n.dataDir(), 0) / "t" / "0")) << "renamed before every holder acked";
+        ASSERT_FALSE(fs::exists(rune::node::droppedRoot(n.dataDir(), 0) / "0.t"));
         ASSERT_EQ(n.heldDroppedLogs(0), 1u) << "the dropped topic's Log was freed before every holder acked";
         ASSERT_FALSE(n.node()->catalogTopicServesForTest(1)) << "the queued create ran before the rename";
     }
@@ -508,7 +509,7 @@ TEST_P(CatalogEffectsRegression, CreateBehindDropSurvivesAHigherIdAndWaitsForThe
     EXPECT_EQ(n.topicIdForName("t"), 1);
     EXPECT_EQ(n.heldDroppedLogs(0), 0u) << "released after the ack";
     EXPECT_EQ(n.logEndOffset(1, 0), 0) << "the reused name starts EMPTY";
-    EXPECT_TRUE(n.awaitPathGone(n.dataDir() / "dropped" / "0.t", 10s));
+    EXPECT_TRUE(n.awaitPathGone(rune::node::droppedRoot(n.dataDir(), 0) / "0.t", 10s));
 }
 
 // Fix round 1 (M4): on a case-insensitive filesystem (the macOS dev boxes) a
@@ -651,13 +652,13 @@ TEST_P(CatalogEffectsRegression, FailedDirRenameIsRetriedAndNeverDeletesInPlaceR
     n.applyCreateTopic(0, "t", 1);
     ASSERT_TRUE(n.awaitServes(0, 10s));
     ASSERT_TRUE(n.produceSync(0, 0, "r"));
-    { std::ofstream block(n.dataDir() / "dropped"); block << "x"; }   // dropped/ is a FILE: the rename fails
+    { std::ofstream block(rune::node::droppedRoot(n.dataDir(), 0)); block << "x"; }   // dropped/ is a FILE: the rename fails
     n.applyDropTopic(0, "t");
     ASSERT_TRUE(n.awaitTopicState(0, rune::gateway::TopicRegistry::TopicState::Dropped, 10s));
     std::this_thread::sleep_for(300ms);
-    EXPECT_TRUE(fs::exists(n.dataDir() / "topics" / "t" / "0")) << "never deleted in place";
-    fs::remove(n.dataDir() / "dropped");
-    EXPECT_TRUE(n.awaitPathGone(n.dataDir() / "topics" / "t", 15s)) << "the retried rename completed";
+    EXPECT_TRUE(fs::exists(rune::node::topicsRoot(n.dataDir(), 0) / "t" / "0")) << "never deleted in place";
+    fs::remove(rune::node::droppedRoot(n.dataDir(), 0));
+    EXPECT_TRUE(n.awaitPathGone(rune::node::topicsRoot(n.dataDir(), 0) / "t", 15s)) << "the retried rename completed";
 }
 
 INSTANTIATE_TEST_SUITE_P(Modes, CatalogEffectsRegression,

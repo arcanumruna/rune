@@ -12,11 +12,11 @@ TEST(SecurityFingerprintRegression, IdsAreNeverHashed) {
     Script a, b;   // same objects, created in the opposite order => different objectIds
     a.run(rs::CreateRoleOps{}, "R"); a.run(rs::CreateUserOps{v(1)}, "u");
     b.run(rs::CreateUserOps{v(1)}, "u"); b.run(rs::CreateRoleOps{}, "R");
-    a.run(rs::GrantRoleOps{a.s.role("R")->objectId, "R"}, "u");
-    b.run(rs::GrantRoleOps{b.s.role("R")->objectId, "R"}, "u");
-    ASSERT_NE(a.s.user("u")->objectId, b.s.user("u")->objectId);
-    EXPECT_EQ(rs::fingerprintOf(*a.s.user("u"), a.s), rs::fingerprintOf(*b.s.user("u"), b.s));
-    EXPECT_EQ(rs::fingerprintOf(*a.s.role("R")), rs::fingerprintOf(*b.s.role("R")));
+    a.run(rs::GrantRoleOps{a.s.roleByName(rune::catalog::kDefaultNsId, "R")->objectId, "R"}, "u");
+    b.run(rs::GrantRoleOps{b.s.roleByName(rune::catalog::kDefaultNsId, "R")->objectId, "R"}, "u");
+    ASSERT_NE(a.s.userByName(rune::catalog::kDefaultNsId, "u")->objectId, b.s.userByName(rune::catalog::kDefaultNsId, "u")->objectId);
+    EXPECT_EQ(rs::fingerprintOf(*a.s.userByName(rune::catalog::kDefaultNsId, "u"), a.s), rs::fingerprintOf(*b.s.userByName(rune::catalog::kDefaultNsId, "u"), b.s));
+    EXPECT_EQ(rs::fingerprintOf(*a.s.roleByName(rune::catalog::kDefaultNsId, "R")), rs::fingerprintOf(*b.s.roleByName(rune::catalog::kDefaultNsId, "R")));
     // the fingerprint an event carries is id-free too: the same CreateUser fingerprints equal under different ids
     EXPECT_NE(a.s.digest(), b.s.digest()) << "the digest covers ids (nextObjectId / apply order); object fingerprints do not";
 }
@@ -26,7 +26,7 @@ TEST(SecurityFingerprintRegression, EveryUserFieldChangesTheFingerprint) {
     sc.run(rs::CreateRoleOps{}, "A"); sc.run(rs::CreateRoleOps{}, "B");
     rs::UserObject base;
     base.objectId = 50; base.name = "u"; base.version = 3; base.enabled = true; base.mustChangePassword = false;
-    base.verifiers.push_back(v(1)); base.roles = {sc.s.role("A")->objectId}; base.grants = {rt()};
+    base.verifiers.push_back(v(1)); base.roles = {sc.s.roleByName(rune::catalog::kDefaultNsId, "A")->objectId}; base.grants = {rt()};
     const uint64_t f0 = rs::fingerprintOf(base, sc.s);
     std::set<uint64_t> seen{f0};
     auto expectFlip = [&](const char* what, auto mutate) {
@@ -44,8 +44,8 @@ TEST(SecurityFingerprintRegression, EveryUserFieldChangesTheFingerprint) {
     expectFlip("storedKey", [](auto& u) { u.verifiers[0].storedKey[63] ^= 1; });
     expectFlip("serverKey", [](auto& u) { u.verifiers[0].serverKey[0] ^= 1; });
     expectFlip("second verifier", [](auto& u) { u.verifiers.push_back(v(1)); });
-    expectFlip("a role name", [&](auto& u) { u.roles = {sc.s.role("B")->objectId}; });
-    expectFlip("role count", [&](auto& u) { u.roles.insert(sc.s.role("B")->objectId); });
+    expectFlip("a role name", [&](auto& u) { u.roles = {sc.s.roleByName(rune::catalog::kDefaultNsId, "B")->objectId}; });
+    expectFlip("role count", [&](auto& u) { u.roles.insert(sc.s.roleByName(rune::catalog::kDefaultNsId, "B")->objectId); });
     expectFlip("grant op", [](auto& u) { u.grants = {rt(rs::Operation::Write)}; });
     expectFlip("grant type", [](auto& u) { u.grants = {g(rs::Operation::Read, rs::ResourceType::View, rs::PatternKind::Exact, "t")}; });
     expectFlip("grant kind", [](auto& u) { u.grants = {g(rs::Operation::Read, rs::ResourceType::Topic, rs::PatternKind::Prefix, "t")}; });

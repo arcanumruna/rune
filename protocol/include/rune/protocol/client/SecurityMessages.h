@@ -320,12 +320,36 @@ inline std::optional<SecurityDdl> SecurityDdl::decode(const uint8_t* buf, std::s
     return s;
 }
 
-/// Issue #114: whether `m` is a user's change of its OWN credential (`self` = the session's user): ALTER USER <self>
-/// ADD / DROP / SET PASSWORD.
-[[nodiscard]] inline bool isOwnCredentialChange(const SecurityDdl& m, std::string_view self) noexcept {
-    return !self.empty() && m.kind == SecurityOpKind::AlterUser && m.name == self &&
+/// Issue #114: whether `m` changes a credential (ALTER USER <name> ADD / DROP / SET PASSWORD).
+[[nodiscard]] inline bool isCredentialChange(const SecurityDdl& m) noexcept {
+    return m.kind == SecurityOpKind::AlterUser &&
            (m.change == UserChangeKind::AddPassword || m.change == UserChangeKind::DropPassword ||
             m.change == UserChangeKind::SetPassword);
+}
+
+/// PR #642 review F1/F2: whether user name `name` (as a request names it: "local" = the session's namespace, or
+/// "ns/local") is the account `login` logged in as ("local" = `default`'s, or "ns/local").  Both sides compare the
+/// RESOLVED (namespace, local) pair, so 'alpha/alice' and alice are the same account for an alpha/alice session.
+/// A malformed name (empty part, two '/') is never anyone's own.
+[[nodiscard]] inline bool isOwnUserName(std::string_view name, std::string_view login) noexcept {
+    const auto split = [](std::string_view s, std::string_view& ns, std::string_view& local) noexcept {
+        const auto slash = s.find('/');
+        if (slash == std::string_view::npos) { ns = {}; local = s; return !s.empty(); }
+        ns = s.substr(0, slash);
+        local = s.substr(slash + 1);
+        return !ns.empty() && !local.empty() && local.find('/') == std::string_view::npos;
+    };
+    std::string_view loginNs, loginLocal, ns, local;
+    if (!split(login, loginNs, loginLocal) || !split(name, ns, local)) return false;
+    if (loginNs.empty()) loginNs = "default";
+    if (ns.empty()) ns = loginNs;
+    return ns == loginNs && local == loginLocal;
+}
+
+/// Issue #114: whether `m` is a user's change of its OWN credential (`login` = the name the session logged in as):
+/// ALTER USER <self> ADD / DROP / SET PASSWORD, <self> bare or qualified with the login's namespace.
+[[nodiscard]] inline bool isOwnCredentialChange(const SecurityDdl& m, std::string_view login) noexcept {
+    return isCredentialChange(m) && isOwnUserName(m.name, login);
 }
 
 inline std::size_t SecurityBootstrap::encodedSize() const noexcept {

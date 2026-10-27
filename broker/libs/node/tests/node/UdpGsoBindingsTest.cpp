@@ -184,7 +184,7 @@ int64_t systemCounter(aeron_t* client, const char* label) {
         &f);
     return f.value;
 }
-constexpr int32_t kGsoPathMtuCounterTypeId = 1000222;   // rune_gso_bindings.c
+constexpr int32_t kGsoPathMtuCounterTypeId = 1000301;   // rune_gso_bindings.c
 // Value of the (first) counter of `typeId` in the client's CnC.
 int64_t counterByType(aeron_t* client, int32_t typeId) {
     struct Find { int32_t type; int64_t value; } f{typeId, -1};

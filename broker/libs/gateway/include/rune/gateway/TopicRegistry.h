@@ -22,6 +22,7 @@
 //   - partitionForKey uses the shared rune::protocol::partitionForKey (FNV-1a 64)
 //     so broker and client always agree on the mapping.
 
+#include <rune/gateway/NsNameKey.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/PartitionHash.h>
@@ -63,16 +64,22 @@ public:
     // Returns empty optional if the name is not registered.
     // -----------------------------------------------------------------------
     [[nodiscard]] std::optional<int32_t>
-    topicIdForName(std::string_view name) const;
+    topicIdForName(std::string_view name) const { return topicIdForName(0, name); }
+    // Namespaces plan Task 6: names are unique per namespace -- the (nsId, name) lookup.  The name-only form above
+    // is the default namespace (ns 0).
+    [[nodiscard]] std::optional<int32_t>
+    topicIdForName(uint32_t nsId, std::string_view name) const;
 
     // -----------------------------------------------------------------------
     // topicIdForFoldedName — a topic whose name equals `name` ignoring ASCII case
     // but is NOT exactly `name` (DDL conformance B3: the two would share
-    // dataDir/topics/<name>/ on a case-insensitive filesystem).  Linear scan —
+    // topicsRoot(dataDir, nsId)/<name>/ on a case-insensitive filesystem).  Linear scan —
     // DDL (cold path) only.  Empty optional when there is none.
     // -----------------------------------------------------------------------
     [[nodiscard]] std::optional<int32_t>
-    topicIdForFoldedName(std::string_view name) const;
+    topicIdForFoldedName(std::string_view name) const { return topicIdForFoldedName(0, name); }
+    [[nodiscard]] std::optional<int32_t>
+    topicIdForFoldedName(uint32_t nsId, std::string_view name) const;
 
     // -----------------------------------------------------------------------
     // topic — return the TopicSpec for a given topicId.
@@ -116,7 +123,7 @@ public:
     //
     // createTopicAt — creates the entry at EXACTLY `topicId` (spec.topicId is
     // ignored), filling a gap below it with Gap slots.  Creates
-    // dataDir/topics/<name>/<p>/ for a disk topic and opens + recovers each Log
+    // topicsRoot(dataDir, spec.nsId)/<name>/<p>/ for a disk topic and opens + recovers each Log
     // (an existing dir is recovered, never wiped: a restart re-runs the effect).
     // A disk topic's dir carries the topic-id marker (TopicDirMarker.h): written before any partition dir
     // exists; a dir marked with another id, or markerless with record bytes, is never opened (returns -1).
@@ -287,7 +294,8 @@ private:
 
     std::string                              dataDir_;     // root data directory
     std::vector<Slot>                        topics_;      // indexed by topicId
-    std::unordered_map<std::string, int32_t> nameIndex_;   // live name → topicId
+    // live (nsId, name) → topicId (namespaces plan Task 6: a name is unique per namespace)
+    std::unordered_map<NsName, int32_t, NsNameHash, NsNameEq> nameIndex_;
 };
 
 } // namespace rune::gateway

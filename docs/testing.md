@@ -149,6 +149,10 @@ Exclude the latency gates under a sanitizer (`-LE latency`): they measure time. 
 TSan target, `rune_group_tsan_tests`, behind `-DENABLE_TSAN=ON`. Sanitizer builds are several times slower and
 larger than a plain Debug build; budget disk and time accordingly.
 
+In CI, `.github/workflows/sanitizers.yml` runs these checkpoint sanitizer suites (ASan+UBSan and TSan, broker and
+client, `-R Regression -LE latency`) on every pull request, on pushes to `main` and on demand, and uploads the test
+logs when a run fails. Use its result for the checkpoint instead of running the sanitizer builds on a shared box.
+
 ## Source guards
 
 Python scripts run as ctest tests (names end in `Regression`) and fail the build when a rule of the engineering philosophy
@@ -177,6 +181,7 @@ later builds hit the layer cache. Run from `broker/`. All waits are bounded; eve
 |---|---|---|---|
 | `docker/e2e.sh` | 3 nodes | One leader elects, the raw-Aeron ping probe answers, the leader is killed, a different node is elected, the probe answers again. Topics are created by DDL, twice (idempotent). | leader 90 s, survivor probe 90 s |
 | `docker/auth-e2e.sh` | 3 nodes | Bootstrap, role, user and grants, a world-server client producing and consuming 10 000 records, an unauthorized topic refused, a wrong password refused, revoke ending a live consumer in 2 s, and **cluster-key rotation** across a rolling restart under load. | leader 180 s, client run 600 s |
+| `docker/namespace-e2e.sh` | 3 nodes | Namespaces on the default config: `rune namespace create`, a namespace admin creating a user, topic and grants, 1000 records produced and consumed as `a/alice`, a `default` user seeing `t` exactly like a missing topic, `list` showing only `a`; repeated after the catalog leader is killed and after a full restart; limits stored and read back. | leader 180 s, client run 300 s |
 | `docker/catalog-e2e.sh` | 2 x 3 nodes | DDL through every broker with redirects, the catalog leader killed mid-DDL (exactly one `CreateTopic`), `catalog export`, `replay` into a second cluster, and a `diff` of no differences. | per step |
 | `docker/schema-e2e.sh` | 1 node | A typed round trip: define, `openTopic<T>` (fingerprint gate), send, consume, decode, and a malformed record rejected. | leader 120 s |
 | `docker/schema-evolution-e2e.sh` | 1 node | add, drop, rename and set-compatibility through the CLI with generated probes; a v1-bound binary still opens the evolved topic; concurrent alters give one `SchemaConflict`. | leader 180 s |

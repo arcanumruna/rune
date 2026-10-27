@@ -38,6 +38,7 @@
 #include "rune/node/CatalogApplier.h"
 #include "rune/node/CatalogPartition.h"
 #include "rune/node/CatalogReadServer.h"
+#include "rune/node/NamespaceLimitDefaults.h"
 #include "rune/node/SecurityAdmin.h"
 #include <rune/peerlink/PeerFrameCrypto.h>
 #include "rune/node/SecurityApplier.h"
@@ -49,6 +50,7 @@
 
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/catalog/CatalogState.h>
+#include <rune/protocol/client/NamespaceMessages.h>
 
 namespace rune::replication {
 class PartitionReplica;
@@ -119,7 +121,9 @@ struct AdminDeps {
     /// #205: `knownEnd` = max(the replica's log end, the leader's committed HW) - posted on every change too, so the
     /// gateway knows when its view is behind events this broker already holds (a login failure there is retriable).
     /// #603: `behind` = the applier is below the committed HW this broker knows (SecurityBehind) - posted on its edges.
-    std::function<void(bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader, int64_t knownEnd, bool behind)>
+    /// #460: `held` = the verdict is held through a leader failover (counts only while in the committed ISR).
+    std::function<void(bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader, int64_t knownEnd, bool behind,
+                       bool held)>
         securityServing;
     /// F (RUNE_SECURITY_MAX_STALENESS_MS, effective): the contact a follower's verdict may lapse for.
     int64_t securityMaxStalenessNs = 1'000'000'000;
@@ -129,6 +133,16 @@ struct AdminDeps {
     /// A CreateTopic / AlterTopicConfig that would raise estimateFdNeed above fdLimit is refused before its append.
     uint64_t fdLimit = 0;
     uint64_t readySegmentsPerPartition = 0;
+
+    /// Namespaces Task 7: ListNamespacesResponse (83) — answered from the applied catalog on any broker (no append).
+    /// Unset: list requests are answered nowhere.
+    std::function<void(int64_t session, int64_t corr, const rune::protocol::client::ListNamespacesResponse&)>
+        respondListNamespaces;
+    /// The defaults a namespace Create resolves absent limit fields from (NodeConfig, read at boot) — the event
+    /// carries the full record, so a later change of the defaults never alters an existing namespace.
+    NamespaceLimitDefaults nsDefaults;
+    /// RUNE_MAX_NAMESPACES: a Create when the registry holds this many (default included) is refused (52 / 39).
+    uint32_t maxNamespaces = 1024;
 };
 
 // ---------------------------------------------------------------------------
@@ -253,7 +267,7 @@ public:
                                     int32_t& outViewTopicId, uint64_t& outFingerprint) const {
         outViewTopicId = -1;
         outFingerprint = 0;
-        const ViewRecord* vrec = viewRegistry_->byName(name);
+        const ViewRecord* vrec = viewRegistry_->byName(rune::catalog::kDefaultNsId, name);   // Task 10: the session's nsId
         if (vrec == nullptr) return 4;
         outViewTopicId = vrec->viewTopicId;
         const RegistryEntry* latest = reg_.latest(vrec->viewTopicId);
@@ -448,10 +462,14 @@ private:
     [[nodiscard]] Built buildDropView_(const DropViewMsg& m, const rune::catalog::CatalogState& s) const;
     [[nodiscard]] Built buildDropTopic_(const DropTopicMsg& m, const rune::catalog::CatalogState& s) const;
     [[nodiscard]] Built buildAlterConfig_(const AlterTopicConfigMsg& m, const rune::catalog::CatalogState& s) const;
-    /// A view definition (CreateView / AlterView) at `viewTopicId`.
+    /// Namespaces Task 7: Create / SetLimits — the full limits record resolved at request time.
+    [[nodiscard]] Built buildNamespace_(const NamespaceDdlMsg& m, const rune::catalog::CatalogState& s) const;
+    /// ListNamespaces (82): one page of the applied registry (no append, any broker).
+    void respondList_(const ListNamespacesMsg& m);
+    /// A view definition (CreateView / AlterView) at `viewTopicId`; every source must live in namespace `nsId`.
     [[nodiscard]] std::expected<rune::catalog::ViewDef, DdlRejection>
         viewDef_(const std::string& name, const std::string& keyField, uint8_t persistence,
-                 const std::vector<uint8_t>& planBlob, int32_t viewTopicId,
+                 const std::vector<uint8_t>& planBlob, int32_t viewTopicId, uint32_t nsId,
                  const rune::catalog::CatalogState& s) const;
     /// Encode + append `e` (key = objectId LE) — false: answered already.
     bool appendEvent_(const DdlRequest& req, rune::catalog::CatalogEvent e, int64_t nowNs);
@@ -516,6 +534,7 @@ private:
     int                                   securityServingPosted_ = -1;   // -1 none, 0 / 1 the verdict
     int32_t                               securityServingPostedEpoch_ = -1;   // PR #459 F2: and what it is for
     bool                                  securityServingPostedLeader_ = false;
+    bool                                  securityServingPostedHeld_ = false;   // #460
     int64_t                               securityServingPostedKnownEnd_ = -1;   // #205
     int stepSecurityServing_(int64_t nowNs);
 public:

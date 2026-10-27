@@ -7,6 +7,8 @@
 /.buildkit-cache/
 *.cmake
 !conan_provider.cmake
+# hand-written CMake modules (not generated)
+!/cmake/*.cmake
 CMakeFiles/
 CMakeCache.txt
 *.ninja
@@ -66,3 +68,4 @@ Thumbs.db
 /docker/.auth.*/
 /.catalog-e2e-work/
 /.eos-e2e-work*/
+/.ns-e2e-work/

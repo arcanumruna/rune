@@ -233,7 +233,7 @@ TEST(AuthLiveChangeRegression, DisableRevokesEnableAllowsLogin) {
     const int64_t s2 = t.r.wire().connect(t.ch());
     ASSERT_GT(s2, 0);
     EXPECT_EQ(t.r.wire().login(t.ch(), s2, name, {AuthRig::kPw, AuthRig::kPw}).errorCode(), 44) << "login while disabled";
-    EXPECT_TRUE(t.b().awaitCounter(kSessionsRevokedCounterTypeId, 1)) << "counter 232";
+    EXPECT_TRUE(t.b().awaitCounter(typeIdOf(RuneMetric::SessionsRevoked), 1)) << "counter 232";
     {
         const auto en = t.b().admin().alterPassword(t.ch(), t.adminSid(), name, pc::UserChangeKind::Enable);
         ASSERT_EQ(en.errorCode, 0) << en.detail;
@@ -256,7 +256,7 @@ TEST(AuthLiveChangeRegression, DropUserRevokesEverySession) {
     EXPECT_EQ(t.errorOn(0, s1), kRevoked);
     EXPECT_EQ(t.errorOn(0, s2), kRevoked);
     EXPECT_EQ(t.errorTextOn(0, s1), "user dropped");
-    EXPECT_TRUE(t.b().awaitCounter(kSessionsRevokedCounterTypeId, 2));
+    EXPECT_TRUE(t.b().awaitCounter(typeIdOf(RuneMetric::SessionsRevoked), 2));
 }
 
 TEST(AuthLiveChangeRegression, SetPasswordKeepsSessions) {

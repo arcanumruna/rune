@@ -712,8 +712,8 @@ private:
         namespace rv = rune::view;
         const auto& st = h_.leaderState_();
         int32_t id = 999'999;
-        if (const auto* t = st.topicByName(source)) id = t->topicId;
-        else if (const auto* v = st.viewByName(source)) id = v->def.viewTopicId;
+        if (const auto* t = st.topicByName(rune::catalog::kDefaultNsId, source)) id = t->topicId;
+        else if (const auto* v = st.viewByName(rune::catalog::kDefaultNsId, source)) id = v->def.viewTopicId;
         rv::ViewPlan p;
         p.viewName = view;
         p.key      = "id";

@@ -13,9 +13,10 @@ rs::ScramVerifier v(uint8_t seed) {
 }
 struct Script {
     rs::SecurityState s; int64_t offset = 0;
+    uint32_t ns = 0;   // the namespace the events built by make() / run() act in (names are per namespace)
     rs::SecurityEvent make(rs::Ops ops, std::string name) {
-        rs::SecurityEvent e; e.kind = rs::kindOf(ops); e.objectName = std::move(name); e.ops = std::move(ops);
-        const rs::UserObject* u = s.user(e.objectName); const rs::RoleObject* r = s.role(e.objectName);
+        rs::SecurityEvent e; e.kind = rs::kindOf(ops); e.objectName = std::move(name); e.ops = std::move(ops); e.nsId = ns;
+        const rs::UserObject* u = s.userByName(ns, e.objectName); const rs::RoleObject* r = s.roleByName(ns, e.objectName);
         const bool roleTarget = e.kind == rs::EventKind::CreateRole || e.kind == rs::EventKind::DropRole ||
             ((e.kind == rs::EventKind::Grant || e.kind == rs::EventKind::Revoke) &&
              std::visit([](const auto& o) { if constexpr (requires { o.grantee; }) return o.grantee == rs::GranteeKind::Role; else return false; }, e.ops));
@@ -27,6 +28,13 @@ struct Script {
         return e;
     }
     std::expected<rs::Applied, rs::ApplyError> run(rs::Ops ops, std::string name) { return rs::apply(s, make(std::move(ops), std::move(name)), offset++); }
+    /// `run` in namespace `nsId` (the namespace is restored afterwards).
+    std::expected<rs::Applied, rs::ApplyError> runIn(uint32_t nsId, rs::Ops ops, std::string name) {
+        const uint32_t saved = ns; ns = nsId;
+        auto r = run(std::move(ops), std::move(name));
+        ns = saved;
+        return r;
+    }
 };
 rs::GrantSpec g(rs::Operation op, rs::ResourceType t, rs::PatternKind k, std::string n) { return {op, {t, k, std::move(n)}}; }
 } // namespace

@@ -10,7 +10,13 @@
 // Every disk-backed CATALOG topic dir carries a topic-id marker (rune/gateway/
 // TopicDirMarker.h): "<id>\n", written before any partition dir exists.  A dir whose
 // marker names id X holds only X's data; a markerless dir with no record bytes holds
-// nothing. 
+// nothing.
+//
+// Namespaces (Task 6, D14; NamespacePaths.h): the steps below run once per namespace root
+// <ns> = dataDir/ns-<nsId> — every ns-<u32> dir under dataDir, plus every namespace a catalog
+// topic names — against that namespace's catalog topics only.  An entry directly under dataDir
+// that is not ns-<u32> (a stray dir, a pre-namespace dataDir/topics, ns-<id>.deleting) is logged
+// and left untouched: never read, moved or deleted (no migration).  Below, "dataDir/" means <ns>/.
 //
 //   0. every dataDir/topics/<name> claimed (exactly or by ASCII case fold) by a CATALOG
 //      topic t is judged by its marker:
@@ -52,9 +58,9 @@
 namespace rune::node {
 
 struct TopicDirReconciliation {
-    std::vector<std::filesystem::path> quarantined;   // destinations under dataDir/quarantine/
-    std::vector<std::filesystem::path> purged;        // dataDir/dropped/ entries removed
-    std::vector<std::filesystem::path> retired;       // dataDir/dropped/ destinations of older incarnations (step 0)
+    std::vector<std::filesystem::path> quarantined;   // destinations under ns-<id>/quarantine/
+    std::vector<std::filesystem::path> purged;        // ns-<id>/dropped/ entries removed
+    std::vector<std::filesystem::path> retired;       // ns-<id>/dropped/ destinations of older incarnations (step 0)
     std::vector<std::filesystem::path> removedSinkDirs;   // VLS B.2: empty dirs of former view-sink replicas, removed
 };
 
@@ -81,8 +87,10 @@ struct CatchUpSentinel {
 bool writeCatchUpSentinel(const std::string& dataDir, int64_t caughtUpAt) noexcept;
 /// unlink + dir fsync; absent -> true.
 bool removeCatchUpSentinel(const std::string& dataDir) noexcept;
-/// Any non-symlink child of dataDir/topics whose topic-id marker is Valid (a catalog-made dir).
+/// Any non-symlink child of dataDir/ns-<u32>/topics (any namespace) whose topic-id marker is Valid (a catalog-made dir).
 [[nodiscard]] bool topicsHoldCatalogMarkedDir(const std::string& dataDir) noexcept;
+/// Any entry in dataDir/ns-<u32>/dropped, in any namespace (a purge an earlier run did not finish).
+[[nodiscard]] bool droppedHoldsEntries(const std::string& dataDir) noexcept;
 
 enum class BootReconcile : uint8_t { Skip, RunNow, RunNowAndClearSentinel, Defer, DeferAndWritePending };
 /// Pure.  First match wins:

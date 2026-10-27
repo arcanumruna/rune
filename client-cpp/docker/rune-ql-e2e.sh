@@ -62,6 +62,7 @@ fail() { echo "[rune-ql-e2e] FAIL: $*" >&2; exit 1; }
 [ -d "${PROJECTS}/crypto" ]    || fail "missing ../crypto"
 [ -d "${PROJECTS}/ql" ]        || fail "missing ../ql"
 [ -d "${FLIGHT_RECORDER_DIR:-${PROJECTS}/../flight-recorder}" ]        || fail "missing ../flight-recorder"
+[ -d "${ARCANUM_METRICS_DIR:-${PROJECTS}/../arcanum-metrics}" ]        || fail "missing ../arcanum-metrics (the compose broker build reads it)"
 [ -f "${CLIENT_DOCKERFILE}" ]       || fail "missing ${CLIENT_DOCKERFILE}"
 [ -f "${CLIENT_REPO}/tests/e2e/characters.rql" ] || fail "missing tests/e2e/characters.rql"
 

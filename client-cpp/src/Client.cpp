@@ -27,6 +27,7 @@
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/SchemaMessages.h>
+#include <rune/protocol/client/NamespaceMessages.h>
 
 #include <concurrent/BackOffIdleStrategy.h>
 #include <concurrent/YieldingIdleStrategy.h>
@@ -177,6 +178,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     acfg.session.allowUnauthenticatedBroker = c.allowUnauthenticatedBroker;
     acfg.session.bootstrapOnly = c.securityBootstrapOnly;
     acfg.session.requireCrypto = c.requireCrypto;
+    if (c.testAnnounceClientVersion > 0) acfg.session.clientVersion = c.testAnnounceClientVersion;   // test only
     acfg.transport.clientLivenessTimeoutNs = c.aeronClientLivenessTimeoutNs;
     // F12: malformed env values are reported (once per Client construction —
     // this runs once per Client, never per cycle), not silently dropped.
@@ -1435,6 +1437,7 @@ std::optional<std::size_t> decodedRequestIdOffset(rune::client::OpKind op, std::
     case OpKind::AlterView:        if (auto m = rpc::AlterView::decode(f.data(), f.size())) ext = m->ext; break;
     case OpKind::AlterTopicConfig: if (auto m = rpc::AlterTopicConfig::decode(f.data(), f.size())) ext = m->ext; break;
     case OpKind::SecurityDdl:      if (auto m = rpc::SecurityDdl::decode(f.data(), f.size())) ext = m->ext; break;
+    case OpKind::NamespaceDdl:     if (auto m = rpc::NamespaceDdlRequest::decode(f.data(), f.size())) ext = m->ext; break;
     default: break;
     }
     if (!ext) return std::nullopt;
@@ -1474,6 +1477,37 @@ OpResult Client::dropTopic(std::string_view name, const DdlOptions& ddl, Complet
     if (n == 0) return OpResult::InvalidArgument;
     return issueDdl_(OpKind::DropTopic, target, token, std::span<const uint8_t>(frame.data(), n), msg.ext,
                      msg.extOffset());
+}
+
+OpResult Client::namespaceDdl(rune::protocol::client::NamespaceDdlKind kind, std::string_view name,
+                              const std::array<uint8_t, rune::protocol::client::kNamespacePresentMaskBytes>& presentMask,
+                              const rune::protocol::NamespaceLimits& limits, const DdlOptions& ddl,
+                              CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    if (name.empty()) return OpResult::InvalidArgument;
+    rpc::NamespaceDdlRequest msg;
+    msg.kind        = kind;
+    msg.name        = std::string(name);
+    msg.presentMask = presentMask;
+    msg.limits      = limits;
+    msg.ext         = ddlExt_(ddl);
+    std::vector<uint8_t> frame(msg.encodedSize());
+    const std::size_t n = msg.encode(frame.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    // The extension follows the header directly (BODY_FIXED = 0).
+    return issueDdl_(OpKind::NamespaceDdl, target, token, std::span<const uint8_t>(frame.data(), n), msg.ext,
+                     rpc::MessageHeader::ENCODED_SIZE + rpc::NamespaceDdlRequest::BODY_FIXED);
+}
+
+OpResult Client::listNamespaces(uint32_t afterNsId, uint16_t max, CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::ListNamespaces msg;
+    msg.afterNsId = afterNsId;
+    msg.max       = max;
+    std::vector<uint8_t> frame(msg.encodedSize());
+    const std::size_t n = msg.encode(frame.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueControl_(OpKind::ListNamespaces, target, token, std::span<const uint8_t>(frame.data(), n), 0);
 }
 
 OpResult Client::dropView(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token) {
@@ -1553,7 +1587,7 @@ OpResult Client::securityDdl(rune::ql::SecurityPlan plan, const DdlOptions& ddl,
     // outcome) until the broker answers OK, so the next login of this Client uses it.  ADD PASSWORD needs nothing
     // (the old password stays valid, D6).
     const bool selfSet = plan.kind == rpc::SecurityOpKind::AlterUser && plan.change == rpc::UserChangeKind::SetPassword &&
-                         !cfg_.username.empty() && plan.name == cfg_.username;
+                         rpc::isOwnUserName(plan.name, cfg_.username);   // PR #642 review F2: bare or qualified
     std::span<const uint8_t> secret;
     if (selfSet) secret = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(plan.password.data()), plan.password.size());
     OpResult res = OpResult::InvalidArgument;
@@ -2846,6 +2880,70 @@ ViewRowResult Client::getViewRowAndWait(int32_t viewTopicId, uint64_t keyU64, ui
                  if (result.status == ViewRowResult::kOk) result.rowBytes.assign(p.begin(), p.end());
              });
     return result;
+}
+
+Client::NamespaceResult<uint32_t> Client::createNamespace(std::string_view name, const NamespaceLimitsPatch& limits,
+                                                          std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    DdlResult r;
+    andWait_("createNamespace()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return namespaceDdl(rpc::NamespaceDdlKind::Create, name, limits.present, limits.values, DdlOptions{}, q, t);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("createNamespace()", c, p);
+                 r = ddlResultOf(c, p);
+                 r.requestId = requestIdOf(c);
+             });
+    if (r.errorCode != 0) return std::unexpected(std::move(r));
+    return static_cast<uint32_t>(r.objectId);
+}
+
+Client::NamespaceResult<void> Client::setNamespaceLimits(std::string_view name, const rune::protocol::NamespaceLimits& full,
+                                                         std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    DdlResult r;
+    andWait_("setNamespaceLimits()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return namespaceDdl(rpc::NamespaceDdlKind::SetLimits, name, kNamespaceFullMask, full, DdlOptions{}, q, t);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("setNamespaceLimits()", c, p);
+                 r = ddlResultOf(c, p);
+                 r.requestId = requestIdOf(c);
+             });
+    if (r.errorCode != 0) return std::unexpected(std::move(r));
+    return {};
+}
+
+Client::NamespaceResult<std::vector<rune::protocol::client::NamespaceInfo>>
+Client::listNamespaces(std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    std::vector<rpc::NamespaceInfo> out;
+    uint32_t after = 0;
+    // Each page strictly advances (nextAfter > after, else the walk stops): a bounded walk even against a broker
+    // that keeps answering the same page.
+    for (;;) {
+        DdlResult err;
+        std::optional<rpc::ListNamespacesResponse> page;
+        andWait_("listNamespaces()", timeout, 64u << 10,
+                 [&](Completions& q, Token t) { return listNamespaces(after, 128, q, t); },
+                 [&](const Completion& c, std::span<const uint8_t> p) {
+                     if (c.status == OpStatus::BrokerError) {
+                         err.errorCode = c.errorCode;
+                         err.detail.assign(reinterpret_cast<const char*>(p.data()), p.size());
+                         return;
+                     }
+                     throwForStatus_("listNamespaces()", c, p);
+                     page = rpc::ListNamespacesResponse::decode(p.data(), p.size());
+                 });
+        if (err.errorCode != 0) return std::unexpected(std::move(err));
+        if (!page) throw std::runtime_error("listNamespaces(): undecodable ListNamespacesResponse");
+        for (auto& i : page->namespaces) out.push_back(std::move(i));
+        if (page->nextAfter == 0 || page->nextAfter <= after) break;
+        after = page->nextAfter;
+    }
+    return out;
 }
 
 std::vector<std::pair<std::string, int32_t>> Client::listTopics(std::chrono::nanoseconds timeout) {
@@ -4321,7 +4419,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
             i < pendingCtl_.size() &&
             (pendingCtl_[i].op == OpKind::DropTopic || pendingCtl_[i].op == OpKind::DropView ||
              pendingCtl_[i].op == OpKind::AlterView || pendingCtl_[i].op == OpKind::AlterTopicConfig ||
-             pendingCtl_[i].op == OpKind::SecurityDdl || pendingCtl_[i].op == OpKind::SecurityBootstrap)) {
+             pendingCtl_[i].op == OpKind::SecurityDdl || pendingCtl_[i].op == OpKind::SecurityBootstrap ||
+             pendingCtl_[i].op == OpKind::NamespaceDdl)) {
             if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::NotLeader)) {
                 onDdlNotLeader_(i, opt->detail, now());
                 break;
@@ -4338,6 +4437,18 @@ void Client::onEgressFrame(codec::TemplateId tid,
                          opt->errorCode,
                          std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(opt->detail.data()),
                                                   opt->detail.size()));
+        }
+        break;
+    }
+
+    // ---- Namespaces (Task 11): ListNamespacesResponse (83) — the raw frame is the payload (the caller decodes).
+    case codec::TemplateId::ListNamespacesResponse: {
+        if (len < rune::protocol::client::MessageHeader::ENCODED_SIZE) break;
+        const auto corr = static_cast<int64_t>(rune::protocol::client::detail::getLE64(buf, 16));
+        if (const std::size_t i = findCtl_(corr); i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::ListNamespaces) {
+            PendingCtl p = takeCtl_(i);
+            completeCtl_(p, OpStatus::Ok, 0, 0, 0, std::span<const uint8_t>(buf, len),
+                         detail::CompletionRing::Overflow::TooLarge);
         }
         break;
     }

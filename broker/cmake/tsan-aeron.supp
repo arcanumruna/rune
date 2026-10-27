@@ -51,3 +51,56 @@ race:aeron::util::removeFromArray
 # calls the public single-poller API from the subscription's own poll thread
 # (ImageLossWatch::afterPoll).  F27 re-review: confirmed Aeron-internal.
 race:aeron::Subscription::imageBySessionId
+
+# Checkpoint A (TSan, rune_auth_cluster_tests): the same two Aeron-internal
+# edges reached through the sibling read paths the list above missed.
+#  - Image::controlledPoll is Image::poll's controlled twin: it reads the
+#    subscriber position and the mmapped log buffer (prior "write" = the
+#    conductor's mmap / Image construction).  rune's gateway polls through it.
+#  - Image::sourceIdentity / Image::sessionId read fields of an Image the
+#    conductor built and published through the AtomicArrayUpdater seqlock;
+#    rune reaches them via Subscription::forEachImage on the poll thread
+#    (AeronPartitionTransport plane-reconnect scan).
+# Function-scoped, Aeron-owned memory only; rune's own state is not covered.
+race:aeron::Image::controlledPoll
+race:aeron::Image::sourceIdentity
+race:aeron::Image::sessionId
+
+# Checkpoint A (TSan): Aeron C's username() (aeron_fileutil.c) fills a function-local `static char static_buffer[16384]`
+# through getpwuid_r when $USER is unset; aeron_default_path() calls it from every aeron_context_init /
+# aeron_driver_context_init, so two threads building an Aeron context at once (a broker's EmbeddedDriver and a test
+# client) race on that buffer.  Aeron-internal and environment-dependent (only without $USER); every Rune context sets an
+# explicit aeron.dir, so the default path built from it is overwritten and never used.  Scoped to that one Aeron file.
+race:aeron_fileutil.c
+
+# Checkpoint E (TSan, rune_peer_link_agent_tests): the reader of a freshly mapped log buffer.  The prior "write" is
+# the client conductor's mmap of the Image's log buffer (MemoryMappedFile::doMapping); the read is a fragment handler
+# reached through Image::poll / TermReader::read, whose template frames symbolize without the `aeron::` prefix, so
+# the poll entries above do not match.  The mapping's publication to the poller is Aeron's fence-ordered image hand-off.
+race:aeron::util::MemoryMappedFile::doMapping
+# The client conductor builds an aeron::Image (make_shared) and publishes it to the subscriber thread through Aeron's
+# own ordered array store (atomic::putValueOrdered - invisible to TSan); every read of the new Image's fields on the
+# polling thread (UnsafeBufferPosition::get, Header::offset, AtomicBuffer::getInt64/boundsCheck, Image::poll inlined
+# into the caller's template frame) then reports against that allocation.  Matched on the allocating frame, so it
+# covers Aeron's Image hand-off only (TSan CI: WorkerReplicationTransportInteg, PeerSealed*, PeerLinkAgent*).
+race:_Sp_counted_ptr_inplace<aeron::Image
+# The C client's async add (aeron_client_conductor_async_add_*) hands the command to its conductor through Aeron's
+# MPSC command queue (C11 atomics in a different TU than TSan sees ordered); the conductor's memcpy of the command
+# body reports against the caller's write (TSan CI: UdpGsoBindings.*).
+race:aeron_client_conductor_async_add_
+# Same queue, other commands: async_destination (MDS add / remove destination) is copied by the conductor's
+# on_cmd_destination (TSan CI: UdpGsoBindings.MdsDestinationRemovedOnTheReceiverIsCounted).
+race:aeron_client_conductor_async_destination
+# Dedicated threading: the conductor opens a channel's socket and hands the endpoint to the receiver thread through
+# the driver's MPSC command queue; TSan's fd tracking then reports the receiver's epoll_ctl against the socket()
+# (TSan CI: BrokerNodeTest.DedicatedAeronThreadingMode_BootsAndElects).
+race:aeron_udp_transport_poller_add
+# The driver's own MPSC command ring (aeron_mpsc_rb_write on one driver agent, aeron_mpsc_rb_read + its memset on the
+# other) orders through C11 atomics in the uninstrumented Aeron build; Rune never uses this ring itself
+# (TSan CI: BrokerNodeTest.DedicatedAeronThreadingMode_BootsAndElects).
+race:aeron_mpsc_rb_
+
+# Aeron C++ client template frames (Image::poll / Subscription::poll instantiated with a Rune lambda) symbolize as a
+# bare `poll<...>` without the aeron:: prefix, so the names above miss them; match by the file instead (only
+# headers inside the Aeron conan package).
+race:*.conan2/*aeron*/include/*

@@ -5,7 +5,9 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 namespace rune::node {
@@ -37,6 +39,7 @@ using rune_aeron_idle_func_t = void (*)(void*, int);
 rune_aeron_idle_func_t aeron_idle_strategy_load(const char* idle_strategy_name, void** idle_strategy_state,
                                                 const char* env_var, const char* init_args);
 void aeron_free(void* ptr);
+int aeron_parse_duration_ns(const char* str, uint64_t* result);
 }
 
 namespace {
@@ -44,6 +47,15 @@ namespace {
 /// pointers behind (aeron_driver_context_set_*_idle_strategy frees the old name/state before loading), so
 /// aeron_driver_context_close would double-free — validate on a scratch state first, then set.
 bool aeronIdleStrategyLoads(const char* name, const char* args) {
+    // Aeron's sleeping init allocates its state BEFORE parsing the args and does not free it on a parse failure
+    // (aeron_agent.c: aeron_idle_strategy_sleeping_init_args / aeron_idle_strategy_load), so a malformed duration
+    // would leak.  Parse it here first, on a stack word, and never reach Aeron's failing path.
+    if (args != nullptr && name != nullptr &&
+        (std::strcmp(name, "sleeping") == 0 || std::strcmp(name, "sleep-ns") == 0 ||
+         std::strcmp(name, "aeron_idle_strategy_sleeping") == 0)) {
+        uint64_t durationNs = 0;
+        if (aeron_parse_duration_ns(args, &durationNs) < 0) return false;
+    }
     void* state = nullptr;
     if (aeron_idle_strategy_load(name, &state, "RUNE_AERON_DRIVER_IDLE", args) == nullptr) return false;
     aeron_free(state);
@@ -112,12 +124,9 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     : cfg_(std::move(cfg)), mode_(mode)
 {
     resolveTransport(cfg_);
-    if (aeron_driver_context_init(&ctx_) < 0)
-        throw std::runtime_error(std::string("EmbeddedDriver: aeron_driver_context_init failed: ") +
-                                 aeron_errmsg());
+    // Judge the live driver's heartbeat BEFORE aeron_driver_context_init: that zero-fills three 128 MB command
+    // queues (over a second under TSan), long enough for an unpumped live driver's heartbeat to look stale.
     if (aeron_is_driver_active(cfg_.dir.c_str(), /*timeout_ms=*/1000, +[](const char*) {})) {
-        aeron_driver_context_close(ctx_);
-        ctx_ = nullptr;
         releaseGso_();
         throw std::runtime_error(
             "EmbeddedDriver: aeron dir '" + cfg_.dir + "' is already in use by an ACTIVE media "
@@ -125,6 +134,9 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
             "shutdown). Use a distinct RUNE_AERON_DIR/RUNE_DATA_DIR, or ensure the previous "
             "instance exited.");
     }
+    if (aeron_driver_context_init(&ctx_) < 0)
+        throw std::runtime_error(std::string("EmbeddedDriver: aeron_driver_context_init failed: ") +
+                                 aeron_errmsg());
     aeron_driver_context_set_dir(ctx_, cfg_.dir.c_str());
     const char* idle = cfg_.idleStrategy.c_str();
     // D2 round 2: an idle strategy's state is built from the init args present when its setter runs — set

@@ -11,6 +11,7 @@
 // replicas) are either re-pinned on their catalog-path counterpart (named in each
 // test's comment) or ruled out in the Task 10 report.
 #include <gtest/gtest.h>
+#include <rune/node/NamespacePaths.h>
 #include "support/DdlHarness.h"
 #include "support/DdlHarnessTestHelpers.h"
 
@@ -276,7 +277,7 @@ TEST_P(DdlNameRegression, AdminPathRejectsEveryOpWithInvalidTopicNameAndCreatesN
     EXPECT_EQ(h.eventsAppended(), events) << "never reaches the catalog";
     EXPECT_EQ(h.catalogLogEnd(), logEnd);
     EXPECT_FALSE(fs::exists(h.root() / "escape")) << "nothing written outside the data dir";
-    EXPECT_FALSE(fs::exists(h.root() / "topics")) << "the admin path writes no topic dir at all";
+    EXPECT_FALSE(fs::exists(rune::node::topicsRoot(h.root(), 0))) << "the admin path writes no topic dir at all";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
@@ -719,10 +720,10 @@ TEST(DdlFixRegression, B3_CatalogRefusesEveryCaseVariantAndReportsTheExistingTop
         const int64_t a = h.submit(c.existingMode ? Op::DefineTransient : Op::DefineDisk, c.existing);
         h.settle();
         ASSERT_EQ(h.response(a)->err, kOk);
-        const std::string* folds = h.state().liveNameFoldingOnto(c.variant);
+        const std::string* folds = h.state().liveNameFoldingOnto(rune::catalog::kDefaultNsId, c.variant);
         ASSERT_NE(folds, nullptr);
         EXPECT_EQ(*folds, c.existing);
-        EXPECT_EQ(h.state().liveNameFoldingOnto(c.existing), nullptr) << "the exact name is not a conflict";
+        EXPECT_EQ(h.state().liveNameFoldingOnto(rune::catalog::kDefaultNsId, c.existing), nullptr) << "the exact name is not a conflict";
         const int64_t b = h.submit(c.requestMode ? Op::DefineTransient : Op::DefineDisk, c.variant);
         h.settle();
         EXPECT_EQ(h.response(b)->err, kTopicExists);

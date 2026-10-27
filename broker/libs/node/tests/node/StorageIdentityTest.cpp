@@ -1,6 +1,7 @@
 // StorageIdentityTest.cpp — storage.meta: the §3.2 format table, the refusals, the CLI rows and the origin /
 // manifest transitions (ISR design v3, Step 5).  Pure filesystem: no threads, no BrokerNode.
 #include <rune/node/StorageIdentity.h>
+#include <rune/node/NamespacePaths.h>
 
 #include <rune/transaction/detail/Crc32c.h>
 
@@ -269,7 +270,7 @@ TEST(StorageIdentityRegression, LegacyNeedsConsensusStateRegression) {
     {
         TmpDir t("legacy_half");
         touch(t.path / "node-state.dat");
-        fs::create_directories(t.path / "topics");
+        fs::create_directories(rune::node::topicsRoot(t.path, 0));
         EXPECT_EQ(refusalOf(t.str(), StorageFormat::Required, true),
                   t.str() + " holds broker data but not node-state.dat and term.log (missing: term.log): a partly deleted data dir");
     }

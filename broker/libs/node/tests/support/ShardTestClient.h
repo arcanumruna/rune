@@ -43,6 +43,16 @@ namespace rune::node::test {
 
 namespace pc = rune::protocol::client;
 
+/// The test client's DefineTopic config: topics roll at 1 MiB, not the 64 MiB default.  The log preallocates
+/// (fallocate) its active segment to segmentRollBytes, so a stress run creating a few hundred topics in one process
+/// otherwise fills the disk (~65 MB per topic).  A test that asserts on rolling or segment sizes passes its own config.
+inline constexpr int64_t kTestTopicSegmentRollBytes = 1LL << 20;
+inline rune::protocol::TopicConfigView boundedTestTopicConfig() {
+    rune::protocol::TopicConfigView c;
+    c.segmentRollBytes = kTestTopicSegmentRollBytes;
+    return c;
+}
+
 inline uint16_t freeUdpPort() {
     return rune::aeronutil::testing::allocFreeUdpPort();   // D8: never an ephemeral port
 }
@@ -545,7 +555,7 @@ public:
     int64_t sendDefineTopic(const std::string& ch, int32_t stream, int64_t sid, std::string_view name,
                             uint32_t partitions, const std::vector<uint8_t>& descriptor, uint8_t persistence = 0,
                             rune::protocol::RequestId rid = {}, int16_t replicationFactor = 0,
-                            const rune::protocol::TopicConfigView& config = {},
+                            const rune::protocol::TopicConfigView& config = boundedTestTopicConfig(),
                             bool validate = false) {
         pc::DefineTopic m;
         m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name; m.partitionCount = partitions;

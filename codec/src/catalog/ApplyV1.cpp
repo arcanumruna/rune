@@ -1,5 +1,10 @@
 // src/catalog/ApplyV1.cpp — the FROZEN formatVer-1 apply rules (spec §5.3, §6).
 //
+// Namespaces (plan D5): formatVer 2 applies the SAME object rules per namespace.  Every name lookup below is
+// (e.nsId, name); a formatVer-1 event always has nsId 0, so its behaviour is unchanged byte for byte (pinned by the
+// v1 golden replay).  ApplyV2 adds the namespace kinds and the gate (the namespace exists and is ACTIVE) around
+// these rules.  The only edit v1 needed for it is this key adaptation.
+//
 // One rule per kind; every rule refuses each invalid precondition explicitly, naming it
 // (ApplyError::detail) — nothing is silently accepted, clamped or defaulted.  `run`
 // builds a staged change without touching the state; `commit` installs it.  The state
@@ -86,8 +91,8 @@ std::optional<std::string> createError(const CatalogState& s, const CatalogEvent
                                        std::string_view topicIdName) {
     if (const TopicNameError ne = checkTopicName(e.objectName); ne != TopicNameError::None)
         return prefix(e) + "name " + quoted(e.objectName) + " is invalid (" + std::string(topicNameErrorText(ne)) + ")";
-    if (s.nameTaken(e.objectName)) return prefix(e) + "name " + quoted(e.objectName) + " is taken";
-    if (const std::string* other = s.liveNameFoldingOnto(e.objectName))
+    if (s.nameTaken(e.nsId, e.objectName)) return prefix(e) + "name " + quoted(e.objectName) + " is taken";
+    if (const std::string* other = s.liveNameFoldingOnto(e.nsId, e.objectName))
         return prefix(e) + "name " + quoted(e.objectName) + " case-folds onto the live name " + quoted(*other);
     if (s.nextObjectId() == std::numeric_limits<uint64_t>::max()) return prefix(e) + "object ids are exhausted";
     if (e.objectId != s.nextObjectId())
@@ -139,7 +144,7 @@ std::expected<SchemaState, ApplyError> schemaFromDef(const CatalogEvent& e, int6
 /// The live topic `e` names: objectId and name agree.
 std::expected<const TopicObject*, ApplyError> liveTopic(const CatalogState& s, const CatalogEvent& e, int64_t offset) {
     const TopicObject* t = s.topicByObjectId(e.objectId);
-    if (t == nullptr)
+    if (t == nullptr || t->nsId != e.nsId)   // an object of another namespace is not live here
         return fail(offset, Code::Precondition, prefix(e) + "no live topic with objectId " + std::to_string(e.objectId));
     if (t->name != e.objectName)
         return fail(offset, Code::Precondition, prefix(e) + "objectId " + std::to_string(e.objectId) + " is topic " +
@@ -149,7 +154,7 @@ std::expected<const TopicObject*, ApplyError> liveTopic(const CatalogState& s, c
 }
 std::expected<const ViewObject*, ApplyError> liveView(const CatalogState& s, const CatalogEvent& e, int64_t offset) {
     const ViewObject* v = s.viewByObjectId(e.objectId);
-    if (v == nullptr)
+    if (v == nullptr || v->nsId != e.nsId)
         return fail(offset, Code::Precondition, prefix(e) + "no live view with objectId " + std::to_string(e.objectId));
     if (v->name != e.objectName)
         return fail(offset, Code::Precondition, prefix(e) + "objectId " + std::to_string(e.objectId) + " is view " +
@@ -192,10 +197,10 @@ std::optional<std::string> viewDefError(const CatalogState& s, const CatalogEven
     if (v.sinkPartitions < 1) return prefix(e) + "sinkPartitions " + std::to_string(v.sinkPartitions) + " < 1";
     if (v.sourceNames.empty()) return prefix(e) + "a view reads at least one source";
     for (const auto& src : v.sourceNames)
-        if (s.topicByName(src) == nullptr) return prefix(e) + "source " + quoted(src) + " is not a live topic";
+        if (s.topicByName(e.nsId, src) == nullptr) return prefix(e) + "source " + quoted(src) + " is not a live topic";
     // #143: the sink is co-partitioned with its FIRST source (AdminWorker writes exactly that, and partition counts
     // are immutable): a mismatch is a crafted / foreign catalog, refused here so every applier halts on it.
-    if (const TopicObject* first = s.topicByName(v.sourceNames.front()); v.sinkPartitions != first->partitions)
+    if (const TopicObject* first = s.topicByName(e.nsId, v.sourceNames.front()); v.sinkPartitions != first->partitions)
         return prefix(e) + "view " + quoted(e.objectName) + " sink partitions " + std::to_string(v.sinkPartitions) +
                " but its first source " + quoted(first->name) + " has " + std::to_string(first->partitions);
     if (v.normalizedPlanBlob.empty()) return prefix(e) + "the normalized plan is empty";
@@ -256,7 +261,7 @@ Result createTopic(const CatalogState& s, const CatalogEvent& e, int64_t off, co
     if (auto c = topicConfigError(o.config)) return fail(off, Code::Precondition, prefix(e) + "config " + *c);
     TopicObject t{.objectId = e.objectId, .name = e.objectName, .version = 1, .topicId = o.topicId,
                   .partitions = o.partitions, .replicationFactor = o.replicationFactor,
-                  .persistence = o.persistence, .config = o.config, .schema = std::nullopt};
+                  .persistence = o.persistence, .config = o.config, .schema = std::nullopt, .nsId = e.nsId};
     if (o.schema) {
         auto sch = schemaFromDef(e, off, *o.schema);
         if (!sch) return std::unexpected(std::move(sch.error()));
@@ -271,9 +276,9 @@ Result dropTopic(const CatalogState& s, const CatalogEvent& e, int64_t off, cons
     if (o.topicId != (*t)->topicId)
         return fail(off, Code::Precondition, prefix(e) + "topicId " + std::to_string(o.topicId) + ", topic " +
                                                  quoted(e.objectName) + " is " + std::to_string((*t)->topicId));
-    if (const ViewObject* v = s.viewReading(e.objectName))
+    if (const ViewObject* v = s.viewReading(e.nsId, e.objectName))
         return fail(off, Code::Precondition, prefix(e) + "topic " + quoted(e.objectName) + " is read by view " + quoted(v->name));
-    return StagedRemove{e.objectId, Tombstone{e.objectId, e.objectName, e.newVersion, /*wasView=*/false}, (*t)->topicId};
+    return StagedRemove{e.objectId, Tombstone{e.objectId, e.objectName, e.newVersion, /*wasView=*/false, e.nsId}, (*t)->topicId};
 }
 
 Result alterTopicConfig(const CatalogState& s, const CatalogEvent& e, int64_t off, const AlterTopicConfigOps& o) {
@@ -362,7 +367,8 @@ Result setCompatibility(const CatalogState& s, const CatalogEvent& e, int64_t of
 Result createView(const CatalogState& s, const CatalogEvent& e, int64_t off, const CreateViewOps& o) {
     if (auto c = createError(s, e, o.view.viewTopicId, "viewTopicId")) return fail(off, Code::Precondition, std::move(*c));
     if (auto err = checkViewDef(s, e, off, o.view)) return std::unexpected(std::move(*err));
-    return StagedCreate{ViewObject{.objectId = e.objectId, .name = e.objectName, .version = 1, .def = o.view}};
+    return StagedCreate{ViewObject{.objectId = e.objectId, .name = e.objectName, .version = 1, .def = o.view,
+                                   .nsId = e.nsId}};
 }
 
 Result alterView(const CatalogState& s, const CatalogEvent& e, int64_t off, const AlterViewOps& o) {
@@ -386,7 +392,7 @@ Result dropView(const CatalogState& s, const CatalogEvent& e, int64_t off, const
     if (o.viewTopicId != (*v)->def.viewTopicId)
         return fail(off, Code::Precondition, prefix(e) + "viewTopicId " + std::to_string(o.viewTopicId) + ", view " +
                                                  quoted(e.objectName) + " sinks to " + std::to_string((*v)->def.viewTopicId));
-    return StagedRemove{e.objectId, Tombstone{e.objectId, e.objectName, e.newVersion, /*wasView=*/true},
+    return StagedRemove{e.objectId, Tombstone{e.objectId, e.objectName, e.newVersion, /*wasView=*/true, e.nsId},
                         (*v)->def.viewTopicId};
 }
 
@@ -444,7 +450,9 @@ std::expected<Staged, ApplyError> ApplyV1::run(const CatalogState& s, const Cata
         else if constexpr (std::is_same_v<T, SetCompatibilityOps>) return setCompatibility(s, e, offset, o);
         else if constexpr (std::is_same_v<T, CreateViewOps>)       return createView(s, e, offset, o);
         else if constexpr (std::is_same_v<T, AlterViewOps>)        return alterView(s, e, offset, o);
-        else                                                       return dropView(s, e, offset, o);
+        else if constexpr (std::is_same_v<T, DropViewOps>)         return dropView(s, e, offset, o);
+        else   // a namespace kind (formatVer 2): not a rule of this table; ApplyV2 owns them
+            return fail(offset, Code::Precondition, prefix(e) + "namespace kinds have no formatVer-1 rule");
     }, e.ops);
 }
 
@@ -458,7 +466,7 @@ uint64_t ApplyV1::fingerprintOfStaged(const Staged& st) noexcept {
 
 Applied ApplyV1::commit(CatalogState& s, const CatalogEvent& e, int64_t offset, uint64_t fingerprint, Staged&& st) {
     Applied a{.kind = e.kind, .objectId = e.objectId, .newVersion = e.newVersion, .fingerprint = fingerprint,
-              .createdTopicId = -1, .droppedTopicId = -1};
+              .createdTopicId = -1, .droppedTopicId = -1, .nsId = e.nsId};
     RequestRecord r{.offset = offset, .kind = e.kind, .objectId = e.objectId, .newVersion = e.newVersion,
                     .topicId = -1, .schemaVersion = 0, .requestFingerprint = e.principal.requestFingerprint};
 
@@ -469,12 +477,12 @@ Applied ApplyV1::commit(CatalogState& s, const CatalogEvent& e, int64_t offset, 
             r.topicId = a.createdTopicId;
             r.schemaVersion = schemaVersionOf(x.object);
             if (auto* t = std::get_if<TopicObject>(&x.object)) {
-                s.topicNames_.emplace(t->name, t->objectId);
+                s.topicNames_.emplace(NsKey{t->nsId, t->name}, t->objectId);
                 s.topicIds_.emplace(t->topicId, t->objectId);
                 s.topics_.emplace(t->objectId, std::move(*t));
             } else {
                 auto& v = std::get<ViewObject>(x.object);
-                s.viewNames_.emplace(v.name, v.objectId);
+                s.viewNames_.emplace(NsKey{v.nsId, v.name}, v.objectId);
                 s.viewTopicIds_.emplace(v.def.viewTopicId, v.objectId);
                 s.views_.emplace(v.objectId, std::move(v));
             }
@@ -500,11 +508,11 @@ Applied ApplyV1::commit(CatalogState& s, const CatalogEvent& e, int64_t offset, 
             a.droppedTopicId = x.droppedTopicId;
             r.topicId = x.droppedTopicId;
             if (x.tomb.wasView) {
-                s.viewNames_.erase(x.tomb.name);
+                s.viewNames_.erase(s.viewNames_.find(NsKeyView{x.tomb.nsId, x.tomb.name}));
                 s.viewTopicIds_.erase(x.droppedTopicId);
                 s.views_.erase(x.objectId);
             } else {
-                s.topicNames_.erase(x.tomb.name);
+                s.topicNames_.erase(s.topicNames_.find(NsKeyView{x.tomb.nsId, x.tomb.name}));
                 s.topicIds_.erase(x.droppedTopicId);
                 s.topics_.erase(x.objectId);
             }

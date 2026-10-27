@@ -26,6 +26,7 @@
 #include <cstring>
 #include <cassert>
 #include <optional>
+#include <rune/protocol/client/NamespaceMessages.h>
 #include <rune/protocol/client/SchemaMessages.h>
 #include <rune/node/CatalogReadFlow.h>
 #include <cstdlib>
@@ -84,6 +85,11 @@
 #include <rune/node/ViewSnapshotIoAgent.h>
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/node/LeaderObserver.h>
+#include <rune/node/RuneMetrics.h>
+#include <metrics/MetricsFile.h>
+#include <metrics/MetricsWriter.h>
+#include <rune/node/RuneMetricSlot.h>
+#include <metrics/SystemMetrics.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
@@ -267,16 +273,18 @@ public:
         m.replicationFactor = replicationFactor;
         m.config = rune::protocol::convertTopicConfig<rune::protocol::TopicConfig>(config);
         m.meta   = ownMeta_(meta);
+        m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         m.adoptDenial.assign(adoptDenial);
         return submitDdl_(m);
     }
 
     bool submitGetSchema(int64_t sessionId, int64_t correlationId,
                          std::string_view name,
-                         uint64_t requestedFingerprint) override {
+                         uint64_t requestedFingerprint, uint32_t nsId) override {
         GetSchemaMsg m;
         m.session = sessionId;
         m.corr    = correlationId;
+        m.nsId    = nsId;   // namespaces Task 10: the gateway-resolved namespace
         m.name.assign(name);
         m.requestedFingerprint = requestedFingerprint;
         return encodeGetSchema(requestRing_, m);
@@ -293,6 +301,7 @@ public:
         m.topicName.assign(topicName);
         if (opsBlob && opsLen) m.opsBlob.assign(opsBlob, opsBlob + opsLen);
         m.meta = ownMeta_(meta);
+        m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         return submitDdl_(m);
     }
 
@@ -308,6 +317,7 @@ public:
         m.keyField.assign(keyField);
         if (planBlob && planLen) m.planBlob.assign(planBlob, planBlob + planLen);
         m.meta = ownMeta_(meta);
+        m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         return submitDdl_(m);
     }
 
@@ -318,6 +328,7 @@ public:
         m.corr    = correlationId;
         m.name.assign(name);
         m.meta = ownMeta_(meta);
+        m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         return submitDdl_(m);
     }
 
@@ -338,6 +349,7 @@ public:
             m.changes.push_back(rune::catalog::ConfigChange{static_cast<rune::catalog::ConfigKey>(c.key), c.value});
         }
         m.meta = ownMeta_(meta);
+        m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         return submitDdl_(m);
     }
 
@@ -348,6 +360,7 @@ public:
         m.corr    = correlationId;
         m.name.assign(name);
         m.meta = ownMeta_(meta);
+        m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         return submitDdl_(m);
     }
 
@@ -364,6 +377,7 @@ public:
         m.keyField.assign(keyField);
         if (planBlob && planLen) m.planBlob.assign(planBlob, planBlob + planLen);
         m.meta = ownMeta_(meta);
+        m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         return submitDdl_(m);
     }
 
@@ -395,6 +409,7 @@ public:
         m.force = (w.flags & rune::protocol::client::kSecurityDdlFlagForce) != 0 ? 1 : 0;
         m.denial.assign(denial);
         m.proofChecked = proofChecked ? 1 : 0;
+        m.callerNsId   = meta.callerNsId;   // namespaces Task 9: the session's namespace (Task 8's resolution input)
         return submitDdl_(m);
     }
     rune::gateway::AdminSubmit submitSecurityBootstrap(const rune::protocol::client::SecurityBootstrap& w,
@@ -414,6 +429,34 @@ public:
     }
     bool submitSecurityUnsubscribe(int64_t sessionId, int64_t subscriptionId) override {
         return encodeSecurityUnsubscribe(requestRing_, CatalogUnsubscribeMsg{sessionId, subscriptionId});
+    }
+
+    // ── Namespaces Task 7: NamespaceDdl (81) and ListNamespaces (82) (gateway → admin) ──────────────────────────
+    rune::gateway::AdminSubmit submitNamespaceDdl(const rune::protocol::client::NamespaceDdlRequest& w,
+                                                  const rune::gateway::DdlMetaView& meta, std::string_view denial,
+                                                  uint16_t clientVersion) override {
+        NamespaceDdlMsg m;
+        m.session = w.sessionId;
+        m.corr    = w.correlationId;
+        m.meta    = ownMeta_(meta);
+        m.kind    = static_cast<uint8_t>(w.kind);
+        m.name.assign(w.name);
+        m.mask    = w.presentMask;
+        m.limits  = w.limits;
+        m.denial.assign(denial);
+        m.clientVersion = clientVersion;
+        return submitDdl_(m);
+    }
+    rune::gateway::AdminSubmit submitListNamespaces(int64_t sessionId, int64_t correlationId, uint32_t afterNsId,
+                                                    uint16_t max, uint32_t callerNsId, bool clusterAdmin) override {
+        ListNamespacesMsg m;
+        m.session      = sessionId;
+        m.corr         = correlationId;
+        m.afterNsId    = afterNsId;
+        m.max          = max;
+        m.callerNsId   = callerNsId;
+        m.clusterAdmin = clusterAdmin ? 1 : 0;
+        return submitDdl_(m);
     }
 
     int doWork(int64_t nowNs) noexcept override {
@@ -572,6 +615,9 @@ public:
             // Authentication Task 10: the security write path and `__security` reads.
             case kMsgSecurityDdl:       worker_.submitSecurity(decodeSecurityDdl(p, n)); break;
             case kMsgSecurityBootstrap: worker_.submitSecurity(decodeSecurityBootstrap(p, n)); break;
+            // Namespaces Task 7.
+            case kMsgNamespaceDdl:      worker_.submit(decodeNamespaceDdl(p, n)); break;
+            case kMsgListNamespaces:    worker_.submit(decodeListNamespaces(p, n)); break;
             case kMsgSecuritySubscribe: {
                 CatalogSubscribeMsg m;
                 if (decodeCatalogSubscribe(p, n, m)) worker_.securitySubscribe(m);
@@ -749,6 +795,20 @@ public:
         [[maybe_unused]] const bool posted = n > 0 && postEgressFrame(session, egressStage_.data(), n);
         assert(posted && "a clamped DdlResponse always fits one admin egress message");
     }
+    /// Namespaces Task 7 — ADMIN thread only (deps.respondListNamespaces).  A ListNamespacesResponse (83): a page is
+    /// at most 100 entries (~33 KB), well inside one admin egress message (ring/8 = 128 KiB); a page that still
+    /// does not fit is answered ErrorResponse MessageTooLarge (never dropped).
+    void postListNamespacesResponse(int64_t session, const rune::protocol::client::ListNamespacesResponse& r) {
+        namespace pc = rune::protocol::client;
+        if (r.encodedSize() > maxEgressFrameBytes()) [[unlikely]] {
+            postErrorResponse(session, r.correlationId, static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge),
+                              "ListNamespaces page larger than one admin egress message");
+            return;
+        }
+        const std::size_t n = r.encode(egressStage_.data());
+        [[maybe_unused]] const bool posted = n > 0 && postEgressFrame(session, egressStage_.data(), n);
+        assert(posted && "a ListNamespaces page within maxEgressFrameBytes always fits one admin egress message");
+    }
     /// Catalog history Task 9 — ADMIN thread only (deps.respondError).  An
     /// ErrorResponse (5) carrying a DDL rejection's detail (InvalidRequest).
     void postErrorResponse(int64_t session, int64_t corr, uint16_t code, std::string_view message) {
@@ -829,9 +889,10 @@ public:
     /// Issues #15 / #111 - ADMIN thread only (deps.securityServing): kA2cSecurityServing on the effect FIFO (never
     /// dropped: the backlog keeps it in order behind the applied events).
     void postSecurityServing(bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader, int64_t knownEnd,
-                             bool behind) {
-        postCatalog_(kA2cSecurityServing, kSecurityServingWireLen,
-                     [&](uint8_t* p) { writeSecurityServing(p, caughtUp, leaderHw, epoch, asLeader, knownEnd, behind); });
+                             bool behind, bool held) {
+        postCatalog_(kA2cSecurityServing, kSecurityServingWireLen, [&](uint8_t* p) {
+            writeSecurityServing(p, caughtUp, leaderHw, epoch, asLeader, knownEnd, behind, held);
+        });
     }
     [[nodiscard]] SecurityBootEffects securityBootEffects() const { return SecurityBootEffects{}; }
     [[nodiscard]] SecurityEffects securitySinkForBootStash() { return securitySink_(); }
@@ -1085,11 +1146,11 @@ private:
 
     void postCatalogTopicApplied_(int32_t topicId, std::string_view name, int32_t partitions, int16_t rf,
                                   rune::catalog::Persistence persistence, const rune::protocol::TopicConfig& c,
-                                  int32_t typeId = kA2cCatalogTopicApplied) {
+                                  uint32_t nsId, int32_t typeId = kA2cCatalogTopicApplied) {
         const std::size_t len = catalogTopicAppliedWireLen(name, c);
         const uint8_t pers = persistence == rune::catalog::Persistence::Transient ? 1 : 0;
         postCatalog_(typeId, len, [&](uint8_t* p) {
-            writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c);
+            writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c, nsId);
         });
     }
 
@@ -1133,19 +1194,23 @@ private:
             // A typed topic's validator follows as schemaChanged (the applier posts both).  Its filter schema goes
             // FIRST: the gateway then validates (and the workers bind) a filter from the moment the topic serves.
             postCatalogFilterSchema_(t);
-            postCatalogTopicApplied_(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence, t.config);
+            postCatalogTopicApplied_(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence, t.config, t.nsId);
         };
         fx.sinkApplied = [this](const SinkSpec& s) {
             // A view sink is a keyed, compacted table (Task 19's sink spec), every broker (rf 0).
             rune::protocol::TopicConfig c;
             c.cleanupPolicy = 1;   // Compact
             c.partitionKey  = s.keyField;
-            postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf*/0, s.persistence, c,
+            postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf*/0, s.persistence, c, s.nsId,
                                      kA2cCatalogSinkApplied);   // Task 12 (N5)
         };
-        fx.topicDropped = [this](int32_t topicId, const std::string& name) {
+        fx.namespaceUpserted = [this](const rune::catalog::NamespaceRecord& r) {   // namespaces Task 9: login mirror
+            postCatalog_(kA2cNamespaceUpserted, namespaceUpsertedWireLen(r.name),
+                         [&](uint8_t* p) { writeNamespaceUpserted(p, r); });
+        };
+        fx.topicDropped = [this](int32_t topicId, uint32_t nsId, const std::string& name) {
             postCatalog_(kA2cCatalogTopicDropped, catalogTopicDroppedWireLen(name),
-                         [&](uint8_t* p) { writeCatalogTopicDropped(p, topicId, name); });
+                         [&](uint8_t* p) { writeCatalogTopicDropped(p, topicId, name, nsId); });
         };
         fx.topicConfig = [this](int32_t topicId, std::span<const rune::catalog::ConfigChange> changes) {
             const std::size_t n = changes.size();
@@ -1163,7 +1228,7 @@ private:
         fx.viewInstalled = [this, viewInstallRecovery](const rune::catalog::ViewObject& v) {
             std::vector<uint8_t> src;   // the first source's materialized descriptor (empty: untyped)
             if (!v.def.sourceNames.empty())
-                if (const RegistryEntry* e = catalogSchemas_->byName(v.def.sourceNames.front()))
+                if (const RegistryEntry* e = catalogSchemas_->byName(v.nsId, v.def.sourceNames.front()))
                     src = rune::codec::serialize(e->descriptor);
             const std::span<const uint8_t> plan(v.def.compiledPlanBlob), out(v.def.outputDescriptorBlob), sd(src);
             const uint8_t pers = v.def.persistence == rune::catalog::Persistence::Transient ? 1 : 0;
@@ -1346,8 +1411,8 @@ public:
     /// this node replicates but is NOT in the committed ISR of; -1 = unknown
     /// (no controller known yet, or the node is stopping).  0 = this node is
     /// fully back in sync — safe to restart the next node.  Also published as
-    /// the Aeron counter kOutOfSyncCounterTypeId by publishRole() (read it
-    /// out-of-band from cnc.dat, like the role counter).  Observer thread
+    /// the RuneMetric::OutOfSyncPartitions row of the metrics file by
+    /// publishRole() (read it out-of-band, like the role row).  Observer thread
     /// (the same single consumer as controlledShutdown()).
     int32_t outOfSyncPartitions() noexcept;
 
@@ -1409,14 +1474,25 @@ public:
     /// current-term announcements (term-aware assert_single_leader).
     rune::consensus::Term leadershipTermId() const noexcept;
 
-    /// Publish this node's current role/term/leaderId into the Aeron node-role
-    /// counter (RoleCounter.h) in the driver's CnC file.  Idempotent + cheap:
-    /// call it from the main poll loop on every tick.  No-op until the driver
-    /// has acked the counter allocation (findCounter returns the live Counter).
-    /// Observer thread (see above): one ring-drained snapshot; the counter is the
+    /// Publish this node's current role, term and out-of-sync count into the
+    /// observer's own rows of the metrics file (RuneMetric::Role / Term /
+    /// OutOfSyncPartitions, owner MetricOwner::Observer).  Idempotent + cheap:
+    /// call it from the main poll loop on every tick.  No-op before start()
+    /// (the rows are allocated there, before any agent thread starts: D59).
+    /// Observer thread (see above): one ring-drained snapshot; the rows are the
     /// machine-readable signal the dr-e2e harness reads (via rune_role) instead
     /// of scraping logs.
     void publishRole() noexcept;
+
+    /// The metrics file this node publishes every RuneMetric in (D54); empty before start().  Immutable after start().
+    [[nodiscard]] const std::string& metricsFilePath() const noexcept { return metricsPath_; }
+
+    /// Test seam (D58): the owners that have written row `m` so far, one metricOwnerBit per MetricOwner.  Debug
+    /// builds only (a release build compiles the record out: always 0).  Any thread (atomic_ref, relaxed).
+    [[nodiscard]] std::uint8_t metricWrittenByForTest(RuneMetric m) const noexcept {
+        auto& b = const_cast<std::uint8_t&>(metricWrittenBy_[static_cast<std::size_t>(runeMetricRow(m))]);
+        return std::atomic_ref<std::uint8_t>(b).load(std::memory_order_relaxed);
+    }
 
     /// Return the leader's client Aeron channel for data-op redirect (GB-4).
     /// Observer thread (see above): ring-drained snapshot + immutable peer config.
@@ -2223,7 +2299,7 @@ private:
     std::optional<SecurityServing> securityServing_;   // engaged iff the broker authenticates (gateway Required)
     int64_t controlNowNs_ = 0;   // PR #459 M2: the current control pass's clock (serviceAdminControl_), control thread
     void publishSecurityMetrics_() noexcept;
-    [[nodiscard]] bool securityMetricsPending_() const noexcept;
+    void publishLoginTallies_() noexcept;   // control thread, every pass: the gateway's login tallies (D59)
     int  serviceAuthMode_(int64_t nowNs);
     // Authentication Task 15 (D33): the inter-broker link handshakes.  buildPeerLinks_ (startup thread) builds the
     // PeerLinkAgent when authMode == Enabled and there is more than one peer; servicePeerLinks_ (control thread, every
@@ -2268,7 +2344,7 @@ private:
     //   2. serviceDroppedTopics_ (each pass): once every worker and the cleaner /
     //      provisioner acked a generation >= retireGen (collectRetired's bound),
     //      the Logs are closed (releaseDroppedLogs) → AwaitingRename; then
-    //      rename(topics/<name>, dropped/<id>.<name>) — atomic; a failure is
+    //      rename(ns-<nsId>/topics/<name>, ns-<nsId>/dropped/<id>.<name>) — atomic; a failure is
     //      logged and retried next pass, never deleted in place — and the path
     //      is posted to the admin thread (kMsgPurgeDroppedDir), which removes it
     //      (a failure leaves it for the boot purge: reconcileTopicDirs, Task 16).
@@ -2278,12 +2354,12 @@ private:
     // -----------------------------------------------------------------------
     void onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView = false);
     void runCatalogCreate_(const TopicSpec& spec);
-    void dropRuntimeTopic_(int32_t topicId, const std::string& name);
+    void dropRuntimeTopic_(int32_t topicId, uint32_t nsId, const std::string& name);
     void onCatalogTopicConfig_(const uint8_t* p, std::size_t n);
     void onViewUninstall_(int32_t viewTopicId);
     int  serviceDroppedTopics_();
     int  pumpCatalogOutboxes_();
-    [[nodiscard]] bool catalogNameHeldByDrop_(const std::string& name) const noexcept;
+    [[nodiscard]] bool catalogNameHeldByDrop_(uint32_t nsId, const std::string& name) const noexcept;
     [[nodiscard]] bool catalogTopicServes_(int32_t topicId) const noexcept;
 
     // -----------------------------------------------------------------------
@@ -2513,23 +2589,6 @@ private:
     uint64_t                                              securityAnswersHeld_    = 0;
     uint64_t                                              securityAnswersDropped_ = 0;
     uint64_t                                              securityAlterIsrRefused_ = 0;
-    std::int64_t                     securityHaltedCounterRegId_  = -1;
-    std::int64_t                     securityAppliedCounterRegId_ = -1;
-    std::int64_t                     authModeCounterRegId_        = -1;
-    std::shared_ptr<aeron::Counter>  securityHaltedCounter_;
-    std::shared_ptr<aeron::Counter>  securityAppliedCounter_;
-    std::shared_ptr<aeron::Counter>  authModeCounter_;
-    // Authentication Task 11: 1'000'229 logins ok, 230 failed, 231 rate-limited (the gateway's control-thread tallies).
-    std::int64_t                     loginsOkCounterRegId_          = -1;
-    std::int64_t                     loginsFailedCounterRegId_      = -1;
-    std::int64_t                     loginsRateLimitedCounterRegId_ = -1;
-    std::shared_ptr<aeron::Counter>  loginsOkCounter_;
-    std::shared_ptr<aeron::Counter>  loginsFailedCounter_;
-    std::shared_ptr<aeron::Counter>  loginsRateLimitedCounter_;
-    std::int64_t                     sessionsRevokedCounterRegId_ = -1;   // Task 14: 1'000'232
-    std::shared_ptr<aeron::Counter>  sessionsRevokedCounter_;
-    std::uint64_t                    publishedSessionsRevoked_ = 0;
-    std::uint64_t                    publishedLoginsOk_ = 0, publishedLoginsFailed_ = 0, publishedLoginsRateLimited_ = 0;
     std::int64_t                     securityHaltedValue_  = 0;    // control-thread-owned (0 = applying)
     std::int64_t                     securityAppliedValue_ = -1;   // control-thread-owned
     DevModeWarnTimer                 devModeWarn_;                 // control thread
@@ -2548,12 +2607,6 @@ private:
     static void onWorkerPeerFrameDropsThunk_(void* self, int32_t worker, uint64_t drops);
     std::vector<uint64_t>            workerPeerDrops_;             // control thread: the workers' last reports
     uint64_t                         adminPeerDrops_ = 0;          // control thread: the admin plane's last report
-    std::int64_t                     peerDropsCounterRegId_ = -1;
-    std::shared_ptr<aeron::Counter>  peerDropsCounter_;
-    std::int64_t                     peerEstablishedCounterRegId_ = -1;
-    std::int64_t                     peerRefusalsCounterRegId_    = -1;
-    std::shared_ptr<aeron::Counter>  peerEstablishedCounter_;
-    std::shared_ptr<aeron::Counter>  peerRefusalsCounter_;
     // Catalog history Task 16 — the boot from __catalog (startup thread; immutable after start()).
     /// Opens/replays the local __catalog on the startup thread and fills the members below.
     void bootFromCatalog_();
@@ -2618,11 +2671,7 @@ private:
     int64_t          haltedSinceNs_ = -1;
     PlacementViewMsg placementPosted_{};
     bool             placementPostedOnce_ = false;
-    std::int64_t     unplaceableCounterRegId_ = -1;
-    std::shared_ptr<aeron::Counter> unplaceableCounter_;
     std::int64_t     unplaceablePublished_ = -1;
-    std::int64_t     blockedCounterRegId_  = -1;   // Task 11 fix round 5 (M5)
-    std::shared_ptr<aeron::Counter> blockedCounter_;
     // DR-bugs fix round 1 (review B-I2): link-MTU watchdog — CONTROL thread only.  The probe host is resolved
     // once at start (empty = every endpoint loopback: the watchdog is off); every kMtuProbePeriodNs the
     // interface MTU of its route is compared with the Aeron MTU; an ERROR on the below edge, a WARN on the
@@ -2640,11 +2689,6 @@ private:
     int32_t          linkMtuDeficit_       = 0;
     uint64_t         mtuBelowEdges_        = 0;
     uint64_t         mtuRestoredEdges_     = 0;
-    std::int64_t     linkMtuCounterRegId_  = -1;
-    std::shared_ptr<aeron::Counter> linkMtuCounter_;
-    // ISR v3 §3.10: the storage counters (registered with the others, published by publishStorageMetrics_).
-    std::array<std::int64_t, 4>                    storageCounterRegIds_{-1, -1, -1, -1};
-    std::array<std::shared_ptr<aeron::Counter>, 4> storageCounters_{};
     std::function<int32_t()> mtuProbeForTest_;   ///< cold test seam (setMtuProbeForTest)
     std::function<void(HostNetFacts&)> hostFactsOverrideForTest_;   ///< cold test seam (B-M5)
     bool holdTransientLineageForTest_ = false;   ///< control thread only (holdTransientLineageForTest)
@@ -2707,6 +2751,7 @@ private:
     static constexpr int64_t kRenameRetryMaxNs = 10'000'000'000;  // 10 s
     struct DroppedTopic {
         int32_t                                      id = -1;
+        uint32_t                                     nsId = 0;   // namespaces Task 6: its dir is under ns-<nsId>
         std::string                                  name;
         bool                                         diskBacked = true;
         std::variant<drop_step::AwaitingRetire, drop_step::AwaitingRename> step;
@@ -2836,9 +2881,6 @@ private:
     std::unique_ptr<ParkUntilWorkIdle>                    provisionerIdleStrategy_;
     rune::consensus::MonotonicNanoClock                   provisionerClock_;
     std::unique_ptr<rune::consensus::AgentRunner>         provisionerRunner_;
-    std::array<std::int64_t, SegmentProvisionerAgent::kMetricCount>                    provCounterRegIds_{-1, -1, -1, -1, -1};
-    std::array<std::shared_ptr<aeron::Counter>, SegmentProvisionerAgent::kMetricCount> provCounters_{};
-    static void publishProvisionMetric_(void* self, int metric, std::int64_t value) noexcept;
     [[nodiscard]] rune::storage::ProvisionChannel* provisionChannel_() noexcept {
         return provisionerAgent_ ? provisionerAgent_->channel() : nullptr;
     }
@@ -2864,47 +2906,42 @@ private:
 
     std::shared_ptr<aeron::Aeron> aeron_;
 
-    // -----------------------------------------------------------------------
-    // Aeron node-role counter (RoleCounter.h) — machine-readable leadership.
-    // Allocated in start() after aeron_ connects; updated by publishRole().
-    // roleCounterRegId_ is the pending registration id until the driver acks
-    // (findCounter returns the live Counter, cached in roleCounter_).
-    // -----------------------------------------------------------------------
-    std::int64_t                     roleCounterRegId_ = -1;
-    std::int64_t                     termCounterRegId_ = -1;
-    std::shared_ptr<aeron::Counter>  roleCounter_;
-    std::shared_ptr<aeron::Counter>  termCounter_;
-    std::int64_t                     outOfSyncCounterRegId_ = -1;   ///< readiness gate (L5)
-    std::shared_ptr<aeron::Counter>  outOfSyncCounter_;
-    // Catalog history Task 7: the CatalogApplier's metrics (RoleCounter.h).
-    // Resolved and set on the CONTROL thread only, from the admin→control drain
-    // (kA2cCatalogHalted / kA2cCatalogApplied); released in stop() before aeron_.
-    std::int64_t                     catalogHaltedCounterRegId_  = -1;
-    std::int64_t                     catalogAppliedCounterRegId_ = -1;
-    std::shared_ptr<aeron::Counter>  catalogHaltedCounter_;
-    std::shared_ptr<aeron::Counter>  catalogAppliedCounter_;
+    // Catalog history Task 7: the CatalogApplier's metrics, set on the CONTROL thread only from the admin→control
+    // drain (kA2cCatalogHalted / kA2cCatalogApplied) into the metrics file.
     std::int64_t                     catalogHaltedValue_  = 0;    // control-thread-owned (0 = applying)
     std::int64_t                     catalogAppliedValue_ = -1;   // control-thread-owned
     void publishCatalogMetrics_() noexcept;
-    /// A value arrived (applied >= 0 or halted) while a registered counter is
-    /// still unresolved — derived from the values and the counter pointers, no
-    /// stored flag (fix round 1, M4).
-    [[nodiscard]] bool catalogMetricsPending_() const noexcept {
-        const bool hasValue = catalogAppliedValue_ >= 0 || catalogHaltedValue_ != 0;
-        return hasValue && ((!catalogHaltedCounter_ && catalogHaltedCounterRegId_ >= 0) ||
-                            (!catalogAppliedCounter_ && catalogAppliedCounterRegId_ >= 0));
-    }
-    // D9 review MEDIUM-3: the TCS stuck-markers gauge counter.  Resolved and
-    // set on the CONTROL (runtime) thread only, from the TCS sink below.
-    std::int64_t                     stuckMarkersCounterRegId_ = -1;
-    std::shared_ptr<aeron::Counter>  stuckMarkersCounter_;
+    // D9 review MEDIUM-3 / #359: the TCS sinks (control thread) - stuck markers, stuck txn offset commits + oldest age.
     static bool publishStuckMarkers_(void* self, std::int64_t value);
-    // #359: stuck transactional offset commits (count, oldest age ms).
-    std::int64_t                     stuckTxnOffsetsCounterRegId_ = -1;
-    std::int64_t                     stuckTxnOffsetAgeCounterRegId_ = -1;
-    std::shared_ptr<aeron::Counter>  stuckTxnOffsetsCounter_;
-    std::shared_ptr<aeron::Counter>  stuckTxnOffsetAgeCounter_;
     static bool publishStuckTxnOffsets_(void* self, std::int64_t stuck, std::int64_t oldestAgeMs);
+
+    // -----------------------------------------------------------------------
+    // arcanum-metrics (plan Task 8): the node's metrics file.  start() creates it, allocates EVERY kRuneMetrics row
+    // (slots_[row]) and inits systemMetrics_ before any agent starts (D59); a failure throws out of start().  Each
+    // slot has ONE writer thread (RuneMetricDef::owner); the control rows are written by the control thread only.
+    // Task 9 (D58): the observer's rows are copied into observerSlots_ and the provisioner's into its constructor,
+    // both before any thread starts; nothing else touches them.  Every store carries its writer's owner tag; a debug
+    // build records it in metricWrittenBy_ (one bit per MetricOwner per row) and asserts it is the row's owner.
+    // metricsFile_ owns the mapping (unmapped at destruction, after every agent joined).
+    // -----------------------------------------------------------------------
+    metrics::MetricsFile                                  metricsFile_;
+    metrics::MetricsWriter                                metricsWriter_;
+    std::vector<int32_t>                                  metricsFreeStack_;   // sized maxSlots once at start (cold)
+    std::array<RuneMetricSlot, kNodeMetricCount>          slots_{};
+    std::array<std::uint8_t, kNodeMetricCount>            metricWrittenBy_{};   // debug owner-tag record (D58)
+    struct ObserverSlots { RuneMetricSlot role, term, outOfSync; };
+    ObserverSlots                                         observerSlots_{};     // observer thread only (publishRole)
+    std::optional<metrics::SystemMetrics>                 systemMetrics_;      // control thread (D62)
+    bool                                                  metricsReady_ = false;   // set by start(), before agents
+    std::string                                           metricsPath_;
+    void createMetrics_();   // startup thread: steps 1-4 of the plan's start order
+    /// A control-thread store into a MetricOwner::Control row.
+    void controlSet_(RuneMetric m, std::int64_t v) noexcept {
+        slots_[static_cast<std::size_t>(runeMetricRow(m))].set(v, MetricOwner::Control);
+    }
+    [[nodiscard]] std::int64_t controlGet_(RuneMetric m) const noexcept {
+        return slots_[static_cast<std::size_t>(runeMetricRow(m))].get();
+    }
 
     // -----------------------------------------------------------------------
     // State flags — CONTROLLER-owned (F9a: no atomics).  Written only by the

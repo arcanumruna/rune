@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <rune/node/NamespacePaths.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/protocol/RecordBatch.h>
@@ -84,7 +85,7 @@ TEST(TopicRegistry, SingleTopicSinglePartition) {
     ASSERT_NE(log, nullptr);
 
     // log dir exists on disk
-    auto expectedDir = dir / "topics" / "chat" / "0";
+    auto expectedDir = rune::node::topicsRoot(dir, 0) / "chat" / "0";
     EXPECT_TRUE(std::filesystem::exists(expectedDir));
 }
 
@@ -105,7 +106,7 @@ TEST(TopicRegistry, MultiTopicMultiPartition) {
     for (int32_t p = 0; p < 8; ++p) {
         Log* l = reg.log(0, p);
         ASSERT_NE(l, nullptr) << "partition " << p;
-        auto d = dir / "topics" / "inventory" / std::to_string(p);
+        auto d = rune::node::topicsRoot(dir, 0) / "inventory" / std::to_string(p);
         EXPECT_TRUE(std::filesystem::exists(d)) << "missing dir for partition " << p;
     }
 

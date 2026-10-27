@@ -18,6 +18,7 @@
 // Namespace: rune::gateway.  C++23.
 
 #include <rune/protocol/CatalogTypes.h>
+#include <rune/protocol/client/NamespaceMessages.h>
 #include <rune/protocol/client/SecurityMessages.h>
 
 #include <cstddef>
@@ -44,6 +45,9 @@ struct DdlMetaView {
     int64_t                         sessionId = 0;   // the session (gateway-supplied)
     rune::protocol::RequestId       requestId{};     // {0, 0} = a pre-v8 client (F14)
     std::optional<ReplayedFromView> replayedFrom;    // absent unless the DDL is a replay
+    uint32_t                        callerNsId = 0;  // namespaces Task 9: the session's namespace (0 = `default`)
+    uint32_t                        targetNsId = 0;  // namespaces Task 10: the object's resolved namespace
+                                                     // (NsResolve.h; kHiddenNsId = hidden or unknown, answered as missing)
 };
 
 /// The outcome of handing a request to the admin thread.
@@ -96,10 +100,11 @@ struct IAdminRequestSink {
 
     // GetTopicSchema (66) — a read, no DDL extension.  requestedFingerprint
     // (Task 13): 0 = latest; non-zero = the SPECIFIC version whose per-version
-    // fingerprint matches.  true = enqueued, false = ring full.
+    // fingerprint matches.  true = enqueued, false = ring full.  nsId (namespaces Task 10): the resolved namespace of
+    // `name` (its local part).
     virtual bool submitGetSchema(int64_t sessionId, int64_t correlationId,
                                  std::string_view name,
-                                 uint64_t requestedFingerprint) = 0;
+                                 uint64_t requestedFingerprint, uint32_t nsId) = 0;
 
     // AlterTopic (68).  expectedVersion: 0 = unconditional; non-zero = the
     // topic's schema version (SchemaConflict on a mismatch).  opsBlob:
@@ -162,6 +167,17 @@ struct IAdminRequestSink {
     // as the catalog's; an Unsubscribe of a security subscription id (isSecuritySubscriptionId) uses this one.
     virtual bool submitSecuritySubscribe(int64_t sessionId, int64_t correlationId, int64_t fromOffset) = 0;
     virtual bool submitSecurityUnsubscribe(int64_t sessionId, int64_t subscriptionId) = 0;
+
+    // Namespaces Task 7: NamespaceDdl (81), answered by a DdlResponse (78) from the admin thread.  `denial` follows
+    // submitSecurityDdl's rules ("" = cluster admin; otherwise forwarded with the NotAuthorized detail when it carries a
+    // request id, so a retry of an applied request still gets its original answer).  `clientVersion` picks the
+    // NamespaceLimitExceeded code (52, v14+) or InvalidRequest (39) for an older session.
+    virtual AdminSubmit submitNamespaceDdl(const rune::protocol::client::NamespaceDdlRequest& m, const DdlMetaView& meta,
+                                           std::string_view denial, uint16_t clientVersion) = 0;
+    // ListNamespaces (82): answered on ANY broker from the admin thread's applied catalog (no route, no append) by a
+    // ListNamespacesResponse (83).  A non-admin caller sees only `callerNsId`.
+    virtual AdminSubmit submitListNamespaces(int64_t sessionId, int64_t correlationId, uint32_t afterNsId, uint16_t max,
+                                             uint32_t callerNsId, bool clusterAdmin) = 0;
 };
 
 } // namespace rune::gateway

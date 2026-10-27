@@ -50,6 +50,7 @@ if(BUILD_TESTING)
             tests/protocol/client/CatalogDdlMessagesTest.cpp
             tests/protocol/client/AuthMessagesTest.cpp
             tests/protocol/client/SecurityMessagesTest.cpp
+            tests/protocol/client/NamespaceMessagesTest.cpp
             tests/protocol/ReplicationSchemaV4Test.cpp
             tests/protocol/internal/RingSbeTest.cpp
             tests/protocol/net/UdpGsoPlanTest.cpp)

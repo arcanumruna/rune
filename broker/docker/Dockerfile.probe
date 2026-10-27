@@ -37,6 +37,8 @@ COPY --from=rune-protocol include /rune-protocol/include
 COPY --from=rune-protocol src     /rune-protocol/src
 COPY --from=flight-recorder src     /flight-recorder/src
 COPY --from=flight-recorder include /flight-recorder/include
+# arcanum-metrics is header-only (the `metrics` INTERFACE target); configure fails without it.
+COPY --from=arcanum-metrics include /arcanum-metrics/include
 COPY --from=rune-codec src     /rune-codec/src
 COPY --from=rune-codec include /rune-codec/include
 COPY --from=rune-crypto src     /rune-crypto/src
@@ -56,6 +58,7 @@ RUN cmake -S . -B build -G Ninja \
         -DRUNE_CODEC_ROOT=/rune-codec \
         -DRUNE_CRYPTO_ROOT=/rune-crypto \
         -DFLIGHT_RECORDER_DIR=/flight-recorder \
+        -DARCANUM_METRICS_DIR=/arcanum-metrics \
         -DBUILD_PING_PROBE=ON \
     && cmake --build build --target ping_probe -j2
 

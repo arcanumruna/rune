@@ -24,6 +24,9 @@ AuthGate gateFor(const SessionAuth& a, pc::TemplateId tid, bool bootstrapOpen, b
     if (std::holds_alternative<AuthPasswordChangeRequired>(a))
         return tid == pc::TemplateId::SecurityDdl && isSelfSetPassword ? AuthGate::Allow
                                                                        : AuthGate::AnswerPasswordChangeRequired;
+    if (std::holds_alternative<AuthAnonymousRead>(a))   // namespaces Task 9: the anonymous reader describes, nothing more
+        return tid == pc::TemplateId::MetadataRequest || tid == pc::TemplateId::GetTopicSchema
+                   ? AuthGate::Allow : AuthGate::AnswerNotAuthorized;
     return AuthGate::Allow;   // AuthAuthenticated / AuthAnonymous
 }
 

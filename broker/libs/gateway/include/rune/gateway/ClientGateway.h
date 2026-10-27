@@ -64,10 +64,12 @@
 #include <rune/gateway/SecurityView.h>
 #include <rune/gateway/SessionAuth.h>
 #include <rune/gateway/Authorizer.h>
+#include <rune/gateway/NsResolve.h>
 #include <rune/gateway/LiveSecurityChanges.h>
 #include <rune/gateway/ObjectIndex.h>
 #include <rune/gateway/LoginThrottle.h>
 #include <rune/gateway/ScramServer.h>
+#include <rune/catalog/NamespaceRegistry.h>
 #include <rune/gateway/FilterAdmission.h>
 #include <rune/peerlink/ClusterKeys.h>
 // client<->broker TLS/AEAD (Task 7): server-role handshake driver. SessionTable.h
@@ -513,11 +515,12 @@ public:
     }
     /// Issue #259 test seam: authenticate `sid` as `userId` holding exactly `grants` (sorted, unique) - through the pool
     /// and the shipper, as a login does.
-    void authenticateWithGrantsForTest(int64_t sid, uint64_t userId, std::vector<rune::security::GrantSpec> grants) {
+    void authenticateWithGrantsForTest(int64_t sid, uint64_t userId, std::vector<rune::security::GrantSpec> grants,
+                                       uint32_t nsId = 0) {
         Session* s = sessions_.find(sid);
         if (s == nullptr) return;
         s->auth = rune::gateway::AuthAuthenticated{userId, "u" + std::to_string(userId),
-                                                    permPool_.acquire(std::move(grants), objectIndex_), {}};
+                                                    permPool_.acquire(std::move(grants), nsId, objectIndex_), {}, nsId};
         (void)shipPermissions_(*s);
     }
     int servicePermissionShippingForTest() { return servicePermissionShipping_(); }
@@ -531,8 +534,17 @@ public:
     // ── authentication Task 12: per-session permission tables and the enforcement of every request type ──
     /// Boot (startup thread, before any thread runs): the catalog's live topics / views, from the replay.
     void setBootObjects(rune::gateway::ObjectIndex objects) { objectIndex_ = std::move(objects); }
+    /// Namespaces Task 9 (spec §2): the booted catalog's namespaces (startup thread, before any thread runs), then
+    /// the applier's namespaceUpserted effects (kA2cNamespaceUpserted, control drain) - the login lookup's mirror.
+    void setBootNamespaces(const rune::catalog::NamespaceRegistry& r) { namespaces_ = rune::catalog::NamespaceMirror(r); }
+    void onNamespaceUpserted(const rune::catalog::NamespaceRecord& r) { (void)namespaces_.upsert(r); }
+    /// Namespaces Task 9 (spec §11, RUNE_ANONYMOUS_READ, off by default): in Required mode a session that sends a
+    /// request without logging in becomes AuthAnonymousRead (nsId 0, Describe-only) instead of being ended.
+    void setAnonymousRead(bool on) noexcept { anonymousRead_ = on; }
     /// The control drain of kA2cCatalogTopicApplied / kA2cCatalogSinkApplied: a topic / view exists at `id`; every
     /// authenticated session's table is extended from its retained patterns (spec §6).  Idempotent.
+    void onCatalogObjectApplied(uint32_t nsId, int32_t id, const std::string& name, bool isView);
+    /// The `default` namespace (nsId 0).
     void onCatalogObjectApplied(int32_t id, const std::string& name, bool isView);
     /// kA2cCatalogTopicDropped: the id is gone; every table's bits for it are cleared.  Idempotent.
     void onCatalogObjectDropped(int32_t id);
@@ -1484,6 +1496,8 @@ public:
         case pc::TemplateId::AlterView:        handleAlterView(buf, len); break;
         case pc::TemplateId::SecurityDdl:      handleSecurityDdl(buf, len); break;
         case pc::TemplateId::SecurityBootstrap: handleSecurityBootstrap(buf, len); break;
+        case pc::TemplateId::NamespaceDdl:     handleNamespaceDdl(buf, len); break;
+        case pc::TemplateId::ListNamespaces:   handleListNamespaces(buf, len); break;
         default: break;
         }
     }
@@ -1941,7 +1955,8 @@ private:
     template <class Msg, class Submit>
     void handleCatalogDdl_(const uint8_t* buf, std::size_t len, const char* what, Submit&& submit);
     [[nodiscard]] static rune::gateway::DdlMetaView
-        ddlMetaOf_(const rune::protocol::client::DdlExtension* ext, int64_t sessionId, const Session& session) noexcept;
+        ddlMetaOf_(const rune::protocol::client::DdlExtension* ext, int64_t sessionId, const Session& session,
+                   uint32_t targetNsId) noexcept;
     void answerAdminSubmit_(const uint8_t* buf, std::size_t len, rune::gateway::AdminSubmit r,
                             const char* ringFull, const char* tooLarge);
     /// Task 11: the DDL route gate — true = answered here (never submitted):
@@ -1955,6 +1970,9 @@ private:
     // Authentication Task 10: SecurityDdl (79) and SecurityBootstrap (80).
     void handleSecurityDdl      (const uint8_t* buf, std::size_t len);
     void handleSecurityBootstrap(const uint8_t* buf, std::size_t len);
+    // Namespaces Task 7: NamespaceDdl (81) and ListNamespaces (82).
+    void handleNamespaceDdl     (const uint8_t* buf, std::size_t len);
+    void handleListNamespaces   (const uint8_t* buf, std::size_t len);
     // Task 20: GetViewRow (72) — build a GetViewRow WorkerOp routed to the
     // owning worker (same op/return plumbing as PushRead); the worker's
     // ViewRowResult is encoded as a ViewRowResponse (73) in drainWorkerReturns_.
@@ -2446,6 +2464,27 @@ private:
     uint64_t controlBatchRefusals_ = 0;   ///< X036: Produce frames refused for carrying a client control batch (rate-limited log)
     static void noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr);
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
+    rune::catalog::NamespaceMirror namespaces_;   ///< namespaces Task 9: control thread's copy (login lookup)
+    bool anonymousRead_ = false;                  ///< namespaces Task 9: RUNE_ANONYMOUS_READ (off by default)
+    /// Namespaces Task 9: the session's namespace (AuthAuthenticated / AuthPasswordChangeRequired; 0 otherwise -
+    /// anonymous and not-yet-logged-in sessions are `default`'s, D12).
+    [[nodiscard]] static uint32_t sessionNsId_(const Session& s) noexcept;
+    /// Namespaces Task 10 (D7, D9): a request's object name in the session's view (NsResolve.h).  Zero allocation.
+    [[nodiscard]] rune::gateway::Resolution resolve_(const Session& s, std::string_view qualified) const noexcept {
+        return rune::gateway::resolveName(sessionNsId_(s), permsOf_(s).isRoot(), namespaces_.registry(), qualified);
+    }
+    /// PR #642 review F1/F2: whether user name `name` (bare or "ns/local") resolves to the session's own account
+    /// (`self` = its local user name): the session's namespace and the same local name.  Zero allocation.
+    [[nodiscard]] bool ownUserName_(const Session& s, std::string_view name, std::string_view self) const noexcept {
+        const rune::gateway::Resolution r = resolve_(s, name);
+        return r.r == rune::gateway::Resolved::Found && r.nsId == sessionNsId_(s) && r.local == self && !self.empty();
+    }
+    /// Namespaces Task 9: the anonymous-read table (Describe on every topic / view of `default`), pooled.
+    [[nodiscard]] rune::gateway::PermissionRef anonPerms_();
+    /// Namespaces Task 9: with RUNE_ANONYMOUS_READ on, an AwaitingFirst session that sends a request other than a login
+    /// leg / the bootstrap becomes the anonymous reader of `default`.  Both entry points (authGateRefuses_ and
+    /// handleProduce's cold branch) call this, so the first request's kind never changes the outcome.
+    void becomeAnonymousIfAllowed_(Session& session, rune::protocol::client::TemplateId tid);
     const rune::gateway::SecurityView* securityView_ = nullptr;   // control thread's own mirror (same thread as the gateway)
     bool     securityServing_ = true;           ///< issues #15 / #111: see setSecurityServing
     int64_t  securityKnownEnd_ = -1;            ///< #205: see setSecurityKnownEnd
@@ -2516,7 +2555,7 @@ private:
     /// The permission table the session's auth state grants: its compiled one, allow-all (anonymous), else deny-all.
     [[nodiscard]] const rune::gateway::PermissionTable& permsOf_(const Session& s) const noexcept;
     /// Compile the table of `userId` against the live ObjectIndex (login and SET PASSWORD; Task 14 refreshes with it).
-    [[nodiscard]] rune::gateway::PermissionRef compilePerms_(uint64_t userId);
+    [[nodiscard]] rune::gateway::PermissionRef compilePerms_(uint64_t userId, uint32_t nsId);
     /// Issue #259: the pool's table births / deaths to the shard workers (FIFO, before any bind or patch).
     void syncPermissionTables_();
     /// true = DENIED here: answered NotAuthorized (45) in the request's own response type (D23 text where the type
@@ -2548,8 +2587,14 @@ private:
     [[nodiscard]] std::size_t filterFetchAllByRead_(const Session& session, const uint8_t* reqBuf, std::size_t reqLen,
                                                     std::size_t encoded);
     [[nodiscard]] bool denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
+    /// Namespaces D8, the cluster admin's half: root logs in to `default`, so the session-nsId check passes it; a
+    /// group / txn request naming a non-default topic id, or a group / transactional id qualified by an existing
+    /// non-default namespace, is still outside `default`.  Non-root sessions: false (their nsId check, then their
+    /// grants, decide).  Zero allocation (zero-copy decoders).
+    [[nodiscard]] bool rootOutsideDefault_(const Session& session, uint16_t tid, const uint8_t* buf, std::size_t len) const;
     [[nodiscard]] bool denyTxnRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
-    template <class Msg> [[nodiscard]] std::optional<rune::gateway::Denial> authorizeCatalogDdl_(const Session& session, const Msg& m) const;
+    template <class Msg> [[nodiscard]] std::optional<rune::gateway::Denial> authorizeCatalogDdl_(const Session& session, const Msg& m,
+                                                                                               std::string_view local) const;
     /// D19: READ on every source topic of a CreateView / AlterView plan (an undecodable blob is left to the admin thread).
     [[nodiscard]] std::optional<rune::gateway::Denial> authorizeViewSources_(const Session& session, const uint8_t* blob,
                                                                               std::size_t len) const;

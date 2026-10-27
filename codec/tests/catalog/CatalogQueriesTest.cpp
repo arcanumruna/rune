@@ -98,7 +98,7 @@ TEST(CatalogQueriesRegression, AsOfOffsetTimeAndVersionAgree) {
     ASSERT_TRUE(byOffset && byTime && byVer);
     EXPECT_EQ(byOffset->digest(), byTime->digest());
     EXPECT_EQ(byOffset->digest(), byVer->digest()) << "event 5 produced players schema version 3";
-    EXPECT_EQ(byOffset->topicByName("players")->schema->schemaVersion, 3);
+    EXPECT_EQ(byOffset->topicByName(rune::catalog::kDefaultNsId, "players")->schema->schemaVersion, 3);
     EXPECT_EQ(byOffset->appliedOffset(), 5);
 }
 
@@ -130,11 +130,11 @@ TEST(CatalogQueriesRegression, AsOfTopicAndViewVersionsSelectTheLatestObjectOfTh
     auto ev = rc::stateAsOf(log, {.by = rc::AsOf::By::Version, .value = 3, .type = rc::ObjectType::Topic, .name = "events"});
     ASSERT_TRUE(ev.has_value()) << ev.error().detail;
     EXPECT_EQ(ev->appliedOffset(), 7);
-    EXPECT_EQ(ev->topicByName("events")->config.retentionMs, 60'000);
+    EXPECT_EQ(ev->topicByName(rune::catalog::kDefaultNsId, "events")->config.retentionMs, 60'000);
     auto v = rc::stateAsOf(log, {.by = rc::AsOf::By::Version, .value = 2, .type = rc::ObjectType::View, .name = "top_players"});
     ASSERT_TRUE(v.has_value()) << v.error().detail;
     EXPECT_EQ(v->appliedOffset(), 10);
-    EXPECT_EQ(v->viewByName("top_players")->def.viewTopicId, 4);
+    EXPECT_EQ(v->viewByName(rune::catalog::kDefaultNsId, "top_players")->def.viewTopicId, 4);
 }
 
 TEST(CatalogQueriesRegression, AsOfAMissingVersionIsAnExplicitError) {
@@ -446,7 +446,7 @@ TEST(CatalogQueriesRegression, AsOfOffsetBoundariesRegression) {
     ASSERT_TRUE(first.has_value());
     EXPECT_EQ(first->appliedOffset(), 0);
     EXPECT_EQ(first->topics().size(), 1u);
-    EXPECT_NE(first->topicByName("players"), nullptr);
+    EXPECT_NE(first->topicByName(rune::catalog::kDefaultNsId, "players"), nullptr);
 
     auto atLast = rc::stateAsOf(log, {.by = rc::AsOf::By::Offset, .value = last});
     ASSERT_TRUE(atLast.has_value());

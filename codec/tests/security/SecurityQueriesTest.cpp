@@ -33,7 +33,7 @@ TEST(SecurityQueriesRegression, AsOfOffsetAndTimeBoundariesAreInclusive) {
     auto s6 = rs::stateAsOf(log, {rs::AsOf::By::Offset, 6});
     ASSERT_TRUE(s6.has_value());
     EXPECT_EQ(s6->appliedOffset(), 6) << "the event AT the boundary is included";
-    EXPECT_EQ(s6->user("ws1")->roles.size(), 1u);
+    EXPECT_EQ(s6->userByName(rune::catalog::kDefaultNsId, "ws1")->roles.size(), 1u);
     auto before = rs::stateAsOf(log, {rs::AsOf::By::Offset, -1});
     EXPECT_EQ(before->appliedOffset(), -1);
     auto t = rs::stateAsOf(log, {rs::AsOf::By::Time, log[6].event.timestampMs});
@@ -43,7 +43,7 @@ TEST(SecurityQueriesRegression, AsOfOffsetAndTimeBoundariesAreInclusive) {
     EXPECT_EQ(t2->appliedOffset(), 5);
     auto all = rs::stateAsOf(log, {rs::AsOf::By::Offset, 1000});
     EXPECT_EQ(all->appliedOffset(), 15);
-    EXPECT_EQ(all->user("ws1"), nullptr) << "dropped at the end";
+    EXPECT_EQ(all->userByName(rune::catalog::kDefaultNsId, "ws1"), nullptr) << "dropped at the end";
 }
 
 TEST(SecurityQueriesRegression, AsOfSurfacesTheErrorOfABadEventInRange) {
@@ -63,8 +63,8 @@ TEST(SecurityQueriesRegression, GrantsForSplitsDirectRolesAndEffective) {
     sc.run(rs::GrantOps{rs::GranteeKind::User, t1}, "u");
     sc.run(rs::GrantOps{rs::GranteeKind::Role, t2}, "R");
     sc.run(rs::GrantOps{rs::GranteeKind::Role, t1}, "S");
-    sc.run(rs::GrantRoleOps{sc.s.role("S")->objectId, "S"}, "u");
-    sc.run(rs::GrantRoleOps{sc.s.role("R")->objectId, "R"}, "u");
+    sc.run(rs::GrantRoleOps{sc.s.roleByName(rune::catalog::kDefaultNsId, "S")->objectId, "S"}, "u");
+    sc.run(rs::GrantRoleOps{sc.s.roleByName(rune::catalog::kDefaultNsId, "R")->objectId, "R"}, "u");
     auto v1 = rs::grantsFor(sc.s, rs::GranteeKind::User, "u");
     ASSERT_TRUE(v1.has_value());
     EXPECT_EQ(v1->direct, (std::vector<rs::GrantSpec>{t1}));
@@ -86,8 +86,8 @@ TEST(SecurityQueriesRegression, UsersAndRolesRowsNeverCarryVerifierBytes) {
     Script sc;
     sc.run(rs::CreateUserOps{v(1)}, "zed"); sc.run(rs::CreateUserOps{v(2)}, "amy"); sc.run(rs::CreateRoleOps{}, "R");
     sc.run(rs::AlterUserOps{rs::AddPassword{v(3)}}, "amy");
-    sc.run(rs::GrantRoleOps{sc.s.role("R")->objectId, "R"}, "zed");
-    sc.run(rs::GrantRoleOps{sc.s.role("R")->objectId, "R"}, "amy");
+    sc.run(rs::GrantRoleOps{sc.s.roleByName(rune::catalog::kDefaultNsId, "R")->objectId, "R"}, "zed");
+    sc.run(rs::GrantRoleOps{sc.s.roleByName(rune::catalog::kDefaultNsId, "R")->objectId, "R"}, "amy");
     sc.run(rs::GrantOps{rs::GranteeKind::Role, g(rs::Operation::Read, rs::ResourceType::Topic, rs::PatternKind::Exact, "t")}, "R");
     const auto us = rs::users(sc.s);
     ASSERT_EQ(us.size(), 2u);

@@ -29,6 +29,7 @@ std::vector<RecordedEvent> history(std::span<const RecordedEvent> log, const His
     for (const RecordedEvent& r : log) {
         if (f.kind && subjectOf(r.event) != *f.kind) continue;
         if (!f.name.empty() && r.event.objectName != f.name) continue;
+        if (f.nsId && r.event.nsId != *f.nsId) continue;
         if (f.sinceMs && r.event.timestampMs < *f.sinceMs) continue;
         out.push_back(r);
     }
@@ -45,16 +46,16 @@ std::expected<SecurityState, ReplayError> stateAsOf(std::span<const RecordedEven
     return r.state();
 }
 
-std::optional<GrantsView> grantsFor(const SecurityState& s, GranteeKind kind, std::string_view name) {
+std::optional<GrantsView> grantsFor(const SecurityState& s, GranteeKind kind, std::string_view name, uint32_t nsId) {
     GrantsView v;
     if (kind == GranteeKind::Role) {
-        const RoleObject* r = s.role(name);
+        const RoleObject* r = s.roleByName(nsId, name);
         if (!r) return std::nullopt;
         v.direct.assign(r->grants.begin(), r->grants.end());
         v.effective = v.direct;
         return v;
     }
-    const UserObject* u = s.user(name);
+    const UserObject* u = s.userByName(nsId, name);
     if (!u) return std::nullopt;
     v.direct.assign(u->grants.begin(), u->grants.end());
     for (uint64_t rid : u->roles)
@@ -68,20 +69,20 @@ std::optional<GrantsView> grantsFor(const SecurityState& s, GranteeKind kind, st
 std::vector<UserRow> users(const SecurityState& s) {
     std::vector<UserRow> out;
     for (const auto& [id, u] : s.users()) {
-        UserRow row{u.name, u.enabled, u.mustChangePassword, static_cast<uint8_t>(u.verifiers.size()), {}, u.version};
+        UserRow row{u.name, u.enabled, u.mustChangePassword, static_cast<uint8_t>(u.verifiers.size()), {}, u.version, u.nsId};
         for (uint64_t rid : u.roles) if (const RoleObject* r = s.roleById(rid)) row.roles.push_back(r->name);
         std::sort(row.roles.begin(), row.roles.end());
         out.push_back(std::move(row));
     }
-    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.name < b.name; });
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.nsId != b.nsId ? a.nsId < b.nsId : a.name < b.name; });
     return out;
 }
 
 std::vector<RoleRow> roles(const SecurityState& s) {
     std::vector<RoleRow> out;
     for (const auto& [id, r] : s.roles())
-        out.push_back(RoleRow{r.name, sortedUserNames(s, s.membersOf(id)), r.grants.size(), r.version});
-    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.name < b.name; });
+        out.push_back(RoleRow{r.name, sortedUserNames(s, s.membersOf(id)), r.grants.size(), r.version, r.nsId});
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.nsId != b.nsId ? a.nsId < b.nsId : a.name < b.name; });
     return out;
 }
 

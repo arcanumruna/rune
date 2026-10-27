@@ -110,7 +110,7 @@ struct FenceRig {
         gw.onCatalogObjectApplied(0, "events", false);
     }
 
-    uint64_t userId(const std::string& name) const { return chain.state().user(name)->objectId; }
+    uint64_t userId(const std::string& name) const { return chain.state().userByName(rune::catalog::kDefaultNsId, name)->objectId; }
 
     /// A session logged in as `name` with exactly its effective grants (as a login compiles them).
     int64_t login(const std::string& name) {
