@@ -149,12 +149,14 @@ the ABAB single-node produce p99 run.
 
 | case | per cycle (median, n=5) | gate | source |
 |---|---|---|---|
-| no `SystemMetrics` (metrics file off) | 0.47 ns | < 50 ns | metrics plan Task 12, 2026-10-27, `-O2`, shared dev host (load ~3) |
+| no `SystemMetrics` (the bare loop: the floor, not a broker config, since a started broker always samples) | 0.47 ns | < 50 ns | metrics plan Task 12, 2026-10-27, `-O2`, shared dev host (load ~3) |
 | `SystemMetrics`, off-interval (the steady state) | 1.0 ns | < 50 ns | same |
 | `SystemMetrics`, on-interval (`pread` of statm and status, `getdents64` of the fd dir) | 5.9 µs | < 50 µs | same |
 
-At the default 1 s interval, the on-interval cost is paid once a second on the control thread. That is about 6 µs/s, or
-0.0006 % of one core, and it is never paid on a produce, fetch or query path.
+At the default 1 s interval, the on-interval cost is paid once a second on the control thread, and it is never paid on a
+produce, fetch or query path. The 5.9 µs is for the bench's own small process. The `getdents64` walk costs about 200 ns per
+open fd, so a broker holding 4000 fds (segments, sockets) spends about 0.8 ms per sample on the control thread, over the
+50 µs gate. Measured by opening 4000 extra fds in the bench process.
 
 ## Checklist
 

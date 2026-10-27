@@ -112,9 +112,9 @@ sampling the file; the broker keeps no history.
 | 1000218 | `rune-catalog-applied-offset` | gauge | control | Last applied `__catalog` offset (`-1` none). |
 | 1000219 | `rune-catalog-unplaceable-topics` | gauge | control | Topics never placed for want of brokers. |
 | 1000220 | `rune-catalog-blocked-partitions` | gauge | control | Partitions blocked until a broker serves again. |
-| 1000221 | `rune_link_mtu_deficit` | gauge | control | A peer link whose path MTU is below the configured MTU. |
+| 1000221 | `rune_link_mtu_deficit` | gauge | control | Bytes by which the probed link MTU falls short of `RUNE_AERON_MTU` plus the UDP header (`0` when it fits). Alert on a non-zero value. |
 | 1000222 | `rune-storage-gate-state` | gauge | control | Storage gate state: `0` CONFIRMED, `1` UNCONFIRMED, `2` UNDECIDED. |
-| 1000223 | `rune-leader-roles-held` | counter | control | Leader roles this node has taken. |
+| 1000223 | `rune-leader-roles-held` | counter | control | Leader roles held back (not taken) because this node's storage gate was closed; each one asks the controller for a failover. |
 | 1000224 | `rune-storage-pending-nodes` | gauge | control | Nodes whose new storage is not yet confirmed. |
 | 1000225 | `rune-lost-committed-reports` | counter | control | Reports of lost committed data. |
 | 1000226 | `rune-security-apply-halted` | gauge | control | `0` while applying; the halted offset plus 1 after a halt. Alert on it. |
@@ -122,7 +122,7 @@ sampling the file; the broker keeps no history.
 | 1000228 | `rune-auth-mode` | gauge | control | `0` authentication enabled, `1` dev mode. Alert on `1` in production. |
 | 1000229 | `rune-logins-ok` | counter | control | Successful logins. |
 | 1000230 | `rune-logins-failed` | counter | control | Failed logins. Alert on a rising rate. |
-| 1000231 | `rune-logins-rate-limited` | counter | control | Logins answered inside a throttle delay. |
+| 1000231 | `rune-logins-rate-limited` | counter | control | Login attempts refused by the login throttle (per user and source). |
 | 1000232 | `rune-sessions-revoked` | counter | control | Sessions ended by drop, disable or `TERMINATE SESSIONS`. |
 | 1000233 | `rune-peer-links-established` | gauge | control | Peers whose link is currently established. |
 | 1000234 | `rune-peer-link-refusals` | counter | control | Peer-link refusals logged by this broker. Alert on a rising rate. |
