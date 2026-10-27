@@ -398,6 +398,12 @@ public:
 
     /// Next expected offset (lastDelivered + 1); 0 before any record.  Final
     /// once finished() is true.
+    ///
+    /// Freshness (#473, applies to every status read of this handle: position(), batchBytes(), dataResets(),
+    /// subscriptionId(), failReason(), brokerErrorCode()): an app-thread read is eventually fresh.  After a gap
+    /// without reads, the first read may return a snapshot from when the gap began (the duty side's status ring
+    /// was full and refused newer ones); a read after the next duty cycle returns the current value.  Poll to
+    /// converge: read, let one duty cycle run, read again.
     [[nodiscard]] int64_t position() const;
 
     /// True until unsubscribe(), or until the duty side finished the
@@ -409,7 +415,7 @@ public:
     [[nodiscard]] bool finished() const noexcept;
 
     /// The subscriptionId assigned by the broker (0 until the SubscribeResponse
-    /// has been processed — records cannot arrive before then).
+    /// has been processed — records cannot arrive before then).  Freshness: see position().
     [[nodiscard]] int64_t subscriptionId() const;
 
     /// Why the duty side finished this subscription on its own (None when it
@@ -425,11 +431,11 @@ public:
     /// each time the subscription restarted at the partition's log start, so
     /// record offsets start over and records it had not consumed before the
     /// reset are gone.  0 for a disk partition.  Never silent: this counter is
-    /// the application's signal.
+    /// the application's signal.  Freshness: see position().
     [[nodiscard]] uint32_t dataResets() const;
 
     /// Phase 2c (FD13): the sum of the recordBatch sizes delivered so far — the egress bytes the broker sent this
-    /// subscription (a filter's saving is visible against an unfiltered one).
+    /// subscription (a filter's saving is visible against an unfiltered one).  Freshness: see position().
     [[nodiscard]] uint64_t batchBytes() const;
 
 private:
@@ -472,7 +478,9 @@ public:
     [[nodiscard]] bool active() const;
     /// True once EVERY partition's subscription is finished.
     [[nodiscard]] bool finished() const;
-    /// The sum of every partition's delivered batch bytes (Subscription::batchBytes()).
+    /// The sum of every partition's delivered batch bytes (Subscription::batchBytes()).  Each partition's term is
+    /// as fresh as its own read (see Subscription::position()): after a gap without reads, read, let one duty
+    /// cycle run, read again.
     [[nodiscard]] uint64_t batchBytes() const;
     /// Unsubscribe every partition (idempotent).
     void unsubscribe();

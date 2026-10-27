@@ -24,6 +24,10 @@
 //     and retries on a following duty cycle — a newer snapshot supersedes it).
 //   - publishFinal(): lifecycle snapshots.  Always fits: ordinary updates never
 //     consume the reserve, and at most a couple are written per channel.
+//   - Consequence for readers (#473): after a gap without reads the ring holds
+//     the snapshots from when it filled, so the FIRST read returns that older
+//     value; the dirty newest one is re-sent every duty cycle and fits once that
+//     read drained the ring, so a read after the next duty cycle is current.
 
 #include <rune/client/detail/OneToOneRingBuffer.h>
 
