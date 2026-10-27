@@ -1008,6 +1008,45 @@ TEST(HubCommandClient, TxnNotCoordinatorRediscoversThroughMetadataRegression) {
     EXPECT_EQ(r.cq.timesCompleted(init.token()), 1);
 }
 
+// C2 adversarial review: a coordinator that keeps answering NotCoordinator (the real broker's TransactionCoordination
+// Service does, for every InitProducerId, while its state is not Loaded - ensureLoaded_) must be retried with backoff.
+// On a frozen duty clock no backoff ever elapses, so a paced client sends a bounded number of requests; today every
+// MetadataResponse bumps the link's generation (Client::onMetadata -> producerHub_.onCoordinatorMoved) and the
+// AwaitCoordinator slot re-sends at once: InitProducerId / MetadataRequest ping-pong per round trip, unpaced.
+TEST(HubCommandClient, TxnNotCoordinatorStormIsPacedOnAFrozenClockAdversarialRegression) {
+    HubRig r(4620, 0, &hubNow);
+    auto tp = r.client.producer(txnPcfg("tx-nc-storm"));
+    r.connect();
+    r.settle(200);
+    r.gw.initPidReply = true;
+    for (int i = 0; i < 5000; ++i)
+        r.gw.initPidCodes.push_back(static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator));
+    const int mdBefore = r.gw.metadataRequests;
+    auto init = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+    ASSERT_TRUE(init.accepted());
+    r.settle(2'000);
+    EXPECT_LE(r.gw.initPids, 4) << "NotCoordinator re-sent with no backoff (frozen clock)";
+    EXPECT_LE(r.gw.metadataRequests - mdBefore, 4) << "one MetadataRequest per NotCoordinator, unpaced";
+}
+
+TEST(HubCommandClient, PlainInitProducerIdNotCoordinatorStormIsPacedOnAFrozenClockAdversarialRegression) {
+    HubRig r(4622, 0, &hubNow);
+    r.connect();
+    r.settle(200);
+    r.gw.plainUsesInitPidCodes = true;
+    for (int i = 0; i < 5000; ++i)
+        r.gw.initPidCodes.push_back(static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator));
+    const int mdBefore = r.gw.metadataRequests;
+    rc::ProducerConfig pc; pc.acks = rc::Acks::Leader; pc.lingerUs = 0;
+    rc::Producer p = r.client.producer(pc);
+    auto s = r.cq.send(p, r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kTxnVal));
+    ASSERT_TRUE(s.accepted());
+    p.flush();
+    r.settle(2'000);
+    EXPECT_LE(r.gw.plainInitPids, 4) << "a plain producer's InitProducerId re-sent with no backoff (frozen clock)";
+    EXPECT_LE(r.gw.metadataRequests - mdBefore, 4) << "one MetadataRequest per NotCoordinator, unpaced";
+}
+
 // C10 (found by the dr-e2e tx suite on a 3-node broker whose partition
 // leaders are spread over the nodes): every transactional frame went through
 // the route of topic 0 / partition 0.  Coordinator requests (InitProducerId,

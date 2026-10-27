@@ -1859,9 +1859,12 @@ private:
     std::array<TxnOp, kMaxTxnFlushes>   txnFlushes_{};
     uint8_t                             txnFlushN_        = 0;
     uint64_t                            txnRefusedBegins_ = 0;
-    /// #367: a partition leader answered 17 / 18 to a transactional batch: the producer is fenced.  Set while a batch
-    /// is being failed (enterFatal_ is not re-entrant there); the next duty pass (txnStepCold_) enters FatalError.
-    std::optional<uint16_t>             txnFencedPending_;
+    /// A terminal failure found where it cannot be entered at once (enterFatal_ / failAllPending are not re-entrant
+    /// while a batch is failed or a hub command runs): #367 a partition leader fenced a transactional batch (17 / 18),
+    /// #291 the coordinator node refused this client's session.  The next duty pass acts on it: txnStepCold_ enters
+    /// FatalError (transactional), identityStepCold_ fails the identity (plain).
+    struct PendingFatal { OpStatus status = OpStatus::BrokerError; uint16_t errorCode = 0; const char* why = ""; };
+    std::optional<PendingFatal>         fatalPending_;
     [[nodiscard]] bool transactional_() const noexcept { return !cfg_.transactionalId.empty(); }
     [[nodiscard]] int64_t txnOpTimeoutNs_() const noexcept {
         return (cfg_.transactionOpTimeoutMs > 0 ? cfg_.transactionOpTimeoutMs : 1) * 1'000'000LL;
@@ -1869,7 +1872,7 @@ private:
     [[nodiscard]] bool txnQuiet_() const noexcept {
         const std::size_t i = txn_.index();
         return txnFlushN_ == 0 && i != kInitializingIdx && i != kCommittingIdx && i != kAbortingIdx &&
-               txnAddQueue_.empty() && offsetsOp_.index() == 0 && !txnFencedPending_;
+               txnAddQueue_.empty() && offsetsOp_.index() == 0 && !fatalPending_;
     }
     // ---- Phase 2b F Task 7: sendOffsetsToTransaction (ProducerTxn.cpp; duty thread only) ----
     /// The copy of the call's offsets + group id the op runs from (the caller's span / the Thread-mode ring payload

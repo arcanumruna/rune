@@ -395,10 +395,10 @@ bool ProducerImpl::txnDataSettled_() const noexcept {
 
 int ProducerImpl::txnStepCold_(int64_t nowNs) noexcept {
     if (discarding()) return 0;   // closeImmediately detached every op
-    if (txnFencedPending_) [[unlikely]] {
-        const uint16_t code = *txnFencedPending_;
-        txnFencedPending_.reset();
-        enterFatal_(OpStatus::Fenced, code, "producer fenced by a partition leader (fatal)");
+    if (fatalPending_) [[unlikely]] {
+        const PendingFatal f = *fatalPending_;
+        fatalPending_.reset();
+        if (!std::holds_alternative<FatalError>(txn_)) enterFatal_(f.status, f.errorCode, f.why);
         return 1;
     }
     retryStatus_();               // a snapshot the ring refused: re-offered (coalesced; only the newest matters)
@@ -821,9 +821,14 @@ void ProducerImpl::onSessionRevoked(uint16_t errorCode) noexcept {
 void ProducerImpl::onCoordinatorRejected(uint16_t errorCode) noexcept {
     // #291: only a producer with a coordinator request live waits on that node; an idle one meets the same Rejected
     // session on its next request.  A login / grant is an admin's act: never retried (classify: 44..47 fatal).
-    if (!transactional_() || !coord_ || coord_->inUse() == 0) return;
-    if (std::holds_alternative<FatalError>(txn_) || discarding()) return;
-    enterFatal_(OpStatus::BrokerError, errorCode, "the transaction coordinator node refused this client's session");
+    // Transactional: FatalError.  Plain: its InitProducerId can never be answered, so the identity fails (every
+    // held record completes).  Deferred to the duty pass: this runs from hub-command entry, which a completion
+    // handler can reach while a batch is being failed.
+    if (!coord_ || coord_->inUse() == 0 || fatalPending_ || discarding()) return;
+    if (transactional_() && std::holds_alternative<FatalError>(txn_)) return;
+    if (!transactional_() && !std::holds_alternative<IdRequested>(identity_)) return;
+    fatalPending_ = PendingFatal{OpStatus::BrokerError, errorCode,
+                                 "the transaction coordinator node refused this client's session"};
 }
 
 void ProducerImpl::txnDiscard_(OpStatus st, uint16_t errorCode) noexcept {
@@ -882,8 +887,8 @@ void ProducerImpl::txnLost_(OpStatus st, uint16_t errorCode, AbortKind kind) noe
     // #367: the partition leader fenced us (Kafka: INVALID_PRODUCER_EPOCH / PRODUCER_FENCED on produce is fatal for a
     // transactional producer).  Handed to the duty pass: enterFatal_ is not re-entrant while a batch is failed.
     if (st == OpStatus::BrokerError && (errorCode == kInvalidProducerEpoch || errorCode == kProducerFenced) &&
-        !std::holds_alternative<FatalError>(txn_) && !txnFencedPending_) {
-        txnFencedPending_ = errorCode;
+        !std::holds_alternative<FatalError>(txn_) && !fatalPending_) {
+        fatalPending_ = PendingFatal{OpStatus::Fenced, errorCode, "producer fenced by a partition leader (fatal)"};
     }
     // A record the transaction accepted failed: the transaction can no longer commit (poison_ keeps a commit
     // that may have landed, and only upgrades the abort kind once it is aborting).

@@ -34,7 +34,9 @@ public:
     struct Unsent {};
     struct InFlight { int64_t sessionId = 0; int64_t answerByNs = 0; };
     struct Backoff  { int64_t untilNs = 0; };
-    struct AwaitCoordinator { uint64_t gen = 0; };
+    /// NotCoordinator: re-sent once the coordinator moved (gen) AND its backoff elapsed - a coordinator that keeps
+    /// answering NotCoordinator (not loaded yet, a follower) is retried paced, never once per metadata round trip.
+    struct AwaitCoordinator { uint64_t gen = 0; int64_t notBeforeNs = 0; };
     using SlotState = std::variant<Free, Building, Unsent, InFlight, Backoff, AwaitCoordinator>;
     struct Slot {
         SlotState state = Free{};

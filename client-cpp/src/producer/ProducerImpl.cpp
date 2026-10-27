@@ -4001,6 +4001,18 @@ void ProducerImpl::retryStatus_() noexcept {
 }
 
 int ProducerImpl::identityStepCold_(int64_t nowNs) noexcept {
+    if (fatalPending_ && !transactional_()) [[unlikely]] {
+        // #291 (plain): the coordinator node refused this client - the id request can never be answered.
+        const PendingFatal f = *fatalPending_;
+        fatalPending_.reset();
+        if (std::holds_alternative<IdRequested>(identity_)) {
+            coord_->releaseAll();   // a plain producer's only coordinator request is its InitProducerId
+            identity_ = IdFailed{f.status, f.errorCode};
+            publishStatus_();
+            failAllPending(f.status, f.errorCode);
+        }
+        return 1;
+    }
     if (std::holds_alternative<IdUnassigned>(identity_)) {
         // A transactional producer's id is requested by initTransactions (Task 5), with its transactional id.
         if (!cfg_.transactionalId.empty() || !coord_ || !coord_->connected()) return 0;

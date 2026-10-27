@@ -159,7 +159,9 @@ TEST(CoordinatorLink, NotCoordinatorWaitsForTheMoveThenResends) {
     EXPECT_EQ(link.onAnswer(a, 3), nullptr);
     EXPECT_EQ(pumpNoExpiry(link, 4), 0);
     link.onCoordinatorMoved();
-    EXPECT_EQ(pumpNoExpiry(link, 5), 1);
+    // C2 review: and for its backoff (attempt 2) - a coordinator that keeps answering NotCoordinator is paced.
+    EXPECT_EQ(pumpNoExpiry(link, 3 + CoordinatorLink::backoffNs(2) - 1), 0) << "moved, but the backoff has not elapsed";
+    EXPECT_EQ(pumpNoExpiry(link, 3 + CoordinatorLink::backoffNs(2)), 1);
 }
 
 TEST(CoordinatorLink, SessionChangeResendsInFlightWithTheSameCorrId) {
@@ -399,11 +401,11 @@ TEST(CoordinatorLinkRegression, AResponseReachesOnlyItsProducerRegression) {
     // The move event reaches the links: p2's parked request re-sends on the next pass.
     const std::size_t before = fake.offered.size();
     hub.onCoordinatorMoved();
-    EXPECT_EQ(p2.pumpCoordinator(20), 1);
+    EXPECT_EQ(p2.pumpCoordinator(13 + CoordinatorLink::backoffNs(1)), 1);   // NotCoordinator at 13: paced
     EXPECT_EQ(fake.offered.size(), before + 1);
     // A session change re-sends in-flight requests.
     hub.onCoordinatorSessionChanged();
-    EXPECT_EQ(p2.pumpCoordinator(21), 1);
+    EXPECT_EQ(p2.pumpCoordinator(14 + CoordinatorLink::backoffNs(1)), 1);
     EXPECT_EQ(fake.offered.size(), before + 2);
 }
 
@@ -576,7 +578,7 @@ TEST(CoordinatorLinkRegression, NotCoordinatorAsksForRediscoveryOncePerGeneratio
     EXPECT_EQ(link.onAnswer(asAnswer(fb, ReqKind::AddPartitions, b->corrId, kNotCoord), 3), nullptr);
     EXPECT_EQ(fake.rediscovers, 1) << "one ask per generation, however many requests wait";
     link.onCoordinatorMoved();
-    ASSERT_EQ(pumpNoExpiry(link, 4), 2);
+    ASSERT_EQ(pumpNoExpiry(link, 3 + CoordinatorLink::backoffNs(1)), 2);
     EXPECT_EQ(link.onAnswer(asAnswer(fa, ReqKind::EndTxn, a->corrId, kNotCoord), 5), nullptr);
     EXPECT_EQ(fake.rediscovers, 2) << "the next generation asks again";
 }
@@ -606,5 +608,5 @@ TEST(CoordinatorLinkRegression, ARefusedRediscoveryIsAskedAgainOnTheNextPumpRegr
     pumpNoExpiry(link, 6);
     EXPECT_EQ(fake.rediscovers, 1) << "once submitted, never again this generation";
     link.onCoordinatorMoved();
-    ASSERT_EQ(pumpNoExpiry(link, 7), 2) << "both re-send after the move";
+    ASSERT_EQ(pumpNoExpiry(link, 3 + CoordinatorLink::backoffNs(1)), 2) << "both re-send after the move (and backoff)";
 }

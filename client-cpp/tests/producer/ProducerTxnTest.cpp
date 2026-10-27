@@ -1737,10 +1737,12 @@ TEST(ProducerTxnRegression, LinkResentCommitRefusedIsFatalNeverAbortableRegressi
         if (moved) {
             r.endAnswer(ec(rpc::ErrorCode::NotCoordinator));   // the link waits for the coordinator move
             r.hub.onCoordinatorMoved();
+            r.tick();                                           // re-offers are paced: not at the same instant
+            ASSERT_EQ(r.endTxns(), 1u) << "a NotCoordinator re-offer was not paced";
         } else {
             r.hub.onCoordinatorSessionChanged();                // in flight: re-offered on the new session
         }
-        r.tick();
+        r.tick(kMs);                                            // past the first backoff step (1 ms)
         ASSERT_EQ(r.endTxns(), 2u) << "the link did not re-offer EndTxn(commit)";
         ASSERT_EQ(r.lastEndCorr(), corr) << "the same request";
         r.endAnswer(ec(rpc::ErrorCode::InvalidRequest));

@@ -602,18 +602,22 @@ TEST(ClientAuthErrorsRegression, ATransactionalProducerWhoseCoordinatorNodeRefus
     EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2));
     EXPECT_EQ(p.state(), rc::TxnState::FatalError);
     EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
-    // A plain producer on the same client still delivers via the seed.  (The fake fences every InitProducerId, plain
-    // ones too, to node 1: drop the fence, or the plain producer's own id request would bounce off it.)
-    r.gw.coordinatorEndpoint = -1;
+    // A plain producer on the same client: its coordinator is the same refused node (the real gateway answers every
+    // InitProducerId, plain ones too, with NotCoordinator), so its id request can never be answered here.  Its record
+    // ends at once with the refusal - it is never held behind an InitProducerId <-> NotCoordinator loop.
     rc::ProducerConfig plain; plain.acks = rc::Acks::Leader; plain.lingerUs = 0;
+    plain.deliveryTimeoutMs = 120'000; plain.produceTimeoutMs = 60'000;
     rc::Producer pp = r.client.producer(plain);
     const auto topic = r.client.topic("t");
     const std::vector<uint8_t> val(16, 0x5C);
-    auto viaSeed = cq.send(pp, topic, TwoNodeRig::keyFor(1), val);
-    ASSERT_TRUE(viaSeed.accepted());
+    auto held = cq.send(pp, topic, TwoNodeRig::keyFor(1), val);
+    ASSERT_TRUE(held.accepted());
     pp.flush();
-    ASSERT_TRUE(r.drive([&] { return viaSeed.ready(); })) << "plainInit " << r.gw.plainInitPids << " notCoord " << r.gw.notCoordinatorAnswers << " initPids " << r.gw.initPids << " produced " << r.gw.produced.size();
-    EXPECT_TRUE(viaSeed.ok()) << viaSeed.describe();
+    ASSERT_TRUE(r.drive([&] { return held.ready(); }))
+        << "a plain producer's record held behind a Rejected coordinator; plainInit " << r.gw.plainInitPids;
+    EXPECT_EQ(held.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(held.outcome().c.errorCode, 44);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
 }
 
 // Review B I5: against a Required broker with no security admin yet, a credential-less client's session is Anonymous

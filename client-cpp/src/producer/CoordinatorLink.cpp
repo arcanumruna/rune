@@ -116,7 +116,7 @@ int CoordinatorLink::offerIfDue_(Slot& s, int64_t nowNs) noexcept {
     if (std::holds_alternative<Unsent>(s.state)) return offer_(s) ? 1 : 0;
     if (const auto* b = std::get_if<Backoff>(&s.state)) return (nowNs >= b->untilNs && offer_(s)) ? 1 : 0;
     if (const auto* a = std::get_if<AwaitCoordinator>(&s.state)) {
-        if (a->gen != gen_) return offer_(s) ? 1 : 0;
+        if (a->gen != gen_) return (nowNs >= a->notBeforeNs && offer_(s)) ? 1 : 0;
         askRediscover_();   // #351: a refused ask is retried each pass until it is submitted
         return 0;
     }
@@ -151,7 +151,8 @@ CoordinatorLink::Slot* CoordinatorLink::onAnswer(const CoordAnswer& a, int64_t n
         return nullptr;
     case Verdict::Rediscover:
         if (!std::holds_alternative<InFlight>(s.state)) return nullptr;
-        s.state = AwaitCoordinator{gen_};
+        ++s.attempt;
+        s.state = AwaitCoordinator{gen_, nowNs + backoffNs(s.attempt)};
         askRediscover_();
         return nullptr;
     default:
