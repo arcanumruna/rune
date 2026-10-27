@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <chrono>
 #include <cstdio>
@@ -531,12 +532,25 @@ TEST(ClientFailoverBrokerRegression, SeedCrashedSubscribeAndControlPlaneFailOver
         homedLive = led.count(other) > otherBefore + 20;
     EXPECT_TRUE(homedLive) << "the homed subscription keeps delivering after the seed's broker died";
 
-    // 2. The seed-bound subscription ends explicitly (never active and silent).
-    bool ended = false;
-    for (const auto deadline = tCrash + 25s; Clock::now() < deadline && !ended; std::this_thread::sleep_for(20ms))
-        ended = !s0.active();
-    ASSERT_TRUE(ended) << "SILENT STALL: the seed-bound subscription stayed active on a dead broker";
-    EXPECT_EQ(s0.failReason(), rc::SubscriptionFailReason::SessionLost);
+    // 2. The seed-bound subscription never stalls silently.  Either outcome is correct, depending on which the
+    //    client learns first (rule 16: any timing): fresh metadata naming p0's new leader MOVES it there (#514
+    //    seed: it stays active and delivers post-crash records itself), or the seed session's loss ENDS it
+    //    explicitly with SessionLost (resumed below from its position).
+    const int target = sentAtCrash + 3 * kPartitions;   // a seq produced after the crash, on every partition
+    auto p0After = [&](SubLedger& l) {
+        for (int s = target; s < target + kPartitions; ++s) if (s % kPartitions == 0 && l.has(0, s)) return true;
+        return false;
+    };
+    bool ended = false, moved = false;
+    for (const auto deadline = tCrash + 25s; Clock::now() < deadline && !ended && !moved;
+         std::this_thread::sleep_for(20ms)) {
+        moved = p0After(led);
+        ended = !moved && !s0.active();
+    }
+    ASSERT_TRUE(ended || moved) << "SILENT STALL: the seed-bound subscription stayed active on a dead broker";
+    if (ended) EXPECT_EQ(s0.failReason(), rc::SubscriptionFailReason::SessionLost);
+    if (moved) EXPECT_TRUE(s0.active()) << "a moved reader is not ended";
+    std::fprintf(stderr, "[sibling] p0 %s\n", moved ? "moved to its new leader" : "ended (SessionLost)");
     const int64_t pos0 = s0.position();
 
     // 3. The control plane rides the seed: a DDL and a schema read succeed within the bound.
@@ -552,22 +566,23 @@ TEST(ClientFailoverBrokerRegression, SeedCrashedSubscribeAndControlPlaneFailOver
     if (hist.has_value()) EXPECT_GE(hist->size(), 2u) << "events + after";
     EXPECT_LT(Clock::now() - tRead, 15s);
 
-    // 4. Re-subscribe p0 from its position, and a NEW subscribe of the third partition: both deliver
-    //    records produced after the crash (from the new leaders).
+    // 4. An ended p0 is re-subscribed from its position (a moved one already delivers), and a NEW subscribe of
+    //    the third partition: both deliver records produced after the crash (from the new leaders).
     const int32_t third = 3 - other;   // the remaining partition of {1, 2}
     SubLedger led2;
     rc::SubscribeOptions o2; o2.from = rc::From::offset(pos0);
-    auto r0 = sub->subscribe(sth, 0, o2, led2.handler(0));
+    std::optional<rc::Subscription> r0;
+    if (ended) r0.emplace(sub->subscribe(sth, 0, o2, led2.handler(0)));
     auto sT = sub->subscribe(sth, third, o, led2.handler(third));
-    const int target = sentAtCrash + 3 * kPartitions;   // a seq produced after the crash, on every partition
     auto deliveredAfter = [&](int32_t p) {
+        if (p == 0) return moved ? p0After(led) : p0After(led2);
         for (int s = target; s < target + kPartitions; ++s) if (s % kPartitions == p && led2.has(p, s)) return true;
         return false;
     };
     bool resumed = false;
     for (const auto deadline = Clock::now() + 25s; Clock::now() < deadline && !resumed; std::this_thread::sleep_for(20ms))
         resumed = deliveredAfter(0) && deliveredAfter(third);
-    EXPECT_TRUE(deliveredAfter(0)) << "the re-subscribed p0 delivers post-crash records from its new leader";
+    EXPECT_TRUE(deliveredAfter(0)) << "p0 (moved, or re-subscribed) delivers post-crash records from its new leader";
     EXPECT_TRUE(deliveredAfter(third)) << "a NEW subscribe after the seed's death is served";
     std::fprintf(stderr, "[sibling] recovered %lld ms after the crash\n",
                  static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - tCrash).count()));
@@ -591,7 +606,9 @@ TEST(ClientFailoverBrokerRegression, SeedCrashedSubscribeAndControlPlaneFailOver
     }
     stop.store(true);
     if (pump.joinable()) pump.join();
-    for (auto* s : {&sO, &r0, &sT}) s->unsubscribe();
+    for (auto* s : {&sO, &sT}) s->unsubscribe();
+    if (r0) r0->unsubscribe();
+    if (moved) s0.unsubscribe();
     producer.close();
     prodClient->close();
     sub->close();
