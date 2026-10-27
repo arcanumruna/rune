@@ -1018,10 +1018,13 @@ TEST(HandleLifetime, BatchBuilderOutlivingItsProducerIsCaughtRegression) {
     r.connect();
     const auto topic = r.client->topic("t");
     std::optional<rc::Producer> p(r.client->producer(ackCfg()));
-    auto b = p->batch(topic, rc::Key(uint64_t{1}));
-    b.add(kVal);
-    p.reset();
-    EXPECT_THROW((void)b.send(), std::logic_error);
+    {
+        auto b = p->batch(topic, rc::Key(uint64_t{1}));
+        b.add(kVal);
+        p.reset();
+        EXPECT_THROW((void)b.send(), std::logic_error);
+    }   // b dies while the duty side still holds the impl (its destructor reads the detach flag); once the
+        // duty side frees the impl, any use of b - its destructor included - touches freed memory
     ASSERT_TRUE(r.drive([&] { return frees(rcd::HandleKind::Producer) == 1; }));
 }
 

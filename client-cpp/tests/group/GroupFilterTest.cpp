@@ -36,7 +36,8 @@ rune::codec::FilterBytes someFilter() {
 }
 
 bool isTheFilter(std::span<const uint8_t> got) {
-    const auto want = someFilter().span();
+    const rune::codec::FilterBytes f = someFilter();   // the span must not outlive its bytes
+    const auto want = f.span();
     return std::equal(got.begin(), got.end(), want.begin(), want.end());
 }
 
