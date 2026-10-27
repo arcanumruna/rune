@@ -46,24 +46,29 @@ env:
 
 jobs:
   sanitize:
-    name: ${{ matrix.name }}
+    name: ${{ matrix.name }} ${{ matrix.shard }}/6
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       fail-fast: false
+      # Each sanitizer runs as 6 shards on their own runners: shard k takes every 6th test number from k on, so the
+      # heavy cluster suites spread evenly.  Memory, not CPU, bounds the parallelism: every embedded media driver
+      # zero-fills three 128 MB Aeron command queues and a 3-node test starts ~24 of them (~3.5 GB plain, ~7 GB under
+      # TSan) - two such TSan tests at once filled the 16 GB runner (shutdown signal), and so did four under ASan.
       matrix:
+        id: [asan, tsan]
+        shard: [0, 1, 2, 3, 4, 5]
         include:
-          - name: ASan+UBSan
-            id: asan
+          - id: asan
+            name: ASan+UBSan
             flags: -fsanitize=address,undefined -fno-omit-frame-pointer
             link: -fsanitize=address,undefined
-            jobs: 4
-          - name: TSan
-            id: tsan
+            jobs: 2
+          - id: tsan
+            name: TSan
             flags: -fsanitize=thread -fno-omit-frame-pointer
             link: -fsanitize=thread
-            # TSan multiplies memory several times; -j4 of the 3-node suites lost the 16 GB runner (shutdown signal).
-            jobs: 2
+            jobs: 1
     env:
       UBSAN_OPTIONS: print_stacktrace=1
     steps:
@@ -159,6 +164,7 @@ jobs:
 
       - name: Build client
         id: client_build
+        if: ${{ matrix.shard == 0 }}
         run: cmake --build "build-client-${{ matrix.id }}/cmake"
 
       - name: ccache statistics
@@ -167,32 +173,36 @@ jobs:
 
       # UdpGsoBindings.Ipv6RoundTrip is a known flake (#628); excluded in case the filter ever selects it.
       # A manual run can cover only what no sanitizer run has yet: the named tests and/or every test from a number on
-      # (the inputs above; passed through the environment, never spliced into the script).  The memory / disk line
-      # every minute says why a runner died.
+      # (the inputs above; passed through the environment, never spliced into the script).  This shard runs its
+      # numbers (FROM + shard, every 6th) in chunks of 400 tests; a [chunk] line per chunk and a memory / disk line
+      # every minute say where and why a runner stopped.
       - name: Regression suite (broker)
         env:
           TESTS: ${{ (matrix.id == 'asan' && inputs.asan_tests) || (matrix.id == 'tsan' && inputs.tsan_tests) || '' }}
           FROM: ${{ (matrix.id == 'asan' && inputs.asan_from) || (matrix.id == 'tsan' && inputs.tsan_from) || '' }}
+          SHARD: ${{ matrix.shard }}
         run: |
           ( while sleep 60; do echo "[mem] $(free -m | awk '/Mem:/{print $3"/"$2" MB"}') [disk] $(df -h . | awk 'NR==2{print $4}') free"; done ) &
           run() { ctest --test-dir "build-${{ matrix.id }}" -LE latency -E 'UdpGsoBindings\.Ipv6RoundTrip' \
                     -j${{ matrix.jobs }} --output-on-failure "$@"; }
-          # Run in chunks of 400 test numbers: a runner that dies loses one chunk, and the [chunk] lines say
-          # exactly where to restart (asan_from / tsan_from).
           total=$(ctest --test-dir "build-${{ matrix.id }}" -N | sed -nE 's/^Total Tests: ([0-9]+)/\1/p')
           rc=0
+          # The whole suite (from FROM on) unless only named tests were asked for.
           if [ -n "$FROM" ] || [ -z "$TESTS" ]; then
-            for ((s=${FROM:-1}; s<=total; s+=400)); do
-              e=$((s+399))
-              if run -R Regression -I "$s,$e"; then r=ok; else r=FAIL; rc=1; fi
-              echo "[chunk] $s-$e of $total: $r [mem] $(free -m | awk '/Mem:/{print $3"/"$2" MB"}')"
+            for ((s=${FROM:-1}+SHARD; s<=total; s+=2400)); do
+              e=$((s+2399))
+              if run -R Regression -I "$s,$e,6"; then r=ok; else r=FAIL; rc=1; fi
+              echo "[chunk] $s-$e step 6 of $total: $r [mem] $(free -m | awk '/Mem:/{print $3"/"$2" MB"}')"
             done
           fi
-          if [ -n "$TESTS" ]; then run -R "$TESTS" || rc=1; fi
+          # The named tests that fall in this shard's numbers.
+          if [ -n "$TESTS" ]; then
+            if run -R "$TESTS" -I "$((SHARD+1)),$total,6"; then echo "[named] ok"; else echo "[named] FAIL"; rc=1; fi
+          fi
           exit $rc
 
       - name: Regression suite (client)
-        if: ${{ !cancelled() && steps.client_build.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.shard == 0 && steps.client_build.outcome == 'success' }}
         env:
           TESTS: ${{ inputs.client_tests || 'Regression' }}
         run: |
@@ -203,7 +213,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: sanitizer-logs-${{ matrix.id }}
+          name: sanitizer-logs-${{ matrix.id }}-${{ matrix.shard }}
           path: |
             build-${{ matrix.id }}/Testing/Temporary/
             build-client-${{ matrix.id }}/cmake/Testing/Temporary/

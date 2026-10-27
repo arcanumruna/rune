@@ -124,12 +124,9 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     : cfg_(std::move(cfg)), mode_(mode)
 {
     resolveTransport(cfg_);
-    if (aeron_driver_context_init(&ctx_) < 0)
-        throw std::runtime_error(std::string("EmbeddedDriver: aeron_driver_context_init failed: ") +
-                                 aeron_errmsg());
+    // Judge the live driver's heartbeat BEFORE aeron_driver_context_init: that zero-fills three 128 MB command
+    // queues (over a second under TSan), long enough for an unpumped live driver's heartbeat to look stale.
     if (aeron_is_driver_active(cfg_.dir.c_str(), /*timeout_ms=*/1000, +[](const char*) {})) {
-        aeron_driver_context_close(ctx_);
-        ctx_ = nullptr;
         releaseGso_();
         throw std::runtime_error(
             "EmbeddedDriver: aeron dir '" + cfg_.dir + "' is already in use by an ACTIVE media "
@@ -137,6 +134,9 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
             "shutdown). Use a distinct RUNE_AERON_DIR/RUNE_DATA_DIR, or ensure the previous "
             "instance exited.");
     }
+    if (aeron_driver_context_init(&ctx_) < 0)
+        throw std::runtime_error(std::string("EmbeddedDriver: aeron_driver_context_init failed: ") +
+                                 aeron_errmsg());
     aeron_driver_context_set_dir(ctx_, cfg_.dir.c_str());
     const char* idle = cfg_.idleStrategy.c_str();
     // D2 round 2: an idle strategy's state is built from the init args present when its setter runs — set

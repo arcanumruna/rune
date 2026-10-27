@@ -88,3 +88,10 @@ race:_Sp_counted_ptr_inplace<aeron::Image
 # MPSC command queue (C11 atomics in a different TU than TSan sees ordered); the conductor's memcpy of the command
 # body reports against the caller's write (TSan CI: UdpGsoBindings.*).
 race:aeron_client_conductor_async_add_
+# Same queue, other commands: async_destination (MDS add / remove destination) is copied by the conductor's
+# on_cmd_destination (TSan CI: UdpGsoBindings.MdsDestinationRemovedOnTheReceiverIsCounted).
+race:aeron_client_conductor_async_destination
+# Dedicated threading: the conductor opens a channel's socket and hands the endpoint to the receiver thread through
+# the driver's MPSC command queue; TSan's fd tracking then reports the receiver's epoll_ctl against the socket()
+# (TSan CI: BrokerNodeTest.DedicatedAeronThreadingMode_BootsAndElects).
+race:aeron_udp_transport_poller_add

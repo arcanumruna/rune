@@ -158,7 +158,8 @@ TEST(DdlConformanceBrokerRegression, T1_SequentialCollisionsAnswerExactCodes) {
         EXPECT_EQ(w.renameKey(sid, "character"), kOk) << "B8: RENAME id -> pk";
         EXPECT_EQ(w.define(sid, ""), kInvalidTopicName);
         EXPECT_EQ(w.define(sid, "__views"), kInvalidTopicName);
-        EXPECT_EQ(w.define(sid, "a/b"), kInvalidTopicName);
+        EXPECT_EQ(w.define(sid, "a/b/c"), kInvalidTopicName) << "namespaces: two '/' is malformed";
+        EXPECT_EQ(w.define(sid, "a/b"), kUnknownTopic) << "namespaces (D7): an unknown namespace answers missing";
         EXPECT_EQ(w.define(sid, "Character"), kTopicExists);
         EXPECT_EQ(w.define(sid, "zero", 0, 0), kInvalidSchema);
         ASSERT_TRUE(w.schema(sid, "__topic_schemas").has_value());
