@@ -171,11 +171,13 @@ checks() {
     log "step 6 [${label}]: a default user cannot see t (same answer as a never-created topic)..."
     local rc_t rc_n out_t out_n
     set +e
-    out_t=$(ql_as du /work/du.pw -e "show topic t;" --broker "rune-${seed}:${BROKER_PORT}" 2>&1); rc_t=$?
-    out_n=$(ql_as du /work/du.pw -e "show topic neverwas;" --broker "rune-${seed}:${BROKER_PORT}" 2>&1); rc_n=$?
+    # GetTopicSchema by name: the lookup a hidden topic must answer exactly like a missing one (`u` never exists).
+    out_t=$(txt "${OP_TIMEOUT_S}" rune schema get t --user du --password-file /work/du.pw --broker "rune-${seed}:${BROKER_PORT}" 2>&1); rc_t=$?
+    out_n=$(txt "${OP_TIMEOUT_S}" rune schema get u --user du --password-file /work/du.pw --broker "rune-${seed}:${BROKER_PORT}" 2>&1); rc_n=$?
     set -e
-    out_n=$(echo "${out_n}" | sed 's/neverwas/t/g')
-    [ "${rc_t}" = "${rc_n}" ] || { echo "t: ${out_t}" >&2; echo "never: ${out_n}" >&2; fail "step 6 [${label}]: show topic t exited ${rc_t}, a never-created topic ${rc_n}"; }
+    out_n=$(echo "${out_n}" | sed "s/'u'/'t'/g")
+    [ "${rc_t}" -ne 0 ] || { echo "t: ${out_t}" >&2; fail "step 6 [${label}]: a default user resolved a/t as its own t"; }
+    [ "${rc_t}" = "${rc_n}" ] || { echo "t: ${out_t}" >&2; echo "never: ${out_n}" >&2; fail "step 6 [${label}]: schema get t exited ${rc_t}, a never-created topic ${rc_n}"; }
     [ "${out_t}" = "${out_n}" ] || { echo "t: ${out_t}" >&2; echo "never: ${out_n}" >&2; fail "step 6 [${label}]: a default user's answer for t differs from a never-created topic's"; }
 
     log "step 7 [${label}]: rune namespace list as a/admin shows exactly a..."
