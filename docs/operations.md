@@ -82,6 +82,33 @@ Never delete or copy `storage.meta` on its own. Details, refusal table and the m
 - **Exit codes.** `2` configuration error, `78` storage refusal (empty or damaged data directory), `74` storage failure
   (the broker halts rather than serve from a suspect disk).
 
+## Namespaces
+
+A namespace is a tenant: its topics, views, schemas, groups, transactions and users belong to it alone. `default` always
+exists and cannot be deleted. Objects are named `ns/name`; a session logs in as `ns/user` and names its own objects
+unqualified (`t` means `a/t` for `a/alice`). Only a cluster admin may name an object of another namespace.
+
+```bash
+rune namespace create a --broker rune-1:40200 --user admin --password-file admin.pw
+rune namespace list --broker rune-1:40200 --user admin --password-file admin.pw           # nsId, name, state (--json: limits too)
+rune namespace limits a --set max-topics=100 --broker rune-1:40200 --user admin --password-file admin.pw   # no --set: print
+```
+
+| Role | Can do |
+|---|---|
+| Cluster admin | Everything in every namespace; creates namespaces and sets limits; appoints namespace admins. |
+| Namespace admin | Within its namespace: users, grants, topic, view and schema DDL (`GRANT ADMIN ON NAMESPACE a TO USER 'a/admin';`). |
+| User | Whatever its grants allow, in its own namespace. |
+
+- **Foreign objects answer exactly like missing ones**: same error code and message, so a name in another namespace is
+  never revealed. A namespace admin sees only its own namespace in `rune namespace list`.
+- **Anonymous read is off by default.** Only a cluster admin turns it on, and only for `default`.
+- **Limits are stored, not enforced**, until Phase 2. Consumer-group and transactional requests outside `default` are
+  refused until Phase 2 as well.
+- The data lives under `<data>/ns-<nsId>/topics/<name>/`. A cluster with namespaces is a new cluster; there is no
+  in-place upgrade.
+- The 3-node check is `docker/namespace-e2e.sh` ([testing](testing.md#end-to-end-docker-suites)).
+
 ## Metrics
 
 The broker writes its metrics to one memory-mapped file in the [arcanum-metrics](https://github.com/arcanumruna/arcanum-metrics)

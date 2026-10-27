@@ -149,7 +149,7 @@ and [contributing](https://github.com/arcanumruna/rune/wiki/Contributing).
 |---|---|
 | [docs/api/client-cpp.md](docs/api/client-cpp.md) · [wire-protocol.md](docs/api/wire-protocol.md) | The C++ client API; frames, versions, error codes |
 | [docs/api/ql.md](docs/api/ql.md) · [codec.md](docs/api/codec.md) · [admin-cli.md](docs/api/admin-cli.md) | Rune QL; schemas and evolution; every `rune` command |
-| [docs/configuration.md](docs/configuration.md) · [operations.md](docs/operations.md) | Every setting; deploy, key rotation, backups, metrics |
+| [docs/configuration.md](docs/configuration.md) · [operations.md](docs/operations.md) | Every setting; deploy, [namespaces](docs/operations.md#namespaces), key rotation, backups, metrics |
 | [docs/testing.md](docs/testing.md) · [benchmarks.md](docs/benchmarks.md) · [BENCHMARKING.md](broker/bench/BENCHMARKING.md) · [DR_SUITE.md](broker/dr-e2e/DR_SUITE.md) | Test, benchmark and DR reference |
 | [SELF-HOSTING.md](broker/docs/SELF-HOSTING.md) · [SECURITY.md](broker/docs/SECURITY.md) · [CATALOG.md](broker/docs/CATALOG.md) | Long-form operator references |
 
