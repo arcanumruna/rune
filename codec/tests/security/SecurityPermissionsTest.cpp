@@ -27,10 +27,31 @@ TEST(SecurityPermissionsRegression, OpsOnCombinesExactPrefixClusterAndImpliedDes
     EXPECT_EQ(rs::clusterOps(grants), rs::opBit(Operation::Create));
 }
 
-TEST(SecurityPermissionsRegression, AdminClusterGivesNoDataAccess) {
+// Namespaces spec §2 (owner ruling): ADMIN ON CLUSTER is root - every operation on every user object and on the
+// cluster, data included, with no other grant.  Internal (`__`) objects stay out of reach of any pattern (I6): root
+// gets on them only what an explicit CREATE/ALTER/DROP/DESCRIBE ON CLUSTER gets.  A NAMESPACE grant stays explicit
+// (namespace-admin membership is a security fact, not an implication).
+TEST(SecurityPermissionsRegression, AdminOnClusterIsRootRegression) {
     const std::vector<rs::GrantSpec> grants = {g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")};
-    EXPECT_EQ(rs::opsOn(grants, ResourceType::Topic, "t"), 0) << "D16";
-    EXPECT_EQ(rs::clusterOps(grants), rs::opBit(Operation::Admin));
+    constexpr uint8_t kAll = 0xFF;
+    EXPECT_EQ(rs::clusterOps(grants), kAll) << "ADMIN ON CLUSTER holds every cluster op (CREATE TOPIC, DESCRIBE)";
+    for (ResourceType t : {ResourceType::Topic, ResourceType::View, ResourceType::Group, ResourceType::TransactionalId})
+        EXPECT_EQ(rs::opsOn(grants, t, "x"), kAll) << static_cast<int>(t);
+    EXPECT_EQ(rs::opsOn(grants, ResourceType::Cluster, ""), kAll);
+    constexpr uint8_t kObjectOps = rs::opBit(Operation::Create) | rs::opBit(Operation::Alter) |
+                                   rs::opBit(Operation::Drop) | rs::opBit(Operation::Describe);
+    EXPECT_EQ(rs::opsOn(grants, ResourceType::Topic, "__catalog"), kObjectOps)
+        << "no READ / WRITE / TRUNCATE on an internal topic, the same as an explicit cluster grant";
+    EXPECT_EQ(rs::opsOn(grants, ResourceType::Namespace, "a"), 0) << "a NAMESPACE grant is never implied";
+    rs::EffectivePerms root; root.nsId = 0; root.grants = grants;
+    EXPECT_EQ(rs::opsOn(root, ResourceType::Topic, 7, "t"), kAll) << "root in every namespace (spec §2)";
+    rs::EffectivePerms reader; reader.nsId = 0;
+    reader.grants = {g(Operation::Read, ResourceType::Topic, PatternKind::Prefix, "")};
+    EXPECT_EQ(rs::opsOn(reader, ResourceType::Topic, 7, "t"), 0) << "D9: a non-root has nothing on a foreign object";
+    // Only ADMIN is root: the other cluster ops keep D16.
+    const std::vector<rs::GrantSpec> drop = {g(Operation::Drop, ResourceType::Cluster, PatternKind::Exact, "")};
+    EXPECT_EQ(rs::opsOn(drop, ResourceType::Topic, "t"), rs::opBit(Operation::Drop) | rs::opBit(Operation::Describe));
+    EXPECT_EQ(rs::clusterOps(drop), rs::opBit(Operation::Drop));
 }
 
 TEST(SecurityPermissionsRegression, EffectiveGrantsAreTheUnionOfDirectAndRoles) {

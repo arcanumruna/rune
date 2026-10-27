@@ -32,12 +32,24 @@ EffectivePerms effectivePerms(const SecurityState& s, uint64_t userId, std::stri
     return p;
 }
 
+namespace {
+constexpr uint8_t kAllOps = 0xFF;
+// ADMIN ON CLUSTER is root (namespaces spec §2): the raw OR of the CLUSTER grants holds ADMIN.
+bool isRoot(std::span<const GrantSpec> grants) noexcept {
+    for (const GrantSpec& g : grants)
+        if (g.resource.type == ResourceType::Cluster && g.op == Operation::Admin) return true;
+    return false;
+}
+} // namespace
+
 uint8_t opsOn(const EffectivePerms& perms, ResourceType type, uint32_t objectNsId, std::string_view name) noexcept {
-    if (objectNsId != perms.nsId) return 0;
-    return opsOn(std::span<const GrantSpec>(perms.grants), type, name);
+    const std::span<const GrantSpec> grants(perms.grants);
+    if (objectNsId != perms.nsId && !isRoot(grants)) return 0;   // D9; root reaches every namespace (spec §2)
+    return opsOn(grants, type, name);
 }
 
 uint8_t clusterOps(std::span<const GrantSpec> grants) noexcept {
+    if (isRoot(grants)) return kAllOps;   // root holds every cluster operation (CREATE TOPIC, DESCRIBE CLUSTER, ...)
     uint8_t bits = 0;
     for (const GrantSpec& g : grants)
         if (g.resource.type == ResourceType::Cluster) bits = static_cast<uint8_t>(bits | opBit(g.op));
@@ -45,11 +57,16 @@ uint8_t clusterOps(std::span<const GrantSpec> grants) noexcept {
 }
 
 uint8_t opsOn(std::span<const GrantSpec> grants, ResourceType type, std::string_view name) noexcept {
+    const bool internal = type != ResourceType::Cluster && name.starts_with("__");   // I6
+    // Root: every operation on the cluster and on every user topic / view / group / transactional id.  An internal
+    // object stays at what an explicit cluster grant gives (below), and a NAMESPACE grant is never implied (it decides
+    // namespace-admin membership).
+    if (type != ResourceType::Namespace && !internal && isRoot(grants)) return kAllOps;
     uint8_t bits = 0;
     for (const GrantSpec& g : grants)
         if (matches(g.resource, type, name)) bits = static_cast<uint8_t>(bits | opBit(g.op));
     // D16: CREATE / ALTER / DROP / DESCRIBE ON CLUSTER reach every topic and view; DESCRIBE reaches
-    // groups and transactional ids.  ADMIN (and READ / WRITE, which a cluster grant cannot hold) never do.
+    // groups and transactional ids.  READ / WRITE / TRUNCATE never come from a cluster grant (only root above).
     const uint8_t cluster = clusterOps(grants);
     constexpr uint8_t kObjectOps = opBit(Operation::Create) | opBit(Operation::Alter) | opBit(Operation::Drop) |
                                    opBit(Operation::Describe);

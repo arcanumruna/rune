@@ -968,9 +968,11 @@ TEST(AuthLiveChangeRegression, AdminLogFramesNeedTheReadersGrantAtSendTimeRegres
         << "an event this broker has not applied yet waits (it may follow a revoke of this very reader)";
     EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, ctrl0.data(), ctrl0.size()), A::Deliver)
         << "a control batch is no event (the applier never mirrors it): never held";
+    EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size()), A::Deliver)
+        << "ADMIN ON CLUSTER is root: it holds DESCRIBE ON CLUSTER, so the catalog streams";
+    g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", clusterTable({rune::security::Operation::Create}), {}});
     EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, catSub, event0.data(), event0.size()), A::Withhold)
-        << "ADMIN does not give DESCRIBE ON CLUSTER here (no implied cluster ops in this table)"
-           " - unless the table says so";
+        << "CREATE ON CLUSTER does not give DESCRIBE ON CLUSTER";
 
     g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", clusterTable({rune::security::Operation::Describe}), {}});
     EXPECT_EQ(g.gw.admitAdminLogFrame(g.sid, secSub, ctrl0.data(), ctrl0.size()), A::Withhold)

@@ -41,8 +41,8 @@ public:
     [[nodiscard]] bool isAllowAll() const noexcept { return allowAll_; }
     /// #211: true when the table holds `op` on at least one resource of `type` - any literal, prefixed or wildcard
     /// grant ON that type (allow-all: always).  O(1): kept when the table is compiled (a grant change recompiles it).
-    /// Only the type's own grants count (no CLUSTER implication), which is exact for READ / WRITE (a CLUSTER grant
-    /// cannot hold them).
+    /// Only the type's own grants count, plus root: ADMIN ON CLUSTER holds every op on every type but NAMESPACE.  The
+    /// other CLUSTER grants give no implication here, which is exact for READ / WRITE (only root holds them).
     [[nodiscard]] bool hasAnyGrant(rune::security::ResourceType type, rune::security::Operation op) const noexcept {
         const auto t = static_cast<std::size_t>(type);
         return allowAll_ || (t < anyOps_.size() && (anyOps_[t] & rune::security::opBit(op)) != 0);

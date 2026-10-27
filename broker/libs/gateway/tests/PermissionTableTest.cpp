@@ -77,12 +77,13 @@ TEST(PermissionTableRegression, DenyAllDeniesEverything) {
 TEST(PermissionTableRegression, ClusterGrantsReachEveryTopicViewButNeverDataOrInternalNames) {
     rg::ObjectIndex idx; idx.onTopic(0, "a"); idx.onView(1, "v");
     auto t = rg::PermissionTable::compile({{g(Operation::Drop, ResourceType::Cluster, PatternKind::Exact, ""),
-                                            g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")}}, idx);
+                                            g(Operation::Describe, ResourceType::Cluster, PatternKind::Exact, "")}}, idx);
     EXPECT_TRUE(t.allows(0, rs::opBit(Operation::Drop)));
     EXPECT_TRUE(t.allows(1, rs::opBit(Operation::Drop)));
-    EXPECT_FALSE(t.allows(0, rs::opBit(Operation::Read))) << "ADMIN/DROP on CLUSTER imply no data access";
-    EXPECT_TRUE(t.allowsCluster(rs::opBit(Operation::Admin)));
+    EXPECT_FALSE(t.allows(0, rs::opBit(Operation::Read))) << "DROP/DESCRIBE on CLUSTER imply no data access";
+    EXPECT_TRUE(t.allowsCluster(rs::opBit(Operation::Drop)));
     EXPECT_FALSE(t.allowsCluster(rs::opBit(Operation::Create)));
+    EXPECT_FALSE(t.allowsCluster(rs::opBit(Operation::Admin)));
     t.onObjectCreated(5, {"later", ResourceType::Topic});
     EXPECT_TRUE(t.allows(5, rs::opBit(Operation::Drop))) << "a cluster grant covers an object created after login";
 }
@@ -390,7 +391,8 @@ TEST(PermissionTableRegression, HasAnyGrantCountsEveryPatternOfThatTypeAndOpRegr
     EXPECT_FALSE(has({g(Operation::Read, ResourceType::Topic, PatternKind::Prefix, "")})) << "READ is not WRITE";
     EXPECT_FALSE(has({g(Operation::Write, ResourceType::TransactionalId, PatternKind::Prefix, ""),
                       g(Operation::Read, ResourceType::Group, PatternKind::Prefix, ""),
-                      g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")}));
+                      g(Operation::Create, ResourceType::Cluster, PatternKind::Exact, "")}));
+    EXPECT_TRUE(has({g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")})) << "ADMIN ON CLUSTER is root";
     EXPECT_FALSE(has({g(Operation::Write, ResourceType::View, PatternKind::Exact, "orders")}));
     EXPECT_TRUE(rg::PermissionTable::allowAll().hasAnyGrant(ResourceType::Topic, Operation::Write));
     EXPECT_FALSE(rg::PermissionTable::denyAll().hasAnyGrant(ResourceType::Topic, Operation::Write));
@@ -402,4 +404,29 @@ TEST(PermissionTableRegression, HasAnyGrantCountsEveryPatternOfThatTypeAndOpRegr
     EXPECT_EQ(d->detail, "not authorized: WRITE on any TOPIC");
     const auto w = rg::PermissionTable::compile(std::vector<rs::GrantSpec>{g(Operation::Write, ResourceType::Topic, PatternKind::Prefix, "x")}, idx);
     EXPECT_FALSE(rg::authorizeAnyGrant(w, ResourceType::Topic, Operation::Write).has_value());
+}
+
+// Namespaces spec §2 (owner ruling): ADMIN ON CLUSTER is root.  The compiled table gives every op on every user
+// object (existing, created after login, by name), every cluster op and every any-grant - and still nothing beyond
+// CREATE/ALTER/DROP/DESCRIBE on an internal (`__`) object (I6).  The bootstrap admin holds only this grant.
+TEST(PermissionTableRegression, AdminOnClusterIsRootRegression) {
+    rg::ObjectIndex idx; idx.onTopic(0, "orders"); idx.onView(1, "board"); idx.onTopic(2, "__catalog");
+    auto t = rg::PermissionTable::compile({{g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")}}, idx);
+    constexpr uint8_t kAll = 0xFF;
+    EXPECT_TRUE(t.allows(0, kAll)) << "READ / WRITE / TRUNCATE / ... on a user topic";
+    EXPECT_TRUE(t.allows(1, kAll)) << "every op on a view";
+    EXPECT_NE(t.writeBits()[0] & (uint64_t{1} << 0), 0u) << "the produce path's write bit";
+    EXPECT_TRUE(t.allowsCluster(rs::opBit(Operation::Create) | rs::opBit(Operation::Describe) | rs::opBit(Operation::Admin)));
+    for (ResourceType ty : {ResourceType::Topic, ResourceType::View, ResourceType::Group, ResourceType::TransactionalId}) {
+        EXPECT_TRUE(t.allowsName(ty, "anything", kAll)) << static_cast<int>(ty);
+        for (Operation op : {Operation::Read, Operation::Write, Operation::Create, Operation::Describe})
+            EXPECT_TRUE(t.hasAnyGrant(ty, op)) << static_cast<int>(ty) << "/" << static_cast<int>(op);
+    }
+    EXPECT_FALSE(t.hasAnyGrant(ResourceType::Namespace, Operation::Admin)) << "a NAMESPACE grant is never implied";
+    EXPECT_FALSE(t.allows(2, rs::opBit(Operation::Read))) << "no data on an internal topic (I6)";
+    EXPECT_FALSE(t.allowsName(ResourceType::Topic, "__security", rs::opBit(Operation::Write)));
+    EXPECT_TRUE(t.allows(2, rs::opBit(Operation::Describe)));
+    t.onObjectCreated(7, {"later", ResourceType::Topic});
+    EXPECT_TRUE(t.allows(7, kAll)) << "root covers an object created after login";
+    EXPECT_NE(t.writeBits()[0] & (uint64_t{1} << 7), 0u);
 }

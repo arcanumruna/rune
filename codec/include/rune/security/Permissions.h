@@ -16,8 +16,10 @@ namespace rune::security {
 [[nodiscard]] bool matches(const ResourcePattern& p, ResourceType type, std::string_view name) noexcept;
 [[nodiscard]] std::vector<GrantSpec> effectiveGrants(const SecurityState&, uint64_t userId);   // direct ∪ roles, sorted, unique
 /// The op bits `grants` give on object (type, name): exact / prefix matches, CLUSTER grants (D16),
-/// and the implied DESCRIBE (D15).  Pure; the broker compiles tables with it, the model checks with its own.
+/// and the implied DESCRIBE (D15).  ADMIN ON CLUSTER is root (namespaces spec §2): every op (0xFF) on the cluster and on
+/// every user object; an internal (`__`) object keeps the D16 bits only (I6) and a NAMESPACE grant is never implied.  Pure; the broker compiles tables with it, the model checks with its own.
 [[nodiscard]] uint8_t opsOn(std::span<const GrantSpec> grants, ResourceType type, std::string_view name) noexcept;
+/// The CLUSTER op bits; 0xFF for root (ADMIN ON CLUSTER).
 [[nodiscard]] uint8_t clusterOps(std::span<const GrantSpec> grants) noexcept;
 
 /// A user's effective permissions, scoped to its namespace.
@@ -30,7 +32,8 @@ struct EffectivePerms {
 /// yields nsAdmin false and no grants.
 [[nodiscard]] EffectivePerms effectivePerms(const SecurityState&, uint64_t userId, std::string_view nsName);
 /// The op bits `perms` give on object (type, name) of namespace `objectNsId`: opsOn() over the grants if the object is
-/// in the grantee's own namespace, 0 otherwise.  A foreign object has no permission bits (plan D9).
+/// in the grantee's own namespace (or the grantee is root), 0 otherwise.  A foreign object has no permission bits for a
+/// non-root grantee (plan D9).
 [[nodiscard]] uint8_t opsOn(const EffectivePerms& perms, ResourceType type, uint32_t objectNsId, std::string_view name) noexcept;
 
 } // namespace rune::security

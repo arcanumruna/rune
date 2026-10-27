@@ -13,6 +13,11 @@ PermissionTable PermissionTable::compile(std::span<const rsec::GrantSpec> effect
         const auto type = static_cast<std::size_t>(g.resource.type);
         if (type < t.anyOps_.size()) t.anyOps_[type] = static_cast<uint8_t>(t.anyOps_[type] | rsec::opBit(g.op));
     }
+    if ((t.clusterOps_ & rsec::opBit(rsec::Operation::Admin)) != 0) {   // root (spec §2): every op on every type
+        const auto ns = static_cast<std::size_t>(rsec::ResourceType::Namespace);   // ... but NAMESPACE stays explicit
+        for (std::size_t i = 0; i < t.anyOps_.size(); ++i)
+            if (i != ns) t.anyOps_[i] = 0xFF;
+    }
     const auto limit = static_cast<std::size_t>(index.idLimit());
     t.ops_.assign(limit, 0);
     t.writeBits_.assign((limit + 63) / 64, 0);

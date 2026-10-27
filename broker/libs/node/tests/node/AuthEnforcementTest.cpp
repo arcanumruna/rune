@@ -241,16 +241,16 @@ TEST(AuthTxnRegression, NonTransactionalInitProducerIdNeedsAWriteGrantRegression
 }
 
 // PR #609 adversarial review (#211, auth class): WRITE on some topic is what counts, however it is held.  Grants of
-// every other kind - WRITE on a transactional id, READ on a group, CREATE/ALTER/DESCRIBE/ADMIN on CLUSTER, CREATE on
-// a topic - never mint a non-transactional producer id; WRITE held only through a ROLE does, and revoking that role
-// mid-session refuses the very next one.  RED: drop the #211 check in ClientGateway::denyTxnRequest_.
+// every other kind - WRITE on a transactional id, READ on a group, CREATE/ALTER/DESCRIBE on CLUSTER, CREATE on a
+// topic - never mint a non-transactional producer id (ADMIN on CLUSTER is root, spec §2: AdminClusterIsRootRegression);
+// WRITE held only through a ROLE does, and revoking that role mid-session refuses the very next one.  RED: drop the #211 check in ClientGateway::denyTxnRequest_.
 TEST(AuthTxnRegression, NonTransactionalInitProducerIdCountsOnlyTopicWriteHoweverHeldAdversarialRegression) {
     using SP = rune::protocol::SecurityPatternKind;
     AuthRig r;
     const int64_t others = r.newUser({exact(SO::Write, ST::TransactionalId, "tx1"), exact(SO::Read, ST::Group, "cg"),
                                       exact(SO::Create, ST::Topic, "orders"), exact(SO::Read, ST::Topic, "orders"),
                                       exact(SO::Create, ST::Cluster, ""), exact(SO::Alter, ST::Cluster, ""),
-                                      exact(SO::Describe, ST::Cluster, ""), exact(SO::Admin, ST::Cluster, "")});
+                                      exact(SO::Describe, ST::Cluster, "")});
     EXPECT_EQ(r.initProducerId(others, ""), kNotAuthorized) << "no grant of WRITE on a topic";
 
     AuthWireClient& aw = r.broker().admin();
@@ -417,7 +417,7 @@ TEST(AuthEnforcementRegression, GetTopicSchemaAnswersPerTheObjectsOwnKindAcrossT
     for (const char* sys : {"__security", "__catalog", "__consumer_offsets", "__transaction_state"}) {
         EXPECT_EQ(r.getTopicSchema(allTopics, sys), kNotAuthorized) << sys;
         EXPECT_EQ(r.getTopicSchema(allViews, sys), kNotAuthorized) << sys;
-        EXPECT_EQ(r.getTopicSchema(adminCluster, sys), kNotAuthorized) << sys << ": ADMIN ON CLUSTER is no data grant";
+        EXPECT_EQ(r.getTopicSchema(adminCluster, sys), kUnknown) << sys << ": root, but no catalog object (I6 keeps no data grant)";
         EXPECT_EQ(r.getTopicSchema(describeCluster, sys), kUnknown) << sys << ": no catalog object";
     }
     EXPECT_EQ(r.getTopicSchema(describeCluster, "orders"), kOk);
@@ -558,14 +558,37 @@ TEST(AuthEnforcementRegression, SelfPasswordChangeNeedsAFreshProofOfTheCurrentPa
     EXPECT_EQ(r.broker().node().securityViewForTest().appliedOffset, before) << "no event was appended";
 }
 
-TEST(AuthEnforcementRegression, AdminClusterGrantsNoDataAccess) {
+// Namespaces spec §2 / plan: "the cluster admin is root" - ADMIN ON CLUSTER alone is every operation on every user
+// object, data and DDL included.  Driven for a user granted only ADMIN ON CLUSTER and for the bootstrap admin itself
+// (which holds nothing else), on a real broker over the wire.
+TEST(AuthEnforcementRegression, AdminClusterIsRootRegression) {
     AuthRig r;
-    const int64_t admin = r.newUser({cluster(SO::Admin)});
-    EXPECT_EQ(r.produceDenied(admin, r.orders), kNotAuthorized);
-    EXPECT_EQ(r.subscribeDenied(admin, r.orders), kNotAuthorized);
-    EXPECT_EQ(r.getTopicSchema(admin, "orders"), kNotAuthorized);
-    EXPECT_EQ(r.catalogSubscribe(admin), kNotAuthorized);
-    EXPECT_TRUE(r.metadataTopics(admin).empty());
+    const int64_t granted = r.newUser({cluster(SO::Admin)});
+    // The bootstrap admin itself, logged in on the rig's data client (its admin-channel session answers elsewhere).
+    const int64_t bootstrap = r.login("admin", AuthBroker::kAdminPassword);
+    int n = 0;
+    for (const int64_t admin : {granted, bootstrap}) {
+        SCOPED_TRACE(admin == bootstrap ? "bootstrap admin" : "ADMIN ON CLUSTER");
+        const std::string t = "root_t" + std::to_string(n), v = "root_v" + std::to_string(n), tx = "root_tx" + std::to_string(n),
+                          cg = "root_cg" + std::to_string(n);
+        ++n;
+        EXPECT_EQ(r.produce(admin, r.orders), kOk);
+        EXPECT_EQ(r.produce(admin, r.secret), kOk);
+        EXPECT_EQ(r.subscribe(admin, r.secret), kOk);
+        EXPECT_EQ(r.getTopicSchema(admin, "orders"), kOk);
+        EXPECT_EQ(r.getTopicSchema(admin, "board"), kOk);
+        EXPECT_NE(r.getViewRow(admin, r.board), kNotAuthorized);
+        EXPECT_EQ(r.catalogSubscribe(admin), kOk);
+        const auto topics = r.metadataTopics(admin);
+        EXPECT_NE(std::find(topics.begin(), topics.end(), r.secret), topics.end()) << "metadata lists every user topic";
+        EXPECT_EQ(r.defineTopicCode(admin, t), kOk) << "CREATE TOPIC";
+        EXPECT_EQ(r.alterTopicCode(admin, t), kOk) << "ALTER TOPIC";
+        EXPECT_EQ(r.createViewCode(admin, v, r.orders), kOk) << "CREATE VIEW";
+        EXPECT_EQ(r.dropViewCode(admin, v), kOk) << "DROP VIEW";
+        EXPECT_EQ(r.dropTopicCode(admin, t), kOk) << "DROP TOPIC";
+        EXPECT_EQ(r.joinGroup(admin, cg, {r.orders}), kOk) << "groups";
+        EXPECT_EQ(r.initProducerId(admin, tx), kOk) << "transactional ids";
+    }
 }
 
 TEST(AuthEnforcementRegression, DescribeOnClusterTurnsAMissingIdIntoUnknownTopicRegression) {   // D22
