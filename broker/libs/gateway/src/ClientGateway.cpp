@@ -9859,8 +9859,20 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
         sendAnswer_(*session, scratch_.data(), n);
         return;
     }
-    answerAdminSubmit_(buf, len, adminSink_->submitSecurityBootstrap(m, ddlMetaOf_(nullptr, m.sessionId, *session, 0)),
-                       "SecurityBootstrap: admin ring full", "SecurityBootstrap: request larger than the admin ring message");
+    const rune::gateway::AdminSubmit submitted =
+        adminSink_->submitSecurityBootstrap(m, ddlMetaOf_(nullptr, m.sessionId, *session, 0));
+    // Issue #240: the bootstrap is now in flight and the session waits for its answer, which the admin thread sends
+    // only after the `__security` commit.  The login deadline restarts here (as after a TLS handshake), so the auth
+    // reaper never answers 44 to a session whose bootstrap is committing.  Once per session: a repeated bootstrap
+    // frame never keeps an unauthenticated session alive.
+    if (submitted == rune::gateway::AdminSubmit::Accepted)
+        if (auto* first = std::get_if<rune::gateway::AuthAwaitingFirst>(&session->auth);
+            first != nullptr && !first->deadlineRestartedByBootstrap) {
+            first->deadlineNs                   = nowNs_ + authTimeoutNs_;
+            first->deadlineRestartedByBootstrap = true;
+        }
+    answerAdminSubmit_(buf, len, submitted, "SecurityBootstrap: admin ring full",
+                       "SecurityBootstrap: request larger than the admin ring message");
 }
 
 // ---------------------------------------------------------------------------

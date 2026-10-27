@@ -411,7 +411,9 @@ public:
     [[nodiscard]] bool authenticated() const noexcept { return authInfo_.authenticated; }
     /// Review B I5: the broker answered Required + Anonymous (a cluster with no security admin yet): this session may
     /// carry ONLY the bootstrap — the broker answers any other frame AuthenticationFailed and closes it, so the
-    /// machine sends no keepalive and the Client no connect-time metadata request on it.
+    /// machine sends no keepalive and the Client no connect-time metadata request on it.  Nothing keeps such a
+    /// session alive: the broker's login deadline ends it, and an accepted bootstrap restarts that deadline so its
+    /// answer arrives first (#240).
     [[nodiscard]] bool anonymousBootstrap() const noexcept { return authInfo_.anonymousBootstrap; }
     /// #514: Connected, able to be pinged (not a bootstrap-only session), and no inbound frame for more than `ns`.
     /// A live node answers every keepalive Ping, so silence past two keepalive intervals means it is suspect -
