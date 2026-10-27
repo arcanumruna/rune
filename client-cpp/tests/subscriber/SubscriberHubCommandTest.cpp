@@ -774,3 +774,226 @@ TEST(SubscriberHubCommand, AnUnknownSubscribeRefusalCodeFinishesThePendingSubscr
         EXPECT_EQ(send.countSubscribe(), 1) << "never re-sent";
     }
 }
+
+// ===========================================================================
+// #446: a Subscribe OK that binds nothing (its correlationId timed out / swept, or it came on another live
+// session than the pending Subscribe expects) used to be dropped while the broker kept the subscription and
+// pushed records until the session closed.  It is now released with one best-effort Unsubscribe.
+// ===========================================================================
+namespace {
+/// A hub's view of the node sessions: records what is offered where, answers sessionIndexOf with `index`.
+struct NodeFake {
+    uint32_t index = 0;   // 0 none, UINT32_MAX ambiguous
+    int64_t  corr  = 9000;
+    int      offersRefused = 0;
+    std::vector<std::pair<uint32_t, Frame>> offered;
+    static uint32_t idxOf(void* ctx, int64_t) { return static_cast<NodeFake*>(ctx)->index; }
+    static uint32_t leader(void*, int32_t, int32_t) { return 0; }
+    static int64_t  sid(void*, uint32_t) { return 0; }
+    static uint64_t epoch(void*, uint32_t) { return 0; }
+    static int64_t  next(void* ctx) { return ++static_cast<NodeFake*>(ctx)->corr; }
+    static rcd::SendResult offer(void* ctx, uint32_t s, const uint8_t* b, std::size_t n) {
+        auto* self = static_cast<NodeFake*>(ctx);
+        if (self->offersRefused > 0) { --self->offersRefused; return rcd::SendResult::Retry; }
+        self->offered.emplace_back(s, Frame{std::vector<uint8_t>(b, b + n)});
+        return rcd::SendResult::Accepted;
+    }
+    SubscriberHub::NodeRouter router() {
+        SubscriberHub::NodeRouter r;
+        r.ctx = this; r.leaderSession = &leader; r.sessionId = &sid; r.epoch = &epoch;
+        r.offer = &offer; r.nextCorrId = &next; r.sessionIndexOf = &idxOf;
+        return r;
+    }
+};
+
+/// The Unsubscribe frames among a transport's accepted frames (the Subscribe itself was sent through it too).
+std::vector<rc::codec::UnsubscribeView> unsubscribesOf(const RefusingTransport& tx) {
+    std::vector<rc::codec::UnsubscribeView> out;
+    for (const auto& f : tx.accepted)
+        if (auto u = rc::codec::decodeUnsubscribe(f.bytes.data(), f.bytes.size())) out.push_back(*u);
+    return out;
+}
+
+/// Subscribe `corr`, then let the client's subscribe timeout sweep it.
+void subscribeAndTimeOut(SubscriberHub& hub, CaptureSend& send, rc::SubscriptionImpl* impl) {
+    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    ASSERT_EQ(hub.pendingCount(), 1u);
+    hub.sweepTimedOut(std::chrono::steady_clock::now() + std::chrono::hours(2));
+    ASSERT_EQ(hub.pendingCount(), 0u);
+}
+} // namespace
+
+// RED (before): the late OK was dropped; no Unsubscribe ever left and the broker kept pushing.
+TEST(SubscriberHubRegression, ALateOkAfterTheSubscribeTimeoutIsUnsubscribedRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    RefusingTransport tx;
+    hub.setDirectSend(&RefusingTransport::fn, &tx);
+    auto impl = makeImpl(80);
+    subscribeAndTimeOut(hub, send, impl.get());
+    hub.onSubscribeResponse(bindRsp(80, 4711), /*unsubCorrId=*/777, kSession, send.fn());
+    const auto unsubs = unsubscribesOf(tx);
+    ASSERT_EQ(unsubs.size(), 1u) << "exactly one Unsubscribe for the unbound OK";
+    EXPECT_EQ(unsubs[0].subscriptionId, 4711);
+    EXPECT_EQ(unsubs[0].sessionId, kSession);
+    EXPECT_EQ(unsubs[0].correlationId, 777);
+    EXPECT_EQ(hub.lateOksReleased(), 1u);
+    EXPECT_EQ(hub.lateOksUnreleased(), 0u);
+    EXPECT_EQ(hub.activeCount(), 0u);
+}
+
+// Records-first binding: the id is in use, so the OK that follows must not tear it down.
+TEST(SubscriberHubRegression, ALateOkForAnIdAlreadyBoundByRecordsIsNotUnsubscribedRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    RefusingTransport tx;
+    hub.setDirectSend(&RefusingTransport::fn, &tx);
+    int delivered = 0;
+    auto impl = makeImpl(81, &delivered);
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    std::vector<uint8_t> st;
+    auto rv = records(st, /*subId=*/4712, 0, 2);
+    rv.correlationId = 81;
+    rv.sessionId     = kSession;
+    hub.onRecords(rv, kSession);                     // binds the pending subscription
+    ASSERT_EQ(hub.activeCount(), 1u);
+    ASSERT_EQ(delivered, 2);
+    hub.onSubscribeResponse(bindRsp(81, 4712), 778, kSession, send.fn());
+    EXPECT_TRUE(unsubscribesOf(tx).empty()) << "the bound subscription was unsubscribed";
+    EXPECT_EQ(hub.activeCount(), 1u);
+    EXPECT_TRUE(impl->active);
+    EXPECT_EQ(hub.lateOksReleased(), 0u);
+}
+
+// An OK stamped with a session that is neither the seed nor any node session: nothing to send on, counted.
+TEST(SubscriberHubRegression, ALateOkFromADeadSessionIsNotUnsubscribedRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    RefusingTransport tx;
+    NodeFake      nodes;                              // sessionIndexOf answers 0: no such live session
+    hub.setDirectSend(&RefusingTransport::fn, &tx);
+    hub.setNodeRouter(nodes.router());
+    auto impl = makeImpl(82);
+    subscribeAndTimeOut(hub, send, impl.get());
+    auto rsp = bindRsp(82, 4713);
+    rsp.sessionId = 99;                               // not the seed (7), not a live node session
+    hub.onSubscribeResponse(rsp, 779, kSession, send.fn());
+    EXPECT_TRUE(unsubscribesOf(tx).empty());
+    EXPECT_TRUE(nodes.offered.empty());
+    EXPECT_EQ(hub.lateOksReleased(), 0u);
+    EXPECT_EQ(hub.lateOksUnreleased(), 1u);
+}
+
+// A node session that is alive and carries that broker session id gets the Unsubscribe - and only it.
+TEST(SubscriberHubRegression, ALateOkOnANodeSessionIsUnsubscribedThereRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    RefusingTransport tx;
+    NodeFake      nodes;
+    nodes.index = 2;
+    hub.setDirectSend(&RefusingTransport::fn, &tx);
+    hub.setNodeRouter(nodes.router());
+    auto impl = makeImpl(83);
+    subscribeAndTimeOut(hub, send, impl.get());
+    auto rsp = bindRsp(83, 4714);
+    rsp.sessionId = 55;
+    hub.onSubscribeResponse(rsp, 780, kSession, send.fn());
+    EXPECT_TRUE(unsubscribesOf(tx).empty()) << "the seed must not get a node session's Unsubscribe";
+    ASSERT_EQ(nodes.offered.size(), 1u);
+    EXPECT_EQ(nodes.offered[0].first, 2u);
+    const auto u = rc::codec::decodeUnsubscribe(nodes.offered[0].second.bytes.data(), nodes.offered[0].second.bytes.size());
+    ASSERT_TRUE(u.has_value());
+    EXPECT_EQ(u->subscriptionId, 4714);
+    EXPECT_EQ(u->sessionId, 55);
+    EXPECT_EQ(u->correlationId, 780);
+    EXPECT_EQ(hub.lateOksReleased(), 1u);
+}
+
+// The same OK arrives for a PENDING Subscribe that expects another session (the I2 check): still released.
+TEST(SubscriberHubRegression, AnOkOnAnotherLiveSessionThanThePendingOneIsUnsubscribedThereRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    RefusingTransport tx;
+    NodeFake      nodes;
+    nodes.index = 3;
+    hub.setDirectSend(&RefusingTransport::fn, &tx);
+    hub.setNodeRouter(nodes.router());
+    auto impl = makeImpl(84);
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    auto rsp = bindRsp(84, 4715);
+    rsp.sessionId = 56;                               // not the pending one's (seed 7)
+    hub.onSubscribeResponse(rsp, 781, kSession, send.fn());
+    EXPECT_EQ(hub.pendingCount(), 1u) << "the pending Subscribe stays for its own session";
+    ASSERT_EQ(nodes.offered.size(), 1u);
+    EXPECT_EQ(nodes.offered[0].first, 3u);
+    EXPECT_EQ(hub.lateOksReleased(), 1u);
+}
+
+// Two sessions claim the id (the seed and a node, or two nodes): ambiguous, so nothing is sent.
+TEST(SubscriberHubRegression, ALateOkMatchingTwoSessionsIsNotUnsubscribedRegression) {
+    {
+        SubscriberHub hub;
+        CaptureSend   send;
+        RefusingTransport tx;
+        NodeFake      nodes;
+        nodes.index = 2;                              // a node also carries the seed's id
+        hub.setDirectSend(&RefusingTransport::fn, &tx);
+        hub.setNodeRouter(nodes.router());
+        auto impl = makeImpl(85);
+        subscribeAndTimeOut(hub, send, impl.get());
+        hub.onSubscribeResponse(bindRsp(85, 4716), 782, kSession, send.fn());   // sessionId == seed
+        EXPECT_TRUE(unsubscribesOf(tx).empty());
+        EXPECT_TRUE(nodes.offered.empty());
+        EXPECT_EQ(hub.lateOksUnreleased(), 1u);
+    }
+    {
+        SubscriberHub hub;
+        CaptureSend   send;
+        NodeFake      nodes;
+        nodes.index = UINT32_MAX;                     // two nodes carry it
+        hub.setNodeRouter(nodes.router());
+        auto impl = makeImpl(86);
+        subscribeAndTimeOut(hub, send, impl.get());
+        auto rsp = bindRsp(86, 4717);
+        rsp.sessionId = 55;
+        hub.onSubscribeResponse(rsp, 783, kSession, send.fn());
+        EXPECT_TRUE(nodes.offered.empty());
+        EXPECT_EQ(hub.lateOksUnreleased(), 1u);
+    }
+}
+
+// A refused offer is one attempt only: counted unreleased, never retried.
+TEST(SubscriberHubRegression, ARefusedLateOkUnsubscribeIsCountedAndNotRetriedRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    RefusingTransport tx;
+    hub.setDirectSend(&RefusingTransport::fn, &tx);
+    auto impl = makeImpl(87);
+    subscribeAndTimeOut(hub, send, impl.get());
+    tx.refuseNext = 1;                               // the late OK's one Unsubscribe attempt
+    hub.onSubscribeResponse(bindRsp(87, 4718), 784, kSession, send.fn());
+    EXPECT_EQ(hub.lateOksUnreleased(), 1u);
+    EXPECT_EQ(hub.lateOksReleased(), 0u);
+    EXPECT_EQ(hub.pendingUnsubscribes(), 0u);
+    EXPECT_EQ(hub.retryPendingUnsubscribes(kSession), 0);
+    EXPECT_TRUE(unsubscribesOf(tx).empty());
+}
+
+// An error answer binds nothing broker-side, so there is nothing to release.
+TEST(SubscriberHubRegression, AnErrorAnswerAfterTimeoutSendsNothingRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    RefusingTransport tx;
+    hub.setDirectSend(&RefusingTransport::fn, &tx);
+    auto impl = makeImpl(88);
+    subscribeAndTimeOut(hub, send, impl.get());
+    auto rsp = bindRsp(88, 0);
+    rsp.errorCode = 12;
+    hub.onSubscribeResponse(rsp, 785, kSession, send.fn());
+    auto withId = bindRsp(88, 4719);
+    withId.errorCode = 12;
+    hub.onSubscribeResponse(withId, 786, kSession, send.fn());
+    EXPECT_TRUE(unsubscribesOf(tx).empty());
+    EXPECT_EQ(hub.lateOksReleased(), 0u);
+    EXPECT_EQ(hub.lateOksUnreleased(), 0u);
+}

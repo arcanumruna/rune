@@ -412,12 +412,16 @@ void SubscriberHub::onSubscribeResponse(
     auto it = pendingByCorrelation_.find(rsp.correlationId);
     if (it == pendingByCorrelation_.end()) {
         if (rsp.sessionId != sessionId) ++staleResponsesIgnored_;
-        return; // unknown correlationId — race with close/timeout; safe
+        // Unknown correlationId — race with close/timeout.  #446: the broker may still hold the subscription
+        // this OK names: release it rather than let it push until its session closes.
+        releaseUnboundOk_(rsp, unsubCorrId, sessionId);
+        return;
     }
     // I2: a moved subscription's Subscribe went out on its own node session.
     const int64_t expectSid = it->second->impl ? homeSidOf_(*it->second->impl, sessionId) : sessionId;
     if (rsp.sessionId != expectSid || expectSid == 0) {
         ++staleResponsesIgnored_;
+        releaseUnboundOk_(rsp, unsubCorrId, sessionId);   // #446: bound broker-side on another live session
         return;
     }
     clearUnsent_(*it->second);
@@ -462,6 +466,32 @@ void SubscriberHub::onSubscribeResponse(
     (void)impl->status.publishFinal(
         SubscriptionStatus{impl->subscriptionId, impl->nextOffset, impl->failReason, 0, impl->dataResets, impl->batchBytes});
     activeById_.emplace(rsp.subscriptionId, impl);
+}
+
+// ---------------------------------------------------------------------------
+// releaseUnboundOk_ — #446 (cold: only a late / stray SubscribeResponse OK)
+// ---------------------------------------------------------------------------
+
+void SubscriberHub::releaseUnboundOk_(const codec::SubscribeResponseView& rsp, int64_t unsubCorrId, int64_t seedSid)
+{
+    if (rsp.errorCode != 0 || rsp.subscriptionId == 0 || rsp.sessionId == 0) return;   // binds nothing broker-side
+    // Bound here already (Records-first, or an earlier answer): the id is in use - not ours to release.
+    if (activeById_.find(rsp.subscriptionId) != activeById_.end()) return;
+    // The live session this answer belongs to: the seed, or exactly one node session.  Zero or several
+    // (dead session, ambiguous id) -> skipped: the broker drops the subscription with its session.
+    const bool seedMatch = sessionConnected_ && rsp.sessionId == seedSid;
+    const uint32_t node  = router_.sessionIndexOf != nullptr ? router_.sessionIndexOf(router_.ctx, rsp.sessionId) : 0;
+    if (node == UINT32_MAX || (seedMatch && node != 0) || (!seedMatch && node == 0)) { ++lateOksUnreleased_; return; }
+    uint8_t buf[64]{};
+    const std::size_t len = codec::encodeUnsubscribe(buf, sizeof(buf), rsp.subscriptionId, rsp.sessionId, unsubCorrId);
+    detail::SendResult r = detail::SendResult::Fatal;
+    if (len != 0) {
+        if (seedMatch)           { if (directSend_ != nullptr) r = directSend_(directSendCtx_, buf, len); }
+        else if (routed_())      { r = router_.offer(router_.ctx, node, buf, len); }
+    }
+    // One attempt only (best-effort, as the #365 old-instance release): a refusal is not retried.
+    if (r == detail::SendResult::Accepted) ++lateOksReleased_;
+    else                                   ++lateOksUnreleased_;
 }
 
 // ---------------------------------------------------------------------------

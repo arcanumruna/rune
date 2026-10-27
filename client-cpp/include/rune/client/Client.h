@@ -1667,6 +1667,7 @@ private:
     /// #290: a node session's reject code (46 / 44 ...) while it is Rejected, else 0 (0 for the seed, whose
     /// rejection ends the Client's work on its own path).
     static int16_t nodeRejectCodeTrampoline_(void* ctx, uint32_t session) noexcept;
+    static uint32_t nodeSessionIndexOfTrampoline_(void* ctx, int64_t sid) noexcept;   // #446
     [[nodiscard]] int16_t nodeRejectCode_(uint32_t session) const noexcept;
     static int32_t subscribeBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept;   // Phase 2c: 0 unless Connected
     /// M1 (duty thread, while a group consumer exists): a leader-node session a

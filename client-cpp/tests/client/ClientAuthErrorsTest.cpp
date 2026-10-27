@@ -1204,3 +1204,32 @@ TEST(ClientAuthErrorsRegression, APendingSubscribeWhoseRejectedHomeMovedFollowsT
     EXPECT_TRUE(sub.active());
     EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
 }
+
+// ---- #446: a Subscribe OK that arrives after the client's subscribe timeout ---------------------------------------
+// The broker registered the Subscribe, the client timed it out (TimedOut) and only then does the OK arrive.  RED
+// (before): the OK was dropped as an unknown correlationId and the broker kept the subscription, pushing records
+// until the session closed; now the client releases it with an Unsubscribe naming the OK's subscription id.
+TEST(ClientAuthErrorsRegression, LateSubscribeOkIsReleasedEndToEndRegression) {
+    rc::ClientConfig c = authCfg(3880, "ws1", kPw);
+    c.subscribeTimeoutMs = 1;       // the Subscribe's deadline is on the real clock; the sweep runs on the duty clock
+    Rig r(c);
+    r.connectOk();
+    r.gw.dropSubscribeResponsesNext = 1;             // registered at the broker, its answer is not sent in time
+    rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty(); }));      // frozen duty clock: no sweep yet
+    const auto registered = r.gw.subscribed.back();
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); }, 10'000'000)) << "the Subscribe never timed out";
+    EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::TimedOut);
+    ASSERT_TRUE(r.gw.unsubscribed.empty());
+
+    uint8_t out[64];                                  // the broker's OK, late
+    const std::size_t n = rcc::encodeSubscribeResponse(out, sizeof out, 0, registered.partition,
+                                                       registered.subscriptionId, registered.sessionId,
+                                                       registered.corrId);
+    ASSERT_GT(n, 0u);
+    r.gw.send(0, out, n);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.unsubscribed.empty(); }))
+        << "the broker still holds subscription " << registered.subscriptionId;
+    EXPECT_EQ(r.gw.unsubscribed.back(), registered.subscriptionId);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}

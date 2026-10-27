@@ -301,6 +301,7 @@ Client::Client(ClientConfig cfg)
         nr.offer         = &Client::fetchOfferTrampoline_;
         nr.nextCorrId    = &Client::nextCorrTrampoline_;
         nr.rejectCode    = &Client::nodeRejectCodeTrampoline_;
+        nr.sessionIndexOf = &Client::nodeSessionIndexOfTrampoline_;
         subscriberHub_.setNodeRouter(nr);
     }
 
@@ -5128,6 +5129,18 @@ int32_t Client::subscribeBrokerVersionTrampoline_(void* ctx, uint32_t session) n
 
 int32_t Client::fetchBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept {
     return static_cast<Client*>(ctx)->agent_.sessionBrokerVersion(session);
+}
+
+// #446: the node session that is Connected with broker session id `sid` (cold: a late / stray Subscribe OK).
+uint32_t Client::nodeSessionIndexOfTrampoline_(void* ctx, int64_t sid) noexcept {
+    const auto& agent = static_cast<Client*>(ctx)->agent_;
+    uint32_t found = 0;
+    for (uint32_t i = 1; i < agent.sessionCount(); ++i) {
+        if (agent.connectedSessionId(i) != sid) continue;
+        if (found != 0) return UINT32_MAX;   // two node sessions carry it: ambiguous
+        found = i;
+    }
+    return found;
 }
 
 int16_t Client::nodeRejectCodeTrampoline_(void* ctx, uint32_t session) noexcept {
