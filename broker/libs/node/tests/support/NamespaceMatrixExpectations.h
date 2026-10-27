@@ -141,6 +141,16 @@ inline bool isExpectedMissingCode(Op o, int code) {
     for (const int c : expectedCodes(o)) if (c >= 0 && c == code) return true;
     return false;
 }
+/// The cluster admin holds every permission bit, so a missing id is not refused (spec: cross-namespace access by
+/// id is closed by permissions only): it gets the path's own unknown answer.  Nothing is hidden from root.
+inline constexpr int kUnknownView = 4;   ///< GetViewRowResponse status
+inline bool isExpectedMissingCode(Op o, Caller c, int code) {
+    if (c == Caller::ClusterAdmin) {
+        if (o == Op::Produce || o == Op::Fetch) return code == kUnknownTopic;
+        if (o == Op::GetViewRow) return code == kUnknownView;
+    }
+    return isExpectedMissingCode(o, code);
+}
 
 /// Rule 1: SameNameBoth is not applicable to the namespace ops (a namespace has no "same local name").
 inline constexpr bool naRule(Op o, Target t) { return t == Target::SameNameBoth && isNamespaceOp(o); }
@@ -149,8 +159,10 @@ inline constexpr bool naRule(Op o, Target t) { return t == Target::SameNameBoth 
 /// rig names an existing object), every other op is Ok (the rig gives drop / revoke / alter a fresh per-cell object).
 inline Outcome todays(Op o) {
     switch (o) {
-        case Op::CreateNamespace: case Op::CreateTopic: case Op::CreateUser: case Op::CreateRole:
-            return Outcome::exists(kTopicExists);
+        case Op::CreateNamespace: case Op::CreateTopic: return Outcome::exists(kTopicExists);
+        // The security DDL's convention (auth phase): a duplicate principal is InvalidRequest with a
+        // "UserExists" / "RoleExists" detail.  Only a duplicate namespace reuses TopicExists (plan, codes).
+        case Op::CreateUser: case Op::CreateRole: return Outcome::exists(kInvalidRequest);
         case Op::CreateView: return Outcome::exists(kViewExists);
         default: return Outcome::ok();
     }
@@ -190,12 +202,18 @@ inline Outcome expect(Op o, Caller c, Target t, Timing = Timing::Sequential) {
     if (o == Op::GroupJoin || o == Op::TxnInit) {
         if (!root) return Outcome::notAuthorized();
         if (t == Target::OwnNs || t == Target::ForeignNs) return Outcome::notAuthorized();
-        if (t == Target::Missing) return o == Op::TxnInit ? Outcome::ok() : Outcome::missing();
+        // A missing transactional id is created; a join names topics it does not check (a member may subscribe
+        // before a topic exists, as in Kafka), so both answer Ok.
+        if (t == Target::Missing) return Outcome::ok();
         return Outcome::ok();
     }
     // 5. ForeignNs: root and the target namespace's own admin (logged into it, naming it unqualified)
     if (t == Target::ForeignNs) {
         if (root || c == Caller::NsAdminSame) return todays(o);
+        // A data op checks the caller's own grants on the LOCAL name before the name resolves, so an ungranted
+        // caller is refused for a foreign namespace exactly as for a missing one.  The security DDL checks the
+        // namespace first (nsGuard), so it answers Missing either way.
+        if (!granted(o, c) && !isSecurityOp(o)) return Outcome::notAuthorized();
         return Outcome::missing();
     }
     // 6. Missing: created when granted; otherwise missing.  The missing name lives in the namespace under test, so a

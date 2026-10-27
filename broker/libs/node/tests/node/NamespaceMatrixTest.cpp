@@ -56,14 +56,21 @@ TEST_P(NamespaceMatrixRegression, SequentialCell) {
             EXPECT_EQ(got.code, want.code) << label;
             break;
         case Kind::Missing:
-            EXPECT_TRUE(isExpectedMissingCode(c.op, got.code)) << label;
-            if (c.target == Target::ForeignNs || c.target == Target::OwnNs) {
-                const NamespaceRig::Answer twin = rig_->runTwin(c.op, c.caller, c.target, c.ordinal);
-                EXPECT_EQ(got.normalized(), twin.normalized())
-                    << "ForeignEqualsMissingBytesRegression: " << label << " (twin code " << twin.code << ")";
-            }
+            EXPECT_TRUE(isExpectedMissingCode(c.op, c.caller, got.code)) << label;
             break;
         case Kind::NotApplicable: FAIL() << label; break;
+    }
+    // Hidden objects (a namespace the caller cannot see): whatever the answer, it is byte-equal to the same op on
+    // a namespace that does not exist.
+    const bool foreignCaller = c.caller == Caller::NsAdminForeign || c.caller == Caller::UserForeign;
+    const bool hidden = !isNamespaceOp(c.op) &&
+                        ((c.target == Target::ForeignNs && c.caller != Caller::ClusterAdmin && c.caller != Caller::NsAdminSame) ||
+                         (c.target == Target::OwnNs && foreignCaller));
+    if (hidden) {
+        const NamespaceRig::Answer twin = rig_->runTwin(c.op, c.caller, c.target, c.ordinal);
+        EXPECT_EQ(twin.code, got.code) << "ForeignEqualsMissingBytesRegression: " << label;
+        EXPECT_EQ(got.normalized(twin), twin.normalized(got))
+            << "ForeignEqualsMissingBytesRegression: " << label << " (twin code " << twin.code << ")";
     }
     if (c.op == Op::ListNamespaces && want.kind == Kind::Ok) {
         std::vector<std::string> names = got.nsNames;

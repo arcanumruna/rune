@@ -42,6 +42,10 @@ constexpr uint16_t kOK                   =  0;
 constexpr uint16_t kNotLeader            =  2;
 constexpr uint16_t kInternal             =  6;
 constexpr uint16_t kUnknownTopic         =  7;
+// Namespaces Task 12: a create in a namespace that does not exist (the gateway sends a hidden one as kHiddenNsId,
+// which never exists) answers UnknownTopic before any other check, so a hidden and a missing namespace answer alike.
+// The detail never names the namespace.
+constexpr const char* kNoNamespaceDetail = "no such namespace";
 constexpr uint16_t kInvalidSchema        = 23;
 constexpr uint16_t kTopicExists          = 25;
 constexpr uint16_t kSchemaIncompatible   = 30;
@@ -1236,6 +1240,7 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
 }
 
 AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat::CatalogState& s) const {
+    if (s.namespaces().byId(m.nsId) == nullptr) return Rejected(reject(kUnknownTopic, kNoNamespaceDetail));
     if (!persistenceFromWire(m.persistence)) return Rejected(reject(kInvalidSchema));   // a direct submit
     if (!cat::isValidTopicName(m.name)) return Rejected(reject(kInvalidTopicName));
     if (m.partitionCount < 1) return Rejected(reject(kInvalidSchema));
@@ -1421,6 +1426,7 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
 }
 
 AdminWorker::Built AdminWorker::buildCreateView_(const CreateViewMsg& m, const cat::CatalogState& s) const {
+    if (s.namespaces().byId(m.nsId) == nullptr) return Rejected(reject(kUnknownTopic, kNoNamespaceDetail));
     if (m.persistence > 1) return Rejected(reject(kInvalidSchema));   // a direct submit
     if (!cat::isValidTopicName(m.viewName)) return Rejected(reject(kInvalidTopicName));
     if (const cat::ViewObject* v = s.viewByName(m.nsId, m.viewName))

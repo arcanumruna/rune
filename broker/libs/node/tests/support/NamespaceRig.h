@@ -28,6 +28,7 @@ public:
     using Target = nsmatrix::Target;
 
     static constexpr int32_t kMissingId = 98'765;
+    static constexpr const char* kTwinNs = "z";
 
     struct Answer {
         int code = kNoAnswer;
@@ -36,12 +37,25 @@ public:
         std::string detail;                 ///< the broker's message, for failure texts
         bool listed = false;                ///< Metadata: the target id is in the listing
         std::vector<std::string> nsNames;   ///< ListNamespaces: the namespaces the answer lists
-        std::vector<int32_t> ids;           ///< topic / view ids this answer may echo (blanked by normalized())
-        /// body with the correlation id and the echoed ids zeroed (a hidden and a missing answer must be byte-equal).
-        [[nodiscard]] std::vector<uint8_t> normalized() const {
+        std::vector<int32_t> ids;           ///< the topic / view ids the REQUEST sent (an answer may echo them)
+        std::string askedNs;                ///< the namespace the request named (an answer may echo it)
+        /// body with the correlation id, the sent ids and the asked namespace blanked: a hidden and a missing answer
+        /// must then be byte-equal.  Only what the request itself carried is blanked; any other id in a hidden
+        /// answer is a leak and stays visible.
+        /// Symmetric: `other`'s correlation id and ids are blanked too, so a byte run that happens to equal one
+        /// side's correlation id (e.g. 255 next to zeros) is blanked on both sides alike.
+        [[nodiscard]] std::vector<uint8_t> normalized(const Answer& other) const {
             std::vector<uint8_t> f = body;
-            blank(f, &corr, 8);
-            for (const int32_t id : ids) blank(f, &id, 4);
+            for (const Answer* x : {this, &other}) {
+                blank(f, &x->corr, 8);
+                for (const int32_t id : x->ids) blank(f, &id, 4);
+            }
+            if (!askedNs.empty()) {
+                const std::string quoted = "'" + askedNs + "'";
+                for (std::size_t i = 0; i + quoted.size() <= f.size(); ++i)
+                    if (std::memcmp(f.data() + i, quoted.data(), quoted.size()) == 0)
+                        std::memset(f.data() + i + 1, '?', askedNs.size());
+            }
             return f;
         }
     private:
@@ -74,7 +88,7 @@ private:
     };
     struct Sess { int64_t sid = 0; std::string ns; };
     struct Names {
-        std::string ns, topic, view, user, role, group, txn, pattern;
+        std::string ns, topic, view, user, role, group, txn, pattern, askedNs;
         int32_t tid = kMissingId, vid = kMissingId, src = kMissingId;
     };
 
@@ -133,6 +147,19 @@ private:
         w.tid[ns] = t;
         w.vid[ns] = v;
     }
+    /// The objects only namespace b holds (the ForeignNs targets).
+    void makeOnly(World& w) {
+        w.tOnly = w.r.defineTopic(w.root, "b/only");
+        need(w.tOnly >= 0, "topic b/only");
+        w.vOnly = w.r.createView(w.root, "b/onlyv", w.tOnly);
+        need(w.vOnly >= 0, "view b/onlyv");
+    }
+    /// User x and role r of namespace `ns` (the security ops' targets).
+    void makeSecurityTargets(World& w, const std::string& ns) {
+        AuthBroker& b = w.r.broker();
+        b.createUser(full(ns, "x"), AuthRig::kPw, {});
+        need(b.admin().createRole(w.r.ch(), b.adminSession(), full(ns, "r")).errorCode == 0, "role r in " + ns);
+    }
     void setupMain() {
         World& w = *main_;
         AuthRig& r = w.r;
@@ -143,10 +170,7 @@ private:
         makeShared(w, "default");
         makeShared(w, "a");
         makeShared(w, "b");
-        w.tOnly = r.defineTopic(w.root, "b/only");
-        need(w.tOnly >= 0, "topic b/only");
-        w.vOnly = r.createView(w.root, "b/onlyv", w.tOnly);
-        need(w.vOnly >= 0, "view b/onlyv");
+        makeOnly(w);
         using namespace grants;
         AuthBroker& b = r.broker();
         b.createUser("a/admin", AuthRig::kPw, nsAdminGrants("a"));
@@ -154,10 +178,7 @@ private:
         b.createUser("a/granted", AuthRig::kPw, dataGrants());
         b.createUser("b/granted", AuthRig::kPw, dataGrants());
         b.createUser("a/ungranted", AuthRig::kPw, {});
-        for (const char* ns : {"default", "a", "b"}) {
-            b.createUser(full(ns, "x"), AuthRig::kPw, {});
-            need(b.admin().createRole(r.ch(), b.adminSession(), full(ns, "r")).errorCode == 0, "role r");
-        }
+        for (const char* ns : {"default", "a", "b"}) makeSecurityTargets(w, ns);
         // The placements are committed before the first cell (a listing names them).
         for (const auto& [who, ns] : std::vector<std::pair<std::string, std::string>>{{"a/admin", "a"}, {"b/admin", "b"}}) {
             const int64_t sid = session(w, who);
@@ -173,13 +194,13 @@ private:
         o.configure = [](NodeConfig& c) { c.anonymousRead = true; };
         anon_ = std::make_unique<World>("nsmxanon", std::move(o));
         World& w = *anon_;
+        w.r.createNamespace("b");
         w.root = loginNs(w.r, "admin", AuthBroker::kAdminPassword);
-        const int32_t t = w.r.defineTopic(w.root, "t");
-        need(t >= 0, "anon topic t");
-        const int32_t v = w.r.createView(w.root, "v", t);
-        need(v >= 0, "anon view v");
-        w.tid["default"] = t;
-        w.vid["default"] = v;
+        makeShared(w, "default");
+        makeShared(w, "b");
+        makeOnly(w);
+        for (const char* ns : {"default", "b"}) makeSecurityTargets(w, ns);
+        const int32_t t = w.tid["default"];
         for (int i = 0; i < 400; ++i) {   // placed: the anonymous listing names it
             const auto ids = w.r.metadataTopics(w.root);
             if (std::find(ids.begin(), ids.end(), t) != ids.end()) break;
@@ -228,16 +249,22 @@ private:
         const std::string rLocal = pick("", "r", "r");
         Names n;
         n.pattern = (op == Op::Revoke ? "d" : "p") + o;
+        // A view's source must be readable by the caller: its own namespace's t unless it is root or in the object's.
+        const std::string srcNs = s.ns == "default" || s.ns == objNs ? objNs : s.ns;
+        n.src = w.tid.contains(srcNs) ? w.tid[srcNs] : kMissingId;
         if (twin) {
-            n.ns = "zz";
-            n.topic = "zz/" + tLocal;
-            n.view = "zz/" + vLocal;
-            n.user = "zz/" + (op == Op::Revoke ? std::string("x") : uLocal);
-            n.role = "zz/" + rLocal;
+            // The truly missing twin: namespace `z` never exists and has the same length as `a` / `b`, the ids are
+            // missing, the source is the real cell's.
+            n.ns = n.askedNs = kTwinNs;
+            n.topic = std::string(kTwinNs) + "/" + tLocal;
+            n.view = std::string(kTwinNs) + "/" + vLocal;
+            n.user = std::string(kTwinNs) + "/" + (op == Op::Revoke ? std::string("x") : uLocal);
+            n.role = std::string(kTwinNs) + "/" + rLocal;
             n.group = "g" + o;
             n.txn = "x" + o;
             return n;
         }
+        n.askedNs = isNamespaceOp(op) ? n.ns : s.ns == objNs ? std::string{} : objNs;
         n.ns = t == Target::OwnNs ? ownNs : t == Target::ForeignNs ? "b" : "m" + o;
         n.topic = q(s.ns, objNs, tLocal);
         n.view = q(s.ns, objNs, vLocal);
@@ -250,9 +277,6 @@ private:
             n.tid = t == Target::ForeignNs ? w.tOnly : w.tid.contains(objNs) ? w.tid[objNs] : kMissingId;
             n.vid = t == Target::ForeignNs ? w.vOnly : w.vid.contains(objNs) ? w.vid[objNs] : kMissingId;
         }
-        // A view's source must be readable by the caller: its own namespace's t unless it is root or in the object's.
-        const std::string srcNs = s.ns == "default" || s.ns == objNs ? objNs : s.ns;
-        n.src = w.tid.contains(srcNs) ? w.tid[srcNs] : kMissingId;
         if (!miss) preCreate(w, op, t, ord, s, objNs, ownNs);
         return n;
     }
@@ -293,7 +317,13 @@ private:
         const Sess s = sessionFor(w, c, t, anon);
         const Names n = namesFor(w, op, t, ordinal, s, anon, twin);
         Answer a = issue(w, op, s.sid, n);
-        a.ids = {n.tid, n.vid, n.src, kMissingId};
+        a.askedNs = n.askedNs;
+        switch (op) {   // the ids the request carried
+            case Op::Produce: case Op::Fetch: case Op::Metadata: case Op::GroupJoin: a.ids = {n.tid}; break;
+            case Op::GetViewRow: a.ids = {n.vid}; break;
+            case Op::CreateView: a.ids = {n.src}; break;
+            default: break;
+        }
         return a;
     }
 
