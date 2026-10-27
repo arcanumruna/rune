@@ -24,6 +24,7 @@
 #include <rune/client/detail/OneToOneRingBuffer.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/codec/DataCodec.h>
+#include <rune/protocol/client/AuthMessages.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/SchemaMessages.h>
@@ -75,6 +76,18 @@ ClientConfig validatedConfig(ClientConfig c) {
                                         "- insecurePlaintextAuth is for tests only");
         c.requireCrypto = true;
     }
+    // Issue #235: the iteration counts are bounded by the wire's range, and a verifier this client builds
+    // (scramIterations) must be one it accepts at login (maxAcceptedScramIterations) - never silently clamped.
+    // The cap must cover the cluster's highest verifier count (a padded slot for an unknown user included).
+    namespace pcl = rune::protocol::client;
+    if (c.maxAcceptedScramIterations < pcl::kAuthIterationsMin || c.maxAcceptedScramIterations > pcl::kAuthIterationsMax)
+        throw std::invalid_argument("ClientConfig::maxAcceptedScramIterations must be in " +
+                                    std::to_string(pcl::kAuthIterationsMin) + ".." +
+                                    std::to_string(pcl::kAuthIterationsMax));
+    if (c.scramIterations < pcl::kAuthIterationsMin || c.scramIterations > c.maxAcceptedScramIterations)
+        throw std::invalid_argument("ClientConfig::scramIterations must be in " +
+                                    std::to_string(pcl::kAuthIterationsMin) + "..maxAcceptedScramIterations (" +
+                                    std::to_string(c.maxAcceptedScramIterations) + ")");
     // Issue #115: the system store with no name check accepts any public certificate for any name.
     if (c.offerCrypto && !c.tlsTrustPem && c.tlsExpectHost.empty() &&
         session::tlsHostOfChannel(c.gatewayChannel).empty())

@@ -395,7 +395,11 @@ struct ClientConfig {
     // client's rule (D9).  Not used by the login itself, which follows the broker's salt and count.
     uint32_t minPasswordLength = 12;
     uint32_t scramIterations   = 4096;
-    uint32_t maxAcceptedScramIterations = 100'000;   // #235: see SessionConfig::maxAcceptedIterations
+    // maxAcceptedScramIterations (#235): the most PBKDF2 iterations a login runs; a broker asking for more is refused
+    // before any hashing.  Set it to at least the cluster's highest verifier count.  Both counts must lie in
+    // 4096..1'000'000 and scramIterations <= maxAcceptedScramIterations, else construction throws
+    // std::invalid_argument.
+    uint32_t maxAcceptedScramIterations = 100'000;
     // requireCrypto (downgrade safety, spec §11 require_tls's client-side
     // mirror): when true, a session never proceeds without TLS — a ConnectResponse
     // that negotiates NO cipher (a MITM that stripped the crypto offer) fails the

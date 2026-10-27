@@ -2016,21 +2016,22 @@ TEST(AuthRestartRegression, ABrokerBehindItsHeldEventsJudgesNoLoginRegression) {
     EXPECT_EQ(after.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
 }
 
-// Issue #232: a username is client-supplied (up to 128 arbitrary bytes): every login log line writes it escaped, so a
+// Issue #232: a username is client-supplied (up to 128 arbitrary bytes).  A name with control bytes is refused at
+// the first leg (#231), so its raw bytes never reach a log line (logged as <undecodable>), and a
 // `\n` in it can never forge a line ("auth: login ok user=admin").  The failure is the first unknown-user failure of a
 // fresh gateway, so the per-kind rate limiter logs it.
-TEST(AuthLogRegression, AUsernameWithControlBytesIsEscapedInLoginLogLinesRegression) {
+TEST(AuthLogRegression, AUsernameWithControlBytesNeverReachesALoginLogLineRegression) {
     Rig rig;
     const std::string forged = "x\nauth: login ok user=admin";
     const auto o = rig.login(forged, {kTestPasswordA, kTestPasswordA});
     ASSERT_TRUE(o.fin.has_value());
     EXPECT_EQ(o.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
     const std::vector<std::string> lines = rig.logSink->last_formatted();
-    bool sawEscaped = false;
+    bool sawUndecodable = false;
     for (std::string l : lines) {
         while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
         EXPECT_EQ(l.find('\n'), std::string::npos) << "a log line holds no raw newline: " << l;
-        if (l.find("user=<undecodable>") != std::string::npos) sawEscaped = true;
+        if (l.find("user=<undecodable>") != std::string::npos) sawUndecodable = true;
         std::size_t start = 0;
         for (;;) {   // every physical line a reader would see
             const std::size_t nl = l.find('\n', start);
@@ -2041,7 +2042,7 @@ TEST(AuthLogRegression, AUsernameWithControlBytesIsEscapedInLoginLogLinesRegress
         }
     }
     // One decoder (#231): a name outside the charset is refused at the first leg, so the raw bytes never reach a log line.
-    EXPECT_TRUE(sawEscaped) << "the failure line names no user: <undecodable>";
+    EXPECT_TRUE(sawUndecodable) << "the failure line names no user: <undecodable>";
     EXPECT_FALSE(rig.logContains("login ok user=admin"));
 }
 

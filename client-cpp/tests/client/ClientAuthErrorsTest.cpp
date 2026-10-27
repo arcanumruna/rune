@@ -1073,6 +1073,25 @@ TEST(ClientAuthErrorsRegression, CredentialsWithoutTlsAreRefusedAtConstructionRe
     EXPECT_NO_THROW(rc::Client{plain(authCfg(3798, "", ""))}) << "no credentials: TLS stays optional";
 }
 
+// Issue #235: the iteration counts are validated at construction, never clamped silently: a cap outside the wire range,
+// or a verifier count above this client's own login cap (it could not log in with a password it set), throws.
+// RED: drop the scramIterations / maxAcceptedScramIterations checks in validatedConfig.
+TEST(ClientAuthErrorsRegression, ScramIterationCountsAreValidatedAtConstructionRegression) {
+    auto with = [](int32_t in, uint32_t iters, uint32_t cap) {
+        rc::ClientConfig c = authCfg(in, "ws1", kPw);
+        c.scramIterations = iters;
+        c.maxAcceptedScramIterations = cap;
+        return c;
+    };
+    EXPECT_THROW(rc::Client{with(3884, 4096, 4095)}, std::invalid_argument) << "cap below the wire minimum";
+    EXPECT_THROW(rc::Client{with(3884, 4096, 1'000'001)}, std::invalid_argument) << "cap above the wire maximum";
+    EXPECT_THROW(rc::Client{with(3884, 4095, 100'000)}, std::invalid_argument) << "verifier count below the minimum";
+    EXPECT_THROW(rc::Client{with(3884, 200'000, 100'000)}, std::invalid_argument)
+        << "a verifier this client could not log in with";
+    EXPECT_NO_THROW(rc::Client{with(3886, 100'000, 100'000)}) << "equal is fine";
+    EXPECT_NO_THROW(rc::Client{with(3888, 4096, 1'000'000)}) << "both wire bounds are inclusive";
+}
+
 // Issue #115: offerCrypto with the system store, no tlsExpectHost and a gateway channel that names no host would check
 // no name at all - any public certificate for any name would pass.  Refused at construction; a host in the channel, an
 // explicit tlsExpectHost or a pinned CA each make it valid.  RED: drop the tlsHostOfChannel check in validatedConfig.

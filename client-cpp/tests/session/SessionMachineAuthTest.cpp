@@ -13,6 +13,8 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 
@@ -518,6 +520,35 @@ TEST(ScramCacheRegression, TwoPasswordsWithTheSameSaltDoNotShareAnEntryRegressio
     EXPECT_EQ(again.bytes.bytes, a.bytes.bytes);
     EXPECT_EQ(c.hits(), 1u);
     EXPECT_EQ(c.pbkdf2Computations(), 2u);
+}
+
+// #239: the cache tag is HMAC(per-cache random key, password), so it cannot be precomputed from a password
+// dictionary nor matched across two caches (or two processes).  The old tag keyed the HMAC with the password
+// over a fixed message: every cache produced the same tag for one password.
+TEST(ScramCacheRegression, ThePasswordTagIsKeyedPerCacheNotPrecomputableRegression) {
+    sm::ScramCache a;
+    sm::ScramCache b;
+    std::array<uint8_t, 64> ta{}, ta2{}, tb{};
+    ASSERT_TRUE(a.tagForTest("hunter2-password", ta));
+    ASSERT_TRUE(a.tagForTest("hunter2-password", ta2));
+    ASSERT_TRUE(b.tagForTest("hunter2-password", tb));
+    EXPECT_EQ(ta, ta2) << "one cache tags one password stably (else nothing would ever hit)";
+    EXPECT_NE(ta, tb) << "two caches must not share a tag for the same password";
+    // The tag is not the old precomputable HMAC(key = password, "rune-scram-cache-tag").
+    static constexpr std::string_view kOldMsg = "rune-scram-cache-tag";
+    const std::string_view pw = "hunter2-password";
+    rune::crypto::DigestBytes old;
+    ASSERT_TRUE(rune::crypto::hmac(rune::crypto::Digest::Sha512,
+                                   std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(pw.data()), pw.size()),
+                                   std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kOldMsg.data()), kOldMsg.size()),
+                                   old));
+    EXPECT_NE(0, std::memcmp(old.bytes.data(), ta.data(), ta.size()));
+    // Still a working cache: a second login with the same verifier reuses the entry.
+    const std::vector<uint8_t> salt(16, 0x22);
+    ASSERT_NE(a.saltedPassword(pw, salt, 4096), nullptr);
+    ASSERT_NE(a.saltedPassword(pw, salt, 4096), nullptr);
+    EXPECT_EQ(a.hits(), 1u);
+    EXPECT_EQ(a.pbkdf2Computations(), 1u);
 }
 
 TEST(ScramCacheTest, EvictsTheOldestAndZeroesWhatItDrops) {

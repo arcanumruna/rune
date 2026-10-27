@@ -23,12 +23,23 @@ void ScramCache::wipe_(Entry& e) noexcept {
     e.iterations    = 0;
 }
 
-bool ScramCache::tagOf_(std::string_view password, Tag& out) noexcept {
-    static constexpr std::string_view kMsg = "rune-scram-cache-tag";
+ScramCache::ScramCache() noexcept : tagKeyed_(rune::crypto::randomBytes(tagKey_)) {
+    if (!tagKeyed_) secureZero(tagKey_.data(), tagKey_.size());
+}
+
+ScramCache::~ScramCache() {
+    clear();
+    secureZero(tagKey_.data(), tagKey_.size());
+}
+
+bool ScramCache::tagOf_(std::string_view password, Tag& out) const noexcept {
+    if (!tagKeyed_) return false;   // no key: every caller takes its uncached path
     rune::crypto::DigestBytes d;
-    const auto key = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(password.data()), password.size());
-    const auto msg = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kMsg.data()), kMsg.size());
-    if (!rune::crypto::hmac(rune::crypto::Digest::Sha512, key, msg, d) || d.size != out.size()) return false;
+    const auto msg = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(password.data()), password.size());
+    if (!rune::crypto::hmac(rune::crypto::Digest::Sha512, tagKey_, msg, d) || d.size != out.size()) {
+        secureZero(d.bytes.data(), d.bytes.size());
+        return false;
+    }
     std::memcpy(out.data(), d.bytes.data(), out.size());
     secureZero(d.bytes.data(), d.bytes.size());
     return true;
@@ -40,7 +51,7 @@ const rune::crypto::scram::SaltedPassword* ScramCache::find_(const Tag& tag, std
     for (const Entry& e : entries_) {
         if (e.iterations == iterations && e.saltLen == salt.size() &&
             std::memcmp(e.salt.data(), salt.data(), salt.size()) == 0 &&
-            std::memcmp(e.pwTag.data(), tag.data(), tag.size()) == 0) {
+            rune::crypto::constantTimeEqual(e.pwTag, tag)) {
             return &e.sp;
         }
     }

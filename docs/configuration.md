@@ -252,7 +252,8 @@ Send `SIGUSR1` to a running broker to dump a report; `SIGHUP` reloads the TLS ce
 | `password` / `passwordFile` | empty | Password, or a file holding it (read once; trailing newline stripped). Setting both throws. |
 | `allowUnauthenticatedBroker` | `false` | Accept a dev-mode broker even with credentials. |
 | `minPasswordLength` | `12` | Minimum length when this client builds a new verifier. |
-| `scramIterations` | `4096` | Iteration count of a new verifier. |
+| `scramIterations` | `4096` | Iteration count of a new verifier. Must be 4096..`maxAcceptedScramIterations`, else construction throws. |
+| `maxAcceptedScramIterations` | `100000` | Most PBKDF2 iterations a login runs; a broker asking for more is refused before hashing. Set it to at least the cluster's highest verifier count. Range 4096..1000000. |
 | `clientName` | `rune-client` | Recorded as the principal's client name in catalog events. |
 | `traceDdlRetries` | `false` | Record followed redirects and retries (Invoker mode only). |
 
