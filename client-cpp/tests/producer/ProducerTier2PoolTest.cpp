@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -450,4 +451,57 @@ TEST(Tier2SlotRegression, FreeCountOffTheBatchThreadReadsNothingRegression) {
     t.join();
     EXPECT_EQ(off, 0u) << "off the batch thread the free ring is not ours to consume";
     EXPECT_EQ(impl.tier2FreeCount(), 4u);
+}
+
+// C1 adversarial review (#341): a seeded mix of on-thread drops, off-thread destructions, off-thread move-assign
+// over a live builder, accepted batches and duty passes never loses or double-returns a slot.
+TEST(Tier2SlotRegression, MixedBuilderDeathsKeepThePoolWholeAdversarialRegression) {
+    constexpr int32_t kSlots = 4;
+    ProducerImpl impl(cfgOf(Acks::None, kSlots));
+    Cap cap;
+    const auto sink = cap.fn();
+    std::mt19937 rng(0xC1C1u);
+    long accepted = 0;
+    for (int step = 0; step < 400; ++step) {
+        SCOPED_TRACE(step);
+        switch (rng() % 5) {
+            case 0: {  // dies off the batch thread
+                BatchBuilder b(&impl, 1, 0);
+                b.add(kVal);
+                destroyOffThread(std::move(b));
+                break;
+            }
+            case 1: {  // off-thread move-assign: the target's live slot goes back, the source's moves
+                BatchBuilder a(&impl, 1, 0);
+                BatchBuilder b(&impl, 1, 0);
+                a.add(kVal);
+                b.add(kVal);
+                std::thread t([&] { a = std::move(b); });
+                t.join();
+                break;  // a (holding b's slot) dies here, on the batch thread
+            }
+            case 2: {  // dropped on the batch thread
+                BatchBuilder b(&impl, 1, 0);
+                b.add(kVal);
+                break;
+            }
+            case 3: {
+                const OpResult r = sendBatch(impl, static_cast<rune::client::Token>(step + 1), 2);
+                ASSERT_TRUE(r == OpResult::Accepted || r == OpResult::BackPressured) << static_cast<int>(r);
+                if (r == OpResult::Accepted) ++accepted;
+                break;
+            }
+            default: pump(impl, sink); break;
+        }
+    }
+    pump(impl, sink);
+    ASSERT_TRUE(driveUntilFree(impl, static_cast<std::size_t>(kSlots))) << "a slot was lost or returned twice";
+    EXPECT_GT(accepted, 0);
+    EXPECT_EQ(impl.ringForeignMessages(), 0u) << "every discard token is understood by the drain";
+    // Every slot is usable at once: kSlots builders open together.
+    std::vector<BatchBuilder> all;
+    all.reserve(kSlots);
+    for (int i = 0; i < kSlots; ++i) all.emplace_back(&impl, 1, 0).add(kVal);
+    EXPECT_EQ(impl.tier2FreeCount(), 0u);
+    EXPECT_EQ(sendBatch(impl, 9999, 1), OpResult::BackPressured) << "no phantom slot either";
 }

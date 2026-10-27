@@ -435,6 +435,74 @@ TEST(ProducerClaimRegression, OffThreadAbortOfACreditClaimInADiscardingProducerR
     EXPECT_EQ(r.impl->claimCreditLost(), 1u);
 }
 
+// C1 adversarial review (#322): a Thread-mode claim with no queue settles from any thread exactly as before -
+// commit delivers, abort pads (never counted as lost credit).
+TEST(ProducerClaimRegression, NoQueueRingClaimSettlesFromAnyThreadAdversarialRegression) {
+    auto* impl = new ProducerImpl(voidCfg(), 64 * 1024);
+    Producer p(impl);
+    rc::Claim a = p.tryClaim(kTopic, Key(uint64_t{1}), 4);
+    ASSERT_TRUE(a);
+    fill(a.buffer(), "AAAA");
+    rc::Claim b = p.tryClaim(kTopic, Key(uint64_t{1}), 4);
+    ASSERT_TRUE(b);
+    fill(b.buffer(), "BBBB");
+    bool committed = false;
+    std::thread t([&] {
+        committed = a.commit();
+        b.abort();
+    });
+    t.join();
+    EXPECT_TRUE(committed) << "no queue: the commit is not owner-bound";
+    EXPECT_FALSE(b) << "aborted";
+    FrameCapture cap;
+    pump(*impl, cap.fn());
+    EXPECT_EQ(cap.values(), std::vector<std::string>{"AAAA"});
+    EXPECT_EQ(impl->claimCreditLost(), 0u) << "no credit was carried: nothing lost";
+    EXPECT_EQ(impl->ringForeignMessages(), 0u);
+}
+
+// C1 adversarial review (#322): the credit-lost record sits between ordinary records; the drain counts it and
+// delivers the records on both sides in order, never treating it as foreign or stopping the pass on it.
+TEST(ProducerClaimRegression, CreditLostRecordBetweenRecordsKeepsOrderAdversarialRegression) {
+    CqRig r;
+    rc::Completions cq(*r.client, smallCq());
+    ASSERT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("A")), SendResult::Ok);
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4, cq, 1);
+    ASSERT_TRUE(c);
+    fill(c.buffer(), "LOST");
+    ASSERT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("B")), SendResult::Ok);
+    std::thread t([&] { c.abort(); });
+    t.join();
+    EXPECT_FALSE(c);
+    c.abort();  // settled: a second abort (and the destructor) does nothing
+    FrameCapture cap;
+    pump(*r.impl, cap.fn());
+    EXPECT_EQ(cap.values(), (std::vector<std::string>{"A", "B"}));
+    EXPECT_EQ(r.impl->claimCreditLost(), 1u) << "counted exactly once";
+    EXPECT_EQ(r.impl->ringForeignMessages(), 0u);
+}
+
+// C1 adversarial review (#322): the close drain's unblock already turned the held claim into padding; the
+// off-thread abort that follows must neither throw, count, nor touch the record the ring holds next.
+TEST(ProducerClaimRegression, OffThreadAbortAfterUnblockIsANoOpAdversarialRegression) {
+    CqRig r;
+    rc::Completions cq(*r.client, smallCq());
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4, cq, 1);
+    ASSERT_TRUE(c);
+    ASSERT_TRUE(r.impl->testUnblockHeadClaim());
+    FrameCapture cap;
+    pump(*r.impl, cap.fn());  // consumes the padding
+    rc::Claim next = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4, cq, 2);
+    ASSERT_TRUE(next);
+    fill(next.buffer(), "NEXT");
+    std::thread t([&] { rc::Claim dead(std::move(c)); });
+    t.join();
+    ASSERT_TRUE(next.commit()) << "the stale abort must not touch the next claim";
+    pump(*r.impl, cap.fn());
+    EXPECT_EQ(cap.values(), std::vector<std::string>{"NEXT"});
+    EXPECT_EQ(r.impl->claimCreditLost(), 0u) << "already released: nothing to report";
+}
+
 TEST(ProducerClaimAllocRegression, RingClaimSteadyStateAllocatesNothingRegression) {
     auto* impl = new ProducerImpl(voidCfg(), 1 << 20);
     Producer p(impl);
@@ -1104,6 +1172,50 @@ TEST(ProducerClaimRegression, CloseAbandonKeepsTheRecordsBeforeTheClaimAndQuaran
     EXPECT_EQ(cap.values(), (std::vector<std::string>{"A", "B"})) << "the records before the claim are delivered";
     EXPECT_FALSE(anyByteIs(cap.values(), static_cast<char>(0xAB))) << "the claim's bytes never reach the wire";
     EXPECT_FALSE(c.commit());
+}
+
+// C1 adversarial review (#322): an Invoker claim settled off the owner thread never touches owner state: commit
+// is refused and the claim stays open (the owner commits it), an off-owner destroy leaves it held until the
+// close abandons it, and the records before it still drain.
+TEST(ProducerClaimRegression, InvokerClaimOffOwnerCommitStaysOpenAdversarialRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    DirectRig r(cfg);
+    FrameCapture cap;
+    r.pass(cap.fn());
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4);
+    ASSERT_TRUE(c);
+    fill(c.buffer(), "OWNR");
+    bool committed = true;
+    std::thread t([&] { committed = c.commit(); });
+    t.join();
+    EXPECT_FALSE(committed);
+    EXPECT_TRUE(c) << "still open";
+    EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{2}), bytes("x")), SendResult::ClaimHeld);
+    ASSERT_TRUE(c.commit()) << "the owner settles it";
+    r.pass(cap.fn());
+    EXPECT_EQ(cap.values(), std::vector<std::string>{"OWNR"});
+}
+
+TEST(ProducerClaimRegression, InvokerClaimDestroyedOffOwnerIsHeldUntilCloseAdversarialRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    DirectRig r(cfg);
+    FrameCapture cap;
+    r.pass(cap.fn());
+    ASSERT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("A")), SendResult::Ok);
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 64);
+    ASSERT_TRUE(c);
+    std::memset(c.buffer().data(), 0xAB, c.buffer().size());
+    std::thread t([&] { rc::Claim dead(std::move(c)); });
+    t.join();
+    EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("x")), SendResult::ClaimHeld) << "held until close";
+    EXPECT_EQ(r.impl->claimsAbandoned(), 0u);
+    r.impl->abandonOpenClaimForClose();
+    EXPECT_EQ(r.impl->claimsAbandoned(), 1u);
+    r.pass(cap.fn());
+    EXPECT_EQ(cap.values(), std::vector<std::string>{"A"}) << "the record before the claim drains";
+    EXPECT_FALSE(anyByteIs(cap.values(), static_cast<char>(0xAB)));
 }
 
 TEST(ProducerClaimRegression, DeliverySweepAbandonKeepsTheHeldBatchClaimOutOfTheRetriedFrameRegression) {
