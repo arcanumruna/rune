@@ -30,6 +30,8 @@
 #include "support/AuthRig.h"
 
 #include <rune/catalog/NamespaceRegistry.h>
+#include <rune/catalog/NsName.h>
+#include <rune/catalog/TopicName.h>
 #include <rune/gateway/NsResolve.h>
 
 #include <gtest/gtest.h>
@@ -264,4 +266,96 @@ TEST(NamespaceGatewayRegression, MalformedNameRegression) {
             EXPECT_EQ(r.alterViewCode(sid, bad, r.orders), kInvalidTopicName) << "AlterView";
         }
     }
+}
+
+// ── Adversarial (batch review, Tasks 9–11): attacks through the wire on the same names, internal logs, bounds ────
+//   | caller          | target                                   | operation                      | expected          | test
+//   |-----------------|------------------------------------------|--------------------------------|-------------------|------
+//   | alpha/carol     | "secretb" (bravo has one) / "BOARDB"     | define (unqualified)           | 0: own namespace  | SameLocalNameIsolation
+//   | alpha/carol     | "Mine" (folds onto alpha/mine)           | define                         | refused (control) | SameLocalNameIsolation
+//   | alpha/carol     | bravo/secretb vs nosuchns/secretb        | drop                           | same code, kept   | SameLocalNameIsolation
+//   | alpha/carol     | bravo/newx                               | define                         | refused, absent   | SameLocalNameIsolation
+//   | alpha/carol     | "secretb"                                | drop                           | 0, bravo's kept   | SameLocalNameIsolation
+//   | alice, ns admin | __catalog                                | catalog subscribe              | 45 (root: 0)      | InternalLogsTenantDenied
+//   | root            | alpha/__x vs __x                         | define                         | same refusal      | InternalLogsTenantDenied
+//   | root            | 249 / 250-byte local, NUL, 63/64-byte ns | define, schema                 | bounds hold       | NameBounds
+
+/// Mutation: drop the foreign-namespace hide in NsResolve.cpp (`nsId != callerNsId && !root`) → the drop of
+/// bravo/secretb answers differently from nosuchns/secretb, and bravo/newx is CREATED (the name-based grant check is
+/// namespace-blind: the resolver is the only fence).  Mutation: CatalogState::liveNameFoldingOnto scans every
+/// namespace → carol's "BOARDB" is refused (an oracle on bravo's names).
+TEST(NamespaceGatewayRegression, SameLocalNameIsolationAdversarialRegression) {
+    NsGw g;
+    AuthRig& r = g.r;
+    r.broker().createUser("alpha/carol", AuthRig::kPw,
+                          {prefix(SO::Create, ST::Topic, ""), prefix(SO::Drop, ST::Topic, ""),
+                           prefix(SO::Alter, ST::Topic, ""), prefix(SO::Describe, ST::Topic, ""),
+                           prefix(SO::Read, ST::Topic, "")});
+    const int64_t carol = r.login("alpha/carol");
+    ASSERT_GT(carol, 0);
+    EXPECT_EQ(r.defineTopicCode(carol, "secretb"), kOk) << "bravo's local name is free in alpha";
+    EXPECT_EQ(r.defineTopicCode(carol, "BOARDB"), kOk) << "a case-fold onto a FOREIGN view's name is no collision";
+    EXPECT_NE(r.defineTopicCode(carol, "Mine"), kOk) << "control: a case-fold onto her own namespace's topic";
+    EXPECT_EQ(r.getTopicSchema(carol, "secretb"), kOk);
+    // A drop through the foreign qualifier answers like an unknown namespace and leaves bravo's topic alone.
+    const int foreignDrop = r.dropTopicCode(carol, "bravo/secretb");
+    EXPECT_NE(foreignDrop, kOk);
+    EXPECT_EQ(foreignDrop, r.dropTopicCode(carol, "nosuchns/secretb"));
+    EXPECT_EQ(r.getTopicSchema(g.root, "bravo/secretb"), kOk) << "bravo's topic survived";
+    // A create through the foreign qualifier is refused and nothing appears in bravo.
+    const int foreignCreate = r.defineTopicCode(carol, "bravo/newx");
+    EXPECT_NE(foreignCreate, kOk);
+    EXPECT_EQ(foreignCreate, r.defineTopicCode(carol, "nosuchns/newx"));
+    EXPECT_NE(r.getTopicSchema(g.root, "bravo/newx"), kOk) << "the foreign create landed";
+    // Her own unqualified drop takes her topic only.
+    EXPECT_EQ(r.dropTopicCode(carol, "secretb"), kOk);
+    EXPECT_EQ(r.getTopicSchema(g.root, "bravo/secretb"), kOk) << "her drop of `secretb` took bravo's";
+    // Root's unqualified name resolves in ITS namespace (`default`), never by searching the others.
+    EXPECT_NE(r.getTopicSchema(g.root, "secretb"), kOk) << "root's bare name found a tenant topic";
+}
+
+/// Mutation: the gateway's catalog-subscribe gate (DESCRIBE ON CLUSTER) admits everyone → the 45s turn 0.
+/// Mutation: AdminWorker checks the local name only in `default` (`&& m.nsId == 0`) → alpha/__x is created.
+TEST(NamespaceGatewayRegression, InternalLogsTenantDeniedAdversarialRegression) {
+    NsGw g;
+    AuthRig& r = g.r;
+    r.broker().createUser("alpha/nsadm", AuthRig::kPw, {exact(SO::Admin, ST::Namespace, "alpha")});
+    const int64_t nsadm = r.login("alpha/nsadm");
+    ASSERT_GT(nsadm, 0);
+    EXPECT_EQ(r.catalogSubscribe(g.alice), kNotAuthorized) << "a tenant user reads the cluster-wide catalog";
+    EXPECT_EQ(r.catalogSubscribe(nsadm), kNotAuthorized) << "a namespace admin reads the cluster-wide catalog";
+    EXPECT_EQ(r.catalogSubscribe(g.root), kOk) << "control: root";
+    // The reserved prefix holds through a qualifier, for root too.
+    const int bare = r.defineTopicCode(g.root, "__x");
+    EXPECT_NE(bare, kOk);
+    EXPECT_EQ(r.defineTopicCode(g.root, "alpha/__x"), bare);
+    EXPECT_EQ(r.defineTopicCode(g.root, "default/__x"), bare);
+    EXPECT_NE(r.getTopicSchema(g.root, "alpha/__x"), kOk);
+}
+
+/// Mutation: AdminWorker checks the local name only in `default` (`&& m.nsId == 0`) → the 250-byte local name under
+/// `alpha/` is created.  The NUL rows guard a resolver or encoder that truncates at a NUL.
+TEST(NamespaceGatewayRegression, NameBoundsAdversarialRegression) {
+    NsGw g;
+    AuthRig& r = g.r;
+    const std::string max(rune::catalog::kMaxTopicNameBytes, 'a');
+    const std::string over(rune::catalog::kMaxTopicNameBytes + 1, 'b');
+    EXPECT_EQ(r.defineTopicCode(g.root, "alpha/" + max), kOk) << "a max-length local name under a qualifier";
+    EXPECT_EQ(r.getTopicSchema(g.root, "alpha/" + max), kOk);
+    EXPECT_EQ(r.getTopicSchema(g.alice, max), kOk) << "the same topic, unqualified, from inside alpha";
+    const int tooLong = r.defineTopicCode(g.root, over);
+    EXPECT_NE(tooLong, kOk);
+    EXPECT_EQ(r.defineTopicCode(g.root, "alpha/" + over), tooLong) << "the qualifier changed the length check";
+    // An embedded NUL never truncates either part.
+    const std::string nulNs = std::string("alpha\0", 6) + "/nulns";
+    const std::string nulLocal = std::string("alpha/x\0y", 9);
+    EXPECT_NE(r.defineTopicCode(g.root, nulNs), kOk);
+    EXPECT_NE(r.getTopicSchema(g.root, "alpha/nulns"), kOk) << "the NUL-truncated namespace resolved";
+    EXPECT_NE(r.defineTopicCode(g.root, nulLocal), kOk);
+    EXPECT_NE(r.getTopicSchema(g.root, "alpha/x"), kOk) << "the NUL-truncated local name was created";
+    // An unknown namespace at 63 and 64 bytes answers like any unknown namespace (no length oracle, no crash).
+    const int unknown = r.defineTopicCode(g.root, "nosuchns/t");
+    EXPECT_NE(unknown, kOk);
+    EXPECT_EQ(r.defineTopicCode(g.root, std::string(rune::catalog::kMaxNamespaceNameBytes, 'z') + "/t"), unknown);
+    EXPECT_EQ(r.defineTopicCode(g.root, std::string(rune::catalog::kMaxNamespaceNameBytes + 1, 'z') + "/t"), unknown);
 }
