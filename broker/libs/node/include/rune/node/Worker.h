@@ -6215,8 +6215,10 @@ private:
     }
     [[gnu::cold]] void executeNsSlotAssignWire_(sbe::WorkerOp& op) {
         rune::protocol::NamespaceLimits l;
-        const uint8_t* tail = reinterpret_cast<const uint8_t*>(op.tail());
-        if (!rune::protocol::decodeLimits(tail, op.tailLength(), l)) { noteNsSlotMismatch_(); return; }
+        // SBE var-data order: the length first, then tail() (which advances past the data).
+        const uint32_t tailLen = op.tailLength();
+        const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
+        if (!rune::protocol::decodeLimits(tail, tailLen, l)) { noteNsSlotMismatch_(); return; }
         applyNsSlotAssign_(static_cast<uint16_t>(op.topicId()), static_cast<uint32_t>(op.nextOffset()), l);
     }
     [[gnu::cold]] void executeNsSlotReleaseWire_(sbe::WorkerOp& op) {

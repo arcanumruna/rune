@@ -234,7 +234,7 @@ TEST(NsSlotRegression, RestartRebuildsSameSlotsRegression) {
     }
     const Pairs want{{0, 0}, {1, 1}, {2, 2}, {3, 3}};
     ASSERT_TRUE(waitFor([&] { return b.node().nsSlotsForTest() == want; }, 10s));
-    b.restart();
+    b.restart(/*reloginAdmin=*/false);   // the rig relogs in with its own default admin password
     EXPECT_EQ(b.node().nsSlotsForTest(), want) << "the authoritative table after the restart";
     EXPECT_EQ(workerPairs(b.node(), 0), want) << "the worker's table after the restart";
     EXPECT_EQ(b.node().nsSlotAssignFailuresForTest(), 0u);
