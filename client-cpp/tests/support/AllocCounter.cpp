@@ -41,6 +41,17 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+// The nothrow forms route through the replaced throwing forms. Otherwise a nothrow allocation (libstdc++'s
+// get_temporary_buffer under std::stable_sort, e.g. in gtest) comes from the default/ASan allocator but is released
+// by the replaced delete: ASan alloc-dealloc-mismatch, and the allocation goes uncounted.
+void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
+    try { return ::operator new(n); } catch (...) { return nullptr; }
+}
+void* operator new[](std::size_t n, const std::nothrow_t&) noexcept {
+    try { return ::operator new[](n); } catch (...) { return nullptr; }
+}
+void operator delete(void* p, const std::nothrow_t&) noexcept { ::operator delete(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { ::operator delete[](p); }
 
 namespace alloc_counter {
 void start() noexcept {

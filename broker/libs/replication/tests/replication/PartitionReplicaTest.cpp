@@ -57,6 +57,7 @@ static std::string makeUniqSuffix() {
 }
 
 // RAII temporary directory for Log storage.
+namespace {   // internal linkage: other TUs of rune_replication_tests define TempDir/TempFile (ODR)
 struct TempDir {
     std::string path;
     explicit TempDir(const std::string& suffix) {
@@ -70,6 +71,7 @@ struct TempDir {
         std::filesystem::remove_all(path, ec);
     }
 };
+}  // namespace
 
 // Convenience: create a PartitionConfig for tests.
 static PartitionConfig makeConfig(NodeId selfId,

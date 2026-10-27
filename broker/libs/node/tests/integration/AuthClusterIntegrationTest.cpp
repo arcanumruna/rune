@@ -570,9 +570,18 @@ ConsumerResult runConsumer(std::stop_token stop, std::future<int64_t> target, st
     std::size_t node = 0;
     int64_t want = -2;   // -2 = not told yet
     int64_t next = 0;
-    const auto hardStop = Clock3::now() + 240s;
+    // The drain bound starts when the test hands over the target, not at thread start: the rolling restarts before it
+    // take minutes under TSan, and a fixed bound from thread start cut the drain off part-way (the consumer returned
+    // with a fraction of the acked offsets).  Before the target the loop ends only through `stop` (the jthread
+    // destructor requests it), so a failed assertion in the test never leaves this thread running.
+    auto hardStop = Clock3::time_point::max();
+    const auto learnTarget = [&] {
+        if (want != -2 || target.wait_for(0ms) != std::future_status::ready) return;
+        want = target.get();
+        hardStop = Clock3::now() + 240s;
+    };
     while (!stop.stop_requested() && Clock3::now() < hardStop) {
-        if (want == -2 && target.wait_for(0ms) == std::future_status::ready) want = target.get();
+        learnTarget();
         if (want >= -1 && static_cast<int64_t>(out.offsets.size()) > want && *out.offsets.rbegin() >= want) { out.complete = true; break; }
         const std::size_t n = node % 3;
         if (sid[n] == 0) {
@@ -604,7 +613,7 @@ ConsumerResult runConsumer(std::stop_token stop, std::future<int64_t> target, st
             }
             while (out.offsets.count(next)) ++next;
             for (const auto& e : c.errors()) if (e.sessionId == sid[n] && e.code != 0) broken = true;
-            if (want == -2 && target.wait_for(0ms) == std::future_status::ready) want = target.get();
+            learnTarget();
             if (want >= -1 && next > want) { out.complete = true; return out; }
             if (Clock3::now() - lastProgress > 4s && want != -2) broken = true;   // told the target but starved: another broker
         }
@@ -1631,8 +1640,13 @@ TEST(AuthClusterRegression, TheBehindRuleAcrossRolesChangesAndOperationsMatrixRe
             }));
             const int32_t part = led.part[static_cast<std::size_t>(node - 1)];
             PartitionInfo ingress;
+            // A fresh builder session per cell: bs[0] sits idle across the cell's DDL, and once a step outlasts the
+            // gateway's session lease (10 s; under TSan the user wire's driver start alone takes ~13 s) the broker
+            // has reaped it and drops every MetadataRequest on it unanswered (Checkpoint A TSan finding).
             ASSERT_TRUE(AuthTrio::until(30s, [&] {
-                for (const PartitionInfo& pi : bs[0].w->raw().metadata(t.channel(bs[0].node), AuthWireClient::kClientStream, bs[0].sid))
+                AuthTrio::Session md;
+                try { md = t.login(1, "builder"); } catch (...) { return false; }
+                for (const PartitionInfo& pi : md.w->raw().metadata(t.channel(md.node), AuthWireClient::kClientStream, md.sid))
                     if (pi.topicId == led.id && pi.partition == part && pi.leaderId == node && !pi.ingressEndpoint.empty()) { ingress = pi; return true; }
                 return false;
             }));

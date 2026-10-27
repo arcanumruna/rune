@@ -48,6 +48,7 @@ using namespace std::chrono_literals;
 // ---------------------------------------------------------------------------
 // TempFile
 // ---------------------------------------------------------------------------
+namespace {   // internal linkage: several TUs of rune_consensus_tests define TempFile (ODR)
 struct TempFile {
     fs::path path;
     explicit TempFile(std::string_view suffix = ".dat") {
@@ -63,6 +64,7 @@ struct TempFile {
     ~TempFile() { std::error_code ec; fs::remove(path, ec); }
     std::string str() const { return path.string(); }
 };
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // NullPublisher — election outbound is irrelevant here

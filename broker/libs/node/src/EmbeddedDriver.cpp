@@ -5,7 +5,9 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 namespace rune::node {
@@ -37,6 +39,7 @@ using rune_aeron_idle_func_t = void (*)(void*, int);
 rune_aeron_idle_func_t aeron_idle_strategy_load(const char* idle_strategy_name, void** idle_strategy_state,
                                                 const char* env_var, const char* init_args);
 void aeron_free(void* ptr);
+int aeron_parse_duration_ns(const char* str, uint64_t* result);
 }
 
 namespace {
@@ -44,6 +47,15 @@ namespace {
 /// pointers behind (aeron_driver_context_set_*_idle_strategy frees the old name/state before loading), so
 /// aeron_driver_context_close would double-free — validate on a scratch state first, then set.
 bool aeronIdleStrategyLoads(const char* name, const char* args) {
+    // Aeron's sleeping init allocates its state BEFORE parsing the args and does not free it on a parse failure
+    // (aeron_agent.c: aeron_idle_strategy_sleeping_init_args / aeron_idle_strategy_load), so a malformed duration
+    // would leak.  Parse it here first, on a stack word, and never reach Aeron's failing path.
+    if (args != nullptr && name != nullptr &&
+        (std::strcmp(name, "sleeping") == 0 || std::strcmp(name, "sleep-ns") == 0 ||
+         std::strcmp(name, "aeron_idle_strategy_sleeping") == 0)) {
+        uint64_t durationNs = 0;
+        if (aeron_parse_duration_ns(args, &durationNs) < 0) return false;
+    }
     void* state = nullptr;
     if (aeron_idle_strategy_load(name, &state, "RUNE_AERON_DRIVER_IDLE", args) == nullptr) return false;
     aeron_free(state);

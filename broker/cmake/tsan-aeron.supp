@@ -51,3 +51,24 @@ race:aeron::util::removeFromArray
 # calls the public single-poller API from the subscription's own poll thread
 # (ImageLossWatch::afterPoll).  F27 re-review: confirmed Aeron-internal.
 race:aeron::Subscription::imageBySessionId
+
+# Checkpoint A (TSan, rune_auth_cluster_tests): the same two Aeron-internal
+# edges reached through the sibling read paths the list above missed.
+#  - Image::controlledPoll is Image::poll's controlled twin: it reads the
+#    subscriber position and the mmapped log buffer (prior "write" = the
+#    conductor's mmap / Image construction).  rune's gateway polls through it.
+#  - Image::sourceIdentity / Image::sessionId read fields of an Image the
+#    conductor built and published through the AtomicArrayUpdater seqlock;
+#    rune reaches them via Subscription::forEachImage on the poll thread
+#    (AeronPartitionTransport plane-reconnect scan).
+# Function-scoped, Aeron-owned memory only; rune's own state is not covered.
+race:aeron::Image::controlledPoll
+race:aeron::Image::sourceIdentity
+race:aeron::Image::sessionId
+
+# Checkpoint A (TSan): Aeron C's username() (aeron_fileutil.c) fills a function-local `static char static_buffer[16384]`
+# through getpwuid_r when $USER is unset; aeron_default_path() calls it from every aeron_context_init /
+# aeron_driver_context_init, so two threads building an Aeron context at once (a broker's EmbeddedDriver and a test
+# client) race on that buffer.  Aeron-internal and environment-dependent (only without $USER); every Rune context sets an
+# explicit aeron.dir, so the default path built from it is overwritten and never used.  Scoped to that one Aeron file.
+race:aeron_fileutil.c

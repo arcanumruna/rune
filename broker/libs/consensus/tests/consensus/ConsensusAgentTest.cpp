@@ -56,6 +56,7 @@ namespace fs = std::filesystem;
 // ---------------------------------------------------------------------------
 // TempFile
 // ---------------------------------------------------------------------------
+namespace {   // internal linkage: several TUs of rune_consensus_tests define TempFile (ODR)
 struct TempFile {
     fs::path path;
     explicit TempFile(std::string_view suffix = ".dat") {
@@ -71,6 +72,7 @@ struct TempFile {
     ~TempFile() { std::error_code ec; fs::remove(path, ec); }
     std::string str() const { return path.string(); }
 };
+}  // namespace
 
 // NullSink — rune::consensus::NullSink (production no-op sink, Task 11 fix 2).
 
