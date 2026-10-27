@@ -492,6 +492,9 @@ private:
         int32_t          gateTopicId     = -1;
         uint64_t         viewFingerprint = 0;
     };
+    /// Suspend into the mode the namespace is already in, or Resume of an ACTIVE one: the answer to give with no event
+    /// appended (nullopt = not a no-op).
+    [[nodiscard]] std::optional<Response> namespaceNoOp_(const NamespaceDdlMsg& m, const rune::catalog::CatalogState& s) const;
     void answer_(const DdlRequest& req, const Response& r);
     void answer_(const DdlRequest& req, uint16_t code, std::string_view detail = {}, int32_t topicId = -1,
                  uint16_t version = 0);

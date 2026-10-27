@@ -47,8 +47,8 @@ std::optional<Violation> checkFormatVer(uint16_t v) noexcept {
     if (v != kFormatV1 && v != kFormatV2) return Violation::UnknownFormatVer;
     return std::nullopt;
 }
-/// formatVer 1 refuses the whole reserved range 32..63; formatVer 2 accepts the namespace kinds 32..35 and
-/// refuses 36..63.  Anything else outside 1..9 is unknown.
+/// formatVer 1 refuses the whole reserved range 32..63; formatVer 2 accepts the namespace kinds 32..36 and
+/// refuses 37..63.  Anything else outside 1..9 is unknown.
 std::optional<Violation> checkKind(uint16_t formatVer, uint16_t k) noexcept {
     if (k >= kReservedKindFirst && k <= kReservedKindLast) {
         if (formatVer >= kFormatV2 && k <= kLastNamespaceKind) return std::nullopt;
@@ -79,6 +79,8 @@ bool validOps(const Ops& ops) noexcept {
             return validPersistence(o.view.persistence);
         } else if constexpr (std::is_same_v<T, NamespaceStateChangedOps>) {
             return validNsStateTag(o.to);
+        } else if constexpr (std::is_same_v<T, NamespaceDeleteStepOps>) {
+            return validDeleteStep(o.step);
         } else {   // DropTopicOps, CreateSchemaOps, DropViewOps, NamespaceCreated / LimitsSet / Deleted: no enum fields
             return true;
         }
@@ -168,6 +170,8 @@ void putOps(Writer& w, const Ops& ops) {
             putLimits(w, o.limits);
         } else if constexpr (std::is_same_v<T, NamespaceStateChangedOps>) {
             w.e8(o.to);
+        } else if constexpr (std::is_same_v<T, NamespaceDeleteStepOps>) {
+            w.u8(o.step);
         } else {   // NamespaceDeletedOps: empty body
             static_assert(std::is_same_v<T, NamespaceDeletedOps>);
         }
@@ -265,6 +269,9 @@ std::expected<Ops, DecodeError> getOps(Reader& r, EventKind kind) {
         NamespaceStateChangedOps o; if (!r.e8(o.to)) return std::unexpected(DecodeError::Truncated); return o;
     }
     case EventKind::NamespaceDeleted: return NamespaceDeletedOps{};
+    case EventKind::NamespaceDeleteStep: {
+        NamespaceDeleteStepOps o; if (!r.u8(o.step)) return std::unexpected(DecodeError::Truncated); return o;
+    }
     }
     return std::unexpected(DecodeError::UnknownKind);   // unreachable: the kind was validated first
 }
@@ -350,6 +357,7 @@ std::string_view kindName(EventKind k) noexcept {
     case EventKind::NamespaceLimitsSet: return "NamespaceLimitsSet";
     case EventKind::NamespaceStateChanged: return "NamespaceStateChanged";
     case EventKind::NamespaceDeleted: return "NamespaceDeleted";
+    case EventKind::NamespaceDeleteStep: return "NamespaceDeleteStep";
     }
     return "?";
 }

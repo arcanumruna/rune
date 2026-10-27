@@ -453,6 +453,7 @@ bool CatalogApplier::applyRecord_(int64_t offset, std::span<const uint8_t> bytes
     // Steps 6–7, LIVE only: the boot sink is coalesced (emitFinalState_, I1).
     if (live && sink != nullptr) {
         effects_(*sink, *ev, *a);
+        if (a->nsErased && sink->namespaceErased) sink->namespaceErased(a->nsId);   // last: after the drops' own effects
         if (sink->applied) sink->applied(offset, state_.digest());
     }
     return true;
@@ -515,6 +516,7 @@ void CatalogApplier::project_(const cat::CatalogEvent& e, const cat::Applied& a)
     case cat::EventKind::NamespaceLimitsSet:
     case cat::EventKind::NamespaceStateChanged:
     case cat::EventKind::NamespaceDeleted:
+    case cat::EventKind::NamespaceDeleteStep:
         return;
     }
 }
@@ -564,11 +566,11 @@ void CatalogApplier::effects_(const CatalogEffects& sink, const cat::CatalogEven
     case cat::EventKind::NamespaceCreated:
     case cat::EventKind::NamespaceLimitsSet:
     case cat::EventKind::NamespaceStateChanged:
+    case cat::EventKind::NamespaceDeleted:
+    case cat::EventKind::NamespaceDeleteStep:
+        // The record after the event; absent when the event completed the delete (then namespaceErased follows).
         if (const cat::NamespaceRecord* r = state_.namespaces().byId(a.nsId); r && sink.namespaceUpserted)
             sink.namespaceUpserted(*r);
-        return;
-    // No live effect yet: Phase 2 (namespace lifecycle) adds the delete effects.
-    case cat::EventKind::NamespaceDeleted:
         return;
     }
 }

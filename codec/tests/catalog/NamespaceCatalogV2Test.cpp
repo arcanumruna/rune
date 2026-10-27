@@ -55,12 +55,13 @@ rp::NamespaceLimits distinctLimits() {
     return l;
 }
 
-/// One richly populated Ops per namespace kind, in kind order 32..35.
+/// One richly populated Ops per namespace kind, in kind order 32..36.
 std::vector<rc::Ops> namespaceOps() {
     return {rc::NamespaceCreatedOps{.name = "arena-7", .limits = distinctLimits()},
             rc::NamespaceLimitsSetOps{.limits = distinctLimits()},
             rc::NamespaceStateChangedOps{.to = rc::NsStateTag::SuspendedRejectAll},
-            rc::NamespaceDeletedOps{}};
+            rc::NamespaceDeletedOps{},
+            rc::NamespaceDeleteStepOps{.step = rc::SecurityPurged}};
 }
 rc::CatalogEvent namespaceEvent(std::size_t i, uint32_t nsId = 5) {
     rc::CatalogEvent e;
@@ -123,16 +124,17 @@ TEST(CatalogV2Regression, V1EventsDecodeWithNsIdZeroAndCannotCarryOneRegression)
 
 // ── the kind table ────────────────────────────────────────────────────────────
 TEST(CatalogV2Regression, KindTableBijectiveRegression) {
-    static_assert(std::variant_size_v<rc::Ops> == 13);
+    static_assert(std::variant_size_v<rc::Ops> == 14);
     for (std::size_t i = 0; i < rc::kKindOfAlt.size(); ++i)
         EXPECT_EQ(rc::altOf(rc::kKindOfAlt[i]), static_cast<int>(i)) << i;
     EXPECT_EQ(rc::altOf(static_cast<rc::EventKind>(10)), -1);
-    EXPECT_EQ(rc::altOf(static_cast<rc::EventKind>(36)), -1);
+    EXPECT_EQ(rc::altOf(static_cast<rc::EventKind>(37)), -1);
     EXPECT_EQ(rc::altOf(static_cast<rc::EventKind>(0)), -1);
     EXPECT_EQ(rc::altOf(static_cast<rc::EventKind>(31)), -1);
     EXPECT_EQ(rc::kKindOfAlt[8], rc::EventKind::DropView);
     EXPECT_EQ(rc::kKindOfAlt[9], rc::EventKind::NamespaceCreated);
     EXPECT_EQ(rc::kKindOfAlt[12], rc::EventKind::NamespaceDeleted);
+    EXPECT_EQ(rc::kKindOfAlt[13], rc::EventKind::NamespaceDeleteStep);
     // kindOf agrees with the table for every namespace alternative.
     const auto ops = namespaceOps();
     for (std::size_t i = 0; i < ops.size(); ++i)
@@ -140,7 +142,7 @@ TEST(CatalogV2Regression, KindTableBijectiveRegression) {
 }
 
 TEST(CatalogV2Regression, NamespaceBodiesRoundTripRegression) {
-    for (std::size_t i = 0; i < 4; ++i) {
+    for (std::size_t i = 0; i < 5; ++i) {
         const rc::CatalogEvent e = namespaceEvent(i);
         const auto enc = rc::encode(e);
         ASSERT_TRUE(enc.has_value()) << i << " " << rc::encodeErrorName(enc.error());
@@ -153,6 +155,7 @@ TEST(CatalogV2Regression, NamespaceBodiesRoundTripRegression) {
     EXPECT_EQ(rc::kindName(rc::EventKind::NamespaceLimitsSet), "NamespaceLimitsSet");
     EXPECT_EQ(rc::kindName(rc::EventKind::NamespaceStateChanged), "NamespaceStateChanged");
     EXPECT_EQ(rc::kindName(rc::EventKind::NamespaceDeleted), "NamespaceDeleted");
+    EXPECT_EQ(rc::kindName(rc::EventKind::NamespaceDeleteStep), "NamespaceDeleteStep");
 }
 
 TEST(CatalogV2Regression, NamespaceCreatedBodyLayoutRegression) {
@@ -172,9 +175,39 @@ TEST(CatalogV2Regression, NamespaceCreatedBodyLayoutRegression) {
     EXPECT_EQ(back, distinctLimits());
 }
 
+TEST(CatalogV2Regression, NamespaceDeleteStepBodyLayoutRegression) {
+    // body = u8 ops tag (36) | u8 step; the ops blob is the tail, preceded by its u32 length (2).
+    for (const uint8_t step : {rc::TxnsAborted, rc::GroupsTombstoned, rc::TxnStateTombstoned, rc::SecurityPurged}) {
+        rc::CatalogEvent e = namespaceEvent(4);
+        std::get<rc::NamespaceDeleteStepOps>(e.ops).step = step;
+        const auto enc = rc::encode(e).value();
+        ASSERT_GT(enc.size(), 6u);
+        const std::vector<uint8_t> tail(enc.end() - 6, enc.end());
+        EXPECT_EQ(tail, (std::vector<uint8_t>{2, 0, 0, 0, 36, step}));
+        auto d = rc::decode(enc);
+        ASSERT_TRUE(d.has_value());
+        EXPECT_EQ(*d, e);
+    }
+    // a step byte that is not exactly one known bit is refused both ways: 0, 3, 16, 0x1F, 0xFF
+    for (const uint8_t bad : {0, 3, 16, 0x1F, 0xFF}) {
+        auto b = rc::encode(namespaceEvent(4)).value();
+        b.back() = bad;
+        auto d = rc::decode(b);
+        ASSERT_FALSE(d.has_value()) << int(bad);
+        EXPECT_EQ(d.error(), rc::DecodeError::BadEnum) << int(bad);
+        rc::CatalogEvent e = namespaceEvent(4);
+        std::get<rc::NamespaceDeleteStepOps>(e.ops).step = bad;
+        auto r = rc::encode(e);
+        ASSERT_FALSE(r.has_value()) << int(bad);
+        EXPECT_EQ(r.error(), rc::EncodeError::BadEnum) << int(bad);
+    }
+    for (int i = 0; i < 256; ++i)
+        EXPECT_EQ(rc::validDeleteStep(static_cast<uint8_t>(i)), i == 1 || i == 2 || i == 4 || i == 8) << i;
+}
+
 TEST(CatalogV2Regression, TruncatedAtEveryOffsetRegression) {
     std::vector<rc::CatalogEvent> all;
-    for (std::size_t i = 0; i < 4; ++i) all.push_back(namespaceEvent(i));
+    for (std::size_t i = 0; i < 5; ++i) all.push_back(namespaceEvent(i));
     all.push_back(dropTopicEvent(rc::kFormatV2, 9));
     for (const rc::CatalogEvent& e : all) {
         const auto b = rc::encode(e).value();
@@ -187,8 +220,8 @@ TEST(CatalogV2Regression, TruncatedAtEveryOffsetRegression) {
 }
 
 TEST(CatalogV2Regression, KindRangeByFormatVerRegression) {
-    // v2 accepts 32..35 and refuses 36..63 (ReservedKind); a kind outside both stays UnknownKind.
-    for (uint16_t k = 36; k <= 63; ++k) {
+    // v2 accepts 32..36 and refuses 37..63 (ReservedKind); a kind outside both stays UnknownKind.
+    for (uint16_t k = 37; k <= 63; ++k) {
         auto b = rc::encode(namespaceEvent(3)).value();
         b[2] = static_cast<uint8_t>(k); b[3] = 0;
         auto d = rc::decode(b);
@@ -222,8 +255,8 @@ TEST(CatalogV2Regression, KindRangeByFormatVerRegression) {
 
 // ── formatVer 1 stays frozen ──────────────────────────────────────────────────
 TEST(CatalogV1FrozenRegression, RefusesNamespaceKindsRegression) {
-    // A formatVer-1 frame with kind 32..35 is refused by checkKind (ReservedKind), by decode and by encode.
-    for (uint16_t k = 32; k <= 35; ++k) {
+    // A formatVer-1 frame with kind 32..36 is refused by checkKind (ReservedKind), by decode and by encode.
+    for (uint16_t k = 32; k <= 36; ++k) {
         auto b = rc::encode(dropTopicEvent(rc::kFormatV1, 0)).value();
         b[2] = static_cast<uint8_t>(k);
         auto d = rc::decode(b);
@@ -377,6 +410,15 @@ struct Rig {
         const rc::NamespaceRecord* r = s.namespaces().byId(nsId);
         return go(base(rc::NamespaceDeletedOps{}, r ? r->name : "?", nsId, 0, r ? r->version : 0));
     }
+    Res nsStep(uint32_t nsId, uint8_t step) {
+        const rc::NamespaceRecord* r = s.namespaces().byId(nsId);
+        return go(base(rc::NamespaceDeleteStepOps{step}, r ? r->name : "?", nsId, 0, r ? r->version : 0));
+    }
+    /// All four delete steps, in bit order.
+    void nsAllSteps(uint32_t nsId) {
+        for (const uint8_t b : {rc::TxnsAborted, rc::GroupsTombstoned, rc::TxnStateTombstoned, rc::SecurityPurged})
+            EXPECT_TRUE(nsStep(nsId, b).has_value()) << "step " << int(b);
+    }
     // ── object events ────────────────────────────────────────────────────────────────────────────────────────
     Res topic(uint32_t nsId, const std::string& name, int32_t partitions = 1) {
         rc::CreateTopicOps o;
@@ -476,9 +518,11 @@ TEST(NamespaceCatalogV2Regression, NsIdNeverReusedRegression) {
     Rig r;
     ASSERT_TRUE(r.nsCreate("one").has_value());   // 1
     ASSERT_TRUE(r.nsCreate("two").has_value());   // 2
-    ASSERT_TRUE(r.nsState(2, rc::NsStateTag::Deleting).has_value());
     ASSERT_TRUE(r.nsDelete(2).has_value());
-    EXPECT_EQ(r.s.namespaces().nextNsId(), 3u) << "survives Deleted";
+    EXPECT_EQ(r.s.namespaces().byName("two"), nullptr) << "DELETING leaves the name index";
+    ASSERT_NE(r.s.namespaces().byId(2), nullptr) << "but stays by id until its steps are done";
+    r.nsAllSteps(2);
+    EXPECT_EQ(r.s.namespaces().nextNsId(), 3u) << "survives erase";
     EXPECT_EQ(r.s.namespaces().byId(2), nullptr);
     EXPECT_EQ(r.s.namespaces().byName("two"), nullptr);
     EXPECT_EQ(r.s.namespaces().liveCount(), 2u);   // default + one
@@ -490,20 +534,22 @@ TEST(NamespaceCatalogV2Regression, NsIdNeverReusedRegression) {
 
 TEST(NamespaceCatalogV2Regression, StateEdgesTableRegression) {
     using T = rc::NsStateTag;
-    struct Row { T from; T to; bool ok; };
     const T states[] = {T::Active, T::SuspendedReadOnly, T::SuspendedRejectAll, T::Deleting};
-    // allowed (D5): ACTIVE <-> SUSPENDED(mode), ACTIVE | SUSPENDED -> DELETING
+    // allowed (D17): ACTIVE -> SUSPENDED(m); SUSPENDED(m) -> ACTIVE | SUSPENDED(other); DELETING only via Deleted
     auto allowed = [](T from, T to) {
-        if (from == T::Deleting) return false;
-        if (from == T::Active) return to != T::Active;
-        return to == T::Active || to == T::Deleting;
+        if (from == T::Deleting || to == T::Deleting) return false;
+        return from != to;
+    };
+    auto reach = [](Rig& r, T from) {
+        ASSERT_TRUE(r.nsCreate("n").has_value());
+        if (from == T::Deleting) ASSERT_TRUE(r.nsDelete(1).has_value());
+        else if (from != T::Active) ASSERT_TRUE(r.nsState(1, from).has_value());
     };
     int rows = 0;
     for (const T from : states) {
         for (const T to : states) {
             Rig r;
-            ASSERT_TRUE(r.nsCreate("n").has_value());
-            if (from != T::Active) ASSERT_TRUE(r.nsState(1, from).has_value());
+            reach(r, from);
             const uint64_t before = r.s.digest();
             const auto res = r.nsState(1, to);
             const std::string what = "state " + std::to_string(static_cast<int>(from)) + " -> " + std::to_string(static_cast<int>(to));
@@ -515,24 +561,24 @@ TEST(NamespaceCatalogV2Regression, StateEdgesTableRegression) {
             }
             ++rows;
         }
-        // Deleted from `from`: only a DELETING namespace may be deleted
+        // Deleted from `from`: ACTIVE or SUSPENDED only
         Rig r;
-        ASSERT_TRUE(r.nsCreate("n").has_value());
-        if (from != T::Active) ASSERT_TRUE(r.nsState(1, from).has_value());
+        reach(r, from);
         const auto res = r.nsDelete(1);
-        if (from == T::Deleting) {
-            EXPECT_TRUE(res.has_value()) << "Deleted from Deleting";
+        if (from != T::Deleting) {
+            EXPECT_TRUE(res.has_value()) << "Deleted from state " << static_cast<int>(from);
         } else {
-            expectRefused(res, rc::ApplyError::Code::Precondition, "Deleted from state " + std::to_string(static_cast<int>(from)));
-            EXPECT_NE(r.s.namespaces().byId(1), nullptr);
+            expectRefused(res, rc::ApplyError::Code::Precondition, "Deleted from DELETING");
         }
         ++rows;
     }
     EXPECT_EQ(rows, 20);
-    // nsId 0 is never deleted (and never enters DELETING, so it can never be deleted)
+    // nsId 0 is never deleted but may be suspended and resumed
     Rig r;
     expectRefused(r.nsDelete(0), rc::ApplyError::Code::Precondition, "Deleted(0)");
     expectRefused(r.nsState(0, T::Deleting), rc::ApplyError::Code::Precondition, "StateChanged(0, Deleting)");
+    EXPECT_TRUE(r.nsState(0, T::SuspendedReadOnly).has_value());
+    EXPECT_TRUE(r.nsState(0, T::Active).has_value());
     // a state change or delete of a namespace that does not exist
     expectRefused(r.nsState(9, T::SuspendedReadOnly), rc::ApplyError::Code::BadNsId, "StateChanged(9)");
     expectRefused(r.nsDelete(9), rc::ApplyError::Code::BadNsId, "Deleted(9)");
@@ -620,10 +666,11 @@ TEST(NamespaceCatalogV2Regression, ObjectInMissingOrDeletingNsRefusedRegression)
     expectRefused(r.dropTopic(1, "t"), rc::ApplyError::Code::Precondition, "DropTopic in a suspended namespace");
     ASSERT_TRUE(r.nsState(1, rc::NsStateTag::Active).has_value());
     ASSERT_TRUE(r.topic(1, "u").has_value());
-    ASSERT_TRUE(r.nsState(1, rc::NsStateTag::Deleting).has_value());
-    expectRefused(r.topic(1, "w"), rc::ApplyError::Code::Precondition, "CreateTopic in a deleting namespace");
-    expectRefused(r.dropTopic(1, "u"), rc::ApplyError::Code::Precondition, "DropTopic in a deleting namespace");
     ASSERT_TRUE(r.nsDelete(1).has_value());
+    expectRefused(r.topic(1, "w"), rc::ApplyError::Code::Precondition, "CreateTopic in a deleting namespace");
+    ASSERT_TRUE(r.dropTopic(1, "u").has_value()) << "DropTopic passes the DELETING gate";
+    ASSERT_TRUE(r.dropTopic(1, "t").has_value());
+    r.nsAllSteps(1);
     expectRefused(r.topic(1, "w"), rc::ApplyError::Code::BadNsId, "CreateTopic in a deleted namespace");
     EXPECT_TRUE(r.topic(0, "w").has_value()) << "the default namespace is unaffected";
 }
@@ -710,8 +757,8 @@ TEST(NamespaceCatalogV2Regression, PreviewFingerprintV2Regression) {
     check(Rig::base(rc::NamespaceCreatedOps{"a", limitsWith(2)}, "a", 1, 0, 0), "Created");
     check(Rig::base(rc::NamespaceLimitsSetOps{limitsWith(3)}, "a", 1, 0, 1), "LimitsSet");
     check(Rig::base(rc::NamespaceStateChangedOps{rc::NsStateTag::SuspendedRejectAll}, "a", 1, 0, 2), "StateChanged");
-    check(Rig::base(rc::NamespaceStateChangedOps{rc::NsStateTag::Deleting}, "a", 1, 0, 3), "StateChanged->Deleting");
-    check(Rig::base(rc::NamespaceDeletedOps{}, "a", 1, 0, 4), "Deleted");
+    check(Rig::base(rc::NamespaceDeletedOps{}, "a", 1, 0, 3), "Deleted");
+    check(Rig::base(rc::NamespaceDeleteStepOps{rc::TxnsAborted}, "a", 1, 0, 4), "DeleteStep");
     rc::CreateTopicOps o;
     o.topicId = 0;
     check(Rig::base(o, "t", 0, 1, 0), "CreateTopic ns 0");
@@ -738,8 +785,8 @@ TEST(NamespaceCatalogV2Regression, DigestTracksNamespacesRegression) {
     Rig e;
     const uint64_t empty = e.s.digest();
     ASSERT_TRUE(e.nsCreate("x").has_value());
-    ASSERT_TRUE(e.nsState(1, rc::NsStateTag::Deleting).has_value());
     ASSERT_TRUE(e.nsDelete(1).has_value());
+    e.nsAllSteps(1);
     EXPECT_NE(e.s.digest(), empty);
     // same topic name in two namespaces is a different state from two topics in one
     Rig f, g;
@@ -822,8 +869,8 @@ TEST(CatalogV2Regression, DeletedNamespaceNameIsInTheDigestRegression) {
     auto run = [](const std::string& name) {
         Rig r;
         EXPECT_TRUE(r.nsCreate(name).has_value());
-        EXPECT_TRUE(r.nsState(1, rc::NsStateTag::Deleting).has_value());
         EXPECT_TRUE(r.nsDelete(1).has_value());
+        r.nsAllSteps(1);
         EXPECT_EQ(r.s.namespaces().byId(1), nullptr);
         EXPECT_EQ(r.s.namespaces().nextNsId(), 2u);
         return r.s.digest();

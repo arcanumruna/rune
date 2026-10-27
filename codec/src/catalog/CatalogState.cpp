@@ -108,6 +108,8 @@ uint64_t CatalogState::digest() const noexcept {
     namespaces_.forEach([&](const NamespaceRecord& r) {
         if (r.nsId == kDefaultNsId && r.version == 0) return;
         h = detail::fnvU64(h, r.fingerprint);
+        // The pending sets derive from the objects already in the digest; the recorded steps do not.
+        if (const auto* d = std::get_if<NsDeleting>(&r.state)) h = rune::codec::detail::fnv1a_byte(h, d->stepMask);
     });
     if (namespaces_.tombstoneFold() != 0) h = detail::fnvU64(h, namespaces_.tombstoneFold());
     return h;

@@ -341,12 +341,13 @@ struct NamespaceDdlMsg {
     int64_t                          session = 0;
     int64_t                          corr    = 0;
     DdlMeta                          meta;            // the request id lives here
-    uint8_t                          kind    = 0;     // rune::protocol::client::NamespaceDdlKind (1 Create, 2 SetLimits)
+    uint8_t                          kind    = 0;     // rune::protocol::client::NamespaceDdlKind (1 Create .. 5 Delete)
     std::string                      name;
     std::array<uint8_t, 4>           mask{};
     rune::protocol::NamespaceLimits  limits;
     std::string                      denial;
     uint16_t                         clientVersion = 0;
+    uint8_t                          mode = 0;        // NsSuspendMode (1 ReadOnly, 2 RejectAll); Suspend only
 };
 
 /// Namespaces Task 7: ListNamespaces (82) — a read, answered on the admin thread from its applied registry (no
@@ -680,7 +681,7 @@ template <class W> void layout(W& w, const NamespaceDdlMsg& m) {
     std::array<uint8_t, rune::protocol::kNamespaceLimitsBytes> lim{};
     rune::protocol::encodeLimits(m.limits, lim.data());
     w.bytes32({lim.data(), lim.size()});
-    w.str16(m.denial); w.u16(m.clientVersion);
+    w.str16(m.denial); w.u16(m.clientVersion); w.u8(m.mode);
 }
 template <class W> void layout(W& w, const ListNamespacesMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.u32(m.afterNsId); w.u16(m.max); w.u32(m.callerNsId); w.u8(m.clusterAdmin);
@@ -870,8 +871,10 @@ inline DdlRequest decodeNamespaceDdl(const uint8_t* buf, std::size_t len) {
     r.bytes32(lim);
     r.str16(m.denial);
     m.clientVersion = r.u16();
+    m.mode = r.u8();
     if (r.ok) {
-        if (m.kind < 1 || m.kind > 2) r.fail("an unknown namespace DDL kind");   // never cast
+        if (m.kind < 1 || m.kind > 5) r.fail("an unknown namespace DDL kind");   // never cast
+        else if (m.kind == 3 && (m.mode < 1 || m.mode > 2)) r.fail("an unknown namespace suspend mode");
         else if (mask.size() != m.mask.size() || lim.size() != rune::protocol::kNamespaceLimitsBytes ||
                  !rune::protocol::decodeLimits(lim.data(), lim.size(), m.limits))
             r.fail("a malformed namespace limits record");

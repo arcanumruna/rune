@@ -116,6 +116,7 @@ std::optional<std::string> eventEffectFramesError(const cat::CatalogState& after
     case cat::EventKind::NamespaceLimitsSet:
     case cat::EventKind::NamespaceStateChanged:
     case cat::EventKind::NamespaceDeleted:
+    case cat::EventKind::NamespaceDeleteStep:
         return std::nullopt;
     }
     (void)a;

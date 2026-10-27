@@ -211,7 +211,7 @@ uint64_t requestFingerprint(const DdlRequest& req) noexcept {
             // The statement as resolved by the client: kind, name, the present mask and the given limits.
             // Never the denial or the client version (a retry from an upgraded client is the same statement).
             f.s(m.meta.statement);
-            f.u(m.kind); f.s(m.name);
+            f.u(m.kind); f.s(m.name); f.u(m.mode);
             for (uint8_t b : m.mask) f.u(b);
             uint8_t raw[rune::protocol::kNamespaceLimitsBytes];
             rune::protocol::encodeLimits(m.limits, raw);
@@ -878,6 +878,14 @@ void AdminWorker::startNext_(int64_t nowNs) {
         return;
     }
 
+    // 3c. Suspend to the mode it is already in, or Resume of an ACTIVE namespace: nothing to append.
+    if (const auto* ns = std::get_if<NamespaceDdlMsg>(&req)) {
+        if (const auto noop = namespaceNoOp_(*ns, state)) {
+            answer_(req, *noop);
+            return;
+        }
+    }
+
     // 4. Build the event against the applied catalog (the dry run is its gate).
     Built built = buildEvent_(req, state);
     if (!built) {
@@ -1072,6 +1080,7 @@ std::optional<cat::RequestRecord> AdminWorker::recordOfLastApplied_(int64_t offs
     case cat::EventKind::NamespaceLimitsSet:
     case cat::EventKind::NamespaceStateChanged:
     case cat::EventKind::NamespaceDeleted:
+    case cat::EventKind::NamespaceDeleteStep:
         return r;   // namespaces Task 7: objectId is the nsId, never a topic's objectId
     case cat::EventKind::CreateTopic:
     case cat::EventKind::CreateView:
@@ -1189,6 +1198,13 @@ void AdminWorker::respond_(const DdlRequest& req, const Response& r) {
 AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::CatalogState& s) const {
     Built b = std::visit([&](const auto& m) -> Built {
         using M = std::decay_t<decltype(m)>;
+        // An object DDL names its namespace by id: one that is gone, or DELETING, is Missing for every caller.
+        if constexpr (!std::is_same_v<M, NamespaceDdlMsg> && !std::is_same_v<M, ListNamespacesMsg> &&
+                      !std::is_same_v<M, MalformedDdl>) {
+            const cat::NamespaceRecord* nsr = s.namespaces().byId(m.nsId);
+            if (nsr == nullptr || std::holds_alternative<cat::NsDeleting>(nsr->state))
+                return Rejected(reject(kUnknownTopic, "no namespace with id " + std::to_string(m.nsId)));
+        }
         if constexpr (std::is_same_v<M, DefineTopicMsg>)      return buildDefine_(m, s);
         else if constexpr (std::is_same_v<M, AlterTopicMsg>)  return buildAlter_(m, s);
         else if constexpr (std::is_same_v<M, CreateViewMsg>)  return buildCreateView_(m, s);
@@ -1513,6 +1529,21 @@ AdminWorker::Built AdminWorker::buildAlterConfig_(const AlterTopicConfigMsg& m, 
     return e;
 }
 
+std::optional<AdminWorker::Response> AdminWorker::namespaceNoOp_(const NamespaceDdlMsg& m,
+                                                                 const cat::CatalogState& s) const {
+    namespace pc = rune::protocol::client;
+    const auto kind = static_cast<pc::NamespaceDdlKind>(m.kind);
+    if (kind != pc::NamespaceDdlKind::Suspend && kind != pc::NamespaceDdlKind::Resume) return std::nullopt;
+    const cat::NamespaceRecord* rec = s.namespaces().byName(m.name);
+    if (rec == nullptr) return std::nullopt;   // buildNamespace_ answers Missing
+    const bool same = kind == pc::NamespaceDdlKind::Resume
+        ? std::holds_alternative<cat::NsActive>(rec->state)
+        : (m.mode == 1 && cat::tagOf(rec->state) == cat::NsStateTag::SuspendedReadOnly) ||
+          (m.mode == 2 && cat::tagOf(rec->state) == cat::NsStateTag::SuspendedRejectAll);
+    if (!same) return std::nullopt;
+    return Response{kOK, {}, -1, 0, rec->nsId, rec->version, -1, 0};
+}
+
 AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const cat::CatalogState& s) const {
     namespace pc = rune::protocol::client;
     const cat::NamespaceRegistry& nss = s.namespaces();
@@ -1556,8 +1587,29 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
     }
     case pc::NamespaceDdlKind::Suspend:
     case pc::NamespaceDdlKind::Resume:
-    case pc::NamespaceDdlKind::Delete:
-        break;   // Phase 2 Task 2 implements these; until then they fall through to the reject below
+    case pc::NamespaceDdlKind::Delete: {
+        const cat::NamespaceRecord* rec = nss.byName(m.name);   // never a DELETING one: its name left the index
+        if (rec == nullptr) return Rejected(reject(kUnknownTopic, "no namespace named " + quotedName(m.name)));
+        const auto kind = static_cast<pc::NamespaceDdlKind>(m.kind);
+        if (kind == pc::NamespaceDdlKind::Delete) {
+            if (rec->nsId == rune::catalog::kDefaultNsId)
+                return Rejected(reject(kInvalidRequest, "the default namespace cannot be deleted"));
+            e.ops = cat::NamespaceDeletedOps{};
+        } else if (kind == pc::NamespaceDdlKind::Resume) {
+            e.ops = cat::NamespaceStateChangedOps{cat::NsStateTag::Active};
+        } else {
+            if (!pc::validSuspendMode(m.mode)) return Rejected(reject(kInvalidRequest, "invalid suspend mode"));
+            e.ops = cat::NamespaceStateChangedOps{static_cast<pc::NsSuspendMode>(m.mode) == pc::NsSuspendMode::ReadOnly
+                                                      ? cat::NsStateTag::SuspendedReadOnly
+                                                      : cat::NsStateTag::SuspendedRejectAll};
+        }
+        e.nsId        = rec->nsId;
+        e.objectId    = rec->nsId;
+        e.objectName  = rec->name;
+        e.prevVersion = rec->version;
+        e.newVersion  = rec->version + 1;
+        return e;
+    }
     }
     return Rejected(reject(kInvalidRequest, "unknown namespace DDL kind " + std::to_string(m.kind)));
 }

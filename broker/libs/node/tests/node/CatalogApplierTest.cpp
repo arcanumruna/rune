@@ -1517,13 +1517,15 @@ TEST(CatalogApplierRegression, NamespaceStateSurvivesBootReplayRegression) {
     commit(cat::NamespaceLimitsSetOps{l}, "guild", guild, 1);
     const uint32_t gone = guild + 1;
     commit(cat::NamespaceCreatedOps{"gone", {}}, "gone", gone, 0);
-    commit(cat::NamespaceStateChangedOps{cat::NsStateTag::Deleting}, "gone", gone, 1);
-    commit(cat::NamespaceDeletedOps{}, "gone", gone, 2);
+    commit(cat::NamespaceDeletedOps{}, "gone", gone, 1);
+    uint32_t goneVersion = 2;
+    for (const uint8_t step : {cat::TxnsAborted, cat::GroupsTombstoned, cat::TxnStateTombstoned, cat::SecurityPurged})
+        commit(cat::NamespaceDeleteStepOps{step}, "gone", gone, goneVersion++);   // the last one erases it
 
     const uint64_t digest = rig.applier.state().digest();
-    ASSERT_EQ(rig.applier.nextOffset(), 8);
+    ASSERT_EQ(rig.applier.nextOffset(), 11);
     rig.restart();
-    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 8);
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 11);
     ASSERT_FALSE(rig.applier.halted()) << (rig.rec.halts.empty() ? "" : rig.rec.halts.back().detail);
     EXPECT_EQ(rig.applier.phaseName(), "Booted");
     EXPECT_EQ(rig.applier.state().digest(), digest);

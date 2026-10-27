@@ -445,6 +445,7 @@ public:
         m.limits  = w.limits;
         m.denial.assign(denial);
         m.clientVersion = clientVersion;
+        m.mode = static_cast<uint8_t>(w.mode);
         return submitDdl_(m);
     }
     rune::gateway::AdminSubmit submitListNamespaces(int64_t sessionId, int64_t correlationId, uint32_t afterNsId,
