@@ -421,12 +421,14 @@ TEST(HandleLifetime, ReleaseRacingCloseExactlyOneFreeRegression) {
 // main thread closes the Client (close() and closeImmediately() alternately) —
 // each impl freed exactly once, no release ever waits (Thread mode; ASan + TSan).
 TEST(HandleLifetime, ClientReleaseRacingCloseExactlyOneFreeRegression) {
-    Watchdog wd("handle releases racing Client close");
     FreeHook hook;
     constexpr int kIterations = 30;
     constexpr int kWorkers    = 4;
     int created = 0;
     for (int it = 0; it < kIterations; ++it) {
+        // Armed per iteration: a hang in any one is caught, while the 30 Client lifecycles (an embedded driver
+        // each, 1-2 s under TSan) are not held to one 60 s budget.
+        Watchdog wd("handle releases racing Client close");
         auto client = std::make_unique<rc::Client>(cfgFor(5410, rc::RunnerMode::Thread));
         const auto topic = client->topic("t");
         std::atomic<int>  ready{0};
