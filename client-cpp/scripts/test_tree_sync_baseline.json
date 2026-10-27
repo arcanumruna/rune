@@ -172,7 +172,7 @@
  "tests/transport/AeronTransportTest.cpp": {
   "atomic|std::atomic": 1,
   "include|#include <atomic>": 1,
-  "sleep|std::this_thread::sleep_for": 5
+  "sleep|std::this_thread::sleep_for": 3
  },
  "tests/transport/InvokerTransportTest.cpp": {
   "atomic|std::atomic": 1,
