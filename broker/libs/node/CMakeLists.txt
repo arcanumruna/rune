@@ -1955,6 +1955,13 @@ if(BUILD_TESTING)
         target_link_libraries(rune_namespace_gateway_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_gateway_tests PROPERTIES TIMEOUT 360)
 
+        # Namespaces Task 12: the Op x Caller x Target matrix (support/NamespaceMatrixExpectations.h) on one real broker.
+        add_executable(rune_namespace_matrix_tests tests/node/NamespaceMatrixTest.cpp)
+        target_include_directories(rune_namespace_matrix_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_matrix_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_matrix_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900 LABELS small)
+        rune_regression_batches(rune_namespace_matrix_tests 2)
+
         # Catalog history Task 17: TestCluster::defineTopic — the in-process way to create a
         # topic now that the static topic list / NodeConfig::topics are gone (DDL over the wire on real
         # single-node and 3-node brokers), and the FD budget counted from the catalog's topics.

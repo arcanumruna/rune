@@ -110,8 +110,10 @@ public:
     }
 
     // ── users and sessions ──────────────────────────────────────────────────────────────────────────────────
-    int64_t login(const std::string& user, const std::string& pw = kPw) {
-        const int64_t sid = w_->connect(ch());
+    /// `clientVersion`: the session's client version (kClientVersionNamespaces for a namespace-aware caller).
+    int64_t login(const std::string& user, const std::string& pw = kPw,
+                  int32_t clientVersion = rune::protocol::client::kClientVersionAuth) {
+        const int64_t sid = w_->connect(ch(), clientVersion);
         if (sid <= 0) throw std::runtime_error("AuthRig: connect failed");
         const auto l = w_->login(ch(), sid, user, {pw, pw});
         if (!l.ok()) throw std::runtime_error("AuthRig: login failed for " + user);
