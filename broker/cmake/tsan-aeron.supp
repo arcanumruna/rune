@@ -72,3 +72,9 @@ race:aeron::Image::sessionId
 # client) race on that buffer.  Aeron-internal and environment-dependent (only without $USER); every Rune context sets an
 # explicit aeron.dir, so the default path built from it is overwritten and never used.  Scoped to that one Aeron file.
 race:aeron_fileutil.c
+
+# Checkpoint E (TSan, rune_peer_link_agent_tests): the reader of a freshly mapped log buffer.  The prior "write" is
+# the client conductor's mmap of the Image's log buffer (MemoryMappedFile::doMapping); the read is a fragment handler
+# reached through Image::poll / TermReader::read, whose template frames symbolize without the `aeron::` prefix, so
+# the poll entries above do not match.  The mapping's publication to the poller is Aeron's fence-ordered image hand-off.
+race:aeron::util::MemoryMappedFile::doMapping

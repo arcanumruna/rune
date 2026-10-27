@@ -36,10 +36,13 @@ jobs:
             id: asan
             flags: -fsanitize=address,undefined -fno-omit-frame-pointer
             link: -fsanitize=address,undefined
+            jobs: 4
           - name: TSan
             id: tsan
             flags: -fsanitize=thread -fno-omit-frame-pointer
             link: -fsanitize=thread
+            # TSan multiplies memory several times; -j4 of the 3-node suites lost the 16 GB runner (shutdown signal).
+            jobs: 2
     env:
       UBSAN_OPTIONS: print_stacktrace=1
     steps:
@@ -145,13 +148,13 @@ jobs:
       - name: Regression suite (broker)
         run: |
           ctest --test-dir "build-${{ matrix.id }}" -R Regression -LE latency \
-            -E 'UdpGsoBindings\.Ipv6RoundTrip' -j4 --output-on-failure
+            -E 'UdpGsoBindings\.Ipv6RoundTrip' -j${{ matrix.jobs }} --output-on-failure
 
       - name: Regression suite (client)
         if: ${{ !cancelled() && steps.client_build.outcome == 'success' }}
         run: |
           ctest --test-dir "build-client-${{ matrix.id }}/cmake" -R Regression -LE latency \
-            -E 'UdpGsoBindings\.Ipv6RoundTrip' -j4 --output-on-failure
+            -E 'UdpGsoBindings\.Ipv6RoundTrip' -j${{ matrix.jobs }} --output-on-failure
 
       - name: Upload test logs
         if: failure()
