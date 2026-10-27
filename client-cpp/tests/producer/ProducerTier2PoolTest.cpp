@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -504,4 +505,59 @@ TEST(Tier2SlotRegression, MixedBuilderDeathsKeepThePoolWholeAdversarialRegressio
     for (int i = 0; i < kSlots; ++i) all.emplace_back(&impl, 1, 0).add(kVal);
     EXPECT_EQ(impl.tier2FreeCount(), 0u);
     EXPECT_EQ(sendBatch(impl, 9999, 1), OpResult::BackPressured) << "no phantom slot either";
+}
+
+// C1 review: after a builder died off the batch thread, rebinding to a new thread is allowed (no live builder),
+// and the new thread collects the returned slot.
+TEST(Tier2SlotRegression, RebindAfterOffThreadBuilderDeathAdversarialRegression) {
+    constexpr int32_t kSlots = 4;
+    ProducerImpl impl(cfgOf(Acks::None, kSlots));
+    Cap cap;
+    {
+        BatchBuilder b(&impl, 1, 0);
+        b.add(kVal);
+        destroyOffThread(std::move(b));
+    }
+    pump(impl, cap.fn());  // the duty side hands the slot back (free-ring type 2)
+    std::size_t freeOnNew = 0;
+    OpResult sent = OpResult::Closed;
+    std::thread t([&] {
+        impl.bindBatchThread();  // no live builder: must be allowed
+        freeOnNew = impl.tier2FreeCount();
+        sent = sendBatch(impl, 1);
+    });
+    t.join();
+    EXPECT_EQ(freeOnNew, static_cast<std::size_t>(kSlots));
+    EXPECT_EQ(sent, OpResult::Accepted);
+}
+
+// C1 review: a builder still live when the batch thread is rebound is refused on its old thread, and its slot
+// comes back through the producer ring when it dies there (#341): the new thread ends with the whole pool.
+TEST(Tier2SlotRegression, BuilderLiveAcrossARebindReturnsItsSlotToTheNewThreadRegression) {
+    constexpr int32_t kSlots = 4;
+    ProducerImpl impl(cfgOf(Acks::None, kSlots));
+    Cap cap;
+    std::optional<BatchBuilder> b;
+    b.emplace(&impl, 1, 0);
+    b->add(kVal);
+    std::size_t freeOnNew = 0;
+    std::thread t([&] {
+        impl.bindBatchThread();  // the old thread's builder is still live
+        freeOnNew = impl.tier2FreeCount();
+    });
+    t.join();
+    EXPECT_EQ(freeOnNew, static_cast<std::size_t>(kSlots - 1)) << "the live builder still holds its slot";
+    EXPECT_EQ(b->send(), OpResult::WrongThread) << "the old thread is no longer the batch thread";
+    b.reset();     // dies on the old thread, now off the batch thread: handed back through the ring
+    pump(impl, cap.fn());
+    std::size_t freeAfter = 0;
+    OpResult sent = OpResult::Closed;
+    std::thread t3([&] {
+        impl.bindBatchThread();  // another thread: nothing live
+        freeAfter = impl.tier2FreeCount();
+        sent = sendBatch(impl, 1);
+    });
+    t3.join();
+    EXPECT_EQ(freeAfter, static_cast<std::size_t>(kSlots));
+    EXPECT_EQ(sent, OpResult::Accepted);
 }

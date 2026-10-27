@@ -869,12 +869,10 @@ public:
     // thread that created the producer (Invoker mode: the owner thread), or the one that called
     // bindBatchThread().  Every Tier-2 entry compares against it BEFORE touching the pool.
     [[nodiscard]] bool onBatchThread() const noexcept { return std::this_thread::get_id() == t2Thread_; }
-    /// Rebind the issuing thread to the caller.  Call before the first batch() from the new
-    /// thread with no BatchBuilder holding a slot (asserted in debug).
-    void bindBatchThread() noexcept {
-        assert(t2Held_ == 0 && "bindBatchThread with a live BatchBuilder");
-        t2Thread_ = std::this_thread::get_id();
-    }
+    /// Rebind the issuing thread to the caller, before the first batch() from the new thread.  A
+    /// builder still live on the old thread is refused there and hands its slot back through the
+    /// producer ring when it dies (#341), so t2Held_ may count slots in flight: no assert on it.
+    void bindBatchThread() noexcept { t2Thread_ = std::this_thread::get_id(); }
     [[nodiscard]] Tier2Slot& tier2Slot(uint32_t slot) noexcept { return tier2Pool_[slot]; }
     /// Largest RecordBatch (header + records) a slot holds.
     [[nodiscard]] std::size_t tier2SlotBytes() const noexcept { return tier2SlotBytes_; }

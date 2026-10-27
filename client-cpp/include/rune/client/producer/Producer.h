@@ -773,8 +773,10 @@ public:
     BatchBuilder batch(TopicHandle topic, const Key& key);
 
     /// Rebind the Tier-2 batch thread to the CALLING thread.  Call it before the first batch() from
-    /// the new thread, with no BatchBuilder live (asserted in debug builds); the hand-off itself
-    /// (e.g. thread start / join) must order the old thread's last use before this call.
+    /// the new thread; the hand-off itself (e.g. thread start / join) must order the old thread's
+    /// last use before this call.  A BatchBuilder still live on the old thread is refused there
+    /// (send() = WrongThread); destroying it hands its slot back (Thread mode; an Invoker producer
+    /// loses the slot and logs it).
     void bindBatchThread();
 
     // ---- Control -------------------------------------------------------------
