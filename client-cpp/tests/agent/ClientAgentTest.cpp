@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -851,6 +852,61 @@ TEST(ClientAgentRegression, ClientAgentSecondStartAfterAFailedStartRethrowsRegre
     }
     EXPECT_NO_THROW(agent.stop());
     EXPECT_THROW(agent.start(), std::logic_error);
+}
+
+// ---------------------------------------------------------------------------
+// #510 adversarial (M31+ review): the failed-start state over its whole matrix —
+// the failure kind (a config the transport validates -> std::invalid_argument,
+// before any driver exists; an unusable channel -> std::runtime_error, after the
+// driver and the Aeron client were created) x the way the agent ends (stop() then
+// the destructor, or the destructor alone).  Every later start() rethrows the
+// ORIGINAL exception with its dynamic type (an invalid_argument never turns into
+// the "start() after stop()" logic_error), a duty cycle driven over the failed
+// agent sends nothing and never brings a session up, and the end is clean.
+// RED by mutation: restore `if (started_) return; started_ = true;` in start().
+// ---------------------------------------------------------------------------
+TEST(ClientAgentRegression, AFailedStartKeepsItsErrorTypeThroughDutyCyclesAndEitherEndAdversarialRegression) {
+    struct Cell { bool badMtu; bool explicitStop; };
+    const Cell cells[] = {{true, true}, {true, false}, {false, true}, {false, false}};
+    int32_t stream = 542;
+    for (const Cell& cell : cells) {
+        SCOPED_TRACE(::testing::Message() << "badMtu=" << cell.badMtu << " explicitStop=" << cell.explicitStop);
+        auto cfg = makeAgentConfig(uniqueDir(), cell.badMtu ? "aeron:ipc" : "127.0.0.1:1", stream,
+                                   "aeron:ipc", stream + 1);
+        stream += 2;
+        if (cell.badMtu) cfg.transport.mtuLength = 1000;   // not a multiple of 32: validate() refuses it
+        auto agent = std::make_unique<rca::ClientAgent>(cfg);
+        auto startKind = [&](std::string& what) -> int {   // 1 invalid_argument, 2 logic_error, 3 runtime_error
+            try { agent->start(); }
+            catch (const std::invalid_argument& e) { what = e.what(); return 1; }
+            catch (const std::logic_error& e)      { what = e.what(); return 2; }
+            catch (const std::runtime_error& e)    { what = e.what(); return 3; }
+            return 0;
+        };
+        std::string first;
+        const int firstKind = startKind(first);
+        ASSERT_EQ(firstKind, cell.badMtu ? 1 : 3) << first;
+        int64_t now = 1'000'000'000;
+        for (int round = 0; round < 3; ++round) {
+            std::string again;
+            EXPECT_EQ(startKind(again), firstKind) << "the rethrow keeps the original exception type";
+            EXPECT_EQ(again, first);
+            const uint8_t frame[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+            (void)agent->submitSend(frame, sizeof frame);
+            for (int i = 0; i < 200; ++i) {
+                now += 50'000'000;                          // 10 s of agent time per round: every connect retry
+                (void)agent->doWork(now);
+            }
+            EXPECT_NE(agent->sessionStateAt(0), rune::client::session::SessionState::Connected);
+        }
+        if (cell.explicitStop) {
+            agent->stop();
+            std::string after;
+            EXPECT_EQ(startKind(after), 2) << "start() after stop() is a logic error, not the old error: " << after;
+            EXPECT_EQ(agent->doWork(now + 1), 0) << "a stopped agent does no work";
+        }
+        EXPECT_NO_THROW(agent.reset());
+    }
 }
 
 // ---------------------------------------------------------------------------

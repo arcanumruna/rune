@@ -997,3 +997,148 @@ TEST(SubscriberHubRegression, AnErrorAnswerAfterTimeoutSendsNothingRegression) {
     EXPECT_EQ(hub.lateOksReleased(), 0u);
     EXPECT_EQ(hub.lateOksUnreleased(), 0u);
 }
+
+// ===========================================================================
+// #446 adversarial (M31+ review): replays and cross-session answers around the late-OK release.
+// ===========================================================================
+
+// The binding OK replayed (a broker answering a resent Subscribe from its dedupe index repeats the same id):
+// the id is bound here, so no replay may release it, and the subscription keeps delivering.
+// RED by mutation: drop the activeById_ check in releaseUnboundOk_.
+TEST(SubscriberHubRegression, ABindingOkReplayedNeverReleasesTheBoundSubscriptionAdversarialRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    RefusingTransport tx;
+    NodeFake      nodes;                              // no node session claims the seed's id
+    hub.setDirectSend(&RefusingTransport::fn, &tx);
+    hub.setNodeRouter(nodes.router());
+    int delivered = 0;
+    auto impl = makeImpl(120, &delivered);
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.onSubscribeResponse(bindRsp(120, 4800), 900, kSession, send.fn());
+    ASSERT_EQ(hub.activeCount(), 1u);
+    for (int replay = 0; replay < 3; ++replay)
+        hub.onSubscribeResponse(bindRsp(120, 4800), 901 + replay, kSession, send.fn());
+    EXPECT_TRUE(unsubscribesOf(tx).empty()) << "a replayed OK released the live subscription";
+    EXPECT_EQ(send.countUnsubscribe(4800), 0);
+    EXPECT_TRUE(nodes.offered.empty());
+    EXPECT_EQ(hub.lateOksReleased(), 0u);
+    EXPECT_EQ(hub.lateOksUnreleased(), 0u);
+    std::vector<uint8_t> st;
+    hub.onRecords(records(st, 4800, 0, 3), kSession);
+    EXPECT_EQ(delivered, 3);
+    EXPECT_TRUE(impl->active);
+}
+
+// The same Subscribe correlation answered on two sessions: a node session (an earlier route) binds broker-side
+// instance X and pushes, and the seed (the pending one's own session) binds Y.  X's Records never bind the
+// pending subscription, X's OK is released on that node session only, Y binds and delivers, and X's later
+// pushes are never delivered to it.  RED by mutation: drop releaseUnboundOk_ from the session-mismatch branch
+// of onSubscribeResponse (X is never released).
+TEST(SubscriberHubRegression, ACorrelationAnsweredOnTwoSessionsBindsOnlyItsOwnAndReleasesTheOtherAdversarialRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    RefusingTransport tx;
+    NodeFake      nodes;
+    nodes.index = 4;                                  // broker session 61 is node session 4
+    hub.setDirectSend(&RefusingTransport::fn, &tx);
+    hub.setNodeRouter(nodes.router());
+    int delivered = 0;
+    auto impl = makeImpl(121, &delivered);
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+
+    std::vector<uint8_t> st;
+    auto x = records(st, /*subId=*/4810, 0, 2);
+    x.correlationId = 121;
+    x.sessionId     = 61;                             // not the pending one's session
+    hub.onRecords(x, kSession);
+    EXPECT_EQ(hub.pendingCount(), 1u) << "a push from another session bound the pending subscription";
+    EXPECT_EQ(delivered, 0);
+
+    auto okX = bindRsp(121, 4810);
+    okX.sessionId = 61;
+    hub.onSubscribeResponse(okX, 910, kSession, send.fn());
+    ASSERT_EQ(nodes.offered.size(), 1u) << "X is released where it lives";
+    EXPECT_EQ(nodes.offered[0].first, 4u);
+    const auto u = rc::codec::decodeUnsubscribe(nodes.offered[0].second.bytes.data(),
+                                                nodes.offered[0].second.bytes.size());
+    ASSERT_TRUE(u.has_value());
+    EXPECT_EQ(u->subscriptionId, 4810);
+    EXPECT_EQ(u->sessionId, 61);
+    EXPECT_TRUE(unsubscribesOf(tx).empty()) << "nothing released on the seed";
+    EXPECT_EQ(hub.pendingCount(), 1u);
+
+    hub.onSubscribeResponse(bindRsp(121, 4811), 911, kSession, send.fn());   // Y on the seed
+    ASSERT_EQ(hub.activeCount(), 1u);
+    EXPECT_EQ(impl->subscriptionId, 4811);
+    auto y = records(st, 4811, 0, 3);
+    y.correlationId = 121;
+    y.sessionId     = kSession;
+    hub.onRecords(y, kSession);
+    EXPECT_EQ(delivered, 3);
+    hub.onRecords(x, kSession);                       // X's push still in flight
+    EXPECT_EQ(delivered, 3) << "X's records reached Y's handler";
+    EXPECT_EQ(hub.lateOksReleased(), 1u);
+    EXPECT_EQ(hub.lateOksUnreleased(), 0u);
+    EXPECT_TRUE(unsubscribesOf(tx).empty());
+    EXPECT_EQ(nodes.offered.size(), 1u);
+}
+
+// Seeded random interleavings of: the binding OK, replays of it, stray OKs naming fresh ids on the seed,
+// error answers naming ids, and Records for the bound id.  Invariant: the bound id is never
+// unsubscribed, every stray id is unsubscribed exactly once on the seed, and every bound record is delivered.
+// RED by mutation: drop the activeById_ check in releaseUnboundOk_ (a replay releases the bound id).
+TEST(SubscriberHubRegression, LateOkReleaseUnderSeededRandomInterleavingsAdversarialRegression) {
+    for (uint32_t seed = 1; seed <= 40; ++seed) {
+        SCOPED_TRACE(::testing::Message() << "seed=" << seed);
+        uint32_t rng = seed * 2654435761u;
+        auto next = [&] { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; };
+        SubscriberHub hub;
+        CaptureSend   send;
+        RefusingTransport tx;
+        NodeFake      nodes;
+        hub.setDirectSend(&RefusingTransport::fn, &tx);
+        hub.setNodeRouter(nodes.router());
+        int delivered = 0;
+        auto impl = makeImpl(130, &delivered);
+        hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+        bool bound = false;
+        int expected = 0;
+        int64_t strayId = 5000, unsubCorr = 2000;
+        std::vector<int64_t> strays;
+        std::vector<int64_t> errored;
+        std::vector<uint8_t> st;
+        for (int step = 0; step < 60; ++step) {
+            switch (next() % 5) {
+            case 0: case 1:                           // the binding OK (first one binds, later ones replay)
+                hub.onSubscribeResponse(bindRsp(130, 4900), ++unsubCorr, kSession, send.fn());
+                bound = true;
+                break;
+            case 2: {                                 // an error answer naming an id: binds nothing, never released
+                auto e = bindRsp(800'000 + step, ++strayId);
+                e.errorCode = 12;
+                hub.onSubscribeResponse(e, ++unsubCorr, kSession, send.fn());
+                errored.push_back(strayId);
+                break;
+            }
+            case 3:                                   // a push for the bound id
+                if (bound) {
+                    auto rv = records(st, 4900, expected, 1);
+                    hub.onRecords(rv, kSession);
+                    ++expected;
+                }
+                break;
+            default:                                  // a stray OK with no correlation at all
+                hub.onSubscribeResponse(bindRsp(999'000 + step, ++strayId), ++unsubCorr, kSession, send.fn());
+                strays.push_back(strayId);
+                break;
+            }
+        }
+        EXPECT_EQ(send.countUnsubscribe(4900) + tx.unsubscribesFor(4900), 0) << "the bound id was released";
+        for (int64_t id : strays) EXPECT_EQ(tx.unsubscribesFor(id), 1) << "stray id " << id;
+        for (int64_t id : errored) EXPECT_EQ(tx.unsubscribesFor(id), 0) << "error-answer id " << id;
+        EXPECT_EQ(hub.lateOksReleased(), strays.size());
+        EXPECT_EQ(delivered, expected);
+        if (bound) EXPECT_TRUE(impl->active);
+    }
+}

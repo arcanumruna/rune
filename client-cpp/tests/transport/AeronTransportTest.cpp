@@ -15,6 +15,7 @@
 //     FragmentAssembler reassembles it back.
 
 #include <filesystem>
+#include <memory>
 #include <rune/client/transport/AeronTransport.h>
 
 #include <gtest/gtest.h>
@@ -347,6 +348,54 @@ TEST(AeronTransportRegression, ASecondStartAfterAFailedStartRethrowsTheOriginalE
     EXPECT_FALSE(t.offer(frame, sizeof frame));
     EXPECT_NO_THROW(t.stop());
     EXPECT_THROW(t.start(), std::logic_error) << "start() after stop() is a logic error";
+}
+
+// ---------------------------------------------------------------------------
+// #510 adversarial (M31+ review): a failed start in either driver mode, failing
+// before the driver exists (validate() -> std::invalid_argument) or after it
+// (an unusable channel -> std::runtime_error).  Every later start() rethrows the
+// original exception with its dynamic type and message, the transport stays
+// refused (offer false, nothing connected, dutyCycle harmless), and the
+// destructor alone (no stop()) tears it down.  RED by mutation: restore
+// `if (started_) return; started_ = true;` in start().
+// ---------------------------------------------------------------------------
+TEST(AeronTransportRegression, AFailedStartRethrowsItsOwnTypeInEitherDriverModeAndTheDtorAloneEndsItAdversarialRegression) {
+    using rune::client::transport::DriverMode;
+    int stream = 1220;
+    for (DriverMode mode : {DriverMode::Invoker, DriverMode::Thread}) {
+        for (bool badMtu : {true, false}) {
+            SCOPED_TRACE(::testing::Message() << "mode=" << static_cast<int>(mode) << " badMtu=" << badMtu);
+            Config cfg = makeLoopbackConfig(stream++);
+            cfg.driverMode = mode;
+            if (badMtu) cfg.mtuLength = 1000;          // not a multiple of 32
+            else        cfg.ingressChannel = "127.0.0.1:1";
+            auto t = std::make_unique<Transport>(cfg);
+            auto kind = [&](std::string& what) -> int {   // 1 invalid_argument, 2 logic_error, 3 runtime_error
+                try { t->start(); }
+                catch (const std::invalid_argument& e) { what = e.what(); return 1; }
+                catch (const std::logic_error& e)      { what = e.what(); return 2; }
+                catch (const std::runtime_error& e)    { what = e.what(); return 3; }
+                return 0;
+            };
+            std::string first;
+            const int firstKind = kind(first);
+            ASSERT_EQ(firstKind, badMtu ? 1 : 3) << first;
+            for (int again = 0; again < 3; ++again) {
+                std::string w;
+                EXPECT_EQ(kind(w), firstKind);
+                EXPECT_EQ(w, first);
+                (void)t->dutyCycle();
+                const uint8_t frame[4] = {1, 2, 3, 4};
+                EXPECT_FALSE(t->offer(frame, sizeof frame));
+                EXPECT_FALSE(t->ingressConnected());
+                EXPECT_FALSE(t->egressConnected());
+            }
+            EXPECT_NO_THROW(t.reset()) << "the destructor alone ends a failed start";
+        }
+    }
+    Transport ok{makeLoopbackConfig(stream)};
+    ASSERT_NO_THROW(ok.start());
+    ok.stop();
 }
 
 // ---------------------------------------------------------------------------

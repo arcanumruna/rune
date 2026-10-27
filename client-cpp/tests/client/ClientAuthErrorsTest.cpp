@@ -1205,6 +1205,70 @@ TEST(ClientAuthErrorsRegression, APendingSubscribeWhoseRejectedHomeMovedFollowsT
     EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
 }
 
+// #515 adversarial (M31+ review): the reject-vs-route ordering from every side.  Node 1's session is Rejected (46)
+// in the very pass fresh metadata names p0's leader as (a) node 1 itself, (b) the seed, then (c) the route follows
+// to node 2 and a later answer flips p0 BACK onto Rejected node 1.  (a) and (c) must end with 46 and send nothing
+// to the Rejected node; (b) must follow to the seed and stay live.  Never a loop of re-sends.
+TEST(ClientAuthErrorsRegression, ARejectedHomeEndsOnlyWhileItIsTheRouteFromEverySideAdversarialRegression) {
+    enum class Cell { StillNode1, ToSeed, ToNode2ThenBack };
+    int32_t port = 3890;
+    for (const Cell cell : {Cell::StillNode1, Cell::ToSeed, Cell::ToNode2ThenBack}) {
+        SCOPED_TRACE(static_cast<int>(cell));
+        ThreeNodeRig r(port);
+        port += 2;
+        test_support::TestCq cq(r.client);
+        connectTwoNode(r, cq);
+        r.gw.subscribeLeader[0] = r.n1;
+        rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+        ASSERT_TRUE(r.drive([&] { return subscribedAt(r.gw, r.n1) != nullptr && sub.active(); }));
+        const int64_t node1Sid = subscribedAt(r.gw, r.n1)->sessionId;
+        // One answer, queued in the same pass as the revocation, names p0's leader.
+        const auto answerWith = [&](int leaderNode, int leaderEp, int32_t epoch, bool revoke) {
+            r.gw.holdMetadata = true;
+            const std::size_t before = r.gw.metadataCorrIds.size();
+            r.client.testRequestMetadataNow();
+            if (!r.drive([&] { return r.gw.metadataCorrIds.size() > before; })) return false;
+            r.gw.subscribeLeader[0] = leaderEp;
+            r.gw.partitions = {{1, 0, leaderNode, epoch, r.c.gatewayStreamId, ""},
+                               {1, 1, 0, 1, r.c.gatewayStreamId, ""}};
+            r.gw.subscribed.clear();
+            if (revoke) r.gw.revokeSession(node1Sid, r.n1);
+            r.gw.sendMetadata(r.gw.metadataSessionIds.back(), r.gw.metadataCorrIds.back(),
+                              r.gw.metadataEndpoints.back());
+            r.gw.holdMetadata = false;
+            return true;
+        };
+        if (cell == Cell::StillNode1) {
+            ASSERT_TRUE(answerWith(1, r.n1, 1, true)) << "no metadata request";
+            ASSERT_TRUE(r.drive([&] { return sub.finished(); })) << "a Rejected home that is still the route hung";
+            EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::SessionRevoked);   // 46
+            EXPECT_EQ(sub.brokerErrorCode(), 46);
+            EXPECT_EQ(subscribedAt(r.gw, r.n2), nullptr);
+            EXPECT_EQ(subscribedAt(r.gw, 0), nullptr) << "a Rejected home that is still the route fell back to the seed";
+        } else if (cell == Cell::ToSeed) {
+            ASSERT_TRUE(answerWith(0, 0, 2, true)) << "no metadata request";
+            ASSERT_TRUE(r.drive([&] { return sub.finished() || subscribedAt(r.gw, 0) != nullptr; }));
+            EXPECT_FALSE(sub.finished()) << "ended with " << sub.brokerErrorCode() << " though p0 moved to the seed";
+            ASSERT_NE(subscribedAt(r.gw, 0), nullptr) << "no Subscribe for p0 reached the seed";
+            ASSERT_TRUE(r.drive([&] { return sub.finished() || sub.active(); }));
+            EXPECT_TRUE(sub.active());
+        } else {
+            ASSERT_TRUE(answerWith(2, r.n2, 2, true)) << "no metadata request";
+            ASSERT_TRUE(r.drive([&] { return sub.finished() || (subscribedAt(r.gw, r.n2) != nullptr && sub.active()); }));
+            ASSERT_FALSE(sub.finished()) << "ended with " << sub.brokerErrorCode() << " though p0 moved to node 2";
+            ASSERT_TRUE(answerWith(1, r.n1, 3, false)) << "no second metadata request";   // flips back onto node 1
+            ASSERT_TRUE(r.drive([&] { return sub.finished(); })) << "a route flipped back onto a Rejected node hung";
+            EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::SessionRevoked);   // 46
+            EXPECT_EQ(sub.brokerErrorCode(), 46) << "the CURRENT route's code";
+            EXPECT_EQ(subscribedAt(r.gw, r.n1), nullptr) << "a Subscribe was sent to the Rejected node";
+        }
+        const std::size_t sent = r.gw.subscribed.size();
+        r.passes(200);
+        EXPECT_EQ(r.gw.subscribed.size(), sent) << "the subscription kept re-sending after it settled";
+        EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+    }
+}
+
 // ---- #446: a Subscribe OK that arrives after the client's subscribe timeout ---------------------------------------
 // The broker registered the Subscribe, the client timed it out (TimedOut) and only then does the OK arrive.  RED
 // (before): the OK was dropped as an unknown correlationId and the broker kept the subscription, pushing records

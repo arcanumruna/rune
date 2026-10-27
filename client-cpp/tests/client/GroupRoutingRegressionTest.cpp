@@ -3704,3 +3704,197 @@ TEST(GroupRoutingRegression, AnIdleButLiveLeaderDoesNotTriggerRefreshStormRegres
     EXPECT_FALSE(sub.finished());
     EXPECT_EQ(r.client.testSessionStateAt(1), rc::session::SessionState::Connected);
 }
+
+// ===========================================================================
+// #514 adversarial (M31+ review): which silent sessions arm a refresh, how often, and when it stops.
+// ===========================================================================
+
+// A silent node session that carries NO reader or fetch (its reader was unsubscribed; the session stays open)
+// arms nothing, even while another homed reader keeps the silent check running.  Only a session a reader or
+// fetch depends on may pace metadata refreshes.
+// RED by mutation: drop the usesSession / fetchUses filter in watchSilentLeaders_ (every silent bit refreshes).
+TEST(GroupRoutingRegression, ASilentNodeCarryingNoReaderArmsNoRefreshAdversarialRegression) {
+    RigOptions o;
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 60'000'000'000;
+    GroupRig r(4561, 4562, o);
+    const auto [n1, p1port] = r.addNode(4561);
+    const auto [n2, p2port] = r.addNode(4561);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 1, 1, 4561, ""}, {1, 1, 2, 1, 4561, ""}};   // p0 on node 1, p1 on node 2
+    r.gw.subscribeLeader = {{0, n1}, {1, n2}};
+    r.connect();
+    auto s0 = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                 [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, n1) != nullptr && s0.active(); }));
+    s0.unsubscribe();                                // node 1's session stays open, carrying nothing
+    ASSERT_TRUE(r.drive([&] { return !r.gw.unsubscribed.empty(); })) << "the Unsubscribe never reached node 1";
+    std::vector<int64_t> offsets;
+    auto s1 = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                 [&](const rc::Record& rec) { offsets.push_back(rec.offset); });
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n2) != nullptr && s1.active(); }));
+    // Confirm both redirect guesses now (an urgent ask fanned out after them), so no backoff refresh of the
+    // subscribe flow is still armed when the silence starts.
+    const int answers = r.client.testMetadataResponses();
+    r.client.testRequestMetadataNow();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() >= answers + 3; }));
+    ASSERT_TRUE(settleRefreshes(r));
+    ASSERT_EQ(r.client.testSessionStateAt(1), rc::session::SessionState::Connected);
+
+    r.gw.deadEndpoints.insert(n1);                   // node 1 goes silent; nothing depends on it
+    const int pingsBefore = r.gw.pings;
+    const int metaBefore  = r.gw.metadataRequests;
+    ASSERT_TRUE(r.drive([&] { return r.gw.pings >= pingsBefore + 20; }, 40'000'000));
+    EXPECT_EQ(r.gw.metadataRequests, metaBefore) << "a silent session nobody reads from armed refreshes";
+    EXPECT_EQ(subscribesAt(r.gw, 1, n2), 1) << "the live reader was re-sent";
+    r.gw.pushRecordsFrom(*r.subAt(1, n2), 0, 2, n2);
+    ASSERT_TRUE(r.drive([&] { return offsets.size() == 2; })) << "the reader on the live node stopped delivering";
+    EXPECT_FALSE(s1.finished());
+}
+
+// A silent leader that fresh metadata STILL names (no election yet): refreshes keep coming - at most one per
+// keepalive interval, never a busy storm - the reader is never re-sent to the same route, and the moment the
+// metadata names a new leader the reader moves there before the old session is declared stale.
+// RED by mutation: drop the scheduleMetadataRefresh() call in watchSilentLeaders_ (no refresh, never moves).
+TEST(GroupRoutingRegression, ASilentLeaderStillNamedKeepsABoundedRefreshPaceThenMovesOnElectionAdversarialRegression) {
+    RigOptions o;
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 60'000'000'000;
+    GroupRig r(4563, 4564, o);
+    const auto [n1, p1port] = r.addNode(4563);
+    const auto [n2, p2port] = r.addNode(4563);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4563, ""}, {1, 1, 1, 1, 4563, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.connect();
+    auto sub = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                  [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr && sub.active(); }));
+    ASSERT_TRUE(settleRefreshes(r));
+
+    r.gw.deadEndpoints.insert(n1);                   // silent, but still the named leader
+    const int pingsBefore = r.gw.pings;
+    const int metaBefore  = r.gw.metadataRequests;
+    ASSERT_TRUE(r.drive([&] { return r.gw.pings >= pingsBefore + 20; }, 40'000'000));
+    const int pings = r.gw.pings - pingsBefore;
+    const int metas = r.gw.metadataRequests - metaBefore;
+    EXPECT_GE(metas, 2) << "refreshing stopped while the leader was still silent";
+    EXPECT_LE(metas, pings) << "a refresh storm: " << metas << " refreshes in " << pings << " keepalive Pings";
+    EXPECT_EQ(subscribesAt(r.gw, 1, n1), 1) << "the reader was re-sent on an unchanged route";
+    EXPECT_FALSE(sub.finished());
+
+    r.gw.partitions      = {{1, 0, 0, 1, 4563, ""}, {1, 1, 2, 2, 4563, ""}};   // the election
+    r.gw.subscribeLeader = {{0, 0}, {1, n2}};
+    ASSERT_TRUE(r.drive([&] {
+        return subscribesAt(r.gw, 1, n2) >= 1 || sub.finished() ||
+               r.client.testSessionStateAt(1) != rc::session::SessionState::Connected;
+    }, 40'000'000)) << "the reader never followed the election";
+    EXPECT_GE(subscribesAt(r.gw, 1, n2), 1);
+    EXPECT_EQ(r.client.testSessionStateAt(1), rc::session::SessionState::Connected);
+    EXPECT_FALSE(sub.finished());
+}
+
+// A leader that went silent (a long pause) and then comes back: once it answers again the refreshes stop, the
+// reader was never moved or re-sent, and its pushes still arrive on the original subscription.
+// RED by mutation: report every Connected session as silent in leaderSessionsSilentMask (refreshes never stop).
+TEST(GroupRoutingRegression, ALeaderSilentThenBackStopsRefreshingAndKeepsItsReaderAdversarialRegression) {
+    RigOptions o;
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 60'000'000'000;
+    GroupRig r(4565, 4566, o);
+    const auto [n1, p1port] = r.addNode(4565);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4565, ""}, {1, 1, 1, 1, 4565, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.connect();
+    std::vector<int64_t> offsets;
+    auto sub = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                  [&](const rc::Record& rec) { offsets.push_back(rec.offset); });
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr && sub.active(); }));
+    const auto bound = *r.subAt(1, n1);
+    ASSERT_TRUE(settleRefreshes(r));
+
+    r.gw.deadEndpoints.insert(n1);
+    const int metaSilent = r.gw.metadataRequests;
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests >= metaSilent + 2; }, 40'000'000))
+        << "the silence armed no refresh";
+    r.gw.deadEndpoints.erase(n1);                    // the pause ends: node 1 answers its next Ping
+    const int n1Pings = r.gw.pings;
+    ASSERT_TRUE(r.drive([&] { return r.gw.pings >= n1Pings + 6; }, 40'000'000));   // node 1 heard again
+    const int pingsBefore = r.gw.pings;
+    const int metaBefore  = r.gw.metadataRequests;
+    ASSERT_TRUE(r.drive([&] { return r.gw.pings >= pingsBefore + 20; }, 40'000'000));
+    EXPECT_LE(r.gw.metadataRequests - metaBefore, 1) << "refreshes went on after the leader answered again";
+    EXPECT_EQ(subscribesAt(r.gw, 1, n1), 1) << "the reader was re-sent although its route never moved";
+    EXPECT_EQ(subscribesAt(r.gw, 1, 0), 0);
+    EXPECT_EQ(r.client.testSessionStateAt(1), rc::session::SessionState::Connected);
+    r.gw.pushRecordsFrom(bound, 0, 3, n1);
+    ASSERT_TRUE(r.drive([&] { return offsets.size() == 3; })) << "the original subscription stopped delivering";
+    EXPECT_FALSE(sub.finished());
+}
+
+// Sibling of #514 on the SEED session (M31+ review: a gap in the #514 fix — out of the suite until it is fixed):
+// a reader bound on the seed's broker when the seed crashes and the cluster elects node 1.  The silent watch
+// skips session 0 and a refresh would be asked on the dead seed first, so the reader waits for the seed
+// session's stale timeout (responseTimeoutNs) before anything moves it.
+TEST(GroupRoutingRegression, DISABLED_ABoundReaderOnACrashedSeedMovesBeforeTheSeedIsStaleAdversarialRegression) {
+    RigOptions o;
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 60'000'000'000;
+    GroupRig r(4567, 4568, o);
+    const auto [n1, p1port] = r.addNode(4567);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4567, ""}, {1, 1, 1, 1, 4567, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.connect();
+    auto other = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                    [](const rc::Record&) {});   // keeps a live node session open
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr && other.active(); }));
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                  [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr && sub.active(); }));
+    ASSERT_TRUE(settleRefreshes(r));
+
+    r.gw.deadEndpoints.insert(0);                    // the seed crashes; node 1 now leads p0
+    r.gw.partitions      = {{1, 0, 1, 2, 4567, ""}, {1, 1, 1, 1, 4567, ""}};
+    r.gw.subscribeLeader = {{0, n1}, {1, n1}};
+    const int pingsBefore = r.gw.pings;              // node 1's keepalives are the clock (~20 per second)
+    EXPECT_TRUE(r.drive([&] { return subscribesAt(r.gw, 0, n1) >= 1 || r.gw.pings >= pingsBefore + 100; },
+                        40'000'000));
+    EXPECT_GE(subscribesAt(r.gw, 0, n1), 1) << "the reader on the crashed seed did not move within ~5 s";
+    EXPECT_FALSE(sub.finished());
+}
+
+// Out-of-batch finding (M31+ review, issue #651 — out of the suite until it is fixed): two redirected
+// Subscribes, the second right after the first binds.  The second redirect's guess stays provisional; each LAGGING
+// MetadataResponse (requested before that redirect, so it cannot confirm the guess) disarms the armed refresh in
+// Client::onMetadataResponse and re-arms it at now + a doubled backoff, pushing the confirming request out (39
+// Pings here, ~0.65 s, instead of the first backoff step).  Fix: keep an armed deadline while a guess is provisional.
+TEST(GroupRoutingRegression, DISABLED_LaggingMetadataAnswersNeverPostponeTheArmedRefreshAdversarialRegression) {
+    RigOptions o;
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 60'000'000'000;
+    GroupRig r(4569, 4570, o);
+    const auto [n1, p1port] = r.addNode(4569);
+    const auto [n2, p2port] = r.addNode(4569);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 1, 1, 4569, ""}, {1, 1, 2, 1, 4569, ""}};
+    r.gw.subscribeLeader = {{0, n1}, {1, n2}};
+    r.connect();
+    auto s0 = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                 [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, n1) != nullptr && s0.active(); }));
+    auto s1 = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                 [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n2) != nullptr && s1.active(); }));
+    const std::size_t asked = r.gw.metadataCorrIds.size();
+    const int64_t lastAsked = asked == 0 ? 0 : r.gw.metadataCorrIds.back();
+    const int pingsBefore = r.gw.pings;              // three live sessions: ~60 Pings per second
+    ASSERT_TRUE(r.drive([&] {
+        for (std::size_t i = asked; i < r.gw.metadataCorrIds.size(); ++i)
+            if (r.gw.metadataCorrIds[i] > lastAsked) return true;
+        return r.gw.pings >= pingsBefore + 200;
+    }, 40'000'000));
+    EXPECT_LE(r.gw.pings - pingsBefore, 30) << "the refresh that confirms the second redirect was postponed by "
+                                               "lagging answers (each re-armed it with a doubled backoff)";
+}

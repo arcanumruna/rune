@@ -160,6 +160,48 @@ TEST(SubscriptionSetRegression, AReadAfterAGapIsCurrentAfterOneDutyCycleRegressi
     EXPECT_EQ(set.batchBytes(), want);
 }
 
+// #473 adversarial (M31+ review): the gap ends with the subscription ENDED by the broker while the ring is full.
+// An app thread that polls finished() must see the end — with its reason and the final position — after its first
+// read plus ONE duty cycle, never only on some later event (the final snapshot takes the ring's reserve; mutation:
+// publishing it with tryPublish turns the full-ring cells red).
+// Repeated over gaps of several lengths, the read side never sees finished() go back to false.
+TEST(SubscriptionSetRegression, AnEndThatLandsInAFullStatusRingIsSeenAfterOneDutyCycleAdversarialRegression) {
+    int32_t port = 4460;
+    for (const int kFrames : {12, 13, 64, 200}) {
+        SCOPED_TRACE(kFrames);
+        SetRig r(port);
+        port += 2;
+        r.connect();
+        std::size_t delivered = 0;
+        auto set = r.client.subscribe(fourPartitions(r.client), rc::AllPartitions{}, {},
+                                      [&](const rc::Record&) { ++delivered; });
+        ASSERT_TRUE(r.drive([&] { return set.active() && r.gw.subscribed.size() == static_cast<std::size_t>(kParts); }));
+        const auto s0 = r.gw.subscribed[0];
+        uint64_t want = 0;
+        for (int i = 0; i < kFrames; ++i) {
+            const auto b = batchOf(i, 1);
+            want += b.size();
+            r.gw.pushBatch(s0, i, b);
+            r.passes(1);                                  // no read of the handle in between
+        }
+        ASSERT_TRUE(r.drive([&] { return delivered == static_cast<std::size_t>(kFrames); }));
+        r.gw.sendError(s0.endpoint, 45, "not authorized: READ on TOPIC t", s0.sessionId, s0.corrId);
+        r.passes(5);                                      // the end lands; still no read
+        rc::Subscription& sub = set[s0.partition];
+        (void)sub.finished();                             // the first read after the gap may be stale
+        r.client.doWork();                                // exactly one duty cycle
+        EXPECT_TRUE(sub.finished()) << "the end was lost in the full ring";
+        EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::NotAuthorized);
+        EXPECT_EQ(sub.position(), kFrames);
+        EXPECT_EQ(sub.batchBytes(), want);
+        for (int i = 0; i < 50; ++i) {
+            r.client.doWork();
+            ASSERT_TRUE(sub.finished()) << "finished() went back to false at read " << i;
+        }
+        for (int p = 1; p < kParts; ++p) EXPECT_FALSE(set[p].finished()) << "partition " << p << " ended too";
+    }
+}
+
 TEST(SubscriptionSet, UnsubscribeEndsEveryPartition) {
     SetRig r(4404);
     r.connect();
