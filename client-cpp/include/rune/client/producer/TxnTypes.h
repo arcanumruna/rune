@@ -24,8 +24,9 @@ inline constexpr int64_t kClientCounterTag = int64_t{1} << 59;   // Client::kCli
 inline constexpr int64_t kTag              = int64_t{1} << 58;
 inline constexpr int64_t kFetchTag         = int64_t{1} << 61;   // GroupConsumerHub::kFetchCorrTag
 inline constexpr int64_t kOffsetFetchTag   = int64_t{1} << 60;   // GroupConsumerHub::kOffsetFetchCorrTag
-static_assert((kTag & (batchcorr::kTag | kFetchTag | kOffsetFetchTag | kClientCounterTag)) == 0,
-              "coordinator ids must not collide with batch / fetch / offset-fetch / Client-counter tags");
+inline constexpr int64_t kGroupCtlTag     = int64_t{1} << 57;   // GroupConsumerHub::kGroupCtlCorrTag
+static_assert((kTag & (batchcorr::kTag | kFetchTag | kOffsetFetchTag | kClientCounterTag | kGroupCtlTag)) == 0,
+              "coordinator ids must not collide with batch / fetch / offset-fetch / Client-counter / group-control tags");
 inline constexpr int64_t kTagMask = int64_t{0x1F} << 58;
 
 [[nodiscard]] constexpr int64_t make(uint32_t ordinal, uint8_t slot, uint32_t seq) noexcept {

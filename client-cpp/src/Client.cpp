@@ -2169,6 +2169,7 @@ std::size_t Client::findCtl_(int64_t corrId) const noexcept {
 // offerCrypto nothing may leave the session before its mode is negotiated.
 // ---------------------------------------------------------------------------
 void Client::onSeedConnected_(int64_t sessionId, int32_t brokerVersion) {
+    groupConsumerHub_.noteBrokerVersion(brokerVersion);   // #440
     // F8c C3: complete the pending connect (state() was published by the
     // caller's syncSeedSession_, so a woken waiter reads Connected).
     completeConnect_(OpStatus::Ok, sessionId, 0, {});
@@ -3411,6 +3412,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // JoinGroup, onConnected) concerns it.
         if (agent_.lastConnectSession() != 0) {
             if (ec == rpc::ErrorCode::OK && agent_.lastConnectAccepted() && !groupConsumerHub_.empty()) {
+                // #440: any node's announced version counts as seen (a coordinator below it defers, not refuses).
+                groupConsumerHub_.noteBrokerVersion(opt->brokerVersion);
                 // That session's event: its unanswered Subscribes are re-sent.
                 (void)groupConsumerHub_.resendUnanswered(agent_.lastConnectSession());
             }

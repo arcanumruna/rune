@@ -283,6 +283,11 @@ public:
     static constexpr int64_t kFetchCorrTag = int64_t{1} << 61;
 
     static constexpr int64_t  kOffsetFetchCorrTag      = int64_t{1} << 60;
+    // #431: JoinGroup / SyncGroup / Heartbeat: bit 57 | ctlId << 32 | per-consumer seq
+    static constexpr int64_t  kGroupCtlCorrTag         = int64_t{1} << 57;
+    [[nodiscard]] static constexpr bool isGroupCtlCorrId(int64_t c) noexcept {
+        return c > 0 && (c & (int64_t{0x3F} << 57)) == kGroupCtlCorrTag;
+    }
     [[nodiscard]] static constexpr bool isFetchCorrId(int64_t c) noexcept {
         return c > 0 && (c & (int64_t{3} << 61)) == kFetchCorrTag;
     }
@@ -341,7 +346,14 @@ public:
     /// GroupConsumer runs only against >= kBrokerVersionExplicitGroupSubscriptions;
     /// otherwise onConnected / joinIfConnected finish it (GroupFailReason::
     /// BrokerTooOld).  Hub-level tests (no broker) keep the default (current).
-    void setBrokerVersion(int32_t v) noexcept { brokerVersion_ = v; }
+    void setBrokerVersion(int32_t v) noexcept {
+        brokerVersion_ = v;
+        noteBrokerVersion(v);
+    }
+    /// #440: any session of this client announced broker version `v` (sticky: the highest ever seen).  A coordinator
+    /// below the version a consumer needs DEFERS its join while a newer node was seen (a rolling upgrade), and only
+    /// refuses (BrokerTooOld) when no node of the cluster ever announced enough.
+    void noteBrokerVersion(int32_t v) noexcept { if (v > maxBrokerVersionSeen_) maxBrokerVersionSeen_ = v; }
 
     /// MEDIUM-7: a consumer adopted while the session is already Connected joins
     /// now (onConnected already ran).  No-op otherwise.
@@ -407,6 +419,14 @@ private:
     void*        directSendCtx_ = nullptr;
 
     int32_t brokerVersion_ = rune::protocol::client::kBrokerVersion;
+    int32_t maxBrokerVersionSeen_ = 0;   // #440: the highest broker version any session announced
+    /// #440: what the coordinator's version allows for `impl`: join now, wait for a coordinator move / reconnect, or end.
+    enum class JoinGate : uint8_t { Ok, Defer, Refuse };
+    [[nodiscard]] JoinGate joinGate_(const GroupConsumerImpl& impl) const noexcept;
+    /// Applies joinGate_ (Refuse ends the consumer, Defer logs once per episode); true = may join now.
+    bool gateAllows_(GroupConsumerImpl& impl);
+    /// gateAllows_, then sendJoinGroup.  Returns whether a JoinGroup was sent.
+    bool tryJoin_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn);
     void refuse_(GroupConsumerImpl& impl, GroupFailReason why);
     bool filterNeedsRouting_(GroupConsumerImpl& impl);   // Phase 2c: refuses (FilterMismatch) a filtered group on a non-routed hub
 
@@ -507,6 +527,10 @@ private:
     static constexpr uint32_t kMaxOffsetFetchRejoins   = 8;
     /// I2: OffsetFetch correlationIds (bit 60 tag; disjoint from fetch ids).
     int64_t nextOffsetFetchCorr_ = 1;
+    /// #431: the last hub-unique control id handed to a consumer (24 bits used, never 0).
+    uint32_t nextCtlId_ = 0;
+    /// #431: the next control correlation id of `impl` (bumps its sequence, skipping 0 on wrap).
+    [[nodiscard]] static int64_t nextCtlCorr_(GroupConsumerImpl& impl) noexcept;
     void publishGeneration_(GroupConsumerImpl& impl);
     /// The status snapshot of `impl` (generation, `reserved`, member id: #125).
     static GroupConsumerStatus statusOf_(const GroupConsumerImpl& impl, int32_t reserved) noexcept;

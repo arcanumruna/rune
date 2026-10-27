@@ -2415,8 +2415,8 @@ TEST(GroupRoutingRegression, OffsetFetchAnsweredNotLeaderWhileTheLineageSettlesI
 // committed offset").  The member starts it at the LOG START — the oldest
 // record the ring still holds — so it reads every refilled record; it never
 // applies Latest (the GroupConfig default), which would skip the refill
-// (silent loss of the first records after a restart).  RED (the seed follows
-// autoOffsetReset=Latest): the subscription did not start at the log start.
+// (silent loss of the first records after a restart).  RED (the seed followed a
+// Latest default): the subscription did not start at the log start.
 TEST(GroupRoutingRegression, TransientNoCommittedOffsetSeedsTheLogStartNeverLatestRegression) {
     GroupRig r(4241, 4242);
     const auto [n1, p1port] = r.addNode(4241);
@@ -2426,7 +2426,6 @@ TEST(GroupRoutingRegression, TransientNoCommittedOffsetSeedsTheLogStartNeverLate
     r.gw.groupAssignment       = {{1, 1}};
     r.gw.committedOffsets[{1, 1}] = -1;   // a re-minted lineage: the old offset answered "none"
     rc::GroupConfig cfg;
-    cfg.autoOffsetReset = rc::OffsetReset::Latest;   // explicit (also the default)
     auto gc = r.client.subscribeGroup("g", {"t"}, cfg);
     Consumed led;
     wire(gc, led);
@@ -4037,4 +4036,35 @@ TEST(GroupRoutingRegression, DISABLED_LaggingMetadataAnswersNeverPostponeTheArme
     }, 40'000'000));
     EXPECT_LE(r.gw.pings - pingsBefore, 30) << "the refresh that confirms the second redirect was postponed by "
                                                "lagging answers (each re-armed it with a doubled backoff)";
+}
+
+// #440: the coordinator's seed session reconnects onto a node that was rolled back below what the consumer needs
+// while the cluster once announced more (a rolling upgrade in flight).  The consumer waits (it is not ended
+// BrokerTooOld) and keeps running once the coordinator answers with a current version.  RED: it ended BrokerTooOld.
+TEST(GroupRoutingRegression, AConsumerDefersWhenItsCoordinatorReconnectsOntoAnOlderNodeRegression) {
+    GroupRig r(4590, 4591);
+    r.gw.groupAssignment = {{1, 0}};
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr; })) << "precondition: the consumer is Stable";
+    const int joins = r.gw.joinGroups;
+
+    r.gw.advertisedBrokerVersionAt[0] = rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions - 1;
+    int connects = r.gw.connectsAt[0];
+    r.gw.expireSession(r.seedSid);
+    ASSERT_TRUE(r.drive([&] { return r.gw.connectsAt[0] > connects; })) << "precondition: the seed reconnected";
+    for (int i = 0; i < 200; ++i) { r.client.doWork(); r.gw.pump(); }
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::None) << "ended on a rolling upgrade";
+    EXPECT_TRUE(gc.active());
+    EXPECT_EQ(r.gw.joinGroups, joins) << "no join against the older coordinator";
+
+    r.gw.advertisedBrokerVersionAt[0] = rune::protocol::client::kBrokerVersion;
+    connects = r.gw.connectsAt[0];
+    r.gw.expireSession(r.seedSid);
+    ASSERT_TRUE(r.drive([&] { return r.gw.connectsAt[0] > connects; })) << "precondition: the seed reconnected again";
+    for (int i = 0; i < 200; ++i) { r.client.doWork(); r.gw.pump(); }
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::None);
+    EXPECT_TRUE(gc.active()) << "still running on the upgraded coordinator";
 }

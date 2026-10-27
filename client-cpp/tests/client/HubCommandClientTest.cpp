@@ -1605,3 +1605,67 @@ TEST(HubCommandClient, VoidCommitRefusalMatrixThrowsOrNoOpNeverDropsAdversarialR
         client.close();
     }
 }
+
+// #356 F6 (Thread mode): the void group seek() retries a BackPressured command ring instead of dropping the seek or
+// throwing.  The runner is parked in a record handler, so the ring stays full until the test releases it.
+TEST(HubCommandClientRegression, ThreadModeVoidSeekRetriesABackPressuredRingRegression) {
+    rc::ClientConfig c = hubCfg(4920, 4921, rc::RunnerMode::Thread);
+    rc::Client client(c);
+    test_support::InvokerGateway gw(c.dataDir + "/aeron", c.gatewayChannel, c.gatewayStreamId,
+                                    c.egressChannel, c.egressStreamId);
+    auto pump = [&](auto pred, int cap = 2'000'000) {
+        for (int i = 0; i < cap; ++i) {
+            gw.pump();
+            if (pred()) return true;
+            std::this_thread::yield();
+        }
+        return false;
+    };
+    gw.groupProtocol   = true;
+    gw.holdJoins       = true;
+    gw.partitions      = {{1, 0, 0, 1, 4920, ""}};
+    gw.groupAssignment = {{1, 0}};
+    ASSERT_TRUE(pump([&] { return gw.ready(); }));
+    test_support::TestCq cq(client);
+    auto cf = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+    ASSERT_TRUE(pump([&] { return cf.ready(); }));
+
+    std::atomic<int> inHandler{kPending};   // runner -> test: "parked in the record handler"
+    std::atomic<int> release{kPending};     // test -> runner: "leave the handler"
+    std::atomic<bool> handled{false};
+    auto gc = client.subscribeGroup("g", {"t"});
+    gc.onRecords([&](const rc::RecordSet&) {
+        if (handled.exchange(true)) return;
+        signal(inHandler, kFull);
+        (void)waitEvent(release);
+    });
+    ASSERT_TRUE(pump([&] { return !gw.pendingJoins.empty(); }));
+    gw.releaseJoins();
+    ASSERT_TRUE(pump([&] { return gw.latestSubscription(1, 0) != nullptr; }));
+    const auto first = *gw.latestSubscription(1, 0);
+    gw.pushRecords(first, 0, 1);
+    if (!pump([&] { return inHandler.load() == kFull; })) {
+        signal(release, kNoFull);
+        FAIL() << "the runner never entered the record handler";
+    }
+    const std::size_t subs = gw.subscribed.size();
+
+    client.testFillCommandRing();
+    std::atomic<bool> started{false}, finished{false}, threw{false};
+    std::string why;
+    std::thread t([&] {
+        started.store(true);
+        try { gc.seek({1, 0}, 0); } catch (const std::exception& e) { why = e.what(); threw.store(true); }
+        finished.store(true);
+    });
+    while (!started.load()) std::this_thread::yield();
+    // The runner is parked and the ring is full: the seek can only be retrying, it cannot have returned.
+    for (int i = 0; i < 20'000; ++i) { gw.pump(); std::this_thread::yield(); }
+    EXPECT_FALSE(finished.load()) << "the seek returned although the command ring was full (dropped?): " << why;
+    signal(release, kFull);   // the runner leaves the handler and drains the ring
+    t.join();
+    EXPECT_FALSE(threw.load()) << "a BackPressured seek must be retried, not thrown: " << why;
+    ASSERT_TRUE(pump([&] { return gw.subscribed.size() > subs; })) << "the seek was dropped: no re-subscription";
+    EXPECT_EQ(gw.latestSubscription(1, 0)->fromOffset, 0);
+    client.close();
+}

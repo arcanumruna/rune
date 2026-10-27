@@ -543,7 +543,6 @@ struct Reader {
     void joinGroup(rc::Client& client) {
         rc::GroupConfig g;
         g.autoCommit          = false;
-        g.autoOffsetReset     = rc::OffsetReset::Earliest;
         g.isolation           = iso;
         g.sessionTimeoutMs    = 30'000;
         g.commitSyncTimeoutMs = 30'000;

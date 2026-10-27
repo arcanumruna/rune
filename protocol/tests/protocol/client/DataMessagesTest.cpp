@@ -1902,7 +1902,9 @@ static_assert(rpc::kBrokerVersionReceiverKeys == rpc::kBrokerVersionFilter + 1);
 static_assert(rpc::kBrokerVersion == rpc::kBrokerVersionReceiverKeys);
 // Issue #112: client 13 (produce ConcurrentTransactions while the leader verifies the txn partition) follows.
 static_assert(rpc::kClientVersionTxnVerify == rpc::kClientVersionReceiverKeys + 1);
-static_assert(rpc::kClientVersion == rpc::kClientVersionTxnVerify);
+// Issue #450: client 14 (SubscribeResponse RecordEgressUnavailable) follows.
+static_assert(rpc::kClientVersionRecordEgressUnavailable == rpc::kClientVersionTxnVerify + 1);
+static_assert(rpc::kClientVersion == rpc::kClientVersionRecordEgressUnavailable);
 static_assert(rpc::sessionUsesReceiverKeys(12, 7) && !rpc::sessionUsesReceiverKeys(11, 7) && !rpc::sessionUsesReceiverKeys(12, 6));
 static_assert(rpc::clientUnderstandsFilters(11) && !rpc::clientUnderstandsFilters(10));
 

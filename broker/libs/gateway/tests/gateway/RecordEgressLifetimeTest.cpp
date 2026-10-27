@@ -664,6 +664,31 @@ TEST(AuthEnforcementAdversarialRegression, AnEgressFailedSubscribeIsNeverAnswere
         << "an OK followed by NotLeader is a MOVE on the client (fresh budget each time): the loop never ends explicitly";
 }
 
+// #450: a held Subscribe retired for want of a record egress is answered RecordEgressUnavailable (49) only to a
+// client that understands it (version >= 14); an older client parks an unknown fetch-refusal code and re-subscribes
+// forever, so it is answered NotAuthorized, which every older client ends the subscription / group consumer on.
+namespace {
+int heldSubscribeAnswer(int32_t clientVersion) {
+    AnswerLog r;
+    const int64_t sid = r.gw.injectTestSession(0, clientVersion);
+    r.gw.setSessionAuthForTest(sid, AuthAuthenticated{1, "reader", PermissionTable::allowAll(), {}});
+    r.subscribeCorr(sid, 4242);
+    for (int p = 0; p < 4; ++p) r.cycle(1 + p);
+    for (const auto& a : r.answers)
+        if (!a.isError && a.corr == 4242) return a.code;
+    return -1;
+}
+}  // namespace
+
+TEST(RecordEgressRegression, AnOlderClientIsAnsweredNotAuthorizedNotEgressUnavailableRegression) {
+    EXPECT_EQ(heldSubscribeAnswer(pc::kClientVersionRecordEgressUnavailable - 1),
+              static_cast<int>(pc::ErrorCode::NotAuthorized));
+}
+
+TEST(RecordEgressRegression, ACurrentClientIsStillAnsweredEgressUnavailableRegression) {
+    EXPECT_EQ(heldSubscribeAnswer(pc::kClientVersion), static_cast<int>(pc::ErrorCode::RecordEgressUnavailable));
+}
+
 // Resources + no fallback over many attempts: whatever the number of failed re-subscribes, no cursor ever reaches the
 // worker, the gateway keeps no subscription and no pending resolve, and the counter counts every retirement.
 TEST(AuthEnforcementAdversarialRegression, RepeatedReSubscribesWithoutEgressLeaveNothingBehindAdversarialRegression) {

@@ -620,7 +620,6 @@ TEST(ClientFailoverBrokerRegression, SeedCoordinatorCrashedGroupMemberKeepsConsu
     rc::Client member(gcfg0);
     rc::GroupConfig gcfg;
     gcfg.autoCommit = true; gcfg.autoCommitIntervalMs = 500; gcfg.sessionTimeoutMs = 10'000;
-    gcfg.autoOffsetReset = rc::OffsetReset::Earliest;
     auto gc = member.subscribeGroup("g", {"events"}, gcfg);
     SubLedger led;
     gc.onRecords([&](const rc::RecordSet& rs) {

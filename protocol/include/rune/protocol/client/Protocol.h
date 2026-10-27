@@ -341,7 +341,11 @@ inline constexpr int32_t kClientVersionReceiverKeys               = 12;  // per-
 //   backoff.  A refused verification answers the batch InvalidTxnState / ProducerFenced / InvalidProducerEpoch
 //   (non-retriable).  A broker answers a session below 13 NotLeader instead of 27 (their retriable code).
 inline constexpr int32_t kClientVersionTxnVerify                  = 13;  // produce ConcurrentTransactions (issue #112)
-inline constexpr int32_t kClientVersion                           = 13;  // what this protocol's client announces
+// 14 — issue #450: a SubscribeResponse may carry RecordEgressUnavailable (49); the client retries it within a small
+// budget, then ends the subscription / group consumer explicitly.  A broker answers a session below 14 NotAuthorized
+// instead: every older client ends a subscription or group fetch on it (never parks it).
+inline constexpr int32_t kClientVersionRecordEgressUnavailable      = 14;  // understands SubscribeResponse 49 (#450)
+inline constexpr int32_t kClientVersion                           = 14;  // what this protocol's client announces
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h
@@ -434,6 +438,13 @@ inline constexpr int32_t kBrokerVersion                           = 7;   // what
 /// (version 9): templates 12-15, 79, 80 and codes 44-47.
 [[nodiscard]] constexpr bool clientUnderstandsAuth(int32_t clientVersion) noexcept {
     return clientVersion >= kClientVersionAuth;
+}
+
+/// True when a session that connected with `clientVersion` may be answered RecordEgressUnavailable (49) on a
+/// SubscribeResponse (issue #450, see version 14); below it the broker answers NotAuthorized.  A negative version
+/// (unknown: rigs) is treated as current.
+[[nodiscard]] constexpr bool clientUnderstandsRecordEgressUnavailable(int32_t clientVersion) noexcept {
+    return clientVersion < 0 || clientVersion >= kClientVersionRecordEgressUnavailable;
 }
 
 /// True when a session that connected with `clientVersion` may be answered UnstableOffsetCommit (50) (version 10);

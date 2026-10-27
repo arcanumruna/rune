@@ -1003,7 +1003,6 @@ static int groupCommitMode(ClientConfig cfg, int timeoutMs, int boundMs) {
     Client c(cfg);
     GroupConfig g;
     g.autoCommit      = false;
-    g.autoOffsetReset = OffsetReset::Earliest;
     auto gc = c.subscribeGroup(kPresenceGroup, {topic}, g);
     std::atomic<int64_t> next{0};
     gc.onRecords([&next](const RecordSet& rs) {
@@ -1058,7 +1057,6 @@ static int groupRestartMode(ClientConfig cfg, int timeoutMs, int boundMs) {
     Client c(cfg);
     GroupConfig g;
     g.autoCommit      = false;
-    g.autoOffsetReset = OffsetReset::Earliest;
     auto gc = c.subscribeGroup(kPresenceGroup, {topic}, g);
     // Records the restarted ring already holds (RUNE_GROUP_PRE; default 1 —
     // verify_restart's record) + the 2 produced above: offsets 0..kWant-1.

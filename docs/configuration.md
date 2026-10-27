@@ -262,7 +262,7 @@ producers), `produceTimeoutMs` (`5000`), `transactionOpTimeoutMs` (`60000`), `ma
 `RUNE_BATCH_RECORDS`, `RUNE_MAX_FRAME_BYTES` and `RUNE_DELIVERY_TIMEOUT_MS`.
 
 `GroupConfig` ([GroupConsumer.h](../client-cpp/include/rune/client/group/GroupConsumer.h)): `autoCommit` (`true`),
-`autoCommitIntervalMs` (`5000`), `sessionTimeoutMs` (`30000`), `autoOffsetReset` (`Latest`), `isolation`
+`autoCommitIntervalMs` (`5000`), `sessionTimeoutMs` (`30000`), `isolation`
 (`ReadUncommitted`), `commitSyncTimeoutMs` (`30000`).
 
 Client environment variables that override `ClientConfig`: `RUNE_CLIENT_AERON_MTU`, `RUNE_CLIENT_AERON_UDP_GSO`,

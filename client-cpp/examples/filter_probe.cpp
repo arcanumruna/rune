@@ -699,7 +699,6 @@ int runConsume(const Env& env) {
     Client plain(makeConfig(env, 0));
     Client g1c(makeConfig(env, 1)), g2c(makeConfig(env, 2));
     GroupConfig gcfg;
-    gcfg.autoOffsetReset = OffsetReset::Earliest;
     gcfg.isolation       = IsolationLevel::ReadCommitted;
     gcfg.sessionTimeoutMs = 30000;
     gcfg.filter(filterOf(Pk::World9));
@@ -930,7 +929,6 @@ int runErrors(const Env& env) {
         Client a(makeConfig(env, 1)), b(makeConfig(env, 2));
         b.onError([&errsB](const std::string& m) { errsB.v.push_back(m); });
         GroupConfig ga, gb;
-        ga.autoOffsetReset = gb.autoOffsetReset = OffsetReset::Earliest;
         ga.filter(E::Filter{.worldId = 9u});
         gb.filter(E::Filter{.worldId = 10u});
         std::size_t assignedA = 0;

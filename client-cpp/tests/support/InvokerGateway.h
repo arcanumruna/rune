@@ -280,6 +280,15 @@ struct InvokerGateway {
     std::map<int, int32_t> advertisedBrokerVersionAt;  // per endpoint (a rolling upgrade)
     // OffsetFetch answers are held until releaseOffsetFetches().
     bool holdOffsetFetch = false;
+    // #356: SubscribeResponse OKs are held until releaseSubscribeResponses().
+    bool holdSubscribeResponses = false;
+    std::vector<std::pair<int, std::vector<uint8_t>>> heldSubscribeResponses;
+    void releaseSubscribeResponses() {
+        holdSubscribeResponses = false;
+        std::vector<std::pair<int, std::vector<uint8_t>>> h;
+        h.swap(heldSubscribeResponses);
+        for (const auto& [ep, f] : h) send(ep, f.data(), f.size());
+    }
     std::vector<std::vector<uint8_t>> heldOffsetFetches;
     void releaseOffsetFetches() {
         std::vector<std::vector<uint8_t>> h;
@@ -355,11 +364,13 @@ struct InvokerGateway {
         send(0, out.data(), n);
     }
     std::vector<int64_t> pendingJoins;     // sessionIds of held JoinGroups
+    std::vector<int64_t> pendingJoinCorrs; // #431: their correlationIds (an answer echoes the request's)
     /// Answer every held JoinGroup now.
     void releaseJoins() {
-        std::vector<int64_t> p;
+        std::vector<int64_t> p, c;
         p.swap(pendingJoins);
-        for (const int64_t sid : p) answerJoin_(sid);
+        c.swap(pendingJoinCorrs);
+        for (std::size_t i = 0; i < p.size(); ++i) answerJoin_(p[i], c[i]);
     }
     /// The latest subscription for (topicId, partition), or nullptr.
     [[nodiscard]] const Subscribed* latestSubscription(int32_t topicId, int32_t partition) const {
@@ -1008,12 +1019,12 @@ private:
         return true;
     }
 
-    void answerJoin_(int64_t sessionId) {
+    void answerJoin_(int64_t sessionId, int64_t correlationId) {
         namespace rp = rune::protocol::client;
         static const std::string kMember = "member-1";
         rp::JoinGroupResponse r;
         r.sessionId     = sessionId;
-        r.correlationId = 0;
+        r.correlationId = correlationId;   // #431
         r.generationId  = groupGeneration;
         r.isLeader      = 0;
         r.errorCode     = joinErrorCode;
@@ -1790,6 +1801,10 @@ private:
                 --dropSubscribeResponsesNext;
                 return;
             }
+            if (holdSubscribeResponses) {   // #356: answered later by releaseSubscribeResponses()
+                heldSubscribeResponses.emplace_back(replyFromArrival ? endpoint : 0, std::vector<uint8_t>(out, out + n));
+                return;
+            }
             send(replyFromArrival ? endpoint : 0, out, n);
             return;
         }
@@ -2044,9 +2059,10 @@ private:
             rebalancing = false;
             if (holdJoins) {
                 pendingJoins.push_back(j->sessionId);
+                pendingJoinCorrs.push_back(j->correlationId);
                 return;
             }
-            answerJoin_(j->sessionId);
+            answerJoin_(j->sessionId, j->correlationId);
             return;
         }
         case rcc::TemplateId::SyncGroup: {
@@ -2066,7 +2082,7 @@ private:
             }
             rp::SyncGroupResponse r;
             r.sessionId     = sg->sessionId;
-            r.correlationId = 0;
+            r.correlationId = sg->correlationId;   // #431
             r.errorCode     = syncErrorCode;
             if (syncErrorCode != 0) asgn.clear();
             std::vector<uint8_t> out(rp::SyncGroupResponse::encodedSizeFor(asgn.size()));
@@ -2084,7 +2100,7 @@ private:
             if (notCoordinator_(endpoint, hb->sessionId, rp::HeartbeatResponse{}, hb->correlationId)) return;
             rp::HeartbeatResponse r;
             r.sessionId     = hb->sessionId;
-            r.correlationId = 0;
+            r.correlationId = hb->correlationId;   // #431
             r.errorCode     = heartbeatErrorCode != 0 ? heartbeatErrorCode
                             : rebalancing ? static_cast<int16_t>(rp::ErrorCode::RebalanceInProgress) : int16_t{0};
             std::vector<uint8_t> out(rp::HeartbeatResponse::ENCODED_SIZE);

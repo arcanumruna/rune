@@ -31,6 +31,7 @@
 //   iterator / element reference across user code.
 
 #include <rune/client/group/GroupConsumerHub.h>
+#include <rune/client/producer/TxnTypes.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -85,6 +86,9 @@ void GroupConsumerHub::add(GroupConsumerImpl* impl) {
     if (impl == nullptr) return;
     // F8c C7: the duty side's share is held from adoption on (even if closed).
     owned_.push_back(impl);
+    // #431: a hub-unique 24-bit control id (never 0) tags this consumer's Join / Sync / Heartbeat correlation ids.
+    impl->ctlId = (++nextCtlId_ & 0xFFFFFFu);
+    if (impl->ctlId == 0) impl->ctlId = (++nextCtlId_ & 0xFFFFFFu);
     // fix3 I3: closed (directly, on this thread) before its adoption: honour
     // it — never driven, never joins.
     if (impl->active) impls_.push_back(impl);
@@ -631,6 +635,16 @@ int GroupConsumerHub::retryPendingLeaves(int64_t currentSessionId) {
     return sent;
 }
 
+static_assert(GroupConsumerHub::kGroupCtlCorrTag == producer::coordcorr::kGroupCtlTag);
+
+// #431: tag | ctlId << 32 | seq.  The sequence skips 0 on wrap.
+/*static*/
+int64_t GroupConsumerHub::nextCtlCorr_(GroupConsumerImpl& impl) noexcept
+{
+    if (++impl.ctlSeq == 0) impl.ctlSeq = 1;
+    return kGroupCtlCorrTag | (static_cast<int64_t>(impl.ctlId) << 32) | static_cast<int64_t>(impl.ctlSeq);
+}
+
 // ---------------------------------------------------------------------------
 // sendJoinGroup — runner thread
 // ---------------------------------------------------------------------------
@@ -645,7 +659,7 @@ void GroupConsumerHub::sendJoinGroup(GroupConsumerImpl& impl,
 
     rpc::JoinGroup msg;
     msg.sessionId        = sessionId;
-    msg.correlationId    = 0;  // broker ignores; matched by state
+    msg.correlationId    = impl.ctlCorrId = nextCtlCorr_(impl);   // #431: the answer echoes it
     msg.sessionTimeoutMs = impl.cfg.sessionTimeoutMs;
     msg.groupId          = grpSpan;
     msg.memberId         = mbrSpan;
@@ -681,7 +695,7 @@ void GroupConsumerHub::sendSyncGroup(GroupConsumerImpl& impl,
     // SyncGroup::encodedSize computes exact size but we need the object set up.
     rpc::SyncGroup msg;
     msg.sessionId     = sessionId;
-    msg.correlationId = 0;
+    msg.correlationId = impl.ctlCorrId = nextCtlCorr_(impl);   // #431
     msg.generationId  = impl.generationId;
     msg.groupId       = grpSpan;
     msg.memberId      = mbrSpan;
@@ -711,7 +725,7 @@ void GroupConsumerHub::sendHeartbeat(GroupConsumerImpl& impl,
 
     rpc::Heartbeat msg;
     msg.sessionId     = sessionId;
-    msg.correlationId = 0;
+    msg.correlationId = nextCtlCorr_(impl);   // #431
     msg.generationId  = impl.generationId;
     msg.groupId       = grpSpan;
     msg.memberId      = mbrSpan;
@@ -1338,19 +1352,61 @@ int GroupConsumerHub::retryOffsetFetch(int64_t nowNs, int64_t sessionId, const S
     return sent;
 }
 
+// #440: what the coordinator's version allows.  A coordinator below the needed version while a newer node was seen is a
+// rolling upgrade in flight: the join waits for a coordinator move / reconnect (no timer); with no newer node ever
+// seen the cluster cannot serve this consumer and it ends BrokerTooOld.
+GroupConsumerHub::JoinGate GroupConsumerHub::joinGate_(const GroupConsumerImpl& impl) const noexcept
+{
+    namespace pc = rune::protocol::client;
+    const int32_t need = impl.cfg.filterBytes.empty()
+        ? pc::kBrokerVersionExplicitGroupSubscriptions
+        : std::max(pc::kBrokerVersionExplicitGroupSubscriptions, pc::kBrokerVersionFilter);
+    if (brokerVersion_ >= need) return JoinGate::Ok;
+    return maxBrokerVersionSeen_ >= need ? JoinGate::Defer : JoinGate::Refuse;
+}
+
+bool GroupConsumerHub::gateAllows_(GroupConsumerImpl& impl)
+{
+    switch (joinGate_(impl)) {
+    case JoinGate::Ok:
+        return true;
+    case JoinGate::Refuse:
+        refuse_(impl, GroupFailReason::BrokerTooOld);   // Phase 2c: a filtered group needs >= kBrokerVersionFilter
+        return false;
+    case JoinGate::Defer:
+        if (!impl.joinDeferredLogged) {
+            impl.joinDeferredLogged = true;   // once per deferral episode
+            const int32_t need = impl.cfg.filterBytes.empty()
+                ? rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions
+                : std::max(rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions,
+                           rune::protocol::client::kBrokerVersionFilter);
+            std::fprintf(stderr,
+                "rune-client: group '%s': coordinator broker version %d is below %d (a newer node was seen): "
+                "join deferred until the coordinator moves or reconnects\n",
+                impl.groupId.c_str(), brokerVersion_, need);
+        }
+        return false;
+    }
+    return false;
+}
+
+bool GroupConsumerHub::tryJoin_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn)
+{
+    if (!gateAllows_(impl)) return false;
+    impl.joinDeferredLogged = false;
+    sendJoinGroup(impl, sessionId, sendFn);
+    return true;
+}
+
 void GroupConsumerHub::joinIfConnected(int64_t sessionId, const SendFn& sendFn)
 {
     if (!sessionConnected_ || sessionId == 0) return;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active || impl->state != GroupConsumerState::Unjoined) continue;
-        if (brokerVersion_ < rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions ||
-            (!impl->cfg.filterBytes.empty() && brokerVersion_ < rune::protocol::client::kBrokerVersionFilter)) {
-            refuse_(*impl, GroupFailReason::BrokerTooOld);   // Phase 2c: a filtered group needs >= kBrokerVersionFilter
-            continue;
-        }
+        if (!gateAllows_(*impl)) continue;   // #440: Refuse ends it, Defer waits
         if (filterNeedsRouting_(*impl)) continue;
-        sendJoinGroup(*impl, sessionId, sendFn);
+        (void)tryJoin_(*impl, sessionId, sendFn);
     }
 }
 
@@ -1459,8 +1515,7 @@ int GroupConsumerHub::doWork(int64_t nowNs,
             // re-offered on the next pass once that session is connected.
             if (now >= impl->joinDeadline || (impl->joinSessionId == 0 && sessionConnected_ && sessionId != 0)) {
                 // Re-send JoinGroup (rejoin guard expired).
-                sendJoinGroup(*impl, sessionId, sendFn);
-                ++work;
+                if (tryJoin_(*impl, sessionId, sendFn)) ++work;   // #440: a deferred join sends nothing
             }
             break;
 
@@ -1495,8 +1550,7 @@ int GroupConsumerHub::doWork(int64_t nowNs,
             // Re-send JoinGroup — at once for a rebalance signal, after the
             // backoff for an Internal / unclassified error (C1).
             if (now < impl->rejoinNotBefore) break;
-            sendJoinGroup(*impl, sessionId, sendFn);
-            ++work;
+            if (tryJoin_(*impl, sessionId, sendFn)) ++work;   // #440
             break;
         }
     }
@@ -1756,16 +1810,14 @@ void GroupConsumerHub::onJoinGroupResponse(const uint8_t* buf, std::size_t len,
 {
     auto opt = rpc::JoinGroupResponse::decode(buf, len);
     if (!opt) return;
+    if (!isGroupCtlCorrId(opt->correlationId)) return;   // #431: not an answer to one of ours
 
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
-        if (impl->state != GroupConsumerState::Joining) continue;
+        // #431: only the answer to THIS consumer's join in flight (a stale or foreign one is dropped).
+        if (impl->state != GroupConsumerState::Joining || impl->ctlCorrId != opt->correlationId) continue;
 
-        // Match by groupId is implicit: only one consumer per hub is in
-        // Joining state for a given connection. (Multi-group: match by corrId
-        // once JoinGroup carries a per-consumer correlationId — for now we
-        // support one group per connection, matching Kafka client convention.)
         const auto ec = static_cast<rpc::ErrorCode>(opt->errorCode);
         // Phase 2c (E10): the group runs with another filter (the first member fixed it).  Re-joining re-sends
         // the same filter — never retried; the consumer ends FilterMismatch.  Any other InvalidRequest keeps the
@@ -1808,11 +1860,12 @@ void GroupConsumerHub::onSyncGroupResponse(const uint8_t* buf, std::size_t len,
 {
     auto opt = rpc::SyncGroupResponse::decode(buf, len);
     if (!opt) return;
+    if (!isGroupCtlCorrId(opt->correlationId)) return;   // #431
 
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
-        if (impl->state != GroupConsumerState::Syncing) continue;
+        if (impl->state != GroupConsumerState::Syncing || impl->ctlCorrId != opt->correlationId) continue;   // #431
 
         const auto ec = static_cast<rpc::ErrorCode>(opt->errorCode);
         const GroupVerdict v = classifyGroupAnswer_(ec);
@@ -1848,6 +1901,9 @@ void GroupConsumerHub::onSyncGroupResponse(const uint8_t* buf, std::size_t len,
             impl->nextAutoCommit =
                 now + std::chrono::milliseconds(impl->cfg.autoCommitIntervalMs);
 
+            // #431: heartbeat answers of earlier episodes (sent before this Sync) are no longer applied.
+            impl->hbSeqLo = impl->ctlSeq + 1;
+            if (impl->hbSeqLo == 0) impl->hbSeqLo = 1;
             impl->state = GroupConsumerState::Stable;
 
             // (TX-5 CRITICAL 2) Send Subscribe per assigned partition so the broker
@@ -1888,11 +1944,16 @@ void GroupConsumerHub::onHeartbeatResponse(const uint8_t* buf, std::size_t len,
 {
     auto opt = rpc::HeartbeatResponse::decode(buf, len);
     if (!opt) return;
+    const int64_t corr = opt->correlationId;
+    if (!isGroupCtlCorrId(corr)) return;   // #431
 
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
+        // #431: this consumer's id, and a heartbeat of the current Stable episode (any still in flight counts).
         if (impl->state != GroupConsumerState::Stable) continue;
+        if (impl->ctlId != static_cast<uint32_t>((corr >> 32) & 0xFFFFFF)) continue;
+        if (static_cast<int32_t>(static_cast<uint32_t>(corr) - impl->hbSeqLo) < 0) continue;
 
         const auto ec = static_cast<rpc::ErrorCode>(
             static_cast<uint16_t>(opt->errorCode));
@@ -2028,8 +2089,8 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
                 it->second = r.offset;
             }
             if (it->second == GroupConsumerImpl::kUnseededSentinel) {
-                // No committed offset: the LOG START, whatever autoOffsetReset
-                // says (the broker clamps 0 up to the oldest held record; the
+                // No committed offset: the LOG START (there is no
+                // auto-offset-reset setting, #170; the broker clamps 0 up to the oldest held record; the
                 // first batch then simply starts above 0, a legitimate gap).
                 // E2 N6: for a transient partition whose lineage changed this
                 // reads every refilled record — never Latest (silent loss).
@@ -2162,11 +2223,7 @@ void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
         if (!impl->active) continue;
         // MAJOR-2 (round 3): never against a broker that predates explicit
         // group subscriptions (it would auto-subscribe and lose records).
-        if (brokerVersion_ < rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions ||
-            (!impl->cfg.filterBytes.empty() && brokerVersion_ < rune::protocol::client::kBrokerVersionFilter)) {
-            refuse_(*impl, GroupFailReason::BrokerTooOld);   // Phase 2c: a filtered group needs >= kBrokerVersionFilter
-            continue;
-        }
+        if (!gateAllows_(*impl)) continue;   // #440: Refuse ends it, Defer waits
         if (filterNeedsRouting_(*impl)) continue;
 
         // fix1 I6: a NEW session (reconnect) means the old one was lost — a
@@ -2175,7 +2232,7 @@ void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
 
         if (impl->state == GroupConsumerState::Unjoined  ||
             impl->state == GroupConsumerState::Rejoining) {
-            sendJoinGroup(*impl, sessionId, sendFn);
+            (void)tryJoin_(*impl, sessionId, sendFn);
         } else if ((impl->state == GroupConsumerState::Joining ||
                     impl->state == GroupConsumerState::Syncing) &&
                    impl->joinSessionId != sessionId) {
@@ -2193,7 +2250,7 @@ void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
             // broker reaps members by sessionTimeoutMs, not with the client
             // session; KIP-394 MEMBER_ID_REQUIRED is the real fix — ticket).
             toRejoining_(*impl);
-            sendJoinGroup(*impl, sessionId, sendFn);
+            (void)tryJoin_(*impl, sessionId, sendFn);
         }
     }
 }

@@ -1920,6 +1920,7 @@ private:
     //                                 Subscribe / Unsubscribe, txn, OffsetCommit
     //   group OffsetFetch             bit 60 (GroupConsumerHub::kOffsetFetchCorrTag)
     //   group fetch Subscribes        bit 61 (GroupConsumerHub::kFetchCorrTag)
+    //   group Join/Sync/Heartbeat     bit 57 (GroupConsumerHub::kGroupCtlCorrTag)
     //   producer batches              bit 62 (producer::batchcorr::kTag)
     //   producer coordinator requests bit 58 (producer::coordcorr::kTag; bit 59 is the counter above)
     // Task 5 fix round 0 (C): the counter used to start at 1 — the seed's

@@ -868,7 +868,6 @@ TEST(EosBrokerRegression, AbortRewindRedoOutputEqualsInputRegression) {
     auto cc = std::make_unique<rc::Client>(e.cfg(e.otherThan(e.ctl), {in}));
     rc::GroupConfig gcfg;
     gcfg.autoCommit        = false;
-    gcfg.autoOffsetReset   = rc::OffsetReset::Earliest;
     gcfg.isolation         = rc::IsolationLevel::ReadCommitted;
     gcfg.sessionTimeoutMs  = 30'000;
     gcfg.commitSyncTimeoutMs = 30'000;
@@ -911,8 +910,20 @@ TEST(EosBrokerRegression, AbortRewindRedoOutputEqualsInputRegression) {
             ASSERT_TRUE(w.abort().ok());
             // Everything delivered before the rewind applies is stale; the command applies at issue (Invoker owner),
             // so what arrives while the wait pumps is the NEW stream and must be kept.
-            pending.clear();
-            gc.seekToCommittedAndWait(60s);   // rewind to the committed offsets, without a restart
+            // #413: a rebalance during the rewind completes it Rejoined (documented); the stale stream is dropped
+            // again and the rewind re-issued once the group settles.  Any other outcome fails the test.
+            bool rewound = false;
+            for (int attempt = 0; attempt < 20 && !rewound; ++attempt) {
+                pending.clear();
+                try {
+                    gc.seekToCommittedAndWait(60s);   // rewind to the committed offsets, without a restart
+                    rewound = true;
+                } catch (const rc::GroupOpError& ex) {
+                    ASSERT_EQ(ex.status(), rc::OpStatus::Rejoined) << ex.what();
+                    for (const auto until = Clock::now() + 200ms; Clock::now() < until;) (void)cc->doWork();
+                }
+            }
+            ASSERT_TRUE(rewound) << "the rewind never completed outside a rebalance";
             ++aborts;
         } else {
             ASSERT_TRUE(w.commit().ok());
@@ -1183,7 +1194,6 @@ TEST(EosBrokerRegression, TransactionalOffsetsReachTheGroupOnlyOnCommitRegressio
     auto cc = std::make_unique<rc::Client>(e.cfg(e.otherThan(e.ctl), {in}));
     rc::GroupConfig gcfg;
     gcfg.autoCommit      = false;   // only the transactions commit offsets
-    gcfg.autoOffsetReset = rc::OffsetReset::Earliest;
     rc::GroupConsumer gc = cc->subscribeGroup("eos-offsets-g", {"eos.in"}, gcfg);
     gc.onRecords([&](const rc::RecordSet& rs) {
         rs.forEachRecord([&](std::string_view, std::string_view, int64_t off, int64_t) {
@@ -1266,7 +1276,6 @@ TEST(EosBrokerRegression, TxnOffsetsCarryingTheMemberAreFencedByGenerationAndMem
     auto cc = std::make_unique<rc::Client>(e.cfg(e.otherThan(e.ctl), {in}));
     rc::GroupConfig gcfg;
     gcfg.autoCommit      = false;
-    gcfg.autoOffsetReset = rc::OffsetReset::Earliest;
     rc::GroupConsumer gc = cc->subscribeGroup("eos-kip447-g", {"eos.in"}, gcfg);
     gc.onRecords([&](const rc::RecordSet& rs) {
         rs.forEachRecord([&](std::string_view, std::string_view, int64_t off, int64_t) {
@@ -1350,7 +1359,6 @@ TEST(EosBrokerRegression, PipelineSurvivesTheCoordinatorCrashWithSeekToCommitted
     auto cc = std::make_unique<rc::Client>(e.cfg(seed, {in}));
     rc::GroupConfig gcfg;
     gcfg.autoCommit          = false;
-    gcfg.autoOffsetReset     = rc::OffsetReset::Earliest;
     gcfg.isolation           = rc::IsolationLevel::ReadCommitted;
     gcfg.sessionTimeoutMs    = 30'000;
     gcfg.commitSyncTimeoutMs = 30'000;
@@ -1437,7 +1445,6 @@ TEST(EosBrokerRegression, SeekToCommittedRightAfterTheCoordinatorCrashSucceedsWi
     auto cc = std::make_unique<rc::Client>(e.cfg(seed, {in}));
     rc::GroupConfig gcfg;
     gcfg.autoCommit       = false;
-    gcfg.autoOffsetReset  = rc::OffsetReset::Earliest;
     gcfg.sessionTimeoutMs = 10'000;
     rc::GroupConsumer gc = cc->subscribeGroup("eos-seek-g", {"eos.in"}, gcfg);
     gc.onRecords([](const rc::RecordSet&) {});
