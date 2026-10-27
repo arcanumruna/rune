@@ -35,6 +35,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -65,7 +66,8 @@ struct FieldValue {
 // THE SAME ORDER the CreateView planBlob declared them (ViewPlan::output
 // order == RowLayout slot order; see PlanCompiler.cpp). Throws
 // std::invalid_argument on a var-len type (String/Bytes) — Phase 1 columns
-// are fixed-width only.
+// are fixed-width only — or on a FixedStr column whose width is not given (or
+// is 0): a guessed width would shift every later column.
 inline RowLayout buildRowLayout(std::span<const rune::codec::PrimType> fieldTypesInOrder,
                                 std::span<const uint16_t> fixedStrWidths = {}) {
     for (const auto t : fieldTypesInOrder) {
@@ -89,7 +91,12 @@ inline RowLayout buildRowLayout(std::span<const rune::codec::PrimType> fieldType
         const auto t = fieldTypesInOrder[idx];
         uint32_t width = rune::codec::fixedSize(t);
         if (t == rune::codec::PrimType::FixedStr) {
-            width = (idx < fixedStrWidths.size()) ? fixedStrWidths[idx] : 0;
+            if (idx >= fixedStrWidths.size() || fixedStrWidths[idx] == 0) {
+                throw std::invalid_argument(
+                    "rune::client::view::buildRowLayout: FixedStr column " + std::to_string(idx) +
+                    " has no width (pass fixedStrWidths from the view's output descriptor)");
+            }
+            width = fixedStrWidths[idx];
         }
         layout.slotOffset.push_back(offset);
         layout.slotType.push_back(t);

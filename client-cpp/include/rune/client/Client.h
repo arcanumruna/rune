@@ -223,9 +223,9 @@ struct ViewRowResult {
     static constexpr uint16_t kNotAuthorized   = 45;  ///< the session may not READ the view (no bytes; never retried)
     /// Client-side only: the view's source-partition leader was not reached within
     /// the retry budget; never sent by a broker.  NB: a GetViewRow's deadline is
-    /// pingTimeoutMs (not ddlTimeoutMs); when that is shorter than ddlRetryBudget
-    /// (the defaults: 5 s < 10 s) a read that is never routed ends as a Timeout
-    /// (the *AndWait form throws), not as kNotLeader.
+    /// pingTimeoutMs (not ddlTimeoutMs) and its retry budget is viewReadRetryBudget;
+    /// with the defaults (5 s each) a read that is never routed ends as kNotLeader or
+    /// as a Timeout (the *AndWait form throws), whichever bound is hit first.
     static constexpr uint16_t kNotLeader       = 8;
 
     uint16_t              status = kUnknownView;
@@ -417,11 +417,16 @@ struct ClientConfig {
     // clientName: carried in every DDL's extension (DdlOptions::clientName
     // overrides it per call); the catalog event's principal records it.
     std::string clientName = "rune-client";
-    // ddlRetryBudget: how long a DDL answered NotLeader (a catalog leader change
+    // ddlRetryBudget: how long a DDL (never a view read) answered NotLeader (a catalog leader change
     // / a catching-up leader) is retried, with a 100 ms backoff doubling to 1 s,
     // before it fails explicitly (BrokerError NotLeader).  Bounded by the DDL's
     // own deadline (ddlTimeoutMs) too.
     std::chrono::milliseconds ddlRetryBudget{10'000};
+    // viewReadRetryBudget: how long a GetViewRow answered NotLeader / Redirect is
+    // re-sent (same 100 ms -> 1 s backoff as a DDL) before it ends as
+    // ViewRowResult::kNotLeader.  Bounded by the read's own deadline
+    // (pingTimeoutMs) too.  Independent of the DDL knobs (#76).
+    std::chrono::milliseconds viewReadRetryBudget{5'000};
     // ddlTimeoutMs: the deadline of EVERY DDL (DefineTopic, AlterTopic,
     // CreateView, DropTopic, DropView, AlterView, AlterTopicConfig) — the whole
     // op, its Redirect hops and NotLeader retries included; no answer by then ->
@@ -946,8 +951,8 @@ public:
                                        uint8_t persistence, std::span<const uint8_t> planBlob,
                                        std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
     /// Routing (Task 22 fix round 1): only the source partition's leader serves a row; a Redirect / NotLeader is followed
-    /// within min(pingTimeoutMs, ddlRetryBudget) and ends as ViewRowResult::kNotLeader, or as a Timeout (throws) when
-    /// pingTimeoutMs is the shorter of the two (the defaults).
+    /// within min(pingTimeoutMs, viewReadRetryBudget) and ends as ViewRowResult::kNotLeader, or as a Timeout (throws) when
+    /// pingTimeoutMs is the shorter of the two (with the defaults, 5 s each, whichever bound is hit first).
     /// Task 21: getViewRow(), blocking. A non-OK ViewRowResponse status (e.g.
     /// AbsentKey, NotReady, NotAuthorized) is returned in the result (not thrown) — only a
     /// transport-level failure (Timeout, NotConnected, SessionLost, Closed)
@@ -1162,7 +1167,7 @@ public:
     /// InvalidArgument, never sends {0,0}).
     void testSkewNextDdlRequestIdAt(uint32_t delta) noexcept { testSkewDdlRequestIdAt_ = delta; }
     /// Task 5 fix round 1: pending DDLs waiting for a resend (pump work); duty thread.
-    [[nodiscard]] int testDdlAwaitingResend() const noexcept { return ddlAwaitingResend_; }
+    [[nodiscard]] int testRoutedCtlAwaitingResend() const noexcept { return routedCtlAwaitingResend_; }
     /// Task 5 fix round 1 (M3): queue releases still deferred behind a ring fence.
     [[nodiscard]] std::size_t testDeferredReleases() const noexcept { return deferredReleases_.size(); }
     /// Test hook (duty thread only): pending control ops (connect included).
@@ -1319,9 +1324,10 @@ private:
     /// Redirected (no NotLeader seen) to a node whose session cannot take the
     /// frame yet (still connecting): re-offered every cycle until it does.
     struct DdlHeldForNode    { int redirects; };
+    // Shared by every routed control op (DDLs and GetViewRow), not DDL-only.
     using DdlRetry = std::variant<DdlUnsentOnSeed, DdlSent, DdlNotLeaderSeen, DdlAwaitingResend, DdlHeldForNode>;
     /// Everything only a DDL has (review M1: one variant on PendingCtl).
-    struct DdlPending {
+    struct RoutedCtlPending {
         std::vector<uint8_t> frame;          // the encoded request, re-sent verbatim (stable requestId)
         std::string          endpoint;       // the node it goes to ("" = the seed); a Redirect moves it
         uint32_t             requestLo = 0;  // the generated requestId's lo (0 = an explicit requestId)
@@ -1359,7 +1365,7 @@ private:
         /// seed was not Connected — its frame waits (on no session) for a Connected seed, inside the op's
         /// own deadline; it never reached a broker.
         struct CtlAwaitingSeed { std::vector<uint8_t> frame; };
-        std::variant<std::monostate, DdlPending, CtlAwaitingSeed> ddl;   // catalog history: a DDL's own state
+        std::variant<std::monostate, RoutedCtlPending, CtlAwaitingSeed> ddl;   // catalog history: a DDL's own state
         detail::SecretString newPassword;   // review B I4: a self SET PASSWORD's plaintext until its answer (wiped always)
     };
 
@@ -1564,11 +1570,11 @@ private:
                          uint16_t failCode = static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader));
     /// Offer d.frame to d.endpoint's node (the seed when ""); on Accepted, `on`
     /// names the session it went out on.
-    transport::AeronTransport::OfferResult offerDdl_(DdlPending& d, int64_t nowNs, DdlOfferedOn& on);
-    /// Move d to `next`, keeping ddlAwaitingResend_ exact.
-    void setDdlRetry_(DdlPending& d, DdlRetry next) noexcept;
-    /// ddlPending_ / ddlAwaitingResend_ for an entry entering (+1) / leaving (-1) the table.
-    void countDdl_(const PendingCtl& p, int sign) noexcept;
+    transport::AeronTransport::OfferResult offerDdl_(RoutedCtlPending& d, int64_t nowNs, DdlOfferedOn& on);
+    /// Move d to `next`, keeping routedCtlAwaitingResend_ exact.
+    void setDdlRetry_(RoutedCtlPending& d, DdlRetry next) noexcept;
+    /// routedCtlPending_ / routedCtlAwaitingResend_ for an entry entering (+1) / leaving (-1) the table.
+    void countRoutedCtl_(const PendingCtl& p, int sign) noexcept;
     /// A seed-session loss: every pending NON-DDL control op ends SessionLost (a
     /// DDL follows its own session: the pump re-sends it, same requestId).
     void failControlOnSeedLoss_(uint16_t errorCode, std::span<const uint8_t> text);
@@ -1579,7 +1585,7 @@ private:
     /// inside the NotLeader budget); every DDL whose resend is due (backoff
     /// elapsed, held for a connecting node, unsent on the seed) is re-offered;
     /// one refused past its budget fails explicitly.
-    int driveDdl_(int64_t nowNs);
+    int driveRoutedCtl_(int64_t nowNs);
     void applyControlOpRecord_(const uint8_t* rec, std::size_t len);
     void applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> frame);
     void completeCtl_(PendingCtl& p, OpStatus st, int64_t value = 0, int64_t aux = 0,
@@ -1988,8 +1994,8 @@ private:
     static uint64_t         drawClientInstanceId_();   // std::random_device, 2 x 32 bits, redrawn while 0
     const uint64_t          clientInstanceId_ = drawClientInstanceId_();
     uint32_t                requestCounter_ = 0;       // duty thread only: the requestId's lo (32-bit, never 0)
-    int                     ddlPending_ = 0;           // pendingCtl_ entries that are DDLs or routed control ops (GetViewRow)
-    int                     ddlAwaitingResend_ = 0;    // pending DDLs in a ddlWaitsForResend() state
+    int                     routedCtlPending_ = 0;           // pendingCtl_ entries that are routed control ops: DDLs and GetViewRow
+    int                     routedCtlAwaitingResend_ = 0;    // pending DDLs in a ddlWaitsForResend() state
     std::vector<DdlRetryNote> ddlRetryNotes_;          // duty thread; filled only under cfg_.traceDdlRetries
     std::size_t             ddlRetryNotesDropped_ = 0;
     void noteDdlRetry_(DdlRetryNote note);

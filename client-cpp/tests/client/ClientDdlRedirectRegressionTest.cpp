@@ -866,7 +866,7 @@ TEST(ClientDdlRedirectRegression, GetViewRowNotLeaderIsRetriedInsideTheBudgetThe
 
 TEST(ClientDdlRedirectRegression, GetViewRowNotLeaderPastTheBudgetIsKNotLeaderNeverNotReadyRegression) {
     rc::ClientConfig cfg = invokerCfg(4454, 4455);
-    cfg.ddlRetryBudget = std::chrono::milliseconds(400);
+    cfg.viewReadRetryBudget = std::chrono::milliseconds(400);
     Rig r(cfg);
     r.connect();
     r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
@@ -882,4 +882,53 @@ TEST(ClientDdlRedirectRegression, GetViewRowNotLeaderPastTheBudgetIsKNotLeaderNe
     EXPECT_EQ(f.getViewRowResult().status, rc::ViewRowResult::kNotLeader)
         << "the routing failure is the client-side kNotLeader (8), not NotReady (2) / SchemaMismatch (3)";
     EXPECT_LE(g_now - t0, int64_t{400'000'000} + int64_t{200'000'000}) << "within the budget + 200 ms";
+}
+
+TEST(ClientViewRowRegression, GetViewRowRetryBudgetIsNotTheDdlBudgetRegression) {
+    rc::ClientConfig cfg = invokerCfg(4812, 4813);
+    cfg.ddlRetryBudget = std::chrono::milliseconds(50);
+    cfg.viewReadRetryBudget = std::chrono::milliseconds(1000);
+    Rig r(cfg);
+    r.connect();
+    int n = 0;
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        if (n++ < 2) { r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId); return; }
+        answerViewRow(r, ep, *m, pc::ViewRowResponse::kAbsentKey, {});
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/20'000'000));
+    EXPECT_EQ(f.getViewRowResult().status, rc::ViewRowResult::kAbsentKey)
+        << "a read is retried for viewReadRetryBudget, not the (shorter) DDL budget";
+    EXPECT_EQ(n, 3);
+}
+
+TEST(ClientViewRowRegression, GetViewRowDeadlineIsNotTheDdlDeadlineRegression) {
+    rc::ClientConfig cfg = invokerCfg(4814, 4815);
+    cfg.ddlTimeoutMs = 100;
+    cfg.pingTimeoutMs = 2000;
+    Rig r(cfg);
+    r.connect();
+    int seenEp = -1;
+    std::optional<pc::GetViewRow> seen;
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        seenEp = ep;
+        seen = *m;
+    };
+    test_support::TestCq cq(r.client);
+    const int64_t t0 = g_now;
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return g_now - t0 >= 500'000'000; }, /*stepNs=*/20'000'000));
+    ASSERT_TRUE(seen.has_value());
+    EXPECT_FALSE(f.ready()) << "a read is not bounded by the DDL deadline";
+    answerViewRow(r, seenEp, *seen, pc::ViewRowResponse::kAbsentKey, {});
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/20'000'000));
+    EXPECT_EQ(f.getViewRowResult().status, rc::ViewRowResult::kAbsentKey);
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::BrokerError) << "the OpStatus a non-OK view status carries (as in the kNotLeader test)";
 }

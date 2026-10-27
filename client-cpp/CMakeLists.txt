@@ -1079,6 +1079,7 @@ if(BUILD_TESTING)
     add_executable(rune_schema_codec_smoke_tests
         tests/SchemaCodecSmokeTest.cpp
         tests/client/ViewPlanAuthorTest.cpp
+        tests/client/ViewRowCodecTest.cpp
         tests/client/PlayerEventSchemaTest.cpp   # Phase 2c Task 4
     )
     target_include_directories(rune_schema_codec_smoke_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include "${RUNE_CLAIM_GEN_DIR}/gen")

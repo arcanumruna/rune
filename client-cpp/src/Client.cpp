@@ -1778,7 +1778,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
         // Catalog history (F14): the requestId is stamped HERE, by the duty
         // thread that owns the counter, then kept with the frame — every resend
         // (Redirect / NotLeader / a lost session) re-offers these exact bytes.
-        DdlPending d;
+        RoutedCtlPending d;
         if (h.requestIdAt != 0) {
             if (std::size_t{h.requestIdAt} + 16u > ctlScratch_.size()) [[unlikely]] {
                 // F4: the stamp would not fit (issue-time decode check bypassed):
@@ -1808,7 +1808,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
             return;
         }
         p.ddl = std::move(d);
-        countDdl_(p, +1);
+        countRoutedCtl_(p, +1);
         pendingCtl_.push_back(std::move(p));
         return;
     }
@@ -1844,7 +1844,7 @@ void Client::completeCtl_(PendingCtl& p, OpStatus st, int64_t value, int64_t aux
     c.errorCode = errorCode;
     c.reserved0 = reserved0;   // GetTopicSchema: partitionCount (Phase 2b C)
     // Catalog history: a DDL reports its generated requestId's lo (requestIdOf).
-    if (const auto* d = std::get_if<DdlPending>(&p.ddl)) c.reserved0 = d->requestLo;
+    if (const auto* d = std::get_if<RoutedCtlPending>(&p.ddl)) c.reserved0 = d->requestLo;
     deliver_(p.target, c, payload, ov);
 }
 
@@ -1854,7 +1854,7 @@ Client::PendingCtl Client::takeCtl_(std::size_t i) {
     pendingCtl_.erase(pendingCtl_.begin() + static_cast<std::ptrdiff_t>(i));
     if (!p.unsentFrame.empty()) --unsentCtl_;
     if (std::holds_alternative<PendingCtl::CtlAwaitingSeed>(p.ddl)) --ctlAwaitingSeed_;   // I-1
-    countDdl_(p, -1);
+    countRoutedCtl_(p, -1);
     return p;
 }
 
@@ -1929,21 +1929,21 @@ int Client::driveAwaitingSeed_() {
 // resend pump.  Duty thread; cold.  Every path ends in exactly one completion.
 // ---------------------------------------------------------------------------
 
-void Client::setDdlRetry_(DdlPending& d, DdlRetry next) noexcept {
-    ddlAwaitingResend_ += (ddlWaitsForResend(next) ? 1 : 0) - (ddlWaitsForResend(d.retry) ? 1 : 0);
+void Client::setDdlRetry_(RoutedCtlPending& d, DdlRetry next) noexcept {
+    routedCtlAwaitingResend_ += (ddlWaitsForResend(next) ? 1 : 0) - (ddlWaitsForResend(d.retry) ? 1 : 0);
     d.retry = std::move(next);
 }
 
-void Client::countDdl_(const PendingCtl& p, int sign) noexcept {
-    const auto* d = std::get_if<DdlPending>(&p.ddl);
+void Client::countRoutedCtl_(const PendingCtl& p, int sign) noexcept {
+    const auto* d = std::get_if<RoutedCtlPending>(&p.ddl);
     if (d == nullptr) return;
-    ddlPending_ += sign;
-    if (ddlWaitsForResend(d->retry)) ddlAwaitingResend_ += sign;
+    routedCtlPending_ += sign;
+    if (ddlWaitsForResend(d->retry)) routedCtlAwaitingResend_ += sign;
 }
 
 void Client::failControlOnSeedLoss_(uint16_t errorCode, std::span<const uint8_t> text) {
     for (std::size_t i = pendingCtl_.size(); i-- > 0;) {
-        if (std::holds_alternative<DdlPending>(pendingCtl_[i].ddl)) continue;   // follows its own session (I1)
+        if (std::holds_alternative<RoutedCtlPending>(pendingCtl_[i].ddl)) continue;   // follows its own session (I1)
         if (std::holds_alternative<PendingCtl::CtlAwaitingSeed>(pendingCtl_[i].ddl)) continue;   // on no session (I-1)
         if (!pendingCtl_[i].unsentFrame.empty()) {
             // Fix round 2 (I-1): never sent (the transport refused it) — it reached no
@@ -1961,7 +1961,7 @@ void Client::failControlOnSeedLoss_(uint16_t errorCode, std::span<const uint8_t>
     }
 }
 
-transport::AeronTransport::OfferResult Client::offerDdl_(DdlPending& d, int64_t nowNs, DdlOfferedOn& on) {
+transport::AeronTransport::OfferResult Client::offerDdl_(RoutedCtlPending& d, int64_t nowNs, DdlOfferedOn& on) {
     uint32_t idx = 0;
     const auto r = agent_.offerToEndpoint(d.endpoint, d.frame.data(), d.frame.size(), nowNs, idx);
     // #290: the node session is named on a refusal too (its epoch is 0 then) — a Rejected one ends the DDL.
@@ -1989,7 +1989,7 @@ constexpr int64_t kDdlMaxBackoffNs     = 1'000'000'000;   // 1 s
 void Client::onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t nowNs) {
     using Offer = transport::AeronTransport::OfferResult;
     PendingCtl& p = pendingCtl_[i];
-    DdlPending& d = std::get<DdlPending>(p.ddl);
+    RoutedCtlPending& d = std::get<RoutedCtlPending>(p.ddl);
     if (endpoint.empty()) {   // a Redirect that names no node: nothing to follow — retriable as NotLeader
         onDdlNotLeader_(i, "redirect without a leader endpoint", nowNs);
         return;
@@ -2031,7 +2031,7 @@ void Client::onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t no
 
 void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t nowNs, uint16_t failCode) {
     PendingCtl& p = pendingCtl_[i];
-    DdlPending& d = std::get<DdlPending>(p.ddl);
+    RoutedCtlPending& d = std::get<RoutedCtlPending>(p.ddl);
     int     redirects   = 0;
     int64_t budgetEndNs = 0;
     int64_t backoffNs   = 0;
@@ -2039,7 +2039,7 @@ void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t now
         redirects   = st->redirects;
         budgetEndNs = std::min(p.deadlineNs, nowNs + static_cast<int64_t>(
                                                          std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                             cfg_.ddlRetryBudget).count()));
+                                                             (isDdlOp(p.op) ? cfg_.ddlRetryBudget : cfg_.viewReadRetryBudget)).count()));
         backoffNs   = kDdlInitialBackoffNs;
     } else if (const auto* n = std::get_if<DdlNotLeaderSeen>(&d.retry)) {
         redirects   = n->redirects;
@@ -2080,12 +2080,12 @@ std::size_t Client::takeDdlRetryNotes(std::vector<DdlRetryNote>& out) {
     return std::exchange(ddlRetryNotesDropped_, 0);
 }
 
-int Client::driveDdl_(int64_t nowNs) {
+int Client::driveRoutedCtl_(int64_t nowNs) {
     using Offer = transport::AeronTransport::OfferResult;
     int work = 0;
     for (std::size_t i = 0; i < pendingCtl_.size();) {
         PendingCtl& p = pendingCtl_[i];
-        auto* d = std::get_if<DdlPending>(&p.ddl);
+        auto* d = std::get_if<RoutedCtlPending>(&p.ddl);
         if (d == nullptr) { ++i; continue; }
         // I1: an in-flight DDL whose session left its connect episode (a
         // session-fatal answer naming it, a stale loss, a transport drop, a
@@ -2101,7 +2101,7 @@ int Client::driveDdl_(int64_t nowNs) {
             redirects = st->redirects;
             budgetEndNs = std::min(p.deadlineNs, nowNs + static_cast<int64_t>(
                                                              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                                 cfg_.ddlRetryBudget).count()));
+                                                                 (isDdlOp(p.op) ? cfg_.ddlRetryBudget : cfg_.viewReadRetryBudget)).count()));
         } else if (const auto* n = std::get_if<DdlNotLeaderSeen>(&d->retry)) {
             on = &n->on;
             redirects = n->redirects;
@@ -3131,7 +3131,7 @@ int Client::dutyCycle(int64_t nowNs) {
     if (!redirectedSubscribes_.empty()) [[unlikely]] work += retryRedirectedSubscribes_(nowNs);
     // Catalog history (Task 5): pending DDLs — a lost session's DDL re-sent
     // toward the seed, due resends offered (one branch when none).
-    if (ddlPending_ != 0) [[unlikely]] work += driveDdl_(nowNs);
+    if (routedCtlPending_ != 0) [[unlikely]] work += driveRoutedCtl_(nowNs);
     if (!heldRedirectFollows_.empty()) [[unlikely]] work += releaseHeldRedirectFollows_();   // R3
     // E2 final fix wave (I2): moved subscriptions on their leader node's own
     // session — held Subscribes flushed, a lost session's ones re-armed.

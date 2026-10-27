@@ -12,6 +12,7 @@
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
 #include <rune/catalog/CatalogEvent.h>
+#include <rune/catalog/CatalogFingerprint.h>
 #include <rune/catalog/CatalogReplayer.h>
 #include <rune/catalog/testing/GoldenScript.h>
 #include <rune/client/Client.h>
@@ -342,6 +343,33 @@ TEST(CatalogReaderRegression, SecondRefreshFetchesOnlyTheNewTail) {
         << "the replayed prefix is cached: the epoch is unchanged, so the read continues at the cache end";
     expectCacheIs(reader, log);
     EXPECT_EQ(reader.stats().epochChanges, 0u);
+}
+
+// #600: a view sink mirrors its first source's partition count; the shared verified replay (ApplyV1) refuses a
+// CreateView whose sinkPartitions differs, so the client's reader stops loudly at that event's offset.  Golden offset 9
+// (CreateView over players, 8 partitions) with a 3-partition sink, fingerprinted as the object it would create:
+// without the rule it would replay cleanly.  (The blocking catalogAsOf shares this reader; no invoker-rig sibling
+// drives it, so only the non-blocking reader is attacked here.)
+TEST(CatalogReaderRegression, AViewSinkWithAMismatchedPartitionCountIsAReplayErrorAtItsOffsetRegression) {
+    Rig r(invokerCfg(4816, 4817)); r.connect();
+    auto log = rcat::testing::goldenScriptV1();
+    auto& ev = log.at(9);
+    ASSERT_EQ(ev.kind, rcat::EventKind::CreateView);
+    auto& ops = std::get<rcat::CreateViewOps>(ev.ops);
+    ASSERT_EQ(ops.view.sourceNames.front(), "players");
+    ops.view.sinkPartitions = 3;
+    ev.fingerprint = rcat::fingerprintOf(rcat::ViewObject{.objectId = ev.objectId, .name = ev.objectName,
+                                                          .version = ev.newVersion, .def = ops.view});
+    CatalogFeed feed(r.gw, log);
+    rc::CatalogReader reader(r.client);
+    auto done = refreshOnce(r, reader, 5'000'000'000);
+    ASSERT_TRUE(done.has_value());
+    ASSERT_FALSE(done->has_value());
+    EXPECT_EQ(done->error().kind, rc::CatalogReadError::Kind::Replay);
+    EXPECT_EQ(done->error().offset, 9);
+    EXPECT_NE(done->error().detail.find("sink partitions 3"), std::string::npos) << done->error().detail;
+    EXPECT_NE(done->error().detail.find("source 'players' has 8"), std::string::npos) << done->error().detail;
+    EXPECT_EQ(reader.events().size(), 9u) << "the verified prefix only";
 }
 
 TEST(CatalogReaderRegression, TamperedEventIsAReplayErrorNamingItsOffset) {

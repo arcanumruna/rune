@@ -257,7 +257,7 @@ TEST_P(ClientDdlTimingMatrixRegression, ExactlyOneCompletionAndNoLeftoverState) 
     test_support::TestCq cq(r.client);
     auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return issue(r.client, op, q, t); });
     ASSERT_TRUE(f.accepted());
-    auto awaiting = [&] { return r.client.testDdlAwaitingResend() == 1; };
+    auto awaiting = [&] { return r.client.testRoutedCtlAwaitingResend() == 1; };
     bool closed = false;
 
     switch (timing) {
@@ -280,7 +280,7 @@ TEST_P(ClientDdlTimingMatrixRegression, ExactlyOneCompletionAndNoLeftoverState) 
         r.answerError(0, pc::ErrorCode::Redirect, nowhere, at[0].sid, at[0].corr);
         r.passes(200);
         ASSERT_FALSE(f.ready()) << f.describe();
-        EXPECT_EQ(r.client.testDdlAwaitingResend(), 1);
+        EXPECT_EQ(r.client.testRoutedCtlAwaitingResend(), 1);
         ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/10'000'000));
         break;
     case Timing::FatalOfferOnResend:
@@ -358,7 +358,7 @@ TEST_P(ClientDdlTimingMatrixRegression, ExactlyOneCompletionAndNoLeftoverState) 
     // the DDL bookkeeping is back to zero.
     if (!closed) r.passes(300, 10'000'000);
     EXPECT_EQ(cq.timesCompleted(f.token()), 1);
-    EXPECT_EQ(r.client.testDdlAwaitingResend(), 0);
+    EXPECT_EQ(r.client.testRoutedCtlAwaitingResend(), 0);
     EXPECT_EQ(r.client.testPendingControlOps(), 0u);
 }
 
@@ -525,7 +525,7 @@ TEST(ClientDdlRedirectRegression, BrokerSilentlyForgetsTheSessionMidDdlEndsInOne
     EXPECT_GT(r.gw.connects, connectsBefore) << "the stale session was re-established";
     r.passes(300, 10'000'000);
     EXPECT_EQ(cq.timesCompleted(f.token()), 1);
-    EXPECT_EQ(r.client.testDdlAwaitingResend(), 0);
+    EXPECT_EQ(r.client.testRoutedCtlAwaitingResend(), 0);
     EXPECT_EQ(r.client.testPendingControlOps(), 0u);
 }
 
@@ -552,6 +552,6 @@ TEST(ClientDdlRedirectRegression, BrokerSilentlyForgetsTheSessionAndNeverReaccep
     EXPECT_EQ(at.size(), 1u);
     r.passes(300, 10'000'000);
     EXPECT_EQ(cq.timesCompleted(f.token()), 1);
-    EXPECT_EQ(r.client.testDdlAwaitingResend(), 0);
+    EXPECT_EQ(r.client.testRoutedCtlAwaitingResend(), 0);
     EXPECT_EQ(r.client.testPendingControlOps(), 0u);
 }
