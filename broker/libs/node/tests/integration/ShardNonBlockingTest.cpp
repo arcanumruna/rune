@@ -3563,17 +3563,21 @@ TEST(SegmentProvisionerRegression, ParkedDemandOfARetiredLogIsDiscardedRegressio
     EXPECT_EQ(prov.parkedDroppedForTest(), 100u);
 }
 
-TEST(SegmentProvisionerRegression, MetricsArePublishedThroughTheSinkRegression) {
-    // Re-review N4: build failures, roll holds, unpreallocated builds and
-    // dropped demands reach the metric sink (BrokerNode: Aeron counters).
+TEST(SegmentProvisionerRegression, MetricsArePublishedThroughItsOwnSlotsRegression) {
+    // Re-review N4 / arcanum-metrics D59: build failures, roll holds, unpreallocated builds, dropped demands and
+    // read-map failures reach the provisioner's own metric slots (handed in at construction, written with the
+    // Provisioner owner tag) — no sink callback, no lazy counter lookup.
     Reg R;
     NoopConsensus noop;
     NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
-    SegmentProvisionerAgent prov(1);
-    std::array<int64_t, SegmentProvisionerAgent::kMetricCount> seen{};
-    prov.setMetricSink([](void* c, int m, int64_t v) noexcept {
-        (*static_cast<std::array<int64_t, SegmentProvisionerAgent::kMetricCount>*>(c))[static_cast<std::size_t>(m)] = v;
-    }, &seen);
+    std::array<int64_t, SegmentProvisionerAgent::kMetricCount> vals{};
+    std::array<std::uint8_t, SegmentProvisionerAgent::kMetricCount> writtenBy{};
+    SegmentProvisionerAgent::MetricSlots slots{};
+    for (int i = 0; i < SegmentProvisionerAgent::kMetricCount; ++i) {
+        const auto u = static_cast<std::size_t>(i);
+        slots[u] = RuneMetricSlot{metrics::SlotWriter(&vals[u], i), MetricOwner::Provisioner, &writtenBy[u]};
+    }
+    SegmentProvisionerAgent prov(1, 0, {}, 10, slots);
     prov.attachViewChannel(rt.enableProvisionerView());
     PartitionReplica* r = R.add(5, 0);
     rt.doWork(1);
@@ -3582,8 +3586,20 @@ TEST(SegmentProvisionerRegression, MetricsArePublishedThroughTheSinkRegression) 
     auto* ch = prov.channel();
     ASSERT_TRUE(postDemandForTest(ch, r->log(), Log::ProvisionDemand::Hold));
     prov.doWork(2);
-    EXPECT_EQ(seen[SegmentProvisionerAgent::kMetricRollHolds], 1);
-    EXPECT_EQ(seen[SegmentProvisionerAgent::kMetricBuildFailures], 1);
+    EXPECT_EQ(vals[SegmentProvisionerAgent::kMetricRollHolds], 1);
+    EXPECT_EQ(vals[SegmentProvisionerAgent::kMetricBuildFailures], 1);
+    EXPECT_EQ(vals[SegmentProvisionerAgent::kMetricRollHolds], static_cast<int64_t>(prov.rollHoldsForTest()));
+    EXPECT_EQ(vals[SegmentProvisionerAgent::kMetricBuildFailures], static_cast<int64_t>(prov.failuresForTest()));
+    EXPECT_EQ(vals[SegmentProvisionerAgent::kMetricUnpreallocatedBuilds],
+              static_cast<int64_t>(prov.unpreallocatedForTest()));
+    EXPECT_EQ(vals[SegmentProvisionerAgent::kMetricParkedDropped], static_cast<int64_t>(prov.parkedDroppedForTest()));
+    EXPECT_EQ(vals[SegmentProvisionerAgent::kMetricReadMapFailures],
+              static_cast<int64_t>(prov.readMapFailuresForTest()));
+#ifndef NDEBUG
+    for (std::size_t i = 0; i < writtenBy.size(); ++i)
+        EXPECT_EQ(writtenBy[i] & ~metricOwnerBit(MetricOwner::Provisioner), 0) << "row " << i << " written off-owner";
+    EXPECT_NE(writtenBy[SegmentProvisionerAgent::kMetricRollHolds], 0);
+#endif
 }
 
 TEST(SegmentProvisionerRegression, ADemandWakesAParkedProvisionerRegression) {

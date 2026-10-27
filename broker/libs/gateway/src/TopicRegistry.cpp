@@ -1,6 +1,7 @@
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/catalog/TopicName.h>
 #include <rune/gateway/TopicDirMarker.h>
+#include <rune/node/NamespacePaths.h>
 
 #include <spdlog/spdlog.h>
 
@@ -25,14 +26,14 @@ TopicRegistry::TopicRegistry(
 
     for (const auto& spec : topics) {
         // Idempotent by name: a repeated static name is one topic.
-        if (nameIndex_.contains(spec.name)) {
+        if (nameIndex_.find(NsNameView{spec.nsId, spec.name}) != nameIndex_.end()) {
             spdlog::debug("TopicRegistry: static topic='{}' listed twice — one topic", spec.name);
             continue;
         }
         const auto id = static_cast<int32_t>(topics_.size());
         Live live = buildLive_(spec, id);
         topics_.emplace_back(std::in_place_type<Static>, Static{std::move(live)});
-        nameIndex_.emplace(spec.name, id);
+        nameIndex_.emplace(NsName{spec.nsId, spec.name}, id);
         ++catalogGeneration_;
     }
 
@@ -42,7 +43,7 @@ TopicRegistry::TopicRegistry(
 TopicRegistry::Live
 TopicRegistry::buildLive_(const rune::node::TopicSpec& spec, int32_t id)
 {
-    const fs::path root{dataDir_};
+    const fs::path root = rune::node::topicsRoot(fs::path{dataDir_}, spec.nsId);
 
     Live live;
     live.spec         = spec;
@@ -63,8 +64,8 @@ TopicRegistry::buildLive_(const rune::node::TopicSpec& spec, int32_t id)
             continue;
         }
 
-        // dataDir/topics/<name>/<partition>/
-        fs::path partDir = root / "topics" / spec.name / std::to_string(p);
+        // dataDir/ns-<nsId>/topics/<name>/<partition>/
+        fs::path partDir = root / spec.name / std::to_string(p);
 
         std::error_code ec;
         fs::create_directories(partDir, ec);
@@ -134,9 +135,9 @@ TopicRegistry::createTopicAt(int32_t topicId, const rune::node::TopicSpec& spec)
         }
         // Gap, or the Pending slot of this very create: filled below.
     }
-    if (const auto it = nameIndex_.find(spec.name); it != nameIndex_.end()) {
-        spdlog::error("TopicRegistry::createTopicAt: name '{}' is held by live id={}, refused for id={}",
-                      spec.name, it->second, topicId);
+    if (const auto it = nameIndex_.find(NsNameView{spec.nsId, spec.name}); it != nameIndex_.end()) {
+        spdlog::error("TopicRegistry::createTopicAt: name '{}' (ns {}) is held by live id={}, refused for id={}",
+                      spec.name, spec.nsId, it->second, topicId);
         return -1;
     }
 
@@ -144,7 +145,7 @@ TopicRegistry::createTopicAt(int32_t topicId, const rune::node::TopicSpec& spec)
         fillGapsBelow_(slot);
         if (slot < topics_.size()) topics_[slot].emplace<ViewSink>(ViewSink{spec});
         else                       topics_.emplace_back(std::in_place_type<ViewSink>, ViewSink{spec});
-        nameIndex_.emplace(spec.name, topicId);
+        nameIndex_.emplace(NsName{spec.nsId, spec.name}, topicId);
         ++catalogGeneration_;
         spdlog::info("TopicRegistry::createTopicAt: view sink='{}' id={} partitions={} (catalog-only, no replica)",
                      spec.name, topicId, spec.partitionCount);
@@ -155,7 +156,7 @@ TopicRegistry::createTopicAt(int32_t topicId, const rune::node::TopicSpec& spec)
     // marker, written durably before any partition dir exists).  The idempotent re-post above returns
     // before this block, so it never re-reads the disk.
     if (spec.persistence != rune::node::PersistenceMode::Transient) {
-        const fs::path dir = fs::path{dataDir_} / "topics" / spec.name;
+        const fs::path dir = rune::node::topicsRoot(fs::path{dataDir_}, spec.nsId) / spec.name;
         std::error_code ec;
         const fs::file_status st = fs::symlink_status(dir, ec);
         if (!fs::exists(st)) {
@@ -192,7 +193,7 @@ TopicRegistry::createTopicAt(int32_t topicId, const rune::node::TopicSpec& spec)
     fillGapsBelow_(slot);                    // ids this broker has not seen (yet): Gap, fillable
     if (slot < topics_.size()) topics_[slot].emplace<Serving>(Serving{std::move(live)});
     else                       topics_.emplace_back(std::in_place_type<Serving>, Serving{std::move(live)});
-    nameIndex_.emplace(spec.name, topicId);
+    nameIndex_.emplace(NsName{spec.nsId, spec.name}, topicId);
     ++catalogGeneration_;
     spdlog::info("TopicRegistry::createTopicAt: topic='{}' id={} partitions={} (catalog)",
                  spec.name, topicId, spec.partitionCount);
@@ -240,7 +241,8 @@ TopicRegistry::dropTopic(int32_t topicId)
     Slot& e = topics_[static_cast<std::size_t>(topicId)];
     if (std::holds_alternative<Dropped>(e)) return false;
     if (auto* vs = std::get_if<ViewSink>(&e)) {   // no Logs to hold: Dropped at once
-        if (const auto it = nameIndex_.find(vs->spec.name); it != nameIndex_.end() && it->second == topicId)
+        if (const auto it = nameIndex_.find(NsNameView{vs->spec.nsId, vs->spec.name});
+            it != nameIndex_.end() && it->second == topicId)
             nameIndex_.erase(it);
         rune::node::TopicSpec sp = std::move(vs->spec);
         e.emplace<Dropped>(Dropped{std::move(sp), {}});
@@ -256,7 +258,8 @@ TopicRegistry::dropTopic(int32_t topicId)
         ++catalogGeneration_;
         return true;
     }
-    if (const auto it = nameIndex_.find(l->spec.name); it != nameIndex_.end() && it->second == topicId)
+    if (const auto it = nameIndex_.find(NsNameView{l->spec.nsId, l->spec.name});
+        it != nameIndex_.end() && it->second == topicId)
         nameIndex_.erase(it);
     const std::string name = l->spec.name;
     Dropped d{std::move(l->spec), std::move(l->partitions)};
@@ -288,9 +291,9 @@ TopicRegistry::servableLog(int32_t topicId, int32_t partition) noexcept
 // TopicRegistry::topicIdForName
 // ---------------------------------------------------------------------------
 std::optional<int32_t>
-TopicRegistry::topicIdForName(std::string_view name) const
+TopicRegistry::topicIdForName(uint32_t nsId, std::string_view name) const
 {
-    auto it = nameIndex_.find(std::string(name));
+    auto it = nameIndex_.find(NsNameView{nsId, name});
     if (it == nameIndex_.end()) return std::nullopt;
     return it->second;
 }
@@ -299,10 +302,10 @@ TopicRegistry::topicIdForName(std::string_view name) const
 // TopicRegistry::topicIdForFoldedName (DDL conformance B3)
 // ---------------------------------------------------------------------------
 std::optional<int32_t>
-TopicRegistry::topicIdForFoldedName(std::string_view name) const
+TopicRegistry::topicIdForFoldedName(uint32_t nsId, std::string_view name) const
 {
-    for (const auto& [n, id] : nameIndex_) {
-        if (n != name && rune::catalog::topicNamesFoldEqual(n, name)) return id;
+    for (const auto& [k, id] : nameIndex_) {
+        if (k.nsId == nsId && k.name != name && rune::catalog::topicNamesFoldEqual(k.name, name)) return id;
     }
     return std::nullopt;
 }

@@ -42,8 +42,8 @@ TEST(ClientSessionRevokedBrokerRegression, InFlightRequestsAndSubscriptionsCompl
     for (int i = 0; i < 400 && sub.subscriptionId() == 0; ++i) std::this_thread::sleep_for(25ms);
     ASSERT_NE(sub.subscriptionId(), 0) << "bound on the broker";
     std::this_thread::sleep_for(300ms);
-    const auto loginsBefore = b.counter(kLoginsOkCounterTypeId).value_or(-1);
-    const auto failedBefore = b.counter(kLoginsFailedCounterTypeId).value_or(-1);
+    const auto loginsBefore = b.counter(typeIdOf(RuneMetric::LoginsOk)).value_or(-1);
+    const auto failedBefore = b.counter(typeIdOf(RuneMetric::LoginsFailed)).value_or(-1);
 
     ASSERT_EQ(b.admin().alterPassword(b.channel(), b.adminSession(), name, pc::UserChangeKind::Disable).errorCode, 0);
 
@@ -54,8 +54,8 @@ TEST(ClientSessionRevokedBrokerRegression, InFlightRequestsAndSubscriptionsCompl
     // Nothing reconnects: the user is disabled, so a reconnect would only log in-and-fail; the login counter must stay put
     // and no failed login may appear.
     std::this_thread::sleep_for(1500ms);
-    EXPECT_EQ(b.counter(kLoginsOkCounterTypeId).value_or(-2), loginsBefore) << "no new session";
-    EXPECT_EQ(b.counter(kLoginsFailedCounterTypeId).value_or(-2), failedBefore) << "and no reconnect attempt either";
-    EXPECT_GE(b.counter(kSessionsRevokedCounterTypeId).value_or(0), 2) << "the harness session and the client's (counter 232)";
+    EXPECT_EQ(b.counter(typeIdOf(RuneMetric::LoginsOk)).value_or(-2), loginsBefore) << "no new session";
+    EXPECT_EQ(b.counter(typeIdOf(RuneMetric::LoginsFailed)).value_or(-2), failedBefore) << "and no reconnect attempt either";
+    EXPECT_GE(b.counter(typeIdOf(RuneMetric::SessionsRevoked)).value_or(0), 2) << "the harness session and the client's (counter 232)";
     client.closeImmediately();
 }

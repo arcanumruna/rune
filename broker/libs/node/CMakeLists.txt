@@ -61,9 +61,12 @@ target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordina
 # (rune::view::kViewCheckpointMagic) -- node -> view is the sanctioned
 # dependency direction (libs/view must NEVER depend on libs/node).
 target_link_libraries(rune_node PUBLIC rune_view)
+# arcanum-metrics plan Task 7: the node publishes its metrics file through the header-only `metrics` lib.
+target_link_libraries(rune_node PUBLIC metrics)
 # Catalog history Task 7: the CatalogApplier folds __catalog through the shared
 # rune_catalog library (decode / apply / fingerprints — one set of frozen rules).
 target_link_libraries(rune_node PUBLIC rune_catalog)
+target_compile_options(rune_node PRIVATE -Werror=switch)   # every enum switch names every enumerator (Checkpoint A F2)
 # Authentication plan Task 9: the SecurityApplier folds __security through rune_security; cluster keys via rune_peerlink.
 target_link_libraries(rune_node PUBLIC rune_security rune_peerlink)
 if(aeron_FOUND)
@@ -180,6 +183,7 @@ if(BUILD_TESTING)
         tests/node/ViewReadinessRegressionTest.cpp
         tests/node/ViewRecoveryRegressionTest.cpp
         tests/node/CatalogApplierTest.cpp
+        tests/node/NamespaceMirrorTest.cpp
         tests/node/ViewSinkRegressionTest.cpp
         tests/node/SecurityApplierTest.cpp
         tests/node/SecurityReadServerTest.cpp
@@ -366,7 +370,7 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_produce_path_tests
         PROPERTIES TIMEOUT 60)
 
-    # RoleCounter wire-encoding unit tests (pure header — no Aeron driver).
+    # Role-metric (RuneMetrics.h) wire-encoding unit tests (pure header — no Aeron driver).
     add_executable(rune_role_counter_tests
         tests/node/RoleCounterTest.cpp)
     target_link_libraries(rune_role_counter_tests PRIVATE
@@ -1300,9 +1304,9 @@ if(BUILD_TESTING)
             target_link_libraries(rune_d9_cross_node_marker_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_d9_cross_node_marker_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
-            # RoleCounter publish→read integration test: BrokerNode publishes the
-            # Aeron node-role/term counters; CncFileReader reads them back (the
-            # rune_role path).  Embeds the media driver → gated with the others.
+            # Role-metric publish→read integration test: BrokerNode publishes the
+            # node-role/term metrics to its metrics file; MetricsReader reads them
+            # back (the rune_role path).  Embeds the media driver → gated with the others.
             add_executable(rune_role_counter_publish_tests
                 tests/integration/RoleCounterPublishTest.cpp)
             target_include_directories(rune_role_counter_publish_tests PRIVATE
@@ -1784,6 +1788,14 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_client_broker_tests TEST_FILTER "-${RUNE_CLIENT_BROKER_LATENCY_TESTS}"
                              PROPERTIES TIMEOUT 600)
 
+        # Namespaces Task 11: the REAL client namespace API and the REAL `rune namespace` / `rune ql` CLI against ONE
+        # real authenticating BrokerNode.
+        add_executable(rune_namespace_client_tests tests/client/NamespaceClientTest.cpp)
+        target_include_directories(rune_namespace_client_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_client_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_client_tests PROPERTIES TIMEOUT 600)
+
         # Authentication Task 11: the SCRAM login in the session handshake against ONE real authenticating broker
         # (raw frames: AuthWireClient + the rune-crypto SCRAM client).
         add_executable(rune_auth_login_tests tests/node/AuthLoginTest.cpp)
@@ -1914,6 +1926,51 @@ if(BUILD_TESTING)
         target_include_directories(rune_catalog_boot_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_catalog_boot_tests PRIVATE rune_node rune_view rune_codec aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_catalog_boot_tests PROPERTIES TIMEOUT 360)
+
+        # Namespaces Task 6 (D14): the disk layout <dataDir>/ns-<nsId>/topics/<name>/ — NamespacePaths, the
+        # per-namespace boot reconcile, and one topic name in two namespaces on a real single-node broker.
+        add_executable(rune_namespace_disk_tests tests/node/NamespaceDiskTest.cpp)
+        target_include_directories(rune_namespace_disk_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_disk_tests PRIVATE rune_node rune_view rune_codec aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_disk_tests PROPERTIES TIMEOUT 360)
+        add_executable(rune_namespace_admin_tests tests/node/NamespaceAdminTest.cpp)
+        target_include_directories(rune_namespace_admin_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_admin_tests PRIVATE rune_node rune_view rune_replication rune_codec aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_admin_tests PROPERTIES TIMEOUT 360)
+        # Namespaces Task 8 (spec §4): the `__security` leader's namespace resolution and guard (no escalation).
+        add_executable(rune_namespace_escalation_tests tests/node/NamespaceEscalationTest.cpp)
+        target_include_directories(rune_namespace_escalation_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_escalation_tests PRIVATE rune_node rune_view rune_replication rune_codec aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_escalation_tests PROPERTIES TIMEOUT 360)
+        # Namespaces Task 9 (spec §2, §11): the session's namespace from the login (`ns/user`), anonymous read.
+        add_executable(rune_namespace_login_tests tests/node/NamespaceLoginTest.cpp)
+        target_include_directories(rune_namespace_login_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_login_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_login_tests PROPERTIES TIMEOUT 360)
+
+        # Namespaces Task 10: the gateway resolves every name against the session's namespace (D7, D9), a foreign
+        # namespace answers like a missing one, listings are filtered, groups / transactions exist only in default (D8).
+        add_executable(rune_namespace_gateway_tests tests/node/NamespaceGatewayTest.cpp tests/support/AllocWindow.cpp)
+        target_include_directories(rune_namespace_gateway_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_gateway_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_gateway_tests PROPERTIES TIMEOUT 360)
+
+        # Namespaces Task 12: the Op x Caller x Target matrix (support/NamespaceMatrixExpectations.h) on one real broker.
+        add_executable(rune_namespace_matrix_tests tests/node/NamespaceMatrixTest.cpp)
+        target_include_directories(rune_namespace_matrix_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_matrix_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_matrix_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900 LABELS small)
+        rune_regression_batches(rune_namespace_matrix_tests 2)
+        # Namespaces Task 13 (spec §8): seeded, model-checked stress on one real broker (one ctest entry per seed).
+        add_executable(rune_namespace_stress_tests tests/node/NamespaceStressTest.cpp)
+        target_include_directories(rune_namespace_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_stress_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_stress_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900)
+        # Namespaces Task 14 (spec §8): the 3-node slice, including the matrix's 14 LeaderChange timing cells.
+        add_executable(rune_namespace_trio_tests tests/node/NamespaceTrioTest.cpp)
+        target_include_directories(rune_namespace_trio_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_trio_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_trio_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900)
 
         # Catalog history Task 17: TestCluster::defineTopic — the in-process way to create a
         # topic now that the static topic list / NodeConfig::topics are gone (DDL over the wire on real
@@ -2059,4 +2116,26 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     gtest_discover_tests(rune_compaction_stress_tests
         PROPERTIES TIMEOUT 180)
+    # arcanum-metrics plan Task 7: the layout version Rune builds against, and the
+    # ARCANUM_METRICS_DIR configure check (a bad checkout fails with a clear message).
+    add_executable(rune_broker_metrics_tests tests/BrokerMetricsRegressionTest.cpp)
+    target_link_libraries(rune_broker_metrics_tests PRIVATE rune_node GTest::gtest_main)
+    # Task 13: OperationsDocTableMatchesRegression reads docs/operations.md from the source tree.
+    target_compile_definitions(rune_broker_metrics_tests PRIVATE RUNE_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../../..")
+    # Task 8: the node-level metrics regressions start in-process BrokerNodes (embedded driver).
+    if(aeron_FOUND)
+        target_include_directories(rune_broker_metrics_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_broker_metrics_tests PRIVATE aeron::aeron)
+        target_compile_definitions(rune_broker_metrics_tests PRIVATE RUNE_BROKER_METRICS_NODE_TESTS=1)
+    endif()
+    gtest_discover_tests(rune_broker_metrics_tests
+        PROPERTIES TIMEOUT 180
+        ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+    add_test(NAME BrokerMetricsRegression.ConfigureRejectsMissingDirRegression
+        COMMAND ${CMAKE_COMMAND}
+            -S ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/cmake/arcanum_metrics_dir
+            -B ${CMAKE_CURRENT_BINARY_DIR}/arcanum_metrics_dir_check
+            -DARCANUM_METRICS_DIR=/nonexistent)
+    set_tests_properties(BrokerMetricsRegression.ConfigureRejectsMissingDirRegression PROPERTIES
+        PASS_REGULAR_EXPRESSION "ARCANUM_METRICS_DIR \\(/nonexistent\\) is not an arcanum-metrics checkout")
 endif()

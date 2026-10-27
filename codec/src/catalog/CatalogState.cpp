@@ -2,10 +2,13 @@
 // fingerprint verification), the digest, and the F20 resolve / unresolve of ALTER ops.
 #include <rune/catalog/CatalogState.h>
 #include <rune/catalog/CatalogFingerprint.h>
+#include <rune/catalog/CatalogFingerprintV2.h>
+#include <rune/catalog/NsName.h>
 #include <rune/catalog/TopicName.h>
 #include <rune/codec/Fingerprint.h>
 #include <rune/codec/Serialize.h>
 #include "ApplyV1.h"
+#include "ApplyV2.h"
 
 #include <algorithm>
 #include <exception>
@@ -30,23 +33,31 @@ const typename Map::mapped_type* byObjectId(const Map& objects, uint64_t id) {
 }
 } // namespace
 
-const TopicObject* CatalogState::topicByName(std::string_view n) const { return viaIndex(topics_, topicNames_, n); }
+const TopicObject* CatalogState::topicByName(uint32_t nsId, std::string_view n) const {
+    return viaIndex(topics_, topicNames_, NsKeyView{nsId, n});
+}
 const TopicObject* CatalogState::topicByObjectId(uint64_t id) const { return byObjectId(topics_, id); }
 const TopicObject* CatalogState::topicByTopicId(int32_t topicId) const { return viaIndex(topics_, topicIds_, topicId); }
-const ViewObject*  CatalogState::viewByName(std::string_view n) const { return viaIndex(views_, viewNames_, n); }
+const ViewObject*  CatalogState::viewByName(uint32_t nsId, std::string_view n) const {
+    return viaIndex(views_, viewNames_, NsKeyView{nsId, n});
+}
 const ViewObject*  CatalogState::viewByObjectId(uint64_t id) const { return byObjectId(views_, id); }
 const ViewObject*  CatalogState::viewByViewTopicId(int32_t topicId) const { return viaIndex(views_, viewTopicIds_, topicId); }
 
-const std::string* CatalogState::liveNameFoldingOnto(std::string_view n) const {
-    for (const auto* index : {&topicNames_, &viewNames_})
-        for (const auto& [name, id] : *index)
-            if (name != n && topicNamesFoldEqual(name, n)) return &name;
+const std::string* CatalogState::liveNameFoldingOnto(uint32_t nsId, std::string_view n) const {
+    for (const auto* index : {&topicNames_, &viewNames_}) {
+        // the namespace's names are one contiguous run of the (nsId, name)-ordered index
+        for (auto it = index->lower_bound(NsKeyView{nsId, std::string_view{}}); it != index->end() && it->first.nsId == nsId; ++it)
+            if (it->first.name != n && topicNamesFoldEqual(it->first.name, n)) return &it->first.name;
+    }
     return nullptr;
 }
 
-const ViewObject* CatalogState::viewReading(std::string_view topicName) const {
+const ViewObject* CatalogState::viewReading(uint32_t nsId, std::string_view topicName) const {
     for (const auto& [id, v] : views_)
-        if (std::find(v.def.sourceNames.begin(), v.def.sourceNames.end(), topicName) != v.def.sourceNames.end()) return &v;
+        if (v.nsId == nsId &&
+            std::find(v.def.sourceNames.begin(), v.def.sourceNames.end(), topicName) != v.def.sourceNames.end())
+            return &v;
     return nullptr;
 }
 std::vector<const TopicObject*> CatalogState::topics() const {
@@ -69,6 +80,11 @@ std::optional<RequestRecord> CatalogState::request(const RequestId& requestId) c
 }
 
 uint64_t CatalogState::digest() const noexcept {
+    // An object of a namespace other than `default` hashes with its namespace mixed in, so the same definition in
+    // two namespaces is a different state; `default` objects hash exactly as they did before namespaces existed.
+    auto fp = [](uint64_t objectFingerprint, uint32_t nsId) {
+        return nsId == kDefaultNsId ? objectFingerprint : objectFingerprintV2(objectFingerprint, nsId);
+    };
     uint64_t h = rune::codec::detail::kFnvSeed;
     h = detail::fnvU64(h, static_cast<uint64_t>(appliedOffset_));
     h = detail::fnvU64(h, nextObjectId_);
@@ -78,27 +94,44 @@ uint64_t CatalogState::digest() const noexcept {
     auto v = views_.begin();
     while (t != topics_.end() || v != views_.end()) {
         if (v == views_.end() || (t != topics_.end() && t->first < v->first)) {
-            h = detail::fnvU64(h, fingerprintOf(t->second));
+            h = detail::fnvU64(h, fp(fingerprintOf(t->second), t->second.nsId));
             ++t;
         } else {
-            h = detail::fnvU64(h, fingerprintOf(v->second));
+            h = detail::fnvU64(h, fp(fingerprintOf(v->second), v->second.nsId));
             ++v;
         }
     }
-    for (const Tombstone& d : tombstones_) h = detail::fnvU64(h, fingerprintOf(d));
+    for (const Tombstone& d : tombstones_) h = detail::fnvU64(h, fp(fingerprintOf(d), d.nsId));
+    // Namespaces, only when they left a trace: the never-reused id counter and every record that is not an untouched
+    // `default`.
+    if (namespaces_.nextNsId() > 1) h = rune::codec::detail::fnv1a_u32le(h, namespaces_.nextNsId());
+    namespaces_.forEach([&](const NamespaceRecord& r) {
+        if (r.nsId == kDefaultNsId && r.version == 0) return;
+        h = detail::fnvU64(h, r.fingerprint);
+    });
+    if (namespaces_.tombstoneFold() != 0) h = detail::fnvU64(h, namespaces_.tombstoneFold());
     return h;
 }
 
 // ── apply ─────────────────────────────────────────────────────────────────────
 std::expected<Applied, ApplyError> apply(CatalogState& s, const CatalogEvent& e, int64_t offset) {
-    if (e.formatVer != kFormatV1)
+    if (e.formatVer != kFormatV1 && e.formatVer != kFormatV2)
         return std::unexpected(ApplyError{offset, ApplyError::Code::UnsupportedFormat, 0, 0,
                                           "formatVer " + std::to_string(e.formatVer) + " has no apply rules"});
     if (offset <= s.appliedOffset())
         return std::unexpected(ApplyError{offset, ApplyError::Code::Precondition, 0, 0,
                                           "offset " + std::to_string(offset) + " is not past the applied offset " +
                                               std::to_string(s.appliedOffset())});
-    auto staged = ApplyV1::run(s, e, offset);
+    if (e.formatVer == kFormatV2) {
+        auto staged = ApplyV2::run(s, e, offset);
+        if (!staged) return std::unexpected(std::move(staged.error()));
+        const uint64_t actual = ApplyV2::fingerprintOfStaged(e, *staged);
+        if (actual != e.fingerprint)
+            return std::unexpected(ApplyError{offset, ApplyError::Code::FingerprintMismatch, e.fingerprint, actual,
+                                              std::string(kindName(e.kind)) + " '" + e.objectName + "'"});
+        return ApplyV2::commit(s, e, offset, actual, std::move(*staged));
+    }
+    auto staged = ApplyV1::run(s, e, offset);   // formatVer 1: nsId is 0 (the event validation refuses anything else)
     if (!staged) return std::unexpected(std::move(staged.error()));
     const uint64_t actual = ApplyV1::fingerprintOfStaged(*staged);
     if (actual != e.fingerprint)
@@ -108,9 +141,14 @@ std::expected<Applied, ApplyError> apply(CatalogState& s, const CatalogEvent& e,
 }
 
 std::expected<uint64_t, ApplyError> previewFingerprint(const CatalogState& s, const CatalogEvent& e) {
-    if (e.formatVer != kFormatV1)
+    if (e.formatVer != kFormatV1 && e.formatVer != kFormatV2)
         return std::unexpected(ApplyError{-1, ApplyError::Code::UnsupportedFormat, 0, 0,
                                           "formatVer " + std::to_string(e.formatVer) + " has no apply rules"});
+    if (e.formatVer == kFormatV2) {
+        auto staged = ApplyV2::run(s, e, -1);
+        if (!staged) return std::unexpected(std::move(staged.error()));
+        return ApplyV2::fingerprintOfStaged(e, *staged);
+    }
     auto staged = ApplyV1::run(s, e, -1);
     if (!staged) return std::unexpected(std::move(staged.error()));
     return ApplyV1::fingerprintOfStaged(*staged);
@@ -122,6 +160,7 @@ std::string_view applyErrorName(ApplyError::Code c) noexcept {
     case ApplyError::Code::Precondition:        return "Precondition";
     case ApplyError::Code::FingerprintMismatch: return "FingerprintMismatch";
     case ApplyError::Code::BadOps:              return "BadOps";
+    case ApplyError::Code::BadNsId:             return "BadNsId";
     }
     return "?";
 }

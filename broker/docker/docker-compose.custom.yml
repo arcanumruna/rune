@@ -14,6 +14,7 @@
 # Uses a prebuilt image (${RUNE_IMAGE}); build it first, e.g.:
 #   (cd broker && docker build --platform linux/amd64 \
 #       --build-context rune-protocol=../protocol --build-context flight-recorder=${FLIGHT_RECORDER_DIR:-../../flight-recorder} \
+#       --build-context arcanum-metrics=${ARCANUM_METRICS_DIR:-../../arcanum-metrics} \
 #       --build-context rune-codec=../codec --build-context rune-crypto=../crypto \
 #       -f docker/Dockerfile -t rune:latest .)
 

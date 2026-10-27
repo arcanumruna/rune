@@ -28,11 +28,13 @@ static std::string tmpPath(const std::string& tag) {
     return (fs::temp_directory_path() / ("term_log_test_" + uniq + "_" + tag + ".bin")).string();
 }
 
+namespace {   // internal linkage: several TUs of rune_consensus_tests define TempFile (ODR)
 struct TempFile {
     std::string path;
     explicit TempFile(const std::string& tag) : path(tmpPath(tag)) {}
     ~TempFile() { fs::remove(path); }
 };
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // 1. Empty log invariants

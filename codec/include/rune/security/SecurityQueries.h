@@ -25,7 +25,9 @@ struct RecordedEvent { int64_t offset = -1; SecurityEvent event; };
 /// name: matches objectName (the user or role the event is about — every object EVER named so);
 ///       empty = every name.
 /// sinceMs: timestampMs >= sinceMs.
-struct HistoryFilter { std::optional<GranteeKind> kind; std::string name; std::optional<int64_t> sinceMs; };
+/// nsId: only events of that namespace (a formatVer-1 event is namespace 0); nullopt = every namespace.
+struct HistoryFilter { std::optional<GranteeKind> kind; std::string name; std::optional<int64_t> sinceMs;
+                       std::optional<uint32_t> nsId; };
 /// The matching events, in log (offset) order.
 [[nodiscard]] std::vector<RecordedEvent> history(std::span<const RecordedEvent> log, const HistoryFilter&);
 
@@ -41,13 +43,15 @@ struct AsOf { enum class By : uint8_t { Offset, Time } by = By::Offset; int64_t 
 /// and the effective union.  A role has only direct (= effective) grants.
 struct GrantsView { std::vector<GrantSpec> direct; std::vector<std::pair<std::string, std::vector<GrantSpec>>> viaRoles;
                     std::vector<GrantSpec> effective; };
-/// nullopt = no such live user / role.
-[[nodiscard]] std::optional<GrantsView> grantsFor(const SecurityState&, GranteeKind, std::string_view name);
+/// nullopt = no such live user / role in namespace `nsId` (default 0).
+[[nodiscard]] std::optional<GrantsView> grantsFor(const SecurityState&, GranteeKind, std::string_view name, uint32_t nsId = 0);
 
-/// SHOW USERS / SHOW ROLES rows, ordered by name.  `passwords` counts the active verifiers; their
+/// SHOW USERS / SHOW ROLES rows, ordered by (nsId, name).  `passwords` counts the active verifiers; their
 /// bytes are never exposed.
-struct UserRow { std::string name; bool enabled; bool mustChangePassword; uint8_t passwords; std::vector<std::string> roles; uint32_t version; };
-struct RoleRow { std::string name; std::vector<std::string> members; std::size_t grants; uint32_t version; };
+/// nsId: the namespace of the row (`name` is the local name); rows are ordered by (nsId, name).
+struct UserRow { std::string name; bool enabled; bool mustChangePassword; uint8_t passwords; std::vector<std::string> roles; uint32_t version;
+                 uint32_t nsId = 0; };
+struct RoleRow { std::string name; std::vector<std::string> members; std::size_t grants; uint32_t version; uint32_t nsId = 0; };
 [[nodiscard]] std::vector<UserRow> users(const SecurityState&);
 [[nodiscard]] std::vector<RoleRow> roles(const SecurityState&);
 

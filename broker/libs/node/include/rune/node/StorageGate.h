@@ -153,7 +153,7 @@ public:
                                                                    : std::get<Unconfirmed>(state_).origin;
         switch (o) { case Origin::Founder: return 1; case Origin::Legacy: return 2; case Origin::Joiner: return 3; default: return 4; }
     }
-    /// 0 CONFIRMED, 1 UNCONFIRMED, 2 UNDECIDED (kStorageGateStateCounterTypeId).
+    /// 0 CONFIRMED, 1 UNCONFIRMED, 2 UNDECIDED (typeIdOf(RuneMetric::StorageGateState)).
     [[nodiscard]] int stateCode() const noexcept {
         return std::holds_alternative<Confirmed>(state_) ? 0 : std::holds_alternative<Unconfirmed>(state_) ? 1 : 2;
     }

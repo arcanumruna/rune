@@ -421,12 +421,14 @@ TEST(HandleLifetime, ReleaseRacingCloseExactlyOneFreeRegression) {
 // main thread closes the Client (close() and closeImmediately() alternately) —
 // each impl freed exactly once, no release ever waits (Thread mode; ASan + TSan).
 TEST(HandleLifetime, ClientReleaseRacingCloseExactlyOneFreeRegression) {
-    Watchdog wd("handle releases racing Client close");
     FreeHook hook;
     constexpr int kIterations = 30;
     constexpr int kWorkers    = 4;
     int created = 0;
     for (int it = 0; it < kIterations; ++it) {
+        // Armed per iteration: a hang in any one is caught, while the 30 Client lifecycles (an embedded driver
+        // each, 1-2 s under TSan) are not held to one 60 s budget.
+        Watchdog wd("handle releases racing Client close");
         auto client = std::make_unique<rc::Client>(cfgFor(5410, rc::RunnerMode::Thread));
         const auto topic = client->topic("t");
         std::atomic<int>  ready{0};
@@ -1018,11 +1020,13 @@ TEST(HandleLifetime, BatchBuilderOutlivingItsProducerIsCaughtRegression) {
     r.connect();
     const auto topic = r.client->topic("t");
     std::optional<rc::Producer> p(r.client->producer(ackCfg()));
-    std::optional<rc::BatchBuilder> b(p->batch(topic, rc::Key(uint64_t{1})));
-    b->add(kVal);
-    p.reset();
-    EXPECT_THROW((void)b->send(), std::logic_error);
-    b.reset();  // before the duty side frees the impl: the builder's destructor reads it
+    {
+        auto b = p->batch(topic, rc::Key(uint64_t{1}));
+        b.add(kVal);
+        p.reset();
+        EXPECT_THROW((void)b.send(), std::logic_error);
+    }   // b dies while the duty side still holds the impl (its destructor reads the detach flag); once the
+        // duty side frees the impl, any use of b - its destructor included - touches freed memory
     ASSERT_TRUE(r.drive([&] { return frees(rcd::HandleKind::Producer) == 1; }));
 }
 

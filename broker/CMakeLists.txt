@@ -83,6 +83,9 @@ else()
     target_compile_definitions(flight_recorder PUBLIC FLIGHT_RECORDER=0)
 endif()
 
+# arcanum-metrics: the `metrics` INTERFACE target, consumed like the flight recorder above.
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/ArcanumMetrics.cmake)
+
 # ── rune-crypto — client<->broker TLS/AEAD (Task 7) ──────────────────────────
 # Consumed as a SIBLING source lib, exactly like flight-recorder/rune-codec above (no
 # conan publish gate yet).  Header-first (TlsSession.h/Aead.h/Cipher.h) + 3
@@ -167,6 +170,8 @@ add_library(rune_catalog STATIC ${RUNE_CATALOG_SOURCES})
 target_include_directories(rune_catalog PUBLIC ${RUNE_CODEC_ROOT}/include ${RUNE_PROTOCOL_INCLUDE})
 target_link_libraries(rune_catalog PUBLIC rune_codec)
 target_compile_features(rune_catalog PUBLIC cxx_std_23)
+# Every EventKind / ApplyError switch must name every enumerator (Checkpoint A F1/F2).
+target_compile_options(rune_catalog PRIVATE -Werror=switch)
 
 # ── rune_security — the shared authentication library (auth spec §3, plan D1): event
 #    model, frozen v1 apply rules, fingerprints, permissions, verifying replayer, .rsec.
@@ -428,17 +433,29 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_broker_process_tests)
 endif()
 
-# ── rune_role — standalone Aeron node-role counter reader ────────────────────
-# Reads the machine-readable leadership signal (RoleCounter.h) out of a broker's
-# CnC file and prints one line.  The dr-e2e harness runs this via `docker exec`
-# to detect the leader WITHOUT scraping "is LEADER" log lines (log-level
-# independent).  Header-only dep on rune/node/RoleCounter.h; links aeron only.
+# ── rune_role — standalone node-role metrics reader ─────────────────────────
+# Reads the machine-readable leadership signal (RuneMetrics.h type ids) out of a broker's
+# arcanum-metrics file and prints the ROLE and STORAGE lines.  The dr-e2e harness runs this via
+# `docker exec` to detect the leader WITHOUT scraping "is LEADER" log lines (log-level
+# independent).  Header-only dep on rune/node/RuneMetrics.h; links the metrics library only.
 if(aeron_FOUND)
     add_executable(rune_role src/rune_role.cpp)
     target_include_directories(rune_role PRIVATE ${RUNE_NODE_INCLUDE})
-    target_link_libraries(rune_role PRIVATE aeron::aeron)
-    if(UNIX AND NOT APPLE)
-        target_link_libraries(rune_role PRIVATE -Wl,--no-as-needed uuid -Wl,--as-needed)
+    target_link_libraries(rune_role PRIVATE metrics)
+
+    # Plan 2026-10-26 Task 10: the real binary against real metrics files (golden output, exit codes, and the
+    # dr-e2e harness parser run on its output).
+    if(BUILD_TESTING)
+        find_package(GTest REQUIRED)
+        add_executable(rune_role_tests tests/RuneRoleRegressionTest.cpp)
+        target_include_directories(rune_role_tests PRIVATE ${RUNE_NODE_INCLUDE})
+        target_link_libraries(rune_role_tests PRIVATE GTest::gtest_main metrics)
+        target_compile_definitions(rune_role_tests PRIVATE
+            RUNE_ROLE_BIN="$<TARGET_FILE:rune_role>"
+            RUNE_DR_E2E_DIR="${CMAKE_CURRENT_SOURCE_DIR}/dr-e2e")
+        add_dependencies(rune_role_tests rune_role)
+        include(GoogleTest)
+        gtest_discover_tests(rune_role_tests)
     endif()
 endif()
 
@@ -496,6 +513,12 @@ if(BUILD_BENCHMARKS)
     target_link_libraries(RoutingImageBench PRIVATE
         rune_metadata
         benchmark::benchmark_main)
+
+    # ── ControlDutyCycleBench — standalone: SystemMetrics cost on the control duty cycle (header-only metrics) ──
+    add_executable(ControlDutyCycleBench
+        benchmark/BenchmarkMain.cpp
+        benchmark/ControlDutyCycleBench.cpp)
+    target_link_libraries(ControlDutyCycleBench PRIVATE metrics benchmark::benchmark)
 
     add_executable(rune_broker_benchmark
         benchmark/BenchmarkMain.cpp

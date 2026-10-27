@@ -215,4 +215,8 @@ the repo, issues or commits.
 - **Query API:** Rune QL will get its own native query API, and the SQL and Redis interfaces will be thin facades
   translated onto it. Until then, keep the existing view read API (`getViewRow`). Don't start query-API work unasked.
 - **Catalog:** `__catalog` is a replicated DDL event log (fingerprints only, no state).
-- **Auth:** SCRAM, a `__security` log, allow-only grants with default deny, and a cluster key. Tenants are deferred.
+- **Auth:** SCRAM, a `__security` log, allow-only grants with default deny, and a cluster key.
+- **Namespaces (tenants):** `broker/docs/superpowers/specs/2026-10-24-rune-namespaces-and-truncate-design.md`.
+  Anonymous read is off by default; a cluster admin turns it on for `default` explicitly.
+  Phase 1 is done (namespace DDL, scoped names, permissions, listings); limits are stored only, and group and
+  transactional requests outside `default` are refused until Phase 2.

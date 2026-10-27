@@ -467,8 +467,8 @@ public:
     }
     /// The topic / view-sink id `name` names (-1 = none).
     [[nodiscard]] int32_t idOf(const std::string& name) const {
-        if (const rune::catalog::TopicObject* t = state().topicByName(name)) return t->topicId;
-        if (const rune::catalog::ViewObject* v = state().viewByName(name)) return v->def.viewTopicId;
+        if (const rune::catalog::TopicObject* t = state().topicByName(rune::catalog::kDefaultNsId, name)) return t->topicId;
+        if (const rune::catalog::ViewObject* v = state().viewByName(rune::catalog::kDefaultNsId, name)) return v->def.viewTopicId;
         return -1;
     }
     [[nodiscard]] uint64_t startedTotal() const { return startedBeforeBoot_ + rig_->admin().startedCount(); }

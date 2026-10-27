@@ -11,6 +11,7 @@
 #include "rune/cli/Cli.h"
 #include "rune/cli/Console.h"
 #include "rune/cli/CatalogCommands.h"
+#include "rune/cli/NamespaceCommands.h"
 #include "rune/cli/SecurityCommands.h"
 #include "CliSupport.h"
 
@@ -100,6 +101,7 @@ void printUsage(std::ostream& err) {
         << "      Fetch topic schema from broker and generate C++ header (live).\n";
     rune::cli::printCatalogUsage(err);
     rune::cli::printSecurityUsage(err);
+    rune::cli::printNamespaceUsage(err);
 }
 
 // ── Live ClientConfig builder (shared by get/list/generate) ─────────────────────
@@ -471,6 +473,9 @@ int run(std::vector<std::string> args, std::istream& in, std::ostream& out, std:
     }
     if (cmd == "security") {
         return cmdSecurity(std::vector<std::string>(args.begin() + 1, args.end()), out, err);
+    }
+    if (cmd == "namespace") {
+        return rune::cli::cmdNamespace(std::vector<std::string>(args.begin() + 1, args.end()), out, err);
     }
 
     err << "rune: unknown command '" << cmd << "'\n";

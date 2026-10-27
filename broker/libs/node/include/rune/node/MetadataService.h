@@ -2019,7 +2019,7 @@ public:
     void holdMetadataApplyForTest(bool on) noexcept { applyHeldForTest_ = on; }
     void setHoldAllDecisionsMaxForTest(int64_t maxNs) noexcept { holdAllMaxNs_ = maxNs; }
     [[nodiscard]] bool holdAllDecisionsActiveForTest() const noexcept { return holdAllActive_(); }
-    /// Counter sources (kStoragePendingNodesCounterTypeId / kLostCommittedReportsCounterTypeId).
+    /// Counter sources (typeIdOf(RuneMetric::StoragePendingNodes) / typeIdOf(RuneMetric::LostCommittedReports)).
     [[nodiscard]] std::size_t storagePendingCount() const noexcept { return controllerReady_() ? storageRegs_.size() : 0; }
     [[nodiscard]] uint64_t lostCommittedReports() const noexcept { return lostCommittedReports_; }
     [[nodiscard]] uint64_t storageConfirmRequeuedForTest() const noexcept { return storageConfirmRequeued_; }

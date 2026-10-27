@@ -24,16 +24,16 @@ std::string quoted(std::string_view n) {
 }
 std::string ident(std::string_view n) { return plainIdent(n) ? std::string(n) : quoted(n); }
 
-// SecurityOperation: Read 0, Write 1, Create 2, Alter 3, Drop 4, Describe 5, Admin 6.
+// SecurityOperation: Read 0, Write 1, Create 2, Alter 3, Drop 4, Describe 5, Admin 6, Truncate 7.
 const char* opText(uint8_t o) noexcept {
     switch (o) {
         case 0: return "READ";   case 1: return "WRITE";    case 2: return "CREATE"; case 3: return "ALTER";
-        case 4: return "DROP";   case 5: return "DESCRIBE"; case 6: return "ADMIN";
+        case 4: return "DROP";   case 5: return "DESCRIBE"; case 6: return "ADMIN"; case 7: return "TRUNCATE";
         default: return nullptr;
     }
 }
 
-// SecurityResourceType: Cluster 0, Topic 1, View 2, Group 3, TransactionalId 4.  False: unknown.
+// SecurityResourceType: Cluster 0, Topic 1, View 2, Group 3, TransactionalId 4, Namespace 5.  False: unknown.
 bool resource(uint8_t type, uint8_t patternKind, std::string_view pattern, std::string& out) {
     if (patternKind > 1) return false;
     const char* t = nullptr;
@@ -43,6 +43,7 @@ bool resource(uint8_t type, uint8_t patternKind, std::string_view pattern, std::
         case 2: t = "VIEW"; break;
         case 3: t = "GROUP"; break;
         case 4: t = "TRANSACTIONAL_ID"; break;
+        case 5: t = "NAMESPACE"; break;
         default: return false;
     }
     out = std::string(t) + (patternKind == 1 ? " PREFIX " + quoted(pattern) : " " + ident(pattern));

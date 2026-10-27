@@ -12,6 +12,7 @@
 // the Bootstrap event carries (the same on every broker and across restarts); before the first bootstrap there are
 // no users to hide and the seed is all zeros.
 
+#include <rune/catalog/NamespaceRegistry.h>
 #include <rune/gateway/SessionAuth.h>
 #include <rune/protocol/client/AuthMessages.h>
 #include <rune/security/SecurityState.h>
@@ -40,12 +41,26 @@ struct ServerFirstPlan {
 /// gets its 1-2 verifiers (+ a fake second slot for one), an unknown / empty name gets two fake slots.
 /// combinedNonce = clientNonce + a fresh server nonce.  `fakeIterations` (SecurityView::fakeIterations) is the count the
 /// fake slots advertise - the most common real count, so the answer does not reveal that an account is unknown.
+///
+/// Namespaces Task 9: the login name is `user` (namespace `default`) or `ns/user`, resolved against `namespaces` (the
+/// control thread's NamespaceMirror; nullptr = only `default` exists).  An unknown or malformed namespace is an unknown
+/// user: the same fake slots, the same work, the same final AuthenticationFailed.
 [[nodiscard]] ServerFirstPlan scramServerFirst(const rune::security::SecurityState&,
                                                const rune::protocol::client::AuthClientFirst&, int64_t deadlineNs,
-                                               uint32_t fakeIterations = 4096);
+                                               uint32_t fakeIterations = 4096,
+                                               const rune::catalog::NamespaceRegistry* namespaces = nullptr);
+
+/// A login name split and its namespace resolved.  `known` = false: malformed, or the namespace does not exist - the
+/// lookup still runs (nsId stays kUnknownLoginNs, which no user holds).
+inline constexpr uint32_t kUnknownLoginNs = 0xFFFF'FFFFu;
+struct LoginName { uint32_t nsId = kUnknownLoginNs; std::string_view local; bool known = false; };
+[[nodiscard]] LoginName resolveLoginName(const rune::catalog::NamespaceRegistry* namespaces, std::string_view username) noexcept;
 
 enum class LoginFailure : uint8_t { NoCredentials, UnknownUser, BadProof, Disabled, Throttled, Timeout, SecurityHalted };
-struct LoginOk { uint64_t userId; std::string user; bool mustChangePassword; std::array<uint8_t, 64> serverSignature; };
+struct LoginOk {
+    uint64_t userId; std::string user; bool mustChangePassword; std::array<uint8_t, 64> serverSignature;
+    uint32_t nsId = 0;   ///< namespaces Task 9: the user's namespace (the session's)
+};
 /// Checks the proofs against the (copied) verifiers of `state`, re-reading the user from the CURRENT state: a user
 /// dropped between the legs is UnknownUser, a user disabled in between is Disabled.  Every slot is verified (no early
 /// exit) so the time does not depend on which slot - or whether any - matched.

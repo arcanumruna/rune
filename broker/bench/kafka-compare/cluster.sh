@@ -43,10 +43,11 @@ rune_shard_layout_check() {
   done
 }
 # The broker honours RUNE_AERON_DIR (set to $WORK/rune-c$i/a below, on tmpfs):
-# Aeron's CnC + term buffers must NOT live on the disk-backed data dir, and
-# rune_role reads the role counter from that same dir.
+# Aeron's CnC + term buffers must NOT live on the disk-backed data dir.
+# rune_role reads the role metric from the broker's metrics file, which is
+# ${RUNE_DATA_DIR}/metrics/rune-metrics.dat (RUNE_DATA_DIR = the node's log dir).
 CLUSTER_PERSISTENCE="nvme"
-_rune_node_aeron() { echo "$WORK/rune-c$1/a"; }
+_rune_node_metrics() { echo "$(data_root "$CLUSTER_PERSISTENCE" rune-log-$1)/metrics/rune-metrics.dat"; }
 
 # rune_start_cluster <workers> <topics_spec> [io] [persistence]
 #   topics_spec: see rune_create_topics (created by DDL once the cluster has a leader).
@@ -108,7 +109,7 @@ rune_start_cluster() {
         $pinprefix "$RUNE_BROKER_BIN" >"$d/broker.log" 2>&1 &
     RUNE_CLUSTER_PIDS+=($!)
   done
-  # Wait for a leader via rune_role (reliable — reads the Aeron role counter).
+  # Wait for a leader via rune_role (reliable — reads the node-role metric).
   local leader; leader="$(rune_wait_leader 60)"
   [ -z "$leader" ] && { log "CLUSTER: no leader elected"; for i in 0 1 2; do tail -5 "$WORK/rune-c$i/broker.log"; done; return 1; }
   # The brokers boot with an empty catalog: create the topics by DDL (retries while the catalog leader forms).
@@ -120,7 +121,7 @@ rune_start_cluster() {
 
 # rune_node_role <i> -> LEADER|FOLLOWER|CANDIDATE|NONE|UNKNOWN
 rune_node_role() {
-  local out; out="$("$RUNE_ROLE_BIN" "$(_rune_node_aeron "$1")" 2>/dev/null | grep -oE "role=[A-Z]+" | head -1)"
+  local out; out="$("$RUNE_ROLE_BIN" "$(_rune_node_metrics "$1")" 2>/dev/null | grep -oE "role=[A-Z]+" | head -1)"
   echo "${out#role=}"
 }
 # rune_leader_node -> node index of current leader, or empty

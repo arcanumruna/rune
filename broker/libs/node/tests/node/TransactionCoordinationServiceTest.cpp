@@ -1911,8 +1911,10 @@ protected:
             k = answers_.frames[0].size();
         }
         const auto r = pc::AddPartitionsToTxnResponse::decode(a, k);
+        // r is a zero-copy view over the answer frame: read it before clear() frees that frame.
+        const int16_t code = r && r->results.size() == 1 ? r->results[0].errorCode : int16_t{-1};
         answers_.frames.clear();
-        return r && r->results.size() == 1 ? r->results[0].errorCode : int16_t{-1};
+        return code;
     }
 };
 

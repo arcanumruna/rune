@@ -179,7 +179,7 @@ TEST(SecurityMessagesRegression, BootstrapMacCoversTheFakeSaltSeedRegression) {
 TEST(SecurityMessagesRegression, OutOfRangeGrantEnumBytesDoNotDecodeRegression) {
     uint8_t buf[512];
     for (int field = 0; field < 4; ++field) {
-        const uint8_t bad[4] = {2, 7, 5, 2};   // first out-of-range value of grantee, op, type, pattern kind
+        const uint8_t bad[4] = {2, 8, 6, 2};   // first out-of-range value of grantee, op, type, pattern kind
         auto m = make(pc::SecurityOpKind::Grant, "ws1"); m.pattern = "world.";
         m.granteeKind = 1; m.op = 1; m.resourceType = 1; m.patternKind = 1;
         std::size_t n = m.encode(buf); ASSERT_GT(n, 0u);
@@ -191,7 +191,7 @@ TEST(SecurityMessagesRegression, OutOfRangeGrantEnumBytesDoNotDecodeRegression) 
     }
     // the largest valid values still decode
     auto top = make(pc::SecurityOpKind::Revoke, "r"); top.pattern = "x";
-    top.granteeKind = 1; top.op = 6; top.resourceType = 4; top.patternKind = 1;
+    top.granteeKind = 1; top.op = 7; top.resourceType = 5; top.patternKind = 1;
     std::size_t n = top.encode(buf);
     EXPECT_TRUE(pc::SecurityDdl::decode(buf, n));
 }

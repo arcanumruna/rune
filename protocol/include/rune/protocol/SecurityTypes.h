@@ -7,13 +7,15 @@
 
 namespace rune::protocol {
 
-enum class SecurityOperation    : uint8_t { Read = 0, Write = 1, Create = 2, Alter = 3, Drop = 4, Describe = 5, Admin = 6 };
-enum class SecurityResourceType : uint8_t { Cluster = 0, Topic = 1, View = 2, Group = 3, TransactionalId = 4 };
+enum class SecurityOperation    : uint8_t { Read = 0, Write = 1, Create = 2, Alter = 3, Drop = 4, Describe = 5, Admin = 6,
+                                             Truncate = 7 /* stored now, enforced in Phase 3; valid on Topic */ };
+enum class SecurityResourceType : uint8_t { Cluster = 0, Topic = 1, View = 2, Group = 3, TransactionalId = 4,
+                                             Namespace = 5 /* ops Admin and Describe; Exact pattern = the role's own namespace */ };
 enum class SecurityPatternKind  : uint8_t { Exact = 0, Prefix = 1 };
 enum class SecurityGranteeKind  : uint8_t { User = 0, Role = 1 };
 
-[[nodiscard]] constexpr bool validSecurityOperation(uint8_t v) noexcept    { return v <= static_cast<uint8_t>(SecurityOperation::Admin); }
-[[nodiscard]] constexpr bool validSecurityResourceType(uint8_t v) noexcept { return v <= static_cast<uint8_t>(SecurityResourceType::TransactionalId); }
+[[nodiscard]] constexpr bool validSecurityOperation(uint8_t v) noexcept    { return v <= static_cast<uint8_t>(SecurityOperation::Truncate); }
+[[nodiscard]] constexpr bool validSecurityResourceType(uint8_t v) noexcept { return v <= static_cast<uint8_t>(SecurityResourceType::Namespace); }
 [[nodiscard]] constexpr bool validSecurityPatternKind(uint8_t v) noexcept  { return v <= static_cast<uint8_t>(SecurityPatternKind::Prefix); }
 [[nodiscard]] constexpr bool validSecurityGranteeKind(uint8_t v) noexcept  { return v <= static_cast<uint8_t>(SecurityGranteeKind::Role); }
 

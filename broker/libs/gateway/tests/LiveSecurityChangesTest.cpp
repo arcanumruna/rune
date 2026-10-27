@@ -57,10 +57,15 @@ TEST(LiveSecurityChangesRegression, LostDescribeClusterEndsCatalogReads) {
     r.session.securityReadCorrs = {6};
     const auto before = r.table({g(Operation::Describe, ResourceType::Cluster, PatternKind::Exact, ""),
                                  g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")});
-    const auto after  = r.table({g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")});
+    const auto after  = r.table({g(Operation::Create, ResourceType::Cluster, PatternKind::Exact, "")});
     const rg::LiveActions a = rg::refreshActions(before, after, r.session, r.idx);
     EXPECT_TRUE(a.endCatalogReads);
-    EXPECT_FALSE(a.endSecurityReads) << "the security reads need ADMIN, which is kept";
+    EXPECT_TRUE(a.endSecurityReads) << "ADMIN went too";
+    // Root (ADMIN ON CLUSTER) holds DESCRIBE ON CLUSTER: losing only the explicit DESCRIBE ends nothing.
+    const auto root = r.table({g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")});
+    const rg::LiveActions k = rg::refreshActions(before, root, r.session, r.idx);
+    EXPECT_FALSE(k.endCatalogReads) << "root keeps DESCRIBE ON CLUSTER";
+    EXPECT_FALSE(k.endSecurityReads) << "the security reads need ADMIN, which is kept";
 }
 
 TEST(LiveSecurityChangesRegression, LostAdminEndsSecurityReads) {

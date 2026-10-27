@@ -66,7 +66,7 @@ std::vector<std::vector<uint8_t>> buildLog() {
             break;
         }
         case 1: {
-            const rc::TopicObject& t = *s.topicByName(name);
+            const rc::TopicObject& t = *s.topicByName(rune::catalog::kDefaultNsId, name);
             cd::AlterOp add{}; add.type = cd::AlterOpType::Add; add.name = "mana"; add.primType = cd::PrimType::Int32;
             add.fixedLen = 0; add.mode = cd::CompatMode::Backward;
             auto r = rc::resolveAlterOps(*t.schema, std::vector<cd::AlterOp>{add});
@@ -74,7 +74,7 @@ std::vector<std::vector<uint8_t>> buildLog() {
             break;
         }
         case 2: {
-            const rc::TopicObject& t = *s.topicByName(name);
+            const rc::TopicObject& t = *s.topicByName(rune::catalog::kDefaultNsId, name);
             emit(rc::AlterTopicConfigOps{{{rc::ConfigKey::RetentionMs, 60'000 + step}}}, name, t.objectId, t.version);
             break;
         }
@@ -85,12 +85,12 @@ std::vector<std::vector<uint8_t>> buildLog() {
             break;
         }
         case 4: {
-            const rc::ViewObject& v = *s.viewByName(view);
+            const rc::ViewObject& v = *s.viewByName(rune::catalog::kDefaultNsId, view);
             emit(rc::DropViewOps{v.def.viewTopicId}, view, v.objectId, v.version);
             break;
         }
         default: {
-            const rc::TopicObject& t = *s.topicByName(name);
+            const rc::TopicObject& t = *s.topicByName(rune::catalog::kDefaultNsId, name);
             emit(rc::DropTopicOps{t.topicId}, name, t.objectId, t.version);
             break;
         }

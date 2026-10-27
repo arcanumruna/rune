@@ -81,7 +81,7 @@ struct CountingAdminSink final : IAdminRequestSink {
     AdminSubmit submitDefineTopic(int64_t, int64_t, std::string_view, uint32_t, std::string_view, bool, const uint8_t*,
                                   uint32_t, uint8_t, int16_t, const rune::protocol::TopicConfigView&, const DdlMetaView&,
                                   std::string_view) override { return AdminSubmit::Accepted; }
-    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t) override { ++gets; return true; }
+    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t, uint32_t) override { ++gets; return true; }
     AdminSubmit submitAlterTopic(int64_t, int64_t, std::string_view, uint16_t, const uint8_t*, uint32_t,
                                  const DdlMetaView&) override { return AdminSubmit::Accepted; }
     AdminSubmit submitCreateView(int64_t, int64_t, std::string_view, std::string_view, uint8_t, const uint8_t*, uint32_t,
@@ -97,6 +97,8 @@ struct CountingAdminSink final : IAdminRequestSink {
     AdminSubmit submitSecurityDdl(const pc::SecurityDdl&, const DdlMetaView&, std::string_view, bool) override {
         return AdminSubmit::Accepted;
     }
+    AdminSubmit submitNamespaceDdl(const pc::NamespaceDdlRequest&, const DdlMetaView&, std::string_view, uint16_t) override { return AdminSubmit::Accepted; }
+    AdminSubmit submitListNamespaces(int64_t, int64_t, uint32_t, uint16_t, uint32_t, bool) override { return AdminSubmit::Accepted; }
     AdminSubmit submitSecurityBootstrap(const pc::SecurityBootstrap&, const DdlMetaView&) override { return AdminSubmit::Accepted; }
     bool submitSecuritySubscribe(int64_t, int64_t, int64_t) override { return true; }
     bool submitSecurityUnsubscribe(int64_t, int64_t) override { return true; }
@@ -509,7 +511,10 @@ TEST(AuthUnappliedTopicRegression, GetTopicSchemaNameBoundsResolveByExactMatchAd
     r.gw.onCatalogObjectApplied(kPlaced, "payments", false);
     EXPECT_EQ(r.codeOf(r.getTopicSchema("paymentsX")), std::nullopt) << "not the live 'payments': unknown, view grant ok";
     EXPECT_EQ(r.codeOf(r.getTopicSchema("payment")), std::nullopt);
-    EXPECT_EQ(r.codeOf(r.getTopicSchema("")), kNotAuthorized) << "no grant matches the empty name";
+    // Namespaces D7: the empty name is a malformed qualified name, answered InvalidTopicName for everyone (it names
+    // nothing, so the answer reveals nothing) before any grant check.
+    EXPECT_EQ(r.codeOf(r.getTopicSchema("")), static_cast<int16_t>(pc::ErrorCode::InvalidTopicName))
+        << "the empty name is malformed (D7)";
     const std::string huge = "pay" + std::string(65535 - 3, 'x');
     EXPECT_EQ(r.codeOf(r.getTopicSchema(huge)), std::nullopt);
     EXPECT_EQ(r.codeOf(r.getTopicSchema("payments")), kNotAuthorized);

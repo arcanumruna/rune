@@ -127,7 +127,7 @@ TEST_P(CompactedTopicRegression, EveryCompactionSettingReachesTheBroker) {
     s.minCompactionLagMs = 1'500;
     s.maxCompactionLagMs = 90'000;
     s.retentionMs = 3'600'000;
-    s.retentionBytes = 1LL << 30;
+    s.retentionBytes = 1LL << 22;  // 4 MiB: 2 partitions x 1024 x 4 KiB segments stay inside the #296 fd budget
     s.retentionCheckMs = 777;
     s.fileDeleteDelayMs = 888;
     s.segmentRollBytes = 4096;
@@ -140,7 +140,7 @@ TEST_P(CompactedTopicRegression, EveryCompactionSettingReachesTheBroker) {
     EXPECT_EQ(got.minCompactionLagMs, 1'500);
     EXPECT_EQ(got.maxCompactionLagMs, 90'000);
     EXPECT_EQ(got.retentionMs, 3'600'000);
-    EXPECT_EQ(got.retentionBytes, 1LL << 30);
+    EXPECT_EQ(got.retentionBytes, 1LL << 22);
     EXPECT_EQ(got.retentionCheckMs, 777);
     EXPECT_EQ(got.fileDeleteDelayMs, 888);
     EXPECT_EQ(got.segmentRollBytes, 4096);
@@ -356,21 +356,32 @@ TEST(FdBudgetRegression, BootBudgetCountsTheCatalogTopicsRegression) {
 TEST(FdBudgetRegression, ARestartRefusesWhenTheCatalogTopicsExceedTheHardLimitRegression) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     SingleNodeForTest n("tc_fd_refuse");
+    // The CREATE must be ADMITTED under this process's open-file limit (issue #296 admission), so the topic is sized
+    // to about half of it rather than to a fixed astronomic need: a host with a 20000 hard limit refused the old
+    // 1 TiB topic at CREATE time and the restart check was never reached.  The child then lowers the hard limit to
+    // one below the catalog's need, so the restart must refuse on every host.
+    rlimit cur{};
+    ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &cur), 0);
+    const uint64_t limit = cur.rlim_cur == RLIM_INFINITY ? (1u << 20) : std::min<uint64_t>(cur.rlim_cur, 1u << 20);
+    const uint64_t depth = static_cast<uint64_t>(n.config().segmentProvisionDepth);
+    const uint64_t perSegment = kFdsPerSegment;
+    ASSERT_GT(limit / 2, fdNeedBase() + 64) << "the host's open-file limit is too low to size the topic";
+    const uint64_t topicFds = limit / 2 - fdNeedBase();
     TopicSpec huge;
     huge.name = "huge";
     huge.partitionCount = 1;
-    huge.retentionBytes = 1LL << 40;
     huge.segmentRollBytes = 4096;
+    huge.retentionBytes = static_cast<int64_t>(4096 * (topicFds / perSegment));
     ASSERT_EQ(TestCluster({n.node()}).defineTopic(huge), 0);
     const std::vector<TopicSpec> specs{n.topicSpecOnControl(0)};
-    ASSERT_GT(estimateFdNeed(specs, static_cast<uint64_t>(n.config().segmentProvisionDepth)), 65536u);
+    const uint64_t need = estimateFdNeed(specs, depth);
+    ASSERT_GT(need, fdNeedBase() + 1000) << "the catalog topic dominates the need";
+    ASSERT_LE(need, limit) << "the CREATE was admitted under the process limit";
     n.stop();
     const NodeConfig cfg = n.config();
-    const auto restartUnderALowHardLimit = [&cfg] {
-            rlimit rl{};
-            getrlimit(RLIMIT_NOFILE, &rl);
-            const rlim_t hard = std::min<rlim_t>(rl.rlim_max, 65536);   // a FINITE hard limit
-            rlimit low{std::min(rl.rlim_cur, hard), hard};
+    const auto restartUnderALowHardLimit = [&cfg, need] {
+            const rlim_t hard = static_cast<rlim_t>(need - 1);   // a FINITE hard limit just below the need
+            rlimit low{hard, hard};
             if (setrlimit(RLIMIT_NOFILE, &low) != 0) _exit(4);
             BrokerNode b{cfg};
             try { b.start(); } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); _exit(3); }

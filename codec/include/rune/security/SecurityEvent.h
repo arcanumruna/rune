@@ -13,6 +13,11 @@
 // Bootstrap body: verifier, fakeSaltSeed[32] (D8: the cluster-wide fake-salt key, set once).
 // GrantRole / RevokeRole body: roleId u64, roleName u16+bytes.  Empty bodies are zero bytes.
 // FROZEN with formatVer 1: a change ships as formatVer 2.
+//
+// formatVer 2 (namespaces, plan D10) is formatVer 1 with `u32 nsId` inserted right after `u16 kind`, so the header
+// is no longer byte-identical to __catalog's v1 (it IS identical to __catalog's v2).  objectName is the LOCAL name of
+// the user or role; its key is (nsId, local).  A formatVer-1 event decodes with nsId 0 and cannot carry another.
+// formatVer 2 also admits the Truncate operation (7) and the Namespace resource type (5).
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/protocol/SecurityTypes.h>
 
@@ -32,10 +37,10 @@ namespace rune::security {
 
 enum class EventKind : uint16_t { CreateUser = 1, AlterUser = 2, DropUser = 3, CreateRole = 4, DropRole = 5,
                                   Grant = 6, Revoke = 7, GrantRole = 8, RevokeRole = 9, Bootstrap = 10 };
-inline constexpr uint16_t kFormatV1 = 1, kCurrentFormatVer = kFormatV1;
+inline constexpr uint16_t kFormatV1 = 1, kFormatV2 = 2, kCurrentFormatVer = kFormatV2;
 // The frozen enums are defined ONCE, in rune-protocol (SecurityTypes.h); the wire, this event and rune-ql share them.
-using Operation    = rune::protocol::SecurityOperation;      // Read 0 … Admin 6
-using ResourceType = rune::protocol::SecurityResourceType;   // Cluster 0 … TransactionalId 4
+using Operation    = rune::protocol::SecurityOperation;      // Read 0 … Admin 6, Truncate 7 (formatVer 2)
+using ResourceType = rune::protocol::SecurityResourceType;   // Cluster 0 … TransactionalId 4, Namespace 5 (formatVer 2)
 using PatternKind  = rune::protocol::SecurityPatternKind;    // Exact 0, Prefix 1
 using GranteeKind  = rune::protocol::SecurityGranteeKind;    // User 0, Role 1
 [[nodiscard]] constexpr uint8_t opBit(Operation o) noexcept { return static_cast<uint8_t>(1u << static_cast<uint8_t>(o)); }
@@ -84,6 +89,7 @@ using rune::catalog::Principal; using rune::catalog::ReplayedFrom; using rune::c
 
 struct SecurityEvent {
     uint16_t formatVer = kCurrentFormatVer; EventKind kind = EventKind::CreateUser;
+    uint32_t nsId = 0;              // formatVer 2: the namespace of the user / role; a formatVer-1 event is 0
     uint64_t objectId = 0; std::string objectName; uint32_t prevVersion = 0, newVersion = 0;
     std::string statement;          // REDACTED (D10)
     Ops ops; Principal principal; std::optional<ReplayedFrom> replayedFrom;
@@ -101,7 +107,7 @@ enum class EncodeError : uint8_t { KindOpsMismatch, FieldTooLong, BadVerifier,
                                    UnknownFormatVer, UnknownKind, BadEnum };
 
 [[nodiscard]] EventKind kindOf(const Ops&) noexcept;
-/// THE formatVer-1 value validation, the one rule set encode and decode run — exported so apply()
+/// THE value validation (formatVer 1 and 2), the one rule set encode and decode run — exported so apply()
 /// refuses an in-memory event exactly where encode would.  nullopt = valid.
 [[nodiscard]] std::optional<EncodeError> validateEvent(const SecurityEvent&) noexcept;
 [[nodiscard]] std::expected<void, EncodeError> encodeInto(const SecurityEvent&, std::vector<uint8_t>& out);   // clears, reuses capacity

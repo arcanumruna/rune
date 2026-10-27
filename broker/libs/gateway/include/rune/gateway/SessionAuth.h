@@ -11,6 +11,10 @@
 //   AuthPasswordChangeRequired- logged in with a one-time password: only `ALTER USER <self> SET PASSWORD` is allowed.
 //   AuthAuthenticated         - logged in; `perms` is what the session may do (Task 12 compiles it).
 //   AuthAnonymous             - DevDisabled / InProcessUnauthenticated brokers: allow all, no login ever.
+//   AuthAnonymousRead         - namespaces Task 9 (spec §11): an authenticating broker with RUNE_ANONYMOUS_READ on (off
+//                               by default); a session that sent a request without logging in.  Namespace `default`
+//                               (nsId 0, D12), `perms` = Describe on its topics / views only; anything else is
+//                               NotAuthorized (45) and the session stays.
 //
 // Replaces the Task 10 SessionAuthGate (open / bootstrap-only / must-authenticate).
 
@@ -50,31 +54,36 @@ struct AuthAwaitingFinal {
     /// throttle refused, any close) abandoned the first leg and is charged to the login throttle as a failure, once:
     /// first-leg probes are never free.
     bool    finalLegSeen = false;
+    uint32_t nsId = 0;                        ///< namespaces Task 9: the resolved user's namespace (0 for the fakes)
 };
 
 // `loginNonce` (issue #114): the SCRAM combined nonce of the login that authenticated this session - what a change of
 // the user's own credential must be proven over (credentialChangeMessage).  "" = none (a test-set state): no such
 // change can be proven.
-struct AuthPasswordChangeRequired { uint64_t userId = 0; std::string user; std::string loginNonce; };
-struct AuthAuthenticated { uint64_t userId = 0; std::string user; PermissionRef perms; std::string loginNonce; };   // #259: a pooled table
+// `nsId` (namespaces Task 9): the session's namespace - the logged-in user's.  `user` stays the LOCAL name.
+struct AuthPasswordChangeRequired { uint64_t userId = 0; std::string user; std::string loginNonce; uint32_t nsId = 0; };
+struct AuthAuthenticated { uint64_t userId = 0; std::string user; PermissionRef perms; std::string loginNonce;   // #259: a pooled table
+                           uint32_t nsId = 0; };
 struct AuthAnonymous {};
+struct AuthAnonymousRead { PermissionRef perms; };   // namespaces Task 9: always nsId 0 (`default`)
 
 /// How the broker authenticates sessions (what ConnectResponse.authMode reports).  The gateway's own copy of
 /// NodeConfig::authMode, set by BrokerNode at start.
 enum class GatewayAuthMode : uint8_t { InProcess = 0, Dev = 1, Required = 2 };
 
 using SessionAuth = std::variant<AuthAwaitingFirst, AuthAwaitingFinal, AuthPasswordChangeRequired, AuthAuthenticated,
-                                 AuthAnonymous>;
+                                 AuthAnonymous, AuthAnonymousRead>;
 
 /// What the gate does with a request in the session's auth state.
-enum class AuthGate : uint8_t { Allow, AnswerAuthFailedAndEnd, AnswerPasswordChangeRequired };
+enum class AuthGate : uint8_t { Allow, AnswerAuthFailedAndEnd, AnswerPasswordChangeRequired, AnswerNotAuthorized };
 
 /// THE rule of what a session may send in its auth state (the gate before the dispatch switch).  Session-level
 /// frames (Connect / HandshakeContinue / Keepalive / Ping / Disconnect) are always allowed; AuthAwaitingFirst allows
 /// AuthClientFirst (12) and, while `bootstrapOpen`, SecurityBootstrap (80); AuthAwaitingFinal allows AuthClientFinal
 /// (14); anything else there is AuthenticationFailed and the session ends (D13).  AuthPasswordChangeRequired allows a
 /// SecurityDdl only when `isSelfSetPassword` (ALTER USER <self> SET PASSWORD), else PasswordChangeRequired (47) and
-/// the session stays.  Authenticated / anonymous sessions pass (what they may DO is the Authorizer's - Task 12).
+/// the session stays.  AuthAnonymousRead allows the Describe-gated reads (MetadataRequest, GetTopicSchema), else
+/// NotAuthorized (45) and the session stays (namespaces Task 9).  Authenticated / anonymous sessions pass (what they may DO is the Authorizer's - Task 12).
 [[nodiscard]] AuthGate gateFor(const SessionAuth&, rune::protocol::client::TemplateId, bool bootstrapOpen,
                                bool isSelfSetPassword) noexcept;
 

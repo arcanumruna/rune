@@ -7,6 +7,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+#include <rune/gateway/NsNameKey.h>
 
 namespace rune::node {
 
@@ -23,6 +24,7 @@ struct ViewRecord {
     std::vector<uint8_t>  compiledPlanBlob;
     uint8_t               persistence = 0;
     std::vector<uint8_t>  outputDescriptorBlob;  // Task 19b: rune::codec::serialize(outputDescriptor)
+    uint32_t              nsId = 0;              // namespaces Task 5: the namespace that owns the view
 };
 
 /// Single-threaded, admin-thread-owned view catalog. No locks, no atomics —
@@ -38,7 +40,9 @@ public:
     void applyRecord(const ViewRecord& v);
 
     /// Look up by view name. Returns nullptr if absent.
-    [[nodiscard]] const ViewRecord* byName(std::string_view name) const;
+    [[nodiscard]] const ViewRecord* byName(uint32_t nsId, std::string_view name) const;
+    /// The `default` namespace (nsId 0) form.
+    [[nodiscard]] const ViewRecord* byName(std::string_view name) const { return byName(0, name); }
 
     /// Look up by the view's own (runtime) topic id. Returns nullptr if absent.
     [[nodiscard]] const ViewRecord* byViewTopicId(int32_t viewTopicId) const;
@@ -67,7 +71,7 @@ private:
     // definition — same stability guarantee, just applied to the updated slot
     // rather than only to untouched ones.
     std::unordered_map<int32_t, std::size_t> idToIndex_;
-    std::unordered_map<std::string, int32_t>  nameToId_;
+    std::unordered_map<rune::gateway::NsName, int32_t, rune::gateway::NsNameHash, rune::gateway::NsNameEq> nameToId_;
 };
 
 } // namespace rune::node

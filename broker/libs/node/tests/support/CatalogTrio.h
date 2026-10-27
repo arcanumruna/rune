@@ -297,11 +297,26 @@ public:
         meta.clientName    = a.clientName;
         meta.requestId     = a.requestId.none() ? rune::protocol::RequestId{0x7710, ++rid_} : a.requestId;
         m.meta = std::move(meta);
+        m.nsId = a.nsId;
         const int64_t corr = m.corr;
         broker_(b).admin->submit(DdlRequest{std::move(m)});
         for (int i = 0; i < 4; ++i) pump();
         return corr;
     }
+    /// Namespaces Task 7: a namespace Create (81) through `b` with this request id — submitted and pumped (started),
+    /// not awaited: its corr.  awaitAnswer(b, corr) waits for the answer.
+    int64_t submitCreateNamespaceNoWait(int32_t b, const std::string& name, rune::protocol::RequestId rid) {
+        NamespaceDdlMsg m;
+        m.session = kSession; m.corr = ++corr_; m.kind = 1; m.name = name; m.clientVersion = 14;
+        m.meta.sessionId  = kSession;
+        m.meta.clientName = "trio";
+        m.meta.requestId  = rid.none() ? rune::protocol::RequestId{0x7710, ++rid_} : rid;
+        const int64_t corr = m.corr;
+        broker_(b).admin->submit(DdlRequest{std::move(m)});
+        for (int i = 0; i < 4; ++i) pump();
+        return corr;
+    }
+    Answer awaitAnswer(int32_t b, int64_t corr) { return await_(b, corr); }
     /// DropTopic (74) through `b` — answered by a DdlResponse (it carries a detail).
     Answer dropTopic(int32_t b, const std::string& name) {
         DropTopicMsg m;
@@ -342,7 +357,7 @@ public:
     /// (acks=leader); nullopt when `b` does not lead it or the append is refused.
     std::optional<int64_t> produce(int32_t b, const std::string& topic, std::vector<uint8_t> bytes) {
         Broker& br = broker_(b);
-        const rune::catalog::TopicObject* t = br.admin->applier().state().topicByName(topic);
+        const rune::catalog::TopicObject* t = br.admin->applier().state().topicByName(rune::catalog::kDefaultNsId, topic);
         if (t == nullptr) return std::nullopt;
         const auto it = br.data.find(t->topicId);
         if (it == br.data.end() || it->second.empty() || it->second[0]->replica->role() != rr::Role::Leader)
@@ -357,7 +372,7 @@ public:
     /// The value of the record at `offset` of `topic` p0 on `b` (empty: none).
     std::vector<uint8_t> consumeFrom(int32_t b, const std::string& topic, int64_t offset) {
         Broker& br = broker_(b);
-        const rune::catalog::TopicObject* t = br.admin->applier().state().topicByName(topic);
+        const rune::catalog::TopicObject* t = br.admin->applier().state().topicByName(rune::catalog::kDefaultNsId, topic);
         if (t == nullptr) return {};
         const auto it = br.data.find(t->topicId);
         if (it == br.data.end() || it->second.empty()) return {};

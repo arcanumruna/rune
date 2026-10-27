@@ -23,7 +23,9 @@
 
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/protocol/CatalogTypes.h>
+#include <rune/protocol/NamespaceLimits.h>   // NamespaceDdlMsg (namespaces Task 7)
 #include <rune/catalog/CatalogEvent.h>   // rune::catalog::ConfigChange (AlterTopicConfig)
+#include <rune/catalog/NamespaceRegistry.h>   // NamespaceRecord (kA2cNamespaceUpserted, namespaces Task 9)
 #include <rune/protocol/SecurityTypes.h>
 #include <rune/security/SecurityEvent.h>   // ScramVerifier (the security DDL messages, authentication Task 10)
 #include <rune/peerlink/PeerLinkKeys.h>      // LinkInstall (kMsgPeerLinkKeys, issue #241)
@@ -114,6 +116,9 @@ enum : int32_t {
     kMsgSecurityBootstrap   = 31,
     kMsgSecuritySubscribe   = 32,  // the catalog layout: [session:i64][corr:i64][fromOffset:i64]
     kMsgSecurityUnsubscribe = 33,  // the catalog layout: [session:i64][subscriptionId:i64]; -1 = the session closed
+    // Namespaces Task 7 - gateway -> admin: namespace DDL (81) and ListNamespaces (82).
+    kMsgNamespaceDdl        = 34,
+    kMsgListNamespaces      = 35,
 };
 
 /// kMsgCatalogSubscribe / kMsgCatalogUnsubscribe (fixed layouts).
@@ -169,6 +174,9 @@ enum : int32_t {
     // [version:u16][blob] (the kA2cSchemaUpdate layout).  The control thread hands it to the gateway, which fans it
     // out to every worker ahead of any filtered Subscribe.
     kA2cFilterSchema        = 25,
+    // Namespaces Task 9: a namespace record the applier created or changed (live, and every namespace again at a boot
+    // stash) -> the gateway's NamespaceMirror, which the login resolves `ns/user` against.  Layout below.
+    kA2cNamespaceUpserted   = 26,
 };
 
 // ---------------------------------------------------------------------------
@@ -195,6 +203,8 @@ inline void putU16(uint8_t* p, uint16_t v){ std::memcpy(p, &v, 2); }
 inline int64_t  getI64(const uint8_t* p){ int64_t v; std::memcpy(&v, p, 8); return v; }
 inline int32_t  getI32(const uint8_t* p){ int32_t v; std::memcpy(&v, p, 4); return v; }
 inline uint16_t getU16(const uint8_t* p){ uint16_t v; std::memcpy(&v, p, 2); return v; }
+inline void putU32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); }
+inline uint32_t getU32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
 
 } // namespace admin_wire
 
@@ -244,6 +254,7 @@ struct DefineTopicMsg {
     /// "" = allowed (also every in-process / admin-level submit, which no session authorizes), otherwise the
     /// NotAuthorized detail the admin thread answers when the name turns out to be such a topic.
     std::string                 adoptDenial;
+    uint32_t                    nsId = 0;   // namespaces Task 7: the namespace the object lives in (0 = default)
 };
 
 /// AlterTopic: the client's CAS expectation (expectedVersion = the topic's SCHEMA
@@ -255,6 +266,7 @@ struct AlterTopicMsg {
     std::string          topicName;
     std::vector<uint8_t> opsBlob;               // encodeAlterOps() wire bytes
     DdlMeta              meta;
+    uint32_t                    nsId = 0;   // namespaces Task 7: the namespace the object lives in (0 = default)
 };
 
 /// CreateView: `planBlob` is the authored rune::view::ViewPlan (serializeAuthored).
@@ -266,6 +278,7 @@ struct CreateViewMsg {
     std::string          keyField;
     std::vector<uint8_t> planBlob;          // authored ViewPlan (serializeAuthored)
     DdlMeta              meta;
+    uint32_t                    nsId = 0;   // namespaces Task 7: the namespace the object lives in (0 = default)
 };
 
 struct DropTopicMsg {
@@ -273,6 +286,7 @@ struct DropTopicMsg {
     int64_t     corr    = 0;
     std::string name;
     DdlMeta     meta;
+    uint32_t    nsId    = 0;
 };
 
 struct DropViewMsg {
@@ -280,6 +294,7 @@ struct DropViewMsg {
     int64_t     corr    = 0;
     std::string name;
     DdlMeta     meta;
+    uint32_t    nsId    = 0;
 };
 
 /// AlterView (ruling 4): the view's plan and output replaced under the same
@@ -293,6 +308,7 @@ struct AlterViewMsg {
     uint32_t             expectedVersion = 0;
     std::vector<uint8_t> planBlob;
     DdlMeta              meta;
+    uint32_t             nsId            = 0;
 };
 
 /// AlterTopicConfig (ruling 5): expectedVersion = the topic's OBJECT version (0 = no check).
@@ -303,6 +319,7 @@ struct AlterTopicConfigMsg {
     uint32_t                                 expectedVersion = 0;
     std::vector<rune::catalog::ConfigChange> changes;
     DdlMeta                                  meta;
+    uint32_t                                 nsId            = 0;
 };
 
 /// The client-protocol template id each DDL request arrived as (TemplateId values).
@@ -313,6 +330,35 @@ inline constexpr uint16_t kTidDropTopic        = 74;
 inline constexpr uint16_t kTidAlterTopicConfig = 75;
 inline constexpr uint16_t kTidDropView         = 76;
 inline constexpr uint16_t kTidAlterView        = 77;
+inline constexpr uint16_t kTidNamespaceDdl     = 81;
+inline constexpr uint16_t kTidListNamespaces   = 82;
+
+/// Namespaces Task 7: NamespaceDdl (81) — Create / SetLimits.  `mask` bit i = limits field i was given (the rest
+/// resolve at the admin thread: Create from the cluster defaults, SetLimits from the current record).  `denial` is
+/// the gateway's verdict ("" = cluster admin authorized); the admin thread answers a dedupe retry first, then 45.
+/// `clientVersion` picks NamespaceLimitExceeded (52, v14+) or InvalidRequest (39) for an older client.
+struct NamespaceDdlMsg {
+    int64_t                          session = 0;
+    int64_t                          corr    = 0;
+    DdlMeta                          meta;            // the request id lives here
+    uint8_t                          kind    = 0;     // rune::protocol::client::NamespaceDdlKind (1 Create, 2 SetLimits)
+    std::string                      name;
+    std::array<uint8_t, 4>           mask{};
+    rune::protocol::NamespaceLimits  limits;
+    std::string                      denial;
+    uint16_t                         clientVersion = 0;
+};
+
+/// Namespaces Task 7: ListNamespaces (82) — a read, answered on the admin thread from its applied registry (no
+/// append).  afterNsId is exclusive; max 0 = 100.  A caller that is not a cluster admin sees only `callerNsId`.
+struct ListNamespacesMsg {
+    int64_t  session      = 0;
+    int64_t  corr         = 0;
+    uint32_t afterNsId    = 0;
+    uint16_t max          = 0;
+    uint32_t callerNsId   = 0;
+    uint8_t  clusterAdmin = 0;   // 0 / 1
+};
 
 /// A DDL frame the ring decode could not read: what can still be answered (the
 /// request's template id, session and correlation id — 0 when even those are
@@ -327,7 +373,7 @@ struct MalformedDdl {
 
 /// One queued DDL: exactly one request message (the alternative IS the kind).
 using DdlRequest = std::variant<DefineTopicMsg, AlterTopicMsg, CreateViewMsg, DropTopicMsg, DropViewMsg,
-                                AlterViewMsg, AlterTopicConfigMsg, MalformedDdl>;
+                                AlterViewMsg, AlterTopicConfigMsg, NamespaceDdlMsg, ListNamespacesMsg, MalformedDdl>;
 
 // ---------------------------------------------------------------------------
 // Authentication Task 10 (D36): the security DDL (79) and the one-time bootstrap (80), gateway → admin on the request
@@ -356,6 +402,9 @@ struct SecurityDdlMsg {
     std::string                   denial;
     /// PR #410 review F2: the gateway checked an own-credential proof for this request (whatever the outcome).
     uint8_t                       proofChecked = 0;
+    /// Namespaces Task 8: the namespace of the session's user (0 = `default`).  An unqualified `name` / `roleName`
+    /// resolves into it, and the leader's namespace guard judges the caller as a user of it.
+    uint32_t                      callerNsId = 0;
 };
 
 /// SecurityBootstrap: the gateway already verified the MAC with its ClusterKeys; the nonce is kept as the request's
@@ -387,6 +436,7 @@ struct GetSchemaMsg {
     int64_t     corr    = 0;
     std::string name;
     uint64_t    requestedFingerprint = 0;
+    uint32_t    nsId = 0;   // namespaces Task 7: the namespace the name resolves in (0 = default)
 };
 
 
@@ -598,30 +648,42 @@ template <class W> void layout(W& w, const DefineTopicMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.i32(m.partitionCount); w.u8(m.validate ? 1 : 0);
     w.str16(m.name); w.str16(m.keyField); w.bytes32(span8(m.blob)); w.u8(m.persistence);
     w.i16(m.replicationFactor); layoutConfig(w, m.config); layoutMeta(w, m.meta); w.str16(m.adoptDenial);
+    w.u32(m.nsId);
 }
 template <class W> void layout(W& w, const AlterTopicMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.u16(m.expectedVersion); w.str16(m.topicName);
-    w.bytes32(span8(m.opsBlob)); layoutMeta(w, m.meta);
+    w.bytes32(span8(m.opsBlob)); layoutMeta(w, m.meta); w.u32(m.nsId);
 }
 template <class W> void layout(W& w, const CreateViewMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.u8(m.persistence); w.str16(m.viewName); w.str16(m.keyField);
-    w.bytes32(span8(m.planBlob)); layoutMeta(w, m.meta);
+    w.bytes32(span8(m.planBlob)); layoutMeta(w, m.meta); w.u32(m.nsId);
 }
 template <class W> void layout(W& w, const DropTopicMsg& m) {
-    w.i64(m.session); w.i64(m.corr); w.str16(m.name); layoutMeta(w, m.meta);
+    w.i64(m.session); w.i64(m.corr); w.str16(m.name); layoutMeta(w, m.meta); w.u32(m.nsId);
 }
 template <class W> void layout(W& w, const DropViewMsg& m) {
-    w.i64(m.session); w.i64(m.corr); w.str16(m.name); layoutMeta(w, m.meta);
+    w.i64(m.session); w.i64(m.corr); w.str16(m.name); layoutMeta(w, m.meta); w.u32(m.nsId);
 }
 template <class W> void layout(W& w, const AlterViewMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.str16(m.name); w.str16(m.keyField); w.u8(m.persistence);
-    w.u32(m.expectedVersion); w.bytes32(span8(m.planBlob)); layoutMeta(w, m.meta);
+    w.u32(m.expectedVersion); w.bytes32(span8(m.planBlob)); layoutMeta(w, m.meta); w.u32(m.nsId);
 }
 template <class W> void layout(W& w, const AlterTopicConfigMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.str16(m.name); w.u32(m.expectedVersion);
     w.u16(static_cast<uint16_t>(m.changes.size()));
     for (const auto& c : m.changes) { w.u8(static_cast<uint8_t>(c.key)); w.i64(c.value); }
-    layoutMeta(w, m.meta);
+    layoutMeta(w, m.meta); w.u32(m.nsId);
+}
+template <class W> void layout(W& w, const NamespaceDdlMsg& m) {
+    w.i64(m.session); w.i64(m.corr); layoutMeta(w, m.meta); w.u8(m.kind); w.str16(m.name);
+    w.bytes32({m.mask.data(), m.mask.size()});
+    std::array<uint8_t, rune::protocol::kNamespaceLimitsBytes> lim{};
+    rune::protocol::encodeLimits(m.limits, lim.data());
+    w.bytes32({lim.data(), lim.size()});
+    w.str16(m.denial); w.u16(m.clientVersion);
+}
+template <class W> void layout(W& w, const ListNamespacesMsg& m) {
+    w.i64(m.session); w.i64(m.corr); w.u32(m.afterNsId); w.u16(m.max); w.u32(m.callerNsId); w.u8(m.clusterAdmin);
 }
 
 template <class W> void layoutVerifier(W& w, const rune::security::ScramVerifier& v) {
@@ -636,6 +698,7 @@ template <class W> void layout(W& w, const SecurityDdlMsg& m) {
     layoutVerifier(w, m.verifier);
     w.u8(m.granteeKind); w.u8(m.op); w.u8(m.resourceType); w.u8(m.patternKind);
     w.str16(m.pattern); w.str16(m.roleName); w.u8(m.force); w.str16(m.denial); w.u8(m.proofChecked);
+    w.u32(m.callerNsId);
 }
 template <class W> void layout(W& w, const SecurityBootstrapMsg& m) {
     w.i64(m.session); w.i64(m.corr); layoutMeta(w, m.meta);
@@ -656,6 +719,8 @@ template <> inline constexpr int32_t kDdlMsgType<DropTopicMsg>        = kMsgDrop
 template <> inline constexpr int32_t kDdlMsgType<DropViewMsg>         = kMsgDropView;
 template <> inline constexpr int32_t kDdlMsgType<AlterViewMsg>        = kMsgAlterView;
 template <> inline constexpr int32_t kDdlMsgType<AlterTopicConfigMsg> = kMsgAlterTopicConfig;
+template <> inline constexpr int32_t kDdlMsgType<NamespaceDdlMsg>     = kMsgNamespaceDdl;
+template <> inline constexpr int32_t kDdlMsgType<ListNamespacesMsg>   = kMsgListNamespaces;
 
 /// The ring frame length of `m`, or 0 when a field does not fit its length prefix.
 template <class M>
@@ -711,6 +776,7 @@ inline DdlRequest decodeDefineTopic(const uint8_t* buf, std::size_t len) {
     admin_wire::readConfig(r, m.config);
     admin_wire::readMeta(r, m.meta);
     r.str16(m.adoptDenial);
+    m.nsId = r.u32();
     return admin_wire::finish(r, std::move(m), kTidDefineTopic);
 }
 inline DdlRequest decodeAlterTopic(const uint8_t* buf, std::size_t len) {
@@ -721,6 +787,7 @@ inline DdlRequest decodeAlterTopic(const uint8_t* buf, std::size_t len) {
     r.str16(m.topicName);
     r.bytes32(m.opsBlob);
     admin_wire::readMeta(r, m.meta);
+    m.nsId = r.u32();
     return admin_wire::finish(r, std::move(m), kTidAlterTopic);
 }
 inline DdlRequest decodeCreateView(const uint8_t* buf, std::size_t len) {
@@ -733,6 +800,7 @@ inline DdlRequest decodeCreateView(const uint8_t* buf, std::size_t len) {
     r.str16(m.keyField);
     r.bytes32(m.planBlob);
     admin_wire::readMeta(r, m.meta);
+    m.nsId = r.u32();
     return admin_wire::finish(r, std::move(m), kTidCreateView);
 }
 inline DdlRequest decodeDropTopic(const uint8_t* buf, std::size_t len) {
@@ -741,6 +809,7 @@ inline DdlRequest decodeDropTopic(const uint8_t* buf, std::size_t len) {
     admin_wire::readHead(r, m);
     r.str16(m.name);
     admin_wire::readMeta(r, m.meta);
+    m.nsId = r.u32();
     return admin_wire::finish(r, std::move(m), kTidDropTopic);
 }
 inline DdlRequest decodeDropView(const uint8_t* buf, std::size_t len) {
@@ -749,6 +818,7 @@ inline DdlRequest decodeDropView(const uint8_t* buf, std::size_t len) {
     admin_wire::readHead(r, m);
     r.str16(m.name);
     admin_wire::readMeta(r, m.meta);
+    m.nsId = r.u32();
     return admin_wire::finish(r, std::move(m), kTidDropView);
 }
 inline DdlRequest decodeAlterView(const uint8_t* buf, std::size_t len) {
@@ -762,6 +832,7 @@ inline DdlRequest decodeAlterView(const uint8_t* buf, std::size_t len) {
     m.expectedVersion = r.u32();
     r.bytes32(m.planBlob);
     admin_wire::readMeta(r, m.meta);
+    m.nsId = r.u32();
     return admin_wire::finish(r, std::move(m), kTidAlterView);
 }
 inline DdlRequest decodeAlterTopicConfig(const uint8_t* buf, std::size_t len) {
@@ -784,7 +855,40 @@ inline DdlRequest decodeAlterTopicConfig(const uint8_t* buf, std::size_t len) {
         m.changes.push_back(rune::catalog::ConfigChange{static_cast<rune::catalog::ConfigKey>(key), value});
     }
     admin_wire::readMeta(r, m.meta);
+    m.nsId = r.u32();
     return admin_wire::finish(r, std::move(m), kTidAlterTopicConfig);
+}
+inline DdlRequest decodeNamespaceDdl(const uint8_t* buf, std::size_t len) {
+    admin_wire::Reader r{buf, len};
+    NamespaceDdlMsg m;
+    admin_wire::readHead(r, m);
+    admin_wire::readMeta(r, m.meta);
+    m.kind = r.u8();
+    r.str16(m.name);
+    std::vector<uint8_t> mask, lim;
+    r.bytes32(mask);
+    r.bytes32(lim);
+    r.str16(m.denial);
+    m.clientVersion = r.u16();
+    if (r.ok) {
+        if (m.kind < 1 || m.kind > 2) r.fail("an unknown namespace DDL kind");   // never cast
+        else if (mask.size() != m.mask.size() || lim.size() != rune::protocol::kNamespaceLimitsBytes ||
+                 !rune::protocol::decodeLimits(lim.data(), lim.size(), m.limits))
+            r.fail("a malformed namespace limits record");
+        else std::memcpy(m.mask.data(), mask.data(), mask.size());
+    }
+    return admin_wire::finish(r, std::move(m), kTidNamespaceDdl);
+}
+inline DdlRequest decodeListNamespaces(const uint8_t* buf, std::size_t len) {
+    admin_wire::Reader r{buf, len};
+    ListNamespacesMsg m;
+    admin_wire::readHead(r, m);
+    m.afterNsId    = r.u32();
+    m.max          = r.u16();
+    m.callerNsId   = r.u32();
+    m.clusterAdmin = r.u8();
+    if (r.ok && m.clusterAdmin > 1) r.fail("a cluster-admin flag other than 0/1");
+    return admin_wire::finish(r, std::move(m), kTidListNamespaces);
 }
 
 // ---- Security DDL decode (authentication Task 10) ----
@@ -828,6 +932,7 @@ inline SecurityRequest decodeSecurityDdl(const uint8_t* buf, std::size_t len) {
     m.force = r.u8();
     r.str16(m.denial);
     m.proofChecked = r.u8();
+    m.callerNsId = r.u32();
     if (r.ok) {
         if (m.kind < 1 || m.kind > 9) r.fail("an unknown security op kind");
         else if (m.force > 1) r.fail("a force flag other than 0/1");
@@ -966,7 +1071,7 @@ struct CatalogReadResumeMsg { int64_t session = 0; int64_t subscriptionId = 0; }
 // nameLen:u16 + name bytes.
 inline bool encodeGetSchema(OneToOneByteRing& ring, const GetSchemaMsg& m) {
     using namespace admin_wire;
-    const std::size_t len = 8 + 8 + 8 + 2 + m.name.size();
+    const std::size_t len = 8 + 8 + 8 + 2 + m.name.size() + 4;
     const auto idx = ring.tryClaim(kMsgGetSchema, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
@@ -974,7 +1079,8 @@ inline bool encodeGetSchema(OneToOneByteRing& ring, const GetSchemaMsg& m) {
     putI64(p, m.corr);    p += 8;
     putI64(p, static_cast<int64_t>(m.requestedFingerprint)); p += 8;
     putU16(p, static_cast<uint16_t>(m.name.size())); p += 2;
-    std::memcpy(p, m.name.data(), m.name.size());
+    std::memcpy(p, m.name.data(), m.name.size()); p += m.name.size();
+    putU32(p, m.nsId);
     ring.commit(idx);
     return true;
 }
@@ -989,6 +1095,7 @@ inline GetSchemaMsg decodeGetSchema(const uint8_t* buf, std::size_t len) {
     const uint16_t nl = getU16(buf + 24);
     if (26 + static_cast<std::size_t>(nl) <= len)
         m.name.assign(reinterpret_cast<const char*>(buf + 26), nl);
+    if (26 + static_cast<std::size_t>(nl) + 4 <= len) m.nsId = getU32(buf + 26 + nl);
     return m;
 }
 
@@ -1120,6 +1227,43 @@ inline void writeFilterSchema(uint8_t* p, int32_t topicId, uint16_t version, std
     return true;
 }
 
+// ---- NamespaceUpserted (admin -> control; namespaces Task 9) ----
+//   [nsId:u32][version:u32][state:u8 NsStateTag][fingerprint:u64][limits: kNamespaceLimitsBytes][nameLen:u16 + name]
+inline constexpr std::size_t kNamespaceUpsertedFixedBytes = 4 + 4 + 1 + 8 + rune::protocol::kNamespaceLimitsBytes + 2;
+[[nodiscard]] inline std::size_t namespaceUpsertedWireLen(std::string_view name) noexcept {
+    return name.size() > 0xFFFF ? 0 : kNamespaceUpsertedFixedBytes + name.size();
+}
+/// Writes exactly namespaceUpsertedWireLen(rec.name) bytes at `p`.
+inline void writeNamespaceUpserted(uint8_t* p, const rune::catalog::NamespaceRecord& rec) noexcept {
+    using namespace admin_wire;
+    putU32(p, rec.nsId);
+    putU32(p + 4, rec.version);
+    p[8] = static_cast<uint8_t>(rune::catalog::tagOf(rec.state));
+    std::memcpy(p + 9, &rec.fingerprint, 8);
+    rune::protocol::encodeLimits(rec.limits, p + 17);
+    uint8_t* q = p + 17 + rune::protocol::kNamespaceLimitsBytes;
+    putU16(q, static_cast<uint16_t>(rec.name.size()));
+    if (!rec.name.empty()) std::memcpy(q + 2, rec.name.data(), rec.name.size());
+}
+/// False on a short / trailing-garbage frame or an unknown state tag (the caller logs it, rate-limited, and skips it).
+[[nodiscard]] inline bool decodeNamespaceUpserted(const uint8_t* buf, std::size_t len, rune::catalog::NamespaceRecord& rec) {
+    using namespace admin_wire;
+    if (buf == nullptr || len < kNamespaceUpsertedFixedBytes) return false;
+    rec.nsId = getU32(buf);
+    rec.version = getU32(buf + 4);
+    const uint8_t tag = buf[8];
+    if (tag > static_cast<uint8_t>(rune::catalog::NsStateTag::Deleting)) return false;
+    rec.state = rune::catalog::stateOf(static_cast<rune::catalog::NsStateTag>(tag));
+    std::memcpy(&rec.fingerprint, buf + 9, 8);
+    if (!rune::protocol::decodeLimits(buf + 17, len - 17, rec.limits)) return false;
+    std::size_t pos = 17 + rune::protocol::kNamespaceLimitsBytes;
+    const uint16_t n = getU16(buf + pos);
+    pos += 2;
+    if (pos + n != len) return false;
+    rec.name.assign(reinterpret_cast<const char*>(buf + pos), n);
+    return true;
+}
+
 // ---- ViewPlanUpdate (Task 19) ----
 // Carries a compiled view plan + its output + source descriptors to install on a
 // worker's WorkerViewSet.  Used on TWO rings with the SAME wire layout:
@@ -1235,7 +1379,8 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
 //                             maxCompactionLagMs:i64 retentionCheckMs:i64
 //                             fileDeleteDelayMs:i64 durability:u8 durabilityTier:u8
 //                             coPartitionGroupLen:u16 + bytes, partitionKeyLen:u16 + bytes
-//   kA2cCatalogTopicDropped : [topicId:i32][nameLen:u16 + name]
+//                             [nsId:u32]   (namespaces Task 5: the owning namespace; appended LAST)
+//   kA2cCatalogTopicDropped : [topicId:i32][nameLen:u16 + name][nsId:u32]
 //   kA2cCatalogTopicConfig  : [topicId:i32][count:u16][(key:u8, value:i64) * count]
 //   kA2cViewUninstall       : [viewTopicId:i32]
 //   kA2cCatalogHalted       : [offset:i64][expected:u64][actual:u64][detail bytes (rest)]
@@ -1278,6 +1423,7 @@ struct CatalogTopicAppliedMsg {
     int16_t                     replicationFactor = 0;
     uint8_t                     persistence       = 0;   // 0 disk, 1 transient
     rune::protocol::TopicConfig config;
+    uint32_t                    nsId              = 0;   // the owning namespace (names are per namespace)
 };
 
 /// 0 = cannot be encoded (a string longer than a u16 prefix holds).
@@ -1285,11 +1431,12 @@ struct CatalogTopicAppliedMsg {
                                                             const rune::protocol::TopicConfig& c) noexcept {
     if (name.size() > kMaxStr16 || c.coPartitionGroup.size() > kMaxStr16 || c.partitionKey.size() > kMaxStr16)
         return 0;
-    return 4 + 2 + name.size() + 4 + 2 + 1 + topicConfigWireLen(c);
+    return 4 + 2 + name.size() + 4 + 2 + 1 + topicConfigWireLen(c) + 4;
 }
 
 inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_view name, int32_t partitions,
-                                     int16_t rf, uint8_t persistence, const rune::protocol::TopicConfig& c) {
+                                     int16_t rf, uint8_t persistence, const rune::protocol::TopicConfig& c,
+                                     uint32_t nsId = 0) {
     using namespace admin_wire;
     putI32(p, topicId); p += 4;
     p = putStr16(p, name);
@@ -1309,7 +1456,8 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
     *p++ = c.durability;
     *p++ = c.durabilityTier;
     p = putStr16(p, c.coPartitionGroup);
-    (void)putStr16(p, c.partitionKey);
+    p = putStr16(p, c.partitionKey);
+    putU32(p, nsId);
 }
 
 [[nodiscard]] inline bool decodeCatalogTopicApplied(const uint8_t* buf, std::size_t len, CatalogTopicAppliedMsg& m) {
@@ -1338,25 +1486,32 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
     c.durabilityTier            = buf[pos++];
     if (!getStr16(buf, len, pos, c.coPartitionGroup)) return false;
     if (!getStr16(buf, len, pos, c.partitionKey)) return false;
+    if (pos + 4 > len) return false;
+    m.nsId = getU32(buf + pos); pos += 4;
     return pos == len && m.topicId >= 0 && m.partitions > 0 && !m.name.empty();
 }
 
 struct CatalogTopicDroppedMsg {
     int32_t     topicId = -1;
     std::string name;
+    uint32_t    nsId    = 0;   // namespaces plan Task 6: the dropped topic's namespace (its dir is under ns-<nsId>)
 };
 [[nodiscard]] inline std::size_t catalogTopicDroppedWireLen(std::string_view name) noexcept {
-    return name.size() > kMaxStr16 ? 0 : 4 + 2 + name.size();
+    return name.size() > kMaxStr16 ? 0 : 4 + 2 + name.size() + 4;
 }
-inline void writeCatalogTopicDropped(uint8_t* p, int32_t topicId, std::string_view name) {
+inline void writeCatalogTopicDropped(uint8_t* p, int32_t topicId, std::string_view name, uint32_t nsId = 0) {
     admin_wire::putI32(p, topicId);
-    (void)admin_wire::putStr16(p + 4, name);
+    uint8_t* q = admin_wire::putStr16(p + 4, name);
+    admin_wire::putU32(q, nsId);
 }
 [[nodiscard]] inline bool decodeCatalogTopicDropped(const uint8_t* buf, std::size_t len, CatalogTopicDroppedMsg& m) {
     if (len < 4) return false;
     m.topicId = admin_wire::getI32(buf);
     std::size_t pos = 4;
     if (!admin_wire::getStr16(buf, len, pos, m.name)) return false;
+    if (pos + 4 > len) return false;
+    m.nsId = admin_wire::getU32(buf + pos);
+    pos += 4;
     return pos == len && m.topicId >= 0;
 }
 
@@ -1511,23 +1666,26 @@ inline void writeSecurityApplied(uint8_t* p, int64_t offset, std::span<const uin
     bytes  = std::span<const uint8_t>(buf + kSecurityAppliedFixedBytes, len - kSecurityAppliedFixedBytes);
     return offset >= 0;
 }
-//   kA2cSecurityServing : [caughtUp:u8][leaderHw:i64][epoch:i32][asLeader:u8][knownEnd:i64][behind:u8]   (issues
+//   kA2cSecurityServing : [caughtUp:u8][leaderHw:i64][epoch:i32][asLeader:u8][knownEnd:i64][behind:u8][held:u8]   (issues
 //                         #15 / #111; PR #459 F2: the epoch / role the verdict is for, compared with the committed
 //                         assignment on the control thread; #205: knownEnd = max(log end, leader HW) - the events this
 //                         broker knows exist; #603: behind = the applier is below the committed HW this broker knows -
-//                         every grant-checked operation answers AuthUnavailable until it is not)
-inline constexpr std::size_t kSecurityServingWireLen = 1 + 8 + 4 + 1 + 8 + 1;
+//                         every grant-checked operation answers AuthUnavailable until it is not; #460: held = the verdict is held through a
+//                         leader failover - it counts only while this broker is in the committed ISR)
+inline constexpr std::size_t kSecurityServingWireLen = 1 + 8 + 4 + 1 + 8 + 1 + 1;
 inline void writeSecurityServing(uint8_t* p, bool caughtUp, int64_t leaderHw, int32_t epoch = -1,
-                                 bool asLeader = false, int64_t knownEnd = -1, bool behind = false) noexcept {
+                                 bool asLeader = false, int64_t knownEnd = -1, bool behind = false,
+                                 bool held = false) noexcept {
     p[0] = caughtUp ? 1 : 0;
     admin_wire::putI64(p + 1, leaderHw);
     std::memcpy(p + 9, &epoch, 4);
     p[13] = asLeader ? 1 : 0;
     admin_wire::putI64(p + 14, knownEnd);
     p[22] = behind ? 1 : 0;
+    p[23] = held ? 1 : 0;
 }
 [[nodiscard]] inline bool decodeSecurityServing(const uint8_t* buf, std::size_t len, bool& caughtUp, int64_t& leaderHw) noexcept {
-    if (len != kSecurityServingWireLen || buf[0] > 1 || buf[13] > 1 || buf[22] > 1) return false;
+    if (len != kSecurityServingWireLen || buf[0] > 1 || buf[13] > 1 || buf[22] > 1 || buf[23] > 1) return false;
     caughtUp = buf[0] == 1;
     leaderHw = admin_wire::getI64(buf + 1);
     return true;
@@ -1549,6 +1707,13 @@ inline void writeSecurityServing(uint8_t* p, bool caughtUp, int64_t leaderHw, in
                                                 int32_t& epoch, bool& asLeader, int64_t& knownEnd, bool& behind) noexcept {
     if (!decodeSecurityServing(buf, len, caughtUp, leaderHw, epoch, asLeader, knownEnd)) return false;
     behind = buf[22] == 1;
+    return true;
+}
+[[nodiscard]] inline bool decodeSecurityServing(const uint8_t* buf, std::size_t len, bool& caughtUp, int64_t& leaderHw,
+                                                int32_t& epoch, bool& asLeader, int64_t& knownEnd, bool& behind,
+                                                bool& held) noexcept {
+    if (!decodeSecurityServing(buf, len, caughtUp, leaderHw, epoch, asLeader, knownEnd, behind)) return false;
+    held = buf[23] == 1;
     return true;
 }
 using SecurityHaltedMsg = CatalogHaltedMsg;
@@ -1581,9 +1746,9 @@ template <typename Write>
 // 6-byte header in front, so every committed descriptor fits.
 // statement(4) + clientName(2) + sourceAddress(2) + authenticated(2, auth Task 10) + sessionId + requestId hi/lo + flag.
 inline constexpr std::size_t kDdlMetaFixedBytes     = 4 + 2 + 2 + 2 + 8 + 8 + 8 + 1;
-// The trailing adoptDenial length prefix (2, issue #129).
+// The trailing adoptDenial length prefix (2, issue #129), then the nsId (4, namespaces).
 inline constexpr std::size_t kDefineTopicFixedBytes =
-    8 + 8 + 4 + 1 + 2 + 2 + 4 + 1 + 2 + kTopicConfigFixedBytes + 2 + 2 + kDdlMetaFixedBytes + 2;
+    8 + 8 + 4 + 1 + 2 + 2 + 4 + 1 + 2 + kTopicConfigFixedBytes + 2 + 2 + kDdlMetaFixedBytes + 2 + 4;
 inline constexpr std::size_t kMaxDescriptorViaRequestRing =
     static_cast<std::size_t>(kAdminRequestRingBytes) / 8 - kDefineTopicFixedBytes;
 static_assert(schemaUpdateWireLen(kMaxDescriptorViaRequestRing) <=

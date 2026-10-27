@@ -37,6 +37,7 @@ TEST(SecurityRingCodecRegression, EveryFieldOfASecurityDdlRoundTrips) {
     m.kind = 2; m.name = "alice"; m.change = 2; m.terminateSessions = 1; m.passwordIndex = 0;
     m.verifier = rune::node::test::SecurityDdlRig::verifierFor("a-long-password-1");
     m.granteeKind = 1; m.op = 6; m.resourceType = 0; m.patternKind = 1; m.pattern = "world."; m.roleName = "world_server";
+    m.callerNsId = 7;   // namespaces Task 8: the session user's namespace rides the frame
     const auto got = roundTrip(m, decodeSecurityDdl);
     const auto* d = std::get_if<SecurityDdlMsg>(&got);
     ASSERT_NE(d, nullptr);
@@ -47,6 +48,7 @@ TEST(SecurityRingCodecRegression, EveryFieldOfASecurityDdlRoundTrips) {
     EXPECT_EQ(d->verifier, m.verifier);
     EXPECT_EQ(d->granteeKind, 1); EXPECT_EQ(d->op, 6); EXPECT_EQ(d->patternKind, 1);
     EXPECT_EQ(d->pattern, "world."); EXPECT_EQ(d->roleName, "world_server");
+    EXPECT_EQ(d->callerNsId, 7u);
 }
 
 TEST(SecurityRingCodecRegression, ABootstrapRoundTripsWithItsSeedAndNonce) {

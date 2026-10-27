@@ -824,12 +824,19 @@ struct Parser {
     }
 
     // ---- security statements (authentication) ----
-    // NAME := IDENT | STRING (non-empty)
+    // NAME := IDENT | STRING (non-empty).  A quoted name may be namespace-qualified, 'ns/name' (namespaces D7):
+    // at most one '/', with a non-empty part on each side.  'a/b/c', 'a//x', '/x' and 'a/' are parse errors; the
+    // broker resolves (and hides) the namespace itself.
     std::expected<std::string, ParseError> parseName(std::string_view what) noexcept {
         if (cur.kind == TK::Ident) { std::string v(cur.text); advance(); return v; }
         if (cur.kind == TK::BadString) return std::unexpected(err("unterminated string literal"));
         if (cur.kind == TK::String) {
             if (cur.text.empty()) return std::unexpected(err(std::string(what) + " must not be empty"));
+            const std::size_t slash = cur.text.find('/');
+            if (slash != std::string_view::npos &&
+                (slash == 0 || slash + 1 == cur.text.size() || cur.text.find('/', slash + 1) != std::string_view::npos))
+                return std::unexpected(err(std::string(what) +
+                                           " must be 'name' or 'namespace/name' (one '/', both parts non-empty)"));
             std::string v(cur.text);
             advance();
             return v;
@@ -928,11 +935,12 @@ struct Parser {
     std::expected<SecOp, ParseError> parseOperation() noexcept {
         static constexpr std::pair<std::string_view, SecOp> kOps[] = {
             {"read", SecOp::Read}, {"write", SecOp::Write}, {"create", SecOp::Create}, {"alter", SecOp::Alter},
-            {"drop", SecOp::Drop}, {"describe", SecOp::Describe}, {"admin", SecOp::Admin}};
+            {"drop", SecOp::Drop}, {"describe", SecOp::Describe}, {"admin", SecOp::Admin},
+            {"truncate", SecOp::Truncate}};
         if (cur.kind == TK::Ident)
             for (const auto& [kw, op] : kOps)
                 if (ieq(cur.text, kw)) { advance(); return op; }
-        return std::unexpected(err("expected an operation ('read', 'write', 'create', 'alter', 'drop', 'describe' or 'admin'), got " + got()));
+        return std::unexpected(err("expected an operation ('read', 'write', 'create', 'alter', 'drop', 'describe', 'admin' or 'truncate'), got " + got()));
     }
 
     std::expected<SecPattern, ParseError> parseResource() noexcept {
@@ -942,7 +950,25 @@ struct Parser {
         else if (isKw("view")) r.type = SecResource::View;
         else if (isKw("group")) r.type = SecResource::Group;
         else if (isKw("transactional_id")) r.type = SecResource::TransactionalId;
-        else return std::unexpected(err("expected 'cluster', 'topic', 'view', 'group' or 'transactional_id', got " + got()));
+        else if (isKw("namespace")) {
+            // NAMESPACE 'name': an exact, unqualified namespace name (no PREFIX form, no '/').
+            advance();
+            Token at = cur;
+            if (isKw("prefix")) {
+                Lexer save = lex; Token savedCur = cur;
+                advance();
+                const bool patterned = cur.kind == TK::String || cur.kind == TK::BadString;
+                lex = save; cur = savedCur;
+                if (patterned) return std::unexpected(errAt(at, "a namespace name is exact (no PREFIX form)"));
+            }
+            auto n = parseName("a namespace name");
+            if (!n) return std::unexpected(std::move(n.error()));
+            if (n->find('/') != std::string::npos) return std::unexpected(errAt(at, "a namespace name has no '/'"));
+            r.type = SecResource::Namespace;
+            r.name = std::move(*n);
+            return r;
+        }
+        else return std::unexpected(err("expected 'cluster', 'topic', 'view', 'group', 'transactional_id' or 'namespace', got " + got()));
         advance();
         if (isKw("prefix")) {
             // `prefix 'x'` is a prefix pattern; a bare `prefix` is an object named prefix.

@@ -14,7 +14,7 @@
 //   1. TooShort          — avail < MessageHeader::ENCODED_SIZE
 //   2. WrongSchema       — header.schemaId != kSchemaId
 //   3. UnsupportedVersion— header.version  >  kProtocolVersion
-//   4. UnknownTemplate   — templateId not in the known set (1..7 MA; 8-9 MD1; 16..21 MB; 32..44 MC; 12..15 auth; 64..80)
+//   4. UnknownTemplate   — templateId not in the known set (1..7 MA; 8-9 MD1; 16..21 MB; 32..44 MC; 12..15 auth; 64..83)
 //   5. Ok
 //
 // Future tickets extend isKnownTemplate() as new template ids are assigned
@@ -108,9 +108,9 @@ struct FrameCheck {
         tid <= static_cast<uint16_t>(TemplateId::EndTxnResponse)) {
         return true;
     }
-    // 0b/0c schema + view-engine range + catalog-history DDL + security DDL: 64..80
+    // 0b/0c schema + view-engine range + catalog-history DDL + security DDL + namespaces: 64..83
     if (tid >= static_cast<uint16_t>(TemplateId::DefineTopic) &&
-        tid <= static_cast<uint16_t>(TemplateId::SecurityBootstrap)) {
+        tid <= static_cast<uint16_t>(TemplateId::ListNamespacesResponse)) {
         return true;
     }
     return false;

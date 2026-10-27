@@ -2,6 +2,7 @@
 // → gateway (Connect) → worker shard ingress (Produce) → worker replication plane
 // → ProduceResponse.  Legacy default must build no shard runtime.
 #include <algorithm>
+#include <rune/node/NamespacePaths.h>
 #include "support/TestCluster.h"
 #include "support/OwnerThreadTestHelpers.h"
 #include "support/ShardTestClient.h"
@@ -139,7 +140,7 @@ std::string workerIngressChannel(const ShardPorts& p, int node, int w) {
     return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p.ib[node] + w);
 }
 int64_t logEndOffsetAfterStop(const fs::path& dataDir) {
-    rune::storage::Log log((dataDir / "topics" / "st" / "0").string(), 64LL * 1024 * 1024);
+    rune::storage::Log log((rune::node::topicsRoot(dataDir, 0) / "st" / "0").string(), 64LL * 1024 * 1024);
     log.recover();
     return log.logEndOffset();
 }

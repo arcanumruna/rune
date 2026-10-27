@@ -124,6 +124,7 @@ struct Sess {
     AuthWireClient*  w = nullptr;
     int64_t     sid = 0;
     bool        alive = false;
+    Clock::time_point loginAt{};   ///< when the test observed this session's login OK
 };
 
 struct Sub {
@@ -229,7 +230,7 @@ private:
             s.sid = s.w->connect(rig_.ch());
             if (s.sid <= 0) { failWith_("connect"); return; }
             const auto l = s.w->login(rig_.ch(), s.sid, user_(s.user), {AuthRig::kPw, AuthRig::kPw});
-            if (l.ok()) { s.alive = true; return; }
+            if (l.ok()) { s.alive = true; s.loginAt = Clock::now(); return; }
             // AuthUnavailable (48) is no verdict either: the gateway's security view moved between the two legs (or is
             // stale) and a real client retries it (review of PR #596) - bounded like the throttle retry.
             const bool unavailable = l.answered() && l.errorCode() == static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable);
@@ -622,10 +623,13 @@ private:
     void check_() {
         observe_();
         checkEndedSilent_();
-        // a disabled user's sessions are dead the moment the DISABLE is answered
+        // a disabled user's sessions are dead the moment the DISABLE is answered - even when a later ENABLE is already
+        // sent or answered (the broker closed them at the DISABLE; an ENABLE never revives a session).  Only a session
+        // whose login the test saw BEFORE that answer was open at the DISABLE (reconnects run only once every change is
+        // answered, so a later login is after it).
         for (const Pending& c : changes_)
             if (c.answered && c.c.kind == pm::Change::Kind::Disable && c.code == 0)
-                for (Sess& s : sess_) if (s.alive && user_(s.user) == c.c.who && !states_.back().isEnabled(c.c.who)) { s.alive = false; }
+                for (Sess& s : sess_) if (s.alive && user_(s.user) == c.c.who && s.loginAt < c.answeredAt) { s.alive = false; }
     }
 
     // ── end of a seed: drain, then convergence ──
@@ -854,4 +858,39 @@ TEST(AuthStressRegression, DisabledLoginIsDefinitelyRefusedOnEverySeedRegression
         EXPECT_TRUE(ok.ok()) << "the first login after an answered ENABLE succeeds (answered=" << ok.answered()
                              << " code=" << ok.errorCode() << " retryAfterMs=" << (ok.fin ? ok.fin->retryAfterMs : 0u) << ")";
     }
+}
+
+// The stress model's DISABLE rule, the deterministic shape: a session open at an answered DISABLE is closed by the
+// broker and stays closed after an ENABLE (an ENABLE never revives it) - the gateway forgets it and the worker holds no
+// permission epoch for it - while a fresh login after the ENABLE holds a shipped epoch.  The seeded stress run once
+// kept such a session "alive" (it read the newest model state, already re-enabled) and checked its epoch.
+TEST(AuthStressRegression, DisableThenEnableLeavesTheOldSessionClosedRegression) {
+    AuthBroker::Options o;
+    o.shard = true;   // the worker permission epoch exists in shard worker mode (as in the seeded run)
+    AuthRig rig("disenable", o);
+    auto& adm = rig.broker().admin();
+    AuthWireClient& w = rig.broker().wire();
+    std::string user;
+    (void)rig.newUser({}, &user);
+    const auto before = w.connectAndLogin(rig.ch(), user, AuthRig::kPw);
+    ASSERT_TRUE(before.ok());
+    const int64_t oldSid = before.sessionId;
+    auto& node = rig.broker().node();
+    EXPECT_TRUE(node.gatewayHasSessionForTest(oldSid));
+    const auto shipped = Clock::now() + 5s;
+    while (node.workerPermissionEpochForTest(0, oldSid) == 0 && Clock::now() < shipped) w.raw().pollFor(2ms, [] { return false; });
+    ASSERT_NE(node.workerPermissionEpochForTest(0, oldSid), 0u) << "a live session holds a shipped epoch";
+    ASSERT_EQ(adm.alterPassword(rig.ch(), rig.broker().adminSession(), user, pc::UserChangeKind::Disable).errorCode, 0);
+    ASSERT_EQ(adm.alterPassword(rig.ch(), rig.broker().adminSession(), user, pc::UserChangeKind::Enable).errorCode, 0);
+    const auto closed = Clock::now() + 5s;
+    while ((node.gatewayHasSessionForTest(oldSid) || node.workerPermissionEpochForTest(0, oldSid) != 0) && Clock::now() < closed)
+        w.raw().pollFor(2ms, [] { return false; });
+    EXPECT_FALSE(node.gatewayHasSessionForTest(oldSid)) << "the DISABLE closed the session; the ENABLE did not revive it";
+    EXPECT_EQ(node.workerPermissionEpochForTest(0, oldSid), 0u) << "the worker dropped the closed session";
+    rig.broker().node().resetLoginThrottleForTest();
+    const auto after = w.connectAndLogin(rig.ch(), user, AuthRig::kPw);
+    ASSERT_TRUE(after.ok());
+    const auto reshipped = Clock::now() + 5s;
+    while (node.workerPermissionEpochForTest(0, after.sessionId) == 0 && Clock::now() < reshipped) w.raw().pollFor(2ms, [] { return false; });
+    EXPECT_NE(node.workerPermissionEpochForTest(0, after.sessionId), 0u) << "a fresh login after the ENABLE holds a shipped epoch";
 }

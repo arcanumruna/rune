@@ -71,16 +71,19 @@ means to reproduce them ([Benchmarking](https://github.com/arcanumruna/rune/wiki
 - **macOS:** add `-s arch=x86_64 -s compiler.cppstd=23` to step 2 (Conan has no Aeron for Apple Silicon; the x86_64 build runs under Rosetta).
 
 ```bash
-# 1. Clone Rune and, next to it, the flight recorder (CMake and the docker scripts read the sibling checkout)
+# 1. Clone Rune and, next to it, the flight recorder and arcanum-metrics (CMake and the docker scripts read the
+#    sibling checkouts; without ARCANUM_METRICS_DIR CMake fetches arcanum-metrics at its pinned sha)
 git clone https://github.com/arcanumruna/rune.git
 git clone https://github.com/arcanumruna/flight-recorder.git
+git clone https://github.com/arcanumruna/arcanum-metrics.git
 cd rune
 # 2. Dependencies: Aeron, spdlog, GTest, Google Benchmark, OpenSSL
 conan install . -of build/conan -s build_type=Debug --build=missing
 # 3. Configure
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
       -DCMAKE_TOOLCHAIN_FILE=build/conan/conan_toolchain.cmake \
-      -DBUILD_TESTING=ON -DBUILD_EXAMPLES=ON -DFLIGHT_RECORDER_DIR=../flight-recorder
+      -DBUILD_TESTING=ON -DBUILD_EXAMPLES=ON -DFLIGHT_RECORDER_DIR=../flight-recorder \
+      -DARCANUM_METRICS_DIR=../arcanum-metrics
 # 4. A quick slice: build and run the protocol tests (seconds)
 cmake --build build --target rune_protocol_tests
 ctest --test-dir build/protocol -j8 --output-on-failure
@@ -146,7 +149,7 @@ and [contributing](https://github.com/arcanumruna/rune/wiki/Contributing).
 |---|---|
 | [docs/api/client-cpp.md](docs/api/client-cpp.md) · [wire-protocol.md](docs/api/wire-protocol.md) | The C++ client API; frames, versions, error codes |
 | [docs/api/ql.md](docs/api/ql.md) · [codec.md](docs/api/codec.md) · [admin-cli.md](docs/api/admin-cli.md) | Rune QL; schemas and evolution; every `rune` command |
-| [docs/configuration.md](docs/configuration.md) · [operations.md](docs/operations.md) | Every setting; deploy, key rotation, backups, metrics |
+| [docs/configuration.md](docs/configuration.md) · [operations.md](docs/operations.md) | Every setting; deploy, [namespaces](docs/operations.md#namespaces), key rotation, backups, metrics |
 | [docs/testing.md](docs/testing.md) · [benchmarks.md](docs/benchmarks.md) · [BENCHMARKING.md](broker/bench/BENCHMARKING.md) · [DR_SUITE.md](broker/dr-e2e/DR_SUITE.md) | Test, benchmark and DR reference |
 | [SELF-HOSTING.md](broker/docs/SELF-HOSTING.md) · [SECURITY.md](broker/docs/SECURITY.md) · [CATALOG.md](broker/docs/CATALOG.md) | Long-form operator references |
 

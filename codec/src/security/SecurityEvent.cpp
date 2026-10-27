@@ -1,4 +1,4 @@
-// src/security/SecurityEvent.cpp — the frozen formatVer-1 __security event encoding
+// src/security/SecurityEvent.cpp — the __security event encoding (formatVer 1 frozen; formatVer 2 adds the nsId)
 // (layout: include/rune/security/SecurityEvent.h).  One validation, run by BOTH directions.
 #include <rune/security/SecurityEvent.h>
 #include "../catalog/Wire.h"
@@ -16,19 +16,27 @@ using wire::Writer;
 
 enum class Violation : uint8_t { UnknownFormatVer, UnknownKind, KindOpsMismatch, BadEnum, BadVerifier };
 
-constexpr bool validOperation(Operation o) noexcept { return static_cast<uint8_t>(o) <= static_cast<uint8_t>(Operation::Admin); }
-constexpr bool validResourceType(ResourceType t) noexcept { return static_cast<uint8_t>(t) <= static_cast<uint8_t>(ResourceType::TransactionalId); }
-constexpr bool validPatternKind(PatternKind k) noexcept { return static_cast<uint8_t>(k) <= static_cast<uint8_t>(PatternKind::Prefix); }
-constexpr bool validGrantee(GranteeKind g) noexcept { return static_cast<uint8_t>(g) <= static_cast<uint8_t>(GranteeKind::Role); }
+// formatVer 1 knows operations Read..Admin and resource types Cluster..TransactionalId (frozen); formatVer 2 adds
+// Truncate and Namespace (the protocol's validators are the formatVer-2 ranges).
+constexpr bool validOperation(uint16_t fv, Operation o) noexcept {
+    return fv == kFormatV1 ? static_cast<uint8_t>(o) <= static_cast<uint8_t>(Operation::Admin)
+                           : rune::protocol::validSecurityOperation(static_cast<uint8_t>(o));
+}
+constexpr bool validResourceType(uint16_t fv, ResourceType t) noexcept {
+    return fv == kFormatV1 ? static_cast<uint8_t>(t) <= static_cast<uint8_t>(ResourceType::TransactionalId)
+                           : rune::protocol::validSecurityResourceType(static_cast<uint8_t>(t));
+}
+constexpr bool validPatternKind(PatternKind k) noexcept { return rune::protocol::validSecurityPatternKind(static_cast<uint8_t>(k)); }
+constexpr bool validGrantee(GranteeKind g) noexcept { return rune::protocol::validSecurityGranteeKind(static_cast<uint8_t>(g)); }
 constexpr bool validSaltLen(std::size_t n) noexcept { return n >= kSaltMin && n <= kSaltMax; }
 constexpr bool validIterations(uint32_t n) noexcept { return n >= kIterMin && n <= kIterMax; }
 bool validVerifier(const ScramVerifier& v) noexcept { return validSaltLen(v.salt.size()) && validIterations(v.iterations); }
-bool validGrantSpec(const GrantSpec& g) noexcept {
-    return validOperation(g.op) && validResourceType(g.resource.type) && validPatternKind(g.resource.kind);
+bool validGrantSpec(uint16_t fv, const GrantSpec& g) noexcept {
+    return validOperation(fv, g.op) && validResourceType(fv, g.resource.type) && validPatternKind(g.resource.kind);
 }
 
-std::optional<Violation> checkOps(const Ops& ops) noexcept {
-    return std::visit([](const auto& o) -> std::optional<Violation> {
+std::optional<Violation> checkOps(uint16_t fv, const Ops& ops) noexcept {
+    return std::visit([fv](const auto& o) -> std::optional<Violation> {
         using T = std::decay_t<decltype(o)>;
         if constexpr (std::is_same_v<T, CreateUserOps> || std::is_same_v<T, BootstrapOps>) {
             if (!validVerifier(o.verifier)) return Violation::BadVerifier;
@@ -36,13 +44,13 @@ std::optional<Violation> checkOps(const Ops& ops) noexcept {
             if (const auto* a = std::get_if<AddPassword>(&o.change); a && !validVerifier(a->verifier)) return Violation::BadVerifier;
             if (const auto* s = std::get_if<SetPassword>(&o.change); s && !validVerifier(s->verifier)) return Violation::BadVerifier;
         } else if constexpr (std::is_same_v<T, GrantOps> || std::is_same_v<T, RevokeOps>) {
-            if (!validGrantee(o.grantee) || !validGrantSpec(o.grant)) return Violation::BadEnum;
+            if (!validGrantee(o.grantee) || !validGrantSpec(fv, o.grant)) return Violation::BadEnum;
         }
         return std::nullopt;
     }, ops);
 }
 std::optional<Violation> checkFormatVer(uint16_t v) noexcept {
-    return v == kFormatV1 ? std::nullopt : std::optional<Violation>(Violation::UnknownFormatVer);
+    return (v == kFormatV1 || v == kFormatV2) ? std::nullopt : std::optional<Violation>(Violation::UnknownFormatVer);
 }
 std::optional<Violation> checkKind(uint16_t k) noexcept {
     return (k >= static_cast<uint16_t>(EventKind::CreateUser) && k <= static_cast<uint16_t>(EventKind::Bootstrap))
@@ -52,7 +60,8 @@ std::optional<Violation> validate(const SecurityEvent& e) noexcept {
     if (auto v = checkFormatVer(e.formatVer)) return v;
     if (auto v = checkKind(static_cast<uint16_t>(e.kind))) return v;
     if (e.kind != kindOf(e.ops)) return Violation::KindOpsMismatch;
-    return checkOps(e.ops);
+    if (e.formatVer == kFormatV1 && e.nsId != 0) return Violation::BadEnum;   // formatVer 1 has no nsId field
+    return checkOps(e.formatVer, e.ops);
 }
 DecodeError asDecodeError(Violation v) noexcept {
     switch (v) {
@@ -186,7 +195,9 @@ std::expected<void, EncodeError> encodeInto(const SecurityEvent& e, std::vector<
     out.clear();
     if (auto v = validate(e)) return std::unexpected(asEncodeError(*v));   // the decoder's own rules
     Writer w(out);
-    w.u16(e.formatVer); w.u16(static_cast<uint16_t>(e.kind)); w.u64(e.objectId);
+    w.u16(e.formatVer); w.u16(static_cast<uint16_t>(e.kind));
+    if (e.formatVer >= kFormatV2) w.u32(e.nsId);   // formatVer 2: nsId right after the kind
+    w.u64(e.objectId);
     w.u32(e.prevVersion); w.u32(e.newVersion); w.i64(e.timestampMs); w.u64(e.fingerprint);
     w.str16(e.objectName); w.str32(e.statement);
     wire::writePrincipalAndReplay(w, e.principal, e.replayedFrom);
@@ -218,6 +229,7 @@ std::expected<SecurityEvent, DecodeError> decode(std::span<const uint8_t> bytes)
         if (!r.u16(kind)) return std::unexpected(DecodeError::Truncated);
         if (auto v = checkKind(kind)) return std::unexpected(asDecodeError(*v));
         e.kind = static_cast<EventKind>(kind);
+        if (e.formatVer >= kFormatV2 && !r.u32(e.nsId)) return std::unexpected(DecodeError::Truncated);
         if (!r.u64(e.objectId) || !r.u32(e.prevVersion) || !r.u32(e.newVersion) || !r.i64(e.timestampMs) ||
             !r.u64(e.fingerprint) || !r.str16(e.objectName) || !r.str32(e.statement))
             return std::unexpected(DecodeError::Truncated);
@@ -267,7 +279,7 @@ std::string_view operationName(Operation o) noexcept {
     switch (o) {
     case Operation::Read: return "READ"; case Operation::Write: return "WRITE"; case Operation::Create: return "CREATE";
     case Operation::Alter: return "ALTER"; case Operation::Drop: return "DROP"; case Operation::Describe: return "DESCRIBE";
-    case Operation::Admin: return "ADMIN";
+    case Operation::Admin: return "ADMIN"; case Operation::Truncate: return "TRUNCATE";
     }
     return "?";
 }
@@ -276,6 +288,7 @@ std::string_view resourceTypeName(ResourceType t) noexcept {
     case ResourceType::Cluster: return "CLUSTER"; case ResourceType::Topic: return "TOPIC";
     case ResourceType::View: return "VIEW"; case ResourceType::Group: return "GROUP";
     case ResourceType::TransactionalId: return "TRANSACTIONAL_ID";
+    case ResourceType::Namespace: return "NAMESPACE";
     }
     return "?";
 }

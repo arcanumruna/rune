@@ -4,6 +4,11 @@
 // FROZEN: a change ships under a new formatVer, and old events keep decoding
 // and applying under their own rules (spec §6).
 //
+// formatVer 2 (namespaces, plan D2) is formatVer 1 with `u32 nsId` inserted right after `u16 kind`; the rest is
+// unchanged.  For object kinds (1..9) nsId is the namespace of the object; for namespace kinds (32..35) it is the
+// subject namespace.  A formatVer-1 event decodes with nsId = 0 and cannot carry another.  The broker writes only
+// formatVer 2 (kCurrentFormatVer).
+//
 // formatVer-1 layout (all little-endian, written and read byte-wise — host-endian independent):
 //   u16 formatVer | u16 kind | u64 objectId | u32 prevVersion | u32 newVersion |
 //   i64 timestampMs | u64 fingerprint |
@@ -18,7 +23,9 @@
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/PrimType.h>
 #include <rune/protocol/CatalogTypes.h>
+#include <rune/protocol/NamespaceLimits.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -36,12 +43,16 @@ enum class EventKind : uint16_t {
     CreateTopic = 1, DropTopic = 2, AlterTopicConfig = 3,
     CreateSchema = 4, AlterSchema = 5, SetCompatibility = 6,
     CreateView = 7, AlterView = 8, DropView = 9,
+    // formatVer 2 (namespaces): the subject namespace is the event's nsId.
+    NamespaceCreated = 32, NamespaceLimitsSet = 33, NamespaceStateChanged = 34, NamespaceDeleted = 35,
 };
 inline constexpr uint16_t kFormatV1          = 1;
-inline constexpr uint16_t kCurrentFormatVer  = kFormatV1;
-/// Reserved for the multi-tenancy design (tenants + ACLs).  formatVer 1 refuses them.
+inline constexpr uint16_t kFormatV2          = 2;
+inline constexpr uint16_t kCurrentFormatVer  = kFormatV2;
+/// Kinds 32..63 are reserved: formatVer 1 refuses all of them, formatVer 2 accepts 32..35 and refuses 36..63.
 inline constexpr uint16_t kReservedKindFirst = 32;
 inline constexpr uint16_t kReservedKindLast  = 63;
+inline constexpr uint16_t kLastNamespaceKind = 35;
 
 enum class Persistence : uint8_t { Disk = 0, Transient = 1 };
 
@@ -112,15 +123,52 @@ struct CreateViewOps { ViewDef view;            bool operator==(const CreateView
 struct AlterViewOps  { ViewDef view;            bool operator==(const AlterViewOps&) const = default; };   // a FRESH sink (ruling 4)
 struct DropViewOps   { int32_t viewTopicId = -1; bool operator==(const DropViewOps&) const = default; };
 
-/// Alternative i is the body of EventKind i+1 — kindOf() relies on it (pinned below).
+/// A namespace's lifecycle tag as carried on the wire (NamespaceStateChanged's target; the registry's NsState
+/// variant keeps the rich state).  Active is the only state a namespace is created in.
+enum class NsStateTag : uint8_t { Active = 0, SuspendedReadOnly = 1, SuspendedRejectAll = 2, Deleting = 3 };
+
+/// formatVer 2.  The namespace is the event's nsId; `name` is its (valid, non-"default") name.
+struct NamespaceCreatedOps      { std::string name; rune::protocol::NamespaceLimits limits;
+                                  bool operator==(const NamespaceCreatedOps&) const = default; };
+/// The FULL replacement limits record (the leader resolves omitted fields, plan §5.1).
+struct NamespaceLimitsSetOps    { rune::protocol::NamespaceLimits limits;
+                                  bool operator==(const NamespaceLimitsSetOps&) const = default; };
+struct NamespaceStateChangedOps { NsStateTag to = NsStateTag::Active;
+                                  bool operator==(const NamespaceStateChangedOps&) const = default; };
+struct NamespaceDeletedOps      { bool operator==(const NamespaceDeletedOps&) const = default; };
+
+/// The body of each event kind.  Alternative order is NOT the kind number any more (kinds 10..31 are unused):
+/// kKindOfAlt / altOf below are the one mapping, and the ops tag byte on the wire is the KIND.
 using Ops = std::variant<CreateTopicOps, DropTopicOps, AlterTopicConfigOps, CreateSchemaOps,
-                         AlterSchemaOps, SetCompatibilityOps, CreateViewOps, AlterViewOps, DropViewOps>;
+                         AlterSchemaOps, SetCompatibilityOps, CreateViewOps, AlterViewOps, DropViewOps,
+                         NamespaceCreatedOps, NamespaceLimitsSetOps, NamespaceStateChangedOps, NamespaceDeletedOps>;
+
+inline constexpr std::array<EventKind, 13> kKindOfAlt = {
+    EventKind::CreateTopic, EventKind::DropTopic, EventKind::AlterTopicConfig, EventKind::CreateSchema,
+    EventKind::AlterSchema, EventKind::SetCompatibility, EventKind::CreateView, EventKind::AlterView,
+    EventKind::DropView, EventKind::NamespaceCreated, EventKind::NamespaceLimitsSet,
+    EventKind::NamespaceStateChanged, EventKind::NamespaceDeleted};
+
+/// The Ops alternative index of `k`; -1 for a kind that has none (10..31, 36 and up).
+[[nodiscard]] constexpr int altOf(EventKind k) noexcept {
+    for (std::size_t i = 0; i < kKindOfAlt.size(); ++i)
+        if (kKindOfAlt[i] == k) return static_cast<int>(i);
+    return -1;
+}
 
 namespace detail {
 template <EventKind K, class T>
-inline constexpr bool kOpsAt = std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(K) - 1, Ops>, T>;
+inline constexpr bool kOpsAt = std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(altOf(K)), Ops>, T>;
+constexpr bool kindTableBijective() noexcept {
+    for (std::size_t i = 0; i < kKindOfAlt.size(); ++i) {
+        if (altOf(kKindOfAlt[i]) != static_cast<int>(i)) return false;       // a kind appears twice
+        for (std::size_t j = 0; j < i; ++j) if (kKindOfAlt[i] == kKindOfAlt[j]) return false;
+    }
+    return true;
 }
-static_assert(std::variant_size_v<Ops> == 9, "one Ops alternative per EventKind 1..9");
+}
+static_assert(std::variant_size_v<Ops> == 13 && kKindOfAlt.size() == 13, "one Ops alternative per EventKind 1..9, 32..35");
+static_assert(detail::kindTableBijective(), "kKindOfAlt must be a bijection onto the Ops alternatives");
 static_assert(detail::kOpsAt<EventKind::CreateTopic, CreateTopicOps> &&
               detail::kOpsAt<EventKind::DropTopic, DropTopicOps> &&
               detail::kOpsAt<EventKind::AlterTopicConfig, AlterTopicConfigOps> &&
@@ -129,8 +177,12 @@ static_assert(detail::kOpsAt<EventKind::CreateTopic, CreateTopicOps> &&
               detail::kOpsAt<EventKind::SetCompatibility, SetCompatibilityOps> &&
               detail::kOpsAt<EventKind::CreateView, CreateViewOps> &&
               detail::kOpsAt<EventKind::AlterView, AlterViewOps> &&
-              detail::kOpsAt<EventKind::DropView, DropViewOps>,
-              "Ops variant order must equal EventKind order (kindOf = index + 1)");
+              detail::kOpsAt<EventKind::DropView, DropViewOps> &&
+              detail::kOpsAt<EventKind::NamespaceCreated, NamespaceCreatedOps> &&
+              detail::kOpsAt<EventKind::NamespaceLimitsSet, NamespaceLimitsSetOps> &&
+              detail::kOpsAt<EventKind::NamespaceStateChanged, NamespaceStateChangedOps> &&
+              detail::kOpsAt<EventKind::NamespaceDeleted, NamespaceDeletedOps>,
+              "kKindOfAlt must list each kind at the index of its Ops alternative");
 
 /// Until authentication exists: session id, client name and source address.  Afterwards
 /// `authenticated` carries the principal (same field, no layout change).  `requestId` is
@@ -157,6 +209,7 @@ struct ReplayedFrom {
 struct CatalogEvent {
     uint16_t                    formatVer   = kCurrentFormatVer;
     EventKind                   kind        = EventKind::CreateTopic;
+    uint32_t                    nsId        = 0;   // formatVer 2: the object's / subject namespace; a v1 event is 0
     uint64_t                    objectId    = 0;
     std::string                 objectName;
     uint32_t                    prevVersion = 0;
@@ -190,18 +243,18 @@ inline constexpr std::size_t kMaxListCount  = 0xFFFF;
 enum class EncodeError : uint8_t {
     FieldTooLong,      // a string / blob (or the ops blob) exceeds its length prefix's width
     TooManyElements,   // a list exceeds its u16 count
-    UnknownFormatVer,  // formatVer != kFormatV1           (decode: UnknownFormatVer)
-    ReservedKind,      // kind in [32, 63]                  (decode: ReservedKind)
+    UnknownFormatVer,  // formatVer not 1 or 2               (decode: UnknownFormatVer)
+    ReservedKind,      // v1: kind in [32, 63]; v2: [36, 63] (decode: ReservedKind)
     UnknownKind,       // kind not 1..9 and not reserved    (decode: UnknownKind)
     KindOpsMismatch,   // kind != kindOf(ops)               (decode: KindOpsMismatch)
-    BadEnum,           // an enum field outside its range   (decode: BadEnum)
+    BadEnum,           // an enum field outside its range, or a v1 event with nsId != 0 (decode: BadEnum)
 };
 
 [[nodiscard]] EventKind kindOf(const Ops& ops) noexcept;
 /// Clears `out` and encodes into it, reusing its capacity.  On error `out` is left empty.
 [[nodiscard]] std::expected<void, EncodeError> encodeInto(const CatalogEvent& e, std::vector<uint8_t>& out);
 [[nodiscard]] std::expected<std::vector<uint8_t>, EncodeError> encode(const CatalogEvent& e);
-/// Bounds-checked decode of one formatVer-1 event; the same validation as encode, plus the
+/// Bounds-checked decode of one formatVer-1 or -2 event; the same validation as encode, plus the
 /// byte-level refusals (Truncated, TrailingBytes, a bool byte other than 0/1 → BadEnum).
 [[nodiscard]] std::expected<CatalogEvent, DecodeError> decode(std::span<const uint8_t> bytes) noexcept;
 [[nodiscard]] std::string_view kindName(EventKind k) noexcept;
