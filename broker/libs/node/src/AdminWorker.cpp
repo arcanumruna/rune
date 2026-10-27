@@ -2,6 +2,7 @@
 // See AdminWorker.h.
 #include "rune/node/AdminWorker.h"
 
+#include <rune/node/NamespaceLimitCheck.h>
 #include <rune/node/CatalogEffectFrames.h>
 #include <rune/node/FdBudget.h>
 #include <rune/node/PersistenceMode.h>
@@ -1295,6 +1296,15 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
         else                                                  return buildAlterConfig_(m, s);
     }, req);
     if (!b) return b;
+
+    // Namespaces Phase 2 Task 9 (D23): the namespace's count, durability and feature limits, against the applied catalog,
+    // before anything is appended (nothing is applied on a refusal).  After the build, so a duplicate name or a bad
+    // request keeps its own, more specific answer.  A client below v14 sees InvalidRequest (the gateway maps the code).
+    if (!std::holds_alternative<NamespaceDdlMsg>(req)) {
+        if (const cat::NamespaceRecord* nsr = s.namespaces().byId(b->nsId); nsr != nullptr)
+            if (auto why = nsLimitRefusal(nsr->limits, s, *b, deps_.brokerCount, deps_.topicMinIsr))
+                return Rejected(reject(kNamespaceLimitExceeded, std::move(*why)));
+    }
 
     // The principal, statement and time (spec §4; F22: timestampMs is the
     // leader's wall clock when the event is built for its append).

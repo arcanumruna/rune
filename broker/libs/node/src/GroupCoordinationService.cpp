@@ -658,11 +658,13 @@ size_t GroupCoordinationService::handleJoinGroup(
     const std::span<const uint8_t> filter = pc::clientUnderstandsFilters(ver) ? msg.filter : std::span<const uint8_t>{};
     // A refused join: never admitted, no state change.  Old clients get the rule's ProtocolVersion; the detail
     // (cold; reserved member string) goes to a session >= 11 only.
-    auto refuseJoin = [&](std::string detail) {
+    auto refuseJoin = [&](std::string detail, bool nsLimit = false) {
         pc::JoinGroupResponse resp;
         resp.sessionId     = msg.sessionId;
         resp.correlationId = msg.correlationId;
-        resp.errorCode     = static_cast<int16_t>(rejectionCodeFor(ver));
+        // Namespaces Phase 2 Task 9: a namespace limit is NamespaceLimitExceeded (52) for a v14+ member, else the old rule.
+        resp.errorCode     = static_cast<int16_t>(nsLimit && ver >= pc::kClientVersionNamespaces ? pc::ErrorCode::NamespaceLimitExceeded
+                                                                                                  : rejectionCodeFor(ver));
         resp.generationId  = 0;
         resp.isLeader      = 0;
         resp.memberId      = std::span<const uint8_t>();
@@ -702,6 +704,19 @@ size_t GroupCoordinationService::handleJoinGroup(
         // Unknown topicId silently ignored (Assignor ignores topics not in partCounts).
     }
 
+    // Namespaces Phase 2 Task 9 (D23): maxGroups of the group's namespace, at the join that would CREATE a group (count of
+    // distinct group ids of that nsId in coordinators_; count >= limit refuses; 0 = unlimited).  The limit is read from the
+    // gateway's namespace mirror the request carries (ctx.reg).  Cold: only a new group's first join scans.
+    if (ctx.reg != nullptr && coordinators_.find(groupIdStr) == coordinators_.end()) {
+        const uint32_t gns = rune::coordination::parseScopedId(groupIdStr).nsId;
+        if (const auto* nsr = ctx.reg->byId(gns); nsr != nullptr && nsr->limits.maxGroups != 0) {
+            uint64_t have = 0;
+            for (const auto& [id, c] : coordinators_) if (rune::coordination::parseScopedId(id).nsId == gns) ++have;
+            if (have >= nsr->limits.maxGroups)
+                return refuseJoin("namespace limit exceeded: groups (" + std::to_string(have) + " of " +
+                                  std::to_string(nsr->limits.maxGroups) + ")", true);
+        }
+    }
     // #214: the number of coordinated groups is bounded.  Only a join that would CREATE a group is refused (never one
     // to an existing group); empty groups are dropped by doWork, so the room comes back as groups empty.
     if (coordinators_.size() >= static_cast<std::size_t>(maxGroups_) &&

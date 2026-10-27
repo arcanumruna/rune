@@ -1,6 +1,7 @@
 // ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 
 #include <rune/catalog/NsName.h>
+#include <rune/node/NamespaceLimitCheck.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/LogSafe.h>  // issue #232: client-supplied names in log lines
 #include <rune/view/PlanSources.h>
@@ -3608,6 +3609,14 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         if (!answerRejection_(*session, *pc::MessageHeader::decode(buf, len),
                               static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "namespace slot mismatch", buf, len))
             noteUnanswerable_(buf, len, "namespace slot mismatch");
+        return true;
+    }
+    // Namespaces Phase 2 Task 9 (D23): the acks floor of the session's namespace, per produce (a client picks acks per
+    // request): one slot-array load and a compare.  wire acks 0 = Leader, 1 = All; lowestAcks >= 2 requires All.
+    if (!rune::node::nsAcksAllowed(nsSlots_.limits(session->nsSlot), msg.acks)) [[unlikely]] {
+        if (!answerRejection_(*session, *pc::MessageHeader::decode(buf, len), nsLimitCode_(*session),
+                              "namespace limit exceeded: acks below the namespace's lowest acks", buf, len))
+            noteUnanswerable_(buf, len, "namespace acks floor");
         return true;
     }
     // Authentication Task 12 (D30, spec §2.1): WRITE on the topic - ONE index test, ONE bounds check, ONE byte load
@@ -7984,6 +7993,13 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
     }
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
     if (denyTxnRequest_(*session, tid, buf, len)) return;                   // authentication Task 12 (D18)
+    // Namespaces Phase 2 Task 9 (D23): the Txns feature is checked at the first transactional call (InitProducerId).
+    if (tid == static_cast<uint16_t>(pc::TemplateId::InitProducerId) &&
+        !rune::node::nsFeatureAllowed(nsSlots_.limits(session->nsSlot), rune::protocol::kNsFeatureTxns)) [[unlikely]] {
+        if (!answerRejection_(*session, *hdrOpt, nsLimitCode_(*session), "namespace limit exceeded: transactions are not enabled for this namespace", buf, len))
+            noteUnanswerable_(buf, len, "namespace txns feature");
+        return;
+    }
 
     std::size_t encoded = 0;
     // Fix round 3 (I3): the scratch always holds any fixed-size txn answer and
@@ -8481,6 +8497,12 @@ uint16_t ClientGateway::suspendedCode_(const Session& s) const noexcept
                                                                                   : pc::ErrorCode::InvalidRequest);
 }
 
+uint16_t ClientGateway::nsLimitCode_(const Session& s) const noexcept
+{
+    return static_cast<uint16_t>(s.clientVersion >= pc::kClientVersionNamespaces ? pc::ErrorCode::NamespaceLimitExceeded
+                                                                                  : pc::ErrorCode::InvalidRequest);
+}
+
 void ClientGateway::answerSuspended_(Session& s, const pc::MessageHeader& hdr, const uint8_t* buf, std::size_t len)
 {
     if (!answerRejection_(s, hdr, suspendedCode_(s), "namespace suspended", buf, len))
@@ -8699,12 +8721,16 @@ uint32_t ClientGateway::sessionNsId_(const Session& s) noexcept
 
 void ClientGateway::becomeAnonymousIfAllowed_(Session& session, pc::TemplateId tid)
 {
+    // Namespaces Phase 2 Task 9 (D23): anonymous read is also a feature of `default` (bit 0 of featureBits = unrestricted).
+    const auto* d = namespaces_.registry().byId(rune::catalog::kDefaultNsId);
     if (anonymousRead_ && authMode_ == GatewayAuthMode::Required && tid != pc::TemplateId::AuthClientFirst &&
         tid != pc::TemplateId::AuthClientFinal && tid != pc::TemplateId::SecurityBootstrap &&
-        std::holds_alternative<rune::gateway::AuthAwaitingFirst>(session.auth))
+        std::holds_alternative<rune::gateway::AuthAwaitingFirst>(session.auth) &&
+        (d == nullptr || rune::node::nsFeatureAllowed(d->limits, rune::protocol::kNsFeatureAnonymousRead))) {
         session.auth = rune::gateway::AuthAnonymousRead{anonPerms_()};
-        if (const auto* d = namespaces_.registry().byId(rune::catalog::kDefaultNsId))
+        if (d != nullptr)
             session.nsGate = rune::catalog::tagOf(d->state);   // namespaces Phase 2 Task 3: the anonymous reader is `default`'s
+    }
 }
 
 rune::gateway::PermissionRef ClientGateway::anonPerms_()
@@ -9284,6 +9310,24 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
                                   ? static_cast<uint16_t>(pc::ErrorCode::NamespaceSuspended)
                                   : static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed);
             f.detail        = "namespace suspended";
+            sendAnswer_(*session, scratch_.data(), f.encode(scratch_.data()));
+            closeAfterAnswers_(session->sessionId);
+            return;
+        }
+    }
+    // Namespaces Phase 2 Task 9 (D23): the AuthScram feature gates SCRAM logins into the namespace (after the proof
+    // verified, so nothing leaks to a guesser); a cluster admin is exempt.
+    if (nsRec != nullptr && !rune::node::nsFeatureAllowed(nsRec->limits, rune::protocol::kNsFeatureAuthScram)) [[unlikely]] {
+        const PermissionRef loginPerms = compilePerms_(ok.userId, ok.nsId);
+        if (authorizeCluster(loginPerms.table(), rune::security::Operation::Admin).has_value()) {
+            if (session->spill.state == SpillState::Closing) return;
+            pc::AuthServerFinal f;
+            f.sessionId     = session->sessionId;
+            f.correlationId = hdr->correlationId;
+            f.errorCode     = static_cast<uint16_t>(session->clientVersion >= pc::kClientVersionNamespaces
+                                                        ? pc::ErrorCode::NamespaceLimitExceeded
+                                                        : pc::ErrorCode::AuthenticationFailed);
+            f.detail        = "namespace limit exceeded: password login is not enabled for this namespace";
             sendAnswer_(*session, scratch_.data(), f.encode(scratch_.data()));
             closeAfterAnswers_(session->sessionId);
             return;
@@ -10241,6 +10285,19 @@ bool ClientGateway::sendControlFrame(int64_t sessionId,
     if (!session) {
         spdlog::debug("ClientGateway::sendControlFrame: unknown sessionId={} — dropped", sessionId);
         return false;
+    }
+    // Namespaces Phase 2 Task 9: a DdlResponse the admin thread answered NamespaceLimitExceeded (52) reaches a client
+    // below v14 as InvalidRequest (39); the admin thread does not know the session's version.  Cold: only that code.
+    if (session->clientVersion < pc::kClientVersionNamespaces && len > pc::MessageHeader::ENCODED_SIZE + 2) [[unlikely]] {
+        if (const auto h = pc::MessageHeader::decode(buf, len);
+            h && h->templateId == static_cast<uint16_t>(pc::TemplateId::DdlResponse) &&
+            (buf[pc::MessageHeader::ENCODED_SIZE] | (buf[pc::MessageHeader::ENCODED_SIZE + 1] << 8)) ==
+                static_cast<int>(pc::ErrorCode::NamespaceLimitExceeded)) {
+            ddlDowngradeScratch_.assign(buf, buf + len);
+            ddlDowngradeScratch_[pc::MessageHeader::ENCODED_SIZE]     = static_cast<uint8_t>(pc::ErrorCode::InvalidRequest);
+            ddlDowngradeScratch_[pc::MessageHeader::ENCODED_SIZE + 1] = 0;
+            buf = ddlDowngradeScratch_.data();
+        }
     }
     // No-hang (R2): every answer delivered through here (DDL responses from the
     // admin thread, deferred EndTxn answers, Assign) is queued and retried under

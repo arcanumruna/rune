@@ -2579,6 +2579,9 @@ private:
     /// templates some gate refuses reach it.  Cluster admins are exempt.  True = consumed.
     [[nodiscard]] bool nsGateRefuses_(uint16_t tid, const uint8_t* buf, std::size_t len);
     [[nodiscard]] uint16_t suspendedCode_(const Session& s) const noexcept;
+    /// Namespaces Phase 2 Task 9: NamespaceLimitExceeded (52) for a v14+ session, InvalidRequest (39) below.
+    [[nodiscard]] uint16_t nsLimitCode_(const Session& s) const noexcept;
+    std::vector<uint8_t> ddlDowngradeScratch_;   ///< sendControlFrame: a DdlResponse 52 -> 39 copy for an old client (cold)
     /// Answers a request refused by the namespace gate (the same answer on the dispatch and the Produce path).
     void answerSuspended_(Session& s, const rune::protocol::client::MessageHeader& hdr, const uint8_t* buf, std::size_t len);
     /// True when `s` is exempt from the namespace gate (ADMIN ON CLUSTER).  Cold: only the refuse path asks.

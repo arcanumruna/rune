@@ -27,7 +27,7 @@
 namespace rune::node {
 
 namespace {
-constexpr uint16_t kOK = 0, kNotLeader = 2, kInternal = 6, kInvalidRequest = 39, kNotAuthorized = 45;
+constexpr uint16_t kOK = 0, kNotLeader = 2, kInternal = 6, kInvalidRequest = 39, kNotAuthorized = 45, kNamespaceLimitExceeded = 52;
 namespace sec = rune::security;
 namespace pc  = rune::protocol::client;
 
@@ -581,6 +581,19 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
     // Issue #228: rendered from the op, never the client's text (the audit log cannot be made to lie).
     e.statement = sec::securityStatementText(m.kind, m.name, m.change, m.passwordIndex, m.terminateSessions, m.force,
                                              m.granteeKind, m.op, m.resourceType, m.patternKind, m.pattern, m.roleName);
+    // Namespaces Phase 2 Task 9 (D23): maxUsers, checked here where the user table lives (count >= limit refuses a
+    // CreateUser; SetLimits below usage keeps the users, new ones are refused).  0 = unlimited.
+    if (opKind == pc::SecurityOpKind::CreateUser && catalog_ != nullptr) {
+        if (const auto* nsr = catalog_->namespaces().byId(target->nsId); nsr != nullptr && nsr->limits.maxUsers != 0) {
+            uint64_t users = 0;
+            for (const auto& [id, u] : state.users()) if (u.nsId == target->nsId) ++users;
+            if (users >= nsr->limits.maxUsers) {
+                answer_(req, kNamespaceLimitExceeded, "namespace limit exceeded: users (" + std::to_string(users) + " of " +
+                                                          std::to_string(nsr->limits.maxUsers) + ")");
+                return;
+            }
+        }
+    }
     if (create) {
         e.objectId = state.nextObjectId();
         e.prevVersion = 0;

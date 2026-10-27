@@ -1812,6 +1812,13 @@ if(BUILD_TESTING)
                               rune_client_api aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_ns_slot_tests PROPERTIES TIMEOUT 900)
 
+        # Namespaces Phase 2 Task 9 (D23): maxUsers, the acks floor and the Txns / AuthScram features through the REAL client.
+        add_executable(rune_limit_broker_tests tests/client/LimitEnforcementBrokerRegressionTest.cpp)
+        target_include_directories(rune_limit_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_limit_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_limit_broker_tests PROPERTIES TIMEOUT 900)
+
         # Namespaces Phase 2 Task 7 (D17, D18; rule 16): the namespace reaper - the state machine over a real CatalogState,
         # and three real AdminWorkers (leader change after each durable step).
         add_executable(rune_namespace_reaper_tests tests/node/NamespaceReaperRegressionTest.cpp)
@@ -1989,6 +1996,11 @@ if(BUILD_TESTING)
         target_include_directories(rune_namespace_admin_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_namespace_admin_tests PRIVATE rune_node rune_view rune_replication rune_codec aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_admin_tests PROPERTIES TIMEOUT 360)
+        # Namespaces Phase 2 Task 9 (D23): the count, durability and feature limits through the REAL AdminWorker.
+        add_executable(rune_limit_ddl_tests tests/node/LimitEnforcementDdlRegressionTest.cpp)
+        target_include_directories(rune_limit_ddl_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_limit_ddl_tests PRIVATE rune_node rune_view rune_replication rune_codec aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_limit_ddl_tests PROPERTIES TIMEOUT 360)
         # Namespaces Task 8 (spec §4): the `__security` leader's namespace resolution and guard (no escalation).
         add_executable(rune_namespace_escalation_tests tests/node/NamespaceEscalationTest.cpp)
         target_include_directories(rune_namespace_escalation_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)

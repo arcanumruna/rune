@@ -4890,3 +4890,51 @@ TEST_F(GroupJoinAdversarial, ATermChangeBetweenJoinAndSyncNeverServesTheOldTerms
     EXPECT_EQ(service_->coordinator(g).memberCount(), 1u);
     EXPECT_TRUE(service_->coordinator(g).hasMember(again.memberId));
 }
+
+// ===========================================================================
+// Namespaces Phase 2 Task 9 (D23): maxGroups of the group's namespace, checked at the first JoinGroup of a NEW group.
+// Cells (LimitEnforcementTable row max-groups, L = 2): 1st group (below), 2nd (at), 3rd refused 52 (above) with no group
+// created; a join to an EXISTING group is never refused; another namespace has its own count; 0 = unlimited.
+// ===========================================================================
+#include <rune/catalog/NamespaceRegistry.h>
+#include <rune/coordination/NsScopedId.h>
+
+TEST_F(CG3ServiceTest, MaxGroupsPerNamespaceRegression) {
+    namespace cat = rune::catalog;
+    cat::NamespaceMirror mirror;
+    auto rec = [&](uint32_t id, const char* name, uint64_t maxGroups) {
+        cat::NamespaceRecord r;
+        r.nsId = id; r.name = name; r.version = 1; r.limits.maxGroups = maxGroups;
+        ASSERT_TRUE(mirror.upsert(r));
+    };
+    rec(1, "a", 2);
+    rec(2, "b", 0);   // unlimited
+    const rune::coordination::NsRequestContext ctxA{1, false, &mirror.registry()};
+    const rune::coordination::NsRequestContext ctxB{2, false, &mirror.registry()};
+    auto join = [&](const rune::coordination::NsRequestContext& ctx, const std::string& group, int32_t ver) {
+        const auto n = encodeJoinGroup(req_, 1, 100, group, "");
+        const auto o = service_->handleJoinGroup(req_, n, ver, clock_, out_, kBufSize, ctx);
+        const auto resp = pc::JoinGroupResponse::decode(out_, o);
+        EXPECT_TRUE(resp.has_value());
+        return resp ? resp->errorCode : int16_t{-1};
+    };
+    const int16_t kOkCode = static_cast<int16_t>(pc::ErrorCode::OK);
+    const int16_t kLimitCode = static_cast<int16_t>(pc::ErrorCode::NamespaceLimitExceeded);
+    EXPECT_EQ(join(ctxA, "g1", pc::kClientVersion), kOkCode) << "below";
+    EXPECT_EQ(join(ctxA, "g2", pc::kClientVersion), kOkCode) << "at: the 2nd group";
+    const std::size_t groups = service_->groupCountForTest();
+    EXPECT_EQ(join(ctxA, "g3", pc::kClientVersion), kLimitCode) << "above: the 3rd group";
+    EXPECT_EQ(service_->groupCountForTest(), groups) << "a refused join created no group";
+    EXPECT_EQ(join(ctxA, "g1", pc::kClientVersion), kOkCode) << "a join to an existing group is never refused";
+    // A client below v14 sees the old refusal code, not 52.
+    EXPECT_NE(join(ctxA, "g4", pc::kClientVersionExplicitGroupSubscriptions), kOkCode);
+    EXPECT_NE(join(ctxA, "g4", pc::kClientVersionExplicitGroupSubscriptions), kLimitCode);
+    // Another namespace has its own count, and 0 is unlimited.
+    EXPECT_EQ(join(ctxB, "g1", pc::kClientVersion), kOkCode);
+    EXPECT_EQ(join(ctxB, "g2", pc::kClientVersion), kOkCode);
+    EXPECT_EQ(join(ctxB, "g3", pc::kClientVersion), kOkCode);
+    // Lowering below usage keeps the groups; a new group is refused until one is gone.
+    rec(1, "a", 1);
+    mirror.upsert([&] { cat::NamespaceRecord r; r.nsId = 1; r.name = "a"; r.version = 2; r.limits.maxGroups = 1; return r; }());
+    EXPECT_EQ(join(ctxA, "g5", pc::kClientVersion), kLimitCode);
+}
