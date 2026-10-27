@@ -2,6 +2,7 @@
 // session, the pre-authentication gate, the throttle, the auth deadline, the must-change-password rule, the counters
 // and the logs.  makeForTest + the apply*ForTest seams; the "client" is ScramTestClient.
 #include "support/ScramTestClient.h"
+#include <rune/node/NamespacePaths.h>
 
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/LogSafe.h>
@@ -39,7 +40,7 @@ struct RecordingSink final : IAdminRequestSink {
     std::string lastAuthenticated;
     AdminSubmit submitDefineTopic(int64_t, int64_t, std::string_view, uint32_t, std::string_view, bool, const uint8_t*, uint32_t,
                                   uint8_t, int16_t, const rune::protocol::TopicConfigView&, const DdlMetaView&, std::string_view) override { ++otherSubmits; return AdminSubmit::Accepted; }
-    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t) override { return true; }
+    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t, uint32_t) override { return true; }
     AdminSubmit submitAlterTopic(int64_t, int64_t, std::string_view, uint16_t, const uint8_t*, uint32_t, const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
     AdminSubmit submitCreateView(int64_t, int64_t, std::string_view, std::string_view, uint8_t, const uint8_t*, uint32_t, const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
     AdminSubmit submitDropTopic(int64_t, int64_t, std::string_view, const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
@@ -55,6 +56,8 @@ struct RecordingSink final : IAdminRequestSink {
         if (!denial.empty()) { denied[w.correlationId] = std::string(denial); return AdminSubmit::Accepted; }
         ++securityDdls; lastAuthenticated = std::string(m.authenticated); return AdminSubmit::Accepted;
     }
+    AdminSubmit submitNamespaceDdl(const pc::NamespaceDdlRequest&, const DdlMetaView&, std::string_view, uint16_t) override { return AdminSubmit::Accepted; }
+    AdminSubmit submitListNamespaces(int64_t, int64_t, uint32_t, uint16_t, uint32_t, bool) override { return AdminSubmit::Accepted; }
     AdminSubmit submitSecurityBootstrap(const pc::SecurityBootstrap&, const DdlMetaView&) override { return AdminSubmit::Accepted; }
     bool submitSecuritySubscribe(int64_t, int64_t, int64_t) override { return true; }
     bool submitSecurityUnsubscribe(int64_t, int64_t) override { return true; }
@@ -118,7 +121,7 @@ struct Rig {
     void withTopic(int32_t partitions) {
         rune::node::TopicSpec ts;
         ts.name = "events"; ts.partitionCount = partitions; ts.topicId = 0;
-        const fs::path d = dir.path / "topics";
+        const fs::path d = rune::node::topicsRoot(dir.path, 0);
         fs::create_directories(d);
         auto next = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{ts}, d.string());
         gw.setTopicRegistry(next.get());
@@ -394,12 +397,10 @@ TEST(AuthLoginTest, ASessionThatMustChangeItsPasswordMayOnlyChangeItsOwnAndThenI
     rig.gw.onSecurityApplied(static_cast<int64_t>(rig.chain.count()) - 1, *applied);
     EXPECT_TRUE(std::holds_alternative<AuthAuthenticated>(*rig.gw.sessionAuthForTest(o.sid)));
     rig.send(defineTopicFrame(o.sid, 74));
-    // Task 12: free of the must-change rule, the session is judged by its grants (admin holds ADMIN, not CREATE).
-    EXPECT_EQ(rig.admin.otherSubmits, 0) << "NotAuthorized, not forwarded";
-    const Frame* denied = rig.last(static_cast<uint16_t>(pc::TemplateId::DefineTopicResponse), o.sid);
-    ASSERT_NE(denied, nullptr);
-    EXPECT_EQ(pc::DefineTopicResponse::decode(denied->bytes.data(), denied->bytes.size())->errorCode,
-              static_cast<uint16_t>(pc::ErrorCode::NotAuthorized));
+    // Free of the must-change rule, the session is judged by its grants: ADMIN ON CLUSTER is root (namespaces Batch 2
+    // review), so the DefineTopic is forwarded to the admin ring, not refused by the gateway.
+    EXPECT_EQ(rig.admin.otherSubmits, 1) << "root: forwarded, not refused";
+    for (const Frame& x : rig.seen) EXPECT_NE(x.corr, 74) << "no gateway refusal for the freed root session";
 }
 
 TEST(AuthLoginRegression, ALoginAgainstAHaltedSecurityLogFailsClosedRegression) {

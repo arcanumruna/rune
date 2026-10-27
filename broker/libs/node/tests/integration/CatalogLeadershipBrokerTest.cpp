@@ -150,7 +150,7 @@ std::optional<rune::metadata::PartitionAssignment> assignmentOn(BrokerNode& n, i
 bool awaitApplied(BrokerNode& n, const std::string& name, std::chrono::seconds within) {
     for (const auto deadline = Clock::now() + within; Clock::now() < deadline;) {
         if (n.onAdminThreadForTest([&n, &name] {
-                return n.adminWorkerAgentForTest()->worker().applier().state().topicByName(name) != nullptr;
+                return n.adminWorkerAgentForTest()->worker().applier().state().topicByName(rune::catalog::kDefaultNsId, name) != nullptr;
             }))
             return true;
         std::this_thread::sleep_for(20ms);

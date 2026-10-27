@@ -222,7 +222,13 @@ void runQuietRun(Rig& r, Entity e) {
         EXPECT_EQ(v.delivered, (std::vector<int64_t>{b0})) << "only the one match";
         std::string ns;
         for (const int64_t n : v.notes) ns += std::to_string(n) + " ";
-        ASSERT_GE(v.notes.size(), 3u) << "notes: " << ns << " end " << end << " 200,000 skipped records need at least three count notes";
+        // The gap rule below allows 65,536 + slack records between notes (a note lands on a scan-pass boundary, and a
+        // slow host makes passes coarser): n notes leave n + 1 gaps, so the count it implies is
+        // ceil(skipped / (65,536 + slack)) - 1, not a fixed 3 (#623: 2 notes, gaps of ~67k, under TSan).
+        const int64_t gap = 65'536 + slack, skipped = end - (b0 + 1);
+        const auto minNotes = static_cast<std::size_t>((skipped + gap - 1) / gap - 1);
+        ASSERT_GE(v.notes.size(), std::max<std::size_t>(minNotes, 1)) << "notes: " << ns << " end " << end
+            << " skipped records need a count note per 65,536 + " << slack;
         int64_t prev = b0 + 1;   // the position after the match
         for (const int64_t n : v.notes) {
             EXPECT_GT(n, prev - 1) << "note offsets increase";

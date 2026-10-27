@@ -1,6 +1,11 @@
-// src/security/ApplyV1.cpp — the FROZEN formatVer-1 rules.  NEVER edited after the golden log
-// pins them; a change ships as formatVer 2 (ApplyV2 beside this file).
+// src/security/ApplyV1.cpp — the formatVer-1 rules, which formatVer 2 shares per namespace.
+// Names are (e.nsId, local); a formatVer-1 event is always nsId 0 (the event validation refuses anything else), so
+// its behaviour is unchanged byte for byte - the v1 golden log pins it.  The only edits namespaces needed are
+// this key adaptation, the namespace checks that hold trivially at nsId 0 (a role membership stays inside one
+// namespace; a Bootstrap is a default-namespace event; a grant is valid for ITS namespace) and the nsId on the
+// objects.  ApplyV2.cpp mixes the nsId into the fingerprints.
 #include "ApplyV1.h"
+#include "ApplyV2.h"
 #include <rune/security/SecurityFingerprint.h>
 
 #include <algorithm>
@@ -17,6 +22,10 @@ Err refuse(int64_t offset, Refusal r, std::string detail) {
     return Err(ApplyError{.offset = offset, .code = ApplyError::Code::Precondition, .refusal = r, .expected = 0,
                           .actual = 0, .detail = std::move(detail)});
 }
+
+/// The namespace's name as far as the apply rules know it: "default" for nsId 0, unknown ("") otherwise - the codec has
+/// no catalog (see validGrant).
+std::string_view ownNsName(uint32_t nsId) noexcept { return nsId == 0 ? std::string_view("default") : std::string_view(); }
 
 struct Ctx {
     const SecurityState& s;
@@ -41,7 +50,8 @@ struct Ctx {
     }
     Applied applied(SessionEffect effect, std::vector<uint64_t> users) const {
         return Applied{.kind = e.kind, .objectId = e.objectId, .newVersion = e.newVersion, .fingerprint = 0,
-                       .effect = users.empty() ? SessionEffect::None : effect, .affectedUsers = std::move(users)};
+                       .effect = users.empty() ? SessionEffect::None : effect, .affectedUsers = std::move(users),
+                       .nsId = e.nsId};
     }
 };
 
@@ -56,13 +66,15 @@ std::expected<Staged, ApplyError> finish(const Ctx& c, StagedChange change, Appl
 }
 
 std::expected<Staged, ApplyError> createUser(const Ctx& c, const ScramVerifier& v, bool bootstrap) {
+    if (bootstrap && c.e.nsId != 0)
+        return refuse(c.offset, Refusal::NamespaceMismatch, "Bootstrap is an event of the default namespace");
     if (bootstrap && c.s.hasSecurityAdmin())
         return refuse(c.offset, Refusal::AlreadyBootstrapped, "an enabled security administrator already exists");
     if (!validName(c.e.objectName)) return refuse(c.offset, Refusal::InvalidName, "invalid name " + c.quoted());
-    if (c.s.user(c.e.objectName)) return refuse(c.offset, Refusal::UserExists, "user " + c.quoted() + " already exists");
+    if (c.s.userByName(c.e.nsId, c.e.objectName)) return refuse(c.offset, Refusal::UserExists, "user " + c.quoted() + " already exists");
     if (auto bad = c.createVersion()) return *bad;
     UserObject u;
-    u.objectId = c.e.objectId; u.name = c.e.objectName; u.version = 1; u.enabled = true;
+    u.objectId = c.e.objectId; u.name = c.e.objectName; u.version = 1; u.enabled = true; u.nsId = c.e.nsId;
     u.verifiers.push_back(v);
     if (bootstrap) {
         u.mustChangePassword = true;
@@ -72,7 +84,7 @@ std::expected<Staged, ApplyError> createUser(const Ctx& c, const ScramVerifier& 
 }
 
 std::expected<Staged, ApplyError> alterUser(const Ctx& c, const AlterUserOps& ops) {
-    const UserObject* cur = c.s.user(c.e.objectName);
+    const UserObject* cur = c.s.userByName(c.e.nsId, c.e.objectName);
     if (!cur) return refuse(c.offset, Refusal::UnknownUser, "unknown user " + c.quoted());
     if (auto bad = c.updateVersion(cur->objectId, cur->version)) return *bad;
     UserObject u = *cur;
@@ -105,40 +117,40 @@ std::expected<Staged, ApplyError> alterUser(const Ctx& c, const AlterUserOps& op
 }
 
 std::expected<Staged, ApplyError> dropUser(const Ctx& c) {
-    const UserObject* cur = c.s.user(c.e.objectName);
+    const UserObject* cur = c.s.userByName(c.e.nsId, c.e.objectName);
     if (!cur) return refuse(c.offset, Refusal::UnknownUser, "unknown user " + c.quoted());
     if (auto bad = c.updateVersion(cur->objectId, cur->version)) return *bad;
-    return finish(c, StagedRemoveUser{Tombstone{cur->objectId, false, cur->name, c.e.newVersion}},
+    return finish(c, StagedRemoveUser{Tombstone{cur->objectId, false, cur->name, c.e.newVersion, c.e.nsId}},
                   c.applied(SessionEffect::Revoke, {cur->objectId}));
 }
 
 std::expected<Staged, ApplyError> createRole(const Ctx& c) {
     if (!validName(c.e.objectName)) return refuse(c.offset, Refusal::InvalidName, "invalid name " + c.quoted());
-    if (c.s.role(c.e.objectName)) return refuse(c.offset, Refusal::RoleExists, "role " + c.quoted() + " already exists");
+    if (c.s.roleByName(c.e.nsId, c.e.objectName)) return refuse(c.offset, Refusal::RoleExists, "role " + c.quoted() + " already exists");
     if (auto bad = c.createVersion()) return *bad;
     RoleObject r;
-    r.objectId = c.e.objectId; r.name = c.e.objectName; r.version = 1;
+    r.objectId = c.e.objectId; r.name = c.e.objectName; r.version = 1; r.nsId = c.e.nsId;
     return finish(c, StagedPutRole{std::move(r), true}, c.applied(SessionEffect::None, {}));
 }
 
 std::expected<Staged, ApplyError> dropRole(const Ctx& c) {
-    const RoleObject* cur = c.s.role(c.e.objectName);
+    const RoleObject* cur = c.s.roleByName(c.e.nsId, c.e.objectName);
     if (!cur) return refuse(c.offset, Refusal::UnknownRole, "unknown role " + c.quoted());
     if (auto bad = c.updateVersion(cur->objectId, cur->version)) return *bad;
     std::vector<uint64_t> members = c.s.membersOf(cur->objectId);
     // The staged removal and the answer each get their own list: argument evaluation order is unspecified, so
     // moving `members` into one argument may empty it before the other copies it (the memberships then survive).
     std::vector<uint64_t> affected = members;
-    return finish(c, StagedRemoveRole{Tombstone{cur->objectId, true, cur->name, c.e.newVersion}, std::move(members)},
+    return finish(c, StagedRemoveRole{Tombstone{cur->objectId, true, cur->name, c.e.newVersion, c.e.nsId}, std::move(members)},
                   c.applied(SessionEffect::Refresh, std::move(affected)));
 }
 
 std::expected<Staged, ApplyError> grantOrRevoke(const Ctx& c, GranteeKind grantee, const GrantSpec& g, bool grant) {
     if (grantee == GranteeKind::User) {
-        const UserObject* cur = c.s.user(c.e.objectName);
+        const UserObject* cur = c.s.userByName(c.e.nsId, c.e.objectName);
         if (!cur) return refuse(c.offset, Refusal::UnknownUser, "unknown user " + c.quoted());
         if (auto bad = c.updateVersion(cur->objectId, cur->version)) return *bad;
-        if (!validGrant(g)) return refuse(c.offset, Refusal::InvalidGrant, "invalid grant on " + c.quoted());
+        if (!validGrant(c.e.nsId, ownNsName(c.e.nsId), g)) return refuse(c.offset, Refusal::InvalidGrant, "invalid grant on " + c.quoted());
         UserObject u = *cur;
         u.version = c.e.newVersion;
         if (grant) {
@@ -148,10 +160,10 @@ std::expected<Staged, ApplyError> grantOrRevoke(const Ctx& c, GranteeKind grante
         }
         return finish(c, StagedPutUser{std::move(u), false}, c.applied(SessionEffect::Refresh, {cur->objectId}));
     }
-    const RoleObject* cur = c.s.role(c.e.objectName);
+    const RoleObject* cur = c.s.roleByName(c.e.nsId, c.e.objectName);
     if (!cur) return refuse(c.offset, Refusal::UnknownRole, "unknown role " + c.quoted());
     if (auto bad = c.updateVersion(cur->objectId, cur->version)) return *bad;
-    if (!validGrant(g)) return refuse(c.offset, Refusal::InvalidGrant, "invalid grant on " + c.quoted());
+    if (!validGrant(c.e.nsId, ownNsName(c.e.nsId), g)) return refuse(c.offset, Refusal::InvalidGrant, "invalid grant on " + c.quoted());
     RoleObject r = *cur;
     r.version = c.e.newVersion;
     if (grant) {
@@ -163,10 +175,12 @@ std::expected<Staged, ApplyError> grantOrRevoke(const Ctx& c, GranteeKind grante
 }
 
 std::expected<Staged, ApplyError> grantOrRevokeRole(const Ctx& c, uint64_t roleId, const std::string& roleName, bool grant) {
-    const UserObject* cur = c.s.user(c.e.objectName);
+    const UserObject* cur = c.s.userByName(c.e.nsId, c.e.objectName);
     if (!cur) return refuse(c.offset, Refusal::UnknownUser, "unknown user " + c.quoted());
     const RoleObject* role = c.s.roleById(roleId);
     if (!role || role->name != roleName) return refuse(c.offset, Refusal::UnknownRole, "unknown role '" + roleName + "'");
+    if (role->nsId != c.e.nsId)   // D10: a user holds roles of its own namespace only
+        return refuse(c.offset, Refusal::NamespaceMismatch, c.quoted() + " and role '" + roleName + "' are in different namespaces");
     if (auto bad = c.updateVersion(cur->objectId, cur->version)) return *bad;
     UserObject u = *cur;
     u.version = c.e.newVersion;
@@ -201,19 +215,19 @@ Applied ApplyV1::commit(SecurityState& s, const SecurityEvent& e, int64_t offset
     std::visit([&](auto& ch) {
         using T = std::decay_t<decltype(ch)>;
         if constexpr (std::is_same_v<T, StagedPutUser>) {
-            if (ch.created) { s.userNames_[ch.obj.name] = ch.obj.objectId; s.nextObjectId_ = std::max(s.nextObjectId_, ch.obj.objectId + 1); }
+            if (ch.created) { s.userNames_[SecKey{ch.obj.nsId, ch.obj.name}] = ch.obj.objectId; s.nextObjectId_ = std::max(s.nextObjectId_, ch.obj.objectId + 1); }
             s.users_.insert_or_assign(ch.obj.objectId, std::move(ch.obj));
         } else if constexpr (std::is_same_v<T, StagedPutRole>) {
-            if (ch.created) { s.roleNames_[ch.obj.name] = ch.obj.objectId; s.nextObjectId_ = std::max(s.nextObjectId_, ch.obj.objectId + 1); }
+            if (ch.created) { s.roleNames_[SecKey{ch.obj.nsId, ch.obj.name}] = ch.obj.objectId; s.nextObjectId_ = std::max(s.nextObjectId_, ch.obj.objectId + 1); }
             s.roles_.insert_or_assign(ch.obj.objectId, std::move(ch.obj));
         } else if constexpr (std::is_same_v<T, StagedRemoveUser>) {
             s.users_.erase(ch.tomb.objectId);
-            s.userNames_.erase(ch.tomb.name);
+            s.userNames_.erase(s.userNames_.find(SecKeyView{ch.tomb.nsId, ch.tomb.name}));
             s.tombstones_.push_back(std::move(ch.tomb));
         } else {   // StagedRemoveRole
             for (uint64_t m : ch.members) s.users_.at(m).roles.erase(ch.tomb.objectId);
             s.roles_.erase(ch.tomb.objectId);
-            s.roleNames_.erase(ch.tomb.name);
+            s.roleNames_.erase(s.roleNames_.find(SecKeyView{ch.tomb.nsId, ch.tomb.name}));
             s.tombstones_.push_back(std::move(ch.tomb));
         }
     }, st.change);
@@ -228,7 +242,7 @@ Applied ApplyV1::commit(SecurityState& s, const SecurityEvent& e, int64_t offset
 // ── the public entry points (formatVer dispatch) ─────────────────────────────
 namespace {
 std::optional<ApplyError> checkWellFormed(const SecurityEvent& e, int64_t offset) {
-    if (e.formatVer != kFormatV1)
+    if (e.formatVer != kFormatV1 && e.formatVer != kFormatV2)
         return ApplyError{.offset = offset, .code = ApplyError::Code::UnsupportedFormat, .refusal = std::nullopt,
                           .expected = 0, .actual = 0,
                           .detail = "formatVer " + std::to_string(e.formatVer) + " has no apply rules"};
@@ -246,19 +260,20 @@ std::expected<Applied, ApplyError> apply(SecurityState& s, const SecurityEvent& 
                                           .expected = 0, .actual = 0,
                                           .detail = "offset " + std::to_string(offset) + " is not past the applied offset " +
                                                     std::to_string(s.appliedOffset())});
-    auto staged = ApplyV1::run(s, e, offset);
+    auto staged = e.formatVer == kFormatV2 ? ApplyV2::run(s, e, offset) : ApplyV1::run(s, e, offset);
     if (!staged) return std::unexpected(std::move(staged.error()));
     const uint64_t actual = staged->applied.fingerprint;
     if (actual != e.fingerprint)
         return std::unexpected(ApplyError{.offset = offset, .code = ApplyError::Code::FingerprintMismatch, .refusal = std::nullopt,
                                           .expected = e.fingerprint, .actual = actual,
                                           .detail = std::string(kindName(e.kind)) + " '" + e.objectName + "'"});
-    return ApplyV1::commit(s, e, offset, std::move(*staged));
+    return e.formatVer == kFormatV2 ? ApplyV2::commit(s, e, offset, std::move(*staged))
+                                    : ApplyV1::commit(s, e, offset, std::move(*staged));
 }
 
 std::expected<Applied, ApplyError> previewApplied(const SecurityState& s, const SecurityEvent& e) {
     if (auto bad = checkWellFormed(e, -1)) return std::unexpected(std::move(*bad));
-    auto staged = ApplyV1::run(s, e, -1);
+    auto staged = e.formatVer == kFormatV2 ? ApplyV2::run(s, e, -1) : ApplyV1::run(s, e, -1);
     if (!staged) return std::unexpected(std::move(staged.error()));
     return std::move(staged->applied);
 }

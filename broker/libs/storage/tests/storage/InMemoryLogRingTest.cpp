@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <vector>
 
@@ -479,4 +480,220 @@ TEST(InMemoryLogRing, SingleBatchLargerThanHalfRing) {
     ASSERT_GE(outC.size(), 70U);
     std::vector<uint8_t> gotC(outC.begin(), outC.begin() + 70);
     EXPECT_EQ(gotC, bC) << "Third large batch must be byte-identical";
+}
+
+// ---------------------------------------------------------------------------
+// truncateTo after a ring wrap (seed-31 transient stress failure).
+//
+// Ring 200, 60-byte batches.  A[0,60) B[60,120) C[120,180); D wraps to [0,60)
+// (20 B padding at [180,200)) and evicts A.
+// ---------------------------------------------------------------------------
+namespace {
+struct Written { std::vector<uint8_t> bytes; int64_t offset; };
+
+void expectAllLiveByteIdentical(rune::storage::InMemoryLog& log, const std::vector<Written>& all) {
+    for (const auto& w : all) {
+        if (w.offset < log.logStartOffset() || w.offset >= log.logEndOffset()) continue;
+        auto out = log.read(w.offset, static_cast<int32_t>(w.bytes.size()));
+        ASSERT_GE(out.size(), w.bytes.size()) << "offset " << w.offset;
+        EXPECT_TRUE(std::equal(w.bytes.begin(), w.bytes.end(), out.begin()))
+            << "live batch at offset " << w.offset << " was overwritten";
+    }
+}
+}  // namespace
+
+// Bug 1: truncating the only (wrapped) entry left its padding counted in the
+// ring's used bytes for good, so the ring lost capacity permanently.
+TEST(InMemoryLogRing, TruncateWrappedLastEntryFreesPaddingRegression) {
+    using rune::storage::InMemoryLog;
+    using rune::storage::FullPolicy;
+    InMemoryLog log(200, 64, FullPolicy::DropOldest);
+    for (int64_t i = 0; i < 4; ++i) {   // A B C D(wraps, evicts A)
+        auto b = makeBatch(60, static_cast<uint8_t>(i));
+        ASSERT_GE(log.append(b.data(), b.size(), i), 0);
+    }
+    auto e = makeBatch(120, 9);           // E [60,180): evicts B and C, leaves D wrapped
+    ASSERT_GE(log.append(e.data(), e.size(), 4), 0);
+    ASSERT_EQ(log.logStartOffset(), 3);
+    log.truncateTo(4);                    // drop E: D is the only, wrapped, entry
+    log.truncateTo(3);                    // drop D: the ring is empty
+    ASSERT_EQ(log.logEndOffset(), 3);
+
+    // The whole capacity must be usable again: four 50 B batches, nothing
+    // evictable (floor below every new batch), all accepted.
+    log.setEvictionFloor(3);
+    for (int64_t i = 3; i < 7; ++i) {
+        auto b = makeBatch(50, static_cast<uint8_t>(i));
+        EXPECT_GE(log.append(b.data(), b.size(), i), 0) << "append " << i << " refused: capacity leaked";
+    }
+    EXPECT_EQ(log.fullRefusals(), 0U);
+}
+
+// Bug 2: truncating a wrapped entry moved the tail to the entry's start (0)
+// instead of back past the previous entry, so the padding was never re-counted
+// on the next wrap: the ring under-counted its used bytes and overwrote live data.
+TEST(InMemoryLogRing, TruncateWrappedEntryRestoresTailRegression) {
+    using rune::storage::InMemoryLog;
+    using rune::storage::FullPolicy;
+    InMemoryLog log(200, 64, FullPolicy::DropOldest);
+    std::vector<Written> all;
+    auto put = [&](std::size_t size, int64_t off) {
+        auto b = makeBatch(size, static_cast<uint8_t>(off * 31 + 7));
+        ASSERT_GE(log.append(b.data(), b.size(), off), 0) << "append " << off;
+        all.push_back({b, off});
+    };
+    for (int64_t i = 0; i < 5; ++i) put(60, i);   // A B C D(wraps) E[60,120): C D E live
+    ASSERT_EQ(log.logStartOffset(), 2);
+    log.truncateTo(3);                            // drop D (wrapped) and E: C alone at [120,180)
+    all.erase(std::remove_if(all.begin(), all.end(), [](const Written& w) { return w.offset >= 3; }),
+              all.end());
+    for (int64_t i = 3; i < 8; ++i) { put(60, i); expectAllLiveByteIdentical(log, all); }
+    put(20, 8);
+    expectAllLiveByteIdentical(log, all);
+    put(20, 9);
+    expectAllLiveByteIdentical(log, all);
+}
+
+// Seeded model check of append/truncate over many wraps: every live batch stays
+// byte-identical, and an emptied ring always takes a full-capacity batch without
+// evicting or refusing.
+TEST(InMemoryLogRing, TruncateAppendRandomizedModelRegression) {
+    using rune::storage::InMemoryLog;
+    using rune::storage::FullPolicy;
+    for (uint32_t seed = 1; seed <= 200; ++seed) {
+        InMemoryLog log(200, 16, FullPolicy::DropOldest);
+        std::vector<Written> all;
+        uint32_t s = seed;
+        auto rnd = [&s](uint32_t n) { s = s * 1664525u + 1013904223u; return (s >> 8) % n; };
+        int64_t next = 0;
+        for (int step = 0; step < 400; ++step) {
+            if (rnd(5) == 0 && log.logEndOffset() > log.logStartOffset()) {
+                const int64_t to = log.logStartOffset() +
+                    static_cast<int64_t>(rnd(static_cast<uint32_t>(log.logEndOffset() - log.logStartOffset() + 1)));
+                log.truncateTo(to);
+                all.erase(std::remove_if(all.begin(), all.end(), [to](const Written& w) { return w.offset >= to; }),
+                          all.end());
+                next = to;
+                if (log.logStartOffset() >= log.logEndOffset()) {
+                    // Empty: the full capacity must fit with nothing evicted.
+                    const auto evBefore = log.evictedRecords();
+                    auto b = makeBatch(200, static_cast<uint8_t>(seed + step));
+                    ASSERT_GE(log.append(b.data(), b.size(), next), 0) << "seed " << seed << " step " << step;
+                    all.push_back({b, next++});
+                    ASSERT_EQ(log.evictedRecords(), evBefore) << "seed " << seed << " step " << step;
+                }
+            } else {
+                const std::size_t len = 1 + rnd(80);
+                auto b = makeBatch(len, static_cast<uint8_t>(rnd(256)));
+                ASSERT_GE(log.append(b.data(), b.size(), next), 0);
+                all.push_back({b, next++});
+            }
+            expectAllLiveByteIdentical(log, all);
+            if (::testing::Test::HasFailure()) { ADD_FAILURE() << "seed " << seed << " step " << step; return; }
+        }
+    }
+}
+
+// Bug 3: evicting the last batch before the wrap point left head_ at that
+// batch's end, so the wrap padding behind it stayed counted as used until the
+// wrapped batch itself was evicted.  With that batch held by the eviction floor
+// the ring refused appends into space that was physically free.
+TEST(InMemoryLogRing, EvictBeforeWrapFreesPaddingAtOnceRegression) {
+    using rune::storage::InMemoryLog;
+    using rune::storage::FullPolicy;
+    InMemoryLog log(200, 64, FullPolicy::DropOldest);
+    std::vector<Written> all;
+    auto put = [&](std::size_t size, int64_t off) {
+        auto b = makeBatch(size, static_cast<uint8_t>(off * 17 + 3));
+        ASSERT_GE(log.append(b.data(), b.size(), off), 0) << "append " << off;
+        all.push_back({b, off});
+    };
+    for (int64_t i = 0; i < 4; ++i) put(60, i);   // A B C, D wraps to [0,60) (20 B padding), evicts A
+    put(60, 4);                                   // E [60,120): evicts B; C D E live
+    ASSERT_EQ(log.logStartOffset(), 2);
+    put(10, 5);                                   // F [120,130): evicts C, the last batch before the wrap
+    ASSERT_EQ(log.logStartOffset(), 3);
+    log.setEvictionFloor(3);                      // D E F are held
+    put(60, 6);                                   // [130,190) is free: must fit without evicting
+    EXPECT_EQ(log.fullRefusals(), 0U);
+    EXPECT_EQ(log.logStartOffset(), 3);
+    expectAllLiveByteIdentical(log, all);
+}
+
+// Seeded model check of append (with and without an eviction floor), truncate
+// and resetTo against a placement model that decides fit by overlap with the
+// live batches (not by byte counters): the ring must accept, refuse and evict
+// exactly as the model does, and every live batch stays byte-identical.
+TEST(InMemoryLogRing, EvictFloorTruncateResetRandomizedModelRegression) {
+    using rune::storage::InMemoryLog;
+    using rune::storage::FullPolicy;
+    constexpr std::size_t kRing = 400, kMaxRec = 16;
+    constexpr int64_t kNoFloor = std::numeric_limits<int64_t>::max();
+    struct MEntry { int64_t off; std::size_t pos, len; };
+    for (uint32_t seed = 1; seed <= 400; ++seed) {
+        InMemoryLog log(kRing, kMaxRec, FullPolicy::DropOldest);
+        std::vector<Written> all;
+        std::vector<MEntry> m;            // model: live batches, oldest first
+        int64_t floor = kNoFloor, mStart = 0;
+        uint32_t s = seed;
+        auto rnd = [&s](uint32_t n) { s = s * 1664525u + 1013904223u; return (s >> 8) % n; };
+        auto mTail = [&m] { return m.empty() ? std::size_t{0} : m.back().pos + m.back().len; };
+        auto freeAt = [&m](std::size_t pos, std::size_t len) {
+            for (const auto& e : m) if (pos < e.pos + e.len && e.pos < pos + len) return false;
+            return true;
+        };
+        int64_t next = 0;
+        for (int step = 0; step < 600; ++step) {
+            const uint32_t op = rnd(12);
+            if (op == 0 && log.logEndOffset() > log.logStartOffset()) {
+                const int64_t to = log.logStartOffset() +
+                    static_cast<int64_t>(rnd(static_cast<uint32_t>(log.logEndOffset() - log.logStartOffset() + 1)));
+                log.truncateTo(to);
+                while (!m.empty() && m.back().off >= to) m.pop_back();
+                all.erase(std::remove_if(all.begin(), all.end(), [to](const Written& w) { return w.offset >= to; }),
+                          all.end());
+                next = to;
+            } else if (op == 1 && rnd(4) == 0) {
+                next = log.logEndOffset() + static_cast<int64_t>(rnd(3));
+                log.resetTo(next);
+                m.clear(); all.clear(); mStart = next;
+            } else if (op == 2) {
+                const int64_t span = log.logEndOffset() - log.logStartOffset();
+                floor = rnd(3) == 0 ? kNoFloor
+                                    : log.logStartOffset() + static_cast<int64_t>(rnd(static_cast<uint32_t>(span + 1)));
+                log.setEvictionFloor(floor);
+            } else {
+                const std::size_t len = 1 + (rnd(4) == 0 ? rnd(kRing / 2) : rnd(60));
+                auto b = makeBatch(len, static_cast<uint8_t>(rnd(256)));
+                // Model: evict unheld oldest batches until the batch fits where
+                // the ring places it; a held batch in the way refuses (no side effect).
+                std::size_t nEvict = 0;
+                bool fits = false;
+                for (;;) {
+                    std::vector<MEntry> rest(m.begin() + static_cast<std::ptrdiff_t>(nEvict), m.end());
+                    std::swap(rest, m);
+                    const std::size_t t = mTail();
+                    const std::size_t pos = (len <= kRing - t) ? t : 0;
+                    fits = freeAt(pos, len) && m.size() + 1 <= kMaxRec;
+                    std::swap(rest, m);
+                    if (fits || nEvict == m.size() || m[nEvict].off >= floor) break;
+                    ++nEvict;
+                }
+                if (!fits && nEvict == m.size()) fits = true;   // emptied: always fits
+                const int64_t r = log.append(b.data(), b.size(), next);
+                ASSERT_EQ(r >= 0, fits) << "seed " << seed << " step " << step << " len " << len;
+                if (fits) {
+                    if (nEvict > 0) mStart = m[nEvict - 1].off + 1;
+                    m.erase(m.begin(), m.begin() + static_cast<std::ptrdiff_t>(nEvict));
+                    const std::size_t t = mTail();
+                    m.push_back({next, (len <= kRing - t) ? t : 0, len});
+                    all.push_back({b, next++});
+                }
+                ASSERT_EQ(log.logStartOffset(), m.empty() ? log.logStartOffset() : mStart)
+                    << "seed " << seed << " step " << step;
+            }
+            expectAllLiveByteIdentical(log, all);
+            if (::testing::Test::HasFailure()) { ADD_FAILURE() << "seed " << seed << " step " << step; return; }
+        }
+    }
 }

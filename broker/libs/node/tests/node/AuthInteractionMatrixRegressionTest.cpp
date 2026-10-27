@@ -218,7 +218,7 @@ void strayLogin(AuthMatrixRig& rig, bool ok) {
     const std::string pw = ok ? rune::node::test::AuthRig::kPw : "not-the-password-000";
     const auto l = rig.rig().wire().login(rig.rig().ch(), sid, "builder", {pw, pw});
     ASSERT_EQ(l.ok(), ok);
-    const std::int32_t id = ok ? rune::node::kLoginsOkCounterTypeId : rune::node::kLoginsFailedCounterTypeId;
+    const std::int32_t id = ok ? rune::node::typeIdOf(rune::node::RuneMetric::LoginsOk) : rune::node::typeIdOf(rune::node::RuneMetric::LoginsFailed);
     ASSERT_TRUE(counterReaches(rig, id, (ok ? rig.issuedOk() : rig.issuedFailed()) + 1))
         << "the stray login never reached the CnC counter";
 }
@@ -307,6 +307,17 @@ TEST(AuthMatrixDiskRegression, EveryRigTopicCreatePathRollsAtTheRigSegmentSizeAd
         const uint64_t grew = grownBy(dir, before);
         EXPECT_GT(grew, 0u) << "AuthRig::defineTopicCode: no segment appeared";
         EXPECT_LT(grew, kPerTopicCeiling) << "AuthRig::defineTopicCode";
+    }
+    {
+        // The raw test client with NO config argument (AuthStress's user CREATE TOPIC, CatalogBoot and ~35 other
+        // call sites): ShardTestClient::sendDefineTopic defaults to a 1 MiB segment, never the 64 MiB broker default.
+        auto& r = rig.rig();
+        const uint64_t before = allocatedBytes(dir);
+        ASSERT_EQ(r.ddlCode(r.c().sendDefineTopic(r.ch(), r.stream(), r.builder, "adv.rawdefault", 1,
+                                                  rune::node::test::authRigCharBlob())), 0);
+        const uint64_t grew = grownBy(dir, before);
+        EXPECT_GT(grew, 0u) << "ShardTestClient::sendDefineTopic default: no segment appeared";
+        EXPECT_LT(grew, kPerTopicCeiling) << "ShardTestClient::sendDefineTopic default config";
     }
     for (const AMOp op : {AMOp::CreateTopic, AMOp::CreateSchema, AMOp::CreateView}) {
         const Cell c{op, Grant::Exact, Timing::Steady};

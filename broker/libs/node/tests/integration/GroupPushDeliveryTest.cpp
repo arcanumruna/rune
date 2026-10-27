@@ -246,7 +246,7 @@ protected:
 
     CG4DeliveryFixture()
         : aeronDir_("aeron")
-        , topicDir_("topics")
+        , topicDir_("topicdata")
         , offsetDir_("offset")
         , offsetLog_(offsetDir_.path)
     {}

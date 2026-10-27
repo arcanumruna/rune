@@ -44,7 +44,7 @@ struct RecordingSink final : IAdminRequestSink {
     AdminSubmit submitDefineTopic(int64_t, int64_t, std::string_view, uint32_t, std::string_view, bool, const uint8_t*,
                                   uint32_t, uint8_t, int16_t, const rune::protocol::TopicConfigView&,
                                   const DdlMetaView&, std::string_view) override { ++otherSubmits; return AdminSubmit::Accepted; }
-    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t) override { return true; }
+    bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t, uint32_t) override { return true; }
     AdminSubmit submitAlterTopic(int64_t, int64_t, std::string_view, uint16_t, const uint8_t*, uint32_t,
                                  const DdlMetaView&) override { ++otherSubmits; return AdminSubmit::Accepted; }
     AdminSubmit submitCreateView(int64_t, int64_t, std::string_view, std::string_view, uint8_t, const uint8_t*, uint32_t,
@@ -64,6 +64,8 @@ struct RecordingSink final : IAdminRequestSink {
         if (!denial.empty()) { denied[w.correlationId] = std::string(denial); return AdminSubmit::Accepted; }
         ++securityDdls; lastAuthenticated = std::string(m.authenticated); return AdminSubmit::Accepted;
     }
+    AdminSubmit submitNamespaceDdl(const pc::NamespaceDdlRequest&, const DdlMetaView&, std::string_view, uint16_t) override { return AdminSubmit::Accepted; }
+    AdminSubmit submitListNamespaces(int64_t, int64_t, uint32_t, uint16_t, uint32_t, bool) override { return AdminSubmit::Accepted; }
     AdminSubmit submitSecurityBootstrap(const pc::SecurityBootstrap&, const DdlMetaView&) override { ++bootstraps; return AdminSubmit::Accepted; }
     bool submitSecuritySubscribe(int64_t s, int64_t c, int64_t) override { secSubs.push_back({s, c}); return true; }
     bool submitSecurityUnsubscribe(int64_t s, int64_t id) override { secUnsubs.push_back({s, id}); return true; }

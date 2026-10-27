@@ -574,8 +574,7 @@ def test_dr14_shm_exhaustion_injection(tmp_path):
     """/dev/shm capped at 1 MiB on every broker: the cluster must still start, elect and serve acks=All.
 
     The original premise ("Aeron CnC / log buffers live in /dev/shm, so a tiny shm must fail startup cleanly")
-    does not hold for this broker: its Aeron directory is RUNE_DATA_DIR/aeron on the data volume (rune_role
-    reads it there), not /dev/shm - measured 2026-10-15 on the Linux VM, brokers with shm_size=1m start and
+    does not hold for this broker: its Aeron directory is RUNE_DATA_DIR/aeron on the data volume, not /dev/shm - measured 2026-10-15 on the Linux VM, brokers with shm_size=1m start and
     elect normally.  So the injected fault is a 1 MiB /dev/shm, and the invariant is that the broker has NO
     hidden /dev/shm dependency: it forms a cluster and serves a committed, ordered, exactly-once round trip.
     (A 1 MiB shm could not hold even one 4 MiB Aeron term, so any shm-backed log buffer would fail here.)

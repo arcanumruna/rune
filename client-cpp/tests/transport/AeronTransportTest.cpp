@@ -98,6 +98,19 @@ static bool boundedOffer(Transport& t, const uint8_t* buf, std::size_t len) {
     return false;
 }
 
+/// Bounded poll until one fragment arrives; copies it into `out`.
+static bool pollOne(Transport& t, std::vector<uint8_t>& out) {
+    bool fired = false;
+    for (int i = 0; i < kPollPumpMax && !fired; ++i) {
+        t.poll([&](const uint8_t* buf, std::size_t len) {
+            out.assign(buf, buf + len);
+            fired = true;
+        }, 10);
+        if (!fired) std::this_thread::sleep_for(kPumpSleep);
+    }
+    return fired;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -120,14 +133,7 @@ TEST(AeronTransport, IpcLoopbackEcho) {
 
     // Poll until handler fires.
     std::vector<uint8_t> received;
-    bool fired = false;
-    for (int i = 0; i < kPollPumpMax && !fired; ++i) {
-        t.poll([&](const uint8_t* buf, std::size_t len) {
-            received.assign(buf, buf + len);
-            fired = true;
-        }, 10);
-        if (!fired) std::this_thread::sleep_for(kPumpSleep);
-    }
+    const bool fired = pollOne(t, received);
 
     ASSERT_TRUE(fired) << "poll() handler never called — echo timed out";
     ASSERT_EQ(received.size(), kPayloadLen);
@@ -193,14 +199,7 @@ TEST(AeronTransport, IpcLoopbackMultiFrame) {
 
     // Poll until the FULLY reassembled frame arrives.
     std::vector<uint8_t> received;
-    bool fired = false;
-    for (int i = 0; i < kPollPumpMax && !fired; ++i) {
-        t.poll([&](const uint8_t* buf, std::size_t len) {
-            received.assign(buf, buf + len);
-            fired = true;
-        }, 10);
-        if (!fired) std::this_thread::sleep_for(kPumpSleep);
-    }
+    const bool fired = pollOne(t, received);
 
     ASSERT_TRUE(fired)
         << "Multi-frame poll() handler never called — FragmentAssembler did not reassemble";
@@ -379,10 +378,7 @@ TEST(AeronTransportRegression, StartFailureEitherSideEitherDriverModeThrowsNever
     const uint8_t frame[4] = {0xDE, 0xAD, 0xBE, 0xEF};
     ASSERT_TRUE(boundedOffer(ok, frame, sizeof frame));
     std::vector<uint8_t> got;
-    for (int i = 0; i < kPollPumpMax && got.empty(); ++i) {
-        ok.poll([&](const uint8_t* b, std::size_t n) { got.assign(b, b + n); }, 10);
-        if (got.empty()) std::this_thread::sleep_for(kPumpSleep);
-    }
+    (void)pollOne(ok, got);
     EXPECT_EQ(got, std::vector<uint8_t>(frame, frame + sizeof frame));
     ok.stop();
 }

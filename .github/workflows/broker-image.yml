@@ -35,6 +35,13 @@ jobs:
           repository: ${{ github.repository_owner }}/flight-recorder
           path: flight-recorder
 
+      # arcanum-metrics (header-only) at the sha pinned in broker/cmake/ArcanumMetrics.cmake.
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository_owner }}/arcanum-metrics
+          ref: 991ecc56ce2f7a02c6dd9f613cb2514e7849206e
+          path: arcanum-metrics
+
       - name: Check tag matches VERSION.txt
         run: |
           VERSION=$(< broker/VERSION.txt)
@@ -70,6 +77,7 @@ jobs:
         env:
           IMAGE_NAME: ${{ env.GHCR_IMAGE }}
           FLIGHT_RECORDER_DIR: ${{ github.workspace }}/flight-recorder
+          ARCANUM_METRICS_DIR: ${{ github.workspace }}/arcanum-metrics
           CMAKE_BUILD_PARALLEL_LEVEL: '4'
         run: |
           VERSION=$(< broker/VERSION.txt)

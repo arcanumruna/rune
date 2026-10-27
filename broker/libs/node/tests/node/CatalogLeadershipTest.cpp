@@ -108,7 +108,7 @@ TEST(CatalogLeadershipRegression, RetryAfterLeaderChangeReturnsTheOriginalResult
     EXPECT_TRUE(t.allDigestsEqual());
     const auto log = t.recordedLog(2);
     ASSERT_FALSE(log.empty());
-    EXPECT_EQ(retry.topicId, t.admin(2).applier().state().topicByName("t")->topicId) << "the original topic id";
+    EXPECT_EQ(retry.topicId, t.admin(2).applier().state().topicByName(rune::catalog::kDefaultNsId, "t")->topicId) << "the original topic id";
     EXPECT_EQ(t.answersSentFor(1, corr), 1u) << "answered exactly once";
     for (int32_t b = 1; b <= 3; ++b) EXPECT_EQ(t.countEventsWithRequestId(rid, b), 1u) << "broker " << b;
 }
@@ -135,7 +135,7 @@ TEST(CatalogLeadershipRegression, NewLeaderTruncatesTheOldLeadersUncommittedEven
     ASSERT_TRUE(t.awaitConverged());
     EXPECT_EQ(t.countEventsWithRequestId(rid, 1), 0u) << "the new leader's history truncated 1's tail";
     EXPECT_EQ(t.replica(1).logEndOffset(), before);
-    EXPECT_EQ(t.admin(1).applier().state().topicByName("t"), nullptr) << "never applied anywhere";
+    EXPECT_EQ(t.admin(1).applier().state().topicByName(rune::catalog::kDefaultNsId, "t"), nullptr) << "never applied anywhere";
 
     // A retry that lands on the old leader (now a follower) is retriable, never OK.
     const auto onOld = t.define(1, {.name = "t", .partitions = 1, .requestId = rid});
@@ -146,7 +146,7 @@ TEST(CatalogLeadershipRegression, NewLeaderTruncatesTheOldLeadersUncommittedEven
     ASSERT_TRUE(t.allDigestsEqual());
     for (int32_t b = 1; b <= 3; ++b) {
         EXPECT_EQ(t.countEventsWithRequestId(rid, b), 1u) << "broker " << b;
-        const auto* topic = t.admin(b).applier().state().topicByName("t");
+        const auto* topic = t.admin(b).applier().state().topicByName(rune::catalog::kDefaultNsId, "t");
         ASSERT_NE(topic, nullptr) << "broker " << b;
         EXPECT_EQ(topic->topicId, retry.topicId);
     }
@@ -196,7 +196,7 @@ TEST(CatalogLeadershipRegression, HaltedLeaderAnswersInternalAndStaysHaltedThrou
     ASSERT_TRUE(t.awaitRole(2, "Follower", 1s));
     t.moveCatalogLeadership(2);
     ASSERT_TRUE(t.awaitRole(2, "LeaderServing", 10s));
-    EXPECT_NE(t.admin(2).applier().state().topicByName("a"), nullptr);
+    EXPECT_NE(t.admin(2).applier().state().topicByName(rune::catalog::kDefaultNsId, "a"), nullptr);
     EXPECT_EQ(t.define(2, {.name = "c", .partitions = 1}).code, kOk) << "every other broker keeps working";
     EXPECT_EQ(t.admin(1).roleName(), "Halted") << "a follower role does not clear the halt";
     t.moveCatalogLeadership(1);
@@ -301,5 +301,5 @@ TEST(CatalogLeadershipRegression, HaltAtItsOwnEventSaysTheEventMayHaveCommittedR
     EXPECT_NE(a.detail.find("may have committed"), std::string::npos) << a.detail;
     EXPECT_NE(a.detail.find("same requestId"), std::string::npos) << a.detail;
     for (int i = 0; i < 50; ++i) t.pump();
-    EXPECT_EQ(t.admin(2).applier().state().topicByName("a"), nullptr) << "it did commit: applied elsewhere";
+    EXPECT_EQ(t.admin(2).applier().state().topicByName(rune::catalog::kDefaultNsId, "a"), nullptr) << "it did commit: applied elsewhere";
 }

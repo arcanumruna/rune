@@ -503,14 +503,14 @@ TEST(RuneCliCatalogRegression, FormatDiffEntryAndDefinitionsRenderTheGoldenState
     cat::CatalogReplayer r;
     int64_t off = 0;
     for (const auto& e : cat::testing::goldenScriptV1()) ASSERT_TRUE(r.feedDecoded(off++, e));
-    const auto* players = r.state().topicByName("players");
+    const auto* players = r.state().topicByName(rune::catalog::kDefaultNsId, "players");
     ASSERT_NE(players, nullptr);
     const std::string topic = rune::cli::formatTopicDefinition(*players);
     EXPECT_NE(topic.find("topic players"), std::string::npos) << topic;
     EXPECT_NE(topic.find("partitions"), std::string::npos) << topic;
     EXPECT_NE(topic.find("config.retentionMs"), std::string::npos) << topic;
     EXPECT_NE(rune::cli::formatSchemaDefinition(*players).find("schema players"), std::string::npos);
-    const auto* view = r.state().viewByName("ev_view");
+    const auto* view = r.state().viewByName(rune::catalog::kDefaultNsId, "ev_view");
     ASSERT_NE(view, nullptr);
     const std::string v = rune::cli::formatViewDefinition(*view);
     EXPECT_NE(v.find("view ev_view"), std::string::npos) << v;

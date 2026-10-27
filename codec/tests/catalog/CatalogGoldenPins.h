@@ -1,5 +1,5 @@
 #pragma once
-// tests/catalog/CatalogGoldenPins.h — FROZEN.  The CatalogState::digest() after each event of
+// tests/catalog/CatalogGoldenPins.h — FROZEN (v2 pins appended at the end, same rule).  The CatalogState::digest() after each event of
 // tests/catalog/golden/v1/basic.rcat, printed once by tools/make_catalog_golden when formatVer 1
 // was introduced.  Never regenerate: a mismatch means a v1 rule changed — ship it as formatVer 2.
 // One deliberate regeneration (#143): GoldenScript's view sinks now mirror their first source's
@@ -31,5 +31,23 @@ inline constexpr uint64_t kBasicV1Digests[] = {
     0xbfcdc90bb2ccc31full,   // offset 20 SetCompatibility
     0x0bda66e6512fbb8aull,   // offset 21 CreateView
     0xfc48be1db130d020ull,   // offset 22 AlterView
+};
+
+// tests/catalog/golden/v2/namespaces.rcat, printed by `make_catalog_golden <out> v2` when formatVer 2 was
+// introduced (namespaces plan, Task 3).  Frozen like the v1 pins.
+inline constexpr uint64_t kNamespacesV2Digests[] = {
+    0xa56fb60911627d63ull,   // offset 0 NamespaceCreated
+    0x5dbeca0a0de4d0e8ull,   // offset 1 NamespaceCreated
+    0x0c3516e7ddaff94dull,   // offset 2 NamespaceCreated
+    0x989eafff282c4417ull,   // offset 3 CreateTopic
+    0x61886ed54c23c9e5ull,   // offset 4 CreateTopic
+    0x75221e7d6d83da71ull,   // offset 5 NamespaceLimitsSet
+    0xc2976eae7e70723cull,   // offset 6 CreateTopic
+    0xe7a629b69dd5f8f3ull,   // offset 7 CreateView
+    0x375fd0620005f4f0ull,   // offset 8 NamespaceStateChanged
+    0xac972125f691c8fdull,   // offset 9 NamespaceStateChanged
+    0x18c99adb9b990162ull,   // offset 10 NamespaceStateChanged
+    0xf2dd7c59594c1763ull,   // offset 11 NamespaceDeleted (tombstone fold, F6)
+    0x5677c3637e380eadull,   // offset 12 DropTopic
 };
 } // namespace rune::catalog::golden

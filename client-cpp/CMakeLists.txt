@@ -1716,6 +1716,7 @@ add_library(rune_cli_lib STATIC
     src/cli/QlEngine.cpp
     src/cli/Console.cpp
     src/cli/SecurityCommands.cpp
+    src/cli/NamespaceCommands.cpp
 )
 target_include_directories(rune_cli_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -1770,6 +1771,17 @@ if(BUILD_TESTING)
     target_link_libraries(rune_cli_catalog_tests PRIVATE rune_cli_lib rune_catalog GTest::gtest_main)
     target_compile_features(rune_cli_catalog_tests PRIVATE cxx_std_23)
     gtest_discover_tests(rune_cli_catalog_tests)
+endif()
+
+# ── Namespaces Task 11: `rune namespace` limit flags / --set / list output, OFFLINE ─────────────────────────
+if(BUILD_TESTING)
+    add_executable(rune_cli_namespace_tests
+        tests/RuneCliNamespaceTest.cpp
+    )
+    target_include_directories(rune_cli_namespace_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_cli_namespace_tests PRIVATE rune_cli_lib GTest::gtest_main)
+    target_compile_features(rune_cli_namespace_tests PRIVATE cxx_std_23)
+    gtest_discover_tests(rune_cli_namespace_tests)
 endif()
 
 # ── Authentication Task 8: `rune security` / `rune ql` security statements, OFFLINE ───────────────────────

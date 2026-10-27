@@ -40,6 +40,7 @@
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/consensus/ControlRing.h>
 #include <rune/node/CleanerViewChannel.h>
+#include <rune/node/RuneMetricSlot.h>
 #include <rune/node/detail/RingDoorbell.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
@@ -80,9 +81,10 @@ public:
         kMetricReadMapFailures,       ///< review Md5: off-owner read-map growths that failed
         kMetricCount
     };
-    /// Sink called on THIS thread whenever a metric changes (BrokerNode: Aeron
-    /// counters).  Plain function pointer — set before the runner starts.
-    using MetricSink = void (*)(void* ctx, int metric, int64_t value) noexcept;
+    /// This thread's own kRuneMetrics rows (arcanum-metrics D58/D59), indexed by Metric: copied from
+    /// BrokerNode's slots in the constructor, before the runner starts, and written only here (owner
+    /// tag MetricOwner::Provisioner).  An unbound slot publishes nothing (unit tests, no metrics file).
+    using MetricSlots = std::array<RuneMetricSlot, kMetricCount>;
 
     /// `capBytes` (node-wide bytes reserved by ready segments' fallocate):
     /// > 0 fixed, 0 no cap, < 0 AUTO = capFreePct % of the free space of
@@ -90,8 +92,8 @@ public:
     /// builds).  Over the cap a ready segment is still built, without its
     /// block reservation (re-review N3) — never an inline roll.
     explicit SegmentProvisionerAgent(std::size_t depth, int64_t capBytes = 0, std::string capDir = {},
-                                     int capFreePct = 10)
-        : depth_(std::clamp<std::size_t>(depth, 1, rune::storage::Log::kMaxProvisionDepth)),
+                                     int capFreePct = 10, MetricSlots slots = {})
+        : slots_(slots), depth_(std::clamp<std::size_t>(depth, 1, rune::storage::Log::kMaxProvisionDepth)),
           capMode_(capBytes), capDir_(std::move(capDir)), capFreePct_(std::clamp(capFreePct, 1, 100)),
           capBytes_(capBytes > 0 ? capBytes : (capBytes < 0 ? kUnknownCap : 0)) {
         if (capMode_ < 0) refreshAutoCap_();
@@ -103,8 +105,6 @@ public:
     /// The replica view (NodeRuntimeAgent::enableProvisionerView).  Before the
     /// runner starts.
     void attachViewChannel(CleanerViewChannel* ch) noexcept { channel_ = ch; }
-    /// Before the runner starts.
-    void setMetricSink(MetricSink fn, void* ctx) noexcept { sink_ = fn; sinkCtx_ = ctx; }
 
     /// The hook every provisioned log posts its demands through (any worker
     /// thread): Log::setProvisioning(provisioner.channel(), thresholdPct).
@@ -130,6 +130,7 @@ public:
     [[nodiscard]] uint64_t unpreallocatedForTest() const noexcept { return metrics_[kMetricUnpreallocatedBuilds]; }
     [[nodiscard]] uint64_t parkedDroppedForTest()  const noexcept { return metrics_[kMetricParkedDropped]; }
     [[nodiscard]] uint64_t rollHoldsForTest()      const noexcept { return metrics_[kMetricRollHolds]; }
+    [[nodiscard]] uint64_t readMapFailuresForTest() const noexcept { return metrics_[kMetricReadMapFailures]; }
     [[nodiscard]] uint64_t viewGenerationForTest() const noexcept { return viewGen_; }
     [[nodiscard]] int64_t  reservedBytesForTest()  const noexcept { return reserved_; }
     [[nodiscard]] std::size_t parkedDemandsForTest() const noexcept { return parked_.size(); }
@@ -202,7 +203,8 @@ private:
 
     void bump_(int m) noexcept {
         ++metrics_[static_cast<std::size_t>(m)];
-        if (sink_ != nullptr) sink_(sinkCtx_, m, static_cast<int64_t>(metrics_[static_cast<std::size_t>(m)]));
+        const RuneMetricSlot& slot = slots_[static_cast<std::size_t>(m)];
+        if (slot.bound()) slot.set(static_cast<int64_t>(metrics_[static_cast<std::size_t>(m)]), MetricOwner::Provisioner);
     }
 
     void refreshAutoCap_() noexcept {
@@ -336,6 +338,7 @@ private:
 
     struct Parked { rune::storage::Log* log; Demand kind; };
 
+    MetricSlots slots_;   // this thread's metric rows (D58); fixed at construction
     std::size_t depth_;
     int64_t     capMode_;
     std::string capDir_;
@@ -355,8 +358,6 @@ private:
     bool     ackPending_  = false;
     uint64_t built_ = 0, demandsServed_ = 0, demandsIgnored_ = 0;
     std::array<uint64_t, kMetricCount> metrics_{};
-    MetricSink sink_ = nullptr;
-    void*      sinkCtx_ = nullptr;
 };
 
 } // namespace rune::node

@@ -8,6 +8,7 @@
 # Env:
 #   IMAGE_NAME                 image name (default rune)
 #   FLIGHT_RECORDER_DIR        flight-recorder checkout (default: sibling of the repo root)
+#   ARCANUM_METRICS_DIR        arcanum-metrics checkout (default: sibling of the repo root)
 #   CMAKE_BUILD_PARALLEL_LEVEL cap on compile jobs (each big TU needs ~1.5 GB)
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -28,6 +29,11 @@ if [[ ! -d $FLIGHT_RECORDER_DIR/src || ! -d $FLIGHT_RECORDER_DIR/include ]]; the
   echo "❌ flight-recorder not found at '$FLIGHT_RECORDER_DIR' (set FLIGHT_RECORDER_DIR)"
   exit 1
 fi
+ARCANUM_METRICS_DIR="${ARCANUM_METRICS_DIR:-../../arcanum-metrics}"
+if [[ ! -f $ARCANUM_METRICS_DIR/include/metrics/MetricsLayout.h ]]; then
+  echo "❌ arcanum-metrics not found at '$ARCANUM_METRICS_DIR' (set ARCANUM_METRICS_DIR)"
+  exit 1
+fi
 
 ARGS=("$@")
 [[ ${#ARGS[@]} -eq 0 ]] && ARGS=(--load)
@@ -42,6 +48,7 @@ docker buildx build \
   --build-context rune-client=../client-cpp \
   --build-context rune-ql=../ql \
   --build-context flight-recorder="$FLIGHT_RECORDER_DIR" \
+  --build-context arcanum-metrics="$ARCANUM_METRICS_DIR" \
   --build-arg CMAKE_BUILD_PARALLEL_LEVEL \
   --label org.opencontainers.image.version="$VERSION" \
   --label org.opencontainers.image.revision="$(git rev-parse HEAD)" \

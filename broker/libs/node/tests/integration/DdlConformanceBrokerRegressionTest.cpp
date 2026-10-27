@@ -11,6 +11,7 @@
 //   T7  catalog + collisions are identical across a restart (the boot replay).
 // T6 / 3-node failover: the catalog leadership suites (Tasks 11 / 20).
 #include <rune/aeronutil/testing/FreePort.h>
+#include <rune/node/NamespacePaths.h>
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
@@ -157,7 +158,8 @@ TEST(DdlConformanceBrokerRegression, T1_SequentialCollisionsAnswerExactCodes) {
         EXPECT_EQ(w.renameKey(sid, "character"), kOk) << "B8: RENAME id -> pk";
         EXPECT_EQ(w.define(sid, ""), kInvalidTopicName);
         EXPECT_EQ(w.define(sid, "__views"), kInvalidTopicName);
-        EXPECT_EQ(w.define(sid, "a/b"), kInvalidTopicName);
+        EXPECT_EQ(w.define(sid, "a/b/c"), kInvalidTopicName) << "namespaces: two '/' is malformed";
+        EXPECT_EQ(w.define(sid, "a/b"), kUnknownTopic) << "namespaces (D7): an unknown namespace answers missing";
         EXPECT_EQ(w.define(sid, "Character"), kTopicExists);
         EXPECT_EQ(w.define(sid, "zero", 0, 0), kInvalidSchema);
         ASSERT_TRUE(w.schema(sid, "__topic_schemas").has_value());
@@ -169,7 +171,7 @@ TEST(DdlConformanceBrokerRegression, T1_SequentialCollisionsAnswerExactCodes) {
         EXPECT_EQ(node.viewRegistryForTest()->byName("hp_of_hp"), nullptr) << "B9: nothing created";
         EXPECT_NE(node.viewRegistryForTest()->byName("char_hp"), nullptr);
     }
-    EXPECT_FALSE(fs::exists(dir / "topics" / "a")) << "no directory for a rejected name";
+    EXPECT_FALSE(fs::exists(rune::node::topicsRoot(dir, 0) / "a")) << "no directory for a rejected name";
 }
 
 TEST(DdlConformanceBrokerRegression, T2_PipelinedSameNameFromTwoSessionsExactlyOneWins) {
@@ -300,7 +302,7 @@ TEST(DdlConformanceBrokerRegression, T5_RefusedDdlLeavesNoTraceAndTheBrokerStill
         ASSERT_TRUE(later.has_value());
         EXPECT_EQ(later->errorCode, kOk);
         EXPECT_EQ(later->topicId, laterId) << "a topic keeps its id across the restart";
-        EXPECT_FALSE(fs::exists(dir / "topics" / "orphan_v")) << "the refused view never had a directory";
+        EXPECT_FALSE(fs::exists(rune::node::topicsRoot(dir, 0) / "orphan_v")) << "the refused view never had a directory";
         for (const std::string ph : {std::string("__orphan.") + std::to_string(laterId), std::string("__catalog")}) {
             SCOPED_TRACE(ph);
             ASSERT_TRUE(w.schema(sid, ph).has_value());
@@ -593,10 +595,10 @@ TEST(DdlConformanceBrokerRegression, HaltedBootReplayMovesNoTopicDirAndLosesNoCo
         ASSERT_TRUE(node.awaitLeader(30s));
         node.stop();
     }
-    EXPECT_TRUE(fs::exists(dir / "topics" / "later" / "0")) << "the halted boot moved / quarantined the dir";
+    EXPECT_TRUE(fs::exists(rune::node::topicsRoot(dir, 0) / "later" / "0")) << "the halted boot moved / quarantined the dir";
     bool quarantined = false;
     std::error_code qec;
-    for (const auto& e : fs::directory_iterator(dir / "quarantine", qec))
+    for (const auto& e : fs::directory_iterator(rune::node::quarantineRoot(dir, 0), qec))
         quarantined = quarantined || e.path().filename().string().rfind("later", 0) == 0;
     EXPECT_FALSE(quarantined) << "nothing quarantined while the catalog replay halts";
     // The operator repairs the catalog; the next boot serves every committed record.

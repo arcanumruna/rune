@@ -273,32 +273,30 @@ public:
         while (entryCount_ > 0 &&
                backEntry().baseOffset >= truncateOffset) {
             const Entry& back = backEntry();
-            // Detect whether this entry was preceded by a wrap-induced padding gap.
-            // A wrap happened when the previous entry's end < back.ringOffset (no)
-            // OR when back.ringOffset < (prev.ringOffset + prev.length) — i.e. the
-            // tail wrapped back to 0 (or near 0) for this entry.
+            // The tail goes back to where it stood before this entry was appended.
+            // If the entry wrapped, that is past the previous entry (or past the
+            // head, for a lone entry), and the wrap padding is freed with it.
+            std::size_t newTail = back.ringOffset;
             if (entryCount_ >= 2) {
                 const Entry& prev = entryAt(entryCount_ - 2);
                 const std::size_t prevEnd = prev.ringOffset + prev.length;
                 if (back.ringOffset < prevEnd) {
-                    // This entry was placed after a wrap; there is a padding gap of
-                    // (maxBytes_ - prevEnd) bytes that should be freed.
-                    const std::size_t paddingGap = maxBytes_ - prevEnd;
-                    bytesUsed_ -= paddingGap;
+                    bytesUsed_ -= maxBytes_ - prevEnd;
+                    newTail = prevEnd;
                 }
-            } else if (entryCount_ == 1) {
-                // Only one entry — if tail_ > back.ringOffset + back.length there's
-                // padding at the logical end, but there can be no wrap (head_ == 0).
-                // No action needed.
+            } else if (back.ringOffset < head_) {
+                // Lone wrapped entry: the padding runs from head_ to the end.
+                bytesUsed_ -= maxBytes_ - head_;
+                newTail = head_;
             }
             bytesUsed_ -= back.length;
-            // Retract tail to free the space this entry occupied.
-            tail_ = back.ringOffset;
+            tail_ = newTail;
             popBackEntry();
         }
         if (entryCount_ == 0) {
             head_ = tail_ = 0;
             entryHead_ = 0;
+            bytesUsed_ = 0;
         }
         logEndOffset_ = truncateOffset;
     }
@@ -485,6 +483,8 @@ private:
                     if (--sCount == 0) sHead = sTail = 0;
                     if (++phys == maxRecords_) phys = 0;   // compare-and-reset, no division
                     ++nEvict;
+                    // As evictOldest(): the wrap padding goes with the last pre-wrap batch.
+                    if (sCount > 0 && entries_[phys].ringOffset < sHead) { sBytes -= maxBytes_ - sHead; sHead = 0; }
                 }
                 for (std::size_t i = 0; i < nEvict; ++i) evictOldest();
             }
@@ -582,6 +582,12 @@ private:
         if (entryCount_ == 0) {
             head_ = tail_ = 0;
             entryHead_ = 0;
+        } else if (frontEntry().ringOffset < head_) {
+            // The last batch before the wrap point is gone: free the wrap
+            // padding now, not when the wrapped batch is evicted (which the
+            // eviction floor may hold back indefinitely).
+            bytesUsed_ -= maxBytes_ - head_;
+            head_ = 0;
         }
     }
 

@@ -34,6 +34,7 @@ namespace fs = std::filesystem;
 // ---------------------------------------------------------------------------
 // TempFile — unique path per test, cleaned up on destruction
 // ---------------------------------------------------------------------------
+namespace {   // internal linkage: other TUs of rune_consensus_tests define TempFile and *Call structs (ODR)
 struct TempFile {
     fs::path path;
     explicit TempFile(std::string_view suffix = ".dat") {
@@ -118,6 +119,8 @@ struct ElectionLogFakePublisher : ConsensusPublisher {
         nltCalls.clear(); appendPositionCalls.clear(); commitPositionCalls.clear();
     }
 };
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Test timing constants

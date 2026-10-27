@@ -33,10 +33,12 @@
 #include <rune/codec/Serialize.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/NamespaceMessages.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 #include <rune/view/ViewPlan.h>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -91,6 +93,7 @@ public:
         bool                        validate    = false;
         rune::protocol::TopicConfig config{};
         bool                        preV8       = false;   // no DDL extension (requestId {0,0})
+        uint32_t                    nsId        = 0;       // namespaces Task 7: the topic's namespace
     };
 
     /// `fdLimit` / `fdReadySegments` (issue #296): AdminDeps::fdLimit / readySegmentsPerPartition (0 = unknown limit).
@@ -195,7 +198,44 @@ public:
         if (a.typed) m.blob = descriptor(a.name);
         m.persistence = a.persistence; m.replicationFactor = a.rf; m.config = a.config;
         m.meta = meta_(a.statement, a.clientName, a.requestId, a.preV8);
+        m.nsId = a.nsId;
         return submit_(DdlRequest{std::move(m)});
+    }
+
+    // ── namespaces (Task 7) ──────────────────────────────────────────────────
+    /// The namespace config the NEXT open_ (construction or restart()) uses — the broker's boot config.
+    void setMaxNamespaces(uint32_t n) noexcept { maxNamespaces_ = n; }
+    void setNamespaceDefaults(const rune::protocol::NamespaceLimits& l) noexcept { nsDefaults_ = l; }
+    /// A NamespaceDdl (81) message (corr drawn, meta with a fresh rid unless `rid` is set) — not submitted.
+    [[nodiscard]] NamespaceDdlMsg namespaceMsg(uint8_t kind, const std::string& name,
+                                               std::array<uint8_t, 4> mask = {},
+                                               const rune::protocol::NamespaceLimits& limits = {},
+                                               rune::protocol::RequestId rid = {}, uint16_t clientVersion = 14) {
+        NamespaceDdlMsg m;
+        m.session = kSession; m.corr = ++corr_; m.kind = kind; m.name = name; m.mask = mask; m.limits = limits;
+        m.clientVersion = clientVersion;
+        m.meta = meta_("", "rig", rid, false);
+        return m;
+    }
+    Answer createNamespace(const std::string& name, std::array<uint8_t, 4> mask = {},
+                           const rune::protocol::NamespaceLimits& limits = {}, rune::protocol::RequestId rid = {},
+                           uint16_t clientVersion = 14) {
+        return await_(submit_(DdlRequest{namespaceMsg(1, name, mask, limits, rid, clientVersion)}));
+    }
+    Answer setNamespaceLimits(const std::string& name, std::array<uint8_t, 4> mask,
+                              const rune::protocol::NamespaceLimits& limits, rune::protocol::RequestId rid = {}) {
+        return await_(submit_(DdlRequest{namespaceMsg(2, name, mask, limits, rid)}));
+    }
+    /// ListNamespaces (82): answered at once (a read) — the page, or nullopt with the error in answerFor(corr).
+    std::optional<rune::protocol::client::ListNamespacesResponse>
+    listNamespaces(uint32_t afterNsId, uint16_t max, uint32_t callerNsId = 0, bool clusterAdmin = true) {
+        ListNamespacesMsg m;
+        m.session = kSession; m.corr = ++corr_; m.afterNsId = afterNsId; m.max = max; m.callerNsId = callerNsId;
+        m.clusterAdmin = clusterAdmin ? 1 : 0;
+        admin_->submit(DdlRequest{m});
+        const auto it = lists_.find(m.corr);
+        if (it == lists_.end()) return std::nullopt;
+        return it->second;
     }
     Answer alterAdd(const std::string& topic, const std::string& field,
                     rune::protocol::RequestId rid = {}, uint16_t expectedVersion = 0) {
@@ -409,7 +449,7 @@ public:
         rv::ViewPlan p;
         p.viewName = view;
         p.key      = "id";
-        const rune::catalog::TopicObject* t = admin_->applier().state().topicByName(source);
+        const rune::catalog::TopicObject* t = admin_->applier().state().topicByName(rune::catalog::kDefaultNsId, source);
         p.sources.push_back(rv::SourceSpec{t ? t->topicId : 999'999, "id"});
         p.output.push_back(rv::AuthoredField{"id", rune::codec::PrimType::Int64, 0, "id", rv::MergeRule::Replace});
         p.output.push_back(rv::AuthoredField{"hp", rune::codec::PrimType::Int64, 0, "hp", rv::MergeRule::Replace});
@@ -499,6 +539,12 @@ private:
         deps.respondError = [this](int64_t, int64_t corr, uint16_t code, std::string_view message) {
             record_(corr, Answer{code, -1, 0, std::string(message), 0, -1, 0, Answer::Kind::Error});
         };
+        deps.respondListNamespaces = [this](int64_t, int64_t corr,
+                                            const rune::protocol::client::ListNamespacesResponse& r) {
+            lists_[corr] = r;
+        };
+        deps.maxNamespaces   = maxNamespaces_;
+        deps.nsDefaults.limits = nsDefaults_;
         deps.respondGet = [this](int64_t, int64_t corr, int32_t topicId, uint16_t version, int32_t partitions,
                                  const std::vector<uint8_t>& blob, uint16_t code) {
             gets_[corr] = SchemaAnswer{code, topicId, version, partitions, blob};
@@ -517,7 +563,7 @@ private:
         CatalogEffects fx;
         fx.topicApplied  = [this](const rune::catalog::TopicObject& t) { effects_.push_back("topicApplied:" + std::to_string(t.topicId)); };
         fx.sinkApplied   = [this](const SinkSpec& s) { effects_.push_back("sinkApplied:" + std::to_string(s.topicId)); };
-        fx.topicDropped  = [this](int32_t id, const std::string&) { effects_.push_back("topicDropped:" + std::to_string(id)); };
+        fx.topicDropped  = [this](int32_t id, uint32_t, const std::string&) { effects_.push_back("topicDropped:" + std::to_string(id)); };
         fx.viewInstalled = [this](const rune::catalog::ViewObject& v) { effects_.push_back("viewInstalled:" + std::to_string(v.def.viewTopicId)); };
         fx.schemaChanged = [this](const rune::catalog::TopicObject& t, uint16_t) {
             effects_.push_back("schemaChanged:" + std::to_string(t.topicId) + "@v" +
@@ -550,6 +596,9 @@ private:
     std::set<int32_t>                                    silent_;
     std::map<int64_t, Answer>                            answers_;
     std::map<int64_t, SchemaAnswer>                      gets_;
+    std::map<int64_t, rune::protocol::client::ListNamespacesResponse> lists_;
+    uint32_t                                             maxNamespaces_ = 1024;
+    rune::protocol::NamespaceLimits                      nsDefaults_{};
     std::vector<std::string>                             effects_;
     std::vector<std::string>                             bootEffects_;
     std::function<void()>                                onAnswer_;

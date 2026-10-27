@@ -13,9 +13,9 @@ using wire::Reader;
 using wire::Writer;
 
 static_assert(kMaxStr16Bytes == 0xFFFF && kMaxStr32Bytes == 0xFFFF'FFFF && kMaxListCount == 0xFFFF,
-              "formatVer-1 wire widths are frozen: u16 / u32 length prefixes, u16 list counts");
+              "formatVer-1 wire widths are frozen: u16 / u32 length prefixes, u16 list counts (formatVer 2 keeps them)");
 
-// ── THE validation (formatVer 1) ───────────────────────────────────────────
+// ── THE validation (formatVer 1 and 2) ───────────────────────────────────────────
 // One set of value rules, run by BOTH directions: encodeInto refuses exactly what decode
 // refuses, so no event the decoder would reject can ever be appended to __catalog.
 // (Byte-level refusals — Truncated, TrailingBytes, a bool byte other than 0/1 — have no
@@ -41,13 +41,19 @@ constexpr bool validPrimType(rune::codec::PrimType t) noexcept {
 constexpr bool validCompatMode(rune::codec::CompatMode m) noexcept {
     return static_cast<uint8_t>(m) <= static_cast<uint8_t>(rune::codec::CompatMode::Forward);
 }
+constexpr bool validNsStateTag(NsStateTag t) noexcept { return static_cast<uint8_t>(t) <= static_cast<uint8_t>(NsStateTag::Deleting); }
 
 std::optional<Violation> checkFormatVer(uint16_t v) noexcept {
-    if (v != kFormatV1) return Violation::UnknownFormatVer;
+    if (v != kFormatV1 && v != kFormatV2) return Violation::UnknownFormatVer;
     return std::nullopt;
 }
-std::optional<Violation> checkKind(uint16_t k) noexcept {
-    if (k >= kReservedKindFirst && k <= kReservedKindLast) return Violation::ReservedKind;
+/// formatVer 1 refuses the whole reserved range 32..63; formatVer 2 accepts the namespace kinds 32..35 and
+/// refuses 36..63.  Anything else outside 1..9 is unknown.
+std::optional<Violation> checkKind(uint16_t formatVer, uint16_t k) noexcept {
+    if (k >= kReservedKindFirst && k <= kReservedKindLast) {
+        if (formatVer >= kFormatV2 && k <= kLastNamespaceKind) return std::nullopt;
+        return Violation::ReservedKind;
+    }
     if (k < static_cast<uint16_t>(EventKind::CreateTopic) || k > static_cast<uint16_t>(EventKind::DropView))
         return Violation::UnknownKind;
     return std::nullopt;
@@ -71,15 +77,18 @@ bool validOps(const Ops& ops) noexcept {
             return validCompatMode(o.mode);
         } else if constexpr (std::is_same_v<T, CreateViewOps> || std::is_same_v<T, AlterViewOps>) {
             return validPersistence(o.view.persistence);
-        } else {   // DropTopicOps, CreateSchemaOps, DropViewOps: no enum fields
+        } else if constexpr (std::is_same_v<T, NamespaceStateChangedOps>) {
+            return validNsStateTag(o.to);
+        } else {   // DropTopicOps, CreateSchemaOps, DropViewOps, NamespaceCreated / LimitsSet / Deleted: no enum fields
             return true;
         }
     }, ops);
 }
 std::optional<Violation> validate(const CatalogEvent& e) noexcept {
     if (auto v = checkFormatVer(e.formatVer)) return v;
-    if (auto v = checkKind(static_cast<uint16_t>(e.kind))) return v;
+    if (auto v = checkKind(e.formatVer, static_cast<uint16_t>(e.kind))) return v;
     if (e.kind != kindOf(e.ops)) return Violation::KindOpsMismatch;
+    if (e.formatVer == kFormatV1 && e.nsId != 0) return Violation::BadEnum;   // v1 has no nsId field
     if (!validOps(e.ops)) return Violation::BadEnum;
     return std::nullopt;
 }
@@ -104,7 +113,7 @@ EncodeError asEncodeError(Violation v) noexcept {
     return EncodeError::BadEnum;
 }
 
-// ── body writers (frozen, formatVer 1) ─────────────────────────────────────
+// ── body writers (frozen, formatVer 1; the namespace bodies are formatVer 2) ─────────────────────────────────────
 void putConfig(Writer& w, const TopicConfig& c) {
     w.u8(c.cleanupPolicy); w.i64(c.retentionMs); w.i64(c.retentionBytes); w.i64(c.deleteRetentionMs);
     w.i32(c.minCleanableDirtyRatioPpm); w.i64(c.segmentRollBytes); w.i64(c.minCompactionLagMs);
@@ -120,6 +129,11 @@ void putView(Writer& w, const ViewDef& v) {
     w.count16(v.sourceNames.size());
     for (const auto& n : v.sourceNames) w.str16(n);
     w.bytes32(v.normalizedPlanBlob); w.bytes32(v.compiledPlanBlob); w.bytes32(v.outputDescriptorBlob);
+}
+void putLimits(Writer& w, const rune::protocol::NamespaceLimits& l) {
+    uint8_t block[rune::protocol::kNamespaceLimitsBytes];
+    rune::protocol::encodeLimits(l, block);
+    w.raw(std::span<const uint8_t>(block, sizeof block));
 }
 void putOps(Writer& w, const Ops& ops) {
     w.u8(static_cast<uint8_t>(kindOf(ops)));   // ops tag == kind (catches a kind/ops mix-up)
@@ -146,8 +160,16 @@ void putOps(Writer& w, const Ops& ops) {
             w.e8(o.mode);
         } else if constexpr (std::is_same_v<T, CreateViewOps> || std::is_same_v<T, AlterViewOps>) {
             putView(w, o.view);
-        } else {   // DropViewOps
+        } else if constexpr (std::is_same_v<T, DropViewOps>) {
             w.i32(o.viewTopicId);
+        } else if constexpr (std::is_same_v<T, NamespaceCreatedOps>) {
+            w.str16(o.name); putLimits(w, o.limits);
+        } else if constexpr (std::is_same_v<T, NamespaceLimitsSetOps>) {
+            putLimits(w, o.limits);
+        } else if constexpr (std::is_same_v<T, NamespaceStateChangedOps>) {
+            w.e8(o.to);
+        } else {   // NamespaceDeletedOps: empty body
+            static_assert(std::is_same_v<T, NamespaceDeletedOps>);
         }
     }, ops);
 }
@@ -161,6 +183,10 @@ constexpr std::size_t kMinSourceNameBytes      = 2;                  // str16 ""
 constexpr std::size_t kConfigChangeBytes       = 1 + 8;              // u8 key, i64 value
 constexpr std::size_t kMinResolvedAlterOpBytes = 1 + 2 + 2 + 1 + 2 + 1;   // type, tag, str16 "", prim, fixedLen, mode
 
+bool getLimits(Reader& r, rune::protocol::NamespaceLimits& l) {
+    uint8_t block[rune::protocol::kNamespaceLimitsBytes];
+    return r.raw(block, sizeof block) && rune::protocol::decodeLimits(block, sizeof block, l);
+}
 std::optional<DecodeError> getBool(Reader& r, bool& b) {
     uint8_t v; if (!r.u8(v)) return DecodeError::Truncated;
     if (v > 1) return DecodeError::BadEnum;
@@ -227,6 +253,18 @@ std::expected<Ops, DecodeError> getOps(Reader& r, EventKind kind) {
     case EventKind::CreateView: { CreateViewOps o; if (auto e = getView(r, o.view)) return std::unexpected(*e); return o; }
     case EventKind::AlterView:  { AlterViewOps o;  if (auto e = getView(r, o.view)) return std::unexpected(*e); return o; }
     case EventKind::DropView:   { DropViewOps o; if (!r.i32(o.viewTopicId)) return std::unexpected(DecodeError::Truncated); return o; }
+    case EventKind::NamespaceCreated: {
+        NamespaceCreatedOps o;
+        if (!r.str16(o.name) || !getLimits(r, o.limits)) return std::unexpected(DecodeError::Truncated);
+        return o;
+    }
+    case EventKind::NamespaceLimitsSet: {
+        NamespaceLimitsSetOps o; if (!getLimits(r, o.limits)) return std::unexpected(DecodeError::Truncated); return o;
+    }
+    case EventKind::NamespaceStateChanged: {
+        NamespaceStateChangedOps o; if (!r.e8(o.to)) return std::unexpected(DecodeError::Truncated); return o;
+    }
+    case EventKind::NamespaceDeleted: return NamespaceDeletedOps{};
     }
     return std::unexpected(DecodeError::UnknownKind);   // unreachable: the kind was validated first
 }
@@ -239,14 +277,16 @@ std::optional<EncodeError> wire::validateEvent(const CatalogEvent& e) noexcept {
 }
 
 EventKind kindOf(const Ops& ops) noexcept {
-    return static_cast<EventKind>(ops.index() + 1);   // variant order == kind order (static_asserts in the header)
+    return kKindOfAlt[ops.index()];   // the explicit table (bijective: static_assert in the header)
 }
 
 std::expected<void, EncodeError> encodeInto(const CatalogEvent& e, std::vector<uint8_t>& out) {
     out.clear();
     if (auto v = validate(e)) return std::unexpected(asEncodeError(*v));   // the decoder's own rules
     Writer w(out);
-    w.u16(e.formatVer); w.u16(static_cast<uint16_t>(e.kind)); w.u64(e.objectId);
+    w.u16(e.formatVer); w.u16(static_cast<uint16_t>(e.kind));
+    if (e.formatVer >= kFormatV2) w.u32(e.nsId);   // formatVer 2: nsId right after the kind
+    w.u64(e.objectId);
     w.u32(e.prevVersion); w.u32(e.newVersion); w.i64(e.timestampMs); w.u64(e.fingerprint);
     w.str16(e.objectName); w.str32(e.statement);
     wire::writePrincipalAndReplay(w, e.principal, e.replayedFrom);
@@ -277,8 +317,9 @@ std::expected<CatalogEvent, DecodeError> decode(std::span<const uint8_t> bytes) 
         if (!r.u16(e.formatVer)) return std::unexpected(DecodeError::Truncated);
         if (auto v = checkFormatVer(e.formatVer)) return std::unexpected(asDecodeError(*v));
         if (!r.u16(kind)) return std::unexpected(DecodeError::Truncated);
-        if (auto v = checkKind(kind)) return std::unexpected(asDecodeError(*v));
+        if (auto v = checkKind(e.formatVer, kind)) return std::unexpected(asDecodeError(*v));
         e.kind = static_cast<EventKind>(kind);
+        if (e.formatVer >= kFormatV2 && !r.u32(e.nsId)) return std::unexpected(DecodeError::Truncated);
         if (!r.u64(e.objectId) || !r.u32(e.prevVersion) || !r.u32(e.newVersion) || !r.i64(e.timestampMs) ||
             !r.u64(e.fingerprint) || !r.str16(e.objectName) || !r.str32(e.statement))
             return std::unexpected(DecodeError::Truncated);
@@ -305,6 +346,10 @@ std::string_view kindName(EventKind k) noexcept {
     case EventKind::AlterSchema: return "AlterSchema";       case EventKind::SetCompatibility: return "SetCompatibility";
     case EventKind::CreateView: return "CreateView";         case EventKind::AlterView: return "AlterView";
     case EventKind::DropView: return "DropView";
+    case EventKind::NamespaceCreated: return "NamespaceCreated";
+    case EventKind::NamespaceLimitsSet: return "NamespaceLimitsSet";
+    case EventKind::NamespaceStateChanged: return "NamespaceStateChanged";
+    case EventKind::NamespaceDeleted: return "NamespaceDeleted";
     }
     return "?";
 }

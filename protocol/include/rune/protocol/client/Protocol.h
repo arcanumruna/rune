@@ -100,6 +100,10 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     // authentication (client version 9): security DDL + one-time bootstrap, both answered by DdlResponse (78)
     SecurityDdl          = 79,
     SecurityBootstrap    = 80,
+    // namespaces (client version 14): NamespaceDdl is answered by DdlResponse (78)
+    NamespaceDdl            = 81,
+    ListNamespaces          = 82,
+    ListNamespacesResponse  = 83,
 };
 
 enum class ErrorCode : uint16_t {
@@ -212,6 +216,12 @@ enum class ErrorCode : uint16_t {
                                   // not loaded on the group coordinator's node (unknown = held).  RETRIABLE: the
                                   // client re-sends after its backoff; never surfaced as a failure.  Clients below 10
                                   // are answered NotCoordinator instead (their retriable code).
+    // Namespaces (client version 14, kClientVersionNamespaces): each is sent ONLY to a session >= 14; an older client
+    // is answered InvalidRequest (39).
+    NamespaceSuspended     = 51,  // the request's namespace is suspended (its mode decides what is still served)
+    NamespaceLimitExceeded = 52,  // a namespace limit (or the cluster's maxNamespaces at CreateNamespace) is reached
+    Throttled              = 53,  // a namespace rate limit shed the request; carries a retry-after
+    ViewPaused             = 54,  // the view is paused by its namespace's state
 };
 
 // ---------------------------------------------------------------------------
@@ -341,7 +351,12 @@ inline constexpr int32_t kClientVersionReceiverKeys               = 12;  // per-
 //   backoff.  A refused verification answers the batch InvalidTxnState / ProducerFenced / InvalidProducerEpoch
 //   (non-retriable).  A broker answers a session below 13 NotLeader instead of 27 (their retriable code).
 inline constexpr int32_t kClientVersionTxnVerify                  = 13;  // produce ConcurrentTransactions (issue #112)
-inline constexpr int32_t kClientVersion                           = 13;  // what this protocol's client announces
+// 14 — namespaces (plan 2026-10-26-rune-namespaces): NamespaceDdl (81), ListNamespaces (82), ListNamespacesResponse (83),
+//   `ns/name` qualified names, the session namespace on login, and error codes 51-54 (NamespaceSuspended,
+//   NamespaceLimitExceeded, Throttled, ViewPaused).  A session below 14 is answered InvalidRequest (39) for 81-83 and
+//   never sent 51-54.  Broker 8 announces it.
+inline constexpr int32_t kClientVersionNamespaces                 = 14;
+inline constexpr int32_t kClientVersion                           = 14;  // what this protocol's client announces
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h
@@ -378,7 +393,8 @@ inline constexpr int32_t kBrokerVersionExplicitGroupSubscriptions = 3;
 inline constexpr int32_t kBrokerVersionAuth                       = 5;   // authentication (ConnectResponse v9 fields)
 inline constexpr int32_t kBrokerVersionFilter                     = 6;   // subscription filters (Phase 2c)
 inline constexpr int32_t kBrokerVersionReceiverKeys               = 7;   // per-receiver c2b keys (issue #116)
-inline constexpr int32_t kBrokerVersion                           = 7;   // what this protocol's broker announces
+inline constexpr int32_t kBrokerVersionNamespaces                 = 8;   // namespaces (client version 14)
+inline constexpr int32_t kBrokerVersion                           = 8;   // what this protocol's broker announces
 
 /// Issue #116: true when a session whose client announced `clientVersion` and whose broker announced
 /// `brokerVersion` binds each encrypted client->broker frame to one receiver (see client version 12).

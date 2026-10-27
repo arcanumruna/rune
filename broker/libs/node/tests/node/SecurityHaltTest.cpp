@@ -60,10 +60,10 @@ TEST(SecurityHaltRegression, HaltEndsEverySessionRetriablyAndRefusesLoginsRegres
     const int64_t s2 = r.wire().connect(r.ch());
     ASSERT_GT(s2, 0) << "the broker still accepts a Connect";
     EXPECT_EQ(r.wire().login(r.ch(), s2, name, {AuthRig::kPw, AuthRig::kPw}).errorCode(), unavailable);
-    const auto halted = b.counter(kSecurityApplyHaltedCounterTypeId);
+    const auto halted = b.counter(typeIdOf(RuneMetric::SecurityApplyHalted));
     ASSERT_TRUE(halted.has_value());
     EXPECT_GT(*halted, 0) << "counter 1'000'226 is raised";
-    EXPECT_EQ(b.counter(kSessionsRevokedCounterTypeId).value_or(0), 0) << "a halt revokes nothing (counter 232)";
+    EXPECT_EQ(b.counter(typeIdOf(RuneMetric::SessionsRevoked)).value_or(0), 0) << "a halt revokes nothing (counter 232)";
     EXPECT_GE(log.count("SECURITY APPLY HALTED"), 1);
     EXPECT_GE(log.count("docs/SECURITY.md#halted"), 1);
 }

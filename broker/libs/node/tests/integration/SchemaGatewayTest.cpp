@@ -175,7 +175,7 @@ struct SgHarness {
 
     SgHarness()
         : dataDir(ownedDirs.add(uniqDir("catalog"))), catalogLog(madeDir((fs::path(dataDir) / "__catalog").string())),
-          topicDirPath(ownedDirs.add(uniqDir("topics"))),
+          topicDirPath(ownedDirs.add(uniqDir("topicdata"))),
           gw(rune::gateway::ClientGateway::makeForTest(
                  [c = &egressFnFrames](const uint8_t*, std::size_t){ ++(*c); return int64_t{1}; },
                  /*sessionId=*/1)) {
@@ -1320,7 +1320,8 @@ struct WireNameCase { const char* label; std::string name; uint32_t parts; uint1
 void PrintTo(const WireNameCase& c, std::ostream* os) { *os << c.label; }
 const WireNameCase kWireNameCases[] = {
     {"Empty",              "",                     1, 40},
-    {"Slash",              "a/b",                  1, 40},
+    {"Slash",              "a/b/c",                1, 40},   // namespaces: two '/' is malformed
+    {"UnknownNamespace",   "a/b",                  1, 7},    // namespaces (D7): an unknown namespace answers missing
     {"DotDot",             "..",                   1, 40},
     {"ReservedViews",      "__views",              1, 40},
     {"ReservedSchemas",    "__topic_schemas",      1, 40},
@@ -1576,7 +1577,7 @@ TEST(SchemaGatewayRegression, CatalogDdlOpsRouteThroughTheGatewayAndAnswerDdlRes
     EXPECT_EQ(ca->errorCode, 0u);
     EXPECT_EQ(ca->newVersion, 2u);
     EXPECT_EQ(ca->gateTopicId, -1);
-    EXPECT_EQ(h.agent->worker().applier().state().topicByName("orders")->config.retentionMs, 1234);
+    EXPECT_EQ(h.agent->worker().applier().state().topicByName(rune::catalog::kDefaultNsId, "orders")->config.retentionMs, 1234);
 
     // DropTopic (74).
     pc::DropTopic dt;
@@ -1589,7 +1590,7 @@ TEST(SchemaGatewayRegression, CatalogDdlOpsRouteThroughTheGatewayAndAnswerDdlRes
     ASSERT_TRUE(da.has_value());
     EXPECT_EQ(da->errorCode, 0u);
     EXPECT_EQ(da->newVersion, 3u);
-    EXPECT_EQ(h.agent->worker().applier().state().topicByName("orders"), nullptr) << "dropped";
+    EXPECT_EQ(h.agent->worker().applier().state().topicByName(rune::catalog::kDefaultNsId, "orders"), nullptr) << "dropped";
 
     // DropView (76) of an unknown view: UnknownTopic with a detail.
     pc::DropView dv;

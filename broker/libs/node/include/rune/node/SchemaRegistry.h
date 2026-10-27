@@ -10,6 +10,7 @@
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Validator.h>
+#include <rune/gateway/NsNameKey.h>
 #include <rune/node/PersistenceMode.h>
 
 namespace rune::node {
@@ -32,6 +33,8 @@ struct TopicSchema {
     std::string           topicName;
     // Phase 2b E: the topic's persistence mode.
     PersistenceMode       persistence    = PersistenceMode::Disk;
+    // Namespaces Task 5: the namespace that owns the topic (names are per namespace).
+    uint32_t              nsId           = 0;
 };
 
 /// In-memory registry entry built from a TopicSchema.
@@ -53,6 +56,7 @@ struct RegistryEntry {
     rune::codec::CompatMode          compatMode     = rune::codec::CompatMode::Backward;
     PersistenceMode                  persistence    = PersistenceMode::Disk;   // Phase 2b E
     std::string                      topicName;        // durable topic name (may be empty: legacy record)
+    uint32_t                         nsId           = 0;
 };
 
 /// Single-threaded, AdminWorker-owned schema registry.
@@ -73,7 +77,9 @@ public:
     /// durable record, or any caller that leaves it unset — is indexed by its
     /// descriptor.name instead, so every caller must set topicName. Returns
     /// nullptr if absent.
-    [[nodiscard]] const RegistryEntry* byName(std::string_view name) const;
+    [[nodiscard]] const RegistryEntry* byName(uint32_t nsId, std::string_view name) const;
+    /// The `default` namespace (nsId 0) form.
+    [[nodiscard]] const RegistryEntry* byName(std::string_view name) const { return byName(0, name); }
 
     /// Look up one specific version of a topic's schema. Returns nullptr if
     /// that topic or version was never applied.
@@ -113,7 +119,8 @@ private:
     // but never references/pointers to already-existing elements, so those
     // pointers stay valid.
     std::unordered_map<int32_t, std::deque<RegistryEntry>> byId_;
-    std::unordered_map<std::string, int32_t>   nameToId_;
+    // (nsId, topic name) -> topicId; transparent hash, so a lookup builds no std::string.
+    std::unordered_map<rune::gateway::NsName, int32_t, rune::gateway::NsNameHash, rune::gateway::NsNameEq> nameToId_;
 };
 
 } // namespace rune::node

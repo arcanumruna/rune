@@ -206,7 +206,7 @@ TEST(ScramRegression, UnknownAndEmptyUsersNeverAuthenticateAndAreNamedForTheLogs
 TEST(ScramRegression, ADisabledUserFailsOnlyAtTheFinalLegAndOnlyWithTheRightPassword) {
     const auto s = makeState();
     const Exchange x = begin(s, "off");
-    ASSERT_EQ(x.st.userId, s.user("off")->objectId) << "a disabled user still gets its real verifiers (Review Focus 1)";
+    ASSERT_EQ(x.st.userId, s.userByName(rune::catalog::kDefaultNsId, "off")->objectId) << "a disabled user still gets its real verifiers (Review Focus 1)";
     EXPECT_EQ(failureOf(scramServerFinal(s, x.st, answer(x, {kPwA, ""}))), LoginFailure::Disabled);
     EXPECT_EQ(failureOf(scramServerFinal(s, x.st, answer(x, {kPwB, ""}))), LoginFailure::BadProof);
 }

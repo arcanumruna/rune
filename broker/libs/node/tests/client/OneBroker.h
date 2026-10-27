@@ -276,7 +276,7 @@ public:
     [[nodiscard]] std::vector<uint8_t> viewPlanOver(const std::string& source, bool extra = false) {
         BrokerNode& n = *node_;
         const int32_t srcId = n.onAdminThreadForTest([&n, &source]() -> int32_t {
-            const auto* t = n.adminWorkerAgentForTest()->worker().applier().state().topicByName(source);
+            const auto* t = n.adminWorkerAgentForTest()->worker().applier().state().topicByName(rune::catalog::kDefaultNsId, source);
             return t != nullptr ? t->topicId : -1;
         });
         namespace rv = rune::view;

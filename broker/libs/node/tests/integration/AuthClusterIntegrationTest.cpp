@@ -120,7 +120,7 @@ TEST(AuthClusterRegression, SecurityReplicatesToEveryBrokerAndDigestsAgree) {
         EXPECT_EQ(v.appliedOffset, off) << "node " << n->nodeIdForTest();
     }
     // The applied-offset counter (1'000'227) of every broker followed.
-    for (int id : {1, 2, 3}) EXPECT_EQ(t.counter(id, kSecurityAppliedOffsetCounterTypeId).value_or(-9), off) << "node " << id;
+    for (int id : {1, 2, 3}) EXPECT_EQ(t.counter(id, typeIdOf(RuneMetric::SecurityAppliedOffset)).value_or(-9), off) << "node " << id;
 }
 
 // §12 gate: the user holds one live subscription on each of the 3 brokers; GRANT -> subscribe -> REVOKE x 20; the time
@@ -305,18 +305,18 @@ TEST(AuthClusterRegression, WrongKeyBrokerNeverJoinsRegression) {
     ASSERT_GE(led.id, 0);
     ASSERT_TRUE(led.part[0] >= 0 && led.part[1] >= 0);
     ASSERT_TRUE(awaitNodeInIsr(t, 1, 3, 60s, led.id)) << "node 3 starts in every ISR";
-    ASSERT_TRUE(AuthTrio::until(30s, [&] { return t.counter(3, kPeerLinksEstablishedCounterTypeId).value_or(0) == 2; }));
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return t.counter(3, typeIdOf(RuneMetric::PeerLinksEstablished)).value_or(0) == 2; }));
 
     const std::string bad = t.makeKeyFile("bad.key", 'X');
     const std::string good = t.makeKeyFile("good.key", 'K');
     t.restart(3, bad);
     ASSERT_TRUE(AuthTrio::until(60s, [&] {
         return cap.sink->count(0) > 0 && cap.sink->count(1) > 0 && cap.sink->count(2) > 0 && cap.sink->count(3) > 0 &&
-               t.counter(1, kPeerLinkRefusalsCounterTypeId).value_or(0) > 0 && t.counter(2, kPeerLinkRefusalsCounterTypeId).value_or(0) > 0 &&
-               t.counter(3, kPeerLinkRefusalsCounterTypeId).value_or(0) > 0;
+               t.counter(1, typeIdOf(RuneMetric::PeerLinkRefusals)).value_or(0) > 0 && t.counter(2, typeIdOf(RuneMetric::PeerLinkRefusals)).value_or(0) > 0 &&
+               t.counter(3, typeIdOf(RuneMetric::PeerLinkRefusals)).value_or(0) > 0;
     })) << "refusals: " << cap.sink->count(0) << "," << cap.sink->count(1) << "," << cap.sink->count(2) << "," << cap.sink->count(3)
-        << " counters " << t.counter(1, kPeerLinkRefusalsCounterTypeId).value_or(-1) << "," << t.counter(2, kPeerLinkRefusalsCounterTypeId).value_or(-1)
-        << "," << t.counter(3, kPeerLinkRefusalsCounterTypeId).value_or(-1);
+        << " counters " << t.counter(1, typeIdOf(RuneMetric::PeerLinkRefusals)).value_or(-1) << "," << t.counter(2, typeIdOf(RuneMetric::PeerLinkRefusals)).value_or(-1)
+        << "," << t.counter(3, typeIdOf(RuneMetric::PeerLinkRefusals)).value_or(-1);
     EXPECT_EQ(t.node(3).peerLinksForTest().established, 0);
 
     // Node 3 leaves the ISR of the catalog, __security and EVERY partition of the user topic, and stays out.
@@ -570,9 +570,18 @@ ConsumerResult runConsumer(std::stop_token stop, std::future<int64_t> target, st
     std::size_t node = 0;
     int64_t want = -2;   // -2 = not told yet
     int64_t next = 0;
-    const auto hardStop = Clock3::now() + 240s;
+    // The drain bound starts when the test hands over the target, not at thread start: the rolling restarts before it
+    // take minutes under TSan, and a fixed bound from thread start cut the drain off part-way (the consumer returned
+    // with a fraction of the acked offsets).  Before the target the loop ends only through `stop` (the jthread
+    // destructor requests it), so a failed assertion in the test never leaves this thread running.
+    auto hardStop = Clock3::time_point::max();
+    const auto learnTarget = [&] {
+        if (want != -2 || target.wait_for(0ms) != std::future_status::ready) return;
+        want = target.get();
+        hardStop = Clock3::now() + 240s;
+    };
     while (!stop.stop_requested() && Clock3::now() < hardStop) {
-        if (want == -2 && target.wait_for(0ms) == std::future_status::ready) want = target.get();
+        learnTarget();
         if (want >= -1 && static_cast<int64_t>(out.offsets.size()) > want && *out.offsets.rbegin() >= want) { out.complete = true; break; }
         const std::size_t n = node % 3;
         if (sid[n] == 0) {
@@ -604,7 +613,7 @@ ConsumerResult runConsumer(std::stop_token stop, std::future<int64_t> target, st
             }
             while (out.offsets.count(next)) ++next;
             for (const auto& e : c.errors()) if (e.sessionId == sid[n] && e.code != 0) broken = true;
-            if (want == -2 && target.wait_for(0ms) == std::future_status::ready) want = target.get();
+            learnTarget();
             if (want >= -1 && next > want) { out.complete = true; return out; }
             if (Clock3::now() - lastProgress > 4s && want != -2) broken = true;   // told the target but starved: another broker
         }
@@ -661,7 +670,7 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
 
     auto allLinked = [&] {
         return AuthTrio::until(60s, [&] {
-            for (int id : {1, 2, 3}) if (t.counter(id, kPeerLinksEstablishedCounterTypeId).value_or(0) != 2) return false;
+            for (int id : {1, 2, 3}) if (t.counter(id, typeIdOf(RuneMetric::PeerLinksEstablished)).value_or(0) != 2) return false;
             return true;
         });
     };
@@ -778,24 +787,25 @@ TEST(AuthClusterRegression, HaltedBrokerRefetchesSecurityAfterItsDirIsMovedAside
     });
     t.createUser(1, "bob");   // replicated everywhere; node 3's applier fails its fingerprint check and halts
     ASSERT_TRUE(AuthTrio::until(30s, [&] { return n3.securityViewForTest().halted; })) << "node 3 must halt";
-    // Fails closed: alice's LIVE session on node 3 is revoked (the session-level SessionRevoked frame) and gone.
+    // Fails closed (docs SECURITY.md#halted): alice's LIVE session on node 3 is ended with the session-level
+    // AuthUnavailable (48, retriable: the client reconnects to a healthy broker) and gone.
     {
         auto& c = before.w->raw();
         bool revoked = false;
         c.pollFor(15s, [&] {
-            for (const auto& e : c.errors()) if (e.sessionId == before.sid && e.code == 46) { revoked = true; return true; }
+            for (const auto& e : c.errors()) if (e.sessionId == before.sid && e.code == 48) { revoked = true; return true; }
             return false;
         });
-        EXPECT_TRUE(revoked) << "alice's session on the halted broker must be revoked (46)";
+        EXPECT_TRUE(revoked) << "alice's session on the halted broker must be ended (48)";
         EXPECT_FALSE(n3.gatewayHasSessionForTest(before.sid)) << "and removed from the gateway";
     }
-    // alice's session on node 3 is revoked, new logins there are refused (44), the other brokers serve.
+    // New logins on node 3 are refused with AuthUnavailable (48, retriable), the other brokers serve.
     AuthWireClient& w = t.newWire(3);
     const int64_t sid = w.connect(t.channel(3));
     ASSERT_GT(sid, 0);
-    EXPECT_EQ(w.login(t.channel(3), sid, "alice", {AuthTrio::kPw, AuthTrio::kPw}).errorCode(), 44);
+    EXPECT_EQ(w.login(t.channel(3), sid, "alice", {AuthTrio::kPw, AuthTrio::kPw}).errorCode(), 48);
     EXPECT_NO_THROW(t.login(1, "alice"));
-    EXPECT_GT(t.counter(3, kSecurityApplyHaltedCounterTypeId).value_or(0), 0);
+    EXPECT_GT(t.counter(3, typeIdOf(RuneMetric::SecurityApplyHalted)).value_or(0), 0);
 
     t.stopNode(3);
     const fs::path dir = t.cluster().dirs[2]->path / "__security";
@@ -1150,12 +1160,19 @@ TEST(AuthRestartRegression, APartitionedBrokerGoesStaleThenEndsSessionsRetriably
     const int cut = leader == 3 ? 2 : 3;   // a follower
     AuthTrio::Session live;
     ASSERT_TRUE(AuthTrio::until(30s, [&] { try { live = t.login(cut, "ws1"); return true; } catch (...) { return false; } }));
+    // The live client keeps its session alive like a real client (a Keepalive every 1 s).  The wait for Stale below
+    // is about replicaLagMaxMs (10 s) - as long as the gateway's lease on a silent session (kDefaultSessionTimeoutNs,
+    // 10 s) - so a silent session would be reaped with SessionExpired (4) before R could end it with 48.
+    live.w->raw().keepSessionsAlive(true);
     BrokerNode& n = t.node(cut);
     n.onAdminThreadForTest([&n]() {   // its `__security` follower hears its leader no more (no fetch, no answer)
         n.securityReplicaForTest()->holdFetchesUntilForTest(INT64_MAX);
         return 0;
     });
-    EXPECT_TRUE(AuthTrio::until(10s, [&] { return n.securityServingForTest() == "Stale"; }));
+    // Its leader is alive, so its verdict is held (issue #460): it is current while it is in the committed ISR (no
+    // record commits without it), and stale once the leader shrinks it out after replicaLagMaxMs (10 s by default).
+    // Wait by pumping the live client, so its keepalives flow meanwhile.
+    EXPECT_TRUE(live.w->raw().pollFor(30s, [&] { return n.securityServingForTest() == "Stale"; }));
     EXPECT_EQ(loginCode(t, cut, "ws1"), kAuthUnavailable) << "a stale broker serves no login";
     EXPECT_TRUE(n.gatewayHasSessionForTest(live.sid)) << "within R the live session keeps working";
     EXPECT_TRUE(sessionEndedWith(live, static_cast<int16_t>(kAuthUnavailable), 15s))
@@ -1341,6 +1358,42 @@ TEST(AuthRestartAdversarialRegression, ASecurityLeaderCrashNeverMakesTheSurvivor
     for (int id : survivors)
         EXPECT_TRUE(lapses[id].empty()) << "survivor " << id << " stopped serving logins during a normal failover: " << lapses[id]
                                         << " (F=" << b.fMs << " ms, liveness=" << b.livenessMs << " ms)";
+}
+
+// Issue #460: the `__security` leader is cut off its peers (not crashed); the two survivors elect a new leader and
+// must keep serving logins throughout - a follower that has applied everything its old leader committed holds its
+// verdict across the silence until the new leader answers.
+TEST(AuthRestartAdversarialRegression, ACutOffSecurityLeaderNeverMakesTheSurvivorsStaleAdversarialRegression) {
+    AuthTrio t("advleadercut");
+    ServingBounds b;
+    captureBounds(t, b);
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1");
+    const int32_t leader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(leader, 0);
+    std::vector<int> survivors;
+    for (int id : {1, 2, 3}) if (id != leader) survivors.push_back(id);
+    for (int id : survivors) ASSERT_TRUE(AuthTrio::until(30s, [&] { return t.node(id).securityServingForTest() == "Serving"; }));
+    t.node(leader).partitionFromPeersForTest(true);
+    const auto cut = std::chrono::steady_clock::now();
+    std::map<int, std::string> lapses;
+    bool newLeader = false;
+    while (msSince(cut) < 20'000) {
+        for (int id : survivors) {
+            const std::string s = t.node(id).securityServingForTest();
+            if (s != "Serving" && lapses[id].empty()) lapses[id] = s + " at " + std::to_string(msSince(cut)) + " ms";
+        }
+        if (!newLeader) { const int32_t l = settledSecurityLeader(t.cluster(), leader); newLeader = l > 0 && l != leader; }
+        std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_TRUE(newLeader) << "a new __security leader";
+    for (int id : survivors) {
+        EXPECT_TRUE(lapses[id].empty()) << "survivor " << id << " stopped serving logins while its leader was cut off: "
+                                        << lapses[id] << " (F=" << b.fMs << " ms, liveness=" << b.livenessMs << " ms)";
+        EXPECT_EQ(loginCode(t, id, "ws1"), 0) << "survivor " << id << " login after the failover";
+    }
+    t.node(leader).partitionFromPeersForTest(false);
 }
 
 // A restart with no seam at all: node 3 comes back after ws1 was DISABLEd while it was down, and is hammered with ws1's
@@ -1587,8 +1640,13 @@ TEST(AuthClusterRegression, TheBehindRuleAcrossRolesChangesAndOperationsMatrixRe
             }));
             const int32_t part = led.part[static_cast<std::size_t>(node - 1)];
             PartitionInfo ingress;
+            // A fresh builder session per cell: bs[0] sits idle across the cell's DDL, and once a step outlasts the
+            // gateway's session lease (10 s; under TSan the user wire's driver start alone takes ~13 s) the broker
+            // has reaped it and drops every MetadataRequest on it unanswered (Checkpoint A TSan finding).
             ASSERT_TRUE(AuthTrio::until(30s, [&] {
-                for (const PartitionInfo& pi : bs[0].w->raw().metadata(t.channel(bs[0].node), AuthWireClient::kClientStream, bs[0].sid))
+                AuthTrio::Session md;
+                try { md = t.login(1, "builder"); } catch (...) { return false; }
+                for (const PartitionInfo& pi : md.w->raw().metadata(t.channel(md.node), AuthWireClient::kClientStream, md.sid))
                     if (pi.topicId == led.id && pi.partition == part && pi.leaderId == node && !pi.ingressEndpoint.empty()) { ingress = pi; return true; }
                 return false;
             }));

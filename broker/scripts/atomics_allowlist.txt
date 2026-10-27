@@ -16,6 +16,8 @@
 #                 widened inline-asm detection — pending ruling).
 #   SLICE-B     — TEMPORARY: F9 slice B converts these, then deletes the entries.
 #   UNSCOPED    — TEMPORARY: owned by neither slice yet; must be converted.
+#   DEBUG-ONLY  — a debug-build test record, compiled out of release builds
+#                 (no production coordination).
 
 # ------------------------------------------------------------ RING
 libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | #include <atomic> | 1 | RING | agrona ring implementation internals
@@ -215,3 +217,8 @@ libs/storage/include/rune/storage/Log.h | alignas(64) mutable std::atomic<uint8_
 libs/storage/include/rune/storage/Log.h | const uint8_t prev = snapMiddle_.exchange(snapFront_, std::memory_order_acq_rel); | 1 | CLEANER | Log cleaner channel: sealed-snapshot latest-value triple buffer (D22, replaced the mutex-backed shared_ptr atomic_store/load)
 libs/storage/include/rune/storage/Log.h | if (snapMiddle_.load(std::memory_order_relaxed) & kSnapFresh) { | 1 | CLEANER | Log cleaner channel: sealed-snapshot latest-value triple buffer (D22, replaced the mutex-backed shared_ptr atomic_store/load)
 libs/storage/src/Log.cpp | const uint8_t prev = snapMiddle_.exchange(mine, std::memory_order_acq_rel); | 1 | CLEANER | Log cleaner channel: sealed-snapshot latest-value triple buffer (D22, replaced the mutex-backed shared_ptr atomic_store/load)
+
+# ------------------------------------------------------------ DEBUG-ONLY
+libs/node/include/rune/node/RuneMetricSlot.h | #include <atomic> | 1 | DEBUG-ONLY | D58 metric owner-tag record (NDEBUG compiles it out)
+libs/node/include/rune/node/RuneMetricSlot.h | std::atomic_ref<std::uint8_t>(*writtenBy_).fetch_or(metricOwnerBit(by), std::memory_order_relaxed); | 1 | DEBUG-ONLY | D58 metric owner-tag record: a second writer thread must not race the tag (NDEBUG compiles it out)
+libs/node/include/rune/node/BrokerNode.h | return std::atomic_ref<std::uint8_t>(b).load(std::memory_order_relaxed); | 1 | DEBUG-ONLY | D58 test seam reading the owner-tag record (always 0 in release builds)

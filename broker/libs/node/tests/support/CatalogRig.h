@@ -21,6 +21,7 @@
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/catalog/CatalogState.h>
 #include <rune/catalog/testing/GoldenScript.h>
+#include <rune/gateway/ObjectIndex.h>
 #include <rune/node/CatalogApplier.h>
 #include <rune/node/CatalogCheckpoint.h>
 #include <rune/node/CatalogPartition.h>
@@ -58,12 +59,17 @@ struct Recorder {
     std::vector<std::pair<int, std::string>> storageFailures;
     std::function<void()>                   onTopicApplied;    // test hook, runs inside topicApplied
     std::function<void(int32_t topicId)>    onTopicAppliedId;  // test hook (may throw: a simulated crash)
+    // Namespaces Task 5: what the control thread's mirror learns from the effects (nsId-aware), not in `sequence`.
+    rune::gateway::ObjectIndex                      objects;
+    std::vector<rune::catalog::NamespaceRecord>     nsUpserts;
 
     void clear() {
         appliedOffsets.clear(); appliedDigests.clear(); halts.clear(); sequence.clear();
         bootViewInstalls.clear(); liveViewInstalls.clear(); storageFailures.clear();
         onTopicApplied = nullptr;
         onTopicAppliedId = nullptr;
+        objects = rune::gateway::ObjectIndex{};
+        nsUpserts.clear();
     }
 
     [[nodiscard]] CatalogEffects effects(std::vector<int32_t>& viewInstalls) {
@@ -71,10 +77,18 @@ struct Recorder {
         e.topicApplied = [this](const rune::catalog::TopicObject& t) {
             if (onTopicApplied) onTopicApplied();
             if (onTopicAppliedId) onTopicAppliedId(t.topicId);
+            objects.onTopic(t.nsId, t.topicId, t.name);
             sequence.push_back("topicApplied:" + std::to_string(t.topicId));
         };
-        e.sinkApplied = [this](const SinkSpec& s) { sequence.push_back("sinkApplied:" + std::to_string(s.topicId)); };
-        e.topicDropped = [this](int32_t id, const std::string&) { sequence.push_back("topicDropped:" + std::to_string(id)); };
+        e.sinkApplied = [this](const SinkSpec& s) {
+            objects.onView(s.nsId, s.topicId, s.name);
+            sequence.push_back("sinkApplied:" + std::to_string(s.topicId));
+        };
+        e.namespaceUpserted = [this](const rune::catalog::NamespaceRecord& r) { nsUpserts.push_back(r); };
+        e.topicDropped = [this](int32_t id, uint32_t, const std::string&) {
+            objects.onDropped(id);
+            sequence.push_back("topicDropped:" + std::to_string(id));
+        };
         e.topicConfig = [this](int32_t id, std::span<const rune::catalog::ConfigChange>) {
             sequence.push_back("topicConfig:" + std::to_string(id));
         };

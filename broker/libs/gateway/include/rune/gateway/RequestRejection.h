@@ -47,7 +47,7 @@ inline constexpr std::size_t kMaxRejectionBytes = 64;
 /// ViewRowResponse carries a ViewRowResponse::Status.  Responses without a
 /// top-level error field (OffsetCommit / OffsetFetch / AddPartitionsToTxn /
 /// TxnOffsetCommit) carry ONE result entry {topicId -1, partition -1, code}.
-/// Ping and MetadataRequest (no error field in their response) are answered
+/// Ping, MetadataRequest and ListNamespaces (no error field in their response) are answered
 /// with ErrorResponse{code}.  Returns the bytes written, or 0 when the request
 /// type has no answer (see the file header) or cap < kMaxRejectionBytes.
 [[nodiscard]] inline std::size_t encodeRejection(uint16_t requestTid, int64_t sessionId,
@@ -156,7 +156,8 @@ inline constexpr std::size_t kMaxRejectionBytes = 64;
     case T::DropView:
     case T::AlterView:
     case T::SecurityDdl:          // authentication (client version 9): answered by DdlResponse too
-    case T::SecurityBootstrap: {
+    case T::SecurityBootstrap:
+    case T::NamespaceDdl: {       // namespaces (client version 14): answered by DdlResponse too
         pc::DdlResponse r;
         r.sessionId = sessionId; r.correlationId = correlationId; r.errorCode = code;
         static_assert(pc::MessageHeader::ENCODED_SIZE + pc::DdlResponse::BODY_FIXED + 2 <= kMaxRejectionBytes);
@@ -168,7 +169,8 @@ inline constexpr std::size_t kMaxRejectionBytes = 64;
         return r.encode(out);
     }
     case T::Ping:
-    case T::MetadataRequest: {
+    case T::MetadataRequest:
+    case T::ListNamespaces: {     // ListNamespacesResponse (83) has no error field
         pc::ErrorResponse r;
         r.sessionId = sessionId; r.correlationId = correlationId; r.code = ec;
         return r.encode(out);

@@ -38,8 +38,8 @@ std::vector<std::vector<uint8_t>> buildLog() {
         e.kind = rs::kindOf(ops); e.ops = std::move(ops); e.objectName = name;
         const bool create = e.kind == rs::EventKind::CreateUser || e.kind == rs::EventKind::CreateRole;
         if (create) { e.objectId = s.nextObjectId(); e.prevVersion = 0; }
-        else if (roleTarget) { const auto* r = s.role(name); e.objectId = r->objectId; e.prevVersion = r->version; }
-        else { const auto* u = s.user(name); e.objectId = u->objectId; e.prevVersion = u->version; }
+        else if (roleTarget) { const auto* r = s.roleByName(rune::catalog::kDefaultNsId, name); e.objectId = r->objectId; e.prevVersion = r->version; }
+        else { const auto* u = s.userByName(rune::catalog::kDefaultNsId, name); e.objectId = u->objectId; e.prevVersion = u->version; }
         e.newVersion = e.prevVersion + 1;
         e.statement = "-- bench " + std::to_string(i);
         e.principal = rs::Principal{.sessionId = 1, .clientName = "bench", .sourceAddress = "local", .authenticated = "admin",
@@ -64,10 +64,10 @@ std::vector<std::vector<uint8_t>> buildLog() {
         const rs::GrantSpec g{rs::Operation::Read, {rs::ResourceType::Topic, rs::PatternKind::Exact, "topic" + std::to_string(u)}};
         switch (stage) {
         case 0: emit(rs::GrantOps{rs::GranteeKind::Role, g}, role, true); break;
-        case 1: emit(rs::GrantRoleOps{s.role(role)->objectId, role}, user, false); break;
+        case 1: emit(rs::GrantRoleOps{s.roleByName(rune::catalog::kDefaultNsId, role)->objectId, role}, user, false); break;
         case 2: emit(rs::AlterUserOps{rs::AddPassword{verifier(static_cast<uint64_t>(u) + 7)}}, user, false); break;
         case 3: emit(rs::RevokeOps{rs::GranteeKind::Role, g}, role, true); break;
-        case 4: emit(rs::RevokeRoleOps{s.role(role)->objectId, role}, user, false); break;
+        case 4: emit(rs::RevokeRoleOps{s.roleByName(rune::catalog::kDefaultNsId, role)->objectId, role}, user, false); break;
         case 5: emit(rs::AlterUserOps{rs::DropPassword{1}}, user, false); break;
         case 6: emit(rs::AlterUserOps{rs::DisableUser{}}, user, false); break;
         default: emit(rs::AlterUserOps{rs::EnableUser{}}, user, false); break;

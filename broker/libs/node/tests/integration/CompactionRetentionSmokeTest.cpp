@@ -45,6 +45,7 @@
 // ---------------------------------------------------------------------------
 
 #include "../support/TestNodeConfig.h"
+#include <rune/node/NamespacePaths.h>
 #include <gtest/gtest.h>
 
 #include <rune/node/BrokerNode.h>
@@ -160,7 +161,7 @@ static rune::node::NodeConfig makeSmokeConfig(const fs::path& dataDir) {
 static fs::path makePartitionDir(const fs::path& dataDir,
                                   const std::string& topicName,
                                   int32_t partition = 0) {
-    fs::path d = dataDir / "topics" / topicName / std::to_string(partition);
+    fs::path d = rune::node::topicsRoot(dataDir, 0) / topicName / std::to_string(partition);
     std::error_code ec;
     fs::create_directories(d, ec);
     return d;

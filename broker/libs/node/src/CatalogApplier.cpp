@@ -51,11 +51,12 @@ TopicSchema topicSchemaOf(const cat::TopicObject& t) {
     ts.compatMode     = s.compat;
     ts.topicName      = t.name;
     ts.persistence    = persistenceOf(t.persistence);
+    ts.nsId           = t.nsId;
     return ts;
 }
 
 SinkSpec sinkSpecOf(const cat::ViewObject& v) {
-    return SinkSpec{v.def.viewTopicId, v.name, v.def.sinkPartitions, v.def.persistence, v.def.keyField};
+    return SinkSpec{v.def.viewTopicId, v.name, v.def.sinkPartitions, v.def.persistence, v.def.keyField, v.nsId};
 }
 
 cat::ApplyError decodeFailure(int64_t offset, cat::DecodeError e) {
@@ -222,6 +223,8 @@ void CatalogApplier::emitFinalState_() {
         else
             spdlog::critical("CatalogApplier: boot: an effect of the applied catalog cannot be posted: {}", why);
     };
+    if (sink->namespaceUpserted)   // namespaces before any object: an object's namespace is known when it arrives
+        state_.namespaces().forEach([&](const cat::NamespaceRecord& r) { sink->namespaceUpserted(r); });
     for (const cat::TopicObject* t : state_.topics()) {
         if (maxFrame != 0)
             if (auto err = topicEffectFramesError(*t, maxFrame, 1)) { refuse(std::move(*err)); continue; }
@@ -482,6 +485,7 @@ void CatalogApplier::project_(const cat::CatalogEvent& e, const cat::Applied& a)
         ViewRecord rec;
         rec.viewTopicId          = v->def.viewTopicId;
         rec.viewName             = v->name;
+        rec.nsId                 = v->nsId;
         rec.compiledPlanBlob     = v->def.compiledPlanBlob;
         rec.persistence          = persistenceToWire(persistenceOf(v->def.persistence));
         rec.outputDescriptorBlob = v->def.outputDescriptorBlob;
@@ -501,10 +505,17 @@ void CatalogApplier::project_(const cat::CatalogEvent& e, const cat::Applied& a)
             ts.nextTag        = static_cast<uint16_t>(out.fields.size());
             ts.topicName      = v->name;
             ts.persistence    = persistenceOf(v->def.persistence);
+            ts.nsId           = v->nsId;
             schemas_->applyRecord(ts);
         }
         return;
     }
+    // Namespace records live in state_ only: the schema and view registries hold no namespace data.
+    case cat::EventKind::NamespaceCreated:
+    case cat::EventKind::NamespaceLimitsSet:
+    case cat::EventKind::NamespaceStateChanged:
+    case cat::EventKind::NamespaceDeleted:
+        return;
     }
 }
 
@@ -517,7 +528,7 @@ void CatalogApplier::effects_(const CatalogEffects& sink, const cat::CatalogEven
         }
         return;
     case cat::EventKind::DropTopic:
-        if (sink.topicDropped) sink.topicDropped(a.droppedTopicId, e.objectName);
+        if (sink.topicDropped) sink.topicDropped(a.droppedTopicId, e.nsId, e.objectName);
         return;
     case cat::EventKind::AlterTopicConfig: {
         const cat::TopicObject* t = state_.topicByObjectId(e.objectId);
@@ -542,13 +553,22 @@ void CatalogApplier::effects_(const CatalogEffects& sink, const cat::CatalogEven
         if (sink.viewInstalled) sink.viewInstalled(*v);
         if (e.kind == cat::EventKind::AlterView) {
             if (sink.viewUninstalled) sink.viewUninstalled(a.droppedTopicId);
-            if (sink.topicDropped) sink.topicDropped(a.droppedTopicId, e.objectName);
+            if (sink.topicDropped) sink.topicDropped(a.droppedTopicId, e.nsId, e.objectName);
         }
         return;
     }
     case cat::EventKind::DropView:
         if (sink.viewUninstalled) sink.viewUninstalled(a.droppedTopicId);
-        if (sink.topicDropped) sink.topicDropped(a.droppedTopicId, e.objectName);
+        if (sink.topicDropped) sink.topicDropped(a.droppedTopicId, e.nsId, e.objectName);
+        return;
+    case cat::EventKind::NamespaceCreated:
+    case cat::EventKind::NamespaceLimitsSet:
+    case cat::EventKind::NamespaceStateChanged:
+        if (const cat::NamespaceRecord* r = state_.namespaces().byId(a.nsId); r && sink.namespaceUpserted)
+            sink.namespaceUpserted(*r);
+        return;
+    // No live effect yet: Phase 2 (namespace lifecycle) adds the delete effects.
+    case cat::EventKind::NamespaceDeleted:
         return;
     }
 }

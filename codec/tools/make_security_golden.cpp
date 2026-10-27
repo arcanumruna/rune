@@ -1,5 +1,7 @@
-// Writes tests/security/golden/v1/basic.rsec from the golden script and prints the per-offset
-// digests as a C++ array for tests/security/SecurityGoldenPins.h.
+// Writes a golden log from the golden script and prints the per-offset digests as a C++ array for
+// tests/security/SecurityGoldenPins.h:
+//   make_security_golden <out.rsec>       -> golden/v1/basic.rsec        (kBasicV1Digests)
+//   make_security_golden <out.rsec> v2    -> golden/v2/namespaces.rsec   (kNamespacesV2Digests)
 // Run ONCE when a formatVer is introduced; never re-run for an existing one.
 #include <rune/security/SecurityFile.h>
 #include <rune/security/SecurityReplayer.h>
@@ -8,13 +10,16 @@
 #include <fstream>
 #include <string>
 int main(int argc, char** argv) {
-    if (argc != 2) { std::fprintf(stderr, "usage: make_security_golden <out.rsec>\n"); return 2; }
+    if (argc != 2 && argc != 3) { std::fprintf(stderr, "usage: make_security_golden <out.rsec> [v1|v2]\n"); return 2; }
+    const bool v2 = argc == 3 && std::string(argv[2]) == "v2";
+    if (argc == 3 && !v2 && std::string(argv[2]) != "v1") { std::fprintf(stderr, "unknown version %s\n", argv[2]); return 2; }
     std::ofstream out(argv[1], std::ios::binary | std::ios::trunc);
     rune::security::writeRsecHeader(out);
     rune::security::SecurityReplayer r;
-    std::printf("inline constexpr uint64_t kBasicV1Digests[] = {\n");
+    std::printf("inline constexpr uint64_t %s[] = {\n", v2 ? "kNamespacesV2Digests" : "kBasicV1Digests");
     int64_t off = 0;
-    for (const auto& e : rune::security::testing::goldenScriptV1()) {
+    const auto script = v2 ? rune::security::testing::goldenScriptV2() : rune::security::testing::goldenScriptV1();
+    for (const auto& e : script) {
         const auto bytes = rune::security::encode(e);
         if (!bytes) {
             std::fprintf(stderr, "offset %lld: encode: %s\n", static_cast<long long>(off),

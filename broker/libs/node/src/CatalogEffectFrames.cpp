@@ -79,7 +79,7 @@ std::optional<std::string> viewEffectFramesError(const cat::ViewObject& v, const
         return e;
     std::size_t src = 0;
     if (!v.def.sourceNames.empty())
-        if (const cat::TopicObject* s = state.topicByName(v.def.sourceNames.front()); s && s->schema) {
+        if (const cat::TopicObject* s = state.topicByName(v.nsId, v.def.sourceNames.front()); s && s->schema) {
             try {
                 src = materializedDescriptorOf(*s).size();
             } catch (const std::exception& ex) {
@@ -112,6 +112,11 @@ std::optional<std::string> eventEffectFramesError(const cat::CatalogState& after
         if (const cat::ViewObject* v = after.viewByObjectId(e.objectId)) return viewEffectFramesError(*v, after, maxFrame);
         return std::nullopt;
     }
+    case cat::EventKind::NamespaceCreated:      // namespace kinds post no effect frame (Checkpoint A F2)
+    case cat::EventKind::NamespaceLimitsSet:
+    case cat::EventKind::NamespaceStateChanged:
+    case cat::EventKind::NamespaceDeleted:
+        return std::nullopt;
     }
     (void)a;
     return std::nullopt;

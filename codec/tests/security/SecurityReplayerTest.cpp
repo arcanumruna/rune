@@ -39,7 +39,7 @@ TEST(SecurityReplayerRegression, UnknownFormatVersionStopsAtItsOffset) {
     rs::SecurityReplayer r;
     ASSERT_TRUE(r.feed(0, rs::encode(events[0]).value()));
     auto bytes = rs::encode(events[1]).value();
-    bytes[0] = 2;
+    bytes[0] = 3;   // 1 and 2 are the known formats
     auto a = r.feed(1, bytes);
     ASSERT_FALSE(a.has_value());
     EXPECT_EQ(a.error().kind, rs::ReplayError::Kind::Decode);

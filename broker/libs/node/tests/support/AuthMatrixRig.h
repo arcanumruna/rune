@@ -59,7 +59,7 @@ public:
         (void)rig_.newUser({grants::prefix(SO::Write, ST::Topic, "")}, &writerName_);
         writerSid_ = rig_.login(writerName_);
         // The exact number of logins this broker has accepted so far (admin, builder, the writer's user, the writer):
-        // counted by the rig, never read from the asynchronously published CnC counter (issue #4).
+        // counted by the rig, never read from the asynchronously published metrics-file counter (issue #4).
         issuedOk_ = rig_.broker().loginsOkDone();
     }
     /// Cumulative logins the rig knows succeeded / failed / revoked sessions on this broker (the Cells' baselines).
@@ -92,12 +92,12 @@ public:
         prefix_ = "c" + std::to_string(ord_) + ".";
         user_ = "u" + std::to_string(1000 + ord_);
         role_ = "r" + std::to_string(ord_);
-        // The CnC counters are published asynchronously (BrokerNode::publishSecurityMetrics_): wait until they have
+        // The metrics-file counters are published asynchronously (BrokerNode::publishSecurityMetrics_): wait until they have
         // caught up with every login the rig knows it made, then take the baseline FROM THE TALLY, not from the
         // counter, so a stray extra login still fails assertion 5 (issue #4).
-        for (const auto& c : {std::make_tuple(kLoginsOkCounterTypeId, m.issuedOk_, "logins ok"),
-                              std::make_tuple(kLoginsFailedCounterTypeId, m.issuedFailed_, "logins failed"),
-                              std::make_tuple(kSessionsRevokedCounterTypeId, m.issuedRevoked_, "sessions revoked")}) {
+        for (const auto& c : {std::make_tuple(typeIdOf(RuneMetric::LoginsOk), m.issuedOk_, "logins ok"),
+                              std::make_tuple(typeIdOf(RuneMetric::LoginsFailed), m.issuedFailed_, "logins failed"),
+                              std::make_tuple(typeIdOf(RuneMetric::SessionsRevoked), m.issuedRevoked_, "sessions revoked")}) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
             while (counterNow(std::get<0>(c)) < std::get<1>(c) && std::chrono::steady_clock::now() < deadline)
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -479,9 +479,9 @@ public:
     /// Assertion 5: the logins ok / failed and sessions-revoked counters moved exactly as the cell implies.
     std::string countersProblem(bool disabled) {
         struct C { std::int32_t id; int64_t start; int64_t delta; const char* name; };
-        for (const C& c : {C{kLoginsOkCounterTypeId, okAtStart_, loginsOk_, "logins ok"},
-                           C{kLoginsFailedCounterTypeId, failedAtStart_, loginsFailed_, "logins failed"},
-                           C{kSessionsRevokedCounterTypeId, revokedAtStart_, disabled ? 1 : 0, "sessions revoked"}}) {
+        for (const C& c : {C{typeIdOf(RuneMetric::LoginsOk), okAtStart_, loginsOk_, "logins ok"},
+                           C{typeIdOf(RuneMetric::LoginsFailed), failedAtStart_, loginsFailed_, "logins failed"},
+                           C{typeIdOf(RuneMetric::SessionsRevoked), revokedAtStart_, disabled ? 1 : 0, "sessions revoked"}}) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
             while (counterNow(c.id) < c.start + c.delta && std::chrono::steady_clock::now() < deadline)
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -489,9 +489,9 @@ public:
                 return std::string(c.name) + " counter is " + std::to_string(counterNow(c.id)) + ", expected " + std::to_string(c.start + c.delta);
         }
         r_.c().pollFor(std::chrono::milliseconds(30), [] { return false; });   // a stray extra tick would land here
-        for (const C& c : {C{kLoginsOkCounterTypeId, okAtStart_, loginsOk_, "logins ok"},
-                           C{kLoginsFailedCounterTypeId, failedAtStart_, loginsFailed_, "logins failed"},
-                           C{kSessionsRevokedCounterTypeId, revokedAtStart_, disabled ? 1 : 0, "sessions revoked"}}) {
+        for (const C& c : {C{typeIdOf(RuneMetric::LoginsOk), okAtStart_, loginsOk_, "logins ok"},
+                           C{typeIdOf(RuneMetric::LoginsFailed), failedAtStart_, loginsFailed_, "logins failed"},
+                           C{typeIdOf(RuneMetric::SessionsRevoked), revokedAtStart_, disabled ? 1 : 0, "sessions revoked"}}) {
             const int64_t now = counterNow(c.id);
             if (now != c.start + c.delta)
                 return std::string(c.name) + " counter is " + std::to_string(now) + ", expected " + std::to_string(c.start + c.delta);

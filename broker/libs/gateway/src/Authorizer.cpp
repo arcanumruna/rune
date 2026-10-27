@@ -17,6 +17,7 @@ const char* opName(rsec::Operation o) noexcept {
         case rsec::Operation::Drop:     return "DROP";
         case rsec::Operation::Describe: return "DESCRIBE";
         case rsec::Operation::Admin:    return "ADMIN";
+        case rsec::Operation::Truncate: return "TRUNCATE";
     }
     return "?";
 }
@@ -27,6 +28,7 @@ const char* typeName(rsec::ResourceType t) noexcept {
         case rsec::ResourceType::View:            return "VIEW";
         case rsec::ResourceType::Group:           return "GROUP";
         case rsec::ResourceType::TransactionalId: return "TRANSACTIONAL_ID";
+        case rsec::ResourceType::Namespace:       return "NAMESPACE";
     }
     return "?";
 }
@@ -63,9 +65,10 @@ std::optional<Denial> authorizeName(const PermissionTable& t, rsec::ResourceType
 }
 
 std::optional<Denial> authorizeTopicOrViewName(const PermissionTable& t, std::string_view name, rsec::Operation op,
-                                               const ObjectIndex& index)
+                                               const ObjectIndex& index, uint32_t nsId)
 {
-    if (const ObjectEntry* e = index.byName(name)) {   // #128: only the object's own kind's grants count
+    if (const auto id = index.byName(nsId, name)) {   // #128: only the object's own kind's grants count
+        const ObjectEntry* e = index.at(*id);
         if (t.allowsName(e->type, name, rsec::opBit(op))) return std::nullopt;
         return deny(op, rsec::ResourceType::Topic, name);
     }

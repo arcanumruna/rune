@@ -415,3 +415,23 @@ TEST(NodeStateFileRegression, FollowFloorFreshRaiseReopenAndLegacyRegression) {
         EXPECT_EQ(nsf.followFloorTermId(), 9) << "the migrated floor is durable";
     }
 }
+
+// Full disk: the 64-byte state file is fallocated before it is mapped, so a full
+// filesystem fails the open with an exception instead of a SIGBUS on the first
+// store.  Mutation: drop the fallocate in NodeStateFile.cpp → the child dies on SIGBUS.
+#include <rune/storage/testing/DiskFullTmpfs.h>
+#include <cstdio>
+#include <system_error>
+
+TEST(NodeStateFileRegression, OpenOnAFullDiskThrowsInsteadOfSigbusRegression) {
+    rune::test::runOnTinyTmpfs(64 * 1024, [](const std::string& dir) {
+        if (!rune::test::fillDisk(dir)) { std::fprintf(stderr, "could not fill fs\n"); return false; }
+        try {
+            NodeStateFile nsf(dir + "/node-state.dat");
+            (void)nsf.proposeMaxCandidateTermId(3, 0, 0);
+            std::fprintf(stderr, "NodeStateFile open on a full fs did not throw\n");
+            return false;
+        } catch (const std::system_error&) {}
+        return true;
+    });
+}

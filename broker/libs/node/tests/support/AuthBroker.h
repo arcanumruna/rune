@@ -7,7 +7,7 @@
 //                               session is kept for the helpers below
 //   createUser(name, pw, grants...) / createRole / grant / grantRole / alter*  - security DDL as that admin
 //   wire()                    - a fresh AuthWireClient (its own embedded Aeron driver) for raw-frame work
-//   counter(typeId)           - a CnC counter of this broker (1'000'229-231 = logins ok / failed / rate-limited)
+//   counter(typeId)           - a metric of this broker (its metrics file) (1'000'229-231 = logins ok / failed / rate-limited)
 //   LogCapture                - the broker's control-thread log lines (reason=..., "authenticated over plaintext")
 //
 // Every wait is bounded (the deadline is the failure, never a hang).  Options: DevDisabled mode, a short auth deadline.
@@ -19,10 +19,9 @@
 #include <rune/aeronutil/testing/FreePort.h>
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
-#include <rune/node/RoleCounter.h>
+#include <rune/node/RuneMetrics.h>
 
-#include <CncFileReader.h>
-#include <concurrent/CountersReader.h>
+#include "MetricsTestReader.h"
 
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
@@ -31,6 +30,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <stdexcept>
@@ -85,6 +85,8 @@ public:
         /// a plaintext Connect HandshakeFailed.  false = ClientTransport::PlaintextForTest, so the raw-frame helpers
         /// (bootstrapAdmin, wire()) still drive plaintext sessions.
         bool tlsOnly = false;
+        /// Applied to the node's config last, before the start (a test's own knobs, e.g. the provisioner cap).
+        std::function<void(NodeConfig&)> configure;
     };
     static constexpr const char* kBootstrapPassword = "bootstrap-otp-123456";
     static constexpr const char* kAdminPassword     = "admin-password-1234";
@@ -145,8 +147,8 @@ public:
             std::filesystem::permissions(keyFile_, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
             cfg.clusterKeyFile = keyFile_.string();
         }
+        if (opts_.configure) opts_.configure(cfg);
         channel_ = cfg.clientEndpoint.channel;
-        aeronDir_ = cfg.aeronDir;
         cfg_ = cfg;
         startNode_();
     }
@@ -171,6 +173,7 @@ public:
             ++loginsOkDone_;
             admin_ = &w;
             adminSid_ = sid;
+            adminUsed_ = std::chrono::steady_clock::now();
         }
     }
     ~AuthBroker() {
@@ -229,26 +232,28 @@ public:
         require(set.errorCode == 0, "admin SET PASSWORD: " + set.detail);
         admin_ = &w;
         adminSid_ = s1;
+        adminPassword_ = adminPassword;
+        adminUsed_ = std::chrono::steady_clock::now();
     }
 
     void createUser(const std::string& name, const std::string& password, const std::vector<AuthGrant>& grants = {}) {
-        auto a = admin().createUser(channel_, adminSid_, name, password);
+        auto a = admin().createUser(channel_, freshAdminSid_(), name, password);
         require(a.errorCode == 0, "CREATE USER " + name + ": " + a.detail);
         for (const AuthGrant& g : grants) {
-            auto r = admin().grant(channel_, adminSid_, name, false, g.op, g.type, g.kind, g.pattern);
+            auto r = admin().grant(channel_, freshAdminSid_(), name, false, g.op, g.type, g.kind, g.pattern);
             require(r.errorCode == 0, "GRANT to " + name + ": " + r.detail);
         }
     }
     void disableUser(const std::string& name) {
-        auto a = admin().alterPassword(channel_, adminSid_, name, pc::UserChangeKind::Disable);
+        auto a = admin().alterPassword(channel_, freshAdminSid_(), name, pc::UserChangeKind::Disable);
         require(a.errorCode == 0, "DISABLE " + name + ": " + a.detail);
     }
     void addPassword(const std::string& name, const std::string& password) {
-        auto a = admin().alterPassword(channel_, adminSid_, name, pc::UserChangeKind::AddPassword, password);
+        auto a = admin().alterPassword(channel_, freshAdminSid_(), name, pc::UserChangeKind::AddPassword, password);
         require(a.errorCode == 0, "ADD PASSWORD " + name + ": " + a.detail);
     }
     void dropOldestPassword(const std::string& name) {
-        auto a = admin().alterPassword(channel_, adminSid_, name, pc::UserChangeKind::DropPassword, {}, false, 1);
+        auto a = admin().alterPassword(channel_, freshAdminSid_(), name, pc::UserChangeKind::DropPassword, {}, false, 1);
         require(a.errorCode == 0, "DROP PASSWORD 1 " + name + ": " + a.detail);
     }
     AuthWireClient& admin() {
@@ -256,22 +261,30 @@ public:
         return *admin_;
     }
     [[nodiscard]] int64_t adminSession() const noexcept { return adminSid_; }
+    /// The admin session for the next security DDL.  The broker reaps a session idle for 10 s
+    /// (kDefaultSessionTimeoutNs), and a long suite can leave the admin unused that long between createUser calls
+    /// (issue #647): a session idle for 5 s is logged in again first.
+    int64_t freshAdminSid_() {
+        AuthWireClient& w = admin();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - adminUsed_ > std::chrono::seconds(5)) {
+            const int64_t sid = w.connect(channel_);
+            require(sid > 0, "admin reconnect");
+            require(w.login(channel_, sid, "admin", {adminPassword_, adminPassword_}).ok(), "admin re-login");
+            ++loginsOkDone_;
+            adminSid_ = sid;
+        }
+        adminUsed_ = now;
+        return adminSid_;
+    }
     /// Successful logins the test rig itself performed on THIS node start (admin + AuthRig::login via noteLoginOk).
-    /// The CnC logins-ok counter is published asynchronously, so a rig that needs an exact baseline counts its own.
+    /// The metrics-file logins-ok counter is published asynchronously, so a rig that needs an exact baseline counts its own.
     [[nodiscard]] int64_t loginsOkDone() const noexcept { return loginsOkDone_; }
     void noteLoginOk() noexcept { ++loginsOkDone_; }
 
-    // ── CnC counters ─────────────────────────────────────────────────────────────────────────────────────────
+    // ── metrics (arcanum-metrics plan Task 8: the node's metrics file, no longer cnc.dat) ─────────────────────
     [[nodiscard]] std::optional<int64_t> counter(std::int32_t typeId) const {
-        try {
-            aeron::CncFileReader reader = aeron::CncFileReader::mapExisting(aeronDir_.c_str());
-            aeron::concurrent::CountersReader counters = reader.countersReader();
-            std::optional<int64_t> found;
-            counters.forEach([&](std::int32_t id, std::int32_t t, const aeron::concurrent::AtomicBuffer&, const std::string&) {
-                if (t == typeId && !found) found = counters.getCounterValue(id);
-            });
-            return found;
-        } catch (...) { return std::nullopt; }
+        return rune::node::test::readRuneMetricAt(cfg_.effectiveMetricsFile(), typeId, cfg_.nodeId);
     }
     /// The counter reaches `want` (bounded); the last value read otherwise.
     [[nodiscard]] bool awaitCounter(std::int32_t typeId, int64_t want, std::chrono::milliseconds within = std::chrono::seconds(10)) const {
@@ -305,11 +318,13 @@ private:
     int64_t                                      loginsOkDone_ = 0;
     std::filesystem::path                        keyFile_;
     uint16_t                                     clientPort_ = 0;
-    std::string                                  channel_, aeronDir_, ingressChannel_;
+    std::string                                  channel_, ingressChannel_;
     std::unique_ptr<BrokerNode>                  node_;
     std::vector<std::unique_ptr<AuthWireClient>> wires_;
     AuthWireClient*                              admin_ = nullptr;
     int64_t                                      adminSid_ = 0;
+    std::string                                  adminPassword_ = kAdminPassword;
+    std::chrono::steady_clock::time_point        adminUsed_{};
     int                                          clientDirs_ = 0;
 };
 

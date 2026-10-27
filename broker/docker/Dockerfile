@@ -71,6 +71,13 @@ COPY --from=rune-protocol src     /rune-protocol/src
 COPY --from=flight-recorder src     /flight-recorder/src
 COPY --from=flight-recorder include /flight-recorder/include
 
+# ── arcanum-metrics sibling (header-only: include) ─────────────────────────────
+# broker/cmake/ArcanumMetrics.cmake defines the INTERFACE target `metrics` from
+# ${ARCANUM_METRICS_DIR}/include (linked into rune_node and rune_role).  Consumed like the
+# flight recorder (plan D60): supplied via the BuildKit named build context `arcanum-metrics`
+# and pointed at with -DARCANUM_METRICS_DIR below, so the image never fetches it over git.
+COPY --from=arcanum-metrics include /arcanum-metrics/include
+
 # ── rune-codec (0a) sibling (compiled: src + include) ─────────────────────────
 # The root CMakeLists wires add_library(rune_codec ...) from ${RUNE_CODEC_ROOT}
 # (default ${SRC}/../codec → /rune-codec here) and links it into rune_node.
@@ -110,6 +117,7 @@ RUN cmake -S . -B build -G Ninja \
         -DRUNE_CODEC_ROOT=/rune-codec \
         -DRUNE_CRYPTO_ROOT=/rune-crypto \
         -DFLIGHT_RECORDER_DIR=/flight-recorder \
+        -DARCANUM_METRICS_DIR=/arcanum-metrics \
         -DRUNE_TLS=ON \
     && cmake --build build --target rune_broker rune_role
 
@@ -135,8 +143,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The broker binary + the newer libstdc++ from the builder (ldconfig repoints
 # the libstdc++.so.6 symlink to the higher 6.0.32 version).
 COPY --from=builder /build/build/rune_broker /usr/local/bin/rune_broker
-# rune_role: standalone Aeron role-counter reader — the dr-e2e harness runs it
-# via `docker exec` to detect leadership from counters (not log scraping).
+# rune_role: standalone node-role metrics reader — the dr-e2e harness runs it
+# via `docker exec` to detect leadership from the broker's metrics file
+# (${RUNE_DATA_DIR}/metrics/rune-metrics.dat), not by log scraping.
 COPY --from=builder /build/build/rune_role /usr/local/bin/rune_role
 # Multi-arch: the multiarch lib dir is x86_64-linux-gnu or aarch64-linux-gnu (= uname -m).
 COPY --from=builder /build/libstdc++.so.6 /tmp/libstdc++.so.6.0.32

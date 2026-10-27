@@ -39,6 +39,13 @@
 //   RUNE_GROUP_MAX_SESSION_TIMEOUT_MS — int32 ms > 0, default 1800000 (#213 / #499).  A larger one is lowered to it.
 //                                     A min above the max (an unset one is its default) refuses startup.
 //
+// Namespaces (all optional, namespaces Task 7):
+//   RUNE_MAX_NAMESPACES             — int32 > 0, default 1024: the cluster-wide cap on namespaces that exist
+//                                     (`default` and DELETING ones count).  A CreateNamespace past it is refused.
+//   RUNE_NS_DEFAULT_<FIELD>         — u64 >= 0 (FEATURE_BITS: u32), one per NamespaceLimits field, e.g.
+//                                     RUNE_NS_DEFAULT_MAX_TOPICS.  Read once at boot; a limit a CreateNamespace omits
+//                                     takes this value at request time and is written into the event.  Default 0.
+//
 // For cross-datacenter deployments set these higher (e.g. 1000/200/2000 ms).
 //
 // E5.2: Aeron media-driver threading mode (optional):
@@ -52,6 +59,7 @@
 #include <rune/node/StorageFormat.h>
 #include <rune/node/IdleShape.h>
 #include <rune/node/PersistenceMode.h>
+#include <rune/protocol/NamespaceLimits.h>
 #include <rune/node/PemFile.h>   // Task 9: loadPemFile() — re-exported here for config callers
 
 #include <algorithm>
@@ -75,6 +83,8 @@ struct TopicSpec {
     std::string name;
     int32_t     partitionCount = 1;
     int32_t     topicId        = -1;
+    /// Namespaces plan Task 6: the namespace the topic lives in (its dir is topicsRoot(dataDir, nsId)/<name>).
+    uint32_t    nsId           = 0;
     /// VLS B.2: a view's sink -- a replica-less, catalog-only namespace (no log, no dir, no replica); its rows live
     /// in the source owner's WorkerViewSet.  Set by the catalog sink effect (live and boot) only.
     bool        viewSink       = false;
@@ -226,6 +236,19 @@ struct NodeConfig {
         return aeronDir.empty() ? (std::filesystem::path{dataDir} / "aeron").string()
                                 : aeronDir;
     }
+    // arcanum-metrics D54: the node's metrics file - RUNE_METRICS_FILE.  Empty → dataDir/metrics/rune-metrics.dat
+    // (the metrics/ dir is created 0750, the file 0640).  Every RuneMetric row is allocated in it at start.
+    std::string         metricsFile;
+    [[nodiscard]] std::string effectiveMetricsFile() const {
+        return metricsFile.empty() ? (std::filesystem::path{dataDir} / "metrics" / "rune-metrics.dat").string()
+                                   : metricsFile;
+    }
+    // D62: SystemMetrics sampling interval (RUNE_METRICS_SYSTEM_INTERVAL_MS, > 0), sampled on the control agent.
+    int64_t             metricsSystemIntervalMs = 1000;
+    // TEST-ONLY seams for the start-refusal tests (never parsed from env): a maxSlots below the required count
+    // (-1 = exactly requiredSlots), and the kRuneMetrics row whose allocation is treated as Full (-1 = none).
+    int32_t             metricsMaxSlotsOverrideForTest = -1;
+    int32_t             metricsFailAllocAtForTest      = -1;
     int32_t             consensusStreamId    = 0;
     int32_t             replicationStreamId  = 20;  // GR-3: stream for per-partition replication
 
@@ -470,6 +493,10 @@ struct NodeConfig {
     /// RUNE_GROUP_MAX_GROUPS (#214): the most consumer groups coordinated at once.  0 = the default
     /// (GroupCoordinationService::kDefaultMaxGroups).
     int32_t groupMaxGroups = 0;
+    /// RUNE_MAX_NAMESPACES (namespaces Task 7): the cluster-wide namespace cap, `default` included.
+    int32_t maxNamespaces = 1024;
+    /// RUNE_NS_DEFAULT_* (namespaces Task 7): the cluster default limits an omitted CreateNamespace field takes.
+    rune::protocol::NamespaceLimits nsDefaultLimits{};
     /// RUNE_GROUP_MIN_SESSION_TIMEOUT_MS / RUNE_GROUP_MAX_SESSION_TIMEOUT_MS (#499): the bounds a JoinGroup's session
     /// timeout is clamped into.  0 = the GroupCoordinationService default (1 s / 30 min).
     int32_t groupMinSessionTimeoutMs = 0;
@@ -539,13 +566,16 @@ struct NodeConfig {
     std::string clusterKeyFile;
     std::string clusterKeyFileNext;
     int64_t     authTimeoutMs    = 10'000;
+    // Namespaces Task 9 (spec §11): RUNE_ANONYMOUS_READ=1|true lets an authenticating broker serve a client that never
+    // starts SCRAM as the read-only anonymous principal of `default` (schema / catalog reads only).  Off by default.
+    bool        anonymousRead    = false;
     int32_t     peerAuthStreamId = 40;
     // Issues #15 / #111 (decision M7): a broker serves logins, `__security` reads and security DDL only while its
     // `__security` state is provably current - caught up with the current leader since boot, a leader answer (a
     // follower) within F and the consensus in contact within F; otherwise it answers the retriable AuthUnavailable (48).
     //   RUNE_SECURITY_MAX_STALENESS_MS      — F (default 1 000); must exceed the broker liveness timeout + 500 ms, so a
-    //                                         leadership move does not make a healthy broker stale (a hard leader
-    //                                         failure can, briefly: #460) (an explicit value
+    //                                         leadership move does not make a healthy broker stale (nor does a hard
+    //                                         leader failure: a current follower in the ISR holds, #460) (an explicit value
     //                                         that does not is refused; the default is raised to it).
     //   RUNE_SECURITY_STALE_SESSION_END_MS  — R (default 10 000; > F): a broker stale this long ends its authenticated
     //                                         sessions with a session-level 48 (clients reconnect elsewhere).

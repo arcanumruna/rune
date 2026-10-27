@@ -24,7 +24,10 @@ add_library(rune_catalog STATIC
     src/catalog/CatalogEvent.cpp
     src/catalog/CatalogState.cpp
     src/catalog/CatalogFingerprint.cpp
+    src/catalog/CatalogFingerprintV2.cpp
     src/catalog/ApplyV1.cpp
+    src/catalog/ApplyV2.cpp
+    src/catalog/NamespaceRegistry.cpp
     src/catalog/CatalogReplayer.cpp
     src/catalog/CatalogQueries.cpp
     src/catalog/CatalogFile.cpp
@@ -32,6 +35,7 @@ add_library(rune_catalog STATIC
 target_include_directories(rune_catalog PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${RUNE_PROTOCOL_INCLUDE})
 target_link_libraries(rune_catalog PUBLIC rune_codec)
 target_compile_features(rune_catalog PUBLIC cxx_std_23)
+target_compile_options(rune_catalog PRIVATE -Werror=switch)   # every EventKind / ApplyError switch names every enumerator
 
 # ── rune_security — the shared authentication library (auth spec §3): event model,
 #    frozen per-formatVer apply rules, fingerprints, permissions, replayer, .rsec.
@@ -241,7 +245,8 @@ add_executable(rune_catalog_tests
     tests/catalog/CatalogFingerprintTest.cpp
     tests/catalog/CatalogReplayerTest.cpp
     tests/catalog/CatalogQueriesTest.cpp
-    tests/catalog/CatalogGoldenTest.cpp)
+    tests/catalog/CatalogGoldenTest.cpp
+    tests/catalog/NamespaceCatalogV2Test.cpp)
 target_link_libraries(rune_catalog_tests PRIVATE rune_catalog GTest::gtest_main)
 target_compile_definitions(rune_catalog_tests PRIVATE
     RUNE_CATALOG_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/catalog/golden")

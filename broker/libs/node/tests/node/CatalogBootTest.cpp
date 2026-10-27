@@ -18,6 +18,7 @@
 //   B8  boot never deletes a topic dir (it quarantines) and purges only dropped/ entries the
 //       catalog marks dropped.
 #include <rune/aeronutil/testing/FreePort.h>
+#include <rune/node/NamespacePaths.h>
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/gateway/ClientGateway.h>
@@ -134,7 +135,7 @@ std::map<std::string, std::string> treeOf(const fs::path& root) {
 
 bool quarantineHasEntryStartingWith(const fs::path& dataDir, const std::string& prefix) {
     std::error_code ec;
-    for (fs::directory_iterator it(dataDir / "quarantine", ec), end; !ec && it != end; it.increment(ec))
+    for (fs::directory_iterator it(rune::node::quarantineRoot(dataDir, 0), ec), end; !ec && it != end; it.increment(ec))
         if (it->path().filename().string().rfind(prefix, 0) == 0) return true;
     return false;
 }
@@ -182,7 +183,7 @@ public:
         const auto r = client_->awaitDefine(
             client_->sendDefineTopic(gw(), stream(), sid_, d.name, d.partitions,
                                      d.typed ? charBlob() : std::vector<uint8_t>{}, d.persistence,
-                                     rune::protocol::RequestId{}, 0, rune::protocol::TopicConfigView{}, d.validate),
+                                     rune::protocol::RequestId{}, 0, boundedTestTopicConfig(), d.validate),
             Clock::now() + 10s);
         return {r ? static_cast<int>(r->errorCode) : -1};
     }
@@ -343,10 +344,10 @@ TEST(CatalogBootRegression, UnclaimedTopicDirIsQuarantinedNeverDeleted) {
     BootRig r("boot_quar");
     ASSERT_TRUE(r.start());
     r.stop();
-    fs::create_directories(r.dataDir() / "topics" / "ghost" / "0");
-    { std::ofstream(r.dataDir() / "topics" / "ghost" / "0" / "00000000000000000000.log") << "x"; }
+    fs::create_directories(rune::node::topicsRoot(r.dataDir(), 0) / "ghost" / "0");
+    { std::ofstream(rune::node::topicsRoot(r.dataDir(), 0) / "ghost" / "0" / "00000000000000000000.log") << "x"; }
     ASSERT_TRUE(r.start());   // start() awaits the (single-node) catch-up that runs the deferred reconcile
-    EXPECT_FALSE(fs::exists(r.dataDir() / "topics" / "ghost"));
+    EXPECT_FALSE(fs::exists(rune::node::topicsRoot(r.dataDir(), 0) / "ghost"));
     EXPECT_TRUE(quarantineHasEntryStartingWith(r.dataDir(), "ghost-"));
 }
 
@@ -357,14 +358,14 @@ TEST(CatalogBootRegression, LeftoverDroppedDirIsPurgedAtBootButOnlyForIdsTheCata
     for (const char* n : {"a", "b", "c", "d"}) ASSERT_EQ(r.define({.name = n}).code, kOk);   // ids 0..3
     ASSERT_EQ(r.dropTopic("d").code, kOk);                                                   // id 3 is dropped
     r.stop();
-    fs::create_directories(r.dataDir() / "dropped" / "3.old");
-    { std::ofstream(r.dataDir() / "dropped" / "3.old" / "left.log") << "x"; }
-    fs::create_directories(r.dataDir() / "dropped" / "1.live");   // id 1 is LIVE: not the catalog's to purge
-    fs::create_directories(r.dataDir() / "dropped" / "99.unknown");
+    fs::create_directories(rune::node::droppedRoot(r.dataDir(), 0) / "3.old");
+    { std::ofstream(rune::node::droppedRoot(r.dataDir(), 0) / "3.old" / "left.log") << "x"; }
+    fs::create_directories(rune::node::droppedRoot(r.dataDir(), 0) / "1.live");   // id 1 is LIVE: not the catalog's to purge
+    fs::create_directories(rune::node::droppedRoot(r.dataDir(), 0) / "99.unknown");
     ASSERT_TRUE(r.start());
-    EXPECT_FALSE(fs::exists(r.dataDir() / "dropped" / "3.old")) << "an interrupted purge is finished at boot";
-    EXPECT_TRUE(fs::exists(r.dataDir() / "dropped" / "1.live")) << "a live id's dropped/ entry is never deleted";
-    EXPECT_TRUE(fs::exists(r.dataDir() / "dropped" / "99.unknown")) << "an id the catalog does not mark dropped";
+    EXPECT_FALSE(fs::exists(rune::node::droppedRoot(r.dataDir(), 0) / "3.old")) << "an interrupted purge is finished at boot";
+    EXPECT_TRUE(fs::exists(rune::node::droppedRoot(r.dataDir(), 0) / "1.live")) << "a live id's dropped/ entry is never deleted";
+    EXPECT_TRUE(fs::exists(rune::node::droppedRoot(r.dataDir(), 0) / "99.unknown")) << "an id the catalog does not mark dropped";
 }
 
 // B7
@@ -440,23 +441,23 @@ TEST(CatalogBootRegression, HaltedBootMovesRenamesDeletesAndQuarantinesNothingRe
     ASSERT_EQ(r.dropTopic("b").code, kOk);          // id 1 dropped
     r.stop();
     // Everything a healthy reconcile would act on:
-    fs::create_directories(r.dataDir() / "topics" / "ghost" / "0");
-    { std::ofstream(r.dataDir() / "topics" / "ghost" / "0" / "00000000000000000000.log") << "ghost"; }
-    fs::create_directories(r.dataDir() / "dropped" / "1.b");                    // id 1: the catalog marks it dropped
-    { std::ofstream(r.dataDir() / "dropped" / "1.b" / "left.log") << "left"; }
+    fs::create_directories(rune::node::topicsRoot(r.dataDir(), 0) / "ghost" / "0");
+    { std::ofstream(rune::node::topicsRoot(r.dataDir(), 0) / "ghost" / "0" / "00000000000000000000.log") << "ghost"; }
+    fs::create_directories(rune::node::droppedRoot(r.dataDir(), 0) / "1.b");                    // id 1: the catalog marks it dropped
+    { std::ofstream(rune::node::droppedRoot(r.dataDir(), 0) / "1.b" / "left.log") << "left"; }
     r.corruptCheckpointDigest();
-    const auto ghostBefore   = treeOf(r.dataDir() / "topics" / "ghost");
-    const auto droppedBefore = treeOf(r.dataDir() / "dropped");
+    const auto ghostBefore   = treeOf(rune::node::topicsRoot(r.dataDir(), 0) / "ghost");
+    const auto droppedBefore = treeOf(rune::node::droppedRoot(r.dataDir(), 0));
     ASSERT_TRUE(r.start());   // halted: still boots
     EXPECT_EQ(r.catalogHaltedCounter(), 1);
     EXPECT_EQ(r.node().bootReconcileStateForTest(), "None") << "a halted boot defers nothing either";
     r.stop();
-    EXPECT_TRUE(fs::exists(r.dataDir() / "topics" / "ghost" / "0" / "00000000000000000000.log"));
-    EXPECT_TRUE(fs::exists(r.dataDir() / "dropped" / "1.b" / "left.log")) << "no purge on a halted boot";
-    EXPECT_FALSE(fs::exists(r.dataDir() / "quarantine")) << "no quarantine on a halted boot";
-    EXPECT_EQ(treeOf(r.dataDir() / "topics" / "ghost"), ghostBefore) << "the unclaimed dir is byte-identical";
-    EXPECT_EQ(treeOf(r.dataDir() / "dropped"), droppedBefore);
-    EXPECT_TRUE(fs::exists(r.dataDir() / "topics" / "a" / "0")) << "the live topic's dir stayed where it was";
+    EXPECT_TRUE(fs::exists(rune::node::topicsRoot(r.dataDir(), 0) / "ghost" / "0" / "00000000000000000000.log"));
+    EXPECT_TRUE(fs::exists(rune::node::droppedRoot(r.dataDir(), 0) / "1.b" / "left.log")) << "no purge on a halted boot";
+    EXPECT_FALSE(fs::exists(rune::node::quarantineRoot(r.dataDir(), 0))) << "no quarantine on a halted boot";
+    EXPECT_EQ(treeOf(rune::node::topicsRoot(r.dataDir(), 0) / "ghost"), ghostBefore) << "the unclaimed dir is byte-identical";
+    EXPECT_EQ(treeOf(rune::node::droppedRoot(r.dataDir(), 0)), droppedBefore);
+    EXPECT_TRUE(fs::exists(rune::node::topicsRoot(r.dataDir(), 0) / "a" / "0")) << "the live topic's dir stayed where it was";
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -489,7 +490,7 @@ TEST(CatalogBootRegression, CheckpointAheadOfTheLogRefusesToStartNamingBothOffse
     ASSERT_FALSE(msg.empty()) << "the broker must REFUSE to start, never replay a shorter history";
     EXPECT_NE(msg.find("offset 2"), std::string::npos) << msg;      // the checkpoint's
     EXPECT_NE(msg.find("ends at 0"), std::string::npos) << msg;     // the log's
-    EXPECT_FALSE(fs::exists(r.dataDir() / "quarantine")) << "refused before anything was touched";
+    EXPECT_FALSE(fs::exists(rune::node::quarantineRoot(r.dataDir(), 0))) << "refused before anything was touched";
 }
 
 TEST(CatalogBootRegression, CheckpointOnePastTheLogEndAlsoRefusesToStartRegression) {
@@ -541,7 +542,7 @@ TEST(CatalogBootRegression, MissingCheckpointMeansAppliedNothingYetAndBootsWithE
     EXPECT_EQ(r.catalogDigest(), digest);
     ASSERT_TRUE(r.awaitServes(0)) << "the live apply builds the topic over its surviving dir";
     EXPECT_EQ(r.logEndOffset(0, 1), 1) << "data survived";
-    EXPECT_FALSE(fs::exists(r.dataDir() / "quarantine")) << "the deferred reconcile claimed the catalog's topics";
+    EXPECT_FALSE(fs::exists(rune::node::quarantineRoot(r.dataDir(), 0))) << "the deferred reconcile claimed the catalog's topics";
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -616,7 +617,7 @@ TEST(CatalogBootRegression, ReCreatedNameAfterADropResolvesToItsNewIdAfterRestar
     EXPECT_EQ(r.topicState(0), TopicState::Dropped);
     EXPECT_EQ(r.logEndOffset(1, 0), 1) << "only the new incarnation's record";
     EXPECT_EQ(r.produceCode(0, 0), kUnknownTopic);
-    EXPECT_FALSE(fs::exists(r.dataDir() / "quarantine"));
+    EXPECT_FALSE(fs::exists(rune::node::quarantineRoot(r.dataDir(), 0)));
 }
 
 // Edge: an empty catalog.
@@ -724,7 +725,7 @@ TEST(CatalogBootRegression, EveryEffectKindSurvivesTwoRealRestartsIdenticallyReg
     EXPECT_EQ(s2.dropped, s1.dropped);
     EXPECT_EQ(r.catalogHaltedCounter(), 0);
     EXPECT_TRUE(r.awaitViewReady("top", 15s));
-    EXPECT_FALSE(fs::exists(r.dataDir() / "quarantine")) << "nothing the catalog names was quarantined";
+    EXPECT_FALSE(fs::exists(rune::node::quarantineRoot(r.dataDir(), 0))) << "nothing the catalog names was quarantined";
     // and the catalog still takes writes.
     ASSERT_EQ(r.define({.name = "after", .typed = true}).code, kOk);
     EXPECT_EQ(r.topicIdForName("after"), 8);
@@ -832,8 +833,8 @@ std::string buildClusterWithData(ClusterWithData& d, ShardTestClient& cl) {
 }
 
 void plantOrphan(const fs::path& dataDir) {
-    fs::create_directories(dataDir / "topics" / "orphan" / "0");
-    { std::ofstream(dataDir / "topics" / "orphan" / "0" / "00000000000000000000.log") << "orphan"; }
+    fs::create_directories(rune::node::topicsRoot(dataDir, 0) / "orphan" / "0");
+    { std::ofstream(rune::node::topicsRoot(dataDir, 0) / "orphan" / "0" / "00000000000000000000.log") << "orphan"; }
 }
 } // namespace
 
@@ -874,7 +875,7 @@ TEST(CatalogBootRegression, WipedCatalogBrokerQuarantinesNothingBeforeCatchUpAnd
     d.c.stop(d.victim);
     fs::remove_all(vdir / "__catalog");   // an operator deleted the catalog as a "repair" (or a new disk)
     plantOrphan(vdir);
-    ASSERT_TRUE(fs::exists(vdir / "topics" / "keep" / "0"));
+    ASSERT_TRUE(fs::exists(rune::node::topicsRoot(vdir, 0) / "keep" / "0"));
     d.c.beforeStart = [&](int id, BrokerNode& n) { if (id == d.victim) n.holdCatalogApplyAtBootForTest(true); };
     d.c.startNode(d.victim);
     BrokerNode& v = d.c.node(d.victim);
@@ -882,17 +883,17 @@ TEST(CatalogBootRegression, WipedCatalogBrokerQuarantinesNothingBeforeCatchUpAnd
     std::this_thread::sleep_for(1s);
     EXPECT_EQ(v.bootReconcileStateForTest(), "AwaitingCatchUp");
     EXPECT_EQ(sentinelOf(vdir).kind, rune::node::CatchUpSentinel::Kind::Pending);
-    EXPECT_TRUE(fs::exists(vdir / "topics" / "orphan" / "0" / "00000000000000000000.log"))
+    EXPECT_TRUE(fs::exists(rune::node::topicsRoot(vdir, 0) / "orphan" / "0" / "00000000000000000000.log"))
         << "NO topic dir is touched before the applier caught up";
-    EXPECT_FALSE(fs::exists(vdir / "quarantine"));
+    EXPECT_FALSE(fs::exists(rune::node::quarantineRoot(vdir, 0)));
     v.holdCatalogApplyForTest(false);
     ASSERT_TRUE(v.awaitBootReconcileSettledForTest(30s));
     EXPECT_EQ(v.bootReconcileStateForTest(), "Done");
     const auto s = sentinelOf(vdir);
     EXPECT_EQ(s.kind, rune::node::CatchUpSentinel::Kind::CaughtUp);
     EXPECT_GE(s.offset, d.catalogEnd - 1) << "the sentinel names the offset it applied up to";
-    EXPECT_TRUE(fs::exists(vdir / "topics" / "orphan")) << "the reconcile does NOT run on the admin thread";
-    EXPECT_FALSE(fs::exists(vdir / "quarantine"));
+    EXPECT_TRUE(fs::exists(rune::node::topicsRoot(vdir, 0) / "orphan")) << "the reconcile does NOT run on the admin thread";
+    EXPECT_FALSE(fs::exists(rune::node::quarantineRoot(vdir, 0)));
     ASSERT_TRUE(awaitTrue([&] { return v.catalogTopicServesForTest(d.topicId); }, 20s));
     EXPECT_EQ(leoOnOwner(v, d.topicId, 0), ClusterWithData::kRecords) << "the data serves after catch-up";
 
@@ -900,10 +901,10 @@ TEST(CatalogBootRegression, WipedCatalogBrokerQuarantinesNothingBeforeCatchUpAnd
     d.c.stop(d.victim);
     d.c.startNode(d.victim);
     BrokerNode& v2 = d.c.node(d.victim);
-    EXPECT_FALSE(fs::exists(vdir / "topics" / "orphan")) << "the NEXT boot quarantined the orphan";
+    EXPECT_FALSE(fs::exists(rune::node::topicsRoot(vdir, 0) / "orphan")) << "the NEXT boot quarantined the orphan";
     EXPECT_TRUE(quarantineHasEntryStartingWith(vdir, "orphan-"));
     EXPECT_FALSE(quarantineHasEntryStartingWith(vdir, "keep-"));
-    EXPECT_TRUE(fs::exists(vdir / "topics" / "keep" / "0"));
+    EXPECT_TRUE(fs::exists(rune::node::topicsRoot(vdir, 0) / "keep" / "0"));
     EXPECT_EQ(sentinelOf(vdir).kind, rune::node::CatchUpSentinel::Kind::Absent);
     ASSERT_TRUE(awaitTrue([&] { return v2.catalogTopicServesForTest(d.topicId); }, 20s));
     EXPECT_EQ(leoOnOwner(v2, d.topicId, 0), ClusterWithData::kRecords);
@@ -965,14 +966,14 @@ TEST(CatalogBootRegression, WipedCatalogCatchUpNeverOpensANewerIncarnationsDirRe
     const fs::path vdir = d.c.dirs[static_cast<std::size_t>(d.victim - 1)]->path;
     d.c.stop(d.victim);
     fs::remove_all(vdir / "__catalog");
-    { std::ofstream(vdir / "topics" / "t" / "0" / "probe.txt") << "p"; }
+    { std::ofstream(rune::node::topicsRoot(vdir, 0) / "t" / "0" / "probe.txt") << "p"; }
     d.c.startNode(d.victim);
     BrokerNode& v = d.c.node(d.victim);
     ASSERT_TRUE(awaitTrue([&] { return v.catalogTopicServesForTest(1); }, 30s));
-    EXPECT_TRUE(fs::exists(vdir / "topics" / "t" / "0" / "probe.txt"))
+    EXPECT_TRUE(fs::exists(rune::node::topicsRoot(vdir, 0) / "t" / "0" / "probe.txt"))
         << "the dir was never renamed or purged by a historic create of the older incarnation";
     EXPECT_EQ(leoOnOwner(v, 1, 0), ClusterWithData::kRecords);
-    EXPECT_FALSE(fs::exists(vdir / "dropped" / "0.t"));
+    EXPECT_FALSE(fs::exists(rune::node::droppedRoot(vdir, 0) / "0.t"));
 }
 
 // R1 (fix round 1, C1): a dropped incarnation's data is never served under a re-created name — the crash window
@@ -985,19 +986,19 @@ TEST(CatalogBootRegression, DroppedIncarnationDataIsNeverResurrectedByARecreated
     for (int i = 0; i < 3; ++i) ASSERT_TRUE(r.produce(0, 0, "old-" + std::to_string(i)));
     r.node().holdDroppedDirPurgeForTest(true);
     ASSERT_EQ(r.dropTopic("t").code, kOk);
-    ASSERT_TRUE(awaitTrue([&] { return fs::exists(r.dataDir() / "dropped" / "0.t"); }, 15s));
+    ASSERT_TRUE(awaitTrue([&] { return fs::exists(rune::node::droppedRoot(r.dataDir(), 0) / "0.t"); }, 15s));
     ASSERT_EQ(r.define({.name = "t", .typed = true}).code, kOk);   // id 1
     ASSERT_TRUE(r.awaitServes(1));
     r.stop();
     // "crash before the rename": the older incarnation's dir is (still) at topics/t
-    fs::remove_all(r.dataDir() / "topics" / "t");
-    fs::rename(r.dataDir() / "dropped" / "0.t", r.dataDir() / "topics" / "t");
+    fs::remove_all(rune::node::topicsRoot(r.dataDir(), 0) / "t");
+    fs::rename(rune::node::droppedRoot(r.dataDir(), 0) / "0.t", rune::node::topicsRoot(r.dataDir(), 0) / "t");
     ASSERT_TRUE(r.start());
     EXPECT_EQ(r.topicIdForName("t"), 1);
     EXPECT_EQ(r.logEndOffset(1, 0), 0) << "the dropped incarnation's 3 records are NOT id 1's";
-    EXPECT_FALSE(fs::exists(r.dataDir() / "dropped" / "0.t")) << "purged";
+    EXPECT_FALSE(fs::exists(rune::node::droppedRoot(r.dataDir(), 0) / "0.t")) << "purged";
     EXPECT_FALSE(quarantineHasEntryStartingWith(r.dataDir(), "t-"));
-    EXPECT_EQ(slurp(r.dataDir() / "topics" / "t" / "topic-id"), "1\n");
+    EXPECT_EQ(slurp(rune::node::topicsRoot(r.dataDir(), 0) / "t" / "topic-id"), "1\n");
     ASSERT_TRUE(r.produce(1, 0, "new"));
     EXPECT_EQ(r.logEndOffset(1, 0), 1);
 }
@@ -1009,20 +1010,20 @@ TEST(CatalogBootRegression, CrashMidCatchUpNeverReconcilesAgainstAPartialCatalog
     ASSERT_TRUE(r.start());
     ASSERT_EQ(r.define({.name = "a"}).code, kOk);
     r.stop();
-    fs::create_directories(r.dataDir() / "topics" / "ghost" / "0");
-    { std::ofstream(r.dataDir() / "topics" / "ghost" / "0" / "00000000000000000000.log") << "ghost"; }
-    fs::create_directories(r.dataDir() / "topics" / "late" / "0");
-    { std::ofstream(r.dataDir() / "topics" / "late" / "topic-id") << "7\n"; }
-    { std::ofstream(r.dataDir() / "topics" / "late" / "0" / "00000000000000000000.log") << "x"; }
+    fs::create_directories(rune::node::topicsRoot(r.dataDir(), 0) / "ghost" / "0");
+    { std::ofstream(rune::node::topicsRoot(r.dataDir(), 0) / "ghost" / "0" / "00000000000000000000.log") << "ghost"; }
+    fs::create_directories(rune::node::topicsRoot(r.dataDir(), 0) / "late" / "0");
+    { std::ofstream(rune::node::topicsRoot(r.dataDir(), 0) / "late" / "topic-id") << "7\n"; }
+    { std::ofstream(rune::node::topicsRoot(r.dataDir(), 0) / "late" / "0" / "00000000000000000000.log") << "x"; }
     ASSERT_TRUE(rune::node::writeCatchUpSentinel(r.dataDir().string(), -1));
-    const auto ghost = treeOf(r.dataDir() / "topics" / "ghost");
-    const auto late  = treeOf(r.dataDir() / "topics" / "late");
+    const auto ghost = treeOf(rune::node::topicsRoot(r.dataDir(), 0) / "ghost");
+    const auto late  = treeOf(rune::node::topicsRoot(r.dataDir(), 0) / "late");
     ASSERT_TRUE(r.start());
     EXPECT_EQ(r.node().bootReconcileStateForTest(), "AwaitingCatchUp");
     std::this_thread::sleep_for(1s);
-    EXPECT_EQ(treeOf(r.dataDir() / "topics" / "ghost"), ghost);
-    EXPECT_EQ(treeOf(r.dataDir() / "topics" / "late"), late);
-    EXPECT_FALSE(fs::exists(r.dataDir() / "quarantine"));
+    EXPECT_EQ(treeOf(rune::node::topicsRoot(r.dataDir(), 0) / "ghost"), ghost);
+    EXPECT_EQ(treeOf(rune::node::topicsRoot(r.dataDir(), 0) / "late"), late);
+    EXPECT_FALSE(fs::exists(rune::node::quarantineRoot(r.dataDir(), 0)));
     EXPECT_EQ(sentinelOf(r.dataDir()).kind, rune::node::CatchUpSentinel::Kind::Pending);
 }
 
@@ -1041,10 +1042,10 @@ TEST(CatalogBootRegression, WipedCatalogLeaderNeverReconcilesAgainstAnEmptyCatal
     std::this_thread::sleep_for(2s);
     std::error_code ec;
     std::uintmax_t bytes = 0;
-    for (const auto& e : fs::recursive_directory_iterator(r.dataDir() / "topics" / "a", ec))
+    for (const auto& e : fs::recursive_directory_iterator(rune::node::topicsRoot(r.dataDir(), 0) / "a", ec))
         if (e.path().extension() == ".log") bytes += fs::file_size(e.path());
     EXPECT_GT(bytes, 0u) << "topics/a keeps its log bytes";
-    EXPECT_FALSE(fs::exists(r.dataDir() / "quarantine"));
+    EXPECT_FALSE(fs::exists(rune::node::quarantineRoot(r.dataDir(), 0)));
     EXPECT_EQ(r.node().bootReconcileStateForTest(), "AwaitingCatchUp");
     EXPECT_EQ(sentinelOf(r.dataDir()).kind, rune::node::CatchUpSentinel::Kind::Pending);
 }
@@ -1061,15 +1062,15 @@ TEST(CatalogBootRegression, DeferredBootWithAnotherIncarnationsDirLeavesTheTopic
     ASSERT_TRUE(r.awaitServes(0));
     ASSERT_TRUE(r.produce(0, 0, "x"));
     r.stop();
-    { std::ofstream(r.dataDir() / "topics" / "t" / "topic-id", std::ios::trunc) << "5\n"; }   // another incarnation
+    { std::ofstream(rune::node::topicsRoot(r.dataDir(), 0) / "t" / "topic-id", std::ios::trunc) << "5\n"; }   // another incarnation
     ASSERT_TRUE(rune::node::writeCatchUpSentinel(r.dataDir().string(), -1));   // a crash in the middle of catch-up
-    const auto before = treeOf(r.dataDir() / "topics" / "t");
+    const auto before = treeOf(rune::node::topicsRoot(r.dataDir(), 0) / "t");
     ASSERT_TRUE(r.start()) << "a deferred boot never refuses to start over a refused topic";
     EXPECT_EQ(r.node().bootReconcileStateForTest(), "AwaitingCatchUp");
     std::this_thread::sleep_for(1s);
     EXPECT_FALSE(r.node().catalogTopicServesForTest(0)) << "never opened over the wrong dir";
-    EXPECT_EQ(treeOf(r.dataDir() / "topics" / "t"), before) << "byte-identical";
-    EXPECT_FALSE(fs::exists(r.dataDir() / "quarantine"));
+    EXPECT_EQ(treeOf(rune::node::topicsRoot(r.dataDir(), 0) / "t"), before) << "byte-identical";
+    EXPECT_FALSE(fs::exists(rune::node::quarantineRoot(r.dataDir(), 0)));
 }
 
 // F2: a wiped broker that LEADS the catalog accepts no DDL — an explicit Internal — so it never extends an
@@ -1089,9 +1090,9 @@ TEST(CatalogBootRegression, WipedCatalogLeaderRefusesDdlExplicitlyAndNeverOpensA
     const uint64_t refused = r.node().onAdminThreadForTest(
         [&] { return r.node().adminWorkerAgentForTest()->worker().ddlRefusedUntrustedLeader(); });
     EXPECT_GE(refused, 1u);
-    EXPECT_EQ(slurp(r.dataDir() / "topics" / "a" / "topic-id"), "0\n");
+    EXPECT_EQ(slurp(rune::node::topicsRoot(r.dataDir(), 0) / "a" / "topic-id"), "0\n");
     std::uintmax_t bytes = 0;
-    for (const auto& e : fs::recursive_directory_iterator(r.dataDir() / "topics" / "a"))
+    for (const auto& e : fs::recursive_directory_iterator(rune::node::topicsRoot(r.dataDir(), 0) / "a"))
         if (e.path().extension() == ".log") bytes += fs::file_size(e.path());
     EXPECT_GT(bytes, 0u) << "the old history's records are untouched";
     r.stop();
@@ -1103,10 +1104,10 @@ TEST(CatalogBootRegression, WipedCatalogLeaderRefusesDdlExplicitlyAndNeverOpensA
 TEST(CatalogBootRegression, DropOfANeverBuiltIdRetiresTheDirItMarkedRegression) {
     BootRig r("boot_f4");
     ASSERT_TRUE(r.start());
-    fs::create_directories(r.dataDir() / "topics" / "u");
-    ASSERT_TRUE(rune::gateway::writeTopicIdMarker(r.dataDir() / "topics" / "u", 3));
-    fs::create_directories(r.dataDir() / "topics" / "v");
-    ASSERT_TRUE(rune::gateway::writeTopicIdMarker(r.dataDir() / "topics" / "v", 4));
+    fs::create_directories(rune::node::topicsRoot(r.dataDir(), 0) / "u");
+    ASSERT_TRUE(rune::gateway::writeTopicIdMarker(rune::node::topicsRoot(r.dataDir(), 0) / "u", 3));
+    fs::create_directories(rune::node::topicsRoot(r.dataDir(), 0) / "v");
+    ASSERT_TRUE(rune::gateway::writeTopicIdMarker(rune::node::topicsRoot(r.dataDir(), 0) / "v", 4));
     auto postDrop = [&](int32_t id, const std::string& name) {
         std::vector<uint8_t> p(rune::node::catalogTopicDroppedWireLen(name));
         rune::node::writeCatalogTopicDropped(p.data(), id, name);
@@ -1114,9 +1115,9 @@ TEST(CatalogBootRegression, DropOfANeverBuiltIdRetiresTheDirItMarkedRegression) 
     };
     postDrop(3, "u");
     postDrop(3, "v");   // the control: v is marked 4, not 3
-    EXPECT_TRUE(awaitTrue([&] { return !fs::exists(r.dataDir() / "topics" / "u"); }, 5s));
-    EXPECT_TRUE(awaitTrue([&] { return !fs::exists(r.dataDir() / "dropped" / "3.u"); }, 5s)) << "purged";
-    EXPECT_FALSE(fs::exists(r.dataDir() / "quarantine"));
+    EXPECT_TRUE(awaitTrue([&] { return !fs::exists(rune::node::topicsRoot(r.dataDir(), 0) / "u"); }, 5s));
+    EXPECT_TRUE(awaitTrue([&] { return !fs::exists(rune::node::droppedRoot(r.dataDir(), 0) / "3.u"); }, 5s)) << "purged";
+    EXPECT_FALSE(fs::exists(rune::node::quarantineRoot(r.dataDir(), 0)));
     std::this_thread::sleep_for(1s);
-    EXPECT_TRUE(fs::exists(r.dataDir() / "topics" / "v")) << "a marker naming another id is never retired";
+    EXPECT_TRUE(fs::exists(rune::node::topicsRoot(r.dataDir(), 0) / "v")) << "a marker naming another id is never retired";
 }

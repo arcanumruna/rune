@@ -36,6 +36,7 @@
 #include <vector>
 
 namespace rune::replication { class PartitionReplica; struct AlterIsrResponseMsg; }
+namespace rune::catalog { class CatalogState; }
 
 namespace rune::node {
 
@@ -54,10 +55,41 @@ using SecurityRole = std::variant<SecurityFollower, SecurityLeaderCatchingUp, Se
 using SecurityRespond = std::function<void(int64_t session, int64_t corr, uint16_t code, uint64_t objectId,
                                            uint32_t newVersion, int64_t gateOffset, std::string_view detail)>;
 
+/// Namespaces Task 8 (spec §4): the namespace guard's verdict.  Missing answers exactly what a namespace that does not
+/// exist answers (a foreign namespace is never confirmed to a non-cluster-admin).
+enum class GuardVerdict : uint8_t { Allow, NotAuthorized, Missing };
+/// Who is asking, as the leader derives it from a SecurityDdlMsg.
+struct CallerPerms {
+    uint32_t nsId         = 0;      // the session user's namespace
+    bool     clusterAdmin = false;  // effectively ADMIN ON CLUSTER (the gateway found no denial and checked no proof)
+    bool     nsAdmin      = false;  // an enabled user of nsId effectively holding ADMIN ON NAMESPACE <its own name>
+    bool     denied       = true;   // the gateway's verdict stands (a non-empty denial)
+};
+/// The guard's view of one resolved security DDL.
+struct SecurityDdl {
+    const rune::security::GrantSpec* spec = nullptr;     // Grant / Revoke: the grant written or removed
+    bool memberRoleIsPrivileged = false;                  // GrantRole / RevokeRole: the role holds a privileged grant
+    bool targetIsPrivileged     = false;                  // the target user / role holds one (directly or via a role)
+    bool targetIsCaller         = false;                  // the target is the caller's own user
+    bool ownCredentialUnproven  = false;                  // PR #642 F1: a change of the caller's own password, no proof
+};
+/// ClusterAdmin -> Allow.  A target outside the caller's namespace -> Missing.  A namespace admin in its own namespace
+/// -> Allow, except NotAuthorized for a grant / revoke of anything on Cluster or of ADMIN on a Namespace, a membership
+/// in a role holding one, or any change to another user / a role holding one.  Otherwise the gateway's verdict.
+/// PR #642 review F1: a non-cluster-admin's change of its OWN password without the gateway's proof check is always
+/// NotAuthorized (issue #114: a session alone never mints a credential, however the request names the account).
+/// Pure; cold path (DDL rate).
+[[nodiscard]] GuardVerdict nsGuard(const CallerPerms& caller, uint32_t targetNsId, const SecurityDdl& ddl);
+
 class SecurityAdmin {
 public:
     SecurityAdmin(SecurityApplier& applier, rune::replication::PartitionReplica* replica, SecurityRespond respond,
                   int32_t selfId);
+
+    /// Namespaces Task 8: the admin thread's applied catalog, whose namespace registry resolves `ns/local` names and
+    /// the namespace guard (spec §4).  Not owned; it must outlive this object (the AdminWorker's CatalogApplier state).
+    /// nullptr (a rig without a catalog): only `default` exists.
+    void bindCatalog(const rune::catalog::CatalogState* catalog) noexcept { catalog_ = catalog; }
 
     /// Queued, one in flight.  Beyond kMaxPending the request is answered Internal at once (never started).
     void submit(SecurityRequest r);
@@ -120,6 +152,7 @@ private:
     rune::replication::PartitionReplica* replica_;
     SecurityRespond                      respond_;
     int32_t                              selfId_;
+    const rune::catalog::CatalogState*   catalog_ = nullptr;
     SecurityRole                         role_{SecurityFollower{}};
     std::variant<Idle, AwaitingCommit>   inFlight_;
     std::deque<SecurityRequest>          pending_;

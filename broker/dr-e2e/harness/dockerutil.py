@@ -385,7 +385,7 @@ class Compose:
         -T disables TTY allocation so the call is non-interactive and safe to
         capture.  Returns the CmdResult (returncode + stdout + stderr); the
         caller decides how to interpret a non-zero rc (e.g. rune_role exits 1/2
-        when the CnC counter isn't ready yet).
+        when the metrics-file counter isn't ready yet).
         """
         args = self._base() + ["exec", "-T", service, *cmd]
         return run(args, timeout=timeout)

@@ -34,6 +34,7 @@ void SchemaRegistry::applyRecord(const TopicSchema& ts) {
     e.compatMode     = ts.compatMode;
     e.topicName      = ts.topicName;
     e.persistence    = ts.persistence;
+    e.nsId           = ts.nsId;
 
     // Index by the TOPIC name — every byName() caller (GetTopicSchema,
     // DefineTopic's TopicExists check, AlterTopic) passes the name the client
@@ -47,7 +48,7 @@ void SchemaRegistry::applyRecord(const TopicSchema& ts) {
     // carry-forward, CREATE VIEW's commitCreateView_ and view recovery all do),
     // or the entry lands under its descriptor name and can shadow a real topic.
     const std::string& indexName = e.topicName.empty() ? e.descriptor.name : e.topicName;
-    nameToId_[indexName] = ts.topicId;
+    nameToId_[rune::gateway::NsName{ts.nsId, indexName}] = ts.topicId;
 
     // Keep ALL versions: append (never overwrite) by version, 1-based index.
     // byId_'s per-topic container is a deque (not a vector) specifically so
@@ -63,8 +64,8 @@ const RegistryEntry* SchemaRegistry::byId(int32_t topicId) const {
     return latest(topicId);
 }
 
-const RegistryEntry* SchemaRegistry::byName(std::string_view name) const {
-    const auto it = nameToId_.find(std::string(name));
+const RegistryEntry* SchemaRegistry::byName(uint32_t nsId, std::string_view name) const {
+    const auto it = nameToId_.find(rune::gateway::NsNameView{nsId, name});
     if (it == nameToId_.end()) return nullptr;
     return latest(it->second);
 }
