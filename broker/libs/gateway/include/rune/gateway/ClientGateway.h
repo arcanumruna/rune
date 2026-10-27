@@ -2581,6 +2581,11 @@ private:
     [[nodiscard]] std::size_t filterFetchAllByRead_(const Session& session, const uint8_t* reqBuf, std::size_t reqLen,
                                                     std::size_t encoded);
     [[nodiscard]] bool denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
+    /// Namespaces D8, the cluster admin's half: root logs in to `default`, so the session-nsId check passes it; a
+    /// group / txn request naming a non-default topic id, or a group / transactional id qualified by an existing
+    /// non-default namespace, is still outside `default`.  Non-root sessions: false (their nsId check, then their
+    /// grants, decide).  Zero allocation (zero-copy decoders).
+    [[nodiscard]] bool rootOutsideDefault_(const Session& session, uint16_t tid, const uint8_t* buf, std::size_t len) const;
     [[nodiscard]] bool denyTxnRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
     template <class Msg> [[nodiscard]] std::optional<rune::gateway::Denial> authorizeCatalogDdl_(const Session& session, const Msg& m,
                                                                                                std::string_view local) const;

@@ -7791,7 +7791,8 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
     }
     // Namespaces Task 10 (D8): phase 1 keys groups and transactional ids by id alone, so a session outside
     // `default` (root included) is refused before the coordinator redirect or any coordinator state.
-    if (sessionNsId_(*session) != 0 && deny_(*session, kGroupTxnOutsideDefault, buf, len)) return;
+    if ((sessionNsId_(*session) != 0 || rootOutsideDefault_(*session, tid, buf, len))
+        && deny_(*session, kGroupTxnOutsideDefault, buf, len)) return;
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
     if (denyGroupRequest_(*session, tid, buf, len)) return;                 // authentication Task 12 (D18)
 
@@ -7957,7 +7958,8 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
     }
     // Namespaces Task 10 (D8): phase 1 keys groups and transactional ids by id alone, so a session outside
     // `default` (root included) is refused before the coordinator redirect or any coordinator state.
-    if (sessionNsId_(*session) != 0 && deny_(*session, kGroupTxnOutsideDefault, buf, len)) return;
+    if ((sessionNsId_(*session) != 0 || rootOutsideDefault_(*session, tid, buf, len))
+        && deny_(*session, kGroupTxnOutsideDefault, buf, len)) return;
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
     if (denyTxnRequest_(*session, tid, buf, len)) return;                   // authentication Task 12 (D18)
 
@@ -8816,6 +8818,71 @@ std::size_t ClientGateway::filterFetchAllByRead_(const Session& session, const u
     out.sessionId     = resp->sessionId;
     out.correlationId = resp->correlationId;
     return out.encode(scratch_.data(), std::span<const pc::OffsetFetchResult>(fetchFilterScratch_));
+}
+
+bool ClientGateway::rootOutsideDefault_(const Session& session, uint16_t tid, const uint8_t* buf, std::size_t len) const
+{
+    if (!permsOf_(session).isRoot()) return false;
+    const auto topicOut = [&](int32_t id) {
+        const rune::gateway::ObjectEntry* e = objectIndex_.at(id);
+        return e != nullptr && e->nsId != 0;
+    };
+    const auto nameOut = [&](std::span<const uint8_t> id) {   // an opaque id unless qualified by a live namespace
+        const auto res = resolve_(session, sv(id));
+        return res.r == rune::gateway::Resolved::Found && res.nsId != 0;
+    };
+    switch (static_cast<pc::TemplateId>(tid)) {
+        case pc::TemplateId::JoinGroup:
+            if (const auto m = pc::JoinGroup::decode(buf, len, session.clientVersion)) {
+                if (nameOut(m->groupId)) return true;
+                for (const int32_t t : m->subscribedTopicIds) if (topicOut(t)) return true;
+            }
+            return false;
+        case pc::TemplateId::SyncGroup:
+            if (const auto m = pc::SyncGroup::decode(buf, len)) return nameOut(m->groupId);
+            return false;
+        case pc::TemplateId::Heartbeat:
+            if (const auto m = pc::Heartbeat::decode(buf, len)) return nameOut(m->groupId);
+            return false;
+        case pc::TemplateId::LeaveGroup:
+            if (const auto m = pc::LeaveGroup::decode(buf, len)) return nameOut(m->groupId);
+            return false;
+        case pc::TemplateId::OffsetCommit:
+            if (const auto m = pc::OffsetCommit::decode(buf, len)) {
+                if (nameOut(m->groupId)) return true;
+                for (const auto& e : m->entries) if (topicOut(e.topicId)) return true;
+            }
+            return false;
+        case pc::TemplateId::OffsetFetch:
+            if (const auto m = pc::OffsetFetch::decode(buf, len)) {
+                if (nameOut(m->groupId)) return true;
+                for (const auto& e : m->entries) if (topicOut(e.topicId)) return true;
+            }
+            return false;
+        case pc::TemplateId::InitProducerId:
+            if (const auto m = pc::InitProducerId::decode(buf, len)) return nameOut(m->transactionalId);
+            return false;
+        case pc::TemplateId::AddPartitionsToTxn:
+            if (const auto m = pc::AddPartitionsToTxn::decode(buf, len)) {
+                if (nameOut(m->transactionalId)) return true;
+                for (const auto& p : m->partitions) if (topicOut(p.topicId)) return true;
+            }
+            return false;
+        case pc::TemplateId::AddOffsetsToTxn:
+            if (const auto m = pc::AddOffsetsToTxn::decode(buf, len))
+                return nameOut(m->transactionalId) || nameOut(m->groupId);
+            return false;
+        case pc::TemplateId::TxnOffsetCommit:
+            if (const auto m = pc::TxnOffsetCommit::decode(buf, len)) {
+                if (nameOut(m->transactionalId) || nameOut(m->groupId)) return true;
+                for (const auto& e : m->entries) if (topicOut(e.topicId)) return true;
+            }
+            return false;
+        case pc::TemplateId::EndTxn:
+            if (const auto m = pc::EndTxn::decode(buf, len)) return nameOut(m->transactionalId);
+            return false;
+        default: return false;   // an undecodable body is the service's InvalidRequest
+    }
 }
 
 bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len)

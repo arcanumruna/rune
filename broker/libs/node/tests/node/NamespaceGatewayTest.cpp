@@ -248,6 +248,32 @@ TEST(NamespaceGatewayRegression, GroupTxnRefusedOutsideDefaultRegression) {
     EXPECT_EQ(r.initProducerId(g.root, "txRoot"), kOk);
 }
 
+/// D8, the cluster admin's half (namespaces Task 12 matrix): root logs in to `default`, so the session-nsId check
+/// passes it; naming a group or transaction THROUGH another namespace - a non-default topic id, or a group /
+/// transactional id qualified by an existing non-default namespace - is still refused 45 before the coordinator.
+/// Mutation: drop the `rootOutsideDefault_` term in ClientGateway's group / txn handlers → every refusal below is 0.
+TEST(NamespaceGatewayRegression, RootGroupTxnOutsideDefaultRegression) {
+    NsGw g;
+    AuthRig& r = g.r;
+    EXPECT_EQ(r.joinGroup(g.root, "cgR", {g.mine}), kNotAuthorized) << "JoinGroup on an alpha topic";
+    EXPECT_EQ(r.offsetCommit(g.root, "cgR", g.mine), kNotAuthorized) << "OffsetCommit on an alpha topic";
+    EXPECT_EQ(r.offsetFetch(g.root, "cgR", g.mine), kNotAuthorized) << "OffsetFetch on an alpha topic";
+    EXPECT_EQ(r.joinGroup(g.root, "alpha/cg", {r.orders}), kNotAuthorized) << "JoinGroup on an alpha-qualified group";
+    EXPECT_EQ(r.initProducerId(g.root, "alpha/tx"), kNotAuthorized) << "InitProducerId on an alpha-qualified txn id";
+    EXPECT_EQ(r.addPartitions(g.root, "txR", g.mine), kNotAuthorized) << "AddPartitionsToTxn on an alpha topic";
+    EXPECT_EQ(r.addOffsets(g.root, "txR", "bravo/cg"), kNotAuthorized) << "AddOffsetsToTxn on a bravo-qualified group";
+    EXPECT_EQ(r.txnOffsetCommit(g.root, "txR", "cgR", g.mine), kNotAuthorized) << "TxnOffsetCommit on an alpha topic";
+    // The coordinator never saw the join: a fresh group's first generation equals the refused one's.
+    const auto joined = r.joinStable(g.root, "cgR", {r.orders});
+    const auto fresh = r.joinStable(g.root, "cgRFresh", {r.orders});
+    ASSERT_GE(fresh.second, 0);
+    EXPECT_EQ(joined.second, fresh.second) << "root's refused JoinGroup reached the coordinator";
+    // Controls: `default` topics, "default/"-qualified and unknown-qualifier ids (opaque in phase 1) stay allowed.
+    EXPECT_EQ(r.initProducerId(g.root, "default/tx"), kOk);
+    EXPECT_EQ(r.initProducerId(g.root, "nosuchns/tx"), kOk);
+    EXPECT_EQ(r.offsetFetch(g.root, "cgR", r.orders), kOk);
+}
+
 // ── a malformed qualified name: 40 on every name-taking request, root included ──────────────────────────────────
 TEST(NamespaceGatewayRegression, MalformedNameRegression) {
     NsGw g;
