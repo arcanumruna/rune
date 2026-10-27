@@ -16,6 +16,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -72,6 +73,135 @@ public:
     Answer run(Op op, Caller c, Target t, int ordinal) { return exec(op, c, t, ordinal, /*twin=*/false); }
     Answer runTwin(Op op, Caller c, Target t, int ordinal) { return exec(op, c, t, ordinal, /*twin=*/true); }
 
+    // ── the timing cells (one node): the caller is root or a/admin, the object is a fresh one of namespace `a` ──
+    using RequestId = rune::protocol::RequestId;
+
+    /// Root precreates what the op consumes (DropTopic: `a/d<ord>`).
+    void prepareTimed(Op op, int ord) {
+        World& w = *main_;
+        if (op == Op::DropTopic) need(w.r.defineTopic(w.root, "a/d" + std::to_string(ord)) >= 0, "fresh topic to drop");
+    }
+    /// A second logged-in session of the caller (kept until the next restart).
+    int64_t secondSession(Caller who) { return timedSession(*main_, who, true); }
+    /// Send the op as the caller and return its correlation id without awaiting.  `rid` none = a fresh request id.
+    /// `arg`: the maxTopics of SetNamespaceLimits.  `sfx` is appended to the object's name.
+    int64_t sendTimed(Op op, Caller who, int ord, RequestId rid, bool second = false, uint64_t arg = 0,
+                      const std::string& sfx = {}) {
+        World& w = *main_;
+        const int64_t sid = timedSession(w, who, second);
+        if (rid.none()) rid = RequestId{0xB0C, ++w.rid};
+        const std::string nm = timedName(op, who, ord, sfx);
+        AuthRig& r = w.r;
+        auto& c = r.c();
+        const std::string& ch = r.ch();
+        constexpr int32_t st = AuthRig::stream();
+        switch (op) {
+            case Op::CreateNamespace: case Op::SetNamespaceLimits: {
+                pc::NamespaceDdlRequest m;
+                m.sessionId = sid;
+                m.correlationId = c.nextCorrelationId();
+                m.ext.clientName = "ns-matrix";
+                m.ext.requestId = rid;
+                m.kind = op == Op::CreateNamespace ? pc::NamespaceDdlKind::Create : pc::NamespaceDdlKind::SetLimits;
+                m.name = nm;
+                if (op == Op::SetNamespaceLimits) { m.presentMask[0] = 1; m.limits.maxTopics = arg; }
+                std::vector<uint8_t> buf(m.encodedSize());
+                buf.resize(m.encode(buf.data()));
+                need(c.send(ch, st, buf.data(), buf.size()), "send timed namespace DDL");
+                return m.correlationId;
+            }
+            case Op::CreateTopic:
+                return c.sendDefineTopic(ch, st, sid, nm, 1, authRigCharBlob(), 0, rid, 0, authRigTopicConfig());
+            case Op::DropTopic: return c.sendDropTopic(ch, st, sid, nm, rid);
+            case Op::CreateView:
+                return c.sendCreateView(ch, st, sid, nm, "id", 0, authRigViewPlan(localOf(nm), {w.tid["a"]}), rid);
+            case Op::CreateUser: case Op::Grant: {
+                if (!ver_) ver_ = AuthWireClient::verifierOf(AuthRig::kPw);
+                pc::SecurityDdl m;
+                m.sessionId = sid;
+                m.correlationId = c.nextCorrelationId();
+                m.ext.clientName = "ns-matrix";
+                m.ext.requestId = rid;
+                std::string stmt, pattern;
+                if (op == Op::CreateUser) {
+                    m.kind = pc::SecurityOpKind::CreateUser;
+                    m.name = nm;
+                    m.verifier = ver_->wire();
+                    stmt = "CREATE USER " + nm + " WITH PASSWORD '<redacted>';";
+                } else {
+                    pattern = "g" + std::to_string(ord) + sfx;
+                    m.kind = pc::SecurityOpKind::Grant;
+                    m.name = nm;
+                    m.granteeKind = 0;
+                    m.op = static_cast<uint8_t>(SO::Read);
+                    m.resourceType = static_cast<uint8_t>(ST::Topic);
+                    m.patternKind = static_cast<uint8_t>(SP::Prefix);
+                    m.pattern = pattern;
+                    stmt = "GRANT ...;";
+                }
+                m.ext.statement = stmt;
+                std::vector<uint8_t> buf(m.encodedSize());
+                buf.resize(m.encode(buf.data()));
+                need(!buf.empty() && c.send(ch, st, buf.data(), buf.size()), "send timed security DDL");
+                return m.correlationId;
+            }
+            default: break;
+        }
+        need(false, "not a timing op");
+        return 0;
+    }
+    Answer awaitTimed(int64_t corr) {
+        Answer a;
+        ddl(*main_, a, corr);
+        return a;
+    }
+    Answer timed(Op op, Caller who, int ord, RequestId rid = {}, uint64_t arg = 0) {
+        return awaitTimed(sendTimed(op, who, ord, rid, false, arg));
+    }
+    /// Root's ListNamespaces answer (body without header; compare two with normalized()).
+    Answer rootListNamespaces() { return issue(*main_, Op::ListNamespaces, main_->root, Names{}); }
+    /// `a`'s maxTopics as root's ListNamespaces lists it (-1: `a` not listed).
+    int64_t maxTopicsOfA() {
+        World& w = *main_;
+        pc::ListNamespaces m;
+        m.sessionId = w.root; m.correlationId = w.r.c().nextCorrelationId(); m.afterNsId = 0; m.max = 100;
+        std::vector<uint8_t> buf(m.encodedSize());
+        buf.resize(m.encode(buf.data()));
+        need(w.r.c().send(w.r.ch(), AuthRig::stream(), buf.data(), buf.size()), "send ListNamespaces");
+        const auto raw = w.r.rawAnswer(m.correlationId);
+        const auto l = pc::ListNamespacesResponse::decode(raw.data(), raw.size());
+        if (!l) return -1;
+        for (const auto& i : l->namespaces)
+            if (i.name == "a") return static_cast<int64_t>(i.limits.maxTopics);
+        return -1;
+    }
+    std::vector<int32_t> rootMetadata() {
+        auto ids = main_->r.metadataTopics(main_->root);
+        std::sort(ids.begin(), ids.end());
+        return ids;
+    }
+    uint64_t securityDigest() { return main_->r.broker().node().securityViewForTest().digest; }
+    int32_t topicIdA() { return main_->tid["a"]; }
+    /// Restart the broker over the same data and log root in again (the other sessions are gone).
+    void restartForTest() {
+        World& w = *main_;
+        w.r.restart();
+        w.sess.clear();
+        w.sess2.clear();
+        w.root = loginNs(w.r, "admin", AuthBroker::kAdminPassword);
+        w.sess["admin"] = w.root;
+    }
+    /// Bounded wait until root's metadata lists topic `tid` and at least `minCount` topics.
+    bool awaitRootListed(int32_t tid, std::size_t minCount) {
+        World& w = *main_;
+        for (int i = 0; i < 400; ++i) {
+            const auto ids = w.r.metadataTopics(w.root);
+            if (ids.size() >= minCount && std::find(ids.begin(), ids.end(), tid) != ids.end()) return true;
+            w.r.c().pollFor(std::chrono::milliseconds(25), [] { return false; });
+        }
+        return false;
+    }
+
 private:
     using SO = rune::protocol::SecurityOperation;
     using ST = rune::protocol::SecurityResourceType;
@@ -83,6 +213,7 @@ private:
         int32_t tOnly = kMissingId, vOnly = kMissingId;
         int64_t root = 0;
         std::map<std::string, int64_t> sess;       ///< logged-in principals by name
+        std::map<int, int64_t> sess2;              ///< the timing cells' second session per caller
         uint64_t rid = 0;
         World(const std::string& tag, AuthBroker::Options o) : r(tag, std::move(o)) {}
     };
@@ -93,6 +224,32 @@ private:
     };
 
     std::unique_ptr<World> main_, anon_;
+    std::optional<AuthWireClient::Verifier> ver_;   ///< one verifier for every timed CreateUser (a retry is byte-identical)
+
+    int64_t timedSession(World& w, Caller who, bool second) {
+        const bool root = who == Caller::ClusterAdmin;
+        if (!second) return root ? w.root : session(w, "a/admin");
+        auto it = w.sess2.find(static_cast<int>(who));
+        if (it == w.sess2.end())
+            it = w.sess2.emplace(static_cast<int>(who), root ? loginNs(w.r, "admin", AuthBroker::kAdminPassword)
+                                                             : loginNs(w.r, "a/admin", AuthRig::kPw)).first;
+        return it->second;
+    }
+    /// The fresh object of a timing cell: root names it qualified, a/admin unqualified.
+    static std::string timedName(Op op, Caller who, int ord, const std::string& sfx) {
+        const std::string o = std::to_string(ord);
+        auto qa = [&](const std::string& local) { return who == Caller::ClusterAdmin ? "a/" + local : local; };
+        switch (op) {
+            case Op::CreateNamespace: return "n" + o + sfx;
+            case Op::SetNamespaceLimits: return "a" + sfx;
+            case Op::CreateTopic: return qa("k" + o + sfx);
+            case Op::DropTopic: return qa("d" + o + sfx);
+            case Op::CreateView: return qa("kv" + o + sfx);
+            case Op::CreateUser: return qa("u" + o + sfx);
+            case Op::Grant: return qa("x" + sfx);
+            default: return {};
+        }
+    }
 
     static std::string full(const std::string& ns, const std::string& local) {
         return ns == "default" ? local : ns + "/" + local;

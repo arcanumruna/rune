@@ -90,3 +90,113 @@ TEST_P(NamespaceMatrixRegression, SequentialCell) {
 
 INSTANTIATE_TEST_SUITE_P(All, NamespaceMatrixRegression, ::testing::ValuesIn(allCells()),
                          [](const auto& info) { return cellName(info.param); });
+
+// ── Task 12b: the one-node timing cells (BackToBack, ConcurrentSameName, Restart) ────────────────────────────────
+namespace {
+struct TCell { Op op; Caller caller; Timing timing; int ordinal; };
+std::vector<TCell> timingCells() {
+    std::vector<TCell> v;
+    int ord = 10'000;
+    for (std::size_t o = 0; o < kOps; ++o)
+        for (std::size_t c = 0; c < kCallers; ++c)
+            for (const Timing tm : {Timing::BackToBack, Timing::ConcurrentSameName, Timing::Restart})
+                if (isTimingCell(Op(o), Caller(c), Target::OwnNs, tm)) v.push_back({Op(o), Caller(c), tm, ord++});
+    return v;
+}
+std::string tCellName(const TCell& c) {
+    return std::string(name(c.op)) + "_" + name(c.caller) + "_" + name(c.timing);
+}
+/// What a repeat of an applied first op answers.
+int dupCode(Op o) {
+    switch (o) {
+        case Op::CreateNamespace: case Op::CreateTopic: return 25;
+        case Op::CreateView: return 32;
+        case Op::CreateUser: case Op::Grant: return 39;
+        case Op::DropTopic: return 7;
+        default: return 0;   // SetNamespaceLimits
+    }
+}
+}  // namespace
+
+TEST(NamespaceMatrixTimingCountRegression, TimingCellCountRegression) {
+    EXPECT_EQ(timingCells().size(), 42u);
+}
+
+class NamespaceMatrixTimingRegression : public ::testing::TestWithParam<TCell> {
+protected:
+    static void SetUpTestSuite() { rig_ = std::make_unique<NamespaceRig>(); }
+    static void TearDownTestSuite() { rig_.reset(); }
+    static inline std::unique_ptr<NamespaceRig> rig_;
+};
+
+TEST_P(NamespaceMatrixTimingRegression, TimingCell) {
+    const TCell& p = GetParam();
+    const Outcome first = expect(p.op, p.caller, isCreateOp(p.op) ? Target::Missing : Target::OwnNs);
+    const int dup = dupCode(p.op);
+    const bool ok = first.kind == Kind::Ok;
+    const std::string label = tCellName(p) + ": want " + describe(first);
+    NamespaceRig& r = *rig_;
+    r.prepareTimed(p.op, p.ordinal);
+    const uint64_t lim = 100u + static_cast<uint64_t>(p.ordinal);
+    switch (p.timing) {
+        case Timing::BackToBack: {
+            const rune::protocol::RequestId rid{0xB2B, static_cast<uint64_t>(p.ordinal)};
+            const int64_t c1 = r.sendTimed(p.op, p.caller, p.ordinal, rid, false, lim);
+            const int64_t c2 = r.sendTimed(p.op, p.caller, p.ordinal, rid, false, lim);
+            const auto a1 = r.awaitTimed(c1);
+            const auto a2 = r.awaitTimed(c2);
+            EXPECT_EQ(a1.code, first.code) << label << " [" << a1.detail << "]";
+            EXPECT_EQ(a2.code, first.code) << label << " (the retry) [" << a2.detail << "]";
+            if (ok) {
+                EXPECT_EQ(a1.normalized(a2), a2.normalized(a1)) << label << ": the retry's answer is not byte-equal";
+                const auto third = r.timed(p.op, p.caller, p.ordinal, {}, lim);
+                EXPECT_EQ(third.code, dup) << label << ": the op did not take effect exactly once [" << third.detail << "]";
+            }
+            break;
+        }
+        case Timing::ConcurrentSameName: {
+            r.secondSession(p.caller);
+            const int64_t c1 = r.sendTimed(p.op, p.caller, p.ordinal, {}, false, lim);
+            const int64_t c2 = r.sendTimed(p.op, p.caller, p.ordinal, {}, true, 200u + static_cast<uint64_t>(p.ordinal));
+            const auto a1 = r.awaitTimed(c1);
+            const auto a2 = r.awaitTimed(c2);
+            if (first.kind == Kind::NotAuthorized) {
+                EXPECT_EQ(a1.code, 45) << label;
+                EXPECT_EQ(a2.code, 45) << label;
+            } else if (p.op == Op::SetNamespaceLimits) {
+                EXPECT_EQ(a1.code, 0) << label;
+                EXPECT_EQ(a2.code, 0) << label;
+                const int64_t got = r.maxTopicsOfA();
+                EXPECT_TRUE(got == static_cast<int64_t>(lim) || got == static_cast<int64_t>(200u + p.ordinal))
+                    << label << ": a's maxTopics is " << got;
+            } else {
+                const int okCount = (a1.code == 0) + (a2.code == 0);
+                const int dupCount = (a1.code == dup) + (a2.code == dup);
+                EXPECT_EQ(okCount, 1) << label << ": codes " << a1.code << ", " << a2.code;
+                EXPECT_EQ(dupCount, 1) << label << ": codes " << a1.code << ", " << a2.code;
+            }
+            break;
+        }
+        default: {   // Restart
+            struct Snap { NamespaceRig::Answer ns; std::vector<int32_t> ids; uint64_t digest = 0; };
+            auto snap = [&] { return Snap{r.rootListNamespaces(), r.rootMetadata(), r.securityDigest()}; };
+            const auto a = r.timed(p.op, p.caller, p.ordinal, {}, lim);
+            EXPECT_EQ(a.code, first.code) << label << " [" << a.detail << "]";
+            const Snap s1 = snap();
+            r.restartForTest();
+            EXPECT_TRUE(r.awaitRootListed(r.topicIdA(), s1.ids.size())) << label << ": the topics did not come back";
+            const Snap s2 = snap();
+            EXPECT_EQ(s1.ns.normalized(s2.ns), s2.ns.normalized(s1.ns)) << label << ": ListNamespaces changed";
+            EXPECT_EQ(s1.ids, s2.ids) << label << ": the topic listing changed";
+            EXPECT_EQ(s1.digest, s2.digest) << label << ": the security view changed";
+            if (ok) {
+                const auto again = r.timed(p.op, p.caller, p.ordinal, {}, lim);
+                EXPECT_EQ(again.code, dup) << label << ": the effect did not survive the restart [" << again.detail << "]";
+            }
+            break;
+        }
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(All, NamespaceMatrixTimingRegression, ::testing::ValuesIn(timingCells()),
+                         [](const auto& info) { return tCellName(info.param); });
