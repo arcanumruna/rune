@@ -7958,7 +7958,13 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
     }
     // Namespaces Task 10 (D8): phase 1 keys groups and transactional ids by id alone, so a session outside
     // `default` (root included) is refused before the coordinator redirect or any coordinator state.
-    if ((sessionNsId_(*session) != 0 || rootOutsideDefault_(*session, tid, buf, len))
+    // An InitProducerId with no transactional id is exempt: it mints a cluster-unique id for an idempotent producer
+    // and keys nothing by name, and every client producer sends one before its first produce.
+    const bool plainProducerIdRequest = tid == static_cast<uint16_t>(pc::TemplateId::InitProducerId) && [&] {
+        const auto m = pc::InitProducerId::decode(buf, len);
+        return m.has_value() && m->transactionalId.empty();
+    }();
+    if (((sessionNsId_(*session) != 0 && !plainProducerIdRequest) || rootOutsideDefault_(*session, tid, buf, len))
         && deny_(*session, kGroupTxnOutsideDefault, buf, len)) return;
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
     if (denyTxnRequest_(*session, tid, buf, len)) return;                   // authentication Task 12 (D18)

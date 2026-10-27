@@ -248,6 +248,21 @@ TEST(NamespaceGatewayRegression, GroupTxnRefusedOutsideDefaultRegression) {
     EXPECT_EQ(r.initProducerId(g.root, "txRoot"), kOk);
 }
 
+/// D8 covers transactional ids only: an InitProducerId WITHOUT one mints a cluster-unique producer id for an
+/// idempotent producer and touches no (ns, id)-keyed state, so a namespace user gets it (the C++ client's producer
+/// always asks for one before its first produce; found by docker/namespace-e2e.sh step 5). A principal with no topic
+/// WRITE still gets 45 (#211), and a transactional id stays refused.
+/// Mutation: drop the `plainProducerIdRequest` exemption in ClientGateway's txn handler -> alice's first call is 45.
+TEST(NamespaceGatewayRegression, IdempotentProducerIdOutsideDefaultRegression) {
+    NsGw g;
+    AuthRig& r = g.r;
+    EXPECT_EQ(r.initProducerId(g.alice, ""), kOk) << "idempotent InitProducerId for alpha/alice";
+    EXPECT_EQ(r.initProducerId(g.alice, "txA"), kNotAuthorized) << "a transactional id stays refused outside default";
+    r.broker().createUser("alpha/nowrite", AuthRig::kPw, {prefix(SO::Read, ST::Topic, "")});
+    const int64_t nowrite = r.login("alpha/nowrite");
+    EXPECT_EQ(r.initProducerId(nowrite, ""), kNotAuthorized) << "no topic WRITE mints no producer id (#211)";
+}
+
 /// D8, the cluster admin's half (namespaces Task 12 matrix): root logs in to `default`, so the session-nsId check
 /// passes it; naming a group or transaction THROUGH another namespace - a non-default topic id, or a group /
 /// transactional id qualified by an existing non-default namespace - is still refused 45 before the coordinator.

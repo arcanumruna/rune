@@ -173,6 +173,7 @@ public:
             ++loginsOkDone_;
             admin_ = &w;
             adminSid_ = sid;
+            adminUsed_ = std::chrono::steady_clock::now();
         }
     }
     ~AuthBroker() {
@@ -231,26 +232,28 @@ public:
         require(set.errorCode == 0, "admin SET PASSWORD: " + set.detail);
         admin_ = &w;
         adminSid_ = s1;
+        adminPassword_ = adminPassword;
+        adminUsed_ = std::chrono::steady_clock::now();
     }
 
     void createUser(const std::string& name, const std::string& password, const std::vector<AuthGrant>& grants = {}) {
-        auto a = admin().createUser(channel_, adminSid_, name, password);
+        auto a = admin().createUser(channel_, freshAdminSid_(), name, password);
         require(a.errorCode == 0, "CREATE USER " + name + ": " + a.detail);
         for (const AuthGrant& g : grants) {
-            auto r = admin().grant(channel_, adminSid_, name, false, g.op, g.type, g.kind, g.pattern);
+            auto r = admin().grant(channel_, freshAdminSid_(), name, false, g.op, g.type, g.kind, g.pattern);
             require(r.errorCode == 0, "GRANT to " + name + ": " + r.detail);
         }
     }
     void disableUser(const std::string& name) {
-        auto a = admin().alterPassword(channel_, adminSid_, name, pc::UserChangeKind::Disable);
+        auto a = admin().alterPassword(channel_, freshAdminSid_(), name, pc::UserChangeKind::Disable);
         require(a.errorCode == 0, "DISABLE " + name + ": " + a.detail);
     }
     void addPassword(const std::string& name, const std::string& password) {
-        auto a = admin().alterPassword(channel_, adminSid_, name, pc::UserChangeKind::AddPassword, password);
+        auto a = admin().alterPassword(channel_, freshAdminSid_(), name, pc::UserChangeKind::AddPassword, password);
         require(a.errorCode == 0, "ADD PASSWORD " + name + ": " + a.detail);
     }
     void dropOldestPassword(const std::string& name) {
-        auto a = admin().alterPassword(channel_, adminSid_, name, pc::UserChangeKind::DropPassword, {}, false, 1);
+        auto a = admin().alterPassword(channel_, freshAdminSid_(), name, pc::UserChangeKind::DropPassword, {}, false, 1);
         require(a.errorCode == 0, "DROP PASSWORD 1 " + name + ": " + a.detail);
     }
     AuthWireClient& admin() {
@@ -258,6 +261,22 @@ public:
         return *admin_;
     }
     [[nodiscard]] int64_t adminSession() const noexcept { return adminSid_; }
+    /// The admin session for the next security DDL.  The broker reaps a session idle for 10 s
+    /// (kDefaultSessionTimeoutNs), and a long suite can leave the admin unused that long between createUser calls
+    /// (issue #647): a session idle for 5 s is logged in again first.
+    int64_t freshAdminSid_() {
+        AuthWireClient& w = admin();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - adminUsed_ > std::chrono::seconds(5)) {
+            const int64_t sid = w.connect(channel_);
+            require(sid > 0, "admin reconnect");
+            require(w.login(channel_, sid, "admin", {adminPassword_, adminPassword_}).ok(), "admin re-login");
+            ++loginsOkDone_;
+            adminSid_ = sid;
+        }
+        adminUsed_ = now;
+        return adminSid_;
+    }
     /// Successful logins the test rig itself performed on THIS node start (admin + AuthRig::login via noteLoginOk).
     /// The metrics-file logins-ok counter is published asynchronously, so a rig that needs an exact baseline counts its own.
     [[nodiscard]] int64_t loginsOkDone() const noexcept { return loginsOkDone_; }
@@ -304,6 +323,8 @@ private:
     std::vector<std::unique_ptr<AuthWireClient>> wires_;
     AuthWireClient*                              admin_ = nullptr;
     int64_t                                      adminSid_ = 0;
+    std::string                                  adminPassword_ = kAdminPassword;
+    std::chrono::steady_clock::time_point        adminUsed_{};
     int                                          clientDirs_ = 0;
 };
 
