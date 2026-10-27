@@ -514,6 +514,12 @@ if(BUILD_BENCHMARKS)
         rune_metadata
         benchmark::benchmark_main)
 
+    # ── ControlDutyCycleBench — standalone: SystemMetrics cost on the control duty cycle (header-only metrics) ──
+    add_executable(ControlDutyCycleBench
+        benchmark/BenchmarkMain.cpp
+        benchmark/ControlDutyCycleBench.cpp)
+    target_link_libraries(ControlDutyCycleBench PRIVATE metrics benchmark::benchmark)
+
     add_executable(rune_broker_benchmark
         benchmark/BenchmarkMain.cpp
         benchmark/StorageBenchmark.cpp

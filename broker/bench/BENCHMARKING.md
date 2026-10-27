@@ -137,6 +137,25 @@ The headline target (p50 50 µs / p99 200 µs) is a single-node hot-path figure.
 - a short /dev/shm;
 - an unprepared box (k3s and iptables running, no lo NOTRACK).
 
+## Micro bench baselines
+
+These benches are in-process and need no prepared box. Still, run them on an idle host for a verdict.
+
+**`ControlDutyCycleBench`** (`broker/benchmark/ControlDutyCycleBench.cpp`, built with `-DBUILD_BENCHMARKS=ON`) measures what
+`SystemMetrics` adds to one control-agent duty cycle: `if (systemMetrics_) work += systemMetrics_->doWork(nowNs);`, run on a
+real metrics file and the real `/proc/self`. It gates two things after the timed loop: zero allocations in every case, and
+the time per cycle shown in the table. The full BrokerNode control `doWork` is not driven here. The produce path is covered by
+the ABAB single-node produce p99 run.
+
+| case | per cycle (median, n=5) | gate | source |
+|---|---|---|---|
+| no `SystemMetrics` (metrics file off) | 0.47 ns | < 50 ns | metrics plan Task 12, 2026-10-27, `-O2`, shared dev host (load ~3) |
+| `SystemMetrics`, off-interval (the steady state) | 1.0 ns | < 50 ns | same |
+| `SystemMetrics`, on-interval (`pread` of statm and status, `getdents64` of the fd dir) | 5.9 µs | < 50 µs | same |
+
+At the default 1 s interval, the on-interval cost is paid once a second on the control thread. That is about 6 µs/s, or
+0.0006 % of one core, and it is never paid on a produce, fetch or query path.
+
 ## Checklist
 
 1. Take the lock; run `vm-bench-prepare.sh`; read its log.
