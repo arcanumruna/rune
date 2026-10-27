@@ -4,10 +4,8 @@
 # Conan only installs dependencies here; it never creates, exports or uploads a package.
 name: sanitizers
 
+# Manual only (workflow_dispatch): never triggered by pull requests or pushes.
 on:
-  pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       asan_tests:
