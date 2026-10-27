@@ -4,14 +4,19 @@
 // fail here at compile time, and a created file must read back that version at run time.
 #include <metrics/MetricsFile.h>
 #include <metrics/MetricsLayout.h>
+#include <rune/node/RuneMetrics.h>
 
 #include <gtest/gtest.h>
 
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 static_assert(metrics::kLayoutVersion == 2, "Rune is built against arcanum-metrics layout version 2");
 
@@ -40,6 +45,79 @@ TEST(BrokerMetricsRegression, LibraryVersionRegression) {
     EXPECT_EQ(readBack, metrics::kLayoutVersion);
 
     std::filesystem::remove(path);
+}
+
+// ===========================================================================
+// arcanum-metrics plan Task 13 (spec §5.3): the operator's metric table in docs/operations.md is kRuneMetrics.
+// The "### Node metrics" table must list every row, in order, with the same type id, label prefix, kind and owner,
+// so a renamed, added or removed metric fails here until the doc follows.
+// ===========================================================================
+namespace {
+
+struct DocMetricRow {
+    std::string id, label, kind, owner;
+};
+
+std::string trimCell(std::string s) {
+    const auto b = s.find_first_not_of(" \t");
+    const auto e = s.find_last_not_of(" \t");
+    s = b == std::string::npos ? std::string{} : s.substr(b, e - b + 1);
+    if (s.size() >= 2 && s.front() == '`' && s.back() == '`') s = s.substr(1, s.size() - 2);
+    return s;
+}
+
+// The data rows of the first table under "### Node metrics" (header and separator rows skipped).
+std::vector<DocMetricRow> parseNodeMetricTable(std::istream& in) {
+    std::vector<DocMetricRow> rows;
+    std::string line;
+    bool inSection = false;
+    bool inTable = false;
+    while (std::getline(in, line)) {
+        if (line.rfind("### Node metrics", 0) == 0) { inSection = true; continue; }
+        if (!inSection) continue;
+        if (line.rfind('|', 0) != 0) {
+            if (inTable) break;  // the table ended
+            if (line.rfind("#", 0) == 0) break;  // the next heading before any table
+            continue;
+        }
+        inTable = true;
+        std::vector<std::string> cells;
+        std::string cell;
+        std::istringstream ls(line.substr(1));
+        while (std::getline(ls, cell, '|')) cells.push_back(trimCell(cell));
+        if (cells.size() < 4 || cells[0].empty() || !std::isdigit(static_cast<unsigned char>(cells[0][0]))) continue;
+        rows.push_back({cells[0], cells[1], cells[2], cells[3]});
+    }
+    return rows;
+}
+
+const char* kindName(metrics::MetricKind k) { return k == metrics::MetricKind::Counter ? "counter" : "gauge"; }
+const char* ownerName(rune::node::MetricOwner o) {
+    switch (o) {
+        case rune::node::MetricOwner::Control: return "control";
+        case rune::node::MetricOwner::Observer: return "observer";
+        case rune::node::MetricOwner::Provisioner: return "provisioner";
+    }
+    return "?";
+}
+
+}  // namespace
+
+TEST(BrokerMetricsRegression, OperationsDocTableMatchesRegression) {
+    const std::string docPath = std::string(RUNE_REPO_ROOT) + "/docs/operations.md";
+    std::ifstream in(docPath);
+    ASSERT_TRUE(in.good()) << "cannot open " << docPath;
+    const std::vector<DocMetricRow> rows = parseNodeMetricTable(in);
+    ASSERT_EQ(rows.size(), rune::node::kRuneMetrics.size())
+        << "docs/operations.md '### Node metrics' must list every kRuneMetrics row";
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        const auto& def = rune::node::kRuneMetrics[i];
+        SCOPED_TRACE("row " + std::to_string(i) + " (" + def.labelPrefix + ")");
+        EXPECT_EQ(rows[i].id, std::to_string(rune::node::typeIdOf(def.id)));
+        EXPECT_EQ(rows[i].label, def.labelPrefix);
+        EXPECT_EQ(rows[i].kind, kindName(def.kind));
+        EXPECT_EQ(rows[i].owner, ownerName(def.owner));
+    }
 }
 
 // ===========================================================================

@@ -202,7 +202,7 @@ Every `rune` command takes `--user <u>` and `--password-file <path>`, or `RUNE_U
 Brokers authenticate each other with one shared key file, `RUNE_CLUSTER_KEY_FILE`. On each
 inter-broker connection they prove possession by a mutual HMAC challenge-response; the key never
 crosses the wire. A broker without a valid key cannot join: it is refused explicitly, and the
-refusal is logged on **both** sides (counter 1 000 234). Broker identity does not depend on
+refusal is logged on **both** sides (metric 1 000 234). Broker identity does not depend on
 `__security`, so a new broker authenticates before it has replicated the log.
 
 **Generating it.** `rune security gen-cluster-key --out <path>` writes 64 hex characters (256 bits)
@@ -318,7 +318,7 @@ zero allocation); tables are owned by the thread that owns the session and updat
 
 - It is never the default: without the setting, authentication is on and the broker needs a cluster key.
 - The broker logs a loud warning at startup and every 5 minutes, and publishes the mode as the
-  counter `rune-auth-mode` (1 000 228: 0 enabled, 1 dev mode).
+  metric `rune-auth-mode` (1 000 228: 0 enabled, 1 dev mode).
 - A broker in dev mode **refuses to start as part of a multi-broker cluster**
   (`RUNE_PEERS` lists more than one broker): an unauthenticated node would be an open door into the
   cluster's data and into `__security`.
@@ -334,7 +334,7 @@ zero allocation); tables are owned by the thread that owns the session and updat
 | A user dropped or disabled, or `TERMINATE SESSIONS` | `SessionRevoked` on every in-flight request and subscription, then the session ends; terminal for that session | 46 |
 | First login before the one-time password is changed | `PasswordChangeRequired`; fails exactly that request | 47 |
 | A client older than version 9 against an authenticated cluster | refused at the handshake (`Connect`), never downgraded | version gate |
-| A broker without a valid cluster key | refused at the peer connection, logged on both sides | counter 1 000 234 |
+| A broker without a valid cluster key | refused at the peer connection, logged on both sides | metric 1 000 234 |
 | `__security` apply halted on this broker | logins `AuthUnavailable`, sessions end with a session-level `AuthUnavailable` (retriable: the client reconnects to another broker), security DDL `Internal` | 48, see `#halted` |
 | This broker's `__security` state is not current (catching up, stale) | logins, `__security` reads and security DDL `AuthUnavailable`; retriable, try another broker. Stale longer than R: a session-level `AuthUnavailable` ends the authenticated sessions | 48, see `#serving` |
 | This broker holds committed `__security` events it has not applied yet (behind) | every grant-checked request `AuthUnavailable`, nothing appended or pushed; retriable, served again once applied | 48, see `#serving` |
@@ -349,13 +349,13 @@ because a security log that stops applying stops enforcing revocations, it **fai
   broker - reconnect to another broker`); it is retriable, so the client reconnects to a healthy broker,
 - refuses new logins with `AuthUnavailable` (retriable, likewise),
 - answers security DDL `Internal`,
-- raises counter `rune-security-apply-halted` (1 000 226: 0 while applying, the halted offset plus 1 after a halt),
+- raises metric `rune-security-apply-halted` (1 000 226: 0 while applying, the halted offset plus 1 after a halt),
 - and logs a critical line `SecurityApplier: apply HALTED at offset N ...`.
 
 The other brokers are not affected, and no topic data is lost. **Runbook** (the catalog's, see
 [CATALOG.md](CATALOG.md#halted)):
 
-1. Find the halted broker from the counter or the critical log line, and note the offset.
+1. Find the halted broker from the metric or the critical log line, and note the offset.
 2. Stop that broker.
 3. Move `dataDir/__security` aside (do not delete it).
 4. Start the broker. It refetches the whole log from a healthy broker and applies it from offset 0.
@@ -366,9 +366,10 @@ Do not use this on a single-node broker: its local `__security` is the only hist
 
 ## Metrics
 
-Aeron counters of the broker's media driver (`dataDir/aeron` unless `RUNE_AERON_DIR` is set):
+Metrics in the broker's metrics file (`RUNE_METRICS_FILE`, default `dataDir/metrics/rune-metrics.dat`; the full table
+is in [operations](../../docs/operations.md#metrics)):
 
-| Counter | Type id | Value |
+| Metric | Type id | Value |
 |---|---|---|
 | `rune-security-apply-halted node=<id>` | 1 000 226 | 0 while applying; after a halt, the halted offset plus 1 |
 | `rune-security-applied-offset node=<id>` | 1 000 227 | the last applied `__security` offset |

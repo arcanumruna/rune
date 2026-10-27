@@ -102,6 +102,7 @@ default, is [../../docs/configuration.md](../../docs/configuration.md). The vari
 | `RUNE_CLIENT_STREAM_ID`         | no       | `1`         | Aeron stream ID for client traffic               |
 | `RUNE_CONSENSUS_STREAM_ID`      | no       | `10`        | Aeron stream ID for consensus traffic            |
 | `RUNE_DATA_DIR`                 | no       | `/var/lib/rune` | Writable data directory (mount a volume here) |
+| `RUNE_METRICS_FILE`             | no       | `$RUNE_DATA_DIR/metrics/rune-metrics.dat` | The broker's metrics file; `docker exec <c> rune_role` reads it (see `docs/operations.md` "Metrics") |
 | `RUNE_STORAGE_FORMAT`           | no       | (unset: never format) | `new` / `join` / `auto`; read **only** when the data dir is empty and not formatted. Unset: an empty dir refuses to start (exit 78) and prints the command to run. `auto` is development only. See `docs/SELF-HOSTING.md` "Formatting the data directory" |
 | `RUNE_STORAGE_RECOVERY_VOTE`    | no       | `0`         | Unsafe, disaster recovery only (see `docs/SELF-HOSTING.md`) |
 | `RUNE_ELECTION_TIMEOUT_MS`      | no       | `150`       | Maximum wait per election round, in ms           |

@@ -2088,6 +2088,8 @@ if(BUILD_TESTING)
     # ARCANUM_METRICS_DIR configure check (a bad checkout fails with a clear message).
     add_executable(rune_broker_metrics_tests tests/BrokerMetricsRegressionTest.cpp)
     target_link_libraries(rune_broker_metrics_tests PRIVATE rune_node GTest::gtest_main)
+    # Task 13: OperationsDocTableMatchesRegression reads docs/operations.md from the source tree.
+    target_compile_definitions(rune_broker_metrics_tests PRIVATE RUNE_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../../..")
     # Task 8: the node-level metrics regressions start in-process BrokerNodes (embedded driver).
     if(aeron_FOUND)
         target_include_directories(rune_broker_metrics_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)

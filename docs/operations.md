@@ -62,7 +62,8 @@ Never delete or copy `storage.meta` on its own. Details, refusal table and the m
 ## Health and failure
 
 - **Leadership.** Each broker logs `rune-broker: node N is LEADER term T` and every change (`leadership change`).
-  `rune_role` prints the machine-readable form from the Aeron counters, independent of the log level:
+  `rune_role` prints the machine-readable form from the broker's metrics file (see [Metrics](#metrics)), independent of
+  the log level:
   `docker exec <container> rune_role` prints `ROLE nodeId=... role=LEADER|FOLLOWER|CANDIDATE|NONE term=...` and a `STORAGE`
   line (`state=CONFIRMED|UNCONFIRMED|...`).
 - **Shutdown.** `SIGTERM` or `SIGINT` stops cleanly. With `RUNE_CONTROLLED_SHUTDOWN_MS` (default 5000) the node first hands
@@ -83,39 +84,69 @@ Never delete or copy `storage.meta` on its own. Details, refusal table and the m
 
 ## Metrics
 
-Metrics are Aeron counters in the broker's media driver (`<data dir>/aeron/cnc.dat`, or `RUNE_AERON_DIR`). Read them with
-Aeron's counter tools or `rune_role`. Labels end with `node=<id>`.
+The broker writes its metrics to one memory-mapped file in the [arcanum-metrics](https://github.com/arcanumruna/arcanum-metrics)
+format: `RUNE_METRICS_FILE`, default `${RUNE_DATA_DIR}/metrics/rune-metrics.dat`. Every metric is allocated once at
+startup, before any agent thread runs, and each has exactly one writer thread. The file is created afresh on every start
+(directory `0750`, file `0640`); a broker that cannot create it does not start.
+Read it with `rune_role` or any arcanum-metrics reader. The Aeron driver's own `cnc.dat` (`<data dir>/aeron/`, or
+`RUNE_AERON_DIR`) now holds only the driver's counters; no Rune metric lives there.
 
-| Counter | Type id | Meaning |
-|---|---|---|
-| `rune-cluster-node-role` | 1 000 201 | This node's consensus role. |
-| `rune-cluster-leadership-term` | 1 000 203 | Current leadership term. |
-| `rune-msm-commit-position` | 1 000 204 | Metadata state machine commit position. |
-| `rune-txn-stuck-markers` | 1 000 210 | Transaction markers that have not landed. |
-| `rune-node-out-of-sync-partitions` | 1 000 211 | Partitions of this node that are out of sync. |
-| `rune-segment-provision-*` | 1 000 212 to 216 | Segment pre-creation: build failures, roll holds, un-preallocated rolls, parked drops, read-map failures. |
-| `rune-catalog-apply-halted` | 1 000 217 | `0` while applying; non-zero after a catalog apply halt. Alert on it. |
-| `rune-catalog-applied-offset` | 1 000 218 | Last applied `__catalog` offset. |
-| `rune-catalog-unplaceable-topics` | 1 000 219 | Topics never placed for want of brokers. |
-| `rune-catalog-blocked-partitions` | 1 000 220 | Partitions blocked until a broker serves again. |
-| link MTU deficit | 1 000 221 | A peer link whose path MTU is below the configured MTU. |
-| `rune-storage-gate-state` | 1 000 222 | Storage gate state of this node. |
-| `rune-leader-roles-held` | 1 000 223 | Leader roles this node holds. |
-| `rune-storage-pending-nodes` | 1 000 224 | Nodes whose new storage is not yet confirmed. |
-| `rune-lost-committed-reports` | 1 000 225 | Reports of lost committed data. |
-| `rune-security-apply-halted` | 1 000 226 | `0` while applying; the halted offset plus 1 after a halt. Alert on it. |
-| `rune-security-applied-offset` | 1 000 227 | Last applied `__security` offset. |
-| `rune-auth-mode` | 1 000 228 | `0` authentication enabled, `1` dev mode. Alert on `1` in production. |
-| `rune-logins-ok` / `-failed` / `-rate-limited` | 1 000 229 to 231 | Login tallies. Alert on rising failures. |
-| `rune-sessions-revoked` | 1 000 232 | Sessions ended by drop, disable or `TERMINATE SESSIONS`. |
-| `rune-peer-links-established` | 1 000 233 | Peers whose link is currently established. |
-| `rune-peer-link-refusals` | 1 000 234 | Peer-link refusals logged by this broker. Alert on a rising count. |
-| `rune-peer-frame-drops` | 1 000 235 | Inter-broker frames dropped for want of a link or because they did not open. |
-| `rune-txn-offset-commits-stuck` | 1 000 240 | Transaction commits waiting because the group coordinator refuses their consumer-group offsets. Alert on a non-zero value that persists. |
-| `rune-txn-offset-stuck-age-ms` | 1 000 241 | Age of the oldest of those, in ms. A WARN names it every 30 s while any is stuck. |
+Every node metric is keyed by the 4-byte little-endian node id, and its label is `<label> node=<id>`. Each slot holds the
+current value only. Counters only go up and gauges are a current level. Readers compute rates and windows themselves by
+sampling the file; the broker keeps no history.
 
-Type ids are defined in `broker/libs/node/include/rune/node/RoleCounter.h`. Logins are metrics and structured logs, not
-`__security` events.
+### Node metrics
+
+| Type id | Label | Kind | Owner | Meaning |
+|---|---|---|---|---|
+| 1000201 | `rune-cluster-node-role` | gauge | observer | This node's consensus role. |
+| 1000203 | `rune-cluster-leadership-term` | gauge | observer | The leadership term this node sees (`-1` none). |
+| 1000210 | `rune-txn-stuck-markers` | gauge | control | Transaction markers that have not landed and are still retrying. |
+| 1000211 | `rune-node-out-of-sync-partitions` | gauge | observer | Partitions of this node that are out of the committed ISR (`-1` unknown). |
+| 1000212 | `rune-segment-provision-build-failures` | counter | provisioner | Segment pre-creation builds that failed. |
+| 1000213 | `rune-segment-provision-roll-holds` | counter | provisioner | Segment rolls held for a segment not ready yet. |
+| 1000214 | `rune-segment-provision-unpreallocated-builds` | counter | provisioner | Segments built without preallocation. |
+| 1000215 | `rune-segment-provision-parked-demands-dropped` | counter | provisioner | Parked segment demands dropped. |
+| 1000216 | `rune-segment-provision-read-map-failures` | counter | provisioner | Segment read maps that failed. |
+| 1000217 | `rune-catalog-apply-halted` | gauge | control | `0` while applying; the halted offset plus 1 after a catalog apply halt. Alert on it. |
+| 1000218 | `rune-catalog-applied-offset` | gauge | control | Last applied `__catalog` offset (`-1` none). |
+| 1000219 | `rune-catalog-unplaceable-topics` | gauge | control | Topics never placed for want of brokers. |
+| 1000220 | `rune-catalog-blocked-partitions` | gauge | control | Partitions blocked until a broker serves again. |
+| 1000221 | `rune_link_mtu_deficit` | gauge | control | A peer link whose path MTU is below the configured MTU. |
+| 1000222 | `rune-storage-gate-state` | gauge | control | Storage gate state: `0` CONFIRMED, `1` UNCONFIRMED, `2` UNDECIDED. |
+| 1000223 | `rune-leader-roles-held` | counter | control | Leader roles this node has taken. |
+| 1000224 | `rune-storage-pending-nodes` | gauge | control | Nodes whose new storage is not yet confirmed. |
+| 1000225 | `rune-lost-committed-reports` | counter | control | Reports of lost committed data. |
+| 1000226 | `rune-security-apply-halted` | gauge | control | `0` while applying; the halted offset plus 1 after a halt. Alert on it. |
+| 1000227 | `rune-security-applied-offset` | gauge | control | Last applied `__security` offset (`-1` none). |
+| 1000228 | `rune-auth-mode` | gauge | control | `0` authentication enabled, `1` dev mode. Alert on `1` in production. |
+| 1000229 | `rune-logins-ok` | counter | control | Successful logins. |
+| 1000230 | `rune-logins-failed` | counter | control | Failed logins. Alert on a rising rate. |
+| 1000231 | `rune-logins-rate-limited` | counter | control | Logins answered inside a throttle delay. |
+| 1000232 | `rune-sessions-revoked` | counter | control | Sessions ended by drop, disable or `TERMINATE SESSIONS`. |
+| 1000233 | `rune-peer-links-established` | gauge | control | Peers whose link is currently established. |
+| 1000234 | `rune-peer-link-refusals` | counter | control | Peer-link refusals logged by this broker. Alert on a rising rate. |
+| 1000235 | `rune-peer-frame-drops` | counter | control | Inter-broker frames dropped for want of a link or because they did not open. |
+| 1000240 | `rune-txn-offset-commits-stuck` | gauge | control | Transaction commits waiting because the group coordinator refuses their consumer-group offsets. Alert on a non-zero value that persists. |
+| 1000241 | `rune-txn-offset-stuck-age-ms` | gauge | control | Age of the oldest of those, in ms. A WARN names it every 30 s while any is stuck. |
+
+The owner is the one thread that writes the metric: `control` the broker's control agent, `observer` the role and ISR
+observer, `provisioner` the segment provisioner. Type id 1000204 (a metadata commit position that was never published) has no row, and
+1000236 to 1000239 are reserved. The table is `kRuneMetrics` in `broker/libs/node/include/rune/node/RuneMetrics.h`; a
+regression test (`BrokerMetricsRegression.OperationsDocTableMatchesRegression`) keeps this table equal to it. Logins are
+metrics and structured logs, not `__security` events.
+
+### Process metrics
+
+The control agent samples `/proc/self` every `RUNE_METRICS_SYSTEM_INTERVAL_MS` (default 1000) and writes:
+
+| Type id | Label | Kind | Meaning |
+|---|---|---|---|
+| 1000301 | `process_open_fds` | gauge | Open file descriptors. |
+| 1000302 | `process_threads` | gauge | Threads in the broker process. |
+| 1000303 | `process_resident_memory_bytes` | gauge | Resident set size, in bytes. |
+| 1000304 | `process_virtual_memory_bytes` | gauge | Virtual memory size, in bytes. |
+| 1000305 | `process_metrics_read_errors_total` | counter | `/proc` reads that failed; the other values keep their last sample. |
 
 ## The cluster key
 

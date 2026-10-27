@@ -144,10 +144,10 @@ brokers are not affected, and a halted broker is not chosen to hold new topic re
 this broker's copy or its software disagrees with the log; it never means data in the topics was
 lost.
 
-**The metrics.** Two Aeron counters of the broker's media driver (in `dataDir/aeron` unless
-`RUNE_AERON_DIR` is set):
+**The metrics.** Two metrics in the broker's metrics file (`RUNE_METRICS_FILE`, default
+`dataDir/metrics/rune-metrics.dat`; the full table is in [operations](../../docs/operations.md#metrics)):
 
-| Counter | Type id | Value |
+| Metric | Type id | Value |
 |---|---|---|
 | `rune-catalog-apply-halted node=<id>` | 1 000 217 | 0 while applying. After a halt: the halted offset plus 1. |
 | `rune-catalog-applied-offset node=<id>` | 1 000 218 | The last applied offset. |
@@ -156,7 +156,7 @@ Alert on the first being non-zero.
 
 **What to do.**
 
-1. Find the halted broker from the counter or the critical log line, and note the offset.
+1. Find the halted broker from the metric or the critical log line, and note the offset.
 2. Stop that broker.
 3. Move `dataDir/__catalog` aside (do not delete it). It holds the log and the `applied` file.
 4. Start the broker. It has no local catalog, so it fetches the whole log from the catalog leader and
