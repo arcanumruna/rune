@@ -382,6 +382,59 @@ TEST(ProducerClaim, CommitOffTheOwnerThreadOfACarriedQueueStaysOpen) {
     EXPECT_EQ(cq.outstanding(), 1u);
 }
 
+// #322: a credit claim aborted off its queue's owner thread cannot return the credit (owner-thread state): the
+// ring record is published as kMsgClaimCreditLost, the duty side counts it and completes nothing.
+TEST(ProducerClaimRegression, OffThreadAbortOfACreditClaimIsCountedRegression) {
+    CqRig r;
+    rc::Completions cq(*r.client, smallCq());
+    FrameCapture cap;
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4, cq, 1);
+    ASSERT_TRUE(c);
+    std::thread t([&] { rc::Claim dead(std::move(c)); });  // destroyed (aborted) off the owner thread
+    t.join();
+    pump(*r.impl, cap.fn());
+    EXPECT_EQ(r.impl->claimCreditLost(), 1u);
+    int completions = 0;
+    cq.poll([&](const rc::Completion&, std::span<const uint8_t>) { ++completions; });
+    EXPECT_EQ(completions, 0) << "nothing completes for a lost credit";
+    EXPECT_TRUE(cap.values().empty());
+    rc::Claim next = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4, cq, 2);
+    EXPECT_TRUE(next) << static_cast<int>(next.result());
+}
+
+TEST(ProducerClaimRegression, OffThreadAbortOfACreditBatchClaimIsCountedRegression) {
+    CqRig r;
+    rc::Completions bq(*r.client, smallCq());
+    r.p.batchAcksTo(bq);
+    FrameCapture cap;
+    rc::BatchClaim b = r.p.claimBatch(kTopic, Key(uint64_t{1}), 3, 4);
+    ASSERT_TRUE(b);
+    std::thread t([&] { rc::BatchClaim dead(std::move(b)); });
+    t.join();
+    pump(*r.impl, cap.fn());
+    EXPECT_EQ(r.impl->claimCreditLost(), 1u);
+    int acks = 0;
+    bq.poll([&](const rc::Completion&, std::span<const uint8_t>) { ++acks; });
+    EXPECT_EQ(acks, 0) << "no BatchAck for the 3 records";
+    EXPECT_TRUE(cap.values().empty());
+    rc::BatchClaim next = r.p.claimBatch(kTopic, Key(uint64_t{1}), 2, 4);
+    EXPECT_TRUE(next) << static_cast<int>(next.result());
+}
+
+// The discarding duty side (closeImmediately) counts it too.
+TEST(ProducerClaimRegression, OffThreadAbortOfACreditClaimInADiscardingProducerRegression) {
+    CqRig r;
+    rc::Completions cq(*r.client, smallCq());
+    FrameCapture cap;
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4, cq, 1);
+    ASSERT_TRUE(c);
+    std::thread t([&] { rc::Claim dead(std::move(c)); });
+    t.join();
+    ASSERT_EQ(r.p.closeImmediately(), rc::OpResult::Accepted);
+    pump(*r.impl, cap.fn());
+    EXPECT_EQ(r.impl->claimCreditLost(), 1u);
+}
+
 TEST(ProducerClaimAllocRegression, RingClaimSteadyStateAllocatesNothingRegression) {
     auto* impl = new ProducerImpl(voidCfg(), 1 << 20);
     Producer p(impl);
@@ -1001,6 +1054,56 @@ TEST(ProducerClaimRegression, RouteFailureAbandonKeepsTheHeldClaimOutOfTheRetrie
     ASSERT_EQ(cap.corrs.size(), 1u);
     r.impl->onProduceResponse(cap.corrs[0], 100, 0);
     EXPECT_EQ(h.ok, (std::vector<rc::Token>{3, 4}));
+}
+
+// #325: the abandoned span must stay inside the quarantine vector's live size (ASan container-overflow
+// otherwise), however the caller writes it.
+TEST(ProducerClaimRegression, WritingAnAbandonedSpanStaysInsideTheQuarantineVectorRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    RetryOnFailure h;  // outlives the rig: ~Producer fails what is pending through onAck
+    DirectRig r(cfg);
+    h.p = &r.p;
+    r.p.onAck(&RetryOnFailure::onAck, &h);
+    FrameCapture cap;
+    r.pass(cap.fn());  // the duty clock
+    ASSERT_EQ(h.send("A"), SendResult::Ok);
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 64);
+    ASSERT_TRUE(c);
+
+    r.impl->failRoutedBroker(&failEveryRoute, nullptr);
+    ASSERT_EQ(r.impl->claimsAbandoned(), 1u);
+    ASSERT_EQ(c.buffer().size(), 64u);
+    EXPECT_TRUE(r.impl->claimQuarantineCovers(c.buffer().data(), c.buffer().size()))
+        << "the quarantined vector must cover the whole claimed span";
+    std::memset(c.buffer().data(), 0xAB, c.buffer().size());
+
+    r.pass(cap.fn());
+    EXPECT_FALSE(anyByteIs(cap.values(), static_cast<char>(0xAB))) << "the span never reaches a frame";
+    EXPECT_FALSE(c.commit());
+}
+
+// #325: the close path keeps the records before the claim and quarantines the whole span.
+TEST(ProducerClaimRegression, CloseAbandonKeepsTheRecordsBeforeTheClaimAndQuarantinesTheWholeSpanRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    DirectRig r(cfg);
+    FrameCapture cap;
+    r.pass(cap.fn());
+    ASSERT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("A")), SendResult::Ok);
+    ASSERT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("B")), SendResult::Ok);
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 64);
+    ASSERT_TRUE(c);
+
+    r.impl->abandonOpenClaimForClose();  // what Producer::close does once the close is issued
+    ASSERT_EQ(r.impl->claimsAbandoned(), 1u);
+    EXPECT_TRUE(r.impl->claimQuarantineCovers(c.buffer().data(), c.buffer().size()));
+    std::memset(c.buffer().data(), 0xAB, c.buffer().size());
+
+    r.pass(cap.fn());  // the drain
+    EXPECT_EQ(cap.values(), (std::vector<std::string>{"A", "B"})) << "the records before the claim are delivered";
+    EXPECT_FALSE(anyByteIs(cap.values(), static_cast<char>(0xAB))) << "the claim's bytes never reach the wire";
+    EXPECT_FALSE(c.commit());
 }
 
 TEST(ProducerClaimRegression, DeliverySweepAbandonKeepsTheHeldBatchClaimOutOfTheRetriedFrameRegression) {

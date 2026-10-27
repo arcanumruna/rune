@@ -264,6 +264,62 @@ TEST(ClaimClientRegression, GracefulCloseWithAnInvokerClaimHeldAbandonsItPromptl
     EXPECT_TRUE(valuesOf(r.gw, 0).empty()) << "nothing was sent";
 }
 
+// #323 (test only): Thread-mode close() on the thread that holds a ring claim.  The held claim blocks the duty side's
+// drain, so the close recovers through the delivery timeout (200 ms here, not the 30 s default), commit() is
+// false afterwards and the queue's credit is back.
+TEST(ClaimClientRegression, ThreadModeCloseWithAHeldRingClaimRecoversWithinTheDeliveryTimeoutRegression) {
+    Rig r(cfgFor(rc::RunnerMode::Thread, 5862, 5863));
+    r.connect();
+    rc::ProducerConfig pc;
+    pc.acks              = rc::Acks::Leader;
+    pc.lingerUs          = 0;
+    pc.deliveryTimeoutMs = 200;
+    auto p = r.client->producer(pc);
+    rc::Completions cq(*r.client);
+    const auto topic = r.client->topic("t");
+    const rc::Key key(uint64_t{3});
+    rc::Claim c = p.tryClaim(topic, key, 32, cq, 1);
+    ASSERT_TRUE(c);
+    fill(c.buffer(), "HELD");
+
+    const auto t0 = std::chrono::steady_clock::now();
+    r.client->close();
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    EXPECT_LT(elapsed, std::chrono::seconds(10)) << "recovers through the 200 ms delivery timeout, not 30 s";
+    EXPECT_FALSE(c.commit());
+    EXPECT_EQ(cq.outstanding(), 0u) << "the credit is back";
+}
+
+// #322 (sibling): an Invoker claim settled off the owner thread never touches owner state.  commit() is refused
+// (the claim stays open), the abort is logged and leaves the claim held, sends see ClaimHeld, and the producer's
+// close abandons it.
+TEST(ClaimClientRegression, DirectClaimSettledOffTheOwnerThreadNeverTouchesOwnerStateRegression) {
+    Rig r(cfgFor(rc::RunnerMode::Invoker, 5860, 5861));
+    r.connect();
+    rc::ProducerConfig pc;
+    pc.acks     = rc::Acks::None;
+    pc.lingerUs = 0;
+    auto p = r.client->producer(pc);
+    const auto topic = r.client->topic("t");
+    const rc::Key key(uint64_t{3});
+    rc::Claim c = p.tryClaim(topic, key, 4);
+    ASSERT_TRUE(c);
+    fill(c.buffer(), "abcd");
+    bool committed = true;
+    bool openAfter = false;
+    std::thread t([&] {
+        committed = c.commit();
+        openAfter = !c.buffer().empty();
+        rc::Claim dead(std::move(c));  // destroyed here: an abort off the owner thread
+    });
+    t.join();
+    EXPECT_FALSE(committed);
+    EXPECT_TRUE(openAfter) << "the refused commit left the claim open";
+    EXPECT_EQ(p.trySend(topic, key, bytes("x")), SendResult::ClaimHeld) << "the off-thread abort did not release it";
+    EXPECT_EQ(p.close(), rc::OpStatus::Ok) << "the close abandons the held claim";
+    r.client->close();
+}
+
 // An abandoned (destroyed uncommitted) BatchClaim returns n credit units and
 // the next send succeeds.
 TEST(ClaimClient, AbandonedBatchClaimReturnsItsCreditAndTheNextSendSucceeds) {

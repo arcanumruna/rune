@@ -73,12 +73,12 @@ BatchBuilder& BatchBuilder::operator=(BatchBuilder&& o) noexcept {
 BatchBuilder::~BatchBuilder() { releaseSlot_(); }
 
 void BatchBuilder::releaseSlot_() noexcept {
-    if ((state_ == State::Open || state_ == State::Built) && impl_ != nullptr && !impl_->handleDetached() &&
-        impl_->onBatchThread()) {  // off the batch thread the pool is not ours to touch (the slot is lost)
+    if ((state_ == State::Open || state_ == State::Built) && impl_ != nullptr && !impl_->handleDetached()) {
         // Drop the records (the next user of the slot starts empty) and hand it back.
         producer::Tier2Slot& t = impl_->tier2Slot(slot_);
         t.builder.reset(0, 0);
-        impl_->tier2Release(slot_);
+        if (impl_->onBatchThread()) impl_->tier2Release(slot_);
+        else impl_->tier2DiscardOffThread(slot_);  // #341: through the producer ring
     }
     state_ = State::Sent;
 }

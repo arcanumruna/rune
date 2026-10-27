@@ -82,7 +82,9 @@ alloc-free handoff). The agent drains, accumulates records into per-
   `baseSequence` into the batch header.
 - Tier-2 `batch()` is single-thread per producer (the creating thread, or `Producer::bindBatchThread()`): the
   preallocated slot pool's app side is owned by that thread; off-thread `batch()` returns a refused builder
-  (`send()` = WrongThread) and never touches the pool. Plain send/trySend/tryClaim/claimBatch stay any-thread.
+  (`send()` = WrongThread) and never touches the pool. Thread mode: a builder destroyed elsewhere hands its slot
+  back through the producer ring; Direct (Invoker) mode loses the slot and logs an error.
+  Plain send/trySend/tryClaim/claimBatch stay any-thread.
 - Phase 2b zero-copy produce: `Producer::tryClaim(topic, key, len)` -> `Claim`
   (`buffer()` / `commit()` / `abort()`, RAII; refused = false + `result()`),
   `claimBatch(topic, key, n, recLen)` -> `BatchClaim` (`record(i)`),

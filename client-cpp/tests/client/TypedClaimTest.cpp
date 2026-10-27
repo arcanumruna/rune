@@ -233,6 +233,25 @@ TEST(TypedClaimRegression, OverlongStringKeyThrowsAndClaimsNothingRegression) {
     EXPECT_EQ(back.v, 5);
 }
 
+// #330: for N > Key::kMaxInline the field is zero-padded, so "abc" and "abc\0" write the same field and must
+// carry the same record key and route the same.
+TEST(TypedClaimRegression, TrailingNulKeyRoutesLikeTheUnpaddedKeyRegression) {
+    auto* impl = new ProducerImpl(voidCfg(), 1 << 20);
+    TypedTopic<LongKey> topic{Producer{impl}, TopicHandle{1, 8}, uint16_t{1}};
+    for (const std::string_view k : {std::string_view("abc"), std::string_view("abc\0", 4)}) {
+        auto w = topic.claim(k);
+        ASSERT_TRUE(w);
+        w.v(7);
+        ASSERT_TRUE(w.commit());
+    }
+    FrameCapture cap;
+    pump(*impl, cap.fn());
+    ASSERT_EQ(cap.recs.size(), 2u);
+    EXPECT_EQ(cap.recs[0].key, "abc");
+    EXPECT_EQ(cap.recs[1].key, cap.recs[0].key) << "trailing NULs are not part of the record key";
+    EXPECT_EQ(cap.recs[1].partition, cap.recs[0].partition);
+}
+
 // string(N <= 16) key: claim(std::string_view) must equal send(rec) byte for byte.
 TEST(TypedClaim, StringKeyClaimMatchesSendForShortKeys) {
     auto* impl = new ProducerImpl(voidCfg(), 1 << 20);

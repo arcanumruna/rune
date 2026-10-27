@@ -284,8 +284,9 @@ public:
 
     /// string(N) key field.  For N <= Key::kMaxInline the record key is the N
     /// zero-padded field bytes, exactly what send(rec) routes with.  For
-    /// N > Key::kMaxInline (send cannot route such a field) the record key is
-    /// the given bytes; more bytes than the field holds (N <= Key::kMaxInline) or
+    /// N > Key::kMaxInline (send cannot route such a field) the record key is the given bytes without
+    /// trailing NULs (the field is zero-padded, so "abc" and "abc\0" write the same field and route the
+    /// same); more bytes than the field holds (N <= Key::kMaxInline) or
     /// than Key::kMaxInline (larger N) throws
     /// std::invalid_argument BEFORE anything is claimed (never truncated).
     template <class U = T>
@@ -305,7 +306,11 @@ public:
         const std::size_t fieldBytes = keyValue.size() < N ? keyValue.size() : N;
         std::memcpy(field.data(), keyValue.data(), fieldBytes);
         std::array<uint8_t, Key::kMaxInline> kb{};
-        const std::size_t keyLen = N <= Key::kMaxInline ? N : keyValue.size();
+        std::size_t keyLen = N;
+        if constexpr (N > Key::kMaxInline) {
+            keyLen = keyValue.size();
+            while (keyLen > 0 && keyValue[keyLen - 1] == '\0') --keyLen;  // #330: "abc" and "abc\0" are one key
+        }
         std::memcpy(kb.data(), keyValue.data(), keyValue.size() < keyLen ? keyValue.size() : keyLen);
         return TypedClaim<E>(
             detail::ClaimInPlace{},

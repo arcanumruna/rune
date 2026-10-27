@@ -393,3 +393,61 @@ TEST(ProducerTier2PoolRegression, OffThreadBatchIsWrongThreadAndPoolUntouchedReg
     impl.bindBatchThread();
     EXPECT_EQ(sendBatch(impl, 5), OpResult::Accepted);
 }
+
+// ---------------------------------------------------------------------------
+// #341 / #342: a builder that dies off the batch thread hands its slot back through the producer ring.
+// ---------------------------------------------------------------------------
+namespace {
+// Destroy `bb` on another thread.
+void destroyOffThread(BatchBuilder&& bb) {
+    std::thread t([p = std::make_unique<BatchBuilder>(std::move(bb))]() mutable { p.reset(); });
+    t.join();
+}
+// Drive the duty side until the batch thread sees `want` free slots; bounded, fails on the cap.
+bool driveUntilFree(ProducerImpl& impl, std::size_t want) {
+    for (int i = 0; i < 1000; ++i) {
+        if (impl.tier2FreeCount() == want) return true;
+        impl.drainRing(kNow, 16);
+    }
+    return impl.tier2FreeCount() == want;
+}
+}  // namespace
+
+TEST(Tier2SlotRegression, BuilderDestroyedOffTheBatchThreadReturnsItsSlotRegression) {
+    constexpr int32_t kSlots = 4;
+    ProducerImpl impl(cfgOf(Acks::None, kSlots));
+    Cap cap; const auto sink = cap.fn();
+    const std::size_t free0 = impl.tier2FreeCount();
+    ASSERT_EQ(free0, static_cast<std::size_t>(kSlots));
+    for (int round = 0; round < 2 * kSlots; ++round) {
+        SCOPED_TRACE(round);
+        BatchBuilder b(&impl, 1, 0);
+        b.add(kVal);
+        ASSERT_EQ(impl.tier2FreeCount(), free0 - 1) << "the builder holds a slot";
+        destroyOffThread(std::move(b));
+        ASSERT_TRUE(driveUntilFree(impl, free0)) << "the slot never came back";
+    }
+    EXPECT_EQ(sendBatch(impl, 1), OpResult::Accepted) << "no slot was lost";
+    pump(impl, sink);
+}
+
+TEST(Tier2SlotRegression, OffThreadDiscardInADiscardingProducerStillReturnsTheSlotRegression) {
+    constexpr int32_t kSlots = 4;
+    ProducerImpl impl(cfgOf(Acks::None, kSlots));
+    const std::size_t free0 = impl.tier2FreeCount();
+    BatchBuilder b(&impl, 1, 0);
+    b.add(kVal);
+    ASSERT_EQ(impl.tier2FreeCount(), free0 - 1);
+    destroyOffThread(std::move(b));
+    ASSERT_EQ(impl.closeImmediately(), OpResult::Accepted);  // discardRing_ reads the message
+    ASSERT_TRUE(driveUntilFree(impl, free0)) << "the slot never came back";
+}
+
+TEST(Tier2SlotRegression, FreeCountOffTheBatchThreadReadsNothingRegression) {
+    ProducerImpl impl(cfgOf(Acks::None, 4));
+    std::size_t off = 99;
+    std::thread t([&] { off = impl.tier2FreeCount(); });
+    t.join();
+    EXPECT_EQ(off, 0u) << "off the batch thread the free ring is not ours to consume";
+    EXPECT_EQ(impl.tier2FreeCount(), 4u);
+}

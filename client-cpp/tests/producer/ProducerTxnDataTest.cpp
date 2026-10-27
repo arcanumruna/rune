@@ -1053,6 +1053,25 @@ TEST(ProducerTxnDataRegression, RefusalPassStopsAtAMessageItDoesNotOwnRegression
     }
 }
 
+// #322: an off-owner credit abort in the ring of a transactional producer is OWNED by the refusal pass (counted,
+// never left blocking the ring, never counted as a foreign message).
+TEST(ProducerClaimRegression, OffThreadCreditLostMessageIsSkippedByTheTxnRefusalPassRegression) {
+    const std::array<uint8_t, 4> payload{1, 2, 3, 4};
+    Rig r;
+    r.initOk();
+    r.begin();
+    r.impl->testPoison(OpStatus::BrokerError, uec(rpc::ErrorCode::NotAuthorized), rp::AbortKind::Plain);
+    ASSERT_TRUE(r.impl->testWriteRing(rp::kMsgClaimCreditLost, payload));
+    ASSERT_TRUE(r.impl->testWriteRing(rp::kMsgTier2Discard, payload));  // short token: skipped, never blocks
+    for (int i = 0; i < 8 && r.impl->testRingHead() < r.impl->testRingTail(); ++i) r.impl->drainRing(r.now, 16);
+    EXPECT_EQ(r.impl->testRingHead(), r.impl->testRingTail()) << "the ring did not drain";
+    EXPECT_EQ(r.impl->claimCreditLost(), 1u);
+    EXPECT_EQ(r.impl->ringForeignMessages(), 0u);
+    Op abort = r.abort();
+    r.tick();
+    ASSERT_TRUE(abort.ready());
+}
+
 // FD5: more new partitions than one 4096-byte AddPartitionsToTxn holds are split across request slots, in the same
 // pass, each partition named once; every partition's data goes out once all are OK.
 TEST(ProducerTxnData, AddPartitionsSplitAcrossSlotsWhenOneFrameIsFull) {
@@ -1304,13 +1323,13 @@ TEST(ProducerTxnDataRegression, NotLeaderParksUntilMetadataThenReoffersSameIdent
         // Changed: the record held while parked leaves in the same pass, BEHIND the re-offered batches (in
         // sequence order); it used to wait for the acks.  Nothing new ever leaves before the re-offers.
         ASSERT_GE(r.wire.size(), before + cur.size()) << "the batches were not re-offered";
-        const std::size_t reoffered = cur.size();
+        const std::vector<WireBatch> prev = cur;  // the previous offer
         cur.assign(r.wire.begin() + static_cast<std::ptrdiff_t>(before), r.wire.end());
         for (std::size_t i = 0; i < cur.size(); ++i) {
             EXPECT_EQ(cur[i].pid, 77);
             EXPECT_EQ(cur[i].epoch, 3);
             EXPECT_EQ(cur[i].baseSeq, static_cast<int32_t>(i)) << "same identity, in order";
-            if (i < reoffered) EXPECT_NE(cur[i].corrId, first[i].corrId) << "a new attempt";
+            if (i < std::min(prev.size(), cur.size())) EXPECT_NE(cur[i].corrId, prev[i].corrId) << "a new attempt";
         }
         ASSERT_LE(cur.size(), 3u);
     }

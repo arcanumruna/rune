@@ -265,11 +265,15 @@ public:
 
     /// Discard a message previously reserved with tryClaim() (becomes padding).
     void abort(aeron::util::index_t index) {
+        abortAs(index, aeron::concurrent::ringbuffer::RecordDescriptor::PADDING_MSG_TYPE_ID);
+    }
+    /// abort() that publishes the claimed record with msgTypeId instead of padding (#322: the consumer must see
+    /// it).  The payload the claimer wrote stays as it is.
+    void abortAs(aeron::util::index_t index, std::int32_t msgTypeId) {
         namespace RD = aeron::concurrent::ringbuffer;
         const aeron::util::index_t recordIndex = computeRecordIndex(index);
         const std::int32_t recordLength = verifyClaimedSpaceNotReleased(recordIndex);
-        m_buffer.putInt32(RD::RecordDescriptor::typeOffset(recordIndex),
-                          RD::RecordDescriptor::PADDING_MSG_TYPE_ID);
+        m_buffer.putInt32(RD::RecordDescriptor::typeOffset(recordIndex), msgTypeId);
         storeRelease32_(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
     }
 

@@ -666,8 +666,12 @@ void ProducerImpl::tier2Collect_() noexcept {
     // that only consumed end-of-buffer padding returns 0 having advanced: ask again once.
     for (int zeros = 0; zeros < 2;) {
         const int n = tier2Free_.read(
-            [this](int32_t, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+            [this](int32_t type, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
                    aeron::util::index_t) {
+                if (type == 2) {  // #341: its builder died off this thread; it never released it
+                    assert(t2Held_ > 0);
+                    --t2Held_;
+                }
                 tier2AppFree_[tier2AppFreeN_++] = static_cast<uint32_t>(buf.getInt32(off));
             },
             INT_MAX);
@@ -683,16 +687,39 @@ uint32_t ProducerImpl::tier2Acquire() noexcept {
 }
 
 std::size_t ProducerImpl::tier2FreeCount() noexcept {
+    // BATCH-ISSUING THREAD ONLY: collecting consumes the free ring.
+    if (!onBatchThread()) return 0;
     tier2Collect_();
     return tier2AppFreeN_;
 }
 
-void ProducerImpl::t2Return_(uint32_t slot) noexcept {
+void ProducerImpl::t2Return_(uint32_t slot, int32_t type) noexcept {
     [[maybe_unused]] const bool ok =
-        tier2Free_.writeWith(1, 4, [slot](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t at) {
+        tier2Free_.writeWith(type, 4, [slot](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t at) {
             b.putInt32(at, static_cast<int32_t>(slot));
         });
     assert(ok && "Tier-2 free ring is sized for every slot: a return cannot fail");
+}
+
+void ProducerImpl::tier2DiscardOffThread(uint32_t slot) noexcept {
+    // #341: called off the batch thread by a dying BatchBuilder.  Thread mode hands the slot to the duty side
+    // through the producer ring (the only cross-thread path).  Direct mode never drains its ring, and a full or
+    // closed ring has no room: the slot is lost, and that is logged.
+    uint8_t tok[kT2TokenSize];
+    writeLE64(tok, 0, static_cast<int64_t>(slot));
+    if (mode_ != IngressMode::Direct && writeToRing(kMsgTier2Discard, tok, kT2TokenSize)) return;
+    std::fprintf(stderr,
+                 "rune producer: a BatchBuilder holding Tier-2 slot %u was destroyed off its batch thread; "
+                 "the slot is lost (destroy builders on the batch thread)\n", slot);
+}
+
+void ProducerImpl::noteClaimCreditLost_() noexcept {
+    if (++claimCreditLost_ % 1024 == 1) {
+        std::fprintf(stderr,
+                     "rune producer: %llu claim(s) aborted off their Completions queue's owner thread; their "
+                     "queue credit is lost (abort claims on the queue's owner thread)\n",
+                     static_cast<unsigned long long>(claimCreditLost_));
+    }
 }
 
 void ProducerImpl::unaccountDeferred_(const DeferredHdr& h) noexcept {
@@ -1487,6 +1514,15 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                     return ControlledAction::ABORT;
                 }
                 appendBatch_(ps, p + kRecKeyBytesOff, keyLen, p + kBatchRecsOff, n, recLen, nowNs);
+                return ControlledAction::CONTINUE;
+            }
+
+            if (msgTypeId == kMsgTier2Discard) {
+                if (len >= kT2TokenSize) t2Return_(static_cast<uint32_t>(readLE64(p, 0)), 2);
+                return ControlledAction::CONTINUE;
+            }
+            if (msgTypeId == kMsgClaimCreditLost) {
+                noteClaimCreditLost_();
                 return ControlledAction::CONTINUE;
             }
 
@@ -2858,10 +2894,11 @@ void ProducerImpl::failBuilder_(PartitionState& ps, OpStatus st, uint16_t errorC
     // review I1: its caller may still write the claimed span, so the builder's
     // storage leaves for the quarantine BEFORE any callback below can queue a
     // retry into the builder - nothing appended or sealed later can cover it.
-    const bool claimed = abandonDirectClaimOn_(ps);
+    const ProduceFrameBuilder::Mark* claimed = abandonDirectClaimOn_(ps);
     if (!ps.builder) return;
-    const int32_t n = ps.builder->recordCount();  // the records before the claim
-    if (claimed) ps.builder->detachStorage(claimQuarantine_);  // swap: no allocation
+    // The records before the claim (the claim itself was never accepted).
+    const int32_t n = claimed != nullptr ? claimed->recordCount : ps.builder->recordCount();
+    if (claimed != nullptr) ps.builder->detachStorage(claimQuarantine_);  // full size: covers the span
     if (n == 0) return;
     emitUnsentBatchAck_(ps.topicId, ps.partition, n, st, static_cast<uint32_t>(n), errorCode);
     if (ps.batchAckCount > 0) {
@@ -3166,6 +3203,10 @@ int ProducerImpl::discardRing_(OpStatus st, int limit, uint16_t errorCode) {
                 t2Return_(slot);
                 emitUnsentBatchAck_(tid, part, rc, st, 1, errorCode);
                 completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, errorCode);
+            } else if (type == kMsgTier2Discard && len >= kT2TokenSize) {
+                t2Return_(static_cast<uint32_t>(readLE64(p, 0)), 2);
+            } else if (type == kMsgClaimCreditLost) {
+                noteClaimCreditLost_();
             } else if (type == kMsgClaimBatch && len >= kBatchHeaderSize) {
                 // Phase 2b B: a committed claimBatch never sent - ONE BatchAck
                 // for its n records (n credit units); claims carry no ack handle.
@@ -3209,7 +3250,8 @@ int ProducerImpl::refuseRingTxn_(int limit) noexcept {
         [&](int32_t type, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
             aeron::util::index_t len) -> ControlledAction {
             const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
-            if (type != kMsgSendRecord && type != kMsgTier2Batch && type != kMsgClaimBatch && type != kMsgFlush) {
+            if (type != kMsgSendRecord && type != kMsgTier2Batch && type != kMsgClaimBatch && type != kMsgFlush &&
+                type != kMsgTier2Discard && type != kMsgClaimCreditLost) {
                 // Not ours (Task 8: kMsgTxnControl - an abort issued in AbortableError arrives HERE): left in the
                 // ring for the normal drain to apply.  Swallowing it would leave its op pending for ever.
                 lastDrainStop_ = DrainStop::Blocked;
@@ -3231,6 +3273,10 @@ int ProducerImpl::refuseRingTxn_(int limit) noexcept {
                 emitBatchAck_(tid, part, -1, rc, -1, BatchAck::kClientFailure, o.status, 1, -1);
                 if (h != 0) completeHandle_(h, OpKind::Tier2Batch, -1, rc, o.status, o.errorCode);
                 else voids += static_cast<uint64_t>(rc);
+            } else if (type == kMsgTier2Discard && len >= kT2TokenSize) {
+                t2Return_(static_cast<uint32_t>(readLE64(p, 0)), 2);  // #341: nothing else to refuse
+            } else if (type == kMsgClaimCreditLost) {
+                noteClaimCreditLost_();  // #322
             } else if (type == kMsgClaimBatch && len >= kBatchHeaderSize) {
                 const int32_t nrec = static_cast<int32_t>(readLE32u(p, kBatchCountOff));
                 emitBatchAck_(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff), -1, nrec, -1,
@@ -3709,6 +3755,19 @@ void ProducerImpl::abortClaim(int64_t token) noexcept {
     }
 }
 
+void ProducerImpl::abortClaimOffOwner(int64_t token) noexcept {
+    if (mode_ == IngressMode::Direct) {
+        std::fprintf(stderr, "rune producer: an Invoker claim was settled off its owner thread; it stays held until "
+                             "the producer closes (settle claims on the owner thread)\n");
+        return;
+    }
+    try {
+        ring_.abortAs(static_cast<aeron::util::index_t>(token), kMsgClaimCreditLost);
+    } catch (...) {
+        // Already released by the close-drain unblock: nothing left to report.
+    }
+}
+
 SendResult ProducerImpl::directClaimGate_(int32_t topicId, int32_t partition) noexcept {
     // Foreign thread decided FIRST, before any owner-thread state is read.
     if (std::this_thread::get_id() != dutyThreadId_) return SendResult::WrongThread;
@@ -3834,13 +3893,14 @@ void ProducerImpl::settleAbandonedClaim_(uint64_t gen) noexcept {
     if (a != nullptr && a->gen == gen) directClaim_ = NoDirectClaim{};
 }
 
-bool ProducerImpl::abandonDirectClaimOn_(PartitionState& ps) noexcept {
+const ProduceFrameBuilder::Mark* ProducerImpl::abandonDirectClaimOn_(PartitionState& ps) noexcept {
     const auto* o = std::get_if<DirectClaimOpen>(&directClaim_);
-    if (o == nullptr || o->slot != ps.slotIndex) return false;
-    ps.builder->rollback(o->mark);
-    directClaim_ = DirectClaimAbandoned{o->gen};
+    if (o == nullptr || o->slot != ps.slotIndex) return nullptr;
+    abandonedMark_ = o->mark;  // o points into directClaim_: read it before the assignment
+    const uint64_t gen = o->gen;
+    directClaim_ = DirectClaimAbandoned{gen};
     ++claimsAbandoned_;
-    return true;
+    return &abandonedMark_;
 }
 
 void ProducerImpl::abandonOpenClaimForClose() noexcept {
@@ -3853,9 +3913,9 @@ void ProducerImpl::abandonOpenClaimForClose() noexcept {
     // fresh storage and the claim's storage (the caller's span) to the
     // quarantine (final review I1: the drain appends deferred records and
     // seals frames while the caller may still write its span).
-    ps.builder->rollback(o->mark);
+    const ProduceFrameBuilder::Mark keep = o->mark;
     try {
-        ps.builder->detachStorageKeepingRecords(claimQuarantine_);
+        ps.builder->detachStorageKeepingRecords(claimQuarantine_, keep);
     } catch (...) {
         // bad_alloc copying them out: fail them instead - failBuilder_ abandons
         // (detaching without a copy), never sending the caller's span.
@@ -3863,7 +3923,7 @@ void ProducerImpl::abandonOpenClaimForClose() noexcept {
         failBuilder_(ps, OpStatus::Closed);
         return;
     }
-    (void)abandonDirectClaimOn_(ps);  // rolls back to the same mark again (no-op)
+    (void)abandonDirectClaimOn_(ps);  // the storage already moved: this only marks the claim abandoned
 }
 
 ProducerImpl::~ProducerImpl() {

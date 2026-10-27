@@ -20,7 +20,8 @@ void giveBack(const ClaimOpen& o) noexcept {
 }  // namespace
 
 bool ClaimCredit::mayCommit(const ClaimOpen& o) noexcept {
-    return (o.cq == nullptr || o.cq->onOwnerThread()) && (o.bq == nullptr || o.bq->onOwnerThread());
+    return o.impl->maySettleClaim() && (o.cq == nullptr || o.cq->onOwnerThread()) &&
+           (o.bq == nullptr || o.bq->onOwnerThread());
 }
 
 bool ClaimCredit::commit(const ClaimOpen& o) noexcept {
@@ -34,8 +35,12 @@ bool ClaimCredit::commit(const ClaimOpen& o) noexcept {
 }
 
 void ClaimCredit::abort(const ClaimOpen& o) noexcept {
-    o.impl->abortClaim(o.token);  // the slot must be released from any thread
-    if (mayCommit(o)) giveBack(o);  // credit is owner-thread state: never touched off it
+    if (mayCommit(o)) {
+        o.impl->abortClaim(o.token);
+        giveBack(o);
+        return;
+    }
+    o.impl->abortClaimOffOwner(o.token);  // #322: flagged, never silent; owner state untouched
 }
 
 }  // namespace detail
