@@ -120,7 +120,10 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # aeron and OpenSSL are built from source: keep them between runs (the dependencies are not sanitized).
-      - uses: actions/cache@v5
+      # Restore and save are separate steps so a failed or cancelled job still saves what it built - a combined
+      # actions/cache step saves only when the whole job succeeds, so every rerun of a red branch rebuilt from zero.
+      - uses: actions/cache/restore@v5
+        id: conan_cache
         with:
           path: ~/.conan2/p
           key: conan-sanitizers-${{ runner.os }}-${{ hashFiles('conanfile.txt', 'client-cpp/conandata.yml') }}-${{ matrix.id }}
@@ -128,7 +131,7 @@ jobs:
             conan-sanitizers-${{ runner.os }}-${{ hashFiles('conanfile.txt', 'client-cpp/conandata.yml') }}-
             conan-sanitizers-${{ runner.os }}-
 
-      - uses: actions/cache@v5
+      - uses: actions/cache/restore@v5
         with:
           path: .ccache
           key: ccache-sanitizers-${{ matrix.id }}-${{ github.sha }}
@@ -139,6 +142,12 @@ jobs:
           conan profile detect --force
           conan install . -of "build-${{ matrix.id }}" -s build_type=Debug --build=missing
           conan install client-cpp -of "build-client-${{ matrix.id }}" -s build_type=Debug --build=missing
+
+      - uses: actions/cache/save@v5
+        if: ${{ always() && steps.conan_cache.outputs.cache-matched-key != format('conan-sanitizers-{0}-{1}-{2}', runner.os, hashFiles('conanfile.txt', 'client-cpp/conandata.yml'), matrix.id) }}
+        with:
+          path: ~/.conan2/p
+          key: conan-sanitizers-${{ runner.os }}-${{ hashFiles('conanfile.txt', 'client-cpp/conandata.yml') }}-${{ matrix.id }}
 
       - name: Configure
         run: |
@@ -169,7 +178,14 @@ jobs:
 
       - name: ccache statistics
         if: always()
-        run: ccache --show-stats || true
+        run: ccache --show-stats --verbose || true
+
+      # Saved right after the build, pass or fail, so the next run (and the tests' rerun) compiles only what changed.
+      - uses: actions/cache/save@v5
+        if: ${{ always() && matrix.shard == 0 }}
+        with:
+          path: .ccache
+          key: ccache-sanitizers-${{ matrix.id }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # UdpGsoBindings.Ipv6RoundTrip is a known flake (#628); excluded in case the filter ever selects it.
       # A manual run can cover only what no sanitizer run has yet: the named tests and/or every test from a number on
