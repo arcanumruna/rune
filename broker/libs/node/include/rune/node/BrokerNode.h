@@ -77,6 +77,8 @@
 #include <rune/node/SecurityServing.h>
 #include <rune/node/SchemaFanout.h>
 #include <rune/node/TopicDroppedFanout.h>
+#include <rune/node/NsSlotFanout.h>
+#include <rune/node/NsSlotTable.h>
 #include <rune/node/PeerLinkAgent.h>
 #include <rune/node/PeerLinkFanout.h>
 #include <rune/peerlink/ClusterKeys.h>
@@ -2782,6 +2784,27 @@ private:
     std::vector<ReapResultMsg>                            reapResultOutbox_;     // kMsgNsReapResult ring-full retry (Task 7)
     void onNsReapRequest_(const ReapRequestMsg& m);                              // control thread (Task 7)
     void onNamespaceErasedDisk_(uint32_t nsId);                                  // control thread (Task 7, D18)
+    // Namespaces Phase 2 Task 8 (D22): the node's AUTHORITATIVE slot table (control thread).  Slot 0 = `default`.  The
+    // gateway, every worker and every worker's view set keep their own copy, fed from here (gateway: direct, same thread;
+    // workers: nsSlotFanout_ on the worker rings).  Each namespace has one per-node gauge in the metrics file whose
+    // owner tag is the nsId (a reader tells a reused slot from the old one).
+    NsSlotTable                                           nsSlots_;
+    NsSlotFanout                                          nsSlotFanout_;
+    std::vector<metrics::SlotWriter>                      nsMetricSlots_;       // by nsSlot; unbound (slot() < 0) = none
+    uint64_t                                              nsSlotAssignFailures_ = 0;   // a bug if ever non-zero
+    std::int64_t                                          lastNsMismatchPublished_ = 0;
+    void bootAssignNsSlots_();                                                   // startup thread: from the booted catalog
+    void onNsUpserted_(const rune::catalog::NamespaceRecord& rec);               // control thread: assign / refresh + broadcast
+    void onNsErasedSlot_(uint32_t nsId);                                         // control thread: release + broadcast
+    void registerNsMetric_(uint16_t slot, const rune::catalog::NamespaceRecord& rec);
+    void freeNsMetric_(uint16_t slot);
+    void publishNsSlotMetrics_() noexcept;
+public:
+    [[nodiscard]] uint16_t nsSlotOfForTest(uint32_t nsId);   // read ON the control thread
+    /// The (nsId, slot) pairs of the authoritative table, ascending slot (read ON the control thread).
+    [[nodiscard]] std::vector<std::pair<uint16_t, uint32_t>> nsSlotsForTest();
+    [[nodiscard]] uint64_t nsSlotAssignFailuresForTest() const noexcept { return nsSlotAssignFailures_; }
+private:
     int  serviceErasedNamespaces_();                                             // control thread: the rename, once its topics retired
     std::vector<uint32_t>                                 erasedNsAwaitingRename_;
     std::size_t                                           nsDirMismatchesAtBoot_ = 0;   // '*.deleting' dirs of a live namespace (fatal)

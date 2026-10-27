@@ -612,6 +612,18 @@ public:
     };
     [[nodiscard]] SegmentBytes segmentBytesAt(int64_t segmentBase);
     int64_t totalBytes() const;
+    /// Namespaces Phase 2 Task 11 (D25): the bytes this log holds on disk, O(1): the sealed segments' sum (re-derived
+    /// whenever segments_ changes - roll, compaction swap, retention delete, truncate, reload, recover) plus the active
+    /// segment's size.  OWNER thread only.  The hot path never calls totalBytes().
+    [[nodiscard]] int64_t bytesOnDisk() const noexcept {
+        return sealedBytes_ + (segments_.empty() ? 0 : segments_.rbegin()->second->sizeBytes());
+    }
+    /// Namespaces Phase 2 Task 8 (D22): the (nsId, nsSlot) of the namespace this topic lives in.  Set by the control
+    /// thread once, before the log is handed to a worker (the ring publish orders it); never changes afterwards.
+    /// (0, 0) = `default` and every internal topic.
+    void setNsTag(uint32_t nsId, uint16_t nsSlot) noexcept { nsId_ = nsId; nsSlot_ = nsSlot; }
+    [[nodiscard]] uint32_t nsId() const noexcept { return nsId_; }
+    [[nodiscard]] uint16_t nsSlot() const noexcept { return nsSlot_; }
     /// Size retention: delete the oldest sealed segments until the log fits in
     /// retainBytes — only segments that END at or below `highWatermark` (Kafka:
     /// HW >= nextSegment.baseOffset), never the active one.
@@ -1002,6 +1014,9 @@ private:
     /// (cold: recover / reloadSegments).
     void rescanActiveSegmentMaxTs_();
 
+    int64_t  sealedBytes_ = 0;   // see bytesOnDisk()
+    uint32_t nsId_        = 0;   // see setNsTag()
+    uint16_t nsSlot_      = 0;
     std::string dir_; int64_t rollBytes_; int64_t logEndOffset_ = 0;
     uint64_t readViewCalls_ = 0;   // F18 B-2 (single-owner thread)
     uint64_t truncations_   = 0;   // contentGeneration() (owner thread)

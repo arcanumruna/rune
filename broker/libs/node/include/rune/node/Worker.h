@@ -71,6 +71,7 @@
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/node/OrderedWaitQueue.h>
 #include <rune/node/RcState.h>
+#include <rune/node/NsSlotTable.h>
 #include <rune/node/ReturnFifo.h>
 #include <rune/node/WorkerViewSet.h>
 #include <rune/node/SessionAckSink.h>
@@ -1267,6 +1268,7 @@ public:
             }
             break;
         case WorkerOp::Type::FilterSchema:   // Phase 2c: the evolving descriptor blob, like SchemaUpdate
+        case WorkerOp::Type::NsSlotAssign:   // Namespaces Phase 2 Task 8: the encoded NamespaceLimits (256 B)
         case WorkerOp::Type::SchemaUpdate:
             // Task 7: descriptor blob carried as the variable tail.
             // topicId is already encoded in the scalar field.
@@ -2672,6 +2674,12 @@ private:
             break;
         case WorkerOp::Type::TopicDropped:
             markTopicDropped_(op.topicId());
+            break;
+        case WorkerOp::Type::NsSlotAssign:
+            executeNsSlotAssignWire_(op);
+            break;
+        case WorkerOp::Type::NsSlotRelease:
+            executeNsSlotReleaseWire_(op);
             break;
         case WorkerOp::Type::PeerLinkKeys:
             executePeerLinkKeysWire_(op);
@@ -6165,6 +6173,55 @@ private:
     static std::size_t ptrHash_(const void* p) noexcept {
         return static_cast<std::size_t>((reinterpret_cast<uintptr_t>(p) >> 4) * 0x9E3779B97F4A7C15ull);
     }
+    // ---- Namespaces Phase 2 Task 8 (D22): this worker's OWN namespace slot table, fed by NsSlotAssign / NsSlotRelease
+    // ops on the ingress ring (FIFO with every other op).  Fixed arrays sized RUNE_MAX_NAMESPACES at start; the hot
+    // path (produceCore_) is one matches() call - an array index and a compare.  A mismatch is counted
+    // (`rune.ns.slot_mismatch`, reported to the control thread as a SessionSignal) and refused, never applied.
+    NsSlotTable nsSlots_;
+    uint64_t    nsSlotMismatches_ = 0;
+public:
+    /// Boot only (before the runner starts): size the slot table to RUNE_MAX_NAMESPACES.
+    void configureNsSlots(uint32_t capacity) { nsSlots_.reset(capacity); }
+    [[nodiscard]] const NsSlotTable& nsSlotsForTest() const noexcept { return nsSlots_; }
+    [[nodiscard]] uint64_t nsSlotMismatchesForTest() const noexcept { return nsSlotMismatches_; }
+    /// Test seam: deliver a namespace slot message exactly as the ring would.
+    void applyNsSlotAssignDirect(uint16_t slot, uint32_t nsId, const rune::protocol::NamespaceLimits& l) { applyNsSlotAssign_(slot, nsId, l); }
+    bool applyNsSlotReleaseDirect(uint16_t slot, uint32_t nsId) { return applyNsSlotRelease_(slot, nsId); }
+    /// Test seam: the hot-path check a stale (slot, nsId) tag goes through (counts + reports on a mismatch).
+    bool checkNsTagForTest(uint16_t slot, uint32_t nsId) { return checkNsTag_(slot, nsId); }
+private:
+    /// Hot path: does this worker's table hold `nsId` in `slot`?  Counts a mismatch.
+    [[nodiscard]] bool checkNsTag_(uint16_t slot, uint32_t nsId) {
+        if (nsSlots_.matches(slot, nsId)) [[likely]] return true;
+        noteNsSlotMismatch_();
+        return false;
+    }
+    [[gnu::cold]] [[gnu::noinline]] void noteNsSlotMismatch_() {
+        ++nsSlotMismatches_;
+        (void)trySessionSignal_(0, SessionSignalKind::NsSlotMismatch, static_cast<int64_t>(nsSlotMismatches_));
+    }
+    [[gnu::cold]] void applyNsSlotAssign_(uint16_t slot, uint32_t nsId, const rune::protocol::NamespaceLimits& l) {
+        if (nsSlots_.nsIdAt(slot) != nsId && !nsSlots_.place(slot, nsId)) {
+            noteNsSlotMismatch_();   // the slot is out of range or holds another namespace: never applied
+            return;
+        }
+        nsSlots_.setLimits(slot, l);
+        if (viewSet_ != nullptr) viewSet_->onNsSlotAssign(slot, nsId, l);
+    }
+    [[gnu::cold]] bool applyNsSlotRelease_(uint16_t slot, uint32_t nsId) {
+        if (!nsSlots_.release(slot, nsId)) { noteNsSlotMismatch_(); return false; }
+        if (viewSet_ != nullptr) viewSet_->onNsSlotRelease(slot, nsId);
+        return true;
+    }
+    [[gnu::cold]] void executeNsSlotAssignWire_(sbe::WorkerOp& op) {
+        rune::protocol::NamespaceLimits l;
+        const uint8_t* tail = reinterpret_cast<const uint8_t*>(op.tail());
+        if (!rune::protocol::decodeLimits(tail, op.tailLength(), l)) { noteNsSlotMismatch_(); return; }
+        applyNsSlotAssign_(static_cast<uint16_t>(op.topicId()), static_cast<uint32_t>(op.nextOffset()), l);
+    }
+    [[gnu::cold]] void executeNsSlotReleaseWire_(sbe::WorkerOp& op) {
+        (void)applyNsSlotRelease_(static_cast<uint16_t>(op.topicId()), static_cast<uint32_t>(op.nextOffset()));
+    }
     // ---- Ownership table: ownedInc_[registryId] = the incarnation this worker
     // owns (0 = not owned).  Dense, indexed by the registry id carried in the op.
     std::vector<uint32_t> ownedInc_;
@@ -8391,6 +8448,16 @@ private:
         // (BecomeFollower applied, or self-demoted) never appends a client batch.
         if (!produceRoleGatePasses_(replica)) [[unlikely]] {
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            enqueueReturn_(ret);
+            return 1;
+        }
+        // Namespaces Phase 2 Task 8 (D22): the topic's (nsId, nsSlot) tag must match THIS worker's slot table.  One array
+        // index and a compare.  A slot this worker has not been told about yet (the assign is still queued behind a full
+        // ring) is the retriable NotLeader; a slot that holds another namespace is a stale tag: InvalidRequest.
+        if (log != nullptr && !nsSlots_.matches(log->nsSlot(), log->nsId())) [[unlikely]] {
+            const bool unassigned = nsSlots_.nsIdAt(log->nsSlot()) == NsSlotTable::kFreeSlot;
+            noteNsSlotMismatch_();
+            ret.errorCode = static_cast<int16_t>(unassigned ? pc::ErrorCode::NotLeader : pc::ErrorCode::InvalidRequest);
             enqueueReturn_(ret);
             return 1;
         }

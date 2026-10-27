@@ -85,6 +85,9 @@ struct TopicSpec {
     int32_t     topicId        = -1;
     /// Namespaces plan Task 6: the namespace the topic lives in (its dir is topicsRoot(dataDir, nsId)/<name>).
     uint32_t    nsId           = 0;
+    /// Namespaces Phase 2 Task 8 (D22): the node-local metric slot of the topic's namespace (0 = `default`); stamped on
+    /// every partition Log (Log::setNsTag) so the hot path indexes an array.
+    uint16_t    nsSlot         = 0;
     /// VLS B.2: a view's sink -- a replica-less, catalog-only namespace (no log, no dir, no replica); its rows live
     /// in the source owner's WorkerViewSet.  Set by the catalog sink effect (live and boot) only.
     bool        viewSink       = false;

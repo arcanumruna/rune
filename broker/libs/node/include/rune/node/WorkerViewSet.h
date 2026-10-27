@@ -58,6 +58,7 @@
 #include <rune/view/ViewTable.h>
 
 #include <rune/node/ViewSnapshotChannel.h>
+#include <rune/node/NsSlotTable.h>
 
 namespace rune::node {
 
@@ -483,6 +484,27 @@ public:
     /// VLS B.3: is `topicId` a view this worker has the plan of -- i.e. a view SINK id?  Pure read of worker-owned
     /// state (the plan install ring carries every view id to every worker).
     [[nodiscard]] bool isViewSink(int32_t topicId) const noexcept { return templates_.find(topicId) != templates_.end(); }
+
+    // Namespaces Phase 2 Task 8 (D22): this view set's OWN slot table, fed by its worker from the NsSlotAssign /
+    // NsSlotRelease ops (the worker thread is the only caller).  Task 12 (view memory) is its first consumer: a view
+    // charges its chunks to its namespace's slot and checks the (slot, nsId) tag with nsTagMatches().
+    void onNsSlotAssign(uint16_t slot, uint32_t nsId, const rune::protocol::NamespaceLimits& l) {
+        if (nsSlots_.nsIdAt(slot) != nsId && !nsSlots_.place(slot, nsId)) { ++nsSlotMismatches_; return; }
+        nsSlots_.setLimits(slot, l);
+    }
+    void onNsSlotRelease(uint16_t slot, uint32_t nsId) { if (!nsSlots_.release(slot, nsId)) ++nsSlotMismatches_; }
+    [[nodiscard]] bool nsTagMatches(uint16_t slot, uint32_t nsId) noexcept {
+        if (nsSlots_.matches(slot, nsId)) return true;
+        ++nsSlotMismatches_;
+        return false;
+    }
+    void configureNsSlots(uint32_t capacity) { nsSlots_.reset(capacity); }
+    [[nodiscard]] const NsSlotTable& nsSlotsForTest() const noexcept { return nsSlots_; }
+    [[nodiscard]] uint64_t nsSlotMismatchesForTest() const noexcept { return nsSlotMismatches_; }
+private:
+    NsSlotTable nsSlots_;
+    uint64_t    nsSlotMismatches_ = 0;
+public:
     [[nodiscard]] bool viewOutputFingerprint(int32_t viewTopicId, uint64_t& out) const {
         const auto it = templates_.find(viewTopicId);
         if (it == templates_.end()) return false;

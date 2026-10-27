@@ -1943,6 +1943,14 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
         if (peerDropFn_ != nullptr) peerDropFn_(peerDropCtx_, ret.partition, static_cast<uint64_t>(ret.baseOffset));
         return;
     }
+    if (kind == K::NsSlotMismatch) [[unlikely]] {   // namespaces Phase 2 Task 8: a worker's cumulative count
+        if (ret.partition >= 0 && ret.partition < 4096) {
+            if (workerNsSlotMismatches_.size() <= static_cast<std::size_t>(ret.partition))
+                workerNsSlotMismatches_.resize(static_cast<std::size_t>(ret.partition) + 1, 0);
+            workerNsSlotMismatches_[static_cast<std::size_t>(ret.partition)] = static_cast<uint64_t>(ret.baseOffset);
+        }
+        return;
+    }
     if (kind == K::EgressReleased) {                                  // retire-on-ack: the worker let go
         onEgressReleased_(ret.partition, static_cast<uint64_t>(ret.baseOffset));
         return;
@@ -3594,6 +3602,14 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             answerSuspended_(*session, *pc::MessageHeader::decode(buf, len), buf, len);
             return true;
         }
+    // Namespaces Phase 2 Task 8 (D22): the session's (nsId, nsSlot) must still be what the slot table holds - one array
+    // index and a compare.  A stale tag is refused and counted, never applied to another namespace.
+    if (!nsTagMatches_(*session)) [[unlikely]] {
+        if (!answerRejection_(*session, *pc::MessageHeader::decode(buf, len),
+                              static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "namespace slot mismatch", buf, len))
+            noteUnanswerable_(buf, len, "namespace slot mismatch");
+        return true;
+    }
     // Authentication Task 12 (D30, spec §2.1): WRITE on the topic - ONE index test, ONE bounds check, ONE byte load
     // (PermissionTable::allows).  permsOf_ is allow-all only on a dev / in-process broker; an AuthAnonymous session on
     // an authenticating broker gets the deny-all table (X013), so nothing is produced for it.  The denial path is cold.
@@ -8483,10 +8499,24 @@ bool ClientGateway::nsGateRefuses_(uint16_t tid, const uint8_t* buf, std::size_t
     return true;
 }
 
+void ClientGateway::onNsSlotAssign(uint16_t slot, uint32_t nsId, const rune::protocol::NamespaceLimits& l)
+{
+    if (nsSlots_.nsIdAt(slot) != nsId && !nsSlots_.place(slot, nsId)) { ++nsSlotMismatches_; return; }
+    nsSlots_.setLimits(slot, l);
+}
+
+void ClientGateway::onNsSlotRelease(uint16_t slot, uint32_t nsId)
+{
+    if (!nsSlots_.release(slot, nsId)) { ++nsSlotMismatches_; return; }
+    sessions_.forEach([&](Session& s) { if (s.nsSlot == slot && s.nsId == nsId) s.nsSlot = rune::node::kNoNsSlot; });
+}
+
 void ClientGateway::onNamespaceUpserted(const rune::catalog::NamespaceRecord& r)
 {
     using rune::catalog::NsStateTag;
+    if (nsSlots_.slotOf(r.nsId) == rune::node::kNoNsSlot) (void)nsSlots_.assign(r.nsId);   // no BrokerNode in front (unit rigs)
     if (!namespaces_.upsert(r)) return;   // an older record: nothing changed
+    nsSlots_.setLimits(nsSlots_.slotOf(r.nsId), r.limits);
     const NsStateTag tag = rune::catalog::tagOf(r.state);
     // Namespaces Phase 2 Task 4: on every node, at the apply of the state change.  Only the node whose transaction
     // coordinator is loaded holds transactions (others return 0), so this covers the transactions whose sessions live
@@ -9270,6 +9300,8 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
     if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user, std::move(loginNonce), ok.nsId};
     else session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId, ok.nsId), std::move(loginNonce), ok.nsId};
     session->nsGate = nsTag;
+    session->nsId   = ok.nsId;
+    session->nsSlot = nsSlots_.slotOf(ok.nsId);   // namespaces Phase 2 Task 8: cached for the hot path
     // Authentication Task 13: announce-before-accept for permissions - the workers learn this session's WRITE bitmap
     // BEFORE the client learns it is logged in, so it can never produce ahead of its grants.
     const uint64_t shipEpoch = shipPermissions_(*session);

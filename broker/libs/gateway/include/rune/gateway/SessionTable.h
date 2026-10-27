@@ -102,6 +102,11 @@ struct Session {
     // Namespaces Phase 2 Task 3 (D21): the lifecycle gate of this session's namespace (Active = serve everything).  Set
     // at login from the NamespaceMirror and re-set on every record upsert; the per-request check is one byte compare.
     rune::catalog::NsStateTag                      nsGate = rune::catalog::NsStateTag::Active;
+    // Namespaces Phase 2 Task 8 (D22): the session's namespace (nsId, node-local nsSlot), cached at login so the hot path
+    // indexes an array: matches() against the gateway's slot table is one compare.  (0, 0) = `default` (also every
+    // dev / anonymous session).
+    uint32_t                                       nsId   = 0;
+    uint16_t                                       nsSlot = 0;
     // D14: the host the session's Connect came from (the Aeron image's sourceIdentity host; the egress host for IPC) -
     // the throttle's key.  "" in unit tests.
     std::string                                    sourceHost;

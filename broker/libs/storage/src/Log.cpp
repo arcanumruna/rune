@@ -530,6 +530,14 @@ void Log::publishSealedSnapshotFrom_(int64_t fromBase) {
         ++i;
     }
     if (!diverged && i < snapEnd_) divergeAt(i);   // trailing entries removed (truncation)
+    // Namespaces Phase 2 Task 11 (D25): the sealed segments' bytes, re-summed on every segments_ change (roll, compaction
+    // swap, retention delete, truncate, reload, recover): cold, never per append.  bytesOnDisk() adds the active
+    // segment's live size.
+    {
+        int64_t sealed = 0;
+        for (auto sit = segments_.begin(); sit != activeIt && sit != segments_.end(); ++sit) sealed += sit->second->sizeBytes();
+        sealedBytes_ = sealed;
+    }
     // CP-5.1: the recovery scan is consumed by the first publish after recover().
     recoveryMaxTimestamps_.clear();
     ++snapRebuilds_;

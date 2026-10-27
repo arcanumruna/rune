@@ -155,6 +155,10 @@ struct WorkerOp {
         // the producer; correlationId = the worker's request id; replicatedPayload.errorCode = the client ErrorCode
         // (0 = the partition is registered in the producer's ongoing transaction).  (26 = TXN_VERIFY_RESULT.)
         TxnVerifyResult           = 26, ///< control → worker: a txn partition verification answer
+        // Namespaces Phase 2 Task 8 (D22): control → EVERY worker (cold): a namespace slot assigned / released.  See
+        // NsRingMessages.h for the field use.  Never ownership-gated.
+        NsSlotAssign              = 27, ///< control → worker: nsId owns nsSlot (+ its limits)
+        NsSlotRelease             = 28, ///< control → worker: nsSlot is free
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the

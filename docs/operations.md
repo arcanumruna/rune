@@ -155,6 +155,14 @@ sampling the file; the broker keeps no history.
 | 1000235 | `rune-peer-frame-drops` | counter | control | Inter-broker frames dropped for want of a link or because they did not open. |
 | 1000240 | `rune-txn-offset-commits-stuck` | gauge | control | Transaction commits waiting because the group coordinator refuses their consumer-group offsets. Alert on a non-zero value that persists. |
 | 1000241 | `rune-txn-offset-stuck-age-ms` | gauge | control | Age of the oldest of those, in ms. A WARN names it every 30 s while any is stuck. |
+| 1000242 | `rune-ns-slot-mismatch` | counter | control | Namespace slot tags refused by the gateway or a worker (`rune.ns.slot_mismatch`): a message or request whose (slot, nsId) pair the receiver's slot table does not hold. Any rise is a bug. |
+
+Per-namespace metrics (one series per namespace on this node, allocated when the namespace is created and freed when it is
+erased; the key is the namespace id and the slot's owner tag is the namespace id too):
+
+| Type id | Label | Kind | Owner | Meaning |
+|---|---|---|---|---|
+| 1000300 | `rune-ns-slot` | gauge | control | The node-local slot of the namespace (`default` is slot 0). The slot is the index of every per-namespace array on the hot path. |
 
 The owner is the one thread that writes the metric: `control` the broker's control agent, `observer` the role and ISR
 observer, `provisioner` the segment provisioner. Type id 1000204 (a metadata commit position that was never published) has no row, and

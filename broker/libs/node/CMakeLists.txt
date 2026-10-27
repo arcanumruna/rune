@@ -1805,6 +1805,13 @@ if(BUILD_TESTING)
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_ns_keyed_stores_tests PROPERTIES TIMEOUT 600)
 
+        # Namespaces Phase 2 Task 8 (D22): per-node namespace slots, the broadcast to every worker and the gateway.
+        add_executable(rune_ns_slot_tests tests/node/NsSlotRegressionTest.cpp)
+        target_include_directories(rune_ns_slot_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_ns_slot_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_ns_slot_tests PROPERTIES TIMEOUT 900)
+
         # Namespaces Phase 2 Task 7 (D17, D18; rule 16): the namespace reaper - the state machine over a real CatalogState,
         # and three real AdminWorkers (leader change after each durable step).
         add_executable(rune_namespace_reaper_tests tests/node/NamespaceReaperRegressionTest.cpp)

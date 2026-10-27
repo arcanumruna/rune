@@ -97,6 +97,7 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 #include <rune/metadata/RoutingImage.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/node/RecordsPush.h>
+#include <rune/node/NsSlotTable.h>
 #include <rune/node/UnauthLogLimiter.h>
 #include <rune/node/SessionAnnouncer.h>
 #include <rune/node/PermissionShipper.h>
@@ -537,12 +538,37 @@ public:
     void setBootObjects(rune::gateway::ObjectIndex objects) { objectIndex_ = std::move(objects); }
     /// Namespaces Task 9 (spec §2): the booted catalog's namespaces (startup thread, before any thread runs), then
     /// the applier's namespaceUpserted effects (kA2cNamespaceUpserted, control drain) - the login lookup's mirror.
-    void setBootNamespaces(const rune::catalog::NamespaceRegistry& r) { namespaces_ = rune::catalog::NamespaceMirror(r); }
+    void setBootNamespaces(const rune::catalog::NamespaceRegistry& r) {
+        namespaces_ = rune::catalog::NamespaceMirror(r);
+        // A gateway with no BrokerNode in front of it (unit rigs) keeps its own slots: lowest free, in nsId order.
+        r.forEach([this](const rune::catalog::NamespaceRecord& rec) { (void)nsSlots_.assign(rec.nsId); });
+    }
     /// Phase 2 Task 3: also re-gates the namespace's live sessions (ReadOnly: bound to the deny table; RejectAll /
     /// Deleting: closed; resumed: real permissions re-shipped).
     void onNamespaceUpserted(const rune::catalog::NamespaceRecord& r);
     /// Phase 2 Task 3: a deleted namespace is gone (kA2cNamespaceErased); its sessions were closed at Deleting.
-    void onNamespaceErased(uint32_t nsId) { (void)namespaces_.erase(nsId); }
+    void onNamespaceErased(uint32_t nsId) {
+        (void)namespaces_.erase(nsId);
+        if (const uint16_t sl = nsSlots_.slotOf(nsId); sl != rune::node::kNoNsSlot && nsId != 0) onNsSlotRelease(sl, nsId);
+    }
+    // Namespaces Phase 2 Task 8 (D22): this gateway's OWN copy of the node's slot table, fed by the control thread
+    // (BrokerNode) before it hands the namespace record to onNamespaceUpserted.  A session caches (nsId, nsSlot) at login;
+    // a produce whose tag no longer matches is refused InvalidRequest and counted (`rune.ns.slot_mismatch`).
+    void configureNsSlots(uint32_t capacity) { nsSlots_.reset(capacity); }
+    void onNsSlotAssign(uint16_t slot, uint32_t nsId, const rune::protocol::NamespaceLimits& l);
+    void onNsSlotRelease(uint16_t slot, uint32_t nsId);
+    /// Mismatches counted here plus the cumulative counts the workers reported (SessionSignal NsSlotMismatch).
+    [[nodiscard]] uint64_t nsSlotMismatchTotal() const noexcept {
+        uint64_t n = nsSlotMismatches_;
+        for (const uint64_t w : workerNsSlotMismatches_) n += w;
+        return n;
+    }
+    [[nodiscard]] const rune::node::NsSlotTable& nsSlotsForTest() const noexcept { return nsSlots_; }
+    /// Test seam: the check a produce of `sessionId` does against the slot table (counts a mismatch).
+    [[nodiscard]] bool sessionNsTagMatchesForTest(int64_t sessionId) {
+        Session* s = sessions_.find(sessionId);
+        return s != nullptr && nsTagMatches_(*s);
+    }
     /// Namespaces Task 9 (spec §11, RUNE_ANONYMOUS_READ, off by default): in Required mode a session that sends a
     /// request without logging in becomes AuthAnonymousRead (nsId 0, Describe-only) instead of being ended.
     void setAnonymousRead(bool on) noexcept { anonymousRead_ = on; }
@@ -2470,6 +2496,15 @@ private:
     static void noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr);
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
     rune::catalog::NamespaceMirror namespaces_;   ///< namespaces Task 9: control thread's copy (login lookup)
+    rune::node::NsSlotTable nsSlots_;             ///< namespaces Phase 2 Task 8: this gateway's own slot table
+    uint64_t                nsSlotMismatches_ = 0;
+    std::vector<uint64_t>   workerNsSlotMismatches_;   ///< cumulative, per worker (SessionSignal NsSlotMismatch)
+    /// One array index and a compare; counts a mismatch.
+    [[nodiscard]] bool nsTagMatches_(const Session& s) noexcept {
+        if (nsSlots_.matches(s.nsSlot, s.nsId)) [[likely]] return true;
+        ++nsSlotMismatches_;
+        return false;
+    }
     bool anonymousRead_ = false;                  ///< namespaces Task 9: RUNE_ANONYMOUS_READ (off by default)
     /// Namespaces Task 9: the session's namespace (AuthAuthenticated / AuthPasswordChangeRequired; 0 otherwise -
     /// anonymous and not-yet-logged-in sessions are `default`'s, D12).

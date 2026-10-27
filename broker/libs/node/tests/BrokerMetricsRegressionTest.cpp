@@ -355,7 +355,7 @@ TEST(BrokerMetricsRegression, CncHoldsOnlyDriverCountersRegression) {
 TEST(BrokerMetricsRegression, StartRefusedWhenFileTooSmallRegression) {
     MetricsTempDir tmp{"small_"};
     NodeConfig cfg = singleNode(tmp.path);
-    const std::int32_t need = metrics::requiredSlots({rune::node::kNodeMetricCount, 0, 0, 0, 0, 16});
+    const std::int32_t need = metrics::requiredSlots(rune::node::runeCapacityPlan(cfg.maxNamespaces));
     cfg.metricsMaxSlotsOverrideForTest = need - 1;
     const std::string err = startError(cfg);
     EXPECT_NE(err.find("metrics file " + cfg.effectiveMetricsFile() + ": CapacityTooSmall"), std::string::npos) << err;
