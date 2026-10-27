@@ -103,8 +103,7 @@ rune namespace limits a --set max-topics=100 --broker rune-1:40200 --user admin 
 - **Foreign objects answer exactly like missing ones**: same error code and message, so a name in another namespace is
   never revealed. A namespace admin sees only its own namespace in `rune namespace list`.
 - **Anonymous read is off by default.** Only a cluster admin turns it on, and only for `default`.
-- **Limits are stored, not enforced**, until Phase 2. Consumer-group and transactional requests outside `default` are
-  refused until Phase 2 as well.
+- **Limits are stored, not enforced**, until Phase 2. Consumer groups and transactions work in every namespace.
 - The data lives under `<data>/ns-<nsId>/topics/<name>/`. A cluster with namespaces is a new cluster; there is no
   in-place upgrade.
 - The 3-node check is `docker/namespace-e2e.sh` ([testing](testing.md#end-to-end-docker-suites)).
