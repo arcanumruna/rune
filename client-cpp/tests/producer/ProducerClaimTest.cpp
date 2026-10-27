@@ -975,8 +975,8 @@ bool anyByteIs(const std::vector<std::string>& vs, char c) {
 TEST(ProducerClaimRegression, RouteFailureAbandonKeepsTheHeldClaimOutOfTheRetriedFrameRegression) {
     ProducerConfig cfg = voidCfg();
     cfg.acks = Acks::Leader;
+    RetryOnFailure h;  // outlives the rig: ~Producer fails what is pending through onAck
     DirectRig r(cfg);
-    RetryOnFailure h;
     h.p = &r.p;
     r.p.onAck(&RetryOnFailure::onAck, &h);
     FrameCapture cap;
@@ -1007,8 +1007,8 @@ TEST(ProducerClaimRegression, DeliverySweepAbandonKeepsTheHeldBatchClaimOutOfThe
     ProducerConfig cfg = voidCfg();
     cfg.acks              = Acks::Leader;
     cfg.deliveryTimeoutMs = 100;
+    RetryOnFailure h;  // outlives the rig: ~Producer fails what is pending through onAck
     DirectRig r(cfg);
-    RetryOnFailure h;
     h.p = &r.p;
     r.p.onAck(&RetryOnFailure::onAck, &h);
     FrameCapture cap;
