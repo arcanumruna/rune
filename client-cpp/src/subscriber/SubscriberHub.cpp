@@ -766,6 +766,18 @@ bool SubscriberHub::hasPending() const
     return !pendingByCorrelation_.empty();
 }
 
+bool SubscriberHub::usesSession(uint32_t session) const noexcept
+{
+    if (!routed_() || session == 0) return false;
+    for (const auto& [corr, req] : pendingByCorrelation_) {
+        if (req && req->impl != nullptr && req->impl->active && req->impl->homeSession == session) return true;
+    }
+    for (const auto& [id, impl] : activeById_) {
+        if (impl->active && impl->homeSession == session) return true;
+    }
+    return false;
+}
+
 bool SubscriberHub::isPending(int64_t correlationId) const
 {
     return pendingByCorrelation_.find(correlationId) != pendingByCorrelation_.end();

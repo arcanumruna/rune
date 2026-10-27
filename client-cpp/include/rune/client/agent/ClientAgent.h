@@ -611,6 +611,17 @@ public:
         }
         return mask;
     }
+    /// #514: the leader-node sessions (bit i = session i + 1; the first 64) that are Connected but have heard
+    /// nothing for more than two of their keepalive intervals (a live node answers each Ping).  Duty thread only.
+    [[nodiscard]] uint64_t leaderSessionsSilentMask(int64_t nowNs) const noexcept {
+        uint64_t mask = 0;
+        const std::size_t n = sessions_.size() < 65 ? sessions_.size() : 65;
+        for (std::size_t i = 1; i < n; ++i) {
+            const session::SessionMachine& m = sessions_[i]->machine;
+            if (m.silentLongerThan(nowNs, 2 * m.keepaliveIntervalNs())) mask |= uint64_t{1} << (i - 1);
+        }
+        return mask;
+    }
     /// T15b: the seed session's machine (read-only; duty thread only).
     [[nodiscard]] const session::SessionMachine& seedMachine() const noexcept { return seedSession().machine; }
     /// A7 park-until-work: the invoker driver's socket-readiness fds (AeronTransport::wakeFds) — the

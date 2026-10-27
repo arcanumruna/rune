@@ -405,6 +405,13 @@ public:
     /// carry ONLY the bootstrap — the broker answers any other frame AuthenticationFailed and closes it, so the
     /// machine sends no keepalive and the Client no connect-time metadata request on it.
     [[nodiscard]] bool anonymousBootstrap() const noexcept { return authInfo_.anonymousBootstrap; }
+    /// #514: Connected, able to be pinged (not a bootstrap-only session), and no inbound frame for more than `ns`.
+    /// A live node answers every keepalive Ping, so silence past two keepalive intervals means it is suspect -
+    /// long before the response timeout declares the session stale.
+    [[nodiscard]] bool silentLongerThan(int64_t nowNs, int64_t ns) const noexcept {
+        return state_ == SessionState::Connected && !authInfo_.anonymousBootstrap && nowNs - lastActivityNs_ > ns;
+    }
+    [[nodiscard]] int64_t keepaliveIntervalNs() const noexcept { return cfg_.keepaliveIntervalNs; }
 
     /// Issue #114: sign, in place, a SecurityDdl frame that changes this session's OWN credential (ALTER USER <self>
     /// ADD / DROP / SET PASSWORD carrying the CredentialProof flag): its last kCredentialProofBytes become the SCRAM

@@ -1676,6 +1676,10 @@ private:
     /// re-drive a Disconnected one's connect, re-route.  Event-driven: state
     /// transitions of the agent's sessions, no clock.
     int watchGroupSessions_(int64_t nowNs);
+    /// #514: a leader-node session carrying a homed subscription or a group fetch that has been silent for more
+    /// than two keepalive intervals keeps the backoff-paced metadata refresh armed (a BOUND reader arms nothing
+    /// else): fresh metadata moves it through driveHomed / group reconcileFetch before the session is stale.
+    int watchSilentLeaders_(int64_t nowNs);
     int watchProduceRoutes_(int64_t nowNs) noexcept;
     // ---- DR client bug 1: seed failover (duty thread) -------------------------
     // The seed's broker died: its session went silent (stale loss) or it gave up
@@ -1754,6 +1758,8 @@ private:
     uint64_t groupUpMask_   = 0;  // leader sessions (bit i-1 = session i) Connected last pass
     uint64_t groupDiscMask_ = 0;  // ... terminally Disconnected last pass
     uint64_t groupRejMask_  = 0;  // #290: ... Rejected last pass (a login refused there is never "lost")
+    int64_t  nextSilentCheckNs_  = 0;   // #514: watchSilentLeaders_ runs once per silentCheckPeriodNs_ (duty clock)
+    int64_t  silentCheckPeriodNs_ = 0;  // #514: a quarter of the configured keepalive interval (set at construction)
     static detail::SendResult fetchOfferTrampoline_(void* ctx, uint32_t session, const uint8_t* buf,
                                                     std::size_t len) noexcept;
     /// A Redirect / NotLeader answered a group fetch Subscribe (corrId tagged

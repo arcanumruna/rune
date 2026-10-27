@@ -202,6 +202,9 @@ Client::Client(ClientConfig cfg)
     // own copy is not kept.
     if (!cfg_.password.empty()) { detail::secureZero(cfg_.password.data(), cfg_.password.size()); cfg_.password.clear(); }
     if (cfg_.traceDdlRetries) ddlRetryNotes_.reserve(kMaxDdlRetryNotes);   // push_back never reallocates on the duty thread
+    // #514: the silent-leader scan runs four times per keepalive interval.
+    silentCheckPeriodNs_ = (cfg_.keepaliveIntervalNs > 0 ? cfg_.keepaliveIntervalNs
+                                                         : session::SessionConfig{}.keepaliveIntervalNs) / 4;
     // F8c review n1: releaseCq_ is noexcept and may defer a release; the list
     // never holds more than one entry per registry slot, so reserve it once
     // here and the push_back there can never allocate (or throw).
@@ -2957,6 +2960,10 @@ int Client::dutyCycle(int64_t nowNs) {
         // the answer re-routes it (driveHomed follows a moved route).
         if (subscriberHub_.unansweredHomed() != 0) [[unlikely]] scheduleMetadataRefresh();
     }
+    // #514: a BOUND reader / group fetch on a leader node that went silent (crashed) arms nothing above; the
+    // check is one compare per cycle, the scan once per quarter keepalive.
+    if (nowNs >= nextSilentCheckNs_ && (subscriberHub_.homedCount() != 0 || !groupConsumerHub_.empty())) [[unlikely]]
+        work += watchSilentLeaders_(nowNs);
 
     // 3b'. F8c C3: control frames the transport refused (Retry), in order.
     if (ctlAwaitingSeed_ != 0) [[unlikely]] work += driveAwaitingSeed_();   // fix round 2 (I-1)
@@ -5426,6 +5433,20 @@ int Client::watchGroupSessions_(int64_t nowNs) {
     requestMetadataNow_();
     (void)groupConsumerHub_.reconcileFetch();
     return 1;
+}
+
+int Client::watchSilentLeaders_(int64_t nowNs) {
+    nextSilentCheckNs_ = nowNs + silentCheckPeriodNs_;
+    uint64_t silent = agent_.leaderSessionsSilentMask(nowNs);
+    if (silent == 0) [[likely]] return 0;
+    for (uint32_t i = 1; i <= 64 && silent != 0; ++i, silent >>= 1) {
+        if ((silent & 1u) == 0) continue;
+        if (subscriberHub_.usesSession(i) || groupConsumerHub_.fetchUses(i)) {
+            scheduleMetadataRefresh();   // idempotent while armed; the answer moves what moved (#365 / reconcile)
+            return 1;
+        }
+    }
+    return 0;
 }
 
 int64_t Client::nextCorrTrampoline_(void* ctx) noexcept {

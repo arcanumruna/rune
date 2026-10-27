@@ -3583,3 +3583,124 @@ TEST(GroupRoutingRegression, AnUnansweredHealthySubscribeIsNeverResentByTheRefre
     EXPECT_EQ(subscribesAt(r.gw, 1, n1), 1) << "the refresh re-sent a Subscribe whose route did not move";
     EXPECT_EQ(subscribesAt(r.gw, 1, 0), 0);
 }
+
+// ===========================================================================
+// #514: a leader node session that carries a bound reader / group fetch and has gone silent
+// ===========================================================================
+namespace {
+/// Lets the one metadata refresh the subscribe flow itself arms (a redirect's provisional guess) fire and quiet
+/// down, so the tests below start with NO refresh armed: ten keepalive rounds on a live rig.
+bool settleRefreshes(GroupRig& r) {
+    const int pingsBefore = r.gw.pings;
+    return r.drive([&] { return r.gw.pings >= pingsBefore + 10; }, 40'000'000);
+}
+} // namespace
+
+// A BOUND reader on a crashed leader arms nothing by itself (a metadata refresh was armed only while a Subscribe
+// was unanswered): its node session was only declared lost at responseTimeoutNs (10 s), so delivery stopped for
+// that long.  A live node answers every keepalive Ping, so silence longer than two keepalive intervals keeps the
+// backoff-paced refresh armed; fresh metadata then moves the reader through the #365 path.
+// responseTimeoutNs is set to 60 s: the stale path cannot be what moves it.
+// RED (before): nothing moves within the drive cap (the session stays Connected, no Subscribe reaches node 2).
+TEST(GroupRoutingRegression, ABoundReaderAloneOnACrashedLeaderMovesBeforeTheSessionIsStaleRegression) {
+    RigOptions o;
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 60'000'000'000;
+    GroupRig r(4551, 4552, o);
+    const auto [n1, p1port] = r.addNode(4551);
+    const auto [n2, p2port] = r.addNode(4551);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4551, ""}, {1, 1, 1, 1, 4551, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.connect();
+    std::vector<int64_t> offsets;
+    auto sub = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                  [&](const rc::Record& rec) { offsets.push_back(rec.offset); });
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr && sub.active(); }));
+    ASSERT_TRUE(settleRefreshes(r));
+    ASSERT_EQ(r.client.testSessionStateAt(1), rc::session::SessionState::Connected);
+
+    // Node 1 crashes; the cluster elects node 2 for p1.  The reader is the only subscription anywhere.
+    r.gw.deadEndpoints.insert(n1);
+    r.gw.partitions      = {{1, 0, 0, 1, 4551, ""}, {1, 1, 2, 2, 4551, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n2}};
+    ASSERT_TRUE(r.drive([&] {
+        return subscribesAt(r.gw, 1, n2) >= 1 || sub.finished() ||
+               r.client.testSessionStateAt(1) != rc::session::SessionState::Connected;
+    }, 40'000'000)) << "the bound reader never moved off the crashed leader";
+    EXPECT_GE(subscribesAt(r.gw, 1, n2), 1);
+    EXPECT_FALSE(sub.finished()) << "ended " << static_cast<int>(sub.failReason());
+    EXPECT_EQ(r.client.testSessionStateAt(1), rc::session::SessionState::Connected)
+        << "moved by fresh metadata, not by node 1's staleness (RED without the fix)";
+
+    // Node 2 answers and its records arrive.
+    ASSERT_TRUE(r.drive([&] { return (r.subAt(1, n2) != nullptr && sub.active()) || sub.finished(); }));
+    ASSERT_NE(r.subAt(1, n2), nullptr);
+    const auto fresh = *r.subAt(1, n2);
+    r.gw.pushRecordsFrom(fresh, 0, 3, n2);
+    ASSERT_TRUE(r.drive([&] { return offsets.size() == 3; })) << "records from node 2 never arrived";
+    EXPECT_FALSE(sub.finished());
+}
+
+// The group twin: a member whose only assigned partition is led by the crashed node keeps its fetch armed the
+// same way - the fetch moves to node 2 before node 1's session is seen stale.
+TEST(GroupRoutingRegression, AGroupMemberAloneOnACrashedLeaderMovesItsFetchBeforeTheSessionIsStaleRegression) {
+    RigOptions o;
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 60'000'000'000;
+    GroupRig r(4553, 4554, o);
+    const auto [n1, p1port] = r.addNode(4553);
+    const auto [n2, p2port] = r.addNode(4553);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4553, ""}, {1, 1, 1, 1, 4553, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment = {{1, 1}};                 // only p1, led by node 1
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testLeaderFor(1, 1) == 1 && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; })) << "the fetch never reached node 1";
+    r.gw.pushRecordsFrom(*r.subAt(1, n1), 0, 3, n1);
+    ASSERT_TRUE(r.drive([&] { return led.records[1] == 3; })) << "the fetch on node 1 never delivered";
+    ASSERT_TRUE(settleRefreshes(r));
+    ASSERT_EQ(r.client.testSessionStateAt(1), rc::session::SessionState::Connected);
+
+    r.gw.deadEndpoints.insert(n1);
+    r.gw.partitions      = {{1, 0, 0, 1, 4553, ""}, {1, 1, 2, 2, 4553, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n2}};
+    ASSERT_TRUE(r.drive([&] {
+        return subscribesAt(r.gw, 1, n2) >= 1 ||
+               r.client.testSessionStateAt(1) != rc::session::SessionState::Connected;
+    }, 40'000'000)) << "the fetch never moved off the crashed leader";
+    EXPECT_GE(subscribesAt(r.gw, 1, n2), 1);
+    EXPECT_EQ(r.client.testSessionStateAt(1), rc::session::SessionState::Connected)
+        << "moved by fresh metadata, not by node 1's staleness (RED without the fix)";
+    EXPECT_FALSE(gc.finished());
+}
+
+// No refresh storm: a live but idle leader answers every keepalive Ping, so it is never silent and the bound
+// reader on it never arms a metadata refresh.
+TEST(GroupRoutingRegression, AnIdleButLiveLeaderDoesNotTriggerRefreshStormRegression) {
+    RigOptions o;
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 60'000'000'000;
+    GroupRig r(4555, 4556, o);
+    const auto [n1, p1port] = r.addNode(4555);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4555, ""}, {1, 1, 1, 1, 4555, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.connect();
+    auto sub = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                  [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr && sub.active(); }));
+    ASSERT_TRUE(settleRefreshes(r));
+    const int pingsBefore = r.gw.pings;
+    const int metaBefore  = r.gw.metadataRequests;
+    ASSERT_TRUE(r.drive([&] { return r.gw.pings >= pingsBefore + 20; }, 40'000'000))
+        << "keepalives never ran (" << (r.gw.pings - pingsBefore) << " pings)";
+    EXPECT_EQ(r.gw.metadataRequests, metaBefore) << "an idle live leader armed metadata refreshes";
+    EXPECT_FALSE(sub.finished());
+    EXPECT_EQ(r.client.testSessionStateAt(1), rc::session::SessionState::Connected);
+}
