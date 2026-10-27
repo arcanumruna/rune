@@ -53,6 +53,10 @@ public:
     /// #438: a commitSync answered UnstableOffsetCommit is re-sent after this backoff (doubling, capped).
     static constexpr int64_t  kCommitRetryMinNs = 20'000'000;
     static constexpr int64_t  kCommitRetryMaxNs = 1'000'000'000;
+    /// C4 review (#607): consecutive Heartbeats answered AuthUnavailable (48) the member rides out while Stable.
+    /// Heartbeats go every sessionTimeout / 3, so 3 in a row span one session timeout - past that the coordinator
+    /// may have evicted the member, so it rejoins (paced, through rejoinWithBackoff_) instead of consuming on.
+    static constexpr uint32_t kMaxHeartbeatAuthUnavailable = 3;
     GroupConsumerHub() = default;
 
     // Non-copyable / non-movable.
@@ -301,6 +305,10 @@ public:
     /// stream) this many times since its last bind ends the consumer explicitly (RetryBudgetExhausted).  Only that
     /// cause counts: NotLeader / Redirect (a failover, however long) re-route without a bound, as before.
     static constexpr uint8_t kMaxEgressRefusalsWithoutBind = 8;
+    /// C4 review (#607): a partition fetch answered AuthUnavailable (48: the leader's security state is catching up)
+    /// this many times since its last bind ends the consumer explicitly (RetryBudgetExhausted).  Its own counter -
+    /// never charged to, or reset by, a routing refusal.  Each retry is paced by a metadata refresh.
+    static constexpr uint8_t kMaxFetchAuthUnavailableWithoutBind = 8;
 
     /// Bring every Stable consumer's subscriptions in line with the current
     /// leaders and sessions (cold: group / routing events).  Also re-offers

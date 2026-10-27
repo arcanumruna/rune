@@ -326,7 +326,8 @@ int GroupConsumerHub::sweepCommitSyncTimeouts(int64_t nowNs) {
             ++n;
         }
         if (impl->hasCommitSync && nowNs >= impl->commitSync.deadlineNs) {
-            completeCommitSync_(*impl, OpStatus::Timeout);
+            // C4 review: a deadline inside a transient retry carries the broker's last code (e.g. 48).
+            completeCommitSync_(*impl, OpStatus::Timeout, impl->commitSync.lastRetriedCode);
             ++n;
         }
         if (impl->hasCommitSync && impl->commitSync.retryDueNs >= 0) {   // #438: an UnstableOffsetCommit retry
@@ -1201,10 +1202,17 @@ bool GroupConsumerHub::onFetchSubscribeResponse(int64_t corrId, int16_t errorCod
                 refuse_(*impl, GroupFailReason::RetryBudgetExhausted);
                 return true;
             }
+            // C4 review (#607): AuthUnavailable is transient (retried after fresh metadata) but bounded on its own.
+            if (errorCode == static_cast<int16_t>(rpc::ErrorCode::AuthUnavailable) &&
+                ++fs.authUnavailable > kMaxFetchAuthUnavailableWithoutBind) {
+                refuse_(*impl, GroupFailReason::RetryBudgetExhausted);
+                return true;
+            }
             if (errorCode == 0) {
                 fs.subscriptionId = subscriptionId;
                 fs.redirects      = 0;
                 fs.egressRefusals = 0;   // F4: bound
+                fs.authUnavailable = 0;
             } else {
                 fs.epoch        = 0;     // nothing registered (UnknownTopic / UnknownPartition / ...)
                 fs.brokerSid    = 0;
@@ -1681,6 +1689,7 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
                 fs.corrId         = 0;
                 fs.redirects      = 0;
                 fs.egressRefusals = 0;   // F4: bound
+                fs.authUnavailable = 0;
             } else if (rv.subscriptionId != fs.subscriptionId) {
                 continue;
             }
@@ -1925,6 +1934,7 @@ void GroupConsumerHub::onSyncGroupResponse(const uint8_t* buf, std::size_t len,
 
             // #431: heartbeat answers of earlier episodes (sent before this Sync) are no longer applied.
             impl->hbSeqLo = impl->ctlSeq + 1;
+            impl->hbAuthUnavailable = 0;
             if (impl->hbSeqLo == 0) impl->hbSeqLo = 1;
             impl->state = GroupConsumerState::Stable;
 
@@ -1981,9 +1991,17 @@ void GroupConsumerHub::onHeartbeatResponse(const uint8_t* buf, std::size_t len,
             static_cast<uint16_t>(opt->errorCode));
 
         // Issue #607: AuthUnavailable (48) - the coordinator's security state is catching up: the member stays Stable
-        // (no rejoin, backoffRejoins untouched); the next Heartbeat at its normal cadence is the retry, and an
-        // eviction shows up as UnknownMember later.
-        if (ec == rpc::ErrorCode::AuthUnavailable) break;
+        // (no rejoin, backoffRejoins untouched); the next Heartbeat at its normal cadence is the retry.  C4 review:
+        // within a budget - kMaxHeartbeatAuthUnavailable in a row span a session timeout, after which the member may
+        // already be evicted and its partitions reassigned: it rejoins (paced) rather than consume on (split-brain).
+        if (ec == rpc::ErrorCode::AuthUnavailable) {
+            if (++impl->hbAuthUnavailable >= kMaxHeartbeatAuthUnavailable) {
+                impl->hbAuthUnavailable = 0;
+                rejoinWithBackoff_(*impl);
+            }
+            break;
+        }
+        impl->hbAuthUnavailable = 0;
         switch (classifyGroupAnswer_(ec)) {
         case GroupVerdict::Ok:      impl->backoffRejoins = 0; break;   // fix round 3: proven healthy — budget reset
         case GroupVerdict::Rejoin:  toRejoining_(*impl); break;
@@ -2019,11 +2037,16 @@ void GroupConsumerHub::onOffsetCommitResponse(const uint8_t* buf, std::size_t le
         }
         int16_t err = 0;
         bool    unstable = false;
+        int16_t transientCode = 0;
         for (std::size_t i = 0; i < opt->results.size(); ++i) {
             const auto r = opt->results[i];
             // Issue #607: AuthUnavailable (48) is waited out exactly like UnstableOffsetCommit.
             if (r.errorCode == static_cast<int16_t>(rpc::ErrorCode::UnstableOffsetCommit) ||
-                r.errorCode == static_cast<int16_t>(rpc::ErrorCode::AuthUnavailable)) { unstable = true; continue; }
+                r.errorCode == static_cast<int16_t>(rpc::ErrorCode::AuthUnavailable)) {
+                unstable = true;
+                transientCode = r.errorCode;
+                continue;
+            }
             if (r.errorCode != 0) { err = r.errorCode; break; }
         }
         if (err == 0 && unstable) {
@@ -2033,6 +2056,7 @@ void GroupConsumerHub::onOffsetCommitResponse(const uint8_t* buf, std::size_t le
             impl->commitSync.retryBackoffNs = impl->commitSync.retryBackoffNs == 0
                 ? kCommitRetryMinNs : std::min<int64_t>(impl->commitSync.retryBackoffNs * 2, kCommitRetryMaxNs);
             impl->commitSync.retryDueNs = 0;   // armed by the next sweep
+            impl->commitSync.lastRetriedCode = static_cast<uint16_t>(transientCode);
             break;
         }
         if (err != 0) {
@@ -2088,6 +2112,12 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
                 // transaction completes or times out), so it is not charged to kMaxOffsetFetchAttempts.
                 if (ec == rpc::ErrorCode::UnstableOffsetCommit && r.topicId >= 0) {
                     unstable = true;
+                    continue;
+                }
+                // #607 class: AuthUnavailable (48) = the broker cannot check security yet (booting / behind,
+                // whole-request {-1,-1,48} or per entry) - transient, re-sent paced within kMaxOffsetFetchAttempts.
+                if (ec == rpc::ErrorCode::AuthUnavailable) {
+                    retriableError = true;
                     continue;
                 }
                 if (r.topicId < 0 || v == GroupVerdict::Refuse) {

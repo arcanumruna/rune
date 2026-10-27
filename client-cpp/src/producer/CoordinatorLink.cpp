@@ -24,11 +24,15 @@ constexpr int16_t kIllegalGeneration      = static_cast<int16_t>(rpc::ErrorCode:
 constexpr int16_t kUnknownMember          = static_cast<int16_t>(rpc::ErrorCode::UnknownMember);
 constexpr int16_t kAuthenticationFailed   = static_cast<int16_t>(rpc::ErrorCode::AuthenticationFailed);  // 44..47
 constexpr int16_t kPasswordChangeRequired = static_cast<int16_t>(rpc::ErrorCode::PasswordChangeRequired);
+constexpr int16_t kAuthUnavailable        = static_cast<int16_t>(rpc::ErrorCode::AuthUnavailable);         // 48
 }  // namespace
 
 Verdict CoordinatorLink::classify(ReqKind kind, int16_t ec) noexcept {
     if (ec == kOk) return Verdict::Ok;
     if (ec == kConcurrentTransactions) return Verdict::Retry;         // retriable everywhere
+    // #607 class: AuthUnavailable (48) = the broker cannot check security yet (booting / behind): transient on every
+    // leg, retried with backoff until the request's deadline - never fatal, never an abort.
+    if (ec == kAuthUnavailable) return Verdict::Retry;
     if (ec == kNotCoordinator) return Verdict::Rediscover;            // re-discover, then re-send
     if (ec == kProducerFenced || ec == kInvalidProducerEpoch) return Verdict::Fenced;
     // The broker could not decode the request: re-sending the same bytes fails the same way.

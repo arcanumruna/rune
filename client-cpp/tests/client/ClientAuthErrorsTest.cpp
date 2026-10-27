@@ -177,6 +177,27 @@ TEST(ClientAuthErrorsRegression, ARateLimitedLoginReportsRetryAfterOnTheConnectF
     EXPECT_EQ(f.outcome().c.aux, 800) << "Completion::aux = the broker's retryAfterMs";
 }
 
+// C4 review (#461 / #519): a retry-after that outlives the connect deadline.  The deadline falls inside the paced retry;
+// the connect must fail with the broker's verdict (44) and its retry-after, not a bare Timeout that loses both, and the
+// retry must stop - no login behind a connect that already failed.
+TEST(ClientAuthErrorsRegression, ARetryAfterBeyondTheConnectDeadlineReportsTheVerdictAndStopsRetryingRegression) {
+    rc::ClientConfig c = authCfg(3920, "ws1", "not the password!");
+    c.connectTimeoutMs = 2'000;
+    Rig r(c);
+    r.gw.retryAfterMsOnFailure = 5'000;   // > connectTimeoutMs
+    test_support::TestCq cq(r.client);
+    auto f = r.connectOp(cq);
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000));
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::NotConnected) << f.describe();
+    EXPECT_EQ(f.outcome().c.errorCode, 44) << "the broker's verdict, not a bare Timeout";
+    EXPECT_EQ(f.outcome().c.aux, 5'000) << "Completion::aux = the broker's retryAfterMs";
+    EXPECT_EQ(r.gw.authFailed, 1);
+    // Well past the retry-after: the abandoned retry never logs in again.
+    r.passes(200, 100'000'000);
+    EXPECT_EQ(r.gw.authFailed, 1) << "the retry stopped with the failed connect";
+    EXPECT_EQ(r.client.testSessionStateAt(0), rc::session::SessionState::Disconnected);
+}
+
 TEST(ClientAuthErrorsRegression, ABrokerThatCannotProveThePasswordIsRefused) {
     Rig r(authCfg(3710, "ws1", kPw));
     r.gw.breakServerSignature = true;

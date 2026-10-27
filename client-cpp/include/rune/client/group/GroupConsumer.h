@@ -277,6 +277,7 @@ struct GroupConsumerImpl {
         bool     rewound        = false;  // Task 10: restarted by a seek, not yet re-bound (the pending Rewind waits on it)
         uint8_t  redirects      = 0;      // consecutive Redirects without a bind
         uint8_t  egressRefusals = 0;      // PR #441 F4: RecordEgressUnavailable answers since the last bind
+        uint8_t  authUnavailable = 0;     // C4 review (#607): AuthUnavailable (48) answers since the last bind
     };
     std::map<TopicPartition, FetchSub> fetch;
     // MEDIUM-2: OffsetFetch re-send pacing (duty-clock ns; 0 = due).
@@ -311,6 +312,9 @@ struct GroupConsumerImpl {
     // earliest time the next JoinGroup may go out.
     uint32_t backoffRejoins = 0;
     std::chrono::steady_clock::time_point rejoinNotBefore{};
+    // C4 review (#607): consecutive Heartbeats answered AuthUnavailable (48) in this Stable episode
+    // (cap: GroupConsumerHub::kMaxHeartbeatAuthUnavailable); any other answer resets it.
+    uint32_t hbAuthUnavailable = 0;
 
     // ---- Timers (duty thread) -------------------------------------------------
     std::chrono::steady_clock::time_point nextHeartbeat;
@@ -346,6 +350,9 @@ struct GroupConsumerImpl {
         // sweep on the duty clock), backing off retryBackoffNs.
         int64_t          retryDueNs     = -1;
         int64_t          retryBackoffNs = 0;
+        // C4 review (#607): the code of the last transient answer being waited out (48 / UnstableOffsetCommit; 0 =
+        // none) - a deadline that ends the retry reports it as the Timeout's errorCode, so the caller learns why.
+        uint16_t         lastRetriedCode = 0;
     };
     bool              hasCommitSync {false};
     PendingCommitSync commitSync{};

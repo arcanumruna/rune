@@ -2152,10 +2152,14 @@ int Client::driveDdl_(int64_t nowNs) {
                                      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kWhy.data()),
                                                               kWhy.size()));
                     } else {
-                        failDdl_(i, static_cast<uint16_t>(due.cause == DdlResendCause::AuthUnavailable
+                        // C4 review: the text names the cause the code reports (48 is not "not leader").
+                        const bool authUnavailable = due.cause == DdlResendCause::AuthUnavailable;
+                        failDdl_(i, static_cast<uint16_t>(authUnavailable
                                                               ? rune::protocol::client::ErrorCode::AuthUnavailable
                                                               : rune::protocol::client::ErrorCode::NotLeader),
-                                 "not leader: the seed can never reconnect", ddlNoValue(p.op));
+                                 authUnavailable ? "AuthUnavailable: the seed can never reconnect"
+                                                 : "not leader: the seed can never reconnect",
+                                 ddlNoValue(p.op));
                     }
                     ++work;
                     break;
@@ -2425,9 +2429,24 @@ void Client::sweepControl_(int64_t nowNs) {
         if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(why)); });
     }
     if (hasPendingConnect_ && nowNs >= pendingConnect_.deadlineNs) {
-        completeConnect_(OpStatus::Timeout, 0, 0, {});
-        if (cbError_) {
-            invokeUserCallback_("onError", [&] { cbError_("connect() timed out"); });
+        // C4 review (#461 / #519): the deadline fell inside a transient-refusal retry (a 48, or a rate-limited 44 whose
+        // retry-after outlives the deadline).  The connect fails with the broker's verdict and retry-after, not a bare
+        // Timeout, and the retry stops so nothing reconnects behind the failed connect.
+        const int16_t last = agent_.seedMachine().lastConnectError();
+        const uint32_t retryAfter = agent_.seedMachine().authRetryAfterMs();
+        if (agent_.seedSession().machine.abandonTransientRetry()) {
+            static constexpr std::string_view kRefused =
+                "connect() timed out while retrying a transient refusal (AuthUnavailable / rate-limited login)";
+            const bool rateLimited =
+                last == static_cast<int16_t>(static_cast<uint16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed));
+            completeConnect_(OpStatus::NotConnected, 0, static_cast<uint16_t>(last), kRefused,
+                             rateLimited ? static_cast<int64_t>(retryAfter) : 0);
+            if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(kRefused)); });
+        } else {
+            completeConnect_(OpStatus::Timeout, 0, 0, {});
+            if (cbError_) {
+                invokeUserCallback_("onError", [&] { cbError_("connect() timed out"); });
+            }
         }
     }
     for (std::size_t i = 0; i < pendingCtl_.size();) {

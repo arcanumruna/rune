@@ -1041,6 +1041,57 @@ TEST(GroupRoutingRegression, OffsetFetchRetriableErrorIsBoundedRegression) {
     EXPECT_EQ(r.gw.offsetFetches, 9) << "1 fetch + kMaxOffsetFetchAttempts (8) re-fetches";
 }
 
+// C4 review (#607 class): AuthUnavailable (48) on an OffsetFetch - whole-request {-1, -1, 48} (#603's
+// answerSecurityBehind_) or per entry - is the broker catching up on security, never a refusal: it is re-fetched
+// (paced) and the consumer recovers once the broker answers.  RED before: the first 48 refused the consumer for good.
+TEST(GroupRoutingRegression, OffsetFetchAnswered48IsRefetchedAndRecoversRegression) {
+    for (const bool wholeRequest : {true, false}) {
+        GroupRig r(wholeRequest ? 4930 : 4932, wholeRequest ? 4931 : 4933);
+        const auto [n1, p1port] = r.addNode(wholeRequest ? 4930 : 4932);
+        r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+        const int32_t gwPort = wholeRequest ? 4930 : 4932;
+        r.gw.partitions      = {{1, 0, 0, 1, gwPort, ""}, {1, 1, 1, 1, gwPort, ""}};
+        r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+        r.gw.groupAssignment = {{1, 1}};
+        const auto k48 = static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthUnavailable);
+        if (wholeRequest) {
+            r.gw.offsetFetchRejectCode = k48;
+            r.gw.offsetFetchRejectNext = 2;
+        } else {
+            r.gw.offsetFetchErrorCode  = k48;
+            r.gw.offsetFetchErrorsNext = 2;
+        }
+        auto gc = r.client.subscribeGroup("g", {"t"});
+        r.connect();
+        ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+        r.gw.releaseJoins();
+        ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr || gc.finished(); }, 80'000'000))
+            << "wholeRequest=" << wholeRequest << " fetches: " << r.gw.offsetFetches;
+        EXPECT_FALSE(gc.finished()) << "wholeRequest=" << wholeRequest << ": a transient 48 ended the consumer";
+        EXPECT_EQ(r.gw.offsetFetches, 3) << "wholeRequest=" << wholeRequest << ": two 48s, then the served fetch";
+    }
+}
+
+// C4 review (#607 class): a broker that answers every OffsetFetch 48 ends the consumer within the same budget as any
+// other retriable OffsetFetch error (RetryBudgetExhausted), never a fast refusal and never a loop.
+TEST(GroupRoutingRegression, OffsetFetchAnswered48ForeverIsBoundedRegression) {
+    GroupRig r(4934, 4935);
+    const auto [n1, p1port] = r.addNode(4934);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions            = {{1, 0, 0, 1, 4934, ""}, {1, 1, 1, 1, 4934, ""}};
+    r.gw.subscribeLeader       = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment       = {{1, 1}};
+    r.gw.offsetFetchRejectCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthUnavailable);
+    r.gw.offsetFetchRejectNext = 1'000;
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 80'000'000)) << "fetches: " << r.gw.offsetFetches;
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RetryBudgetExhausted);
+    EXPECT_EQ(r.gw.offsetFetches, 9) << "1 fetch + kMaxOffsetFetchAttempts (8) re-fetches";
+}
+
 // No-hang fix round 2: an OffsetCommit the broker rejects (InvalidRequest /
 // Internal as its {-1, -1, code} entry) completes the pending commitSync with
 // BrokerError and that code — never left pending.

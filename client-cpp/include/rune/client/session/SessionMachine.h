@@ -459,7 +459,7 @@ public:
     /// Authentication: the retryAfterMs of the AuthServerFinal{44} that last refused this session (0 = none).
     [[nodiscard]] uint32_t authRetryAfterMs() const noexcept { return authInfo_.retryAfterMs; }
     [[nodiscard]] int      unavailableRetries() const noexcept { return unavailableRetries_; }
-    /// Issue #461: in Backoff because a transient refusal (48 / rate-limited 44) before Live is being retried within
+    /// Issue #461: in Backoff because a transient refusal (48 / rate-limited 44) on a connect is being retried within
     /// maxUnavailableRetries - not because the machine gave up.
     [[nodiscard]] bool     retryingTransientRefusal() const noexcept {
         return state_ == SessionState::Backoff && unavailableRetries_ > 0 &&
@@ -470,6 +470,28 @@ public:
     /// a machine built alone (tests) uses its own.  Duty thread, before the first connect.
     void useScramCache(ScramCache* cache) noexcept { cache_ = cache != nullptr ? cache : &ownCache_; }
     /// client<->broker TLS/AEAD (Task 5): the session's crypto state.  `encrypted`
+    /// C4 review (#461): the caller's connect deadline passed while a transient refusal (48 / rate-limited 44) on a
+    /// connect was being retried.  The retry ends here (-> Disconnected) so nothing reconnects behind a connect that
+    /// already failed; lastConnectError() and authRetryAfterMs() keep the refusal for the report.  Returns whether it
+    /// abandoned anything.  A reconnect-forever session (Live before) is never stopped here.
+    bool abandonTransientRetry() noexcept {
+        if (reconnectsForever_() || unavailableRetries_ == 0) return false;
+        if (lastConnectError_ != static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthUnavailable) &&
+            lastConnectError_ != static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed)) {
+            return false;
+        }
+        switch (state_) {
+            case SessionState::Backoff:
+            case SessionState::Connecting:
+            case SessionState::Handshaking:
+            case SessionState::Authenticating:
+                hs_.reset();
+                transitionTo(SessionState::Disconnected);
+                return true;
+            default:
+                return false;
+        }
+    }
     /// is false until the handshake completes (or if no cipher was negotiated).
     [[nodiscard]] const CryptoState& cryptoState() const noexcept { return cryptoState_; }
     /// Mutable overload — AeadCipher::seal/open are non-const (they advance the
@@ -972,6 +994,11 @@ public:
                 redirectCount_++;
 
                 // FIX B: if the message field carries a non-empty endpoint string,
+            } else if (ec == rpc::ErrorCode::AuthUnavailable) {
+                // C4 review (#461): the broker could not check security for this login - transient, retried (paced,
+                // bounded) like a 48 on the ConnectResponse, never waited out to the handshake timeout.
+                scram_.reset();
+                onAuthUnavailable_(nowNs);
                 // this is the real broker-gateway redirect path — retarget.
                 // FIX F8: retarget is noexcept; a failed retarget keeps the old
                 // endpoint and we still resend (no throw into noexcept dispatch).
@@ -1407,7 +1434,7 @@ private:
         ++connectFailures_;
         cryptoState_ = CryptoState{};
         if (retryAfterMs > 0 &&   // Issue #519: a rate-limited login before Live is a bounded retry, not a verdict
-            retryTransientBeforeLive_(static_cast<int16_t>(static_cast<uint16_t>(ec)),
+            retryTransientRefusal_(static_cast<int16_t>(static_cast<uint16_t>(ec)),
                                       nowNs + static_cast<int64_t>(retryAfterMs) * 1'000'000LL, nowNs)) {
             return;
         }
@@ -1423,12 +1450,16 @@ private:
         transitionTo(SessionState::Rejected);
     }
 
-    /// Issues #461 / #519 / #613: a transient refusal before this session was ever Live (the broker's security state is
-    /// catching up, its unauthenticated-session cap is full, the login throttle asks for a pause): retried with Backoff,
-    /// at least `notBeforeNs`, within maxUnavailableRetries - then Disconnected with the code, never Rejected.
-    /// False when it does not apply (the session was Live: the caller keeps its own path).
-    bool retryTransientBeforeLive_(int16_t code, int64_t notBeforeNs, int64_t nowNs) noexcept {
-        if (everLive_) return false;
+    /// Issues #461 / #519 / #613: a transient refusal on a connect (the broker's security state is catching up, its
+    /// unauthenticated-session cap is full, the login throttle asks for a pause): retried with Backoff, at least
+    /// `notBeforeNs`, within maxUnavailableRetries (reset by a fresh connect() and by Live) - then Disconnected with the
+    /// code, never Rejected.  C4 review: this holds on EVERY connect of a session that does not reconnect forever (a
+    /// re-connect() after Live too); a reconnect-forever session that was Live keeps its own unbounded Backoff path
+    /// (false: the caller goes on).  A session the client revives on demand (node sessions) ends its budget in
+    /// Backoff, never Disconnected: a revive from Disconnected is immediate, so it would storm the refusing broker.
+    bool retryTransientRefusal_(int16_t code, int64_t notBeforeNs, int64_t nowNs) noexcept {
+        // A live session the broker ended (ErrorResponse 48, corr 0) is no connect in progress: the caller's path.
+        if (reconnectsForever_() || state_ == SessionState::Connected) return false;
         hs_.reset();
         cryptoState_            = CryptoState{};
         scram_.reset();
@@ -1436,11 +1467,11 @@ private:
         authenticatedSessionId_ = 0;
         lastConnectError_       = code;
         ++connectFailures_;
-        if (unavailableRetries_ >= cfg_.maxUnavailableRetries) {
+        if (unavailableRetries_ >= cfg_.maxUnavailableRetries && !cfg_.revivedOnDemand) {
             transitionTo(SessionState::Disconnected);
             return true;
         }
-        ++unavailableRetries_;
+        if (unavailableRetries_ < cfg_.maxUnavailableRetries) ++unavailableRetries_;
         enterBackoff_(nowNs);
         if (backoff_.nextAttemptNs < notBeforeNs) backoff_.nextAttemptNs = notBeforeNs;
         return true;
@@ -1663,8 +1694,8 @@ private:
     /// OK nor a redirect.
     void onConnectError_(rune::protocol::client::ErrorCode ec, int64_t nowNs) noexcept {
         namespace rpc = rune::protocol::client;
-        if (ec == rpc::ErrorCode::AuthUnavailable &&   // Issue #461: a transient refusal before Live is retried
-            retryTransientBeforeLive_(static_cast<int16_t>(static_cast<uint16_t>(ec)), 0, nowNs)) return;
+        if (ec == rpc::ErrorCode::AuthUnavailable &&   // Issue #461: a transient refusal on a connect is retried
+            retryTransientRefusal_(static_cast<int16_t>(static_cast<uint16_t>(ec)), 0, nowNs)) return;
         if (cfg_.offerCrypto && cfg_.requireCrypto &&
             (state_ == SessionState::Connecting || state_ == SessionState::Handshaking)) {
             onPreTlsRefusal_(static_cast<int16_t>(static_cast<uint16_t>(ec)), nowNs);   // issue #14: unauthenticated

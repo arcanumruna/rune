@@ -297,6 +297,56 @@ TEST(CoordinatorLinkRegression, NotLeaderOnAddPartitionsAndTxnOffsetCommitIsRetr
     EXPECT_EQ(pumpNoExpiry(link, 2 + CoordinatorLink::backoffNs(1)), 1) << "offered again after the backoff";
 }
 
+// C4 review (#607 class): AuthUnavailable (48) = the broker cannot check security yet (booting / behind, #603).  On
+// every coordinator leg it is retried in place with backoff: a 48 then OK succeeds, and 48 forever ends at the
+// request's deadline (an expiry), never Fatal and never an abort.  RED before: InitProducerId 48 was Fatal and
+// AddPartitions / AddOffsets / TxnOffsetCommit 48 aborted the transaction.
+TEST(CoordinatorLinkRegression, AuthUnavailableIsRetriedOnEveryLegUntilTheDeadlineRegression) {
+    constexpr int16_t k48 = static_cast<int16_t>(rpc::ErrorCode::AuthUnavailable);
+    for (ReqKind k : {ReqKind::InitProducerId, ReqKind::EndTxn, ReqKind::AddPartitions, ReqKind::AddOffsets,
+                      ReqKind::TxnOffsetCommit}) {
+        const int ki = static_cast<int>(k);
+        EXPECT_EQ(CoordinatorLink::classify(k, k48), Verdict::Retry) << "kind " << ki;
+
+        // One 48, then OK: retried in place, then handed back as a success.
+        {
+            FakeCoordinator fake;
+            CoordinatorLink link(0, fake.sink());
+            CoordinatorLink::Slot* s = send(link, k);
+            ASSERT_NE(s, nullptr);
+            ASSERT_EQ(pumpNoExpiry(link, 1), 1);
+            const auto f = FakeCoordinator::answer(k, s->corrId, k48);
+            EXPECT_EQ(link.onAnswer(asAnswer(f, k, s->corrId, k48), 2), nullptr) << "kind " << ki << ": not retried";
+            ASSERT_EQ(pumpNoExpiry(link, 2 + CoordinatorLink::backoffNs(1)), 1) << "kind " << ki;
+            const auto ok = FakeCoordinator::answer(k, s->corrId, 0);
+            EXPECT_EQ(link.onAnswer(asAnswer(ok, k, s->corrId, 0), 3 + CoordinatorLink::backoffNs(1)), s)
+                << "kind " << ki;
+        }
+        // 48 forever: bounded by the request deadline (expiry), never a terminal verdict before it.
+        {
+            FakeCoordinator fake;
+            CoordinatorLink link(0, fake.sink());
+            const int64_t deadline = 10 * CoordinatorLink::backoffNs(1);
+            CoordinatorLink::Slot* s = send(link, k, deadline);
+            ASSERT_NE(s, nullptr);
+            int expired = 0;
+            int64_t now = 1;
+            for (int i = 0; i < 1'000 && expired == 0; ++i) {
+                (void)link.pump(now, [&](CoordinatorLink::Slot&) { ++expired; });
+                if (expired != 0) break;
+                if (std::holds_alternative<CoordinatorLink::InFlight>(s->state)) {
+                    const auto f = FakeCoordinator::answer(k, s->corrId, k48);
+                    ASSERT_EQ(link.onAnswer(asAnswer(f, k, s->corrId, k48), now), nullptr)
+                        << "kind " << ki << ": a 48 was handed back as terminal";
+                }
+                now += CoordinatorLink::backoffNs(1);
+            }
+            EXPECT_EQ(expired, 1) << "kind " << ki << ": 48 forever never ended at the deadline";
+            EXPECT_GE(now, deadline) << "kind " << ki;
+        }
+    }
+}
+
 TEST(CoordinatorLink, NonRetriableAnswersAreHandedBackAndLateOnesIgnored) {
     FakeCoordinator fake;
     CoordinatorLink link(0, fake.sink());

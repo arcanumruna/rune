@@ -2783,6 +2783,46 @@ TEST_F(GroupConsumerHubTest, AFetchRefusedForeverWithoutABindEndsTheConsumerExpl
     EXPECT_EQ(refusals, GroupConsumerHub::kMaxEgressRefusalsWithoutBind + 1);
 }
 
+// C4 review (#607): a partition fetch answered AuthUnavailable (48) forever ends the consumer explicitly after its own
+// bounded budget; 48s separated by binds never do.  RED before: a 48 was parked and retried with no bound.
+TEST_F(GroupConsumerHubTest, AFetchAnswered48ForeverIsBoundedButRecoversAfterABindRegression) {
+    constexpr auto k48 = static_cast<int16_t>(rpc::ErrorCode::AuthUnavailable);
+    for (const bool withBinds : {false, true}) {
+        SCOPED_TRACE(withBinds ? "48s separated by binds" : "48 forever");
+        SetUp();
+        FakeFetchRouter fr;
+        fr.leader = {{0, 0u}, {1, 0u}};
+        hub_->setFetchRouter(fr.router());
+        stableWithTwoPartitions(*hub_, sink_);
+        auto ofr = makeOffsetFetchResponse(kTopicId, 1, 0);
+        hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+        int refusals = 0;
+        for (int round = 0; round < 8 * GroupConsumerHub::kMaxFetchAuthUnavailableWithoutBind && impl_->active; ++round) {
+            std::vector<rune::client::codec::SubscribeView> subs;
+            for (const auto& v : fr.subscribes(0)) if (v.partition == 1) subs.push_back(v);
+            ASSERT_FALSE(subs.empty()) << "round " << round << ": the fetch is re-subscribed after each 48";
+            const auto sub = subs.back();
+            if (withBinds && round % 4 == 3) {
+                ASSERT_TRUE(hub_->onFetchSubscribeResponse(sub.correlationId, 0, 900 + round));   // bound
+                int32_t t = -1, p = -1;
+                (void)hub_->onFetchSubscribeRefused(sub.correlationId, /*park=*/true, t, p);
+            } else {
+                ASSERT_TRUE(hub_->onFetchSubscribeResponse(sub.correlationId, k48, 0));
+                ++refusals;
+            }
+            hub_->unparkFetch();
+            (void)hub_->reconcileFetch();
+        }
+        if (withBinds) {
+            EXPECT_TRUE(impl_->active) << "48s separated by binds must never exhaust the budget";
+        } else {
+            EXPECT_FALSE(impl_->active) << "the consumer ends instead of re-subscribing forever";
+            EXPECT_EQ(impl_->failReason, GroupFailReason::RetryBudgetExhausted);
+            EXPECT_EQ(refusals, GroupConsumerHub::kMaxFetchAuthUnavailableWithoutBind + 1);
+        }
+    }
+}
+
 // Positive control: RecordEgressUnavailable answers separated by binds (an egress that recovers) never exhaust it.
 TEST_F(GroupConsumerHubTest, FetchRefusalsSeparatedByABindNeverEndTheConsumerRegression) {
     FakeFetchRouter fr;
@@ -3482,6 +3522,36 @@ TEST_F(GroupAuthUnavailableRegression, AHeartbeatAnswered48KeepsTheMemberStableR
     EXPECT_EQ(impl_->state, GroupConsumerState::Rejoining) << "an eviction still shows up as UnknownMember";
 }
 
+// C4 review (#607): the 48 ride-out is bounded.  kMaxHeartbeatAuthUnavailable heartbeats answered 48 in a row span a
+// session timeout - the coordinator may have evicted the member and reassigned its partitions - so the member rejoins
+// (paced) instead of consuming on as Stable (split-brain).  A served heartbeat in between resets the streak.
+// RED before: Stable forever.
+TEST_F(GroupAuthUnavailableRegression, HeartbeatsAnswered48ForASessionTimeoutRejoinRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    auto beatAnswered = [&](int16_t code) {
+        sink_.clear();
+        impl_->nextHeartbeat = std::chrono::steady_clock::time_point{};
+        hub_->doWork(0, kSessionId, sink_.fn());
+        const int64_t h = lastCorr(sink_, rpc::TemplateId::Heartbeat);
+        ASSERT_NE(h, 0);
+        auto r = makeHeartbeatResponse(code, h);
+        hub_->onHeartbeatResponse(r.data(), r.size(), kSessionId, sink_.fn());
+    };
+    const auto k48 = static_cast<int16_t>(rpc::ErrorCode::AuthUnavailable);
+    // Two 48s, then a served heartbeat: the streak resets, the member stays Stable.
+    for (uint32_t i = 0; i + 1 < GroupConsumerHub::kMaxHeartbeatAuthUnavailable; ++i) beatAnswered(k48);
+    ASSERT_EQ(impl_->state, GroupConsumerState::Stable);
+    beatAnswered(0);
+    for (uint32_t i = 0; i + 1 < GroupConsumerHub::kMaxHeartbeatAuthUnavailable; ++i) beatAnswered(k48);
+    EXPECT_EQ(impl_->state, GroupConsumerState::Stable) << "a served heartbeat must reset the 48 streak";
+    // The streak's last 48: past a session timeout - rejoin, paced through the backoff budget.
+    const auto rejoinsBefore = impl_->backoffRejoins;
+    beatAnswered(k48);
+    EXPECT_EQ(impl_->state, GroupConsumerState::Rejoining) << "48 for a whole session timeout kept the member Stable";
+    EXPECT_EQ(impl_->backoffRejoins, rejoinsBefore + 1) << "the rejoin is paced and charged to the backoff budget";
+    EXPECT_TRUE(impl_->active);
+}
+
 // Issue #607: a commitSync answered 48 is handled exactly like UnstableOffsetCommit - re-sent after a backoff on the
 // duty clock, never surfaced, bounded by the commitSync deadline.
 TEST_F(GroupAuthUnavailableRegression, ACommitSyncAnswered48IsResentRegression) {
@@ -3507,6 +3577,41 @@ TEST_F(GroupAuthUnavailableRegression, ACommitSyncAnswered48IsResentRegression) 
     ASSERT_TRUE(op.ready());
     EXPECT_EQ(op.status(), OpStatus::Ok);
     EXPECT_EQ(op.times(), 1);
+}
+
+// C4 review: a commitSync answered 48 until its deadline ends Timeout and CARRIES 48 (the caller learns why); a
+// commitSync that timed out with no transient answer still carries 0.
+TEST_F(GroupAuthUnavailableRegression, ACommitSyncAnswered48UntilItsDeadlineReports48Regression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 7);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    auto op = commitSyncOp(gc);
+    int64_t now = 1'000'000'000;
+    hub_->doWork(now, kSessionId, sink_.fn());
+    for (int i = 0; i < 64 && !op.ready(); ++i) {
+        const int64_t corr = lastCommitCorrId(sink_);
+        ASSERT_NE(corr, 0);
+        auto r = makeOffsetCommitResponse(corr, static_cast<int16_t>(rpc::ErrorCode::AuthUnavailable));
+        hub_->onOffsetCommitResponse(r.data(), r.size());
+        if (!impl_->hasCommitSync) break;
+        (void)hub_->sweepCommitSyncTimeouts(now);              // arms the retry
+        now = std::min(impl_->commitSync.retryDueNs, impl_->commitSync.deadlineNs);
+        (void)hub_->sweepCommitSyncTimeouts(now);              // re-sends, or the deadline ends it
+        hub_->doWork(now, kSessionId, sink_.fn());
+    }
+    ASSERT_TRUE(op.ready()) << "the commitSync deadline never bounded the 48 retry";
+    EXPECT_EQ(op.times(), 1);
+    EXPECT_EQ(op.status(), OpStatus::Timeout);
+    EXPECT_EQ(op.c().errorCode, static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) << "the 48 was lost";
+
+    auto op2 = commitSyncOp(gc);
+    hub_->doWork(now, kSessionId, sink_.fn());
+    ASSERT_TRUE(impl_->hasCommitSync);
+    now = impl_->commitSync.deadlineNs;
+    (void)hub_->sweepCommitSyncTimeouts(now);
+    ASSERT_TRUE(op2.ready());
+    EXPECT_EQ(op2.status(), OpStatus::Timeout);
+    EXPECT_EQ(op2.c().errorCode, 0u) << "an unanswered commitSync reports no broker code";
 }
 
 TEST_F(GroupConsumerHubRegression, AStaleJoinAnswerIsDroppedRegression) {
