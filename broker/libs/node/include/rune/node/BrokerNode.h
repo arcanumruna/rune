@@ -570,6 +570,13 @@ public:
                 onPurgeDroppedDir_(std::string_view(reinterpret_cast<const char*>(p), n));
                 return;
             }
+            if (tid == kMsgNsReapResult) {   // Phase 2 Task 7: the control thread's answer to a reaper request
+                ReapResultMsg m;
+                if (decodeReapResult(p, n, m)) worker_.onNsReapResult(m);
+                else if (badControlFrames_++ % 1024 == 0)
+                    spdlog::error("AdminWorkerAgent: malformed kMsgNsReapResult (len={}) refused", n);
+                return;
+            }
             if (badControlFrames_++ % 1024 == 0)
                 spdlog::error("AdminWorkerAgent: control→admin frame type={} len={} refused (unknown; refused "
                               "so far: {})", tid, n, badControlFrames_);
@@ -894,6 +901,12 @@ public:
         postCatalog_(kA2cSecurityServing, kSecurityServingWireLen, [&](uint8_t* p) {
             writeSecurityServing(p, caughtUp, leaderHw, epoch, asLeader, knownEnd, behind, held);
         });
+    }
+    /// Namespaces Phase 2 Task 7 - ADMIN thread only (deps.askControl): the reaper's request to the control thread, on the
+    /// effect FIFO behind every applied event it follows (never dropped).
+    bool postNsReapRequest(const ReapRequestMsg& m) {
+        postCatalog_(kA2cNsReapRequest, kReapRequestWireLen, [&](uint8_t* p) { writeReapRequest(p, m); });
+        return true;
     }
     [[nodiscard]] SecurityBootEffects securityBootEffects() const { return SecurityBootEffects{}; }
     [[nodiscard]] SecurityEffects securitySinkForBootStash() { return securitySink_(); }
@@ -1700,6 +1713,7 @@ public:
     }
     /// Test-only (Task 16): the topics / dropped ids the boot replay produced (immutable after start()).
     [[nodiscard]] const std::vector<TopicSpec>& bootTopicsForTest() const noexcept { return bootTopics_; }
+    [[nodiscard]] std::size_t nsDirMismatchesAtBootForTest() const noexcept { return nsDirMismatchesAtBoot_; }
     [[nodiscard]] const std::vector<int32_t>& bootDroppedIdsForTest() const noexcept { return bootDroppedIds_; }
     /// Test-only (F6): the open-file need the boot budget estimated from bootTopics_ (immutable after start()).
     [[nodiscard]] uint64_t fdNeedAtBootForTest() const noexcept { return fdNeedAtBoot_; }
@@ -2765,6 +2779,12 @@ private:
     std::vector<PendingCreateBehindDrop>                  pendingCreatesBehindDrop_;   // FIFO (per name)
     std::vector<std::string>                              purgeOutbox_;        // kMsgPurgeDroppedDir ring-full retry
     std::vector<std::vector<uint8_t>>                     cleanerPolicyOutbox_;  // kPolicyMsgType ring-full retry
+    std::vector<ReapResultMsg>                            reapResultOutbox_;     // kMsgNsReapResult ring-full retry (Task 7)
+    void onNsReapRequest_(const ReapRequestMsg& m);                              // control thread (Task 7)
+    void onNamespaceErasedDisk_(uint32_t nsId);                                  // control thread (Task 7, D18)
+    int  serviceErasedNamespaces_();                                             // control thread: the rename, once its topics retired
+    std::vector<uint32_t>                                 erasedNsAwaitingRename_;
+    std::size_t                                           nsDirMismatchesAtBoot_ = 0;   // '*.deleting' dirs of a live namespace (fatal)
     CleanerViewChannel*                                   cleanerViewChannel_ = nullptr;   // owned by runtimeAgent_
     void fanoutViewPlan_(ViewPlanUpdateMsg msg);   // control thread
     int  pumpViewFanout_();                        // control thread (every cycle)

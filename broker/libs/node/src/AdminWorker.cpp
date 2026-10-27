@@ -17,6 +17,7 @@
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/SchemaMessages.h>   // kSchemaLineageFingerprint (#418)
 #include <rune/replication/PartitionReplica.h>
+#include <rune/security/SecurityQueries.h>
 #include <rune/replication/WorkerReplicationTransport.h>   // the __catalog plane (Task 6)
 #include <rune/view/AggState.h>      // rune::view::isAggregateView (Phase 2a)
 #include <rune/view/PlanCompiler.h>  // rune::view::compileView
@@ -283,7 +284,8 @@ AdminWorker::AdminWorker(SchemaRegistry& reg,
     , viewRegistry_(viewRegistry != nullptr ? viewRegistry : ownViews_.get())
     , catalogReplica_(catalogReplica)
     , catalogPlane_(catalogPlane)
-    , applier_(catalogDirOf(catalogReplica), reg, *viewRegistry_) {
+    , applier_(catalogDirOf(catalogReplica), reg, *viewRegistry_)
+    , reaper_(deps_.nsDeleteBatch) {
     securityCatchUp_ = SecurityCatchUp{deps_.securityMaxStalenessNs};   // issues #15 / #111: F from the config
     if (catalogReplica_ != nullptr) {
         // One max fetch + the batch framing slack the worker's scratch carries.
@@ -741,7 +743,73 @@ int AdminWorker::doWork(int64_t nowNs) {
         startNext_(nowNs);
         ++work;
     }
+    work += stepReaper_(nowNs);   // after the DDL queue: a client DDL in flight keeps its turn
     return work;
+}
+
+// Namespaces Phase 2 Task 7: the reaper's hands.  Admin thread only.
+struct AdminWorker::ReaperPortImpl final : ReaperPort {
+    AdminWorker& w;
+    explicit ReaperPortImpl(AdminWorker& worker) : w(worker) {}
+    bool askControl(uint64_t correlation, ReapOp op, uint32_t nsId, uint32_t batch) override {
+        if (!w.deps_.askControl) {   // no control thread in this rig: nothing it owns needs cleaning (answered next pass)
+            w.deferredControlDone_ = correlation;
+            return true;
+        }
+        return w.deps_.askControl(ReapRequestMsg{correlation, op, nsId, batch});
+    }
+    bool submitDrop(uint64_t correlation, uint32_t nsId, bool isView, const std::string& name) override {
+        if (w.pending_.size() >= kMaxPendingDdl) return false;
+        DdlMeta meta;
+        meta.statement     = std::string(isView ? "DROP VIEW " : "DROP TOPIC ") + name + "; -- namespace delete";
+        meta.clientName    = "rune-broker";
+        meta.authenticated = "__system";   // not a valid user name: only the broker itself writes it
+        if (isView) {
+            DropViewMsg m;
+            m.session = kReaperSession; m.corr = static_cast<int64_t>(correlation); m.name = name; m.meta = std::move(meta); m.nsId = nsId;
+            w.submit(DdlRequest{std::move(m)});
+        } else {
+            DropTopicMsg m;
+            m.session = kReaperSession; m.corr = static_cast<int64_t>(correlation); m.name = name; m.meta = std::move(meta); m.nsId = nsId;
+            w.submit(DdlRequest{std::move(m)});
+        }
+        return true;
+    }
+    bool submitDeleteStep(uint64_t correlation, uint32_t nsId, uint8_t step) override {
+        if (w.pending_.size() >= kMaxPendingDdl) return false;
+        NamespaceDdlMsg m;
+        m.session = kReaperSession; m.corr = static_cast<int64_t>(correlation);
+        m.kind = kNsDdlInternalDeleteStep; m.mode = step; m.nsId = nsId;
+        m.meta.statement     = "NAMESPACE DELETE STEP " + std::to_string(step) + "; -- namespace delete";
+        m.meta.clientName    = "rune-broker";
+        m.meta.authenticated = "__system";
+        w.submit(DdlRequest{std::move(m)});
+        return true;
+    }
+    bool securityClean(uint32_t nsId, std::string_view name) override {
+        if (!w.securityApplier_) return true;   // no __security on this broker (a rig): nothing to purge
+        return !rune::security::hasNamespaceRecords(w.securityApplier_->state(), nsId, name);
+    }
+};
+
+int AdminWorker::stepReaper_(int64_t nowNs) {
+    if (catalogReplica_ == nullptr) return 0;
+    if (!isLeader() || applier_.halted()) {   // only the catalog leader steps it; a lost leadership drops its in-flight work
+        reaper_.onLeadershipLost();
+        deferredControlDone_ = 0;
+        return 0;
+    }
+    if (deferredControlDone_ != 0) {
+        const uint64_t c = deferredControlDone_;
+        deferredControlDone_ = 0;
+        reaper_.onControlResult(c, ReapStatus::Done);
+    }
+    ReaperPortImpl port{*this};
+    return reaper_.doWork(nowNs, applier_.state(), port);
+}
+
+bool AdminWorker::isReaperRequest_(const DdlRequest& req) noexcept {
+    return std::visit([](const auto& m) noexcept { return m.session == kReaperSession; }, req);
 }
 
 // Issues #15 / #111 (decision M7): is this broker's `__security` state caught up and fresh?  Posted on change.
@@ -1167,6 +1235,12 @@ void AdminWorker::answerOk_(const DdlRequest& req, const cat::RequestRecord& r) 
 }
 
 void AdminWorker::respond_(const DdlRequest& req, const Response& r) {
+    // Task 7: the reaper's own DDL is answered to the reaper, never to a session.
+    if (isReaperRequest_(req)) {
+        const int64_t corr = std::visit([](const auto& m) noexcept { return m.corr; }, req);
+        reaper_.onDdlResult(static_cast<uint64_t>(corr), r.code);
+        return;
+    }
     // A detail rides an ErrorResponse for the pre-v8 response types (their own
     // frames have no detail field) — InvalidRequest only (spec §9).
     const bool viaError = r.code == kInvalidRequest && !r.detail.empty() && deps_.respondError;
@@ -1202,7 +1276,11 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
         if constexpr (!std::is_same_v<M, NamespaceDdlMsg> && !std::is_same_v<M, ListNamespacesMsg> &&
                       !std::is_same_v<M, MalformedDdl>) {
             const cat::NamespaceRecord* nsr = s.namespaces().byId(m.nsId);
-            if (nsr == nullptr || std::holds_alternative<cat::NsDeleting>(nsr->state))
+            // D17: the catalog drops (DropTopic, DropView) are accepted on a DELETING namespace - the reaper's own,
+            // never a client's (a client cannot name a DELETING namespace; its name left the index).
+            constexpr bool isDrop = std::is_same_v<M, DropTopicMsg> || std::is_same_v<M, DropViewMsg>;
+            const bool deletingOk = isDrop && m.session == kReaperSession;
+            if (nsr == nullptr || (std::holds_alternative<cat::NsDeleting>(nsr->state) && !deletingOk))
                 return Rejected(reject(kUnknownTopic, "no namespace with id " + std::to_string(m.nsId)));
         }
         if constexpr (std::is_same_v<M, DefineTopicMsg>)      return buildDefine_(m, s);
@@ -1548,6 +1626,20 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
     namespace pc = rune::protocol::client;
     const cat::NamespaceRegistry& nss = s.namespaces();
     cat::CatalogEvent e;
+    if (m.kind == kNsDdlInternalDeleteStep) {   // Task 7: the reaper's NamespaceDeleteStep; never from the wire
+        if (m.session != kReaperSession) return Rejected(reject(kInvalidRequest, "unknown namespace DDL kind 6"));
+        const cat::NamespaceRecord* rec = nss.byId(m.nsId);
+        if (rec == nullptr || !std::holds_alternative<cat::NsDeleting>(rec->state))
+            return Rejected(reject(kUnknownTopic, "no DELETING namespace with id " + std::to_string(m.nsId)));
+        if (!cat::validDeleteStep(m.mode)) return Rejected(reject(kInvalidRequest, "invalid namespace delete step"));
+        e.nsId        = rec->nsId;
+        e.objectId    = rec->nsId;
+        e.objectName  = rec->name;
+        e.prevVersion = rec->version;
+        e.newVersion  = rec->version + 1;
+        e.ops         = cat::NamespaceDeleteStepOps{m.mode};
+        return e;
+    }
     switch (static_cast<pc::NamespaceDdlKind>(m.kind)) {
     case pc::NamespaceDdlKind::Create: {
         if (!rune::catalog::validNamespaceName(m.name))

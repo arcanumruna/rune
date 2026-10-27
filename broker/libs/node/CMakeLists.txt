@@ -20,6 +20,7 @@ add_library(rune_node
     src/CatalogApplier.cpp
     src/SecurityApplier.cpp
     src/SecurityAdmin.cpp
+    src/NamespaceReaper.cpp
     src/PeerLinkAgent.cpp
     src/CatalogReadServer.cpp
     src/CatalogEffectFrames.cpp
@@ -1803,6 +1804,21 @@ if(BUILD_TESTING)
         target_link_libraries(rune_ns_keyed_stores_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_ns_keyed_stores_tests PROPERTIES TIMEOUT 600)
+
+        # Namespaces Phase 2 Task 7 (D17, D18; rule 16): the namespace reaper - the state machine over a real CatalogState,
+        # and three real AdminWorkers (leader change after each durable step).
+        add_executable(rune_namespace_reaper_tests tests/node/NamespaceReaperRegressionTest.cpp)
+        target_include_directories(rune_namespace_reaper_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_reaper_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
+                              aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_reaper_tests PROPERTIES TIMEOUT 600)
+
+        # Namespaces Phase 2 Task 7 (D17, D18): delete to the end through the REAL client against ONE real broker.
+        add_executable(rune_namespace_delete_tests tests/client/NamespaceDeleteRegressionTest.cpp)
+        target_include_directories(rune_namespace_delete_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_delete_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_delete_tests PROPERTIES TIMEOUT 900)
 
         # Namespaces Phase 2 Task 6b (D20): tombstones of a deleted namespace's offsets and transaction state.
         add_executable(rune_namespace_tombstone_tests tests/node/NamespaceTombstoneRegressionTest.cpp)

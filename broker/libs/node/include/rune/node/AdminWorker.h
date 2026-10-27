@@ -39,6 +39,7 @@
 #include "rune/node/CatalogPartition.h"
 #include "rune/node/CatalogReadServer.h"
 #include "rune/node/NamespaceLimitDefaults.h"
+#include "rune/node/NamespaceReaper.h"
 #include "rune/node/SecurityAdmin.h"
 #include <rune/peerlink/PeerFrameCrypto.h>
 #include "rune/node/SecurityApplier.h"
@@ -143,6 +144,14 @@ struct AdminDeps {
     NamespaceLimitDefaults nsDefaults;
     /// RUNE_MAX_NAMESPACES: a Create when the registry holds this many (default included) is refused (52 / 39).
     uint32_t maxNamespaces = 1024;
+    /// Namespaces Phase 2 Task 7: how the namespace reaper asks the CONTROL thread (which owns the offset and
+    /// transaction-state stores and the transaction coordinator) for one idempotent step of a delete - production posts
+    /// kA2cNsReapRequest on the admin->control FIFO and the answer returns as kMsgNsReapResult (onNsReapResult).
+    /// false = could not be queued now (retried next pass).  Unset (rigs without a control thread): there is nothing to
+    /// clean on a control thread, so every such step counts as done at once.
+    std::function<bool(const ReapRequestMsg&)> askControl;
+    /// RUNE_NS_DELETE_BATCH (tombstones per control call).
+    uint32_t nsDeleteBatch = 256;
 };
 
 // ---------------------------------------------------------------------------
@@ -362,6 +371,11 @@ public:
     /// Drive the plane, the replica and the applier; advance / start DDL.
     int doWork(int64_t nowNs);
 
+    /// control -> admin (Task 7): the answer of one reaper control request.
+    void onNsReapResult(const ReapResultMsg& m) noexcept { reaper_.onControlResult(m.correlation, m.status); }
+    [[nodiscard]] NamespaceReaper& reaperForTest() noexcept { return reaper_; }
+    [[nodiscard]] const NamespaceReaper& reaper() const noexcept { return reaper_; }
+
     // ── Introspection ───────────────────────────────────────────────────────
     [[nodiscard]] rune::replication::PartitionReplica* catalogReplica() const noexcept { return catalogReplica_; }
     [[nodiscard]] const CatalogFrameStats& catalogFrameStats() const noexcept { return catalogFrameStats_; }
@@ -567,6 +581,13 @@ private:
     uint64_t ddlRefusedFdBudget_ = 0;   ///< issue #296
     bool     applyHeldForTest_  = false;   // holdApplyForTest (test seam only)
     bool     answersHeldForTest_ = false;  // holdAnswersForTest (test seam only)
+
+    // Namespaces Phase 2 Task 7: drives every DELETING namespace to removal.  Stepped on the catalog leader only.
+    NamespaceReaper reaper_;
+    uint64_t        deferredControlDone_ = 0;   // a rig without a control thread: the correlation to answer Done next pass
+    struct ReaperPortImpl;   // the reaper's hands (AdminWorker.cpp)
+    int stepReaper_(int64_t nowNs);
+    [[nodiscard]] static bool isReaperRequest_(const DdlRequest& req) noexcept;
 
     // The booted applier's goLive, owed to the admin thread's first pass (Task 16).
     std::optional<LiveEffects> pendingLive_;

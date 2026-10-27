@@ -37,6 +37,8 @@
 #include <cstring>
 #include <span>
 #include <string>
+#include <rune/node/NamespaceReapTypes.h>
+
 #include <string_view>
 #include <optional>
 #include <utility>
@@ -88,6 +90,9 @@ enum : int32_t {
     kMsgSecurityHoldLeadership   = 24,
     // control -> admin on controlToAdminRing (Task 15 posts it): the peer link keys of the admin plane.
     kMsgPeerLinkKeys             = 25,
+    // Namespaces Phase 2 Task 7 - control -> admin on controlToAdminRing: the result of one namespace-reaper control
+    // operation, [correlation:u64][status:u8] (ReapStatus below).
+    kMsgNsReapResult             = 36,
 };
 
 /// kMsgPlacementView: [placeable:i32][haltedCount:u16][halted ids: i32 * haltedCount].
@@ -180,6 +185,10 @@ enum : int32_t {
     // Namespaces Phase 2 Task 3: a namespace was erased (its delete completed) -> the gateway's NamespaceMirror drops
     // it.  Body: [nsId:u32].
     kA2cNamespaceErased     = 27,
+    // Namespaces Phase 2 Task 7: the namespace reaper (catalog leader's admin thread) asks the CONTROL thread, which owns
+    // the offset / transaction-state stores and the transaction coordinator, to do one idempotent step of a namespace
+    // delete: [correlation:u64][op:u8][nsId:u32][batch:u32] (ReapOp below).  The answer is kMsgNsReapResult.
+    kA2cNsReapRequest       = 28,
 };
 
 // ---------------------------------------------------------------------------
@@ -351,7 +360,16 @@ struct NamespaceDdlMsg {
     std::string                      denial;
     uint16_t                         clientVersion = 0;
     uint8_t                          mode = 0;        // NsSuspendMode (1 ReadOnly, 2 RejectAll); Suspend only
+    /// Namespaces Phase 2 Task 7, INTERNAL kind kNsDdlInternalDeleteStep only (never decoded from the wire): the
+    /// DELETING namespace (a DELETING one has no name in the index) and, in `mode`, the NsDeleteStepBit to record.
+    uint32_t                         nsId = 0;
 };
+/// The namespace reaper's own request kinds, above rune::protocol::client::NamespaceDdlKind (1..5): refused unless the
+/// request's session is kReaperSession, so a client can never send one.
+inline constexpr uint8_t kNsDdlInternalDeleteStep = 6;
+/// The session id of the reaper's own DDL (a real session id is positive).
+inline constexpr int64_t kReaperSession = -0x5245'4150;   // "REAP"
+
 
 /// Namespaces Task 7: ListNamespaces (82) — a read, answered on the admin thread from its applied registry (no
 /// append).  afterNsId is exclusive; max 0 = 100.  A caller that is not a cluster admin sees only `callerNsId`.
@@ -1276,6 +1294,37 @@ inline void writeNamespaceErased(uint8_t* p, uint32_t nsId) noexcept { admin_wir
 [[nodiscard]] inline bool decodeNamespaceErased(const uint8_t* buf, std::size_t len, uint32_t& nsId) {
     if (buf == nullptr || len != kNamespaceErasedWireLen) return false;
     nsId = admin_wire::getU32(buf);
+    return true;
+}
+
+// ---- Namespace reaper control operations (Phase 2 Task 7) ----
+struct ReapRequestMsg { uint64_t correlation = 0; ReapOp op = ReapOp::AbortTxns; uint32_t nsId = 0; uint32_t batch = 0; };
+inline constexpr std::size_t kReapRequestWireLen = 17;
+inline void writeReapRequest(uint8_t* p, const ReapRequestMsg& m) noexcept {
+    std::memcpy(p, &m.correlation, 8);
+    p[8] = static_cast<uint8_t>(m.op);
+    admin_wire::putU32(p + 9, m.nsId);
+    admin_wire::putU32(p + 13, m.batch);
+}
+[[nodiscard]] inline bool decodeReapRequest(const uint8_t* buf, std::size_t len, ReapRequestMsg& m) {
+    if (buf == nullptr || len != kReapRequestWireLen) return false;
+    std::memcpy(&m.correlation, buf, 8);
+    if (buf[8] < 1 || buf[8] > 3) return false;
+    m.op = static_cast<ReapOp>(buf[8]);
+    m.nsId = admin_wire::getU32(buf + 9);
+    m.batch = admin_wire::getU32(buf + 13);
+    return true;
+}
+struct ReapResultMsg { uint64_t correlation = 0; ReapStatus status = ReapStatus::Refused; };
+inline constexpr std::size_t kReapResultWireLen = 9;
+inline void writeReapResult(uint8_t* p, const ReapResultMsg& m) noexcept {
+    std::memcpy(p, &m.correlation, 8);
+    p[8] = static_cast<uint8_t>(m.status);
+}
+[[nodiscard]] inline bool decodeReapResult(const uint8_t* buf, std::size_t len, ReapResultMsg& m) {
+    if (buf == nullptr || len != kReapResultWireLen || buf[8] > 2) return false;
+    std::memcpy(&m.correlation, buf, 8);
+    m.status = static_cast<ReapStatus>(buf[8]);
     return true;
 }
 

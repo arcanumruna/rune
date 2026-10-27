@@ -52,6 +52,7 @@
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 #include <rune/transaction/TransactionCoordinator.h>
 #include <rune/transaction/Types.h>
+#include <rune/node/NamespaceReapTypes.h>
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/protocol/client/TxnMessages.h>
@@ -199,6 +200,11 @@ public:
     /// suspended or deleted namespace.  0 when this node is not the loaded coordinator.
     uint32_t abortAllForSession(int64_t sessionId, int64_t nowNs) override;
     uint32_t abortAllForNamespace(uint32_t nsId, int64_t nowNs) override;
+    /// Namespaces Phase 2 Task 7 (the reaper, via the control thread): one batch of tombstones of namespace `nsId`'s
+    /// transaction state.  Refused while this node is not the loaded coordinator, or a transaction of the namespace is
+    /// still open or ending (its completion would persist a record after the tombstone).  More = a batch was written, or
+    /// the tombstones are not yet committed; Done = none left and all committed.
+    ReapStatus tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs);
 
     /// A control marker this node could not append.  NEVER counts as landed: a
     /// retriable refusal (NotLeader, MinIsrViolation, Internal, ...) is re-dispatched

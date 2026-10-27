@@ -49,6 +49,7 @@
 #include <rune/coordination/GroupCoordinator.h>
 #include <rune/coordination/ReplicatedOffsetStore.h>
 #include <rune/coordination/TxnOffsetApply.h>
+#include <rune/node/NamespaceReapTypes.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/gateway/IGroupRequestHandler.h>
 
@@ -273,6 +274,10 @@ public:
     /// Authentication Task 14: every member of `sessionId` whose group the check refuses leaves; issue #212: so does
     /// every member of `sessionId` subscribed to a topic `check.mayReadTopic` refuses (cold).
     int removeUnauthorizedMembers(int64_t sessionId, int64_t nowNs, GroupReadCheck check) override;
+    /// Namespaces Phase 2 Task 7 (the reaper, via the control thread): one batch of tombstones of namespace `nsId`'s
+    /// committed consumer offsets.  Refused while this node is not the loaded group coordinator.  More = a batch was
+    /// written, or the tombstones are not yet committed; Done = none left and all committed.
+    ReapStatus tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs);
     /// Issue #212: the session was revoked (terminal) - every member tracked on it leaves its group now (cold).
     void removeSessionMembers(int64_t sessionId, int64_t nowNs) override;
     /// No-hang fix round 5 (N23): only the request's (group, member) on `sessionId`

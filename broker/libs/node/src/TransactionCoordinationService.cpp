@@ -472,6 +472,20 @@ uint32_t TransactionCoordinationService::abortAllForSession(int64_t sessionId, i
     return coordinator_.abortAllForSession(sessionId, nowNs);
 }
 
+ReapStatus TransactionCoordinationService::tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs)
+{
+    if (txnState_ == nullptr) return ReapStatus::Done;   // no transaction-state store (a rig): nothing to remove
+    if (loadState_ != LoadState::Loaded) return ReapStatus::Refused;
+    (void)coordinator_.abortAllForNamespace(nsId, nowNs);   // idempotent: anything still open ends now
+    if (coordinator_.anyUnsettledForNamespace(nsId)) return ReapStatus::Refused;
+    rune::replication::PartitionReplica* r = txnState_->replica();
+    const rune::replication::Offset leo0 = r->logEndOffset();
+    const bool none = txnState_->tombstoneNamespace(nsId, batch, nowNs);
+    if (!none) return r->logEndOffset() > leo0 ? ReapStatus::More : ReapStatus::Refused;
+    // Nothing left to write: Done only once every tombstone is committed (a leader change must not resurrect a key).
+    return r->highWatermark() >= r->logEndOffset() ? ReapStatus::Done : ReapStatus::More;
+}
+
 uint32_t TransactionCoordinationService::abortAllForNamespace(uint32_t nsId, int64_t nowNs)
 {
     if (loadState_ != LoadState::Loaded) return 0;

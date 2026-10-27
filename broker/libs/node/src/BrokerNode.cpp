@@ -3996,6 +3996,20 @@ void BrokerNode::bootFromCatalog_() {
         break;
     case BootReconcile::RunNow:
     case BootReconcile::RunNowAndClearSentinel: {
+        {   // Phase 2 Task 7 (D18): the leftovers of deleted namespaces, judged against the booted catalog, first.
+            std::vector<NsDirFact> facts;
+            bootApplier_->state().namespaces().forEach([&](const cat::NamespaceRecord& r) {
+                facts.push_back(NsDirFact{r.nsId, std::holds_alternative<cat::NsDeleting>(r.state)});
+            });
+            const NsDeletingReconciliation nsr = reconcileNsDeletingDirs(
+                config_.dataDir, facts, bootApplier_->state().namespaces().nextNsId());
+            nsDirMismatchesAtBoot_ = nsr.liveMismatch.size();
+            if (!nsr.liveMismatch.empty())
+                throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: " +
+                                         std::to_string(nsr.liveMismatch.size()) + " namespace dir(s) named '*.deleting' belong to a "
+                                         "LIVE namespace (first: " + nsr.liveMismatch.front().string() +
+                                         ") - refusing to start; see the critical log lines");
+        }
         (void)reconcileTopicDirs(config_.dataDir, bootTopics_, bootDroppedIds_, nowSeconds);
         if (decision == BootReconcile::RunNowAndClearSentinel && !removeCatchUpSentinel(config_.dataDir))
             spdlog::error("BrokerNode[{}]: cannot remove the catch-up sentinel in {} — the next boot reconciles "
@@ -4350,6 +4364,11 @@ void BrokerNode::buildAdminWorker() {
         };
         deps.nsDefaults.limits = config_.nsDefaultLimits;
         deps.maxNamespaces     = static_cast<uint32_t>(config_.maxNamespaces);
+        // Namespaces Phase 2 Task 7: the reaper's requests to the control thread, and its tombstone batch.
+        deps.askControl = [this](const ReapRequestMsg& m) {
+            return adminWorkerAgent_ != nullptr && adminWorkerAgent_->postNsReapRequest(m);
+        };
+        deps.nsDeleteBatch = config_.nsDeleteBatch;
         // Issues #15 / #111: the `__security` catch-up verdict -> the control thread's SecurityServing.
         deps.securityServing = [this](bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader, int64_t knownEnd,
                                       bool behind, bool held) {
@@ -5025,8 +5044,16 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                 uint32_t nsId = 0;
                 if (decodeNamespaceErased(p, n, nsId)) {
                     if (gateway_) gateway_->onNamespaceErased(nsId);
+                    onNamespaceErasedDisk_(nsId);   // D18: ns-<id> -> ns-<id>.deleting, purged off-thread
                 } else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
                     spdlog::error("BrokerNode[{}]: malformed kA2cNamespaceErased (len={}) skipped", config_.nodeId, n);
+                return;
+            }
+            if (tid == kA2cNsReapRequest) {   // Phase 2 Task 7: one step of a namespace delete, on the control thread
+                ReapRequestMsg m;
+                if (decodeReapRequest(p, n, m)) onNsReapRequest_(m);
+                else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+                    spdlog::error("BrokerNode[{}]: malformed kA2cNsReapRequest (len={}) skipped", config_.nodeId, n);
                 return;
             }
             if (tid == kA2cViewUninstall) {
@@ -5059,7 +5086,9 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     if (!viewFanoutBacklog_.empty()) work += pumpViewFanout_();
     // Catalog history Task 8: the drop sequence's later steps + ring-full retries.
     if (!droppedAwaitingRetire_.empty()) [[unlikely]] work += serviceDroppedTopics_();
-    if (!purgeOutbox_.empty() || !cleanerPolicyOutbox_.empty()) [[unlikely]] work += pumpCatalogOutboxes_();
+    if (!erasedNsAwaitingRename_.empty()) [[unlikely]] work += serviceErasedNamespaces_();   // Phase 2 Task 7 (D18)
+    if (!purgeOutbox_.empty() || !cleanerPolicyOutbox_.empty() || !reapResultOutbox_.empty()) [[unlikely]]
+        work += pumpCatalogOutboxes_();
 
     // (3) Drain response frames (admin → control) → session egress.
     //     C1 / M7: through the DDL answer gate — a DefineTopic / CreateView OK
@@ -5867,6 +5896,72 @@ int BrokerNode::serviceDroppedTopics_() {
     return work;
 }
 
+// Namespaces Phase 2 Task 7: one step of a namespace delete asked by the reaper (catalog leader's admin thread).  Runs on the
+// control thread, which owns the transaction coordinator and the offset / transaction-state stores.  Idempotent; the
+// answer (Done / More / Refused) always goes back, and the reaper retries anything not Done.
+void BrokerNode::onNsReapRequest_(const ReapRequestMsg& m) {
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    ReapStatus st = ReapStatus::Done;
+    switch (m.op) {
+    case ReapOp::AbortTxns:
+        // Only the loaded coordinator holds transactions (the others return 0): the gateway's apply of the namespace state
+        // change already aborted them on that node; this re-issue covers a coordinator that loaded since.
+        if (txnCoordService_) (void)txnCoordService_->abortAllForNamespace(m.nsId, nowNs);
+        st = ReapStatus::Done;
+        break;
+    case ReapOp::TombstoneGroups:
+        if (groupCoordService_) st = groupCoordService_->tombstoneNamespace(m.nsId, m.batch, nowNs);
+        break;
+    case ReapOp::TombstoneTxnState:
+        if (txnCoordService_) st = txnCoordService_->tombstoneNamespace(m.nsId, m.batch, nowNs);
+        break;
+    }
+    reapResultOutbox_.push_back(ReapResultMsg{m.correlation, st});
+    (void)pumpCatalogOutboxes_();
+}
+
+// D18: a namespace left the catalog.  Its directory moves to ns-<id>.deleting (atomic, never deleted in place) and the
+// admin thread removes it off-thread (kMsgPurgeDroppedDir); a crash in between is finished by the boot reconcile.  The
+// rename waits until every topic the namespace dropped finished its own retire sequence (its Logs are closed and its
+// segment provisioning stopped): nothing may write below a directory that moved.
+void BrokerNode::onNamespaceErasedDisk_(uint32_t nsId) {
+    if (nsId == 0) return;
+    if (std::find(erasedNsAwaitingRename_.begin(), erasedNsAwaitingRename_.end(), nsId) == erasedNsAwaitingRename_.end())
+        erasedNsAwaitingRename_.push_back(nsId);
+    (void)serviceErasedNamespaces_();
+}
+
+int BrokerNode::serviceErasedNamespaces_() {
+    namespace fs = std::filesystem;
+    int work = 0;
+    for (std::size_t i = 0; i < erasedNsAwaitingRename_.size();) {
+        const uint32_t nsId = erasedNsAwaitingRename_[i];
+        const bool dropping = std::any_of(droppedAwaitingRetire_.begin(), droppedAwaitingRetire_.end(),
+                                          [nsId](const DroppedTopic& d) { return d.nsId == nsId; });
+        if (dropping) { ++i; continue; }
+        erasedNsAwaitingRename_.erase(erasedNsAwaitingRename_.begin() + static_cast<std::ptrdiff_t>(i));
+        ++work;
+        const fs::path from = nsRoot(fs::path(config_.dataDir), nsId);
+        std::error_code ec;
+        if (!fs::exists(fs::symlink_status(from, ec))) continue;   // a namespace that never held a topic has no dir
+        const fs::path to = from.string() + ".deleting";
+        if (fs::exists(fs::symlink_status(to, ec))) fs::remove_all(to, ec);   // a leftover of an earlier crash: cold, rare
+        ec.clear();
+        fs::rename(from, to, ec);
+        if (ec) {
+            spdlog::error("BrokerNode[{}]: renaming the deleted namespace dir '{}' -> '{}' failed: {} - left for the "
+                          "boot reconcile", config_.nodeId, from.string(), to.string(), ec.message());
+            continue;
+        }
+        spdlog::info("BrokerNode[{}]: namespace {} erased - its data moved to '{}' (purged off-thread)", config_.nodeId,
+                     nsId, to.string());
+        purgeOutbox_.push_back(to.string());
+    }
+    if (!purgeOutbox_.empty()) work += pumpCatalogOutboxes_();
+    return work;
+}
+
 int BrokerNode::pumpCatalogOutboxes_() {
     int work = 0;
     if (!purgeOutbox_.empty() && adminWorkerAgent_) {
@@ -5886,6 +5981,18 @@ int BrokerNode::pumpCatalogOutboxes_() {
         work += static_cast<int>(sent);
     } else if (!purgeOutbox_.empty()) {
         purgeOutbox_.clear();   // no admin thread: the boot purge removes them
+    }
+    if (!reapResultOutbox_.empty() && adminWorkerAgent_) {   // Phase 2 Task 7: reaper answers; never dropped
+        std::size_t sent = 0;
+        OneToOneByteRing& ring = adminWorkerAgent_->controlToAdminRing();
+        for (const ReapResultMsg& r : reapResultOutbox_) {
+            uint8_t frame[kReapResultWireLen];
+            writeReapResult(frame, r);
+            if (!ring.write(frame, sizeof(frame), kMsgNsReapResult)) break;
+            ++sent;
+        }
+        reapResultOutbox_.erase(reapResultOutbox_.begin(), reapResultOutbox_.begin() + static_cast<std::ptrdiff_t>(sent));
+        work += static_cast<int>(sent);
     }
     if (!cleanerPolicyOutbox_.empty()) {
         std::size_t sent = 0;

@@ -80,6 +80,7 @@
 //   (In-memory only here; P5-3 adds durable transaction log + replay.)
 // ---------------------------------------------------------------------------
 
+#include <rune/coordination/NsScopedId.h>
 #include <rune/transaction/Types.h>
 #include <rune/transaction/ProducerIdAllocator.h>
 #include <rune/protocol/ProducerIdBinding.h>
@@ -522,6 +523,17 @@ public:
     /// Namespaces Phase 2 Task 4: the same internal abort for every Ongoing transaction that session `sessionId`
     /// opened (noteSession).  Returns the count.  No allocation.  The gateway calls it on every session revoke.
     uint32_t abortAllForSession(int64_t sessionId, int64_t nowNs);
+
+    /// Namespaces Phase 2 Task 7: true while any transaction of namespace `nsId` is not at rest - Ongoing, or Prepare*
+    /// (its completion would still persist a record under its key).  Cold scan.
+    [[nodiscard]] bool anyUnsettledForNamespace(uint32_t nsId) const noexcept {
+        for (const auto& [id, meta] : txnMap_) {
+            if (meta.state == TxnState::Empty || meta.state == TxnState::CompleteCommit ||
+                meta.state == TxnState::CompleteAbort || meta.state == TxnState::Dead) continue;
+            if (rune::coordination::parseScopedId(id).nsId == nsId) return true;
+        }
+        return false;
+    }
 
     /// Records the session that drives `txnId` (the service calls it after a successful AddPartitions / AddOffsets /
     /// TxnOffsetCommit).  Unknown id: no-op.

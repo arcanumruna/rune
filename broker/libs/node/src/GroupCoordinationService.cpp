@@ -77,6 +77,19 @@ bool GroupCoordinationService::isLocalCoordinator() const {
 }
 
 // ---------------------------------------------------------------------------
+// tombstoneNamespace (Phase 2 Task 7)
+// ---------------------------------------------------------------------------
+ReapStatus GroupCoordinationService::tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs) {
+    if (offsets_ == nullptr) return ReapStatus::Done;   // no offset store (a rig): nothing to remove
+    if (!isLocalCoordinator() || !offsetsLoaded_()) return ReapStatus::Refused;
+    rune::replication::PartitionReplica* r = offsets_->replica();
+    const rune::replication::Offset leo0 = r->logEndOffset();
+    const bool none = offsets_->tombstoneNamespace(nsId, batch, nowNs);
+    if (!none) return r->logEndOffset() > leo0 ? ReapStatus::More : ReapStatus::Refused;
+    return r->highWatermark() >= r->logEndOffset() ? ReapStatus::Done : ReapStatus::More;   // all committed
+}
+
+// ---------------------------------------------------------------------------
 // coordinatorFor — v1 seam: cluster leader owns all groups.
 // ---------------------------------------------------------------------------
 NodeId GroupCoordinationService::coordinatorFor(const GroupId& /*groupId*/) const {

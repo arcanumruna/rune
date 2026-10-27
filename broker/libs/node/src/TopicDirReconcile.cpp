@@ -312,6 +312,75 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDirStr, const s
     return result;
 }
 
+NsDeletingReconciliation reconcileNsDeletingDirs(const std::string& dataDirStr, std::span<const NsDirFact> facts,
+                                                 uint32_t nextNsId) {
+    NsDeletingReconciliation result;
+    const fs::path dataDir{dataDirStr};
+    constexpr std::string_view kSuffix = ".deleting";
+    const auto factOf = [&](uint32_t id) -> const NsDirFact* {
+        for (const NsDirFact& f : facts) if (f.nsId == id) return &f;
+        return nullptr;
+    };
+    std::vector<fs::path> entries;
+    std::error_code ec;
+    for (fs::directory_iterator it(dataDir, ec), end; !ec && it != end; it.increment(ec)) entries.push_back(it->path());
+    std::sort(entries.begin(), entries.end());
+    for (const fs::path& p : entries) {
+        const std::string n = p.filename().string();
+        std::error_code sec;
+        const fs::file_status st = fs::symlink_status(p, sec);
+        if (sec || fs::is_symlink(st) || !fs::is_directory(st)) continue;   // never followed
+        const bool deletingDir = n.size() > kSuffix.size() && n.ends_with(kSuffix);
+        const auto id = parseNsDir(deletingDir ? std::string_view(n).substr(0, n.size() - kSuffix.size()) : std::string_view(n));
+        if (!id || *id == 0) continue;
+        const NsDirFact* fact = factOf(*id);
+        if (fact != nullptr && !deletingDir) continue;   // a live / DELETING namespace's own dir: the topic reconcile's
+        if (fact == nullptr && *id >= nextNsId) {        // an id this catalog never issued: not ours to judge
+            spdlog::warn("namespace-dir reconcile: leaving '{}' alone - namespace id {} was never issued by this catalog",
+                         p.string(), *id);
+            continue;
+        }
+        if (fact != nullptr) {   // a ".deleting" dir of a namespace the registry still holds
+            if (fact->deleting) {
+                spdlog::info("namespace-dir reconcile: keeping '{}' - namespace {} is still DELETING", p.string(), *id);
+                result.keptDeleting.push_back(p);
+            } else {
+                spdlog::critical("namespace-dir reconcile: '{}' exists but namespace {} is LIVE - a deleted namespace's data "
+                                 "dir beside a live namespace of the same id; refusing to start (catalog or disk damage)",
+                                 p.string(), *id);
+                result.liveMismatch.push_back(p);
+            }
+            continue;
+        }
+        // The namespace is erased: its dir (ns-<id>, or ns-<id>.deleting) goes.
+        fs::path doomed = p;
+        if (!deletingDir) {
+            const fs::path to = fs::path(p.string() + std::string(kSuffix));
+            std::error_code rec;
+            if (fs::exists(fs::symlink_status(to, rec))) fs::remove_all(to, rec);
+            rec.clear();
+            fs::rename(p, to, rec);
+            if (rec) {
+                spdlog::error("namespace-dir reconcile: renaming '{}' -> '{}' failed: {} - retried at the next boot",
+                              p.string(), to.string(), rec.message());
+                continue;
+            }
+            doomed = to;
+        }
+        std::error_code rem;
+        fs::remove_all(doomed, rem);   // never follows symlinks
+        if (rem) {
+            spdlog::error("namespace-dir reconcile: removing '{}' failed: {} - retried at the next boot", doomed.string(),
+                          rem.message());
+            continue;
+        }
+        spdlog::info("namespace-dir reconcile: removed '{}' - namespace {} was deleted (an interrupted purge)",
+                     doomed.string(), *id);
+        (deletingDir ? result.removed : result.erasedDirs).push_back(doomed);
+    }
+    return result;
+}
+
 bool droppedHoldsEntries(const std::string& dataDir) noexcept {
     try {
         const fs::path d{dataDir};
