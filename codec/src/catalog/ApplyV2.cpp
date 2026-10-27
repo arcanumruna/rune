@@ -175,9 +175,9 @@ std::expected<StagedV2, ApplyError> ApplyV2::run(const CatalogState& s, const Ca
     if (std::holds_alternative<NsDeleting>(ns->state)) {
         if (e.kind != EventKind::DropTopic && e.kind != EventKind::DropView)   // only the drops may pass
             return fail(offset, Code::Precondition, prefix(e) + "namespace " + quoted(ns->name) + " is DELETING");
-    } else if (!std::holds_alternative<NsActive>(ns->state)) {
-        return fail(offset, Code::Precondition, prefix(e) + "namespace " + quoted(ns->name) + " is not ACTIVE");
     }
+    // ACTIVE and SUSPENDED both take object DDL: a suspended namespace refuses its own users at the gateway (the
+    // suspend table), while a cluster admin is exempt (plan D21) and its DDL must apply on every node.
     auto staged = ApplyV1::run(s, e, offset);
     if (!staged) return std::unexpected(std::move(staged.error()));
     return StagedV2{std::move(*staged)};

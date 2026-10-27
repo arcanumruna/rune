@@ -218,8 +218,7 @@ TEST(NamespaceSuspendRegression, ClusterAdminExemptRegression) {
     EXPECT_EQ(produceOne(*f.admin, th, 1).status, rc::OpStatus::Ok) << "the admin still produces";
     EXPECT_EQ(fetchCount(*f.admin, th, 1), 1u);
     const auto ddl = f.admin->defineTopicAndWait("dt2", 1, "", false, {}, 20s);
-    EXPECT_NE(ddl.errorCode, kSuspended) << "the gateway does not refuse the admin's DDL";
-    EXPECT_NE(ddl.detail.find("not ACTIVE"), std::string::npos) << ddl.detail << " (the catalog's own refusal)";
+    EXPECT_EQ(ddl.errorCode, 0) << ddl.detail << " (the cluster admin's DDL applies in a suspended namespace)";
     ASSERT_TRUE(f.admin->resumeNamespace("default").has_value());
 }
 

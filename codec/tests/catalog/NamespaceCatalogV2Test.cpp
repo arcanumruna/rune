@@ -662,10 +662,9 @@ TEST(NamespaceCatalogV2Regression, ObjectInMissingOrDeletingNsRefusedRegression)
     ASSERT_TRUE(r.nsCreate("a").has_value());
     ASSERT_TRUE(r.topic(1, "t").has_value());
     ASSERT_TRUE(r.nsState(1, rc::NsStateTag::SuspendedReadOnly).has_value());
-    expectRefused(r.topic(1, "u"), rc::ApplyError::Code::Precondition, "CreateTopic in a suspended namespace");
-    expectRefused(r.dropTopic(1, "t"), rc::ApplyError::Code::Precondition, "DropTopic in a suspended namespace");
+    // Phase 2: a suspended namespace still applies object DDL (only a cluster admin gets past the gateway's gate).
+    ASSERT_TRUE(r.topic(1, "u").has_value()) << "CreateTopic in a suspended namespace applies";
     ASSERT_TRUE(r.nsState(1, rc::NsStateTag::Active).has_value());
-    ASSERT_TRUE(r.topic(1, "u").has_value());
     ASSERT_TRUE(r.nsDelete(1).has_value());
     expectRefused(r.topic(1, "w"), rc::ApplyError::Code::Precondition, "CreateTopic in a deleting namespace");
     ASSERT_TRUE(r.dropTopic(1, "u").has_value()) << "DropTopic passes the DELETING gate";
