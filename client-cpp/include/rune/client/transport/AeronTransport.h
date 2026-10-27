@@ -39,6 +39,7 @@ extern "C" {
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <string>
@@ -77,6 +78,9 @@ public:
     /// ExclusivePublication (ingress) and Subscription (egress).
     /// Blocks until both are resolved or throws on failure.
     /// Bounded resolution (kResolveMaxMs hard cap + ASSERT — no busy-spin).
+    /// #510: a start() that threw leaves the transport StartFailed - every later
+    /// start() rethrows that original error (stop() still frees what it created);
+    /// a start() after stop() throws std::logic_error.
     void start();
 
     /// Release pub/sub → close aeron client → stop+join driver thread →
@@ -443,11 +447,15 @@ private:
     std::shared_ptr<aeron::Subscription>         egressSub_;
     std::unique_ptr<aeron::FragmentAssembler>    assembler_;
 
-    // ---- Lifecycle flags (idempotent start/stop) ------------------------------
+    // ---- Lifecycle (idempotent start/stop) --------------------------------------
     // F8c C0: plain owner-thread state — start()/stop() are lifecycle calls made
     // only by the single owner (see stop()), never concurrently with a pumper.
-    bool started_ = false;
-    bool stopped_ = false;
+    // #510: a start() that threw is its own state holding the original error, so a
+    // later start() rethrows it instead of reporting success.
+    enum class Lifecycle : uint8_t { Idle, Started, StartFailed, Stopped };
+    void startBody_();   // start()'s steps; start() owns the lifecycle state around it
+    Lifecycle          state_ = Lifecycle::Idle;
+    std::exception_ptr startError_;   // cold: set only by a failed start()
 
     // ---- Poll handler thunk (set during poll(), cleared after) ---------------
     // Single-writer: only one thread calls poll() so this is never concurrent.

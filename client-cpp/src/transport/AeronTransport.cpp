@@ -135,8 +135,27 @@ AeronTransport::~AeronTransport() {
 // ---------------------------------------------------------------------------
 
 void AeronTransport::start() {
-    if (started_) return;  // already started (owner state)
-    started_ = true;
+    switch (state_) {
+    case Lifecycle::Started:
+        return;  // already started (owner state)
+    case Lifecycle::StartFailed:
+        std::rethrow_exception(startError_);   // #510: the ORIGINAL error, every time
+    case Lifecycle::Stopped:
+        throw std::logic_error("AeronTransport: start() after stop()");
+    case Lifecycle::Idle:
+        break;
+    }
+    try {
+        startBody_();
+    } catch (...) {
+        startError_ = std::current_exception();
+        state_      = Lifecycle::StartFailed;   // stop() still frees whatever the failed start created
+        throw;
+    }
+    state_ = Lifecycle::Started;
+}
+
+void AeronTransport::startBody_() {
     bindPumpThread();      // the starting thread owns every pump until a handoff
 
     if (auto err = validate(cfg_)) {
@@ -229,8 +248,8 @@ void AeronTransport::start() {
 // ---------------------------------------------------------------------------
 
 void AeronTransport::stop() noexcept {
-    if (stopped_) return;  // already stopped (owner state)
-    stopped_ = true;
+    if (state_ == Lifecycle::Stopped) return;  // already stopped (owner state)
+    state_ = Lifecycle::Stopped;
     // Precondition (see the header): no other thread pumps any more — the
     // caller takes pump ownership for the final driver drain below.
     bindPumpThread();

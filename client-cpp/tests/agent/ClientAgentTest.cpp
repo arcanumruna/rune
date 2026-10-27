@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -823,6 +824,33 @@ TEST(ClientAgent, StopIdempotent) {
 
     agent.stop();
     EXPECT_NO_THROW(agent.stop()) << "Second stop() threw an exception";
+}
+
+// ---------------------------------------------------------------------------
+// #510: a second start() after a failed one rethrows the original error (it
+// used to return as if started); stop() still works; start() after stop() is a
+// logic error.  RED by mutation: set started_ before transport_.start().
+// ---------------------------------------------------------------------------
+TEST(ClientAgentRegression, ClientAgentSecondStartAfterAFailedStartRethrowsRegression) {
+    auto cfg = makeAgentConfig(uniqueDir(), "127.0.0.1:1", 540, "aeron:ipc", 541);  // bad ingress channel
+    rca::ClientAgent agent(cfg);
+
+    std::string firstWhat;
+    try {
+        agent.start();
+        ADD_FAILURE() << "start() must reject an unusable ingress channel";
+    } catch (const std::runtime_error& e) {
+        firstWhat = e.what();
+    }
+    ASSERT_FALSE(firstWhat.empty());
+    try {
+        agent.start();
+        ADD_FAILURE() << "a second start() after a failed one must not report success";
+    } catch (const std::runtime_error& e) {
+        EXPECT_EQ(firstWhat, e.what());
+    }
+    EXPECT_NO_THROW(agent.stop());
+    EXPECT_THROW(agent.start(), std::logic_error);
 }
 
 // ---------------------------------------------------------------------------

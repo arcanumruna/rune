@@ -40,6 +40,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <span>
@@ -1054,8 +1055,11 @@ private:
     // runner shutdown path (Client::close(): stop the runner loop, join it, then
     // stop()) or the command ring (submitClose()).  The thread creation / join
     // edges order every access, so doWork()'s read below is race-free.
-    bool started_ = false;
-    bool stopped_ = false;
+    // #510: a start() that threw is StartFailed (holding the original error) so a
+    // later start() rethrows it instead of reporting success.
+    enum class Lifecycle : uint8_t { Idle, Started, StartFailed, Stopped };
+    Lifecycle          state_ = Lifecycle::Idle;
+    std::exception_ptr startError_;   // cold: set only by a failed start()
     bool failed_    = false;  // T15b failed mode (duty thread only)
     // The duty clock (ClientConfig::nanoClock, or the default clock) of the
     // current / latest doWork pass — the ONE clock every session machine runs

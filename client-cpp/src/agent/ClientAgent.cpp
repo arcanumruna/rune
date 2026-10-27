@@ -100,14 +100,29 @@ ClientAgent::~ClientAgent() {
 // ---------------------------------------------------------------------------
 
 void ClientAgent::start() {
-    if (started_) return;  // already started (owner state, see ClientAgent.h)
-    started_ = true;
-    transport_.start();
+    switch (state_) {
+    case Lifecycle::Started:
+        return;  // already started (owner state, see ClientAgent.h)
+    case Lifecycle::StartFailed:
+        std::rethrow_exception(startError_);   // #510: the ORIGINAL error, every time
+    case Lifecycle::Stopped:
+        throw std::logic_error("ClientAgent: start() after stop()");
+    case Lifecycle::Idle:
+        break;
+    }
+    try {
+        transport_.start();
+    } catch (...) {
+        startError_ = std::current_exception();
+        state_      = Lifecycle::StartFailed;   // stop() still frees what the failed start created
+        throw;
+    }
+    state_ = Lifecycle::Started;
 }
 
 void ClientAgent::stop() noexcept {
-    if (stopped_) return;  // already stopped (owner state, see ClientAgent.h)
-    stopped_ = true;
+    if (state_ == Lifecycle::Stopped) return;  // already stopped (owner state, see ClientAgent.h)
+    state_ = Lifecycle::Stopped;
     transport_.stop();
 }
 
@@ -119,7 +134,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     // fix1 C2/I3: a no-op after stop() — belt-and-suspenders against any stray
     // call reaching here once the transport (and everything it touches) is
     // being/has been torn down.
-    if (stopped_) return 0;
+    if (state_ == Lifecycle::Stopped) return 0;
     dutyNowNs_ = nowNs;  // the clock a session opened during this pass runs on
 
     // T15b failed mode: no driver / conductor pumping, no I/O of any kind.

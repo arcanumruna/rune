@@ -324,6 +324,42 @@ TEST(AeronTransportRegression, StartWithAnUnusableIngressChannelThrowsNeverAbort
 }
 
 // ---------------------------------------------------------------------------
+// #510: start() set started_ before the steps that throw, so a second start()
+// after a failed one returned as if the transport were up.  A failed start is
+// now its own state: every later start() rethrows the ORIGINAL error, offer()
+// stays refused, stop() still frees what the failed start created, and a start()
+// after stop() is a logic error (nobody restarts a stopped transport).
+// RED by mutation: restore `if (started_) return; started_ = true;` ordering.
+// ---------------------------------------------------------------------------
+TEST(AeronTransportRegression, ASecondStartAfterAFailedStartRethrowsTheOriginalErrorRegression) {
+    Config cfg = makeLoopbackConfig(1210);
+    cfg.ingressChannel = "127.0.0.1:1";  // not an Aeron channel URI
+    Transport t{cfg};
+
+    std::string firstWhat;
+    try {
+        t.start();
+        ADD_FAILURE() << "start() must reject an unusable ingress channel";
+    } catch (const std::runtime_error& e) {
+        firstWhat = e.what();
+    }
+    ASSERT_FALSE(firstWhat.empty());
+
+    for (int again = 0; again < 3; ++again) {
+        try {
+            t.start();
+            ADD_FAILURE() << "a second start() after a failed one must not report success";
+        } catch (const std::runtime_error& e) {
+            EXPECT_EQ(firstWhat, e.what());
+        }
+    }
+    const uint8_t frame[4] = {1, 2, 3, 4};
+    EXPECT_FALSE(t.offer(frame, sizeof frame));
+    EXPECT_NO_THROW(t.stop());
+    EXPECT_THROW(t.start(), std::logic_error) << "start() after stop() is a logic error";
+}
+
+// ---------------------------------------------------------------------------
 // #432 adversarial (M4 review of PR 509): the failure branch over the whole
 // matrix — which side is unusable (ingress publication or egress subscription:
 // the OTHER handle is the one that resolved and must be released first) x both
