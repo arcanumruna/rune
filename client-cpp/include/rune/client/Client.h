@@ -1044,7 +1044,8 @@ public:
     OpResult namespaceDdl(rune::protocol::client::NamespaceDdlKind kind, std::string_view name,
                           const std::array<uint8_t, rune::protocol::client::kNamespacePresentMaskBytes>& presentMask,
                           const rune::protocol::NamespaceLimits& limits, const DdlOptions& ddl,
-                          CompletionTarget target, Token token);
+                          CompletionTarget target, Token token,
+                          rune::protocol::client::NsSuspendMode mode = rune::protocol::client::NsSuspendMode::ReadOnly);
     /// One page of namespaces with nsId > afterNsId (at most `max`; the broker caps it): completes Ok with the raw
     /// ListNamespacesResponse frame as payload (decode with rune::protocol::client::ListNamespacesResponse::decode;
     /// reserve 64 KiB), or BrokerError.  Only the session's own namespace unless it is a cluster admin.
@@ -1059,6 +1060,13 @@ public:
     /// Replaces the namespace's whole limits record with `full`.
     NamespaceResult<void> setNamespaceLimits(std::string_view name, const rune::protocol::NamespaceLimits& full,
                                              std::chrono::milliseconds timeout = std::chrono::seconds(30));
+    /// Phase 2 Task 3 (D21): suspends `name` (ReadOnly: reads served, writes and DDL refused with NamespaceSuspended;
+    /// RejectAll: every session of it ends and its logins are refused), resumes it, or deletes it (sessions closed,
+    /// objects dropped in steps, the record erased).  ADMIN ON CLUSTER; Resume of an Active namespace is an Ok no-op.
+    NamespaceResult<void> suspendNamespace(std::string_view name, rune::protocol::client::NsSuspendMode mode,
+                                           std::chrono::milliseconds timeout = std::chrono::seconds(30));
+    NamespaceResult<void> resumeNamespace(std::string_view name, std::chrono::milliseconds timeout = std::chrono::seconds(30));
+    NamespaceResult<void> deleteNamespace(std::string_view name, std::chrono::milliseconds timeout = std::chrono::seconds(30));
     /// Every namespace this session may see, in nsId order (pages internally).
     NamespaceResult<std::vector<rune::protocol::client::NamespaceInfo>>
     listNamespaces(std::chrono::milliseconds timeout = std::chrono::seconds(30));

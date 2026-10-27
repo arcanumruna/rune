@@ -5021,6 +5021,14 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                     spdlog::error("BrokerNode[{}]: malformed kA2cNamespaceUpserted (len={}) skipped", config_.nodeId, n);
                 return;
             }
+            if (tid == kA2cNamespaceErased) {   // namespaces Phase 2 Task 3: a deleted namespace -> the gateway's mirror
+                uint32_t nsId = 0;
+                if (decodeNamespaceErased(p, n, nsId)) {
+                    if (gateway_) gateway_->onNamespaceErased(nsId);
+                } else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+                    spdlog::error("BrokerNode[{}]: malformed kA2cNamespaceErased (len={}) skipped", config_.nodeId, n);
+                return;
+            }
             if (tid == kA2cViewUninstall) {
                 const int32_t viewTopicId = decodeViewUninstall(p, n);
                 if (viewTopicId >= 0) onViewUninstall_(viewTopicId);

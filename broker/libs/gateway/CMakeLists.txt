@@ -99,6 +99,11 @@ if(BUILD_TESTING)
     target_link_libraries(rune_gateway_permission_table_tests PRIVATE rune_gateway GTest::gtest_main)
     gtest_discover_tests(rune_gateway_permission_table_tests)
 
+    # Namespaces Phase 2 Task 3: the suspend table (pure header).
+    add_executable(rune_namespace_suspend_table_tests tests/NamespaceSuspendTableRegressionTest.cpp)
+    target_link_libraries(rune_namespace_suspend_table_tests PRIVATE rune_gateway GTest::gtest_main)
+    gtest_discover_tests(rune_namespace_suspend_table_tests)
+
     # Namespaces Task 5 (fixes #128): the (nsId, name) ObjectIndex hash.  AllocWindow.cpp replaces the global operator
     # new for this binary (the zero-allocation lookup gate).  The linear-scan ratio guard is a timing test: label latency.
     add_executable(rune_gateway_object_index_tests

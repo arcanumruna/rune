@@ -1310,6 +1310,12 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
     // unauthenticated session may only keep itself alive - and, in the bootstrap window, send SecurityBootstrap.
     if (authMode_ == rune::gateway::GatewayAuthMode::Required && authGateRefuses_(tid, buf, len)) return true;
 
+    // Namespaces Phase 2 Task 3 (D21): a suspended namespace refuses what its mode says.  Produce is gated inside
+    // handleProduce on the session it already looked up; every other templates' check is one constexpr array load.
+    if (rune::gateway::suspendGateChecked(static_cast<uint16_t>(tid)) && tid != pc::TemplateId::Produce &&
+        nsGateRefuses_(static_cast<uint16_t>(tid), buf, len))
+        return true;
+
     switch (tid) {
         case pc::TemplateId::Connect:
             handleConnect(buf, len, nowNs_);
@@ -3581,6 +3587,12 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         answerSecurityBehind_(*session, *pc::MessageHeader::decode(buf, len), buf, len);
         return true;
     }
+    // Namespaces Phase 2 Task 3 (D21): a suspended namespace takes no produce (one byte compare; the refusal is cold).
+    if (session->nsGate != rune::catalog::NsStateTag::Active) [[unlikely]]
+        if (!gateExempt_(*session)) {
+            answerSuspended_(*session, *pc::MessageHeader::decode(buf, len), buf, len);
+            return true;
+        }
     // Authentication Task 12 (D30, spec §2.1): WRITE on the topic - ONE index test, ONE bounds check, ONE byte load
     // (PermissionTable::allows).  permsOf_ is allow-all only on a dev / in-process broker; an AuthAnonymous session on
     // an authenticating broker gets the deny-all table (X013), so nothing is produced for it.  The denial path is cold.
@@ -8453,6 +8465,68 @@ std::string ClientGateway::sourceHostOf_(std::string_view egressChannel) const
     return std::string(rune::consensus::PeerHostTable::endpointHost(egressChannel));
 }
 
+bool ClientGateway::gateExempt_(const Session& s) const
+{
+    return !rune::gateway::authorizeCluster(permsOf_(s), rune::security::Operation::Admin).has_value();
+}
+
+uint16_t ClientGateway::suspendedCode_(const Session& s) const noexcept
+{
+    return static_cast<uint16_t>(s.clientVersion >= pc::kClientVersionNamespaces ? pc::ErrorCode::NamespaceSuspended
+                                                                                  : pc::ErrorCode::InvalidRequest);
+}
+
+void ClientGateway::answerSuspended_(Session& s, const pc::MessageHeader& hdr, const uint8_t* buf, std::size_t len)
+{
+    if (!answerRejection_(s, hdr, suspendedCode_(s), "namespace suspended", buf, len))
+        noteUnanswerable_(buf, len, "namespace suspended");
+}
+
+bool ClientGateway::nsGateRefuses_(uint16_t tid, const uint8_t* buf, std::size_t len)
+{
+    const auto hdr = pc::MessageHeader::decode(buf, len);
+    if (!hdr) return false;                                // the handler answers / notes it
+    Session* s = sessions_.find(hdr->sessionId);
+    if (s == nullptr || s->nsGate == rune::catalog::NsStateTag::Active) return false;
+    if (rune::gateway::suspendAction(tid, s->nsGate) != rune::gateway::SuspendAction::Refuse) return false;
+    if (gateExempt_(*s)) return false;
+    answerSuspended_(*s, *hdr, buf, len);
+    return true;
+}
+
+void ClientGateway::onNamespaceUpserted(const rune::catalog::NamespaceRecord& r)
+{
+    using rune::catalog::NsStateTag;
+    if (!namespaces_.upsert(r)) return;   // an older record: nothing changed
+    const NsStateTag tag = rune::catalog::tagOf(r.state);
+    nsGateScratch_.clear();
+    sessions_.forEach([&](Session& s) {
+        // Only sessions past the login's first leg carry a namespace; the login itself sets the gate of the rest.
+        if (s.auth.index() < 2 || sessionNsId_(s) != r.nsId || s.nsGate == tag) return;
+        nsGateScratch_.push_back(s.sessionId);
+        s.nsGate = tag;
+    });
+    // Outside the forEach: revoke / bind erase or touch sessions.
+    for (const int64_t sid : nsGateScratch_) {
+        Session* s = sessions_.find(sid);
+        if (s == nullptr || gateExempt_(*s)) continue;
+        switch (tag) {
+        case NsStateTag::SuspendedRejectAll:
+            revokeSession_(sid, "namespace suspended", suspendedCode_(*s));
+            break;
+        case NsStateTag::Deleting:
+            revokeSession_(sid, "namespace deleted");
+            break;
+        case NsStateTag::SuspendedReadOnly:
+            bindDenyTable_(*s);
+            break;
+        case NsStateTag::Active:
+            (void)shipPermissions_(*s);   // resumed (it was ReadOnly: closed sessions are gone): its real permissions again
+            break;
+        }
+    }
+}
+
 bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std::size_t len)
 {
     using namespace rune::gateway;
@@ -8606,6 +8680,8 @@ void ClientGateway::becomeAnonymousIfAllowed_(Session& session, pc::TemplateId t
         tid != pc::TemplateId::AuthClientFinal && tid != pc::TemplateId::SecurityBootstrap &&
         std::holds_alternative<rune::gateway::AuthAwaitingFirst>(session.auth))
         session.auth = rune::gateway::AuthAnonymousRead{anonPerms_()};
+        if (const auto* d = namespaces_.registry().byId(rune::catalog::kDefaultNsId))
+            session.nsGate = rune::catalog::tagOf(d->state);   // namespaces Phase 2 Task 3: the anonymous reader is `default`'s
 }
 
 rune::gateway::PermissionRef ClientGateway::anonPerms_()
@@ -9229,6 +9305,32 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         return;
     }
     const LoginOk& ok = std::get<LoginOk>(verdict);
+    // Namespaces Phase 2 Task 3 (D21): the verdict is computed first (a wrong proof already got its 44 above), so a
+    // suspended or deleted namespace leaks nothing to someone who does not hold the password.  A namespace that is
+    // gone or being deleted is indistinguishable from a bad password; a RejectAll one answers 51 (44 below client
+    // version 14) to every user but a cluster admin.  Neither charges the throttle.
+    const rune::catalog::NamespaceRecord* const nsRec = namespaces_.registry().byId(ok.nsId);
+    const rune::catalog::NsStateTag nsTag = nsRec != nullptr ? rune::catalog::tagOf(nsRec->state) : rune::catalog::NsStateTag::Deleting;
+    if (nsTag == rune::catalog::NsStateTag::Deleting) [[unlikely]] {
+        failLogin_(*session, hdr->correlationId, 0);
+        return;
+    }
+    if (nsTag == rune::catalog::NsStateTag::SuspendedRejectAll) [[unlikely]] {
+        const PermissionRef loginPerms = compilePerms_(ok.userId, ok.nsId);
+        if (authorizeCluster(loginPerms.table(), rune::security::Operation::Admin).has_value()) {   // not a cluster admin
+            if (session->spill.state == SpillState::Closing) return;
+            pc::AuthServerFinal f;
+            f.sessionId     = session->sessionId;
+            f.correlationId = hdr->correlationId;
+            f.errorCode     = suspendedCode_(*session) == static_cast<uint16_t>(pc::ErrorCode::NamespaceSuspended)
+                                  ? static_cast<uint16_t>(pc::ErrorCode::NamespaceSuspended)
+                                  : static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed);
+            f.detail        = "namespace suspended";
+            sendAnswer_(*session, scratch_.data(), f.encode(scratch_.data()));
+            closeAfterAnswers_(session->sessionId);
+            return;
+        }
+    }
     std::string loginNonce = st->combinedNonce;   // issue #114: before session->auth (which owns *st) is replaced
     ++loginsOk_;
     loginThrottle_.onSuccess(user, session->sourceHost, nowNs_);
@@ -9239,6 +9341,7 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
                      session->sessionId);
     if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user, std::move(loginNonce), ok.nsId};
     else session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId, ok.nsId), std::move(loginNonce), ok.nsId};
+    session->nsGate = nsTag;
     // Authentication Task 13: announce-before-accept for permissions - the workers learn this session's WRITE bitmap
     // BEFORE the client learns it is logged in, so it can never produce ahead of its grants.
     const uint64_t shipEpoch = shipPermissions_(*session);
@@ -9520,7 +9623,7 @@ void ClientGateway::executeLiveActions_(Session& s, const rune::gateway::LiveAct
     }
 }
 
-void ClientGateway::revokeSession_(int64_t sid, std::string_view reason)
+void ClientGateway::revokeSession_(int64_t sid, std::string_view reason, uint16_t code)
 {
     using namespace rune::gateway;
     Session* s = sessions_.find(sid);
@@ -9538,7 +9641,6 @@ void ClientGateway::revokeSession_(int64_t sid, std::string_view reason)
     // to nothing FIRST, on the permission shipper's FIFO: the event's lifecycle fence follows it, so the DDL's OK is
     // released only once every worker refuses this session's produce, whatever the close's progress.
     bindDenyTable_(*s);
-    const auto code = static_cast<uint16_t>(pc::ErrorCode::SessionRevoked);
     // Each live subscription (and admin-log read) completes SessionRevoked on its correlation id.  PR #459 F3 (the #109
     // class): a subscription a WORKER pushes is ended by that worker - its 46 follows its last Records on the same
     // egress, and it is forgotten here first so the close below sends no plain Unsubscribe that would cancel the end.

@@ -177,6 +177,9 @@ enum : int32_t {
     // Namespaces Task 9: a namespace record the applier created or changed (live, and every namespace again at a boot
     // stash) -> the gateway's NamespaceMirror, which the login resolves `ns/user` against.  Layout below.
     kA2cNamespaceUpserted   = 26,
+    // Namespaces Phase 2 Task 3: a namespace was erased (its delete completed) -> the gateway's NamespaceMirror drops
+    // it.  Body: [nsId:u32].
+    kA2cNamespaceErased     = 27,
 };
 
 // ---------------------------------------------------------------------------
@@ -1264,6 +1267,15 @@ inline void writeNamespaceUpserted(uint8_t* p, const rune::catalog::NamespaceRec
     pos += 2;
     if (pos + n != len) return false;
     rec.name.assign(reinterpret_cast<const char*>(buf + pos), n);
+    return true;
+}
+
+// ---- NamespaceErased (admin -> control; namespaces Phase 2 Task 3) ----   [nsId:u32]
+inline constexpr std::size_t kNamespaceErasedWireLen = 4;
+inline void writeNamespaceErased(uint8_t* p, uint32_t nsId) noexcept { admin_wire::putU32(p, nsId); }
+[[nodiscard]] inline bool decodeNamespaceErased(const uint8_t* buf, std::size_t len, uint32_t& nsId) {
+    if (buf == nullptr || len != kNamespaceErasedWireLen) return false;
+    nsId = admin_wire::getU32(buf);
     return true;
 }
 

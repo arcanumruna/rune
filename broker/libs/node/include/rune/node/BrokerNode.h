@@ -1209,6 +1209,9 @@ private:
             postCatalog_(kA2cNamespaceUpserted, namespaceUpsertedWireLen(r.name),
                          [&](uint8_t* p) { writeNamespaceUpserted(p, r); });
         };
+        fx.namespaceErased = [this](uint32_t nsId) {   // namespaces Phase 2 Task 3: the mirror forgets it
+            postCatalog_(kA2cNamespaceErased, kNamespaceErasedWireLen, [&](uint8_t* p) { writeNamespaceErased(p, nsId); });
+        };
         fx.topicDropped = [this](int32_t topicId, uint32_t nsId, const std::string& name) {
             postCatalog_(kA2cCatalogTopicDropped, catalogTopicDroppedWireLen(name),
                          [&](uint8_t* p) { writeCatalogTopicDropped(p, topicId, name, nsId); });

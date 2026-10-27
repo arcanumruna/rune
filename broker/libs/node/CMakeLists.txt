@@ -1796,6 +1796,13 @@ if(BUILD_TESTING)
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_client_tests PROPERTIES TIMEOUT 600)
 
+        # Namespaces Phase 2 Task 3: suspend / resume / delete through the REAL client against ONE real broker.
+        add_executable(rune_namespace_suspend_tests tests/client/NamespaceSuspendRegressionTest.cpp)
+        target_include_directories(rune_namespace_suspend_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_suspend_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_suspend_tests PROPERTIES TIMEOUT 600)
+
         # Authentication Task 11: the SCRAM login in the session handshake against ONE real authenticating broker
         # (raw frames: AuthWireClient + the rune-crypto SCRAM client).
         add_executable(rune_auth_login_tests tests/node/AuthLoginTest.cpp)

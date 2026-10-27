@@ -1478,11 +1478,12 @@ OpResult Client::dropTopic(std::string_view name, const DdlOptions& ddl, Complet
 OpResult Client::namespaceDdl(rune::protocol::client::NamespaceDdlKind kind, std::string_view name,
                               const std::array<uint8_t, rune::protocol::client::kNamespacePresentMaskBytes>& presentMask,
                               const rune::protocol::NamespaceLimits& limits, const DdlOptions& ddl,
-                              CompletionTarget target, Token token) {
+                              CompletionTarget target, Token token, rune::protocol::client::NsSuspendMode mode) {
     namespace rpc = rune::protocol::client;
     if (name.empty()) return OpResult::InvalidArgument;
     rpc::NamespaceDdlRequest msg;
     msg.kind        = kind;
+    msg.mode        = mode;
     msg.name        = std::string(name);
     msg.presentMask = presentMask;
     msg.limits      = limits;
@@ -2904,6 +2905,63 @@ Client::NamespaceResult<void> Client::setNamespaceLimits(std::string_view name, 
              },
              [&](const Completion& c, std::span<const uint8_t> p) {
                  if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("setNamespaceLimits()", c, p);
+                 r = ddlResultOf(c, p);
+                 r.requestId = requestIdOf(c);
+             });
+    if (r.errorCode != 0) return std::unexpected(std::move(r));
+    return {};
+}
+
+namespace {
+// Suspend / Resume / Delete carry no limits.
+const std::array<uint8_t, rune::protocol::client::kNamespacePresentMaskBytes> kNoMask{};
+}  // namespace
+
+Client::NamespaceResult<void> Client::suspendNamespace(std::string_view name, rune::protocol::client::NsSuspendMode mode,
+                                                       std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    DdlResult r;
+    andWait_("suspendNamespace()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return namespaceDdl(rpc::NamespaceDdlKind::Suspend, name, kNoMask, rune::protocol::NamespaceLimits{},
+                                     DdlOptions{}, q, t, mode);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("suspendNamespace()", c, p);
+                 r = ddlResultOf(c, p);
+                 r.requestId = requestIdOf(c);
+             });
+    if (r.errorCode != 0) return std::unexpected(std::move(r));
+    return {};
+}
+
+Client::NamespaceResult<void> Client::resumeNamespace(std::string_view name, std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    DdlResult r;
+    andWait_("resumeNamespace()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return namespaceDdl(rpc::NamespaceDdlKind::Resume, name, kNoMask, rune::protocol::NamespaceLimits{},
+                                     DdlOptions{}, q, t);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("resumeNamespace()", c, p);
+                 r = ddlResultOf(c, p);
+                 r.requestId = requestIdOf(c);
+             });
+    if (r.errorCode != 0) return std::unexpected(std::move(r));
+    return {};
+}
+
+Client::NamespaceResult<void> Client::deleteNamespace(std::string_view name, std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    DdlResult r;
+    andWait_("deleteNamespace()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return namespaceDdl(rpc::NamespaceDdlKind::Delete, name, kNoMask, rune::protocol::NamespaceLimits{},
+                                     DdlOptions{}, q, t);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("deleteNamespace()", c, p);
                  r = ddlResultOf(c, p);
                  r.requestId = requestIdOf(c);
              });

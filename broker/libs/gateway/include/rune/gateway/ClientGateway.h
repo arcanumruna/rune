@@ -64,6 +64,7 @@
 #include <rune/gateway/SecurityView.h>
 #include <rune/gateway/SessionAuth.h>
 #include <rune/gateway/Authorizer.h>
+#include <rune/gateway/NamespaceSuspendTable.h>
 #include <rune/gateway/NsResolve.h>
 #include <rune/gateway/LiveSecurityChanges.h>
 #include <rune/gateway/ObjectIndex.h>
@@ -537,7 +538,11 @@ public:
     /// Namespaces Task 9 (spec §2): the booted catalog's namespaces (startup thread, before any thread runs), then
     /// the applier's namespaceUpserted effects (kA2cNamespaceUpserted, control drain) - the login lookup's mirror.
     void setBootNamespaces(const rune::catalog::NamespaceRegistry& r) { namespaces_ = rune::catalog::NamespaceMirror(r); }
-    void onNamespaceUpserted(const rune::catalog::NamespaceRecord& r) { (void)namespaces_.upsert(r); }
+    /// Phase 2 Task 3: also re-gates the namespace's live sessions (ReadOnly: bound to the deny table; RejectAll /
+    /// Deleting: closed; resumed: real permissions re-shipped).
+    void onNamespaceUpserted(const rune::catalog::NamespaceRecord& r);
+    /// Phase 2 Task 3: a deleted namespace is gone (kA2cNamespaceErased); its sessions were closed at Deleting.
+    void onNamespaceErased(uint32_t nsId) { (void)namespaces_.erase(nsId); }
     /// Namespaces Task 9 (spec §11, RUNE_ANONYMOUS_READ, off by default): in Required mode a session that sends a
     /// request without logging in becomes AuthAnonymousRead (nsId 0, Describe-only) instead of being ended.
     void setAnonymousRead(bool on) noexcept { anonymousRead_ = on; }
@@ -2534,6 +2539,15 @@ public:
 private:
     /// true = refused here: the auth gate (gateFor) answered AuthenticationFailed (and ended the session) or
     /// PasswordChangeRequired (the session stays) in the request's own response type.
+    /// Namespaces Phase 2 Task 3 (D21): refuses `tid` (answered NamespaceSuspended, or InvalidRequest for a client below
+    /// kClientVersionNamespaces) when the session's namespace is suspended and the table says so.  Cold: only
+    /// templates some gate refuses reach it.  Cluster admins are exempt.  True = consumed.
+    [[nodiscard]] bool nsGateRefuses_(uint16_t tid, const uint8_t* buf, std::size_t len);
+    [[nodiscard]] uint16_t suspendedCode_(const Session& s) const noexcept;
+    /// Answers a request refused by the namespace gate (the same answer on the dispatch and the Produce path).
+    void answerSuspended_(Session& s, const rune::protocol::client::MessageHeader& hdr, const uint8_t* buf, std::size_t len);
+    /// True when `s` is exempt from the namespace gate (ADMIN ON CLUSTER).  Cold: only the refuse path asks.
+    [[nodiscard]] bool gateExempt_(const Session& s) const;
     [[nodiscard]] bool authGateRefuses_(rune::protocol::client::TemplateId tid, const uint8_t* buf, std::size_t len);
     /// The gate's answer: AuthenticationFailed + end, or PasswordChangeRequired (the session stays), in the request's own type.
     void answerGate_(Session& session, const rune::protocol::client::MessageHeader& hdr, rune::gateway::AuthGate gate,
@@ -2628,11 +2642,13 @@ private:
     uint64_t applyOpWorkers_   = 0;   ///< bit w: an Unsubscribe of this event went to worker w's op ring
     void onEnforceFenceAck_(int32_t worker, int ring, uint64_t seq) noexcept;
     void promoteEnforced_() noexcept;
+    std::vector<int64_t> nsGateScratch_;         ///< namespaces Phase 2 Task 3: sessions re-gated by one upsert (capacity persists)
     std::vector<int64_t> liveScratch_;           ///< reused session-id list (capacity persists)
     /// Recompile one session's table, end what lost READ, ship the WRITE bits.
     void refreshSession_(int64_t sid);
     /// Revoke one session: SessionRevoked on every live subscription, then session-level (corr 0) with `reason`, then close.
-    void revokeSession_(int64_t sid, std::string_view reason);
+    void revokeSession_(int64_t sid, std::string_view reason,
+                        uint16_t code = static_cast<uint16_t>(rune::protocol::client::ErrorCode::SessionRevoked));
     /// Issue #196: on the shard path, bind `s` to the deny table on the permission shipper's FIFO, so the workers refuse
     /// its direct produce whatever its close's progress.  No-op off the shard path.
     void bindDenyTable_(Session& s);

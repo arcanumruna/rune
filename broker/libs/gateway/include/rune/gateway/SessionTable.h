@@ -1,5 +1,6 @@
 #pragma once
 
+#include <rune/catalog/CatalogEvent.h>   // NsStateTag (Session::nsGate)
 #include <cstdio>
 #include <cstdlib>
 // SessionTable.h — Per-session egress tracking for the ClientGateway (BR-4).
@@ -98,6 +99,9 @@ struct Session {
     // never silently start allow-all.  AuthAnonymous is allow-all only on a dev / in-process broker (permsOf_ denies it
     // on an authenticating one).
     SessionAuth                                    auth;
+    // Namespaces Phase 2 Task 3 (D21): the lifecycle gate of this session's namespace (Active = serve everything).  Set
+    // at login from the NamespaceMirror and re-set on every record upsert; the per-request check is one byte compare.
+    rune::catalog::NsStateTag                      nsGate = rune::catalog::NsStateTag::Active;
     // D14: the host the session's Connect came from (the Aeron image's sourceIdentity host; the egress host for IPC) -
     // the throttle's key.  "" in unit tests.
     std::string                                    sourceHost;
