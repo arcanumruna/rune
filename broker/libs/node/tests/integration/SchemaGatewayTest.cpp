@@ -1320,7 +1320,8 @@ struct WireNameCase { const char* label; std::string name; uint32_t parts; uint1
 void PrintTo(const WireNameCase& c, std::ostream* os) { *os << c.label; }
 const WireNameCase kWireNameCases[] = {
     {"Empty",              "",                     1, 40},
-    {"Slash",              "a/b",                  1, 40},
+    {"Slash",              "a/b/c",                1, 40},   // namespaces: two '/' is malformed
+    {"UnknownNamespace",   "a/b",                  1, 7},    // namespaces (D7): an unknown namespace answers missing
     {"DotDot",             "..",                   1, 40},
     {"ReservedViews",      "__views",              1, 40},
     {"ReservedSchemas",    "__topic_schemas",      1, 40},

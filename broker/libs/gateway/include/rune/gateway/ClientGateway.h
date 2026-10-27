@@ -2473,6 +2473,12 @@ private:
     [[nodiscard]] rune::gateway::Resolution resolve_(const Session& s, std::string_view qualified) const noexcept {
         return rune::gateway::resolveName(sessionNsId_(s), permsOf_(s).isRoot(), namespaces_.registry(), qualified);
     }
+    /// PR #642 review F1/F2: whether user name `name` (bare or "ns/local") resolves to the session's own account
+    /// (`self` = its local user name): the session's namespace and the same local name.  Zero allocation.
+    [[nodiscard]] bool ownUserName_(const Session& s, std::string_view name, std::string_view self) const noexcept {
+        const rune::gateway::Resolution r = resolve_(s, name);
+        return r.r == rune::gateway::Resolved::Found && r.nsId == sessionNsId_(s) && r.local == self && !self.empty();
+    }
     /// Namespaces Task 9: the anonymous-read table (Describe on every topic / view of `default`), pooled.
     [[nodiscard]] rune::gateway::PermissionRef anonPerms_();
     /// Namespaces Task 9: with RUNE_ANONYMOUS_READ on, an AwaitingFirst session that sends a request other than a login

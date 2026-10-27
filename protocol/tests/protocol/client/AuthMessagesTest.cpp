@@ -3,6 +3,8 @@
 #include <rune/protocol/client/SecurityMessages.h>
 #include <gtest/gtest.h>
 #include <array>
+#include <initializer_list>
+#include <string_view>
 #include <string>
 #include <vector>
 namespace pc = rune::protocol::client;
@@ -238,4 +240,20 @@ TEST(AuthMessagesRegression, CredentialChangeMessageCoversExactlyTheWireFieldsRe
     EXPECT_FALSE(pc::isOwnCredentialChange(c.m, ""));
     c.m.change = pc::UserChangeKind::Disable;
     EXPECT_FALSE(pc::isOwnCredentialChange(c.m, "ws1")) << "DISABLE is not a credential change";
+}
+
+// PR #642 review F1 / F2: the own-account rule compares the RESOLVED (namespace, local) pair - the client (login name)
+// and the broker agree on it.  Mutation: compare name == login -> the qualified / default rows flip.
+TEST(AuthMessagesRegression, OwnUserNameResolvedRegression) {
+    struct Row { std::string_view name, login; bool own; };
+    for (const Row& r : std::initializer_list<Row>{
+             {"alice", "alpha/alice", true},          {"alpha/alice", "alpha/alice", true},
+             {"bravo/alice", "alpha/alice", false},   {"alice", "alice", true},
+             {"default/alice", "alice", true},        {"alice", "default/alice", true},
+             {"alpha/alice", "alice", false},         {"bob", "alpha/alice", false},
+             {"alpha/", "alpha/alice", false},        {"/alice", "alpha/alice", false},
+             {"a/b/alice", "alpha/alice", false},     {"", "alice", false},
+             {"alice", "", false},                    {"alpha/alicex", "alpha/alice", false}}) {
+        EXPECT_EQ(pc::isOwnUserName(r.name, r.login), r.own) << r.name << " vs login " << r.login;
+    }
 }

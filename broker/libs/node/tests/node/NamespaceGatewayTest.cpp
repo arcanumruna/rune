@@ -400,3 +400,41 @@ TEST(NamespaceGatewayRegression, NameBoundsAdversarialRegression) {
     EXPECT_EQ(r.defineTopicCode(g.root, std::string(rune::catalog::kMaxNamespaceNameBytes, 'z') + "/t"), unknown);
     EXPECT_EQ(r.defineTopicCode(g.root, std::string(rune::catalog::kMaxNamespaceNameBytes + 1, 'z') + "/t"), unknown);
 }
+
+/// PR #642 review F1 / F2 (issue #114 across namespaces): a session's OWN account is the resolved (namespace, local)
+/// pair, so ALTER USER '<ns>/<self>' is an own credential change exactly like ALTER USER <self>.
+///   * F1: a namespace admin's session WITHOUT the password (the wire client's signing off: what a hijacked session
+///     can send) adds no password to its own account, bare or qualified - and the attacker's password logs nobody in.
+///   * F2: a plain namespace user changes its own password through both spellings when it proves the current one,
+///     and the new password is the one that logs in.
+/// Mutation: in ClientGateway::handleSecurityDdl compare `m.name == *self` again (instead of ownUserName_) -> the
+/// signed qualified SET is 45 (F2).  F1 has two layers: with that mutation AND `ownCredentialUnproven` dropped from
+/// nsGuard (NamespaceEscalationTest rows 12 / 12-q) the qualified unsigned ADD is 0 and the attacker logs in.
+TEST(NamespaceGatewayRegression, OwnPasswordQualifiedNameAdversarialRegression) {
+    NsGw g;
+    AuthRig& r = g.r;
+    r.broker().createUser("alpha/nsadm", AuthRig::kPw, {exact(SO::Admin, ST::Namespace, "alpha")});
+    const int64_t nsadm = r.login("alpha/nsadm");
+    r.wire().signOwnCredentialChanges(false);
+    for (const char* name : {"nsadm", "alpha/nsadm"}) {
+        const auto a = r.wire().alterPassword(r.ch(), nsadm, name, pc::UserChangeKind::AddPassword, "attacker-password-1");
+        EXPECT_EQ(a.errorCode, kNotAuthorized) << "unproven ADD PASSWORD on " << name << ": " << a.detail;
+    }
+    EXPECT_FALSE(r.loginSlot("alpha/nsadm", 1, "attacker-password-1").ok()) << "the attacker's password logs in";
+    EXPECT_FALSE(r.loginSlot("alpha/nsadm", 0, "attacker-password-1").ok()) << "the attacker's password logs in";
+    r.wire().signOwnCredentialChanges(true);
+
+    const auto bare = r.wire().alterPassword(r.ch(), g.alice, "alice", pc::UserChangeKind::SetPassword, "alice-new-pass-1");
+    ASSERT_EQ(bare.errorCode, kOk) << "own SET PASSWORD, bare name: " << bare.detail;
+    const int64_t alice2 = r.login("alpha/alice", "alice-new-pass-1");
+    const auto qual =
+        r.wire().alterPassword(r.ch(), alice2, "alpha/alice", pc::UserChangeKind::SetPassword, "alice-new-pass-2");
+    ASSERT_EQ(qual.errorCode, kOk) << "own SET PASSWORD, qualified name: " << qual.detail;
+    EXPECT_NO_THROW((void)r.login("alpha/alice", "alice-new-pass-2"));
+    EXPECT_FALSE(r.loginSlot("alpha/alice", 0, "alice-new-pass-1").ok()) << "the replaced password still logs in";
+    // Another namespace's spelling of the same local name is not her own account: refused (hidden), never signed.
+    const auto foreign =
+        r.wire().alterPassword(r.ch(), r.login("alpha/alice", "alice-new-pass-2"), "bravo/alice",
+                               pc::UserChangeKind::SetPassword, "alice-new-pass-3");
+    EXPECT_NE(foreign.errorCode, kOk) << foreign.detail;
+}

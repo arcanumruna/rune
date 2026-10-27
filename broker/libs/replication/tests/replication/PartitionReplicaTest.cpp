@@ -5536,3 +5536,18 @@ TEST(InternalIsrRegression, ClearInternalFencingNeverReadmitsAStaleMemberAdversa
         }
     }
 }
+
+// The follower keepalive cadence was std::clamp(lag / 4, fetchInterval, 20 ms): undefined for a fetch interval above
+// 20 ms (59 tests aborted under GCC 15's _GLIBCXX_ASSERTIONS in the TSan CI job).  The helper keeps every value the old
+// call produced where it was defined, and picks the cap where it was not.
+// Mutation: return std::clamp(v, fetchIntervalNs, kCapNs) -> the constexpr rows with a 1 s interval stop compiling
+// (std::clamp's precondition) / abort under _GLIBCXX_ASSERTIONS.
+TEST(PartitionReplicaRegression, FollowerKeepaliveAboveCapFetchIntervalRegression) {
+    using rune::replication::PartitionReplica;
+    static_assert(PartitionReplica::followerKeepaliveNs(10'000, 1'000'000) == 20'000'000);     // lag/4 above the cap
+    static_assert(PartitionReplica::followerKeepaliveNs(40, 1'000'000) == 10'000'000);         // inside the band
+    static_assert(PartitionReplica::followerKeepaliveNs(2, 1'000'000) == 1'000'000);           // the floor
+    static_assert(PartitionReplica::followerKeepaliveNs(10'000, 1'000'000'000) == 20'000'000); // interval > cap
+    static_assert(PartitionReplica::followerKeepaliveNs(2, 1'000'000'000) == 1'000'000'000);   // interval > cap, low lag
+    EXPECT_EQ(PartitionReplica::followerKeepaliveNs(30'000, 50'000'000), 20'000'000);
+}

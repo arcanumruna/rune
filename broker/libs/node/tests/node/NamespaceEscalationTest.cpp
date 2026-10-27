@@ -68,7 +68,8 @@ struct Catalog {
     }
 };
 
-enum class Who { ClusterAdmin, NsAdminA, PlainA, PlainB };
+/// NsAdminAProven: a/nsadmin's own credential change after the gateway checked its proof (no denial, proofChecked).
+enum class Who { ClusterAdmin, NsAdminA, NsAdminAProven, PlainA, PlainB };
 
 /// Stamp `m` as the gateway would for `who`: a cluster admin passes the gateway's ADMIN ON CLUSTER check (no denial);
 /// everyone else carries the gateway's denial, which the leader overrides only for a namespace admin's own namespace.
@@ -76,10 +77,11 @@ SecurityDdlMsg as(Who who, SecurityDdlMsg m) {
     switch (who) {
     case Who::ClusterAdmin: m.meta.authenticated = "admin";   m.callerNsId = 0;   m.denial.clear(); break;
     case Who::NsAdminA:     m.meta.authenticated = "nsadmin"; m.callerNsId = kNsA; m.denial = kClusterDenial; break;
+    case Who::NsAdminAProven: m.meta.authenticated = "nsadmin"; m.callerNsId = kNsA; m.denial.clear(); break;
     case Who::PlainA:       m.meta.authenticated = "plain";   m.callerNsId = kNsA; m.denial = kClusterDenial; break;
     case Who::PlainB:       m.meta.authenticated = "u";       m.callerNsId = kNsB; m.denial = kClusterDenial; break;
     }
-    m.proofChecked = 0;
+    m.proofChecked = who == Who::NsAdminAProven ? 1 : 0;
     return m;
 }
 
@@ -172,9 +174,26 @@ const std::vector<Row>& rows() {
              return m;
          },
          Expect::NotAuthorized},
-        {"12 change its own password", Who::NsAdminA,
+        // PR #642 review F1: the session alone never changes its own credential (issue #114) - without the gateway's
+        // proof check it is refused, bare or qualified name; with it, allowed.
+        // Mutation: drop `ownCredentialUnproven` from nsGuard -> 12 and 12-q are Allow.
+        {"12 change its own password without a proof", Who::NsAdminA,
          [](auto& g) {
              auto m = g.alterUser("nsadmin", Ch::SetPassword);
+             m.verifier = SecurityDdlRig::verifierFor("new-own-password-1");
+             return m;
+         },
+         Expect::NotAuthorized},
+        {"12-q add its own password, qualified a/nsadmin, without a proof", Who::NsAdminA,
+         [](auto& g) {
+             auto m = g.alterUser("a/nsadmin", Ch::AddPassword);
+             m.verifier = SecurityDdlRig::verifierFor("attacker-password-1");
+             return m;
+         },
+         Expect::NotAuthorized},
+        {"12-p change its own password with a checked proof", Who::NsAdminAProven,
+         [](auto& g) {
+             auto m = g.alterUser("a/nsadmin", Ch::SetPassword);
              m.verifier = SecurityDdlRig::verifierFor("new-own-password-1");
              return m;
          },

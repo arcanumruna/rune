@@ -9,6 +9,27 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      asan_tests:
+        description: broker ctest -R regex for ASan (empty with no asan_from = every *Regression* test)
+        required: false
+        default: ''
+      asan_from:
+        description: also run every broker *Regression* test numbered >= this (ctest -I), e.g. where a run died
+        required: false
+        default: ''
+      tsan_tests:
+        description: broker ctest -R regex for TSan (empty with no tsan_from = every *Regression* test)
+        required: false
+        default: ''
+      tsan_from:
+        description: also run every broker *Regression* test numbered >= this (ctest -I), e.g. where a run died
+        required: false
+        default: ''
+      client_tests:
+        description: client ctest -R regex (empty = every client *Regression* test)
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -145,15 +166,29 @@ jobs:
         run: ccache --show-stats || true
 
       # UdpGsoBindings.Ipv6RoundTrip is a known flake (#628); excluded in case the filter ever selects it.
+      # A manual run can cover only what no sanitizer run has yet: the named tests and/or every test from a number on
+      # (the inputs above; passed through the environment, never spliced into the script).  The memory / disk line
+      # every minute says why a runner died.
       - name: Regression suite (broker)
+        env:
+          TESTS: ${{ (matrix.id == 'asan' && inputs.asan_tests) || (matrix.id == 'tsan' && inputs.tsan_tests) || '' }}
+          FROM: ${{ (matrix.id == 'asan' && inputs.asan_from) || (matrix.id == 'tsan' && inputs.tsan_from) || '' }}
         run: |
-          ctest --test-dir "build-${{ matrix.id }}" -R Regression -LE latency \
-            -E 'UdpGsoBindings\.Ipv6RoundTrip' -j${{ matrix.jobs }} --output-on-failure
+          ( while sleep 60; do echo "[mem] $(free -m | awk '/Mem:/{print $3"/"$2" MB"}') [disk] $(df -h . | awk 'NR==2{print $4}') free"; done ) &
+          run() { ctest --test-dir "build-${{ matrix.id }}" -LE latency -E 'UdpGsoBindings\.Ipv6RoundTrip' \
+                    -j${{ matrix.jobs }} --output-on-failure "$@"; }
+          if [ -z "$TESTS" ] && [ -z "$FROM" ]; then run -R Regression; exit $?; fi
+          rc=0
+          if [ -n "$FROM" ]; then run -R Regression -I "$FROM," || rc=1; fi
+          if [ -n "$TESTS" ]; then run -R "$TESTS" || rc=1; fi
+          exit $rc
 
       - name: Regression suite (client)
         if: ${{ !cancelled() && steps.client_build.outcome == 'success' }}
+        env:
+          TESTS: ${{ inputs.client_tests || 'Regression' }}
         run: |
-          ctest --test-dir "build-client-${{ matrix.id }}/cmake" -R Regression -LE latency \
+          ctest --test-dir "build-client-${{ matrix.id }}/cmake" -R "$TESTS" -LE latency \
             -E 'UdpGsoBindings\.Ipv6RoundTrip' -j${{ matrix.jobs }} --output-on-failure
 
       - name: Upload test logs

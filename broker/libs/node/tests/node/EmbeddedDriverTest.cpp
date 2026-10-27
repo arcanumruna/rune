@@ -108,10 +108,19 @@ TEST(EmbeddedDriverRegression, StaleInactiveDirIsReclaimed) {
     EXPECT_NO_THROW(EmbeddedDriver b(cfgAt(d.path), DriverMode::Invoker));
 }
 
+// The refusal is judged on Aeron's cnc heartbeat (EmbeddedDriver: a heartbeat under 1 s old is ACTIVE).  The
+// conductor stamps it once per timer interval, so a slow start (TSan: ~1.6 s of init) can leave a live driver's
+// heartbeat older than that when the second driver looks (the TSan CI job saw it).  Pump `a` until Aeron itself
+// reports it active - the state this test is about - then the second driver must be refused.
 TEST(EmbeddedDriverRegression, ActiveDirIsRefused) {
     TmpDir d;
     EmbeddedDriver a(cfgAt(d.path), DriverMode::Invoker);
-    a.doWork();
+    bool active = false;
+    for (int i = 0; i < 2'000'000 && !active; ++i) {   // hard cap: fail, never hang
+        a.doWork();
+        active = aeron_is_driver_active(d.path.string().c_str(), /*timeout_ms=*/1000, +[](const char*) {});
+    }
+    ASSERT_TRUE(active) << "the live driver never stamped a fresh heartbeat";
     EXPECT_THROW(EmbeddedDriver b(cfgAt(d.path), DriverMode::Invoker), std::runtime_error);
 }
 

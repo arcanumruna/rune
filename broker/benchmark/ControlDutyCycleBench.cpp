@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -50,8 +51,8 @@ struct MetricsFixture {
     bool ok = false;
 
     MetricsFixture() {
-        char tmpl[] = "/tmp/rune_duty_cycle_XXXXXX";
-        const char* d = ::mkdtemp(tmpl);
+        std::string tmpl = (std::filesystem::temp_directory_path() / "rune_duty_cycle_XXXXXX").string();   // #577
+        const char* d = ::mkdtemp(tmpl.data());
         if (d == nullptr) return;
         dir = d;
         path = dir + "/m.dat";

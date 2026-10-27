@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <span>
@@ -118,7 +119,7 @@ static_assert(sizeof(kRows) / sizeof(kRows[0]) == sizeof(kGolden) / sizeof(kGold
 class TempDir {
 public:
     TempDir() {
-        path_ = "/tmp/rune_t" + std::to_string(::getpid()) + "_role";
+        path_ = (std::filesystem::temp_directory_path() / ("rune_t" + std::to_string(::getpid()) + "_role")).string();   // #577
         ::mkdir(path_.c_str(), 0700);
     }
     ~TempDir() {

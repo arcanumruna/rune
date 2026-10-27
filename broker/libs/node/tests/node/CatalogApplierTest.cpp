@@ -929,15 +929,17 @@ TEST(CatalogApplierRegression, CoalescedBootSurvivesAHistoryLargerThanTheBacklog
     }
     for (auto& f : drainFailureRing(agent)) frames.push_back(std::move(f));
     ASSERT_EQ(agent.catalogBacklogForTest(), 0u);
-    ASSERT_EQ(frames.size(), 405u) << "one topic: its filter schema (before the topic, and again after the validators), "
-                                      "its 401 versions' validators, one applied";
-    EXPECT_EQ(frames[0].type, kA2cFilterSchema);
-    EXPECT_EQ(frames[1].type, kA2cCatalogTopicApplied);
-    EXPECT_EQ(frames[403].type, kA2cFilterSchema);
+    // Namespaces Task 9: the boot posts every namespace (here only `default`) before any object.
+    ASSERT_EQ(frames.size(), 406u) << "the default namespace; one topic: its filter schema (before the topic, and again "
+                                      "after the validators), its 401 versions' validators, one applied";
+    EXPECT_EQ(frames[0].type, kA2cNamespaceUpserted);
+    EXPECT_EQ(frames[1].type, kA2cFilterSchema);
+    EXPECT_EQ(frames[2].type, kA2cCatalogTopicApplied);
+    EXPECT_EQ(frames[404].type, kA2cFilterSchema);
     EXPECT_EQ(frames.back().type, kA2cCatalogApplied);
     for (std::size_t i = 0; i < 401; ++i) {
-        ASSERT_EQ(frames[2 + i].type, kA2cSchemaUpdate) << i;
-        EXPECT_EQ(decodeSchemaUpdate(frames[2 + i].bytes.data(), frames[2 + i].bytes.size()).version, i + 1)
+        ASSERT_EQ(frames[3 + i].type, kA2cSchemaUpdate) << i;
+        EXPECT_EQ(decodeSchemaUpdate(frames[3 + i].bytes.data(), frames[3 + i].bytes.size()).version, i + 1)
             << "ascending versions";
     }
 }

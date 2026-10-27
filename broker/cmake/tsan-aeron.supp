@@ -78,3 +78,13 @@ race:aeron_fileutil.c
 # reached through Image::poll / TermReader::read, whose template frames symbolize without the `aeron::` prefix, so
 # the poll entries above do not match.  The mapping's publication to the poller is Aeron's fence-ordered image hand-off.
 race:aeron::util::MemoryMappedFile::doMapping
+# The client conductor builds an aeron::Image (make_shared) and publishes it to the subscriber thread through Aeron's
+# own ordered array store (atomic::putValueOrdered - invisible to TSan); every read of the new Image's fields on the
+# polling thread (UnsafeBufferPosition::get, Header::offset, AtomicBuffer::getInt64/boundsCheck, Image::poll inlined
+# into the caller's template frame) then reports against that allocation.  Matched on the allocating frame, so it
+# covers Aeron's Image hand-off only (TSan CI: WorkerReplicationTransportInteg, PeerSealed*, PeerLinkAgent*).
+race:_Sp_counted_ptr_inplace<aeron::Image
+# The C client's async add (aeron_client_conductor_async_add_*) hands the command to its conductor through Aeron's
+# MPSC command queue (C11 atomics in a different TU than TSan sees ordered); the conductor's memcpy of the command
+# body reports against the caller's write (TSan CI: UdpGsoBindings.*).
+race:aeron_client_conductor_async_add_

@@ -71,10 +71,13 @@ struct SecurityDdl {
     bool memberRoleIsPrivileged = false;                  // GrantRole / RevokeRole: the role holds a privileged grant
     bool targetIsPrivileged     = false;                  // the target user / role holds one (directly or via a role)
     bool targetIsCaller         = false;                  // the target is the caller's own user
+    bool ownCredentialUnproven  = false;                  // PR #642 F1: a change of the caller's own password, no proof
 };
 /// ClusterAdmin -> Allow.  A target outside the caller's namespace -> Missing.  A namespace admin in its own namespace
 /// -> Allow, except NotAuthorized for a grant / revoke of anything on Cluster or of ADMIN on a Namespace, a membership
 /// in a role holding one, or any change to another user / a role holding one.  Otherwise the gateway's verdict.
+/// PR #642 review F1: a non-cluster-admin's change of its OWN password without the gateway's proof check is always
+/// NotAuthorized (issue #114: a session alone never mints a credential, however the request names the account).
 /// Pure; cold path (DDL rate).
 [[nodiscard]] GuardVerdict nsGuard(const CallerPerms& caller, uint32_t targetNsId, const SecurityDdl& ddl);
 

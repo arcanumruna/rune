@@ -8486,7 +8486,7 @@ bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std
         if (const auto* pcr = std::get_if<AuthPasswordChangeRequired>(&session->auth))
             if (const auto m = pc::SecurityDdl::decode(buf, len))
                 selfSetPassword = m->kind == pc::SecurityOpKind::AlterUser &&
-                                  m->change == pc::UserChangeKind::SetPassword && m->name == pcr->user;
+                                  m->change == pc::UserChangeKind::SetPassword && ownUserName_(*session, m->name, pcr->user);
 
     // bootstrapOpen_() walks the account list: evaluated only for the one request that can use it (never per frame).
     const AuthGate gate = gateFor(session->auth, tid, tid == pc::TemplateId::SecurityBootstrap && bootstrapOpen_(), selfSetPassword);
@@ -9655,7 +9655,9 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
         else if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session->auth)) { self = &p->user; loginNonce = &p->loginNonce; }
         std::optional<rune::gateway::Denial> admin =
             rune::gateway::authorizeCluster(permsOf_(*session), rune::security::Operation::Admin);
-        const bool ownPassword = self != nullptr && pc::isOwnCredentialChange(m, *self);
+        // PR #642 review F1: "own" is the RESOLVED (namespace, local) pair, so 'alpha/nsadm' from an alpha/nsadm
+        // session is its own change too and needs the proof (never ADMIN-denied and forwarded to the ns-admin rule).
+        const bool ownPassword = self != nullptr && pc::isCredentialChange(m) && ownUserName_(*session, m.name, *self);
         // A TRUE retry: a request this broker's mirror already holds with the same request id AND the same statement
         // fingerprint (PR #410 review F2: the id alone would let a different change skip the throttle).  The mirror
         // may lag the leader by an apply, so a retry can also look new: then it is still answered right, only charged

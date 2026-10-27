@@ -1583,7 +1583,7 @@ OpResult Client::securityDdl(rune::ql::SecurityPlan plan, const DdlOptions& ddl,
     // outcome) until the broker answers OK, so the next login of this Client uses it.  ADD PASSWORD needs nothing
     // (the old password stays valid, D6).
     const bool selfSet = plan.kind == rpc::SecurityOpKind::AlterUser && plan.change == rpc::UserChangeKind::SetPassword &&
-                         !cfg_.username.empty() && plan.name == cfg_.username;
+                         rpc::isOwnUserName(plan.name, cfg_.username);   // PR #642 review F2: bare or qualified
     std::span<const uint8_t> secret;
     if (selfSet) secret = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(plan.password.data()), plan.password.size());
     OpResult res = OpResult::InvalidArgument;

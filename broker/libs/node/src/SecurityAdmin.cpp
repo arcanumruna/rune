@@ -393,6 +393,7 @@ bool privilegedUser(const sec::SecurityState& state, const sec::UserObject& u) {
 GuardVerdict nsGuard(const CallerPerms& caller, uint32_t targetNsId, const SecurityDdl& ddl) {
     if (caller.clusterAdmin) return GuardVerdict::Allow;
     if (targetNsId != caller.nsId) return GuardVerdict::Missing;
+    if (ddl.ownCredentialUnproven) return GuardVerdict::NotAuthorized;
     if (!caller.nsAdmin) return caller.denied ? GuardVerdict::NotAuthorized : GuardVerdict::Allow;
     // A namespace admin in its own namespace: everything but minting or touching admin power.
     if (ddl.spec != nullptr && privilegedGrant(*ddl.spec)) return GuardVerdict::NotAuthorized;
@@ -538,6 +539,11 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
     view.targetIsPrivileged = (targetUser != nullptr && privilegedUser(state, *targetUser)) ||
                               (targetRole != nullptr && privilegedRole(*targetRole));
     view.targetIsCaller = targetUser != nullptr && callerUserId != 0 && targetUser->objectId == callerUserId;
+    view.ownCredentialUnproven =
+        view.targetIsCaller && m.proofChecked == 0 && static_cast<pc::SecurityOpKind>(m.kind) == pc::SecurityOpKind::AlterUser &&
+        (static_cast<pc::UserChangeKind>(m.change) == pc::UserChangeKind::AddPassword ||
+         static_cast<pc::UserChangeKind>(m.change) == pc::UserChangeKind::DropPassword ||
+         static_cast<pc::UserChangeKind>(m.change) == pc::UserChangeKind::SetPassword);
     switch (nsGuard(caller, target->nsId, view)) {
     case GuardVerdict::Allow: break;
     case GuardVerdict::Missing: answerMissing(callerNsName); return;   // unreachable: resolve() hid a foreign target
