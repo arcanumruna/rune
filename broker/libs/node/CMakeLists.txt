@@ -370,7 +370,7 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_produce_path_tests
         PROPERTIES TIMEOUT 60)
 
-    # RoleCounter wire-encoding unit tests (pure header — no Aeron driver).
+    # Role-metric (RuneMetrics.h) wire-encoding unit tests (pure header — no Aeron driver).
     add_executable(rune_role_counter_tests
         tests/node/RoleCounterTest.cpp)
     target_link_libraries(rune_role_counter_tests PRIVATE
@@ -1304,9 +1304,9 @@ if(BUILD_TESTING)
             target_link_libraries(rune_d9_cross_node_marker_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_d9_cross_node_marker_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
-            # RoleCounter publish→read integration test: BrokerNode publishes the
-            # Aeron node-role/term counters; CncFileReader reads them back (the
-            # rune_role path).  Embeds the media driver → gated with the others.
+            # Role-metric publish→read integration test: BrokerNode publishes the
+            # node-role/term metrics to its metrics file; MetricsReader reads them
+            # back (the rune_role path).  Embeds the media driver → gated with the others.
             add_executable(rune_role_counter_publish_tests
                 tests/integration/RoleCounterPublishTest.cpp)
             target_include_directories(rune_role_counter_publish_tests PRIVATE

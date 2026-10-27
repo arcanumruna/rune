@@ -23,9 +23,6 @@
 
 #include "MetricsTestReader.h"
 
-#include <CncFileReader.h>
-#include <concurrent/CountersReader.h>
-
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
 
@@ -262,7 +259,7 @@ public:
     }
     [[nodiscard]] int64_t adminSession() const noexcept { return adminSid_; }
     /// Successful logins the test rig itself performed on THIS node start (admin + AuthRig::login via noteLoginOk).
-    /// The CnC logins-ok counter is published asynchronously, so a rig that needs an exact baseline counts its own.
+    /// The metrics-file logins-ok counter is published asynchronously, so a rig that needs an exact baseline counts its own.
     [[nodiscard]] int64_t loginsOkDone() const noexcept { return loginsOkDone_; }
     void noteLoginOk() noexcept { ++loginsOkDone_; }
 

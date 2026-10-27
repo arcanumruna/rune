@@ -43,7 +43,6 @@
 #include "MetricsTestReader.h"
 #include <rune/node/NodeConfig.h>
 #include <rune/node/RuneMetrics.h>
-#include <CncFileReader.h>
 #include <Aeron.h>
 #include <Context.h>
 
@@ -1677,7 +1676,7 @@ TEST(D9CrossNodeMarkerIntegrationRegression, PlaneReportsPeerUpEdgeAndNewInbound
 // TCS calls it) for a partition another node leads.  It must reach that
 // leader over BrokerNode's own transport ↔ gateway wiring, land there as a
 // control batch, and its answer must come back (after the HW) and clear the
-// coordinator's in-flight entry.  The stuck-markers counter is in the CnC.
+// coordinator's in-flight entry.  The stuck-markers counter is in the metrics file.
 // Waits are condition loops on owner-thread round trips (no sleeps).
 // ============================================================================
 namespace {

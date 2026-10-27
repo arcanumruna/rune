@@ -19,9 +19,6 @@
 
 #include "MetricsTestReader.h"
 
-#include <CncFileReader.h>
-#include <concurrent/CountersReader.h>
-
 #include <array>
 #include <fstream>
 #include <iterator>

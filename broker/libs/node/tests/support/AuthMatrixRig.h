@@ -59,7 +59,7 @@ public:
         (void)rig_.newUser({grants::prefix(SO::Write, ST::Topic, "")}, &writerName_);
         writerSid_ = rig_.login(writerName_);
         // The exact number of logins this broker has accepted so far (admin, builder, the writer's user, the writer):
-        // counted by the rig, never read from the asynchronously published CnC counter (issue #4).
+        // counted by the rig, never read from the asynchronously published metrics-file counter (issue #4).
         issuedOk_ = rig_.broker().loginsOkDone();
     }
     /// Cumulative logins the rig knows succeeded / failed / revoked sessions on this broker (the Cells' baselines).
@@ -92,7 +92,7 @@ public:
         prefix_ = "c" + std::to_string(ord_) + ".";
         user_ = "u" + std::to_string(1000 + ord_);
         role_ = "r" + std::to_string(ord_);
-        // The CnC counters are published asynchronously (BrokerNode::publishSecurityMetrics_): wait until they have
+        // The metrics-file counters are published asynchronously (BrokerNode::publishSecurityMetrics_): wait until they have
         // caught up with every login the rig knows it made, then take the baseline FROM THE TALLY, not from the
         // counter, so a stray extra login still fails assertion 5 (issue #4).
         for (const auto& c : {std::make_tuple(typeIdOf(RuneMetric::LoginsOk), m.issuedOk_, "logins ok"),
