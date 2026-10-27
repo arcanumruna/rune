@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <poll.h>
 #include <unistd.h>
 
 // Scribble freed memory (glibc M_PERTURB) so a use-after-free crashes; a no-op where mallopt is unavailable.
@@ -1630,41 +1631,55 @@ TEST(HubCommandClientRegression, ThreadModeVoidSeekRetriesABackPressuredRingRegr
     auto cf = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
     ASSERT_TRUE(pump([&] { return cf.ready(); }));
 
-    std::atomic<int> inHandler{kPending};   // runner -> test: "parked in the record handler"
-    std::atomic<int> release{kPending};     // test -> runner: "leave the handler"
-    std::atomic<bool> handled{false};
+    // Pipes, not shared atomics: toTest carries "parked" ('P'), "seek started" ('S') and "seek returned" ('R');
+    // toRunner releases the parked runner.  Reads wait with a failure-only deadline.
+    int toTest[2], toRunner[2];
+    ASSERT_EQ(::pipe(toTest), 0);
+    ASSERT_EQ(::pipe(toRunner), 0);
+    auto put = [](int fd, char c) { return ::write(fd, &c, 1) == 1; };
+    auto get = [](int fd, int timeoutMs) -> char {   // 0 = nothing arrived within timeoutMs
+        pollfd p{fd, POLLIN, 0};
+        char c = 0;
+        if (::poll(&p, 1, timeoutMs) == 1 && ::read(fd, &c, 1) == 1) return c;
+        return 0;
+    };
+    bool handled = false;   // runner thread only
     auto gc = client.subscribeGroup("g", {"t"});
     gc.onRecords([&](const rc::RecordSet&) {
-        if (handled.exchange(true)) return;
-        signal(inHandler, kFull);
-        (void)waitEvent(release);
+        if (handled) return;
+        handled = true;
+        (void)put(toTest[1], 'P');
+        (void)get(toRunner[0], 60'000);
     });
     ASSERT_TRUE(pump([&] { return !gw.pendingJoins.empty(); }));
     gw.releaseJoins();
     ASSERT_TRUE(pump([&] { return gw.latestSubscription(1, 0) != nullptr; }));
     const auto first = *gw.latestSubscription(1, 0);
     gw.pushRecords(first, 0, 1);
-    if (!pump([&] { return inHandler.load() == kFull; })) {
-        signal(release, kNoFull);
+    char parked = 0;
+    ASSERT_TRUE(pump([&] { return (parked = get(toTest[0], 0)) != 0; }));
+    if (parked != 'P') {
+        (void)put(toRunner[1], 'G');
         FAIL() << "the runner never entered the record handler";
     }
     const std::size_t subs = gw.subscribed.size();
 
     client.testFillCommandRing();
-    std::atomic<bool> started{false}, finished{false}, threw{false};
+    bool threw = false;     // read only after join()
     std::string why;
     std::thread t([&] {
-        started.store(true);
-        try { gc.seek({1, 0}, 0); } catch (const std::exception& e) { why = e.what(); threw.store(true); }
-        finished.store(true);
+        (void)put(toTest[1], 'S');
+        try { gc.seek({1, 0}, 0); } catch (const std::exception& e) { why = e.what(); threw = true; }
+        (void)put(toTest[1], 'R');
     });
-    while (!started.load()) std::this_thread::yield();
+    ASSERT_EQ(get(toTest[0], 60'000), 'S');
     // The runner is parked and the ring is full: the seek can only be retrying, it cannot have returned.
     for (int i = 0; i < 20'000; ++i) { gw.pump(); std::this_thread::yield(); }
-    EXPECT_FALSE(finished.load()) << "the seek returned although the command ring was full (dropped?): " << why;
-    signal(release, kFull);   // the runner leaves the handler and drains the ring
+    EXPECT_EQ(get(toTest[0], 0), 0) << "the seek returned although the command ring was full (dropped?)";
+    (void)put(toRunner[1], 'G');   // the runner leaves the handler and drains the ring
     t.join();
-    EXPECT_FALSE(threw.load()) << "a BackPressured seek must be retried, not thrown: " << why;
+    EXPECT_FALSE(threw) << "a BackPressured seek must be retried, not thrown: " << why;
+    for (int fd : {toTest[0], toTest[1], toRunner[0], toRunner[1]}) ::close(fd);
     ASSERT_TRUE(pump([&] { return gw.subscribed.size() > subs; })) << "the seek was dropped: no re-subscription";
     EXPECT_EQ(gw.latestSubscription(1, 0)->fromOffset, 0);
     client.close();
