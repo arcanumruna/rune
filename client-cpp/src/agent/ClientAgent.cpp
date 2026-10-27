@@ -955,7 +955,7 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             if ((handshakeFinalLegFailures_++ & 1023u) == 0)
                 std::fprintf(stderr,
                     "rune-client: the broker failed the TLS handshake on its final leg (session %lld) — "
-                    "the session is Rejected (HandshakeFailed); %llu so far\n",
+                    "the connect is retried, then fails (HandshakeFailed); %llu so far\n",
                     static_cast<long long>(opt->sessionId),
                     static_cast<unsigned long long>(handshakeFinalLegFailures_));
         }
@@ -1269,6 +1269,7 @@ Session& ClientAgent::openSession_(const std::string& endpoint) noexcept {
     scfg.correlationIdBase =
         static_cast<int64_t>(sessions_.size()) * kSessionCorrIdStride;
     scfg.keepaliveCorrelationId = -(static_cast<int64_t>(sessions_.size()) + 1);   // A10: Pong routing
+    scfg.revivedOnDemand = true;   // Issue #481: paced by Backoff, never a revive per duty cycle
     sessions_.emplace_back(std::make_unique<Session>(this, std::move(scfg), endpoint));
     Session& s = *sessions_.back();
     s.machine.useScramCache(&scramCache_);   // authentication: PBKDF2 once per verifier, not once per session

@@ -2028,7 +2028,7 @@ void Client::onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t no
     }
 }
 
-void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t nowNs) {
+void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t nowNs, uint16_t failCode) {
     PendingCtl& p = pendingCtl_[i];
     DdlPending& d = std::get<DdlPending>(p.ddl);
     int     redirects   = 0;
@@ -2049,15 +2049,21 @@ void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t now
     }
     if (nowNs >= budgetEndNs) {   // spec §5.5: retried within the budget, then an explicit failure
         std::string why(detail);
-        why += why.empty() ? "not leader: DDL retry budget exhausted" : " (DDL retry budget exhausted)";
-        failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader), why, ddlNoValue(p.op));
+        // Issue #607: the same retry serves AuthUnavailable (48), reported with its own code and text.
+        const bool authUnavailable = failCode == static_cast<uint16_t>(rune::protocol::client::ErrorCode::AuthUnavailable);
+        why += why.empty() ? (authUnavailable ? "AuthUnavailable: DDL retry budget exhausted"
+                                              : "not leader: DDL retry budget exhausted")
+                           : " (DDL retry budget exhausted)";
+        failDdl_(i, failCode, why, ddlNoValue(p.op));
         return;
     }
     // The last resend lands at the budget's end at the latest; its answer decides.
     if (cfg_.traceDdlRetries)
         noteDdlRetry_({DdlRetryNote::Kind::NotLeader, redirects, std::min(backoffNs, budgetEndNs - nowNs) / 1'000'000,
                        std::string(detail)});
-    setDdlRetry_(d, DdlAwaitingResend{redirects, budgetEndNs, backoffNs, std::min(nowNs + backoffNs, budgetEndNs)});
+    setDdlRetry_(d, DdlAwaitingResend{redirects, budgetEndNs, backoffNs, std::min(nowNs + backoffNs, budgetEndNs),
+                                      failCode == static_cast<uint16_t>(rune::protocol::client::ErrorCode::AuthUnavailable)
+                                          ? DdlResendCause::AuthUnavailable : DdlResendCause::NotLeader});
 }
 
 void Client::noteDdlRetry_(DdlRetryNote note) {
@@ -2146,7 +2152,9 @@ int Client::driveDdl_(int64_t nowNs) {
                                      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kWhy.data()),
                                                               kWhy.size()));
                     } else {
-                        failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader),
+                        failDdl_(i, static_cast<uint16_t>(due.cause == DdlResendCause::AuthUnavailable
+                                                              ? rune::protocol::client::ErrorCode::AuthUnavailable
+                                                              : rune::protocol::client::ErrorCode::NotLeader),
                                  "not leader: the seed can never reconnect", ddlNoValue(p.op));
                     }
                     ++work;
@@ -2166,6 +2174,10 @@ int Client::driveDdl_(int64_t nowNs) {
                         completeCtl_(dead, OpStatus::SessionLost, ddlNoValue(dead.op), 0, 0,
                                      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kWhy.data()),
                                                               kWhy.size()));
+                    } else if (due.cause == DdlResendCause::AuthUnavailable) {
+                        // Issue #607: the retries were answered AuthUnavailable - that is the code the caller sees.
+                        failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::AuthUnavailable),
+                                 "AuthUnavailable: DDL retry budget exhausted", ddlNoValue(p.op));
                     } else {
                         failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader),
                                  "not leader: DDL retry budget exhausted (the node could not be reached)",
@@ -2388,9 +2400,12 @@ void Client::sweepControl_(int64_t nowNs) {
     // Backoff — reconnect-forever — keeps trying and stays deadline-bounded.)
     if (hasPendingConnect_ &&
         (agent_.seedMachine().state() == session::SessionState::Disconnected ||
-         // PR #476 review: a machine that is not reconnect-forever enters Backoff only after unproven TLS final-leg
+         // PR #476 review: a machine that is not reconnect-forever enters Backoff after unproven TLS final-leg
          // failures exhausted their retries - the pending connect has failed too.
-         (agent_.seedMachine().state() == session::SessionState::Backoff && !cfg_.reconnectForeverAfterLive))) [[unlikely]] {
+         // Issue #461: but Backoff before Live is also a bounded retry of a transient refusal (48 / rate-limited 44) -
+         // the pending connect waits for it, bounded by its deadline and by maxUnavailableRetries.
+         (agent_.seedMachine().state() == session::SessionState::Backoff && !cfg_.reconnectForeverAfterLive &&
+          !agent_.seedMachine().retryingTransientRefusal()))) [[unlikely]] {
         static constexpr std::string_view kGaveUp =
             "connect() gave up (redirect budget exhausted or connect refused): not connected";
         // Issue #13 / #14: a session that requires TLS and never got it says why (the refusals were unauthenticated,
@@ -2402,7 +2417,11 @@ void Client::sweepControl_(int64_t nowNs) {
         const int16_t last = agent_.seedMachine().lastConnectError();
         const bool noTls = last == static_cast<int16_t>(static_cast<uint16_t>(rune::protocol::client::ErrorCode::HandshakeFailed));
         const std::string_view why = noTls ? kNoTls : kGaveUp;
-        completeConnect_(OpStatus::NotConnected, 0, last > 0 ? static_cast<uint16_t>(last) : 0, why);
+        // A rate-limited login that exhausted its retries (Issue #519) still reports the broker's retry-after.
+        const int64_t retryAfterMs =
+            last == static_cast<int16_t>(static_cast<uint16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed))
+                ? static_cast<int64_t>(agent_.seedMachine().authRetryAfterMs()) : 0;
+        completeConnect_(OpStatus::NotConnected, 0, last > 0 ? static_cast<uint16_t>(last) : 0, why, retryAfterMs);
         if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(why)); });
     }
     if (hasPendingConnect_ && nowNs >= pendingConnect_.deadlineNs) {
@@ -3572,7 +3591,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // (plaintext under requireCrypto -> Rejected) is failed by enterFailed_.
             if (agent_.lastConnectAccepted())
                 onSeedConnected_(opt->assignedSessionId, opt->brokerVersion);
-        } else {
+        } else if (!agent_.seedMachine().retryingTransientRefusal()) {   // Issue #461: a transient 48 is retried
             // Error response via ConnectResponse — fail the connect and fire onError.
             const std::string msg = "ConnectResponse error code: " +
                                     std::to_string(opt->code);
@@ -3601,7 +3620,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         }
         if (agent_.lastConnectAccepted()) {
             onSeedConnected_(agent_.seedMachine().sessionId(), agent_.sessionBrokerVersion(0));
-        } else if (ec != rpc::ErrorCode::OK) {
+        } else if (ec != rpc::ErrorCode::OK && !agent_.seedMachine().retryingTransientRefusal()) {
             // The broker ended the handshake (HandshakeFailed -> Rejected: enterFailed_
             // fails every op; any other code -> a retriable connect failure).  The
             // pending connect ends now, once — exactly like a ConnectResponse error.
@@ -3631,6 +3650,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
             break;
         }
         if (agent_.seedMachine().state() == session::SessionState::Authenticating) break;   // (cannot happen: awaited)
+        // Issue #461 / #519: a transient refusal (48, rate-limited 44) before Live is a bounded Backoff retry inside
+        // the machine - the pending connect waits for it (it ends with the code once the budget is spent).
+        if (agent_.seedMachine().retryingTransientRefusal()) break;
         // The login was refused (or the broker proved nothing): the pending connect ends now, once, with the
         // broker's code and its retry-after (a rate-limited login).  A Rejected seed also fails every pending
         // op AuthenticationFailed — nothing more can be answered on it.
@@ -3678,6 +3700,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     onDdlRedirect_(i, opt->message, now());
                 } else if (ec == rpc::ErrorCode::NotLeader) {
                     onDdlNotLeader_(i, opt->message, now());
+                } else if (ec == rpc::ErrorCode::AuthUnavailable) {   // Issue #607: retried like NotLeader
+                    onDdlNotLeader_(i, opt->message, now(), static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable));
                 } else {
                     std::string msg(opt->message);
                     if (msg.empty()) msg = "ErrorResponse code: " + std::to_string(opt->code);
@@ -4168,7 +4192,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // No-hang fix round 2: only an answer to THE connect (its correlationId)
         // or a session-fatal one fails a pending connect — an error answering
         // some other request (e.g. an InvalidRequest Ping) no longer does.
-        if (sessionFatal || opt->correlationId == agent_.seedSession().machine.correlationId())
+        if ((sessionFatal || opt->correlationId == agent_.seedSession().machine.correlationId()) &&
+            !agent_.seedMachine().retryingTransientRefusal())   // Issue #461: a transient 48 is retried
             completeConnect_(OpStatus::BrokerError, 0, ecode, msg);
         if (sessionFatal) {
             failControlOnSeedLoss_(ecode, text);   // a DDL follows its own session (I1)
@@ -4222,9 +4247,15 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // PR #441 F4 (issue #118): RecordEgressUnavailable - the broker could not build this session's own record
         // stream.  Retried like a pending NotLeader (paced by fresh metadata + backoff) within a small budget of THIS
         // request, then failed explicitly with the code (onSubscribeResponse below finishes it).
-        if (opt->errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::RecordEgressUnavailable) &&
+        // Issue #607: AuthUnavailable (48) - the broker's security state is catching up, so the grant check cannot
+        // answer yet - is retried the same way, within its own budget.
+        const bool authUnavailable =
+            opt->errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthUnavailable);
+        if ((opt->errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::RecordEgressUnavailable) ||
+             authUnavailable) &&
             subscriberHub_.isPending(opt->correlationId)) {
-            if (subscriberHub_.chargeNotLeaderRetry(opt->correlationId, kMaxEgressUnavailableRetries)) {
+            if (subscriberHub_.chargeNotLeaderRetry(
+                    opt->correlationId, authUnavailable ? kMaxAuthUnavailableRetries : kMaxEgressUnavailableRetries)) {
                 if (std::find(redirectedSubscribes_.begin(), redirectedSubscribes_.end(), opt->correlationId) ==
                     redirectedSubscribes_.end()) {
                     try {
@@ -4241,7 +4272,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
             }
             if (cbError_)
                 invokeUserCallback_("onError", [&] {
-                    cbError_("Subscribe failed: RecordEgressUnavailable (retry budget exhausted)");
+                    cbError_(authUnavailable ? "Subscribe failed: AuthUnavailable (retry budget exhausted)"
+                                             : "Subscribe failed: RecordEgressUnavailable (retry budget exhausted)");
                 });
         }
         // CB-5 A2: pass a sendFn so SubscriberHub can emit a late Unsubscribe
@@ -4375,6 +4407,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 onDdlNotLeader_(i, {}, now());
                 break;
             }
+            if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) {   // Issue #607
+                onDdlNotLeader_(i, {}, now(), opt->errorCode);
+                break;
+            }
             PendingCtl p = takeCtl_(i);
             // Task 9 (CLI): on success, register (name, topicId) so listTopics()
             // can enumerate topics that were applied via this client.
@@ -4426,6 +4462,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 onDdlNotLeader_(i, {}, now());
                 break;
             }
+            if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) {   // Issue #607
+                onDdlNotLeader_(i, {}, now(), opt->errorCode);
+                break;
+            }
             PendingCtl p = takeCtl_(i);
             completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
                          opt->topicId, opt->newVersion, opt->errorCode);
@@ -4443,6 +4483,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
             i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::CreateView) {
             if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::NotLeader)) {   // catalog history: retriable
                 onDdlNotLeader_(i, {}, now());
+                break;
+            }
+            if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) {   // Issue #607
+                onDdlNotLeader_(i, {}, now(), opt->errorCode);
                 break;
             }
             PendingCtl p = takeCtl_(i);
@@ -4467,6 +4511,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
              pendingCtl_[i].op == OpKind::NamespaceDdl)) {
             if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::NotLeader)) {
                 onDdlNotLeader_(i, opt->detail, now());
+                break;
+            }
+            if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) {   // Issue #607
+                onDdlNotLeader_(i, opt->detail, now(), opt->errorCode);
                 break;
             }
             PendingCtl p = takeCtl_(i);
@@ -4505,6 +4553,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
 
         if (const std::size_t i = findCtl_(opt->correlationId);
             i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::GetViewRow) {
+            if (opt->status == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) {   // Issue #607: retried
+                onDdlNotLeader_(i, {}, now(), static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable));
+                break;
+            }
             PendingCtl p = takeCtl_(i);
             // status is a ViewRowResponse-specific outcome, not a broker
             // ErrorCode — reuse the errorCode field as its carrier (same

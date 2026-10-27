@@ -2177,7 +2177,9 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
         // reaped or closed no longer counts.  A redirect creates no session here and is never refused.
         const bool redirect = !pc_entry.isLeader && !pc_entry.leaderClientEndpoint.empty();
         if (!redirect && unauthSessionsOf_(pc_entry.sourceHost) >= maxUnauthPerHost_) [[unlikely]] {
-            pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed);   // answered, no session
+            // Issue #613: retriable - no credential was checked; the client backs off and reconnects once a slot
+            // frees (44 stays a credential verdict).
+            pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable);   // answered, no session
             ++connectsRefusedUnauthCap_;
             if (unauthLog_.due(15)) [[unlikely]]
                 spdlog::warn("auth: connect refused source={} reason=unauthenticated-sessions-per-host cap={} "

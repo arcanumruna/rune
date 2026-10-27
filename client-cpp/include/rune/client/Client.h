@@ -1309,7 +1309,7 @@ private:
     /// Why a DDL waits for its resend: a NotLeader answer, or its session was
     /// lost before any answer (Task 5 re-review F1: past the budget the first
     /// ends BrokerError NotLeader, the second OpStatus::SessionLost).
-    enum class DdlResendCause : uint8_t { NotLeader, SessionLost };
+    enum class DdlResendCause : uint8_t { NotLeader, SessionLost, AuthUnavailable };   // Issue #607: AuthUnavailable ends with 48
     /// Not in flight: re-sent at resendAtNs (if refused then, every cycle after, until budgetEndNs).
     struct DdlAwaitingResend {
         int redirects; int64_t budgetEndNs; int64_t backoffNs; int64_t resendAtNs;
@@ -1559,7 +1559,8 @@ private:
     /// ErrorResponse{Redirect, endpoint} for pendingCtl_[i] (a DDL).
     void onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t nowNs);
     /// NotLeader (ErrorResponse or a response's errorCode 2) for pendingCtl_[i] (a DDL).
-    void onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t nowNs);
+    void onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t nowNs,
+                         uint16_t failCode = static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader));
     /// Offer d.frame to d.endpoint's node (the seed when ""); on Accepted, `on`
     /// names the session it went out on.
     transport::AeronTransport::OfferResult offerDdl_(DdlPending& d, int64_t nowNs, DdlOfferedOn& on);
@@ -1803,6 +1804,7 @@ private:
     static constexpr int64_t kRedirectedResendInitNs = 100'000'000LL;     // 100 ms
     static constexpr int64_t kRedirectedResendMaxNs  = 2'000'000'000LL;   // 2 s
     static constexpr int kMaxEgressUnavailableRetries = kMaxEgressUnavailableRetriesForTest;
+    static constexpr int kMaxAuthUnavailableRetries = 8;   // Issue #607: re-sends of ONE request answered AuthUnavailable (48)
     int64_t               redirectedResendBackoffNs_ = kRedirectedResendInitNs;
     uint64_t              unreachableRedirects_ = 0;
     uint64_t groupUpMask_   = 0;  // leader sessions (bit i-1 = session i) Connected last pass

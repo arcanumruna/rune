@@ -202,10 +202,10 @@ TEST(SessionMachineAuthRegression, AuthenticationFailedIsTerminalUnlessRateLimit
         EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
         EXPECT_EQ(t.m->rejectCode(), 44);
     }
-    {   // 44 with retryAfterMs, a plain session (never reconnects forever) -> Rejected too
+    {   // 44 with retryAfterMs before the session was ever Live -> Backoff (Issue #519), not a verdict
         Rig t; t.connectAuthRequired();
         t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 800}, 3);
-        EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Backoff);
         EXPECT_EQ(t.m->authRetryAfterMs(), 800u);
     }
     {   // reconnectForeverAfterLive + a previous Live episode: 44 with retryAfterMs 800 -> Backoff >= now + 800 ms
@@ -667,6 +667,72 @@ TEST(SessionMachineAuthRegression, AFinalLegHandshakeFailedWhileAuthenticatingIs
     EXPECT_FALSE(again->cipherList.empty()) << "a fresh TLS offer";
 }
 
+// Issue #481: a session the app connected ends Disconnected once its unproven final-leg retries are spent (no background
+// retries the app never asked for); a node session the agent revives on demand keeps the paced Backoff instead (a
+// Disconnected one would be revived every duty cycle).  RED (old): Backoff for both.
+TEST(SessionMachineAuthRegression, UnprovenFinalLegExhaustionEndsDisconnectedUnlessRevivedOnDemandRegression) {
+    const std::string serverPem = slurp(testdata("server.pem")), serverKey = slurp(testdata("server.key")),
+                      caPem = slurp(testdata("ca.pem"));
+    constexpr int64_t kSid = 42;
+    for (const bool revivedOnDemand : {false, true}) {
+        SCOPED_TRACE(revivedOnDemand ? "revived on demand" : "app-connected");
+        CapturingIo io; sm::SessionConfig cfg;
+        cfg.offerCrypto = true; cfg.tlsTrustPem = caPem; cfg.tlsExpectHost = "localhost";
+        cfg.username = "ws1"; cfg.password = "correct horse battery";
+        cfg.revivedOnDemand = revivedOnDemand;
+        sm::SessionMachine m(io, cfg);
+        m.connect(0);
+        for (int episode = 0; episode <= cfg.maxConnectRetries; ++episode) {
+            // One fresh TLS episode to Authenticating (the client is done once it sent its Finished).
+            cr::TlsSession srv = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+            ASSERT_TRUE(srv.valid());
+            ASSERT_FALSE(io.frames.empty());
+            std::size_t delivered = io.frames.size() - 1;   // this episode's ConnectRequest
+            bool first = true;
+            for (int i = 0; i < 20 && m.state() != sm::SessionState::Authenticating; ++i) {
+                ASSERT_GT(io.frames.size(), delivered);
+                const auto& frame = io.frames[delivered++];
+                std::string_view peer; int64_t corr = 0; uint8_t cipher = 0;
+                if (first) {
+                    auto req = rune::client::codec::decodeConnectRequest(frame.data(), frame.size());
+                    ASSERT_TRUE(req.has_value());
+                    peer = req->handshakeBytes; corr = req->correlationId; cipher = req->cipherList[0];
+                } else {
+                    auto hc = rune::client::codec::decodeHandshakeContinue(frame.data(), frame.size());
+                    ASSERT_TRUE(hc.has_value());
+                    peer = hc->handshakeBytes; corr = hc->correlationId;
+                }
+                ASSERT_NE(srv.readInbound(reinterpret_cast<const uint8_t*>(peer.data()), peer.size()), cr::HsState::Failed);
+                uint8_t out[16384];
+                const std::size_t n = srv.writeOutbound(out, sizeof out);
+                const std::string_view outView(reinterpret_cast<const char*>(out), n);
+                if (first) m.onConnectResponse(0, -1, kSid, corr, 1, cipher, outView, pc::AuthMode::Required,
+                                               pc::AuthState::MustAuthenticate);
+                else m.onHandshakeContinueResponse(0, outView, corr, 1);
+                first = false;
+            }
+            ASSERT_EQ(m.state(), sm::SessionState::Authenticating) << "episode " << episode;
+            m.onHandshakeContinueResponse(static_cast<int16_t>(pc::ErrorCode::HandshakeFailed), {}, m.correlationId(), 2,
+                                          kSid);
+            if (episode < cfg.maxConnectRetries) {
+                ASSERT_EQ(m.state(), sm::SessionState::Connecting) << "retried within the budget, episode " << episode;
+            }
+        }
+        EXPECT_NE(m.state(), sm::SessionState::Rejected) << "never terminal";
+        EXPECT_EQ(m.lastConnectError(), static_cast<int16_t>(pc::ErrorCode::HandshakeFailed));
+        if (!revivedOnDemand) {
+            ASSERT_EQ(m.state(), sm::SessionState::Disconnected) << "the app's failed connect ends the machine";
+            const std::size_t sent = io.frames.size();
+            m.tick(60'000'000'000LL);   // far past any Backoff delay
+            EXPECT_EQ(m.state(), sm::SessionState::Disconnected);
+            EXPECT_EQ(io.frames.size(), sent) << "no background retry the app never asked for";
+        } else {
+            ASSERT_EQ(m.state(), sm::SessionState::Backoff) << "a node session is paced, never revived per duty cycle";
+            EXPECT_GT(m.nextAttemptNs(), 2) << "the Backoff delay lies ahead";
+        }
+    }
+}
+
 // Issues #15 / #111: AuthUnavailable (48) - the broker cannot vouch for its security state right now (booting, wiped,
 // partitioned).  Never a verdict on the credentials (never Rejected), and the broker closed that session: the retry is a
 // FRESH connect (sessionId dropped) - a reconnect-forever session that was Live backs off (the client's seed failover
@@ -676,10 +742,12 @@ TEST(ClientAuthUnavailableRegression, BacksOffAndRotatesSeedsRegression) {
     {   // a first connect: a retriable failure the caller sees as 48 - never Rejected / AuthenticationFailed
         Rig t; t.connectAuthRequired();
         t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, 3);
-        EXPECT_EQ(t.m->state(), sm::SessionState::Disconnected);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Backoff) << "Issue #461: retried within its own budget";
         EXPECT_EQ(t.m->lastConnectError(), kUnavailable);
         EXPECT_EQ(t.m->sessionId(), 0) << "the broker ended that session: never resumed";
         EXPECT_EQ(t.m->authUnavailableCount(), 1u);
+        t.m->tick(t.m->nextAttemptNs());
+        EXPECT_EQ(t.m->state(), sm::SessionState::Connecting);
     }
     {   // reconnect-forever after Live: the re-login answered 48 -> Backoff, then a fresh ConnectRequest
         Rig t("ws1", "correct horse battery", /*forever=*/true, /*allowUnauthenticated=*/true);
@@ -720,6 +788,83 @@ TEST(ClientAuthUnavailableRegression, BacksOffAndRotatesSeedsRegression) {
         t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), 1);
         t.m->onErrorResponse(kUnavailable, "", /*corr=*/77, 50, 42);
         EXPECT_EQ(t.m->state(), sm::SessionState::Connected);
+    }
+}
+
+// Issues #461 / #519: before the session was ever Live a transient refusal (48, or a rate-limited 44) is retried with
+// Backoff within maxUnavailableRetries; the exhausted budget ends Disconnected carrying the code, never Rejected.
+TEST(ClientAuthUnavailableRegression, AFirstConnectRetriesAuthUnavailableWithinItsBudgetThenDisconnectsRegression) {
+    constexpr int16_t kUnavailable = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
+    Rig t;
+    t.m->connect(0);
+    int64_t now = 1;
+    const int budget = t.cfg.maxUnavailableRetries;
+    for (int i = 0; i <= budget; ++i) {
+        const int64_t corr = t.io.lastCorrelation();
+        if (i % 2 == 1) {   // the Connect itself answered 48
+            ASSERT_EQ(t.m->state(), sm::SessionState::Connecting) << i;
+            t.m->onConnectResponse(48, -1, 0, corr, ++now);
+        } else {            // the login answered 48
+            auto r = authRequired(corr);
+            t.m->onConnectResponse(r.code, -1, 42, corr, ++now, 0, {}, r.authMode, r.authState);
+            ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating) << i;
+            t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, ++now);
+        }
+        if (i == budget) break;
+        ASSERT_EQ(t.m->state(), sm::SessionState::Backoff) << i;
+        EXPECT_EQ(t.m->unavailableRetries(), i + 1);
+        now = t.m->nextAttemptNs();
+        t.m->tick(now);
+        ASSERT_EQ(t.m->state(), sm::SessionState::Connecting) << i;
+    }
+    EXPECT_EQ(t.m->state(), sm::SessionState::Disconnected) << "budget spent: Disconnected, never Rejected";
+    EXPECT_EQ(t.m->lastConnectError(), kUnavailable);
+    EXPECT_EQ(t.m->rejectCode(), 0);
+    t.m->connect(now + 1);
+    EXPECT_EQ(t.m->state(), sm::SessionState::Connecting);
+    EXPECT_EQ(t.m->unavailableRetries(), 0) << "a fresh connect() renews the budget";
+}
+
+TEST(ClientAuthUnavailableRegression, AForeverSessionNeverLiveAlsoRetriesAuthUnavailableRegression) {
+    Rig t("ws1", "correct horse battery", /*forever=*/true);
+    t.connectAuthRequired();
+    ASSERT_EQ(t.m->state(), sm::SessionState::Authenticating);
+    ASSERT_FALSE(t.m->everLive());
+    t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, 3);
+    EXPECT_EQ(t.m->state(), sm::SessionState::Backoff);
+    EXPECT_EQ(t.m->rejectCode(), 0);
+}
+
+TEST(ClientAuthRateLimitRegression, ARateLimited44BeforeLiveBacksOffAtLeastRetryAfterRegression) {
+    {
+        Rig t; t.connectAuthRequired();
+        const int64_t T = 1'000'000'000;
+        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 500}, T);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Backoff);
+        EXPECT_GE(t.m->nextAttemptNs(), T + 500'000'000LL);
+        EXPECT_EQ(t.m->rejectCode(), 0);
+        t.m->tick(t.m->nextAttemptNs() - 1);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Backoff);
+        // The budget spent: Disconnected carrying 44, never Rejected.
+        int64_t now = t.m->nextAttemptNs();
+        for (int i = 0; i < t.cfg.maxUnavailableRetries + 2 && t.m->state() != sm::SessionState::Disconnected; ++i) {
+            t.m->tick(now);
+            ASSERT_EQ(t.m->state(), sm::SessionState::Connecting) << i;
+            const int64_t corr = t.io.lastCorrelation();
+            auto r = authRequired(corr);
+            t.m->onConnectResponse(r.code, -1, 42, corr, now, 0, {}, r.authMode, r.authState);
+            t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 500}, now);
+            if (t.m->state() == sm::SessionState::Backoff) now = t.m->nextAttemptNs();
+        }
+        EXPECT_EQ(t.m->state(), sm::SessionState::Disconnected);
+        EXPECT_EQ(t.m->lastConnectError(), 44);
+        EXPECT_EQ(t.m->rejectCode(), 0);
+    }
+    {   // control: a plain 44 stays a verdict
+        Rig t; t.connectAuthRequired();
+        t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 44, .retryAfterMs = 0}, 3);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
+        EXPECT_EQ(t.m->rejectCode(), 44);
     }
 }
 
@@ -772,7 +917,7 @@ TEST(SessionMachineAuthRegression, AHaltedBrokerAnswerFailsOverInsteadOfRejectin
     {   // a first login answered 48
         Rig t; t.connectAuthRequired();
         t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 48}, 3);
-        EXPECT_EQ(t.m->state(), sm::SessionState::Disconnected);
+        EXPECT_EQ(t.m->state(), sm::SessionState::Backoff) << "Issue #461: a bounded retry, then Disconnected";
         EXPECT_EQ(t.m->rejectCode(), 0);
         EXPECT_EQ(t.m->lastConnectError(), kUnavailable);
     }

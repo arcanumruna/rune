@@ -166,6 +166,7 @@ struct SessionConfig {
     // Redirect/retry caps — prevent infinite loops.
     int maxRedirects     = 5;  // per connect() call
     int maxConnectRetries = 3;  // connect-timeout retries before → Disconnected
+    int maxUnavailableRetries = 8;  // Issues #461/#519: transient refusals (48, rate-limited 44) retried with Backoff before Live (10 ms doubling to 1 s: ~2.3 s)
     int maxResumeRetries  = 3;  // Resuming → Connecting retries before → Disconnected
 
     // Task 1.3 (multi-node): starting value for this session's ConnectRequest
@@ -185,6 +186,9 @@ struct SessionConfig {
     // non-retriable answer (ProtocolVersion) goes to terminal Rejected.  A
     // session that was never Live keeps today's first-connect budget.
     bool    reconnectForeverAfterLive = false;
+    // Issue #481: a node session the agent opens and revives on demand (not one the app connected).  Its unproven
+    // final-leg exhaustion keeps the paced Backoff: Disconnected would be revived at once, every duty cycle.
+    bool    revivedOnDemand = false;
     int64_t backoffInitialNs = 10'000'000LL;     // 10 ms first Backoff delay, doubling...
     int64_t backoffMaxNs     = 1'000'000'000LL;  // ...capped at 1 s
 
@@ -454,6 +458,14 @@ public:
     }
     /// Authentication: the retryAfterMs of the AuthServerFinal{44} that last refused this session (0 = none).
     [[nodiscard]] uint32_t authRetryAfterMs() const noexcept { return authInfo_.retryAfterMs; }
+    [[nodiscard]] int      unavailableRetries() const noexcept { return unavailableRetries_; }
+    /// Issue #461: in Backoff because a transient refusal (48 / rate-limited 44) before Live is being retried within
+    /// maxUnavailableRetries - not because the machine gave up.
+    [[nodiscard]] bool     retryingTransientRefusal() const noexcept {
+        return state_ == SessionState::Backoff && unavailableRetries_ > 0 &&
+               (lastConnectError_ == static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthUnavailable) ||
+                lastConnectError_ == static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed));
+    }
     /// Authentication: the salted-password cache is the duty thread's (the agent's), shared by its sessions;
     /// a machine built alone (tests) uses its own.  Duty thread, before the first connect.
     void useScramCache(ScramCache* cache) noexcept { cache_ = cache != nullptr ? cache : &ownCache_; }
@@ -739,11 +751,16 @@ public:
                 doConnect(nowNs, /*resetSessionId=*/true, /*freshEpisode=*/false);
                 return;
             }
-            // Exhausted: Backoff (never terminal), whose delay keeps growing until a sealed frame proves the keys
-            // (finishConnected_ does not renew it for an unproven TLS session) - a broker failing every final leg is
-            // retried at most once per Backoff delay, and an on-demand revive (Disconnected only) cannot storm.
+            // Issue #481: exhausted like any connect budget - Disconnected for a session the app connected, Backoff
+            // once Live with reconnectForeverAfterLive.  A node session revived on demand keeps Backoff, whose delay
+            // keeps growing until a sealed frame proves the keys (finishConnected_ does not renew it for an unproven
+            // TLS session): a broker failing every final leg is retried at most once per Backoff delay, never a storm.
             sessionId_ = 0;
-            enterBackoff_(nowNs);
+            if (cfg_.revivedOnDemand) {
+                enterBackoff_(nowNs);
+            } else {
+                onRetryBudgetExhausted_(nowNs);
+            }
             return;
         }
         if (state_ != SessionState::Handshaking) return;
@@ -1086,6 +1103,7 @@ private:
             redirectCount_     = 0;
             connectRetryCount_ = 0;
             resumeRetryCount_  = 0;
+            unavailableRetries_ = 0;
         }
         correlationId_       = nextCorrelationId();
         connectStartNs_      = nowNs;
@@ -1381,12 +1399,18 @@ private:
     }
 
     /// The broker refused the login (or proved nothing): terminal Rejected(code) — except a rate-limited 44
-    /// (retryAfterMs > 0) of a reconnect-forever session that was Live, which backs off at least that long (D27).
+    /// (retryAfterMs > 0): before Live a bounded Backoff (Issue #519), of a reconnect-forever session that was Live
+    /// Backoff without bound; both wait at least that long (D27).
     void failAuth_(rune::protocol::client::ErrorCode ec, uint32_t retryAfterMs, int64_t nowNs) noexcept {
         lastConnectError_ = static_cast<int16_t>(static_cast<uint16_t>(ec));
         authInfo_.retryAfterMs = retryAfterMs;
         ++connectFailures_;
         cryptoState_ = CryptoState{};
+        if (retryAfterMs > 0 &&   // Issue #519: a rate-limited login before Live is a bounded retry, not a verdict
+            retryTransientBeforeLive_(static_cast<int16_t>(static_cast<uint16_t>(ec)),
+                                      nowNs + static_cast<int64_t>(retryAfterMs) * 1'000'000LL, nowNs)) {
+            return;
+        }
         if (retryAfterMs > 0 && reconnectsForever_()) {
             sessionId_ = 0;                       // the refused broker session is gone: the retry is fresh
             authenticatedSessionId_ = 0;
@@ -1397,6 +1421,29 @@ private:
         }
         rejectCode_ = static_cast<int16_t>(static_cast<uint16_t>(ec));
         transitionTo(SessionState::Rejected);
+    }
+
+    /// Issues #461 / #519 / #613: a transient refusal before this session was ever Live (the broker's security state is
+    /// catching up, its unauthenticated-session cap is full, the login throttle asks for a pause): retried with Backoff,
+    /// at least `notBeforeNs`, within maxUnavailableRetries - then Disconnected with the code, never Rejected.
+    /// False when it does not apply (the session was Live: the caller keeps its own path).
+    bool retryTransientBeforeLive_(int16_t code, int64_t notBeforeNs, int64_t nowNs) noexcept {
+        if (everLive_) return false;
+        hs_.reset();
+        cryptoState_            = CryptoState{};
+        scram_.reset();
+        sessionId_              = 0;     // the refused broker session is gone: the retry is fresh
+        authenticatedSessionId_ = 0;
+        lastConnectError_       = code;
+        ++connectFailures_;
+        if (unavailableRetries_ >= cfg_.maxUnavailableRetries) {
+            transitionTo(SessionState::Disconnected);
+            return true;
+        }
+        ++unavailableRetries_;
+        enterBackoff_(nowNs);
+        if (backoff_.nextAttemptNs < notBeforeNs) backoff_.nextAttemptNs = notBeforeNs;
+        return true;
     }
 
     /// Issues #15 / #111: AuthUnavailable (48) - THIS broker cannot vouch for its security state right now (catching
@@ -1442,6 +1489,7 @@ private:
         // FIX C: reset both retry counters on successful connect/resume.
         connectRetryCount_   = 0;
         resumeRetryCount_    = 0;
+        unavailableRetries_  = 0;
         everLive_            = true;   // T15a R1 latch
         // PR #476 review: an encrypted session's Backoff is renewed only once a sealed frame proves the keys
         // (onSealedFrameOpened) - an optimistic Connected followed by a final-leg failure keeps its growing delay.
@@ -1615,6 +1663,8 @@ private:
     /// OK nor a redirect.
     void onConnectError_(rune::protocol::client::ErrorCode ec, int64_t nowNs) noexcept {
         namespace rpc = rune::protocol::client;
+        if (ec == rpc::ErrorCode::AuthUnavailable &&   // Issue #461: a transient refusal before Live is retried
+            retryTransientBeforeLive_(static_cast<int16_t>(static_cast<uint16_t>(ec)), 0, nowNs)) return;
         if (cfg_.offerCrypto && cfg_.requireCrypto &&
             (state_ == SessionState::Connecting || state_ == SessionState::Handshaking)) {
             onPreTlsRefusal_(static_cast<int16_t>(static_cast<uint16_t>(ec)), nowNs);   // issue #14: unauthenticated
@@ -1801,6 +1851,7 @@ private:
     // certificate name it keeps verifying there (most recently used last); the anchor name, and the fail-closed flag.
     bool                     brokerKeysProven_ = false;   // PR #476 review: see onSealedFrameOpened
     int                      unprovenFinalLegRetries_ = 0;   // final-leg failures retried since keys were last proven
+    int                      unavailableRetries_ = 0;   // transient refusals retried since the last fresh connect() / Live
     std::vector<RedirectPin> redirectPins_;
     std::string              anchorHost_;
     bool                     anchorSet_ = false;

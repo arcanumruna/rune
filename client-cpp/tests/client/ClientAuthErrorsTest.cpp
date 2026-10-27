@@ -164,11 +164,15 @@ TEST(ClientAuthErrorsRegression, NoCredentialsFailsConnectWithAuthenticationFail
 }
 
 TEST(ClientAuthErrorsRegression, ARateLimitedLoginReportsRetryAfterOnTheConnectFailure) {
-    Rig r(authCfg(3708, "ws1", "not the password!"));
+    rc::ClientConfig c = authCfg(3708, "ws1", "not the password!");
+    c.connectTimeoutMs = 120'000;   // the whole retry budget (8 x >= 800 ms) fits the connect deadline
+    Rig r(c);
     r.gw.retryAfterMsOnFailure = 800;
     test_support::TestCq cq(r.client);
     auto f = r.connectOp(cq);
-    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    // Issue #519: before Live a rate-limited login is retried (Backoff >= the retry-after) within the retry budget,
+    // then the connect fails with the code and the retry-after; drive the injected clock past the whole budget.
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000));
     EXPECT_EQ(f.outcome().c.errorCode, 44);
     EXPECT_EQ(f.outcome().c.aux, 800) << "Completion::aux = the broker's retryAfterMs";
 }
@@ -729,21 +733,40 @@ TEST(ClientAuthErrorsRegression, NoDataFrameLeavesBeforeConnectedRegression) {
     EXPECT_EQ(r.gw.unauthenticatedRequests, 0);
 }
 
-// Review B I5 (d): a resume of a session that IS authenticated keeps its login — no second SCRAM exchange.
-TEST(ClientAuthErrorsRegression, AResumedSessionKeepsItsLoginRegression) {
+// Issue #478: the real gateway never resumes a login (ClientGateway::handleConnect since PR #476): a reconnect gets a NEW
+// session id and MustAuthenticate, and the client logs in again.  The fake now does exactly that; the work that was in
+// flight on the lost session completes on the new one, exactly once.
+TEST(ClientAuthErrorsRegression, AReconnectedSessionLogsInAgainAndItsWorkResumesRegression) {
     Rig r(authCfg(3752, "ws1", kPw));
     r.gw.uniqueSessionIds = true;
+    r.gw.replyAcks = false;                       // the produce stays in flight across the lost session
     r.connectOk();
-    ASSERT_EQ(r.gw.authFirsts, 1);
-    const int64_t sid = r.client.state() == rc::session::SessionState::Connected ? r.gw.authSessionIds.front() : 0;
-    r.client.testForceResume();   // the link drops: Connected -> Resuming -> a resume ConnectRequest with the hint
-    ASSERT_TRUE(r.drive([&] { return r.gw.resumedAnswers == 1; }, 10'000'000));
+    ASSERT_EQ(r.gw.authFirsts, 1) << "the first login";
+    const int64_t firstSid = r.gw.authSessionIds.front();
+    test_support::TestCq cq(r.client);
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    rc::Producer p = r.client.producer(pcfg);
+    const std::vector<uint8_t> val(16, 0x3C);
+    auto sent = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{1}), val);
+    ASSERT_TRUE(sent.accepted());
+    p.flush();
+    ASSERT_TRUE(r.drive([&] { return !r.gw.held.empty(); })) << "the produce never reached the broker";
+    const int connectsBefore = r.gw.connects;
+    r.client.testForceResume();                   // the link drops: Connected -> Resuming -> a resume ConnectRequest
     ASSERT_TRUE(r.drive([&] { return r.client.state() == rc::session::SessionState::Connected; }, 10'000'000));
-    EXPECT_EQ(r.gw.authFirsts, 1) << "no second login across the resume";
-    EXPECT_EQ(r.gw.authOk, 1);
-    EXPECT_EQ(r.client.authStatus().kind, rc::AuthStatus::Kind::Authenticated) << "an earned resume";
+    EXPECT_EQ(r.gw.connects, connectsBefore + 1) << "the first reconnect attempt is the one that completed";
+    EXPECT_EQ(r.gw.authFirsts, 2) << "the reconnect logged in again (the gateway never resumes a login)";
+    EXPECT_EQ(r.gw.authOk, 2);
+    EXPECT_NE(r.gw.authSessionIds.back(), firstSid) << "a reconnect gets a NEW session id";
+    EXPECT_EQ(r.client.authStatus().kind, rc::AuthStatus::Kind::Authenticated);
     EXPECT_EQ(r.client.authStatus().user, "ws1");
-    EXPECT_NE(sid, 0);
+    r.gw.replyAcks = true;
+    ASSERT_TRUE(r.drive([&] { return r.gw.held.size() >= 2; }, 10'000'000)) << "the batch was not re-offered on the new session";
+    r.gw.ack(r.gw.held.back());
+    ASSERT_TRUE(r.drive([&] { return sent.ready(); }, 10'000'000));
+    EXPECT_TRUE(sent.ok()) << sent.describe();
+    r.passes(50, 10'000'000);                // a duplicate completion would trip the completion queue's exactly-once check
+    EXPECT_EQ(r.gw.unauthenticatedRequests, 0);
 }
 
 // ---- 45 / 47 on an op --------------------------------------------------------------------------------------
@@ -1387,4 +1410,169 @@ TEST(ClientAuthErrorsRegression, LateSubscribeOkIsReleasedEndToEndRegression) {
         << "the broker still holds subscription " << registered.subscriptionId;
     EXPECT_EQ(r.gw.unsubscribed.back(), registered.subscriptionId);
     EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+// ---- #461: a booting broker answers AuthUnavailable (48) to the first Connects ---------------------------------------
+// The security state is still catching up: the first connect() retries it with Backoff and completes Ok once the broker
+// is ready - the caller never sees the transient 48.  RED (before): the pending connect failed NotConnected at the
+// first 48.
+TEST(ClientAuthUnavailableRegression, ConnectSucceedsAfterABootingBrokerAnswersAuthUnavailableRegression) {
+    Rig r(authCfg(3890, "ws1", kPw));
+    r.gw.connectErrorFirstN    = 3;
+    r.gw.connectErrorFirstCode = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
+    test_support::TestCq cq(r.client);
+    auto f = r.connectOp(cq);
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000)) << "the connect hung";   // >= the sweep cadence
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(r.gw.connectErrorFirstN, 0) << "all three refusals were served";
+    EXPECT_GE(r.gw.connects, 4);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+// ---- #607: grant-checked requests answered AuthUnavailable (48) are retried, not surfaced --------------------------
+namespace {
+constexpr int16_t k48 = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
+void answerDdlResponse(Rig& r, int64_t sid, int64_t corr, uint16_t code) {
+    pc::DdlResponse resp; resp.sessionId = sid; resp.correlationId = corr; resp.errorCode = code;
+    resp.objectId = 5; resp.newVersion = 2;
+    r.gw.sendDdlResponse(0, resp);
+}
+}  // namespace
+
+// C1: a Subscribe answered 48 is re-sent (paced by fresh metadata + backoff) and binds; the application sees nothing.
+TEST(SubscribeAuthUnavailableRegression, ASubscribeAnswered48IsRetriedThenBindsRegression) {
+    Rig r(authCfg(3900, "ws1", kPw));
+    r.connectOk();
+    r.gw.subscribeErrorFirstN    = 2;
+    r.gw.subscribeErrorFirstCode = k48;
+    int errors = 0;
+    r.client.onError([&](const std::string&) { ++errors; });
+    rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty(); }, 50'000'000)) << "the subscription never bound";
+    EXPECT_FALSE(sub.finished());
+    EXPECT_EQ(r.gw.subscribeFrames.size(), 3u) << "two refusals, then the bound Subscribe";
+    EXPECT_EQ(errors, 0) << "a transient 48 reached the application";
+}
+
+TEST(SubscribeAuthUnavailableRegression, ASubscribeAnswered48IsFailedWith48AfterItsBudgetRegression) {
+    Rig r(authCfg(3902, "ws1", kPw));
+    r.connectOk();
+    r.gw.subscribeErrorFirstN    = 1000;
+    r.gw.subscribeErrorFirstCode = k48;
+    int errors = 0;
+    r.client.onError([&](const std::string&) { ++errors; });
+    rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); }, 50'000'000)) << "the budget never ended it";
+    EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::RejectedByBroker);
+    EXPECT_EQ(sub.brokerErrorCode(), static_cast<uint16_t>(k48));
+    EXPECT_EQ(errors, 1) << "onError exactly once";
+    EXPECT_EQ(r.gw.subscribeFrames.size(), 1u + 8u) << "the first Subscribe and kMaxAuthUnavailableRetries re-sends";
+}
+
+// C2: a GetViewRow answered ViewRowResponse{status 48} is re-sent like a NotLeader and completes Ok.
+TEST(ViewReadAuthUnavailableRegression, AGetViewRowAnswered48IsRetriedRegression) {
+    Rig r(authCfg(3904, "ws1", kPw));
+    r.connectOk();
+    int seen = 0;
+    const std::vector<uint8_t> row = {1, 2, 3, 4};
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
+        const auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        pc::ViewRowResponse resp;
+        resp.sessionId = m->sessionId; resp.correlationId = m->correlationId;
+        resp.status = ++seen <= 2 ? static_cast<uint16_t>(k48) : uint16_t{0};
+        if (resp.status == 0) { resp.rowLen = 4; resp.rowBytes = row.data(); resp.rowBytesLen = 4; }
+        std::vector<uint8_t> out(resp.encodedSize());
+        const std::size_t n = resp.encode(out.data());
+        r.gw.send(0, out.data(), n);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 50'000'000));
+    EXPECT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(seen, 3);
+}
+
+// C2: a DDL answered 48 (a DefineTopicResponse, a DdlResponse, an ErrorResponse) is re-sent within its budget.
+TEST(DdlAuthUnavailableRegression, ADdlAnswered48IsRetriedWithinItsBudgetRegression) {
+    Rig r(authCfg(3906, "ws1", kPw));
+    r.connectOk();
+    int defines = 0, drops = 0, errs = 0;
+    r.gw.templateHandlers[pc::DefineTopic::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
+        const auto m = pc::DefineTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        pc::DefineTopicResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId;
+        resp.errorCode = ++defines <= 2 ? static_cast<uint16_t>(k48) : uint16_t{0};
+        resp.topicId = 9; resp.version = 1;
+        std::vector<uint8_t> out(256);
+        const std::size_t n = resp.encode(out.data());
+        r.gw.send(0, out.data(), n);
+    };
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
+        const auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        answerDdlResponse(r, m->sessionId, m->correlationId, ++drops <= 2 ? static_cast<uint16_t>(k48) : uint16_t{0});
+    };
+    r.gw.templateHandlers[pc::DropView::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
+        const auto m = pc::DropView::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        if (++errs <= 2) r.gw.sendError(0, k48, "booting", m->sessionId, m->correlationId);
+        else answerDdlResponse(r, m->sessionId, m->correlationId, 0);
+    };
+    test_support::TestCq cq(r.client);
+    auto a = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.defineTopic("nt", 1, "", false, {}, q, t); });
+    ASSERT_TRUE(r.drive([&] { return a.ready(); }, 50'000'000));
+    EXPECT_TRUE(a.ok()) << "DefineTopicResponse: " << a.describe();
+    EXPECT_EQ(defines, 3);
+    auto b = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(r.drive([&] { return b.ready(); }, 50'000'000));
+    EXPECT_TRUE(b.ok()) << "DdlResponse: " << b.describe();
+    EXPECT_EQ(drops, 3);
+    auto c = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropView("v", {}, q, t); });
+    ASSERT_TRUE(r.drive([&] { return c.ready(); }, 50'000'000));
+    EXPECT_TRUE(c.ok()) << "ErrorResponse: " << c.describe();
+    EXPECT_EQ(errs, 3);
+}
+
+TEST(DdlAuthUnavailableRegression, ADdlAnswered48ForeverFailsWith48WhenItsBudgetEndsRegression) {
+    rc::ClientConfig c = authCfg(3908, "ws1", kPw);
+    c.ddlTimeoutMs = 600'000;   // the retry budget, not the op deadline, ends it
+    Rig r(c);
+    r.connectOk();
+    int drops = 0;
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
+        const auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        ++drops;
+        answerDdlResponse(r, m->sessionId, m->correlationId, static_cast<uint16_t>(k48));
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 50'000'000)) << "the budget never ended it";
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(f.outcome().c.errorCode, 48);
+    EXPECT_GT(drops, 1) << "retried before it failed";
+}
+
+// C2 (the CLI half of #461): `rune security bootstrap` is a routed SecurityBootstrap op answered by a DdlResponse.
+TEST(DdlAuthUnavailableRegression, SecurityBootstrapAnswered48IsRetriedRegression) {
+    Rig r(authCfg(3910, "", ""));
+    r.gw.users.clear();
+    r.gw.bootstrapped = false;
+    const std::string keyFile(64, 'k');
+    r.gw.clusterKey.assign(keyFile.begin(), keyFile.end());
+    r.connectOk();
+    int seen = 0;
+    r.gw.templateHandlers[pc::SecurityBootstrap::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
+        const auto m = pc::SecurityBootstrap::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        answerDdlResponse(r, m->sessionId, m->correlationId, ++seen <= 2 ? static_cast<uint16_t>(k48) : uint16_t{0});
+    };
+    const std::vector<uint8_t> key(keyFile.begin(), keyFile.end());
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.bootstrapSecurity("admin", "a one-time password 24", key, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 50'000'000));
+    EXPECT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(seen, 3);
 }

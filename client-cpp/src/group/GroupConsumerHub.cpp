@@ -1980,6 +1980,10 @@ void GroupConsumerHub::onHeartbeatResponse(const uint8_t* buf, std::size_t len,
         const auto ec = static_cast<rpc::ErrorCode>(
             static_cast<uint16_t>(opt->errorCode));
 
+        // Issue #607: AuthUnavailable (48) - the coordinator's security state is catching up: the member stays Stable
+        // (no rejoin, backoffRejoins untouched); the next Heartbeat at its normal cadence is the retry, and an
+        // eviction shows up as UnknownMember later.
+        if (ec == rpc::ErrorCode::AuthUnavailable) break;
         switch (classifyGroupAnswer_(ec)) {
         case GroupVerdict::Ok:      impl->backoffRejoins = 0; break;   // fix round 3: proven healthy — budget reset
         case GroupVerdict::Rejoin:  toRejoining_(*impl); break;
@@ -2017,7 +2021,9 @@ void GroupConsumerHub::onOffsetCommitResponse(const uint8_t* buf, std::size_t le
         bool    unstable = false;
         for (std::size_t i = 0; i < opt->results.size(); ++i) {
             const auto r = opt->results[i];
-            if (r.errorCode == static_cast<int16_t>(rpc::ErrorCode::UnstableOffsetCommit)) { unstable = true; continue; }
+            // Issue #607: AuthUnavailable (48) is waited out exactly like UnstableOffsetCommit.
+            if (r.errorCode == static_cast<int16_t>(rpc::ErrorCode::UnstableOffsetCommit) ||
+                r.errorCode == static_cast<int16_t>(rpc::ErrorCode::AuthUnavailable)) { unstable = true; continue; }
             if (r.errorCode != 0) { err = r.errorCode; break; }
         }
         if (err == 0 && unstable) {

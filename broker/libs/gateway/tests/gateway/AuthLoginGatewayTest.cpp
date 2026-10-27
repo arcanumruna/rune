@@ -2100,7 +2100,8 @@ int loginOn(Rig& rig, int64_t sid, const std::string& user, const std::string& p
     const auto fin = lastFinal(rig, sid);
     return fin ? fin->errorCode : -1;
 }
-constexpr int16_t kConnectAuthFailed = static_cast<int16_t>(pc::ErrorCode::AuthenticationFailed);
+// Issue #613: the per-host unauthenticated-session cap answers the retriable AuthUnavailable, not a credential verdict.
+constexpr int16_t kConnectCapRefused = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
 }  // namespace
 
 TEST(UnauthSessionCapRegression, OneHostCannotHoldMoreThanTheCapOfUnauthenticatedSessionsRegression) {
@@ -2114,7 +2115,7 @@ TEST(UnauthSessionCapRegression, OneHostCannotHoldMoreThanTheCapOfUnauthenticate
     }
     const std::size_t sessions = rig.gw.sessionCount();
     const auto refused = connectFrom(rig, "10.0.0.21");
-    EXPECT_EQ(refused.code, kConnectAuthFailed) << "the 5th unauthenticated session of one host is refused at once";
+    EXPECT_EQ(refused.code, kConnectCapRefused) << "the 5th unauthenticated session of one host is refused at once";
     EXPECT_EQ(refused.sid, 0);
     EXPECT_EQ(rig.gw.sessionCount(), sessions) << "a refused Connect creates no session";
     EXPECT_EQ(rig.gw.pendingConnectCount(), 0u);
@@ -2125,6 +2126,24 @@ TEST(UnauthSessionCapRegression, OneHostCannotHoldMoreThanTheCapOfUnauthenticate
     EXPECT_TRUE(rig.gw.hasSessionForTest(other.sid));
 }
 
+// Issue #613: the cap refusal is retriable (48, no session) and the same host's next Connect is accepted once a slot frees.
+TEST(UnauthSessionCapRegression, TheCapRefusalIsRetriableAndASlotFreesForTheRetryRegression) {
+    Rig rig;
+    rig.gw.setMaxUnauthenticatedSessionsPerHost(2);
+    const auto a = connectFrom(rig, "10.0.0.81");
+    const auto b = connectFrom(rig, "10.0.0.81");
+    ASSERT_EQ(a.code, 0);
+    ASSERT_EQ(b.code, 0);
+    const auto refused = connectFrom(rig, "10.0.0.81");
+    EXPECT_EQ(refused.code, static_cast<int16_t>(pc::ErrorCode::AuthUnavailable));
+    EXPECT_NE(refused.code, static_cast<int16_t>(pc::ErrorCode::AuthenticationFailed)) << "not a credential verdict";
+    EXPECT_EQ(refused.sid, 0);
+    ASSERT_EQ(loginOn(rig, a.sid, "ws1", kTestPasswordA), 0);   // one capped session logs in: its slot frees
+    const auto retry = connectFrom(rig, "10.0.0.81");
+    EXPECT_EQ(retry.code, 0) << "the retry is accepted";
+    EXPECT_TRUE(rig.gw.hasSessionForTest(retry.sid));
+}
+
 TEST(UnauthSessionCapRegression, ALoggedInSessionFreesItsUnauthenticatedSlotRegression) {
     Rig rig;
     rig.gw.setMaxUnauthenticatedSessionsPerHost(2);
@@ -2132,12 +2151,12 @@ TEST(UnauthSessionCapRegression, ALoggedInSessionFreesItsUnauthenticatedSlotRegr
     const auto b = connectFrom(rig, "10.0.0.31");
     ASSERT_EQ(a.code, 0);
     ASSERT_EQ(b.code, 0);
-    EXPECT_EQ(connectFrom(rig, "10.0.0.31").code, kConnectAuthFailed) << "at the cap";
+    EXPECT_EQ(connectFrom(rig, "10.0.0.31").code, kConnectCapRefused) << "at the cap";
     ASSERT_EQ(loginOn(rig, a.sid, "ws1", kTestPasswordA), 0);
     ASSERT_TRUE(std::holds_alternative<AuthAuthenticated>(*rig.gw.sessionAuthForTest(a.sid)));
     const auto c = connectFrom(rig, "10.0.0.31");
     EXPECT_EQ(c.code, 0) << "a logged-in session holds no unauthenticated slot";
-    EXPECT_EQ(connectFrom(rig, "10.0.0.31").code, kConnectAuthFailed);
+    EXPECT_EQ(connectFrom(rig, "10.0.0.31").code, kConnectCapRefused);
     EXPECT_EQ(rig.gw.connectsRefusedUnauthenticatedCap(), 2u);
 }
 
@@ -2146,12 +2165,12 @@ TEST(UnauthSessionCapRegression, AReapedOrClosedSessionFreesItsSlotRegression) {
     rig.gw.setMaxUnauthenticatedSessionsPerHost(1);
     const auto a = connectFrom(rig, "10.0.0.41");
     ASSERT_EQ(a.code, 0);
-    EXPECT_EQ(connectFrom(rig, "10.0.0.41").code, kConnectAuthFailed);
+    EXPECT_EQ(connectFrom(rig, "10.0.0.41").code, kConnectCapRefused);
     rig.gw.reapExpiredForTest(1'000'000'001);   // past the 1 s auth deadline
     ASSERT_FALSE(rig.gw.hasSessionForTest(a.sid));
     const auto b = connectFrom(rig, "10.0.0.41", 1'000'000'002);
     ASSERT_EQ(b.code, 0) << "a reaped session frees its slot";
-    EXPECT_EQ(connectFrom(rig, "10.0.0.41", 1'000'000'002).code, kConnectAuthFailed);
+    EXPECT_EQ(connectFrom(rig, "10.0.0.41", 1'000'000'002).code, kConnectCapRefused);
     rig.send(disconnectFrame(b.sid, ++rig.corr));
     ASSERT_FALSE(rig.gw.hasSessionForTest(b.sid));
     EXPECT_EQ(connectFrom(rig, "10.0.0.41", 1'000'000'003).code, 0) << "a closed session frees its slot";
@@ -2161,7 +2180,7 @@ TEST(UnauthSessionCapRegression, TheDefaultCapIs64Regression) {
     Rig rig;
     EXPECT_EQ(ClientGateway::kDefaultMaxUnauthSessionsPerHost, 64u);
     for (int i = 0; i < 64; ++i) ASSERT_EQ(connectFrom(rig, "10.0.0.51").code, 0) << i;
-    EXPECT_EQ(connectFrom(rig, "10.0.0.51").code, kConnectAuthFailed);
+    EXPECT_EQ(connectFrom(rig, "10.0.0.51").code, kConnectCapRefused);
     EXPECT_EQ(rig.gw.connectsRefusedUnauthenticatedCap(), 1u);
 }
 
@@ -2175,7 +2194,7 @@ TEST(UnauthSessionCapRegression, ShardSlotsStayAvailableToOtherHostsRegression) 
     rig.gw.setMaxUnauthenticatedSessionsPerHost(2);
     ASSERT_EQ(connectFrom(rig, "10.0.0.61").code, 0);
     ASSERT_EQ(connectFrom(rig, "10.0.0.61").code, 0);
-    for (int i = 0; i < 8; ++i) EXPECT_EQ(connectFrom(rig, "10.0.0.61").code, kConnectAuthFailed) << i;
+    for (int i = 0; i < 8; ++i) EXPECT_EQ(connectFrom(rig, "10.0.0.61").code, kConnectCapRefused) << i;
     EXPECT_EQ(rig.gw.pendingConnectCount(), 0u) << "a refused Connect is never announced nor held";
     const auto other = connectFrom(rig, "10.0.0.62");
     EXPECT_EQ(other.code, 0);
@@ -2217,7 +2236,7 @@ TEST(UnauthSessionCapRegression, VaryingTheSourcePortStillCountsAsOneHostAdversa
         ASSERT_TRUE(a.has_value()) << i;
         codes.push_back(a->code);
     }
-    EXPECT_EQ(codes, (std::vector<int16_t>{0, 0, 0, kConnectAuthFailed, kConnectAuthFailed, kConnectAuthFailed}));
+    EXPECT_EQ(codes, (std::vector<int16_t>{0, 0, 0, kConnectCapRefused, kConnectCapRefused, kConnectCapRefused}));
     EXPECT_EQ(rig.gw.connectsRefusedUnauthenticatedCap(), 3u);
 }
 
@@ -2234,7 +2253,7 @@ TEST(UnauthSessionCapRegression, ABurstOfConnectsBeforeAnyResolvesIsCappedAdvers
         const auto a = connectAnswer(rig, c);
         ASSERT_TRUE(a.has_value()) << c;
         if (a->code == 0) ++ok;
-        else if (a->code == kConnectAuthFailed) ++refused;
+        else if (a->code == kConnectCapRefused) ++refused;
     }
     EXPECT_EQ(ok, 4);
     EXPECT_EQ(refused, 3);
@@ -2247,7 +2266,7 @@ TEST(UnauthSessionCapRegression, AFailedLoginFreesItsSlotAdversarialRegression) 
     rig.gw.setMaxUnauthenticatedSessionsPerHost(1);
     const auto a = connectFrom(rig, "10.0.0.73");
     ASSERT_EQ(a.code, 0);
-    EXPECT_EQ(connectFrom(rig, "10.0.0.73").code, kConnectAuthFailed);
+    EXPECT_EQ(connectFrom(rig, "10.0.0.73").code, kConnectCapRefused);
     EXPECT_EQ(loginOn(rig, a.sid, "ws1", "not-the-password-xx"), static_cast<int>(pc::ErrorCode::AuthenticationFailed));
     rig.gw.pollPendingConnectsForTest(0);
     EXPECT_EQ(connectFrom(rig, "10.0.0.73").code, 0) << "the failed session holds no slot";

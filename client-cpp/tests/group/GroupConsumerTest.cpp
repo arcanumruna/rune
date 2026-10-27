@@ -3453,6 +3453,62 @@ TEST_F(GroupConsumerHubRegression, AHeartbeatErrorRejoinsOnlyTheConsumerItAnswer
     }
 }
 
+// Issue #607: AuthUnavailable (48) - the coordinator's security state is catching up, the grant check cannot answer
+// yet.  A heartbeat answered 48 keeps the member Stable (no rejoin, no backoff charge): the next heartbeat at its normal
+// cadence is the retry, and an eviction shows up as UnknownMember later.
+class GroupAuthUnavailableRegression : public GroupConsumerHubTest {};
+
+TEST_F(GroupAuthUnavailableRegression, AHeartbeatAnswered48KeepsTheMemberStableRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    sink_.clear();
+    impl_->nextHeartbeat = std::chrono::steady_clock::time_point{};
+    hub_->doWork(0, kSessionId, sink_.fn());
+    const int64_t h1 = lastCorr(sink_, rpc::TemplateId::Heartbeat);
+    ASSERT_NE(h1, 0);
+    const auto rejoinsBefore = impl_->backoffRejoins;
+    auto hbr = makeHeartbeatResponse(static_cast<int16_t>(rpc::ErrorCode::AuthUnavailable), h1);
+    hub_->onHeartbeatResponse(hbr.data(), hbr.size(), kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Stable) << "a transient 48 rejoined the group";
+    EXPECT_EQ(impl_->backoffRejoins, rejoinsBefore);
+    EXPECT_TRUE(impl_->active);
+    sink_.clear();
+    impl_->nextHeartbeat = std::chrono::steady_clock::time_point{};
+    hub_->doWork(0, kSessionId, sink_.fn());
+    EXPECT_EQ(lastCorr(sink_, rpc::TemplateId::JoinGroup), 0) << "no JoinGroup after the 48";
+    EXPECT_NE(lastCorr(sink_, rpc::TemplateId::Heartbeat), 0) << "the next heartbeat is the retry";
+    auto gone = makeHeartbeatResponse(static_cast<int16_t>(rpc::ErrorCode::UnknownMember),
+                                      lastCorr(sink_, rpc::TemplateId::Heartbeat));
+    hub_->onHeartbeatResponse(gone.data(), gone.size(), kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Rejoining) << "an eviction still shows up as UnknownMember";
+}
+
+// Issue #607: a commitSync answered 48 is handled exactly like UnstableOffsetCommit - re-sent after a backoff on the
+// duty clock, never surfaced, bounded by the commitSync deadline.
+TEST_F(GroupAuthUnavailableRegression, ACommitSyncAnswered48IsResentRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 7);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
+    auto op = commitSyncOp(gc);
+    int64_t now = 1'000'000'000;
+    hub_->doWork(now, kSessionId, sink_.fn());
+    const int64_t corr1 = lastCommitCorrId(sink_);
+    ASSERT_NE(corr1, 0);
+    auto r1 = makeOffsetCommitResponse(corr1, static_cast<int16_t>(rpc::ErrorCode::AuthUnavailable));
+    hub_->onOffsetCommitResponse(r1.data(), r1.size());
+    EXPECT_FALSE(op.ready()) << "AuthUnavailable was surfaced";
+    (void)hub_->sweepCommitSyncTimeouts(now);   // arms the retry
+    now += GroupConsumerHub::kCommitRetryMinNs;
+    (void)hub_->sweepCommitSyncTimeouts(now);
+    hub_->doWork(now, kSessionId, sink_.fn());
+    const int64_t corr2 = lastCommitCorrId(sink_);
+    ASSERT_NE(corr2, corr1) << "never re-sent";
+    auto ok = makeOffsetCommitResponse(corr2);
+    hub_->onOffsetCommitResponse(ok.data(), ok.size());
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::Ok);
+    EXPECT_EQ(op.times(), 1);
+}
+
 TEST_F(GroupConsumerHubRegression, AStaleJoinAnswerIsDroppedRegression) {
     hub_->onConnected(kSessionId, sink_.fn());
     const int64_t c1 = lastCorr(sink_, rpc::TemplateId::JoinGroup);
