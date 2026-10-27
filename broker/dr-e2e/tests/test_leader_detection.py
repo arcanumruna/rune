@@ -1,8 +1,8 @@
-"""Leader detection via the Aeron role counter (not log scraping).
+"""Leader detection via the node-role metric (not log scraping).
 
 These tests prove the machine-readable leadership signal end-to-end in Docker:
-  * rune_role reads the node-role + leadership-term counters out of each broker's
-    CnC file and prints a parseable ROLE line.
+  * rune_role reads the node-role + leadership-term metrics out of each broker's
+    metrics file (RUNE_DATA_DIR/metrics/rune-metrics.dat) and prints a parseable ROLE line.
   * The harness (cluster._read_role / _scan_leader / identify_leader /
     assert_single_leader) detects the leader from those counters.
   * Detection is INDEPENDENT of RUNE_LOG_LEVEL — the regression that motivated

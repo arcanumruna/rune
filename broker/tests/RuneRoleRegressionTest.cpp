@@ -378,4 +378,172 @@ TEST(RuneRoleRegression, ParsersStillAgreeRegression) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Adversarial (batch review of plan 2026-10-26 Tasks 7-11): hostile metrics files through the real binary.
+//
+//   InputBoundsTable      a zero-length file, a header-only file, a file one byte short of its slot area, a wrong
+//                         layout version and a wrong record length: exit 1 with the open status on stderr, never a
+//                         crash (SIGBUS from reading past a short mapping) and never a ROLE line.
+//   KeyMatchTable         the term/storage metrics are matched by the role metric's key, never by typeId alone: a
+//                         file whose storage rows carry another node's key prints -1/UNKNOWN; with two role rows the
+//                         first live one wins and its own term is printed; a freed role row is skipped; a role key
+//                         shorter than 4 bytes prints nodeId=-1 but still matches its term by key.
+//
+// Mutations: valueOr() matching by typeId only (findFirst with an empty key / first slot of the type) -> KeyMatchTable
+// red; dropping the `roleSlot < 0` guard (last role wins) -> KeyMatchTable red; rune_role carrying on after a
+// BadLength open (instead of exit 1) -> InputBoundsTable red.
+// ---------------------------------------------------------------------------------------------------------------
+
+struct Alloc {
+    RuneMetric metric;
+    std::vector<std::uint8_t> key;
+    std::int64_t value;
+    bool freeAfter = false;
+};
+
+std::vector<std::uint8_t> nodeKey(std::int32_t nodeId) {
+    std::vector<std::uint8_t> k(kRoleKeyLength);
+    encodeRoleKey(k.data(), nodeId);
+    return k;
+}
+
+// Allocates `allocs` in order (D55 capacity), then frees the ones marked freeAfter.
+void writeCustomFile(const std::string& path, const std::vector<Alloc>& allocs) {
+    const std::int64_t required = metrics::requiredSlots({kNodeMetricCount, 0, 0, 0, 0, 16});
+    const auto maxSlots = static_cast<std::int32_t>(required);
+    metrics::MetricsFile file;
+    ASSERT_EQ(metrics::MetricsFile::create(metrics::CreateParams{path.c_str(), maxSlots, required,
+                                                                 static_cast<std::int64_t>(::getpid()), 1, {}},
+                                           file),
+              metrics::FileStatus::Ok);
+    std::vector<std::int32_t> freeStack(static_cast<std::size_t>(maxSlots), 0);
+    metrics::MetricsWriter writer;
+    ASSERT_EQ(metrics::MetricsWriter::create(file, freeStack, writer), metrics::WriterStatus::Ok);
+    std::vector<std::int32_t> toFree;
+    for (const Alloc& a : allocs) {
+        const std::span<const std::byte> key{reinterpret_cast<const std::byte*>(a.key.data()), a.key.size()};
+        const metrics::AllocResult r = writer.allocate(typeIdOf(a.metric), metrics::MetricKind::Gauge, -1, key, "adv");
+        ASSERT_EQ(r.status, metrics::AllocStatus::Ok);
+        r.writer.set(a.value);
+        if (a.freeAfter) toFree.push_back(r.writer.slot());
+    }
+    for (const std::int32_t s : toFree) ASSERT_EQ(writer.free(s), metrics::FreeStatus::Ok);
+}
+
+void truncateTo(const std::string& path, off_t length) { ASSERT_EQ(::truncate(path.c_str(), length), 0); }
+
+void pokeI32(const std::string& path, off_t offset, std::int32_t v) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::pwrite(fd, &v, sizeof v, offset), static_cast<ssize_t>(sizeof v));
+    ::close(fd);
+}
+
+TEST(RuneRoleRegression, AdversarialInputBoundsTableRegression) {
+    TempDir tmp;
+    const Row full{7, 2, 9, true, 1, 12, 1, 3, 2};
+    struct Case {
+        const char* name;
+        void (*mangle)(const std::string&);
+        const char* errHas;
+    };
+    static const Case cases[] = {
+        {"zero length", [](const std::string& p) { truncateTo(p, 0); }, "BadLength"},
+        {"header minus one byte", [](const std::string& p) { truncateTo(p, metrics::kHeaderLength - 1); }, "BadLength"},
+        {"header only", [](const std::string& p) { truncateTo(p, metrics::kHeaderLength); }, "BadLength"},
+        {"one byte short of the slot area",
+         [](const std::string& p) {
+             struct stat sb;
+             ASSERT_EQ(::stat(p.c_str(), &sb), 0);
+             truncateTo(p, sb.st_size - 1);
+         },
+         "BadLength"},
+        {"layout version + 1",
+         [](const std::string& p) { pokeI32(p, metrics::kHdrLayoutVersionOffset, metrics::kLayoutVersion + 1); },
+         "VersionMismatch"},
+        {"layout version -1", [](const std::string& p) { pokeI32(p, metrics::kHdrLayoutVersionOffset, -1); },
+         "VersionMismatch"},
+        {"value record length 0", [](const std::string& p) { pokeI32(p, metrics::kHdrValueRecordLengthOffset, 0); },
+         "VersionMismatch"},
+        {"maxSlots negative", [](const std::string& p) { pokeI32(p, metrics::kHdrMaxSlotsOffset, -1); }, "BadLength"},
+        {"maxSlots doubled",
+         [](const std::string& p) {
+             const std::int64_t req = metrics::requiredSlots({kNodeMetricCount, 0, 0, 0, 0, 16});
+             pokeI32(p, metrics::kHdrMaxSlotsOffset, static_cast<std::int32_t>(req * 2));
+         },
+         "BadLength"},
+    };
+    int i = 0;
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.name);
+        const std::string path = tmp.file("bounds" + std::to_string(i++) + ".dat");
+        writeMetricsFile(path, full);
+        c.mangle(path);
+        const RunResult r = runRole(tmp, {path}, {});
+        EXPECT_EQ(r.exitCode, 1) << r.err;
+        EXPECT_EQ(r.out, "");
+        EXPECT_NE(r.err.find(c.errHas), std::string::npos) << r.err;
+    }
+}
+
+TEST(RuneRoleRegression, AdversarialKeyMatchTableRegression) {
+    TempDir tmp;
+    const std::vector<std::uint8_t> shortKey{0x03, 0x00};
+    struct Case {
+        const char* name;
+        std::vector<Alloc> allocs;
+        std::string out;
+    };
+    const std::vector<Case> cases = {
+        {"storage rows under another node's key",
+         {{RuneMetric::Term, nodeKey(4), 44},
+          {RuneMetric::StorageGateState, nodeKey(4), 0},
+          {RuneMetric::LeaderRolesHeld, nodeKey(4), 5},
+          {RuneMetric::StoragePendingNodes, nodeKey(4), 5},
+          {RuneMetric::OutOfSyncPartitions, nodeKey(4), 5},
+          {RuneMetric::LostCommittedReports, nodeKey(4), 5},
+          {RuneMetric::Role, nodeKey(3), 2}},
+         "ROLE nodeId=3 role=LEADER term=-1\nSTORAGE nodeId=3 state=UNKNOWN heldLeaderRoles=-1 pendingNodes=-1 "
+         "outOfSync=-1 lostCommittedReports=-1\n"},
+        {"two role rows: the first wins, with its own term",
+         {{RuneMetric::Term, nodeKey(4), 44},
+          {RuneMetric::Role, nodeKey(3), 0},
+          {RuneMetric::Role, nodeKey(4), 2},
+          {RuneMetric::Term, nodeKey(3), 33},
+          {RuneMetric::StorageGateState, nodeKey(4), 0},
+          {RuneMetric::StorageGateState, nodeKey(3), 1}},
+         "ROLE nodeId=3 role=FOLLOWER term=33\nSTORAGE nodeId=3 state=UNCONFIRMED heldLeaderRoles=-1 pendingNodes=-1 "
+         "outOfSync=-1 lostCommittedReports=-1\n"},
+        {"a freed role row is skipped",
+         {{RuneMetric::Role, nodeKey(3), 2, /*freeAfter=*/true},
+          {RuneMetric::Term, nodeKey(3), 33},
+          {RuneMetric::Role, nodeKey(4), 1},
+          {RuneMetric::Term, nodeKey(4), 44}},
+         "ROLE nodeId=4 role=CANDIDATE term=44\nSTORAGE nodeId=4 state=UNKNOWN heldLeaderRoles=-1 pendingNodes=-1 "
+         "outOfSync=-1 lostCommittedReports=-1\n"},
+        {"role key shorter than 4 bytes",
+         {{RuneMetric::Term, nodeKey(3), 33},
+          {RuneMetric::Role, shortKey, 2},
+          {RuneMetric::Term, shortKey, 22}},
+         "ROLE nodeId=-1 role=LEADER term=22\nSTORAGE nodeId=-1 state=UNKNOWN heldLeaderRoles=-1 pendingNodes=-1 "
+         "outOfSync=-1 lostCommittedReports=-1\n"},
+        {"empty role key matches only empty-key rows",
+         {{RuneMetric::Term, nodeKey(0), 10},
+          {RuneMetric::Role, {}, 0},
+          {RuneMetric::Term, {}, 20}},
+         "ROLE nodeId=-1 role=FOLLOWER term=20\nSTORAGE nodeId=-1 state=UNKNOWN heldLeaderRoles=-1 pendingNodes=-1 "
+         "outOfSync=-1 lostCommittedReports=-1\n"},
+    };
+    int i = 0;
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.name);
+        const std::string path = tmp.file("key" + std::to_string(i++) + ".dat");
+        writeCustomFile(path, c.allocs);
+        const RunResult r = runRole(tmp, {path}, {});
+        EXPECT_EQ(r.exitCode, 0) << r.err;
+        EXPECT_EQ(r.out, c.out);
+        EXPECT_EQ(r.err, "");
+    }
+}
+
 }  // namespace
