@@ -315,3 +315,78 @@ TEST(GatewayCryptoRegression, AReceiverFrameTruncatedAtEveryOffsetNeverAppendsAd
     for (int i = 0; i < 8 && records(r) == before + 1; ++i) r.pass();
     EXPECT_EQ(records(r), before + 2);
 }
+
+// ── Shard-mode first produce racing the key (the gateway's second announce wave) ────────────────────────────────────
+
+namespace {
+/// The gateway's FIRST (parked) wave: the session is encrypted, its keys do not exist yet (pollPendingConnects).
+void announceFirstWave(rune::node::WorkerPool& pool, int64_t sid, int32_t clientVersion) {
+    rune::node::SessionAnnouncer ann(/*grantAll=*/true);
+    ASSERT_TRUE(ann.announce(pool, sid, "aeron:ipc", 7, clientVersion, /*sessionEncrypted=*/true, /*keyReady=*/false));
+}
+}  // namespace
+
+// A shard client holds its ConnectResponse after the first wave and may send its first sealed produce straight to a
+// worker before the second wave (the real keys) is applied there.  That frame is HELD (kIngressHeld: the controlled
+// poll ABORTs, the frame stays in its image), never dropped, and commits no seq; once the keys land the SAME bytes are
+// appended exactly once.  Covers the legacy (shared raw key) and the receiver-key client.
+// RED (mutation): remove the recvPending hold in Worker::handleWorkerIngressFrame_ - the frame is dropped as a decrypt
+// failure (returns 0) and never appended (the ShardClientWithRequireCryptoFailsOverToALiveBroker flake).
+TEST(GatewayCryptoRegression, AProduceBeforeTheKeyWaveIsHeldThenAppendedOnceRegression) {
+    for (const int32_t clientVersion : {pc::kClientVersion, pc::kClientVersionReceiverKeys - 1}) {
+        SCOPED_TRACE(clientVersion);
+        GatewayProduceRig r{ProduceTopicMode::StaticRouted};
+        SessionKeys k;
+        installGatewayCrypto(*r.gw.sessionCryptoForTest(r.sid), k, clientVersion);
+        announceFirstWave(r.pool, r.sid, clientVersion);
+        r.pass();   // worker 0 applies the parked first wave
+        auto& w = r.pool.worker(0);
+        const bool receiverKeys = pc::sessionUsesReceiverKeys(clientVersion, pc::kBrokerVersion);
+        const auto key = receiverKeys ? k.receiverKey(1) : k.c2b;
+        const auto frame = sealFor(key, k.c2bPrefix, receiverKeys ? 1 : 0, /*seq=*/1, r.produceFrame(400));
+        const int64_t before = records(r);
+
+        for (int i = 0; i < 3; ++i)   // redelivered while the key is still missing: held every time
+            EXPECT_EQ(w.handleIngressFrameForTest(frame.data(), frame.size(), r.now), -1) << "held, not dropped";
+        EXPECT_EQ(w.intakeKeyHoldsForTest(), 3u);
+        EXPECT_EQ(w.decryptFailuresForTest(), 0u) << "never reached the AEAD without a key";
+        r.pass();
+        EXPECT_EQ(records(r), before);
+
+        announceKeys(r.pool, r.sid, k, clientVersion);
+        r.pass();   // the second wave lands
+        EXPECT_EQ(w.handleIngressFrameForTest(frame.data(), frame.size(), r.now), 1) << "the held frame opens";
+        r.pass();
+        EXPECT_EQ(records(r), before + 1);
+        EXPECT_EQ(w.handleIngressFrameForTest(frame.data(), frame.size(), r.now), 0) << "a replay is still refused";
+        r.pass();
+        EXPECT_EQ(records(r), before + 1) << "appended exactly once";
+        EXPECT_EQ(w.decryptFailuresForTest(), 1u) << "only the replay failed";
+    }
+}
+
+// The hold is ONLY for the pending first wave: a keyed wave that shipped no c2b key (an upstream derivation failure)
+// still fails closed at once (dropped, counted) - a hold there would stall the client's image forever.
+// RED (mutation): hold on `!cr->recv` alone - this frame returns -1 instead of 0.
+TEST(GatewayCryptoRegression, AKeyedWaveWithoutAKeyStillDropsAtOnceRegression) {
+    GatewayProduceRig r{ProduceTopicMode::StaticRouted};
+    SessionKeys k;
+    installGatewayCrypto(*r.gw.sessionCryptoForTest(r.sid), k, pc::kClientVersion);
+    announceFirstWave(r.pool, r.sid, pc::kClientVersion);
+    r.pass();
+    rune::node::WorkerOp op;   // a keyed wave whose derivations both failed (SessionAnnouncer's fail-closed op)
+    op.type             = rune::node::WorkerOp::Type::SessionAnnounce;
+    op.sessionId        = r.sid;
+    op.egressStreamId   = 7;
+    op.egressChannel    = "aeron:ipc";
+    op.clientVersion    = pc::kClientVersion;
+    op.grantAll         = true;
+    op.sessionEncrypted = true;
+    ASSERT_TRUE(r.pool.worker(0).tryEnqueueOp(std::move(op)));
+    r.pass();
+    auto& w = r.pool.worker(0);
+    const auto frame = sealFor(k.receiverKey(1), k.c2bPrefix, 1, /*seq=*/1, r.produceFrame(401));
+    EXPECT_EQ(w.handleIngressFrameForTest(frame.data(), frame.size(), r.now), 0);
+    EXPECT_EQ(w.intakeKeyHoldsForTest(), 0u);
+    EXPECT_EQ(w.decryptFailuresForTest(), 1u);
+}
