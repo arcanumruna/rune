@@ -1112,3 +1112,95 @@ TEST(ClientAuthErrorsRegression, AForgedConnectLegErrorNeverFailsWorkInFlightAdv
         EXPECT_EQ(s->outcome().c.status, rc::OpStatus::Ok) << "code " << int(code) << " " << s->describe();
     }
 }
+
+// ---- #515: a subscription is ended with a node session's reject code only while that session is STILL its route --
+namespace {
+/// TwoNodeRig plus a third node (broker node 2) that can take p0 over.
+struct ThreeNodeRig : TwoNodeRig {
+    int n2 = 0;
+    explicit ThreeNodeRig(int32_t in) : TwoNodeRig(in) {
+        const int p2 = freePort();
+        n2 = gw.addEndpoint(udp(p2), in);
+        gw.nodeOfEndpoint[n2] = n2;
+        gw.moreBrokers.push_back({2, "127.0.0.1", p2});
+    }
+    /// Node 1's session is revoked (its per-subscription answers lost) in the SAME client pass in which the
+    /// metadata answer moves p0 to node 2: both frames are queued before the client polls again.
+    [[nodiscard]] bool revokeNode1AndMoveP0ToNode2(int64_t node1Sid) {
+        gw.holdMetadata = true;
+        const std::size_t before = gw.metadataCorrIds.size();
+        client.testRequestMetadataNow();
+        if (!drive([&] { return gw.metadataCorrIds.size() > before; })) return false;   // no metadata request
+        gw.subscribeLeader[0] = n2;
+        gw.partitions = {{1, 0, 2, 2, c.gatewayStreamId, ""}, {1, 1, 0, 1, c.gatewayStreamId, ""}};
+        gw.subscribed.clear();                          // node 1's per-subscription answers are lost
+        gw.revokeSession(node1Sid, n1);                 // node 1's session -> Rejected(46)
+        gw.sendMetadata(gw.metadataSessionIds.back(), gw.metadataCorrIds.back(), gw.metadataEndpoints.back());   // p0 is node 2's now
+        gw.holdMetadata = false;
+        return true;
+    }
+};
+} // namespace
+
+// Bound on node 1; node 1's session is Rejected in the very pass fresh metadata moves p0 to node 2.  RED (before):
+// driveHomed checked the reject code before the route and ended the subscription with 46 though a healthy node
+// leads p0 — the group path refuses only when the CURRENT leader is Rejected.
+TEST(ClientAuthErrorsRegression, ASubscriptionWhoseRejectedHomeMovedFollowsTheRouteRegression) {
+    ThreeNodeRig r(3870);
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    r.gw.subscribeLeader[0] = r.n1;
+    rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return subscribedAt(r.gw, r.n1) != nullptr && sub.active(); }));
+    const int64_t node1Sid = subscribedAt(r.gw, r.n1)->sessionId;
+    ASSERT_TRUE(r.revokeNode1AndMoveP0ToNode2(node1Sid)) << "no metadata request";
+    ASSERT_TRUE(r.drive([&] { return sub.finished() || subscribedAt(r.gw, r.n2) != nullptr; }));
+    EXPECT_FALSE(sub.finished()) << "ended with node 1's code " << sub.brokerErrorCode()
+                                 << " though p0 moved to a healthy node";
+    ASSERT_NE(subscribedAt(r.gw, r.n2), nullptr) << "no Subscribe for p0 reached node 2";
+    ASSERT_TRUE(r.drive([&] { return sub.finished() || sub.active(); }));
+    EXPECT_TRUE(sub.active());
+    EXPECT_FALSE(sub.finished());
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+// The new home is Rejected too: the NEXT driveHomed pass ends the subscription, with node 2's code (44 = a refused
+// login), not node 1's (46).
+TEST(ClientAuthErrorsRegression, ASubscriptionWhoseRejectedHomeMovedToAnotherRejectedNodeEndsWithItsCodeRegression) {
+    ThreeNodeRig r(3872);
+    r.gw.rejectLoginsAt.insert(r.n2);
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    r.gw.subscribeLeader[0] = r.n1;
+    rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return subscribedAt(r.gw, r.n1) != nullptr && sub.active(); }));
+    const int64_t node1Sid = subscribedAt(r.gw, r.n1)->sessionId;
+    ASSERT_TRUE(r.revokeNode1AndMoveP0ToNode2(node1Sid)) << "no metadata request";
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); })) << "the subscription waited on a Rejected session";
+    EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::RejectedByBroker);
+    EXPECT_EQ(sub.brokerErrorCode(), 44) << "node 2's code, not the old home's 46";
+    EXPECT_EQ(subscribedAt(r.gw, r.n2), nullptr) << "nothing was ever sent to the refused node";
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+// The pending (not yet answered) twin of the first: the Subscribe reached node 1 but its answer is lost, then node
+// 1's session is Rejected in the pass the metadata moves p0 to node 2.
+TEST(ClientAuthErrorsRegression, APendingSubscribeWhoseRejectedHomeMovedFollowsTheRouteRegression) {
+    ThreeNodeRig r(3874);
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    r.gw.subscribeLeader[0] = r.n1;
+    r.gw.dropSubscribeResponsesNext = 1;             // the Subscribe is registered at node 1, its answer is lost
+    rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return subscribedAt(r.gw, r.n1) != nullptr; }));
+    ASSERT_EQ(sub.subscriptionId(), 0) << "the answer was meant to be lost";
+    const int64_t node1Sid = subscribedAt(r.gw, r.n1)->sessionId;
+    ASSERT_TRUE(r.revokeNode1AndMoveP0ToNode2(node1Sid)) << "no metadata request";
+    ASSERT_TRUE(r.drive([&] { return sub.finished() || subscribedAt(r.gw, r.n2) != nullptr; }));
+    EXPECT_FALSE(sub.finished()) << "ended with node 1's code " << sub.brokerErrorCode()
+                                 << " though p0 moved to a healthy node";
+    ASSERT_NE(subscribedAt(r.gw, r.n2), nullptr) << "no Subscribe for p0 reached node 2";
+    ASSERT_TRUE(r.drive([&] { return sub.finished() || sub.active(); }));
+    EXPECT_TRUE(sub.active());
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}

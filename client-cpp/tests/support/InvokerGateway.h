@@ -123,6 +123,7 @@ struct InvokerGateway {
     int connects = 0;
     int metadataRequests = 0;
     std::vector<int> metadataEndpoints;   // the endpoint each MetadataRequest arrived on
+    std::vector<int64_t> metadataSessionIds;   // the session each MetadataRequest came on
     // DR fix round 1: per-endpoint routing image (I4: a lagging node keeps naming the
     // dead leader) and per-endpoint Connect refusal (I2: ConnectResponse{code}).
     std::map<int, std::vector<PartitionAd>> partitionsAt;
@@ -1664,6 +1665,7 @@ private:
             if (!m) return;
             ++metadataRequests;
             metadataCorrIds.push_back(m->correlationId);
+            metadataSessionIds.push_back(m->sessionId);   // #515: the session that asked (to answer it by hand)
             metadataEndpoints.push_back(endpoint);   // DR client bug 1: which node was asked
             if (holdMetadata) return;
             sendMetadata(m->sessionId, m->correlationId, endpoint);

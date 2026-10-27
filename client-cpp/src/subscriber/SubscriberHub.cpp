@@ -1050,7 +1050,15 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
         SubscribeRequest* req = it->second.get();
         if (req != nullptr && req->impl != nullptr && req->impl->active && req->impl->homeSession != 0) {
             SubscriptionImpl& impl = *req->impl;
-            if (const int16_t code = homeRejectCode_(impl); code != 0) {   // #290: never sendable there
+            const int16_t code = homeRejectCode_(impl);
+            const bool held    = impl.homeSid == 0;
+            // #515: a node session's reject code ends the subscription only while that session is STILL the
+            // partition's route; if fresh metadata already moved the route it follows it (the group path
+            // refuses only when the CURRENT leader is Rejected).  A held, healthy one needs no route here.
+            const int32_t part = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
+            const uint32_t routeNow = (code != 0 || !held) ? router_.leaderSession(router_.ctx, impl.topicId, part)
+                                                           : impl.homeSession;
+            if (code != 0 && routeNow == impl.homeSession) {   // #290: never sendable there
                 endRejected_(impl, code);
                 clearUnsent_(*req);
                 pendingByCorrelation_.erase(it);
@@ -1058,13 +1066,11 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
                 it = next;
                 continue;
             }
-            const bool held = impl.homeSid == 0;
             const bool lost = !held && router_.epoch(router_.ctx, impl.homeSession) != impl.homeEpoch;
             const bool due  = !held || now >= req->notBefore;   // a NotLeader backoff (holdMovedForRetry)
             // #365: fresh metadata moved the partition off its home session (a
             // crashed leader's session is not yet seen lost): follow the route.
-            const int32_t part = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
-            const bool moved = !held && router_.leaderSession(router_.ctx, impl.topicId, part) != impl.homeSession;
+            const bool moved = (!held || code != 0) && routeNow != impl.homeSession;
             if ((held && due) || lost || moved) {
                 if (lost) ++homedSessionsLost_;
                 routeMovedPending_(it, seedSid);   // homedCount_ is recounted below
@@ -1100,14 +1106,18 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
         const auto ait = activeById_.find(id);
         if (ait == activeById_.end()) continue;
         SubscriptionImpl& impl = *ait->second;
-        if (const int16_t code = homeRejectCode_(impl); code != 0) {   // #290: its node session was Rejected
+        const int32_t part = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
+        // #290 / #515: its node session was Rejected - it ends with that code only while that session is still
+        // the partition's route; a moved route falls through to the re-arm below (the best-effort release there
+        // is skipped for a Rejected session: connectedEpoch() is 0 off Connected, never the stored epoch).
+        if (const int16_t code = homeRejectCode_(impl);
+            code != 0 && router_.leaderSession(router_.ctx, impl.topicId, part) == impl.homeSession) {
             endRejected_(impl, code);
             activeById_.erase(ait);
             ++work;
             continue;
         }
         const int64_t newCorr = router_.nextCorrId(router_.ctx);
-        const int32_t part    = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
         const int64_t from    = impl.nextOffset > 0  ? impl.nextOffset
                               : impl.resumeHint >= 0 ? impl.resumeHint
                                                      : impl.fromWire;
