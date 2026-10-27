@@ -80,8 +80,8 @@ exits non-zero when any stage fails, and lists non-injected "perturbed cells" (c
 preceded them) from `<build>/perturbed-cells.log`. A latency stage over 60 s is reported.
 
 When to run what: after a fix, build and run the test executables covering the code it touches plus every new or changed
-test. The **full** `*Regression*` suite runs at checkpoints: after a batch of related tasks, before a whole-branch review
-and after every merge. A checkpoint failure is bisected over the commits since the last green checkpoint.
+test. A batch runs only these focused tests for the area and workflow it changes. The **full** `*Regression*` suite runs
+only at big checkpoints: every 3–4 batches and before a final whole-branch review. A checkpoint failure is bisected over the commits since the last green checkpoint.
 
 ## Latency gates
 

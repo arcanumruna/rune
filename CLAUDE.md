@@ -82,7 +82,9 @@ goes off the hot path onto its own worker.
   state is shared. Every plan has an "Interaction matrix" section; reviewers check the matrix, not only the diff.
 - **Per task / fix round:** build, then run the test executables covering the touched code plus every new or changed
   test.
-- **Checkpoints** (after a batch of related tasks, before a final whole-branch review, after every merge): the full
+- **Per batch:** only the affected-area tests (the executables covering the touched code plus every new or changed
+  test). No full suite per batch.
+- **Big checkpoints only** (every 3–4 batches, and before a final whole-branch review): the full
   `*Regression*` suite (`-R Regression -LE latency`), plus the same suite under ASan+UBSan and under TSan (broker and
   client; a client TSan build needs `-DBUILD_TESTING=ON`). A checkpoint failure is bisected over the commits since
   the last green checkpoint. After fixing checkpoint failures, re-run only the failed and affected tests.
