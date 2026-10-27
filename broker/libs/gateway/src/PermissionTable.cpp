@@ -5,15 +5,17 @@ namespace rune::gateway {
 
 namespace rsec = rune::security;
 
-PermissionTable PermissionTable::compile(std::span<const rsec::GrantSpec> effective, const ObjectIndex& index) {
+PermissionTable PermissionTable::compile(std::span<const rsec::GrantSpec> effective, uint32_t nsId, const ObjectIndex& index) {
     PermissionTable t;
+    t.nsId_ = nsId;
     t.grants_.assign(effective.begin(), effective.end());
     t.clusterOps_ = rsec::clusterOps(t.grants_);
     for (const rsec::GrantSpec& g : t.grants_) {   // #211: hasAnyGrant
         const auto type = static_cast<std::size_t>(g.resource.type);
         if (type < t.anyOps_.size()) t.anyOps_[type] = static_cast<uint8_t>(t.anyOps_[type] | rsec::opBit(g.op));
     }
-    if ((t.clusterOps_ & rsec::opBit(rsec::Operation::Admin)) != 0) {   // root (spec §2): every op on every type
+    t.root_ = (t.clusterOps_ & rsec::opBit(rsec::Operation::Admin)) != 0;
+    if (t.root_) {   // root (spec §2): every op on every type
         const auto ns = static_cast<std::size_t>(rsec::ResourceType::Namespace);   // ... but NAMESPACE stays explicit
         for (std::size_t i = 0; i < t.anyOps_.size(); ++i)
             if (i != ns) t.anyOps_[i] = 0xFF;
@@ -21,8 +23,13 @@ PermissionTable PermissionTable::compile(std::span<const rsec::GrantSpec> effect
     const auto limit = static_cast<std::size_t>(index.idLimit());
     t.ops_.assign(limit, 0);
     t.writeBits_.assign((limit + 63) / 64, 0);
-    index.forEach([&](int32_t id, const ObjectEntry& e) { t.setOps_(id, rsec::opsOn(t.grants_, e.type, e.name)); });
+    index.forEach([&](int32_t id, const ObjectEntry& e) { t.setOps_(id, t.opsOf_(e)); });
     return t;
+}
+
+uint8_t PermissionTable::opsOf_(const ObjectEntry& e) const noexcept {
+    if (e.nsId != nsId_ && !root_) return 0;   // plan D9: a foreign object has no bits; root reaches every ns (#626)
+    return rsec::opsOn(grants_, e.type, e.name);
 }
 
 bool PermissionTable::allowsName(rsec::ResourceType type, std::string_view name, uint8_t opBits) const noexcept {
@@ -42,7 +49,7 @@ void PermissionTable::setOps_(int32_t id, uint8_t ops) {
 
 void PermissionTable::onObjectCreated(int32_t id, const ObjectEntry& entry) {
     if (allowAll_ || id < 0) return;
-    setOps_(id, rsec::opsOn(grants_, entry.type, entry.name));
+    setOps_(id, opsOf_(entry));
 }
 
 void PermissionTable::onObjectDropped(int32_t id) noexcept {

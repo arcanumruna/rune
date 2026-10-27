@@ -35,9 +35,11 @@ struct Denial {
                                                   rune::security::Operation);
 /// GetTopicSchema: a name may be a topic or a view.  Issue #128: a live name is checked against its own kind's grants
 /// only (the ObjectIndex knows which); a name not live here is allowed when either type allows it (D22 parity: the
-/// request's own "unknown" answer follows).  The text always says TOPIC.
+/// request's own "unknown" answer follows).  The text always says TOPIC.  `nsId` (namespaces Task 10): the name's
+/// resolved namespace (NsResolve.h; kHiddenNsId never holds an object, so a hidden name is judged as a missing one).
 [[nodiscard]] std::optional<Denial> authorizeTopicOrViewName(const PermissionTable&, std::string_view,
-                                                             rune::security::Operation, const ObjectIndex&);
+                                                             rune::security::Operation, const ObjectIndex&,
+                                                             uint32_t nsId = 0);
 [[nodiscard]] std::optional<Denial> authorizeCluster(const PermissionTable&, rune::security::Operation);
 /// #211: `op` on at least one resource of `type` (no resource is named: a non-transactional InitProducerId needs
 /// WRITE on some topic, Kafka's rule).  Detail: `not authorized: <OP> on any <TYPE>`.

@@ -273,16 +273,18 @@ public:
         m.replicationFactor = replicationFactor;
         m.config = rune::protocol::convertTopicConfig<rune::protocol::TopicConfig>(config);
         m.meta   = ownMeta_(meta);
+        m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         m.adoptDenial.assign(adoptDenial);
         return submitDdl_(m);
     }
 
     bool submitGetSchema(int64_t sessionId, int64_t correlationId,
                          std::string_view name,
-                         uint64_t requestedFingerprint) override {
+                         uint64_t requestedFingerprint, uint32_t nsId) override {
         GetSchemaMsg m;
         m.session = sessionId;
         m.corr    = correlationId;
+        m.nsId    = nsId;   // namespaces Task 10: the gateway-resolved namespace
         m.name.assign(name);
         m.requestedFingerprint = requestedFingerprint;
         return encodeGetSchema(requestRing_, m);
@@ -299,6 +301,7 @@ public:
         m.topicName.assign(topicName);
         if (opsBlob && opsLen) m.opsBlob.assign(opsBlob, opsBlob + opsLen);
         m.meta = ownMeta_(meta);
+        m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         return submitDdl_(m);
     }
 
@@ -314,6 +317,7 @@ public:
         m.keyField.assign(keyField);
         if (planBlob && planLen) m.planBlob.assign(planBlob, planBlob + planLen);
         m.meta = ownMeta_(meta);
+        m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         return submitDdl_(m);
     }
 
@@ -324,6 +328,7 @@ public:
         m.corr    = correlationId;
         m.name.assign(name);
         m.meta = ownMeta_(meta);
+        m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         return submitDdl_(m);
     }
 
@@ -344,6 +349,7 @@ public:
             m.changes.push_back(rune::catalog::ConfigChange{static_cast<rune::catalog::ConfigKey>(c.key), c.value});
         }
         m.meta = ownMeta_(meta);
+        m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         return submitDdl_(m);
     }
 
@@ -354,6 +360,7 @@ public:
         m.corr    = correlationId;
         m.name.assign(name);
         m.meta = ownMeta_(meta);
+        m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         return submitDdl_(m);
     }
 
@@ -370,6 +377,7 @@ public:
         m.keyField.assign(keyField);
         if (planBlob && planLen) m.planBlob.assign(planBlob, planBlob + planLen);
         m.meta = ownMeta_(meta);
+        m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         return submitDdl_(m);
     }
 

@@ -15,6 +15,7 @@
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
+#include <rune/protocol/client/NamespaceMessages.h>
 #include <rune/view/ViewPlan.h>
 
 #include <gtest/gtest.h>
@@ -101,6 +102,7 @@ public:
     /// obtained before (newUser) are dead: log the users in again with login(name).
     void restart() {
         b_.restart();
+        nsWire_ = nullptr;   // the restart closed every client (a fresh v14 admin session on the next createNamespace)
         w_ = &b_.wire();
         c().captureRawAnswers(true);
         builder = login("builder");
@@ -151,8 +153,35 @@ public:
         return r && r->errorCode == 0 ? r->topicId : -1;
     }
     int32_t createView(int64_t sid, const std::string& name, int32_t source) {
-        const auto r = c().awaitCreateView(c().sendCreateView(ch(), stream(), sid, name, "id", 0, authRigViewPlan(name, {source})), dl(20));
+        const auto r = c().awaitCreateView(c().sendCreateView(ch(), stream(), sid, name, "id", 0, authRigViewPlan(localOf(name), {source})), dl(20));
         return r && r->errorCode == 0 ? r->viewTopicId : -1;
+    }
+    /// CREATE NAMESPACE `name` as the bootstrap admin on its own client-version-14 session (namespace DDL needs it);
+    /// returns the new nsId.  Throws when the broker refuses (a test precondition).
+    uint32_t createNamespace(const std::string& name) {
+        if (nsWire_ == nullptr) {
+            nsWire_ = &b_.wire();
+            const auto l = nsWire_->connectAndLogin(ch(), "admin", AuthBroker::kAdminPassword,
+                                                    rune::protocol::client::kClientVersionNamespaces);
+            if (!l.ok()) throw std::runtime_error("AuthRig: the v14 admin login failed");
+            b_.noteLoginOk();
+            nsAdminSid_ = l.sessionId;
+        }
+        namespace pc = rune::protocol::client;
+        pc::NamespaceDdlRequest m;
+        m.sessionId = nsAdminSid_;
+        m.correlationId = nsWire_->raw().nextCorrelationId();
+        m.ext.clientName = "auth-rig";
+        m.ext.requestId = rune::protocol::RequestId{0xA11CE, ++nsRid_};
+        m.kind = pc::NamespaceDdlKind::Create;
+        m.name = name;
+        std::vector<uint8_t> buf(m.encodedSize());
+        buf.resize(m.encode(buf.data()));
+        if (!nsWire_->raw().send(ch(), stream(), buf.data(), buf.size())) throw std::runtime_error("AuthRig: send CREATE NAMESPACE");
+        nsWire_->raw().awaitAnyDdlAnswer(m.correlationId, dl(20));
+        const auto a = nsWire_->raw().awaitDdl(m.correlationId, dl(1));
+        if (!a || a->errorCode != 0) throw std::runtime_error("AuthRig: CREATE NAMESPACE " + name + " failed");
+        return static_cast<uint32_t>(a->objectId);
     }
 
     // ── one function per request type: the answer code ──────────────────────────────────────────────────────
@@ -207,11 +236,13 @@ public:
     }
     /// subscribe() expected refused: when it answers 45, also no subscription was registered (on an existing user topic:
     /// expectSubscribeRegisteredNothing; otherwise nothing delivered).  Returns the answer code (the caller asserts it).
-    int subscribeDenied(int64_t sid, int32_t topicId) {
+    /// `reader` / `writer` (0 = the rig's default-namespace builder / rigwriter) are sessions allowed on the topic -
+    /// a topic in another namespace needs ones from that namespace (or root).
+    int subscribeDenied(int64_t sid, int32_t topicId, int64_t reader = 0, int64_t writer = 0) {
         const int code = subscribe(sid, topicId);
         if (code == kNotAuthorized) {
             const int64_t corr = lastCorr_;
-            if (topicId >= 0 && logEnd(topicId) >= 0) expectSubscribeRegisteredNothing(sid, corr, topicId);
+            if (topicId >= 0 && logEnd(topicId) >= 0) expectSubscribeRegisteredNothing(sid, corr, topicId, reader, writer);
             else expectNothingDelivered(sid, corr);
         }
         return code;
@@ -219,15 +250,17 @@ public:
     /// A refused Subscribe (`corr` on `sid`) registered nothing: nothing delivered; then an allowed writer appends one
     /// record that an allowed reader (a fresh builder session bound at the log end) is pushed - so the fan-out ran -
     /// and still nothing reached the refused session.
-    void expectSubscribeRegisteredNothing(int64_t sid, int64_t corr, int32_t topicId) {
+    void expectSubscribeRegisteredNothing(int64_t sid, int64_t corr, int32_t topicId, int64_t reader = 0,
+                                          int64_t writer = 0) {
         expectNothingDelivered(sid, corr);
         if (::testing::Test::HasFatalFailure()) return;
-        if (writer_ == 0) {
+        if (writer == 0 && writer_ == 0) {
             b_.createUser("rigwriter", kPw, {grants::prefix(rune::protocol::SecurityOperation::Write,
                                                             rune::protocol::SecurityResourceType::Topic, "")});
             writer_ = login("rigwriter");
         }
-        const int64_t watcher = login("builder");
+        if (writer == 0) writer = writer_;
+        const int64_t watcher = reader != 0 ? reader : login("builder");
         int64_t watchCorr = 0;
         for (int i = 0; i < 200; ++i) {   // NotLeader while the partition settles: re-sent (bounded)
             watchCorr = c().subscribeIsolated(ch(), stream(), watcher, topicId, 0, /*fromOffset=Latest*/ -1, 0);
@@ -239,7 +272,7 @@ public:
         }
         const auto watchId = c().subscriptionIdOf(watchCorr);
         ASSERT_TRUE(watchId.has_value());
-        ASSERT_EQ(produce(writer_, topicId, /*untilOk=*/true), 0) << "the allowed writer's produce";
+        ASSERT_EQ(produce(writer, topicId, /*untilOk=*/true), 0) << "the allowed writer's produce";
         ASSERT_TRUE(c().pollUntil([&] {
             for (const auto& r : c().records()) if (r.subscriptionId == *watchId) return true;
             return false;
@@ -338,10 +371,10 @@ public:
                                               authRigTopicConfig()));
     }
     int createViewCode(int64_t sid, const std::string& name, int32_t source) {
-        return ddlCode(c().sendCreateView(ch(), stream(), sid, name, "id", 0, authRigViewPlan(name, {source})));
+        return ddlCode(c().sendCreateView(ch(), stream(), sid, name, "id", 0, authRigViewPlan(localOf(name), {source})));
     }
     int alterViewCode(int64_t sid, const std::string& name, int32_t source) {
-        return ddlCode(c().sendAlterView(ch(), stream(), sid, name, "id", 0, 0, authRigViewPlan(name, {source})));
+        return ddlCode(c().sendAlterView(ch(), stream(), sid, name, "id", 0, 0, authRigViewPlan(localOf(name), {source})));
     }
     int alterTopicCode(int64_t sid, const std::string& name) {
         rune::codec::AlterOp o{};
@@ -483,6 +516,11 @@ public:
     }
 
 private:
+    /// A qualified `ns/view` carries its LOCAL name in the plan (the plan names the view inside its namespace).
+    static std::string localOf(const std::string& name) {
+        const auto slash = name.rfind('/');
+        return slash == std::string::npos ? name : name.substr(slash + 1);
+    }
     static std::span<const uint8_t> bytes(const std::string& s) {
         return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
     }
@@ -515,6 +553,9 @@ private:
     }
 
     AuthBroker b_;
+    AuthWireClient* nsWire_ = nullptr;   // the v14 admin session createNamespace() uses
+    int64_t nsAdminSid_ = 0;
+    uint64_t nsRid_ = 0;
     AuthWireClient* w_ = nullptr;
     int seq_ = 0;
     int64_t lastCorr_ = 0;

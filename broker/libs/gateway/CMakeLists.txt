@@ -14,6 +14,7 @@ add_library(rune_gateway
     src/SessionAuth.cpp
     src/PermissionTable.cpp
     src/PermissionPool.cpp
+    src/NsResolve.cpp
     src/Authorizer.cpp
     src/LiveSecurityChanges.cpp
     src/ScramServer.cpp

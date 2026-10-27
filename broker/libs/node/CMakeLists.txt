@@ -1940,6 +1940,13 @@ if(BUILD_TESTING)
         target_link_libraries(rune_namespace_login_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_login_tests PROPERTIES TIMEOUT 360)
 
+        # Namespaces Task 10: the gateway resolves every name against the session's namespace (D7, D9), a foreign
+        # namespace answers like a missing one, listings are filtered, groups / transactions exist only in default (D8).
+        add_executable(rune_namespace_gateway_tests tests/node/NamespaceGatewayTest.cpp tests/support/AllocWindow.cpp)
+        target_include_directories(rune_namespace_gateway_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_gateway_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_gateway_tests PROPERTIES TIMEOUT 360)
+
         # Catalog history Task 17: TestCluster::defineTopic — the in-process way to create a
         # topic now that the static topic list / NodeConfig::topics are gone (DDL over the wire on real
         # single-node and 3-node brokers), and the FD budget counted from the catalog's topics.

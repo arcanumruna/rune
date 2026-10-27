@@ -589,6 +589,32 @@ TEST(AuthEnforcementRegression, AdminClusterIsRootRegression) {
         EXPECT_EQ(r.joinGroup(admin, cg, {r.orders}), kOk) << "groups";
         EXPECT_EQ(r.initProducerId(admin, tx), kOk) << "transactional ids";
     }
+    // Issue #626: root is root in EVERY namespace - a foreign (non-default) namespace's objects, by id and by
+    // qualified name, data and DDL alike, with no grant naming that namespace.
+    r.createNamespace("rootns");
+    const int32_t foreign = r.defineTopic(bootstrap, "rootns/owned");
+    ASSERT_GE(foreign, 0) << "root defines a topic in a foreign namespace";
+    const int32_t foreignView = r.createView(bootstrap, "rootns/ownedv", foreign);
+    ASSERT_GE(foreignView, 0) << "root creates a view in a foreign namespace";
+    n = 0;
+    for (const int64_t admin : {granted, bootstrap}) {
+        SCOPED_TRACE(admin == bootstrap ? "bootstrap admin, foreign ns" : "ADMIN ON CLUSTER, foreign ns");
+        const std::string t = "rootns/root_t" + std::to_string(n), v = "rootns/root_v" + std::to_string(n);
+        ++n;
+        EXPECT_EQ(r.produce(admin, foreign, /*untilOk=*/true), kOk);
+        EXPECT_EQ(r.subscribe(admin, foreign), kOk);
+        EXPECT_EQ(r.getTopicSchema(admin, "rootns/owned"), kOk);
+        EXPECT_EQ(r.getTopicSchema(admin, "rootns/ownedv"), kOk);
+        EXPECT_NE(r.getViewRow(admin, foreignView), kNotAuthorized);
+        const auto topics = r.metadataTopics(admin);
+        EXPECT_NE(std::find(topics.begin(), topics.end(), foreign), topics.end()) << "metadata lists the foreign topic";
+        EXPECT_EQ(r.defineTopicCode(admin, t), kOk) << "CREATE TOPIC ns/x";
+        EXPECT_EQ(r.alterTopicCode(admin, t), kOk) << "ALTER TOPIC ns/x";
+        EXPECT_EQ(r.alterConfigCode(admin, t), kOk) << "ALTER TOPIC ns/x CONFIG";
+        EXPECT_EQ(r.createViewCode(admin, v, foreign), kOk) << "CREATE VIEW ns/v";
+        EXPECT_EQ(r.dropViewCode(admin, v), kOk) << "DROP VIEW ns/v";
+        EXPECT_EQ(r.dropTopicCode(admin, t), kOk) << "DROP TOPIC ns/x";
+    }
 }
 
 TEST(AuthEnforcementRegression, DescribeOnClusterTurnsAMissingIdIntoUnknownTopicRegression) {   // D22

@@ -64,6 +64,7 @@
 #include <rune/gateway/SecurityView.h>
 #include <rune/gateway/SessionAuth.h>
 #include <rune/gateway/Authorizer.h>
+#include <rune/gateway/NsResolve.h>
 #include <rune/gateway/LiveSecurityChanges.h>
 #include <rune/gateway/ObjectIndex.h>
 #include <rune/gateway/LoginThrottle.h>
@@ -514,11 +515,12 @@ public:
     }
     /// Issue #259 test seam: authenticate `sid` as `userId` holding exactly `grants` (sorted, unique) - through the pool
     /// and the shipper, as a login does.
-    void authenticateWithGrantsForTest(int64_t sid, uint64_t userId, std::vector<rune::security::GrantSpec> grants) {
+    void authenticateWithGrantsForTest(int64_t sid, uint64_t userId, std::vector<rune::security::GrantSpec> grants,
+                                       uint32_t nsId = 0) {
         Session* s = sessions_.find(sid);
         if (s == nullptr) return;
         s->auth = rune::gateway::AuthAuthenticated{userId, "u" + std::to_string(userId),
-                                                    permPool_.acquire(std::move(grants), objectIndex_), {}};
+                                                    permPool_.acquire(std::move(grants), nsId, objectIndex_), {}, nsId};
         (void)shipPermissions_(*s);
     }
     int servicePermissionShippingForTest() { return servicePermissionShipping_(); }
@@ -1953,7 +1955,8 @@ private:
     template <class Msg, class Submit>
     void handleCatalogDdl_(const uint8_t* buf, std::size_t len, const char* what, Submit&& submit);
     [[nodiscard]] static rune::gateway::DdlMetaView
-        ddlMetaOf_(const rune::protocol::client::DdlExtension* ext, int64_t sessionId, const Session& session) noexcept;
+        ddlMetaOf_(const rune::protocol::client::DdlExtension* ext, int64_t sessionId, const Session& session,
+                   uint32_t targetNsId) noexcept;
     void answerAdminSubmit_(const uint8_t* buf, std::size_t len, rune::gateway::AdminSubmit r,
                             const char* ringFull, const char* tooLarge);
     /// Task 11: the DDL route gate — true = answered here (never submitted):
@@ -2466,6 +2469,10 @@ private:
     /// Namespaces Task 9: the session's namespace (AuthAuthenticated / AuthPasswordChangeRequired; 0 otherwise -
     /// anonymous and not-yet-logged-in sessions are `default`'s, D12).
     [[nodiscard]] static uint32_t sessionNsId_(const Session& s) noexcept;
+    /// Namespaces Task 10 (D7, D9): a request's object name in the session's view (NsResolve.h).  Zero allocation.
+    [[nodiscard]] rune::gateway::Resolution resolve_(const Session& s, std::string_view qualified) const noexcept {
+        return rune::gateway::resolveName(sessionNsId_(s), permsOf_(s).isRoot(), namespaces_.registry(), qualified);
+    }
     /// Namespaces Task 9: the anonymous-read table (Describe on every topic / view of `default`), pooled.
     [[nodiscard]] rune::gateway::PermissionRef anonPerms_();
     /// Namespaces Task 9: with RUNE_ANONYMOUS_READ on, an AwaitingFirst session that sends a request other than a login
@@ -2542,7 +2549,7 @@ private:
     /// The permission table the session's auth state grants: its compiled one, allow-all (anonymous), else deny-all.
     [[nodiscard]] const rune::gateway::PermissionTable& permsOf_(const Session& s) const noexcept;
     /// Compile the table of `userId` against the live ObjectIndex (login and SET PASSWORD; Task 14 refreshes with it).
-    [[nodiscard]] rune::gateway::PermissionRef compilePerms_(uint64_t userId);
+    [[nodiscard]] rune::gateway::PermissionRef compilePerms_(uint64_t userId, uint32_t nsId);
     /// Issue #259: the pool's table births / deaths to the shard workers (FIFO, before any bind or patch).
     void syncPermissionTables_();
     /// true = DENIED here: answered NotAuthorized (45) in the request's own response type (D23 text where the type
@@ -2575,7 +2582,8 @@ private:
                                                     std::size_t encoded);
     [[nodiscard]] bool denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
     [[nodiscard]] bool denyTxnRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
-    template <class Msg> [[nodiscard]] std::optional<rune::gateway::Denial> authorizeCatalogDdl_(const Session& session, const Msg& m) const;
+    template <class Msg> [[nodiscard]] std::optional<rune::gateway::Denial> authorizeCatalogDdl_(const Session& session, const Msg& m,
+                                                                                               std::string_view local) const;
     /// D19: READ on every source topic of a CreateView / AlterView plan (an undecodable blob is left to the admin thread).
     [[nodiscard]] std::optional<rune::gateway::Denial> authorizeViewSources_(const Session& session, const uint8_t* blob,
                                                                               std::size_t len) const;

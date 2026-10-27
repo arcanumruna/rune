@@ -77,6 +77,10 @@ namespace rune::gateway {
 
 namespace pc = rune::protocol::client;
 
+// Namespaces Task 10: the fixed refusal texts (D7: they never echo a name, so they reveal no foreign object).
+constexpr const char* kMalformedNameDetail = "malformed qualified name";
+const Denial kGroupTxnOutsideDefault{45, "not authorized: groups and transactions exist only in the default namespace"};
+
 // ---------------------------------------------------------------------------
 // Startup-only synchronous resolve budget: the ingress subscription in the
 // constructor.  Every duty-cycle resolve (Connect / redirect egress) is async
@@ -7785,6 +7789,9 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
         noteUnanswerable_(buf, len, "group message for unknown session");
         return;
     }
+    // Namespaces Task 10 (D8): phase 1 keys groups and transactional ids by id alone, so a session outside
+    // `default` (root included) is refused before the coordinator redirect or any coordinator state.
+    if (sessionNsId_(*session) != 0 && deny_(*session, kGroupTxnOutsideDefault, buf, len)) return;
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
     if (denyGroupRequest_(*session, tid, buf, len)) return;                 // authentication Task 12 (D18)
 
@@ -7948,6 +7955,9 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
         noteUnanswerable_(buf, len, "txn message for unknown session");
         return;
     }
+    // Namespaces Task 10 (D8): phase 1 keys groups and transactional ids by id alone, so a session outside
+    // `default` (root included) is refused before the coordinator redirect or any coordinator state.
+    if (sessionNsId_(*session) != 0 && deny_(*session, kGroupTxnOutsideDefault, buf, len)) return;
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
     if (denyTxnRequest_(*session, tid, buf, len)) return;                   // authentication Task 12 (D18)
 
@@ -8006,9 +8016,10 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
 // client fields and a {0, 0} request id.  Views into the ingress buffer / session.
 // ---------------------------------------------------------------------------
 rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext, int64_t sessionId,
-                                                     const Session& session) noexcept
+                                                     const Session& session, uint32_t targetNsId) noexcept
 {
     rune::gateway::DdlMetaView m;
+    m.targetNsId    = targetNsId;   // namespaces Task 10: the object's resolved namespace (kHiddenNsId = answered missing)
     m.sessionId     = sessionId;
     m.sourceAddress = session.egressChannel;
     // The authenticated user (Task 11; Task 12 makes the catalog principal carry it too): a view into the session's
@@ -8145,9 +8156,16 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
         noteUnanswerable_(buf, len, "DefineTopic for unknown session");
         return;
     }
+    // Namespaces Task 10 (D7, D9): the name in the session's view.  A hidden namespace is answered as a missing one
+    // by the admin thread itself (kHiddenNsId); every check below sees the LOCAL name only.
+    const rune::gateway::Resolution res = resolve_(*session, m.topicName);
+    if (res.r == rune::gateway::Resolved::Malformed) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidTopicName), kMalformedNameDetail);
+        return;
+    }
     // Authentication Task 12 (spec §2.1): CREATE on the topic name (a CLUSTER grant is part of the table); CreateSchema
     // is the same request.
-    if (deny_(*session, rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, m.topicName,
+    if (deny_(*session, rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, res.local,
                                                      rune::security::Operation::Create), buf, len))
         return;
     // Issue #129: if the name is an existing UNTYPED topic, a descriptor makes this a new schema version of it
@@ -8155,16 +8173,16 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
     // exists is the admin thread's call (its catalog may be ahead of this thread's index), so the verdict rides along.
     std::optional<rune::gateway::Denial> adopt;
     if (m.descriptorLen != 0)
-        adopt = rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, m.topicName,
+        adopt = rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, res.local,
                                              rune::security::Operation::Alter);
 
     // Copy-and-return: the sink OWNS the copied bytes (every view points into
     // the ingress buffer and is copied by the sink before return).
     answerAdminSubmit_(buf, len,
-                       adminSink_->submitDefineTopic(m.sessionId, m.correlationId, m.topicName, m.partitionCount,
+                       adminSink_->submitDefineTopic(m.sessionId, m.correlationId, res.local, m.partitionCount,
                                                      m.keyField, m.validate, m.descriptorBlob, m.descriptorLen,
                                                      m.persistence, m.replicationFactor, m.config,
-                                                     ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session),
+                                                     ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session, res.nsId),
                                                      adopt ? std::string_view(adopt->detail) : std::string_view{}),
                        "DefineTopic: admin ring full", "DefineTopic: request larger than the admin ring message");
 }
@@ -8192,12 +8210,18 @@ void ClientGateway::handleGetTopicSchema(const uint8_t* buf, std::size_t len)
         noteUnanswerable_(buf, len, "GetTopicSchema for unknown session");
         return;
     }
-    // Authentication Task 12 (D18): DESCRIBE on the name, whether it is a topic or a view (the text always says TOPIC).
-    if (deny_(*session, rune::gateway::authorizeTopicOrViewName(permsOf_(*session), m.topicName,
-                                                                 rune::security::Operation::Describe, objectIndex_), buf, len))
+    const rune::gateway::Resolution res = resolve_(*session, m.topicName);   // namespaces Task 10 (D7, D9)
+    if (res.r == rune::gateway::Resolved::Malformed) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidTopicName), kMalformedNameDetail);
         return;
-    if (!adminSink_->submitGetSchema(m.sessionId, m.correlationId, m.topicName,
-                                     m.requestedFingerprint)) {
+    }
+    // Authentication Task 12 (D18): DESCRIBE on the name, whether it is a topic or a view (the text always says TOPIC).
+    if (deny_(*session, rune::gateway::authorizeTopicOrViewName(permsOf_(*session), res.local,
+                                                                 rune::security::Operation::Describe, objectIndex_,
+                                                                 res.nsId), buf, len))
+        return;
+    if (!adminSink_->submitGetSchema(m.sessionId, m.correlationId, res.local,
+                                     m.requestedFingerprint, res.nsId)) {
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "GetTopicSchema: admin ring full");
     }
 }
@@ -8232,16 +8256,21 @@ void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
         noteUnanswerable_(buf, len, "AlterTopic for unknown session");
         return;
     }
-    if (deny_(*session, rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, m.topicName,
+    const rune::gateway::Resolution res = resolve_(*session, m.topicName);   // namespaces Task 10 (D7, D9)
+    if (res.r == rune::gateway::Resolved::Malformed) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidTopicName), kMalformedNameDetail);
+        return;
+    }
+    if (deny_(*session, rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, res.local,
                                                      rune::security::Operation::Alter), buf, len))
         return;
 
     // Copy-and-return: the sink OWNS the copied bytes (topicName/opsBlob views
     // point into the ingress buffer and are copied by the sink before return).
     answerAdminSubmit_(buf, len,
-                       adminSink_->submitAlterTopic(m.sessionId, m.correlationId, m.topicName, m.expectedVersion,
+                       adminSink_->submitAlterTopic(m.sessionId, m.correlationId, res.local, m.expectedVersion,
                                                     m.opsBlob, m.opsLen,
-                                                    ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session)),
+                                                    ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session, res.nsId)),
                        "AlterTopic: admin ring full", "AlterTopic: request larger than the admin ring message");
 }
 
@@ -8276,10 +8305,15 @@ void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
         noteUnanswerable_(buf, len, "CreateView for unknown session");
         return;
     }
+    const rune::gateway::Resolution res = resolve_(*session, m.viewName);   // namespaces Task 10 (D7, D9)
+    if (res.r == rune::gateway::Resolved::Malformed) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidTopicName), kMalformedNameDetail);
+        return;
+    }
     // Authentication Task 12 (spec §2.1, D19): CREATE on the view name AND READ on every source topic of the plan.
     {
         std::optional<rune::gateway::Denial> d = rune::gateway::authorizeName(
-            permsOf_(*session), rune::security::ResourceType::View, m.viewName, rune::security::Operation::Create);
+            permsOf_(*session), rune::security::ResourceType::View, res.local, rune::security::Operation::Create);
         if (!d) d = authorizeViewSources_(*session, m.planBlob, m.planLen);
         if (deny_(*session, d, buf, len)) return;
     }
@@ -8287,9 +8321,9 @@ void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
     // Copy-and-return: the sink OWNS the copied bytes (viewName/keyField/planBlob
     // views point into the ingress buffer and are copied by the sink before return).
     answerAdminSubmit_(buf, len,
-                       adminSink_->submitCreateView(m.sessionId, m.correlationId, m.viewName, m.keyField,
+                       adminSink_->submitCreateView(m.sessionId, m.correlationId, res.local, m.keyField,
                                                     m.persistence, m.planBlob, m.planLen,
-                                                    ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session)),
+                                                    ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session, res.nsId)),
                        "CreateView: admin ring full", "CreateView: request larger than the admin ring message");
 }
 
@@ -8318,24 +8352,32 @@ void ClientGateway::handleCatalogDdl_(const uint8_t* buf, std::size_t len, const
         noteUnanswerable_(buf, len, what);
         return;
     }
-    if (deny_(*session, authorizeCatalogDdl_(*session, m), buf, len)) return;   // authentication Task 12
-    answerAdminSubmit_(buf, len, submit(m, ddlMetaOf_(&m.ext, m.sessionId, *session)),
+    std::string_view name;
+    if constexpr (std::is_same_v<Msg, pc::DropView> || std::is_same_v<Msg, pc::AlterView>) name = m.viewName;
+    else name = m.topicName;
+    const rune::gateway::Resolution res = resolve_(*session, name);   // namespaces Task 10 (D7, D9)
+    if (res.r == rune::gateway::Resolved::Malformed) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidTopicName), kMalformedNameDetail);
+        return;
+    }
+    if (deny_(*session, authorizeCatalogDdl_(*session, m, res.local), buf, len)) return;   // authentication Task 12
+    answerAdminSubmit_(buf, len, submit(m, res.local, ddlMetaOf_(&m.ext, m.sessionId, *session, res.nsId)),
                        "catalog DDL: admin ring full", "catalog DDL: request larger than the admin ring message");
 }
 
 void ClientGateway::handleDropTopic(const uint8_t* buf, std::size_t len)
 {
     handleCatalogDdl_<pc::DropTopic>(buf, len, "DropTopic not routable",
-        [this](const pc::DropTopic& m, const rune::gateway::DdlMetaView& meta) {
-            return adminSink_->submitDropTopic(m.sessionId, m.correlationId, m.topicName, meta);
+        [this](const pc::DropTopic& m, std::string_view local, const rune::gateway::DdlMetaView& meta) {
+            return adminSink_->submitDropTopic(m.sessionId, m.correlationId, local, meta);
         });
 }
 
 void ClientGateway::handleAlterTopicConfig(const uint8_t* buf, std::size_t len)
 {
     handleCatalogDdl_<pc::AlterTopicConfig>(buf, len, "AlterTopicConfig not routable",
-        [this](const pc::AlterTopicConfig& m, const rune::gateway::DdlMetaView& meta) {
-            return adminSink_->submitAlterTopicConfig(m.sessionId, m.correlationId, m.topicName,
+        [this](const pc::AlterTopicConfig& m, std::string_view local, const rune::gateway::DdlMetaView& meta) {
+            return adminSink_->submitAlterTopicConfig(m.sessionId, m.correlationId, local,
                                                       m.expectedVersion, m.changes, meta);
         });
 }
@@ -8343,16 +8385,16 @@ void ClientGateway::handleAlterTopicConfig(const uint8_t* buf, std::size_t len)
 void ClientGateway::handleDropView(const uint8_t* buf, std::size_t len)
 {
     handleCatalogDdl_<pc::DropView>(buf, len, "DropView not routable",
-        [this](const pc::DropView& m, const rune::gateway::DdlMetaView& meta) {
-            return adminSink_->submitDropView(m.sessionId, m.correlationId, m.viewName, meta);
+        [this](const pc::DropView& m, std::string_view local, const rune::gateway::DdlMetaView& meta) {
+            return adminSink_->submitDropView(m.sessionId, m.correlationId, local, meta);
         });
 }
 
 void ClientGateway::handleAlterView(const uint8_t* buf, std::size_t len)
 {
     handleCatalogDdl_<pc::AlterView>(buf, len, "AlterView not routable",
-        [this](const pc::AlterView& m, const rune::gateway::DdlMetaView& meta) {
-            return adminSink_->submitAlterView(m.sessionId, m.correlationId, m.viewName, m.keyField,
+        [this](const pc::AlterView& m, std::string_view local, const rune::gateway::DdlMetaView& meta) {
+            return adminSink_->submitAlterView(m.sessionId, m.correlationId, local, m.keyField,
                                                m.persistence, m.expectedVersion, m.planBlob, m.planLen, meta);
         });
 }
@@ -8568,12 +8610,13 @@ rune::gateway::PermissionRef ClientGateway::anonPerms_()
                              objectIndex_);
 }
 
-rune::gateway::PermissionRef ClientGateway::compilePerms_(uint64_t userId)
+rune::gateway::PermissionRef ClientGateway::compilePerms_(uint64_t userId, uint32_t nsId)
 {
     if (securityView_ == nullptr) return rune::gateway::PermissionRef{};   // deny-all
     // Issue #259: the effective set is computed per principal (O(its grants)); the table is compiled only when no
-    // session holds that exact set already.
-    return permPool_.acquire(rune::security::effectiveGrants(securityView_->state(), userId), objectIndex_);
+    // session holds that exact set already.  Namespaces Task 10: the session's namespace is part of the key - a
+    // foreign object gets no bits, except for root (ADMIN ON CLUSTER keeps every op in every namespace, #626).
+    return permPool_.acquire(rune::security::effectiveGrants(securityView_->state(), userId), nsId, objectIndex_);
 }
 
 void ClientGateway::syncPermissionTables_()
@@ -8897,20 +8940,21 @@ std::optional<rune::gateway::Denial> ClientGateway::authorizeViewSources_(const 
 }
 
 template <class Msg>
-std::optional<rune::gateway::Denial> ClientGateway::authorizeCatalogDdl_(const Session& session, const Msg& m) const
+std::optional<rune::gateway::Denial> ClientGateway::authorizeCatalogDdl_(const Session& session, const Msg& m,
+                                                                         std::string_view local) const
 {
     namespace rsec = rune::security;
     using rune::gateway::authorizeName;
     const PermissionTable& perms = permsOf_(session);
     if constexpr (std::is_same_v<Msg, pc::DropTopic>)
-        return authorizeName(perms, rsec::ResourceType::Topic, m.topicName, rsec::Operation::Drop);
+        return authorizeName(perms, rsec::ResourceType::Topic, local, rsec::Operation::Drop);
     else if constexpr (std::is_same_v<Msg, pc::AlterTopicConfig>)
-        return authorizeName(perms, rsec::ResourceType::Topic, m.topicName, rsec::Operation::Alter);
+        return authorizeName(perms, rsec::ResourceType::Topic, local, rsec::Operation::Alter);
     else if constexpr (std::is_same_v<Msg, pc::DropView>)
-        return authorizeName(perms, rsec::ResourceType::View, m.viewName, rsec::Operation::Drop);
+        return authorizeName(perms, rsec::ResourceType::View, local, rsec::Operation::Drop);
     else {
         static_assert(std::is_same_v<Msg, pc::AlterView>);
-        if (auto d = authorizeName(perms, rsec::ResourceType::View, m.viewName, rsec::Operation::Alter)) return d;
+        if (auto d = authorizeName(perms, rsec::ResourceType::View, local, rsec::Operation::Alter)) return d;
         return authorizeViewSources_(session, m.planBlob, m.planLen);
     }
 }
@@ -9118,7 +9162,7 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         spdlog::warn("auth: session {} authenticated over plaintext (no TLS): frames are not integrity-protected",
                      session->sessionId);
     if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user, std::move(loginNonce), ok.nsId};
-    else session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId), std::move(loginNonce), ok.nsId};
+    else session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId, ok.nsId), std::move(loginNonce), ok.nsId};
     // Authentication Task 13: announce-before-accept for permissions - the workers learn this session's WRITE bitmap
     // BEFORE the client learns it is logged in, so it can never produce ahead of its grants.
     const uint64_t shipEpoch = shipPermissions_(*session);
@@ -9329,14 +9373,14 @@ void ClientGateway::refreshSession_(int64_t sid)
         // The Task 11 transition, through this one path: a SET PASSWORD cleared the user's must-change flag.
         const rune::security::UserObject* user = securityView_->state().userById(pcr->userId);
         if (user == nullptr || user->mustChangePassword) return;
-        s->auth = AuthAuthenticated{pcr->userId, pcr->user, compilePerms_(pcr->userId), pcr->loginNonce, pcr->nsId};
+        s->auth = AuthAuthenticated{pcr->userId, pcr->user, compilePerms_(pcr->userId, pcr->nsId), pcr->loginNonce, pcr->nsId};
         (void)shipPermissions_(*s);
         return;
     }
     auto* a = std::get_if<AuthAuthenticated>(&s->auth);
     if (a == nullptr) return;
     // Issue #259: a pooled table - compiled only if no session holds the new set yet; the same set = the same table.
-    PermissionRef fresh = compilePerms_(a->userId);
+    PermissionRef fresh = compilePerms_(a->userId, a->nsId);
     if (fresh.id() == a->perms.id() && fresh.id() != PermissionRef::kNoId) return;   // nothing changed for it
     const LiveActions actions = refreshActions(a->perms.table(), fresh.table(), *s, objectIndex_);
     // The old table is held until the rebind is queued: its drop (if this was its last holder) must FOLLOW the bind,
@@ -9560,7 +9604,7 @@ void ClientGateway::handleSecurityDdl(const uint8_t* buf, std::size_t len)
                          session->sessionId, LogSafeName{session->sourceHost});
     }
     answerAdminSubmit_(buf, len,
-                       adminSink_->submitSecurityDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session),
+                       adminSink_->submitSecurityDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session, 0),
                                                      denial ? std::string_view(denial->detail) : std::string_view{},
                                                      proofChecked),
                        "SecurityDdl: admin ring full", "SecurityDdl: request larger than the admin ring message");
@@ -9601,7 +9645,7 @@ void ClientGateway::handleNamespaceDdl(const uint8_t* buf, std::size_t len)
     }
     if (denial) noteDenied_(*session, pc::TemplateId::NamespaceDdl, *denial);
     answerAdminSubmit_(buf, len,
-                       adminSink_->submitNamespaceDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session),
+                       adminSink_->submitNamespaceDdl(m, ddlMetaOf_(&m.ext, m.sessionId, *session, 0),
                                                       denial ? std::string_view(denial->detail) : std::string_view{},
                                                       static_cast<uint16_t>(session->clientVersion)),
                        "NamespaceDdl: admin ring full", "NamespaceDdl: request larger than the admin ring message");
@@ -9731,7 +9775,7 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
         sendAnswer_(*session, scratch_.data(), n);
         return;
     }
-    answerAdminSubmit_(buf, len, adminSink_->submitSecurityBootstrap(m, ddlMetaOf_(nullptr, m.sessionId, *session)),
+    answerAdminSubmit_(buf, len, adminSink_->submitSecurityBootstrap(m, ddlMetaOf_(nullptr, m.sessionId, *session, 0)),
                        "SecurityBootstrap: admin ring full", "SecurityBootstrap: request larger than the admin ring message");
 }
 
