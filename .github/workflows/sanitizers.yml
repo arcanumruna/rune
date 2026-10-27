@@ -177,9 +177,17 @@ jobs:
           ( while sleep 60; do echo "[mem] $(free -m | awk '/Mem:/{print $3"/"$2" MB"}') [disk] $(df -h . | awk 'NR==2{print $4}') free"; done ) &
           run() { ctest --test-dir "build-${{ matrix.id }}" -LE latency -E 'UdpGsoBindings\.Ipv6RoundTrip' \
                     -j${{ matrix.jobs }} --output-on-failure "$@"; }
-          if [ -z "$TESTS" ] && [ -z "$FROM" ]; then run -R Regression; exit $?; fi
+          # Run in chunks of 400 test numbers: a runner that dies loses one chunk, and the [chunk] lines say
+          # exactly where to restart (asan_from / tsan_from).
+          total=$(ctest --test-dir "build-${{ matrix.id }}" -N | sed -nE 's/^Total Tests: ([0-9]+)/\1/p')
           rc=0
-          if [ -n "$FROM" ]; then run -R Regression -I "$FROM," || rc=1; fi
+          if [ -n "$FROM" ] || [ -z "$TESTS" ]; then
+            for ((s=${FROM:-1}; s<=total; s+=400)); do
+              e=$((s+399))
+              if run -R Regression -I "$s,$e"; then r=ok; else r=FAIL; rc=1; fi
+              echo "[chunk] $s-$e of $total: $r [mem] $(free -m | awk '/Mem:/{print $3"/"$2" MB"}')"
+            done
+          fi
           if [ -n "$TESTS" ]; then run -R "$TESTS" || rc=1; fi
           exit $rc
 
