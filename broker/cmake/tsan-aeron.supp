@@ -99,3 +99,8 @@ race:aeron_udp_transport_poller_add
 # other) orders through C11 atomics in the uninstrumented Aeron build; Rune never uses this ring itself
 # (TSan CI: BrokerNodeTest.DedicatedAeronThreadingMode_BootsAndElects).
 race:aeron_mpsc_rb_
+
+# Aeron C++ client template frames (Image::poll / Subscription::poll instantiated with a Rune lambda) symbolize as a
+# bare `poll<...>` without the aeron:: prefix, so the names above miss them; match by the file instead (only
+# headers inside the Aeron conan package).
+race:*.conan2/*aeron*/include/*

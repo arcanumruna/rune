@@ -206,6 +206,10 @@ jobs:
         env:
           TESTS: ${{ inputs.client_tests || 'Regression' }}
         run: |
+          # The broker's ctest sets this itself; the client's does not.  Aeron hands its log buffers and image lists
+          # across threads with inline-asm atomics TSan cannot see, so without the same Aeron-only suppressions every
+          # poll reports a race.  ASan ignores it.
+          export TSAN_OPTIONS="halt_on_error=1 suppressions=$GITHUB_WORKSPACE/broker/cmake/tsan-aeron.supp"
           ctest --test-dir "build-client-${{ matrix.id }}/cmake" -R "$TESTS" -LE latency \
             -E 'UdpGsoBindings\.Ipv6RoundTrip' -j${{ matrix.jobs }} --output-on-failure
 
