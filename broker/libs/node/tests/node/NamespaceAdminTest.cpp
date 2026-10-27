@@ -298,6 +298,48 @@ TEST(NamespaceAdminRegression, CrossNsViewRefusedRegression) {
     EXPECT_EQ(same.code, kCodeOk) << same.detail;
 }
 
+// Batch 2 review: a source topic in another namespace answers EXACTLY like a missing one (spec §1: a foreign object is
+// hidden).  A plan names its sources by topic id, which a hostile client picks freely, and AlterView answers with a
+// DdlResponse that carries the detail - so a detail naming the foreign topic enumerates another tenant's topic names.
+// RED: the "source topic 'secret' is in another namespace" detail.
+TEST(NamespaceAdminRegression, CrossNsViewSourceAnswersLikeMissingRegression) {
+    namespace rv = rune::view;
+    CatalogDdlRig rig("ns_xview_hidden");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.define({.name = "secret", .partitions = 1, .typed = true}).code, kCodeOk);
+    ASSERT_EQ(rig.createNamespace("a").code, kCodeOk);
+    ASSERT_EQ(rig.define({.name = "own", .partitions = 1, .typed = true, .nsId = 1}).code, kCodeOk);
+    const auto& st = rig.admin().applier().state();
+    const int32_t foreignId = st.topicByName(cat::kDefaultNsId, "secret")->topicId;
+    const int32_t ownId     = st.topicByName(1, "own")->topicId;
+    auto planOver = [](int32_t topicId) {
+        rv::ViewPlan p;
+        p.viewName = "v";
+        p.key      = "id";
+        p.sources.push_back(rv::SourceSpec{topicId, "id"});
+        p.output.push_back(rv::AuthoredField{"id", rune::codec::PrimType::Int64, 0, "id", rv::MergeRule::Replace});
+        p.output.push_back(rv::AuthoredField{"hp", rune::codec::PrimType::Int64, 0, "hp", rv::MergeRule::Replace});
+        return rv::serializeAuthored(p);
+    };
+    rune::node::CreateViewMsg c;
+    c.session = rig.sessionId(); c.corr = rig.nextCorr(); c.viewName = "v"; c.keyField = "id";
+    c.planBlob = planOver(ownId); c.meta = rig.meta(); c.nsId = 1;
+    ASSERT_EQ(rig.submitRaw(rune::node::DdlRequest{c}).code, kCodeOk);
+    auto alter = [&](int32_t topicId) {
+        rune::node::AlterViewMsg m;
+        m.session = rig.sessionId(); m.corr = rig.nextCorr(); m.name = "v"; m.keyField = "id";
+        m.planBlob = planOver(topicId); m.meta = rig.meta(); m.nsId = 1;
+        return rig.submitRaw(rune::node::DdlRequest{m});
+    };
+    const auto foreign = alter(foreignId);
+    const auto missing = alter(999'999);
+    EXPECT_EQ(foreign.code, kCodeViewSource) << foreign.detail;
+    EXPECT_EQ(foreign.code, missing.code);
+    EXPECT_EQ(foreign.detail, missing.detail) << "the refusal reveals the foreign topic";
+    EXPECT_EQ(foreign.detail.find("secret"), std::string::npos) << foreign.detail;
+    EXPECT_TRUE(eventsOfKind(rig.recordedLog(), cat::EventKind::AlterView).empty());
+}
+
 // The same Create (one rid) twice back to back, before the first is answered: both answered OK with nsId 1, one
 // event.
 TEST(NamespaceAdminRegression, BackToBackDedupeRegression) {

@@ -1378,9 +1378,10 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
         if (s.viewByViewTopicId(src.topicId) != nullptr) return Rejected(reject(kViewSourceIsView));
         const cat::TopicObject* t = s.topicByTopicId(src.topicId);
         // Namespaces Task 7 (D11): a view reads only its own namespace's topics — for every caller, the cluster
-        // admin included.  The ApplyV2 preview (buildEvent_) is the backstop for anything this misses.
-        if (t != nullptr && t->nsId != nsId) return Rejected(reject(kViewSourceNotFound, "source topic " +
-                                                                    quotedName(t->name) + " is in another namespace"));
+        // admin included.  A foreign source answers EXACTLY like a missing one (spec §1, hidden): sources are topic
+        // ids a client picks freely, so naming the topic would enumerate another namespace's topics.  The ApplyV2
+        // preview (buildEvent_) is the backstop for anything this misses.
+        if (t != nullptr && t->nsId != nsId) return Rejected(reject(kViewSourceNotFound));
         const RegistryEntry* e = t != nullptr && t->schema ? reg_.byId(src.topicId) : nullptr;
         if (e == nullptr) return Rejected(reject(kViewSourceNotFound));
         // Phase 2b E: a view that reads a transient topic must itself be transient.
