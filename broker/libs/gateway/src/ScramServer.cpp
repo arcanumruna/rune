@@ -13,6 +13,9 @@ namespace rs = rune::crypto::scram;
 using rune::crypto::Digest;
 using rune::crypto::DigestBytes;
 
+static_assert(4 * ((rs::kNonceBytes + 2) / 3) == pc::kAuthServerNonceChars,
+              "server nonce length is part of the wire bound");
+
 namespace {
 
 DigestBytes keyBytes(const std::array<uint8_t, 64>& k) noexcept {
@@ -66,21 +69,6 @@ std::string authMessageOf(const AuthAwaitingFinal& st, const rs::Verifier& v) {
 }
 
 }  // namespace
-
-std::optional<pc::AuthClientFirst> decodeClientFirst(const uint8_t* buf, std::size_t len) noexcept
-{
-    std::size_t pos = 0;
-    const auto h = pc::detail::getAuthHeader(buf, len, pc::AuthClientFirst::TEMPLATE_ID, pc::AuthClientFirst::BODY_FIXED, pos);
-    if (!h) return std::nullopt;
-    pc::AuthClientFirst m;
-    m.sessionId = h->sessionId;
-    m.correlationId = h->correlationId;
-    m.mechanism = buf[pc::MessageHeader::ENCODED_SIZE];
-    if (!pc::getVarStr(buf, len, pos, m.username) || !pc::getVarStr(buf, len, pos, m.clientNonce)) return std::nullopt;
-    if (m.username.size() > pc::kAuthNameMax) return std::nullopt;                          // empty IS allowed here
-    if (m.clientNonce.empty() || m.clientNonce.size() > pc::kAuthNonceMax) return std::nullopt;
-    return m;
-}
 
 LoginName resolveLoginName(const rune::catalog::NamespaceRegistry* namespaces, std::string_view username) noexcept
 {

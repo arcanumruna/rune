@@ -2030,7 +2030,7 @@ TEST(AuthLogRegression, AUsernameWithControlBytesIsEscapedInLoginLogLinesRegress
     for (std::string l : lines) {
         while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
         EXPECT_EQ(l.find('\n'), std::string::npos) << "a log line holds no raw newline: " << l;
-        if (l.find("x\\x0aauth:") != std::string::npos) sawEscaped = true;
+        if (l.find("user=<undecodable>") != std::string::npos) sawEscaped = true;
         std::size_t start = 0;
         for (;;) {   // every physical line a reader would see
             const std::size_t nl = l.find('\n', start);
@@ -2040,8 +2040,9 @@ TEST(AuthLogRegression, AUsernameWithControlBytesIsEscapedInLoginLogLinesRegress
             start = nl + 1;
         }
     }
-    EXPECT_TRUE(sawEscaped) << "the failure line names the user escaped";
-    EXPECT_TRUE(rig.logContains("user=x\\x0aauth:\\x20login\\x20ok\\x20user=admin source=10.0.0.9"));
+    // One decoder (#231): a name outside the charset is refused at the first leg, so the raw bytes never reach a log line.
+    EXPECT_TRUE(sawEscaped) << "the failure line names no user: <undecodable>";
+    EXPECT_FALSE(rig.logContains("login ok user=admin"));
 }
 
 TEST(AuthLogRegression, LogSafeNameEscapesEveryNonPrintableByteRegression) {
@@ -2309,4 +2310,21 @@ TEST(UnauthSessionCapRegression, TheCapRefusalLogsTheSourceHostEscapedAdversaria
         if (l.find("connect refused source=evil\\x0aauth:\\x20login") != std::string::npos) sawLine = true;
     }
     EXPECT_TRUE(sawLine);
+}
+
+TEST(AuthLoginRegression, AClientFirstWithACommaInTheNonceIsAnsweredMalformedRegression) {
+    Rig rig;
+    const uint64_t before = rig.gw.loginsFailed();
+    const int64_t sid = rig.newSession();
+    pc::AuthClientFirst cf;
+    cf.sessionId = sid; cf.correlationId = ++rig.corr; cf.username = "ws1"; cf.clientNonce = "ab,cd";
+    std::vector<uint8_t> b(cf.encodedSize()); b.resize(cf.encode(b.data()));
+    rig.send(b);
+    EXPECT_EQ(rig.last(static_cast<uint16_t>(pc::TemplateId::AuthServerFirst), sid), nullptr);
+    const auto fin = lastFinal(rig, sid);
+    ASSERT_TRUE(fin.has_value());
+    EXPECT_EQ(fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
+    EXPECT_FALSE(rig.gw.hasSessionForTest(sid));
+    EXPECT_EQ(rig.gw.loginsFailed(), before + 1);
+    EXPECT_TRUE(rig.logContains("reason=malformed"));
 }

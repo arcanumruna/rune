@@ -238,16 +238,43 @@ TEST(ScramRegression, AnEmptyUsernameIsDecodedAndAnythingMalformedIsNot) {
     cf.sessionId = 1; cf.correlationId = 2; cf.username = ""; cf.clientNonce = "n";
     std::vector<uint8_t> b(cf.encodedSize());
     b.resize(cf.encode(b.data()));
-    const auto lenient = decodeClientFirst(b.data(), b.size());
-    ASSERT_TRUE(lenient.has_value()) << "the generated decoder refuses it; the gateway must not";
+    const auto lenient = pc::AuthClientFirst::decode(b.data(), b.size());
+    ASSERT_TRUE(lenient.has_value()) << "one decoder: an empty name means no credentials";
     EXPECT_TRUE(lenient->username.empty());
     EXPECT_EQ(lenient->correlationId, 2);
-    EXPECT_FALSE(decodeClientFirst(b.data(), 20).has_value());
+    EXPECT_FALSE(pc::AuthClientFirst::decode(b.data(), 20).has_value());
     cf.clientNonce = "";
     b.resize(cf.encodedSize()); b.resize(cf.encode(b.data()));
-    EXPECT_FALSE(decodeClientFirst(b.data(), b.size()).has_value()) << "an empty nonce is malformed";
+    EXPECT_FALSE(pc::AuthClientFirst::decode(b.data(), b.size()).has_value()) << "an empty nonce is malformed";
     const std::string longName(129, 'u');
     cf.username = longName; cf.clientNonce = "n";
     b.resize(cf.encodedSize()); b.resize(cf.encode(b.data()));
-    EXPECT_FALSE(decodeClientFirst(b.data(), b.size()).has_value());
+    EXPECT_FALSE(pc::AuthClientFirst::decode(b.data(), b.size()).has_value());
+}
+
+TEST(ScramServerRegression, ClientFirstWithABadNonceOrUsernameIsRefusedRegression) {
+    auto decodeOf = [](std::string_view user, std::string_view nonce) {
+        pc::AuthClientFirst cf;
+        cf.sessionId = 1; cf.correlationId = 2; cf.username = user; cf.clientNonce = nonce;
+        std::vector<uint8_t> b(cf.encodedSize());
+        b.resize(cf.encode(b.data()));
+        return pc::AuthClientFirst::decode(b.data(), b.size()).has_value();
+    };
+    EXPECT_FALSE(decodeOf("ws1", "a,b"));
+    EXPECT_FALSE(decodeOf("ws1", std::string_view("a\x07" "b", 3)));
+    EXPECT_FALSE(decodeOf("a\nb", "abc"));
+    EXPECT_FALSE(decodeOf("a b", "abc"));
+
+    const std::string nonce96(96, 'x');
+    pc::AuthClientFirst cf;
+    cf.sessionId = 1; cf.correlationId = 2; cf.username = "ws1"; cf.clientNonce = nonce96;
+    std::vector<uint8_t> b(cf.encodedSize());
+    b.resize(cf.encode(b.data()));
+    const auto m = pc::AuthClientFirst::decode(b.data(), b.size());
+    ASSERT_TRUE(m.has_value());
+    const auto s = makeState();
+    const auto plan = scramServerFirst(s, *m, 123);
+    const auto sf = pc::AuthServerFirst::decode(plan.frame.data(), plan.frame.size());
+    ASSERT_TRUE(sf.has_value());
+    EXPECT_EQ(sf->combinedNonce.size(), 128u);
 }

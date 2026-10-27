@@ -12,8 +12,9 @@
 //   AuthClientFinal (14)  [count u8]     | count x 64 proof bytes
 //   AuthServerFinal (15)  [errorCode u16][flags u8][retryAfterMs u32] | serverSignature var16, detail var16
 //
-// Bounds on decode: username 1..128, nonce 1..128, salt 16..64, count 1..2,
-// iterations 4096..1e6, signature 0 or 64 bytes.
+// Bounds on decode: username 0..128 [A-Za-z0-9._@/-] (empty = no credentials), client nonce 1..96
+// printable without ',', combined nonce 1..128 printable without ','; mechanism must be SCRAM-SHA-512;
+// salt 16..64, count 1..2, iterations 4096..1e6, signature 0 or 64 bytes.
 
 #include <array>
 #include <cstddef>
@@ -32,6 +33,8 @@ inline constexpr uint8_t     kAuthFlagMustChangePassword = 0x01;
 
 inline constexpr std::size_t kAuthNameMax        = 128;
 inline constexpr std::size_t kAuthNonceMax       = 128;
+inline constexpr std::size_t kAuthServerNonceChars = 32;                                  // base64 of 24 random bytes
+inline constexpr std::size_t kAuthClientNonceMax   = kAuthNonceMax - kAuthServerNonceChars;   // 96: combined <= 128
 inline constexpr std::size_t kAuthSaltMin        = 16;
 inline constexpr std::size_t kAuthSaltMax        = 64;
 inline constexpr uint32_t    kAuthIterationsMin  = 4096;
@@ -68,6 +71,25 @@ inline std::optional<MessageHeader> getAuthHeader(const uint8_t* buf, std::size_
 [[nodiscard]] constexpr bool authIterationsOk(uint32_t i) noexcept {
     return i >= kAuthIterationsMin && i <= kAuthIterationsMax;
 }
+
+/// D7: a user name is [A-Za-z0-9._@-], plus '/' for the namespace-qualified login "ns/name"; empty = "no credentials"
+/// (the broker answers 44).
+[[nodiscard]] constexpr bool authNameCharsOk(std::string_view s) noexcept {
+    for (const char ch : s) {
+        const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+                        ch == '.' || ch == '_' || ch == '@' || ch == '-' || ch == '/';
+        if (!ok) return false;
+    }
+    return true;
+}
+/// RFC 5802 `printable`: 0x21..0x7E except ','.
+[[nodiscard]] constexpr bool authNonceCharsOk(std::string_view s) noexcept {
+    for (const char ch : s) {
+        const auto u = static_cast<unsigned char>(ch);
+        if (u < 0x21 || u > 0x7E || ch == ',') return false;
+    }
+    return true;
+}
 } // namespace detail
 
 // ---------------------------------------------------------------------------
@@ -102,8 +124,11 @@ struct AuthClientFirst {
         m.sessionId = h->sessionId; m.correlationId = h->correlationId;
         m.mechanism = buf[MessageHeader::ENCODED_SIZE];
         if (!getVarStr(buf, avail, pos, m.username) || !getVarStr(buf, avail, pos, m.clientNonce)) return std::nullopt;
-        if (m.username.empty() || m.username.size() > kAuthNameMax) return std::nullopt;
-        if (m.clientNonce.empty() || m.clientNonce.size() > kAuthNonceMax) return std::nullopt;
+        if (m.mechanism != kMechanismScramSha512) return std::nullopt;
+        if (m.username.size() > kAuthNameMax || !detail::authNameCharsOk(m.username)) return std::nullopt;   // empty allowed
+        if (m.clientNonce.empty() || m.clientNonce.size() > kAuthClientNonceMax ||
+            !detail::authNonceCharsOk(m.clientNonce))
+            return std::nullopt;
         return m;
     }
 };
@@ -151,7 +176,9 @@ struct AuthServerFirst {
         AuthServerFirst m;
         m.sessionId = h->sessionId; m.correlationId = h->correlationId;
         if (!getVarStr(buf, avail, pos, m.combinedNonce)) return std::nullopt;
-        if (m.combinedNonce.empty() || m.combinedNonce.size() > kAuthNonceMax) return std::nullopt;
+        if (m.combinedNonce.empty() || m.combinedNonce.size() > kAuthNonceMax ||
+            !detail::authNonceCharsOk(m.combinedNonce))
+            return std::nullopt;
         if (pos + 1u > avail) return std::nullopt;
         m.count = buf[pos++];
         if (m.count < 1 || m.count > kAuthMaxVerifiers) return std::nullopt;

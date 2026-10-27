@@ -176,6 +176,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     acfg.session.username      = c.username;   // authentication: SCRAM credentials (never logged)
     acfg.session.password      = c.password;
     acfg.session.allowUnauthenticatedBroker = c.allowUnauthenticatedBroker;
+    acfg.session.maxAcceptedIterations = c.maxAcceptedScramIterations;
     acfg.session.bootstrapOnly = c.securityBootstrapOnly;
     acfg.session.requireCrypto = c.requireCrypto;
     if (c.testAnnounceClientVersion > 0) acfg.session.clientVersion = c.testAnnounceClientVersion;   // test only

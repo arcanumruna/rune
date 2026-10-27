@@ -385,8 +385,10 @@ TEST(SessionMachineAuthRegression, NoCredentialsStillSendsAuthClientFirstAndTheB
     Rig t("", ""); t.connectAuthRequired();
     EXPECT_EQ(t.m->state(), sm::SessionState::Authenticating) << "the client never short-circuits";
     ASSERT_EQ(t.io.lastTemplate(), static_cast<uint16_t>(pc::TemplateId::AuthClientFirst));
-    // (the strict decoder rejects an empty username — the broker answers 44; exactly that is what the client sees)
-    EXPECT_FALSE(pc::AuthClientFirst::decode(t.io.frames.back().data(), t.io.frames.back().size()).has_value());
+    // one decoder: empty = no credentials (the broker answers 44; exactly that is what the client sees)
+    const auto cf0 = pc::AuthClientFirst::decode(t.io.frames.back().data(), t.io.frames.back().size());
+    ASSERT_TRUE(cf0.has_value());
+    EXPECT_TRUE(cf0->username.empty());
     t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = 44}, 3);
     EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
     EXPECT_EQ(t.m->rejectCode(), 44);
@@ -475,18 +477,61 @@ TEST(SessionMachineAuthRegression, TheSaltedPasswordCacheIsSharedAcrossSessions)
     EXPECT_EQ(cache.hits(), 2u);
 }
 
+TEST(SessionMachineAuthRegression, AnAbsurdIterationCountFromTheBrokerIsRefusedWithoutHashingRegression) {
+    auto attempt = [](uint32_t it0, uint32_t it1, bool two) {
+        struct Out { sm::SessionState st; int16_t code; int finals; uint64_t hashes; std::string detail; };
+        sm::ScramCache cache;
+        Rig t; t.m->useScramCache(&cache); t.connectAuthRequired();
+        Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
+        if (two) srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
+        std::string combined; auto sf = srv.first(t.clientFirst(), combined);
+        sf.salts[0].iterations = it0;
+        if (two) sf.salts[1].iterations = it1;
+        t.m->onAuthServerFirst(sf, 2);
+        return Out{t.m->state(), t.m->rejectCode(), t.io.countOf(pc::TemplateId::AuthClientFinal),
+                   cache.pbkdf2Computations(), t.m->rejectDetail()};
+    };
+    const auto a = attempt(1'000'000, 0, false);
+    EXPECT_EQ(a.st, sm::SessionState::Rejected);
+    EXPECT_EQ(a.code, 44);
+    EXPECT_EQ(a.hashes, 0u);
+    EXPECT_EQ(a.finals, 0);
+    EXPECT_NE(a.detail.find("1000000"), std::string::npos) << a.detail;
+    const auto b = attempt(4096, 100'001, true);
+    EXPECT_EQ(b.st, sm::SessionState::Rejected);
+    EXPECT_EQ(b.hashes, 0u) << "the check runs before ANY hash";
+    EXPECT_EQ(b.finals, 0);
+    const auto c = attempt(100'000, 0, false);
+    EXPECT_EQ(c.st, sm::SessionState::Authenticating);
+    EXPECT_EQ(c.finals, 1) << "exactly the cap is accepted";
+    EXPECT_EQ(c.hashes, 1u);
+}
+
+TEST(ScramCacheRegression, TwoPasswordsWithTheSameSaltDoNotShareAnEntryRegression) {
+    sm::ScramCache c;
+    const std::vector<uint8_t> salt(16, 0x11);
+    const auto a = *c.saltedPassword("p1", salt, 4096);
+    const auto b = *c.saltedPassword("p2", salt, 4096);
+    EXPECT_NE(a.bytes.bytes, b.bytes.bytes) << "the password is part of the key";
+    EXPECT_EQ(c.pbkdf2Computations(), 2u);
+    const auto again = *c.saltedPassword("p1", salt, 4096);
+    EXPECT_EQ(again.bytes.bytes, a.bytes.bytes);
+    EXPECT_EQ(c.hits(), 1u);
+    EXPECT_EQ(c.pbkdf2Computations(), 2u);
+}
+
 TEST(ScramCacheTest, EvictsTheOldestAndZeroesWhatItDrops) {
     sm::ScramCache cache;
     std::vector<uint8_t> salt(16, 1);
     for (uint32_t i = 0; i < sm::ScramCache::kCapacity + 2; ++i) {
         salt[0] = static_cast<uint8_t>(i);
         rs::SaltedPassword sp; sp.bytes.size = 64; sp.bytes.bytes.fill(static_cast<uint8_t>(i + 1));
-        cache.put(salt, 4096, sp);
+        cache.put("pw", salt, 4096, sp);
     }
     EXPECT_EQ(cache.size(), sm::ScramCache::kCapacity);
-    salt[0] = 0;   EXPECT_EQ(cache.find(salt, 4096), nullptr) << "the oldest was evicted";
-    salt[0] = 9;   ASSERT_NE(cache.find(salt, 4096), nullptr);
-    salt[0] = 9;   EXPECT_EQ(cache.find(salt, 4097), nullptr) << "iterations are part of the key";
+    salt[0] = 0;   EXPECT_EQ(cache.find("pw", salt, 4096), nullptr) << "the oldest was evicted";
+    salt[0] = 9;   ASSERT_NE(cache.find("pw", salt, 4096), nullptr);
+    salt[0] = 9;   EXPECT_EQ(cache.find("pw", salt, 4097), nullptr) << "iterations are part of the key";
     cache.clear();
     EXPECT_EQ(cache.size(), 0u);
 }

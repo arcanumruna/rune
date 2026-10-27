@@ -395,6 +395,7 @@ struct ClientConfig {
     // client's rule (D9).  Not used by the login itself, which follows the broker's salt and count.
     uint32_t minPasswordLength = 12;
     uint32_t scramIterations   = 4096;
+    uint32_t maxAcceptedScramIterations = 100'000;   // #235: see SessionConfig::maxAcceptedIterations
     // requireCrypto (downgrade safety, spec §11 require_tls's client-side
     // mirror): when true, a session never proceeds without TLS — a ConnectResponse
     // that negotiates NO cipher (a MITM that stripped the crypto offer) fails the

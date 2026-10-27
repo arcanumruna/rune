@@ -9117,8 +9117,8 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
         return;
     }
     const int64_t deadline = awaiting->deadlineNs;
-    const auto m = decodeClientFirst(buf, len);
-    if (!m || m->mechanism != pc::kMechanismScramSha512) {
+    const auto m = pc::AuthClientFirst::decode(buf, len);
+    if (!m) {
         ++loginsFailed_;
         if (unauthLog_.due(6)) [[unlikely]]
             spdlog::warn("auth: login failed user=<undecodable> source={} session={} reason=malformed",

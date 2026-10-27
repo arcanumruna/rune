@@ -9,8 +9,8 @@
 //     expensive step of a login; a client holding one session per broker pays it
 //     once per verifier, not once per session (every broker replicates the same
 //     verifier, hence the same (salt, iterations)).  Fixed storage, no heap,
-//     never logged, zeroed on eviction and on destruction.  One cache serves one
-//     password (the Client's): the key is (salt, iterations) only.
+//     never logged, zeroed on eviction and on destruction.  The key is (password tag,
+//     salt, iterations): two passwords never share an entry.
 #pragma once
 
 #include <array>
@@ -59,11 +59,12 @@ public:
     ScramCache(const ScramCache&)            = delete;
     ScramCache& operator=(const ScramCache&) = delete;
 
-    /// The cached Hi(password, salt, iterations), or nullptr.
-    [[nodiscard]] const rune::crypto::scram::SaltedPassword* find(std::span<const uint8_t> salt,
+    /// The cached Hi(password, salt, iterations), or nullptr.  The password is part of the key (as a keyed tag).
+    [[nodiscard]] const rune::crypto::scram::SaltedPassword* find(std::string_view password,
+                                                                  std::span<const uint8_t> salt,
                                                                   uint32_t iterations) const noexcept;
     /// Stores one entry (evicting the oldest, zeroed first).  A salt longer than kMaxSalt is not cached.
-    void put(std::span<const uint8_t> salt, uint32_t iterations,
+    void put(std::string_view password, std::span<const uint8_t> salt, uint32_t iterations,
              const rune::crypto::scram::SaltedPassword& sp) noexcept;
 
     /// find(), else PBKDF2 + put().  nullptr = local crypto failure.  The pointer is valid until the next call.
@@ -84,9 +85,16 @@ private:
         std::array<uint8_t, kMaxSalt>          salt{};
         uint8_t                                saltLen = 0;
         uint32_t                               iterations = 0;     // 0 = empty
+        std::array<uint8_t, 64>                pwTag{};            // HMAC-SHA-512 tag of the password (not the password)
         rune::crypto::scram::SaltedPassword    sp{};
     };
+    using Tag = std::array<uint8_t, 64>;
     static void wipe_(Entry& e) noexcept;
+    [[nodiscard]] static bool tagOf_(std::string_view password, Tag& out) noexcept;
+    [[nodiscard]] const rune::crypto::scram::SaltedPassword* find_(const Tag& tag, std::span<const uint8_t> salt,
+                                                                   uint32_t iterations) const noexcept;
+    void put_(const Tag& tag, std::span<const uint8_t> salt, uint32_t iterations,
+              const rune::crypto::scram::SaltedPassword& sp) noexcept;
 
     std::array<Entry, kCapacity> entries_{};
     Entry                        overflow_{};      // a salt too long to cache: held for the caller

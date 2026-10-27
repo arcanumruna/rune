@@ -14,6 +14,7 @@
 #include <rune/security/testing/SecurityGoldenScript.h>
 
 #include <gtest/gtest.h>
+#include <stdexcept>
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
 
@@ -156,7 +157,8 @@ struct BootFrame {
             std::vector<uint8_t> in;
             pc::bootstrapMacInput(m, in);
             rune::crypto::DigestBytes mac;
-            rune::crypto::hmac(rune::crypto::Digest::Sha512, k->master, in, mac);
+            if (!rune::crypto::hmac(rune::crypto::Digest::Sha512, k->master, in, mac))
+                throw std::runtime_error("SecurityGatewayTest: bootstrap proof HMAC failed");
             std::memcpy(m.mac.data(), mac.bytes.data(), 64);
         }
         bytes.resize(m.encodedSize());

@@ -92,7 +92,11 @@ TEST(AuthMessagesRegression, OutOfBoundsFieldsDoNotDecode) {
     buf[24] = 0;
     EXPECT_FALSE(pc::AuthClientFinal::decode(buf, fn)) << "count 0";
     pc::AuthClientFirst cf{.username = "", .clientNonce = "n"};
-    EXPECT_FALSE(pc::AuthClientFirst::decode(buf, cf.encode(buf))) << "empty username";
+    {
+        const auto e = pc::AuthClientFirst::decode(buf, cf.encode(buf));
+        ASSERT_TRUE(e.has_value()) << "empty username = no credentials";
+        EXPECT_TRUE(e->username.empty());
+    }
     const std::string longName(129, 'u');
     cf = {.username = longName, .clientNonce = "n"};
     EXPECT_FALSE(pc::AuthClientFirst::decode(buf, cf.encode(buf))) << "username > 128";
@@ -256,4 +260,51 @@ TEST(AuthMessagesRegression, OwnUserNameResolvedRegression) {
              {"alice", "", false},                    {"alpha/alicex", "alpha/alice", false}}) {
         EXPECT_EQ(pc::isOwnUserName(r.name, r.login), r.own) << r.name << " vs login " << r.login;
     }
+}
+
+TEST(AuthMessagesRegression, ClientFirstRefusesBadNonceUsernameAndMechanismRegression) {
+    struct Row { std::string user, nonce; uint8_t mech; bool ok; };
+    const std::vector<Row> rows = {
+        {"ws1", "abc", 1, true},
+        {"", "abc", 1, true},
+        {"svc@eu-1.x_y", "abc", 1, true},
+        {"a/alice", "abc", 1, true},
+        {"ws1", "a,b", 1, false},
+        {"ws1", std::string("a\x07" "b"), 1, false},
+        {"ws1", "a b", 1, false},
+        {"ws1", std::string(1, '\x7f'), 1, false},
+        {"a\nb", "abc", 1, false},
+        {"a b", "abc", 1, false},
+        {"a,b", "abc", 1, false},
+        {"ws1", "abc", 0, false},
+        {"ws1", "abc", 2, false},
+        {"ws1", std::string(96, 'x'), 1, true},
+        {"ws1", std::string(97, 'x'), 1, false},
+        {std::string(128, 'u'), "n", 1, true},
+        {std::string(129, 'u'), "n", 1, false},
+    };
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        const Row& r = rows[i];
+        pc::AuthClientFirst cf;
+        cf.mechanism = r.mech; cf.username = r.user; cf.clientNonce = r.nonce;
+        std::vector<uint8_t> b(cf.encodedSize());
+        ASSERT_EQ(cf.encode(b.data()), b.size());
+        EXPECT_EQ(pc::AuthClientFirst::decode(b.data(), b.size()).has_value(), r.ok) << "row " << i;
+    }
+}
+
+TEST(AuthMessagesRegression, ACombinedNonceFromTheLongestClientNonceDecodesRegression) {
+    const std::string salt(16, 's');
+    auto decodes = [&](const std::string& nonce) {
+        pc::AuthServerFirst sf;
+        sf.combinedNonce = nonce;
+        sf.count = 1;
+        sf.salts[0] = {salt, 4096};
+        std::vector<uint8_t> b(sf.encodedSize());
+        EXPECT_EQ(sf.encode(b.data()), b.size());
+        return pc::AuthServerFirst::decode(b.data(), b.size()).has_value();
+    };
+    EXPECT_TRUE(decodes(std::string(96, 'x') + std::string(32, 'y')));
+    EXPECT_FALSE(decodes(std::string(96, 'x') + "," + std::string(31, 'y')));
+    EXPECT_FALSE(decodes(std::string(96, 'x') + "\x07" + std::string(31, 'y')));
 }

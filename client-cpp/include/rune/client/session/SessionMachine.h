@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -223,6 +224,9 @@ struct SessionConfig {
     // is Connected in the anonymous-bootstrap mode, exactly as on a never-bootstrapped cluster (Required+Anonymous).
     // Ignored with credentials.  Default false: a credential-less client otherwise starts the (failing) login.
     bool bootstrapOnly = false;
+    // Issue #235: the most PBKDF2 iterations this client runs for a login (the broker names the count).  A count
+    // above it is refused before any hashing: a rogue broker cannot stall the duty thread.  Clamped to 4096..1e6.
+    uint32_t maxAcceptedIterations = 100'000;
 
     // Task 9 (downgrade safety, spec §11 require_tls's client-side mirror):
     // when true, a ConnectResponse{OK} that negotiates NO cipher (chosenCipher
@@ -466,10 +470,6 @@ public:
                (lastConnectError_ == static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthUnavailable) ||
                 lastConnectError_ == static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed));
     }
-    /// Authentication: the salted-password cache is the duty thread's (the agent's), shared by its sessions;
-    /// a machine built alone (tests) uses its own.  Duty thread, before the first connect.
-    void useScramCache(ScramCache* cache) noexcept { cache_ = cache != nullptr ? cache : &ownCache_; }
-    /// client<->broker TLS/AEAD (Task 5): the session's crypto state.  `encrypted`
     /// C4 review (#461): the caller's connect deadline passed while a transient refusal (48 / rate-limited 44) on a
     /// connect was being retried.  The retry ends here (-> Disconnected) so nothing reconnects behind a connect that
     /// already failed; lastConnectError() and authRetryAfterMs() keep the refusal for the report.  Returns whether it
@@ -492,6 +492,10 @@ public:
                 return false;
         }
     }
+    /// Authentication: the salted-password cache is the duty thread's (the agent's), shared by its sessions;
+    /// a machine built alone (tests) uses its own.  Duty thread, before the first connect.
+    void useScramCache(ScramCache* cache) noexcept { cache_ = cache != nullptr ? cache : &ownCache_; }
+    /// client<->broker TLS/AEAD (Task 5): the session's crypto state.  `encrypted`
     /// is false until the handshake completes (or if no cipher was negotiated).
     [[nodiscard]] const CryptoState& cryptoState() const noexcept { return cryptoState_; }
     /// Mutable overload — AeadCipher::seal/open are non-const (they advance the
@@ -859,6 +863,17 @@ public:
             failAuth_(rpc::ErrorCode::AuthenticationFailed, 0, nowNs);
             return;
         }
+        const uint32_t cap = std::clamp(cfg_.maxAcceptedIterations, rpc::kAuthIterationsMin, rpc::kAuthIterationsMax);
+        for (uint8_t i = 0; i < sf.count; ++i) {
+            if (sf.salts[i].iterations > cap) {
+                failAuth_(rpc::ErrorCode::AuthenticationFailed, 0, nowNs);
+                try {
+                    rejectDetail_ = "the broker asked for " + std::to_string(sf.salts[i].iterations) +
+                                    " SCRAM iterations, above maxAcceptedScramIterations " + std::to_string(cap);
+                } catch (...) {}
+                return;
+            }
+        }
         const std::string combined(sf.combinedNonce);
         const std::string cfwp = rs::clientFinalWithoutProof(combined);
         ScramSentFinal fin;
@@ -979,6 +994,11 @@ public:
                 failAuth_(ec, /*retryAfterMs=*/0, nowNs);
             } else if (ec == rpc::ErrorCode::SessionExpired || ec == rpc::ErrorCode::UnknownSession) {
                 onConnectError_(ec, nowNs);
+            } else if (ec == rpc::ErrorCode::AuthUnavailable) {
+                // C4 review (#461): the broker could not check security for this login - transient, retried (paced,
+                // bounded) like a 48 on the ConnectResponse, never waited out to the handshake timeout.
+                scram_.reset();
+                onAuthUnavailable_(nowNs);
             }
             return;
         }
@@ -994,11 +1014,6 @@ public:
                 redirectCount_++;
 
                 // FIX B: if the message field carries a non-empty endpoint string,
-            } else if (ec == rpc::ErrorCode::AuthUnavailable) {
-                // C4 review (#461): the broker could not check security for this login - transient, retried (paced,
-                // bounded) like a 48 on the ConnectResponse, never waited out to the handshake timeout.
-                scram_.reset();
-                onAuthUnavailable_(nowNs);
                 // this is the real broker-gateway redirect path — retarget.
                 // FIX F8: retarget is noexcept; a failed retarget keeps the old
                 // endpoint and we still resend (no throw into noexcept dispatch).
