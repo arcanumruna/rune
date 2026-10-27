@@ -67,13 +67,17 @@
 #include <rune/catalog/CatalogQueries.h>
 #include <rune/protocol/CatalogTypes.h>
 #include <rune/protocol/client/SchemaMessages.h>
+#include <rune/protocol/client/NamespaceMessages.h>
+#include <rune/client/NamespaceLimitFields.h>
 
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
+#include <array>
 #include <exception>
+#include <expected>
 #include <functional>
 #include <optional>
 #include <span>
@@ -439,6 +443,10 @@ struct ClientConfig {
     // Requires RunnerMode::Invoker (the constructor throws std::invalid_argument otherwise).
     // Default false: nothing is recorded, nothing allocates.
     bool traceDdlRetries = false;
+    // TEST ONLY (namespaces Task 11): > 0 = the ConnectRequest.clientVersion this client announces instead of
+    // protocol::client::kClientVersion (e.g. 13, to prove a pre-namespace client is refused the namespace ops).
+    // 0 (the default) = the current version.  Never set it in production code.
+    int32_t testAnnounceClientVersion = 0;
 };
 
 /// Maps a ClientConfig to the agent/transport configuration (applies env overrides).
@@ -1027,6 +1035,34 @@ public:
     SecurityResult<std::vector<rune::security::RoleRow>> securityRoles(std::chrono::milliseconds timeout);
     SecurityReader& securityReader();
 
+    // ---- Namespaces (Task 11, spec §10 / D13): namespace DDL (wire 81 -> DdlResponse 78) and ListNamespaces
+    // (82 -> 83).  Client version 14; the broker answers an older session InvalidRequest (39).  Namespace DDL needs
+    // ADMIN ON CLUSTER (else 45).  Redirect / NotLeader retries behave exactly like catalog DDL.
+    /// The DDL itself: `kind` Create (fields not in `presentMask` take the broker's current defaults) or SetLimits
+    /// (the full record: pass kNamespaceFullMask).  Completes Ok (value = nsId, aux = new version) or BrokerError
+    /// (errorCode, payload = detail).
+    OpResult namespaceDdl(rune::protocol::client::NamespaceDdlKind kind, std::string_view name,
+                          const std::array<uint8_t, rune::protocol::client::kNamespacePresentMaskBytes>& presentMask,
+                          const rune::protocol::NamespaceLimits& limits, const DdlOptions& ddl,
+                          CompletionTarget target, Token token);
+    /// One page of namespaces with nsId > afterNsId (at most `max`; the broker caps it): completes Ok with the raw
+    /// ListNamespacesResponse frame as payload (decode with rune::protocol::client::ListNamespacesResponse::decode;
+    /// reserve 64 KiB), or BrokerError.  Only the session's own namespace unless it is a cluster admin.
+    OpResult listNamespaces(uint32_t afterNsId, uint16_t max, CompletionTarget target, Token token);
+
+    /// Blocking forms (any thread but the runner).  A broker refusal is the error (DdlResult: errorCode +
+    /// detail); a transport failure (Timeout / NotConnected / SessionLost / Closed) throws as every *AndWait does.
+    template <class T> using NamespaceResult = std::expected<T, DdlResult>;
+    /// Creates `name`; returns its nsId.
+    NamespaceResult<uint32_t> createNamespace(std::string_view name, const NamespaceLimitsPatch& limits = {},
+                                              std::chrono::milliseconds timeout = std::chrono::seconds(30));
+    /// Replaces the namespace's whole limits record with `full`.
+    NamespaceResult<void> setNamespaceLimits(std::string_view name, const rune::protocol::NamespaceLimits& full,
+                                             std::chrono::milliseconds timeout = std::chrono::seconds(30));
+    /// Every namespace this session may see, in nsId order (pages internally).
+    NamespaceResult<std::vector<rune::protocol::client::NamespaceInfo>>
+    listNamespaces(std::chrono::milliseconds timeout = std::chrono::seconds(30));
+
     /// Topics successfully defined through this Client (Task 9 CLI), in
     /// definition order.  Duty-owned registry, read through a ListTopics op.
     [[nodiscard]] std::vector<std::pair<std::string, int32_t>>
@@ -1285,11 +1321,12 @@ private:
         uint32_t             requestLo = 0;  // the generated requestId's lo (0 = an explicit requestId)
         DdlRetry             retry{};
     };
-    /// The DDL ops (the seven that carry the DDL extension).
+    /// The DDL ops (the ones that carry the DDL extension, plus the bootstrap).
     [[nodiscard]] static constexpr bool isDdlOp(OpKind op) noexcept {
         return op == OpKind::DefineTopic || op == OpKind::AlterTopic || op == OpKind::CreateView ||
                op == OpKind::DropTopic || op == OpKind::DropView || op == OpKind::AlterView ||
-               op == OpKind::AlterTopicConfig || op == OpKind::SecurityDdl || op == OpKind::SecurityBootstrap;
+               op == OpKind::AlterTopicConfig || op == OpKind::SecurityDdl || op == OpKind::SecurityBootstrap ||
+               op == OpKind::NamespaceDdl;
     }
     /// Task 22 fix round 1 (C1): the ops answered by a Redirect / NotLeader and so
     /// re-sent on the named node's session within the retry budget: the DDLs and

@@ -46,7 +46,7 @@ TEST(SecurityStatementsRegression, PasswordsAreRedactedInTheStatementSentRegress
 TEST(SecurityStatementsRegression, BadStatementsAreLocatedErrors) {
     struct Case { const char* src; const char* contains; } cases[] = {
         {"ALTER USER ws1 DROP PASSWORD 3;", "password index is 1 (oldest) or 2"},
-        {"GRANT READ ON CLUSTERS TO USER u;", "expected 'cluster', 'topic', 'view', 'group' or 'transactional_id'"},
+        {"GRANT READ ON CLUSTERS TO USER u;", "expected 'cluster', 'topic', 'view', 'group', 'transactional_id' or 'namespace'"},
         {"GRANT FLY ON TOPIC t TO USER u;", "expected an operation"},
         {"CREATE USER ws1 WITH PASSWORD '';", "password must not be empty"},
         {"GRANT READ ON TOPIC t TO u;", "expected 'user' or 'role'"},
@@ -363,9 +363,9 @@ TEST(SecurityStatementTextRegression, MatchesTheClientRedactionForEveryStatement
     EXPECT_EQ(sec::securityStatementText(0, "u", 0, 0, 0, 0, 0, 0, 0, 0, "", ""), "");
     EXPECT_EQ(sec::securityStatementText(10, "u", 0, 0, 0, 0, 0, 0, 0, 0, "", ""), "");
     EXPECT_EQ(sec::securityStatementText(2, "u", 5, 0, 0, 0, 0, 0, 0, 0, "", ""), "");
-    EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 7, 1, 0, "t", ""), "");
+    EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 8, 1, 0, "t", ""), "");
     EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 2, 0, 1, 0, "t", ""), "");
-    EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 0, 5, 0, "t", ""), "");
+    EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 0, 6, 0, "t", ""), "");
     EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 0, 1, 2, "t", ""), "");
 }
 
