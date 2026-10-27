@@ -1321,6 +1321,9 @@ public:
     /// `errorCode`; a transactional producer goes FatalError(BrokerError, errorCode): every pending op completes
     /// with it and no coordinator request is ever sent or re-sent.  Duty thread.
     void onSessionRevoked(uint16_t errorCode) noexcept;
+    /// #291: the transaction coordinator's node session was Rejected: a transactional producer with a coordinator
+    /// request live ends FatalError with `errorCode` (an idle one meets the same refusal on its next request).
+    void onCoordinatorRejected(uint16_t errorCode) noexcept;
     /// beginTransaction() calls the machine refused (outside Ready): counted, no side effect.
     [[nodiscard]] uint64_t txnRefusedBegins() const noexcept { return txnRefusedBegins_; }
     /// FD2 duty re-check (Task 6): void records that reached the duty side while the machine was not InTransaction
@@ -1856,6 +1859,9 @@ private:
     std::array<TxnOp, kMaxTxnFlushes>   txnFlushes_{};
     uint8_t                             txnFlushN_        = 0;
     uint64_t                            txnRefusedBegins_ = 0;
+    /// #367: a partition leader answered 17 / 18 to a transactional batch: the producer is fenced.  Set while a batch
+    /// is being failed (enterFatal_ is not re-entrant there); the next duty pass (txnStepCold_) enters FatalError.
+    std::optional<uint16_t>             txnFencedPending_;
     [[nodiscard]] bool transactional_() const noexcept { return !cfg_.transactionalId.empty(); }
     [[nodiscard]] int64_t txnOpTimeoutNs_() const noexcept {
         return (cfg_.transactionOpTimeoutMs > 0 ? cfg_.transactionOpTimeoutMs : 1) * 1'000'000LL;
@@ -1863,7 +1869,7 @@ private:
     [[nodiscard]] bool txnQuiet_() const noexcept {
         const std::size_t i = txn_.index();
         return txnFlushN_ == 0 && i != kInitializingIdx && i != kCommittingIdx && i != kAbortingIdx &&
-               txnAddQueue_.empty() && offsetsOp_.index() == 0;
+               txnAddQueue_.empty() && offsetsOp_.index() == 0 && !txnFencedPending_;
     }
     // ---- Phase 2b F Task 7: sendOffsetsToTransaction (ProducerTxn.cpp; duty thread only) ----
     /// The copy of the call's offsets + group id the op runs from (the caller's span / the Thread-mode ring payload

@@ -56,6 +56,7 @@
 #include <rune/client/TypedTopic.h>
 #include <rune/client/Completion.h>
 #include <rune/client/Completions.h>
+#include <rune/client/detail/CoordRoute.h>
 #include <rune/client/detail/OpTarget.h>
 #include <rune/client/detail/StatusRing.h>
 #include <rune/client/DutyView.h>
@@ -664,8 +665,12 @@ public:
     [[nodiscard]] std::size_t testSessionCount() const noexcept { return agent_.sessionCount(); }
     /// D4: the coordinator route (empty = the seed), its session index, and how
     /// many coordinator moves / fallbacks were followed (duty thread / owner).
-    [[nodiscard]] const std::string& testCoordinatorChannel() const noexcept { return coordinatorChannel_; }
-    [[nodiscard]] uint32_t testCoordinatorSessionIndex() const noexcept { return coordIdx_; }
+    [[nodiscard]] const std::string& testCoordinatorChannel() const noexcept {
+        static const std::string kNone;   // the seed (empty, as before)
+        const auto* rm = std::get_if<detail::CoordRemote>(&coordRoute_);
+        return rm != nullptr ? rm->channel : kNone;
+    }
+    [[nodiscard]] uint32_t testCoordinatorSessionIndex() const noexcept { return coordIdx(); }
     [[nodiscard]] uint64_t testCoordinatorRedirects() const noexcept { return coordinatorRedirects_; }
     [[nodiscard]] uint64_t testCoordinatorFallbacks() const noexcept { return coordinatorFallbacks_; }
     /// DR client bug 1 (duty thread / after close): seed failovers started (each a
@@ -1460,26 +1465,22 @@ private:
     void syncCoordinatorSession_() noexcept;
     /// D4: the coordinator session's broker id (0 while not connected / known).
     [[nodiscard]] int64_t coordSessionId_() const noexcept {
-        return agent_.sessionMachineAt(coordIdx_).sessionId();
+        return agent_.sessionMachineAt(coordIdx()).sessionId();
     }
     // ---- D4 coordinator route (duty thread only) ----------------------------
     // Kafka's coordinator connection: empty = the seed (byte-identical to the
     // pre-D4 client until a NotCoordinator answer names another node).
-    std::string coordinatorChannel_;
-    uint32_t    coordIdx_ = 0;          // its agent session index (0 = the seed)
-    uint64_t    coordFailBase_ = 0;     // its connectFailures() when it became the coordinator
-    // Phase 2b F Task 11: the duty-clock time the coordinator session (coordIdx_ != 0) was first seen NOT Connected
-    // (0 = it is up / just moved).  A coordinator that stays down past kCoordDownFallbackNs is given up like an
-    // exhausted connect budget (back to the seed, which names the CURRENT coordinator): a crashed coordinator
-    // node's session otherwise retries for minutes and every txn / group op waits on it.
-    int64_t     coordDownSinceNs_ = 0;
+    detail::CoordRoute coordRoute_;   // #362: CoordSeed, or CoordRemote{session index, channel, failBase, downSince}
+    [[nodiscard]] uint32_t coordIdx() const noexcept { return detail::coordIdxOf(coordRoute_); }
+    // A coordinator that stays down past kCoordDownFallbackNs is given up like an exhausted connect budget (back to
+    // the seed, which names the CURRENT coordinator): a crashed coordinator node's session otherwise retries for
+    // minutes and every txn / group op waits on it.
     static constexpr int64_t kCoordDownFallbackNs = 5'000'000'000LL;
     uint64_t    coordinatorRedirects_ = 0;   // coordinator moves followed
     uint64_t    coordinatorFallbacks_ = 0;   // coordinator sessions given up (back to the seed)
     // r2 LOW-3: a coordinator channel whose session was Rejected / Closed, and
     // the metadataResponses_ count then (re-followed only after fresh metadata).
-    std::string coordRejectedChannel_;
-    int         coordRejectedMeta_ = 0;
+    std::optional<detail::RejectedCoord> coordRejected_;
     // The last coordinator-session tuple the group hub was told about.
     uint32_t              lastCoordIdx_     = 0;
     session::SessionState lastCoordState_   = session::SessionState::Disconnected;
@@ -1493,7 +1494,7 @@ private:
                                                                                 std::size_t len) noexcept;
     [[nodiscard]] static int64_t coordSessionIdTrampoline_(void* ctx) noexcept;
     /// F14: NotCoordinator -> send a MetadataRequest (duty thread).
-    static void rediscoverTrampoline_(void* ctx) noexcept;
+    [[nodiscard]] static bool rediscoverTrampoline_(void* ctx) noexcept;
 
     // ---- F8c C3: control ops (duty-thread owned pending table) --------------
     /// `secret` (review B I4): bytes carried to the duty thread AFTER the wire frame in the same record, handed to the

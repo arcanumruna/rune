@@ -1513,6 +1513,7 @@ if(BUILD_TESTING)
         tests/detail/Crc32cPatchTest.cpp
         tests/detail/Crc32cFastTest.cpp
         tests/producer/ProduceFrameBuilderTest.cpp
+        tests/detail/CoordRouteTest.cpp
     )
     target_include_directories(rune_pure_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include

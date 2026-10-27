@@ -333,6 +333,59 @@ TEST(ClientAuthErrorsRegression, ARevokedLeaderNodeSessionFailsItsRequestsSessio
     EXPECT_TRUE(viaSeed.ok()) << viaSeed.describe();
 }
 
+// #291: a TRANSACTIONAL producer whose batches wait on a leader node session that goes Rejected fails them at once
+// (the Review-B path reaches transactional producers too) and its transaction is abortable.
+TEST(ClientAuthErrorsRegression, ATransactionalProducerWithBatchesOnARejectedLeaderNodeSessionFailsAtOnceRegression) {
+    TwoNodeRig r(3858);
+    r.gw.initPidReply = true;
+    r.gw.replyTxn     = true;
+    ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+    test_support::TestCq cq(r.client);
+    auto conn = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.connect(q, t); });
+    ASSERT_TRUE(r.drive([&] { return conn.ready(); }));
+    ASSERT_TRUE(conn.ok()) << conn.describe();
+    ASSERT_TRUE(r.drive([&] { return r.client.testLeaderFor(1, 0) == 1; })) << "metadata names node 1 as p0's leader";
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::All; pcfg.lingerUs = 60'000'000; pcfg.batchBytes = 64 * 1024;
+    pcfg.maxInFlight = 8; pcfg.produceTimeoutMs = 60'000; pcfg.deliveryTimeoutMs = 120'000;
+    pcfg.transactionalId = "tx-leader-rejected"; pcfg.transactionOpTimeoutMs = 30'000;
+    rc::Producer p = r.client.producer(pcfg);
+    auto init = cq.issue([&](rc::Completions& q, rc::Token t) { return p.initTransactions(q, t); });
+    ASSERT_TRUE(r.drive([&] { return init.ready(); }));
+    ASSERT_TRUE(init.ok()) << init.describe();
+    r.gw.replyAcks = false;                          // node-1 batches stay in flight
+    p.beginTransaction();
+    const auto topic = r.client.topic("t");
+    const std::vector<uint8_t> val(16, 0x5C);
+    std::vector<test_support::PendingOp> sends;
+    for (int i = 0; i < 2; ++i) {
+        sends.push_back(cq.send(p, topic, TwoNodeRig::keyFor(0), val));
+        ASSERT_TRUE(sends.back().accepted()) << "send " << i << " result " << static_cast<int>(sends.back().sendResult());
+        p.flush();
+        r.passes(30);
+    }
+    ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() >= 1; })) << "a txn batch in flight on node 1";
+    for (const auto& pr : r.gw.produced) EXPECT_EQ(pr.endpoint, r.n1);
+    r.gw.subscribeLeader[0] = r.n1;                  // the seed redirects the Subscribe to node 1
+    rc::Subscription sub = r.client.subscribe(topic, 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty() && sub.subscriptionId() != 0; }));
+    ASSERT_EQ(r.gw.subscribed.back().endpoint, r.n1);
+    const int64_t node1Sid = r.gw.subscribed.back().sessionId;
+    ASSERT_NE(node1Sid, r.gw.authSessionIds.front()) << "node 1 has its own session";
+
+    r.gw.revokeSession(node1Sid, r.n1);
+    r.passes(50);
+    for (auto& s : sends) {
+        ASSERT_TRUE(s.ready()) << "a txn batch was held behind a Rejected session";
+        EXPECT_EQ(s.outcome().c.status, rc::OpStatus::BrokerError);
+        EXPECT_EQ(s.outcome().c.errorCode, 46);
+    }
+    EXPECT_EQ(p.state(), rc::TxnState::AbortableError);
+    auto commit = cq.issue([&](rc::Completions& q, rc::Token t) { return p.commitTransaction(q, t); });
+    ASSERT_TRUE(r.drive([&] { return commit.ready(); }));
+    EXPECT_FALSE(commit.ok());
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
 TEST(ClientAuthErrorsRegression, ALeaderNodeLoginRefusedFailsItsRequestsAuthenticationFailedButNotTheClientRegression) {
     TwoNodeRig r(3762);
     r.gw.rejectLoginsAt.insert(r.n1);                // node 1 refuses every login (a halted broker, D28)
@@ -527,6 +580,40 @@ TEST(ClientAuthErrorsRegression, AMemberWhoseCoordinatorNodeRefusesItsLoginEndsA
     EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker) << static_cast<int>(gc.failReason());
     EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2));
     EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+// #291: the transaction COORDINATOR is on a node whose login is refused.  A transactional producer waiting on it
+// ends FatalError at once with the refusal, not at its op deadline.
+TEST(ClientAuthErrorsRegression, ATransactionalProducerWhoseCoordinatorNodeRefusesItsLoginEndsAtOnceAdversarialRegression) {
+    TwoNodeRig r(3860);
+    r.gw.rejectLoginsAt.insert(r.n1);
+    r.gw.coordinatorEndpoint   = r.n1;
+    r.gw.coordinatorRedirectTo = r.node1.substr(r.node1.find("endpoint=") + 9);
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::All;
+    pcfg.transactionalId = "tx-coord-rejected"; pcfg.transactionOpTimeoutMs = 30'000;
+    rc::Producer p = r.client.producer(pcfg);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto init = cq.issue([&](rc::Completions& q, rc::Token t) { return p.initTransactions(q, t); });
+    ASSERT_TRUE(r.drive([&] { return init.ready(); })) << "InitProducerId waited on a Rejected coordinator session";
+    EXPECT_EQ(init.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(init.outcome().c.errorCode, 44);
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2));
+    EXPECT_EQ(p.state(), rc::TxnState::FatalError);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+    // A plain producer on the same client still delivers via the seed.  (The fake fences every InitProducerId, plain
+    // ones too, to node 1: drop the fence, or the plain producer's own id request would bounce off it.)
+    r.gw.coordinatorEndpoint = -1;
+    rc::ProducerConfig plain; plain.acks = rc::Acks::Leader; plain.lingerUs = 0;
+    rc::Producer pp = r.client.producer(plain);
+    const auto topic = r.client.topic("t");
+    const std::vector<uint8_t> val(16, 0x5C);
+    auto viaSeed = cq.send(pp, topic, TwoNodeRig::keyFor(1), val);
+    ASSERT_TRUE(viaSeed.accepted());
+    pp.flush();
+    ASSERT_TRUE(r.drive([&] { return viaSeed.ready(); })) << "plainInit " << r.gw.plainInitPids << " notCoord " << r.gw.notCoordinatorAnswers << " initPids " << r.gw.initPids << " produced " << r.gw.produced.size();
+    EXPECT_TRUE(viaSeed.ok()) << viaSeed.describe();
 }
 
 // Review B I5: against a Required broker with no security admin yet, a credential-less client's session is Anonymous

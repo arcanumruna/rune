@@ -79,9 +79,10 @@ struct CoordinatorSink {
     Offer (*offer)(void* ctx, const uint8_t* buf, std::size_t len) noexcept = nullptr;
     int64_t (*sessionId)(void* ctx) noexcept = nullptr;   // 0 = not connected
     void* ctx = nullptr;
-    /// NotCoordinator was answered: ask for a fresh cluster view (the Client sends a MetadataRequest).  Called by
-    /// the link at most once per coordinator generation (until onCoordinatorMoved), on the duty thread.  May be null.
-    void (*rediscover)(void* ctx) noexcept = nullptr;
+    /// NotCoordinator was answered: ask for a fresh cluster view (the Client sends a MetadataRequest).  Returns true
+    /// when the request was submitted; false (refused: ring full / no Connected session) and the link asks again on its
+    /// next pump.  Called on the duty thread.  May be null (treated as asked).
+    bool (*rediscover)(void* ctx) noexcept = nullptr;
 };
 
 }  // namespace rune::client::producer

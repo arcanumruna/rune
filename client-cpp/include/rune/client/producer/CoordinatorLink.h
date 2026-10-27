@@ -115,6 +115,7 @@ public:
 
 private:
     int offerIfDue_(Slot& s, int64_t nowNs) noexcept;
+    void askRediscover_() noexcept;   // #351: once per generation; a refused ask stays due
     bool offer_(Slot& s) noexcept;
 
     std::array<Slot, kMaxCoordRequests> slots_{};
@@ -123,7 +124,7 @@ private:
     uint32_t        live_ = 0;   // slots not Free (Building included)
     uint64_t        scans_ = 0;
     uint64_t        gen_ = 0;
-    uint64_t        askedGen_ = ~uint64_t{0};   // the generation a re-discovery was last requested for
+    uint64_t        askedGen_ = ~uint64_t{0};   // the generation a re-discovery was last SUBMITTED for (#351)
     CoordinatorSink sink_;
 };
 

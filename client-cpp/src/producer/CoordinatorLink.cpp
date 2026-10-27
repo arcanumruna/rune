@@ -14,6 +14,7 @@ namespace rpc = rune::protocol::client;
 namespace {
 constexpr int16_t kOk                     = 0;
 constexpr int16_t kNotCoordinator         = static_cast<int16_t>(rpc::ErrorCode::NotCoordinator);
+constexpr int16_t kNotLeader             = static_cast<int16_t>(rpc::ErrorCode::NotLeader);
 constexpr int16_t kInvalidProducerEpoch   = static_cast<int16_t>(rpc::ErrorCode::InvalidProducerEpoch);
 constexpr int16_t kProducerFenced         = static_cast<int16_t>(rpc::ErrorCode::ProducerFenced);
 constexpr int16_t kInvalidTxnState        = static_cast<int16_t>(rpc::ErrorCode::InvalidTxnState);
@@ -32,6 +33,9 @@ Verdict CoordinatorLink::classify(ReqKind kind, int16_t ec) noexcept {
     if (ec == kProducerFenced || ec == kInvalidProducerEpoch) return Verdict::Fenced;
     // The broker could not decode the request: re-sending the same bytes fails the same way.
     if (ec == kInvalidRequest) return Verdict::Reject;
+    // #503: the coordinator has not applied this topic's placement yet (PR 501): transient, retried with backoff
+    // until the request's deadline (Kafka: NOT_LEADER / UNKNOWN_TOPIC_OR_PARTITION are retriable).
+    if (ec == kNotLeader && (kind == ReqKind::AddPartitions || kind == ReqKind::TxnOffsetCommit)) return Verdict::Retry;
     // Authentication (44..47): a login or a grant is an admin's act - never retried.  InitProducerId and
     // EndTxn cannot go on without it (fatal); the other legs fail only the transaction (abortable).
     if (ec >= kAuthenticationFailed && ec <= kPasswordChangeRequired) {
@@ -111,8 +115,17 @@ bool CoordinatorLink::offer_(Slot& s) noexcept {
 int CoordinatorLink::offerIfDue_(Slot& s, int64_t nowNs) noexcept {
     if (std::holds_alternative<Unsent>(s.state)) return offer_(s) ? 1 : 0;
     if (const auto* b = std::get_if<Backoff>(&s.state)) return (nowNs >= b->untilNs && offer_(s)) ? 1 : 0;
-    if (const auto* a = std::get_if<AwaitCoordinator>(&s.state)) return (a->gen != gen_ && offer_(s)) ? 1 : 0;
+    if (const auto* a = std::get_if<AwaitCoordinator>(&s.state)) {
+        if (a->gen != gen_) return offer_(s) ? 1 : 0;
+        askRediscover_();   // #351: a refused ask is retried each pass until it is submitted
+        return 0;
+    }
     return 0;   // InFlight: waits for its answer (or onSessionChanged / its deadline)
+}
+
+void CoordinatorLink::askRediscover_() noexcept {
+    if (askedGen_ == gen_) return;   // F14: once per generation, however many requests wait
+    if (sink_.rediscover == nullptr || sink_.rediscover(sink_.ctx)) askedGen_ = gen_;
 }
 
 void CoordinatorLink::onSessionChanged() noexcept {
@@ -139,10 +152,7 @@ CoordinatorLink::Slot* CoordinatorLink::onAnswer(const CoordAnswer& a, int64_t n
     case Verdict::Rediscover:
         if (!std::holds_alternative<InFlight>(s.state)) return nullptr;
         s.state = AwaitCoordinator{gen_};
-        if (askedGen_ != gen_) {   // F14: ask once per generation, however many requests wait
-            askedGen_ = gen_;
-            if (sink_.rediscover != nullptr) sink_.rediscover(sink_.ctx);
-        }
+        askRediscover_();
         return nullptr;
     default:
         return &s;

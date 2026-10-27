@@ -273,6 +273,28 @@ TEST(CoordinatorLink, VerdictTableFollowsFD6) {
     for (int16_t auth = 44; auth <= 47; ++auth) EXPECT_NE(c(ReqKind::AddPartitions, auth), V::Retry) << auth;
 }
 
+// #503: the gateway answers NotLeader for a topic id that is placed but not yet applied on the coordinator
+// (PR 501): transient, so AddPartitions / TxnOffsetCommit retry with backoff instead of aborting the transaction.
+TEST(CoordinatorLinkRegression, NotLeaderOnAddPartitionsAndTxnOffsetCommitIsRetriedRegression) {
+    constexpr int16_t kNotLeader = static_cast<int16_t>(rpc::ErrorCode::NotLeader);
+    EXPECT_EQ(CoordinatorLink::classify(ReqKind::AddPartitions, kNotLeader), Verdict::Retry);
+    EXPECT_EQ(CoordinatorLink::classify(ReqKind::TxnOffsetCommit, kNotLeader), Verdict::Retry);
+    EXPECT_EQ(CoordinatorLink::classify(ReqKind::AddOffsets, kNotLeader), Verdict::Abortable)
+        << "a group id: no topic placement race";
+    EXPECT_EQ(CoordinatorLink::classify(ReqKind::InitProducerId, kNotLeader), Verdict::Fatal);
+    EXPECT_EQ(CoordinatorLink::classify(ReqKind::EndTxn, kNotLeader), Verdict::Retry);
+
+    FakeCoordinator fake;
+    CoordinatorLink link(0, fake.sink());
+    CoordinatorLink::Slot* s = send(link, ReqKind::AddPartitions);
+    ASSERT_NE(s, nullptr);
+    ASSERT_EQ(pumpNoExpiry(link, 1), 1);
+    const auto f = FakeCoordinator::answer(ReqKind::AddPartitions, s->corrId, kNotLeader);
+    EXPECT_EQ(link.onAnswer(asAnswer(f, ReqKind::AddPartitions, s->corrId, kNotLeader), 2), nullptr)
+        << "retried in place, not handed to the caller";
+    EXPECT_EQ(pumpNoExpiry(link, 2 + CoordinatorLink::backoffNs(1)), 1) << "offered again after the backoff";
+}
+
 TEST(CoordinatorLink, NonRetriableAnswersAreHandedBackAndLateOnesIgnored) {
     FakeCoordinator fake;
     CoordinatorLink link(0, fake.sink());
@@ -557,4 +579,32 @@ TEST(CoordinatorLinkRegression, NotCoordinatorAsksForRediscoveryOncePerGeneratio
     ASSERT_EQ(pumpNoExpiry(link, 4), 2);
     EXPECT_EQ(link.onAnswer(asAnswer(fa, ReqKind::EndTxn, a->corrId, kNotCoord), 5), nullptr);
     EXPECT_EQ(fake.rediscovers, 2) << "the next generation asks again";
+}
+
+// #351: a refused re-discovery ask (command ring full / no Connected session) was recorded as asked, so every request
+// of that generation waited for a metadata answer nobody requested.  A refused ask stays due and is re-asked.
+TEST(CoordinatorLinkRegression, ARefusedRediscoveryIsAskedAgainOnTheNextPumpRegression) {
+    FakeCoordinator fake;
+    fake.refuseRediscovers = 2;
+    CoordinatorLink link(0, fake.sink());
+    CoordinatorLink::Slot* a = send(link, ReqKind::EndTxn);
+    CoordinatorLink::Slot* b = send(link, ReqKind::AddPartitions);
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    ASSERT_EQ(pumpNoExpiry(link, 1), 2);
+    const auto fa = FakeCoordinator::answer(ReqKind::EndTxn, a->corrId, kNotCoord);
+    const auto fb = FakeCoordinator::answer(ReqKind::AddPartitions, b->corrId, kNotCoord);
+    EXPECT_EQ(link.onAnswer(asAnswer(fa, ReqKind::EndTxn, a->corrId, kNotCoord), 2), nullptr);
+    EXPECT_EQ(fake.refusedRediscovers, 1);
+    EXPECT_EQ(fake.rediscovers, 0);
+    EXPECT_EQ(link.onAnswer(asAnswer(fb, ReqKind::AddPartitions, b->corrId, kNotCoord), 3), nullptr);
+    EXPECT_EQ(fake.refusedRediscovers, 2) << "a refused ask is not 'asked': the next NotCoordinator asks again";
+    EXPECT_EQ(fake.rediscovers, 0);
+    EXPECT_EQ(pumpNoExpiry(link, 4), 0) << "nothing is offered: same generation";
+    EXPECT_EQ(fake.rediscovers, 1) << "the pump re-asks a refused re-discovery";
+    pumpNoExpiry(link, 5);
+    pumpNoExpiry(link, 6);
+    EXPECT_EQ(fake.rediscovers, 1) << "once submitted, never again this generation";
+    link.onCoordinatorMoved();
+    ASSERT_EQ(pumpNoExpiry(link, 7), 2) << "both re-send after the move";
 }

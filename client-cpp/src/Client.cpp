@@ -280,8 +280,8 @@ Client::Client(ClientConfig cfg)
     // path (unchanged) while the coordinator is the seed, else that node's own
     // session (re-stamped with its id; held = refused while it connects).
     coordSendFn_ = [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
-        if (coordIdx_ == 0) return agent_.submitSend(fb, fl);
-        return agent_.offerToCoordinator(coordIdx_, fb, fl) != transport::AeronTransport::OfferResult::Retry;
+        if (coordIdx() == 0) return agent_.submitSend(fb, fl);
+        return agent_.offerToCoordinator(coordIdx(), fb, fl) != transport::AeronTransport::OfferResult::Retry;
     };
     {
         group::GroupConsumerHub::FetchRouter fr;
@@ -2229,7 +2229,7 @@ void Client::onSeedConnected_(int64_t sessionId, int32_t brokerVersion) {
     // M3 (Phase 2c): the hub judges the COORDINATOR's session.  A seed that reconnected onto another (older)
     // node while the coordinator lives on a session of its own must not overwrite the coordinator's version
     // (syncCoordinatorSession_ keeps that one current).
-    if (coordIdx_ == 0) groupConsumerHub_.setBrokerVersion(brokerVersion);
+    if (coordIdx() == 0) groupConsumerHub_.setBrokerVersion(brokerVersion);
 
     // CG-5: Trigger group consumers to send JoinGroup on connect — only
     // when the SEED (the coordinator's session) connected: a leader
@@ -2240,7 +2240,7 @@ void Client::onSeedConnected_(int64_t sessionId, int32_t brokerVersion) {
     // session of its own joins its members on ITS connect
     // (syncCoordinatorSession_).
     if (!groupConsumerHub_.empty()) {
-        if (coordIdx_ == 0) groupConsumerHub_.onConnected(sessionId, coordSendFn_);
+        if (coordIdx() == 0) groupConsumerHub_.onConnected(sessionId, coordSendFn_);
         // A (leader or seed) session (re)connected: partitions waiting
         // for it — or whose subscription died with its old session —
         // subscribe now.
@@ -2929,7 +2929,7 @@ int Client::dutyCycle(int64_t nowNs) {
         if (!groupConsumerHub_.empty()) {
             // D4: a coordinator session that gave up falls back to the seed
             // BEFORE the session watch below could revive it.
-            if (coordIdx_ != 0) [[unlikely]] syncCoordinatorSession_();
+            if (coordIdx() != 0) [[unlikely]] syncCoordinatorSession_();
             const int64_t gsid = coordSessionId_();  // the coordinator's session (the seed's by default)
             work += groupConsumerHub_.flushRequestedCommits(gsid);
             if (groupConsumerHub_.pendingLeaves() != 0) work += groupConsumerHub_.retryPendingLeaves(gsid);
@@ -5105,9 +5105,9 @@ detail::SendResult Client::directSendTrampoline_(void* ctx, const uint8_t* buf, 
 
 detail::SendResult Client::coordDirectSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len) {
     auto* self = static_cast<Client*>(ctx);
-    if (self->coordIdx_ == 0) return directSendTrampoline_(ctx, buf, len);  // the seed: unchanged
+    if (self->coordIdx() == 0) return directSendTrampoline_(ctx, buf, len);  // the seed: unchanged
     using R = transport::AeronTransport::OfferResult;
-    switch (self->agent_.offerToCoordinator(self->coordIdx_, buf, len)) {
+    switch (self->agent_.offerToCoordinator(self->coordIdx(), buf, len)) {
     case R::Accepted: return detail::SendResult::Accepted;
     case R::Retry:    return detail::SendResult::Retry;
     case R::Fatal:    break;
@@ -5582,7 +5582,7 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
             // MEDIUM-7: adopted after the seed connected — join now (the
             // connect-time onConnected already ran).
             // D4: on the coordinator session (the seed by default).
-            if (agent_.sessionMachineAt(coordIdx_).state() == session::SessionState::Connected) {
+            if (agent_.sessionMachineAt(coordIdx()).state() == session::SessionState::Connected) {
                 groupConsumerHub_.joinIfConnected(coordSessionId_(), coordSendFn_);
             }
         }
@@ -5954,26 +5954,25 @@ void Client::onCoordinatorRedirect_(const std::string& endpoint) {
     // MAJOR-1: "the seed" means where the seed PHYSICALLY is (its default
     // publication), not its bootstrap identity — a seed a data-op redirect moved
     // to L that hears NotCoordinator{bootstrap} must route to the bootstrap.
-    const std::string& current = coordIdx_ == 0 ? agent_.seedChannel() : coordinatorChannel_;
+    const auto* rm = std::get_if<detail::CoordRemote>(&coordRoute_);
+    const std::string& current = rm == nullptr ? agent_.seedChannel() : rm->channel;
     if (agent::ClientAgent::sameEndpoint(channel, current)) return;
     // r2 LOW-3: a coordinator whose session was Rejected / Closed is not
     // re-followed until fresh metadata arrives (the member waits its join
     // deadline, the txn op its retry) — never a 100 ms move/fallback loop.
-    if (!coordRejectedChannel_.empty()) {
-        if (metadataResponses_ == coordRejectedMeta_ &&
-            agent::ClientAgent::sameEndpoint(channel, coordRejectedChannel_)) {
+    if (coordRejected_) {
+        if (metadataResponses_ == coordRejected_->meta &&
+            agent::ClientAgent::sameEndpoint(channel, coordRejected_->channel)) {
             scheduleMetadataRefresh();
             return;
         }
-        coordRejectedChannel_.clear();
+        coordRejected_.reset();
     }
     ++coordinatorRedirects_;
     // That node's ONE session (lazily opened / re-driven) — 0 = the seed is there.
-    coordIdx_ = agent_.coordinatorSessionIndex(channel, now());
-    if (coordIdx_ == 0) coordinatorChannel_.clear();
-    else                coordinatorChannel_ = channel;
-    coordFailBase_ = agent_.sessionConnectFailuresAt(coordIdx_);
-    coordDownSinceNs_ = 0;
+    const uint32_t idx = agent_.coordinatorSessionIndex(channel, now());
+    if (idx == 0) coordRoute_ = detail::CoordSeed{};
+    else          coordRoute_ = detail::CoordRemote{idx, channel, agent_.sessionConnectFailuresAt(idx), std::nullopt};
     groupConsumerHub_.onCoordinatorMoved();   // members -> Rejoining (there)
     producerHub_.onCoordinatorMoved();        // Phase 2b F: AwaitCoordinator requests re-send
     syncCoordinatorSession_();                // already connected: they join at once
@@ -5981,9 +5980,9 @@ void Client::onCoordinatorRedirect_(const std::string& endpoint) {
 
 // D4: see syncSeedSession_ / onCoordinatorRedirect_.  Duty thread.
 void Client::syncCoordinatorSession_() noexcept {
-    const session::SessionMachine& m = agent_.sessionMachineAt(coordIdx_);
+    const session::SessionMachine& m = agent_.sessionMachineAt(coordIdx());
     const session::SessionState st  = m.state();
-    if (coordIdx_ != 0) [[unlikely]] {
+    if (auto* rm = std::get_if<detail::CoordRemote>(&coordRoute_)) [[unlikely]] {
         // Fallback: the coordinator session gave up (its connect budget is spent
         // — terminal Disconnected / Rejected / Closed — or a failed attempt sent
         // it to Backoff): back to the seed, whose node answers again with the
@@ -5993,41 +5992,37 @@ void Client::syncCoordinatorSession_() noexcept {
         // minutes before any of the exhausted-budget states above - so a session that stays down for
         // kCoordDownFallbackNs is given up too (level-triggered; the seed names the current coordinator, and
         // each fallback is paced by this grace, never a spin).
-        if (st == session::SessionState::Connected) {
-            coordDownSinceNs_ = 0;
-        } else if (coordDownSinceNs_ == 0) {
-            coordDownSinceNs_ = now();
-        }
-        const bool downTooLong = coordDownSinceNs_ != 0 && now() - coordDownSinceNs_ > kCoordDownFallbackNs;
+        const int64_t nowNs = now();
+        const bool downTooLong =
+            detail::coordDownTooLong(*rm, st == session::SessionState::Connected, nowNs, kCoordDownFallbackNs);
         const bool gaveUp = downTooLong ||
                             st == session::SessionState::Disconnected ||
                             st == session::SessionState::Rejected ||
                             st == session::SessionState::Closed ||
                             (st == session::SessionState::Backoff &&
-                             agent_.sessionConnectFailuresAt(coordIdx_) != coordFailBase_);
+                             agent_.sessionConnectFailuresAt(rm->idx) != rm->failBase);
         if (gaveUp) {
             ++coordinatorFallbacks_;
             if (st == session::SessionState::Rejected || st == session::SessionState::Closed) {
-                coordRejectedChannel_ = coordinatorChannel_;   // r2 LOW-3
-                coordRejectedMeta_    = metadataResponses_;
+                coordRejected_ = detail::RejectedCoord{rm->channel, metadataResponses_};   // r2 LOW-3
             }
             // #290 (PR #513 review): a Rejected coordinator session (its user revoked there, its login
             // refused) never carries a join / commit: the members end now with its code, as a fetch homed on a
             // Rejected node session does — never cycling seed -> NotCoordinator -> that node.
-            if (st == session::SessionState::Rejected && m.rejectCode() != 0) [[unlikely]]
+            if (st == session::SessionState::Rejected && m.rejectCode() != 0) [[unlikely]] {
                 groupConsumerHub_.onCoordinatorRejected(m.rejectCode());
-            coordinatorChannel_.clear();
-            coordIdx_ = 0;
-            coordDownSinceNs_ = 0;
+                producerHub_.onCoordinatorRejected(m.rejectCode());   // #291
+            }
+            coordRoute_ = detail::CoordSeed{};   // rm dangles from here
             groupConsumerHub_.onCoordinatorMoved();
             producerHub_.onCoordinatorMoved();
-            syncCoordinatorSession_();  // once: the seed's tuple (coordIdx_ == 0 now)
+            syncCoordinatorSession_();  // once: the seed's tuple (the seed now)
             return;
         }
     }
     const int64_t sid     = m.sessionId();
     const int64_t episode = m.correlationId();
-    if (coordIdx_ == lastCoordIdx_ && st == lastCoordState_ && sid == lastCoordSid_ &&
+    if (coordIdx() == lastCoordIdx_ && st == lastCoordState_ && sid == lastCoordSid_ &&
         episode == lastCoordEpisode_) [[likely]] {
         return;
     }
@@ -6036,12 +6031,12 @@ void Client::syncCoordinatorSession_() noexcept {
     // Every (re)establishment counts (the episode changes, or the session was not Connected before): a broker
     // that keeps the session id on a resume (auth Required: resumeAuthenticated_) is still a new session for
     // the in-flight requests, which were lost with the old connection.
-    if (connected && sid != 0 && (coordIdx_ != lastCoordIdx_ || sid != lastCoordSid_ || episode != lastCoordEpisode_ ||
+    if (connected && sid != 0 && (coordIdx() != lastCoordIdx_ || sid != lastCoordSid_ || episode != lastCoordEpisode_ ||
                        lastCoordState_ != session::SessionState::Connected)) {
         producerHub_.onCoordinatorSessionChanged();
     }
     groupConsumerHub_.setSessionConnected(connected, sid, episode);
-    lastCoordIdx_     = coordIdx_;
+    lastCoordIdx_     = coordIdx();
     lastCoordState_   = st;
     lastCoordSid_     = sid;
     lastCoordEpisode_ = episode;
@@ -6049,8 +6044,8 @@ void Client::syncCoordinatorSession_() noexcept {
     // once (the seed's own connect does this in the ConnectResponse handler; a
     // TLS session connects on a later handshake leg — this level check sees it).
     // M3: the coordinator's own version, kept current for consumers created later (joinIfConnected) as well.
-    if (connected && sid != 0) groupConsumerHub_.setBrokerVersion(agent_.sessionBrokerVersion(coordIdx_));
-    if (coordIdx_ != 0 && connected && !groupConsumerHub_.empty()) {
+    if (connected && sid != 0) groupConsumerHub_.setBrokerVersion(agent_.sessionBrokerVersion(coordIdx()));
+    if (coordIdx() != 0 && connected && !groupConsumerHub_.empty()) {
         groupConsumerHub_.onConnected(sid, coordSendFn_);
         (void)groupConsumerHub_.reconcileFetch();
     }
@@ -6060,7 +6055,7 @@ producer::CoordinatorSink::Offer Client::coordOfferTrampoline_(void* ctx, const 
                                                                 std::size_t len) noexcept {
     auto* self = static_cast<Client*>(ctx);
     // The coordinator session (the seed until a NotCoordinator names another node), as the producers' coordinator links route.
-    const auto r = self->coordIdx_ != 0 ? self->agent_.offerToCoordinator(self->coordIdx_, buf, len)
+    const auto r = self->coordIdx() != 0 ? self->agent_.offerToCoordinator(self->coordIdx(), buf, len)
                                         : self->agent_.offerDefault(buf, len);
     switch (r) {
     case transport::AeronTransport::OfferResult::Accepted: return producer::CoordinatorSink::Offer::Accepted;
@@ -6074,11 +6069,12 @@ int64_t Client::coordSessionIdTrampoline_(void* ctx) noexcept {
     return static_cast<Client*>(ctx)->coordSessionId_();
 }
 
-void Client::rediscoverTrampoline_(void* ctx) noexcept {
+bool Client::rediscoverTrampoline_(void* ctx) noexcept {
     // F14: NotCoordinator -> re-discover the coordinator (== the consensus leader today, F15 5.1): ask for a fresh
     // cluster view now.  Not connected: the MetadataRequest sent on the next Connected edge answers it instead.
     // DR client bug 1: through any Connected session (the seed may be the dead one).
-    (void)static_cast<Client*>(ctx)->sendMetadataRequestAnywhere_();
+    // Not submitted: the link asks again on its next pump (#351).
+    return static_cast<Client*>(ctx)->sendMetadataRequestAnywhere_();
 }
 
 // ---------------------------------------------------------------------------
