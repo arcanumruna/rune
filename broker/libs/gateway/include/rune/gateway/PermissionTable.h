@@ -31,8 +31,10 @@ public:
     [[nodiscard]] static PermissionTable denyAll() { return PermissionTable{}; }
     /// Cold.  `effective` = rune::security::effectiveGrants(state, userId); `nsId` = the session's namespace (plan D9:
     /// an object of another namespace gets no bits - unless the grants are root, ADMIN ON CLUSTER, issue #626).
+    /// `nsName` = that namespace's name (plan D11): ADMIN ON NAMESPACE `nsName` is the namespace admin and holds
+    /// CREATE / ALTER / DROP / DESCRIBE on every non-internal topic and view of its own namespace.  Empty: no implication.
     [[nodiscard]] static PermissionTable compile(std::span<const rune::security::GrantSpec> effective, uint32_t nsId,
-                                                 const ObjectIndex&);
+                                                 const ObjectIndex&, std::string_view nsName = {});
     /// The `default` namespace (nsId 0).
     [[nodiscard]] static PermissionTable compile(std::span<const rune::security::GrantSpec> effective, const ObjectIndex& index) {
         return compile(effective, 0, index);
@@ -74,6 +76,7 @@ private:
     bool root_ = false;
     uint32_t nsId_ = 0;
     uint8_t clusterOps_ = 0;
+    uint8_t nsAdminOps_ = 0;                            // D11: the DDL bits a namespace admin holds on own topics / views
     std::array<uint8_t, 5> anyOps_{};                   // #211: op bits granted on ANY resource, per ResourceType
     std::vector<uint8_t> ops_;                          // by object id; capacity persists
     std::vector<rune::security::GrantSpec> grants_;     // retained for onObjectCreated / allowsName

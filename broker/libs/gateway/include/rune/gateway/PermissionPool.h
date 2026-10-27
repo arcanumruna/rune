@@ -94,7 +94,10 @@ public:
     /// The shared table of `grants` (sorted, unique - rune::security::effectiveGrants), compiled against `index` only
     /// when no live entry has that exact set.  Full pool (kMaxTables distinct live sets): a deny-all ref (fail closed).
     /// `nsId`: the session's namespace - part of the key (the same grants in two namespaces are two tables).
-    [[nodiscard]] PermissionRef acquire(std::vector<rune::security::GrantSpec> grants, uint32_t nsId, const ObjectIndex& index);
+    /// `nsName`: that namespace's name, for the namespace-admin implication (PermissionTable::compile, plan D11).  A
+    /// namespace's name never changes, so it is a function of `nsId` and needs no place in the key.
+    [[nodiscard]] PermissionRef acquire(std::vector<rune::security::GrantSpec> grants, uint32_t nsId, const ObjectIndex& index,
+                                        std::string_view nsName = {});
     /// The `default` namespace (nsId 0).
     [[nodiscard]] PermissionRef acquire(std::vector<rune::security::GrantSpec> grants, const ObjectIndex& index) {
         return acquire(std::move(grants), 0, index);

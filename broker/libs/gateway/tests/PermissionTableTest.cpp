@@ -430,3 +430,53 @@ TEST(PermissionTableRegression, AdminOnClusterIsRootRegression) {
     EXPECT_TRUE(t.allows(7, kAll)) << "root covers an object created after login";
     EXPECT_NE(t.writeBits()[0] & (uint64_t{1} << 7), 0u);
 }
+
+// Namespaces plan D11: ADMIN ON NAMESPACE "<own ns>" is the namespace admin.  It holds topic, view and schema DDL
+// (CREATE / ALTER / DROP, and the implied DESCRIBE) on every topic and view of its OWN namespace - existing, created
+// after login and by name - and nothing more: no READ / WRITE, nothing on a foreign namespace's object, nothing on an
+// internal (`__`) object, no CLUSTER op, no group / transactional-id op.  A NAMESPACE grant naming another namespace
+// (or a table compiled without the session's namespace name) implies nothing.
+TEST(PermissionTableRegression, NamespaceAdminHoldsDdlInItsOwnNamespaceRegression) {
+    rg::ObjectIndex idx;
+    idx.onTopic(1, 0, "orders");     // namespace 1 ("alpha")
+    idx.onView(1, 1, "board");
+    idx.onTopic(2, 2, "orders");     // namespace 2: the same local name
+    idx.onTopic(1, 3, "__internal");
+    constexpr uint8_t kDdl = rs::opBit(Operation::Create) | rs::opBit(Operation::Alter) | rs::opBit(Operation::Drop) |
+                             rs::opBit(Operation::Describe);
+    const std::vector<rs::GrantSpec> adm = {g(Operation::Admin, ResourceType::Namespace, PatternKind::Exact, "alpha")};
+    auto t = rg::PermissionTable::compile(adm, 1, idx, "alpha");
+    EXPECT_TRUE(t.allows(0, kDdl)) << "DDL on an own topic";
+    EXPECT_TRUE(t.allows(1, kDdl)) << "DDL on an own view";
+    EXPECT_FALSE(t.allows(0, rs::opBit(Operation::Read))) << "no data access";
+    EXPECT_FALSE(t.allows(0, rs::opBit(Operation::Write)));
+    EXPECT_FALSE(t.allows(2, rs::opBit(Operation::Describe))) << "a foreign namespace's object";
+    EXPECT_FALSE(t.allows(3, rs::opBit(Operation::Describe))) << "an internal object (I6)";
+    for (ResourceType ty : {ResourceType::Topic, ResourceType::View}) {
+        for (Operation op : {Operation::Create, Operation::Alter, Operation::Drop, Operation::Describe}) {
+            EXPECT_TRUE(t.allowsName(ty, "anything", rs::opBit(op))) << static_cast<int>(ty) << "/" << static_cast<int>(op);
+            EXPECT_TRUE(t.hasAnyGrant(ty, op)) << static_cast<int>(ty) << "/" << static_cast<int>(op);
+        }
+        EXPECT_FALSE(t.allowsName(ty, "anything", rs::opBit(Operation::Read)));
+        EXPECT_FALSE(t.allowsName(ty, "__x", rs::opBit(Operation::Create))) << "an internal name (I6)";
+    }
+    EXPECT_FALSE(t.hasAnyGrant(ResourceType::Topic, Operation::Write));
+    EXPECT_FALSE(t.allowsName(ResourceType::Group, "g", rs::opBit(Operation::Describe)));
+    EXPECT_FALSE(t.allowsName(ResourceType::TransactionalId, "x", rs::opBit(Operation::Describe)));
+    EXPECT_FALSE(t.allowsCluster(rs::opBit(Operation::Create))) << "no CLUSTER op";
+    EXPECT_FALSE(t.isRoot());
+    t.onObjectCreated(7, {"later", ResourceType::Topic, 1});
+    EXPECT_TRUE(t.allows(7, kDdl)) << "an own object created after login";
+    t.onObjectCreated(8, {"later", ResourceType::Topic, 2});
+    EXPECT_FALSE(t.allows(8, rs::opBit(Operation::Describe))) << "a foreign object created after login";
+
+    const auto other = rg::PermissionTable::compile(
+        std::vector<rs::GrantSpec>{g(Operation::Admin, ResourceType::Namespace, PatternKind::Exact, "bravo")}, 1, idx, "alpha");
+    EXPECT_FALSE(other.allows(0, rs::opBit(Operation::Describe))) << "ADMIN on another namespace's name";
+    EXPECT_FALSE(other.allowsName(ResourceType::Topic, "x", rs::opBit(Operation::Create)));
+    const auto describeOnly = rg::PermissionTable::compile(
+        std::vector<rs::GrantSpec>{g(Operation::Describe, ResourceType::Namespace, PatternKind::Exact, "alpha")}, 1, idx, "alpha");
+    EXPECT_FALSE(describeOnly.allowsName(ResourceType::Topic, "x", rs::opBit(Operation::Create))) << "DESCRIBE is not admin";
+    const auto unnamed = rg::PermissionTable::compile(adm, 1, idx);
+    EXPECT_FALSE(unnamed.allows(0, rs::opBit(Operation::Describe))) << "no namespace name: nothing implied";
+}

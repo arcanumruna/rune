@@ -30,7 +30,8 @@ uint64_t PermissionPool::hashOf_(std::span<const rsec::GrantSpec> grants, uint32
     return h;
 }
 
-PermissionRef PermissionPool::acquire(std::vector<rsec::GrantSpec> grants, uint32_t nsId, const ObjectIndex& index) {
+PermissionRef PermissionPool::acquire(std::vector<rsec::GrantSpec> grants, uint32_t nsId, const ObjectIndex& index,
+                                     std::string_view nsName) {
     const uint64_t h = hashOf_(grants, nsId);
     for (auto [it, end] = byHash_.equal_range(h); it != end; ++it) {
         Entry& e = *entries_[it->second];
@@ -52,7 +53,7 @@ PermissionRef PermissionPool::acquire(std::vector<rsec::GrantSpec> grants, uint3
         return PermissionRef{};   // deny-all, never pooled (fail closed)
     }
     Entry& e = *entries_[id];
-    e.table = PermissionTable::compile(grants, nsId, index);
+    e.table = PermissionTable::compile(grants, nsId, index, nsName);
     ++compiles_;
     e.key   = std::move(grants);
     e.hash  = h;

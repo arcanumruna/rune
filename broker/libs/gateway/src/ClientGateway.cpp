@@ -8618,7 +8618,10 @@ rune::gateway::PermissionRef ClientGateway::compilePerms_(uint64_t userId, uint3
     // Issue #259: the effective set is computed per principal (O(its grants)); the table is compiled only when no
     // session holds that exact set already.  Namespaces Task 10: the session's namespace is part of the key - a
     // foreign object gets no bits, except for root (ADMIN ON CLUSTER keeps every op in every namespace, #626).
-    return permPool_.acquire(rune::security::effectiveGrants(securityView_->state(), userId), nsId, objectIndex_);
+    // Plan D11: the session's namespace name decides whether ADMIN ON NAMESPACE makes it that namespace's admin.
+    const rune::catalog::NamespaceRecord* ns = namespaces_.registry().byId(nsId);
+    return permPool_.acquire(rune::security::effectiveGrants(securityView_->state(), userId), nsId, objectIndex_,
+                             ns != nullptr ? std::string_view(ns->name) : std::string_view{});
 }
 
 void ClientGateway::syncPermissionTables_()
