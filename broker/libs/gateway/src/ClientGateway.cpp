@@ -8488,6 +8488,10 @@ void ClientGateway::onNamespaceUpserted(const rune::catalog::NamespaceRecord& r)
     using rune::catalog::NsStateTag;
     if (!namespaces_.upsert(r)) return;   // an older record: nothing changed
     const NsStateTag tag = rune::catalog::tagOf(r.state);
+    // Namespaces Phase 2 Task 4: on every node, at the apply of the state change.  Only the node whose transaction
+    // coordinator is loaded holds transactions (others return 0), so this covers the transactions whose sessions live
+    // on other gateways or are already gone.  Idempotent.
+    if (tag != NsStateTag::Active && txnService_ != nullptr) (void)txnService_->abortAllForNamespace(r.nsId, nowNs_);
     nsGateScratch_.clear();
     sessions_.forEach([&](Session& s) {
         // Only sessions past the login's first leg carry a namespace; the login itself sets the gate of the rest.
@@ -9527,6 +9531,8 @@ void ClientGateway::executeLiveActions_(Session& s, const rune::gateway::LiveAct
             sendErrorOn_(s, corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized), d ? std::string_view(d->detail) : std::string_view("not authorized"));
         s.securityReadCorrs.clear();
     }
+    // Task 4: a lost WRITE grant aborts the session's open transactions (they could no longer be ended by it).
+    if (act.endTxns && txnService_ != nullptr) (void)txnService_->abortAllForSession(s.sessionId, nowNs_);
     // Group members: a lost group READ removes the member (its next Heartbeat / Commit / Fetch answers 45); issue #212:
     // a lost READ on a topic a member subscribed to removes that member too (its group rebalances now; the re-join is
     // refused by the join check) - a consumer must not keep an assignment of a topic it may no longer read.
@@ -9581,6 +9587,10 @@ void ClientGateway::revokeSession_(int64_t sid, std::string_view reason, uint16_
     // Issue #212: a revoked session is terminal (never resumed): its group members leave now, so their groups
     // rebalance at once instead of at the members' heartbeat timeout.
     if (groupService_ != nullptr) groupService_->removeSessionMembers(sid, nowNs_);
+    // Namespaces Phase 2 Task 4: for EVERY reason (password change, user drop / disable, namespace suspend / delete /
+    // purge) the session's open transactions abort now (PrepareAbort + ABORT markers), so a read_committed reader's
+    // LSO never waits for the transaction timeout of a producer that can no longer end it.
+    if (txnService_ != nullptr) (void)txnService_->abortAllForSession(sid, nowNs_);
     closeAfterAnswers_(sid);   // issue #119: every 46 is delivered first, even when spilled
 }
 

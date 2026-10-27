@@ -241,6 +241,11 @@ struct TransactionMetadata {
     /// (via OffsetApplyCallback), discarded on ABORT.
     /// Persisted to TransactionLog so a recovered PrepareCommit can re-apply them.
     std::vector<PendingTxnOffset> pendingOffsets;
+
+    /// Namespaces Phase 2 Task 4: the gateway session that last opened / extended this transaction (0 = none known).
+    /// NOT persisted: a coordinator that reloads (failover) has no live session of the old coordinator's node; the
+    /// transaction then ends by its timeout or by abortAllForNamespace.  Set by noteSession().
+    int64_t sessionId{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -513,6 +518,16 @@ public:
     /// exactly the timeout-abort transition (PrepareAbort, markersPending, persisted).  Returns the count.  No
     /// allocation.  (Task 4 calls it on suspend / delete.)
     uint32_t abortAllForNamespace(uint32_t nsId, int64_t nowNs);
+
+    /// Namespaces Phase 2 Task 4: the same internal abort for every Ongoing transaction that session `sessionId`
+    /// opened (noteSession).  Returns the count.  No allocation.  The gateway calls it on every session revoke.
+    uint32_t abortAllForSession(int64_t sessionId, int64_t nowNs);
+
+    /// Records the session that drives `txnId` (the service calls it after a successful AddPartitions / AddOffsets /
+    /// TxnOffsetCommit).  Unknown id: no-op.
+    void noteSession(const TransactionalId& txnId, int64_t sessionId) noexcept {
+        if (auto it = txnMap_.find(txnId); it != txnMap_.end()) it->second.sessionId = sessionId;
+    }
 
     // -----------------------------------------------------------------------
     // pendingMarkerTransactions — B1/B2 resolution API

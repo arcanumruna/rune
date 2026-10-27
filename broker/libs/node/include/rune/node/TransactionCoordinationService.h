@@ -195,6 +195,11 @@ public:
                                   int64_t nowNs, uint8_t* out, size_t outCap,
         const rune::coordination::NsRequestContext& ctx = {}) override;
 
+    /// Namespaces Phase 2 Task 4 (ITxnRequestHandler): abort every Ongoing transaction a revoked session opened / of a
+    /// suspended or deleted namespace.  0 when this node is not the loaded coordinator.
+    uint32_t abortAllForSession(int64_t sessionId, int64_t nowNs) override;
+    uint32_t abortAllForNamespace(uint32_t nsId, int64_t nowNs) override;
+
     /// A control marker this node could not append.  NEVER counts as landed: a
     /// retriable refusal (NotLeader, MinIsrViolation, Internal, ...) is re-dispatched
     /// with a doubling backoff until it lands; a partition that no longer exists

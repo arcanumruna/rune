@@ -571,6 +571,18 @@ uint32_t TransactionCoordinator::abortAllForNamespace(uint32_t nsId, int64_t /*n
     return n;
 }
 
+uint32_t TransactionCoordinator::abortAllForSession(int64_t sessionId, int64_t /*nowNs*/)
+{
+    if (sessionId == 0) return 0;   // 0 = "no session known": never matches
+    uint32_t n = 0;
+    for (auto& [id, meta] : txnMap_) {
+        if (meta.state != TxnState::Ongoing || meta.sessionId != sessionId) continue;
+        beginInternalAbort_(meta);
+        ++n;
+    }
+    return n;
+}
+
 void TransactionCoordinator::markersDispatched(const TransactionalId& txnId)
 {
     auto it = txnMap_.find(txnId);

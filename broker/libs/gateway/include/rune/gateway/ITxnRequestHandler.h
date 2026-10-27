@@ -102,6 +102,13 @@ struct ITxnRequestHandler {
     virtual void onControlMarkerLanded(int32_t /*topicId*/, int32_t /*partition*/,
                                        int64_t /*producerId*/, int32_t /*coordinatorEpoch*/) {}
 
+    // Namespaces Phase 2 Task 4: abort (through the coordinator's internal abort: PrepareAbort, then ABORT markers) every
+    // Ongoing transaction that session `sessionId` opened, resp. every Ongoing transaction of namespace `nsId`.  Called
+    // by the gateway on every session revoke and on a namespace suspend / delete.  Returns the count aborted; 0 when this
+    // node is not the loaded coordinator.  Control thread, cold.  Default (test doubles): nothing to abort.
+    virtual uint32_t abortAllForSession(int64_t /*sessionId*/, int64_t /*nowNs*/) { return 0; }
+    virtual uint32_t abortAllForNamespace(uint32_t /*nsId*/, int64_t /*nowNs*/) { return 0; }
+
     // F15-FU1 (#112, KIP-890 part 1): may a transactional data batch of (producerId,
     // producerEpoch) open a transaction on (topicId, partition)?  Asked by a partition
     // leader for the first such batch of a producer with no open transaction there.

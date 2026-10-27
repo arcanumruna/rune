@@ -1804,6 +1804,14 @@ if(BUILD_TESTING)
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_ns_keyed_stores_tests PROPERTIES TIMEOUT 600)
 
+        # Namespaces Phase 2 Task 4: open transactions abort on suspend, delete and every session revoke (coordinator
+        # unit tests + the REAL client against ONE real broker).
+        add_executable(rune_txn_abort_on_suspend_tests tests/client/TxnAbortOnSuspendRegressionTest.cpp tests/support/AllocWindow.cpp)
+        target_include_directories(rune_txn_abort_on_suspend_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_txn_abort_on_suspend_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_txn_abort_on_suspend_tests PROPERTIES TIMEOUT 600)
+
         # Namespaces Phase 2 Task 3: suspend / resume / delete through the REAL client against ONE real broker.
         add_executable(rune_namespace_suspend_tests tests/client/NamespaceSuspendRegressionTest.cpp)
         target_include_directories(rune_namespace_suspend_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)

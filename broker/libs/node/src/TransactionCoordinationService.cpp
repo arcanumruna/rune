@@ -463,6 +463,21 @@ int16_t TransactionCoordinationService::verifyTxnPartition(int64_t producerId, i
 // ---------------------------------------------------------------------------
 // #358 class: answers and markers wait for the __transaction_state records they depend on to COMMIT.
 // ---------------------------------------------------------------------------
+// Namespaces Phase 2 Task 4: the gateway's revoke / suspend / delete hooks.  Control thread; only a Loaded coordinator
+// holds transactions (an Unloaded one answers 0).  The abort is the coordinator's internal one: PrepareAbort is
+// persisted (here, through the same gate as a timeout abort) and doWork() hands the ABORT markers out.
+uint32_t TransactionCoordinationService::abortAllForSession(int64_t sessionId, int64_t nowNs)
+{
+    if (loadState_ != LoadState::Loaded) return 0;
+    return coordinator_.abortAllForSession(sessionId, nowNs);
+}
+
+uint32_t TransactionCoordinationService::abortAllForNamespace(uint32_t nsId, int64_t nowNs)
+{
+    if (loadState_ != LoadState::Loaded) return 0;
+    return coordinator_.abortAllForNamespace(nsId, nowNs);
+}
+
 size_t TransactionCoordinationService::handleInitProducerId(const uint8_t* buf, size_t len, int64_t nowNs,
                                                             uint8_t* out, size_t outCap,
     const rune::coordination::NsRequestContext& ctx)
@@ -929,6 +944,7 @@ size_t TransactionCoordinationService::handleAddPartitions_(
 
     // Persist before responding (pass the real coordinatorEpoch, not literal 0).
     if (result.ok()) {
+        coordinator_.noteSession(txnIdScratch_, msg.sessionId);   // Task 4: abortAllForSession finds it
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
             (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
@@ -1000,6 +1016,7 @@ size_t TransactionCoordinationService::handleAddOffsets_(
 
     // Persist before responding (pass the real coordinatorEpoch, not literal 0).
     if (result.ok()) {
+        coordinator_.noteSession(txnIdScratch_, msg.sessionId);   // Task 4: abortAllForSession finds it
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
             (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
@@ -1100,6 +1117,7 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit_(
 
     // Persist before responding (pass the real coordinatorEpoch, not literal 0).
     if (result.ok()) {
+        coordinator_.noteSession(txnIdScratch_, msg.sessionId);   // Task 4: abortAllForSession finds it
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
             (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
