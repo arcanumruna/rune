@@ -665,7 +665,7 @@ TEST(AuthEnforcementAdversarialRegression, AnEgressFailedSubscribeIsNeverAnswere
 }
 
 // #450: a held Subscribe retired for want of a record egress is answered RecordEgressUnavailable (49) only to a
-// client that understands it (version >= 14); an older client parks an unknown fetch-refusal code and re-subscribes
+// client that understands it (version >= 15); an older client parks an unknown fetch-refusal code and re-subscribes
 // forever, so it is answered NotAuthorized, which every older client ends the subscription / group consumer on.
 namespace {
 int heldSubscribeAnswer(int32_t clientVersion) {
@@ -687,6 +687,22 @@ TEST(RecordEgressRegression, AnOlderClientIsAnsweredNotAuthorizedNotEgressUnavai
 
 TEST(RecordEgressRegression, ACurrentClientIsStillAnsweredEgressUnavailableRegression) {
     EXPECT_EQ(heldSubscribeAnswer(pc::kClientVersion), static_cast<int>(pc::ErrorCode::RecordEgressUnavailable));
+}
+
+// C3 adversarial review (#450 x namespaces merge, version skew): main took client version 14 for namespaces, so #450
+// gates at 15.  A namespace-era client (14, which never heard of code 49) and every older one are answered
+// NotAuthorized; 15 and the current client get 49.  Mutation: gate clientUnderstandsRecordEgressUnavailable at
+// kClientVersionNamespaces (14) -> the 14 row answers 49 and the test goes red.
+TEST(RecordEgressRegression, ANamespaceEraClientNeverSeesCode49AdversarialRegression) {
+    static_assert(pc::kClientVersionRecordEgressUnavailable == pc::kClientVersionNamespaces + 1);
+    static_assert(pc::kClientVersion >= pc::kClientVersionRecordEgressUnavailable);
+    static_assert(!pc::clientUnderstandsRecordEgressUnavailable(pc::kClientVersionNamespaces));
+    for (const int32_t v : {0, pc::kClientVersionExplicitGroupSubscriptions, pc::kClientVersionTxnVerify,
+                            pc::kClientVersionNamespaces}) {
+        EXPECT_EQ(heldSubscribeAnswer(v), static_cast<int>(pc::ErrorCode::NotAuthorized)) << "client version " << v;
+    }
+    EXPECT_EQ(heldSubscribeAnswer(pc::kClientVersionRecordEgressUnavailable),
+              static_cast<int>(pc::ErrorCode::RecordEgressUnavailable));
 }
 
 // Resources + no fallback over many attempts: whatever the number of failed re-subscribes, no cursor ever reaches the

@@ -1352,9 +1352,29 @@ int GroupConsumerHub::retryOffsetFetch(int64_t nowNs, int64_t sessionId, const S
     return sent;
 }
 
-// #440: what the coordinator's version allows.  A coordinator below the needed version while a newer node was seen is a
-// rolling upgrade in flight: the join waits for a coordinator move / reconnect (no timer); with no newer node ever
-// seen the cluster cannot serve this consumer and it ends BrokerTooOld.
+// #440: what the coordinator's version allows.  A coordinator below the needed version while another CONNECTED session
+// announces enough is a rolling upgrade in flight: the join waits for a coordinator move / reconnect (no timer).  With
+// no connected session new enough, nothing this client reaches can serve the consumer and it ends BrokerTooOld.
+int32_t GroupConsumerHub::liveMaxBrokerVersion_() const noexcept
+{
+    if (router_.maxConnectedBrokerVersion != nullptr) return router_.maxConnectedBrokerVersion(router_.ctx);
+    return std::max(brokerVersion_, connectedMaxBrokerVersion_);
+}
+
+void GroupConsumerHub::recheckDeferredJoins_()
+{
+    anyJoinDeferred_ = false;
+    for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
+        GroupConsumerImpl* const impl = impls_[ix];
+        if (!impl->active || !impl->joinDeferredLogged) continue;
+        switch (joinGate_(*impl)) {
+        case JoinGate::Ok:     break;                                       // the next join site sends it
+        case JoinGate::Defer:  anyJoinDeferred_ = true; break;
+        case JoinGate::Refuse: refuse_(*impl, GroupFailReason::BrokerTooOld); break;
+        }
+    }
+}
+
 GroupConsumerHub::JoinGate GroupConsumerHub::joinGate_(const GroupConsumerImpl& impl) const noexcept
 {
     namespace pc = rune::protocol::client;
@@ -1362,7 +1382,7 @@ GroupConsumerHub::JoinGate GroupConsumerHub::joinGate_(const GroupConsumerImpl& 
         ? pc::kBrokerVersionExplicitGroupSubscriptions
         : std::max(pc::kBrokerVersionExplicitGroupSubscriptions, pc::kBrokerVersionFilter);
     if (brokerVersion_ >= need) return JoinGate::Ok;
-    return maxBrokerVersionSeen_ >= need ? JoinGate::Defer : JoinGate::Refuse;
+    return liveMaxBrokerVersion_() >= need ? JoinGate::Defer : JoinGate::Refuse;
 }
 
 bool GroupConsumerHub::gateAllows_(GroupConsumerImpl& impl)
@@ -1374,6 +1394,7 @@ bool GroupConsumerHub::gateAllows_(GroupConsumerImpl& impl)
         refuse_(impl, GroupFailReason::BrokerTooOld);   // Phase 2c: a filtered group needs >= kBrokerVersionFilter
         return false;
     case JoinGate::Defer:
+        anyJoinDeferred_ = true;
         if (!impl.joinDeferredLogged) {
             impl.joinDeferredLogged = true;   // once per deferral episode
             const int32_t need = impl.cfg.filterBytes.empty()
@@ -1381,7 +1402,7 @@ bool GroupConsumerHub::gateAllows_(GroupConsumerImpl& impl)
                 : std::max(rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions,
                            rune::protocol::client::kBrokerVersionFilter);
             std::fprintf(stderr,
-                "rune-client: group '%s': coordinator broker version %d is below %d (a newer node was seen): "
+                "rune-client: group '%s': coordinator broker version %d is below %d (a connected node is newer): "
                 "join deferred until the coordinator moves or reconnects\n",
                 impl.groupId.c_str(), brokerVersion_, need);
         }
@@ -1495,6 +1516,7 @@ int GroupConsumerHub::doWork(int64_t nowNs,
 {
     int work = 0;
     const auto now = std::chrono::steady_clock::now();
+    if (anyJoinDeferred_) [[unlikely]] recheckDeferredJoins_();   // #440: the newer node may be gone
 
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];

@@ -1488,6 +1488,10 @@ private:
     /// F8c C4: detail::AndWaitSink — the handles' *AndWait sugar.
     static Completion andWaitTrampoline_(void* ctx, const char* what, std::chrono::nanoseconds timeout,
                                          detail::AndWaitIssue issue, void* issueCtx, std::string* text);
+    /// #378: the GroupConsumer's AndWaitSink — a wait timeout / client close comes back as Completion status
+    /// Timeout / Closed (the group raises GroupOpError for it) instead of a plain std::runtime_error.
+    static Completion groupAndWaitTrampoline_(void* ctx, const char* what, std::chrono::nanoseconds timeout,
+                                              detail::AndWaitIssue issue, void* issueCtx, std::string* text);
     /// I3: pin the completion target a command carries (re-encoded counted).
     void pinCommandTarget_(detail::HubCommand& cmd) noexcept;
     /// D4: a follower named the group / txn coordinator (ErrorResponse{
@@ -1607,6 +1611,12 @@ private:
     template <class Issue, class OnDone>
     void andWait_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
                   Issue&& issue, OnDone&& onDone);
+    /// How andWaitCore_ ended (andWait_ throws for each; the group's sink maps them to a Completion status).
+    enum class AndWaitEnd : uint8_t { Done, RingTimedOut, WaitTimedOut, Closed, Rejected };
+    /// andWait_ without the throw: `rejected` holds the issue's OpResult when it returns Rejected.
+    template <class Issue, class OnDone>
+    AndWaitEnd andWaitCore_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
+                            Issue& issue, OnDone& onDone, OpResult& rejected);
     void throwForStatus_(const char* what, const Completion& c, std::span<const uint8_t> payload) const;
     /// F8c C3: publish (state, sessionId) to app threads on change (duty).
     void publishSeedStatus_(session::SessionState st, int64_t sid) noexcept;
@@ -1701,6 +1711,8 @@ private:
     static int64_t fetchSessionIdTrampoline_(void* ctx, uint32_t session) noexcept;
     static uint64_t fetchEpochTrampoline_(void* ctx, uint32_t session) noexcept;
     static void fetchReviveTrampoline_(void* ctx, uint32_t session) noexcept;
+    /// #440: FetchRouter::maxConnectedBrokerVersion.
+    static int32_t maxConnectedBrokerVersionTrampoline_(void* ctx) noexcept;
     static int32_t fetchBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept;
     /// #290: a node session's reject code (46 / 44 ...) while it is Rejected, else 0 (0 for the seed, whose
     /// rejection ends the Client's work on its own path).

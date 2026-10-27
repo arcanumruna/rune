@@ -273,6 +273,9 @@ public:
         /// Rejected, else 0 (optional).  A fetch it would carry can never be
         /// sent: the consumer is refused with that code at once.
         int16_t (*rejectCode)(void* ctx, uint32_t session) = nullptr;
+        /// #440: the highest broker version a session of this client announces while it is Connected NOW (0 = none
+        /// connected).  Optional; nullptr = the hub's setConnectedMaxBrokerVersion value.
+        int32_t (*maxConnectedBrokerVersion)(void* ctx) = nullptr;
     };
     void setFetchRouter(const FetchRouter& r) noexcept { router_ = r; }
 
@@ -346,14 +349,13 @@ public:
     /// GroupConsumer runs only against >= kBrokerVersionExplicitGroupSubscriptions;
     /// otherwise onConnected / joinIfConnected finish it (GroupFailReason::
     /// BrokerTooOld).  Hub-level tests (no broker) keep the default (current).
-    void setBrokerVersion(int32_t v) noexcept {
-        brokerVersion_ = v;
-        noteBrokerVersion(v);
-    }
-    /// #440: any session of this client announced broker version `v` (sticky: the highest ever seen).  A coordinator
-    /// below the version a consumer needs DEFERS its join while a newer node was seen (a rolling upgrade), and only
-    /// refuses (BrokerTooOld) when no node of the cluster ever announced enough.
-    void noteBrokerVersion(int32_t v) noexcept { if (v > maxBrokerVersionSeen_) maxBrokerVersionSeen_ = v; }
+    void setBrokerVersion(int32_t v) noexcept { brokerVersion_ = v; }
+    /// #440: a coordinator below the version a consumer needs DEFERS its join while some CONNECTED session announces
+    /// enough (a rolling upgrade in flight), and refuses it (BrokerTooOld) once none does — decided by the live
+    /// sessions, re-checked on every connect edge and every duty cycle while a join is deferred (no timer).  The
+    /// Client's router answers it (FetchRouter::maxConnectedBrokerVersion); a hub without one (hub-level tests) uses
+    /// this value: the highest version the connected sessions announce now (not sticky).
+    void setConnectedMaxBrokerVersion(int32_t v) noexcept { connectedMaxBrokerVersion_ = v; }
 
     /// MEDIUM-7: a consumer adopted while the session is already Connected joins
     /// now (onConnected already ran).  No-op otherwise.
@@ -419,7 +421,12 @@ private:
     void*        directSendCtx_ = nullptr;
 
     int32_t brokerVersion_ = rune::protocol::client::kBrokerVersion;
-    int32_t maxBrokerVersionSeen_ = 0;   // #440: the highest broker version any session announced
+    int32_t connectedMaxBrokerVersion_ = 0;   // #440: router-less hubs only (see setConnectedMaxBrokerVersion)
+    bool    anyJoinDeferred_ = false;         // #440: some consumer's join is deferred — re-checked every doWork
+    /// #440: the highest version a Connected session announces now (the coordinator's own included).
+    [[nodiscard]] int32_t liveMaxBrokerVersion_() const noexcept;
+    /// #440: every deferred join re-checked against the live sessions: Refuse ends it (BrokerTooOld).
+    void recheckDeferredJoins_();
     /// #440: what the coordinator's version allows for `impl`: join now, wait for a coordinator move / reconnect, or end.
     enum class JoinGate : uint8_t { Ok, Defer, Refuse };
     [[nodiscard]] JoinGate joinGate_(const GroupConsumerImpl& impl) const noexcept;

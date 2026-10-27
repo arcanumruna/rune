@@ -153,6 +153,7 @@ struct FakeRouter {
 class GroupFilterHubTest : public ::testing::Test {
 protected:
     void make(bool filtered) {
+        g_lastJoinCorr = g_lastSyncCorr = g_lastOffsetFetchCorr = 0;   // C3 review: never a previous test's corr
         hub_  = std::make_unique<GroupConsumerHub>();
         impl_ = std::make_unique<GroupConsumerImpl>();
         impl_->groupId  = "g";

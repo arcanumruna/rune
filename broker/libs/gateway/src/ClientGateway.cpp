@@ -4720,7 +4720,7 @@ void ClientGateway::retireWithoutRecordEgress_(int64_t subId)
         pc::SubscribeResponse resp;
         resp.sessionId      = sub.sessionId;
         resp.correlationId  = sub.subscribeCorrId;
-        // #450: a client below 14 parks an unknown code forever (a group fetch re-subscribes silently): it gets
+        // #450: a client below 15 parks an unknown code forever (a group fetch re-subscribes silently): it gets
         // NotAuthorized, which every older client ends the subscription / group consumer on.
         resp.errorCode      = pc::clientUnderstandsRecordEgressUnavailable(session->clientVersion)
                                   ? static_cast<int16_t>(pc::ErrorCode::RecordEgressUnavailable)

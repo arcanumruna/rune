@@ -9,6 +9,8 @@
 
 #include <rune/client/group/GroupConsumer.h>
 
+#include <concurrent/BackOffIdleStrategy.h>
+
 #include <algorithm>
 
 #include <cassert>
@@ -291,6 +293,9 @@ void GroupConsumer::seek(TopicPartition tp, int64_t offset) {
     static constexpr CompletionHandler kDrop{
         [](void*, const Completion&, std::span<const uint8_t>) noexcept {}, nullptr};
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    // C3 review: wait for the duty thread to drain the ring under a back-off (as andWait_ does), never a bare spin.
+    aeron::concurrent::BackoffIdleStrategy backoff(
+        10, 20, std::chrono::duration<long, std::nano>(1'000), std::chrono::duration<long, std::nano>(100'000));
     for (;;) {
         switch (seek(tp, offset, CompletionTarget(kDrop), Token{0})) {
         case OpResult::Accepted:
@@ -299,7 +304,7 @@ void GroupConsumer::seek(TopicPartition tp, int64_t offset) {
             if (std::chrono::steady_clock::now() >= deadline) {
                 throw std::runtime_error("seek(): not delivered, the command ring stayed full (BackPressured)");
             }
-            std::this_thread::yield();   // the duty thread drains the ring
+            backoff.idle(0);   // the duty thread drains the ring
             continue;
         case OpResult::Closed:
             throw std::runtime_error("seek(): GroupConsumer closed (Closed)");

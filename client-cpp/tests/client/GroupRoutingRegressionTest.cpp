@@ -4041,14 +4041,21 @@ TEST(GroupRoutingRegression, DISABLED_LaggingMetadataAnswersNeverPostponeTheArme
 // #440: the coordinator's seed session reconnects onto a node that was rolled back below what the consumer needs
 // while the cluster once announced more (a rolling upgrade in flight).  The consumer waits (it is not ended
 // BrokerTooOld) and keeps running once the coordinator answers with a current version.  RED: it ended BrokerTooOld.
+// A rolling upgrade: node 1 (a partition leader) is already current and stays connected while the coordinator (the
+// seed) is rolled back to an older broker: the consumer's join waits, it does not end.
 TEST(GroupRoutingRegression, AConsumerDefersWhenItsCoordinatorReconnectsOntoAnOlderNodeRegression) {
     GroupRig r(4590, 4591);
-    r.gw.groupAssignment = {{1, 0}};
+    const auto [n1, p1port] = r.addNode(4590);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, /*leader*/ 0, 1, 4590, ""}, {1, 1, /*leader*/ 1, 1, 4590, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment = {{1, 0}, {1, 1}};
     auto gc = r.client.subscribeGroup("g", {"t"});
     r.connect();
     ASSERT_TRUE(r.drive([&] { return !r.gw.pendingJoins.empty(); }));
     r.gw.releaseJoins();
-    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr; })) << "precondition: the consumer is Stable";
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr && r.subAt(1, n1) != nullptr; }))
+        << "precondition: the consumer is Stable, node 1's session connected";
     const int joins = r.gw.joinGroups;
 
     r.gw.advertisedBrokerVersionAt[0] = rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions - 1;
@@ -4067,4 +4074,37 @@ TEST(GroupRoutingRegression, AConsumerDefersWhenItsCoordinatorReconnectsOntoAnOl
     for (int i = 0; i < 200; ++i) { r.client.doWork(); r.gw.pump(); }
     EXPECT_EQ(gc.failReason(), rc::GroupFailReason::None);
     EXPECT_TRUE(gc.active()) << "still running on the upgraded coordinator";
+}
+
+// ===========================================================================
+// C3 adversarial review (#440): liveness of a deferred join.
+// ===========================================================================
+
+// #440 liveness: the cluster announced a current version ONCE (the seed itself, before it was rolled back) and then
+// never again: the rollback is permanent, no node of the cluster can serve the consumer.  The consumer must end
+// explicitly (BrokerTooOld) once no CONNECTED session announces the needed version — never wait silently forever (a
+// permanent hang that only one stderr line reveals).  Time-independent: it is decided by the live sessions'
+// versions, no timer.  RED before the fix: the gate used the highest version EVER seen (sticky), so the consumer
+// stayed active, unjoined, failReason None, through any number of reconnects onto the old node.
+TEST(GroupRoutingRegression, ADeferredJoinWithNoLiveNewerNodeEndsBrokerTooOldNeverHangsAdversarialRegression) {
+    GroupRig r(4594, 4595);
+    r.gw.groupAssignment = {{1, 0}};
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr; })) << "precondition: the consumer is Stable";
+    const int joins = r.gw.joinGroups;
+
+    // Permanent rollback: every later connect announces an old version; no other node exists.
+    r.gw.advertisedBrokerVersionAt[0] = rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions - 1;
+    for (int round = 0; round < 3; ++round) {
+        const int connects = r.gw.connectsAt[0];
+        r.gw.expireSession(r.seedSid);
+        ASSERT_TRUE(r.drive([&] { return r.gw.connectsAt[0] > connects; })) << "the seed never reconnected";
+        for (int i = 0; i < 200; ++i) { r.client.doWork(); r.gw.pump(); }
+    }
+    EXPECT_EQ(r.gw.joinGroups, joins) << "joined an old coordinator";
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::BrokerTooOld)
+        << "no connected node can serve the consumer, yet it waits silently forever (deferred on a stale max)";
 }

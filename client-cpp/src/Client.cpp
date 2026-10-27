@@ -295,6 +295,7 @@ Client::Client(ClientConfig cfg)
         fr.brokerVersion = &Client::fetchBrokerVersionTrampoline_;
         fr.offer         = &Client::fetchOfferTrampoline_;
         fr.rejectCode    = &Client::nodeRejectCodeTrampoline_;
+        fr.maxConnectedBrokerVersion = &Client::maxConnectedBrokerVersionTrampoline_;   // #440
         groupConsumerHub_.setFetchRouter(fr);
         // E2 final fix wave (I2): a moved plain subscription lives on its
         // partition leader's own node session, reached the same way.
@@ -1184,6 +1185,39 @@ Completion Client::andWaitTrampoline_(void* ctx, const char* what, std::chrono::
                        if (text != nullptr) text->assign(reinterpret_cast<const char*>(p.data()), p.size());
                    });
     return out;
+}
+
+// #378 (C3 review): the GroupConsumer *AndWait sugar.  A wait that ends without a completion (the wait or the
+// command ring timed out, the client closed) is reported as that Completion status, so the group's typed switch
+// raises a GroupOpError for it as for every other non-Ok outcome.  A refused issue (wrong thread, bad argument) is
+// a caller error and still throws as andWait_ does.
+Completion Client::groupAndWaitTrampoline_(void* ctx, const char* what, std::chrono::nanoseconds timeout,
+                                           detail::AndWaitIssue issue, void* issueCtx, std::string* text) {
+    auto* self = static_cast<Client*>(ctx);
+    Completion out;
+    auto doIssue = [&](Completions& q, Token t) { return issue(issueCtx, CompletionTarget(q), t); };
+    auto onDone  = [&](const Completion& c, std::span<const uint8_t> p) {
+        out = c;
+        if (text != nullptr) text->assign(reinterpret_cast<const char*>(p.data()), p.size());
+    };
+    OpResult rejected = OpResult::Accepted;
+    switch (self->andWaitCore_(what, timeout, 0, doIssue, onDone, rejected)) {
+    case AndWaitEnd::Done:
+        return out;
+    case AndWaitEnd::RingTimedOut:
+    case AndWaitEnd::WaitTimedOut:
+        out        = Completion{};
+        out.status = OpStatus::Timeout;
+        return out;
+    case AndWaitEnd::Closed:
+        out        = Completion{};
+        out.status = OpStatus::Closed;
+        return out;
+    case AndWaitEnd::Rejected:
+        break;
+    }
+    throw std::runtime_error(std::string(what) + ": rejected (OpResult " +
+                             std::to_string(static_cast<int>(rejected)) + ")");
 }
 
 // ---------------------------------------------------------------------------
@@ -2203,7 +2237,6 @@ std::size_t Client::findCtl_(int64_t corrId) const noexcept {
 // offerCrypto nothing may leave the session before its mode is negotiated.
 // ---------------------------------------------------------------------------
 void Client::onSeedConnected_(int64_t sessionId, int32_t brokerVersion) {
-    groupConsumerHub_.noteBrokerVersion(brokerVersion);   // #440
     // F8c C3: complete the pending connect (state() was published by the
     // caller's syncSeedSession_, so a woken waiter reads Connected).
     completeConnect_(OpStatus::Ok, sessionId, 0, {});
@@ -2462,6 +2495,21 @@ void Client::checkBlockingCaller_(const char* what) const {
 template <class Issue, class OnDone>
 void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
                       Issue&& issue, OnDone&& onDone) {
+    OpResult rejected = OpResult::Accepted;
+    switch (andWaitCore_(what, timeout, maxResultBytes, issue, onDone, rejected)) {
+    case AndWaitEnd::Done:         return;
+    case AndWaitEnd::RingTimedOut: throw std::runtime_error(std::string(what) + ": timed out (command ring full)");
+    case AndWaitEnd::WaitTimedOut: throw std::runtime_error(std::string(what) + ": timed out waiting");
+    case AndWaitEnd::Closed:       throw std::runtime_error(std::string(what) + ": client closed");
+    case AndWaitEnd::Rejected:
+        throw std::runtime_error(std::string(what) + ": rejected (OpResult " +
+                                 std::to_string(static_cast<int>(rejected)) + ")");
+    }
+}
+
+template <class Issue, class OnDone>
+Client::AndWaitEnd Client::andWaitCore_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
+                                        Issue& issue, OnDone& onDone, OpResult& rejected) {
     checkBlockingCaller_(what);
     CompletionsConfig qc;
     qc.maxResultBytes = std::max<uint32_t>(maxResultBytes, qc.maxErrorText);
@@ -2483,15 +2531,13 @@ void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32
         const OpResult r = issue(q, kToken);
         if (r == OpResult::Accepted) break;
         if (r == OpResult::BackPressured) {  // the command ring is full: let the duty thread drain
-            if (std::chrono::steady_clock::now() >= issueDeadline) {
-                throw std::runtime_error(std::string(what) + ": timed out (command ring full)");
-            }
+            if (std::chrono::steady_clock::now() >= issueDeadline) return AndWaitEnd::RingTimedOut;
             if (cfg_.runnerMode == RunnerMode::Invoker) (void)doWork(); else backoff.idle(0);
             continue;
         }
-        if (r == OpResult::Closed) throw std::runtime_error(std::string(what) + ": client closed");
-        throw std::runtime_error(std::string(what) + ": rejected (OpResult " +
-                                 std::to_string(static_cast<int>(r)) + ")");
+        if (r == OpResult::Closed) return AndWaitEnd::Closed;
+        rejected = r;
+        return AndWaitEnd::Rejected;
     }
     bool       ok = false;
     auto done = [&](const Completion& c, std::span<const uint8_t> payload) {
@@ -2507,8 +2553,8 @@ void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32
     } else {
         w = q.waitFor(kToken, left, done);
     }
-    if (w == Completions::Wait::TimedOut) throw std::runtime_error(std::string(what) + ": timed out waiting");
-    if (!ok) throw std::runtime_error(std::string(what) + ": client closed");
+    if (w == Completions::Wait::TimedOut) return AndWaitEnd::WaitTimedOut;
+    return ok ? AndWaitEnd::Done : AndWaitEnd::Closed;
 }
 
 // ---------------------------------------------------------------------------
@@ -3510,8 +3556,6 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // JoinGroup, onConnected) concerns it.
         if (agent_.lastConnectSession() != 0) {
             if (ec == rpc::ErrorCode::OK && agent_.lastConnectAccepted() && !groupConsumerHub_.empty()) {
-                // #440: any node's announced version counts as seen (a coordinator below it defers, not refuses).
-                groupConsumerHub_.noteBrokerVersion(opt->brokerVersion);
                 // That session's event: its unanswered Subscribes are re-sent.
                 (void)groupConsumerHub_.resendUnanswered(agent_.lastConnectSession());
             }
@@ -5248,6 +5292,17 @@ int32_t Client::subscribeBrokerVersionTrampoline_(void* ctx, uint32_t session) n
     return agent.connectedEpoch(session) != 0 ? agent.sessionBrokerVersion(session) : 0;
 }
 
+// #440: the highest broker version among the sessions Connected now (cold: only while a group join is deferred, or
+// at a join site that found the coordinator too old).
+int32_t Client::maxConnectedBrokerVersionTrampoline_(void* ctx) noexcept {
+    const auto& agent = static_cast<Client*>(ctx)->agent_;
+    int32_t best = 0;
+    for (uint32_t i = 0, n = static_cast<uint32_t>(agent.sessionCount()); i < n; ++i) {
+        if (agent.connectedEpoch(i) != 0) best = std::max(best, agent.sessionBrokerVersion(i));
+    }
+    return best;
+}
+
 int32_t Client::fetchBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept {
     return static_cast<Client*>(ctx)->agent_.sessionBrokerVersion(session);
 }
@@ -5825,7 +5880,7 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
     }
 
     return GroupConsumer(impl.release(), &Client::hubCommandTrampoline_, this, handleDutyThread_(),
-                         &Client::targetedOpTrampoline_, &Client::andWaitTrampoline_);
+                         &Client::targetedOpTrampoline_, &Client::groupAndWaitTrampoline_);   // #378
 }
 
 // ---------------------------------------------------------------------------

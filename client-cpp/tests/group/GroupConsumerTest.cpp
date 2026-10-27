@@ -458,6 +458,7 @@ protected:
     void SetUp() override {
         g_ledger   = SyncLedger{};
         g_hubNowNs = 0;
+        g_lastJoinCorr = g_lastSyncCorr = g_lastHbCorr = 0;   // C3 review: no answer reuses a previous test's corr
         hub_ = std::make_unique<GroupConsumerHub>();
         impl_ = std::make_unique<GroupConsumerImpl>();
         impl_->groupId  = "test-group";
@@ -3553,7 +3554,7 @@ TEST_F(GroupConsumerHubRegression, AFilteredConsumerDefersOnAnOlderCoordinatorAf
     rune::codec::FilterBytes f;
     f.bytes[0] = 0xA1; f.len = 1;
     impl_->cfg.filter(f);
-    hub_->noteBrokerVersion(rpc::kBrokerVersion);
+    hub_->setConnectedMaxBrokerVersion(rpc::kBrokerVersion);
     hub_->setBrokerVersion(rpc::kBrokerVersionFilter - 1);
     hub_->onConnected(kSessionId, sink_.fn());
     EXPECT_EQ(joinFrames(sink_), 0);
@@ -3569,7 +3570,7 @@ TEST_F(GroupConsumerHubRegression, AFilteredConsumerDefersOnAnOlderCoordinatorAf
 }
 
 TEST_F(GroupConsumerHubRegression, AnUnfilteredConsumerDefersTheSameWayRegression) {
-    hub_->noteBrokerVersion(rpc::kBrokerVersion);
+    hub_->setConnectedMaxBrokerVersion(rpc::kBrokerVersion);
     hub_->setBrokerVersion(rpc::kBrokerVersionExplicitGroupSubscriptions - 1);
     hub_->onConnected(kSessionId, sink_.fn());
     EXPECT_EQ(joinFrames(sink_), 0);
@@ -3581,6 +3582,24 @@ TEST_F(GroupConsumerHubRegression, AnUnfilteredConsumerDefersTheSameWayRegressio
     hub_->setBrokerVersion(rpc::kBrokerVersion);
     hub_->onConnected(kSessionId, sink_.fn());
     EXPECT_EQ(joinFrames(sink_), 1);
+}
+
+// #440 (C3 review): a deferred join is re-checked every duty cycle against the CONNECTED sessions.  The newer node
+// it waited for disconnects while the old coordinator stays up (no connect edge at all): the consumer ends
+// BrokerTooOld on the next doWork, never waits silently.  Mutation: drop the doWork re-check -> stays active.
+TEST_F(GroupConsumerHubRegression, ADeferredJoinEndsBrokerTooOldOnceNoConnectedNodeIsNewerRegression) {
+    hub_->setConnectedMaxBrokerVersion(rpc::kBrokerVersion);
+    hub_->setBrokerVersion(rpc::kBrokerVersionExplicitGroupSubscriptions - 1);
+    hub_->onConnected(kSessionId, sink_.fn());
+    ASSERT_TRUE(impl_->active) << "precondition: deferred, not refused";
+    tickManyTimes(*hub_, sink_);
+    ASSERT_TRUE(impl_->active) << "precondition: still deferred while the newer node is connected";
+
+    hub_->setConnectedMaxBrokerVersion(0);   // the newer node's session is gone; only the old coordinator remains
+    hub_->doWork(0, kSessionId, sink_.fn());
+    EXPECT_FALSE(impl_->active);
+    EXPECT_EQ(impl_->failReason, GroupFailReason::BrokerTooOld);
+    EXPECT_EQ(joinFrames(sink_), 0);
 }
 
 TEST_F(GroupConsumerHubRegression, WithNoNewerNodeSeenAnOlderCoordinatorStillRefusesRegression) {
@@ -3598,7 +3617,7 @@ TEST_F(GroupConsumerHubRegression, WithNoNewerNodeSeenAnOlderCoordinatorStillRef
 
 TEST_F(GroupConsumerHubRegression, ARejoiningConsumerDefersOnAnOlderCoordinatorRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
-    hub_->noteBrokerVersion(rpc::kBrokerVersion);
+    hub_->setConnectedMaxBrokerVersion(rpc::kBrokerVersion);
     hub_->onCoordinatorMoved();
     ASSERT_EQ(impl_->state, GroupConsumerState::Rejoining);
     sink_.clear();
@@ -3672,4 +3691,104 @@ TEST_F(GroupConsumerHubRegression, GroupOpErrorIsARuntimeErrorAndSessionLostIsOn
         EXPECT_STREQ(e.what(), "lost");
     }
     EXPECT_THROW(throw GroupOpError(OpStatus::Rejoined, 0, "x"), std::runtime_error);
+}
+
+// ===========================================================================
+// C3 adversarial review (#431): corr-id matching at the sequence wrap, duplicates and episode edges.
+// ===========================================================================
+
+// Input bounds / wrap: the per-consumer sequence wraps inside one Stable episode (it skips 0).  A heartbeat sent just
+// before the wrap is still applied after the wrap; the Sync's own seq (just below the episode's floor, across the
+// wrap) is not.  Mutation: compare `seq < hbSeqLo` unsigned instead of the serial-number difference -> the
+// post-wrap answer (seq 1 < floor ...FE) is dropped (state stays Stable) and the test goes red.
+TEST_F(GroupConsumerHubRegression, HeartbeatWindowHoldsAcrossTheSequenceWrapAdversarialRegression) {
+    impl_->ctlSeq = 0xFFFFFFFBu;   // Join = ...FC, Sync = ...FD, first heartbeat = ...FE
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    ASSERT_EQ(impl_->state, GroupConsumerState::Stable);
+    ASSERT_EQ(impl_->hbSeqLo, 0xFFFFFFFEu);
+    std::vector<int64_t> hb;
+    for (int i = 0; i < 4; ++i) {
+        impl_->nextHeartbeat = std::chrono::steady_clock::time_point{};
+        sink_.clear();
+        hub_->doWork(0, kSessionId, sink_.fn());
+        hb.push_back(lastCorr(sink_, rpc::TemplateId::Heartbeat));
+    }
+    ASSERT_EQ(static_cast<uint32_t>(hb[0]), 0xFFFFFFFEu);
+    ASSERT_EQ(static_cast<uint32_t>(hb[1]), 0xFFFFFFFFu);
+    ASSERT_EQ(static_cast<uint32_t>(hb[2]), 1u) << "the sequence must skip 0 on wrap";
+    ASSERT_EQ(static_cast<uint32_t>(hb[3]), 2u);
+    for (const int64_t c : hb) EXPECT_TRUE(GroupConsumerHub::isGroupCtlCorrId(c)) << std::hex << c;
+
+    // The Sync's seq (...FD) answered as a heartbeat: before this episode -> dropped.
+    const int64_t syncSeq = (hb[0] & ~int64_t{0xFFFFFFFF}) | 0xFFFFFFFDu;
+    auto stale = makeHeartbeatResponse(static_cast<int16_t>(rpc::ErrorCode::UnknownMember), syncSeq);
+    hub_->onHeartbeatResponse(stale.data(), stale.size(), kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Stable) << "an answer from before the Sync was applied across the wrap";
+
+    // The first post-wrap heartbeat (seq 1) answered after seq 2 was sent: still this episode -> applied.
+    auto slow = makeHeartbeatResponse(static_cast<int16_t>(rpc::ErrorCode::RebalanceInProgress), hb[2]);
+    hub_->onHeartbeatResponse(slow.data(), slow.size(), kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Rejoining) << "a post-wrap heartbeat answer of this episode was dropped";
+}
+
+// Protocol state / replays: every control answer delivered twice, and the previous episode's answers replayed after
+// a rejoin reached Stable again, change nothing (no second Sync, no second Subscribe, no rejoin).  Mutation: drop the
+// `impl->ctlCorrId != corr` check in onJoinGroupResponse -> the replayed episode-1 Join answer (in Joining of
+// episode 2) is applied as the answer to the episode-2 join and a stray SyncGroup leaves.
+TEST_F(GroupConsumerHubRegression, DuplicateAndReplayedControlAnswersChangeNothingAdversarialRegression) {
+    hub_->onConnected(kSessionId, sink_.fn());
+    const int64_t j1 = lastCorr(sink_, rpc::TemplateId::JoinGroup);
+    auto jOk1 = makeJoinGroupResponseOK(1, "m1", j1);
+    hub_->onJoinGroupResponse(jOk1.data(), jOk1.size(), kSessionId, sink_.fn());
+    ASSERT_EQ(impl_->state, GroupConsumerState::Syncing);
+    const int64_t s1 = lastCorr(sink_, rpc::TemplateId::SyncGroup);
+    sink_.clear();
+    hub_->onJoinGroupResponse(jOk1.data(), jOk1.size(), kSessionId, sink_.fn());   // duplicate Join answer
+    EXPECT_EQ(lastCorr(sink_, rpc::TemplateId::SyncGroup), 0) << "a duplicate Join answer sent a second SyncGroup";
+    auto sOk1 = makeSyncGroupResponseOK({{kTopicId, kPartition}}, s1);
+    hub_->onSyncGroupResponse(sOk1.data(), sOk1.size(), kSessionId, sink_.fn());
+    ASSERT_EQ(impl_->state, GroupConsumerState::Stable);
+    impl_->nextHeartbeat = std::chrono::steady_clock::time_point{};
+    hub_->doWork(0, kSessionId, sink_.fn());
+    const int64_t h1 = lastCorr(sink_, rpc::TemplateId::Heartbeat);
+    ASSERT_NE(h1, 0);
+    const std::size_t framesAfterStable = sink_.frames.size();
+    hub_->onSyncGroupResponse(sOk1.data(), sOk1.size(), kSessionId, sink_.fn());   // duplicate Sync answer
+    EXPECT_EQ(sink_.frames.size(), framesAfterStable) << "a duplicate Sync answer re-applied the assignment";
+
+    // Episode 2: rebalance -> rejoin.  The episode-1 Join answer replayed while episode 2 is Joining: dropped.
+    auto rb = makeHeartbeatResponse(static_cast<int16_t>(rpc::ErrorCode::RebalanceInProgress), h1);
+    hub_->onHeartbeatResponse(rb.data(), rb.size(), kSessionId, sink_.fn());
+    ASSERT_EQ(impl_->state, GroupConsumerState::Rejoining);
+    impl_->rejoinNotBefore = std::chrono::steady_clock::time_point{};
+    sink_.clear();
+    hub_->doWork(0, kSessionId, sink_.fn());
+    ASSERT_EQ(impl_->state, GroupConsumerState::Joining);
+    const int64_t j2 = lastCorr(sink_, rpc::TemplateId::JoinGroup);
+    ASSERT_NE(j2, j1);
+    sink_.clear();
+    hub_->onJoinGroupResponse(jOk1.data(), jOk1.size(), kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Joining) << "the episode-1 Join answer completed the episode-2 join";
+    EXPECT_EQ(lastCorr(sink_, rpc::TemplateId::SyncGroup), 0);
+    auto jOk2 = makeJoinGroupResponseOK(2, "m1", j2);
+    hub_->onJoinGroupResponse(jOk2.data(), jOk2.size(), kSessionId, sink_.fn());
+    ASSERT_EQ(impl_->state, GroupConsumerState::Syncing);
+    hub_->onSyncGroupResponse(sOk1.data(), sOk1.size(), kSessionId, sink_.fn());   // episode-1 Sync replayed
+    EXPECT_EQ(impl_->state, GroupConsumerState::Syncing) << "the episode-1 Sync answer completed the episode-2 sync";
+    auto sOk2 = makeSyncGroupResponseOK({{kTopicId, kPartition}}, lastCorr(sink_, rpc::TemplateId::SyncGroup));
+    hub_->onSyncGroupResponse(sOk2.data(), sOk2.size(), kSessionId, sink_.fn());
+    ASSERT_EQ(impl_->state, GroupConsumerState::Stable);
+    // The episode-1 heartbeat answer replayed in episode 2: dropped (no rejoin).
+    auto um = makeHeartbeatResponse(static_cast<int16_t>(rpc::ErrorCode::UnknownMember), h1);
+    hub_->onHeartbeatResponse(um.data(), um.size(), kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Stable) << "an episode-1 heartbeat answer rejoined episode 2";
+    EXPECT_EQ(impl_->generationId, 2);
+
+    // Corr-space collisions: a txn coordinator id and an untagged id never match any control answer.
+    for (const int64_t foreign : {producer::coordcorr::make(1, 1, static_cast<uint32_t>(h1)), int64_t{0},
+                                  h1 & 0xFFFFFFFFFFFFFF /* tag bit stripped */}) {
+        auto f = makeHeartbeatResponse(static_cast<int16_t>(rpc::ErrorCode::UnknownMember), foreign);
+        hub_->onHeartbeatResponse(f.data(), f.size(), kSessionId, sink_.fn());
+        EXPECT_EQ(impl_->state, GroupConsumerState::Stable) << std::hex << foreign;
+    }
 }

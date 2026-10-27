@@ -504,3 +504,30 @@ TEST(GroupSeekRegression, ARewindIsNotOkUntilItsSubscribeIsAnsweredRegression) {
     EXPECT_EQ(f.done[t].c.status, rc::OpStatus::Ok);
     EXPECT_EQ(f.done[t].times, 1);
 }
+
+// ===========================================================================
+// C3 adversarial review (#378 / #413): the typed error covers EVERY non-Ok exit of a blocking group call.
+// ===========================================================================
+
+// #378: the most common failure of a blocking rewind is the caller's own wait budget running out (the OffsetFetch is
+// never answered).  The header documents "GroupOpError ... on any other non-Ok outcome or wait timeout", so a caller
+// that catches GroupOpError and branches on status() must see Timeout here.  RED today: Client::andWait_ throws a
+// plain std::runtime_error("...: timed out waiting") for Completions::Wait::TimedOut, which escapes the
+// GroupOpError handler.
+TEST(GroupSeekRegression, ABlockingRewindWaitTimeoutIsATypedGroupOpErrorAdversarialRegression) {
+    Fixture f(4996, 4997, {{kTopic, 1}});   // commitSyncTimeoutMs default: far above the 50 ms wait below
+    f.r.gw.holdOffsetFetch = true;            // the rewind's OffsetFetch is never answered
+    bool typed = false, untyped = false;
+    rc::OpStatus st = rc::OpStatus::Ok;
+    try {
+        f.gc.seekToCommittedAndWait(std::chrono::milliseconds(50));
+    } catch (const rc::GroupOpError& e) {
+        typed = true;
+        st    = e.status();
+    } catch (const std::runtime_error&) {
+        untyped = true;
+    }
+    EXPECT_FALSE(untyped) << "the wait timeout escaped as a plain std::runtime_error";
+    EXPECT_TRUE(typed);
+    EXPECT_EQ(st, rc::OpStatus::Timeout);
+}
