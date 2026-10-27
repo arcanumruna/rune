@@ -509,6 +509,11 @@ public:
     /// Returns 0 when there is no work. NEVER spins.
     int doWork(int64_t nowNs);
 
+    /// Namespaces Phase 2 Task 5: every Ongoing transaction whose scoped id belongs to namespace `nsId` takes
+    /// exactly the timeout-abort transition (PrepareAbort, markersPending, persisted).  Returns the count.  No
+    /// allocation.  (Task 4 calls it on suspend / delete.)
+    uint32_t abortAllForNamespace(uint32_t nsId, int64_t nowNs);
+
     // -----------------------------------------------------------------------
     // pendingMarkerTransactions — B1/B2 resolution API
     // -----------------------------------------------------------------------
@@ -603,6 +608,8 @@ private:
     /// to the OffsetStore atomically with the transaction completion (F3).
     OffsetApplyCallback offsetApplyCb_;
     CheckedOffsetApplyCallback checkedOffsetApplyCb_;
+
+    void beginInternalAbort_(TransactionMetadata& meta);   ///< the timeout-abort transition (doWork, abortAllForNamespace)
 
     /// Primary state: transactionalId → TransactionMetadata.
     std::unordered_map<TransactionalId, TransactionMetadata> txnMap_;

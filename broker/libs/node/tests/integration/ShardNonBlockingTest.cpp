@@ -1520,11 +1520,11 @@ TEST(OwnershipGuardRegression, ParkedSubscriptionReactivatesByIncarnation) {
 namespace {
 struct CapturingTxn final : rune::gateway::ITxnRequestHandler {
     int refused = 0; int32_t topic = -1, part = -1; int16_t err = 0;
-    size_t handleInitProducerId(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-    size_t handleAddPartitions(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-    size_t handleAddOffsets(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-    size_t handleTxnOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-    size_t handleEndTxn(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+    size_t handleInitProducerId(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+    size_t handleAddPartitions(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+    size_t handleAddOffsets(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+    size_t handleTxnOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+    size_t handleEndTxn(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
     void onControlMarkerRefused(int32_t t, int32_t p, int64_t, int16_t e, int32_t) override { ++refused; topic = t; part = p; err = e; }
 };
 } // namespace

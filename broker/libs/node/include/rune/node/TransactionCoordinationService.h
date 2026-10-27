@@ -180,15 +180,20 @@ public:
     // Never throws.  Never allocates from heap in steady state.
     // -----------------------------------------------------------------------
     size_t handleInitProducerId (const uint8_t* buf, size_t len,
-                                  int64_t nowNs, uint8_t* out, size_t outCap) override;
+                                  int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
     size_t handleAddPartitions  (const uint8_t* buf, size_t len,
-                                  int64_t nowNs, uint8_t* out, size_t outCap) override;
+                                  int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
     size_t handleAddOffsets     (const uint8_t* buf, size_t len,
-                                  int64_t nowNs, uint8_t* out, size_t outCap) override;
+                                  int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
     size_t handleTxnOffsetCommit(const uint8_t* buf, size_t len,
-                                  int64_t nowNs, uint8_t* out, size_t outCap) override;
+                                  int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
     size_t handleEndTxn         (const uint8_t* buf, size_t len,
-                                  int64_t nowNs, uint8_t* out, size_t outCap) override;
+                                  int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
 
     /// A control marker this node could not append.  NEVER counts as landed: a
     /// retriable refusal (NotLeader, MinIsrViolation, Internal, ...) is re-dispatched
@@ -369,6 +374,7 @@ private:
         int64_t              sessionId  = 0;
         uint16_t             templateId = 0;
         std::vector<uint8_t> request;
+        rune::coordination::NsRequestContext ctx;   ///< Phase 2 Task 5: the parked request's namespace context
     };
     static constexpr std::size_t kMaxParkedNextTxn = 1024;
     /// The replay's answer buffer: the gateway's txn scratch size (ClientGateway::kScratchSize, 68 KiB).
@@ -379,7 +385,11 @@ private:
     std::vector<uint8_t>       replayOut_;          ///< kReplayOutBytes, allocated on the first park
     bool                       nextTxnReplayDue_ = false;   ///< a transaction completed since the last replay
     /// True when the request was parked (the handler then returns 0: deferred).
-    bool parkNextTxn_(const uint8_t* buf, size_t len, rune::protocol::client::TemplateId tid, int64_t nowNs);
+    bool parkNextTxn_(const uint8_t* buf, size_t len, rune::protocol::client::TemplateId tid, int64_t nowNs,
+                      const rune::coordination::NsRequestContext& ctx);
+    [[nodiscard]] static std::string_view idView_(std::span<const uint8_t> b) noexcept {
+        return std::string_view(reinterpret_cast<const char*>(b.data()), b.size());
+    }
     int  replayNextTxn_(int64_t nowNs);
     /// The offset of the last record appended per transactional id (cleared on load: the loaded log is committed);
     /// kUnpersisted when the id's last put was refused.  No entry: the id's state is the loaded (committed) one.
@@ -410,11 +420,16 @@ private:
     bool gateOpen_(PrepareGate& g);
     int  processPrepareGates_();
     void dropDeferred_();   ///< unload: every parked answer / gated EndTxn answered NotCoordinator
-    size_t handleInitProducerId_ (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
-    size_t handleAddPartitions_  (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
-    size_t handleAddOffsets_     (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
-    size_t handleTxnOffsetCommit_(const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
-    size_t handleEndTxn_         (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
+    size_t handleInitProducerId_ (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx);
+    size_t handleAddPartitions_  (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx);
+    size_t handleAddOffsets_     (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx);
+    size_t handleTxnOffsetCommit_(const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx);
+    size_t handleEndTxn_         (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx);
 
     // ----- #438: a consumer-group (group, tp) is held by at most one unfinished transaction -----
     // From the TxnOffsetCommit that adds it until the holder's Complete* record is COMMITTED on __transaction_state.

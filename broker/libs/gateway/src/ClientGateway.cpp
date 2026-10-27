@@ -79,7 +79,6 @@ namespace pc = rune::protocol::client;
 
 // Namespaces Task 10: the fixed refusal texts (D7: they never echo a name, so they reveal no foreign object).
 constexpr const char* kMalformedNameDetail = "malformed qualified name";
-const Denial kGroupTxnOutsideDefault{45, "not authorized: groups and transactions exist only in the default namespace"};
 
 // ---------------------------------------------------------------------------
 // Startup-only synchronous resolve budget: the ingress subscription in the
@@ -3234,19 +3233,21 @@ void ClientGateway::evictOldClientMember_(Session& session, uint16_t tid, const 
     const auto sv = [](std::span<const uint8_t> b) {
         return std::string_view(reinterpret_cast<const char*>(b.data()), b.size());
     };
+    // Phase 2 Task 5 (D19): the service keys groups by their scoped id.  Cold path (an old client's error answer).
+    const rune::coordination::NsRequestContext nsCtx{sessionNsId_(session), permsOf_(session).isRoot(), &namespaces_.registry()};
     if (tid == static_cast<uint16_t>(pc::TemplateId::Heartbeat)) {
         if (const auto m = pc::Heartbeat::decode(buf, len)) {
-            groupService_->evictMember(sv(m->groupId), sv(m->memberId), session.sessionId, nowNs);
+            groupService_->evictMember(rune::gateway::scopeClientId(nsCtx, sv(m->groupId)), sv(m->memberId), session.sessionId, nowNs);
             return;
         }
     } else if (tid == static_cast<uint16_t>(pc::TemplateId::SyncGroup)) {
         if (const auto m = pc::SyncGroup::decode(buf, len)) {
-            groupService_->evictMember(sv(m->groupId), sv(m->memberId), session.sessionId, nowNs);
+            groupService_->evictMember(rune::gateway::scopeClientId(nsCtx, sv(m->groupId)), sv(m->memberId), session.sessionId, nowNs);
             return;
         }
     } else if (tid == static_cast<uint16_t>(pc::TemplateId::OffsetFetch)) {
         if (const auto m = pc::OffsetFetch::decode(buf, len)) {
-            groupService_->evictMember(sv(m->groupId), std::string_view{}, session.sessionId, nowNs);
+            groupService_->evictMember(rune::gateway::scopeClientId(nsCtx, sv(m->groupId)), std::string_view{}, session.sessionId, nowNs);
             return;
         }
     }
@@ -7801,10 +7802,6 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
         noteUnanswerable_(buf, len, "group message for unknown session");
         return;
     }
-    // Namespaces Task 10 (D8): phase 1 keys groups and transactional ids by id alone, so a session outside
-    // `default` (root included) is refused before the coordinator redirect or any coordinator state.
-    if ((sessionNsId_(*session) != 0 || rootOutsideDefault_(*session, tid, buf, len))
-        && deny_(*session, kGroupTxnOutsideDefault, buf, len)) return;
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
     if (denyGroupRequest_(*session, tid, buf, len)) return;                 // authentication Task 12 (D18)
 
@@ -7830,27 +7827,28 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
     // Dispatch to the service.  The service encodes the response into scratch_.
     // Capacity is passed so handlers bound-check BEFORE writing each element;
     // the post-write guard below is a final safety net only.
+    const rune::coordination::NsRequestContext nsCtx{sessionNsId_(*session), permsOf_(*session).isRoot(), &namespaces_.registry()};
     std::size_t encoded = 0;
     const std::size_t cap = scratch_.size();
     const auto templateId = static_cast<pc::TemplateId>(tid);
     switch (templateId) {
         case pc::TemplateId::JoinGroup:
-            encoded = groupService_->handleJoinGroup(buf, len, session->clientVersion, nowNs, scratch_.data(), cap);
+            encoded = groupService_->handleJoinGroup(buf, len, session->clientVersion, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::SyncGroup:
-            encoded = groupService_->handleSyncGroup(buf, len, nowNs, scratch_.data(), cap);
+            encoded = groupService_->handleSyncGroup(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::Heartbeat:
-            encoded = groupService_->handleHeartbeat(buf, len, nowNs, scratch_.data(), cap);
+            encoded = groupService_->handleHeartbeat(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::LeaveGroup:
-            encoded = groupService_->handleLeaveGroup(buf, len, nowNs, scratch_.data(), cap);
+            encoded = groupService_->handleLeaveGroup(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::OffsetCommit:
-            encoded = groupService_->handleOffsetCommit(buf, len, nowNs, scratch_.data(), cap);
+            encoded = groupService_->handleOffsetCommit(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::OffsetFetch:
-            encoded = groupService_->handleOffsetFetch(buf, len, nowNs, scratch_.data(), cap);
+            encoded = groupService_->handleOffsetFetch(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         default:
             // Unreachable: onClientFrame_ routes only the six group request ids here.
@@ -7968,16 +7966,6 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
         noteUnanswerable_(buf, len, "txn message for unknown session");
         return;
     }
-    // Namespaces Task 10 (D8): phase 1 keys groups and transactional ids by id alone, so a session outside
-    // `default` (root included) is refused before the coordinator redirect or any coordinator state.
-    // An InitProducerId with no transactional id is exempt: it mints a cluster-unique id for an idempotent producer
-    // and keys nothing by name, and every client producer sends one before its first produce.
-    const bool plainProducerIdRequest = tid == static_cast<uint16_t>(pc::TemplateId::InitProducerId) && [&] {
-        const auto m = pc::InitProducerId::decode(buf, len);
-        return m.has_value() && m->transactionalId.empty();
-    }();
-    if (((sessionNsId_(*session) != 0 && !plainProducerIdRequest) || rootOutsideDefault_(*session, tid, buf, len))
-        && deny_(*session, kGroupTxnOutsideDefault, buf, len)) return;
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
     if (denyTxnRequest_(*session, tid, buf, len)) return;                   // authentication Task 12 (D18)
 
@@ -7985,23 +7973,24 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
     // Fix round 3 (I3): the scratch always holds any fixed-size txn answer and
     // any rejection — a handler's 0 can only mean "deferred" (ITxnRequestHandler).
     static_assert(kScratchSize >= kTxnMinOutCap, "txn handlers need kTxnMinOutCap");
+    const rune::coordination::NsRequestContext nsCtx{sessionNsId_(*session), permsOf_(*session).isRoot(), &namespaces_.registry()};
     const std::size_t cap = scratch_.size();
     const auto templateId = static_cast<pc::TemplateId>(tid);
     switch (templateId) {
         case pc::TemplateId::InitProducerId:
-            encoded = txnService_->handleInitProducerId(buf, len, nowNs, scratch_.data(), cap);
+            encoded = txnService_->handleInitProducerId(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::AddPartitionsToTxn:
-            encoded = txnService_->handleAddPartitions(buf, len, nowNs, scratch_.data(), cap);
+            encoded = txnService_->handleAddPartitions(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::AddOffsetsToTxn:
-            encoded = txnService_->handleAddOffsets(buf, len, nowNs, scratch_.data(), cap);
+            encoded = txnService_->handleAddOffsets(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::TxnOffsetCommit:
-            encoded = txnService_->handleTxnOffsetCommit(buf, len, nowNs, scratch_.data(), cap);
+            encoded = txnService_->handleTxnOffsetCommit(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::EndTxn:
-            encoded = txnService_->handleEndTxn(buf, len, nowNs, scratch_.data(), cap);
+            encoded = txnService_->handleEndTxn(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         default:
             // Unreachable: onClientFrame_ routes only the five txn request ids here.
@@ -8903,71 +8892,6 @@ std::size_t ClientGateway::filterFetchAllByRead_(const Session& session, const u
     out.sessionId     = resp->sessionId;
     out.correlationId = resp->correlationId;
     return out.encode(scratch_.data(), std::span<const pc::OffsetFetchResult>(fetchFilterScratch_));
-}
-
-bool ClientGateway::rootOutsideDefault_(const Session& session, uint16_t tid, const uint8_t* buf, std::size_t len) const
-{
-    if (!permsOf_(session).isRoot()) return false;
-    const auto topicOut = [&](int32_t id) {
-        const rune::gateway::ObjectEntry* e = objectIndex_.at(id);
-        return e != nullptr && e->nsId != 0;
-    };
-    const auto nameOut = [&](std::span<const uint8_t> id) {   // an opaque id unless qualified by a live namespace
-        const auto res = resolve_(session, sv(id));
-        return res.r == rune::gateway::Resolved::Found && res.nsId != 0;
-    };
-    switch (static_cast<pc::TemplateId>(tid)) {
-        case pc::TemplateId::JoinGroup:
-            if (const auto m = pc::JoinGroup::decode(buf, len, session.clientVersion)) {
-                if (nameOut(m->groupId)) return true;
-                for (const int32_t t : m->subscribedTopicIds) if (topicOut(t)) return true;
-            }
-            return false;
-        case pc::TemplateId::SyncGroup:
-            if (const auto m = pc::SyncGroup::decode(buf, len)) return nameOut(m->groupId);
-            return false;
-        case pc::TemplateId::Heartbeat:
-            if (const auto m = pc::Heartbeat::decode(buf, len)) return nameOut(m->groupId);
-            return false;
-        case pc::TemplateId::LeaveGroup:
-            if (const auto m = pc::LeaveGroup::decode(buf, len)) return nameOut(m->groupId);
-            return false;
-        case pc::TemplateId::OffsetCommit:
-            if (const auto m = pc::OffsetCommit::decode(buf, len)) {
-                if (nameOut(m->groupId)) return true;
-                for (const auto& e : m->entries) if (topicOut(e.topicId)) return true;
-            }
-            return false;
-        case pc::TemplateId::OffsetFetch:
-            if (const auto m = pc::OffsetFetch::decode(buf, len)) {
-                if (nameOut(m->groupId)) return true;
-                for (const auto& e : m->entries) if (topicOut(e.topicId)) return true;
-            }
-            return false;
-        case pc::TemplateId::InitProducerId:
-            if (const auto m = pc::InitProducerId::decode(buf, len)) return nameOut(m->transactionalId);
-            return false;
-        case pc::TemplateId::AddPartitionsToTxn:
-            if (const auto m = pc::AddPartitionsToTxn::decode(buf, len)) {
-                if (nameOut(m->transactionalId)) return true;
-                for (const auto& p : m->partitions) if (topicOut(p.topicId)) return true;
-            }
-            return false;
-        case pc::TemplateId::AddOffsetsToTxn:
-            if (const auto m = pc::AddOffsetsToTxn::decode(buf, len))
-                return nameOut(m->transactionalId) || nameOut(m->groupId);
-            return false;
-        case pc::TemplateId::TxnOffsetCommit:
-            if (const auto m = pc::TxnOffsetCommit::decode(buf, len)) {
-                if (nameOut(m->transactionalId) || nameOut(m->groupId)) return true;
-                for (const auto& e : m->entries) if (topicOut(e.topicId)) return true;
-            }
-            return false;
-        case pc::TemplateId::EndTxn:
-            if (const auto m = pc::EndTxn::decode(buf, len)) return nameOut(m->transactionalId);
-            return false;
-        default: return false;   // an undecodable body is the service's InvalidRequest
-    }
 }
 
 bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len)

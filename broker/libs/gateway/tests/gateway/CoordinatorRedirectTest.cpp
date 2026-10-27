@@ -22,20 +22,20 @@ namespace pc = rune::protocol::client;
 
 struct CountingGroup final : IGroupRequestHandler {
     int calls = 0;
-    size_t handleJoinGroup(const uint8_t*, size_t, int32_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
-    size_t handleSyncGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
-    size_t handleHeartbeat(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
-    size_t handleLeaveGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
-    size_t handleOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
-    size_t handleOffsetFetch(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
+    size_t handleJoinGroup(const uint8_t*, size_t, int32_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { ++calls; return 0; }
+    size_t handleSyncGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { ++calls; return 0; }
+    size_t handleHeartbeat(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { ++calls; return 0; }
+    size_t handleLeaveGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { ++calls; return 0; }
+    size_t handleOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { ++calls; return 0; }
+    size_t handleOffsetFetch(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { ++calls; return 0; }
 };
 struct CountingTxn final : ITxnRequestHandler {
     int calls = 0;
-    size_t handleInitProducerId(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
-    size_t handleAddPartitions(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
-    size_t handleAddOffsets(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
-    size_t handleTxnOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
-    size_t handleEndTxn(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { ++calls; return 0; }
+    size_t handleInitProducerId(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { ++calls; return 0; }
+    size_t handleAddPartitions(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { ++calls; return 0; }
+    size_t handleAddOffsets(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { ++calls; return 0; }
+    size_t handleTxnOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { ++calls; return 0; }
+    size_t handleEndTxn(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { ++calls; return 0; }
 };
 
 struct Rig {

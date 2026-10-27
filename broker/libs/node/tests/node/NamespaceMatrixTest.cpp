@@ -66,7 +66,11 @@ TEST_P(NamespaceMatrixRegression, SequentialCell) {
     const bool hidden = !isNamespaceOp(c.op) &&
                         ((c.target == Target::ForeignNs && c.caller != Caller::ClusterAdmin && c.caller != Caller::NsAdminSame) ||
                          (c.target == Target::OwnNs && foreignCaller));
-    if (hidden) {
+    // Phase 2 Task 5 (D19): a transactional id is scoped to the caller's own namespace, so InitProducerId answers Ok
+    // for a foreign caller too, and its body carries a freshly allocated producer id (unique per call): there is no
+    // hidden object to compare, and the two Ok bodies differ in the id alone.
+    const bool freshIdAnswer = c.op == Op::TxnInit && got.code == 0;
+    if (hidden && !freshIdAnswer) {
         const NamespaceRig::Answer twin = rig_->runTwin(c.op, c.caller, c.target, c.ordinal);
         EXPECT_EQ(twin.code, got.code) << "ForeignEqualsMissingBytesRegression: " << label;
         EXPECT_EQ(got.normalized(twin), twin.normalized(got))

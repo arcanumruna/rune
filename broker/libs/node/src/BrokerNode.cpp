@@ -5770,7 +5770,7 @@ void BrokerNode::dropRuntimeTopic_(int32_t topicId, uint32_t nsId, const std::st
     }
     // Groups resolve topic names in the default namespace only (namespaces Task 6): a drop in another namespace
     // never rebalances a default-namespace group subscribed to the same name.
-    if (groupCoordService_ && d.nsId == 0) (void)groupCoordService_->onTopicDropped(d.name, nowNs);   // groups rebalance it away
+    if (groupCoordService_) (void)groupCoordService_->onTopicDropped(d.name, nowNs, d.nsId);   // groups rebalance it away
     drop_step::AwaitingRetire retire;
     for (int32_t part = 0; part < partitions; ++part) {
         rune::replication::PartitionReplica* r = replicaRegistry_ ? replicaRegistry_->lookup(topicId, part) : nullptr;

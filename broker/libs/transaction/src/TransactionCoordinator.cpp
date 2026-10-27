@@ -7,6 +7,7 @@
 
 #include <rune/transaction/TransactionCoordinator.h>
 #include <rune/transaction/TransactionLog.h>
+#include <rune/coordination/NsScopedId.h>
 
 #include <cassert>
 #include <cstdint>
@@ -539,16 +540,35 @@ int TransactionCoordinator::doWork(int64_t nowNs)
 
         int64_t timeoutNs = static_cast<int64_t>(meta.txnTimeoutMs) * 1'000'000LL;
         if (nowNs - meta.txnStartNs > timeoutNs) {
-            meta.state            = TxnState::PrepareAbort;
-            meta.markersPending   = true;   // B1: caller must write ABORT markers
-            meta.coordinatorEpoch = coordinatorEpoch_;
-            // Persist PrepareAbort to log (durable-before-markers ordering).
-            persistTransition(txnLog_, meta, coordinatorEpoch_);
+            beginInternalAbort_(meta);
             ++work;
         }
     }
 
     return work;
+}
+
+// The coordinator's own abort of an Ongoing transaction (timeout, namespace suspend / delete): PrepareAbort, the
+// caller must write ABORT markers, persisted before the markers.
+void TransactionCoordinator::beginInternalAbort_(TransactionMetadata& meta)
+{
+    meta.state            = TxnState::PrepareAbort;
+    meta.markersPending   = true;   // B1: caller must write ABORT markers
+    meta.coordinatorEpoch = coordinatorEpoch_;
+    // Persist PrepareAbort to log (durable-before-markers ordering).
+    persistTransition(txnLog_, meta, coordinatorEpoch_);
+}
+
+uint32_t TransactionCoordinator::abortAllForNamespace(uint32_t nsId, int64_t /*nowNs*/)
+{
+    uint32_t n = 0;
+    for (auto& [id, meta] : txnMap_) {
+        if (meta.state != TxnState::Ongoing) continue;
+        if (rune::coordination::parseScopedId(id).nsId != nsId) continue;
+        beginInternalAbort_(meta);
+        ++n;
+    }
+    return n;
 }
 
 void TransactionCoordinator::markersDispatched(const TransactionalId& txnId)

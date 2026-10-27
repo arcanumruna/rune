@@ -12,6 +12,8 @@
 // Namespace: rune::gateway
 // C++23.
 
+#include <rune/coordination/NsScopedId.h>
+
 #include <cstddef>
 #include <climits>
 #include <cstdint>
@@ -24,6 +26,10 @@ inline constexpr std::size_t kTxnMinOutCap = 64;
 struct ITxnRequestHandler {
     virtual ~ITxnRequestHandler() = default;
 
+    // Namespaces Phase 2 Task 5 (D19): `ctx` is the request's namespace context; the transactional id (and the group
+    // id of AddOffsets / TxnOffsetCommit) is turned into its scoped id right after decode; an id with the reserved
+    // prefix is answered InvalidRequest; an empty transactional id stays empty.  Responses echo the client's ids.
+    //
     // Each method decodes the request from buf[0..len-1], acts, encodes the
     // response into out[0..outCap-1], and returns the number of bytes written.
     //
@@ -49,27 +55,32 @@ struct ITxnRequestHandler {
     // InitProducerId (templateId 45) — allocate or refresh a producer identity.
     virtual size_t handleInitProducerId (const uint8_t* buf, size_t len,
                                          int64_t nowNs,
-                                         uint8_t* out, size_t outCap) = 0;
+                                         uint8_t* out, size_t outCap,
+                                         const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     // AddPartitionsToTxn (templateId 47) — record partitions in the transaction.
     virtual size_t handleAddPartitions  (const uint8_t* buf, size_t len,
                                          int64_t nowNs,
-                                         uint8_t* out, size_t outCap) = 0;
+                                         uint8_t* out, size_t outCap,
+                                         const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     // AddOffsetsToTxn (templateId 49) — bind consumer-group offsets to the txn.
     virtual size_t handleAddOffsets     (const uint8_t* buf, size_t len,
                                          int64_t nowNs,
-                                         uint8_t* out, size_t outCap) = 0;
+                                         uint8_t* out, size_t outCap,
+                                         const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     // TxnOffsetCommit (templateId 51) — commit consumer offsets within the txn.
     virtual size_t handleTxnOffsetCommit(const uint8_t* buf, size_t len,
                                          int64_t nowNs,
-                                         uint8_t* out, size_t outCap) = 0;
+                                         uint8_t* out, size_t outCap,
+                                         const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     // EndTxn (templateId 53) — begin commit or abort of the transaction.
     virtual size_t handleEndTxn         (const uint8_t* buf, size_t len,
                                          int64_t nowNs,
-                                         uint8_t* out, size_t outCap) = 0;
+                                         uint8_t* out, size_t outCap,
+                                         const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     // A COMMIT/ABORT control marker this node could not append (NotLeader,
     // MinIsrViolation, ...).  Never silently dropped and never "landed": the

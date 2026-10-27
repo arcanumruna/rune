@@ -12,9 +12,11 @@
 //
 // Zero allocation: string_views over the request and a heterogeneous registry lookup.
 #include <rune/catalog/NamespaceRegistry.h>
+#include <rune/coordination/NsScopedId.h>
 
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <string_view>
 
 namespace rune::gateway {
@@ -40,5 +42,26 @@ struct Resolution {
 /// `callerNsId` is the session's login namespace, `root` its PermissionTable::isRoot().
 [[nodiscard]] Resolution resolveName(uint32_t callerNsId, bool root, const rune::catalog::NamespaceRegistry& reg,
                                      std::string_view qualified) noexcept;
+
+/// Namespaces Phase 2 Task 5 (D19): a client's group / transactional id -> the internal scoped id, written into `out`
+/// (cleared first; no allocation when its capacity suffices).  A name that resolves (`r == Found`) lands in the
+/// namespace it names (root's "a/g" in `a`; anyone's unqualified "g" in their own); anything else (Missing, Malformed:
+/// a non-root "b/g", a legacy name containing '/') is an opaque local id in the SESSION namespace — never another one.
+/// The scoping lives here (not in rune_coordination) because it needs resolveName.
+inline void scopeClientIdInto(const rune::coordination::NsRequestContext& ctx, std::string_view raw, std::string& out)
+{
+    if (ctx.reg != nullptr) {
+        const Resolution r = resolveName(ctx.sessionNsId, ctx.root, *ctx.reg, raw);
+        if (r.r == Resolved::Found) { rune::coordination::scopedIdInto(r.nsId, r.local, out); return; }
+    }
+    rune::coordination::scopedIdInto(ctx.sessionNsId, raw, out);
+}
+
+[[nodiscard]] inline std::string scopeClientId(const rune::coordination::NsRequestContext& ctx, std::string_view raw)
+{
+    std::string s;
+    scopeClientIdInto(ctx, raw, s);
+    return s;
+}
 
 } // namespace rune::gateway
