@@ -1554,6 +1554,10 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
         e.ops = cat::NamespaceLimitsSetOps{resolveLimits(m.mask, m.limits, base)};
         return e;
     }
+    case pc::NamespaceDdlKind::Suspend:
+    case pc::NamespaceDdlKind::Resume:
+    case pc::NamespaceDdlKind::Delete:
+        break;   // Phase 2 Task 2 implements these; until then they fall through to the reject below
     }
     return Rejected(reject(kInvalidRequest, "unknown namespace DDL kind " + std::to_string(m.kind)));
 }

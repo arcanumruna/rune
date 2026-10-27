@@ -415,19 +415,23 @@ struct Disconnect {
 //   [26..27]  message length : uint16  (var prefix)
 //   [28..]    message bytes
 //
-// Total = 24 + 2 + 2 + message.size() = 28 + message.size()
+//   [..+8]    retryAfterNs : uint64 — ONLY when code == ErrorCode::Throttled (trailer after the message; older
+//             decoders ignore trailing bytes, a Throttled frame without it decodes retryAfterNs 0)
+//
+// Total = 24 + 2 + 2 + message.size() = 28 + message.size()  (+ 8 when code == Throttled)
 // ---------------------------------------------------------------------------
 struct ErrorResponse {
     int64_t          sessionId     = 0;
     int64_t          correlationId = 0;
     int16_t          code          = 0;   // rune::protocol::client::ErrorCode value
     std::string_view message;
+    uint64_t         retryAfterNs  = 0;   // Throttled only: how long the client should wait before retrying
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::ErrorResponse); // 5
     static constexpr uint16_t BODY_FIXED  = 2;
 
     /// Encode the full frame into buf.  buf must be large enough:
-    ///   MessageHeader::ENCODED_SIZE + BODY_FIXED + 2 + message.size()
+    ///   MessageHeader::ENCODED_SIZE + BODY_FIXED + 2 + message.size()  (+ 8 when code == Throttled)
     /// Returns total bytes written.
     std::size_t encode(uint8_t* buf) const noexcept {
         MessageHeader hdr;
@@ -445,7 +449,12 @@ struct ErrorResponse {
         const std::size_t varOffset = fixedBase + BODY_FIXED;
         const std::size_t varWritten = putVarStr(buf + varOffset, message);
 
-        return varOffset + varWritten;
+        std::size_t end = varOffset + varWritten;
+        if (code == static_cast<int16_t>(ErrorCode::Throttled)) {
+            detail::putLE64(buf, static_cast<int>(end), static_cast<int64_t>(retryAfterNs));
+            end += 8;
+        }
+        return end;
     }
 
     /// Decode a full frame from buf[0..avail-1].
@@ -471,6 +480,8 @@ struct ErrorResponse {
         std::size_t pos = fixedBase + BODY_FIXED;
         if (!getVarStr(buf, avail, pos, msg.message)) return std::nullopt;
 
+        if (msg.code == static_cast<int16_t>(ErrorCode::Throttled) && pos + 8u <= avail)
+            msg.retryAfterNs = static_cast<uint64_t>(detail::getLE64(buf, static_cast<int>(pos)));
         return msg;
     }
 };
