@@ -622,6 +622,12 @@ public:
         }
         return mask;
     }
+    /// #514 (seed): the seed session is Connected but has heard nothing for more than two of its keepalive intervals
+    /// (a live node answers each Ping).  Duty thread only.
+    [[nodiscard]] bool seedSilent(int64_t nowNs) const noexcept {
+        const session::SessionMachine& m = seedSession().machine;
+        return m.silentLongerThan(nowNs, 2 * m.keepaliveIntervalNs());
+    }
     /// T15b: the seed session's machine (read-only; duty thread only).
     [[nodiscard]] const session::SessionMachine& seedMachine() const noexcept { return seedSession().machine; }
     /// A7 park-until-work: the invoker driver's socket-readiness fds (AeronTransport::wakeFds) — the

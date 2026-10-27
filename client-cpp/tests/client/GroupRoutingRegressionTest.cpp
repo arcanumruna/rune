@@ -13,6 +13,7 @@
 // more nodes).  Subscribe leadership is modelled by InvokerGateway::
 // subscribeLeader.  Everything is single-threaded and condition-driven: no
 // sleeps; every wait is a bounded pump loop.
+#include <optional>
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
 
@@ -3833,11 +3834,11 @@ TEST(GroupRoutingRegression, ALeaderSilentThenBackStopsRefreshingAndKeepsItsRead
     EXPECT_FALSE(sub.finished());
 }
 
-// Sibling of #514 on the SEED session (M31+ review: a gap in the #514 fix — out of the suite until it is fixed):
+// Sibling of #514 on the SEED session (M31+ review: a gap in the #514 fix, closed in fix round 1):
 // a reader bound on the seed's broker when the seed crashes and the cluster elects node 1.  The silent watch
 // skips session 0 and a refresh would be asked on the dead seed first, so the reader waits for the seed
 // session's stale timeout (responseTimeoutNs) before anything moves it.
-TEST(GroupRoutingRegression, DISABLED_ABoundReaderOnACrashedSeedMovesBeforeTheSeedIsStaleAdversarialRegression) {
+TEST(GroupRoutingRegression, ABoundReaderOnACrashedSeedMovesBeforeTheSeedIsStaleAdversarialRegression) {
     RigOptions o;
     o.keepaliveNs       = 50'000'000;
     o.responseTimeoutNs = 60'000'000'000;
@@ -3863,6 +3864,145 @@ TEST(GroupRoutingRegression, DISABLED_ABoundReaderOnACrashedSeedMovesBeforeTheSe
                         40'000'000));
     EXPECT_GE(subscribesAt(r.gw, 0, n1), 1) << "the reader on the crashed seed did not move within ~5 s";
     EXPECT_FALSE(sub.finished());
+}
+
+namespace {
+/// The #514 (seed) rig: a node-1 reader on p1 keeps node 1's session open, a reader on p0 is bound at the seed.
+struct SeedRig {
+    RigOptions    o;
+    GroupRig      r;
+    int           n1{0};
+    int           base_{0};
+    std::optional<rc::Subscription> other_;
+    std::optional<rc::Subscription> sub_;
+    static RigOptions opts() {
+        RigOptions o;
+        o.keepaliveNs       = 50'000'000;
+        o.responseTimeoutNs = 60'000'000'000;
+        return o;
+    }
+    SeedRig(int base) : o(opts()), r(base, base + 1, o), base_(base) {
+        const auto [node1, p1port] = r.addNode(base);
+        n1 = node1;
+        r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+        r.gw.partitions      = {{1, 0, 0, 1, base, ""}, {1, 1, 1, 1, base, ""}};
+        r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+        r.connect();
+        other_.emplace(r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                          [](const rc::Record&) {}));
+    }
+    bool bind() {
+        if (!r.drive([&] { return r.subAt(1, n1) != nullptr && other_->active(); })) return false;
+        sub_.emplace(r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                        [](const rc::Record&) {}));
+        if (!r.drive([&] { return r.subAt(0, 0) != nullptr && sub_->active(); })) return false;
+        return settleRefreshes(r);
+    }
+    void moveP0ToNode1() {
+        r.gw.partitions      = {{1, 0, 1, 2, base_, ""}, {1, 1, 1, 1, base_, ""}};
+        r.gw.subscribeLeader = {{0, n1}, {1, n1}};
+    }
+};
+int unsubscribesAt(const test_support::InvokerGateway& gw, int64_t subId, int ep) {
+    int n = 0;
+    for (std::size_t i = 0; i < gw.unsubscribed.size(); ++i)
+        n += (gw.unsubscribed[i] == subId && gw.unsubscribedAt[i] == ep) ? 1 : 0;
+    return n;
+}
+} // namespace
+
+// Seed alive, p0's leader moves to node 1: the seed-homed reader follows fresh metadata (reconcile no longer skips
+// homeSession == 0), releases its old instance on the seed exactly once, and is not ended.
+// RED by mutation: restore the `homeSession == 0 -> continue` skip, or drop the seed release block.
+TEST(GroupRoutingRegression, ASeedHomedReaderFollowsAMovedRouteWhileTheSeedIsUpRegression) {
+    SeedRig s(4571);
+    ASSERT_TRUE(s.bind());
+    const int64_t oldId = s.sub_->subscriptionId();
+    s.moveP0ToNode1();
+    s.r.client.testRequestMetadataNow();
+    const int pingsBefore = s.r.gw.pings;
+    EXPECT_TRUE(s.r.drive([&] { return subscribesAt(s.r.gw, 0, s.n1) >= 1 || s.r.gw.pings >= pingsBefore + 100; },
+                          40'000'000));
+    EXPECT_GE(subscribesAt(s.r.gw, 0, s.n1), 1);
+    EXPECT_TRUE(s.r.drive([&] { return unsubscribesAt(s.r.gw, oldId, 0) >= 1 || s.r.gw.pings >= pingsBefore + 100; },
+                          40'000'000));
+    const int pingsAfter = s.r.gw.pings;
+    EXPECT_TRUE(s.r.drive([&] { return s.r.gw.pings >= pingsAfter + 20; }, 40'000'000));
+    EXPECT_EQ(unsubscribesAt(s.r.gw, oldId, 0), 1) << "the old seed instance must be released exactly once";
+    EXPECT_FALSE(s.sub_->finished());
+}
+
+// Seed alive and p0 stays on the seed: refreshes never re-arm or move the seed-homed reader.
+// RED by mutation: drop the `leaderSession == 0 -> continue` guard in the reconcile sweep.
+TEST(GroupRoutingRegression, ASeedHomedReaderWhoseRouteStaysOnTheSeedIsNeverReArmedRegression) {
+    SeedRig s(4573);
+    ASSERT_TRUE(s.bind());
+    const int pingsBefore = s.r.gw.pings;
+    int round = 0;
+    EXPECT_TRUE(s.r.drive([&] {
+        if (s.r.gw.pings >= pingsBefore + 40 * (round + 1) && round < 5) {
+            ++round;
+            s.r.client.testRequestMetadataNow();
+        }
+        return s.r.gw.pings >= pingsBefore + 200;
+    }, 40'000'000));
+    EXPECT_GE(round, 4);
+    EXPECT_EQ(subscribesAt(s.r.gw, 0, 0), 1);
+    EXPECT_EQ(subscribesAt(s.r.gw, 0, s.n1), 0);
+    EXPECT_FALSE(s.sub_->finished());
+}
+
+// The seed crashes, p0 moves to node 1, then the seed comes back: p0 is subscribed on node 1 once and never
+// re-sent to the returned seed.
+TEST(GroupRoutingRegression, AReaderMovedOffACrashedSeedIsNotSubscribedTwiceWhenTheSeedReturnsRegression) {
+    SeedRig s(4575);
+    ASSERT_TRUE(s.bind());
+    s.r.gw.deadEndpoints.insert(0);
+    s.moveP0ToNode1();
+    const int pingsBefore = s.r.gw.pings;
+    ASSERT_TRUE(s.r.drive([&] { return subscribesAt(s.r.gw, 0, s.n1) >= 1 || s.r.gw.pings >= pingsBefore + 100; },
+                          40'000'000));
+    ASSERT_GE(subscribesAt(s.r.gw, 0, s.n1), 1) << "the reader never moved";
+    const int atSeed = subscribesAt(s.r.gw, 0, 0);
+    s.r.gw.deadEndpoints.erase(0);
+    const int pingsReturn = s.r.gw.pings;
+    EXPECT_TRUE(s.r.drive([&] { return s.r.gw.pings >= pingsReturn + 200; }, 80'000'000));
+    EXPECT_EQ(subscribesAt(s.r.gw, 0, s.n1), 1);
+    EXPECT_EQ(subscribesAt(s.r.gw, 0, 0), atSeed) << "a new Subscribe for p0 reached the returned seed";
+    EXPECT_FALSE(s.sub_->finished());
+}
+
+// The group twin: a member whose p0 fetch lives on the seed moves it to node 1 before the seed session is stale.
+// RED by mutation: remove the seed branch in watchSilentLeaders_, or ask the seed first in
+// sendMetadataRequestAnywhere_.
+TEST(GroupRoutingRegression, AGroupFetchOnACrashedSeedMovesBeforeTheSeedIsStaleRegression) {
+    RigOptions o;
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 60'000'000'000;
+    GroupRig r(4577, 4578, o);
+    const auto [n1, p1port] = r.addNode(4577);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4577, ""}, {1, 1, 1, 1, 4577, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment = {{1, 0}, {1, 1}};
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testLeaderFor(1, 1) == 1 && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr && r.subAt(1, n1) != nullptr; }))
+        << "the fetches never reached the seed and node 1";
+    ASSERT_TRUE(settleRefreshes(r));
+
+    r.gw.deadEndpoints.insert(0);
+    r.gw.partitions      = {{1, 0, 1, 2, 4577, ""}, {1, 1, 1, 1, 4577, ""}};
+    r.gw.subscribeLeader = {{0, n1}, {1, n1}};
+    const int pingsBefore = r.gw.pings;
+    EXPECT_TRUE(r.drive([&] { return subscribesAt(r.gw, 0, n1) >= 1 || r.gw.pings >= pingsBefore + 100; },
+                        40'000'000));
+    EXPECT_GE(subscribesAt(r.gw, 0, n1), 1) << "the group fetch on the crashed seed did not move within ~5 s";
+    EXPECT_FALSE(gc.finished());
 }
 
 // Out-of-batch finding (M31+ review, issue #651 — out of the suite until it is fixed): two redirected

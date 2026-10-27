@@ -5438,6 +5438,10 @@ int Client::watchGroupSessions_(int64_t nowNs) {
 int Client::watchSilentLeaders_(int64_t nowNs) {
     nextSilentCheckNs_ = nowNs + silentCheckPeriodNs_;
     uint64_t silent = agent_.leaderSessionsSilentMask(nowNs);
+    if (agent_.seedSilent(nowNs) && (subscriberHub_.usesSession(0) || groupConsumerHub_.fetchUses(0))) {
+        scheduleMetadataRefresh();   // #514 (seed): idempotent while armed
+        return 1;
+    }
     if (silent == 0) [[likely]] return 0;
     for (uint32_t i = 1; i <= 64 && silent != 0; ++i, silent >>= 1) {
         if ((silent & 1u) == 0) continue;
@@ -6173,16 +6177,23 @@ bool Client::offerMetadataOnNode_(uint32_t i) noexcept {
 
 bool Client::sendMetadataRequestAnywhere_() noexcept {
     const auto snap = agent_.stateAndSessionId();
+    const auto n    = static_cast<uint32_t>(agent_.sessionCount());
+    // #514 (seed): a silent seed (Connected, nothing heard for 2 keepalives) is asked last - a crashed seed would
+    // swallow the request until responseTimeoutNs.
+    const bool seedFirst = !agent_.seedSilent(now());
     // M2: a refused submit (command ring full) is not "asked".
-    if (snap.state == session::SessionState::Connected && snap.sessionId != 0 && sendMetadataRequest(snap.sessionId))
+    if (seedFirst && snap.state == session::SessionState::Connected && snap.sessionId != 0 &&
+        sendMetadataRequest(snap.sessionId))
         return true;
     // The seed is down: the first Connected node session asks (duty-thread direct
     // send on that node's ingress, stamped with ITS session id, sealed under its
     // crypto state).  The answer is applied like any other (any session's
     // MetadataResponse reaches onMetadataResponse).
-    const auto n = static_cast<uint32_t>(agent_.sessionCount());
     for (uint32_t i = 1; i < n; ++i)
         if (offerMetadataOnNode_(i)) return true;
+    if (!seedFirst && snap.state == session::SessionState::Connected && snap.sessionId != 0 &&
+        sendMetadataRequest(snap.sessionId))
+        return true;
     return false;
 }
 

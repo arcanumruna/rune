@@ -296,7 +296,7 @@ public:
     /// stale after responseTimeoutNs, fresh metadata moves them sooner.
     [[nodiscard]] std::size_t unansweredHomed() const noexcept { return unansweredHomed_; }
     /// #514: does a pending request (with an active subscription) or a bound active subscription live on node
-    /// session `session`?  False unless routed.  Cold: asked only when that session has gone silent.
+    /// session `session` (0 = the seed: a reader homed there)?  False unless routed.  Cold: asked only when that session has gone silent.
     [[nodiscard]] bool usesSession(uint32_t session) const noexcept;
     /// Duty cycle (while homedCount() != 0): flush held moved Subscribes whose
     /// node session is Connected (re-resolving the leader each attempt); a

@@ -768,7 +768,7 @@ bool SubscriberHub::hasPending() const
 
 bool SubscriberHub::usesSession(uint32_t session) const noexcept
 {
-    if (!routed_() || session == 0) return false;
+    if (!routed_()) return false;
     for (const auto& [corr, req] : pendingByCorrelation_) {
         if (req && req->impl != nullptr && req->impl->active && req->impl->homeSession == session) return true;
     }
@@ -1131,7 +1131,15 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
     // to another node (#365: a crashed leader) — re-arm from the position.
     homedScratch_.clear();
     for (const auto& [id, impl] : activeById_) {
-        if (impl->homeSession == 0 || !impl->active || impl->unsubPending || impl == dispatching_) continue;
+        if (!impl->active || impl->unsubPending || impl == dispatching_) continue;
+        if (impl->homeSession == 0) {
+            // #514 (seed): a reader on the seed moves only when fresh metadata names a node session as its leader
+            // (an unknown route also reads 0 - it stays).  Never counted in `homed` (node-homed only).
+            const int32_t sp = impl->boundPartition >= 0 ? impl->boundPartition : impl->partition;
+            if (router_.leaderSession(router_.ctx, impl->topicId, sp) == 0) continue;
+            try { homedScratch_.push_back(id); } catch (...) {}   // cold; the next pass retries
+            continue;
+        }
         const int32_t part = impl->boundPartition >= 0 ? impl->boundPartition : impl->partition;
         if (router_.epoch(router_.ctx, impl->homeSession) == impl->homeEpoch &&
             router_.leaderSession(router_.ctx, impl->topicId, part) == impl->homeSession) {   // #365: route moved
@@ -1180,12 +1188,16 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
         }
         req->impl     = &impl;
         req->deadline = deadline;
-        if (router_.epoch(router_.ctx, impl.homeSession) == impl.homeEpoch) {
+        const bool wasSeed = impl.homeSession == 0;   // #514 (seed): before homeSession is reset below
+        const bool homeUp  = wasSeed ? router_.epoch(router_.ctx, 0) != 0
+                                     : router_.epoch(router_.ctx, impl.homeSession) == impl.homeEpoch;
+        if (homeUp) {
             // #365: its session is still up (only the route moved): release the
             // old instance there, best-effort as on a NotLeader move.
+            const int64_t relSid = wasSeed ? homeSidOf_(impl, seedSid) : impl.homeSid;
             uint8_t unsubBuf[64]{};
             const std::size_t unsubLen = codec::encodeUnsubscribe(unsubBuf, sizeof(unsubBuf), impl.subscriptionId,
-                                                                  impl.homeSid, router_.nextCorrId(router_.ctx));
+                                                                  relSid, router_.nextCorrId(router_.ctx));
             if (unsubLen > 0) (void)router_.offer(router_.ctx, impl.homeSession, unsubBuf, unsubLen);
         }
         ++homedSessionsLost_;
