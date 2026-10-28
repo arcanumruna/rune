@@ -757,6 +757,8 @@ protected:
             g.erasedSeen = true;
             ASSERT_TRUE(waitGone(nsRoot(dataDir(), g.nsId))) << "ns-" << g.nsId << " directory survived the delete";
             ASSERT_TRUE(waitGone(std::filesystem::path(nsRoot(dataDir(), g.nsId).string() + ".deleting")));
+            ASSERT_TRUE(r_.broker().node().nsKeyedStoresCleanForTest(g.nsId))
+                << "the consumer-offset or transaction-state store still holds a key of the erased namespace " << g.name << " (id " << g.nsId << ")";
             const auto ids = r_.metadataTopics(rootSid());
             for (const int32_t t : g.topicIds)
                 ASSERT_TRUE(std::find(ids.begin(), ids.end(), t) == ids.end()) << "topic id " << t << " of erased " << g.name << " is listed";
