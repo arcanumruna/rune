@@ -5001,6 +5001,9 @@ TEST_F(CG3ServiceTest, MaxGroupsPerNamespaceRegression) {
     rec(1, "a", 1);
     mirror.upsert([&] { cat::NamespaceRecord r; r.nsId = 1; r.name = "a"; r.version = 2; r.limits.maxGroups = 1; return r; }());
     EXPECT_EQ(join(ctxA, "g5", pc::kClientVersion), kLimitCode);
+}
+
+// ===========================================================================
 // C16 adversarial review (#472): the held-offset answer by client version, at every bound and on every path
 // ===========================================================================
 

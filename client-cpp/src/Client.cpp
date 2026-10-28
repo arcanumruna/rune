@@ -3206,6 +3206,13 @@ Client::NamespaceResult<void> Client::deleteNamespace(std::string_view name, std
              },
              [&](const Completion& c, std::span<const uint8_t> p) {
                  if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("deleteNamespace()", c, p);
+                 r = ddlResultOf(c, p);
+                 r.requestId = requestIdOf(c);
+             });
+    if (r.errorCode != 0) return std::unexpected(std::move(r));
+    return {};
+}
+
 Client::NamespaceResult<void> Client::setNamespaceLimits(std::string_view name, const NamespaceLimitsPatch& patch,
                                                          std::chrono::milliseconds timeout) {
     namespace rpc = rune::protocol::client;
