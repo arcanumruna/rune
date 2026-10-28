@@ -13,6 +13,8 @@ exact sites listed in scripts/atomics_allowlist.txt:
                 mmap'd file (not shared state, not an atomic, not a mutex);
   CPU-HINT    — a spin-wait CPU hint (pause/yield) in the busy-spin idle
                 strategy — no shared state, no ordering contract;
+  CYCLE-COUNTER — a read of the CPU's own cycle counter (rdtsc / cntvct_el0)
+                for a single-thread cost measurement — no shared state;
   SLICE-B     — TEMPORARY: F9 slice B converts these, then deletes the entry;
   UNSCOPED    — TEMPORARY: found by this guard, owned by neither slice yet;
   DEBUG-ONLY  — a debug-build test record compiled out of release builds (no
@@ -152,7 +154,7 @@ ATOMIC_DECL_RE = re.compile(
     r"(?:\b(?:\w+::)*atomic(?:_ref)?\s*<[^;{}()]*?>|\b_Atomic\s*\([^)]*\)|\b_Atomic\s+[\w:\s*]+?)"
     r"\s*[*&]?\s*(\w+)\s*(?:[{=;\[]|\()")
 
-CATEGORIES = {"RING", "CLEANER", "CRASH-ORDER", "CPU-HINT", "SLICE-B", "UNSCOPED", "DEBUG-ONLY"}
+CATEGORIES = {"RING", "CLEANER", "CRASH-ORDER", "CPU-HINT", "CYCLE-COUNTER", "SLICE-B", "UNSCOPED", "DEBUG-ONLY"}
 SOURCE_EXTS = {".cpp", ".h", ".hpp", ".cc", ".cxx", ".ipp", ".inl"}
 SKIP_DIR_NAMES = {"tests", "build", "build-fast", "build-tsan", "build-release",
                   "cmake-build-debug", "cmake-build-release", ".git", "_deps"}

@@ -170,7 +170,7 @@ struct Rig {
         limits_[slot] = SlotLimit{ns, limitBytes};
         settle();
     }
-    void release(uint16_t slot, uint32_t ns) { vs.onNsSlotRelease(slot, ns); limits_.erase(slot); }
+    void release(uint16_t slot, uint32_t ns) { vs.onNsSlotFreed(slot, ns); limits_.erase(slot); }
     int drive(int32_t srcTopic, uint16_t slot, uint32_t ns, const SimLog& log, uint64_t gen = 0) {
         auto rd = [&](int64_t f, int64_t t) { return log.read(f, t); };
         const int n = vs.driveFolds(srcTopic, 0, rd, log.end, rv::kNoAbortedTxns, 0, nullptr, gen, true, NsTag{slot, ns});

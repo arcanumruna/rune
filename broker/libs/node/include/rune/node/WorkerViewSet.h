@@ -520,7 +520,7 @@ public:
         }
         nsSlots_.setLimits(slot, l);   // the over decision is the aggregator's (ViewMemOver): a raised limit clears it there
     }
-    void onNsSlotRelease(uint16_t slot, uint32_t nsId) {
+    void onNsSlotFreed(uint16_t slot, uint32_t nsId) {
         if (!nsSlots_.release(slot, nsId)) { ++nsSlotMismatches_; return; }
         nsViewMem_[slot] = 0; nsViewMemOver_[slot] = 0;
     }

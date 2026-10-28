@@ -14,6 +14,8 @@
 #   CPU-HINT    — spin-wait CPU hint (pause/yield) in BusySpinIdleStrategy; no
 #                 shared state, no ordering contract (F9a r1: flagged by the
 #                 widened inline-asm detection — pending ruling).
+#   CYCLE-COUNTER — a read of the CPU's own cycle counter for a single-thread
+#                 cost measurement (no shared state, no ordering contract).
 #   SLICE-B     — TEMPORARY: F9 slice B converts these, then deletes the entries.
 #   UNSCOPED    — TEMPORARY: owned by neither slice yet; must be converted.
 #   DEBUG-ONLY  — a debug-build test record, compiled out of release builds
@@ -149,6 +151,7 @@ libs/consensus/src/NodeStateFile.cpp | inline void crashOrderBarrier() noexcept 
 libs/consensus/include/rune/consensus/IdleStrategy.h | __asm__ volatile("pause" ::: "memory"); | 1 | CPU-HINT | BusySpinIdleStrategy spin hint (pause/yield; compiler-barrier fallback): no shared state
 libs/consensus/include/rune/consensus/IdleStrategy.h | __asm__ volatile("yield" ::: "memory"); | 1 | CPU-HINT | BusySpinIdleStrategy spin hint (pause/yield; compiler-barrier fallback): no shared state
 libs/consensus/include/rune/consensus/IdleStrategy.h | __asm__ volatile("" ::: "memory"); | 1 | CPU-HINT | BusySpinIdleStrategy spin hint (pause/yield; compiler-barrier fallback): no shared state
+libs/node/include/rune/node/Worker.h | asm volatile("mrs %0, cntvct_el0" : "=r"(v)); | 1 | CYCLE-COUNTER | aarch64 cycle counter for the per-namespace queryCycles charge (Task 14, D28)
 
 # ------------------------------------------------------------ SLICE-B
 libs/gateway/include/rune/gateway/ClientGateway.h | #include <atomic> | 1 | SLICE-B | ClientGateway::minIsr_ (slice B)

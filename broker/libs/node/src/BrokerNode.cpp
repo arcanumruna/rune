@@ -6042,8 +6042,8 @@ void BrokerNode::onNsErasedSlot_(uint32_t nsId) {
     if (slot == kNoNsSlot || nsId == 0) return;
     if (!nsSlots_.release(slot, nsId)) return;
     freeNsMetric_(slot);
-    if (gateway_) gateway_->onNsSlotRelease(slot, nsId);
-    nsAggregator_.onSlotRelease(slot, nsId);
+    if (gateway_) gateway_->onNsSlotFreed(slot, nsId);
+    nsAggregator_.onSlotFreed(slot, nsId);
     if (workerPool_) nsSlotFanout_.post(NsSlotRelease{slot, nsId});
     postCleanerNsLimit_(slot, CleanerViewChannel::kNsLimitFree, 0, 0);
 }

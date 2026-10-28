@@ -8576,7 +8576,7 @@ void ClientGateway::onNsSlotAssign(uint16_t slot, uint32_t nsId, const rune::pro
     if (slot < nsConns_.size() && nsConns_[slot].perUser.empty()) nsConns_[slot].perUser.reserve(16);   // D24: preallocated at assign
 }
 
-void ClientGateway::onNsSlotRelease(uint16_t slot, uint32_t nsId)
+void ClientGateway::onNsSlotFreed(uint16_t slot, uint32_t nsId)
 {
     if (!nsSlots_.release(slot, nsId)) { ++nsSlotMismatches_; return; }
     if (slot < nsConns_.size()) nsConns_[slot] = NsConnSlot{};   // a reused slot starts from zero usage

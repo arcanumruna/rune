@@ -1791,7 +1791,11 @@ public:
         work += drainSessionOps_();
         work += beginPushPass_();   // F5: push budget + last pass's deferred reads first
         if (nowNs >= nextDiskScanNs_) [[unlikely]] scanNamespaceDisk_(nowNs);   // Namespaces Phase 2 Task 11 (D25)
-        if (nowNs >= nextNsReportNs_) [[unlikely]] { nextNsReportNs_ = nowNs + nsReportIntervalNs_; work += reportNsUsage_(); }   // Task 14
+        if (nowNs >= nextNsReportNs_) [[unlikely]] {   // Task 14: the first tick only arms the deadline (nothing to report yet)
+            const bool armed = nextNsReportNs_ != kNsReportUnarmed;
+            nextNsReportNs_ = nowNs + nsReportIntervalNs_;
+            if (armed) work += reportNsUsage_();
+        }
         // Re-check I6: one INFO line the first pass a consumer is connected to THIS
         // worker's MDC egress (every mode); latched, so one branch per pass after it.
         if (workerEgress_ && !workerEgress_->connectedLogged()) [[unlikely]]
@@ -6276,7 +6280,8 @@ private:
     std::vector<NsHot>    nsHot_ = std::vector<NsHot>(NsSlotTable::kDefaultCapacity);
     std::vector<uint64_t> nsLastReport_ = std::vector<uint64_t>(NsSlotTable::kDefaultCapacity * kNsMetrics, 0);
     int64_t               nsReportIntervalNs_ = 5'000'000;
-    int64_t               nextNsReportNs_ = 0;
+    static constexpr int64_t kNsReportUnarmed = std::numeric_limits<int64_t>::min();
+    int64_t               nextNsReportNs_ = kNsReportUnarmed;
     uint64_t              throttledRefusals_ = 0;
     uint16_t              lastViewReadSlot_ = kNoNsSlot;
 public:
@@ -6348,7 +6353,7 @@ private:
     }
     [[gnu::cold]] bool applyNsSlotRelease_(uint16_t slot, uint32_t nsId) {
         if (!nsSlots_.release(slot, nsId)) { noteNsSlotMismatch_(); return false; }
-        if (viewSet_ != nullptr) viewSet_->onNsSlotRelease(slot, nsId);
+        if (viewSet_ != nullptr) viewSet_->onNsSlotFreed(slot, nsId);
         resetNsSlotState_(slot);
         return true;
     }

@@ -557,14 +557,14 @@ public:
     void onNamespaceErased(uint32_t nsId) {
         (void)namespaces_.erase(nsId);
         if (txnService_ != nullptr) txnService_->setNamespaceTxnLimits(nsId, 0, 0);   // Task 10
-        if (const uint16_t sl = nsSlots_.slotOf(nsId); sl != rune::node::kNoNsSlot && nsId != 0) onNsSlotRelease(sl, nsId);
+        if (const uint16_t sl = nsSlots_.slotOf(nsId); sl != rune::node::kNoNsSlot && nsId != 0) onNsSlotFreed(sl, nsId);
     }
     // Namespaces Phase 2 Task 8 (D22): this gateway's OWN copy of the node's slot table, fed by the control thread
     // (BrokerNode) before it hands the namespace record to onNamespaceUpserted.  A session caches (nsId, nsSlot) at login;
     // a produce whose tag no longer matches is refused InvalidRequest and counted (`rune.ns.slot_mismatch`).
     void configureNsSlots(uint32_t capacity) { nsSlots_.reset(capacity); nsConns_.assign(nsSlots_.capacity(), NsConnSlot{}); }
     void onNsSlotAssign(uint16_t slot, uint32_t nsId, const rune::protocol::NamespaceLimits& l);
-    void onNsSlotRelease(uint16_t slot, uint32_t nsId);
+    void onNsSlotFreed(uint16_t slot, uint32_t nsId);
     /// Mismatches counted here plus the cumulative counts the workers reported (SessionSignal NsSlotMismatch).
     [[nodiscard]] uint64_t nsSlotMismatchTotal() const noexcept {
         uint64_t n = nsSlotMismatches_;

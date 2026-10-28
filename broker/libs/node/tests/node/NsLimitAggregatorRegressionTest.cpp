@@ -257,7 +257,7 @@ TEST(NsLimitAggregatorRegression, RecreatedSlotStartsClearRegression) {
     rig.add(NsMetric::ProduceBytes, 100);
     rig.tick();
     ASSERT_EQ(rig.throttles.size(), 1u);
-    rig.agg.onSlotRelease(kSlot, kNs);
+    rig.agg.onSlotFreed(kSlot, kNs);
     rig.agg.onSlotAssign(kSlot, kNs + 1, produceBytes(1000));
     EXPECT_EQ(rig.agg.debtOf(kSlot, ThrottleKind::ProduceBytes), 0u);
     EXPECT_EQ(rig.agg.sentUntil(kSlot, ThrottleKind::ProduceBytes), 0);
@@ -268,7 +268,7 @@ TEST(NsLimitAggregatorRegression, RecreatedSlotStartsClearRegression) {
     EXPECT_EQ(rig.throttles.size(), 1u) << "no throttle for the new owner";
     // A release with the wrong nsId frees nothing.
     const uint64_t stale = rig.agg.staleReports();
-    rig.agg.onSlotRelease(kSlot, kNs);
+    rig.agg.onSlotFreed(kSlot, kNs);
     EXPECT_EQ(rig.agg.staleReports(), stale + 1);
 }
 

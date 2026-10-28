@@ -73,7 +73,7 @@ public:
         }
         slots_.setLimits(slot, l);   // the next tick applies them (a SetLimits between a read and a broadcast)
     }
-    void onSlotRelease(uint16_t slot, uint32_t nsId) {
+    void onSlotFreed(uint16_t slot, uint32_t nsId) {
         if (!slots_.release(slot, nsId)) { ++staleReports_; return; }
         resetSlot_(slot);
     }
