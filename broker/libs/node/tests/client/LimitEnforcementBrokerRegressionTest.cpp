@@ -73,14 +73,14 @@ std::span<const uint8_t> bytesOf(const std::string& s) { return {reinterpret_cas
 struct Outcome { rc::OpStatus status = rc::OpStatus::Timeout; uint16_t code = 0; };
 
 /// One acked produce of one record with `acks`; the broker's verdict (status + ErrorCode).
-Outcome produceOne(rc::Client& c, rc::TopicHandle th, rc::Acks acks, uint64_t key = 1) {
+Outcome produceOne(rc::Client& c, rc::TopicHandle th, rc::Acks acks, uint64_t key = 1, std::size_t valueBytes = 8) {
     rc::ProducerConfig pcfg;
     pcfg.acks     = acks;
     pcfg.lingerUs = 0;
     auto p = c.producer(pcfg);
     rc::Completions cq(c);
-    const uint8_t v[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-    if (p.trySend(th, rc::Key(key), std::span<const uint8_t>(v, 8), cq, 1) != rc::SendResult::Ok) return {rc::OpStatus::InvalidArgument, 0};
+    const std::vector<uint8_t> v(valueBytes, 7);
+    if (p.trySend(th, rc::Key(key), std::span<const uint8_t>(v.data(), v.size()), cq, 1) != rc::SendResult::Ok) return {rc::OpStatus::InvalidArgument, 0};
     p.flush();
     Outcome out;
     const auto deadline = std::chrono::steady_clock::now() + 20s;
@@ -233,4 +233,39 @@ TEST(LimitEnforcementTableRegression, AuthScramFeatureRegression) {
     std::string err2;
     try { badClient.connectAndWait(20s); } catch (const std::exception& e) { err2 = e.what(); }
     EXPECT_NE(err2.find("44"), std::string::npos) << err2;
+}
+
+// ProduceSize rows (max-message-bytes, max-batch-bytes): a real client produce above the limit completes BrokerError 52 and
+// is not stored; at / below it is served.  The exact L-1 / L / L+1 cells run at the worker (NsProduceSizeLimitRegressionTest).
+TEST(LimitEnforcementTableRegression, ProduceSizeRegression) {
+    const LimitRow& msg = *rowOf("max-message-bytes");
+    const LimitRow& bat = *rowOf("max-batch-bytes");
+    AuthBroker b("lim_size");
+    b.bootstrapAdmin(kAdminPw);
+    auto admin = connected(b, "admin");
+    ASSERT_TRUE(admin->createNamespace("m", patchOf("max-message-bytes", msg.limit)).has_value());
+    ASSERT_TRUE(admin->createNamespace("b", patchOf("max-batch-bytes", bat.limit)).has_value());
+    b.createUser("m/u", kUserPw, userGrants());
+    b.createUser("b/u", kUserPw, userGrants());
+    auto define = [&](const std::string& user) {
+        auto c = connected(b, user);
+        const auto r = c->defineTopicAndWait("t", 1, "", false, {}, 20s);
+        if (r.errorCode != 0) throw std::runtime_error("define: " + r.detail);
+        c->close();
+        return rc::TopicHandle{r.topicId, 1};
+    };
+    const rc::TopicHandle tm = define("m/u");
+    const rc::TopicHandle tb = define("b/u");
+    auto um = connected(b, "m/u");
+    EXPECT_EQ(produceOne(*um, tm, rc::Acks::All, 1, msg.limit / 2).status, rc::OpStatus::Ok) << "Below: a record under max-message-bytes";
+    const Outcome longRec = produceOne(*um, tm, rc::Acks::All, 2, msg.limit * 2);
+    EXPECT_NE(longRec.status, rc::OpStatus::Ok) << "Above: a record over max-message-bytes";
+    EXPECT_EQ(longRec.code, kCodeNamespaceLimitExceeded);
+    auto ub = connected(b, "b/u");
+    EXPECT_EQ(produceOne(*ub, tb, rc::Acks::All, 1, bat.limit / 2).status, rc::OpStatus::Ok) << "Below: a batch under max-batch-bytes";
+    const Outcome bigBatch = produceOne(*ub, tb, rc::Acks::All, 2, bat.limit * 2);
+    EXPECT_NE(bigBatch.status, rc::OpStatus::Ok) << "Above: a batch over max-batch-bytes";
+    EXPECT_EQ(bigBatch.code, kCodeNamespaceLimitExceeded);
+    // A refusal does not poison the session: a small produce is served afterwards.
+    EXPECT_EQ(produceOne(*ub, tb, rc::Acks::All, 3, 100).status, rc::OpStatus::Ok);
 }

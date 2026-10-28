@@ -8672,7 +8672,6 @@ private:
     /// answers false (the existing validation answers it).
     [[gnu::cold]] [[gnu::noinline]] static bool anyRecordLongerThan_(std::span<const uint8_t> batch, uint64_t max) noexcept {
         namespace pb = rune::protocol::batch;
-        fprintf(stderr,"WALK size=%zu max=%lu\n", batch.size(), (unsigned long)max);
         if (batch.size() < static_cast<std::size_t>(pb::kRecordBatchOverhead)) return false;
         const int32_t count = static_cast<int32_t>(rune::protocol::detail::getLE32(batch.data() + pb::kRecordCountOffset));
         std::size_t pos = static_cast<std::size_t>(pb::kRecordBatchOverhead);

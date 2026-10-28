@@ -148,10 +148,10 @@ enforced, each with one precise code:
 |---|---|---|
 | `max-topics`, `max-partitions-per-topic`, `max-partitions-total`, `max-views`, `max-schemas`, `max-versions-per-schema`, `max-groups`, `max-users` | at the DDL (groups at a new group's first join, users at `CREATE USER`) | `NamespaceLimitExceeded (52)` |
 | `min-replication-factor`, `max-replication-factor`, `lowest-acks`, `lowest-min-insync` | at topic DDL; the acks floor at every produce | `NamespaceLimitExceeded (52)` |
-| feature bits (compaction, txns, ql, views, sql, redis, anonymous read, scram) | at the DDL or at connect / login | `NamespaceLimitExceeded (52)` |
+| feature bits | the `compaction`, `views`, `txns`, `anonymous read` and `scram` bits are enforced at the DDL or at connect / login. The `ql`, `sql` and `redis` bits are stored only: there is no serving path for them yet | `NamespaceLimitExceeded (52)` |
 | `max-connections`, `max-connections-per-user`, `max-sessions-per-user`, `max-open-txns`, `max-txn-time-ms` | at login / `InitProducerId` / `AddPartitions`, **per node** | `NamespaceLimitExceeded (52)` |
 | `max-disk-bytes` | measured on the node that leads the partition | produce on the leader: `NamespaceLimitExceeded (52)`; follower apply, replication catch-up and the log cleaner are never refused |
-| `max-message-bytes`, `max-batch-bytes` | stored and listed only: no broker path reads them yet | - |
+| `max-message-bytes`, `max-batch-bytes` | the worker's produce intake on the leader. A batch longer than `max-batch-bytes`, or a record whose encoded length is longer than `max-message-bytes`, is refused and nothing is appended. 0 = unlimited | `NamespaceLimitExceeded (52)` |
 | `max-retention-ms`, `max-retention-bytes` | a topic DDL above the maximum is refused; the cleaner applies `min(topic retention, namespace maximum)` | `NamespaceLimitExceeded (52)` at DDL |
 | `produce-bytes-per-sec`, `produce-records-per-sec`, `fetch-bytes-per-sec`, `request-ops-per-sec`, `query-cycles-per-sec` | a per-namespace aggregator compares the node's usage with `limit x elapsed` every `RUNE_NS_LIMIT_TICK_US` (default 1000) | `Throttled (53)` carrying a retry-after; the client library waits it out and retries |
 | `max-view-memory-bytes` | the node's view chunks | the namespace's views pause at their offset and a view read answers `ViewPaused (54)`; they resume when memory falls or the limit is raised |
