@@ -1733,6 +1733,8 @@ public:
     /// pass on (the replica still fetches) until holdSecurityApplyForTest(false) - a restarted broker whose local
     /// state is behind the cluster's.
     void holdSecurityApplyAtBootForTest(bool on) noexcept { holdSecurityApplyAtBootForTest_ = on; }
+    /// Test seam, before start(): the namespace reaper issues nothing until its budget is raised.
+    void holdReaperAtBootForTest(bool on) noexcept { holdReaperAtBootForTest_ = on; }
     /// Catalog history Task 22 (checklist 1): a REAL crash for the 3-node slice - stop() without the
     /// controlled-shutdown protocol (no halt, no consensus hand-off, no goodbye to the members): the
     /// threads are joined and the transport torn down, nothing is answered or flushed on purpose.
@@ -2658,6 +2660,7 @@ private:
     bool                                                  bootReconcileDeferred_ = false;   // B6: the admin thread reconciles after catch-up
     bool                                                  holdCatalogApplyAtBootForTest_ = false;
     bool holdSecurityApplyAtBootForTest_ = false;   // issue #15 test seam (startup thread, before start)
+    bool holdReaperAtBootForTest_ = false;          // test seam (startup thread, before start)
     std::vector<int32_t>                                  topicsAtReplicationBuild_;   // serving topic ids when replication was built
     std::thread::id                                       controlThreadId_;   // start() (controller); see controlThreadIdForTest
     // Control thread: the last consensus-driven catalog role posted (single node).
@@ -2809,6 +2812,7 @@ private:
     // workers: nsSlotFanout_ on the worker rings).  Each namespace has one per-node gauge in the metrics file whose
     // owner tag is the nsId (a reader tells a reused slot from the old one).
     NsSlotTable                                           nsSlots_;
+    std::vector<uint8_t>                                  nsDeletingAtBoot_;   // per slot: 1 = the booted catalog has the namespace DELETING
     NsSlotFanout                                          nsSlotFanout_;
     NsLimitAggregator                                     nsAggregator_;       // Task 14 (D28): control thread only
     std::vector<metrics::SlotWriter>                      nsMetricSlots_;       // by nsSlot; unbound (slot() < 0) = none

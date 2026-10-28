@@ -1639,9 +1639,14 @@ void BrokerNode::buildWorkerPool() {
             Worker& wk = workerPool_->worker(w);
             wk.configureNsSlots(nsSlots_.capacity());
             for (uint32_t sl = 0; sl < nsSlots_.capacity(); ++sl)
-                if (nsSlots_.nsIdAt(static_cast<uint16_t>(sl)) != NsSlotTable::kFreeSlot)
-                    wk.applyNsSlotAssignDirect(static_cast<uint16_t>(sl), nsSlots_.nsIdAt(static_cast<uint16_t>(sl)),
-                                               nsSlots_.limits(static_cast<uint16_t>(sl)));
+                if (nsSlots_.nsIdAt(static_cast<uint16_t>(sl)) != NsSlotTable::kFreeSlot) {
+                    const uint32_t nsId = nsSlots_.nsIdAt(static_cast<uint16_t>(sl));
+                    wk.applyNsSlotAssignDirect(static_cast<uint16_t>(sl), nsId, nsSlots_.limits(static_cast<uint16_t>(sl)));
+                    // Review U1: the DELETING gate is rebuilt from the booted catalog - a live event may never come
+                    // while the reaper waits.
+                    if (sl < nsDeletingAtBoot_.size() && nsDeletingAtBoot_[sl])
+                        wk.applyNsThrottleDirect(static_cast<uint16_t>(sl), nsId, ThrottleKind::NsDeleting, 0);
+                }
         }
         // Namespaces Phase 2 Task 14 (D28): the limit aggregator (control thread) starts from the boot slot table; every worker
         // reports its per-slot usage to it at the same period.
@@ -4434,6 +4439,7 @@ void BrokerNode::buildAdminWorker() {
         bootSecurityApplier_.reset();
         if (holdCatalogApplyAtBootForTest_) adminWorkerAgent_->worker().holdApplyForTest(true);
         if (holdSecurityApplyAtBootForTest_) adminWorkerAgent_->worker().holdSecurityApplyForTest(true);
+        if (holdReaperAtBootForTest_) adminWorkerAgent_->worker().reaperForTest().setIssueBudgetForTest(0);
         if (bootReconcileDeferred_) {
             adminWorkerAgent_->worker().deferTopicDirReconcile(config_.dataDir);
         }
@@ -5975,10 +5981,12 @@ void BrokerNode::onNsReapRequest_(const ReapRequestMsg& m) {
 // on the numbers), and the boot topics get their namespace's slot before they are built.
 void BrokerNode::bootAssignNsSlots_() {
     if (!bootApplier_) return;
+    nsDeletingAtBoot_.assign(nsSlots_.capacity(), 0);
     bootApplier_->state().namespaces().forEach([this](const rune::catalog::NamespaceRecord& rec) {
         const auto slot = nsSlots_.assign(rec.nsId);
         if (!slot) { ++nsSlotAssignFailures_; spdlog::error("BrokerNode[{}]: no free namespace slot for nsId {} at boot (bug)", config_.nodeId, rec.nsId); return; }
         nsSlots_.setLimits(*slot, rec.limits);
+        if (std::holds_alternative<rune::catalog::NsDeleting>(rec.state)) nsDeletingAtBoot_[*slot] = 1;
         registerNsMetric_(*slot, rec);
     });
     for (TopicSpec& t : bootTopics_) t.nsSlot = nsSlots_.slotOf(t.nsId);

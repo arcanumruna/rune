@@ -651,9 +651,19 @@ TEST(NamespaceDeletingProduceRegression, ClusterAdminProduceToDeletingNamespaceI
     ASSERT_FALSE(rig.erased(nsId)) << "the reaper is held: the namespace is still DELETING";
 
     rig.restart(/*holdReaper=*/true);
-    for (const int32_t id : ids)
-        EXPECT_TRUE(rig.until([&] { return rig.auth().produce(rig.rootSid(), id) == kUnknownTopic; }, 500))
-            << "after a restart, topic " << id << " of the DELETING namespace still takes a produce";
+    // Review U1: the gate is rebuilt from the booted catalog before the workers run, not from the next live catalog
+    // event - so NO produce after the restart is acked (the log does not grow), not only an eventual UnknownTopic.
+    for (const int32_t id : ids) {
+        const int64_t endBefore = rig.auth().logEnd(id);
+        int acked = 0;
+        EXPECT_TRUE(rig.until([&] {
+            const int code = rig.auth().produce(rig.rootSid(), id);
+            if (code == 0) ++acked;
+            return code == kUnknownTopic;
+        }, 500)) << "after a restart, topic " << id << " of the DELETING namespace still takes a produce";
+        EXPECT_EQ(acked, 0) << "after a restart, topic " << id << " of the DELETING namespace acked a produce";
+        EXPECT_EQ(rig.auth().logEnd(id), endBefore) << "after a restart, topic " << id << " grew";
+    }
 
     rig.releaseReaper();
     ASSERT_TRUE(rig.until([&] { return rig.erased(nsId); }));

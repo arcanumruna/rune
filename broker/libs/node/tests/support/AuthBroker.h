@@ -296,9 +296,13 @@ public:
         return false;
     }
 
+    /// Test seam: runs on the fresh node between construction and start() (every start, restarts included).
+    std::function<void(BrokerNode&)> beforeStartForTest;
+
 private:
     void startNode_() {
         node_ = std::make_unique<BrokerNode>(cfg_);
+        if (beforeStartForTest) beforeStartForTest(*node_);
         node_->start();
         if (!node_->awaitLeader(std::chrono::seconds(30))) throw std::runtime_error("AuthBroker: no leader");
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);

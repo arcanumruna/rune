@@ -303,7 +303,9 @@ public:
 
     /// Restart the broker over the same data and log root in again (the other sessions are gone).  The reaper is held again.
     void restart(bool holdReaper) {
+        if (holdReaper) w_->r.broker().beforeStartForTest = [](BrokerNode& n) { n.holdReaperAtBootForTest(true); };
         w_->r.restart();
+        w_->r.broker().beforeStartForTest = nullptr;
         w_->root = loginRoot();
         w_->rootUsed = Clock::now();
         if (holdReaper) holdReaper_();
