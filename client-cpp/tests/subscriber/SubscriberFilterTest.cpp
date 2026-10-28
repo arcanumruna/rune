@@ -506,3 +506,48 @@ TEST(SubscriberStatusRegression, BatchBytesCountsOnlyDeliveredBatchesRegression)
         << "only the delivered batch counts (duplicate " << duplicate.size() << ", control " << control.size()
         << ", malformed " << malformed.size() << ")";
 }
+
+// ---- C16 adversarial review (#428): batchBytes on every path of a coalesced frame --------------------------------
+
+// One Records frame carries a valid batch followed by a malformed tail (a coalesced frame torn mid-batch): the valid
+// batch is delivered and counted, the tail is not.  Mutation: `batchBytes += rb.size()` up front -> red.
+TEST(SubscriberStatusRegression, BatchBytesOfACoalescedFrameWithAMalformedTailAdversarialRegression) {
+    FilterRig r(4360);
+    r.connect();
+    std::vector<int64_t> seen;
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, {}, [&](const rc::Record& rec) { seen.push_back(rec.offset); });
+    ASSERT_TRUE(r.drive([&] { return sub.subscriptionId() != 0; }));
+    const auto delivered = plainBatch(0, 3);
+    std::vector<uint8_t> frame = delivered;
+    const auto torn = plainBatch(3, 2);
+    frame.insert(frame.end(), torn.begin(), torn.begin() + static_cast<std::ptrdiff_t>(torn.size() / 2));   // torn tail
+    r.gw.pushBatch(*r.firstSub(), 0, frame);
+    ASSERT_TRUE(r.drive([&] { return sub.position() == 3; }));
+    r.passes(300);
+    EXPECT_EQ(seen, (std::vector<int64_t>{0, 1, 2}));
+    EXPECT_EQ(sub.batchBytes(), delivered.size()) << "the torn tail (" << torn.size() / 2 << " bytes) was counted";
+}
+
+// The handler unsubscribes on the first record of a two-batch frame: the second batch is never delivered, so it is
+// never counted; the final status snapshot carries the first batch only.  Mutation: count the whole frame -> red.
+TEST(SubscriberStatusRegression, BatchBytesStopsAtTheBatchAnUnsubscribingHandlerEndedAdversarialRegression) {
+    FilterRig r(4362);
+    r.connect();
+    std::vector<int64_t> seen;
+    rc::Subscription* self = nullptr;
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, {}, [&](const rc::Record& rec) {
+        seen.push_back(rec.offset);
+        if (self != nullptr) self->unsubscribe();
+    });
+    self = &sub;
+    ASSERT_TRUE(r.drive([&] { return sub.subscriptionId() != 0; }));
+    const auto a = plainBatch(0, 2);
+    const auto b = plainBatch(2, 2);
+    std::vector<uint8_t> frame = a;
+    frame.insert(frame.end(), b.begin(), b.end());
+    r.gw.pushBatch(*r.firstSub(), 0, frame);
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); }));
+    EXPECT_EQ(seen, (std::vector<int64_t>{0}));
+    EXPECT_EQ(sub.position(), 1);
+    EXPECT_EQ(sub.batchBytes(), a.size()) << "the batch after the unsubscribe was counted";
+}

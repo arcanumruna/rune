@@ -867,3 +867,190 @@ TEST(GroupSeekRegression, EveryFetchPhaseHandlesEveryEventRegression) {
         EXPECT_EQ(r.seen[T2].times, x.t2Times) << "the second rewind is still pending";
     }
 }
+
+// ===========================================================================
+// C16 adversarial review (#357, #371): the rewind state machine and its OffsetFetch, attacked through the public API
+// ===========================================================================
+
+#include "../support/AllocCounter.h"
+
+namespace {
+std::size_t passesUntil(GroupRig& r, std::map<rc::Token, Done>& out, int n) {
+    for (int i = 0; i < n; ++i) { r.client.doWork(); r.gw.pump(); collect(r, out); }
+    return out.size();
+}
+} // namespace
+
+// #371 x pacing: a seekToCommitted whose OffsetFetch is answered UnstableOffsetCommit (a transaction holds the key)
+// is re-fetched on the duty pass now, so the pacing is the only thing between the pass and a storm.  With the clock
+// frozen, 20k passes send exactly ONE OffsetFetch (the next one is due 100 ms of duty time later); once the hold
+// lifts and the clock moves the rewind completes Ok exactly once at the committed offset.
+// Mutation: drop the Idle pacing check in retryOffsetFetchFor_ -> one OffsetFetch per pass.
+TEST(GroupSeekRegression, AHeldOffsetNeverStormsOffsetFetchesFromTheDutyPassAdversarialRegression) {
+    Fixture f(5711, 5712, {{kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000), {{{kTopic, 1}, 40}}, manualClockOptions());
+    freeze(f.r);
+    const int fetches = f.r.gw.offsetFetches;
+    f.r.gw.offsetFetchErrorCode  = static_cast<int16_t>(rune::protocol::client::ErrorCode::UnstableOffsetCommit);
+    f.r.gw.offsetFetchErrorsNext = 1'000'000;
+    const rc::Token t = f.tok();
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    (void)passesUntil(f.r, f.done, 20'000);
+    EXPECT_EQ(f.r.gw.offsetFetches, fetches + 1) << "the duty pass re-sent the held OffsetFetch without pacing";
+    EXPECT_EQ(f.done.count(t), 0u) << "a held offset ended the rewind";
+    EXPECT_FALSE(f.gc.finished()) << "UnstableOffsetCommit was charged to the fetch budget";
+    // The transaction completes; duty time moves: the next paced fetch seeds and the rewind completes.
+    f.r.gw.offsetFetchErrorsNext = 0;
+    f.r.opt.stepNs = 100'000;
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, t, 40'000));
+    EXPECT_EQ(f.done[t].c.status, rc::OpStatus::Ok);
+    EXPECT_EQ(f.done[t].times, 1);
+    EXPECT_LE(f.r.gw.offsetFetches, fetches + 3) << "paced: 100 ms, then the answer";
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 1)->fromOffset, 40);
+}
+
+// #357.5 x duplicate answers: the Assign answer is replayed AFTER it already seeded p0 and the seeked p1 is Bound
+// (the answered corr is never cleared, so the replay passes the correlation check).  The fence still holds: p1 keeps
+// the seek.  Then a seekToCommitted takes a fresh fetch whose answer DOES move p1 (the fence never outlives its
+// fetch).  Mutation: drop `staleFetchCorr == corr` from onOffsetFetchResponse -> red.
+TEST(GroupSeekRegression, AReplayedAssignAnswerNeverMovesABoundSeekAdversarialRegression) {
+    Fixture f(5713, 5714, {{kTopic, 0}, {kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000),
+              {{{kTopic, 0}, 30}, {{kTopic, 1}, 55}}, manualClockOptions(), /*holdFetch=*/true);
+    const rc::Token t = f.tok();
+    ASSERT_EQ(f.gc.seek({kTopic, 1}, 3, rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, t, 20'000));
+    ASSERT_EQ(f.done[t].c.status, rc::OpStatus::Ok);
+    ASSERT_EQ(f.r.gw.heldOffsetFetches.size(), 1u);
+    const std::vector<uint8_t> answer = f.r.gw.heldOffsetFetches.front();
+    f.r.gw.holdOffsetFetch = false;
+    f.r.gw.releaseOffsetFetches();
+    ASSERT_TRUE(f.r.drive([&] { return f.r.gw.latestSubscription(kTopic, 0) != nullptr; }, 20'000));
+    const auto s1 = *f.r.gw.latestSubscription(kTopic, 1);
+    ASSERT_EQ(s1.fromOffset, 3);
+    for (int dup = 0; dup < 3; ++dup) f.r.gw.send(0, answer.data(), answer.size());
+    (void)passesUntil(f.r, f.done, 2'000);
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 1)->corrId, s1.corrId) << "a replayed answer re-made the seeked fetch";
+    f.r.gw.pushRecords(s1, 3, 7);   // 3..9
+    ASSERT_TRUE(f.consumed(1, 7)) << "a replayed answer moved the seeked partition: its records were dropped";
+    EXPECT_EQ(f.seen.offsets[1].front(), 3);
+    // A later seekToCommitted is not fenced: its own fetch moves p1 to the committed offset.
+    const rc::Token u = f.tok();
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), u), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, u, 20'000));
+    EXPECT_EQ(f.done[u].c.status, rc::OpStatus::Ok);
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 1)->fromOffset, 55) << "the fence outlived its fetch";
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 0)->fromOffset, 30);
+}
+
+// #357.5 x a second seek: both partitions are seeked (p1, then p0 - which superseded nothing, p1's seek completed)
+// while the Assign fetch is in flight.  Its answer moves neither.  p0's seek is the first position p0 ever had (the
+// fetch was its only seed).  Mutation: drop the fence -> p1 jumps to 55 (and/or p0 to 30).
+TEST(GroupSeekRegression, TwoSeeksUnderOneInFlightAssignFetchBothHoldAdversarialRegression) {
+    Fixture f(5715, 5716, {{kTopic, 0}, {kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000),
+              {{{kTopic, 0}, 30}, {{kTopic, 1}, 55}}, manualClockOptions(), /*holdFetch=*/true);
+    const rc::Token t = f.tok(), u = f.tok();
+    ASSERT_EQ(f.gc.seek({kTopic, 1}, 3, rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, t, 20'000));
+    ASSERT_EQ(f.gc.seek({kTopic, 0}, 4, rc::CompletionTarget(f.r.cq), u), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, u, 20'000));
+    EXPECT_EQ(f.done[t].c.status, rc::OpStatus::Ok);
+    EXPECT_EQ(f.done[u].c.status, rc::OpStatus::Ok);
+    EXPECT_EQ(f.r.gw.offsetFetches, 1);
+    const auto s0 = *f.r.gw.latestSubscription(kTopic, 0);
+    const auto s1 = *f.r.gw.latestSubscription(kTopic, 1);
+    EXPECT_EQ(s0.fromOffset, 4);
+    EXPECT_EQ(s1.fromOffset, 3);
+    f.r.gw.holdOffsetFetch = false;
+    f.r.gw.releaseOffsetFetches();
+    (void)passesUntil(f.r, f.done, 2'000);
+    f.r.gw.pushRecords(s0, 4, 2);
+    f.r.gw.pushRecords(s1, 3, 2);
+    ASSERT_TRUE(f.r.drive([&] { return f.seen.offsets[0].size() >= 2 && f.seen.offsets[1].size() >= 2; }, 20'000))
+        << "the in-flight answer moved a seeked partition (p0 " << f.seen.offsets[0].size() << ", p1 "
+        << f.seen.offsets[1].size() << ")";
+    EXPECT_EQ(f.seen.offsets[0].front(), 4);
+    EXPECT_EQ(f.seen.offsets[1].front(), 3);
+    EXPECT_EQ(f.done[t].times, 1);
+    EXPECT_EQ(f.done[u].times, 1);
+}
+
+// Concurrency x generation: an Assign of a new generation lands while seekToCommitted waits for its (held) fetch,
+// with the clock frozen.  The rewind completes Rejoined exactly once on the duty pass; the stale answer released
+// afterwards completes nothing again and seeds nothing; the new generation's own fetch seeds the partition.
+TEST(GroupSeekRegression, AnAssignMidRewindCompletesRejoinedOnceAndTheStaleAnswerIsInertAdversarialRegression) {
+    Fixture f(5717, 5718, {{kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000), {{{kTopic, 1}, 40}}, manualClockOptions());
+    freeze(f.r);
+    f.r.gw.holdOffsetFetch = true;
+    const int fetches = f.r.gw.offsetFetches;
+    const rc::Token t = f.tok();
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_TRUE(f.r.drive([&] { return f.r.gw.offsetFetches == fetches + 1; }, 20'000));
+    f.r.gw.committedOffsets[{kTopic, 1}] = 44;   // a commit lands between the two fetches
+    f.r.gw.sendAssign(f.r.gw.groupSessionIds.back(), 2, {{kTopic, 1}});
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, t, 20'000)) << "the Assign never ended the rewind";
+    EXPECT_EQ(f.done[t].c.status, rc::OpStatus::Rejoined);
+    ASSERT_TRUE(f.r.drive([&] { return f.r.gw.offsetFetches == fetches + 2; }, 20'000)) << "the Assign's own fetch";
+    // Release the stale answer (40) and the Assign's answer (44) together.
+    f.r.gw.holdOffsetFetch = false;
+    f.r.gw.releaseOffsetFetches();
+    ASSERT_TRUE(f.r.drive([&] {
+        collect(f.r, f.done);
+        const auto* s = f.r.gw.latestSubscription(kTopic, 1);
+        return s != nullptr && s->fromOffset == 44;
+    }, 20'000)) << "the new generation's answer never seeded the partition";
+    (void)passesUntil(f.r, f.done, 2'000);
+    EXPECT_EQ(f.done[t].times, 1) << "a rewind completed twice";
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 1)->fromOffset, 44) << "the stale answer seeded the partition";
+}
+
+// Whole-area finding (pre-existing; OffsetFetch seeding): a COMPLETED seek backwards below the committed offset is
+// silently undone by an Assign that keeps the partition (the coordinator's incremental assignment, Stable
+// throughout): onAssign re-fetches the WHOLE assignment and the answer seeds a Bound, offset-known partition up to
+// its committed offset (`position < committed`), so every replayed record of the still-bound subscription is then
+// dropped as a "duplicate".  Fixed: onAssign fetches only the offset-unknown (newly added) partitions.
+TEST(GroupSeekRegression, ACompletedSeekBackwardsSurvivesAnAssignThatKeepsThePartitionAdversarialRegression) {
+    Fixture f(5719, 5720, {{kTopic, 0}, {kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000),
+              {{{kTopic, 0}, 30}, {{kTopic, 1}, 55}});
+    const rc::Token t = f.tok();
+    ASSERT_EQ(f.gc.seek({kTopic, 1}, 3, rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, t));
+    ASSERT_EQ(f.done[t].c.status, rc::OpStatus::Ok);
+    const auto s1 = *f.r.gw.latestSubscription(kTopic, 1);
+    ASSERT_EQ(s1.fromOffset, 3);
+    f.r.gw.pushRecords(s1, 3, 2);   // 3, 4 replayed
+    ASSERT_TRUE(f.consumed(1, 2));
+    const int fetches = f.r.gw.offsetFetches;
+    f.r.gw.sendAssign(f.r.gw.groupSessionIds.back(), 2, {{kTopic, 0}, {kTopic, 1}});   // both kept
+    for (int i = 0; i < 2'000; ++i) { f.r.client.doWork(); f.r.gw.pump(); }   // the Assign (and any fetch) applied
+    EXPECT_EQ(f.r.gw.offsetFetches, fetches) << "an Assign that only keeps known partitions re-fetched them";
+    const auto now1 = *f.r.gw.latestSubscription(kTopic, 1);
+    EXPECT_EQ(now1.corrId, s1.corrId) << "the kept partition was re-subscribed";
+    f.r.gw.pushRecords(now1, 5, 10);   // the replay goes on: 5..14
+    EXPECT_TRUE(f.consumed(1, 12)) << "the Assign answer moved the seeked partition to its committed offset: the replay "
+                                      "5..14 was dropped (delivered " << f.seen.offsets[1].size() << ")";
+}
+
+// Hot path: driveRewinds runs on EVERY duty pass.  Idle (no rewind) and with a rewind waiting for its fetch (the
+// fetch re-sent every 50 ms of duty time), thousands of passes allocate nothing.
+TEST(GroupSeekRegression, DriveRewindsAllocatesNothingIdleOrPendingAdversarialRegression) {
+    PhaseRig r;
+    r.impl->cfg.sessionTimeoutMs = 50;   // a 50 ms answer timeout: the pending fetch is re-sent many times below
+    for (int i = 0; i < 100; ++i) { r.now += 1'000'000; (void)r.hub.driveRewinds(r.now, PhaseRig::kSid, r.send); }
+    alloc_counter::startThisThread();
+    int idleWork = 0;
+    for (int i = 0; i < 5'000; ++i) { r.now += 1'000'000; idleWork += r.hub.driveRewinds(r.now, PhaseRig::kSid, r.send); }
+    const long idleAllocs = alloc_counter::stopThisThread();
+    EXPECT_EQ(idleAllocs, 0) << "driveRewinds allocated with no rewind pending";
+    EXPECT_EQ(idleWork, 0);
+    constexpr rc::Token T = 9;
+    int sends = 0;
+    r.send = [&sends](int32_t, const uint8_t*, std::size_t) { ++sends; return true; };
+    r.seekToCommitted(T);
+    for (int i = 0; i < 300; ++i) { r.now += 1'000'000; (void)r.hub.driveRewinds(r.now, PhaseRig::kSid, r.send); }   // warm: scratch sized
+    const int warmSends = sends;
+    alloc_counter::startThisThread();
+    for (int i = 0; i < 5'000; ++i) { r.now += 1'000'000; (void)r.hub.driveRewinds(r.now, PhaseRig::kSid, r.send); }
+    const long pendingAllocs = alloc_counter::stopThisThread();
+    EXPECT_EQ(pendingAllocs, 0) << "driveRewinds allocated while a rewind waited for its fetch";
+    EXPECT_GT(sends, warmSends) << "the window never re-sent the fetch (the attack did not reach the send path)";
+    EXPECT_EQ(r.seen[T].times, 0) << "the rewind ended inside the window (deadline 30 s)";
+}

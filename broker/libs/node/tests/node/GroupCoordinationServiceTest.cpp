@@ -4954,3 +4954,109 @@ TEST_F(GroupJoinAdversarial, ATermChangeBetweenJoinAndSyncNeverServesTheOldTerms
     EXPECT_EQ(service_->coordinator(g).memberCount(), 1u);
     EXPECT_TRUE(service_->coordinator(g).hasMember(again.memberId));
 }
+
+// ===========================================================================
+// C16 adversarial review (#472): the held-offset answer by client version, at every bound and on every path
+// ===========================================================================
+
+// Version skew x input bounds: every client version a session can announce (negative = unknown, 0, the 9/10 edge,
+// the current version, INT32_MAX) on every path that answers a held / unknown-hold key: OffsetFetch of one entry,
+// fetch-all, plain OffsetCommit, a two-entry OffsetFetch with one held key next to a free one (only the held entry
+// carries the code; the free one is served), and an offset whose record is not committed yet (#471).  Below 10 the
+// answer is NotLeader (never a code a v9 hub rejoins on, never 50 which it does not know); unknown and >= 10 get
+// UnstableOffsetCommit.  Mutation: `v < 10` -> `v < 9` in clientUnderstandsUnstableOffsetCommit, or NotCoordinator
+// in unstableFor_ -> red.
+TEST(OffsetCommitDurabilityRegression, HeldOffsetAnswerByVersionAtEveryBoundAndPathAdversarialRegression) {
+    using H  = rune::coordination::TxnOffsetHold;
+    using EC = pc::ErrorCode;
+    struct Probe {
+        H hold = H::Free;
+        bool onlyP0 = false;   // hold partition 0 only (the mixed two-entry fetch)
+        static H of(void* ctx, const std::string&, const TopicPartition& t) {
+            const auto* p = static_cast<Probe*>(ctx);
+            return p->onlyP0 && t.partition != 0 ? H::Free : p->hold;
+        }
+    };
+    struct Version {
+        int32_t v = -1;
+        static int32_t of(void* ctx, int64_t) noexcept { return static_cast<Version*>(ctx)->v; }
+    };
+    const auto expected = [](int32_t v) {
+        return v >= 0 && v < pc::kClientVersionTxnOffsetFence ? static_cast<int16_t>(EC::NotLeader)
+                                                              : static_cast<int16_t>(EC::UnstableOffsetCommit);
+    };
+    const int32_t versions[] = {std::numeric_limits<int32_t>::min(), -2, -1, 0, 1, 8, 9, 10, 11,
+                                pc::kClientVersion, std::numeric_limits<int32_t>::max()};
+    ASSERT_EQ(pc::kClientVersionTxnOffsetFence, 10);
+    int n = 0;
+    for (const H hold : {H::Held, H::Unknown}) {
+        for (const int32_t v : versions) {
+            SCOPED_TRACE(::testing::Message() << "hold=" << static_cast<int>(hold) << " version=" << v);
+            const std::string group = "g472adv_" + std::to_string(n++);
+            const int16_t want = expected(v);
+            CommitRig g(group);
+            Probe probe;
+            Version ver{v};
+            g.svc.setClientVersionResolverForTest(&Version::of, &ver);
+            ASSERT_EQ(g.commit(group, 40), 0u);
+            ASSERT_EQ(g.svc.handleOffsetCommit(g.req, encodeOffsetCommit(g.req, 1, g.corr++, group, g.member, g.gen,
+                                                                         kTestTopicId, 1, 70),
+                                               g.clock, g.out, sizeof g.out), 0u);
+            g.fetch();
+            g.svc.doWork(g.clock);
+            g.svc.setTxnOffsetHoldProbe(&Probe::of, &probe);
+            probe.hold = hold;
+            // one entry
+            std::size_t len = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, group, kTestTopicId, 0),
+                                                      g.clock, g.out, sizeof g.out);
+            auto f = pc::OffsetFetchResponse::decode(g.out, len);
+            ASSERT_TRUE(f && f->results.size() == 1u);
+            EXPECT_EQ(f->results[0].errorCode, want) << "OffsetFetch";
+            EXPECT_EQ(f->results[0].offset, -1) << "a held offset was handed out";
+            // fetch-all
+            len = g.svc.handleOffsetFetch(g.req, encodeOffsetFetchAll(g.req, 1, g.corr++, group), g.clock, g.out, sizeof g.out);
+            f = pc::OffsetFetchResponse::decode(g.out, len);
+            ASSERT_TRUE(f && !f->results.empty());
+            for (const auto& r : f->results) EXPECT_EQ(r.errorCode, want) << "OffsetFetch (all)";
+            // plain OffsetCommit
+            len = g.commit(group, 41);
+            ASSERT_GT(len, 0u);
+            EXPECT_EQ(CommitRig::codeOf(g.out, len), want) << "OffsetCommit";
+            // two entries, p0 held and p1 free
+            probe.onlyP0 = true;
+            {
+                pc::OffsetFetch msg;
+                msg.sessionId     = 1;
+                msg.correlationId = g.corr++;
+                msg.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+                std::array<pc::OffsetFetchEntry, 2> es{};
+                es[0].topicId = kTestTopicId; es[0].partition = 0;
+                es[1].topicId = kTestTopicId; es[1].partition = 1;
+                len = g.svc.handleOffsetFetch(g.req, msg.encode(g.req, std::span<const pc::OffsetFetchEntry>(es)),
+                                              g.clock, g.out, sizeof g.out);
+            }
+            f = pc::OffsetFetchResponse::decode(g.out, len);
+            ASSERT_TRUE(f && f->results.size() == 2u);
+            for (const auto& r : f->results) {
+                if (r.partition == 0) {
+                    EXPECT_EQ(r.errorCode, want) << "mixed: the held entry";
+                } else {
+                    EXPECT_EQ(r.errorCode, int16_t{0}) << "mixed: the free entry";
+                    EXPECT_EQ(r.offset, 70);
+                }
+            }
+            // #471: a parked (uncommitted) offset record, nothing held
+            probe.hold   = H::Free;
+            probe.onlyP0 = false;
+            ASSERT_EQ(g.svc.handleOffsetCommit(g.req, encodeOffsetCommit(g.req, 1, g.corr++, group, g.member, g.gen,
+                                                                         kTestTopicId, 1, 90),
+                                               g.clock, g.out, sizeof g.out), 0u);
+            len = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, group, kTestTopicId, 1),
+                                          g.clock, g.out, sizeof g.out);
+            f = pc::OffsetFetchResponse::decode(g.out, len);
+            ASSERT_TRUE(f && f->results.size() == 1u);
+            EXPECT_EQ(f->results[0].errorCode, want) << "a parked offset record";
+            EXPECT_EQ(f->results[0].offset, -1);
+        }
+    }
+}

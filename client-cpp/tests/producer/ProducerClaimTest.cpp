@@ -1690,10 +1690,13 @@ TEST(ProducerClaimRegression, DirectClaimAfterARecycledBufferIsByteExactRegressi
     hdr.producerId     = v->producerId;
     hdr.producerEpoch  = v->producerEpoch;
     hdr.baseSequence   = v->baseSequence;
+    // The record's own timestamp (wall ms at the claim) can be a tick past the batch base (wall ms at the builder's
+    // reset): take both from the decoded frame, so only the claimed bytes decide the comparison.
+    int64_t recordTs = 0;
+    rd.forEachRecord([&](std::string_view, std::string_view, int64_t, int64_t ts) { recordTs = ts; });
     rc::producer::ProduceFrameBuilder fresh(0, rd.baseTimestamp());
     const auto kb = key.bytes();
-    fresh.append(std::string_view(reinterpret_cast<const char*>(kb.data()), kb.size()), "0123456789",
-                 rd.baseTimestamp());
+    fresh.append(std::string_view(reinterpret_cast<const char*>(kb.data()), kb.size()), "0123456789", recordTs);
     fresh.setProducerId(v->producerId);
     fresh.setProducerEpoch(v->producerEpoch);
     fresh.setBaseSequence(v->baseSequence);

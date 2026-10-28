@@ -2259,8 +2259,9 @@ void GroupConsumerHub::onAssign(const uint8_t* buf, std::size_t len,
             sendSubscribeForPartitions(*impl, sessionId, sendFn);
         }
 
-        // (#1a) Seed positions for any newly added partitions from broker offsets.
-        sendOffsetFetch(*impl, sessionId, sendFn);
+        // (#1a) Seed positions for the newly added partitions only: a kept partition's position is known (and may be
+        // a seek's); re-fetching it would raise it to the committed offset and skip the requested replay.
+        (void)sendOffsetFetchFor_(*impl, sessionId, sendFn, /*unknownOnly=*/true);
         break;
     }
 }
