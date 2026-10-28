@@ -496,6 +496,8 @@ private:
     // Answers — every exit of a STARTED DDL goes through answer_(req, Response),
     // the ONE place answeredCount() moves; respond_ only encodes (a queue-overflow
     // refusal, never started, calls it directly).
+    /// Task 13: backing text of the SetLimits retention warning (cold; the answer is sent before the next DDL starts).
+    std::string warnScratch_;
     struct Response {
         uint16_t         code            = 0;
         std::string_view detail;

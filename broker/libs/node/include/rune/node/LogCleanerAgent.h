@@ -228,6 +228,24 @@ public:
         ++policyUpdates_;
         return true;
     }
+    // -----------------------------------------------------------------------
+    // Namespaces Phase 2 Task 13 (D27): the per-slot retention maximums (kNsLimitMsgType).  Cleaner-thread-owned; a
+    // vector indexed by the namespace slot, grown on a (cold) message.  runRetention clamps every USER topic's effective
+    // retention to min(topic, maximum); internal topics (topicId < 0) are never clamped.
+    // -----------------------------------------------------------------------
+    bool applyNsLimitMessage(const uint8_t* p, std::size_t n) {
+        if (n != CleanerViewChannel::kNsLimitBytes) return refusePolicy_(n);
+        uint16_t slot; uint32_t nsId; uint64_t ms, bytes;
+        std::memcpy(&slot, p, 2); std::memcpy(&nsId, p + 4, 4); std::memcpy(&ms, p + 8, 8); std::memcpy(&bytes, p + 16, 8);
+        if (slot >= nsRetention_.size()) nsRetention_.resize(static_cast<std::size_t>(slot) + 1);
+        nsRetention_[slot] = nsId == CleanerViewChannel::kNsLimitFree ? NsRetention{} : NsRetention{nsId, ms, bytes, true};
+        ++policyUpdates_;
+        return true;
+    }
+    /// Test seam (cleaner thread): the clamp for a Log tagged (nsId, slot) applied to a topic's retention.
+    void clampRetentionForTest(int32_t topicId, uint16_t slot, uint32_t nsId, int64_t& ms, int64_t& bytes) const noexcept {
+        clampRetention_(topicId, slot, nsId, ms, bytes);
+    }
     /// Test-only, CLEANER thread only (a unit test driving doWork itself, or
     /// BrokerNode::onCleanerThreadForTest): the override of `topicId` (nullptr = none).
     [[nodiscard]] const PolicyOverride* policyOverrideForTest(int32_t topicId) const noexcept {
@@ -831,9 +849,10 @@ private:
             if (!log) continue;
 
             const PolicyOverride* ov = overrideFor_(replica->topicId());   // Task 8
-            const int64_t retentionMs     = ov && ov->retentionMs ? *ov->retentionMs : replica->retentionMs();
-            const int64_t retentionBytes  = ov && ov->retentionBytes ? *ov->retentionBytes
-                                                                     : replica->retentionBytes();
+            int64_t retentionMs     = ov && ov->retentionMs ? *ov->retentionMs : replica->retentionMs();
+            int64_t retentionBytes  = ov && ov->retentionBytes ? *ov->retentionBytes
+                                                               : replica->retentionBytes();
+            clampRetention_(replica->topicId(), log->nsSlot(), log->nsId(), retentionMs, retentionBytes);   // Task 13 (D27)
             const int64_t logStartOffset  = replica->logStartOffset();
             const int64_t fileDelayMs     = replica->fileDeleteDelayMs();
 
@@ -995,6 +1014,23 @@ private:
         checkpoints_.emplace(log, std::move(ckpt));
     }
 
+    struct NsRetention { uint32_t nsId = 0; uint64_t maxMs = 0; uint64_t maxBytes = 0; bool set = false; };
+    std::vector<NsRetention> nsRetention_;
+    /// effective = min(topic, namespace maximum); -1 = unbounded, so the maximum then applies as is.
+    void clampRetention_(int32_t topicId, uint16_t slot, uint32_t nsId, int64_t& ms, int64_t& bytes) const noexcept {
+        if (topicId < 0 || slot >= nsRetention_.size()) return;   // internal topics are never clamped
+        const NsRetention& r = nsRetention_[slot];
+        if (!r.set || r.nsId != nsId) return;
+        if (r.maxMs != 0) {
+            const auto cap = static_cast<int64_t>(std::min<uint64_t>(r.maxMs, static_cast<uint64_t>(INT64_MAX)));
+            ms = ms < 0 ? cap : std::min(ms, cap);
+        }
+        if (r.maxBytes != 0) {
+            const auto cap = static_cast<int64_t>(std::min<uint64_t>(r.maxBytes, static_cast<uint64_t>(INT64_MAX)));
+            bytes = bytes < 0 ? cap : std::min(bytes, cap);
+        }
+    }
+
     // Task 8: per-topic policy overrides (see applyPolicyMessage).
     static constexpr std::size_t kPolicyOverridesReserved = 1024;
     std::unordered_map<int32_t, PolicyOverride> overrides_;
@@ -1045,6 +1081,11 @@ private:
     void applyViewUpdates_() {
         channel_->view.drain([this](int32_t type, aeron::concurrent::AtomicBuffer& buf,
                                     aeron::util::index_t off, aeron::util::index_t len) {
+            if (type == CleanerViewChannel::kNsLimitMsgType) {   // Task 13
+                (void)applyNsLimitMessage(reinterpret_cast<const uint8_t*>(buf.buffer() + off),
+                                          static_cast<std::size_t>(len));
+                return;
+            }
             if (type == CleanerViewChannel::kPolicyMsgType) {   // Task 8
                 (void)applyPolicyMessage(reinterpret_cast<const uint8_t*>(buf.buffer() + off),
                                          static_cast<std::size_t>(len));

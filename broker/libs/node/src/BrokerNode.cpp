@@ -3016,6 +3016,13 @@ void BrokerNode::buildGateway() {
         if (runtimeAgent_) {
             cleanerViewChannel_ = runtimeAgent_->enableCleanerView();   // Task 8: also the policy-override ring
             cleanerAgent_->attachViewChannel(cleanerViewChannel_);
+            // Task 13 (D27): the cleaner starts with the boot table's retention maximums.
+            for (uint32_t sl = 0; sl < nsSlots_.capacity(); ++sl) {
+                const uint32_t id = nsSlots_.nsIdAt(static_cast<uint16_t>(sl));
+                if (id == NsSlotTable::kFreeSlot) continue;
+                const auto& L = nsSlots_.limits(static_cast<uint16_t>(sl));
+                postCleanerNsLimit_(static_cast<uint16_t>(sl), id, L.maxRetentionMs, L.maxRetentionBytes);
+            }
         }
         cleanerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
             *cleanerAgent_, cleanerIdleStrategy_, cleanerClock_);
@@ -5110,7 +5117,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     // Catalog history Task 8: the drop sequence's later steps + ring-full retries.
     if (!droppedAwaitingRetire_.empty()) [[unlikely]] work += serviceDroppedTopics_();
     if (!erasedNsAwaitingRename_.empty()) [[unlikely]] work += serviceErasedNamespaces_();   // Phase 2 Task 7 (D18)
-    if (!purgeOutbox_.empty() || !cleanerPolicyOutbox_.empty() || !reapResultOutbox_.empty()) [[unlikely]]
+    if (!purgeOutbox_.empty() || !cleanerPolicyOutbox_.empty() || !cleanerNsLimitOutbox_.empty() || !reapResultOutbox_.empty()) [[unlikely]]
         work += pumpCatalogOutboxes_();
 
     // (3) Drain response frames (admin → control) → session egress.
@@ -6000,6 +6007,18 @@ void BrokerNode::onNsUpserted_(const rune::catalog::NamespaceRecord& rec) {
     registerNsMetric_(*slot, rec);
     if (gateway_) gateway_->onNsSlotAssign(*slot, rec.nsId, rec.limits);
     if (workerPool_) nsSlotFanout_.post(NsSlotAssign{*slot, rec.nsId, rec.limits});
+    postCleanerNsLimit_(*slot, rec.nsId, rec.limits.maxRetentionMs, rec.limits.maxRetentionBytes);   // Task 13 (D27)
+}
+
+void BrokerNode::postCleanerNsLimit_(uint16_t slot, uint32_t nsId, uint64_t maxRetentionMs, uint64_t maxRetentionBytes) {
+    if (!cleanerViewChannel_) return;   // no cleaner: nothing to clamp (the boot attach re-posts every slot)
+    std::array<uint8_t, CleanerViewChannel::kNsLimitBytes> f{};
+    std::memcpy(f.data(), &slot, 2);
+    std::memcpy(f.data() + 4, &nsId, 4);
+    std::memcpy(f.data() + 8, &maxRetentionMs, 8);
+    std::memcpy(f.data() + 16, &maxRetentionBytes, 8);
+    cleanerNsLimitOutbox_.push_back(f);
+    (void)pumpCatalogOutboxes_();
 }
 
 void BrokerNode::onNsErasedSlot_(uint32_t nsId) {
@@ -6009,6 +6028,7 @@ void BrokerNode::onNsErasedSlot_(uint32_t nsId) {
     freeNsMetric_(slot);
     if (gateway_) gateway_->onNsSlotRelease(slot, nsId);
     if (workerPool_) nsSlotFanout_.post(NsSlotRelease{slot, nsId});
+    postCleanerNsLimit_(slot, CleanerViewChannel::kNsLimitFree, 0, 0);
 }
 
 void BrokerNode::publishNsSlotMetrics_() noexcept {
@@ -6110,6 +6130,19 @@ int BrokerNode::pumpCatalogOutboxes_() {
             ++sent;
         }
         reapResultOutbox_.erase(reapResultOutbox_.begin(), reapResultOutbox_.begin() + static_cast<std::ptrdiff_t>(sent));
+        work += static_cast<int>(sent);
+    }
+    if (!cleanerNsLimitOutbox_.empty()) {
+        std::size_t sent = 0;
+        if (cleanerViewChannel_) {
+            for (const auto& f : cleanerNsLimitOutbox_) {
+                if (!cleanerViewChannel_->view.write(f.data(), f.size(), CleanerViewChannel::kNsLimitMsgType)) break;
+                ++sent;
+            }
+        } else {
+            sent = cleanerNsLimitOutbox_.size();
+        }
+        cleanerNsLimitOutbox_.erase(cleanerNsLimitOutbox_.begin(), cleanerNsLimitOutbox_.begin() + static_cast<std::ptrdiff_t>(sent));
         work += static_cast<int>(sent);
     }
     if (!cleanerPolicyOutbox_.empty()) {

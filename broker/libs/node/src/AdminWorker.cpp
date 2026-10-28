@@ -1232,7 +1232,18 @@ void AdminWorker::answerOk_(const DdlRequest& req, const cat::RequestRecord& r) 
         viewFp = *fp;
     }
     const int32_t gate = r.kind == cat::EventKind::AlterView ? r.topicId : -1;
-    answer_(req, Response{kOK, {}, r.topicId, r.schemaVersion, r.objectId, r.newVersion, gate, viewFp});
+    // Namespaces Phase 2 Task 13 (D27): SetLimits is Ok with a warning when it lowered the retention maximum under topics.
+    std::string_view detail;
+    if (r.kind == cat::EventKind::NamespaceLimitsSet) {
+        const cat::CatalogState& st = applier_.state();
+        if (const cat::NamespaceRecord* nsr = st.namespaces().byId(static_cast<uint32_t>(r.objectId))) {
+            if (const uint64_t n = countRetentionClamped(st, nsr->nsId, nsr->limits); n != 0) {
+                warnScratch_ = "retention clamped on " + std::to_string(n) + " topics";
+                detail = warnScratch_;
+            }
+        }
+    }
+    answer_(req, Response{kOK, detail, r.topicId, r.schemaVersion, r.objectId, r.newVersion, gate, viewFp});
 }
 
 void AdminWorker::respond_(const DdlRequest& req, const Response& r) {

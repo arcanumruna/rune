@@ -25,6 +25,7 @@ enum class LimitArea : uint8_t {
     Txn,          // transaction coordinator (Task 10)
     Disk,         // worker, per node (Task 11)
     ViewMemory,   // worker's view set (Task 12)
+    Retention,    // AdminWorker refusal + the cleaner's clamp (Task 13)
 };
 
 enum class LimitCell : uint8_t { Below = 0, At = 1, Above = 2 };
@@ -67,6 +68,10 @@ inline constexpr std::array kLimitRows = {
     // ---- Task 11: disk ---------------------------------------------------------------------------------------
     LimitRow{"max-disk-bytes",            8, LimitArea::Disk, 16384, 52, "leader produce",            "the produce that brings usage to the limit"},
     // ---- Task 12: view memory (limit = 2 table chunks; codeAbove 54 = ViewPaused, the read answer of a paused view) ------
+    // ---- Task 13: retention maximums (Above = an explicit topic retention over the maximum is refused at DDL; a lowered maximum
+    //      clamps the cleaner's effective retention to min(topic, maximum) on its next pass) ---------------------------------
+    LimitRow{"max-retention-ms",          9, LimitArea::Retention, 3600000, 52, "DefineTopic / AlterTopicConfig(retention.ms)", "retention.ms == the maximum is accepted"},
+    LimitRow{"max-retention-bytes",      10, LimitArea::Retention, 1048576, 52, "DefineTopic / AlterTopicConfig(retention.bytes)", "retention.bytes == the maximum is accepted"},
     LimitRow{"max-view-memory-bytes",    23, LimitArea::ViewMemory,   2, 54, "GetViewRow after the fold", "the fold that brings the view to exactly the limit still serves"},
 };
 // clang-format on

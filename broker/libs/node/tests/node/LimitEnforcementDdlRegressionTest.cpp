@@ -328,3 +328,55 @@ TEST(NamespaceLimitsLowerRegression, RaceWithCreateRegression) {
         else         EXPECT_EQ(defAt, SIZE_MAX);
     }
 }
+
+// ---- Task 13 (D27): retention above the namespace maximum is refused at DDL; SetLimits warns about the clamp ------------
+TEST(LimitEnforcementTableRegression, RetentionRegression) {
+    using rune::protocol::ConfigKey;
+    for (const char* field : {"max-retention-ms", "max-retention-bytes"}) {
+        const LimitRow& row = *rowOf(field);
+        const bool ms = std::string(field) == "max-retention-ms";
+        CatalogDdlRig rig(ms ? "lim_ret_ms" : "lim_ret_bytes"); rig.becomeServingLeader();
+        const uint32_t ns = makeNs(rig, "a", row.index, row.limit);
+        Cells c{rig};
+        auto withRetention = [&](const std::string& name, int64_t v) {
+            auto a = def(name, ns);
+            (ms ? a.config.retentionMs : a.config.retentionBytes) = v;
+            return a;
+        };
+        const auto L = static_cast<int64_t>(row.limit);
+        c.ok(rig.define(withRetention("below", L - 1)), "below: retention == L-1");
+        c.ok(rig.define(withRetention("at", L)), "at: retention == L");
+        c.refused([&] { return rig.define(withRetention("above", L + 1)); }, "above: retention == L+1");
+        c.ok(rig.define(def("unset", ns)), "an unset (-1, unbounded) retention is accepted: the cleaner clamps it");
+        const ConfigKey key = ms ? ConfigKey::RetentionMs : ConfigKey::RetentionBytes;
+        c.ok(rig.alterConfig("below", {{key, L}}, 0, ns), "alter to == L");
+        c.refused([&] { return rig.alterConfig("below", {{key, L + 1}}, 0, ns); }, "alter to L+1");
+        EXPECT_EQ(c.run, 6);
+        // Another namespace without the limit is unaffected.
+        const auto b = rig.createNamespace("b");
+        ASSERT_EQ(b.code, kOk);
+        auto big = def("big", static_cast<uint32_t>(b.objectId));
+        (ms ? big.config.retentionMs : big.config.retentionBytes) = L * 1000;
+        EXPECT_EQ(rig.define(big).code, kOk);
+    }
+}
+
+TEST(LimitEnforcementTableRegression, SetLimitsWarnsWhenRetentionIsClampedRegression) {
+    CatalogDdlRig rig("lim_ret_warn"); rig.becomeServingLeader();
+    const auto a = rig.createNamespace("a");
+    ASSERT_EQ(a.code, kOk);
+    const uint32_t ns = static_cast<uint32_t>(a.objectId);
+    for (int i = 0; i < 3; ++i) ASSERT_EQ(rig.define(def("t" + std::to_string(i), ns)).code, kOk);   // unbounded retention
+    const auto set = rig.setNamespaceLimits("a", maskOf(9), limitsWith(9, 60000));
+    ASSERT_EQ(set.code, kOk) << set.detail;
+    EXPECT_EQ(set.detail, "retention clamped on 3 topics");
+    // Raising it above every topic's retention (none left unbounded to clamp is impossible: -1 stays unbounded) or
+    // clearing it leaves no warning.
+    const auto clear = rig.setNamespaceLimits("a", maskOf(9), limitsWith(9, 0));
+    ASSERT_EQ(clear.code, kOk);
+    EXPECT_TRUE(clear.detail.empty()) << clear.detail;
+    // An unrelated limit change carries no warning.
+    const auto other = rig.setNamespaceLimits("a", maskOf(0), limitsWith(0, 100));
+    ASSERT_EQ(other.code, kOk);
+    EXPECT_TRUE(other.detail.empty());
+}

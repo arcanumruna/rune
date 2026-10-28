@@ -261,8 +261,9 @@ public:
         return await_(submit_(DdlRequest{std::move(m)}));
     }
     Answer alterConfig(const std::string& topic, std::vector<rune::catalog::ConfigChange> changes,
-                       uint32_t expectedVersion = 0) {
+                       uint32_t expectedVersion = 0, uint32_t nsId = 0) {
         AlterTopicConfigMsg m;
+        m.nsId = nsId;
         m.session = kSession; m.corr = ++corr_; m.name = topic; m.expectedVersion = expectedVersion;
         m.changes = std::move(changes);
         m.meta = meta_("", "rig", {}, false);

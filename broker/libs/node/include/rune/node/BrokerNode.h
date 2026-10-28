@@ -2781,6 +2781,8 @@ private:
     std::vector<PendingCreateBehindDrop>                  pendingCreatesBehindDrop_;   // FIFO (per name)
     std::vector<std::string>                              purgeOutbox_;        // kMsgPurgeDroppedDir ring-full retry
     std::vector<std::vector<uint8_t>>                     cleanerPolicyOutbox_;  // kPolicyMsgType ring-full retry
+    std::vector<std::array<uint8_t, CleanerViewChannel::kNsLimitBytes>> cleanerNsLimitOutbox_;   // kNsLimitMsgType ring-full retry (Task 13)
+    void postCleanerNsLimit_(uint16_t slot, uint32_t nsId, uint64_t maxRetentionMs, uint64_t maxRetentionBytes);   // control thread
     std::vector<ReapResultMsg>                            reapResultOutbox_;     // kMsgNsReapResult ring-full retry (Task 7)
     void onNsReapRequest_(const ReapRequestMsg& m);                              // control thread (Task 7)
     void onNamespaceErasedDisk_(uint32_t nsId);                                  // control thread (Task 7, D18)

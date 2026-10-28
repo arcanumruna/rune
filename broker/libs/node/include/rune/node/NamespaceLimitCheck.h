@@ -38,6 +38,22 @@ struct NsObjectCounts {
     return c;
 }
 
+/// Task 13 (D27): the topics of `nsId` whose retention a namespace maximum clamps: a user topic with unbounded (-1) or
+/// larger-than-maximum time or size retention.  One pass, cold (the SetLimits answer).  A maximum of 0 = unlimited.
+[[nodiscard]] inline uint64_t countRetentionClamped(const rune::catalog::CatalogState& s, uint32_t nsId,
+                                                    const rune::protocol::NamespaceLimits& L) {
+    uint64_t n = 0;
+    for (const rune::catalog::TopicObject* t : s.topics()) {
+        if (t->nsId != nsId) continue;
+        const bool msClamped    = L.maxRetentionMs != 0 && (t->config.retentionMs < 0 ||
+                                  static_cast<uint64_t>(t->config.retentionMs) > L.maxRetentionMs);
+        const bool bytesClamped = L.maxRetentionBytes != 0 && (t->config.retentionBytes < 0 ||
+                                  static_cast<uint64_t>(t->config.retentionBytes) > L.maxRetentionBytes);
+        if (msClamped || bytesClamped) ++n;
+    }
+    return n;
+}
+
 /// True when the namespace may use `featureBit` (bit 0 of the record = unrestricted).
 [[nodiscard]] constexpr bool nsFeatureAllowed(const rune::protocol::NamespaceLimits& l, uint32_t featureBit) noexcept {
     return l.featureBits == 0 || (l.featureBits & featureBit) != 0;
@@ -53,6 +69,16 @@ namespace detail {
     return std::string("namespace limit exceeded: ") + what + " (" + std::to_string(have) + " of " + std::to_string(limit) + ")";
 }
 }  // namespace detail
+
+/// D27: explicit (>= 0) time / size retention above the namespace maximum (0 = unlimited).
+[[nodiscard]] inline std::optional<std::string> retentionRefusal(const rune::protocol::NamespaceLimits& L, int64_t retentionMs,
+                                                                 int64_t retentionBytes) {
+    if (L.maxRetentionMs != 0 && retentionMs >= 0 && static_cast<uint64_t>(retentionMs) > L.maxRetentionMs)
+        return detail::over("retention.ms", static_cast<uint64_t>(retentionMs), L.maxRetentionMs);
+    if (L.maxRetentionBytes != 0 && retentionBytes >= 0 && static_cast<uint64_t>(retentionBytes) > L.maxRetentionBytes)
+        return detail::over("retention.bytes", static_cast<uint64_t>(retentionBytes), L.maxRetentionBytes);
+    return std::nullopt;
+}
 
 /// The refusal (detail text) the namespace's limits give the catalog event `e`, nullopt when it is within every limit.
 /// `brokerCount` resolves replicationFactor 0 ("every broker"); `clusterMinIsr` is the effective min.insync of every
@@ -84,6 +110,18 @@ nsLimitRefusal(const rune::protocol::NamespaceLimits& L, const rune::catalog::Ca
                    std::to_string(L.lowestMinInsync);
         if (o->config.cleanupPolicy != 0 && !nsFeatureAllowed(L, kNsFeatureCompaction))
             return "namespace limit exceeded: compaction is not enabled for this namespace";
+        // D27: an explicit retention above the namespace maximum is refused (-1, unbounded, is the unset default: it is
+        // clamped by the cleaner instead).
+        if (auto why = retentionRefusal(L, o->config.retentionMs, o->config.retentionBytes)) return why;
+        return std::nullopt;
+    }
+    if (const auto* o = std::get_if<cat::AlterTopicConfigOps>(&e.ops)) {
+        for (const cat::ConfigChange& c : o->changes) {
+            if (c.key == cat::ConfigKey::RetentionMs)
+                if (auto why = retentionRefusal(L, c.value, -1)) return why;
+            if (c.key == cat::ConfigKey::RetentionBytes)
+                if (auto why = retentionRefusal(L, -1, c.value)) return why;
+        }
         return std::nullopt;
     }
     if (std::holds_alternative<cat::CreateSchemaOps>(e.ops)) {   // adopting a schema onto an untyped topic
