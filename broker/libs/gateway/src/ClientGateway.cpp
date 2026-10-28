@@ -2486,7 +2486,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         // Try to find the publication (non-blocking).
         std::shared_ptr<aeron::ExclusivePublication> pub;
         try {
-            if (aeron_) pub = aeron_->findExclusivePublication(pending.registrationId);   // test gateway: stashed pub
+            if (aeron_ && !pending.resolvedPub) pub = aeron_->findExclusivePublication(pending.registrationId);   // test gateway: stashed pub
         } catch (const std::exception& e) {
             // ERRORED_MEDIA_DRIVER: conductor signalled an error (bad channel, etc.).
             // The conductor erased its own entry when throwing — no registration leak.
