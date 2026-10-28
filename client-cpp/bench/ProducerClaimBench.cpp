@@ -119,7 +119,11 @@ int main() {
             }
         });
     }
-    auto relieve = [&] {  // back-pressured: Invoker flushes itself, Thread mode yields to the duty thread
+    auto relieve = [&](SendResult r) {  // back-pressured: Invoker flushes itself, Thread mode yields to the duty thread
+        if (r != SendResult::BackPressured && r != SendResult::QueueFull) {   // C10 review: a refusal never retries
+            std::fprintf(stderr, "FAIL: a produce was refused (result %d), not back-pressured\n", static_cast<int>(r));
+            std::exit(1);
+        }
         if (invoker) impl.flushBatches(nowNs(), 1, sink);
         else std::this_thread::yield();
     };
@@ -136,7 +140,7 @@ int main() {
             PositionEncoder e(scratch);
             e.userId(i);
             encodeInto(e, i);
-            while (plain->trySend(topic, key, scratch) != SendResult::Ok) relieve();
+            for (SendResult r; (r = plain->trySend(topic, key, scratch)) != SendResult::Ok;) relieve(r);
             break;
         }
         case Mode::Claim:
@@ -149,7 +153,7 @@ int main() {
                     (void)c.commit();
                     break;
                 }
-                relieve();
+                relieve(c.result());
             }
             break;
         case Mode::TypedSend: {
@@ -173,7 +177,7 @@ int main() {
                     (void)w.commit();
                     break;
                 }
-                relieve();
+                relieve(w.result());
             }
             break;
         }

@@ -38,14 +38,22 @@ int main() {
     using clk = std::chrono::steady_clock;
     clk::time_point tEnd;
     impl.setOnAck([](void* c, Token, int64_t, OpStatus, uint16_t) noexcept { ++*static_cast<uint64_t*>(c); }, &completed);
+    // C10 review: the duty loop gives up after kIdleCap consecutive passes without progress (nothing sent, nothing
+    // acked) - a lost ack or a wedged window fails the bench (and its smoke ctest) fast instead of hanging it.
+    constexpr int64_t kIdleCap = 20'000'000;
     std::thread duty([&] {
-        int64_t off = 0;
+        int64_t  off = 0;
+        uint64_t lastProgress = 0;
+        int64_t  idle = 0;
         while (completed < (uint64_t)N) {
             const int64_t now = clk::now().time_since_epoch().count();
             impl.drainRing(now, 256);
             impl.flushBatches(now, 1, sink);
             for (int64_t c : corr) { impl.onProduceResponse(c, off, 0); off += 64; }
             corr.clear();
+            const uint64_t progress = completed + impl.recordsSent();
+            if (progress != lastProgress) { lastProgress = progress; idle = 0; }
+            else if (++idle > kIdleCap) break;   // wedged: report it below, never hang
         }
         tEnd = clk::now();
         done.store(true, std::memory_order_release);
@@ -60,7 +68,12 @@ int main() {
         const int64_t h = static_cast<int64_t>(rune::client::producer::ackhandle::forHandler(static_cast<uint64_t>(i)));
         const bool sample = i % every == 0;
         const auto s0 = sample ? clk::now() : clk::time_point{};
-        while (impl.trySubmit(0, (int32_t)(i % partitions), key, val, h) != SendResult::Ok) std::this_thread::yield();
+        bool wedged = false;
+        while (impl.trySubmit(0, (int32_t)(i % partitions), key, val, h) != SendResult::Ok) {
+            if (done.load(std::memory_order_acquire)) { wedged = true; break; }   // the duty loop gave up
+            std::this_thread::yield();
+        }
+        if (wedged) break;
         if (sample) lat[nLat++] = std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - s0).count();
     }
     while (!done.load(std::memory_order_acquire)) std::this_thread::yield();

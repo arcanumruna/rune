@@ -405,8 +405,9 @@ bool deriveFailsForWorkerZero(const cr::AeadKey& c2b, uint8_t receiverId, cr::Ae
 // a frame sealed under the real key, one sealed under the all-zero key a half-derived announce would have shipped, and a
 // plaintext frame are ALL dropped (counted), nothing is appended, nothing is held as "key pending", and no frame is ever
 // decoded as plaintext.  The announce itself still completes (the other workers are unaffected).
-// RED (mutation): `op.c2bKeyValid = true` on the failure branch - the worker then installs the zero key and opens the
-// frame sealed under it, which is appended.
+// RED (mutation): `op.c2bKeyValid = true` on the failure branch - the worker then installs the zero key (and zero
+// prefix) and opens frame 2b sealed under them, which is appended.  Also RED: shipping the prefix with the zero key
+// (frame 2).
 TEST(GatewayCryptoRegression, AnnouncerDeriveFailureFailsClosedAdversarialRegression) {
     {   // One worker, whose derivation fails: nothing it receives is appended.
         GatewayProduceRig r{ProduceTopicMode::StaticRouted};
@@ -432,6 +433,14 @@ TEST(GatewayCryptoRegression, AnnouncerDeriveFailureFailsClosedAdversarialRegres
         EXPECT_EQ(w.handleIngressFrameForTest(underZero.data(), underZero.size(), r.now), 0)
             << "a frame sealed under the zero key must not open: no half-derived key was installed";
         EXPECT_EQ(w.decryptFailuresForTest(), 2u);
+        // 2b. ...and under the zero key AND the zero nonce prefix: a broker that marks the failed worker valid without
+        // copying either field ships both as zero bytes.  Without this frame the RED mutation below stays green (the
+        // zero prefix alone refuses frame 2).
+        const uint8_t zeroPrefix[4] = {0, 0, 0, 0};
+        const auto underZeroBoth = sealFor(cr::AeadKey{}, zeroPrefix, /*receiverId=*/1, /*seq=*/3, r.produceFrame(703));
+        EXPECT_EQ(w.handleIngressFrameForTest(underZeroBoth.data(), underZeroBoth.size(), r.now), 0)
+            << "a frame sealed under the zero key and zero prefix must not open";
+        EXPECT_EQ(w.decryptFailuresForTest(), 3u);
         // 3. The same produce in the clear, for the encrypted session: refused, never decoded as plaintext.
         const auto plainFrame = r.produceFrame(702);
         EXPECT_EQ(w.handleIngressFrameForTest(plainFrame.data(), plainFrame.size(), r.now), 0);
@@ -469,4 +478,45 @@ TEST(GatewayCryptoRegression, AnnouncerDeriveFailureFailsClosedAdversarialRegres
         EXPECT_EQ(pool.worker(1).decryptFailuresForTest(), 0u) << "worker 1's derivation worked: its frame opens";
         EXPECT_EQ(pool.worker(1).c2bWrongReceiverDropsForTest(), 0u);
     }
+}
+
+// Attack (C10 review): the shard race meets a failed derivation.  A frame sent before the first (key-pending) wave's
+// keys land is HELD; the second wave then arrives with worker 0's derivation FAILED.  The held frame must now fail
+// closed - dropped at once and counted, never held forever, never opened under a zero key, never decoded as plaintext,
+// nothing appended - and a plaintext produce and a zero-key/zero-prefix frame are refused too.
+// RED (mutation): `op.c2bKeyValid = true` on SessionAnnouncer's failure branch (zero key + zero prefix installed) -
+// the zero-key frame opens and is appended.  RED (mutation): keep `cr->recvPending` set when a keyed wave installs no
+// key (Worker.h `cr->recvPending = ...` line) - the held frame returns -1 forever instead of 0.
+TEST(GatewayCryptoRegression, AHeldFrameAfterAFailedDerivationFailsClosedAdversarialRegression) {
+    GatewayProduceRig r{ProduceTopicMode::StaticRouted};
+    SessionKeys k;
+    installGatewayCrypto(*r.gw.sessionCryptoForTest(r.sid), k, pc::kClientVersion);
+    announceFirstWave(r.pool, r.sid, pc::kClientVersion);
+    r.pass();
+    auto& w = r.pool.worker(0);
+    const int64_t before = records(r);
+    const auto honest = sealFor(k.receiverKey(1), k.c2bPrefix, /*receiverId=*/1, /*seq=*/1, r.produceFrame(800));
+    ASSERT_EQ(w.handleIngressFrameForTest(honest.data(), honest.size(), r.now), -1) << "held while the key is pending";
+    ASSERT_EQ(w.intakeKeyHoldsForTest(), 1u);
+
+    rune::node::SessionAnnouncer ann(/*grantAll=*/true);
+    ann.setDeriveReceiverKeyForTest(&deriveFailsForWorkerZero);
+    ASSERT_TRUE(ann.announce(r.pool, r.sid, "aeron:ipc", 7, pc::kClientVersion, /*sessionEncrypted=*/true,
+                             /*keyReady=*/true, k.b2c, k.b2cPrefix, kCipher, k.c2b, k.c2bPrefix));
+    r.pass();   // the failed second wave lands
+
+    EXPECT_EQ(w.handleIngressFrameForTest(honest.data(), honest.size(), r.now), 0)
+        << "the redelivered held frame is dropped once the keyed wave failed, not held forever";
+    EXPECT_EQ(w.intakeKeyHoldsForTest(), 1u) << "no further hold after the keyed wave";
+    EXPECT_EQ(w.decryptFailuresForTest(), 1u);
+    const uint8_t zeroPrefix[4] = {0, 0, 0, 0};
+    const auto zeroBoth = sealFor(cr::AeadKey{}, zeroPrefix, 1, /*seq=*/2, r.produceFrame(801));
+    EXPECT_EQ(w.handleIngressFrameForTest(zeroBoth.data(), zeroBoth.size(), r.now), 0);
+    const auto zeroKey = sealFor(cr::AeadKey{}, k.c2bPrefix, 1, /*seq=*/3, r.produceFrame(802));
+    EXPECT_EQ(w.handleIngressFrameForTest(zeroKey.data(), zeroKey.size(), r.now), 0);
+    const auto plainFrame = r.produceFrame(803);
+    EXPECT_EQ(w.handleIngressFrameForTest(plainFrame.data(), plainFrame.size(), r.now), 0);
+    for (int i = 0; i < 4; ++i) r.pass();
+    EXPECT_EQ(records(r), before) << "a worker whose receiver key never derived appended a frame";
+    EXPECT_EQ(w.intakeKeyHoldsForTest(), 1u);
 }

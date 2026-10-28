@@ -12,6 +12,11 @@ long stopThisThread() noexcept;
 /// thread's counted allocations were such external ones (so a failure can say which counter fired).
 void  noteExternal() noexcept;
 long  externalThisThread() noexcept;
+/// C10 review: allocation-failure injection.  The n-th operator new on the calling thread from now (n >= 1) throws
+/// std::bad_alloc (once); 0 disarms.  injectedFailureFiredThisThread() says whether the armed failure fired, so a
+/// test proves it reached the branch it targets.
+void failNthAllocationThisThread(long n) noexcept;
+bool injectedFailureFiredThisThread() noexcept;
 } // namespace alloc_counter
 
 /// OpenSslAllocCounter.cpp (linked into rune_client_crypto_regression_tests only): true when the CRYPTO_set_mem_functions

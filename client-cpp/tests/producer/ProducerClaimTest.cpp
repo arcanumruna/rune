@@ -1744,3 +1744,48 @@ TEST(ProducerClaimRegression, WritingAnAbandonedClaimSpanAfterCloseNeverReachesA
     EXPECT_EQ(closeLog.got[0].status, rc::OpStatus::Ok);
     EXPECT_FALSE(c.commit());
 }
+
+// Attack (C10 review, #331): the close-path abandon under allocation failure.  Copying the records before the claim
+// into fresh storage throws bad_alloc; the catch branch must fail those records (Closed, each exactly once), quarantine
+// the whole claimed span, report the claim abandoned (commit -> false, no completion for it) and never send anything
+// from that builder - neither the records it failed nor the caller's span, which the caller keeps writing.
+// RED (mutation): the catch branch only marks the claim abandoned (`(void)abandonDirectClaimOn_(ps); return;`) - the
+// builder still holds A, B and the span, which the next pass sends (0xAB on the wire, no Closed completions).
+TEST(ProducerClaimRegression, CloseAbandonUnderBadAllocFailsTheRecordsAndNeverSendsTheSpanAdversarialRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    DirectRig r(cfg);
+    test_support::AckLedger L;
+    r.p.onAck(&test_support::AckLedger::onAck, &L);
+    FrameCapture cap;
+    cap.keepRaw = true;
+    r.pass(cap.fn());
+    const Key key(uint64_t{1});
+    ASSERT_EQ(r.p.trySend(kTopic, key, bytes("A"), rc::AckToken{1}), SendResult::Ok);
+    ASSERT_EQ(r.p.trySend(kTopic, key, bytes("B"), rc::AckToken{2}), SendResult::Ok);
+    rc::Claim c = r.p.tryClaim(kTopic, key, 64, rc::AckToken{3});
+    ASSERT_TRUE(c);
+    std::memset(c.buffer().data(), 0xAB, c.buffer().size());
+
+    alloc_counter::failNthAllocationThisThread(1);   // the copy of A, B into fresh storage
+    r.impl->abandonOpenClaimForClose();
+    const bool fired = alloc_counter::injectedFailureFiredThisThread();
+    alloc_counter::failNthAllocationThisThread(0);
+    ASSERT_TRUE(fired) << "the injected bad_alloc never reached the close abandon";
+
+    EXPECT_EQ(r.impl->claimsAbandoned(), 1u);
+    EXPECT_TRUE(r.impl->claimQuarantineCovers(c.buffer().data(), c.buffer().size())) << "the span is quarantined";
+    for (const rc::Token t : {rc::Token{1}, rc::Token{2}}) {
+        EXPECT_EQ(L.times(t), 1) << "token " << t << " completes exactly once";
+        EXPECT_EQ(L.last[t].status, rc::OpStatus::Closed) << "token " << t;
+    }
+    EXPECT_EQ(L.times(3), 0) << "the uncommitted claim was never accepted: no completion";
+    std::memset(c.buffer().data(), 0xAB, c.buffer().size());   // the caller keeps writing its span
+    for (int i = 0; i < 4; ++i) r.pass(cap.fn());
+    EXPECT_EQ(cap.frames, 0) << "the failed records and the span are never sent";
+    EXPECT_FALSE(containsRun(cap.rawFrames, 0xAB, 8));
+    EXPECT_FALSE(c.commit());
+    EXPECT_EQ(L.times(1), 1);
+    EXPECT_EQ(L.times(2), 1);
+    EXPECT_EQ(L.times(3), 0);
+}

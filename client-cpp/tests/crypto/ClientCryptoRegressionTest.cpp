@@ -1638,3 +1638,67 @@ TEST(ClientCryptoRegression, UnderivableReceiverKeySealsNothingAdversarialRegres
     EXPECT_TRUE(c.workerSend[2].cipher.has_value());
     EXPECT_EQ(c.workerSend[2].sendSeq, 1u);
 }
+
+// Attack (C10 review, #535 x N-I1): a receiver slot derived in one connect episode must never seal a frame of the
+// next.  Episode 1 derives receiver 3's cipher and seals with it; the resume is refused and a fresh connect negotiates
+// NEW keys; in episode 2 receiver 3's derivation fails.  The seal must return 0 (nothing to transmit) - the episode-1
+// cipher is not reused under the new session, no seq is consumed - and once the derive works the frame opens under
+// episode 2's receiver key only, as receiver 3's FIRST frame (seq 1), never under episode 1's key.
+// RED (mutation): beginCryptoHandshake_ resets only encrypted/send/recv instead of `cryptoState_ = CryptoState{}` -
+// episode 1's workerSend[2] cipher survives and seals episode 2's frame under the old key.
+TEST(ClientCryptoRegression, AReceiverSlotFromAnEarlierEpisodeNeverSealsAfterAFailedDeriveAdversarialRegression) {
+    FakeIo io;
+    const std::string serverPem = slurp(testdataPath("server.pem"));
+    const std::string serverKey = slurp(testdataPath("server.key"));
+    auto srv1 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+    sm::SessionConfig cfg;
+    cfg.egressChannel = "aeron:udp?endpoint=client:40456";
+    cfg.offerCrypto = true; cfg.tlsTrustPem = slurp(testdataPath("ca.pem")); cfg.tlsExpectHost = "localhost";
+    cfg.reconnectForeverAfterLive = true;
+    sm::SessionMachine m(io, cfg);
+    int64_t now = 1'000'000'000LL;
+    m.connect(now);
+    ASSERT_TRUE(driveHandshake(m, io, srv1, FrameFixture::kSessionId, now + 1, nullptr,
+                               rpc116::kBrokerVersionReceiverKeys));
+    ASSERT_TRUE(m.cryptoState().receiverKeys);
+    const auto keys1 = srv1.exportKeys(m.cryptoState().cipher, FrameFixture::kSessionId);
+    const auto ep1 = sealFor(m.cryptoState(), 3, 1);
+    ASSERT_FALSE(ep1.empty());
+    ASSERT_EQ(m.cryptoState().workerSend[2].sendSeq, 1u);
+
+    (void)freshConnectAfterAResumeRefused(io, m, now);
+    EXPECT_FALSE(m.cryptoState().workerSend[2].cipher.has_value()) << "episode 1's receiver cipher survived";
+    EXPECT_TRUE(sealFor(m.cryptoState(), 3, 2).empty()) << "nothing seals between episodes";
+
+    io.sends.erase(io.sends.begin(), io.sends.end() - 1);   // the fresh ConnectRequest leads the new handshake
+    auto srv2 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+    ASSERT_TRUE(driveHandshake(m, io, srv2, FrameFixture::kSessionId, now += 1'000'000, nullptr,
+                               rpc116::kBrokerVersionReceiverKeys));
+    auto& c = m.cryptoState();
+    ASSERT_TRUE(c.receiverKeys);
+    const auto keys2 = srv2.exportKeys(c.cipher, FrameFixture::kSessionId);
+    ASSERT_NE(std::memcmp(keys1.c2b.bytes, keys2.c2b.bytes, sizeof keys1.c2b.bytes), 0) << "new episode, new keys";
+
+    c.deriveReceiverKeyFn = &deriveFailsForReceiverThree;
+    for (int i = 0; i < 3; ++i) {
+        const auto fr = sealFor(c, 3, 10 + i);
+        EXPECT_TRUE(fr.empty()) << "an underivable receiver sealed a frame (episode 1's cipher reused?)";
+        if (!fr.empty()) {
+            cr::AeadKey old3{};
+            ASSERT_TRUE(cr::deriveReceiverKey(keys1.c2b, 3, old3));
+            EXPECT_FALSE(opensUnder(old3, keys1.c2bPrefix, keys1.cipher, fr)) << "sealed under episode 1's key";
+        }
+        EXPECT_EQ(c.workerSend[2].sendSeq, 0u);
+        EXPECT_FALSE(c.workerSend[2].cipher.has_value());
+    }
+
+    c.deriveReceiverKeyFn = &cr::deriveReceiverKey;
+    const auto fr = sealFor(c, 3, 20);
+    ASSERT_FALSE(fr.empty());
+    EXPECT_EQ(subOf(fr).seq, 1u) << "receiver 3's first frame of the new episode";
+    cr::AeadKey new3{}, old3{};
+    ASSERT_TRUE(cr::deriveReceiverKey(keys2.c2b, 3, new3));
+    ASSERT_TRUE(cr::deriveReceiverKey(keys1.c2b, 3, old3));
+    EXPECT_TRUE(opensUnder(new3, keys2.c2bPrefix, keys2.cipher, fr));
+    EXPECT_FALSE(opensUnder(old3, keys1.c2bPrefix, keys1.cipher, fr));
+}
