@@ -521,9 +521,7 @@ TEST(PasswordFileRegression, AFileOwnedByAnotherUserIsRefusedRegression) {
 // C20 adversarial review (#678, the whole bug class): the owner check covers only regular files.  A FIFO that another
 // user created (e.g. in a shared directory) lets that user feed the password the client logs in with.  ssh and libpq
 // refuse any credential file owned by someone else, whatever its type.
-// Broken by the C20 review: DISABLED_ until the #678 fix round (the uid check for every file type; the mode check
-// stays regular-file only).
-TEST(PasswordFileRegression, DISABLED_AFifoOwnedByAnotherUserIsRefusedAdversarialRegression) {
+TEST(PasswordFileRegression, AFifoOwnedByAnotherUserIsRefusedAdversarialRegression) {
     if (::geteuid() != 0) GTEST_SKIP() << "needs root to chown a FIFO to another user";
     const std::string path = std::filesystem::temp_directory_path().string() + "/client_auth_pw_fifo_" +
                              std::to_string(::getpid());

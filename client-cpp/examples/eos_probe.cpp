@@ -286,7 +286,7 @@ bool topicMatchesBroker(Client& c, const char* tag, const char* name, const Topi
             fail(tag, std::string("the broker did not describe '") + name + "' (error " + std::to_string(r.errorCode) + ")");
             return false;
         }
-        if (r.topicId != t.topicId || (r.partitionCount > 0 && r.partitionCount != t.partitionCount)) {
+        if (r.topicId != t.topicId || r.partitionCount != t.partitionCount) {   // #688: a broker reporting 0 partitions is a mismatch too
             fail(tag, std::string(name) + " is topic " + std::to_string(r.topicId) + " with " + std::to_string(r.partitionCount) +
                           " partitions on the broker, RUNE_CLIENT_TOPIC_TABLE says topic " + std::to_string(t.topicId) + " with " +
                           std::to_string(t.partitionCount));

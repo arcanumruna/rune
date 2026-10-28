@@ -455,6 +455,7 @@ int run(std::vector<std::string> args, std::istream& in, std::ostream& out, std:
 
     const std::string& cmd = args[0];
 
+    try {   // #680: nothing escapes the CLI as an uncaught exception (the commands' secret guards unwind first)
     if (cmd == "console") {
         return console::cmdConsole(args, in, out, err);
     }
@@ -477,6 +478,10 @@ int run(std::vector<std::string> args, std::istream& in, std::ostream& out, std:
     err << "rune: unknown command '" << cmd << "'\n";
     printUsage(err);
     return 1;
+    } catch (const std::exception& e) {
+        err << "rune: " << e.what() << "\n";
+        return 1;
+    }
 }
 
 } // namespace rune::cli

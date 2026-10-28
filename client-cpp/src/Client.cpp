@@ -54,7 +54,7 @@ static_assert(kMaxPasswordBytes == detail::FixedSecret::kCapacity);
 namespace {
 
 // now + ms, in ns, saturated at INT64_MAX: a huge timeout or retry budget (e.g. milliseconds::max(), "let the
-// deadline end it") never wraps into the past.  ms <= 0 is now (validatedConfig refuses negatives).
+// deadline end it") never wraps into the past.  ms <= 0 is now (validatedInPlace refuses negatives).
 int64_t nsAfter(int64_t nowNs, int64_t ms) noexcept {
     constexpr int64_t kNsPerMs = 1'000'000;
     if (ms <= 0) return nowNs;
@@ -62,23 +62,22 @@ int64_t nsAfter(int64_t nowNs, int64_t ms) noexcept {
     return nowNs + ms * kNsPerMs;
 }
 void validateConfigInPlace(ClientConfig& c);
-// #257 (C6 review): validates `c` and moves it out.  The password (given, or read from passwordFile) is wiped from
-// `c` on every exit - a later refusal (no TLS, a bad iteration cap) or a bad_alloc never frees an unwiped copy, and
-// the moved-from string's in-place (SSO) bytes are zeroed too.
-ClientConfig validatedConfig(ClientConfig& c) {
+// #257 (C6 review): validates `c` in place.  The password (given, or read from passwordFile) is wiped from `c` on a
+// refusal (no TLS, a bad iteration cap) or a bad_alloc, so no unwiped copy is freed.  #682: returns `c` itself - the
+// caller moves it straight into the member, so no named local relies on NRVO and no temporary holds SSO bytes.
+ClientConfig& validatedInPlace(ClientConfig& c) {
     try {
         validateConfigInPlace(c);
     } catch (...) {
         detail::wipeString(c.password);
         throw;
     }
-    ClientConfig out(std::move(c));
-    detail::wipeString(c.password);
-    return out;
+    return c;
 }
 // #682: the agent's config (no password in it); a throw while it is built (bad_alloc) wipes `c.password` - the Client
-// is then not constructed, so nothing else would.
-agent::AgentConfig agentConfigWipingOnThrow(ClientConfig& c) {
+// is then not constructed, so nothing else would.  First statement: the moved-from caller copy is wiped.
+agent::AgentConfig agentConfigWipingOnThrow(ClientConfig& c, std::string& callerPassword) {
+    detail::wipeString(callerPassword);   // #682: the moved-from caller copy (SSO bytes) never outlives the hand-off
     try {
         return toAgentConfig(c);
     } catch (...) {
@@ -245,14 +244,14 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
 // ---------------------------------------------------------------------------
 
 Client::Client(ClientConfig cfg)
-    : cfg_(validatedConfig(cfg))
-    , agent_(agentConfigWipingOnThrow(cfg_), cfg_.password)   // #682: the agent takes the password and wipes cfg_.password
+    : cfg_(std::move(validatedInPlace(cfg)))
+    , agent_(agentConfigWipingOnThrow(cfg_, cfg.password), cfg_.password)   // #682: the agent takes the password and wipes cfg_.password
     , partitionRouter_(metadataCache_)
     , catalogReader_(std::make_unique<CatalogReader>(*this))   // eagerly, on the owning thread (I2)
     , securityReader_(std::make_unique<SecurityReader>(*this))   // authentication Task 8: same rule
 {
     // Review B M4: the agent's sessions hold the credential from here on (one owner, wiped when replaced); the Client
-    // keeps no copy - validatedConfig and the agent constructor moved it out and wiped every source (#257, #682).
+    // keeps no copy - validatedInPlace and the agent constructor moved it out and wiped every source (#257, #682).
     if (cfg_.traceDdlRetries) ddlRetryNotes_.reserve(kMaxDdlRetryNotes);   // push_back never reallocates on the duty thread
     // #514: the silent-leader scan runs four times per keepalive interval.
     silentCheckPeriodNs_ = (cfg_.keepaliveIntervalNs > 0 ? cfg_.keepaliveIntervalNs

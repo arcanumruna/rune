@@ -37,7 +37,7 @@ namespace rune::client::detail {
         std::snprintf(m, sizeof m, "%04o", static_cast<unsigned>(st.st_mode & 0777));
         return "'" + path + "' is accessible by group or others (mode " + m + "); chmod 0600 it";
     }
-    if (S_ISREG(st.st_mode) && st.st_uid != ::geteuid())   // #678: another user could rewrite it
+    if (st.st_uid != ::geteuid())   // #678: every file type, a FIFO included
         return "'" + path + "' is owned by another user (uid " + std::to_string(st.st_uid) + "); it must be owned by the user running the client";
     std::size_t n = 0;
     while (n < sizeof(buf)) {

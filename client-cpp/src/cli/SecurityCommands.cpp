@@ -277,27 +277,22 @@ int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::o
 
     // The cluster key and the one-time password.  Both are wiped before returning.
     std::string key;
-    if (!readFileBytes(keyPath, key, err)) return 1;
     std::string password;
+    struct SecretsWipe { std::string& k; std::string& p; ~SecretsWipe() { rune::client::detail::wipeString(k); rune::client::detail::wipeString(p); } } secretsWipe{key, password};   // #680: wiped on every exit, a throw included
+    if (!readFileBytes(keyPath, key, err)) return 1;
     const bool fromFile = a.has("--password-file");
     if (fromFile) {
         if (auto e = rune::client::detail::readPasswordFile(a.value("--password-file"), password)) {
             err << "rune: " << *e << "\n";
-            rune::client::detail::wipeString(key);
             return 1;
         }
     } else {
         password = generateOneTimePassword();
         if (password.empty()) {
             err << "rune: no randomness available to generate the one-time password\n";
-            rune::client::detail::wipeString(key);
             return 1;
         }
     }
-    auto wipe = [&] {
-        rune::client::detail::wipeString(key);
-        rune::client::detail::wipeString(password);
-    };
 
 #ifdef RUNE_CLI_LIVE_ENABLED
     // The bootstrap proves itself with the cluster-key MAC, not a login: this connection presents no credentials.
@@ -311,7 +306,6 @@ int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::o
         } else {
             err << "rune error: " << broker.lastFailure() << "\n";
         }
-        wipe();
         return 1;
     }
     rune::client::SecurityDdlResult r;
@@ -321,7 +315,6 @@ int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::o
             std::chrono::seconds(15));
     } catch (const std::exception& e) {
         err << "rune: " << e.what() << "\n";
-        wipe();
         return 1;
     }
     if (r.errorCode == static_cast<uint16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed)) {
@@ -329,22 +322,18 @@ int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::o
         // window is closed: an enabled security admin exists.
         err << "rune: bootstrap refused: this cluster is already bootstrapped - it already has a security admin (it requires a login); "
                "use `rune ql --user <admin> --password-file <file>` to manage it\n";
-        wipe();
         return 1;
     }
     if (r.errorCode != 0) {
         err << "rune: bootstrap refused: code " << r.errorCode << (r.detail.empty() ? "" : " " + r.detail) << "\n";
-        wipe();
         return 1;
     }
     if (fromFile) out << "bootstrapped " << admin << " (password from " << a.value("--password-file") << ")\n";
     else out << "one-time password for " << admin << ": " << password << "\n";
-    wipe();
     return 0;
 #else
     (void)out;
     err << "rune security bootstrap: live mode requires RUNE_CLI_LIVE_ENABLED and a real Aeron build.\n";
-    wipe();
     return 1;
 #endif
 }

@@ -129,6 +129,11 @@ bool readPasswordLine(int fd, std::string& password) {
         char c = 0;
         const ssize_t got = ::read(fd, &c, 1);
         if (got < 0 && errno == EINTR) continue;
+        if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            pollfd p{fd, POLLIN, 0};
+            (void)::poll(&p, 1, -1);
+            continue;   // #672: a non-blocking fd is not end of input
+        }
         if (got <= 0) { ok = n > 0; break; }
         if (c == '\n') { ok = true; break; }
         if (c == '\r') continue;
@@ -581,6 +586,7 @@ int runLiveSession(const ConsoleOptions& opts, const std::vector<PreparedStateme
         std::string& s;
         ~Wipe() { rune::client::detail::wipeString(s); }
     } wipe{password};
+    struct LivePasswordWipe { std::string& s; ~LivePasswordWipe() { rune::client::detail::wipeString(s); } } livePasswordWipe{o.live.password};   // #680: on a throw too
     if (!user.empty() && !havePasswordFile) {
         if (!(input.canPrompt && o.scriptPath.empty() && ::isatty(STDIN_FILENO)))
             return usage(err, "--password-file is required with --user (passwords are never read from argv or the environment)");
@@ -605,7 +611,8 @@ int runLiveSession(const ConsoleOptions& opts, const std::vector<PreparedStateme
     exec.run.origin = o.scriptPath;
     int rc = 0;
     if (!o.scriptPath.empty()) {
-        rc = consoleScriptExitStatus(runBatch(exec, batch, 1), exec.sessionEnded(), exec.endCode());   // as interactive
+        const int batchRc = runBatch(exec, batch, 1);   // #690: sequenced - the session state is read after the batch ran
+        rc = consoleScriptExitStatus(batchRc, exec.sessionEnded(), exec.endCode());   // as interactive
     } else if (input.fd >= 0 || input.canPrompt) {
         // The process stdin (a TTY or a pipe, #311) is polled and the client pumped while it is idle; only an injected
         // non-stdin stream (StreamLineSource below) is read blocking.

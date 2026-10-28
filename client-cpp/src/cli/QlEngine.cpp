@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <poll.h>
 #include <rune/client/detail/SecureZero.h>
 
 #ifdef RUNE_CLI_LIVE_ENABLED
@@ -408,6 +409,30 @@ bool readScript(const std::string& path, std::istream& stdinStream, std::string&
     struct ChunkWipe { char* b; ~ChunkWipe() { rune::client::detail::secureZero(b, sizeof chunk); } } chunkWipe{chunk};
     rune::client::detail::wipeString(text);
     if (path == "-") {
+        if (&stdinStream == &std::cin) {   // #672: the process stdin may be O_NONBLOCK: EAGAIN is not end of input
+            bool ok = true;
+            for (;;) {
+                const ssize_t n = ::read(STDIN_FILENO, chunk, sizeof chunk);
+                if (n == 0) break;
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        pollfd p{STDIN_FILENO, POLLIN, 0};
+                        (void)::poll(&p, 1, -1);
+                        continue;
+                    }
+                    ok = false;
+                    break;
+                }
+                rune::client::detail::appendWiped(text, std::string_view(chunk, static_cast<std::size_t>(n)));
+            }
+            if (!ok) {
+                rune::client::detail::wipeString(text);
+                err << "rune: cannot read the script from stdin\n";
+                return false;
+            }
+            return true;
+        }
         std::streambuf* sb = stdinStream.rdbuf();
         for (std::streamsize n; sb != nullptr && (n = sb->sgetn(chunk, sizeof chunk)) > 0;)
             rune::client::detail::appendWiped(text, std::string_view(chunk, static_cast<std::size_t>(n)));
@@ -554,7 +579,13 @@ bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredenti
         err << "rune: --cli-stream-in/--cli-stream-out must be integers\n";
         return false;
     }
-    cfg.dataDir = resolveDataDir(o.dataDir, dir_);   // empty = a private scratch directory, removed on close (#315)
+    try {
+        cfg.dataDir = resolveDataDir(o.dataDir, dir_);   // empty = a private scratch directory, removed on close (#315)
+    } catch (const std::exception& e) {   // #680: a bad TMPDIR is a clean failure, not an exception past the secrets
+        lastFailure_ = std::string("cannot create the client's data directory: ") + e.what();
+        if (!quietFailure) err << "rune: " << lastFailure_ << "\n";
+        return false;
+    }
     // Authentication (Task 8): who to log in as.  --user / RUNE_USER and --password-file / RUNE_PASSWORD_FILE;
     // a password is NEVER taken from argv (parseArgs refuses --password) or from the environment.
     // Issue #121: the only connection the CLI opens without credentials is `rune security bootstrap`'s.

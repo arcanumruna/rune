@@ -641,9 +641,7 @@ struct RevokingGateway {
 // #690: statement 1 fails NotAuthorized (45) and the session is revoked (46) in the same pump.  runBatch's own status
 // is the statement's (45); the script must exit with the session-end code (46), like the interactive console - and
 // statement 2 never runs.  Mutation: the script branch returns runBatch's status -> rc 45.
-// Broken by the C20 review: DISABLED_ until the #690 fix round.  consoleScriptExitStatus(runBatch(..), exec.sessionEnded(),
-// exec.endCode()) has unsequenced arguments; GCC reads sessionEnded()/endCode() before runBatch runs -> rc 45.
-TEST(RuneConsoleOfflineRegression, DISABLED_ScriptExitsWithTheSessionEndCodeNotTheFailedStatementsAdversarialRegression) {
+TEST(RuneConsoleOfflineRegression, ScriptExitsWithTheSessionEndCodeNotTheFailedStatementsAdversarialRegression) {
     const fs::path dir = fs::temp_directory_path() / ("c20r_690_" + std::to_string(::getpid()));
     fs::remove_all(dir);
     const fs::path script = writeScript("c20r_690.rql", "drop topic first;\ndrop topic second;\n");
@@ -953,8 +951,7 @@ TEST(ConsolePollingSourceRegression, WouldBlockAtEveryPositionNeverEndsOrSplitsA
 // terminal another process left non-blocking) takes EAGAIN for the end of the line: a password typed in two bursts
 // is accepted TRUNCATED to its first burst and the login fails with the wrong password.  The rest of the line arrives
 // once the reader waits; the whole password must come back.
-// Broken by the C20 review: DISABLED_ until the #672 fix round (poll on EAGAIN, as PollingFdLineSource does).
-TEST(ConsolePromptRegression, DISABLED_PasswordOnANonBlockingFdIsNotCutAtEagainAdversarialRegression) {
+TEST(ConsolePromptRegression, PasswordOnANonBlockingFdIsNotCutAtEagainAdversarialRegression) {
     int fds[2];
     ASSERT_EQ(::pipe(fds), 0);
     ASSERT_EQ(::fcntl(fds[0], F_SETFL, ::fcntl(fds[0], F_GETFL) | O_NONBLOCK), 0);
@@ -980,8 +977,7 @@ TEST(ConsolePromptRegression, DISABLED_PasswordOnANonBlockingFdIsNotCutAtEagainA
 // C20 adversarial review (#672 bug class - `-f -` scripts): a script on a non-blocking stdin pipe is read up to the
 // first EAGAIN and the prefix RUNS as if it were the whole script (rc 0): `rune console -f -` and `rune ql -f -`
 // share readScript.  The whole script must run.
-// Broken by the C20 review: DISABLED_ until the #672 fix round (readScript waits on EAGAIN).
-TEST(RuneConsoleOfflineRegression, DISABLED_StdinScriptOnANonBlockingPipeIsReadWholeAdversarialRegression) {
+TEST(RuneConsoleOfflineRegression, StdinScriptOnANonBlockingPipeIsReadWholeAdversarialRegression) {
     int in[2], res[2];
     ASSERT_EQ(::pipe(in), 0);
     ASSERT_EQ(::pipe(res), 0);
@@ -1201,8 +1197,7 @@ struct BadTmpdir {
 // which throws when TMPDIR is not a directory.  The throw leaves LiveBroker::open and cmdBootstrap with the key and the
 // password still in their strings: they are freed unwiped and the exception reaches std::terminate (main has no catch),
 // so a core dump holds both.  Bootstrap must fail cleanly (1) and leave no freed copy.
-// Broken by the C20 review: DISABLED_ until the #680 fix round (RAII wipe in cmdBootstrap; resolveDataDir inside a try).
-TEST(SecurityBootstrapRegression, DISABLED_BadTmpdirFailsCleanlyAndLeavesNoKeyOrPasswordAdversarialRegression) {
+TEST(SecurityBootstrapRegression, BadTmpdirFailsCleanlyAndLeavesNoKeyOrPasswordAdversarialRegression) {
     const fs::path keyFile = writeScript("c20r_tmpdir_key", kConsoleNeedle);
     const fs::path pwFile  = writeScript("c20r_tmpdir_pw", std::string(kConsoleNeedle) + "\n");
     fs::permissions(keyFile, fs::perms::owner_read | fs::perms::owner_write);
@@ -1230,8 +1225,7 @@ TEST(SecurityBootstrapRegression, DISABLED_BadTmpdirFailsCleanlyAndLeavesNoKeyOr
 
 // C20 adversarial review (#680 sibling entry points): the same bad TMPDIR on `rune console --broker` and `rune ql
 // --broker` must be a clean failure (1), not an exception out of rune::cli::run.
-// Broken by the C20 review: DISABLED_ until the #680 fix round.
-TEST(RuneConsoleOfflineRegression, DISABLED_BadTmpdirIsACleanFailureForConsoleAndQlAdversarialRegression) {
+TEST(RuneConsoleOfflineRegression, BadTmpdirIsACleanFailureForConsoleAndQlAdversarialRegression) {
     const fs::path notADir = writeScript("c20r_tmpdir_file", "x");
     BadTmpdir bad(notADir.string());
     for (const std::vector<std::string>& args :
@@ -1250,8 +1244,7 @@ TEST(RuneConsoleOfflineRegression, DISABLED_BadTmpdirIsACleanFailureForConsoleAn
 
 // C20 adversarial review (#680, resources): an allocation failure at ANY step of `rune security bootstrap` after the
 // key is read leaves no freed copy of the key or the password.  Sweeps every operator new of the run.
-// Broken by the C20 review: DISABLED_ until the #680 fix round (the `wipe` lambda is not RAII: a throw skips it).
-TEST(SecurityBootstrapRegression, DISABLED_AllocationFailureAtAnyStepLeavesNoKeyOrPasswordAdversarialRegression) {
+TEST(SecurityBootstrapRegression, AllocationFailureAtAnyStepLeavesNoKeyOrPasswordAdversarialRegression) {
     const fs::path keyFile = writeScript("c20r_oom_key", kConsoleNeedle);
     const fs::path pwFile  = writeScript("c20r_oom_pw", std::string(kConsoleNeedle) + "\n");
     fs::permissions(keyFile, fs::perms::owner_read | fs::perms::owner_write);
