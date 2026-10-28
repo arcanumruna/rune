@@ -403,8 +403,8 @@ TEST(NamespaceClientRegression, LimitPatchWithoutClusterAdminIsRefusedAdversaria
 
 // Finding (C8 adversarial review, minor): `rune namespace limits <ns> --set` pre-lists the namespaces, so a user without
 // ADMIN ON CLUSTER is told "no namespace '<ns>'" (rc 1) instead of the broker's NotAuthorized (45): the patch is never
-// sent.  Kept out of the suite until the issue is fixed (the CLI should send the patch and report the broker's code).
-TEST(NamespaceClientRegression, DISABLED_LimitsCliRefusalNamesNotAuthorizedAdversarialRegression) {
+// sent.  The CLI sends the patch and reports the broker's code.
+TEST(NamespaceClientRegression, LimitsCliRefusalNamesNotAuthorizedAdversarialRegression) {
     AuthBroker b("nslimits641authcli");
     b.bootstrapAdmin(kAdminPw);
     auto admin = makeClient(b, "admin", kAdminPw);
@@ -418,4 +418,18 @@ TEST(NamespaceClientRegression, DISABLED_LimitsCliRefusalNamesNotAuthorizedAdver
     EXPECT_NE(code, 0) << out;
     EXPECT_NE(err.find("NotAuthorized"), std::string::npos) << "a refusal reads as one, not as a missing namespace: " << err;
     admin->close();
+}
+
+// C8 fix round: `--set` on a namespace that does not exist reads as "no namespace" (rc 1), not as a bare broker code.
+TEST(NamespaceClientRegression, LimitsCliSetOnAMissingNamespaceNamesItAdversarialRegression) {
+    AuthBroker b("nslimits641missingcli");
+    b.bootstrapAdmin(kAdminPw);
+    fs::create_directories(scratchDir());
+    const std::string pw = writeTemp("admin-pw641missing", std::string(kAdminPw) + "\n");
+    std::string out, err;
+    const int code = runCli({"namespace", "limits", "ghost", "--set", "max-topics=5", "--broker", b.endpoint(), "--user",
+                             "admin", "--password-file", pw}, &out, &err);
+    EXPECT_EQ(code, 1) << out << err;
+    EXPECT_NE(err.find("no namespace 'ghost'"), std::string::npos) << err;
+    EXPECT_EQ(out.find("updated limits"), std::string::npos) << out;
 }

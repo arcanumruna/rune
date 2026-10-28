@@ -23,6 +23,24 @@ int consoleExitStatus(uint16_t brokerCode) noexcept;
 /// SessionRevoked when the statement failed with it), or 0 when the session is still usable.
 uint16_t consoleSessionEndCode(uint16_t sessionRejectCode, uint16_t statementErrorCode) noexcept;
 
+/// The reject code of a rejected session as the unsigned broker code (the client keeps it as an int16_t: a code
+/// >= 0x8000 from a newer broker is negative there); 0 when the session was not rejected.
+uint16_t consoleRejectCode(int16_t sessionRejectCode) noexcept;
+
+/// What a script (-f) run exits with: like the interactive console, a session that ended exits with its end code
+/// (consoleExitStatus), else the failing statement's status @p batchStatus.
+int consoleScriptExitStatus(int batchStatus, bool sessionEnded, uint16_t endCode) noexcept;
+
+/// What `rune console` exits with when the connect / login at start fails with @p failureText (the client's
+/// message): AuthenticationFailed is the same status a refused reconnect gives; every other failure is 1.
+int consoleOpenFailureStatus(std::string_view failureText) noexcept;
+
+/// An input line holds fewer than this many bytes (the line without its newline); a longer one is reported and
+/// dropped (Issue #307).  Shared by the fd and the stream line sources.
+inline constexpr std::size_t kMaxInputLineBytes = 64 * 1024;
+/// The error both line sources print for a dropped line.
+inline constexpr std::string_view kInputLineTooLongMessage = "error: input line too long (64 KiB); the line was discarded\n";
+
 /// A line of input; false at EOF.
 struct LineSource {
     virtual ~LineSource() = default;
@@ -52,7 +70,7 @@ private:
     int                        fd_;
     void                     (*idle_)(void*) noexcept;
     void*                      ctx_;
-    std::array<char, 64 * 1024> buf_{};
+    std::array<char, kMaxInputLineBytes> buf_{};
     std::size_t                len_ = 0;
     bool                       discarding_ = false;   // inside an over-long line: drop input up to its newline
 };

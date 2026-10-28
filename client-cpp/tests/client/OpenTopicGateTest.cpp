@@ -77,6 +77,7 @@ struct GateGateway {
 
     bool replyConnectOK      = true;
     bool replyGetTopicSchema = true;
+    int  getTopicSchemaSeen  = 0;   // GetTopicSchema requests that reached the gateway (a skipped probe sends none)
 
     int32_t              getTopicId   = 0x40000001;
     uint16_t             getVersion   = 1;
@@ -183,6 +184,7 @@ struct GateGateway {
 
         case rcc::TemplateId::GetTopicSchema: {
             auto opt = rpc::GetTopicSchema::decode(buf, len);
+            if (opt) ++getTopicSchemaSeen;
             if (!opt || !replyGetTopicSchema) break;
 
             rpc::TopicSchemaResponse resp;
@@ -916,7 +918,7 @@ TEST(OpenTopicGateRegression, LineageOfAMissingTopicSaysItDoesNotExistRegression
     EXPECT_NE(msg.find("topic 't' does not exist"), std::string::npos) << msg;
     // Any other code is named as is, with no probe.
     const std::string other = h.client->lineageFailure("t", 45, 5s);
-    EXPECT_NE(other.find("did not serve the schema lineage of 't' (error 45)"), std::string::npos) << other;
+    EXPECT_NE(other.find("did not serve the schema lineage of 't' (NotAuthorized 45)"), std::string::npos) << other;
 }
 
 // Adversarial review of C8 (#435): the probe that disambiguates UnknownTopic must never turn a probe timeout or a
@@ -930,7 +932,7 @@ TEST(OpenTopicGateRegression, LineageProbeTimeoutFallsBackToThePlainCodeAdversar
     const auto t0  = std::chrono::steady_clock::now();
     const std::string msg = h.client->lineageFailure("t", 7, 300ms);
     const auto took = std::chrono::steady_clock::now() - t0;
-    EXPECT_NE(msg.find("did not serve the schema lineage of 't' (error 7)"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("did not serve the schema lineage of 't' (UnknownTopic 7)"), std::string::npos) << msg;
     EXPECT_EQ(msg.find("does not exist"), std::string::npos) << "an unanswered probe proves nothing: " << msg;
     EXPECT_EQ(msg.find("upgrade"), std::string::npos) << msg;
     EXPECT_LT(took, 5s) << "the probe is bounded by its timeout";
@@ -942,12 +944,70 @@ TEST(OpenTopicGateRegression, LineageProbeRefusedNamesTheProbeCodeAdversarialReg
     h.connectAndWait();
     h.gw->unknownFingerprintErrorCode = 7;
     GateGatewayPump pump(*h.gw);
+    const std::map<uint16_t, std::string> names{{45, "NotAuthorized"}, {1, "ProtocolVersion"}, {0x7FFF, "UnknownErrorCode"}};
     for (const uint16_t probeCode : {uint16_t{45}, uint16_t{1}, uint16_t{0x7FFF}}) {
         h.gw->getErrorCode = probeCode;
         const std::string msg = h.client->lineageFailure("t", 7, 5s);
-        EXPECT_NE(msg.find("(error " + std::to_string(probeCode) + ")"), std::string::npos) << probeCode << ": " << msg;
+        EXPECT_NE(msg.find("(" + names.at(probeCode) + " " + std::to_string(probeCode) + ")"), std::string::npos) << probeCode << ": " << msg;
         EXPECT_EQ(msg.find("does not exist"), std::string::npos) << probeCode << ": " << msg;
         EXPECT_EQ(msg.find("upgrade"), std::string::npos) << probeCode << ": " << msg;
+    }
+}
+
+// C8 fix round (d): the probe gets what is LEFT of the caller's budget, never a second full wait; with nothing left
+// it is not sent at all and the plain code text is returned.
+TEST(OpenTopicGateRegression, LineageProbeIsSkippedWhenTheBudgetIsSpentRegression) {
+    GateHarness h(1338, 1339);
+    h.build();
+    h.connectAndWait();
+    h.gw->getErrorCode                = 0;   // a sent probe WOULD be served: skipping it is the only way to get the plain text
+    h.gw->unknownFingerprintErrorCode = 7;
+    GateGatewayPump pump(*h.gw);
+    const int before = h.gw->getTopicSchemaSeen;
+    for (const std::chrono::nanoseconds left : {std::chrono::nanoseconds{0}, std::chrono::nanoseconds{-1}, std::chrono::nanoseconds{-10s}}) {
+        const std::string msg = h.client->lineageFailure("t", 7, left);
+        EXPECT_NE(msg.find("did not serve the schema lineage of 't' (UnknownTopic 7)"), std::string::npos)
+            << left.count() << ": " << msg;
+        EXPECT_EQ(msg.find("upgrade"), std::string::npos) << left.count() << ": " << msg;
+    }
+    EXPECT_EQ(h.gw->getTopicSchemaSeen, before) << "no probe was sent with no budget left";
+    // With budget left the very same call probes.
+    EXPECT_NE(h.client->lineageFailure("t", 7, 5s).find("upgrade"), std::string::npos);
+    EXPECT_GT(h.gw->getTopicSchemaSeen, before);
+}
+
+TEST(OpenTopicGateRegression, LineageProbeWaitsAtMostTheRemainingBudgetRegression) {
+    GateHarness h(1340, 1341);
+    h.build();
+    h.connectAndWait();
+    h.gw->replyGetTopicSchema = false;   // the probe is never answered
+    GateGatewayPump pump(*h.gw);
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string msg = h.client->lineageFailure("t", 7, 200ms);
+    const auto took = std::chrono::steady_clock::now() - t0;
+    EXPECT_NE(msg.find("(UnknownTopic 7)"), std::string::npos) << msg;
+    EXPECT_LT(took, 3s) << "bounded by the remaining budget (200 ms), nowhere near a second full CLI wait";
+}
+
+// C8 fix round (g): a patch naming a bit outside kNamespaceFullMask is refused up front (std::invalid_argument, like the
+// empty patch) - before anything is sent, so no broker (not even a connect) is needed.
+TEST(OpenTopicGateRegression, NamespaceLimitsPatchWithReservedBitsIsRefusedUpFrontRegression) {
+    GateHarness h(1342, 1343);
+    h.build();   // deliberately NOT connected: the check runs before any send
+    for (std::size_t byte = 0; byte < rune::client::NamespaceLimitsPatch{}.present.size(); ++byte) {
+        const uint8_t reserved = static_cast<uint8_t>(~rune::client::kNamespaceFullMask[byte]);
+        for (unsigned bit = 0; bit < 8; ++bit) {
+            if ((reserved & (1u << bit)) == 0) continue;
+            rune::client::NamespaceLimitsPatch patch;
+            ASSERT_TRUE(patch.set(0, 5));   // a valid limit as well: the reserved bit alone must refuse it
+            patch.present[byte] = static_cast<uint8_t>(patch.present[byte] | (1u << bit));
+            EXPECT_THROW((void)h.client->setNamespaceLimits("a", patch, 50ms), std::invalid_argument)
+                << "byte " << byte << " bit " << bit;
+            rune::client::NamespaceLimitsPatch only;   // and no valid limit at all
+            only.present[byte] = static_cast<uint8_t>(1u << bit);
+            EXPECT_THROW((void)h.client->setNamespaceLimits("a", only, 50ms), std::invalid_argument)
+                << "byte " << byte << " bit " << bit;
+        }
     }
 }
 

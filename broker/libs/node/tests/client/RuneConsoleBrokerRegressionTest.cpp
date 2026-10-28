@@ -735,3 +735,19 @@ TEST(RuneConsoleBrokerRegression, LoginRefusedOnReconnectEndsTheConsoleAdversari
     EXPECT_EQ(c.out.str().find("ok topic ok_d"), std::string::npos) << c.out.str();
     EXPECT_EQ(c.err.str().find("client closed"), std::string::npos) << "no statement runs on the dead client: " << c.err.str();
 }
+
+TEST(RuneConsoleBrokerRegression, LoginRefusedAtStartExitsLikeARefusedReconnectAdversarialRegression) {
+    // C8 fix round (f): the login refused when the console starts (a wrong password) is AuthenticationFailed (44),
+    // the status a refused reconnect gives - not a generic 1.  Script and interactive mode alike.
+    using namespace rune::node::test::grants;
+    AuthBroker b("console_badlogin");
+    b.bootstrapAdmin();
+    b.createUser("u", kUserPw, {prefix(SO::Create, ST::Topic, "ok_")});
+    const std::string wrong = writeFile("badlogin.pw", "not-the-password-0000\n");
+    const std::string script = writeFile("badlogin.rql", "topic ok_a partitions 1;\n");
+    const auto interactive = consoleLive(b, {"--user", "u", "--password-file", wrong}, "topic ok_a partitions 1;\n");
+    EXPECT_EQ(interactive.rc, 44) << interactive.err;
+    const auto scripted = consoleLive(b, {"-f", script, "--user", "u", "--password-file", wrong}, "");
+    EXPECT_EQ(scripted.rc, 44) << scripted.err;
+    EXPECT_EQ(interactive.out.find("ok topic"), std::string::npos) << interactive.out;
+}

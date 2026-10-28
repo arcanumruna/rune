@@ -47,6 +47,18 @@ uint16_t consoleSessionEndCode(uint16_t sessionRejectCode, uint16_t statementErr
     return sessionRejectCode != 0 ? sessionRejectCode : (statementErrorCode == 46 ? uint16_t{46} : uint16_t{0});
 }
 
+uint16_t consoleRejectCode(int16_t sessionRejectCode) noexcept {
+    return sessionRejectCode != 0 ? static_cast<uint16_t>(sessionRejectCode) : uint16_t{0};
+}
+
+int consoleScriptExitStatus(int batchStatus, bool sessionEnded, uint16_t endCode) noexcept {
+    return sessionEnded ? consoleExitStatus(endCode) : batchStatus;
+}
+
+int consoleOpenFailureStatus(std::string_view failureText) noexcept {
+    return failureText.find("AuthenticationFailed") != std::string_view::npos ? consoleExitStatus(44) : 1;
+}
+
 PollingFdLineSource::~PollingFdLineSource() { rune::client::detail::secureZero(buf_.data(), buf_.size()); }
 
 bool PollingFdLineSource::next(std::string& line) {
@@ -76,7 +88,7 @@ bool PollingFdLineSource::next(std::string& line) {
             wipeFrom(0, len_);
             len_        = 0;
             discarding_ = true;
-            if (err != nullptr) *err << "error: input line too long (64 KiB); the line was discarded\n";
+            if (err != nullptr) *err << kInputLineTooLongMessage;
             line.clear();
             lastLineDiscarded = true;   // Issue #307: the caller must not treat this as an ordinary empty line
             return true;
@@ -451,8 +463,10 @@ int runInteractive(Exec& exec, const ConsoleOptions& o, LineSource& in, std::ost
 
 struct StreamLineSource final : LineSource {
     std::istream& in;
+    std::ostream* err = nullptr;   // where the "input line too long" error goes (null: silent)
     explicit StreamLineSource(std::istream& s) : in(s) {}
     bool next(std::string& line) override {
+        lastLineDiscarded = false;
         // std::getline would grow `line` and free unwiped copies of a typed password (#305): read char by char.
         rune::client::detail::wipeString(line);
         std::streambuf* sb = in.rdbuf();
@@ -468,6 +482,16 @@ struct StreamLineSource final : LineSource {
             any = true;
             const char ch = std::char_traits<char>::to_char_type(c);
             if (ch == '\n') break;
+            if (line.size() + 1 >= kMaxInputLineBytes) {   // same cap and rule as PollingFdLineSource (#307)
+                rune::client::detail::wipeString(line);
+                line.clear();
+                for (auto d = sb->sbumpc(); !std::char_traits<char>::eq_int_type(d, std::char_traits<char>::eof()) &&
+                                            std::char_traits<char>::to_char_type(d) != '\n';)
+                    d = sb->sbumpc();   // drop the rest of the over-long line
+                if (err != nullptr) *err << kInputLineTooLongMessage;
+                lastLineDiscarded = true;
+                return true;
+            }
             const char one[1] = {ch};
             rune::client::detail::appendWiped(line, std::string_view(one, 1));
         }
@@ -506,7 +530,7 @@ struct LiveExecutor {
         // Issue #308: any terminal session rejection ends the console, not only SessionRevoked.  A rejected session
         // fails the client for good: the next statement would see "client closed", with no broker code.
         const int16_t reject = broker.client().sessionRejectCode();
-        const uint16_t end = consoleSessionEndCode(reject > 0 ? static_cast<uint16_t>(reject) : uint16_t{0}, run.lastErrorCode);
+        const uint16_t end = consoleSessionEndCode(consoleRejectCode(reject), run.lastErrorCode);
         if (end != 0) {
             ended    = true;
             endCode_ = end;
@@ -570,7 +594,7 @@ int runLiveSession(const ConsoleOptions& opts, const std::vector<PreparedStateme
     const bool opened = broker.open(o.live, err);
     rune::client::detail::wipeString(password);
     rune::client::detail::wipeString(o.live.password);
-    if (!opened) return 1;
+    if (!opened) return consoleOpenFailureStatus(broker.lastFailure());   // a refused login ends like a refused reconnect
     if (broker.client().authStatus().kind == rune::client::AuthStatus::Kind::PasswordChangeRequired)
         err << "WARNING: password change required — run ALTER USER " << broker.client().authStatus().user
             << " SET PASSWORD '…';\n";
@@ -580,7 +604,7 @@ int runLiveSession(const ConsoleOptions& opts, const std::vector<PreparedStateme
     exec.run.origin = o.scriptPath;
     int rc = 0;
     if (!o.scriptPath.empty()) {
-        rc = runBatch(exec, batch, 1);
+        rc = consoleScriptExitStatus(runBatch(exec, batch, 1), exec.sessionEnded(), exec.endCode());   // as interactive
     } else if (input.fd >= 0 || input.canPrompt) {
         // The process stdin (a TTY or a pipe, #311) is polled and the client pumped while it is idle; only an injected
         // non-stdin stream (StreamLineSource below) is read blocking.
@@ -590,6 +614,7 @@ int runLiveSession(const ConsoleOptions& opts, const std::vector<PreparedStateme
         if (input.idlePumps != nullptr) *input.idlePumps = src.idlePumps;
     } else {
         StreamLineSource src(*input.in);
+        src.err = &err;
         rc = runInteractive(exec, o, src, out, err);
     }
     broker.flushVerbose(err);
@@ -630,6 +655,7 @@ int cmdConsole(const std::vector<std::string>& args, std::istream& in, std::ostr
         DryRunExecutor exec{out, o.requestIdBase};
         if (!o.scriptPath.empty()) return runBatch(exec, batch, 1);
         StreamLineSource src(in);
+        src.err = &err;
         return runInteractive(exec, o, src, out, err);
     }
     return runLive(o, in, batch, out, err);

@@ -338,6 +338,7 @@ int cmdSchemaGenerate(const std::vector<std::string>& args,
         if (!connectOrReport(client, err)) return 1;
 
         TopicSchemaResult r;
+        const auto lineageStarted = std::chrono::steady_clock::now();
         try {
             // #418: the topic's LINEAGE (evolving descriptor), so the generated type places records of every
             // version up to its own; a materialized descriptor would hide every DROP before it.
@@ -352,7 +353,8 @@ int cmdSchemaGenerate(const std::vector<std::string>& args,
         }
 
         if (r.errorCode != 0) {
-            err << "rune: " << client.lineageFailure(topic, r.errorCode, kCliWait) << "\n";   // Issue #435
+            err << "rune: " << client.lineageFailure(
+                       topic, r.errorCode, kCliWait - (std::chrono::steady_clock::now() - lineageStarted)) << "\n";   // Issue #435
             return 1;
         }
 

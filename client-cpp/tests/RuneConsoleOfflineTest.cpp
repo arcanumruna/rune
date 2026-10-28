@@ -1154,6 +1154,73 @@ TEST(ConsoleOfflineRegression, AnyRejectedSessionEndsTheConsoleRegression) {
         EXPECT_EQ(consoleSessionEndCode(c.reject, c.stmt), c.want) << "reject " << c.reject << " statement " << c.stmt;
 }
 
+// ── C8 fix round ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+TEST(ConsoleOfflineRegression, ARejectCodeAboveInt16MaxStillEndsTheSessionRegression) {
+    // (b) the client keeps the reject code as an int16_t: a code >= 0x8000 (a newer broker) is negative there and must
+    // still end the session with that code, not be ignored.
+    using rune::cli::console::consoleRejectCode;
+    using rune::cli::console::consoleSessionEndCode;
+    EXPECT_EQ(consoleRejectCode(0), 0u);
+    EXPECT_EQ(consoleRejectCode(44), 44u);
+    EXPECT_EQ(consoleRejectCode(0x7FFF), 0x7FFFu);
+    EXPECT_EQ(consoleRejectCode(static_cast<int16_t>(0x8000)), 0x8000u);
+    EXPECT_EQ(consoleRejectCode(static_cast<int16_t>(0xFFFF)), 0xFFFFu);
+    for (const uint16_t code : {uint16_t{0x8000}, uint16_t{0x8001}, uint16_t{0xFFFE}, uint16_t{0xFFFF}})
+        EXPECT_EQ(consoleSessionEndCode(rune::cli::console::consoleRejectCode(static_cast<int16_t>(code)), 0), code) << code;
+}
+
+TEST(ConsoleOfflineRegression, ScriptModeReportsARejectedSessionLikeInteractiveRegression) {
+    // (c) a session that ended exits with its end code - the statement that failed may carry another code (or none).
+    using rune::cli::console::consoleExitStatus;
+    using rune::cli::console::consoleScriptExitStatus;
+    for (const uint16_t end : {uint16_t{44}, uint16_t{46}, uint16_t{48}, uint16_t{200}, uint16_t{0x8000}}) {
+        for (const int batch : {1, 30, 125})
+            EXPECT_EQ(consoleScriptExitStatus(batch, true, end), consoleExitStatus(end)) << "end " << end << " batch " << batch;
+    }
+    // no session end: the failing statement's status stands
+    for (const int batch : {0, 1, 30, 125}) EXPECT_EQ(consoleScriptExitStatus(batch, false, 0), batch);
+}
+
+TEST(ConsoleOfflineRegression, ARefusedLoginAtStartExitsLikeARefusedReconnectRegression) {
+    // (f) AuthenticationFailed (44) at start is the status a refused reconnect gives; any other open failure is 1.
+    using rune::cli::console::consoleExitStatus;
+    using rune::cli::console::consoleOpenFailureStatus;
+    EXPECT_EQ(consoleOpenFailureStatus("connect(): broker error AuthenticationFailed (44)"), consoleExitStatus(44));
+    EXPECT_EQ(consoleOpenFailureStatus("AuthenticationFailed"), 44);
+    EXPECT_EQ(consoleOpenFailureStatus("connect(): timed out waiting"), 1);
+    EXPECT_EQ(consoleOpenFailureStatus("NotAuthorized"), 1);
+    EXPECT_EQ(consoleOpenFailureStatus(""), 1);
+}
+
+TEST(ConsoleOfflineRegression, StreamSourceDiscardsAnOverlongLineLikeTheFdSourceRegression) {
+    // (e) the dry-run interactive stream source caps a line at 64 KiB exactly as the fd source does (#307): the long
+    // line is reported and dropped, a statement in progress is abandoned, the next line still runs.
+    using rune::cli::console::kInputLineTooLongMessage;
+    using rune::cli::console::kMaxInputLineBytes;
+    const std::string good = "topic b { x int32 } partitions 1 key x;\n";
+    for (const std::size_t len : {kMaxInputLineBytes, kMaxInputLineBytes + 1, std::size_t{70 * 1024}}) {
+        const auto r = console({"--dry-run"}, std::string(len, 'x') + "\n" + good);
+        EXPECT_EQ(r.rc, 0) << len << ": " << r.err;
+        EXPECT_NE(r.err.find(std::string(kInputLineTooLongMessage)), std::string::npos) << len << ": " << r.err.substr(0, 300);
+        EXPECT_EQ(count(r.err, std::string(kInputLineTooLongMessage)), 1u) << len;
+        EXPECT_EQ(count(r.out, "partitions"), 1u) << "the next line still ran: " << r.out;
+    }
+    // One byte under the cap is an ordinary (here: unparsable) line, not a discard.
+    const auto under = console({"--dry-run"}, std::string(kMaxInputLineBytes - 2, 'x') + ";\n" + good);   // cap-1 bytes
+    EXPECT_EQ(under.err.find(std::string(kInputLineTooLongMessage)), std::string::npos) << under.err.substr(0, 300);
+    EXPECT_EQ(count(under.out, "partitions"), 1u) << under.out;
+    // An over-long line without a final newline, and one that ends the input, are dropped too (no hang, no run).
+    const auto tail = console({"--dry-run"}, good + std::string(kMaxInputLineBytes + 5, 'y'));
+    EXPECT_EQ(count(tail.err, std::string(kInputLineTooLongMessage)), 1u) << tail.err.substr(0, 300);
+    EXPECT_EQ(count(tail.out, "partitions"), 1u) << tail.out;
+    // A statement in progress is abandoned by the long line, never joined with what follows.
+    const auto joined = console({"--dry-run"}, "topic a\n" + std::string(70 * 1024, 'x') + "\npartitions 1;\n" + good);
+    EXPECT_NE(joined.err.find("the statement in progress was abandoned (an input line was too long)"), std::string::npos)
+        << joined.err.substr(0, 400);
+    EXPECT_EQ(joined.out.find("topic a"), std::string::npos) << joined.out;
+}
+
 // ── Adversarial review of client batch C8 (#301 #302 #303 #307 #308) ────────────────────────────────────────────────
 
 TEST(ConsoleOfflineRegression, ExitStatusNeverCollidesAtAnyCodeAdversarialRegression) {

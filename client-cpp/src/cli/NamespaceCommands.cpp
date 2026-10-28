@@ -83,6 +83,8 @@ std::string endpointOf(const ParsedArgs& a) {
 }
 
 #ifdef RUNE_CLI_LIVE_ENABLED
+constexpr uint16_t kUnknownTopicCode = 7;   // wire ErrorCode::UnknownTopic: a namespace that does not exist
+
 int refused(std::ostream& err, std::string_view what, const rcl::DdlResult& r) {
     err << "rune namespace " << what << ": " << engine::brokerFailure(r.errorCode, r.detail) << "\n";
     return 1;
@@ -175,30 +177,37 @@ int cmdLimits(std::vector<std::string> args, std::ostream& out, std::ostream& er
     engine::LiveBroker broker;
     if (!broker.open(engine::liveOptionsOf(a, endpoint, false), err)) return 1;
     try {
-        const auto all = broker.client().listNamespaces(broker.ddlTimeout());
-        if (!all) return refused(err, "limits", all.error());
-        const rpc::NamespaceInfo* ns = nullptr;
-        for (const auto& n : *all)
-            if (n.name == name) ns = &n;
-        if (ns == nullptr) {
+        const auto findIn = [&](const std::vector<rpc::NamespaceInfo>& v) -> const rpc::NamespaceInfo* {
+            for (const auto& n : v)
+                if (n.name == name) return &n;
+            return nullptr;
+        };
+        const auto noNamespace = [&] {
             err << "rune namespace limits: no namespace '" << name << "'\n";
             return 1;
-        }
+        };
         if (sets.empty()) {
+            const auto all = broker.client().listNamespaces(broker.ddlTimeout());
+            if (!all) return refused(err, "limits", all.error());
+            const rpc::NamespaceInfo* ns = findIn(*all);
+            if (ns == nullptr) return noNamespace();
             out << formatNamespaceLimits(ns->limits);
             return 0;
         }
         // Issue #641: send only the named limits; the broker merges them onto the CURRENT record, so a concurrent
-        // change to another limit survives.  The result is re-read to print what is stored now.
+        // change to another limit survives.  No pre-list: a caller who may not see the namespace still gets the
+        // broker's own refusal (NotAuthorized names itself).  The result is re-read to print what is stored now.
         const auto r = broker.client().setNamespaceLimits(name, *patch, broker.ddlTimeout());
-        if (!r) return refused(err, "limits", r.error());
+        if (!r) {
+            if (r.error().errorCode == kUnknownTopicCode) return noNamespace();
+            return refused(err, "limits", r.error());
+        }
         const auto after = broker.client().listNamespaces(broker.ddlTimeout());
         if (!after) return refused(err, "limits", after.error());
-        const rpc::NamespaceInfo* now = nullptr;
-        for (const auto& n : *after)
-            if (n.name == name) now = &n;
+        const rpc::NamespaceInfo* now = findIn(*after);
+        if (now == nullptr) return noNamespace();   // dropped between the patch and the re-read
         out << "updated limits of namespace " << name << "\n";
-        if (now != nullptr) out << formatNamespaceLimits(now->limits);
+        out << formatNamespaceLimits(now->limits);
         return 0;
     } catch (const std::exception& e) {
         err << "rune: " << e.what() << "\n";

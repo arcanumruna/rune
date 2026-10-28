@@ -1090,7 +1090,8 @@ public:
                                              std::chrono::milliseconds timeout = std::chrono::seconds(30));
     /// Issue #641: changes only the limits `patch` names (its `present` bits are the wire mask); the broker applies
     /// them onto the CURRENT committed record, so a concurrent change to another limit is never overwritten.
-    /// Throws std::invalid_argument when the patch names no limit.
+    /// Throws std::invalid_argument when the patch names no limit, or a limit bit outside kNamespaceFullMask (before
+    /// anything is sent).
     NamespaceResult<void> setNamespaceLimits(std::string_view name, const NamespaceLimitsPatch& patch,
                                              std::chrono::milliseconds timeout = std::chrono::seconds(30));
     /// Every namespace this session may see, in nsId order (pages internally).
@@ -1152,16 +1153,21 @@ public:
     template <class T>
     [[nodiscard]] typename T::Lineage lineageAndWait(std::string_view name,
                                                      std::chrono::nanoseconds timeout = kDefaultWaitTimeout) {
+        const auto started = std::chrono::steady_clock::now();
         TopicSchemaResult r = getTopicSchemaAndWait(name, rune::protocol::client::kSchemaLineageFingerprint, timeout);
-        if (r.errorCode != 0) throw std::runtime_error(lineageFailure(name, r.errorCode, timeout));   // Issue #435
+        if (r.errorCode != 0)   // Issue #435: the probe gets only what is left of `timeout`
+            throw std::runtime_error(lineageFailure(
+                name, r.errorCode, timeout - (std::chrono::steady_clock::now() - started)));
         return T::lineage(rune::codec::deserialize(std::span<const uint8_t>(r.descriptorBlob)));
     }
 
     /// Issue #435: the message for a failed schema-lineage request.  On UnknownTopic it probes the latest schema
     /// (fingerprint 0): served -> the broker predates lineage; UnknownTopic -> the topic does not exist.  Runs on the
-    /// caller's thread, exactly like lineageAndWait; a probe that fails otherwise names the original code.
+    /// caller's thread, exactly like lineageAndWait; a probe that fails otherwise names the original code as
+    /// "(<Name> <code>)".  @p remaining is what is LEFT of the caller's wait budget (the lineage request already
+    /// used part of it): the probe waits at most that long, and is skipped (plain code text) when nothing is left.
     [[nodiscard]] std::string lineageFailure(std::string_view topic, uint16_t code,
-                                             std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+                                             std::chrono::nanoseconds remaining = kDefaultWaitTimeout);
 
     /// Phase 2b F (FD7): the same version-binding open, but the typed topic BORROWS `shared` instead of owning
     /// a producer of its own - its sends and claims go through that producer, inside its transaction when one

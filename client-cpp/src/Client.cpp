@@ -2826,17 +2826,42 @@ TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, std::chro
     return getTopicSchemaAndWait(name, /*requestedFingerprint=*/0, timeout);
 }
 
-std::string Client::lineageFailure(std::string_view topic, uint16_t code, std::chrono::nanoseconds timeout) {
+namespace {
+// The broker error names as the Rune QL engine prints them (client-cpp/src/cli/QlEngine.cpp errorCodeName): a copy, because
+// the engine lives in the CLI library, which depends on this one.  The size assert catches a code added to only one.
+std::string_view lineageErrorName(uint16_t code) noexcept {
+    static constexpr std::string_view kNames[] = {
+        "OK", "ProtocolVersion", "NotLeader", "Redirect", "SessionExpired", "UnknownSession", "Internal",
+        "UnknownTopic", "UnknownPartition", "NotPartitionLeader", "MinIsrViolation", "StaleGeneration",
+        "UnknownMember", "RebalanceInProgress", "NotCoordinator", "IllegalGeneration", "GroupDead",
+        "InvalidProducerEpoch", "ProducerFenced", "InvalidTxnState", "OutOfOrderSequence", "DuplicateSequence",
+        "MessageTooLarge", "InvalidSchema", "SchemaValidationFailed", "TopicExists", "StorageError",
+        "ConcurrentTransactions", "UnknownProducerId", "HandshakeFailed", "SchemaIncompatible", "SchemaConflict",
+        "ViewExists", "ViewSourceNotFound", "ViewFieldUnresolved", "ViewKeyInvalid", "ViewNotCoPartitioned",
+        "ViewSourceTransient", "ViewNotAlterable", "InvalidRequest", "InvalidTopicName", "ViewSourceIsView",
+        "TransientLogFull", "PartitionDataReset", "AuthenticationFailed", "NotAuthorized", "SessionRevoked",
+        "PasswordChangeRequired", "AuthUnavailable", "RecordEgressUnavailable", "UnstableOffsetCommit",
+        "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused"};
+    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::ViewPaused) + 1,
+                  "lineageErrorName: one name per rune::protocol::client::ErrorCode");
+    return code < std::size(kNames) ? kNames[code] : std::string_view("UnknownErrorCode");
+}
+} // namespace
+
+std::string Client::lineageFailure(std::string_view topic, uint16_t code, std::chrono::nanoseconds remaining) {
     const auto plain = [&](uint16_t c) {
-        return "lineage: the broker did not serve the schema lineage of '" + std::string(topic) + "' (error " +
-               std::to_string(c) + ")";
+        return "lineage: the broker did not serve the schema lineage of '" + std::string(topic) + "' (" +
+               std::string(lineageErrorName(c)) + " " + std::to_string(c) + ")";
     };
     constexpr auto kUnknownTopic = static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownTopic);
     if (code != kUnknownTopic) return plain(code);
-    // An old broker answers UnknownTopic for the lineage request although the topic exists: ask for the latest schema.
+    // The caller's budget is spent: no probe, just the code.
+    if (remaining <= std::chrono::nanoseconds::zero()) return plain(code);
+    // An old broker answers UnknownTopic for the lineage request although the topic exists: ask for the latest schema,
+    // within what is left of the caller's budget.
     TopicSchemaResult probe;
     try {
-        probe = getTopicSchemaAndWait(topic, /*requestedFingerprint=*/0, timeout);
+        probe = getTopicSchemaAndWait(topic, /*requestedFingerprint=*/0, remaining);
     } catch (const std::exception&) {
         return plain(code);
     }
@@ -3088,6 +3113,10 @@ Client::NamespaceResult<void> Client::setNamespaceLimits(std::string_view name, 
     bool any = false;
     for (const uint8_t b : patch.present) any = any || b != 0;
     if (!any) throw std::invalid_argument("setNamespaceLimits(): the patch names no limit");
+    for (std::size_t i = 0; i < patch.present.size(); ++i) {   // up front, like the empty patch: not the encoder's runtime_error
+        if ((patch.present[i] & ~kNamespaceFullMask[i] & 0xFFu) != 0)
+            throw std::invalid_argument("setNamespaceLimits(): the patch names a limit this client does not know");
+    }
     DdlResult r;
     andWait_("setNamespaceLimits()", timeout, 0,
              [&](Completions& q, Token t) {
