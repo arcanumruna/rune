@@ -45,6 +45,19 @@ See spec §5.
     1.41.4 baseline (BENCHMARKING.md counts).
 - A regression is root-caused before anything builds on 1.51.
 - Commit: `build: Aeron 1.51.0 (NAT-safe egress D1)`.
+- **Status: done.** `MdcEgressSpikeTest`, every `AeronPump` test and the transport, driver, GSO, ring and client
+  tests are green. The full regression suite, the sanitizers and the ABAB bench are deferred to the next checkpoint
+  (issue #736), by the owner's call. 1.51 changes Rune had to absorb:
+  - the native C++ client is gone; the header-only wrapper over the C client replaces it;
+  - `BufferBuilder` starts empty, so a reassembled message starts at offset 0, not 32
+    (`FragmentAssemblerRegression.*`);
+  - `aeron_counter_ordered_increment` is gone (`aeron_counter_increment`);
+  - transport bindings take a `params` struct; the poller logs a failing socket and polls the rest
+    (`EpollFirstPollLogsAFailingSocketAndPollsTheRestRegression`);
+  - name resolvers need `start_func`, and an "aeron-executor" thread starts per driver unless disabled
+    (`InvokerDriverStartsNoThreadRegression`);
+  - the ring-buffer `RecordDescriptor` header is gone (Rune and the flight recorder carry their own copy);
+  - the default `network_publication_max_messages_per_send` is 4, not 2.
 
 ### Task 2: response-channel spike (gates D3)
 - **Test:** `broker/libs/node/tests/integration/ResponseEgressSpikeRegressionTest.cpp`, real media drivers over
