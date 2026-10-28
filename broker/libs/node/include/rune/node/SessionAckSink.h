@@ -1041,8 +1041,8 @@ private:
                 }
                 if (f == PubFind::Error) {
                     // The client conductor erased the registration before
-                    // reporting the error (later finds of it say "not yet"
-                    // forever): nothing to release — NOT via leaveState_'s
+                    // reporting the error (on Aeron 1.51 a later find of it
+                    // THROWS "Unknown registration id", reported as PubFind::Error): nothing to release — NOT via leaveState_'s
                     // drain push (fix round 3).
                     ++work;
                     // A10: a driver error can be transient (EINTR: tmpfs fallocate interrupted by pending
