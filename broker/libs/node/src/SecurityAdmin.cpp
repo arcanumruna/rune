@@ -660,7 +660,7 @@ void SecurityAdmin::startBootstrap_(const SecurityBootstrapMsg& m, int64_t nowNs
 }
 
 bool SecurityAdmin::issuePurge_(int64_t nowNs) {
-    if (catalog_ == nullptr || replica_ == nullptr) return false;
+    if (catalog_ == nullptr || replica_ == nullptr || purgeHeldForTest_) return false;
     const sec::SecurityState& state = applier_.state();
     const rune::catalog::NamespaceRecord* target = nullptr;
     catalog_->namespaces().forEach([&](const rune::catalog::NamespaceRecord& rec) {   // nsId order: lowest first

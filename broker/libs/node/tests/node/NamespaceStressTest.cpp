@@ -523,7 +523,10 @@ protected:
         trace_ += " recreate:" + old.name;
         int code = 0;
         const uint32_t id = createNamespace(old.name, code);
-        ASSERT_EQ(code, 0) << "re-create " << old.name << " (the name is free at once)";
+        // Review U3: the name is refused (25) until the old incarnation's grants are purged from `__security`: not done
+        // yet - the model keeps the name absent and the generator retries it later.
+        if (code == static_cast<int>(rune::protocol::client::ErrorCode::TopicExists)) { trace_ += " (still purging)"; return; }
+        ASSERT_EQ(code, 0) << "re-create " << old.name << " (the name is free once its grants are purged)";
         ASSERT_EQ(id, lastNsId_ + 1) << "a recreated name gets a new, increasing id";
         lastNsId_ = id;
         NsModel n;

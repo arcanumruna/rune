@@ -364,6 +364,8 @@ public:
     [[nodiscard]] const SecurityAdmin* securityAdmin() const noexcept { return securityAdmin_ ? &*securityAdmin_ : nullptr; }
     /// Test seam (the 3-node suites): while held, doWork does not run the `__security` applier.
     void holdSecurityApplyForTest(bool on) noexcept { securityApplyHeldForTest_ = on; }
+    /// Test seam: while held, the `__security` leader issues no NamespacePurged.
+    void holdSecurityPurgeForTest(bool on) noexcept { if (securityAdmin_) securityAdmin_->holdPurgeForTest(on); }
     /// Issue #603 probes (admin thread): the behind verdict and how many edges were posted.
     [[nodiscard]] bool securityBehindForTest() const noexcept { return securityBehind_.behind(); }
     [[nodiscard]] uint64_t securityBehindEdgesForTest() const noexcept { return securityBehindEdges_; }

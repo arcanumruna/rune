@@ -3817,6 +3817,10 @@ BrokerNode::AdminBehindSnap BrokerNode::adminSecurityBehindForTest() {
     });
 }
 
+void BrokerNode::holdSecurityPurgeForTest(bool on) {
+    onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdSecurityPurgeForTest(on); });
+}
+
 void BrokerNode::holdSecurityApplyForTest(bool on) {
     onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdSecurityApplyForTest(on); });
 }

@@ -89,3 +89,34 @@ TEST(NamespaceCrossRefRegression, CrossNamespaceVerifyByNameRegression) {
     const auto p = txnProduce(rig, t.foreign, ids.pid, ids.epoch);
     EXPECT_EQ(p, kUnknownTopic) << "verify must not match a foreign topic by its local name";
 }
+
+// Review U3: grants naming `ra/...` are stripped only when NamespacePurged applies on `__security` (asynchronously).
+// A name recreated before that must not match the old incarnation's retained grants.
+TEST(NamespaceCrossRefRegression, RecreateBeforeSecurityPurgeIsRefusedRegression) {
+    using namespace grants;
+    constexpr int kTopicExists = static_cast<int>(pc::ErrorCode::TopicExists);
+    LcRig rig("xrefrc");
+    AuthRig& a = rig.auth();
+    rig.createNs("ra");
+    const uint32_t oldId = rig.observe("ra").nsId;
+    ASSERT_NE(oldId, 0u);
+    // A default-namespace user whose grants name namespace `ra` (a prefix grant on `ra/` topics).
+    rig.broker().createUser("bob", AuthRig::kPw,
+                            {prefix(SO::Read, ST::Topic, "ra/"), prefix(SO::Write, ST::Topic, "ra/"),
+                             prefix(SO::Describe, ST::Topic, "ra/")});
+    // The purge is held (holding the security APPLY instead makes every authenticated request answer AuthUnavailable):
+    // the namespace is DELETING and its grants are still in __security.
+    rig.broker().node().holdSecurityPurgeForTest(true);
+    ASSERT_EQ(rig.ns(rig.rootSid(), pc::NamespaceDdlKind::Delete, "ra").code, 0);
+    EXPECT_EQ(rig.ns(rig.rootSid(), pc::NamespaceDdlKind::Create, "ra").code, kTopicExists)
+        << "recreated while the old incarnation's grants are still in __security";
+
+    rig.broker().node().holdSecurityPurgeForTest(false);
+    rig.releaseReaper();
+    ASSERT_TRUE(rig.until([&] { return rig.erased(oldId); })) << "the old incarnation is erased once the purge applied";
+    ASSERT_EQ(rig.ns(rig.rootSid(), pc::NamespaceDdlKind::Create, "ra").code, 0);
+    const int32_t tid = a.defineTopic(rig.rootSid(), "ra/t");
+    ASSERT_GE(tid, 0);
+    const int64_t bob = a.login("bob", AuthRig::kPw, pc::kClientVersionNamespaces);
+    EXPECT_EQ(a.produceDenied(bob, tid), kNotAuthorized) << "bob's old grant on ra/ must not reach the new namespace";
+}

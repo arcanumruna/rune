@@ -20,7 +20,9 @@
 
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/catalog/CatalogReplayer.h>
+#include <rune/node/BrokerNode.h>
 #include <rune/node/Worker.h>
+#include <rune/security/SecurityQueries.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
@@ -217,6 +219,10 @@ public:
             cell.loginRefused = true;
             cell.a.code = s.code;
         } else {
+            // Review U3: a name is not recreated until the old incarnation's grants are purged from `__security`
+            // (asynchronous after the namespace turns DELETING): wait for that, bounded, so the cell is deterministic.
+            if (op == Op::Recreate && t == Target::Deleting && cell.nsIdBefore != 0)
+                need(until([&] { return securityPurged(cell.nsIdBefore, name); }), "security purge of " + name);
             cell.a = issue(op, s.sid, t, name, before.limits);
         }
         const Observed after = observe(name);
@@ -399,6 +405,14 @@ public:
     /// The namespace's slot in the node's authoritative slot table is free (read ON the control thread).
     [[nodiscard]] bool nsSlotFreed(uint32_t nsId) { return w_->r.broker().node().nsSlotOfForTest(nsId) == kNoNsSlot; }
     /// The id is gone from the root listing (erased).
+    /// True once `__security` holds no record of the namespace (read on the admin thread).
+    bool securityPurged(uint32_t nsId, const std::string& name) {
+        BrokerNode& n = w_->r.broker().node();
+        return n.onAdminThreadForTest([&] {
+            const SecurityApplier* sa = n.adminWorkerAgentForTest()->worker().securityApplierForTest();
+            return sa == nullptr || !rune::security::hasNamespaceRecords(sa->state(), nsId, name);
+        });
+    }
     bool erased(uint32_t nsId) {
         for (const Seen& s : list()) if (s.nsId == nsId) return false;
         return true;

@@ -1667,6 +1667,19 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
             return Rejected(reject(kInvalidRequest, "invalid namespace name " + quotedName(m.name)));
         if (nss.byName(m.name) != nullptr)
             return Rejected(reject(kTopicExists, "namespace " + quotedName(m.name) + " already exists"));
+        // Review U3: the old incarnation's grants are purged first - a DELETING namespace already left `byName`, so a
+        // recreated name would match the grants still retained in `__security`.  Cold path.
+        if (securityApplier_) {
+            bool stillPurging = false;
+            nss.forEach([&](const cat::NamespaceRecord& rec) {
+                if (!stillPurging && rec.name == m.name && std::holds_alternative<cat::NsDeleting>(rec.state) &&
+                    rune::security::hasNamespaceRecords(securityApplier_->state(), rec.nsId, rec.name))
+                    stillPurging = true;
+            });
+            if (stillPurging)
+                return Rejected(reject(kTopicExists, "namespace " + quotedName(m.name) +
+                                                         " is still being deleted; retry shortly"));
+        }
         // RUNE_MAX_NAMESPACES counts every namespace that exists (`default` and DELETING ones included).
         if (nss.liveCount() >= deps_.maxNamespaces) {
             const uint16_t code = m.clientVersion >= pc::kClientVersionNamespaces ? kNamespaceLimitExceeded

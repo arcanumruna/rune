@@ -1620,6 +1620,8 @@ public:
     [[nodiscard]] int64_t appendSecurityRecordOnLeaderForTest(std::span<const uint8_t> eventBytes);
     /// Test-only: while held, this broker's `__security` applier applies nothing (the replica still replicates).
     void holdSecurityApplyForTest(bool on);
+    /// Test-only: while held, the `__security` leader issues no NamespacePurged (a namespace stays DELETING with its grants).
+    void holdSecurityPurgeForTest(bool on);
     /// Test-only (issue #111): cut this broker off the cluster's control plane - the consensus (nothing in, nothing
     /// out) and the control replication transport (nothing in: no metadata, no internal-ISR news) - or reconnect it.
     /// Its client links and admin plane stay up (a frame of the new leader's epoch is refused by its stale replica

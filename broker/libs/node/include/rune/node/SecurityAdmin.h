@@ -120,6 +120,9 @@ public:
     [[nodiscard]] uint64_t eventsAppended() const noexcept { return eventsAppended_; }
     /// NamespacePurged events this leader appended on its own.
     [[nodiscard]] uint64_t purgesIssued() const noexcept { return purgesIssued_; }
+    /// Test seam (admin thread): while held, the leader issues no NamespacePurged (the window between a namespace turning
+    /// DELETING and its grants being purged).
+    void holdPurgeForTest(bool on) noexcept { purgeHeldForTest_ = on; }
     [[nodiscard]] std::size_t pendingCount() const noexcept { return pending_.size(); }
     [[nodiscard]] uint64_t pendingRefused() const noexcept { return pendingRefused_; }
     [[nodiscard]] bool hasInFlight() const noexcept { return !std::holds_alternative<Idle>(inFlight_); }
@@ -165,6 +168,7 @@ private:
     std::variant<Idle, AwaitingCommit>   inFlight_;
     std::deque<SecurityRequest>          pending_;
     std::vector<uint8_t>                 eventBuf_;   // the encoded event (capacity reused)
+    bool purgeHeldForTest_ = false;
     uint64_t started_ = 0, answered_ = 0, eventsAppended_ = 0, pendingRefused_ = 0, purgesIssued_ = 0;
 };
 
