@@ -781,7 +781,7 @@ protected:
             g.erasedSeen = true;
             ASSERT_TRUE(waitGone(nsRoot(dataDir(), g.nsId))) << "ns-" << g.nsId << " directory survived the delete";
             ASSERT_TRUE(waitGone(std::filesystem::path(nsRoot(dataDir(), g.nsId).string() + ".deleting")));
-            ASSERT_TRUE(r_.broker().node().nsKeyedStoresCleanForTest(g.nsId))
+            ASSERT_TRUE(r_.keyedStoresCleanBounded(g.nsId))
                 << "the consumer-offset or transaction-state store still holds a key of the erased namespace " << g.name << " (id " << g.nsId << ")";
             const auto ids = r_.metadataTopics(rootSid());
             for (const int32_t t : g.topicIds)
@@ -866,7 +866,7 @@ protected:
         ASSERT_TRUE(f1 == f2) << "restart changed the world (invariant 3)\n  before: " << show(f1) << "\n  after:  " << show(f2);
         // the delete invariant survives the restart: no deleted namespace holds a live offset or transaction-state key
         for (const GoneNs& g : gone_)
-            ASSERT_TRUE(r_.broker().node().nsKeyedStoresCleanForTest(g.nsId)) << "deleted " << g.name << " (id " << g.nsId << ") still holds a keyed-store key after the restart";
+            ASSERT_TRUE(r_.keyedStoresCleanBounded(g.nsId)) << "deleted " << g.name << " (id " << g.nsId << ") still holds a keyed-store key after the restart";
         // the gates survived: a RejectAll namespace refuses its logins, a ReadOnly one its produce
         for (const NsModel& n : ns_) {
             if (n.state == 2 && !n.users.empty())

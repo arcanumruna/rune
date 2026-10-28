@@ -89,8 +89,8 @@ ReapStatus GroupCoordinationService::tombstoneNamespace(uint32_t nsId, uint32_t 
     return r->highWatermark() >= r->logEndOffset() ? ReapStatus::Done : ReapStatus::More;   // all committed
 }
 
-std::size_t GroupCoordinationService::liveKeysOfNamespaceForTest(uint32_t nsId) const {
-    if (offsets_ == nullptr || !isLocalCoordinator() || !offsetsLoaded_()) return 0;   // this node holds no keys
+std::optional<std::size_t> GroupCoordinationService::liveKeysOfNamespaceForTest(uint32_t nsId) const {
+    if (offsets_ == nullptr || !isLocalCoordinator() || !offsetsLoaded_()) return std::nullopt;   // unknown: not loaded / not the coordinator
     return offsets_->liveKeysOfNamespaceForTest(nsId);
 }
 

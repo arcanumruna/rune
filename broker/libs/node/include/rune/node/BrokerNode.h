@@ -1760,14 +1760,21 @@ public:
         onControlThreadForTest([this]() { if (gateway_) gateway_->resetLoginThrottleForTest(); return 0; });
     }
     /// Namespaces Phase 2 Task 18 seam (CONTROL thread): true iff neither the consumer-offset store nor the transaction-state
-    /// store holds a live key of namespace `nsId` (the delete invariant).  Read-only: it counts the keys and writes nothing.  A
-    /// store this node does not hold (not the coordinator, not loaded) has no keys here and counts 0.
+    /// store holds a live key of namespace `nsId` (the delete invariant).  Read-only: it counts the keys and writes nothing.
+    /// Tri-state: Dirty = a live key; Unknown = a store this node could not read (not the coordinator / not loaded yet), so
+    /// nothing is proven; Clean = every store was read and holds none.  Tests wait (bounded) until not Unknown.
+    enum class KeyedStoresState : uint8_t { Clean, Dirty, Unknown };
     template <class = void>   // instantiated after onControlThreadForTest is defined
-    bool nsKeyedStoresCleanForTest(uint32_t nsId) {
-        return onControlThreadForTest([this, nsId]() -> bool {
-            const bool groups = !groupCoordService_ || groupCoordService_->liveKeysOfNamespaceForTest(nsId) == 0;
-            const bool txns   = !txnCoordService_ || txnCoordService_->liveKeysOfNamespaceForTest(nsId) == 0;
-            return groups && txns;
+    KeyedStoresState nsKeyedStoresCleanForTest(uint32_t nsId) {
+        return onControlThreadForTest([this, nsId]() -> KeyedStoresState {
+            bool unknown = false;
+            const auto fold = [&](const std::optional<std::size_t>& n) {
+                if (!n) unknown = true;
+                return n && *n != 0;
+            };
+            const bool dirty = (groupCoordService_ && fold(groupCoordService_->liveKeysOfNamespaceForTest(nsId))) |
+                               (txnCoordService_ && fold(txnCoordService_->liveKeysOfNamespaceForTest(nsId)));
+            return dirty ? KeyedStoresState::Dirty : unknown ? KeyedStoresState::Unknown : KeyedStoresState::Clean;
         });
     }
     /// Issues #188 / #5 seam (CONTROL thread): hold / release the gateway's record-egress resolve.

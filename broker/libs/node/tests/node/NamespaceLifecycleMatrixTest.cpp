@@ -245,7 +245,7 @@ void crashMidDelete(const TCell& p) {
     EXPECT_FALSE(std::filesystem::exists(nsRoot(rig.dataDir(), id))) << "ns-<id> directory";
     EXPECT_FALSE(std::filesystem::exists(std::filesystem::path(nsRoot(rig.dataDir(), id).string() + ".deleting")));
     EXPECT_EQ(rig.tryLogin("d/u").code, static_cast<int>(ErrorCode::AuthenticationFailed)) << "the namespace's user is gone";
-    EXPECT_TRUE(rig.broker().node().nsKeyedStoresCleanForTest(id)) << "a live consumer-offset or transaction-state key of the deleted namespace";
+    EXPECT_TRUE(rig.auth().keyedStoresCleanBounded(id)) << "a live consumer-offset or transaction-state key of the deleted namespace";
     EXPECT_TRUE(rig.nsSlotFreed(id)) << "the deleted namespace's slot is still held";
     EXPECT_EQ(rig.catalogEventCount(rune::catalog::EventKind::DropTopic, id), 2u) << "each topic dropped exactly once";
     EXPECT_EQ(rig.catalogEventCount(rune::catalog::EventKind::NamespaceDeleteStep, id), 4u) << "each step bit recorded exactly once";

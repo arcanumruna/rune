@@ -48,6 +48,7 @@
 //   lookup — transparent comparators (std::less<>) on the coordinator map.
 // ---------------------------------------------------------------------------
 
+#include <optional>
 #include <spdlog/spdlog.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 #include <rune/transaction/TransactionCoordinator.h>
@@ -209,7 +210,7 @@ public:
     /// the tombstones are not yet committed; Done = none left and all committed.
     ReapStatus tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs);
     /// Read-only test seam: the live transactional ids of `nsId` in this node's store; 0 when the store is not loaded here.
-    [[nodiscard]] std::size_t liveKeysOfNamespaceForTest(uint32_t nsId) const;
+    [[nodiscard]] std::optional<std::size_t> liveKeysOfNamespaceForTest(uint32_t nsId) const;   ///< nullopt = unknown (not loaded / not the coordinator)
 
     /// A control marker this node could not append.  NEVER counts as landed: a
     /// retriable refusal (NotLeader, MinIsrViolation, Internal, ...) is re-dispatched

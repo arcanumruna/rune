@@ -21,6 +21,8 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
+#include <type_traits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -91,6 +93,18 @@ public:
     AuthBroker& broker() noexcept { return b_; }
     AuthWireClient& wire() noexcept { return *w_; }
     ShardTestClient& c() noexcept { return w_->raw(); }
+    /// The delete invariant, non-vacuous: waits (bounded: 3000 x 10 ms, then fails) until the node's keyed stores are READABLE
+    /// (not Unknown: not loaded / not the coordinator yet), then true iff both hold no live key of namespace `nsId`.
+    [[nodiscard]] bool keyedStoresCleanBounded(uint32_t nsId, int tries = 3000) {
+        using S = std::remove_reference_t<decltype(b_.node())>::KeyedStoresState;
+        for (int i = 0; i < tries; ++i) {
+            const S s = b_.node().nsKeyedStoresCleanForTest(nsId);
+            if (s == S::Clean) return true;
+            if (s == S::Dirty) return false;
+            (void)c().pollFor(std::chrono::milliseconds(10), [] { return false; });
+        }
+        return false;   // never readable: nothing was proven
+    }
     const std::string& ch() const noexcept { return b_.channel(); }
     static constexpr int32_t stream() noexcept { return AuthWireClient::kClientStream; }
     static Clock::time_point dl(int seconds = 10) { return Clock::now() + std::chrono::seconds(seconds); }
