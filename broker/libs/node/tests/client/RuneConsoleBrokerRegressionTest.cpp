@@ -348,12 +348,85 @@ TEST(RuneConsoleBrokerRegression, AlterOnlyScriptIssuesNoCreateTopicRegression) 
     EXPECT_EQ(alterSchemaEvents(after, "ao").size(), 2u) << "one AlterSchema per ALTER statement";
 }
 
+namespace {
+// The injected duty clock of the piped-stdin test: the real steady clock plus an offset only the test advances.
+std::atomic<int64_t>  gClockOffsetNs{0};
+std::atomic<uint64_t> gClockSamples{0};
+int64_t pipedTestClock() noexcept {
+    gClockSamples.fetch_add(1, std::memory_order_relaxed);
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
+           gClockOffsetNs.load(std::memory_order_relaxed);
+}
+
+/// Process stdin (fd 0) replaced by the read end of a pipe for the scope; restored after.
+struct StdinPipe {
+    int fds[2]{-1, -1};
+    int saved = -1;
+    StdinPipe() {
+        if (::pipe(fds) != 0) throw std::runtime_error("pipe");
+        saved = ::dup(STDIN_FILENO);
+        if (saved < 0 || ::dup2(fds[0], STDIN_FILENO) < 0) throw std::runtime_error("dup2");
+    }
+    void send(const std::string& s) { ASSERT_EQ(::write(fds[1], s.data(), s.size()), static_cast<ssize_t>(s.size())); }
+    void closeWriter() {
+        if (fds[1] >= 0) { ::close(fds[1]); fds[1] = -1; }
+    }
+    ~StdinPipe() {
+        closeWriter();
+        if (saved >= 0) { ::dup2(saved, STDIN_FILENO); ::close(saved); }
+        if (fds[0] >= 0) ::close(fds[0]);
+    }
+};
+
+
+/// Advances the injected duty clock one second per step for `steps` steps, each step waiting until the console has
+/// sampled the clock twice more (= pumped the client while it waits for input).  false: the console stopped pumping.
+bool gapPastTheWindow(int steps) {
+    for (int i = 0; i < steps; ++i) {
+        gClockOffsetNs.fetch_add(1'000'000'000LL);
+        const uint64_t target = gClockSamples.load() + 2;
+        if (!waitUntil([&] { return gClockSamples.load() >= target; }, 5s)) return false;
+    }
+    return true;
+}
+
+int stepsPastTheWindow() {
+    return static_cast<int>(rune::client::session::SessionConfig::kDefaultResponseTimeoutNs / 1'000'000'000LL) + 4;
+}
+
+
+/// #671: a console on the process stdin (a pipe) in its own thread, with the injected duty clock.  Only the console's
+/// client clock is injected; the broker runs on its real clock.
+struct StdinConsole {
+    StdinPipe in;
+    Sink out, err;
+    uint64_t pumps = 0;
+    int rc = -1;
+    std::thread t;
+    explicit StdinConsole(std::vector<std::string> args) {
+        gClockOffsetNs = 0;
+        gClockSamples = 0;
+        t = std::thread([this, a = std::move(args)] {
+            rc = rune::cli::console::runLiveOnStdinForTest(a, &pipedTestClock, out, err, &pumps);
+        });
+    }
+    void send(const std::string& s) { in.send(s); }
+    void finish() {
+        in.closeWriter();
+        if (t.joinable()) t.join();
+    }
+    ~StdinConsole() { finish(); }
+};
+} // namespace
+
 TEST(RuneConsoleBrokerRegression, IdlePromptKeepsTheSessionAliveRegression) {
     // Review Focus #6 / DD9: an interactive console idle past the session's stale-session window stays connected.
     OneBroker b("console_idle");
-    PipeConsole c({"console", "--broker", b.endpoint()});
+    StdinConsole c({"console", "--broker", b.endpoint()});   // #671: injected clock, no wall-clock sleep
     c.send("topic idle1 partitions 1;\n");
-    std::this_thread::sleep_for(std::chrono::nanoseconds(rune::client::session::SessionConfig{}.responseTimeoutNs) + 2s);
+    ASSERT_TRUE(waitUntil([&] { return c.out.str().find("ok topic idle1") != std::string::npos; }))
+        << "out: " << c.out.str() << "\nerr: " << c.err.str();
+    ASSERT_TRUE(gapPastTheWindow(stepsPastTheWindow())) << "the console stopped pumping while idle";   // > responseTimeoutNs + 2 s
     c.send("topic idle2 partitions 1;\n");
     c.finish();   // EOF: the console leaves
     EXPECT_EQ(c.rc, 0) << c.err.str();
@@ -416,15 +489,16 @@ TEST(RuneConsoleBrokerRegression, SessionRevokedEndsTheConsoleRegression) {
     b.bootstrapAdmin();
     b.createUser("u", kUserPw, {prefix(SO::Create, ST::Topic, "ok_")});
     const std::string pw = writeFile("revoked.pw", std::string(kUserPw) + "\n");
-    PipeConsole c({"console", "--broker", b.endpoint(), "--user", "u", "--password-file", pw, "--tls-ca",
-                   AuthBroker::tlsCaFile().string()});   // issue #13: credentials only over TLS
+    StdinConsole c({"console", "--broker", b.endpoint(), "--user", "u", "--password-file", pw, "--tls-ca",
+                    AuthBroker::tlsCaFile().string()});   // issue #13: credentials only over TLS; #671: injected clock
     c.send("topic ok_a partitions 1;\n");
     // The login and the first statement must be done before the admin disables the user (a fixed 500 ms is not enough
     // under load: the disable then lands before the connect and the login itself fails).
     ASSERT_TRUE(waitUntil([&] { return c.out.str().find("ok topic ok_a") != std::string::npos; }))
         << "out: " << c.out.str() << "\nerr: " << c.err.str();
     b.disableUser("u");
-    std::this_thread::sleep_for(1500ms);   // the console pumps while idle and learns the session ended
+    // #671: the console pumps while idle (driven by the injected clock, bounded) and learns the session ended.
+    ASSERT_TRUE(gapPastTheWindow(3)) << "the console stopped pumping while idle";
     c.send("topic ok_b partitions 1;\ntopic ok_c partitions 1;\n");
     c.finish();
     EXPECT_EQ(c.rc, 46) << c.err.str();
@@ -438,37 +512,26 @@ TEST(RuneConsoleBrokerRegression, SessionRevokedEndsTheConsoleRegression) {
     EXPECT_EQ(countOf(c.err.str(), "the session ended"), 1u) << "reported once: " << c.err.str();
 }
 
-namespace {
-// The injected duty clock of the piped-stdin test: the real steady clock plus an offset only the test advances.
-std::atomic<int64_t>  gClockOffsetNs{0};
-std::atomic<uint64_t> gClockSamples{0};
-int64_t pipedTestClock() noexcept {
-    gClockSamples.fetch_add(1, std::memory_order_relaxed);
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
-           gClockOffsetNs.load(std::memory_order_relaxed);
+TEST(RuneConsoleBrokerRegression, ScriptEndsWithTheRejectCodeWhenTheSessionIsRevokedMidScriptRegression) {
+    // #690: `-f` script mode through the real console entry point (the stdin seam carries no script batch).  Statement 2
+    // disables the script's own user, so the revoke lands deterministically between statements 1 and 3: the script stops
+    // at the revoked statement, nothing after it runs, and the exit status is the reject code (SessionRevoked, 46).
+    // No real broker path produces a session reject code >= 0x8000 (the broker's ErrorCode values are small), so the
+    // `consoleRejectCode` call site in LiveExecutor stays covered by the helper test
+    // (ConsoleOfflineRegression.ARejectCodeAboveInt16MaxStillEndsTheSessionRegression).
+    AuthBroker b("console_script_revoked");
+    b.bootstrapAdmin();
+    const std::string pw = writeFile("script_revoked.pw", std::string(AuthBroker::kAdminPassword) + "\n");
+    const std::string f = writeFile("script_revoked.rql",
+        "topic rv_a partitions 1;\nalter user admin disable force;\ntopic rv_b partitions 1;\ntopic rv_c partitions 1;\n");
+    const auto r = consoleLive(b, {"-f", f, "--user", "admin", "--password-file", pw}, "");
+    EXPECT_EQ(r.rc, 46) << r.err;
+    EXPECT_NE(r.out.find("ok topic rv_a"), std::string::npos) << r.out;
+    EXPECT_EQ(r.out.find("ok topic rv_b"), std::string::npos) << "no statement after the revoke ran: " << r.out;
+    EXPECT_EQ(r.out.find("ok topic rv_c"), std::string::npos) << r.out;
+    EXPECT_NE(r.err.find("statement 2: SessionRevoked (46)"), std::string::npos) << r.err;
+    EXPECT_EQ(countOf(r.err, "the session ended"), 1u) << "reported once: " << r.err;
 }
-
-/// Process stdin (fd 0) replaced by the read end of a pipe for the scope; restored after.
-struct StdinPipe {
-    int fds[2]{-1, -1};
-    int saved = -1;
-    StdinPipe() {
-        if (::pipe(fds) != 0) throw std::runtime_error("pipe");
-        saved = ::dup(STDIN_FILENO);
-        if (saved < 0 || ::dup2(fds[0], STDIN_FILENO) < 0) throw std::runtime_error("dup2");
-    }
-    void send(const std::string& s) { ASSERT_EQ(::write(fds[1], s.data(), s.size()), static_cast<ssize_t>(s.size())); }
-    void closeWriter() {
-        if (fds[1] >= 0) { ::close(fds[1]); fds[1] = -1; }
-    }
-    ~StdinPipe() {
-        closeWriter();
-        if (saved >= 0) { ::dup2(saved, STDIN_FILENO); ::close(saved); }
-        if (fds[0] >= 0) ::close(fds[0]);
-    }
-};
-
-} // namespace
 
 TEST(RuneConsoleBrokerRegression, PipedStdinGapKeepsTheSessionAliveRegression) {
     // #311: the console reads the process stdin through the polling source whether or not it is a terminal, so a gap on
@@ -522,21 +585,6 @@ TEST(RuneConsoleBrokerRegression, PipedStdinGapKeepsTheSessionAliveRegression) {
 // ── Adversarial review of PR #669 (#311 / #315), through the public console entry points ─────────────────────────
 
 namespace {
-/// Advances the injected duty clock one second per step for `steps` steps, each step waiting until the console has
-/// sampled the clock twice more (= pumped the client while it waits for input).  false: the console stopped pumping.
-bool gapPastTheWindow(int steps) {
-    for (int i = 0; i < steps; ++i) {
-        gClockOffsetNs.fetch_add(1'000'000'000LL);
-        const uint64_t target = gClockSamples.load() + 2;
-        if (!waitUntil([&] { return gClockSamples.load() >= target; }, 5s)) return false;
-    }
-    return true;
-}
-
-int stepsPastTheWindow() {
-    return static_cast<int>(rune::client::session::SessionConfig::kDefaultResponseTimeoutNs / 1'000'000'000LL) + 4;
-}
-
 /// This process's CLI scratch directories (`rune-cli-<pid>-...` under the temp dir).
 std::vector<fs::path> cliScratchDirs() {
     std::vector<fs::path> out;

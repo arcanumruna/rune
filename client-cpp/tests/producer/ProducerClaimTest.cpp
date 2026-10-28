@@ -1259,6 +1259,78 @@ TEST(ProducerClaimRegression, InvokerBatchClaimDestroyedOffOwnerIsReleasedRegres
     EXPECT_FALSE(anyByteIs(cap.values(), static_cast<char>(0xAB)));
 }
 
+// C19 adversarial review (#656 x #689): an Invoker claim abandoned by a partition refusal and destroyed off the owner
+// thread, in both orders (the abort message queued before the refusal abandons the claim, and after).  Either way the
+// owner's next duty pass settles it: a new claim opens, the abandoned span (0xAB) is never sent, nothing is foreign.
+TEST(ProducerClaimRegression, InvokerClaimRefusedAndDestroyedOffOwnerSettlesInEitherOrderAdversarialRegression) {
+    for (const bool destroyFirst : {false, true}) {
+        SCOPED_TRACE(destroyFirst ? "destroy, then refusal" : "refusal, then destroy");
+        ProducerConfig cfg = voidCfg();
+        cfg.acks = Acks::Leader;
+        DirectRig r(cfg);
+        test_support::AckLedger L;
+        L.attach(r.p);
+        FrameCapture cap;
+        r.pass(cap.fn());
+        ASSERT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("A"), rc::AckToken{1}), SendResult::Ok);
+        r.pass(cap.fn());
+        ASSERT_EQ(cap.corrs.size(), 1u) << "A is in flight";
+        rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 64);
+        ASSERT_TRUE(c);
+        std::memset(c.buffer().data(), 0xAB, c.buffer().size());
+        auto destroy = [&] { std::thread t([&] { rc::Claim dead(std::move(c)); }); t.join(); };
+        if (destroyFirst) destroy();
+        r.impl->onProduceResponse(cap.corrs[0], -1, 45);  // NotAuthorized: #689 fails the builder, abandoning the claim
+        EXPECT_EQ(r.impl->claimsAbandoned(), 1u);
+        EXPECT_EQ(L.times(1), 1);
+        if (!destroyFirst) destroy();
+        r.pass(cap.fn());   // ONE owner duty pass settles the abandoned claim
+        EXPECT_EQ(r.impl->claimCreditLost(), 1u);
+        EXPECT_EQ(r.impl->ringForeignMessages(), 0u);
+        rc::Claim c2 = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4);
+        ASSERT_TRUE(c2) << "still held: " << static_cast<int>(c2.result());
+        fill(c2.buffer(), "NEW!");
+        ASSERT_TRUE(c2.commit());
+        r.pass(cap.fn());
+        EXPECT_EQ(cap.values(), (std::vector<std::string>{"A", "NEW!"}));
+        EXPECT_FALSE(anyByteIs(cap.values(), static_cast<char>(0xAB)));
+    }
+}
+
+// C19 adversarial review (#655 x #656): one Direct ring carries both kinds of off-owner settle message.  Every Tier-2
+// slot plus the open claim die off the owner thread; ONE duty pass applies them all (no message is foreign or lost).
+TEST(ProducerClaimRegression, InvokerTier2DiscardsAndAClaimAbortShareOneDutyPassAdversarialRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks       = Acks::Leader;
+    cfg.tier2Slots = 6;
+    DirectRig r(cfg);
+    FrameCapture cap;
+    r.pass(cap.fn());
+    std::vector<std::unique_ptr<rc::BatchBuilder>> held;
+    for (int i = 0; i < 6; ++i) {
+        held.push_back(std::make_unique<rc::BatchBuilder>(r.impl, 1, 0));
+        held.back()->add(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>("v"), 1));
+    }
+    ASSERT_EQ(r.impl->tier2FreeCount(), 0u);
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 8);
+    ASSERT_TRUE(c);
+    std::memset(c.buffer().data(), 0xAB, c.buffer().size());
+    std::thread t([&] {
+        for (int i = 0; i < 3; ++i) held[static_cast<std::size_t>(i)].reset();
+        { rc::Claim dead(std::move(c)); }
+        for (int i = 3; i < 6; ++i) held[static_cast<std::size_t>(i)].reset();
+    });
+    t.join();
+    EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("x")), SendResult::ClaimHeld);
+    EXPECT_EQ(r.impl->drainRing(kNow, 16), 7) << "six discards and one claim abort";
+    EXPECT_EQ(r.impl->ringForeignMessages(), 0u);
+    EXPECT_EQ(r.impl->claimCreditLost(), 1u);
+    EXPECT_EQ(r.impl->tier2FreeCount(), 6u) << "every slot came back";
+    EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("x")), SendResult::Ok);
+    r.impl->flushBatches(kNow, 42, cap.fn());
+    EXPECT_EQ(cap.values(), std::vector<std::string>{"x"});
+}
+
 TEST(ProducerClaimRegression, DeliverySweepAbandonKeepsTheHeldBatchClaimOutOfTheRetriedFrameRegression) {
     ProducerConfig cfg = voidCfg();
     cfg.acks              = Acks::Leader;

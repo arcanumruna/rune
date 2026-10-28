@@ -14,10 +14,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -1378,6 +1381,184 @@ TEST(ProducerSequence, ARetriableAnswerLeavesTheLingeringRecordsAloneRegression)
     EXPECT_EQ(L.times(2), 0);
     EXPECT_EQ(L.times(3), 0);
     EXPECT_EQ(L.times(1), 0) << "the answered batch is retried too";
+}
+
+// C19 adversarial review (#689, whole bug class): a Tier-2 batch queued on the refused partition (held behind a full
+// in-flight window) is as doomed as the builder's records: it must fail at once with the same code, never be sent
+// (and refused) again.  DISABLED: open #689 gap (failBuilder_ does not fail ps's queued Tier-2 batches; failAllPending
+// does) - reported to the C19 fix round; enable with the fix.
+TEST(ProducerSequence, DISABLED_ARefusedPartitionAlsoFailsItsQueuedTier2BatchAdversarialRegression) {
+    ProducerConfig cfg = ackCfg(1, /*lingerUs=*/60'000'000);
+    cfg.deliveryTimeoutMs = 3'600'000;
+    ProducerImpl impl(cfg);
+    AckLedger L;
+    L.attach(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(1)));  // A
+    impl.submitFlush();
+    pump(impl, sink);
+    ASSERT_EQ(cap.frames.size(), 1u) << "A is in flight (window of 1 now full)";
+    // The record enters the builder first (a record behind a queued Tier-2 batch waits in the ring instead).
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(3)));  // lingers
+    pump(impl, sink);
+    {
+        rune::client::BatchBuilder bb(&impl, 1, 0);
+        bb.add(kVal);
+        bb.add(kVal);
+        ASSERT_EQ(bb.send(AckToken{2}), OpResult::Accepted);  // queued behind A
+    }
+    pump(impl, sink);
+    ASSERT_EQ(cap.frames.size(), 1u) << "the record and the Tier-2 batch wait for the window";
+    impl.onProduceResponse(cap.frames[0].corrId, -1, 45);
+    pump(impl, sink);  // the clock is NOT advanced
+    for (const rune::client::Token t : {1, 3, 2}) {
+        ASSERT_EQ(L.times(t), 1) << "token " << t;
+        EXPECT_EQ(L.status(t), OpStatus::BrokerError) << "token " << t;
+        EXPECT_EQ(L.last.at(t).ec, 45u) << "token " << t;
+    }
+    EXPECT_EQ(cap.frames.size(), 1u) << "the queued Tier-2 batch was sent to the refused partition again";
+}
+
+// C19 adversarial review (#689): the refusal fails only the answered partition's UNSENT records.  A later batch of the
+// same partition already in flight is answered on its own (its own OK completes it, once), and another partition's
+// lingering record is untouched; everything completes exactly once.
+TEST(ProducerSequence, ARefusalLeavesInFlightBatchesAndOtherPartitionsAloneAdversarialRegression) {
+    ProducerConfig cfg = ackCfg(8, /*lingerUs=*/60'000'000);
+    cfg.deliveryTimeoutMs = 3'600'000;
+    ProducerImpl impl(cfg);
+    AckLedger L;
+    L.attach(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    auto sendFlushed = [&](int32_t part, rune::client::Token t) {
+        ASSERT_TRUE(impl.submitSendRecord(1, part, Key(uint64_t{1}), kVal, true, AckLedger::hi(t)));
+        impl.submitFlush();
+        pump(impl, sink);
+    };
+    sendFlushed(0, 1);  // A
+    sendFlushed(0, 2);  // B, in flight behind A
+    ASSERT_EQ(cap.frames.size(), 2u);
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(3)));  // C lingers on p0
+    ASSERT_TRUE(impl.submitSendRecord(1, 1, Key(uint64_t{1}), kVal, true, AckLedger::hi(4)));  // D lingers on p1
+    pump(impl, sink);
+    ASSERT_EQ(cap.frames.size(), 2u);
+    impl.onProduceResponse(cap.frames[0].corrId, -1, 7);  // UnknownTopic on A (outcome-unknown path D)
+    pump(impl, sink);
+    EXPECT_EQ(L.times(1), 1);
+    EXPECT_EQ(L.times(3), 1) << "p0's lingering record fails at once";
+    EXPECT_EQ(L.last.at(3).ec, 7u);
+    EXPECT_EQ(L.times(2), 0) << "B is in flight: answered on its own";
+    EXPECT_EQ(L.times(4), 0) << "p1 is another partition";
+    EXPECT_EQ(cap.frames.size(), 2u);
+    impl.onProduceResponse(cap.frames[1].corrId, 50, 0);
+    ASSERT_EQ(L.times(2), 1);
+    EXPECT_EQ(L.status(2), OpStatus::Ok);
+    EXPECT_EQ(L.value(2), 50);
+    impl.submitFlush();
+    pump(impl, sink);
+    ASSERT_EQ(cap.frames.size(), 3u) << "D goes out on p1";
+    EXPECT_EQ(cap.frames[2].partition, 1);
+    impl.onProduceResponse(cap.frames[2].corrId, 9, 0);
+    sendFlushed(0, 5);  // E: p0 is usable again
+    ASSERT_EQ(cap.frames.size(), 4u);
+    impl.onProduceResponse(cap.frames[3].corrId, 51, 0);
+    for (const rune::client::Token t : {1, 2, 3, 4, 5}) EXPECT_EQ(L.times(t), 1) << "token " << t;
+    EXPECT_EQ(L.status(4), OpStatus::Ok);
+    EXPECT_EQ(L.status(5), OpStatus::Ok);
+    EXPECT_FALSE(impl.hasInFlight());
+}
+
+// C19 adversarial review (#689, data integrity): a seeded random model over two partitions (window 2, linger 0) mixing
+// OK, retriable (10), outcome-unknown (7, 51) and definite (45) answers on random live batches.  Invariants: no record
+// completes twice; right after a partition-refusal answer completes its batch, every record of that partition not in
+// a frame on the wire has completed with that code (#689); at the end every record has completed exactly once.
+TEST(ProducerSequence, RandomAnswersOverTwoPartitionsCompleteEveryRecordOnceAdversarialRegression) {
+    namespace bc = rune::client::producer::batchcorr;
+    for (uint32_t seed = 1; seed <= 40; ++seed) {
+        SCOPED_TRACE(::testing::Message() << "seed " << seed);
+        std::mt19937 rng(seed);
+        ProducerConfig cfg    = ackCfg(2, /*lingerUs=*/0);
+        cfg.deliveryTimeoutMs = 3'600'000;
+        ProducerImpl impl(cfg);
+        AckLedger L;
+        L.attach(impl);
+        std::vector<rune::client::Token> unsent[2];                // accepted, not yet in a frame (FIFO)
+        std::map<int64_t, std::pair<int32_t, std::vector<rune::client::Token>>> live;   // base corr -> (part, tokens)
+        std::map<int64_t, int64_t> latest;                          // base corr -> latest attempt's corr
+        const auto sink = [&](int32_t, int32_t p, int32_t, const uint8_t* b, std::size_t n) {
+            const auto v = rcc::decodeProduce(b, n);
+            if (!v) return false;
+            const int64_t base = bc::base(v->correlationId);
+            latest[base]       = v->correlationId;
+            if (live.find(base) == live.end()) {
+                rune::protocol::RecordBatchReader r(v->recordBatch.data(), v->recordBatch.size());
+                const auto k = static_cast<std::size_t>(r.recordCount());
+                EXPECT_LE(k, unsent[p].size());
+                std::vector<rune::client::Token> toks(unsent[p].begin(), unsent[p].begin() + static_cast<std::ptrdiff_t>(std::min(k, unsent[p].size())));
+                unsent[p].erase(unsent[p].begin(), unsent[p].begin() + static_cast<std::ptrdiff_t>(toks.size()));
+                live.emplace(base, std::make_pair(p, std::move(toks)));
+            }
+            return true;
+        };
+        const ProducerImpl::SendFn fn = sink;
+        int64_t now = kNow;
+        rune::client::Token next = 1;
+        auto noneTwice = [&] {
+            for (const auto& [t, c] : L.count) ASSERT_LE(c, 1) << "token " << t << " completed twice";
+        };
+        for (int step = 0; step < 300 && !::testing::Test::HasFatalFailure(); ++step) {
+            const int op = static_cast<int>(rng() % 10);
+            if (op < 5) {
+                const int32_t p = static_cast<int32_t>(rng() % 2);
+                ASSERT_TRUE(impl.submitSendRecord(1, p, Key(uint64_t{1}), kVal, true, AckLedger::hi(next)));
+                unsent[p].push_back(next++);
+                pump(impl, fn, now);
+            } else if (op < 9 && !live.empty()) {
+                auto it = live.begin();
+                std::advance(it, static_cast<long>(rng() % live.size()));
+                const int64_t base = it->first;
+                const int32_t p    = it->second.first;
+                static constexpr int16_t kCodes[] = {0, 0, 0, 10, 7, 45, 51};
+                const int16_t code = kCodes[rng() % (sizeof kCodes / sizeof kCodes[0])];
+                const std::vector<rune::client::Token> toks = it->second.second;
+                impl.onProduceResponse(latest[base], code == 0 ? 100 : -1, code);
+                noneTwice();
+                if (code != 10) {
+                    for (const auto t : toks) ASSERT_EQ(L.times(t), 1) << "answered token " << t << " code " << code;
+                    live.erase(base);
+                    if (code == 7 || code == 45 || code == 51) {   // #689: partition refusals
+                        for (const auto t : unsent[p]) {
+                            ASSERT_EQ(L.times(t), 1) << "unsent token " << t << " after refusal " << code;
+                            EXPECT_EQ(L.last.at(t).ec, static_cast<uint16_t>(code));
+                        }
+                        unsent[p].clear();
+                    }
+                }
+                pump(impl, fn, now);
+            } else {
+                now += 600'000'000;   // past the retriable backoff
+                impl.retransmitStalled(now, fn);
+                pump(impl, fn, now);
+            }
+            noneTwice();
+        }
+        // Drain: answer everything OK until every record has completed.
+        for (int i = 0; i < 2000 && L.count.size() < static_cast<std::size_t>(next - 1); ++i) {
+            now += 2'000'000'000;
+            impl.submitFlush();
+            pump(impl, fn, now);
+            impl.retransmitStalled(now, fn);
+            const auto snapshot = live;
+            for (const auto& [base, pt] : snapshot) {
+                impl.onProduceResponse(latest[base], 100, 0);
+                live.erase(base);
+            }
+            noneTwice();
+        }
+        for (rune::client::Token t = 1; t < next; ++t) ASSERT_EQ(L.times(t), 1) << "token " << t;
+        EXPECT_FALSE(impl.hasInFlight());
+    }
 }
 
 // OOS behind an unresolved older batch: parked (no completion, no bump); the
