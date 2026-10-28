@@ -4,6 +4,7 @@
 // client.doWork() + gw.pump(); the blocking *AndWait forms are proven against
 // real BrokerNodes (Task 11: one node; Task 22: three nodes).
 #include <filesystem>
+#include "../support/FreePort.h"
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
 #include <rune/client/Client.h>
@@ -32,18 +33,6 @@ int g_ctr = 0;                                      // test thread only
 
 // Never a fixed UDP port (GroupRoutingRegressionTest MEDIUM-6): ctest -j runs
 // test processes in parallel — the kernel picks a free one.
-int freePort() {
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in a{};
-    a.sin_family      = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port        = 0;
-    (void)::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
-    socklen_t len = sizeof a;
-    (void)::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-    ::close(fd);
-    return ntohs(a.sin_port);
-}
 std::string udp(int port) { return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port); }
 
 rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {   // as InvokerClientTest.cpp's invokerCfg, plus the clock
@@ -136,7 +125,7 @@ TEST(ClientDdlRedirectRegression, NotLeaderPastTheBudgetIsAnExplicitFailureNotAH
 
 TEST(ClientDdlRedirectRegression, RedirectIsFollowedToTheLeaderEndpoint) {
     Rig r(invokerCfg(3964, 3965));
-    const std::string leaderCh = udp(freePort());
+    const std::string leaderCh = udp(rune::client::testing::allocFreeUdpPort());
     const int leader = r.gw.addNode(leaderCh, 3964);          // a second fake node (IngressEndpointRoutingTest)
     r.connect();
     int leaderSaw = 0;
@@ -162,7 +151,7 @@ TEST(ClientDdlRedirectRegression, RedirectIsFollowedToTheLeaderEndpoint) {
 
 TEST(ClientDdlRedirectRegression, RedirectLoopEndsExplicitly) {
     Rig r(invokerCfg(3966, 3967));
-    const std::string loopCh = udp(freePort());
+    const std::string loopCh = udp(rune::client::testing::allocFreeUdpPort());
     (void)r.gw.addNode(loopCh, 3966);
     r.connect();
     r.gw.templateHandlers[pc::DropView::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
@@ -304,7 +293,7 @@ TEST_P(ClientDdlAnswerMatrixRegression, EveryDdlOpHandlesEveryAnswerClass) {
     // session's liveness window (past it the session, not the op, would end).
     cfg.ddlTimeoutMs = 2'000;
     Rig r(cfg);
-    const std::string leaderCh = udp(freePort());
+    const std::string leaderCh = udp(rune::client::testing::allocFreeUdpPort());
     const int leader = r.gw.addNode(leaderCh, 3970);
     r.connect();
     std::vector<rune::protocol::RequestId> ids;
@@ -469,7 +458,7 @@ TEST(ClientDdlRedirectRegression, RedirectToAnUnreachableNodeEndsInTimeout) {
     cfg.ddlTimeoutMs = 500;   // the DDL deadline
     Rig r(cfg);
     r.connect();
-    const std::string nowhere = udp(freePort());   // no fake node listens there
+    const std::string nowhere = udp(rune::client::testing::allocFreeUdpPort());   // no fake node listens there
     int seen = 0;
     r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
         auto m = pc::DropTopic::decode(f, len);
@@ -488,7 +477,7 @@ TEST(ClientDdlRedirectRegression, RedirectToAnUnreachableNodeEndsInTimeout) {
 // back to the seed) with the same requestId, and the answer completes the op.
 TEST(ClientDdlRedirectRegression, NotLeaderAfterARedirectResendsToTheLeaderWithTheSameRequestId) {
     Rig r(invokerCfg(3998, 3999));
-    const std::string leaderCh = udp(freePort());
+    const std::string leaderCh = udp(rune::client::testing::allocFreeUdpPort());
     const int leader = r.gw.addNode(leaderCh, 3998);
     r.connect();
     std::vector<int> at;
@@ -645,8 +634,8 @@ TEST(ClientCorrIdRegression, ConnectAnswerAndControlAnswerFromTheSameCounterValu
 TEST(ClientDdlRedirectRegression, RepeatedRedirectsReachTheCapAndEndBrokerErrorRedirectRegression) {
     Rig r(invokerCfg(3976, 3977));
     r.gw.uniqueSessionIds = true;
-    const std::string aCh = udp(freePort());
-    const std::string bCh = udp(freePort());
+    const std::string aCh = udp(rune::client::testing::allocFreeUdpPort());
+    const std::string bCh = udp(rune::client::testing::allocFreeUdpPort());
     const int a = r.gw.addNode(aCh, 3976);
     const int b = r.gw.addNode(bCh, 3976);
     r.connect();
@@ -707,7 +696,7 @@ TEST(ClientDdlRedirectRegression, TraceDdlRetriesRecordsEveryFollowedRedirectAnd
         rc::ClientConfig cfg = invokerCfg(trace ? 3980 : 3982, trace ? 3981 : 3983);
         cfg.traceDdlRetries = trace;
         Rig r(cfg);
-        const std::string leaderCh = udp(freePort());
+        const std::string leaderCh = udp(rune::client::testing::allocFreeUdpPort());
         const int leader = r.gw.addNode(leaderCh, cfg.gatewayStreamId);
         r.connect();
         int leaderCalls = 0;
@@ -812,7 +801,7 @@ void answerViewRow(Rig& r, int ep, const pc::GetViewRow& m, uint16_t status, con
 
 TEST(ClientDdlRedirectRegression, GetViewRowRedirectIsFollowedToTheSourceLeaderAndAnswersTheRowRegression) {
     Rig r(invokerCfg(4450, 4451));
-    const std::string leaderCh = udp(freePort());
+    const std::string leaderCh = udp(rune::client::testing::allocFreeUdpPort());
     const int leader = r.gw.addNode(leaderCh, 4450);
     r.connect();
     std::vector<int> arrivedOn;
@@ -1029,7 +1018,7 @@ TEST(ClientViewRowRegression, GetViewRowSessionLostThenNotLeaderEndsOnTheViewRea
     cfg.pingTimeoutMs       = 8000;
     Rig r(cfg);
     r.gw.uniqueSessionIds = true;
-    const std::string aCh = udp(freePort());
+    const std::string aCh = udp(rune::client::testing::allocFreeUdpPort());
     const int a = r.gw.addNode(aCh, 4876);
     r.connect();
     struct Seen { int ep; int64_t sid; };

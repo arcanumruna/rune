@@ -1523,6 +1523,8 @@ if(BUILD_TESTING)
         tests/detail/Crc32cFastTest.cpp
         tests/producer/ProduceFrameBuilderTest.cpp
         tests/detail/CoordRouteTest.cpp
+        tests/support/FreePortRegressionTest.cpp   # 429 / 370
+        tests/support/AtomicFileRegressionTest.cpp   # 44
     )
     target_include_directories(rune_pure_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include

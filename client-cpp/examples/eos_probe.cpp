@@ -33,6 +33,7 @@
 //   RUNE_PIPELINE_TIMEOUT_S  pipeline: hard cap (default 600)
 //   RUNE_TIMEOUT_MS          per-operation timeout (default 20000)
 
+#include "AtomicFile.h"
 #include "ExampleAuth.h"
 #include "eos_out.gen.h"   // rune::gen::EosOut {id int64 key, v int64}
 
@@ -309,9 +310,9 @@ int runFill(Client& c, const TopicHandle& in, int64_t n, int timeoutMs) {
     }
     const std::string counts = envStr("RUNE_COUNTS_FILE");
     if (!counts.empty()) {
-        std::ofstream f(counts, std::ios::trunc);
-        for (std::size_t i = 0; i < perPart.size(); ++i) f << i << ' ' << perPart[i] << '\n';
-        if (!f) { fail("EOS-FILL", "cannot write " + counts); return 1; }
+        std::string text;
+        for (std::size_t i = 0; i < perPart.size(); ++i) text += std::to_string(i) + ' ' + std::to_string(perPart[i]) + '\n';
+        if (!rune::examples::writeFileAtomically(counts, text)) { fail("EOS-FILL", "cannot write " + counts); return 1; }
     }
     std::printf("EOS-FILL: OK count=%lld\n", static_cast<long long>(acked));
     return 0;

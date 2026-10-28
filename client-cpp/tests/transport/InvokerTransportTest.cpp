@@ -6,6 +6,7 @@
 
 #include <Aeron.h>  // aeron::currentTimeMillis — the conductor's own clock (stall test)
 
+#include "../support/FreePort.h"
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -629,15 +630,6 @@ TEST(InvokerTransportEpollPoll, AeronIsTheReleaseEpollFirstWasVerifiedAgainst) {
 // it in the pass, or the owner parked on wakeFds() wakes at once forever (100% CPU while a broker node is down).
 // Linux only.
 namespace {
-uint16_t closedUdpPort() {
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
-    ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
-    socklen_t len = sizeof a;
-    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-    ::close(fd);
-    return ntohs(a.sin_port);
-}
 template <class Pred>
 bool pumpFor(Transport& t, std::chrono::milliseconds limit, Pred&& pred) {
     const auto deadline = std::chrono::steady_clock::now() + limit;
@@ -653,8 +645,8 @@ TEST(InvokerTransportWakeRegression, PeerDownNeverLeavesWakeFdsReadyAfterAnIdleP
 #if !defined(__linux__)
     GTEST_SKIP() << "driver wake fds are Linux-only (Aeron's transport pollers use epoll there)";
 #else
-    const std::string down1 = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(closedUdpPort());
-    const std::string down2 = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(closedUdpPort());
+    const std::string down1 = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPort());
+    const std::string down2 = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPort());
     Transport t{invokerConfig(down1, "aeron:ipc", 3194)};
     t.start();
     const Transport::PubHandle h = t.publicationHandle(down2, 3195);   // a 2nd send socket: the epoll-first branch
@@ -703,7 +695,7 @@ TEST(InvokerTransportWakeRegression, PeerDownNeverLeavesWakeFdsReadyAfterAnIdleP
 // A7 re-review LOW-2: coverage (delivery worked before the fix) — not a regression test.
 TEST(InvokerTransportEpollPoll, MultiTransportReceiverDeliversThroughEpollFirst) {
     for (bool epoll : {true, false}) {
-        const uint16_t p0 = closedUdpPort(), p1 = closedUdpPort(), p2 = closedUdpPort();
+        const uint16_t p0 = rune::client::testing::allocFreeUdpPort(), p1 = rune::client::testing::allocFreeUdpPort(), p2 = rune::client::testing::allocFreeUdpPort();
         const std::string c0 = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p0);
         const std::string c1 = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p1);
         const std::string c2 = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p2);

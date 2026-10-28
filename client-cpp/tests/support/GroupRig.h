@@ -6,6 +6,7 @@
 #pragma once
 
 #include <filesystem>
+#include "FreePort.h"
 #include "InvokerGateway.h"
 #include "TestCompletions.h"
 
@@ -32,19 +33,6 @@ int g_ctr = 0;  // test thread only
 std::string udp(int port) { return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port); }
 
 // MEDIUM-6: never a fixed port — the kernel picks a free one.
-int freePort() {
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in a{};
-    a.sin_family      = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port        = 0;
-    (void)::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
-    socklen_t len = sizeof a;
-    (void)::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-    ::close(fd);
-    return ntohs(a.sin_port);
-}
-
 struct RigOptions {
     // Each fake node sends from its own UDP socket (a distinct
     // Image::sourceIdentity), like real broker nodes on distinct hosts; the
@@ -70,8 +58,8 @@ struct GroupRig {
     // sessions need the SessionMachine's connect retry (duty clock).
     GroupRig(int32_t in, int32_t eg, RigOptions o = {})
         : opt(o),
-          egress(o.udpSources ? udp(freePort()) : std::string("aeron:ipc")),
-          c(makeCfg(in, eg, udp(freePort()), egress, o)),
+          egress(o.udpSources ? udp(rune::client::testing::allocFreeUdpPort()) : std::string("aeron:ipc")),
+          c(makeCfg(in, eg, udp(rune::client::testing::allocFreeUdpPort()), egress, o)),
           client(c),
           gw(c.dataDir + "/aeron", c.gatewayChannel, in, egress, eg, pubChannel()) {
         const std::string& seed = c.gatewayChannel;
@@ -85,11 +73,11 @@ struct GroupRig {
     }
     // The reply publication of the next fake node (a distinct source when udpSources).
     std::string pubChannel() const {
-        return opt.udpSources ? egress + "|interface=127.0.0.1:" + std::to_string(freePort()) : std::string();
+        return opt.udpSources ? egress + "|interface=127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPort()) : std::string();
     }
     /// Adds a fake broker node on a free port; returns (endpoint index, port).
     std::pair<int, int> addNode(int32_t stream) {
-        const int port = freePort();
+        const int port = rune::client::testing::allocFreeUdpPort();
         gw.nextPubChannel = pubChannel();
         const int ep = gw.addEndpoint(udp(port), stream);
         gw.nodeOfEndpoint[ep] = ep;   // a broker of its own: its own session table (strict sessions)

@@ -3,6 +3,7 @@
 // cache.  The fake is as strict as the real broker will be (nothing but the login before it finishes; always two
 // salts; one proof per salt), so a vacuous pass is not possible: each test also asserts what the broker SAW.
 #include <filesystem>
+#include "../support/FreePort.h"
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
 
@@ -33,16 +34,6 @@ int64_t fakeNow() noexcept { return g_now; }
 int g_ctr = 0;
 const char* kPw = "correct horse battery";
 
-int freePort() {
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in a{};
-    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
-    (void)::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
-    socklen_t len = sizeof a;
-    (void)::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-    ::close(fd);
-    return ntohs(a.sin_port);
-}
 std::string udp(int port) { return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port); }
 
 std::string testPem(const char* name) {
@@ -278,7 +269,7 @@ struct TwoNodeRig {
         gw.addUser("ws1", kPw);
         gw.uniqueSessionIds = true;
         gw.replyFromArrival = true;
-        const int p0 = freePort(), p1 = freePort();
+        const int p0 = rune::client::testing::allocFreeUdpPort(), p1 = rune::client::testing::allocFreeUdpPort();
         (void)gw.addEndpoint(udp(p0), in);
         node1 = udp(p1);
         n1 = gw.addEndpoint(node1, in);
@@ -1005,7 +996,7 @@ TEST(ClientAuthErrorsRegression, ScramCachePaysPbkdf2OncePerVerifierRegression) 
     gw.authMode = pc::AuthMode::Required;
     gw.addUser("ws1", kPw);
     gw.uniqueSessionIds = true;   // each node session gets its own id (the login state is keyed by it)
-    const std::string n1 = udp(freePort()), n2 = udp(freePort());
+    const std::string n1 = udp(rune::client::testing::allocFreeUdpPort()), n2 = udp(rune::client::testing::allocFreeUdpPort());
     (void)gw.addNode(n1, 3736);
     (void)gw.addNode(n2, 3736);
     auto now = [] {
@@ -1132,7 +1123,7 @@ TEST(ClientCryptoRegression, SystemTrustWithoutAHostIsRefusedRegression) {
     }
     {
         rc::ClientConfig c = sys(3804);
-        c.gatewayChannel = udp(freePort());   // names a host (127.0.0.1)
+        c.gatewayChannel = udp(rune::client::testing::allocFreeUdpPort());   // names a host (127.0.0.1)
         EXPECT_NO_THROW(rc::Client{c});
     }
     EXPECT_NO_THROW(rc::Client{authCfg(3806, "", "")}) << "a pinned CA";
@@ -1193,7 +1184,7 @@ TEST(ClientAuthErrorsRegression, AForgedPlaintextRedirectNeverMovesATlsSessionAd
     const auto pr = produceInFlight(r, p, cq, s);
     const int connectsBefore = r.gw.connectsArrived;
     for (const int64_t sid : {int64_t{0}, int64_t{0x7EAD'BEEF}}) {
-        r.gw.sendError(0, static_cast<int16_t>(pc::ErrorCode::Redirect), "127.0.0.1:" + std::to_string(freePort()), sid,
+        r.gw.sendError(0, static_cast<int16_t>(pc::ErrorCode::Redirect), "127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPort()), sid,
                        pr.corrId);   // sid not held by the gateway's TLS keys: sent in clear
         r.passes(100, 1'000'000);
         EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected) << "sid " << sid;
@@ -1205,7 +1196,7 @@ TEST(ClientAuthErrorsRegression, AForgedPlaintextRedirectNeverMovesATlsSessionAd
     // Control (non-vacuity): the same Redirect SEALED under the session's keys is followed.
     std::optional<test_support::PendingOp> s2;
     const auto pr2 = produceInFlight(r, p, cq, s2);
-    r.gw.sendError(0, static_cast<int16_t>(pc::ErrorCode::Redirect), "127.0.0.1:" + std::to_string(freePort()),
+    r.gw.sendError(0, static_cast<int16_t>(pc::ErrorCode::Redirect), "127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPort()),
                    pr2.sessionId, pr2.corrId);
     EXPECT_TRUE(r.drive([&] { return r.client.state() != rc::session::SessionState::Connected; }, 1'000'000))
         << "control: a sealed Redirect moves the session";
@@ -1296,7 +1287,7 @@ namespace {
 struct ThreeNodeRig : TwoNodeRig {
     int n2 = 0;
     explicit ThreeNodeRig(int32_t in) : TwoNodeRig(in) {
-        const int p2 = freePort();
+        const int p2 = rune::client::testing::allocFreeUdpPort();
         n2 = gw.addEndpoint(udp(p2), in);
         gw.nodeOfEndpoint[n2] = n2;
         gw.moreBrokers.push_back({2, "127.0.0.1", p2});
