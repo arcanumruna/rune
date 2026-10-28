@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <sched.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <signal.h>
@@ -18,6 +19,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <chrono>
 #include <cstdlib>
@@ -787,6 +789,144 @@ TEST(ConsolePromptRegression, PasswordIsReadIntoAFixedBufferAndOverlongIsRefused
     EXPECT_EQ(pw.size(), 1024u);
 }
 
+namespace {
+/// C20 review: the scheduler state of a thread ('R' running, 'S' sleeping in a blocking call, 'Z' ...); 0 if unknown.
+char threadState(pid_t pid, pid_t tid) {
+    const std::string path = "/proc/" + std::to_string(pid) + "/task/" + std::to_string(tid) + "/stat";
+    std::ifstream f(path);
+    std::string s;
+    std::getline(f, s);
+    const auto rp = s.rfind(')');
+    return (rp == std::string::npos || rp + 2 >= s.size()) ? '\0' : s[rp + 2];
+}
+/// Writes @p rest to @p fd once thread (pid, tid) blocks (sleeps) - i.e. once it waits for more input - or once
+/// `doneFd` is readable / the process is gone.  Capped: never hangs.  Async-safe enough for a forked child.
+void writeWhenBlocked(pid_t pid, pid_t tid, int fd, const std::string& rest, int doneFd) {
+    for (long i = 0; i < 50'000'000; ++i) {
+        if (doneFd >= 0) {
+            pollfd p{doneFd, POLLIN, 0};
+            if (::poll(&p, 1, 0) > 0) break;   // the reader returned without waiting
+        }
+        const char st = threadState(pid, tid);
+        if (st == 'S') { (void)!::write(fd, rest.data(), rest.size()); break; }
+        if (st == '\0' || st == 'Z') break;
+        ::sched_yield();
+    }
+}
+
+int g_scriptStep = 0;
+/// #672 adversarial: a scripted read(2) - partial lines, EAGAIN and EWOULDBLOCK at every position, EINTR, an
+/// over-long run, then EOF.  An entry {nullptr, e} fails with errno e; {s, 0} returns s; past the end: EOF.
+struct ScriptedRead { const char* data; int err; };
+std::vector<ScriptedRead> g_script;
+std::string g_bigChunk;
+ssize_t scriptedRead(int, void* b, std::size_t n) {
+    if (g_scriptStep >= static_cast<int>(g_script.size())) return 0;
+    const ScriptedRead s = g_script[static_cast<std::size_t>(g_scriptStep++)];
+    if (s.data == nullptr) { errno = s.err; return -1; }
+    const std::size_t len = std::min(n, std::strlen(s.data));
+    std::memcpy(b, s.data, len);
+    return static_cast<ssize_t>(len);
+}
+} // namespace
+
+// C20 adversarial review (#672, input bounds / truncation at every offset): EAGAIN / EWOULDBLOCK / EINTR between the
+// bytes of one line, while an over-long line is being discarded, and before a last line without '\n' never end the
+// input or split a line; each would-block pumps the client.
+TEST(ConsolePollingSourceRegression, WouldBlockAtEveryPositionNeverEndsOrSplitsALineAdversarialRegression) {
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    ASSERT_EQ(::write(fds[1], "x", 1), 1);   // never read (the scripted read stands in): poll always says POLLIN
+    g_bigChunk.assign(rune::cli::console::kMaxInputLineBytes + 10, 'z');
+    g_script = {{"ab", 0}, {nullptr, EAGAIN}, {"c", 0}, {nullptr, EWOULDBLOCK}, {nullptr, EINTR}, {"d\nsecond", 0},
+                {nullptr, EAGAIN}, {nullptr, EAGAIN}, {"\n", 0},
+                {g_bigChunk.c_str(), 0}, {nullptr, EAGAIN}, {"zzz", 0}, {nullptr, EWOULDBLOCK}, {"zz\nafter", 0},
+                {nullptr, EAGAIN}, {" long\ntail-no-newline", 0}, {nullptr, EAGAIN}};
+    g_scriptStep = 0;
+    int idle = 0;
+    std::ostringstream err;
+    rune::cli::console::PollingFdLineSource src(fds[0], &countIdle, &idle);
+    src.err = &err;
+    src.setReadFnForTest(&scriptedRead);
+    std::vector<std::string> lines;
+    std::vector<bool> discarded;
+    std::string line;
+    for (int i = 0; i < 20 && src.next(line); ++i) { lines.push_back(line); discarded.push_back(src.lastLineDiscarded); }
+    ASSERT_EQ(lines.size(), 5u) << "abcd, second, the dropped long line, `after long`, the last line";
+    EXPECT_EQ(lines[0], "abcd");
+    EXPECT_EQ(lines[1], "second");
+    EXPECT_TRUE(discarded[2]) << "the over-long line is the flagged placeholder";
+    EXPECT_EQ(lines[3], "after long") << "the discard ends at the long line's newline, across would-blocks";
+    EXPECT_EQ(lines[4], "tail-no-newline") << "a would-block before EOF does not lose the last line";
+    EXPECT_EQ(src.idlePumps, 8u) << "every EAGAIN / EWOULDBLOCK pumps the client (EINTR only retries)";
+    EXPECT_EQ(idle, 8);
+    EXPECT_EQ(count(err.str(), "input line too long"), 1u) << err.str();
+    ::close(fds[0]); ::close(fds[1]);
+}
+
+// C20 adversarial review (#672 bug class - the terminal password prompt): readPasswordLine on an O_NONBLOCK fd (a
+// terminal another process left non-blocking) takes EAGAIN for the end of the line: a password typed in two bursts
+// is accepted TRUNCATED to its first burst and the login fails with the wrong password.  The rest of the line arrives
+// once the reader waits; the whole password must come back.
+// Broken by the C20 review: DISABLED_ until the #672 fix round (poll on EAGAIN, as PollingFdLineSource does).
+TEST(ConsolePromptRegression, DISABLED_PasswordOnANonBlockingFdIsNotCutAtEagainAdversarialRegression) {
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    ASSERT_EQ(::fcntl(fds[0], F_SETFL, ::fcntl(fds[0], F_GETFL) | O_NONBLOCK), 0);
+    ASSERT_EQ(::write(fds[1], "secr", 4), 4);   // the first burst; the rest only once the reader waits
+    const pid_t self = ::getpid();
+    const pid_t tid = static_cast<pid_t>(::syscall(SYS_gettid));
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        writeWhenBlocked(self, tid, fds[1], "et-pw\n", -1);
+        ::_exit(0);
+    }
+    std::string pw;
+    const bool ok = rune::cli::console::readPasswordLine(fds[0], pw);
+    int status = 0;
+    ::waitpid(child, &status, 0);
+    EXPECT_TRUE(ok);
+    EXPECT_EQ(pw, "secret-pw") << "the password was cut at the first EAGAIN";
+    rune::client::detail::wipeString(pw);
+    ::close(fds[0]); ::close(fds[1]);
+}
+
+// C20 adversarial review (#672 bug class - `-f -` scripts): a script on a non-blocking stdin pipe is read up to the
+// first EAGAIN and the prefix RUNS as if it were the whole script (rc 0): `rune console -f -` and `rune ql -f -`
+// share readScript.  The whole script must run.
+// Broken by the C20 review: DISABLED_ until the #672 fix round (readScript waits on EAGAIN).
+TEST(RuneConsoleOfflineRegression, DISABLED_StdinScriptOnANonBlockingPipeIsReadWholeAdversarialRegression) {
+    int in[2], res[2];
+    ASSERT_EQ(::pipe(in), 0);
+    ASSERT_EQ(::pipe(res), 0);
+    ASSERT_EQ(::write(in[1], "topic first partitions 1;\n", 26), 26);
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        ::dup2(in[0], STDIN_FILENO);
+        ::close(in[1]);
+        (void)::fcntl(STDIN_FILENO, F_SETFL, ::fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
+        std::ostringstream out, err;
+        const int rc = rune::cli::run({"console", "-f", "-", "--dry-run"}, std::cin, out, err);
+        const std::string r = std::to_string(rc) + "\n" + out.str() + err.str();
+        (void)!::write(res[1], r.data(), r.size());
+        ::_exit(0);
+    }
+    ::close(res[1]);
+    writeWhenBlocked(child, child, in[1], "topic second partitions 1;\n", res[0]);
+    ::close(in[1]);   // EOF: the script ends
+    std::string got;
+    char b[4096];
+    for (ssize_t n; (n = ::read(res[0], b, sizeof b)) > 0;) got.append(b, static_cast<std::size_t>(n));
+    int status = 0;
+    ::waitpid(child, &status, 0);
+    ::close(in[0]); ::close(res[0]);
+    EXPECT_EQ(got.rfind("0\n", 0), 0u) << got;
+    EXPECT_NE(got.find("first"), std::string::npos) << got;
+    EXPECT_NE(got.find("second"), std::string::npos) << "the script was cut at the first EAGAIN: " << got;
+}
+
 TEST(ConsoleOfflineRegression, WipeStringZeroesTheWholeCapacityRegression) {
     std::string s(100, 'z');
     s.resize(3);
@@ -955,6 +1095,104 @@ TEST(SecurityBootstrapRegression, KeyAndPasswordLeaveNoCopyInSpareCapacityRegres
     EXPECT_NE(rc, 0) << "the broker cannot be reached: bootstrap fails after reading both files";
     EXPECT_EQ(hits, 0) << "a freed block held the key or the password: " << err.str();
     EXPECT_EQ(err.str().find(kConsoleNeedle + 1), std::string::npos);
+    fs::remove(keyFile); fs::remove(pwFile);
+}
+
+namespace {
+/// Points TMPDIR at a path that is not a directory for the scope (std::filesystem::temp_directory_path then throws);
+/// the old value comes back on exit.
+struct BadTmpdir {
+    std::string old;
+    bool had = false;
+    explicit BadTmpdir(const std::string& notADir) {
+        if (const char* e = std::getenv("TMPDIR"); e != nullptr) { old = e; had = true; }
+        ::setenv("TMPDIR", notADir.c_str(), 1);
+    }
+    ~BadTmpdir() { if (had) ::setenv("TMPDIR", old.c_str(), 1); else ::unsetenv("TMPDIR"); }
+};
+} // namespace
+
+// C20 adversarial review (#680, crash at a durable step): the private scratch dir comes from temp_directory_path(),
+// which throws when TMPDIR is not a directory.  The throw leaves LiveBroker::open and cmdBootstrap with the key and the
+// password still in their strings: they are freed unwiped and the exception reaches std::terminate (main has no catch),
+// so a core dump holds both.  Bootstrap must fail cleanly (1) and leave no freed copy.
+// Broken by the C20 review: DISABLED_ until the #680 fix round (RAII wipe in cmdBootstrap; resolveDataDir inside a try).
+TEST(SecurityBootstrapRegression, DISABLED_BadTmpdirFailsCleanlyAndLeavesNoKeyOrPasswordAdversarialRegression) {
+    const fs::path keyFile = writeScript("c20r_tmpdir_key", kConsoleNeedle);
+    const fs::path pwFile  = writeScript("c20r_tmpdir_pw", std::string(kConsoleNeedle) + "\n");
+    fs::permissions(keyFile, fs::perms::owner_read | fs::perms::owner_write);
+    fs::permissions(pwFile, fs::perms::owner_read | fs::perms::owner_write);
+    std::ostringstream out, err;
+    int rc = -1;
+    long hits = -1;
+    bool threw = false;
+    {
+        BadTmpdir bad(keyFile.string());   // a regular file: not a directory
+        ConsoleFreedScan scan;
+        try {
+            rc = rune::cli::cmdSecurity({"bootstrap", "--admin", "root", "--cluster-key-file", keyFile.string(),
+                                         "--password-file", pwFile.string(), "--broker", "127.0.0.1:1"}, out, err);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        hits = scan.hits();
+    }
+    EXPECT_FALSE(threw) << "an exception left `rune security bootstrap` (std::terminate in the binary)";
+    EXPECT_EQ(rc, 1) << err.str();
+    EXPECT_EQ(hits, 0) << "a freed block held the cluster key or the password";
+    fs::remove(keyFile); fs::remove(pwFile);
+}
+
+// C20 adversarial review (#680 sibling entry points): the same bad TMPDIR on `rune console --broker` and `rune ql
+// --broker` must be a clean failure (1), not an exception out of rune::cli::run.
+// Broken by the C20 review: DISABLED_ until the #680 fix round.
+TEST(RuneConsoleOfflineRegression, DISABLED_BadTmpdirIsACleanFailureForConsoleAndQlAdversarialRegression) {
+    const fs::path notADir = writeScript("c20r_tmpdir_file", "x");
+    BadTmpdir bad(notADir.string());
+    for (const std::vector<std::string>& args :
+         {std::vector<std::string>{"console", "--broker", "127.0.0.1:1"},
+          std::vector<std::string>{"ql", "--broker", "127.0.0.1:1", "-e", "show topics;"}}) {
+        SCOPED_TRACE(args[0]);
+        std::istringstream in("topic t partitions 1;\n");
+        std::ostringstream out, err;
+        int rc = -1;
+        bool threw = false;
+        try { rc = rune::cli::run(args, in, out, err); } catch (const std::exception&) { threw = true; }
+        EXPECT_FALSE(threw) << "an exception left rune::cli::run (std::terminate in the binary)";
+        EXPECT_NE(rc, 0) << err.str();
+    }
+}
+
+// C20 adversarial review (#680, resources): an allocation failure at ANY step of `rune security bootstrap` after the
+// key is read leaves no freed copy of the key or the password.  Sweeps every operator new of the run.
+// Broken by the C20 review: DISABLED_ until the #680 fix round (the `wipe` lambda is not RAII: a throw skips it).
+TEST(SecurityBootstrapRegression, DISABLED_AllocationFailureAtAnyStepLeavesNoKeyOrPasswordAdversarialRegression) {
+    const fs::path keyFile = writeScript("c20r_oom_key", kConsoleNeedle);
+    const fs::path pwFile  = writeScript("c20r_oom_pw", std::string(kConsoleNeedle) + "\n");
+    fs::permissions(keyFile, fs::perms::owner_read | fs::perms::owner_write);
+    fs::permissions(pwFile, fs::perms::owner_read | fs::perms::owner_write);
+    const std::vector<std::string> args{"bootstrap", "--admin", "root", "--cluster-key-file", keyFile.string(),
+                                        "--password-file", pwFile.string(), "--broker", "no-such-host.invalid:1"};
+    int leakySteps = 0;
+    long n = 1;
+    for (; n <= 5000; ++n) {
+        std::ostringstream out, err;
+        long hits = -1;
+        bool fired = false;
+        {
+            ConsoleFreedScan scan;
+            alloc_counter::failNthAllocationThisThread(n);
+            try { (void)rune::cli::cmdSecurity(args, out, err); } catch (const std::bad_alloc&) {}
+            fired = alloc_counter::injectedFailureFiredThisThread();
+            alloc_counter::failNthAllocationThisThread(0);
+            hits = scan.hits();
+        }
+        if (hits != 0) { ++leakySteps; ADD_FAILURE() << "allocation " << n << " failed: " << hits << " freed block(s) held a secret"; }
+        if (!fired) break;   // the run finished without reaching the n-th allocation: every step was swept
+    }
+    EXPECT_LT(n, 5000) << "vacuity guard: the sweep never reached the end of the run";
+    EXPECT_GT(n, 3) << "vacuity guard: the run allocates";
+    EXPECT_EQ(leakySteps, 0);
     fs::remove(keyFile); fs::remove(pwFile);
 }
 

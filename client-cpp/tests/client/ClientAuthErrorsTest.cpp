@@ -27,6 +27,8 @@
 #include <stdexcept>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -516,6 +518,53 @@ TEST(PasswordFileRegression, AFileOwnedByAnotherUserIsRefusedRegression) {
     ::unlink(path.c_str());
 }
 
+// C20 adversarial review (#678, the whole bug class): the owner check covers only regular files.  A FIFO that another
+// user created (e.g. in a shared directory) lets that user feed the password the client logs in with.  ssh and libpq
+// refuse any credential file owned by someone else, whatever its type.
+// Broken by the C20 review: DISABLED_ until the #678 fix round (the uid check for every file type; the mode check
+// stays regular-file only).
+TEST(PasswordFileRegression, DISABLED_AFifoOwnedByAnotherUserIsRefusedAdversarialRegression) {
+    if (::geteuid() != 0) GTEST_SKIP() << "needs root to chown a FIFO to another user";
+    const std::string path = std::filesystem::temp_directory_path().string() + "/client_auth_pw_fifo_" +
+                             std::to_string(::getpid());
+    ::unlink(path.c_str());
+    ASSERT_EQ(::mkfifo(path.c_str(), 0600), 0);
+    ASSERT_EQ(::chown(path.c_str(), 65534, static_cast<gid_t>(-1)), 0);
+    const pid_t writer = ::fork();   // the other user's side: open blocks until the reader opens, then feeds a password
+    ASSERT_GE(writer, 0);
+    if (writer == 0) {
+        const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+        if (fd >= 0) { (void)!::write(fd, "attacker-chosen-pw\n", 19); ::close(fd); }
+        ::_exit(0);
+    }
+    std::string pw;
+    const auto why = rune::client::detail::readPasswordFile(path, pw);
+    if (why.has_value()) {   // refused before reading: unblock the writer (it is waiting for a reader)
+        const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd >= 0) ::close(fd);
+    }
+    int status = 0;
+    ::waitpid(writer, &status, 0);
+    ::unlink(path.c_str());
+    ASSERT_TRUE(why.has_value()) << "a FIFO owned by uid 65534 was accepted; the password read was: " << pw;
+    EXPECT_NE(why->find("owned by another user (uid 65534)"), std::string::npos) << *why;
+    EXPECT_TRUE(pw.empty());
+}
+
+// C20 adversarial review (#678 fix-overreach guard): a pipe the user's own shell made (`--password-file <(...)`,
+// a /dev/fd/N path) is owned by the running user and stays accepted, whatever the fix for the FIFO case.
+TEST(PasswordFileRegression, AProcessSubstitutionPipeOfTheUserIsStillAcceptedAdversarialRegression) {
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    ASSERT_EQ(::write(fds[1], "pipe-pw-0001\n", 13), 13);
+    ::close(fds[1]);
+    std::string pw;
+    const auto why = rune::client::detail::readPasswordFile("/dev/fd/" + std::to_string(fds[0]), pw);
+    ::close(fds[0]);
+    EXPECT_FALSE(why.has_value()) << *why;
+    EXPECT_EQ(pw, "pipe-pw-0001");
+}
+
 TEST(PasswordFileRegression, OversizeFileIsRefusedRegression) {
     {
         const std::string path = writePwFile("big", std::string(1 << 20, 'p'), 0600);
@@ -852,6 +901,91 @@ TEST(ClientSecretAdversarialRegression, ASecurityDdlAndWaitRetriedOnAFullCommand
     EXPECT_EQ(seen[0].name, "world_server_role");
     EXPECT_EQ(seen[0].pattern, "world.server.zone.") << "the re-issued grant lost its pattern";
     EXPECT_EQ(seen[0].patternKind, prefixKind);
+}
+
+namespace {
+/// C20 review: the freed-block scan armed on the CLIENT's steps only (the in-thread fake gateway decodes frames into
+/// its own strings, which are not the client's copies); the hits of every armed step add up.
+struct ClientOnlyScan {
+    const char* needle;
+    long hits = 0;
+    explicit ClientOnlyScan(const char* n) : needle(n) {}
+    template <class F> void client(F&& f) {
+        alloc_counter::scanFreedForThisThread(needle + 1, std::strlen(needle) - 1);
+        f();
+        hits += alloc_counter::freedHitsThisThread();
+        alloc_counter::scanFreedForThisThread(nullptr, 0);
+    }
+    /// Steps the client (scanned) and the gateway (not) until pred(), at most `cap` passes.
+    template <class P> bool drive(Rig& r, P&& pred, int cap = 200'000, int64_t stepNs = 1'000'000) {
+        for (int i = 0; i < cap; ++i) {
+            g_now += stepNs;
+            client([&] { r.client.doWork(); });
+            r.gw.pump();
+            if (pred()) return true;
+        }
+        return false;
+    }
+};
+} // namespace
+
+// C20 adversarial review (#682 / #680, data integrity of the secret over a whole lifecycle): construct, a SCRAM login
+// (the salted-password derivation, the proof, the server signature check), a ping on the session, then close and
+// destroy.  No block the client frees on any of those steps holds the password.
+TEST(ClientSecretAdversarialRegression, AWholeLoginLifecycleLeavesNoFreedCopyOfThePasswordAdversarialRegression) {
+    const rc::ClientConfig cfg = authCfg(4160, "ws1", kNeedle);
+    ClientOnlyScan scan(kNeedle);
+    std::optional<Rig> r;
+    scan.client([&] { r.emplace(cfg); });   // the gateway's constructor runs inside too: it never sees the password
+    r->gw.addUser("ws1", kNeedle);
+    test_support::TestCq cq(r->client);
+    ASSERT_TRUE(scan.drive(*r, [&] { return r->gw.ready(); }));
+    std::optional<test_support::PendingOp> f;
+    scan.client([&] { f.emplace(cq.issue([&](rc::Completions& q, rc::Token t) { return r->client.connect(q, t); })); });
+    ASSERT_TRUE(scan.drive(*r, [&] { return f->ready(); }));
+    ASSERT_TRUE(f->ok()) << f->describe();
+    EXPECT_EQ(r->gw.authOk, 1) << "vacuity guard: the SCRAM login ran";
+    scan.client([&] { r->client.closeImmediately(); });
+    scan.client([&] { r.reset(); });
+    EXPECT_EQ(scan.hits, 0) << "a block the client freed held the login password";
+}
+
+// C20 adversarial review (#680, the client half of `rune security bootstrap`): the one-time password and the cluster
+// key travel API -> command ring -> agent -> SecurityBootstrap frame (MAC over the key).  No block the client frees
+// from the call to its destruction holds either.
+TEST(ClientSecretAdversarialRegression, ASecurityBootstrapLeavesNoFreedCopyOfThePasswordOrTheKeyAdversarialRegression) {
+    static constexpr const char kKeyNeedle[] = "freed-scan-needle-c20-key-0003-padding-to-sixty-four-bytes-xxxx";
+    std::optional<Rig> r(std::in_place, authCfg(4162, "", ""));
+    r->gw.users.clear();
+    r->gw.bootstrapped = false;
+    const std::string keyText(kKeyNeedle);
+    r->gw.clusterKey.assign(keyText.begin(), keyText.end());
+    r->connectOk();
+    int seen = 0;
+    r->gw.templateHandlers[pc::SecurityBootstrap::TEMPLATE_ID] = [&](int, const uint8_t* fr, std::size_t len) {
+        const auto m = pc::SecurityBootstrap::decode(fr, len);
+        ASSERT_TRUE(m.has_value());
+        ++seen;
+        pc::DdlResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId; resp.errorCode = 0; r->gw.sendDdlResponse(0, resp);
+    };
+    const std::vector<uint8_t> key(keyText.begin(), keyText.end());
+    test_support::TestCq cq(r->client);
+    for (const char* needle : {kNeedle, kKeyNeedle}) {   // one pass per secret: the scan has one needle
+        SCOPED_TRACE(needle);
+        ClientOnlyScan scan(needle);
+        std::optional<test_support::PendingOp> f;
+        scan.client([&] {
+            f.emplace(cq.issue([&](rc::Completions& q, rc::Token t) { return r->client.bootstrapSecurity("admin", kNeedle, key, q, t); }));
+        });
+        ASSERT_TRUE(f->accepted());
+        ASSERT_TRUE(scan.drive(*r, [&] { return f->ready(); }));
+        EXPECT_TRUE(f->ok()) << f->describe();
+        EXPECT_EQ(scan.hits, 0) << "a block the client freed held the secret";
+    }
+    EXPECT_EQ(seen, 2) << "vacuity guard: both bootstraps reached the gateway";
+    ClientOnlyScan last(kNeedle);
+    last.client([&] { r->client.closeImmediately(); });
+    EXPECT_EQ(last.hits, 0) << "freed at close";
 }
 
 TEST(ClientSecretAdversarialRegression, TheAgentPasswordInstallAllocatesNothingAndRefusesOverCapAdversarialRegression) {
