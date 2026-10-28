@@ -409,33 +409,36 @@ bool readScript(const std::string& path, std::istream& stdinStream, std::string&
     struct ChunkWipe { char* b; ~ChunkWipe() { rune::client::detail::secureZero(b, sizeof chunk); } } chunkWipe{chunk};
     rune::client::detail::wipeString(text);
     if (path == "-") {
-        if (&stdinStream == &std::cin) {   // #672: the process stdin may be O_NONBLOCK: EAGAIN is not end of input
-            bool ok = true;
-            for (;;) {
-                const ssize_t n = ::read(STDIN_FILENO, chunk, sizeof chunk);
-                if (n == 0) break;
-                if (n < 0) {
-                    if (errno == EINTR) continue;
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        pollfd p{STDIN_FILENO, POLLIN, 0};
-                        (void)::poll(&p, 1, -1);
-                        continue;
-                    }
-                    ok = false;
-                    break;
-                }
-                rune::client::detail::appendWiped(text, std::string_view(chunk, static_cast<std::size_t>(n)));
-            }
-            if (!ok) {
-                rune::client::detail::wipeString(text);
-                err << "rune: cannot read the script from stdin\n";
-                return false;
-            }
-            return true;
-        }
+        // Read through the stream's buffer, so a redirected std::cin (or any other stream) is honoured.  #672: the
+        // process stdin may be O_NONBLOCK.  std::cin is stdio-synced, so a read that hit EAGAIN shows as a short read
+        // with ferror(stdin) set and errno EAGAIN: wait for input and go on - it is not end of input.  Any other stdin
+        // error fails the command rather than running a prefix.
+        const bool processStdin = &stdinStream == &std::cin;
         std::streambuf* sb = stdinStream.rdbuf();
-        for (std::streamsize n; sb != nullptr && (n = sb->sgetn(chunk, sizeof chunk)) > 0;)
-            rune::client::detail::appendWiped(text, std::string_view(chunk, static_cast<std::size_t>(n)));
+        while (sb != nullptr) {
+            // A stale error flag is cleared first, so ferror() below speaks for this read only.  EOF is never cleared:
+            // a tty would need a second end-of-input.
+            if (processStdin && std::ferror(stdin) && !std::feof(stdin)) std::clearerr(stdin);
+            errno = 0;
+            const std::streamsize n = sb->sgetn(chunk, sizeof chunk);
+            const int readErrno = errno;
+            if (n > 0) rune::client::detail::appendWiped(text, std::string_view(chunk, static_cast<std::size_t>(n)));
+            if (n == static_cast<std::streamsize>(sizeof chunk)) continue;
+            if (!processStdin || !std::ferror(stdin)) {
+                if (n > 0) continue;   // a short read of a plain stream: the next one reports the end
+                break;
+            }
+            if (readErrno == EINTR) continue;
+            if (readErrno == EAGAIN || readErrno == EWOULDBLOCK) {
+                pollfd p{STDIN_FILENO, POLLIN, 0};
+                (void)::poll(&p, 1, -1);
+                continue;
+            }
+            std::clearerr(stdin);
+            rune::client::detail::wipeString(text);
+            err << "rune: cannot read the script from stdin\n";
+            return false;
+        }
         return true;
     }
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
