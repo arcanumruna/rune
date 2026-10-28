@@ -60,6 +60,9 @@ struct FieldValue {
     double                f       = 0;
     bool                  b       = false;
     std::string_view      bytes;   // FixedStr only; valid only while row outlives this value
+    // false: the row does not fit the layout (shorter than layout.rowLen - a broker on another layout / version)
+    // or the slot is out of range; nothing was read and present is false.
+    bool                  valid   = true;
 };
 
 // Builds the fixed-width row layout from the output fields' PrimTypes, IN
@@ -122,10 +125,15 @@ inline uint64_t readU(std::span<const uint8_t> row, uint32_t off, uint32_t n) no
 // Reads the field at `slot` out of `row` (a GetViewRow response's rowBytes,
 // span length >= layout.rowLen). Returns FieldValue{present=false} for a
 // NULL slot (merged-away / never-set field), distinguishable from a real
-// zero value.
+// zero value.  A row shorter than layout.rowLen or a slot outside the layout
+// reads nothing: FieldValue{valid=false, present=false}.
 inline FieldValue readSlot(std::span<const uint8_t> row, const RowLayout& layout, uint16_t slot) noexcept {
     using rune::codec::PrimType;
     FieldValue fv;
+    if (slot >= layout.slotType.size() || row.size() < layout.rowLen) {
+        fv.valid = false;
+        return fv;
+    }
     fv.type = layout.slotType[slot];
     if (isNullSlot(row, slot)) {
         fv.present = false;

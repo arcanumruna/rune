@@ -1012,3 +1012,64 @@ TEST(CatalogReaderRegression, EveryAccessorRefusesAForeignThreadInThreadModeRegr
     auto again = reader.refresh(std::chrono::seconds(5));
     EXPECT_TRUE(again.has_value()) << (again.has_value() ? "" : again.error().detail);
 }
+
+// ---- Adversarial review of batch C9 (#600): the sink-partition rule on every view-definition entry point. ----
+namespace {
+// Golden event `at` (a CreateView or AlterView) with its sink set to `sinkPartitions`, fingerprinted as the object
+// it would produce, so only the definition rule can refuse it.
+std::vector<rcat::CatalogEvent> withSink(int at, int32_t sinkPartitions) {
+    auto log = rcat::testing::goldenScriptV1();
+    auto& ev = log.at(static_cast<std::size_t>(at));
+    rcat::ViewDef* def = nullptr;
+    if (auto* c = std::get_if<rcat::CreateViewOps>(&ev.ops)) def = &c->view;
+    if (auto* a = std::get_if<rcat::AlterViewOps>(&ev.ops)) def = &a->view;
+    if (def == nullptr) throw std::logic_error("withSink: not a view event");
+    def->sinkPartitions = sinkPartitions;
+    ev.fingerprint = rcat::fingerprintOf(rcat::ViewObject{.objectId = ev.objectId, .name = ev.objectName,
+                                                          .version = ev.newVersion, .def = *def});
+    return log;
+}
+}  // namespace
+
+// AlterView (golden 22, sources events(4), presence(2)) with the sink sized to the SECOND source: still refused —
+// the sink mirrors the FIRST source.  AlterView re-checks the rule (it creates a fresh sink); a reader that only
+// checked CreateView would replay it.
+TEST(CatalogReaderRegression, AnAlterViewSinkSizedToTheSecondSourceIsAReplayErrorAtItsOffsetAdversarialRegression) {
+    Rig r(invokerCfg(4882, 4883)); r.connect();
+    auto log = withSink(22, 2);
+    ASSERT_EQ(log.at(22).kind, rcat::EventKind::AlterView);
+    CatalogFeed feed(r.gw, log);
+    rc::CatalogReader reader(r.client);
+    auto done = refreshOnce(r, reader, 5'000'000'000);
+    ASSERT_TRUE(done.has_value());
+    ASSERT_FALSE(done->has_value());
+    EXPECT_EQ(done->error().kind, rc::CatalogReadError::Kind::Replay);
+    EXPECT_EQ(done->error().offset, 22);
+    EXPECT_NE(done->error().detail.find("sink partitions 2"), std::string::npos) << done->error().detail;
+    EXPECT_NE(done->error().detail.find("'events' has 4"), std::string::npos) << done->error().detail;
+    EXPECT_EQ(reader.events().size(), 22u) << "the verified prefix only";
+}
+
+// Bounds: a sink larger than its source (16 vs 8) and a sink of 0 are both refused at the event's offset; the
+// reader never exposes a state past the bad event.
+TEST(CatalogReaderRegression, AViewSinkLargerThanItsSourceOrZeroIsAReplayErrorAtItsOffsetAdversarialRegression) {
+    struct Case { int at; int32_t sink; const char* needle; };
+    const Case cases[] = {{9, 16, "sink partitions 16"}, {9, 0, "sinkPartitions 0 < 1"}, {11, 8, "sink partitions 8"},
+                          {10, 4, "sink partitions 4"}};
+    int port = 4884;
+    for (const Case& c : cases) {
+        SCOPED_TRACE("event " + std::to_string(c.at) + " sink " + std::to_string(c.sink));
+        Rig r(invokerCfg(port, port + 1)); port += 2;
+        r.connect();
+        auto log = withSink(c.at, c.sink);
+        CatalogFeed feed(r.gw, log);
+        rc::CatalogReader reader(r.client);
+        auto done = refreshOnce(r, reader, 5'000'000'000);
+        ASSERT_TRUE(done.has_value());
+        ASSERT_FALSE(done->has_value());
+        EXPECT_EQ(done->error().kind, rc::CatalogReadError::Kind::Replay);
+        EXPECT_EQ(done->error().offset, c.at);
+        EXPECT_NE(done->error().detail.find(c.needle), std::string::npos) << done->error().detail;
+        EXPECT_EQ(reader.events().size(), static_cast<std::size_t>(c.at));
+    }
+}

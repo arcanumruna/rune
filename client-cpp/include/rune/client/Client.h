@@ -1305,7 +1305,8 @@ private:
     // ---- Catalog history (Task 5): a pending DDL's state — one explicit state
     // per phase, each holding exactly its variables (hard rule 3, F29).
     // `redirects` counts the Redirect hops followed (> kMaxDdlRedirects fails);
-    // budgetEndNs = min(DDL deadline, first NotLeader / session loss + ddlRetryBudget).
+    // budgetEndNs = min(op deadline, first NotLeader / session loss + ddlRetryBudget, or viewReadRetryBudget for a
+    // GetViewRow).
     /// The session an in-flight DDL was offered on (agent session index) and
     /// its connect episode then — a different episode (left Connected, a
     /// reconnect, a new id) = that session was lost under the DDL.
@@ -1330,7 +1331,7 @@ private:
     struct DdlHeldForNode    { int redirects; };
     // Shared by every routed control op (DDLs and GetViewRow), not DDL-only.
     using DdlRetry = std::variant<DdlUnsentOnSeed, DdlSent, DdlNotLeaderSeen, DdlAwaitingResend, DdlHeldForNode>;
-    /// Everything only a DDL has (review M1: one variant on PendingCtl).
+    /// Everything only a routed control op (a DDL or a GetViewRow) has (review M1: one variant on PendingCtl).
     struct RoutedCtlPending {
         std::vector<uint8_t> frame;          // the encoded request, re-sent verbatim (stable requestId)
         std::string          endpoint;       // the node it goes to ("" = the seed); a Redirect moves it
@@ -1999,7 +2000,7 @@ private:
     const uint64_t          clientInstanceId_ = drawClientInstanceId_();
     uint32_t                requestCounter_ = 0;       // duty thread only: the requestId's lo (32-bit, never 0)
     int                     routedCtlPending_ = 0;           // pendingCtl_ entries that are routed control ops: DDLs and GetViewRow
-    int                     routedCtlAwaitingResend_ = 0;    // pending DDLs in a ddlWaitsForResend() state
+    int                     routedCtlAwaitingResend_ = 0;    // pending routed ops (DDLs and view reads) in a ddlWaitsForResend() state
     std::vector<DdlRetryNote> ddlRetryNotes_;          // duty thread; filled only under cfg_.traceDdlRetries
     std::size_t             ddlRetryNotesDropped_ = 0;
     void noteDdlRetry_(DdlRetryNote note);

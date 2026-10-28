@@ -51,7 +51,20 @@ namespace rune::client {
 
 namespace {
 
+// now + ms, in ns, saturated at INT64_MAX: a huge timeout or retry budget (e.g. milliseconds::max(), "let the
+// deadline end it") never wraps into the past.  ms <= 0 is now (validatedConfig refuses negatives).
+int64_t nsAfter(int64_t nowNs, int64_t ms) noexcept {
+    constexpr int64_t kNsPerMs = 1'000'000;
+    if (ms <= 0) return nowNs;
+    if (ms >= (INT64_MAX - std::max<int64_t>(nowNs, 0)) / kNsPerMs) return INT64_MAX;
+    return nowNs + ms * kNsPerMs;
+}
 ClientConfig validatedConfig(ClientConfig c) {
+    // A negative timeout or retry budget has no meaning (0 = none / at once); refused, never silently clamped.
+    if (c.connectTimeoutMs < 0 || c.pingTimeoutMs < 0 || c.ddlTimeoutMs < 0)
+        throw std::invalid_argument("ClientConfig: connectTimeoutMs / pingTimeoutMs / ddlTimeoutMs must be >= 0");
+    if (c.ddlRetryBudget.count() < 0 || c.viewReadRetryBudget.count() < 0)
+        throw std::invalid_argument("ClientConfig: ddlRetryBudget / viewReadRetryBudget must be >= 0");
     if (c.traceDdlRetries && c.runnerMode != RunnerMode::Invoker)
         throw std::invalid_argument("ClientConfig::traceDdlRetries requires RunnerMode::Invoker "
                                     "(the notes are duty-thread state, read by the Invoker owner)");
@@ -160,8 +173,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     // the session transitions to Disconnected and sweep can promptly fail pending
     // produce futures and subscribes.  Map ms → ns; clamp to a 1ms minimum.
     if (c.connectTimeoutMs > 0) {
-        acfg.session.connectTimeoutNs =
-            static_cast<int64_t>(c.connectTimeoutMs) * 1'000'000LL;
+        acfg.session.connectTimeoutNs = nsAfter(0, c.connectTimeoutMs);
     }
 
     // Task 3: explicit Aeron knobs (spec §4.1/§4.3).  Env overrides win.
@@ -1740,7 +1752,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
             completeCtl_(p, OpStatus::Ok, machine.sessionId());
             return;
         }
-        p.deadlineNs = nowNs + cfg_.connectTimeoutMs * 1'000'000LL;
+        p.deadlineNs = nsAfter(nowNs, cfg_.connectTimeoutMs);
         pendingConnect_    = std::move(p);
         hasPendingConnect_ = true;
         machine.connect(nowNs);
@@ -1780,7 +1792,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
     p.corrId     = nextCorrId_++;
     // Catalog history (fix round 0, A): a DDL has its own deadline — the whole
     // op, its Redirect hops and its NotLeader budget (budgetEnd <= deadline).
-    p.deadlineNs = nowNs + (isDdlOp(h.op) ? cfg_.ddlTimeoutMs : cfg_.pingTimeoutMs) * 1'000'000LL;
+    p.deadlineNs = nsAfter(nowNs, isDdlOp(h.op) ? cfg_.ddlTimeoutMs : cfg_.pingTimeoutMs);
     if (h.op == OpKind::DefineTopic) {
         if (auto d = rpc::DefineTopic::decode(frame.data(), frame.size())) p.topicName = std::string(d->topicName);
     }
@@ -2050,9 +2062,7 @@ void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t now
     int64_t backoffNs   = 0;
     if (const auto* st = std::get_if<DdlSent>(&d.retry)) {
         redirects   = st->redirects;
-        budgetEndNs = std::min(p.deadlineNs, nowNs + static_cast<int64_t>(
-                                                         std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                             (isDdlOp(p.op) ? cfg_.ddlRetryBudget : cfg_.viewReadRetryBudget)).count()));
+        budgetEndNs = std::min(p.deadlineNs, nsAfter(nowNs, (isDdlOp(p.op) ? cfg_.ddlRetryBudget : cfg_.viewReadRetryBudget).count()));
         backoffNs   = kDdlInitialBackoffNs;
     } else if (const auto* n = std::get_if<DdlNotLeaderSeen>(&d.retry)) {
         redirects   = n->redirects;
@@ -2065,9 +2075,9 @@ void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t now
         std::string why(detail);
         // Issue #607: the same retry serves AuthUnavailable (48), reported with its own code and text.
         const bool authUnavailable = failCode == static_cast<uint16_t>(rune::protocol::client::ErrorCode::AuthUnavailable);
-        why += why.empty() ? (authUnavailable ? "AuthUnavailable: DDL retry budget exhausted"
-                                              : "not leader: DDL retry budget exhausted")
-                           : " (DDL retry budget exhausted)";
+        why += why.empty() ? (authUnavailable ? "AuthUnavailable: retry budget exhausted"
+                                              : "not leader: retry budget exhausted")
+                           : " (retry budget exhausted)";
         failDdl_(i, failCode, why, ddlNoValue(p.op));
         return;
     }
@@ -2112,9 +2122,7 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
         if (const auto* st = std::get_if<DdlSent>(&d->retry)) {
             on = &st->on;
             redirects = st->redirects;
-            budgetEndNs = std::min(p.deadlineNs, nowNs + static_cast<int64_t>(
-                                                             std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                                 (isDdlOp(p.op) ? cfg_.ddlRetryBudget : cfg_.viewReadRetryBudget)).count()));
+            budgetEndNs = std::min(p.deadlineNs, nsAfter(nowNs, (isDdlOp(p.op) ? cfg_.ddlRetryBudget : cfg_.viewReadRetryBudget).count()));
         } else if (const auto* n = std::get_if<DdlNotLeaderSeen>(&d->retry)) {
             on = &n->on;
             redirects = n->redirects;
@@ -2186,7 +2194,7 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
                         // F1: the DDL's session was lost and never came back
                         // inside the budget — a session loss, not a NotLeader.
                         constexpr std::string_view kWhy =
-                            "session lost: the DDL's session was not re-established within the DDL retry budget "
+                            "session lost: the request's session was not re-established within its retry budget "
                             "(it may have been applied; a retry with the same requestId is exact)";
                         PendingCtl dead = takeCtl_(i);
                         completeCtl_(dead, OpStatus::SessionLost, ddlNoValue(dead.op), 0, 0,
@@ -2195,10 +2203,10 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
                     } else if (due.cause == DdlResendCause::AuthUnavailable) {
                         // Issue #607: the retries were answered AuthUnavailable - that is the code the caller sees.
                         failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::AuthUnavailable),
-                                 "AuthUnavailable: DDL retry budget exhausted", ddlNoValue(p.op));
+                                 "AuthUnavailable: retry budget exhausted", ddlNoValue(p.op));
                     } else {
                         failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader),
-                                 "not leader: DDL retry budget exhausted (the node could not be reached)",
+                                 "not leader: retry budget exhausted (the node could not be reached)",
                                  ddlNoValue(p.op));
                     }
                     ++work;
@@ -6622,7 +6630,7 @@ bool Client::startSeedFailoverAttempt_(SeedFailingOver& f, int64_t nowNs, bool c
                             static_cast<uint64_t>(f.gapNs / 4 + 1);
     f.notBeforeNs = nowNs + f.gapNs + static_cast<int64_t>(jitter);
     f.gapNs       = std::min(f.gapNs * 2, kSeedFailoverMaxGapNs);
-    const int64_t connectNs = cfg_.connectTimeoutMs > 0 ? cfg_.connectTimeoutMs * 1'000'000LL : kSeedFailoverAttemptMaxNs;
+    const int64_t connectNs = cfg_.connectTimeoutMs > 0 ? nsAfter(0, cfg_.connectTimeoutMs) : kSeedFailoverAttemptMaxNs;
     f.attemptDeadlineNs = nowNs + std::min(connectNs, kSeedFailoverAttemptMaxNs);
     if (target.empty() || !agent_.failoverSeedTo(target, nowNs, connectNow)) {
         f.attemptDeadlineNs = f.notBeforeNs;  // did not resolve: the next candidate after the gap

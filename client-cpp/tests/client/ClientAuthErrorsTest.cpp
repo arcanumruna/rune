@@ -1092,6 +1092,29 @@ TEST(ClientAuthErrorsRegression, ScramIterationCountsAreValidatedAtConstructionR
     EXPECT_NO_THROW(rc::Client{with(3888, 4096, 1'000'000)}) << "both wire bounds are inclusive";
 }
 
+// C9 review: a negative timeout or retry budget is refused at construction; a huge one (milliseconds::max()) is
+// accepted (saturated, see ClientViewRowRegression.*MaxRetryBudget*).  RED: drop the >= 0 checks in validatedConfig.
+TEST(ClientConfigRegression, NegativeTimeoutsAndRetryBudgetsAreRefusedAtConstructionRegression) {
+    auto with = [](int32_t in, auto&& set) {
+        rc::ClientConfig c = authCfg(in, "", "");
+        set(c);
+        return c;
+    };
+    using std::chrono::milliseconds;
+    EXPECT_THROW(rc::Client{with(3890, [](auto& c) { c.connectTimeoutMs = -1; })}, std::invalid_argument);
+    EXPECT_THROW(rc::Client{with(3890, [](auto& c) { c.pingTimeoutMs = -1; })}, std::invalid_argument);
+    EXPECT_THROW(rc::Client{with(3890, [](auto& c) { c.ddlTimeoutMs = -1; })}, std::invalid_argument);
+    EXPECT_THROW(rc::Client{with(3890, [](auto& c) { c.ddlRetryBudget = milliseconds{-1}; })}, std::invalid_argument);
+    EXPECT_THROW(rc::Client{with(3890, [](auto& c) { c.viewReadRetryBudget = milliseconds{-1}; })},
+                 std::invalid_argument);
+    EXPECT_NO_THROW(rc::Client{with(3892, [](auto& c) {
+        c.ddlRetryBudget = milliseconds::max();
+        c.viewReadRetryBudget = milliseconds::max();
+        c.ddlTimeoutMs = INT64_MAX;
+        c.pingTimeoutMs = INT64_MAX;
+    })}) << "huge values are saturated, never refused";
+}
+
 // Issue #115: offerCrypto with the system store, no tlsExpectHost and a gateway channel that names no host would check
 // no name at all - any public certificate for any name would pass.  Refused at construction; a host in the channel, an
 // explicit tlsExpectHost or a pinned CA each make it valid.  RED: drop the tlsHostOfChannel check in validatedConfig.
