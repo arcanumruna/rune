@@ -6573,7 +6573,7 @@ void Client::tickMetadataRefresh() noexcept {
     if (nextMetadataRefreshAtNs_ == kMetadataRefreshNotArmed) {
         return; // not armed
     }
-    if (std::chrono::steady_clock::now().time_since_epoch().count() < nextMetadataRefreshAtNs_) return; // MUTATIONCLK
+    if (now() < nextMetadataRefreshAtNs_) return;   // duty clock (injected in tests)
     // DR client bug 1: through any Connected session; none -> stays armed (the
     // next sweep retries; a session that connects asks on its own).
     if (!sendMetadataRequestAnywhere_()) return;
