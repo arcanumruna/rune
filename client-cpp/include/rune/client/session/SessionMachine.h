@@ -315,16 +315,25 @@ struct CryptoState {
     // per receiver per session).  Populated alongside `send` in finishHandshake_.
     rune::crypto::AeadKey c2bKey{};
     uint8_t               c2bPrefix[rune::crypto::kNoncePrefix] = {};
-    // #535 test seam (cold path: the FIRST derivation per receiver slot): the receiver-key derivation selectSendSlot
-    // uses.  Production never changes it; a test installs a failing one to prove an underivable key seals nothing.
-    bool (*deriveReceiverKeyFn)(const rune::crypto::AeadKey&, uint8_t, rune::crypto::AeadKey&) noexcept =
-        &rune::crypto::deriveReceiverKey;
     struct ReceiverSend {
         std::optional<rune::crypto::AeadCipher> cipher;
         uint64_t sendSeq = 0;
+        bool     deriveFailed = false;   // #673: this receiver's key failed to derive: held until the session reconnects
     };
     // One slot per worker receiver (id k >= 1, indexed k-1); same bound as workerRecv (the broker's max workers).
     std::array<ReceiverSend, kMaxShardWorkers> workerSend{};
+    uint32_t receiverDeriveFailures = 0;   // #673: receiver keys that failed to derive this episode (each counted once)
+
+    /// #535 / #675: derive receiver `receiverId`'s c2b key (selectSendSlot's cold path).  The derivation function is
+    /// a test seam (CryptoStateTestAccess, tests only); production always uses rune::crypto::deriveReceiverKey.
+    [[nodiscard]] bool deriveReceiverKeyFor(uint8_t receiverId, rune::crypto::AeadKey& out) const noexcept {
+        return deriveFn_(c2bKey, receiverId, out);
+    }
+
+private:
+    friend struct CryptoStateTestAccess;
+    bool (*deriveFn_)(const rune::crypto::AeadKey&, uint8_t, rune::crypto::AeadKey&) noexcept =
+        &rune::crypto::deriveReceiverKey;
 };
 
 // ---------------------------------------------------------------------------

@@ -40,6 +40,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 namespace rune::client::codec {
@@ -136,8 +137,17 @@ struct SendSlot {
     if (idx >= session::CryptoState::kMaxShardWorkers) return {};   // above the broker's max workers: refuse
     auto& slot = crypto.workerSend[idx];
     if (!slot.cipher.has_value()) {
+        if (slot.deriveFailed) return {};   // #673: already failed this episode: not retried per offer
         rune::crypto::AeadKey derived{};
-        if (!crypto.deriveReceiverKeyFn(crypto.c2bKey, receiverId, derived)) return {};   // fail closed
+        if (!crypto.deriveReceiverKeyFor(receiverId, derived)) {   // fail closed
+            slot.deriveFailed = true;
+            ++crypto.receiverDeriveFailures;
+            std::fprintf(stderr,
+                         "rune client: receiver key %u failed to derive; frames for it are held until the session "
+                         "reconnects\n",
+                         static_cast<unsigned>(receiverId));
+            return {};
+        }
         slot.cipher.emplace(crypto.cipher, derived, crypto.c2bPrefix);
     }
     return SendSlot{&*slot.cipher, &slot.sendSeq, receiverId};
