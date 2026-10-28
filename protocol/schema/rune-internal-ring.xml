@@ -121,6 +121,11 @@
            NS_SLOT_RELEASE: topicId = nsSlot, nextOffset = nsId.  Cold; never ownership-gated. -->
       <validValue name="NS_SLOT_ASSIGN">27</validValue>
       <validValue name="NS_SLOT_RELEASE">28</validValue>
+      <!-- Namespaces Phase 2 Task 14 (D26, D28): control -> EVERY worker (cold: on a CHANGE only), no tail.  NS_THROTTLE:
+           topicId = nsSlot, nextOffset = nsId, partition = ThrottleKind, hwBound = untilNs (0 = clear).  NS_VIEW_MEM_OVER:
+           topicId = nsSlot, nextOffset = nsId, partition = 0 / 1.  Never ownership-gated. -->
+      <validValue name="NS_THROTTLE">29</validValue>
+      <validValue name="NS_VIEW_MEM_OVER">30</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica

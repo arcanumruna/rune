@@ -163,7 +163,7 @@ TEST(NamespaceThrottleRegression, OtherNamespaceNotThrottledRegression) {
 
 TEST(NamespaceThrottleRegression, ClientBacksOffAndSucceedsRegression) {
     constexpr uint64_t kRate = 40'000;   // bytes/s
-    constexpr int kRecords = 40;         // 40 x 2 KiB = 80 KiB: >= ~2 s at the rate
+    constexpr int kWave = 40;            // 40 x 2 KiB = 80 KiB per wave: twice the rate's second
     AuthBroker b("thr_backoff");
     b.bootstrapAdmin(kAdminPw);
     auto admin = connected(b, "admin");
@@ -172,36 +172,60 @@ TEST(NamespaceThrottleRegression, ClientBacksOffAndSucceedsRegression) {
     b.createUser("d/u", kUserPw, userGrants());
     const rc::TopicHandle t = defineTopic(b, "d/u");
     auto u = connected(b, "d/u", {rc::TopicSpec{"t", t.topicId, 1}});
+    const uint16_t slot = b.node().nsSlotOfForTest(*ns);
+    ASSERT_NE(slot, kNoNsSlot);
     rc::ProducerConfig pcfg;
     pcfg.acks     = rc::Acks::All;
     pcfg.lingerUs = 0;
     auto p = u->producer(pcfg);
     rc::Completions cq(*u);
     const std::vector<uint8_t> v(2048, 7);
-    const auto t0 = std::chrono::steady_clock::now();
-    int sent = 0, ok = 0, failed = 0;
-    const auto deadline = t0 + 90s;
-    while ((sent < kRecords || ok + failed < kRecords) && std::chrono::steady_clock::now() < deadline) {
-        if (sent < kRecords && p.trySend(t, rc::Key(static_cast<uint64_t>(sent + 1)), std::span<const uint8_t>(v.data(), v.size()), cq,
-                                          static_cast<uint64_t>(sent + 1)) == rc::SendResult::Ok)
-            ++sent;
-        p.flush();
-        (void)cq.poll([&](const rc::Completion& d, std::span<const uint8_t>) { (d.status == rc::OpStatus::Ok ? ok : failed)++; });
-        std::this_thread::sleep_for(1ms);
-    }
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
-    EXPECT_EQ(sent, kRecords);
-    EXPECT_EQ(ok, kRecords) << "every record was acked (failed " << failed << ")";
-    EXPECT_EQ(failed, 0);
-    EXPECT_GE(elapsed, 1s) << "80 KiB at 40 KiB/s cannot finish sooner: the client waited out the retry-after";
-    const uint16_t slot = b.node().nsSlotOfForTest(*ns);
-    ASSERT_NE(slot, kNoNsSlot);
-    uint64_t refusals = 0;
-    for (int w = 0; w < 8; ++w) {
-        try { refusals += b.node().onWorkerThreadForTest(w, [](Worker& wk) { return wk.throttledRefusalsForTest(); }); }
-        catch (const std::invalid_argument&) { break; }   // no such worker
-    }
-    EXPECT_GT(refusals, 0u) << "the broker refused at least once (the client really backed off)";
+    uint64_t key = 0;
+    struct Wave { int sent = 0, ok = 0, failed = 0; std::chrono::steady_clock::duration took{}; };
+    auto wave = [&]() {
+        Wave w;
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto deadline = t0 + 90s;
+        while ((w.sent < kWave || w.ok + w.failed < kWave) && std::chrono::steady_clock::now() < deadline) {
+            if (w.sent < kWave && p.trySend(t, rc::Key(++key), std::span<const uint8_t>(v.data(), v.size()), cq, key) == rc::SendResult::Ok)
+                ++w.sent;
+            else if (w.sent < kWave) --key;
+            p.flush();
+            (void)cq.poll([&](const rc::Completion& d, std::span<const uint8_t>) { (d.status == rc::OpStatus::Ok ? w.ok : w.failed)++; });
+            std::this_thread::sleep_for(1ms);
+        }
+        w.took = std::chrono::steady_clock::now() - t0;
+        return w;
+    };
+    auto refusals = [&] {
+        uint64_t n = 0;
+        for (int w = 0; w < 8; ++w) {
+            try { n += b.node().onWorkerThreadForTest(w, [](Worker& wk) { return wk.throttledRefusalsForTest(); }); }
+            catch (const std::invalid_argument&) { break; }   // no such worker
+        }
+        return n;
+    };
+    auto throttleUntil = [&] {
+        int64_t m = 0;
+        for (int w = 0; w < 8; ++w) {
+            try { m = std::max(m, b.node().onWorkerThreadForTest(w, [slot](Worker& wk) { return wk.nsThrottleUntilForTest(slot, rune::node::ThrottleKind::ProduceBytes); })); }
+            catch (const std::invalid_argument&) { break; }
+        }
+        return m;
+    };
+
+    // Wave 1 goes through (the aggregator only learns of the burst a tick later) ...
+    const Wave w1 = wave();
+    EXPECT_EQ(w1.ok, kWave) << "wave 1 failed " << w1.failed;
+    // ... then the namespace is over its rate: the worker holds a throttle deadline seconds away.
+    ASSERT_TRUE(until([&] { return throttleUntil() != 0; })) << "the aggregator never throttled the namespace";
+    const uint64_t before = refusals();
+    // Wave 2 meets the throttle: the broker answers 53, the client waits out the retry-after and every record still lands.
+    const Wave w2 = wave();
+    EXPECT_EQ(w2.ok, kWave) << "wave 2 failed " << w2.failed;
+    EXPECT_EQ(w2.failed, 0);
+    EXPECT_GE(w2.took, 1s) << "the second wave could only complete after the throttle deadline (~2 s for 80 KiB over 40 KiB/s)";
+    EXPECT_GT(refusals(), before) << "the broker refused at least once while the client was backing off";
     p.close();
 }
 

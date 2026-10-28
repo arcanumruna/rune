@@ -4177,7 +4177,7 @@ private:
                 enqueueReturn_(std::move(ret));
                 return ViewServe::Answered;
             }
-            if (rune::storage::Log* const sl = srcRep->log(); sl != nullptr && src >= 0) {   // Task 14: count + pace (one add, one compare)
+            if (rune::storage::Log* const sl = srcRep->isDiskBacked() ? srcRep->log() : nullptr; sl != nullptr && src >= 0) {   // Task 14: count + pace (one add, one compare); a transient source has no Log and no namespace tag
                 NsHot& nh = nsHot_[sl->nsSlot()];
                 ++nh.requestOps;
                 lastViewReadSlot_ = sl->nsSlot();
