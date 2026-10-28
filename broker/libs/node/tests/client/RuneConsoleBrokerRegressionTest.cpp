@@ -20,6 +20,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <tuple>
+#include <fcntl.h>
 #include <unistd.h>
 
 using namespace std::chrono_literals;
@@ -501,4 +503,174 @@ TEST(RuneConsoleBrokerRegression, PipedStdinGapKeepsTheSessionAliveRegression) {
     EXPECT_EQ(errBuf.str().find("session"), std::string::npos) << errBuf.str();
     EXPECT_GT(pumps, static_cast<uint64_t>(steps)) << "the idle pump ran during the gap";
     EXPECT_EQ(b.node().testConnectsAccepted() - connectsBefore, 1u) << "no reconnect: one connected client for the whole session";
+}
+
+// ── Adversarial review of PR #669 (#311 / #315), through the public console entry points ─────────────────────────
+
+namespace {
+/// Advances the injected duty clock one second per step for `steps` steps, each step waiting until the console has
+/// sampled the clock twice more (= pumped the client while it waits for input).  false: the console stopped pumping.
+bool gapPastTheWindow(int steps) {
+    for (int i = 0; i < steps; ++i) {
+        gClockOffsetNs.fetch_add(1'000'000'000LL);
+        const uint64_t target = gClockSamples.load() + 2;
+        if (!waitUntil([&] { return gClockSamples.load() >= target; }, 5s)) return false;
+    }
+    return true;
+}
+
+int stepsPastTheWindow() {
+    return static_cast<int>(rune::client::session::SessionConfig::kDefaultResponseTimeoutNs / 1'000'000'000LL) + 4;
+}
+
+/// This process's CLI scratch directories (`rune-cli-<pid>-...` under the temp dir).
+std::vector<fs::path> cliScratchDirs() {
+    std::vector<fs::path> out;
+    const std::string prefix = "rune-cli-" + std::to_string(::getpid()) + "-";
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(fs::temp_directory_path(), ec))
+        if (e.path().filename().string().rfind(prefix, 0) == 0) out.push_back(e.path());
+    return out;
+}
+} // namespace
+
+TEST(RuneConsoleBrokerRegression, PipedStdinPartialStatementAcrossGapsAdversarialRegression) {
+    // #311 attacked: the gap falls INSIDE the input - in the middle of a line (bytes buffered, no newline yet) and
+    // between the lines of one multi-line statement (continuation prompt) - each gap past the stale-session window.
+    // The console must keep pumping while it holds a partial line or a partial statement, and run both statements on
+    // the one session.
+    OneBroker b("console_piped_partial");
+    const uint64_t connectsBefore = b.node().testConnectsAccepted();
+    StdinPipe in;
+    Sink outBuf, errBuf;
+    std::ostream& out = outBuf;
+    std::ostream& err = errBuf;
+    gClockOffsetNs = 0;
+    gClockSamples = 0;
+    uint64_t pumps = 0;
+    int rc = -1;
+    std::thread t([&] {
+        rc = rune::cli::console::runLiveOnStdinForTest({"console", "--broker", b.endpoint()}, &pipedTestClock, out, err, &pumps);
+    });
+    auto finish = [&] {
+        in.closeWriter();
+        if (t.joinable()) t.join();
+    };
+    // Wait until the session is up and the console is polling (it samples the clock), then start mid-line.
+    if (!waitUntil([&] { return countOf(outBuf.str(), "rune> ") == 1u && gClockSamples.load() > 2; })) {
+        finish();
+        FAIL() << "the console never reached its first prompt: " << errBuf.str();
+    }
+    in.send("topic partial1 parti");   // no newline: the bytes wait in the console's buffer
+    if (!gapPastTheWindow(stepsPastTheWindow())) { finish(); FAIL() << "no pump while a partial line was buffered"; }
+    in.send("tions 1;\n");
+    if (!waitUntil([&] { return outBuf.str().find("ok topic partial1") != std::string::npos; })) {
+        finish();
+        FAIL() << "the line completed after the gap never ran: " << outBuf.str() << "\nerr: " << errBuf.str();
+    }
+    in.send("topic partial2\n");   // a statement over two lines, with the gap between them
+    if (!waitUntil([&] { return outBuf.str().find("   ...> ") != std::string::npos; })) {
+        finish();
+        FAIL() << "no continuation prompt: " << outBuf.str();
+    }
+    if (!gapPastTheWindow(stepsPastTheWindow())) { finish(); FAIL() << "no pump inside a multi-line statement"; }
+    in.send("partitions 1;\n");
+    const bool second = waitUntil([&] { return outBuf.str().find("ok topic partial2") != std::string::npos; });
+    finish();
+    EXPECT_TRUE(second) << "out: " << outBuf.str() << "\nerr: " << errBuf.str();
+    EXPECT_EQ(rc, 0) << errBuf.str();
+    EXPECT_TRUE(errBuf.str().empty()) << errBuf.str();
+    EXPECT_EQ(countOf(outBuf.str(), "ok topic partial"), 2u) << outBuf.str();
+    EXPECT_EQ(countOf(outBuf.str(), "   ...> "), 1u) << "one continuation line: " << outBuf.str();
+    EXPECT_EQ(countOf(outBuf.str(), "rune> "), 3u) << "before partial1, before partial2, before EOF: " << outBuf.str();
+    EXPECT_GT(pumps, static_cast<uint64_t>(2 * stepsPastTheWindow())) << "the idle pump ran during both gaps";
+    EXPECT_EQ(b.node().testConnectsAccepted() - connectsBefore, 1u) << "no reconnect: one session throughout";
+}
+
+TEST(RuneConsoleBrokerRegression, ProcessStdinRegularFileAndDevNullAdversarialRegression) {
+    // #311 attacked: the process stdin is now always polled; a regular file (`rune console < s.rql`) is always
+    // "readable" to poll(2) and /dev/null is an immediate EOF.  Both must end the session cleanly (rc 0), run exactly
+    // the complete statements in order, report an unterminated tail, and never spin.
+    OneBroker b("console_stdin_file");
+    const std::string script = writeFile("stdin.rql",
+        "topic sf1 partitions 1;\r\n"
+        "topic sf2\n"
+        "  partitions 1;\n"
+        "topic sf3 partitions 1");   // no ';' and no newline: not run
+    auto runOnStdin = [&](const std::string& path) {
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        EXPECT_GE(fd, 0) << path;
+        const int saved = ::dup(STDIN_FILENO);
+        EXPECT_EQ(::dup2(fd, STDIN_FILENO), STDIN_FILENO);
+        ::close(fd);
+        std::ostringstream out, err;
+        uint64_t pumps = 0;
+        const int rc = rune::cli::console::runLiveOnStdinForTest({"console", "--broker", b.endpoint()}, nullptr, out, err, &pumps);
+        ::dup2(saved, STDIN_FILENO);
+        ::close(saved);
+        return std::tuple<int, std::string, std::string>{rc, out.str(), err.str()};
+    };
+    const auto [rc, out, err] = runOnStdin(script);
+    EXPECT_EQ(rc, 0) << err;
+    EXPECT_NE(out.find("ok topic sf1"), std::string::npos) << out;
+    EXPECT_NE(out.find("ok topic sf2"), std::string::npos) << out;
+    EXPECT_LT(out.find("ok topic sf1"), out.find("ok topic sf2"));
+    EXPECT_EQ(out.find("sf3"), std::string::npos) << "the unterminated tail is not run: " << out;
+    EXPECT_NE(err.find("input ended inside a statement"), std::string::npos) << err;
+    EXPECT_EQ(createTopicCount(b.catalogEvents(), "sf3"), 0u);
+    EXPECT_EQ(createTopicCount(b.catalogEvents(), "sf1"), 1u);
+    EXPECT_EQ(createTopicCount(b.catalogEvents(), "sf2"), 1u);
+
+    const auto [nrc, nout, nerr] = runOnStdin("/dev/null");
+    EXPECT_EQ(nrc, 0) << nerr;
+    EXPECT_EQ(nout, "rune> \n") << "one prompt, then EOF";
+    EXPECT_TRUE(nerr.empty()) << nerr;
+}
+
+TEST(RuneConsoleBrokerRegression, EmptyCliDataDirIsAPrivateScratchRemovedOnExitAdversarialRegression) {
+    // #315 attacked through every CLI entry that connects: `--cli-data-dir ""` (and no flag) give each client a private
+    // scratch directory that exists while it runs and is gone when the command ends; a non-empty value is used as
+    // given and left in place.
+    OneBroker b("console_datadir");
+    ASSERT_TRUE(cliScratchDirs().empty()) << "no scratch directory before any command";
+
+    // The interactive console: the scratch directory exists while the session is open.
+    {
+        PipeConsole c({"console", "--broker", b.endpoint(), "--cli-data-dir", ""});
+        c.send("topic dd1 partitions 1;\n");
+        ASSERT_TRUE(waitUntil([&] { return c.out.str().find("ok topic dd1") != std::string::npos; }))
+            << c.out.str() << "\nerr: " << c.err.str();
+        const auto live = cliScratchDirs();
+        ASSERT_EQ(live.size(), 1u) << "exactly one private scratch directory while the console runs";
+        EXPECT_FALSE(fs::is_empty(live[0])) << "the embedded driver uses it: " << live[0];
+        c.finish();
+        EXPECT_EQ(c.rc, 0) << c.err.str();
+    }
+    EXPECT_TRUE(cliScratchDirs().empty()) << "the console's scratch directory is removed on exit";
+
+    // `rune console -f`, `rune ql` and `rune schema list` with an empty value: each ends with nothing left behind.
+    const std::string f = writeFile("dd.rql", "topic dd2 partitions 1;\n");
+    EXPECT_EQ(consoleLive(b, {"-f", f, "--cli-data-dir", ""}, "").rc, 0);
+    EXPECT_TRUE(cliScratchDirs().empty()) << "console -f";
+    {
+        std::ostringstream out, err;
+        EXPECT_EQ(rune::cli::run({"ql", "-e", "topic dd3 partitions 1;", "--broker", b.endpoint(), "--tls-ca",
+                                  AuthBroker::tlsCaFile().string(), "--cli-data-dir", ""}, out, err), 0) << err.str();
+        EXPECT_TRUE(cliScratchDirs().empty()) << "rune ql";
+    }
+    {
+        std::ostringstream out, err;
+        EXPECT_EQ(rune::cli::run({"schema", "list", "--broker", b.endpoint(), "--cli-data-dir", ""}, out, err), 0) << err.str();
+        EXPECT_TRUE(cliScratchDirs().empty()) << "rune schema list";
+    }
+    EXPECT_EQ(createTopicCount(b.catalogEvents(), "dd2"), 1u);
+    EXPECT_EQ(createTopicCount(b.catalogEvents(), "dd3"), 1u);
+
+    // A caller's directory is used as given and left in place.
+    const fs::path mine = fs::temp_directory_path() / ("rune_console_own_datadir_" + std::to_string(::getpid()));
+    fs::remove_all(mine);
+    EXPECT_EQ(consoleLive(b, {"-f", writeFile("dd4.rql", "topic dd4 partitions 1;\n"), "--cli-data-dir", mine.string()}, "").rc, 0);
+    EXPECT_TRUE(fs::exists(mine)) << "a non-empty --cli-data-dir is the caller's: left in place";
+    EXPECT_TRUE(cliScratchDirs().empty()) << "and no scratch directory was made for it";
+    fs::remove_all(mine);
 }

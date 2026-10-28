@@ -3,6 +3,9 @@
 // Also carries the migrated `rune schema apply|alter --dry-run` assertions (Task 5 table).
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <filesystem>
@@ -542,3 +545,166 @@ TEST(QlEngineRegression, EmptyCliDataDirIsScratchRegression) {
     EXPECT_FALSE(fs::exists(seen)) << "removed, with its contents, when the scope ends";
 }
 #endif
+
+// ── Adversarial review of PR #669 (#311): every process stdin now goes through PollingFdLineSource ─────────────────
+// A pipe, a regular file and /dev/null; a line completed across idle pumps; a signal storm while blocked.  No sleeps:
+// input arrives from the idle callback itself, and every drive has a hard cap that ends the input (EOF) instead of
+// hanging.
+
+namespace {
+/// Idle callback: on pump N writes the next chunk; after the last chunk closes the writer (EOF).  Past `cap` pumps it
+/// closes the writer anyway (the test then fails on its assertions, never hangs).
+struct ChunkFeeder {
+    int fd = -1;
+    std::vector<std::pair<int, std::string>> chunks;   // (pump number, bytes)
+    std::size_t next = 0;
+    int pumps = 0;
+    int cap = 1000;
+    bool capped = false;
+    void closeWriter() { if (fd >= 0) { ::close(fd); fd = -1; } }
+};
+void feedOnIdle(void* ctx) noexcept {
+    auto* f = static_cast<ChunkFeeder*>(ctx);
+    ++f->pumps;
+    while (f->next < f->chunks.size() && f->chunks[f->next].first == f->pumps) {
+        const std::string& s = f->chunks[f->next++].second;
+        [[maybe_unused]] const ssize_t n = ::write(f->fd, s.data(), s.size());
+    }
+    if (f->next == f->chunks.size() || f->pumps >= f->cap) {
+        f->capped = f->next != f->chunks.size();
+        f->closeWriter();
+    }
+}
+} // namespace
+
+TEST(ConsolePollingSourceRegression, PartialLineCompletedAcrossIdlePumpsAdversarialRegression) {
+    // A pipe that delivers a statement in fragments separated by gaps (`slow-producer | rune console`): the partial
+    // line is held across the idle pumps and returned whole; a CRLF split between two writes, a final line with no
+    // newline, then EOF.  The source keeps pumping while it holds a partial line.
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    ChunkFeeder f;
+    f.fd = fds[1];
+    f.chunks = {{2, "topic a parti"}, {4, "tions 1;\r"}, {5, "\nsecond"}, {8, " line\nthird"}};
+    rune::cli::console::PollingFdLineSource src(fds[0], &feedOnIdle, &f);
+    std::string line;
+    ASSERT_TRUE(src.next(line));
+    EXPECT_EQ(line, "topic a partitions 1;") << "a line split across idle gaps (and a split CRLF) is joined";
+    EXPECT_GE(f.pumps, 5);
+    ASSERT_TRUE(src.next(line));
+    EXPECT_EQ(line, "second line");
+    ASSERT_TRUE(src.next(line));
+    EXPECT_EQ(line, "third") << "a last line without a newline is still returned at EOF";
+    EXPECT_FALSE(src.next(line));
+    EXPECT_FALSE(src.next(line)) << "EOF is sticky";
+    EXPECT_FALSE(f.capped) << "every chunk was delivered by the idle pump";
+    EXPECT_EQ(src.idlePumps, static_cast<uint64_t>(f.pumps));
+    ::close(fds[0]);
+}
+
+TEST(ConsolePollingSourceRegression, RegularFileAndDevNullStdinEndCleanlyAdversarialRegression) {
+    // `rune console < script.rql` and `rune console < /dev/null`: poll(2) reports a regular file always readable, so
+    // the source must read it to EOF without an idle pump, and end (false) - never spin on a ready-but-empty fd.
+    const fs::path p = writeScript("stdin_file.rql", "a\r\nb\n\nc");
+    const int fd = ::open(p.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+    int idle = 0;
+    rune::cli::console::PollingFdLineSource src(fd, &countIdle, &idle);
+    std::string line;
+    std::vector<std::string> got;
+    for (int i = 0; i < 10 && src.next(line); ++i) got.push_back(line);
+    EXPECT_EQ(got, (std::vector<std::string>{"a", "b", "", "c"}));
+    EXPECT_FALSE(src.next(line));
+    EXPECT_EQ(src.idlePumps, 0u);
+    ::close(fd);
+
+    const int nul = ::open("/dev/null", O_RDONLY);
+    ASSERT_GE(nul, 0);
+    rune::cli::console::PollingFdLineSource empty(nul, &countIdle, &idle);
+    EXPECT_FALSE(empty.next(line));
+    EXPECT_FALSE(empty.next(line));
+    EXPECT_EQ(empty.idlePumps, 0u);
+    ::close(nul);
+
+    // A descriptor that is not open (`rune console <&-`): poll reports POLLNVAL and read fails: the end of input.
+    int dead[2];
+    ASSERT_EQ(::pipe(dead), 0);
+    ::close(dead[0]);
+    ::close(dead[1]);
+    rune::cli::console::PollingFdLineSource closed(dead[0], &countIdle, &idle);
+    EXPECT_FALSE(closed.next(line));
+    EXPECT_EQ(idle, 0) << "no pump loop on a closed descriptor";
+}
+
+namespace {
+// The signal storm of the next test.  The handler is async-signal-safe: it counts, and after kWatchdog signals it
+// writes the input itself and closes the pipe (so the test fails on its assertions instead of hanging).
+volatile sig_atomic_t gStormSignals = 0;
+volatile sig_atomic_t gStormWatchdogFd = -1;
+constexpr sig_atomic_t kWatchdog = 3000;
+void stormHandler(int) {
+    gStormSignals = gStormSignals + 1;
+    if (gStormSignals == kWatchdog && gStormWatchdogFd >= 0) {
+        const int fd = gStormWatchdogFd;
+        gStormWatchdogFd = -1;
+        [[maybe_unused]] const ssize_t n = ::write(fd, "watchdog\n", 9);
+        ::close(fd);
+    }
+}
+} // namespace
+
+namespace {
+// Storm idle callback: the 3rd pump writes the line (the watchdog is disarmed first: one writer, one close).
+int gStormPumps = 0;
+void stormIdle(void*) noexcept {
+    if (++gStormPumps != 3) return;
+    sigset_t alrm, saved;   // the handler is held off while the pump takes the descriptor
+    sigemptyset(&alrm);
+    sigaddset(&alrm, SIGALRM);
+    ::pthread_sigmask(SIG_BLOCK, &alrm, &saved);
+    if (gStormWatchdogFd >= 0) {
+        const int fd = gStormWatchdogFd;
+        gStormWatchdogFd = -1;
+        [[maybe_unused]] const ssize_t n = ::write(fd, "pumped\n", 7);
+        ::close(fd);
+    }
+    ::pthread_sigmask(SIG_SETMASK, &saved, nullptr);
+}
+} // namespace
+
+TEST(ConsolePollingSourceRegression, SignalStormStillPumpsTheClientAdversarialRegression) {
+    // A process that receives signals more often than the 50 ms poll timeout (a profiler's SIGPROF, a terminal being
+    // resized, a timer) has every poll(2) interrupted with EINTR.  The idle pump must still run - it is what keeps the
+    // broker session alive - so the input that the 3rd pump writes arrives.  Before the fix an EINTR re-polled without
+    // pumping, and the pump starved for as long as the signals lasted (here: until the watchdog wrote the input).
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    gStormSignals = 0;
+    gStormPumps = 0;
+    gStormWatchdogFd = fds[1];   // both the 3rd pump and the watchdog write here; whichever is first disarms the other
+
+    struct sigaction sa{}, old{};
+    sa.sa_handler = &stormHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;   // no SA_RESTART: poll(2) is interrupted
+    ASSERT_EQ(::sigaction(SIGALRM, &sa, &old), 0);
+    itimerval tick{{0, 1000}, {0, 1000}};   // every 1 ms, far below the 50 ms poll timeout
+    ASSERT_EQ(::setitimer(ITIMER_REAL, &tick, nullptr), 0);
+
+    rune::cli::console::PollingFdLineSource src(fds[0], &stormIdle, nullptr);
+    std::string line;
+    const bool got = src.next(line);
+
+    itimerval off{};
+    ::setitimer(ITIMER_REAL, &off, nullptr);
+    ::sigaction(SIGALRM, &old, nullptr);
+    const int signals = gStormSignals;
+    if (gStormWatchdogFd >= 0) { ::close(gStormWatchdogFd); gStormWatchdogFd = -1; }   // neither fired: close it here
+
+    ASSERT_TRUE(got);
+    EXPECT_EQ(line, "pumped") << "the idle pump starved under the signal storm: the watchdog wrote the input after "
+                              << signals << " signals (" << gStormPumps << " pumps)";
+    EXPECT_GE(gStormPumps, 3);
+    EXPECT_EQ(src.idlePumps, static_cast<uint64_t>(gStormPumps));
+    ::close(fds[0]);
+}

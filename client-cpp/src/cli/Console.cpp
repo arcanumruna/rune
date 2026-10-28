@@ -63,15 +63,14 @@ bool PollingFdLineSource::next(std::string& line) {
         }
         pollfd p{fd_, POLLIN, 0};
         const int n = ::poll(&p, 1, 50);
-        if (n == 0) {
+        // A timeout pumps the client; so does a poll interrupted by a signal: signals more frequent than the timeout
+        // (SIGPROF, SIGWINCH, a timer) would otherwise re-poll forever and starve the pump - and the session with it.
+        if (n == 0 || (n < 0 && errno == EINTR)) {
             ++idlePumps;
             idle_(ctx_);
             continue;
         }
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
+        if (n < 0) return false;
         const ssize_t got = ::read(fd_, buf_.data() + len_, buf_.size() - len_);
         if (got < 0 && errno == EINTR) continue;
         if (got <= 0) {
