@@ -450,7 +450,10 @@ TEST_F(GatewayAsyncDropFixture, ResolveAfterCycles_SessionCreated_PendingClears)
         kEgressBase + 200);
     offerBounded(*ingressPub, sc, reqLen, "Connect-good");
 
-    // Pump with the wall clock until ConnectResponse arrives.
+    // Pump with a FROZEN gateway clock until ConnectResponse arrives: the
+    // 10 ms connect timeout must never race the client conductor's own
+    // resolution latency (wall-clock pumping made this test timing-dependent).
+    // The wall deadline below only bounds the loop.
     std::optional<pc::ConnectResponse> resp;
     aeron::FragmentAssembler respAsm(
         [&](aeron::concurrent::AtomicBuffer& buf,
@@ -466,7 +469,7 @@ TEST_F(GatewayAsyncDropFixture, ResolveAfterCycles_SessionCreated_PendingClears)
     using clock = std::chrono::steady_clock;
     const auto deadline = clock::now() + std::chrono::seconds{10};
     for (int i = 0; i < kPumpIter && clock::now() < deadline; ++i) {
-        gw_->doWork(wallNowNs());
+        gw_->doWork(tBase);
         egressSub->poll(respAsm.handler(), 10);
         if (resp.has_value()) break;
         std::this_thread::sleep_for(std::chrono::microseconds{200});
