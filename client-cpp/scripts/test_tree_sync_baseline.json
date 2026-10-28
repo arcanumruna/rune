@@ -94,8 +94,7 @@
  },
  "tests/client/TlsConnectEdgeRegressionTest.cpp": {
   "atomic|std::atomic": 1,
-  "include|#include <atomic>": 1,
-  "sleep|std::this_thread::sleep_for": 5
+  "include|#include <atomic>": 1
  },
  "tests/detail/OneToOneRingBufferTest.cpp": {
   "atomic|std::atomic": 1,

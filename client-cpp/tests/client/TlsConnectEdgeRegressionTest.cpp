@@ -36,7 +36,6 @@
 #include <optional>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -47,9 +46,14 @@ namespace rcs = rune::client::session;
 
 namespace {
 
-constexpr int  kPumpMax   = 6'000;
-constexpr auto kPumpSleep = 2ms;
+constexpr int kPumpMax = 6'000;
 std::atomic<int> g_ctr{0};
+
+// The Rig's injected clock (one Rig at a time per test; reset in the Rig constructor).  Nothing here sleeps or reads
+// wall time: simulated time passes only through Rig::pumpFor / pumpWithin.
+int64_t g_nowNs = 1'000'000'000;
+int64_t manualNow() noexcept { return g_nowNs; }
+constexpr int64_t kTickNs = 1'000'000;   // one pump step = 1 ms of simulated time
 
 std::string uniqueDir() {
     return std::filesystem::temp_directory_path().string() + "/tls_edge_" + std::to_string(static_cast<long>(::getpid())) + "_" +
@@ -105,10 +109,12 @@ struct TwoLegTlsGateway {
     std::shared_ptr<aeron::Subscription> gwSub;
     std::shared_ptr<aeron::ExclusivePublication> gwPub;
     std::unique_ptr<aeron::FragmentAssembler> gwAsm;
+    std::function<void()> idle_;   // pumps the Invoker client while the gateway waits for the ring (no sleeping)
 
     /// `idle` runs while the gateway waits for its publications: an Invoker client's embedded
     /// driver only works while its owner pumps it.
-    TwoLegTlsGateway(const std::string& aeronDir, int32_t in, int32_t eg, const std::function<void()>& idle = {}) {
+    TwoLegTlsGateway(const std::string& aeronDir, int32_t in, int32_t eg, const std::function<void()>& idle = {})
+        : idle_(idle) {
         serverPem = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.pem");
         serverKey = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.key");
         aeron::Context ctx;
@@ -117,12 +123,11 @@ struct TwoLegTlsGateway {
         gwAeron = aeron::Aeron::connect(ctx);
         const int64_t subId = gwAeron->addSubscription("aeron:ipc", in);
         const int64_t pubId = gwAeron->addExclusivePublication("aeron:ipc", eg);
-        for (const auto dl = std::chrono::steady_clock::now() + 5s; std::chrono::steady_clock::now() < dl;) {
+        for (int i = 0; i < kPumpMax * 10; ++i) {   // hard iteration cap: a failing setup ends, never hangs
             if (!gwSub) gwSub = gwAeron->findSubscription(subId);
             if (!gwPub) gwPub = gwAeron->findExclusivePublication(pubId);
             if (gwSub && gwPub) break;
             if (idle) idle();
-            std::this_thread::sleep_for(kPumpSleep);
         }
         gwAsm = std::make_unique<aeron::FragmentAssembler>(
             [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len,
@@ -164,8 +169,8 @@ struct TwoLegTlsGateway {
     }
     void sendRaw(const uint8_t* b, std::size_t n) {
         aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(b), static_cast<aeron::util::index_t>(n));
-        for (int i = 0; i < 500 && gwPub->offer(ab, 0, static_cast<aeron::util::index_t>(n)) <= 0; ++i)
-            std::this_thread::sleep_for(1ms);
+        for (int i = 0; i < 5'000 && gwPub->offer(ab, 0, static_cast<aeron::util::index_t>(n)) <= 0; ++i)
+            if (idle_) idle_();   // back-pressured: let the client drain its egress (no sleeping)
     }
     void onFrame(const uint8_t* buf, std::size_t len) {
         const auto tid = rcc::peekTemplate(buf, len);
@@ -282,10 +287,10 @@ struct TwoLegTlsGateway {
 struct Rig {
     static constexpr int32_t kInStr = 4114, kEgStr = 4115;
     std::string agentDir = uniqueDir();
-    bool invoker = false;
     std::unique_ptr<Client> client;
     std::unique_ptr<TwoLegTlsGateway> gw;
-    explicit Rig(bool invokerMode = false, bool twoLeg = true, bool login = false) : invoker(invokerMode) {
+    explicit Rig(bool twoLeg = true, bool login = false) {
+        g_nowNs = 1'000'000'000;
         ClientConfig cfg;
         if (login) { cfg.username = "ws1"; cfg.password = "correct horse battery"; }
         cfg.gatewayChannel = "aeron:ipc"; cfg.gatewayStreamId = kInStr;
@@ -295,18 +300,14 @@ struct Rig {
         cfg.offerCrypto = true; cfg.requireCrypto = true;
         cfg.tlsTrustPem = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/ca.pem");
         cfg.tlsExpectHost = "localhost";
-        if (invoker) cfg.runnerMode = RunnerMode::Invoker;
+        cfg.runnerMode = RunnerMode::Invoker;   // every test drives the client itself, on the injected clock
+        cfg.nanoClock  = &manualNow;
         TopicSpec ts; ts.name = "inventory"; ts.topicId = 1; ts.partitionCount = 1;
         cfg.topics.push_back(ts);
         client = std::make_unique<Client>(cfg);
-        if (invoker) {
-            for (int i = 0; i < 75; ++i) { (void)client->doWork(); std::this_thread::sleep_for(kPumpSleep); }
-        } else {
-            std::this_thread::sleep_for(150ms);
-        }
-        std::function<void()> idle;
-        if (invoker) idle = [this] { (void)client->doWork(); };
-        gw = std::make_unique<TwoLegTlsGateway>(agentDir + "/aeron", kInStr, kEgStr, idle);
+        // The gateway waits for the client's embedded driver to create the rings: pump the client meanwhile.
+        gw = std::make_unique<TwoLegTlsGateway>(agentDir + "/aeron", kInStr, kEgStr,
+                                                [this] { (void)client->doWork(); });
         gw->twoLeg = twoLeg;
     }
     ~Rig() {
@@ -317,15 +318,20 @@ struct Rig {
     }
     void step() {
         gw->poll(16);
-        if (invoker) (void)client->doWork();
-        std::this_thread::sleep_for(kPumpSleep);
+        (void)client->doWork();
     }
+    /// Simulated time: one step per millisecond, the clock advancing with each.
     void pumpFor(std::chrono::milliseconds d) {
-        for (const auto dl = std::chrono::steady_clock::now() + d; std::chrono::steady_clock::now() < dl;) step();
+        for (int64_t i = 0; i < d.count(); ++i) {
+            g_nowNs += kTickNs;
+            step();
+        }
     }
+    /// Returns as soon as p() holds; the step count (d / 1 ms) is the hard cap, so a failure ends, never hangs.
     template <class Pred> bool pumpWithin(std::chrono::milliseconds d, Pred p) {
-        for (const auto dl = std::chrono::steady_clock::now() + d; std::chrono::steady_clock::now() < dl;) {
+        for (int64_t i = 0; i < d.count(); ++i) {
             if (p()) return true;
+            g_nowNs += kTickNs;
             step();
         }
         return p();
@@ -433,7 +439,7 @@ TEST(TlsConnectEdgeRegression, DirectSendsWaitForTheHandshakeRegression) {
 // (the old ruling), or an unbounded reconnect storm (the failover treating the optimistic
 // Connected as success).
 TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedFailsTheSeedExplicitlyRegression) {
-    Rig r(/*invokerMode=*/true, /*twoLeg=*/false);
+    Rig r(/*twoLeg=*/false);
     r.gw->failFinalLeg = true;
     std::vector<std::string> errors;
     r.client->onError([&](const std::string& e) { errors.push_back(e); });
@@ -463,7 +469,7 @@ TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedFailsTheSeedExplicitlyRegr
 // final-leg HandshakeFailed arrives.  The pending connect must complete with HandshakeFailed once the retries are spent
 // - not hang to its timeout, and never a terminal Rejected.
 TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedWhileAuthenticatingFailsTheConnectRegression) {
-    Rig r(/*invokerMode=*/true, /*twoLeg=*/false, /*login=*/true);
+    Rig r(/*twoLeg=*/false, /*login=*/true);
     r.gw->failFinalLeg = true;
     r.gw->requireAuth  = true;
     test_support::TestCq cq(*r.client);
@@ -480,7 +486,7 @@ TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedWhileAuthenticatingFailsTh
 // Issue #481: once the app's connect has failed on unproven final legs, a session that does not reconnect forever stops:
 // Disconnected, and the gateway sees no further ConnectRequest.  RED (old): Backoff kept reconnecting in the background.
 TEST(TlsConnectEdgeRegression, ANonForeverSessionEndsDisconnectedAfterUnprovenFinalLegFailuresRegression) {
-    Rig r(/*invokerMode=*/true, /*twoLeg=*/false, /*login=*/true);
+    Rig r(/*twoLeg=*/false, /*login=*/true);
     r.gw->failFinalLeg = true;
     r.gw->requireAuth  = true;
     test_support::TestCq cq(*r.client);
@@ -501,7 +507,7 @@ TEST(TlsConnectEdgeRegression, ANonForeverSessionEndsDisconnectedAfterUnprovenFi
 // stays Connected and keeps answering; the node session is never Rejected and its
 // retries are bounded.  RED (no (sid, corr) resolution): the frame falls back to the seed.
 TEST(TlsConnectEdgeRegression, NodeSessionFinalLegHandshakeFailedRejectsOnlyThatSessionRegression) {
-    Rig r(/*invokerMode=*/true, /*twoLeg=*/false);
+    Rig r(/*twoLeg=*/false);
     r.gw->failFinalLeg = true;
     r.gw->failFinalLegFromCorr = 1'000'000'000'000LL;   // node sessions' corrId range only
     test_support::TestCq cq(*r.client);
