@@ -1385,9 +1385,8 @@ TEST(ProducerSequence, ARetriableAnswerLeavesTheLingeringRecordsAloneRegression)
 
 // C19 adversarial review (#689, whole bug class): a Tier-2 batch queued on the refused partition (held behind a full
 // in-flight window) is as doomed as the builder's records: it must fail at once with the same code, never be sent
-// (and refused) again.  DISABLED: open #689 gap (failBuilder_ does not fail ps's queued Tier-2 batches; failAllPending
-// does) - reported to the C19 fix round; enable with the fix.
-TEST(ProducerSequence, DISABLED_ARefusedPartitionAlsoFailsItsQueuedTier2BatchAdversarialRegression) {
+// (and refused) again.
+TEST(ProducerSequence, ARefusedPartitionAlsoFailsItsQueuedTier2BatchAdversarialRegression) {
     ProducerConfig cfg = ackCfg(1, /*lingerUs=*/60'000'000);
     cfg.deliveryTimeoutMs = 3'600'000;
     ProducerImpl impl(cfg);
@@ -1418,6 +1417,75 @@ TEST(ProducerSequence, DISABLED_ARefusedPartitionAlsoFailsItsQueuedTier2BatchAdv
         EXPECT_EQ(L.last.at(t).ec, 45u) << "token " << t;
     }
     EXPECT_EQ(cap.frames.size(), 1u) << "the queued Tier-2 batch was sent to the refused partition again";
+}
+
+// #689 (path D, UnknownTopic: outcome unknown): a Tier-2 batch queued on the refused partition (held behind a full
+// in-flight window) is as doomed as the builder's records: it must fail at once with the same code, never be sent
+// (and refused) again.
+TEST(ProducerSequence, ARefusedPartitionOutcomeUnknownAlsoFailsItsQueuedTier2BatchAdversarialRegression) {
+    ProducerConfig cfg = ackCfg(1, /*lingerUs=*/60'000'000);
+    cfg.deliveryTimeoutMs = 3'600'000;
+    ProducerImpl impl(cfg);
+    AckLedger L;
+    L.attach(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(1)));  // A
+    impl.submitFlush();
+    pump(impl, sink);
+    ASSERT_EQ(cap.frames.size(), 1u) << "A is in flight (window of 1 now full)";
+    // The record enters the builder first (a record behind a queued Tier-2 batch waits in the ring instead).
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(3)));  // lingers
+    pump(impl, sink);
+    {
+        rune::client::BatchBuilder bb(&impl, 1, 0);
+        bb.add(kVal);
+        bb.add(kVal);
+        ASSERT_EQ(bb.send(AckToken{2}), OpResult::Accepted);  // queued behind A
+    }
+    pump(impl, sink);
+    ASSERT_EQ(cap.frames.size(), 1u) << "the record and the Tier-2 batch wait for the window";
+    impl.onProduceResponse(cap.frames[0].corrId, -1, 7);
+    pump(impl, sink);  // the clock is NOT advanced
+    for (const rune::client::Token t : {1, 3, 2}) {
+        ASSERT_EQ(L.times(t), 1) << "token " << t;
+        EXPECT_EQ(L.status(t), OpStatus::BrokerError) << "token " << t;
+        EXPECT_EQ(L.last.at(t).ec, 7u) << "token " << t;
+    }
+    EXPECT_EQ(cap.frames.size(), 1u) << "the queued Tier-2 batch was sent to the refused partition again";
+}
+
+// #689 (same bug class): a routed-broker failure (46 / 44 Rejected session) fails the builder AND the queued Tier-2
+// batches of the failed partition: none is sent afterwards.
+TEST(ProducerSequence, ARoutedBrokerFailureAlsoFailsQueuedTier2BatchesRegression) {
+    ProducerConfig cfg = ackCfg(1, /*lingerUs=*/60'000'000);
+    cfg.deliveryTimeoutMs = 3'600'000;
+    ProducerImpl impl(cfg);
+    AckLedger L;
+    L.attach(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(1)));  // A
+    impl.submitFlush();
+    pump(impl, sink);
+    ASSERT_EQ(cap.frames.size(), 1u) << "A is in flight (window of 1 now full)";
+    {
+        rune::client::BatchBuilder bb(&impl, 1, 0);
+        bb.add(kVal);
+        bb.add(kVal);
+        ASSERT_EQ(bb.send(AckToken{2}), OpResult::Accepted);  // queued behind A
+    }
+    pump(impl, sink);
+    ASSERT_EQ(cap.frames.size(), 1u) << "the Tier-2 batch waits for the window";
+    impl.failRoutedBroker([](void*, int32_t, int32_t) noexcept -> uint16_t { return 46; }, nullptr);
+    for (const rune::client::Token t : {1, 2}) {
+        ASSERT_EQ(L.times(t), 1) << "token " << t;
+        EXPECT_EQ(L.status(t), OpStatus::BrokerError) << "token " << t;
+        EXPECT_EQ(L.last.at(t).ec, 46u) << "token " << t;
+    }
+    pump(impl, sink);
+    EXPECT_EQ(cap.frames.size(), 1u) << "the queued Tier-2 batch was sent after its partition failed";
+    EXPECT_EQ(L.times(2), 1);
 }
 
 // C19 adversarial review (#689): the refusal fails only the answered partition's UNSENT records.  A later batch of the

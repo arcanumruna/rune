@@ -1229,7 +1229,7 @@ TEST(ProducerClaimRegression, InvokerClaimDestroyedOffOwnerIsReleasedOnTheNextDu
         << "owner state is untouched until the owner's duty pass";
     EXPECT_EQ(r.impl->claimCreditLost(), 0u);
     r.pass(cap.fn());   // ONE owner duty pass rolls the claim back
-    EXPECT_EQ(r.impl->claimCreditLost(), 1u);
+    EXPECT_EQ(r.impl->claimCreditLost(), 0u) << "#656: a plain claim held no queue credit";
     EXPECT_EQ(r.impl->claimsAbandoned(), 0u) << "rolled back, not abandoned";
     EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("x")), SendResult::Ok) << "no longer wedged";
     r.pass(cap.fn());
@@ -1252,10 +1252,61 @@ TEST(ProducerClaimRegression, InvokerBatchClaimDestroyedOffOwnerIsReleasedRegres
     t.join();
     EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("x")), SendResult::ClaimHeld);
     r.pass(cap.fn());
-    EXPECT_EQ(r.impl->claimCreditLost(), 1u);
+    EXPECT_EQ(r.impl->claimCreditLost(), 0u) << "#656: a plain claim held no queue credit";
     EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("x")), SendResult::Ok);
     r.pass(cap.fn());
     EXPECT_EQ(cap.values(), (std::vector<std::string>{"A", "x"}));
+    EXPECT_FALSE(anyByteIs(cap.values(), static_cast<char>(0xAB)));
+}
+
+// #656 (C19 fix round): only a claim that held cq / bq credit loses credit.  A plain claim (no queue) aborted off the
+// owner thread is settled by the owner's next duty pass and counts nothing; a cq-credit claim counts exactly once.
+TEST(ProducerClaimRegression, InvokerPlainClaimAbortedOffOwnerCountsNoCreditLostRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    DirectRig r(cfg);
+    FrameCapture cap;
+    r.pass(cap.fn());
+    rc::Claim c = r.p.tryClaim(kTopic, Key(uint64_t{1}), 16);
+    ASSERT_TRUE(c);
+    std::memset(c.buffer().data(), 0xAB, c.buffer().size());
+    std::thread t([&] { c.abort(); });
+    t.join();
+    r.pass(cap.fn());   // ONE owner duty pass settles the claim
+    EXPECT_EQ(r.impl->claimCreditLost(), 0u);
+    EXPECT_EQ(r.impl->ringForeignMessages(), 0u);
+    rc::Claim c2 = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4);
+    ASSERT_TRUE(c2) << "still held: " << static_cast<int>(c2.result());
+    fill(c2.buffer(), "NEW!");
+    ASSERT_TRUE(c2.commit());
+    r.pass(cap.fn());
+    EXPECT_EQ(cap.values(), std::vector<std::string>{"NEW!"});
+    EXPECT_FALSE(anyByteIs(cap.values(), static_cast<char>(0xAB))) << "the aborted span is never sent";
+}
+
+TEST(ProducerClaimRegression, InvokerCreditClaimAbortedOffOwnerCountsOneCreditLostRegression) {
+    std::unique_ptr<rc::Client> client = std::make_unique<rc::Client>(regCfg());
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    auto* impl = new ProducerImpl(cfg, 4 * 1024);
+    Producer p(impl);
+    ProducerImpl::Hooks h;
+    h.ctx = client.get();
+    impl->setHooks(h);
+    impl->enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr});
+    rc::Completions cq(*client, smallCq());
+    FrameCapture cap;
+    impl->drainRing(kNow, 16);
+    impl->flushBatches(kNow, 42, cap.fn());
+    rc::Claim c = p.tryClaim(kTopic, Key(uint64_t{1}), 8, cq, 1);
+    ASSERT_TRUE(c) << static_cast<int>(c.result());
+    std::memset(c.buffer().data(), 0xAB, c.buffer().size());
+    std::thread t([&] { c.abort(); });
+    t.join();
+    impl->drainRing(kNow, 16);
+    impl->flushBatches(kNow, 42, cap.fn());
+    EXPECT_EQ(impl->claimCreditLost(), 1u);
+    EXPECT_EQ(impl->ringForeignMessages(), 0u);
     EXPECT_FALSE(anyByteIs(cap.values(), static_cast<char>(0xAB)));
 }
 
@@ -1285,7 +1336,7 @@ TEST(ProducerClaimRegression, InvokerClaimRefusedAndDestroyedOffOwnerSettlesInEi
         EXPECT_EQ(L.times(1), 1);
         if (!destroyFirst) destroy();
         r.pass(cap.fn());   // ONE owner duty pass settles the abandoned claim
-        EXPECT_EQ(r.impl->claimCreditLost(), 1u);
+        EXPECT_EQ(r.impl->claimCreditLost(), 0u) << "#656: a plain claim held no queue credit";
         EXPECT_EQ(r.impl->ringForeignMessages(), 0u);
         rc::Claim c2 = r.p.tryClaim(kTopic, Key(uint64_t{1}), 4);
         ASSERT_TRUE(c2) << "still held: " << static_cast<int>(c2.result());
@@ -1324,7 +1375,7 @@ TEST(ProducerClaimRegression, InvokerTier2DiscardsAndAClaimAbortShareOneDutyPass
     EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("x")), SendResult::ClaimHeld);
     EXPECT_EQ(r.impl->drainRing(kNow, 16), 7) << "six discards and one claim abort";
     EXPECT_EQ(r.impl->ringForeignMessages(), 0u);
-    EXPECT_EQ(r.impl->claimCreditLost(), 1u);
+    EXPECT_EQ(r.impl->claimCreditLost(), 0u) << "#656: a plain claim held no queue credit";
     EXPECT_EQ(r.impl->tier2FreeCount(), 6u) << "every slot came back";
     EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("x")), SendResult::Ok);
     r.impl->flushBatches(kNow, 42, cap.fn());

@@ -40,7 +40,7 @@ void ClaimCredit::abort(const ClaimOpen& o) noexcept {
         giveBack(o);
         return;
     }
-    o.impl->abortClaimOffOwner(o.token);  // #322: flagged, never silent; owner state untouched
+    o.impl->abortClaimOffOwner(o.token, o.cq != nullptr || o.bq != nullptr);  // #322: flagged, never silent; owner state untouched
 }
 
 bool ClaimCredit::abandoned(const ClaimOpen& o) noexcept { return o.impl->claimAbandoned(o.token); }

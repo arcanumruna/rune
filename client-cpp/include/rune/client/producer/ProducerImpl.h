@@ -84,7 +84,7 @@ inline constexpr int32_t kMsgClaimBatch  = 4; // Phase 2b B: claimBatch — n re
 inline constexpr int32_t kMsgTxnControl  = 5; // Phase 2b F: a transaction control op, FIFO with the records before it
 inline constexpr int32_t kMsgTier2Discard  = 6; // #341: a Tier-2 slot whose builder died off the batch thread
 inline constexpr int32_t kMsgClaimCreditLost = 7; // #322: a credit claim aborted off its queue's owner thread
-inline constexpr int32_t kMsgDirectClaimAbort = 8; // #656: an Invoker claim aborted / destroyed off its owner thread: the owner rolls it back (payload: the claim's gen, 8 bytes LE)
+inline constexpr int32_t kMsgDirectClaimAbort = 8; // #656: an Invoker claim aborted / destroyed off its owner thread: the owner rolls it back (payload: the claim's gen, 8 bytes LE, then one byte: 1 = the claim held cq / bq credit)
 
 // TXN_CONTROL layout (kMsgTxnControl payload, little endian, Phase 2b F Task 8):
 //   [0]      kind          : u8  (TxnControl::Kind)
@@ -698,9 +698,9 @@ public:
     }
     /// #322: abort a claim whose credit cannot be returned on this thread.  Thread mode: published as
     /// kMsgClaimCreditLost (the duty side counts it, completes nothing).  Direct mode (#656): on the owner thread
-    /// the claim is rolled back at once (its queue credit is lost, counted); off it, kMsgDirectClaimAbort is
+    /// the claim is rolled back at once (a claim that held queue credit loses it: counted; heldCredit false counts nothing); off it, kMsgDirectClaimAbort is
     /// published and the owner rolls the claim back on its next duty pass (only a full / closed ring logs).
-    void abortClaimOffOwner(int64_t token) noexcept;
+    void abortClaimOffOwner(int64_t token, bool heldCredit) noexcept;
     /// Phase 2b B (owner thread): Invoker claims abandoned while open - their
     /// partition's builder was failed / the producer closed; commit() returned false.
     [[nodiscard]] uint64_t claimsAbandoned() const noexcept { return claimsAbandoned_; }
@@ -1797,6 +1797,8 @@ private:
     void failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st, uint16_t errorCode = 0);
     /// Fails the never-sent builder records of `ps` (handles + one BatchAck).
     void failBuilder_(PartitionState& ps, OpStatus st, uint16_t errorCode = 0);
+    /// #689: fail (never send) every Tier-2 batch queued on ps.
+    void failQueuedTier2_(PartitionState& ps, OpStatus st, uint16_t errorCode) noexcept;
     /// Draining: every accepted record completed and the ring consumed to the
     /// closed tail.
     [[nodiscard]] bool fullyDrained_() const noexcept;

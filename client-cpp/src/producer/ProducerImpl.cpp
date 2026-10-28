@@ -1637,11 +1637,11 @@ int ProducerImpl::drainDirectRing_(int messageLimit) noexcept {
             const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
             if (msgTypeId == kMsgTier2Discard && len >= kT2TokenSize) {
                 t2Return_(static_cast<uint32_t>(readLE64(p, 0)), 2);
-            } else if (msgTypeId == kMsgDirectClaimAbort && len >= 8) {
+            } else if (msgTypeId == kMsgDirectClaimAbort && len >= 9) {
                 // The ring's release / acquire orders the writer's span writes before this rollback; a stale gen is a
                 // no-op, an abandoned claim is settled.
                 abortDirectClaim_(static_cast<uint64_t>(readLE64(p, 0)));
-                noteClaimCreditLost_();
+                if (p[8] != 0) noteClaimCreditLost_();   // #656: only a claim that held cq / bq credit lost any
             } else {
                 ++ringForeign_;   // any other type in a Direct ring is a bug
             }
@@ -2691,7 +2691,11 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         }
         releaseResolved_(ps, *b);
         reclaimAckRing_(ps);
-        if (isPartitionRefusal_(static_cast<uint16_t>(ec))) failBuilder_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));   // #689
+        if (isPartitionRefusal_(static_cast<uint16_t>(ec))) {
+            failBuilder_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));   // #689
+            // #689: the queued Tier-2 batches go too - none is sent to a refused partition
+            failQueuedTier2_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));
+        }
         return;
     }
     // D: rejected, but an earlier attempt may be stored — outcome unknown (44..47 after a retransmit too).
@@ -2703,7 +2707,11 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
     markUnresolved_(ps, *b);
     releaseResolved_(ps, *b);
     reclaimAckRing_(ps);
-    if (isPartitionRefusal_(static_cast<uint16_t>(ec))) failBuilder_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));   // #689
+    if (isPartitionRefusal_(static_cast<uint16_t>(ec))) {
+        failBuilder_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));   // #689
+        // #689: the queued Tier-2 batches go too - none is sent to a refused partition
+        failQueuedTier2_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));
+    }
 }
 
 void ProducerImpl::parkOutOfOrder_(PartitionState& ps, InFlightBatch& b) noexcept {
@@ -3023,6 +3031,17 @@ void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st,
     markUnresolved_(ps, b);  // D: outcome at the broker unknown
     releaseResolved_(ps, b);
     reclaimAckRing_(ps);
+}
+
+void ProducerImpl::failQueuedTier2_(PartitionState& ps, OpStatus st, uint16_t errorCode) noexcept {
+    while (ps.hasTier2()) {
+        const uint32_t slot = t2Pop_(ps);
+        const uint64_t h  = tier2Pool_[slot].ackHandle;
+        const int32_t  rc = tier2Pool_[slot].recordCount;
+        t2Return_(slot);
+        emitUnsentBatchAck_(ps.topicId, ps.partition, rc, st, 1, errorCode);
+        completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, errorCode);
+    }
 }
 
 void ProducerImpl::failBuilder_(PartitionState& ps, OpStatus st, uint16_t errorCode) {
@@ -3456,6 +3475,7 @@ void ProducerImpl::failRoutedBroker(RouteFailFn pred, void* ctx) noexcept {
             reclaimAckRing_(ps);
         });
         failBuilder_(ps, OpStatus::BrokerError, errorCode);
+        failQueuedTier2_(ps, OpStatus::BrokerError, errorCode);   // #689: same bug class
         ps.resendParked = false;
         ps.laneWait     = false;
     }
@@ -3499,14 +3519,7 @@ void ProducerImpl::failAllPending(OpStatus st, uint16_t errorCode) noexcept {
         PartitionState& ps = *partitions_[i];
         ps.inflight.forEachLive([&](InFlightBatch& b) { failBatch_(ps, b, st, errorCode); });
         failBuilder_(ps, st, errorCode);
-        while (ps.hasTier2()) {
-            const uint32_t slot = t2Pop_(ps);
-            const uint64_t h  = tier2Pool_[slot].ackHandle;
-            const int32_t  rc = tier2Pool_[slot].recordCount;
-            t2Return_(slot);
-            emitUnsentBatchAck_(ps.topicId, ps.partition, rc, st, 1, errorCode);
-            completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, errorCode);
-        }
+        failQueuedTier2_(ps, st, errorCode);
         ps.builderBytes   = 0;
         ps.batchStartNs   = 0;
         ps.flushRequested = false;
@@ -3881,18 +3894,19 @@ void ProducerImpl::abortClaim(int64_t token) noexcept {
     }
 }
 
-void ProducerImpl::abortClaimOffOwner(int64_t token) noexcept {
+void ProducerImpl::abortClaimOffOwner(int64_t token, bool heldCredit) noexcept {
     if (mode_ == IngressMode::Direct) {
         // #656: the owner thread (only the cq / bq owner differed) rolls back at once; the queue credit cannot be
         // returned off its owner (Thread mode's kMsgClaimCreditLost accounting).  Off the owner: the owner does it
         // on its next duty pass.
         if (std::this_thread::get_id() == dutyThreadId_) {
             abortDirectClaim_(static_cast<uint64_t>(token));
-            noteClaimCreditLost_();
+            if (heldCredit) noteClaimCreditLost_();   // #656: a plain claim held no queue credit
             return;
         }
-        uint8_t tok[8];
+        uint8_t tok[9];
         writeLE64(tok, 0, token);
+        tok[8] = heldCredit ? 1 : 0;
         if (!writeToRing(kMsgDirectClaimAbort, tok, sizeof tok)) {
             std::fprintf(stderr, "rune producer: an Invoker claim was settled off its owner thread and the producer "
                                  "ring could not take the abort; it stays held until the producer closes\n");
@@ -3900,7 +3914,11 @@ void ProducerImpl::abortClaimOffOwner(int64_t token) noexcept {
         return;
     }
     try {
-        ring_.abortAs(static_cast<aeron::util::index_t>(token), kMsgClaimCreditLost);
+        if (heldCredit) {
+            ring_.abortAs(static_cast<aeron::util::index_t>(token), kMsgClaimCreditLost);
+        } else {
+            ring_.abort(static_cast<aeron::util::index_t>(token));   // #656: no credit held: plain padding
+        }
     } catch (...) {
         // Already released by the close-drain unblock: nothing left to report.
     }
