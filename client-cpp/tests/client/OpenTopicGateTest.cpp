@@ -77,6 +77,7 @@ struct GateGateway {
 
     bool replyConnectOK      = true;
     bool replyGetTopicSchema = true;
+    int  getTopicSchemaSeen  = 0;   // GetTopicSchema requests that reached the gateway (a skipped probe sends none)
 
     int32_t              getTopicId   = 0x40000001;
     uint16_t             getVersion   = 1;
@@ -183,6 +184,7 @@ struct GateGateway {
 
         case rcc::TemplateId::GetTopicSchema: {
             auto opt = rpc::GetTopicSchema::decode(buf, len);
+            if (opt) ++getTopicSchemaSeen;
             if (!opt || !replyGetTopicSchema) break;
 
             rpc::TopicSchemaResponse resp;
@@ -584,11 +586,157 @@ TEST(OpenTopicGate, StaleFingerprintStillThrows) {
     h.gw->getVersion   = 2;
     h.gw->getBlob      = serialize(makeCharsV2Descriptor());
     h.gw->getErrorCode = 0;
+    h.gw->unknownFingerprintErrorCode = 7;   // Issue #22: the real broker's UnknownTopic
 
     GateGatewayPump pump(*h.gw);
-    EXPECT_THROW((void)h.client->openTopicAndWait<StubV1>("characters"), std::runtime_error)
-        << "openTopicAndWait must throw when the broker has no version "
-           "matching T::kFingerprint";
+    try {
+        (void)h.client->openTopicAndWait<StubV1>("characters");
+        ADD_FAILURE() << "openTopicAndWait must throw when the broker has no version matching T::kFingerprint";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("stale"), std::string::npos) << e.what();
+    }
+}
+
+namespace {
+// Issue #22: the what() of openTopicAndWait<StubV1> ("" and an ADD_FAILURE when nothing is thrown).
+template <class Open>
+std::string openFailure(Open&& open) {
+    try {
+        open();
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+    ADD_FAILURE() << "openTopicAndWait did not throw";
+    return {};
+}
+}  // namespace
+
+// Issue #22: UnknownTopic for the fingerprint is ambiguous; a topic that does not exist is reported as missing,
+// never as a stale generated type.
+TEST(OpenTopicGateRegression, AnUndefinedTopicIsReportedAsMissingNotStaleRegression) {
+    GateHarness h(1346, 1347);
+    h.build();
+    h.connectAndWait();
+    h.gw->getErrorCode                = 7;
+    h.gw->unknownFingerprintErrorCode = 7;
+    h.gw->getBlob                     = {};
+    GateGatewayPump pump(*h.gw);
+    const std::string msg = openFailure([&] { (void)h.client->openTopicAndWait<StubV1>("nope"); });
+    EXPECT_NE(msg.find("does not exist"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("stale"), std::string::npos) << msg;
+}
+
+// Issue #22: the topic exists but has no version with this fingerprint: still the stale-type message, on both overloads.
+TEST(OpenTopicGateRegression, AnUnknownFingerprintOfAnExistingTopicIsStillStaleRegression) {
+    GateHarness h(1348, 1349);
+    h.build();
+    h.connectAndWait();
+    h.gw->getTopicId                  = 0x40000002;
+    h.gw->getVersion                  = 2;
+    h.gw->getBlob                     = serialize(makeCharsV2Descriptor());
+    h.gw->getErrorCode                = 0;
+    h.gw->unknownFingerprintErrorCode = 7;
+    GateGatewayPump pump(*h.gw);
+    const std::string owning = openFailure([&] { (void)h.client->openTopicAndWait<StubV1>("characters"); });
+    EXPECT_NE(owning.find("stale"), std::string::npos) << owning;
+    EXPECT_EQ(owning.find("does not exist"), std::string::npos) << owning;
+    rune::client::Producer shared = h.client->producer();
+    const std::string borrowed = openFailure([&] { (void)h.client->openTopicAndWait<StubV1>("characters", shared); });
+    EXPECT_NE(borrowed.find("stale"), std::string::npos) << borrowed;
+    h.gw->getErrorCode = 7;
+    h.gw->getBlob      = {};
+    const std::string missing = openFailure([&] { (void)h.client->openTopicAndWait<StubV1>("nope", shared); });
+    EXPECT_NE(missing.find("does not exist"), std::string::npos) << missing;
+    EXPECT_EQ(missing.find("stale"), std::string::npos) << missing;
+}
+
+// Issue #22: any other broker error is named, not reported as a stale type.
+TEST(OpenTopicGateRegression, AnotherBrokerErrorIsNamedRegression) {
+    GateHarness h(1350, 1351);
+    h.build();
+    h.connectAndWait();
+    h.gw->unknownFingerprintErrorCode = 45;
+    GateGatewayPump pump(*h.gw);
+    const std::string msg = openFailure([&] { (void)h.client->openTopicAndWait<StubV1>("characters"); });
+    EXPECT_NE(msg.find("error 45"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("NotAuthorized"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("stale"), std::string::npos) << msg;
+}
+
+namespace {
+// C7 adversarial review (#22): the what() of a direct throwOpenTopicFailure call.
+std::string openFailureText(Client& c, std::string_view name, uint16_t code, std::chrono::nanoseconds left) {
+    try {
+        c.throwOpenTopicFailure(name, code, left);
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+    ADD_FAILURE() << "throwOpenTopicFailure returned";
+    return {};
+}
+}  // namespace
+
+// #22 budget bound: with nothing left of the caller's budget the UnknownTopic probe is NOT sent (a sent one would be
+// served and say "stale"): the plain code is named.  With budget left the same call probes.
+TEST(OpenTopicGateRegression, OpenFailureWithNoBudgetLeftSkipsTheProbeAdversarialRegression) {
+    GateHarness h(1352, 1353);
+    h.build();
+    h.connectAndWait();
+    h.gw->getBlob      = serialize(makeCharsV2Descriptor());
+    h.gw->getErrorCode = 0;
+    GateGatewayPump pump(*h.gw);
+    const int before = h.gw->getTopicSchemaSeen;
+    for (const std::chrono::nanoseconds left :
+         {std::chrono::nanoseconds{0}, std::chrono::nanoseconds{-1}, std::chrono::nanoseconds{-10s}}) {
+        const std::string msg = openFailureText(*h.client, "characters", 7, left);
+        EXPECT_NE(msg.find("refused 'characters' (error 7 UnknownTopic)"), std::string::npos) << left.count() << ": " << msg;
+        EXPECT_EQ(msg.find("stale"), std::string::npos) << msg;
+        EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
+    }
+    EXPECT_EQ(h.gw->getTopicSchemaSeen, before) << "no probe without budget";
+    EXPECT_NE(openFailureText(*h.client, "characters", 7, 5s).find("stale"), std::string::npos);
+    EXPECT_EQ(h.gw->getTopicSchemaSeen, before + 1);
+}
+
+// #22: a probe that is never answered proves nothing - the original code is named (never "does not exist" or
+// "stale"), within the remaining budget.
+TEST(OpenTopicGateRegression, OpenFailureProbeTimeoutNamesTheOriginalCodeAdversarialRegression) {
+    GateHarness h(1354, 1355);
+    h.build();
+    h.connectAndWait();
+    h.gw->replyGetTopicSchema = false;
+    GateGatewayPump pump(*h.gw);
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string msg = openFailureText(*h.client, "characters", 7, 200ms);
+    const auto took = std::chrono::steady_clock::now() - t0;
+    EXPECT_NE(msg.find("(error 7 UnknownTopic)"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("stale"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
+    EXPECT_LT(took, 3s) << "bounded by the remaining budget";
+}
+
+// #22: the probe itself refused names the PROBE's code (an auth name when it has one, the bare number for an unknown
+// code); a non-UnknownTopic code is never probed at all.
+TEST(OpenTopicGateRegression, OpenFailureProbeRefusalAndOtherCodesAreNamedAdversarialRegression) {
+    GateHarness h(1356, 1357);
+    h.build();
+    h.connectAndWait();
+    GateGatewayPump pump(*h.gw);
+    h.gw->getErrorCode = 45;
+    std::string msg = openFailureText(*h.client, "characters", 7, 5s);
+    EXPECT_NE(msg.find("(error 45 NotAuthorized)"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
+    h.gw->getErrorCode = 0x7FFF;
+    msg = openFailureText(*h.client, "characters", 7, 5s);
+    EXPECT_NE(msg.find("(error 32767)"), std::string::npos) << msg;
+    h.gw->getErrorCode = 0;   // a probe WOULD be served: only skipping it gives the plain code
+    const int before = h.gw->getTopicSchemaSeen;
+    for (const uint16_t code : {uint16_t{1}, uint16_t{6}, uint16_t{8}, uint16_t{46}, uint16_t{0xFFFF}}) {
+        msg = openFailureText(*h.client, "characters", code, 5s);
+        EXPECT_NE(msg.find("(error " + std::to_string(code)), std::string::npos) << code << ": " << msg;
+        EXPECT_EQ(msg.find("stale"), std::string::npos) << code << ": " << msg;
+    }
+    EXPECT_EQ(h.gw->getTopicSchemaSeen, before) << "only UnknownTopic is probed";
 }
 
 // ===========================================================================
@@ -883,6 +1031,144 @@ TEST(OpenTopicGate, LineageUnknownFingerprintStillThrowsRegression) {
     EXPECT_THROW((void)h.client->openTopicAndWait<StubLineageUnknown>("characters"), std::runtime_error)
         << "openTopicAndWait must throw when the broker's full lineage table "
            "still has no version matching T::kFingerprint";
+}
+
+// ===========================================================================
+// Issue #435: a lineage request an OLD broker answers UnknownTopic (it predates lineage) must not read as "the topic
+// does not exist" when the latest schema of that topic is served.
+// ===========================================================================
+TEST(OpenTopicGateRegression, LineageAgainstAnOldBrokerNamesTheVersionSkewRegression) {
+    GateHarness h(1330, 1331);
+    h.build();
+    h.connectAndWait();
+    h.gw->getTopicId                  = 0x40000011;
+    h.gw->getVersion                  = 1;
+    h.gw->getBlob                     = serialize(makeCharsDescriptor());
+    h.gw->getErrorCode                = 0;   // the latest schema IS served
+    h.gw->unknownFingerprintErrorCode = 7;   // ... but the lineage fingerprint is "unknown topic"
+    GateGatewayPump pump(*h.gw);
+    const std::string msg = h.client->lineageFailure("t", 7, 5s);
+    EXPECT_NE(msg.find("does not serve the schema lineage"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("upgrade"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
+}
+
+TEST(OpenTopicGateRegression, LineageOfAMissingTopicSaysItDoesNotExistRegression) {
+    GateHarness h(1332, 1333);
+    h.build();
+    h.connectAndWait();
+    h.gw->getErrorCode                = 7;
+    h.gw->unknownFingerprintErrorCode = 7;
+    GateGatewayPump pump(*h.gw);
+    const std::string msg = h.client->lineageFailure("t", 7, 5s);
+    EXPECT_NE(msg.find("topic 't' does not exist"), std::string::npos) << msg;
+    // Any other code is named as is, with no probe.
+    const std::string other = h.client->lineageFailure("t", 45, 5s);
+    EXPECT_NE(other.find("did not serve the schema lineage of 't' (NotAuthorized 45)"), std::string::npos) << other;
+}
+
+// Adversarial review of C8 (#435): the probe that disambiguates UnknownTopic must never turn a probe timeout or a
+// refused probe into "does not exist" (or "upgrade"), and must end within its own timeout.
+TEST(OpenTopicGateRegression, LineageProbeTimeoutFallsBackToThePlainCodeAdversarialRegression) {
+    GateHarness h(1334, 1335);
+    h.build();
+    h.connectAndWait();
+    h.gw->replyGetTopicSchema = false;   // the broker never answers the probe
+    GateGatewayPump pump(*h.gw);
+    const auto t0  = std::chrono::steady_clock::now();
+    const std::string msg = h.client->lineageFailure("t", 7, 300ms);
+    const auto took = std::chrono::steady_clock::now() - t0;
+    EXPECT_NE(msg.find("did not serve the schema lineage of 't' (UnknownTopic 7)"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("does not exist"), std::string::npos) << "an unanswered probe proves nothing: " << msg;
+    EXPECT_EQ(msg.find("upgrade"), std::string::npos) << msg;
+    EXPECT_LT(took, 5s) << "the probe is bounded by its timeout";
+}
+
+TEST(OpenTopicGateRegression, LineageProbeRefusedNamesTheProbeCodeAdversarialRegression) {
+    GateHarness h(1336, 1337);
+    h.build();
+    h.connectAndWait();
+    h.gw->unknownFingerprintErrorCode = 7;
+    GateGatewayPump pump(*h.gw);
+    const std::map<uint16_t, std::string> names{{45, "NotAuthorized"}, {1, "ProtocolVersion"}, {0x7FFF, "UnknownErrorCode"}};
+    for (const uint16_t probeCode : {uint16_t{45}, uint16_t{1}, uint16_t{0x7FFF}}) {
+        h.gw->getErrorCode = probeCode;
+        const std::string msg = h.client->lineageFailure("t", 7, 5s);
+        EXPECT_NE(msg.find("(" + names.at(probeCode) + " " + std::to_string(probeCode) + ")"), std::string::npos) << probeCode << ": " << msg;
+        EXPECT_EQ(msg.find("does not exist"), std::string::npos) << probeCode << ": " << msg;
+        EXPECT_EQ(msg.find("upgrade"), std::string::npos) << probeCode << ": " << msg;
+    }
+}
+
+TEST(OpenTopicGateRegression, LineageFailureNamesComeFromAuthErrorNameRegression) {
+    // #225: the 44..48 names are authErrorName's (the CLI's source), never a third copy.
+    GateHarness h(1358, 1359);
+    h.build();
+    h.connectAndWait();
+    for (uint16_t code = 44; code <= 48; ++code) {
+        const char* want = rune::client::authErrorName(code);
+        ASSERT_NE(want, nullptr) << code;
+        ASSERT_NE(std::string_view(want), "") << code;
+        const std::string msg = h.client->lineageFailure("t", code, 5s);
+        EXPECT_NE(msg.find(std::string("(") + want + " " + std::to_string(code) + ")"), std::string::npos) << code << ": " << msg;
+    }
+}
+
+// C8 fix round (d): the probe gets what is LEFT of the caller's budget, never a second full wait; with nothing left
+// it is not sent at all and the plain code text is returned.
+TEST(OpenTopicGateRegression, LineageProbeIsSkippedWhenTheBudgetIsSpentRegression) {
+    GateHarness h(1338, 1339);
+    h.build();
+    h.connectAndWait();
+    h.gw->getErrorCode                = 0;   // a sent probe WOULD be served: skipping it is the only way to get the plain text
+    h.gw->unknownFingerprintErrorCode = 7;
+    GateGatewayPump pump(*h.gw);
+    const int before = h.gw->getTopicSchemaSeen;
+    for (const std::chrono::nanoseconds left : {std::chrono::nanoseconds{0}, std::chrono::nanoseconds{-1}, std::chrono::nanoseconds{-10s}}) {
+        const std::string msg = h.client->lineageFailure("t", 7, left);
+        EXPECT_NE(msg.find("did not serve the schema lineage of 't' (UnknownTopic 7)"), std::string::npos)
+            << left.count() << ": " << msg;
+        EXPECT_EQ(msg.find("upgrade"), std::string::npos) << left.count() << ": " << msg;
+    }
+    EXPECT_EQ(h.gw->getTopicSchemaSeen, before) << "no probe was sent with no budget left";
+    // With budget left the very same call probes.
+    EXPECT_NE(h.client->lineageFailure("t", 7, 5s).find("upgrade"), std::string::npos);
+    EXPECT_GT(h.gw->getTopicSchemaSeen, before);
+}
+
+TEST(OpenTopicGateRegression, LineageProbeWaitsAtMostTheRemainingBudgetRegression) {
+    GateHarness h(1340, 1341);
+    h.build();
+    h.connectAndWait();
+    h.gw->replyGetTopicSchema = false;   // the probe is never answered
+    GateGatewayPump pump(*h.gw);
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string msg = h.client->lineageFailure("t", 7, 200ms);
+    const auto took = std::chrono::steady_clock::now() - t0;
+    EXPECT_NE(msg.find("(UnknownTopic 7)"), std::string::npos) << msg;
+    EXPECT_LT(took, 3s) << "bounded by the remaining budget (200 ms), nowhere near a second full CLI wait";
+}
+
+// C8 fix round (g): a patch naming a bit outside kNamespaceFullMask is refused up front (std::invalid_argument, like the
+// empty patch) - before anything is sent, so no broker (not even a connect) is needed.
+TEST(OpenTopicGateRegression, NamespaceLimitsPatchWithReservedBitsIsRefusedUpFrontRegression) {
+    GateHarness h(1342, 1343);
+    h.build();   // deliberately NOT connected: the check runs before any send
+    for (std::size_t byte = 0; byte < rune::client::NamespaceLimitsPatch{}.present.size(); ++byte) {
+        const uint8_t reserved = static_cast<uint8_t>(~rune::client::kNamespaceFullMask[byte]);
+        for (unsigned bit = 0; bit < 8; ++bit) {
+            if ((reserved & (1u << bit)) == 0) continue;
+            rune::client::NamespaceLimitsPatch patch;
+            ASSERT_TRUE(patch.set(0, 5));   // a valid limit as well: the reserved bit alone must refuse it
+            patch.present[byte] = static_cast<uint8_t>(patch.present[byte] | (1u << bit));
+            EXPECT_THROW((void)h.client->setNamespaceLimits("a", patch, 50ms), std::invalid_argument)
+                << "byte " << byte << " bit " << bit;
+            rune::client::NamespaceLimitsPatch only;   // and no valid limit at all
+            only.present[byte] = static_cast<uint8_t>(1u << bit);
+            EXPECT_THROW((void)h.client->setNamespaceLimits("a", only, 50ms), std::invalid_argument)
+                << "byte " << byte << " bit " << bit;
+        }
+    }
 }
 
 // ===========================================================================

@@ -86,6 +86,8 @@ std::string endpointOf(const ParsedArgs& a) {
 }
 
 #ifdef RUNE_CLI_LIVE_ENABLED
+constexpr uint16_t kUnknownTopicCode = 7;   // wire ErrorCode::UnknownTopic: a namespace that does not exist
+
 int refused(std::ostream& err, std::string_view what, const rcl::DdlResult& r) {
     err << "rune namespace " << what << ": " << engine::brokerFailure(r.errorCode, r.detail) << "\n";
     return 1;
@@ -170,33 +172,45 @@ int cmdLimits(std::vector<std::string> args, std::ostream& out, std::ostream& er
         return 2;
     }
     // Validate the assignments before connecting (a typo never reaches the broker).
-    if (auto probe = applyNamespaceLimitSets(rp::NamespaceLimits{}, sets); !probe)
-        return namespaceUsageError("limits", err, probe.error());
+    const auto patch = namespaceLimitSetsPatch(sets);
+    if (!patch) return namespaceUsageError("limits", err, patch.error());
     const std::string endpoint = endpointOf(a);
     if (endpoint.empty()) return namespaceUsageError("limits", err, "--broker host:port is required");
 #ifdef RUNE_CLI_LIVE_ENABLED
     engine::LiveBroker broker;
     if (!broker.open(engine::liveOptionsOf(a, endpoint, false), err)) return 1;
     try {
-        const auto all = broker.client().listNamespaces(broker.ddlTimeout());
-        if (!all) return refused(err, "limits", all.error());
-        const rpc::NamespaceInfo* ns = nullptr;
-        for (const auto& n : *all)
-            if (n.name == name) ns = &n;
-        if (ns == nullptr) {
+        const auto findIn = [&](const std::vector<rpc::NamespaceInfo>& v) -> const rpc::NamespaceInfo* {
+            for (const auto& n : v)
+                if (n.name == name) return &n;
+            return nullptr;
+        };
+        const auto noNamespace = [&] {
             err << "rune namespace limits: no namespace '" << name << "'\n";
             return 1;
-        }
+        };
         if (sets.empty()) {
+            const auto all = broker.client().listNamespaces(broker.ddlTimeout());
+            if (!all) return refused(err, "limits", all.error());
+            const rpc::NamespaceInfo* ns = findIn(*all);
+            if (ns == nullptr) return noNamespace();
             out << formatNamespaceLimits(ns->limits);
             return 0;
         }
-        // Read-modify-write: the named limits change, every other one keeps its current value.
-        const auto next = applyNamespaceLimitSets(ns->limits, sets);
-        if (!next) return namespaceUsageError("limits", err, next.error());
-        const auto r = broker.client().setNamespaceLimits(name, *next, broker.ddlTimeout());
-        if (!r) return refused(err, "limits", r.error());
-        out << "updated limits of namespace " << name << "\n" << formatNamespaceLimits(*next);
+        // Issue #641: send only the named limits; the broker merges them onto the CURRENT record, so a concurrent
+        // change to another limit survives.  No pre-list: a caller who may not see the namespace still gets the
+        // broker's own refusal (NotAuthorized names itself).  The result is re-read to print what is stored now.
+        const auto r = broker.client().setNamespaceLimits(name, *patch, broker.ddlTimeout());
+        if (!r) {
+            if (r.error().errorCode == kUnknownTopicCode) return noNamespace();
+            return refused(err, "limits", r.error());
+        }
+        const auto after = broker.client().listNamespaces(broker.ddlTimeout());
+        if (!after) return refused(err, "limits", after.error());
+        const rpc::NamespaceInfo* now = findIn(*after);
+        if (now == nullptr) return noNamespace();   // dropped between the patch and the re-read
+        out << "updated limits of namespace " << name << "\n";
+        out << formatNamespaceLimits(now->limits);
         return 0;
     } catch (const std::exception& e) {
         err << "rune: " << e.what() << "\n";
@@ -369,9 +383,8 @@ parseNamespaceLimitFlags(const std::vector<std::string>& args, std::vector<std::
     return patch;
 }
 
-std::expected<rp::NamespaceLimits, std::string>
-applyNamespaceLimitSets(rp::NamespaceLimits base, const std::vector<std::string>& sets) {
-    std::array<bool, rcl::kNamespaceLimitFields.size()> seen{};
+std::expected<rcl::NamespaceLimitsPatch, std::string> namespaceLimitSetsPatch(const std::vector<std::string>& sets) {
+    rcl::NamespaceLimitsPatch patch;
     for (const std::string& s : sets) {
         const auto eq = s.find('=');
         if (eq == std::string::npos || eq == 0 || eq + 1 == s.size())
@@ -379,12 +392,20 @@ applyNamespaceLimitSets(rp::NamespaceLimits base, const std::vector<std::string>
         const std::string_view key = std::string_view(s).substr(0, eq);
         const auto idx = rcl::namespaceLimitIndex(key);
         if (!idx) return std::unexpected("--set '" + s + "': unknown limit '" + std::string(key) + "'");
-        if (seen[*idx]) return std::unexpected("--set: '" + std::string(key) + "' given twice");
-        seen[*idx] = true;
+        if (patch.has(*idx)) return std::unexpected("--set: '" + std::string(key) + "' given twice");
         const auto v = parseU64(std::string_view(s).substr(eq + 1));
-        if (!v || !rcl::namespaceLimitSet(base, *idx, *v))
+        if (!v || !patch.set(*idx, *v))
             return std::unexpected("--set '" + s + "': not a valid value (a non-negative integer that fits the limit)");
     }
+    return patch;
+}
+
+std::expected<rp::NamespaceLimits, std::string>
+applyNamespaceLimitSets(rp::NamespaceLimits base, const std::vector<std::string>& sets) {
+    const auto patch = namespaceLimitSetsPatch(sets);
+    if (!patch) return std::unexpected(patch.error());
+    for (std::size_t i = 0; i < rcl::kNamespaceLimitFields.size(); ++i)
+        if (patch->has(i)) (void)rcl::namespaceLimitSet(base, i, rcl::namespaceLimitGet(patch->values, i));
     return base;
 }
 

@@ -196,6 +196,46 @@ TEST(ProducerTxnApiRegression, SendOutsideATransactionIsRefusedRegression) {
     EXPECT_EQ(p.trySend(kTopic, Key(uint64_t{1}), bytes("v")), SendResult::Ok);
 }
 
+// #339: the gate is decided BEFORE any credit is reserved.  Observable: with the completion queue (or the batch-ack
+// queue) FULL, a send outside a transaction still reports NotInTransaction - not QueueFull from a reservation it
+// then had to give back - and the queue's credit count never moves.
+TEST(ProducerTxnApiRegression, NotInTransactionRefusalReservesNoCreditRegression) {
+    constexpr uint32_t kUnit = rc::producer::kAckRecordBytes;
+    Rig r(cfgOf(Acks::All, "tx-credit"));
+    Producer& p = r.p;
+    rc::CompletionsConfig small;
+    small.capacityBytes  = 1024;
+    small.maxResultBytes = 64;
+    small.maxErrorText   = 64;
+    rc::Completions cq(*r.client, small);
+    rc::Completions bq(*r.client, small);
+    p.batchAcksTo(bq);
+    uint32_t cqFilled = 0, bqFilled = 0;
+    while (cq.reserve(kUnit) == rc::OpResult::Accepted) ++cqFilled;
+    while (bq.reserve(kUnit) == rc::OpResult::Accepted) ++bqFilled;
+    ASSERT_GT(cqFilled, 0u);
+    ASSERT_GT(bqFilled, 0u);
+    const Key key(uint64_t{1});
+    for (int i = 0; i < 50; ++i) {
+        // Both queues are full: only a gate decided first yields NotInTransaction.
+        EXPECT_EQ(p.trySend(kTopic, key, bytes("v")), SendResult::NotInTransaction) << "void send, bq full";
+        EXPECT_EQ(p.trySend(kTopic, key, bytes("v"), cq, 9), SendResult::NotInTransaction) << "cq token form";
+        EXPECT_EQ(p.trySend(kTopic, key, bytes("v"), rc::AckToken{9}), SendResult::NotInTransaction) << "AckToken form";
+        EXPECT_EQ(p.tryClaim(kTopic, key, 8).result(), SendResult::NotInTransaction) << "claim";
+        EXPECT_EQ(p.tryClaim(kTopic, key, 8, cq, 9).result(), SendResult::NotInTransaction) << "claim(cq)";
+        EXPECT_EQ(p.tryClaim(kTopic, key, 8, rc::AckToken{9}).result(), SendResult::NotInTransaction) << "claim(AckToken)";
+        EXPECT_EQ(p.claimBatch(kTopic, key, 2, 8).result(), SendResult::NotInTransaction) << "claimBatch";
+    }
+    EXPECT_EQ(cq.outstanding(), cqFilled) << "the refusals never touched the cq credit";
+    EXPECT_EQ(bq.outstanding(), bqFilled) << "the refusals never touched the batch-ack credit";
+    // Not vacuous: inside a transaction (gate open) the same full queues refuse for want of credit.
+    r.impl->setTxnGate(ProducerImpl::TxnGate::Open);
+    EXPECT_EQ(p.trySend(kTopic, key, bytes("v")), SendResult::QueueFull);
+    EXPECT_EQ(p.trySend(kTopic, key, bytes("v"), cq, 9), SendResult::QueueFull);
+    for (uint32_t i = 0; i < cqFilled; ++i) cq.unreserve(kUnit);
+    for (uint32_t i = 0; i < bqFilled; ++i) bq.unreserve(kUnit);
+}
+
 TEST(ProducerTxnApiRegression, PlainProducerHotPathIsUnchangedRegression) {
     // The gate is NotTransactional: trySend takes the same path (one predictable branch) and allocates nothing.
     Rig r(cfgOf(Acks::None));

@@ -340,6 +340,7 @@ int cmdSchemaGenerate(const std::vector<std::string>& args,
         if (!connectOrReport(client, err)) return 1;
 
         TopicSchemaResult r;
+        const auto lineageStarted = std::chrono::steady_clock::now();
         try {
             // #418: the topic's LINEAGE (evolving descriptor), so the generated type places records of every
             // version up to its own; a materialized descriptor would hide every DROP before it.
@@ -354,8 +355,8 @@ int cmdSchemaGenerate(const std::vector<std::string>& args,
         }
 
         if (r.errorCode != 0) {
-            err << "rune: broker error code " << r.errorCode
-                << " for topic '" << topic << "'\n";
+            err << "rune: " << client.lineageFailure(
+                       topic, r.errorCode, kCliWait - (std::chrono::steady_clock::now() - lineageStarted)) << "\n";   // Issue #435
             return 1;
         }
 
@@ -456,6 +457,7 @@ int run(std::vector<std::string> args, std::istream& in, std::ostream& out, std:
 
     const std::string& cmd = args[0];
 
+    try {   // #680: nothing escapes the CLI as an uncaught exception (the commands' secret guards unwind first)
     if (cmd == "console") {
         return console::cmdConsole(args, in, out, err);
     }
@@ -463,7 +465,7 @@ int run(std::vector<std::string> args, std::istream& in, std::ostream& out, std:
         return cmdSchema(args, out, err);
     }
     if (cmd == "ql") {
-        return cmdQl(std::vector<std::string>(args.begin() + 1, args.end()), out, err);
+        return cmdQl(std::vector<std::string>(args.begin() + 1, args.end()), in, out, err);
     }
     if (cmd == "catalog") {
         return cmdCatalog(std::vector<std::string>(args.begin() + 1, args.end()), out, err);
@@ -480,6 +482,10 @@ int run(std::vector<std::string> args, std::istream& in, std::ostream& out, std:
     err << "rune: unknown command '" << cmd << "'\n";
     printUsage(err);
     return 1;
+    } catch (const std::exception& e) {
+        err << "rune: " << e.what() << "\n";
+        return 1;
+    }
 }
 
 } // namespace rune::cli

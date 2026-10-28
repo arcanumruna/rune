@@ -121,6 +121,12 @@ public:
     /// with OpStatus::Timeout.  Returns how many.
     int sweepCommitSyncTimeouts(int64_t nowNs);
 
+    /// C16 (#371, #357.2): the duty-pass step of every pending seek / seekToCommitted: moves it forward
+    /// (AwaitFetch -> Resubscribe -> Ok), ends it (Rejoined / Timeout), and sends the OffsetFetch of a seekToCommitted
+    /// at once - on the pass the event arrives, not on the 100 ms sweep.  O(consumers); returns immediately when no
+    /// rewind is pending.  Returns the rewinds visited.
+    int driveRewinds(int64_t nowNs, int64_t sessionId, const SendFn& sendFn);
+
     /// fix3 M4: LeaveGroup frames the transport refused (GroupConsumer close),
     /// retried every duty cycle; dropped on a session change.
     [[nodiscard]] std::size_t pendingLeaves() const noexcept { return pendingLeaves_; }
@@ -353,6 +359,8 @@ public:
     /// partition whose start offset is still unknown (refused send, errored
     /// entry, capped answer).  Paced by a doubling backoff on the duty clock.
     int retryOffsetFetch(int64_t nowNs, int64_t sessionId, const SendFn& sendFn);
+    /// One consumer's share of retryOffsetFetch (also driven per duty pass for a pending rewind).  1 = a fetch was sent.
+    int retryOffsetFetchFor_(GroupConsumerImpl& impl, int64_t nowNs, int64_t sessionId, const SendFn& sendFn);
     /// MAJOR-2 (round 3): the seed broker's ConnectResponse.brokerVersion.  A
     /// GroupConsumer runs only against >= kBrokerVersionExplicitGroupSubscriptions;
     /// otherwise onConnected / joinIfConnected finish it (GroupFailReason::
@@ -544,6 +552,10 @@ private:
     int64_t nextOffsetFetchCorr_ = 1;
     /// #431: the last hub-unique control id handed to a consumer (24 bits used, never 0).
     uint32_t nextCtlId_ = 0;
+public:
+    /// #660 test hook: position the 24-bit control-id counter (the next candidate is v + 1) to force a wrap.
+    void testSetNextCtlId(uint32_t v) noexcept { nextCtlId_ = v; }
+private:
     /// #431: the next control correlation id of `impl` (bumps its sequence, skipping 0 on wrap).
     [[nodiscard]] static int64_t nextCtlCorr_(GroupConsumerImpl& impl) noexcept;
     void publishGeneration_(GroupConsumerImpl& impl);

@@ -71,6 +71,8 @@ namespace rune::client {
 // Forward-declare the implementation class (PIMPL — impl lives in Producer.cpp).
 namespace producer { class ProducerImpl; }
 class Completions;
+class ProducerRef;
+class Client;
 struct CompletionTarget;
 
 // ---------------------------------------------------------------------------
@@ -171,13 +173,14 @@ struct ProducerConfig {
     std::string transactionalId;
     /// InitProducerId's transactionTimeoutMs for a transactional producer.
     int32_t     transactionTimeoutMs = 60'000;
-    /// Tier-2 (BatchBuilder) slot pool, preallocated once at creation: this many batches
-    /// may be built or queued-unsent at a time (a slot returns to the pool when its batch
+    /// Tier-2 (BatchBuilder) slot pool, allocated ONCE by the producer's first batch() (or
+    /// bindBatchThread()) on its batch thread - a producer that never uses Tier-2 reserves nothing: this many
+    /// batches may be built or queued-unsent at a time (a slot returns to the pool when its batch
     /// is encoded and offered, failed or discarded - not at ack).  Exhausted pool =
-    /// BackPressured, never an allocation.  >= 2 x maxInFlight recommended.  Memory:
-    /// tier2Slots x 2 x tier2SlotBytes of address space (touched only as used).  The reserve is per
-    /// producer: N per-shard producers reserve N times that, so lower tier2Slots (or tier2SlotBytes)
-    /// when running many producers.
+    /// BackPressured, never an allocation after that first one.  >= 2 x maxInFlight recommended.  Memory (once
+    /// Tier-2 is used): tier2Slots x 2 x tier2SlotBytes of address space (touched only as used) - ~8 MiB by
+    /// default.  The reserve is per Tier-2-using producer: N per-shard producers that all batch reserve N times
+    /// that, so lower tier2Slots (or tier2SlotBytes) when running many of them.
     int32_t tier2Slots     = 64;
     /// Largest Tier-2 batch (RecordBatch header + records) one slot holds; 0 = max(batchBytes,
     /// maxFrameBytes).
@@ -360,6 +363,10 @@ enum class SendResult : uint8_t {
 // A claim must not outlive its Producer.  Zero allocation.
 // ---------------------------------------------------------------------------
 namespace detail {
+/// Debug check of a ProducerRef (ProducerRef.h): the handle of `impl` was destroyed while the duty side still holds
+/// it.  false for nullptr (a moved-from Producer answers like any such Producer).
+[[nodiscard]] bool producerImplDetached(const producer::ProducerImpl* impl) noexcept;
+
 /// The state of an OPEN claim — exactly what settling it needs.
 struct ClaimOpen {
     producer::ProducerImpl* impl  = nullptr;
@@ -379,6 +386,8 @@ struct ClaimCredit {
     static bool mayCommit(const ClaimOpen& o) noexcept;
     /// Discard; every reservation is returned.
     static void abort(const ClaimOpen& o) noexcept;
+    /// #326: the claim was abandoned under its holder (Invoker: a failed partition / a close); cheap, owner thread.
+    [[nodiscard]] static bool abandoned(const ClaimOpen& o) noexcept;
 };
 }  // namespace detail
 
@@ -423,6 +432,12 @@ public:
         if (!std::holds_alternative<Open>(state_)) [[unlikely]] return false;
         return commitOpen_();
     }
+    /// #326: true when this claim was ABANDONED under its holder (Invoker mode: its partition failed during a pump,
+    /// or the producer closed) while it is still unsettled.  buffer() stays writable but harmless, and commit()
+    /// will return false; a holder encoding a large record can poll this to stop early.  Cheap (one variant
+    /// test plus one load of the producer's claim state).  Owner thread only: off the owner thread, and in Thread
+    /// mode (a ring claim released by the Client close is learned through commit() == false), it reports false.
+    [[nodiscard]] bool abandoned() const noexcept;
     /// Discard the record: nothing is sent, nothing completes.  No-op unless open.
     /// Off the owner thread of a carried queue the ring slot is still released
     /// but the credit cannot be returned (it is the owner's plain state): the
@@ -460,11 +475,18 @@ private:
 class BatchClaim {
 public:
     BatchClaim() noexcept = default;  ///< refused: InvalidTopic
-    BatchClaim(BatchClaim&& o) noexcept;
-    BatchClaim& operator=(BatchClaim&& o) noexcept;  ///< aborts this claim first if it is open
+    // The same inline move / destructor bodies as Claim (#329); commit / abort share Claim's settle code in Claim.cpp.
+    BatchClaim(BatchClaim&& o) noexcept : state_(std::exchange(o.state_, Settled{})) {}
+    BatchClaim& operator=(BatchClaim&& o) noexcept {  ///< aborts this claim first if it is open
+        if (this != &o) {
+            abort();
+            state_ = std::exchange(o.state_, Settled{});
+        }
+        return *this;
+    }
     BatchClaim(const BatchClaim&) = delete;
     BatchClaim& operator=(const BatchClaim&) = delete;
-    ~BatchClaim();  ///< aborts an open claim
+    ~BatchClaim() { abort(); }  ///< aborts an open claim
 
     [[nodiscard]] explicit operator bool() const noexcept { return std::holds_alternative<Open>(state_); }
     [[nodiscard]] SendResult result() const noexcept;
@@ -477,6 +499,8 @@ public:
     /// neighbouring sends unless fenced by flush()).  False: nothing was open, or the claim was abandoned under it (see Claim).
     bool commit() noexcept;
     void abort() noexcept;
+    /// #326: see Claim::abandoned().
+    [[nodiscard]] bool abandoned() const noexcept;
 
 private:
     friend class Producer;
@@ -547,6 +571,9 @@ public:
 
     /// The handle owns no producer (moved-from).
     [[nodiscard]] bool valid() const noexcept { return impl_ != nullptr; }
+    /// This producer was created by `client` (Client::producer()).  False for a moved-from handle and for a producer
+    /// of another Client.
+    [[nodiscard]] bool ownedBy(const Client& client) const noexcept;
 
     // ---- Max value size (named constant) ------------------------------------
 
@@ -712,6 +739,22 @@ public:
     /// partition.  With batchAcksTo bound it reserves n credit units (the
     /// BatchAck(s) covering the claim's RecordBatch return them).  ZERO allocation in steady state.
     [[nodiscard]] BatchClaim claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen) noexcept;
+    /// #324: claimBatch with ONE polled completion for the whole batch (tryClaim(.., cq, token)'s rules: the credit
+    /// is reserved at claim time and returned if the claim is aborted, a refused or an abandoned claim never
+    /// completes).  The completion {op = Send, value = the batch's BASE offset (its FIRST record's offset), status}
+    /// arrives when the RecordBatch holding the n records is acknowledged - a claimBatch lands whole in ONE
+    /// RecordBatch (neighbouring sends of an unfenced claim join the same RecordBatch), so that is one ack and
+    /// the completion fires exactly once, after the batch's LAST record is covered.  An acked claimBatch also
+    /// reserves its n batchAcksTo() units, like the unacked form.  Both modes.
+    [[nodiscard]] BatchClaim claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen,
+                                        Completions& cq, Token token) noexcept;
+    /// claimBatch whose single completion goes to the onAck() handler (same value rule as above).
+    [[nodiscard]] BatchClaim claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen,
+                                        AckToken token) noexcept;
+    /// #326: how many Invoker claims were abandoned under their holder (a failed partition, a close) since the
+    /// producer was created.  A plain counter owned by the Invoker owner thread: read it there (off the owner
+    /// thread, and in Thread mode, where claims are never abandoned, it reads 0).
+    [[nodiscard]] uint64_t claimsAbandoned() const noexcept;
 
     /// Setup phase (before the first AckToken send): the per-record ack
     /// handler.  See AckFn.
@@ -769,7 +812,10 @@ public:
     /// the thread that last called bindBatchThread().  batch() from another thread returns a refused
     /// builder (send() = WrongThread; the batch pool is untouched).  With every pool slot in use
     /// (ProducerConfig::tier2Slots) it returns a refused builder whose send() is BackPressured -
-    /// rebuild the whole batch.
+    /// rebuild the whole batch.  The first batch() (or bindBatchThread()) of a producer allocates its slot pool
+    /// (ProducerConfig::tier2Slots); after that the Tier-2 path never allocates.  Invoker mode: while a claim
+    /// (tryClaim / claimBatch) is open on the producer, send() is refused (BackPressured, the batch stays intact:
+    /// retry once the claim is committed or aborted) - like every other append, it waits on the claim.
     BatchBuilder batch(TopicHandle topic, const Key& key);
 
     /// Rebind the Tier-2 batch thread to the CALLING thread.  Call it before the first batch() from
@@ -796,6 +842,12 @@ public:
     // lifecycle.  On a plain producer every token form returns
     // OpResult::InvalidArgument (no completion) and every *AndWait /
     // beginTransaction() throws std::logic_error("<op>: producer has no transactionalId").
+    // UnknownProducerId (28) inside a transaction (the broker forgot the producer id: retention removed every
+    // record of ours, then a failover) ABORTS the transaction: the commit completes BrokerError(28) and the app aborts
+    // and redoes it.  A transactional epoch belongs to the coordinator, so the sequences are never restarted
+    // client-side; the abort bumps the epoch (InitProducerId) and the NEXT transaction runs under epoch+1 from
+    // sequence 0.  (KIP-360 - the coordinator bumping the epoch while KEEPING the transaction - needs broker work and
+    // stays an open enhancement.)
     // A transactional producer outside a transaction refuses every produce path
     // with SendResult::NotInTransaction (send / sendTo / blocking claim helpers
     // throw std::logic_error("produce outside a transaction")).
@@ -818,8 +870,11 @@ public:
     /// machine in AbortableError (pinned by BeginBeforeThePreviousEndCompletesIsRefusedRegression).
     void     beginTransaction();
     /// One sendOffsetsToTransaction runs at a time: a call made while another is still running completes
-    /// BrokerError(19, InvalidTxnState) at once (no queueing, the transaction is not poisoned) - wait for the first
-    /// completion before issuing the next.  At most 1024 offsets and a 1..255-byte group id: otherwise the call is
+    /// InvalidArgument at once with the text "a sendOffsetsToTransaction is already in flight on this producer; wait
+    /// for its completion" (no queueing; the first call completes normally and the transaction is NOT poisoned) - wait
+    /// for the first completion before issuing the next.  An EMPTY offsets list completes Ok locally with no wire
+    /// traffic and does not open the transaction on the coordinator (a commit with nothing else in the transaction
+    /// then sends no EndTxn).  At most 1024 offsets and a 1..255-byte group id: otherwise the call is
     /// accepted and COMPLETES InvalidArgument.  Only a ring too small to ever carry the message (a tiny producer
     /// ring) is a synchronous OpResult::InvalidArgument with no completion.
     OpResult sendOffsetsToTransaction(std::span<const OffsetEntry> offsets, std::string_view groupId,
@@ -834,9 +889,15 @@ public:
     /// than kMaxGroupMemberIdBytes completes InvalidArgument.  Otherwise exactly the groupId form.
     OpResult sendOffsetsToTransaction(std::span<const OffsetEntry> offsets, const GroupMetadata& group,
                                       const CompletionTarget& target, Token token);
+    /// Calls that arrive while a commit (abort) is already pending JOIN it: one EndTxn, every call completes with its
+    /// result.  At most 4 joiners (kMaxTxnJoiners) per pending op: a further call completes InvalidArgument with the
+    /// text "too many concurrent commitTransaction waiters (max 4)" ("... abortTransaction waiters ...").  It is a
+    /// capacity refusal, not a state error (BrokerError 19 stays "no transaction to commit / abort").
     OpResult commitTransaction(const CompletionTarget& target, Token token);
     OpResult abortTransaction(const CompletionTarget& target, Token token);
-    /// Token form of flush(); the existing void flush() stays.
+    /// Token form of flush(); the existing void flush() stays.  At most 8 flush calls pending at once
+    /// (kMaxTxnFlushCalls): a further one completes InvalidArgument with the text "too many concurrent flush calls
+    /// (max 8)".
     OpResult flush(const CompletionTarget& target, Token token);
 
     static constexpr std::chrono::nanoseconds kDefaultTxnWait = std::chrono::seconds(60);
@@ -855,7 +916,7 @@ public:
     /// (TxnState::Uninitialized / -1 / -1 / false) and touch nothing.  They report the latest status the duty
     /// side published, so after issuing an op a Thread-mode caller sees the change once the op completed.
     [[nodiscard]] TxnState state() const noexcept;
-    [[nodiscard]] int64_t  producerId() const noexcept;  ///< -1 until assigned (or off the bound thread)
+    [[nodiscard]] int64_t  producerId() const noexcept;  ///< -1 until assigned, after FatalError (a deliberate change: a fenced producer has no id), or off the bound thread
     [[nodiscard]] int16_t  producerEpoch() const noexcept;
     [[nodiscard]] bool     transactionActive() const noexcept;
     [[nodiscard]] bool     transactional() const noexcept;
@@ -940,6 +1001,8 @@ public:
     void testSetNextSequence(TopicHandle topic, int32_t partition, int32_t seq) noexcept;
 
 private:
+    friend class ProducerRef;   // reads implForRef_() (FD7 debug check)
+    [[nodiscard]] const producer::ProducerImpl* implForRef_() const noexcept { return impl_; }
     /// Phase 2b F Task 8: issue one transaction control op (resolves and reserves the completion target).
     OpResult issueTxn_(std::uint8_t kind, const CompletionTarget& target, Token token,
                        std::span<const OffsetEntry> offsets, std::string_view groupId,
@@ -955,6 +1018,10 @@ private:
     /// per-record ack credit (cq) already reserved by the caller.
     [[nodiscard]] Claim claimPart_(TopicHandle topic, int32_t part, const Key& key, uint32_t valueLen,
                                    uint64_t ackHandle, Completions* cq) noexcept;
+    /// #324: the claimBatch body; `part` computed once by the caller, `cq` (the per-batch completion credit) already
+    /// reserved by the caller, `ackHandle` 0 = no completion.
+    [[nodiscard]] BatchClaim claimBatchPart_(TopicHandle topic, int32_t part, const Key& key, uint32_t n,
+                                             uint32_t recLen, uint64_t ackHandle, Completions* cq) noexcept;
     /// F8c C7: the §3.3 release of the handle's share (see the destructor).
     void release_() noexcept;
 

@@ -8,6 +8,11 @@
 #include <rune/transaction/ControlMarker.h>
 #include <rune/transaction/TransactionCoordinator.h>
 #include <rune/transaction/TransactionMessages.h>
+#include <rune/replication/PartitionReplica.h>
+#include <rune/protocol/RecordBatch.h>
+
+#include <climits>
+#include <span>
 
 #include <gtest/gtest.h>
 
@@ -709,4 +714,40 @@ TEST(ControlMarkerTest, BuildExtremeProducerIdEpochRoundTrips) {
             EXPECT_EQ(p.coordinatorEpoch, -7);
         }
     }
+}
+
+// ===========================================================================
+// C17 adversarial review (#180): every end-transaction marker the coordinator
+// writes must stay a VALID RecordBatch.  The marker's single record carries no
+// record-length varint (rune/storage/ControlMarkerLayout.h), so a record-count
+// walk over length prefixes that does not exempt control batches refuses every
+// marker: the leader's appendControlBatch answers kAppendInvalidBatch, log
+// recovery truncates at the marker, followers and the cleaner stop there.
+// Matrix: {Commit, Abort} x producerId {0, 1, max} x epoch {0, max} x
+// coordinatorEpoch {0, 1, max}.
+//
+// Fixed: RecordBatchReader::ensureValid walks the records of data batches only.
+// ===========================================================================
+TEST(ControlMarkerAdversarialRegression, EveryMarkerPassesEnsureValidAndIsAppendableRegression) {
+    const ControlType types[] = {ControlType::Commit, ControlType::Abort};
+    const int64_t pids[] = {0, 1, INT64_MAX};
+    const int16_t epochs[] = {0, INT16_MAX};
+    const int32_t coordEpochs[] = {0, 1, INT32_MAX};
+    int cases = 0;
+    for (auto t : types)
+        for (auto pid : pids)
+            for (auto ep : epochs)
+                for (auto ce : coordEpochs) {
+                    const auto m = ControlMarker::build(pid, ep, t, ce);
+                    ASSERT_EQ(m.size(), ControlMarker::ENCODED_SIZE);
+                    rune::protocol::RecordBatchReader r(m.data(), m.size());
+                    EXPECT_TRUE(r.isControl());
+                    EXPECT_TRUE(r.ensureValid())
+                        << "type " << int(t) << " pid " << pid << " epoch " << ep << " coordEpoch " << ce;
+                    EXPECT_TRUE(rune::replication::PartitionReplica::isControlBatch(
+                        std::span<const uint8_t>(m.data(), m.size())))
+                        << "the leader would refuse to append this marker (kAppendInvalidBatch)";
+                    ++cases;
+                }
+    EXPECT_EQ(cases, 2 * 3 * 2 * 3);
 }

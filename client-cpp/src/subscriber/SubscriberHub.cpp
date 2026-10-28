@@ -593,7 +593,6 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
     // batch's offsets are consumed, never delivered.  No allocation: the visitor is
     // a template (RecordBatchReader::forEachRecord), never a std::function.
     const int32_t partitionOfRecords = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
-    impl.batchBytes += rb.size();   // FD13: egress bytes delivered (the status is published below)
     dispatching_ = &impl;
     std::span<const uint8_t> rest(rb.data(), rb.size());
     bool first = true;
@@ -634,6 +633,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
             skip = true;
         }
         if (!skip) {
+            impl.batchBytes += batchLen;   // FD13 / #428: only DELIVERED batches count (not malformed, duplicate or control ones)
             reader.forEachRecord([&](std::string_view keyView,
                                      std::string_view valView,
                                      int64_t          absOffset,
@@ -688,7 +688,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         return;
     }
     // One status snapshot per Records frame (not per record).
-    publishStatus_(impl);   // rb is non-empty here: batchBytes grew
+    publishStatus_(impl);   // one snapshot per frame (batchBytes may have grown)
 }
 
 // A Records frame whose batch (the first, or one after decoded ones) is not a
@@ -1268,6 +1268,8 @@ bool SubscriberHub::failActiveByCorrelation(int64_t correlationId, SubscriptionF
                                             int64_t unsubCorrId, int64_t sessionId, const SendFn& submitFn)
 {
     if (correlationId == 0) return false;
+    // #428: a scan is deliberate - this is the cold InvalidRequest error path and the subscription count is small and
+    // bounded, so a second correlation index (kept in step on every subscribe / unsubscribe) would cost more than it saves.
     for (const auto& [id, impl] : activeById_) {
         if (impl == nullptr || impl->correlationId != correlationId) continue;
         if (!impl->active) return false;

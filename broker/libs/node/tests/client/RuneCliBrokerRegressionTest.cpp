@@ -641,3 +641,15 @@ TEST(RuneCliBrokerRegression, SchemaGenerateEmbedsTheLineageOfEveryVersionRegres
     EXPECT_NE(hdr.find("{0u, 12u},  // v1"), std::string::npos) << "a v1 record's score is at 12\n" << hdr;
     EXPECT_NE(hdr.find("{0u, 8u},  // v2"), std::string::npos) << "a v2 record's score is at 8";
 }
+
+// Issue #397: `rune schema list` without --cli-data-dir runs in a scratch data dir of its own (it used to fail with an
+// empty data dir).
+TEST(RuneCliBrokerRegression, SchemaListWorksWithoutTheCliDataDirFlagRegression) {
+    OneBroker b("cli_list_nodatadir");
+    std::string o, e;
+    const std::string egress = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+    // `schema list` shows the topics defined in its own session (the CLI's client registry), so a fresh run prints the
+    // empty-session line; what is pinned is that it connects and exits 0 with no --cli-data-dir.
+    ASSERT_EQ(runCli({"schema", "list", "--broker", "aeron:udp?endpoint=" + b.endpoint(), "--cli-egress", egress}, &o, &e), 0) << e;
+    EXPECT_NE(o.find("(no topics applied in this session)"), std::string::npos) << o;
+}

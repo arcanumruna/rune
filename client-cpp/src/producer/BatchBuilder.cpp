@@ -190,8 +190,13 @@ void BatchBuilder::checkProducer_() const {
     }
 }
 
+void BatchBuilder::checkTxnGate_() const {
+    if (impl_->gateRefusesBeforeCredit()) throw std::logic_error("produce outside a transaction");
+}
+
 OpResult BatchBuilder::send() {
     checkProducer_();
+    checkTxnGate_();
     Completions* bq = impl_->batchAckCq();
     const OpResult u = reserveUnit(bq);
     if (u != OpResult::Accepted) return u;
@@ -211,6 +216,7 @@ OpResult BatchBuilder::send() {
 
 OpResult BatchBuilder::send(Completions& cq, Token token) {
     checkProducer_();
+    checkTxnGate_();
     if (token > kMaxToken || cq.client_ == nullptr || cq.client_ != impl_->hooks().ctx ||
         cq.ring_ == nullptr) {
         return OpResult::InvalidArgument;
@@ -244,6 +250,7 @@ OpResult BatchBuilder::send(Completions& cq, Token token) {
 
 OpResult BatchBuilder::send(AckToken token) {
     checkProducer_();
+    checkTxnGate_();
     if (token.token > kMaxToken) return OpResult::InvalidArgument;
     Completions* bq = impl_->batchAckCq();
     const OpResult u = reserveUnit(bq);

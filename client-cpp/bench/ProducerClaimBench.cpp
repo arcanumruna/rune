@@ -18,6 +18,9 @@
 // operator new on THIS thread after a 10'000-record warm-up, over both phases.
 // Exit 1 if a claim form allocated (spec B: claim paths 0 allocations in
 // steady state).
+// CLAIM_MODE=typed_gate (Invoker only, #335): typed_send and typed_claim INTERLEAVED block by block (ABAB, one
+// process, one producer, so the host's drift hits both equally) and compared at the median ns/record; exit 1 when
+// typed_claim exceeds typed_send by more than CLAIM_GATE_MARGIN_NS (default 1.0 ns) at this record size (67 B).
 #include "../tests/support/AllocCounter.h"
 #include "gen/position.gen.h"
 
@@ -58,7 +61,7 @@ std::string envStr(const char* n, const char* d) {
 int64_t nowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now().time_since_epoch()).count();
 }
-enum class Mode { Send, Claim, TypedSend, TypedClaim };
+enum class Mode { Send, Claim, TypedSend, TypedClaim, TypedGate };
 template <class Enc>
 void encodeInto(Enc& e, int64_t i) {
     e.zone(static_cast<int32_t>(i & 7)).x(1.5).y(2.5).z(-3.5).seq(static_cast<uint32_t>(i))
@@ -71,6 +74,7 @@ int main() {
     const Mode mode = modeName == "send"       ? Mode::Send
                     : modeName == "typed_send" ? Mode::TypedSend
                     : modeName == "typed_claim" ? Mode::TypedClaim
+                    : modeName == "typed_gate" ? Mode::TypedGate
                                                : Mode::Claim;
     const bool    invoker    = envStr("CLAIM_INGRESS", "thread") == "invoker";
     const int64_t N          = envI64("CLAIM_RECORDS", 1'000'000);
@@ -94,7 +98,7 @@ int main() {
     const TopicHandle topic{0, partitions};
     std::optional<Producer>             plain;
     std::optional<TypedTopic<Position>> typed;
-    if (mode == Mode::TypedSend || mode == Mode::TypedClaim) {
+    if (mode == Mode::TypedSend || mode == Mode::TypedClaim || mode == Mode::TypedGate) {
         typed.emplace(Producer{raw}, topic, uint16_t{1});
     } else {
         plain.emplace(raw);
@@ -133,9 +137,9 @@ int main() {
     std::vector<int64_t> blk(static_cast<std::size_t>(N / block));  // amortised phase: ns/record per block
     std::vector<uint8_t> scratch(PositionEncoder::kEncodedLength);  // "send": the caller's own buffer
     long allocs = 0;
-    auto produceOne = [&](int64_t i) {
+    auto produceAs = [&](Mode m, int64_t i) {
         const Key key(i);
-        switch (mode) {
+        switch (m) {
         case Mode::Send: {
             PositionEncoder e(scratch);
             e.userId(i);
@@ -180,8 +184,59 @@ int main() {
                 relieve(w.result());
             }
             break;
+        case Mode::TypedGate:
+            break;  // not a form: the gate drives TypedSend / TypedClaim itself
         }
     };
+    auto produceOne = [&](int64_t i) { produceAs(mode, i); };
+    if (mode == Mode::TypedGate) {
+        if (!invoker) {
+            std::fprintf(stderr, "typed_gate needs CLAIM_INGRESS=invoker (Thread mode meets the gate by design)\n");
+            return 2;
+        }
+        // ABAB: block 2k is typed_send, block 2k+1 typed_claim; a clock pair per block, a flush pass every 64.
+        for (int64_t i = 0; i < kWarm; ++i) {  // warm-up of both forms
+            produceAs(Mode::TypedSend, i);
+            produceAs(Mode::TypedClaim, i);
+            if ((i & 63) == 63) impl.flushBatches(nowNs(), 1, sink);
+        }
+        const std::size_t pairs = std::max<std::size_t>(1, blk.size() / 2);
+        std::vector<double> sendNs(pairs), claimNs(pairs);
+        alloc_counter::startThisThread();
+        int64_t at = N;
+        for (std::size_t b = 0; b < pairs; ++b) {
+            for (const Mode m : {Mode::TypedSend, Mode::TypedClaim}) {
+                const int64_t t0 = nowNs();
+                for (int64_t i = at; i < at + block; ++i) {
+                    produceAs(m, i);
+                    if ((i & 63) == 63) impl.flushBatches(nowNs(), 1, sink);
+                }
+                at += block;
+                (m == Mode::TypedSend ? sendNs : claimNs)[b] = static_cast<double>(nowNs() - t0) / static_cast<double>(block);
+            }
+        }
+        const long gateAllocs = alloc_counter::stopThisThread();
+        impl.flushBatches(nowNs(), 1, sink);
+        auto median = [](std::vector<double>& v) {
+            std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2), v.end());
+            return v[v.size() / 2];
+        };
+        const double sendMed = median(sendNs), claimMed = median(claimNs);
+        const double margin = static_cast<double>(envI64("CLAIM_GATE_MARGIN_NS_X10", 10)) / 10.0;  // default 1.0 ns
+        std::printf("GATE typed_gate record_bytes=%u pairs=%zu typed_send_ns=%.2f typed_claim_ns=%.2f"
+                    " delta_ns=%.2f margin_ns=%.1f allocs=%ld\n",
+                    static_cast<unsigned>(PositionEncoder::kEncodedLength), pairs, sendMed, claimMed, claimMed - sendMed, margin, gateAllocs);
+        if (gateAllocs != 0) {
+            std::fprintf(stderr, "GATE FAIL: typed_gate allocated %ld times in steady state\n", gateAllocs);
+            return 1;
+        }
+        if (claimMed - sendMed > margin) {
+            std::fprintf(stderr, "GATE FAIL: Invoker typed_claim %.2f ns exceeds typed_send %.2f ns by %.2f ns (> %.1f ns)\n",
+                         claimMed, sendMed, claimMed - sendMed, margin);
+            return 1;
+        }
+        return 0;
+    }
     // Phase 1: per-record latency.
     for (int64_t i = 0; i < N; ++i) {
         if (i == kWarm) alloc_counter::startThisThread();

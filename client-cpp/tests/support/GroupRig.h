@@ -43,6 +43,11 @@ struct RigOptions {
     int64_t connectTimeoutMs  = 0;  // 0 = the client default
     bool    reconnectForever  = false;
     int64_t pingTimeoutMs     = 0;  // 0 = the client default
+    // C16: an injected duty clock.  nanoClock = the client's clock function; when manualNs is set, drive() adds
+    // stepNs to *manualNs once per pass (stepNs = 0 freezes the clock).  nullptr = the real steady clock.
+    rc::NanoClock nanoClock   = nullptr;
+    int64_t*      manualNs    = nullptr;
+    int64_t       stepNs      = 0;
 };
 
 struct GroupRig {
@@ -96,6 +101,7 @@ struct GroupRig {
         c.responseTimeoutNs   = o.responseTimeoutNs;
         if (o.connectTimeoutMs > 0) c.connectTimeoutMs = o.connectTimeoutMs;
         c.reconnectForeverAfterLive = o.reconnectForever;
+        c.nanoClock = o.nanoClock;
         if (o.pingTimeoutMs > 0) c.pingTimeoutMs = o.pingTimeoutMs;
         rc::TopicSpec ts;
         ts.name           = "t";
@@ -112,6 +118,7 @@ struct GroupRig {
     template <class P>
     bool drive(P&& pred, int cap = 400'000) {
         for (int i = 0; i < cap; ++i) {
+            if (opt.manualNs != nullptr) *opt.manualNs += opt.stepNs;
             client.doWork();
             gw.pump();
             if (pred()) return true;
@@ -120,6 +127,15 @@ struct GroupRig {
     }
     void connect() {
         ASSERT_TRUE(drive([&] { return gw.ready(); }));
+        // #676: the ingress publication connects in REAL time while the SessionMachine's connect retry and deadline
+        // run on the duty clock; with the clock frozen the handshake cannot expire before Aeron is connected.
+        {
+            const int64_t step = opt.stepNs;
+            opt.stepNs         = 0;
+            const bool up      = drive([&] { return client.testTransport().ingressConnected(); }, 2'000'000);
+            opt.stepNs         = step;
+            ASSERT_TRUE(up) << "the client's ingress publication never connected";
+        }
         const rc::Token t = nextToken++;
         ASSERT_EQ(client.connect(cq, t), rc::OpResult::Accepted);
         bool ok = false;

@@ -29,6 +29,7 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <random>
 #include <set>
 #include <span>
 #include <string>
@@ -812,4 +813,73 @@ TEST(EosFrameValidityRegression, OverflowEpochMoveFramesAreBrokerValidRegression
     EXPECT_EQ(r.gw.log[2].producerEpoch, 1) << "precondition: the epoch moved before the overflow";
     EXPECT_EQ(r.gw.log[2].baseSequence, 0);
     expectBrokerValid(r.gw);
+}
+
+// ---------------------------------------------------------------------------
+// C7 adversarial review (#222): seeded model check of the definite-non-append path against the broker idempotence
+// model.  Each seed mixes auth refusals (45: answered before the append, never stored), lost answers (stored, the
+// client never hears it: its retransmit may then be refused 45 too) and delayed acks=all OKs (a 45 overtakes an
+// older batch's OK).  Invariants: every record completes exactly once; every record completed Ok is in the log
+// exactly once (a 45 that gave back a sequence an earlier attempt had used would make the next batch a "duplicate"
+// the broker answers OK without storing it - silent loss); nothing is logged twice; the log keeps send order.
+// ---------------------------------------------------------------------------
+TEST(EosOosRegression, AuthRefusalsMixedWithLostAnswersNeverLoseOrDuplicateAdversarialRegression) {
+    for (uint32_t seed = 1; seed <= 12; ++seed) {
+        SCOPED_TRACE("seed " + std::to_string(seed));
+        std::mt19937 rng(seed);
+        Rig r(invokerCfg(static_cast<int32_t>(4990 + 2 * seed), static_cast<int32_t>(4991 + 2 * seed)));
+        r.connect();
+        r.gw.idempotence  = true;
+        r.gw.okDelayPumps = static_cast<int>(rng() % 4);
+        for (int ord = 1; ord <= 600; ++ord) {
+            const uint32_t roll = rng() % 100;
+            if (roll < 18) r.gw.errorFor[ord] = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotAuthorized);
+            else if (roll < 33) r.gw.dropAnswer.insert(ord);
+        }
+        const int32_t inFlight = (rng() % 2) == 0 ? 1 : 4;
+        AckLedger    L;
+        rc::Producer p = r.client.producer(eosProducer(inFlight, /*produceTimeoutMs=*/20, rc::Acks::All));
+        L.attach(p);
+        const rc::TopicHandle topic = r.client.topic("t");
+        constexpr int kN = 40;
+        for (int i = 0; i < kN; ++i) {
+            // A full window waits on a lost answer's retransmit: the clock moves while the send is refused.
+            const auto v = idValue(static_cast<uint64_t>(i));
+            bool accepted = false;
+            for (int k = 0; k < 100'000 && !accepted; ++k) {
+                const rc::SendResult res = p.trySend(topic, rc::Key(static_cast<uint64_t>(i)), std::span<const uint8_t>(v),
+                                                     rc::AckToken{static_cast<rc::Token>(i + 1)});
+                if (res == rc::SendResult::Ok) accepted = true;
+                else ASSERT_EQ(res, rc::SendResult::BackPressured);
+                if (!accepted) r.step(1'000'000);
+            }
+            ASSERT_TRUE(accepted) << "record " << i << " never accepted";
+            for (int s = 0; s < static_cast<int>(rng() % 4); ++s) r.step(1'000'000);
+        }
+        ASSERT_TRUE(r.drive([&] { return static_cast<int>(L.count.size()) >= kN; }, /*advanceNs=*/1'000'000))
+            << "completed " << L.count.size() << " of " << kN;
+        r.step();
+        EXPECT_TRUE(L.exactlyOnce(1, kN + 1));
+        EXPECT_TRUE(L.noneDuplicated());
+        const std::vector<uint64_t> logged = loggedIds(r.gw, 0);
+        std::map<uint64_t, int> inLog;
+        for (const uint64_t id : logged) ++inLog[id];
+        int ok = 0;
+        for (int i = 0; i < kN; ++i) {
+            const rc::Token t = static_cast<rc::Token>(i + 1);
+            if (L.times(t) == 0) continue;
+            if (L.status(t) == rc::OpStatus::Ok) {
+                ++ok;
+                EXPECT_EQ(inLog[static_cast<uint64_t>(i)], 1) << "record " << i << " acked Ok but not stored once";
+            } else {
+                EXPECT_EQ(L.status(t), rc::OpStatus::BrokerError) << "record " << i;
+                EXPECT_EQ(L.last.at(t).ec, 45) << "record " << i;
+            }
+        }
+        for (const auto& [id, n] : inLog) EXPECT_EQ(n, 1) << "record " << id << " stored " << n << " times";
+        for (std::size_t k = 1; k < logged.size(); ++k) EXPECT_LT(logged[k - 1], logged[k]) << "log order at " << k;
+        EXPECT_GT(ok, 0) << "precondition: some records were stored";
+        expectBrokerValid(r.gw);
+        p.closeImmediately();
+    }
 }

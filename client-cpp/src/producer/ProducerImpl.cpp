@@ -100,6 +100,30 @@ inline uint32_t readLE32u(const uint8_t* buf, int off) noexcept {
            (static_cast<uint32_t>(buf[off+3]) << 24);
 }
 
+/// The SEND_RECORD / CLAIM_BATCH common header [0..33] (topicId, partition, keyLen, inline key zero-padded to 16,
+/// flags, ackHandle) - the ONE writer every ring / deferred-arena record is built with (#329).  `key` may be
+/// null when keyLen == 0.
+inline void writeRecordHeader(uint8_t* d, int32_t topicId, int32_t partition, const uint8_t* key, std::size_t keyLen,
+                              uint8_t flags, int64_t ackHandle) noexcept {
+    writeLE32(d, kRecTopicIdOff, topicId);
+    writeLE32(d, kRecPartOff, partition);
+    d[kRecKeyLenOff] = static_cast<uint8_t>(keyLen);
+    std::memset(d + kRecKeyBytesOff, 0, Key::kMaxInline);  // pad the inline key
+    if (keyLen > 0) std::memcpy(d + kRecKeyBytesOff, key, keyLen);
+    d[kRecFlagsOff] = flags;
+    writeLE64(d, kRecCorrIdOff, ackHandle);
+}
+
+/// Well-formedness of a ring message, shared by the drain and every discard / refuse walk (#328): a message the
+/// drain would skip must be skipped - never reported - by the others too.  The caller checked the header fits.
+[[nodiscard]] inline bool recordMessageFits(std::size_t len, uint32_t valueLen) noexcept {
+    return len >= static_cast<std::size_t>(kRecHeaderSize) + valueLen;
+}
+[[nodiscard]] inline bool claimBatchMessageFits(std::size_t len, uint32_t n, uint32_t recLen) noexcept {
+    return n != 0 && static_cast<uint64_t>(len) >= static_cast<uint64_t>(kBatchHeaderSize) +
+                                                       static_cast<uint64_t>(n) * recLen;
+}
+
 // Read an 8-byte LE int64 from buf[off].
 inline int64_t readLE64(const uint8_t* buf, int off) noexcept {
     uint64_t v = 0;
@@ -277,14 +301,18 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     , tier2FreeBuf_(makeRingBuffer(static_cast<std::size_t>(tier2FreeRingBytes(cfg.tier2Slots)), kRingAlignment))
     , tier2Free_(tier2FreeBuf_.get(), static_cast<std::size_t>(tier2FreeRingBytes(cfg.tier2Slots)))
 {
+    // #349: kMsgTxnControl reads OffsetEntry arrays in place (decodeTxnControl_): the ring base is 8-byte aligned.
+    assert((reinterpret_cast<uintptr_t>(ringBuf_.get()) & 7u) == 0 && "producer ring base must be 8-byte aligned");
     // FD4: a transactional producer has no usable id until initTransactions (Task 5), even as a bare rig.
     if (!cfg_.transactionalId.empty()) identity_ = IdUnassigned{};
     publishStatus_();   // FD9: a bare rig reports its rig id
-    // Tier-2 slot pool: sized ONCE (steady state never allocates).  Every slot starts on
-    // the app's free stack; capacities are reserved so a batch of up to tier2SlotBytes
-    // is built and sealed without touching the heap.
+    // Tier-2 slot pool geometry only: the pool itself (tier2Slots x 2 x tier2SlotBytes, ~8 MiB by default) is
+    // allocated ONCE by the first batch() / bindBatchThread() (ensureTier2Pool_, #393), so a producer that never
+    // uses Tier-2 reserves nothing.  Sized once; steady state never allocates.  Every slot starts on the app's
+    // free stack; capacities are reserved so a batch of up to tier2SlotBytes is built and sealed without
+    // touching the heap.
     {
-        const std::size_t nSlots = static_cast<std::size_t>(std::max<int32_t>(cfg_.tier2Slots, 1));
+        tier2Slots_ = static_cast<std::size_t>(std::max<int32_t>(cfg_.tier2Slots, 1));
         // Default: the larger of the Tier-1 flush size and the wire frame cap, so a small
         // batchBytes (flush Tier-1 early) never refuses a Tier-2 batch that fits a frame.
         tier2SlotBytes_ = static_cast<std::size_t>(
@@ -292,14 +320,6 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
         if (tier2SlotBytes_ < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) + 64) {
             tier2SlotBytes_ = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) + 64;
         }
-        tier2Pool_.resize(nSlots);
-        tier2AppFree_.resize(nSlots);
-        for (std::size_t i = 0; i < nSlots; ++i) {
-            tier2Pool_[i].builder.reserveBody(tier2SlotBytes_);
-            tier2Pool_[i].batchBytes.reserve(tier2SlotBytes_);
-            tier2AppFree_[i] = static_cast<uint32_t>(nSlots - 1 - i);  // pop() hands out slot 0 first
-        }
-        tier2AppFreeN_ = nSlots;
     }
     if (!cfg_.transactionalId.empty()) {
         txnGate_       = TxnGate::Closed;  // Phase 2b F: closed until beginTransaction()
@@ -318,6 +338,12 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     // a user sets batchBytes larger than maxFrameBytes.
     frameCapped_ = (cfg_.maxFrameBytes > 0 && cfg_.maxFrameBytes < cfg_.batchBytes);
     effCap_      = frameCapped_ ? cfg_.maxFrameBytes : cfg_.batchBytes;
+    // #374: a partition's builder is created with room for the largest frame the documented limits allow: the
+    // headers, the larger of the flush threshold and the frame cap (a claimBatch may fill a whole frame), and the
+    // one record (kMaxRecordBytes + its framing) that may overshoot a builder just under the threshold.
+    builderPrealloc_ = ProduceFrameBuilder::kRecordsStart +
+                       static_cast<std::size_t>(std::max<int32_t>(std::max(cfg_.batchBytes, cfg_.maxFrameBytes), 0)) +
+                       rune::client::Producer::kMaxRecordBytes + ProduceFrameBuilder::kRecordOverheadMax;
     // EOS-OOS: an idempotent producer never has more batches of one partition
     // outstanding than the broker's dedup window (the shared protocol constant):
     // a retransmit older than the window could otherwise not be recognised as a
@@ -375,13 +401,8 @@ bool ProducerImpl::submitSendRecord(int32_t topicId,
         if (idx < 0) return false; // INSUFFICIENT_CAPACITY → back-pressure
 
         uint8_t* dst = ring_.base() + idx;
-        writeLE32(dst, kRecTopicIdOff, topicId);
-        writeLE32(dst, kRecPartOff,    partition);
-        dst[kRecKeyLenOff] = static_cast<uint8_t>(keyLen);
-        std::memset(dst + kRecKeyBytesOff, 0, Key::kMaxInline); // pad inline key
-        if (keyLen > 0) std::memcpy(dst + kRecKeyBytesOff, key.bytes().data(), keyLen);
-        dst[kRecFlagsOff] = wantAck ? kFlagWantAck : 0u;
-        writeLE64(dst, kRecCorrIdOff, correlationId);
+        writeRecordHeader(dst, topicId, partition, key.bytes().data(), keyLen, wantAck ? kFlagWantAck : uint8_t{0},
+                          correlationId);
         writeLE32u(dst, kRecValLenOff, static_cast<uint32_t>(valueLen));
         if (valueLen > 0) std::memcpy(dst + kRecValBytesOff, value.data(), valueLen);
 
@@ -436,6 +457,20 @@ SendResult ProducerImpl::trySubmit(int32_t topicId, int32_t partition, const Key
     return r;
 }
 
+SendResult ProducerImpl::ringRecordFits_(std::size_t keySize, std::size_t valueLen) const noexcept {
+    // Backlog B6: one O(1) compare at append (key + value <= 16 KiB).
+    if (keySize + valueLen > rune::client::Producer::kMaxRecordBytes) [[unlikely]] return SendResult::MessageTooLarge;
+    // fix1 minor 11: a value that can NEVER fit this ring (maxMsgLength is a
+    // function of ringCap, which can be far smaller than kMaxRecordBytes -
+    // e.g. a small test ring) must not be reported as retryable back-pressure:
+    // no amount of draining ever makes room for a message the ring cannot hold,
+    // so BackPressured here would livelock sendBlocking's retry loop forever.
+    if (static_cast<std::size_t>(kRecHeaderSize) + valueLen > static_cast<std::size_t>(ring_.maxMsgLength())) {
+        return SendResult::ValueTooLarge;
+    }
+    return SendResult::Ok;
+}
+
 SendResult ProducerImpl::trySubmitRing_(int32_t topicId, int32_t partition, const Key& key,
                                         std::span<const uint8_t> value, int64_t ackHandle) noexcept {
     // fix1 C2/I3 + F8c C1(a): closed is a terminal state, decided by the claim
@@ -446,17 +481,9 @@ SendResult ProducerImpl::trySubmitRing_(int32_t topicId, int32_t partition, cons
     // load on the hot path: the rejected claim is told apart from back-pressure
     // only on the (cold) failure branch below.  sendBlocking() still checks
     // closed_() before ever touching the pump hook's context.
-    // Backlog B6: one O(1) compare at append (key + value <= 16 KiB).
-    if (key.size() + value.size() > rune::client::Producer::kMaxRecordBytes) [[unlikely]] {
-        return SendResult::MessageTooLarge;
+    if (const SendResult fits = ringRecordFits_(key.size(), value.size()); fits != SendResult::Ok) [[unlikely]] {
+        return fits;
     }
-    // fix1 minor 11: a value that can NEVER fit this ring (maxMsgLength is a
-    // function of ringCap, which can be far smaller than kMaxRecordBytes —
-    // e.g. a small test ring) must not be reported as retryable back-pressure:
-    // no amount of draining ever makes room for a message the ring cannot hold,
-    // so BackPressured here would livelock sendBlocking's retry loop forever.
-    const std::size_t totalLen = static_cast<std::size_t>(kRecHeaderSize) + value.size();
-    if (totalLen > static_cast<std::size_t>(ring_.maxMsgLength())) return SendResult::ValueTooLarge;
     if (submitSendRecord(topicId, partition, key, value, ackHandle != 0, ackHandle)) [[likely]] {
         return SendResult::Ok;
     }
@@ -512,6 +539,11 @@ SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, co
             why = RejectReason::PartitionDeferred;
             return SendResult::BackPressured;
         }
+        // Same as a claim's gate: the settle's completions may have closed the producer / ended the transaction.
+        if (const SendResult again = recheckAfterSettle_(); again != SendResult::Ok) {
+            why = again == SendResult::Closed ? RejectReason::Closed : RejectReason::NotInTransaction;
+            return again;
+        }
     }
     try {
         const auto a = appendRecord_(topicId, partition, kb.data(), static_cast<uint8_t>(kb.size()),
@@ -549,6 +581,9 @@ void ProducerImpl::enableDirectIngress(const DirectIngress& d) {
         static_cast<std::size_t>(kRecHeaderSize) + rune::client::Producer::kMaxRecordBytes);
     const std::size_t want = cfg_.directDeferredBytes > 0
                                  ? static_cast<std::size_t>(cfg_.directDeferredBytes) : 0u;
+    // #344: the claim quarantine holds a builder-sized spare, so abandoning an open claim (a commit / abort / close with
+    // a claim open) copies the records before it into the spare and swaps - no allocation.  Control plane, once.
+    claimQuarantine_.reserve(builderPrealloc_);
     deferred_.init(std::max(want, 2 * kMaxRec));
     const std::size_t arena = deferred_.capacity();
     std::size_t share = cfg_.directDeferredPartitionBytes > 0
@@ -606,13 +641,7 @@ SendResult ProducerImpl::deferRecord_(int32_t topicId, int32_t partition,
         why = RejectReason::DeferredFull;
         return SendResult::BackPressured;
     }
-    writeLE32(d, kRecTopicIdOff, topicId);
-    writeLE32(d, kRecPartOff, partition);
-    d[kRecKeyLenOff] = static_cast<uint8_t>(key.size());
-    std::memset(d + kRecKeyBytesOff, 0, Key::kMaxInline);
-    if (!key.empty()) std::memcpy(d + kRecKeyBytesOff, key.data(), key.size());
-    d[kRecFlagsOff] = flags;
-    writeLE64(d, kRecCorrIdOff, ackHandle);
+    writeRecordHeader(d, topicId, partition, key.data(), key.size(), flags, ackHandle);
     writeLE32u(d, kRecValLenOff, static_cast<uint32_t>(value.size()));
     if (!value.empty()) std::memcpy(d + kRecValBytesOff, value.data(), value.size());
     if (ps != nullptr) {
@@ -679,7 +708,33 @@ void ProducerImpl::tier2Collect_() noexcept {
     }
 }
 
+bool ProducerImpl::ensureTier2Pool_() noexcept {
+    if (!tier2Pool_.empty()) [[likely]] return true;
+    // Batch thread only (the creating / bound thread): the duty side never indexes the pool before a slot token
+    // crossed the producer ring (or, Direct, this same thread), so the vector is stable once a slot is handed over.
+    try {
+        tier2Pool_.resize(tier2Slots_);
+        tier2AppFree_.resize(tier2Slots_);
+        for (std::size_t i = 0; i < tier2Slots_; ++i) {
+            tier2Pool_[i].builder.reserveBody(tier2SlotBytes_);
+            tier2Pool_[i].batchBytes.reserve(tier2SlotBytes_);
+            tier2AppFree_[i] = static_cast<uint32_t>(tier2Slots_ - 1 - i);  // pop() hands out slot 0 first
+        }
+        tier2AppFreeN_ = tier2Slots_;
+        tier2Reserved_ = tier2Slots_ * 2 * tier2SlotBytes_;
+        return true;
+    } catch (...) {
+        tier2Pool_.clear();
+        tier2Pool_.shrink_to_fit();
+        tier2AppFree_.clear();
+        tier2AppFreeN_ = 0;
+        tier2Reserved_ = 0;
+        return false;
+    }
+}
+
 uint32_t ProducerImpl::tier2Acquire() noexcept {
+    if (!ensureTier2Pool_()) [[unlikely]] return kNoTier2Slot;
     if (tier2AppFreeN_ == 0) tier2Collect_();
     if (tier2AppFreeN_ == 0) return kNoTier2Slot;
     ++t2Held_;
@@ -689,6 +744,7 @@ uint32_t ProducerImpl::tier2Acquire() noexcept {
 std::size_t ProducerImpl::tier2FreeCount() noexcept {
     // BATCH-ISSUING THREAD ONLY: collecting consumes the free ring.
     if (!onBatchThread()) return 0;
+    if (tier2Pool_.empty()) return tier2Slots_;   // nothing allocated yet, so nothing is in use (#393)
     tier2Collect_();
     return tier2AppFreeN_;
 }
@@ -703,11 +759,11 @@ void ProducerImpl::t2Return_(uint32_t slot, int32_t type) noexcept {
 
 void ProducerImpl::tier2DiscardOffThread(uint32_t slot) noexcept {
     // #341: called off the batch thread by a dying BatchBuilder.  Thread mode hands the slot to the duty side
-    // through the producer ring (the only cross-thread path).  Direct mode never drains its ring, and a full or
-    // closed ring has no room: the slot is lost, and that is logged.
+    // through the producer ring (the only cross-thread path); #655: Direct mode too (its duty pass drains the
+    // ring, drainDirectRing_).  A full or closed ring has no room: the slot is lost, and that is logged.
     uint8_t tok[kT2TokenSize];
     writeLE64(tok, 0, static_cast<int64_t>(slot));
-    if (mode_ != IngressMode::Direct && writeToRing(kMsgTier2Discard, tok, kT2TokenSize)) return;
+    if (writeToRing(kMsgTier2Discard, tok, kT2TokenSize)) return;
     std::fprintf(stderr,
                  "rune producer: a BatchBuilder holding Tier-2 slot %u was destroyed off its batch thread; "
                  "the slot is lost (destroy builders on the batch thread)\n", slot);
@@ -1165,6 +1221,9 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
             if (txnGate_ == TxnGate::Closed || txnIntakeShut_()) return RejectReason::NotInTransaction;
         }
         if (directClosed_) return RejectReason::Closed;
+        // An open claim owns the append path until it settles (documented: every other append is ClaimHeld).  Not
+        // accepted: the slot stays the caller's (retryable once the claim is committed / aborted).
+        if (std::holds_alternative<DirectClaimOpen>(directClaim_)) [[unlikely]] return RejectReason::ClaimHeld;
         if (inDuty_) {
             // fix1 C1 / fix2: deferred like a Tier-1 record (same per-partition
             // order, same validation and full policy).
@@ -1175,8 +1234,13 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
             t.recordCount = recordCount;
             return deferTier2_(slot);  // not accepted: the slot stays the caller's (C6: retryable)
         }
-        if (!deferred_.empty() && !settleDeferredFor_(topicId, partition)) {
-            return RejectReason::PartitionDeferred;  // its deferred records must go first
+        if (!deferred_.empty()) {
+            if (!settleDeferredFor_(topicId, partition)) {
+                return RejectReason::PartitionDeferred;  // its deferred records must go first
+            }
+            if (const SendResult again = recheckAfterSettle_(); again != SendResult::Ok) {
+                return again == SendResult::Closed ? RejectReason::Closed : RejectReason::NotInTransaction;
+            }
         }
         PartitionState* psp = nullptr;
         try {
@@ -1399,9 +1463,9 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
     // ProducerHub::drainAndFlush (publishHeartbeat()), not here — drainRing can
     // run up to 256x per producer per cycle.
     lastNowNs_ = nowNs;  // Task 14: the pass clock Direct appends stamp batches with
-    // Task 14: a Direct producer's records were appended by trySubmit already;
-    // its ring never carries anything — skip the ring's head/tail reads entirely.
-    if (mode_ == IngressMode::Direct) return 0;
+    // Task 14: a Direct producer's records were appended by trySubmit already; #655/#656: its ring carries only
+    // off-owner settle messages (an empty one costs a head/tail compare).
+    if (mode_ == IngressMode::Direct) return drainDirectRing_(messageLimit);
     // F8c C6a: closeImmediately / failure path / Client close — every record
     // read from the closed ring completes with the Discarding status.
     if (const auto* dc = std::get_if<LifeDiscarding>(&life_)) [[unlikely]] {
@@ -1464,8 +1528,7 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                                          static_cast<uint32_t>(ackHandle),
                                          static_cast<double>(valueLen));
 
-                if (sz < static_cast<std::size_t>(kRecHeaderSize) + valueLen)
-                    return ControlledAction::CONTINUE;
+                if (!recordMessageFits(sz, valueLen)) return ControlledAction::CONTINUE;
 
                 const ControlledAction a =
                     appendRecord_(topicId, partition, p + kRecKeyBytesOff, keyLen,
@@ -1503,17 +1566,23 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
                 if (bsz < static_cast<std::size_t>(kBatchHeaderSize)) return ControlledAction::CONTINUE;
                 const uint32_t n      = readLE32u(p, kBatchCountOff);
                 const uint32_t recLen = readLE32u(p, kBatchRecLenOff);
-                if (n == 0 || bsz < static_cast<std::size_t>(kBatchHeaderSize) +
-                                        static_cast<std::size_t>(n) * recLen) {
+                if (!claimBatchMessageFits(bsz, n, recLen)) {
                     return ControlledAction::CONTINUE;  // malformed: the producer validated it
                 }
+                // #324: an acked claim batch carries its one completion's handle (flags + ackHandle, as a record).
+                const uint8_t  flags     = p[kRecFlagsOff];
+                const uint64_t ackHandle = (flags & kFlagWantAck) ? static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)) : 0u;
+                // #327: the same drain mark a SEND_RECORD leaves (corr = ack handle, value = payload bytes).
+                FLIGHT_RECORDER_MARK_VAL_PRODUCE(flight_recorder::Site::ClientAgentDrain,
+                                         static_cast<uint32_t>(ackHandle),
+                                         static_cast<double>(static_cast<uint64_t>(n) * recLen));
                 PartitionState& ps = getOrCreatePartition(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff));
                 const uint8_t keyLen = p[kRecKeyLenOff];
-                if (admitBatch_(ps, keyLen, n, recLen) == ControlledAction::ABORT) {
+                if (admitBatch_(ps, keyLen, n, recLen, ackHandle) == ControlledAction::ABORT) {
                     lastDrainStop_ = DrainStop::Blocked;
                     return ControlledAction::ABORT;
                 }
-                appendBatch_(ps, p + kRecKeyBytesOff, keyLen, p + kBatchRecsOff, n, recLen, nowNs);
+                appendBatch_(ps, p + kRecKeyBytesOff, keyLen, p + kBatchRecsOff, n, recLen, flags, ackHandle, nowNs);
                 return ControlledAction::CONTINUE;
             }
 
@@ -1559,6 +1628,27 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
     return n + refused;
 }
 
+int ProducerImpl::drainDirectRing_(int messageLimit) noexcept {
+    // #655/#656: a Direct producer's ring carries only off-owner settle messages.
+    if (ring_.headPosition() == ring_.tailPosition()) [[likely]] return 0;
+    return ring_.read(
+        [this](int32_t msgTypeId, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t offset,
+               aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+            if (msgTypeId == kMsgTier2Discard && len >= kT2TokenSize) {
+                t2Return_(static_cast<uint32_t>(readLE64(p, 0)), 2);
+            } else if (msgTypeId == kMsgDirectClaimAbort && len >= 9) {
+                // The ring's release / acquire orders the writer's span writes before this rollback; a stale gen is a
+                // no-op, an abandoned claim is settled.
+                abortDirectClaim_(static_cast<uint64_t>(readLE64(p, 0)));
+                if (p[8] != 0) noteClaimCreditLost_();   // #656: only a claim that held cq / bq credit lost any
+            } else {
+                ++ringForeign_;   // any other type in a Direct ring is a bug
+            }
+        },
+        messageLimit);
+}
+
 // ---------------------------------------------------------------------------
 // Owner/duty thread: append one record to its partition builder (Task 14: the
 // single append path — the ring drain and Direct trySubmit both land here).
@@ -1576,6 +1666,7 @@ void ProducerImpl::createBuilder_(PartitionState& ps) {
     // there is no per-batch heap allocation.
     const int64_t baseWall = wallMs();
     ps.builder = std::make_unique<ProduceFrameBuilder>(0, baseWall);
+    ps.builder->preallocate(builderPrealloc_);   // #374: control plane (once per partition); the hot path never grows it
     if (txnBatchAttrs_ != 0) ps.builder->setTransactional(true);   // Phase 2b F Task 6: set once, here
     ps.builderBaseWallMs = baseWall;
 }
@@ -1675,7 +1766,7 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
 }
 
 rune::client::detail::ControlledAction ProducerImpl::admitBatch_(PartitionState& ps, uint8_t keyLen, uint32_t n,
-                                                                 uint32_t recLen) {
+                                                                 uint32_t recLen, uint64_t ackHandle) {
     using rune::client::detail::ControlledAction;
     // Same ordering rule as a record: never ahead of a queued Tier-2 batch.
     if (ps.hasTier2()) return ControlledAction::ABORT;
@@ -1683,7 +1774,10 @@ rune::client::detail::ControlledAction ProducerImpl::admitBatch_(PartitionState&
                          static_cast<int64_t>(rune::protocol::batch::kRecordBatchOverhead);
     if (ps.builder && ps.builder->recordCount() > 0) {
         // Join the open batch only when the WHOLE claim fits it; otherwise
-        // flush that batch first and start an empty one with the claim.
+        // flush that batch first and start an empty one with the claim.  `body` is the claim's wire UPPER bound
+        // (every record charged the widest timestamp delta and the last offsetDelta) against builderBytes, the
+        // open batch's TRUE size, so the test is conservative: a claim that would really fit may still start a
+        // batch of its own - never the reverse (a joined claim never pushes the batch over effCap_).
         const bool overBytes   = static_cast<int64_t>(ps.builderBytes) + body > static_cast<int64_t>(effCap_);
         const bool overRecords = cfg_.batchRecords > 0 &&
                                  static_cast<int64_t>(ps.builder->recordCount()) + n > cfg_.batchRecords;
@@ -1694,11 +1788,17 @@ rune::client::detail::ControlledAction ProducerImpl::admitBatch_(PartitionState&
     }
     ensureBuilder_(ps);
     ps.builder->reserveExtra(static_cast<std::size_t>(body));  // the n appends cannot reallocate / throw
+    // #324: the batch's one completion handle lands at its FIRST record's index - reserve that ack slot here, where
+    // growing may still throw (before anything is committed), exactly like admitRecord_.
+    if (ackHandle != 0) {
+        const uint64_t need = static_cast<uint64_t>(ps.builder->recordCount() - ps.batchAckCount) + 1u;
+        while (ps.ackHead - ps.ackTail + need > ps.ackRing.size()) growAckRing(ps);
+    }
     return ControlledAction::CONTINUE;
 }
 
 void ProducerImpl::appendBatch_(PartitionState& ps, const uint8_t* keyBytes, uint8_t keyLen, const uint8_t* recs,
-                                uint32_t n, uint32_t recLen, int64_t nowNs) {
+                                uint32_t n, uint32_t recLen, uint8_t flags, uint64_t ackHandle, int64_t nowNs) {
     // Capacity for all n was reserved by admitBatch_: no append below
     // reallocates, so the n records land together.
     const int32_t first = ps.builder->recordCount();
@@ -1708,7 +1808,7 @@ void ProducerImpl::appendBatch_(PartitionState& ps, const uint8_t* keyBytes, uin
         const std::string_view vv(reinterpret_cast<const char*>(recs + static_cast<std::size_t>(i) * recLen), recLen);
         ps.builder->append(kv, vv, ts);
     }
-    noteAppended_(ps, first, static_cast<int32_t>(n), 0, 0, nowNs);
+    noteAppended_(ps, first, static_cast<int32_t>(n), flags, ackHandle, nowNs);
 }
 
 // ---------------------------------------------------------------------------
@@ -2386,6 +2486,19 @@ int ProducerImpl::flushBatches(
 //     lastAckedOffset (per partition) = the max last offset of every OK (B).
 // ---------------------------------------------------------------------------
 
+namespace {
+// #689: an error that refuses the PARTITION itself (not one batch): every later batch to it is refused the same
+// way, so records still lingering in its builder fail at once instead of being sent (and refused) again.
+// (46 / 44 Rejected sessions are covered by failRoutedBroker, which fails the builders.)
+constexpr bool isPartitionRefusal_(uint16_t code) noexcept {
+    namespace pc = rune::protocol::client;
+    return code == static_cast<uint16_t>(pc::ErrorCode::UnknownTopic) ||
+           code == static_cast<uint16_t>(pc::ErrorCode::UnknownPartition) ||
+           code == static_cast<uint16_t>(pc::ErrorCode::NotAuthorized) ||
+           code == static_cast<uint16_t>(pc::ErrorCode::NamespaceSuspended);
+}
+}  // namespace
+
 void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
                                      int64_t logStartOffset)
 {
@@ -2574,7 +2687,33 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         if (b->attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b->attemptDeadlineNs;
         return;
     }
-    // D: rejected, but an earlier attempt may be stored — outcome unknown.
+    // Issue #222: auth refusals (44..47) are answered before the append: when this was the batch's ONLY attempt it
+    // was definitely not stored — fail it without marking the partition unresolved (no epoch bump).  A retransmit's
+    // refusal proves nothing about the earlier attempt: that stays the outcome-unknown path (D) below.
+    if (ec >= static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed) &&
+        ec <= static_cast<int16_t>(rune::protocol::client::ErrorCode::PasswordChangeRequired) &&
+        b->attempts == 1) {
+        emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
+                      OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
+        txnNoteLoss_(OpStatus::BrokerError, static_cast<uint16_t>(ec), AbortKind::BumpEpoch);
+        completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
+                       static_cast<uint16_t>(ec), b->tier2, b->recordCount);
+        // The newest sequences were never used: give them back, so the next batch continues the sequence.
+        // Otherwise the later in-flight batches meet the gap (OutOfOrderSequence) and C3 re-sequences them.
+        if (b->baseSequence >= 0 && b->producerId == ps.producerId && b->producerEpoch == ps.epoch &&
+            b->baseSequence + b->recordCount == ps.nextBaseSequence) {
+            ps.nextBaseSequence = b->baseSequence;
+        }
+        releaseResolved_(ps, *b);
+        reclaimAckRing_(ps);
+        if (isPartitionRefusal_(static_cast<uint16_t>(ec))) {
+            failBuilder_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));   // #689
+            // #689: the queued Tier-2 batches go too - none is sent to a refused partition
+            failQueuedTier2_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));
+        }
+        return;
+    }
+    // D: rejected, but an earlier attempt may be stored — outcome unknown (44..47 after a retransmit too).
     emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
                   OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
     txnNoteLoss_(OpStatus::BrokerError, static_cast<uint16_t>(ec), AbortKind::BumpEpoch);   // Task 6
@@ -2583,6 +2722,11 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
     markUnresolved_(ps, *b);
     releaseResolved_(ps, *b);
     reclaimAckRing_(ps);
+    if (isPartitionRefusal_(static_cast<uint16_t>(ec))) {
+        failBuilder_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));   // #689
+        // #689: the queued Tier-2 batches go too - none is sent to a refused partition
+        failQueuedTier2_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));
+    }
 }
 
 void ProducerImpl::parkOutOfOrder_(PartitionState& ps, InFlightBatch& b) noexcept {
@@ -2904,6 +3048,17 @@ void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st,
     reclaimAckRing_(ps);
 }
 
+void ProducerImpl::failQueuedTier2_(PartitionState& ps, OpStatus st, uint16_t errorCode) noexcept {
+    while (ps.hasTier2()) {
+        const uint32_t slot = t2Pop_(ps);
+        const uint64_t h  = tier2Pool_[slot].ackHandle;
+        const int32_t  rc = tier2Pool_[slot].recordCount;
+        t2Return_(slot);
+        emitUnsentBatchAck_(ps.topicId, ps.partition, rc, st, 1, errorCode);
+        completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, errorCode);
+    }
+}
+
 void ProducerImpl::failBuilder_(PartitionState& ps, OpStatus st, uint16_t errorCode) {
     // Phase 2b B: an open claim is abandoned first (never reported).  Final
     // review I1: its caller may still write the claimed span, so the builder's
@@ -3202,7 +3357,7 @@ int ProducerImpl::discardRing_(OpStatus st, int limit, uint16_t errorCode) {
         [&](int32_t type, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
             aeron::util::index_t len) {
             const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
-            if (type == kMsgSendRecord && len >= kRecHeaderSize) {
+            if (type == kMsgSendRecord && len >= kRecHeaderSize && recordMessageFits(len, readLE32u(p, kRecValLenOff))) {
                 const uint64_t h = (p[kRecFlagsOff] & kFlagWantAck)
                                        ? static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)) : 0u;
                 const int32_t tid  = readLE32(p, kRecTopicIdOff);
@@ -3222,13 +3377,17 @@ int ProducerImpl::discardRing_(OpStatus st, int limit, uint16_t errorCode) {
                 t2Return_(static_cast<uint32_t>(readLE64(p, 0)), 2);
             } else if (type == kMsgClaimCreditLost) {
                 noteClaimCreditLost_();
-            } else if (type == kMsgClaimBatch && len >= kBatchHeaderSize) {
+            } else if (type == kMsgClaimBatch && len >= kBatchHeaderSize &&
+                       claimBatchMessageFits(len, readLE32u(p, kBatchCountOff), readLE32u(p, kBatchRecLenOff))) {
                 // Phase 2b B: a committed claimBatch never sent - ONE BatchAck
-                // for its n records (n credit units); claims carry no ack handle.
+                // for its n records (n credit units); #324: and its one completion, if it carries a handle.
+                const uint64_t h = (p[kRecFlagsOff] & kFlagWantAck)
+                                       ? static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)) : 0u;
                 const int32_t tid  = readLE32(p, kRecTopicIdOff);
                 const int32_t part = readLE32(p, kRecPartOff);
                 const int32_t n    = static_cast<int32_t>(readLE32u(p, kBatchCountOff));
                 emitUnsentBatchAck_(tid, part, n, st, static_cast<uint32_t>(n), errorCode);
+                completeHandle_(h, OpKind::Send, -1, 0, st, errorCode);
             }
             else if (type == kMsgTxnControl) {
                 // Phase 2b F Task 8: a control op that reaches a closed / discarding producer completes Closed
@@ -3272,7 +3431,7 @@ int ProducerImpl::refuseRingTxn_(int limit) noexcept {
                 lastDrainStop_ = DrainStop::Blocked;
                 return ControlledAction::ABORT;
             }
-            if (type == kMsgSendRecord && len >= kRecHeaderSize) {
+            if (type == kMsgSendRecord && len >= kRecHeaderSize && recordMessageFits(len, readLE32u(p, kRecValLenOff))) {
                 const uint64_t h = (p[kRecFlagsOff] & kFlagWantAck) ? static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)) : 0u;
                 emitBatchAck_(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff), -1, 1, -1, BatchAck::kClientFailure,
                               o.status, 1, -1);
@@ -3292,11 +3451,14 @@ int ProducerImpl::refuseRingTxn_(int limit) noexcept {
                 t2Return_(static_cast<uint32_t>(readLE64(p, 0)), 2);  // #341: nothing else to refuse
             } else if (type == kMsgClaimCreditLost) {
                 noteClaimCreditLost_();  // #322
-            } else if (type == kMsgClaimBatch && len >= kBatchHeaderSize) {
+            } else if (type == kMsgClaimBatch && len >= kBatchHeaderSize &&
+                       claimBatchMessageFits(len, readLE32u(p, kBatchCountOff), readLE32u(p, kBatchRecLenOff))) {
                 const int32_t nrec = static_cast<int32_t>(readLE32u(p, kBatchCountOff));
+                const uint64_t h = (p[kRecFlagsOff] & kFlagWantAck) ? static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)) : 0u;
                 emitBatchAck_(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff), -1, nrec, -1,
                               BatchAck::kClientFailure, o.status, static_cast<uint32_t>(nrec), -1);
-                voids += static_cast<uint64_t>(nrec);   // claims carry no ack handle
+                if (h != 0) completeHandle_(h, OpKind::Send, -1, 0, o.status, o.errorCode);   // #324: the batch's completion
+                else voids += static_cast<uint64_t>(nrec);
             }
             // kMsgFlush: nothing to complete (a plain flush token carries no completion).
             return ControlledAction::CONTINUE;
@@ -3328,6 +3490,7 @@ void ProducerImpl::failRoutedBroker(RouteFailFn pred, void* ctx) noexcept {
             reclaimAckRing_(ps);
         });
         failBuilder_(ps, OpStatus::BrokerError, errorCode);
+        failQueuedTier2_(ps, OpStatus::BrokerError, errorCode);   // #689: same bug class
         ps.resendParked = false;
         ps.laneWait     = false;
     }
@@ -3371,14 +3534,7 @@ void ProducerImpl::failAllPending(OpStatus st, uint16_t errorCode) noexcept {
         PartitionState& ps = *partitions_[i];
         ps.inflight.forEachLive([&](InFlightBatch& b) { failBatch_(ps, b, st, errorCode); });
         failBuilder_(ps, st, errorCode);
-        while (ps.hasTier2()) {
-            const uint32_t slot = t2Pop_(ps);
-            const uint64_t h  = tier2Pool_[slot].ackHandle;
-            const int32_t  rc = tier2Pool_[slot].recordCount;
-            t2Return_(slot);
-            emitUnsentBatchAck_(ps.topicId, ps.partition, rc, st, 1, errorCode);
-            completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, errorCode);
-        }
+        failQueuedTier2_(ps, st, errorCode);
         ps.builderBytes   = 0;
         ps.batchStartNs   = 0;
         ps.flushRequested = false;
@@ -3611,13 +3767,8 @@ aeron::util::index_t ProducerImpl::testClaimSendRecord(int32_t topicId, int32_t 
         const aeron::util::index_t idx = ring_.tryClaim(kMsgSendRecord, totalLen);
         if (idx < 0) return idx;
         uint8_t* dst = ring_.base() + idx;
-        writeLE32(dst, kRecTopicIdOff, topicId);
-        writeLE32(dst, kRecPartOff, partition);
-        dst[kRecKeyLenOff] = static_cast<uint8_t>(key.size());
-        std::memset(dst + kRecKeyBytesOff, 0, Key::kMaxInline);
-        if (key.size() > 0) std::memcpy(dst + kRecKeyBytesOff, key.bytes().data(), key.size());
-        dst[kRecFlagsOff] = ackHandle != 0 ? kFlagWantAck : 0u;
-        writeLE64(dst, kRecCorrIdOff, static_cast<int64_t>(ackHandle));
+        writeRecordHeader(dst, topicId, partition, key.bytes().data(), key.size(),
+                          ackHandle != 0 ? kFlagWantAck : uint8_t{0}, static_cast<int64_t>(ackHandle));
         writeLE32u(dst, kRecValLenOff, static_cast<uint32_t>(value.size()));
         if (!value.empty()) std::memcpy(dst + kRecValBytesOff, value.data(), value.size());
         return idx;
@@ -3630,20 +3781,6 @@ aeron::util::index_t ProducerImpl::testClaimSendRecord(int32_t topicId, int32_t 
 // Phase 2b Part B: zero-copy claims
 // ---------------------------------------------------------------------------
 
-namespace {
-// The SEND_RECORD / CLAIM_BATCH common header [0..33] (topicId, partition,
-// keyLen, inline key zero-padded to 16, flags, ackHandle).
-inline void writeClaimHeader(uint8_t* d, int32_t topicId, int32_t partition, const Key& key,
-                             uint64_t ackHandle) noexcept {
-    writeLE32(d, kRecTopicIdOff, topicId);
-    writeLE32(d, kRecPartOff, partition);
-    d[kRecKeyLenOff] = static_cast<uint8_t>(key.size());
-    std::memset(d + kRecKeyBytesOff, 0, Key::kMaxInline);
-    if (key.size() > 0) std::memcpy(d + kRecKeyBytesOff, key.bytes().data(), key.size());
-    d[kRecFlagsOff] = ackHandle != 0 ? kFlagWantAck : uint8_t{0};
-    writeLE64(d, kRecCorrIdOff, static_cast<int64_t>(ackHandle));
-}
-}  // namespace
 
 ProducerImpl::ClaimGrant ProducerImpl::claimRecord(int32_t topicId, int32_t partition, const Key& key,
                                                    uint32_t valueLen, uint64_t ackHandle) noexcept {
@@ -3655,17 +3792,9 @@ ProducerImpl::ClaimGrant ProducerImpl::claimRecord(int32_t topicId, int32_t part
     // Invoker: the claim is reserved in the partition builder, never in the ring.
     if (mode_ == IngressMode::Direct) return claimRecordDirect_(topicId, partition, key, valueLen, ackHandle);
     ClaimGrant g;
-    // Backlog B6: the per-record cap, one O(1) compare (key + value <= 16 KiB).
-    if (key.size() + valueLen > rune::client::Producer::kMaxRecordBytes) {
-        g.result = SendResult::MessageTooLarge;
-        return g;
-    }
-    // fix1 minor 11 parity: a record this ring can NEVER hold is not back-pressure.
+    g.result = ringRecordFits_(key.size(), valueLen);   // B6 + "a record this ring can NEVER hold" (as a send)
+    if (g.result != SendResult::Ok) return g;
     const std::size_t totalLen = static_cast<std::size_t>(kRecHeaderSize) + valueLen;
-    if (totalLen > static_cast<std::size_t>(ring_.maxMsgLength())) {
-        g.result = SendResult::ValueTooLarge;
-        return g;
-    }
     aeron::util::index_t idx = -1;
     try {
         idx = ring_.tryClaim(kMsgSendRecord, totalLen);
@@ -3679,7 +3808,8 @@ ProducerImpl::ClaimGrant ProducerImpl::claimRecord(int32_t topicId, int32_t part
         return g;
     }
     uint8_t* dst = ring_.base() + idx;
-    writeClaimHeader(dst, topicId, partition, key, ackHandle);
+    writeRecordHeader(dst, topicId, partition, key.bytes().data(), key.size(),
+                      ackHandle != 0 ? kFlagWantAck : uint8_t{0}, static_cast<int64_t>(ackHandle));
     writeLE32u(dst, kRecValLenOff, valueLen);
     g.result = SendResult::Ok;
     g.token  = idx;
@@ -3707,13 +3837,13 @@ SendResult ProducerImpl::checkBatchClaim_(const Key& key, uint32_t n, uint32_t r
 }
 
 ProducerImpl::ClaimGrant ProducerImpl::claimBatch(int32_t topicId, int32_t partition, const Key& key, uint32_t n,
-                                                  uint32_t recLen) noexcept {
+                                                  uint32_t recLen, uint64_t ackHandle) noexcept {
     if (mode_ != IngressMode::Direct && txnGate_ == TxnGate::Closed) [[unlikely]] {
         ClaimGrant refused;
         refused.result = SendResult::NotInTransaction;
         return refused;
     }
-    if (mode_ == IngressMode::Direct) return claimBatchDirect_(topicId, partition, key, n, recLen);
+    if (mode_ == IngressMode::Direct) return claimBatchDirect_(topicId, partition, key, n, recLen, ackHandle);
     ClaimGrant g;
     const SendResult check = checkBatchClaim_(key, n, recLen);
     if (check != SendResult::Ok) {
@@ -3737,7 +3867,8 @@ ProducerImpl::ClaimGrant ProducerImpl::claimBatch(int32_t topicId, int32_t parti
         return g;
     }
     uint8_t* dst = ring_.base() + idx;
-    writeClaimHeader(dst, topicId, partition, key, 0);
+    writeRecordHeader(dst, topicId, partition, key.bytes().data(), key.size(),
+                      ackHandle != 0 ? kFlagWantAck : uint8_t{0}, static_cast<int64_t>(ackHandle));
     writeLE32u(dst, kBatchCountOff, n);
     writeLE32u(dst, kBatchRecLenOff, recLen);
     g.result = SendResult::Ok;
@@ -3748,13 +3879,21 @@ ProducerImpl::ClaimGrant ProducerImpl::claimBatch(int32_t topicId, int32_t parti
 
 bool ProducerImpl::commitClaim(int64_t token) noexcept {
     if (mode_ == IngressMode::Direct) return commitDirectClaim_(static_cast<uint64_t>(token));
+    // #327: the hand-over mark a send leaves (submitSendRecord) - corr = the claim's ack handle (0 for a void one).
+    // Read before the commit: after it the slot belongs to the duty side.
+    const auto     idx  = static_cast<aeron::util::index_t>(token);
+    const uint32_t corr = static_cast<uint32_t>(readLE64(ring_.base() + idx, kRecCorrIdOff));
+    bool committed = false;
     try {
-        ring_.commit(static_cast<aeron::util::index_t>(token));
+        ring_.commit(idx);
+        committed = true;
+        FLIGHT_RECORDER_MARK_PRODUCE(flight_recorder::Site::ClientAppSend, corr);
         return true;
     } catch (...) {
         // Released by Client close's drain unblock (closeFinal): the slot is
-        // padding now and is never read — nothing was accepted.
-        return false;
+        // padding now and is never read — nothing was accepted.  (A throw after
+        // the commit is only the trailing mark: published.)
+        return committed;
     }
 }
 
@@ -3770,14 +3909,31 @@ void ProducerImpl::abortClaim(int64_t token) noexcept {
     }
 }
 
-void ProducerImpl::abortClaimOffOwner(int64_t token) noexcept {
+void ProducerImpl::abortClaimOffOwner(int64_t token, bool heldCredit) noexcept {
     if (mode_ == IngressMode::Direct) {
-        std::fprintf(stderr, "rune producer: an Invoker claim was settled off its owner thread; it stays held until "
-                             "the producer closes (settle claims on the owner thread)\n");
+        // #656: the owner thread (only the cq / bq owner differed) rolls back at once; the queue credit cannot be
+        // returned off its owner (Thread mode's kMsgClaimCreditLost accounting).  Off the owner: the owner does it
+        // on its next duty pass.
+        if (std::this_thread::get_id() == dutyThreadId_) {
+            abortDirectClaim_(static_cast<uint64_t>(token));
+            if (heldCredit) noteClaimCreditLost_();   // #656: a plain claim held no queue credit
+            return;
+        }
+        uint8_t tok[9];
+        writeLE64(tok, 0, token);
+        tok[8] = heldCredit ? 1 : 0;
+        if (!writeToRing(kMsgDirectClaimAbort, tok, sizeof tok)) {
+            std::fprintf(stderr, "rune producer: an Invoker claim was settled off its owner thread and the producer "
+                                 "ring could not take the abort; it stays held until the producer closes\n");
+        }
         return;
     }
     try {
-        ring_.abortAs(static_cast<aeron::util::index_t>(token), kMsgClaimCreditLost);
+        if (heldCredit) {
+            ring_.abortAs(static_cast<aeron::util::index_t>(token), kMsgClaimCreditLost);
+        } else {
+            ring_.abort(static_cast<aeron::util::index_t>(token));   // #656: no credit held: plain padding
+        }
     } catch (...) {
         // Already released by the close-drain unblock: nothing left to report.
     }
@@ -3796,7 +3952,12 @@ SendResult ProducerImpl::directClaimGate_(int32_t topicId, int32_t partition) no
     // callback it fired) the builders may be mid-walk - use trySend() there.
     if (inDuty_) return SendResult::BackPressured;
     // This partition's deferred records go first (same rule as a send).
-    if (!deferred_.empty() && !settleDeferredFor_(topicId, partition)) return SendResult::BackPressured;
+    if (!deferred_.empty()) {
+        if (!settleDeferredFor_(topicId, partition)) return SendResult::BackPressured;
+        // The settle fires completions (a failed deferred record's): a handler may have closed the producer or
+        // ended the transaction.  Decide again - a claim never opens on a producer closed during its own gate.
+        if (const SendResult again = recheckAfterSettle_(); again != SendResult::Ok) return again;
+    }
     return SendResult::Ok;
 }
 
@@ -3839,7 +4000,7 @@ ProducerImpl::ClaimGrant ProducerImpl::claimRecordDirect_(int32_t topicId, int32
 }
 
 ProducerImpl::ClaimGrant ProducerImpl::claimBatchDirect_(int32_t topicId, int32_t partition, const Key& key,
-                                                         uint32_t n, uint32_t recLen) noexcept {
+                                                         uint32_t n, uint32_t recLen, uint64_t ackHandle) noexcept {
     using rune::client::detail::ControlledAction;
     ClaimGrant g;
     g.result = directClaimGate_(topicId, partition);
@@ -3851,7 +4012,7 @@ ProducerImpl::ClaimGrant ProducerImpl::claimBatchDirect_(int32_t topicId, int32_
     try {
         if (claimOffsets_.size() < n) claimOffsets_.resize(n);  // high-water mark: warm-up only
         PartitionState& ps = getOrCreatePartition(topicId, partition);
-        if (admitBatch_(ps, static_cast<uint8_t>(kb.size()), n, recLen) == ControlledAction::ABORT) {
+        if (admitBatch_(ps, static_cast<uint8_t>(kb.size()), n, recLen, ackHandle) == ControlledAction::ABORT) {
             g.result = SendResult::BackPressured;
             return g;
         }
@@ -3863,7 +4024,8 @@ ProducerImpl::ClaimGrant ProducerImpl::claimBatchDirect_(int32_t topicId, int32_
         for (uint32_t i = 0; i < n; ++i) {
             claimOffsets_[i] = static_cast<uint32_t>(ps.builder->reserveRecord(kv, recLen, ts));
         }
-        directClaim_ = DirectClaimOpen{ps.slotIndex, mark, first, static_cast<int32_t>(n), 0, 0, ++claimGen_};
+        directClaim_ = DirectClaimOpen{ps.slotIndex, mark, first, static_cast<int32_t>(n),
+                                       ackHandle != 0 ? kFlagWantAck : uint8_t{0}, ackHandle, ++claimGen_};
         g.result  = SendResult::Ok;
         g.token   = static_cast<int64_t>(claimGen_);
         g.base    = ps.builder->data();
@@ -3919,7 +4081,12 @@ const ProduceFrameBuilder::Mark* ProducerImpl::abandonDirectClaimOn_(PartitionSt
 }
 
 void ProducerImpl::abandonOpenClaimForClose() noexcept {
-    // Owner-thread, Direct-mode state: anything else is a no-op.
+    // #692: Owner-thread, Direct-mode state: anything else is a no-op (Thread mode has no Direct claim; off the
+    // owner thread the state is not ours to touch).  This guard IS the thread-owner check (dutyThreadId_), so no
+    // caller asserts it.  Every caller and why it is legal:
+    //  - Client::checkDrain_ (Client.cpp): the Client's close drain; it may run off the owner thread, then no-op.
+    //  - Producer.cpp (the owner's blocking close): only after an accepted beginClose.
+    //  - ProducerTxn.cpp (four sites): the owner / duty thread ending a transaction.
     if (mode_ != IngressMode::Direct || std::this_thread::get_id() != dutyThreadId_) return;
     const auto* o = std::get_if<DirectClaimOpen>(&directClaim_);
     if (o == nullptr) return;
@@ -3967,13 +4134,29 @@ template int ProducerImpl::retransmitStalled<CountingSink>(int64_t, const Counti
 
 namespace rune::client::producer {
 
-void ProducerImpl::enableCoordinator(CoordinatorSink sink, uint32_t seqBase) {
-    coord_.emplace(ordinal_, sink, seqBase);
+bool ProducerImpl::enableCoordinator(CoordinatorSink sink, uint32_t seqBase) {
+    // #343: moving a bare impl off the rig id resets its partitions; with batches in flight, id assignment would
+    // re-stamp them at sequence 0 under the new id (duplicate records).  The Client / ProducerHub always enable the
+    // coordinator before the first send; #693: a refusal (logged, nothing changed, no coordinator wired) is
+    // reported as false in every build, never an assert.
+    for (const auto& up : partitions_) {
+        if (!up->inflight.empty()) {
+            std::fprintf(stderr,
+                         "ProducerImpl: enableCoordinator refused: topic=%d part=%d has in-flight batches (enable the "
+                         "coordinator before the first send)\n",
+                         up->topicId, up->partition);
+            return false;
+        }
+    }
+    // #340: a plain producer's only coordinator request is its InitProducerId (one at a time): one preallocated
+    // slot; a transactional one needs the whole pool.  Allocated here (control plane), never grown.
+    coord_.emplace(ordinal_, sink, seqBase, transactional_() ? CoordinatorLink::kMaxCoordRequests : std::size_t{1});
     // A Client producer already expects its broker id (expectBrokerId, at creation); a hub fed a bare impl
     // moves it off the rig id here.
     if (const auto* a = std::get_if<IdAssigned>(&identity_); a != nullptr && a->producerId == kRigProducerId) {
         expectBrokerId();
     }
+    return true;
 }
 
 void ProducerImpl::expectBrokerId() {
@@ -4064,7 +4247,7 @@ CoordinatorLink::Slot* ProducerImpl::sendInitProducerId_(int64_t deadlineNs) noe
     } else {
         m.transactionTimeoutMs = 0;   // a plain producer has no transaction; an empty id = idempotent-only
     }
-    s->frameLen = static_cast<uint16_t>(m.encode(s->frame.data()));
+    s->setFrameLen(static_cast<uint16_t>(m.encode(s->frame.data())));
     coord_->submit(*s);
     identity_ = IdRequested{s};
     publishStatus_();
@@ -4096,6 +4279,9 @@ void ProducerImpl::onInitAnswer_(const CoordAnswer& a, CoordinatorLink::Slot&) n
         identity_ = IdFailed{OpStatus::DeliveryFailed, static_cast<uint16_t>(rpc::ErrorCode::InvalidRequest)};
     } else {
         // Anything the link did not retry (FD5/FD6): non-retriable, so every record fails explicitly.
+        // (#343: this includes a wired sequence overflow turning the new InitProducerId into IdFailed - the
+        // failAllPending below then fails every partition's still-in-flight batches DeliveryFailed although their
+        // outcome at the broker is unknown.  That is the close-immediately semantic, deliberately the same.)
         // An ErrorResponse carrying code 0 is a protocol error: InvalidRequest (39), never a code-less failure.
         const uint16_t ec = a.errorCode != 0 ? static_cast<uint16_t>(a.errorCode)
                                              : static_cast<uint16_t>(rpc::ErrorCode::InvalidRequest);
@@ -4120,7 +4306,7 @@ void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noex
     if (s == nullptr) return;
     // The answer's slot is released only after its machine handled it (and any completion it delivered): a
     // handler that issues the next op can never be handed this slot while its answer is still being read.
-    switch (s->kind) {
+    switch (s->kind()) {
     case ReqKind::InitProducerId: {
         const auto* r = std::get_if<IdRequested>(&identity_);
         if (r == nullptr || r->slot != s) break;   // stale
@@ -4145,7 +4331,7 @@ void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noex
 int ProducerImpl::pumpCoordinator(int64_t nowNs) noexcept {
     if (!coord_ || coord_->inUse() == 0) [[likely]] return 0;   // idle link: one load, no slot memory
     const int work = coord_->pump(nowNs, [this](CoordinatorLink::Slot& s) {
-        if (s.kind == ReqKind::InitProducerId && cfg_.transactionalId.empty()) onInitExpired_(s);
+        if (s.kind() == ReqKind::InitProducerId && cfg_.transactionalId.empty()) onInitExpired_(s);
         else onTxnSlotExpired_(s);   // the link releases the slot after this
     });
     if (work != 0 && transactional_()) noteEndReoffer_();   // Task 6 fix round 1 (I1)

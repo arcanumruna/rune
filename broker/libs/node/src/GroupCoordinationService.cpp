@@ -1609,8 +1609,11 @@ int16_t GroupCoordinationService::unstableFor_(int64_t sessionId)
     const int32_t v = clientVersionFn_ != nullptr ? clientVersionFn_(clientVersionCtx_, sessionId)
                     : gateway_ != nullptr        ? gateway_->sessionClientVersion(sessionId)
                                                  : -1;
+    // #472: a client below 10 gets NotLeader - the code its hub waits out with a paced re-fetch / re-send.  NotCoordinator
+    // would send a v9 hub to REJOIN the group (classifyGroupAnswer_: GroupVerdict::Rejoin), a rebalance of the whole
+    // group per answer for as long as the transaction holds the key.
     return static_cast<int16_t>(pc::clientUnderstandsUnstableOffsetCommit(v) ? pc::ErrorCode::UnstableOffsetCommit
-                                                                            : pc::ErrorCode::NotCoordinator);
+                                                                            : pc::ErrorCode::NotLeader);
 }
 
 // ---------------------------------------------------------------------------

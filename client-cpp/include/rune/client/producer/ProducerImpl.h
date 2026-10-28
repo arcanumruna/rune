@@ -84,6 +84,7 @@ inline constexpr int32_t kMsgClaimBatch  = 4; // Phase 2b B: claimBatch — n re
 inline constexpr int32_t kMsgTxnControl  = 5; // Phase 2b F: a transaction control op, FIFO with the records before it
 inline constexpr int32_t kMsgTier2Discard  = 6; // #341: a Tier-2 slot whose builder died off the batch thread
 inline constexpr int32_t kMsgClaimCreditLost = 7; // #322: a credit claim aborted off its queue's owner thread
+inline constexpr int32_t kMsgDirectClaimAbort = 8; // #656: an Invoker claim aborted / destroyed off its owner thread: the owner rolls it back (payload: the claim's gen, 8 bytes LE, then one byte: 1 = the claim held cq / bq credit)
 
 // TXN_CONTROL layout (kMsgTxnControl payload, little endian, Phase 2b F Task 8):
 //   [0]      kind          : u8  (TxnControl::Kind)
@@ -633,6 +634,17 @@ public:
     enum class TxnGate : uint8_t { NotTransactional, Closed, Open };
     [[nodiscard]] TxnGate txnGate() const noexcept { return txnGate_; }
     void setTxnGate(TxnGate g) noexcept { txnGate_ = g; }
+    /// #339: true when a produce would be refused NotInTransaction.  The credit-reserving forms (token sends, claims,
+    /// batchAcksTo) ask this FIRST, so a refusal never reserves (and gives back) cq / bq credit.  A plain producer
+    /// pays one compare; Direct mode answers only on its owner thread (the gate is owner-written there - any other
+    /// thread falls through to the normal WrongThread decision).
+    [[nodiscard]] bool gateRefusesBeforeCredit() const noexcept {
+        if (txnGate_ == TxnGate::NotTransactional) [[likely]] return false;
+        if (mode_ == IngressMode::Direct) {
+            return std::this_thread::get_id() == dutyThreadId_ && (txnGate_ == TxnGate::Closed || txnIntakeShut_());
+        }
+        return txnGate_ == TxnGate::Closed;
+    }
 
     /// Non-blocking submit (ZERO allocation, lock-free): checks the ring's closed
     /// word FIRST (fix1 C2/I3 — a Producer outliving its closed Client gets
@@ -665,8 +677,16 @@ public:
     /// CLAIM_BATCH ring message (header written, records contiguous at `base`).
     /// Refusals: InvalidArgument (n == 0), MessageTooLarge (per-record cap,
     /// maxFrameBytes bound, ring maxMsgLength), Closed, BackPressured.
+    /// `ackHandle` (#324, 0 = none): the ONE completion of the whole batch - stamped on the batch's FIRST record, so
+    /// it completes (with that record's offset) when the RecordBatch holding all n records is acknowledged.
     [[nodiscard]] ClaimGrant claimBatch(int32_t topicId, int32_t partition, const Key& key, uint32_t n,
-                                        uint32_t recLen) noexcept;
+                                        uint32_t recLen, uint64_t ackHandle = 0) noexcept;
+    /// claimBatch's never-retryable size rules, evaluated alone (no ring, no state): the Producer asks this BEFORE it
+    /// reserves n batch-ack credit units, so an impossible claim reports MessageTooLarge / InvalidArgument and never
+    /// QueueFull (a retry could not help) and never walks the reservation loop for a huge n.
+    [[nodiscard]] SendResult claimBatchShape(const Key& key, uint32_t n, uint32_t recLen) const noexcept {
+        return checkBatchClaim_(key, n, recLen);
+    }
     /// Publish a granted claim.  False: it was released under the caller
     /// (Ring: Client close's drain unblock) — nothing was accepted.
     [[nodiscard]] bool commitClaim(int64_t token) noexcept;
@@ -677,12 +697,23 @@ public:
         return mode_ != IngressMode::Direct || std::this_thread::get_id() == dutyThreadId_;
     }
     /// #322: abort a claim whose credit cannot be returned on this thread.  Thread mode: published as
-    /// kMsgClaimCreditLost (the duty side counts it, completes nothing).  Direct mode off the owner thread: owner
-    /// state is not touched; logged, and the claim stays held until the producer closes.
-    void abortClaimOffOwner(int64_t token) noexcept;
+    /// kMsgClaimCreditLost (the duty side counts it, completes nothing).  Direct mode (#656): on the owner thread
+    /// the claim is rolled back at once (a claim that held queue credit loses it: counted; heldCredit false counts nothing); off it, kMsgDirectClaimAbort is
+    /// published and the owner rolls the claim back on its next duty pass (only a full / closed ring logs).
+    void abortClaimOffOwner(int64_t token, bool heldCredit) noexcept;
     /// Phase 2b B (owner thread): Invoker claims abandoned while open - their
     /// partition's builder was failed / the producer closed; commit() returned false.
     [[nodiscard]] uint64_t claimsAbandoned() const noexcept { return claimsAbandoned_; }
+    /// #326: the public forms (Producer::claimsAbandoned, Claim::abandoned).  The abandon state is Invoker owner
+    /// thread state: anywhere else they report 0 / false instead of racing (Thread mode never abandons a claim).
+    [[nodiscard]] uint64_t claimsAbandonedChecked() const noexcept {
+        return maySettleClaim() ? claimsAbandoned_ : 0u;
+    }
+    [[nodiscard]] bool claimAbandoned(int64_t token) const noexcept {
+        if (mode_ != IngressMode::Direct || std::this_thread::get_id() != dutyThreadId_) return false;
+        const auto* a = std::get_if<DirectClaimAbandoned>(&directClaim_);
+        return a != nullptr && a->gen == static_cast<uint64_t>(token);
+    }
     [[nodiscard]] uint64_t claimCreditLost() const noexcept { return claimCreditLost_; }  // duty thread
     /// Test: true when [p, p+n) lies inside claimQuarantine_'s live size (owner thread).
     [[nodiscard]] bool claimQuarantineCovers(const uint8_t* p, std::size_t n) const noexcept {
@@ -851,6 +882,9 @@ public:
     /// accepts it or tier2Release returns it), or kNoTier2Slot when every slot is in
     /// use (the caller reports BackPressured).  Never allocates.
     [[nodiscard]] uint32_t tier2Acquire() noexcept;
+    /// #393: allocate the slot pool once (batch thread only: the first batch() / bindBatchThread()); a producer
+    /// that never uses Tier-2 reserves nothing.  False: out of memory (the caller reports BackPressured).
+    [[nodiscard]] bool ensureTier2Pool_() noexcept;
     /// Return a slot the caller still owns (a builder dropped before / without an
     /// accepted send) - exactly once per acquired slot.
     void tier2Release(uint32_t slot) noexcept {
@@ -872,14 +906,20 @@ public:
     /// Rebind the issuing thread to the caller, before the first batch() from the new thread.  A
     /// builder still live on the old thread is refused there and hands its slot back through the
     /// producer ring when it dies (#341), so t2Held_ may count slots in flight: no assert on it.
-    void bindBatchThread() noexcept { t2Thread_ = std::this_thread::get_id(); }
+    void bindBatchThread() noexcept {
+        t2Thread_ = std::this_thread::get_id();
+        (void)ensureTier2Pool_();   // #393 (an out-of-memory retry happens at the first batch()): the first use of Tier-2 by its owning thread allocates the pool
+    }
     [[nodiscard]] Tier2Slot& tier2Slot(uint32_t slot) noexcept { return tier2Pool_[slot]; }
     /// Largest RecordBatch (header + records) a slot holds.
     [[nodiscard]] std::size_t tier2SlotBytes() const noexcept { return tier2SlotBytes_; }
     /// Pool introspection (tests; BATCH-ISSUING THREAD ONLY - it drains the free ring): total
     /// slots, and slots not owned by a builder or the duty side (app-local free +
     /// returned-but-undrained).
-    [[nodiscard]] std::size_t tier2SlotCount() const noexcept { return tier2Pool_.size(); }
+    /// (The configured count: the pool itself is allocated by the first batch() / bindBatchThread(), #393.)
+    [[nodiscard]] std::size_t tier2SlotCount() const noexcept { return tier2Slots_; }
+    /// #393 test seam: bytes the Tier-2 slot pool reserves (0 until the first batch() / bindBatchThread()).
+    [[nodiscard]] std::size_t tier2ReservedBytes() const noexcept { return tier2Reserved_; }
     /// BATCH-ISSUING THREAD ONLY: collecting consumes the free ring (0 off that thread).
     [[nodiscard]] std::size_t tier2FreeCount() noexcept;
 
@@ -1253,7 +1293,7 @@ public:
     // ---- Phase 2b F Task 2: the coordinator link (duty thread only) -----------
     /// Emplaces the link with this producer's ordinal (ProducerHub::add, right after setOrdinal) and
     /// the sink to offer coordinator frames through.  Before it, a bare rig has no link.
-    void enableCoordinator(CoordinatorSink sink, uint32_t seqBase = 0);
+    [[nodiscard]] bool enableCoordinator(CoordinatorSink sink, uint32_t seqBase = 0);
     /// FD4: this producer's id comes from the broker, not the rig default.  Client::producer calls it on the
     /// creating thread, before the impl is shared, so the handle reports -1 until the id is assigned.
     void expectBrokerId();
@@ -1261,6 +1301,11 @@ public:
     [[nodiscard]] uint32_t coordinatorSeq() const noexcept { return coord_ ? coord_->seq() : 0; }
     [[nodiscard]] bool hasCoordinator() const noexcept { return coord_.has_value(); }
     [[nodiscard]] CoordinatorLink* coordinatorLink() noexcept { return coord_ ? &*coord_ : nullptr; }
+    /// Test hook (duty thread): the transaction step has nothing to do this pass (#346: a poisoned transaction does
+    /// no per-pass work once its unsent records are failed and its add queue is dropped).
+    [[nodiscard]] bool testTxnQuiet() const noexcept { return txnQuiet_(); }
+    /// Test hook (duty thread): partitions queued for the next AddPartitionsToTxn.
+    [[nodiscard]] std::size_t testTxnAddQueued() const noexcept { return txnAddQueue_.size(); }
     /// An answer routed here by ordinal (ProducerHub::onCoordinatorResponse).  The machines of Tasks
     /// 4-7 consume the settled slot; until then it is released here.
     void onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noexcept;
@@ -1504,6 +1549,8 @@ private:
     rune::client::detail::ControlledAction appendRecord_(int32_t topicId, int32_t partition,
         const uint8_t* keyBytes, uint8_t keyLen, const uint8_t* valBytes, uint32_t valueLen,
         uint8_t flags, uint64_t ackHandle, int64_t nowNs);
+    // [[gnu::always_inline]] members are DEFINED only in ProducerImpl.cpp: they may be called only from that
+    // translation unit (appendRecord_, the claim paths, the drain), never from another TU or a header.
     // Task 10 (perf): the per-record helpers below are force-inlined into the
     // send path (appendRecord_) — out of line they cost ~4 ns/record on the
     // plain send path (two extra calls + reloads per record).  Their rare
@@ -1522,11 +1569,13 @@ private:
     /// Same for a claimBatch of n x recLen: it joins a non-empty builder only
     /// when it fits whole (else flushRequested + ABORT); builder capacity for
     /// all n is reserved so appending them cannot throw (all or none).
+    /// `ackHandle` != 0 (#324): the batch's one completion; its ack-ring room is reserved too.
     rune::client::detail::ControlledAction admitBatch_(PartitionState& ps, uint8_t keyLen, uint32_t n,
-                                                       uint32_t recLen);
-    /// Append an admitted CLAIM_BATCH's n records (one timestamp), then account them.
+                                                       uint32_t recLen, uint64_t ackHandle);
+    /// Append an admitted CLAIM_BATCH's n records (one timestamp), then account them (`flags` / `ackHandle`: the
+    /// batch's completion, stamped on its first record).
     void appendBatch_(PartitionState& ps, const uint8_t* keyBytes, uint8_t keyLen, const uint8_t* recs,
-                      uint32_t n, uint32_t recLen, int64_t nowNs);
+                      uint32_t n, uint32_t recLen, uint8_t flags, uint64_t ackHandle, int64_t nowNs);
     /// Accounting after `count` records starting at offsetDelta `firstIndex`
     /// were written into ps.builder: batch clock, dirty list, the ack handle of
     /// an acked single record (room reserved by admitRecord_), wire size, count.
@@ -1579,9 +1628,24 @@ private:
     [[nodiscard]] ClaimGrant claimRecordDirect_(int32_t topicId, int32_t partition, const Key& key,
                                                 uint32_t valueLen, uint64_t ackHandle) noexcept;
     [[nodiscard]] ClaimGrant claimBatchDirect_(int32_t topicId, int32_t partition, const Key& key, uint32_t n,
-                                               uint32_t recLen) noexcept;
+                                               uint32_t recLen, uint64_t ackHandle) noexcept;
+    /// What a settle of deferred records (completions it fired may have closed the producer or ended the
+    /// transaction) can have changed since the caller's gate: Ok = still open for business.
+    [[nodiscard]] SendResult recheckAfterSettle_() const noexcept {
+        if (directClosed_) return SendResult::Closed;
+        if (txnGate_ != TxnGate::NotTransactional && (txnGate_ == TxnGate::Closed || txnIntakeShut_())) {
+            return SendResult::NotInTransaction;
+        }
+        return SendResult::Ok;
+    }
+    /// One record's ring-message size rules (B6 per-record cap, then the ring's own maxMsgLength): Ok,
+    /// MessageTooLarge or ValueTooLarge.  Shared by a send and a claim.
+    [[nodiscard]] SendResult ringRecordFits_(std::size_t keySize, std::size_t valueLen) const noexcept;
     [[nodiscard]] bool commitDirectClaim_(uint64_t gen) noexcept;
     void abortDirectClaim_(uint64_t gen) noexcept;
+    /// #655/#656: a Direct producer's ring carries only off-owner settle messages (kMsgTier2Discard,
+    /// kMsgDirectClaimAbort); the owner applies them here.  An empty ring costs one head/tail compare.
+    int drainDirectRing_(int messageLimit) noexcept;
 
     /// Double a partition's ack-ring, preserving live entries [ackTail, ackHead).
     /// Called only on overflow (deep single-partition pipeline); steady state
@@ -1735,6 +1799,8 @@ private:
     void failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st, uint16_t errorCode = 0);
     /// Fails the never-sent builder records of `ps` (handles + one BatchAck).
     void failBuilder_(PartitionState& ps, OpStatus st, uint16_t errorCode = 0);
+    /// #689: fail (never send) every Tier-2 batch queued on ps.
+    void failQueuedTier2_(PartitionState& ps, OpStatus st, uint16_t errorCode) noexcept;
     /// Draining: every accepted record completed and the ring consumed to the
     /// closed tail.
     [[nodiscard]] bool fullyDrained_() const noexcept;
@@ -1754,6 +1820,10 @@ private:
     // Both are immutable after construction (cfg_ is immutable).
     bool    frameCapped_ = false;
     int32_t effCap_      = 0;
+    /// #374: the frame capacity a partition's builder is created with - header space + max(batchBytes,
+    /// maxFrameBytes) + the one record that may overshoot a full builder - so no send / claim within the documented
+    /// limits ever grows it (computed once in the constructor).
+    std::size_t builderPrealloc_ = 0;
 
     // F8c C0: a flush() requested ON the duty thread (inside a callback) while
     // the ring is full cannot wait for ring room (it would wait on itself).  It
@@ -1788,13 +1858,19 @@ private:
     rune::client::detail::M2ORingBuffer      ring_;
     IngressMode  mode_       = IngressMode::Ring;  // set once before any send (Task 14)
     Completions* batchAckCq_ = nullptr;            // app side: reserve one unit per send (C6)
-    TxnGate      txnGate_    = TxnGate::NotTransactional;  // Phase 2b F: issuing thread only (FD2)
 
-    // ---- Tier-2 slot pool (preallocated once; see Tier2Slot) ------------------
+    // #339: the transactional gate is WRITTEN at every transaction boundary (begin / commit / abort, by the issuing
+    // thread), so it sits on a cache line of its own - not on the setup-only line above, which every send reads.
+    // (The duty-side ring consumer reads it too; it is a plain byte, not coordination.)
+    alignas(64) TxnGate txnGate_ = TxnGate::NotTransactional;  // Phase 2b F: issuing thread only (FD2)
+
+    // ---- Tier-2 slot pool (allocated by the first batch(); see Tier2Slot) -------
     // App side (the single batch-issuing thread): tier2AppFree_[0, tier2AppFreeN_) are
     // free slot indices it owns outright; when empty it drains tier2Free_ (the duty
     // side's returns) into it.  Duty side: t2Return_ writes tier2Free_.
-    std::vector<Tier2Slot>                    tier2Pool_;
+    alignas(64) std::vector<Tier2Slot>        tier2Pool_;   // empty until ensureTier2Pool_() (#393)
+    std::size_t                               tier2Slots_ = 0;      ///< the configured slot count
+    std::size_t                               tier2Reserved_ = 0;   ///< bytes the allocated pool reserves
     std::size_t                               tier2SlotBytes_ = 0;
     std::unique_ptr<uint8_t, void(*)(void*)>  tier2FreeBuf_;
     rune::client::detail::OneToOneRingBuffer  tier2Free_;
@@ -1840,7 +1916,8 @@ private:
     void restampInflight_(PartitionState& ps) noexcept;
     void publishStatus_() noexcept;
     void drainStatus_() noexcept { statusRing_.drainLatest(appStatus_); }
-    // 4096 bytes (~170 snapshots): every identity AND transaction transition publishes one (FD9).
+    // 4096 BYTES of ring (not FD9's early `StatusRing<ProducerStatus, 64>`: the capacity is in bytes), i.e. ~170
+    // snapshots: every identity AND transaction transition publishes one (FD9); only the newest matters.
     detail::StatusRing<ProducerStatus, 4096> statusRing_;
     ProducerStatus appStatus_{};   // the bound app thread's cache (it alone drains the ring)
     // Duty side: is the newest snapshot in the ring?  A refused tryPublish keeps the snapshot here and it is
@@ -1854,9 +1931,10 @@ private:
     static constexpr std::size_t kInitializingIdx = static_cast<std::size_t>(TxnState::Initializing);
     static constexpr std::size_t kCommittingIdx   = static_cast<std::size_t>(TxnState::CommittingTransaction);
     static constexpr std::size_t kAbortingIdx     = static_cast<std::size_t>(TxnState::AbortingTransaction);
+    static constexpr std::size_t kAbortableErrorIdx = static_cast<std::size_t>(TxnState::AbortableError);
     /// Pending flush(target, token) ops: a compact prefix [0, txnFlushN_) (zero allocation; one more completes
-    /// BrokerError(19)).
-    static constexpr std::size_t kMaxTxnFlushes = 8;
+    /// InvalidArgument).
+    static constexpr std::size_t kMaxTxnFlushes = kMaxTxnFlushCalls;
     TxnMachine                          txn_{Uninitialized{}};
     std::array<TxnOp, kMaxTxnFlushes>   txnFlushes_{};
     uint8_t                             txnFlushN_        = 0;
@@ -1874,7 +1952,12 @@ private:
     [[nodiscard]] bool txnQuiet_() const noexcept {
         const std::size_t i = txn_.index();
         return txnFlushN_ == 0 && i != kInitializingIdx && i != kCommittingIdx && i != kAbortingIdx &&
-               txnAddQueue_.empty() && offsetsOp_.index() == 0 && !fatalPending_;
+               txnAddQueue_.empty() && offsetsOp_.index() == 0 && !fatalPending_ && !poisonDiscardPending_();
+    }
+    /// #368: an AbortableError whose unsent records the next txnStepCold_ pass still fails.
+    [[nodiscard]] bool poisonDiscardPending_() const noexcept {
+        if (txn_.index() != kAbortableErrorIdx) return false;
+        return std::get<AbortableError>(txn_).discard == PoisonDiscard::Pending;
     }
     // ---- Phase 2b F Task 7: sendOffsetsToTransaction (ProducerTxn.cpp; duty thread only) ----
     /// The copy of the call's offsets + group id the op runs from (the caller's span / the Thread-mode ring payload
@@ -1937,6 +2020,10 @@ private:
     /// Abort (AwaitData): every record of the producer not yet sent completes `o`, never produced; an
     /// AddPartitionsToTxn still on the link is cancelled.  True when anything was discarded / cancelled.
     bool txnDiscardUnsent_(const TxnOutcome& o) noexcept;
+    /// Every record of the producer not yet sent (deferred, builders, Tier-2) completes `o`, never produced.  True when
+    /// any was dropped.  The abort's discard (above) and the poison's (#368: txnStepCold_, the pass after the
+    /// transaction became AbortableError) share it.
+    bool txnFailUnsentRecords_(const TxnOutcome& o) noexcept;
     /// FD2 duty re-check, Ring mode: reads up to `limit` ring messages and refuses each record (never produced).
     /// Stops (lastDrainStop_ Blocked, the message left in the ring) at any message that is not a record / flush.
     [[gnu::cold, gnu::noinline]] int refuseRingTxn_(int limit) noexcept;
@@ -2028,15 +2115,6 @@ private:
     };
     // Phase 2b F Task 5: close() of a transactional producer with a transaction open (or an op running) ends it
     // first - its own EndTxn(abort), or the running commit / abort / init - then drains as LifeDraining.
-    struct CloseAbortNone {};
-    struct CloseAbortRunning {};
-    struct CloseAbortDone { OpStatus status = OpStatus::Ok; uint16_t errorCode = 0; };
-    struct LifeEndingTxn {
-        detail::OpTarget target{};
-        Token            token      = 0;
-        int64_t          deadlineNs = 0;   ///< transactionOpTimeoutMs
-        std::variant<CloseAbortNone, CloseAbortRunning, CloseAbortDone> own{};
-    };
     std::variant<LifeOpen, LifeDraining, LifeClosed, LifeDiscarding, LifeEndingTxn> life_{};
     [[nodiscard]] bool endingTxn_() const noexcept { return std::holds_alternative<LifeEndingTxn>(life_); }
     // Duty side: the intake is closed and the duty side knows it (Draining /
@@ -2204,6 +2282,7 @@ static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::InTransaction), TxnMachine>, InTransaction>);
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::CommittingTransaction), TxnMachine>, Committing>);
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::AbortingTransaction), TxnMachine>, Aborting>);
+static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::AbortableError), TxnMachine>, AbortableError>);
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::AbortableError), TxnMachine>, AbortableError>);
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::FatalError), TxnMachine>, FatalError>);
 

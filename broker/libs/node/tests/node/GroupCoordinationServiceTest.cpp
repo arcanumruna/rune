@@ -2477,7 +2477,7 @@ TEST(OffsetCommitDurabilityRegression, AFetchOfAParkedCommitIsRetriableUntilItsR
         static int32_t of(void* ctx, int64_t) noexcept { return static_cast<Version*>(ctx)->v; }
     };
     const auto unstable = static_cast<int16_t>(pc::ErrorCode::UnstableOffsetCommit);
-    const auto notCoord = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+    const auto notCoord = static_cast<int16_t>(pc::ErrorCode::NotLeader);   // #472: what a client below 10 is answered
     for (const int32_t version : {10, 9}) {
         SCOPED_TRACE(::testing::Message() << "version=" << version);
         const std::string group = "g471v" + std::to_string(version);
@@ -2650,7 +2650,7 @@ TEST(OffsetCommitDurabilityRegression, AFullParkRefusesNotCoordinatorWithoutAppe
 }
 
 // #438 × request kind × client version: Free serves; Held / Unknown answer the retriable code (50 to a client >= 10
-// or of unknown version, NotCoordinator below) and append nothing.
+// or of unknown version, NotLeader below - #472) and append nothing.
 TEST(OffsetCommitDurabilityRegression, HoldStateByRequestByClientVersionMatrixRegression) {
     using H = rune::coordination::TxnOffsetHold;
     struct Probe {
@@ -2662,7 +2662,7 @@ TEST(OffsetCommitDurabilityRegression, HoldStateByRequestByClientVersionMatrixRe
         static int32_t of(void* ctx, int64_t) noexcept { return static_cast<Version*>(ctx)->v; }
     };
     const auto unstable = static_cast<int16_t>(pc::ErrorCode::UnstableOffsetCommit);
-    const auto notCoord = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+    const auto notCoord = static_cast<int16_t>(pc::ErrorCode::NotLeader);   // #472: what a client below 10 is answered
     int row = 0;
     for (const H hold : {H::Free, H::Held, H::Unknown}) {
         for (const int32_t version : {-1, 9, 10}) {
@@ -2701,6 +2701,70 @@ TEST(OffsetCommitDurabilityRegression, HoldStateByRequestByClientVersionMatrixRe
                 EXPECT_EQ(CommitRig::codeOf(g.out, n), refused);
                 EXPECT_EQ(g.rep.logEndOffset(), leo) << "a plain record was appended over a held key";
             }
+        }
+    }
+}
+
+// #472: a client below 10 does not know UnstableOffsetCommit (50).  The code it is answered for a transaction-held
+// offset must be one its v9 hub waits out WITHOUT leaving the group: v9 classifyGroupAnswer_ sends NotCoordinator /
+// RebalanceInProgress / UnknownMember / IllegalGeneration / StaleGeneration to a REJOIN (a rebalance of the whole
+// group per answer, for as long as the hold lasts), and every code outside the rejoin / refuse sets (NotLeader among
+// them) to a paced re-fetch.  Pinned per request type (OffsetFetch, fetch-all, plain OffsetCommit) and version.
+// RED (the old NotCoordinator for version 9): the v9 rows answer a rejoin code.
+TEST(OffsetCommitDurabilityRegression, OldClientHeldOffsetAnswerNeverForcesARejoinRegression) {
+    using H = rune::coordination::TxnOffsetHold;
+    struct Probe {
+        H hold = H::Held;
+        static H of(void* ctx, const std::string&, const TopicPartition&) { return static_cast<Probe*>(ctx)->hold; }
+    };
+    struct Version {
+        int32_t v = -1;
+        static int32_t of(void* ctx, int64_t) noexcept { return static_cast<Version*>(ctx)->v; }
+    };
+    // The codes a v9 GroupConsumerHub answers with a rejoin (classifyGroupAnswer_ -> GroupVerdict::Rejoin).
+    const auto isV9Rejoin = [](int16_t code) {
+        using EC = pc::ErrorCode;
+        const auto ec = static_cast<EC>(code);
+        return ec == EC::NotCoordinator || ec == EC::RebalanceInProgress || ec == EC::UnknownMember ||
+               ec == EC::IllegalGeneration || ec == EC::StaleGeneration;
+    };
+    struct Row { int32_t version; pc::ErrorCode want; };
+    const Row rows[] = {{9, pc::ErrorCode::NotLeader}, {5, pc::ErrorCode::NotLeader},
+                        {10, pc::ErrorCode::UnstableOffsetCommit}, {pc::kClientVersion, pc::ErrorCode::UnstableOffsetCommit},
+                        {-1, pc::ErrorCode::UnstableOffsetCommit}};
+    int n = 0;
+    for (const H hold : {H::Held, H::Unknown}) {
+        for (const Row& row : rows) {
+            const std::string group = "g472_" + std::to_string(n++);
+            SCOPED_TRACE(::testing::Message() << "hold=" << static_cast<int>(hold) << " version=" << row.version);
+            CommitRig g(group);
+            Probe probe{H::Free};
+            Version ver{row.version};
+            g.svc.setClientVersionResolverForTest(&Version::of, &ver);
+            ASSERT_EQ(g.commit(group, 40), 0u);
+            g.fetch();
+            g.svc.doWork(g.clock);
+            probe.hold = hold;
+            g.svc.setTxnOffsetHoldProbe(&Probe::of, &probe);
+            const auto want = static_cast<int16_t>(row.want);
+            // OffsetFetch of one entry
+            std::size_t len = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, group, kTestTopicId, 0),
+                                                      g.clock, g.out, sizeof g.out);
+            auto f = pc::OffsetFetchResponse::decode(g.out, len);
+            ASSERT_TRUE(f && f->results.size() == 1u);
+            EXPECT_EQ(f->results[0].errorCode, want) << "OffsetFetch";
+            EXPECT_FALSE(row.version >= 0 && row.version < 10 && isV9Rejoin(f->results[0].errorCode));
+            // OffsetFetch of every committed offset
+            len = g.svc.handleOffsetFetch(g.req, encodeOffsetFetchAll(g.req, 1, g.corr++, group), g.clock, g.out, sizeof g.out);
+            f = pc::OffsetFetchResponse::decode(g.out, len);
+            ASSERT_TRUE(f && f->results.size() == 1u);
+            EXPECT_EQ(f->results[0].errorCode, want) << "OffsetFetch (all)";
+            EXPECT_FALSE(row.version >= 0 && row.version < 10 && isV9Rejoin(f->results[0].errorCode));
+            // plain OffsetCommit
+            len = g.commit(group, 41);
+            ASSERT_GT(len, 0u);
+            EXPECT_EQ(CommitRig::codeOf(g.out, len), want) << "OffsetCommit";
+            EXPECT_FALSE(row.version >= 0 && row.version < 10 && isV9Rejoin(CommitRig::codeOf(g.out, len)));
         }
     }
 }
@@ -4289,7 +4353,7 @@ TEST(GroupCoordinationServiceRegression, SessionTimeoutBelowTheMinimumIsRaisedTo
 // ===========================================================================
 // #498: a fetch-all answered only the retriable {-1, -1} sentinel while ANY key of the group had a record above the
 // high watermark, so steady commits on one key starved a listing of all the others.  Each unstable key is now listed
-// with the retriable code (UnstableOffsetCommit from client 10, NotCoordinator below) and offset -1 - exactly as a
+// with the retriable code (UnstableOffsetCommit from client 10, NotLeader below - #472) and offset -1 - exactly as a
 // specific fetch answers it - and every stable key with its offset.  #471 holds: an unstable value is never served.
 // ===========================================================================
 namespace {
@@ -4333,7 +4397,7 @@ TEST(OffsetCommitDurabilityRegression, AFetchAllListsStableKeysWhileAnotherKeyIs
         FetchVersion498 ver{version};
         g.svc.setClientVersionResolverForTest(&FetchVersion498::of, &ver);
         const auto retriable = static_cast<int16_t>(version >= 10 ? pc::ErrorCode::UnstableOffsetCommit
-                                                                  : pc::ErrorCode::NotCoordinator);
+                                                                  : pc::ErrorCode::NotLeader);
         ASSERT_EQ(commit498(g, group, kTestTopicId, 0, 11), 0u);
         ASSERT_EQ(commit498(g, group, kTestTopicId, 1, 22), 0u);
         g.fetch();
@@ -4800,7 +4864,7 @@ TEST(GroupCoordinationServiceRegression, TheLargestMemberLeavingMidRebalanceLeav
 }
 
 // Version skew (#498): for every client version, a fetch-all lists a stable key with its offset and an unstable key
-// with exactly the code a specific fetch of that key answers (UnstableOffsetCommit from 10, NotCoordinator below), never
+// with exactly the code a specific fetch of that key answers (UnstableOffsetCommit from 10, NotLeader below - #472), never
 // a value.  RED (UnstableOffsetCommit for every version): the rows below 10 differ from the specific fetch.
 TEST(OffsetCommitDurabilityRegression, AFetchAllAnswersEachUnstableKeyLikeASpecificFetchForEveryClientVersionAdversarialRegression) {
     for (const int32_t version : {pc::kClientVersion, 10, 9, 5, 4, 1}) {
@@ -4814,7 +4878,7 @@ TEST(OffsetCommitDurabilityRegression, AFetchAllAnswersEachUnstableKeyLikeASpeci
         g.svc.doWork(g.clock);
         ASSERT_EQ(commitCode616(g, group, g.member, g.gen, 1, 22), 0);   // parked: above the high watermark
         const auto want = static_cast<int16_t>(version >= 10 ? pc::ErrorCode::UnstableOffsetCommit
-                                                             : pc::ErrorCode::NotCoordinator);
+                                                             : pc::ErrorCode::NotLeader);
         const auto specific = fetchOne616(g, group, 1);
         EXPECT_EQ(specific, std::make_pair(want, int64_t{-1}));
         const auto all = fetchAll498(g, group);
@@ -4937,4 +5001,107 @@ TEST_F(CG3ServiceTest, MaxGroupsPerNamespaceRegression) {
     rec(1, "a", 1);
     mirror.upsert([&] { cat::NamespaceRecord r; r.nsId = 1; r.name = "a"; r.version = 2; r.limits.maxGroups = 1; return r; }());
     EXPECT_EQ(join(ctxA, "g5", pc::kClientVersion), kLimitCode);
+// C16 adversarial review (#472): the held-offset answer by client version, at every bound and on every path
+// ===========================================================================
+
+// Version skew x input bounds: every client version a session can announce (negative = unknown, 0, the 9/10 edge,
+// the current version, INT32_MAX) on every path that answers a held / unknown-hold key: OffsetFetch of one entry,
+// fetch-all, plain OffsetCommit, a two-entry OffsetFetch with one held key next to a free one (only the held entry
+// carries the code; the free one is served), and an offset whose record is not committed yet (#471).  Below 10 the
+// answer is NotLeader (never a code a v9 hub rejoins on, never 50 which it does not know); unknown and >= 10 get
+// UnstableOffsetCommit.  Mutation: `v < 10` -> `v < 9` in clientUnderstandsUnstableOffsetCommit, or NotCoordinator
+// in unstableFor_ -> red.
+TEST(OffsetCommitDurabilityRegression, HeldOffsetAnswerByVersionAtEveryBoundAndPathAdversarialRegression) {
+    using H  = rune::coordination::TxnOffsetHold;
+    using EC = pc::ErrorCode;
+    struct Probe {
+        H hold = H::Free;
+        bool onlyP0 = false;   // hold partition 0 only (the mixed two-entry fetch)
+        static H of(void* ctx, const std::string&, const TopicPartition& t) {
+            const auto* p = static_cast<Probe*>(ctx);
+            return p->onlyP0 && t.partition != 0 ? H::Free : p->hold;
+        }
+    };
+    struct Version {
+        int32_t v = -1;
+        static int32_t of(void* ctx, int64_t) noexcept { return static_cast<Version*>(ctx)->v; }
+    };
+    const auto expected = [](int32_t v) {
+        return v >= 0 && v < pc::kClientVersionTxnOffsetFence ? static_cast<int16_t>(EC::NotLeader)
+                                                              : static_cast<int16_t>(EC::UnstableOffsetCommit);
+    };
+    const int32_t versions[] = {std::numeric_limits<int32_t>::min(), -2, -1, 0, 1, 8, 9, 10, 11,
+                                pc::kClientVersion, std::numeric_limits<int32_t>::max()};
+    ASSERT_EQ(pc::kClientVersionTxnOffsetFence, 10);
+    int n = 0;
+    for (const H hold : {H::Held, H::Unknown}) {
+        for (const int32_t v : versions) {
+            SCOPED_TRACE(::testing::Message() << "hold=" << static_cast<int>(hold) << " version=" << v);
+            const std::string group = "g472adv_" + std::to_string(n++);
+            const int16_t want = expected(v);
+            CommitRig g(group);
+            Probe probe;
+            Version ver{v};
+            g.svc.setClientVersionResolverForTest(&Version::of, &ver);
+            ASSERT_EQ(g.commit(group, 40), 0u);
+            ASSERT_EQ(g.svc.handleOffsetCommit(g.req, encodeOffsetCommit(g.req, 1, g.corr++, group, g.member, g.gen,
+                                                                         kTestTopicId, 1, 70),
+                                               g.clock, g.out, sizeof g.out), 0u);
+            g.fetch();
+            g.svc.doWork(g.clock);
+            g.svc.setTxnOffsetHoldProbe(&Probe::of, &probe);
+            probe.hold = hold;
+            // one entry
+            std::size_t len = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, group, kTestTopicId, 0),
+                                                      g.clock, g.out, sizeof g.out);
+            auto f = pc::OffsetFetchResponse::decode(g.out, len);
+            ASSERT_TRUE(f && f->results.size() == 1u);
+            EXPECT_EQ(f->results[0].errorCode, want) << "OffsetFetch";
+            EXPECT_EQ(f->results[0].offset, -1) << "a held offset was handed out";
+            // fetch-all
+            len = g.svc.handleOffsetFetch(g.req, encodeOffsetFetchAll(g.req, 1, g.corr++, group), g.clock, g.out, sizeof g.out);
+            f = pc::OffsetFetchResponse::decode(g.out, len);
+            ASSERT_TRUE(f && !f->results.empty());
+            for (const auto& r : f->results) EXPECT_EQ(r.errorCode, want) << "OffsetFetch (all)";
+            // plain OffsetCommit
+            len = g.commit(group, 41);
+            ASSERT_GT(len, 0u);
+            EXPECT_EQ(CommitRig::codeOf(g.out, len), want) << "OffsetCommit";
+            // two entries, p0 held and p1 free
+            probe.onlyP0 = true;
+            {
+                pc::OffsetFetch msg;
+                msg.sessionId     = 1;
+                msg.correlationId = g.corr++;
+                msg.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+                std::array<pc::OffsetFetchEntry, 2> es{};
+                es[0].topicId = kTestTopicId; es[0].partition = 0;
+                es[1].topicId = kTestTopicId; es[1].partition = 1;
+                len = g.svc.handleOffsetFetch(g.req, msg.encode(g.req, std::span<const pc::OffsetFetchEntry>(es)),
+                                              g.clock, g.out, sizeof g.out);
+            }
+            f = pc::OffsetFetchResponse::decode(g.out, len);
+            ASSERT_TRUE(f && f->results.size() == 2u);
+            for (const auto& r : f->results) {
+                if (r.partition == 0) {
+                    EXPECT_EQ(r.errorCode, want) << "mixed: the held entry";
+                } else {
+                    EXPECT_EQ(r.errorCode, int16_t{0}) << "mixed: the free entry";
+                    EXPECT_EQ(r.offset, 70);
+                }
+            }
+            // #471: a parked (uncommitted) offset record, nothing held
+            probe.hold   = H::Free;
+            probe.onlyP0 = false;
+            ASSERT_EQ(g.svc.handleOffsetCommit(g.req, encodeOffsetCommit(g.req, 1, g.corr++, group, g.member, g.gen,
+                                                                         kTestTopicId, 1, 90),
+                                               g.clock, g.out, sizeof g.out), 0u);
+            len = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, group, kTestTopicId, 1),
+                                          g.clock, g.out, sizeof g.out);
+            f = pc::OffsetFetchResponse::decode(g.out, len);
+            ASSERT_TRUE(f && f->results.size() == 1u);
+            EXPECT_EQ(f->results[0].errorCode, want) << "a parked offset record";
+            EXPECT_EQ(f->results[0].offset, -1);
+        }
+    }
 }

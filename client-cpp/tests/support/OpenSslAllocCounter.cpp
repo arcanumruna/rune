@@ -19,7 +19,11 @@ void* countingMalloc(std::size_t n, const char*, int) {
 }
 void* countingRealloc(void* p, std::size_t n, const char*, int) {
     alloc_counter::noteExternal();
-    return std::realloc(p, n != 0 ? n : 1);
+    if (n == 0) {   // #675: libc / OpenSSL semantics - realloc(p, 0) frees p
+        std::free(p);
+        return nullptr;
+    }
+    return std::realloc(p, n);
 }
 void countingFree(void* p, const char*, int) { std::free(p); }
 

@@ -41,6 +41,7 @@
 
 #pragma once
 
+#include <limits>
 #include <rune/client/agent/ClientAgent.h>
 #include <rune/client/session/SessionMachine.h>
 #include <rune/client/codec/Codec.h>
@@ -599,6 +600,9 @@ public:
     /// Test hook: producers adopted by the duty-cycle thread.
     [[nodiscard]] std::size_t testProducerCount() const noexcept { return producerHub_.size(); }
     /// Test hook: fill the agent command ring so the next registration finds it full.
+    /// Issue #60: how many Rejected-route sweeps ran (edge-triggered: one per Rejected edge / refused routing).
+    [[nodiscard]] uint64_t routedBrokerSweeps() const noexcept { return routedBrokerSweeps_; }
+    [[nodiscard]] uint32_t rejectedLeaderSessionsForTest() const noexcept { return agent_.rejectedLeaderSessions(); }
     [[nodiscard]] std::string_view testAgentSecret() const noexcept { return agent_.secretForTest().view(); }
     /// The command ring's record area (not the position trailer): a consumed record must be zeroed.
     [[nodiscard]] std::span<const uint8_t> testCommandRingBytes() noexcept {
@@ -780,8 +784,10 @@ public:
     [[nodiscard]] AuthStatus authStatus() const;
 
     /// The broker error code that ended the seed session for good (SessionRevoked 46, AuthenticationFailed 44, ...), or 0
-    /// while the session is not Rejected.  The duty thread only (Invoker owner / a callback); any other thread gets 0.
-    [[nodiscard]] int16_t sessionRejectCode() const noexcept;
+    /// while the session is not Rejected.  Same threading rule as state(): the duty thread (Invoker owner / a callback)
+    /// reads the machine, the owner thread (Thread mode) the latest published status; any other thread throws
+    /// std::logic_error.
+    [[nodiscard]] int16_t sessionRejectCode() const;
 
     // -------------------------------------------------------------------------
     // Control ops (F8c C3) — completion tokens, no futures
@@ -1107,6 +1113,12 @@ public:
     OpResult namespaceUsage(std::string_view name, CompletionTarget target, Token token);
     NamespaceResult<rune::protocol::client::NamespaceUsageResponse>
     namespaceUsage(std::string_view name, std::chrono::milliseconds timeout = std::chrono::seconds(30));
+    /// Issue #641: changes only the limits `patch` names (its `present` bits are the wire mask); the broker applies
+    /// them onto the CURRENT committed record, so a concurrent change to another limit is never overwritten.
+    /// Throws std::invalid_argument when the patch names no limit, or a limit bit outside kNamespaceFullMask (before
+    /// anything is sent).
+    NamespaceResult<void> setNamespaceLimits(std::string_view name, const NamespaceLimitsPatch& patch,
+                                             std::chrono::milliseconds timeout = std::chrono::seconds(30));
     /// Every namespace this session may see, in nsId order (pages internally).
     NamespaceResult<std::vector<rune::protocol::client::NamespaceInfo>>
     listNamespaces(std::chrono::milliseconds timeout = std::chrono::seconds(30));
@@ -1125,9 +1137,12 @@ public:
     /// topic has evolved: it binds to (and every send() stamps) the version it
     /// was actually compiled against, instead of whatever is latest.
     ///
-    /// A broker errorCode (no version has that fingerprint — UnknownSchema or
-    /// equivalent) throws the same "stale generated type" error as an exact
-    /// descriptor mismatch did before Task 18 added fingerprint selection.
+    /// Issue #22: a failure throws std::runtime_error with one of three messages.  UnknownTopic is ambiguous (the
+    /// topic is missing, or no version has that fingerprint): one more GetTopicSchema(name, latest) tells them apart.
+    ///   - "topic '<name>' does not exist" - the topic is not defined;
+    ///   - "generated type is stale — rerun rune schema generate" - the topic exists but no version has T's
+    ///     fingerprint, or the returned descriptor does not match it;
+    ///   - "the broker refused '<name>' (error <code>[ <Name>])" - any other broker error.
     ///
     /// Belt-and-suspenders (consistency with TypedTopic::fromSchema, which
     /// still performs this check on its own completion path): even on a
@@ -1143,17 +1158,10 @@ public:
     template <class T>
     [[nodiscard]] TypedTopic<T> openTopicAndWait(std::string_view name,
                                                  std::chrono::nanoseconds timeout = kDefaultWaitTimeout) {
-        TopicSchemaResult r = getTopicSchemaAndWait(name, T::kFingerprint, timeout);
-        if (r.errorCode != 0) {
-            throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
-        }
-        if (!schemaMatches(T::kFingerprint, std::span<const uint8_t>(r.descriptorBlob))) {
-            throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
-        }
+        const TopicSchemaResult r = openTypedSchema_<T>(name, timeout);
         // Phase 2b Part C: route over the topic's partitions (broker-reported;
         // a pre-2b broker reports 0 -> 1, the pre-2b partition-0 behaviour).
-        return TypedTopic<T>(producer(), TopicHandle{r.topicId, typedPartitionCount(r.partitionCount)},
-                             r.version);
+        return TypedTopic<T>(producer(), TopicHandle{r.topicId, typedPartitionCount(r.partitionCount)}, r.version);
     }
 
     /// #418: the run-time lineage of the generated type T for topic `name` (T::Lineage), built from the topic's
@@ -1166,13 +1174,26 @@ public:
     template <class T>
     [[nodiscard]] typename T::Lineage lineageAndWait(std::string_view name,
                                                      std::chrono::nanoseconds timeout = kDefaultWaitTimeout) {
+        const auto started = std::chrono::steady_clock::now();
         TopicSchemaResult r = getTopicSchemaAndWait(name, rune::protocol::client::kSchemaLineageFingerprint, timeout);
-        if (r.errorCode != 0) {
-            throw std::runtime_error("lineage: the broker did not serve the schema lineage of '" + std::string(name) +
-                                     "' (error " + std::to_string(r.errorCode) + ")");
-        }
+        if (r.errorCode != 0)   // Issue #435: the probe gets only what is left of `timeout`
+            throw std::runtime_error(lineageFailure(
+                name, r.errorCode, timeout - (std::chrono::steady_clock::now() - started)));
         return T::lineage(rune::codec::deserialize(std::span<const uint8_t>(r.descriptorBlob)));
     }
+
+    /// Internal (Issue #22): the open failure for a GetTopicSchema(name, fingerprint) error `code`; cold path, throws,
+    /// never returns.  @p remaining is what is left of the caller's wait budget (the UnknownTopic probe waits at most
+    /// that long and is skipped when nothing is left).
+    [[noreturn]] void throwOpenTopicFailure(std::string_view name, uint16_t code, std::chrono::nanoseconds remaining);
+
+    /// Issue #435: the message for a failed schema-lineage request.  On UnknownTopic it probes the latest schema
+    /// (fingerprint 0): served -> the broker predates lineage; UnknownTopic -> the topic does not exist.  Runs on the
+    /// caller's thread, exactly like lineageAndWait; a probe that fails otherwise names the original code as
+    /// "(<Name> <code>)".  @p remaining is what is LEFT of the caller's wait budget (the lineage request already
+    /// used part of it): the probe waits at most that long, and is skipped (plain code text) when nothing is left.
+    [[nodiscard]] std::string lineageFailure(std::string_view topic, uint16_t code,
+                                             std::chrono::nanoseconds remaining = kDefaultWaitTimeout);
 
     /// Phase 2b F (FD7): the same version-binding open, but the typed topic BORROWS `shared` instead of owning
     /// a producer of its own - its sends and claims go through that producer, inside its transaction when one
@@ -1180,10 +1201,12 @@ public:
     template <class T>
     [[nodiscard]] TypedTopic<T, ProducerRef> openTopicAndWait(std::string_view name, Producer& shared,
                                                               std::chrono::nanoseconds timeout = kDefaultWaitTimeout) {
-        TopicSchemaResult r = getTopicSchemaAndWait(name, T::kFingerprint, timeout);
-        if (r.errorCode != 0 || !schemaMatches(T::kFingerprint, std::span<const uint8_t>(r.descriptorBlob))) {
-            throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
+        // #349: the borrowed producer must be this Client's (a ProducerRef sends through ITS client's duty thread, so a
+        // foreign one would write through the wrong client) - refused before anything is sent.
+        if (!shared.ownedBy(*this)) {
+            throw std::invalid_argument("openTopicAndWait: the producer does not belong to this Client");
         }
+        const TopicSchemaResult r = openTypedSchema_<T>(name, timeout);
         return TypedTopic<T, ProducerRef>(ProducerRef(shared),
                                           TopicHandle{r.topicId, typedPartitionCount(r.partitionCount)}, r.version);
     }
@@ -1324,6 +1347,18 @@ public:
                                  GroupConfig                cfg = {});
 
 private:
+    /// The one body of both openTopicAndWait overloads: the topic's schema, checked against T's fingerprint.
+    template <class T>
+    TopicSchemaResult openTypedSchema_(std::string_view name, std::chrono::nanoseconds timeout) {
+        const auto started = std::chrono::steady_clock::now();
+        TopicSchemaResult r = getTopicSchemaAndWait(name, T::kFingerprint, timeout);
+        if (r.errorCode != 0)   // Issue #22: missing topic / stale type / another refusal
+            throwOpenTopicFailure(name, r.errorCode, timeout - (std::chrono::steady_clock::now() - started));
+        if (!schemaMatches(T::kFingerprint, std::span<const uint8_t>(r.descriptorBlob))) {
+            throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
+        }
+        return r;
+    }
     // -------------------------------------------------------------------------
     // Internal types
     // -------------------------------------------------------------------------
@@ -1352,8 +1387,10 @@ private:
     struct DdlNotLeaderSeen  { int redirects; int64_t budgetEndNs; int64_t backoffNs; DdlOfferedOn on; };
     /// Why a DDL waits for its resend: a NotLeader answer, or its session was
     /// lost before any answer (Task 5 re-review F1: past the budget the first
-    /// ends BrokerError NotLeader, the second OpStatus::SessionLost).
-    enum class DdlResendCause : uint8_t { NotLeader, SessionLost, AuthUnavailable };   // Issue #607: AuthUnavailable ends with 48
+    /// ends BrokerError NotLeader, the second OpStatus::SessionLost).  Issue #97: NodeUnreachable = a NotLeader
+    /// answer whose resend was refused because the target node's session is not up; past the budget it ends
+    /// SessionLost too (the request may have been applied), not NotLeader.
+    enum class DdlResendCause : uint8_t { NotLeader, SessionLost, AuthUnavailable, NodeUnreachable };   // Issue #607: AuthUnavailable ends with 48
     /// Not in flight: re-sent at resendAtNs (if refused then, every cycle after, until budgetEndNs).
     struct DdlAwaitingResend {
         int redirects; int64_t budgetEndNs; int64_t backoffNs; int64_t resendAtNs;
@@ -1438,8 +1475,10 @@ private:
         uint8_t authMode  = static_cast<uint8_t>(rune::protocol::client::AuthMode::InProcess);   // brokerAuthMode()
         uint8_t passwordChangeRequired = 0;                                                      // one-time password
         uint8_t authenticated = 0;                                                               // review B I3: an earned session
-        uint8_t pad[4]{};
+        int16_t rejectCode = 0;   // issue #310: the seed's reject code while Rejected
+        uint8_t pad[2]{};
     };
+    static_assert(sizeof(SeedStatus) == 16);
 
     // -------------------------------------------------------------------------
     // Runner
@@ -1825,6 +1864,8 @@ private:
     std::vector<uint64_t> routeConnectFailuresSeen_;  // DR-7: per session, last seen connectFailures()
     std::vector<uint8_t>  routeSessionUp_;            // DR-7 review M1: per session, Connected last pass
     uint64_t              heldOffersSeen_ = 0;        // DR-7: last seen agent_.heldOffers()
+    uint64_t              rejectedEpochSeen_ = 0;     // issue #60: agent_.rejectedEpoch() at the last route sweep
+    uint64_t              routedBrokerSweeps_ = 0;    // issue #60: failRoutedBroker sweeps run (test-visible)
     // DR-15: Subscribes whose Redirect named an unreachable node — re-sent (only
     // they) after a fresh metadata answer and a doubling backoff.
     int retryRedirectedSubscribes_(int64_t nowNs);
@@ -2186,13 +2227,13 @@ private:
     // redirects) a metadata refresh is scheduled with EXPONENTIAL backoff so the
     // client cannot storm the broker.  metadataBackoffNs_ is the wait before the
     // NEXT scheduled refresh; it doubles per schedule up to the cap and resets on
-    // a successful MetadataResponse.  nextMetadataRefreshAt_ == time_point::max()
+    // a successful MetadataResponse.  nextMetadataRefreshAtNs_ == kMetadataRefreshNotArmed
     // means "no refresh armed".  Agent-thread-only.
     static constexpr int64_t kMetadataBackoffInitNs = 100'000'000LL;    // 100 ms
     static constexpr int64_t kMetadataBackoffMaxNs  = 30'000'000'000LL; // 30 s
     int64_t metadataBackoffNs_ {kMetadataBackoffInitNs};
-    std::chrono::steady_clock::time_point nextMetadataRefreshAt_ {
-        std::chrono::steady_clock::time_point::max()};  // max() = not armed
+    static constexpr int64_t kMetadataRefreshNotArmed = std::numeric_limits<int64_t>::max();
+    int64_t nextMetadataRefreshAtNs_ {kMetadataRefreshNotArmed};  // duty-clock ns (now()); max = not armed
 
     // sendMetadataRequest() — encodes and submits a MetadataRequest for all
     // topics to the agent ring.  Called on the runner thread after

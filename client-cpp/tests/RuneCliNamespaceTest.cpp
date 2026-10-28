@@ -70,6 +70,21 @@ TEST(NamespaceCliRegression, FlagsCoverEveryLimitRegression) {
     for (const auto& f : rcl::kNamespaceLimitFields) EXPECT_NE(u.str().find(f.name), std::string::npos) << f.name;
 }
 
+// Issue #641: the patch built from `--set` flags names exactly the given fields (the wire mask), so the write
+// never carries a stale copy of any other limit.
+TEST(NamespaceCliRegression, LimitSetsBuildAPatchOfOnlyTheNamedFieldsRegression) {
+    const auto patch = rune::cli::namespaceLimitSetsPatch({"max-topics=7", "max-users=0"});
+    ASSERT_TRUE(patch.has_value()) << patch.error();
+    for (std::size_t i = 0; i < rcl::kNamespaceLimitFields.size(); ++i) {
+        const std::string_view name = rcl::kNamespaceLimitFields[i].name;
+        const bool named = name == "max-topics" || name == "max-users";
+        EXPECT_EQ(patch->has(i), named) << name;
+        EXPECT_EQ(rcl::namespaceLimitGet(patch->values, i), name == "max-topics" ? 7u : 0u) << name;
+    }
+    EXPECT_FALSE(rune::cli::namespaceLimitSetsPatch({"max-topics=1", "max-topics=2"}).has_value());
+    EXPECT_FALSE(rune::cli::namespaceLimitSetsPatch({"nope=1"}).has_value());
+}
+
 // `limits <ns> --set k=v`: only the named fields change, every other keeps the value read from the broker.
 TEST(NamespaceCliRegression, LimitsSetReadModifyWriteRegression) {
     rp::NamespaceLimits base{};
@@ -203,4 +218,94 @@ TEST(NamespaceCliRegression, UsageFormatRegression) {
     EXPECT_NE(j.find("\"usage\":{\"max-topics\":3,"), std::string::npos) << j;
     EXPECT_EQ(j.find("max-schemas\":99"), std::string::npos) << "no usage for a field without a meaning: " << j;
     EXPECT_EQ(j.back(), '\n');
+// ── Adversarial review of client batch C8 (#641): the --set patch over every field combination and malformed input ──
+
+namespace {
+void expectPatchExactly(const rcl::NamespaceLimitsPatch& p, const std::vector<std::pair<std::size_t, uint64_t>>& want,
+                        const std::string& ctx) {
+    std::vector<bool> named(rcl::kNamespaceLimitFields.size(), false);
+    for (const auto& [i, v] : want) {
+        named[i] = true;
+        EXPECT_TRUE(p.has(i)) << ctx << " field " << rcl::kNamespaceLimitFields[i].name;
+        EXPECT_EQ(rcl::namespaceLimitGet(p.values, i), v) << ctx << " field " << rcl::kNamespaceLimitFields[i].name;
+    }
+    for (std::size_t i = 0; i < named.size(); ++i)
+        if (!named[i]) EXPECT_FALSE(p.has(i)) << ctx << ": unnamed field " << rcl::kNamespaceLimitFields[i].name << " is in the mask";
+    // Bits 29..31 of the 4-byte mask name no field: never sent.
+    EXPECT_EQ(p.present[3] & 0xE0u, 0u) << ctx;
+}
+} // namespace
+
+TEST(NamespaceCliRegression, LimitSetsPatchEveryFieldCombinationAdversarialRegression) {
+    const std::size_t n = rcl::kNamespaceLimitFields.size();
+    const auto maxOf = [](std::size_t i) -> uint64_t {
+        return i == rcl::kNamespaceFeatureBitsField ? uint64_t{UINT32_MAX} : UINT64_MAX;
+    };
+    // Each field alone at 0, 1 and its max; max+1 is refused for the u32 field.
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::string name(rcl::kNamespaceLimitFields[i].name);
+        for (const uint64_t v : {uint64_t{0}, uint64_t{1}, maxOf(i)}) {
+            const auto p = rune::cli::namespaceLimitSetsPatch({name + "=" + std::to_string(v)});
+            ASSERT_TRUE(p.has_value()) << name << "=" << v << ": " << p.error();
+            expectPatchExactly(*p, {{i, v}}, name + "=" + std::to_string(v));
+        }
+        if (i == rcl::kNamespaceFeatureBitsField)
+            EXPECT_FALSE(rune::cli::namespaceLimitSetsPatch({name + "=4294967296"}).has_value());
+        EXPECT_FALSE(rune::cli::namespaceLimitSetsPatch({name + "=18446744073709551616"}).has_value()) << name;
+    }
+    // All 29 at once, in reverse order.
+    std::vector<std::string> all;
+    std::vector<std::pair<std::size_t, uint64_t>> want;
+    for (std::size_t i = n; i-- > 0;) {
+        all.push_back(std::string(rcl::kNamespaceLimitFields[i].name) + "=" + std::to_string(500 + i));
+        want.emplace_back(i, 500 + i);
+    }
+    const auto full = rune::cli::namespaceLimitSetsPatch(all);
+    ASSERT_TRUE(full.has_value()) << full.error();
+    expectPatchExactly(*full, want, "all");
+    EXPECT_EQ(full->present, rcl::kNamespaceFullMask);
+    // Seeded random subsets (every pair of fields is covered many times over 400 draws).
+    uint64_t seed = 0x9E3779B97F4A7C15ull;
+    const auto rnd = [&] { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
+    for (int k = 0; k < 400; ++k) {
+        std::vector<std::string> sets;
+        std::vector<std::pair<std::size_t, uint64_t>> w;
+        const uint64_t mask = rnd();
+        for (std::size_t i = 0; i < n; ++i) {
+            if (((mask >> i) & 1u) == 0) continue;
+            const uint64_t v = rnd() % (maxOf(i) == UINT64_MAX ? UINT64_MAX : maxOf(i) + 1);
+            sets.push_back(std::string(rcl::kNamespaceLimitFields[i].name) + "=" + std::to_string(v));
+            w.emplace_back(i, v);
+        }
+        const auto p = rune::cli::namespaceLimitSetsPatch(sets);
+        ASSERT_TRUE(p.has_value()) << "seed draw " << k << ": " << p.error();
+        expectPatchExactly(*p, w, "draw " + std::to_string(k));
+    }
+    // An empty list is an empty patch (cmdLimits then only prints; it never sends one).
+    const auto none = rune::cli::namespaceLimitSetsPatch({});
+    ASSERT_TRUE(none.has_value());
+    expectPatchExactly(*none, {}, "empty");
+}
+
+TEST(NamespaceCliRegression, LimitSetsPatchRefusesMalformedAdversarialRegression) {
+    for (const char* bad : {"", "=", "k=", "=v", "max-topics=1=2", "max-topics==1", "max-topics=-1", "max-topics=+1",
+                            "max-topics= 1", "max-topics=1 ", " max-topics=1", "MAX-TOPICS=1", "max_topics=1",
+                            "max-topics=0x10", "max-topics=1.0", "--max-topics=1", "feature-bits=-0"}) {
+        const auto p = rune::cli::namespaceLimitSetsPatch({bad});
+        EXPECT_FALSE(p.has_value()) << "'" << bad << "' was accepted";
+        // A bad entry after good ones refuses the whole list: nothing partial is ever sent.
+        EXPECT_FALSE(rune::cli::namespaceLimitSetsPatch({"max-users=3", bad}).has_value()) << bad;
+    }
+    EXPECT_FALSE(rune::cli::namespaceLimitSetsPatch({"max-users=3", "max-topics=1", "max-users=3"}).has_value())
+        << "a repeat is refused even with the same value";
+    // The CLI refuses a malformed --set before any broker contact (usage, rc 2), even with no --broker at all.
+    for (const char* bad : {"max-topics", "nope=1", "max-topics=x"}) {
+        const auto r = runCli({"namespace", "limits", "ns1", "--set", bad});
+        EXPECT_EQ(r.code, 2) << bad << ": " << r.err;
+        const std::string first = r.err.substr(0, r.err.find('\n'));
+        EXPECT_NE(first.find(std::string("--set '") + bad + "'"), std::string::npos) << first;
+        EXPECT_EQ(first.find("--broker"), std::string::npos) << "the bad --set is named, not the missing broker: " << first;
+    }
+    const auto dangling = runCli({"namespace", "limits", "ns1", "--broker", "h:1", "--set"});
+    EXPECT_EQ(dangling.code, 2) << dangling.err;
 }

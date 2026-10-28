@@ -1152,7 +1152,7 @@ TEST(HubCommandClient, TxnNotLeaderReoffersOnTheNewRouteAndCommitsRegression) {
 // coordinator owns a transactional epoch, so no local restart keeps the
 // transaction); each record is written once.  Loss instead (acked data at/above
 // the log start forgotten) -> the commit fails with the app-visible code 28.
-TEST(HubCommandClient, TxnUnknownProducerIdAfterRetentionRestartsSequencesAndCommitsRegression) {
+TEST(HubCommandClient, TxnUnknownProducerIdAfterRetentionAbortsTheTxnAndTheNextCommitsUnderANewEpochRegression) {
     for (bool retention : {true, false}) {
         HubRig r(retention ? 4090 : 4092);
         auto tp = r.client.producer(txnPcfg(retention ? "tx-upid-ret" : "tx-upid-loss"));

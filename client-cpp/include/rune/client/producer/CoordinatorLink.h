@@ -12,9 +12,12 @@
 #include <rune/client/detail/OpTarget.h>
 #include <rune/client/producer/TxnTypes.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <span>
 #include <type_traits>
 #include <variant>
 
@@ -29,32 +32,67 @@ public:
     static constexpr std::size_t kHdrSessionOff    = 8;             // MessageHeader.sessionId
     static constexpr std::size_t kHdrCorrOff       = 16;            // MessageHeader.correlationId
 
+    /// What every live request carries (the facts that were stale in `Free` when they sat on the slot itself).
+    struct Req {
+        ReqKind  kind       = ReqKind::InitProducerId;
+        uint16_t frameLen   = 0;
+        int64_t  deadlineNs = 0;   ///< absolute duty-clock expiry, > 0
+    };
+    /// A request that has been submitted: it can be retried, so it also counts its retries (`attempt` drives the
+    /// backoff and survives a session change's InFlight -> Unsent).
+    struct Sent : Req { uint32_t attempt = 0; };
+
     struct Free {};
-    struct Building {};   ///< acquired, the caller is encoding; submit() makes it Unsent
-    struct Unsent {};
-    struct InFlight { int64_t sessionId = 0; int64_t answerByNs = 0; };
-    struct Backoff  { int64_t untilNs = 0; };
+    struct Building : Req {};   ///< acquired, the caller is encoding; submit() makes it Unsent
+    struct Unsent : Sent {};
+    struct InFlight : Sent {};
+    struct Backoff : Sent { int64_t untilNs = 0; };
     /// NotCoordinator: re-sent once the coordinator moved (gen) AND its backoff elapsed - a coordinator that keeps
     /// answering NotCoordinator (not loaded yet, a follower) is retried paced, never once per metadata round trip.
-    struct AwaitCoordinator { uint64_t gen = 0; int64_t notBeforeNs = 0; };
+    struct AwaitCoordinator : Sent { uint64_t gen = 0; int64_t notBeforeNs = 0; };
     using SlotState = std::variant<Free, Building, Unsent, InFlight, Backoff, AwaitCoordinator>;
     struct Slot {
         SlotState state = Free{};
-        ReqKind   kind  = ReqKind::InitProducerId;
         int64_t   corrId = 0;
-        uint32_t  attempt = 0;
         uint32_t  offers  = 0;      ///< frames offered for this request (first send + every re-send of the link)
-        int64_t   deadlineNs = 0;   ///< absolute duty-clock expiry, > 0
-        uint16_t  frameLen = 0;
         std::array<uint8_t, kCoordFrameCap> frame{};
+
+        /// The live request's facts; nullptr in Free.
+        [[nodiscard]] Req* req() noexcept {
+            return std::visit([](auto& st) -> Req* {
+                if constexpr (std::is_base_of_v<Req, std::remove_reference_t<decltype(st)>>) return &st;
+                else return nullptr;
+            }, state);
+        }
+        [[nodiscard]] const Req* req() const noexcept { return const_cast<Slot*>(this)->req(); }
+        [[nodiscard]] Sent* sent() noexcept {
+            return std::visit([](auto& st) -> Sent* {
+                if constexpr (std::is_base_of_v<Sent, std::remove_reference_t<decltype(st)>>) return &st;
+                else return nullptr;
+            }, state);
+        }
+        [[nodiscard]] ReqKind  kind() const noexcept { const Req* r = req(); return r != nullptr ? r->kind : ReqKind::InitProducerId; }
+        [[nodiscard]] uint16_t frameLen() const noexcept { const Req* r = req(); return r != nullptr ? r->frameLen : uint16_t{0}; }
+        [[nodiscard]] int64_t  deadlineNs() const noexcept { const Req* r = req(); return r != nullptr ? r->deadlineNs : 0; }
+        /// Retries so far (a test hook; 0 before the first retry and in Building / Free).
+        [[nodiscard]] uint32_t attempt() const noexcept { const Sent* x = const_cast<Slot*>(this)->sent(); return x != nullptr ? x->attempt : 0u; }
+        /// The caller encoded `n` bytes into `frame` (Building).
+        void setFrameLen(uint16_t n) noexcept { if (Req* r = req()) r->frameLen = n; }
     };
 
     /// `seqBase`: the ordinal's carried-forward request sequence (ProducerHub keeps it per ordinal, like the
     /// batch sequences): ids never repeat across incarnations of an ordinal, so a late answer to a closed
     /// producer's request can never match the new one's.  The 32-bit sequence wraps only after 2^32 requests
     /// on one ordinal (~50 days at one per millisecond), far past any answer's lifetime.
-    CoordinatorLink(uint32_t ordinal, CoordinatorSink sink, uint32_t seqBase = 0) noexcept
-        : ordinal_(ordinal), seq_(seqBase), sink_(sink) {}
+    /// `capacity` (1..kMaxCoordRequests): the slots this producer can ever have in flight, allocated here (control
+    /// plane) and never grown - a transactional producer needs kMaxCoordRequests, a plain one only its InitProducerId.
+    explicit CoordinatorLink(uint32_t ordinal, CoordinatorSink sink, uint32_t seqBase = 0,
+                             std::size_t capacity = kMaxCoordRequests)
+        : slots_(std::make_unique<Slot[]>(std::clamp<std::size_t>(capacity, 1, kMaxCoordRequests))),
+          capacity_(std::clamp<std::size_t>(capacity, 1, kMaxCoordRequests)),
+          ordinal_(ordinal), seq_(seqBase), sink_(sink) {}
+    /// Slots allocated for this link (a test hook; fixed for the link's life).
+    [[nodiscard]] std::size_t slotCapacity() const noexcept { return capacity_; }
 
     /// A free slot, or nullptr (the caller retries next pass).  The slot carries its correlation id
     /// (`corrId`); the caller encodes the request into slot->frame with that id and sets frameLen, then
@@ -73,9 +111,9 @@ public:
         if (live_ == 0) return 0;   // idle: touches no slot memory
         ++scans_;
         int work = 0;
-        for (Slot& s : slots_) {
+        for (Slot& s : slots()) {
             if (std::holds_alternative<Free>(s.state) || std::holds_alternative<Building>(s.state)) continue;
-            if (nowNs >= s.deadlineNs) {
+            if (nowNs >= s.deadlineNs()) {
                 onExpired(s);
                 release(s);
                 ++work;
@@ -95,7 +133,7 @@ public:
     /// Every slot back to Free (a terminal failure: fenced / revoked / closeImmediately - nothing is ever
     /// offered or re-sent again for them).  Idempotent.
     void releaseAll() noexcept {
-        for (Slot& s : slots_) release(s);
+        for (Slot& s : slots()) release(s);
     }
     void onCoordinatorMoved() noexcept { ++gen_; }   ///< AwaitCoordinator slots become due
     void onSessionChanged() noexcept;                ///< InFlight -> Unsent (same corrId)
@@ -120,7 +158,10 @@ private:
     void askRediscover_() noexcept;   // #351: once per generation; a refused ask stays due
     bool offer_(Slot& s) noexcept;
 
-    std::array<Slot, kMaxCoordRequests> slots_{};
+    [[nodiscard]] std::span<Slot> slots() noexcept { return {slots_.get(), capacity_}; }
+
+    std::unique_ptr<Slot[]> slots_;   // capacity_ slots, preallocated at construction
+    std::size_t     capacity_;
     uint32_t        ordinal_;
     uint32_t        seq_;
     uint32_t        live_ = 0;   // slots not Free (Building included)
@@ -154,21 +195,27 @@ static_assert(std::is_same_v<std::variant_alternative_t<kIdAssignedIndex, Produc
 //   ended                  -> Bumping, then InDoubt{Bump} (a retried abort / close re-sends ONLY the bump);
 //   opId == 0 (in doubt)   -> InDoubt{BeforeEnd | AfterEnd | Bump}.
 
-/// One pending lifecycle op: where its single completion goes and when it times out.  An EMPTY target (no
-/// handler, no queue) is the close's own abort: its outcome is the close's, never delivered on its own.
+/// Who issued a lifecycle op.  An Internal op is the close's own abort (startCloseAbort_): its outcome is the
+/// close's (closeTxnStep_ reads it), never delivered on its own.  Every other op is an App op, whether or not its
+/// target is empty (a fire-and-forget call completes into nothing but never overwrites the close's outcome).
+enum class TxnOpOrigin : uint8_t { App, Internal };
+
+/// One pending lifecycle op: where its single completion goes and when it times out.
 struct TxnOp {
     detail::OpTarget target{};
     Token            token      = 0;
     int64_t          deadlineNs = 0;   ///< absolute duty clock (transactionOpTimeoutMs)
+    TxnOpOrigin      origin     = TxnOpOrigin::App;
 };
 /// m5 / m13: calls that joined a pending commit / abort complete with it (one EndTxn).  Fixed capacity (zero
-/// allocation): a call beyond it completes BrokerError(19).
+/// allocation): a call beyond it completes InvalidArgument (Producer.h documents the cap).
 inline constexpr std::size_t kMaxTxnJoiners = 4;
+/// Pending flush() calls: a call beyond the cap completes InvalidArgument.
+inline constexpr std::size_t kMaxTxnFlushCalls = 8;
 struct TxnJoiners {
     std::array<TxnOp, kMaxTxnJoiners> ops{};
     uint8_t                           n = 0;
 };
-
 struct AwaitData {};                                          ///< EndTxn waits for every record of the txn to be acked
 /// Which send of EndTxn is on the link: the first, or a re-send - the app's retry of an in-doubt one (ResendEnd), or
 /// the link's own re-offer of the same request (session change, coordinator move, backoff).  After any re-send of
@@ -205,15 +252,32 @@ struct Aborting       {
     TxnJoiners joined{};
     TxnOutcome discard{};   ///< unsent records of the transaction complete with it (never produced)
 };
+/// #368: has the poison failed the records the transaction still held unsent?  Pending = the next duty pass does it
+/// (never inside the call that poisoned: that may be failing a batch); Done = nothing is left to fail.
+enum class PoisonDiscard : uint8_t { Pending, Done };
 struct AbortableError {
-    OpStatus   status    = OpStatus::BrokerError;
-    uint16_t   errorCode = 0;
-    TxnStarted started   = TxnStarted::No;
-    AbortKind  kind      = AbortKind::Plain;
+    OpStatus      status    = OpStatus::BrokerError;
+    uint16_t      errorCode = 0;
+    TxnStarted    started   = TxnStarted::No;
+    AbortKind     kind      = AbortKind::Plain;
+    PoisonDiscard discard   = PoisonDiscard::Pending;
 };
 struct FatalError     { OpStatus status = OpStatus::Fenced; uint16_t errorCode = 0; };
 using TxnMachine = std::variant<Uninitialized, Initializing, Ready, InTransaction, Committing, Aborting,
                                 AbortableError, FatalError>;
+
+// ---- close() of a transactional producer with a transaction open (ProducerImpl's life_ state LifeEndingTxn) ----
+// Declared here, not inside ProducerImpl, so the rule-3 static_assert (ProducerTxn.MachineStatesCarryNoBooleans) can
+// name them.
+struct CloseAbortNone {};
+struct CloseAbortRunning {};
+struct CloseAbortDone { OpStatus status = OpStatus::Ok; uint16_t errorCode = 0; };
+struct LifeEndingTxn {
+    detail::OpTarget target{};
+    Token            token      = 0;
+    int64_t          deadlineNs = 0;   ///< transactionOpTimeoutMs
+    std::variant<CloseAbortNone, CloseAbortRunning, CloseAbortDone> own{};
+};
 
 // ---- Phase 2b F Task 6: a partition's membership in the current transaction (PartitionState::txn) ----
 //   NotInTxn -first record while InTransaction (seen by the flush)-> Adding{nullptr} (queued) -AddPartitionsToTxn

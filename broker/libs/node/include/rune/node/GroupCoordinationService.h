@@ -178,8 +178,8 @@ public:
                                                                          int32_t generationId, int64_t sessionId);
 
     /// #438: whether an unfinished transaction holds a (group, tp) (BrokerNode wires the transaction coordinator).
-    /// Held / Unknown: OffsetFetch and plain OffsetCommit of that key answer UnstableOffsetCommit (NotCoordinator
-    /// to a client below 10) - retriable.  No probe (rigs) = Free.  Plain function pointer + ctx.
+    /// Held / Unknown: OffsetFetch and plain OffsetCommit of that key answer UnstableOffsetCommit (NotLeader
+    /// to a client below 10, #472) - retriable.  No probe (rigs) = Free.  Plain function pointer + ctx.
     using TxnOffsetHoldProbe = rune::coordination::TxnOffsetHold (*)(void* ctx, const std::string& group,
                                                                      const rune::coordination::TopicPartition& tp);
     void setTxnOffsetHoldProbe(TxnOffsetHoldProbe fn, void* ctx) noexcept { holdProbe_ = fn; holdProbeCtx_ = ctx; }
@@ -377,7 +377,7 @@ private:
         return holdProbe_ != nullptr ? holdProbe_(holdProbeCtx_, group, tp) : rune::coordination::TxnOffsetHold::Free;
     }
     /// #438: the retriable code a held key is answered with on `sessionId`: UnstableOffsetCommit (client >= 10),
-    /// NotCoordinator below.
+    /// NotLeader below (#472: a v9 hub backs off on it; NotCoordinator would make it rejoin the group).
     [[nodiscard]] int16_t unstableFor_(int64_t sessionId);
     uint64_t unstableAnswers_ = 0;
 

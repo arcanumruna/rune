@@ -15,6 +15,7 @@
 #include <rune/ql/Backends.h>
 
 #include <gtest/gtest.h>
+#include <rune/client/detail/PasswordFile.h>
 
 #include <algorithm>
 #include <cstring>
@@ -22,8 +23,12 @@
 #include <optional>
 #include <fstream>
 #include <string>
+#include <thread>
+#include <stdexcept>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -136,6 +141,163 @@ TEST(ClientAuthErrorsRegression, WrongPasswordFailsConnectWithAuthenticationFail
     EXPECT_EQ(r.client.authStatus().kind, rc::AuthStatus::Kind::Anonymous);
 }
 
+// Issue #310: sessionRejectCode() follows state()'s threading rule - the duty thread reads the machine, the owner
+// thread (Thread mode) the published seed status, any other thread is refused.
+TEST(ClientAuthErrorsRegression, SessionRejectCodeFollowsTheStateThreadingRuleRegression) {
+    {   // Invoker mode: the owner is the duty thread.
+        Rig r(authCfg(4166, "ws1", "not the password!"));
+        test_support::TestCq cq(r.client);
+        auto f = r.connectOp(cq);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+        ASSERT_TRUE(r.drive([&] { return r.client.state() == rc::session::SessionState::Rejected; }));
+        EXPECT_EQ(r.client.sessionRejectCode(), 44);
+    }
+    // Thread mode: a runner thread drives the client; the real clock (the fake one is a plain global).
+    rc::ClientConfig c = authCfg(4168, "ws1", "not the password!");
+    c.runnerMode = rc::RunnerMode::Thread;
+    c.nanoClock  = nullptr;
+    rc::Client                   client(c);
+    test_support::InvokerGateway gw(c.dataDir + "/aeron", c.gatewayChannel, c.gatewayStreamId, c.egressChannel,
+                                    c.egressStreamId);
+    gw.authMode   = pc::AuthMode::Required;
+    gw.tlsCertPem = testPem("server.pem");
+    gw.tlsKeyPem  = testPem("server.key");
+    gw.addUser("ws1", kPw);
+    const auto driveGw = [&](auto&& pred) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            gw.pump();
+            if (pred()) return true;
+        }
+        return false;
+    };
+    EXPECT_EQ(client.sessionRejectCode(), 0) << "never rejected";
+    ASSERT_TRUE(driveGw([&] { return gw.ready(); }));
+    test_support::TestCq cq(client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+    ASSERT_TRUE(driveGw([&] { return f.ready(); }));
+    ASSERT_TRUE(f.failed());
+    ASSERT_TRUE(driveGw([&] { return client.state() == rc::session::SessionState::Rejected; }));
+    EXPECT_EQ(client.sessionRejectCode(), 44) << "owner thread, Thread mode";
+    bool threw = false;
+    std::thread other([&] {
+        try {
+            (void)client.sessionRejectCode();
+        } catch (const std::logic_error&) {
+            threw = true;
+        }
+    });
+    other.join();
+    EXPECT_TRUE(threw) << "a foreign thread is refused, as state() does";
+}
+
+// C7 adversarial review (#310): every thread class.  Invoker mode: a foreign thread is refused too (it used to read 0).
+// Thread mode: a duty-cycle callback (onError, on the runner thread) reads the machine; a foreign thread is refused
+// before any connect as well as after the reject; the owner reads 0 before the reject.
+TEST(ClientAuthErrorsRegression, SessionRejectCodeOnEveryThreadClassAdversarialRegression) {
+    {
+        Rig r(authCfg(4170, "ws1", "not the password!"));
+        bool threwBefore = false;
+        std::thread before([&] {
+            try { (void)r.client.sessionRejectCode(); } catch (const std::logic_error&) { threwBefore = true; }
+        });
+        before.join();
+        EXPECT_TRUE(threwBefore) << "Invoker mode: a foreign thread is refused";
+        test_support::TestCq cq(r.client);
+        auto f = r.connectOp(cq);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+        ASSERT_TRUE(r.drive([&] { return r.client.state() == rc::session::SessionState::Rejected; }));
+        EXPECT_EQ(r.client.sessionRejectCode(), 44);
+        bool threwAfter = false;
+        std::thread after([&] {
+            try { (void)r.client.sessionRejectCode(); } catch (const std::logic_error&) { threwAfter = true; }
+        });
+        after.join();
+        EXPECT_TRUE(threwAfter) << "Invoker mode, rejected: a foreign thread is still refused (never a silent 0)";
+    }
+    rc::ClientConfig c = authCfg(4172, "ws1", "not the password!");
+    c.runnerMode = rc::RunnerMode::Thread;
+    c.nanoClock  = nullptr;
+    rc::Client client(c);
+    // Written on the runner thread inside onError; read on this thread only after close() joined the runner.
+    int16_t inCallback  = -1;
+    bool    callbackRan = false;
+    client.onError([&](const std::string&) {
+        if (callbackRan) return;
+        callbackRan = true;
+        try { inCallback = client.sessionRejectCode(); } catch (const std::logic_error&) { inCallback = -2; }
+    });
+    test_support::InvokerGateway gw(c.dataDir + "/aeron", c.gatewayChannel, c.gatewayStreamId, c.egressChannel,
+                                    c.egressStreamId);
+    gw.authMode   = pc::AuthMode::Required;
+    gw.tlsCertPem = testPem("server.pem");
+    gw.tlsKeyPem  = testPem("server.key");
+    gw.addUser("ws1", kPw);
+    const auto driveGw = [&](auto&& pred) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            gw.pump();
+            if (pred()) return true;
+        }
+        return false;
+    };
+    bool threwBefore = false;
+    std::thread before([&] {
+        try { (void)client.sessionRejectCode(); } catch (const std::logic_error&) { threwBefore = true; }
+    });
+    before.join();
+    EXPECT_TRUE(threwBefore) << "Thread mode, never connected: a foreign thread is refused";
+    ASSERT_TRUE(driveGw([&] { return gw.ready(); }));
+    test_support::TestCq cq(client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+    ASSERT_TRUE(driveGw([&] { return f.ready(); }));
+    ASSERT_TRUE(f.failed());
+    ASSERT_TRUE(driveGw([&] { return client.state() == rc::session::SessionState::Rejected; }));
+    EXPECT_EQ(client.sessionRejectCode(), 44);
+    client.close();   // joins the runner: its writes in onError are visible from here on
+    EXPECT_TRUE(callbackRan);
+    EXPECT_EQ(inCallback, 44) << "a duty-cycle callback reads the machine";
+}
+
+// C7 adversarial review (#226) input bounds: the hint is a u32 on the wire - 1 and the u32 maximum both come back
+// exactly (no sign flip), on the BrokerError and on the NotConnected (hint beyond the deadline) completions; every
+// other op / status / code reads 0.
+TEST(ClientAuthErrorsRegression, RetryAfterBoundsReadBackExactlyAdversarialRegression) {
+    {   // 1 ms: retried within the budget, then the BrokerError verdict.
+        rc::ClientConfig c = authCfg(4174, "ws1", "not the password!");
+        c.connectTimeoutMs = 120'000;
+        Rig r(c);
+        r.gw.retryAfterMsOnFailure = 1;
+        test_support::TestCq cq(r.client);
+        auto f = r.connectOp(cq);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000));
+        EXPECT_EQ(f.outcome().c.errorCode, 44);
+        EXPECT_EQ(rc::retryAfterMs(f.outcome().c), 1) << f.describe();
+    }
+    {   // u32 max: far beyond the connect deadline -> NotConnected with the hint.
+        rc::ClientConfig c = authCfg(4176, "ws1", "not the password!");
+        c.connectTimeoutMs = 2'000;
+        Rig r(c);
+        r.gw.retryAfterMsOnFailure = UINT32_MAX;
+        test_support::TestCq cq(r.client);
+        auto f = r.connectOp(cq);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000));
+        EXPECT_EQ(f.outcome().c.status, rc::OpStatus::NotConnected) << f.describe();
+        EXPECT_EQ(rc::retryAfterMs(f.outcome().c), static_cast<int64_t>(UINT32_MAX));
+    }
+    const auto mk = [](rc::OpKind op, rc::OpStatus st, uint16_t ec) {
+        rc::Completion c{};
+        c.op = op; c.status = st; c.errorCode = ec; c.aux = 7;
+        return c;
+    };
+    EXPECT_EQ(rc::retryAfterMs(mk(rc::OpKind::Connect, rc::OpStatus::NotConnected, 44)), 7);
+    EXPECT_EQ(rc::retryAfterMs(mk(rc::OpKind::Connect, rc::OpStatus::Timeout, 44)), 0);
+    EXPECT_EQ(rc::retryAfterMs(mk(rc::OpKind::Connect, rc::OpStatus::Ok, 44)), 0);
+    EXPECT_EQ(rc::retryAfterMs(mk(rc::OpKind::Connect, rc::OpStatus::NotConnected, 48)), 0);
+    EXPECT_EQ(rc::retryAfterMs(mk(rc::OpKind::Connect, rc::OpStatus::BrokerError, 43)), 0);
+    EXPECT_EQ(rc::retryAfterMs(mk(rc::OpKind::Ping, rc::OpStatus::BrokerError, 44)), 0);
+}
+
 TEST(ClientAuthErrorsRegression, UnknownUserIsTheSameFailureAsAWrongPassword) {
     Rig r(authCfg(3704, "nobody", kPw));
     test_support::TestCq cq(r.client);
@@ -170,6 +332,60 @@ TEST(ClientAuthErrorsRegression, ARateLimitedLoginReportsRetryAfterOnTheConnectF
     ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000));
     EXPECT_EQ(f.outcome().c.errorCode, 44);
     EXPECT_EQ(f.outcome().c.aux, 800) << "Completion::aux = the broker's retryAfterMs";
+}
+
+// Issue #226: the retry hint has a typed accessor; Completion::aux carries it only for a refused Connect.
+TEST(ClientAuthErrorsRegression, RetryAfterIsReadableThroughItsTypedAccessorRegression) {
+    {
+        rc::ClientConfig c = authCfg(4160, "ws1", "not the password!");
+        c.connectTimeoutMs = 120'000;
+        Rig r(c);
+        r.gw.retryAfterMsOnFailure = 800;
+        test_support::TestCq cq(r.client);
+        auto f = r.connectOp(cq);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000));
+        EXPECT_EQ(f.outcome().c.aux, 800);
+        EXPECT_EQ(rc::retryAfterMs(f.outcome().c), 800);
+    }
+    {
+        rc::ClientConfig c = authCfg(4162, "ws1", "not the password!");
+        Rig r(c);
+        r.gw.retryAfterMsOnFailure = 0;
+        test_support::TestCq cq(r.client);
+        auto f = r.connectOp(cq);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+        EXPECT_EQ(f.outcome().c.errorCode, 44);
+        EXPECT_EQ(rc::retryAfterMs(f.outcome().c), 0);
+    }
+    {   // C4: a retry-after beyond the connect deadline fails the connect NotConnected with the hint.
+        rc::ClientConfig c = authCfg(4164, "ws1", "not the password!");
+        c.connectTimeoutMs = 2'000;
+        Rig r(c);
+        r.gw.retryAfterMsOnFailure = 5'000;
+        test_support::TestCq cq(r.client);
+        auto f = r.connectOp(cq);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000));
+        EXPECT_EQ(f.outcome().c.status, rc::OpStatus::NotConnected);
+        EXPECT_EQ(rc::retryAfterMs(f.outcome().c), 5'000);
+    }
+    rc::Completion other{};
+    other.op = rc::OpKind::DefineTopic; other.status = rc::OpStatus::Ok; other.aux = 5;
+    EXPECT_EQ(rc::retryAfterMs(other), 0);
+    rc::Completion notAuth{};
+    notAuth.op = rc::OpKind::Connect; notAuth.status = rc::OpStatus::BrokerError; notAuth.errorCode = 45; notAuth.aux = 5;
+    EXPECT_EQ(rc::retryAfterMs(notAuth), 0);
+    rc::Completion refused{};
+    refused.op = rc::OpKind::Connect; refused.status = rc::OpStatus::BrokerError; refused.errorCode = 44; refused.aux = 5;
+    EXPECT_EQ(rc::retryAfterMs(refused), 5);
+    constexpr rc::Completion kOther = [] {
+        rc::Completion c{}; c.op = rc::OpKind::DefineTopic; c.status = rc::OpStatus::Ok; c.aux = 5; return c;
+    }();
+    constexpr rc::Completion kNotAuth = [] {
+        rc::Completion c{}; c.op = rc::OpKind::Connect; c.status = rc::OpStatus::BrokerError; c.errorCode = 45; c.aux = 5;
+        return c;
+    }();
+    static_assert(rc::retryAfterMs(kOther) == 0);
+    static_assert(rc::retryAfterMs(kNotAuth) == 0);
 }
 
 // C4 review (#461 / #519): a retry-after that outlives the connect deadline.  The deadline falls inside the paced retry;
@@ -286,6 +502,67 @@ TEST(PasswordFileRegression, GroupReadableFileIsRefusedRegression) {
     ::unlink(path.c_str());
 }
 
+TEST(PasswordFileRegression, AFileOwnedByAnotherUserIsRefusedRegression) {
+    // #678: a file another user owns can be rewritten by that user: refused like a group-readable one.
+    if (::geteuid() != 0) GTEST_SKIP() << "needs root to chown a file to another user";
+    const std::string path = writePwFile("owner", std::string(kPw) + "\n", 0600);
+    std::string pw;
+    EXPECT_FALSE(rune::client::detail::readPasswordFile(path, pw).has_value()) << "owned by the running user: accepted";
+    EXPECT_EQ(pw, kPw);
+    ASSERT_EQ(::chown(path.c_str(), 65534, static_cast<gid_t>(-1)), 0);
+    std::string other;
+    const auto why = rune::client::detail::readPasswordFile(path, other);
+    ASSERT_TRUE(why.has_value()) << "a file owned by uid 65534 must be refused";
+    EXPECT_NE(why->find("owned by another user (uid 65534)"), std::string::npos) << *why;
+    EXPECT_TRUE(other.empty());
+    ::unlink(path.c_str());
+}
+
+// C20 adversarial review (#678, the whole bug class): the owner check covers only regular files.  A FIFO that another
+// user created (e.g. in a shared directory) lets that user feed the password the client logs in with.  ssh and libpq
+// refuse any credential file owned by someone else, whatever its type.
+TEST(PasswordFileRegression, AFifoOwnedByAnotherUserIsRefusedAdversarialRegression) {
+    if (::geteuid() != 0) GTEST_SKIP() << "needs root to chown a FIFO to another user";
+    const std::string path = std::filesystem::temp_directory_path().string() + "/client_auth_pw_fifo_" +
+                             std::to_string(::getpid());
+    ::unlink(path.c_str());
+    ASSERT_EQ(::mkfifo(path.c_str(), 0600), 0);
+    ASSERT_EQ(::chown(path.c_str(), 65534, static_cast<gid_t>(-1)), 0);
+    const pid_t writer = ::fork();   // the other user's side: open blocks until the reader opens, then feeds a password
+    ASSERT_GE(writer, 0);
+    if (writer == 0) {
+        const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+        if (fd >= 0) { (void)!::write(fd, "attacker-chosen-pw\n", 19); ::close(fd); }
+        ::_exit(0);
+    }
+    std::string pw;
+    const auto why = rune::client::detail::readPasswordFile(path, pw);
+    if (why.has_value()) {   // refused before reading: unblock the writer (it is waiting for a reader)
+        const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd >= 0) ::close(fd);
+    }
+    int status = 0;
+    ::waitpid(writer, &status, 0);
+    ::unlink(path.c_str());
+    ASSERT_TRUE(why.has_value()) << "a FIFO owned by uid 65534 was accepted; the password read was: " << pw;
+    EXPECT_NE(why->find("owned by another user (uid 65534)"), std::string::npos) << *why;
+    EXPECT_TRUE(pw.empty());
+}
+
+// C20 adversarial review (#678 fix-overreach guard): a pipe the user's own shell made (`--password-file <(...)`,
+// a /dev/fd/N path) is owned by the running user and stays accepted, whatever the fix for the FIFO case.
+TEST(PasswordFileRegression, AProcessSubstitutionPipeOfTheUserIsStillAcceptedAdversarialRegression) {
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    ASSERT_EQ(::write(fds[1], "pipe-pw-0001\n", 13), 13);
+    ::close(fds[1]);
+    std::string pw;
+    const auto why = rune::client::detail::readPasswordFile("/dev/fd/" + std::to_string(fds[0]), pw);
+    ::close(fds[0]);
+    EXPECT_FALSE(why.has_value()) << *why;
+    EXPECT_EQ(pw, "pipe-pw-0001");
+}
+
 TEST(PasswordFileRegression, OversizeFileIsRefusedRegression) {
     {
         const std::string path = writePwFile("big", std::string(1 << 20, 'p'), 0600);
@@ -397,6 +674,29 @@ TEST(ClientAuthErrorsRegression, APasswordOverTheCapIsRefusedAtConstructionRegre
     EXPECT_NO_THROW(rc::Client{authCfg(4120, "ws1", std::string(1024, 'p'))});
 }
 
+TEST(ClientAuthErrorsRegression, TheLoginPasswordNeverEntersTheCommandRingRegression) {
+    // #681: the ring test above passes partly because a consumed record is zeroed.  Here nothing is consumed: the
+    // ring is filled before the first duty pass, and no record of it carries the login password (given directly or
+    // read from a file).
+    constexpr std::string_view kLogin = "ring-scan-login-password-c20a";
+    const std::string path = writePwFile("ring", std::string(kLogin) + "\n", 0600);
+    for (const bool fromFile : {false, true}) {
+        rc::ClientConfig c = authCfg(fromFile ? 4164 : 4160, "ws1", fromFile ? "" : std::string(kLogin));
+        if (fromFile) c.passwordFile = path;
+        rc::Client client{c};
+        client.testFillCommandRing();
+        const auto b = client.testCommandRingBytes();
+        const auto holds = [&] {
+            return std::search(b.begin(), b.end(), kLogin.begin(), kLogin.end(),
+                               [](uint8_t x, char y) { return x == static_cast<uint8_t>(y); }) != b.end();
+        };
+        EXPECT_TRUE(std::any_of(b.begin(), b.end(), [](uint8_t x) { return x != 0; }))
+            << "vacuity guard: the ring holds records";
+        EXPECT_FALSE(holds()) << (fromFile ? "password file" : "direct password") << ": the ring holds the login password";
+    }
+    ::unlink(path.c_str());
+}
+
 // ---- C6 review: adversarial credential hygiene (#257 / #56 / #184) -----------------------------------------------
 // The freed-memory scan (AllocCounter): every heap block the Client frees is searched for the plaintext before it
 // goes back to the allocator - an unwiped copy is a hit.  The needles are long (heap strings, never SSO) and appear
@@ -462,6 +762,36 @@ rune::client::agent::AgentConfig agentCfg(int32_t in, std::string password) {
     return cfg;
 }
 } // namespace
+
+TEST(ClientSecretAdversarialRegression, NoPasswordCopyOutlivesTheAgentHandOffRegression) {
+    // #682: the Client hands the password to the agent without an AgentConfig round trip, so the mapping from
+    // ClientConfig never carries it (a by-value AgentConfig hop would leave an SSO copy in a moved-from object).
+    rc::ClientConfig c;
+    c.password = "short-pw";   // in place (SSO)
+    EXPECT_TRUE(rc::toAgentConfig(c).session.password.empty()) << "toAgentConfig copied the password";
+    c.password = std::string(300, 'p');   // heap
+    EXPECT_TRUE(rc::toAgentConfig(c).session.password.empty()) << "toAgentConfig copied the password";
+}
+
+TEST(ClientSecretAdversarialRegression, TheAgentTakesAPasswordBesideItsConfigAndWipesTheSourceRegression) {
+    // #682: ClientAgent(cfg, password): the secret holds it, the caller's string is wiped over its whole capacity;
+    // over the cap it throws and the source is wiped too.
+    std::string pw(200, 'q');
+    const char* p = pw.data();
+    const std::size_t cap = pw.capacity();
+    {
+        rune::client::agent::ClientAgent agent(agentCfg(4150, ""), pw);
+        EXPECT_EQ(agent.secretForTest().view(), std::string(200, 'q'));
+        EXPECT_TRUE(pw.empty());
+        for (std::size_t i = 0; i < cap; ++i) ASSERT_EQ(p[i], 0) << "byte " << i << " of the source capacity";
+    }
+    std::string over(rune::client::detail::FixedSecret::kCapacity + 1, 'o');
+    const char* q = over.data();
+    const std::size_t ocap = over.capacity();
+    EXPECT_THROW((rune::client::agent::ClientAgent{agentCfg(4152, ""), over}), std::invalid_argument);
+    EXPECT_TRUE(over.empty());
+    for (std::size_t i = 0; i < ocap; ++i) ASSERT_EQ(q[i], 0) << "byte " << i << " of the refused source";
+}
 
 TEST(ClientSecretAdversarialRegression, AnAllocationFailureAtEveryConstructionStepLeavesNoFreedCopyAdversarialRegression) {
     // Crash at every step: the n-th allocation throws bad_alloc, for every n.  First the agent's constructor (unstarted:
@@ -569,6 +899,91 @@ TEST(ClientSecretAdversarialRegression, ASecurityDdlAndWaitRetriedOnAFullCommand
     EXPECT_EQ(seen[0].name, "world_server_role");
     EXPECT_EQ(seen[0].pattern, "world.server.zone.") << "the re-issued grant lost its pattern";
     EXPECT_EQ(seen[0].patternKind, prefixKind);
+}
+
+namespace {
+/// C20 review: the freed-block scan armed on the CLIENT's steps only (the in-thread fake gateway decodes frames into
+/// its own strings, which are not the client's copies); the hits of every armed step add up.
+struct ClientOnlyScan {
+    const char* needle;
+    long hits = 0;
+    explicit ClientOnlyScan(const char* n) : needle(n) {}
+    template <class F> void client(F&& f) {
+        alloc_counter::scanFreedForThisThread(needle + 1, std::strlen(needle) - 1);
+        f();
+        hits += alloc_counter::freedHitsThisThread();
+        alloc_counter::scanFreedForThisThread(nullptr, 0);
+    }
+    /// Steps the client (scanned) and the gateway (not) until pred(), at most `cap` passes.
+    template <class P> bool drive(Rig& r, P&& pred, int cap = 200'000, int64_t stepNs = 1'000'000) {
+        for (int i = 0; i < cap; ++i) {
+            g_now += stepNs;
+            client([&] { r.client.doWork(); });
+            r.gw.pump();
+            if (pred()) return true;
+        }
+        return false;
+    }
+};
+} // namespace
+
+// C20 adversarial review (#682 / #680, data integrity of the secret over a whole lifecycle): construct, a SCRAM login
+// (the salted-password derivation, the proof, the server signature check), a ping on the session, then close and
+// destroy.  No block the client frees on any of those steps holds the password.
+TEST(ClientSecretAdversarialRegression, AWholeLoginLifecycleLeavesNoFreedCopyOfThePasswordAdversarialRegression) {
+    const rc::ClientConfig cfg = authCfg(4160, "ws1", kNeedle);
+    ClientOnlyScan scan(kNeedle);
+    std::optional<Rig> r;
+    scan.client([&] { r.emplace(cfg); });   // the gateway's constructor runs inside too: it never sees the password
+    r->gw.addUser("ws1", kNeedle);
+    test_support::TestCq cq(r->client);
+    ASSERT_TRUE(scan.drive(*r, [&] { return r->gw.ready(); }));
+    std::optional<test_support::PendingOp> f;
+    scan.client([&] { f.emplace(cq.issue([&](rc::Completions& q, rc::Token t) { return r->client.connect(q, t); })); });
+    ASSERT_TRUE(scan.drive(*r, [&] { return f->ready(); }));
+    ASSERT_TRUE(f->ok()) << f->describe();
+    EXPECT_EQ(r->gw.authOk, 1) << "vacuity guard: the SCRAM login ran";
+    scan.client([&] { r->client.closeImmediately(); });
+    scan.client([&] { r.reset(); });
+    EXPECT_EQ(scan.hits, 0) << "a block the client freed held the login password";
+}
+
+// C20 adversarial review (#680, the client half of `rune security bootstrap`): the one-time password and the cluster
+// key travel API -> command ring -> agent -> SecurityBootstrap frame (MAC over the key).  No block the client frees
+// from the call to its destruction holds either.
+TEST(ClientSecretAdversarialRegression, ASecurityBootstrapLeavesNoFreedCopyOfThePasswordOrTheKeyAdversarialRegression) {
+    static constexpr const char kKeyNeedle[] = "freed-scan-needle-c20-key-0003-padding-to-sixty-four-bytes-xxxx";
+    std::optional<Rig> r(std::in_place, authCfg(4162, "", ""));
+    r->gw.users.clear();
+    r->gw.bootstrapped = false;
+    const std::string keyText(kKeyNeedle);
+    r->gw.clusterKey.assign(keyText.begin(), keyText.end());
+    r->connectOk();
+    int seen = 0;
+    r->gw.templateHandlers[pc::SecurityBootstrap::TEMPLATE_ID] = [&](int, const uint8_t* fr, std::size_t len) {
+        const auto m = pc::SecurityBootstrap::decode(fr, len);
+        ASSERT_TRUE(m.has_value());
+        ++seen;
+        pc::DdlResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId; resp.errorCode = 0; r->gw.sendDdlResponse(0, resp);
+    };
+    const std::vector<uint8_t> key(keyText.begin(), keyText.end());
+    test_support::TestCq cq(r->client);
+    for (const char* needle : {kNeedle, kKeyNeedle}) {   // one pass per secret: the scan has one needle
+        SCOPED_TRACE(needle);
+        ClientOnlyScan scan(needle);
+        std::optional<test_support::PendingOp> f;
+        scan.client([&] {
+            f.emplace(cq.issue([&](rc::Completions& q, rc::Token t) { return r->client.bootstrapSecurity("admin", kNeedle, key, q, t); }));
+        });
+        ASSERT_TRUE(f->accepted());
+        ASSERT_TRUE(scan.drive(*r, [&] { return f->ready(); }));
+        EXPECT_TRUE(f->ok()) << f->describe();
+        EXPECT_EQ(scan.hits, 0) << "a block the client freed held the secret";
+    }
+    EXPECT_EQ(seen, 2) << "vacuity guard: both bootstraps reached the gateway";
+    ClientOnlyScan last(kNeedle);
+    last.client([&] { r->client.closeImmediately(); });
+    EXPECT_EQ(last.hits, 0) << "freed at close";
 }
 
 TEST(ClientSecretAdversarialRegression, TheAgentPasswordInstallAllocatesNothingAndRefusesOverCapAdversarialRegression) {
@@ -699,6 +1114,112 @@ TEST(ClientAuthErrorsRegression, ARevokedLeaderNodeSessionFailsItsRequestsSessio
     p.flush();
     ASSERT_TRUE(r.drive([&] { return viaSeed.ready(); }));
     EXPECT_TRUE(viaSeed.ok()) << viaSeed.describe();
+}
+
+// Issue #60: the Rejected-route sweep is edge-triggered.  A node session entering Rejected fails its routes' batches
+// ONCE (one failRoutedBroker sweep), not every duty cycle for as long as the session stays Rejected.
+namespace {
+struct RejectedNodeRig {
+    TwoNodeRig r;
+    test_support::TestCq cq;
+    std::optional<rc::Producer> p;
+    std::vector<test_support::PendingOp> sends;
+    const std::vector<uint8_t> val = std::vector<uint8_t>(16, 0x5C);
+    explicit RejectedNodeRig(int32_t in) : r(in), cq(r.client) {}
+    // Connects, leaves 3 batches in flight on node 1 (p0's leader), then revokes node 1's session.
+    void setupAndRevoke() {
+        ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+        auto conn = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.connect(q, t); });
+        ASSERT_TRUE(r.drive([&] { return conn.ready(); }));
+        ASSERT_TRUE(conn.ok()) << conn.describe();
+        ASSERT_TRUE(r.drive([&] { return r.client.testLeaderFor(1, 0) == 1; }));
+        r.gw.replyAcks = false;
+        rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::Leader; pcfg.lingerUs = 60'000'000; pcfg.batchBytes = 64 * 1024;
+        pcfg.maxInFlight = 8; pcfg.produceTimeoutMs = 60'000; pcfg.deliveryTimeoutMs = 120'000;
+        p.emplace(r.client.producer(pcfg));
+        const auto topic = r.client.topic("t");
+        for (int i = 0; i < 3; ++i) {
+            sends.push_back(cq.send(*p, topic, TwoNodeRig::keyFor(0), val));
+            ASSERT_TRUE(sends.back().accepted());
+            p->flush();
+            r.passes(30);
+        }
+        ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() >= 1; }));
+        r.gw.subscribeLeader[0] = r.n1;
+        sub.emplace(r.client.subscribe(topic, 0, {}, &noopRecords));
+        ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty() && sub->subscriptionId() != 0; }));
+        ASSERT_EQ(r.gw.subscribed.back().endpoint, r.n1);
+        ASSERT_EQ(r.client.routedBrokerSweeps(), 0u) << "no Rejected session yet: no sweep";
+        r.gw.revokeSession(r.gw.subscribed.back().sessionId, r.n1);
+    }
+    std::optional<rc::Subscription> sub;
+};
+} // namespace
+
+TEST(ProduceRouteRegression, RejectedBrokerFailsItsRoutesOnceNotEveryCycleRegression) {
+    RejectedNodeRig t(3870);
+    ASSERT_NO_FATAL_FAILURE(t.setupAndRevoke());
+    t.r.passes(50);
+    for (auto& s : t.sends) {
+        ASSERT_TRUE(s.ready());
+        EXPECT_EQ(s.outcome().c.status, rc::OpStatus::BrokerError);
+        EXPECT_EQ(s.outcome().c.errorCode, 46);
+    }
+    EXPECT_EQ(t.r.client.testSessionStateAt(1), rc::session::SessionState::Rejected);
+    const uint64_t afterFirst = t.r.client.routedBrokerSweeps();
+    EXPECT_EQ(afterFirst, 1u) << "one Rejected edge = one sweep";
+    t.r.passes(50);   // N further idle cycles with the session still Rejected
+    EXPECT_EQ(t.r.client.routedBrokerSweeps(), afterFirst) << "an idle Rejected session is not re-swept each cycle";
+}
+
+TEST(ProduceRouteRegression, ABatchRoutedToARejectedBrokerAfterTheSweepStillFailsRegression) {
+    RejectedNodeRig t(3872);
+    ASSERT_NO_FATAL_FAILURE(t.setupAndRevoke());
+    t.r.passes(50);
+    ASSERT_EQ(t.r.client.routedBrokerSweeps(), 1u);
+    auto later = t.cq.send(*t.p, t.r.client.topic("t"), TwoNodeRig::keyFor(0), t.val);   // routed AFTER the sweep
+    ASSERT_TRUE(later.accepted());
+    t.p->flush();
+    ASSERT_TRUE(t.r.drive([&] { return later.ready(); })) << "the late batch was held behind the Rejected session";
+    EXPECT_EQ(later.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(later.outcome().c.errorCode, 46);
+    const uint64_t sweeps = t.r.client.routedBrokerSweeps();
+    EXPECT_EQ(sweeps, 2u) << "the refused routing raised exactly one more sweep";
+    t.r.passes(50);
+    EXPECT_EQ(t.r.client.routedBrokerSweeps(), sweeps);
+    EXPECT_EQ(t.r.client.rejectedLeaderSessionsForTest(), 1u);
+}
+
+// C17 adversarial review (#60): sibling entry points to the edge-triggered sweep.  A producer CREATED after the
+// sweep (its own ProducerImpl, its own route table) whose batches go to the already-Rejected leader fails each one
+// with the Rejected node's code — never held, never re-swept per cycle; the sweep count grows by at most one per
+// refused offer and stays put once idle.
+TEST(ProduceRouteRegression, AdversarialANewProducerAfterTheSweepFailsOnTheRejectedLeaderRegression) {
+    RejectedNodeRig t(3880);
+    ASSERT_NO_FATAL_FAILURE(t.setupAndRevoke());
+    t.r.passes(50);
+    ASSERT_EQ(t.r.client.routedBrokerSweeps(), 1u);
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::All; pcfg.lingerUs = 60'000'000; pcfg.batchBytes = 64 * 1024;
+    pcfg.maxInFlight = 4; pcfg.produceTimeoutMs = 60'000; pcfg.deliveryTimeoutMs = 120'000;
+    const std::size_t producedBefore = t.r.gw.produced.size();
+    auto p2 = t.r.client.producer(pcfg);
+    const auto topic = t.r.client.topic("t");
+    std::vector<test_support::PendingOp> late;
+    for (int i = 0; i < 5; ++i) {
+        late.push_back(t.cq.send(p2, topic, TwoNodeRig::keyFor(0), t.val));
+        ASSERT_TRUE(late.back().accepted());
+        p2.flush();
+        ASSERT_TRUE(t.r.drive([&] { return late.back().ready(); })) << "batch " << i << " held behind the Rejected session";
+        EXPECT_EQ(late.back().outcome().c.status, rc::OpStatus::BrokerError) << i;
+        EXPECT_EQ(late.back().outcome().c.errorCode, 46) << i;
+    }
+    const uint64_t sweeps = t.r.client.routedBrokerSweeps();
+    EXPECT_GE(sweeps, 2u);
+    EXPECT_LE(sweeps, 1u + 5u) << "at most one sweep per refused offer";
+    t.r.passes(200);
+    EXPECT_EQ(t.r.client.routedBrokerSweeps(), sweeps) << "idle: no sweep while nothing is offered";
+    EXPECT_EQ(t.r.client.rejectedLeaderSessionsForTest(), 1u);
+    EXPECT_EQ(t.r.gw.produced.size(), producedBefore) << "nothing reached the Rejected node after its revoke";
 }
 
 // #291: a TRANSACTIONAL producer whose batches wait on a leader node session that goes Rejected fails them at once

@@ -54,7 +54,7 @@ static_assert(kMaxPasswordBytes == detail::FixedSecret::kCapacity);
 namespace {
 
 // now + ms, in ns, saturated at INT64_MAX: a huge timeout or retry budget (e.g. milliseconds::max(), "let the
-// deadline end it") never wraps into the past.  ms <= 0 is now (validatedConfig refuses negatives).
+// deadline end it") never wraps into the past.  ms <= 0 is now (validatedInPlace refuses negatives).
 int64_t nsAfter(int64_t nowNs, int64_t ms) noexcept {
     constexpr int64_t kNsPerMs = 1'000'000;
     if (ms <= 0) return nowNs;
@@ -62,28 +62,28 @@ int64_t nsAfter(int64_t nowNs, int64_t ms) noexcept {
     return nowNs + ms * kNsPerMs;
 }
 void validateConfigInPlace(ClientConfig& c);
-// #257 (C6 review): validates `c` and moves it out.  The password (given, or read from passwordFile) is wiped from
-// `c` on every exit - a later refusal (no TLS, a bad iteration cap) or a bad_alloc never frees an unwiped copy, and
-// the moved-from string's in-place (SSO) bytes are zeroed too.
-ClientConfig validatedConfig(ClientConfig& c) {
+// #257 (C6 review): validates `c` in place.  The password (given, or read from passwordFile) is wiped from `c` on a
+// refusal (no TLS, a bad iteration cap) or a bad_alloc, so no unwiped copy is freed.  #682: returns `c` itself - the
+// caller moves it straight into the member, so no named local relies on NRVO and no temporary holds SSO bytes.
+ClientConfig& validatedInPlace(ClientConfig& c) {
     try {
         validateConfigInPlace(c);
     } catch (...) {
         detail::wipeString(c.password);
         throw;
     }
-    ClientConfig out(std::move(c));
-    detail::wipeString(c.password);
-    return out;
+    return c;
 }
-// The ClientAgent's config with the password MOVED out of `c` (never copied); `c.password` is left wiped.
-agent::AgentConfig agentConfigTakingPassword(ClientConfig& c) {
-    std::string pw = std::move(c.password);
-    detail::wipeString(c.password);
-    struct Wipe { std::string& s; ~Wipe() { detail::wipeString(s); } } wipePw{pw};
-    agent::AgentConfig a = toAgentConfig(c);   // copies an empty password
-    a.session.password = std::move(pw);
-    return a;
+// #682: the agent's config (no password in it); a throw while it is built (bad_alloc) wipes `c.password` - the Client
+// is then not constructed, so nothing else would.  First statement: the moved-from caller copy is wiped.
+agent::AgentConfig agentConfigWipingOnThrow(ClientConfig& c, std::string& callerPassword) {
+    detail::wipeString(callerPassword);   // #682: the moved-from caller copy (SSO bytes) never outlives the hand-off
+    try {
+        return toAgentConfig(c);
+    } catch (...) {
+        detail::wipeString(c.password);
+        throw;
+    }
 }
 void validateConfigInPlace(ClientConfig& c) {
     // A negative timeout or retry budget has no meaning (0 = none / at once); refused, never silently clamped.
@@ -223,7 +223,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     acfg.session.tlsTrustPem   = c.tlsTrustPem;
     acfg.session.tlsExpectHost = c.tlsExpectHost;
     acfg.session.username      = c.username;   // authentication: SCRAM credentials (never logged)
-    acfg.session.password      = c.password;
+    // #682: the password is never mapped (Client passes it to the ClientAgent constructor by reference): acfg.session.password stays empty
     acfg.session.allowUnauthenticatedBroker = c.allowUnauthenticatedBroker;
     acfg.session.maxAcceptedIterations = c.maxAcceptedScramIterations;
     acfg.session.bootstrapOnly = c.securityBootstrapOnly;
@@ -244,14 +244,14 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
 // ---------------------------------------------------------------------------
 
 Client::Client(ClientConfig cfg)
-    : cfg_(validatedConfig(cfg))
-    , agent_(agentConfigTakingPassword(cfg_))
+    : cfg_(std::move(validatedInPlace(cfg)))
+    , agent_(agentConfigWipingOnThrow(cfg_, cfg.password), cfg_.password)   // #682: the agent takes the password and wipes cfg_.password
     , partitionRouter_(metadataCache_)
     , catalogReader_(std::make_unique<CatalogReader>(*this))   // eagerly, on the owning thread (I2)
     , securityReader_(std::make_unique<SecurityReader>(*this))   // authentication Task 8: same rule
 {
     // Review B M4: the agent's sessions hold the credential from here on (one owner, wiped when replaced); the Client
-    // keeps no copy - validatedConfig and agentConfigTakingPassword moved it out and wiped every source (#257).
+    // keeps no copy - validatedInPlace and the agent constructor moved it out and wiped every source (#257, #682).
     if (cfg_.traceDdlRetries) ddlRetryNotes_.reserve(kMaxDdlRetryNotes);   // push_back never reallocates on the duty thread
     // #514: the silent-leader scan runs four times per keepalive interval.
     silentCheckPeriodNs_ = (cfg_.keepaliveIntervalNs > 0 ? cfg_.keepaliveIntervalNs
@@ -750,10 +750,19 @@ session::SessionState Client::state() const {
     return static_cast<session::SessionState>(seedStatusCache_.state);
 }
 
-int16_t Client::sessionRejectCode() const noexcept {
-    if (std::this_thread::get_id() != dutyThreadId_) return 0;
-    const auto& m = agent_.seedMachine();
-    return m.state() == session::SessionState::Rejected ? m.rejectCode() : int16_t{0};
+int16_t Client::sessionRejectCode() const {
+    const auto me = std::this_thread::get_id();
+    if (me == dutyThreadId_) {
+        const auto& m = agent_.seedMachine();
+        return m.state() == session::SessionState::Rejected ? m.rejectCode() : int16_t{0};
+    }
+    // Issue #310: state()'s rule - the owner thread reads the published status, any other thread is refused.
+    if (me != ownerThread_) {
+        throw std::logic_error(
+            "Client::sessionRejectCode(): call from the owner (constructing) thread or a duty-cycle callback");
+    }
+    (void)seedStatus_.drainLatest(seedStatusCache_);
+    return seedStatusCache_.rejectCode;
 }
 
 AuthStatus Client::authStatus() const {
@@ -800,6 +809,7 @@ void Client::publishSeedStatus_(session::SessionState st, int64_t sid) noexcept 
         seedStatusLast_.authMode               = static_cast<uint8_t>(m.brokerAuthMode());
         seedStatusLast_.passwordChangeRequired = m.passwordChangeRequired() ? 1 : 0;
         seedStatusLast_.authenticated          = m.authenticated() ? 1 : 0;
+        seedStatusLast_.rejectCode = st == session::SessionState::Rejected ? m.rejectCode() : int16_t{0};   // #310
     }
     seedStatusDirty_ = !seedStatus_.tryPublish(seedStatusLast_);
 }
@@ -2180,7 +2190,7 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
         DdlOfferedOn sentOn;
         if (const auto* a = std::get_if<DdlAwaitingResend>(&d->retry)) {
             if (nowNs < a->resendAtNs) { ++i; continue; }
-            const DdlAwaitingResend due = *a;
+            DdlAwaitingResend due = *a;
             switch (offerDdl_(*d, nowNs, sentOn)) {
             case Offer::Accepted:
                 setDdlRetry_(*d, DdlNotLeaderSeen{due.redirects, due.budgetEndNs, due.backoffNs, sentOn});
@@ -2193,9 +2203,15 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
                     ++work;
                     break;
                 }
+                // Issue #97: the resend was refused because the target node's session is not up.  Record it in the
+                // state itself (SessionLost and AuthUnavailable are stronger statements and stay).
+                if (due.cause == DdlResendCause::NotLeader || due.cause == DdlResendCause::NodeUnreachable) {
+                    due.cause = DdlResendCause::NodeUnreachable;
+                    std::get<DdlAwaitingResend>(d->retry).cause = DdlResendCause::NodeUnreachable;
+                }
                 // Fix round 2 (I-1): toward a seed that can never reconnect: end now.
                 if (d->endpoint.empty() && seedCannotReconnect_()) {
-                    if (due.cause == DdlResendCause::SessionLost) {
+                    if (due.cause == DdlResendCause::SessionLost || due.cause == DdlResendCause::NodeUnreachable) {
                         constexpr std::string_view kWhy =
                             "session lost: the seed can never reconnect (it may have been applied; a retry with "
                             "the same requestId is exact)";
@@ -2220,7 +2236,17 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
                 // the sweep ends it Timeout (the DDL timed out); a shorter
                 // budget ends it NotLeader here.
                 if (nowNs >= due.budgetEndNs && nowNs < p.deadlineNs) {
-                    if (due.cause == DdlResendCause::SessionLost) {
+                    if (due.cause == DdlResendCause::NodeUnreachable) {
+                        // Issue #97: a NotLeader redirect to a node whose session never came up - the request was
+                        // never answered there, so it is a session loss, not a NotLeader.
+                        constexpr std::string_view kWhy =
+                            "node unreachable: the request's node session was not re-established within its retry "
+                            "budget (it may have been applied; a retry with the same requestId is exact)";
+                        PendingCtl dead = takeCtl_(i);
+                        completeCtl_(dead, OpStatus::SessionLost, ddlNoValue(dead.op), 0, 0,
+                                     std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kWhy.data()),
+                                                              kWhy.size()));
+                    } else if (due.cause == DdlResendCause::SessionLost) {
                         // F1: the DDL's session was lost and never came back
                         // inside the budget — a session loss, not a NotLeader.
                         constexpr std::string_view kWhy =
@@ -2236,7 +2262,7 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
                                  "AuthUnavailable: retry budget exhausted", ddlNoValue(p.op));
                     } else {
                         failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader),
-                                 "not leader: retry budget exhausted (the node could not be reached)",
+                                 "not leader: retry budget exhausted",
                                  ddlNoValue(p.op));
                     }
                     ++work;
@@ -2821,6 +2847,80 @@ TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, std::chro
     return getTopicSchemaAndWait(name, /*requestedFingerprint=*/0, timeout);
 }
 
+namespace {
+// The broker error names as the Rune QL engine prints them (client-cpp/src/cli/QlEngine.cpp errorCodeName): a copy, because
+// the engine lives in the CLI library, which depends on this one.  The size assert catches a code added to only one.
+std::string_view lineageErrorName(uint16_t code) noexcept {
+    static constexpr std::string_view kNames[] = {
+        "OK", "ProtocolVersion", "NotLeader", "Redirect", "SessionExpired", "UnknownSession", "Internal",
+        "UnknownTopic", "UnknownPartition", "NotPartitionLeader", "MinIsrViolation", "StaleGeneration",
+        "UnknownMember", "RebalanceInProgress", "NotCoordinator", "IllegalGeneration", "GroupDead",
+        "InvalidProducerEpoch", "ProducerFenced", "InvalidTxnState", "OutOfOrderSequence", "DuplicateSequence",
+        "MessageTooLarge", "InvalidSchema", "SchemaValidationFailed", "TopicExists", "StorageError",
+        "ConcurrentTransactions", "UnknownProducerId", "HandshakeFailed", "SchemaIncompatible", "SchemaConflict",
+        "ViewExists", "ViewSourceNotFound", "ViewFieldUnresolved", "ViewKeyInvalid", "ViewNotCoPartitioned",
+        "ViewSourceTransient", "ViewNotAlterable", "InvalidRequest", "InvalidTopicName", "ViewSourceIsView",
+        "TransientLogFull", "PartitionDataReset", "", "", "", "", "" /* 44..48: authErrorName (#225) */, "RecordEgressUnavailable", "UnstableOffsetCommit",
+        "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused"};
+    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::ViewPaused) + 1,
+                  "lineageErrorName: one name per rune::protocol::client::ErrorCode");
+    if (const char* auth = authErrorName(code)) return auth;   // #225: the one source of the 44..48 names
+    return code < std::size(kNames) ? kNames[code] : std::string_view("UnknownErrorCode");
+}
+} // namespace
+
+std::string Client::lineageFailure(std::string_view topic, uint16_t code, std::chrono::nanoseconds remaining) {
+    const auto plain = [&](uint16_t c) {
+        return "lineage: the broker did not serve the schema lineage of '" + std::string(topic) + "' (" +
+               std::string(lineageErrorName(c)) + " " + std::to_string(c) + ")";
+    };
+    constexpr auto kUnknownTopic = static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownTopic);
+    if (code != kUnknownTopic) return plain(code);
+    // The caller's budget is spent: no probe, just the code.
+    if (remaining <= std::chrono::nanoseconds::zero()) return plain(code);
+    // An old broker answers UnknownTopic for the lineage request although the topic exists: ask for the latest schema,
+    // within what is left of the caller's budget.
+    TopicSchemaResult probe;
+    try {
+        probe = getTopicSchemaAndWait(topic, /*requestedFingerprint=*/0, remaining);
+    } catch (const std::exception&) {
+        return plain(code);
+    }
+    if (probe.errorCode == 0)
+        return "lineage: this broker does not serve the schema lineage of '" + std::string(topic) +
+               "' (upgrade the broker to generate a type that reads every version)";
+    if (probe.errorCode == kUnknownTopic) return "lineage: topic '" + std::string(topic) + "' does not exist";
+    return plain(probe.errorCode);
+}
+
+void Client::throwOpenTopicFailure(std::string_view name, uint16_t code, std::chrono::nanoseconds remaining) {
+    constexpr auto kUnknownTopic = static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownTopic);
+    const auto refused = [&](uint16_t c) {
+        std::string msg = "openTopic: the broker refused '" + std::string(name) + "' (error " + std::to_string(c);
+        if (const char* an = authErrorName(c)) msg += std::string(" ") + an;
+        else if (c == kUnknownTopic) msg += " UnknownTopic";
+        return msg + ")";
+    };
+    if (code == kUnknownTopic && remaining > std::chrono::nanoseconds::zero()) {
+        // The broker answers UnknownTopic for a missing topic AND for an unknown fingerprint: ask for the latest.
+        TopicSchemaResult latest;
+        bool probed = true;
+        try {
+            latest = getTopicSchemaAndWait(name, uint64_t{0}, remaining);
+        } catch (const std::exception&) {
+            probed = false;   // a probe that timed out proves nothing: name the original code
+        }
+        if (probed) {
+            if (latest.errorCode == kUnknownTopic)
+                throw std::runtime_error("openTopic: topic '" + std::string(name) + "' does not exist");
+            if (latest.errorCode == 0)
+                throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
+            code = latest.errorCode;
+        }
+    }
+    throw std::runtime_error(refused(code));
+}
+
 TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, uint64_t requestedFingerprint,
                                                 std::chrono::nanoseconds timeout) {
     TopicSchemaResult result;
@@ -3106,6 +3206,25 @@ Client::NamespaceResult<void> Client::deleteNamespace(std::string_view name, std
              },
              [&](const Completion& c, std::span<const uint8_t> p) {
                  if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("deleteNamespace()", c, p);
+Client::NamespaceResult<void> Client::setNamespaceLimits(std::string_view name, const NamespaceLimitsPatch& patch,
+                                                         std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    // Issue #641: only the patch's fields go on the wire (mask = patch.present); the broker merges them onto the
+    // current record.
+    bool any = false;
+    for (const uint8_t b : patch.present) any = any || b != 0;
+    if (!any) throw std::invalid_argument("setNamespaceLimits(): the patch names no limit");
+    for (std::size_t i = 0; i < patch.present.size(); ++i) {   // up front, like the empty patch: not the encoder's runtime_error
+        if ((patch.present[i] & ~kNamespaceFullMask[i] & 0xFFu) != 0)
+            throw std::invalid_argument("setNamespaceLimits(): the patch names a limit this client does not know");
+    }
+    DdlResult r;
+    andWait_("setNamespaceLimits()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return namespaceDdl(rpc::NamespaceDdlKind::SetLimits, name, patch.present, patch.values, DdlOptions{}, q, t);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("setNamespaceLimits()", c, p);
                  r = ddlResultOf(c, p);
                  r.requestId = requestIdOf(c);
              });
@@ -3253,6 +3372,9 @@ int Client::dutyCycle(int64_t nowNs) {
             if (coordIdx() != 0) [[unlikely]] syncCoordinatorSession_();
             const int64_t gsid = coordSessionId_();  // the coordinator's session (the seed's by default)
             work += groupConsumerHub_.flushRequestedCommits(gsid);
+            // #371: a pending seek / seekToCommitted progresses on THIS pass (its OffsetFetch answer, its
+            // resubscribe, its completion), not on the 100 ms sweep.
+            work += groupConsumerHub_.driveRewinds(nowNs, gsid, coordSendFn_);
             if (groupConsumerHub_.pendingLeaves() != 0) work += groupConsumerHub_.retryPendingLeaves(gsid);
             // M2: refused fetch Unsubscribes are re-offered every pass until sent / moot.
             if (groupConsumerHub_.pendingFetchUnsubscribes() != 0) work += groupConsumerHub_.retryFetchUnsubscribes();
@@ -3605,7 +3727,7 @@ void Client::sweepTimeouts(int64_t nowNs) {
         // LOW-2), and MEDIUM-2: OffsetFetch for start offsets still unknown.
         (void)groupConsumerHub_.reconcileFetch();
         (void)groupConsumerHub_.retryOffsetFetch(nowNs, gsid, sendFn);
-        // F8c C4: commitSync deadlines on the duty clock -> Timeout.
+        // F8c C4: commitSync deadlines on the duty clock -> Timeout (a rewind progresses per pass: driveRewinds).
         (void)groupConsumerHub_.sweepCommitSyncTimeouts(nowNs);
     }
 
@@ -3998,8 +4120,15 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if (ec == rpc::ErrorCode::NotCoordinator && !opt->message.empty()) {
             // Phase 2b F: a producer's coordinator request waits (AwaitCoordinator) for the move below;
             // a redirect naming the coordinator already in use moves nothing, so ask for fresh metadata
-            // (its answer releases the waiters too).
-            if (coordRouted) scheduleMetadataRefresh();
+            // (its answer releases the waiters too).  #340: a redirect that names a NEW coordinator moves it right
+            // below (onCoordinatorMoved releases the waiters), so no refresh is asked for it.
+            if (coordRouted) {
+                const auto* rm = std::get_if<detail::CoordRemote>(&coordRoute_);
+                const std::string& current = rm == nullptr ? agent_.seedChannel() : rm->channel;
+                if (agent::ClientAgent::sameEndpoint(toChannel(std::string(opt->message)), current)) {
+                    scheduleMetadataRefresh();
+                }
+            }
             onCoordinatorRedirect_(std::string(opt->message));
             break;
         }
@@ -5590,7 +5719,18 @@ int Client::watchProduceRoutes_(int64_t nowNs) noexcept {
     // Review B I1: a leader node's session that is Rejected (its user was revoked there, or its login was refused)
     // can never carry its partitions' batches: they fail NOW with the session's code (46 / 44), not after the
     // delivery timeout.  A metadata refresh that moves the partition re-routes new sends as it always does.
-    if (agent_.rejectedLeaderSessions() != 0) [[unlikely]] producerHub_.failRoutedBroker(&rejectedRouteTrampoline, &agent_);
+    //
+    // Issue #60 - edge-triggered, O(1) when idle.  The sweep runs when a leader session ENTERED Rejected since the last
+    // one (rejectedEpoch), or when a produce offer met a Rejected leader after a sweep (the routing site in
+    // ClientAgent::offerProduceToLeader_ raises takeRejectedRouteHit).  Invariant: a Rejected leader is terminal, so
+    // after a sweep every batch on its routes is failed and any later one is caught by that routing-site flag.
+    const bool routeHit = agent_.takeRejectedRouteHit();
+    const uint64_t rejEpoch = agent_.rejectedEpoch();
+    if (rejEpoch != rejectedEpochSeen_ || routeHit) [[unlikely]] {
+        rejectedEpochSeen_ = rejEpoch;
+        ++routedBrokerSweeps_;
+        producerHub_.failRoutedBroker(&rejectedRouteTrampoline, &agent_);
+    }
     // Review MEDIUM-2: a produce attempt timed out (Kafka: a request timeout
     // requests a metadata update) — the partition may have moved silently.
     bool ask = producerHub_.takeMetadataWanted();
@@ -6313,19 +6453,20 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         partitionRouter_.setTopicPartitionCount(topicId, maxP + 1);
     }
 
-    // MD1 IMPORTANT-3: a fresh authoritative map arrived — reset the backoff to
+    // MD1 IMPORTANT-3: a fresh authoritative map arrived - reset the backoff to
     // its initial interval so a future no-progress episode starts from the floor,
-    // and disarm any pending refresh (we just refreshed).
-    nextMetadataRefreshAt_ = std::chrono::steady_clock::time_point::max();
+    // and disarm the pending refresh (we just refreshed).
     if (metadataCache_.anyProvisional()) {
         // R2-1: an answer that leaves a redirect's guess unconfirmed (requested
         // before a later redirect of the burst, or a partition the answer omits)
-        // must not end the refresh cycle — re-arm WITHOUT resetting the backoff,
-        // so a guess that is never confirmed backs off to the cap instead of
-        // polling every 100 ms forever.
+        // must not end the refresh cycle - keep it armed WITHOUT resetting the
+        // backoff, so a guess that is never confirmed backs off to the cap instead
+        // of polling every 100 ms forever.
+        // #651: idempotent while armed - a lagging answer never postpones the armed refresh.
         scheduleMetadataRefresh();
     } else {
-        metadataBackoffNs_ = kMetadataBackoffInitNs;
+        nextMetadataRefreshAtNs_ = kMetadataRefreshNotArmed;   // a fresh authoritative map: disarm
+        metadataBackoffNs_       = kMetadataBackoffInitNs;
     }
 
     // A fresh cluster view: group members follow their partitions' leaders
@@ -6489,11 +6630,10 @@ void Client::scheduleMetadataRefresh() noexcept {
     // deadline forward forever (it would never fire) and blow the backoff to the
     // cap instantly.  So only arm+double when NOT already armed; the doubling
     // then happens once per fired-then-rescheduled episode.
-    if (nextMetadataRefreshAt_ != std::chrono::steady_clock::time_point::max()) {
+    if (nextMetadataRefreshAtNs_ != kMetadataRefreshNotArmed) {
         return; // already armed — leave the pending deadline in place
     }
-    nextMetadataRefreshAt_ = std::chrono::steady_clock::now() +
-        std::chrono::nanoseconds(metadataBackoffNs_);
+    nextMetadataRefreshAtNs_ = now() + metadataBackoffNs_;   // duty clock (injected in tests)
 
     if (metadataBackoffNs_ <= kMetadataBackoffMaxNs / 2) {
         metadataBackoffNs_ *= 2;
@@ -6538,14 +6678,14 @@ void Client::tickMetadataRefresh() noexcept {
         metadataAnswerByNs_ = 0;
         scheduleMetadataRefresh();
     }
-    if (nextMetadataRefreshAt_ == std::chrono::steady_clock::time_point::max()) {
+    if (nextMetadataRefreshAtNs_ == kMetadataRefreshNotArmed) {
         return; // not armed
     }
-    if (std::chrono::steady_clock::now() < nextMetadataRefreshAt_) return;
+    if (now() < nextMetadataRefreshAtNs_) return;   // duty clock (injected in tests)
     // DR client bug 1: through any Connected session; none -> stays armed (the
     // next sweep retries; a session that connects asks on its own).
     if (!sendMetadataRequestAnywhere_()) return;
-    nextMetadataRefreshAt_ = std::chrono::steady_clock::time_point::max(); // disarm
+    nextMetadataRefreshAtNs_ = kMetadataRefreshNotArmed; // disarm
 }
 
 void Client::noteMetadataSent_() noexcept {

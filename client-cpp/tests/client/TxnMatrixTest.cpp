@@ -944,8 +944,10 @@ void CellRunner::txnAbortable() {
     EXPECT_EQ(r.comps[ct].size(), 1u);
     ASSERT_NO_FATAL_FAILURE(r.abortOk(kTokAbort));
     EXPECT_EQ(r.p->state(), rc::TxnState::Ready);
-    // A record held for its failed AddPartitions is discarded by the abort (Kafka parity): its token completes
-    // with the transaction's failure at the latest there.
+    // A record held for its failed AddPartitions completes with the transaction's failure as soon as the producer learns
+    // of it (#368: Kafka's sender fails undrained batches with the last error at once) - long before the abort, and not
+    // at deliveryTimeoutMs; the abort only ends the transaction.  Pinned by
+    // TxnMatrixRegression.UnsentRecordsOfAPoisonedTxnCompleteAtOnceRegression.
     if (is.accepted && is.token != 0) {
         ASSERT_TRUE(r.drive([&] { return tokenDone(is); })) << "the op's token never completed";
         EXPECT_EQ(statusOf(r, is), rc::OpStatus::BrokerError);
@@ -1179,3 +1181,33 @@ std::string cellName(const ::testing::TestParamInfo<Cell>& i) {
 }  // namespace
 
 INSTANTIATE_TEST_SUITE_P(TxnMatrix, TxnMatrixTest, ::testing::ValuesIn(allCells()), cellName);
+
+// #368: the record whose AddPartitions failed completes with the poison status within a few passes of the failure -
+// not at the abort and not at deliveryTimeoutMs (60 s here; the loop is bounded by passes, so a token that waits for
+// either never completes inside it).
+TEST(TxnMatrixRegression, UnsentRecordsOfAPoisonedTxnCompleteAtOnceRegression) {
+    Rig r(Cell{mx::Op::TrySendAck, mx::Entity::TxnNewPartition, mx::Timing::AbortableError});
+    ASSERT_NO_FATAL_FAILURE(r.connect());
+    r.gw->framesReceived = 0;
+    ASSERT_NO_FATAL_FAILURE(r.makeProducer());
+    ASSERT_NO_FATAL_FAILURE(r.init());
+    ASSERT_NO_FATAL_FAILURE(r.begin());
+    r.gw->txnCoordCodes.push_back(19);   // the next AddPartitions is answered InvalidTxnState
+    const Issued is = r.issue(mx::Op::TrySendAck, 1, false, kTokOp);
+    ASSERT_TRUE(is.accepted);
+    ASSERT_TRUE(r.drive([&] { return r.p->state() == rc::TxnState::AbortableError; })) << "the transaction was not poisoned";
+    bool done = false;
+    for (int pass = 0; pass < 3000 && !done; ++pass) {
+        r.step();
+        done = r.acks.count(kTokOp) != 0;
+    }
+    ASSERT_TRUE(done) << "the unsent record's token did not complete while the transaction waited for its abort";
+    ASSERT_EQ(r.acks[kTokOp].size(), 1u);
+    EXPECT_EQ(r.acks[kTokOp][0].status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(r.acks[kTokOp][0].errorCode, 19);
+    EXPECT_EQ(r.p->state(), rc::TxnState::AbortableError) << "no abort was issued: the transaction still waits for one";
+    ASSERT_NO_FATAL_FAILURE(r.abortOk(kTokAbort));
+    r.settle();
+    EXPECT_EQ(r.acks[kTokOp].size(), 1u) << "completed once, not again at the abort";
+    EXPECT_EQ(r.gw->visibleBatches(0, Gw::TxnFate::Open) + r.gw->visibleBatches(1, Gw::TxnFate::Open), 0u);
+}
