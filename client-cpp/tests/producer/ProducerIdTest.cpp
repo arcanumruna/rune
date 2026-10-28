@@ -527,9 +527,8 @@ TEST(ProducerIdRegression, CloseWithHeldRecordsCompletesWithinTheBoundRegression
 
 // #343: enableCoordinator moves a hub-fed BARE impl off the rig id - only legal before anything was sent.  With
 // acked batches in flight it used to reset the partitions and re-stamp those batches at sequence 0 under the new
-// id (duplicate records).  Debug builds assert; release builds refuse (logged): the pid, the sequences and the
-// in-flight batches are untouched and no InitProducerId is ever requested.
-#if GTEST_HAS_DEATH_TEST
+// id (duplicate records).  #693: every build refuses the same way (logged, returns false): the pid, the sequences
+// and the in-flight batches are untouched and no InitProducerId is ever requested.
 TEST(ProducerIdRegression, EnableCoordinatorWithInFlightBatchesNeverReStampsThemRegression) {
     Rig r(cfgOf(Acks::Leader), /*direct=*/false, /*wired=*/false);
     ASSERT_TRUE(r.send(0, 1, true, 1));
@@ -543,9 +542,8 @@ TEST(ProducerIdRegression, EnableCoordinatorWithInFlightBatchesNeverReStampsThem
     const int32_t nextSeq = ps->nextBaseSequence;
     ASSERT_GT(nextSeq, 0);
 
-    EXPECT_DEBUG_DEATH(r.impl->enableCoordinator(r.fake.sink(), 0), "in-flight");
+    EXPECT_FALSE(r.impl->enableCoordinator(r.fake.sink(), 0)) << "refused: batches in flight";
 
-    // (Release builds ran the call above in this process; debug builds ran it in a child.  Either way:)
     ASSERT_TRUE(r.impl->identityAssigned());
     EXPECT_EQ(std::get<rp::IdAssigned>(r.impl->identity()).producerId, rp::kRigProducerId);
     EXPECT_FALSE(r.impl->hasCoordinator()) << "a refused enable wires nothing";
@@ -557,4 +555,11 @@ TEST(ProducerIdRegression, EnableCoordinatorWithInFlightBatchesNeverReStampsThem
     EXPECT_EQ(r.wire.size(), 1u) << "and never re-sent";
     EXPECT_EQ(r.wire[0].baseSeq, 0);
 }
-#endif
+
+// #693: the positive leg - before the first send the enable is accepted and reported.
+TEST(ProducerIdRegression, EnableCoordinatorBeforeTheFirstSendReportsSuccessRegression) {
+    Rig r(cfgOf(Acks::Leader), /*direct=*/false, /*wired=*/false);
+    EXPECT_FALSE(r.impl->hasCoordinator());
+    EXPECT_TRUE(r.impl->enableCoordinator(r.fake.sink(), 0));
+    EXPECT_TRUE(r.impl->hasCoordinator());
+}

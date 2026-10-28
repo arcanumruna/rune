@@ -83,7 +83,9 @@ alloc-free handoff). The agent drains, accumulates records into per-
 - Tier-2 `batch()` is single-thread per producer (the creating thread, or `Producer::bindBatchThread()`): the
   preallocated slot pool's app side is owned by that thread; off-thread `batch()` returns a refused builder
   (`send()` = WrongThread) and never touches the pool. Thread mode: a builder destroyed elsewhere hands its slot
-  back through the producer ring; Direct (Invoker) mode loses the slot and logs an error.
+  back through the producer ring; Direct (Invoker) mode too (#655): the slot comes back on the owner's next duty
+  pass (only a full or closed ring loses it, logged). An Invoker claim aborted off its owner thread is rolled back
+  the same way (#656, kMsgDirectClaimAbort).
   Plain send/trySend/tryClaim/claimBatch stay any-thread.
   The Tier-2 slot pool is allocated by the first `batch()` / `bindBatchThread()`, never at construction: a
   producer that never batches reserves nothing.

@@ -3962,32 +3962,32 @@ TEST_F(GroupConsumerHubRegression, DuplicateAndReplayedControlAnswersChangeNothi
 
 // #660: the 24-bit control id wraps after 2^24 add() calls; a candidate equal to a live consumer's id would make
 // two consumers' Join / Sync / Heartbeat answers indistinguishable.  add() skips 0 and every id still held.
-TEST(GroupConsumerHubRegression, CtlIdNeverReusesALiveConsumersIdRegression) {
-    GroupConsumerHub hub;
-    GroupConsumerImpl a, b, x, y;
-    for (GroupConsumerImpl* c : {&a, &b, &x, &y}) {
+TEST_F(GroupConsumerHubRegression, CtlIdNeverReusesALiveConsumersIdRegression) {
+    GroupConsumerImpl& a = *impl_;   // added by the fixture
+    GroupConsumerImpl b, x, y;
+    for (GroupConsumerImpl* c : {&b, &x, &y}) {
         c->groupId  = "g";
         c->topicIds = {kTopicId};
         c->active   = true;
         c->state    = GroupConsumerState::Unjoined;
     }
-    hub.add(&a);
     const uint32_t aId = a.ctlId;
     ASSERT_NE(aId, 0u);
 
     // The counter wraps onto A's id: the next candidate equals it.
-    hub.testSetNextCtlId(aId - 1);
-    hub.add(&b);
+    hub_->testSetNextCtlId(aId - 1);
+    hub_->add(&b);
     EXPECT_NE(b.ctlId, 0u);
     EXPECT_NE(b.ctlId, aId) << "B reuses the live consumer A's control id";
 
-    // The wrap past 0: a live consumer holds 0xFFFFFF; the next candidates are 0 (skipped), aId, b.ctlId.
-    hub.testSetNextCtlId(0xFFFFFEu);
-    hub.add(&x);
+    // The wrap past 0: a live consumer holds 0xFFFFFF; the next candidates are 0 (skipped), then the held ids.
+    hub_->testSetNextCtlId(0xFFFFFEu);
+    hub_->add(&x);
     ASSERT_EQ(x.ctlId, 0xFFFFFFu);
-    hub.add(&y);
+    hub_->add(&y);
     EXPECT_NE(y.ctlId, 0u);
     for (const GroupConsumerImpl* o : {&a, &b, &x}) {
         EXPECT_NE(y.ctlId, o->ctlId) << "Y reuses a live consumer's control id";
     }
+    hub_.reset();   // before the locals die: the hub holds raw pointers to them
 }

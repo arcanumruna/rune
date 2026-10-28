@@ -759,11 +759,11 @@ void ProducerImpl::t2Return_(uint32_t slot, int32_t type) noexcept {
 
 void ProducerImpl::tier2DiscardOffThread(uint32_t slot) noexcept {
     // #341: called off the batch thread by a dying BatchBuilder.  Thread mode hands the slot to the duty side
-    // through the producer ring (the only cross-thread path).  Direct mode never drains its ring, and a full or
-    // closed ring has no room: the slot is lost, and that is logged.
+    // through the producer ring (the only cross-thread path); #655: Direct mode too (its duty pass drains the
+    // ring, drainDirectRing_).  A full or closed ring has no room: the slot is lost, and that is logged.
     uint8_t tok[kT2TokenSize];
     writeLE64(tok, 0, static_cast<int64_t>(slot));
-    if (mode_ != IngressMode::Direct && writeToRing(kMsgTier2Discard, tok, kT2TokenSize)) return;
+    if (writeToRing(kMsgTier2Discard, tok, kT2TokenSize)) return;
     std::fprintf(stderr,
                  "rune producer: a BatchBuilder holding Tier-2 slot %u was destroyed off its batch thread; "
                  "the slot is lost (destroy builders on the batch thread)\n", slot);
@@ -1463,9 +1463,9 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
     // ProducerHub::drainAndFlush (publishHeartbeat()), not here — drainRing can
     // run up to 256x per producer per cycle.
     lastNowNs_ = nowNs;  // Task 14: the pass clock Direct appends stamp batches with
-    // Task 14: a Direct producer's records were appended by trySubmit already;
-    // its ring never carries anything — skip the ring's head/tail reads entirely.
-    if (mode_ == IngressMode::Direct) return 0;
+    // Task 14: a Direct producer's records were appended by trySubmit already; #655/#656: its ring carries only
+    // off-owner settle messages (an empty one costs a head/tail compare).
+    if (mode_ == IngressMode::Direct) return drainDirectRing_(messageLimit);
     // F8c C6a: closeImmediately / failure path / Client close — every record
     // read from the closed ring completes with the Discarding status.
     if (const auto* dc = std::get_if<LifeDiscarding>(&life_)) [[unlikely]] {
@@ -1626,6 +1626,27 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
         const DutyScope duty(*this);   // runs what the op's handlers deferred (a close, deferred records)
     }
     return n + refused;
+}
+
+int ProducerImpl::drainDirectRing_(int messageLimit) noexcept {
+    // #655/#656: a Direct producer's ring carries only off-owner settle messages.
+    if (ring_.headPosition() == ring_.tailPosition()) [[likely]] return 0;
+    return ring_.read(
+        [this](int32_t msgTypeId, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t offset,
+               aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+            if (msgTypeId == kMsgTier2Discard && len >= kT2TokenSize) {
+                t2Return_(static_cast<uint32_t>(readLE64(p, 0)), 2);
+            } else if (msgTypeId == kMsgDirectClaimAbort && len >= 8) {
+                // The ring's release / acquire orders the writer's span writes before this rollback; a stale gen is a
+                // no-op, an abandoned claim is settled.
+                abortDirectClaim_(static_cast<uint64_t>(readLE64(p, 0)));
+                noteClaimCreditLost_();
+            } else {
+                ++ringForeign_;   // any other type in a Direct ring is a bug
+            }
+        },
+        messageLimit);
 }
 
 // ---------------------------------------------------------------------------
@@ -2465,6 +2486,19 @@ int ProducerImpl::flushBatches(
 //     lastAckedOffset (per partition) = the max last offset of every OK (B).
 // ---------------------------------------------------------------------------
 
+namespace {
+// #689: an error that refuses the PARTITION itself (not one batch): every later batch to it is refused the same
+// way, so records still lingering in its builder fail at once instead of being sent (and refused) again.
+// (46 / 44 Rejected sessions are covered by failRoutedBroker, which fails the builders.)
+constexpr bool isPartitionRefusal_(uint16_t code) noexcept {
+    namespace pc = rune::protocol::client;
+    return code == static_cast<uint16_t>(pc::ErrorCode::UnknownTopic) ||
+           code == static_cast<uint16_t>(pc::ErrorCode::UnknownPartition) ||
+           code == static_cast<uint16_t>(pc::ErrorCode::NotAuthorized) ||
+           code == static_cast<uint16_t>(pc::ErrorCode::NamespaceSuspended);
+}
+}  // namespace
+
 void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
                                      int64_t logStartOffset)
 {
@@ -2657,6 +2691,7 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         }
         releaseResolved_(ps, *b);
         reclaimAckRing_(ps);
+        if (isPartitionRefusal_(static_cast<uint16_t>(ec))) failBuilder_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));   // #689
         return;
     }
     // D: rejected, but an earlier attempt may be stored — outcome unknown (44..47 after a retransmit too).
@@ -2668,6 +2703,7 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
     markUnresolved_(ps, *b);
     releaseResolved_(ps, *b);
     reclaimAckRing_(ps);
+    if (isPartitionRefusal_(static_cast<uint16_t>(ec))) failBuilder_(ps, OpStatus::BrokerError, static_cast<uint16_t>(ec));   // #689
 }
 
 void ProducerImpl::parkOutOfOrder_(PartitionState& ps, InFlightBatch& b) noexcept {
@@ -3847,8 +3883,20 @@ void ProducerImpl::abortClaim(int64_t token) noexcept {
 
 void ProducerImpl::abortClaimOffOwner(int64_t token) noexcept {
     if (mode_ == IngressMode::Direct) {
-        std::fprintf(stderr, "rune producer: an Invoker claim was settled off its owner thread; it stays held until "
-                             "the producer closes (settle claims on the owner thread)\n");
+        // #656: the owner thread (only the cq / bq owner differed) rolls back at once; the queue credit cannot be
+        // returned off its owner (Thread mode's kMsgClaimCreditLost accounting).  Off the owner: the owner does it
+        // on its next duty pass.
+        if (std::this_thread::get_id() == dutyThreadId_) {
+            abortDirectClaim_(static_cast<uint64_t>(token));
+            noteClaimCreditLost_();
+            return;
+        }
+        uint8_t tok[8];
+        writeLE64(tok, 0, token);
+        if (!writeToRing(kMsgDirectClaimAbort, tok, sizeof tok)) {
+            std::fprintf(stderr, "rune producer: an Invoker claim was settled off its owner thread and the producer "
+                                 "ring could not take the abort; it stays held until the producer closes\n");
+        }
         return;
     }
     try {
@@ -4000,9 +4048,12 @@ const ProduceFrameBuilder::Mark* ProducerImpl::abandonDirectClaimOn_(PartitionSt
 }
 
 void ProducerImpl::abandonOpenClaimForClose() noexcept {
-    // Owner-thread, Direct-mode state: anything else is a no-op (Thread mode has no Direct claim; off the owner
-    // thread the state is not ours to touch).  The duty-thread caller is therefore not asserted: this guard IS the
-    // thread-owner check (dutyThreadId_), and Client's close drain may run it from a non-owner thread by design.
+    // #692: Owner-thread, Direct-mode state: anything else is a no-op (Thread mode has no Direct claim; off the
+    // owner thread the state is not ours to touch).  This guard IS the thread-owner check (dutyThreadId_), so no
+    // caller asserts it.  Every caller and why it is legal:
+    //  - Client::checkDrain_ (Client.cpp): the Client's close drain; it may run off the owner thread, then no-op.
+    //  - Producer.cpp (the owner's blocking close): only after an accepted beginClose.
+    //  - ProducerTxn.cpp (four sites): the owner / duty thread ending a transaction.
     if (mode_ != IngressMode::Direct || std::this_thread::get_id() != dutyThreadId_) return;
     const auto* o = std::get_if<DirectClaimOpen>(&directClaim_);
     if (o == nullptr) return;
@@ -4050,19 +4101,18 @@ template int ProducerImpl::retransmitStalled<CountingSink>(int64_t, const Counti
 
 namespace rune::client::producer {
 
-void ProducerImpl::enableCoordinator(CoordinatorSink sink, uint32_t seqBase) {
+bool ProducerImpl::enableCoordinator(CoordinatorSink sink, uint32_t seqBase) {
     // #343: moving a bare impl off the rig id resets its partitions; with batches in flight, id assignment would
     // re-stamp them at sequence 0 under the new id (duplicate records).  The Client / ProducerHub always enable the
-    // coordinator before the first send, so this is a precondition: asserted in debug, refused (logged, nothing
-    // changed, no coordinator wired) in release.
+    // coordinator before the first send; #693: a refusal (logged, nothing changed, no coordinator wired) is
+    // reported as false in every build, never an assert.
     for (const auto& up : partitions_) {
         if (!up->inflight.empty()) {
             std::fprintf(stderr,
                          "ProducerImpl: enableCoordinator refused: topic=%d part=%d has in-flight batches (enable the "
                          "coordinator before the first send)\n",
                          up->topicId, up->partition);
-            assert(false && "enableCoordinator with in-flight batches");
-            return;
+            return false;
         }
     }
     // #340: a plain producer's only coordinator request is its InitProducerId (one at a time): one preallocated
@@ -4073,6 +4123,7 @@ void ProducerImpl::enableCoordinator(CoordinatorSink sink, uint32_t seqBase) {
     if (const auto* a = std::get_if<IdAssigned>(&identity_); a != nullptr && a->producerId == kRigProducerId) {
         expectBrokerId();
     }
+    return true;
 }
 
 void ProducerImpl::expectBrokerId() {

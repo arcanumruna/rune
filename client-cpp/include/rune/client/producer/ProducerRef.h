@@ -52,6 +52,17 @@ public:
         check_();
         return p_->claimBatch(topic, key, n, recLen);
     }
+    // #692: the acked claimBatch forms Producer declares (one completion for the whole batch).
+    [[nodiscard]] BatchClaim claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen, Completions& cq,
+                                        Token token) const noexcept {
+        check_();
+        return p_->claimBatch(topic, key, n, recLen, cq, token);
+    }
+    [[nodiscard]] BatchClaim claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen,
+                                        AckToken token) const noexcept {
+        check_();
+        return p_->claimBatch(topic, key, n, recLen, token);
+    }
 
     /// The borrowed producer (lifecycle calls: begin / commit / abort ...).
     [[nodiscard]] Producer& producer() const noexcept {

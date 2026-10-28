@@ -84,6 +84,7 @@ inline constexpr int32_t kMsgClaimBatch  = 4; // Phase 2b B: claimBatch — n re
 inline constexpr int32_t kMsgTxnControl  = 5; // Phase 2b F: a transaction control op, FIFO with the records before it
 inline constexpr int32_t kMsgTier2Discard  = 6; // #341: a Tier-2 slot whose builder died off the batch thread
 inline constexpr int32_t kMsgClaimCreditLost = 7; // #322: a credit claim aborted off its queue's owner thread
+inline constexpr int32_t kMsgDirectClaimAbort = 8; // #656: an Invoker claim aborted / destroyed off its owner thread: the owner rolls it back (payload: the claim's gen, 8 bytes LE)
 
 // TXN_CONTROL layout (kMsgTxnControl payload, little endian, Phase 2b F Task 8):
 //   [0]      kind          : u8  (TxnControl::Kind)
@@ -696,8 +697,9 @@ public:
         return mode_ != IngressMode::Direct || std::this_thread::get_id() == dutyThreadId_;
     }
     /// #322: abort a claim whose credit cannot be returned on this thread.  Thread mode: published as
-    /// kMsgClaimCreditLost (the duty side counts it, completes nothing).  Direct mode off the owner thread: owner
-    /// state is not touched; logged, and the claim stays held until the producer closes.
+    /// kMsgClaimCreditLost (the duty side counts it, completes nothing).  Direct mode (#656): on the owner thread
+    /// the claim is rolled back at once (its queue credit is lost, counted); off it, kMsgDirectClaimAbort is
+    /// published and the owner rolls the claim back on its next duty pass (only a full / closed ring logs).
     void abortClaimOffOwner(int64_t token) noexcept;
     /// Phase 2b B (owner thread): Invoker claims abandoned while open - their
     /// partition's builder was failed / the producer closed; commit() returned false.
@@ -1291,7 +1293,7 @@ public:
     // ---- Phase 2b F Task 2: the coordinator link (duty thread only) -----------
     /// Emplaces the link with this producer's ordinal (ProducerHub::add, right after setOrdinal) and
     /// the sink to offer coordinator frames through.  Before it, a bare rig has no link.
-    void enableCoordinator(CoordinatorSink sink, uint32_t seqBase = 0);
+    [[nodiscard]] bool enableCoordinator(CoordinatorSink sink, uint32_t seqBase = 0);
     /// FD4: this producer's id comes from the broker, not the rig default.  Client::producer calls it on the
     /// creating thread, before the impl is shared, so the handle reports -1 until the id is assigned.
     void expectBrokerId();
@@ -1639,6 +1641,9 @@ private:
     [[nodiscard]] SendResult ringRecordFits_(std::size_t keySize, std::size_t valueLen) const noexcept;
     [[nodiscard]] bool commitDirectClaim_(uint64_t gen) noexcept;
     void abortDirectClaim_(uint64_t gen) noexcept;
+    /// #655/#656: a Direct producer's ring carries only off-owner settle messages (kMsgTier2Discard,
+    /// kMsgDirectClaimAbort); the owner applies them here.  An empty ring costs one head/tail compare.
+    int drainDirectRing_(int messageLimit) noexcept;
 
     /// Double a partition's ack-ring, preserving live entries [ackTail, ackHead).
     /// Called only on overflow (deep single-partition pipeline); steady state

@@ -4098,42 +4098,42 @@ TEST(GroupRoutingRegression, LaggingMetadataAnswersNeverPostponeTheArmedRefreshA
 }
 
 // The armed metadata refresh is driven by the injected duty clock (rule 2: one injected clock), not by the wall
-// clock.  Same setup as the #651 test: the second redirect's guess stays provisional, so a refresh is armed.  With
-// the duty clock frozen NO new MetadataRequest is sent, however many passes run; once the clock moves past the
-// backoff exactly one is.  RED before the fix: the wall clock fired it while the duty clock stood still.
+// clock.  Setup: MetadataRequests are never answered, so each one arms the backoff refresh a response timeout (2 s)
+// after it was sent, and the backoff doubles per cycle (100 ms, 200 ms, ...).  The duty clock moves 100 ms per pass
+// (= one timeout sweep per pass) until a fire whose armed wait was 800 ms; the NEXT refresh is then armed with a
+// 1.6 s wait.  The clock is FROZEN while it is armed: no MetadataRequest is sent however many passes run; once the
+// clock moves past the wait exactly one is.  RED before the fix: the refresh used the wall clock (it fired while the
+// duty clock stood still, or did not fire when the duty clock jumped).
 TEST(GroupRoutingRegression, MetadataRefreshFollowsTheInjectedClockRegression) {
-    RigOptions o        = routingClockOptions(100'000);
+    constexpr int64_t kStepNs = 100'000'000LL;   // one timeout sweep per pass
+    RigOptions o        = routingClockOptions(100'000);   // fine steps while connecting
     o.keepaliveNs       = 50'000'000;
-    o.responseTimeoutNs = 60'000'000'000;
+    o.responseTimeoutNs = 2'000'000'000;
     GroupRig r(4573, 4574, o);
-    const auto [n1, p1port] = r.addNode(4573);
-    const auto [n2, p2port] = r.addNode(4573);
-    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
-    r.gw.partitions      = {{1, 0, 1, 1, 4573, ""}, {1, 1, 2, 1, 4573, ""}};
-    r.gw.subscribeLeader = {{0, n1}, {1, n2}};
+    r.gw.partitions   = {{1, 0, 0, 1, 4573, ""}, {1, 1, 0, 1, 4573, ""}};
+    r.gw.holdMetadata = true;   // requests are counted, never answered
     r.connect();
-    auto s0 = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
-                                 [](const rc::Record&) {});
-    ASSERT_TRUE(r.drive([&] { return r.subAt(0, n1) != nullptr && s0.active(); }));
-    // Let the refreshes of the first redirect run their course.
-    const int64_t settled = g_routingClockNs + 3'000'000'000LL;
-    ASSERT_TRUE(r.drive([&] { return g_routingClockNs >= settled; }, 100'000));
-    const int before = r.gw.metadataRequests;
-    // The second redirect arms a refresh.  The duty clock barely moves (1 us per pass, far below the 100 ms first
-    // backoff step) and then stands still: only the clock can fire the armed refresh.
-    r.opt.stepNs = 100'000;
-    const int64_t sub0 = g_routingClockNs;
-    auto s1 = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
-                                 [](const rc::Record&) {});
-    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n2) != nullptr && s1.active(); }, 20'000));
-    const int atActive = r.gw.metadataRequests; const int64_t dt = g_routingClockNs - sub0;
-    r.opt.stepNs = 0;
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests >= 1; }, 20'000));
+    r.opt.stepNs        = kStepNs;
+    int seen            = r.gw.metadataRequests;
+    int64_t lastFireNs  = g_routingClockNs;
+    int64_t waitNs      = 0;   // the armed wait of the cycle that just fired (gap - the 2 s answer timeout)
+    ASSERT_TRUE(r.drive([&] {
+        if (r.gw.metadataRequests == seen) return false;
+        waitNs     = (g_routingClockNs - lastFireNs) - 2'000'000'000LL;
+        lastFireNs = g_routingClockNs;
+        seen       = r.gw.metadataRequests;
+        return waitNs >= 700'000'000LL;   // the 800 ms cycle just fired: the next wait is 1.6 s
+    }, 20'000)) << "the backoff never reached 800 ms";
+    // 2.2 s later the next refresh is armed (answer timeout 2 s) and due 1.6 s after that.
+    ASSERT_TRUE(r.drive([&] { return g_routingClockNs >= lastFireNs + 2'200'000'000LL; }, 1'000));
+    ASSERT_EQ(r.gw.metadataRequests, seen) << "precondition: the armed refresh fired early";
+    r.opt.stepNs = 0;   // freeze the duty clock
     for (int i = 0; i < 5000; ++i) { r.client.doWork(); r.gw.pump(); }
-    const int frozenAt = r.gw.metadataRequests;
-    ADD_FAILURE() << "DIAG before=" << before << " atActive=" << atActive << " dtNs=" << dt << " frozenAt=" << frozenAt;
-    g_routingClockNs += 2'000'000'000LL;   // past the first backoff step
+    EXPECT_EQ(r.gw.metadataRequests, seen) << "a refresh fired while the duty clock stood still";
+    g_routingClockNs += 1'600'000'000LL;   // past the armed wait (arm <= +2.1 s, due <= +3.7 s; now +3.8 s)
     for (int i = 0; i < 200; ++i) { r.client.doWork(); r.gw.pump(); }
-    EXPECT_EQ(r.gw.metadataRequests, frozenAt + 1) << "the armed refresh did not fire once the duty clock passed it";
+    EXPECT_EQ(r.gw.metadataRequests, seen + 1) << "the armed refresh did not fire once the duty clock passed it";
 }
 
 // #440: the coordinator's seed session reconnects onto a node that was rolled back below what the consumer needs

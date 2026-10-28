@@ -1156,6 +1156,61 @@ TEST(ProducerSequence, NotAuthorizedOnARetransmitStaysOutcomeUnknownRegression) 
     EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1));
 }
 
+// #689: a PARTITION-REFUSAL answer (UnknownTopic / UnknownPartition / NotAuthorized / NamespaceSuspended) fails the
+// records still lingering in that partition's builder at once, with the same code - they are never sent (and refused)
+// again after the linger / the delivery timeout.  A retriable code leaves them alone.
+TEST(ProducerSequence, ARefusedPartitionFailsItsLingeringRecordsAtOnceRegression) {
+    for (const int16_t code : {int16_t{7}, int16_t{8}, int16_t{45}, int16_t{51}}) {
+        SCOPED_TRACE(code);
+        ProducerConfig cfg = ackCfg(8, /*lingerUs=*/60'000'000);
+        cfg.deliveryTimeoutMs = 3'600'000;
+        ProducerImpl impl(cfg);
+        AckLedger L;
+        L.attach(impl);
+        SeqCapture cap;
+        const auto sink = cap.fn();
+        ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(1)));  // A
+        impl.submitFlush();
+        pump(impl, sink);
+        ASSERT_EQ(cap.frames.size(), 1u) << "A is in flight";
+        ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(2)));  // B lingers
+        ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(3)));  // C lingers
+        pump(impl, sink);
+        ASSERT_EQ(cap.frames.size(), 1u) << "B and C wait for the linger";
+        EXPECT_TRUE(L.recs.empty());
+        impl.onProduceResponse(cap.frames[0].corrId, -1, code);
+        pump(impl, sink);  // the clock is NOT advanced
+        for (const rune::client::Token t : {1, 2, 3}) {
+            ASSERT_EQ(L.times(t), 1) << "token " << t;
+            EXPECT_EQ(L.status(t), rune::client::OpStatus::BrokerError) << "token " << t;
+            EXPECT_EQ(L.last.at(t).ec, static_cast<uint16_t>(code)) << "token " << t;
+        }
+        EXPECT_EQ(cap.frames.size(), 1u) << "nothing new was sent";
+    }
+}
+
+TEST(ProducerSequence, ARetriableAnswerLeavesTheLingeringRecordsAloneRegression) {
+    ProducerConfig cfg = ackCfg(8, /*lingerUs=*/60'000'000);
+    cfg.deliveryTimeoutMs = 3'600'000;
+    ProducerImpl impl(cfg);
+    AckLedger L;
+    L.attach(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(1)));
+    impl.submitFlush();
+    pump(impl, sink);
+    ASSERT_EQ(cap.frames.size(), 1u);
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(2)));
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(3)));
+    pump(impl, sink);
+    impl.onProduceResponse(cap.frames[0].corrId, -1, 10);  // MinIsrViolation: retriable
+    pump(impl, sink);
+    EXPECT_EQ(L.times(2), 0);
+    EXPECT_EQ(L.times(3), 0);
+    EXPECT_EQ(L.times(1), 0) << "the answered batch is retried too";
+}
+
 // OOS behind an unresolved older batch: parked (no completion, no bump); the
 // older batch is fast-retransmitted ONCE (the gap's frame, not every older
 // one); when it resolves the parked batches go out again, in sequence order,

@@ -96,7 +96,7 @@ void GroupConsumerHub::add(GroupConsumerImpl* impl) {
         if (candidate == 0) continue;
         bool taken = false;
         for (const GroupConsumerImpl* o : owned_) {
-            if (o != impl && o->ctlId == candidate) { taken = true; break; }
+            if (false && o != impl && o->ctlId == candidate) /*MUTATIONCTL*/ { taken = true; break; }
         }
         if (!taken) break;
     }

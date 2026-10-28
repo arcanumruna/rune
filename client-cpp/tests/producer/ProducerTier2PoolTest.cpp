@@ -433,6 +433,24 @@ TEST(Tier2SlotRegression, BuilderDestroyedOffTheBatchThreadReturnsItsSlotRegress
     pump(impl, sink);
 }
 
+// #655: an Invoker (Direct) producer's builder destroyed off the batch thread returns its slot on the owner's next
+// duty pass (it used to be lost and logged).
+TEST(Tier2SlotRegression, InvokerBuilderDestroyedOffTheBatchThreadReturnsItsSlotRegression) {
+    constexpr int32_t kSlots = 4;
+    ProducerImpl impl(cfgOf(Acks::None, kSlots));
+    impl.enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr});
+    BatchBuilder b(&impl, 1, 0);
+    b.add(kVal);
+    const std::size_t free = impl.tier2FreeCount();
+    ASSERT_EQ(free, static_cast<std::size_t>(kSlots) - 1) << "the builder holds a slot";
+    destroyOffThread(std::move(b));
+    EXPECT_EQ(impl.tier2FreeCount(), free) << "nothing returns before the owner's duty pass";
+    EXPECT_EQ(impl.drainRing(kNow, 16), 1) << "one duty pass applies the discard";
+    EXPECT_EQ(impl.tier2FreeCount(), static_cast<std::size_t>(kSlots)) << "the full pool";
+    EXPECT_EQ(impl.ringForeignMessages(), 0u);
+    EXPECT_EQ(impl.drainRing(kNow, 16), 0);
+}
+
 TEST(Tier2SlotRegression, OffThreadDiscardInADiscardingProducerStillReturnsTheSlotRegression) {
     constexpr int32_t kSlots = 4;
     ProducerImpl impl(cfgOf(Acks::None, kSlots));

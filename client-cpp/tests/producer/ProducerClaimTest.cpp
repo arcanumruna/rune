@@ -14,6 +14,7 @@
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/BatchBuilder.h>
 #include <rune/client/producer/Producer.h>
+#include <rune/client/producer/ProducerRef.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/producer/ProduceFrameBuilder.h>
@@ -913,8 +914,11 @@ struct DirectRig {
         : impl(new ProducerImpl(cfg, 4 * 1024)), p(impl) {
         impl->enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr});
     }
-    /// One owner duty pass (Direct: drainRing is a no-op; flush the builders).
-    void pass(const ProducerImpl::SendFn& sink) { impl->flushBatches(kNow, 42, sink); }
+    /// One owner duty pass: drainRing (#655/#656: the off-owner settle messages), then flush the builders.
+    void pass(const ProducerImpl::SendFn& sink) {
+        impl->drainRing(kNow, 16);
+        impl->flushBatches(kNow, 42, sink);
+    }
 };
 }  // namespace
 
@@ -1207,7 +1211,9 @@ TEST(ProducerClaimRegression, InvokerClaimOffOwnerCommitStaysOpenAdversarialRegr
     EXPECT_EQ(cap.values(), std::vector<std::string>{"OWNR"});
 }
 
-TEST(ProducerClaimRegression, InvokerClaimDestroyedOffOwnerIsHeldUntilCloseAdversarialRegression) {
+// #656: a claim destroyed off the owner thread is rolled back by the owner's next duty pass (it used to wedge the
+// producer in ClaimHeld until close).
+TEST(ProducerClaimRegression, InvokerClaimDestroyedOffOwnerIsReleasedOnTheNextDutyPassAdversarialRegression) {
     ProducerConfig cfg = voidCfg();
     cfg.acks = Acks::Leader;
     DirectRig r(cfg);
@@ -1219,12 +1225,37 @@ TEST(ProducerClaimRegression, InvokerClaimDestroyedOffOwnerIsHeldUntilCloseAdver
     std::memset(c.buffer().data(), 0xAB, c.buffer().size());
     std::thread t([&] { rc::Claim dead(std::move(c)); });
     t.join();
-    EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("x")), SendResult::ClaimHeld) << "held until close";
-    EXPECT_EQ(r.impl->claimsAbandoned(), 0u);
-    r.impl->abandonOpenClaimForClose();
-    EXPECT_EQ(r.impl->claimsAbandoned(), 1u);
+    EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("x")), SendResult::ClaimHeld)
+        << "owner state is untouched until the owner's duty pass";
+    EXPECT_EQ(r.impl->claimCreditLost(), 0u);
+    r.pass(cap.fn());   // ONE owner duty pass rolls the claim back
+    EXPECT_EQ(r.impl->claimCreditLost(), 1u);
+    EXPECT_EQ(r.impl->claimsAbandoned(), 0u) << "rolled back, not abandoned";
+    EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("x")), SendResult::Ok) << "no longer wedged";
     r.pass(cap.fn());
-    EXPECT_EQ(cap.values(), std::vector<std::string>{"A"}) << "the record before the claim drains";
+    EXPECT_EQ(cap.values(), (std::vector<std::string>{"A", "x"})) << "the claimed bytes were never sent";
+    EXPECT_FALSE(anyByteIs(cap.values(), static_cast<char>(0xAB)));
+    EXPECT_EQ(r.impl->ringForeignMessages(), 0u);
+}
+
+TEST(ProducerClaimRegression, InvokerBatchClaimDestroyedOffOwnerIsReleasedRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    DirectRig r(cfg);
+    FrameCapture cap;
+    r.pass(cap.fn());
+    ASSERT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("A")), SendResult::Ok);
+    rc::BatchClaim b = r.p.claimBatch(kTopic, Key(uint64_t{1}), 3, 8);
+    ASSERT_TRUE(b);
+    for (uint32_t i = 0; i < b.count(); ++i) std::memset(b.record(i).data(), 0xAB, b.recordLength());
+    std::thread t([&] { rc::BatchClaim dead(std::move(b)); });
+    t.join();
+    EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("x")), SendResult::ClaimHeld);
+    r.pass(cap.fn());
+    EXPECT_EQ(r.impl->claimCreditLost(), 1u);
+    EXPECT_EQ(r.p.trySend(kTopic, Key(uint64_t{1}), bytes("x")), SendResult::Ok);
+    r.pass(cap.fn());
+    EXPECT_EQ(cap.values(), (std::vector<std::string>{"A", "x"}));
     EXPECT_FALSE(anyByteIs(cap.values(), static_cast<char>(0xAB)));
 }
 
@@ -2209,6 +2240,40 @@ TEST(ProducerClaimRegression, AckedClaimBatchCompletesWithItsBaseOffsetRegressio
                 EXPECT_EQ(L.recs[0].status, rc::OpStatus::Ok);
             }
         }
+    }
+}
+
+// #692: ProducerRef forwards both acked claimBatch overloads.
+TEST(ProducerClaimRegression, ProducerRefForwardsTheAckedClaimBatchOverloadsRegression) {
+    for (const bool direct : {false, true}) {
+        SCOPED_TRACE(direct ? "Direct" : "Ring");
+        AckedRig r(direct);
+        test_support::AckLedger L;
+        L.attach(r.p);
+        const rc::ProducerRef ref(r.p);
+        const Key key(uint64_t{4});
+        rc::BatchClaim a = ref.claimBatch(kTopic, key, 2, 2, r.cq, 7);
+        ASSERT_TRUE(a) << static_cast<int>(a.result());
+        EXPECT_EQ(r.cq.outstanding(), 1u);
+        for (uint32_t i = 0; i < 2; ++i) fill(a.record(i), "aa");
+        ASSERT_TRUE(a.commit());
+        rc::BatchClaim b = ref.claimBatch(kTopic, key, 2, 2, rc::AckToken{8});
+        ASSERT_TRUE(b) << static_cast<int>(b.result());
+        for (uint32_t i = 0; i < 2; ++i) fill(b.record(i), "bb");
+        ASSERT_TRUE(b.commit());
+        r.pass();
+        ASSERT_EQ(r.cap.corrs.size(), 1u);
+        EXPECT_TRUE(r.polled().empty());
+        r.impl->onProduceResponse(r.cap.corrs[0], 200, 0);
+        const auto done = r.polled();
+        ASSERT_EQ(done.size(), 1u) << "exactly one cq completion";
+        EXPECT_EQ(std::get<0>(done[0]), 7u);
+        EXPECT_EQ(std::get<1>(done[0]), 200) << "the batch's base offset";
+        EXPECT_EQ(std::get<2>(done[0]), rc::OpStatus::Ok);
+        ASSERT_EQ(L.recs.size(), 1u) << "exactly one AckToken completion";
+        EXPECT_EQ(L.recs[0].token, 8u);
+        EXPECT_EQ(L.recs[0].value, 202) << "the second batch's base offset";
+        EXPECT_EQ(L.recs[0].status, rc::OpStatus::Ok);
     }
 }
 

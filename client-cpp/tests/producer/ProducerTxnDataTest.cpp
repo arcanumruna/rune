@@ -14,6 +14,7 @@
 #include <rune/client/Completion.h>
 #include <rune/client/Key.h>
 #include <rune/client/codec/DataCodec.h>
+#include <rune/client/producer/BatchBuilder.h>
 #include <rune/client/producer/ProducerHub.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/protocol/RecordBatch.h>
@@ -1081,6 +1082,25 @@ TEST(ProducerClaimRegression, OffThreadCreditLostMessageIsSkippedByTheTxnRefusal
     Op abort = r.abort();
     r.tick();
     ASSERT_TRUE(abort.ready());
+}
+
+// #657: an off-thread BatchBuilder death in the ring of a transactional producer OUTSIDE a transaction (intake
+// shut) is applied by the refusal pass: the slot comes back and the message is never counted as foreign.
+TEST(ProducerTxnDataRegression, OffThreadTier2DiscardIsAppliedByTheTxnRefusalPassRegression) {
+    Rig r;
+    r.initOk();   // Ready, no transaction open: the intake is shut
+    const std::size_t full = r.impl->tier2FreeCount();
+    ASSERT_GT(full, 0u);
+    {
+        rc::BatchBuilder b(r.impl.get(), 1, 0);
+        b.add(std::vector<uint8_t>(8, 0x11));
+        ASSERT_EQ(r.impl->tier2FreeCount(), full - 1) << "the builder holds a slot";
+        std::thread t([p = std::make_unique<rc::BatchBuilder>(std::move(b))]() mutable { p.reset(); });
+        t.join();
+    }
+    for (int i = 0; i < 8 && r.impl->tier2FreeCount() != full; ++i) r.impl->drainRing(r.now, 16);
+    EXPECT_EQ(r.impl->tier2FreeCount(), full) << "the slot never came back";
+    EXPECT_EQ(r.impl->ringForeignMessages(), 0u);
 }
 
 // FD5: more new partitions than one 4096-byte AddPartitionsToTxn holds are split across request slots, in the same
