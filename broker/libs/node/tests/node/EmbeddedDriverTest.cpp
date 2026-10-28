@@ -14,6 +14,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <csignal>
+#include <sys/wait.h>
 #include <unistd.h>
 
 using namespace rune::node;
@@ -27,7 +29,7 @@ struct TmpDir {
         path = fs::temp_directory_path() /
                ("rune_edrv_" + std::to_string(::getpid()) + "_" + std::to_string(seq++));
     }
-    ~TmpDir() { std::error_code ec; fs::remove_all(path, ec); }
+    ~TmpDir() { std::error_code ec; fs::remove_all(path, ec); fs::remove(path.string() + ".lock", ec); }
 };
 EmbeddedDriverConfig cfgAt(const fs::path& p) {
     EmbeddedDriverConfig c;
@@ -108,20 +110,55 @@ TEST(EmbeddedDriverRegression, StaleInactiveDirIsReclaimed) {
     EXPECT_NO_THROW(EmbeddedDriver b(cfgAt(d.path), DriverMode::Invoker));
 }
 
-// The refusal is judged on Aeron's cnc heartbeat (EmbeddedDriver: a heartbeat under 1 s old is ACTIVE).  The
-// conductor stamps it once per timer interval, so a slow start (TSan: ~1.6 s of init) can leave a live driver's
-// heartbeat older than that when the second driver looks (the TSan CI job saw it).  Pump `a` until Aeron itself
-// reports it active - the state this test is about - then the second driver must be refused.
 TEST(EmbeddedDriverRegression, ActiveDirIsRefused) {
     TmpDir d;
     EmbeddedDriver a(cfgAt(d.path), DriverMode::Invoker);
-    bool active = false;
-    for (int i = 0; i < 2'000'000 && !active; ++i) {   // hard cap: fail, never hang
-        a.doWork();
-        active = aeron_is_driver_active(d.path.string().c_str(), /*timeout_ms=*/1000, +[](const char*) {});
-    }
-    ASSERT_TRUE(active) << "the live driver never stamped a fresh heartbeat";
+    a.doWork();
     EXPECT_THROW(EmbeddedDriver b(cfgAt(d.path), DriverMode::Invoker), std::runtime_error);
+}
+
+// #654: the dir is owned through an exclusive lock, not judged from Aeron's 1 s heartbeat.  `a` is never pumped, so
+// its heartbeat may be arbitrarily stale (slow start under a sanitizer); it is still live and still refused.
+TEST(EmbeddedDriverRegression, ALiveDriverDirIsRefusedWhateverItsHeartbeatAgeRegression) {
+    TmpDir d;
+    EmbeddedDriver a(cfgAt(d.path), DriverMode::Invoker);
+    EXPECT_THROW(EmbeddedDriver b(cfgAt(d.path), DriverMode::Invoker), std::runtime_error);
+}
+
+// A holder killed without a clean shutdown (SIGKILL, docker kill) leaves its dir behind with a fresh heartbeat;
+// the kernel drops its lock, so the restart succeeds at once.  The pipe orders the kill after the child's start.
+TEST(EmbeddedDriverRegression, ADirIsReusableRightAfterItsHolderIsKilledRegression) {
+    TmpDir d;
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        ::close(fds[0]);
+        try {
+            EmbeddedDriver a(cfgAt(d.path), DriverMode::Invoker);
+            a.doWork();
+            const char byte = 1;
+            if (::write(fds[1], &byte, 1) != 1) ::_exit(2);
+            for (;;) ::pause();
+        } catch (...) {
+            ::_exit(3);
+        }
+    }
+    ::close(fds[1]);
+    char byte = 0;
+    ASSERT_EQ(::read(fds[0], &byte, 1), 1) << "the child never got its driver up";
+    ::close(fds[0]);
+    ASSERT_EQ(::kill(child, SIGKILL), 0);
+    int status = 0;
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+    EXPECT_NO_THROW(EmbeddedDriver b(cfgAt(d.path), DriverMode::Invoker));
+}
+
+TEST(EmbeddedDriverRegression, ADirIsReusableAfterItsHolderIsDestroyedRegression) {
+    TmpDir d;
+    { EmbeddedDriver a(cfgAt(d.path), DriverMode::Invoker); }
+    EXPECT_NO_THROW(EmbeddedDriver b(cfgAt(d.path), DriverMode::Invoker));
 }
 
 TEST(EmbeddedDriverRegression, AeronSpaceCheck) {

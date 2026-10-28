@@ -32,6 +32,7 @@ extern "C" {
 
 #include <rune/client/detail/FlatIndexMap.h>
 #include <rune/client/detail/OneToOneRingBuffer.h>
+#include <rune/client/transport/DriverDirLock.h>
 #include <rune/client/transport/FrameCrc.h>
 #include <rune/client/transport/Resolution.h>
 #include <rune/client/transport/TransportConfig.h>
@@ -42,6 +43,7 @@ extern "C" {
 #include <exception>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -400,6 +402,7 @@ private:
     TransportConfig cfg_;
 
     // ---- Embedded driver (C API) --------------------------------------------
+    std::optional<DriverDirLock> dirLock_;   // held from startEmbeddedDriver to the end of stopEmbeddedDriver
     aeron_driver_context_t* driverCtx_     = nullptr;
     aeron_driver_t*         driver_        = nullptr;
     rune_gso_bindings_t*    gso_           = nullptr;   // owned; outlives driverCtx_ (Aeron points at it)

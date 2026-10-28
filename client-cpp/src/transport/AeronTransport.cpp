@@ -595,26 +595,26 @@ bool AeronTransport::retarget(const std::string& newIngressChannel) noexcept {
 void AeronTransport::startEmbeddedDriver() {
     const std::string aeronDir = (fs::path{cfg_.dataDir} / "aeron").string();
 
+    // The dir is owned through an exclusive flock on a lock file next to it (DriverDirLock.h), not judged from
+    // Aeron's 1 s heartbeat: a live holder is refused whatever its heartbeat age (dir_delete_on_start cannot
+    // wipe a live driver's dir, so an unguarded start degrades into an opaque init failure or produce timeout),
+    // and a holder killed without a clean shutdown releases the lock with its process.
+    {
+        std::string lockErr;
+        dirLock_ = DriverDirLock::tryAcquire(aeronDir, lockErr);
+        if (!dirLock_) {
+            throw std::runtime_error(
+                "AeronTransport: aeron dir '" + aeronDir + "' is already in use by a live media "
+                "driver (a prior client instance may still be running) or its lock cannot be taken: " +
+                lockErr + ". Use a distinct dataDir, or ensure the previous instance exited.");
+        }
+    }
+
     if (aeron_driver_context_init(&driverCtx_) < 0) {
+        dirLock_.reset();
         throw std::runtime_error(
             std::string("AeronTransport: aeron_driver_context_init failed: ") +
             aeron_errmsg());
-    }
-
-    // Silent-failure guard: if an ACTIVE media driver already holds this aeron
-    // dir, dir_delete_on_start cannot wipe it and the start degrades into a
-    // cryptic init failure or an opaque produce timeout (the stale-dir hang we
-    // hit under SIGKILL'd prior clients).  Detect it and fail LOUDLY with a
-    // clear, actionable message instead.
-    if (aeron_is_driver_active(aeronDir.c_str(), /*timeout_ms=*/1000,
-                               +[](const char*){})) {
-        aeron_driver_context_close(driverCtx_);
-        driverCtx_ = nullptr;
-        throw std::runtime_error(
-            "AeronTransport: aeron dir '" + aeronDir + "' is already in use by an "
-            "ACTIVE media driver (a prior client instance may still be running, or "
-            "was killed without clean shutdown so its driver is still holding the "
-            "dir). Use a distinct dataDir, or ensure the previous instance exited.");
     }
 
     aeron_driver_context_set_dir(driverCtx_, aeronDir.c_str());
@@ -799,6 +799,7 @@ void AeronTransport::stopEmbeddedDriver() noexcept {
         driverCtx_ = nullptr;
     }
     releaseGso_();
+    dirLock_.reset();   // last: the dir is only free once the driver and its context are closed
 }
 
 void AeronTransport::releaseGso_() noexcept {

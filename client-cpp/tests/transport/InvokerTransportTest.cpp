@@ -16,6 +16,8 @@
 #include <string>
 #include <thread>
 #include <arpa/inet.h>
+#include <csignal>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -729,4 +731,59 @@ TEST(InvokerTransportEpollPoll, MultiTransportReceiverDeliversThroughEpollFirst)
 #endif
         t.stop();
     }
+}
+
+// #654: a dir is owned through an exclusive lock, not judged from Aeron's 1 s heartbeat.
+// `a` is never pumped after start(), so its heartbeat may be arbitrarily stale; it is still live.
+TEST(InvokerTransportDirLockRegression, ALiveDriverDirIsRefusedWhateverItsHeartbeatAgeRegression) {
+    Config cfg = invokerConfig("aeron:ipc", "aeron:ipc", 3200);
+    Transport a{cfg};
+    a.start();
+    Transport b{cfg};
+    EXPECT_THROW(b.start(), std::runtime_error);
+    b.stop();
+    a.stop();
+}
+
+TEST(InvokerTransportDirLockRegression, ADirIsReusableRightAfterItsHolderIsKilledRegression) {
+    const Config cfg = invokerConfig("aeron:ipc", "aeron:ipc", 3201);
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        ::close(fds[0]);
+        try {
+            Transport t{cfg};
+            t.start();
+            const char byte = 1;
+            if (::write(fds[1], &byte, 1) != 1) ::_exit(2);
+            for (;;) ::pause();
+        } catch (...) {
+            ::_exit(3);
+        }
+    }
+    ::close(fds[1]);
+    char byte = 0;
+    ASSERT_EQ(::read(fds[0], &byte, 1), 1) << "the child never got its driver up";
+    ::close(fds[0]);
+    ASSERT_EQ(::kill(child, SIGKILL), 0);
+    int status = 0;
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+    // The killed holder's dir (cnc.dat, fresh heartbeat) is still on disk; the kernel dropped its lock.
+    Transport b{cfg};
+    EXPECT_NO_THROW(b.start());
+    b.stop();
+}
+
+TEST(InvokerTransportDirLockRegression, ADirIsReusableAfterItsHolderIsStoppedRegression) {
+    const Config cfg = invokerConfig("aeron:ipc", "aeron:ipc", 3202);
+    {
+        Transport a{cfg};
+        a.start();
+        a.stop();
+    }
+    Transport b{cfg};
+    EXPECT_NO_THROW(b.start());
+    b.stop();
 }
