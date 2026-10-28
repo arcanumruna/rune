@@ -2487,12 +2487,18 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         std::shared_ptr<aeron::ExclusivePublication> pub;
         try {
             if (aeron_) pub = aeron_->findExclusivePublication(pending.registrationId);   // test gateway: stashed pub
-        } catch (...) {
+        } catch (const std::exception& e) {
             // ERRORED_MEDIA_DRIVER: conductor signalled an error (bad channel, etc.).
             // The conductor erased its own entry when throwing — no registration leak.
+            spdlog::warn("ClientGateway: findExclusivePublication threw for session={}: {}; dropped",
+                         pending.sessionId, e.what());
+            closeDroppedPendingConnect_(pending);   // fix round 1 (I2): every drop site
+            it = pendingConnects_.erase(it);
+            continue;
+        } catch (...) {
             spdlog::warn("ClientGateway: findExclusivePublication threw for session={}; dropped",
                          pending.sessionId);
-            closeDroppedPendingConnect_(pending);   // fix round 1 (I2): every drop site
+            closeDroppedPendingConnect_(pending);
             it = pendingConnects_.erase(it);
             continue;
         }
