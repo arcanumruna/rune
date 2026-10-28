@@ -578,6 +578,10 @@ struct NodeConfig {
     int32_t     anonymousMaxConnections     = 16;
     int32_t     anonymousRequestOpsPerSec   = 1000;
     static constexpr int32_t kMaxAnonymousCap = 1'000'000;
+    /// Namespaces Phase 2 Task 14 (D28): RUNE_NS_LIMIT_TICK_US - the period of the namespace limit aggregator (and of the
+    /// workers' usage reports to it).  Default 10000, range [1000, 1000000].
+    int32_t     nsLimitTickUs = 10'000;
+    static constexpr int32_t kMinNsLimitTickUs = 1'000, kMaxNsLimitTickUs = 1'000'000;
     int32_t     peerAuthStreamId = 40;
     // Issues #15 / #111 (decision M7): a broker serves logins, `__security` reads and security DDL only while its
     // `__security` state is provably current - caught up with the current leader since boot, a leader answer (a

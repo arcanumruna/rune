@@ -12,6 +12,8 @@
 #include <unistd.h>
 
 #include <gtest/gtest.h>
+
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <string>
@@ -3163,6 +3165,27 @@ TEST(NodeConfigRegression, MaxNamespacesReadWithoutGroupSessionTimeoutRegression
     r = parseNodeConfig(fakeEnv(env));
     EXPECT_FALSE(r.config.has_value());
     EXPECT_NE(r.error.find("RUNE_MAX_NAMESPACES"), std::string::npos) << r.error;
+}
+
+// Namespaces Phase 2 Task 14 (D28): RUNE_NS_LIMIT_TICK_US - default 10000, carried when set, range [1000, 1000000].
+TEST(NodeConfigRegression, NsLimitTickRegression) {
+    auto env = base1node();
+    env["RUNE_AUTH"] = "disabled";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->nsLimitTickUs, 10'000);
+    for (const char* ok : {"1000", "1000000", "25000"}) {
+        env["RUNE_NS_LIMIT_TICK_US"] = ok;
+        r = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(r.config.has_value()) << ok << ": " << r.error;
+        EXPECT_EQ(r.config->nsLimitTickUs, std::atoi(ok));
+    }
+    for (const char* bad : {"999", "1000001", "0", "-5", "x", "1e3"}) {
+        env["RUNE_NS_LIMIT_TICK_US"] = bad;
+        r = parseNodeConfig(fakeEnv(env));
+        EXPECT_FALSE(r.config.has_value()) << bad;
+        EXPECT_NE(r.error.find("RUNE_NS_LIMIT_TICK_US"), std::string::npos) << r.error;
+    }
 }
 
 // Namespaces Phase 2 Task 10 (#236, D24): the anonymous caps - defaults 16 / 1000, carried when set, bounds-checked.

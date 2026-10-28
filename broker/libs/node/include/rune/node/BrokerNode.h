@@ -2792,6 +2792,7 @@ private:
     // owner tag is the nsId (a reader tells a reused slot from the old one).
     NsSlotTable                                           nsSlots_;
     NsSlotFanout                                          nsSlotFanout_;
+    NsLimitAggregator                                     nsAggregator_;       // Task 14 (D28): control thread only
     std::vector<metrics::SlotWriter>                      nsMetricSlots_;       // by nsSlot; unbound (slot() < 0) = none
     uint64_t                                              nsSlotAssignFailures_ = 0;   // a bug if ever non-zero
     std::int64_t                                          lastNsMismatchPublished_ = 0;

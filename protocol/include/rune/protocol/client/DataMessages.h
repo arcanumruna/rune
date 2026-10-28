@@ -824,9 +824,10 @@ struct ViewRowResponse {
     // no row bytes are carried); 45 = NotAuthorized (client version 9: the session may not READ the view -
     // the same value as ErrorCode::NotAuthorized, non-retriable); 54 = ViewPaused (client version 14: the view is
     // paused over its namespace's memory limit; the row bytes carry the paused fold offset as one little-endian i64;
-    // a client below 14 is answered kInvalidRequest by the gateway).
+    // a client below 14 is answered kInvalidRequest by the gateway); 53 = Throttled (the namespace is over its
+    // query / request rate: the row bytes carry the retry-after in ns as one little-endian i64; same gating).
     enum Status : uint16_t { kOk = 0, kAbsentKey = 1, kNotReady = 2, kSchemaMismatch = 3, kUnknownView = 4,
-                             kInvalidRequest = 5, kBusy = 6, kRowTooLarge = 7, kNotAuthorized = 45, kViewPaused = 54 };
+                             kInvalidRequest = 5, kBusy = 6, kRowTooLarge = 7, kNotAuthorized = 45, kThrottled = 53, kViewPaused = 54 };
 
     /// Total encoded size accounting for the var field.
     std::size_t encodedSize() const noexcept {

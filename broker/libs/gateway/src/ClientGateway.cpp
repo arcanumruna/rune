@@ -1956,6 +1956,16 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
         }
         return;
     }
+    if (kind == K::NsUsage) [[unlikely]] {   // namespaces Phase 2 Task 14 (D28): sessionId = (slot << 8) | metric
+        if (nsAggregator_ != nullptr && ret.partition >= 0 && ret.sessionId >= 0) {
+            const auto metric = static_cast<std::size_t>(ret.sessionId & 0xFF);
+            if (metric < rune::node::kNsMetrics)
+                (void)nsAggregator_->report(static_cast<uint32_t>(ret.partition), static_cast<uint16_t>(ret.sessionId >> 8),
+                                            static_cast<uint32_t>(ret.correlationId), static_cast<rune::node::NsMetric>(metric),
+                                            static_cast<uint64_t>(ret.baseOffset));
+        }
+        return;
+    }
     if (kind == K::EgressReleased) {                                  // retire-on-ack: the worker let go
         onEgressReleased_(ret.partition, static_cast<uint64_t>(ret.baseOffset));
         return;
@@ -7208,7 +7218,9 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // Namespaces Phase 2 Task 12 (D26): a view paused over its namespace's memory limit.  Client >= 14: status
             // ViewPaused (54) with the paused fold offset (the worker's lastOffset) as 8 LE bytes; older: InvalidRequest.
             uint8_t pausedOffsetLe[8];
-            if (ret.errorCode == static_cast<int16_t>(pc::ViewRowResponse::kViewPaused)) [[unlikely]] {
+            // Task 14 (D28): Throttled (53) is the same shape - the retry-after ns rides lastOffset.
+            if (ret.errorCode == static_cast<int16_t>(pc::ViewRowResponse::kViewPaused) ||
+                ret.errorCode == static_cast<int16_t>(pc::ViewRowResponse::kThrottled)) [[unlikely]] {
                 if (session->clientVersion >= pc::kClientVersionNamespaces) {
                     for (int b = 0; b < 8; ++b)
                         pausedOffsetLe[b] = static_cast<uint8_t>(static_cast<uint64_t>(ret.lastOffset) >> (8 * b));
@@ -7280,6 +7292,10 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 resp.partition      = ret.partition;
                 resp.baseOffset     = 0;
                 resp.logStartOffset = ec == pc::ErrorCode::UnknownProducerId ? ret.baseOffset : -1;
+                // Task 14 (D28): Throttled carries the retry-after in ns (the worker's lastOffset) in logStartOffset; a
+                // client below v14 is answered InvalidRequest by encodeFor and gets no retry-after.
+                if (ec == pc::ErrorCode::Throttled && session->clientVersion >= pc::kClientVersionNamespaces)
+                    resp.logStartOffset = ret.lastOffset;
                 static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
                               "scratch too small for ProduceResponse");
                 // D6 review M4: the pre-D6 38 B frame below clientVersion 2.

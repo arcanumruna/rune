@@ -10,30 +10,73 @@
 //   | max-disk-bytes   | the per-slot sum          | after appends / scan       | == the logs' bytesOnDisk()                       | OverDiskRegression.ScanEqualsLogBytesRegression
 #include "HotPathBRig.h"
 
+#include <rune/node/NsLimitAggregator.h>
 #include <rune/protocol/NamespaceLimits.h>
 
 namespace {
 
+// Task 14 (D25, D28): the over-disk byte is no longer decided on the worker - the control thread's NsLimitAggregator sums the
+// workers' per-slot bytes and broadcasts Throttle{Disk}.  This rig closes the same loop deterministically with the REAL
+// aggregator: the worker's usage report (a SessionSignal on its return ring) -> report() -> one tick -> the Throttle applied
+// to the worker exactly as the ring would.  settle() runs after every pass whose answer is read (see answerOf).
+struct AggLoop {
+    rune::node::NsLimitAggregator agg;
+    int64_t now = 1;
+    bool configured = false;
+    static constexpr int64_t kTick = 10'000'000;
+    void ensure() {
+        if (configured) return;
+        agg.configure(8, 1, kTick);
+        (void)agg.doWork(now);   // baseline
+        configured = true;
+    }
+};
+AggLoop g_loop;
+
+
 constexpr uint32_t kNs   = 1;
 constexpr uint16_t kSlot = 1;
 constexpr uint64_t kLimit = 8192;
+
+void assignLimits(Rig& rig, const rune::protocol::NamespaceLimits& l) {
+    g_loop = AggLoop{};
+    g_loop.ensure();
+    g_loop.agg.onSlotAssign(kSlot, kNs, l);
+    rig.worker().applyNsSlotAssignDirect(kSlot, kNs, l);
+}
+void relimit(Rig& rig, const rune::protocol::NamespaceLimits& l) {   // SetLimits: same owner, new limits
+    g_loop.agg.onSlotAssign(kSlot, kNs, l);
+    rig.worker().applyNsSlotAssignDirect(kSlot, kNs, l);
+}
 
 /// Assign the namespace to the worker's slot table with `limit`, tag the log, and let the worker take a first scan.
 void tagNamespace(Rig& rig, uint64_t limit) {
     rig.log->setNsTag(kNs, kSlot);
     rune::protocol::NamespaceLimits l;
     l.maxDiskBytes = limit;
-    rig.worker().applyNsSlotAssignDirect(kSlot, kNs, l);
+    assignLimits(rig, l);
 }
 
-/// The ErrorCode of the single produce answer the pass produced (-1: none).
+/// The ErrorCode of the single produce answer the pass produced (-1: none).  Also closes the aggregator loop (above).
 int answerOf(Rig& rig) {
     int code = -1;
+    (void)rig.worker().reportNsUsageForTest();
     rig.pool.drainAllReturns([&](WorkerReturn r) {
         if (r.type == WorkerReturn::Type::ProduceResult) code = r.errorCode;
+        else if (r.type == WorkerReturn::Type::SessionSignal &&
+                 r.lastOffset == static_cast<int64_t>(rune::node::SessionSignalKind::NsUsage))
+            (void)g_loop.agg.report(static_cast<uint32_t>(r.partition), static_cast<uint16_t>(r.sessionId >> 8),
+                                    static_cast<uint32_t>(r.correlationId), static_cast<rune::node::NsMetric>(r.sessionId & 0xFF),
+                                    static_cast<uint64_t>(r.baseOffset));
     });
+    g_loop.now += AggLoop::kTick;
+    if (g_loop.agg.doWork(g_loop.now) > 0)
+        g_loop.agg.drain([&](const rune::node::Throttle& t) { rig.worker().applyNsThrottleDirect(t.slot, t.nsId, t.kind, t.untilNs); },
+                         [&](const rune::node::ViewMemOver&) {});
     return code;
 }
+/// Settle without a produce answer (after a scan or a limit change).
+void settle(Rig& rig) { (void)answerOf(rig); }
 
 void applyOne(Rig& rig, int64_t leaderEpoch) {
     const int64_t leo = rig.log->logEndOffset();
@@ -91,26 +134,29 @@ TEST(OverDiskRegression, RaisedLimitResumesProduceRegression) {
     ASSERT_TRUE(rig.worker().nsOverDiskForTest(kSlot));
     rig.pass(&frame);
     ASSERT_EQ(answerOf(rig), static_cast<int>(pc::ErrorCode::NamespaceLimitExceeded));
-    // The limit is raised (a SetLimits reaches the worker as NsSlotAssign): the next scan clears the byte.
+    // The limit is raised (a SetLimits reaches the aggregator and the worker): the next tick clears the byte.
     rune::protocol::NamespaceLimits l;
     l.maxDiskBytes = 1 << 20;
-    rig.worker().applyNsSlotAssignDirect(kSlot, kNs, l);
+    relimit(rig, l);
     rig.worker().scanNamespaceDiskForTest(rig.now);
+    settle(rig);
     EXPECT_FALSE(rig.worker().nsOverDiskForTest(kSlot));
     rig.pass(&frame);
     EXPECT_EQ(answerOf(rig), 0) << "served again";
     // Lowering below usage refuses again but keeps every byte.
     const int64_t end = rig.log->logEndOffset();
     l.maxDiskBytes = kLimit;
-    rig.worker().applyNsSlotAssignDirect(kSlot, kNs, l);
+    relimit(rig, l);
     rig.worker().scanNamespaceDiskForTest(rig.now);
+    settle(rig);
     rig.pass(&frame);
     EXPECT_EQ(answerOf(rig), static_cast<int>(pc::ErrorCode::NamespaceLimitExceeded));
     EXPECT_EQ(rig.log->logEndOffset(), end) << "lowering deleted nothing";
     // Limit 0 = unlimited.
     l.maxDiskBytes = 0;
-    rig.worker().applyNsSlotAssignDirect(kSlot, kNs, l);
+    relimit(rig, l);
     rig.worker().scanNamespaceDiskForTest(rig.now);
+    settle(rig);
     rig.pass(&frame);
     EXPECT_EQ(answerOf(rig), 0);
 }
@@ -125,6 +171,7 @@ TEST(OverDiskRegression, FollowerApplyNeverRefusedRegression) {
     rig.pass();
     ASSERT_EQ(rig.rep->role(), Role::Follower);
     rig.worker().scanNamespaceDiskForTest(rig.now);
+    settle(rig);
     ASSERT_TRUE(rig.worker().nsOverDiskForTest(kSlot)) << "still over on the follower";
     const uint64_t refusals = rig.worker().overDiskRefusalsForTest();
     for (int i = 0; i < 12; ++i) {

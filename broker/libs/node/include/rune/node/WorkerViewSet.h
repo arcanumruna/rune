@@ -518,12 +518,17 @@ public:
             if (!nsSlots_.place(slot, nsId)) { ++nsSlotMismatches_; return; }
             nsViewMem_[slot] = 0; nsViewMemOver_[slot] = 0;   // a reused slot starts from zero usage
         }
-        nsSlots_.setLimits(slot, l);
-        recomputeViewMemOver_(slot);   // a raised limit resumes the slot's views on their next pass
+        nsSlots_.setLimits(slot, l);   // the over decision is the aggregator's (ViewMemOver): a raised limit clears it there
     }
     void onNsSlotRelease(uint16_t slot, uint32_t nsId) {
         if (!nsSlots_.release(slot, nsId)) { ++nsSlotMismatches_; return; }
         nsViewMem_[slot] = 0; nsViewMemOver_[slot] = 0;
+    }
+    /// Task 14 (D26): the aggregator's decision (node total over maxViewMemoryBytes).  Tag-checked: a message for a
+    /// namespace that no longer owns the slot is counted and ignored.  The fold gate reads the byte on the next pass.
+    void onViewMemOver(uint16_t slot, uint32_t nsId, bool on) noexcept {
+        if (!nsTagMatches(slot, nsId)) return;
+        nsViewMemOver_[slot] = on ? 1 : 0;
     }
     /// Task 12: the namespace's view memory on this worker (sum of its instances' chunk bytes) and whether it is over.
     [[nodiscard]] uint64_t nsViewMemBytes(uint16_t slot) const noexcept { return slot < nsViewMem_.size() ? nsViewMem_[slot] : 0; }
@@ -547,7 +552,7 @@ private:
     NsSlotTable nsSlots_;
     uint64_t    nsSlotMismatches_ = 0;
     // Task 12 (D26): per-slot view memory (chunk bytes) and the over-limit byte the fold gate reads.  Worker-owned arrays
-    // sized to the slot table; Task 14 replaces the local over decision with the aggregator's ViewMemOver message.
+    // sized to the slot table; the over byte is set only by the aggregator's ViewMemOver message (Task 14).
     std::vector<uint64_t> nsViewMem_     = std::vector<uint64_t>(NsSlotTable::kDefaultCapacity, 0);
     std::vector<uint8_t>  nsViewMemOver_ = std::vector<uint8_t>(NsSlotTable::kDefaultCapacity, 0);
     uint64_t viewPauses_ = 0, viewResumes_ = 0;
@@ -560,11 +565,6 @@ private:
         }
         return m;
     }
-    void recomputeViewMemOver_(uint16_t slot) noexcept {
-        if (slot >= nsViewMemOver_.size()) return;
-        const uint64_t limit = nsSlots_.limits(slot).maxViewMemoryBytes;
-        nsViewMemOver_[slot] = (limit != 0 && nsViewMem_[slot] > limit) ? 1 : 0;
-    }
     /// Charge the instance's current memory to its slot (one compare when nothing grew).
     void chargeMem_(ViewInstance& inst) noexcept {
         if (inst.nsSlot == kNoNsSlot) return;
@@ -573,13 +573,11 @@ private:
         if (!nsSlots_.matches(inst.nsSlot, inst.nsId)) { ++nsSlotMismatches_; return; }   // stale tag: never charge another namespace
         nsViewMem_[inst.nsSlot] = nsViewMem_[inst.nsSlot] + m - inst.memCharged;
         inst.memCharged = m;
-        recomputeViewMemOver_(inst.nsSlot);
     }
     void releaseMem_(ViewInstance& inst) noexcept {
         if (inst.nsSlot == kNoNsSlot || inst.memCharged == 0) return;
         if (nsSlots_.matches(inst.nsSlot, inst.nsId)) {
             nsViewMem_[inst.nsSlot] -= std::min<uint64_t>(nsViewMem_[inst.nsSlot], inst.memCharged);
-            recomputeViewMemOver_(inst.nsSlot);
         }
         inst.memCharged = 0;
     }

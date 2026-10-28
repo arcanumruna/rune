@@ -98,6 +98,7 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/node/RecordsPush.h>
 #include <rune/node/NsSlotTable.h>
+#include <rune/node/NsLimitAggregator.h>
 #include <rune/node/UnauthLogLimiter.h>
 #include <rune/node/SessionAnnouncer.h>
 #include <rune/node/PermissionShipper.h>
@@ -570,6 +571,9 @@ public:
         for (const uint64_t w : workerNsSlotMismatches_) n += w;
         return n;
     }
+    /// Namespaces Phase 2 Task 14 (D28): the node's limit aggregator (control thread, the gateway's own thread).  Worker usage
+    /// reports (SessionSignal NsUsage) are forwarded to it; the usage query (template 84) reads its totals.
+    void setNsLimitAggregator(rune::node::NsLimitAggregator* a) noexcept { nsAggregator_ = a; }
     [[nodiscard]] const rune::node::NsSlotTable& nsSlotsForTest() const noexcept { return nsSlots_; }
     /// Namespaces Phase 2 Task 10 (#236, D24): RUNE_ANONYMOUS_MAX_CONNECTIONS / RUNE_ANONYMOUS_REQUEST_OPS_PER_SEC.
     void setAnonymousCaps(int32_t maxConnections, int32_t opsPerSec) noexcept {
@@ -2522,6 +2526,7 @@ private:
     rune::catalog::NamespaceMirror namespaces_;   ///< namespaces Task 9: control thread's copy (login lookup)
     rune::node::NsSlotTable nsSlots_;             ///< namespaces Phase 2 Task 8: this gateway's own slot table
     uint64_t                nsSlotMismatches_ = 0;
+    rune::node::NsLimitAggregator* nsAggregator_ = nullptr;   ///< Task 14: not owned; same thread
     std::vector<uint64_t>   workerNsSlotMismatches_;   ///< cumulative, per worker (SessionSignal NsSlotMismatch)
     /// One array index and a compare; counts a mismatch.
     [[nodiscard]] bool nsTagMatches_(const Session& s) noexcept {

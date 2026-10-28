@@ -1643,6 +1643,16 @@ void BrokerNode::buildWorkerPool() {
                     wk.applyNsSlotAssignDirect(static_cast<uint16_t>(sl), nsSlots_.nsIdAt(static_cast<uint16_t>(sl)),
                                                nsSlots_.limits(static_cast<uint16_t>(sl)));
         }
+        // Namespaces Phase 2 Task 14 (D28): the limit aggregator (control thread) starts from the boot slot table; every worker
+        // reports its per-slot usage to it at the same period.
+        nsAggregator_.configure(nsSlots_.capacity(), static_cast<uint32_t>(workerPool_->workerCount()),
+                                static_cast<int64_t>(config_.nsLimitTickUs) * 1000);
+        for (uint32_t sl = 0; sl < nsSlots_.capacity(); ++sl)
+            if (nsSlots_.nsIdAt(static_cast<uint16_t>(sl)) != NsSlotTable::kFreeSlot)
+                nsAggregator_.onSlotAssign(static_cast<uint16_t>(sl), nsSlots_.nsIdAt(static_cast<uint16_t>(sl)),
+                                           nsSlots_.limits(static_cast<uint16_t>(sl)));
+        for (int32_t w = 0; w < workerPool_->workerCount(); ++w)
+            workerPool_->worker(w).setNsReportIntervalNs(static_cast<int64_t>(config_.nsLimitTickUs) * 1000);
         // Task 10 fix 3 (I2): ops are only routed after an inline reconcile, so
         // the SetOwnership that governs them is always ahead of them.
         workerPool_->setRegistry(replicaRegistry_.get());
@@ -2132,6 +2142,7 @@ void BrokerNode::buildGateway() {
         if (bootApplier_) gateway_->setBootNamespaces(bootApplier_->state().namespaces());
         gateway_->setAnonymousRead(config_.anonymousRead);   // spec §11: RUNE_ANONYMOUS_READ, off by default
         gateway_->setAnonymousCaps(config_.anonymousMaxConnections, config_.anonymousRequestOpsPerSec);   // #236 (Task 10)
+        gateway_->setNsLimitAggregator(&nsAggregator_);   // Task 14: worker usage reports -> the aggregator (same thread)
         // Authentication Task 10 (D4/D32): the gateway's OWN copy of the cluster keys (loaded on this startup thread,
         // validated by validateAuth) verifies the bootstrap proof.  Dev / in-process configs hold none.
         // Review C I4: the keys validated in start() ARE the keys in use - one load, handed out as copies; Enabled with
@@ -5110,6 +5121,10 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     // Control (runtime) thread = the single producer of every worker ring.
     if (workerPool_) work += schemaFanout_.pump(*workerPool_);
     if (workerPool_) work += topicDroppedFanout_.pump(*workerPool_);   // R-M1
+    if (workerPool_ && nsAggregator_.slotCapacity() != 0) {            // Namespaces Phase 2 Task 14 (D28): one tick per period
+        if (nsAggregator_.doWork(nowNs) > 0)
+            nsAggregator_.drain([&](const Throttle& t) { nsSlotFanout_.post(t); }, [&](const ViewMemOver& v) { nsSlotFanout_.post(v); });
+    }
     if (workerPool_) work += nsSlotFanout_.pump(*workerPool_);         // Namespaces Phase 2 Task 8 (D22)
     publishNsSlotMetrics_();
     // Task 19: retry any view-plan install frames a worker ring could not take.
@@ -6006,6 +6021,7 @@ void BrokerNode::onNsUpserted_(const rune::catalog::NamespaceRecord& rec) {
     nsSlots_.setLimits(*slot, rec.limits);
     registerNsMetric_(*slot, rec);
     if (gateway_) gateway_->onNsSlotAssign(*slot, rec.nsId, rec.limits);
+    nsAggregator_.onSlotAssign(*slot, rec.nsId, rec.limits);   // Task 14: new owner -> zero usage; refresh -> next tick applies
     if (workerPool_) nsSlotFanout_.post(NsSlotAssign{*slot, rec.nsId, rec.limits});
     postCleanerNsLimit_(*slot, rec.nsId, rec.limits.maxRetentionMs, rec.limits.maxRetentionBytes);   // Task 13 (D27)
 }
@@ -6027,6 +6043,7 @@ void BrokerNode::onNsErasedSlot_(uint32_t nsId) {
     if (!nsSlots_.release(slot, nsId)) return;
     freeNsMetric_(slot);
     if (gateway_) gateway_->onNsSlotRelease(slot, nsId);
+    nsAggregator_.onSlotRelease(slot, nsId);
     if (workerPool_) nsSlotFanout_.post(NsSlotRelease{slot, nsId});
     postCleanerNsLimit_(slot, CleanerViewChannel::kNsLimitFree, 0, 0);
 }

@@ -21,6 +21,7 @@ add_library(rune_node
     src/SecurityApplier.cpp
     src/SecurityAdmin.cpp
     src/NamespaceReaper.cpp
+    src/NsLimitAggregator.cpp
     src/PeerLinkAgent.cpp
     src/CatalogReadServer.cpp
     src/CatalogEffectFrames.cpp
@@ -1097,6 +1098,11 @@ if(BUILD_TESTING)
     target_include_directories(rune_ns_disk_worker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration)
     target_link_libraries(rune_ns_disk_worker_tests PRIVATE rune_node rune_replication rune_storage rune_transaction GTest::gtest_main)
     gtest_discover_tests(rune_ns_disk_worker_tests)
+    # Namespaces Phase 2 Task 14 (D22, D28): the Throttle message at the owning worker (HotPathBRig, no Aeron).
+    add_executable(rune_ns_throttle_worker_tests tests/integration/NamespaceThrottleWorkerRegressionTest.cpp)
+    target_include_directories(rune_ns_throttle_worker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration)
+    target_link_libraries(rune_ns_throttle_worker_tests PRIVATE rune_node rune_replication rune_storage rune_transaction GTest::gtest_main)
+    gtest_discover_tests(rune_ns_throttle_worker_tests)
     add_executable(rune_hotpath_b_alloc_regression_tests
         tests/integration/HotPathBAllocRegressionTest.cpp)
     target_link_libraries(rune_hotpath_b_alloc_regression_tests PRIVATE
@@ -1838,6 +1844,13 @@ if(BUILD_TESTING)
                               rune_client_api aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_ns_disk_limit_tests PROPERTIES TIMEOUT 900)
 
+        # Namespaces Phase 2 Task 14 (D28): the rate throttle through the REAL client / a raw v14 session against a real broker.
+        add_executable(rune_ns_throttle_tests tests/client/NamespaceThrottleRegressionTest.cpp)
+        target_include_directories(rune_ns_throttle_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_ns_throttle_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_ns_throttle_tests PROPERTIES TIMEOUT 900)
+
         # Namespaces Phase 2 Task 12 (D26): the namespace view-memory limit pauses views at an offset and resumes them.
         add_executable(rune_ns_view_memory_tests tests/node/NsViewMemoryRegressionTest.cpp)
         target_include_directories(rune_ns_view_memory_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -1851,6 +1864,12 @@ if(BUILD_TESTING)
         target_link_libraries(rune_retention_clamp_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
                               aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_retention_clamp_tests PROPERTIES TIMEOUT 300)
+
+        # Namespaces Phase 2 Task 14 (D25, D26, D28): the limit aggregator (pure, injected clock).
+        add_executable(rune_ns_limit_aggregator_tests tests/node/NsLimitAggregatorRegressionTest.cpp)
+        target_include_directories(rune_ns_limit_aggregator_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_ns_limit_aggregator_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_ns_limit_aggregator_tests PROPERTIES TIMEOUT 120)
 
         # Namespaces Phase 2 Task 7 (D17, D18; rule 16): the namespace reaper - the state machine over a real CatalogState,
         # and three real AdminWorkers (leader change after each durable step).

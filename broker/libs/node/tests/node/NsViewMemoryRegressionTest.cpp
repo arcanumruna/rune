@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -154,14 +155,27 @@ struct Rig {
             assign(kSlotB, kNsB, limitB * chunkB);
         }
     }
+    // The aggregator's loopback (Task 14): in the broker the control thread sums every worker's bytes and broadcasts
+    // ViewMemOver; with one worker the node total is this view set's own, so settle() applies the same compare.
+    struct SlotLimit { uint32_t ns = 0; uint64_t limit = 0; };
+    std::map<uint16_t, SlotLimit> limits_;
+    void settle() {
+        for (const auto& [slot, sl] : limits_)
+            vs.onViewMemOver(slot, sl.ns, sl.limit != 0 && vs.nsViewMemBytes(slot) > sl.limit);
+    }
     void assign(uint16_t slot, uint32_t ns, uint64_t limitBytes) {
         rune::protocol::NamespaceLimits l;
         l.maxViewMemoryBytes = limitBytes;
         vs.onNsSlotAssign(slot, ns, l);
+        limits_[slot] = SlotLimit{ns, limitBytes};
+        settle();
     }
+    void release(uint16_t slot, uint32_t ns) { vs.onNsSlotRelease(slot, ns); limits_.erase(slot); }
     int drive(int32_t srcTopic, uint16_t slot, uint32_t ns, const SimLog& log, uint64_t gen = 0) {
         auto rd = [&](int64_t f, int64_t t) { return log.read(f, t); };
-        return vs.driveFolds(srcTopic, 0, rd, log.end, rv::kNoAbortedTxns, 0, nullptr, gen, true, NsTag{slot, ns});
+        const int n = vs.driveFolds(srcTopic, 0, rd, log.end, rv::kNoAbortedTxns, 0, nullptr, gen, true, NsTag{slot, ns});
+        settle();
+        return n;
     }
     int driveA(const SimLog& log, uint64_t gen = 0) { return drive(kSrcA, kSlotA, kNsA, log, gen); }
     const uint8_t* row(int32_t view, int64_t key, WorkerViewSet::RowStatus& rs) {
@@ -345,6 +359,7 @@ TEST(NsViewMemoryRegression, DroppedViewReleasesMemoryRegression) {
     rig.driveA(log);
     ASSERT_TRUE(rig.vs.nsViewMemOver(kSlotA));
     EXPECT_TRUE(rig.vs.uninstallView(kViewA));
+    rig.settle();
     EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), 0u);
     EXPECT_FALSE(rig.vs.nsViewMemOver(kSlotA));
 }
@@ -356,7 +371,7 @@ TEST(NsViewMemoryRegression, ReusedSlotStartsFromZeroRegression) {
     log.append(1, static_cast<int>(rig.rowsPerChunk) + 1);
     rig.driveA(log);
     ASSERT_GT(rig.vs.nsViewMemBytes(kSlotA), 0u);
-    rig.vs.onNsSlotRelease(kSlotA, kNsA);
+    rig.release(kSlotA, kNsA);
     EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), 0u);
     rig.assign(kSlotA, /*new nsId*/ 99, 1 * rig.chunkB);
     EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), 0u);

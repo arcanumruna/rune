@@ -1043,6 +1043,13 @@ ConfigResult parseNodeConfig(
             *field = static_cast<int32_t>(v);
         }
     }
+    if (const char* raw = getenv_fn("RUNE_NS_LIMIT_TICK_US"); raw && *raw) {   // namespaces Phase 2 Task 14 (D28)
+        int64_t v = 0;
+        if (!parseInt64Positive(raw, v) || v < NodeConfig::kMinNsLimitTickUs || v > NodeConfig::kMaxNsLimitTickUs)
+            return {{}, std::string("RUNE_NS_LIMIT_TICK_US must be an integer in [") + std::to_string(NodeConfig::kMinNsLimitTickUs) +
+                            ", " + std::to_string(NodeConfig::kMaxNsLimitTickUs) + "], got: " + raw};
+        cfg.nsLimitTickUs = static_cast<int32_t>(v);
+    }
     if (const char* raw = getenv_fn("RUNE_AUTH_TIMEOUT_MS"); raw && *raw) {
         int64_t v = 0;
         if (!parseInt64Positive(raw, v))

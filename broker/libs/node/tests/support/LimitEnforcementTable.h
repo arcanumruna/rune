@@ -26,6 +26,7 @@ enum class LimitArea : uint8_t {
     Disk,         // worker, per node (Task 11)
     ViewMemory,   // worker's view set (Task 12)
     Retention,    // AdminWorker refusal + the cleaner's clamp (Task 13)
+    Rate,         // the limit aggregator's throttle deadline (Task 14, D28); codeAbove 53 = Throttled
 };
 
 enum class LimitCell : uint8_t { Below = 0, At = 1, Above = 2 };
@@ -72,6 +73,12 @@ inline constexpr std::array kLimitRows = {
     //      clamps the cleaner's effective retention to min(topic, maximum) on its next pass) ---------------------------------
     LimitRow{"max-retention-ms",          9, LimitArea::Retention, 3600000, 52, "DefineTopic / AlterTopicConfig(retention.ms)", "retention.ms == the maximum is accepted"},
     LimitRow{"max-retention-bytes",      10, LimitArea::Retention, 1048576, 52, "DefineTopic / AlterTopicConfig(retention.bytes)", "retention.bytes == the maximum is accepted"},
+    // ---- Task 14: rates (the aggregator compares the excess over limit x elapsed; Above = Throttled 53 with a retry-after) ----
+    LimitRow{"produce-bytes-per-sec",    13, LimitArea::Rate,  10000, 53, "leader produce (bytes)",   "usage at limit x elapsed is not throttled"},
+    LimitRow{"produce-records-per-sec",  14, LimitArea::Rate,   1000, 53, "leader produce (records)", "usage at limit x elapsed is not throttled"},
+    LimitRow{"fetch-bytes-per-sec",      15, LimitArea::Rate,  10000, 53, "push read (bytes)",        "usage at limit x elapsed is not throttled"},
+    LimitRow{"request-ops-per-sec",      16, LimitArea::Rate,   1000, 53, "produce / fetch / view read (ops)", "usage at limit x elapsed is not throttled"},
+    LimitRow{"query-cycles-per-sec",     17, LimitArea::Rate, 1000000, 53, "GetViewRow (cycles)",     "usage at limit x elapsed is not throttled"},
     LimitRow{"max-view-memory-bytes",    23, LimitArea::ViewMemory,   2, 54, "GetViewRow after the fold", "the fold that brings the view to exactly the limit still serves"},
 };
 // clang-format on

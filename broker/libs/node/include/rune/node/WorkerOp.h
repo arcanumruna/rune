@@ -159,6 +159,10 @@ struct WorkerOp {
         // NsRingMessages.h for the field use.  Never ownership-gated.
         NsSlotAssign              = 27, ///< control → worker: nsId owns nsSlot (+ its limits)
         NsSlotRelease             = 28, ///< control → worker: nsSlot is free
+        // Namespaces Phase 2 Task 14 (D26, D28): control → EVERY worker (cold: on a CHANGE only).  See NsRingMessages.h for the
+        // field use.  Never ownership-gated.
+        NsThrottle                = 29, ///< control → worker: nsSlot's throttle deadline of one kind changed
+        NsViewMemOver             = 30, ///< control → worker: nsSlot's views are over (or back under) the memory limit
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the

@@ -18,10 +18,12 @@ namespace rune::node {
 
 class NsSlotFanout {
 public:
-    using Msg = std::variant<NsSlotAssign, NsSlotRelease>;
+    using Msg = std::variant<NsSlotAssign, NsSlotRelease, Throttle, ViewMemOver>;
 
     void post(const NsSlotAssign& m) { pending_.push_back(Pending{Msg{m}, 0}); }
     void post(const NsSlotRelease& m) { pending_.push_back(Pending{Msg{m}, 0}); }
+    void post(const Throttle& m) { pending_.push_back(Pending{Msg{m}, 0}); }        // Task 14
+    void post(const ViewMemOver& m) { pending_.push_back(Pending{Msg{m}, 0}); }     // Task 14
 
     /// Control thread, every duty cycle.  Returns the number of ops enqueued.
     int pump(WorkerPool& pool) {
@@ -32,8 +34,11 @@ public:
             while (p.nextWorker < n) {
                 WorkerOp op = std::visit(
                     [](const auto& m) {
-                        if constexpr (std::is_same_v<std::decay_t<decltype(m)>, NsSlotAssign>) return makeNsSlotAssignOp(m);
-                        else return makeNsSlotReleaseOp(m);
+                        using T = std::decay_t<decltype(m)>;
+                        if constexpr (std::is_same_v<T, NsSlotAssign>) return makeNsSlotAssignOp(m);
+                        else if constexpr (std::is_same_v<T, NsSlotRelease>) return makeNsSlotReleaseOp(m);
+                        else if constexpr (std::is_same_v<T, Throttle>) return makeThrottleOp(m);
+                        else return makeViewMemOverOp(m);
                     }, p.msg);
                 const EnqueueResult r = pool.worker(p.nextWorker).enqueueOp(std::move(op));
                 if (r == EnqueueResult::Full) break;   // back-pressure: retry next cycle (FIFO)

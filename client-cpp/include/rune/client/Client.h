@@ -223,6 +223,9 @@ struct ViewRowResult {
     /// The view is paused over its namespace's memory limit (client version 14); rowBytes = the paused fold offset as one
     /// little-endian i64 (8 bytes).  Retriable once the limit is raised or memory falls.
     static constexpr uint16_t kViewPaused      = 54;
+    /// The namespace is over its query / request-ops rate (client version 14); rowBytes = the retry-after in ns as one
+    /// little-endian i64 (8 bytes).
+    static constexpr uint16_t kThrottled       = 53;
     /// Client-side only: the view's source-partition leader was not reached within
     /// the retry budget; never sent by a broker.  NB: a GetViewRow's deadline is
     /// pingTimeoutMs (not ddlTimeoutMs); when that is shorter than ddlRetryBudget
