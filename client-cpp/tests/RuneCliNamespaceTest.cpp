@@ -218,6 +218,8 @@ TEST(NamespaceCliRegression, UsageFormatRegression) {
     EXPECT_NE(j.find("\"usage\":{\"max-topics\":3,"), std::string::npos) << j;
     EXPECT_EQ(j.find("max-schemas\":99"), std::string::npos) << "no usage for a field without a meaning: " << j;
     EXPECT_EQ(j.back(), '\n');
+}
+
 // ── Adversarial review of client batch C8 (#641): the --set patch over every field combination and malformed input ──
 
 namespace {

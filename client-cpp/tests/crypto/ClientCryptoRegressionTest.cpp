@@ -1717,6 +1717,8 @@ TEST(ClientCryptoRegression, SessionEndNoticeIsIgnoredWhileHandshakingRegression
         f.m.onErrorResponse(code, "end", /*corr=*/0, 1'000'000'020LL, FrameFixture::kSessionId);
         EXPECT_EQ(f.m.state(), sm::SessionState::Handshaking) << code;
     }
+}
+
 // #673: a receiver key that fails to derive is counted ONCE per episode and never retried per offer: five seals for
 // receiver 3 run the derive exactly once; receiver 2 still seals; a new episode (CryptoState reset) derives again.
 namespace {

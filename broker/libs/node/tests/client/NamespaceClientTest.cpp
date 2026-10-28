@@ -421,6 +421,8 @@ TEST(NamespaceCliRegression, UnknownNamespaceRegression) {
     // `default` cannot be suspended or deleted (the broker refuses; the namespace stays active).
     EXPECT_EQ(runCli(with({"namespace", "delete", "default", "--yes"}), &out, &err), 1);
     EXPECT_EQ(stateOf(b, pw, "default"), "active");
+}
+
 // ── Adversarial review of client batch C8 (#641): limit patches through the real client against a real broker ──────
 
 namespace {

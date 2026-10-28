@@ -688,6 +688,8 @@ TEST(CoordinatorLinkRegression, NamespaceRefusalsAreNeverRetriedRegression) {
     const auto f = FakeCoordinator::answer(ReqKind::EndTxn, s->corrId, k51);
     EXPECT_EQ(link.onAnswer(asAnswer(f, ReqKind::EndTxn, s->corrId, k51), 2), s) << "handed to the producer";
     EXPECT_EQ(s->offers, 1u);
+}
+
 // #340: the txn copies of the group fetch tags are asserted against GroupConsumerHub's constants where both headers
 // are visible, and the tag spaces are disjoint as BIT SETS and as classifiers, not merely `!=`.
 TEST(CoordinatorLinkRegression, CoordinatorCorrTagsNeverCollideWithGroupTagsRegression) {

@@ -4243,6 +4243,8 @@ TEST(GroupRoutingRegression, JoinGroupNamespaceRefusalFinishesTheConsumerRegress
         EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker) << static_cast<int>(ec);
         EXPECT_EQ(r.gw.joinGroups, 1) << static_cast<int>(ec);
     }
+}
+
 // C18 adversarial review (#651 on the duty clock, deterministic): p1's Subscribe is redirected by the seed to node 1,
 // so the route is a provisional guess and a confirming refresh is armed.  MetadataRequests are held (never answered)
 // and, with the duty clock FROZEN, ten LAGGING answers (to the connect-time request, older than the redirect) land.
