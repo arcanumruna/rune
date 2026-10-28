@@ -414,17 +414,39 @@ bool readScript(const std::string& path, std::istream& stdinStream, std::string&
         // with ferror(stdin) set and errno EAGAIN: wait for input and go on - it is not end of input.  Any other stdin
         // error fails the command rather than running a prefix.
         const bool processStdin = &stdinStream == &std::cin;
+        // PR #704 review: the script passes through stdio's stdin buffer (a pipe's later bursts are read into it): the
+        // consumed buffer is wiped on every exit, so no password literal stays there for the rest of the process.
+        struct StdioWipe {
+            bool on;
+            ~StdioWipe() {
+#ifdef __GLIBC__
+                // Everything but the unread window [read_ptr, read_end) is stale (consumed, or left by an earlier fill).
+                FILE* f = stdin;
+                if (!on || f->_IO_buf_base == nullptr) return;
+                char* lo = f->_IO_buf_base;
+                char* hi = f->_IO_buf_end;
+                char* rp = f->_IO_read_ptr != nullptr ? f->_IO_read_ptr : lo;
+                char* re = f->_IO_read_end != nullptr ? f->_IO_read_end : lo;
+                if (rp < lo || rp > hi || re < rp || re > hi) { rp = lo; re = lo; }
+                rune::client::detail::secureZero(lo, static_cast<std::size_t>(rp - lo));
+                rune::client::detail::secureZero(re, static_cast<std::size_t>(hi - re));
+#endif
+            }
+        } stdioWipe{processStdin};
         std::streambuf* sb = stdinStream.rdbuf();
         while (sb != nullptr) {
             // A stale error flag is cleared first, so ferror() below speaks for this read only.  EOF is never cleared:
-            // a tty would need a second end-of-input.
+            // a tty would need a second end-of-input.  A flag that survives (error AND end of file, left by earlier
+            // use of the process stdin) is not this read's: only a flag this read raised counts (a redirected
+            // std::cin never touches stdio at all).
             if (processStdin && std::ferror(stdin) && !std::feof(stdin)) std::clearerr(stdin);
+            const bool staleError = processStdin && std::ferror(stdin);
             errno = 0;
             const std::streamsize n = sb->sgetn(chunk, sizeof chunk);
             const int readErrno = errno;
             if (n > 0) rune::client::detail::appendWiped(text, std::string_view(chunk, static_cast<std::size_t>(n)));
             if (n == static_cast<std::streamsize>(sizeof chunk)) continue;
-            if (!processStdin || !std::ferror(stdin)) {
+            if (!processStdin || staleError || !std::ferror(stdin)) {
                 if (n > 0) continue;   // a short read of a plain stream: the next one reports the end
                 break;
             }

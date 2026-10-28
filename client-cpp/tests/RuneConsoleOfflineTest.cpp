@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -1006,6 +1007,236 @@ TEST(RuneConsoleOfflineRegression, StdinScriptOnANonBlockingPipeIsReadWholeAdver
     EXPECT_EQ(got.rfind("0\n", 0), 0u) << got;
     EXPECT_NE(got.find("first"), std::string::npos) << got;
     EXPECT_NE(got.find("second"), std::string::npos) << "the script was cut at the first EAGAIN: " << got;
+}
+
+// ---- Whole-branch review of PR #704: readScript ('-' through std::cin, 25275f44) attacked through the public CLI ----
+namespace {
+constexpr const char kStdinNeedle[] = "stdin-needle-review-704-qz";
+/// Runs `rune <args>` in a forked child on the real std::cin.  `setupChild` (child side) puts fd 0 in place; `feed`
+/// (parent side, gets the child's pid) writes the input.  The child reports "<rc>\n<out><err>" and, on glibc, whether
+/// stdio's stdin buffer still holds kStdinNeedle ("STDIO-HIT").
+template <class Setup, class Feed>
+std::string runCliInChild(std::vector<std::string> args, Setup setupChild, Feed feed) {
+    int res[2];
+    if (::pipe(res) != 0) return "pipe failed";
+    const pid_t child = ::fork();
+    if (child < 0) return "fork failed";
+    if (child == 0) {
+        ::close(res[0]);
+        setupChild();
+        std::ostringstream out, err;
+        const int rc = rune::cli::run(std::move(args), out, err);   // the process entry: std::cin, as main() does
+        std::string r = std::to_string(rc) + "\n" + out.str() + err.str();
+#ifdef __GLIBC__
+        if (stdin->_IO_buf_base != nullptr) {
+            const std::string_view buf(stdin->_IO_buf_base, static_cast<std::size_t>(stdin->_IO_buf_end - stdin->_IO_buf_base));
+            if (buf.find(kStdinNeedle + 1) != std::string_view::npos) r += "\nSTDIO-HIT\n";
+        }
+#endif
+        (void)!::write(res[1], r.data(), r.size());
+        ::_exit(0);
+    }
+    ::close(res[1]);
+    feed(child);
+    std::string got;
+    char b[4096];
+    for (ssize_t n; (n = ::read(res[0], b, sizeof b)) > 0;) got.append(b, static_cast<std::size_t>(n));
+    int status = 0;
+    ::waitpid(child, &status, 0);
+    ::close(res[0]);
+    return got;
+}
+/// Waits (capped) until thread (pid, tid) sleeps; false if it never does or is gone.
+bool awaitSleeping(pid_t pid) {
+    for (long i = 0; i < 50'000'000; ++i) {
+        const char st = threadState(pid, pid);
+        if (st == 'S') return true;
+        if (st == '\0' || st == 'Z') return false;
+        ::sched_yield();
+    }
+    return false;
+}
+int g_sigPipeWr = -1;
+void notifyOnSignal(int) { const char c = 's'; (void)!::write(g_sigPipeWr, &c, 1); }
+} // namespace
+
+// Input bounds: a '-' script of 0, 1 and chunk-boundary sizes (4095/4096/4097/8192: the read loop's n == sizeof chunk
+// edge) on a regular-file stdin is read whole - the tail statement sits in the last byte(s), so a cut loses it.
+TEST(RuneConsoleOfflineRegression, StdinScriptAtEveryChunkBoundaryIsReadWholeAdversarialRegression) {
+    const std::string tail = "topic tail_topic partitions 1;";
+    for (const std::size_t size : {std::size_t{0}, std::size_t{1}, std::size_t{4095}, std::size_t{4096}, std::size_t{4097},
+                                   std::size_t{8192}, std::size_t{8193}}) {
+        std::string script;
+        if (size == 1) script = " ";
+        else if (size > 0) {
+            ASSERT_GT(size, tail.size() + 4);
+            script = "--" + std::string(size - tail.size() - 3, 'p') + "\n" + tail;
+            ASSERT_EQ(script.size(), size);
+        }
+        const fs::path file = writeScript("boundary_" + std::to_string(size) + ".rql", script);
+        for (const char* cmd : {"console", "ql"}) {
+            const std::string got = runCliInChild(
+                {cmd, "-f", "-", "--dry-run"},
+                [&] { const int fd = ::open(file.c_str(), O_RDONLY); ::dup2(fd, STDIN_FILENO); ::close(fd); },
+                [](pid_t) {});
+            EXPECT_EQ(got.rfind("0\n", 0), 0u) << cmd << " size " << size << ": " << got;
+            EXPECT_EQ(got.find("tail_topic") != std::string::npos, size > 1) << cmd << " size " << size << ": " << got;
+        }
+        fs::remove(file);
+    }
+}
+
+// Resources / input bounds: a script of ~200 KB on an O_NONBLOCK stdin pipe, fed in seeded random bursts by a writer
+// that keeps the pipe running dry (EAGAIN between bursts, the pipe's 64 KiB capacity exceeded): every statement runs,
+// once, in order - nothing is lost at an EAGAIN or a chunk edge.
+TEST(RuneConsoleOfflineRegression, HugeStdinScriptInRandomBurstsOnANonBlockingPipeIsReadWholeAdversarialRegression) {
+    constexpr int kStatements = 8000;
+    std::string script;
+    for (int i = 0; i < kStatements; ++i) script += "topic burst_" + std::to_string(i) + " partitions 1;\n";
+    const unsigned seed = 704u;
+    // A reader that gives up early must fail the test, not kill it with SIGPIPE.
+    struct IgnoreSigpipe { void (*old)(int) = ::signal(SIGPIPE, SIG_IGN); ~IgnoreSigpipe() { ::signal(SIGPIPE, old); } } ignoreSigpipe;
+    for (const char* cmd : {"console", "ql"}) {
+        int in[2];
+        ASSERT_EQ(::pipe(in), 0);
+        const std::string got = runCliInChild(
+            {cmd, "-f", "-", "--dry-run"},
+            [&] {
+                ::dup2(in[0], STDIN_FILENO);
+                ::close(in[0]); ::close(in[1]);
+                (void)::fcntl(STDIN_FILENO, F_SETFL, ::fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
+            },
+            [&](pid_t) {
+                ::close(in[0]);
+                unsigned s = seed;
+                std::size_t off = 0;
+                while (off < script.size()) {
+                    s = s * 1103515245u + 12345u;
+                    const std::size_t len = std::min<std::size_t>(script.size() - off, 1 + (s >> 8) % 9000);
+                    const ssize_t w = ::write(in[1], script.data() + off, len);
+                    if (w <= 0) break;
+                    off += static_cast<std::size_t>(w);
+                    if ((s >> 4) % 3 == 0) ::sched_yield();
+                }
+                ::close(in[1]);
+            });
+        EXPECT_EQ(got.rfind("0\n", 0), 0u) << cmd << " seed " << seed << ": " << got.substr(0, 400);
+        std::size_t seen = 0, pos = 0, last = 0;
+        bool ordered = true;
+        for (int i = 0; i < kStatements; ++i) {
+            const std::string name = "burst_" + std::to_string(i) + " ";
+            pos = got.find(name, last);
+            if (pos == std::string::npos) { ordered = false; break; }
+            last = pos + name.size();
+            ++seen;
+        }
+        EXPECT_TRUE(ordered) << cmd << " seed " << seed << ": statement " << seen << " missing or out of order";
+        EXPECT_EQ(count(got, "burst_"), static_cast<std::size_t>(kStatements)) << cmd << " seed " << seed;
+    }
+}
+
+// EINTR: a signal (no SA_RESTART) interrupting the blocked stdin read of a '-' script is not end of input: the
+// statements written after it run too.
+TEST(RuneConsoleOfflineRegression, SignalInterruptingTheStdinScriptReadIsNotEndOfInputAdversarialRegression) {
+    for (const char* cmd : {"console", "ql"}) {
+        int in[2], sig[2];
+        ASSERT_EQ(::pipe(in), 0);
+        ASSERT_EQ(::pipe(sig), 0);
+        ASSERT_EQ(::write(in[1], "topic before_signal partitions 1;\n", 34), 34);
+        const std::string got = runCliInChild(
+            {cmd, "-f", "-", "--dry-run"},
+            [&] {
+                ::dup2(in[0], STDIN_FILENO);
+                ::close(in[0]); ::close(in[1]); ::close(sig[0]);
+                g_sigPipeWr = sig[1];
+                struct sigaction sa {};
+                sa.sa_handler = &notifyOnSignal;   // no SA_RESTART: the blocked read(2) fails with EINTR
+                ::sigaction(SIGUSR1, &sa, nullptr);
+            },
+            [&](pid_t child) {
+                ::close(in[0]); ::close(sig[1]);
+                ASSERT_TRUE(awaitSleeping(child)) << "the reader never blocked";
+                ::kill(child, SIGUSR1);
+                char c = 0;
+                ASSERT_EQ(::read(sig[0], &c, 1), 1) << "the handler never ran";   // the read was interrupted
+                ASSERT_TRUE(awaitSleeping(child)) << "the reader did not go back to reading";
+                ASSERT_EQ(::write(in[1], "topic after_signal partitions 1;\n", 33), 33);
+                ::close(in[1]);
+                ::close(sig[0]);
+            });
+        EXPECT_EQ(got.rfind("0\n", 0), 0u) << cmd << ": " << got;
+        EXPECT_NE(got.find("before_signal"), std::string::npos) << cmd << ": " << got;
+        EXPECT_NE(got.find("after_signal"), std::string::npos) << cmd << ": EINTR ended the script: " << got;
+    }
+}
+
+// A stdin read ERROR (fd 0 write-only: EBADF; a directory: EISDIR) fails the command with nothing run - never an
+// empty or prefix script that exits 0.
+TEST(RuneConsoleOfflineRegression, StdinReadErrorFailsTheScriptAndRunsNothingAdversarialRegression) {
+    for (const int mode : {0, 1}) {
+        for (const char* cmd : {"console", "ql"}) {
+            const std::string got = runCliInChild(
+                {cmd, "-f", "-", "--dry-run"},
+                [&] {
+                    const int fd = mode == 0 ? ::open("/dev/null", O_WRONLY) : ::open("/", O_RDONLY | O_DIRECTORY);
+                    ::dup2(fd, STDIN_FILENO);
+                    ::close(fd);
+                },
+                [](pid_t) {});
+            EXPECT_EQ(got.rfind("1\n", 0), 0u) << cmd << " mode " << mode << ": " << got;
+            EXPECT_NE(got.find("cannot read the script from stdin"), std::string::npos) << cmd << " mode " << mode << ": " << got;
+        }
+    }
+}
+
+// Redirected std::cin (an embedder, the CLI tests): the redirected script is read even when the process stdin carries
+// stale end-of-file AND error flags from earlier use - those flags speak for the real stdin, not for the stream read.
+TEST(RuneConsoleOfflineRegression, RedirectedCinIgnoresStaleProcessStdinFlagsAdversarialRegression) {
+    for (const char* cmd : {"console", "ql"}) {
+        std::istringstream script("topic redirected_topic partitions 1;\n");
+        const std::string got = runCliInChild(
+            {cmd, "-f", "-", "--dry-run"},
+            [&] {
+                const int fd = ::open("/dev/null", O_RDONLY);
+                ::dup2(fd, STDIN_FILENO);
+                ::close(fd);
+                (void)std::getchar();          // end of file: feof(stdin)
+                (void)std::fputc('x', stdin);  // a read-only stream: ferror(stdin)
+                std::cin.rdbuf(script.rdbuf());
+            },
+            [](pid_t) {});
+        EXPECT_EQ(got.rfind("0\n", 0), 0u) << cmd << ": " << got;
+        EXPECT_NE(got.find("redirected_topic"), std::string::npos) << cmd << ": " << got;
+    }
+}
+
+// Secret hygiene (#305 / #680) of the '-' script read: a password literal arriving in a later pipe burst leaves no copy
+// in stdio's stdin buffer (a heap block that lives, unwiped, for the rest of the process) - the script text is only
+// ever held in the wiped chunk and the wiped string.
+TEST(RuneConsoleOfflineRegression, StdinScriptPasswordLeavesNoCopyInTheStdioBufferAdversarialRegression) {
+#ifndef __GLIBC__
+    GTEST_SKIP() << "inspects glibc's FILE buffer";
+#else
+    const std::string secret = std::string("create user stdin_user with password '") + kStdinNeedle + "';\n";
+    for (const char* cmd : {"console", "ql"}) {
+        int in[2];
+        ASSERT_EQ(::pipe(in), 0);
+        ASSERT_EQ(::write(in[1], "topic first_burst partitions 1;\n", 32), 32);
+        const std::string got = runCliInChild(
+            {cmd, "-f", "-", "--dry-run"},
+            [&] { ::dup2(in[0], STDIN_FILENO); ::close(in[0]); ::close(in[1]); },
+            [&](pid_t child) {
+                ::close(in[0]);
+                ASSERT_TRUE(awaitSleeping(child));
+                ASSERT_EQ(::write(in[1], secret.data(), secret.size()), static_cast<ssize_t>(secret.size()));
+                ::close(in[1]);
+            });
+        EXPECT_EQ(got.rfind("0\n", 0), 0u) << cmd << ": " << got;
+        EXPECT_NE(got.find("stdin_user"), std::string::npos) << cmd << ": " << got;
+        EXPECT_EQ(got.find("STDIO-HIT"), std::string::npos)
+            << cmd << ": the password literal stays in stdio's stdin buffer after the script was read";
+    }
+#endif
 }
 
 TEST(ConsoleOfflineRegression, WipeStringZeroesTheWholeCapacityRegression) {
