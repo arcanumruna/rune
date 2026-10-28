@@ -688,3 +688,50 @@ TEST(RuneConsoleBrokerRegression, EmptyCliDataDirIsAPrivateScratchRemovedOnExitA
     EXPECT_TRUE(cliScratchDirs().empty()) << "and no scratch directory was made for it";
     fs::remove_all(mine);
 }
+
+// ── Adversarial review of client batch C8 (#307 #308) on a real broker ─────────────────────────────────────────────
+
+TEST(RuneConsoleBrokerRegression, OverlongLineOnALivePipeAbandonsTheStatementAdversarialRegression) {
+    // #307's own repro through the live console's real reader: `topic t {`, a 70 KiB line, `a int32 } ... key a;`.
+    // Nothing reaches the broker from the abandoned statement; the next statement still runs on the same session.
+    OneBroker b("console_overlong");
+    PipeConsole c({"console", "--broker", b.endpoint(), "--tls-ca", AuthBroker::tlsCaFile().string()});
+    c.send("topic t {\n");
+    c.send(std::string(70 * 1024, 'z') + "\n");
+    c.send("a int32 } partitions 1 key a;\ntopic after { x int32 } partitions 1 key x;\n");
+    c.finish();
+    EXPECT_EQ(c.rc, 0) << c.err.str();
+    EXPECT_EQ(countOf(c.err.str(), "input line too long"), 1u) << c.err.str();
+    EXPECT_EQ(countOf(c.err.str(), "the statement in progress was abandoned"), 1u) << c.err.str();
+    EXPECT_NE(c.out.str().find("ok topic after"), std::string::npos) << c.out.str() << c.err.str();
+    const auto ev = b.catalogEvents();
+    EXPECT_EQ(createTopicCount(ev, "t"), 0u) << "the halves around the dropped line never become a statement";
+    EXPECT_EQ(createTopicCount(ev, "after"), 1u);
+}
+
+TEST(RuneConsoleBrokerRegression, LoginRefusedOnReconnectEndsTheConsoleAdversarialRegression) {
+    // #308's own scenario: the user's password is rotated (the console's one dropped), then the broker restarts; the
+    // console's reconnect login is refused (AuthenticationFailed, 44).  The console ends with 44 at the next statement
+    // instead of prompting on a dead client.
+    using namespace rune::node::test::grants;
+    AuthBroker b("console_relogin");
+    b.bootstrapAdmin();
+    b.createUser("u", kUserPw, {prefix(SO::Create, ST::Topic, "ok_")});
+    const std::string pw = writeFile("relogin.pw", std::string(kUserPw) + "\n");
+    PipeConsole c({"console", "--broker", b.endpoint(), "--user", "u", "--password-file", pw, "--tls-ca",
+                   AuthBroker::tlsCaFile().string()});
+    c.send("topic ok_a partitions 1;\n");
+    ASSERT_TRUE(waitUntil([&] { return c.out.str().find("ok topic ok_a") != std::string::npos; }))
+        << "out: " << c.out.str() << "\nerr: " << c.err.str();
+    b.addPassword("u", "console-user-pw-rotated-5678");
+    b.dropOldestPassword("u");
+    b.restart();
+    c.send("topic ok_b partitions 1;\ntopic ok_c partitions 1;\ntopic ok_d partitions 1;\n");
+    c.finish();
+    const auto ended = countOf(c.err.str(), "the session ended");
+    EXPECT_EQ(ended, 1u) << "out: " << c.out.str() << "\nerr: " << c.err.str();
+    EXPECT_EQ(c.rc, 44) << "AuthenticationFailed, not a generic 1: " << c.err.str();
+    EXPECT_NE(c.err.str().find("AuthenticationFailed (44): the session ended"), std::string::npos) << c.err.str();
+    EXPECT_EQ(c.out.str().find("ok topic ok_d"), std::string::npos) << c.out.str();
+    EXPECT_EQ(c.err.str().find("client closed"), std::string::npos) << "no statement runs on the dead client: " << c.err.str();
+}

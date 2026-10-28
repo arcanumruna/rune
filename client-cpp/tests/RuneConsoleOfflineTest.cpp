@@ -1153,3 +1153,158 @@ TEST(ConsoleOfflineRegression, AnyRejectedSessionEndsTheConsoleRegression) {
     for (const C c : {C{0, 0, 0}, C{0, 30, 0}, C{0, 46, 46}, C{44, 0, 44}, C{48, 30, 48}, C{46, 46, 46}})
         EXPECT_EQ(consoleSessionEndCode(c.reject, c.stmt), c.want) << "reject " << c.reject << " statement " << c.stmt;
 }
+
+// ── Adversarial review of client batch C8 (#301 #302 #303 #307 #308) ────────────────────────────────────────────────
+
+TEST(ConsoleOfflineRegression, ExitStatusNeverCollidesAtAnyCodeAdversarialRegression) {
+    // #301: every 16-bit broker code maps to 4..125; never 0 (success), 1/2/3 (local codes) or a value a shell
+    // truncates (256 would be 0 mod 256, 257 would be 1).
+    using rune::cli::console::consoleExitStatus;
+    const std::pair<uint16_t, int> edges[] = {{3, 125},   {4, 4},     {5, 5},     {123, 123}, {124, 124}, {125, 125},
+                                              {126, 125}, {127, 125}, {128, 125}, {255, 125}, {256, 125}, {257, 125},
+                                              {258, 125}, {259, 125}, {0x7FFF, 125}, {0x8000, 125}, {0xFFFF, 125}};
+    for (const auto& [code, want] : edges) EXPECT_EQ(consoleExitStatus(code), want) << "broker code " << code;
+    for (uint32_t c = 0; c <= 0xFFFF; ++c) {
+        const int s = consoleExitStatus(static_cast<uint16_t>(c));
+        ASSERT_TRUE(s >= 4 && s <= 125) << "code " << c << " -> " << s;
+        ASSERT_TRUE(s == static_cast<int>(c) || s == 125) << "code " << c << " -> " << s << ": a code is never remapped to another code";
+    }
+}
+
+TEST(ConsoleOfflineRegression, EverySessionRejectCodeEndsTheSessionAdversarialRegression) {
+    // #308: reject codes 44..48 and unknown ones (a newer broker) each end the session with their own code, whatever the
+    // failed statement's code was; without a reject only SessionRevoked (46) ends it.
+    using rune::cli::console::consoleSessionEndCode;
+    const uint16_t rejects[] = {44, 45, 46, 47, 48, 60, 0x7FFF, 0x8000, 0xFFFF};
+    const uint16_t stmts[]   = {0, 1, 7, 30, 44, 45, 46, 47, 48, 0xFFFF};
+    for (const uint16_t r : rejects)
+        for (const uint16_t s : stmts) EXPECT_EQ(consoleSessionEndCode(r, s), r) << "reject " << r << " statement " << s;
+    for (const uint16_t s : stmts)
+        EXPECT_EQ(consoleSessionEndCode(0, s), s == 46 ? 46 : 0) << "no reject, statement " << s
+            << ": a statement error other than SessionRevoked keeps the session (DD7)";
+}
+
+namespace {
+std::string ridStatements(std::size_t n) {
+    std::string s;
+    for (std::size_t i = 0; i < n; ++i) s += "topic t" + std::to_string(i) + " { x int32 } partitions 1 key x;\n";
+    return s;
+}
+} // namespace
+
+TEST(ConsoleOfflineRegression, RequestIdAtMaxMaxMinusOneAndWrapAdversarialRegression) {
+    // #303: statement N uses lo + N - 1.  lo = max fits one statement only; lo = max-1 fits two; the refusal names the
+    // first statement whose id would wrap.
+    const std::string hiMax = "0000000000000001ffffffffffffffff", hiMax1 = "0000000000000001fffffffffffffffe";
+    struct C { std::string rid; std::size_t n; int rc; std::string needle; };
+    const C cases[] = {
+        {hiMax, 1, 0, "request-id 0000000000000001ffffffffffffffff\n"},
+        {hiMax, 2, 1, "overflow at statement 2 of 2 "},
+        {hiMax1, 2, 0, "request-id 0000000000000001ffffffffffffffff\n"},
+        {hiMax1, 3, 1, "overflow at statement 3 of 3 "},
+        {hiMax1, 9, 1, "overflow at statement 3 of 9 "},
+        {"ffffffffffffffff0000000000000000", 9, 0, "request-id ffffffffffffffff0000000000000008\n"},   // hi never carries
+    };
+    for (const auto& c : cases) {
+        const fs::path f = writeScript("c8adv_rid.rql", ridStatements(c.n));
+        const auto r = console({"-f", f.string(), "--dry-run", "--request-id", c.rid});
+        EXPECT_EQ(r.rc, c.rc) << c.rid << " x" << c.n << ": " << r.err;
+        EXPECT_NE((c.rc == 0 ? r.out : r.err).find(c.needle), std::string::npos) << c.rid << " x" << c.n << ": " << r.out << r.err;
+        if (c.rc != 0) EXPECT_TRUE(r.out.empty()) << "nothing is planned before the refusal: " << r.out;
+        if (c.rc == 0) EXPECT_EQ(count(r.out, "request-id "), c.n) << r.out;
+    }
+}
+
+TEST(ConsoleOfflineRegression, RequestIdRefusalOrderAndScriptFromStdinAdversarialRegression) {
+    const std::string hiMax = "0000000000000001ffffffffffffffff";
+    // `-f -` reads the script from stdin: still script mode, still refused.
+    const auto fromStdin = consoleWithoutBrokerEnv({"-f", "-", "--request-id", hiMax}, ridStatements(2));
+    EXPECT_EQ(fromStdin.rc, 1) << fromStdin.err;
+    EXPECT_NE(fromStdin.err.find("would overflow at statement 2 of 2"), std::string::npos) << fromStdin.err;
+    // Interactive mode cannot take --request-id at all (the claimed reason #303 needs no per-statement guard there).
+    for (const bool dry : {true, false}) {
+        std::vector<std::string> a{"--request-id", hiMax};
+        if (dry) a.push_back("--dry-run");
+        const auto i = consoleWithoutBrokerEnv(a, ridStatements(3));
+        EXPECT_EQ(i.rc, 2) << i.err;
+        EXPECT_NE(i.err.find("--request-id needs -f"), std::string::npos) << i.err;
+        EXPECT_TRUE(i.out.empty()) << "no statement ran: " << i.out;
+    }
+    // A syntax error is reported (rc 1, statement position) before the overflow; an empty script never overflows.
+    const fs::path bad = writeScript("c8adv_rid_bad.rql", ridStatements(2) + "topic ;\n");
+    const auto b = console({"-f", bad.string(), "--dry-run", "--request-id", hiMax});
+    EXPECT_EQ(b.rc, 1);
+    EXPECT_NE(b.err.find("c8adv_rid_bad.rql:statement 3: "), std::string::npos) << b.err;
+    EXPECT_EQ(b.err.find("would overflow"), std::string::npos) << b.err;
+    const auto e = console({"-f", writeScript("c8adv_rid_empty.rql", "-- nothing\n").string(), "--dry-run", "--request-id", hiMax});
+    EXPECT_EQ(e.rc, 0) << e.err;
+    EXPECT_TRUE(e.err.empty()) << e.err;
+}
+
+namespace {
+/// Runs the dry-run REPL over the REAL 64 KiB PollingFdLineSource reading a file (no writer thread needed).
+struct PolledRepl { int rc = -1; std::string out, err; };
+PolledRepl replOverFile(const std::string& name, const std::string& body) {
+    const fs::path p = writeScript(name, body);
+    const int fd = ::open(p.c_str(), O_RDONLY);
+    if (fd < 0) return {};
+    int idle = 0;
+    std::ostringstream out, err;
+    PolledRepl r;
+    {
+        rune::cli::console::PollingFdLineSource src(fd, &countIdle, &idle);
+        src.err = &err;
+        r.rc = rune::cli::console::runInteractiveDryRunForTest(src, out, err);
+    }
+    ::close(fd);
+    r.out = out.str();
+    r.err = err.str();
+    return r;
+}
+const std::string kLong(70 * 1024, 'z');
+} // namespace
+
+TEST(ConsoleOfflineRegression, DiscardInEveryReplStateAdversarialRegression) {
+    // #307 through the real reader: the over-long line arrives in every parser state the REPL can be in.
+    struct C { const char* name; std::string body; std::size_t abandoned; std::size_t planned; std::string mustNotPlan; };
+    const C cases[] = {
+        // the issue's repro: the halves around the dropped line are never joined into "topic t { a int32 } ..."
+        {"repro", "topic t {\n" + kLong + "\na int32 } partitions 1 key a;\n", 1, 0, "topic t "},
+        // inside an open string literal and an open block comment
+        // (a REPL input is buffered until it ends in ';', so the complete `topic s` before the open string goes with it; the
+        // leftover "');" is an unterminated string again, so it swallows the next line into one parse error - the
+        // abandoned text is never planned)
+        {"string", "topic s { a string } partitions 1 key a; insert into s values ('abc\n" + kLong + "\n');\ntopic ok { x int32 } partitions 1 key x;\n", 1, 0, "topic s "},
+        {"comment", "/* open\n" + kLong + "\n*/ topic c { x int32 } partitions 1 key x;\ntopic ok { x int32 } partitions 1 key x;\n", 1, 1, "topic c "},
+        // two dropped lines in a row: one abandonment, not two
+        {"twice", "topic d {\n" + kLong + "\n" + kLong + "\nx int32 } partitions 1 key x;\ntopic ok { x int32 } partitions 1 key x;\n", 1, 1, "topic d "},
+        // a complete statement and the dropped line on ONE physical line: the whole line goes, nothing runs from it
+        {"sameline", "topic e { x int32 } partitions 1 key x; -- " + kLong + "\ntopic ok { x int32 } partitions 1 key x;\n", 0, 1, "topic e "},
+        // dropped line while awaiting, then EOF without a newline: no "input ended inside a statement"
+        {"eof", "topic ok { x int32 } partitions 1 key x;\n" + kLong, 0, 1, ""},
+        // dropped line mid-statement, then exit: exit is honoured as a fresh command, not a continuation
+        {"exit", "topic f {\n" + kLong + "\nexit\ntopic g { x int32 } partitions 1 key x;\n", 1, 0, "topic g "},
+    };
+    for (const auto& c : cases) {
+        const auto r = replOverFile(std::string("c8adv_discard_") + c.name + ".rql", c.body);
+        EXPECT_EQ(r.rc, 0) << c.name << ": " << r.err;
+        EXPECT_EQ(count(r.err, "input line too long"), c.body.size() > 2 * kLong.size() ? 2u : 1u) << c.name << ": " << r.err;
+        EXPECT_EQ(count(r.err, "was abandoned"), c.abandoned) << c.name << ": " << r.err;
+        EXPECT_EQ(count(r.err, "input ended inside a statement"), 0u) << c.name << ": " << r.err;
+        EXPECT_EQ(count(r.out, " partitions 1"), c.planned) << c.name << ": " << r.out << "\nerr: " << r.err.substr(0, 600);
+        if (!c.mustNotPlan.empty()) EXPECT_EQ(r.out.find(c.mustNotPlan), std::string::npos) << c.name << ": " << r.out;
+        EXPECT_EQ(r.out.find("zzzz"), std::string::npos) << c.name << ": no byte of the dropped line is planned";
+    }
+}
+
+TEST(ConsoleOfflineRegression, LineLengthBoundaryIsExactAdversarialRegression) {
+    // 65535 bytes + '\n' fills the 64 KiB buffer exactly and is a line; one byte more is dropped.  Neither leaks into
+    // the following line.
+    const auto fits = replOverFile("c8adv_len_fit.rql", "-- " + std::string(65535 - 3, 'q') + "\ntopic ok { x int32 } partitions 1 key x;\n");
+    EXPECT_EQ(fits.err.find("too long"), std::string::npos) << fits.err;
+    EXPECT_EQ(count(fits.out, " partitions 1"), 1u) << fits.out;
+    const auto over = replOverFile("c8adv_len_over.rql", "-- " + std::string(65536 - 3, 'q') + "\ntopic ok { x int32 } partitions 1 key x;\n");
+    EXPECT_EQ(count(over.err, "input line too long"), 1u) << over.err;
+    EXPECT_EQ(count(over.out, " partitions 1"), 1u) << "the next line is read whole: " << over.out;
+    EXPECT_EQ(over.err.find("1:1: "), std::string::npos) << "the tail of the dropped line is not parsed: " << over.err;
+}

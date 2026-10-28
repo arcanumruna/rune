@@ -919,6 +919,38 @@ TEST(OpenTopicGateRegression, LineageOfAMissingTopicSaysItDoesNotExistRegression
     EXPECT_NE(other.find("did not serve the schema lineage of 't' (error 45)"), std::string::npos) << other;
 }
 
+// Adversarial review of C8 (#435): the probe that disambiguates UnknownTopic must never turn a probe timeout or a
+// refused probe into "does not exist" (or "upgrade"), and must end within its own timeout.
+TEST(OpenTopicGateRegression, LineageProbeTimeoutFallsBackToThePlainCodeAdversarialRegression) {
+    GateHarness h(1334, 1335);
+    h.build();
+    h.connectAndWait();
+    h.gw->replyGetTopicSchema = false;   // the broker never answers the probe
+    GateGatewayPump pump(*h.gw);
+    const auto t0  = std::chrono::steady_clock::now();
+    const std::string msg = h.client->lineageFailure("t", 7, 300ms);
+    const auto took = std::chrono::steady_clock::now() - t0;
+    EXPECT_NE(msg.find("did not serve the schema lineage of 't' (error 7)"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("does not exist"), std::string::npos) << "an unanswered probe proves nothing: " << msg;
+    EXPECT_EQ(msg.find("upgrade"), std::string::npos) << msg;
+    EXPECT_LT(took, 5s) << "the probe is bounded by its timeout";
+}
+
+TEST(OpenTopicGateRegression, LineageProbeRefusedNamesTheProbeCodeAdversarialRegression) {
+    GateHarness h(1336, 1337);
+    h.build();
+    h.connectAndWait();
+    h.gw->unknownFingerprintErrorCode = 7;
+    GateGatewayPump pump(*h.gw);
+    for (const uint16_t probeCode : {uint16_t{45}, uint16_t{1}, uint16_t{0x7FFF}}) {
+        h.gw->getErrorCode = probeCode;
+        const std::string msg = h.client->lineageFailure("t", 7, 5s);
+        EXPECT_NE(msg.find("(error " + std::to_string(probeCode) + ")"), std::string::npos) << probeCode << ": " << msg;
+        EXPECT_EQ(msg.find("does not exist"), std::string::npos) << probeCode << ": " << msg;
+        EXPECT_EQ(msg.find("upgrade"), std::string::npos) << probeCode << ": " << msg;
+    }
+}
+
 // ===========================================================================
 // Phase 2b Part C — the broker-reported partition count reaches the client:
 // TopicSchemaResponse trailing partitionCount -> Completion.reserved0 ->
