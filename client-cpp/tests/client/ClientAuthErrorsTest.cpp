@@ -15,11 +15,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <optional>
 #include <fstream>
 #include <string>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -223,9 +225,19 @@ TEST(ClientAuthErrorsRegression, AFakeBrokerRefusesAnyRequestBeforeTheLoginFinis
     EXPECT_TRUE(r.gw.authStates().empty()) << "the session ended";
 }
 
+namespace {
+/// A password file with an explicit mode (the Client refuses group / other access).
+std::string writePwFile(const std::string& tag, const std::string& content, mode_t mode) {
+    const std::string path = std::filesystem::temp_directory_path().string() + "/client_auth_pw_" + tag + "_" +
+                             std::to_string(::getpid());
+    { std::ofstream(path, std::ios::binary | std::ios::trunc) << content; }
+    ::chmod(path.c_str(), mode);
+    return path;
+}
+} // namespace
+
 TEST(ClientAuthErrorsRegression, PasswordFileIsReadOnceAndBothSetIsRefused) {
-    const std::string path = std::filesystem::temp_directory_path().string() + "/client_auth_pw_" + std::to_string(::getpid());
-    { std::ofstream(path, std::ios::binary) << kPw << "\n"; }
+    const std::string path = writePwFile("once", std::string(kPw) + "\n", 0600);
     {
         rc::ClientConfig c = authCfg(3716, "ws1", "");
         c.passwordFile = path;
@@ -244,6 +256,143 @@ TEST(ClientAuthErrorsRegression, PasswordFileIsReadOnceAndBothSetIsRefused) {
         EXPECT_THROW(rc::Client{c}, std::runtime_error);
     }
     ::unlink(path.c_str());
+}
+
+TEST(PasswordFileRegression, GroupReadableFileIsRefusedRegression) {
+    for (const mode_t bad : {mode_t(0644), mode_t(0604), mode_t(0640)}) {
+        const std::string path = writePwFile("mode", std::string(kPw) + "\n", bad);
+        rc::ClientConfig c = authCfg(4100, "ws1", "");
+        c.passwordFile = path;
+        try {
+            rc::Client{c};
+            ADD_FAILURE() << "mode " << std::oct << bad << " must be refused";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("group or others"), std::string::npos) << e.what();
+            char m[8];
+            std::snprintf(m, sizeof m, "%04o", static_cast<unsigned>(bad));
+            EXPECT_NE(std::string(e.what()).find(m), std::string::npos) << e.what();
+        }
+        ::unlink(path.c_str());
+    }
+    const std::string path = writePwFile("mode", std::string(kPw) + "\n", 0600);
+    rc::ClientConfig c = authCfg(4102, "ws1", "");
+    c.passwordFile = path;
+    {
+        Rig r(c);
+        r.connectOk();
+    }
+    ::unlink(path.c_str());
+}
+
+TEST(PasswordFileRegression, OversizeFileIsRefusedRegression) {
+    {
+        const std::string path = writePwFile("big", std::string(1 << 20, 'p'), 0600);
+        rc::ClientConfig c = authCfg(4104, "ws1", "");
+        c.passwordFile = path;
+        try {
+            rc::Client{c};
+            ADD_FAILURE() << "a 1 MiB file must be refused";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("larger than"), std::string::npos) << e.what();
+        }
+        ::unlink(path.c_str());
+    }
+    {
+        const std::string path = writePwFile("max", std::string(1024, 'p') + "\r\n", 0600);
+        rc::ClientConfig c = authCfg(4106, "ws1", "");
+        c.passwordFile = path;
+        rc::Client client{c};
+        EXPECT_EQ(client.testAgentSecret().size(), 1024u);
+        ::unlink(path.c_str());
+    }
+    {
+        const std::string path = writePwFile("max1", std::string(1025, 'p'), 0600);
+        rc::ClientConfig c = authCfg(4108, "ws1", "");
+        c.passwordFile = path;
+        EXPECT_THROW(rc::Client{c}, std::runtime_error);
+        ::unlink(path.c_str());
+    }
+}
+
+TEST(PasswordFileRegression, TrailingWhitespaceIsPartOfThePasswordRegression) {
+    {
+        const std::string path = writePwFile("ws", std::string(kPw) + " \n", 0600);
+        rc::ClientConfig c = authCfg(4110, "ws1", "");
+        c.passwordFile = path;
+        rc::Client client{c};
+        EXPECT_EQ(client.testAgentSecret(), std::string(kPw) + " ");
+        ::unlink(path.c_str());
+    }
+    {
+        const std::string path = writePwFile("crlf", std::string(kPw) + "\r\n\n", 0600);
+        rc::ClientConfig c = authCfg(4112, "ws1", "");
+        c.passwordFile = path;
+        rc::Client client{c};
+        EXPECT_EQ(client.testAgentSecret(), kPw);
+        ::unlink(path.c_str());
+    }
+}
+
+TEST(PasswordFileRegression, AnEmptyPasswordFileIsRefusedRegression) {
+    const std::string path = writePwFile("empty", "\n", 0600);
+    rc::ClientConfig c = authCfg(4114, "ws1", "");
+    c.passwordFile = path;
+    try {
+        rc::Client{c};
+        ADD_FAILURE() << "an empty password file must be refused";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("is empty"), std::string::npos) << e.what();
+    }
+    ::unlink(path.c_str());
+}
+
+TEST(ClientAuthErrorsRegression, ThePasswordLivesOnlyInTheAgentsSharedSecretRegression) {
+    Rig r(authCfg(4116, "ws1", kPw));
+    r.gw.mustChange.insert("ws1");   // the fake applies a self SET PASSWORD for a must-change user
+    r.connectOk();
+    EXPECT_TRUE(r.client.testConfigPasswordEmpty());
+    EXPECT_EQ(r.client.testAgentSecret(), kPw);
+    auto st = rune::ql::parse("alter user ws1 set password 'new password 456';");
+    ASSERT_TRUE(st.has_value());
+    auto plan = rune::ql::applySecurityPlan(*st);
+    ASSERT_TRUE(plan.has_value());
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.securityDdl(*plan, {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_TRUE(r.client.testConfigPasswordEmpty()) << "the Client keeps no copy after a self SET PASSWORD (#56)";
+    EXPECT_EQ(r.client.testAgentSecret(), "new password 456");
+}
+
+TEST(ClientAuthErrorsRegression, ASelfSetPasswordLeavesNoPlaintextInTheCommandRingRegression) {
+    Rig r(authCfg(4122, "ws1", kPw));
+    r.gw.mustChange.insert("ws1");
+    r.connectOk();
+    auto st = rune::ql::parse("alter user ws1 set password 'new password 456';");
+    ASSERT_TRUE(st.has_value());
+    auto plan = rune::ql::applySecurityPlan(*st);
+    ASSERT_TRUE(plan.has_value());
+    auto holds = [&] {
+        const auto b = r.client.testCommandRingBytes();
+        const std::string_view needle = "new password 456";
+        return std::search(b.begin(), b.end(), needle.begin(), needle.end(),
+                           [](uint8_t a, char c) { return a == static_cast<uint8_t>(c); }) != b.end();
+    };
+    test_support::TestCq cq(r.client);
+    // Issued from the owner thread outside a duty cycle: the record goes through the ring.
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.securityDdl(*plan, {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    EXPECT_TRUE(holds()) << "vacuity guard: the secret rides in the ring record until the duty thread reads it";
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    ASSERT_TRUE(f.ok()) << f.describe();
+    r.passes(3);
+    EXPECT_FALSE(holds()) << "a consumed ring record is zeroed";
+}
+
+TEST(ClientAuthErrorsRegression, APasswordOverTheCapIsRefusedAtConstructionRegression) {
+    EXPECT_THROW(rc::Client{authCfg(4118, "ws1", std::string(1025, 'p'))}, std::invalid_argument);
+    EXPECT_NO_THROW(rc::Client{authCfg(4120, "ws1", std::string(1024, 'p'))});
 }
 
 // Review B I1 (D26 is per session): a LEADER NODE's session revoked (a D28-style halt of that node) fails its

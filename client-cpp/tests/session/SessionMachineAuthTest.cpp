@@ -141,6 +141,26 @@ TEST(SessionMachineAuthRegression, FullExchangeReachesConnectedOnlyAfterTheServe
     EXPECT_FALSE(m.passwordChangeRequired());
 }
 
+TEST(SessionMachineAuthRegression, InstallPasswordDoesNotAllocateAndWipesTheOldSecretRegression) {
+    // No allocation hook exists in this binary (and none may be added): FixedSecret has no allocating member.
+    rune::client::detail::FixedSecret s;
+    ASSERT_TRUE(s.assign("old password 123456"));
+    ASSERT_TRUE(s.assign("new"));
+    EXPECT_EQ(s.view(), "new");
+    EXPECT_EQ(s.rawForTest().find("password"), std::string_view::npos) << "the old tail is wiped";
+    const std::string big(1025, 'x');
+    EXPECT_FALSE(s.assign(big));
+    EXPECT_EQ(s.view(), "new") << "refused, not truncated";
+    EXPECT_TRUE(s.assign(std::string(1024, 'y')));
+    EXPECT_EQ(s.view().size(), 1024u);
+
+    CapturingIo io; sm::SessionConfig cfg; cfg.username = "ws1"; cfg.password = "correct horse battery";
+    sm::SessionMachine m(io, cfg);
+    EXPECT_TRUE(cfg.password.size() > 0);   // the caller's copy is its own
+    EXPECT_TRUE(m.installPassword("another long password"));
+    EXPECT_FALSE(m.installPassword(big));
+}
+
 TEST(SessionMachineAuthRegression, AWrongServerSignatureIsRejectedNeverConnected) {
     Rig t; t.connectAuthRequired();
     Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));

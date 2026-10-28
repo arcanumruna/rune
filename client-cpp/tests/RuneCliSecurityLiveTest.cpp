@@ -26,6 +26,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace pc = rune::protocol::client;
@@ -95,7 +96,8 @@ CliRun runCli(std::vector<std::string> args) {
     return {code, o.str(), e.str()};
 }
 std::string writeFile(const std::string& path, const std::string& content) {
-    std::ofstream(path, std::ios::binary) << content;
+    { std::ofstream(path, std::ios::binary) << content; }
+    ::chmod(path.c_str(), 0600);   // password and key files must not be group / other accessible
     return path;
 }
 std::vector<std::string> cat(std::vector<std::string> a, const std::vector<std::string>& b) {

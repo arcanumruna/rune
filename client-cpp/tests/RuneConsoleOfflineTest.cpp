@@ -4,6 +4,9 @@
 #include <gtest/gtest.h>
 
 #include <fcntl.h>
+#include <pty.h>
+#include <sys/wait.h>
+#include <termios.h>
 #include <signal.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -19,6 +22,7 @@
 
 #include "rune/cli/Cli.h"
 #include "rune/cli/Console.h"
+#include <rune/client/detail/SecureZero.h>
 #include "rune/ql/Parser.h"
 
 #include "QlEngine.h"   // src/cli: splitStatements, the engine's internal seams
@@ -707,4 +711,104 @@ TEST(ConsolePollingSourceRegression, SignalStormStillPumpsTheClientAdversarialRe
     EXPECT_GE(gStormPumps, 3);
     EXPECT_EQ(src.idlePumps, static_cast<uint64_t>(gStormPumps));
     ::close(fds[0]);
+}
+
+// ── Credential hygiene (#305, #306) ──────────────────────────────────────────────────────────────────────────────────
+TEST(ConsolePollingSourceRegression, PasswordLiteralIsWipedFromTheReadBufferRegression) {
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    const std::string text = "create user u with password 'S3cretS3cret';\nshow users;\n";
+    ASSERT_EQ(::write(fds[1], text.data(), text.size()), static_cast<ssize_t>(text.size()));
+    rune::cli::console::PollingFdLineSource src(fds[0], nullptr, nullptr);
+    std::string line;
+    ASSERT_TRUE(src.next(line));
+    EXPECT_NE(line.find("S3cret"), std::string::npos);
+    ASSERT_TRUE(src.next(line));
+    EXPECT_EQ(line, "show users;");
+    EXPECT_EQ(src.heldBytesForTest().find("S3cret"), std::string_view::npos) << "a consumed line lingers in the buffer";
+    ::close(fds[0]);
+    ::close(fds[1]);
+}
+
+namespace {
+bool readPw(const std::string& input, std::string& pw) {
+    int fds[2];
+    if (::pipe(fds) != 0) return false;
+    EXPECT_EQ(::write(fds[1], input.data(), input.size()), static_cast<ssize_t>(input.size()));
+    ::close(fds[1]);
+    const bool ok = rune::cli::console::readPasswordLine(fds[0], pw);
+    ::close(fds[0]);
+    return ok;
+}
+} // namespace
+
+TEST(ConsolePromptRegression, PasswordIsReadIntoAFixedBufferAndOverlongIsRefusedRegression) {
+    std::string pw;
+    ASSERT_TRUE(readPw("pw with spaces \r\n", pw));
+    EXPECT_EQ(pw, "pw with spaces ");
+    EXPECT_FALSE(readPw(std::string(1025, 'a') + "\n", pw));
+    EXPECT_TRUE(pw.empty());
+    ASSERT_TRUE(readPw(std::string(1024, 'a') + "\n", pw));
+    EXPECT_EQ(pw.size(), 1024u);
+}
+
+TEST(ConsoleOfflineRegression, WipeStringZeroesTheWholeCapacityRegression) {
+    std::string s(100, 'z');
+    s.resize(3);
+    const char* p = s.data();
+    ASSERT_GE(s.capacity(), 100u);
+    rune::client::detail::wipeString(s);
+    EXPECT_TRUE(s.empty());
+    for (std::size_t i = 0; i < 100; ++i) ASSERT_EQ(p[i], 0) << "byte " << i;
+}
+
+namespace {
+struct FdBuf final : std::streambuf {
+    int fd;
+    explicit FdBuf(int f) : fd(f) {}
+    int_type overflow(int_type c) override {
+        if (c != traits_type::eof()) { const char ch = static_cast<char>(c); (void)!::write(fd, &ch, 1); }
+        return c;
+    }
+    std::streamsize xsputn(const char* s, std::streamsize n) override {
+        return ::write(fd, s, static_cast<std::size_t>(n));
+    }
+};
+} // namespace
+
+TEST(RuneConsolePtyRegression, SigintAtPasswordPromptRestoresEchoRegression) {
+    int master = -1, slave = -1;
+    ASSERT_EQ(::openpty(&master, &slave, nullptr, nullptr, nullptr), 0);
+    termios t{};
+    ASSERT_EQ(::tcgetattr(slave, &t), 0);
+    ASSERT_NE(t.c_lflag & ECHO, 0u) << "a fresh pty echoes";
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        ::signal(SIGINT, SIG_DFL);   // a backgrounded test runner may have left it ignored
+        FdBuf fb(slave);
+        std::ostream errStream(&fb);
+        std::string pw;
+        (void)rune::cli::console::promptPasswordOnFd(slave, "u", pw, errStream);
+        ::_exit(0);
+    }
+    // The prompt is written after echo is off and the handlers are in: it is the sync point.
+    std::string seen;
+    bool prompted = false;
+    for (int i = 0; i < 64 && !prompted; ++i) {
+        char buf[256];
+        const ssize_t n = ::read(master, buf, sizeof buf);
+        if (n <= 0) break;
+        seen.append(buf, static_cast<std::size_t>(n));
+        prompted = seen.find("password for u: ") != std::string::npos;
+    }
+    ASSERT_TRUE(prompted) << "saw: " << seen;
+    ASSERT_EQ(::kill(child, SIGINT), 0);
+    int status = 0;
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+    EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGINT) << "the child dies of the SIGINT, status " << status;
+    ASSERT_EQ(::tcgetattr(slave, &t), 0);
+    EXPECT_NE(t.c_lflag & ECHO, 0u) << "echo stayed off after Ctrl-C at the password prompt";
+    ::close(master);
+    ::close(slave);
 }

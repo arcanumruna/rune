@@ -531,6 +531,8 @@ bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredenti
     // a password is NEVER taken from argv (parseArgs refuses --password) or from the environment.
     // Issue #121: the only connection the CLI opens without credentials is `rune security bootstrap`'s.
     cfg.securityBootstrapOnly = !withCredentials;
+    // cfg.password (the prompted one) is wiped on every path out, a throw from the Client constructor included.
+    struct CfgPasswordWipe { rc::ClientConfig& c; ~CfgPasswordWipe() { rc::detail::wipeString(c.password); } } cfgPasswordWipe{cfg};
     if (withCredentials) {
         applyCredentials(cfg, o.user, o.passwordFile);
         if (!o.password.empty()) {   // an interactively prompted password replaces any file (the client refuses both)
@@ -545,13 +547,12 @@ bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredenti
     } catch (const std::exception& e) {
         lastFailure_ = e.what();
         if (!quietFailure) err << "rune: " << e.what() << "\n";   // a quiet caller reports lastFailure() itself
-        if (!cfg.password.empty()) rc::detail::secureZero(cfg.password.data(), cfg.password.size());
         close();
         return false;
     }
     try {
         client_ = std::make_unique<rc::Client>(cfg);
-        if (!cfg.password.empty()) rc::detail::secureZero(cfg.password.data(), cfg.password.size());
+        rc::detail::wipeString(cfg.password);   // the Client holds its own copy now
         client_->connectAndWait(kConnectWait);
         printDevBannerIfAny(*client_, err);   // dev mode: say so, loudly
         return true;

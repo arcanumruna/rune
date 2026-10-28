@@ -163,6 +163,22 @@ TEST(SecurityDdlRegression, ShortPasswordsAreRefusedLocallyBeforeSending) {
     EXPECT_NO_THROW((void)cq2.issue([&](rc::Completions& q, rc::Token t) { return r2.client.securityDdl(plan, {}, q, t); }));
 }
 
+TEST(SecurityDdlRegression, APasswordOverTheCapIsRefusedLocallyRegression) {
+    Rig r(invokerCfg(3818, 3819));
+    r.connect();
+    test_support::TestCq cq(r.client);
+    auto planWith = [&](std::size_t n) { return planOf("create user ws1 with password '" + std::string(n, 'p') + "';"); };
+    const auto big = planWith(1025);
+    try {
+        (void)cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.securityDdl(big, {}, q, t); });
+        FAIL() << "an over-long password must throw";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("at most"), std::string::npos) << e.what();
+    }
+    const auto ok = planWith(1024);
+    EXPECT_NO_THROW((void)cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.securityDdl(ok, {}, q, t); }));
+}
+
 TEST(SecurityDdlRegression, EveryPlanKindMapsToItsWireOp) {
     Rig r(invokerCfg(3816, 3817));
     r.connect();

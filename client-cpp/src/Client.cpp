@@ -20,6 +20,7 @@
 #include <rune/client/Client.h>
 #include <rune/client/agent/AgentProduceSink.h>
 #include <rune/client/detail/CpuAffinity.h>
+#include <rune/client/detail/PasswordFile.h>
 #include <rune/client/detail/SecureZero.h>
 #include <rune/client/detail/OneToOneRingBuffer.h>
 #include <rune/client/producer/ProducerImpl.h>
@@ -48,6 +49,7 @@
 #include <unordered_map>
 
 namespace rune::client {
+static_assert(kMaxPasswordBytes == detail::FixedSecret::kCapacity);
 
 namespace {
 
@@ -68,17 +70,16 @@ ClientConfig validatedConfig(ClientConfig c) {
     if (c.traceDdlRetries && c.runnerMode != RunnerMode::Invoker)
         throw std::invalid_argument("ClientConfig::traceDdlRetries requires RunnerMode::Invoker "
                                     "(the notes are duty-thread state, read by the Invoker owner)");
-    // Authentication: a password file is read ONCE, here; the contents (trailing newline stripped) become
-    // the password.  Both set is ambiguous: refused, never silently one over the other.
+    // Authentication: a password file is read ONCE, here (mode 0600/0400, at most 1024 bytes, only trailing CR/LF
+    // stripped: see PasswordFile.h); the contents become the password.  Both set is ambiguous: refused, never silently one over the other.
     if (!c.passwordFile.empty()) {
         if (!c.password.empty())
             throw std::invalid_argument("ClientConfig: set either `password` or `passwordFile`, not both");
-        std::ifstream f(c.passwordFile, std::ios::binary);
-        if (!f) throw std::runtime_error("ClientConfig::passwordFile: cannot read '" + c.passwordFile + "'");
-        std::string pw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        while (!pw.empty() && (pw.back() == '\n' || pw.back() == '\r')) pw.pop_back();
-        c.password = std::move(pw);
+        if (auto e = detail::readPasswordFile(c.passwordFile, c.password))
+            throw std::runtime_error("ClientConfig::passwordFile: " + *e);
     }
+    if (c.password.size() > kMaxPasswordBytes)
+        throw std::invalid_argument("ClientConfig: password longer than " + std::to_string(kMaxPasswordBytes) + " bytes");
     // Issues #14 / #113: credentials (a SCRAM proof, a verifier in security DDL) and the bootstrap material travel
     // only over TLS.  Without offerCrypto that is impossible: refused, never silently plaintext.
     const bool credentialed = !c.username.empty() || !c.password.empty() || c.securityBootstrapOnly;
@@ -228,7 +229,8 @@ Client::Client(ClientConfig cfg)
 {
     // Review B M4: the agent's sessions hold the credential from here on (one owner, wiped when replaced); the Client's
     // own copy is not kept.
-    if (!cfg_.password.empty()) { detail::secureZero(cfg_.password.data(), cfg_.password.size()); cfg_.password.clear(); }
+    detail::wipeString(cfg_.password);
+    detail::wipeString(cfg.password);   // the moved-from parameter may keep short contents in place
     if (cfg_.traceDdlRetries) ddlRetryNotes_.reserve(kMaxDdlRetryNotes);   // push_back never reallocates on the duty thread
     // #514: the silent-leader scan runs four times per keepalive interval.
     silentCheckPeriodNs_ = (cfg_.keepaliveIntervalNs > 0 ? cfg_.keepaliveIntervalNs
@@ -2490,9 +2492,8 @@ void Client::failAllControl_(OpStatus st) {
 }
 
 void Client::installSelfPassword_(std::string_view newPassword) noexcept {
-    if (!cfg_.password.empty()) detail::secureZero(cfg_.password.data(), cfg_.password.size());
-    cfg_.password.assign(newPassword);
-    agent_.installPassword(newPassword);   // every session's config, the salted-password cache, the one-time flag
+    // Every session's secret, the salted-password cache, the one-time flag.  The Client keeps no copy (#56).
+    (void)agent_.installPassword(newPassword);   // unreachable refusal: buildVerifier refuses > kMaxPasswordBytes
 }
 
 void Client::failAllControlWithCode_(uint16_t errorCode, std::string_view text) {

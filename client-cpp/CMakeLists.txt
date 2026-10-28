@@ -1769,7 +1769,7 @@ if(BUILD_TESTING)
         tests/RuneConsoleOfflineTest.cpp
     )
     target_include_directories(rune_cli_offline_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/cli)   # QlEngine.h / CliSupport.h (internal)
-    target_link_libraries(rune_cli_offline_tests PRIVATE rune_cli_lib GTest::gtest_main)
+    target_link_libraries(rune_cli_offline_tests PRIVATE rune_cli_lib GTest::gtest_main $<$<PLATFORM_ID:Linux>:util>)
     target_compile_features(rune_cli_offline_tests PRIVATE cxx_std_23)
     gtest_discover_tests(rune_cli_offline_tests)
 endif()

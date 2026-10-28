@@ -4,8 +4,8 @@
 //   RUNE_USER           — the principal to log in as ("" / unset = no credentials: an authenticated broker answers
 //                         AuthenticationFailed, a dev-mode broker (RUNE_AUTH=disabled) is then refused only by a
 //                         credentialed client, never by this one)
-//   RUNE_PASSWORD_FILE  — a file holding the password (read once at Client construction; a trailing newline is
-//                         stripped).  A password is never accepted from the environment or the command line.
+//   RUNE_PASSWORD_FILE  — a file holding the password (read once at Client construction; mode 0600/0400, at
+//                         most 1024 bytes, only a trailing CR/LF is stripped).  A password is never accepted from the environment or the command line.
 //   RUNE_TLS_CA_FILE    — a PEM CA bundle to trust instead of the system store (issue #13: the CLI's --tls-ca)
 //   RUNE_TLS_HOST       — the certificate name to check ("" / unset = each session checks its endpoint's host)
 // Credentials travel only over TLS (issue #14): with RUNE_USER, or either TLS variable, the example offers TLS and,

@@ -173,6 +173,21 @@ TEST(RuneCliSecurityRegression, BootstrapRequiresAClusterKeyFile) {
     EXPECT_NE(bad.err.find("cannot read"), std::string::npos);
 }
 
+TEST(RuneCliSecurityRegression, BootstrapRefusesAGroupReadablePasswordFileRegression) {
+    EnvGuard g("RUNE_CLUSTER_KEY_FILE", nullptr);
+    const std::string key = tmpPath("pwmode.key").string();
+    const std::string pw  = tmpPath("pwmode.pw").string();
+    { std::ofstream(key, std::ios::binary) << std::string(64, 'a'); }
+    ::chmod(key.c_str(), 0600);
+    { std::ofstream(pw, std::ios::binary) << "a-one-time-password-24c\n"; }
+    ::chmod(pw.c_str(), 0644);
+    const CliRun r = runCli({"security", "bootstrap", "--admin", "a", "--cluster-key-file", key, "--password-file", pw,
+                             "--broker", "x:1"});
+    EXPECT_EQ(r.code, 1);
+    EXPECT_NE(r.err.find("group or others"), std::string::npos) << r.err;
+    EXPECT_EQ(r.err.find("a-one-time-password"), std::string::npos) << "the password is never echoed";
+}
+
 TEST(RuneCliSecurityRegression, TheOneTimePasswordIs24UnbiasedAlphanumerics) {
     std::set<std::string> seen;
     std::array<int, 128> histogram{};

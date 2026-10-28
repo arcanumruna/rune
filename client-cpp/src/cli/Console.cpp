@@ -16,6 +16,8 @@
 
 #include "rune/ql/Parser.h"
 
+#include <rune/client/detail/SecureZero.h>
+
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
@@ -30,13 +32,18 @@
 #include <variant>
 #include <vector>
 
+#include <csignal>
 #include <poll.h>
 #include <termios.h>
 #include <unistd.h>
 
 namespace rune::cli::console {
 
+PollingFdLineSource::~PollingFdLineSource() { rune::client::detail::secureZero(buf_.data(), buf_.size()); }
+
 bool PollingFdLineSource::next(std::string& line) {
+    // The buffer may hold a password literal (CREATE USER ... PASSWORD '...'): every byte that leaves it is zeroed.
+    const auto wipeFrom = [this](std::size_t from, std::size_t n) { rune::client::detail::secureZero(buf_.data() + from, n); };
     for (;;) {
         const auto end = buf_.begin() + static_cast<std::ptrdiff_t>(len_);
         if (const auto nl = std::find(buf_.begin(), end, '\n'); nl != end) {
@@ -44,17 +51,20 @@ bool PollingFdLineSource::next(std::string& line) {
             if (discarding_) {
                 discarding_ = false;
                 std::memmove(buf_.data(), buf_.data() + used, len_ - used);
+                wipeFrom(len_ - used, used);
                 len_ -= used;
                 continue;
             }
             line.assign(buf_.begin(), nl);
             if (!line.empty() && line.back() == '\r') line.pop_back();
             std::memmove(buf_.data(), buf_.data() + used, len_ - used);
+            wipeFrom(len_ - used, used);
             len_ -= used;
             return true;
         }
-        if (discarding_) len_ = 0;   // no newline yet: the over-long line goes on, drop what we hold
+        if (discarding_) { wipeFrom(0, len_); len_ = 0; }   // no newline yet: the over-long line goes on, drop what we hold
         if (len_ == buf_.size()) {
+            wipeFrom(0, len_);
             len_        = 0;
             discarding_ = true;
             if (err != nullptr) *err << "error: input line too long (64 KiB); the line was discarded\n";
@@ -76,11 +86,102 @@ bool PollingFdLineSource::next(std::string& line) {
         if (got <= 0) {
             if (len_ == 0 || discarding_) return false;
             line.assign(buf_.begin(), buf_.begin() + static_cast<std::ptrdiff_t>(len_));   // a last line without '\n'
+            wipeFrom(0, len_);
             len_ = 0;
             return true;
         }
         len_ += static_cast<std::size_t>(got);
     }
+}
+
+bool readPasswordLine(int fd, std::string& password) {
+    namespace cd = rune::client::detail;
+    char buf[cd::kMaxPasswordBytes + 1];
+    struct Wipe { char* b; ~Wipe() { cd::secureZero(b, sizeof buf); } } wipe{buf};
+    password.clear();
+    std::size_t n = 0;
+    bool ok = false;
+    bool over = false;
+    for (;;) {   // byte-wise: nothing of the following input is consumed
+        char c = 0;
+        const ssize_t got = ::read(fd, &c, 1);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) { ok = n > 0; break; }
+        if (c == '\n') { ok = true; break; }
+        if (c == '\r') continue;
+        if (n == cd::kMaxPasswordBytes) { over = true; continue; }   // over the cap: keep reading to the end of the line
+        buf[n++] = c;
+    }
+    if (over) return false;
+    password.assign(buf, n);   // one allocation, no growth copies
+    return ok;
+}
+
+namespace {
+// The one place a signal handler needs file-scope state: it must put the terminal back before the process dies or
+// stops, and a handler can reach nothing but globals.  Written only by promptPasswordOnFd, before the handlers go in.
+termios                g_savedTermios{};
+termios                g_quietTermios{};
+volatile sig_atomic_t  g_promptFd = -1;
+struct sigaction       g_oldInt{}, g_oldTerm{}, g_oldHup{}, g_oldTstp{};
+struct sigaction       g_ours{};
+
+void restoreTerminalOnSignal(int sig) {
+    const int fd = g_promptFd;
+    if (fd >= 0) ::tcsetattr(fd, TCSANOW, &g_savedTermios);
+    sigset_t unblock;
+    sigemptyset(&unblock);
+    sigaddset(&unblock, sig);
+    if (sig == SIGTSTP) {
+        ::sigaction(SIGTSTP, &g_oldTstp, nullptr);
+        ::sigprocmask(SIG_UNBLOCK, &unblock, nullptr);
+        ::raise(SIGTSTP);   // stops here until SIGCONT
+        if (fd >= 0) ::tcsetattr(fd, TCSANOW, &g_quietTermios);
+        ::sigaction(SIGTSTP, &g_ours, nullptr);
+        return;
+    }
+    const struct sigaction* old = sig == SIGINT ? &g_oldInt : sig == SIGTERM ? &g_oldTerm : &g_oldHup;
+    ::sigaction(sig, old, nullptr);
+    ::sigprocmask(SIG_UNBLOCK, &unblock, nullptr);
+    ::raise(sig);
+}
+} // namespace
+
+bool promptPasswordOnFd(int fd, const std::string& user, std::string& password, std::ostream& err) {
+    termios saved{};
+    const bool haveTermios = ::tcgetattr(fd, &saved) == 0;
+    struct Restore {
+        bool on; int fd; const termios& t;
+        ~Restore() {
+            if (!on) return;
+            ::sigaction(SIGINT, &g_oldInt, nullptr);
+            ::sigaction(SIGTERM, &g_oldTerm, nullptr);
+            ::sigaction(SIGHUP, &g_oldHup, nullptr);
+            ::sigaction(SIGTSTP, &g_oldTstp, nullptr);
+            ::tcsetattr(fd, TCSANOW, &t);
+            g_promptFd = -1;
+        }
+    } restore{haveTermios, fd, saved};
+    if (haveTermios) {
+        g_savedTermios = saved;
+        g_quietTermios = saved;
+        g_quietTermios.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+        g_promptFd = fd;
+        // Handlers first, then echo off: a signal at any point finds the terminal restorable.  No SA_RESTART: a read
+        // interrupted by a stop / continue returns EINTR and readPasswordLine retries it.
+        g_ours = {};
+        g_ours.sa_handler = &restoreTerminalOnSignal;
+        sigemptyset(&g_ours.sa_mask);
+        ::sigaction(SIGINT, &g_ours, &g_oldInt);
+        ::sigaction(SIGTERM, &g_ours, &g_oldTerm);
+        ::sigaction(SIGHUP, &g_ours, &g_oldHup);
+        ::sigaction(SIGTSTP, &g_ours, &g_oldTstp);
+        ::tcsetattr(fd, TCSANOW, &g_quietTermios);
+    }
+    err << "password for " << user << ": " << std::flush;
+    const bool ok = readPasswordLine(fd, password);
+    err << "\n";
+    return ok;
 }
 
 namespace {
@@ -178,6 +279,12 @@ int parseConsoleOptions(const std::vector<std::string>& args, ConsoleOptions& o,
 
 struct PreparedStatement { engine::Prepared p; std::string text; };
 
+/// Wipes the statement texts of a batch (they may hold password literals) when it goes out of scope.
+struct BatchWipe {
+    std::vector<PreparedStatement>& v;
+    ~BatchWipe() { for (auto& st : v) rune::client::detail::wipeString(st.text); }
+};
+
 /// Parse + prepare every statement of `src`.  false (message on err, prefixed by `origin`) when any
 /// statement fails: nothing of `src` runs (DD6).
 bool prepareAll(std::string_view origin, std::string_view src, const engine::PrepareOptions& opts,
@@ -192,7 +299,11 @@ bool prepareAll(std::string_view origin, std::string_view src, const engine::Pre
         err << e.error.line << ":" << e.error.col << ": " << e.error.message << "\n";
         return false;
     }
-    const std::vector<std::string> texts = engine::splitStatements(src);
+    std::vector<std::string> texts = engine::splitStatements(src);
+    struct TextsWipe {   // statement texts may hold password literals
+        std::vector<std::string>& v;
+        ~TextsWipe() { for (auto& t : v) rune::client::detail::wipeString(t); }
+    } textsWipe{texts};
     if (texts.size() != parsed->size()) {
         err << "rune console: internal error: statement splitter found " << texts.size() << " statements, the parser "
             << parsed->size() << "; nothing was executed\n";
@@ -224,6 +335,7 @@ int runBatch(Exec& exec, const std::vector<PreparedStatement>& batch, std::size_
 template <class Exec>
 int runScript(Exec& exec, const ConsoleOptions& o, std::string_view src, std::ostream& err) {
     std::vector<PreparedStatement> batch;
+    BatchWipe batchWipe{batch};
     if (!prepareAll(o.scriptPath, src, o.prep, batch, err)) return 1;
     return runBatch(exec, batch, 1);
 }
@@ -257,6 +369,13 @@ int runInteractive(Exec& exec, const ConsoleOptions& o, LineSource& in, std::ost
     ReplState state = AwaitingStatement{};
     std::string line;
     std::size_t index = 1;
+    struct ReplWipe {   // the typed text may hold a password literal: nothing of it outlives the session
+        ReplState& st; std::string& line;
+        ~ReplWipe() {
+            rune::client::detail::wipeString(line);
+            if (auto* c = std::get_if<ContinuingStatement>(&st)) rune::client::detail::wipeString(c->text);
+        }
+    } replWipe{state, line};
     for (;;) {
         out << (std::holds_alternative<AwaitingStatement>(state) ? kPrompt : kContinuationPrompt) << std::flush;
         if (!in.next(line)) {
@@ -266,9 +385,13 @@ int runInteractive(Exec& exec, const ConsoleOptions& o, LineSource& in, std::ost
             return 0;
         }
         std::string text;
-        if (auto* c = std::get_if<ContinuingStatement>(&state)) text = std::move(c->text);
-        else if (isExitCommand(line)) return 0;
+        struct TextWipe { std::string& s; ~TextWipe() { rune::client::detail::wipeString(s); } } textWipe{text};
+        if (auto* c = std::get_if<ContinuingStatement>(&state)) {
+            text = std::move(c->text);
+            rune::client::detail::wipeString(c->text);
+        } else if (isExitCommand(line)) return 0;
         text += line;
+        rune::client::detail::wipeString(line);   // consumed into `text`
         text += '\n';
         switch (rune::ql::classifyInput(text)) {
             case rune::ql::InputState::Empty: state = AwaitingStatement{}; break;
@@ -276,6 +399,7 @@ int runInteractive(Exec& exec, const ConsoleOptions& o, LineSource& in, std::ost
             case rune::ql::InputState::Complete: {
                 state = AwaitingStatement{};
                 std::vector<PreparedStatement> batch;
+                BatchWipe batchWipe{batch};
                 if (prepareAll({}, text, o.prep, batch, err)) {
                     (void)runBatch(exec, batch, index);   // DD7: a failure skips the rest of this input
                     index += batch.size();
@@ -346,30 +470,7 @@ void pumpClient(void* ctx) noexcept {
 
 /// Reads a password from the terminal with echo off; the terminal is restored on every path.  false on EOF / error.
 bool promptPassword(const std::string& user, std::string& password, std::ostream& err) {
-    termios saved{};
-    const bool haveTermios = ::tcgetattr(STDIN_FILENO, &saved) == 0;
-    if (haveTermios) {
-        termios quiet = saved;
-        quiet.c_lflag &= ~static_cast<tcflag_t>(ECHO);
-        ::tcsetattr(STDIN_FILENO, TCSANOW, &quiet);
-    }
-    struct Restore {
-        bool on; const termios& t;
-        ~Restore() { if (on) ::tcsetattr(STDIN_FILENO, TCSANOW, &t); }
-    } restore{haveTermios, saved};
-    err << "password for " << user << ": " << std::flush;
-    password.clear();
-    bool ok = false;
-    for (;;) {   // byte-wise: nothing of the following input is consumed
-        char c = 0;
-        const ssize_t n = ::read(STDIN_FILENO, &c, 1);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) { ok = !password.empty(); break; }
-        if (c == '\n') { ok = true; break; }
-        if (c != '\r') password.push_back(c);
-    }
-    err << "\n";
-    return ok;
+    return promptPasswordOnFd(STDIN_FILENO, user, password, err);
 }
 
 struct LiveInput {
@@ -395,7 +496,7 @@ int runLiveSession(const ConsoleOptions& opts, std::string_view script, const Li
     std::string password;
     struct Wipe {
         std::string& s;
-        ~Wipe() { if (!s.empty()) rune::client::detail::secureZero(s.data(), s.size()); }
+        ~Wipe() { rune::client::detail::wipeString(s); }
     } wipe{password};
     if (!user.empty() && !havePasswordFile) {
         if (!(input.canPrompt && o.scriptPath.empty() && ::isatty(STDIN_FILENO)))
@@ -409,12 +510,8 @@ int runLiveSession(const ConsoleOptions& opts, std::string_view script, const Li
 
     engine::LiveBroker broker;
     const bool opened = broker.open(o.live, err);
-    if (!password.empty()) {
-        rune::client::detail::secureZero(password.data(), password.size());
-        password.clear();
-    }
-    if (!o.live.password.empty()) rune::client::detail::secureZero(o.live.password.data(), o.live.password.size());
-    o.live.password.clear();
+    rune::client::detail::wipeString(password);
+    rune::client::detail::wipeString(o.live.password);
     if (!opened) return 1;
     if (broker.client().authStatus().kind == rune::client::AuthStatus::Kind::PasswordChangeRequired)
         err << "WARNING: password change required — run ALTER USER " << broker.client().authStatus().user
@@ -460,6 +557,7 @@ int cmdConsole(const std::vector<std::string>& args, std::istream& in, std::ostr
     ConsoleOptions o;
     if (const int rc = parseConsoleOptions(args, o, err); rc != 0) return rc;
     std::string script;
+    struct ScriptWipe { std::string& s; ~ScriptWipe() { rune::client::detail::wipeString(s); } } scriptWipe{script};
     if (!o.scriptPath.empty() && !engine::readScript(o.scriptPath, in, script, err)) return 1;
     if (o.dryRun) {
         DryRunExecutor exec{out, o.requestIdBase};

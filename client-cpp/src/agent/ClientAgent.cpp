@@ -65,7 +65,7 @@ int32_t ringTotalBytes(int32_t cap) noexcept {
 // ---------------------------------------------------------------------------
 
 ClientAgent::ClientAgent(AgentConfig cfg)
-    : cfg_(cfg)
+    : cfg_(std::move(cfg))
     , transport_(cfg_.transport)
     , ringBuf_(makeAlignedBuffer(
           static_cast<std::size_t>(ringTotalBytes(cfg_.ringCapacity)),
@@ -73,6 +73,10 @@ ClientAgent::ClientAgent(AgentConfig cfg)
     , ring_(ringBuf_.get(), static_cast<std::size_t>(ringTotalBytes(cfg_.ringCapacity)))
     , egressObserver_(nullptr)
 {
+    if (!secret_.assign(cfg_.session.password))
+        throw std::invalid_argument("password longer than " + std::to_string(detail::FixedSecret::kCapacity) + " bytes");
+    detail::wipeString(cfg_.session.password);
+    detail::wipeString(cfg.session.password);   // the moved-from parameter may keep short contents in place
     mnDebug_ = std::getenv("RUNE_MN_DEBUG") != nullptr;
     produceAcks_.reserve(static_cast<std::size_t>(cfg_.egressPollLimit) * 4);
     // Seed the endpoint-keyed session collection with the seed session
@@ -85,6 +89,7 @@ ClientAgent::ClientAgent(AgentConfig cfg)
     sessions_.emplace_back(std::make_unique<Session>(
         this, seedCfg, cfg_.transport.ingressChannel));
     sessions_.back()->machine.useScramCache(&scramCache_);   // authentication: one salted-password cache per duty thread
+    sessions_.back()->machine.useSharedSecret(&secret_);
 }
 
 // ---------------------------------------------------------------------------
@@ -1273,6 +1278,7 @@ Session& ClientAgent::openSession_(const std::string& endpoint) noexcept {
     sessions_.emplace_back(std::make_unique<Session>(this, std::move(scfg), endpoint));
     Session& s = *sessions_.back();
     s.machine.useScramCache(&scramCache_);   // authentication: PBKDF2 once per verifier, not once per session
+    s.machine.useSharedSecret(&secret_);
     // On the duty clock (the clock tick() runs on), never steady_clock: with an
     // injected nanoClock the two are different domains and the connect's
     // fast-retry / timeout would never (or only much later) come due.
