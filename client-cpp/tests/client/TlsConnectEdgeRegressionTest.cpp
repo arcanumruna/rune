@@ -701,3 +701,33 @@ TEST(TlsConnectEdgeRegression, APlaintextEpisodeAfterAnEncryptedOneReadsClearFra
     ASSERT_TRUE(r.within(10'000, [&] { return rec.ready(); })) << "a clear frame of a plaintext episode was dropped";
     EXPECT_EQ(rec.status(), OpStatus::Ok) << rec.describe();
 }
+
+// #426 review — FAILING (not committed).  Encrypted episode A, then a PLAINTEXT episode with a NEW id: the retired
+// marker is cleared unconditionally at that Connected edge, so the broker's late ack for A (sealed under A's key,
+// naming A's id, which no plaintext session holds) is read in clear.  Only a plaintext resume of the SAME id may clear it.
+TEST(TlsConnectEdgeRegression, APlaintextEpisodeWithANewIdNeverReadsTheOldSealedAckAdversarialRegression) {
+    StaleRig r(/*newIdOnResume=*/true);
+    test_support::TestCq cq(*r.client);
+    r.connect(cq);
+    r.gw->holdPartitions.insert(0);
+    ProducerConfig pcfg;
+    pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    pcfg.produceTimeoutMs = 600'000; pcfg.deliveryTimeoutMs = 600'000;
+    auto p = r.client->producer(pcfg);
+    const std::vector<uint8_t> val = {1, 2, 3};
+    auto rec = cq.send(p, r.client->topic("t"), Key(kStaleBase), std::span<const uint8_t>(val));
+    ASSERT_TRUE(r.within(5'000, [&] { return !r.gw->held.empty(); }));
+    const auto staleA = r.gw->held.front();
+    const int64_t sidA = staleA.sessionId;
+    const int connectsBefore = r.gw->connects;
+    r.gw->tlsCertPem.clear();   // the next episode is plaintext
+    // A's ack (sealed under A's key) arrives right AFTER the plaintext ConnectResponse, before the batch is resent.
+    r.gw->ackAfterNextConnect.push_back(staleA);
+    r.gw->replyPongs = false;
+    ASSERT_TRUE(r.within(30'000, [&] { return r.gw->connects > connectsBefore; })) << "no new connect episode";
+    r.gw->replyPongs = true;
+    ASSERT_TRUE(r.within(5'000, [&] { return r.client->state() == rcs::SessionState::Connected &&
+                                             r.gw->lastUniqueSessionId() != sidA; }));
+    r.within(200, [] { return false; });
+    EXPECT_FALSE(rec.ready()) << "an ack sealed under episode A's key was read in clear: " << rec.describe();
+}

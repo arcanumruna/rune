@@ -1593,7 +1593,7 @@ private:
         // (onSealedFrameOpened) - an optimistic Connected followed by a final-leg failure keeps its growing delay.
         if (!cryptoState_.encrypted) {
             backoff_ = {};
-            retiredSealedSid_ = 0;     // #426: a plaintext episode: frames naming the old id are legitimately clear
+            if (sessionId_ == retiredSealedSid_) retiredSealedSid_ = 0;   // #426: a plaintext episode resuming the SAME id: its frames are legitimately clear; a new id never reads the old sealed ack
         }
         lastConnectError_    = 0;      // I2: refused attempts are history now
         transitionTo(SessionState::Connected);
