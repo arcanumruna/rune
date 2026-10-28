@@ -70,6 +70,10 @@ Decisions:
   `sessionId` on that worker's ingress) instead of a channel string. The worker creates the response publication
   itself on its own thread, so it stays single-writer, and resolves it with the same bounded resolve as
   `WorkerEgress`.
+- **D6a.** **Worker binding is token-proven** (decided 2026-10-28). The gateway returns a 16-byte random bind token in
+  the v16 ConnectResponse; the client sends it in `WorkerBind` as the first frame on each worker ingress; the worker binds
+  that image once and refuses produce for the session from any other image. Without it a guessed session id would
+  redirect another client's Records.
 - **D7.** **Client.**
   - The `AeronTransport` creates one response subscription per broker endpoint before the request publication.
   - `ClientConfig::egressChannel` stays for older brokers (a broker below the version answers with the declared

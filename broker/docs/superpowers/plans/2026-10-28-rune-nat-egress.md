@@ -122,6 +122,14 @@ See spec §5.
   publication (the client's ingress to that worker) correlates exactly one response subscription, so acks and
   Records cannot ride separate response flows.
 - A subscribe that arrives before its response publication resolves parks, as #118's `AwaitingEgress` does today.
+- **Binding (decided 2026-10-28):** session ids are sequential, so a worker never binds a session to whoever first
+  names it. The gateway draws a 16-byte random bind token per response-mode shard session and returns it in a v16
+  ConnectResponse tail (on the gateway response publication, so only that client sees it). `SessionAnnouncer` ships the
+  token, not a channel. The client sends `WorkerBind{sessionId, correlationId, token}` (TemplateId 86) as the first
+  frame on each worker ingress it uses. The worker binds that image once (a second bind never rebinds), opens the
+  response publication on its own response-control port, and drops produce frames for the session from any other
+  image. Records for the session use that publication and park until it resolves; they never fall back to the MDC.
+  `PartitionEntry.responseControlPort` is filled for v16 clients.
 - **Tests:**
   - `ResponseEgressWorkerRegression.*`: acks and Records reach a new client on response publications only;
   - a park-then-resolve subscribe;
