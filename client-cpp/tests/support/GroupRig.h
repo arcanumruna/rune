@@ -127,6 +127,15 @@ struct GroupRig {
     }
     void connect() {
         ASSERT_TRUE(drive([&] { return gw.ready(); }));
+        // #676: the ingress publication connects in REAL time while the SessionMachine's connect retry and deadline
+        // run on the duty clock; with the clock frozen the handshake cannot expire before Aeron is connected.
+        {
+            const int64_t step = opt.stepNs;
+            opt.stepNs         = 0;
+            const bool up      = drive([&] { return client.testTransport().ingressConnected(); }, 2'000'000);
+            opt.stepNs         = step;
+            ASSERT_TRUE(up) << "the client's ingress publication never connected";
+        }
         const rc::Token t = nextToken++;
         ASSERT_EQ(client.connect(cq, t), rc::OpResult::Accepted);
         bool ok = false;

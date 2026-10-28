@@ -344,8 +344,9 @@ void GroupConsumerHub::startRewind_(GroupConsumerImpl* impl, OpKind kind, const 
 }
 
 // #685: a fetch in flight died with its session: the answer can never come - re-send on the first pass after reconnect.
-// offsetFetchCorrId is kept on purpose: an answer still arriving from the old session is fenced by its session id.
+// The fence against an answer from the dropped session is clearing the correlation id (answers match by it only).
 static void resetOffsetFetch_(GroupConsumerImpl& impl) noexcept {
+    impl.offsetFetchCorrId    = 0;   // #685: an answer from the dropped session no longer matches; the fetch is re-sent on the new session
     impl.offsetFetchPhase     = GroupConsumerImpl::OffsetFetchPhase::Idle;
     impl.offsetFetchDueNs     = 0;
     impl.offsetFetchBackoffNs = 0;

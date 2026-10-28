@@ -58,7 +58,7 @@ namespace {
 // #676: an injected duty clock for the metadata-timer tests (single test thread).
 int64_t g_routingClockNs = 1'000'000'000LL;
 int64_t routingClock() noexcept { return g_routingClockNs; }
-RigOptions routingClockOptions(int64_t stepNs = 10'000) {
+RigOptions routingClockOptions(int64_t stepNs = 1'000'000) {
     RigOptions o;
     g_routingClockNs = 1'000'000'000LL;
     o.nanoClock      = &routingClock;
@@ -1325,7 +1325,6 @@ TEST(GroupRoutingRegression, OldLeaderNodeNeverPollsMetadataAndResumesAfterUpgra
     Consumed led;
     wire(gc, led);
     r.connect();
-    r.opt.stepNs = 1'000'000;   // #676: connected (real-time handshake needed fine steps); the window runs coarser
     ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
     r.gw.releaseJoins();
     ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr && r.gw.connectsAt[n1] > 0; }));
@@ -2776,7 +2775,6 @@ TEST(GroupRoutingRegression, MetadataIsAskedThroughALiveNodeSessionWhileTheSeedI
     r.gw.subscribeLeader = {{0, 0}, {1, n1}};
     r.gw.groupProtocol   = false;
     r.connect();
-    r.opt.stepNs = 1'000'000;   // #676: connected (real-time handshake needed fine steps); the window runs coarser
     PlainLedger led;
     auto s1 = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()}, led.handler(1));
     ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr && s1.subscriptionId() == r.subAt(1, n1)->subscriptionId; }))

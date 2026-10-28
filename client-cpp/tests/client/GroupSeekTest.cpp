@@ -1129,11 +1129,11 @@ bool reconnectAndFreeze(GroupRig& r, int connectsBefore, int cap = 200'000) {
 // #685 x protocol state (an answer of a dead session): seekToCommitted's OffsetFetch is in flight (held) when the
 // seed session drops; while it is down the group's committed offsets move (a transactional commit: 30 -> 44,
 // 55 -> 60).  After the reconnect the dead session's answer (30 / 55) arrives BEFORE the re-send.  It must not seed
-// anything: the partitions start from the re-sent fetch's answer (44 / 60).  RED: the answer is matched by
-// correlationId alone (offsetFetchCorrId survives resetOffsetFetch_), so it seeds 30 / 55 and records 30..43 and
+// anything: the partitions start from the re-sent fetch's answer (44 / 60).  Before the fix the answer was matched by
+// correlationId alone (offsetFetchCorrId survived resetOffsetFetch_), so it seeds 30 / 55 and records 30..43 and
 // 55..59 are re-delivered although they were committed.
-// C18 review finding (the fix round enables it): resetOffsetFetch_ must also forget offsetFetchCorrId.
-TEST(GroupSeekRegression, DISABLED_ADeadSessionsOffsetFetchAnswerNeverSeedsAfterTheReconnectAdversarialRegression) {
+// Fix: resetOffsetFetch_ forgets offsetFetchCorrId.
+TEST(GroupSeekRegression, ADeadSessionsOffsetFetchAnswerNeverSeedsAfterTheReconnectAdversarialRegression) {
     Fixture f(5725, 5726, {{kTopic, 0}, {kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000),
               {{{kTopic, 0}, 30}, {{kTopic, 1}, 55}}, manualClockOptions());
     f.r.gw.holdOffsetFetch = true;
