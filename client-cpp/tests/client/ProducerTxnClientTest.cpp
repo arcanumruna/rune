@@ -8,6 +8,7 @@
 #include <rune/client/TypedTopic.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/producer/ProducerRef.h>
+#include <rune/protocol/client/TxnMessages.h>
 #include <rune/codec/Serialize.h>
 
 #include "gen/position.gen.h"
@@ -19,6 +20,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <map>
 #include <memory>
 #include <span>
@@ -26,6 +28,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace rc = rune::client;
@@ -777,4 +782,485 @@ TEST(CoordinatorLinkRegression, ReconnectWithTheSameSessionIdResendsInFlightRequ
     ASSERT_TRUE(r.await(cq, 105)) << "the in-flight request was not re-sent (addOffsets " << r.gw.addOffsets << ")";
     EXPECT_GT(r.gw.addOffsets, before);
     EXPECT_EQ(r.got[105].status, rc::OpStatus::Ok);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// #350: the control-op handle paths (Thread mode CQ credit, begin back-pressure, begin after an unfinished end)
+// ---------------------------------------------------------------------------------------------------------------
+namespace {
+/// Parks the Thread-mode runner INSIDE a completion callback until opened, so the producer ring cannot drain: the
+/// test thread then fills it deterministically (no timing, no sleeps).  Declare it BEFORE the rig and an Opener AFTER
+/// it, so the runner is always released before the Client closes.
+struct RunnerGate {
+    std::promise<void>       entered;
+    std::promise<void>       release;
+    std::shared_future<void> releaseF = release.get_future().share();
+    bool                     opened   = false;
+    static void on(void* ctx, const rc::Completion&, std::span<const uint8_t>) noexcept {
+        auto* g = static_cast<RunnerGate*>(ctx);
+        g->entered.set_value();
+        g->releaseF.wait();
+    }
+    [[nodiscard]] rc::CompletionHandler handler() noexcept { return rc::CompletionHandler{&RunnerGate::on, this}; }
+    [[nodiscard]] bool waitEntered() { return entered.get_future().wait_for(std::chrono::seconds(10)) == std::future_status::ready; }
+    void open() {
+        if (!opened) {
+            opened = true;
+            release.set_value();
+        }
+    }
+};
+struct GateOpener {
+    RunnerGate& g;
+    ~GateOpener() { g.open(); }
+};
+
+/// Polls `cq` until `n` completions arrived (all kept, in order) or the pass cap is hit.
+bool collect(TxnRig& r, rc::Completions& cq, std::size_t n, std::vector<rc::Completion>& out, int cap = 200'000) {
+    for (int i = 0; i < cap && out.size() < n; ++i) {
+        if (r.invoker) r.client->doWork();
+        r.gw.pump();
+        cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) { out.push_back(c); });
+        if (!r.invoker) std::this_thread::yield();
+    }
+    return out.size() >= n;
+}
+}  // namespace
+
+// Thread mode: a control op refused for BackPressured (full ring) or Closed (after close) hands its CQ credit back.
+// RED (mutation): Producer::issueTxn_ without `q->unreserve(...)` on a refused issue -> the counters stay raised.
+TEST(ProducerTxnClientRegression, CqCreditReturnsOnBackPressuredAndClosedRegression) {
+    RunnerGate gate;
+    TxnRig     r(rc::RunnerMode::Thread);
+    GateOpener opener{gate};
+    r.connect();
+    rc::Producer    p = r.client->testProducerWithRingCap(txnCfg(), 64 * 1024);
+    rc::Completions cq(*r.client);
+    ASSERT_NO_FATAL_FAILURE(initAndBegin(r, p, cq));
+    ASSERT_EQ(cq.reservedBytes(), 0u);
+    ASSERT_EQ(cq.outstanding(), 0u);
+
+    // The runner is parked in the completion callback of a flush: the ring cannot drain from here on.
+    ASSERT_EQ(p.flush(gate.handler(), 900), rc::OpResult::Accepted);
+    ASSERT_TRUE(gate.waitEntered()) << "the blocker flush never completed";
+
+    // One accepted op holds credit while the ring fills with records (the credit baseline is NOT zero).
+    ASSERT_EQ(p.flush(cq, 1000), rc::OpResult::Accepted);
+    const uint32_t reservedBase    = cq.reservedBytes();
+    const uint32_t outstandingBase = cq.outstanding();
+    ASSERT_GT(reservedBase, 0u);
+    ASSERT_EQ(outstandingBase, 1u);
+    const rc::TopicHandle topic = r.client->topic("t");
+    const std::string     rec   = "fill";
+    rc::SendResult        sr    = rc::SendResult::Ok;
+    uint32_t              filled = 0;
+    for (int i = 0; i < 100'000 && sr == rc::SendResult::Ok; ++i) {
+        sr = p.trySend(topic, rc::Key(uint64_t{1}), bytesOf(rec));
+        if (sr == rc::SendResult::Ok) ++filled;
+    }
+    ASSERT_EQ(sr, rc::SendResult::BackPressured) << "the ring never filled (" << filled << " records)";
+    for (int i = 0; i < 3; ++i) {   // every refused kind: the credit it reserved comes straight back
+        EXPECT_EQ(p.flush(cq, 5000), rc::OpResult::BackPressured);
+        EXPECT_EQ(p.commitTransaction(cq, 5001), rc::OpResult::BackPressured);
+        EXPECT_EQ(p.abortTransaction(cq, 5002), rc::OpResult::BackPressured);
+        const rc::OffsetEntry e{1, 0, 5};
+        EXPECT_EQ(p.sendOffsetsToTransaction(std::span<const rc::OffsetEntry>(&e, 1), "g", cq, 5003), rc::OpResult::BackPressured);
+        EXPECT_EQ(cq.reservedBytes(), reservedBase) << "BackPressured kept CQ credit (round " << i << ")";
+        EXPECT_EQ(cq.outstanding(), outstandingBase);
+    }
+
+    // Release the runner: the one accepted op completes Ok exactly once and the credit drains to zero.
+    gate.open();
+    std::vector<rc::Completion> done;
+    ASSERT_TRUE(collect(r, cq, 1, done));
+    EXPECT_FALSE(collect(r, cq, 2, done, 2'000)) << "a second completion for the one op";
+    ASSERT_EQ(done.size(), 1u);
+    EXPECT_EQ(done[0].token, 1000u);
+    EXPECT_EQ(done[0].status, rc::OpStatus::Ok);
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+    EXPECT_EQ(cq.outstanding(), 0u);
+
+    // Closed: after the producer closed, a control op is refused Closed and keeps nothing.
+    ASSERT_EQ(p.close(cq, 7000), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.await(cq, 7000));
+    EXPECT_EQ(r.got[7000].status, rc::OpStatus::Ok);
+    const uint32_t reservedClosed    = cq.reservedBytes();
+    const uint32_t outstandingClosed = cq.outstanding();
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(p.flush(cq, 7100), rc::OpResult::Closed);
+        EXPECT_EQ(p.commitTransaction(cq, 7101), rc::OpResult::Closed);
+        EXPECT_EQ(p.abortTransaction(cq, 7102), rc::OpResult::Closed);
+        EXPECT_EQ(p.initTransactions(cq, 7103), rc::OpResult::Closed);
+        EXPECT_EQ(cq.reservedBytes(), reservedClosed) << "Closed kept CQ credit (round " << i << ")";
+        EXPECT_EQ(cq.outstanding(), outstandingClosed);
+    }
+    EXPECT_EQ(reservedClosed, 0u);
+}
+
+// The Completions-queue twin of ProducerTxnControlRegression.ControlOpAfterCloseCompletesClosedRegression (that one
+// uses handler targets on a bare rig): each op kind sits in the producer ring, closeImmediately() discards it, and the
+// token completes Closed exactly once into the queue, which gets its credit back.
+// RED (mutation): the ring-discard path of ProducerImpl completes the control op without the CQ delivery -> no token.
+TEST(ProducerTxnClientRegression, ControlOpAfterCloseCompletesClosedWithCqTargetRegression) {
+    enum class K { Init, SendOffsets, Commit, Abort, Flush };
+    for (const K kind : {K::Init, K::SendOffsets, K::Commit, K::Abort, K::Flush}) {
+        SCOPED_TRACE(static_cast<int>(kind));
+        TxnRig r(rc::RunnerMode::Invoker);
+        r.connect();
+        rc::Producer    p = r.client->testProducerWithRingCap(txnCfg(), 64 * 1024);   // Ring ingress: ops ride the ring
+        rc::Completions cq(*r.client);
+        const rc::OffsetEntry e{1, 0, 5};
+        const std::span<const rc::OffsetEntry> es(&e, 1);
+        auto issue = [&](rc::Token t) {
+            switch (kind) {
+            case K::Init:        return p.initTransactions(cq, t);
+            case K::SendOffsets: return p.sendOffsetsToTransaction(es, "g", cq, t);
+            case K::Commit:      return p.commitTransaction(cq, t);
+            case K::Abort:       return p.abortTransaction(cq, t);
+            case K::Flush:       return p.flush(cq, t);
+            }
+            return rc::OpResult::InvalidArgument;
+        };
+        ASSERT_EQ(issue(41), rc::OpResult::Accepted);
+        EXPECT_GT(cq.reservedBytes(), 0u);
+        ASSERT_EQ(cq.outstanding(), 1u);
+        ASSERT_EQ(p.closeImmediately(), rc::OpResult::Accepted);   // the ring is discarded by the next duty pass
+        std::vector<rc::Completion> done;
+        ASSERT_TRUE(collect(r, cq, 1, done));
+        EXPECT_EQ(done[0].token, 41u);
+        EXPECT_EQ(done[0].status, rc::OpStatus::Closed);
+        EXPECT_FALSE(collect(r, cq, 2, done, 2'000)) << "a second completion for the one op";
+        EXPECT_EQ(done.size(), 1u) << "exactly once";
+        EXPECT_EQ(cq.reservedBytes(), 0u) << "the credit came back";
+        EXPECT_EQ(cq.outstanding(), 0u);
+        // Issued after the close: refused, nothing completes later, no credit kept.
+        EXPECT_NE(issue(42), rc::OpResult::Accepted);
+        EXPECT_FALSE(collect(r, cq, 2, done, 2'000)) << "a completion for a refused op";
+        EXPECT_EQ(done.size(), 1u);
+        EXPECT_EQ(cq.reservedBytes(), 0u);
+        EXPECT_EQ(cq.outstanding(), 0u);
+    }
+}
+
+// beginTransaction() on a full ring waits for room (the duty cycle drains it) and then applies exactly once.
+// RED (mutation): Producer::beginTransaction() throws on BackPressured instead of waiting.
+TEST(ProducerTxnClientRegression, BeginTransactionWaitsOutBackPressureRegression) {
+    TxnRig r(rc::RunnerMode::Invoker);
+    r.connect();
+    rc::Producer          p = r.client->testProducerWithRingCap(txnCfg(), 4 * 1024);   // small ring: fills fast
+    rc::Completions       cq(*r.client);
+    const rc::TopicHandle topic = r.client->topic("t");
+    ASSERT_EQ(p.initTransactions(cq, 100), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.await(cq, 100));
+    ASSERT_EQ(r.got[100].status, rc::OpStatus::Ok);
+    ASSERT_TRUE(r.drive([&] { return p.state() == rc::TxnState::Ready; }));
+
+    // Nothing drains until the duty cycle runs: fill the ring with flush ops until the first BackPressured.
+    uint32_t accepted = 0;
+    rc::OpResult last = rc::OpResult::Accepted;
+    for (int i = 0; i < 20'000 && last == rc::OpResult::Accepted; ++i) {
+        last = p.flush(cq, static_cast<rc::Token>(1000 + i));
+        if (last == rc::OpResult::Accepted) ++accepted;
+    }
+    ASSERT_EQ(last, rc::OpResult::BackPressured) << "the ring never filled";
+    ASSERT_GT(accepted, 0u);
+    ASSERT_EQ(p.state(), rc::TxnState::Ready) << "begin has not run yet";
+
+    // begin's FIRST attempt meets the full ring; it pumps the duty cycle and retries.
+    EXPECT_NO_THROW(p.beginTransaction());
+    ASSERT_TRUE(r.drive([&] { return p.state() == rc::TxnState::InTransaction; })) << "begin never applied";
+    EXPECT_TRUE(p.transactionActive());
+
+    // The fillers completed exactly once each (a producer holds a bounded number of pending flushes: the rest are
+    // refused 19 at once), and the transaction is real and usable once.
+    std::vector<rc::Completion> done;
+    ASSERT_TRUE(collect(r, cq, accepted, done));
+    EXPECT_FALSE(collect(r, cq, accepted + 1, done, 2'000)) << "a filler completed twice";
+    EXPECT_EQ(done.size(), accepted);
+    uint32_t okFlushes = 0;
+    for (const auto& c : done) {
+        if (c.status == rc::OpStatus::Ok) {
+            ++okFlushes;
+        } else {
+            EXPECT_EQ(c.status, rc::OpStatus::BrokerError) << c.token;
+            EXPECT_EQ(c.errorCode, static_cast<uint16_t>(rune::protocol::client::ErrorCode::InvalidTxnState)) << c.token;
+        }
+    }
+    EXPECT_GE(okFlushes, 1u);
+    const std::string v = "after-begin";
+    ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), bytesOf(v)), rc::SendResult::Ok);
+    ASSERT_EQ(p.commitTransaction(cq, 101), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.await(cq, 101));
+    EXPECT_EQ(r.got[101].status, rc::OpStatus::Ok) << "errorCode " << r.got[101].errorCode;
+    EXPECT_EQ(strs(r.gw.committedValues(0)), (std::vector<std::string>{"after-begin"}));
+    EXPECT_EQ(r.gw.addPartitions, 1) << "one transaction began";
+    EXPECT_EQ(r.gw.endTxnCommits, (std::vector<uint8_t>{1})) << "and ended once";
+}
+
+// Thread mode: `commit(token); begin(); send()` WITHOUT waiting for the commit's completion.  beginTransaction() must
+// follow the previous end's completion (documented at beginTransaction()).  PINNED outcome: the ring is FIFO, so the
+// duty side applies the commit, then the begin while the machine is still Committing (refused: counted, void), then
+// the record behind it, which is outside any transaction (refused, never produced).  The record poisons the commit:
+// the EARLIER commit completes BrokerError(19 InvalidTxnState), nothing is committed, no EndTxn leaves, and the machine
+// is AbortableError until the app aborts; then begin / send / commit work as usual.
+// The runner is parked while the three calls are issued, so the ring order (not timing) decides.
+TEST(ProducerTxnClientRegression, BeginBeforeThePreviousEndCompletesIsRefusedRegression) {
+    RunnerGate gate;
+    TxnRig     r(rc::RunnerMode::Thread);
+    GateOpener opener{gate};
+    r.connect();
+    rc::Producer          p = r.client->producer(txnCfg());
+    rc::Completions       cq(*r.client);
+    const rc::TopicHandle topic = r.client->topic("t");
+    ASSERT_NO_FATAL_FAILURE(initAndBegin(r, p, cq));
+    ASSERT_EQ(p.flush(gate.handler(), 900), rc::OpResult::Accepted);
+    ASSERT_TRUE(gate.waitEntered());
+    const rc::Key     key(uint64_t{1});
+    const std::string first = "first", second = "second", third = "third";
+    ASSERT_EQ(p.trySend(topic, key, bytesOf(first)), rc::SendResult::Ok);
+    ASSERT_EQ(p.commitTransaction(cq, 201), rc::OpResult::Accepted);
+    ASSERT_NO_THROW(p.beginTransaction());
+    EXPECT_EQ(p.trySend(topic, key, bytesOf(second)), rc::SendResult::Ok) << "the app-side gate is open again";
+    gate.open();
+
+    ASSERT_TRUE(r.await(cq, 201));
+    EXPECT_EQ(r.got[201].status, rc::OpStatus::BrokerError) << "the EARLIER commit is the op that fails";
+    EXPECT_EQ(r.got[201].errorCode, static_cast<uint16_t>(rune::protocol::client::ErrorCode::InvalidTxnState));
+    ASSERT_TRUE(r.drive([&] { return p.state() == rc::TxnState::AbortableError; }));
+    settle(r);
+    EXPECT_EQ(r.gw.endTxns, 0) << "no EndTxn left the producer";
+    EXPECT_TRUE(r.gw.committedValues(0).empty()) << "nothing was committed";
+    EXPECT_EQ(p.state(), rc::TxnState::AbortableError);
+
+    // Recovery: abort completes Ok, a new transaction works.
+    ASSERT_EQ(p.abortTransaction(cq, 202), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.await(cq, 202));
+    EXPECT_EQ(r.got[202].status, rc::OpStatus::Ok);
+    ASSERT_TRUE(r.drive([&] { return p.state() == rc::TxnState::Ready; }));
+    p.beginTransaction();
+    ASSERT_EQ(p.trySend(topic, key, bytesOf(third)), rc::SendResult::Ok);
+    ASSERT_EQ(p.commitTransaction(cq, 203), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.await(cq, 203));
+    EXPECT_EQ(r.got[203].status, rc::OpStatus::Ok);
+    EXPECT_EQ(strs(r.gw.committedValues(0)), (std::vector<std::string>{"third"}));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// #363: the coordinator fallback, on the injected clock.
+//
+// The transaction coordinator is a remote node (NotCoordinator -> its own session).  When that session stays down for
+// more than 5 s (Client::kCoordDownFallbackNs) the route falls back to the seed, whose node names the current
+// coordinator, and the producer's in-flight request is re-offered on the new session with its original correlation id.
+// The only other test of this is a ~17 s real-broker timing test.  Here one Client (Invoker, UDP sessions to two
+// fake nodes) runs on ClientConfig::nanoClock: the clock moves only where the test moves it.
+// ---------------------------------------------------------------------------------------------------------------
+namespace {
+
+int64_t g_fbNow = 0;
+int64_t fbNow() noexcept { return g_fbNow; }
+constexpr int64_t kFbGraceNs = 5'000'000'000LL;   // Client::kCoordDownFallbackNs (private): the documented 5 s
+
+int fbFreePort() {
+    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in a{};
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port        = 0;
+    (void)::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
+    socklen_t len = sizeof a;
+    (void)::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
+    ::close(fd);
+    return ntohs(a.sin_port);
+}
+std::string fbUdp(int port) { return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port); }
+
+struct FallbackRig {
+    int                          seedPort;
+    int                          nodePort;
+    rc::ClientConfig             cfg;
+    rc::Client                   client;
+    test_support::InvokerGateway gw;
+    int                          node = -1;   // the coordinator's endpoint
+    rc::Completions              cq{client};
+    std::map<rc::Token, rc::Completion> got;
+
+    static rc::ClientConfig makeCfg(int32_t in, int32_t eg, int seedPort) {
+        rc::ClientConfig c;
+        c.gatewayChannel  = fbUdp(seedPort);
+        c.gatewayStreamId = in;
+        c.egressChannel   = "aeron:ipc";
+        c.egressStreamId  = eg;
+        c.dataDir         = std::string(std::filesystem::temp_directory_path().string() + "/f_coordfb_") + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+        g_sweeper.dirs.push_back(c.dataDir);
+        c.runnerMode      = rc::RunnerMode::Invoker;
+        c.nanoClock       = &fbNow;
+        c.connectTimeoutMs = 3000;   // below the 5 s grace: a silent coordinator session stays Connecting, never Backoff
+        // Nothing else may time out inside the 5 s windows the test jumps over.
+        c.responseTimeoutNs = 3'600'000'000'000LL;
+        c.pingTimeoutMs     = 3'600'000;
+        rc::TopicSpec ts;
+        ts.name           = "t";
+        ts.topicId        = 1;
+        ts.partitionCount = 1;
+        c.topics.push_back(ts);
+        return c;
+    }
+    explicit FallbackRig(int32_t in, int32_t eg)
+        : seedPort(fbFreePort()), nodePort(fbFreePort()), cfg(makeCfg(in, eg, seedPort)), client(cfg),
+          gw(cfg.dataDir + "/aeron", cfg.gatewayChannel, in, cfg.egressChannel, eg) {
+        gw.brokerHost       = "127.0.0.1";
+        gw.brokerPort       = seedPort;
+        gw.uniqueSessionIds = true;
+        gw.replyPongs       = true;
+        gw.replyFromArrival = true;
+        node = gw.addEndpoint(fbUdp(nodePort), in);
+        gw.nodeOfEndpoint[node] = node;
+        gw.moreBrokers           = {{1, "127.0.0.1", nodePort}};
+        gw.partitions            = {{1, 0, 0, 1, in, ""}};   // the data leader is the seed node
+        gw.coordinatorEndpoint   = node;                       // the transaction coordinator is the other node
+        gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(nodePort);
+        gw.idempotence           = true;
+        gw.initPidReply          = true;
+        gw.replyTxn              = true;
+        g_fbNow                  = 1'000'000'000'000LL;
+    }
+    ~FallbackRig() { client.close(); }
+
+    /// One pass; the clock moves by `advanceNs` first.
+    void step(int64_t advanceNs = 0) {
+        g_fbNow += advanceNs;
+        client.doWork();
+        gw.pump();
+        cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) { got[c.token] = c; });
+    }
+    template <class P>
+    bool drive(P&& pred, int cap = 2'000'000, int64_t advancePerStepNs = 5'000) {
+        for (int i = 0; i < cap; ++i) {
+            step(advancePerStepNs);
+            if (pred()) return true;
+        }
+        return false;
+    }
+    void passes(int n) {
+        for (int i = 0; i < n; ++i) step(0);
+    }
+    /// Moves the clock to `target` in 250 ms legs (each with a few real passes), so no single jump stalls a session.
+    void advanceTo(int64_t target) {
+        while (g_fbNow + 250'000'000LL < target) {
+            g_fbNow += 250'000'000LL;
+            passes(8);
+        }
+        g_fbNow = target;
+        passes(8);
+    }
+    [[nodiscard]] uint32_t coordIdx() const { return client.testCoordinatorSessionIndex(); }
+    [[nodiscard]] rc::session::SessionState coordState() const { return client.testSessionStateAt(coordIdx()); }
+};
+
+}  // namespace
+
+// RED (mutations): coordDownTooLong `>` -> `>=` (fallback at exactly 5 s); no reset of the timer on Connected (the
+// second outage inherits the first one's start); CoordinatorLink::onSessionChanged re-stamping the correlation id.
+TEST(ProducerTxnClientRegression, CoordinatorFallbackHappensAfterFiveSecondsNotConnectedRegression) {
+    FallbackRig r(5101, 5102);
+    ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+    ASSERT_EQ(r.client.connect(r.cq, 1), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return r.got.count(1) != 0; })) << "the seed never connected";
+    ASSERT_EQ(r.got[1].status, rc::OpStatus::Ok);
+
+    rc::ProducerConfig pc = txnCfg();
+    pc.transactionOpTimeoutMs = 3'600'000;
+    pc.produceTimeoutMs       = 3'600'000;
+    pc.deliveryTimeoutMs      = 7'200'000;
+    rc::Producer p = r.client.producer(pc);
+    const rc::TopicHandle topic = r.client.topic("t");
+    ASSERT_EQ(p.initTransactions(r.cq, 100), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return r.got.count(100) != 0; })) << "init never completed (redirects " << r.client.testCoordinatorRedirects() << ")";
+    ASSERT_EQ(r.got[100].status, rc::OpStatus::Ok);
+    ASSERT_EQ(r.client.testCoordinatorRedirects(), 1u) << "precondition: the coordinator is the other node";
+    ASSERT_NE(r.coordIdx(), 0u);
+    ASSERT_EQ(r.coordState(), rc::session::SessionState::Connected);
+    ASSERT_EQ(r.client.testCoordinatorFallbacks(), 0u);
+    const int64_t coordSid = r.gw.coordinatorSessionIds.back();
+
+    // ---- an outage that ends before the edge resets the timer --------------------------------------------------
+    // The node stops answering connects and expires the session: the coordinator session is down (Connecting) from T1.
+    const int64_t t1 = g_fbNow;
+    r.gw.silentEndpoints.insert(r.node);
+    r.gw.sendError(r.node, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired), "expired", coordSid, 0);
+    int i1 = 0;
+    for (; i1 < 20'000 && r.coordState() == rc::session::SessionState::Connected; ++i1) r.step(0);
+    ASSERT_NE(r.coordState(), rc::session::SessionState::Connected) << "the expiry was not seen";
+    ASSERT_EQ(g_fbNow, t1) << "the clock moved while waiting for the outage";
+    r.passes(40);   // the duty side has seen the coordinator down, at T1
+    r.advanceTo(t1 + 1'000'000'000LL);
+    EXPECT_EQ(r.client.testCoordinatorFallbacks(), 0u);
+    r.gw.silentEndpoints.erase(r.node);   // the node answers again; the session's own connect retry (3 s) finds it
+    r.advanceTo(t1 + 3'100'000'000LL);
+    ASSERT_TRUE(r.drive([&] { return r.coordState() == rc::session::SessionState::Connected; }, 20'000, 0))
+        << "the coordinator session never came back (state " << static_cast<int>(r.coordState()) << ")";
+    EXPECT_EQ(r.client.testCoordinatorFallbacks(), 0u) << "fell back although the session was Connected again before 5 s";
+    ASSERT_EQ(r.coordIdx(), 1u);
+
+    // ---- a transaction whose EndTxn is in flight at the coordinator ---------------------------------------------
+    p.beginTransaction();
+    ASSERT_TRUE(r.drive([&] { return p.state() == rc::TxnState::InTransaction; }, 20'000, 0));
+    const std::string v = "fb";
+    ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), bytesOf(v), r.cq, 200), rc::SendResult::Ok);
+    ASSERT_TRUE(r.drive([&] { return r.got.count(200) != 0; }, 200'000, 0)) << "the record was never acknowledged";
+    ASSERT_EQ(r.got[200].status, rc::OpStatus::Ok);
+    r.gw.holdTxnReplies = true;   // the coordinator decides the EndTxn, its answer never leaves
+    ASSERT_EQ(p.commitTransaction(r.cq, 201), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return r.gw.endTxns >= 1; }, 200'000, 0)) << "the EndTxn never reached the coordinator";
+    ASSERT_EQ(r.gw.endTxns, 1);
+    ASSERT_FALSE(r.gw.coordDecisions.empty());
+    const int64_t endCorr = r.gw.coordDecisions.back().correlationId;
+    ASSERT_EQ(r.gw.coordDecisions.back().kind, test_support::InvokerGateway::TxnFrameKind::EndTxn);
+
+    // ---- the second outage: the 5 s edge ------------------------------------------------------------------------
+    r.advanceTo(g_fbNow + 1'500'000'000LL);   // T1 + 4.6 s: a timer that was not reset would fire 0.4 s into the outage
+    const int64_t t2 = g_fbNow;
+    ASSERT_GT(t2 - t1, 4'000'000'000LL);
+    r.gw.silentEndpoints.insert(r.node);
+    r.gw.sendError(r.node, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired), "expired", r.gw.coordinatorSessionIds.back(), 0);
+    int i2 = 0;
+    for (; i2 < 20'000 && r.coordState() == rc::session::SessionState::Connected; ++i2) r.step(0);
+    ASSERT_NE(r.coordState(), rc::session::SessionState::Connected) << "the second expiry was not seen";
+    ASSERT_EQ(g_fbNow, t2);
+    r.passes(40);   // seen down at T2
+    EXPECT_EQ(r.client.testCoordinatorFallbacks(), 0u) << "fell back at once: the timer of the first outage was not reset";
+    r.gw.coordinatorEndpoint = 0;   // the seed is where the new coordinator is named
+    r.advanceTo(t2 + 2'000'000'000LL);
+    EXPECT_EQ(r.client.testCoordinatorFallbacks(), 0u);
+    r.advanceTo(t2 + 4'750'000'000LL);
+    EXPECT_EQ(r.client.testCoordinatorFallbacks(), 0u);
+    g_fbNow = t2 + kFbGraceNs - 1;
+    r.passes(20);
+    EXPECT_EQ(r.client.testCoordinatorFallbacks(), 0u) << "fell back one ns before the 5 s edge";
+    g_fbNow = t2 + kFbGraceNs;
+    r.passes(20);
+    EXPECT_EQ(r.client.testCoordinatorFallbacks(), 0u) << "fell back at exactly 5 s (the edge is 'more than 5 s')";
+    EXPECT_NE(r.coordIdx(), 0u);
+    EXPECT_EQ(r.gw.endTxns, 1) << "nothing was re-offered before the fallback";
+    r.gw.holdTxnReplies = false;   // the seed node, the coordinator now, answers
+    g_fbNow = t2 + kFbGraceNs + 1;
+    r.passes(1);
+    EXPECT_EQ(r.client.testCoordinatorFallbacks(), 1u) << "no fallback one ns past the edge";
+    EXPECT_EQ(r.coordIdx(), 0u) << "the route is the seed again";
+
+    // ---- the pending EndTxn is re-offered on the seed, once, with the same correlation id -----------------------
+    ASSERT_TRUE(r.drive([&] { return r.got.count(201) != 0; }, 200'000, 0)) << "the commit never completed after the fallback";
+    EXPECT_EQ(r.got[201].status, rc::OpStatus::Ok) << "errorCode " << r.got[201].errorCode;
+    r.passes(2000);
+    EXPECT_EQ(r.gw.endTxns, 2) << "the EndTxn must reach the seed exactly once";
+    std::vector<test_support::InvokerGateway::CoordDecision> ends;
+    for (const auto& d : r.gw.coordDecisions) if (d.kind == test_support::InvokerGateway::TxnFrameKind::EndTxn) ends.push_back(d);
+    ASSERT_EQ(ends.size(), 2u);
+    EXPECT_EQ(ends[0].correlationId, endCorr);
+    EXPECT_EQ(ends[1].correlationId, endCorr) << "the re-offer carries the original correlation id";
+    EXPECT_TRUE(ends[1].resend) << "the coordinator saw the same request again (idempotent)";
+    ASSERT_GE(r.gw.coordinatorEndpoints.size(), 2u);
+    EXPECT_EQ(r.gw.coordinatorEndpoints.back(), 0) << "the re-offer arrived on the seed node";
+    EXPECT_EQ(r.client.testCoordinatorFallbacks(), 1u) << "a second fallback";
+    EXPECT_EQ(strs(r.gw.committedValues(0)), (std::vector<std::string>{"fb"}));
 }

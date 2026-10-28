@@ -1090,6 +1090,10 @@ bool ProducerImpl::txnDiscardUnsent_(const TxnOutcome& o) noexcept {
     if (dropped && txnFlushN_ != 0) {
         // E3 / B-MEDIUM-1: a flush whose records the abort dropped (never produced) must not complete Ok - it completes
         // with the abort's outcome (the scan restarts nothing: the array is taken first, completions may run user code).
+        // Conservative by design (#352): a flush does not remember which records it covers, so once ANY record was
+        // dropped EVERY pending flush fails - also one whose own records were already on the wire.  The abort decides
+        // the transaction either way, so nothing is lost; pinned by
+        // FlushOfRecordsAlreadyOnTheWireFailsWhenAnyRecordIsDroppedRegression.
         const std::array<TxnOp, kMaxTxnFlushes> flushes = txnFlushes_;
         const std::size_t                        nFlushes = txnFlushN_;
         txnFlushN_ = 0;

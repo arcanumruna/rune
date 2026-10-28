@@ -812,6 +812,10 @@ public:
     /// Void: a begin the machine refuses (not Ready: still committing / aborting, fenced, closed, init not done) is
     /// only counted; it is surfaced by the NEXT op (that op completes 19 / the fenced status) and by the records
     /// refused behind it.  Call it after the previous commit / abort / init completed.
+    /// Call only after the previous commit/abort has completed: in Thread mode `commit(token); begin(); send()` does
+    /// NOT pipeline - the ring is FIFO, so the duty side meets the begin while the commit is still running, refuses
+    /// it, refuses the record behind it, and the EARLIER commit completes BrokerError(19 InvalidTxnState) with the
+    /// machine in AbortableError (pinned by BeginBeforeThePreviousEndCompletesIsRefusedRegression).
     void     beginTransaction();
     /// One sendOffsetsToTransaction runs at a time: a call made while another is still running completes
     /// BrokerError(19, InvalidTxnState) at once (no queueing, the transaction is not poisoned) - wait for the first

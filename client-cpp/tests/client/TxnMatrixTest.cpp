@@ -58,6 +58,7 @@ TEST(TxnMatrixCountRegression, CellCountsArePinned) {
     int total = 0, applicable = 0, na = 0;
     int naRules[3]{};
     int rules[9]{};   // by Outcome
+    int refusedAt[mx::kTimings]{};   // R4 / R5 / R6 are the Refused outcome at BeforeInit / OutsideTxn / AfterCommitIssued
     for (uint8_t o = 0; o < mx::kOps; ++o) {
         for (uint8_t e = 0; e < mx::kEntities; ++e) {
             for (uint8_t t = 0; t < mx::kTimings; ++t) {
@@ -71,6 +72,7 @@ TEST(TxnMatrixCountRegression, CellCountsArePinned) {
                 } else {
                     ++applicable;
                     ++rules[static_cast<uint8_t>(mx::expect(op, en, tm))];
+                    if (mx::expect(op, en, tm) == mx::Outcome::Refused) ++refusedAt[t];
                 }
             }
         }
@@ -84,8 +86,15 @@ TEST(TxnMatrixCountRegression, CellCountsArePinned) {
     EXPECT_EQ(rules[static_cast<uint8_t>(mx::Outcome::Delivered)], 18);       // R1
     EXPECT_EQ(rules[static_cast<uint8_t>(mx::Outcome::DeliveredOnce)], 9);    // R2
     EXPECT_EQ(rules[static_cast<uint8_t>(mx::Outcome::AtMostOnce)], 9);       // R3
-    // R4-R6 share Refused (3 timings); R7..R11 one outcome each: 19 per timing.
-    EXPECT_EQ(rules[static_cast<uint8_t>(mx::Outcome::Refused)], 19 * 3);
+    // R4 / R5 / R6 share the Refused outcome, told apart by their timing: 19 cells each (2 transactional entities x 10
+    // ops, less the NA3 offsets cell of the new-partition entity).  R7..R11 one outcome each: 19 per timing.
+    EXPECT_EQ(refusedAt[static_cast<uint8_t>(mx::Timing::BeforeInit)], 19) << "R4";
+    EXPECT_EQ(refusedAt[static_cast<uint8_t>(mx::Timing::OutsideTxn)], 19) << "R5";
+    EXPECT_EQ(refusedAt[static_cast<uint8_t>(mx::Timing::AfterCommitIssued)], 19) << "R6";
+    EXPECT_EQ(rules[static_cast<uint8_t>(mx::Outcome::Refused)], refusedAt[static_cast<uint8_t>(mx::Timing::BeforeInit)] +
+                                                                    refusedAt[static_cast<uint8_t>(mx::Timing::OutsideTxn)] +
+                                                                    refusedAt[static_cast<uint8_t>(mx::Timing::AfterCommitIssued)])
+        << "Refused occurs at no other timing";
     EXPECT_EQ(rules[static_cast<uint8_t>(mx::Outcome::CommittedVisible)], 19);
     EXPECT_EQ(rules[static_cast<uint8_t>(mx::Outcome::FailsTxn)], 19);
     EXPECT_EQ(rules[static_cast<uint8_t>(mx::Outcome::Fenced)], 19);
@@ -464,6 +473,11 @@ public:
             });
             break;
         }
+        // #369: an issue that ends neither accepted nor refused (a claim whose commit() returned false, ...) used to pass
+        // every cell that did not ASSERT_TRUE(is.accepted).
+        if (!is.accepted && !is.refused) {
+            ADD_FAILURE() << "op " << mx::name(op) << " ended neither accepted nor refused";
+        }
         if (is.accepted) acceptedRecords += is.records;
         return is;
     }
@@ -552,6 +566,9 @@ public:
 };
 
 // Drives one cell.
+// (#369 item 5b, not done: the status / error codes of an outcome still live in the handlers below; expect() names only
+// the Outcome.  Moving them into TxnMatrixExpectations.h is not a mechanical move - the handlers differ per timing and
+// per op form - so it stays listed in the issue.)
 class CellRunner {
 public:
     explicit CellRunner(Cell c) : r(c), c_(c), outcome(mx::expect(c.op, c.ent, c.tm)) {}
@@ -745,6 +762,9 @@ void CellRunner::plainSessionLost() {
         EXPECT_GE(r.gw->windowDupAnswers, 1) << "the re-sent batch was not answered as a duplicate";
     }
     r.settle();
+    // statusOf() reads the token's completion: wait for it (an absent one would insert an empty vector and .back()
+    // would be undefined behaviour - a crash instead of a clean failure).
+    ASSERT_TRUE(r.drive([&] { return tokenDone(is); })) << "the op's token never completed";
     r.checkAllocs(is);
     r.checkExactlyOnce(is, acked);
     if (is.token != 0) {
@@ -960,6 +980,7 @@ void CellRunner::txnFenced() {
     ASSERT_NO_FATAL_FAILURE(beginTxn(false));
     // A second init of the same transactional id bumps the epoch: this producer's next coordinator request is 18.
     r.gw->fenceTransactionalId(r.txnId, r.gw->initPid);
+    const int endTxns0 = r.gw->endTxns;
     const Issued is = r.issue(c_.op, 1, true, kTokOp);
     r.checkAllocs(is);
     ASSERT_TRUE(is.accepted) << "the handle's gate is open until the machine learns of the fence";
@@ -969,6 +990,16 @@ void CellRunner::txnFenced() {
     EXPECT_EQ(r.comps[kTokCommit].size(), 1u);
     ASSERT_TRUE(r.drive([&] { return tokenDone(is); }));
     r.settle();
+    // R9, early: for a new partition's data op and for an offsets leg the fence is learned from the AddPartitions /
+    // AddOffsets 18, BEFORE the end phase - the machine is already FatalError when the commit would send its EndTxn, so
+    // none leaves (a producer that still sent it would have the coordinator just answer 18 again, which the
+    // completions alone cannot tell).  An added partition's batch goes straight to its leader: the coordinator
+    // reveals the fence only at the EndTxn, so exactly that one frame is sent.
+    if (isOffsets() || !added()) {
+        EXPECT_EQ(r.gw->endTxns, endTxns0) << "an EndTxn left a producer that already knew it was fenced";
+    } else {
+        EXPECT_EQ(r.gw->endTxns, endTxns0 + 1) << "the commit's EndTxn is the frame that reveals the fence";
+    }
     if (is.token != 0) {
         const rc::OpStatus st = statusOf(r, is);
         if (isOffsets() || !added()) {
@@ -1073,6 +1104,7 @@ void CellRunner::txnRewind() {
     }
     ASSERT_NO_FATAL_FAILURE(r.abortOk(kTokAbort));
     r.settle();
+    r.checkExactlyOnce(first, false);   // the first attempt's token completed exactly once (it was never checked)
     EXPECT_TRUE(r.committed(0).empty()) << "the aborted attempt is visible";
     EXPECT_EQ((r.gw->committedOffsets[{kTopicId, 0}]), 0) << "an aborted attempt's offsets must not commit";
     const std::size_t abortedBatches = r.gw->visibleBatches(0, Gw::TxnFate::Aborted);
@@ -1109,7 +1141,6 @@ void CellRunner::txnRewind() {
     r.checkAllocs(redo);
     r.checkExactlyOnce(redo, true);
     if (redo.token != 0) EXPECT_EQ(statusOf(r, redo), rc::OpStatus::Ok);
-    EXPECT_EQ(r.comps[kTokWarm].size(), first.token != 0 && first.viaCq ? 1u : r.comps[kTokWarm].size());
     EXPECT_EQ(r.committed(0), Rig::sorted(r.expectVisible)) << "the redo is committed and visible exactly once";
     EXPECT_EQ(r.gw->visibleBatches(0, Gw::TxnFate::Aborted), abortedBatches) << "the aborted attempt stays aborted";
     EXPECT_EQ((r.gw->committedOffsets[{kTopicId, 0}]), 5) << "the group's committed offset advanced exactly by the redo";

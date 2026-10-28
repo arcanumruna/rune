@@ -120,6 +120,8 @@ struct WireBatch {
     bool                     crcOk     = false;
     std::vector<uint8_t>     tags;   ///< first byte of every record value, in order
     bool                     acked     = false;
+    uint32_t                 crcStored = 0;   ///< the CRC-32C field as sent
+    uint32_t                 crcActual = 0;   ///< CRC-32C computed over the bytes as sent (attributes .. end)
 };
 
 enum class Mode : uint8_t { Ring, Direct };
@@ -160,6 +162,13 @@ struct Rig {
             r.forEachRecord([&](std::string_view, std::string_view value, int64_t, int64_t) {
                 w.tags.push_back(value.empty() ? uint8_t{0} : static_cast<uint8_t>(value[0]));
             });
+            const auto* rb = v->recordBatch.data();
+            const std::size_t rn = v->recordBatch.size();
+            if (rn > static_cast<std::size_t>(rune::protocol::batch::kAttributesOffset)) {
+                std::memcpy(&w.crcStored, rb + rune::protocol::batch::kCrcOffset, 4);
+                w.crcActual = rune::protocol::crc32c(rb + rune::protocol::batch::kAttributesOffset,
+                                                     rn - static_cast<std::size_t>(rune::protocol::batch::kAttributesOffset));
+            }
             wire.push_back(std::move(w));
             return true;
         };
@@ -1154,7 +1163,7 @@ void committedTxnAckedAt(Rig& r, int64_t off) {
     r.answerAdd(0);
     r.tick();
     ASSERT_EQ(r.wire.size(), before + 1);
-    answerWire(r, before, 0, off);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, before, 0, off));
     Op commit = r.commit();
     r.tick();
     r.endAnswer();
@@ -1187,12 +1196,12 @@ void answerAddFor(Rig& r, int32_t part, int16_t code) {
 TEST(ProducerTxnData, IdempotentRetryReusesBaseSequence) {
     Rig r;
     r.initOk(99, 0);
-    sendBatches(r, 2);
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 2));
     EXPECT_EQ(r.wire[0].baseSeq, 0);
     EXPECT_EQ(r.wire[1].baseSeq, 1);
     EXPECT_NE(r.wire[0].corrId, r.wire[1].corrId);
     const int64_t firstCorr = r.wire[0].corrId;
-    answerWire(r, 1, 0, 1);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 1, 0, 1));
     const std::size_t before = r.wire.size();
     r.hub.onProduceResponse(firstCorr, -1, kNotLeaderCode);
     r.impl->resendRouteParked();   // a NotLeader re-offers after fresh metadata
@@ -1212,23 +1221,23 @@ TEST(ProducerTxnData, IdempotentRetryReusesBaseSequence) {
 TEST(ProducerTxnDataRegression, OutOfOrderBehindAnOlderBatchIsRetriedNotPoisonedRegression) {
     Rig r;
     r.initOk(77, 0);
-    sendBatches(r, 3);
-    answerWire(r, 1, kOosCode);   // seq 0 was lost: seq 1 and 2 meet the gap
-    answerWire(r, 2, kOosCode);
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 3));
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 1, kOosCode));   // seq 0 was lost: seq 1 and 2 meet the gap
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 2, kOosCode));
     EXPECT_EQ(r.state(), TxnState::InTransaction) << "an OOS behind a live older batch is retried, not poisoned";
     std::size_t n = r.wire.size();
     r.tick();
     // Fast retransmit of the gap frame (seq 0) only; seq 1 and 2 wait for it.
     ASSERT_EQ(r.wire.size(), n + 1);
     EXPECT_EQ(r.wire.back().baseSeq, 0);
-    answerWire(r, r.wire.size() - 1, 0, 100);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, r.wire.size() - 1, 0, 100));
     n = r.wire.size();
     r.tick();   // the parked batches go out again, in sequence order
     ASSERT_EQ(r.wire.size(), n + 2);
     EXPECT_EQ(r.wire[n].baseSeq, 1);
     EXPECT_EQ(r.wire[n + 1].baseSeq, 2);
-    answerWire(r, n, 0, 101);
-    answerWire(r, n + 1, 0, 102);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, n, 0, 101));
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, n + 1, 0, 102));
     EXPECT_EQ(r.state(), TxnState::InTransaction);
     EXPECT_FALSE(r.impl->hasInFlight());
 }
@@ -1252,7 +1261,7 @@ TEST(ProducerTxnDataRegression, InFlightPerPartitionClampedToTheBrokerWindowRegr
     }
     ASSERT_EQ(r.wire.size(), static_cast<std::size_t>(kWindow)) << "at most the broker's window in flight per partition";
     EXPECT_EQ(r.impl->partitionState(kTopic, 0)->inflight.live(), static_cast<uint32_t>(kWindow));
-    answerWire(r, 0, 0, 100);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 0, 0, 100));
     r.tick();
     ASSERT_EQ(r.wire.size(), static_cast<std::size_t>(kWindow) + 1) << "one acked -> one more";
     EXPECT_EQ(r.wire.back().baseSeq, kWindow);
@@ -1262,7 +1271,7 @@ TEST(ProducerTxnDataRegression, InFlightPerPartitionClampedToTheBrokerWindowRegr
 TEST(ProducerTxnDataRegression, ErrorOfASupersededAttemptIsIgnoredRegression) {
     Rig r;
     r.initOk(77, 0);
-    sendBatches(r, 1);
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 1));
     const int64_t firstCorr = r.wire[0].corrId;
     r.hub.onProduceResponse(firstCorr, -1, kNotLeaderCode);   // retriable
     r.impl->resendRouteParked();                               // re-offered after fresh metadata
@@ -1270,7 +1279,7 @@ TEST(ProducerTxnDataRegression, ErrorOfASupersededAttemptIsIgnoredRegression) {
     ASSERT_EQ(r.wire.size(), 2u);
     r.hub.onProduceResponse(firstCorr, -1, kOosCode);          // the FIRST attempt's late answer
     EXPECT_EQ(r.state(), TxnState::InTransaction) << "a superseded attempt's error is ignored";
-    answerWire(r, 1, 0, 100);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 1, 0, 100));
     EXPECT_EQ(r.state(), TxnState::InTransaction);
     EXPECT_FALSE(r.impl->hasInFlight());
 }
@@ -1280,12 +1289,12 @@ TEST(ProducerTxnDataRegression, ErrorOfASupersededAttemptIsIgnoredRegression) {
 TEST(ProducerTxnDataRegression, SequenceCounterNeverOverflowsInt32Regression) {
     Rig r;
     r.initOk(77, 0);
-    sendBatches(r, 1);
-    answerWire(r, 0, 0, 100);
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 1));
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 0, 0, 100));
     r.impl->debugSetNextSequenceForTest(kTopic, 0, INT32_MAX - 1);
     const std::size_t before = r.wire.size();
     for (int i = 0; i < 3; ++i) {   // one record per batch (the old producer sent one batch per send)
-        ASSERT_EQ(r.send(0, static_cast<uint8_t>(10 + i)), SendResult::Ok);
+        ASSERT_EQ(r.sendAck(0, static_cast<uint8_t>(10 + i), static_cast<Token>(700 + i)), SendResult::Ok);
         r.tick();
     }
     r.ticks(2);
@@ -1295,10 +1304,27 @@ TEST(ProducerTxnDataRegression, SequenceCounterNeverOverflowsInt32Regression) {
     // Changed timing: the batches behind it wait for the one in flight (as on the plain producer: nothing is
     // abandoned while it may still be stored); once it is acked the transaction becomes abortable.
     EXPECT_EQ(r.state(), TxnState::InTransaction);
-    answerWire(r, before, 0, 900);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, before, 0, 900));
     r.ticks(2);
     EXPECT_EQ(r.state(), TxnState::AbortableError) << "abortable with an epoch bump before the overflow";
     for (std::size_t i = before; i < r.wire.size(); ++i) EXPECT_GE(r.wire[i].baseSeq, 0) << "a wrapped sequence went out";
+    // The fate of the three records (one per batch: 700 went out and was acked; 701 and 702 were held behind it):
+    // the acked one completed Ok; the two held ones are NOT dropped silently and NOT completed yet - they wait for the
+    // app's abort, which fails each exactly once with the cause of the poison (20, OutOfOrderSequence).
+    EXPECT_EQ(r.acks.times(700), 1);
+    EXPECT_EQ(r.acks.status(700), OpStatus::Ok);
+    EXPECT_EQ(r.acks.times(701), 0) << "held, not completed";
+    EXPECT_EQ(r.acks.times(702), 0) << "held, not completed";
+    Op abort = r.abort();
+    r.tick();
+    for (const Token t : {Token{701}, Token{702}}) {
+        ASSERT_EQ(r.acks.times(t), 1) << "held record " << t << " must complete exactly once at the abort";
+        EXPECT_EQ(r.acks.status(t), OpStatus::BrokerError) << t;
+        EXPECT_EQ(r.acks.last.at(t).ec, uec(rpc::ErrorCode::OutOfOrderSequence)) << t;
+    }
+    EXPECT_EQ(r.acks.times(700), 1);
+    EXPECT_EQ(r.wire.size(), before + 1) << "the held records were never sent";
+    (void)abort;
 }
 
 // NEW-3: ProduceResponse{NotLeader} is a routine partition move, never a reason to abort the transaction.  The
@@ -1307,7 +1333,7 @@ TEST(ProducerTxnDataRegression, SequenceCounterNeverOverflowsInt32Regression) {
 TEST(ProducerTxnDataRegression, NotLeaderParksUntilMetadataThenReoffersSameIdentityRegression) {
     Rig r;
     r.initOk(77, 3);
-    sendBatches(r, 2);
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 2));
     std::vector<WireBatch> first(r.wire.begin(), r.wire.end());
     std::vector<WireBatch> cur = first;
     for (int round = 0; round < 8; ++round) {
@@ -1344,8 +1370,8 @@ TEST(ProducerTxnDataRegression, NotLeaderParksUntilMetadataThenReoffersSameIdent
 TEST(ProducerTxnDataRegression, DuplicateSequenceIsAStoredBatchRegression) {
     Rig r;
     r.initOk(77, 0);
-    sendBatches(r, 1);
-    answerWire(r, 0, static_cast<int16_t>(rpc::ErrorCode::DuplicateSequence));
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 1));
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 0, static_cast<int16_t>(rpc::ErrorCode::DuplicateSequence)));
     EXPECT_FALSE(r.impl->hasInFlight()) << "a DuplicateSequence batch is stored";
     const std::size_t before = r.wire.size();
     r.ticks(2);
@@ -1358,20 +1384,20 @@ TEST(ProducerTxnDataRegression, DuplicateSequenceIsAStoredBatchRegression) {
 TEST(ProducerTxnDataRegression, UnknownProducerIdBehindAnOlderBatchIsRetriedNotPoisonedRegression) {
     Rig r;
     r.initOk(77, 0);
-    sendBatches(r, 3);
-    answerWire(r, 1, kUnknownPid);
-    answerWire(r, 2, kUnknownPid);
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 3));
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 1, kUnknownPid));
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 2, kUnknownPid));
     EXPECT_EQ(r.state(), TxnState::InTransaction);
     std::size_t n = r.wire.size();
     r.tick();
     ASSERT_EQ(r.wire.size(), n + 1);
     EXPECT_EQ(r.wire.back().baseSeq, 0) << "fast retransmit of the gap frame";
-    answerWire(r, r.wire.size() - 1, 0, 100);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, r.wire.size() - 1, 0, 100));
     n = r.wire.size();
     r.tick();
     ASSERT_EQ(r.wire.size(), n + 2);
-    answerWire(r, n, 0, 101);
-    answerWire(r, n + 1, 0, 102);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, n, 0, 101));
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, n + 1, 0, 102));
     EXPECT_EQ(r.state(), TxnState::InTransaction);
     EXPECT_FALSE(r.impl->hasInFlight());
 }
@@ -1381,8 +1407,8 @@ TEST(ProducerTxnDataRegression, UnknownProducerIdBehindAnOlderBatchIsRetriedNotP
 TEST(ProducerTxnDataRegression, UnknownProducerIdOnTheHeadMakesTheTxnAbortableRegression) {
     Rig r;
     r.initOk(77, 0);
-    sendBatches(r, 1);
-    answerWire(r, 0, kUnknownPid);
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 1));
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 0, kUnknownPid));
     EXPECT_EQ(r.state(), TxnState::AbortableError);
     Op commit = r.commit();
     ASSERT_TRUE(commit.ready());
@@ -1394,8 +1420,8 @@ TEST(ProducerTxnDataRegression, UnknownProducerIdOnTheHeadMakesTheTxnAbortableRe
 TEST(ProducerTxnDataRegression, PartitionLeaderInvalidProducerEpochIsFatalFencedAtOnceRegression) {
     Rig r;
     r.initOk(77, 0);
-    sendBatches(r, 1);
-    answerWire(r, 0, static_cast<int16_t>(rpc::ErrorCode::InvalidProducerEpoch));
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 1));
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 0, static_cast<int16_t>(rpc::ErrorCode::InvalidProducerEpoch)));
     r.tick();
     EXPECT_EQ(r.state(), TxnState::FatalError) << "17 from the partition leader fences the producer";
     Op commit = r.commit();
@@ -1410,8 +1436,8 @@ TEST(ProducerTxnDataRegression, PartitionLeaderInvalidProducerEpochIsFatalFenced
 TEST(ProducerTxnDataRegression, PartitionLeaderProducerFencedIsFatalFencedAtOnceRegression) {
     Rig r;
     r.initOk(77, 0);
-    sendBatches(r, 1);
-    answerWire(r, 0, static_cast<int16_t>(rpc::ErrorCode::ProducerFenced));
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 1));
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 0, static_cast<int16_t>(rpc::ErrorCode::ProducerFenced)));
     r.tick();
     EXPECT_EQ(r.state(), TxnState::FatalError) << "18 from the partition leader fences the producer";
     Op commit = r.commit();
@@ -1426,10 +1452,10 @@ TEST(ProducerTxnDataRegression, PartitionLeaderProducerFencedIsFatalFencedAtOnce
 // A transactional epoch belongs to the coordinator (Task 6), so the sequences cannot restart in place: the
 // transaction fails abortable with 28 and the abort's epoch bump restarts them - the NEXT transaction's records go
 // out at sequence 0 under the bumped epoch.
-TEST(ProducerTxnDataRegression, UnknownProducerIdAfterRetentionRestartsSequencesAndKeepsTheTxnRegression) {
+TEST(ProducerTxnDataRegression, UnknownProducerIdAfterRetentionAbortsTheTxnAndTheNextOneRestartsSequencesRegression) {
     Rig r;
     r.initOk(77, 0);
-    committedTxnAckedAt(r, /*off=*/10);   // lastAckedOffset 10; sequences go on at 1
+    ASSERT_NO_FATAL_FAILURE(committedTxnAckedAt(r, /*off=*/10));   // lastAckedOffset 10; sequences go on at 1
     r.begin();
     ASSERT_EQ(r.send(0, 1), SendResult::Ok);
     r.tick();
@@ -1438,7 +1464,7 @@ TEST(ProducerTxnDataRegression, UnknownProducerIdAfterRetentionRestartsSequences
     const std::size_t first = r.wire.size() - 1;
     ASSERT_EQ(r.wire[first].baseSeq, 1);
     // Retention + failover: the broker forgot us; its log starts at 50 > 10.
-    answerWire(r, first, kUnknownPid, 0, /*logStart=*/50);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, first, kUnknownPid, 0, /*logStart=*/50));
     EXPECT_EQ(r.state(), TxnState::AbortableError) << "changed: a transactional sequence restart can only abort";
     Op commit = r.commit();
     ASSERT_TRUE(commit.ready());
@@ -1463,8 +1489,95 @@ TEST(ProducerTxnDataRegression, UnknownProducerIdAfterRetentionRestartsSequences
     EXPECT_EQ(r.wire.back().baseSeq, 0) << "sequences restart at 0";
     EXPECT_EQ(r.wire.back().epoch, 1) << "under the bumped epoch";
     EXPECT_NE(r.wire.back().attrs & rb::kAttrTransactional, 0);
-    EXPECT_TRUE(r.wire.back().crcOk) << "re-stamped batch CRC";
-    answerWire(r, r.wire.size() - 1, 0, 60);
+    EXPECT_TRUE(r.wire.back().crcOk) << "the freshly built batch of the next transaction has a valid CRC";
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, r.wire.size() - 1, 0, 60));
+    Op c2 = r.commit();
+    r.tick();
+    r.endAnswer();
+    ASSERT_TRUE(c2.ready());
+    EXPECT_EQ(c2.status(), OpStatus::Ok);
+}
+
+// #352: the legs the port dropped.  Retention with TWO batches in flight: the head's 28 (log start above everything
+// we ever had acked) makes the transaction abortable and fails the in-flight batches at once; the second batch's 28,
+// which arrives later for a batch the first answer already decided, changes nothing (no state change, no frame, no
+// second completion); after the abort's epoch bump the next transaction's TWO batches go out at sequences 0 and 1
+// under the new epoch, each with a CRC that is valid over the bytes as sent (computed here independently of the
+// producer: CRC-32C of attributes..end against the stored field) - and a late answer of a pre-bump attempt is ignored.
+TEST(ProducerTxnDataRegression, UnknownProducerIdAfterRetentionWithTwoBatchesInFlightRegression) {
+    Rig r;
+    r.initOk(77, 0);
+    ASSERT_NO_FATAL_FAILURE(committedTxnAckedAt(r, /*off=*/10));   // lastAckedOffset 10; sequences go on at 1
+    r.begin();
+    ASSERT_EQ(r.batch(0, 1, 1, 301), rp::RejectReason::None);
+    r.tick();
+    r.answerAdd(0);
+    r.tick();
+    ASSERT_EQ(r.batch(0, 2, 1, 302), rp::RejectReason::None);
+    r.tick();
+    const std::size_t first = r.wire.size() - 2;
+    ASSERT_EQ(r.wire.size(), first + 2) << "two batches in flight";
+    EXPECT_EQ(r.wire[first].baseSeq, 1);
+    EXPECT_EQ(r.wire[first + 1].baseSeq, 2);
+    const int64_t corr1 = r.wire[first].corrId;
+    const int64_t corr2 = r.wire[first + 1].corrId;
+
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, first, kUnknownPid, 0, /*logStart=*/50));   // 50 > 10: retention
+    EXPECT_EQ(r.state(), TxnState::AbortableError);
+    const std::size_t wireAfterHead = r.wire.size();
+    // Both in-flight batches failed at once with the cause (28), each record exactly once.
+    for (const Token t : {Token{301}, Token{302}}) {
+        ASSERT_EQ(r.acks.times(t), 1) << t;
+        EXPECT_EQ(r.acks.status(t), OpStatus::BrokerError) << t;
+        EXPECT_EQ(r.acks.last.at(t).ec, uec(rpc::ErrorCode::UnknownProducerId)) << t;
+    }
+    // The late 28 of the second batch (its attempt is superseded by the head's failure): nothing changes.
+    r.hub.onProduceResponse(corr2, -1, kUnknownPid, /*logStart=*/50);
+    r.ticks(3);
+    EXPECT_EQ(r.state(), TxnState::AbortableError);
+    EXPECT_EQ(r.wire.size(), wireAfterHead) << "a superseded 28 re-sent something";
+    EXPECT_EQ(r.acks.times(301), 1);
+    EXPECT_EQ(r.acks.times(302), 1);
+
+    Op commit = r.commit();
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::BrokerError);
+    EXPECT_EQ(commit.code(), uec(rpc::ErrorCode::UnknownProducerId));
+    Op abort = r.abort();
+    r.tick();
+    r.endAnswer();
+    r.tick();   // the abort's epoch bump
+    ASSERT_NE(r.last(rpc::InitProducerId::TEMPLATE_ID), nullptr);
+    r.answer(Rig::initAnswer(r.last(rpc::InitProducerId::TEMPLATE_ID)->corrId, 77, 1));
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::Ok);
+    EXPECT_EQ(r.state(), TxnState::Ready);
+
+    const std::size_t afterAbort = r.wire.size();
+    r.begin();
+    // Tier-2 batches: built with no identity and stamped (producer id, epoch, base sequence, CRC patched) when offered.
+    ASSERT_EQ(r.batch(0, 3, 2, 303), rp::RejectReason::None);
+    r.tick();
+    r.answerAdd(0);
+    r.tick();
+    ASSERT_EQ(r.batch(0, 5, 2, 304), rp::RejectReason::None);
+    r.tick();
+    ASSERT_EQ(r.wire.size(), afterAbort + 2) << "the next transaction's two batches";
+    for (int i = 0; i < 2; ++i) {
+        const WireBatch& w = r.wire[afterAbort + static_cast<std::size_t>(i)];
+        EXPECT_EQ(w.baseSeq, 2 * i) << "sequences restart at 0 (two records per batch)";
+        EXPECT_EQ(w.epoch, 1) << "under the bumped epoch";
+        EXPECT_EQ(w.pid, 77);
+        EXPECT_NE(w.attrs & rb::kAttrTransactional, 0);
+        EXPECT_TRUE(w.crcOk);
+        EXPECT_EQ(w.crcStored, w.crcActual) << "the CRC of a frame is re-stamped over the bytes as sent";
+    }
+    // A late answer of the pre-bump attempts changes nothing.
+    r.hub.onProduceResponse(corr1, -1, kUnknownPid, /*logStart=*/50);
+    r.hub.onProduceResponse(corr2, 5, 0);
+    EXPECT_EQ(r.state(), TxnState::InTransaction);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, afterAbort, 0, 60));
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, afterAbort + 1, 0, 61));
     Op c2 = r.commit();
     r.tick();
     r.endAnswer();
@@ -1475,13 +1588,13 @@ TEST(ProducerTxnDataRegression, UnknownProducerIdAfterRetentionRestartsSequences
 TEST(ProducerTxnDataRegression, UnknownProducerIdWithAckedDataAboveTheLogStartIsAbortableWithCode28Regression) {
     Rig r;
     r.initOk(77, 0);
-    committedTxnAckedAt(r, /*off=*/10);
+    ASSERT_NO_FATAL_FAILURE(committedTxnAckedAt(r, /*off=*/10));
     r.begin();
     ASSERT_EQ(r.send(0, 1), SendResult::Ok);
     r.tick();
     r.answerAdd(0);
     r.tick();
-    answerWire(r, r.wire.size() - 1, kUnknownPid, 0, /*logStart=*/5);   // acked offset 10 >= 5: not retention
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, r.wire.size() - 1, kUnknownPid, 0, /*logStart=*/5));   // acked offset 10 >= 5: not retention
     EXPECT_EQ(r.state(), TxnState::AbortableError);
     Op commit = r.commit();
     ASSERT_TRUE(commit.ready());
@@ -1494,7 +1607,7 @@ TEST(ProducerTxnDataRegression, UnknownProducerIdWithAckedDataAboveTheLogStartIs
 TEST(ProducerTxnDataRegression, TransientLogFullBacksOffWithoutSpendingRetriesRegression) {
     Rig r;
     r.initOk(77, 0);
-    sendBatches(r, 1);
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 1));
     const int32_t seq0 = r.wire[0].baseSeq;
     for (int round = 0; round < 3 * 5 /* > kMaxRetries */; ++round) {
         SCOPED_TRACE(round);
@@ -1510,7 +1623,7 @@ TEST(ProducerTxnDataRegression, TransientLogFullBacksOffWithoutSpendingRetriesRe
         EXPECT_EQ(r.wire.back().baseSeq, seq0) << "same identity";
         ASSERT_EQ(r.state(), TxnState::InTransaction) << "42 poisoned the transaction";
     }
-    answerWire(r, r.wire.size() - 1, 0, 7);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, r.wire.size() - 1, 0, 7));
     EXPECT_EQ(r.state(), TxnState::InTransaction);
     EXPECT_FALSE(r.impl->hasInFlight());
 }
@@ -1522,7 +1635,7 @@ TEST(ProducerTxnDataRegression, TransientLogFullBacksOffWithoutSpendingRetriesRe
 TEST(ProducerTxnDataRegression, ConcurrentTransactionsIsRetriedWithAShortBackoffNeverAbortingRegression) {
     Rig r;
     r.initOk(77, 0);
-    sendBatches(r, 1);
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 1));
     const int32_t seq0 = r.wire[0].baseSeq;
     const int16_t epoch0 = r.wire[0].epoch;
     int firstWait = -1;
@@ -1541,7 +1654,7 @@ TEST(ProducerTxnDataRegression, ConcurrentTransactionsIsRetriedWithAShortBackoff
         EXPECT_EQ(r.wire.back().epoch, epoch0);
     }
     EXPECT_LE(firstWait, 2) << "the first retry must follow within a broker pass or a plane round trip";
-    answerWire(r, r.wire.size() - 1, 0, 7);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, r.wire.size() - 1, 0, 7));
     EXPECT_EQ(r.state(), TxnState::InTransaction);
     EXPECT_FALSE(r.impl->hasInFlight());
     Op c = r.commit();
@@ -1559,17 +1672,17 @@ TEST(ProducerTxnDataRegression, ConcurrentTransactionsIsRetriedWithAShortBackoff
 TEST(ProducerTxnDataRegression, ConcurrentTransactionsBackoffsReorderPipelinedBatchesWithoutAbortingAdversarialRegression) {
     Rig r;
     r.initOk(77, 0);
-    sendBatches(r, 2);
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 2));
     const int32_t seq0 = r.wire[0].baseSeq, seq1 = r.wire[1].baseSeq;
     ASSERT_LT(seq0, seq1);
     constexpr int16_t k27 = static_cast<int16_t>(rpc::ErrorCode::ConcurrentTransactions);
-    answerWire(r, 0, k27);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 0, k27));
     // seq0's first retry: answered 27 again (still verifying) -> its next backoff doubles.
     for (int i = 0; i < 200 && r.wire.size() == 2; ++i) r.tick(kMs / 10);
     ASSERT_EQ(r.wire.size(), 3u);
     ASSERT_EQ(r.wire[2].baseSeq, seq0);
-    answerWire(r, 2, k27);
-    answerWire(r, 1, k27);   // seq1's first refusal: the shorter backoff
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 2, k27));
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 1, k27));   // seq1's first refusal: the shorter backoff
     // The verified leader from here on: in-order sequences are stored, a gap is OutOfOrderSequence.
     int32_t expected = seq0;
     int64_t nextOffset = 0;
@@ -1580,14 +1693,14 @@ TEST(ProducerTxnDataRegression, ConcurrentTransactionsBackoffsReorderPipelinedBa
         while (answered < r.wire.size()) {
             const WireBatch& w = r.wire[answered];
             if (w.baseSeq == expected) {
-                answerWire(r, answered, 0, nextOffset);
+                ASSERT_NO_FATAL_FAILURE(answerWire(r, answered, 0, nextOffset));
                 nextOffset += static_cast<int64_t>(w.tags.size());
                 expected += static_cast<int32_t>(w.tags.size());
             } else if (w.baseSeq < expected) {
-                answerWire(r, answered, 0, -1);   // a duplicate of a stored batch: OK, offset unknown
+                ASSERT_NO_FATAL_FAILURE(answerWire(r, answered, 0, -1));   // a duplicate of a stored batch: OK, offset unknown
             } else {
                 sawReorder = true;
-                answerWire(r, answered, kOosCode);
+                ASSERT_NO_FATAL_FAILURE(answerWire(r, answered, kOosCode));
             }
             ++answered;
         }
@@ -1656,9 +1769,41 @@ TEST(ProducerTxnDataRegression, FlushFailsWhenAbortDropsItsRecords) {
         Op abort = r.issue(TxnControl::Kind::Abort);   // same duty pass, before the record's partition was added
         r.ticks(4);
         ASSERT_TRUE(flush.ready());
-        EXPECT_NE(flush.status(), OpStatus::Ok) << "the flushed record was dropped, never produced";
+        EXPECT_EQ(flush.status(), OpStatus::BrokerError) << "the flushed record was dropped, never produced";
+        EXPECT_EQ(flush.code(), kInvalidTxnState) << "the flush completes with the abort's outcome (19)";
         EXPECT_TRUE(r.wire.empty());
         ASSERT_TRUE(abort.ready());
+        EXPECT_EQ(abort.status(), OpStatus::Ok);
+    }
+}
+
+// #352: the conservative corner of the above, pinned.  ProducerImpl::abortStep drops what is unsent and then fails EVERY
+// pending flush once ANY record was dropped - including a flush whose own records are already on the wire (and would
+// have completed Ok): it cannot tell whose records were dropped.  Not a loss (the abort decides the transaction), so it
+// is documented rather than fixed; a precise per-flush watermark would only turn this Ok.
+TEST(ProducerTxnDataRegression, FlushOfRecordsAlreadyOnTheWireFailsWhenAnyRecordIsDroppedRegression) {
+    for (const Mode mode : {Mode::Ring, Mode::Direct}) {
+        SCOPED_TRACE(mode == Mode::Ring ? "Ring" : "Direct");
+        Rig r(mode);
+        r.initOk();
+        r.begin();
+        ASSERT_EQ(r.sendAck(0, 1, 801), SendResult::Ok);
+        r.tick();
+        r.answerAdd(0);
+        r.tick();
+        ASSERT_EQ(r.wire.size(), 1u) << "the flushed record is on the wire";
+        Op flush = r.issue(TxnControl::Kind::Flush);   // covers record 1 only
+        r.tick();
+        EXPECT_FALSE(flush.ready()) << "record 1 is in flight, not acked";
+        ASSERT_EQ(r.send(1, 2), SendResult::Ok);       // partition 1 is not added yet: held, never produced
+        Op abort = r.issue(TxnControl::Kind::Abort);   // the abort drops it
+        r.ticks(3);
+        ASSERT_TRUE(flush.ready()) << "the dropped record on partition 1 fails the flush of record 1";
+        EXPECT_EQ(flush.status(), OpStatus::BrokerError);
+        EXPECT_EQ(flush.code(), kInvalidTxnState);
+        EXPECT_EQ(r.wire.size(), 1u) << "the dropped record was never produced";
+        EXPECT_EQ(r.acks.times(801), 0) << "record 1 is still in flight: the flush failed anyway (conservative)";
+        (void)abort;
     }
 }
 
@@ -1693,7 +1838,7 @@ TEST(ProducerTxnDataRegression, FlushFencedWhenTheProducerIsFenced) {
     ASSERT_EQ(r.wire.size(), 1u);
     Op flush  = r.flush();
     Op commit = r.commit();
-    answerWire(r, 0, static_cast<int16_t>(rpc::ErrorCode::ProducerFenced));
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 0, static_cast<int16_t>(rpc::ErrorCode::ProducerFenced)));
     r.tick();
     ASSERT_TRUE(flush.ready());
     ASSERT_EQ(r.state(), TxnState::FatalError);   // #367: a partition leader's 18 is fatal at once
@@ -1715,7 +1860,10 @@ TEST(ProducerTxnDataRegression, FlushCompletesWhenTheProducerCloses) {
     Op close = r.close();
     r.ticks(5);
     ASSERT_TRUE(flush.ready());
-    EXPECT_NE(flush.status(), OpStatus::Ok);
+    EXPECT_EQ(flush.status(), OpStatus::BrokerError) << "the dropped record fails the flush";
+    EXPECT_EQ(flush.code(), kInvalidTxnState);
+    ASSERT_TRUE(close.ready()) << "the close itself completes";
+    EXPECT_EQ(close.status(), OpStatus::Ok);
 }
 
 // TX-6b + fix round 1 (C-1): a batch that times out poisons the transaction: the commit completes DeliveryFailed
@@ -1775,7 +1923,7 @@ TEST(ProducerTxnDataRegression, PoisonedCommitNeverCommitsOrphanedDataRegression
     answerAddFor(r, kGood, 0);
     r.tick();   // the good partition's record lands
     ASSERT_EQ(r.wire.size(), 1u);
-    answerWire(r, 0, 0, 0);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 0, 0, 0));
     answerAddFor(r, kBad, ec(rpc::ErrorCode::UnknownTopic));
     ASSERT_TRUE(commit.ready());
     EXPECT_EQ(commit.status(), OpStatus::BrokerError);
@@ -1836,7 +1984,7 @@ TEST(ProducerTxnDataRegression, AddPartitionsErrorGatesPartitionDataRegression) 
     Op abort = r.abort();
     r.tick();
     EXPECT_EQ(r.endTxns(), 0u) << "the in-flight batch has not settled";
-    answerWire(r, 0, 0, 0);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 0, 0, 0));
     r.tick();
     ASSERT_EQ(r.endTxns(), 1u);
     EXPECT_EQ(r.lastEnd()->commit, uint8_t{0});

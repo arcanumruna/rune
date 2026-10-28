@@ -5,11 +5,14 @@
 // refusals.  Nothing sleeps, no threads, no atomics.
 #include <filesystem>
 #include "../support/AllocCounter.h"
+#include "../support/FrameCapture.h"
+#include "gen/position.gen.h"
 
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
+#include <rune/client/TypedTopic.h>
 #include <rune/client/producer/BatchBuilder.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/producer/ProducerImpl.h>
@@ -18,10 +21,12 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -265,9 +270,135 @@ concept HasProducerFactory = requires(C& c) { c.producer(); };
 #error "the TransactionalProducer headers must stay deleted (Phase 2b F Task 9)"
 #endif
 
+// #352: "no alias" - a `using TransactionalProducer = Producer;` in any header would pass the header checks above.
+// Detection idiom: a fallback type is made visible in rune::client through a using-directive.  A qualified lookup finds
+// a member of rune::client BEFORE it looks into namespaces nominated by a using-directive, so
+// rune::client::TransactionalProducer is the fallback exactly when the library declares no such name.
+namespace rune::client {
+namespace txn_probe_absent_ {
+struct TransactionalProducer {};
+}  // namespace txn_probe_absent_
+using namespace txn_probe_absent_;
+}  // namespace rune::client
+
 TEST(ProducerTxnRegression, TransactionalProducerTypeIsGoneRegression) {
+    static_assert(std::is_same_v<rune::client::TransactionalProducer, rune::client::txn_probe_absent_::TransactionalProducer>,
+                  "rune::client declares a name TransactionalProducer (type or alias): the separate handle is gone, "
+                  "transactions are Producer + ProducerConfig::transactionalId");
     static_assert(!HasTransactionalProducerFactory<rune::client::Client>,
                   "Client::transactionalProducer must stay deleted");
     static_assert(HasProducerFactory<rune::client::Client>, "the concept itself works");
     SUCCEED();
+}
+
+// ---------------------------------------------------------------------------
+// C10 (#338): every ingress mode and every entry point is gated outside a transaction.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr int64_t kGateNow = 1'000'000'000;
+
+/// Nothing a refused call did may reach a frame: the ring is empty, the builders hold no record.
+void expectNothingSent(ProducerImpl& impl, bool direct, const char* why) {
+    test_support::FrameCapture cap;
+    if (!direct) EXPECT_EQ(impl.drainRing(kGateNow, 256), 0) << why;
+    for (int i = 0; i < 4; ++i) {
+        if (!direct) (void)impl.drainRing(kGateNow, 256);
+        (void)impl.flushBatches(kGateNow, 42, cap.fn());
+    }
+    EXPECT_EQ(cap.frames, 0) << why << ": a frame left";
+    EXPECT_TRUE(cap.recs.empty()) << why;
+}
+}  // namespace
+
+TEST(ProducerTxnApiRegression, EveryIngressModeAndEntryPointIsGatedOutsideATransactionRegression) {
+    for (const bool direct : {false, true}) {
+        SCOPED_TRACE(direct ? "Invoker (Direct) ingress" : "Thread (Ring) ingress");
+        Rig r(cfgOf(Acks::All, "tx-matrix"));
+        if (direct) r.impl->enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr, 1});
+        ASSERT_EQ(r.impl->txnGate(), ProducerImpl::TxnGate::Closed);
+        Producer& p = r.p;
+        rc::Completions cq(*r.client, smallCq());
+        rc::Completions bq(*r.client, smallCq());
+        p.batchAcksTo(bq);  // every refusal below must also keep no batch-ack unit
+        const Key k(uint64_t{1});
+
+        struct Case {
+            const char*                        name;
+            std::function<SendResult()>        run;
+        };
+        const std::vector<Case> returning = {
+            {"trySend", [&] { return p.trySend(kTopic, k, bytes("v")); }},
+            {"trySendTo", [&] { return p.trySendTo(kTopic, 0, k, bytes("v")); }},
+            {"trySend(cq)", [&] { return p.trySend(kTopic, k, bytes("v"), cq, 9); }},
+            {"trySend(token)", [&] { return p.trySend(kTopic, k, bytes("v"), rc::AckToken{9}); }},
+            {"tryClaim", [&] { return p.tryClaim(kTopic, k, 8).result(); }},
+            {"tryClaim(cq)", [&] { return p.tryClaim(kTopic, k, 8, cq, 9).result(); }},
+            {"tryClaim(token)", [&] { return p.tryClaim(kTopic, k, 8, rc::AckToken{9}).result(); }},
+            {"claimBatch", [&] { return p.claimBatch(kTopic, k, 2, 8).result(); }},
+        };
+        for (const Case& c : returning) {
+            EXPECT_EQ(c.run(), SendResult::NotInTransaction) << c.name;
+            EXPECT_EQ(cq.reservedBytes(), 0u) << c.name << " keeps no credit";
+        }
+        EXPECT_EQ(bq.outstanding(), 0u) << "no refused call kept a batch-ack unit";
+        EXPECT_EQ(bq.reservedBytes(), 0u);
+        const std::vector<Case> throwing = {
+            {"send", [&] { p.send(kTopic, k, bytes("v")); return SendResult::Ok; }},
+            {"sendTo", [&] { p.sendTo(kTopic, 0, k, bytes("v")); return SendResult::Ok; }},
+            {"send(cq)", [&] { p.send(kTopic, k, bytes("v"), cq, 9); return SendResult::Ok; }},
+            {"send(token)", [&] { p.send(kTopic, k, bytes("v"), rc::AckToken{9}); return SendResult::Ok; }},
+        };
+        for (const Case& c : throwing) EXPECT_THROW((void)c.run(), std::logic_error) << c.name;
+        // Tier-2 batch: throws, keeps no credit, stays intact.
+        auto b = p.batch(kTopic, k);
+        b.add(bytes("a"));
+        EXPECT_THROW((void)b.send(), std::logic_error);
+        EXPECT_THROW((void)b.send(cq, 3), std::logic_error);
+        EXPECT_THROW((void)b.send(rc::AckToken{3}), std::logic_error);
+        EXPECT_EQ(cq.reservedBytes(), 0u);
+        EXPECT_EQ(bq.outstanding(), 0u);
+        expectNothingSent(*r.impl, direct, "closed gate");
+
+        // Typed: send(rec) throws, claim(key) is NotInTransaction, over a gated producer.
+        {
+            ProducerImpl* timpl = new ProducerImpl(cfgOf(Acks::All, "tx-typed"), 1 << 20);
+            ProducerImpl::Hooks h;
+            h.ctx = r.client.get();
+            timpl->setHooks(h);
+            if (direct) timpl->enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr, 1});
+            rc::TypedTopic<rune::gen::Position> topic{Producer{timpl}, kTopic, uint16_t{1}};
+            rune::gen::Position rec;
+            rec.userId = 5;
+            EXPECT_THROW(topic.send(rec), std::logic_error);
+            auto w = topic.claim(int64_t{5});
+            EXPECT_FALSE(w);
+            EXPECT_EQ(w.result(), SendResult::NotInTransaction);
+            w.zone(1);  // scratch only
+            EXPECT_FALSE(w.commit());
+            expectNothingSent(*timpl, direct, "typed over a closed gate");
+            if (!direct) {  // (an Invoker producer's gate also needs the transaction machine InTransaction)
+                // Gate open: the very same typed topic now takes both.
+                timpl->setTxnGate(ProducerImpl::TxnGate::Open);
+                EXPECT_NO_THROW(topic.send(rec));
+                auto ok = topic.claim(int64_t{6});
+                EXPECT_TRUE(ok) << static_cast<int>(ok.result());
+                if (ok) ok.abort();
+            }
+        }
+
+        if (direct) continue;
+        // Ring: the gate is the only thing refusing - open it and every entry point is served.
+        r.impl->setTxnGate(ProducerImpl::TxnGate::Open);
+        EXPECT_EQ(p.trySend(kTopic, k, bytes("v")), SendResult::Ok);
+        {
+            auto claim = p.tryClaim(kTopic, k, 8);
+            EXPECT_EQ(claim.result(), SendResult::Ok);
+            claim.abort();
+        }
+        {
+            auto claim = p.claimBatch(kTopic, k, 2, 8);
+            EXPECT_EQ(claim.result(), SendResult::Ok);
+            claim.abort();
+        }
+    }
 }
