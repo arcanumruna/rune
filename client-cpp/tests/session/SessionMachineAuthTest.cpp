@@ -141,6 +141,53 @@ TEST(SessionMachineAuthRegression, FullExchangeReachesConnectedOnlyAfterTheServe
     EXPECT_FALSE(m.passwordChangeRequired());
 }
 
+TEST(SessionMachineAuthRegression, InstallPasswordDoesNotAllocateAndWipesTheOldSecretRegression) {
+    // No allocation hook exists in this binary (and none may be added): FixedSecret has no allocating member.
+    rune::client::detail::FixedSecret s;
+    ASSERT_TRUE(s.assign("old password 123456"));
+    ASSERT_TRUE(s.assign("new"));
+    EXPECT_EQ(s.view(), "new");
+    EXPECT_EQ(s.rawForTest().find("password"), std::string_view::npos) << "the old tail is wiped";
+    const std::string big(1025, 'x');
+    EXPECT_FALSE(s.assign(big));
+    EXPECT_EQ(s.view(), "new") << "refused, not truncated";
+    EXPECT_TRUE(s.assign(std::string(1024, 'y')));
+    EXPECT_EQ(s.view().size(), 1024u);
+
+    CapturingIo io; sm::SessionConfig cfg; cfg.username = "ws1"; cfg.password = "correct horse battery";
+    sm::SessionMachine m(io, cfg);
+    EXPECT_TRUE(cfg.password.size() > 0);   // the caller's copy is its own
+    EXPECT_TRUE(m.installPassword("another long password"));
+    EXPECT_FALSE(m.installPassword(big));
+}
+
+namespace {
+// True when the object's own bytes (where libstdc++ keeps a string of <= 15 chars in place) still hold `needle`.
+template <class T> bool bytesHold(const T& o, std::string_view needle) {
+    // libstdc++ zeroes the first byte of a moved-from in-place string: the rest of the password is what remains.
+    const std::string_view raw(reinterpret_cast<const char*>(&o), sizeof(T));
+    return raw.find(needle.substr(1)) != std::string_view::npos;
+}
+} // namespace
+
+TEST(SessionMachineAuthRegression, AMovedFromSecretStringKeepsNoShortPasswordInPlaceAdversarialRegression) {
+    // C6 review: a moved-from std::string of <= 15 chars keeps its bytes in place with size 0, so a size-based wipe
+    // of the moved-from SecretString misses them.  Both move paths; a short (in-place) and a long password.
+    namespace d = rune::client::detail;
+    for (const std::string_view pw : {std::string_view("shortpw-9q"), std::string_view("a-much-longer-password-9q")}) {
+        d::SecretString a; a.assign(pw);
+        d::SecretString b(std::move(a));
+        EXPECT_FALSE(bytesHold(a, pw)) << "move-constructed from: '" << pw << "' left in place";
+        EXPECT_EQ(b.view(), pw);
+        d::SecretString c; c.assign("x");
+        c = std::move(b);
+        EXPECT_FALSE(bytesHold(b, pw)) << "move-assigned from: '" << pw << "' left in place";
+        EXPECT_EQ(c.view(), pw);
+        c.assign("y");
+        EXPECT_FALSE(bytesHold(c, pw)) << "re-assigned: the old password left in place";
+    }
+}
+
 TEST(SessionMachineAuthRegression, AWrongServerSignatureIsRejectedNeverConnected) {
     Rig t; t.connectAuthRequired();
     Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));

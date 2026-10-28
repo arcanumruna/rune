@@ -35,6 +35,7 @@
 #include <concurrent/AtomicBuffer.h>
 #include <rune/client/detail/FlatIndexMap.h>
 #include <rune/client/detail/HubCommand.h>
+#include <rune/client/detail/SecureZero.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (templated read, no std::function)
 
 #include <cstddef>
@@ -470,12 +471,13 @@ public:
     /// Review B I4: the credential changed (the user set their own password): every session logs in with
     /// `newPassword` from now on (also sessions opened later), the salted-password cache is cleared (the old password's
     /// salted values must not survive), a one-time session is a normal one.  Duty thread.
-    void installPassword(std::string_view newPassword) noexcept {
-        if (!cfg_.session.password.empty()) detail::secureZero(cfg_.session.password.data(), cfg_.session.password.size());
-        cfg_.session.password.assign(newPassword);
-        for (auto& s : sessions_) s->machine.installPassword(newPassword);
+    [[nodiscard]] bool installPassword(std::string_view newPassword) noexcept {
+        if (!secret_.assign(newPassword)) return false;   // over capacity: refused, the old secret stays
+        for (auto& s : sessions_) s->machine.passwordChanged();
         scramCache_.clear();
+        return true;
     }
+    [[nodiscard]] const detail::FixedSecret& secretForTest() const noexcept { return secret_; }
     /// Review B I1: sessions other than the seed that are Rejected (revoked / login refused) — cheap check (the
     /// session list is cluster-sized).  The owner then fails the routes they carried.
     [[nodiscard]] uint32_t rejectedLeaderSessions() const noexcept {
@@ -923,6 +925,9 @@ private:
     // Members
     // -------------------------------------------------------------------------
 
+    /// The one password copy, shared by every session's machine.  Declared first (#257, C6 review): the constructor
+    /// moves the password into it before anything that can throw, and it outlives every session pointing at it.
+    detail::FixedSecret secret_;
     AgentConfig cfg_;
 
     // ---- Transport (SHARED across all sessions; agent-thread owned) ----------

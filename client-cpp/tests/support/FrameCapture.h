@@ -22,6 +22,10 @@ struct CapturedRecord {
     int64_t     corr      = 0;  // the frame's correlation id
     std::string key;
     std::string value;
+    // #331: where the decoded value sits in the offered frame (offset from the frame start; the address of the
+    // frame start itself is frameBase, valid only while that frame's buffer is alive - compare, never dereference).
+    std::size_t    valueOffset = 0;
+    const uint8_t* frameBase   = nullptr;
 };
 
 struct FrameCapture {
@@ -30,6 +34,8 @@ struct FrameCapture {
     int                         frames       = 0;
     const uint8_t*              watch        = nullptr;
     bool                        watchInFrame = false;
+    bool                        keepRaw      = false;  ///< #331: also keep a byte copy of every offered frame
+    std::vector<std::vector<uint8_t>> rawFrames;       ///< one per decoded frame, when keepRaw
 
     rune::client::producer::ProducerImpl::SendFn fn() {
         return [this](int32_t, int32_t partition, int32_t, const uint8_t* b, std::size_t n) {
@@ -37,10 +43,14 @@ struct FrameCapture {
             const auto v = rune::client::codec::decodeProduce(b, n);
             if (!v) return true;
             const int f = frames++;
+            if (keepRaw) rawFrames.emplace_back(b, b + n);
             corrs.push_back(v->correlationId);
             rune::protocol::RecordBatchReader r(v->recordBatch.data(), v->recordBatch.size());
             r.forEachRecord([&](std::string_view k, std::string_view val, int64_t off, int64_t) {
-                recs.push_back(CapturedRecord{partition, f, off, v->correlationId, std::string(k), std::string(val)});
+                recs.push_back(CapturedRecord{partition, f, off, v->correlationId, std::string(k), std::string(val),
+                                              static_cast<std::size_t>(
+                                                  reinterpret_cast<const uint8_t*>(val.data()) - b),
+                                              b});
             });
             return true;
         };

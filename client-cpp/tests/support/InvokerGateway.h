@@ -456,14 +456,14 @@ struct InvokerGateway {
     /// the FIRST decision again - no second scripted code, no second apply.  Keyed (pid, epoch, correlation id).
     std::map<std::tuple<int64_t, int16_t, int64_t>, int16_t> coordDecided_;
     /// The code for a coordinator request; `resend` = it was decided before.
-    int16_t coordDecide_(int64_t pid, int16_t epoch, int64_t corr, bool& resend) {
+    int16_t coordDecide_(int64_t pid, int16_t epoch, int64_t corr, bool& resend, bool offsetCommitLeg = false) {
         const auto key = std::make_tuple(pid, epoch, corr);
         if (const auto it = coordDecided_.find(key); it != coordDecided_.end()) {
             resend = true;
             return it->second;
         }
         resend = false;
-        const int16_t code = txnCoordCode_(pid, epoch);
+        const int16_t code = txnCoordCode_(pid, epoch, offsetCommitLeg);
         // A retriable answer (27 ConcurrentTransactions, 14 NotCoordinator) is not a decision: the client re-sends the
         // same request (same correlation id) and it is decided afresh.
         if (code != static_cast<int16_t>(rune::protocol::client::ErrorCode::ConcurrentTransactions) &&
@@ -475,6 +475,23 @@ struct InvokerGateway {
     // Scripted coordinator answers: the next AddPartitions / AddOffsets / TxnOffsetCommit / EndTxn requests are
     // answered with the front code (19 InvalidTxnState, 18 ProducerFenced, ...) and NOT applied; popped per request.
     std::deque<int16_t> txnCoordCodes;
+    /// #373: codes answered ONLY by TxnOffsetCommit requests (19 / 27 / 14), independent of AddOffsets: a code in
+    /// txnCoordCodes goes to whichever coordinator request comes first, which for an offsets leg is the AddOffsets.
+    std::deque<int16_t> txnOffsetCommitCodes;
+    /// #373: TxnOffsetCommit requests answered with an injected code (from either queue; a fence's 18 is not one).
+    int injectedOffsetCommitCodes = 0;
+    /// #373: injected sequence-gap answers (OutOfOrderSequence 20 / UnknownProducerId 28).  The next FRESH idempotent
+    /// Produce - the next sequence of its partition, its answer not dropped - is rejected with the front code and not
+    /// appended, as a broker that lost the producer's state or saw a gap would.  Not counted in oosAnswers /
+    /// unknownPidAnswers (those stay "the client caused a gap").  Each injection is logged in seqGapEvents, in order.
+    std::deque<int16_t> seqGapCodes;
+    int                 injectedSeqGaps = 0;
+    std::vector<int16_t> seqGapEvents;
+    /// #373: a transactional InitProducerId answered OK after an injected gap and before the next such init: the
+    /// KIP-360 epoch bump (the poisoned transaction's abort re-inits the id).  A replacement producer's init after a gap
+    /// counts too.
+    int  epochBumpsAfterGap = 0;
+    bool gapSinceInit_      = false;
     /// A later init of the same transactional id: bumps its epoch and fences every request still stamped with
     /// the old one (answered ProducerFenced 18, not applied) - the zombie rule of a real coordinator.
     std::map<int64_t, int16_t> fencedBelow;   ///< producerId -> the lowest epoch still accepted
@@ -496,13 +513,20 @@ struct InvokerGateway {
     }
     /// The code a coordinator request stamped (pid, epoch) is answered with: 18 for a fenced epoch, else the next
     /// scripted code, else 0.
-    int16_t txnCoordCode_(int64_t pid, int16_t epoch) {
+    int16_t txnCoordCode_(int64_t pid, int16_t epoch, bool offsetCommitLeg = false) {
         if (const auto f = fencedBelow.find(pid); f != fencedBelow.end() && epoch < f->second) {
             return static_cast<int16_t>(rune::protocol::client::ErrorCode::ProducerFenced);
+        }
+        if (offsetCommitLeg && !txnOffsetCommitCodes.empty()) {   // #373: this leg's own queue first
+            const int16_t c = txnOffsetCommitCodes.front();
+            txnOffsetCommitCodes.pop_front();
+            if (c != 0) ++injectedOffsetCommitCodes;
+            return c;
         }
         if (!txnCoordCodes.empty()) {
             const int16_t c = txnCoordCodes.front();
             txnCoordCodes.pop_front();
+            if (offsetCommitLeg && c != 0) ++injectedOffsetCommitCodes;
             return c;
         }
         return 0;
@@ -1325,6 +1349,25 @@ private:
             if (answer) ackAt(pr, injected, 0);
             return;
         }
+        if (!seqGapCodes.empty() && answer && pv.producerId >= 0) {   // #373: an injected sequence-gap answer
+            const auto gapKey = std::make_tuple(pv.topicId, pv.producerId, pv.partition);
+            const auto gapIt  = seqStates.find(gapKey);
+            const bool fresh  = gapIt == seqStates.end()
+                                    ? pv.baseSequence == 0
+                                    : (pv.producerEpoch > gapIt->second.epoch
+                                           ? pv.baseSequence == 0
+                                           : (pv.producerEpoch == gapIt->second.epoch &&
+                                              pv.baseSequence == gapIt->second.lastSeq + 1));
+            if (fresh) {
+                const int16_t gap = seqGapCodes.front();
+                seqGapCodes.pop_front();
+                ++injectedSeqGaps;
+                seqGapEvents.push_back(gap);
+                gapSinceInit_ = true;
+                ackAt(pr, gap, 0, gap == static_cast<int16_t>(rp::ErrorCode::UnknownProducerId) ? logStartOffset : -1);
+                return;
+            }
+        }
         if (notLeaderEndpoints.count(endpoint) != 0) {  // refuseNotOwned_: not processed
             ++notLeaderAnswers;
             if (answer) ackAt(pr, static_cast<int16_t>(rp::ErrorCode::NotLeader), -1);
@@ -1913,6 +1956,10 @@ private:
             if (rsp.errorCode == 0 && !plain) {   // a transactional id's epoch grows with every successful init / bump
                 const std::string tid(ip->transactionalId.begin(), ip->transactionalId.end());
                 rsp.producerEpoch = txnEpochs_[tid]++;
+                if (gapSinceInit_) {   // #373: the init that follows an injected sequence gap (KIP-360)
+                    ++epochBumpsAfterGap;
+                    gapSinceInit_ = false;
+                }
                 // A real coordinator's InitProducerId ends the id's previous transaction (Kafka: an ongoing one is
                 // aborted on the epoch bump): a fenced zombie's open batches and staged offsets never commit later.
                 for (auto& b : log) {
@@ -1984,7 +2031,7 @@ private:
             if (!oc) return;
             txnFrames.push_back({TxnFrameKind::TxnOffsetCommit, -1, false, oc->producerId, oc->producerEpoch, 0});
             bool resend = false;
-            const int16_t code = coordDecide_(oc->producerId, oc->producerEpoch, oc->correlationId, resend);
+            const int16_t code = coordDecide_(oc->producerId, oc->producerEpoch, oc->correlationId, resend, /*offsetCommitLeg=*/true);
             coordDecisions.push_back({TxnFrameKind::TxnOffsetCommit, code, 0, oc->producerEpoch, replyTxn && !holdTxnReplies, resend,
                                       oc->producerId, oc->correlationId});
             lastTxnOffsetGroup.assign(oc->groupId.begin(), oc->groupId.end());

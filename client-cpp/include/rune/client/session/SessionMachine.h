@@ -311,6 +311,10 @@ struct CryptoState {
     // per receiver per session).  Populated alongside `send` in finishHandshake_.
     rune::crypto::AeadKey c2bKey{};
     uint8_t               c2bPrefix[rune::crypto::kNoncePrefix] = {};
+    // #535 test seam (cold path: the FIRST derivation per receiver slot): the receiver-key derivation selectSendSlot
+    // uses.  Production never changes it; a test installs a failing one to prove an underivable key seals nothing.
+    bool (*deriveReceiverKeyFn)(const rune::crypto::AeadKey&, uint8_t, rune::crypto::AeadKey&) noexcept =
+        &rune::crypto::deriveReceiverKey;
     struct ReceiverSend {
         std::optional<rune::crypto::AeadCipher> cipher;
         uint64_t sendSeq = 0;
@@ -350,7 +354,12 @@ public:
         : io_(io)
         , cfg_(std::move(cfg))
         , correlationIdCounter_(cfg_.correlationIdBase) // Task 1.3: disjoint per-session range
-    {}
+    {
+        // A password over kCapacity leaves the secret empty (the login then fails AuthenticationFailed); Client and
+        // ClientAgent refuse it earlier with std::invalid_argument.
+        (void)ownSecret_.assign(cfg_.password);
+        detail::wipeString(cfg_.password);
+    }
 
     // Non-copyable, non-movable (holds reference to io_).
     SessionMachine(const SessionMachine&)            = delete;
@@ -439,7 +448,7 @@ public:
                 return;
             const LoginCredential& c = *loginCredential_;
             const auto salt = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(c.salt.data()), c.salt.size());
-            const auto* sp = cache_->saltedPassword(cfg_.password, salt, c.iterations);
+            const auto* sp = cache_->saltedPassword(secret_->view(), salt, c.iterations);
             if (sp == nullptr) return;
             const auto proof = rune::crypto::scram::clientProof(rune::crypto::Digest::Sha512, *sp,
                                                                 rpc::credentialChangeMessage(c.loginNonce, *m));
@@ -451,11 +460,17 @@ public:
     }
     /// Why the machine refused the broker (Rejected after an OK ConnectResponse that skipped the login); "" if not.
     [[nodiscard]] const std::string& rejectDetail() const noexcept { return rejectDetail_; }
-    /// Review B I4: the session user changed their own password — the next login uses the new one, and a
-    /// one-time (must-change) session is now a normal one.  Duty thread.
-    void installPassword(std::string_view newPassword) noexcept {
-        if (!cfg_.password.empty()) detail::secureZero(cfg_.password.data(), cfg_.password.size());
-        cfg_.password.assign(newPassword);
+    /// Review B I4: the session user changed their own password - the next login uses the new one, and a one-time
+    /// (must-change) session is now a normal one.  Duty thread.  For a standalone machine (its own secret); the agent
+    /// updates its shared secret and calls passwordChanged().  false (nothing changed): shared secret, or over the cap.
+    [[nodiscard]] bool installPassword(std::string_view newPassword) noexcept {
+        if (secret_ != &ownSecret_ || !ownSecret_.assign(newPassword)) return false;
+        passwordChanged();
+        return true;
+    }
+    /// The credential changed (the agent already updated the shared secret): the one-time flag is cleared and the
+    /// login proof is dropped.
+    void passwordChanged() noexcept {
         authInfo_.passwordChangeRequired = false;
         // Issue #114: the login's password may be gone (SET replaces every verifier): this session can no longer prove a
         // further own-credential change (the broker answers "log in again") - never sign with a stale salt, which
@@ -497,6 +512,12 @@ public:
     /// Authentication: the salted-password cache is the duty thread's (the agent's), shared by its sessions;
     /// a machine built alone (tests) uses its own.  Duty thread, before the first connect.
     void useScramCache(ScramCache* cache) noexcept { cache_ = cache != nullptr ? cache : &ownCache_; }
+    /// The agent's shared secret (one copy for every session); nullptr = this machine's own.  Duty thread, before
+    /// the first connect.  Wipes the machine's own copy.
+    void useSharedSecret(const detail::FixedSecret* s) noexcept {
+        secret_ = s != nullptr ? s : &ownSecret_;
+        if (s != nullptr) ownSecret_.wipe();
+    }
     /// client<->broker TLS/AEAD (Task 5): the session's crypto state.  `encrypted`
     /// is false until the handshake completes (or if no cipher was negotiated).
     [[nodiscard]] const CryptoState& cryptoState() const noexcept { return cryptoState_; }
@@ -888,7 +909,7 @@ public:
         for (uint8_t i = 0; i < sf.count; ++i) {
             const auto salt = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(sf.salts[i].salt.data()),
                                                        sf.salts[i].salt.size());
-            const auto* sp = cache_->saltedPassword(cfg_.password, salt, sf.salts[i].iterations);
+            const auto* sp = cache_->saltedPassword(secret_->view(), salt, sf.salts[i].iterations);
             if (sp == nullptr) { failAuthLocal_(); return; }
             fin.authMessages[i] = rs::authMessage(first->clientFirstBare,
                                                   rs::serverFirst(combined, salt, sf.salts[i].iterations), cfwp);
@@ -1932,6 +1953,8 @@ private:
     AuthInfo     authInfo_{};
     ScramCache   ownCache_;
     ScramCache*  cache_ = &ownCache_;
+    detail::FixedSecret        ownSecret_;
+    const detail::FixedSecret* secret_ = &ownSecret_;
 };
 
 } // namespace rune::client::session

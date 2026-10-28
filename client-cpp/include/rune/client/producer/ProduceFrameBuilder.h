@@ -29,6 +29,7 @@
 #include <rune/protocol/client/MessageHeader.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -117,6 +118,9 @@ public:
     };
     [[nodiscard]] Mark mark() const noexcept { return Mark{frame_.size(), recordCount_, maxTimestamp_}; }
     void rollback(const Mark& m) noexcept {
+        // Debug-only precondition (#333, no release-path branch): a Mark is always taken at or before the point we
+        // roll back from; a larger (stale) one would GROW the frame over bytes nobody wrote.
+        assert(m.size <= frame_.size() && "rollback to a stale Mark taken after the current end");
         frame_.resize(m.size);  // shrink only: never allocates
         recordCount_  = m.recordCount;
         maxTimestamp_ = m.maxTimestamp;

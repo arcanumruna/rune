@@ -1182,3 +1182,106 @@ TEST(ProducerTxnOffsetsRegression, AMemberIdOverTheCapCompletesInvalidArgumentRe
     ASSERT_TRUE(m && m->hasMemberBlock);
     EXPECT_EQ(m->memberId.size(), rp::kMaxTxnMemberIdBytes);
 }
+
+// #350: the widest legal control message through every txn control op that rides writeTxnControl_.  Only SendOffsets
+// carries variable fields; the others are header-only and are issued behind it so the ring holds the widest message
+// next to the narrowest.  Every byte of the group id and the member id differs from its neighbours, so an overflow, a
+// shifted field or a clobbered tail shows as a mismatch in the frames the coordinator receives.
+// RED (mutation): `alignas(8) uint8_t buf[kTxnCtlMaxBytes - 64]` in ProducerImpl::writeTxnControl_.
+TEST(ProducerTxnControlRegression, MaxSizeControlMessageIsEncodedWithoutOverflowRegression) {
+    Rig r(txnCfg(), 1 << 20);
+    ringReady(r);
+    std::string group(rp::kMaxTxnGroupIdBytes, 'g');
+    for (std::size_t i = 0; i < group.size(); ++i) group[i] = static_cast<char>('a' + (i * 7) % 26);
+    std::string member(rp::kMaxTxnMemberIdBytes, 'm');
+    for (std::size_t i = 0; i < member.size(); ++i) member[i] = static_cast<char>('A' + (i * 11) % 26);
+    const auto offs = offsetsOf(static_cast<int>(rp::kMaxTxnOffsets));
+    ASSERT_EQ(offs.size(), rp::kMaxTxnOffsets);
+
+    // The widest: group id, member id and offsets all at their caps (the member form and the legacy form).
+    Token wide = 0;
+    ASSERT_EQ(issueWithMember(r, wide, offs, group, 0x7fffffff, member), rc::OpResult::Accepted);
+    r.tick();
+    r.tick();
+    const auto adds = r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID);
+    ASSERT_EQ(adds.size(), 1u);
+    const auto add = rpc::AddOffsetsToTxn::decode(r.cap.data(adds[0]), adds[0].len);
+    ASSERT_TRUE(add);
+    EXPECT_EQ(std::string(add->groupId.begin(), add->groupId.end()), group);
+    r.answerFrame(adds[0], rp::ReqKind::AddOffsets, 0);
+    r.tick();
+    const auto commits = r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID);
+    ASSERT_GE(commits.size(), 2u) << "1024 entries are split across requests (FD5)";
+    std::size_t total = 0;
+    for (const auto& f : commits) {
+        const auto m = rpc::TxnOffsetCommit::decode(r.cap.data(f), f.len);
+        ASSERT_TRUE(m);
+        EXPECT_EQ(std::string(m->groupId.begin(), m->groupId.end()), group);
+        EXPECT_TRUE(m->hasMemberBlock);
+        EXPECT_EQ(m->generationId, 0x7fffffff);
+        EXPECT_EQ(std::string(m->memberId.begin(), m->memberId.end()), member);
+        for (const auto& e : m->entries) {
+            ASSERT_LT(total, offs.size());
+            EXPECT_EQ(e.topicId, offs[total].topicId) << total;
+            EXPECT_EQ(e.partition, offs[total].partition) << total;
+            EXPECT_EQ(e.offset, offs[total].offset) << total;
+            ++total;
+        }
+    }
+    EXPECT_EQ(total, offs.size()) << "every offset of the widest message reached the coordinator, in order";
+    for (const auto& f : commits) r.answerFrame(f, rp::ReqKind::TxnOffsetCommit, 0);
+    ASSERT_EQ(r.d(wide).times, 1);
+    EXPECT_EQ(r.d(wide).status, OpStatus::Ok);
+
+    // The legacy (group id only) widest form, then every header-only kind behind it in the same ring.
+    Token legacy = 0;
+    ASSERT_EQ(issueWithMember(r, legacy, offs, group, -1, {}), rc::OpResult::Accepted);
+    const auto fl = r.issue(TxnControl::Kind::Flush);
+    ASSERT_EQ(fl.result, rc::OpResult::Accepted);
+    r.tick();
+    r.tick();
+    if (r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).size() > 1) {   // a second AddOffsets for the second call
+        r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+        r.tick();
+    }
+    const auto commits2 = r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID);
+    ASSERT_GT(commits2.size(), commits.size());
+    std::size_t total2 = 0;
+    for (std::size_t k = commits.size(); k < commits2.size(); ++k) {
+        const auto m = rpc::TxnOffsetCommit::decode(r.cap.data(commits2[k]), commits2[k].len);
+        ASSERT_TRUE(m);
+        EXPECT_EQ(std::string(m->groupId.begin(), m->groupId.end()), group);
+        EXPECT_FALSE(m->hasMemberBlock);
+        for (const auto& e : m->entries) {
+            ASSERT_LT(total2, offs.size());
+            EXPECT_EQ(e.offset, offs[total2].offset) << total2;
+            ++total2;
+        }
+    }
+    EXPECT_EQ(total2, offs.size());
+    for (std::size_t k = commits.size(); k < commits2.size(); ++k) {
+        r.answerFrame(commits2[k], rp::ReqKind::TxnOffsetCommit, 0);
+    }
+    EXPECT_EQ(r.d(legacy).times, 1);
+    EXPECT_EQ(r.d(legacy).status, OpStatus::Ok);
+    r.tick();
+    EXPECT_EQ(r.d(fl.token).times, 1);
+    EXPECT_EQ(r.d(fl.token).status, OpStatus::Ok);
+    const auto commit = r.issue(TxnControl::Kind::Commit);
+    ASSERT_EQ(commit.result, rc::OpResult::Accepted);
+    r.tick();
+    r.tick();
+    r.answerFrame(r.lastOf(rpc::EndTxn::TEMPLATE_ID), rp::ReqKind::EndTxn, 0);
+    EXPECT_EQ(r.d(commit.token).times, 1);
+    EXPECT_EQ(r.d(commit.token).status, OpStatus::Ok);
+    // The remaining header-only kinds ride the same writer next to the widest message's leftovers: each is written,
+    // applied and completed exactly once (the machine is Ready: both are refused 19, none is lost or garbled).
+    for (const TxnControl::Kind k : {TxnControl::Kind::Abort, TxnControl::Kind::Init}) {
+        const auto c = r.issue(k);
+        ASSERT_EQ(c.result, rc::OpResult::Accepted);
+        r.tick();
+        EXPECT_EQ(r.d(c.token).times, 1) << static_cast<int>(k);
+        EXPECT_EQ(r.d(c.token).status, OpStatus::BrokerError) << static_cast<int>(k);
+        EXPECT_EQ(r.d(c.token).code, kInvalidTxnState) << static_cast<int>(k);
+    }
+}

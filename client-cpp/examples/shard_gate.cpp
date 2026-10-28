@@ -39,6 +39,7 @@
 //
 // Output: one `RESULT key=value ...` line (and `VERIFY ...` for --arm verify).
 // Exit code 0 = ran to completion (the gate scripts judge the numbers).
+#include "AtomicFile.h"
 #include "ExampleAuth.h"
 #include <rune/client/Client.h>
 #include <rune/client/detail/CpuAffinity.h>
@@ -318,8 +319,6 @@ constexpr uint32_t kAckedMagic = 0x4B414753u;
 
 bool writeAckedFile(const std::string& path, const std::vector<uint8_t>& okIds,
                     const std::vector<uint8_t>& failedIds) {
-    std::FILE* f = std::fopen(path.c_str(), "wb");
-    if (f == nullptr) return false;
     const uint32_t hdr[2] = {kAckedMagic, 2u};
     const uint64_t nbits  = okIds.size();
     auto pack = [&](const std::vector<uint8_t>& ids) {
@@ -330,11 +329,12 @@ bool writeAckedFile(const std::string& path, const std::vector<uint8_t>& okIds,
         return bits;
     };
     const std::vector<uint8_t> okBits = pack(okIds), failedBits = pack(failedIds);
-    bool ok = std::fwrite(hdr, sizeof hdr, 1, f) == 1 && std::fwrite(&nbits, sizeof nbits, 1, f) == 1 &&
-              (okBits.empty() || (std::fwrite(okBits.data(), okBits.size(), 1, f) == 1 &&
-                                  std::fwrite(failedBits.data(), failedBits.size(), 1, f) == 1));
-    ok = (std::fclose(f) == 0) && ok;
-    return ok;
+    std::string bytes;
+    bytes.append(reinterpret_cast<const char*>(hdr), sizeof hdr);
+    bytes.append(reinterpret_cast<const char*>(&nbits), sizeof nbits);
+    bytes.append(reinterpret_cast<const char*>(okBits.data()), okBits.size());
+    if (!okBits.empty()) bytes.append(reinterpret_cast<const char*>(failedBits.data()), failedBits.size());
+    return rune::examples::writeFileAtomically(path, bytes);   // #44: a poller never sees a partial file
 }
 
 // Returns false on a missing / malformed file.  failedIds is empty for v1.

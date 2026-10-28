@@ -4,18 +4,48 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <new>
+
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#else
+#include <malloc.h>
+#endif
 
 namespace {
 std::atomic<bool> g_on{false};
 std::atomic<long> g_count{0};
 thread_local bool t_on    = false;  // test instrumentation (startThisThread)
 thread_local long t_count = 0;
+thread_local long t_ext   = 0;  // the part of t_count that came from noteExternal()
+thread_local long t_failIn = 0;      // failNthAllocationThisThread: 0 = disarmed
+thread_local bool t_failFired = false;
+thread_local const char* t_needle    = nullptr;   // scanFreedForThisThread: null = disarmed
+thread_local std::size_t t_needleLen = 0;
+thread_local long        t_freedHits = 0;
+/// Counts a block about to be freed that still holds the armed needle (no allocation here).
+void scanBeforeFree(void* p) noexcept {
+    if (t_needle == nullptr || p == nullptr) return;
+#if defined(__APPLE__)
+    const std::size_t n = malloc_size(p);
+#else
+    const std::size_t n = malloc_usable_size(p);
+#endif
+    if (n >= t_needleLen && ::memmem(p, n, t_needle, t_needleLen) != nullptr) ++t_freedHits;
+}
+/// True when this allocation is the injected failure (counts down the armed n).
+bool injectFailure() noexcept {
+    if (t_failIn <= 0 || --t_failIn != 0) return false;
+    t_failFired = true;
+    return true;
+}
 } // namespace
 
 void* operator new(std::size_t n) {
     if (g_on.load(std::memory_order_relaxed)) g_count.fetch_add(1, std::memory_order_relaxed);
     if (t_on) ++t_count;
+    if (injectFailure()) throw std::bad_alloc{};
     if (void* p = std::malloc(n != 0 ? n : 1)) return p;
     throw std::bad_alloc{};
 }
@@ -27,20 +57,21 @@ void* operator new[](std::size_t n) { return ::operator new(n); }
 void* operator new(std::size_t n, std::align_val_t al) {
     if (g_on.load(std::memory_order_relaxed)) g_count.fetch_add(1, std::memory_order_relaxed);
     if (t_on) ++t_count;
+    if (injectFailure()) throw std::bad_alloc{};
     const std::size_t a = static_cast<std::size_t>(al);
     const std::size_t sz = ((n != 0 ? n : 1) + a - 1) / a * a;  // aligned_alloc: size % align == 0
     if (void* p = std::aligned_alloc(a, sz)) return p;
     throw std::bad_alloc{};
 }
 void* operator new[](std::size_t n, std::align_val_t al) { return ::operator new(n, al); }
-void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, std::align_val_t) noexcept { scanBeforeFree(p); std::free(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { scanBeforeFree(p); std::free(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept { scanBeforeFree(p); std::free(p); }
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { scanBeforeFree(p); std::free(p); }
+void operator delete(void* p) noexcept { scanBeforeFree(p); std::free(p); }
+void operator delete[](void* p) noexcept { scanBeforeFree(p); std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { scanBeforeFree(p); std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { scanBeforeFree(p); std::free(p); }
 // The nothrow forms route through the replaced throwing forms. Otherwise a nothrow allocation (libstdc++'s
 // get_temporary_buffer under std::stable_sort, e.g. in gtest) comes from the default/ASan allocator but is released
 // by the replaced delete: ASan alloc-dealloc-mismatch, and the allocation goes uncounted.
@@ -64,10 +95,30 @@ long stop() noexcept {
 }
 void startThisThread() noexcept {
     t_count = 0;
+    t_ext   = 0;
     t_on    = true;
 }
 long stopThisThread() noexcept {
     t_on = false;
     return t_count;
 }
+void noteExternal() noexcept {
+    if (g_on.load(std::memory_order_relaxed)) g_count.fetch_add(1, std::memory_order_relaxed);
+    if (t_on) {
+        ++t_count;
+        ++t_ext;
+    }
+}
+long externalThisThread() noexcept { return t_ext; }
+void failNthAllocationThisThread(long n) noexcept {
+    t_failIn    = n > 0 ? n : 0;
+    t_failFired = false;
+}
+bool injectedFailureFiredThisThread() noexcept { return t_failFired; }
+void scanFreedForThisThread(const char* needle, std::size_t len) noexcept {
+    t_needle    = len != 0 ? needle : nullptr;
+    t_needleLen = len;
+    t_freedHits = 0;
+}
+long freedHitsThisThread() noexcept { return t_freedHits; }
 } // namespace alloc_counter

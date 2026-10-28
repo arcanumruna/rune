@@ -75,8 +75,10 @@ int main() {
     const bool    invoker    = envStr("CLAIM_INGRESS", "thread") == "invoker";
     const int64_t N          = envI64("CLAIM_RECORDS", 1'000'000);
     const int32_t partitions = static_cast<int32_t>(envI64("CLAIM_PARTITIONS", 8));
-    constexpr int64_t kWarm  = 10'000;
-    if (N <= kWarm) {
+    // #376: the warm-up is 10'000 records (CLAIM_WARMUP) but never more than half of N, so a tiny smoke run
+    // (CLAIM_RECORDS=500) still has a steady-state phase; the default run is unchanged.
+    const int64_t kWarm = std::min<int64_t>(envI64("CLAIM_WARMUP", 10'000), N / 2);
+    if (N <= kWarm || kWarm < 1) {
         std::fprintf(stderr, "CLAIM_RECORDS must exceed the %lld-record warm-up\n", static_cast<long long>(kWarm));
         return 2;
     }
@@ -117,7 +119,11 @@ int main() {
             }
         });
     }
-    auto relieve = [&] {  // back-pressured: Invoker flushes itself, Thread mode yields to the duty thread
+    auto relieve = [&](SendResult r) {  // back-pressured: Invoker flushes itself, Thread mode yields to the duty thread
+        if (r != SendResult::BackPressured && r != SendResult::QueueFull) {   // C10 review: a refusal never retries
+            std::fprintf(stderr, "FAIL: a produce was refused (result %d), not back-pressured\n", static_cast<int>(r));
+            std::exit(1);
+        }
         if (invoker) impl.flushBatches(nowNs(), 1, sink);
         else std::this_thread::yield();
     };
@@ -134,7 +140,7 @@ int main() {
             PositionEncoder e(scratch);
             e.userId(i);
             encodeInto(e, i);
-            while (plain->trySend(topic, key, scratch) != SendResult::Ok) relieve();
+            for (SendResult r; (r = plain->trySend(topic, key, scratch)) != SendResult::Ok;) relieve(r);
             break;
         }
         case Mode::Claim:
@@ -147,7 +153,7 @@ int main() {
                     (void)c.commit();
                     break;
                 }
-                relieve();
+                relieve(c.result());
             }
             break;
         case Mode::TypedSend: {
@@ -171,7 +177,7 @@ int main() {
                     (void)w.commit();
                     break;
                 }
-                relieve();
+                relieve(w.result());
             }
             break;
         }

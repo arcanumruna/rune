@@ -66,6 +66,7 @@ constexpr int32_t kTopicId    = 1;
 constexpr int32_t kPartitions = 3;
 constexpr int     kSteps      = 400;
 constexpr int     kDefaultSeeds = 64;
+int               g_runs        = 0;   // Stress objects built so far (a data directory per run: a seed may run twice)
 using PositionTopic = rc::TypedTopic<rune::gen::Position, rc::ProducerRef>;
 
 enum class DataOp : uint8_t { Send, SendTo, TrySendCq, TrySendAck, Batch, TryClaim, ClaimBatch, TypedSend, TypedClaim };
@@ -134,7 +135,7 @@ public:
         cfg_.gatewayStreamId = 16000 + 2 * static_cast<int32_t>(seed);
         cfg_.egressChannel   = "aeron:ipc";
         cfg_.egressStreamId  = 16001 + 2 * static_cast<int32_t>(seed);
-        cfg_.dataDir         = std::string(std::filesystem::temp_directory_path().string() + "/f_txnst_") + std::to_string(::getpid()) + "_" + n;
+        cfg_.dataDir         = std::string(std::filesystem::temp_directory_path().string() + "/f_txnst_") + std::to_string(::getpid()) + "_" + n + "_" + std::to_string(g_runs++);
         g_sweeper.dirs.push_back(cfg_.dataDir);
         cfg_.runnerMode = rc::RunnerMode::Invoker;
         rc::TopicSpec ts;
@@ -169,6 +170,12 @@ public:
 
     void run();
 
+    // What a run reached (#373): injected sequence gaps, KIP-360 epoch bumps after one, TxnOffsetCommit answers that
+    // carried an injected code.  Read after run().
+    [[nodiscard]] int seqGaps() const noexcept { return gw_->injectedSeqGaps; }
+    [[nodiscard]] int epochBumps() const noexcept { return gw_->epochBumpsAfterGap; }
+    [[nodiscard]] int offsetCommitInjections() const noexcept { return gw_->injectedOffsetCommitCodes; }
+
 private:
     // ---- rig -------------------------------------------------------------------------------------------------------
     uint32_t                         seed_;
@@ -191,6 +198,8 @@ private:
     txm::TxnModel model_;
     std::vector<std::string> log_;          // the step log (printed on failure)
     std::size_t decisionsSeen_ = 0;
+    std::size_t gapsSeen_      = 0;
+    bool        gapArmed_      = false;     // a sequence-gap answer is armed for the op of this step
     rc::Token   nextToken_     = 1000;
     uint64_t    nextValue_     = 0;
     int64_t     nextOffset_    = 1;
@@ -304,6 +313,14 @@ private:
         absorbDecisions_();
     }
     void absorbDecisions_() {
+        // An injected sequence gap is the leader's decision on a produce: the model learns it before the completions it
+        // causes (the answer leaves in this pump; the client completes the batch in a later pass).
+        for (; gapsSeen_ < gw_->seqGapEvents.size(); ++gapsSeen_) {
+            const int16_t code = gw_->seqGapEvents[gapsSeen_];
+            ++stats_["seqGap" + std::to_string(code)];
+            model_.produceGap(code);
+            note("  sequence gap " + std::to_string(code) + " injected -> " + txm::name(model_.state));
+        }
         for (; decisionsSeen_ < gw_->coordDecisions.size(); ++decisionsSeen_) {
             const auto& d = gw_->coordDecisions[decisionsSeen_];
             // An older epoch: a request of a replaced (fenced) producer.  A newer one: this producer after a KIP-360
@@ -584,7 +601,8 @@ private:
         settle();
         checkNoFrameAfterFence_();
         if (dead_) reconnect_();
-        gw_->txnCoordCodes.clear();   // a scripted code still queued is dropped (the new producer starts clean)
+        gw_->txnCoordCodes.clear();
+        gw_->txnOffsetCommitCodes.clear();   // a scripted code still queued is dropped (the new producer starts clean)
         typed_.reset();
         p_.reset();
         settle();
@@ -865,6 +883,28 @@ private:
         }
         seekToken_ = 0;
     }
+    /// #373: arm one sequence-gap answer for the data op about to be issued - only where it is certain to hit that op's
+    /// frame as the HEAD of its partition (so the producer poisons the transaction instead of retrying behind an older
+    /// batch): nothing in flight anywhere, the machine InTransaction, the session up, no scripted code that could
+    /// fail the op's AddPartitions first.  Disarmed after the step's settle if no frame took it.
+    void armGap_() {
+        if (dead_ || !model_.accepts() || acceptedCum_ != ackedCum_ || !gw_->txnCoordCodes.empty() ||
+            !gw_->txnOffsetCommitCodes.empty() || !gw_->seqGapCodes.empty()) {
+            return;
+        }
+        if (std::uniform_int_distribution<int>(0, 99)(rng_) >= 20) return;   // a low rate (of the data ops that can take it)
+        const int16_t code = std::uniform_int_distribution<int>(0, 1)(rng_) == 0 ? int16_t{20} : int16_t{28};
+        gw_->seqGapCodes.push_back(code);
+        gapArmed_ = true;
+        note("arm a sequence gap " + std::to_string(code) + " on the next produce");
+    }
+    /// #373: a code on the next TxnOffsetCommit (not the AddOffsets before it): 19, 27 or 14.
+    void injectOffsetCommit_() {
+        static constexpr int16_t kCodes[] = {19, 27, 14};
+        const int16_t code = kCodes[std::uniform_int_distribution<int>(0, 2)(rng_)];
+        gw_->txnOffsetCommitCodes.push_back(code);
+        note("inject " + std::to_string(code) + " on the next TxnOffsetCommit");
+    }
     void inject_(int16_t code) {
         gw_->txnCoordCodes.push_back(code);
         note("inject " + std::to_string(code) + " on the next coordinator answer");
@@ -908,9 +948,11 @@ private:
             const auto op   = static_cast<DataOp>(std::uniform_int_distribution<int>(0, kDataOps - 1)(rng_));
             const int32_t p = std::uniform_int_distribution<int32_t>(0, kPartitions - 1)(rng_);
             ++counts_[name(op)];
+            armGap_();
             (void)doData_(op, p);
         };
-        if (r < 42) return data();
+        if (r < 38) return data();
+        if (r < 42) { ++counts_["injectOffsetCommit"]; return injectOffsetCommit_(); }
         if (r < 52) {
             if (model_.state != txm::State::Ready) return data();   // begin only after the previous end completed
             ++counts_["begin"];
@@ -935,6 +977,7 @@ private:
         note("wind down");
         if (dead_) reconnect_();
         gw_->txnCoordCodes.clear();
+        gw_->txnOffsetCommitCodes.clear();
         settle();
         for (int round = 0; round < 8; ++round) {
             if (model_.state == txm::State::Fatal) {
@@ -973,6 +1016,10 @@ public:
             randomStep_();
             fatalSeen_ = false;
             settle();
+            if (gapArmed_) {   // not taken by a frame: nothing may be left armed for a later, unprepared step
+                gapArmed_ = false;
+                gw_->seqGapCodes.clear();
+            }
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
             if (ms > 250) note("  (slow step: " + std::to_string(ms) + " ms)");
             if (fatalSeen_) fencedMark_ = std::make_pair(gw_->txnFrames.size(), epoch_);
@@ -1048,3 +1095,29 @@ std::vector<uint32_t> seeds() {
 
 INSTANTIATE_TEST_SUITE_P(TxnStress, TxnStressRegression, ::testing::ValuesIn(seeds()),
                          [](const ::testing::TestParamInfo<uint32_t>& i) { return "Seed" + std::to_string(i.param); });
+
+// #373: the seeded stress used to be blind to two paths - no seed ever reached a KIP-360 epoch bump (the in-process
+// gateway never produced a sequence gap) and a scripted coordinator code almost never landed on TxnOffsetCommit (the
+// AddOffsets before it takes it first).  The gateway now injects a sequence-gap answer (20 / 28) and has a code queue
+// of its own for TxnOffsetCommit; this pins that the stress's seeds REACH both: over the first 16 of its seeds (each run
+// is checked against the model like any other) at least one gap was injected, at least one epoch bump followed one, and
+// at least one TxnOffsetCommit answer carried an injected code.
+// RED (mutations): armGap_() never arming / the gateway ignoring seqGapCodes -> no gap; txnCoordCode_ ignoring
+// txnOffsetCommitCodes -> no injected TxnOffsetCommit code.
+TEST(TxnStressRegression, SeedsReachEpochBumpAndOffsetCommitInjectionRegression) {
+    int gaps = 0, bumps = 0, tocs = 0;
+    const std::vector<uint32_t> all = seeds();
+    const std::size_t           n   = std::min<std::size_t>(all.size(), 16);
+    for (std::size_t i = 0; i < n; ++i) {
+        Stress s(all[i]);
+        s.run();
+        if (::testing::Test::HasFatalFailure()) return;
+        gaps += s.seqGaps();
+        bumps += s.epochBumps();
+        tocs += s.offsetCommitInjections();
+    }
+    EXPECT_GT(gaps, 0) << "no seed injected a sequence gap (" << n << " seeds)";
+    EXPECT_GT(bumps, 0) << "no seed reached a KIP-360 epoch bump (" << gaps << " gaps injected)";
+    EXPECT_GT(tocs, 0) << "no seed had a TxnOffsetCommit answered with an injected code";
+    std::printf("[ reach    ] %zu seeds: %d sequence gaps, %d epoch bumps after one, %d injected TxnOffsetCommit codes\n", n, gaps, bumps, tocs);
+}

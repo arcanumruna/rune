@@ -3,6 +3,8 @@
 // cache.  The fake is as strict as the real broker will be (nothing but the login before it finishes; always two
 // salts; one proof per salt), so a vacuous pass is not possible: each test also asserts what the broker SAW.
 #include <filesystem>
+#include "../support/AllocCounter.h"
+#include "../support/FreePort.h"
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
 
@@ -14,11 +16,14 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstring>
 #include <chrono>
 #include <optional>
 #include <fstream>
 #include <string>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -33,16 +38,6 @@ int64_t fakeNow() noexcept { return g_now; }
 int g_ctr = 0;
 const char* kPw = "correct horse battery";
 
-int freePort() {
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in a{};
-    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
-    (void)::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
-    socklen_t len = sizeof a;
-    (void)::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-    ::close(fd);
-    return ntohs(a.sin_port);
-}
 std::string udp(int port) { return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port); }
 
 std::string testPem(const char* name) {
@@ -232,9 +227,19 @@ TEST(ClientAuthErrorsRegression, AFakeBrokerRefusesAnyRequestBeforeTheLoginFinis
     EXPECT_TRUE(r.gw.authStates().empty()) << "the session ended";
 }
 
+namespace {
+/// A password file with an explicit mode (the Client refuses group / other access).
+std::string writePwFile(const std::string& tag, const std::string& content, mode_t mode) {
+    const std::string path = std::filesystem::temp_directory_path().string() + "/client_auth_pw_" + tag + "_" +
+                             std::to_string(::getpid());
+    { std::ofstream(path, std::ios::binary | std::ios::trunc) << content; }
+    ::chmod(path.c_str(), mode);
+    return path;
+}
+} // namespace
+
 TEST(ClientAuthErrorsRegression, PasswordFileIsReadOnceAndBothSetIsRefused) {
-    const std::string path = std::filesystem::temp_directory_path().string() + "/client_auth_pw_" + std::to_string(::getpid());
-    { std::ofstream(path, std::ios::binary) << kPw << "\n"; }
+    const std::string path = writePwFile("once", std::string(kPw) + "\n", 0600);
     {
         rc::ClientConfig c = authCfg(3716, "ws1", "");
         c.passwordFile = path;
@@ -253,6 +258,344 @@ TEST(ClientAuthErrorsRegression, PasswordFileIsReadOnceAndBothSetIsRefused) {
         EXPECT_THROW(rc::Client{c}, std::runtime_error);
     }
     ::unlink(path.c_str());
+}
+
+TEST(PasswordFileRegression, GroupReadableFileIsRefusedRegression) {
+    for (const mode_t bad : {mode_t(0644), mode_t(0604), mode_t(0640)}) {
+        const std::string path = writePwFile("mode", std::string(kPw) + "\n", bad);
+        rc::ClientConfig c = authCfg(4100, "ws1", "");
+        c.passwordFile = path;
+        try {
+            rc::Client{c};
+            ADD_FAILURE() << "mode " << std::oct << bad << " must be refused";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("group or others"), std::string::npos) << e.what();
+            char m[8];
+            std::snprintf(m, sizeof m, "%04o", static_cast<unsigned>(bad));
+            EXPECT_NE(std::string(e.what()).find(m), std::string::npos) << e.what();
+        }
+        ::unlink(path.c_str());
+    }
+    const std::string path = writePwFile("mode", std::string(kPw) + "\n", 0600);
+    rc::ClientConfig c = authCfg(4102, "ws1", "");
+    c.passwordFile = path;
+    {
+        Rig r(c);
+        r.connectOk();
+    }
+    ::unlink(path.c_str());
+}
+
+TEST(PasswordFileRegression, OversizeFileIsRefusedRegression) {
+    {
+        const std::string path = writePwFile("big", std::string(1 << 20, 'p'), 0600);
+        rc::ClientConfig c = authCfg(4104, "ws1", "");
+        c.passwordFile = path;
+        try {
+            rc::Client{c};
+            ADD_FAILURE() << "a 1 MiB file must be refused";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("larger than"), std::string::npos) << e.what();
+        }
+        ::unlink(path.c_str());
+    }
+    {
+        const std::string path = writePwFile("max", std::string(1024, 'p') + "\r\n", 0600);
+        rc::ClientConfig c = authCfg(4106, "ws1", "");
+        c.passwordFile = path;
+        rc::Client client{c};
+        EXPECT_EQ(client.testAgentSecret().size(), 1024u);
+        ::unlink(path.c_str());
+    }
+    {
+        const std::string path = writePwFile("max1", std::string(1025, 'p'), 0600);
+        rc::ClientConfig c = authCfg(4108, "ws1", "");
+        c.passwordFile = path;
+        EXPECT_THROW(rc::Client{c}, std::runtime_error);
+        ::unlink(path.c_str());
+    }
+}
+
+TEST(PasswordFileRegression, TrailingWhitespaceIsPartOfThePasswordRegression) {
+    {
+        const std::string path = writePwFile("ws", std::string(kPw) + " \n", 0600);
+        rc::ClientConfig c = authCfg(4110, "ws1", "");
+        c.passwordFile = path;
+        rc::Client client{c};
+        EXPECT_EQ(client.testAgentSecret(), std::string(kPw) + " ");
+        ::unlink(path.c_str());
+    }
+    {
+        const std::string path = writePwFile("crlf", std::string(kPw) + "\r\n\n", 0600);
+        rc::ClientConfig c = authCfg(4112, "ws1", "");
+        c.passwordFile = path;
+        rc::Client client{c};
+        EXPECT_EQ(client.testAgentSecret(), kPw);
+        ::unlink(path.c_str());
+    }
+}
+
+TEST(PasswordFileRegression, AnEmptyPasswordFileIsRefusedRegression) {
+    const std::string path = writePwFile("empty", "\n", 0600);
+    rc::ClientConfig c = authCfg(4114, "ws1", "");
+    c.passwordFile = path;
+    try {
+        rc::Client{c};
+        ADD_FAILURE() << "an empty password file must be refused";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("is empty"), std::string::npos) << e.what();
+    }
+    ::unlink(path.c_str());
+}
+
+TEST(ClientAuthErrorsRegression, ThePasswordLivesOnlyInTheAgentsSharedSecretRegression) {
+    Rig r(authCfg(4116, "ws1", kPw));
+    r.gw.mustChange.insert("ws1");   // the fake applies a self SET PASSWORD for a must-change user
+    r.connectOk();
+    EXPECT_TRUE(r.client.testConfigPasswordEmpty());
+    EXPECT_EQ(r.client.testAgentSecret(), kPw);
+    auto st = rune::ql::parse("alter user ws1 set password 'new password 456';");
+    ASSERT_TRUE(st.has_value());
+    auto plan = rune::ql::applySecurityPlan(*st);
+    ASSERT_TRUE(plan.has_value());
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.securityDdl(*plan, {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_TRUE(r.client.testConfigPasswordEmpty()) << "the Client keeps no copy after a self SET PASSWORD (#56)";
+    EXPECT_EQ(r.client.testAgentSecret(), "new password 456");
+}
+
+TEST(ClientAuthErrorsRegression, ASelfSetPasswordLeavesNoPlaintextInTheCommandRingRegression) {
+    Rig r(authCfg(4122, "ws1", kPw));
+    r.gw.mustChange.insert("ws1");
+    r.connectOk();
+    auto st = rune::ql::parse("alter user ws1 set password 'new password 456';");
+    ASSERT_TRUE(st.has_value());
+    auto plan = rune::ql::applySecurityPlan(*st);
+    ASSERT_TRUE(plan.has_value());
+    auto holds = [&] {
+        const auto b = r.client.testCommandRingBytes();
+        const std::string_view needle = "new password 456";
+        return std::search(b.begin(), b.end(), needle.begin(), needle.end(),
+                           [](uint8_t a, char c) { return a == static_cast<uint8_t>(c); }) != b.end();
+    };
+    test_support::TestCq cq(r.client);
+    // Issued from the owner thread outside a duty cycle: the record goes through the ring.
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.securityDdl(*plan, {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    EXPECT_TRUE(holds()) << "vacuity guard: the secret rides in the ring record until the duty thread reads it";
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    ASSERT_TRUE(f.ok()) << f.describe();
+    r.passes(3);
+    EXPECT_FALSE(holds()) << "a consumed ring record is zeroed";
+}
+
+TEST(ClientAuthErrorsRegression, APasswordOverTheCapIsRefusedAtConstructionRegression) {
+    EXPECT_THROW(rc::Client{authCfg(4118, "ws1", std::string(1025, 'p'))}, std::invalid_argument);
+    EXPECT_NO_THROW(rc::Client{authCfg(4120, "ws1", std::string(1024, 'p'))});
+}
+
+// ---- C6 review: adversarial credential hygiene (#257 / #56 / #184) -----------------------------------------------
+// The freed-memory scan (AllocCounter): every heap block the Client frees is searched for the plaintext before it
+// goes back to the allocator - an unwiped copy is a hit.  The needles are long (heap strings, never SSO) and appear
+// nowhere else, and every test-owned copy outlives the scan window.
+namespace {
+constexpr const char kNeedle[]    = "freed-scan-needle-c6-0001";   // a Client's login password
+constexpr const char kNewNeedle[] = "freed-scan-needle-c6-0002";   // a self SET PASSWORD's new password
+struct FreedScan {
+    // From the second byte: a cleared (not wiped) string has only its first byte zeroed.
+    explicit FreedScan(const char* n) { alloc_counter::scanFreedForThisThread(n + 1, std::strlen(n) - 1); }
+    ~FreedScan() { alloc_counter::scanFreedForThisThread(nullptr, 0); }
+    long hits() const { return alloc_counter::freedHitsThisThread(); }
+};
+} // namespace
+
+TEST(ClientSecretAdversarialRegression, NoFreedBlockKeepsThePasswordAfterASuccessfulConstructionAdversarialRegression) {
+    const rc::ClientConfig direct = authCfg(4140, "ws1", kNeedle);
+    {
+        FreedScan scan(kNeedle);
+        { rc::Client client{direct}; EXPECT_EQ(client.testAgentSecret(), kNeedle); }
+        EXPECT_EQ(scan.hits(), 0) << "a freed block still held the password (given in ClientConfig::password)";
+    }
+    const std::string path = writePwFile("scan_ok", std::string(kNeedle) + "\n", 0600);
+    rc::ClientConfig fromFile = authCfg(4142, "ws1", "");
+    fromFile.passwordFile = path;
+    {
+        FreedScan scan(kNeedle);
+        { rc::Client client{fromFile}; EXPECT_EQ(client.testAgentSecret(), kNeedle); }
+        EXPECT_EQ(scan.hits(), 0) << "a freed block still held the password (read from passwordFile)";
+    }
+    ::unlink(path.c_str());
+}
+
+TEST(ClientSecretAdversarialRegression, AConfigRefusedAfterThePasswordIsReadLeavesNoFreedCopyAdversarialRegression) {
+    // Every validation that runs after the password is in hand: no TLS for credentials, a bad iteration cap.
+    const std::string path = writePwFile("scan_bad", std::string(kNeedle) + "\n", 0600);
+    auto noTls = [](rc::ClientConfig c) { c.offerCrypto = false; return c; };
+    auto badIterations = [](rc::ClientConfig c) { c.maxAcceptedScramIterations = 0; return c; };
+    for (int variant = 0; variant < 4; ++variant) {
+        rc::ClientConfig c = variant < 2 ? authCfg(4144, "ws1", kNeedle) : authCfg(4144, "ws1", "");
+        if (variant >= 2) c.passwordFile = path;
+        c = (variant % 2 == 0) ? noTls(std::move(c)) : badIterations(std::move(c));
+        FreedScan scan(kNeedle);
+        EXPECT_THROW(rc::Client{c}, std::invalid_argument) << "variant " << variant;
+        EXPECT_EQ(scan.hits(), 0) << "variant " << variant << ": the refused config's password was freed unwiped";
+    }
+    ::unlink(path.c_str());
+}
+
+namespace {
+rune::client::agent::AgentConfig agentCfg(int32_t in, std::string password) {
+    rune::client::agent::AgentConfig cfg;
+    cfg.transport.ingressChannel  = "aeron:ipc";
+    cfg.transport.ingressStreamId = in;
+    cfg.transport.egressChannel   = "aeron:ipc";
+    cfg.transport.egressStreamId  = in + 1;
+    cfg.transport.dataDir = std::filesystem::temp_directory_path().string() + "/client_auth_agent_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
+    cfg.transport.driverMode = rune::client::transport::DriverMode::Invoker;
+    cfg.session.egressChannel  = "aeron:ipc";
+    cfg.session.egressStreamId = in + 1;
+    cfg.session.username = "ws1";
+    cfg.session.password = std::move(password);
+    return cfg;
+}
+} // namespace
+
+TEST(ClientSecretAdversarialRegression, AnAllocationFailureAtEveryConstructionStepLeavesNoFreedCopyAdversarialRegression) {
+    // Crash at every step: the n-th allocation throws bad_alloc, for every n.  First the agent's constructor (unstarted:
+    // every allocation it makes), until it succeeds; then the Client's constructor over the same number of steps (its
+    // config validation, the agent-config hand-off and the agent's constructor all come before it starts the transport;
+    // the Aeron client itself is not exception-safe under an allocation failure, so the sweep stops short of it).
+    const rune::client::agent::AgentConfig acfg = agentCfg(4146, kNeedle);
+    long agentSteps = 0;
+    for (long n = 1; n <= 20'000 && agentSteps == 0; ++n) {
+        FreedScan scan(kNeedle);
+        alloc_counter::failNthAllocationThisThread(n);
+        try {
+            rune::client::agent::ClientAgent agent(acfg);
+            if (!alloc_counter::injectedFailureFiredThisThread()) agentSteps = n;
+        } catch (const std::bad_alloc&) {
+        }
+        alloc_counter::failNthAllocationThisThread(0);
+        ASSERT_EQ(scan.hits(), 0) << "ClientAgent: allocation " << n << " failed: a freed block still held the password";
+    }
+    ASSERT_GT(agentSteps, 3) << "vacuity guard: the agent's constructor allocates and the sweep reached its end";
+
+    // The Client's steps before the transport starts are at least: its config copy, the agent config, the agent.
+    const rc::ClientConfig c = authCfg(4148, "ws1", kNeedle);
+    alloc_counter::startThisThread();
+    {
+        rc::ClientConfig copy = c;
+        rune::client::agent::AgentConfig a = rc::toAgentConfig(copy);
+        a.transport.dataDir += "_steps";
+        rune::client::agent::ClientAgent agent(std::move(a));
+    }
+    const long clientSteps = alloc_counter::stopThisThread();
+    ASSERT_GT(clientSteps, agentSteps) << "vacuity guard";
+    for (long n = 1; n <= clientSteps; ++n) {
+        FreedScan scan(kNeedle);
+        alloc_counter::failNthAllocationThisThread(n);
+        bool threw = false;
+        try {
+            rc::Client client{c};
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        }
+        alloc_counter::failNthAllocationThisThread(0);
+        ASSERT_TRUE(threw) << "allocation " << n << ": the injected failure surfaced as bad_alloc";
+        ASSERT_EQ(scan.hits(), 0) << "Client: allocation " << n << " failed: a freed block still held the password";
+    }
+}
+
+TEST(ClientSecretAdversarialRegression, ASelfSetPasswordLifecycleLeavesNoFreedCopyOfTheNewPasswordAdversarialRegression) {
+    // Test-owned copies (the parsed statement, the plan) outlive both windows.
+    const std::string stmt = std::string("alter user ws1 set password '") + kNewNeedle + "';";
+    auto st = rune::ql::parse(stmt);
+    ASSERT_TRUE(st.has_value());
+    auto plan = rune::ql::applySecurityPlan(*st);
+    ASSERT_TRUE(plan.has_value());
+    long newHits = -1;
+    {
+        FreedScan scanNew(kNewNeedle);
+        {
+            Rig r(authCfg(4152, "ws1", kPw));
+            r.gw.mustChange.insert("ws1");
+            r.connectOk();
+            test_support::TestCq cq(r.client);
+            auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.securityDdl(*plan, {}, q, t); });
+            ASSERT_TRUE(f.accepted());
+            ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+            ASSERT_TRUE(f.ok()) << f.describe();
+            EXPECT_EQ(r.client.testAgentSecret(), kNewNeedle);
+            r.passes(3);
+        }
+        newHits = scanNew.hits();
+    }
+    EXPECT_EQ(newHits, 0) << "a freed block still held the new password (ring record, pending op, plan copy, secret)";
+}
+
+TEST(ClientSecretAdversarialRegression, ASecurityDdlAndWaitRetriedOnAFullCommandRingSendsTheWholePlanAdversarialRegression) {
+    // Resources x auth: the blocking form re-issues a BackPressured op.  The re-issue must carry the same plan - not
+    // a moved-from one (an empty grantee and an empty PREFIX pattern: a grant on every topic).
+    Rig r(authCfg(4156, "ws1", kPw));
+    r.connectOk();
+    struct Seen { std::string name, pattern; uint8_t patternKind; };
+    std::vector<Seen> seen;
+    r.gw.templateHandlers[pc::SecurityDdl::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
+        const auto m = pc::SecurityDdl::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        seen.push_back({std::string(m->name), std::string(m->pattern), m->patternKind});
+        pc::DdlResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId;
+        r.gw.sendDdlResponse(0, resp);
+    };
+    auto st = rune::ql::parse("GRANT WRITE ON TOPIC PREFIX 'world.server.zone.' TO ROLE world_server_role;");
+    ASSERT_TRUE(st.has_value());
+    auto plan = rune::ql::applySecurityPlan(*st);
+    ASSERT_TRUE(plan.has_value());
+    const uint8_t prefixKind = plan->patternKind;
+    r.client.testFillCommandRing();   // the first issue is BackPressured; the call drains the ring and re-issues
+    std::string why;
+    try {
+        (void)r.client.securityDdlAndWait(*plan, {}, std::chrono::milliseconds(200));
+    } catch (const std::runtime_error& e) {
+        why = e.what();   // the fake gateway is not pumped while the call waits: it times out after sending
+    }
+    EXPECT_NE(why.find("timed out waiting"), std::string::npos) << why;
+    ASSERT_TRUE(r.drive([&] { return !seen.empty(); }));
+    r.passes(3);
+    ASSERT_EQ(seen.size(), 1u);
+    EXPECT_EQ(seen[0].name, "world_server_role");
+    EXPECT_EQ(seen[0].pattern, "world.server.zone.") << "the re-issued grant lost its pattern";
+    EXPECT_EQ(seen[0].patternKind, prefixKind);
+}
+
+TEST(ClientSecretAdversarialRegression, TheAgentPasswordInstallAllocatesNothingAndRefusesOverCapAdversarialRegression) {
+    rune::client::agent::AgentConfig cfg = agentCfg(4150, kPw);
+    rune::client::agent::ClientAgent agent(cfg);
+    ASSERT_EQ(agent.secretForTest().view(), kPw);
+    const std::string next(rc::kMaxPasswordBytes, 'n');   // the longest valid password
+    const std::string over(rc::kMaxPasswordBytes + 1, 'o');
+    alloc_counter::startThisThread();
+    const bool okNext = agent.installPassword(next);
+    const bool okOver = agent.installPassword(over);
+    const bool okEmpty = agent.installPassword("");
+    const bool okBack  = agent.installPassword(kPw);
+    const long allocs = alloc_counter::stopThisThread();
+    EXPECT_EQ(allocs, 0) << "installPassword runs on the duty thread: no allocation (#184)";
+    EXPECT_TRUE(okNext);
+    EXPECT_FALSE(okOver) << "over the cap: refused, never truncated";
+    EXPECT_TRUE(okEmpty);
+    EXPECT_TRUE(okBack);
+    EXPECT_EQ(agent.secretForTest().view(), kPw);
+    EXPECT_EQ(agent.secretForTest().rawForTest().find('n'), std::string_view::npos) << "the 1024-byte secret's tail is wiped";
+
+    // The agent refuses an over-cap password itself (a direct AgentConfig user, not only through Client).
+    rune::client::agent::AgentConfig big = cfg;
+    big.session.password = over;
+    big.transport.dataDir += "_big";
+    EXPECT_THROW(rune::client::agent::ClientAgent{big}, std::invalid_argument);
 }
 
 // Review B I1 (D26 is per session): a LEADER NODE's session revoked (a D28-style halt of that node) fails its
@@ -278,7 +621,7 @@ struct TwoNodeRig {
         gw.addUser("ws1", kPw);
         gw.uniqueSessionIds = true;
         gw.replyFromArrival = true;
-        const int p0 = freePort(), p1 = freePort();
+        const int p0 = rune::client::testing::allocFreeUdpPort(), p1 = rune::client::testing::allocFreeUdpPort();
         (void)gw.addEndpoint(udp(p0), in);
         node1 = udp(p1);
         n1 = gw.addEndpoint(node1, in);
@@ -1005,7 +1348,7 @@ TEST(ClientAuthErrorsRegression, ScramCachePaysPbkdf2OncePerVerifierRegression) 
     gw.authMode = pc::AuthMode::Required;
     gw.addUser("ws1", kPw);
     gw.uniqueSessionIds = true;   // each node session gets its own id (the login state is keyed by it)
-    const std::string n1 = udp(freePort()), n2 = udp(freePort());
+    const std::string n1 = udp(rune::client::testing::allocFreeUdpPort()), n2 = udp(rune::client::testing::allocFreeUdpPort());
     (void)gw.addNode(n1, 3736);
     (void)gw.addNode(n2, 3736);
     auto now = [] {
@@ -1132,7 +1475,7 @@ TEST(ClientCryptoRegression, SystemTrustWithoutAHostIsRefusedRegression) {
     }
     {
         rc::ClientConfig c = sys(3804);
-        c.gatewayChannel = udp(freePort());   // names a host (127.0.0.1)
+        c.gatewayChannel = udp(rune::client::testing::allocFreeUdpPort());   // names a host (127.0.0.1)
         EXPECT_NO_THROW(rc::Client{c});
     }
     EXPECT_NO_THROW(rc::Client{authCfg(3806, "", "")}) << "a pinned CA";
@@ -1193,7 +1536,7 @@ TEST(ClientAuthErrorsRegression, AForgedPlaintextRedirectNeverMovesATlsSessionAd
     const auto pr = produceInFlight(r, p, cq, s);
     const int connectsBefore = r.gw.connectsArrived;
     for (const int64_t sid : {int64_t{0}, int64_t{0x7EAD'BEEF}}) {
-        r.gw.sendError(0, static_cast<int16_t>(pc::ErrorCode::Redirect), "127.0.0.1:" + std::to_string(freePort()), sid,
+        r.gw.sendError(0, static_cast<int16_t>(pc::ErrorCode::Redirect), "127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPort()), sid,
                        pr.corrId);   // sid not held by the gateway's TLS keys: sent in clear
         r.passes(100, 1'000'000);
         EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected) << "sid " << sid;
@@ -1205,7 +1548,7 @@ TEST(ClientAuthErrorsRegression, AForgedPlaintextRedirectNeverMovesATlsSessionAd
     // Control (non-vacuity): the same Redirect SEALED under the session's keys is followed.
     std::optional<test_support::PendingOp> s2;
     const auto pr2 = produceInFlight(r, p, cq, s2);
-    r.gw.sendError(0, static_cast<int16_t>(pc::ErrorCode::Redirect), "127.0.0.1:" + std::to_string(freePort()),
+    r.gw.sendError(0, static_cast<int16_t>(pc::ErrorCode::Redirect), "127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPort()),
                    pr2.sessionId, pr2.corrId);
     EXPECT_TRUE(r.drive([&] { return r.client.state() != rc::session::SessionState::Connected; }, 1'000'000))
         << "control: a sealed Redirect moves the session";
@@ -1296,7 +1639,7 @@ namespace {
 struct ThreeNodeRig : TwoNodeRig {
     int n2 = 0;
     explicit ThreeNodeRig(int32_t in) : TwoNodeRig(in) {
-        const int p2 = freePort();
+        const int p2 = rune::client::testing::allocFreeUdpPort();
         n2 = gw.addEndpoint(udp(p2), in);
         gw.nodeOfEndpoint[n2] = n2;
         gw.moreBrokers.push_back({2, "127.0.0.1", p2});

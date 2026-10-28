@@ -88,7 +88,9 @@ bool hasFlag(const std::vector<std::string>& args, std::string_view flag) {
 
 void printUsage(std::ostream& err) {
     err << "Usage:\n"
-        << "  rune console [--broker <ep>] [-f <script.rql|->] [--dry-run] [--validate] [--expected-version N]\n"
+        << "  rune console [--broker <ep>] [--cli-egress <ch>] [-f <script.rql|->] [--dry-run] [--validate]\n"
+        << "               [--expected-version N] [--request-id <32 hex>] [--verbose] [--user <u>] [--password-file <p>]\n"
+        << "               [--tls-ca <pem>] [--tls-host <name>] [--insecure-plaintext]\n"
         << "      Run Rune QL statements interactively (prompt `rune> `) or from a script (-f; stops at\n"
         << "      the first error). --dry-run prints each statement's plan (no broker).\n"
         << "  rune schema get <topic> --broker <ep>\n"
@@ -109,7 +111,8 @@ void printUsage(std::ostream& err) {
 // Hidden flags (test-only, not advertised):
 //   --cli-stream-in  <n>   override gatewayStreamId  (default 1)
 //   --cli-stream-out <n>   override egressStreamId   (default 2)
-//   --cli-data-dir   <p>   override dataDir          (default "")
+//   --cli-data-dir   <p>   override dataDir          (default and "": a private scratch directory,
+//                          removed when the command ends)
 //   --cli-egress     <ch>  override egressChannel    (default "aeron:ipc")
 //                          Required for a real UDP broker: the broker publishes
 //                          responses back to this channel, so with a UDP gateway
@@ -154,15 +157,7 @@ rune::client::ClientConfig buildClientConfig(const std::vector<std::string>& arg
     if (!sOut.empty()) cfg.egressStreamId  = std::stoi(sOut);
 
     // Aeron data directory: hidden test override, else a private scratch directory removed with `dir`.
-    const std::string dataDir = flagValue(args, "--cli-data-dir");
-    if (!dataDir.empty()) {
-        cfg.dataDir = dataDir;
-    } else {
-        dir = rune::cli::support::ScopedDir(std::filesystem::temp_directory_path() /
-                                            ("rune-cli-" + std::to_string(::getpid()) + "-" +
-                                             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())));
-        cfg.dataDir = dir.path().string();
-    }
+    cfg.dataDir = rune::cli::support::resolveDataDir(flagValue(args, "--cli-data-dir"), dir);   // empty = scratch (#315)
 
     // Review B I6: the credential flags are global (--user / --password-file, RUNE_USER / RUNE_PASSWORD_FILE).
     rune::cli::support::applyCredentials(cfg, flagValue(args, "--user"), flagValue(args, "--password-file"));

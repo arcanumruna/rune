@@ -36,6 +36,7 @@
 // regression version ... don't delete the originals").
 
 #include <gtest/gtest.h>
+#include <openssl/evp.h>
 
 #include <rune/client/codec/Codec.h>
 #include <rune/client/codec/CryptoFrame.h>
@@ -1551,6 +1552,9 @@ TEST(ClientCryptoRegression, AFreshEpisodeRederivesEveryReceiverSlotAdversarialR
 // Hot path: once a receiver's slot is derived, sealing for it (and for the gateway) allocates nothing - the slot is an
 // array index, the cipher is reused.  RED (mutation): derive the receiver key / build the cipher per frame.
 TEST(ClientCryptoRegression, SealingForAWorkerReceiverAllocatesNothingAfterWarmUpAdversarialRegression) {
+    // #535: OpenSSL allocates through CRYPTO_malloc, which the replaced operator new never sees; OpenSslAllocCounter.cpp
+    // routes it into the same window.  The gate is only meaningful if that install won the race with OpenSSL's first use.
+    ASSERT_TRUE(openSslAllocCounterInstalled()) << "CRYPTO_set_mem_functions was refused: OpenSSL allocated first";
     FrameFixture f;
     ASSERT_TRUE(f.srv.valid());
     ASSERT_TRUE(f.established(1'000'000'000LL, rpc116::kBrokerVersionReceiverKeys));
@@ -1566,5 +1570,135 @@ TEST(ClientCryptoRegression, SealingForAWorkerReceiverAllocatesNothingAfterWarmU
             sealed += cc::sealFrame(c, plain.data(), plain.size(), out.data(), out.size(), id) > 0 ? 1u : 0u;
     const long allocs = alloc_counter::stopThisThread();
     EXPECT_EQ(sealed, 4000u);
-    EXPECT_EQ(allocs, 0) << "sealing for a derived receiver allocated";
+    EXPECT_EQ(allocs, 0) << "sealing for a derived receiver allocated (" << alloc_counter::externalThisThread()
+                         << " of the counted allocations were OpenSSL's CRYPTO_malloc, the rest operator new)";
+}
+
+// #535: the instrumentation itself - an OpenSSL allocation inside the window is counted (and attributed to the external
+// counter), so a gate that reads zero means zero.  RED if the CRYPTO_set_mem_functions wrappers are not installed.
+TEST(ClientCryptoRegression, OpenSslAllocationsAreCountedByTheGateCounterRegression) {
+    ASSERT_TRUE(openSslAllocCounterInstalled());
+    alloc_counter::startThisThread();
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    EVP_CIPHER_CTX_free(ctx);
+    const long counted  = alloc_counter::stopThisThread();
+    const long external = alloc_counter::externalThisThread();
+    EXPECT_GE(counted, 1) << "an OpenSSL allocation went unseen";
+    EXPECT_GE(external, 1) << "and was not attributed to the OpenSSL counter";
+    EXPECT_LE(external, counted);
+}
+
+// #535 (cold path, client): a receiver key that fails to derive seals NOTHING - sealFrame returns 0, the receiver's seq
+// space is untouched (no seq consumed for a frame that was never produced), its slot cipher stays empty (no half-built
+// cipher is cached), the gateway's and the other receivers' state are untouched; once the derive works again the very
+// next seal succeeds as the receiver's first frame (seq 1) under the properly derived key.
+// RED (mutation): selectSendSlot ignores the derive result and builds the cipher from the half-written key.
+namespace {
+bool deriveFailsForReceiverThree(const cr::AeadKey& c2b, uint8_t id, cr::AeadKey& out) noexcept {
+    return id != 3 && cr::deriveReceiverKey(c2b, id, out);
+}
+}  // namespace
+
+TEST(ClientCryptoRegression, UnderivableReceiverKeySealsNothingAdversarialRegression) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL, rpc116::kBrokerVersionReceiverKeys));
+    auto& c = f.m.cryptoState();
+    ASSERT_TRUE(c.receiverKeys);
+    const auto keys = f.srv.exportKeys(c.cipher, FrameFixture::kSessionId);
+    c.deriveReceiverKeyFn = &deriveFailsForReceiverThree;
+
+    const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 1, "underivable-receiver-key");
+    std::vector<uint8_t> out(plain.size() + rpc116::kCryptoOverhead);
+    EXPECT_EQ(cc::sealFrame(c, plain.data(), plain.size(), out.data(), out.size(), 3), 0u)
+        << "an underivable receiver key must never produce a frame";
+    EXPECT_EQ(c.workerSend[2].sendSeq, 0u) << "no seq consumed by the refused seal";
+    EXPECT_FALSE(c.workerSend[2].cipher.has_value()) << "no cipher cached from a failed derive";
+    EXPECT_EQ(c.sendSeq, 0u) << "the gateway's seq is untouched";
+    // Refused every time it is asked, still without side effects.
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(cc::sealFrame(c, plain.data(), plain.size(), out.data(), out.size(), 3), 0u);
+        EXPECT_EQ(c.workerSend[2].sendSeq, 0u);
+        EXPECT_FALSE(c.workerSend[2].cipher.has_value());
+    }
+    // The other receivers are unaffected: they derive and seal normally on their own seq spaces.
+    EXPECT_GT(cc::sealFrame(c, plain.data(), plain.size(), out.data(), out.size(), 2), 0u);
+    EXPECT_EQ(c.workerSend[1].sendSeq, 1u);
+    EXPECT_EQ(c.workerSend[2].sendSeq, 0u);
+
+    // The real derive is back: receiver 3's next frame is its first, sealed under its properly derived key.
+    c.deriveReceiverKeyFn = &cr::deriveReceiverKey;
+    const auto fr = sealFor(c, 3, 77);
+    ASSERT_FALSE(fr.empty()) << "the seal succeeds once the key derives";
+    EXPECT_EQ(subOf(fr).senderId, 3);
+    EXPECT_EQ(subOf(fr).seq, 1u);
+    cr::AeadKey r3{};
+    ASSERT_TRUE(cr::deriveReceiverKey(keys.c2b, 3, r3));
+    EXPECT_TRUE(opensUnder(r3, keys.c2bPrefix, keys.cipher, fr));
+    EXPECT_TRUE(c.workerSend[2].cipher.has_value());
+    EXPECT_EQ(c.workerSend[2].sendSeq, 1u);
+}
+
+// Attack (C10 review, #535 x N-I1): a receiver slot derived in one connect episode must never seal a frame of the
+// next.  Episode 1 derives receiver 3's cipher and seals with it; the resume is refused and a fresh connect negotiates
+// NEW keys; in episode 2 receiver 3's derivation fails.  The seal must return 0 (nothing to transmit) - the episode-1
+// cipher is not reused under the new session, no seq is consumed - and once the derive works the frame opens under
+// episode 2's receiver key only, as receiver 3's FIRST frame (seq 1), never under episode 1's key.
+// RED (mutation): beginCryptoHandshake_ resets only encrypted/send/recv instead of `cryptoState_ = CryptoState{}` -
+// episode 1's workerSend[2] cipher survives and seals episode 2's frame under the old key.
+TEST(ClientCryptoRegression, AReceiverSlotFromAnEarlierEpisodeNeverSealsAfterAFailedDeriveAdversarialRegression) {
+    FakeIo io;
+    const std::string serverPem = slurp(testdataPath("server.pem"));
+    const std::string serverKey = slurp(testdataPath("server.key"));
+    auto srv1 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+    sm::SessionConfig cfg;
+    cfg.egressChannel = "aeron:udp?endpoint=client:40456";
+    cfg.offerCrypto = true; cfg.tlsTrustPem = slurp(testdataPath("ca.pem")); cfg.tlsExpectHost = "localhost";
+    cfg.reconnectForeverAfterLive = true;
+    sm::SessionMachine m(io, cfg);
+    int64_t now = 1'000'000'000LL;
+    m.connect(now);
+    ASSERT_TRUE(driveHandshake(m, io, srv1, FrameFixture::kSessionId, now + 1, nullptr,
+                               rpc116::kBrokerVersionReceiverKeys));
+    ASSERT_TRUE(m.cryptoState().receiverKeys);
+    const auto keys1 = srv1.exportKeys(m.cryptoState().cipher, FrameFixture::kSessionId);
+    const auto ep1 = sealFor(m.cryptoState(), 3, 1);
+    ASSERT_FALSE(ep1.empty());
+    ASSERT_EQ(m.cryptoState().workerSend[2].sendSeq, 1u);
+
+    (void)freshConnectAfterAResumeRefused(io, m, now);
+    EXPECT_FALSE(m.cryptoState().workerSend[2].cipher.has_value()) << "episode 1's receiver cipher survived";
+    EXPECT_TRUE(sealFor(m.cryptoState(), 3, 2).empty()) << "nothing seals between episodes";
+
+    io.sends.erase(io.sends.begin(), io.sends.end() - 1);   // the fresh ConnectRequest leads the new handshake
+    auto srv2 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+    ASSERT_TRUE(driveHandshake(m, io, srv2, FrameFixture::kSessionId, now += 1'000'000, nullptr,
+                               rpc116::kBrokerVersionReceiverKeys));
+    auto& c = m.cryptoState();
+    ASSERT_TRUE(c.receiverKeys);
+    const auto keys2 = srv2.exportKeys(c.cipher, FrameFixture::kSessionId);
+    ASSERT_NE(std::memcmp(keys1.c2b.bytes, keys2.c2b.bytes, sizeof keys1.c2b.bytes), 0) << "new episode, new keys";
+
+    c.deriveReceiverKeyFn = &deriveFailsForReceiverThree;
+    for (int i = 0; i < 3; ++i) {
+        const auto fr = sealFor(c, 3, 10 + i);
+        EXPECT_TRUE(fr.empty()) << "an underivable receiver sealed a frame (episode 1's cipher reused?)";
+        if (!fr.empty()) {
+            cr::AeadKey old3{};
+            ASSERT_TRUE(cr::deriveReceiverKey(keys1.c2b, 3, old3));
+            EXPECT_FALSE(opensUnder(old3, keys1.c2bPrefix, keys1.cipher, fr)) << "sealed under episode 1's key";
+        }
+        EXPECT_EQ(c.workerSend[2].sendSeq, 0u);
+        EXPECT_FALSE(c.workerSend[2].cipher.has_value());
+    }
+
+    c.deriveReceiverKeyFn = &cr::deriveReceiverKey;
+    const auto fr = sealFor(c, 3, 20);
+    ASSERT_FALSE(fr.empty());
+    EXPECT_EQ(subOf(fr).seq, 1u) << "receiver 3's first frame of the new episode";
+    cr::AeadKey new3{}, old3{};
+    ASSERT_TRUE(cr::deriveReceiverKey(keys2.c2b, 3, new3));
+    ASSERT_TRUE(cr::deriveReceiverKey(keys1.c2b, 3, old3));
+    EXPECT_TRUE(opensUnder(new3, keys2.c2bPrefix, keys2.cipher, fr));
+    EXPECT_FALSE(opensUnder(old3, keys1.c2bPrefix, keys1.cipher, fr));
 }

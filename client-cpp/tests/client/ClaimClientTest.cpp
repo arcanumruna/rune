@@ -516,3 +516,116 @@ TEST(ClaimClientRegression, RefusedCloseAndWaitLeavesTheHeldInvokerClaimOpenRegr
     EXPECT_EQ(valuesOf(r.gw, 0), (std::vector<std::string>{"a", "LIVE"}));
     r.client->close();
 }
+
+// ---------------------------------------------------------------------------
+// C10 (#331)
+// ---------------------------------------------------------------------------
+
+// Thread-mode mirror of BatchAckCreditIsReturnedForCommittedAndAbortedClaims: an aborted / destroyed ring batch
+// claim returns every unit at once; a committed one is returned by exactly one BatchAck of its 3 records.
+TEST(ClaimClientRegression, ThreadModeBatchAckCreditIsReturnedForCommittedAndAbortedClaimsRegression) {
+    Rig r(cfgFor(rc::RunnerMode::Thread, 5870, 5871));
+    r.connect();
+    rc::ProducerConfig pc;
+    pc.acks     = rc::Acks::Leader;
+    pc.lingerUs = 0;
+    auto p = r.client->producer(pc);
+    rc::Completions bq(*r.client);
+    p.batchAcksTo(bq);
+    const auto topic = r.client->topic("t");
+    const rc::Key key(uint64_t{4});
+    {
+        rc::BatchClaim a = p.claimBatch(topic, key, 3, 2);
+        ASSERT_TRUE(a);
+        EXPECT_EQ(bq.outstanding(), 3u) << "one unit per record, like three sends";
+        a.abort();
+        EXPECT_EQ(bq.outstanding(), 0u) << "an aborted batch returns every unit";
+    }
+    {
+        rc::Claim c = p.tryClaim(topic, key, 2);
+        ASSERT_TRUE(c);
+        EXPECT_EQ(bq.outstanding(), 1u);
+    }  // the destructor aborts
+    EXPECT_EQ(bq.outstanding(), 0u);
+    {
+        rc::BatchClaim b = p.claimBatch(topic, key, 3, 2);
+        ASSERT_TRUE(b);
+        fill(b.record(0), "x1");
+        fill(b.record(1), "x2");
+        fill(b.record(2), "x3");
+        ASSERT_TRUE(b.commit());
+    }
+    int      recordsAcked = 0;
+    int      batchAcks    = 0;
+    ASSERT_TRUE(r.drive([&] {
+        bq.poll([&](const rc::Completion& c, std::span<const uint8_t>) {
+            if (c.op != rc::OpKind::BatchAck) return;
+            ++batchAcks;
+            recordsAcked += rc::batchAckOf(c).recordCount;
+            EXPECT_EQ(rc::batchAckOf(c).errorCode, 0);
+        });
+        return recordsAcked >= 3;
+    }));
+    EXPECT_EQ(recordsAcked, 3) << "the aborted claims were never accepted: only the committed 3 are acked";
+    EXPECT_GE(batchAcks, 1);
+    EXPECT_EQ(bq.outstanding(), 0u) << "the BatchAck(s) of the 3 committed records return their 3 units";
+    EXPECT_EQ(bq.reservedBytes(), 0u);
+    EXPECT_EQ(valuesOf(r.gw, 0), (std::vector<std::string>{"x1", "x2", "x3"})) << "the aborted claims never left";
+    r.client->close();
+}
+
+// An acked claim / claim batch held across Client::close(): the committed acked record completes exactly once (the
+// gateway is never pumped, so it fails with the delivery timeout), the held claims were never accepted - commit()
+// is false, they complete nothing, and every reservation is back.  Never a hang.
+namespace {
+void ackedClaimsHeldAcrossClientClose(rc::RunnerMode mode, int32_t in, bool heldSingle, bool heldBatch) {
+    Rig r(cfgFor(mode, in, in + 1));
+    r.connect();
+    rc::ProducerConfig pc;
+    pc.acks              = rc::Acks::Leader;
+    pc.lingerUs          = 0;
+    pc.deliveryTimeoutMs = 200;
+    auto p = r.client->producer(pc);
+    rc::Completions cq(*r.client);
+    rc::Completions bq(*r.client);
+    p.batchAcksTo(bq);
+    const auto topic = r.client->topic("t");
+    const rc::Key key(uint64_t{3});
+    {
+        rc::Claim done = p.tryClaim(topic, key, 4, cq, 1);
+        ASSERT_TRUE(done);
+        fill(done.buffer(), "DONE");
+        ASSERT_TRUE(done.commit());
+    }
+    rc::Claim      c2;
+    rc::BatchClaim b3;
+    if (heldSingle) {
+        c2 = p.tryClaim(topic, key, 4, cq, 2);
+        ASSERT_TRUE(c2) << static_cast<int>(c2.result());
+        fill(c2.buffer(), "HELD");
+    }
+    if (heldBatch) {
+        b3 = p.claimBatch(topic, key, 3, 2);
+        ASSERT_TRUE(b3) << static_cast<int>(b3.result());
+        fill(b3.record(0), "h1");
+    }
+    r.client->close();  // bounded by the 200 ms delivery timeout; the ctest timeout is the hang backstop
+    EXPECT_FALSE(c2.commit());
+    EXPECT_FALSE(b3.commit());
+    std::vector<rc::Token> done;
+    cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) { done.push_back(c.token); });
+    EXPECT_EQ(std::count(done.begin(), done.end(), rc::Token{1}), 1) << "the committed acked claim completes once";
+    EXPECT_EQ(std::count(done.begin(), done.end(), rc::Token{2}), 0) << "the held claim was never accepted";
+    EXPECT_EQ(cq.outstanding(), 0u);
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+    bq.poll([&](const rc::Completion&, std::span<const uint8_t>) {});
+    EXPECT_EQ(bq.outstanding(), 0u) << "the held batch claim's units are back";
+    EXPECT_EQ(bq.reservedBytes(), 0u);
+}
+}  // namespace
+
+TEST(ClaimClientRegression, AckedClaimsHeldAcrossClientCloseCompleteOrFailRegression) {
+    ackedClaimsHeldAcrossClientClose(rc::RunnerMode::Invoker, 5872, /*single*/ true, /*batch*/ false);
+    ackedClaimsHeldAcrossClientClose(rc::RunnerMode::Invoker, 5874, /*single*/ false, /*batch*/ true);
+    ackedClaimsHeldAcrossClientClose(rc::RunnerMode::Thread, 5876, /*single*/ true, /*batch*/ true);
+}

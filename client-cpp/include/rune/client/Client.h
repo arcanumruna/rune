@@ -270,6 +270,9 @@ using NanoClock = int64_t (*)() noexcept;
 // ---------------------------------------------------------------------------
 // ClientConfig
 // ---------------------------------------------------------------------------
+/// The longest password a Client logs in with.
+inline constexpr std::size_t kMaxPasswordBytes = detail::kMaxPasswordBytes;
+
 struct ClientConfig {
     std::string gatewayChannel   = "aeron:ipc";
     int32_t     gatewayStreamId  = 1;
@@ -375,8 +378,9 @@ struct ClientConfig {
     // password is never logged and never sent (only a proof derived from it).
     std::string username;
     std::string password;
-    // passwordFile: a file holding the password (read ONCE at construction; trailing newline
-    // stripped) — keeps it off the command line and out of the environment.  Setting both
+    // passwordFile: a file holding the password (read ONCE at construction) — keeps it off the command line and out
+    // of the environment.  A regular file must be mode 0600/0400 (group or others access is refused), at most
+    // 1024 bytes; only trailing CR/LF is stripped (spaces and tabs are part of the password).  Setting both
     // `password` and `passwordFile` throws std::invalid_argument; an unreadable file throws
     // std::runtime_error.
     std::string passwordFile;
@@ -588,6 +592,13 @@ public:
     /// Test hook: producers adopted by the duty-cycle thread.
     [[nodiscard]] std::size_t testProducerCount() const noexcept { return producerHub_.size(); }
     /// Test hook: fill the agent command ring so the next registration finds it full.
+    [[nodiscard]] std::string_view testAgentSecret() const noexcept { return agent_.secretForTest().view(); }
+    /// The command ring's record area (not the position trailer): a consumed record must be zeroed.
+    [[nodiscard]] std::span<const uint8_t> testCommandRingBytes() noexcept {
+        auto& r = agent_.ringForTesting();
+        return {r.base(), static_cast<std::size_t>(r.capacity())};
+    }
+    [[nodiscard]] bool testConfigPasswordEmpty() const noexcept { return cfg_.password.empty(); }
     void testFillCommandRing() { agent_.testFillCommandRing(); }
     /// fix5 Important-2(c) test hooks: orphan a claim on the agent command ring
     /// (claimed, never committed), lower the close-drain unblock threshold, and

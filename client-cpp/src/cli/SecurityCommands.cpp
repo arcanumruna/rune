@@ -5,6 +5,7 @@
 #include "QlEngine.h"
 #include "rune/cli/CatalogCommands.h"
 
+#include <rune/client/detail/PasswordFile.h>
 #include <rune/client/detail/SecureZero.h>
 #include <rune/crypto/Kdf.h>
 #include <rune/security/SecurityEvent.h>
@@ -271,11 +272,11 @@ int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::o
     std::string password;
     const bool fromFile = a.has("--password-file");
     if (fromFile) {
-        if (!readFileBytes(a.value("--password-file"), password, err)) {
+        if (auto e = rune::client::detail::readPasswordFile(a.value("--password-file"), password)) {
+            err << "rune: " << *e << "\n";
             rune::client::detail::secureZero(key.data(), key.size());
             return 1;
         }
-        while (!password.empty() && (password.back() == '\n' || password.back() == '\r')) password.pop_back();
     } else {
         password = generateOneTimePassword();
         if (password.empty()) {

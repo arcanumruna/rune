@@ -64,8 +64,20 @@ int32_t ringTotalBytes(int32_t cap) noexcept {
 // Construction
 // ---------------------------------------------------------------------------
 
+namespace {
+// #257 (C6 review): the password goes into the agent's fixed secret and is wiped from the config BEFORE anything can
+// throw (an over-cap refusal, the transport, the ring, bad_alloc), so no unwiped heap copy is ever freed.
+AgentConfig takingPassword(AgentConfig& cfg, detail::FixedSecret& secret) {
+    const bool fits = secret.assign(cfg.session.password);
+    detail::wipeString(cfg.session.password);
+    if (!fits)
+        throw std::invalid_argument("password longer than " + std::to_string(detail::FixedSecret::kCapacity) + " bytes");
+    return std::move(cfg);
+}
+} // namespace
+
 ClientAgent::ClientAgent(AgentConfig cfg)
-    : cfg_(cfg)
+    : cfg_(takingPassword(cfg, secret_))
     , transport_(cfg_.transport)
     , ringBuf_(makeAlignedBuffer(
           static_cast<std::size_t>(ringTotalBytes(cfg_.ringCapacity)),
@@ -85,6 +97,7 @@ ClientAgent::ClientAgent(AgentConfig cfg)
     sessions_.emplace_back(std::make_unique<Session>(
         this, seedCfg, cfg_.transport.ingressChannel));
     sessions_.back()->machine.useScramCache(&scramCache_);   // authentication: one salted-password cache per duty thread
+    sessions_.back()->machine.useSharedSecret(&secret_);
 }
 
 // ---------------------------------------------------------------------------
@@ -1273,6 +1286,7 @@ Session& ClientAgent::openSession_(const std::string& endpoint) noexcept {
     sessions_.emplace_back(std::make_unique<Session>(this, std::move(scfg), endpoint));
     Session& s = *sessions_.back();
     s.machine.useScramCache(&scramCache_);   // authentication: PBKDF2 once per verifier, not once per session
+    s.machine.useSharedSecret(&secret_);
     // On the duty clock (the clock tick() runs on), never steady_clock: with an
     // injected nanoClock the two are different domains and the connect's
     // fast-retry / timeout would never (or only much later) come due.

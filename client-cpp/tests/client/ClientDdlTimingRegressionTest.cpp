@@ -9,6 +9,7 @@
 // on another session; the generated requestId is reported.
 // Non-blocking ops on the single-threaded fake (F7).
 #include <filesystem>
+#include "../support/FreePort.h"
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
 #include <rune/client/Client.h>
@@ -35,18 +36,6 @@ int64_t g_now = 1'000'000'000;   // test thread only: invoker mode has one threa
 int64_t fakeNow() noexcept { return g_now; }
 int g_ctr = 0;                   // test thread only
 
-int freePort() {   // never a fixed UDP port (GroupRoutingRegressionTest MEDIUM-6)
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in a{};
-    a.sin_family      = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port        = 0;
-    (void)::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
-    socklen_t len = sizeof a;
-    (void)::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-    ::close(fd);
-    return ntohs(a.sin_port);
-}
 std::string udp(int port) { return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port); }
 
 rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {
@@ -200,11 +189,11 @@ TEST_P(ClientDdlTimingMatrixRegression, ExactlyOneCompletionAndNoLeftoverState) 
         cfg.ddlRetryBudget = std::chrono::milliseconds(300);
     Rig r(cfg);
     r.gw.uniqueSessionIds = true;   // every node session its own id (a session-fatal answer names one)
-    const std::string l1Ch = udp(freePort());
-    const std::string l2Ch = udp(freePort());
+    const std::string l1Ch = udp(rune::client::testing::allocFreeUdpPort());
+    const std::string l2Ch = udp(rune::client::testing::allocFreeUdpPort());
     const int l1 = r.gw.addNode(l1Ch, 4440);
     const int l2 = r.gw.addNode(l2Ch, 4440);
-    const std::string nowhere = udp(freePort());   // no node listens there
+    const std::string nowhere = udp(rune::client::testing::allocFreeUdpPort());   // no node listens there
     r.connect();
 
     std::vector<Arrival> at;
@@ -382,8 +371,8 @@ INSTANTIATE_TEST_SUITE_P(
 TEST(ClientDdlRedirectRegression, LeaderSessionLostMidDdlIsResentWithTheSameRequestIdRegression) {
     Rig r(invokerCfg(4442, 4443));
     r.gw.uniqueSessionIds = true;
-    const std::string aCh = udp(freePort());
-    const std::string cCh = udp(freePort());
+    const std::string aCh = udp(rune::client::testing::allocFreeUdpPort());
+    const std::string cCh = udp(rune::client::testing::allocFreeUdpPort());
     const int a = r.gw.addNode(aCh, 4442);
     const int cNode = r.gw.addNode(cCh, 4442);
     r.connect();
@@ -421,7 +410,7 @@ TEST(ClientDdlRedirectRegression, LeaderSessionLostMidDdlIsResentWithTheSameRequ
 TEST(ClientDdlRedirectRegression, SeedLossDoesNotFailADdlInFlightOnTheLeaderSessionRegression) {
     Rig r(invokerCfg(4444, 4445));
     r.gw.uniqueSessionIds = true;
-    const std::string aCh = udp(freePort());
+    const std::string aCh = udp(rune::client::testing::allocFreeUdpPort());
     const int a = r.gw.addNode(aCh, 4444);
     r.connect();
     std::vector<Arrival> at;

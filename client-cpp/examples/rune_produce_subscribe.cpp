@@ -56,6 +56,7 @@
 //   "subscription ended: <Name>" and exits 1; a login failure prints the client's message (e.g.
 //   "AuthenticationFailed") and exits 1.
 
+#include "AtomicFile.h"
 #include "ExampleAuth.h"
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
@@ -271,8 +272,10 @@ const char* groupFailName(GroupFailReason r) {
 
 void writeSeqFile(const std::string& path, const std::set<long>& seqs) {
     if (path.empty()) return;
-    std::ofstream f(path, std::ios::trunc);
-    for (const long s : seqs) f << s << "\n";
+    std::string text;
+    for (const long s : seqs) text += std::to_string(s) + "\n";
+    // Another process polls these files (RUNE_EXPECT_FILE): publish atomically, never a prefix (#44).
+    (void)rune::examples::writeFileAtomically(path, text);
 }
 
 // "ws:<seq>" -> seq (-1 if foreign).

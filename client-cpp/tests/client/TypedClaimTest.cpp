@@ -22,6 +22,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -358,3 +359,158 @@ static_assert(std::is_same_v<PositionChain, rune::gen::PositionClaimEncoder>,
 static_assert(!CanSetKey<PositionChain>, "the key field must not be reachable through a setter chain");
 static_assert(std::is_same_v<decltype(std::declval<PositionEncoder&>().zone(1)), PositionEncoder>,
               "an encoder setter returns the encoder by value");
+
+// ---------------------------------------------------------------------------
+// C10 (#332)
+// ---------------------------------------------------------------------------
+
+// The string_view-key claim (a 16-byte key: past the std::string SSO, so any hidden std::string of it allocates)
+// and the keyless claim are zero-allocation too, like the scalar-key claim above.
+TEST(TypedClaimAllocRegression, StringViewAndKeylessClaimAllocateNothingRegression) {
+    const ProducerImpl::SendFn sink = [](int32_t, int32_t, int32_t, const uint8_t*, std::size_t) { return true; };
+    {
+        auto* impl = new ProducerImpl(voidCfg(), 1 << 20);
+        TypedTopic<LongKey> topic{Producer{impl}, TopicHandle{1, 8}, uint16_t{1}};
+        const std::string key16(16, 'k');
+        auto cycle = [&](int i) {
+            {
+                auto w = topic.claim(std::string_view(key16.data(), 16 - static_cast<std::size_t>(i % 2)));
+                if (w) {
+                    w.v(i);
+                    (void)w.commit();
+                }
+            }
+            pump(*impl, sink);
+        };
+        for (int i = 0; i < 64; ++i) cycle(i);
+        alloc_counter::start();
+        for (int i = 64; i < 1064; ++i) cycle(i);
+        EXPECT_EQ(alloc_counter::stop(), 0L) << "claim(std::string_view) + commit + drain/flush must not allocate";
+    }
+    {
+        auto* impl = new ProducerImpl(voidCfg(), 1 << 20);
+        TypedTopic<ShortKey> topic{Producer{impl}, TopicHandle{1, 8}, uint16_t{1}};
+        auto cycle = [&](int i) {
+            {
+                auto w = topic.claim(std::string_view("abcdefgh", 1 + static_cast<std::size_t>(i % 8)));
+                if (w) {
+                    w.v(i);
+                    (void)w.commit();
+                }
+            }
+            pump(*impl, sink);
+        };
+        for (int i = 0; i < 64; ++i) cycle(i);
+        alloc_counter::start();
+        for (int i = 64; i < 1064; ++i) cycle(i);
+        EXPECT_EQ(alloc_counter::stop(), 0L) << "string(N<=16) claim(std::string_view) must not allocate";
+    }
+    {
+        auto* impl = new ProducerImpl(voidCfg(), 1 << 20);
+        TypedTopic<TickSample> topic{Producer{impl}, TopicHandle{1, 8}, uint16_t{1}};
+        auto cycle = [&](uint64_t i) {
+            {
+                auto w = topic.claim();
+                if (w) {
+                    w.seq(i).value(0.5);
+                    (void)w.commit();
+                }
+            }
+            pump(*impl, sink);
+        };
+        for (uint64_t i = 0; i < 64; ++i) cycle(i);
+        alloc_counter::start();
+        for (uint64_t i = 64; i < 1064; ++i) cycle(i);
+        EXPECT_EQ(alloc_counter::stop(), 0L) << "keyless claim() + commit + drain/flush must not allocate";
+    }
+}
+
+// The claim path and the send path produce the SAME record: identical fields through typed send(rec) and through
+// claim(key) + setters give identical key, partition and every value byte (version stamp, padding, all fields).
+TEST(TypedClaimRegression, ClaimAndSendProduceByteIdenticalValuesRegression) {
+    auto* impl = new ProducerImpl(voidCfg(), 1 << 20);
+    TypedTopic<Position> topic{Producer{impl}, TopicHandle{1, 8}, uint16_t{7}};  // a bound version other than Position::kVersion: the stamp is part of the bytes
+    for (int64_t k = 0; k < 16; ++k) {
+        Position rec;
+        rec.userId = k;
+        rec.zone   = static_cast<int16_t>(-3 + k);
+        rec.x      = 1.5 + static_cast<double>(k);
+        rec.y      = -2.25;
+        rec.z      = 1e9;
+        rec.flags  = 0xBEEF;
+        rec.seq    = 4'000'000'000u;
+        rec.tick   = 0x0102030405060708ull;
+        rec.alive  = (k % 2) == 0;
+        rec.kind   = 2;
+        std::memcpy(rec.tag.data(), "north\0\0\0", 8);
+        topic.send(rec);
+        auto w = topic.claim(k);
+        ASSERT_TRUE(w);
+        w.zone(rec.zone).x(rec.x).y(rec.y).z(rec.z).flags(rec.flags).seq(rec.seq).tick(rec.tick)
+            .alive(rec.alive).kind(rec.kind).tag("north");
+        ASSERT_TRUE(w.commit());
+    }
+    FrameCapture cap;
+    pump(*impl, cap.fn());
+    ASSERT_EQ(cap.recs.size(), 32u);
+    std::map<int64_t, std::vector<test_support::CapturedRecord>> byUser;
+    for (const auto& r : cap.recs) {  // the key field sits at value[4..12): no decode (v7 is past kVersion)
+        int64_t uid = 0;
+        std::memcpy(&uid, r.value.data() + 4, 8);
+        byUser[uid].push_back(r);
+    }
+    ASSERT_EQ(byUser.size(), 16u);
+    for (const auto& [k, rs] : byUser) {
+        ASSERT_EQ(rs.size(), 2u) << k;
+        EXPECT_EQ(rs[0].value.size(), PositionEncoder::kEncodedLength);
+        EXPECT_EQ(static_cast<uint8_t>(rs[1].value[2]), 7) << "the claim stamps the bound version";
+        EXPECT_EQ(rs[0].value, rs[1].value) << "full value bytes, userId " << k;
+        EXPECT_EQ(rs[0].key, rs[1].key) << k;
+        EXPECT_EQ(rs[0].partition, rs[1].partition) << k;
+    }
+    // Keyless schema too.
+    auto* impl2 = new ProducerImpl(voidCfg(), 1 << 20);
+    TypedTopic<TickSample> topic2{Producer{impl2}, TopicHandle{1, 8}, uint16_t{2}};
+    TickSample ts;
+    ts.seq   = 77;
+    ts.value = 0.25;
+    topic2.send(ts);
+    auto w = topic2.claim();
+    ASSERT_TRUE(w);
+    w.seq(77).value(0.25);
+    ASSERT_TRUE(w.commit());
+    FrameCapture cap2;
+    pump(*impl2, cap2.fn());
+    ASSERT_EQ(cap2.recs.size(), 2u);
+    EXPECT_EQ(cap2.recs[0].value, cap2.recs[1].value);
+    EXPECT_EQ(cap2.recs[0].key, cap2.recs[1].key);
+    EXPECT_EQ(cap2.recs[0].partition, cap2.recs[1].partition);
+}
+
+// Invoker mode: a held claim owns the append path - a second typed claim is ClaimHeld (not retryable by waiting),
+// writes only its scratch, commits nothing; once the first settles the next claim succeeds and both land in order.
+TEST(TypedClaimRegression, HeldInvokerClaimRefusesASecondTypedClaimWithClaimHeldRegression) {
+    auto* impl = new ProducerImpl(voidCfg(), 4 * 1024);
+    impl->enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr});
+    TypedTopic<Position> topic{Producer{impl}, TopicHandle{1, 8}, uint16_t{1}};
+    auto first = topic.claim(int64_t{1});
+    ASSERT_TRUE(first) << static_cast<int>(first.result());
+    first.zone(11);
+    for (int i = 0; i < 3; ++i) {
+        auto second = topic.claim(int64_t{2});
+        EXPECT_FALSE(second);
+        EXPECT_EQ(second.result(), SendResult::ClaimHeld);
+        second.zone(99).x(1.0);  // scratch only
+        EXPECT_FALSE(second.commit());
+    }
+    ASSERT_TRUE(first.commit());
+    auto third = topic.claim(int64_t{3});
+    ASSERT_TRUE(third) << "settled: the next claim is granted";
+    third.zone(33);
+    ASSERT_TRUE(third.commit());
+    FrameCapture cap;
+    impl->flushBatches(kNow, 42, cap.fn());
+    ASSERT_EQ(cap.recs.size(), 2u) << "the refused claims left nothing";
+    EXPECT_EQ(PositionDecoder(span(cap.recs[0].value)).zone(), 11);
+    EXPECT_EQ(PositionDecoder(span(cap.recs[1].value)).zone(), 33);
+}

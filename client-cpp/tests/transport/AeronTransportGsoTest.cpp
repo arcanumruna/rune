@@ -7,6 +7,7 @@
 // datagrams.  The totals prove both paths actually ran; udpGso=false proves the stock path is unchanged.
 // Polls with a deadline + sched_yield (tests never sleep).
 #include <filesystem>
+#include "../support/FreePort.h"
 #include <rune/client/transport/AeronTransport.h>
 
 #include <gtest/gtest.h>
@@ -28,7 +29,8 @@ constexpr auto kDeadline = std::chrono::seconds(20);
 int g_seq = 0;
 
 int freeUdpPort() {
-    return 25000 + static_cast<int>((::getpid() * 7 + (++g_seq) * 13) % 20000);
+    ++g_seq;
+    return rune::client::testing::allocFreeUdpPort();
 }
 
 Config udpLoopbackConfig(const char* tag, int32_t streamId) {

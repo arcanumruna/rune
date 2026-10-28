@@ -242,6 +242,17 @@ public:
         errors.push_back("model: unscripted coordinator code " + std::to_string(code));
     }
 
+    // ---- #373: the partition leader rejected a batch with a sequence gap (OutOfOrderSequence 20 / UnknownProducerId 28)
+    // that was the head of its partition: the transaction can only abort (its abort's epoch bump restarts the
+    // sequences).  The caller injects it only where nothing else is in flight, so the batch is the head. ----
+    void produceGap(int16_t code) {
+        if (state != State::InTxn) {
+            errors.push_back("model: a produce gap landed in state " + std::string(name(state)));
+            return;
+        }
+        toAbortable_({Status::BrokerError, static_cast<uint16_t>(code)});
+    }
+
     // ---- a completion; returns what changed for the caller's checks ----
     enum class Ended : uint8_t { None, Committed, Aborted, Failed };
     struct Applied {

@@ -19,7 +19,7 @@ Every command that connects takes the broker's client endpoint and, because auth
 | `--password-file <path>` | `RUNE_PASSWORD_FILE` | A file holding the password (trailing newline stripped). |
 | `--cli-egress <channel>` | `RUNE_EGRESS` | The channel replies arrive on. By default the CLI derives a local UDP endpoint toward the broker. |
 | `--cli-stream-in <n>`, `--cli-stream-out <n>` | | Aeron stream ids, when the broker is not on the default `1` and `2`. |
-| `--cli-data-dir <dir>` | | Scratch directory of the embedded driver. Default: a private temporary directory, removed on exit. |
+| `--cli-data-dir <dir>` | | Scratch directory of the embedded driver. Default, and for an empty value (`--cli-data-dir ""`): a private temporary directory, removed on exit. A non-empty directory is used as given and left in place. |
 
 A password is **never** accepted on the command line or from the environment: `--password` and `RUNE_PASSWORD` are
 refused with an explanation. Against a broker in dev mode (`RUNE_AUTH=disabled`) the CLI connects without credentials and
@@ -30,7 +30,8 @@ Exit codes: `0` success, `1` error, `2` usage error, and `3` for `rune catalog d
 ## `rune ql`
 
 ```text
-rune ql (-e "<statement>" | -f <file|->) [--dry-run] [--verbose] [--request-id <32 hex digits>] --broker host:port
+rune ql (-e "<statement>" | -f <file|->) [--dry-run] [--verbose] [--request-id <32 hex digits>]
+        [--validate] [--expected-version N] --broker host:port
 ```
 
 Executes Rune QL: DDL (topics, drops, security) and reads (`SHOW HISTORY`, `SHOW ... AS OF`, `DIFF`, `SHOW USERS`, ...).
@@ -43,6 +44,10 @@ The statement text is recorded in the catalog. The grammar and examples are in [
 | `--dry-run` | Parse and print the plan. No broker needed. |
 | `--verbose` | Print every followed redirect and NotLeader retry to stderr. |
 | `--request-id <32 hex>` | Fix the DDL's request id (not all zero). With `-f`, statement `N` uses the id plus `N - 1`. A re-run returns the original results. |
+| `--validate` | Make the broker validate every produced record against the schema of each `topic` the input defines. |
+| `--expected-version N` | The optimistic-concurrency gate for `alter topic` (0..65535, default 0 = none). A stale value is `SchemaConflict`. |
+
+`rune ql` exits `1` on any failure; it does not map a broker refusal to its wire code (`rune console -f` does).
 
 ## `rune console`
 
@@ -52,7 +57,7 @@ The interactive Rune QL shell, and the way to run a `.rql` script (topic DDL inc
 ```text
 rune console [--broker <ep>] [--cli-egress <ch>] [-f <script.rql|->] [--dry-run]
              [--validate] [--expected-version N] [--request-id <32 hex>] [--verbose]
-             [--user <u>] [--password-file <p>]
+             [--user <u>] [--password-file <p>] [--tls-ca <pem>] [--tls-host <name>] [--insecure-plaintext]
 ```
 
 | Flag | Meaning |
@@ -67,14 +72,21 @@ rune console [--broker <ep>] [--cli-egress <ch>] [-f <script.rql|->] [--dry-run]
 Interactive: the prompt is `rune> ` (`   ...> ` while a statement continues). A statement ends at a `;` outside
 comments and strings. Each completed input is parsed, then run in order over one broker session. A failure skips the
 rest of that input and keeps the session. `exit`, `quit` or end of input leaves with `0`. The one failure that ends
-the session is `SessionRevoked`. Interactive mode needs a terminal when no `--password-file` or `RUNE_PASSWORD_FILE`
-is given: it prompts for the password.
+the session is `SessionRevoked`. The terminal requirement applies only when a user is set (`--user` or `RUNE_USER`)
+and no `--password-file` or `RUNE_PASSWORD_FILE` is given: the console then prompts for the password on the terminal,
+and refuses to start without one. Without a user (a broker in dev mode) no terminal is needed and a piped session
+works. Input from a pipe (`producer | rune console`) is read like a terminal: the console keeps the broker session
+alive while it waits for the next line, so a long gap between statements does not lose the session.
 
 With `-f`: every statement is parsed and prepared first, so nothing is issued unless the whole script is valid. The
 statements then run in order and the run stops at the first failure. Stderr reads
 `<file>:statement N: <CodeName> (<code>) ...`. The exit code is the broker's wire error code, or `1` for a local
 error, or `2` for a usage error. For example `TopicExists` is `25`, `SchemaIncompatible` is `30` and `SchemaConflict`
 is `31`.
+
+Unlike the removed `rune schema apply`, which printed "already exists" and exited `0`, `-f` treats a `topic` statement
+for a topic that already exists as an error: `TopicExists`, exit `25`. A CI script that re-applies the same define file
+therefore fails unless it passes `--request-id` (a re-run with the same id returns the original result).
 
 ## `rune schema`
 

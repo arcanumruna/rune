@@ -31,6 +31,9 @@ void buildVerifier(std::string_view password, uint32_t iterations, uint32_t minP
     if (password.size() < minPasswordLength) {
         throw std::invalid_argument("password must be at least " + std::to_string(minPasswordLength) + " characters");
     }
+    if (password.size() > rune::client::detail::kMaxPasswordBytes) {
+        throw std::invalid_argument("password must be at most " + std::to_string(rune::client::detail::kMaxPasswordBytes) + " characters");
+    }
     auto v = rune::crypto::scram::makeVerifier(password, iterations);
     if (!v || v->storedKey.size != 64 || v->serverKey.size != 64) {
         throw std::runtime_error("cannot derive a SCRAM verifier (no randomness or hashing available)");

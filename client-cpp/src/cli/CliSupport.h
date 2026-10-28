@@ -115,8 +115,7 @@ inline int usageError(std::string_view cmd, std::ostream& err, const std::string
 // ═══════════════════════════════════════════════════════════════════════════
 #ifdef RUNE_CLI_LIVE_ENABLED
 
-namespace rc  = rune::client;
-namespace rpc = rune::protocol::client;
+// No short namespace aliases here (issue #317): every includer would inherit them through `using namespace support`.
 
 inline constexpr std::chrono::seconds kConnectWait{10};
 /// Bound on every catalog read (the client's reads are unbounded without one).
@@ -196,6 +195,19 @@ private:
     std::filesystem::path path_;
 };
 
+/// The embedded driver's data directory for `--cli-data-dir <requested>` (issue #315): a non-empty value is the
+/// caller's directory, used as is and left in place; an EMPTY value (absent flag, or `--cli-data-dir ""`) is a fresh
+/// private scratch directory under the temp dir, owned by `scratch` and removed with it.  Every CLI command that
+/// connects resolves the flag through here, so an empty value means the same everywhere.
+[[nodiscard]] inline std::string resolveDataDir(const std::string& requested, ScopedDir& scratch) {
+    if (!requested.empty()) return requested;
+    scratch = ScopedDir(std::filesystem::temp_directory_path() /
+                        ("rune-cli-" + std::to_string(::getpid()) + "-" +
+                         std::to_string(reinterpret_cast<std::uintptr_t>(&scratch)) + "-" +
+                         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())));
+    return scratch.path().string();
+}
+
 /// One connected Client for one broker.  Invoker mode: this thread is the duty thread, so the
 /// DDL retry notes (--verbose) are read race-free.
 inline std::string envOr(const char* name) {
@@ -206,7 +218,7 @@ inline std::string envOr(const char* name) {
 /// Review B I6: the credential flags are GLOBAL — every command that connects resolves them the same way:
 /// `--user` (else RUNE_USER) and `--password-file` (else RUNE_PASSWORD_FILE).  No password ever comes from argv or
 /// the environment.
-inline void applyCredentials(rc::ClientConfig& cfg, const std::string& userFlag, const std::string& passwordFileFlag) {
+inline void applyCredentials(rune::client::ClientConfig& cfg, const std::string& userFlag, const std::string& passwordFileFlag) {
     cfg.username     = !userFlag.empty() ? userFlag : envOr("RUNE_USER");
     cfg.passwordFile = !passwordFileFlag.empty() ? passwordFileFlag : envOr("RUNE_PASSWORD_FILE");
 }
@@ -218,7 +230,7 @@ inline void applyCredentials(rc::ClientConfig& cfg, const std::string& userFlag,
 /// sends credentials: with --user / RUNE_USER / --password-file, or for the bootstrap, it is refused.  Call after
 /// applyCredentials / securityBootstrapOnly.  Throws std::invalid_argument (a usage error) or std::runtime_error (an
 /// unreadable CA file).
-inline void applyTls(rc::ClientConfig& cfg, const std::string& caFlag, const std::string& hostFlag, bool insecure) {
+inline void applyTls(rune::client::ClientConfig& cfg, const std::string& caFlag, const std::string& hostFlag, bool insecure) {
     const std::string ca   = !caFlag.empty() ? caFlag : envOr("RUNE_TLS_CA_FILE");
     const std::string host = !hostFlag.empty() ? hostFlag : envOr("RUNE_TLS_HOST");
     if (insecure) {
@@ -239,12 +251,12 @@ inline void applyTls(rc::ClientConfig& cfg, const std::string& caFlag, const std
     cfg.tlsExpectHost = host;
     // A UDP endpoint (another host) or an explicit TLS option: TLS.  aeron:ipc (this host) without one: plaintext,
     // and the library refuses credentials there.
-    cfg.offerCrypto = !ca.empty() || !host.empty() || !rc::session::tlsHostOfChannel(cfg.gatewayChannel).empty();
+    cfg.offerCrypto = !ca.empty() || !host.empty() || !rune::client::session::tlsHostOfChannel(cfg.gatewayChannel).empty();
 }
 
 /// Review B I6: the dev-mode banner, after any CLI connect (stderr, so it never mixes with a command's output).
-inline void printDevBannerIfAny(const rc::Client& client, std::ostream& err) {
-    if (client.authStatus().brokerMode == rpc::AuthMode::DevDisabled) {
+inline void printDevBannerIfAny(const rune::client::Client& client, std::ostream& err) {
+    if (client.authStatus().brokerMode == rune::protocol::client::AuthMode::DevDisabled) {
         err << "WARNING: this broker runs with authentication DISABLED (RUNE_AUTH=disabled, dev mode)\n";
     }
 }

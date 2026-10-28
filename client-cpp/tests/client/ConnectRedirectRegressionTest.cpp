@@ -17,6 +17,7 @@
 // subscribed on its own UDP ingress endpoint, same stream id; both answer on
 // the Client's ipc egress.
 
+#include "../support/FreePort.h"
 #include "../support/AeronTestErrors.h"
 #include "../support/TestCompletions.h"
 #include <rune/client/Client.h>
@@ -57,19 +58,6 @@ std::string uniqueDir(const char* prefix) {
 }
 
 /// A free loopback UDP port (bound once, released).
-int freeUdpPort() {
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in a{};
-    a.sin_family      = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port        = 0;
-    ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
-    socklen_t l = sizeof a;
-    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &l);
-    ::close(fd);
-    return ntohs(a.sin_port);
-}
-
 /// Gateway A answers every Connect with Redirect{redirectTo}; gateway B (if
 /// any) accepts every Connect.  Counts the Connects each one saw.
 struct TwoGateways {
@@ -154,8 +142,8 @@ ClientConfig clientConfig(const std::string& dir, const std::string& seed, uint3
 
 TEST(ConnectRedirectRegression, TheSeedFollowsAConnectTimeRedirectToTheNamedGatewayRegression) {
     const std::string dir = uniqueDir("rune_conn_redirect");
-    const std::string a = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(freeUdpPort());
-    const std::string b = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(freeUdpPort());
+    const std::string a = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPort());
+    const std::string b = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPort());
     auto client = std::make_unique<Client>(clientConfig(dir, a, 8'000));
     std::this_thread::sleep_for(150ms);   // the embedded driver is up before the gateways attach
     TwoGateways gw(dir + "/aeron", a, b, /*redirectTo=*/b);
@@ -178,8 +166,8 @@ TEST(ConnectRedirectRegression, TheSeedFollowsAConnectTimeRedirectToTheNamedGate
 
 TEST(ConnectRedirectRegression, AConnectWhoseRedirectBudgetRunsOutEndsNotConnectedAtOnceRegression) {
     const std::string dir = uniqueDir("rune_conn_redirect_loop");
-    const std::string a = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(freeUdpPort());
-    const std::string b = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(freeUdpPort());
+    const std::string a = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPort());
+    const std::string b = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::client::testing::allocFreeUdpPort());
     // A long connect timeout: the explicit end must come from the exhausted
     // budget, not from the deadline.
     auto client = std::make_unique<Client>(clientConfig(dir, a, 30'000));

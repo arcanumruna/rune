@@ -174,6 +174,49 @@ bool pumpUntil(rc::Client& c, bool invoker, Pred&& pred, std::chrono::seconds bu
     return false;
 }
 
+/// Everything the READ-only "viewer" principal consumes from the topic (every partition, from the beginning), through a
+/// real client: an Invoker-mode client, so the handler runs inside doWork() on this thread (no cross-thread state).
+/// Waits until `expect` records arrived, then pumps a bounded extra stretch so a surplus record cannot hide.
+std::vector<Rec> consumeAsViewer(ClaimRig& rig, const std::string& name, int32_t tid, std::size_t expect) {
+    auto viewer = rig.connect("viewer", rc::RunnerMode::Invoker, {rc::TopicSpec{name, tid, kParts}});
+    std::vector<Rec> got;
+    rc::SubscribeOptions o;
+    o.from = rc::From::earliest();
+    const rc::TopicHandle th = viewer->topic(name);
+    std::vector<rc::Subscription> subs;
+    for (int32_t part = 0; part < kParts; ++part) {
+        subs.push_back(viewer->subscribe(th, part, o, [&got](const rc::Record& r) {
+            got.push_back(Rec{r.partition, r.offset, 0, 0,
+                              std::string(reinterpret_cast<const char*>(r.key.data()), r.key.size()),
+                              std::string(reinterpret_cast<const char*>(r.value.data()), r.value.size())});
+        }));
+    }
+    EXPECT_TRUE(pumpUntil(*viewer, true, [&] { return got.size() >= expect; })) << "viewer consumed " << got.size() << " of " << expect;
+    for (int i = 0; i < 2000; ++i) (void)viewer->doWork();   // a bounded stretch: nothing more may arrive
+    for (auto& sub : subs) sub.unsubscribe();
+    EXPECT_TRUE(pumpUntil(*viewer, true, [&] {
+        return std::all_of(subs.begin(), subs.end(), [](const rc::Subscription& sub) { return sub.finished(); });
+    })) << "the subscriptions finish";
+    viewer->close();
+    return got;
+}
+
+/// produced = stored = consumed: the viewer's records equal the broker log's, record for record (partition, offset, key,
+/// value), per partition in offset order.
+void expectConsumedEqualsStored(const std::vector<Rec>& stored, std::vector<Rec> consumed) {
+    auto order = [](const Rec& a, const Rec& b) { return a.partition != b.partition ? a.partition < b.partition : a.offset < b.offset; };
+    std::vector<Rec> want = stored;
+    std::sort(want.begin(), want.end(), order);
+    std::sort(consumed.begin(), consumed.end(), order);
+    ASSERT_EQ(consumed.size(), want.size()) << "the viewer consumed exactly what the broker stored";
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        EXPECT_EQ(consumed[i].partition, want[i].partition) << i;
+        EXPECT_EQ(consumed[i].offset, want[i].offset) << i;
+        EXPECT_EQ(consumed[i].key, want[i].key) << i;
+        EXPECT_EQ(consumed[i].value, want[i].value) << i;
+    }
+}
+
 const char* modeName(rc::RunnerMode m) { return m == rc::RunnerMode::Invoker ? "Invoker" : "Thread"; }
 
 rc::ProducerConfig producerCfg() {
@@ -249,6 +292,8 @@ TEST(ClaimBrokerRegression, TryClaimRoundTripsThroughTheBrokerInBothRunnerModesR
             EXPECT_EQ(mine[1]->value, pattern('a', k, kLen));
             EXPECT_LT(mine[0]->offset, mine[1]->offset) << "per-key order: the claim was committed first";
         }
+        // #334: produced = stored = consumed, through the READ-only viewer's client.
+        expectConsumedEqualsStored(recs, consumeAsViewer(rig, name, tid, recs.size()));
         p.close();
         cl->close();
     }
@@ -340,27 +385,60 @@ TEST(ClaimBrokerRegression, ClaimBatchIsOneAtomicBatchOnTheBrokerRegression) {
             EXPECT_NE(recs.back().batchBase, 1);
         }
 
-        // Case 2 (unfenced): a claim may share its RecordBatch with the neighbours the producer was about to send
-        // anyway (it joins an open batch only when it fits whole).  Its 8 records are still contiguous, in ONE
-        // RecordBatch, with no foreign record between them, and the acks account for every record.
-        sendStr("pre2");
-        claimEight('C');
-        sendStr("post2");
-        p.flush();
-        ASSERT_TRUE(awaitAcks(20)) << "acked records " << acked;
-        EXPECT_EQ(acked, 20);
+        // Case 2 (unfenced): no flush() fence between pre2, the claim and post2 - the claim shares its RecordBatch with
+        // the neighbours.  To make that DETERMINISTIC in both runner modes (a Thread-mode runner would otherwise seal
+        // pre2 on its own the moment it drains it), this producer lingers 60 s: only the final flush() ends the open
+        // batch.  So the broker holds exactly ONE RecordBatch of kN + 2 = 10 records (pre2, the 8 claimed, post2),
+        // acked by exactly one BatchAck of 10; the claim's 8 records are contiguous with no foreign record between.
         {
+            rc::ProducerConfig lp = producerCfg();
+            lp.lingerUs = 60'000'000;
+            auto p2 = cl->producer(lp);
+            rc::Completions bq2(*cl);
+            p2.batchAcksTo(bq2);
+            ASSERT_EQ(p2.trySend(topic, key, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>("pre2"), 4)),
+                      rc::SendResult::Ok);
+            {
+                rc::BatchClaim b = p2.claimBatch(topic, key, kN, kRec);
+                ASSERT_TRUE(b) << static_cast<int>(b.result());
+                for (uint32_t i = 0; i < kN; ++i) {
+                    const std::string v = pattern('C', i, kRec);
+                    std::memcpy(b.record(i).data(), v.data(), kRec);
+                }
+                ASSERT_TRUE(b.commit());
+            }
+            ASSERT_EQ(p2.trySend(topic, key, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>("post2"), 5)),
+                      rc::SendResult::Ok);
+            p2.flush();
+            int32_t acked2 = 0;
+            std::vector<rc::BatchAck> acks2;
+            ASSERT_TRUE(pumpUntil(*cl, invoker, [&] {
+                (void)bq2.poll([&](const rc::Completion& c, std::span<const uint8_t>) {
+                    const rc::BatchAck a = rc::batchAckOf(c);
+                    acks2.push_back(a);
+                    acked2 += a.recordCount;
+                });
+                return acked2 >= static_cast<int32_t>(kN + 2);
+            })) << "acked records " << acked2;
+            EXPECT_EQ(acked2, static_cast<int32_t>(kN + 2));
+            ASSERT_EQ(acks2.size(), 1u) << "one RecordBatch, one BatchAck";
+            EXPECT_EQ(acks2[0].recordCount, static_cast<int32_t>(kN + 2));
+            EXPECT_EQ(acks2[0].errorCode, 0);
             const std::vector<Rec> recs = readPartition(rig.b.node(), tid, part);
             ASSERT_EQ(recs.size(), 2u * (kN + 2u));
             for (std::size_t i = 0; i < recs.size(); ++i) EXPECT_EQ(recs[i].offset, static_cast<int64_t>(i)) << "no gaps";
             EXPECT_EQ(recs[10].value, "pre2");
             EXPECT_EQ(recs[19].value, "post2");
-            for (uint32_t i = 0; i < kN; ++i) {
-                const Rec& r = recs[11 + i];
-                EXPECT_EQ(r.value, pattern('C', i, kRec)) << "record " << i << " contiguous after pre2";
-                EXPECT_EQ(r.batchBase, recs[11].batchBase) << "record " << i << " is in the claim's one RecordBatch";
-                EXPECT_GE(r.batchCount, static_cast<int32_t>(kN));
+            for (std::size_t i = 10; i < recs.size(); ++i) {
+                EXPECT_EQ(recs[i].batchBase, 10) << "record " << i << " is in the one RecordBatch that starts at offset 10";
+                EXPECT_EQ(recs[i].batchCount, static_cast<int32_t>(kN + 2)) << "pre2 + 8 claimed + post2, exactly";
             }
+            for (uint32_t i = 0; i < kN; ++i) {
+                EXPECT_EQ(recs[11 + i].value, pattern('C', i, kRec)) << "record " << i << " contiguous after pre2";
+                EXPECT_EQ(recs[11 + i].key, keyBytes(key));
+            }
+            // #334: produced = stored = consumed through the READ-only viewer.
+            expectConsumedEqualsStored(recs, consumeAsViewer(rig, name, tid, recs.size()));
         }
         p.close();
         cl->close();
@@ -693,4 +771,144 @@ TEST(ClaimBrokerRegression, ALineageGoesStaleOnTheNextAlterIsRefetchedAndIsRefus
     const auto plain = out->getTopicSchemaAndWait(name, 30s);
     EXPECT_NE(plain.errorCode, 0) << "and the plain read is refused alike";
     out->close();
+}
+
+// #334: the typed claim path with the acks AWAITED - no log polling stands in for them.  The typed topic is built over
+// a producer bound to a batch-ack queue, so every typed send and every typed claim reserves a credit unit; the test
+// waits for the BatchAcks of all of them (every errorCode 0, the queue back to zero outstanding) BEFORE it closes the
+// client, then reads the log once: every acked record is already there.
+TEST(ClaimBrokerRegression, TypedClaimAcksAreAwaitedBeforeCloseRegression) {
+    ClaimRig rig("claim_typed_ack");
+    const rune::codec::Descriptor desc = positionDescriptor();
+    ASSERT_EQ(rune::codec::fingerprint(desc), Position::kFingerprint) << "the test's descriptor is the generated schema";
+    int modeIdx = 0;
+    for (const rc::RunnerMode mode : {rc::RunnerMode::Thread, rc::RunnerMode::Invoker}) {
+        SCOPED_TRACE(modeName(mode));
+        const bool invoker = mode == rc::RunnerMode::Invoker;
+        const std::string name = "claim.posack" + std::to_string(modeIdx++);
+        const int32_t tid = rig.define(name, "userId", rune::codec::serialize(desc), true);
+        ASSERT_GE(tid, 0);
+        auto cl = rig.connect("writer", mode);
+        // The broker's open gate yields the handle and the bound version; the topic under test is built over an acked producer.
+        const rc::TypedTopic<Position> opened = cl->openTopicAndWait<Position>(name, 30s);
+        ASSERT_EQ(opened.handle().topicId, tid);
+        auto p = cl->producer(producerCfg());
+        rc::Completions bq(*cl);
+        p.batchAcksTo(bq);
+        rc::TypedTopic<Position> topic{std::move(p), opened.handle(), opened.boundVersion()};
+
+        const std::vector<int64_t> users = {0, 1, 2, 7, 42, 1000, 123456789, -1, -77, int64_t{1} << 40};
+        for (const int64_t u : users) {
+            Position rec;
+            rec.userId = u;
+            rec.zone   = 3;
+            rec.x      = 1.5;
+            rec.y      = -2.25;
+            rec.z      = 1e9;
+            rec.flags  = 0xBEEF;
+            rec.seq    = 4'000'000'000u;
+            rec.tick   = 0x0102030405060708ull;
+            rec.alive  = true;
+            rec.kind   = 2;
+            std::memcpy(rec.tag.data(), "north", 5);
+            topic.send(rec);
+            auto w = topic.claim(u);
+            ASSERT_TRUE(w) << static_cast<int>(w.result());
+            w.zone(3).x(1.5).y(-2.25).z(1e9).flags(0xBEEF).seq(4'000'000'000u).tick(0x0102030405060708ull).alive(true).kind(2).tag("north");
+            ASSERT_TRUE(w.commit());
+        }
+        const int32_t total = static_cast<int32_t>(2 * users.size());
+        int32_t acked = 0;
+        ASSERT_TRUE(pumpUntil(*cl, invoker, [&] {
+            (void)bq.poll([&](const rc::Completion& c, std::span<const uint8_t>) {
+                const rc::BatchAck a = rc::batchAckOf(c);
+                EXPECT_EQ(a.errorCode, 0) << "a validator refusal or a produce error";
+                acked += a.recordCount;
+            });
+            return acked >= total;
+        })) << "acked " << acked << " of " << total;
+        EXPECT_EQ(acked, total) << "every typed send and every typed claim is acked, none twice";
+        EXPECT_EQ(bq.outstanding(), 0u) << "all the credit is back";
+        EXPECT_EQ(bq.reservedBytes(), 0u);
+        cl->close();   // only now: nothing is in flight
+
+        const std::vector<Rec> recs = readTopic(rig.b.node(), tid);   // read once, no waiting: acked means stored
+        ASSERT_EQ(recs.size(), 2 * users.size());
+        for (const int64_t u : users) {
+            const rc::Key key(u);
+            std::vector<const Rec*> mine;
+            for (const Rec& r : recs)
+                if (r.key == keyBytes(key)) mine.push_back(&r);
+            ASSERT_EQ(mine.size(), 2u) << "userId " << u;
+            EXPECT_EQ(mine[0]->partition, mine[1]->partition) << "claim(" << u << ") lands where send(rec) does";
+            EXPECT_EQ(mine[0]->partition, key.partition(kParts));
+            EXPECT_EQ(mine[0]->value, mine[1]->value) << "claim and send store the same bytes";
+            ASSERT_EQ(mine[0]->value.size(), Position::Encoder::kEncodedLength);
+            EXPECT_EQ(static_cast<uint8_t>(mine[0]->value[2]), opened.boundVersion()) << "the bound version is stamped";
+            EXPECT_LT(mine[0]->offset, mine[1]->offset) << "per-key order: send, then claim";
+        }
+        // produced = stored = consumed, through the READ-only viewer.
+        expectConsumedEqualsStored(recs, consumeAsViewer(rig, name, tid, recs.size()));
+    }
+}
+
+// #334: a claim the broker refuses (no WRITE) completes NotAuthorized and RETURNS its credit: right after each refused
+// wave is polled, the Completions' outstanding counter and reserved bytes are back to their prior value, and the
+// queue - sized to hold exactly `fit` records - takes a full wave again.  A leak of even one unit per refusal would
+// QueueFull the next wave.
+TEST(ClaimBrokerRegression, NotAuthorizedClaimReturnsItsCreditRegression) {
+    ClaimRig rig("claim_noauth_credit");
+    int modeIdx = 0;
+    for (const rc::RunnerMode mode : {rc::RunnerMode::Thread, rc::RunnerMode::Invoker}) {
+        SCOPED_TRACE(modeName(mode));
+        const bool invoker = mode == rc::RunnerMode::Invoker;
+        const std::string name = "claim.rocredit" + std::to_string(modeIdx++);
+        const int32_t tid = rig.define(name, "", {}, false);
+        ASSERT_GE(tid, 0);
+        auto cl = rig.connect("viewer", mode, {rc::TopicSpec{name, tid, kParts}});   // READ + DESCRIBE, no WRITE
+        auto p = cl->producer(producerCfg());
+        const rc::TopicHandle topic = cl->topic(name);
+        rc::CompletionsConfig cc;
+        cc.capacityBytes  = 1024;
+        cc.maxResultBytes = 64;
+        cc.maxErrorText   = 64;
+        rc::Completions cq(*cl, cc);
+        // How many records the queue holds: reserve until it refuses, give it all back.
+        uint32_t fit = 0;
+        while (cq.reserve(rc::producer::kAckRecordBytes) == rc::OpResult::Accepted) ++fit;
+        for (uint32_t i = 0; i < fit; ++i) cq.unreserve(rc::producer::kAckRecordBytes);
+        ASSERT_GE(fit, 2u);
+        ASSERT_EQ(cq.outstanding(), 0u);
+        const uint32_t priorOutstanding = cq.outstanding();
+        const uint32_t priorReserved    = cq.reservedBytes();
+
+        rc::Token tok = 1;
+        for (int wave = 0; wave < 3; ++wave) {
+            SCOPED_TRACE("wave " + std::to_string(wave));
+            for (uint32_t i = 0; i < fit; ++i) {
+                rc::Claim c = p.tryClaim(topic, rc::Key(uint64_t{9} + i), 16, cq, tok++);
+                ASSERT_TRUE(c) << "the queue's credit is whole at the start of every wave: " << static_cast<int>(c.result());
+                std::memset(c.buffer().data(), 0x5A, c.buffer().size());
+                ASSERT_TRUE(c.commit());
+            }
+            EXPECT_EQ(cq.outstanding(), fit) << "one unit per claim in flight";
+            p.flush();
+            uint32_t refused = 0;
+            ASSERT_TRUE(pumpUntil(*cl, invoker, [&] {
+                (void)cq.poll([&](const rc::Completion& d, std::span<const uint8_t>) {
+                    EXPECT_EQ(d.status, rc::OpStatus::DeliveryFailed);
+                    EXPECT_EQ(d.errorCode, kNotAuthorized);
+                    ++refused;
+                });
+                return refused >= fit;
+            })) << "refused " << refused << " of " << fit;
+            EXPECT_EQ(refused, fit);
+            // Right after the refusals were polled: the credit is back to its prior value.
+            EXPECT_EQ(cq.outstanding(), priorOutstanding);
+            EXPECT_EQ(cq.reservedBytes(), priorReserved);
+        }
+        EXPECT_TRUE(readTopic(rig.b.node(), tid).empty()) << "nothing was appended";
+        p.close();
+        cl->close();
+    }
 }
