@@ -32,7 +32,11 @@
 #include <string_view>
 #include <tuple>
 #include <thread>
+#include <map>
 #include <memory>
+#include <random>
+#include <cstdio>
+#include <stdexcept>
 #include <vector>
 #include <unistd.h>
 
@@ -1753,13 +1757,15 @@ TEST(ProducerClaimRegression, WritingAnAbandonedClaimSpanAfterCloseNeverReachesA
     EXPECT_FALSE(c.commit());
 }
 
-// Attack (C10 review, #331): the close-path abandon under allocation failure.  Copying the records before the claim
-// into fresh storage throws bad_alloc; the catch branch must fail those records (Closed, each exactly once), quarantine
-// the whole claimed span, report the claim abandoned (commit -> false, no completion for it) and never send anything
-// from that builder - neither the records it failed nor the caller's span, which the caller keeps writing.
-// RED (mutation): the catch branch only marks the claim abandoned (`(void)abandonDirectClaimOn_(ps); return;`) - the
-// builder still holds A, B and the span, which the next pass sends (0xAB on the wire, no Closed completions).
-TEST(ProducerClaimRegression, CloseAbandonUnderBadAllocFailsTheRecordsAndNeverSendsTheSpanAdversarialRegression) {
+// Attack (C10 review, #331), reworked by C15 (#344): the close-path abandon used to copy the records before the claim
+// into FRESH storage (bad_alloc -> the catch branch failed them).  The Direct producer now reserves a builder-sized
+// spare quarantine at creation, so the abandon copies into it and swaps: it NEVER allocates, and an injected allocation
+// failure armed across it does not fire.  The invariants the old test guarded still hold: the claim is reported
+// abandoned (commit -> false, no completion for it), the caller's span is quarantined and never sent however it keeps
+// writing, and the records before the claim are each completed exactly once (here: sent, acked Ok).
+// RED (mutation): the abandon allocates again (the spare reserve removed) - the injected failure fires (and the catch
+// branch fails A, B Closed instead of sending them).
+TEST(ProducerClaimRegression, CloseAbandonNeverAllocatesAndNeverSendsTheSpanAdversarialRegression) {
     ProducerConfig cfg = voidCfg();
     cfg.acks = Acks::Leader;
     DirectRig r(cfg);
@@ -1775,26 +1781,28 @@ TEST(ProducerClaimRegression, CloseAbandonUnderBadAllocFailsTheRecordsAndNeverSe
     ASSERT_TRUE(c);
     std::memset(c.buffer().data(), 0xAB, c.buffer().size());
 
-    alloc_counter::failNthAllocationThisThread(1);   // the copy of A, B into fresh storage
+    alloc_counter::failNthAllocationThisThread(1);   // armed across the abandon: it must not allocate at all
     r.impl->abandonOpenClaimForClose();
     const bool fired = alloc_counter::injectedFailureFiredThisThread();
     alloc_counter::failNthAllocationThisThread(0);
-    ASSERT_TRUE(fired) << "the injected bad_alloc never reached the close abandon";
+    EXPECT_FALSE(fired) << "the close abandon allocated";
 
     EXPECT_EQ(r.impl->claimsAbandoned(), 1u);
     EXPECT_TRUE(r.impl->claimQuarantineCovers(c.buffer().data(), c.buffer().size())) << "the span is quarantined";
-    for (const rc::Token t : {rc::Token{1}, rc::Token{2}}) {
-        EXPECT_EQ(L.times(t), 1) << "token " << t << " completes exactly once";
-        EXPECT_EQ(L.last[t].status, rc::OpStatus::Closed) << "token " << t;
-    }
     EXPECT_EQ(L.times(3), 0) << "the uncommitted claim was never accepted: no completion";
     std::memset(c.buffer().data(), 0xAB, c.buffer().size());   // the caller keeps writing its span
-    for (int i = 0; i < 4; ++i) r.pass(cap.fn());
-    EXPECT_EQ(cap.frames, 0) << "the failed records and the span are never sent";
-    EXPECT_FALSE(containsRun(cap.rawFrames, 0xAB, 8));
+    std::size_t acked = 0;
+    for (int i = 0; i < 4; ++i) {
+        r.pass(cap.fn());
+        ackNewFrames(*r.impl, cap, acked);
+    }
+    EXPECT_EQ(cap.values(), (std::vector<std::string>{"A", "B"})) << "the records before the claim drain, nothing else";
+    EXPECT_FALSE(containsRun(cap.rawFrames, 0xAB, 8)) << "the span is never sent";
     EXPECT_FALSE(c.commit());
-    EXPECT_EQ(L.times(1), 1);
-    EXPECT_EQ(L.times(2), 1);
+    for (const rc::Token t : {rc::Token{1}, rc::Token{2}}) {
+        EXPECT_EQ(L.times(t), 1) << "token " << t << " completes exactly once";
+        EXPECT_EQ(L.last[t].status, rc::OpStatus::Ok) << "token " << t;
+    }
     EXPECT_EQ(L.times(3), 0);
 }
 
@@ -2116,8 +2124,10 @@ TEST(ProducerClaimRegression, DiscardOfAMalformedRingMessageEmitsNoBatchAckRegre
 
 namespace {
 rc::Completions* g_ackCq = nullptr;  // the one queue the rig's producer delivers per-record completions to
-void deliverToAckCq(void*, rc::CqRef, const rc::Completion& c) noexcept {
-    if (g_ackCq != nullptr) (void)g_ackCq->ring().deliver(c, {});
+rc::Completions* g_ackBq = nullptr;  // C14 review: a batchAcksTo() queue, routed by its CqRef (else everything -> g_ackCq)
+void deliverToAckCq(void*, rc::CqRef ref, const rc::Completion& c) noexcept {
+    rc::Completions* q = (g_ackBq != nullptr && ref == g_ackBq->cqRef()) ? g_ackBq : g_ackCq;
+    if (q != nullptr) (void)q->ring().deliver(c, {});
 }
 ProducerConfig ackedCfg() {
     ProducerConfig c = voidCfg();
@@ -2368,4 +2378,494 @@ TEST(ProducerClaimDirectRegression, AbandonedClaimReportsAbandonedBeforeCommitRe
     ASSERT_TRUE(ring);
     EXPECT_FALSE(ring.abandoned());
     EXPECT_EQ(p.claimsAbandoned(), 0u);
+}
+
+// ===========================================================================
+// C14 review (adversarial pass): #324 #326 #327 #328 #329 #335 #339 #343 #374 #393.  Driven through the public
+// Producer / Claim / BatchClaim API on the bare-impl rigs above; every loop is capped, nothing sleeps.
+// ===========================================================================
+
+namespace {
+uint32_t polledCount(rc::Completions& q) {
+    return static_cast<uint32_t>(q.poll([](const rc::Completion&, std::span<const uint8_t>) {}));
+}
+/// Routes the rig's batch-ack completions to `bq` (by its CqRef) for the scope.
+struct BqRoute {
+    explicit BqRoute(rc::Completions& bq) { g_ackBq = &bq; }
+    ~BqRoute() { g_ackBq = nullptr; }
+    BqRoute(const BqRoute&)            = delete;
+    BqRoute& operator=(const BqRoute&) = delete;
+};
+}  // namespace
+
+// Resources / credit (#328, #339, #324): every refusal of every claim form - after the credit-first reordering -
+// hands back exactly what it took: the per-claim cq unit and the n batch-ack units, in both ingress modes.
+TEST(ProducerClaimRegression, ClaimRefusalsNeverLeakCreditAdversarialRegression) {
+    for (const bool direct : {false, true}) {
+        SCOPED_TRACE(direct ? "Direct" : "Ring");
+        AckedRig r(direct);
+        rc::Completions bq(*r.client, smallCq(1024));
+        r.p.batchAcksTo(bq);
+        BqRoute route(bq);
+        const Key key(uint64_t{4});
+        auto clean = [&](const char* what) {
+            EXPECT_EQ(r.cq.outstanding(), 0u) << what;
+            EXPECT_EQ(r.cq.reservedBytes(), 0u) << what;
+            EXPECT_EQ(bq.outstanding(), 0u) << what;
+            EXPECT_EQ(bq.reservedBytes(), 0u) << what;
+        };
+        auto everyForm = [&](uint32_t n, uint32_t len, SendResult want, const char* what) {
+            EXPECT_EQ(r.p.tryClaim(kTopic, key, len).result(), want) << what << ": tryClaim";
+            EXPECT_EQ(r.p.tryClaim(kTopic, key, len, r.cq, 1).result(), want) << what << ": tryClaim(cq)";
+            EXPECT_EQ(r.p.tryClaim(kTopic, key, len, rc::AckToken{2}).result(), want) << what << ": tryClaim(tok)";
+            EXPECT_EQ(r.p.claimBatch(kTopic, key, n, len).result(), want) << what << ": claimBatch";
+            EXPECT_EQ(r.p.claimBatch(kTopic, key, n, len, r.cq, 3).result(), want) << what << ": claimBatch(cq)";
+            EXPECT_EQ(r.p.claimBatch(kTopic, key, n, len, rc::AckToken{4}).result(), want)
+                << what << ": claimBatch(tok)";
+        };
+        // Never-retryable sizes.
+        everyForm(2, static_cast<uint32_t>(Producer::kMaxRecordBytes), SendResult::MessageTooLarge, "too large");
+        clean("too large");
+        EXPECT_EQ(r.p.claimBatch(kTopic, key, 0, 4).result(), SendResult::InvalidArgument);
+        EXPECT_EQ(r.p.claimBatch(kTopic, key, 0, 4, r.cq, 5).result(), SendResult::InvalidArgument);
+        EXPECT_EQ(r.p.claimBatch(kTopic, key, 0, 4, rc::AckToken{6}).result(), SendResult::InvalidArgument);
+        clean("n == 0");
+        // Batch-ack queue full: QueueFull for every form, the cq unit taken first comes back.
+        uint32_t filled = 0;
+        while (bq.reserve(kUnit) == rc::OpResult::Accepted && filled < 10'000) ++filled;
+        ASSERT_GT(filled, 0u);
+        everyForm(2, 4, SendResult::QueueFull, "bq full");
+        EXPECT_EQ(r.cq.outstanding(), 0u) << "bq full: the cq unit came back";
+        EXPECT_EQ(bq.outstanding(), filled) << "bq full: no batch unit was kept";
+        // A claimBatch needing more units than the room left: all or none.
+        for (uint32_t i = 0; i < 2; ++i) bq.unreserve(kUnit);
+        EXPECT_EQ(r.p.claimBatch(kTopic, key, 3, 4, r.cq, 7).result(), SendResult::QueueFull);
+        EXPECT_EQ(bq.outstanding(), filled - 2) << "a partial reservation was rolled back";
+        EXPECT_EQ(r.cq.outstanding(), 0u);
+        for (uint32_t i = 0; i < filled - 2; ++i) bq.unreserve(kUnit);
+        clean("bq drained");
+        // Completion queue full: the cq forms are QueueFull and take no batch unit.
+        uint32_t cqFilled = 0;
+        while (r.cq.reserve(kUnit) == rc::OpResult::Accepted && cqFilled < 10'000) ++cqFilled;
+        EXPECT_EQ(r.p.tryClaim(kTopic, key, 4, r.cq, 8).result(), SendResult::QueueFull);
+        EXPECT_EQ(r.p.claimBatch(kTopic, key, 2, 4, r.cq, 9).result(), SendResult::QueueFull);
+        EXPECT_EQ(r.cq.outstanding(), cqFilled);
+        EXPECT_EQ(bq.outstanding(), 0u);
+        for (uint32_t i = 0; i < cqFilled; ++i) r.cq.unreserve(kUnit);
+        clean("cq drained");
+        if (direct) {
+            // ClaimHeld: an open (void) claim holds one batch unit; every other claim is refused and keeps nothing.
+            rc::Claim held = r.p.tryClaim(kTopic, key, 4);
+            ASSERT_TRUE(held);
+            EXPECT_EQ(bq.outstanding(), 1u);
+            everyForm(2, 4, SendResult::ClaimHeld, "claim held");
+            EXPECT_EQ(bq.outstanding(), 1u) << "ClaimHeld kept no batch unit";
+            EXPECT_EQ(r.cq.outstanding(), 0u) << "ClaimHeld kept no cq unit";
+            held.abort();
+            clean("claim held, aborted");
+        }
+        // Not vacuous: an acked claimBatch with both queues bound takes n batch units + one cq unit, and the ack
+        // (polled) gives all of them back.
+        {
+            rc::BatchClaim ok = r.p.claimBatch(kTopic, key, 3, 2, r.cq, 10);
+            ASSERT_TRUE(ok) << static_cast<int>(ok.result());
+            EXPECT_EQ(r.cq.outstanding(), 1u);
+            EXPECT_EQ(bq.outstanding(), 3u);
+            ASSERT_TRUE(ok.commit());
+        }
+        r.pass();
+        ASSERT_EQ(r.cap.corrs.size(), 1u);
+        r.impl->onProduceResponse(r.cap.corrs[0], 100, 0);
+        const auto done = r.polled();
+        ASSERT_EQ(done.size(), 1u);
+        EXPECT_EQ(std::get<1>(done[0]), 100);
+        EXPECT_GE(polledCount(bq), 1u);
+        clean("acked claimBatch round trip");
+        // Closed: every form is Closed and takes nothing.
+        ASSERT_EQ(r.p.closeImmediately(), rc::OpResult::Accepted);
+        (void)polledCount(bq);
+        const uint32_t bqAfterClose = bq.outstanding();
+        everyForm(2, 4, SendResult::Closed, "closed");
+        EXPECT_EQ(r.cq.outstanding(), 0u) << "closed";
+        EXPECT_EQ(bq.outstanding(), bqAfterClose) << "closed";
+    }
+    // Ring full (Thread mode): BackPressured for every form after BOTH credits were taken - each comes back.
+    AckedRig r(false);
+    rc::Completions bq(*r.client, smallCq(1024));
+    r.p.batchAcksTo(bq);
+    BqRoute route(bq);
+    std::vector<long> held;
+    for (int i = 0; i < 100'000; ++i) {
+        const long idx = r.p.testClaimRecord(kTopic, 0, Key(uint64_t{1}), bytes("xxxxxxxxxxxxxxxxxxxxxxxx"));
+        if (idx < 0) break;
+        held.push_back(idx);
+    }
+    ASSERT_FALSE(held.empty());
+    ASSERT_LT(held.size(), 100'000u) << "the ring must fill";
+    const Key key(uint64_t{4});
+    EXPECT_EQ(r.p.tryClaim(kTopic, key, 4).result(), SendResult::BackPressured);
+    EXPECT_EQ(r.p.tryClaim(kTopic, key, 4, r.cq, 1).result(), SendResult::BackPressured);
+    EXPECT_EQ(r.p.tryClaim(kTopic, key, 4, rc::AckToken{2}).result(), SendResult::BackPressured);
+    EXPECT_EQ(r.p.claimBatch(kTopic, key, 3, 4).result(), SendResult::BackPressured);
+    EXPECT_EQ(r.p.claimBatch(kTopic, key, 3, 4, r.cq, 3).result(), SendResult::BackPressured);
+    EXPECT_EQ(r.p.claimBatch(kTopic, key, 3, 4, rc::AckToken{4}).result(), SendResult::BackPressured);
+    EXPECT_EQ(r.cq.outstanding(), 0u) << "ring full: the cq unit came back";
+    EXPECT_EQ(r.cq.reservedBytes(), 0u);
+    EXPECT_EQ(bq.outstanding(), 0u) << "ring full: all n batch units came back";
+    EXPECT_EQ(bq.reservedBytes(), 0u);
+    for (const long idx : held) r.p.testCommitClaim(idx);
+}
+
+// Data integrity (#324): a seeded random mix of void sends, acked sends and acked claimBatches (cq and AckToken,
+// random n / record length, some aborted) on a small batchBytes, so claims both join an open RecordBatch and are
+// forced to start their own.  Every committed acked claimBatch completes EXACTLY once with its first record's
+// offset; its records are contiguous in ONE frame; an aborted one never lands and never completes.
+TEST(ProducerClaimRegression, AckedClaimBatchCompletesExactlyOnceAcrossBatchShapesAdversarialRegression) {
+    for (const bool direct : {false, true}) {
+        for (const uint32_t seed : {1u, 7u, 0xC14u}) {
+            SCOPED_TRACE(std::string(direct ? "Direct" : "Ring") + " seed " + std::to_string(seed));
+            ProducerConfig cfg = ackedCfg();
+            cfg.batchBytes     = 512;
+            AckedRig r(direct, cfg);
+            test_support::AckLedger L;
+            L.attach(r.p);
+            std::mt19937 rng(seed);
+            const Key key(uint64_t{4});
+            enum class Kind { Void, Acked, Claim };
+            struct Op {
+                Kind     kind    = Kind::Void;
+                rc::Token tok    = 0;
+                uint32_t n       = 0;
+                bool     viaCq   = false;
+                bool     aborted = false;
+            };
+            std::vector<Op>              ops;
+            std::map<rc::Token, int>     cqTimes;
+            std::map<rc::Token, int64_t> cqValue;
+            std::size_t                  acked = 0;
+            auto settle = [&] {
+                r.pass();
+                for (; acked < r.cap.corrs.size(); ++acked) {
+                    r.impl->onProduceResponse(r.cap.corrs[acked], static_cast<int64_t>(10'000 * (acked + 1)), 0);
+                }
+                for (const auto& [t, v, s] : r.polled()) {
+                    EXPECT_EQ(s, rc::OpStatus::Ok);
+                    ++cqTimes[t];
+                    cqValue[t] = v;
+                }
+            };
+            auto marker = [](rc::Token t, uint32_t i) {
+                char b[16];
+                std::snprintf(b, sizeof b, "C%06u#%02u", static_cast<unsigned>(t), i);
+                return std::string(b);
+            };
+            for (rc::Token tok = 1; tok <= 300; ++tok) {
+                const uint32_t pick = rng() % 4;
+                Op op;
+                op.tok = tok;
+                bool done = false;
+                for (int attempt = 0; attempt < 8 && !done; ++attempt) {
+                    if (pick == 0 || pick == 1) {
+                        op.kind = pick == 0 ? Kind::Void : Kind::Acked;
+                        const std::string v = (pick == 0 ? "V" : "S") + std::to_string(tok);
+                        const SendResult s = pick == 0 ? r.p.trySend(kTopic, key, bytes(v))
+                                                       : r.p.trySend(kTopic, key, bytes(v), rc::AckToken{tok});
+                        done = s == SendResult::Ok;
+                        if (!done) ASSERT_EQ(s, SendResult::BackPressured);
+                    } else {
+                        op.kind  = Kind::Claim;
+                        op.n     = attempt == 0 ? 1 + rng() % 6 : op.n;
+                        const uint32_t len = 12 + (static_cast<uint32_t>(tok) * 7) % 37;
+                        op.viaCq = (tok % 2) == 0;
+                        op.aborted = (tok % 5) == 0;
+                        rc::BatchClaim b = op.viaCq ? r.p.claimBatch(kTopic, key, op.n, len, r.cq, tok)
+                                                    : r.p.claimBatch(kTopic, key, op.n, len, rc::AckToken{tok});
+                        if (!b) {
+                            ASSERT_EQ(b.result(), SendResult::BackPressured);
+                        } else {
+                            for (uint32_t i = 0; i < op.n; ++i) {
+                                std::memset(b.record(i).data(), '.', len);
+                                const std::string m = marker(tok, i);
+                                std::memcpy(b.record(i).data(), m.data(), m.size());
+                            }
+                            if (op.aborted) b.abort();
+                            else ASSERT_TRUE(b.commit());
+                            done = true;
+                        }
+                    }
+                    if (!done) settle();
+                }
+                ASSERT_TRUE(done) << "op " << tok << " never went through";
+                ops.push_back(op);
+                if (rng() % 3 == 0) settle();
+            }
+            for (int i = 0; i < 8; ++i) settle();
+            ASSERT_EQ(acked, r.cap.corrs.size());
+            // Locate every record by its value.
+            std::map<std::string, std::size_t> at;
+            for (std::size_t i = 0; i < r.cap.recs.size(); ++i) {
+                const std::string& v = r.cap.recs[i].value;
+                const std::string  k = v.size() >= 10 && v[0] == 'C' ? v.substr(0, 10) : v;
+                EXPECT_TRUE(at.emplace(k, i).second) << "record landed twice: " << k;
+            }
+            int handlerOps = 0;
+            int cqOps      = 0;
+            for (const Op& op : ops) {
+                SCOPED_TRACE("token " + std::to_string(op.tok));
+                if (op.kind == Kind::Void) {
+                    EXPECT_EQ(at.count("V" + std::to_string(op.tok)), 1u);
+                    EXPECT_EQ(L.times(op.tok), 0);
+                    continue;
+                }
+                if (op.kind == Kind::Acked) {
+                    ++handlerOps;
+                    const auto it = at.find("S" + std::to_string(op.tok));
+                    ASSERT_NE(it, at.end());
+                    const auto& rec = r.cap.recs[it->second];
+                    ASSERT_EQ(L.times(op.tok), 1);
+                    EXPECT_EQ(L.value(op.tok), 10'000 * (rec.frame + 1) + rec.offset);
+                    continue;
+                }
+                if (op.aborted) {
+                    for (uint32_t i = 0; i < op.n; ++i) EXPECT_EQ(at.count(marker(op.tok, i)), 0u);
+                    EXPECT_EQ(L.times(op.tok), 0);
+                    EXPECT_EQ(cqTimes.count(op.tok), 0u);
+                    continue;
+                }
+                const auto first = at.find(marker(op.tok, 0));
+                ASSERT_NE(first, at.end());
+                const auto& r0 = r.cap.recs[first->second];
+                for (uint32_t i = 1; i < op.n; ++i) {
+                    const auto it = at.find(marker(op.tok, i));
+                    ASSERT_NE(it, at.end());
+                    EXPECT_EQ(r.cap.recs[it->second].frame, r0.frame) << "a claimBatch is split across frames";
+                    EXPECT_EQ(r.cap.recs[it->second].offset, r0.offset + i) << "not contiguous";
+                }
+                const int64_t want = 10'000 * (r0.frame + 1) + r0.offset;
+                if (op.viaCq) {
+                    ++cqOps;
+                    ASSERT_EQ(cqTimes[op.tok], 1) << "exactly one completion per claim batch";
+                    EXPECT_EQ(cqValue[op.tok], want) << "the first record's offset";
+                    EXPECT_EQ(L.times(op.tok), 0);
+                } else {
+                    ++handlerOps;
+                    ASSERT_EQ(L.times(op.tok), 1) << "exactly one completion per claim batch";
+                    EXPECT_EQ(L.value(op.tok), want) << "the first record's offset";
+                }
+            }
+            EXPECT_EQ(static_cast<int>(L.recs.size()), handlerOps) << "no stray handler completion";
+            int cqTotal = 0;
+            for (const auto& [t, c] : cqTimes) cqTotal += c;
+            EXPECT_EQ(cqTotal, cqOps) << "no stray cq completion";
+            EXPECT_EQ(r.cq.outstanding(), 0u);
+            EXPECT_GT(r.cap.corrs.size(), 4u) << "not vacuous: the mix spans many RecordBatches";
+        }
+    }
+}
+
+// #324 + #326 (Invoker): an ACKED claimBatch abandoned under its caller (close, or a live route failure) never
+// completes, its commit is false, and every unit of credit it took (one cq unit, n batch-ack units) comes back.  The
+// record before it completes once with the failure; after a live abandon the next acked claimBatch works.
+TEST(ProducerClaimDirectRegression, AbandonedAckedClaimBatchNeverCompletesAndReturnsAllCreditAdversarialRegression) {
+    for (const bool viaClose : {true, false}) {
+        for (const bool viaCq : {true, false}) {
+            SCOPED_TRACE(std::string(viaClose ? "close" : "route failure") + (viaCq ? " cq" : " AckToken"));
+            AckedRig r(true);
+            rc::Completions bq(*r.client, smallCq());
+            r.p.batchAcksTo(bq);
+            BqRoute route(bq);
+            test_support::AckLedger L;
+            L.attach(r.p);
+            r.pass();
+            const Key key(uint64_t{4});
+            ASSERT_EQ(r.p.trySend(kTopic, key, bytes("A"), rc::AckToken{30}), SendResult::Ok);
+            rc::BatchClaim b = viaCq ? r.p.claimBatch(kTopic, key, 3, 2, r.cq, 31)
+                                     : r.p.claimBatch(kTopic, key, 3, 2, rc::AckToken{31});
+            ASSERT_TRUE(b);
+            EXPECT_EQ(bq.outstanding(), 4u);
+            if (viaClose) {
+                ASSERT_EQ(r.p.closeImmediately(), rc::OpResult::Accepted);
+            } else {
+                r.impl->failRoutedBroker(&failEveryRoute, nullptr);
+            }
+            EXPECT_EQ(r.p.claimsAbandoned(), 1u);
+            EXPECT_TRUE(b.abandoned());
+            for (uint32_t i = 0; i < b.count(); ++i) std::memset(b.record(i).data(), 'Z', b.recordLength());
+            EXPECT_FALSE(b.commit());
+            EXPECT_EQ(L.times(30), 1) << "the record before the claim fails once";
+            EXPECT_NE(L.status(30), rc::OpStatus::Ok);
+            r.pass();
+            EXPECT_FALSE(anyByteIs(r.cap.values(), 'Z'));
+            if (!viaClose) {
+                rc::BatchClaim n = r.p.claimBatch(kTopic, key, 2, 2, rc::AckToken{32});
+                ASSERT_TRUE(n) << static_cast<int>(n.result());
+                fill(n.record(0), "n0");
+                fill(n.record(1), "n1");
+                ASSERT_TRUE(n.commit());
+                r.pass();
+                ASSERT_FALSE(r.cap.corrs.empty());
+                r.impl->onProduceResponse(r.cap.corrs.back(), 500, 0);
+                ASSERT_EQ(L.times(32), 1);
+                EXPECT_EQ(L.value(32), 500);
+            }
+            EXPECT_TRUE(r.polled().empty()) << "the abandoned claim batch never completes";
+            EXPECT_EQ(L.times(31), 0) << "the abandoned claim batch never completes";
+            EXPECT_EQ(r.cq.outstanding(), 0u);
+            EXPECT_EQ(r.cq.reservedBytes(), 0u);
+            (void)polledCount(bq);
+            EXPECT_EQ(bq.outstanding(), 0u) << "the n batch-ack units came back";
+        }
+    }
+}
+
+// #374: a partition builder is preallocated for the largest frame the documented limits allow - a builder just
+// under its flush threshold plus one max-size record (the overshoot), the frame-capped solo oversize record, and a
+// whole-frame claimBatch.  data() never moves (nothing reallocates) on any of them, in both modes and across shapes.
+TEST(ProducerClaimAllocRegression, BuilderNeverReallocatesAtTheDocumentedMaximumAdversarialRegression) {
+    struct Shape {
+        int32_t     batchBytes;
+        int32_t     maxFrameBytes;
+        const char* name;
+    };
+    const Shape shapes[] = {{64 * 1024, 64 * 1024, "default"},
+                            {16 * 1024, 64 * 1024, "frame cap above batchBytes"},
+                            {16 * 1024, 0, "no frame cap"},
+                            {1024, 0, "tiny batchBytes"},
+                            {64 * 1024, 4 * 1024, "frame-capped"}};
+    const Key      key(uint64_t{4});
+    const uint32_t maxVal = static_cast<uint32_t>(Producer::kMaxRecordBytes) - static_cast<uint32_t>(key.size());
+    const std::vector<uint8_t> big(maxVal, 0x42);
+    for (const Shape& s : shapes) {
+        for (const bool direct : {false, true}) {
+            SCOPED_TRACE(std::string(s.name) + (direct ? " Direct" : " Ring"));
+            ProducerConfig cfg = voidCfg();
+            cfg.batchBytes     = s.batchBytes;
+            cfg.maxFrameBytes  = s.maxFrameBytes;
+            cfg.maxInFlight    = 64;
+            ProducerImpl* impl = new ProducerImpl(cfg, direct ? 4 * 1024 : 1 << 20);
+            Producer      p(impl);
+            if (direct) impl->enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr});
+            FrameCapture cap;
+            const int32_t part = key.partition(kTopic.partitionCount);
+            auto apply = [&] { if (!direct) impl->drainRing(kNow, 1 << 20); };
+            auto flush = [&] { apply(); impl->flushBatches(kNow, 42, cap.fn()); };
+            // Warm: create the partition and seal one frame (the builder then runs on an in-flight slot's buffer).
+            ASSERT_EQ(p.trySend(kTopic, key, bytes("w")), SendResult::Ok);
+            flush();
+            ASSERT_EQ(cap.frames, 1);
+            const auto* ps = impl->partitionState(kTopic.topicId, part);
+            ASSERT_NE(ps, nullptr);
+            const bool capped = s.maxFrameBytes > 0 && s.maxFrameBytes < s.batchBytes;
+            const int32_t effCap = capped ? s.maxFrameBytes : s.batchBytes;
+            // (1) Fill just under the flush threshold, then the one max record that overshoots it.
+            if (!capped) {
+                ASSERT_EQ(p.trySend(kTopic, key, bytes("x")), SendResult::Ok);
+                apply();
+                const uint8_t* base = ps->builder->data();
+                for (int i = 0; i < 10'000; ++i) {
+                    const int32_t room = effCap - 1 - ps->builderBytes;
+                    if (room < 40) break;
+                    const uint32_t len = room > 300 ? 256u : static_cast<uint32_t>(room - 30);
+                    ASSERT_EQ(p.trySend(kTopic, key, std::vector<uint8_t>(len, 0x11)), SendResult::Ok);
+                    apply();
+                }
+                ASSERT_LT(ps->builderBytes, effCap);
+                ASSERT_GE(ps->builderBytes, effCap - 40);
+                const int32_t before = ps->builder->recordCount();
+                ASSERT_EQ(p.trySend(kTopic, key, big), SendResult::Ok);
+                apply();
+                ASSERT_EQ(ps->builder->recordCount(), before + 1) << "the max record joined the builder";
+                EXPECT_GT(ps->builderBytes, effCap) << "it overshot the threshold";
+                EXPECT_EQ(ps->builder->data(), base) << "the overshoot reallocated the builder";
+                flush();
+                ASSERT_EQ(ps->builder->recordCount(), 0);
+            }
+            // (2) A max record alone on an empty builder (frame-capped: the solo oversize record).
+            {
+                ASSERT_EQ(p.trySend(kTopic, key, bytes("y")), SendResult::Ok);
+                apply();
+                const uint8_t* base = ps->builder->data();
+                flush();
+                const uint8_t* after = ps->builder->data();
+                ASSERT_EQ(p.trySend(kTopic, key, big), SendResult::Ok);
+                apply();
+                ASSERT_EQ(ps->builder->recordCount(), 1);
+                EXPECT_EQ(ps->builder->data(), after) << "a solo max record reallocated the builder";
+                (void)base;
+                flush();
+            }
+            // (3) Direct: the largest claimBatch the frame cap allows, on an empty builder - written in place.
+            if (direct && s.maxFrameBytes > 0) {
+                const uint8_t* base = ps->builder->data();
+                uint32_t       n    = static_cast<uint32_t>(s.maxFrameBytes) / 16;
+                rc::BatchClaim b;
+                for (; n > 0; --n) {
+                    b = p.claimBatch(kTopic, key, n, 8);
+                    if (b) break;
+                    ASSERT_EQ(b.result(), SendResult::MessageTooLarge);
+                }
+                ASSERT_TRUE(b);
+                EXPECT_EQ(ps->builder->data(), base) << "a whole-frame claimBatch reallocated the builder";
+                ASSERT_TRUE(b.commit());
+                flush();
+            }
+        }
+    }
+}
+
+// #374 / #344: a LIVE abandon (a route failure while an Invoker claim is held) swaps the builder's storage with the
+// claim quarantine.  The quarantine must be builder-sized (#344), or the builder is no longer preallocated and the
+// next records on that partition reallocate it until the next seal.  Found by the C14 review (same bug as #344).
+TEST(ProducerClaimAllocRegression, BuilderStaysPreallocatedAfterALiveAbandonAdversarialRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    DirectRig r(cfg);
+    r.p.onAck([](void*, rc::Token, int64_t, rc::OpStatus, uint16_t) noexcept {}, nullptr);
+    FrameCapture cap;
+    r.pass(cap.fn());
+    const Key key(uint64_t{4});
+    {
+        rc::Claim c = r.p.tryClaim(kTopic, key, 8);
+        ASSERT_TRUE(c);
+        r.impl->failRoutedBroker(&failEveryRoute, nullptr);
+        EXPECT_EQ(r.p.claimsAbandoned(), 1u);
+    }  // settled
+    const auto* ps = r.impl->partitionState(kTopic.topicId, key.partition(kTopic.partitionCount));
+    ASSERT_NE(ps, nullptr);
+    const uint8_t* base = ps->builder->data();
+    ASSERT_EQ(r.p.trySend(kTopic, key, bytes("a")), SendResult::Ok);
+    EXPECT_EQ(ps->builder->data(), base) << "a tiny record reallocated the builder after a live abandon";
+    const std::vector<uint8_t> big(static_cast<uint32_t>(Producer::kMaxRecordBytes) - key.size(), 0x42);
+    ASSERT_EQ(r.p.trySend(kTopic, key, big), SendResult::Ok);
+    EXPECT_EQ(ps->builder->data(), base) << "the builder reallocated after a live abandon";
+}
+
+// #339 sibling: a Tier-2 batch outside a transaction is refused by the gate BEFORE any credit (the documented
+// logic_error), like every Tier-1 form - not QueueFull from a full batch-ack / completion queue.  Found by the C14
+// review; minor (no credit leaks - the reservation is refused and the batch stays intact - but the refusal reason
+// differs from every other entry point).
+TEST(ProducerClaimRegression,
+     Tier2BatchGateIsDecidedBeforeCreditAdversarialRegression) {
+    ProducerConfig cfg   = voidCfg();
+    cfg.acks             = Acks::All;
+    cfg.transactionalId  = "tx-c14";
+    CqRig r(cfg);
+    ASSERT_EQ(r.impl->txnGate(), ProducerImpl::TxnGate::Closed);
+    rc::Completions cq(*r.client, smallCq(1024));
+    rc::Completions bq(*r.client, smallCq(1024));
+    r.p.batchAcksTo(bq);
+    uint32_t cqFilled = 0, bqFilled = 0;
+    while (cq.reserve(kUnit) == rc::OpResult::Accepted && cqFilled < 10'000) ++cqFilled;
+    while (bq.reserve(kUnit) == rc::OpResult::Accepted && bqFilled < 10'000) ++bqFilled;
+    const Key key(uint64_t{1});
+    EXPECT_EQ(r.p.trySend(kTopic, key, bytes("v")), SendResult::NotInTransaction) << "Tier-1: the gate first";
+    auto b = r.p.batch(kTopic, key);
+    b.add(bytes("v"));
+    EXPECT_THROW((void)b.send(), std::logic_error) << "void form, bq full";
+    EXPECT_THROW((void)b.send(cq, 1), std::logic_error) << "cq form, cq full";
+    EXPECT_THROW((void)b.send(rc::AckToken{2}), std::logic_error) << "AckToken form, bq full";
+    EXPECT_EQ(cq.outstanding(), cqFilled);
+    EXPECT_EQ(bq.outstanding(), bqFilled);
+    for (uint32_t i = 0; i < cqFilled; ++i) cq.unreserve(kUnit);
+    for (uint32_t i = 0; i < bqFilled; ++i) bq.unreserve(kUnit);
 }

@@ -627,3 +627,62 @@ TEST(ProducerTier2Regression, FirstBatchAllocatesThePoolOnceThenSteadyStateIsAll
     EXPECT_EQ(alloc_counter::stop(), 0L) << "after the first use the Tier-2 path allocates nothing";
     EXPECT_EQ(impl.tier2ReservedBytes(), reserved) << "the pool was allocated once";
 }
+
+// C14 review (#393, adversarial): the pool is allocated lazily by the FIRST batch thread - here a thread that did
+// not create the producer, bound before any batch.  Its batches cross the producer ring to the duty side (this
+// thread), are encoded from the slots, acked exactly once each, and every slot comes back to the bound thread; the
+// creating thread (no longer the batch thread) is refused without touching the pool.
+TEST(ProducerTier2Regression, PoolFirstAllocatedOnABoundNonCreatingThreadServesItsBatchesAdversarialRegression) {
+    constexpr int32_t kSlots = 4;
+    ProducerImpl impl(cfgOf(Acks::Leader, kSlots));
+    AckLedger L;
+    L.attach(impl);
+    ASSERT_EQ(impl.tier2ReservedBytes(), 0u);
+    std::vector<int64_t> corrs;
+    const ProducerImpl::SendFn sink = [&](int32_t, int32_t, int32_t, const uint8_t* b, std::size_t n) {
+        const auto v = rcc::decodeProduce(b, n);
+        if (!v) return false;
+        corrs.push_back(v->correlationId);
+        return true;
+    };
+    std::size_t reservedOnT = 0, freeOnT = 0;
+    OpResult    sent[kSlots + 1] = {};
+    std::thread t([&] {
+        impl.bindBatchThread();
+        reservedOnT = impl.tier2ReservedBytes();
+        freeOnT     = impl.tier2FreeCount();
+        for (int i = 0; i <= kSlots; ++i) sent[i] = sendBatch(impl, static_cast<rune::client::Token>(10 + i));
+    });
+    t.join();
+    EXPECT_EQ(reservedOnT, static_cast<std::size_t>(kSlots) * 2u * impl.tier2SlotBytes());
+    EXPECT_EQ(freeOnT, static_cast<std::size_t>(kSlots));
+    for (int i = 0; i < kSlots; ++i) EXPECT_EQ(sent[i], OpResult::Accepted) << i;
+    EXPECT_EQ(sent[kSlots], OpResult::BackPressured) << "every slot is held: the pool is exactly kSlots";
+    {
+        BatchBuilder off(&impl, 1, 0);  // the creating thread is not the batch thread any more
+        off.add(kVal);
+        EXPECT_EQ(off.send(), OpResult::WrongThread);
+    }
+    for (int round = 0; round < 32 && L.recs.size() < static_cast<std::size_t>(kSlots); ++round) {
+        const std::size_t from = corrs.size();
+        pump(impl, sink);
+        for (std::size_t i = from; i < corrs.size(); ++i) impl.onProduceResponse(corrs[i], 100 * (int64_t(i) + 1), 0);
+    }
+    ASSERT_FALSE(corrs.empty());
+    for (int i = 0; i < kSlots; ++i) {
+        EXPECT_EQ(L.times(static_cast<rune::client::Token>(10 + i)), 1) << i;
+        EXPECT_EQ(L.status(static_cast<rune::client::Token>(10 + i)), OpStatus::Ok) << i;
+    }
+    EXPECT_EQ(L.times(10 + kSlots), 0);
+    std::size_t freeAfter = 0;
+    OpResult    again     = OpResult::Closed;
+    std::thread t2([&] {
+        impl.bindBatchThread();  // the same pool (allocated once), every slot back
+        freeAfter = impl.tier2FreeCount();
+        again     = sendBatch(impl, 99);
+    });
+    t2.join();
+    EXPECT_EQ(freeAfter, static_cast<std::size_t>(kSlots));
+    EXPECT_EQ(again, OpResult::Accepted);
+    EXPECT_EQ(impl.tier2ReservedBytes(), reservedOnT) << "allocated once";
+}

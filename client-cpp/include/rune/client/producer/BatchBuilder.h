@@ -162,6 +162,8 @@ public:
 
 private:
     void checkProducer_() const;
+    // #339: a closed transactional gate refuses (logic_error) before any credit is reserved.
+    void checkTxnGate_() const;
 
     /// Where the batch is.  The slot index is meaningful only in Open / Built (each state
     /// holds exactly what it needs):
