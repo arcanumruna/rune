@@ -14,6 +14,7 @@
 #include "../support/TestCompletions.h"
 #include "../support/PlainInitPid.h"
 #include "../support/AeronTestErrors.h"
+#include "../support/InvokerGateway.h"
 #include <rune/client/Client.h>
 #include <rune/client/codec/Codec.h>
 #include <rune/client/codec/CryptoFrame.h>
@@ -532,4 +533,171 @@ TEST(TlsConnectEdgeRegression, NodeSessionFinalLegHandshakeFailedRejectsOnlyThat
     auto ping = cq.issue([&](Completions& q, Token t) { return r.client->ping(Bytes(4, 7), q, t); });
     EXPECT_TRUE(r.pumpWithin(2s, [&] { return ping.ready(); }));
     EXPECT_TRUE(ping.ok()) << (ping.ready() ? ping.describe() : std::string("pending"));
+}
+
+// ===========================================================================
+// #426: crypto OFFERED (not required).  A new connect episode drops the session's keys while the broker still holds
+// the old session (its lease has not expired) and may answer on it, sealed under the discarded key.  Such a frame
+// names a session id no live key opens: it is never decoded as plaintext.
+// ===========================================================================
+namespace {
+
+constexpr uint64_t kStaleBase = 1ull;
+
+struct StaleRig {
+    static constexpr int32_t kIn = 4120, kEg = 4121;
+    std::string dir = uniqueDir();
+    std::unique_ptr<Client> client;
+    std::unique_ptr<test_support::InvokerGateway> gw;
+    explicit StaleRig(bool newIdOnResume = true) {
+        g_nowNs = 1'000'000'000;
+        ClientConfig cfg;
+        cfg.gatewayChannel = "aeron:ipc"; cfg.gatewayStreamId = kIn;
+        cfg.egressChannel  = "aeron:ipc"; cfg.egressStreamId  = kEg;
+        cfg.dataDir = dir;
+        cfg.runnerMode = RunnerMode::Invoker;
+        cfg.nanoClock  = &manualNow;
+        cfg.offerCrypto = true; cfg.requireCrypto = false;
+        cfg.tlsTrustPem = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/ca.pem");
+        cfg.keepaliveIntervalNs = 20'000'000;   // a silent broker is noticed within ~0.1 s of simulated time
+        cfg.responseTimeoutNs   = 100'000'000;
+        cfg.connectTimeoutMs    = 60'000;
+        cfg.reconnectForeverAfterLive = true;
+        TopicSpec ts; ts.name = "t"; ts.topicId = 1; ts.partitionCount = 1;
+        cfg.topics.push_back(ts);
+        client = std::make_unique<Client>(cfg);
+        gw = std::make_unique<test_support::InvokerGateway>(dir + "/aeron", cfg.gatewayChannel, cfg.gatewayStreamId,
+                                                            cfg.egressChannel, cfg.egressStreamId);
+        gw->tlsCertPem = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.pem");
+        gw->tlsKeyPem  = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.key");
+        gw->uniqueSessionIds = true;   // every episode is a NEW broker session (a fresh id)
+        gw->newIdOnResume    = newIdOnResume;   // true: a resume hint still gets a NEW session id
+        gw->replyPongs       = true;
+        gw->initPidReply     = true;   // the idempotent producer's InitProducerId is answered
+    }
+    ~StaleRig() {
+        client->close();
+        gw.reset();
+        client.reset();
+        try { std::filesystem::remove_all(dir); } catch (...) {}
+    }
+    void step() { gw->pump(); (void)client->doWork(); }
+    template <class Pred> bool within(int64_t ms, Pred p) {   // simulated ms; the count is the hard cap
+        for (int64_t i = 0; i < ms; ++i) {
+            if (p()) return true;
+            g_nowNs += kTickNs;
+            step();
+        }
+        return p();
+    }
+    template <class Pred> bool until(Pred p) {   // event-driven, no simulated time
+        for (int i = 0; i < 200'000; ++i) {
+            if (p()) return true;
+            step();
+        }
+        return p();
+    }
+    void connect(test_support::TestCq& cq) {
+        ASSERT_TRUE(until([&] { return gw->ready(); }));
+        auto f = cq.issue([&](Completions& q, Token t) { return client->connect(q, t); });
+        ASSERT_TRUE(until([&] { return f.ready(); }));
+        ASSERT_TRUE(f.ok()) << f.describe();
+    }
+};
+
+}  // namespace
+
+TEST(TlsConnectEdgeRegression, AnAckSealedUnderTheDiscardedKeyIsNeverReadInClearRegression) {
+    StaleRig r;
+    test_support::TestCq cq(*r.client);
+    r.connect(cq);
+    r.gw->holdPartitions.insert(0);
+    ProducerConfig pcfg;
+    pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    pcfg.produceTimeoutMs = 600'000; pcfg.deliveryTimeoutMs = 600'000;
+    auto p = r.client->producer(pcfg);
+    const std::vector<uint8_t> val = {1, 2, 3};
+    auto rec = cq.send(p, r.client->topic("t"), Key(kStaleBase), std::span<const uint8_t>(val));
+    ASSERT_TRUE(r.within(5'000, [&] { return !r.gw->held.empty(); })) << "the record never reached the broker: produced " << r.gw->produced.size() << " pids " << r.gw->initPids
+        << " rec " << rec.ready() << " " << (rec.ready() ? rec.describe() : std::string()) << " state " << int(r.client->state());
+    const auto stale = r.gw->held.front();   // the broker's ack for it, sealed under THIS episode's key
+    const int64_t oldSid = stale.sessionId;
+    // The broker answers it on the old session right before it answers the new episode's ConnectRequest.
+    r.gw->ackBeforeNextConnect.push_back(stale);
+    const int connectsBefore = r.gw->connects;
+    // The broker goes silent (no pongs): the session times out and a new connect episode starts.
+    r.gw->replyPongs = false;
+    ASSERT_TRUE(r.within(30'000, [&] { return r.gw->connects > connectsBefore; })) << "no new connect episode";
+    r.gw->replyPongs = true;
+    ASSERT_TRUE(r.within(5'000, [&] { return r.client->state() == rcs::SessionState::Connected && r.gw->lastUniqueSessionId() != oldSid; }))
+        << "state " << static_cast<int>(r.client->state()) << " connects " << r.gw->connects << " oldSid " << oldSid
+        << " last " << r.gw->lastUniqueSessionId();
+    r.within(200, [] { return false; });
+    EXPECT_FALSE(rec.ready()) << "the stale sealed ack completed the record: " << rec.describe();
+    // The new episode: the held batch is resent on the new session and acked there.
+    ASSERT_TRUE(r.within(10'000, [&] { return r.gw->held.size() >= 2; })) << "the batch was never resent on the new session";
+    const auto resent = r.gw->held.back();
+    EXPECT_NE(resent.sessionId, oldSid) << "resent on the new session";
+    EXPECT_FALSE(rec.ready()) << rec.describe();
+    r.gw->holdPartitions.clear();
+    r.gw->ack(resent);   // the broker acks the resend, on the new session
+    ASSERT_TRUE(r.within(10'000, [&] { return rec.ready(); })) << "the record never completed after the new episode";
+    EXPECT_EQ(rec.status(), OpStatus::Ok) << rec.describe();
+    EXPECT_EQ(cq.timesCompleted(rec.token()), 1);
+}
+
+// The exemption stays: a CLEAR ErrorResponse answering the new episode's in-flight ConnectRequest (a pre-TLS
+// NotLeader / Redirect / refusal) is still dispatched even though its header names the discarded session's id.
+TEST(TlsConnectEdgeRegression, AClearConnectRefusalStillReachesTheNewEpisodeRegression) {
+    StaleRig r;
+    test_support::TestCq cq(*r.client);
+    r.connect(cq);
+    const int connectsBefore = r.gw->connects;
+    const int64_t oldSid     = r.gw->lastUniqueSessionId();
+    r.gw->replyConnects = false;   // the new episode's ConnectRequest stays unanswered
+    r.gw->replyPongs    = false;   // the session times out: a new episode starts
+    ASSERT_TRUE(r.within(30'000, [&] { return r.gw->connects > connectsBefore; })) << "no new connect episode";
+    ASSERT_FALSE(r.gw->connectCorrIds.empty());
+    const int connectsInFlight = r.gw->connects;
+    // A clear NotLeader (no endpoint) naming the old session id and the in-flight connect's correlation id.
+    uint8_t out[128];
+    const std::size_t n = rcc::encodeErrorResponse(out, sizeof out,
+                                                   static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader),
+                                                   {}, oldSid, r.gw->connectCorrIds.back());
+    ASSERT_GT(n, 0u);
+    ASSERT_TRUE(r.gw->sendInClear(0, std::vector<uint8_t>(out, out + n)));
+    // The machine acts on it at once (it resends the ConnectRequest), long before the 60 s connect timeout.
+    EXPECT_TRUE(r.within(50, [&] { return r.gw->connects > connectsInFlight; }))
+        << "the clear refusal answering the in-flight connect never reached the session machine";
+}
+
+// A plaintext episode after an encrypted one: the broker answers the new episode in clear and RESUMES the same session id
+// (no TLS offered back).  The retired marker is cleared at that Connected edge, so the clear ack naming the id is read.
+TEST(TlsConnectEdgeRegression, APlaintextEpisodeAfterAnEncryptedOneReadsClearFramesRegression) {
+    StaleRig r(/*newIdOnResume=*/false);
+    test_support::TestCq cq(*r.client);
+    r.connect(cq);
+    r.gw->holdPartitions.insert(0);
+    ProducerConfig pcfg;
+    pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    pcfg.produceTimeoutMs = 600'000; pcfg.deliveryTimeoutMs = 600'000;
+    auto p = r.client->producer(pcfg);
+    const std::vector<uint8_t> val = {1, 2, 3};
+    auto rec = cq.send(p, r.client->topic("t"), Key(kStaleBase), std::span<const uint8_t>(val));
+    ASSERT_TRUE(r.within(5'000, [&] { return !r.gw->held.empty(); }));
+    const int64_t sid = r.gw->held.front().sessionId;
+    const int connectsBefore = r.gw->connects;
+    r.gw->tlsCertPem.clear();   // the next episode is answered in clear (no TLS flight, no keys)
+    r.gw->replyPongs = false;
+    ASSERT_TRUE(r.within(30'000, [&] { return r.gw->connects > connectsBefore; })) << "no new connect episode";
+    r.gw->replyPongs = true;
+    ASSERT_TRUE(r.within(5'000, [&] { return r.client->state() == rcs::SessionState::Connected; }));
+    ASSERT_TRUE(r.within(10'000, [&] { return r.gw->held.size() >= 2; })) << "the batch was never resent";
+    const auto resent = r.gw->held.back();
+    EXPECT_EQ(resent.sessionId, sid) << "the same session id was resumed in clear";
+    EXPECT_FALSE(rec.ready()) << rec.describe();
+    r.gw->holdPartitions.clear();
+    r.gw->ack(resent);   // a clear ack naming the id the client once held sealed
+    ASSERT_TRUE(r.within(10'000, [&] { return rec.ready(); })) << "a clear frame of a plaintext episode was dropped";
+    EXPECT_EQ(rec.status(), OpStatus::Ok) << rec.describe();
 }
