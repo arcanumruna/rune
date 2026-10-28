@@ -524,6 +524,7 @@ LiveOptions liveOptionsOf(const support::ParsedArgs& a, const std::string& endpo
 }
 
 bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredentials, bool quietFailure) {
+    close();   // #672: the previous client (and its scratch dir) goes before a new one is built - a ScopedDir is never replaced under a live client
     rc::ClientConfig cfg;
     cfg.gatewayChannel = toChannel(o.endpoint);
     cfg.clientName     = "rune-cli";

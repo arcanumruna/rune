@@ -511,7 +511,7 @@ if(aeron_FOUND)
 endif()
 
 # ── Examples ──────────────────────────────────────────────────────────────────
-option(BUILD_EXAMPLES "Build example programs" OFF)
+option(BUILD_EXAMPLES "Build example programs (default: on with BUILD_TESTING, #668)" ${BUILD_TESTING})
 if(BUILD_EXAMPLES AND aeron_FOUND)
     add_executable(rune_client_ping
         examples/rune_client_ping.cpp

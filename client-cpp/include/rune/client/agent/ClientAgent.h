@@ -225,6 +225,9 @@ public:
     // -------------------------------------------------------------------------
 
     explicit ClientAgent(AgentConfig cfg);
+    /// #682: `cfg` carries no password; `password` goes into the agent's fixed secret and is wiped (whole capacity)
+    /// before anything can throw.  invalid_argument when longer than FixedSecret::kCapacity.
+    ClientAgent(AgentConfig cfg, std::string& password);
     ~ClientAgent();
 
     // Non-copyable, non-movable (owns transport, ring buffer).
@@ -894,6 +897,7 @@ public:
     }
 
 private:
+    void init();   // the constructors' common body (the seed session)
     // -------------------------------------------------------------------------
     // Seed-transport helpers (agent thread only).  ClientAgent is NOT a SessionIo (issue #178): the only session
     // send path is SessionEndpointIo::sendFrame, which seals per destination.

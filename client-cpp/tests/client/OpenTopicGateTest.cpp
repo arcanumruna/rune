@@ -1100,6 +1100,20 @@ TEST(OpenTopicGateRegression, LineageProbeRefusedNamesTheProbeCodeAdversarialReg
     }
 }
 
+TEST(OpenTopicGateRegression, LineageFailureNamesComeFromAuthErrorNameRegression) {
+    // #225: the 44..48 names are authErrorName's (the CLI's source), never a third copy.
+    GateHarness h(1358, 1359);
+    h.build();
+    h.connectAndWait();
+    for (uint16_t code = 44; code <= 48; ++code) {
+        const char* want = rune::client::authErrorName(code);
+        ASSERT_NE(want, nullptr) << code;
+        ASSERT_NE(std::string_view(want), "") << code;
+        const std::string msg = h.client->lineageFailure("t", code, 5s);
+        EXPECT_NE(msg.find(std::string("(") + want + " " + std::to_string(code) + ")"), std::string::npos) << code << ": " << msg;
+    }
+}
+
 // C8 fix round (d): the probe gets what is LEFT of the caller's budget, never a second full wait; with nothing left
 // it is not sent at all and the plain code text is returned.
 TEST(OpenTopicGateRegression, LineageProbeIsSkippedWhenTheBudgetIsSpentRegression) {

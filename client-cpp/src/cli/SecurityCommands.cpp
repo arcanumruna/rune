@@ -43,7 +43,7 @@ std::string generateOneTimePassword() {
     std::array<uint8_t, 64> buf{};
     while (pw.size() < kLength) {
         if (!rune::crypto::randomBytes(buf)) {
-            rune::client::detail::secureZero(pw.data(), pw.size());
+            rune::client::detail::wipeString(pw);
             return {};
         }
         for (const uint8_t b : buf) {
@@ -74,7 +74,7 @@ bool writeClusterKeyFile(const std::string& path, std::string& why) {
     if (fd < 0) {
         why = std::string("cannot create '") + path + "': " + std::strerror(errno) +
               (errno == EEXIST ? " (an existing key file is never overwritten)" : "");
-        rune::client::detail::secureZero(hex.data(), hex.size());
+        rune::client::detail::wipeString(hex);
         return false;
     }
     (void)::fchmod(fd, 0600);   // whatever the umask said
@@ -87,7 +87,7 @@ bool writeClusterKeyFile(const std::string& path, std::string& why) {
     }
     if (ok && ::fsync(fd) != 0) ok = false;   // review B M9: the key is on disk before we say so
     ::close(fd);
-    rune::client::detail::secureZero(hex.data(), hex.size());
+    rune::client::detail::wipeString(hex);
     if (!ok) {
         why = std::string("cannot write '") + path + "'";
         ::unlink(path.c_str());
@@ -231,16 +231,25 @@ int cmdGenClusterKey(const std::vector<std::string>& args, std::ostream& out, st
 }
 
 bool readFileBytes(const std::string& path, std::string& bytes, std::ostream& err) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) {
+    // #680: plain read(2) straight into the destination: an ifstream's stream buffer would keep an unwiped copy of the
+    // key that is freed with the stream.
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
         err << "rune: cannot read '" << path << "'\n";
         return false;
     }
-    // Read straight into the destination (no stream-buffer copies of key / password material linger).
-    const std::streamsize n = f.tellg();
-    f.seekg(0);
-    bytes.assign(n > 0 ? static_cast<std::size_t>(n) : 0, '\0');
-    if (n > 0) f.read(bytes.data(), n);
+    struct stat st {};
+    const std::size_t n = (::fstat(fd, &st) == 0 && st.st_size > 0) ? static_cast<std::size_t>(st.st_size) : 0;
+    bytes.assign(n, '\0');   // one allocation of exactly n: the string never grows
+    std::size_t got = 0;
+    while (got < n) {
+        const ssize_t r = ::read(fd, bytes.data() + got, n - got);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        got += static_cast<std::size_t>(r);
+    }
+    ::close(fd);
+    bytes.resize(got);
     return true;
 }
 
@@ -274,20 +283,20 @@ int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::o
     if (fromFile) {
         if (auto e = rune::client::detail::readPasswordFile(a.value("--password-file"), password)) {
             err << "rune: " << *e << "\n";
-            rune::client::detail::secureZero(key.data(), key.size());
+            rune::client::detail::wipeString(key);
             return 1;
         }
     } else {
         password = generateOneTimePassword();
         if (password.empty()) {
             err << "rune: no randomness available to generate the one-time password\n";
-            rune::client::detail::secureZero(key.data(), key.size());
+            rune::client::detail::wipeString(key);
             return 1;
         }
     }
     auto wipe = [&] {
-        rune::client::detail::secureZero(key.data(), key.size());
-        rune::client::detail::secureZero(password.data(), password.size());
+        rune::client::detail::wipeString(key);
+        rune::client::detail::wipeString(password);
     };
 
 #ifdef RUNE_CLI_LIVE_ENABLED

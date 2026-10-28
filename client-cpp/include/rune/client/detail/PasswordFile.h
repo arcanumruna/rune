@@ -17,6 +17,7 @@ namespace rune::client::detail {
 /// Reads a password file: an error text, or nullopt with `out` holding the password.
 /// - A regular file whose mode gives group or others ANY access is refused (like ssh and the broker's cluster key:
 ///   chmod 0600 / 0400).  Pipes and other non-regular files (`--password-file <(...)`) are not mode-checked.
+/// - A regular file owned by another user than the effective user is refused (#678).
 /// - At most kMaxPasswordBytes after stripping: the read goes into a fixed stack buffer of kMaxPasswordBytes + 3,
 ///   which is wiped; more bytes than that is refused ("larger than 1024 bytes").
 /// - Only trailing '\n' and '\r' are stripped; spaces and tabs are part of the password.
@@ -36,6 +37,8 @@ namespace rune::client::detail {
         std::snprintf(m, sizeof m, "%04o", static_cast<unsigned>(st.st_mode & 0777));
         return "'" + path + "' is accessible by group or others (mode " + m + "); chmod 0600 it";
     }
+    if (S_ISREG(st.st_mode) && st.st_uid != ::geteuid())   // #678: another user could rewrite it
+        return "'" + path + "' is owned by another user (uid " + std::to_string(st.st_uid) + "); it must be owned by the user running the client";
     std::size_t n = 0;
     while (n < sizeof(buf)) {
         const ssize_t r = ::read(guard.fd, buf + n, sizeof(buf) - n);

@@ -277,15 +277,14 @@ void pumpFor(Client& c, int ms) {
 void fail(const char* tag, const std::string& msg) { std::fprintf(stderr, "%s: FAIL %s\n", tag, msg.c_str()); }
 
 // #377: a topic's id and partition count are resolved from the broker (GetTopicSchema), not trusted from the
-// RUNE_CLIENT_TOPIC_TABLE: a definite mismatch fails loudly before any record is written.  A broker that does not
-// describe the topic (no answer) is reported on stderr and tolerated: the pipeline's group assignment checks eos_in too.
+// RUNE_CLIENT_TOPIC_TABLE: a mismatch fails loudly before any record is written.  So does a broker that cannot
+// describe the topic (a non-zero error code, or a thrown error): a broken broker setup must fail the run (#688).
 bool topicMatchesBroker(Client& c, const char* tag, const char* name, const TopicHandle& t) {
     try {
         const TopicSchemaResult r = c.getTopicSchemaAndWait(name);
         if (r.errorCode != 0) {
-            std::fprintf(stderr, "%s: note: the broker did not describe '%s' (error %u); using the table's id %d\n", tag, name,
-                         static_cast<unsigned>(r.errorCode), t.topicId);
-            return true;
+            fail(tag, std::string("the broker did not describe '") + name + "' (error " + std::to_string(r.errorCode) + ")");
+            return false;
         }
         if (r.topicId != t.topicId || (r.partitionCount > 0 && r.partitionCount != t.partitionCount)) {
             fail(tag, std::string(name) + " is topic " + std::to_string(r.topicId) + " with " + std::to_string(r.partitionCount) +
@@ -294,7 +293,8 @@ bool topicMatchesBroker(Client& c, const char* tag, const char* name, const Topi
             return false;
         }
     } catch (const std::exception& ex) {
-        std::fprintf(stderr, "%s: note: could not resolve '%s' from the broker (%s); using the table's id %d\n", tag, name, ex.what(), t.topicId);
+        fail(tag, std::string("could not resolve '") + name + "' from the broker: " + ex.what());
+        return false;
     }
     return true;
 }

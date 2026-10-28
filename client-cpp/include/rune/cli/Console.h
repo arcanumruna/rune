@@ -1,5 +1,8 @@
 // include/rune/cli/Console.h — Phase 2b Part D: `rune console` (interactive Rune QL / -f scripts / --dry-run).
 #pragma once
+#include <sys/types.h>
+#include <unistd.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>

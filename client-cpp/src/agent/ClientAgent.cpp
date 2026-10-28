@@ -74,7 +74,29 @@ AgentConfig takingPassword(AgentConfig& cfg, detail::FixedSecret& secret) {
         throw std::invalid_argument("password longer than " + std::to_string(detail::FixedSecret::kCapacity) + " bytes");
     return std::move(cfg);
 }
+
+// #682: the same, for a password handed over beside the config (never inside an AgentConfig).
+AgentConfig takingPasswordBeside(AgentConfig& cfg, std::string& password, detail::FixedSecret& secret) {
+    const bool fits = secret.assign(password);
+    detail::wipeString(password);
+    detail::wipeString(cfg.session.password);
+    if (!fits)
+        throw std::invalid_argument("password longer than " + std::to_string(detail::FixedSecret::kCapacity) + " bytes");
+    return std::move(cfg);
+}
 } // namespace
+
+ClientAgent::ClientAgent(AgentConfig cfg, std::string& password)
+    : cfg_(takingPasswordBeside(cfg, password, secret_))
+    , transport_(cfg_.transport)
+    , ringBuf_(makeAlignedBuffer(
+          static_cast<std::size_t>(ringTotalBytes(cfg_.ringCapacity)),
+          kRingAlignment))
+    , ring_(ringBuf_.get(), static_cast<std::size_t>(ringTotalBytes(cfg_.ringCapacity)))
+    , egressObserver_(nullptr)
+{
+    init();
+}
 
 ClientAgent::ClientAgent(AgentConfig cfg)
     : cfg_(takingPassword(cfg, secret_))
@@ -85,6 +107,10 @@ ClientAgent::ClientAgent(AgentConfig cfg)
     , ring_(ringBuf_.get(), static_cast<std::size_t>(ringTotalBytes(cfg_.ringCapacity)))
     , egressObserver_(nullptr)
 {
+    init();
+}
+
+void ClientAgent::init() {
     mnDebug_ = std::getenv("RUNE_MN_DEBUG") != nullptr;
     produceAcks_.reserve(static_cast<std::size_t>(cfg_.egressPollLimit) * 4);
     // Seed the endpoint-keyed session collection with the seed session

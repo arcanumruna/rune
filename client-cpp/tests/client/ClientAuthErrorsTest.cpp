@@ -15,6 +15,7 @@
 #include <rune/ql/Backends.h>
 
 #include <gtest/gtest.h>
+#include <rune/client/detail/PasswordFile.h>
 
 #include <algorithm>
 #include <cstring>
@@ -499,6 +500,22 @@ TEST(PasswordFileRegression, GroupReadableFileIsRefusedRegression) {
     ::unlink(path.c_str());
 }
 
+TEST(PasswordFileRegression, AFileOwnedByAnotherUserIsRefusedRegression) {
+    // #678: a file another user owns can be rewritten by that user: refused like a group-readable one.
+    if (::geteuid() != 0) GTEST_SKIP() << "needs root to chown a file to another user";
+    const std::string path = writePwFile("owner", std::string(kPw) + "\n", 0600);
+    std::string pw;
+    EXPECT_FALSE(rune::client::detail::readPasswordFile(path, pw).has_value()) << "owned by the running user: accepted";
+    EXPECT_EQ(pw, kPw);
+    ASSERT_EQ(::chown(path.c_str(), 65534, static_cast<gid_t>(-1)), 0);
+    std::string other;
+    const auto why = rune::client::detail::readPasswordFile(path, other);
+    ASSERT_TRUE(why.has_value()) << "a file owned by uid 65534 must be refused";
+    EXPECT_NE(why->find("owned by another user (uid 65534)"), std::string::npos) << *why;
+    EXPECT_TRUE(other.empty());
+    ::unlink(path.c_str());
+}
+
 TEST(PasswordFileRegression, OversizeFileIsRefusedRegression) {
     {
         const std::string path = writePwFile("big", std::string(1 << 20, 'p'), 0600);
@@ -610,6 +627,29 @@ TEST(ClientAuthErrorsRegression, APasswordOverTheCapIsRefusedAtConstructionRegre
     EXPECT_NO_THROW(rc::Client{authCfg(4120, "ws1", std::string(1024, 'p'))});
 }
 
+TEST(ClientAuthErrorsRegression, TheLoginPasswordNeverEntersTheCommandRingRegression) {
+    // #681: the ring test above passes partly because a consumed record is zeroed.  Here nothing is consumed: the
+    // ring is filled before the first duty pass, and no record of it carries the login password (given directly or
+    // read from a file).
+    constexpr std::string_view kLogin = "ring-scan-login-password-c20a";
+    const std::string path = writePwFile("ring", std::string(kLogin) + "\n", 0600);
+    for (const bool fromFile : {false, true}) {
+        rc::ClientConfig c = authCfg(fromFile ? 4164 : 4160, "ws1", fromFile ? "" : std::string(kLogin));
+        if (fromFile) c.passwordFile = path;
+        rc::Client client{c};
+        client.testFillCommandRing();
+        const auto b = client.testCommandRingBytes();
+        const auto holds = [&] {
+            return std::search(b.begin(), b.end(), kLogin.begin(), kLogin.end(),
+                               [](uint8_t x, char y) { return x == static_cast<uint8_t>(y); }) != b.end();
+        };
+        EXPECT_TRUE(std::any_of(b.begin(), b.end(), [](uint8_t x) { return x != 0; }))
+            << "vacuity guard: the ring holds records";
+        EXPECT_FALSE(holds()) << (fromFile ? "password file" : "direct password") << ": the ring holds the login password";
+    }
+    ::unlink(path.c_str());
+}
+
 // ---- C6 review: adversarial credential hygiene (#257 / #56 / #184) -----------------------------------------------
 // The freed-memory scan (AllocCounter): every heap block the Client frees is searched for the plaintext before it
 // goes back to the allocator - an unwiped copy is a hit.  The needles are long (heap strings, never SSO) and appear
@@ -675,6 +715,36 @@ rune::client::agent::AgentConfig agentCfg(int32_t in, std::string password) {
     return cfg;
 }
 } // namespace
+
+TEST(ClientSecretAdversarialRegression, NoPasswordCopyOutlivesTheAgentHandOffRegression) {
+    // #682: the Client hands the password to the agent without an AgentConfig round trip, so the mapping from
+    // ClientConfig never carries it (a by-value AgentConfig hop would leave an SSO copy in a moved-from object).
+    rc::ClientConfig c;
+    c.password = "short-pw";   // in place (SSO)
+    EXPECT_TRUE(rc::toAgentConfig(c).session.password.empty()) << "toAgentConfig copied the password";
+    c.password = std::string(300, 'p');   // heap
+    EXPECT_TRUE(rc::toAgentConfig(c).session.password.empty()) << "toAgentConfig copied the password";
+}
+
+TEST(ClientSecretAdversarialRegression, TheAgentTakesAPasswordBesideItsConfigAndWipesTheSourceRegression) {
+    // #682: ClientAgent(cfg, password): the secret holds it, the caller's string is wiped over its whole capacity;
+    // over the cap it throws and the source is wiped too.
+    std::string pw(200, 'q');
+    const char* p = pw.data();
+    const std::size_t cap = pw.capacity();
+    {
+        rune::client::agent::ClientAgent agent(agentCfg(4150, ""), pw);
+        EXPECT_EQ(agent.secretForTest().view(), std::string(200, 'q'));
+        EXPECT_TRUE(pw.empty());
+        for (std::size_t i = 0; i < cap; ++i) ASSERT_EQ(p[i], 0) << "byte " << i << " of the source capacity";
+    }
+    std::string over(rune::client::detail::FixedSecret::kCapacity + 1, 'o');
+    const char* q = over.data();
+    const std::size_t ocap = over.capacity();
+    EXPECT_THROW((rune::client::agent::ClientAgent{agentCfg(4152, ""), over}), std::invalid_argument);
+    EXPECT_TRUE(over.empty());
+    for (std::size_t i = 0; i < ocap; ++i) ASSERT_EQ(q[i], 0) << "byte " << i << " of the refused source";
+}
 
 TEST(ClientSecretAdversarialRegression, AnAllocationFailureAtEveryConstructionStepLeavesNoFreedCopyAdversarialRegression) {
     // Crash at every step: the n-th allocation throws bad_alloc, for every n.  First the agent's constructor (unstarted:

@@ -105,6 +105,7 @@ bool PollingFdLineSource::next(std::string& line) {
         if (n < 0) return false;
         const ssize_t got = readFn_(fd_, buf_.data() + len_, buf_.size() - len_);
         if (got < 0 && errno == EINTR) continue;
+        if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { ++idlePumps; idle_(ctx_); continue; }   // #672: spurious wakeup on an O_NONBLOCK fd: back to polling, like a timeout
         if (got <= 0) {
             if (len_ == 0 || discarding_) return false;
             line.assign(buf_.begin(), buf_.begin() + static_cast<std::ptrdiff_t>(len_));   // a last line without '\n'

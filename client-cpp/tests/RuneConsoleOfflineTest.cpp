@@ -27,6 +27,7 @@
 
 #include "rune/cli/Cli.h"
 #include "rune/cli/Console.h"
+#include "rune/cli/SecurityCommands.h"
 #include <rune/client/detail/SecureZero.h>
 #include "rune/ql/Parser.h"
 
@@ -858,6 +859,103 @@ TEST(RuneConsoleOfflineRegression, AnInteractivePasswordLiteralLeavesNoFreedCopy
         << "interactive: a freed block held the password literal";
     EXPECT_EQ(r.rc, 0) << r.err;
     EXPECT_EQ(r.out.find(kConsoleNeedle + 1), std::string::npos);
+}
+
+// ---- #681: every console wipe guard has its own test ----------------------------------------------------------------
+// Each input puts the needle ONLY in the buffer its guard owns (a comment is dropped by the parser, so no parsed
+// statement or password field holds it): delete that guard's wipe and exactly that buffer is freed with the needle.
+TEST(ConsoleWipeRegression, ScriptWipeLeavesNoFreedCopyRegression) {
+    // The script text: the needle sits in a trailing comment, so no statement text holds it.
+    const fs::path file = writeScript("c20a_script_wipe.rql", std::string("show history;\n-- ") + kConsoleNeedle + "\n");
+    ConsoleRun r;
+    EXPECT_EQ(freedHitsOfConsole({"-f", file.string(), "--dry-run"}, "", r), 0) << "the script buffer was freed unwiped";
+    EXPECT_EQ(r.rc, 0) << r.err;
+    fs::remove(file);
+}
+
+TEST(ConsoleWipeRegression, BatchWipeLeavesNoFreedCopyRegression) {
+    // The prepared statement's text: the needle is in a comment inside the statement (the parser drops it, the text
+    // keeps it).  The statement splitter's copy is TextsWipe's: a mutation of either guard turns this red (the same
+    // bytes); TextsWipe has its own test where the batch never holds them.
+    const fs::path file = writeScript("c20a_batch_wipe.rql", std::string("show history -- ") + kConsoleNeedle + "\n;\n");
+    ConsoleRun r;
+    EXPECT_EQ(freedHitsOfConsole({"-f", file.string(), "--dry-run"}, "", r), 0) << "a batch text was freed unwiped";
+    EXPECT_EQ(r.rc, 0) << r.err;
+    fs::remove(file);
+}
+
+TEST(ConsoleWipeRegression, TextsWipeLeavesNoFreedCopyRegression) {
+    // Statement 1 parses but cannot be prepared (a version out of range): the batch stays empty while the splitter's texts
+    // (all statements) are freed - statement 2 carries the needle in a comment.
+    const fs::path file = writeScript("c20a_texts_wipe.rql",
+        std::string("show schema t as of version 99999999999;\nshow history -- ") + kConsoleNeedle + "\n;\n");
+    ConsoleRun r;
+    EXPECT_EQ(freedHitsOfConsole({"-f", file.string(), "--dry-run"}, "", r), 0) << "the splitter's texts were freed unwiped";
+    EXPECT_NE(r.rc, 0) << "the statement cannot be prepared: " << r.err;
+    EXPECT_NE(r.err.find("out of range"), std::string::npos) << "vacuity guard: it failed in prepare: " << r.err;
+    fs::remove(file);
+}
+
+TEST(ConsoleWipeRegression, TextWipeLeavesNoFreedCopyRegression) {
+    // The REPL's per-line statement text: a comment-only line is an Empty input - only `text` ever holds it.
+    ConsoleRun r;
+    EXPECT_EQ(freedHitsOfConsole({"--dry-run"}, std::string("-- ") + kConsoleNeedle + "\n", r), 0)
+        << "the REPL text buffer was freed unwiped";
+    EXPECT_EQ(r.rc, 0) << r.err;
+}
+
+TEST(ConsoleWipeRegression, ReplWipeLeavesNoFreedCopyRegression) {
+    // Input ends inside a statement: the text sits in the ContinuingStatement when the REPL returns; only ReplWipe
+    // (its second wipe) reaches it.  (Its `line` wipe is not isolable: the loop wipes `line` itself on every path.)
+    ConsoleRun r;
+    EXPECT_EQ(freedHitsOfConsole({"--dry-run"}, std::string("show history -- ") + kConsoleNeedle + "\n", r), 0)
+        << "the unfinished statement was freed unwiped";
+    EXPECT_NE(r.err.find("input ended inside a statement"), std::string::npos) << "vacuity guard: " << r.err;
+}
+
+TEST(ConsoleWipeRegression, CfgPasswordWipeLeavesNoFreedCopyRegression) {
+    // LiveBroker::open copies the prompted password into its ClientConfig, then refuses the TLS options before any
+    // Client exists: only CfgPasswordWipe reaches that copy.  (--insecure-plaintext never sends credentials.)
+    namespace engine = rune::cli::engine;
+    engine::LiveOptions o;
+    o.endpoint          = "aeron:ipc";
+    o.user              = "ws1";
+    o.password          = kConsoleNeedle;   // test-owned: it outlives the window
+    o.insecurePlaintext = true;
+    engine::LiveBroker broker;
+    std::ostringstream err;
+    long hits = -1;
+    bool opened = true;
+    {
+        ConsoleFreedScan scan;
+        opened = broker.open(o, err);
+        hits = scan.hits();
+    }
+    EXPECT_FALSE(opened);
+    EXPECT_NE(broker.lastFailure().find("insecure-plaintext"), std::string::npos) << "vacuity guard: " << broker.lastFailure();
+    EXPECT_EQ(hits, 0) << "the ClientConfig password copy was freed unwiped";
+}
+
+TEST(SecurityBootstrapRegression, KeyAndPasswordLeaveNoCopyInSpareCapacityRegression) {
+    // #680: the key and the password are wiped over their whole capacity, not only their size.  Both files carry the
+    // needle; bootstrap reads both, then fails at the broker (an endpoint that cannot be reached).
+    const fs::path keyFile = writeScript("c20a_cluster_key", kConsoleNeedle);
+    const fs::path pwFile  = writeScript("c20a_bootstrap_pw", std::string(kConsoleNeedle) + "\n");
+    fs::permissions(keyFile, fs::perms::owner_read | fs::perms::owner_write);
+    fs::permissions(pwFile, fs::perms::owner_read | fs::perms::owner_write);
+    std::ostringstream out, err;
+    int rc = -1;
+    long hits = -1;
+    {
+        ConsoleFreedScan scan;
+        rc = rune::cli::cmdSecurity({"bootstrap", "--admin", "root", "--cluster-key-file", keyFile.string(),
+                                     "--password-file", pwFile.string(), "--broker", "no-such-host.invalid:1"}, out, err);
+        hits = scan.hits();
+    }
+    EXPECT_NE(rc, 0) << "the broker cannot be reached: bootstrap fails after reading both files";
+    EXPECT_EQ(hits, 0) << "a freed block held the key or the password: " << err.str();
+    EXPECT_EQ(err.str().find(kConsoleNeedle + 1), std::string::npos);
+    fs::remove(keyFile); fs::remove(pwFile);
 }
 
 TEST(RuneConsoleOfflineRegression, AMovedFromPreparedSecurityKeepsNoShortPasswordInPlaceAdversarialRegression) {

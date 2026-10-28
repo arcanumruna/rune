@@ -76,14 +76,15 @@ ClientConfig validatedConfig(ClientConfig& c) {
     detail::wipeString(c.password);
     return out;
 }
-// The ClientAgent's config with the password MOVED out of `c` (never copied); `c.password` is left wiped.
-agent::AgentConfig agentConfigTakingPassword(ClientConfig& c) {
-    std::string pw = std::move(c.password);
-    detail::wipeString(c.password);
-    struct Wipe { std::string& s; ~Wipe() { detail::wipeString(s); } } wipePw{pw};
-    agent::AgentConfig a = toAgentConfig(c);   // copies an empty password
-    a.session.password = std::move(pw);
-    return a;
+// #682: the agent's config (no password in it); a throw while it is built (bad_alloc) wipes `c.password` - the Client
+// is then not constructed, so nothing else would.
+agent::AgentConfig agentConfigWipingOnThrow(ClientConfig& c) {
+    try {
+        return toAgentConfig(c);
+    } catch (...) {
+        detail::wipeString(c.password);
+        throw;
+    }
 }
 void validateConfigInPlace(ClientConfig& c) {
     // A negative timeout or retry budget has no meaning (0 = none / at once); refused, never silently clamped.
@@ -223,7 +224,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     acfg.session.tlsTrustPem   = c.tlsTrustPem;
     acfg.session.tlsExpectHost = c.tlsExpectHost;
     acfg.session.username      = c.username;   // authentication: SCRAM credentials (never logged)
-    acfg.session.password      = c.password;
+    // #682: the password is never mapped (Client passes it to the ClientAgent constructor by reference): acfg.session.password stays empty
     acfg.session.allowUnauthenticatedBroker = c.allowUnauthenticatedBroker;
     acfg.session.maxAcceptedIterations = c.maxAcceptedScramIterations;
     acfg.session.bootstrapOnly = c.securityBootstrapOnly;
@@ -245,13 +246,13 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
 
 Client::Client(ClientConfig cfg)
     : cfg_(validatedConfig(cfg))
-    , agent_(agentConfigTakingPassword(cfg_))
+    , agent_(agentConfigWipingOnThrow(cfg_), cfg_.password)   // #682: the agent takes the password and wipes cfg_.password
     , partitionRouter_(metadataCache_)
     , catalogReader_(std::make_unique<CatalogReader>(*this))   // eagerly, on the owning thread (I2)
     , securityReader_(std::make_unique<SecurityReader>(*this))   // authentication Task 8: same rule
 {
     // Review B M4: the agent's sessions hold the credential from here on (one owner, wiped when replaced); the Client
-    // keeps no copy - validatedConfig and agentConfigTakingPassword moved it out and wiped every source (#257).
+    // keeps no copy - validatedConfig and the agent constructor moved it out and wiped every source (#257, #682).
     if (cfg_.traceDdlRetries) ddlRetryNotes_.reserve(kMaxDdlRetryNotes);   // push_back never reallocates on the duty thread
     // #514: the silent-leader scan runs four times per keepalive interval.
     silentCheckPeriodNs_ = (cfg_.keepaliveIntervalNs > 0 ? cfg_.keepaliveIntervalNs
@@ -2849,11 +2850,11 @@ std::string_view lineageErrorName(uint16_t code) noexcept {
         "ConcurrentTransactions", "UnknownProducerId", "HandshakeFailed", "SchemaIncompatible", "SchemaConflict",
         "ViewExists", "ViewSourceNotFound", "ViewFieldUnresolved", "ViewKeyInvalid", "ViewNotCoPartitioned",
         "ViewSourceTransient", "ViewNotAlterable", "InvalidRequest", "InvalidTopicName", "ViewSourceIsView",
-        "TransientLogFull", "PartitionDataReset", "AuthenticationFailed", "NotAuthorized", "SessionRevoked",
-        "PasswordChangeRequired", "AuthUnavailable", "RecordEgressUnavailable", "UnstableOffsetCommit",
+        "TransientLogFull", "PartitionDataReset", "", "", "", "", "" /* 44..48: authErrorName (#225) */, "RecordEgressUnavailable", "UnstableOffsetCommit",
         "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused"};
     static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::ViewPaused) + 1,
                   "lineageErrorName: one name per rune::protocol::client::ErrorCode");
+    if (const char* auth = authErrorName(code)) return auth;   // #225: the one source of the 44..48 names
     return code < std::size(kNames) ? kNames[code] : std::string_view("UnknownErrorCode");
 }
 } // namespace
