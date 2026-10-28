@@ -43,6 +43,7 @@ struct RigOptions {
     int64_t connectTimeoutMs  = 0;  // 0 = the client default
     bool    reconnectForever  = false;
     int64_t pingTimeoutMs     = 0;  // 0 = the client default
+    int64_t subscribeTimeoutMs = 0; // 0 = the client default
     // C16: an injected duty clock.  nanoClock = the client's clock function; when manualNs is set, drive() adds
     // stepNs to *manualNs once per pass (stepNs = 0 freezes the clock).  nullptr = the real steady clock.
     rc::NanoClock nanoClock   = nullptr;
@@ -103,6 +104,7 @@ struct GroupRig {
         c.reconnectForeverAfterLive = o.reconnectForever;
         c.nanoClock = o.nanoClock;
         if (o.pingTimeoutMs > 0) c.pingTimeoutMs = o.pingTimeoutMs;
+        if (o.subscribeTimeoutMs > 0) c.subscribeTimeoutMs = o.subscribeTimeoutMs;
         rc::TopicSpec ts;
         ts.name           = "t";
         ts.topicId        = 1;

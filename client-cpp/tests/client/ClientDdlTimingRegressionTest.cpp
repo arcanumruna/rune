@@ -206,8 +206,12 @@ TEST_P(ClientDdlTimingMatrixRegression, ExactlyOneCompletionAndNoLeftoverState) 
         const std::size_t n = at.size();
         switch (timing) {
         case Timing::CloseWhileAwaitingResend:
-        case Timing::ResendPastBudgetEnd:
             r.answerError(ep, pc::ErrorCode::NotLeader, "", h->sessionId, h->correlationId);
+            break;
+        case Timing::ResendPastBudgetEnd:   // #687: the node it is sent on never comes up (a refused offer on a
+                                            // CONNECTED session is back-pressure, no longer "unreachable")
+            if (n == 1) r.answerError(ep, pc::ErrorCode::NotLeader, "", h->sessionId, h->correlationId);
+            else        r.answerError(ep, pc::ErrorCode::Redirect, nowhere, h->sessionId, h->correlationId);
             break;
         case Timing::CloseWhileHeldForNode:
             r.answerError(ep, pc::ErrorCode::Redirect, nowhere, h->sessionId, h->correlationId);
@@ -280,9 +284,7 @@ TEST_P(ClientDdlTimingMatrixRegression, ExactlyOneCompletionAndNoLeftoverState) 
         break;
     case Timing::ResendPastBudgetEnd:
         ASSERT_TRUE(r.drive(awaiting));
-        r.client.testForceIngressOffers(Offer::Retry, 1'000'000);   // the seed refuses every offer
         ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/20'000'000));
-        r.client.testForceIngressOffers(Offer::Accepted, 0);
         break;
     case Timing::LeaderSessionLost:
     case Timing::FatalOfferOnRedirect:
@@ -324,7 +326,7 @@ TEST_P(ClientDdlTimingMatrixRegression, ExactlyOneCompletionAndNoLeftoverState) 
         EXPECT_EQ(c.status, rc::OpStatus::NotConnected);
         break;
     case Timing::ResendPastBudgetEnd:
-        // Issue #97: the seed refused every resend (its node was not reachable) - a session loss, not a NotLeader.
+        // Issue #97: the resend's node was never reachable - a session loss, not a NotLeader.
         EXPECT_EQ(c.status, rc::OpStatus::SessionLost);
         EXPECT_EQ(payloadText(f).rfind("node unreachable", 0), 0u) << payloadText(f);
         break;

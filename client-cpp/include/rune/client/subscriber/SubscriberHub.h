@@ -41,12 +41,13 @@ namespace rune::client::subscriber {
 struct SubscribeRequest {
     SubscriptionImpl*                     impl = nullptr;  // F8c C7: not owning (see owned_)
     std::vector<uint8_t>                  subscribeFrame;  // encoded Subscribe (resend on redirect)
-    std::chrono::steady_clock::time_point deadline;        // M2: subscribe-request timeout
+    int64_t                               timeoutNs = 0;   // #701: the relative subscribe timeout (set on the app thread)
+    int64_t                               deadlineNs = 0;  // M2: subscribe-request deadline, duty-clock ns (stamped at adoption)
     bool                                  unsent = false;  // fix3 I4: refused, retried per cycle
     uint8_t                               nlRetries = 0;   // bare-NotLeader retries spent (bounded budget)
     // E2 final fix wave (I2): a moved subscription held on its node session is
     // not re-offered before this time (a bare NotLeader backoff); epoch = no wait.
-    std::chrono::steady_clock::time_point notBefore{};
+    int64_t                               notBeforeNs = 0;   // duty-clock ns (0 = no wait)
 };
 
 class SubscriberHub {
@@ -78,7 +79,8 @@ public:
     ///   isolation      — isolation byte
     ///   keyBytes       — key bytes (valid only during this call)
     ///   partitionKnown — 1 if partition is explicit, 0 if resolved from key
-    ///   deadline       — subscribe-request timeout (sweepTimedOut fails it)
+    ///   timeoutNs      — subscribe-request timeout, RELATIVE (the duty thread stamps deadlineNs = now + timeoutNs at
+    ///                    adoption; app threads never read the duty clock); sweepTimedOut fails it past the deadline
     [[nodiscard]] static std::unique_ptr<SubscribeRequest>
     makeSubscribeRequest(SubscriptionImpl*                     impl,
                          int64_t                               sessionId,
@@ -86,7 +88,7 @@ public:
                          int64_t                               fromOffset,
                          uint8_t                               isolation,
                          std::span<const uint8_t>              keyBytes,
-                         std::chrono::steady_clock::time_point deadline);
+                         int64_t                               timeoutNs);
 
     // -------------------------------------------------------------------------
     // Duty thread: commands drained from the agent ring
@@ -96,10 +98,12 @@ public:
     /// `unsubCorrId` is a fresh correlationId for an Unsubscribe frame (used
     /// only by Op::Unsubscribe on a bound subscription).  Ops that are not
     /// subscriber ops are ignored.
+    /// `nowNs` is the duty clock: a SubscribeAdd's deadline is stamped nowNs + its timeout.
     void applyCommand(const detail::HubCommand& cmd,
                       int64_t                   unsubCorrId,
                       int64_t                   sessionId,
-                      const SendFn&             submitFn);
+                      const SendFn&             submitFn,
+                      int64_t                   nowNs);
 
     /// Adopt a SubscribeRequest: register it as pending (keyed by its
     /// correlationId) and send its Subscribe frame.
@@ -200,7 +204,7 @@ public:
     /// `newCorrId`: its Subscribe is re-encoded from the resume position
     /// (nextOffset; the requested From while nothing was delivered), the same
     /// isolation, its bound partition (partitionKnown), stamped `sessionId`,
-    /// with `deadline` as its subscribe timeout.  The Subscribe is NOT sent
+    /// with `deadlineNs` (duty-clock ns) as its subscribe deadline.  The Subscribe is NOT sent
     /// here: the caller routes it like any refused pending Subscribe.  The old
     /// instance gets a best-effort Unsubscribe (`unsubCorrId`) on `sessionId`;
     /// its Records (old id / correlationId) are dropped from now on.  False (no
@@ -212,7 +216,7 @@ public:
     /// the old instance's Unsubscribe goes to that home.  The re-armed request
     /// is stamped `seedSid` and homed on the seed until routed (homeMoved).
     bool rearmMovedAway(int64_t correlationId, int64_t newCorrId, int64_t unsubCorrId, int64_t answerSid,
-                        int64_t seedSid, std::chrono::steady_clock::time_point deadline);
+                        int64_t seedSid, int64_t deadlineNs);
 
     /// Catalog history (Task 13): the broker answered the Subscribe
     /// `correlationId` of a BOUND catalog subscription (TopicHandle::catalog())
@@ -276,7 +280,7 @@ public:
     /// did not survive.  The subscription restarts at the log start (no resume
     /// floor, no claim), its dataResets() is bumped, and the request is re-sent
     /// on its route.  False when it is not a pending Subscribe.
-    bool restartFromLogStart(int64_t correlationId, int64_t seedSid, std::chrono::steady_clock::time_point deadline);
+    bool restartFromLogStart(int64_t correlationId, int64_t seedSid, int64_t deadlineNs);
     [[nodiscard]] uint64_t partitionDataResets() const noexcept { return partitionDataResets_; }
     /// R3: `correlationId` is a pending, never-bound, never-moved Subscribe.
     [[nodiscard]] bool isNewPendingSubscribe(int64_t correlationId) const;
@@ -302,16 +306,15 @@ public:
     /// node session is Connected (re-resolving the leader each attempt); a
     /// moved subscription whose node session was LOST (dropped / reconnected:
     /// the broker ended the subscription with it) is re-armed from its
-    /// position under a fresh correlationId (`deadline` = its subscribe
-    /// timeout) and routed again — never a silent stall.  Returns work done.
-    int driveHomed(int64_t seedSid, std::chrono::steady_clock::time_point deadline,
-                   std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+    /// position under a fresh correlationId (`deadlineNs` = its subscribe
+    /// deadline) and routed again — never a silent stall.  Returns work done.
+    int driveHomed(int64_t seedSid, int64_t deadlineNs, int64_t nowNs);
     /// The pending MOVED Subscribe `correlationId` was answered a bare
     /// NotLeader (its new leader has not taken over yet): it is re-offered on
-    /// the partition's current route after `notBefore` by driveHomed — never
+    /// the partition's current route after `notBeforeNs` by driveHomed — never
     /// through the seed (which may sit on the node that just went away).  False
     /// when it is not a pending moved one whose route is a node session.
-    bool holdMovedForRetry(int64_t correlationId, std::chrono::steady_clock::time_point notBefore);
+    bool holdMovedForRetry(int64_t correlationId, int64_t notBeforeNs);
     /// The pending Subscribe `correlationId` is a moved one whose partition
     /// currently routes to a node session (not the seed).
     [[nodiscard]] bool movedRoutesToANode(int64_t correlationId);
@@ -361,7 +364,7 @@ public:
     /// Called from Client::sweepTimeouts() on the runner thread.
     /// Each still-active timed-out Subscribe finishes with failReason TimedOut;
     /// the return value is how many, so the caller can fire onError for each.
-    int sweepTimedOut(const std::chrono::steady_clock::time_point& now);
+    int sweepTimedOut(int64_t nowNs);
 
     /// CB-5 B: resend every PENDING Subscribe frame after a leader redirect +
     /// reconnect.  A Subscribe rejected by a follower with ErrorResponse
@@ -460,7 +463,7 @@ public:
     /// restart its deadline (a re-routed request is progressing, not silent).
     /// False when it is no longer pending.
     bool resendOne(int64_t correlationId, int64_t sessionId, const SendFn& submitFn,
-                   std::chrono::steady_clock::time_point newDeadline);
+                   int64_t newDeadlineNs);
 
     // -------------------------------------------------------------------------
     // Helpers (accessible so SubscriberHub is testable standalone)

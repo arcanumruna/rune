@@ -386,6 +386,8 @@ struct InvokerGateway {
     // F8a fix2: stop consuming client ingress (the client's publication then
     // back-pressures once its term window is full).
     bool pauseIngress = false;
+    // Like pauseIngress, for single endpoints (indices as addNode / addEndpoint return): their ingress is not drained.
+    std::set<int> pausedEndpoints;
     int  pings        = 0;
     std::vector<std::vector<uint8_t>> offsetCommits;  // raw OffsetCommit frames received
     bool replyOffsetCommits = true;
@@ -825,8 +827,10 @@ struct InvokerGateway {
             }
         }
         if (!pauseIngress) {
-            for (auto& ep : endpoints) {
-                if (ep->sub) work += ep->sub->poll(ep->assembler->handler(), 16);
+            for (std::size_t e = 0; e < endpoints.size(); ++e) {
+                auto& ep = endpoints[e];
+                if (ep->sub && pausedEndpoints.count(static_cast<int>(e)) == 0)
+                    work += ep->sub->poll(ep->assembler->handler(), 16);
             }
         }
         return work;
