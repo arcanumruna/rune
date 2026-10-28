@@ -1941,9 +1941,9 @@ public:
     }
     /// The consensus leader (this node, if it is) resigns (posted to the control thread).
     template <class = void>
-    void resignConsensusForTest() {
-        (void)onControlThreadForTest([this]() {
-            if (election_) (void)election_->resign(std::chrono::duration_cast<std::chrono::nanoseconds>(
+    bool resignConsensusForTest() {
+        return onControlThreadForTest([this]() -> bool {
+            return election_ && election_->resign(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
             return 0;
         });
