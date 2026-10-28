@@ -1375,8 +1375,10 @@ private:
         DdlResendCause cause = DdlResendCause::NotLeader;
     };
     /// Redirected (no NotLeader seen) to a node whose session cannot take the
-    /// frame yet (still connecting): re-offered every cycle until it does.
-    struct DdlHeldForNode    { int redirects; };
+    /// frame yet (still connecting): re-offered every cycle until it does, or until budgetEndNs (the retry budget
+    /// started at the Redirect, capped at the op deadline) passes while that node's session is still not up: it
+    /// then ends SessionLost "node unreachable", like the same Redirect after a NotLeader (#97, #687).
+    struct DdlHeldForNode    { int redirects; int64_t budgetEndNs; };
     // Shared by every routed control op (DDLs and GetViewRow), not DDL-only.
     using DdlRetry = std::variant<DdlUnsentOnSeed, DdlSent, DdlNotLeaderSeen, DdlAwaitingResend, DdlHeldForNode>;
     /// Everything only a routed control op (a DDL or a GetViewRow) has (review M1: one variant on PendingCtl).

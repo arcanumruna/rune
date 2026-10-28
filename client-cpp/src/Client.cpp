@@ -2028,7 +2028,19 @@ void Client::failDdl_(std::size_t i, uint16_t code, std::string_view detail, int
     // GetViewRow's errorCode namespace is the ViewRowResponse status, where 2 is
     // NotReady and 3 SchemaMismatch: a routing failure (NotLeader 2 / Redirect 3)
     // is the client-side kNotLeader, never mistaken for either.
-    if (p.op == OpKind::GetViewRow && (code == 2 || code == 3)) code = ViewRowResult::kNotLeader;
+    // #687: a routing failure of a GetViewRow also names the route it died on and the broker's own code (the
+    // errorCode the caller reads is the client-side kNotLeader).  Cold path: one small string.
+    std::string routed;
+    if (p.op == OpKind::GetViewRow && (code == 2 || code == 3)) {
+        const auto* rp = std::get_if<RoutedCtlPending>(&p.ddl);
+        routed.reserve(detail.size() + 64);
+        routed.append(detail);
+        routed.append(" (route: ");
+        if (rp != nullptr && !rp->endpoint.empty()) routed.append(rp->endpoint); else routed.append("seed");
+        routed.append(", broker code ").append(std::to_string(code)).append(")");
+        detail = routed;
+        code   = ViewRowResult::kNotLeader;
+    }
     completeCtl_(p, OpStatus::BrokerError, value, aux, code,
                  std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(detail.data()), detail.size()));
 }
@@ -2038,6 +2050,11 @@ constexpr int64_t kDdlInitialBackoffNs = 100'000'000;     // 100 ms
 constexpr std::string_view kDdlNodeRejected =
     "the DDL's node session was rejected (the user was revoked there or its login was refused)";
 constexpr int64_t kDdlMaxBackoffNs     = 1'000'000'000;   // 1 s
+// Issue #97 / #687: the text of a routed control op ended because its node's session never came up within the
+// retry budget (after a NotLeader's resend, or a Redirect's first offer).
+constexpr std::string_view kDdlNodeUnreachable =
+    "node unreachable: the request's node session was not re-established within its retry "
+    "budget (it may have been applied; a retry with the same requestId is exact)";
 } // namespace
 
 void Client::onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t nowNs) {
@@ -2073,7 +2090,10 @@ void Client::onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t no
     case Offer::Retry:   // that node's session is still connecting: the pump re-offers it
         if (cfg_.traceDdlRetries) noteDdlRetry_({DdlRetryNote::Kind::Redirect, redirects, 0, std::string(endpoint)});
         if (nl) setDdlRetry_(d, DdlAwaitingResend{redirects, nl->budgetEndNs, nl->backoffNs, nowNs});
-        else    setDdlRetry_(d, DdlHeldForNode{redirects});
+        else    setDdlRetry_(d, DdlHeldForNode{redirects,
+                                               std::min(p.deadlineNs,
+                                                        nsAfter(nowNs, (isDdlOp(p.op) ? cfg_.ddlRetryBudget
+                                                                                      : cfg_.viewReadRetryBudget).count()))});
         return;
     case Offer::Fatal: {   // the transport can never carry it
         PendingCtl dead = takeCtl_(i);
@@ -2193,10 +2213,12 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
                     break;
                 }
                 // Issue #97: the resend was refused because the target node's session is not up.  Record it in the
-                // state itself (SessionLost and AuthUnavailable are stronger statements and stay).
+                // state itself (SessionLost and AuthUnavailable are stronger statements and stay).  #687: Retry
+                // also means Aeron back-pressure on a node session that IS up - that is no "unreachable" claim.
                 if (due.cause == DdlResendCause::NotLeader || due.cause == DdlResendCause::NodeUnreachable) {
-                    due.cause = DdlResendCause::NodeUnreachable;
-                    std::get<DdlAwaitingResend>(d->retry).cause = DdlResendCause::NodeUnreachable;
+                    due.cause = agent_.connectedSessionId(sentOn.sessionIndex) == 0 ? DdlResendCause::NodeUnreachable
+                                                                                    : DdlResendCause::NotLeader;
+                    std::get<DdlAwaitingResend>(d->retry).cause = due.cause;
                 }
                 // Fix round 2 (I-1): toward a seed that can never reconnect: end now.
                 if (d->endpoint.empty() && seedCannotReconnect_()) {
@@ -2228,13 +2250,11 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
                     if (due.cause == DdlResendCause::NodeUnreachable) {
                         // Issue #97: a NotLeader redirect to a node whose session never came up - the request was
                         // never answered there, so it is a session loss, not a NotLeader.
-                        constexpr std::string_view kWhy =
-                            "node unreachable: the request's node session was not re-established within its retry "
-                            "budget (it may have been applied; a retry with the same requestId is exact)";
                         PendingCtl dead = takeCtl_(i);
                         completeCtl_(dead, OpStatus::SessionLost, ddlNoValue(dead.op), 0, 0,
-                                     std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kWhy.data()),
-                                                              kWhy.size()));
+                                     std::span<const uint8_t>(
+                                         reinterpret_cast<const uint8_t*>(kDdlNodeUnreachable.data()),
+                                         kDdlNodeUnreachable.size()));
                     } else if (due.cause == DdlResendCause::SessionLost) {
                         // F1: the DDL's session was lost and never came back
                         // inside the budget — a session loss, not a NotLeader.
@@ -2268,10 +2288,14 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
             }
             continue;
         }
-        // DdlHeldForNode / DdlUnsentOnSeed: re-offered every cycle; the DDL deadline bounds them.
+        // DdlHeldForNode / DdlUnsentOnSeed: re-offered every cycle; the DDL deadline bounds them, and a held
+        // node's retry budget (#687) ends it like a NotLeader's resend toward an unreachable node.
         int heldRedirects = 0;
-        if (const auto* hld = std::get_if<DdlHeldForNode>(&d->retry)) heldRedirects = hld->redirects;
-        else if (!std::holds_alternative<DdlUnsentOnSeed>(d->retry)) { ++i; continue; }
+        int64_t heldBudgetEndNs = -1;   // -1: not held for a node (DdlUnsentOnSeed has no budget)
+        if (const auto* hld = std::get_if<DdlHeldForNode>(&d->retry)) {
+            heldRedirects   = hld->redirects;
+            heldBudgetEndNs = hld->budgetEndNs;
+        } else if (!std::holds_alternative<DdlUnsentOnSeed>(d->retry)) { ++i; continue; }
         switch (offerDdl_(*d, nowNs, sentOn)) {
         case Offer::Accepted:
             setDdlRetry_(*d, DdlSent{heldRedirects, sentOn});
@@ -2288,6 +2312,18 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
             if (d->endpoint.empty() && seedCannotReconnect_()) {
                 PendingCtl dead = takeCtl_(i);   // never sent (or held for a node that is the seed)
                 completeCtl_(dead, OpStatus::NotConnected);
+                ++work;
+                break;
+            }
+            // #687: past its budget, still refused, and the node's session is not up: a session loss, exactly as
+            // the same Redirect after a NotLeader.  (A connected but back-pressured node keeps retrying until the
+            // deadline.)  A budget that ends at the deadline itself is the deadline: the sweep ends it Timeout.
+            if (heldBudgetEndNs >= 0 && nowNs >= heldBudgetEndNs && nowNs < p.deadlineNs &&
+                agent_.connectedSessionId(sentOn.sessionIndex) == 0) {
+                PendingCtl dead = takeCtl_(i);
+                completeCtl_(dead, OpStatus::SessionLost, ddlNoValue(dead.op), 0, 0,
+                             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kDdlNodeUnreachable.data()),
+                                                      kDdlNodeUnreachable.size()));
                 ++work;
                 break;
             }

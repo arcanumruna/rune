@@ -1091,3 +1091,141 @@ TEST(ClientViewRowRegression, DdlMaxRetryBudgetIsBoundedByTheDdlDeadlineAdversar
     EXPECT_GE(n, 2) << "retried: a max budget is not an exhausted one";
     EXPECT_GE(g_now - t0, int64_t{400'000'000}) << "ran to the DDL's own deadline: " << f.describe();
 }
+
+// ── #687: the routed control ops' retry machine (DDLs and GetViewRow) ──
+
+// A Redirect that is the FIRST answer (no NotLeader seen) toward a node whose session never comes up held the op
+// with no budget: it ended only at the op deadline as Timeout, while the same situation after a NotLeader ends
+// SessionLost "node unreachable" once the retry budget is spent.  Both now end the same way (DDL).
+// RED before the fix: Timeout.
+TEST(RoutedCtlRegression, RedirectWithoutNotLeaderToAnUnreachableNodeEndsNodeUnreachableRegression) {
+    rc::ClientConfig cfg = invokerCfg(4460, 4461);
+    cfg.ddlRetryBudget = std::chrono::milliseconds(300);
+    cfg.ddlTimeoutMs   = 3'000;
+    Rig r(cfg);
+    r.connect();
+    const std::string nowhere = udp(rune::client::testing::allocFreeUdpPort());   // no node listens there
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        r.answerError(ep, pc::ErrorCode::Redirect, nowhere, m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/20'000'000)) << "the DDL must end, not hang";
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::SessionLost) << payloadText(f);
+    EXPECT_EQ(payloadText(f).rfind("node unreachable", 0), 0u) << payloadText(f);
+    r.passes(100, 20'000'000);
+    EXPECT_EQ(cq.timesCompleted(f.token()), 1);
+    EXPECT_EQ(r.client.testPendingControlOps(), 0u);
+}
+
+// The same for GetViewRow (its own budget, viewReadRetryBudget).
+TEST(RoutedCtlRegression, GetViewRowRedirectWithoutNotLeaderToAnUnreachableNodeEndsNodeUnreachableRegression) {
+    rc::ClientConfig cfg = invokerCfg(4462, 4463);
+    cfg.viewReadRetryBudget = std::chrono::milliseconds(300);
+    cfg.pingTimeoutMs       = 3'000;
+    Rig r(cfg);
+    r.connect();
+    const std::string nowhere = udp(rune::client::testing::allocFreeUdpPort());
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        r.answerError(ep, pc::ErrorCode::Redirect, nowhere, m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/20'000'000)) << "the read must end, not hang";
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::SessionLost) << payloadText(f);
+    EXPECT_EQ(payloadText(f).rfind("node unreachable", 0), 0u) << payloadText(f);
+    r.passes(100, 20'000'000);
+    EXPECT_EQ(cq.timesCompleted(f.token()), 1);
+    EXPECT_EQ(r.client.testPendingControlOps(), 0u);
+}
+
+// A GetViewRow routing failure carries the route it died on and the broker's own code in its text (the code in
+// errorCode is the client-side kNotLeader).  RED before the fix: only the generic budget text.
+TEST(RoutedCtlRegression, GetViewRowRoutingFailureNamesRouteAndCodeRegression) {
+    rc::ClientConfig cfg = invokerCfg(4464, 4465);
+    cfg.viewReadRetryBudget = std::chrono::milliseconds(200);
+    Rig r(cfg);
+    r.connect();
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/20'000'000));
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(f.getViewRowResult().status, rc::ViewRowResult::kNotLeader);
+    const std::string text = payloadText(f);
+    EXPECT_NE(text.find("route:"), std::string::npos) << text;
+    EXPECT_NE(text.find("broker code 2"), std::string::npos) << text;
+}
+
+// Offer::Retry also means Aeron back-pressure on a node session that IS up.  A Redirect-held op whose node is
+// connected but back-pressured must keep retrying (it is answered once the node drains), never end SessionLost
+// "node unreachable" at the budget's end.  Setup: the node session is brought up by a first DDL; then the gateway
+// stops draining that node's ingress and two large DDLs are redirected to the node, so the second is refused by the full
+// publication while the node's session stays Connected.
+TEST(RoutedCtlRegression, BackPressureOnAConnectedNodeIsNotNodeUnreachableRegression) {
+    rc::ClientConfig cfg = invokerCfg(4466, 4467);
+    cfg.ddlRetryBudget = std::chrono::milliseconds(300);
+    cfg.ddlTimeoutMs   = 5'000;
+    Rig r(cfg);
+    const std::string nodeCh = udp(rune::client::testing::allocFreeUdpPort());
+    const int node = r.gw.addNode(nodeCh, 4466);
+    r.connect();
+    int seedBig = 0;
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        if (ep != node) { r.answerError(ep, pc::ErrorCode::Redirect, nodeCh, m->sessionId, m->correlationId); return; }
+        pc::DdlResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId;
+        resp.objectId = 4; resp.newVersion = 2;
+        r.gw.sendDdlResponse(ep, resp);
+    };
+    r.gw.templateHandlers[pc::AlterTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::AlterTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        if (ep != node) {
+            r.answerError(ep, pc::ErrorCode::Redirect, nodeCh, m->sessionId, m->correlationId);
+            ++seedBig;
+            return;
+        }
+        pc::AlterTopicResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId;
+        resp.topicId = 9; resp.newVersion = 5;
+        std::vector<uint8_t> out(256);
+        r.gw.send(ep, out.data(), resp.encode(out.data()));
+    };
+    test_support::TestCq cq(r.client);
+    // 1. bring the node's session up.
+    auto warm = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(warm.accepted());
+    ASSERT_TRUE(r.drive([&] { return warm.ready(); }, /*stepNs=*/1'000'000));
+    ASSERT_TRUE(warm.ok()) << warm.describe();
+    r.gw.pausedEndpoints.insert(node);   // the node's ingress is no longer drained
+    // 2. several large DDLs, redirected to the node, which is no longer drained.
+    const std::vector<uint8_t> big(480 * 1024, 0x5a);
+    std::vector<test_support::PendingOp> ops;
+    for (int k = 0; k < 16; ++k) {
+        ops.push_back(cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.alterTopic("t", 1, big, {}, q, t); }));
+        ASSERT_TRUE(ops.back().accepted());
+    }
+    ASSERT_TRUE(r.drive([&] { return seedBig >= 16; }, /*stepNs=*/1'000'000)) << "all were redirected";
+    // 3. well past the 300 ms budget (and inside the 5 s deadline): nothing ends, nothing is SessionLost.
+    r.passes(40, 20'000'000);   // 800 ms
+    ASSERT_GT(r.client.testIngressOfferRefused(), 0u) << "precondition: the node's full publication refused an offer";
+    for (auto& o : ops)
+        EXPECT_FALSE(o.ready() && o.outcome().c.status == rc::OpStatus::SessionLost) << payloadText(o);
+    EXPECT_FALSE(ops.back().ready()) << "the back-pressured op keeps retrying until its deadline";
+    // 4. the node drains: both are answered.
+    r.gw.pausedEndpoints.clear();
+    ASSERT_TRUE(r.drive([&] { for (auto& o : ops) if (!o.ready()) return false; return true; }, /*stepNs=*/1'000'000));
+    for (auto& o : ops) EXPECT_TRUE(o.ok()) << o.describe();
+}
