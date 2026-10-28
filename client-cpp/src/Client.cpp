@@ -6166,7 +6166,7 @@ bool Client::sendMetadataRequest(int64_t sessionId) noexcept {
     // Submit to the agent ring (thread-safe, non-blocking).
     // Fix round 1 (M2): the verdict reaches the caller (a full ring is not "asked").
     if (!agent_.submitSend(buf.data(), n)) return false;
-    noteMetadataSent_();
+    noteMetadataSent_(corrId);
     return true;
 }
 
@@ -6203,7 +6203,13 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
 
     // NEW-1: the answered request's correlationId orders it against redirects.
     metadataCache_.updateFromResponse(brokers, partitions, resp.correlationId);
-    metadataAnswerByNs_ = 0;   // fix round 1 (M2): answered
+    // fix round 1 (M2): answered.  #705: only the NEWEST request's answer (or a later one) clears the timer; a
+    // lagging answer to an older request must not wipe the newer request's deadline (corrIds are monotonic: one
+    // nextCorrId_ counter feeds every sender).
+    if (resp.correlationId >= metadataAnswerCorr_) {
+        metadataAnswerByNs_   = 0;
+        metadataAnswerCorr_   = 0;
+    }
 
     // Task 1.3: (re)build the agent-owned partition routing table IN PLACE.  For
     // each partition with a known leader + per-worker ingressStreamId, map the
@@ -6568,6 +6574,7 @@ void Client::tickMetadataRefresh() noexcept {
     // refresh, so the client always asks again.
     if (metadataAnswerByNs_ != 0 && now() >= metadataAnswerByNs_) [[unlikely]] {
         metadataAnswerByNs_ = 0;
+        metadataAnswerCorr_ = 0;
         scheduleMetadataRefresh();
     }
     if (nextMetadataRefreshAtNs_ == kMetadataRefreshNotArmed) {
@@ -6580,10 +6587,11 @@ void Client::tickMetadataRefresh() noexcept {
     nextMetadataRefreshAtNs_ = kMetadataRefreshNotArmed; // disarm
 }
 
-void Client::noteMetadataSent_() noexcept {
+void Client::noteMetadataSent_(int64_t corrId) noexcept {
     const int64_t timeoutNs = cfg_.responseTimeoutNs > 0 ? cfg_.responseTimeoutNs
                                                          : session::SessionConfig::kDefaultResponseTimeoutNs;
     metadataAnswerByNs_ = now() + timeoutNs;
+    metadataAnswerCorr_ = corrId;
 }
 
 bool Client::offerMetadataOnNode_(uint32_t i) noexcept {
@@ -6597,7 +6605,7 @@ bool Client::offerMetadataOnNode_(uint32_t i) noexcept {
     if (agent_.offerOnSession(i, buf.data(), len) != transport::AeronTransport::OfferResult::Accepted) return false;
     pendingMetadataCorrId_ = corrId;
     ++metadataViaOtherSession_;
-    noteMetadataSent_();
+    noteMetadataSent_(corrId);
     return true;
 }
 

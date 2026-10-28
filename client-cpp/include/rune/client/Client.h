@@ -1826,7 +1826,8 @@ private:
     uint64_t seedMovesSeen_ = 0;           ///< fix round 1 (C1): agent_.seedMoves() last seen
     uint64_t seedConnectEpochSeen_ = 0;    ///< fix round 2 (C-1): agent_.connectedEpoch(0) last seen
     int64_t  metadataAnswerByNs_ = 0;      ///< fix round 1 (M2): an unanswered MetadataRequest's due time (0 = none)
-    void noteMetadataSent_() noexcept;
+    int64_t  metadataAnswerCorr_ = 0;      ///< #705: corrId of the newest MetadataRequest sent (its answer clears the timer)
+    void noteMetadataSent_(int64_t corrId) noexcept;
     bool offerMetadataOnNode_(uint32_t index) noexcept;
     /// Fix round 1 (I4): one MetadataRequest on EVERY Connected session (route
     /// failures); returns how many were sent.

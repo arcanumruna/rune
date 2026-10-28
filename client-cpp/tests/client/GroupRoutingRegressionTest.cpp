@@ -4155,6 +4155,34 @@ TEST(GroupRoutingRegression, MetadataRefreshFollowsTheInjectedClockRegression) {
     EXPECT_EQ(r.gw.metadataRequests, seen + 1) << "the armed refresh did not fire once the duty clock passed it";
 }
 
+// #705: a LAGGING MetadataResponse (the answer to an older request) must not clear the answer timer of the NEWER
+// request.  Setup: MetadataRequests are held; the first (A) times out, the backoff refresh sends a second (B).  Only A
+// is then answered (late).  B stays unanswered: its own timer must still fire and ask a third time.
+// RED (unconditional clear in onMetadataResponse): B's timer was wiped by A's answer, no third request ever goes out.
+TEST(GroupRoutingRegression, LaggingMetadataAnswerKeepsTheNewerRequestsTimerRegression) {
+    constexpr int64_t kStepNs = 100'000'000LL;
+    RigOptions o        = routingClockOptions(100'000);
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 2'000'000'000;
+    GroupRig r(4601, 4602, o);
+    r.gw.partitions   = {{1, 0, 0, 1, 4601, ""}};
+    r.gw.holdMetadata = true;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.gw.metadataCorrIds.empty(); }, 20'000));
+    r.opt.stepNs = kStepNs;
+    const int64_t corrA = r.gw.metadataCorrIds.front();
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataCorrIds.back() > corrA; }, 20'000))
+        << "precondition: the timed-out request was never re-asked";
+    const std::size_t asked = r.gw.metadataCorrIds.size();
+    r.gw.sendMetadata(r.seedSid, corrA, 0);   // the late answer to A only
+    r.opt.stepNs = 1'000'000;
+    const int64_t t0 = g_routingClockNs;
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataCorrIds.size() > asked || g_routingClockNs - t0 >= 60'000'000'000LL; },
+                        100'000));
+    EXPECT_GT(r.gw.metadataCorrIds.size(), asked)
+        << "no third MetadataRequest: A's lagging answer cleared B's answer timer";
+}
+
 // #440: the coordinator's seed session reconnects onto a node that was rolled back below what the consumer needs
 // while the cluster once announced more (a rolling upgrade in flight).  The consumer waits (it is not ended
 // BrokerTooOld) and keeps running once the coordinator answers with a current version.  RED: it ended BrokerTooOld.
