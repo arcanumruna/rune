@@ -872,6 +872,7 @@ protected:
             else if (roll < 72) op = "txn-begin";
             else if (roll < 78) op = "txn-end";
             SCOPED_TRACE("seed=" + std::to_string(seed_) + " step=" + std::to_string(step) + " op=" + op);
+            ++tally_[op];
             try {
                 if (!std::strcmp(op, "create-namespace")) stepCreateNamespace(step);
                 else if (!std::strcmp(op, "create-topic")) stepCreateTopic(step);
@@ -910,6 +911,12 @@ protected:
         }
         SCOPED_TRACE("seed=" + std::to_string(seed_) + " op=final-checkpoint");
         checkpoint();
+        std::string t = "seed=" + std::to_string(seed_) + " ops:";
+        for (const auto& [k, v] : tally_) t += " " + k + "=" + std::to_string(v);
+        t += " gone=" + std::to_string(gone_.size()) + " txns=" + std::to_string(txns_.size());
+        std::size_t committed = 0, aborted = 0;
+        for (const TxnRec& x : txns_) (x.st == TxnRec::St::Committed ? committed : aborted)++;
+        std::printf("[ STRESS ] %s committed=%zu aborted=%zu\n", t.c_str(), committed, aborted);
     }
 
     static constexpr int kCheckpointEvery = 100;
@@ -927,6 +934,7 @@ protected:
     Session root_;
     std::map<std::string, Session> sess_;
     std::string trace_;
+    std::map<std::string, int> tally_;
 };
 
 TEST_P(NamespaceStressRegression, SeededModelRegression) { run(); }
