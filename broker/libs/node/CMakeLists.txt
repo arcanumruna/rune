@@ -2115,6 +2115,13 @@ if(BUILD_TESTING)
                               rune_client_api aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_lifecycle_matrix_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900 LABELS small)
         rune_regression_batches(rune_namespace_lifecycle_matrix_tests 6 TIMEOUT 1800)
+        # Final review U2/U3: cross-namespace group/txn references and recreate-before-purge (real broker).
+        add_executable(rune_namespace_cross_ref_tests tests/node/NamespaceCrossRefRegressionTest.cpp)
+        target_include_directories(rune_namespace_cross_ref_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_cross_ref_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_cross_ref_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900 LABELS small)
+        rune_regression_batches(rune_namespace_cross_ref_tests 1)
         # Namespaces Task 13 (spec §8): seeded, model-checked stress on one real broker (one ctest entry per seed).
         add_executable(rune_namespace_stress_tests tests/node/NamespaceStressTest.cpp)
         target_include_directories(rune_namespace_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)

@@ -546,12 +546,13 @@ void GroupCoordinationService::sweepSupersededLineages_(int64_t nowNs) {
 
 // ---------------------------------------------------------------------------
 // Lookup topicId → topic name via TopicRegistry.
-// Returns empty string if topics_ is null or topicId is out of range.
+// Returns empty string if topics_ is null, topicId is out of range, or the topic belongs to another namespace than
+// `nsId` (Review U2: a cross-namespace reference is "does not exist", for everyone).
 // ---------------------------------------------------------------------------
-static std::string topicNameForId(rune::gateway::TopicRegistry* topics, int32_t topicId) {
+static std::string topicNameForId(rune::gateway::TopicRegistry* topics, uint32_t nsId, int32_t topicId) {
     if (!topics) return {};
     const rune::node::TopicSpec* spec = topics->topic(topicId);
-    if (!spec) return {};
+    if (!spec || spec->nsId != nsId) return {};
     return spec->name;
 }
 
@@ -702,7 +703,7 @@ size_t GroupCoordinationService::handleJoinGroup(
             return refuseJoin("topic id " + std::to_string(tid) +
                               " is a view sink: it holds no records to consume; read the view with the view read API");
         }
-        std::string name = topicNameForId(topics_, tid);
+        std::string name = topicNameForId(topics_, rune::coordination::parseScopedId(groupIdStr).nsId, tid);
         if (!name.empty()) {
             joinTopicsScratch_.push_back(std::move(name));
         }
@@ -1454,7 +1455,7 @@ size_t GroupCoordinationService::handleOffsetCommit(
         }
 
         // Resolve topicId → topic name.
-        const std::string topicName = topicNameForId(topics_, e.topicId);
+        const std::string topicName = topicNameForId(topics_, rune::coordination::parseScopedId(groupIdStr).nsId, e.topicId);
         if (topicName.empty()) {
             // Unknown topic — no commit; report UnknownTopic per entry.
             r.errorCode = static_cast<int16_t>(pc::ErrorCode::UnknownTopic);
@@ -1782,7 +1783,7 @@ size_t GroupCoordinationService::handleOffsetFetch(
                 break;
             }
 
-            const std::string topicName = topicNameForId(topics_, e.topicId);
+            const std::string topicName = topicNameForId(topics_, rune::coordination::parseScopedId(groupIdStr).nsId, e.topicId);
 
             pc::OffsetFetchResult r;
             r.topicId   = e.topicId;

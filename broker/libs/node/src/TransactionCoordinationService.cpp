@@ -408,18 +408,21 @@ int64_t TransactionCoordinationService::requestPid_(int64_t pid, int64_t session
 // retriably).  Only a coordinator wired without a registry (unit rigs) names topics
 // "topic_<id>" — its markers go through the by-name test seam.  Cold.
 // ---------------------------------------------------------------------------
-bool TransactionCoordinationService::topicNameOf_(int32_t topicId, std::string& out)
+TransactionCoordinationService::TopicLookup
+TransactionCoordinationService::topicNameOf_(uint32_t nsId, int32_t topicId, std::string& out)
 {
     if (topics_ != nullptr) {
         const auto* spec = topics_->topic(topicId);
-        if (spec == nullptr) return false;
+        if (spec == nullptr) return TopicLookup::Unknown;
+        // Review U2: a topic of another namespace than the id's is treated exactly as "does not exist" (UnknownTopic).
+        if (spec->nsId != nsId) return TopicLookup::Foreign;
         out = spec->name;
-        return true;
+        return TopicLookup::Ok;
     }
     char numBuf[32];
     const int n = std::snprintf(numBuf, sizeof(numBuf), "topic_%d", topicId);
     out.assign(numBuf, static_cast<size_t>(n > 0 ? n : 0));
-    return true;
+    return TopicLookup::Ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -431,9 +434,6 @@ int16_t TransactionCoordinationService::verifyTxnPartition(int64_t producerId, i
     if (!ensureLoaded_(nowNs)) return static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
     tx::TopicPartition tp;
     tp.partition = partition;
-    // A topic this registry does not know (yet) is never judged: retriable (the
-    // client re-sends; once applied, the name matches what AddPartitions registered).
-    if (!topicNameOf_(topicId, tp.topic)) return static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions);
     const tx::TransactionMetadata* meta = nullptr;
     if (const auto it = pidIndex_.find(producerId); it != pidIndex_.end()) {
         meta = coordinator_.metadata(it->second);
@@ -444,6 +444,14 @@ int16_t TransactionCoordinationService::verifyTxnPartition(int64_t producerId, i
         if (meta == nullptr) return static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);   // no such transaction
         if (pidIndex_.size() > 2 * coordinator_.size() + 1024) [[unlikely]] pidIndex_.clear();   // stale ids
         pidIndex_.emplace(producerId, meta->txnId);
+    }
+    // A topic this registry does not know (yet) is never judged: retriable (the client re-sends; once applied, the name
+    // matches what AddPartitions registered).  Review U2: a topic of another namespace than the transactional id's
+    // is "does not exist" (UnknownTopic, non-retriable) - the verification never matches it by name.
+    switch (topicNameOf_(rune::coordination::parseScopedId(meta->txnId).nsId, topicId, tp.topic)) {
+        case TopicLookup::Ok: break;
+        case TopicLookup::Unknown: return static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions);
+        case TopicLookup::Foreign: return static_cast<int16_t>(pc::ErrorCode::UnknownTopic);
     }
     if (producerEpoch < meta->producerEpoch) return static_cast<int16_t>(pc::ErrorCode::ProducerFenced);
     if (producerEpoch > meta->producerEpoch) return static_cast<int16_t>(pc::ErrorCode::InvalidProducerEpoch);
@@ -943,22 +951,26 @@ size_t TransactionCoordinationService::handleAddPartitions_(
     // get its marker (the marker dispatch resolves names), pinning the LSO forever.
     partitionScratch_.clear();
     const size_t partCount = msg.partitions.size();
-    bool unknownTopic = false;
+    TopicLookup lookup = TopicLookup::Ok;
+    const uint32_t txnNs = rune::coordination::parseScopedId(txnIdScratch_).nsId;
     for (size_t i = 0; i < partCount; ++i) {
         auto tp = msg.partitions[i];
         tx::TopicPartition txtp;
         txtp.partition = tp.partition;
-        if (!topicNameOf_(tp.topicId, txtp.topic)) { unknownTopic = true; break; }
+        const TopicLookup l = topicNameOf_(txnNs, tp.topicId, txtp.topic);
+        if (l == TopicLookup::Foreign) { lookup = l; break; }   // Foreign wins over Unknown: UnknownTopic, non-retriable
+        if (l == TopicLookup::Unknown) lookup = l;
         partitionScratch_.push_back(std::move(txtp));
     }
-    if (unknownTopic) [[unlikely]] {
+    if (lookup != TopicLookup::Ok) [[unlikely]] {
+        const int16_t refusal = static_cast<int16_t>(lookup == TopicLookup::Foreign ? pc::ErrorCode::UnknownTopic
+                                                                                    : pc::ErrorCode::ConcurrentTransactions);
         const size_t needed = pc::AddPartitionsToTxnResponse::encodedSizeFor(partCount);
         if (outCap < needed) return answerCannotFit_(buf, len, out, outCap);
         partResultScratch_.clear();
         for (size_t i = 0; i < partCount; ++i) {
             auto tp = msg.partitions[i];
-            partResultScratch_.push_back({tp.topicId, tp.partition,
-                                          static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions)});
+            partResultScratch_.push_back({tp.topicId, tp.partition, refusal});
         }
         pc::AddPartitionsToTxnResponse resp;
         resp.sessionId     = msg.sessionId;
@@ -1126,9 +1138,13 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit_(
     // #112 review (same class as AddPartitions): an unknown topic id is refused retriably,
     // never recorded under a "topic_<id>" placeholder the group would never resolve.
     offsetsScratch_.clear();
+    const uint32_t groupNs = rune::coordination::parseScopedId(groupIdScratch_).nsId;
     for (const auto& e : msg.entries) {
         rune::coordination::TopicPartition tp;
-        if (!topicNameOf_(e.topicId, tp.topic)) [[unlikely]]
+        const TopicLookup l = topicNameOf_(groupNs, e.topicId, tp.topic);
+        if (l == TopicLookup::Foreign) [[unlikely]]   // Review U2: another namespace's topic does not exist for this group
+            return answerAll(static_cast<int16_t>(pc::ErrorCode::UnknownTopic));
+        if (l == TopicLookup::Unknown) [[unlikely]]
             return answerAll(static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
         tp.partition = e.partition;
         offsetsScratch_[tp] = e.offset;

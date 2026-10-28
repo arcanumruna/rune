@@ -414,8 +414,10 @@ private:
     /// #112: producer id → its transactional id (a cache for verifyTxnPartition; every hit
     /// is re-validated against the coordinator, cleared on load and when it outgrows the map).
     std::unordered_map<int64_t, rune::transaction::TransactionalId> pidIndex_;
-    /// #112 review: topic id -> name; false = the registry does not know the id (refuse retriably).
-    bool topicNameOf_(int32_t topicId, std::string& out);
+    /// #112 review: topic id -> name in namespace `nsId`.  Unknown = the registry does not know the id (refuse
+    /// retriably); Foreign (Review U2) = the topic belongs to another namespace (UnknownTopic, non-retriable).
+    enum class TopicLookup : uint8_t { Ok, Unknown, Foreign };
+    TopicLookup topicNameOf_(uint32_t nsId, int32_t topicId, std::string& out);
     int64_t requestPutOffset_  = -1;      ///< the newest record the current request appended
     bool    requestPutRefused_ = false;   ///< the current request's append was refused (min-ISR)
     AnswerSinkFn answerSink_    = nullptr;
