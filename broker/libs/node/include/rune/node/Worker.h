@@ -8668,28 +8668,67 @@ private:
         int64_t enqueuedAtNs  = 0;      ///< gateway enqueue time (op path; latency attribution)
     };
 
-    /// Cold: true when a record of the RecordBatch v2 in `batch` has a body longer than `max`.  A malformed batch
-    /// answers false (the existing validation answers it).
-    [[gnu::cold]] [[gnu::noinline]] static bool anyRecordLongerThan_(std::span<const uint8_t> batch, uint64_t max) noexcept {
+    enum class RecordWalk : uint8_t { Ok, TooLong, Malformed };
+
+    /// Cold: walk the records of the RecordBatch v2 in `batch` exactly as RecordBatchReader::forEachRecord (the consumer
+    /// side) reads them - length varint, attributes, timestampDelta, offsetDelta, key, value, headers - and compare each
+    /// record's body length with `max`.  The length varint is only a claim (consumers ignore it), so it is trusted only
+    /// once the fields end exactly at (start after the varint) + length.  Malformed: a bounds overrun, fields that do not
+    /// end at the claimed length, a record count that differs from the header's, or bytes after the last record.
+    /// A compressed batch (attribute bits 0-2) cannot be walked (no codec; consumers would not decode it either), so the
+    /// limit is applied conservatively to the whole records region.
+    [[gnu::cold]] [[gnu::noinline]] static RecordWalk walkRecords_(std::span<const uint8_t> batch, uint64_t max) noexcept {
         namespace pb = rune::protocol::batch;
-        if (batch.size() < static_cast<std::size_t>(pb::kRecordBatchOverhead)) return false;
+        if (batch.size() < static_cast<std::size_t>(pb::kRecordBatchOverhead)) return RecordWalk::Malformed;
+        const std::size_t end = batch.size();
         const int32_t count = static_cast<int32_t>(rune::protocol::detail::getLE32(batch.data() + pb::kRecordCountOffset));
-        std::size_t pos = static_cast<std::size_t>(pb::kRecordBatchOverhead);
-        for (int32_t i = 0; i < count; ++i) {
-            uint64_t v = 0; int shift = 0; bool done = false;
-            while (pos < batch.size() && shift < 64) {
-                const uint8_t b = batch[pos++];
-                v |= static_cast<uint64_t>(b & 0x7F) << shift; shift += 7;
-                if ((b & 0x80) == 0) { done = true; break; }
-            }
-            if (!done) return false;
-            const int64_t len = static_cast<int64_t>(v >> 1) ^ -static_cast<int64_t>(v & 1);   // un-zigzag
-            if (len < 0) return false;
-            if (static_cast<uint64_t>(len) > max) return true;
-            if (static_cast<uint64_t>(len) > batch.size() - pos) return false;
-            pos += static_cast<std::size_t>(len);
+        if (count < 0) return RecordWalk::Malformed;
+        const int16_t attrs = static_cast<int16_t>(rune::protocol::detail::getLE16(batch.data() + pb::kAttributesOffset));
+        if ((attrs & 0x7) != 0) {
+            return end - static_cast<std::size_t>(pb::kRecordBatchOverhead) > max ? RecordWalk::TooLong : RecordWalk::Ok;
         }
-        return false;
+        std::size_t pos = static_cast<std::size_t>(pb::kRecordBatchOverhead);
+        // Bounded zigzag varint (at most 10 bytes, never past `lim`).
+        const auto rd = [&](std::size_t lim, int64_t& out) noexcept {
+            uint64_t raw = 0; int shift = 0;
+            while (pos < lim && shift < 64) {
+                const uint8_t b = batch[pos++];
+                raw |= static_cast<uint64_t>(b & 0x7F) << shift;
+                if ((b & 0x80) == 0) { out = static_cast<int64_t>(raw >> 1) ^ -static_cast<int64_t>(raw & 1); return true; }
+                shift += 7;
+            }
+            return false;
+        };
+        // A length the consumer reads as int32 (readVarint truncates), then skips when positive.
+        const auto skipBytes = [&](std::size_t lim) noexcept {
+            int64_t raw = 0;
+            if (!rd(lim, raw)) return false;
+            const int32_t n = static_cast<int32_t>(raw);
+            if (n > 0) { if (static_cast<uint64_t>(n) > lim - pos) return false; pos += static_cast<std::size_t>(n); }
+            return true;
+        };
+        bool tooLong = false;
+        for (int32_t i = 0; i < count; ++i) {
+            int64_t len = 0, v = 0;
+            if (!rd(end, len) || len < 0 || static_cast<uint64_t>(len) > end - pos) return RecordWalk::Malformed;
+            const std::size_t recEnd = pos + static_cast<std::size_t>(len);
+            if (pos >= recEnd) return RecordWalk::Malformed;
+            ++pos;                                                  // attributes
+            if (!rd(recEnd, v)) return RecordWalk::Malformed;       // timestampDelta
+            if (!rd(recEnd, v)) return RecordWalk::Malformed;       // offsetDelta
+            if (!skipBytes(recEnd)) return RecordWalk::Malformed;   // key
+            if (!skipBytes(recEnd)) return RecordWalk::Malformed;   // value
+            if (!rd(recEnd, v)) return RecordWalk::Malformed;       // header count
+            const int32_t hcount = static_cast<int32_t>(v);
+            if (hcount < 0) return RecordWalk::Malformed;
+            for (int32_t h = 0; h < hcount; ++h) {
+                if (!skipBytes(recEnd) || !skipBytes(recEnd)) return RecordWalk::Malformed;   // header key, value
+            }
+            if (pos != recEnd) return RecordWalk::Malformed;
+            if (static_cast<uint64_t>(len) > max) tooLong = true;
+        }
+        if (pos != end) return RecordWalk::Malformed;
+        return tooLong ? RecordWalk::TooLong : RecordWalk::Ok;
     }
 
     int produceCore_(const ProduceFields& f, rune::storage::Log* log,
@@ -8767,9 +8806,13 @@ private:
             {
                 const uint64_t len = rbSpan.size();
                 if (len > nh.maxMessageBytes || len > nh.maxBatchBytes) [[unlikely]] {
-                    if (len > nh.maxBatchBytes || anyRecordLongerThan_(rbSpan, nh.maxMessageBytes)) {
-                        ++nsSizeRefusals_;
-                        ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NamespaceLimitExceeded);
+                    const RecordWalk w = len > nh.maxBatchBytes ? RecordWalk::TooLong : walkRecords_(rbSpan, nh.maxMessageBytes);
+                    if (w != RecordWalk::Ok) {
+                        // TooLong: 52 (an old client is mapped by produceErrorForClient when the answer is encoded).
+                        // Malformed: InvalidRequest, like every other undecodable produce.
+                        if (w == RecordWalk::TooLong) ++nsSizeRefusals_;
+                        ret.errorCode = static_cast<int16_t>(w == RecordWalk::TooLong ? pc::ErrorCode::NamespaceLimitExceeded
+                                                                                     : pc::ErrorCode::InvalidRequest);
                         enqueueReturn_(ret);
                         return 1;
                     }

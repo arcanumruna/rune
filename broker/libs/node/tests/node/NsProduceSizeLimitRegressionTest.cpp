@@ -170,3 +170,56 @@ TEST(NsProduceSizeLimitRegression, ReleaseThenReassignRegression) {
     EXPECT_GT(rig.log->logEndOffset(), end);
     EXPECT_EQ(rig.worker().nsSizeRefusalsForTest(), 1u);
 }
+
+namespace {
+constexpr int kInvalid = static_cast<int>(pc::ErrorCode::InvalidRequest);
+
+/// Recompute the length field (bytes after it) and the CRC-32C of a hand-edited batch.
+void refix(std::vector<uint8_t>& b) {
+    namespace pb = rune::protocol::batch;
+    const uint32_t len = static_cast<uint32_t>(b.size() - 12);
+    for (int i = 0; i < 4; ++i) b[pb::kLengthOffset + i] = static_cast<uint8_t>(len >> (8 * i));
+    const uint32_t crc = rune::protocol::crc32c(b.data() + pb::kAttributesOffset, b.size() - pb::kAttributesOffset);
+    for (int i = 0; i < 4; ++i) b[pb::kCrcOffset + i] = static_cast<uint8_t>(crc >> (8 * i));
+}
+}  // namespace
+
+// The record length varint is a claim; consumers ignore it.  A record that says 10 but carries 2000 value bytes
+// must not pass max-message-bytes=1024: the walk parses the fields exactly as forEachRecord does, and a record whose
+// fields do not end at start+length is malformed (InvalidRequest), nothing appended.
+TEST(NsProduceSizeLimitRegression, LyingRecordLengthAdversarialRegression) {
+    Rig rig;
+    assign(rig, 1024, 0);
+    auto b = batchOf({2000});
+    size_t pos = rune::protocol::batch::kRecordBatchOverhead;
+    (void)rune::protocol::readVarint(b.data(), pos);
+    ASSERT_EQ(pos, static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead) + 2) << "a 2-byte length varint";
+    b[rune::protocol::batch::kRecordBatchOverhead]     = 0x94;   // zigzag(10) = 20, non-canonical 2-byte form
+    b[rune::protocol::batch::kRecordBatchOverhead + 1] = 0x00;
+    refix(b);
+    const int64_t end = rig.log->logEndOffset();
+    EXPECT_EQ(produce(rig, b), kInvalid);
+    EXPECT_EQ(rig.log->logEndOffset(), end) << "nothing appended";
+}
+
+TEST(NsProduceSizeLimitRegression, RecordCountMismatchAdversarialRegression) {
+    Rig rig;
+    assign(rig, 1024, 0);
+    auto b = batchOf({2000});
+    b[rune::protocol::batch::kRecordCountOffset] = 2;   // header says 2, the body holds 1
+    refix(b);
+    const int64_t end = rig.log->logEndOffset();
+    EXPECT_EQ(produce(rig, b), kInvalid);
+    EXPECT_EQ(rig.log->logEndOffset(), end);
+}
+
+TEST(NsProduceSizeLimitRegression, TrailingBytesAdversarialRegression) {
+    Rig rig;
+    assign(rig, 1024, 0);
+    auto b = batchOf({2000});
+    for (int i = 0; i < 7; ++i) b.push_back(0x55);   // garbage after the last record
+    refix(b);
+    const int64_t end = rig.log->logEndOffset();
+    EXPECT_EQ(produce(rig, b), kInvalid);
+    EXPECT_EQ(rig.log->logEndOffset(), end);
+}
