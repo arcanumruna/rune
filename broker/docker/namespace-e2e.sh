@@ -291,6 +291,7 @@ log "step 4: a/admin creates alice, topic t and READ + WRITE on t..."
       printf "topic t partitions 1 replicas 3;\n"
       printf "GRANT READ ON TOPIC t TO USER alice;\n"
       printf "GRANT WRITE ON TOPIC t TO USER alice;\n"
+      printf "GRANT READ ON GROUP g TO USER alice;\n"   # step 15's consumer group (default deny: a join needs READ on it)
   } > "${WORK_DIR}/step4.rql" )
 ql_as a/admin /work/aadmin.pw -f /work/step4.rql --broker "rune-3:${BROKER_PORT}" || fail "step 4: a/admin's script failed"
 rm -f "${WORK_DIR}/step4.rql"
@@ -420,7 +421,7 @@ wait_until 90 "alice's live session to be closed" live_ended || {
 wait "${live_pid}" 2>/dev/null || true
 expect_refusal "step 12: alice's login (right password) to a RejectAll namespace" "NamespaceSuspended" \
     ql_as a/alice /work/alice.pw -e "show grants for user alice;" --broker "rune-2:${BROKER_PORT}"
-printf 'not the password' > "${WORK_DIR}/wrong.pw"
+( umask 077; printf 'not the password' > "${WORK_DIR}/wrong.pw" )   # the client refuses a password file others can read
 expect_refusal "step 12: a wrong password to a RejectAll namespace" "AuthenticationFailed" \
     ql_as a/alice /work/wrong.pw -e "show grants for user alice;" --broker "rune-2:${BROKER_PORT}"
 ns_as admin /work/admin.pw resume a --broker "rune-1:${BROKER_PORT}" || fail "step 12: resume failed"
