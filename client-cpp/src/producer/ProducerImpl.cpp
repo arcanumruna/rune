@@ -2641,7 +2641,7 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
     // Issue #222: auth refusals (44..47) are answered before the append: when this was the batch's ONLY attempt it
     // was definitely not stored — fail it without marking the partition unresolved (no epoch bump).  A retransmit's
     // refusal proves nothing about the earlier attempt: that stays the outcome-unknown path (D) below.
-    if (ec >= static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed) &&
+    if (false && ec >= static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed) &&
         ec <= static_cast<int16_t>(rune::protocol::client::ErrorCode::PasswordChangeRequired) &&
         b->attempts == 1) {
         emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,

@@ -552,6 +552,10 @@ private:
     int64_t nextOffsetFetchCorr_ = 1;
     /// #431: the last hub-unique control id handed to a consumer (24 bits used, never 0).
     uint32_t nextCtlId_ = 0;
+public:
+    /// #660 test hook: position the 24-bit control-id counter (the next candidate is v + 1) to force a wrap.
+    void testSetNextCtlId(uint32_t v) noexcept { nextCtlId_ = v; }
+private:
     /// #431: the next control correlation id of `impl` (bumps its sequence, skipping 0 on wrap).
     [[nodiscard]] static int64_t nextCtlCorr_(GroupConsumerImpl& impl) noexcept;
     void publishGeneration_(GroupConsumerImpl& impl);

@@ -87,8 +87,20 @@ void GroupConsumerHub::add(GroupConsumerImpl* impl) {
     // F8c C7: the duty side's share is held from adoption on (even if closed).
     owned_.push_back(impl);
     // #431: a hub-unique 24-bit control id (never 0) tags this consumer's Join / Sync / Heartbeat correlation ids.
-    impl->ctlId = (++nextCtlId_ & 0xFFFFFFu);
-    if (impl->ctlId == 0) impl->ctlId = (++nextCtlId_ & 0xFFFFFFu);
+    // #660: skip 0 AND every id a consumer the hub still answers for (owned_) holds, so the id stays unique after
+    // the 24-bit counter wraps.  Cold path.  At most owned_.size() ids are taken, so the loop ends within
+    // owned_.size() + 1 steps; the 2^24 bound is a hard cap on top.
+    uint32_t candidate = 0;
+    for (uint32_t tries = 0; tries <= 0x1000000u; ++tries) {
+        candidate = (++nextCtlId_ & 0xFFFFFFu);
+        if (candidate == 0) continue;
+        bool taken = false;
+        for (const GroupConsumerImpl* o : owned_) {
+            if (o != impl && o->ctlId == candidate) { taken = true; break; }
+        }
+        if (!taken) break;
+    }
+    impl->ctlId = candidate;
     // fix3 I3: closed (directly, on this thread) before its adoption: honour
     // it — never driven, never joins.
     if (impl->active) impls_.push_back(impl);
@@ -331,6 +343,14 @@ void GroupConsumerHub::startRewind_(GroupConsumerImpl* impl, OpKind kind, const 
     if (isSeek) (void)reconcileImpl_(*impl);   // the start offset is known: resubscribe now
 }
 
+// #685: a fetch in flight died with its session: the answer can never come - re-send on the first pass after reconnect.
+// offsetFetchCorrId is kept on purpose: an answer still arriving from the old session is fenced by its session id.
+static void resetOffsetFetch_(GroupConsumerImpl& impl) noexcept {
+    impl.offsetFetchPhase     = GroupConsumerImpl::OffsetFetchPhase::Idle;
+    impl.offsetFetchDueNs     = 0;
+    impl.offsetFetchBackoffNs = 0;
+}
+
 int GroupConsumerHub::driveRewinds(int64_t nowNs, int64_t sessionId, const SendFn& sendFn) {
     int n = 0;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
@@ -338,8 +358,11 @@ int GroupConsumerHub::driveRewinds(int64_t nowNs, int64_t sessionId, const SendF
         if (std::holds_alternative<GroupConsumerImpl::NoRewind>(impl->rewind)) continue;
         advanceRewind_(*impl, nowNs);   // Task 10: bound / fetched / rejoined / timed out
         ++n;
-        if (std::holds_alternative<GroupConsumerImpl::RewindAwaitFetch>(impl->rewind)) {
-            (void)retryOffsetFetchFor_(*impl, nowNs, sessionId, sendFn);   // #371: now, not on the next sweep
+        // #371: now, not on the next sweep.  #684: also in RewindResubscribe - a seek that superseded a
+        // seekToCommitted leaves the other partitions offset-unknown (a no-op when none is; paced by its own phase).
+        if (std::holds_alternative<GroupConsumerImpl::RewindAwaitFetch>(impl->rewind) ||
+            std::holds_alternative<GroupConsumerImpl::RewindResubscribe>(impl->rewind)) {
+            (void)retryOffsetFetchFor_(*impl, nowNs, sessionId, sendFn);
         }
     }
     return n;
@@ -380,6 +403,7 @@ void GroupConsumerHub::setSessionConnected(bool connected, int64_t sessionId, in
         for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {
             completeCommitSync_(*impls_[ix], OpStatus::SessionLost);
             if (rewindInFlight_(*impls_[ix])) completeRewind_(*impls_[ix], OpStatus::SessionLost);   // #494
+            resetOffsetFetch_(*impls_[ix]);   // #685
         }
     }
     sessionConnected_ = connected;
@@ -1680,6 +1704,7 @@ void GroupConsumerHub::onSessionDown()
         if (impl->active) {
             completeCommitSync_(*impl, OpStatus::SessionLost);
             if (rewindInFlight_(*impl)) completeRewind_(*impl, OpStatus::SessionLost);   // #494
+            resetOffsetFetch_(*impl);   // #685
         }
     }
 }

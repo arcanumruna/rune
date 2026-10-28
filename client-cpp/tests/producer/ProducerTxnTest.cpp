@@ -1986,11 +1986,13 @@ TEST(ProducerTxnAllocRegression, AbortAndCloseWithAnOpenClaimAbandonWithoutAlloc
     const long allocs = alloc_counter::stopThisThread();
     EXPECT_EQ(allocs, 0L) << "the close's abandon allocated";
     EXPECT_FALSE(r.impl->commitClaim(g.token));
-    r.tick();
+    for (int i = 0; i < 4 && r.endTxns() < 5; ++i) r.tick();
+    ASSERT_EQ(r.endTxns(), 5u) << "the close sends one EndTxn(abort)";
+    EXPECT_EQ(r.lastEnd()->commit, uint8_t{0});
     r.endAnswer();
     r.ticks(2);
     const Op cl{&r.ledger, t};
-    ASSERT_TRUE(cl.ready());
+    ASSERT_TRUE(cl.ready()) << "endTxns " << r.endTxns() << " state " << static_cast<int>(r.state());
     EXPECT_EQ(cl.status(), OpStatus::Ok);
     EXPECT_TRUE(r.wire.empty());
 }

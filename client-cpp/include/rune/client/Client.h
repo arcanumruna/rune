@@ -41,6 +41,7 @@
 
 #pragma once
 
+#include <limits>
 #include <rune/client/agent/ClientAgent.h>
 #include <rune/client/session/SessionMachine.h>
 #include <rune/client/codec/Codec.h>
@@ -2204,13 +2205,13 @@ private:
     // redirects) a metadata refresh is scheduled with EXPONENTIAL backoff so the
     // client cannot storm the broker.  metadataBackoffNs_ is the wait before the
     // NEXT scheduled refresh; it doubles per schedule up to the cap and resets on
-    // a successful MetadataResponse.  nextMetadataRefreshAt_ == time_point::max()
+    // a successful MetadataResponse.  nextMetadataRefreshAtNs_ == kMetadataRefreshNotArmed
     // means "no refresh armed".  Agent-thread-only.
     static constexpr int64_t kMetadataBackoffInitNs = 100'000'000LL;    // 100 ms
     static constexpr int64_t kMetadataBackoffMaxNs  = 30'000'000'000LL; // 30 s
     int64_t metadataBackoffNs_ {kMetadataBackoffInitNs};
-    std::chrono::steady_clock::time_point nextMetadataRefreshAt_ {
-        std::chrono::steady_clock::time_point::max()};  // max() = not armed
+    static constexpr int64_t kMetadataRefreshNotArmed = std::numeric_limits<int64_t>::max();
+    int64_t nextMetadataRefreshAtNs_ {kMetadataRefreshNotArmed};  // duty-clock ns (now()); max = not armed
 
     // sendMetadataRequest() — encodes and submits a MetadataRequest for all
     // topics to the agent ring.  Called on the runner thread after

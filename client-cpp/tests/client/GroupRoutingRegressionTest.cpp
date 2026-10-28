@@ -4055,12 +4055,12 @@ TEST(GroupRoutingRegression, AGroupFetchOnACrashedSeedMovesBeforeTheSeedIsStaleR
     EXPECT_FALSE(gc.finished());
 }
 
-// Out-of-batch finding (M31+ review, issue #651 — out of the suite until it is fixed): two redirected
+// Issue #651 (M31+ review): two redirected
 // Subscribes, the second right after the first binds.  The second redirect's guess stays provisional; each LAGGING
 // MetadataResponse (requested before that redirect, so it cannot confirm the guess) disarms the armed refresh in
 // Client::onMetadataResponse and re-arms it at now + a doubled backoff, pushing the confirming request out (39
 // Pings here, ~0.65 s, instead of the first backoff step).  Fix: keep an armed deadline while a guess is provisional.
-TEST(GroupRoutingRegression, DISABLED_LaggingMetadataAnswersNeverPostponeTheArmedRefreshAdversarialRegression) {
+TEST(GroupRoutingRegression, LaggingMetadataAnswersNeverPostponeTheArmedRefreshAdversarialRegression) {
     RigOptions o;
     o.keepaliveNs       = 50'000'000;
     o.responseTimeoutNs = 60'000'000'000;
@@ -4087,6 +4087,52 @@ TEST(GroupRoutingRegression, DISABLED_LaggingMetadataAnswersNeverPostponeTheArme
     }, 40'000'000));
     EXPECT_LE(r.gw.pings - pingsBefore, 30) << "the refresh that confirms the second redirect was postponed by "
                                                "lagging answers (each re-armed it with a doubled backoff)";
+}
+
+namespace {
+// #676: an injected duty clock for the metadata-timer tests (single test thread).
+int64_t g_routingClockNs = 1'000'000'000LL;
+int64_t routingClock() noexcept { return g_routingClockNs; }
+RigOptions routingClockOptions(int64_t stepNs = 1'000'000) {
+    RigOptions o;
+    g_routingClockNs = 1'000'000'000LL;
+    o.nanoClock      = &routingClock;
+    o.manualNs       = &g_routingClockNs;
+    o.stepNs         = stepNs;
+    return o;
+}
+} // namespace
+
+// The armed metadata refresh is driven by the injected duty clock (rule 2: one injected clock), not by the wall
+// clock.  Same setup as the #651 test: the second redirect's guess stays provisional, so a refresh is armed.  With
+// the duty clock frozen NO new MetadataRequest is sent, however many passes run; once the clock moves past the
+// backoff exactly one is.  RED before the fix: the wall clock fired it while the duty clock stood still.
+TEST(GroupRoutingRegression, MetadataRefreshFollowsTheInjectedClockRegression) {
+    RigOptions o        = routingClockOptions(100'000);
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 60'000'000'000;
+    GroupRig r(4573, 4574, o);
+    const auto [n1, p1port] = r.addNode(4573);
+    const auto [n2, p2port] = r.addNode(4573);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 1, 1, 4573, ""}, {1, 1, 2, 1, 4573, ""}};
+    r.gw.subscribeLeader = {{0, n1}, {1, n2}};
+    r.connect();
+    auto s0 = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                 [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, n1) != nullptr && s0.active(); }));
+    auto s1 = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                 [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n2) != nullptr && s1.active(); }));
+    // Freeze the duty clock and let the already-due work drain.
+    r.opt.stepNs = 0;
+    for (int i = 0; i < 100; ++i) { r.client.doWork(); r.gw.pump(); }
+    const int frozenAt = r.gw.metadataRequests;
+    for (int i = 0; i < 5000; ++i) { r.client.doWork(); r.gw.pump(); }
+    EXPECT_EQ(r.gw.metadataRequests, frozenAt) << "a refresh fired while the duty clock stood still";
+    g_routingClockNs += 2'000'000'000LL;   // past the first backoff step
+    for (int i = 0; i < 200; ++i) { r.client.doWork(); r.gw.pump(); }
+    EXPECT_EQ(r.gw.metadataRequests, frozenAt + 1) << "the armed refresh did not fire once the duty clock passed it";
 }
 
 // #440: the coordinator's seed session reconnects onto a node that was rolled back below what the consumer needs

@@ -2392,13 +2392,14 @@ TEST(ProducerTxnDataRegression, SeededRandomTxnsCompleteEveryRecordOnceNeverFail
                 }
             }
         };
-        const Op end = fault == 3 ? r.abort() : r.commit();
+        // Through the ring (the handle path), FIFO behind the records still in it (FD1).
+        const Op end = r.issue(fault == 3 ? TxnControl::Kind::Abort : TxnControl::Kind::Commit);
         drive(end);
         ASSERT_TRUE(end.ready()) << "the transaction's end never completed (fault " << fault << ")";
         if (end.status() != OpStatus::Ok) {
             ASSERT_NE(fault, 0) << "a fault-free commit failed";
             ASSERT_EQ(r.state(), TxnState::AbortableError);
-            const Op ab = r.abort();
+            const Op ab = r.issue(TxnControl::Kind::Abort);
             drive(ab);
             ASSERT_TRUE(ab.ready());
             ASSERT_EQ(ab.status(), OpStatus::Ok);
@@ -2416,7 +2417,7 @@ TEST(ProducerTxnDataRegression, SeededRandomTxnsCompleteEveryRecordOnceNeverFail
             } else {
                 EXPECT_EQ(produced, 0) << "record " << t << " failed AND was produced (fault " << fault << ")";
             }
-            if (fault == 0) EXPECT_EQ(r.acks.status(t), OpStatus::Ok) << "fault-free commit: every record lands";
+            if (fault == 0) EXPECT_EQ(r.acks.status(t), OpStatus::Ok) << "fault-free commit: every record lands (ec " << r.acks.last.at(t).ec << ")";
         }
     }
 }
