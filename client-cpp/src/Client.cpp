@@ -5311,7 +5311,7 @@ int Client::checkDrain_() {
             tgt.handler = internal;
             p.applyBeginClose(tgt, 0, t);
         }
-        if (p.lifeOpen() || p.draining()) settled = false;
+        if (p.lifeOpen() || p.draining() || p.endingTxn()) settled = false;
     });
     if (!settled) return 0;
     std::vector<DrainWaiter> ws;
