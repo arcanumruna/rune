@@ -1184,3 +1184,56 @@ TEST(HandleLifetime, ClientCloseAbortsOpenTransactionsRegression) {
                   OpResult::Closed);
     }
 }
+
+// #475: close() must wait for an EndTxn(abort) already in flight.  The gateway swallows the coordinator
+// replies once the transaction has its partition and record, so the abort stays unanswered: the drain
+// has to run to closeTimeoutMs (deadline hit) with the abort on the wire exactly once, instead of
+// settling at once and discarding the in-flight abort locally.
+TEST(HandleLifetime, ClientCloseWaitsForTheTransactionAbortRegression) {
+    for (const rc::RunnerMode mode : {rc::RunnerMode::Invoker, rc::RunnerMode::Thread}) {
+        const bool invoker = mode == rc::RunnerMode::Invoker;
+        SCOPED_TRACE(invoker ? "Invoker" : "Thread");
+        Watchdog wd("close waits for the transaction abort");
+        rc::ClientConfig cfg = cfgFor(invoker ? 5452 : 5454, mode);
+        cfg.closeTimeoutMs   = 300;
+        auto client = std::make_unique<rc::Client>(cfg);
+        test_support::InvokerGateway gw(cfg.dataDir + "/aeron", cfg.gatewayChannel, cfg.gatewayStreamId,
+                                        cfg.egressChannel, cfg.egressStreamId);
+        auto drive = [&](auto&& pred) {  // capped by the wall deadline (a FAILING test only)
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (invoker) client->doWork();
+                gw.pump();
+                if (pred()) return true;
+            }
+            return false;
+        };
+        TestCq cq(*client);
+        ASSERT_TRUE(drive([&] { return gw.ready(); }));
+        {
+            auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client->connect(q, t); });
+            ASSERT_TRUE(drive([&] { return f.ready(); }));
+            ASSERT_TRUE(f.ok()) << f.describe();
+        }
+        gw.initPidReply = true;
+        gw.replyTxn     = true;
+        auto tp = client->producer(txnCfg("tx-475"));
+        auto init = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+        ASSERT_TRUE(drive([&] { return init.ready(); }));
+        ASSERT_TRUE(init.ok()) << init.describe();
+        tp.beginTransaction();
+        tp.send(client->topic("t"), rc::Key(uint64_t{1}), kVal);
+        ASSERT_TRUE(drive([&] { return gw.addPartitions == 1 && !gw.produced.empty(); }));
+        ASSERT_TRUE(tp.transactionActive());
+        gw.holdTxnReplies = true;  // the abort reaches the gateway but is never answered
+        {
+            GatewayPump pump(gw);
+            client->close();
+            pump.stop();
+        }
+        EXPECT_EQ(client->testCloseDeadlineHits(), 1u) << "close() waited for the abort until its deadline";
+        EXPECT_EQ(gw.endTxns, 1) << "exactly one EndTxn";
+        ASSERT_EQ(gw.endTxnCommits.size(), 1u);
+        EXPECT_EQ(gw.endTxnCommits[0], 0) << "an abort";
+    }
+}

@@ -4,7 +4,9 @@
 
 #include <gtest/gtest.h>
 
+#include <exception>
 #include <memory>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <variant>
@@ -177,4 +179,74 @@ TEST(Resolution, ResetDropsTheHandle) {
     EXPECT_EQ(r.ready(), nullptr);
     EXPECT_TRUE(weak.expired());
     EXPECT_TRUE(std::holds_alternative<Res::Unstarted>(r.state()));
+}
+
+// #679: add()/find() throwing was mapped to a bare Rejected, so a std::bad_alloc from Aeron looked like a driver
+// rejection.  Rejected now carries the exception; no exception means no cause.
+namespace {
+enum class Throw { None, BadAlloc, Runtime };
+struct ThrowingRegistry {
+    Throw onAdd  = Throw::None;
+    Throw onFind = Throw::None;
+    int64_t add() {
+        if (onAdd == Throw::BadAlloc) throw std::bad_alloc();
+        if (onAdd == Throw::Runtime) throw std::runtime_error("add");
+        return 7;
+    }
+    std::shared_ptr<FakeHandle> find(int64_t regId) {
+        if (onFind == Throw::BadAlloc) throw std::bad_alloc();
+        if (onFind == Throw::Runtime) throw std::runtime_error("find");
+        return std::make_shared<FakeHandle>(FakeHandle{regId});
+    }
+};
+
+// 0 = no cause, 1 = bad_alloc, 2 = runtime_error, 3 = other
+int causeKind(const Res& r) {
+    const std::exception_ptr e = r.rejectCause();
+    if (e == nullptr) return 0;
+    try {
+        std::rethrow_exception(e);
+    } catch (const std::bad_alloc&) {
+        return 1;
+    } catch (const std::runtime_error&) {
+        return 2;
+    } catch (...) {
+        return 3;
+    }
+}
+} // namespace
+
+TEST(ResolutionRegression, AnExceptionFromTheRegistryIsRejectedWithItsCauseRegression) {
+    struct Row { Throw add, find; bool viaPoll; int kind; };
+    const Row rows[] = {
+        // start() (the first poll): add() throws
+        {Throw::BadAlloc, Throw::None, false, 1},
+        {Throw::Runtime,  Throw::None, false, 2},
+        // poll() after a successful add: find() throws
+        {Throw::None, Throw::BadAlloc, true, 1},
+        {Throw::None, Throw::Runtime,  true, 2},
+        // the normal path: no cause
+        {Throw::None, Throw::None, false, 0},
+        {Throw::None, Throw::None, true,  0},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(::testing::Message() << "add=" << int(row.add) << " find=" << int(row.find)
+                                          << " viaPoll=" << row.viaPoll);
+        ThrowingRegistry reg;
+        reg.onAdd  = row.add;
+        reg.onFind = row.find;
+        Res r{kTimeout, kBackoff};
+        const ResolveStatus first = r.poll(reg, 0);
+        if (row.viaPoll) {
+            ASSERT_EQ(first, ResolveStatus::Pending);
+            r.poll(reg, 1);
+        }
+        EXPECT_EQ(causeKind(r), row.kind);
+        const bool threw = row.kind != 0;
+        EXPECT_EQ(r.rejected(), threw);
+        if (!threw) {
+            EXPECT_EQ(r.rejectCause(), nullptr);
+            if (row.viaPoll) EXPECT_NE(r.ready(), nullptr);
+        }
+    }
 }

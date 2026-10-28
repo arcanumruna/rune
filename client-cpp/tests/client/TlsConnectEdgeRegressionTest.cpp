@@ -14,6 +14,7 @@
 #include "../support/TestCompletions.h"
 #include "../support/PlainInitPid.h"
 #include "../support/AeronTestErrors.h"
+#include "../support/InvokerGateway.h"
 #include <rune/client/Client.h>
 #include <rune/client/codec/Codec.h>
 #include <rune/client/codec/CryptoFrame.h>
@@ -36,7 +37,6 @@
 #include <optional>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -47,9 +47,14 @@ namespace rcs = rune::client::session;
 
 namespace {
 
-constexpr int  kPumpMax   = 6'000;
-constexpr auto kPumpSleep = 2ms;
+constexpr int kPumpMax = 6'000;
 std::atomic<int> g_ctr{0};
+
+// The Rig's injected clock (one Rig at a time per test; reset in the Rig constructor).  Nothing here sleeps or reads
+// wall time: simulated time passes only through Rig::pumpFor / pumpWithin.
+int64_t g_nowNs = 1'000'000'000;
+int64_t manualNow() noexcept { return g_nowNs; }
+constexpr int64_t kTickNs = 1'000'000;   // one pump step = 1 ms of simulated time
 
 std::string uniqueDir() {
     return std::filesystem::temp_directory_path().string() + "/tls_edge_" + std::to_string(static_cast<long>(::getpid())) + "_" +
@@ -105,10 +110,12 @@ struct TwoLegTlsGateway {
     std::shared_ptr<aeron::Subscription> gwSub;
     std::shared_ptr<aeron::ExclusivePublication> gwPub;
     std::unique_ptr<aeron::FragmentAssembler> gwAsm;
+    std::function<void()> idle_;   // pumps the Invoker client while the gateway waits for the ring (no sleeping)
 
     /// `idle` runs while the gateway waits for its publications: an Invoker client's embedded
     /// driver only works while its owner pumps it.
-    TwoLegTlsGateway(const std::string& aeronDir, int32_t in, int32_t eg, const std::function<void()>& idle = {}) {
+    TwoLegTlsGateway(const std::string& aeronDir, int32_t in, int32_t eg, const std::function<void()>& idle = {})
+        : idle_(idle) {
         serverPem = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.pem");
         serverKey = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.key");
         aeron::Context ctx;
@@ -117,12 +124,11 @@ struct TwoLegTlsGateway {
         gwAeron = aeron::Aeron::connect(ctx);
         const int64_t subId = gwAeron->addSubscription("aeron:ipc", in);
         const int64_t pubId = gwAeron->addExclusivePublication("aeron:ipc", eg);
-        for (const auto dl = std::chrono::steady_clock::now() + 5s; std::chrono::steady_clock::now() < dl;) {
+        for (int i = 0; i < kPumpMax * 10; ++i) {   // hard iteration cap: a failing setup ends, never hangs
             if (!gwSub) gwSub = gwAeron->findSubscription(subId);
             if (!gwPub) gwPub = gwAeron->findExclusivePublication(pubId);
             if (gwSub && gwPub) break;
             if (idle) idle();
-            std::this_thread::sleep_for(kPumpSleep);
         }
         gwAsm = std::make_unique<aeron::FragmentAssembler>(
             [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len,
@@ -164,8 +170,8 @@ struct TwoLegTlsGateway {
     }
     void sendRaw(const uint8_t* b, std::size_t n) {
         aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(b), static_cast<aeron::util::index_t>(n));
-        for (int i = 0; i < 500 && gwPub->offer(ab, 0, static_cast<aeron::util::index_t>(n)) <= 0; ++i)
-            std::this_thread::sleep_for(1ms);
+        for (int i = 0; i < 5'000 && gwPub->offer(ab, 0, static_cast<aeron::util::index_t>(n)) <= 0; ++i)
+            if (idle_) idle_();   // back-pressured: let the client drain its egress (no sleeping)
     }
     void onFrame(const uint8_t* buf, std::size_t len) {
         const auto tid = rcc::peekTemplate(buf, len);
@@ -282,10 +288,10 @@ struct TwoLegTlsGateway {
 struct Rig {
     static constexpr int32_t kInStr = 4114, kEgStr = 4115;
     std::string agentDir = uniqueDir();
-    bool invoker = false;
     std::unique_ptr<Client> client;
     std::unique_ptr<TwoLegTlsGateway> gw;
-    explicit Rig(bool invokerMode = false, bool twoLeg = true, bool login = false) : invoker(invokerMode) {
+    explicit Rig(bool twoLeg = true, bool login = false) {
+        g_nowNs = 1'000'000'000;
         ClientConfig cfg;
         if (login) { cfg.username = "ws1"; cfg.password = "correct horse battery"; }
         cfg.gatewayChannel = "aeron:ipc"; cfg.gatewayStreamId = kInStr;
@@ -295,18 +301,14 @@ struct Rig {
         cfg.offerCrypto = true; cfg.requireCrypto = true;
         cfg.tlsTrustPem = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/ca.pem");
         cfg.tlsExpectHost = "localhost";
-        if (invoker) cfg.runnerMode = RunnerMode::Invoker;
+        cfg.runnerMode = RunnerMode::Invoker;   // every test drives the client itself, on the injected clock
+        cfg.nanoClock  = &manualNow;
         TopicSpec ts; ts.name = "inventory"; ts.topicId = 1; ts.partitionCount = 1;
         cfg.topics.push_back(ts);
         client = std::make_unique<Client>(cfg);
-        if (invoker) {
-            for (int i = 0; i < 75; ++i) { (void)client->doWork(); std::this_thread::sleep_for(kPumpSleep); }
-        } else {
-            std::this_thread::sleep_for(150ms);
-        }
-        std::function<void()> idle;
-        if (invoker) idle = [this] { (void)client->doWork(); };
-        gw = std::make_unique<TwoLegTlsGateway>(agentDir + "/aeron", kInStr, kEgStr, idle);
+        // The gateway waits for the client's embedded driver to create the rings: pump the client meanwhile.
+        gw = std::make_unique<TwoLegTlsGateway>(agentDir + "/aeron", kInStr, kEgStr,
+                                                [this] { (void)client->doWork(); });
         gw->twoLeg = twoLeg;
     }
     ~Rig() {
@@ -317,15 +319,20 @@ struct Rig {
     }
     void step() {
         gw->poll(16);
-        if (invoker) (void)client->doWork();
-        std::this_thread::sleep_for(kPumpSleep);
+        (void)client->doWork();
     }
+    /// Simulated time: one step per millisecond, the clock advancing with each.
     void pumpFor(std::chrono::milliseconds d) {
-        for (const auto dl = std::chrono::steady_clock::now() + d; std::chrono::steady_clock::now() < dl;) step();
+        for (int64_t i = 0; i < d.count(); ++i) {
+            g_nowNs += kTickNs;
+            step();
+        }
     }
+    /// Returns as soon as p() holds; the step count (d / 1 ms) is the hard cap, so a failure ends, never hangs.
     template <class Pred> bool pumpWithin(std::chrono::milliseconds d, Pred p) {
-        for (const auto dl = std::chrono::steady_clock::now() + d; std::chrono::steady_clock::now() < dl;) {
+        for (int64_t i = 0; i < d.count(); ++i) {
             if (p()) return true;
+            g_nowNs += kTickNs;
             step();
         }
         return p();
@@ -433,7 +440,7 @@ TEST(TlsConnectEdgeRegression, DirectSendsWaitForTheHandshakeRegression) {
 // (the old ruling), or an unbounded reconnect storm (the failover treating the optimistic
 // Connected as success).
 TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedFailsTheSeedExplicitlyRegression) {
-    Rig r(/*invokerMode=*/true, /*twoLeg=*/false);
+    Rig r(/*twoLeg=*/false);
     r.gw->failFinalLeg = true;
     std::vector<std::string> errors;
     r.client->onError([&](const std::string& e) { errors.push_back(e); });
@@ -463,7 +470,7 @@ TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedFailsTheSeedExplicitlyRegr
 // final-leg HandshakeFailed arrives.  The pending connect must complete with HandshakeFailed once the retries are spent
 // - not hang to its timeout, and never a terminal Rejected.
 TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedWhileAuthenticatingFailsTheConnectRegression) {
-    Rig r(/*invokerMode=*/true, /*twoLeg=*/false, /*login=*/true);
+    Rig r(/*twoLeg=*/false, /*login=*/true);
     r.gw->failFinalLeg = true;
     r.gw->requireAuth  = true;
     test_support::TestCq cq(*r.client);
@@ -480,7 +487,7 @@ TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedWhileAuthenticatingFailsTh
 // Issue #481: once the app's connect has failed on unproven final legs, a session that does not reconnect forever stops:
 // Disconnected, and the gateway sees no further ConnectRequest.  RED (old): Backoff kept reconnecting in the background.
 TEST(TlsConnectEdgeRegression, ANonForeverSessionEndsDisconnectedAfterUnprovenFinalLegFailuresRegression) {
-    Rig r(/*invokerMode=*/true, /*twoLeg=*/false, /*login=*/true);
+    Rig r(/*twoLeg=*/false, /*login=*/true);
     r.gw->failFinalLeg = true;
     r.gw->requireAuth  = true;
     test_support::TestCq cq(*r.client);
@@ -501,7 +508,7 @@ TEST(TlsConnectEdgeRegression, ANonForeverSessionEndsDisconnectedAfterUnprovenFi
 // stays Connected and keeps answering; the node session is never Rejected and its
 // retries are bounded.  RED (no (sid, corr) resolution): the frame falls back to the seed.
 TEST(TlsConnectEdgeRegression, NodeSessionFinalLegHandshakeFailedRejectsOnlyThatSessionRegression) {
-    Rig r(/*invokerMode=*/true, /*twoLeg=*/false);
+    Rig r(/*twoLeg=*/false);
     r.gw->failFinalLeg = true;
     r.gw->failFinalLegFromCorr = 1'000'000'000'000LL;   // node sessions' corrId range only
     test_support::TestCq cq(*r.client);
@@ -526,4 +533,201 @@ TEST(TlsConnectEdgeRegression, NodeSessionFinalLegHandshakeFailedRejectsOnlyThat
     auto ping = cq.issue([&](Completions& q, Token t) { return r.client->ping(Bytes(4, 7), q, t); });
     EXPECT_TRUE(r.pumpWithin(2s, [&] { return ping.ready(); }));
     EXPECT_TRUE(ping.ok()) << (ping.ready() ? ping.describe() : std::string("pending"));
+}
+
+// ===========================================================================
+// #426: crypto OFFERED (not required).  A new connect episode drops the session's keys while the broker still holds
+// the old session (its lease has not expired) and may answer on it, sealed under the discarded key.  Such a frame
+// names a session id no live key opens: it is never decoded as plaintext.
+// ===========================================================================
+namespace {
+
+constexpr uint64_t kStaleBase = 1ull;
+
+struct StaleRig {
+    static constexpr int32_t kIn = 4120, kEg = 4121;
+    std::string dir = uniqueDir();
+    std::unique_ptr<Client> client;
+    std::unique_ptr<test_support::InvokerGateway> gw;
+    explicit StaleRig(bool newIdOnResume = true) {
+        g_nowNs = 1'000'000'000;
+        ClientConfig cfg;
+        cfg.gatewayChannel = "aeron:ipc"; cfg.gatewayStreamId = kIn;
+        cfg.egressChannel  = "aeron:ipc"; cfg.egressStreamId  = kEg;
+        cfg.dataDir = dir;
+        cfg.runnerMode = RunnerMode::Invoker;
+        cfg.nanoClock  = &manualNow;
+        cfg.offerCrypto = true; cfg.requireCrypto = false;
+        cfg.tlsTrustPem = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/ca.pem");
+        cfg.keepaliveIntervalNs = 20'000'000;   // a silent broker is noticed within ~0.1 s of simulated time
+        cfg.responseTimeoutNs   = 100'000'000;
+        cfg.connectTimeoutMs    = 60'000;
+        cfg.reconnectForeverAfterLive = true;
+        TopicSpec ts; ts.name = "t"; ts.topicId = 1; ts.partitionCount = 1;
+        cfg.topics.push_back(ts);
+        client = std::make_unique<Client>(cfg);
+        gw = std::make_unique<test_support::InvokerGateway>(dir + "/aeron", cfg.gatewayChannel, cfg.gatewayStreamId,
+                                                            cfg.egressChannel, cfg.egressStreamId);
+        gw->tlsCertPem = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.pem");
+        gw->tlsKeyPem  = slurpFile(std::string(RUNE_CRYPTO_TESTDATA_DIR) + "/server.key");
+        gw->uniqueSessionIds = true;   // every episode is a NEW broker session (a fresh id)
+        gw->newIdOnResume    = newIdOnResume;   // true: a resume hint still gets a NEW session id
+        gw->replyPongs       = true;
+        gw->initPidReply     = true;   // the idempotent producer's InitProducerId is answered
+    }
+    ~StaleRig() {
+        client->close();
+        gw.reset();
+        client.reset();
+        try { std::filesystem::remove_all(dir); } catch (...) {}
+    }
+    void step() { gw->pump(); (void)client->doWork(); }
+    template <class Pred> bool within(int64_t ms, Pred p) {   // simulated ms; the count is the hard cap
+        for (int64_t i = 0; i < ms; ++i) {
+            if (p()) return true;
+            g_nowNs += kTickNs;
+            step();
+        }
+        return p();
+    }
+    template <class Pred> bool until(Pred p) {   // event-driven, no simulated time
+        for (int i = 0; i < 200'000; ++i) {
+            if (p()) return true;
+            step();
+        }
+        return p();
+    }
+    void connect(test_support::TestCq& cq) {
+        ASSERT_TRUE(until([&] { return gw->ready(); }));
+        auto f = cq.issue([&](Completions& q, Token t) { return client->connect(q, t); });
+        ASSERT_TRUE(until([&] { return f.ready(); }));
+        ASSERT_TRUE(f.ok()) << f.describe();
+    }
+};
+
+}  // namespace
+
+TEST(TlsConnectEdgeRegression, AnAckSealedUnderTheDiscardedKeyIsNeverReadInClearRegression) {
+    StaleRig r;
+    test_support::TestCq cq(*r.client);
+    r.connect(cq);
+    r.gw->holdPartitions.insert(0);
+    ProducerConfig pcfg;
+    pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    pcfg.produceTimeoutMs = 600'000; pcfg.deliveryTimeoutMs = 600'000;
+    auto p = r.client->producer(pcfg);
+    const std::vector<uint8_t> val = {1, 2, 3};
+    auto rec = cq.send(p, r.client->topic("t"), Key(kStaleBase), std::span<const uint8_t>(val));
+    ASSERT_TRUE(r.within(5'000, [&] { return !r.gw->held.empty(); })) << "the record never reached the broker: produced " << r.gw->produced.size() << " pids " << r.gw->initPids
+        << " rec " << rec.ready() << " " << (rec.ready() ? rec.describe() : std::string()) << " state " << int(r.client->state());
+    const auto stale = r.gw->held.front();   // the broker's ack for it, sealed under THIS episode's key
+    const int64_t oldSid = stale.sessionId;
+    // The broker answers it on the old session right before it answers the new episode's ConnectRequest.
+    r.gw->ackBeforeNextConnect.push_back(stale);
+    const int connectsBefore = r.gw->connects;
+    // The broker goes silent (no pongs): the session times out and a new connect episode starts.
+    r.gw->replyPongs = false;
+    ASSERT_TRUE(r.within(30'000, [&] { return r.gw->connects > connectsBefore; })) << "no new connect episode";
+    r.gw->replyPongs = true;
+    ASSERT_TRUE(r.within(5'000, [&] { return r.client->state() == rcs::SessionState::Connected && r.gw->lastUniqueSessionId() != oldSid; }))
+        << "state " << static_cast<int>(r.client->state()) << " connects " << r.gw->connects << " oldSid " << oldSid
+        << " last " << r.gw->lastUniqueSessionId();
+    r.within(200, [] { return false; });
+    EXPECT_FALSE(rec.ready()) << "the stale sealed ack completed the record: " << rec.describe();
+    // The new episode: the held batch is resent on the new session and acked there.
+    ASSERT_TRUE(r.within(10'000, [&] { return r.gw->held.size() >= 2; })) << "the batch was never resent on the new session";
+    const auto resent = r.gw->held.back();
+    EXPECT_NE(resent.sessionId, oldSid) << "resent on the new session";
+    EXPECT_FALSE(rec.ready()) << rec.describe();
+    r.gw->holdPartitions.clear();
+    r.gw->ack(resent);   // the broker acks the resend, on the new session
+    ASSERT_TRUE(r.within(10'000, [&] { return rec.ready(); })) << "the record never completed after the new episode";
+    EXPECT_EQ(rec.status(), OpStatus::Ok) << rec.describe();
+    EXPECT_EQ(cq.timesCompleted(rec.token()), 1);
+}
+
+// The exemption stays: a CLEAR ErrorResponse answering the new episode's in-flight ConnectRequest (a pre-TLS
+// NotLeader / Redirect / refusal) is still dispatched even though its header names the discarded session's id.
+TEST(TlsConnectEdgeRegression, AClearConnectRefusalStillReachesTheNewEpisodeRegression) {
+    StaleRig r;
+    test_support::TestCq cq(*r.client);
+    r.connect(cq);
+    const int connectsBefore = r.gw->connects;
+    const int64_t oldSid     = r.gw->lastUniqueSessionId();
+    r.gw->replyConnects = false;   // the new episode's ConnectRequest stays unanswered
+    r.gw->replyPongs    = false;   // the session times out: a new episode starts
+    ASSERT_TRUE(r.within(30'000, [&] { return r.gw->connects > connectsBefore; })) << "no new connect episode";
+    ASSERT_FALSE(r.gw->connectCorrIds.empty());
+    const int connectsInFlight = r.gw->connects;
+    // A clear NotLeader (no endpoint) naming the old session id and the in-flight connect's correlation id.
+    uint8_t out[128];
+    const std::size_t n = rcc::encodeErrorResponse(out, sizeof out,
+                                                   static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader),
+                                                   {}, oldSid, r.gw->connectCorrIds.back());
+    ASSERT_GT(n, 0u);
+    ASSERT_TRUE(r.gw->sendInClear(0, std::vector<uint8_t>(out, out + n)));
+    // The machine acts on it at once (it resends the ConnectRequest), long before the 60 s connect timeout.
+    EXPECT_TRUE(r.within(50, [&] { return r.gw->connects > connectsInFlight; }))
+        << "the clear refusal answering the in-flight connect never reached the session machine";
+}
+
+// A plaintext episode after an encrypted one: the broker answers the new episode in clear and RESUMES the same session id
+// (no TLS offered back).  The retired marker is cleared at that Connected edge, so the clear ack naming the id is read.
+TEST(TlsConnectEdgeRegression, APlaintextEpisodeAfterAnEncryptedOneReadsClearFramesRegression) {
+    StaleRig r(/*newIdOnResume=*/false);
+    test_support::TestCq cq(*r.client);
+    r.connect(cq);
+    r.gw->holdPartitions.insert(0);
+    ProducerConfig pcfg;
+    pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    pcfg.produceTimeoutMs = 600'000; pcfg.deliveryTimeoutMs = 600'000;
+    auto p = r.client->producer(pcfg);
+    const std::vector<uint8_t> val = {1, 2, 3};
+    auto rec = cq.send(p, r.client->topic("t"), Key(kStaleBase), std::span<const uint8_t>(val));
+    ASSERT_TRUE(r.within(5'000, [&] { return !r.gw->held.empty(); }));
+    const int64_t sid = r.gw->held.front().sessionId;
+    const int connectsBefore = r.gw->connects;
+    r.gw->tlsCertPem.clear();   // the next episode is answered in clear (no TLS flight, no keys)
+    r.gw->replyPongs = false;
+    ASSERT_TRUE(r.within(30'000, [&] { return r.gw->connects > connectsBefore; })) << "no new connect episode";
+    r.gw->replyPongs = true;
+    ASSERT_TRUE(r.within(5'000, [&] { return r.client->state() == rcs::SessionState::Connected; }));
+    ASSERT_TRUE(r.within(10'000, [&] { return r.gw->held.size() >= 2; })) << "the batch was never resent";
+    const auto resent = r.gw->held.back();
+    EXPECT_EQ(resent.sessionId, sid) << "the same session id was resumed in clear";
+    EXPECT_FALSE(rec.ready()) << rec.describe();
+    r.gw->holdPartitions.clear();
+    r.gw->ack(resent);   // a clear ack naming the id the client once held sealed
+    ASSERT_TRUE(r.within(10'000, [&] { return rec.ready(); })) << "a clear frame of a plaintext episode was dropped";
+    EXPECT_EQ(rec.status(), OpStatus::Ok) << rec.describe();
+}
+
+// #426 review — FAILING (not committed).  Encrypted episode A, then a PLAINTEXT episode with a NEW id: the retired
+// marker is cleared unconditionally at that Connected edge, so the broker's late ack for A (sealed under A's key,
+// naming A's id, which no plaintext session holds) is read in clear.  Only a plaintext resume of the SAME id may clear it.
+TEST(TlsConnectEdgeRegression, APlaintextEpisodeWithANewIdNeverReadsTheOldSealedAckAdversarialRegression) {
+    StaleRig r(/*newIdOnResume=*/true);
+    test_support::TestCq cq(*r.client);
+    r.connect(cq);
+    r.gw->holdPartitions.insert(0);
+    ProducerConfig pcfg;
+    pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    pcfg.produceTimeoutMs = 600'000; pcfg.deliveryTimeoutMs = 600'000;
+    auto p = r.client->producer(pcfg);
+    const std::vector<uint8_t> val = {1, 2, 3};
+    auto rec = cq.send(p, r.client->topic("t"), Key(kStaleBase), std::span<const uint8_t>(val));
+    ASSERT_TRUE(r.within(5'000, [&] { return !r.gw->held.empty(); }));
+    const auto staleA = r.gw->held.front();
+    const int64_t sidA = staleA.sessionId;
+    const int connectsBefore = r.gw->connects;
+    r.gw->tlsCertPem.clear();   // the next episode is plaintext
+    // A's ack (sealed under A's key) arrives right AFTER the plaintext ConnectResponse, before the batch is resent.
+    r.gw->ackAfterNextConnect.push_back(staleA);
+    r.gw->replyPongs = false;
+    ASSERT_TRUE(r.within(30'000, [&] { return r.gw->connects > connectsBefore; })) << "no new connect episode";
+    r.gw->replyPongs = true;
+    ASSERT_TRUE(r.within(5'000, [&] { return r.client->state() == rcs::SessionState::Connected &&
+                                             r.gw->lastUniqueSessionId() != sidA; }));
+    r.within(200, [] { return false; });
+    EXPECT_FALSE(rec.ready()) << "an ack sealed under episode A's key was read in clear: " << rec.describe();
 }

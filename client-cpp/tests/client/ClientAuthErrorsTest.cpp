@@ -839,6 +839,72 @@ TEST(ClientSecretAdversarialRegression, AnAllocationFailureAtEveryConstructionSt
     }
 }
 
+namespace {
+int64_t g_sweepNow = 1'000'000'000;
+int64_t sweepNow() noexcept { return g_sweepNow; }
+rc::ClientConfig sweepCfg(int n) {
+    rc::ClientConfig c;
+    c.gatewayChannel  = "aeron:ipc";
+    c.gatewayStreamId = 4260;
+    c.egressChannel   = "aeron:ipc";
+    c.egressStreamId  = 4261;
+    c.dataDir   = "/dev/shm/ctor_oom_" + std::to_string(::getpid()) + "_" + std::to_string(n);
+    c.runnerMode = rc::RunnerMode::Invoker;
+    c.nanoClock  = &sweepNow;
+    rc::TopicSpec ts;
+    ts.name           = "t";
+    ts.topicId        = 1;
+    ts.partitionCount = 1;
+    c.topics.push_back(ts);
+    return c;
+}
+constexpr int kExitBadAlloc = 10, kExitOther = 11, kExitNoThrow = 12;
+} // namespace
+
+// #679: the n-th allocation fails during FULL Client construction (the embedded driver and the Aeron client
+// included), for every n.  Each n runs in a forked child (an unsafe state cannot take the suite down): it must
+// throw std::bad_alloc - no crash, no other exception, no silent success.
+TEST(ClientConstructionAllocationFailureRegression, EveryStepThrowsBadAllocRegression) {
+    long steps = 0;
+    {
+        const rc::ClientConfig c = sweepCfg(0);
+        alloc_counter::startThisThread();
+        { rc::Client client{c}; }
+        steps = alloc_counter::stopThisThread();
+        std::error_code ec;
+        std::filesystem::remove_all(c.dataDir, ec);
+    }
+    ASSERT_GT(steps, 50) << "vacuity guard: a full construction (transport start included) allocates this much";
+    for (long n = 1; n <= steps; ++n) {
+        const pid_t pid = ::fork();
+        ASSERT_GE(pid, 0);
+        if (pid == 0) {
+            ::alarm(120);  // a hang is a signal, not a stuck suite
+            const rc::ClientConfig c = sweepCfg(static_cast<int>(n));
+            int code = kExitNoThrow;
+            alloc_counter::failNthAllocationThisThread(n);
+            try {
+                rc::Client client{c};
+            } catch (const std::bad_alloc&) {
+                code = kExitBadAlloc;
+            } catch (...) {
+                code = kExitOther;
+            }
+            alloc_counter::failNthAllocationThisThread(0);
+            std::error_code ec;
+            std::filesystem::remove_all(c.dataDir, ec);
+            ::_exit(code);
+        }
+        int st = 0;
+        ASSERT_EQ(::waitpid(pid, &st, 0), pid);
+        ASSERT_FALSE(WIFSIGNALED(st)) << "allocation " << n << ": the child died on signal " << WTERMSIG(st);
+        ASSERT_TRUE(WIFEXITED(st));
+        EXPECT_EQ(WEXITSTATUS(st), kExitBadAlloc)
+            << "allocation " << n << " of " << steps << ": expected bad_alloc (10); got " << WEXITSTATUS(st)
+            << " (11 = another exception, 12 = no throw)";
+    }
+}
+
 TEST(ClientSecretAdversarialRegression, ASelfSetPasswordLifecycleLeavesNoFreedCopyOfTheNewPasswordAdversarialRegression) {
     // Test-owned copies (the parsed statement, the plan) outlive both windows.
     const std::string stmt = std::string("alter user ws1 set password '") + kNewNeedle + "';";

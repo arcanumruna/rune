@@ -117,6 +117,7 @@ struct InvokerGateway {
     // Acks sent immediately BEFORE the next ConnectResponse, from the same
     // publication, so the client receives [ack..., ConnectResponse] in one poll.
     std::vector<Produced> ackBeforeNextConnect;
+    std::vector<Produced> ackAfterNextConnect;   // #426 review: acked right after the next ConnectResponse
     // F8a fix4: Records pushed immediately AFTER the next ConnectResponse, from
     // the same publication, so the client receives [ConnectResponse, Records...]
     // in one poll.  Element: (subscription, baseOffset).
@@ -1678,6 +1679,8 @@ private:
             }
             for (const auto& [sub, base] : recordsAfterNextConnect) pushRecords(sub, base, 1);
             recordsAfterNextConnect.clear();
+            for (const Produced& pr : ackAfterNextConnect) ack(pr);
+            ackAfterNextConnect.clear();
             return;
         }
         case rcc::TemplateId::HandshakeContinue: {

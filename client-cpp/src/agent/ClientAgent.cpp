@@ -812,6 +812,9 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     // authenticates, this is a genuine tamper/replay (or an unresolvable
     // collision) — drop rather than risk falling through to plaintext
     // dispatch on an encrypted session's frame.
+    // Retired-episode rule (#426): a session id whose keys were discarded is remembered by its machine
+    // (namesRetiredSealedSession); a frame naming it that no live key opens is dropped, except a clear ErrorResponse
+    // answering the new episode's in-flight ConnectRequest.
     if (len >= rune::protocol::client::MessageHeader::ENCODED_SIZE) {
         const auto peekedTid = static_cast<codec::TemplateId>(
             rune::protocol::client::detail::getLE16(buf, 2));
@@ -819,10 +822,12 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             peekedTid != codec::TemplateId::HandshakeContinueResponse) {
             const int64_t sid = rune::protocol::client::detail::getLE64(buf, 8);
             bool sawEncryptedCandidate = false;
+            bool sawRetiredCandidate   = false;
             bool decrypted             = false;
             if (sid != 0) {
                 for (auto& sp : sessions_) {
                     Session& cand = *sp;
+                    if (cand.machine.namesRetiredSealedSession(sid)) sawRetiredCandidate = true;
                     if (cand.machine.sessionId() != sid || !cand.machine.cryptoState().encrypted) continue;
                     sawEncryptedCandidate = true;
                     // Plaintext is always kCryptoOverhead (28) bytes SHORTER than
@@ -853,6 +858,14 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             }
             if (!decrypted && sawEncryptedCandidate) {
                 return;  // every encrypted candidate failed auth — drop
+            }
+            // #426: a frame naming a session whose keys were discarded (a new connect episode began while the broker
+            // still held the old session and sealed its answer under the old key) is old-episode ciphertext: no live
+            // key opens it and it is never decoded as plaintext.  The only clear frame still dispatched is an
+            // ErrorResponse answering the new episode's in-flight ConnectRequest.
+            if (!decrypted && sawRetiredCandidate &&
+                !(peekedTid == codec::TemplateId::ErrorResponse && answersAnInFlightConnect_(buf))) {
+                return;
             }
             // PR #476 review (issues #14 / #115): with crypto REQUIRED nothing in clear is ever acted on - whatever
             // session id its header names (0, one nobody holds, a pre-key session's) - except the connect leg itself:

@@ -1026,6 +1026,7 @@ public:
     /// ring's consumer-finished word (any thread); Direct — owner state.
     [[nodiscard]] bool clientClosed() const noexcept;
     [[nodiscard]] bool lifeOpen() const noexcept { return std::holds_alternative<LifeOpen>(life_); }
+    [[nodiscard]] bool endingTxn() const noexcept { return std::holds_alternative<LifeEndingTxn>(life_); }
     [[nodiscard]] bool draining() const noexcept { return std::holds_alternative<LifeDraining>(life_); }
     [[nodiscard]] bool discarding() const noexcept { return std::holds_alternative<LifeDiscarding>(life_); }
 
@@ -2116,7 +2117,7 @@ private:
     // Phase 2b F Task 5: close() of a transactional producer with a transaction open (or an op running) ends it
     // first - its own EndTxn(abort), or the running commit / abort / init - then drains as LifeDraining.
     std::variant<LifeOpen, LifeDraining, LifeClosed, LifeDiscarding, LifeEndingTxn> life_{};
-    [[nodiscard]] bool endingTxn_() const noexcept { return std::holds_alternative<LifeEndingTxn>(life_); }
+    [[nodiscard]] bool endingTxn_() const noexcept { return endingTxn(); }
     // Duty side: the intake is closed and the duty side knows it (Draining /
     // Closed / Discarding) — every pass flushes at once (no linger: nothing
     // more can join a batch).

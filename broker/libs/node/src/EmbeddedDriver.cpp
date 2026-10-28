@@ -124,15 +124,21 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     : cfg_(std::move(cfg)), mode_(mode)
 {
     resolveTransport(cfg_);
-    // Judge the live driver's heartbeat BEFORE aeron_driver_context_init: that zero-fills three 128 MB command
-    // queues (over a second under TSan), long enough for an unpumped live driver's heartbeat to look stale.
-    if (aeron_is_driver_active(cfg_.dir.c_str(), /*timeout_ms=*/1000, +[](const char*) {})) {
-        releaseGso_();
-        throw std::runtime_error(
-            "EmbeddedDriver: aeron dir '" + cfg_.dir + "' is already in use by an ACTIVE media "
-            "driver (a prior broker instance may still be running, or was killed without clean "
-            "shutdown). Use a distinct RUNE_AERON_DIR/RUNE_DATA_DIR, or ensure the previous "
-            "instance exited.");
+    // The dir is owned through an exclusive flock on a lock file next to it (DriverDirLock.h), not judged from
+    // Aeron's 1 s heartbeat: a live holder is refused whatever its heartbeat age, and a holder killed without a
+    // clean shutdown releases the lock with its process.  Taken BEFORE aeron_driver_context_init, which can take
+    // over a second to zero-fill the command queues.
+    {
+        std::string lockErr;
+        dirLock_ = DriverDirLock::tryAcquire(cfg_.dir, lockErr);
+        if (!dirLock_) {
+            releaseGso_();
+            throw std::runtime_error(
+                "EmbeddedDriver: aeron dir '" + cfg_.dir + "' is already in use by a live media "
+                "driver (a prior broker instance may still be running) or its lock cannot be taken: " +
+                lockErr + ". Use a distinct RUNE_AERON_DIR/RUNE_DATA_DIR, or ensure the previous "
+                "instance exited.");
+        }
     }
     if (aeron_driver_context_init(&ctx_) < 0)
         throw std::runtime_error(std::string("EmbeddedDriver: aeron_driver_context_init failed: ") +
@@ -381,6 +387,7 @@ void EmbeddedDriver::close() noexcept {
         ctx_ = nullptr;
     }
     releaseGso_();
+    dirLock_.reset();   // last: the dir is only free once the driver and its context are closed
 }
 
 void EmbeddedDriver::releaseGso_() noexcept {

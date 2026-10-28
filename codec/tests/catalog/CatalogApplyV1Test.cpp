@@ -976,3 +976,35 @@ TEST(CatalogApplyAdversarial, RandomDdlHistoriesKeepEverySinkMirroringItsFirstSo
     EXPECT_GT(refusedMismatches, 300) << "not vacuous: many mismatched sinks were attempted";
     EXPECT_GT(appliedViews, 300) << "not vacuous: many view events applied";
 }
+
+// #667 adversarial review (boot recovery): a CreateTopic event written BEFORE the zero-width FixedStr refusal holds a
+// width-0 FixedStr in its descriptor; every broker accepted it then.  Replaying that historical event on boot (or on a
+// lagging follower) must apply as before: the refusal belongs to DDL admission, never to replay of the log.  Today the
+// apply rejects it (BadOps "does not deserialize"), so an upgraded broker boots with its catalog HALTED and refuses
+// every later DDL, and a mixed-version cluster diverges at that offset.
+TEST(CatalogApplyV1Regression, AHistoricalZeroWidthFixedStrReplaysOnBootAdversarialRegression) {
+    // {id int64 key, code string(1)} with the FixedStr's width patched to 0, as a pre-fix broker serialized it.
+    cd::DescriptorBuilder b("players");
+    b.add("id", cd::PrimType::Int64, /*sinceVersion=*/1, /*isKey=*/true);
+    b.addFixedStr("code", 1);
+    std::vector<uint8_t> blob = cd::serialize(b.build());
+    ASSERT_EQ(blob[blob.size() - 4], 1u);   // RCD2: ... fixedLen (u16 LE), untilVersion (u16 LE)
+    blob[blob.size() - 4] = 0;
+    rc::CreateTopicOps o; o.topicId = 0; o.partitions = 2; o.replicationFactor = 3;
+    o.schema = rc::SchemaDef{.keyField = "id", .validate = true, .descriptorBlob = blob, .nextTag = 2};
+    rc::CatalogEvent e{.formatVer = rc::kFormatV1};
+    e.kind = rc::kindOf(o); e.ops = o; e.objectName = "players"; e.objectId = 1; e.prevVersion = 0; e.newVersion = 1;
+    // The fingerprint the pre-fix leader stamped: the staged object's (a topic hashes its raw evolving blob).
+    rc::TopicObject t{.objectId = 1, .name = "players", .version = 1, .topicId = 0, .partitions = 2,
+                      .replicationFactor = 3, .persistence = o.persistence, .config = o.config, .schema = std::nullopt,
+                      .nsId = e.nsId};
+    t.schema = rc::SchemaState{.keyField = "id", .validate = true, .evolvingBlob = blob, .schemaVersion = 1,
+                               .nextTag = 2, .compat = cd::CompatMode::Backward};
+    e.fingerprint = rc::fingerprintOf(t);
+    rc::CatalogState s;
+    auto a = rc::apply(s, e, 0);
+    ASSERT_TRUE(a.has_value()) << rc::applyErrorName(a.error().code) << ": " << a.error().detail;
+    const rc::TopicObject* got = s.topicByName(rune::catalog::kDefaultNsId, "players");
+    ASSERT_NE(got, nullptr);
+    EXPECT_EQ(got->schema->evolvingBlob, blob);
+}

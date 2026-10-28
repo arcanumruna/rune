@@ -51,3 +51,30 @@ TEST(FixedStrSerialize, Rcd2RoundTripPreservesTagAndUntilForFixedStr) {
     EXPECT_EQ(f->fixedLen, 8u);
     EXPECT_EQ(f->untilVersion, 4u);
 }
+
+// #667: a FixedStr of width 0 has no storage; refused when the column is defined.
+TEST(DescriptorBuilderRegression, FixedStrOfWidthZeroIsRefusedRegression) {
+    EXPECT_THROW(DescriptorBuilder("t", 1).addFixedStr("code", 0), std::invalid_argument);
+    EXPECT_THROW(DescriptorBuilder("t", 1).addFixedStrTagged("code", 3, 0, 1, 0xFFFF, false), std::invalid_argument);
+    EXPECT_NO_THROW(mk(1));
+    EXPECT_NO_THROW(mk(65535));
+    EXPECT_EQ(mk(1).find("code")->fixedLen, 1u);
+    EXPECT_EQ(mk(65535).find("code")->fixedLen, 65535u);
+}
+
+// The decoder reports a zero-width FixedStr like every other malformed field (std::runtime_error), never the
+// builder's invalid_argument.  The FixedStr is the LAST field, so its fixedLen (u16 LE) sits just before the
+// trailing untilVersion (u16 LE) of the RCD2 blob.
+TEST(DescriptorBuilderRegression, DecodingAHistoricalZeroWidthFixedStrSucceedsRegression) {
+    std::vector<uint8_t> blob = serialize(mk(8));
+    ASSERT_GE(blob.size(), 4u);
+    ASSERT_EQ(blob[blob.size() - 4], 8u);
+    ASSERT_EQ(blob[blob.size() - 3], 0u);
+    blob[blob.size() - 4] = 0;
+    Descriptor d;
+    ASSERT_NO_THROW(d = deserialize(blob));   // legal when written (#667): replay must accept it
+    const FieldDescriptor* zf = zeroWidthFixedStr(d);
+    ASSERT_NE(zf, nullptr);
+    EXPECT_EQ(zf->fixedLen, 0u);
+    EXPECT_EQ(zeroWidthFixedStr(deserialize(serialize(mk(8)))), nullptr);
+}

@@ -32,6 +32,7 @@ extern "C" {
 
 #include <rune/client/detail/FlatIndexMap.h>
 #include <rune/client/detail/OneToOneRingBuffer.h>
+#include <rune/client/transport/DriverDirLock.h>
 #include <rune/client/transport/FrameCrc.h>
 #include <rune/client/transport/Resolution.h>
 #include <rune/client/transport/TransportConfig.h>
@@ -42,6 +43,7 @@ extern "C" {
 #include <exception>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -109,7 +111,9 @@ public:
 
     /// True once the Aeron client closed itself (inter-service timeout, driver
     /// timeout).  Offers then fail; the owner decides whether to rebuild.
-    [[nodiscard]] bool closed() const noexcept { return aeron_ && aeron_->isClosed(); }
+    [[nodiscard]] bool closed() const noexcept {
+        return conductorFault_ != nullptr || (aeron_ && aeron_->isClosed());
+    }
 
     /// The default ingress publication's current channel (changes on retarget()).
     /// Owner thread only.
@@ -398,6 +402,7 @@ private:
     TransportConfig cfg_;
 
     // ---- Embedded driver (C API) --------------------------------------------
+    std::optional<DriverDirLock> dirLock_;   // held from startEmbeddedDriver to the end of stopEmbeddedDriver
     aeron_driver_context_t* driverCtx_     = nullptr;
     aeron_driver_t*         driver_        = nullptr;
     rune_gso_bindings_t*    gso_           = nullptr;   // owned; outlives driverCtx_ (Aeron points at it)
@@ -422,6 +427,9 @@ private:
     std::unique_ptr<detail::OneToOneRingBuffer> driverCtl_;
     // The one thread allowed to pump (see bindPumpThread()).  Debug-checked.
     std::thread::id         pumpOwner_{};
+    /// Set (once, by the duty/pump thread) when the Aeron client conductor threw: a conductor that has thrown
+    /// is half-updated and is never invoked again; closed() reports it.
+    std::exception_ptr      conductorFault_{};
 
     void startEmbeddedDriver();
     void stopEmbeddedDriver() noexcept;

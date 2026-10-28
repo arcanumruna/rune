@@ -253,8 +253,9 @@ Descriptor deserialize(std::span<const uint8_t> blob) {
         }
 
         if (type == PrimType::FixedStr) {
-            builder.addFixedStrTagged(std::move(fieldName), tag, fixedLen,
-                                      sinceVersion, untilVersion, isKeyByte != 0);
+            // Width 0 decodes: historical events hold it (#667); only DDL admission refuses it.
+            builder.addDecodedFixedStrTagged(std::move(fieldName), tag, fixedLen,
+                                             sinceVersion, untilVersion, isKeyByte != 0);
         } else {
             builder.addTagged(std::move(fieldName), tag, type, sinceVersion,
                                untilVersion, isKeyByte != 0, std::move(enumValues));

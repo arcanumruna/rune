@@ -2484,3 +2484,86 @@ TEST(NsConnectionLimitRegression, AnonymousOpsBucketRegression) {
     }
     EXPECT_EQ(served, 4) << "the burst is capped at one second of ops";
 }
+
+// ── Issue #665: version skew at the unauthenticated-session cap ────────────────────────────────────────────────────────
+// The cap refusal (AuthUnavailable, 48) is not version-gated, and a client below kClientVersionAuth is refused for its
+// version (ProtocolVersion) before the cap is looked at.  Either way every client version gets exactly ONE answer, a
+// ConnectResponse its own decoder reads, and the broker keeps no state for it.
+namespace {
+struct SkewAnswer { std::size_t frames = 0; std::size_t responses = 0; std::optional<pc::ConnectResponse> resp; };
+SkewAnswer connectAsVersion(Rig& rig, int32_t version, const std::string& host, int64_t now, int64_t* corrOut) {
+    pc::ConnectRequest req;
+    req.correlationId = ++rig.corr; req.egressStreamId = 9; req.clientVersion = version;
+    const std::string channel = "aeron:udp?endpoint=" + host + ":40123";   // egressChannel is a view: keep it alive
+    req.egressChannel = channel;
+    if (corrOut) *corrOut = req.correlationId;
+    std::vector<uint8_t> f(1024);
+    f.resize(req.encode(f.data()));
+    rig.gw.setNowNsForTest(now);
+    rig.send(f);
+    rig.gw.pollPendingConnectsForTest(now);
+    SkewAnswer a;
+    for (const auto& fr : rig.seen) {
+        if (fr.corr != req.correlationId) continue;
+        ++a.frames;
+        if (fr.tid == static_cast<uint16_t>(pc::TemplateId::ConnectResponse)) {
+            ++a.responses;
+            a.resp = pc::ConnectResponse::decode(fr.bytes.data(), fr.bytes.size());
+        }
+    }
+    return a;
+}
+std::size_t framesFor(const Rig& rig, int64_t corr) {
+    std::size_t n = 0;
+    for (const auto& fr : rig.seen) n += (fr.corr == corr);
+    return n;
+}
+}  // namespace
+
+TEST(AuthLoginGatewayRegression, UnauthCapRefusalIsReadableByEveryAcceptedClientVersionRegression) {
+    static_assert(pc::kClientVersionAuth > pc::kClientVersionCrypto, "the table below spans the version gate");
+    const int32_t versions[] = {pc::kClientVersionUnknownProducerId, pc::kClientVersionCrypto - 1,
+                                pc::kClientVersionCrypto,            pc::kClientVersionAuth /* the oldest accepted */,
+                                pc::kClientVersionTxnOffsetFence,    pc::kClientVersion};
+    for (const int32_t v : versions) {
+        SCOPED_TRACE("clientVersion=" + std::to_string(v));
+        const bool accepted = pc::clientUnderstandsAuth(v);
+        // Below the gate the version refusal wins and the cap is never consulted; at and above it the cap answers.
+        const int16_t expectCode = accepted ? kConnectCapRefused : static_cast<int16_t>(pc::ErrorCode::ProtocolVersion);
+        Rig rig;
+        rig.gw.setMaxUnauthenticatedSessionsPerHost(2);
+        const auto a = connectFrom(rig, "10.0.0.91");
+        const auto b = connectFrom(rig, "10.0.0.91");
+        ASSERT_EQ(a.code, 0);
+        ASSERT_EQ(b.code, 0);
+        const std::size_t sessions = rig.gw.sessionCount();
+        const uint64_t refusedBefore = rig.gw.connectsRefusedUnauthenticatedCap();
+
+        int64_t corr = 0;
+        const SkewAnswer ans = connectAsVersion(rig, v, "10.0.0.91", 0, &corr);
+        EXPECT_EQ(ans.frames, 1u) << "exactly one answer frame for its correlationId";
+        EXPECT_EQ(ans.responses, 1u);
+        ASSERT_TRUE(ans.resp.has_value()) << "the refusal decodes with the ConnectResponse decoder every client uses";
+        EXPECT_EQ(ans.resp->code, expectCode);
+        EXPECT_EQ(ans.resp->sessionId, 0);
+        EXPECT_EQ(rig.gw.sessionCount(), sessions) << "no session is created for the refused Connect";
+        EXPECT_EQ(rig.gw.pendingConnectCount(), 0u);
+        EXPECT_EQ(rig.gw.connectsRefusedUnauthenticatedCap(), refusedBefore + (accepted ? 1u : 0u));
+        if (accepted) EXPECT_EQ(ans.resp->code, 48);
+
+        // Past the auth deadline nothing more is ever sent to the refused Connect (the fillers are reaped, it is not).
+        rig.gw.setNowNsForTest(1'000'000'001);
+        rig.gw.reapExpiredForTest(1'000'000'001);
+        rig.gw.pollPendingConnectsForTest(1'000'000'001);
+        EXPECT_EQ(framesFor(rig, corr), 1u) << "no further frame for the refused Connect";
+        EXPECT_FALSE(rig.gw.hasSessionForTest(a.sid)) << "the capped holders were reaped";
+
+        // A freed slot: the same version's next Connect is accepted (a pre-gate version stays refused for its version).
+        int64_t corr2 = 0;
+        const SkewAnswer retry = connectAsVersion(rig, v, "10.0.0.91", 1'000'000'002, &corr2);
+        ASSERT_TRUE(retry.resp.has_value());
+        EXPECT_EQ(retry.frames, 1u);
+        EXPECT_EQ(retry.resp->code, accepted ? int16_t{0} : expectCode);
+        if (accepted) EXPECT_TRUE(rig.gw.hasSessionForTest(retry.resp->sessionId));
+    }
+}

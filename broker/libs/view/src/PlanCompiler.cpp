@@ -346,7 +346,12 @@ std::expected<CompileResult, CompileError> compileView(
         const bool isKeyField      = (origIdx == keyOutIdx);
 
         if (af.type == rune::codec::PrimType::FixedStr) {
-            builder.addFixedStr(af.name, rof.fixedLen, /*sinceVersion*/ 1, isKeyField);
+            try {
+                builder.addFixedStr(af.name, rof.fixedLen, /*sinceVersion*/ 1, isKeyField);
+            } catch (const std::exception& e) {   // zero-width FixedStr (#667): a DDL refusal, never a throw
+                return std::unexpected(CompileError{
+                    "view '" + authored.viewName + "': failed to build output schema: " + e.what()});
+            }
         } else {
             builder.add(af.name, af.type, /*sinceVersion*/ 1, isKeyField);
         }
