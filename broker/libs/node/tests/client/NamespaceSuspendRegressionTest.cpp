@@ -28,8 +28,8 @@ constexpr const char* kAdminPw = "namespace-admin-password-1";
 constexpr const char* kUserPw = "namespace-user-password-12";
 constexpr uint16_t kSuspended = static_cast<uint16_t>(pc::ErrorCode::NamespaceSuspended);
 
-std::unique_ptr<rc::Client> newClient(AuthBroker& b, const std::string& user, const std::string& password,
-                                      int32_t announceVersion = 0) {
+rc::ClientConfig newClientCfg(AuthBroker& b, const std::string& user, const std::string& password,
+                              int32_t announceVersion = 0) {
     rc::ClientConfig c;
     c.gatewayChannel  = b.channel();
     c.gatewayStreamId = 1;
@@ -41,7 +41,11 @@ std::unique_ptr<rc::Client> newClient(AuthBroker& b, const std::string& user, co
     c.offerCrypto     = true;
     c.tlsTrustPem     = AuthBroker::tlsCaPem();
     c.testAnnounceClientVersion = announceVersion;
-    return std::make_unique<rc::Client>(c);
+    return c;
+}
+std::unique_ptr<rc::Client> newClient(AuthBroker& b, const std::string& user, const std::string& password,
+                                      int32_t announceVersion = 0) {
+    return std::make_unique<rc::Client>(newClientCfg(b, user, password, announceVersion));
 }
 std::unique_ptr<rc::Client> connected(AuthBroker& b, const std::string& user, const std::string& password,
                                       int32_t announceVersion = 0) {
@@ -173,6 +177,47 @@ TEST(NamespaceSuspendRegression, RejectAllClosesSessionsRegression) {
     EXPECT_TRUE(sessionEnded(*a1));
     EXPECT_TRUE(sessionEnded(*a2));
     EXPECT_EQ(produceOne(*ub, f.tB, 1).status, rc::OpStatus::Ok);
+}
+
+// e2e step 12: a producer that is open (records in flight, acks=all) when RejectAll ends its session.  Every record
+// completes, and close() returns promptly instead of waiting out a drain that can never be answered.
+TEST(NamespaceSuspendRegression, RejectAllOpenProducerThenCloseReturnsPromptlyRegression) {
+    Fix f("nssusp_close");
+    std::unique_ptr<rc::Client> a1;
+    {
+        // As the e2e's world-server client: the low-latency idle mode.
+        auto c = newClientCfg(f.b, "a/ua", kUserPw);
+        c.idleMode = rc::IdleMode::LowLatency;
+        a1 = std::make_unique<rc::Client>(c);
+    }
+    a1->connectAndWait(20s);
+    rc::ProducerConfig pcfg;
+    pcfg.acks             = rc::Acks::All;
+    pcfg.lingerUs         = 1;
+    pcfg.batchBytes       = 1;
+    pcfg.maxInFlight      = 16;
+    pcfg.produceTimeoutMs = 20000;
+    {
+        auto p = a1->producer(pcfg);
+        rc::Completions cq(*a1);
+        const uint8_t v[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+        auto one = [&](uint64_t k) {
+            rc::Completion out;
+            out.status = rc::OpStatus::Timeout;
+            if (p.trySend(f.tA, rc::Key(k), std::span<const uint8_t>(v, 8), cq, k) != rc::SendResult::Ok) return out;
+            p.flush();
+            (void)cq.waitFor(k, 20s, [&](const rc::Completion& d, std::span<const uint8_t>) { out = d; });
+            return out;
+        };
+        ASSERT_EQ(one(1).status, rc::OpStatus::Ok);
+        ASSERT_TRUE(f.admin->suspendNamespace("a", pc::NsSuspendMode::RejectAll).has_value());
+        const auto t0 = std::chrono::steady_clock::now();
+        for (uint64_t k = 2; k < 60; ++k) (void)one(k);
+        EXPECT_LT(std::chrono::steady_clock::now() - t0, 30s) << "every record after the session end completes";
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    a1->close();
+    EXPECT_LT(std::chrono::steady_clock::now() - t1, 10s) << "close() after a RejectAll session end returns promptly";
 }
 
 // RejectAll ends each session with a code its client knows as "the session ended": NamespaceSuspended (51) for a v14+

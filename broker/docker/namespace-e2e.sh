@@ -406,7 +406,15 @@ live_pid=$!
 wait_until 60 "alice's live producer running" grep -q 'WS: READY' "${WORK_DIR}/live.out" || fail "step 12: the live producer never became ready"
 ns_as admin /work/admin.pw suspend a --reject-all --broker "rune-1:${BROKER_PORT}" || fail "step 12: suspend --reject-all failed"
 live_ended() { [ -s "${WORK_DIR}/live.rc" ]; }
-wait_until 90 "alice's live session to be closed" live_ended || { kill "${live_pid}" 2>/dev/null || true; fail "step 12: the live session of a was not closed by RejectAll"; }
+wait_until 90 "alice's live session to be closed" live_ended || {
+    # Which phase hangs: the client's own lines (DONE = the produce loop ended, CLOSED = close() returned) and its threads.
+    echo "--- live.out:" >&2; cat "${WORK_DIR}/live.out" >&2 || true
+    echo "--- live.err (tail):" >&2; tail -20 "${WORK_DIR}/live.err" >&2 || true
+    echo "--- client threads:" >&2
+    docker exec "${TOOLS}" sh -c 'for p in $(pgrep -f rune_produce_subscribe); do for t in /proc/$p/task/*; do echo "$t $(cat $t/comm) $(cat $t/wchan) $(cut -d" " -f3 $t/stat)"; done; done' >&2 || true
+    kill "${live_pid}" 2>/dev/null || true
+    fail "step 12: the live session of a was not closed by RejectAll"
+}
 [ "$(cat "${WORK_DIR}/live.rc")" != "0" ] || fail "step 12: the live producer ended cleanly; RejectAll must end its session with an error"
 wait "${live_pid}" 2>/dev/null || true
 expect_refusal "step 12: alice's login (right password) to a RejectAll namespace" "NamespaceSuspended" \

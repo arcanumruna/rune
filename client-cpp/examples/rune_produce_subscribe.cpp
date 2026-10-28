@@ -471,6 +471,8 @@ int runWorldServer(ClientConfig& cfg, const std::string& role, int timeoutMs) {
         std::cout << "CLIENT: DONE rc=" << rc << "\n";
         std::cout.flush();
         c.close();
+        std::cout << "CLIENT: CLOSED\n";   // the e2e tells a close() that never returns from a process that never exits
+        std::cout.flush();
     } catch (const std::exception& ex) {
         // A login failure surfaces here with its code name ("connect(): broker error code 44 (AuthenticationFailed)").
         std::cout << "WS: FAIL " << ex.what() << "\n";
