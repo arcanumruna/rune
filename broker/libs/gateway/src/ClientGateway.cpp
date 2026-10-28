@@ -8614,7 +8614,12 @@ void ClientGateway::onNamespaceUpserted(const rune::catalog::NamespaceRecord& r)
         if (s == nullptr || gateExempt_(*s)) continue;
         switch (tag) {
         case NsStateTag::SuspendedRejectAll:
-            revokeSession_(sid, "namespace suspended", suspendedCode_(*s));
+            // A code the client reads as "the session ended": 51 for v14+, SessionRevoked (46) below - an old
+            // client's InvalidRequest (suspendedCode_) at corr 0 is no session end, it would keep a dead session.
+            revokeSession_(sid, "namespace suspended",
+                           s->clientVersion >= pc::kClientVersionNamespaces
+                               ? static_cast<uint16_t>(pc::ErrorCode::NamespaceSuspended)
+                               : static_cast<uint16_t>(pc::ErrorCode::SessionRevoked));
             break;
         case NsStateTag::Deleting:
             revokeSession_(sid, "namespace deleted");

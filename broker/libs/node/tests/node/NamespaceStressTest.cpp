@@ -679,6 +679,11 @@ protected:
         } catch (const std::exception& e) { err = e.what(); }
         trace_ += " [ended after " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clk::now() - endStart).count()) + " ms: " + (err.empty() ? "ok" : err) + "]";
         if (platformAborted) {
+            // Review B1: a definite outcome, at once - never a wait to the bound (a timeout used to pass here and hid
+            // the EndTxn-51 retry loop and the ignored RejectAll notice).  A commit fails (51, fenced or client closed);
+            // an abort may succeed or fail, but answers.
+            EXPECT_LT(Clk::now() - endStart, std::chrono::seconds(3)) << "ending a platform-aborted transaction waited: " << err;
+            EXPECT_EQ(err.find("timed out"), std::string::npos) << ns << ": " << err;
             if (commit) EXPECT_FALSE(err.empty()) << "a commit succeeded after the platform aborted the transaction of " << ns;
         } else if (n != nullptr && n->state == 0) {
             EXPECT_TRUE(err.empty()) << "ending a transaction in an ACTIVE namespace failed: " << err;

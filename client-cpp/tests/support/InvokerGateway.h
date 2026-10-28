@@ -267,12 +267,13 @@ struct InvokerGateway {
     std::vector<std::string> connectAuthTokens;
     /// D26: revoke `sid`: each live subscription of it is answered SessionRevoked on its Subscribe correlation
     /// id, then the session-level ErrorResponse{SessionRevoked, corr 0}; the session is gone (closed).
-    void revokeSession(int64_t sid, int from = 0) {
-        namespace rp = rune::protocol::client;
+    /// `code`: SessionRevoked (46), or NamespaceSuspended (51) - a RejectAll suspend's revoke to a v14+ client.
+    void revokeSession(int64_t sid, int from = 0,
+                       int16_t code = static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionRevoked)) {
         for (const Subscribed& sub : subscribed) {
-            if (sub.sessionId == sid) sendError(from, static_cast<int16_t>(rp::ErrorCode::SessionRevoked), "revoked", sid, sub.corrId);
+            if (sub.sessionId == sid) sendError(from, code, "revoked", sid, sub.corrId);
         }
-        sendError(from, static_cast<int16_t>(rp::ErrorCode::SessionRevoked), "session revoked", sid, 0);
+        sendError(from, code, "session revoked", sid, 0);
         for (auto& [node, set] : sessionsAtNode) set.erase(sid);
         authState_.erase(sid);
     }

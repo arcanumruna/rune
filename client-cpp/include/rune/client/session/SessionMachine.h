@@ -995,9 +995,11 @@ public:
                 // Issues #15 / #111: the broker's security state stayed stale and it ended this session - retriable:
                 // reconnect FRESH elsewhere (the seed failover rotates the candidates), never resume here.
                 onAuthUnavailable_(nowNs);
-            } else if (ec == rpc::ErrorCode::SessionRevoked && incomingCorrelationId == 0) {
+            } else if ((ec == rpc::ErrorCode::SessionRevoked || ec == rpc::ErrorCode::NamespaceSuspended) &&
+                       incomingCorrelationId == 0) {
                 // Authentication (D26): the session-level ErrorResponse{SessionRevoked, corr 0} — the user was
-                // dropped / disabled.  The broker closes the session:
+                // dropped / disabled — or {NamespaceSuspended 51, corr 0}: a RejectAll suspend of the user's namespace
+                // (client version 14; an older client gets 46).  The broker closes the session:
                 // terminal, never resumed or reconnected (a reconnect is AuthenticationFailed anyway).
                 rejectCode_       = static_cast<int16_t>(static_cast<uint16_t>(ec));
                 lastConnectError_ = rejectCode_;

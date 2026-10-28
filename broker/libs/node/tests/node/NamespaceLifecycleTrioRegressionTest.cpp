@@ -15,7 +15,7 @@
 //   | SetLimits            | maxConnections=1, produceBytesPerSec   | 3     | per node: one session each; limit on every worker; | ThrottleOnEveryNode
 //   |                      |                                        |       | Throttled only where the partition leads           |
 //   | produce acks=all     | across suspend RO / resume             | 3     | produced = consumed = every replica's log          | AcksAllNoLossAcrossSuspendResume
-//   | produce (shard path) | RO: a login, a grant change, the suspend | 3     | every later permission ship binds the suspended   | ReadOnlyEveryPermissionShipStaysSuspended
+//   | produce (shard path) | RO: a login, a limits change, the suspend | 3   | every later permission ship binds the suspended   | ReadOnlyEveryPermissionShipStaysSuspended
 //   |                      | itself                                 |       | table: 51 at the worker, nothing appended         |
 #include "support/AuthRig.h"
 #include "support/AuthTrio.h"
@@ -529,6 +529,7 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
 // deny table (answered 45, not 51) and the login / grant change re-shipped the full WRITE table, so the session could
 // produce on the worker-ingress path while its namespace was read-only.
 TEST(NamespaceLifecycleTrioRegression, ReadOnlyEveryPermissionShipStaysSuspendedRegression) {
+    constexpr int kMaxConnectionsField = 18;
     auto w = setupWorld("nslct_roship");
     World& W = *w;
     const int leader = W.leaderOf(W.tA);
@@ -555,18 +556,24 @@ TEST(NamespaceLifecycleTrioRegression, ReadOnlyEveryPermissionShipStaysSuspended
     const auto rb = W.produce(bob.sid, leader, W.tA, 64);
     ASSERT_TRUE(rb.has_value());
     EXPECT_EQ(rb->errorCode, kSuspended) << "a login during ReadOnly shipped its WRITE grants to the worker";
-    // 3. a grant change while ReadOnly re-ships alice's permissions: still the suspended table.
+    // 3. a grant into a ReadOnly namespace is itself refused (namespace-scoped DDL is a write).
     {
         using namespace grants;
         const AuthGrant g = prefix(SO::Read, ST::Topic, "zz");
-        W.t.grant(1, "a/alice", g.op, g.type, g.kind, g.pattern);
-        ASSERT_TRUE(W.t.awaitDigestsAgree(0, 30s));
+        const auto ga = W.t.ddl(1, [&](AuthWireClient& c, const std::string& ch, int64_t s) {
+            return c.grant(ch, s, "a/alice", false, g.op, g.type, g.kind, g.pattern);
+        });
+        EXPECT_NE(ga.errorCode, 0) << "a grant into a ReadOnly namespace was accepted";
     }
-    for (int i = 0; i < 5; ++i) {
-        const auto r = W.produce(alice, leader, W.tA, 64);
-        ASSERT_TRUE(r.has_value()) << "produce " << i;
-        EXPECT_EQ(r->errorCode, kSuspended) << "produce " << i << " after a grant change during ReadOnly";
-    }
+    // 4. a limits change while ReadOnly re-upserts `a` and re-ships every session's permissions: still suspended.
+    ASSERT_EQ(W.ns(1, pc::NamespaceDdlKind::SetLimits, "a", 1, kMaxConnectionsField, 1000).code, 0);
+    ASSERT_TRUE(W.t.awaitDigestsAgree(0, 30s));
+    for (int i = 0; i < 5; ++i)
+        for (const int64_t s : {alice, bob.sid}) {
+            const auto r = W.produce(s, leader, W.tA, 64);
+            ASSERT_TRUE(r.has_value()) << "produce " << i;
+            EXPECT_EQ(r->errorCode, kSuspended) << "produce " << i << " after a limits change during ReadOnly";
+        }
     EXPECT_EQ(logEnd(), endAtSuspend) << "nothing is appended while ReadOnly";
     EXPECT_EQ(W.t.node(leader).onWorkerThreadForTest(0, [](Worker& wk) { return wk.workerNotAuthorizedForTest(); }), 0u)
         << "a suspended session is never answered NotAuthorized by the worker";

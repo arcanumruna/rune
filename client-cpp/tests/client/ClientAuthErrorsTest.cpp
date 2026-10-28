@@ -1325,6 +1325,52 @@ TEST(ClientAuthErrorsRegression, SessionRevokedFailsAPendingControlOpToo) {
     EXPECT_EQ(f.outcome().c.errorCode, 46);
 }
 
+// Namespaces Phase 2 (Timing/TxnOpen_SuspendRA): a RejectAll suspend revokes a v14+ client's session with the
+// session-level ErrorResponse{NamespaceSuspended 51, corr 0}.  It ends the session exactly like SessionRevoked (D26):
+// every in-flight record, subscription, control op and transactional op completes BrokerError 51 at once, nothing
+// reconnects, the seed is Rejected.  RED before: 51 at corr 0 was ignored - the session stayed Connected (dead on
+// the broker) and a pending commit waited out its whole timeout.
+TEST(ClientAuthErrorsRegression, ANamespaceSuspendedNoticeEndsTheSessionLikeARevokeRegression) {
+    constexpr int16_t k51 = static_cast<int16_t>(pc::ErrorCode::NamespaceSuspended);
+    Rig r(authCfg(3768, "ws1", kPw));
+    r.connectOk();
+    r.gw.replyAcks = false;   // produces stay in flight
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::Leader; pcfg.lingerUs = 60'000'000; pcfg.maxInFlight = 8;
+    pcfg.produceTimeoutMs = 20'000; pcfg.deliveryTimeoutMs = 60'000;
+    rc::Producer p = r.client.producer(pcfg);
+    rc::ProducerConfig tcfg;
+    tcfg.acks            = rc::Acks::All;
+    tcfg.transactionalId = "tx-suspended";
+    rc::Producer tp = r.client.producer(tcfg);
+    const auto topic = r.client.topic("t");
+    test_support::TestCq cq(r.client);
+    const std::vector<uint8_t> val(16, 0x5C);
+    auto sent = cq.send(p, topic, rc::Key(uint64_t{1}), val);
+    ASSERT_TRUE(sent.accepted());
+    p.flush();
+    ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() + r.gw.held.size() >= 1; }));
+    auto unsent = cq.send(p, topic, rc::Key(uint64_t{2}), val);   // lingers in the builder
+    ASSERT_TRUE(unsent.accepted());
+    auto init = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+    ASSERT_TRUE(init.accepted());
+    ASSERT_TRUE(r.drive([&] { return r.gw.initPids > 0; })) << "the InitProducerId is in flight, unanswered";
+    rc::Subscription sub = r.client.subscribe(topic, 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty() && sub.subscriptionId() != 0; }));
+    const int connectsBefore = r.gw.connectsArrived;
+
+    r.gw.revokeSession(r.gw.assignedSessionId, 0, k51);
+    for (auto* op : {&sent, &unsent, &init}) {
+        ASSERT_TRUE(r.drive([&] { return op->ready(); }));
+        EXPECT_EQ(op->outcome().c.status, rc::OpStatus::BrokerError);
+        EXPECT_EQ(op->outcome().c.errorCode, 51) << "NamespaceSuspended, not Closed / a timeout";
+    }
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); }));
+    EXPECT_EQ(sub.brokerErrorCode(), 51);
+    r.passes(200, 10'000'000);   // 2 s of duty cycles
+    EXPECT_EQ(r.gw.connectsArrived, connectsBefore) << "a session ended by a RejectAll suspend is never reconnected";
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Rejected);
+}
+
 // ---- the salted-password cache -----------------------------------------------------------------------------
 
 TEST(ClientAuthErrorsRegression, ScramCachePaysPbkdf2OncePerVerifierRegression) {

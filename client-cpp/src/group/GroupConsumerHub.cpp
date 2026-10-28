@@ -404,7 +404,10 @@ GroupVerdict classifyGroupAnswer_(rpc::ErrorCode ec) noexcept {
     case rpc::ErrorCode::AuthenticationFailed:
     case rpc::ErrorCode::NotAuthorized:
     case rpc::ErrorCode::SessionRevoked:
-    case rpc::ErrorCode::PasswordChangeRequired: return GroupVerdict::Refuse;    // re-sending fails the same way
+    case rpc::ErrorCode::PasswordChangeRequired:
+    // Namespaces Phase 2: a suspended namespace / a limit is an admin's act too.
+    case rpc::ErrorCode::NamespaceSuspended:
+    case rpc::ErrorCode::NamespaceLimitExceeded: return GroupVerdict::Refuse;    // re-sending fails the same way
     default:                                  return GroupVerdict::Backoff;   // Internal, NotLeader, unknown, ...
     }
 }
@@ -1182,8 +1185,9 @@ bool GroupConsumerHub::onFetchSubscribeResponse(int64_t corrId, int16_t errorCod
             if (fs.corrId != corrId) continue;
             fs.corrId = 0;
             if (errorCode == static_cast<int16_t>(rpc::ErrorCode::NotAuthorized) ||
-                errorCode == static_cast<int16_t>(rpc::ErrorCode::SessionRevoked)) {
-                // Authentication: not retriable — never parked for a metadata retry loop.
+                errorCode == static_cast<int16_t>(rpc::ErrorCode::SessionRevoked) ||
+                errorCode == static_cast<int16_t>(rpc::ErrorCode::NamespaceSuspended)) {
+                // Authentication / a suspended namespace: not retriable — never parked for a metadata retry loop.
                 refuse_(*impl, refusalFor_(static_cast<rpc::ErrorCode>(static_cast<uint16_t>(errorCode))));
                 return true;
             }

@@ -1042,7 +1042,8 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         if (sp == &seedSession() && opt->sessionId != 0 &&
             (opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::SessionExpired) ||
              opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::UnknownSession) ||
-             opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::SessionRevoked)) &&
+             opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::SessionRevoked) ||
+             opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::NamespaceSuspended)) &&
             !(seedSession().machine.correlationId() == opt->correlationId &&
               (seedSession().machine.state() == session::SessionState::Connecting ||
                seedSession().machine.state() == session::SessionState::Handshaking ||
@@ -1061,7 +1062,8 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             const bool fatal =
                 opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::SessionExpired) ||
                 opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::UnknownSession) ||
-                opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::SessionRevoked);
+                opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::SessionRevoked) ||
+                opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::NamespaceSuspended);
             const int64_t mine = s.machine.sessionId();
             const bool answersMyConnect =
                 s.machine.correlationId() == opt->correlationId &&

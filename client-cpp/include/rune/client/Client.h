@@ -1645,7 +1645,7 @@ private:
     bool onAuthErrorResponse_(const codec::ErrorResponseView& e);
     /// Authentication (D26): the seed session was revoked — every in-flight request and subscription
     /// completes SessionRevoked; the Rejected seed then fails the Client for good (no reconnect).
-    void onSeedRevoked_(std::string_view text);
+    void onSeedRevoked_(std::string_view text, uint16_t code);
     void completeConnect_(OpStatus st, int64_t value, uint16_t errorCode, std::string_view text, int64_t aux = 0);
     /// Fix round 4: the seed's Connected edge — every connect-time action, once.
     void onSeedConnected_(int64_t sessionId, int32_t brokerVersion);

@@ -481,13 +481,18 @@ struct LiveExecutor {
         run.index = index;
         run.lastErrorCode = 0;
         if (run.exec(p, text, rid)) return 0;
-        // A revoked session fails the client for good: the next statement sees "client closed", with no broker code.
-        if (run.lastErrorCode == 0 && broker.client().sessionRejectCode() ==
-                                          static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionRevoked))
-            run.lastErrorCode = static_cast<uint16_t>(rune::protocol::client::ErrorCode::SessionRevoked);
-        if (run.lastErrorCode == static_cast<uint16_t>(rune::protocol::client::ErrorCode::SessionRevoked)) {
+        // A revoked session (46) - or one a RejectAll suspend ended (51) - fails the client for good: the next statement
+        // sees "client closed", with no broker code.
+        constexpr int16_t k46 = static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionRevoked);
+        constexpr int16_t k51 = static_cast<int16_t>(rune::protocol::client::ErrorCode::NamespaceSuspended);
+        const int16_t rejected = broker.client().sessionRejectCode();
+        if (run.lastErrorCode == 0 && (rejected == k46 || rejected == k51)) run.lastErrorCode = static_cast<uint16_t>(rejected);
+        if (run.lastErrorCode == static_cast<uint16_t>(k46)) {
             ended = true;
             run.err << "error: SessionRevoked (46): the session ended\n";
+        } else if (run.lastErrorCode == static_cast<uint16_t>(k51) && rejected == k51) {
+            ended = true;
+            run.err << "error: NamespaceSuspended (51): the namespace was suspended, the session ended\n";
         }
         return run.lastErrorCode != 0 ? run.lastErrorCode : 1;
     }

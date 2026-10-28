@@ -27,6 +27,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -532,23 +533,48 @@ void txnOpen(const TCell& p) {
         values.emplace_back(reinterpret_cast<const char*>(r.value.data()), r.value.size());
     });
     auto snapshot = [&] { std::lock_guard<std::mutex> lk(mu); return values; };
-    std::this_thread::sleep_for(300ms);
+    // Premise (no wall-time wait): a read_uncommitted reader of the same partition has seen the sentinel, so the log
+    // holds it - yet read_committed has delivered nothing: the open transaction pins the last stable offset.
+    std::atomic<bool> uncommittedSawS{false};
+    rc::SubscribeOptions ou;
+    ou.from = rc::From::earliest();
+    ou.isolation = rc::Isolation::ReadUncommitted;
+    rc::Subscription subU = admin->subscribe(th, 0, ou, [&](const rc::Record& r) {
+        if (r.value.size() == 1 && r.value[0] == static_cast<uint8_t>('S')) uncommittedSawS = true;
+    });
+    ASSERT_TRUE(waitFor([&] { return uncommittedSawS.load(); }, 20s)) << "premise: the sentinel is in the log";
+    subU.unsubscribe();
     EXPECT_TRUE(snapshot().empty()) << "premise: an open transaction pins the last stable offset";
     switch (p.variant) {
         case 0: ASSERT_TRUE(admin->suspendNamespace("a", pc::NsSuspendMode::ReadOnly).has_value()); break;
         case 1: ASSERT_TRUE(admin->suspendNamespace("a", pc::NsSuspendMode::RejectAll).has_value()); break;
-        default: ASSERT_TRUE(admin->deleteNamespace("a").has_value()); break;
+        default:
+            // Hold the reaper before its first event: `a` is Deleting (its transactions aborted at the gate) but a/t is
+            // not dropped yet, so the read_committed reader can still see the sentinel (the TxnOpen_Delete flake).
+            b.node().onAdminThreadForTest([&] {
+                b.node().adminWorkerAgentForTest()->worker().reaperForTest().setIssueBudgetForTest(0);
+                return 0;
+            });
+            ASSERT_TRUE(admin->deleteNamespace("a").has_value());
+            break;
     }
     ASSERT_TRUE(waitFor([&] { const auto s = snapshot(); return std::find(s.begin(), s.end(), "S") != s.end(); }, 40s))
         << "the sentinel never became visible: the open transaction was not aborted";
     for (const std::string& v : snapshot()) EXPECT_EQ(v, "S") << "an aborted record is visible to read_committed";
+    // The commit fails at once with a definite outcome - never by waiting out its timeout (review B1: a timeout used to
+    // pass here and hid two client hangs: EndTxn 51 retried until the deadline, a RejectAll's corr-0 51 ignored).
     std::string err;
+    const auto t0 = std::chrono::steady_clock::now();
     try { txn.commitTransactionAndWait(15s); } catch (const std::exception& e) { err = e.what(); }
-    EXPECT_FALSE(err.empty()) << "the producer's next call must fail";
+    const auto took = std::chrono::steady_clock::now() - t0;
+    EXPECT_LT(took, 3s) << "the commit waited instead of failing: " << err;
+    EXPECT_EQ(err.find("timed out"), std::string::npos) << err;
     if (p.variant == 0) {
-        const bool known = err.find("NamespaceSuspended") != std::string::npos || err.find("51") != std::string::npos ||
-                           err.find("InvalidProducerEpoch") != std::string::npos || err.find("poch") != std::string::npos;
-        EXPECT_TRUE(known) << "ReadOnly: InvalidProducerEpoch or NamespaceSuspended expected, got: " << err;
+        // ReadOnly: the session lives; the gateway refuses EndTxn NamespaceSuspended and the client goes FatalError.
+        EXPECT_EQ(err, "commitTransaction(): broker error code 51 (EndTxn failed (fatal))");
+    } else {
+        // RejectAll (corr-0 51) / Delete (corr-0 46) ended the session: the client failed for good before the commit.
+        EXPECT_EQ(err, "commitTransaction(): client closed");
     }
     sub.unsubscribe();
 }

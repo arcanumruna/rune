@@ -3345,10 +3345,11 @@ void Client::enterFailed_() {
         const int16_t rc = sm.rejectCode();
         using Ec = rune::protocol::client::ErrorCode;
         if (rc == static_cast<int16_t>(Ec::AuthenticationFailed) || rc == static_cast<int16_t>(Ec::SessionRevoked) ||
-            rc == static_cast<int16_t>(Ec::Internal)) {
+            rc == static_cast<int16_t>(Ec::NamespaceSuspended) || rc == static_cast<int16_t>(Ec::Internal)) {
             std::string why = sm.rejectDetail();
             if (why.empty()) why = rc == static_cast<int16_t>(Ec::AuthenticationFailed) ? "authentication failed"
                                   : rc == static_cast<int16_t>(Ec::SessionRevoked)      ? "the session was revoked"
+                                  : rc == static_cast<int16_t>(Ec::NamespaceSuspended)  ? "the namespace was suspended"
                                                                                          : "login failed locally";
             completeConnect_(OpStatus::BrokerError, 0, static_cast<uint16_t>(rc), why,
                              static_cast<int64_t>(sm.authRetryAfterMs()));
@@ -3361,9 +3362,11 @@ void Client::enterFailed_() {
     // from the ring and completed) and complete every accepted, unacknowledged
     // record Closed — exactly once (ProducerImpl's Discarding life).
     // Authentication (D26): a REVOKED session completes the records it accepted but never sent SessionRevoked
-    // (BrokerError 46), like the ones already in flight — not Closed.
-    if (agent_.seedMachine().rejectCode() == static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionRevoked))
-        producerHub_.failCloseAll(OpStatus::BrokerError, static_cast<uint16_t>(rune::protocol::client::ErrorCode::SessionRevoked));
+    // (BrokerError 46), like the ones already in flight — not Closed.  A RejectAll suspend's end (51) likewise.
+    if (const int16_t rc = agent_.seedMachine().rejectCode();
+        rc == static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionRevoked) ||
+        rc == static_cast<int16_t>(rune::protocol::client::ErrorCode::NamespaceSuspended))
+        producerHub_.failCloseAll(OpStatus::BrokerError, static_cast<uint16_t>(rc));
     else
         producerHub_.failCloseAll(OpStatus::Closed);
     // Pending control ops can never be answered now.
@@ -3651,12 +3654,13 @@ bool Client::onAuthErrorResponse_(const codec::ErrorResponseView& e) {
     const auto snap = agent_.stateAndSessionId();
 
     if (e.correlationId == 0) {
-        if (ec != rpc::ErrorCode::SessionRevoked) return false;   // a session-level 44 concerns the login (below)
+        // a session-level 44 concerns the login (below); 51 = a RejectAll suspend ended the session (client v14)
+        if (ec != rpc::ErrorCode::SessionRevoked && ec != rpc::ErrorCode::NamespaceSuspended) return false;
         // D26: the session-level notice.  Only the SEED's own session ends the Client's work; the agent already
         // put that session's machine in Rejected (a notice naming a session this client left was dropped by the
         // agent's F-A C1 guard and arrives here with the id of no session we hold).
         if (e.sessionId != 0 && e.sessionId != snap.sessionId) return true;
-        onSeedRevoked_(msg);
+        onSeedRevoked_(msg, code);
         return true;
     }
 
@@ -3690,13 +3694,12 @@ bool Client::onAuthErrorResponse_(const codec::ErrorResponseView& e) {
     return false;   // control ops / DDL / connect: the generic tail completes them with the code
 }
 
-void Client::onSeedRevoked_(std::string_view text) {
-    constexpr uint16_t kRevoked = static_cast<uint16_t>(rune::protocol::client::ErrorCode::SessionRevoked);
+void Client::onSeedRevoked_(std::string_view text, uint16_t code) {   // 46, or 51 (a RejectAll suspend)
     // Every in-flight request: a pending connect, every control op, every unanswered produce batch.
-    failAllControlWithCode_(kRevoked, text);
-    producerHub_.onSessionRevoked(kRevoked);   // in-flight batches + Phase 2b F: a transactional producer goes FatalError
+    failAllControlWithCode_(code, text);
+    producerHub_.onSessionRevoked(code);   // in-flight batches + Phase 2b F: a transactional producer goes FatalError
     // Every subscription and group consumer of the session.
-    (void)subscriberHub_.endAllLive(SubscriptionFailReason::SessionRevoked, kRevoked);
+    (void)subscriberHub_.endAllLive(SubscriptionFailReason::SessionRevoked, code);
     (void)groupConsumerHub_.revokeAll();
     // The seed machine is Rejected(SessionRevoked): the duty cycle's failure tail (enterFailed_) closes the rest
     // — nothing reconnects (D26).
@@ -3870,9 +3873,11 @@ void Client::onEgressFrame(codec::TemplateId tid,
         }
 
         // Authentication (Task 7): codes 44..47 — a refused / revoked subscription or group fetch, a rejected
-        // produce batch, a revoked session.  Never routed (Redirect / NotLeader) and never retried.
+        // produce batch, a revoked session.  Never routed (Redirect / NotLeader) and never retried.  Namespaces
+        // Phase 2: NamespaceSuspended (51) the same way (a RejectAll suspend ends the session at corr 0).
         if (ec == rpc::ErrorCode::AuthenticationFailed || ec == rpc::ErrorCode::NotAuthorized ||
-            ec == rpc::ErrorCode::SessionRevoked || ec == rpc::ErrorCode::PasswordChangeRequired) {
+            ec == rpc::ErrorCode::SessionRevoked || ec == rpc::ErrorCode::PasswordChangeRequired ||
+            ec == rpc::ErrorCode::NamespaceSuspended) {
             if (onAuthErrorResponse_(*opt)) break;
         }
 

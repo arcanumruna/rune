@@ -175,6 +175,40 @@ TEST(NamespaceSuspendRegression, RejectAllClosesSessionsRegression) {
     EXPECT_EQ(produceOne(*ub, f.tB, 1).status, rc::OpStatus::Ok);
 }
 
+// RejectAll ends each session with a code its client knows as "the session ended": NamespaceSuspended (51) for a v14+
+// client, SessionRevoked (46) below (a v13 client has no 51; the InvalidRequest it used to get was no session end, so it
+// kept a dead session and every pending op waited out its timeout).  Both clients reject for good, nothing reconnects.
+TEST(NamespaceSuspendRegression, RejectAllEndsEachSessionWithACodeItsClientKnowsRegression) {
+    Fix f("nssusp_racode");
+    auto v14 = connected(f.b, "a/ua", kUserPw);
+    auto v13 = connected(f.b, "a/ua2", kUserPw, 13);
+    ASSERT_EQ(produceOne(*v14, f.tA, 1).status, rc::OpStatus::Ok);
+    // A live subscription on each: the revoke ends it with the session's code (readable from this thread).
+    std::atomic<size_t> n14{0}, n13{0};
+    rc::SubscribeOptions o;
+    o.from = rc::From::earliest();
+    rc::Subscription s14 = v14->subscribe(f.tA, 0, o, [&](const rc::Record&) { ++n14; });
+    rc::Subscription s13 = v13->subscribe(f.tA, 0, o, [&](const rc::Record&) { ++n13; });
+    const auto bound = std::chrono::steady_clock::now() + 20s;
+    while ((n14.load() == 0 || n13.load() == 0) && std::chrono::steady_clock::now() < bound) std::this_thread::sleep_for(5ms);
+    ASSERT_GT(n14.load(), 0u);
+    ASSERT_GT(n13.load(), 0u);
+    ASSERT_TRUE(f.admin->suspendNamespace("a", pc::NsSuspendMode::RejectAll).has_value());
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < deadline && (!s14.finished() || !s13.finished()))
+        std::this_thread::sleep_for(5ms);
+    ASSERT_TRUE(s14.finished());
+    ASSERT_TRUE(s13.finished());
+    EXPECT_EQ(s14.brokerErrorCode(), static_cast<uint16_t>(pc::ErrorCode::NamespaceSuspended));
+    EXPECT_EQ(s13.brokerErrorCode(), static_cast<uint16_t>(pc::ErrorCode::SessionRevoked));
+    const auto ended = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < ended && (v14->state() != rc::session::SessionState::Rejected ||
+                                                        v13->state() != rc::session::SessionState::Rejected))
+        std::this_thread::sleep_for(5ms);
+    EXPECT_EQ(v14->state(), rc::session::SessionState::Rejected);
+    EXPECT_EQ(v13->state(), rc::session::SessionState::Rejected);
+}
+
 TEST(NamespaceSuspendRegression, RejectAllLoginRightProofSuspendedRegression) {
     Fix f("nssusp_login");
     ASSERT_TRUE(f.admin->suspendNamespace("a", pc::NsSuspendMode::RejectAll).has_value());
