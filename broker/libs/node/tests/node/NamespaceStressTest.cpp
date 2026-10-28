@@ -824,8 +824,15 @@ protected:
                 const Answer a = schemaOf(rootSid(), q);
                 ASSERT_NE(a.code, 0) << "topic " << q << " of the deleted namespace " << it->name << " still resolves (invariant 6)";
             }
-            for (const int32_t id : it->topicIds)   // by id: a produce to the old topic id answers UnknownTopic
-                ASSERT_EQ(r_.produce(rootSid(), id), kUnknownTopic) << "topic id " << id << " of the deleted namespace " << it->name << " still resolves (invariant 6)";
+            for (const int32_t id : it->topicIds) {   // by id: a produce to the old topic id answers UnknownTopic (the
+                // workers' DELETING gate rides their ingress ring, one hop after the commit: a bounded wait, never a sleep)
+                int code = r_.produce(rootSid(), id);
+                for (int i = 0; i < 500 && code != kUnknownTopic; ++i) {
+                    r_.c().pollFor(std::chrono::milliseconds(10), [] { return false; });
+                    code = r_.produce(rootSid(), id);
+                }
+                ASSERT_EQ(code, kUnknownTopic) << "topic id " << id << " of the deleted namespace " << it->name << " still resolves (invariant 6)";
+            }
             for (const int32_t v : it->viewIds) {
                 const Answer a = viewRowOf(rootSid(), v);
                 ASSERT_NE(a.code, 0) << "view id " << v << " of the deleted namespace " << it->name << " still readable (invariant 6)";

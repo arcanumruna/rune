@@ -30,7 +30,10 @@ struct NsState       { uint16_t slot; uint32_t nsId; uint8_t tag; };
 /// The rates and gauges a namespace is limited by (D28).  Disk: untilNs = INT64_MAX while the node is over the limit, 0
 /// to clear.  A rate's untilNs is a deadline on the injected monotonic clock the receiver compares with.
 enum class ThrottleKind : uint8_t { ProduceBytes = 0, FetchBytes = 1, RequestOps = 2, Disk = 3, ProduceRecords = 4,
-                                    QueryCycles = 5, kCount = 6 };
+                                    QueryCycles = 5, kCount = 6,
+                                    // Not a rate: the namespace is DELETING (spec §4: it refuses every request and answers
+                                    // like a missing namespace).  Sticky until the slot is released at the erase; untilNs unused.
+                                    NsDeleting = 0x80 };
 inline constexpr std::size_t kThrottleKinds = static_cast<std::size_t>(ThrottleKind::kCount);
 struct Throttle      { uint16_t slot; uint32_t nsId; ThrottleKind kind; int64_t untilNs; };
 struct ViewMemOver   { uint16_t slot; uint32_t nsId; bool on; };

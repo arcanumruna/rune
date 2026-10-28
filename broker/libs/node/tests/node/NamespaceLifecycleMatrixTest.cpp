@@ -628,3 +628,34 @@ TEST_P(NamespaceLifecycleMatrixTimingRegression, Timing) {
 
 INSTANTIATE_TEST_SUITE_P(All, NamespaceLifecycleMatrixTimingRegression, ::testing::ValuesIn(timingCells()),
                          [](const auto& info) { return tName(info.param); });
+
+// Spec §4: DELETING refuses every request from the NamespaceDeleted commit on, the cluster admin's too (its exemption is
+// from suspend only).  The topics are dropped later, one reaper step at a time; a produce acked in between would be erased
+// with the namespace.  Held reaper = the window stays open: the cluster admin's produce to the topic id answers UnknownTopic
+// (like a missing namespace), also after a restart (the DELETING gate is rebuilt from the catalog), and after the erase.
+// Found by NamespaceStressRegression seed 18 (invariant 6, a delete right after a restart).
+TEST(NamespaceDeletingProduceRegression, ClusterAdminProduceToDeletingNamespaceIsUnknownTopicRegression) {
+    constexpr int kUnknownTopic = static_cast<int>(pc::ErrorCode::UnknownTopic);
+    LcRig rig("nsdelprod");   // the reaper is held: a deleted namespace stays DELETING
+    rig.prepare("dp", LcTarget::Active, 0, LcCaller::ClusterAdmin);
+    const std::vector<int32_t> ids = rig.topicIds("dp");
+    ASSERT_EQ(ids.size(), 2u);
+    for (const int32_t id : ids) ASSERT_EQ(rig.auth().produce(rig.rootSid(), id, /*untilOk=*/true), 0) << "baseline: topic " << id;
+    const uint32_t nsId = rig.observe("dp").nsId;
+    ASSERT_NE(nsId, 0u);
+    ASSERT_EQ(rig.ns(rig.rootSid(), pc::NamespaceDdlKind::Delete, "dp").code, 0);
+    // The gate rides the workers' ingress ring (one hop after the commit): bounded.
+    for (const int32_t id : ids)
+        EXPECT_TRUE(rig.until([&] { return rig.auth().produce(rig.rootSid(), id) == kUnknownTopic; }, 500))
+            << "topic " << id << " of the DELETING namespace still takes a produce";
+    ASSERT_FALSE(rig.erased(nsId)) << "the reaper is held: the namespace is still DELETING";
+
+    rig.restart(/*holdReaper=*/true);
+    for (const int32_t id : ids)
+        EXPECT_TRUE(rig.until([&] { return rig.auth().produce(rig.rootSid(), id) == kUnknownTopic; }, 500))
+            << "after a restart, topic " << id << " of the DELETING namespace still takes a produce";
+
+    rig.releaseReaper();
+    ASSERT_TRUE(rig.until([&] { return rig.erased(nsId); }));
+    for (const int32_t id : ids) EXPECT_EQ(rig.auth().produce(rig.rootSid(), id), kUnknownTopic) << "erased: topic " << id;
+}

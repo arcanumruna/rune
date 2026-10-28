@@ -6283,6 +6283,9 @@ private:
     // The byte accounting (nsDiskBytes_) stays: it is what this worker reports.
     static constexpr int64_t kDiskScanIntervalNs = 50'000'000;
     std::vector<int64_t> nsDiskBytes_ = std::vector<int64_t>(NsSlotTable::kDefaultCapacity, 0);
+    // The one byte a leader produce reads: 0 = serve, kNsGateOverDisk = NamespaceLimitExceeded (52), kNsGateDeleting = the
+    // namespace is DELETING: UnknownTopic, like a missing namespace (its records would be erased with it - never acked).
+    static constexpr uint8_t kNsGateOverDisk = 1, kNsGateDeleting = 2;
     std::vector<uint8_t> nsOverDisk_  = std::vector<uint8_t>(NsSlotTable::kDefaultCapacity, 0);
     int64_t              nextDiskScanNs_ = 0;
     uint64_t             overDiskRefusals_ = 0;
@@ -6309,7 +6312,8 @@ private:
     uint16_t              lastViewReadSlot_ = kNoNsSlot;
 public:
     [[nodiscard]] int64_t  nsDiskBytesForTest(uint16_t slot) const noexcept { return slot < nsDiskBytes_.size() ? nsDiskBytes_[slot] : 0; }
-    [[nodiscard]] bool     nsOverDiskForTest(uint16_t slot) const noexcept { return slot < nsOverDisk_.size() && nsOverDisk_[slot] != 0; }
+    [[nodiscard]] bool     nsOverDiskForTest(uint16_t slot) const noexcept { return slot < nsOverDisk_.size() && nsOverDisk_[slot] == kNsGateOverDisk; }
+    [[nodiscard]] bool     nsDeletingForTest(uint16_t slot) const noexcept { return slot < nsOverDisk_.size() && nsOverDisk_[slot] == kNsGateDeleting; }
     [[nodiscard]] uint64_t overDiskRefusalsForTest() const noexcept { return overDiskRefusals_; }
     [[nodiscard]] uint64_t nsSizeRefusalsForTest() const noexcept { return nsSizeRefusals_; }
     [[nodiscard]] uint64_t throttledRefusalsForTest() const noexcept { return throttledRefusals_; }
@@ -6397,10 +6401,12 @@ private:
     /// Cold (a CHANGE, from the aggregator): set one throttle deadline.  The (slot, nsId) tag is checked: a message for
     /// a namespace that no longer owns the slot is dropped and counted, never applied to the new owner (D22).
     [[gnu::cold]] void applyNsThrottle_(uint16_t slot, uint32_t nsId, ThrottleKind kind, int64_t untilNs) {
-        if (!checkNsTag_(slot, nsId) || static_cast<std::size_t>(kind) >= kThrottleKinds) return;
+        if (!checkNsTag_(slot, nsId)) return;
+        if (kind == ThrottleKind::NsDeleting) { nsOverDisk_[slot] = kNsGateDeleting; return; }   // sticky until the release
+        if (static_cast<std::size_t>(kind) >= kThrottleKinds) return;
         NsHot& h = nsHot_[slot];
         h.until[static_cast<std::size_t>(kind)] = untilNs;
-        if (kind == ThrottleKind::Disk) nsOverDisk_[slot] = untilNs != 0 ? 1 : 0;
+        if (kind == ThrottleKind::Disk && nsOverDisk_[slot] != kNsGateDeleting) nsOverDisk_[slot] = untilNs != 0 ? kNsGateOverDisk : 0;
         const auto u = [&](ThrottleKind k) { return h.until[static_cast<std::size_t>(k)]; };
         h.produceUntil = std::max({u(ThrottleKind::ProduceBytes), u(ThrottleKind::ProduceRecords), u(ThrottleKind::RequestOps)});
         h.fetchUntil   = std::max(u(ThrottleKind::FetchBytes), u(ThrottleKind::RequestOps));
@@ -8800,9 +8806,10 @@ private:
         if (log != nullptr && f.topicId >= 0) {
             NsHot& nh = nsHot_[log->nsSlot()];
             ++nh.requestOps;   // Task 14 (D28): one add ...
-            if (nsOverDisk_[log->nsSlot()] != 0) [[unlikely]] {
-                ++overDiskRefusals_;
-                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NamespaceLimitExceeded);
+            if (const uint8_t gate = nsOverDisk_[log->nsSlot()]; gate != 0) [[unlikely]] {
+                if (gate == kNsGateOverDisk) ++overDiskRefusals_;
+                ret.errorCode = static_cast<int16_t>(gate == kNsGateOverDisk ? pc::ErrorCode::NamespaceLimitExceeded
+                                                                             : pc::ErrorCode::UnknownTopic);
                 enqueueReturn_(ret);
                 return 1;
             }

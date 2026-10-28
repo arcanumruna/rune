@@ -6017,13 +6017,21 @@ void BrokerNode::onNsUpserted_(const rune::catalog::NamespaceRecord& rec) {
         spdlog::error("BrokerNode[{}]: no free namespace slot for nsId {} (bug: capacity {})", config_.nodeId, rec.nsId, nsSlots_.capacity());
         return;
     }
-    if (had != kNoNsSlot && nsSlots_.limits(*slot) == rec.limits) return;   // a state change / step: limits unchanged
+    // Spec §4: DELETING refuses every request from the NamespaceDeleted commit on.  The topics are dropped later, one
+    // reaper step at a time; until then every worker refuses a produce to them (UnknownTopic) - an acked record would be
+    // erased with the namespace.  Posted after the assign below on a new slot (same FIFO): see the end of this function.
+    const bool deleting = std::holds_alternative<rune::catalog::NsDeleting>(rec.state);
+    if (had != kNoNsSlot && nsSlots_.limits(*slot) == rec.limits) {   // a state change / step: limits unchanged
+        if (deleting && workerPool_) nsSlotFanout_.post(Throttle{*slot, rec.nsId, ThrottleKind::NsDeleting, 0});
+        return;
+    }
     nsSlots_.setLimits(*slot, rec.limits);
     registerNsMetric_(*slot, rec);
     if (gateway_) gateway_->onNsSlotAssign(*slot, rec.nsId, rec.limits);
     nsAggregator_.onSlotAssign(*slot, rec.nsId, rec.limits);   // Task 14: new owner -> zero usage; refresh -> next tick applies
     if (workerPool_) nsSlotFanout_.post(NsSlotAssign{*slot, rec.nsId, rec.limits});
     postCleanerNsLimit_(*slot, rec.nsId, rec.limits.maxRetentionMs, rec.limits.maxRetentionBytes);   // Task 13 (D27)
+    if (deleting && workerPool_) nsSlotFanout_.post(Throttle{*slot, rec.nsId, ThrottleKind::NsDeleting, 0});
 }
 
 void BrokerNode::postCleanerNsLimit_(uint16_t slot, uint32_t nsId, uint64_t maxRetentionMs, uint64_t maxRetentionBytes) {
