@@ -278,6 +278,8 @@ public:
     /// committed consumer offsets.  Refused while this node is not the loaded group coordinator.  More = a batch was
     /// written, or the tombstones are not yet committed; Done = none left and all committed.
     ReapStatus tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs);
+    /// Read-only test seam: the live offset keys of `nsId` in this node's store; 0 when the store is not loaded here.
+    [[nodiscard]] std::size_t liveKeysOfNamespaceForTest(uint32_t nsId) const;
     /// Issue #212: the session was revoked (terminal) - every member tracked on it leaves its group now (cold).
     void removeSessionMembers(int64_t sessionId, int64_t nowNs) override;
     /// No-hang fix round 5 (N23): only the request's (group, member) on `sessionId`

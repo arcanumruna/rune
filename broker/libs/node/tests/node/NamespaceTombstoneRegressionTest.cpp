@@ -223,6 +223,42 @@ TEST(NamespaceTombstoneRegression, TxnStateGoneAfterRebuildRegression) {
     EXPECT_EQ(l.replica->logEndOffset(), leoBefore + 600);
 }
 
+TEST(NamespaceTombstoneRegression, OffsetStoreLiveKeysOfNamespaceCountsOnlyThatNamespaceRegression) {
+    {
+        Leader l("livekeys_off");
+        co::ReplicatedOffsetStore store(l.replica.get());
+        fillOffsets(store, 1, 7);
+        fillOffsets(store, 2, 3);
+        EXPECT_EQ(store.liveKeysOfNamespaceForTest(1), 7u);
+        EXPECT_EQ(store.liveKeysOfNamespaceForTest(2), 3u);
+        EXPECT_EQ(store.liveKeysOfNamespaceForTest(9), 0u);
+        const rr::Offset leo = l.replica->logEndOffset();
+        EXPECT_EQ(store.liveKeysOfNamespaceForTest(1), 7u);
+        EXPECT_EQ(l.replica->logEndOffset(), leo) << "counting writes nothing";
+        ASSERT_GE(drain([&] { return store.tombstoneNamespace(1, 4, 9'000); }), 0);
+        EXPECT_EQ(store.liveKeysOfNamespaceForTest(1), 0u);
+        EXPECT_EQ(store.liveKeysOfNamespaceForTest(2), 3u);
+    }
+}
+
+TEST(NamespaceTombstoneRegression, TxnStoreLiveKeysOfNamespaceCountsOnlyThatNamespaceRegression) {
+    {
+        Leader l("livekeys_txn");
+        tx::ReplicatedTxnStateStore store(l.replica.get());
+        fillTxns(store, 1, 7);
+        fillTxns(store, 2, 3);
+        EXPECT_EQ(store.liveKeysOfNamespaceForTest(1), 7u);
+        EXPECT_EQ(store.liveKeysOfNamespaceForTest(2), 3u);
+        EXPECT_EQ(store.liveKeysOfNamespaceForTest(9), 0u);
+        const rr::Offset leo = l.replica->logEndOffset();
+        EXPECT_EQ(store.liveKeysOfNamespaceForTest(1), 7u);
+        EXPECT_EQ(l.replica->logEndOffset(), leo) << "counting writes nothing";
+        ASSERT_GE(drain([&] { return store.tombstoneNamespace(1, 4, 9'000); }), 0);
+        EXPECT_EQ(store.liveKeysOfNamespaceForTest(1), 0u);
+        EXPECT_EQ(store.liveKeysOfNamespaceForTest(2), 3u);
+    }
+}
+
 // ── batch bounds ──────────────────────────────────────────────────────────────────────────────────────────────
 TEST(NamespaceTombstoneRegression, BatchBoundsRegression) {
     int cases = 0;

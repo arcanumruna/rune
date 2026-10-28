@@ -234,6 +234,14 @@ bool ReplicatedOffsetStore::tombstoneNamespace(uint32_t nsId, uint32_t batch, in
     return written == 0;
 }
 
+std::size_t ReplicatedOffsetStore::liveKeysOfNamespaceForTest(uint32_t nsId) const
+{
+    std::size_t n = 0;
+    for (const auto& [group, tps] : index_)
+        if (parseScopedId(group).nsId == nsId) n += tps.size();
+    return n;
+}
+
 // ---------------------------------------------------------------------------
 // fetch
 // ---------------------------------------------------------------------------

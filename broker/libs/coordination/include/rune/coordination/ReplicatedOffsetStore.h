@@ -143,6 +143,9 @@ public:
     /// are no longer live, so the next call continues.  A refused append (min-ISR gate) stops the call (false).
     /// `nsId` 0 (`default`) is never deleted: nothing is written, true.  `batch` 0 counts as 1.  Control thread, cold.
     bool tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs);
+    /// Read-only: the number of live (group, topic-partition) keys of namespace `nsId` (the keys tombstoneNamespace would
+    /// write).  Writes nothing.  Control thread, cold.
+    [[nodiscard]] std::size_t liveKeysOfNamespaceForTest(uint32_t nsId) const;
 
     /// The __consumer_offsets replica this store appends to / rebuilds from.
     [[nodiscard]] rune::replication::PartitionReplica* replica() const noexcept { return replica_; }

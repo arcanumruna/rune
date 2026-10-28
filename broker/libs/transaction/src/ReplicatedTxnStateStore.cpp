@@ -213,6 +213,14 @@ bool ReplicatedTxnStateStore::tombstoneNamespace(uint32_t nsId, uint32_t batch, 
     return written == 0;
 }
 
+std::size_t ReplicatedTxnStateStore::liveKeysOfNamespaceForTest(uint32_t nsId) const
+{
+    std::size_t n = 0;
+    for (const auto& kv : index_)
+        if (rune::coordination::parseScopedId(kv.first).nsId == nsId) ++n;
+    return n;
+}
+
 // ---------------------------------------------------------------------------
 // get
 // ---------------------------------------------------------------------------

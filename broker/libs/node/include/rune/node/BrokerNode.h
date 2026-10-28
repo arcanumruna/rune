@@ -1760,14 +1760,13 @@ public:
         onControlThreadForTest([this]() { if (gateway_) gateway_->resetLoginThrottleForTest(); return 0; });
     }
     /// Namespaces Phase 2 Task 18 seam (CONTROL thread): true iff neither the consumer-offset store nor the transaction-state
-    /// store holds a live key of namespace `nsId` (the delete invariant).  It asks each for ONE tombstone batch of 1, so a leak
-    /// is answered false and costs that one key a tombstone: call it once per assertion.
+    /// store holds a live key of namespace `nsId` (the delete invariant).  Read-only: it counts the keys and writes nothing.  A
+    /// store this node does not hold (not the coordinator, not loaded) has no keys here and counts 0.
     template <class = void>   // instantiated after onControlThreadForTest is defined
     bool nsKeyedStoresCleanForTest(uint32_t nsId) {
         return onControlThreadForTest([this, nsId]() -> bool {
-            const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            const bool groups = !groupCoordService_ || groupCoordService_->tombstoneNamespace(nsId, 1, now) == ReapStatus::Done;
-            const bool txns   = !txnCoordService_ || txnCoordService_->tombstoneNamespace(nsId, 1, now) == ReapStatus::Done;
+            const bool groups = !groupCoordService_ || groupCoordService_->liveKeysOfNamespaceForTest(nsId) == 0;
+            const bool txns   = !txnCoordService_ || txnCoordService_->liveKeysOfNamespaceForTest(nsId) == 0;
             return groups && txns;
         });
     }

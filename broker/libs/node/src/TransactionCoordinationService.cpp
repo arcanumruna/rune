@@ -487,6 +487,12 @@ ReapStatus TransactionCoordinationService::tombstoneNamespace(uint32_t nsId, uin
     return r->highWatermark() >= r->logEndOffset() ? ReapStatus::Done : ReapStatus::More;
 }
 
+std::size_t TransactionCoordinationService::liveKeysOfNamespaceForTest(uint32_t nsId) const
+{
+    if (txnState_ == nullptr || loadState_ != LoadState::Loaded) return 0;   // this node holds no keys
+    return txnState_->liveKeysOfNamespaceForTest(nsId);
+}
+
 uint32_t TransactionCoordinationService::abortAllForNamespace(uint32_t nsId, int64_t nowNs)
 {
     if (loadState_ != LoadState::Loaded) return 0;

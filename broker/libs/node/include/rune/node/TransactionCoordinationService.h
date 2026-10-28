@@ -208,6 +208,8 @@ public:
     /// still open or ending (its completion would persist a record after the tombstone).  More = a batch was written, or
     /// the tombstones are not yet committed; Done = none left and all committed.
     ReapStatus tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs);
+    /// Read-only test seam: the live transactional ids of `nsId` in this node's store; 0 when the store is not loaded here.
+    [[nodiscard]] std::size_t liveKeysOfNamespaceForTest(uint32_t nsId) const;
 
     /// A control marker this node could not append.  NEVER counts as landed: a
     /// retriable refusal (NotLeader, MinIsrViolation, Internal, ...) is re-dispatched
