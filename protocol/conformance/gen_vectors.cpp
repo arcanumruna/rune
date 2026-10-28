@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
         msg.correlationId  = kCorrelationId;
         msg.egressStreamId = 1001;
         msg.clientVersion  = 16;
-        msg.egressChannel  = "";
+        msg.egressChannel  = "aeron:udp?endpoint=localhost:40200";
         msg.responseCorrelated = true;
         n = msg.encode(buf);
         write_vec(dir, "connect_request_v16_response.bin", buf, n);

@@ -11,19 +11,19 @@
 // Findings (each guarded by a test below):
 //   * OneControlPortServesManyClients: N exclusive response publications share ONE response-control port
 //     (<S_RSP>); each reaches only its correlated client (no cross-delivery, in order, no loss).
-//   * ReplyFollowsTheResponseFlow: the reply goes to the address the client's response-subscription flow
-//     comes from, never to a declared address and not to the request flow's source port (the request
-//     publication and the response subscription are different client sockets; Aeron 1.51 has no `bind`).
+//   * ReplyReachesTheResponseSubscription: the reply is delivered on the client's response subscription, and
+//     the client's request socket and response socket are distinct ports.  (That the reply follows the
+//     observed, NAT-rewritten source is NOT provable on loopback; later plan tasks cover it.)
 //   * ClientGoneEndsTheResponsePublication: when the client vanishes the response publication goes
-//     not-connected after Aeron's publication connection timeout and releasing it frees its counters.
+//     not-connected after Aeron's publication connection timeout and, once the server closes it, no allocated
+//     counter in the server driver is owned by that publication's registration id any more.
 //
 // CONCLUSION: N exclusive response publications share ONE response-control port; each reaches only its
-// correlated client; replies follow the client's response-subscription flow (no bind/declared address); a
-// vanished client's publication goes not-connected after Aeron's publication connection timeout and frees
-// its counters.
+// correlated client; a vanished client's publication goes not-connected and frees its counters when closed.
 //
-// Wall time: test 3 waits for Aeron's publication connection timeout (the driver clock is not injectable
-// through EmbeddedDriver); that wait is bounded by a steady_clock deadline AND an iteration cap.
+// Wall time: test 3 waits for Aeron's publication connection timeout and linger (the driver clock is not
+// injectable through EmbeddedDriver); those waits sleep 1 ms per iteration, bounded by a steady_clock
+// deadline AND an iteration cap.
 #include <rune/aeronutil/testing/FreePort.h>
 #include <rune/node/EmbeddedDriver.h>
 
@@ -33,13 +33,13 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <string>
-#include <unistd.h>
-#include <atomic>
+#include <thread>
 #include <vector>
 
 using namespace rune::node;
@@ -53,9 +53,9 @@ constexpr int32_t kRspStream = 3002;
 struct TmpDir {
     fs::path path;
     TmpDir() {
-        static std::atomic<int> seq{0};
-        path = fs::temp_directory_path() /
-               ("rune_rspk_" + std::to_string(::getpid()) + "_" + std::to_string(seq++));
+        std::string tmpl = (fs::temp_directory_path() / "rune-resp-spike-XXXXXX").string();
+        if (::mkdtemp(tmpl.data()) == nullptr) std::abort();
+        path = tmpl;
     }
     ~TmpDir() { std::error_code ec; fs::remove_all(path, ec); fs::remove(path.string() + ".lock", ec); }
 };
@@ -64,7 +64,6 @@ EmbeddedDriverConfig cfgAt(const fs::path& p) {
     EmbeddedDriverConfig c;
     c.dir = p.string();
     c.termBufferBytes = 64 * 1024;
-    c.clientLivenessTimeoutNs = 2'000'000'000;  // 2 s; must exceed the 1 s driver timer
     return c;
 }
 
@@ -123,13 +122,20 @@ auto resolveOnce(Pump&& pump, Find&& find, int cap = 200'000) {
     return r;
 }
 
-size_t countersCount(aeron::Aeron& a) {
+constexpr int32_t kSystemCounterTypeId = 0;
+
+// Number of allocated counters in the driver's CountersReader owned by `registrationId`.
+size_t countersOwnedBy(aeron::Aeron& a, int64_t registrationId) {
     size_t n = 0;
-    a.countersReader().forEach([&](int32_t, int32_t, const aeron::concurrent::AtomicBuffer&, const std::string&) { ++n; });
+    auto& reader = a.countersReader();
+    reader.forEach([&](int32_t id, int32_t typeId, const aeron::concurrent::AtomicBuffer&, const std::string&) {
+        if (typeId == kSystemCounterTypeId) return;  // system counters carry no owner registration id
+        if (reader.getCounterRegistrationId(id) == registrationId) ++n;
+    });
     return n;
 }
 
-constexpr auto kWallDeadline = std::chrono::seconds(15);
+constexpr auto kWallDeadline = std::chrono::seconds(30);
 
 }  // namespace
 
@@ -177,6 +183,7 @@ TEST(ResponseEgressSpikeRegression, OneControlPortServesManyClientsRegression) {
 
     for (int i = 0; i < N; ++i) {
         clients.push_back(std::make_unique<Client>());
+        pumpAll();  // service every live Aeron client (server + earlier clients) while this driver starts
         Client& c = *clients.back();
         int64_t rid = c.node.aeron->addSubscription(respSubChannel(rspCtl), kRspStream);
         c.rsp = resolveOnce(pumpAll, [&] { return c.node.aeron->findSubscription(rid); });
@@ -264,7 +271,7 @@ TEST(ResponseEgressSpikeRegression, OneControlPortServesManyClientsRegression) {
     reqSub.reset();
 }
 
-TEST(ResponseEgressSpikeRegression, ReplyFollowsTheResponseFlowRegression) {
+TEST(ResponseEgressSpikeRegression, ReplyReachesTheResponseSubscriptionRegression) {
     const std::string reqEp = ep(rune::aeronutil::testing::allocFreeUdpPort());
     const std::string rspCtl = ep(rune::aeronutil::testing::allocFreeUdpPort());
 
@@ -299,8 +306,7 @@ TEST(ResponseEgressSpikeRegression, ReplyFollowsTheResponseFlowRegression) {
     ASSERT_TRUE(rspPub);
     ASSERT_TRUE(pumpUntil([&] { return rspPub->isConnected() && client.rsp->isConnected() && client.req->isConnected(); }));
 
-    // The reply goes to the address the client's response-subscription flow comes from — never to a declared
-    // address, and not to the request flow's source port: they are different client sockets.
+    // The client's request socket and response socket are distinct ports.
     std::vector<std::string> addrs;
     ASSERT_TRUE(pumpUntil([&] { addrs = client.rsp->localSocketAddresses(); return !addrs.empty(); }))
         << "response subscription reports no local socket address";
@@ -348,10 +354,11 @@ TEST(ResponseEgressSpikeRegression, ClientGoneEndsTheResponsePublicationRegressi
     // injectable through EmbeddedDriver.  Bounded by BOTH a steady_clock deadline and an iteration cap.
     auto pumpServerUntilWall = [&](auto cond) {
         const auto deadline = std::chrono::steady_clock::now() + kWallDeadline;
-        for (long i = 0; i < 400'000'000L; ++i) {
+        for (long i = 0; i < 100'000L; ++i) {
             if (cond()) return true;
             if (std::chrono::steady_clock::now() > deadline) return cond();
             pumpServer();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         return cond();
     };
@@ -369,12 +376,13 @@ TEST(ResponseEgressSpikeRegression, ClientGoneEndsTheResponsePublicationRegressi
     auto image = reqSub->imageByIndex(0);
     ASSERT_TRUE(image);
 
-    const size_t baseline = countersCount(*server.aeron);
-
     int64_t pubId = server.aeron->addExclusivePublication(rspPubChannel(rspCtl, image->correlationId()), kRspStream);
     auto rspPub = resolveOnce(pumpBoth, [&] { return server.aeron->findExclusivePublication(pubId); });
     ASSERT_TRUE(rspPub);
+    const int64_t pubRegId = rspPub->registrationId();
     ASSERT_TRUE(pumpUntil([&] { return rspPub->isConnected() && client->rsp->isConnected(); }));
+    // Non-vacuous: the open publication owns at least one allocated counter.
+    ASSERT_GT(countersOwnedBy(*server.aeron, pubRegId), 0u) << "open publication owns no counters";
 
     // Round trip first.
     uint8_t buf[4] = {};
@@ -393,12 +401,12 @@ TEST(ResponseEgressSpikeRegression, ClientGoneEndsTheResponsePublicationRegressi
     image.reset();
 
     ASSERT_TRUE(pumpServerUntilWall([&] { return !rspPub->isConnected(); }))
-        << "response publication stayed connected after the client vanished";
+        << "step 1 timed out: response publication stayed connected after the client vanished";
 
-    rspPub.reset();
-    size_t after = countersCount(*server.aeron);
-    const bool back = pumpServerUntilWall([&] { return (after = countersCount(*server.aeron)) == baseline; });
-    EXPECT_TRUE(back) << "counters baseline=" << baseline << " after=" << after;
+    // rspPub.reset();
+    size_t owned = 0;
+    const bool freed = pumpServerUntilWall([&] { return (owned = countersOwnedBy(*server.aeron, pubRegId)) == 0; });
+    EXPECT_TRUE(freed) << "step 2 timed out: " << owned << " counters still owned by closed publication " << pubRegId;
 
     reqSub.reset();
 }

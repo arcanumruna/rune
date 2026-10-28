@@ -446,7 +446,9 @@ struct MetadataResponse {
         if (brokerCount2 != brokerCount) return std::nullopt;   // must parallel brokers[]
         if (pos + static_cast<std::size_t>(brokerCount2) * 4u > avail) return std::nullopt;
         for (uint16_t i = 0; i < brokerCount2; ++i) {
-            result.brokers[i].responseControlPort = detail::getLE32(buf, static_cast<int>(pos));
+            const int32_t port = detail::getLE32(buf, static_cast<int>(pos));
+            if (port < 0 || port > 65535) return std::nullopt;   // not a port
+            result.brokers[i].responseControlPort = port;
             pos += 4;
         }
         if (pos + 2u > avail) return std::nullopt;
@@ -455,7 +457,9 @@ struct MetadataResponse {
         if (partCount2 != partCount) return std::nullopt;       // must parallel partitions[]
         if (pos + static_cast<std::size_t>(partCount2) * 4u > avail) return std::nullopt;
         for (uint16_t i = 0; i < partCount2; ++i) {
-            result.partitions[i].responseControlPort = detail::getLE32(buf, static_cast<int>(pos));
+            const int32_t port = detail::getLE32(buf, static_cast<int>(pos));
+            if (port < 0 || port > 65535) return std::nullopt;   // not a port
+            result.partitions[i].responseControlPort = port;
             pos += 4;
         }
         return result;   // later additive trailers (none today) are ignored

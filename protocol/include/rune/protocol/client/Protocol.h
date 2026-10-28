@@ -366,10 +366,11 @@ inline constexpr int32_t kClientVersionNamespaces                 = 14;
 // instead: every older client ends a subscription or group fetch on it (never parks it).
 inline constexpr int32_t kClientVersionRecordEgressUnavailable      = 15;  // understands SubscribeResponse 49 (#450)
 // 16 — NAT-safe egress (spec broker/docs/superpowers/specs/2026-10-26-rune-nat-egress-design.md D4): ConnectRequest
-// carries a trailing responseCorrelated byte. 1 = the client opened a response subscription and its request
-// publication carries response-correlation-id; a broker >= 9 then answers it only on an Aeron response publication
-// correlated with the request image, and its Metadata carries the response-control ports. A session below 16 keeps
-// the declared egressChannel path.
+// carries a trailing responseCorrelated byte. A v16 client ALWAYS sends its declared egressChannel together with
+// responseCorrelated = 1 (an older broker ignores the flag and answers on the declared channel); a broker >= 9
+// ignores the declared channel whenever the flag is 1 and answers only on an Aeron response publication correlated
+// with the request image, and its Metadata carries the response-control ports. A session below 16 keeps the
+// declared egressChannel path.
 inline constexpr int32_t kClientVersionResponseEgress             = 16;
 inline constexpr int32_t kClientVersion                           = 15;  // what this protocol's client announces
 // 16 (response egress) is announced once client-cpp implements it (NAT plan Task 7).

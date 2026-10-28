@@ -6,7 +6,7 @@ This directory contains the **golden binary frames** (`.bin`) for every Rune cli
 
 ```
 conformance/
-  vectors/               — 10 committed golden .bin files
+  vectors/               — 49 committed golden .bin files (the main ones listed)
     connect_request.bin                  (67 bytes)
     connect_request_empty_channel.bin    (34 bytes)
     connect_request_v16_response.bin     (43 bytes, NAT-safe egress)

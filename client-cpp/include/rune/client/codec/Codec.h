@@ -102,19 +102,13 @@ inline std::size_t encodeConnectRequest(uint8_t*         buf,
                                         int32_t          clientVersion,
                                         int64_t          sessionId,
                                         int64_t          correlationId) noexcept {
-    // Minimum bytes needed: header(24) + fixed(8) + varLen(2) + channel bytes
-    const std::size_t needed = rpc::MessageHeader::ENCODED_SIZE
-                             + rpc::ConnectRequest::BODY_FIXED
-                             + 2u
-                             + egressChannel.size();
-    if (cap < needed) return 0u;
-
     rpc::ConnectRequest msg;
     msg.sessionId      = sessionId;
     msg.correlationId  = correlationId;
     msg.egressStreamId = egressStreamId;
     msg.clientVersion  = clientVersion;
     msg.egressChannel  = egressChannel;
+    if (cap < msg.encodedSize()) return 0u;
     return msg.encode(buf);
 }
 
@@ -162,13 +156,7 @@ inline std::size_t encodeConnectRequestCrypto(std::vector<uint8_t>&     buf,
     msg.handshakeBytes = handshakeBytes;
     msg.authToken      = authToken;
 
-    const std::size_t needed = rpc::MessageHeader::ENCODED_SIZE
-                              + rpc::ConnectRequest::BODY_FIXED
-                              + 2u + egressChannel.size()
-                              + 2u + cipherList.size()
-                              + 4u + handshakeBytes.size()
-                              + 2u + authToken.size();
-    buf.resize(needed);
+    buf.resize(msg.encodedSize());
     return msg.encode(buf.data());
 }
 

@@ -164,8 +164,7 @@ public:
         req.clientVersion  = clientVersion_;
         req.egressChannel  = egressChannel_;
         req.sessionId      = connectHint_;   // authentication Task 11: a resume hint (0 = none)
-        std::vector<uint8_t> buf(pc::MessageHeader::ENCODED_SIZE + pc::ConnectRequest::BODY_FIXED + 2 +
-                                 req.egressChannel.size());
+        std::vector<uint8_t> buf(req.encodedSize());
         const std::size_t len = req.encode(buf.data());
         if (!send(gatewayChannel, stream, buf.data(), len, deadline)) return -1;
         for (int i = 0; i < kMaxIters && !connect_ && std::chrono::steady_clock::now() < deadline; ++i) { poll_(); pause_(); }

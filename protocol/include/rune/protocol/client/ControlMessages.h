@@ -61,10 +61,20 @@ struct ConnectRequest {
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::Connect); // 1
     static constexpr uint16_t BODY_FIXED  = 8;  // fixed body bytes (not counting header or var fields)
 
-    /// Encode the full frame into buf.  buf must be large enough:
-    ///   MessageHeader::ENCODED_SIZE + BODY_FIXED + 2 + egressChannel.size()
-    ///   [+ 2+cipherList.size() + 4+handshakeBytes.size() + 2+authToken.size() if offering crypto]
-    ///   [at clientVersion >= 16: the crypto block is always written (+2+4+2 when empty) and then +1 flag byte]
+    /// Exact encoded frame size; mirrors encode() (every hand-sized buffer must use this).
+    ///   header + BODY_FIXED + 2 + egressChannel.size()
+    ///   [+ 2+cipherList.size() + 4+handshakeBytes.size() + 2+authToken.size() if offering crypto or clientVersion >= 16]
+    ///   [+ 1 flag byte at clientVersion >= 16]
+    std::size_t encodedSize() const noexcept {
+        std::size_t n = MessageHeader::ENCODED_SIZE + BODY_FIXED + 2u + egressChannel.size();
+        const bool offersCrypto = !cipherList.empty() || !handshakeBytes.empty() || !authToken.empty();
+        if (offersCrypto || clientVersion >= kClientVersionResponseEgress)
+            n += 2u + cipherList.size() + 4u + handshakeBytes.size() + 2u + authToken.size();
+        if (clientVersion >= kClientVersionResponseEgress) n += 1u;
+        return n;
+    }
+
+    /// Encode the full frame into buf.  buf must hold encodedSize() bytes.
     /// Returns total bytes written.
     std::size_t encode(uint8_t* buf) const noexcept {
         // Write header
@@ -132,6 +142,9 @@ struct ConnectRequest {
         // bytes left to read. Absence of either ⇒ no crypto offered (fields
         // stay default-empty); an old (<v4) client's frame decodes exactly
         // as before this task.
+        // At clientVersion >= 16 the crypto block is mandatory (an empty one is 2+4+2 bytes).
+        const bool v16 = msg.clientVersion >= kClientVersionResponseEgress;
+        if (v16 && pos >= avail) return std::nullopt;
         if (msg.clientVersion >= kClientVersionCrypto && pos < avail) {
             const uint8_t* clData = nullptr;
             uint16_t       clLen  = 0;
@@ -146,8 +159,9 @@ struct ConnectRequest {
             if (!getVarStr(buf, avail, pos, msg.authToken)) return std::nullopt;
         }
 
-        // v16: the response-correlated flag follows the crypto block; absent = false.
-        if (msg.clientVersion >= kClientVersionResponseEgress && pos < avail) {
+        // v16: the response-correlated flag follows the crypto block and is mandatory.
+        if (v16) {
+            if (pos >= avail) return std::nullopt;
             const uint8_t f = buf[pos++];
             if (f > 1) return std::nullopt;
             msg.responseCorrelated = f == 1;

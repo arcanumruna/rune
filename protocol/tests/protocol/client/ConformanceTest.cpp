@@ -170,12 +170,12 @@ TEST(ConformanceGolden, ConnectRequestEmptyChannel) {
 
 // ===========================================================================
 // connect_request_v16_response.bin
-//    ConnectRequest{ egressStreamId=1001, clientVersion=16, egressChannel="", responseCorrelated=true }
-//    Expected byte length: 34 + (2+4+2 empty crypto block) + 1 flag = 43
+//    ConnectRequest{ egressStreamId=1001, clientVersion=16, egressChannel="aeron:udp?endpoint=localhost:40200", responseCorrelated=true }
+//    Expected byte length: 34 + 34 channel + (2+4+2 empty crypto block) + 1 flag = 77
 // ===========================================================================
 TEST(ConformanceGolden, ConnectRequestV16Response) {
     const auto golden = readVector("connect_request_v16_response.bin");
-    ASSERT_EQ(golden.size(), 43u);
+    ASSERT_EQ(golden.size(), 77u);
 
     assertHeader(golden, rpc::ConnectRequest::TEMPLATE_ID, rpc::ConnectRequest::BODY_FIXED);
 
@@ -185,7 +185,7 @@ TEST(ConformanceGolden, ConnectRequestV16Response) {
     EXPECT_EQ(msgOpt->correlationId,  kCorrelationId);
     EXPECT_EQ(msgOpt->egressStreamId, 1001);
     EXPECT_EQ(msgOpt->clientVersion,  16);
-    EXPECT_EQ(msgOpt->egressChannel.size(), 0u);
+    EXPECT_EQ(msgOpt->egressChannel, "aeron:udp?endpoint=localhost:40200");
     EXPECT_TRUE(msgOpt->responseCorrelated);
 
     rpc::ConnectRequest msg;
@@ -193,12 +193,12 @@ TEST(ConformanceGolden, ConnectRequestV16Response) {
     msg.correlationId  = kCorrelationId;
     msg.egressStreamId = 1001;
     msg.clientVersion  = 16;
-    msg.egressChannel  = "";
+    msg.egressChannel  = "aeron:udp?endpoint=localhost:40200";
     msg.responseCorrelated = true;
 
-    std::array<uint8_t, 64> enc{};
+    std::array<uint8_t, 128> enc{};
     const std::size_t n = msg.encode(enc.data());
-    ASSERT_EQ(n, 43u);
+    ASSERT_EQ(n, 77u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden connect_request_v16_response.bin";
 }

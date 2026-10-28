@@ -75,7 +75,7 @@ Offset  Hex                                        Notes
 
 ---
 
-## 2b. `connect_request_v16_response.bin` — 43 bytes
+## 2b. `connect_request_v16_response.bin` — 77 bytes
 
 **Message:** `ConnectRequest` (templateId = 1), NAT-safe egress form (clientVersion 16)
 
@@ -89,7 +89,7 @@ Offset  Hex                                        Notes
 | correlationId      | 723685415333974033       | 0x0A0B0C0D0E0F1011              |
 | egressStreamId     | 1001                     | 0x000003E9                      |
 | clientVersion      | 16                       | 0x00000010                      |
-| egressChannel      | ""                       | len=0 (0x0000)                  |
+| egressChannel      | "aeron:udp?endpoint=localhost:40200" | len=34 (0x0022) |
 | cipherList         | empty                    | len=0 (uint16)                  |
 | handshakeBytes     | empty                    | len=0 (uint32)                  |
 | authToken          | ""                       | len=0 (uint16)                  |
@@ -108,11 +108,12 @@ Offset  Hex                                        Notes
 16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
 24      E9 03 00 00                                egressStreamId = 1001 (LE)
 28      10 00 00 00                                clientVersion = 16 (LE)
-32      00 00                                      egressChannel var-len = 0 (LE)
-34      00 00                                      cipherList var-len = 0 (LE)
-36      00 00 00 00                                handshakeBytes var-len = 0 (uint32 LE)
-40      00 00                                      authToken var-len = 0 (LE)
-42      01                                         responseCorrelated = 1
+32      22 00                                      egressChannel var-len = 34 (LE)
+34      61 65 72 6F 6E 3A 75 64 ...   egressChannel bytes "aeron:udp?endpoint=localhost:40200"
+68      00 00                                      cipherList var-len = 0 (LE)
+70      00 00 00 00                                handshakeBytes var-len = 0 (uint32 LE)
+74      00 00                                      authToken var-len = 0 (LE)
+76      01                                         responseCorrelated = 1
 ```
 
 ---

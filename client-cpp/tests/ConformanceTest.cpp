@@ -25,6 +25,7 @@
 #include <rune/client/codec/Codec.h>
 
 #include <array>
+#include <span>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -543,5 +544,52 @@ TEST(ClientCodecSessionFlow, RoundTripSequence) {
             << " (" << kFlow[i].filename << ")";
         EXPECT_EQ(*tid, kFlow[i].expectedTemplateId)
             << "TemplateId mismatch (enum) at flow step " << i;
+    }
+}
+
+// ===========================================================================
+// v16 ConnectRequest: the buffer bound must be the codec's own encodedSize() (crypto block + flag byte at >= 16)
+// ===========================================================================
+TEST(ClientCodecConnectRegression, ConnectRequestCodecV16BufferRegression) {
+    const std::string_view channel = "aeron:udp?endpoint=localhost:40200";
+    const std::size_t oldFormula = 24u + 8u + 2u + channel.size();   // pre-v16 size: too small for a v16 frame
+    {
+        std::vector<uint8_t> buf(oldFormula + 32u, 0xAB);
+        const std::size_t n = cc::encodeConnectRequest(buf.data(), oldFormula, channel, 1001, 16, kSessionId,
+                                                       kCorrelationId);
+        EXPECT_EQ(n, 0u) << "a v16 frame does not fit the pre-v16 capacity";
+        for (std::size_t i = 0; i < buf.size(); ++i) ASSERT_EQ(buf[i], 0xAB) << "wrote at " << i;
+    }
+    {
+        const std::size_t need = oldFormula + 2u + 4u + 2u + 1u;
+        std::vector<uint8_t> buf(need + 32u, 0xAB);
+        const std::size_t n = cc::encodeConnectRequest(buf.data(), need, channel, 1001, 16, kSessionId,
+                                                       kCorrelationId);
+        ASSERT_EQ(n, need);
+        for (std::size_t i = need; i < buf.size(); ++i) ASSERT_EQ(buf[i], 0xAB) << "guard overwritten at " << i;
+        const auto view = cc::decodeConnectRequest(buf.data(), n);
+        ASSERT_TRUE(view.has_value());
+        EXPECT_EQ(view->clientVersion, 16);
+        EXPECT_EQ(view->egressChannel, channel);
+    }
+    {
+        // pre-v16 capacity is still exact
+        std::vector<uint8_t> buf(oldFormula, 0u);
+        EXPECT_EQ(cc::encodeConnectRequest(buf.data(), oldFormula, channel, 1001, 15, kSessionId, kCorrelationId),
+                  oldFormula);
+    }
+    {
+        // the crypto encoder sizes the vector from encodedSize(): exact at v16 with and without a flag
+        const uint8_t cipher = 2;
+        std::vector<uint8_t> buf;
+        const std::size_t n = cc::encodeConnectRequestCrypto(buf, channel, 1001, 16, kSessionId, kCorrelationId,
+                                                             std::span<const uint8_t>(&cipher, 1), "hs", "");
+        EXPECT_EQ(buf.size(), n);
+        EXPECT_EQ(n, oldFormula + 2u + 1u + 4u + 2u + 2u + 1u);
+        const auto dec = rune::protocol::client::ConnectRequest::decode(buf.data(), n);
+        ASSERT_TRUE(dec.has_value());
+        EXPECT_FALSE(dec->responseCorrelated);
+        EXPECT_EQ(dec->handshakeBytes, "hs");
+        EXPECT_EQ(dec->egressChannel, channel);
     }
 }

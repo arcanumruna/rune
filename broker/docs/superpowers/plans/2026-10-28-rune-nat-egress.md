@@ -65,11 +65,11 @@ See spec §5.
   - **`OneControlPortServesManyClientsRegression`:** one server request subscription and N = 8 client drivers. The
     server creates one response publication per image, all on ONE response-control endpoint. Each client gets only
     its own messages: a payload tag per client, over 1,000 messages each.
-  - **`ReplyFollowsTheObservedSourceRegression`:** the client's request publication binds a source port different
-    from its response subscription. The reply still arrives (the response follows the client's flow, not a declared
-    address).
+  - **`ReplyReachesTheResponseSubscriptionRegression`:** the reply is delivered on the client's response
+    subscription, and the client's request and response sockets are distinct ports. Following the observed
+    (NAT-rewritten) source is proven by Task 8's source-port change and Task 9's NAT e2e.
   - **`ClientGoneEndsTheResponsePublicationRegression`:** the client closes. The server's response publication goes
-    not-connected within the liveness timeout and is closed with no leak (`countersReader` count back to baseline).
+    not-connected within the liveness timeout and, once closed, no allocated counter is owned by its registration id.
 - **Decision recorded in the spec:** a shared control port works, so one port per publisher thread; otherwise stop
   and redesign D3.
 

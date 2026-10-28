@@ -360,6 +360,27 @@ TEST(VarFieldHelper, GetVarBytesLengthPrefixTruncated) {
 // 1. Max-length egressChannel = u16 max (65535 bytes)
 //    encode→decode round-trips exactly; total size == 34 + 65535 == 65569.
 // ---------------------------------------------------------------------------
+TEST(ConnectRequestCodec, MaxU16EgressChannelRoundTripV16) {
+    const std::string bigChannel(65535u, 'A');
+    rpc::ConnectRequest req;
+    req.sessionId      = 0xDEADBEEFCAFEBABELL;
+    req.correlationId  = 0x0102030405060708LL;
+    req.egressStreamId = 12345;
+    req.clientVersion  = rpc::kClientVersionResponseEgress;
+    req.egressChannel  = bigChannel;
+    req.responseCorrelated = true;
+    std::vector<uint8_t> buf(req.encodedSize(), 0u);
+    ASSERT_EQ(buf.size(), 65569u + 2u + 4u + 2u + 1u);
+    const std::size_t written = req.encode(buf.data());
+    EXPECT_EQ(written, buf.size());
+    auto decoded = rpc::ConnectRequest::decode(buf.data(), written);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->egressChannel, std::string_view(bigChannel));
+    EXPECT_EQ(decoded->clientVersion, req.clientVersion);
+    EXPECT_EQ(decoded->egressStreamId, req.egressStreamId);
+    EXPECT_TRUE(decoded->responseCorrelated);
+}
+
 TEST(ConnectRequestCodec, MaxU16EgressChannelRoundTrip) {
     // 65535 bytes — the maximum a uint16 length prefix can encode.
     const std::size_t kMaxLen = 65535u;
@@ -1024,16 +1045,9 @@ TEST(ConnectRequestResponseEgressRegression, TruncationNeverMisparsesRegression)
     req.authToken = "t";
     const auto buf = encodeConnect(req);
     const std::size_t full = buf.size();
-    for (std::size_t cut = 34 + req.egressChannel.size(); cut < full; ++cut) {
-        const auto out = rpc::ConnectRequest::decode(buf.data(), cut);
-        if (cut == 34 + req.egressChannel.size() || cut == full - 1) {
-            // No crypto block at all (a v4-style frame), or the flag byte missing: both decode with the flag false.
-            ASSERT_TRUE(out.has_value());
-            EXPECT_FALSE(out->responseCorrelated);
-        } else {
-            EXPECT_FALSE(out.has_value()) << "cut=" << cut;
-        }
-    }
+    // At v16 the crypto block and the flag byte are mandatory: every truncation rejects.
+    for (std::size_t cut = 0; cut < full; ++cut)
+        EXPECT_FALSE(rpc::ConnectRequest::decode(buf.data(), cut).has_value()) << "cut=" << cut;
     const auto whole = rpc::ConnectRequest::decode(buf.data(), full);
     ASSERT_TRUE(whole.has_value());
     EXPECT_TRUE(whole->responseCorrelated);
@@ -1043,4 +1057,41 @@ TEST(ConnectRequestResponseEgressRegression, FlagAboveOneIsRejectedRegression) {
     auto buf = encodeConnect(v16Request("", true));
     buf.back() = 2;
     EXPECT_FALSE(rpc::ConnectRequest::decode(buf.data(), buf.size()).has_value());
+}
+
+TEST(ConnectRequestResponseEgressRegression, V16MissingFlagRejectedRegression) {
+    const auto buf = encodeConnect(v16Request("aeron:ipc", true));
+    // the flag byte missing (crypto block complete)
+    EXPECT_FALSE(rpc::ConnectRequest::decode(buf.data(), buf.size() - 1).has_value());
+    // no crypto block and no flag (a v4-style body under a v16 version)
+    EXPECT_FALSE(rpc::ConnectRequest::decode(buf.data(), 34 + 9).has_value());
+    EXPECT_TRUE(rpc::ConnectRequest::decode(buf.data(), buf.size()).has_value());
+    // below v16 the crypto block stays optional
+    auto v15 = v16Request("aeron:ipc", false);
+    v15.clientVersion = rpc::kClientVersionCrypto;
+    const auto b15 = encodeConnect(v15);
+    EXPECT_TRUE(rpc::ConnectRequest::decode(b15.data(), 34 + 9).has_value());
+}
+
+TEST(ConnectRequestResponseEgressRegression, EncodedSizeMatchesEncodeRegression) {
+    const std::string big(65535, 'c');
+    const std::array<uint8_t, 3> ciphers{1, 2, 3};
+    const std::string_view channels[] = {"", "aeron:udp?endpoint=localhost:40200", big};
+    for (const int32_t version : {3, 15, 16, 17})
+        for (const bool crypto : {false, true})
+            for (const std::string_view ch : channels) {
+                rpc::ConnectRequest req = v16Request(ch, true);
+                req.clientVersion = version;
+                if (crypto) {
+                    req.cipherList = std::span<const uint8_t>(ciphers);
+                    req.handshakeBytes = "hello-handshake";
+                    req.authToken = "tok";
+                }
+                const std::size_t sz = req.encodedSize();
+                std::vector<uint8_t> buf(sz + 16, 0xAB);
+                const std::size_t n = req.encode(buf.data());
+                EXPECT_EQ(n, sz) << "v" << version << " crypto=" << crypto << " ch=" << ch.size();
+                for (std::size_t i = sz; i < sz + 16; ++i)
+                    ASSERT_EQ(buf[i], 0xAB) << "guard overwritten v" << version << " crypto=" << crypto;
+            }
 }

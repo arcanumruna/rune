@@ -28,6 +28,7 @@
 #include <rune/protocol/client/Protocol.h>
 
 #include <array>
+#include <climits>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -745,4 +746,46 @@ TEST(MetadataResponsePortsRegression, WithEndpointsAndReceiverIdsRegression) {
     EXPECT_EQ(out->partitions[2].ingressReceiverId, 3);
     EXPECT_EQ(out->brokers[0].responseControlPort, 9001);
     EXPECT_EQ(out->partitions[1].responseControlPort, 9102);
+}
+
+TEST(MetadataResponsePortsRegression, OutOfRangePortRejectedRegression) {
+    PortsFixture f;
+    const auto buf = encodeMd(f.response(16));
+    const std::size_t trailer = 2u + 2u * 4u + 2u + 3u * 4u;
+    const std::size_t brokerPorts = buf.size() - trailer + 2u;       // first broker port
+    const std::size_t partPorts = buf.size() - trailer + 2u + 8u + 2u;   // first partition port
+    for (const std::size_t at : {brokerPorts, brokerPorts + 4u, partPorts, partPorts + 8u}) {
+        for (const int32_t bad : {-1, 65536, INT32_MIN, INT32_MAX}) {
+            auto b = buf;
+            rpc::detail::putLE32(b.data(), static_cast<int>(at), bad);
+            EXPECT_FALSE(rpc::MetadataResponse::decode(b.data(), b.size()).has_value()) << "at " << at << " port " << bad;
+        }
+        for (const int32_t good : {0, 1, 65535}) {
+            auto b = buf;
+            rpc::detail::putLE32(b.data(), static_cast<int>(at), good);
+            const auto out = rpc::MetadataResponse::decode(b.data(), b.size());
+            ASSERT_TRUE(out.has_value()) << "at " << at << " port " << good;
+        }
+    }
+}
+
+TEST(MetadataMessagesReceiverIdRegression, JunkAfterReceiverTrailerRejectedRegression) {
+    // At clientVersion >= 16 the bytes after the receiver trailer are the response-port trailer: 1, 2 or 3 junk
+    // bytes are a torn or mismatched trailer, never ignored.
+    rpc::PartitionEntry p0; p0.topicId = 3; p0.partition = 0; p0.ingressEndpoint = "h:1"; p0.ingressReceiverId = 1;
+    std::vector<rpc::BrokerEntry> brokers(2);
+    brokers[0].nodeId = 1; brokers[0].host = "a"; brokers[1].nodeId = 2; brokers[1].host = "b";
+    const std::vector<rpc::PartitionEntry> parts{p0};
+    rpc::MetadataResponse r;
+    r.sessionId = 5; r.correlationId = 6; r.clientVersion = rpc::kClientVersionResponseEgress;
+    r.brokers = std::span<const rpc::BrokerEntry>(brokers);
+    r.partitions = std::span<const rpc::PartitionEntry>(parts);
+    std::vector<uint8_t> base(r.encodedSize());
+    ASSERT_EQ(r.encode(base.data()), base.size());
+    ASSERT_TRUE(rpc::MetadataResponse::decode(base.data(), base.size()).has_value());
+    for (std::size_t junk = 1; junk <= 3; ++junk) {
+        auto b = base;
+        for (std::size_t i = 0; i < junk; ++i) b.push_back(static_cast<uint8_t>(0xA0 + i));
+        EXPECT_FALSE(rpc::MetadataResponse::decode(b.data(), b.size()).has_value()) << "junk " << junk;
+    }
 }
