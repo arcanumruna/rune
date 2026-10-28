@@ -101,10 +101,18 @@ public:
         return at;
     }
 
+    /// #374: reserve the whole frame (Produce header + RecordBatch header + records) up front, once, off the hot
+    /// path (the producer calls it when a partition's builder is created, with a bound no send / claim within the
+    /// documented limits can exceed): afterwards no append, reservation or reserveExtra() within `frameBytes`
+    /// ever allocates or moves data().  The capacity persists across batches (reset() keeps it).
+    void preallocate(std::size_t frameBytes) { frame_.reserve(frameBytes); }
+
     /// Capacity for `n` more bytes: appends / reservations within it never
     /// reallocate (so they never throw and data() never moves).
-    /// Grows geometrically (an exact reserve would reallocate - and copy the whole builder - on EVERY claim while
-    /// a held builder grows past its high-water mark); capacity persists across batches (reset() keeps it).
+    /// With preallocate() done this is a no-op for everything inside the documented limits.  The geometric growth
+    /// below is only the fallback for a size beyond them (a claimBatch with no frame cap on a ring larger than
+    /// the preallocated bound): an exact reserve would reallocate - and copy the whole builder - on EVERY claim
+    /// while a held builder grows past its high-water mark.
     void reserveExtra(std::size_t n) {
         const std::size_t need = frame_.size() + n;
         if (need > frame_.capacity()) frame_.reserve(std::max(need, 2 * frame_.capacity()));
@@ -117,6 +125,9 @@ public:
         int64_t     maxTimestamp = 0;
     };
     [[nodiscard]] Mark mark() const noexcept { return Mark{frame_.size(), recordCount_, maxTimestamp_}; }
+    /// Shrinks the frame back to `m`.  PRECONDITION: `m.size <= size()` - a Mark is always taken at or before the
+    /// point we roll back from; a larger (stale) one would GROW the frame over bytes nobody wrote.  Debug builds
+    /// assert it; a release build has no branch for it (this is the claim abort path), so callers must honour it.
     void rollback(const Mark& m) noexcept {
         // Debug-only precondition (#333, no release-path branch): a Mark is always taken at or before the point we
         // roll back from; a larger (stale) one would GROW the frame over bytes nobody wrote.

@@ -524,3 +524,37 @@ TEST(ProducerIdRegression, CloseWithHeldRecordsCompletesWithinTheBoundRegression
     EXPECT_EQ(L.times(1), 1);
     EXPECT_EQ(L.status(1), OpStatus::DeliveryFailed);
 }
+
+// #343: enableCoordinator moves a hub-fed BARE impl off the rig id - only legal before anything was sent.  With
+// acked batches in flight it used to reset the partitions and re-stamp those batches at sequence 0 under the new
+// id (duplicate records).  Debug builds assert; release builds refuse (logged): the pid, the sequences and the
+// in-flight batches are untouched and no InitProducerId is ever requested.
+#if GTEST_HAS_DEATH_TEST
+TEST(ProducerIdRegression, EnableCoordinatorWithInFlightBatchesNeverReStampsThemRegression) {
+    Rig r(cfgOf(Acks::Leader), /*direct=*/false, /*wired=*/false);
+    ASSERT_TRUE(r.send(0, 1, true, 1));
+    ASSERT_TRUE(r.send(0, 2, true, 2));
+    r.tick();
+    ASSERT_EQ(r.wire.size(), 1u) << "one batch in flight";
+    ASSERT_EQ(r.wire[0].pid, rp::kRigProducerId);
+    const rp::PartitionState* ps = r.impl->partitionState(1, 0);
+    ASSERT_NE(ps, nullptr);
+    ASSERT_FALSE(ps->inflight.empty());
+    const int32_t nextSeq = ps->nextBaseSequence;
+    ASSERT_GT(nextSeq, 0);
+
+    EXPECT_DEBUG_DEATH(r.impl->enableCoordinator(r.fake.sink(), 0), "in-flight");
+
+    // (Release builds ran the call above in this process; debug builds ran it in a child.  Either way:)
+    ASSERT_TRUE(r.impl->identityAssigned());
+    EXPECT_EQ(std::get<rp::IdAssigned>(r.impl->identity()).producerId, rp::kRigProducerId);
+    EXPECT_FALSE(r.impl->hasCoordinator()) << "a refused enable wires nothing";
+    EXPECT_EQ(ps->producerId, rp::kRigProducerId) << "the partition keeps its identity";
+    EXPECT_EQ(ps->nextBaseSequence, nextSeq) << "its sequences are not restarted";
+    EXPECT_FALSE(ps->inflight.empty());
+    r.ticks(5, kMs);
+    EXPECT_EQ(r.initRequests(), 0u) << "no InitProducerId: the batch is never re-stamped under a new id";
+    EXPECT_EQ(r.wire.size(), 1u) << "and never re-sent";
+    EXPECT_EQ(r.wire[0].baseSeq, 0);
+}
+#endif

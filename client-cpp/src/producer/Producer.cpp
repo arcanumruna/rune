@@ -123,12 +123,21 @@ void Producer::release_() noexcept {
 // F8c C6: the batch-ack credit unit every send reserves when batchAcksTo() is
 // bound (cold: only producers bound to a batch-ack queue reach this).
 namespace {
-[[nodiscard]] SendResult reserveBatchUnit(Completions& bq) noexcept {
+// The batch-ack credit of a send / claim: `units` reservations of ONE unit each - the units a Tier-1 BatchAck
+// returns per record.  All or none (#329: the single-unit form is the same body).
+[[nodiscard]] SendResult reserveBatchUnits(Completions& bq, uint32_t units) noexcept {
     if (!bq.valid()) return SendResult::InvalidArgument;  // review m7: moved-from queue
     if (!bq.onOwnerThread()) return SendResult::WrongThread;
-    const OpResult r = bq.reserve(producer::kAckRecordBytes);
-    return r == OpResult::Accepted ? SendResult::Ok : mapReserve(r);
+    for (uint32_t i = 0; i < units; ++i) {
+        const OpResult r = bq.reserve(producer::kAckRecordBytes);
+        if (r != OpResult::Accepted) {
+            for (uint32_t j = 0; j < i; ++j) bq.unreserve(producer::kAckRecordBytes);
+            return mapReserve(r);
+        }
+    }
+    return SendResult::Ok;
 }
+[[nodiscard]] SendResult reserveBatchUnit(Completions& bq) noexcept { return reserveBatchUnits(bq, 1); }
 } // namespace
 
 // The one send body (T15b M3): the partition is computed by the caller, once.
@@ -139,6 +148,7 @@ SendResult Producer::trySendPart_(TopicHandle topic, int32_t part, const Key& ke
     if (bq == nullptr) [[likely]] {
         return impl->trySubmit(topic.topicId, part, key, value, 0);
     }
+    if (impl->gateRefusesBeforeCredit()) [[unlikely]] return SendResult::NotInTransaction;  // #339: before any credit
     const SendResult u = reserveBatchUnit(*bq);
     if (u != SendResult::Ok) return u;
     const SendResult r = impl->trySubmit(topic.topicId, part, key, value, 0);
@@ -212,6 +222,7 @@ SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const 
     // Owner check in EVERY build (review m8): the credit counters are the
     // owner thread's plain state; a foreign thread must never touch them.
     if (!cq.onOwnerThread()) return SendResult::WrongThread;
+    if (impl_->gateRefusesBeforeCredit()) [[unlikely]] return SendResult::NotInTransaction;  // #339: before any credit
     const OpResult rr = cq.reserve(producer::kAckRecordBytes);
     if (rr != OpResult::Accepted) return mapReserve(rr);
     Completions* bq = impl_->batchAckCq();
@@ -242,6 +253,7 @@ SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const 
     if (token.token > kMaxToken) return SendResult::InvalidArgument;
     Completions* bq = impl_->batchAckCq();
     if (bq != nullptr) [[unlikely]] {
+        if (impl_->gateRefusesBeforeCredit()) return SendResult::NotInTransaction;  // #339: before any credit
         const SendResult u = reserveBatchUnit(*bq);
         if (u != SendResult::Ok) return u;
     }
@@ -301,42 +313,27 @@ void Producer::batchAcksTo(Completions& cq) {
 // Phase 2b Part B: zero-copy produce
 // ---------------------------------------------------------------------------
 
-namespace {
-// The batch-ack credit of a claim: `units` reservations of ONE unit each — the
-// units a Tier-1 BatchAck returns per record.  All or none.
-[[nodiscard]] SendResult reserveBatchUnits(Completions& bq, uint32_t units) noexcept {
-    if (!bq.valid()) return SendResult::InvalidArgument;
-    if (!bq.onOwnerThread()) return SendResult::WrongThread;
-    for (uint32_t i = 0; i < units; ++i) {
-        const OpResult r = bq.reserve(producer::kAckRecordBytes);
-        if (r != OpResult::Accepted) {
-            for (uint32_t j = 0; j < i; ++j) bq.unreserve(producer::kAckRecordBytes);
-            return mapReserve(r);
-        }
-    }
-    return SendResult::Ok;
-}
-}  // namespace
 
 Claim Producer::claimPart_(TopicHandle topic, int32_t part, const Key& key, uint32_t valueLen,
                            uint64_t ackHandle, Completions* cq) noexcept {
+    // Credit BEFORE the ring slot (#328): exactly a send's order, so with the ring and the batch-ack queue both
+    // full a claim reports QueueFull like a send does - and a ring refusal below returns the credit.
+    Completions* bq = impl_->batchAckCq();
+    if (bq != nullptr) [[unlikely]] {
+        SendResult u = impl_->gateRefusesBeforeCredit() ? SendResult::NotInTransaction : reserveBatchUnit(*bq);
+        if (u != SendResult::Ok) {
+            if (cq != nullptr) cq->unreserve(producer::kAckRecordBytes);
+            return Claim(u);
+        }
+    }
     const producer::ProducerImpl::ClaimGrant g =
         impl_->claimRecord(topic.topicId, part, key, valueLen, ackHandle);
     if (g.result != SendResult::Ok) {
+        if (bq != nullptr) bq->unreserve(producer::kAckRecordBytes);
         if (cq != nullptr) cq->unreserve(producer::kAckRecordBytes);  // nothing will ever complete
         return Claim(g.result);
     }
-    detail::ClaimOpen core{impl_, g.token, cq, nullptr, 0};
-    if (Completions* bq = impl_->batchAckCq(); bq != nullptr) [[unlikely]] {
-        const SendResult u = reserveBatchUnits(*bq, 1);
-        if (u != SendResult::Ok) {
-            detail::ClaimCredit::abort(core);  // discards the record, returns cq's credit
-            return Claim(u);
-        }
-        core.bq    = bq;
-        core.units = 1;
-    }
-    return Claim(core, g.base, valueLen);
+    return Claim(detail::ClaimOpen{impl_, g.token, cq, bq, bq != nullptr ? 1u : 0u}, g.base, valueLen);
 }
 
 Claim Producer::tryClaim(TopicHandle topic, const Key& key, uint32_t valueLen) noexcept {
@@ -351,6 +348,7 @@ Claim Producer::tryClaim(TopicHandle topic, const Key& key, uint32_t valueLen, C
         return Claim(SendResult::InvalidArgument);
     }
     if (!cq.onOwnerThread()) return Claim(SendResult::WrongThread);
+    if (impl_->gateRefusesBeforeCredit()) [[unlikely]] return Claim(SendResult::NotInTransaction);  // #339
     const OpResult rr = cq.reserve(producer::kAckRecordBytes);
     if (rr != OpResult::Accepted) return Claim(mapReserve(rr));
     return claimPart_(topic, key.partition(topic.partitionCount), key, valueLen,
@@ -364,23 +362,62 @@ Claim Producer::tryClaim(TopicHandle topic, const Key& key, uint32_t valueLen, A
                       producer::ackhandle::forHandler(token.token), nullptr);
 }
 
-BatchClaim Producer::claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen) noexcept {
-    if (!impl_ || !topic.valid()) return BatchClaim(SendResult::InvalidTopic);
-    const producer::ProducerImpl::ClaimGrant g =
-        impl_->claimBatch(topic.topicId, key.partition(topic.partitionCount), key, n, recLen);
-    if (g.result != SendResult::Ok) return BatchClaim(g.result);
-    detail::ClaimOpen core{impl_, g.token, nullptr, nullptr, 0};
-    if (Completions* bq = impl_->batchAckCq(); bq != nullptr) [[unlikely]] {
-        const SendResult u = reserveBatchUnits(*bq, n);  // one unit per record, like n sends
+BatchClaim Producer::claimBatchPart_(TopicHandle topic, int32_t part, const Key& key, uint32_t n,
+                                     uint32_t recLen, uint64_t ackHandle, Completions* cq) noexcept {
+    // Credit before the ring slot, as claimPart_: n batch-ack units (one per record, like n sends), all or none.
+    // The never-retryable size rules come first: an impossible claim is not QueueFull (polling cannot help) and
+    // must not walk a reservation loop of n units.
+    Completions* bq = impl_->batchAckCq();
+    if (bq != nullptr) [[unlikely]] {
+        if (const SendResult shape = impl_->claimBatchShape(key, n, recLen); shape != SendResult::Ok) {
+            if (cq != nullptr) cq->unreserve(producer::kAckRecordBytes);
+            return BatchClaim(shape);
+        }
+        SendResult u = impl_->gateRefusesBeforeCredit() ? SendResult::NotInTransaction : reserveBatchUnits(*bq, n);
         if (u != SendResult::Ok) {
-            detail::ClaimCredit::abort(core);
+            if (cq != nullptr) cq->unreserve(producer::kAckRecordBytes);
             return BatchClaim(u);
         }
-        core.bq    = bq;
-        core.units = n;
     }
-    return BatchClaim(core, g.base, g.offsets, n, recLen);
+    const producer::ProducerImpl::ClaimGrant g = impl_->claimBatch(topic.topicId, part, key, n, recLen, ackHandle);
+    if (g.result != SendResult::Ok) {
+        if (bq != nullptr) {
+            for (uint32_t i = 0; i < n; ++i) bq->unreserve(producer::kAckRecordBytes);
+        }
+        if (cq != nullptr) cq->unreserve(producer::kAckRecordBytes);  // nothing will ever complete
+        return BatchClaim(g.result);
+    }
+    return BatchClaim(detail::ClaimOpen{impl_, g.token, cq, bq, bq != nullptr ? n : 0u}, g.base, g.offsets, n, recLen);
 }
+
+BatchClaim Producer::claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen) noexcept {
+    if (!impl_ || !topic.valid()) return BatchClaim(SendResult::InvalidTopic);
+    return claimBatchPart_(topic, key.partition(topic.partitionCount), key, n, recLen, 0, nullptr);
+}
+
+BatchClaim Producer::claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen, Completions& cq,
+                                Token token) noexcept {
+    if (!impl_ || !topic.valid()) return BatchClaim(SendResult::InvalidTopic);
+    if (token > kMaxToken || cq.client_ == nullptr || cq.client_ != impl_->hooks().ctx || cq.ring_ == nullptr) {
+        return BatchClaim(SendResult::InvalidArgument);
+    }
+    if (!cq.onOwnerThread()) return BatchClaim(SendResult::WrongThread);
+    if (impl_->gateRefusesBeforeCredit()) [[unlikely]] return BatchClaim(SendResult::NotInTransaction);  // #339
+    const OpResult rr = cq.reserve(producer::kAckRecordBytes);  // ONE completion for the whole batch
+    if (rr != OpResult::Accepted) return BatchClaim(mapReserve(rr));
+    return claimBatchPart_(topic, key.partition(topic.partitionCount), key, n, recLen,
+                           producer::ackhandle::forCq(cq.cqRef_, token), &cq);
+}
+
+BatchClaim Producer::claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen,
+                                AckToken token) noexcept {
+    if (!impl_ || !topic.valid()) return BatchClaim(SendResult::InvalidTopic);
+    if (token.token > kMaxToken) return BatchClaim(SendResult::InvalidArgument);
+    return claimBatchPart_(topic, key.partition(topic.partitionCount), key, n, recLen,
+                           producer::ackhandle::forHandler(token.token), nullptr);
+}
+
+uint64_t Producer::claimsAbandoned() const noexcept { return impl_ != nullptr ? impl_->claimsAbandonedChecked() : 0u; }
 
 // ---------------------------------------------------------------------------
 // Tier-2: explicit atomic batch

@@ -171,13 +171,14 @@ struct ProducerConfig {
     std::string transactionalId;
     /// InitProducerId's transactionTimeoutMs for a transactional producer.
     int32_t     transactionTimeoutMs = 60'000;
-    /// Tier-2 (BatchBuilder) slot pool, preallocated once at creation: this many batches
-    /// may be built or queued-unsent at a time (a slot returns to the pool when its batch
+    /// Tier-2 (BatchBuilder) slot pool, allocated ONCE by the producer's first batch() (or
+    /// bindBatchThread()) on its batch thread - a producer that never uses Tier-2 reserves nothing: this many
+    /// batches may be built or queued-unsent at a time (a slot returns to the pool when its batch
     /// is encoded and offered, failed or discarded - not at ack).  Exhausted pool =
-    /// BackPressured, never an allocation.  >= 2 x maxInFlight recommended.  Memory:
-    /// tier2Slots x 2 x tier2SlotBytes of address space (touched only as used).  The reserve is per
-    /// producer: N per-shard producers reserve N times that, so lower tier2Slots (or tier2SlotBytes)
-    /// when running many producers.
+    /// BackPressured, never an allocation after that first one.  >= 2 x maxInFlight recommended.  Memory (once
+    /// Tier-2 is used): tier2Slots x 2 x tier2SlotBytes of address space (touched only as used) - ~8 MiB by
+    /// default.  The reserve is per Tier-2-using producer: N per-shard producers that all batch reserve N times
+    /// that, so lower tier2Slots (or tier2SlotBytes) when running many of them.
     int32_t tier2Slots     = 64;
     /// Largest Tier-2 batch (RecordBatch header + records) one slot holds; 0 = max(batchBytes,
     /// maxFrameBytes).
@@ -379,6 +380,8 @@ struct ClaimCredit {
     static bool mayCommit(const ClaimOpen& o) noexcept;
     /// Discard; every reservation is returned.
     static void abort(const ClaimOpen& o) noexcept;
+    /// #326: the claim was abandoned under its holder (Invoker: a failed partition / a close); cheap, owner thread.
+    [[nodiscard]] static bool abandoned(const ClaimOpen& o) noexcept;
 };
 }  // namespace detail
 
@@ -423,6 +426,12 @@ public:
         if (!std::holds_alternative<Open>(state_)) [[unlikely]] return false;
         return commitOpen_();
     }
+    /// #326: true when this claim was ABANDONED under its holder (Invoker mode: its partition failed during a pump,
+    /// or the producer closed) while it is still unsettled.  buffer() stays writable but harmless, and commit()
+    /// will return false; a holder encoding a large record can poll this to stop early.  Cheap (one variant
+    /// test plus one load of the producer's claim state).  Owner thread only: off the owner thread, and in Thread
+    /// mode (a ring claim released by the Client close is learned through commit() == false), it reports false.
+    [[nodiscard]] bool abandoned() const noexcept;
     /// Discard the record: nothing is sent, nothing completes.  No-op unless open.
     /// Off the owner thread of a carried queue the ring slot is still released
     /// but the credit cannot be returned (it is the owner's plain state): the
@@ -460,11 +469,18 @@ private:
 class BatchClaim {
 public:
     BatchClaim() noexcept = default;  ///< refused: InvalidTopic
-    BatchClaim(BatchClaim&& o) noexcept;
-    BatchClaim& operator=(BatchClaim&& o) noexcept;  ///< aborts this claim first if it is open
+    // The same inline move / destructor bodies as Claim (#329); commit / abort share Claim's settle code in Claim.cpp.
+    BatchClaim(BatchClaim&& o) noexcept : state_(std::exchange(o.state_, Settled{})) {}
+    BatchClaim& operator=(BatchClaim&& o) noexcept {  ///< aborts this claim first if it is open
+        if (this != &o) {
+            abort();
+            state_ = std::exchange(o.state_, Settled{});
+        }
+        return *this;
+    }
     BatchClaim(const BatchClaim&) = delete;
     BatchClaim& operator=(const BatchClaim&) = delete;
-    ~BatchClaim();  ///< aborts an open claim
+    ~BatchClaim() { abort(); }  ///< aborts an open claim
 
     [[nodiscard]] explicit operator bool() const noexcept { return std::holds_alternative<Open>(state_); }
     [[nodiscard]] SendResult result() const noexcept;
@@ -477,6 +493,8 @@ public:
     /// neighbouring sends unless fenced by flush()).  False: nothing was open, or the claim was abandoned under it (see Claim).
     bool commit() noexcept;
     void abort() noexcept;
+    /// #326: see Claim::abandoned().
+    [[nodiscard]] bool abandoned() const noexcept;
 
 private:
     friend class Producer;
@@ -712,6 +730,22 @@ public:
     /// partition.  With batchAcksTo bound it reserves n credit units (the
     /// BatchAck(s) covering the claim's RecordBatch return them).  ZERO allocation in steady state.
     [[nodiscard]] BatchClaim claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen) noexcept;
+    /// #324: claimBatch with ONE polled completion for the whole batch (tryClaim(.., cq, token)'s rules: the credit
+    /// is reserved at claim time and returned if the claim is aborted, a refused or an abandoned claim never
+    /// completes).  The completion {op = Send, value = the batch's BASE offset (its FIRST record's offset), status}
+    /// arrives when the RecordBatch holding the n records is acknowledged - a claimBatch lands whole in ONE
+    /// RecordBatch (neighbouring sends of an unfenced claim join the same RecordBatch), so that is one ack and
+    /// the completion fires exactly once, after the batch's LAST record is covered.  An acked claimBatch also
+    /// reserves its n batchAcksTo() units, like the unacked form.  Both modes.
+    [[nodiscard]] BatchClaim claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen,
+                                        Completions& cq, Token token) noexcept;
+    /// claimBatch whose single completion goes to the onAck() handler (same value rule as above).
+    [[nodiscard]] BatchClaim claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen,
+                                        AckToken token) noexcept;
+    /// #326: how many Invoker claims were abandoned under their holder (a failed partition, a close) since the
+    /// producer was created.  A plain counter owned by the Invoker owner thread: read it there (off the owner
+    /// thread, and in Thread mode, where claims are never abandoned, it reads 0).
+    [[nodiscard]] uint64_t claimsAbandoned() const noexcept;
 
     /// Setup phase (before the first AckToken send): the per-record ack
     /// handler.  See AckFn.
@@ -769,7 +803,10 @@ public:
     /// the thread that last called bindBatchThread().  batch() from another thread returns a refused
     /// builder (send() = WrongThread; the batch pool is untouched).  With every pool slot in use
     /// (ProducerConfig::tier2Slots) it returns a refused builder whose send() is BackPressured -
-    /// rebuild the whole batch.
+    /// rebuild the whole batch.  The first batch() (or bindBatchThread()) of a producer allocates its slot pool
+    /// (ProducerConfig::tier2Slots); after that the Tier-2 path never allocates.  Invoker mode: while a claim
+    /// (tryClaim / claimBatch) is open on the producer, send() is refused (BackPressured, the batch stays intact:
+    /// retry once the claim is committed or aborted) - like every other append, it waits on the claim.
     BatchBuilder batch(TopicHandle topic, const Key& key);
 
     /// Rebind the Tier-2 batch thread to the CALLING thread.  Call it before the first batch() from
@@ -955,6 +992,10 @@ private:
     /// per-record ack credit (cq) already reserved by the caller.
     [[nodiscard]] Claim claimPart_(TopicHandle topic, int32_t part, const Key& key, uint32_t valueLen,
                                    uint64_t ackHandle, Completions* cq) noexcept;
+    /// #324: the claimBatch body; `part` computed once by the caller, `cq` (the per-batch completion credit) already
+    /// reserved by the caller, `ackHandle` 0 = no completion.
+    [[nodiscard]] BatchClaim claimBatchPart_(TopicHandle topic, int32_t part, const Key& key, uint32_t n,
+                                             uint32_t recLen, uint64_t ackHandle, Completions* cq) noexcept;
     /// F8c C7: the §3.3 release of the handle's share (see the destructor).
     void release_() noexcept;
 

@@ -633,6 +633,17 @@ public:
     enum class TxnGate : uint8_t { NotTransactional, Closed, Open };
     [[nodiscard]] TxnGate txnGate() const noexcept { return txnGate_; }
     void setTxnGate(TxnGate g) noexcept { txnGate_ = g; }
+    /// #339: true when a produce would be refused NotInTransaction.  The credit-reserving forms (token sends, claims,
+    /// batchAcksTo) ask this FIRST, so a refusal never reserves (and gives back) cq / bq credit.  A plain producer
+    /// pays one compare; Direct mode answers only on its owner thread (the gate is owner-written there - any other
+    /// thread falls through to the normal WrongThread decision).
+    [[nodiscard]] bool gateRefusesBeforeCredit() const noexcept {
+        if (txnGate_ == TxnGate::NotTransactional) [[likely]] return false;
+        if (mode_ == IngressMode::Direct) {
+            return std::this_thread::get_id() == dutyThreadId_ && (txnGate_ == TxnGate::Closed || txnIntakeShut_());
+        }
+        return txnGate_ == TxnGate::Closed;
+    }
 
     /// Non-blocking submit (ZERO allocation, lock-free): checks the ring's closed
     /// word FIRST (fix1 C2/I3 — a Producer outliving its closed Client gets
@@ -665,8 +676,16 @@ public:
     /// CLAIM_BATCH ring message (header written, records contiguous at `base`).
     /// Refusals: InvalidArgument (n == 0), MessageTooLarge (per-record cap,
     /// maxFrameBytes bound, ring maxMsgLength), Closed, BackPressured.
+    /// `ackHandle` (#324, 0 = none): the ONE completion of the whole batch - stamped on the batch's FIRST record, so
+    /// it completes (with that record's offset) when the RecordBatch holding all n records is acknowledged.
     [[nodiscard]] ClaimGrant claimBatch(int32_t topicId, int32_t partition, const Key& key, uint32_t n,
-                                        uint32_t recLen) noexcept;
+                                        uint32_t recLen, uint64_t ackHandle = 0) noexcept;
+    /// claimBatch's never-retryable size rules, evaluated alone (no ring, no state): the Producer asks this BEFORE it
+    /// reserves n batch-ack credit units, so an impossible claim reports MessageTooLarge / InvalidArgument and never
+    /// QueueFull (a retry could not help) and never walks the reservation loop for a huge n.
+    [[nodiscard]] SendResult claimBatchShape(const Key& key, uint32_t n, uint32_t recLen) const noexcept {
+        return checkBatchClaim_(key, n, recLen);
+    }
     /// Publish a granted claim.  False: it was released under the caller
     /// (Ring: Client close's drain unblock) — nothing was accepted.
     [[nodiscard]] bool commitClaim(int64_t token) noexcept;
@@ -683,6 +702,16 @@ public:
     /// Phase 2b B (owner thread): Invoker claims abandoned while open - their
     /// partition's builder was failed / the producer closed; commit() returned false.
     [[nodiscard]] uint64_t claimsAbandoned() const noexcept { return claimsAbandoned_; }
+    /// #326: the public forms (Producer::claimsAbandoned, Claim::abandoned).  The abandon state is Invoker owner
+    /// thread state: anywhere else they report 0 / false instead of racing (Thread mode never abandons a claim).
+    [[nodiscard]] uint64_t claimsAbandonedChecked() const noexcept {
+        return maySettleClaim() ? claimsAbandoned_ : 0u;
+    }
+    [[nodiscard]] bool claimAbandoned(int64_t token) const noexcept {
+        if (mode_ != IngressMode::Direct || std::this_thread::get_id() != dutyThreadId_) return false;
+        const auto* a = std::get_if<DirectClaimAbandoned>(&directClaim_);
+        return a != nullptr && a->gen == static_cast<uint64_t>(token);
+    }
     [[nodiscard]] uint64_t claimCreditLost() const noexcept { return claimCreditLost_; }  // duty thread
     /// Test: true when [p, p+n) lies inside claimQuarantine_'s live size (owner thread).
     [[nodiscard]] bool claimQuarantineCovers(const uint8_t* p, std::size_t n) const noexcept {
@@ -851,6 +880,9 @@ public:
     /// accepts it or tier2Release returns it), or kNoTier2Slot when every slot is in
     /// use (the caller reports BackPressured).  Never allocates.
     [[nodiscard]] uint32_t tier2Acquire() noexcept;
+    /// #393: allocate the slot pool once (batch thread only: the first batch() / bindBatchThread()); a producer
+    /// that never uses Tier-2 reserves nothing.  False: out of memory (the caller reports BackPressured).
+    [[nodiscard]] bool ensureTier2Pool_() noexcept;
     /// Return a slot the caller still owns (a builder dropped before / without an
     /// accepted send) - exactly once per acquired slot.
     void tier2Release(uint32_t slot) noexcept {
@@ -872,14 +904,20 @@ public:
     /// Rebind the issuing thread to the caller, before the first batch() from the new thread.  A
     /// builder still live on the old thread is refused there and hands its slot back through the
     /// producer ring when it dies (#341), so t2Held_ may count slots in flight: no assert on it.
-    void bindBatchThread() noexcept { t2Thread_ = std::this_thread::get_id(); }
+    void bindBatchThread() noexcept {
+        t2Thread_ = std::this_thread::get_id();
+        (void)ensureTier2Pool_();   // #393 (an out-of-memory retry happens at the first batch()): the first use of Tier-2 by its owning thread allocates the pool
+    }
     [[nodiscard]] Tier2Slot& tier2Slot(uint32_t slot) noexcept { return tier2Pool_[slot]; }
     /// Largest RecordBatch (header + records) a slot holds.
     [[nodiscard]] std::size_t tier2SlotBytes() const noexcept { return tier2SlotBytes_; }
     /// Pool introspection (tests; BATCH-ISSUING THREAD ONLY - it drains the free ring): total
     /// slots, and slots not owned by a builder or the duty side (app-local free +
     /// returned-but-undrained).
-    [[nodiscard]] std::size_t tier2SlotCount() const noexcept { return tier2Pool_.size(); }
+    /// (The configured count: the pool itself is allocated by the first batch() / bindBatchThread(), #393.)
+    [[nodiscard]] std::size_t tier2SlotCount() const noexcept { return tier2Slots_; }
+    /// #393 test seam: bytes the Tier-2 slot pool reserves (0 until the first batch() / bindBatchThread()).
+    [[nodiscard]] std::size_t tier2ReservedBytes() const noexcept { return tier2Reserved_; }
     /// BATCH-ISSUING THREAD ONLY: collecting consumes the free ring (0 off that thread).
     [[nodiscard]] std::size_t tier2FreeCount() noexcept;
 
@@ -1502,6 +1540,8 @@ private:
     rune::client::detail::ControlledAction appendRecord_(int32_t topicId, int32_t partition,
         const uint8_t* keyBytes, uint8_t keyLen, const uint8_t* valBytes, uint32_t valueLen,
         uint8_t flags, uint64_t ackHandle, int64_t nowNs);
+    // [[gnu::always_inline]] members are DEFINED only in ProducerImpl.cpp: they may be called only from that
+    // translation unit (appendRecord_, the claim paths, the drain), never from another TU or a header.
     // Task 10 (perf): the per-record helpers below are force-inlined into the
     // send path (appendRecord_) — out of line they cost ~4 ns/record on the
     // plain send path (two extra calls + reloads per record).  Their rare
@@ -1520,11 +1560,13 @@ private:
     /// Same for a claimBatch of n x recLen: it joins a non-empty builder only
     /// when it fits whole (else flushRequested + ABORT); builder capacity for
     /// all n is reserved so appending them cannot throw (all or none).
+    /// `ackHandle` != 0 (#324): the batch's one completion; its ack-ring room is reserved too.
     rune::client::detail::ControlledAction admitBatch_(PartitionState& ps, uint8_t keyLen, uint32_t n,
-                                                       uint32_t recLen);
-    /// Append an admitted CLAIM_BATCH's n records (one timestamp), then account them.
+                                                       uint32_t recLen, uint64_t ackHandle);
+    /// Append an admitted CLAIM_BATCH's n records (one timestamp), then account them (`flags` / `ackHandle`: the
+    /// batch's completion, stamped on its first record).
     void appendBatch_(PartitionState& ps, const uint8_t* keyBytes, uint8_t keyLen, const uint8_t* recs,
-                      uint32_t n, uint32_t recLen, int64_t nowNs);
+                      uint32_t n, uint32_t recLen, uint8_t flags, uint64_t ackHandle, int64_t nowNs);
     /// Accounting after `count` records starting at offsetDelta `firstIndex`
     /// were written into ps.builder: batch clock, dirty list, the ack handle of
     /// an acked single record (room reserved by admitRecord_), wire size, count.
@@ -1577,7 +1619,19 @@ private:
     [[nodiscard]] ClaimGrant claimRecordDirect_(int32_t topicId, int32_t partition, const Key& key,
                                                 uint32_t valueLen, uint64_t ackHandle) noexcept;
     [[nodiscard]] ClaimGrant claimBatchDirect_(int32_t topicId, int32_t partition, const Key& key, uint32_t n,
-                                               uint32_t recLen) noexcept;
+                                               uint32_t recLen, uint64_t ackHandle) noexcept;
+    /// What a settle of deferred records (completions it fired may have closed the producer or ended the
+    /// transaction) can have changed since the caller's gate: Ok = still open for business.
+    [[nodiscard]] SendResult recheckAfterSettle_() const noexcept {
+        if (directClosed_) return SendResult::Closed;
+        if (txnGate_ != TxnGate::NotTransactional && (txnGate_ == TxnGate::Closed || txnIntakeShut_())) {
+            return SendResult::NotInTransaction;
+        }
+        return SendResult::Ok;
+    }
+    /// One record's ring-message size rules (B6 per-record cap, then the ring's own maxMsgLength): Ok,
+    /// MessageTooLarge or ValueTooLarge.  Shared by a send and a claim.
+    [[nodiscard]] SendResult ringRecordFits_(std::size_t keySize, std::size_t valueLen) const noexcept;
     [[nodiscard]] bool commitDirectClaim_(uint64_t gen) noexcept;
     void abortDirectClaim_(uint64_t gen) noexcept;
 
@@ -1752,6 +1806,10 @@ private:
     // Both are immutable after construction (cfg_ is immutable).
     bool    frameCapped_ = false;
     int32_t effCap_      = 0;
+    /// #374: the frame capacity a partition's builder is created with - header space + max(batchBytes,
+    /// maxFrameBytes) + the one record that may overshoot a full builder - so no send / claim within the documented
+    /// limits ever grows it (computed once in the constructor).
+    std::size_t builderPrealloc_ = 0;
 
     // F8c C0: a flush() requested ON the duty thread (inside a callback) while
     // the ring is full cannot wait for ring room (it would wait on itself).  It
@@ -1786,13 +1844,19 @@ private:
     rune::client::detail::M2ORingBuffer      ring_;
     IngressMode  mode_       = IngressMode::Ring;  // set once before any send (Task 14)
     Completions* batchAckCq_ = nullptr;            // app side: reserve one unit per send (C6)
-    TxnGate      txnGate_    = TxnGate::NotTransactional;  // Phase 2b F: issuing thread only (FD2)
 
-    // ---- Tier-2 slot pool (preallocated once; see Tier2Slot) ------------------
+    // #339: the transactional gate is WRITTEN at every transaction boundary (begin / commit / abort, by the issuing
+    // thread), so it sits on a cache line of its own - not on the setup-only line above, which every send reads.
+    // (The duty-side ring consumer reads it too; it is a plain byte, not coordination.)
+    alignas(64) TxnGate txnGate_ = TxnGate::NotTransactional;  // Phase 2b F: issuing thread only (FD2)
+
+    // ---- Tier-2 slot pool (allocated by the first batch(); see Tier2Slot) -------
     // App side (the single batch-issuing thread): tier2AppFree_[0, tier2AppFreeN_) are
     // free slot indices it owns outright; when empty it drains tier2Free_ (the duty
     // side's returns) into it.  Duty side: t2Return_ writes tier2Free_.
-    std::vector<Tier2Slot>                    tier2Pool_;
+    alignas(64) std::vector<Tier2Slot>        tier2Pool_;   // empty until ensureTier2Pool_() (#393)
+    std::size_t                               tier2Slots_ = 0;      ///< the configured slot count
+    std::size_t                               tier2Reserved_ = 0;   ///< bytes the allocated pool reserves
     std::size_t                               tier2SlotBytes_ = 0;
     std::unique_ptr<uint8_t, void(*)(void*)>  tier2FreeBuf_;
     rune::client::detail::OneToOneRingBuffer  tier2Free_;

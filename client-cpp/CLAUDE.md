@@ -85,6 +85,8 @@ alloc-free handoff). The agent drains, accumulates records into per-
   (`send()` = WrongThread) and never touches the pool. Thread mode: a builder destroyed elsewhere hands its slot
   back through the producer ring; Direct (Invoker) mode loses the slot and logs an error.
   Plain send/trySend/tryClaim/claimBatch stay any-thread.
+  The Tier-2 slot pool is allocated by the first `batch()` / `bindBatchThread()`, never at construction: a
+  producer that never batches reserves nothing.
 - Phase 2b zero-copy produce: `Producer::tryClaim(topic, key, len)` -> `Claim`
   (`buffer()` / `commit()` / `abort()`, RAII; refused = false + `result()`),
   `claimBatch(topic, key, n, recLen)` -> `BatchClaim` (`record(i)`),
@@ -102,7 +104,8 @@ alloc-free handoff). The agent drains, accumulates records into per-
   can join an open RecordBatch with neighbouring sends, and is acked by the
   BatchAck(s) covering that RecordBatch, not by "one BatchAck of n"; `flush()`
   (+ `doWork()` in Invoker mode) before the claim fences it into its own
-  RecordBatch.  Zero allocation (gates: `ProducerClaimAllocRegression`,
+  RecordBatch.  Acked `claimBatch(..., cq, token)` / `claimBatch(..., AckToken)` complete once
+  with the batch's base offset; an aborted one never completes.  Zero allocation (gates: `ProducerClaimAllocRegression`,
   `TypedClaimAllocRegression`, `rune_producer_claim_bench`).
 - `ProducerHub` holds the producers the duty thread owns (registered through
   the agent command ring — no lock, no atomic); `onProduceResponse` routes acks

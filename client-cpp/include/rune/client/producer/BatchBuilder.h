@@ -30,6 +30,12 @@
 // RAII / lifecycle:
 //   - add() after send() → throws std::logic_error ("BatchBuilder: add after send").
 //   - send() with 0 records → throws std::invalid_argument ("BatchBuilder: empty batch").
+//   - send() on a transactional producer outside a transaction (its gate closed) → throws
+//     std::logic_error ("produce outside a transaction"); no credit is kept and the batch stays intact, so the
+//     same builder can be sent once a transaction is open.  (OpResult has no such value, so it throws like every
+//     other Tier-2 misuse.)
+//   - send() on an Invoker-mode producer while one of its claims (tryClaim / claimBatch) is open → returns
+//     BackPressured and keeps the batch: retry after the claim is committed or aborted.
 //   - BatchBuilder destroyed without send() → nothing produced; its pool slot goes back to the
 //     producer (so it must be destroyed on the batch thread, before the Producer).
 //     Thread mode: a builder destroyed elsewhere hands its slot back through the producer ring;

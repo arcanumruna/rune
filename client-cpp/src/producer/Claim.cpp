@@ -43,36 +43,47 @@ void ClaimCredit::abort(const ClaimOpen& o) noexcept {
     o.impl->abortClaimOffOwner(o.token);  // #322: flagged, never silent; owner state untouched
 }
 
+bool ClaimCredit::abandoned(const ClaimOpen& o) noexcept { return o.impl->claimAbandoned(o.token); }
+
 }  // namespace detail
+
+bool Claim::abandoned() const noexcept {
+    const auto* o = std::get_if<Open>(&state_);
+    return o != nullptr && detail::ClaimCredit::abandoned(o->core);
+}
+
+bool BatchClaim::abandoned() const noexcept {
+    const auto* o = std::get_if<Open>(&state_);
+    return o != nullptr && detail::ClaimCredit::abandoned(o->core);
+}
+
+namespace {
+// The settle of an OPEN claim, shared by Claim and BatchClaim (#329).  The open state is read in place and the
+// claim marked Settled AFTER the settle call (no copy of it); nothing a settle calls can reach this claim.
+// `Open` / `Settled` are the claim class's own (private) state types.
+template <class Open, class Settled, class State>
+bool commitState(State& state) noexcept {
+    const auto* o = std::get_if<Open>(&state);
+    if (o == nullptr) return false;
+    if (!detail::ClaimCredit::mayCommit(o->core)) return false;  // stays open: not this thread's to settle
+    const bool ok = detail::ClaimCredit::commit(o->core);
+    state = Settled{};
+    return ok;
+}
+template <class Open, class Settled, class State>
+void abortState(State& state) noexcept {
+    const auto* o = std::get_if<Open>(&state);
+    if (o == nullptr) return;
+    detail::ClaimCredit::abort(o->core);
+    state = Settled{};
+}
+}  // namespace
 
 // Claim's accessors, move and the open-test of commit() / abort() / ~Claim
 // are inline in Producer.h (Task 10); only settling an Open claim is here.
-// The open state is read in place and the Claim marked Settled after the
-// settle call (no copy of it); nothing a settle calls can reach this Claim.
-bool Claim::commitOpen_() noexcept {
-    const detail::ClaimOpen& core = std::get_if<Open>(&state_)->core;  // callers checked Open
-    if (!detail::ClaimCredit::mayCommit(core)) return false;  // stays open: not this thread's to settle
-    const bool ok = detail::ClaimCredit::commit(core);
-    state_ = Settled{};
-    return ok;
-}
+bool Claim::commitOpen_() noexcept { return commitState<Open, Settled>(state_); }
 
-void Claim::abortOpen_() noexcept {
-    detail::ClaimCredit::abort(std::get_if<Open>(&state_)->core);  // callers checked Open
-    state_ = Settled{};
-}
-
-BatchClaim::BatchClaim(BatchClaim&& o) noexcept : state_(std::exchange(o.state_, Settled{})) {}
-
-BatchClaim& BatchClaim::operator=(BatchClaim&& o) noexcept {
-    if (this != &o) {
-        abort();
-        state_ = std::exchange(o.state_, Settled{});
-    }
-    return *this;
-}
-
-BatchClaim::~BatchClaim() { abort(); }
+void Claim::abortOpen_() noexcept { abortState<Open, Settled>(state_); }
 
 SendResult BatchClaim::result() const noexcept {
     if (const auto* r = std::get_if<Refused>(&state_)) return r->why;
@@ -97,21 +108,8 @@ uint32_t BatchClaim::recordLength() const noexcept {
     return o != nullptr ? o->recLen : 0u;
 }
 
-bool BatchClaim::commit() noexcept {
-    const auto* o = std::get_if<Open>(&state_);
-    if (o == nullptr) return false;
-    const detail::ClaimOpen core = o->core;
-    if (!detail::ClaimCredit::mayCommit(core)) return false;  // stays open: not this thread's to settle
-    state_ = Settled{};
-    return detail::ClaimCredit::commit(core);
-}
+bool BatchClaim::commit() noexcept { return commitState<Open, Settled>(state_); }
 
-void BatchClaim::abort() noexcept {
-    const auto* o = std::get_if<Open>(&state_);
-    if (o == nullptr) return;
-    const detail::ClaimOpen core = o->core;
-    state_ = Settled{};
-    detail::ClaimCredit::abort(core);
-}
+void BatchClaim::abort() noexcept { abortState<Open, Settled>(state_); }
 
 }  // namespace rune::client
