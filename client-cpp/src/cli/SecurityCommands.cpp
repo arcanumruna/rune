@@ -43,7 +43,7 @@ std::string generateOneTimePassword() {
     std::array<uint8_t, 64> buf{};
     while (pw.size() < kLength) {
         if (!rune::crypto::randomBytes(buf)) {
-            rune::client::detail::secureZero(pw.data(), pw.size());
+            rune::client::detail::wipeString(pw);
             return {};
         }
         for (const uint8_t b : buf) {
@@ -74,7 +74,7 @@ bool writeClusterKeyFile(const std::string& path, std::string& why) {
     if (fd < 0) {
         why = std::string("cannot create '") + path + "': " + std::strerror(errno) +
               (errno == EEXIST ? " (an existing key file is never overwritten)" : "");
-        rune::client::detail::secureZero(hex.data(), hex.size());
+        rune::client::detail::wipeString(hex);
         return false;
     }
     (void)::fchmod(fd, 0600);   // whatever the umask said
@@ -87,7 +87,7 @@ bool writeClusterKeyFile(const std::string& path, std::string& why) {
     }
     if (ok && ::fsync(fd) != 0) ok = false;   // review B M9: the key is on disk before we say so
     ::close(fd);
-    rune::client::detail::secureZero(hex.data(), hex.size());
+    rune::client::detail::wipeString(hex);
     if (!ok) {
         why = std::string("cannot write '") + path + "'";
         ::unlink(path.c_str());
@@ -206,6 +206,54 @@ void printSecurityUsage(std::ostream& err) {
 // ═══════════════════════════════════════════════════════════════════════════
 // rune security
 // ═══════════════════════════════════════════════════════════════════════════
+bool readFileBytes(const std::string& path, std::string& bytes, std::ostream& err) {
+    // #680: plain read(2) straight into the destination: an ifstream's stream buffer would keep an unwiped copy of the
+    // key that is freed with the stream.  A read error never returns a truncated key.
+    constexpr std::size_t kMaxKeyFileBytes = 64 * 1024;
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        err << "rune: cannot read '" << path << "'\n";
+        return false;
+    }
+    const auto fail = [&](const char* tail) {
+        rune::client::detail::wipeString(bytes);
+        ::close(fd);
+        if (tail == nullptr) err << "rune: cannot read '" << path << "'\n";
+        else err << "rune: '" << path << "' " << tail << "\n";
+        return false;
+    };
+    struct stat st {};
+    if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+        const std::size_t n = static_cast<std::size_t>(st.st_size);
+        bytes.assign(n, '\0');   // one allocation of exactly n: the string never grows
+        std::size_t got = 0;
+        while (got < n) {
+            const ssize_t r = ::read(fd, bytes.data() + got, n - got);
+            if (r < 0 && errno == EINTR) continue;
+            if (r < 0) return fail(nullptr);
+            if (r == 0) break;   // the file shrank
+            got += static_cast<std::size_t>(r);
+        }
+        ::close(fd);
+        bytes.resize(got);
+        return true;
+    }
+    // Empty-size or non-regular (FIFO, /proc-like): read until EOF through a wiped stack buffer.
+    bytes.clear();
+    char buf[4096];
+    struct BufWipe { char* b; ~BufWipe() { rune::client::detail::secureZero(b, sizeof(buf)); } } bufWipe{buf};
+    for (;;) {
+        const ssize_t r = ::read(fd, buf, sizeof(buf));
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) return fail(nullptr);
+        if (r == 0) break;
+        if (bytes.size() + static_cast<std::size_t>(r) > kMaxKeyFileBytes) return fail("is too large");
+        rune::client::detail::appendWiped(bytes, std::string_view(buf, static_cast<std::size_t>(r)));
+    }
+    ::close(fd);
+    return true;
+}
+
 namespace {
 
 int securityUsageError(std::string_view cmd, std::ostream& err, const std::string& msg) {
@@ -228,20 +276,6 @@ int cmdGenClusterKey(const std::vector<std::string>& args, std::ostream& out, st
     }
     out << "wrote cluster key " << a.value("--out") << " (64 hex characters, mode 0600)\n";
     return 0;
-}
-
-bool readFileBytes(const std::string& path, std::string& bytes, std::ostream& err) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) {
-        err << "rune: cannot read '" << path << "'\n";
-        return false;
-    }
-    // Read straight into the destination (no stream-buffer copies of key / password material linger).
-    const std::streamsize n = f.tellg();
-    f.seekg(0);
-    bytes.assign(n > 0 ? static_cast<std::size_t>(n) : 0, '\0');
-    if (n > 0) f.read(bytes.data(), n);
-    return true;
 }
 
 int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
@@ -268,27 +302,22 @@ int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::o
 
     // The cluster key and the one-time password.  Both are wiped before returning.
     std::string key;
-    if (!readFileBytes(keyPath, key, err)) return 1;
     std::string password;
+    struct SecretsWipe { std::string& k; std::string& p; ~SecretsWipe() { rune::client::detail::wipeString(k); rune::client::detail::wipeString(p); } } secretsWipe{key, password};   // #680: wiped on every exit, a throw included
+    if (!readFileBytes(keyPath, key, err)) return 1;
     const bool fromFile = a.has("--password-file");
     if (fromFile) {
         if (auto e = rune::client::detail::readPasswordFile(a.value("--password-file"), password)) {
             err << "rune: " << *e << "\n";
-            rune::client::detail::secureZero(key.data(), key.size());
             return 1;
         }
     } else {
         password = generateOneTimePassword();
         if (password.empty()) {
             err << "rune: no randomness available to generate the one-time password\n";
-            rune::client::detail::secureZero(key.data(), key.size());
             return 1;
         }
     }
-    auto wipe = [&] {
-        rune::client::detail::secureZero(key.data(), key.size());
-        rune::client::detail::secureZero(password.data(), password.size());
-    };
 
 #ifdef RUNE_CLI_LIVE_ENABLED
     // The bootstrap proves itself with the cluster-key MAC, not a login: this connection presents no credentials.
@@ -302,7 +331,6 @@ int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::o
         } else {
             err << "rune error: " << broker.lastFailure() << "\n";
         }
-        wipe();
         return 1;
     }
     rune::client::SecurityDdlResult r;
@@ -312,7 +340,6 @@ int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::o
             std::chrono::seconds(15));
     } catch (const std::exception& e) {
         err << "rune: " << e.what() << "\n";
-        wipe();
         return 1;
     }
     if (r.errorCode == static_cast<uint16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed)) {
@@ -320,22 +347,18 @@ int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::o
         // window is closed: an enabled security admin exists.
         err << "rune: bootstrap refused: this cluster is already bootstrapped - it already has a security admin (it requires a login); "
                "use `rune ql --user <admin> --password-file <file>` to manage it\n";
-        wipe();
         return 1;
     }
     if (r.errorCode != 0) {
         err << "rune: bootstrap refused: code " << r.errorCode << (r.detail.empty() ? "" : " " + r.detail) << "\n";
-        wipe();
         return 1;
     }
     if (fromFile) out << "bootstrapped " << admin << " (password from " << a.value("--password-file") << ")\n";
     else out << "one-time password for " << admin << ": " << password << "\n";
-    wipe();
     return 0;
 #else
     (void)out;
     err << "rune security bootstrap: live mode requires RUNE_CLI_LIVE_ENABLED and a real Aeron build.\n";
-    wipe();
     return 1;
 #endif
 }

@@ -14,7 +14,7 @@
 //     refuses at once while the machine is not InTransaction (AbortableError / FatalError) - Thread mode would accept
 //     and complete the record with the failure (FD2);
 //   * fixed capacities (zero allocation, documented): at most 4 calls join a running commit / abort and at most 8
-//     flushes are pending - a call beyond completes BrokerError(19) and changes nothing;
+//     flushes are pending - a call beyond completes InvalidArgument (#344) and changes nothing;
 //   * 27 ConcurrentTransactions and 14 NotCoordinator are retried: no visible effect;
 //   * 18 ProducerFenced anywhere -> FatalError(Fenced); 19 InvalidTxnState on EndTxn(commit) -> FatalError(19);
 //     19 on a leg (AddPartitions / AddOffsets / TxnOffsetCommit) while the transaction is open or its commit is
@@ -25,8 +25,8 @@
 //   * a commit completes Ok only if no failure reached the transaction: then every record of it is visible to a
 //     read_committed reader exactly once, every record token of it completed Ok, and the group's committed offset
 //     is the last one it sent; anything else leaves nothing visible;
-//   * misuse completes BrokerError(19) (commit with no transaction, abort while committing, a second concurrent
-//     sendOffsets), AbortableError ops complete with the poison, FatalError ops with the fatal status.
+//   * misuse completes BrokerError(19) (commit with no transaction, abort while committing); a second concurrent
+//     sendOffsets completes InvalidArgument (#347); AbortableError ops complete with the poison, FatalError ops with the fatal status.
 // Every token op completes exactly once; a completion outside the allowed set is a violation (`errors`).
 #pragma once
 
@@ -54,6 +54,8 @@ struct Result {
 };
 inline constexpr Result kOk{Status::Ok, 0};
 inline constexpr Result kInvalidTxnState{Status::BrokerError, 19};
+/// #344 / #347: a call beyond a fixed capacity (joiners, flushes) or a second concurrent sendOffsets.
+inline constexpr Result kCapRefused{Status::InvalidArgument, 0};
 inline constexpr Result kFenced{Status::Fenced, 0};
 
 enum class State : uint8_t { Uninitialized, Ready, InTxn, Committing, Aborting, Abortable, Fatal };
@@ -100,7 +102,7 @@ public:
     uint32_t txn   = 0;           // the current (or last) transaction's number
     Values   pending;             // the current transaction's accepted records
     std::optional<int64_t> stagedOffset;   // the last offset a sendOffsets of this transaction completed Ok with
-    Token    offsetsRunning = 0;  // a sendOffsets still running (0 = none): a second one is refused 19
+    Token    offsetsRunning = 0;  // a sendOffsets still running (0 = none): a second one is refused InvalidArgument (#347)
     Result   poison{};            // Abortable: what the transaction failed with
     Result   fatal{};             // Fatal: the terminal status
 
@@ -158,7 +160,7 @@ public:
             add(token, {TokenKind::Commit, txn, {kOk}, 0});
             return;
         case State::Committing:   // joins the running commit: the same outcome (capacity: kMaxJoiners)
-            if (joiners_ >= kMaxJoiners) return refuse_(token, TokenKind::Commit, kInvalidTxnState);
+            if (joiners_ >= kMaxJoiners) return refuse_(token, TokenKind::Commit, kCapRefused);
             ++joiners_;
             add(token, {TokenKind::Commit, txn, commitAllowed_(), 0});
             return;
@@ -179,7 +181,7 @@ public:
             add(token, {TokenKind::Abort, txn, {kOk}, 0});
             return;
         case State::Aborting:     // joins (capacity: kMaxJoiners)
-            if (joiners_ >= kMaxJoiners) return refuse_(token, TokenKind::Abort, kInvalidTxnState);
+            if (joiners_ >= kMaxJoiners) return refuse_(token, TokenKind::Abort, kCapRefused);
             ++joiners_;
             add(token, {TokenKind::Abort, txn, abortAllowed_(), 0});
             return;
@@ -189,7 +191,7 @@ public:
     }
     void flush(Token token) {
         if (state == State::Fatal) return refuse_(token, TokenKind::Flush, fatal);
-        if (flushes_ >= kMaxFlushes) return refuse_(token, TokenKind::Flush, kInvalidTxnState);
+        if (flushes_ >= kMaxFlushes) return refuse_(token, TokenKind::Flush, kCapRefused);
         ++flushes_;
         switch (state) {
         case State::Abortable: add(token, {TokenKind::Flush, txn, {poison}, 0}); return;
@@ -203,7 +205,7 @@ public:
         case State::Abortable: return refuse_(token, TokenKind::SendOffsets, poison);
         case State::InTxn:
             // One at a time: a second one is refused, the transaction is not poisoned.
-            if (offsetsRunning != 0) return refuse_(token, TokenKind::SendOffsets, kInvalidTxnState);
+            if (offsetsRunning != 0) return refuse_(token, TokenKind::SendOffsets, kCapRefused);
             offsetsRunning = token;
             add(token, {TokenKind::SendOffsets, txn, {kOk}, offset});
             return;

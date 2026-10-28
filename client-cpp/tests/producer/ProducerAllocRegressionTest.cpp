@@ -23,7 +23,9 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <random>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -133,22 +135,43 @@ TEST(ProducerAllocRegression, AcksNoneVoidSteadyStateAllocatesNothingRegression)
 }
 
 // Phase 2b F Task 13 (seeded txn stress): a claim reserves room for its record first
-// (ProduceFrameBuilder::reserveExtra) - an EXACT vector::reserve, so while a builder grew past its high-water
-// mark (a partition held for its AddPartitionsToTxn, or a session down) every claim reallocated and copied the
-// whole builder: O(records) allocations instead of amortized geometric growth.  1000 claim-style appends into one
-// builder must now allocate O(log n) times.
+// (ProduceFrameBuilder::reserveExtra); an EXACT vector::reserve reallocated and copied the whole builder on EVERY
+// claim while a held builder grew past its high-water mark, and the geometric fix still allocated O(log n) times.
+// #374: a partition's builder is preallocated when the partition is created (max(batchBytes, maxFrameBytes) + one
+// record), so appends and claims within the documented limits NEVER grow it: after the partition exists, 1000
+// claim-style appends into its builder allocate exactly zero times.
 TEST(ProduceFrameBuilderAllocRegression, ReserveExtraGrowsGeometricallyNotOncePerClaimRegression) {
-    rune::client::producer::ProduceFrameBuilder b(0, kNow);
-    const std::string key = "k";
+    ProducerConfig cfg;
+    cfg.acks       = Acks::None;
+    cfg.lingerUs   = 0;
+    cfg.batchBytes = 64 * 1024;
+    ProducerImpl impl(cfg, 4096);
+    impl.enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr});
+    const Key key(uint64_t{1});
     constexpr int kRecords = 1000;
+    {
+        const ProducerImpl::ClaimGrant g = impl.claimRecord(1, 0, key, 24, 0);  // creates the partition + builder
+        ASSERT_EQ(g.result, rune::client::SendResult::Ok);
+        ASSERT_TRUE(impl.commitClaim(g.token));
+    }
     alloc_counter::startThisThread();
-    for (int i = 0; i < kRecords; ++i) {
-        b.reserveExtra(key.size() + 24 + rune::client::producer::ProduceFrameBuilder::kRecordOverheadMax);
-        (void)b.reserveRecord(key, 24, kNow);
+    for (int i = 1; i < kRecords; ++i) {
+        const ProducerImpl::ClaimGrant g = impl.claimRecord(1, 0, key, 24, 0);
+        if (g.result != rune::client::SendResult::Ok) {
+            ADD_FAILURE() << "claim " << i << " refused: " << static_cast<int>(g.result);
+            break;
+        }
+        std::memset(g.base, 0x5A, 24);
+        if (!impl.commitClaim(g.token)) {
+            ADD_FAILURE() << "claim " << i << " not committed";
+            break;
+        }
     }
     const long allocs = alloc_counter::stopThisThread();
-    EXPECT_EQ(b.recordCount(), kRecords);
-    EXPECT_LE(allocs, 16) << "reserveExtra reallocated " << allocs << " times for " << kRecords << " claims";
+    EXPECT_EQ(allocs, 0L) << "the builder grew " << allocs << " times for " << kRecords << " claims";
+    const auto* ps = impl.partitionState(1, 0);
+    ASSERT_NE(ps, nullptr);
+    EXPECT_EQ(ps->builder->recordCount(), kRecords);
 }
 
 // ============================================================================================================
@@ -386,6 +409,55 @@ struct TxnAllocRig {
         if (p.commitTransaction(cq, ++token) != rc::OpResult::Accepted) return false;
         return runUntil(want);
     }
+    /// #374: one transaction of the same ten operations over every produce path, but with a SEEDED random key and
+    /// size mix (1..256-byte values over 8 keys / 4 partitions): a changing mix used to grow the frame buffers to
+    /// new high-water marks all the time.
+    bool transactionRandom(int64_t k, std::mt19937_64& g, std::span<const rc::OffsetEntry> offsets) {
+        std::array<uint8_t, 256> buf{};
+        auto val = [&] { return std::span<const uint8_t>(buf.data(), 1 + g() % buf.size()); };
+        auto key = [&] { return Key(static_cast<uint64_t>(g() % 8)); };
+        const int64_t want = commitsOk + 1;
+        p.beginTransaction();
+        p.send(kTopic, key(), val());                                                                      // 1
+        p.sendTo(kTopic, static_cast<int32_t>(g() % 4), key(), val());                                    // 2
+        if (p.trySend(kTopic, key(), val(), cq, ++token) != rc::SendResult::Ok) return false;             // 3
+        if (p.trySend(kTopic, key(), val(), rc::AckToken{++token}) != rc::SendResult::Ok) return false;   // 4
+        {
+            rc::BatchBuilder b = p.batch(kTopic, key());                                                   // 5
+            const int n = 1 + static_cast<int>(g() % 4);
+            for (int i = 0; i < n; ++i) b.add(val());
+            if (b.send(rc::AckToken{++token}) != rc::OpResult::Accepted) return false;
+        }
+        {
+            const auto len = static_cast<uint32_t>(1 + g() % 200);
+            rc::Claim c = p.tryClaim(kTopic, key(), len);                                                  // 6
+            if (!c) return false;
+            std::memset(c.buffer().data(), 1, len);
+            if (!c.commit()) return false;
+        }
+        {
+            const auto n   = static_cast<uint32_t>(1 + g() % 4);
+            const auto len = static_cast<uint32_t>(1 + g() % 100);
+            rc::BatchClaim c = p.claimBatch(kTopic, key(), n, len);                                        // 7
+            if (!c) return false;
+            for (uint32_t i = 0; i < n; ++i) std::memset(c.record(i).data(), 2, len);
+            if (!c.commit()) return false;
+        }
+        rune::gen::Position rec;                                                                           // 8
+        rec.userId = static_cast<int64_t>(g() % 8);
+        rec.zone   = int32_t(k & 7);
+        rec.seq    = uint32_t(k);
+        typed.send(rec);
+        {
+            auto w = typed.claim(static_cast<int64_t>(g() % 8));                                          // 9
+            if (!w) return false;
+            w.zone(1).x(1.5).seq(uint32_t(k));
+            if (!w.commit()) return false;
+        }
+        if (p.sendOffsetsToTransaction(offsets, "grp-alloc", cq, ++token) != rc::OpResult::Accepted) return false;
+        if (p.commitTransaction(cq, ++token) != rc::OpResult::Accepted) return false;
+        return runUntil(want);
+    }
 };
 }  // namespace
 
@@ -416,6 +488,37 @@ TEST(ProducerTxnAllocRegression, SteadyStateTransactionsAllocateNothingRegressio
     EXPECT_EQ(r.opFailures, 0);
     EXPECT_EQ(r.recordFailures, 0);
     EXPECT_EQ(r.offset, int64_t{10} * (kWarm + kCounted)) << "every record of every transaction was acknowledged";
+}
+
+// #374: the same gate with a seeded random key / size mix.  A partition's frame builder is preallocated, so a
+// transaction bigger or differently spread than any before it grows nothing.  The warm-up is the FIXED small
+// shape of the test above, long enough (24 transactions > the in-flight ring's 8 slots per partition) for every
+// in-flight slot's frame buffer to have been handed a builder-sized buffer once (a one-off per slot, whatever the
+// shapes); the 1000 counted transactions then carry 1..256-byte values and 1..4-record batches the warm-up never
+// saw - which used to grow the buffers (9 allocations over 1000 transactions, #374 comment).
+TEST(ProducerTxnAllocRegression, RandomShapesAllocateNothingRegression) {
+    TxnAllocRig r;
+    ASSERT_EQ(r.p.initTransactions(r.cq, ++r.token), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.runUntil(1)) << "initTransactions never completed Ok";
+    const std::array<rc::OffsetEntry, 4> offs{rc::OffsetEntry{9, 0, 100}, rc::OffsetEntry{9, 1, 200},
+                                              rc::OffsetEntry{9, 2, 300}, rc::OffsetEntry{9, 3, 400}};
+    std::mt19937_64 gen(0x5EED'374ull);
+    constexpr int kWarm = 24, kCounted = 1000;
+    for (int k = 0; k < kWarm; ++k) ASSERT_TRUE(r.transaction(k, offs)) << "warm-up transaction " << k;
+    alloc_counter::startThisThread();
+    bool ok = true;
+    int  failedAt = -1;
+    for (int k = kWarm; k < kWarm + kCounted && ok; ++k) {
+        ok = r.transactionRandom(k, gen, offs);
+        if (!ok) failedAt = k;
+    }
+    const long allocs = alloc_counter::stopThisThread();
+    ASSERT_TRUE(ok) << "transaction " << failedAt << " was refused or never committed";
+    EXPECT_EQ(allocs, 0L) << "random-shape transactions allocated " << allocs << " times over " << kCounted
+                          << " transactions";
+    EXPECT_EQ(r.commitsOk, 1 + kWarm + kCounted);
+    EXPECT_EQ(r.opFailures, 0);
+    EXPECT_EQ(r.recordFailures, 0);
 }
 
 namespace {

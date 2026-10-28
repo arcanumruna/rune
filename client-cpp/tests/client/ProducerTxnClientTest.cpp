@@ -1006,7 +1006,7 @@ TEST(ProducerTxnClientRegression, BeginTransactionWaitsOutBackPressureRegression
     EXPECT_TRUE(p.transactionActive());
 
     // The fillers completed exactly once each (a producer holds a bounded number of pending flushes: the rest are
-    // refused 19 at once), and the transaction is real and usable once.
+    // refused InvalidArgument at once), and the transaction is real and usable once.
     std::vector<rc::Completion> done;
     ASSERT_TRUE(collect(r, cq, accepted, done));
     EXPECT_FALSE(collect(r, cq, accepted + 1, done, 2'000)) << "a filler completed twice";
@@ -1016,8 +1016,8 @@ TEST(ProducerTxnClientRegression, BeginTransactionWaitsOutBackPressureRegression
         if (c.status == rc::OpStatus::Ok) {
             ++okFlushes;
         } else {
-            EXPECT_EQ(c.status, rc::OpStatus::BrokerError) << c.token;
-            EXPECT_EQ(c.errorCode, static_cast<uint16_t>(rune::protocol::client::ErrorCode::InvalidTxnState)) << c.token;
+            EXPECT_EQ(c.status, rc::OpStatus::InvalidArgument) << c.token;   // #344: the cap, not the misuse code 19
+            EXPECT_EQ(c.errorCode, 0) << c.token;
         }
     }
     EXPECT_GE(okFlushes, 1u);
@@ -1446,4 +1446,27 @@ TEST(ProducerTxnClientRegression, SendOffsetsBoundsAtEveryEdgeAdversarialRegress
         EXPECT_EQ(strs(r.gw.committedValues(0)), (std::vector<std::string>{v}));
         EXPECT_EQ((r.gw.committedOffsets[std::make_pair(int32_t{1}, int32_t{0})]), 0) << "the last legal call's single offset (0) committed";
     }
+}
+
+// #349 item 4: openTopicAndWait(name, producer) borrows a producer of THIS Client.  Another Client's producer (or an
+// empty, moved-from one) is refused with std::invalid_argument before anything is sent.
+TEST(ProducerTxnClientRegression, OpenTopicAndWaitWithAnotherClientsProducerIsRefusedRegression) {
+    TxnRig a(rc::RunnerMode::Invoker);
+    TxnRig b(rc::RunnerMode::Invoker);
+    a.connect();
+    b.connect();
+    rc::Producer pa = a.client->producer(txnCfg());
+    rc::Producer pb = b.client->producer(txnCfg());
+    EXPECT_TRUE(pa.ownedBy(*a.client));
+    EXPECT_FALSE(pa.ownedBy(*b.client));
+    const int requestsBefore = b.gw.metadataRequests;
+    const auto shortWait = std::chrono::milliseconds(50);
+    EXPECT_THROW((void)b.client->openTopicAndWait<rune::gen::Position>("t", pa, shortWait), std::invalid_argument)
+        << "a producer of another Client must be refused";
+    EXPECT_EQ(b.gw.metadataRequests, requestsBefore);
+    EXPECT_EQ(b.gw.schemaGets, 0) << "refused before any schema request was sent";
+    rc::Producer moved = std::move(pb);
+    EXPECT_THROW((void)b.client->openTopicAndWait<rune::gen::Position>("t", pb, shortWait), std::invalid_argument)
+        << "a moved-from producer belongs to no Client";
+    EXPECT_TRUE(moved.ownedBy(*b.client));
 }

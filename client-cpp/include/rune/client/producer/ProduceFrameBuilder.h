@@ -31,8 +31,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
-#include <cstdint>
 #include <cstring>
+#include <cstdint>
 #include <string_view>
 #include <vector>
 
@@ -101,10 +101,18 @@ public:
         return at;
     }
 
+    /// #374: reserve the whole frame (Produce header + RecordBatch header + records) up front, once, off the hot
+    /// path (the producer calls it when a partition's builder is created, with a bound no send / claim within the
+    /// documented limits can exceed): afterwards no append, reservation or reserveExtra() within `frameBytes`
+    /// ever allocates or moves data().  The capacity persists across batches (reset() keeps it).
+    void preallocate(std::size_t frameBytes) { frame_.reserve(frameBytes); }
+
     /// Capacity for `n` more bytes: appends / reservations within it never
     /// reallocate (so they never throw and data() never moves).
-    /// Grows geometrically (an exact reserve would reallocate - and copy the whole builder - on EVERY claim while
-    /// a held builder grows past its high-water mark); capacity persists across batches (reset() keeps it).
+    /// With preallocate() done this is a no-op for everything inside the documented limits.  The geometric growth
+    /// below is only the fallback for a size beyond them (a claimBatch with no frame cap on a ring larger than
+    /// the preallocated bound): an exact reserve would reallocate - and copy the whole builder - on EVERY claim
+    /// while a held builder grows past its high-water mark.
     void reserveExtra(std::size_t n) {
         const std::size_t need = frame_.size() + n;
         if (need > frame_.capacity()) frame_.reserve(std::max(need, 2 * frame_.capacity()));
@@ -117,10 +125,16 @@ public:
         int64_t     maxTimestamp = 0;
     };
     [[nodiscard]] Mark mark() const noexcept { return Mark{frame_.size(), recordCount_, maxTimestamp_}; }
+    /// Shrinks the frame back to `m`.  PRECONDITION: `m.size <= size()` - a Mark is always taken at or before the
+    /// point we roll back from; a larger (stale) one would GROW the frame over bytes nobody wrote.  Debug builds
+    /// assert it; a release build has no branch for it (this is the claim abort path), so callers must honour it.
     void rollback(const Mark& m) noexcept {
-        // Debug-only precondition (#333, no release-path branch): a Mark is always taken at or before the point we
-        // roll back from; a larger (stale) one would GROW the frame over bytes nobody wrote.
-        assert(m.size <= frame_.size() && "rollback to a stale Mark taken after the current end");
+        // #333/#675: a Mark is always taken at or before the point we roll back from; a larger (stale) one would GROW
+        // the frame over bytes nobody wrote.  Refused in every build (no change); debug builds also assert.
+        if (m.size > frame_.size()) [[unlikely]] {
+            assert(false && "rollback to a stale Mark taken after the current end");
+            return;
+        }
         frame_.resize(m.size);  // shrink only: never allocates
         recordCount_  = m.recordCount;
         maxTimestamp_ = m.maxTimestamp;
@@ -194,13 +208,17 @@ public:
         recordCount_  = 0;
         maxTimestamp_ = baseTimestamp_;
     }
-    /// detachStorageKeepingRecords: the builder keeps the records before the claim (copied into
-    /// fresh storage first: a cold close path, it allocates).  `keep` is the claim's mark.  May
-    /// throw bad_alloc; then nothing changed.
+    /// detachStorageKeepingRecords: the builder keeps the records before the claim (`keep` is the claim's mark):
+    /// they are copied into `quarantine`'s old storage - the spare - which becomes the builder's, and the caller's
+    /// storage (full size, covers the claimed span) becomes the quarantine.  Allocation-free whenever the spare holds
+    /// `keep.size` bytes: ProducerImpl::enableDirectIngress reserves the quarantine at the builders' capacity, and
+    /// the two buffers then swap roles for ever (#344).  A smaller spare grows first (cold, once); may throw
+    /// bad_alloc, then nothing changed.
     void detachStorageKeepingRecords(FrameBytes& quarantine, const Mark& keep) {
-        FrameBytes kept(frame_.begin(), frame_.begin() + static_cast<std::ptrdiff_t>(keep.size));
-        frame_.swap(quarantine);  // quarantine: the caller's storage, full size (covers the claimed span)
-        frame_.swap(kept);        // the builder: the records before the claim, in fresh storage
+        if (quarantine.capacity() < keep.size) quarantine.reserve(keep.size);   // may throw: nothing changed yet
+        quarantine.resize(keep.size);   // within capacity: no allocation, no throw
+        if (keep.size != 0) std::memcpy(quarantine.data(), frame_.data(), keep.size);
+        frame_.swap(quarantine);  // the builder: the records before the claim; the quarantine: the caller's storage
         recordCount_  = keep.recordCount;
         maxTimestamp_ = keep.maxTimestamp;
     }

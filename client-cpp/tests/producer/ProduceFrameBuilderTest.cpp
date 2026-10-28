@@ -260,6 +260,12 @@ TEST(ProduceFrameBuilderRegression, AppendAfterRollbackMatchesANeverReservedBuil
         rune::protocol::RecordBatchReader rd(x.data() + ProduceFrameBuilder::kBatchStart,
                                              lx - ProduceFrameBuilder::kBatchStart);
         EXPECT_EQ(rd.maxTimestamp(), base + 3);
+        // #675: the callback's offset is baseOffset + offsetDelta; the rolled-back r2 left no gap.
+        std::vector<int64_t> offsets;
+        rd.forEachRecord([&](std::string_view, std::string_view, int64_t off, int64_t) {
+            offsets.push_back(off - rd.baseOffset());
+        });
+        EXPECT_EQ(offsets, (std::vector<int64_t>{0, 1}));
     }
     {   // Mark taken at the empty batch.
         ProduceFrameBuilder x(0, base);
@@ -303,9 +309,32 @@ TEST(ProduceFrameBuilderRegression, ReserveExtraBoundHoldsAtMaximumRecordOverhea
     }
 }
 
-#if GTEST_HAS_DEATH_TEST
-// #333: a Mark taken AFTER the current end (stale / larger) must be refused, not silently grow the frame over
-// unwritten bytes.  Debug builds assert; release builds (no assert, no hot-path branch) skip the statement.
+// #374: after preallocate(N) nothing within N bytes moves the frame - not appends, not claim-style reservations,
+// not reserveExtra() - which is what lets a producer's partition builder never allocate on the hot path.
+TEST(ProduceFrameBuilderRegression, PreallocatedBuilderNeverMovesWithinItsCapacityRegression) {
+    constexpr std::size_t kBytes = 32 * 1024;
+    ProduceFrameBuilder fb(0, 0);
+    fb.preallocate(kBytes);
+    const uint8_t* const at = fb.data();
+    ASSERT_NE(at, nullptr);
+    std::size_t i = 0;
+    while (fb.size() + 64 + ProduceFrameBuilder::kRecordOverheadMax < kBytes) {
+        if (i++ % 2 == 0) {
+            fb.append("key", std::string(60, 'v'), 1);
+        } else {
+            fb.reserveExtra(3 + 60 + ProduceFrameBuilder::kRecordOverheadMax);
+            (void)fb.reserveRecord("key", 60, 1);
+        }
+        ASSERT_EQ(fb.data(), at) << "record " << i << ": the frame moved inside its preallocated capacity";
+    }
+    EXPECT_GT(fb.recordCount(), 100);
+    fb.reset(0, 0);
+    EXPECT_EQ(fb.data(), at) << "reset() keeps the storage";
+}
+
+// #333/#675: a Mark taken AFTER the current end (stale / larger) must be refused, not silently grow the frame over
+// unwritten bytes.  Every build refuses it with a branch (no change); debug builds also assert, so the debug leg is a
+// death test and the release leg checks that size and recordCount are untouched.
 TEST(ProduceFrameBuilderRegression, RollbackToAStaleLargerMarkIsRefusedRegression) {
     ProduceFrameBuilder fb(0, 0);
     fb.append("k", "v", 1);
@@ -313,7 +342,16 @@ TEST(ProduceFrameBuilderRegression, RollbackToAStaleLargerMarkIsRefusedRegressio
     (void)fb.reserveRecord("k", 500, 2);
     const ProduceFrameBuilder::Mark stale = fb.mark();
     fb.rollback(small);
-    fb.reserveExtra(4096);  // release builds: the stale grow stays inside capacity (no throw from noexcept)
+    fb.reserveExtra(4096);  // the stale grow would stay inside capacity (no throw from noexcept)
+    const std::size_t sizeBefore = fb.size();
+    const int32_t countBefore = fb.recordCount();
+#ifdef NDEBUG
+    fb.rollback(stale);
+    EXPECT_EQ(fb.size(), sizeBefore) << "a stale larger mark must not grow the frame";
+    EXPECT_EQ(fb.recordCount(), countBefore);
+#elif GTEST_HAS_DEATH_TEST
     EXPECT_DEBUG_DEATH(fb.rollback(stale), "stale Mark");
-}
 #endif
+    (void)sizeBefore;
+    (void)countBefore;
+}

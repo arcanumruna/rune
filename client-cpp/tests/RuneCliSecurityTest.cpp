@@ -14,6 +14,9 @@
 #include <iostream>
 #include <set>
 #include <sstream>
+#include <csignal>
+#include <thread>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -235,4 +238,74 @@ TEST(RuneCliSecurityRegression, ShowTablesHaveTheDocumentedColumns) {
     EXPECT_EQ(grants.find("direct"), std::string::npos) << "ws1 has no direct grants at offset 8";
     // Verifier bytes are never part of any row.
     EXPECT_EQ(users.find("storedKey"), std::string::npos);
+}
+
+namespace {
+// A FIFO under the temp dir, fed by a writer thread that writes `data` and closes.  The open-for-write blocks until
+// the reader opens, so no sleeps are needed.
+struct FifoWriter {
+    std::thread t;
+    std::string path_;
+    FifoWriter(const std::string& path, std::string data) : path_(path) {
+        std::signal(SIGPIPE, SIG_IGN);   // a reader that closes early must give the writer EPIPE, not kill the test
+        t = std::thread([path, d = std::move(data)] {
+            const int fd = ::open(path.c_str(), O_WRONLY);
+            if (fd < 0) return;
+            std::size_t off = 0;
+            while (off < d.size()) {
+                const ssize_t w = ::write(fd, d.data() + off, d.size() - off);
+                if (w <= 0) break;
+                off += static_cast<std::size_t>(w);
+            }
+            ::close(fd);
+        });
+    }
+    ~FifoWriter() {
+        // If the reader never opened (a failing reader), the writer's open() blocks: a non-blocking read open frees it
+        // so the test fails on its assertion instead of hanging.
+        const int rfd = ::open(path_.c_str(), O_RDONLY | O_NONBLOCK);
+        if (t.joinable()) t.join();
+        if (rfd >= 0) ::close(rfd);
+    }
+};
+}  // namespace
+
+TEST(RuneCliSecurityRegression, KeyFileReadErrorFailsInsteadOfTruncatingRegression) {
+    // read(2) on a directory fails with EISDIR: the old `if (r <= 0) break;` returned true with an empty key.
+    const std::string dir = tmpPath("keydir").string();
+    fs::create_directories(dir);
+    std::string bytes = "stale";
+    std::ostringstream err;
+    EXPECT_FALSE(rune::cli::readFileBytes(dir, bytes, err));
+    EXPECT_TRUE(bytes.empty());
+    EXPECT_NE(err.str().find("cannot read"), std::string::npos) << err.str();
+}
+
+TEST(RuneCliSecurityRegression, KeyFileFromAFifoIsReadWholeRegression) {
+    const std::string path = tmpPath("key.fifo").string();
+    ASSERT_EQ(::mkfifo(path.c_str(), 0600), 0);
+    std::string want;
+    for (int i = 0; i < 100; ++i) want.push_back(static_cast<char>('a' + i % 26));
+    std::string bytes;
+    std::ostringstream err;
+    {
+        FifoWriter w(path, want);
+        EXPECT_TRUE(rune::cli::readFileBytes(path, bytes, err)) << err.str();
+    }
+    EXPECT_EQ(bytes, want);
+}
+
+TEST(RuneCliSecurityRegression, KeyFileOverSixtyFourKiBFromAFifoIsRefusedRegression) {
+    const std::string path = tmpPath("big.fifo").string();
+    ASSERT_EQ(::mkfifo(path.c_str(), 0600), 0);
+    std::string bytes;
+    std::ostringstream err;
+    bool ok = true;
+    {
+        FifoWriter w(path, std::string(70 * 1024, 'k'));
+        ok = rune::cli::readFileBytes(path, bytes, err);
+    }
+    EXPECT_FALSE(ok);
+    EXPECT_TRUE(bytes.empty());
+    EXPECT_NE(err.str().find("too large"), std::string::npos) << err.str();
 }

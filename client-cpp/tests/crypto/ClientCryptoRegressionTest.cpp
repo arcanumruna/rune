@@ -39,6 +39,7 @@
 #include <openssl/evp.h>
 
 #include <rune/client/codec/Codec.h>
+#include "../support/CryptoStateTestAccess.h"
 #include <rune/client/codec/CryptoFrame.h>
 #include <rune/client/session/SessionMachine.h>
 #include <rune/crypto/TlsSession.h>
@@ -1606,7 +1607,7 @@ TEST(ClientCryptoRegression, UnderivableReceiverKeySealsNothingAdversarialRegres
     auto& c = f.m.cryptoState();
     ASSERT_TRUE(c.receiverKeys);
     const auto keys = f.srv.exportKeys(c.cipher, FrameFixture::kSessionId);
-    c.deriveReceiverKeyFn = &deriveFailsForReceiverThree;
+    sm::CryptoStateTestAccess::setDeriveFn(c, &deriveFailsForReceiverThree);
 
     const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 1, "underivable-receiver-key");
     std::vector<uint8_t> out(plain.size() + rpc116::kCryptoOverhead);
@@ -1626,8 +1627,10 @@ TEST(ClientCryptoRegression, UnderivableReceiverKeySealsNothingAdversarialRegres
     EXPECT_EQ(c.workerSend[1].sendSeq, 1u);
     EXPECT_EQ(c.workerSend[2].sendSeq, 0u);
 
-    // The real derive is back: receiver 3's next frame is its first, sealed under its properly derived key.
-    c.deriveReceiverKeyFn = &cr::deriveReceiverKey;
+    // The real derive is back and the session reconnected (#673: the held flag is an episode's; modelled by clearing
+    // it): receiver 3's next frame is its first, sealed under its properly derived key.
+    sm::CryptoStateTestAccess::setDeriveFn(c, &cr::deriveReceiverKey);
+    c.workerSend[2].deriveFailed = false;
     const auto fr = sealFor(c, 3, 77);
     ASSERT_FALSE(fr.empty()) << "the seal succeeds once the key derives";
     EXPECT_EQ(subOf(fr).senderId, 3);
@@ -1679,7 +1682,7 @@ TEST(ClientCryptoRegression, AReceiverSlotFromAnEarlierEpisodeNeverSealsAfterAFa
     const auto keys2 = srv2.exportKeys(c.cipher, FrameFixture::kSessionId);
     ASSERT_NE(std::memcmp(keys1.c2b.bytes, keys2.c2b.bytes, sizeof keys1.c2b.bytes), 0) << "new episode, new keys";
 
-    c.deriveReceiverKeyFn = &deriveFailsForReceiverThree;
+    sm::CryptoStateTestAccess::setDeriveFn(c, &deriveFailsForReceiverThree);
     for (int i = 0; i < 3; ++i) {
         const auto fr = sealFor(c, 3, 10 + i);
         EXPECT_TRUE(fr.empty()) << "an underivable receiver sealed a frame (episode 1's cipher reused?)";
@@ -1692,7 +1695,8 @@ TEST(ClientCryptoRegression, AReceiverSlotFromAnEarlierEpisodeNeverSealsAfterAFa
         EXPECT_FALSE(c.workerSend[2].cipher.has_value());
     }
 
-    c.deriveReceiverKeyFn = &cr::deriveReceiverKey;
+    sm::CryptoStateTestAccess::setDeriveFn(c, &cr::deriveReceiverKey);
+    c.workerSend[2].deriveFailed = false;   // #673: held for the episode; modelled as the reconnect
     const auto fr = sealFor(c, 3, 20);
     ASSERT_FALSE(fr.empty());
     EXPECT_EQ(subOf(fr).seq, 1u) << "receiver 3's first frame of the new episode";
@@ -1701,4 +1705,60 @@ TEST(ClientCryptoRegression, AReceiverSlotFromAnEarlierEpisodeNeverSealsAfterAFa
     ASSERT_TRUE(cr::deriveReceiverKey(keys1.c2b, 3, old3));
     EXPECT_TRUE(opensUnder(new3, keys2.c2bPrefix, keys2.cipher, fr));
     EXPECT_FALSE(opensUnder(old3, keys1.c2bPrefix, keys1.cipher, fr));
+}
+
+// #673: a receiver key that fails to derive is counted ONCE per episode and never retried per offer: five seals for
+// receiver 3 run the derive exactly once; receiver 2 still seals; a new episode (CryptoState reset) derives again.
+namespace {
+int g_deriveCalls = 0;   // single test thread
+bool countingDeriveFailsForReceiverThree(const cr::AeadKey& c2b, uint8_t id, cr::AeadKey& out) noexcept {
+    ++g_deriveCalls;
+    return id != 3 && cr::deriveReceiverKey(c2b, id, out);
+}
+}  // namespace
+
+TEST(ClientCryptoRegression, AFailedReceiverDeriveIsCountedOnceAndNeverRetriedRegression) {
+    FakeIo io;
+    const std::string serverPem = slurp(testdataPath("server.pem"));
+    const std::string serverKey = slurp(testdataPath("server.key"));
+    auto srv1 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+    sm::SessionConfig cfg;
+    cfg.egressChannel = "aeron:udp?endpoint=client:40457";
+    cfg.offerCrypto = true; cfg.tlsTrustPem = slurp(testdataPath("ca.pem")); cfg.tlsExpectHost = "localhost";
+    cfg.reconnectForeverAfterLive = true;
+    sm::SessionMachine m(io, cfg);
+    int64_t now = 1'000'000'000LL;
+    m.connect(now);
+    ASSERT_TRUE(driveHandshake(m, io, srv1, FrameFixture::kSessionId, now + 1, nullptr,
+                               rpc116::kBrokerVersionReceiverKeys));
+    auto& c = m.cryptoState();
+    ASSERT_TRUE(c.receiverKeys);
+    g_deriveCalls = 0;
+    sm::CryptoStateTestAccess::setDeriveFn(c, &countingDeriveFailsForReceiverThree);
+    const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 1, "derive-fails-once");
+    std::vector<uint8_t> out(plain.size() + rpc116::kCryptoOverhead);
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_EQ(cc::sealFrame(c, plain.data(), plain.size(), out.data(), out.size(), 3), 0u);
+        EXPECT_EQ(cc::selectSendSlot(c, 3).cipher, nullptr);
+    }
+    EXPECT_EQ(g_deriveCalls, 1) << "the derive ran once, not per offer";
+    EXPECT_EQ(c.receiverDeriveFailures, 1u);
+    EXPECT_GT(cc::sealFrame(c, plain.data(), plain.size(), out.data(), out.size(), 2), 0u) << "receiver 2 still seals";
+    EXPECT_EQ(g_deriveCalls, 2);
+    EXPECT_EQ(c.receiverDeriveFailures, 1u);
+
+    // A new episode resets the state (counter, held flags, the seam): the derive runs again.
+    (void)freshConnectAfterAResumeRefused(io, m, now);
+    EXPECT_EQ(m.cryptoState().receiverDeriveFailures, 0u);
+    io.sends.erase(io.sends.begin(), io.sends.end() - 1);
+    auto srv2 = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+    ASSERT_TRUE(driveHandshake(m, io, srv2, FrameFixture::kSessionId, now += 1'000'000, nullptr,
+                               rpc116::kBrokerVersionReceiverKeys));
+    auto& c2 = m.cryptoState();
+    ASSERT_TRUE(c2.receiverKeys);
+    sm::CryptoStateTestAccess::setDeriveFn(c2, &countingDeriveFailsForReceiverThree);
+    const int before = g_deriveCalls;
+    EXPECT_EQ(cc::sealFrame(c2, plain.data(), plain.size(), out.data(), out.size(), 3), 0u);
+    EXPECT_EQ(g_deriveCalls, before + 1) << "the new episode derives again";
+    EXPECT_EQ(c2.receiverDeriveFailures, 1u);
 }

@@ -237,7 +237,7 @@ rc::Persistence clientPersistence(cat::Persistence p) noexcept {
 // rune ql
 // ═══════════════════════════════════════════════════════════════════════════
 
-int cmdQl(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
+int cmdQl(const std::vector<std::string>& args, std::istream& in, std::ostream& out, std::ostream& err) {
     ParsedArgs a;
     if (!parseArgs("ql", args, {"-e", "-f", "--request-id", "--broker", "--expected-version"}, {"--dry-run", "--verbose", "--validate"}, a, err)) {
         printCatalogUsage(err);
@@ -269,7 +269,7 @@ int cmdQl(const std::vector<std::string>& args, std::ostream& out, std::ostream&
     const bool script = a.has("-f");
     std::string text;
     if (script) {
-        if (!readScript(a.value("-f"), std::cin, text, err)) return 1;
+        if (!readScript(a.value("-f"), in, text, err)) return 1;
     } else {
         text = a.value("-e");
     }
@@ -706,7 +706,8 @@ int cmdReplay(const std::vector<std::string>& args, std::ostream& out, std::ostr
                 }
                 ++reissued;
                 std::string why;
-                done = awaitOwnWrite(client, rid, why);
+                uint16_t brokerCode = 0;   // Issue #309: replay keeps returning 1
+                done = awaitOwnWrite(client, rid, why, brokerCode);
                 if (!done) {
                     err << "rune: " << head << "the target's catalog (read from " << into << ") did not show request id "
                         << requestIdHex(rid) << " within " << kCatalogWait.count() << " s: " << why << "\n";

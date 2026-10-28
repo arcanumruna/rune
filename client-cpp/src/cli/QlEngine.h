@@ -122,7 +122,8 @@ void printPlan(const Prepared& p, const std::optional<rune::catalog::RequestId>&
 [[nodiscard]] int64_t steadyNowMs();
 /// Waits (bounded by kCatalogWait) until the client's catalog reader holds `rid`.  The seed broker
 /// serves the catalog up to ITS OWN high watermark, which can trail the leader that answered the DDL.
-[[nodiscard]] std::optional<rune::catalog::RequestRecord> awaitOwnWrite(rune::client::Client& c, const rune::catalog::RequestId& rid, std::string& why);
+/// Issue #309: `brokerCode` is 0, or the broker's code when a catalog read was refused (NotAuthorized, ...).
+[[nodiscard]] std::optional<rune::catalog::RequestRecord> awaitOwnWrite(rune::client::Client& c, const rune::catalog::RequestId& rid, std::string& why, uint16_t& brokerCode);
 
 /// What LiveBroker::open needs.
 struct LiveOptions {

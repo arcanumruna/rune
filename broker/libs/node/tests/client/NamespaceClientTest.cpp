@@ -10,6 +10,8 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -174,6 +176,46 @@ TEST(NamespaceClientRegression, CreateListLimitsRegression) {
     EXPECT_EQ(findNs(*list, "c"), nullptr);
 }
 
+// Issue #641: `limits --set` sends only the named fields and the broker merges them onto the CURRENT record.  Two
+// CLI runs for two fields both persist; and a Client holding a STALE read cannot overwrite a field it did not name.
+TEST(NamespaceCliRegression, NamespaceLimitSetsOfDifferentFieldsBothPersistRegression) {
+    AuthBroker b("nslimits641");
+    b.bootstrapAdmin(kAdminPw);
+    const std::string adminPw = writeTemp("admin-pw641", std::string(kAdminPw) + "\n");
+    const std::vector<std::string> as = {"--broker", b.endpoint(), "--user", "admin", "--password-file", adminPw};
+    auto with = [&](std::vector<std::string> args) { args.insert(args.end(), as.begin(), as.end()); return args; };
+    std::string out, err;
+    ASSERT_EQ(runCli(with({"namespace", "create", "a", "--max-topics", "5", "--max-views", "6"}), &out, &err), 0) << err;
+    ASSERT_EQ(runCli(with({"namespace", "limits", "a", "--set", "max-topics=9"}), &out, &err), 0) << err;
+    ASSERT_EQ(runCli(with({"namespace", "limits", "a", "--set", "max-views=11"}), &out, &err), 0) << err;
+    ASSERT_EQ(runCli(with({"namespace", "list", "--json"}), &out, &err), 0) << err;
+    EXPECT_NE(out.find("\"max-topics\":9,"), std::string::npos) << out;
+    EXPECT_NE(out.find("\"max-views\":11,"), std::string::npos) << out;
+
+    // The Client level: `stale` is read once; another writer changes max-topics; a patch naming only max-views,
+    // built next to that stale read, must leave the other writer's max-topics alone.
+    auto c = makeClient(b, "admin", kAdminPw);
+    const auto stale = c->listNamespaces();
+    ASSERT_TRUE(stale.has_value());
+    const auto* sa = findNs(*stale, "a");
+    ASSERT_NE(sa, nullptr);
+    EXPECT_EQ(sa->limits.maxTopics, 9u);
+    rc::NamespaceLimitsPatch other;
+    ASSERT_TRUE(other.set(*rc::namespaceLimitIndex("max-topics"), 21));
+    ASSERT_TRUE(c->setNamespaceLimits("a", other).has_value());
+    rc::NamespaceLimitsPatch mine;
+    ASSERT_TRUE(mine.set(*rc::namespaceLimitIndex("max-views"), 33));
+    ASSERT_TRUE(c->setNamespaceLimits("a", mine).has_value());
+    const auto now = c->listNamespaces();
+    ASSERT_TRUE(now.has_value());
+    const auto* na = findNs(*now, "a");
+    ASSERT_NE(na, nullptr);
+    EXPECT_EQ(na->limits.maxTopics, 21u) << "the other writer's field survives a patch that did not name it";
+    EXPECT_EQ(na->limits.maxViews, 33u);
+    EXPECT_THROW((void)c->setNamespaceLimits("a", rc::NamespaceLimitsPatch{}), std::invalid_argument);
+    c->close();
+}
+
 // The CLI: `rune namespace create|list|limits` end to end, then the Task 8 rows 1, 6 and 8 as a namespace admin of
 // `a` through `rune ql`: GRANT ADMIN ON CLUSTER is NotAuthorized (45), CREATE USER 'b/u2' answers like a missing
 // namespace (39, "no namespace '"), CREATE ROLE is allowed.
@@ -221,4 +263,173 @@ TEST(NamespaceCliRegression, CreateListLimitsAndEscalationRowsRegression) {
     // ... and a namespace admin cannot run namespace DDL (cluster admin only).
     EXPECT_EQ(runCli({"namespace", "create", "n2", "--broker", b.endpoint(), "--user", "a/nsadmin", "--password-file", nsPw},
                      &out, &err), 1);
+}
+
+// ── Adversarial review of client batch C8 (#641): limit patches through the real client against a real broker ──────
+
+namespace {
+uint64_t limitMaxOf(std::size_t i) {
+    return i == rc::kNamespaceFeatureBitsField ? uint64_t{UINT32_MAX} : UINT64_MAX;
+}
+std::vector<uint64_t> limitsOf(rc::Client& c, const std::string& ns) {
+    const auto all = c.listNamespaces();
+    if (!all) return {};
+    const auto* n = findNs(*all, ns);
+    if (n == nullptr) return {};
+    std::vector<uint64_t> v;
+    for (std::size_t i = 0; i < rc::kNamespaceLimitFields.size(); ++i) v.push_back(rc::namespaceLimitGet(n->limits, i));
+    return v;
+}
+} // namespace
+
+TEST(NamespaceClientRegression, LimitPatchEachFieldAloneAndUnknownBitsAdversarialRegression) {
+    AuthBroker b("nslimits641adv");
+    b.bootstrapAdmin(kAdminPw);
+    auto c = makeClient(b, "admin", kAdminPw);
+    const std::size_t n = rc::kNamespaceLimitFields.size();
+    rc::NamespaceLimitsPatch all;
+    std::vector<uint64_t> want;
+    for (std::size_t i = 0; i < n; ++i) {
+        ASSERT_TRUE(all.set(i, 100 + i));
+        want.push_back(100 + i);
+    }
+    ASSERT_TRUE(c->createNamespace("p", all).has_value());
+    ASSERT_EQ(limitsOf(*c, "p"), want);
+    // Every field alone, at its max: exactly that field changes.
+    for (std::size_t i = 0; i < n; ++i) {
+        rc::NamespaceLimitsPatch one;
+        ASSERT_TRUE(one.set(i, limitMaxOf(i)));
+        const auto r = c->setNamespaceLimits("p", one);
+        ASSERT_TRUE(r.has_value()) << rc::kNamespaceLimitFields[i].name << ": " << r.error().errorCode << " " << r.error().detail;
+        want[i] = limitMaxOf(i);
+        ASSERT_EQ(limitsOf(*c, "p"), want) << "after setting only " << rc::kNamespaceLimitFields[i].name;
+    }
+    // A patch whose mask carries the reserved bits 29..31 is refused by the encoder: it never reaches the broker.
+    rc::NamespaceLimitsPatch odd;
+    ASSERT_TRUE(odd.set(0, 4242));
+    odd.present[3] = static_cast<uint8_t>(odd.present[3] | 0xE0u);
+    EXPECT_ANY_THROW((void)c->setNamespaceLimits("p", odd));
+    EXPECT_EQ(limitsOf(*c, "p"), want);
+    // A value without its mask bit is never applied.
+    rc::NamespaceLimitsPatch partial;
+    ASSERT_TRUE(partial.set(0, 4242));
+    partial.values.featureBits = 7;
+    partial.values.maxViews    = 7;
+    ASSERT_TRUE(c->setNamespaceLimits("p", partial).has_value());
+    want[0] = 4242;
+    EXPECT_EQ(limitsOf(*c, "p"), want);
+    // An empty patch never reaches the broker.
+    EXPECT_THROW((void)c->setNamespaceLimits("p", rc::NamespaceLimitsPatch{}), std::invalid_argument);
+    EXPECT_EQ(limitsOf(*c, "p"), want);
+    // A patch on a namespace that does not exist is refused with a code, and creates nothing.
+    rc::NamespaceLimitsPatch some;
+    ASSERT_TRUE(some.set(0, 1));
+    const auto missing = c->setNamespaceLimits("nope", some);
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_NE(missing.error().errorCode, 0u);
+    EXPECT_TRUE(limitsOf(*c, "nope").empty());
+    c->close();
+}
+
+TEST(NamespaceClientRegression, ConcurrentLimitWritersNeverLoseAFieldAdversarialRegression) {
+    // #641: two admins patch DIFFERENT fields of one namespace at the same time, 25 times each.  Each field ends at its
+    // own writer's last value; the fields neither writer named keep their values.
+    AuthBroker b("nslimits641race");
+    b.bootstrapAdmin(kAdminPw);
+    auto setup = makeClient(b, "admin", kAdminPw);
+    const std::size_t n = rc::kNamespaceLimitFields.size();
+    rc::NamespaceLimitsPatch all;
+    for (std::size_t i = 0; i < n; ++i) ASSERT_TRUE(all.set(i, 1000 + i));
+    ASSERT_TRUE(setup->createNamespace("r", all).has_value());
+    auto c1 = makeClient(b, "admin", kAdminPw);
+    auto c2 = makeClient(b, "admin", kAdminPw);
+    const std::size_t f1 = *rc::namespaceLimitIndex("max-topics"), f2 = *rc::namespaceLimitIndex("max-views");
+    constexpr int kRounds = 25;
+    std::atomic<int> failures{0};
+    auto writer = [&](rc::Client& c, std::size_t field, uint64_t base) {
+        for (int k = 1; k <= kRounds; ++k) {
+            rc::NamespaceLimitsPatch p;
+            if (!p.set(field, base + static_cast<uint64_t>(k))) { ++failures; return; }
+            if (!c.setNamespaceLimits("r", p).has_value()) ++failures;
+        }
+    };
+    std::thread t1(writer, std::ref(*c1), f1, 10'000);
+    std::thread t2(writer, std::ref(*c2), f2, 20'000);
+    t1.join();
+    t2.join();
+    EXPECT_EQ(failures.load(), 0);
+    const auto got = limitsOf(*setup, "r");
+    ASSERT_EQ(got.size(), n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const uint64_t want = i == f1 ? 10'000 + kRounds : i == f2 ? 20'000 + kRounds : 1000 + i;
+        EXPECT_EQ(got[i], want) << rc::kNamespaceLimitFields[i].name;
+    }
+    c1->close();
+    c2->close();
+    setup->close();
+}
+
+TEST(NamespaceClientRegression, LimitPatchWithoutClusterAdminIsRefusedAdversarialRegression) {
+    // Auth: a user with no grants, and a namespace admin of `a` (ADMIN ON NAMESPACE a, not ON CLUSTER), may not change
+    // limits - their own namespace's included (a tenant raising its own quota is an escalation).
+    AuthBroker b("nslimits641auth");
+    b.bootstrapAdmin(kAdminPw);
+    auto admin = makeClient(b, "admin", kAdminPw);
+    rc::NamespaceLimitsPatch init;
+    ASSERT_TRUE(init.set(*rc::namespaceLimitIndex("max-topics"), 5));
+    ASSERT_TRUE(admin->createNamespace("a", init).has_value());
+    const auto before = limitsOf(*admin, "a");
+    b.createUser("nobody", kNsAdminPw, {});
+    auto nobody = makeClient(b, "nobody", kNsAdminPw);
+    rc::NamespaceLimitsPatch raise;
+    ASSERT_TRUE(raise.set(*rc::namespaceLimitIndex("max-topics"), 1'000'000));
+    for (const char* ns : {"a", "default"}) {
+        const auto r = nobody->setNamespaceLimits(ns, raise);
+        ASSERT_FALSE(r.has_value()) << ns;
+        EXPECT_EQ(r.error().errorCode, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized)) << ns << ": " << r.error().detail;
+    }
+    EXPECT_EQ(limitsOf(*admin, "a"), before) << "a refused patch changes nothing";
+    // The CLI as the same user: refused (non-zero), nothing stored.
+    fs::create_directories(scratchDir());
+    const std::string pw = writeTemp("nobody-pw641", std::string(kNsAdminPw) + "\n");
+    std::string out, err;
+    const int code = runCli({"namespace", "limits", "a", "--set", "max-topics=1000000", "--broker", b.endpoint(), "--user",
+                             "nobody", "--password-file", pw}, &out, &err);
+    EXPECT_NE(code, 0) << out;
+    EXPECT_EQ(limitsOf(*admin, "a"), before);
+    nobody->close();
+    admin->close();
+}
+
+// Finding (C8 adversarial review, minor): `rune namespace limits <ns> --set` pre-lists the namespaces, so a user without
+// ADMIN ON CLUSTER is told "no namespace '<ns>'" (rc 1) instead of the broker's NotAuthorized (45): the patch is never
+// sent.  The CLI sends the patch and reports the broker's code.
+TEST(NamespaceClientRegression, LimitsCliRefusalNamesNotAuthorizedAdversarialRegression) {
+    AuthBroker b("nslimits641authcli");
+    b.bootstrapAdmin(kAdminPw);
+    auto admin = makeClient(b, "admin", kAdminPw);
+    ASSERT_TRUE(admin->createNamespace("a").has_value());
+    b.createUser("nobody", kNsAdminPw, {});
+    fs::create_directories(scratchDir());
+    const std::string pw = writeTemp("nobody-pw641cli", std::string(kNsAdminPw) + "\n");
+    std::string out, err;
+    const int code = runCli({"namespace", "limits", "a", "--set", "max-topics=1000000", "--broker", b.endpoint(), "--user",
+                             "nobody", "--password-file", pw}, &out, &err);
+    EXPECT_NE(code, 0) << out;
+    EXPECT_NE(err.find("NotAuthorized"), std::string::npos) << "a refusal reads as one, not as a missing namespace: " << err;
+    admin->close();
+}
+
+// C8 fix round: `--set` on a namespace that does not exist reads as "no namespace" (rc 1), not as a bare broker code.
+TEST(NamespaceClientRegression, LimitsCliSetOnAMissingNamespaceNamesItAdversarialRegression) {
+    AuthBroker b("nslimits641missingcli");
+    b.bootstrapAdmin(kAdminPw);
+    fs::create_directories(scratchDir());
+    const std::string pw = writeTemp("admin-pw641missing", std::string(kAdminPw) + "\n");
+    std::string out, err;
+    const int code = runCli({"namespace", "limits", "ghost", "--set", "max-topics=5", "--broker", b.endpoint(), "--user",
+                             "admin", "--password-file", pw}, &out, &err);
+    EXPECT_EQ(code, 1) << out << err;
+    EXPECT_NE(err.find("no namespace 'ghost'"), std::string::npos) << err;
+    EXPECT_EQ(out.find("updated limits"), std::string::npos) << out;
 }

@@ -30,6 +30,11 @@ namespace rune::cli {
 [[nodiscard]] std::expected<rune::client::NamespaceLimitsPatch, std::string>
 parseNamespaceLimitFlags(const std::vector<std::string>& args, std::vector<std::string>& rest);
 
+/// Issue #641: the patch of `k=v` assignments - exactly the named limits are present, so sending it changes only
+/// those (the broker merges onto the current record).  Same errors as applyNamespaceLimitSets.
+[[nodiscard]] std::expected<rune::client::NamespaceLimitsPatch, std::string>
+namespaceLimitSetsPatch(const std::vector<std::string>& sets);
+
 /// Applies `k=v` assignments (each `k` a limit name) to `base`.  Error: a malformed assignment, an unknown name, a
 /// value that does not fit, or the same name twice.
 [[nodiscard]] std::expected<rune::protocol::NamespaceLimits, std::string>

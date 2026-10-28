@@ -33,6 +33,10 @@ namespace {
 int g_ctr = 0;  // single test thread
 int64_t          g_fakeNow = 0;  // test thread only; Invoker mode only (a Thread-mode runner would read it too)
 int64_t fakeNow() noexcept { return g_fakeNow; }
+// #674: a stepping clock (1 ms per read) so a blocking Invoker Client::close() reaches its delivery timeout without
+// waiting on wall time.  Test thread only: Invoker legs only (a Thread-mode runner would read it too).
+int64_t g_stepNow = 0;
+int64_t steppingNow() noexcept { return g_stepNow += 1'000'000; }
 
 rc::ClientConfig cfgFor(rc::RunnerMode mode, int32_t in, int32_t eg) {
     rc::ClientConfig c;
@@ -579,7 +583,13 @@ TEST(ClaimClientRegression, ThreadModeBatchAckCreditIsReturnedForCommittedAndAbo
 // is false, they complete nothing, and every reservation is back.  Never a hang.
 namespace {
 void ackedClaimsHeldAcrossClientClose(rc::RunnerMode mode, int32_t in, bool heldSingle, bool heldBatch) {
-    Rig r(cfgFor(mode, in, in + 1));
+    rc::ClientConfig cc = cfgFor(mode, in, in + 1);
+    if (mode == rc::RunnerMode::Invoker) {  // #674: the Thread leg keeps the real clock (its runner thread reads it too)
+        g_stepNow    = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch()).count();
+        cc.nanoClock = &steppingNow;
+    }
+    Rig r(cc);
     r.connect();
     rc::ProducerConfig pc;
     pc.acks              = rc::Acks::Leader;

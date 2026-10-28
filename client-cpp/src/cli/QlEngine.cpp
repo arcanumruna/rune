@@ -5,6 +5,7 @@
 #include "rune/cli/CatalogCommands.h"
 #include "rune/cli/SecurityCommands.h"
 
+#include <rune/client/Completion.h>
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/Serialize.h>
 
@@ -21,6 +22,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <poll.h>
 #include <rune/client/detail/SecureZero.h>
 
 #ifdef RUNE_CLI_LIVE_ENABLED
@@ -146,6 +148,8 @@ std::string descriptorText(const std::vector<uint8_t>& blob) {
 }
 
 std::string_view errorCodeName(uint16_t code) noexcept {
+    // Issue #225: the auth names have one source, rune::client::authErrorName.
+    if (const char* a = rune::client::authErrorName(code)) return a;
     static constexpr std::string_view kNames[] = {
         "OK", "ProtocolVersion", "NotLeader", "Redirect", "SessionExpired", "UnknownSession", "Internal",
         "UnknownTopic", "UnknownPartition", "NotPartitionLeader", "MinIsrViolation", "StaleGeneration",
@@ -405,9 +409,58 @@ bool readScript(const std::string& path, std::istream& stdinStream, std::string&
     struct ChunkWipe { char* b; ~ChunkWipe() { rune::client::detail::secureZero(b, sizeof chunk); } } chunkWipe{chunk};
     rune::client::detail::wipeString(text);
     if (path == "-") {
+        // Read through the stream's buffer, so a redirected std::cin (or any other stream) is honoured.  #672: the
+        // process stdin may be O_NONBLOCK.  std::cin is stdio-synced, so a read that hit EAGAIN shows as a short read
+        // with ferror(stdin) set and errno EAGAIN: wait for input and go on - it is not end of input.  Any other stdin
+        // error fails the command rather than running a prefix.
+        const bool processStdin = &stdinStream == &std::cin;
+        // PR #704 review: the script passes through stdio's stdin buffer (a pipe's later bursts are read into it): the
+        // consumed buffer is wiped on every exit, so no password literal stays there for the rest of the process.
+        struct StdioWipe {
+            bool on;
+            ~StdioWipe() {
+#ifdef __GLIBC__
+                // Everything but the unread window [read_ptr, read_end) is stale (consumed, or left by an earlier fill).
+                FILE* f = stdin;
+                if (!on || f->_IO_buf_base == nullptr) return;
+                char* lo = f->_IO_buf_base;
+                char* hi = f->_IO_buf_end;
+                char* rp = f->_IO_read_ptr != nullptr ? f->_IO_read_ptr : lo;
+                char* re = f->_IO_read_end != nullptr ? f->_IO_read_end : lo;
+                if (rp < lo || rp > hi || re < rp || re > hi) { rp = lo; re = lo; }
+                rune::client::detail::secureZero(lo, static_cast<std::size_t>(rp - lo));
+                rune::client::detail::secureZero(re, static_cast<std::size_t>(hi - re));
+#endif
+            }
+        } stdioWipe{processStdin};
         std::streambuf* sb = stdinStream.rdbuf();
-        for (std::streamsize n; sb != nullptr && (n = sb->sgetn(chunk, sizeof chunk)) > 0;)
-            rune::client::detail::appendWiped(text, std::string_view(chunk, static_cast<std::size_t>(n)));
+        while (sb != nullptr) {
+            // A stale error flag is cleared first, so ferror() below speaks for this read only.  EOF is never cleared:
+            // a tty would need a second end-of-input.  A flag that survives (error AND end of file, left by earlier
+            // use of the process stdin) is not this read's: only a flag this read raised counts (a redirected
+            // std::cin never touches stdio at all).
+            if (processStdin && std::ferror(stdin) && !std::feof(stdin)) std::clearerr(stdin);
+            const bool staleError = processStdin && std::ferror(stdin);
+            errno = 0;
+            const std::streamsize n = sb->sgetn(chunk, sizeof chunk);
+            const int readErrno = errno;
+            if (n > 0) rune::client::detail::appendWiped(text, std::string_view(chunk, static_cast<std::size_t>(n)));
+            if (n == static_cast<std::streamsize>(sizeof chunk)) continue;
+            if (!processStdin || staleError || !std::ferror(stdin)) {
+                if (n > 0) continue;   // a short read of a plain stream: the next one reports the end
+                break;
+            }
+            if (readErrno == EINTR) continue;
+            if (readErrno == EAGAIN || readErrno == EWOULDBLOCK) {
+                pollfd p{STDIN_FILENO, POLLIN, 0};
+                (void)::poll(&p, 1, -1);
+                continue;
+            }
+            std::clearerr(stdin);
+            rune::client::detail::wipeString(text);
+            err << "rune: cannot read the script from stdin\n";
+            return false;
+        }
         return true;
     }
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -486,13 +539,17 @@ int64_t steadyNowMs() {
 }
 /// Waits (bounded by kCatalogWait) until the client's catalog reader holds `rid`.  The seed broker
 /// serves the catalog up to ITS OWN high watermark, which can trail the leader that answered the DDL.
-std::optional<cat::RequestRecord> awaitOwnWrite(rc::Client& c, const cat::RequestId& rid, std::string& why) {
+std::optional<cat::RequestRecord> awaitOwnWrite(rc::Client& c, const cat::RequestId& rid, std::string& why, uint16_t& brokerCode) {
+    brokerCode = 0;
     auto& reader = c.catalogReader();
     const int64_t deadline = steadyNowMs() + std::chrono::duration_cast<std::chrono::milliseconds>(kCatalogWait).count();
     return awaitRequestVisible(
         [&]() -> std::optional<std::string> {
             const int64_t left = std::max<int64_t>(1, deadline - steadyNowMs());
-            if (auto r = reader.refresh(std::chrono::milliseconds(left)); !r) return catalogReadFailure(r.error());
+            if (auto r = reader.refresh(std::chrono::milliseconds(left)); !r) {
+                brokerCode = r.error().brokerErrorCode;   // Issue #309
+                return catalogReadFailure(r.error());
+            }
             return std::nullopt;
         },
         [&] { return reader.state().request(rid); }, steadyNowMs,
@@ -517,6 +574,7 @@ LiveOptions liveOptionsOf(const support::ParsedArgs& a, const std::string& endpo
 }
 
 bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredentials, bool quietFailure) {
+    close();   // #672: the previous client (and its scratch dir) goes before a new one is built - a ScopedDir is never replaced under a live client
     rc::ClientConfig cfg;
     cfg.gatewayChannel = toChannel(o.endpoint);
     cfg.clientName     = "rune-cli";
@@ -546,7 +604,13 @@ bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredenti
         err << "rune: --cli-stream-in/--cli-stream-out must be integers\n";
         return false;
     }
-    cfg.dataDir = resolveDataDir(o.dataDir, dir_);   // empty = a private scratch directory, removed on close (#315)
+    try {
+        cfg.dataDir = resolveDataDir(o.dataDir, dir_);   // empty = a private scratch directory, removed on close (#315)
+    } catch (const std::exception& e) {   // #680: a bad TMPDIR is a clean failure, not an exception past the secrets
+        lastFailure_ = std::string("cannot create the client's data directory: ") + e.what();
+        if (!quietFailure) err << "rune: " << lastFailure_ << "\n";
+        return false;
+    }
     // Authentication (Task 8): who to log in as.  --user / RUNE_USER and --password-file / RUNE_PASSWORD_FILE;
     // a password is NEVER taken from argv (parseArgs refuses --password) or from the environment.
     // Issue #121: the only connection the CLI opens without credentials is `rune security bootstrap`'s.
@@ -617,7 +681,9 @@ void LiveBroker::flushVerbose(std::ostream& err) {
 bool QlRun::awaitLastDdl() {
     if (!lastDdl) return true;
     std::string why;
-    if (awaitOwnWrite(broker.client(), *lastDdl, why)) return true;
+    uint16_t code = 0;
+    if (awaitOwnWrite(broker.client(), *lastDdl, why, code)) return true;
+    if (code != 0) lastErrorCode = code;   // Issue #309: the exit status carries the broker's refusal
     return fail("the catalog read did not show this script's last DDL (request id " + requestIdHex(*lastDdl) + "): " + why);
 }
 

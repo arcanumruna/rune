@@ -215,7 +215,8 @@ enum class ErrorCode : uint16_t {
                                   // transaction's Complete* record commits), or while the transaction coordinator is
                                   // not loaded on the group coordinator's node (unknown = held).  RETRIABLE: the
                                   // client re-sends after its backoff; never surfaced as a failure.  Clients below 10
-                                  // are answered NotCoordinator instead (their retriable code).
+                                  // are answered NotLeader instead (#472: the retriable code their hub waits out
+                                  // without rejoining the group; NotCoordinator would make it rejoin).
     // Namespaces (client version 14, kClientVersionNamespaces): each is sent ONLY to a session >= 14; an older client
     // is answered InvalidRequest (39).
     NamespaceSuspended     = 51,  // the request's namespace is suspended (its mode decides what is still served)
@@ -323,7 +324,8 @@ inline constexpr int32_t kClientVersionLineageNote                = 7;
 //     No block = legacy (no member check).  An older broker's decoder ignores the trailing bytes (it reads only
 //     `count` entries), so a v10 client may send it to any broker.
 //   - OffsetFetch / OffsetCommit may be answered UnstableOffsetCommit (50), retriable (see the code).  A broker
-//     answers a session below 10 NotCoordinator instead.
+//     answers a session below 10 NotLeader instead (#472: a v9 hub backs off and retries on it; NotCoordinator would
+//     make it rejoin the group).
 // 11 — Phase 2c subscription filters: `Subscribe` and `JoinGroup` may carry a trailing filter (`[u16 len][bytes]`,
 //   canonical format in `rune/codec/FilterWire.h`; omitted = no filter). A broker >= 6 serves it and answers a refused
 //   filter `SubscribeResponse` / `JoinGroupResponse` `{InvalidRequest, detail}`, the detail in a trailing
@@ -464,7 +466,7 @@ inline constexpr int32_t kBrokerVersion                           = 8;   // what
 }
 
 /// True when a session that connected with `clientVersion` may be answered UnstableOffsetCommit (50) (version 10);
-/// below it the broker answers NotCoordinator (retriable for every client).  A negative version (unknown: rigs) is
+/// below it the broker answers NotLeader (retriable for every client, and no rejoin: #472).  A negative version (unknown: rigs) is
 /// treated as current.
 [[nodiscard]] constexpr bool clientUnderstandsUnstableOffsetCommit(int32_t clientVersion) noexcept {
     return clientVersion < 0 || clientVersion >= kClientVersionTxnOffsetFence;

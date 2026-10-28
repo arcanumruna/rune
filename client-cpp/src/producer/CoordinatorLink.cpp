@@ -70,15 +70,14 @@ int64_t CoordinatorLink::backoffNs(uint32_t attempt) noexcept {
 CoordinatorLink::Slot* CoordinatorLink::acquire(ReqKind kind, int64_t deadlineNs) noexcept {
     assert(deadlineNs > 0 && "every coordinator request needs a deadline");
     if (deadlineNs <= 0) return nullptr;
-    for (std::size_t i = 0; i < slots_.size(); ++i) {
+    for (std::size_t i = 0; i < capacity_; ++i) {
         Slot& s = slots_[i];
         if (!std::holds_alternative<Free>(s.state)) continue;
-        s.state      = Building{};   // claimed; not offered until submit()
-        s.kind       = kind;
-        s.attempt    = 0;
+        Building b;
+        b.kind       = kind;
+        b.deadlineNs = deadlineNs;
+        s.state      = b;   // claimed; not offered until submit()
         s.offers     = 0;
-        s.deadlineNs = deadlineNs;
-        s.frameLen   = 0;
         s.corrId     = coordcorr::make(ordinal_, static_cast<uint8_t>(i), (++seq_ == 0 ? ++seq_ : seq_));
         ++live_;
         return &s;
@@ -87,9 +86,11 @@ CoordinatorLink::Slot* CoordinatorLink::acquire(ReqKind kind, int64_t deadlineNs
 }
 
 void CoordinatorLink::submit(Slot& s) noexcept {
-    assert(std::holds_alternative<Building>(s.state) && s.frameLen >= kHdrCorrOff + 8 && "submit: the caller encodes the request before submit()");
+    assert(std::holds_alternative<Building>(s.state) && s.frameLen() >= kHdrCorrOff + 8 && "submit: the caller encodes the request before submit()");
     rpc::detail::putLE64(s.frame.data(), static_cast<int>(kHdrCorrOff), s.corrId);
-    s.state = Unsent{};
+    Unsent u;
+    static_cast<Req&>(u) = *s.req();
+    s.state = u;
 }
 
 void CoordinatorLink::release(Slot& s) noexcept {
@@ -97,19 +98,29 @@ void CoordinatorLink::release(Slot& s) noexcept {
     --live_;
     s.state = Free{};
     s.corrId = 0;
-    s.frameLen = 0;
 }
+
+namespace {
+/// The request's facts and retry count, carried into the next state.
+template <class To>
+To carry(CoordinatorLink::Slot& s) noexcept {
+    To t;
+    static_cast<CoordinatorLink::Req&>(t) = *s.req();
+    if (const auto* sent = s.sent()) t.attempt = sent->attempt;
+    return t;
+}
+}  // namespace
 
 bool CoordinatorLink::offer_(Slot& s) noexcept {
     const int64_t sid = sink_.sessionId != nullptr ? sink_.sessionId(sink_.ctx) : 0;
     if (sid == 0 || sink_.offer == nullptr) return false;   // not connected: held, re-tried next pass
     rpc::detail::putLE64(s.frame.data(), static_cast<int>(kHdrSessionOff), sid);
-    switch (sink_.offer(sink_.ctx, s.frame.data(), s.frameLen)) {
+    switch (sink_.offer(sink_.ctx, s.frame.data(), s.req()->frameLen)) {
     case CoordinatorSink::Offer::Retry:
         return false;
     case CoordinatorSink::Offer::Accepted:
     case CoordinatorSink::Offer::Fatal:   // never deliverable: consumed, the slot's deadline completes it
-        s.state = InFlight{sid, s.deadlineNs};
+        s.state = carry<InFlight>(s);
         ++s.offers;
         return true;
     }
@@ -133,32 +144,39 @@ void CoordinatorLink::askRediscover_() noexcept {
 }
 
 void CoordinatorLink::onSessionChanged() noexcept {
-    for (Slot& s : slots_) {
-        if (std::holds_alternative<InFlight>(s.state)) s.state = Unsent{};   // same corrId: idempotent at the coordinator
+    for (Slot& s : slots()) {
+        if (std::holds_alternative<InFlight>(s.state)) s.state = carry<Unsent>(s);   // same corrId: idempotent at the coordinator
     }
 }
 
 CoordinatorLink::Slot* CoordinatorLink::onAnswer(const CoordAnswer& a, int64_t nowNs) noexcept {
     if (!coordcorr::isCoord(a.corrId) || coordcorr::ordinal(a.corrId) != (ordinal_ & batchcorr::kMaxOrdinal)) return nullptr;
     const std::size_t i = coordcorr::slot(a.corrId);
-    if (i >= slots_.size()) return nullptr;
+    if (i >= capacity_) return nullptr;
     Slot& s = slots_[i];
     if (std::holds_alternative<Free>(s.state) || s.corrId != a.corrId) return nullptr;   // late / stale
-    if (!a.anyKind && a.kind != s.kind) return nullptr;
-    switch (classify(s.kind, a.errorCode)) {
-    case Verdict::Retry:
+    if (!a.anyKind && a.kind != s.kind()) return nullptr;
+    switch (classify(s.kind(), a.errorCode)) {
+    case Verdict::Retry: {
         // Only the answer to the offer on the wire retries; a late duplicate (the re-send is already
         // pending) changes nothing.
         if (!std::holds_alternative<InFlight>(s.state)) return nullptr;
-        ++s.attempt;
-        s.state = Backoff{nowNs + backoffNs(s.attempt)};
+        Backoff b = carry<Backoff>(s);
+        ++b.attempt;
+        b.untilNs = nowNs + backoffNs(b.attempt);
+        s.state = b;
         return nullptr;
-    case Verdict::Rediscover:
+    }
+    case Verdict::Rediscover: {
         if (!std::holds_alternative<InFlight>(s.state)) return nullptr;
-        ++s.attempt;
-        s.state = AwaitCoordinator{gen_, nowNs + backoffNs(s.attempt)};
+        AwaitCoordinator w = carry<AwaitCoordinator>(s);
+        ++w.attempt;
+        w.gen         = gen_;
+        w.notBeforeNs = nowNs + backoffNs(w.attempt);
+        s.state = w;
         askRediscover_();
         return nullptr;
+    }
     default:
         return &s;
     }

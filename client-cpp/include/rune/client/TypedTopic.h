@@ -108,26 +108,35 @@ concept HasRecordKey = requires(const R& r) { r.key(); };
 // plus the claim's commit() / abort().  Chain the setters, then commit():
 //   auto w = positions.claim(userId);  w.zone(4).x(118.5);  w.commit();
 // A refused claim is false (result(): BackPressured / Closed / ...); its
-// setters then write a private scratch block and commit() returns false.
+// setters then write the TOPIC's scratch block and commit() returns false.
 // Neither copyable nor movable (E points into the claim or into the scratch).
+// The scratch belongs to the TypedTopic (one per topic, #335): a claim must not outlive its topic (it already
+// must not outlive the topic's Producer) nor be held across a move of the topic.
 // ---------------------------------------------------------------------------
 namespace detail {
 template <class E>
 struct TypedClaimSlot {
-    Claim                                  claim;
-    // A refused claim's encoder writes here.  Deliberately NOT zero-filled
-    // (Task 10: that was a per-claim memset on the granted path too); it is
-    // only ever written, never sent or read back.
-    std::array<uint8_t, E::kEncodedLength> scratch;
-    explicit TypedClaimSlot(Claim&& c) noexcept : claim(std::move(c)) {}
+    Claim claim;
+    /// Where the encoder writes: the granted claim's bytes, or - a refused claim - the TOPIC's scratch block
+    /// (#335: it used to be a 67-byte array in every claim object, which made the compiler add a stack protector to
+    /// every typed claim call site).  Decided ONCE here: neither target() nor the version stamp tests the claim again.
+    uint8_t* target_;
     /// Task 10 (perf): the claim is constructed IN the slot from `make()`'s
-    /// prvalue (guaranteed elision) — no Claim move per typed claim.
+    /// prvalue (guaranteed elision) - no Claim move per typed claim.  `scratch`: the topic's refused-claim block
+    /// (E::kEncodedLength bytes; deliberately NOT zero-filled - it is only ever written, never sent or read back).
     template <class Make>
         requires std::is_invocable_r_v<Claim, Make&>
-    explicit TypedClaimSlot(Make& make) noexcept(noexcept(make())) : claim(make()) {}
-    [[nodiscard]] std::span<uint8_t> target() noexcept {
-        return claim ? claim.buffer() : std::span<uint8_t>(scratch.data(), scratch.size());
-    }
+    explicit TypedClaimSlot(Make& make, uint8_t* scratch) noexcept(noexcept(make()))
+        : claim(make()), target_(claim ? claim.buffer().data() : scratch) {}
+    [[nodiscard]] std::span<uint8_t> target() noexcept { return {target_, E::kEncodedLength}; }
+};
+
+/// #335: the refused-claim scratch block a TypedTopic owns (empty for a schema without a ClaimEncoder).
+template <class T, class = void>
+struct ClaimScratch {};
+template <class T>
+struct ClaimScratch<T, std::void_t<typename T::ClaimEncoder>> {
+    std::array<uint8_t, T::ClaimEncoder::kEncodedLength> bytes;   // uninitialised on purpose
 };
 
 /// Tag: TypedClaim builds its Claim in place from a factory.
@@ -147,17 +156,13 @@ public:
     /// `boundVersion`: the TypedTopic's bound schema version, stamped over the
     /// encoder's codegen kVersion at bytes [2..3]; `keyValue` (keyed schemas):
     /// written into the key field by E's constructor (E has no key accessor).
-    template <class... K>
-    TypedClaim(Claim&& c, uint16_t boundVersion, const K&... keyValue)
-        : Slot(std::move(c)), E(Slot::target(), keyValue...) {
-        stampVersion_(boundVersion);
-    }
-    /// The claim built in place from `make()` (TypedTopic::claim's form).
+    /// The claim built in place from `make()` (TypedTopic::claim's form); `scratch` is the topic's
+    /// refused-claim block (E::kEncodedLength bytes).
     template <class Make, class... K>
         requires std::is_invocable_r_v<Claim, Make&>
-    [[gnu::always_inline]] TypedClaim(detail::ClaimInPlace, Make&& make, uint16_t boundVersion,
+    [[gnu::always_inline]] TypedClaim(detail::ClaimInPlace, Make&& make, uint8_t* scratch, uint16_t boundVersion,
                                       const K&... keyValue)
-        : Slot(make), E(Slot::target(), keyValue...) {
+        : Slot(make, scratch), E(Slot::target(), keyValue...) {
         stampVersion_(boundVersion);
     }
     TypedClaim(const TypedClaim&)            = delete;
@@ -173,7 +178,7 @@ public:
 
 private:
     void stampVersion_(uint16_t boundVersion) noexcept {
-        const std::span<uint8_t> t = Slot::target();
+        uint8_t* const t = Slot::target_;   // already decided: no second claim test
         t[2] = static_cast<uint8_t>(boundVersion & 0xffu);
         t[3] = static_cast<uint8_t>((boundVersion >> 8) & 0xffu);
     }
@@ -278,8 +283,8 @@ public:
         static_assert(std::is_trivially_copyable_v<K> && sizeof(K) <= Key::kMaxInline,
                       "TypedTopic::claim: the key field cannot be a record key without truncation");
         return TypedClaim<E>(detail::ClaimInPlace{},
-                             [&] { return producer_.tryClaim(topic_, Key(keyValue), E::kEncodedLength); }, version_,
-                             keyValue);
+                             [&] { return producer_.tryClaim(topic_, Key(keyValue), E::kEncodedLength); },
+                             claimScratch_.bytes.data(), version_, keyValue);
     }
 
     /// string(N) key field.  For N <= Key::kMaxInline the record key is the N
@@ -315,7 +320,7 @@ public:
         return TypedClaim<E>(
             detail::ClaimInPlace{},
             [&] { return producer_.tryClaim(topic_, Key(std::span<const uint8_t>(kb.data(), keyLen)), E::kEncodedLength); },
-            version_, field);
+            claimScratch_.bytes.data(), version_, field);
     }
 
     /// Keyless schema: partition 0, empty record key (spec C's documented
@@ -325,7 +330,8 @@ public:
     [[nodiscard]] TypedClaim<typename U::ClaimEncoder> claim() {
         using E = typename U::ClaimEncoder;
         return TypedClaim<E>(detail::ClaimInPlace{},
-                             [&] { return producer_.tryClaim(topic_, Key{}, E::kEncodedLength); }, version_);
+                             [&] { return producer_.tryClaim(topic_, Key{}, E::kEncodedLength); },
+                             claimScratch_.bytes.data(), version_);
     }
 
     // ---- Accessors / test seams ------------------------------------------------
@@ -392,6 +398,7 @@ private:
     TopicHandle            topic_;         // {topicId, partitionCount} — Phase 2b Part C
     uint16_t               version_ = 0;   // bound schema version; stamped onto every send()
     std::vector<uint8_t>   buf_;           // reused; grown to high-water mark, never freed per send
+    [[no_unique_address]] detail::ClaimScratch<T> claimScratch_;   // #335: a refused claim's encoder writes here
 };
 
 } // namespace rune::client

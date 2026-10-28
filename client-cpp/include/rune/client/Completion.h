@@ -94,7 +94,8 @@ struct Completion {
                                  ///< DefineTopic/GetTopicSchema/AlterTopic: topicId; ResultTooLarge: real size
                                  ///< CreateView: viewTopicId; GetViewRow: rowLen (informational; the payload's
                                  ///< own length is ground truth)
-    int64_t  aux   = 0;          ///< Connect refused AuthenticationFailed: the broker's retryAfterMs (rate-limited login; 0 = none)
+    int64_t  aux   = 0;          ///< Connect refused AuthenticationFailed: the broker's retryAfterMs (rate-limited login; 0 = none): read it
+                                 ///< with retryAfterMs(c)
                                  ///< GetTopicSchema/DefineTopic: version; AlterTopic: newVersion; Tier2: recordCount
                                  ///< CreateView: outputFingerprint (bit-cast uint64_t)
     OpKind   op{};
@@ -104,12 +105,22 @@ struct Completion {
                                  ///< ...,45=NotAuthorized: no READ on the view)
     uint32_t payloadLen = 0;     ///< bytes of inline payload
     uint32_t reservedBytes = 0;  ///< credit returned to the Completions on consume (§2.2)
-    uint32_t reserved0 = 0;      ///< BatchAck: producerEpoch; GetTopicSchema: the topic's partitionCount
-                                 ///< (Phase 2b Part C; 0 = a pre-2b broker that does not report it);
-                                 ///< DDL ops: the generated requestId's lo (0 = the caller's explicit
-                                 ///< requestId — Client::requestIdOf)
+    uint32_t reserved0 = 0;      ///< BatchAck: producerEpoch; GetTopicSchema: the topic's partitionCount;
+                                 ///< DDL ops: the generated requestId's low 32 bits (Phase 2b Part C; 0 = a pre-2b
+                                 ///< broker that does not report it, or the caller's explicit requestId -
+                                 ///< Client::requestIdOf)
 };
 static_assert(sizeof(Completion) == 40);
+
+/// Issue #226: the broker's login retry hint (ms) of a Connect refused AuthenticationFailed (a rate-limited login:
+/// BrokerError, or NotConnected when the hint outlived the connect deadline), else 0.  The typed way to read it:
+/// Completion::aux carries it only for that op/status/code.
+[[nodiscard]] constexpr int64_t retryAfterMs(const Completion& c) noexcept {
+    return c.op == OpKind::Connect && (c.status == OpStatus::BrokerError || c.status == OpStatus::NotConnected) &&
+                   c.errorCode == 44
+               ? c.aux
+               : 0;
+}
 
 /// One BatchAck credit unit: the reservation of one producer completion record
 /// (CompletionRing::completionRecordBytes(0); asserted in Completions.h).  A

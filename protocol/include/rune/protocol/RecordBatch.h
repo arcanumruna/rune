@@ -378,7 +378,12 @@ public:
         uint32_t stored = detail::getLE32(d_ + batch::kCrcOffset);
         uint32_t actual = crc32c(d_ + batch::kAttributesOffset,
                                  static_cast<size_t>(tl) - batch::kAttributesOffset);
-        return stored == actual;
+        if (stored != actual) return false;
+        // A control batch has its own record layout (the broker's end-txn marker has no record-length varint,
+        // storage/ControlMarkerLayout.h): every reader checks isControl() and parses it with that layout, never with
+        // forEachRecord(), so the record walk below applies to data batches only.
+        if (isControl()) return true;
+        return recordsMatchCount_(static_cast<size_t>(tl));
     }
 
     /// Cold-path convenience (type-erased).  Hot paths use forEachRecord().
@@ -441,6 +446,31 @@ public:
             data[batch::kPartitionLeaderEpochOffset + i] = static_cast<uint8_t>(u >> (i * 8));
     }
 private:
+    // Issue #180: the header recordCount must agree with the body.  The CRC covers the count but a corrupt or hostile
+    // sender re-seals it, and forEachRecord() loops recordCount() times without a bound: a count above the body would
+    // read past the batch.  Walks the records' length prefixes only (zigzag varint32; O(records), no field decode, no
+    // allocation): exactly recordCount() records must end exactly at the batch end - a body that runs out early, or
+    // has bytes left over, is invalid.
+    bool recordsMatchCount_(size_t total) const {
+        const int32_t cnt = recordCount();
+        if (cnt < 0) return false;
+        size_t pos = batch::kRecordBatchOverhead;
+        for (int32_t i = 0; i < cnt; ++i) {
+            uint32_t raw = 0;
+            unsigned shift = 0;
+            for (;;) {
+                if (pos >= total || shift > 28) return false;
+                const uint8_t b = d_[pos++];
+                raw |= static_cast<uint32_t>(b & 0x7Fu) << shift;
+                if ((b & 0x80u) == 0) break;
+                shift += 7;
+            }
+            const int32_t len = static_cast<int32_t>(raw >> 1) ^ -static_cast<int32_t>(raw & 1u);   // zigzag
+            if (len < 0 || static_cast<size_t>(len) > total - pos) return false;
+            pos += static_cast<size_t>(len);
+        }
+        return pos == total;
+    }
     const uint8_t* d_; size_t len_;
 };
 } // namespace rune::protocol

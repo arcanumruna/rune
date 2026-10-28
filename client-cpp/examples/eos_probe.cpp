@@ -31,6 +31,9 @@
 //   RUNE_PROGRESS_FILE       pipeline: the sum of the committed input offsets, rewritten after every commit
 //   RUNE_TXN_PAUSE_MS        pipeline: pause after every commit (default 0)
 //   RUNE_PIPELINE_TIMEOUT_S  pipeline: hard cap (default 600)
+//   RUNE_EOS_MAX_UNFORCED_ABORTS  pipeline: the budget of aborts NOT injected on purpose (a rebalance, a fault, a
+//                            broker error), default 100: one more fails the run loudly (exit 1); the DONE / Fenced
+//                            summary prints used / budget.  A count, never a time constant.
 //   RUNE_TIMEOUT_MS          per-operation timeout (default 20000)
 
 #include "AtomicFile.h"
@@ -72,6 +75,7 @@ constexpr std::size_t kInBytes     = 16;    // {id u64 LE, v u64 LE}
 constexpr uint32_t    kOutBytes    = rune::gen::EosOutEncoder::kEncodedLength;   // 4-byte header + {id, v}
 constexpr int         kTxnRecords  = 500;
 constexpr int         kAbortEvery  = 7;
+constexpr int64_t     kDefaultMaxUnforcedAborts = 100;   // #377: aborts other than the injected every-7th
 constexpr int         kPaths       = 5;
 constexpr int         kMaxParts    = 64;
 
@@ -272,6 +276,29 @@ void pumpFor(Client& c, int ms) {
 
 void fail(const char* tag, const std::string& msg) { std::fprintf(stderr, "%s: FAIL %s\n", tag, msg.c_str()); }
 
+// #377: a topic's id and partition count are resolved from the broker (GetTopicSchema), not trusted from the
+// RUNE_CLIENT_TOPIC_TABLE: a mismatch fails loudly before any record is written.  So does a broker that cannot
+// describe the topic (a non-zero error code, or a thrown error): a broken broker setup must fail the run (#688).
+bool topicMatchesBroker(Client& c, const char* tag, const char* name, const TopicHandle& t) {
+    try {
+        const TopicSchemaResult r = c.getTopicSchemaAndWait(name);
+        if (r.errorCode != 0) {
+            fail(tag, std::string("the broker did not describe '") + name + "' (error " + std::to_string(r.errorCode) + ")");
+            return false;
+        }
+        if (r.topicId != t.topicId || r.partitionCount != t.partitionCount) {   // #688: a broker reporting 0 partitions is a mismatch too
+            fail(tag, std::string(name) + " is topic " + std::to_string(r.topicId) + " with " + std::to_string(r.partitionCount) +
+                          " partitions on the broker, RUNE_CLIENT_TOPIC_TABLE says topic " + std::to_string(t.topicId) + " with " +
+                          std::to_string(t.partitionCount));
+            return false;
+        }
+    } catch (const std::exception& ex) {
+        fail(tag, std::string("could not resolve '") + name + "' from the broker: " + ex.what());
+        return false;
+    }
+    return true;
+}
+
 // ---- fill ----------------------------------------------------------------------------------------------------------
 
 int runFill(Client& c, const TopicHandle& in, int64_t n, int timeoutMs) {
@@ -356,7 +383,7 @@ public:
         for (auto& v : byPart_) v.reserve(kTxnRecords);
     }
 
-    int run(int pauseMs, long timeoutS, const std::string& progressFile) {
+    int run(int pauseMs, long timeoutS, const std::string& progressFile, int64_t maxUnforcedAborts) {
         const auto deadline = Clock::now() + std::chrono::seconds(timeoutS);
         auto idleSince = Clock::now();
         while (!done(Clock::now() - idleSince)) {
@@ -369,16 +396,23 @@ public:
             gather();
             const Outcome o = transaction();
             if (o == Outcome::Fenced) {
-                std::printf("EOS-PIPELINE: Fenced after %lld commits, %lld aborts (a newer producer holds '%s')\n",
-                            static_cast<long long>(commits_), static_cast<long long>(aborts_), txnId_.c_str());
+                std::printf("EOS-PIPELINE: Fenced after %lld commits, %lld aborts (%lld/%lld unforced) (a newer producer holds '%s')\n",
+                            static_cast<long long>(commits_), static_cast<long long>(aborts_),
+                            static_cast<long long>(unforcedAborts_), static_cast<long long>(maxUnforcedAborts), txnId_.c_str());
                 std::fflush(stdout);
                 return 4;
+            }
+            if (unforcedAborts_ > maxUnforcedAborts) {   // #377: a pipeline that keeps aborting for other reasons must not pass
+                fail("EOS-PIPELINE", std::to_string(unforcedAborts_) + " unforced aborts exceed the budget of " + std::to_string(maxUnforcedAborts) +
+                                         " (RUNE_EOS_MAX_UNFORCED_ABORTS); " + std::to_string(aborts_) + " aborts in all, " + std::to_string(commits_) + " commits");
+                return 1;
             }
             writeProgress(progressFile);
             if (pauseMs > 0) pumpFor(c_, pauseMs);
         }
-        std::printf("EOS-PIPELINE: DONE commits=%lld aborts=%lld records=%lld rebalances=%lld\n",
-                    static_cast<long long>(commits_), static_cast<long long>(aborts_), static_cast<long long>(records_),
+        std::printf("EOS-PIPELINE: DONE commits=%lld aborts=%lld unforced=%lld/%lld records=%lld rebalances=%lld\n",
+                    static_cast<long long>(commits_), static_cast<long long>(aborts_), static_cast<long long>(unforcedAborts_),
+                    static_cast<long long>(maxUnforcedAborts), static_cast<long long>(records_),
                     static_cast<long long>(st_.rebalances));
         std::fflush(stdout);
         return 0;
@@ -417,7 +451,7 @@ private:
                 // Records of an aborted transaction must reach the log (they stay invisible to read_committed).
                 tp_.flushAndWait();
                 tp_.abortTransactionAndWait();
-                return rewound(Outcome::Aborted, abortOnPurpose ? "on purpose" : "rebalance", false);
+                return rewound(Outcome::Aborted, abortOnPurpose ? "on purpose" : "rebalance", false, abortOnPurpose);
             }
             commitIssued_ = true;
             tp_.commitTransactionAndWait();
@@ -486,8 +520,9 @@ private:
     // inDoubt: a commit call threw and the producer is Ready - the broker may or may not have the offsets of this
     // batch.  The partitions of the batch relearn their baseline from the broker (seekToCommitted decides), never
     // from the probe's local offsets; a first record beyond the batch's end offset is a loud Gap.
-    Outcome rewound(Outcome o, const std::string& why, bool inDoubt) {
+    Outcome rewound(Outcome o, const std::string& why, bool inDoubt, bool forced = false) {
         ++aborts_;
+        if (!forced) ++unforcedAborts_;   // #377: counted against the budget (the every-7th injected abort is not)
         std::fprintf(stderr, "EOS-PIPELINE: transaction %lld (%s) aborted (%s)%s, rewinding\n", static_cast<long long>(attempt_),
                      pathName(static_cast<int>(attempt_ % kPaths)), why.c_str(), inDoubt ? ", commit in doubt" : "");
         if (inDoubt) for (const OffsetEntry& e : entries_) markRebase(st_.part[static_cast<std::size_t>(e.partition)], e.offset);
@@ -609,7 +644,7 @@ private:
     std::vector<OffsetEntry>  entries_;
     std::array<std::vector<uint32_t>, kMaxParts> byPart_;
     bool commitIssued_ = false;
-    int64_t attempt_ = 0, commits_ = 0, aborts_ = 0, records_ = 0;
+    int64_t attempt_ = 0, commits_ = 0, aborts_ = 0, unforcedAborts_ = 0, records_ = 0;
 };
 
 std::vector<int64_t> readCounts(const std::string& file, int parts) {
@@ -637,7 +672,8 @@ int runPipeline(Client& c, const TopicHandle& in, const std::string& groupId, co
     std::printf("EOS-PIPELINE: READY txnId=%s group=%s pid=%lld epoch=%d\n", txnId.c_str(), groupId.c_str(),
                 static_cast<long long>(tp.producerId()), static_cast<int>(tp.producerEpoch()));
     std::fflush(stdout);
-    return pl.run(static_cast<int>(envInt("RUNE_TXN_PAUSE_MS", 0)), envInt("RUNE_PIPELINE_TIMEOUT_S", 600), envStr("RUNE_PROGRESS_FILE"));
+    return pl.run(static_cast<int>(envInt("RUNE_TXN_PAUSE_MS", 0)), envInt("RUNE_PIPELINE_TIMEOUT_S", 600), envStr("RUNE_PROGRESS_FILE"),
+                  envInt("RUNE_EOS_MAX_UNFORCED_ABORTS", kDefaultMaxUnforcedAborts));
 }
 
 // ---- verify --------------------------------------------------------------------------------------------------------
@@ -733,8 +769,16 @@ int main() {
             std::fprintf(stderr, "EOS-PROBE: eos_in / eos_out missing from RUNE_CLIENT_TOPIC_TABLE (or more than %d partitions)\n", kMaxParts);
             return 1;
         }
-        if (mode == "fill") { c.connectAndWait(); return runFill(c, in, n, timeoutMs); }
-        if (mode == "verify") { c.connectAndWait(); return runVerify(c, out, n); }
+        if (mode == "fill") {
+            c.connectAndWait();
+            if (!topicMatchesBroker(c, "EOS-FILL", "eos_in", in)) return 1;
+            return runFill(c, in, n, timeoutMs);
+        }
+        if (mode == "verify") {
+            c.connectAndWait();
+            if (!topicMatchesBroker(c, "EOS-VERIFY", "eos_out", out)) return 1;
+            return runVerify(c, out, n);
+        }
         if (mode == "pipeline") {
             const std::string groupId = envStr("RUNE_GROUP_ID", "eos-1"), txnId = envStr("RUNE_TXN_ID", "eos-worker-1");
             InState st;
@@ -742,7 +786,16 @@ int main() {
             gcfg.autoCommit       = false;            // the offsets travel in the transaction
             gcfg.sessionTimeoutMs = 10000;
             GroupConsumer gc = c.subscribeGroup(groupId, {"eos_in"}, gcfg);
-            const auto reset = [&st](std::vector<TopicPartition> parts) { st.rebalance(parts); };
+            // #377: eos_in's id is resolved from the broker, not trusted from RUNE_CLIENT_TOPIC_TABLE: the group
+            // subscribed to "eos_in" BY NAME, so every partition the coordinator assigns carries eos_in's real topic id.
+            const auto reset = [&st, inId = in.topicId, inParts = in.partitionCount](std::vector<TopicPartition> parts) {
+                for (const TopicPartition& tp : parts) {
+                    if ((tp.topicId != inId || tp.partition < 0 || tp.partition >= inParts) && st.error.empty())
+                        st.error = "the broker assigned topic " + std::to_string(tp.topicId) + " partition " + std::to_string(tp.partition) +
+                                   " for eos_in, RUNE_CLIENT_TOPIC_TABLE says topic " + std::to_string(inId) + " with " + std::to_string(inParts) + " partitions";
+                }
+                st.rebalance(parts);
+            };
             gc.onAssigned(reset);
             gc.onRevoked(reset);
             gc.onRecords([&st](const RecordSet& rs) {

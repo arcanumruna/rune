@@ -32,6 +32,7 @@
 //   PoisonedTransactionMustBeAbortedBeforeTheNextRegression (lifecycle part),
 //   TimedOutAddPartitionsAbortsPossiblyStartedTxnRegression (the EndTxn half: TxnStarted::Maybe).
 #include "../support/AckLedger.h"
+#include "../support/AllocCounter.h"
 #include "../support/FakeCoordinator.h"
 
 #include <rune/client/Completion.h>
@@ -362,6 +363,11 @@ TEST(ProducerTxn, MachineStatesCarryNoBooleans) {
     static_assert(nobool::noBoolMembers<rp::TxnJoiners>(), "TxnJoiners carries a bool member");
     static_assert(nobool::everyAlternative<rp::TxnMembership>(), "a TxnMembership state carries a bool member");
     static_assert(nobool::noBoolMembers<rp::TxnOutcome>(), "TxnOutcome carries a bool member");
+    // #344: close()'s own-abort states (declared in CoordinatorLink.h so they can be named here).
+    static_assert(nobool::noBoolMembers<rp::LifeEndingTxn>(), "LifeEndingTxn carries a bool member");
+    static_assert(nobool::noBoolMembers<rp::CloseAbortDone>(), "CloseAbortDone carries a bool member");
+    static_assert(nobool::everyAlternative<decltype(rp::LifeEndingTxn::own)>(), "a CloseAbort state carries a bool member");
+    static_assert(nobool::noBoolMembers<rp::AbortableError>(), "AbortableError carries a bool member");
     static_assert(std::variant_size_v<rp::TxnMachine> == static_cast<std::size_t>(TxnState::FatalError) + 1);
     SUCCEED();
 }
@@ -1756,4 +1762,237 @@ TEST(ProducerTxnRegression, LinkResentCommitRefusedIsFatalNeverAbortableRegressi
         r.ticks(4, kMs);
         EXPECT_EQ(r.endTxns(), 2u) << "an EndTxn(abort) over a commit that may have landed";
     }
+}
+
+
+// ============================================================================================================
+// Batch C15 (#344): op origin, the caps, the claim-abandon allocation
+// ============================================================================================================
+
+// #344 item 1: the close's own abort was marked by an EMPTY target, so an app commit with an empty target (a
+// fire-and-forget call) that failed abortably while close() waited for it completed INTO the close's outcome: close
+// finished at once without aborting the open transaction.  TxnOpOrigin::Internal marks the close's own op only.
+TEST(ProducerTxnRegression, CloseDuringAnAbortablyFailingCommitStillAbortsTheTxnRegression) {
+    Rig r;
+    r.initOk();
+    r.startTxn();                      // TxnStarted::Yes: the coordinator has the transaction
+    ASSERT_TRUE(r.sendRecord(0));
+    TxnControl commit;                 // an APP commit whose target is EMPTY (no handler, no queue)
+    commit.kind = TxnControl::Kind::Commit;
+    r.impl->applyTxnControl(commit, r.now);
+    ASSERT_EQ(r.state(), TxnState::CommittingTransaction);
+    const OfferedFrame* add = nullptr;
+    for (int i = 0; i < 4 && add == nullptr; ++i) {   // AddPartitionsToTxn leaves
+        r.tick();
+        for (const auto& f : r.fake.offered) if (f.templateId == rpc::AddPartitionsToTxn::TEMPLATE_ID) add = &f;
+    }
+    ASSERT_NE(add, nullptr);
+    Op cl = r.close();                 // arrives while the app commit runs
+    EXPECT_FALSE(cl.ready());
+    r.answer(FakeCoordinator::answer(rp::ReqKind::AddPartitions, add->corrId, ec(rpc::ErrorCode::InvalidTxnState)));
+    // The commit failed abortably; the close must abort the still-open transaction itself.
+    for (int i = 0; i < 4 && r.endTxns() == 0; ++i) r.tick();
+    EXPECT_FALSE(cl.ready()) << "close finished without aborting the open transaction (the app op's outcome became its own)";
+    ASSERT_EQ(r.endTxns(), 1u) << "EndTxn(abort) must be on the wire";
+    ASSERT_TRUE(r.lastEnd().has_value());
+    EXPECT_EQ(r.lastEnd()->commit, 0) << "an abort, never a commit";
+    r.endAnswer();
+    r.ticks(3);
+    ASSERT_TRUE(cl.ready());
+    EXPECT_EQ(cl.status(), OpStatus::Ok);
+    EXPECT_EQ(cl.times(), 1) << "the close completes once";
+}
+
+// #344 item 2: a call beyond the joiner cap (4) or the flush cap (8) completes InvalidArgument with a payload that
+// names the cap - not the BrokerError(19) of misuse - and the op it could not join runs on, unpoisoned.
+TEST(ProducerTxnRegression, JoinerAndFlushCapsCompleteInvalidArgumentNotMisuseCodeRegression) {
+    for (const TxnControl::Kind kind : {TxnControl::Kind::Commit, TxnControl::Kind::Abort}) {
+        const bool commit = kind == TxnControl::Kind::Commit;
+        SCOPED_TRACE(commit ? "commit" : "abort");
+        Rig r;
+        r.initOk();
+        r.startTxn();
+        Op first = r.apply(kind);
+        r.tick();
+        ASSERT_EQ(r.endTxns(), 1u);
+        std::vector<Op> joiners;
+        for (std::size_t i = 0; i < rp::kMaxTxnJoiners; ++i) {
+            joiners.push_back(r.apply(kind));
+            EXPECT_FALSE(joiners.back().ready()) << "joiner " << i << " joins the pending op";
+        }
+        Op over = r.apply(kind);
+        ASSERT_TRUE(over.ready()) << "the call beyond the cap is refused at once";
+        EXPECT_EQ(over.status(), OpStatus::InvalidArgument);
+        EXPECT_EQ(over.code(), 0) << "not the state-error code 19";
+        EXPECT_EQ(r.ledger.e.at(over.t).text,
+                  commit ? "too many concurrent commitTransaction waiters (max 4)"
+                         : "too many concurrent abortTransaction waiters (max 4)");
+        EXPECT_EQ(r.state(), commit ? TxnState::CommittingTransaction : TxnState::AbortingTransaction)
+            << "the refusal does not disturb the running op";
+        EXPECT_EQ(r.endTxns(), 1u);
+        r.endAnswer();
+        for (Op* op : [&] { std::vector<Op*> v{&first}; for (auto& j : joiners) v.push_back(&j); return v; }()) {
+            ASSERT_TRUE(op->ready());
+            EXPECT_EQ(op->status(), OpStatus::Ok);
+            EXPECT_EQ(op->times(), 1);
+        }
+        EXPECT_EQ(r.state(), TxnState::Ready);
+    }
+    // Flush: 8 pending flushes (a record is unsettled), the ninth is refused with the cap in its payload.
+    Rig r;
+    r.initOk();
+    r.startTxn();
+    ASSERT_TRUE(r.sendRecord(0));
+    std::vector<Op> flushes;
+    for (std::size_t i = 0; i < 8; ++i) {
+        flushes.push_back(r.flush());
+        EXPECT_FALSE(flushes.back().ready()) << "flush " << i << " waits for the record";
+    }
+    Op over = r.flush();
+    ASSERT_TRUE(over.ready());
+    EXPECT_EQ(over.status(), OpStatus::InvalidArgument);
+    EXPECT_EQ(over.code(), 0);
+    EXPECT_EQ(r.ledger.e.at(over.t).text, "too many concurrent flush calls (max 8)");
+    EXPECT_EQ(r.state(), TxnState::InTransaction) << "the refusal poisons nothing";
+    Op ab = r.abort();                 // the pending flushes complete with the transaction's end
+    r.ticks(3);
+    if (r.endTxns() != 0) r.endAnswer();
+    r.ticks(3);
+    for (const Op& f : flushes) EXPECT_TRUE(f.ready()) << "a pending flush never completed";
+    EXPECT_TRUE(ab.ready());
+}
+
+// #344 item 4: a commit / abort with an Invoker (Direct) claim open abandons the claim; the records before it are kept
+// by copying them into the preallocated quarantine buffer (a builder-sized spare, reserved when the Direct producer is
+// created) and swapping - no allocation, in the very first abandon and in every later one.
+TEST(ProducerTxnAllocRegression, CommitWithAnOpenClaimAbandonsItWithoutAllocatingRegression) {
+    Rig r(txnCfg(), /*direct=*/true);
+    r.initOk();
+    for (int round = 0; round < 3; ++round) {
+        SCOPED_TRACE(round);
+        r.startTxn();
+        r.impl->setTxnGate(ProducerImpl::TxnGate::Open);
+        ASSERT_TRUE(r.sendRecord(0)) << "a record before the claim: it must survive the abandon";
+        const auto g = r.impl->claimRecord(1, 0, Key(uint64_t{3}), 16, 0);
+        ASSERT_EQ(g.result, rc::SendResult::Ok);
+        std::memset(g.base, 0xC1, 16);
+        TxnControl c = r.ctl(TxnControl::Kind::Commit, ++r.next);
+        const Token tok = c.token;
+        alloc_counter::startThisThread();
+        r.impl->applyTxnControl(c, r.now);
+        const long allocs = alloc_counter::stopThisThread();
+        EXPECT_EQ(allocs, 0L) << "abandoning an open claim allocated";
+        std::memset(g.base, 0xC2, 16);   // the caller still writes its span: quarantined
+        EXPECT_FALSE(r.impl->commitClaim(g.token));
+        r.tick();
+        r.addOk();
+        r.tick();
+        ASSERT_EQ(r.wire.size(), static_cast<std::size_t>(round) + 1) << "the kept record is produced exactly once";
+        r.ackLastData(0, round);
+        r.tick();
+        r.endAnswer();
+        const Op commitOp{&r.ledger, tok};
+        ASSERT_TRUE(commitOp.ready());
+        EXPECT_EQ(commitOp.status(), OpStatus::Ok);
+        ASSERT_EQ(r.state(), TxnState::Ready);
+    }
+}
+
+// ============================================================================================================
+// C15 review - adversarial pass over #344 (joiner caps, claim abandon allocation)
+// ============================================================================================================
+
+// #344 item 2, bounds and reuse: cap-1 and cap joiners join, cap+1 AND cap+2 are refused (no wrap), on the commit, the
+// plain abort and the abort of a poisoned transaction (Aborting from AbortableError) - and the cap is per op: every
+// next transaction joins four again.  RED (mutation): join() not bounded by kMaxTxnJoiners; the joiner count carried
+// over from the previous op.
+TEST(ProducerTxnRegression, JoinerCapIsExactPerOpAndFreedWhenTheOpEndsAdversarialRegression) {
+    Rig r;
+    r.initOk();
+    for (int txn = 0; txn < 4; ++txn) {
+        SCOPED_TRACE(txn);
+        r.startTxn();
+        if (txn >= 2) r.impl->testPoison(OpStatus::BrokerError, 77, rp::AbortKind::Plain);
+        const TxnControl::Kind kind = txn == 0 ? TxnControl::Kind::Commit : TxnControl::Kind::Abort;   // 2, 3: poisoned
+        Op first = r.apply(kind);
+        r.tick();
+        ASSERT_EQ(r.endTxns(), static_cast<std::size_t>(txn) + 1);
+        std::vector<Op> joined;
+        for (std::size_t i = 0; i < rp::kMaxTxnJoiners; ++i) {
+            joined.push_back(r.apply(kind));
+            EXPECT_FALSE(joined.back().ready()) << "joiner " << i << " (cap " << rp::kMaxTxnJoiners << ") joins";
+        }
+        for (int extra = 0; extra < 2; ++extra) {
+            Op over = r.apply(kind);
+            ASSERT_TRUE(over.ready()) << "cap+" << extra + 1 << " is refused at once";
+            EXPECT_EQ(over.status(), OpStatus::InvalidArgument);
+            EXPECT_EQ(over.code(), 0);
+        }
+        EXPECT_EQ(r.endTxns(), static_cast<std::size_t>(txn) + 1) << "one EndTxn for the op and its joiners";
+        r.endAnswer();
+        ASSERT_TRUE(first.ready());
+        EXPECT_EQ(first.status(), OpStatus::Ok);
+        for (const Op& j : joined) {
+            ASSERT_TRUE(j.ready());
+            EXPECT_EQ(j.status(), OpStatus::Ok);
+            EXPECT_EQ(j.times(), 1);
+        }
+        ASSERT_EQ(r.state(), TxnState::Ready);
+    }
+}
+
+// #344 item 4 on the abort path and the close path: abandoning an open Invoker claim allocates nothing on any round
+// (the quarantine is the reserved spare, swapped back and forth), the claim never commits, and its bytes never reach
+// a frame.  RED (mutation): claimQuarantine_ not reserved in enableDirectIngress (round 0 allocates).
+TEST(ProducerTxnAllocRegression, AbortAndCloseWithAnOpenClaimAbandonWithoutAllocatingAdversarialRegression) {
+    Rig r(txnCfg(), /*direct=*/true);
+    r.initOk();
+    for (int round = 0; round < 4; ++round) {
+        SCOPED_TRACE(round);
+        r.startTxn();
+        r.impl->setTxnGate(ProducerImpl::TxnGate::Open);
+        ASSERT_TRUE(r.sendRecord(0));
+        const auto g = r.impl->claimRecord(1, 0, Key(uint64_t{3}), 16, 0);
+        ASSERT_EQ(g.result, rc::SendResult::Ok);
+        std::memset(g.base, 0xC1, 16);
+        TxnControl c = r.ctl(TxnControl::Kind::Abort, ++r.next);
+        const Op ab{&r.ledger, c.token};
+        alloc_counter::startThisThread();
+        r.impl->applyTxnControl(c, r.now);
+        const long allocs = alloc_counter::stopThisThread();
+        EXPECT_EQ(allocs, 0L) << "abandoning an open claim on abort allocated";
+        std::memset(g.base, 0xC2, 16);
+        EXPECT_FALSE(r.impl->commitClaim(g.token));
+        r.ticks(3);
+        ASSERT_EQ(r.endTxns(), static_cast<std::size_t>(round) + 1);
+        r.endAnswer();
+        ASSERT_TRUE(ab.ready());
+        EXPECT_EQ(ab.status(), OpStatus::Ok);
+        EXPECT_TRUE(r.wire.empty()) << "an aborted transaction produced";
+        EXPECT_EQ(r.impl->claimsAbandoned(), static_cast<uint64_t>(round) + 1);
+    }
+    // The close's own abort with a claim open: the same, allocation-free.
+    r.startTxn();
+    r.impl->setTxnGate(ProducerImpl::TxnGate::Open);
+    ASSERT_TRUE(r.sendRecord(0));
+    const auto g = r.impl->claimRecord(1, 0, Key(uint64_t{3}), 16, 0);
+    ASSERT_EQ(g.result, rc::SendResult::Ok);
+    const Token t = ++r.next;
+    rc::detail::OpTarget target;
+    target.handler = rc::CompletionHandler{&Ledger::on, &r.ledger};
+    (void)r.impl->closeIntake();
+    alloc_counter::startThisThread();
+    r.impl->applyBeginClose(target, t, r.now);
+    const long allocs = alloc_counter::stopThisThread();
+    EXPECT_EQ(allocs, 0L) << "the close's abandon allocated";
+    EXPECT_FALSE(r.impl->commitClaim(g.token));
+    for (int i = 0; i < 4 && r.endTxns() < 5; ++i) r.tick();
+    ASSERT_EQ(r.endTxns(), 5u) << "the close sends one EndTxn(abort)";
+    EXPECT_EQ(r.lastEnd()->commit, uint8_t{0});
+    r.endAnswer();
+    r.ticks(2);
+    const Op cl{&r.ledger, t};
+    ASSERT_TRUE(cl.ready()) << "endTxns " << r.endTxns() << " state " << static_cast<int>(r.state());
+    EXPECT_EQ(cl.status(), OpStatus::Ok);
+    EXPECT_TRUE(r.wire.empty());
 }

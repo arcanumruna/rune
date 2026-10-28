@@ -9,6 +9,7 @@
 #include <rune/protocol/RecordBatch.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -39,7 +40,9 @@ struct FrameCapture {
 
     rune::client::producer::ProducerImpl::SendFn fn() {
         return [this](int32_t, int32_t partition, int32_t, const uint8_t* b, std::size_t n) {
-            if (watch != nullptr && watch >= b && watch < b + n) watchInFrame = true;
+            // std::less<>: a total order over unrelated pointers (a bare relational compare is unspecified).
+            const std::less<> lt;
+            if (watch != nullptr && !lt(watch, b) && lt(watch, b + n)) watchInFrame = true;
             const auto v = rune::client::codec::decodeProduce(b, n);
             if (!v) return true;
             const int f = frames++;

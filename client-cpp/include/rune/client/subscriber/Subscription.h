@@ -195,7 +195,7 @@ struct SubscriptionStatus {
     SubscriptionFailReason failReason = SubscriptionFailReason::None;  // final snapshot only
     uint16_t brokerErrorCode = 0;  // RejectedByBroker: the SubscribeResponse errorCode (final snapshot only)
     uint32_t dataResets      = 0;  // E2 round 6: times the partition's data was reset under it (see dataResets())
-    uint64_t batchBytes      = 0;  // Phase 2c (FD13): sum of the delivered recordBatch sizes
+    uint64_t batchBytes      = 0;  // Phase 2c (FD13) / #428: sum of the sizes of the batches DELIVERED to the handler (malformed, duplicate and control batches do not count)
 };
 
 // ---------------------------------------------------------------------------
@@ -254,7 +254,7 @@ struct SubscriptionImpl {
     SubscriptionFailReason failReason = SubscriptionFailReason::None;  // set before a failing finish
     uint16_t brokerErrorCode = 0;  // RejectedByBroker: the broker's error code
     int64_t nextOffset     = 0;  // lastDelivered + 1 (CB-5 resume point); filtered: follows batch ends and notes
-    uint64_t batchBytes    = 0;  // Phase 2c (FD13): sum of the delivered recordBatch sizes
+    uint64_t batchBytes    = 0;  // Phase 2c (FD13) / #428: sum of the sizes of the batches DELIVERED to the handler (malformed, duplicate and control batches do not count)
     // E2 Task 13: the resume position of a moved subscription (rearmMovedAway).
     // Records below it were delivered before the move: dropped (a straddling
     // batch's lower records, whole batches below it while the new leader's HW
@@ -434,8 +434,10 @@ public:
     /// the application's signal.  Freshness: see position().
     [[nodiscard]] uint32_t dataResets() const;
 
-    /// Phase 2c (FD13): the sum of the recordBatch sizes delivered so far — the egress bytes the broker sent this
-    /// subscription (a filter's saving is visible against an unfiltered one).  Freshness: see position().
+    /// Phase 2c (FD13) / #428: the sum of the sizes of the recordBatches DELIVERED to the handler so far - the egress
+    /// bytes of the batches the application actually received (a filter's saving is visible against an unfiltered
+    /// one).  A malformed batch, a duplicate (a moved subscription's batch wholly below its resume floor) and a
+    /// control batch (consumed, never delivered) do not add.  Freshness: see position().
     [[nodiscard]] uint64_t batchBytes() const;
 
 private:

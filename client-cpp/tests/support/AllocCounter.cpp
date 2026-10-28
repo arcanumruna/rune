@@ -34,6 +34,17 @@ void scanBeforeFree(void* p) noexcept {
 #endif
     if (n >= t_needleLen && ::memmem(p, n, t_needle, t_needleLen) != nullptr) ++t_freedHits;
 }
+/// While the scan is armed a new block starts zeroed: a reused chunk can carry stale bytes from a block freed while the
+/// scan was off (the test's own unwiped copies), and only bytes written by the code under test may count as a hit.
+void* scrubIfScanning(void* p) noexcept {
+    if (t_needle == nullptr || p == nullptr) return p;
+#if defined(__APPLE__)
+    std::memset(p, 0, malloc_size(p));
+#else
+    std::memset(p, 0, malloc_usable_size(p));
+#endif
+    return p;
+}
 /// True when this allocation is the injected failure (counts down the armed n).
 bool injectFailure() noexcept {
     if (t_failIn <= 0 || --t_failIn != 0) return false;
@@ -46,7 +57,7 @@ void* operator new(std::size_t n) {
     if (g_on.load(std::memory_order_relaxed)) g_count.fetch_add(1, std::memory_order_relaxed);
     if (t_on) ++t_count;
     if (injectFailure()) throw std::bad_alloc{};
-    if (void* p = std::malloc(n != 0 ? n : 1)) return p;
+    if (void* p = std::malloc(n != 0 ? n : 1)) return scrubIfScanning(p);
     throw std::bad_alloc{};
 }
 void* operator new[](std::size_t n) { return ::operator new(n); }
@@ -60,7 +71,7 @@ void* operator new(std::size_t n, std::align_val_t al) {
     if (injectFailure()) throw std::bad_alloc{};
     const std::size_t a = static_cast<std::size_t>(al);
     const std::size_t sz = ((n != 0 ? n : 1) + a - 1) / a * a;  // aligned_alloc: size % align == 0
-    if (void* p = std::aligned_alloc(a, sz)) return p;
+    if (void* p = std::aligned_alloc(a, sz)) return scrubIfScanning(p);
     throw std::bad_alloc{};
 }
 void* operator new[](std::size_t n, std::align_val_t al) { return ::operator new(n, al); }

@@ -209,3 +209,119 @@ TEST(SubscriberHubRecordsRegression, AHoledBatchDeliversItsOwnOffsetsRegression)
     EXPECT_EQ(b.impl->nextOffset, 13);
     EXPECT_EQ(b.hub.malformedBatches(), 0u);
 }
+
+// ---- Issue #180: a RecordBatch header recordCount that disagrees with its body is rejected ------------------
+namespace {
+// Set the header's recordCount and re-seal the CRC (the CRC covers the count: a hostile or corrupt broker re-seals).
+std::vector<uint8_t> withCount(std::vector<uint8_t> b, uint32_t count) {
+    namespace pb = rune::protocol::batch;
+    for (int i = 0; i < 4; ++i) b[static_cast<std::size_t>(pb::kRecordCountOffset + i)] = static_cast<uint8_t>(count >> (8 * i));
+    const uint32_t crc = rune::protocol::crc32c(b.data() + pb::kAttributesOffset, b.size() - pb::kAttributesOffset);
+    for (int i = 0; i < 4; ++i) b[static_cast<std::size_t>(pb::kCrcOffset + i)] = static_cast<uint8_t>(crc >> (8 * i));
+    return b;
+}
+std::size_t visited(const rc::codec::RecordsView& v) {
+    std::size_t n = 0;
+    v.forEachRecord([&](std::string_view, std::string_view, int64_t, int64_t) { ++n; });
+    return n;
+}
+}   // namespace
+
+// Table: header count in {actual-1, actual+1, 0, max int32, max uint32 (-1)} x body in {empty, 1 record, many}.
+// Every disagreeing batch is invalid (the reader's ensureValid), a view over it visits nothing, and the subscriber
+// counts it malformed and neither delivers nor moves the position.
+TEST(RecordsViewRegression, HeaderCountDisagreeingWithBodyIsRejectedRegression) {
+    int cases = 0;
+    for (const int32_t actual : {0, 1, 2, 7, 40}) {
+        const auto good = batchAt(0, actual);
+        std::vector<uint32_t> counts{static_cast<uint32_t>(actual + 1), 0u, 0x7FFFFFFFu, 0xFFFFFFFFu, 0x80000000u};
+        if (actual > 0) counts.push_back(static_cast<uint32_t>(actual - 1));
+        for (const uint32_t cnt : counts) {
+            if (cnt == static_cast<uint32_t>(actual)) continue;
+            const auto bad = withCount(good, cnt);
+            SCOPED_TRACE("actual=" + std::to_string(actual) + " headerCount=" + std::to_string(cnt));
+            rune::protocol::RecordBatchReader reader(bad.data(), bad.size());
+            EXPECT_FALSE(reader.ensureValid()) << "the CRC is valid; the count disagrees with the body";
+            Bound b(kTopic, 100 + cases, 500 + cases);
+            const auto view = b.view(bad, 0);
+            EXPECT_EQ(visited(view), 0u) << "a view over a disagreeing batch visits nothing";
+            b.hub.onRecords(view);
+            EXPECT_TRUE(b.delivered.empty()) << "a partial or over-read batch is never delivered";
+            EXPECT_EQ(b.hub.malformedBatches(), 1u);
+            EXPECT_EQ(b.impl->nextOffset, 0) << "the position does not move";
+            ++cases;
+        }
+    }
+    EXPECT_GE(cases, 25) << "vacuity guard: the table ran";
+}
+
+TEST(RecordsViewRegression, HeaderCountMatchingBodyDecodesEveryRecordRegression) {
+    int cases = 0;
+    for (const int32_t actual : {0, 1, 2, 7, 40}) {
+        const auto good = batchAt(0, actual);
+        SCOPED_TRACE("actual=" + std::to_string(actual));
+        rune::protocol::RecordBatchReader reader(good.data(), good.size());
+        EXPECT_TRUE(reader.ensureValid());
+        Bound b(kTopic, 200 + cases, 600 + cases);
+        const auto view = b.view(good, 0);
+        EXPECT_EQ(visited(view), static_cast<std::size_t>(actual));
+        b.hub.onRecords(view);
+        EXPECT_EQ(b.delivered, range(0, actual));
+        EXPECT_EQ(b.hub.malformedBatches(), 0u);
+        ++cases;
+    }
+    EXPECT_EQ(cases, 5);
+}
+
+// ---- C17 adversarial review (#180): a REAL end-transaction marker in a Records frame -------------------------
+// The broker writes markers in the 75-byte layout of broker/libs/storage/include/rune/storage/ControlMarkerLayout.h:
+// ONE record WITHOUT a record-length varint (the control batches above are protocol-builder batches, which do carry
+// one, so they never exercised it).  A frame [data, marker, data] must deliver every data record, consume the
+// marker's offset, and count nothing malformed.
+//
+// Guards #180's control-batch exemption: ensureValid walks the records of data batches only.
+namespace {
+std::vector<uint8_t> brokerLayoutMarker(int64_t base, int16_t controlType) {
+    namespace pb = rune::protocol::batch;
+    std::vector<uint8_t> m(75, 0);
+    auto put = [&](std::size_t off, uint64_t v, int n) { for (int i = 0; i < n; ++i) m[off + static_cast<std::size_t>(i)] = uint8_t(v >> (8 * i)); };
+    put(0, static_cast<uint64_t>(base), 8);
+    put(pb::kLengthOffset, 75 - 12, 4);
+    put(12, 0xFFFFFFFFu, 4);                 // partitionLeaderEpoch -1
+    m[16] = 2;                               // magic
+    put(pb::kAttributesOffset, 0x0030, 2);   // CONTROL | TRANSACTIONAL
+    put(23, 0, 4);                           // lastOffsetDelta 0
+    put(43, 42, 8);                          // producerId
+    put(51, 0, 2);                           // producerEpoch
+    put(53, 0xFFFFFFFFu, 4);                 // baseSequence -1
+    put(pb::kRecordCountOffset, 1, 4);       // one record
+    // record (no length varint): attrs 0, tsDelta 0, offsetDelta 0, keyLen zz(2), key, valueLen zz(6), value, headers 0
+    m[64] = 0x04; put(65, static_cast<uint16_t>(controlType), 2);
+    m[67] = 0x0C; put(68, 1, 2); put(70, 7, 4);
+    m[74] = 0;
+    put(pb::kCrcOffset, rune::protocol::crc32c(m.data() + pb::kAttributesOffset, m.size() - pb::kAttributesOffset), 4);
+    return m;
+}
+}   // namespace
+
+TEST(SubscriberHubAdversarialRegression, ABrokerLayoutMarkerMidFrameIsConsumedAndTheDataAfterItDeliveredRegression) {
+    for (const int16_t type : {int16_t{0}, int16_t{1}}) {   // commit, abort
+        SCOPED_TRACE("controlType=" + std::to_string(type));
+        Bound b(kTopic, 900 + type, 950 + type);
+        const auto frame = concat({batchAt(0, 3), brokerLayoutMarker(3, type), batchAt(4, 2)});
+        b.hub.onRecords(b.view(frame, 0));
+        EXPECT_EQ(b.delivered, (std::vector<int64_t>{0, 1, 2, 4, 5})) << "the data after the marker is delivered";
+        EXPECT_EQ(b.impl->nextOffset, 6) << "the position passes the marker and the batch after it";
+        EXPECT_EQ(b.hub.malformedBatches(), 0u) << "a broker marker is not malformed";
+        EXPECT_EQ(b.hub.controlBatchesSkipped(), 1u);
+    }
+}
+
+TEST(SubscriberHubAdversarialRegression, AFrameOpeningWithABrokerLayoutMarkerMovesThePositionRegression) {
+    Bound b(kTopic, 960, 970);
+    const auto frame = concat({brokerLayoutMarker(0, 0), batchAt(1, 2)});
+    b.hub.onRecords(b.view(frame, 0));
+    EXPECT_EQ(b.delivered, (std::vector<int64_t>{1, 2}));
+    EXPECT_EQ(b.impl->nextOffset, 3) << "never stuck before the marker";
+    EXPECT_EQ(b.hub.malformedBatches(), 0u);
+}

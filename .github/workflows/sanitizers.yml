@@ -160,7 +160,7 @@ jobs:
           CLIENT_GEN=$(realpath "$(dirname "$(find "$GITHUB_WORKSPACE/build-client-${{ matrix.id }}" -name conan_toolchain.cmake | head -1)")")
           cmake -S client-cpp -B "build-client-${{ matrix.id }}/cmake" -G Ninja -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_TOOLCHAIN_FILE="$CLIENT_GEN/conan_toolchain.cmake" -DCMAKE_PREFIX_PATH="$CLIENT_GEN" \
-            -DBUILD_TESTING=ON \
+            -DBUILD_TESTING=ON -DBUILD_EXAMPLES=ON \
             -DFLIGHT_RECORDER_DIR="$GITHUB_WORKSPACE/flight-recorder" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_FLAGS="${{ matrix.flags }}" \

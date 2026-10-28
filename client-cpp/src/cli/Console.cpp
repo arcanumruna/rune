@@ -26,6 +26,7 @@
 #include <iostream>
 #include <istream>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -40,9 +41,28 @@
 
 namespace rune::cli::console {
 
+int consoleExitStatus(uint16_t brokerCode) noexcept { return (brokerCode >= 4 && brokerCode <= 124) ? brokerCode : 125; }   // Issue #301
+
+uint16_t consoleSessionEndCode(uint16_t sessionRejectCode, uint16_t statementErrorCode) noexcept {   // Issue #308
+    return sessionRejectCode != 0 ? sessionRejectCode : (statementErrorCode == 46 ? uint16_t{46} : uint16_t{0});
+}
+
+uint16_t consoleRejectCode(int16_t sessionRejectCode) noexcept {
+    return sessionRejectCode != 0 ? static_cast<uint16_t>(sessionRejectCode) : uint16_t{0};
+}
+
+int consoleScriptExitStatus(int batchStatus, bool sessionEnded, uint16_t endCode) noexcept {
+    return sessionEnded ? consoleExitStatus(endCode) : batchStatus;
+}
+
+int consoleOpenFailureStatus(std::string_view failureText) noexcept {
+    return failureText.find("AuthenticationFailed") != std::string_view::npos ? consoleExitStatus(44) : 1;
+}
+
 PollingFdLineSource::~PollingFdLineSource() { rune::client::detail::secureZero(buf_.data(), buf_.size()); }
 
 bool PollingFdLineSource::next(std::string& line) {
+    lastLineDiscarded = false;
     // The buffer may hold a password literal (CREATE USER ... PASSWORD '...'): every byte that leaves it is zeroed.
     const auto wipeFrom = [this](std::size_t from, std::size_t n) { rune::client::detail::secureZero(buf_.data() + from, n); };
     for (;;) {
@@ -68,8 +88,9 @@ bool PollingFdLineSource::next(std::string& line) {
             wipeFrom(0, len_);
             len_        = 0;
             discarding_ = true;
-            if (err != nullptr) *err << "error: input line too long (64 KiB); the line was discarded\n";
+            if (err != nullptr) *err << kInputLineTooLongMessage;
             line.clear();
+            lastLineDiscarded = true;   // Issue #307: the caller must not treat this as an ordinary empty line
             return true;
         }
         pollfd p{fd_, POLLIN, 0};
@@ -82,8 +103,9 @@ bool PollingFdLineSource::next(std::string& line) {
             continue;
         }
         if (n < 0) return false;
-        const ssize_t got = ::read(fd_, buf_.data() + len_, buf_.size() - len_);
+        const ssize_t got = readFn_(fd_, buf_.data() + len_, buf_.size() - len_);
         if (got < 0 && errno == EINTR) continue;
+        if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { ++idlePumps; idle_(ctx_); continue; }   // #672: spurious wakeup on an O_NONBLOCK fd: back to polling, like a timeout
         if (got <= 0) {
             if (len_ == 0 || discarding_) return false;
             line.assign(buf_.begin(), buf_.begin() + static_cast<std::ptrdiff_t>(len_));   // a last line without '\n'
@@ -107,6 +129,11 @@ bool readPasswordLine(int fd, std::string& password) {
         char c = 0;
         const ssize_t got = ::read(fd, &c, 1);
         if (got < 0 && errno == EINTR) continue;
+        if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            pollfd p{fd, POLLIN, 0};
+            (void)::poll(&p, 1, -1);
+            continue;   // #672: a non-blocking fd is not end of input
+        }
         if (got <= 0) { ok = n > 0; break; }
         if (c == '\n') { ok = true; break; }
         if (c == '\r') continue;
@@ -209,7 +236,8 @@ void printConsoleUsage(std::ostream& err) {
     err << "Usage: rune console [--broker <ep>] [--cli-egress <ch>] [-f <script.rql|->] [--dry-run]\n"
            "                    [--validate] [--expected-version N] [--request-id <32 hex>] [--verbose]\n"
            "                    [--user <u>] [--password-file <p>] [--tls-ca <pem>] [--tls-host <name>]\n"
-           "                    [--insecure-plaintext]\n";
+           "                    [--insecure-plaintext]\n"
+           "exit status: 0 ok, 1 error, 2 usage, 3 diff, 4..124 the broker error code, 125 any other broker error\n";
 }
 
 int usage(std::ostream& err, const std::string& msg) {
@@ -348,12 +376,13 @@ int runBatch(Exec& exec, const std::vector<PreparedStatement>& batch, std::size_
 
 // ── Script mode (-f) ─────────────────────────────────────────────────────────
 
-template <class Exec>
-int runScript(Exec& exec, const ConsoleOptions& o, std::string_view src, std::ostream& err) {
-    std::vector<PreparedStatement> batch;
-    BatchWipe batchWipe{batch};
-    if (!prepareAll(o.scriptPath, src, o.prep, batch, err)) return 1;
-    return runBatch(exec, batch, 1);
+/// Issue #303: the same refusal as `rune ql`: statement N uses lo + N - 1, which must not wrap.
+bool requestIdFits(const std::optional<rune::catalog::RequestId>& base, std::size_t n, std::ostream& err) {
+    if (!base || n <= 1 || base->lo <= std::numeric_limits<uint64_t>::max() - (n - 1)) return true;
+    err << "rune: --request-id: the low 64 bits would overflow at statement "
+        << (std::numeric_limits<uint64_t>::max() - base->lo) + 2 << " of " << n
+        << " (statement N uses lo + N - 1); choose a smaller id\n";
+    return false;
 }
 
 // ── Interactive mode: REPL state machine (CLAUDE.md #3) ──────────────────────
@@ -363,7 +392,8 @@ int runScript(Exec& exec, const ConsoleOptions& o, std::string_view src, std::os
 //   any ──line, Incomplete───────────────> ContinuingStatement{text so far}
 //   any ──line, Complete─────────────────> prepare + run the batch ──> AwaitingStatement
 //   any ──EOF──> leave (0); a ContinuingStatement is reported, never run
-//   any ──executor.sessionEnded()────────> leave (46, DD11)
+//   any ──executor.sessionEnded()────────> leave (the session's end code, DD11 / #308)
+//   any ──line was too long (#307)────────> skipped; a ContinuingStatement is abandoned
 
 struct AwaitingStatement {};
 struct ContinuingStatement { std::string text; };
@@ -400,6 +430,14 @@ int runInteractive(Exec& exec, const ConsoleOptions& o, LineSource& in, std::ost
                 err << "error: input ended inside a statement (missing ';'); it was not executed\n";
             return 0;
         }
+        if (in.lastLineDiscarded) {   // Issue #307: never join the text before and after a dropped line
+            if (auto* c = std::get_if<ContinuingStatement>(&state)) {
+                rune::client::detail::wipeString(c->text);
+                err << "error: the statement in progress was abandoned (an input line was too long)\n";
+                state = AwaitingStatement{};
+            }
+            continue;
+        }
         std::string text;
         struct TextWipe { std::string& s; ~TextWipe() { rune::client::detail::wipeString(s); } } textWipe{text};
         if (auto* c = std::get_if<ContinuingStatement>(&state)) {
@@ -420,7 +458,7 @@ int runInteractive(Exec& exec, const ConsoleOptions& o, LineSource& in, std::ost
                     (void)runBatch(exec, batch, index);   // DD7: a failure skips the rest of this input
                     index += batch.size();
                 }
-                if (exec.sessionEnded()) return 46;
+                if (exec.sessionEnded()) return consoleExitStatus(exec.endCode());
                 break;
             }
         }
@@ -431,8 +469,10 @@ int runInteractive(Exec& exec, const ConsoleOptions& o, LineSource& in, std::ost
 
 struct StreamLineSource final : LineSource {
     std::istream& in;
+    std::ostream* err = nullptr;   // where the "input line too long" error goes (null: silent)
     explicit StreamLineSource(std::istream& s) : in(s) {}
     bool next(std::string& line) override {
+        lastLineDiscarded = false;
         // std::getline would grow `line` and free unwiped copies of a typed password (#305): read char by char.
         rune::client::detail::wipeString(line);
         std::streambuf* sb = in.rdbuf();
@@ -448,6 +488,16 @@ struct StreamLineSource final : LineSource {
             any = true;
             const char ch = std::char_traits<char>::to_char_type(c);
             if (ch == '\n') break;
+            if (line.size() + 1 >= kMaxInputLineBytes) {   // same cap and rule as PollingFdLineSource (#307)
+                rune::client::detail::wipeString(line);
+                line.clear();
+                for (auto d = sb->sbumpc(); !std::char_traits<char>::eq_int_type(d, std::char_traits<char>::eof()) &&
+                                            std::char_traits<char>::to_char_type(d) != '\n';)
+                    d = sb->sbumpc();   // drop the rest of the over-long line
+                if (err != nullptr) *err << kInputLineTooLongMessage;
+                lastLineDiscarded = true;
+                return true;
+            }
             const char one[1] = {ch};
             rune::client::detail::appendWiped(line, std::string_view(one, 1));
         }
@@ -466,6 +516,7 @@ struct DryRunExecutor {
         return 0;
     }
     [[nodiscard]] bool sessionEnded() const noexcept { return false; }
+    [[nodiscard]] uint16_t endCode() const noexcept { return 0; }
 };
 
 #ifdef RUNE_CLI_LIVE_ENABLED
@@ -475,23 +526,27 @@ struct LiveExecutor {
     engine::QlRun       run;
     std::optional<rune::catalog::RequestId> base;
     bool ended = false;
+    uint16_t endCode_ = 0;
     int execute(const engine::Prepared& p, const std::string& text, std::size_t index) {
         std::optional<rune::catalog::RequestId> rid;
         if (base) rid = rune::catalog::RequestId{base->hi, base->lo + (index - 1)};
         run.index = index;
         run.lastErrorCode = 0;
         if (run.exec(p, text, rid)) return 0;
-        // A revoked session fails the client for good: the next statement sees "client closed", with no broker code.
-        if (run.lastErrorCode == 0 && broker.client().sessionRejectCode() ==
-                                          static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionRevoked))
-            run.lastErrorCode = static_cast<uint16_t>(rune::protocol::client::ErrorCode::SessionRevoked);
-        if (run.lastErrorCode == static_cast<uint16_t>(rune::protocol::client::ErrorCode::SessionRevoked)) {
-            ended = true;
-            run.err << "error: SessionRevoked (46): the session ended\n";
+        // Issue #308: any terminal session rejection ends the console, not only SessionRevoked.  A rejected session
+        // fails the client for good: the next statement would see "client closed", with no broker code.
+        const int16_t reject = broker.client().sessionRejectCode();
+        const uint16_t end = consoleSessionEndCode(consoleRejectCode(reject), run.lastErrorCode);
+        if (end != 0) {
+            ended    = true;
+            endCode_ = end;
+            if (run.lastErrorCode == 0) run.lastErrorCode = end;
+            run.err << "error: " << engine::errorCodeName(end) << " (" << end << "): the session ended\n";
         }
-        return run.lastErrorCode != 0 ? run.lastErrorCode : 1;
+        return run.lastErrorCode != 0 ? consoleExitStatus(run.lastErrorCode) : 1;   // Issue #301
     }
     [[nodiscard]] bool sessionEnded() const noexcept { return ended; }
+    [[nodiscard]] uint16_t endCode() const noexcept { return endCode_; }
 };
 
 void pumpClient(void* ctx) noexcept {
@@ -513,7 +568,7 @@ struct LiveInput {
     uint64_t*     idlePumps = nullptr;
 };
 
-int runLiveSession(const ConsoleOptions& opts, std::string_view script, const LiveInput& input, std::ostream& out,
+int runLiveSession(const ConsoleOptions& opts, const std::vector<PreparedStatement>& batch, const LiveInput& input, std::ostream& out,
                    std::ostream& err) {
     ConsoleOptions o = opts;
     if (o.live.endpoint.empty()) {
@@ -531,6 +586,7 @@ int runLiveSession(const ConsoleOptions& opts, std::string_view script, const Li
         std::string& s;
         ~Wipe() { rune::client::detail::wipeString(s); }
     } wipe{password};
+    struct LivePasswordWipe { std::string& s; ~LivePasswordWipe() { rune::client::detail::wipeString(s); } } livePasswordWipe{o.live.password};   // #680: on a throw too
     if (!user.empty() && !havePasswordFile) {
         if (!(input.canPrompt && o.scriptPath.empty() && ::isatty(STDIN_FILENO)))
             return usage(err, "--password-file is required with --user (passwords are never read from argv or the environment)");
@@ -545,7 +601,7 @@ int runLiveSession(const ConsoleOptions& opts, std::string_view script, const Li
     const bool opened = broker.open(o.live, err);
     rune::client::detail::wipeString(password);
     rune::client::detail::wipeString(o.live.password);
-    if (!opened) return 1;
+    if (!opened) return consoleOpenFailureStatus(broker.lastFailure());   // a refused login ends like a refused reconnect
     if (broker.client().authStatus().kind == rune::client::AuthStatus::Kind::PasswordChangeRequired)
         err << "WARNING: password change required — run ALTER USER " << broker.client().authStatus().user
             << " SET PASSWORD '…';\n";
@@ -555,7 +611,8 @@ int runLiveSession(const ConsoleOptions& opts, std::string_view script, const Li
     exec.run.origin = o.scriptPath;
     int rc = 0;
     if (!o.scriptPath.empty()) {
-        rc = runScript(exec, o, script, err);
+        const int batchRc = runBatch(exec, batch, 1);   // #690: sequenced - the session state is read after the batch ran
+        rc = consoleScriptExitStatus(batchRc, exec.sessionEnded(), exec.endCode());   // as interactive
     } else if (input.fd >= 0 || input.canPrompt) {
         // The process stdin (a TTY or a pipe, #311) is polled and the client pumped while it is idle; only an injected
         // non-stdin stream (StreamLineSource below) is read blocking.
@@ -565,19 +622,21 @@ int runLiveSession(const ConsoleOptions& opts, std::string_view script, const Li
         if (input.idlePumps != nullptr) *input.idlePumps = src.idlePumps;
     } else {
         StreamLineSource src(*input.in);
+        src.err = &err;
         rc = runInteractive(exec, o, src, out, err);
     }
     broker.flushVerbose(err);
     return rc;
 }
 
-int runLive(const ConsoleOptions& o, std::istream& in, const std::string& script, std::ostream& out, std::ostream& err) {
-    return runLiveSession(o, script, LiveInput{&in, -1, &in == &std::cin, nullptr}, out, err);
+int runLive(const ConsoleOptions& o, std::istream& in, const std::vector<PreparedStatement>& batch, std::ostream& out,
+            std::ostream& err) {
+    return runLiveSession(o, batch, LiveInput{&in, -1, &in == &std::cin, nullptr}, out, err);
 }
 
 #else
 
-int runLive(const ConsoleOptions&, std::istream&, const std::string&, std::ostream&, std::ostream& err) {
+int runLive(const ConsoleOptions&, std::istream&, const std::vector<PreparedStatement>&, std::ostream&, std::ostream& err) {
     err << "rune console: live mode requires RUNE_CLI_LIVE_ENABLED and a real Aeron build. Use --dry-run.\n";
     return 1;
 }
@@ -591,14 +650,29 @@ int cmdConsole(const std::vector<std::string>& args, std::istream& in, std::ostr
     if (const int rc = parseConsoleOptions(args, o, err); rc != 0) return rc;
     std::string script;
     struct ScriptWipe { std::string& s; ~ScriptWipe() { rune::client::detail::wipeString(s); } } scriptWipe{script};
-    if (!o.scriptPath.empty() && !engine::readScript(o.scriptPath, in, script, err)) return 1;
+    std::vector<PreparedStatement> batch;
+    BatchWipe batchWipe{batch};
+    if (!o.scriptPath.empty()) {
+        if (!engine::readScript(o.scriptPath, in, script, err)) return 1;
+        // Issue #302: the script is parsed and prepared once, before any broker is needed.
+        if (!prepareAll(o.scriptPath, script, o.prep, batch, err)) return 1;
+        if (batch.empty()) return 0;
+        if (!requestIdFits(o.requestIdBase, batch.size(), err)) return 1;   // Issue #303
+    }
     if (o.dryRun) {
         DryRunExecutor exec{out, o.requestIdBase};
-        if (!o.scriptPath.empty()) return runScript(exec, o, script, err);
+        if (!o.scriptPath.empty()) return runBatch(exec, batch, 1);
         StreamLineSource src(in);
+        src.err = &err;
         return runInteractive(exec, o, src, out, err);
     }
-    return runLive(o, in, script, out, err);
+    return runLive(o, in, batch, out, err);
+}
+
+int runInteractiveDryRunForTest(LineSource& src, std::ostream& out, std::ostream& err) {
+    ConsoleOptions o;
+    DryRunExecutor exec{out, std::nullopt};
+    return runInteractive(exec, o, src, out, err);
 }
 
 int runLiveOnStdinForTest([[maybe_unused]] const std::vector<std::string>& args,

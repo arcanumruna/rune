@@ -29,6 +29,8 @@
 #   EOS_E2E_N             records (default 200000)
 #   E2E_LOG_DIR           when set, the brokers' and the probes' logs are kept there at teardown
 #   E2E_WORK_DIR          scratch dir shared with the client container as /work (default: a mktemp dir under <broker>, removed at teardown; yours is kept)
+#   EOS_E2E_MAX_UNFORCED_ABORTS  budget of pipeline aborts NOT injected on purpose (default 100); one more fails the run;
+#                         the DONE line prints used/budget
 #   EOS_E2E_PAUSE_MS      pause after every pipeline commit (default 100: keeps the run long enough to inject the faults)
 #   EOS_E2E_PYTHON        python3 for the dr-e2e step (default python3; a venv with requirements.txt is created when pytest is missing)
 #
@@ -54,6 +56,7 @@ else WORK_DIR="$(mktemp -d "${BROKER_REPO}/.eos-e2e-work.XXXXXX")"; OWN_WORK=1; 
 
 N="${EOS_E2E_N:-200000}"
 PAUSE_MS="${EOS_E2E_PAUSE_MS:-100}"
+MAX_UNFORCED_ABORTS="${EOS_E2E_MAX_UNFORCED_ABORTS:-100}"   # #377: aborts other than the injected every-7th
 LEADER_WAIT_S=180      # a common consensus leader after `up`
 OP_TIMEOUT_S=150       # one rune CLI command
 FILL_S=600             # the fill client
@@ -305,7 +308,7 @@ log "Step 2 OK: $(grep -c . "${WORK_DIR}/eos-counts") partitions filled"
 # Step 3: the pipeline, with the faults.
 # ---------------------------------------------------------------------------
 PIPE_START=$(now_s)
-pipe_env=(RUNE_GROUP_ID=eos-1 RUNE_TXN_ID=eos-worker-1 "RUNE_TXN_PAUSE_MS=${PAUSE_MS}" "RUNE_PIPELINE_TIMEOUT_S=${PIPELINE_S}")
+pipe_env=(RUNE_GROUP_ID=eos-1 RUNE_TXN_ID=eos-worker-1 "RUNE_TXN_PAUSE_MS=${PAUSE_MS}" "RUNE_PIPELINE_TIMEOUT_S=${PIPELINE_S}" "RUNE_EOS_MAX_UNFORCED_ABORTS=${MAX_UNFORCED_ABORTS}")
 log "Step 3: starting the pipeline (transactionalId eos-worker-1, group eos-1)..."
 probe_start pipe-a pipeline "${PIPELINE_S}" 1 "${pipe_env[@]}" RUNE_PROGRESS_FILE=/work/pipe-a.progress
 wait_until "${PROGRESS_WAIT_S}" "the pipeline READY" bg_ready pipe-a || { bg_out pipe-a | tail -20 >&2; fail "step 3: the pipeline never became ready"; }

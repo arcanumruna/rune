@@ -139,6 +139,28 @@ TEST(SubscriberFilterRegression, RefusedFilterSurfacesTheDetailNeverFallsBackReg
     EXPECT_TRUE(r.gw.subscribed.empty());
 }
 
+// #428: the same assertions for a KEY subscription (the broker resolves its partition; the refusal detail reaches
+// onError just the same, and nothing falls back to an unfiltered Subscribe).
+TEST(SubscriberFilterRegression, KeySubscriptionRefusalCarriesTheDetailRegression) {
+    FilterRig r(4309);
+    r.gw.subscribeErrorCode   = 39;   // InvalidRequest
+    r.gw.subscribeErrorDetail = "filter needs a typed topic";
+    r.connect();
+    rc::SubscribeOptions opts;
+    opts.filter(E::Filter{.worldId = 7u});
+    const rc::Key key(uint64_t{7});
+    auto sub = r.client.subscribe(r.client.topic("t"), key, opts, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); }));
+    EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::RejectedByBroker);
+    EXPECT_EQ(sub.brokerErrorCode(), 39);
+    ASSERT_TRUE(r.drive([&] { return !r.errors.empty(); }));
+    EXPECT_NE(r.errors.back().find("filter needs a typed topic"), std::string::npos) << r.errors.back();
+    EXPECT_NE(r.errors.back().find("InvalidRequest"), std::string::npos) << r.errors.back();
+    r.passes(300);
+    EXPECT_EQ(r.gw.subscribeFrames.size(), 1u) << "never an unfiltered fallback";
+    EXPECT_TRUE(r.gw.subscribed.empty());
+}
+
 TEST(SubscriberFilterRegression, EncodeErrorThrowsBeforeAnythingIsSentRegression) {
     FilterRig r(4310);
     r.connect();
@@ -422,4 +444,110 @@ TEST(SubscriberFilter, UnfilteredSubscriptionImplCarriesNoFilterStorage) {
     EXPECT_TRUE(impl.filtered());
     EXPECT_EQ(std::vector<uint8_t>(impl.filterSpan().begin(), impl.filterSpan().end()),
               std::vector<uint8_t>(o.filterBytes.span().begin(), o.filterBytes.span().end()));
+}
+
+namespace {
+std::vector<uint8_t> controlBatch(int64_t base) {
+    rune::protocol::RecordBatchBuilder b(base, 1000);
+    b.append("c", "m", 1000);
+    std::vector<uint8_t> v = b.build();
+    const uint16_t attrs = static_cast<uint16_t>(rune::protocol::batch::kAttrControl);
+    v[rune::protocol::batch::kAttributesOffset]     = static_cast<uint8_t>(v[rune::protocol::batch::kAttributesOffset] | (attrs & 0xFF));
+    v[rune::protocol::batch::kAttributesOffset + 1] = static_cast<uint8_t>(v[rune::protocol::batch::kAttributesOffset + 1] | (attrs >> 8));
+    const uint32_t crc = rune::protocol::crc32c(v.data() + rune::protocol::batch::kAttributesOffset,
+                                                v.size() - rune::protocol::batch::kAttributesOffset);
+    std::memcpy(v.data() + rune::protocol::batch::kCrcOffset, &crc, 4);
+    return v;
+}
+std::vector<uint8_t> plainBatch(int64_t base, int n) {
+    rune::protocol::RecordBatchBuilder b(base, 1000);
+    for (int i = 0; i < n; ++i) b.append("k", "v", 1000);
+    return b.build();
+}
+} // namespace
+
+// #428 decision: SubscriptionStatus::batchBytes counts only DELIVERED batches.  One delivered, one duplicate (a
+// moved subscription's batch wholly below its resume floor), one control (its offsets consumed, never delivered)
+// and one malformed batch: only the delivered one adds.  Mutation: count every received frame (the old
+// `batchBytes += rb.size()` up front) -> red.
+TEST(SubscriberStatusRegression, BatchBytesCountsOnlyDeliveredBatchesRegression) {
+    FilterRig r(4326);
+    const auto [n1, port1] = r.addNode(4326);
+    r.gw.moreBrokers = {{1, "127.0.0.1", port1}};
+    r.gw.partitions  = {{1, 0, /*leader*/ 0, 1, 4326, ""}, {1, 1, /*leader*/ 0, 1, 4326, ""}};
+    r.connect();
+    std::vector<int64_t> seen;
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, {}, [&](const rc::Record& rec) { seen.push_back(rec.offset); });
+    ASSERT_TRUE(r.drive([&] { return sub.subscriptionId() != 0; }));
+    const auto first = *r.firstSub();
+    r.gw.pushRecords(first, 0, 3);   // offsets 0..2 delivered: the position is 3
+    ASSERT_TRUE(r.drive([&] { return sub.position() == 3; }));
+    const uint64_t before = sub.batchBytes();
+    // The partition moves to node 1: the re-armed subscription carries a resume floor of 3.
+    r.gw.subscribeLeader = {{0, n1}, {1, 0}};
+    r.gw.partitions      = {{1, 0, /*leader*/ n1, 1, 4326, ""}, {1, 1, /*leader*/ 0, 1, 4326, ""}};
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::Redirect),
+                   "127.0.0.1:" + std::to_string(port1), first.sessionId, first.corrId);
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, n1) != nullptr; })) << "re-subscribed on node 1";
+    const auto moved = *r.subAt(0, n1);
+
+    const auto duplicate = plainBatch(0, 2);     // offsets 0..1: wholly below the floor
+    const auto delivered = plainBatch(3, 2);     // offsets 3..4
+    const auto control   = controlBatch(5);      // offset 5: consumed
+    const std::vector<uint8_t> malformed(40, 0xEE);
+    r.gw.pushBatch(moved, 0, duplicate);
+    r.gw.pushBatch(moved, 3, delivered);
+    r.gw.pushBatch(moved, 5, control);
+    r.gw.pushBatch(moved, 6, malformed);
+    ASSERT_TRUE(r.drive([&] { return sub.position() == 6; })) << "delivered + control consumed through offset 5";
+    r.passes(300);   // the malformed frame is certainly processed too
+    EXPECT_EQ(seen, (std::vector<int64_t>{0, 1, 2, 3, 4}));
+    EXPECT_EQ(sub.batchBytes() - before, delivered.size())
+        << "only the delivered batch counts (duplicate " << duplicate.size() << ", control " << control.size()
+        << ", malformed " << malformed.size() << ")";
+}
+
+// ---- C16 adversarial review (#428): batchBytes on every path of a coalesced frame --------------------------------
+
+// One Records frame carries a valid batch followed by a malformed tail (a coalesced frame torn mid-batch): the valid
+// batch is delivered and counted, the tail is not.  Mutation: `batchBytes += rb.size()` up front -> red.
+TEST(SubscriberStatusRegression, BatchBytesOfACoalescedFrameWithAMalformedTailAdversarialRegression) {
+    FilterRig r(4360);
+    r.connect();
+    std::vector<int64_t> seen;
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, {}, [&](const rc::Record& rec) { seen.push_back(rec.offset); });
+    ASSERT_TRUE(r.drive([&] { return sub.subscriptionId() != 0; }));
+    const auto delivered = plainBatch(0, 3);
+    std::vector<uint8_t> frame = delivered;
+    const auto torn = plainBatch(3, 2);
+    frame.insert(frame.end(), torn.begin(), torn.begin() + static_cast<std::ptrdiff_t>(torn.size() / 2));   // torn tail
+    r.gw.pushBatch(*r.firstSub(), 0, frame);
+    ASSERT_TRUE(r.drive([&] { return sub.position() == 3; }));
+    r.passes(300);
+    EXPECT_EQ(seen, (std::vector<int64_t>{0, 1, 2}));
+    EXPECT_EQ(sub.batchBytes(), delivered.size()) << "the torn tail (" << torn.size() / 2 << " bytes) was counted";
+}
+
+// The handler unsubscribes on the first record of a two-batch frame: the second batch is never delivered, so it is
+// never counted; the final status snapshot carries the first batch only.  Mutation: count the whole frame -> red.
+TEST(SubscriberStatusRegression, BatchBytesStopsAtTheBatchAnUnsubscribingHandlerEndedAdversarialRegression) {
+    FilterRig r(4362);
+    r.connect();
+    std::vector<int64_t> seen;
+    rc::Subscription* self = nullptr;
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, {}, [&](const rc::Record& rec) {
+        seen.push_back(rec.offset);
+        if (self != nullptr) self->unsubscribe();
+    });
+    self = &sub;
+    ASSERT_TRUE(r.drive([&] { return sub.subscriptionId() != 0; }));
+    const auto a = plainBatch(0, 2);
+    const auto b = plainBatch(2, 2);
+    std::vector<uint8_t> frame = a;
+    frame.insert(frame.end(), b.begin(), b.end());
+    r.gw.pushBatch(*r.firstSub(), 0, frame);
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); }));
+    EXPECT_EQ(seen, (std::vector<int64_t>{0}));
+    EXPECT_EQ(sub.position(), 1);
+    EXPECT_EQ(sub.batchBytes(), a.size()) << "the batch after the unsubscribe was counted";
 }

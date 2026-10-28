@@ -9,6 +9,7 @@
 #include <vector>
 #include <cstdint>
 #include <climits>
+#include <cstring>
 namespace b = rune::protocol::batch;
 
 // Little-endian field readers (all fixed header fields are LE after the BE→LE unification).
@@ -948,4 +949,132 @@ TEST(RecordBatchReaderRegression, EnsureValidRefusesShortAndHugeLengths) {
     const uint32_t l = 0x7FFFFFFFu;
     for (int i = 0; i < 4; ++i) buf[b::kLengthOffset + i] = uint8_t(l >> (8 * i));
     EXPECT_EQ(rune::protocol::RecordBatchReader(buf.data(), buf.size()).totalLength(), -1);
+}
+
+// ---------------------------------------------------------------------------
+// C17 adversarial review (#180): ensureValid refuses a batch whose header
+// recordCount disagrees with the record bodies — with the CRC RE-COMPUTED after
+// each mutation, so only the count walk can catch it.  Input bounds on the count
+// (0, ±1, max, min), truncation of the record area at every offset, trailing
+// bytes, varint overflow, negative record length; and the legitimate shapes
+// (empty, horizon-stamped, transactional, header-carrying records) stay valid.
+// ---------------------------------------------------------------------------
+namespace {
+std::vector<uint8_t> adv180Batch(int n) {
+    rune::protocol::RecordBatchBuilder bb(500, 1'000);
+    for (int i = 0; i < n; ++i)
+        bb.append("key" + std::to_string(i), std::string(static_cast<std::size_t>(i * 37 % 200), 'v'), 1'000 + i);
+    return bb.build();
+}
+void adv180Put32(std::vector<uint8_t>& v, int off, uint32_t x) {
+    for (int i = 0; i < 4; ++i) v[static_cast<std::size_t>(off + i)] = uint8_t(x >> (8 * i));
+}
+void adv180Reseal(std::vector<uint8_t>& v) {   // length + CRC consistent with the current bytes
+    adv180Put32(v, b::kLengthOffset, static_cast<uint32_t>(v.size() - 12));
+    adv180Put32(v, b::kCrcOffset, rune::protocol::crc32c(v.data() + b::kAttributesOffset, v.size() - b::kAttributesOffset));
+}
+bool adv180Valid(const std::vector<uint8_t>& v) {
+    // Exactly-sized copy so ASan flags any read past the batch.
+    auto heap = std::make_unique<uint8_t[]>(v.size());
+    std::memcpy(heap.get(), v.data(), v.size());
+    return rune::protocol::RecordBatchReader(heap.get(), v.size()).ensureValid();
+}
+}   // namespace
+
+TEST(RecordBatchAdversarialRegression, CountMismatchWithAValidCrcIsRefusedRegression) {
+    for (int n : {1, 2, 7}) {
+        const auto good = adv180Batch(n);
+        ASSERT_TRUE(adv180Valid(good)) << n;
+        for (int64_t c : {int64_t{0}, int64_t{n} - 1, int64_t{n} + 1, int64_t{n} + 1000, int64_t{-1},
+                          int64_t{INT32_MAX}, int64_t{INT32_MIN}}) {
+            if (c == n) continue;
+            auto bad = good;
+            adv180Put32(bad, b::kRecordCountOffset, static_cast<uint32_t>(static_cast<int32_t>(c)));
+            adv180Reseal(bad);
+            EXPECT_FALSE(adv180Valid(bad)) << "records " << n << " header count " << c;
+        }
+    }
+}
+
+TEST(RecordBatchAdversarialRegression, RecordAreaTruncatedAtEveryOffsetIsRefusedRegression) {
+    const auto good = adv180Batch(5);
+    for (std::size_t cut = b::kRecordBatchOverhead; cut < good.size(); ++cut) {
+        std::vector<uint8_t> bad(good.begin(), good.begin() + static_cast<std::ptrdiff_t>(cut));
+        adv180Reseal(bad);   // the length field and CRC both agree with the short body
+        EXPECT_FALSE(adv180Valid(bad)) << "cut at " << cut << " of " << good.size();
+    }
+}
+
+TEST(RecordBatchAdversarialRegression, TrailingBytesInsideTheBatchAreRefusedRegression) {
+    for (int extra : {1, 2, 5, 64}) {
+        auto bad = adv180Batch(3);
+        bad.insert(bad.end(), static_cast<std::size_t>(extra), uint8_t{0});
+        adv180Reseal(bad);
+        EXPECT_FALSE(adv180Valid(bad)) << "trailing " << extra;
+    }
+}
+
+TEST(RecordBatchAdversarialRegression, OverlongNegativeAndOversizedRecordLengthsAreRefusedRegression) {
+    const auto good = adv180Batch(1);
+    std::vector<uint8_t> hdr(good.begin(), good.begin() + b::kRecordBatchOverhead);
+    // (a) a six-byte varint (continuation bit on five bytes): overflow, never UB.
+    // (b) zigzag -1 (raw 1).  (c) a length far past the end.  (d) an unterminated varint.
+    const std::vector<std::vector<uint8_t>> bodies = {
+        {0x80, 0x80, 0x80, 0x80, 0x80, 0x00},
+        {0x01, 0x00, 0x00},
+        {0xFE, 0xFF, 0xFF, 0xFF, 0x0F},
+        {0x80},
+    };
+    for (std::size_t i = 0; i < bodies.size(); ++i) {
+        auto bad = hdr;
+        bad.insert(bad.end(), bodies[i].begin(), bodies[i].end());
+        adv180Put32(bad, b::kRecordCountOffset, 1u);
+        adv180Reseal(bad);
+        EXPECT_FALSE(adv180Valid(bad)) << "body " << i;
+    }
+}
+
+TEST(RecordBatchAdversarialRegression, LegitimateShapesStayValidRegression) {
+    // Empty (count 0, no record bytes).
+    {
+        rune::protocol::RecordBatchBuilder bb(0, 1);
+        EXPECT_TRUE(adv180Valid(bb.build())) << "empty batch";
+    }
+    // Horizon-stamped, transactional, protocol-built control, idempotent.
+    {
+        rune::protocol::RecordBatchBuilder bb(10, 1'000);
+        bb.append("a", "", 1'000);
+        bb.append("", "tombstone-ish", 1'005);
+        bb.setDeleteHorizonMs(9'999'999);
+        bb.setTransactional(true);
+        bb.setProducerId(77); bb.setProducerEpoch(3); bb.setBaseSequence(41);
+        EXPECT_TRUE(adv180Valid(bb.build())) << "horizon + transactional";
+        bb.setControl(true);
+        EXPECT_TRUE(adv180Valid(bb.build())) << "protocol-built control batch";
+    }
+    // A record carrying two headers, hand-encoded: the walk only follows the
+    // length prefix, so the headers are covered by it.
+    {
+        auto v = adv180Batch(1);
+        std::vector<uint8_t> hdr(v.begin(), v.begin() + b::kRecordBatchOverhead);
+        // attrs 0, tsDelta 0, offDelta 0, keyLen 1 'k', valLen 1 'v', 2 headers: ("h",'x'), ("i",'y')
+        const std::vector<uint8_t> body = {0x00, 0x00, 0x00, 0x02, 'k', 0x02, 'v',
+                                           0x04, 0x02, 'h', 0x02, 'x', 0x02, 'i', 0x02, 'y'};
+        hdr.push_back(static_cast<uint8_t>(body.size() * 2));   // zigzag length
+        hdr.insert(hdr.end(), body.begin(), body.end());
+        adv180Put32(hdr, b::kRecordCountOffset, 1u);
+        adv180Reseal(hdr);
+        EXPECT_TRUE(adv180Valid(hdr)) << "header-carrying record";
+        int seen = 0;
+        rune::protocol::RecordBatchReader(hdr.data(), hdr.size()).forEachRecord(
+            [&](std::string_view k, std::string_view val, int64_t, int64_t) { ++seen; EXPECT_EQ(k, "k"); EXPECT_EQ(val, "v"); });
+        EXPECT_EQ(seen, 1);
+    }
+    // Two batches back to back: the first one's walk stops at ITS end.
+    {
+        auto two = adv180Batch(3);
+        const auto second = adv180Batch(2);
+        two.insert(two.end(), second.begin(), second.end());
+        EXPECT_TRUE(rune::protocol::RecordBatchReader(two.data(), two.size()).ensureValid());
+    }
 }

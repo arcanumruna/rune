@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <vector>
 
@@ -37,15 +38,15 @@ constexpr int64_t kFar          = int64_t{1} << 60;
 
 /// Encode a request of `kind` into the slot (the link never looks past the 24-byte header).
 void encode(CoordinatorLink::Slot& s) {
-    if (s.kind == ReqKind::EndTxn) {
+    if (s.kind() == ReqKind::EndTxn) {
         rpc::EndTxn m;
         m.correlationId = s.corrId;
         m.commit        = 1;
-        s.frameLen = static_cast<uint16_t>(m.encode(s.frame.data()));
+        s.setFrameLen(static_cast<uint16_t>(m.encode(s.frame.data())));
     } else {
         rpc::InitProducerId m;
         m.correlationId = s.corrId;
-        s.frameLen = static_cast<uint16_t>(m.encode(s.frame.data()));
+        s.setFrameLen(static_cast<uint16_t>(m.encode(s.frame.data())));
     }
 }
 
@@ -368,7 +369,7 @@ TEST(CoordinatorLink, NonRetriableAnswersAreHandedBackAndLateOnesIgnored) {
     const auto r = FakeCoordinator::answer(ReqKind::EndTxn, t->corrId, kConcurrent);
     EXPECT_EQ(link.onAnswer(asAnswer(r, ReqKind::EndTxn, t->corrId, kConcurrent), 6), nullptr);
     EXPECT_EQ(link.onAnswer(asAnswer(r, ReqKind::EndTxn, t->corrId, kConcurrent), 7), nullptr);
-    EXPECT_EQ(t->attempt, 1u);
+    EXPECT_EQ(t->attempt(), 1u);
 }
 
 // ---------------------------------------------------------------------------
@@ -659,4 +660,134 @@ TEST(CoordinatorLinkRegression, ARefusedRediscoveryIsAskedAgainOnTheNextPumpRegr
     EXPECT_EQ(fake.rediscovers, 1) << "once submitted, never again this generation";
     link.onCoordinatorMoved();
     ASSERT_EQ(pumpNoExpiry(link, 3 + CoordinatorLink::backoffNs(1)), 2) << "both re-send after the move (and backoff)";
+}
+
+// #340: the txn copies of the group fetch tags are asserted against GroupConsumerHub's constants where both headers
+// are visible, and the tag spaces are disjoint as BIT SETS and as classifiers, not merely `!=`.
+TEST(CoordinatorLinkRegression, CoordinatorCorrTagsNeverCollideWithGroupTagsRegression) {
+    using Hub = rc::group::GroupConsumerHub;
+    static_assert(rp::coordcorr::kFetchTag == Hub::kFetchCorrTag);
+    static_assert(rp::coordcorr::kOffsetFetchTag == Hub::kOffsetFetchCorrTag);
+    static_assert(rp::coordcorr::kGroupCtlTag == Hub::kGroupCtlCorrTag);
+    // Every tag is one bit and no two share one.
+    constexpr int64_t kTags[] = {rp::coordcorr::kTag, Hub::kFetchCorrTag, Hub::kOffsetFetchCorrTag,
+                                 Hub::kGroupCtlCorrTag, rp::batchcorr::kTag, rp::coordcorr::kClientCounterTag};
+    for (std::size_t i = 0; i < std::size(kTags); ++i) {
+        EXPECT_EQ(kTags[i] & (kTags[i] - 1), 0) << "tag " << i << " is a single bit";
+        for (std::size_t j = i + 1; j < std::size(kTags); ++j) EXPECT_EQ(kTags[i] & kTags[j], 0) << i << " vs " << j;
+    }
+    // Over the whole coordinator payload shape, no other space's classifier claims a coordinator id, and no other
+    // space's id is a coordinator id.
+    for (uint32_t ord : {0u, 1u, 4095u}) {
+        for (uint8_t slot : {uint8_t{0}, uint8_t{7}}) {
+            const int64_t id = rp::coordcorr::make(ord, slot, 0xFFFFFFFFu);
+            EXPECT_FALSE(Hub::isFetchCorrId(id));
+            EXPECT_FALSE(Hub::isGroupCtlCorrId(id));
+            EXPECT_EQ(id & Hub::kOffsetFetchCorrTag, 0);
+            EXPECT_FALSE(rp::batchcorr::isBatch(id));
+        }
+    }
+    for (const int64_t tag : {Hub::kFetchCorrTag, Hub::kOffsetFetchCorrTag, Hub::kGroupCtlCorrTag}) {
+        EXPECT_FALSE(rp::coordcorr::isCoord(tag | 12345));
+    }
+}
+
+// #340 item 4: a plain producer's only coordinator request is its InitProducerId, so its link holds ONE slot; a
+// transactional producer holds the full pool.  Slots are allocated with the link, never grown.
+TEST(CoordinatorLinkRegression, ANonTransactionalProducerHoldsOnlyTheSlotsItCanUseRegression) {
+    FakeCoordinator fake;
+    rp::ProducerHub hub;
+    hub.setCoordinatorSink(fake.sink());
+    rp::ProducerImpl plain(plainCfg(), 1 << 16);
+    hub.add(&plain);
+    rc::ProducerConfig tc = plainCfg();
+    tc.transactionalId = "t-1";
+    rp::ProducerImpl txn(tc, 1 << 16);
+    hub.add(&txn);
+    ASSERT_TRUE(plain.hasCoordinator());
+    ASSERT_TRUE(txn.hasCoordinator());
+    EXPECT_EQ(plain.coordinatorLink()->slotCapacity(), 1u);
+    EXPECT_EQ(txn.coordinatorLink()->slotCapacity(), CoordinatorLink::kMaxCoordRequests);
+    // The one slot works end to end (the plain producer's InitProducerId), a second acquire is refused.
+    CoordinatorLink::Slot* a = send(*plain.coordinatorLink(), ReqKind::InitProducerId);
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(plain.coordinatorLink()->acquire(ReqKind::InitProducerId, kFar), nullptr);
+    // A link built directly with a capacity honours it and clamps nonsense.
+    EXPECT_EQ(CoordinatorLink(0, fake.sink(), 0, 3).slotCapacity(), 3u);
+    EXPECT_EQ(CoordinatorLink(0, fake.sink(), 0, 0).slotCapacity(), 1u);
+    EXPECT_EQ(CoordinatorLink(0, fake.sink(), 0, 99).slotCapacity(), CoordinatorLink::kMaxCoordRequests);
+}
+
+// ============================================================================================================
+// C15 review - adversarial pass over #340 (slot capacity, per-state fields)
+// ============================================================================================================
+
+// #340 item 4 x input bounds: a plain link holds ONE slot, so an answer whose correlation id names any other slot index
+// (1 .. 7, the transactional range, and the 8-bit max) is foreign - ignored, never indexed past the allocation - and the
+// real request is still settled by its own answer.  RED (mutation, under ASan): the `i >= capacity_` guard removed.
+TEST(CoordinatorLinkRegression, APlainLinkIgnoresAnswersNamingASlotItDoesNotHaveAdversarialRegression) {
+    FakeCoordinator fake;
+    CoordinatorLink link(0, fake.sink(), 0, 1);
+    ASSERT_EQ(link.slotCapacity(), 1u);
+    CoordinatorLink::Slot* s = send(link, ReqKind::InitProducerId);
+    ASSERT_NE(s, nullptr);
+    ASSERT_EQ(pumpNoExpiry(link, 1), 1);
+    const uint32_t seq = static_cast<uint32_t>(s->corrId & 0xFFFFFFFF);
+    for (const uint8_t slot : {uint8_t{1}, uint8_t{2}, uint8_t{7}, uint8_t{255}}) {
+        const int64_t foreign = rp::coordcorr::make(0, slot, seq);
+        ASSERT_TRUE(rp::coordcorr::isCoord(foreign));
+        ASSERT_EQ(rp::coordcorr::slot(foreign), slot);
+        for (const int16_t code : {int16_t{0}, kNotCoord, kConcurrent, kFenced}) {
+            const auto f = FakeCoordinator::answer(ReqKind::InitProducerId, foreign, code);
+            EXPECT_EQ(link.onAnswer(asAnswer(f, ReqKind::InitProducerId, foreign, code), 2), nullptr)
+                << "slot " << int(slot) << " code " << code;
+        }
+    }
+    EXPECT_TRUE(std::holds_alternative<CoordinatorLink::InFlight>(s->state)) << "the real request is untouched";
+    EXPECT_EQ(fake.rediscovers, 0) << "a foreign NotCoordinator asks for nothing";
+    const auto f = FakeCoordinator::answer(ReqKind::InitProducerId, s->corrId, 0);
+    EXPECT_EQ(link.onAnswer(asAnswer(f, ReqKind::InitProducerId, s->corrId, 0), 3), s);
+}
+
+// #340 item 2: the retry attempt lives in the Sent states and survives every hop between them - InFlight -> Backoff ->
+// InFlight -> (session change) Unsent -> InFlight -> Backoff: the second ConcurrentTransactions backs off for attempt 2,
+// not 1, and a NotCoordinator after that waits for attempt 3.  A released and re-acquired slot starts again at 0.
+// RED (mutation): carry<Unsent> in onSessionChanged dropping the attempt (the second backoff is backoffNs(1)).
+TEST(CoordinatorLinkRegression, TheRetryAttemptSurvivesASessionChangeAndResetsOnReacquireAdversarialRegression) {
+    FakeCoordinator fake;
+    CoordinatorLink link(0, fake.sink());
+    CoordinatorLink::Slot* s = send(link, ReqKind::AddPartitions);
+    ASSERT_NE(s, nullptr);
+    int64_t now = 1;
+    ASSERT_EQ(pumpNoExpiry(link, now), 1);
+    auto answerWith = [&](int16_t code) {
+        const auto f = FakeCoordinator::answer(ReqKind::AddPartitions, s->corrId, code);
+        return link.onAnswer(asAnswer(f, ReqKind::AddPartitions, s->corrId, code), now);
+    };
+    EXPECT_EQ(answerWith(kConcurrent), nullptr);   // attempt 1
+    now += CoordinatorLink::backoffNs(1);
+    ASSERT_EQ(pumpNoExpiry(link, now), 1);
+    fake.sid = 88;
+    link.onSessionChanged();                         // InFlight -> Unsent
+    ASSERT_TRUE(std::holds_alternative<CoordinatorLink::Unsent>(s->state));
+    ASSERT_EQ(pumpNoExpiry(link, now), 1);
+    EXPECT_EQ(answerWith(kConcurrent), nullptr);     // attempt 2
+    const int64_t at = now;
+    EXPECT_EQ(pumpNoExpiry(link, at + CoordinatorLink::backoffNs(1)), 0) << "attempt 2 waits backoffNs(2), not (1)";
+    EXPECT_EQ(pumpNoExpiry(link, at + CoordinatorLink::backoffNs(2) - 1), 0);
+    now = at + CoordinatorLink::backoffNs(2);
+    ASSERT_EQ(pumpNoExpiry(link, now), 1);
+    EXPECT_EQ(answerWith(kNotCoord), nullptr);       // attempt 3
+    link.onCoordinatorMoved();
+    EXPECT_EQ(pumpNoExpiry(link, now + CoordinatorLink::backoffNs(2)), 0) << "attempt 3 waits backoffNs(3)";
+    now += CoordinatorLink::backoffNs(3);
+    ASSERT_EQ(pumpNoExpiry(link, now), 1);
+    EXPECT_EQ(answerWith(0), s);
+    link.release(*s);
+    CoordinatorLink::Slot* again = send(link, ReqKind::AddPartitions);
+    ASSERT_EQ(again, s) << "the same slot";
+    ASSERT_EQ(pumpNoExpiry(link, now), 1);
+    const auto f = FakeCoordinator::answer(ReqKind::AddPartitions, again->corrId, kConcurrent);
+    EXPECT_EQ(link.onAnswer(asAnswer(f, ReqKind::AddPartitions, again->corrId, kConcurrent), now), nullptr);
+    EXPECT_EQ(pumpNoExpiry(link, now + CoordinatorLink::backoffNs(1)), 1) << "a fresh request starts at attempt 1";
 }
