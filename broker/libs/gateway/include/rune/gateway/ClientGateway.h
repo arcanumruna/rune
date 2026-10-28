@@ -143,6 +143,7 @@ class TopicRegistry;
 struct LeaderView {
     bool        isLeader             = true;   // true if this node is the current leader
     std::string leaderClientEndpoint;           // leader's client-facing channel; empty if unknown
+    int32_t     leaderNodeId = -1;              // the leader's node id (-1 = unknown); NAT-safe egress redirect suffix
 };
 
 /// Shard mode (spec §3.3): a node's explicitly configured per-worker ingress base.
@@ -857,6 +858,15 @@ public:
         shardIngressEndpoints_ = std::move(eps);
     }
 
+    struct NodeResponseControl { int32_t nodeId = -1; int32_t gatewayPort = 0; };
+    /// NAT-safe egress (spec D3): this gateway's response-control endpoint "host:port" (empty = none: every client
+    /// uses the declared path) and every node's gateway response-control port (for redirects and Metadata).
+    /// Set before doWork() runs.
+    void setResponseControl(std::string selfEndpoint, std::vector<NodeResponseControl> nodes) noexcept {
+        responseControlEndpoint_ = std::move(selfEndpoint);
+        nodeResponseControl_     = std::move(nodes);
+    }
+
     // read-rework T3/T4 (I3b): setPerWorkerEgressActive — when active, the gateway
     // ROUTES Subscribe/Unsubscribe for user partitions (topicId >= 0) to the owning
     // worker via the ingress ring and STOPS pushing those partitions itself (the
@@ -1324,12 +1334,14 @@ public:
         sessions_.add(sid, /*egress=*/nullptr, rune::gateway::AuthAnonymous{}, nowNs, {}, 0, clientVersion);
         return sid;
     }
-    /// Catalog history Task 9: a test session whose egress CHANNEL is known (the
-    /// DDL principal's source address is the session's egress channel).
-    int64_t injectTestSessionOnChannel(std::string egressChannel, int64_t nowNs = 0) {
+    /// Catalog history Task 9: a test session whose egress CHANNEL is known.  The DDL principal's source address
+    /// is the Connect image's source identity (#227), given here as `sourceIdentity` (a real Connect reads it off
+    /// the Aeron image).
+    int64_t injectTestSessionOnChannel(std::string egressChannel, int64_t nowNs = 0, std::string sourceIdentity = {}) {
         const int64_t sid = sessions_.nextSessionId();
-        sessions_.add(sid, /*egress=*/nullptr, rune::gateway::AuthAnonymous{}, nowNs, std::move(egressChannel), 0,
-                      rune::protocol::client::kClientVersion);
+        Session& s = sessions_.add(sid, /*egress=*/nullptr, rune::gateway::AuthAnonymous{}, nowNs,
+                                   std::move(egressChannel), 0, rune::protocol::client::kClientVersion);
+        s.sourceIdentity = std::move(sourceIdentity);
         return sid;
     }
 
@@ -1801,6 +1813,10 @@ private:
         int32_t     clientVersion  = 0;   ///< D6: ConnectRequest.clientVersion
         rune::gateway::SessionAuth auth;   ///< decided when the ConnectResponse is built (what the client was told)
         std::string sourceHost;            ///< D14: the Connect image's source host (throttle key)
+        std::string sourceIdentity;        ///< the Connect image's "host:port" (the session's source address, #227)
+        bool        responseEgress = false;///< NAT-safe egress: answered on a response publication (no declared channel)
+        std::string replyChannel;          ///< the channel the per-session egress publication uses
+        int32_t     leaderNodeId   = -1;   ///< captured with leaderClientEndpoint (redirect response-port suffix)
 
         // Task 13 (spec §3.4): every worker has this session's reply destination
         // queued (announce-before-accept) — set once, so a ConnectResponse retry
@@ -2794,6 +2810,12 @@ private:
     // connect-time only); empty in legacy mode and for every plaintext
     // session.
     std::vector<int64_t> pendingCryptoAnnounces_;
+    std::string                       responseControlEndpoint_;   // NAT-safe egress: "host:port", empty = none
+    std::vector<NodeResponseControl>  nodeResponseControl_;       // NAT-safe egress: per-node gateway response port
+    int32_t gatewayResponsePortOf_(int32_t nodeId) const noexcept {
+        for (const auto& n : nodeResponseControl_) if (n.nodeId == nodeId) return n.gatewayPort;
+        return 0;
+    }
     std::vector<ShardIngressEndpoint> shardIngressEndpoints_;  // spec §3.3; empty = legacy
 
     // read-rework T3/T4 (I3b): when true, Subscribe/Unsubscribe for user partitions

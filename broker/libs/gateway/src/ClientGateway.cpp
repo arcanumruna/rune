@@ -2127,12 +2127,14 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // none without one), so every follower Redirected every Connect.
     bool capturedIsLeader = true;
     std::string capturedLeaderEndpoint;
+    int32_t     capturedLeaderNodeId = -1;
     if (leaderView_ && sessionAdmission_ == SessionAdmission::ClusterLeaderOnly && !routingImage_) {
         // No per-partition routing image yet: use the Raft-leader gate (Path B /
         // pre-MD1 bootstrap).  Raft followers redirect sessions to the Raft leader.
         const LeaderView lv = leaderView_();
         capturedIsLeader        = lv.isLeader;
         capturedLeaderEndpoint  = lv.leaderClientEndpoint;
+        capturedLeaderNodeId    = lv.leaderNodeId;
 
         // NOTE: the REDIRECT case (!isLeader && !leaderClientEndpoint.empty()) is
         // handled by the SAME async pending-connect machinery as the leader-accept
@@ -2196,8 +2198,31 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     pc_entry.requestedAtNs         = nowNs;
     pc_entry.isLeader              = capturedIsLeader;
     pc_entry.leaderClientEndpoint  = std::move(capturedLeaderEndpoint);
+    pc_entry.leaderNodeId          = capturedLeaderNodeId;
     pc_entry.egressChannel         = std::string(req.egressChannel);
     pc_entry.egressStreamId        = req.egressStreamId;
+    // NAT-safe egress (spec D2): a v16 client that sets responseCorrelated is answered on an Aeron response
+    // publication correlated with THIS request image - never on the declared channel.
+    {
+        const auto image = (sub_ != nullptr && currentImageSessionId_ != 0)
+                               ? sub_->imageBySessionId(currentImageSessionId_) : nullptr;
+        if (image) pc_entry.sourceIdentity = image->sourceIdentity();
+        const bool wantsResponse = req.clientVersion >= pc::kClientVersionResponseEgress && req.responseCorrelated;
+        pc_entry.responseEgress = wantsResponse && !responseControlEndpoint_.empty() && image != nullptr;
+        if (pc_entry.responseEgress) {
+            pc_entry.replyChannel = "aeron:udp?control=" + responseControlEndpoint_ +
+                                    "|control-mode=response|response-correlation-id=" +
+                                    std::to_string(image->correlationId());
+        } else {
+            pc_entry.replyChannel = pc_entry.egressChannel;
+            if (wantsResponse) {
+                const bool noPort = responseControlEndpoint_.empty();
+                if (unauthLog_.due(noPort ? 16 : 17)) [[unlikely]]
+                    spdlog::warn("ClientGateway: response egress unavailable ({}); answering on the declared channel",
+                                 noPort ? "no gateway response-control port configured" : "no request image");
+            }
+        }
+    }
     pc_entry.clientVersion         = req.clientVersion;   // D6
     pc_entry.sourceHost            = std::move(connectHost);   // every entry: the eviction's fairness key
     if (channelTooLongForShard) [[unlikely]]
@@ -2291,7 +2316,7 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // cold resolver (never by a driver conductor on a duty thread); the session
     // stays pending — bounded by the connect timeout — until the hub answers.
     const std::string_view replyHost = rune::consensus::PeerHostTable::endpointHost(pc_entry.egressChannel);
-    if (hostResolver_.valid() && !replyHost.empty() &&
+    if (!pc_entry.responseEgress && hostResolver_.valid() && !replyHost.empty() &&
         !rune::consensus::PeerHostTable::isNumericHost(replyHost)) [[unlikely]] {
         pc_entry.awaitingResolve = true;
         // Fix round 3 (concern 2): a momentarily full resolve ring no longer
@@ -2355,7 +2380,7 @@ bool ClientGateway::registerConnectEgress_(PendingConnect& pending)
         // A10: sparse terms — the gateway runs on a worker thread in fused placement, where a non-sparse
         // term's tmpfs fallocate fails with EINTR while io_uring completions are pending (withSparseTerms).
         pending.registrationId = aeron_->addExclusivePublication(
-            rune::node::withSparseTerms(pending.egressChannel), pending.egressStreamId);
+            rune::node::withSparseTerms(pending.replyChannel), pending.egressStreamId);
     } catch (...) {
         // Bad channel — drop (never crash).
         spdlog::warn("ClientGateway: addExclusivePublication threw for egress channel {}; dropping Connect",
@@ -2400,6 +2425,7 @@ int ClientGateway::pollHostResolutions_()
             char buf[INET_ADDRSTRLEN] = {};
             ::inet_ntop(AF_INET, &a, buf, sizeof buf);
             it->egressChannel   = rune::consensus::PeerHostTable::withEndpointHost(it->egressChannel, buf);
+            it->replyChannel    = it->egressChannel;   // only a declared-path entry ever awaits a resolve
             it->awaitingResolve = false;
             if ((shardMode_ && it->egressChannel.size() > rune::node::SessionAckSink::kMaxChannelBytes) ||
                 !registerConnectEgress_(*it)) {
@@ -2547,12 +2573,18 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             err.sessionId     = 0;
             err.correlationId = pending.correlationId;
             err.code          = static_cast<int16_t>(pc::ErrorCode::Redirect);
-            err.message       = pending.leaderClientEndpoint;
+            // NAT-safe egress (spec D3): a session >= 16 learns the leader's gateway response-control port.
+            std::string redirectMessage = pending.leaderClientEndpoint;   // cold (one per redirect)
+            if (pending.clientVersion >= pc::kClientVersionResponseEgress) {
+                if (const int32_t port = gatewayResponsePortOf_(pending.leaderNodeId); port > 0)
+                    redirectMessage += "#" + std::to_string(port);
+            }
+            err.message = redirectMessage;
 
             // Guard: message must fit in scratch (encode would overflow otherwise).
             const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
                                        pc::ErrorResponse::BODY_FIXED + 2 +
-                                       pending.leaderClientEndpoint.size();
+                                       redirectMessage.size();
             if (needed > scratch_.size()) {
                 // Fix round 2: a pathological endpoint length is never a silent
                 // drop — the client gets the bare NotLeader (no endpoint).
@@ -2699,7 +2731,8 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
                       pending.clientVersion);
         {
             Session* added = sessions_.find(pending.sessionId);
-            added->sourceHost = std::move(pending.sourceHost);
+            added->sourceHost     = std::move(pending.sourceHost);
+            added->sourceIdentity = std::move(pending.sourceIdentity);
         }
 
         it = pendingConnects_.erase(it);
@@ -2847,7 +2880,8 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
     Session& session = sessions_.add(pending.sessionId, std::move(pending.resolvedPub), std::move(pending.auth), nowNs,
                                       pending.egressChannel, pending.egressStreamId,
                                       pending.clientVersion);
-    session.sourceHost = std::move(pending.sourceHost);
+    session.sourceHost     = std::move(pending.sourceHost);
+    session.sourceIdentity = std::move(pending.sourceIdentity);
     // The TLS handshake took time: the login deadline runs from the moment the session exists.
     if (auto* first = std::get_if<rune::gateway::AuthAwaitingFirst>(&session.auth)) first->deadlineNs = nowNs + authTimeoutNs_;
     session.crypto.cipher = keys.cipher;
@@ -8118,7 +8152,7 @@ rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext
     rune::gateway::DdlMetaView m;
     m.targetNsId    = targetNsId;   // namespaces Task 10: the object's resolved namespace (kHiddenNsId = answered missing)
     m.sessionId     = sessionId;
-    m.sourceAddress = session.egressChannel;
+    m.sourceAddress = session.sourceIdentity;   // the Connect image's source, never the declared channel (#227)
     // The authenticated user (Task 11; Task 12 makes the catalog principal carry it too): a view into the session's
     // auth state, copied by the admin ring submit before this frame's handler returns.
     if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) m.authenticated = a->user;
@@ -10217,7 +10251,7 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
     if (proof != BootstrapProof::Ok) {
         ++bootstrapsRefused_;
         if (unauthLog_.due(3)) [[unlikely]]   // X103: an unauthenticated session drives this
-            spdlog::warn("security: bootstrap refused from {}: bad cluster-key proof{}", LogSafeName{session->egressChannel},
+            spdlog::warn("security: bootstrap refused from {}: bad cluster-key proof{}", LogSafeName{session->sourceIdentity},
                          proof == BootstrapProof::NoKey ? " (this broker holds no cluster key: authentication is not enabled)" : "");
         pc::DdlResponse r;
         r.sessionId     = m.sessionId;
@@ -10894,6 +10928,7 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
     for (const auto& [nodeId, channel] : nodeEndpointMap_) {
         pc::BrokerEntry b;
         b.nodeId = nodeId;
+        b.responseControlPort = gatewayResponsePortOf_(nodeId);   // NAT-safe egress (0 = none)
 
         // Parse "aeron:udp?endpoint=host:port" → host, port.
         // We look for "endpoint=" and then split on the last ':'.

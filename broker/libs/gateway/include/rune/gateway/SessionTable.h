@@ -118,6 +118,8 @@ struct Session {
     // D14: the host the session's Connect came from (the Aeron image's sourceIdentity host; the egress host for IPC) -
     // the throttle's key.  "" in unit tests.
     std::string                                    sourceHost;
+    // The Connect image's "host:port" (Aeron sourceIdentity; the DDL principal's source address, #227). "" in unit tests.
+    std::string                                    sourceIdentity;
     // D8b round 2: bit w set = worker w reports this session's ack publication
     // Lost (NOT_CONNECTED); lostSinceNs = when the mask last became non-zero, restarted by a Found
     // from one worker while another is still Lost (D8b-L: a successful claim is proof of life).

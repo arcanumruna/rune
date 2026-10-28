@@ -2031,7 +2031,8 @@ void BrokerNode::buildGateway() {
         const LeaderSnapshot v = leaderObserver_.computeOnControl();
         return rune::gateway::LeaderView{
             /*isLeader=*/v.isLeader,
-            /*leaderClientEndpoint=*/v.isLeader ? std::string{} : this->leaderClientEndpointFor_(v)
+            /*leaderClientEndpoint=*/v.isLeader ? std::string{} : this->leaderClientEndpointFor_(v),
+            /*leaderNodeId=*/static_cast<int32_t>(v.leaderId)
         };
     };
 
@@ -2217,6 +2218,19 @@ void BrokerNode::buildGateway() {
         //   ingressStreamId = base + ShardRouter.workerForPartition(topicId, partition)
         // so the client can connect directly to the owning worker's ingress stream.
         gateway_->setWorkerIngressBaseStreamId(config_.workerIngressBaseStreamId);
+        // NAT-safe egress (spec D3): the gateway's response-control endpoint and every node's gateway response port,
+        // in BOTH shard and legacy mode (empty endpoint = none: every client uses the declared path).
+        {
+            std::string selfEndpoint;
+            if (config_.gatewayResponseControlPort && *config_.gatewayResponseControlPort > 0)
+                selfEndpoint = config_.effectiveResponseControlHost() + ":" +
+                               std::to_string(*config_.gatewayResponseControlPort);
+            std::vector<rune::gateway::ClientGateway::NodeResponseControl> rc;
+            rc.reserve(config_.peers.size());
+            for (const auto& peer : config_.peers)
+                rc.push_back({static_cast<int32_t>(peer.id), static_cast<int32_t>(peer.gatewayResponseControlPort)});
+            gateway_->setResponseControl(std::move(selfEndpoint), std::move(rc));
+        }
         spdlog::info("BrokerNode[{}]: workerIngressBaseStreamId set to {}",
                      nodeId, config_.workerIngressBaseStreamId);
 

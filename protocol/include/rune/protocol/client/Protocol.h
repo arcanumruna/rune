@@ -370,7 +370,8 @@ inline constexpr int32_t kClientVersionRecordEgressUnavailable      = 15;  // un
 // responseCorrelated = 1 (an older broker ignores the flag and answers on the declared channel); a broker >= 9
 // ignores the declared channel whenever the flag is 1 and answers only on an Aeron response publication correlated
 // with the request image, and its Metadata carries the response-control ports. A session below 16 keeps the
-// declared egressChannel path.
+// declared egressChannel path. A Redirect's message to a session >= 16 may end with `#<gateway response-control
+// port>`; absent = the leader has none (use the declared path).
 inline constexpr int32_t kClientVersionResponseEgress             = 16;
 inline constexpr int32_t kClientVersion                           = 15;  // what this protocol's client announces
 // 16 (response egress) is announced once client-cpp implements it (NAT plan Task 7).
@@ -414,8 +415,7 @@ inline constexpr int32_t kBrokerVersionFilter                     = 6;   // subs
 inline constexpr int32_t kBrokerVersionReceiverKeys               = 7;   // per-receiver c2b keys (issue #116)
 inline constexpr int32_t kBrokerVersionNamespaces                 = 8;   // namespaces (client version 14)
 inline constexpr int32_t kBrokerVersionResponseEgress             = 9;   // NAT-safe egress (client version 16)
-inline constexpr int32_t kBrokerVersion                           = 8;   // what this protocol's broker announces
-// 9 is announced once the gateway implements it (NAT plan Task 5).
+inline constexpr int32_t kBrokerVersion                           = kBrokerVersionResponseEgress;   // what this protocol's broker announces
 
 /// Issue #116: true when a session whose client announced `clientVersion` and whose broker announced
 /// `brokerVersion` binds each encrypted client->broker frame to one receiver (see client version 12).
