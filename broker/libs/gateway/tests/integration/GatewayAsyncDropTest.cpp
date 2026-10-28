@@ -586,7 +586,15 @@ TEST_F(GatewayAsyncDropFixture, LateEgressSubscriberStillGetsConnectResponseRegr
         << "entry must be kept (stash-and-retry), not dropped by a re-find throw";
     ASSERT_EQ(gw_->sessionCount(), 0u);
 
-    auto egressSub = makeEgressSub(kLateStream);   // pumps at wall clock; tBase is far from it
+    // Create the subscription WITHOUT pumping the gateway (makeEgressSub pumps at the wall clock,
+    // which would time the frozen-clock pending entry out).
+    const int64_t subReg = aeron_->addSubscription("aeron:ipc", kLateStream);
+    std::shared_ptr<aeron::Subscription> egressSub;
+    for (int i = 0; i < kPumpIter && !egressSub; ++i) {
+        egressSub = aeron_->findSubscription(subReg);
+        if (!egressSub) std::this_thread::sleep_for(std::chrono::microseconds{200});
+    }
+    ASSERT_NE(egressSub, nullptr) << "late egress subscription did not resolve";
     std::optional<pc::ConnectResponse> resp;
     aeron::FragmentAssembler respAsm(
         [&](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t offset,
