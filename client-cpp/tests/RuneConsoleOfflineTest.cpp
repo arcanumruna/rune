@@ -37,6 +37,7 @@
 #include <rune/protocol/client/Protocol.h>
 #include "QlEngine.h"   // src/cli: splitStatements, the engine's internal seams
 #include "support/AllocCounter.h"
+#include "support/InvokerGateway.h"   // C20 review (#690): a fake gateway for the live console
 
 namespace fs = std::filesystem;
 
@@ -584,6 +585,90 @@ TEST(QlEngineRegression, EmptyCliDataDirIsScratchRegression) {
         EXPECT_TRUE(none.path().empty());
     }
     EXPECT_FALSE(fs::exists(seen)) << "removed, with its contents, when the scope ends";
+}
+#endif
+
+#ifdef RUNE_CLI_LIVE_ENABLED
+// ── C20 adversarial review (#690): `-f` exits with the session-end code, not the failed statement's ──────────────────
+namespace {
+/// A fake gateway on its own thread, on the console client's embedded driver: it answers the first DropTopic with
+/// NotAuthorized (45) on its correlation id and, in the same pump, revokes the session (ErrorResponse{SessionRevoked,
+/// corr 0}).  Nothing is shared with the console thread but the file system and the stop pipe.
+struct RevokingGateway {
+    std::string dataDir;
+    int32_t     stream;
+    int         stop[2] = {-1, -1};
+    int         drops = 0;      // gateway thread only; read after join
+    bool        started = false;
+    std::thread t;
+    RevokingGateway(std::string dir, int32_t s) : dataDir(std::move(dir)), stream(s) {
+        EXPECT_EQ(::pipe(stop), 0);
+        t = std::thread([this] { run(); });
+    }
+    bool stopRequested() const {
+        pollfd p{stop[0], POLLIN, 0};
+        return ::poll(&p, 1, 0) > 0;
+    }
+    void run() {
+        const fs::path cnc = fs::path(dataDir) / "aeron" / "cnc.dat";
+        for (long i = 0; i < 100'000'000 && !fs::exists(cnc); ++i) {   // the console's client starts the driver
+            if (stopRequested()) return;
+            ::sched_yield();
+        }
+        if (!fs::exists(cnc)) return;
+        test_support::InvokerGateway gw(dataDir + "/aeron", "aeron:ipc", stream, "aeron:ipc", stream + 1);
+        started = true;
+        namespace pc = rune::protocol::client;
+        gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int from, const uint8_t* f, std::size_t len) {
+            const auto m = pc::DropTopic::decode(f, len);
+            if (!m) return;
+            ++drops;
+            gw.sendError(from, static_cast<int16_t>(pc::ErrorCode::NotAuthorized), "no drop", m->sessionId, m->correlationId);
+            gw.revokeSession(m->sessionId, from);
+        };
+        for (long i = 0; i < 2'000'000'000 && !stopRequested(); ++i) {
+            if (gw.pump() == 0) ::sched_yield();
+        }
+    }
+    ~RevokingGateway() {
+        (void)!::write(stop[1], "x", 1);
+        if (t.joinable()) t.join();
+        ::close(stop[0]); ::close(stop[1]);
+    }
+};
+} // namespace
+
+// #690: statement 1 fails NotAuthorized (45) and the session is revoked (46) in the same pump.  runBatch's own status
+// is the statement's (45); the script must exit with the session-end code (46), like the interactive console - and
+// statement 2 never runs.  Mutation: the script branch returns runBatch's status -> rc 45.
+// Broken by the C20 review: DISABLED_ until the #690 fix round.  consoleScriptExitStatus(runBatch(..), exec.sessionEnded(),
+// exec.endCode()) has unsequenced arguments; GCC reads sessionEnded()/endCode() before runBatch runs -> rc 45.
+TEST(RuneConsoleOfflineRegression, DISABLED_ScriptExitsWithTheSessionEndCodeNotTheFailedStatementsAdversarialRegression) {
+    const fs::path dir = fs::temp_directory_path() / ("c20r_690_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    const fs::path script = writeScript("c20r_690.rql", "drop topic first;\ndrop topic second;\n");
+    std::istringstream in;
+    std::ostringstream out, err;
+    int rc = -1;
+    int drops = -1;
+    bool started = false;
+    {
+        RevokingGateway gw(dir.string(), 6900);
+        rc = rune::cli::run({"console", "-f", script.string(), "--broker", "aeron:ipc", "--cli-egress", "aeron:ipc",
+                             "--cli-stream-in", "6900", "--cli-stream-out", "6901", "--cli-data-dir", dir.string()},
+                            in, out, err);
+        (void)!::write(gw.stop[1], "x", 1);
+        if (gw.t.joinable()) gw.t.join();
+        drops = gw.drops;
+        started = gw.started;
+    }
+    fs::remove_all(dir);
+    fs::remove(script);
+    ASSERT_TRUE(started) << "vacuity guard: the gateway came up. err: " << err.str();
+    EXPECT_EQ(drops, 1) << "statement 2 never reached the broker: " << err.str();
+    EXPECT_NE(err.str().find("NotAuthorized (45)"), std::string::npos) << "vacuity guard: statement 1 failed 45: " << err.str();
+    EXPECT_EQ(count(err.str(), "SessionRevoked (46): the session ended"), 1u) << err.str();
+    EXPECT_EQ(rc, 46) << "the script exits with the session-end code, not the statement's 45: " << err.str();
 }
 #endif
 
