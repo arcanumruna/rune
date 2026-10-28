@@ -24,6 +24,7 @@
 #include <ExclusivePublication.h>
 #include <FragmentAssembler.h>
 #include <Subscription.h>
+#include <concurrent/logbuffer/FrameDescriptor.h>
 
 extern "C" {
 #include <aeronmd/aeronmd.h>
@@ -283,7 +284,7 @@ public:
             return [&handler, &assembler](aeron::concurrent::AtomicBuffer& buf,
                                           aeron::util::index_t offset, aeron::util::index_t length,
                                           aeron::Header& header) {
-                namespace FrameDescriptor = aeron::FrameDescriptor;
+                namespace FrameDescriptor = aeron::concurrent::logbuffer::FrameDescriptor;
                 if ((header.flags() & FrameDescriptor::UNFRAGMENTED) == FrameDescriptor::UNFRAGMENTED) {
                     handler(reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
                             static_cast<std::size_t>(length));
@@ -363,7 +364,7 @@ public:
     /// this Aeron release.  Any other runtime Aeron keeps Aeron's stock polling (no wake fds: the owner
     /// backs off as before A7) and logs why — re-verify rune_driver_wake.c, then move the pin.  Same pin as
     /// the broker (rune-broker 3763230).
-    static constexpr int kEpollPollAeronPin[3] = {1, 41, 4};
+    static constexpr int kEpollPollAeronPin[3] = {1, 51, 0};
     [[nodiscard]] static constexpr bool epollPollSupportsAeron(int major, int minor, int patch) noexcept {
         return major == kEpollPollAeronPin[0] && minor == kEpollPollAeronPin[1] && patch == kEpollPollAeronPin[2];
     }

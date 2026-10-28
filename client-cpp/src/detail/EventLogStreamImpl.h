@@ -41,8 +41,8 @@ constexpr index_t kHead = 16;
 constexpr index_t kControlReserve = 64;
 
 constexpr index_t aligned(index_t n) noexcept {
-    return aeron::util::BitUtil::align(n + static_cast<index_t>(aeron::concurrent::ringbuffer::RecordDescriptor::HEADER_LENGTH),
-                                       static_cast<index_t>(aeron::concurrent::ringbuffer::RecordDescriptor::ALIGNMENT));
+    return aeron::util::BitUtil::align(n + static_cast<index_t>(rune::protocol::ring::RecordDescriptor::HEADER_LENGTH),
+                                       static_cast<index_t>(rune::protocol::ring::RecordDescriptor::ALIGNMENT));
 }
 
 bool writeFrame(detail::OneToOneRingBuffer& ring, int32_t type, uint32_t gen, uint32_t total, int64_t offset,

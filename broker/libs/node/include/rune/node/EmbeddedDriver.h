@@ -133,7 +133,7 @@ public:
     /// bindings clientd epoll_event[] array, the receiver / sender poller fields), verified against exactly
     /// this Aeron release.  Any other runtime Aeron keeps Aeron's stock polling (no wake fds: the legacy
     /// backoff idle) and logs why — re-verify rune_driver_wake.c, then move the pin.
-    static constexpr int kEpollPollAeronPin[3] = {1, 41, 4};
+    static constexpr int kEpollPollAeronPin[3] = {1, 51, 0};
     [[nodiscard]] static bool epollPollSupportsAeron(int major, int minor, int patch) noexcept {
         return major == kEpollPollAeronPin[0] && minor == kEpollPollAeronPin[1] && patch == kEpollPollAeronPin[2];
     }

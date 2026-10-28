@@ -493,11 +493,11 @@ int AeronPartitionTransport::notePlaneReconnects_()
         lastImageCount_ = images;
         std::vector<int32_t> now;
         std::vector<std::string> fresh;
-        sub_->forEachImage([&](aeron::Image& img) {
-            now.push_back(img.sessionId());
-            if (std::find(knownImageSessions_.begin(), knownImageSessions_.end(), img.sessionId()) ==
+        sub_->forEachImage([&](const std::shared_ptr<aeron::Image>& img) {
+            now.push_back(img->sessionId());
+            if (std::find(knownImageSessions_.begin(), knownImageSessions_.end(), img->sessionId()) ==
                 knownImageSessions_.end()) {
-                std::string src = img.sourceIdentity();
+                std::string src = img->sourceIdentity();
                 const auto colon = src.rfind(':');
                 fresh.push_back(colon == std::string::npos ? src : src.substr(0, colon));
             }

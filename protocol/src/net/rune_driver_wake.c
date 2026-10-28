@@ -3,7 +3,7 @@
  * Threading: install / free / active run on the driver's owner before init / after close.  The poll function runs
  * on the agent that owns the poller (the invoker owner, or the sender / receiver agent of a threaded driver).
  * rune_driver_wake_fds and the test seam run on the pump thread.  No locks, no atomics, no allocation on the poll
- * path.  Depends on Aeron internals (1.41.x: poller->fd, poller->bindings_clientd holding an epoll_event array of
+ * path.  Depends on Aeron internals (1.51.0: poller->fd, poller->bindings_clientd holding an epoll_event array of
  * capacity >= transports.length, driver->receiver/sender.poller); re-check on any Aeron upgrade. */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE   /* struct mmsghdr (Aeron's transport headers) */
@@ -55,9 +55,10 @@ int rune_fd_is_epoll(int fd)
  * or without EPOLLIN) → getsockopt(SO_ERROR) first, which clears the socket's pending error: a connected UDP send
  * socket whose peer port answered ICMP unreachable reports EPOLLERR WITHOUT EPOLLIN, and Aeron's EPOLLIN-only check
  * left that error pending — the epoll fd stayed readable and an owner parked on it woke at once, forever, while
- * the peer was down.  ECONNREFUSED is benign (Aeron's recvmmsg / sendmmsg map it to 0); any other socket error is
- * reported like Aeron's recvmmsg reports it (-1, error set; the next pass continues with the other sockets, which
- * stay level-triggered ready).  Consuming an error is not work (0). */
+ * the peer was down.  ECONNREFUSED is benign (Aeron's recvmmsg / sendmmsg map it to 0).  Any other socket error, and
+ * any recvmmsg failure, is handled as Aeron 1.51's poller handles it: logged to the driver's distinct error log and
+ * errors counter (aeron_udp_channel_transport_log_error), and the pass continues with the remaining sockets.
+ * Consuming an error is not work (0). */
 static int rune_epoll_first_poll(
     aeron_udp_transport_poller_t *poller,
     struct mmsghdr *msgvec,
@@ -103,7 +104,7 @@ static int rune_epoll_first_poll(
             if (0 != so_error && ECONNREFUSED != so_error)
             {
                 AERON_SET_ERR(so_error, "socket error, fd: %d", (int)transport->recv_fd);
-                return -1;
+                aeron_udp_channel_transport_log_error(transport);
             }
         }
         if (ev & EPOLLIN)
@@ -111,9 +112,13 @@ static int rune_epoll_first_poll(
             const int recv_result = recvmmsg_func(transport, msgvec, vlen, bytes_rcved, recv_func, clientd);
             if (recv_result < 0)
             {
-                return recv_result;
+                AERON_APPEND_ERR("%s", "rune_epoll_first_poll");
+                aeron_udp_channel_transport_log_error(transport);
             }
-            work_count += recv_result;
+            else
+            {
+                work_count += recv_result;
+            }
         }
     }
     return work_count;

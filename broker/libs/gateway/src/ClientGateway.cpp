@@ -2902,8 +2902,8 @@ void ClientGateway::abandonRegistration_(int64_t regId) noexcept
 // drainPendingReleases — poll registrations that were logically dropped before
 // their ExclusivePublication resolved, to complete the release.
 //
-// Release mechanism (Aeron C++ 1.41.4, ExclusivePublication.cpp line 62-65):
-//   ~ExclusivePublication() { m_conductor.releaseExclusivePublication(m_registrationId); }
+// Release mechanism (Aeron 1.51.0 C++ wrapper, ExclusivePublication.h):
+//   ~ExclusivePublication() { aeron_exclusive_publication_close(m_publication, nullptr, nullptr); }
 // So: obtaining a shared_ptr via findExclusivePublication and letting it drop
 // is the ONLY correct release path for a registration that is still in
 // AWAITING_MEDIA_DRIVER state.  Once the conductor transitions it to
@@ -2922,15 +2922,14 @@ void ClientGateway::drainPendingReleases()
     // an unresolved entry re-introduces the registration leak this table prevents).
     {
         static constexpr std::size_t kDrainWarnThreshold = 4 * kMaxPendingConnects;
-        static bool sWarned = false;
         const std::size_t drainSz = drainingRegistrations_.size();
-        if (drainSz > kDrainWarnThreshold && !sWarned) {
+        if (drainSz > kDrainWarnThreshold && !drainWarned_) {
             spdlog::warn("ClientGateway: drainingRegistrations_ size {} exceeds {}×kMaxPendingConnects={}; "
                          "possible stuck driver entry — investigate Aeron media driver state",
                          drainSz, 4u, kMaxPendingConnects);
-            sWarned = true;
+            drainWarned_ = true;
         } else if (drainSz <= kDrainWarnThreshold) {
-            sWarned = false; // reset so the warning fires again if it grows again
+            drainWarned_ = false; // reset so the warning fires again if it grows again
         }
     }
 

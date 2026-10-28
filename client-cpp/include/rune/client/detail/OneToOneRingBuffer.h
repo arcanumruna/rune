@@ -37,7 +37,7 @@
 #include <string>
 
 #include <concurrent/AtomicBuffer.h>
-#include <concurrent/ringbuffer/RecordDescriptor.h>
+#include "rune/protocol/ring/RecordDescriptor.h"
 #include <util/BitUtil.h>
 #include <util/Index.h>
 #include <util/Exceptions.h>
@@ -88,7 +88,7 @@ public:
     /// published (the tail is not advanced) and the exception propagates.
     template <typename Fill>
     bool writeWith(std::int32_t msgTypeId, aeron::util::index_t length, Fill&& fill) {
-        namespace RD = aeron::concurrent::ringbuffer;
+        namespace RD = rune::protocol::ring;
         RD::RecordDescriptor::checkMsgTypeId(msgTypeId);
         checkMsgLength(length);
 
@@ -174,7 +174,7 @@ public:
     /// only consumed end-of-buffer padding returns 0 having advanced the head.
     template <typename Handler>
     int read(Handler&& handler, int messageCountLimit) {
-        namespace RD = aeron::concurrent::ringbuffer;
+        namespace RD = rune::protocol::ring;
         const std::int64_t head = m_buffer.getInt64(m_headPositionIndex);  // consumer-owned
         const auto headIndex = static_cast<std::int32_t>(head & (m_capacity - 1));
         const std::int32_t contiguousBlockLength = m_capacity - headIndex;

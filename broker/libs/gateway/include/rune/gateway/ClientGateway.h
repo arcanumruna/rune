@@ -2273,9 +2273,9 @@ private:
     // drainPendingReleases — called in pollPendingConnects; for each
     // registration in drainingRegistrations_, attempt findExclusivePublication.
     // On resolve (shared_ptr non-null): let it drop immediately — destructor
-    // calls ClientConductor::releaseExclusivePublication(registrationId)
-    // (Aeron C++ 1.41.4: ExclusivePublication::~ExclusivePublication() calls
-    // m_conductor.releaseExclusivePublication(m_registrationId)).
+    // closes the publication
+    // (Aeron 1.51.0 C++ wrapper: ExclusivePublication::~ExclusivePublication() calls
+    // aeron_exclusive_publication_close).
     // On error (throws): conductor already removed the entry — no leak.
     // On still-AWAITING (nullptr): keep polling until it resolves.
     // Never blocks.
@@ -2385,6 +2385,7 @@ private:
     // subscriber), and drainPendingReleases() clears each entry the cycle it
     // resolves, so the table stays small (≈ pending drop rate × resolve latency).
     std::vector<int64_t>                 drainingRegistrations_;
+    bool                                 drainWarned_ = false;   // drain-table growth warning latch (per gateway)
 
     // Scratch buffer for reap ID collection (avoids heap allocation per frame).
     // Populated and drained entirely within reapExpired() — single-writer, safe.

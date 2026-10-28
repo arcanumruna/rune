@@ -1253,8 +1253,13 @@ if(BUILD_TESTING)
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # EmbeddedDriver: one driver, one pumping thread (spec §3.6).
-            add_executable(rune_embedded_driver_tests tests/node/EmbeddedDriverTest.cpp)
+            add_executable(rune_embedded_driver_tests tests/node/EmbeddedDriverTest.cpp tests/node/DriverWakePollProbe.c)
             target_link_libraries(rune_embedded_driver_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+            # DriverWakePollProbe.c includes Aeron's internal driver headers, as rune_driver_wake.c does.
+            foreach(_rune_aeron_inc IN LISTS aeron_INCLUDE_DIRS)
+                target_include_directories(rune_embedded_driver_tests PRIVATE
+                    "${_rune_aeron_inc}" "${_rune_aeron_inc}/aeron" "${_rune_aeron_inc}/aeronmd")
+            endforeach()
             gtest_discover_tests(rune_embedded_driver_tests
                 PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
