@@ -419,12 +419,14 @@ wait_until 90 "alice's live session to be closed" live_ended || {
 [ "$(cat "${WORK_DIR}/live.rc")" != "0" ] || fail "step 12: the live producer ended cleanly; RejectAll must end its session with an error"
 wait "${live_pid}" 2>/dev/null || true
 expect_refusal "step 12: alice's login (right password) to a RejectAll namespace" "NamespaceSuspended" \
-    ql_as a/alice /work/alice.pw -e "show topics;" --broker "rune-2:${BROKER_PORT}"
+    ql_as a/alice /work/alice.pw -e "show grants for user alice;" --broker "rune-2:${BROKER_PORT}"
 printf 'not the password' > "${WORK_DIR}/wrong.pw"
 expect_refusal "step 12: a wrong password to a RejectAll namespace" "AuthenticationFailed" \
-    ql_as a/alice /work/wrong.pw -e "show topics;" --broker "rune-2:${BROKER_PORT}"
+    ql_as a/alice /work/wrong.pw -e "show grants for user alice;" --broker "rune-2:${BROKER_PORT}"
 ns_as admin /work/admin.pw resume a --broker "rune-1:${BROKER_PORT}" || fail "step 12: resume failed"
-ql_as a/alice /work/alice.pw -e "show topics;" --broker "rune-2:${BROKER_PORT}" >/dev/null || fail "step 12: alice cannot log in after resume"
+ws_run_ex "ra-resumed" 2 a/alice /work/alice.pw produce 1
+[ "${WS_RC}" -eq 0 ] && echo "${WS_OUT}" | grep -q "WS-PRODUCER: acked=1 failed=0" \
+    || { echo "${WS_OUT}" | tail -20 >&2; fail "step 12: alice cannot log in and produce after resume (exit ${WS_RC})"; }
 log "step 12 OK"
 
 # ---------------------------------------------------------------------------
@@ -494,7 +496,7 @@ ns_dir_gone() {
 wait_until "${SERVING_WAIT_S}" "ns-${old_id} to vanish from every node's data volume" ns_dir_gone \
     || { for n in 1 2 3; do docker exec "$(cname "${n}")" find /var/lib/rune -maxdepth 3 -name "ns-${old_id}*" >&2 || true; done; fail "step 15: ns-${old_id} is still on a node's data volume"; }
 expect_refusal "step 15: a/alice logging in to the deleted namespace" "AuthenticationFailed" \
-    ql_as a/alice /work/alice.pw -e "show topics;" --broker "rune-2:${BROKER_PORT}"
+    ql_as a/alice /work/alice.pw -e "show grants for user alice;" --broker "rune-2:${BROKER_PORT}"
 ns_as admin /work/admin.pw create a --broker "rune-1:${BROKER_PORT}" || fail "step 15: creating a again failed"
 new_row=$(ns_row a); new_id=$(echo "${new_row}" | awk '{print $1}')
 [ -n "${new_id}" ] && [ "${new_id}" != "${old_id}" ] || fail "step 15: the re-created a has id '${new_id}' (old ${old_id}): ids are never reused"
@@ -502,7 +504,7 @@ echo "${new_row}" | grep -q 'active' || fail "step 15: the re-created a is not a
 expect_refusal "step 15: the old topic a/t in the re-created namespace" "UnknownTopic" \
     txt "${OP_TIMEOUT_S}" rune schema get a/t --user admin --password-file /work/admin.pw --broker "rune-1:${BROKER_PORT}"
 expect_refusal "step 15: the old user a/alice in the re-created namespace" "AuthenticationFailed" \
-    ql_as a/alice /work/alice.pw -e "show topics;" --broker "rune-3:${BROKER_PORT}"
+    ql_as a/alice /work/alice.pw -e "show grants for user alice;" --broker "rune-3:${BROKER_PORT}"
 lim2=$(ns_as admin /work/admin.pw limits a --broker "rune-1:${BROKER_PORT}") || fail "step 15: limits of the re-created a"
 echo "${lim2}" | grep -qE '^max-topics +1$' && fail "step 15: the re-created a inherited max-topics=1 of the old namespace"
 log "step 15 OK: ${old_id} erased, a re-created as ${new_id}, empty"
@@ -516,7 +518,7 @@ row=$(ns_row a); [ "$(echo "${row}" | awk '{print $1}')" = "${new_id}" ] || { ec
 expect_refusal "step 16: the old topic a/t after the restart" "UnknownTopic" \
     txt "${OP_TIMEOUT_S}" rune schema get a/t --user admin --password-file /work/admin.pw --broker "rune-2:${BROKER_PORT}"
 expect_refusal "step 16: the old user a/alice after the restart" "AuthenticationFailed" \
-    ql_as a/alice /work/alice.pw -e "show topics;" --broker "rune-3:${BROKER_PORT}"
+    ql_as a/alice /work/alice.pw -e "show grants for user alice;" --broker "rune-3:${BROKER_PORT}"
 log "step 16 OK"
 
 echo "NAMESPACE-E2E: OK"
