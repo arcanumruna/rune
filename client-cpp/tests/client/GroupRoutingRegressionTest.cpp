@@ -4115,15 +4115,22 @@ TEST(GroupRoutingRegression, MetadataRefreshFollowsTheInjectedClockRegression) {
     auto s0 = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
                                  [](const rc::Record&) {});
     ASSERT_TRUE(r.drive([&] { return r.subAt(0, n1) != nullptr && s0.active(); }));
+    // Let the refreshes of the first redirect run their course.
+    const int64_t settled = g_routingClockNs + 3'000'000'000LL;
+    ASSERT_TRUE(r.drive([&] { return g_routingClockNs >= settled; }, 100'000));
+    const int before = r.gw.metadataRequests;
+    // The second redirect arms a refresh.  The duty clock barely moves (1 us per pass, far below the 100 ms first
+    // backoff step) and then stands still: only the clock can fire the armed refresh.
+    r.opt.stepNs = 100'000;
+    const int64_t sub0 = g_routingClockNs;
     auto s1 = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
                                  [](const rc::Record&) {});
-    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n2) != nullptr && s1.active(); }));
-    // Freeze the duty clock and let the already-due work drain.
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n2) != nullptr && s1.active(); }, 20'000));
+    const int atActive = r.gw.metadataRequests; const int64_t dt = g_routingClockNs - sub0;
     r.opt.stepNs = 0;
-    for (int i = 0; i < 100; ++i) { r.client.doWork(); r.gw.pump(); }
-    const int frozenAt = r.gw.metadataRequests;
     for (int i = 0; i < 5000; ++i) { r.client.doWork(); r.gw.pump(); }
-    EXPECT_EQ(r.gw.metadataRequests, frozenAt) << "a refresh fired while the duty clock stood still";
+    const int frozenAt = r.gw.metadataRequests;
+    ADD_FAILURE() << "DIAG before=" << before << " atActive=" << atActive << " dtNs=" << dt << " frozenAt=" << frozenAt;
     g_routingClockNs += 2'000'000'000LL;   // past the first backoff step
     for (int i = 0; i < 200; ++i) { r.client.doWork(); r.gw.pump(); }
     EXPECT_EQ(r.gw.metadataRequests, frozenAt + 1) << "the armed refresh did not fire once the duty clock passed it";

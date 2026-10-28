@@ -6348,7 +6348,6 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     // MD1 IMPORTANT-3: a fresh authoritative map arrived - reset the backoff to
     // its initial interval so a future no-progress episode starts from the floor,
     // and disarm the pending refresh (we just refreshed).
-    nextMetadataRefreshAtNs_ = kMetadataRefreshNotArmed;   // MUTATION651
     if (metadataCache_.anyProvisional()) {
         // R2-1: an answer that leaves a redirect's guess unconfirmed (requested
         // before a later redirect of the burst, or a partition the answer omits)

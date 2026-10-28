@@ -96,7 +96,7 @@ void GroupConsumerHub::add(GroupConsumerImpl* impl) {
         if (candidate == 0) continue;
         bool taken = false;
         for (const GroupConsumerImpl* o : owned_) {
-            if (false && o != impl && o->ctlId == candidate) /*MUTATIONCTL*/ { taken = true; break; }
+            if (o != impl && o->ctlId == candidate) { taken = true; break; }
         }
         if (!taken) break;
     }
@@ -346,7 +346,9 @@ void GroupConsumerHub::startRewind_(GroupConsumerImpl* impl, OpKind kind, const 
 // #685: a fetch in flight died with its session: the answer can never come - re-send on the first pass after reconnect.
 // offsetFetchCorrId is kept on purpose: an answer still arriving from the old session is fenced by its session id.
 static void resetOffsetFetch_(GroupConsumerImpl& impl) noexcept {
-    (void)impl; /*MUTATIONRESET*/
+    impl.offsetFetchPhase     = GroupConsumerImpl::OffsetFetchPhase::Idle;
+    impl.offsetFetchDueNs     = 0;
+    impl.offsetFetchBackoffNs = 0;
 }
 
 int GroupConsumerHub::driveRewinds(int64_t nowNs, int64_t sessionId, const SendFn& sendFn) {
@@ -358,7 +360,8 @@ int GroupConsumerHub::driveRewinds(int64_t nowNs, int64_t sessionId, const SendF
         ++n;
         // #371: now, not on the next sweep.  #684: also in RewindResubscribe - a seek that superseded a
         // seekToCommitted leaves the other partitions offset-unknown (a no-op when none is; paced by its own phase).
-        if (std::holds_alternative<GroupConsumerImpl::RewindAwaitFetch>(impl->rewind)) { /*MUTATIONE*/
+        if (std::holds_alternative<GroupConsumerImpl::RewindAwaitFetch>(impl->rewind) ||
+            std::holds_alternative<GroupConsumerImpl::RewindResubscribe>(impl->rewind)) {
             (void)retryOffsetFetchFor_(*impl, nowNs, sessionId, sendFn);
         }
     }
