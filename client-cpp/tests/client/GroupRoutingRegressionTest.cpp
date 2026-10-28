@@ -180,7 +180,7 @@ TEST(GroupRoutingRegression, NotLeaderGroupSubscribeConvergesOnMetadataRegressio
 // - every metadata answer keeps naming the refusing node, which answers each re-subscribe NotLeader.  The member must
 // survive it (routing refusals are unbounded, however many the pacing produces) and bind once a leader appears.
 TEST(GroupRoutingRegression, AFiveSecondLeaderlessPartitionStillBindsWhenALeaderAppearsRegression) {
-    GroupRig r(4195, 4196);
+    GroupRig r(4195, 4196, routingClockOptions());   // #676: the 5 s window runs on the duty clock
     const auto [n1, p1port] = r.addNode(4195);
     r.gw.moreBrokers        = {{1, "127.0.0.1", p1port}};
     r.gw.partitions         = {{1, 0, 0, 1, 4195, ""}, {1, 1, /*stale*/ 0, 1, 4195, ""}};
@@ -195,8 +195,8 @@ TEST(GroupRoutingRegression, AFiveSecondLeaderlessPartitionStillBindsWhenALeader
     ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0 && !r.gw.pendingJoins.empty(); }));
     r.gw.releaseJoins();
     ASSERT_TRUE(r.drive([&] { return r.gw.subscribeRefusals >= 1; }));
-    const auto t0 = std::chrono::steady_clock::now();
-    (void)r.drive([&] { return std::chrono::steady_clock::now() - t0 >= std::chrono::seconds(5); }, 50'000'000);
+    const int64_t until = g_routingClockNs + 5'000'000'000LL;
+    (void)r.drive([&] { return g_routingClockNs >= until; }, 50'000'000);
     const int refusals = r.gw.subscribeRefusals;
     std::fprintf(stderr, "leaderless 5 s: %d NotLeader refusals of the partition-1 fetch\n", refusals);
     EXPECT_GT(refusals, 1) << "the client kept re-subscribing during the outage";
@@ -955,7 +955,7 @@ void reachStable(GroupRig& r, rc::GroupConsumer& gc) {
 } // namespace
 
 TEST(GroupRoutingRegression, SyncGroupInvalidRequestFinishesTheConsumerRegression) {
-    GroupRig r(4183, 4184);
+    GroupRig r(4183, 4184, routingClockOptions());
     r.gw.holdJoins     = false;
     r.gw.syncErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::InvalidRequest);
     auto gc = r.client.subscribeGroup("g", {"t"});
@@ -972,10 +972,10 @@ TEST(GroupRoutingRegression, JoinGroupInternalBacksOffThenRefusesRegression) {
     r.gw.holdJoins     = false;
     r.gw.joinErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
     auto gc = r.client.subscribeGroup("g", {"t"});
-    const auto t0 = std::chrono::steady_clock::now();
+    const int64_t t0 = g_routingClockNs;   // #676: the pacing is measured on the duty clock
     r.connect();
     ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 40'000'000)) << "joins: " << r.gw.joinGroups;
-    const auto took = std::chrono::steady_clock::now() - t0;
+    const auto took = std::chrono::nanoseconds(g_routingClockNs - t0);
     EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RetryBudgetExhausted);
     EXPECT_EQ(r.gw.joinGroups, 9) << "1 join + kMaxBackoffRejoins (8) paced re-joins, then refused";
     EXPECT_GE(took, std::chrono::milliseconds(2000)) << "the re-joins were not paced (a storm)";
@@ -1238,7 +1238,7 @@ TEST(GroupRoutingRegression, OffsetFetchNotCoordinatorFailoverRejoinsWithoutSpen
 // fetch in flight is never duplicated; only one unanswered past
 // sessionTimeoutMs (a lost answer) is re-sent — exactly once per deadline.
 TEST(GroupRoutingRegression, OffsetFetchInFlightIsNeverDuplicatedByTheRetryPassRegression) {
-    GroupRig r(4221, 4222);
+    GroupRig r(4221, 4222, routingClockOptions());   // #676: sessionTimeoutMs runs on the duty clock
     const auto [n1, p1port] = r.addNode(4221);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4221, ""}, {1, 1, 1, 1, 4221, ""}};
@@ -1252,14 +1252,13 @@ TEST(GroupRoutingRegression, OffsetFetchInFlightIsNeverDuplicatedByTheRetryPassR
     ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
     r.gw.releaseJoins();
     ASSERT_TRUE(r.drive([&] { return r.gw.offsetFetches == 1; }, 4'000'000));
-    const auto sentAt = std::chrono::steady_clock::now();
-    // Many duty sweeps (100 ms each) while it is in flight: no duplicate.
-    (void)r.drive([&] { return std::chrono::steady_clock::now() - sentAt > std::chrono::milliseconds(700); },
-                  80'000'000);
+    const int64_t sentAt = g_routingClockNs;
+    // Many duty sweeps while it is in flight: no duplicate.
+    (void)r.drive([&] { return g_routingClockNs - sentAt > 700'000'000LL; }, 80'000'000);
     EXPECT_EQ(r.gw.offsetFetches, 1) << "the retry pass duplicated an OffsetFetch still in flight";
     // Unanswered past sessionTimeoutMs: a lost answer — re-sent, once.
     ASSERT_TRUE(r.drive([&] { return r.gw.offsetFetches >= 2; }, 80'000'000)) << "a lost answer was never re-sent";
-    EXPECT_LT(std::chrono::steady_clock::now() - sentAt, std::chrono::milliseconds(1'500 + 1'000));
+    EXPECT_LT(std::chrono::nanoseconds(g_routingClockNs - sentAt), std::chrono::milliseconds(1'500 + 1'000));
     EXPECT_EQ(r.gw.offsetFetches, 2);
     // The (latest) answer seeds the start offset: the leader-node subscription goes out.
     r.gw.holdOffsetFetch = false;
@@ -1523,7 +1522,7 @@ TEST(GroupRoutingRegression, BatchHeldOnAConnectingDeadLeaderAsksForMetadataRegr
 // re-joined the follower forever (dockerized: 0 of 80 records consumed).
 // ===========================================================================
 TEST(GroupRoutingRegression, MemberOnAFollowerJoinsTheCoordinatorRegression) {
-    GroupRig r(4131, 4132);
+    GroupRig r(4131, 4132, routingClockOptions());   // #676: the join-deadline window is duty-clock time
     const auto [n1, p1port] = r.addNode(4131);
     r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
     // Partition 0 is led by the coordinator (node 1); partition 1 by the
@@ -1544,10 +1543,10 @@ TEST(GroupRoutingRegression, MemberOnAFollowerJoinsTheCoordinatorRegression) {
     bool assigned = false;
     gc.onAssigned([&](std::vector<rc::TopicPartition>) { assigned = true; });
     r.connect();
-    const auto t0 = std::chrono::steady_clock::now();
+    const int64_t t0 = g_routingClockNs;
     ASSERT_TRUE(r.drive([&] { return assigned; }, 4'000'000))
         << "the member never joined the coordinator (NotCoordinator answers: " << r.gw.notCoordinatorAnswers << ")";
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    const int64_t ms = (g_routingClockNs - t0) / 1'000'000;
     EXPECT_LT(ms, 5'000) << "joined only after " << ms << " ms (a join deadline, not the redirect)";
     EXPECT_GE(r.gw.notCoordinatorAnswers, 1) << "precondition: the follower answered NotCoordinator";
     EXPECT_EQ(r.gw.groupEndpoints.back(), n1) << "the last group frame did not reach the coordinator";
@@ -1587,7 +1586,7 @@ TEST(GroupRoutingRegression, MemberOnAFollowerJoinsTheCoordinatorRegression) {
 // deadline, not move the seed).  RED without the coordinator route: the
 // InitProducerId in flight on the follower is never answered.
 TEST(GroupRoutingRegression, TxnProducerOnAFollowerInitsOnTheCoordinatorRegression) {
-    GroupRig r(4133, 4134);
+    GroupRig r(4133, 4134, routingClockOptions());   // #676: the op-deadline window is duty-clock time
     const auto [n1, p1port] = r.addNode(4133);
     r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
     r.gw.partitions            = {{1, 0, n1, 1, 4133, ""}, {1, 1, 0, 1, 4133, ""}};
@@ -1599,7 +1598,7 @@ TEST(GroupRoutingRegression, TxnProducerOnAFollowerInitsOnTheCoordinatorRegressi
     tcfg.transactionalId = "tx-d4";
     auto tp = r.client.producer(tcfg);
     r.connect();
-    const auto t0 = std::chrono::steady_clock::now();
+    const int64_t t0 = g_routingClockNs;
     const rc::Token t = r.nextToken++;
     ASSERT_EQ(tp.initTransactions(r.cq, t), rc::OpResult::Accepted);
     bool done = false;
@@ -1611,7 +1610,7 @@ TEST(GroupRoutingRegression, TxnProducerOnAFollowerInitsOnTheCoordinatorRegressi
         });
         return done;
     }, 4'000'000)) << "InitProducerId never completed (NotCoordinator answers: " << r.gw.notCoordinatorAnswers << ")";
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    const int64_t ms = (g_routingClockNs - t0) / 1'000'000;
     EXPECT_EQ(st, rc::OpStatus::Ok);
     EXPECT_EQ(pid, 4242);
     EXPECT_LT(ms, 5'000) << "completed only after " << ms << " ms (an op deadline, not the redirect)";
@@ -1748,10 +1747,17 @@ TEST(GroupRoutingRegression, ResumeKeepingTheSessionIdKeepsTheHeldJoinRegression
 // that connect.  RED before: the seed machine took it as a connect error ->
 // terminal Disconnected.
 TEST(GroupRoutingRegression, NotCoordinatorWithAConnectCorrIdNeverFailsTheConnectRegression) {
-    GroupRig r(4141, 4142);
+    GroupRig r(4141, 4142, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4141);
     r.gw.replyConnects = false;
     ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+    {   // #676: as GroupRig::connect — wait for the real-time ingress publication on a frozen duty clock
+        const int64_t step = r.opt.stepNs;
+        r.opt.stepNs       = 0;
+        const bool up      = r.drive([&] { return r.client.testTransport().ingressConnected(); }, 2'000'000);
+        r.opt.stepNs       = step;
+        ASSERT_TRUE(up) << "the client's ingress publication never connected";
+    }
     const rc::Token t = r.nextToken++;
     ASSERT_EQ(r.client.connect(r.cq, t), rc::OpResult::Accepted);
     ASSERT_TRUE(r.drive([&] { return !r.gw.connectCorrIds.empty(); }));
@@ -1766,16 +1772,14 @@ TEST(GroupRoutingRegression, NotCoordinatorWithAConnectCorrIdNeverFailsTheConnec
     // r3 MEDIUM-2: the property is that the seed CONNECTS (it was never failed);
     // the app's connect() op itself may race its own deadline (the seed's retry
     // and connect() both fire at 5 s), so it is not the oracle.
-    // Bounded by wall time, not a pump count: the seed's connect retry is a
-    // 5 s timer, which a fast host's pump loop can outrun.
-    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    // #676: bounded by 30 s of duty clock (the seed's connect retry is a 5 s duty-clock timer).
+    const int64_t until = g_routingClockNs + 30'000'000'000LL;
     bool connected = false;
-    while (!connected && std::chrono::steady_clock::now() < until) {
-        r.client.doWork();
-        r.gw.pump();
+    (void)r.drive([&] {
         r.cq.poll([](const rc::Completion&, std::span<const uint8_t>) {});
         connected = r.client.testSessionStateAt(0) == rc::session::SessionState::Connected;
-    }
+        return connected || g_routingClockNs >= until;
+    }, 50'000'000);
     ASSERT_TRUE(connected) << "the seed never connected";
 }
 
@@ -3541,7 +3545,7 @@ TEST(GroupRoutingRegression, PlainReaderCreatedRightAfterALeaderCrashBindsOnTheN
                                     [](const rc::Record&) {});
     // Its Subscribe is redirected by the seed (stale view) to node 1, which
     // never answers (a dead node records nothing: bounded drive, no predicate).
-    (void)r.drive([&] { return fresh.finished(); }, 50'000);
+    (void)r.drive([&] { return fresh.finished(); }, 3'000);   // #676: 3 s of duty clock, inside the 10 s stale window
     ASSERT_FALSE(fresh.finished());
     ASSERT_EQ(subscribesAt(r.gw, 1, n2), 0);
 
@@ -3618,7 +3622,7 @@ TEST(GroupRoutingRegression, APendingReaderOnACrashedLeaderFollowsTheRouteToTheS
     r.gw.deadEndpoints.insert(n1);   // node 1 crashes; its session still looks Connected
     auto fresh = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
                                     [](const rc::Record&) {});
-    (void)r.drive([&] { return fresh.finished(); }, 50'000);
+    (void)r.drive([&] { return fresh.finished(); }, 3'000);   // #676: 3 s of duty clock, inside the 10 s stale window
     ASSERT_FALSE(fresh.finished());
     ASSERT_EQ(subscribesAt(r.gw, 1, 0), 0);
     // The seed's node is elected for p1.
