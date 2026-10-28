@@ -51,8 +51,12 @@ Decisions:
   - Aeron's heartbeats and status messages keep the NAT mapping open. No extra keepalive is needed; the client
     liveness timeout stays below typical NAT UDP timeouts (about 30 s).
 - **D3.** **Response-control endpoints.** Each publisher thread has one response-control port: the gateway, and each
-  worker. They are derived like the shard ports today (`deriveShardBasePorts` gains a fourth base). They are
-  advertised in Metadata next to `egressControlPort`, and added to `nodeBoundPorts`, the MTU host list and
+  worker. They sit in the unused top of the node's egress-control block (decided 2026-10-28): gateway =
+  `egressBase + 63`, worker `w` = `egressBase + 63 - W + w` (the dynamic-MDC egress uses `egressBase + w`), valid for
+  W <= 31 so the two sets never overlap. They are derived only when the egress-control base is the derived one; an
+  explicit base derives none and warns (`RUNE_RESPONSE_CONTROL_BASE_PORT`, `RUNE_GATEWAY_RESPONSE_CONTROL_PORT`; port 0 =
+  not available, the node serves new clients on the old path). Peers advertise them as `RUNE_PEERS` segments 7 and 8.
+  They are advertised in Metadata next to `egressControlPort`, and added to `nodeBoundPorts`, the MTU host list and
   `docs/operations.md`. Task 2 decides whether several response publications can share one control port; if not,
   the design stops and comes back here.
 - **D4.** **Wire.** A new `kClientVersionResponseEgress`:
