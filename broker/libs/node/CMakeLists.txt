@@ -2102,16 +2102,33 @@ if(BUILD_TESTING)
         target_link_libraries(rune_namespace_matrix_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_matrix_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900 LABELS small)
         rune_regression_batches(rune_namespace_matrix_tests 2)
+        # Namespaces Phase 2 Task 17 (spec §8): the lifecycle matrix (support/NamespaceLifecycleMatrixExpectations.h): 300 sequential
+        # cells on one real broker plus 36 timing cells (real brokers, CatalogTrio, the limit aggregator).
+        add_executable(rune_namespace_lifecycle_matrix_tests tests/node/NamespaceLifecycleMatrixTest.cpp)
+        target_include_directories(rune_namespace_lifecycle_matrix_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_lifecycle_matrix_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_lifecycle_matrix_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900 LABELS small)
+        rune_regression_batches(rune_namespace_lifecycle_matrix_tests 6 TIMEOUT 1800)
         # Namespaces Task 13 (spec §8): seeded, model-checked stress on one real broker (one ctest entry per seed).
         add_executable(rune_namespace_stress_tests tests/node/NamespaceStressTest.cpp)
         target_include_directories(rune_namespace_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-        target_link_libraries(rune_namespace_stress_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_namespace_stress_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900)
+        target_link_libraries(rune_namespace_stress_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        # Phase 2 Task 18: the lifecycle ops, transactions through a real client and the 3-node leader-change variant.
+        gtest_discover_tests(rune_namespace_stress_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 3600)
         # Namespaces Task 14 (spec §8): the 3-node slice, including the matrix's 14 LeaderChange timing cells.
         add_executable(rune_namespace_trio_tests tests/node/NamespaceTrioTest.cpp)
         target_include_directories(rune_namespace_trio_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_namespace_trio_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_trio_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900)
+
+        # Namespaces Phase 2 Task 19 (spec §8): the lifecycle on three real authenticating brokers.
+        add_executable(rune_namespace_lifecycle_trio_tests tests/node/NamespaceLifecycleTrioRegressionTest.cpp)
+        target_include_directories(rune_namespace_lifecycle_trio_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_lifecycle_trio_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_lifecycle_trio_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 1200)
 
         # Catalog history Task 17: TestCluster::defineTopic — the in-process way to create a
         # topic now that the static topic list / NodeConfig::topics are gone (DDL over the wire on real

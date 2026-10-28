@@ -220,5 +220,6 @@ the repo, issues or commits.
 - **Auth:** SCRAM, a `__security` log, allow-only grants with default deny, and a cluster key.
 - **Namespaces (tenants):** `broker/docs/superpowers/specs/2026-10-24-rune-namespaces-and-truncate-design.md`.
   Anonymous read is off by default; a cluster admin turns it on for `default` explicitly.
-  Phase 1 is done (namespace DDL, scoped names, permissions, listings); limits are stored only; groups and
-  transactions work in every namespace (Phase 2).
+  Phase 1 is done (namespace DDL, scoped names, permissions, listings). Phase 2 is done: namespaces have suspend
+  (ReadOnly, RejectAll), resume and delete, every limit is enforced with its own error code, and groups and
+  transactions work in every namespace.

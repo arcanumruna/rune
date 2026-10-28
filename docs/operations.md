@@ -107,10 +107,75 @@ rune namespace delete a --broker rune-1:40200 --user admin --password-file admin
 - **Foreign objects answer exactly like missing ones**: same error code and message, so a name in another namespace is
   never revealed. A namespace admin sees only its own namespace in `rune namespace list`.
 - **Anonymous read is off by default.** Only a cluster admin turns it on, and only for `default`.
-- **Limits are stored, not enforced**, until Phase 2. Consumer groups and transactions work in every namespace.
+- Consumer groups and transactions work in every namespace: the same group id or transactional id in two namespaces
+  is two groups or two producers, with independent offsets, membership and fencing.
 - The data lives under `<data>/ns-<nsId>/topics/<name>/`. A cluster with namespaces is a new cluster; there is no
   in-place upgrade.
 - The 3-node check is `docker/namespace-e2e.sh` ([testing](testing.md#end-to-end-docker-suites)).
+
+### Lifecycle: suspend, resume, delete
+
+Only a cluster admin changes a namespace's state (`ADMIN ON CLUSTER`). A state change is one catalog event, so it takes
+effect on every node when that event applies; no timer is involved.
+
+| State | Served | Refused | Sessions |
+|---|---|---|---|
+| Active | everything its grants allow | - | - |
+| Suspended, read-only | fetch, metadata, view and QL reads, offset fetch, group join, sync, heartbeat, leave | produce, every DDL (topic, view, schema, user, grant), transactions, offset commit: `NamespaceSuspended (51)` | kept; open transactions are aborted when the suspend applies |
+| Suspended, reject-all | nothing | every request; a login with the right password gets `NamespaceSuspended (51)`, a wrong password `AuthenticationFailed (44)` | every session of the namespace is closed when the suspend applies |
+| Deleting | nothing: it answers like a name that never existed | everything; a login gets `AuthenticationFailed (44)` | closed when the delete applies |
+
+- The cluster admin is exempt from both suspend modes. A client older than version 14 does not know code 51 and gets
+  `InvalidRequest (39)` instead; the same holds for codes 52 to 54 below.
+- `resume` returns a suspended namespace to Active; suspending a suspended namespace again, or resuming an Active one, is
+  an Ok no-op. `default` cannot be deleted. Suspend, resume and delete of an unknown or Deleting name answer exactly like
+  any unknown name.
+- **Delete** is one event, and that event is the commit point: the namespace is DELETING at once and **its name is free
+  at once** (a new `create` of the same name gets a new nsId and sees nothing of the old namespace). The reaper on the
+  `__catalog` leader then aborts the open transactions, drops the views, topics and schemas, tombstones the consumer-group
+  offsets and the transaction state, and purges the users, roles and grants. Every step is recorded in the catalog, so a
+  crash or a leader change at any point is finished by whichever broker leads next. When all steps are done the namespace
+  leaves `rune namespace list`, every node renames `ns-<id>` to `ns-<id>.deleting` and removes it, and the boot reconcile
+  removes any leftover. A DELETING namespace still counts toward `RUNE_MAX_NAMESPACES`.
+- `RUNE_NS_DELETE_BATCH` (default 256) bounds the tombstones and drops the reaper issues per pass.
+
+### Limits
+
+`rune namespace limits <name> --set <limit>=N` stores a limit (`0` = unlimited where the limit allows it); every limit is
+enforced, each with one precise code:
+
+| Limit | Checked | Refused with |
+|---|---|---|
+| `max-topics`, `max-partitions-per-topic`, `max-partitions-total`, `max-views`, `max-schemas`, `max-versions-per-schema`, `max-groups`, `max-users` | at the DDL (groups at a new group's first join, users at `CREATE USER`) | `NamespaceLimitExceeded (52)` |
+| `min-replication-factor`, `max-replication-factor`, `lowest-acks`, `lowest-min-insync` | at topic DDL; the acks floor at every produce | `NamespaceLimitExceeded (52)` |
+| feature bits (compaction, txns, ql, views, sql, redis, anonymous read, scram) | at the DDL or at connect / login | `NamespaceLimitExceeded (52)` |
+| `max-connections`, `max-connections-per-user`, `max-sessions-per-user`, `max-open-txns`, `max-txn-time-ms` | at login / `InitProducerId` / `AddPartitions`, **per node** | `NamespaceLimitExceeded (52)` |
+| `max-disk-bytes` | measured on the node that leads the partition | produce on the leader: `NamespaceLimitExceeded (52)`; follower apply, replication catch-up and the log cleaner are never refused |
+| `max-message-bytes`, `max-batch-bytes` | stored and listed only: no broker path reads them yet | - |
+| `max-retention-ms`, `max-retention-bytes` | a topic DDL above the maximum is refused; the cleaner applies `min(topic retention, namespace maximum)` | `NamespaceLimitExceeded (52)` at DDL |
+| `produce-bytes-per-sec`, `produce-records-per-sec`, `fetch-bytes-per-sec`, `request-ops-per-sec`, `query-cycles-per-sec` | a per-namespace aggregator compares the node's usage with `limit x elapsed` every `RUNE_NS_LIMIT_TICK_US` (default 1000) | `Throttled (53)` carrying a retry-after; the client library waits it out and retries |
+| `max-view-memory-bytes` | the node's view chunks | the namespace's views pause at their offset and a view read answers `ViewPaused (54)`; they resume when memory falls or the limit is raised |
+
+- **Lowering a limit deletes nothing**, except the retention maximum: objects over a lowered count stay and the next
+  create is refused; a lowered retention maximum deletes old segments on the next retention pass and the `limits --set`
+  answers Ok with the warning `retention clamped on N topics`.
+- Rates, disk and view memory are enforced from the workers' paced reports, so a namespace can exceed one by what its
+  node produces in about one report interval plus one aggregator tick before the throttle arrives; the rate debt carries
+  the excess forward and the long-run rate converges on the limit. A rate limit never makes a follower refuse a replicated
+  batch, so `acks=all` never stalls on it.
+- `rune namespace usage <name>` prints each limit next to its current usage on the node it asks (counts, disk, view
+  memory, connections and rates; fields with no usage meaning print `-`).
+- Anonymous sessions have their own caps: `RUNE_ANONYMOUS_MAX_CONNECTIONS` (default 16) and
+  `RUNE_ANONYMOUS_REQUEST_OPS_PER_SEC` (default 1000).
+
+The error codes, all gated on client version 14:
+
+| Code | Name | Meaning |
+|---|---|---|
+| 51 | `NamespaceSuspended` | the namespace is suspended and this request is not served in that mode |
+| 52 | `NamespaceLimitExceeded` | a count, durability, feature, connection, transaction or disk limit |
+| 53 | `Throttled` | a rate limit; the response carries `retryAfterNs` |
+| 54 | `ViewPaused` | the view is paused over its namespace's memory limit |
 
 ## Metrics
 
