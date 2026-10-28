@@ -94,6 +94,22 @@ TEST(EmbeddedDriver, InvokerModeRoundTripOnOneThreadOnly) {
     sub.reset(); pub.reset(); a.reset();
 }
 
+// Aeron 1.51 starts an "aeron-executor" thread per driver by default (name resolution, async channel
+// parsing).  An invoker driver runs on its owner's thread only, so starting it and pumping it must leave
+// the process thread count unchanged.
+TEST(EmbeddedDriverRegression, InvokerDriverStartsNoThreadRegression) {
+    const auto threads = [] {
+        int n = 0;
+        for ([[maybe_unused]] const auto& e : fs::directory_iterator("/proc/self/task")) ++n;
+        return n;
+    };
+    TmpDir d;
+    const int before = threads();
+    EmbeddedDriver drv(cfgAt(d.path), DriverMode::Invoker);
+    for (int i = 0; i < 100; ++i) drv.doWork();
+    EXPECT_EQ(threads(), before) << "an invoker driver must not spawn a thread (Aeron async executor)";
+}
+
 TEST(EmbeddedDriverRegression, InvokerForeignThreadPumpIsRefused) {
     TmpDir d;
     EmbeddedDriver drv(cfgAt(d.path), DriverMode::Invoker);

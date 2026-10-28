@@ -130,6 +130,7 @@ public:
         if (aeron_driver_context_init(&ctx_) < 0) throw std::runtime_error(aeron_errmsg());
         aeron_driver_context_set_dir(ctx_, dir_.c_str());
         aeron_driver_context_set_threading_mode(ctx_, AERON_THREADING_MODE_DEDICATED);
+        aeron_driver_context_set_async_executor_enabled(ctx_, false);   // same thread layout as the broker
         aeron_driver_context_set_dir_delete_on_start(ctx_, true);
         aeron_driver_context_set_dir_delete_on_shutdown(ctx_, true);
         aeron_driver_context_set_term_buffer_sparse_file(ctx_, true);

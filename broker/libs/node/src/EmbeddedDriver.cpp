@@ -144,6 +144,10 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
         throw std::runtime_error(std::string("EmbeddedDriver: aeron_driver_context_init failed: ") +
                                  aeron_errmsg());
     aeron_driver_context_set_dir(ctx_, cfg_.dir.c_str());
+    // Aeron 1.51 runs name resolution and async channel parsing on its own "aeron-executor" thread by
+    // default.  Keep that work on the conductor, as in 1.41: an invoker driver owns no thread, and the
+    // rune peer resolver's cache has exactly one consumer (the conductor).
+    aeron_driver_context_set_async_executor_enabled(ctx_, false);
     const char* idle = cfg_.idleStrategy.c_str();
     // D2 round 2: an idle strategy's state is built from the init args present when its setter runs — set
     // the args FIRST.  Empty args = Aeron's own (AERON_*_IDLE_STRATEGY_INIT_ARGS env, else built-in).  A

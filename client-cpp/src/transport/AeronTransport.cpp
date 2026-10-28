@@ -618,6 +618,9 @@ void AeronTransport::startEmbeddedDriver() {
     }
 
     aeron_driver_context_set_dir(driverCtx_, aeronDir.c_str());
+    // Aeron 1.51 runs name resolution and async channel parsing on its own "aeron-executor" thread by
+    // default.  Keep it on the conductor, as in 1.41: an invoker driver owns no thread.
+    aeron_driver_context_set_async_executor_enabled(driverCtx_, false);
     // INVOKER: one runner (conductor+sender+receiver), no threads, refuses a
     // non-manual start (aeron_driver.c:939-957, :1054-1087).
     aeron_driver_context_set_threading_mode(

@@ -42,6 +42,12 @@ static int rune_peer_resolve(
     return 0;
 }
 
+static int rune_peer_start(aeron_name_resolver_t *resolver)
+{
+    (void)resolver;
+    return 0;
+}
+
 static int rune_peer_do_work(aeron_name_resolver_t *resolver, int64_t now_ms)
 {
     (void)now_ms;
@@ -74,6 +80,7 @@ static int rune_peer_supplier(aeron_name_resolver_t *resolver, const char *args,
     resolver->name = "rune-peer";
     resolver->lookup_func = aeron_default_name_resolver_lookup;
     resolver->resolve_func = rune_peer_resolve;
+    resolver->start_func = rune_peer_start;      /* Aeron 1.51 calls it unconditionally */
     resolver->do_work_func = rune_peer_do_work;
     resolver->close_func = rune_peer_close;
     resolver->state = (void *)p;
