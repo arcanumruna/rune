@@ -2281,7 +2281,6 @@ static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::CommittingTransaction), TxnMachine>, Committing>);
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::AbortingTransaction), TxnMachine>, Aborting>);
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::AbortableError), TxnMachine>, AbortableError>);
-static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::AbortableError), TxnMachine>, AbortableError>);
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::FatalError), TxnMachine>, FatalError>);
 
 } // namespace rune::client::producer

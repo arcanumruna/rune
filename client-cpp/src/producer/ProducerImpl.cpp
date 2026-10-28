@@ -581,8 +581,8 @@ void ProducerImpl::enableDirectIngress(const DirectIngress& d) {
         static_cast<std::size_t>(kRecHeaderSize) + rune::client::Producer::kMaxRecordBytes);
     const std::size_t want = cfg_.directDeferredBytes > 0
                                  ? static_cast<std::size_t>(cfg_.directDeferredBytes) : 0u;
-    // #344: the claim quarantine holds a builder-sized spare, so abandoning an open claim (a commit / abort / close with
-    // a claim open) copies the records before it into the spare and swaps - no allocation.  Control plane, once.
+    // #344/#699: the largest possible claim is one whole builder, so the quarantine reserve is exactly that: an abandon
+    // never allocates (hot path). Memory cost is one builder per Direct producer, deliberate. Control plane, once.
     claimQuarantine_.reserve(builderPrealloc_);
     deferred_.init(std::max(want, 2 * kMaxRec));
     const std::size_t arena = deferred_.capacity();
