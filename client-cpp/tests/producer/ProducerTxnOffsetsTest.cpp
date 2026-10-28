@@ -1488,3 +1488,59 @@ TEST(ProducerTxnOffsetsRegression, RefusedSecondCallsDuringAFailingFirstKeepOnly
     ASSERT_EQ(r.d(d).times, 1);
     EXPECT_EQ(r.d(d).status, OpStatus::Ok);
 }
+
+// #698 x timing (back-to-back from the completion): the app issues an EMPTY sendOffsets from inside the first call's
+// completion callback (the public path: through the ring).  The first call is over by then (its slot is free before
+// its completion runs), so the empty call is NOT refused as "one in flight": it completes Ok exactly once, sends
+// nothing, and a following real call runs normally.
+// RED (mutation): the finished call's slot never returned to idle (the in-flight check, now ahead of the empty-list
+// shortcut, refuses the empty call with InvalidArgument).
+TEST(ProducerTxnOffsetsRegression, AnEmptySendOffsetsIssuedFromTheFirstsCompletionIsOkAdversarialRegression) {
+    Rig r;
+    r.inTxn();
+    struct Reenter {
+        Rig*        r = nullptr;
+        Done        first;
+        Rig::Issued second{0, rc::OpResult::Accepted};
+        bool        fired = false;
+        static void on(void* ctx, const rc::Completion& c, std::span<const uint8_t> t) noexcept {
+            auto* self = static_cast<Reenter*>(ctx);
+            Done::on(&self->first, c, t);
+            if (!self->fired) {
+                self->fired  = true;
+                self->second = self->r->issue(TxnControl::Kind::SendOffsets, {}, "grp-a");
+            }
+        }
+    } re;
+    re.r = &r;
+    const auto offs = offsetsOf(2);
+    TxnControl c;
+    c.kind           = TxnControl::Kind::SendOffsets;
+    c.target.handler = rc::CompletionHandler{&Reenter::on, &re};
+    c.token          = 60;
+    c.offsets        = offs;
+    c.groupId        = "grp-a";
+    r.impl->applyTxnControl(c, r.now);
+    r.tick();
+    r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+    r.tick();
+    for (const auto& f : r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID)) {
+        if (re.first.times == 0) r.answerFrame(f, rp::ReqKind::TxnOffsetCommit, 0);
+    }
+    ASSERT_EQ(re.first.times, 1);
+    EXPECT_EQ(re.first.status, OpStatus::Ok);
+    ASSERT_TRUE(re.fired);
+    ASSERT_EQ(re.second.result, rc::OpResult::Accepted);
+    const std::size_t frames = r.cap.frames.size();
+    r.tick();   // the ring is drained: the empty call is applied
+    ASSERT_EQ(r.d(re.second.token).times, 1);
+    EXPECT_EQ(r.d(re.second.token).status, OpStatus::Ok) << "nothing in flight any more";
+    EXPECT_EQ(r.cap.frames.size(), frames) << "an empty call sends nothing";
+    const Token third = r.sendOffsets(offsetsOf(1), "grp-a");
+    r.sendOk(third);
+    ASSERT_EQ(r.d(third).times, 1);
+    EXPECT_EQ(r.d(third).status, OpStatus::Ok);
+    EXPECT_EQ(re.first.times, 1);
+    EXPECT_EQ(r.d(re.second.token).times, 1);
+    EXPECT_EQ(r.impl->txnStateDuty(), TxnState::InTransaction);
+}

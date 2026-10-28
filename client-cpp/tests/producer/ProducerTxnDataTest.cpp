@@ -2769,3 +2769,548 @@ TEST(ProducerTxnDataRegression, FlushCapThroughTheRingIsExactAndFreedAfterwardsA
     EXPECT_EQ(r.acks.times(1), 1);
     EXPECT_EQ(r.acks.times(2), 1);
 }
+
+// ============================================================================================================
+// Batch C22 adversarial review (#345 #694 #700): attacks through the producer's public ops against the rig above.
+// ============================================================================================================
+
+namespace {
+std::size_t initsOn(const Rig& r) {
+    std::size_t n = 0;
+    for (const auto& f : r.fake.offered) n += f.templateId == rpc::InitProducerId::TEMPLATE_ID ? 1 : 0;
+    return n;
+}
+}  // namespace
+
+// #345 x bounds: the threshold is a scan of EVERY partition, not partition 0.  Partition 0 is far below it; partition 3
+// starts at exactly kTxnSeqBumpAt, so its one record leaves it at kTxnSeqBumpAt + 1: the commit bumps, and the next
+// transaction restarts BOTH partitions at 0 under the new epoch; each record completes exactly once.
+// RED (mutation): the #345 hunk in endDone_ removed (no InitProducerId; p3's next batch at kTxnSeqBumpAt + 1).
+TEST(ProducerTxnDataRegression, ACommitWhereOnlyANonZeroPartitionPassesTheThresholdBumpsEveryPartitionAdversarialRegression) {
+    Rig r;
+    r.initOk(77, 0);
+    r.impl->debugSetNextSequenceForTest(kTopic, 0, 5);
+    r.impl->debugSetNextSequenceForTest(kTopic, 3, rp::kTxnSeqBumpAt);
+    r.begin();
+    ASSERT_EQ(r.sendAck(0, 1, 501), SendResult::Ok);
+    ASSERT_EQ(r.sendAck(3, 2, 502), SendResult::Ok);
+    r.tick();
+    r.answerAdd(0);
+    r.ticks(2);
+    ASSERT_EQ(r.wire.size(), 2u);
+    for (const auto& w : r.wire) EXPECT_EQ(w.baseSeq, w.partition == 0 ? 5 : rp::kTxnSeqBumpAt);
+    r.ackAll();
+    Op commit = r.commit();
+    r.tick();
+    ASSERT_EQ(r.endTxns(), 1u);
+    r.endAnswer();
+    r.tick();
+    EXPECT_FALSE(commit.ready()) << "partition 3 passed the threshold: the commit waits for the bump";
+    ASSERT_EQ(initsOn(r), 2u);
+    r.answer(Rig::initAnswer(r.last(rpc::InitProducerId::TEMPLATE_ID)->corrId, 77, 1));
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+    EXPECT_EQ(r.acks.times(501), 1);
+    EXPECT_EQ(r.acks.times(502), 1);
+    r.begin();
+    ASSERT_EQ(r.send(0, 3), SendResult::Ok);
+    ASSERT_EQ(r.send(3, 4), SendResult::Ok);
+    r.tick();
+    r.answerAdd(0);
+    r.ticks(2);
+    ASSERT_EQ(r.wire.size(), 4u);
+    for (std::size_t i = 2; i < 4; ++i) {
+        EXPECT_EQ(r.wire[i].baseSeq, 0) << "partition " << r.wire[i].partition;
+        EXPECT_EQ(r.wire[i].epoch, 1) << "partition " << r.wire[i].partition;
+    }
+}
+
+// #345 x the real coordinator's window: right after EndTxn(commit) the coordinator is still in PrepareCommit and
+// answers the bump's InitProducerId with ConcurrentTransactions (27).  The bump is retried (never EndTxn again), the
+// commit completes Ok exactly once after the retried bump, and no other op is disturbed.
+// RED (mutation): the #345 hunk in endDone_ removed (no InitProducerId is ever sent after the commit).
+TEST(ProducerTxnDataRegression, ABumpAnsweredConcurrentTransactionsIsRetriedAndTheCommitCompletesOnceAdversarialRegression) {
+    Rig r;
+    r.initOk(77, 0);
+    Op commit = commitAfterSequence(r, rp::kTxnSeqBumpAt + 1);
+    r.tick();
+    ASSERT_EQ(initsOn(r), 2u);
+    for (int busy = 0; busy < 3; ++busy) {
+        r.answer(FakeCoordinator::answer(rp::ReqKind::InitProducerId, r.last(rpc::InitProducerId::TEMPLATE_ID)->corrId,
+                                         ec(rpc::ErrorCode::ConcurrentTransactions)));
+        EXPECT_FALSE(commit.ready()) << "a 27 is retried, not an outcome";
+        EXPECT_EQ(r.state(), TxnState::CommittingTransaction);
+        for (int i = 0; i < 50 && initsOn(r) < static_cast<std::size_t>(3 + busy); ++i) r.tick(5 * kMs);
+        ASSERT_EQ(initsOn(r), static_cast<std::size_t>(3 + busy)) << "the bump is re-sent after the backoff";
+    }
+    EXPECT_EQ(r.endTxns(), 1u) << "EndTxn is never re-sent";
+    r.answer(Rig::initAnswer(r.last(rpc::InitProducerId::TEMPLATE_ID)->corrId, 77, 1));
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+    EXPECT_EQ(r.ops.e.at(commit.t).times, 1) << "the commit completes exactly once";
+    EXPECT_EQ(r.state(), TxnState::Ready);
+}
+
+// #345 x close: a close() that arrives while the commit's bump is on the wire waits for it (the commit landed; the
+// producer must not close under a half-done bump), then completes Ok; the commit completes Ok exactly once and no frame
+// leaves after the close.
+// RED (mutation): the #345 hunk in endDone_ removed (the commit completes before the close, no bump ever sent).
+TEST(ProducerTxnDataRegression, CloseDuringACommitsEpochBumpWaitsForItAdversarialRegression) {
+    Rig r;
+    r.initOk(77, 0);
+    Op commit = commitAfterSequence(r, rp::kTxnSeqBumpAt + 1);
+    r.tick();
+    ASSERT_EQ(initsOn(r), 2u);
+    Op cl = r.close();
+    r.ticks(3);
+    EXPECT_FALSE(cl.ready()) << "close waits for the commit's bump";
+    EXPECT_FALSE(commit.ready());
+    EXPECT_EQ(r.endTxns(), 1u) << "close sends no EndTxn of its own over the landed commit";
+    r.answer(Rig::initAnswer(r.last(rpc::InitProducerId::TEMPLATE_ID)->corrId, 77, 1));
+    r.ticks(3);
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+    ASSERT_TRUE(cl.ready());
+    EXPECT_EQ(cl.status(), OpStatus::Ok);
+    EXPECT_EQ(r.ops.e.at(commit.t).times, 1);
+    EXPECT_EQ(r.ops.e.at(cl.t).times, 1);
+    const std::size_t frames = r.fake.offered.size();
+    r.ticks(5, 100 * kMs);
+    EXPECT_EQ(r.fake.offered.size(), frames) << "nothing leaves a closed producer";
+}
+
+// #694 x two partitions: retention removed the producer's state on BOTH partitions; this transaction acked nothing on
+// either, so each partition's head answered 28 restarts that partition in place, independently: both batches re-sent
+// at sequence 0 under the same id / epoch, the commit is Ok, no epoch bump, every record exactly once.
+// RED (mutation): the U3 hook (restartInPlace_) removed (the transaction is abortable with 28).
+TEST(ProducerTxnDataRegression, UnknownProducerIdOnTwoPartitionsRestartsEachInPlaceAdversarialRegression) {
+    Rig r;
+    r.initOk(77, 0);
+    ASSERT_NO_FATAL_FAILURE(committedTxnAckedAt(r, 10));   // p0 continues at sequence 1
+    r.impl->debugSetNextSequenceForTest(kTopic, 2, 7);    // p2 as if an earlier transaction wrote 7 records there
+    r.begin();
+    ASSERT_EQ(r.sendAck(0, 11, 601), SendResult::Ok);
+    ASSERT_EQ(r.sendAck(2, 12, 602), SendResult::Ok);
+    r.tick();
+    r.answerAdd(0);
+    r.ticks(2);
+    ASSERT_EQ(r.wire.size(), 3u);
+    std::size_t w0 = 1, w2 = 2;
+    if (r.wire[1].partition != 0) std::swap(w0, w2);
+    EXPECT_EQ(r.wire[w0].baseSeq, 1);
+    EXPECT_EQ(r.wire[w2].baseSeq, 7);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, w2, kUnknownPid, 0, /*logStart=*/90));
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, w0, kUnknownPid, 0, /*logStart=*/50));
+    EXPECT_EQ(r.state(), TxnState::InTransaction) << "both absorbed in place";
+    r.ticks(3);
+    ASSERT_EQ(r.wire.size(), 5u) << "each batch re-sent once";
+    for (std::size_t i = 3; i < 5; ++i) {
+        EXPECT_EQ(r.wire[i].baseSeq, 0) << "partition " << r.wire[i].partition;
+        EXPECT_EQ(r.wire[i].epoch, 0);
+        EXPECT_EQ(r.wire[i].pid, 77);
+        EXPECT_TRUE(r.wire[i].crcOk);
+    }
+    EXPECT_NE(r.wire[3].partition, r.wire[4].partition);
+    r.ackAll();
+    Op commit = r.commit();
+    r.tick();
+    ASSERT_EQ(r.endTxns(), 2u);
+    EXPECT_EQ(r.lastEnd()->commit, uint8_t{1});
+    r.endAnswer();
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+    EXPECT_EQ(initsOn(r), 1u) << "no epoch bump";
+    EXPECT_EQ(r.acks.times(601), 1);
+    EXPECT_EQ(r.acks.times(602), 1);
+    EXPECT_EQ(r.acks.status(601), OpStatus::Ok);
+    EXPECT_EQ(r.acks.status(602), OpStatus::Ok);
+}
+
+// #694 x mid-operation timing: the commit is issued BEFORE the head's 28 arrives (the commit waits for its data).  The
+// restart re-sends the batch; EndTxn(commit) must not leave before the RE-SENT batch is acked (else the commit marker
+// could precede the data), then the commit is Ok.
+// RED (mutation): the U3 hook removed (the commit completes BrokerError 28 and no batch is re-sent).
+TEST(ProducerTxnDataRegression, UnknownProducerIdWhileTheCommitWaitsForDataRestartsAndEndTxnWaitsForTheResendAdversarialRegression) {
+    Rig r;
+    r.initOk(77, 0);
+    ASSERT_NO_FATAL_FAILURE(committedTxnAckedAt(r, 10));
+    r.begin();
+    ASSERT_EQ(r.sendAck(0, 21, 701), SendResult::Ok);
+    r.tick();
+    r.answerAdd(0);
+    r.tick();
+    ASSERT_EQ(r.wire.size(), 2u);
+    Op commit = r.commit();
+    r.ticks(2);
+    EXPECT_EQ(r.endTxns(), 1u) << "the commit waits for its data";
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 1, kUnknownPid, 0, /*logStart=*/50));
+    r.ticks(3);
+    ASSERT_EQ(r.wire.size(), 3u) << "re-sent after the restart";
+    EXPECT_EQ(r.wire[2].baseSeq, 0);
+    EXPECT_EQ(r.endTxns(), 1u) << "EndTxn waits for the re-sent batch";
+    EXPECT_FALSE(commit.ready());
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 2, 0, 60));
+    r.ticks(2);
+    ASSERT_EQ(r.endTxns(), 2u);
+    EXPECT_EQ(r.lastEnd()->commit, uint8_t{1});
+    r.endAnswer();
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+    EXPECT_EQ(r.acks.times(701), 1);
+    EXPECT_EQ(r.acks.value(701), 60);
+    EXPECT_EQ(initsOn(r), 1u);
+}
+
+// #694 x ordering: the NEWER batch's 28 arrives while the OLDER one's answer is still pending (it may yet be OK: the
+// broker would then know the producer).  The restart must not run on the newer batch's answer: once the older batch
+// is acked, the transaction has data on the partition and the newer batch is never re-stamped to 0 (that would be a
+// sequence regression behind an appended batch); nothing on the wire after the first two frames starts at 0.
+// RED (mutation): the U3 hook moved ahead of the older-live-batch check (C1) - the newer batch restarts at 0.
+TEST(ProducerTxnDataRegression, UnknownProducerIdBehindAPendingOlderBatchNeverRestartsBehindItsAckAdversarialRegression) {
+    Rig r;
+    r.initOk(77, 0);
+    ASSERT_NO_FATAL_FAILURE(committedTxnAckedAt(r, 10));
+    r.begin();
+    ASSERT_EQ(r.sendAck(0, 31, 801), SendResult::Ok);
+    r.tick();
+    r.answerAdd(0);
+    r.tick();
+    ASSERT_EQ(r.sendAck(0, 32, 802), SendResult::Ok);
+    r.tick();
+    ASSERT_EQ(r.wire.size(), 3u);
+    EXPECT_EQ(r.wire[1].baseSeq, 1);
+    EXPECT_EQ(r.wire[2].baseSeq, 2);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 2, kUnknownPid, 0, /*logStart=*/0));   // the newer one first
+    r.ticks(2);
+    for (std::size_t i = 3; i < r.wire.size(); ++i) EXPECT_NE(r.wire[i].baseSeq, 0) << "no restart while the older is live";
+    EXPECT_EQ(r.state(), TxnState::InTransaction) << "C1 parks the newer batch: no poison, no restart";
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 1, 0, 20));   // the older one was appended
+    r.ticks(3);
+    ASSERT_GT(r.wire.size(), 3u) << "the parked newer batch is re-sent after the older one's OK";
+    for (std::size_t i = 3; i < r.wire.size(); ++i) {
+        EXPECT_NE(r.wire[i].baseSeq, 0) << "a restart behind an appended batch of this transaction";
+        EXPECT_EQ(r.wire[i].epoch, 0);
+    }
+    EXPECT_EQ(r.wire.back().baseSeq, 2) << "the newer batch keeps its sequence";
+    ASSERT_EQ(r.wire.back().tags, std::vector<uint8_t>{32});
+    // The broker answers what is still on the wire: a fast retransmit of the older batch is a duplicate (its offset),
+    // the newer batch is appended next.
+    for (std::size_t i = 3; i < r.wire.size(); ++i) {
+        if (!r.wire[i].acked) ASSERT_NO_FATAL_FAILURE(answerWire(r, i, 0, r.wire[i].baseSeq == 1 ? 20 : 21));
+    }
+    r.ticks(2);
+    Op commit = r.commit();
+    r.ticks(2);
+    ASSERT_EQ(r.endTxns(), 2u);
+    EXPECT_EQ(r.lastEnd()->commit, uint8_t{1});
+    r.endAnswer();
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+    EXPECT_EQ(initsOn(r), 1u);
+    EXPECT_EQ(r.acks.value(801), 20);
+    EXPECT_EQ(r.acks.value(802), 21);
+    EXPECT_EQ(r.acks.times(801), 1);
+    EXPECT_EQ(r.acks.times(802), 1);
+    EXPECT_EQ(r.acks.status(801), OpStatus::Ok);
+    EXPECT_EQ(r.acks.status(802), OpStatus::Ok);
+}
+
+// #694 x data integrity (seeded, model-checked): an in-order broker per partition (it appends sequence `next`, answers
+// 28 to a non-zero sequence from a producer it holds no state for, and would answer 20 to any gap) against random
+// interleavings of sends, per-partition answers and retention.  Retention (the broker forgets the producer on a
+// partition) happens only between transactions, so no transaction ever has acked data that is gone: every 28 must be
+// absorbed in place.  Over 3 transactions per seed: every commit is Ok, there is never an epoch bump or a sequence gap
+// (20), every frame carries the one epoch, and each partition's log holds every record sent there exactly once, in
+// send order; every record's token completes exactly once, Ok.
+// RED (mutation): the U3 hook removed (a 28 makes the transaction abortable: a commit fails).
+TEST(ProducerTxnDataRegression, SeededRetentionInterleavingsAbsorbEvery28InPlaceAdversarialRegression) {
+    constexpr int32_t kParts = 2;
+    int restarts = 0;
+    for (uint32_t seed = 1; seed <= 40; ++seed) {
+        SCOPED_TRACE("seed " + std::to_string(seed));
+        std::mt19937 rng(seed);
+        Rig r;
+        r.initOk(77, 0);
+        struct Broker { bool known = false; int32_t next = 0; int64_t off = 0; std::vector<uint8_t> log; };
+        std::array<Broker, kParts> br{};
+        std::array<std::vector<uint8_t>, kParts> sent{};
+        std::vector<Token> tokens;
+        uint8_t tag = 1;
+        // The broker processes the oldest unanswered frame of partition p (in wire order).  Returns false if none.
+        auto process = [&](int32_t p) -> bool {
+            for (std::size_t i = 0; i < r.wire.size(); ++i) {
+                WireBatch& w = r.wire[i];
+                if (w.acked || w.partition != p) continue;
+                Broker& b = br[static_cast<std::size_t>(p)];
+                EXPECT_EQ(w.epoch, 0) << "an epoch bump";
+                EXPECT_EQ(w.pid, 77);
+                EXPECT_TRUE(w.crcOk);
+                if (!b.known && w.baseSeq != 0) {
+                    ++restarts;
+                    answerWire(r, i, kUnknownPid, 0, /*logStart=*/b.off + 1000);
+                } else if (!b.known || w.baseSeq == b.next) {
+                    b.known = true;
+                    b.next  = w.baseSeq + static_cast<int32_t>(w.tags.size());
+                    const int64_t base = b.off;
+                    b.off += static_cast<int64_t>(w.tags.size());
+                    b.log.insert(b.log.end(), w.tags.begin(), w.tags.end());
+                    answerWire(r, i, 0, base);
+                } else {
+                    ADD_FAILURE() << "partition " << p << ": batch at " << w.baseSeq << ", broker expects " << b.next;
+                    answerWire(r, i, kOosCode);
+                }
+                return true;
+            }
+            return false;
+        };
+        for (int txn = 0; txn < 3 && !::testing::Test::HasFailure(); ++txn) {
+            for (auto& b : br) if (rng() % 2 == 0) b.known = false;   // retention between transactions
+            r.begin();
+            bool addAnswered = false;
+            const int steps = 6 + static_cast<int>(rng() % 10);
+            for (int s = 0; s < steps; ++s) {
+                const uint32_t act = rng() % 3;
+                if (act == 0 || tokens.empty()) {
+                    const int32_t p = static_cast<int32_t>(rng() % kParts);
+                    const Token   t = 1000 + tag;
+                    if (r.sendAck(p, tag, t) == SendResult::Ok) {
+                        sent[static_cast<std::size_t>(p)].push_back(tag);
+                        tokens.push_back(t);
+                        ++tag;
+                    }
+                } else {
+                    if (!addAnswered && r.pendingAdd() != nullptr) { r.answerAdd(0); addAnswered = true; }
+                    (void)process(static_cast<int32_t>(rng() % kParts));
+                }
+                r.tick();
+                if (addAnswered && r.pendingAdd() != nullptr) r.answerAdd(0);   // a partition joining later
+            }
+            Op commit = r.commit();
+            for (int i = 0; i < 400 && !commit.ready(); ++i) {
+                if (r.pendingAdd() != nullptr) r.answerAdd(0);
+                bool any = false;
+                for (int32_t p = 0; p < kParts; ++p) any = process(p) || any;
+                r.tick();
+                if (!any && r.endTxns() == static_cast<std::size_t>(txn + 1) && !commit.ready()) r.endAnswer();
+            }
+            ASSERT_TRUE(commit.ready()) << "txn " << txn;
+            ASSERT_EQ(commit.status(), OpStatus::Ok) << "txn " << txn << " code " << commit.code();
+            ASSERT_EQ(r.state(), TxnState::Ready);
+        }
+        EXPECT_EQ(initsOn(r), 1u) << "no epoch bump";
+        for (int32_t p = 0; p < kParts; ++p) {
+            EXPECT_EQ(br[static_cast<std::size_t>(p)].log, sent[static_cast<std::size_t>(p)])
+                << "partition " << p << ": every record exactly once, in order";
+        }
+        for (const Token t : tokens) {
+            EXPECT_EQ(r.acks.times(t), 1) << "token " << t;
+            if (r.acks.times(t) == 1) EXPECT_EQ(r.acks.status(t), OpStatus::Ok) << "token " << t;
+        }
+    }
+    EXPECT_GT(restarts, 0) << "the seeds reached a 28";
+}
+
+// #700 x ordering: both in-flight batches are refused (45) on their first attempt, the NEWEST first.  Each is given
+// back in turn (newest, then the older one, which is then the newest): neither was appended and no sequence is left
+// used, so the abort is Plain (no InitProducerId) and the next transaction restarts at sequence 0 under the same epoch.
+// RED (mutation): txnNoteLoss_ always BumpEpoch for 44..47 (an InitProducerId at the abort).
+TEST(ProducerTxnDataRegression, BothBatchesRefusedNewestFirstAbortWithoutABumpAdversarialRegression) {
+    Rig r;
+    r.initOk(42, 0);
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 2));
+    EXPECT_EQ(r.wire[0].baseSeq, 0);
+    EXPECT_EQ(r.wire[1].baseSeq, 1);
+    r.hub.onProduceResponse(r.wire[1].corrId, -1, ec(rpc::ErrorCode::NotAuthorized));
+    r.wire[1].acked = true;
+    r.hub.onProduceResponse(r.wire[0].corrId, -1, ec(rpc::ErrorCode::NotAuthorized));
+    r.wire[0].acked = true;
+    ASSERT_EQ(r.state(), TxnState::AbortableError);
+    Op abort = r.abort();
+    r.ticks(3);
+    ASSERT_EQ(r.endTxns(), 1u);
+    EXPECT_EQ(r.lastEnd()->commit, uint8_t{0});
+    r.endAnswer();
+    r.ticks(3);
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::Ok);
+    EXPECT_EQ(initsOn(r), 1u) << "nothing appended, nothing used: no epoch bump";
+    r.begin();
+    ASSERT_EQ(r.send(0, 9), SendResult::Ok);
+    r.tick();
+    r.answerAdd(0);
+    r.tick();
+    ASSERT_EQ(r.wire.size(), 3u);
+    EXPECT_EQ(r.wire[2].baseSeq, 0) << "both sequences given back";
+    EXPECT_EQ(r.wire[2].epoch, 0);
+}
+
+// #700 x ordering, the other way: the OLDER batch is refused first (its sequence stays used behind the newer one in
+// flight: BumpEpoch), then the newer is refused too and given back.  The sticky BumpEpoch is never downgraded by the
+// later Plain loss: the abort bumps the epoch, and the next transaction restarts at 0 under epoch 1.
+// RED (mutation): poison_ letting a later Plain overwrite BumpEpoch (no InitProducerId at the abort).
+TEST(ProducerTxnDataRegression, OlderRefusedFirstThenNewerKeepsTheEpochBumpAdversarialRegression) {
+    Rig r;
+    r.initOk(42, 0);
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 2));
+    r.hub.onProduceResponse(r.wire[0].corrId, -1, ec(rpc::ErrorCode::NotAuthorized));
+    r.wire[0].acked = true;
+    r.hub.onProduceResponse(r.wire[1].corrId, -1, ec(rpc::ErrorCode::NotAuthorized));
+    r.wire[1].acked = true;
+    ASSERT_EQ(r.state(), TxnState::AbortableError);
+    Op abort = r.abort();
+    r.ticks(3);
+    ASSERT_EQ(r.endTxns(), 1u);
+    r.endAnswer();
+    r.ticks(3);
+    ASSERT_EQ(initsOn(r), 2u) << "the older batch's sequence was used behind a newer one: the abort bumps";
+    EXPECT_FALSE(abort.ready());
+    r.answer(Rig::initAnswer(r.last(rpc::InitProducerId::TEMPLATE_ID)->corrId, 42, 1));
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::Ok);
+    r.begin();
+    ASSERT_EQ(r.send(0, 9), SendResult::Ok);
+    r.tick();
+    r.answerAdd(0);
+    r.tick();
+    ASSERT_EQ(r.wire.size(), 3u);
+    EXPECT_EQ(r.wire[2].baseSeq, 0);
+    EXPECT_EQ(r.wire[2].epoch, 1);
+}
+
+// #700 x mixed: the NEWER batch is refused first (given back: Plain), then the older is acked (appended).  No sequence
+// is left used past the appended one, so the abort is Plain, and the next transaction continues at sequence 1 under
+// the same epoch (the broker's next expected sequence after the appended batch).
+// RED (mutation): txnNoteLoss_ always BumpEpoch for 44..47 (an InitProducerId at the abort, epoch 1 at sequence 0).
+TEST(ProducerTxnDataRegression, NewerRefusedThenOlderAckedAbortsPlainAndContinuesTheSequenceAdversarialRegression) {
+    Rig r;
+    r.initOk(42, 0);
+    ASSERT_NO_FATAL_FAILURE(sendBatches(r, 2));
+    r.hub.onProduceResponse(r.wire[1].corrId, -1, ec(rpc::ErrorCode::NotAuthorized));
+    r.wire[1].acked = true;
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 0, 0, 100));
+    ASSERT_EQ(r.state(), TxnState::AbortableError);
+    Op abort = r.abort();
+    r.ticks(3);
+    ASSERT_EQ(r.endTxns(), 1u);
+    r.endAnswer();
+    r.ticks(3);
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::Ok);
+    EXPECT_EQ(initsOn(r), 1u);
+    r.begin();
+    ASSERT_EQ(r.send(0, 9), SendResult::Ok);
+    r.tick();
+    r.answerAdd(0);
+    r.tick();
+    ASSERT_EQ(r.wire.size(), 3u);
+    EXPECT_EQ(r.wire[2].baseSeq, 1) << "continues after the appended batch";
+    EXPECT_EQ(r.wire[2].epoch, 0);
+}
+
+// #698 x the omitted partition is not always partition 0: two partitions asked in one AddPartitionsToTxn, the answer
+// names only partition 1 (Ok).  Partition 1 is Added; partition 0 fails InvalidRequest (39) and never produces; the
+// transaction is abortable with 39 (Plain: nothing was produced, so the abort sends no InitProducerId).
+// RED (mutation): the #698 hunk reverted (the unnamed partition takes the request-level code 0: both Added, no poison).
+TEST(ProducerTxnDataRegression, AnAddPartitionsAnswerNamingOnlyTheSecondPartitionFailsTheFirstAdversarialRegression) {
+    Rig r;
+    r.initOk(42, 0);
+    r.begin();
+    ASSERT_EQ(r.sendAck(0, 1, 901), SendResult::Ok);
+    ASSERT_EQ(r.sendAck(1, 2, 902), SendResult::Ok);
+    r.ticks(2);
+    const OfferedFrame* add = r.pendingAdd();
+    ASSERT_NE(add, nullptr);
+    ASSERT_EQ(Rig::named(*add).size(), 2u) << "both partitions in one request";
+    const std::array<rpc::TxnPartitionResult, 1> only1{{{kTopic, 1, 0}}};
+    r.answeredAdds.push_back(add->corrId);
+    r.answer(FakeCoordinator::answerNaming(add->corrId, 0, only1));
+    r.ticks(3);
+    EXPECT_TRUE(std::holds_alternative<rp::Added>(r.membership(1))) << "the named partition is Added";
+    ASSERT_TRUE(std::holds_alternative<rp::AddFailed>(r.membership(0))) << "the omitted partition failed";
+    for (const auto& w : r.wire) EXPECT_NE(w.partition, 0) << "the omitted partition never produces";
+    ASSERT_EQ(r.state(), TxnState::AbortableError);
+    EXPECT_EQ(r.acks.times(901), 1);
+    EXPECT_EQ(r.acks.status(901), OpStatus::BrokerError);
+    Op commit = r.commit();
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::BrokerError);
+    EXPECT_EQ(commit.code(), uec(rpc::ErrorCode::InvalidRequest));
+    Op abort = r.abort();
+    r.ticks(3);
+    if (!abort.ready() && r.endTxns() > 0) r.endAnswer();
+    r.ticks(3);
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::Ok);
+    EXPECT_EQ(initsOn(r), 1u) << "nothing produced: no epoch bump";
+    EXPECT_EQ(r.state(), TxnState::Ready);
+}
+
+// #698 x input bounds (0): a parsed AddPartitionsToTxn answer with NO results (worst code 0) said Ok for nothing: every
+// requested partition fails 39 and nothing is produced; the abort completes Ok.
+// RED (mutation): the #698 hunk reverted (both partitions inherit the request-level 0 and produce).
+TEST(ProducerTxnDataRegression, AnAddPartitionsAnswerWithNoResultsFailsEveryPartitionAdversarialRegression) {
+    Rig r;
+    r.initOk(42, 0);
+    r.begin();
+    ASSERT_EQ(r.sendAck(0, 1, 911), SendResult::Ok);
+    ASSERT_EQ(r.sendAck(1, 2, 912), SendResult::Ok);
+    r.ticks(2);
+    const OfferedFrame* add = r.pendingAdd();
+    ASSERT_NE(add, nullptr);
+    r.answeredAdds.push_back(add->corrId);
+    r.answer(FakeCoordinator::answerNaming(add->corrId, 0, std::span<const rpc::TxnPartitionResult>{}));
+    r.ticks(3);
+    EXPECT_TRUE(r.wire.empty()) << "nothing produced";
+    EXPECT_TRUE(std::holds_alternative<rp::AddFailed>(r.membership(0)));
+    EXPECT_TRUE(std::holds_alternative<rp::AddFailed>(r.membership(1)));
+    ASSERT_EQ(r.state(), TxnState::AbortableError);
+    Op commit = r.commit();
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.code(), uec(rpc::ErrorCode::InvalidRequest));
+    Op abort = r.abort();
+    r.ticks(3);
+    if (!abort.ready() && r.endTxns() > 0) r.endAnswer();
+    r.ticks(3);
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::Ok);
+    EXPECT_EQ(r.acks.times(911), 1);
+    EXPECT_EQ(r.acks.times(912), 1);
+}
+
+// #698 x extra results: the answer names the requested partition (Ok) plus results never asked for - the same
+// partition number under another topic, and another partition of the topic - each with a non-fatal error
+// (InvalidTxnState 19).  An unrequested result changes nothing for the requested partition: it is Added, its record
+// produced, the transaction commits Ok.
+// RED (mutation): matching a result by partition only (ignoring topicId) - the other topic's 19 fails partition 0.
+TEST(ProducerTxnDataRegression, AnAddPartitionsAnswerWithUnrequestedResultsLeavesTheRequestedOneAddedAdversarialRegression) {
+    Rig r;
+    r.initOk(42, 0);
+    r.begin();
+    ASSERT_EQ(r.sendAck(0, 1, 921), SendResult::Ok);
+    r.ticks(2);
+    const OfferedFrame* add = r.pendingAdd();
+    ASSERT_NE(add, nullptr);
+    const std::array<rpc::TxnPartitionResult, 3> res{{{kTopic + 1, 0, ec(rpc::ErrorCode::InvalidTxnState)},
+                                                      {kTopic, 0, 0},
+                                                      {kTopic, 7, ec(rpc::ErrorCode::InvalidTxnState)}}};
+    test_support::AnswerFrame a;
+    rpc::AddPartitionsToTxnResponse m;
+    m.correlationId = add->corrId;
+    a.len        = m.encode(a.buf.data(), std::span<const rpc::TxnPartitionResult>(res.data(), res.size()));
+    a.templateId = rpc::AddPartitionsToTxnResponse::TEMPLATE_ID;
+    r.answeredAdds.push_back(add->corrId);
+    r.answer(a);
+    r.ticks(2);
+    EXPECT_TRUE(std::holds_alternative<rp::Added>(r.membership(0)));
+    ASSERT_EQ(r.state(), TxnState::InTransaction) << "an unrequested result poisons nothing";
+    ASSERT_EQ(r.wire.size(), 1u);
+    r.ackAll();
+    Op commit = r.commit();
+    r.ticks(2);
+    ASSERT_EQ(r.endTxns(), 1u);
+    r.endAnswer();
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+    EXPECT_EQ(r.acks.times(921), 1);
+    EXPECT_EQ(r.acks.status(921), OpStatus::Ok);
+}
