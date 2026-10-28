@@ -71,6 +71,8 @@ namespace rune::client {
 // Forward-declare the implementation class (PIMPL — impl lives in Producer.cpp).
 namespace producer { class ProducerImpl; }
 class Completions;
+class ProducerRef;
+class Client;
 struct CompletionTarget;
 
 // ---------------------------------------------------------------------------
@@ -361,6 +363,10 @@ enum class SendResult : uint8_t {
 // A claim must not outlive its Producer.  Zero allocation.
 // ---------------------------------------------------------------------------
 namespace detail {
+/// Debug check of a ProducerRef (ProducerRef.h): the handle of `impl` was destroyed while the duty side still holds
+/// it.  false for nullptr (a moved-from Producer answers like any such Producer).
+[[nodiscard]] bool producerImplDetached(const producer::ProducerImpl* impl) noexcept;
+
 /// The state of an OPEN claim — exactly what settling it needs.
 struct ClaimOpen {
     producer::ProducerImpl* impl  = nullptr;
@@ -565,6 +571,9 @@ public:
 
     /// The handle owns no producer (moved-from).
     [[nodiscard]] bool valid() const noexcept { return impl_ != nullptr; }
+    /// This producer was created by `client` (Client::producer()).  False for a moved-from handle and for a producer
+    /// of another Client.
+    [[nodiscard]] bool ownedBy(const Client& client) const noexcept;
 
     // ---- Max value size (named constant) ------------------------------------
 
@@ -833,6 +842,12 @@ public:
     // lifecycle.  On a plain producer every token form returns
     // OpResult::InvalidArgument (no completion) and every *AndWait /
     // beginTransaction() throws std::logic_error("<op>: producer has no transactionalId").
+    // UnknownProducerId (28) inside a transaction (the broker forgot the producer id: retention removed every
+    // record of ours, then a failover) ABORTS the transaction: the commit completes BrokerError(28) and the app aborts
+    // and redoes it.  A transactional epoch belongs to the coordinator, so the sequences are never restarted
+    // client-side; the abort bumps the epoch (InitProducerId) and the NEXT transaction runs under epoch+1 from
+    // sequence 0.  (KIP-360 - the coordinator bumping the epoch while KEEPING the transaction - needs broker work and
+    // stays an open enhancement.)
     // A transactional producer outside a transaction refuses every produce path
     // with SendResult::NotInTransaction (send / sendTo / blocking claim helpers
     // throw std::logic_error("produce outside a transaction")).
@@ -855,8 +870,11 @@ public:
     /// machine in AbortableError (pinned by BeginBeforeThePreviousEndCompletesIsRefusedRegression).
     void     beginTransaction();
     /// One sendOffsetsToTransaction runs at a time: a call made while another is still running completes
-    /// BrokerError(19, InvalidTxnState) at once (no queueing, the transaction is not poisoned) - wait for the first
-    /// completion before issuing the next.  At most 1024 offsets and a 1..255-byte group id: otherwise the call is
+    /// InvalidArgument at once with the text "a sendOffsetsToTransaction is already in flight on this producer; wait
+    /// for its completion" (no queueing; the first call completes normally and the transaction is NOT poisoned) - wait
+    /// for the first completion before issuing the next.  An EMPTY offsets list completes Ok locally with no wire
+    /// traffic and does not open the transaction on the coordinator (a commit with nothing else in the transaction
+    /// then sends no EndTxn).  At most 1024 offsets and a 1..255-byte group id: otherwise the call is
     /// accepted and COMPLETES InvalidArgument.  Only a ring too small to ever carry the message (a tiny producer
     /// ring) is a synchronous OpResult::InvalidArgument with no completion.
     OpResult sendOffsetsToTransaction(std::span<const OffsetEntry> offsets, std::string_view groupId,
@@ -871,9 +889,15 @@ public:
     /// than kMaxGroupMemberIdBytes completes InvalidArgument.  Otherwise exactly the groupId form.
     OpResult sendOffsetsToTransaction(std::span<const OffsetEntry> offsets, const GroupMetadata& group,
                                       const CompletionTarget& target, Token token);
+    /// Calls that arrive while a commit (abort) is already pending JOIN it: one EndTxn, every call completes with its
+    /// result.  At most 4 joiners (kMaxTxnJoiners) per pending op: a further call completes InvalidArgument with the
+    /// text "too many concurrent commitTransaction waiters (max 4)" ("... abortTransaction waiters ...").  It is a
+    /// capacity refusal, not a state error (BrokerError 19 stays "no transaction to commit / abort").
     OpResult commitTransaction(const CompletionTarget& target, Token token);
     OpResult abortTransaction(const CompletionTarget& target, Token token);
-    /// Token form of flush(); the existing void flush() stays.
+    /// Token form of flush(); the existing void flush() stays.  At most 8 flush calls pending at once
+    /// (kMaxTxnFlushCalls): a further one completes InvalidArgument with the text "too many concurrent flush calls
+    /// (max 8)".
     OpResult flush(const CompletionTarget& target, Token token);
 
     static constexpr std::chrono::nanoseconds kDefaultTxnWait = std::chrono::seconds(60);
@@ -892,7 +916,7 @@ public:
     /// (TxnState::Uninitialized / -1 / -1 / false) and touch nothing.  They report the latest status the duty
     /// side published, so after issuing an op a Thread-mode caller sees the change once the op completed.
     [[nodiscard]] TxnState state() const noexcept;
-    [[nodiscard]] int64_t  producerId() const noexcept;  ///< -1 until assigned (or off the bound thread)
+    [[nodiscard]] int64_t  producerId() const noexcept;  ///< -1 until assigned, after FatalError (a deliberate change: a fenced producer has no id), or off the bound thread
     [[nodiscard]] int16_t  producerEpoch() const noexcept;
     [[nodiscard]] bool     transactionActive() const noexcept;
     [[nodiscard]] bool     transactional() const noexcept;
@@ -977,6 +1001,8 @@ public:
     void testSetNextSequence(TopicHandle topic, int32_t partition, int32_t seq) noexcept;
 
 private:
+    friend class ProducerRef;   // reads implForRef_() (FD7 debug check)
+    [[nodiscard]] const producer::ProducerImpl* implForRef_() const noexcept { return impl_; }
     /// Phase 2b F Task 8: issue one transaction control op (resolves and reserves the completion target).
     OpResult issueTxn_(std::uint8_t kind, const CompletionTarget& target, Token token,
                        std::span<const OffsetEntry> offsets, std::string_view groupId,

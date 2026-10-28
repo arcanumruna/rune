@@ -389,7 +389,17 @@ try {
   Outside a transaction a transactional producer refuses every produce path with `SendResult::NotInTransaction`; on a plain
   producer the lifecycle token calls return `OpResult::InvalidArgument`, and `beginTransaction()` and the `*AndWait` forms throw
   `std::logic_error` ("producer has no transactionalId"). `acks = None` is rejected.
-  The status getters (`state()`, `producerId()`, ...) work on the thread that created the producer only.
+  The status getters (`state()`, `producerId()`, `producerEpoch()`, `transactionActive()`) are bound to the producer's
+  batch thread: the thread that created the producer, or the one that last called `bindBatchThread()`. Off that thread
+  they return -1 / `TxnState::Uninitialized` / `false` and touch nothing. `producerId()` is also -1 after `FatalError`.
+- Transaction call limits (all complete `InvalidArgument`, never the state error 19): at most 4 `commitTransaction` /
+  `abortTransaction` calls join a pending one, at most 8 `flush` calls are pending, and one
+  `sendOffsetsToTransaction` runs at a time (a second completes `InvalidArgument` with "a sendOffsetsToTransaction is
+  already in flight on this producer; wait for its completion"; the first completes normally and the transaction stays
+  good). An empty offsets list completes `Ok` locally with no wire traffic.
+- `UnknownProducerId` (28) inside a transaction aborts it (the commit completes `BrokerError(28)`); the app aborts and
+  redoes the transaction, which runs under epoch+1 from sequence 0. KIP-360 (the coordinator keeping the transaction
+  across the epoch bump) is not implemented.
 - A newer producer with the same `transactionalId` fences the old one: its next operation fails and its state is
   `FatalError`.
 - `ProducerConfig::tier2Slots` (default 64) is the pool of Tier-2 batch slots; with every slot in use `batch()` returns a

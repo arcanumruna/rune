@@ -1309,19 +1309,18 @@ TEST(ProducerTxnDataRegression, SequenceCounterNeverOverflowsInt32Regression) {
     EXPECT_EQ(r.state(), TxnState::AbortableError) << "abortable with an epoch bump before the overflow";
     for (std::size_t i = before; i < r.wire.size(); ++i) EXPECT_GE(r.wire[i].baseSeq, 0) << "a wrapped sequence went out";
     // The fate of the three records (one per batch: 700 went out and was acked; 701 and 702 were held behind it):
-    // the acked one completed Ok; the two held ones are NOT dropped silently and NOT completed yet - they wait for the
-    // app's abort, which fails each exactly once with the cause of the poison (20, OutOfOrderSequence).
+    // the acked one completed Ok; the two held ones are NOT dropped silently - changed by #368: they complete at once
+    // (exactly once) with the cause of the poison (20, OutOfOrderSequence), not at the app's abort.
     EXPECT_EQ(r.acks.times(700), 1);
     EXPECT_EQ(r.acks.status(700), OpStatus::Ok);
-    EXPECT_EQ(r.acks.times(701), 0) << "held, not completed";
-    EXPECT_EQ(r.acks.times(702), 0) << "held, not completed";
-    Op abort = r.abort();
-    r.tick();
     for (const Token t : {Token{701}, Token{702}}) {
-        ASSERT_EQ(r.acks.times(t), 1) << "held record " << t << " must complete exactly once at the abort";
+        ASSERT_EQ(r.acks.times(t), 1) << "held record " << t << " must complete once, at the poison";
         EXPECT_EQ(r.acks.status(t), OpStatus::BrokerError) << t;
         EXPECT_EQ(r.acks.last.at(t).ec, uec(rpc::ErrorCode::OutOfOrderSequence)) << t;
     }
+    Op abort = r.abort();
+    r.tick();
+    for (const Token t : {Token{701}, Token{702}}) EXPECT_EQ(r.acks.times(t), 1) << "not again at the abort: " << t;
     EXPECT_EQ(r.acks.times(700), 1);
     EXPECT_EQ(r.wire.size(), before + 1) << "the held records were never sent";
     (void)abort;
@@ -1452,7 +1451,7 @@ TEST(ProducerTxnDataRegression, PartitionLeaderProducerFencedIsFatalFencedAtOnce
 // A transactional epoch belongs to the coordinator (Task 6), so the sequences cannot restart in place: the
 // transaction fails abortable with 28 and the abort's epoch bump restarts them - the NEXT transaction's records go
 // out at sequence 0 under the bumped epoch.
-TEST(ProducerTxnDataRegression, UnknownProducerIdAfterRetentionAbortsTheTxnAndTheNextOneRestartsSequencesRegression) {
+TEST(ProducerTxnDataRegression, UnknownProducerIdAfterRetentionAbortsTheTxnAndTheNextCommitsUnderANewEpochRegression) {
     Rig r;
     r.initOk(77, 0);
     ASSERT_NO_FATAL_FAILURE(committedTxnAckedAt(r, /*off=*/10));   // lastAckedOffset 10; sequences go on at 1
@@ -2066,4 +2065,127 @@ TEST(ProducerTxnDataRegression, NotCoordinatorRediscoversThenRetriesRegression) 
     r.answer(FakeCoordinator::answer(rp::ReqKind::AddPartitions, corr, 0));
     r.tick();
     EXPECT_EQ(r.wire.size(), 1u) << "the record after its AddPartitions OK";
+}
+
+// ============================================================================================================
+// Batch C15 (#346 / #368): a poisoned transaction fails what it holds unsent at once, then does no per-pass work
+// ============================================================================================================
+
+// #346 item 1: queued partitions kept txnQuiet_ false (txnStepCold_ / addStep_ ran every pass and returned 0) once the
+// transaction was no longer flowing.  The poison drops the add queue and fails the held records; the machine is quiet.
+TEST(ProducerTxnDataRegression, APoisonedTxnDoesNoPerPassWorkRegression) {
+    Rig r(Mode::Ring);
+    r.initOk();
+    r.begin();
+    ASSERT_EQ(r.send(0, 1), SendResult::Ok);
+    ASSERT_EQ(r.send(1, 2), SendResult::Ok);
+    ASSERT_EQ(r.send(2, 3), SendResult::Ok);
+    while (r.impl->drainRing(r.now, 1024) > 0) {}
+    (void)r.impl->flushBatches(r.now, 42, r.sink);   // every partition queued for AddPartitionsToTxn, none sent yet
+    ASSERT_EQ(r.impl->testTxnAddQueued(), 3u);
+    EXPECT_FALSE(r.impl->testTxnQuiet()) << "queued adds are work";
+    // A leg fails before the AddPartitionsToTxn left: the transaction can only abort.
+    r.impl->testLegAnswer(rp::ReqKind::AddOffsets, ec(rpc::ErrorCode::NotAuthorized));
+    ASSERT_EQ(r.state(), TxnState::AbortableError);
+    EXPECT_EQ(r.impl->testTxnAddQueued(), 0u) << "a poisoned transaction adds nothing";
+    r.tick();   // fails the held records (#368)
+    const std::size_t offered = r.fake.offered.size();
+    for (int i = 0; i < 100; ++i) {
+        r.tick();
+        ASSERT_TRUE(r.impl->testTxnQuiet()) << "pass " << i << ": a poisoned transaction still does per-pass work";
+    }
+    EXPECT_EQ(r.fake.offered.size(), offered) << "nothing is sent for a poisoned transaction";
+    EXPECT_TRUE(r.wire.empty());
+    // The abort still works (nothing was started on the coordinator, so it ends locally).
+    Op ab = r.abort();
+    r.ticks(3);
+    ASSERT_TRUE(ab.ready());
+    EXPECT_EQ(ab.status(), OpStatus::Ok);
+    EXPECT_EQ(r.state(), TxnState::Ready);
+    EXPECT_TRUE(r.impl->testTxnQuiet());
+}
+
+// #346 item 3: "no free coordinator slot, so the rest go in the next pass".  Every slot busy: the AddPartitionsToTxn
+// waits (the record is held, not lost); one slot freed: it goes out on the very next pass and the record follows.
+TEST(ProducerTxnDataRegression, AddPartitionsWithNoFreeSlotGoesOutNextPassRegression) {
+    Rig r(Mode::Ring);
+    r.initOk();
+    r.begin();
+    rp::CoordinatorLink* link = r.impl->coordinatorLink();
+    ASSERT_NE(link, nullptr);
+    ASSERT_EQ(link->slotCapacity(), rp::CoordinatorLink::kMaxCoordRequests);
+    std::vector<rp::CoordinatorLink::Slot*> held;
+    for (std::size_t i = 0; i < rp::CoordinatorLink::kMaxCoordRequests; ++i) {
+        held.push_back(link->acquire(rp::ReqKind::InitProducerId, int64_t{1} << 60));
+        ASSERT_NE(held.back(), nullptr);
+    }
+    ASSERT_EQ(link->acquire(rp::ReqKind::AddPartitions, int64_t{1} << 60), nullptr) << "every slot is held";
+    ASSERT_EQ(r.sendAck(0, 5, 41), SendResult::Ok);
+    r.ticks(5);
+    EXPECT_TRUE(r.adds().empty()) << "no slot: no AddPartitionsToTxn";
+    EXPECT_TRUE(r.wire.empty());
+    EXPECT_EQ(r.acks.times(41), 0) << "the record is held, not lost";
+    EXPECT_EQ(r.impl->testTxnAddQueued(), 1u) << "the partition stays queued";
+    link->release(*held[3]);   // one slot frees up
+    r.tick();
+    ASSERT_EQ(r.adds().size(), 1u) << "the AddPartitionsToTxn goes out on the next pass";
+    EXPECT_EQ(Rig::named(*r.adds()[0]), std::vector<int32_t>{0});
+    r.answerAdd(0);
+    r.tick();
+    ASSERT_EQ(r.wire.size(), 1u) << "and the record follows its OK";
+    EXPECT_EQ(r.wire[0].tags, std::vector<uint8_t>{5});
+    r.ackAll();
+    EXPECT_EQ(r.acks.times(41), 1);
+    EXPECT_EQ(r.acks.status(41), OpStatus::Ok);
+    for (std::size_t i = 0; i < held.size(); ++i) if (i != 3) link->release(*held[i]);
+    Op commit = r.commit();
+    r.tick();
+    r.endAnswer();
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+}
+
+// #368: once the transaction is AbortableError, the records it still holds UNSENT complete at once with the poison
+// status (the one a record arriving after the poison gets) - not at the abort and not at deliveryTimeoutMs.  A record
+// already on the wire waits for its answer as before.  The injected clock never advances.
+TEST(ProducerTxnDataRegression, UnsentRecordsOfAPoisonedTxnCompleteAtOnceRegression) {
+    Rig r(Mode::Ring);
+    r.initOk();
+    r.begin();
+    // Partition 3 is added and its record is on the wire.
+    ASSERT_EQ(r.sendAck(3, 9, 9), SendResult::Ok);
+    r.tick();
+    r.answerAdd(0);
+    r.tick();
+    ASSERT_EQ(r.wire.size(), 1u);
+    // Partitions 0 (a record) and 2 (a Tier-2 batch of 3) are new: their AddPartitionsToTxn fails.
+    ASSERT_EQ(r.sendAck(0, 7, 7), SendResult::Ok);
+    ASSERT_EQ(r.batch(2, 20, 3, 8), rp::RejectReason::None);
+    for (int i = 0; i < 4 && r.adds().size() < 2; ++i) r.tick();
+    ASSERT_EQ(r.adds().size(), 2u);
+    const int64_t clock = r.now;
+    r.answerAdd(ec(rpc::ErrorCode::InvalidTxnState));
+    ASSERT_EQ(r.state(), TxnState::AbortableError);
+    for (int i = 0; i < 4 && (r.acks.times(7) == 0 || r.acks.times(8) == 0); ++i) r.tick();   // a few passes, no time
+    EXPECT_EQ(r.now, clock) << "the clock did not advance";
+    ASSERT_EQ(r.acks.times(7), 1) << "the unsent record's token completes at once";
+    EXPECT_EQ(r.acks.status(7), OpStatus::BrokerError);
+    EXPECT_EQ(r.acks.last.at(7).ec, kInvalidTxnState) << "the poison status";
+    ASSERT_EQ(r.acks.times(8), 1) << "so does the unsent Tier-2 batch";
+    EXPECT_EQ(r.acks.status(8), OpStatus::BrokerError);
+    EXPECT_EQ(r.acks.times(9), 0) << "a record already on the wire waits for its answer";
+    r.ticks(3);
+    EXPECT_EQ(r.wire.size(), 1u) << "nothing unsent was produced";
+    r.ackAll();
+    EXPECT_EQ(r.acks.times(9), 1);
+    EXPECT_EQ(r.acks.status(9), OpStatus::Ok);
+    // A record sent after the poison gets the same status (the refusal the issue names), and the abort ends cleanly.
+    Op ab = r.abort();
+    r.ticks(3);
+    r.endAnswer();
+    r.ticks(2);
+    ASSERT_TRUE(ab.ready());
+    EXPECT_EQ(ab.status(), OpStatus::Ok);
+    EXPECT_EQ(r.acks.times(7), 1) << "completed once, not again at the abort";
+    EXPECT_EQ(r.acks.times(8), 1);
 }

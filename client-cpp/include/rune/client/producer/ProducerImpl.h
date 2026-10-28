@@ -1299,6 +1299,11 @@ public:
     [[nodiscard]] uint32_t coordinatorSeq() const noexcept { return coord_ ? coord_->seq() : 0; }
     [[nodiscard]] bool hasCoordinator() const noexcept { return coord_.has_value(); }
     [[nodiscard]] CoordinatorLink* coordinatorLink() noexcept { return coord_ ? &*coord_ : nullptr; }
+    /// Test hook (duty thread): the transaction step has nothing to do this pass (#346: a poisoned transaction does
+    /// no per-pass work once its unsent records are failed and its add queue is dropped).
+    [[nodiscard]] bool testTxnQuiet() const noexcept { return txnQuiet_(); }
+    /// Test hook (duty thread): partitions queued for the next AddPartitionsToTxn.
+    [[nodiscard]] std::size_t testTxnAddQueued() const noexcept { return txnAddQueue_.size(); }
     /// An answer routed here by ordinal (ProducerHub::onCoordinatorResponse).  The machines of Tasks
     /// 4-7 consume the settled slot; until then it is released here.
     void onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noexcept;
@@ -1902,7 +1907,8 @@ private:
     void restampInflight_(PartitionState& ps) noexcept;
     void publishStatus_() noexcept;
     void drainStatus_() noexcept { statusRing_.drainLatest(appStatus_); }
-    // 4096 bytes (~170 snapshots): every identity AND transaction transition publishes one (FD9).
+    // 4096 BYTES of ring (not FD9's early `StatusRing<ProducerStatus, 64>`: the capacity is in bytes), i.e. ~170
+    // snapshots: every identity AND transaction transition publishes one (FD9); only the newest matters.
     detail::StatusRing<ProducerStatus, 4096> statusRing_;
     ProducerStatus appStatus_{};   // the bound app thread's cache (it alone drains the ring)
     // Duty side: is the newest snapshot in the ring?  A refused tryPublish keeps the snapshot here and it is
@@ -1916,9 +1922,10 @@ private:
     static constexpr std::size_t kInitializingIdx = static_cast<std::size_t>(TxnState::Initializing);
     static constexpr std::size_t kCommittingIdx   = static_cast<std::size_t>(TxnState::CommittingTransaction);
     static constexpr std::size_t kAbortingIdx     = static_cast<std::size_t>(TxnState::AbortingTransaction);
+    static constexpr std::size_t kAbortableErrorIdx = static_cast<std::size_t>(TxnState::AbortableError);
     /// Pending flush(target, token) ops: a compact prefix [0, txnFlushN_) (zero allocation; one more completes
-    /// BrokerError(19)).
-    static constexpr std::size_t kMaxTxnFlushes = 8;
+    /// InvalidArgument).
+    static constexpr std::size_t kMaxTxnFlushes = kMaxTxnFlushCalls;
     TxnMachine                          txn_{Uninitialized{}};
     std::array<TxnOp, kMaxTxnFlushes>   txnFlushes_{};
     uint8_t                             txnFlushN_        = 0;
@@ -1936,7 +1943,12 @@ private:
     [[nodiscard]] bool txnQuiet_() const noexcept {
         const std::size_t i = txn_.index();
         return txnFlushN_ == 0 && i != kInitializingIdx && i != kCommittingIdx && i != kAbortingIdx &&
-               txnAddQueue_.empty() && offsetsOp_.index() == 0 && !fatalPending_;
+               txnAddQueue_.empty() && offsetsOp_.index() == 0 && !fatalPending_ && !poisonDiscardPending_();
+    }
+    /// #368: an AbortableError whose unsent records the next txnStepCold_ pass still fails.
+    [[nodiscard]] bool poisonDiscardPending_() const noexcept {
+        if (txn_.index() != kAbortableErrorIdx) return false;
+        return std::get<AbortableError>(txn_).discard == PoisonDiscard::Pending;
     }
     // ---- Phase 2b F Task 7: sendOffsetsToTransaction (ProducerTxn.cpp; duty thread only) ----
     /// The copy of the call's offsets + group id the op runs from (the caller's span / the Thread-mode ring payload
@@ -1999,6 +2011,10 @@ private:
     /// Abort (AwaitData): every record of the producer not yet sent completes `o`, never produced; an
     /// AddPartitionsToTxn still on the link is cancelled.  True when anything was discarded / cancelled.
     bool txnDiscardUnsent_(const TxnOutcome& o) noexcept;
+    /// Every record of the producer not yet sent (deferred, builders, Tier-2) completes `o`, never produced.  True when
+    /// any was dropped.  The abort's discard (above) and the poison's (#368: txnStepCold_, the pass after the
+    /// transaction became AbortableError) share it.
+    bool txnFailUnsentRecords_(const TxnOutcome& o) noexcept;
     /// FD2 duty re-check, Ring mode: reads up to `limit` ring messages and refuses each record (never produced).
     /// Stops (lastDrainStop_ Blocked, the message left in the ring) at any message that is not a record / flush.
     [[gnu::cold, gnu::noinline]] int refuseRingTxn_(int limit) noexcept;
@@ -2090,15 +2106,6 @@ private:
     };
     // Phase 2b F Task 5: close() of a transactional producer with a transaction open (or an op running) ends it
     // first - its own EndTxn(abort), or the running commit / abort / init - then drains as LifeDraining.
-    struct CloseAbortNone {};
-    struct CloseAbortRunning {};
-    struct CloseAbortDone { OpStatus status = OpStatus::Ok; uint16_t errorCode = 0; };
-    struct LifeEndingTxn {
-        detail::OpTarget target{};
-        Token            token      = 0;
-        int64_t          deadlineNs = 0;   ///< transactionOpTimeoutMs
-        std::variant<CloseAbortNone, CloseAbortRunning, CloseAbortDone> own{};
-    };
     std::variant<LifeOpen, LifeDraining, LifeClosed, LifeDiscarding, LifeEndingTxn> life_{};
     [[nodiscard]] bool endingTxn_() const noexcept { return std::holds_alternative<LifeEndingTxn>(life_); }
     // Duty side: the intake is closed and the duty side knows it (Draining /
@@ -2265,6 +2272,7 @@ static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::InTransaction), TxnMachine>, InTransaction>);
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::CommittingTransaction), TxnMachine>, Committing>);
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::AbortingTransaction), TxnMachine>, Aborting>);
+static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::AbortableError), TxnMachine>, AbortableError>);
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::AbortableError), TxnMachine>, AbortableError>);
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::FatalError), TxnMachine>, FatalError>);
 

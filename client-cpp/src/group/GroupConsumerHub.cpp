@@ -661,6 +661,9 @@ int GroupConsumerHub::retryPendingLeaves(int64_t currentSessionId) {
 }
 
 static_assert(GroupConsumerHub::kGroupCtlCorrTag == producer::coordcorr::kGroupCtlTag);
+// #340: TxnTypes.h keeps its own copies of the fetch tags (the include graph forbids the reverse); they must not drift.
+static_assert(GroupConsumerHub::kFetchCorrTag == producer::coordcorr::kFetchTag);
+static_assert(GroupConsumerHub::kOffsetFetchCorrTag == producer::coordcorr::kOffsetFetchTag);
 
 // #431: tag | ctlId << 32 | seq.  The sequence skips 0 on wrap.
 /*static*/

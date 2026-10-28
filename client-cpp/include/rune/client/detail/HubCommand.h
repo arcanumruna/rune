@@ -104,7 +104,8 @@ struct HubCommand {
     int64_t  a      = 0;
     int64_t  b      = 0;
     int64_t  c      = 0;  ///< F8c C4: second completion-target word
-    int64_t  d      = 0;  ///< F8c C5: op payload (a heap holder for txn sends / offsets)
+    int64_t  d      = 0;  ///< F8c C5: op payload word.  Serialised only: it travels the ring as a plain 64-bit word
+                          ///< (AgentRingMessages.h encode / decode) - never a pointer or heap holder (#353).
     int64_t  e      = 0;  ///< Phase 2b F (Task 10): second payload word (GroupSeek's partition)
 };
 

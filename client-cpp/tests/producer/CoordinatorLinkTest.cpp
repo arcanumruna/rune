@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <vector>
 
@@ -37,15 +38,15 @@ constexpr int64_t kFar          = int64_t{1} << 60;
 
 /// Encode a request of `kind` into the slot (the link never looks past the 24-byte header).
 void encode(CoordinatorLink::Slot& s) {
-    if (s.kind == ReqKind::EndTxn) {
+    if (s.kind() == ReqKind::EndTxn) {
         rpc::EndTxn m;
         m.correlationId = s.corrId;
         m.commit        = 1;
-        s.frameLen = static_cast<uint16_t>(m.encode(s.frame.data()));
+        s.setFrameLen(static_cast<uint16_t>(m.encode(s.frame.data())));
     } else {
         rpc::InitProducerId m;
         m.correlationId = s.corrId;
-        s.frameLen = static_cast<uint16_t>(m.encode(s.frame.data()));
+        s.setFrameLen(static_cast<uint16_t>(m.encode(s.frame.data())));
     }
 }
 
@@ -368,7 +369,7 @@ TEST(CoordinatorLink, NonRetriableAnswersAreHandedBackAndLateOnesIgnored) {
     const auto r = FakeCoordinator::answer(ReqKind::EndTxn, t->corrId, kConcurrent);
     EXPECT_EQ(link.onAnswer(asAnswer(r, ReqKind::EndTxn, t->corrId, kConcurrent), 6), nullptr);
     EXPECT_EQ(link.onAnswer(asAnswer(r, ReqKind::EndTxn, t->corrId, kConcurrent), 7), nullptr);
-    EXPECT_EQ(t->attempt, 1u);
+    EXPECT_EQ(t->attempt(), 1u);
 }
 
 // ---------------------------------------------------------------------------
@@ -659,4 +660,60 @@ TEST(CoordinatorLinkRegression, ARefusedRediscoveryIsAskedAgainOnTheNextPumpRegr
     EXPECT_EQ(fake.rediscovers, 1) << "once submitted, never again this generation";
     link.onCoordinatorMoved();
     ASSERT_EQ(pumpNoExpiry(link, 3 + CoordinatorLink::backoffNs(1)), 2) << "both re-send after the move (and backoff)";
+}
+
+// #340: the txn copies of the group fetch tags are asserted against GroupConsumerHub's constants where both headers
+// are visible, and the tag spaces are disjoint as BIT SETS and as classifiers, not merely `!=`.
+TEST(CoordinatorLinkRegression, CoordinatorCorrTagsNeverCollideWithGroupTagsRegression) {
+    using Hub = rc::group::GroupConsumerHub;
+    static_assert(rp::coordcorr::kFetchTag == Hub::kFetchCorrTag);
+    static_assert(rp::coordcorr::kOffsetFetchTag == Hub::kOffsetFetchCorrTag);
+    static_assert(rp::coordcorr::kGroupCtlTag == Hub::kGroupCtlCorrTag);
+    // Every tag is one bit and no two share one.
+    constexpr int64_t kTags[] = {rp::coordcorr::kTag, Hub::kFetchCorrTag, Hub::kOffsetFetchCorrTag,
+                                 Hub::kGroupCtlCorrTag, rp::batchcorr::kTag, rp::coordcorr::kClientCounterTag};
+    for (std::size_t i = 0; i < std::size(kTags); ++i) {
+        EXPECT_EQ(kTags[i] & (kTags[i] - 1), 0) << "tag " << i << " is a single bit";
+        for (std::size_t j = i + 1; j < std::size(kTags); ++j) EXPECT_EQ(kTags[i] & kTags[j], 0) << i << " vs " << j;
+    }
+    // Over the whole coordinator payload shape, no other space's classifier claims a coordinator id, and no other
+    // space's id is a coordinator id.
+    for (uint32_t ord : {0u, 1u, 4095u}) {
+        for (uint8_t slot : {uint8_t{0}, uint8_t{7}}) {
+            const int64_t id = rp::coordcorr::make(ord, slot, 0xFFFFFFFFu);
+            EXPECT_FALSE(Hub::isFetchCorrId(id));
+            EXPECT_FALSE(Hub::isGroupCtlCorrId(id));
+            EXPECT_EQ(id & Hub::kOffsetFetchCorrTag, 0);
+            EXPECT_FALSE(rp::batchcorr::isBatch(id));
+        }
+    }
+    for (const int64_t tag : {Hub::kFetchCorrTag, Hub::kOffsetFetchCorrTag, Hub::kGroupCtlCorrTag}) {
+        EXPECT_FALSE(rp::coordcorr::isCoord(tag | 12345));
+    }
+}
+
+// #340 item 4: a plain producer's only coordinator request is its InitProducerId, so its link holds ONE slot; a
+// transactional producer holds the full pool.  Slots are allocated with the link, never grown.
+TEST(CoordinatorLinkRegression, ANonTransactionalProducerHoldsOnlyTheSlotsItCanUseRegression) {
+    FakeCoordinator fake;
+    rp::ProducerHub hub;
+    hub.setCoordinatorSink(fake.sink());
+    rp::ProducerImpl plain(plainCfg(), 1 << 16);
+    hub.add(&plain);
+    rc::ProducerConfig tc = plainCfg();
+    tc.transactionalId = "t-1";
+    rp::ProducerImpl txn(tc, 1 << 16);
+    hub.add(&txn);
+    ASSERT_TRUE(plain.hasCoordinator());
+    ASSERT_TRUE(txn.hasCoordinator());
+    EXPECT_EQ(plain.coordinatorLink()->slotCapacity(), 1u);
+    EXPECT_EQ(txn.coordinatorLink()->slotCapacity(), CoordinatorLink::kMaxCoordRequests);
+    // The one slot works end to end (the plain producer's InitProducerId), a second acquire is refused.
+    CoordinatorLink::Slot* a = send(*plain.coordinatorLink(), ReqKind::InitProducerId);
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(plain.coordinatorLink()->acquire(ReqKind::InitProducerId, kFar), nullptr);
+    // A link built directly with a capacity honours it and clamps nonsense.
+    EXPECT_EQ(CoordinatorLink(0, fake.sink(), 0, 3).slotCapacity(), 3u);
+    EXPECT_EQ(CoordinatorLink(0, fake.sink(), 0, 0).slotCapacity(), 1u);
+    EXPECT_EQ(CoordinatorLink(0, fake.sink(), 0, 99).slotCapacity(), CoordinatorLink::kMaxCoordRequests);
 }

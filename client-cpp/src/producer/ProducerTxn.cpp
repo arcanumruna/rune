@@ -54,10 +54,8 @@ constexpr uint16_t kProducerFenced       = static_cast<uint16_t>(rpc::ErrorCode:
 inline std::span<const uint8_t> textBytes(std::string_view t) noexcept {
     return {reinterpret_cast<const uint8_t*>(t.data()), t.size()};
 }
-/// The close's own abort carries no target (CoordinatorLink.h, TxnOp).
-inline bool internalOp(const TxnOp& op) noexcept {
-    return op.target.handler.fn == nullptr && op.target.cqRef == kNoCqRef;
-}
+/// The close's own abort (TxnOpOrigin::Internal, CoordinatorLink.h): its outcome is the close's.
+inline bool internalOp(const TxnOp& op) noexcept { return op.origin == TxnOpOrigin::Internal; }
 inline OpKind opKindOf(TxnControl::Kind k) noexcept {
     switch (k) {
     case TxnControl::Kind::Init:        return OpKind::InitTransactions;
@@ -146,6 +144,9 @@ void ProducerImpl::refuseTxn_(const TxnControl& c, OpStatus st, uint16_t errorCo
 // Phase 2b F Task 8: the handle side - kMsgTxnControl on the producer ring (FD1), the gate (FD2)
 // ---------------------------------------------------------------------------------------------------------------
 
+// The cap texts above and in Producer.h name these numbers.
+static_assert(kMaxTxnJoiners == 4 && kMaxTxnFlushCalls == 8, "update the cap texts (applyTxnControl, Producer.h)");
+
 static_assert(sizeof(OffsetEntry) == 16 && alignof(OffsetEntry) <= 8 && std::is_trivially_copyable_v<OffsetEntry>,
               "kMsgTxnControl carries OffsetEntry as 16 raw bytes (topicId i32, partition i32, offset i64)");
 
@@ -157,8 +158,9 @@ inline int64_t  getI64(const uint8_t* p) noexcept { int64_t v; std::memcpy(&v, p
 inline std::size_t align8(std::size_t n) noexcept { return (n + 7u) & ~std::size_t{7}; }
 }  // namespace
 
-OpResult ProducerImpl::writeTxnControl_(const TxnControl& c, bool overCap) noexcept {
-    alignas(8) uint8_t buf[kTxnCtlMaxBytes];   // stack only: a control op allocates nothing
+namespace {
+/// The fixed kTxnCtlHeaderBytes header of a kMsgTxnControl message (every kind).
+void encodeTxnCtlHeader(uint8_t* buf, const TxnControl& c) noexcept {
     std::memset(buf, 0, kTxnCtlHeaderBytes);
     buf[0] = static_cast<uint8_t>(c.kind);
     putU32(buf + 4, static_cast<uint32_t>(c.groupId.size()));
@@ -170,17 +172,31 @@ OpResult ProducerImpl::writeTxnControl_(const TxnControl& c, bool overCap) noexc
     putU32(buf + 32, static_cast<uint32_t>(c.offsets.size()));
     putU32(buf + 36, static_cast<uint32_t>(c.generationId));   // #125
     putU32(buf + 40, static_cast<uint32_t>(c.memberId.size()));
-    std::size_t len = kTxnCtlHeaderBytes;
-    if (c.kind == TxnControl::Kind::SendOffsets && !overCap) {
-        std::memcpy(buf + len, c.groupId.data(), c.groupId.size());
-        const std::size_t mat = align8(len + c.groupId.size());
-        std::memset(buf + len + c.groupId.size(), 0, mat - (len + c.groupId.size()));
-        if (!c.memberId.empty()) std::memcpy(buf + mat, c.memberId.data(), c.memberId.size());
-        const std::size_t at = align8(mat + c.memberId.size());
-        std::memset(buf + mat + c.memberId.size(), 0, at - (mat + c.memberId.size()));
-        if (!c.offsets.empty()) std::memcpy(buf + at, c.offsets.data(), c.offsets.size() * sizeof(OffsetEntry));
-        len = at + c.offsets.size() * sizeof(OffsetEntry);
+}
+}  // namespace
+
+OpResult ProducerImpl::writeTxnControl_(const TxnControl& c, bool overCap) noexcept {
+    // #349: only a SendOffsets that fits its caps carries a body (group id, member id, offsets) and needs the large
+    // stack frame; every other op (Commit, Abort, Flush, Init, Begin - and an over-cap SendOffsets, refused on the duty
+    // side) is the header alone, a small buffer.  Stack only: a control op allocates nothing.
+    if (c.kind != TxnControl::Kind::SendOffsets || overCap) {
+        alignas(8) uint8_t hdr[kTxnCtlHeaderBytes];
+        encodeTxnCtlHeader(hdr, c);
+        if (kTxnCtlHeaderBytes > static_cast<std::size_t>(ring_.maxMsgLength())) return OpResult::InvalidArgument;   // a tiny ring
+        if (writeToRing(kMsgTxnControl, hdr, kTxnCtlHeaderBytes)) return OpResult::Accepted;
+        return closed_() ? OpResult::Closed : OpResult::BackPressured;
     }
+    alignas(8) uint8_t buf[kTxnCtlMaxBytes];
+    encodeTxnCtlHeader(buf, c);
+    std::size_t len = kTxnCtlHeaderBytes;
+    std::memcpy(buf + len, c.groupId.data(), c.groupId.size());
+    const std::size_t mat = align8(len + c.groupId.size());
+    std::memset(buf + len + c.groupId.size(), 0, mat - (len + c.groupId.size()));
+    if (!c.memberId.empty()) std::memcpy(buf + mat, c.memberId.data(), c.memberId.size());
+    const std::size_t at = align8(mat + c.memberId.size());
+    std::memset(buf + mat + c.memberId.size(), 0, at - (mat + c.memberId.size()));
+    if (!c.offsets.empty()) std::memcpy(buf + at, c.offsets.data(), c.offsets.size() * sizeof(OffsetEntry));
+    len = at + c.offsets.size() * sizeof(OffsetEntry);
     if (len > static_cast<std::size_t>(ring_.maxMsgLength())) return OpResult::InvalidArgument;   // a tiny ring
     if (writeToRing(kMsgTxnControl, buf, len)) return OpResult::Accepted;
     return closed_() ? OpResult::Closed : OpResult::BackPressured;
@@ -241,7 +257,9 @@ bool ProducerImpl::decodeTxnControl_(const uint8_t* p, std::size_t len, TxnContr
     }
     const std::size_t mat = align8(kTxnCtlHeaderBytes + glen);
     const std::size_t at  = align8(mat + mlen);
-    if (len < at + static_cast<std::size_t>(ocount) * sizeof(OffsetEntry) || (reinterpret_cast<uintptr_t>(p) & 7u) != 0) {
+    // (the ring base is 8-byte aligned - asserted once at construction - and every record starts on 8 bytes, so the
+    // OffsetEntry array below is aligned too)
+    if (len < at + static_cast<std::size_t>(ocount) * sizeof(OffsetEntry)) {
         return true;   // truncated (cannot happen: the issuing side wrote it whole): refused like over-cap
     }
     out.groupId = std::string_view(reinterpret_cast<const char*>(p + kTxnCtlHeaderBytes), glen);
@@ -303,7 +321,7 @@ void ProducerImpl::applyTxnControl(const TxnControl& c, int64_t nowNs) {
 
     case TxnControl::Kind::Flush:
         if (txnFlushN_ >= txnFlushes_.size()) {
-            refuseTxn_(c, OpStatus::BrokerError, kInvalidTxnState, "flush: too many pending flushes");
+            refuseTxn_(c, OpStatus::InvalidArgument, 0, "too many concurrent flush calls (max 8)");
             return;
         }
         txnFlushes_[txnFlushN_++] = op;   // decided by txnStep (data settled / poison / deadline)
@@ -326,7 +344,7 @@ void ProducerImpl::applyTxnControl(const TxnControl& c, int64_t nowNs) {
                 return;
             }
             if (join(cm->joined, op)) return;   // m13: one EndTxn, the same completion
-            refuseTxn_(c, OpStatus::BrokerError, kInvalidTxnState, "commitTransaction: too many concurrent calls");
+            refuseTxn_(c, OpStatus::InvalidArgument, 0, "too many concurrent commitTransaction waiters (max 4)");
             return;
         }
         if (const auto* ae = std::get_if<AbortableError>(&txn_)) {
@@ -341,6 +359,7 @@ void ProducerImpl::applyTxnControl(const TxnControl& c, int64_t nowNs) {
             const TxnStarted started = it->started;
             abandonOpenClaimForClose();
             txn_ = Aborting{op, AwaitData{}, started, AbortKind::Plain, {}, TxnOutcome{}};
+            txnAddQueue_.clear();   // #346: an abort sends no AddPartitionsToTxn (the discard drops the held data)
             dutyFlushPending_ = true;
             publishStatus_();
             return;
@@ -351,6 +370,7 @@ void ProducerImpl::applyTxnControl(const TxnControl& c, int64_t nowNs) {
             const TxnOutcome failed{ae->status, ae->errorCode};   // its records complete with the poison
             abandonOpenClaimForClose();
             txn_ = Aborting{op, AwaitData{}, started, kind, {}, failed};
+            txnAddQueue_.clear();   // #346
             dutyFlushPending_ = true;
             publishStatus_();
             return;
@@ -362,7 +382,7 @@ void ProducerImpl::applyTxnControl(const TxnControl& c, int64_t nowNs) {
                 return;
             }
             if (join(ab->joined, op)) return;   // m5
-            refuseTxn_(c, OpStatus::BrokerError, kInvalidTxnState, "abortTransaction: too many concurrent calls");
+            refuseTxn_(c, OpStatus::InvalidArgument, 0, "too many concurrent abortTransaction waiters (max 4)");
             return;
         }
         // Includes Committing (Kafka: COMMITTING -> ABORTING is invalid).
@@ -403,6 +423,14 @@ int ProducerImpl::txnStepCold_(int64_t nowNs) noexcept {
     }
     retryStatus_();               // a snapshot the ring refused: re-offered (coalesced; only the newest matters)
     int work = 0;
+    if (const auto* ae = std::get_if<AbortableError>(&txn_); ae != nullptr && ae->discard == PoisonDiscard::Pending) {
+        // #368: the poison fails every record the transaction still held unsent, at once (not at the abort or at
+        // deliveryTimeoutMs).  Done before anything else is stepped: the completions may run user code.
+        const TxnOutcome o{ae->status, ae->errorCode};
+        std::get<AbortableError>(txn_).discard = PoisonDiscard::Done;
+        (void)txnFailUnsentRecords_(o);   // (a completion may change the machine: every step below re-reads it)
+        work = 1;
+    }
     if (auto* in = std::get_if<Initializing>(&txn_)) {
         if (nowNs >= in->op.deadlineNs) {
             initExpired_(/*releaseSlot=*/true);
@@ -464,7 +492,7 @@ int ProducerImpl::endStep_(int64_t nowNs) noexcept {
         m.commit          = cm != nullptr ? uint8_t{1} : uint8_t{0};
         m.transactionalId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(cfg_.transactionalId.data()),
                                                      cfg_.transactionalId.size());
-        s->frameLen = static_cast<uint16_t>(m.encode(s->frame.data()));
+        s->setFrameLen(static_cast<uint16_t>(m.encode(s->frame.data())));
         coord_->submit(*s);
         op.deadlineNs = deadline;
         phase         = EndSent{s, std::holds_alternative<ResendEnd>(phase) ? EndTry::Resend : EndTry::First};
@@ -524,6 +552,7 @@ void ProducerImpl::poison_(OpStatus st, uint16_t errorCode, AbortKind kind) noex
     // The transaction can no longer commit: AbortableError (the app must abort).
     if (const auto* it = std::get_if<InTransaction>(&txn_)) {
         txn_ = AbortableError{st, errorCode, it->started, kind};
+        txnAddQueue_.clear();   // #346: nothing is added to a poisoned transaction (the queue would only keep the passes busy)
         publishStatus_();
         return;
     }
@@ -535,6 +564,7 @@ void ProducerImpl::poison_(OpStatus st, uint16_t errorCode, AbortKind kind) noex
         const TxnOp       op     = cm->op;
         const TxnJoiners  joined = cm->joined;
         txn_ = AbortableError{st, errorCode, cm->started, kind};
+        txnAddQueue_.clear();   // #346
         publishStatus_();
         // TX-6b: never a commit marker over this data - the commit fails and the app must abort.
         if (live) {
@@ -673,11 +703,11 @@ void ProducerImpl::initExpired_(bool releaseSlot) noexcept {
 }
 
 void ProducerImpl::onTxnSlotExpired_(CoordinatorLink::Slot& s) noexcept {
-    if (s.kind == ReqKind::AddPartitions) {
+    if (s.kind() == ReqKind::AddPartitions) {
         onAddExpired_(s);
         return;
     }
-    if (s.kind == ReqKind::AddOffsets || s.kind == ReqKind::TxnOffsetCommit) {
+    if (s.kind() == ReqKind::AddOffsets || s.kind() == ReqKind::TxnOffsetCommit) {
         offsetsExpired_(&s);
         return;
     }
@@ -802,7 +832,7 @@ void ProducerImpl::onEndTxnAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& 
         const TxnJoiners joined  = commit ? cm->joined : ab->joined;
         const TxnStarted started = commit ? cm->started : ab->started;
         const AbortKind  kind    = commit ? AbortKind::Plain : ab->kind;
-        txn_ = AbortableError{OpStatus::BrokerError, ucode, started, kind};
+        txn_ = AbortableError{OpStatus::BrokerError, ucode, started, kind, PoisonDiscard::Done};   // the data settled before EndTxn
         publishStatus_();
         const OpKind k = commit ? OpKind::CommitTransaction : OpKind::AbortTransaction;
         completeTxn_(op, k, OpStatus::BrokerError, ucode, "EndTxn: InvalidRequest");
@@ -951,7 +981,7 @@ int ProducerImpl::addStep_(int64_t nowNs) noexcept {
             break;
         }
         rpc::detail::putLE16(f + countAt, 0, count);
-        s->frameLen = static_cast<uint16_t>(pos);
+        s->setFrameLen(static_cast<uint16_t>(pos));
         coord_->submit(*s);
         ++work;
     }
@@ -959,6 +989,9 @@ int ProducerImpl::addStep_(int64_t nowNs) noexcept {
     return work;
 }
 
+// Cost (#346): matching the answer's per-partition results against txnSeen_ is O(txnSeen x results). Both
+// are bounded by one AddPartitions frame (the request carries at most a frame's worth of partitions), and it
+// runs once per answer on the control plane, never per record.
 void ProducerImpl::onAddPartitionsAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& s) noexcept {
     // An ErrorResponse carrying code 0 is a protocol error: InvalidRequest (39), never a code-less success.
     const int16_t  worst  = (a.anyKind && a.errorCode == 0) ? static_cast<int16_t>(kInvalidRequest) : a.errorCode;
@@ -1041,6 +1074,34 @@ void ProducerImpl::txnResetMembership_() noexcept {
     txnAddQueue_.clear();
 }
 
+bool ProducerImpl::txnFailUnsentRecords_(const TxnOutcome& o) noexcept {
+    const DutyScope duty(*this);   // sends from the completions below are deferred (Direct)
+    // The ring holds nothing of this transaction: records ahead of the abort / poison were drained before it applied
+    // (FD1), later ones are refused by the drain (the machine is not InTransaction).
+    bool dropped = false;
+    if (!deferred_.empty()) {
+        dropped = true;
+        failDeferred_(o.status, o.errorCode);
+    }
+    for (std::size_t i = 0; i < partitions_.size(); ++i) {
+        PartitionState& ps = *partitions_[i];
+        if (ps.builder && ps.builder->recordCount() > 0) {
+            dropped = true;
+            failBuilder_(ps, o.status, o.errorCode);
+        }
+        while (ps.hasTier2()) {
+            dropped = true;
+            const uint32_t slot = t2Pop_(ps);
+            const uint64_t h  = tier2Pool_[slot].ackHandle;
+            const int32_t  rc = tier2Pool_[slot].recordCount;
+            t2Return_(slot);
+            emitUnsentBatchAck_(ps.topicId, ps.partition, rc, o.status, 1, o.errorCode);
+            completeHandle_(h, OpKind::Tier2Batch, -1, rc, o.status, o.errorCode);
+        }
+    }
+    return dropped;
+}
+
 bool ProducerImpl::txnDiscardUnsent_(const TxnOutcome& o) noexcept {
     // An AddPartitionsToTxn still on the link is cancelled: the abort never waits for it, and the link never re-sends
     // it after EndTxn(abort) (a re-sent one could open a new transaction on the coordinator).  One that was on the
@@ -1061,32 +1122,8 @@ bool ProducerImpl::txnDiscardUnsent_(const TxnOutcome& o) noexcept {
         changed = true;
     }
     const DutyScope duty(*this);   // sends from the completions below are deferred (Direct)
-    // The ring holds nothing of this transaction: records ahead of the abort were drained before it applied (FD1),
-    // later ones are refused by the drain (the machine is not InTransaction).
-    bool dropped = false;   // a record was dropped unproduced
-    if (!deferred_.empty()) {
-        changed = true;
-        dropped = true;
-        failDeferred_(o.status, o.errorCode);
-    }
-    for (std::size_t i = 0; i < partitions_.size(); ++i) {
-        PartitionState& ps = *partitions_[i];
-        if (ps.builder && ps.builder->recordCount() > 0) {
-            changed = true;
-            dropped = true;
-            failBuilder_(ps, o.status, o.errorCode);
-        }
-        while (ps.hasTier2()) {
-            changed = true;
-            dropped = true;
-            const uint32_t slot = t2Pop_(ps);
-            const uint64_t h  = tier2Pool_[slot].ackHandle;
-            const int32_t  rc = tier2Pool_[slot].recordCount;
-            t2Return_(slot);
-            emitUnsentBatchAck_(ps.topicId, ps.partition, rc, o.status, 1, o.errorCode);
-            completeHandle_(h, OpKind::Tier2Batch, -1, rc, o.status, o.errorCode);
-        }
-    }
+    const bool dropped = txnFailUnsentRecords_(o);   // a record was dropped unproduced
+    if (dropped) changed = true;
     if (dropped && txnFlushN_ != 0) {
         // E3 / B-MEDIUM-1: a flush whose records the abort dropped (never produced) must not complete Ok - it completes
         // with the abort's outcome (the scan restarts nothing: the array is taken first, completions may run user code).
@@ -1159,15 +1196,17 @@ bool ProducerImpl::txnOpenForClose_() const noexcept {
 
 void ProducerImpl::startCloseAbort_(int64_t nowNs) noexcept {
     auto& e = std::get<LifeEndingTxn>(life_);
-    const TxnOp own{detail::OpTarget{}, 0, nowNs + txnOpTimeoutNs_()};   // empty target: the close's own abort
+    const TxnOp own{detail::OpTarget{}, 0, nowNs + txnOpTimeoutNs_(), TxnOpOrigin::Internal};   // the close's own abort
     if (const auto* it = std::get_if<InTransaction>(&txn_)) {
         const TxnStarted started = it->started;
         txn_ = Aborting{own, AwaitData{}, started, AbortKind::Plain, {}, TxnOutcome{}};
+        txnAddQueue_.clear();   // #346
     } else if (const auto* ae = std::get_if<AbortableError>(&txn_)) {
         const TxnStarted started = ae->started;
         const AbortKind  kind    = ae->kind;
         const TxnOutcome failed{ae->status, ae->errorCode};
         txn_ = Aborting{own, AwaitData{}, started, kind, {}, failed};
+        txnAddQueue_.clear();   // #346
     } else if (auto* ab = std::get_if<Aborting>(&txn_); ab != nullptr && std::holds_alternative<InDoubt>(ab->phase)) {
         ab->op    = own;   // in doubt (an abort timed out): retried once as the close's own, from the leg left
         ab->phase = resumeFrom(std::get<InDoubt>(ab->phase));
@@ -1255,10 +1294,6 @@ int ProducerImpl::closeTxnStep_(int64_t nowNs) noexcept {
 
 void ProducerImpl::applySendOffsets_(const TxnControl& c, const TxnOp& op) {
     // The state gates (InTransaction only; AbortableError refuses with the poison) ran in applyTxnControl.
-    if (offsetsOp_.index() != 0) {
-        refuseTxn_(c, OpStatus::BrokerError, kInvalidTxnState, "sendOffsetsToTransaction: another call is still running");
-        return;
-    }
     if (c.offsets.size() > kMaxTxnOffsets) {
         refuseTxn_(c, OpStatus::InvalidArgument, 0, "sendOffsetsToTransaction: at most 1024 offsets per call");
         return;
@@ -1267,6 +1302,20 @@ void ProducerImpl::applySendOffsets_(const TxnControl& c, const TxnOp& op) {
         refuseTxn_(c, OpStatus::InvalidArgument, 0,
                    "sendOffsetsToTransaction: at most 1024 offsets, a group id of 1 to 255 bytes and a member id of at "
                    "most 512 bytes");
+        return;
+    }
+    // #348: nothing to commit - Ok locally, no wire traffic.  AddOffsetsToTxn would open the transaction on the
+    // coordinator (TxnStarted::Yes) and make a commit send an EndTxn for an otherwise empty transaction (Kafka
+    // returns at once).  Checked after the argument validation, before the in-flight check: it needs no scratch.
+    if (c.offsets.empty()) {
+        completeTxn_(op, OpKind::SendOffsets, OpStatus::Ok, 0, {});
+        return;
+    }
+    // #347: one call in flight (the TxnOffsetCommit frames are built from ONE scratch).  A second is refused clearly
+    // - InvalidArgument, not the state-error code 19; the first completes normally and the transaction is not poisoned.
+    if (offsetsOp_.index() != 0) {
+        refuseTxn_(c, OpStatus::InvalidArgument, 0,
+                   "a sendOffsetsToTransaction is already in flight on this producer; wait for its completion");
         return;
     }
     OffsetsScratch& sc = *offsetsScratch_;   // allocated at construction of a transactional producer
@@ -1317,7 +1366,7 @@ int ProducerImpl::offsetsStep_(int64_t nowNs) noexcept {
         m.producerEpoch   = id->epoch;
         m.transactionalId = txnId;
         m.groupId         = group;
-        s->frameLen = static_cast<uint16_t>(m.encode(s->frame.data()));
+        s->setFrameLen(static_cast<uint16_t>(m.encode(s->frame.data())));
         coord_->submit(*s);
         oa->slot = s;
         return 1;
@@ -1367,7 +1416,7 @@ int ProducerImpl::offsetsStep_(int64_t nowNs) noexcept {
         assert(count > 0);   // the frame always has room for an entry (static_assert above)
         rpc::detail::putLE16(f + countAt, 0, count);
         pos += m.encodeMemberBlock(f, pos);
-        s->frameLen = static_cast<uint16_t>(pos);
+        s->setFrameLen(static_cast<uint16_t>(pos));
         coord_->submit(*s);
         oc->slots[oc->outstanding++] = s;
         ++work;
@@ -1381,7 +1430,7 @@ void ProducerImpl::onOffsetsAnswer_(const CoordAnswer& a, CoordinatorLink::Slot&
     const uint16_t ucode = static_cast<uint16_t>(code);
     auto* oa = std::get_if<OffsetsAdding>(&offsetsOp_);
     auto* oc = std::get_if<OffsetsCommitting>(&offsetsOp_);
-    if (s.kind == ReqKind::AddOffsets ? (oa == nullptr || oa->slot != &s) : oc == nullptr) return;   // stale
+    if (s.kind() == ReqKind::AddOffsets ? (oa == nullptr || oa->slot != &s) : oc == nullptr) return;   // stale
     if (oc != nullptr) {   // a TxnOffsetCommit request: it leaves the outstanding set (the caller releases the slot)
         std::size_t i = 0;
         while (i < oc->outstanding && oc->slots[i] != &s) ++i;
@@ -1389,7 +1438,7 @@ void ProducerImpl::onOffsetsAnswer_(const CoordAnswer& a, CoordinatorLink::Slot&
         for (; i + 1 < oc->outstanding; ++i) oc->slots[i] = oc->slots[i + 1];
         oc->slots[--oc->outstanding] = nullptr;
     }
-    switch (CoordinatorLink::classify(s.kind, code)) {
+    switch (CoordinatorLink::classify(s.kind(), code)) {
     case Verdict::Ok:
         if (oa != nullptr) {
             markStarted_(TxnStarted::Yes);   // B-1: AddOffsetsToTxn OK - the transaction exists on the coordinator
@@ -1410,7 +1459,7 @@ void ProducerImpl::onOffsetsAnswer_(const CoordAnswer& a, CoordinatorLink::Slot&
     case Verdict::Abortable:
     case Verdict::Reject:
         offsetsEnd_(OpStatus::BrokerError, ucode,
-                    s.kind == ReqKind::AddOffsets ? "AddOffsetsToTxn failed" : "TxnOffsetCommit failed",
+                    s.kind() == ReqKind::AddOffsets ? "AddOffsetsToTxn failed" : "TxnOffsetCommit failed",
                     OffsetsEnd::Failed);
         return;
     }

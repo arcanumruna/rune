@@ -125,7 +125,7 @@ struct HubCommandMsg {
         pc::detail::putLE64(buf, B + 16, c.a);
         pc::detail::putLE64(buf, B + 24, c.b);
         pc::detail::putLE64(buf, B + 32, c.c);
-        pc::detail::putLE64(buf, B + 40, c.d);
+        pc::detail::putLE64(buf, B + 40, c.d);   // d: a plain payload word, serialised only (HubCommand.h)
         pc::detail::putLE64(buf, B + 48, c.e);
         return ENCODED_SIZE;
     }

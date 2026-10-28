@@ -1130,17 +1130,10 @@ public:
     template <class T>
     [[nodiscard]] TypedTopic<T> openTopicAndWait(std::string_view name,
                                                  std::chrono::nanoseconds timeout = kDefaultWaitTimeout) {
-        TopicSchemaResult r = getTopicSchemaAndWait(name, T::kFingerprint, timeout);
-        if (r.errorCode != 0) {
-            throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
-        }
-        if (!schemaMatches(T::kFingerprint, std::span<const uint8_t>(r.descriptorBlob))) {
-            throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
-        }
+        const TopicSchemaResult r = openTypedSchema_<T>(name, timeout);
         // Phase 2b Part C: route over the topic's partitions (broker-reported;
         // a pre-2b broker reports 0 -> 1, the pre-2b partition-0 behaviour).
-        return TypedTopic<T>(producer(), TopicHandle{r.topicId, typedPartitionCount(r.partitionCount)},
-                             r.version);
+        return TypedTopic<T>(producer(), TopicHandle{r.topicId, typedPartitionCount(r.partitionCount)}, r.version);
     }
 
     /// #418: the run-time lineage of the generated type T for topic `name` (T::Lineage), built from the topic's
@@ -1175,10 +1168,12 @@ public:
     template <class T>
     [[nodiscard]] TypedTopic<T, ProducerRef> openTopicAndWait(std::string_view name, Producer& shared,
                                                               std::chrono::nanoseconds timeout = kDefaultWaitTimeout) {
-        TopicSchemaResult r = getTopicSchemaAndWait(name, T::kFingerprint, timeout);
-        if (r.errorCode != 0 || !schemaMatches(T::kFingerprint, std::span<const uint8_t>(r.descriptorBlob))) {
-            throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
+        // #349: the borrowed producer must be this Client's (a ProducerRef sends through ITS client's duty thread, so a
+        // foreign one would write through the wrong client) - refused before anything is sent.
+        if (!shared.ownedBy(*this)) {
+            throw std::invalid_argument("openTopicAndWait: the producer does not belong to this Client");
         }
+        const TopicSchemaResult r = openTypedSchema_<T>(name, timeout);
         return TypedTopic<T, ProducerRef>(ProducerRef(shared),
                                           TopicHandle{r.topicId, typedPartitionCount(r.partitionCount)}, r.version);
     }
@@ -1319,6 +1314,15 @@ public:
                                  GroupConfig                cfg = {});
 
 private:
+    /// The one body of both openTopicAndWait overloads: the topic's schema, checked against T's fingerprint.
+    template <class T>
+    TopicSchemaResult openTypedSchema_(std::string_view name, std::chrono::nanoseconds timeout) {
+        TopicSchemaResult r = getTopicSchemaAndWait(name, T::kFingerprint, timeout);
+        if (r.errorCode != 0 || !schemaMatches(T::kFingerprint, std::span<const uint8_t>(r.descriptorBlob))) {
+            throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
+        }
+        return r;
+    }
     // -------------------------------------------------------------------------
     // Internal types
     // -------------------------------------------------------------------------

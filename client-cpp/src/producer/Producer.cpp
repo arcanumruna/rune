@@ -711,6 +711,14 @@ void Producer::testSetNextSequence(TopicHandle topic, int32_t partition, int32_t
 } // namespace rune::client
 
 namespace rune::client {
+bool detail::producerImplDetached(const producer::ProducerImpl* impl) noexcept {
+    return impl != nullptr && impl->handleDetached();
+}
+
+bool Producer::ownedBy(const Client& client) const noexcept {
+    return impl_ != nullptr && impl_->hooks().ctx == static_cast<const void*>(&client);
+}
+
 void Producer::bindBatchThread() {
     if (!impl_) throw std::logic_error("Producer::bindBatchThread: empty producer");
     impl_->bindBatchThread();

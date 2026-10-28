@@ -322,15 +322,15 @@ TEST(ProducerTxnOffsets, OneFailedRequestOfManyFailsTheCallAndPoisonsTheTransact
     EXPECT_EQ(r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID).size(), commits.size()) << "nothing is re-sent";
 }
 
-TEST(ProducerTxnOffsets, NoEntriesCompletesAfterAddOffsets) {
+// #348: changed from "completes after an AddOffsetsToTxn round trip" - an empty list completes Ok locally.
+TEST(ProducerTxnOffsets, NoEntriesCompletesOkLocallyWithoutAddOffsets) {
     Rig r;
     r.inTxn();
     const Token t = r.sendOffsets({}, "grp-1");
-    r.tick();
-    r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
-    r.tick();
-    ASSERT_EQ(r.d(t).times, 1);
+    ASSERT_EQ(r.d(t).times, 1) << "completes at once, before any pass";
     EXPECT_EQ(r.d(t).status, OpStatus::Ok);
+    r.tick();
+    EXPECT_TRUE(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).empty());
     EXPECT_TRUE(r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID).empty());
 }
 
@@ -472,7 +472,8 @@ TEST(ProducerTxnOffsetsRegression, AnotherCallWhileOneRunsIsRefusedNotInterleave
     const Token a = r.sendOffsets(offsetsOf(2), "grp-a");
     const Token b = r.sendOffsets(offsetsOf(2), "grp-b");
     ASSERT_EQ(r.d(b).times, 1);
-    EXPECT_EQ(r.d(b).code, kInvalidTxnState);
+    EXPECT_EQ(r.d(b).status, OpStatus::InvalidArgument);   // #347: was BrokerError(19)
+    EXPECT_EQ(r.d(b).code, 0);
     EXPECT_EQ(r.d(a).times, 0);
     r.sendOk(a);
     ASSERT_EQ(r.d(a).times, 1);
@@ -480,6 +481,68 @@ TEST(ProducerTxnOffsetsRegression, AnotherCallWhileOneRunsIsRefusedNotInterleave
     // The scratch is free again.
     const Token c = r.sendOffsets(offsetsOf(2), "grp-c");
     EXPECT_EQ(r.d(c).times, 0);
+}
+
+// #347: a second concurrent call is refused CLEARLY (InvalidArgument with the reason), the first completes normally and
+// the transaction is not poisoned - the commit that follows succeeds.
+TEST(ProducerTxnOffsetsRegression, ASecondConcurrentSendOffsetsIsRefusedClearlyAndTheTxnStaysGoodRegression) {
+    Rig r;
+    r.inTxn();
+    const Token a = r.sendOffsets(offsetsOf(2), "grp-a");
+    const Token b = r.sendOffsets(offsetsOf(3), "grp-b");
+    ASSERT_EQ(r.d(b).times, 1);
+    EXPECT_EQ(r.d(b).status, OpStatus::InvalidArgument);
+    EXPECT_EQ(r.d(b).code, 0) << "not the state-error code 19";
+    EXPECT_EQ(r.d(b).text, "a sendOffsetsToTransaction is already in flight on this producer; wait for its completion");
+    EXPECT_EQ(r.impl->txnStateDuty(), TxnState::InTransaction) << "the refusal poisons nothing";
+    EXPECT_EQ(r.d(a).times, 0);
+    r.sendOk(a);
+    ASSERT_EQ(r.d(a).times, 1);
+    EXPECT_EQ(r.d(a).status, OpStatus::Ok) << "the first call completes normally";
+    EXPECT_EQ(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).size(), 1u) << "the refused call sent nothing";
+    const Token c = r.apply(TxnControl::Kind::Commit);
+    r.tick();
+    ASSERT_EQ(r.cap.of(rpc::EndTxn::TEMPLATE_ID).size(), 1u);
+    r.answerFrame(r.lastOf(rpc::EndTxn::TEMPLATE_ID), rp::ReqKind::EndTxn, 0);
+    ASSERT_EQ(r.d(c).times, 1);
+    EXPECT_EQ(r.d(c).status, OpStatus::Ok) << "the transaction was never poisoned";
+    EXPECT_EQ(r.impl->txnStateDuty(), TxnState::Ready);
+}
+
+// #348: an empty offsets list completes Ok locally, with no wire traffic, and does not open the transaction on the
+// coordinator - a commit with nothing else in the transaction ends locally too (B-1), exactly like an empty one.
+TEST(ProducerTxnOffsetsRegression, EmptySendOffsetsCompletesLocallyWithNoWireTrafficRegression) {
+    Rig r;
+    r.inTxn();
+    const std::size_t framesBefore = r.cap.frames.size();
+    const Token t = r.sendOffsets({}, "grp-1");
+    ASSERT_EQ(r.d(t).times, 1);
+    EXPECT_EQ(r.d(t).status, OpStatus::Ok);
+    EXPECT_EQ(r.d(t).op, OpKind::SendOffsets);
+    for (int i = 0; i < 5; ++i) r.tick();
+    EXPECT_EQ(r.cap.frames.size(), framesBefore) << "no wire traffic";
+    EXPECT_EQ(r.impl->txnStateDuty(), TxnState::InTransaction);
+    const Token c = r.apply(TxnControl::Kind::Commit);
+    for (int i = 0; i < 3; ++i) r.tick();
+    ASSERT_EQ(r.d(c).times, 1);
+    EXPECT_EQ(r.d(c).status, OpStatus::Ok);
+    EXPECT_TRUE(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).empty());
+    EXPECT_TRUE(r.cap.of(rpc::EndTxn::TEMPLATE_ID).empty()) << "the coordinator never saw the transaction: no EndTxn";
+    EXPECT_EQ(r.impl->txnStateDuty(), TxnState::Ready);
+}
+
+// #348: an empty call while a real one runs completes Ok at once and leaves the running call alone.
+TEST(ProducerTxnOffsetsRegression, EmptySendOffsetsDuringARunningCallLeavesItAloneRegression) {
+    Rig r;
+    r.inTxn();
+    const Token a = r.sendOffsets(offsetsOf(2), "grp-a");
+    const Token e = r.sendOffsets({}, "grp-e");
+    ASSERT_EQ(r.d(e).times, 1);
+    EXPECT_EQ(r.d(e).status, OpStatus::Ok);
+    EXPECT_EQ(r.d(a).times, 0);
+    r.sendOk(a);
+    ASSERT_EQ(r.d(a).times, 1);
+    EXPECT_EQ(r.d(a).status, OpStatus::Ok);
 }
 
 // ---- failures (FD6) --------------------------------------------------------------------------------------------
@@ -796,12 +859,12 @@ TEST(ProducerTxnControlRegression, SendOffsetsTravelsTheRingIntoTheDutyScratchRe
     r.answerFrame(commits[0], rp::ReqKind::TxnOffsetCommit, 0);
     ASSERT_EQ(r.d(i.token).times, 1);
     EXPECT_EQ(r.d(i.token).status, OpStatus::Ok);
-    // A second call is refused with 19 while one runs: documented, never queued.
+    // A second call is refused (InvalidArgument, #347) while one runs: documented, never queued.
     const auto second = r.issue(TxnControl::Kind::SendOffsets, offsetsOf(2), "grp-ring");
     const auto third  = r.issue(TxnControl::Kind::SendOffsets, offsetsOf(2), "grp-ring");
     r.tick();
-    EXPECT_EQ(r.d(third.token).status, OpStatus::BrokerError);
-    EXPECT_EQ(r.d(third.token).code, kInvalidTxnState);
+    EXPECT_EQ(r.d(third.token).status, OpStatus::InvalidArgument);
+    EXPECT_EQ(r.d(third.token).code, 0);
     EXPECT_EQ(r.d(third.token).times, 1);
     EXPECT_EQ(r.d(second.token).times, 0) << "the first of the two is running";
 }

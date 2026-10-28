@@ -301,6 +301,8 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     , tier2FreeBuf_(makeRingBuffer(static_cast<std::size_t>(tier2FreeRingBytes(cfg.tier2Slots)), kRingAlignment))
     , tier2Free_(tier2FreeBuf_.get(), static_cast<std::size_t>(tier2FreeRingBytes(cfg.tier2Slots)))
 {
+    // #349: kMsgTxnControl reads OffsetEntry arrays in place (decodeTxnControl_): the ring base is 8-byte aligned.
+    assert((reinterpret_cast<uintptr_t>(ringBuf_.get()) & 7u) == 0 && "producer ring base must be 8-byte aligned");
     // FD4: a transactional producer has no usable id until initTransactions (Task 5), even as a bare rig.
     if (!cfg_.transactionalId.empty()) identity_ = IdUnassigned{};
     publishStatus_();   // FD9: a bare rig reports its rig id
@@ -579,6 +581,9 @@ void ProducerImpl::enableDirectIngress(const DirectIngress& d) {
         static_cast<std::size_t>(kRecHeaderSize) + rune::client::Producer::kMaxRecordBytes);
     const std::size_t want = cfg_.directDeferredBytes > 0
                                  ? static_cast<std::size_t>(cfg_.directDeferredBytes) : 0u;
+    // #344: the claim quarantine holds a builder-sized spare, so abandoning an open claim (a commit / abort / close with
+    // a claim open) copies the records before it into the spare and swaps - no allocation.  Control plane, once.
+    claimQuarantine_.reserve(builderPrealloc_);
     deferred_.init(std::max(want, 2 * kMaxRec));
     const std::size_t arena = deferred_.capacity();
     std::size_t share = cfg_.directDeferredPartitionBytes > 0
@@ -4039,7 +4044,9 @@ void ProducerImpl::enableCoordinator(CoordinatorSink sink, uint32_t seqBase) {
             return;
         }
     }
-    coord_.emplace(ordinal_, sink, seqBase);
+    // #340: a plain producer's only coordinator request is its InitProducerId (one at a time): one preallocated
+    // slot; a transactional one needs the whole pool.  Allocated here (control plane), never grown.
+    coord_.emplace(ordinal_, sink, seqBase, transactional_() ? CoordinatorLink::kMaxCoordRequests : std::size_t{1});
     // A Client producer already expects its broker id (expectBrokerId, at creation); a hub fed a bare impl
     // moves it off the rig id here.
     if (const auto* a = std::get_if<IdAssigned>(&identity_); a != nullptr && a->producerId == kRigProducerId) {
@@ -4135,7 +4142,7 @@ CoordinatorLink::Slot* ProducerImpl::sendInitProducerId_(int64_t deadlineNs) noe
     } else {
         m.transactionTimeoutMs = 0;   // a plain producer has no transaction; an empty id = idempotent-only
     }
-    s->frameLen = static_cast<uint16_t>(m.encode(s->frame.data()));
+    s->setFrameLen(static_cast<uint16_t>(m.encode(s->frame.data())));
     coord_->submit(*s);
     identity_ = IdRequested{s};
     publishStatus_();
@@ -4194,7 +4201,7 @@ void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noex
     if (s == nullptr) return;
     // The answer's slot is released only after its machine handled it (and any completion it delivered): a
     // handler that issues the next op can never be handed this slot while its answer is still being read.
-    switch (s->kind) {
+    switch (s->kind()) {
     case ReqKind::InitProducerId: {
         const auto* r = std::get_if<IdRequested>(&identity_);
         if (r == nullptr || r->slot != s) break;   // stale
@@ -4219,7 +4226,7 @@ void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noex
 int ProducerImpl::pumpCoordinator(int64_t nowNs) noexcept {
     if (!coord_ || coord_->inUse() == 0) [[likely]] return 0;   // idle link: one load, no slot memory
     const int work = coord_->pump(nowNs, [this](CoordinatorLink::Slot& s) {
-        if (s.kind == ReqKind::InitProducerId && cfg_.transactionalId.empty()) onInitExpired_(s);
+        if (s.kind() == ReqKind::InitProducerId && cfg_.transactionalId.empty()) onInitExpired_(s);
         else onTxnSlotExpired_(s);   // the link releases the slot after this
     });
     if (work != 0 && transactional_()) noteEndReoffer_();   // Task 6 fix round 1 (I1)

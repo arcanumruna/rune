@@ -31,8 +31,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
-#include <cstdint>
 #include <cstring>
+#include <cstdint>
 #include <string_view>
 #include <vector>
 
@@ -205,13 +205,17 @@ public:
         recordCount_  = 0;
         maxTimestamp_ = baseTimestamp_;
     }
-    /// detachStorageKeepingRecords: the builder keeps the records before the claim (copied into
-    /// fresh storage first: a cold close path, it allocates).  `keep` is the claim's mark.  May
-    /// throw bad_alloc; then nothing changed.
+    /// detachStorageKeepingRecords: the builder keeps the records before the claim (`keep` is the claim's mark):
+    /// they are copied into `quarantine`'s old storage - the spare - which becomes the builder's, and the caller's
+    /// storage (full size, covers the claimed span) becomes the quarantine.  Allocation-free whenever the spare holds
+    /// `keep.size` bytes: ProducerImpl::enableDirectIngress reserves the quarantine at the builders' capacity, and
+    /// the two buffers then swap roles for ever (#344).  A smaller spare grows first (cold, once); may throw
+    /// bad_alloc, then nothing changed.
     void detachStorageKeepingRecords(FrameBytes& quarantine, const Mark& keep) {
-        FrameBytes kept(frame_.begin(), frame_.begin() + static_cast<std::ptrdiff_t>(keep.size));
-        frame_.swap(quarantine);  // quarantine: the caller's storage, full size (covers the claimed span)
-        frame_.swap(kept);        // the builder: the records before the claim, in fresh storage
+        if (quarantine.capacity() < keep.size) quarantine.reserve(keep.size);   // may throw: nothing changed yet
+        quarantine.resize(keep.size);   // within capacity: no allocation, no throw
+        if (keep.size != 0) std::memcpy(quarantine.data(), frame_.data(), keep.size);
+        frame_.swap(quarantine);  // the builder: the records before the claim; the quarantine: the caller's storage
         recordCount_  = keep.recordCount;
         maxTimestamp_ = keep.maxTimestamp;
     }

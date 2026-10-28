@@ -3986,8 +3986,15 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if (ec == rpc::ErrorCode::NotCoordinator && !opt->message.empty()) {
             // Phase 2b F: a producer's coordinator request waits (AwaitCoordinator) for the move below;
             // a redirect naming the coordinator already in use moves nothing, so ask for fresh metadata
-            // (its answer releases the waiters too).
-            if (coordRouted) scheduleMetadataRefresh();
+            // (its answer releases the waiters too).  #340: a redirect that names a NEW coordinator moves it right
+            // below (onCoordinatorMoved releases the waiters), so no refresh is asked for it.
+            if (coordRouted) {
+                const auto* rm = std::get_if<detail::CoordRemote>(&coordRoute_);
+                const std::string& current = rm == nullptr ? agent_.seedChannel() : rm->channel;
+                if (agent::ClientAgent::sameEndpoint(toChannel(std::string(opt->message)), current)) {
+                    scheduleMetadataRefresh();
+                }
+            }
             onCoordinatorRedirect_(std::string(opt->message));
             break;
         }
