@@ -124,9 +124,11 @@ public:
             if (offset == builder->nextTermOffset()) {
                 builder->append(buffer, offset, length, header);
                 if ((flags & FrameDescriptor::END_FRAG) == FrameDescriptor::END_FRAG) {
-                    const auto msgLength = static_cast<aeron::util::index_t>(builder->limit()) - DataFrameHeader::LENGTH;
+                    // The message is builder[0, limit): Aeron 1.51's BufferBuilder starts empty (1.41.4's reserved a
+                    // 32-byte frame header at the front).
+                    const auto msgLength = static_cast<aeron::util::index_t>(builder->limit());
                     aeron::concurrent::AtomicBuffer msgBuffer(builder->buffer(), builder->limit());
-                    delegate(msgBuffer, DataFrameHeader::LENGTH, msgLength, header);
+                    delegate(msgBuffer, 0, msgLength, header);
                     builder->reset();
                 } else {
                     builder->nextTermOffset(detail::nextTermOffsetAfter(offset, length));
@@ -172,9 +174,9 @@ public:
             if (offset == builder->nextTermOffset()) {
                 builder->append(buffer, offset, length, header);
                 if ((flags & FrameDescriptor::END_FRAG) == FrameDescriptor::END_FRAG) {
-                    const auto msgLength = static_cast<aeron::util::index_t>(builder->limit()) - DataFrameHeader::LENGTH;
+                    const auto msgLength = static_cast<aeron::util::index_t>(builder->limit());   // see above
                     aeron::concurrent::AtomicBuffer msgBuffer(builder->buffer(), builder->limit());
-                    action = delegate(msgBuffer, DataFrameHeader::LENGTH, msgLength, header);
+                    action = delegate(msgBuffer, 0, msgLength, header);
                     if (action == aeron::ControlledPollAction::ABORT) builder->limit(limit);   // END re-delivered
                     else builder->reset();
                 } else {

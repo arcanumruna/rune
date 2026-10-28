@@ -445,7 +445,10 @@ static int rune_gso_send(
                 st->t.gso_path_mtu_fallbacks++;
                 if (NULL != st->owner->path_mtu_counter)
                 {
-                    aeron_counter_ordered_increment(st->owner->path_mtu_counter, 1);
+                    /* One counter for every transport: the sender agent and (status / NAK sends) the receiver
+                     * agent can both reach it, so an atomic add, as Aeron's own errors counter.  Rare (a path-MTU
+                     * refusal), never on the steady-state send path. */
+                    aeron_counter_increment(st->owner->path_mtu_counter);
                 }
                 if (0 == now)
                 {

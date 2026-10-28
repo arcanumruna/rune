@@ -5,6 +5,7 @@
 // 32-byte aligned; the Header object points at each frame like Image::poll does.
 #include <rune/aeronutil/FragmentAssembler.h>
 
+#include <aeron_image.h>   // aeron_header_t: Aeron 1.51's Header wraps the C client's header over the frame
 #include <gtest/gtest.h>
 
 #include <cstring>
@@ -40,11 +41,18 @@ struct Sink {
     std::vector<const std::uint8_t*> ptrs;
 };
 
+// The C header Image::poll hands the wrapper's Header: a pointer to the frame in the term buffer.
+struct FrameHeader {
+    aeron_header_t c{};
+    Header h;
+    FrameHeader(Term& t, aeron::util::index_t frameOffset)
+        : c{reinterpret_cast<aeron_data_header_t*>(t.bytes.data() + frameOffset), 0, 16, 0, nullptr}, h(&c) {}
+};
+
 template <class Asm>
 void feed(Asm& a, Term& t, const Term::Frame& f, Sink& s) {
-    Header h(0, static_cast<aeron::util::index_t>(t.bytes.size()), nullptr);
-    h.buffer(t.buf);
-    h.offset(f.frameOffset);
+    FrameHeader fh(t, f.frameOffset);
+    Header& h = fh.h;
     a.onFragment([&s](AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l, Header&) {
         s.msgs.emplace_back(reinterpret_cast<const char*>(b.buffer() + o), static_cast<std::size_t>(l));
         s.ptrs.push_back(b.buffer() + o);
@@ -98,8 +106,8 @@ TEST(FragmentAssemblerRegression, ControlledAbortRedeliversTheEndFragment) {
     std::vector<std::string> got;
     int calls = 0;
     auto deliver = [&](const Term::Frame& f) {
-        Header h(0, static_cast<aeron::util::index_t>(t.bytes.size()), nullptr);
-        h.buffer(t.buf); h.offset(f.frameOffset);
+        FrameHeader fh(t, f.frameOffset);
+        Header& h = fh.h;
         return a.onFragment([&](AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l, Header&) {
             ++calls;
             if (calls == 1) return aeron::ControlledPollAction::ABORT;   // back-pressured consumer
