@@ -173,6 +173,7 @@ public:
     // What a run reached (#373): injected sequence gaps, KIP-360 epoch bumps after one, TxnOffsetCommit answers that
     // carried an injected code.  Read after run().
     [[nodiscard]] int seqGaps() const noexcept { return gw_->injectedSeqGaps; }
+    [[nodiscard]] int restartsAfterGap() const noexcept { return gw_->restartsAfterGap; }   // #694: injected 28s absorbed in place
     [[nodiscard]] int epochBumps() const noexcept { return gw_->epochBumpsAfterGap; }
     [[nodiscard]] int offsetCommitInjections() const noexcept { return gw_->injectedOffsetCommitCodes; }
 
@@ -247,9 +248,9 @@ private:
     // batch ends (a record after a queued Tier-2 batch is back-pressured until that batch leaves).
     std::array<int64_t, kPartitions> acceptedCum_{}, ackedCum_{}, lastTier2End_{};
     int64_t ackedRecords_ = 0;
-    /// A blocking void send (send / sendTo / TypedTopic::send) in Invoker mode pumps only the CLIENT while it is
-    /// back-pressured; this rig's broker is pumped by the same thread, so such a send could never finish.  It is
-    /// issued only where it cannot be back-pressured: no unsent Tier-2 batch ahead of it, the builder far from full.
+    /// A blocking void send behind a held Tier-2 batch cannot run in this rig: its broker is pumped by this same thread,
+    /// so the send would wait for itself (by design of Invoker mode, #372); it is issued as trySendAck there instead.
+    /// The blocking path runs against a broker on its own thread: TxnInvokerRegression.BlockingSendBehindAHeldTier2Batch...
     [[nodiscard]] bool voidMayBlock_(int32_t p) const {
         const auto i = static_cast<std::size_t>(p);
         return lastTier2End_[i] > ackedCum_[i] || acceptedCum_[i] - ackedCum_[i] >= 64;
@@ -1103,12 +1104,13 @@ INSTANTIATE_TEST_SUITE_P(TxnStress, TxnStressRegression, ::testing::ValuesIn(see
 // gateway never produced a sequence gap) and a scripted coordinator code almost never landed on TxnOffsetCommit (the
 // AddOffsets before it takes it first).  The gateway now injects a sequence-gap answer (20 / 28) and has a code queue
 // of its own for TxnOffsetCommit; this pins that the stress's seeds REACH both: over the first 16 of its seeds (each run
-// is checked against the model like any other) at least one gap was injected, at least one epoch bump followed one, and
-// at least one TxnOffsetCommit answer carried an injected code.
+// is checked against the model like any other) at least one gap was injected, at least one epoch bump followed one (now
+// only a 20, or a 28 after this transaction's own ack: #694), at least one injected 28 was absorbed by a restart in
+// place (the transaction continued), and at least one TxnOffsetCommit answer carried an injected code.
 // RED (mutations): armGap_() never arming / the gateway ignoring seqGapCodes -> no gap; txnCoordCode_ ignoring
-// txnOffsetCommitCodes -> no injected TxnOffsetCommit code.
+// txnOffsetCommitCodes -> no injected TxnOffsetCommit code; the gateway never counting a restart -> no restart.
 TEST(TxnStressRegression, SeedsReachEpochBumpAndOffsetCommitInjectionRegression) {
-    int gaps = 0, bumps = 0, tocs = 0;
+    int gaps = 0, bumps = 0, restarts = 0, tocs = 0;
     const std::vector<uint32_t> all = seeds();
     const std::size_t           n   = std::min<std::size_t>(all.size(), 16);
     for (std::size_t i = 0; i < n; ++i) {
@@ -1116,11 +1118,14 @@ TEST(TxnStressRegression, SeedsReachEpochBumpAndOffsetCommitInjectionRegression)
         s.run();
         if (::testing::Test::HasFatalFailure()) return;
         gaps += s.seqGaps();
+        restarts += s.restartsAfterGap();
         bumps += s.epochBumps();
         tocs += s.offsetCommitInjections();
     }
     EXPECT_GT(gaps, 0) << "no seed injected a sequence gap (" << n << " seeds)";
     EXPECT_GT(bumps, 0) << "no seed reached a KIP-360 epoch bump (" << gaps << " gaps injected)";
+    EXPECT_GT(restarts, 0) << "no seed absorbed an injected 28 by restarting in place (" << gaps << " gaps injected)";
     EXPECT_GT(tocs, 0) << "no seed had a TxnOffsetCommit answered with an injected code";
-    std::printf("[ reach    ] %zu seeds: %d sequence gaps, %d epoch bumps after one, %d injected TxnOffsetCommit codes\n", n, gaps, bumps, tocs);
+    std::printf("[ reach    ] %zu seeds: %d sequence gaps, %d epoch bumps after one, %d 28 restarts, %d injected TxnOffsetCommit codes\n",
+                n, gaps, bumps, restarts, tocs);
 }
