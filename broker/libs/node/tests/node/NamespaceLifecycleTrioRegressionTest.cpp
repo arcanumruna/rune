@@ -321,8 +321,8 @@ TEST(NamespaceLifecycleTrioRegression, SuspendConvergesOnEveryNodeRegression) {
             << "node " << n << ": DDL in a ReadOnly namespace must get NamespaceSuspended";
     ASSERT_EQ(W.ns(1, pc::NamespaceDdlKind::Resume, "a").code, 0);
     for (int n = 1; n <= 3; ++n)
-        EXPECT_TRUE(AuthTrio::until(30s, [&] { return W.defineAs("a/alice", n, "ok" + std::to_string(n)).code == 0; }))
-            << "node " << n << ": DDL after resume";
+        EXPECT_EQ(W.call("a/alice", n, [&](int node, int64_t sid) { return W.sendDefine(node, sid, "ok" + std::to_string(n)); }).code, 0)
+            << "node " << n << ": DDL after resume (routed to the catalog leader)";
 }
 
 // The catalog leader is killed after the reaper took 2 of its steps: the new leader's reaper re-derives from the registry
@@ -464,7 +464,7 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
     rc::Producer p = c.producer(pcfg);
     rc::Completions cq(c);
     uint64_t key = 0;
-    struct Tally { int ok = 0, refused = 0, other = 0; };
+    struct Tally { int ok = 0, refused = 0, other = 0; int lastCode = 0; int lastStatus = 0; };
     auto burst = [&](int n) {
         Tally tl;
         const std::vector<uint8_t> v(64, 9);
@@ -478,7 +478,7 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
                 ++done;
                 if (d.status == rc::OpStatus::Ok) ++tl.ok;
                 else if (d.errorCode == kSuspended) ++tl.refused;
-                else ++tl.other;
+                else { ++tl.other; tl.lastCode = d.errorCode; tl.lastStatus = static_cast<int>(d.status); }
             });
             std::this_thread::sleep_for(1ms);
         }
@@ -488,8 +488,12 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
     EXPECT_EQ(before.ok, 50) << "refused " << before.refused << ", other " << before.other;
     ASSERT_EQ(W.ns(1, pc::NamespaceDdlKind::Suspend, "a", 1).code, 0);
     Tally during;
-    ASSERT_TRUE(AuthTrio::until(30s, [&] { during = burst(10); return during.refused == 10; }))
-        << "ReadOnly must refuse every produce with 51 (ok " << during.ok << ", refused " << during.refused << ", other " << during.other << ")";
+    // The suspend reaches the gate: no record is acked any more (a bounded wait), and every refusal is NamespaceSuspended.
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { during = burst(10); return during.ok == 0; }))
+        << "ReadOnly never stopped acking produces (ok " << during.ok << ")";
+    EXPECT_EQ(during.refused, 10) << "ReadOnly must refuse every produce with NamespaceSuspended (51): ok " << during.ok
+        << ", refused " << during.refused << ", other " << during.other << ", last other: status " << during.lastStatus
+        << " errorCode " << during.lastCode;
     ASSERT_EQ(W.ns(1, pc::NamespaceDdlKind::Resume, "a").code, 0);
     Tally after;
     ASSERT_TRUE(AuthTrio::until(30s, [&] { after = burst(50); return after.ok == 50; })) << "after resume: ok " << after.ok << ", other " << after.other;

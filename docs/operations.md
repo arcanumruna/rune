@@ -127,8 +127,8 @@ effect on every node when that event applies; no timer is involved.
 
 - The cluster admin is exempt from both suspend modes. A client older than version 14 does not know code 51 and gets
   `InvalidRequest (39)` instead; the same holds for codes 52 to 54 below.
-- `resume` returns a suspended namespace to Active; suspending a suspended namespace again, or resuming an Active one, is
-  an Ok no-op. `default` cannot be deleted. Suspend, resume and delete of an unknown or Deleting name answer exactly like
+- `resume` returns a suspended namespace to Active; suspending in the mode a namespace is already in, or resuming an Active
+  one, is an Ok no-op (suspending in the other mode switches it). `default` cannot be deleted. Suspend, resume and delete of an unknown or Deleting name answer exactly like
   any unknown name.
 - **Delete** is one event, and that event is the commit point: the namespace is DELETING at once and **its name is free
   at once** (a new `create` of the same name gets a new nsId and sees nothing of the old namespace). The reaper on the
@@ -157,8 +157,8 @@ enforced, each with one precise code:
 | `max-view-memory-bytes` | the node's view chunks | the namespace's views pause at their offset and a view read answers `ViewPaused (54)`; they resume when memory falls or the limit is raised |
 
 - **Lowering a limit deletes nothing**, except the retention maximum: objects over a lowered count stay and the next
-  create is refused; a lowered retention maximum deletes old segments on the next retention pass and the `limits --set`
-  answers Ok with the warning `retention clamped on N topics`.
+  create is refused; a lowered retention maximum deletes old segments on the next retention pass and the SetLimits is answered Ok with the warning `retention clamped on N topics` in the
+  DDL response's detail.
 - Rates, disk and view memory are enforced from the workers' paced reports, so a namespace can exceed one by what its
   node produces in about one report interval plus one aggregator tick before the throttle arrives; the rate debt carries
   the excess forward and the long-run rate converges on the limit. A rate limit never makes a follower refuse a replicated

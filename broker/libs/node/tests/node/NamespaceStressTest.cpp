@@ -615,8 +615,11 @@ protected:
     void closeTxnClient(const std::string& ns) {
         auto it = live_.find(ns);
         if (it == live_.end()) return;
-        try { if (it->second.producer) it->second.producer->close(); } catch (...) {}
-        try { if (it->second.client) it->second.client->close(); } catch (...) {}
+        // The client goes first and never drains (its session may be revoked); the producer's own close would wait for it.
+        try { if (it->second.client) it->second.client->closeImmediately(); } catch (...) {}
+        const auto t0 = Clk::now();
+        try { it->second.producer.reset(); } catch (...) {}
+        trace_ += " [producer reset " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clk::now() - t0).count()) + " ms]";
         live_.erase(it);
     }
     void closeAllTxnClients() {
@@ -665,11 +668,16 @@ protected:
         const NsModel* n = byName(ns);
         const bool platformAborted = rec.st == TxnRec::St::Aborted;
         trace_ += std::string(" txn-") + (commit ? "commit:" : "abort:") + ns + (platformAborted ? "(aborted by the platform)" : "");
+        const auto endStart = Clk::now();
         std::string err;
+        // A platform-aborted transaction's producer gets no success: a short bound, because every OTHER open transaction of
+        // the run keeps its own timeout (the producers' 60 s) ticking while this one waits.
+        const auto bound = platformAborted ? std::chrono::seconds(5) : std::chrono::seconds(30);
         try {
-            if (commit) it->second.producer->commitTransactionAndWait(std::chrono::seconds(30));
-            else it->second.producer->abortTransactionAndWait(std::chrono::seconds(30));
+            if (commit) it->second.producer->commitTransactionAndWait(bound);
+            else it->second.producer->abortTransactionAndWait(bound);
         } catch (const std::exception& e) { err = e.what(); }
+        trace_ += " [ended after " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clk::now() - endStart).count()) + " ms: " + (err.empty() ? "ok" : err) + "]";
         if (platformAborted) {
             if (commit) EXPECT_FALSE(err.empty()) << "a commit succeeded after the platform aborted the transaction of " << ns;
         } else if (n != nullptr && n->state == 0) {
@@ -875,6 +883,7 @@ protected:
             else if (roll < 78) op = "txn-end";
             SCOPED_TRACE("seed=" + std::to_string(seed_) + " step=" + std::to_string(step) + " op=" + op);
             ++tally_[op];
+            const auto stepStart = Clk::now();
             try {
                 if (!std::strcmp(op, "create-namespace")) stepCreateNamespace(step);
                 else if (!std::strcmp(op, "create-topic")) stepCreateTopic(step);
@@ -892,6 +901,7 @@ protected:
                 else if (!std::strcmp(op, "txn-end")) stepTxnEnd();
                 else stepProbe(step);
                 if (!HasFatalFailure() && !HasNonfatalFailure()) checkInvariants();
+                if (std::getenv("RUNE_NS_STRESS_TRACE") != nullptr) std::printf("[ TRACE ] seed=%u step=%d op=%s%s (%lld ms)\n", seed_, step, op, trace_.c_str(), static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clk::now() - stepStart).count()));
             } catch (const std::exception& e) {
                 ADD_FAILURE() << "seed=" << seed_ << " step=" << step << " op=" << op << " threw: " << e.what() << trace_;
                 return;
@@ -1112,6 +1122,7 @@ protected:
             else if (roll < 90) op = "set-limits";
             else op = "leader-change";
             SCOPED_TRACE("seed=" + std::to_string(seed_) + " step=" + std::to_string(step) + " op=" + op);
+            ++tally_[op];
             if (!std::strcmp(op, "create")) stepCreate(step);
             else if (!std::strcmp(op, "topic")) stepTopic(step);
             else if (!std::strcmp(op, "suspend")) stepSuspend();
@@ -1127,8 +1138,12 @@ protected:
             }
         }
         finish();
+        std::string t = "seed=" + std::to_string(seed_) + " ops:";
+        for (const auto& [k, v] : tally_) t += " " + k + "=" + std::to_string(v);
+        std::printf("[ STRESS ] trio %s gone=%zu live=%zu leader=%d\n", t.c_str(), gone_.size(), ns_.size(), leader_);
     }
 
+    std::map<std::string, int> tally_;
     uint32_t seed_;
     std::mt19937 rng_;
     CatalogTrio trio_;
