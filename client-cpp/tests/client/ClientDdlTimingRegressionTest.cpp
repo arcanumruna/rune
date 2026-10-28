@@ -416,6 +416,49 @@ TEST(ClientDdlRegression, DdlNotLeaderUntilBudgetEndsReportsNotLeaderWithoutUnre
     EXPECT_NE(text.find("not leader: retry budget exhausted"), std::string::npos) << text;
 }
 
+// C17 adversarial review (#97): NodeUnreachable is a statement about the CURRENT resend, never sticky.  The DDL is
+// answered NotLeader, redirected to a node that is down (resends refused: NodeUnreachable recorded), then that node
+// comes up and answers NotLeader itself until the budget ends: the DDL ends BrokerError NotLeader with the NotLeader
+// text, never SessionLost "node unreachable".
+TEST(ClientDdlRegression, AdversarialANodeThatComesUpAndAnswersNotLeaderEndsNotLeaderRegression) {
+    rc::ClientConfig cfg = invokerCfg(4450, 4451);
+    cfg.ddlRetryBudget = std::chrono::milliseconds(2'000);
+    Rig r(cfg);
+    r.connect();
+    const std::string later = udp(rune::client::testing::allocFreeUdpPort());   // nobody listens there yet
+    int seedAnswers = 0, nodeAnswers = 0;
+    int nodeEp = -1;
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        if (ep == nodeEp) { ++nodeAnswers; r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId); return; }
+        if (seedAnswers++ == 0) r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId);
+        else                    r.answerError(ep, pc::ErrorCode::Redirect, later, m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return seedAnswers >= 2; }, 20'000'000)) << "redirected to the down node";
+    r.passes(10, 20'000'000);                       // ~200 ms of refused resends toward the down node
+    ASSERT_FALSE(f.ready()) << "inside the 2 s budget";
+    nodeEp = r.gw.addNode(later, cfg.gatewayStreamId);   // the node comes up
+    // Its UDP image connects on the real clock: hold the fake clock until the node's subscription sees the
+    // client's publication, then step it 1 ms at a time (inside the 2 s budget) until the node answers a resend.
+    ASSERT_TRUE(r.drive([&] { return r.gw.endpoints[static_cast<std::size_t>(nodeEp)]->sub &&
+                                     r.gw.endpoints[static_cast<std::size_t>(nodeEp)]->sub->isConnected(); }, 0))
+        << "the client's publication to the node never connected";
+    ASSERT_TRUE(r.drive([&] { return nodeAnswers >= 1 || f.ready(); }, 1'000'000)) << "the node never got the resend";
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 20'000'000)) << "the DDL must end, not hang";
+    EXPECT_GE(nodeAnswers, 1) << "the node that came up answered the resend";
+    const auto& c = f.outcome().c;
+    EXPECT_EQ(c.status, rc::OpStatus::BrokerError) << payloadText(f);
+    EXPECT_EQ(c.errorCode, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_EQ(payloadText(f).find("unreachable"), std::string::npos) << payloadText(f);
+    r.passes(100, 20'000'000);
+    EXPECT_EQ(cq.timesCompleted(f.token()), 1);
+    EXPECT_EQ(r.client.testPendingControlOps(), 0u);
+}
+
 // I1 (review): the catalog leader's session is lost after the redirected DDL
 // reached it (it may have appended); the DDL is re-sent toward the seed with
 // the SAME frame and requestId, the seed redirects it to the new leader, and

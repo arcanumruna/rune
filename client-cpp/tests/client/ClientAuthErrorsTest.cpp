@@ -775,6 +775,38 @@ TEST(ProduceRouteRegression, ABatchRoutedToARejectedBrokerAfterTheSweepStillFail
     EXPECT_EQ(t.r.client.rejectedLeaderSessionsForTest(), 1u);
 }
 
+// C17 adversarial review (#60): sibling entry points to the edge-triggered sweep.  A producer CREATED after the
+// sweep (its own ProducerImpl, its own route table) whose batches go to the already-Rejected leader fails each one
+// with the Rejected node's code — never held, never re-swept per cycle; the sweep count grows by at most one per
+// refused offer and stays put once idle.
+TEST(ProduceRouteRegression, AdversarialANewProducerAfterTheSweepFailsOnTheRejectedLeaderRegression) {
+    RejectedNodeRig t(3880);
+    ASSERT_NO_FATAL_FAILURE(t.setupAndRevoke());
+    t.r.passes(50);
+    ASSERT_EQ(t.r.client.routedBrokerSweeps(), 1u);
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::All; pcfg.lingerUs = 60'000'000; pcfg.batchBytes = 64 * 1024;
+    pcfg.maxInFlight = 4; pcfg.produceTimeoutMs = 60'000; pcfg.deliveryTimeoutMs = 120'000;
+    const std::size_t producedBefore = t.r.gw.produced.size();
+    auto p2 = t.r.client.producer(pcfg);
+    const auto topic = t.r.client.topic("t");
+    std::vector<test_support::PendingOp> late;
+    for (int i = 0; i < 5; ++i) {
+        late.push_back(t.cq.send(p2, topic, TwoNodeRig::keyFor(0), t.val));
+        ASSERT_TRUE(late.back().accepted());
+        p2.flush();
+        ASSERT_TRUE(t.r.drive([&] { return late.back().ready(); })) << "batch " << i << " held behind the Rejected session";
+        EXPECT_EQ(late.back().outcome().c.status, rc::OpStatus::BrokerError) << i;
+        EXPECT_EQ(late.back().outcome().c.errorCode, 46) << i;
+    }
+    const uint64_t sweeps = t.r.client.routedBrokerSweeps();
+    EXPECT_GE(sweeps, 2u);
+    EXPECT_LE(sweeps, 1u + 5u) << "at most one sweep per refused offer";
+    t.r.passes(200);
+    EXPECT_EQ(t.r.client.routedBrokerSweeps(), sweeps) << "idle: no sweep while nothing is offered";
+    EXPECT_EQ(t.r.client.rejectedLeaderSessionsForTest(), 1u);
+    EXPECT_EQ(t.r.gw.produced.size(), producedBefore) << "nothing reached the Rejected node after its revoke";
+}
+
 // #291: a TRANSACTIONAL producer whose batches wait on a leader node session that goes Rejected fails them at once
 // (the Review-B path reaches transactional producers too) and its transaction is abortable.
 TEST(ClientAuthErrorsRegression, ATransactionalProducerWithBatchesOnARejectedLeaderNodeSessionFailsAtOnceRegression) {

@@ -272,3 +272,56 @@ TEST(RecordsViewRegression, HeaderCountMatchingBodyDecodesEveryRecordRegression)
     }
     EXPECT_EQ(cases, 5);
 }
+
+// ---- C17 adversarial review (#180): a REAL end-transaction marker in a Records frame -------------------------
+// The broker writes markers in the 75-byte layout of broker/libs/storage/include/rune/storage/ControlMarkerLayout.h:
+// ONE record WITHOUT a record-length varint (the control batches above are protocol-builder batches, which do carry
+// one, so they never exercised it).  A frame [data, marker, data] must deliver every data record, consume the
+// marker's offset, and count nothing malformed.
+//
+// Guards #180's control-batch exemption: ensureValid walks the records of data batches only.
+namespace {
+std::vector<uint8_t> brokerLayoutMarker(int64_t base, int16_t controlType) {
+    namespace pb = rune::protocol::batch;
+    std::vector<uint8_t> m(75, 0);
+    auto put = [&](std::size_t off, uint64_t v, int n) { for (int i = 0; i < n; ++i) m[off + static_cast<std::size_t>(i)] = uint8_t(v >> (8 * i)); };
+    put(0, static_cast<uint64_t>(base), 8);
+    put(pb::kLengthOffset, 75 - 12, 4);
+    put(12, 0xFFFFFFFFu, 4);                 // partitionLeaderEpoch -1
+    m[16] = 2;                               // magic
+    put(pb::kAttributesOffset, 0x0030, 2);   // CONTROL | TRANSACTIONAL
+    put(23, 0, 4);                           // lastOffsetDelta 0
+    put(43, 42, 8);                          // producerId
+    put(51, 0, 2);                           // producerEpoch
+    put(53, 0xFFFFFFFFu, 4);                 // baseSequence -1
+    put(pb::kRecordCountOffset, 1, 4);       // one record
+    // record (no length varint): attrs 0, tsDelta 0, offsetDelta 0, keyLen zz(2), key, valueLen zz(6), value, headers 0
+    m[64] = 0x04; put(65, static_cast<uint16_t>(controlType), 2);
+    m[67] = 0x0C; put(68, 1, 2); put(70, 7, 4);
+    m[74] = 0;
+    put(pb::kCrcOffset, rune::protocol::crc32c(m.data() + pb::kAttributesOffset, m.size() - pb::kAttributesOffset), 4);
+    return m;
+}
+}   // namespace
+
+TEST(SubscriberHubAdversarialRegression, ABrokerLayoutMarkerMidFrameIsConsumedAndTheDataAfterItDeliveredRegression) {
+    for (const int16_t type : {int16_t{0}, int16_t{1}}) {   // commit, abort
+        SCOPED_TRACE("controlType=" + std::to_string(type));
+        Bound b(kTopic, 900 + type, 950 + type);
+        const auto frame = concat({batchAt(0, 3), brokerLayoutMarker(3, type), batchAt(4, 2)});
+        b.hub.onRecords(b.view(frame, 0));
+        EXPECT_EQ(b.delivered, (std::vector<int64_t>{0, 1, 2, 4, 5})) << "the data after the marker is delivered";
+        EXPECT_EQ(b.impl->nextOffset, 6) << "the position passes the marker and the batch after it";
+        EXPECT_EQ(b.hub.malformedBatches(), 0u) << "a broker marker is not malformed";
+        EXPECT_EQ(b.hub.controlBatchesSkipped(), 1u);
+    }
+}
+
+TEST(SubscriberHubAdversarialRegression, AFrameOpeningWithABrokerLayoutMarkerMovesThePositionRegression) {
+    Bound b(kTopic, 960, 970);
+    const auto frame = concat({brokerLayoutMarker(0, 0), batchAt(1, 2)});
+    b.hub.onRecords(b.view(frame, 0));
+    EXPECT_EQ(b.delivered, (std::vector<int64_t>{1, 2}));
+    EXPECT_EQ(b.impl->nextOffset, 3) << "never stuck before the marker";
+    EXPECT_EQ(b.hub.malformedBatches(), 0u);
+}

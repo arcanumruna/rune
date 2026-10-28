@@ -379,6 +379,10 @@ public:
         uint32_t actual = crc32c(d_ + batch::kAttributesOffset,
                                  static_cast<size_t>(tl) - batch::kAttributesOffset);
         if (stored != actual) return false;
+        // A control batch has its own record layout (the broker's end-txn marker has no record-length varint,
+        // storage/ControlMarkerLayout.h): every reader checks isControl() and parses it with that layout, never with
+        // forEachRecord(), so the record walk below applies to data batches only.
+        if (isControl()) return true;
         return recordsMatchCount_(static_cast<size_t>(tl));
     }
 
