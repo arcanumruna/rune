@@ -245,13 +245,17 @@ public:
     }
 
     // ---- #373: the partition leader rejected a batch with a sequence gap (OutOfOrderSequence 20 / UnknownProducerId 28)
-    // that was the head of its partition: the transaction can only abort (its abort's epoch bump restarts the
-    // sequences).  The caller injects it only where nothing else is in flight, so the batch is the head. ----
-    void produceGap(int16_t code) {
+    // that was the head of its partition.  A 20 can only abort the transaction (its abort's epoch bump restarts the
+    // sequences).  #694: a 28 means the broker holds no producer state for us on that partition; when this
+    // transaction has no acked batch there (`txnDataOnPartition` false) the client restarts the partition's
+    // sequences at 0 under the same epoch and the transaction CONTINUES; when its own acked data is gone (true) it
+    // can only abort.  The caller injects it only where nothing else is in flight, so the batch is the head. ----
+    void produceGap(int16_t code, bool txnDataOnPartition = true) {
         if (state != State::InTxn) {
             errors.push_back("model: a produce gap landed in state " + std::string(name(state)));
             return;
         }
+        if (code == 28 && !txnDataOnPartition) return;   // restarted in place: nothing changes
         toAbortable_({Status::BrokerError, static_cast<uint16_t>(code)});
     }
 

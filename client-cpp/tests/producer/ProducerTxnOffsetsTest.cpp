@@ -531,14 +531,15 @@ TEST(ProducerTxnOffsetsRegression, EmptySendOffsetsCompletesLocallyWithNoWireTra
     EXPECT_EQ(r.impl->txnStateDuty(), TxnState::Ready);
 }
 
-// #348: an empty call while a real one runs completes Ok at once and leaves the running call alone.
-TEST(ProducerTxnOffsetsRegression, EmptySendOffsetsDuringARunningCallLeavesItAloneRegression) {
+// #348 / #698: an empty call while a real one runs is refused (InvalidArgument; one call at a time) and leaves the
+// running call alone.
+TEST(ProducerTxnOffsetsRegression, EmptySendOffsetsDuringARunningCallIsRefusedAndLeavesItAloneRegression) {
     Rig r;
     r.inTxn();
     const Token a = r.sendOffsets(offsetsOf(2), "grp-a");
     const Token e = r.sendOffsets({}, "grp-e");
     ASSERT_EQ(r.d(e).times, 1);
-    EXPECT_EQ(r.d(e).status, OpStatus::Ok);
+    EXPECT_EQ(r.d(e).status, OpStatus::InvalidArgument);
     EXPECT_EQ(r.d(a).times, 0);
     r.sendOk(a);
     ASSERT_EQ(r.d(a).times, 1);
@@ -1405,6 +1406,37 @@ TEST(ProducerTxnOffsetsRegression, EmptySendOffsetsInEveryTxnStateAdversarialReg
     EXPECT_EQ(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).size(), 2u) << "only the two real calls sent AddOffsets";
 }
 
+// #698: one sendOffsets at a time applies to an EMPTY second call too (the in-flight check runs before the empty-list
+// shortcut): InvalidArgument, no frame; the first one is untouched and completes Ok when answered.  An empty call with
+// nothing in flight is still Ok locally.
+// RED (mutation): the empty-list check moved back ahead of the in-flight check (the empty call completes Ok).
+TEST(ProducerTxnOffsetsRegression, AnEmptySendOffsetsWhileOneIsInFlightIsInvalidArgumentRegression) {
+    Rig r;
+    r.inTxn();
+    const Token first = r.sendOffsets(offsetsOf(2), "grp-a");
+    r.tick();   // AddOffsetsToTxn on the wire, unanswered: the first call is in flight
+    ASSERT_EQ(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).size(), 1u);
+    const std::size_t framesBefore = r.cap.frames.size();
+    const Token second = r.sendOffsets({}, "grp-a");
+    ASSERT_EQ(r.d(second).times, 1);
+    EXPECT_EQ(r.d(second).status, OpStatus::InvalidArgument) << "a second call, even an empty one, is refused";
+    r.tick();
+    EXPECT_EQ(r.cap.frames.size(), framesBefore) << "the refusal sends nothing";
+    EXPECT_EQ(r.d(first).times, 0);
+    r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+    r.tick();
+    for (const auto& f : r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID)) {
+        if (r.d(first).times == 0) r.answerFrame(f, rp::ReqKind::TxnOffsetCommit, 0);
+    }
+    ASSERT_EQ(r.d(first).times, 1);
+    EXPECT_EQ(r.d(first).status, OpStatus::Ok);
+    EXPECT_EQ(r.d(second).times, 1) << "the refused call is never completed again";
+    EXPECT_EQ(r.impl->txnStateDuty(), TxnState::InTransaction) << "the transaction is not poisoned";
+    const Token third = r.sendOffsets({}, "grp-a");
+    ASSERT_EQ(r.d(third).times, 1);
+    EXPECT_EQ(r.d(third).status, OpStatus::Ok) << "nothing in flight: an empty list completes Ok locally";
+}
+
 // #347 x concurrency: the same refused call repeated while the first runs, then the first FAILS.  Each refusal
 // completes once with InvalidArgument and is never touched again; the first's failure alone poisons the transaction
 // (its code, not the refusal's); a later call gets the poison; after the abort a new transaction's call runs (the
@@ -1455,4 +1487,60 @@ TEST(ProducerTxnOffsetsRegression, RefusedSecondCallsDuringAFailingFirstKeepOnly
     r.sendOk(d);
     ASSERT_EQ(r.d(d).times, 1);
     EXPECT_EQ(r.d(d).status, OpStatus::Ok);
+}
+
+// #698 x timing (back-to-back from the completion): the app issues an EMPTY sendOffsets from inside the first call's
+// completion callback (the public path: through the ring).  The first call is over by then (its slot is free before
+// its completion runs), so the empty call is NOT refused as "one in flight": it completes Ok exactly once, sends
+// nothing, and a following real call runs normally.
+// RED (mutation): the finished call's slot never returned to idle (the in-flight check, now ahead of the empty-list
+// shortcut, refuses the empty call with InvalidArgument).
+TEST(ProducerTxnOffsetsRegression, AnEmptySendOffsetsIssuedFromTheFirstsCompletionIsOkAdversarialRegression) {
+    Rig r;
+    r.inTxn();
+    struct Reenter {
+        Rig*        r = nullptr;
+        Done        first;
+        Rig::Issued second{0, rc::OpResult::Accepted};
+        bool        fired = false;
+        static void on(void* ctx, const rc::Completion& c, std::span<const uint8_t> t) noexcept {
+            auto* self = static_cast<Reenter*>(ctx);
+            Done::on(&self->first, c, t);
+            if (!self->fired) {
+                self->fired  = true;
+                self->second = self->r->issue(TxnControl::Kind::SendOffsets, {}, "grp-a");
+            }
+        }
+    } re;
+    re.r = &r;
+    const auto offs = offsetsOf(2);
+    TxnControl c;
+    c.kind           = TxnControl::Kind::SendOffsets;
+    c.target.handler = rc::CompletionHandler{&Reenter::on, &re};
+    c.token          = 60;
+    c.offsets        = offs;
+    c.groupId        = "grp-a";
+    r.impl->applyTxnControl(c, r.now);
+    r.tick();
+    r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+    r.tick();
+    for (const auto& f : r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID)) {
+        if (re.first.times == 0) r.answerFrame(f, rp::ReqKind::TxnOffsetCommit, 0);
+    }
+    ASSERT_EQ(re.first.times, 1);
+    EXPECT_EQ(re.first.status, OpStatus::Ok);
+    ASSERT_TRUE(re.fired);
+    ASSERT_EQ(re.second.result, rc::OpResult::Accepted);
+    const std::size_t frames = r.cap.frames.size();
+    r.tick();   // the ring is drained: the empty call is applied
+    ASSERT_EQ(r.d(re.second.token).times, 1);
+    EXPECT_EQ(r.d(re.second.token).status, OpStatus::Ok) << "nothing in flight any more";
+    EXPECT_EQ(r.cap.frames.size(), frames) << "an empty call sends nothing";
+    const Token third = r.sendOffsets(offsetsOf(1), "grp-a");
+    r.sendOk(third);
+    ASSERT_EQ(r.d(third).times, 1);
+    EXPECT_EQ(r.d(third).status, OpStatus::Ok);
+    EXPECT_EQ(re.first.times, 1);
+    EXPECT_EQ(r.d(re.second.token).times, 1);
+    EXPECT_EQ(r.impl->txnStateDuty(), TxnState::InTransaction);
 }

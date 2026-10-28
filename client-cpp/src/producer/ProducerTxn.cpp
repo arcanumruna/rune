@@ -12,6 +12,8 @@
 //   * B-3 / B-4 (KIP-360): a sequence gap makes the abort bump the epoch (InitProducerId after EndTxn(abort));
 //     once EndTxn(abort) is answered the end phase is Bumping (then InDoubt{Bump} if the bump times out), so a
 //     retried abort re-sends ONLY the bump;
+//   * #345: a commit OR an abort also bumps once a sequence passed kTxnSeqBumpAt (after EndTxn(commit) is answered OK: Bumping, then
+//     the commit completes Ok; a failed bump completes it Ok and the producer is FatalError);
 //   * m15: TxnStarted::Maybe + 19 on EndTxn(abort) = nothing was open: the abort is done;
 //   * FD6: 17 / 18 -> FatalError(Fenced); 19 or 45 / 47 on EndTxn, any non-retriable InitProducerId ->
 //     FatalError(BrokerError code); 39 on the FIRST EndTxn -> AbortableError(39); a leg's 19 / 45 / unknown ->
@@ -73,9 +75,12 @@ inline TxnStarted upgrade(TxnStarted cur, TxnStarted s) noexcept {
 }
 /// EndTxn may have reached the coordinator (sent, or its re-send pending): a commit there may have landed.
 inline bool endMayHaveLanded(const EndPhase& p) noexcept {
-    if (std::holds_alternative<EndSent>(p) || std::holds_alternative<ResendEnd>(p)) return true;
+    // Bumping / InDoubt{Bump} after a COMMIT (#345): EndTxn(commit) was answered OK, the commit HAS landed.
+    if (std::holds_alternative<EndSent>(p) || std::holds_alternative<ResendEnd>(p) || std::holds_alternative<Bumping>(p)) {
+        return true;
+    }
     const auto* d = std::get_if<InDoubt>(&p);
-    return d != nullptr && d->at == InDoubtAt::AfterEnd;
+    return d != nullptr && (d->at == InDoubtAt::AfterEnd || d->at == InDoubtAt::Bump);
 }
 /// EndTxn(abort) was answered OK; only the KIP-360 bump is left (the old `ended`).
 inline bool abortEnded(const EndPhase& p) noexcept {
@@ -640,15 +645,31 @@ void ProducerImpl::enterFatal_(OpStatus st, uint16_t errorCode, std::string_view
 }
 
 void ProducerImpl::endDone_(int64_t nowNs) noexcept {
-    if (auto* ab = std::get_if<Aborting>(&txn_); ab != nullptr && ab->kind == AbortKind::BumpEpoch) {
-        // B-3 (KIP-360): the aborted transaction left a sequence gap - bump the epoch (InitProducerId for this
+    if (auto* ab = std::get_if<Aborting>(&txn_); ab != nullptr && (ab->kind == AbortKind::BumpEpoch || seqBumpDue_())) {
+        // B-3 (KIP-360): the aborted transaction left a sequence gap - or, #345, an abort (like a commit) left a
+        // partition's sequence space more than half used - bump the epoch (InitProducerId for this
         // transactional id) and restart every sequence before Ready; the abort completes after the bump.  B-4:
         // from here nothing is open on the broker: Bumping / InDoubt{Bump} - a retried abort re-sends only the bump.
         ab->op.deadlineNs = nowNs + txnOpTimeoutNs_();
         ab->phase         = Bumping{nullptr};   // txnStep sends it
         return;
     }
+    // #345: a commit that left a partition's sequence space more than half used bumps the epoch too, so the space is
+    // never exhausted across transactions (the commit has landed; it completes Ok once the bump is answered).
+    if (auto* cm = std::get_if<Committing>(&txn_); cm != nullptr && seqBumpDue_()) {
+        cm->op.deadlineNs = nowNs + txnOpTimeoutNs_();
+        cm->phase         = Bumping{nullptr};   // txnStep sends it
+        return;
+    }
     finishTxn_();
+}
+
+bool ProducerImpl::seqBumpDue_() const noexcept {
+    // Control path (once per commit), never per record: a scan of the partitions.
+    for (const auto& up : partitions_) {
+        if (up->nextBaseSequence > kTxnSeqBumpAt) return true;
+    }
+    return false;
 }
 
 void ProducerImpl::finishTxn_() noexcept {
@@ -754,12 +775,32 @@ void ProducerImpl::onTxnInitAnswer_(const CoordAnswer& a, CoordinatorLink::Slot&
         }
         return;
     }
+    // The bump follows an abort (B-3), #345 an abort whose sequences passed kTxnSeqBumpAt, or a commit whose sequences passed kTxnSeqBumpAt.
     const auto* ab = std::get_if<Aborting>(&txn_);
-    const auto* b  = ab != nullptr ? std::get_if<Bumping>(&ab->phase) : nullptr;
+    auto*       cm = std::get_if<Committing>(&txn_);
+    const auto* b  = ab != nullptr ? std::get_if<Bumping>(&ab->phase)
+                                   : (cm != nullptr ? std::get_if<Bumping>(&cm->phase) : nullptr);
     if (b == nullptr || b->slot != &s) return;   // stale
+    if (v != Verdict::Ok && cm != nullptr) {
+        // #345: the COMMIT HAS LANDED, so it completes Ok; the producer cannot continue under an epoch it failed to
+        // renew: FatalError with the bump's status.  Copy the commit out and leave Ready (enterFatal_ then takes no
+        // commit op) - the state is FatalError BEFORE the completions are delivered (a handler's next op is refused).
+        const TxnOp      op     = cm->op;
+        const TxnJoiners joined = cm->joined;
+        txn_ = Ready{};
+        if (v == Verdict::Fenced) {
+            enterFatal_(OpStatus::Fenced, ucode, "the epoch bump after the commit failed (fatal): producer fenced");
+        } else {
+            enterFatal_(OpStatus::BrokerError, ucode, "the epoch bump after the commit failed (fatal)");
+        }
+        constexpr std::string_view kWhy = "committed; the producer is now fatal: the epoch bump after the commit failed";
+        completeTxn_(op, OpKind::CommitTransaction, OpStatus::Ok, 0, kWhy);
+        completeJoined_(joined, OpKind::CommitTransaction, OpStatus::Ok, 0, kWhy);
+        return;
+    }
     if (v == Verdict::Ok) {
         // KIP-360: every partition restarts its sequences under the bumped epoch (assignIdentity_ adopts it;
-        // a partition with stored batches - none after a settled abort - is re-stamped there).
+        // a partition with stored batches - none after a settled abort / commit - is re-stamped there).
         for (auto& up : partitions_) {
             PartitionState& ps = *up;
             ps.producerId = -1;
@@ -769,7 +810,7 @@ void ProducerImpl::onTxnInitAnswer_(const CoordAnswer& a, CoordinatorLink::Slot&
             }
         }
         assignIdentity_(pid, epoch);
-        finishTxn_();   // the abort is complete under the bumped epoch
+        finishTxn_();   // the abort (or, #345, the commit) is complete under the bumped epoch
     } else if (v == Verdict::Fenced) {
         enterFatal_(OpStatus::Fenced, ucode, "abortTransaction: producer fenced on the epoch bump (fatal)");
     } else {
@@ -1006,7 +1047,8 @@ void ProducerImpl::onAddPartitionsAnswer_(const CoordAnswer& a, CoordinatorLink:
     default:
         break;
     }
-    // Per partition: its own result when the response names it, else the request's (worst) code.
+    // Per partition: its own result when the response names it; an unnamed one fails (a parsed answer) or takes the
+    // request's (worst) code (an ErrorResponse).
     std::optional<rpc::AddPartitionsToTxnResponse> m;
     if (!a.anyKind) m = rpc::AddPartitionsToTxnResponse::decode(a.frame.data(), a.frame.size());
     bool     anyOk    = false;
@@ -1015,7 +1057,8 @@ void ProducerImpl::onAddPartitionsAnswer_(const CoordAnswer& a, CoordinatorLink:
         PartitionState& ps = *partitions_[slot];
         const auto* ad = std::get_if<Adding>(&ps.txn);
         if (ad == nullptr || ad->slot != &s) continue;
-        int16_t code = worst;
+        // #698: a parsed answer that does not name this partition fails it (InvalidRequest): the broker never said Ok.
+        int16_t code = m ? static_cast<int16_t>(kInvalidRequest) : worst;
         if (m) {
             for (std::size_t i = 0; i < m->results.size(); ++i) {
                 const auto r = m->results[i];
@@ -1148,7 +1191,8 @@ static_assert(ProducerImpl::kTxnResetUnknownPid == static_cast<uint16_t>(rpc::Er
 void ProducerImpl::txnResetPartition_(PartitionState& ps, uint16_t cause) noexcept {
     // KIP-360: a transactional producer's epoch belongs to its coordinator - a local bump would put this
     // partition's data under an epoch no EndTxn ever ends.  The partition sends nothing new (not Added, its id
-    // pending), the transaction can only abort, and the abort's epoch bump restarts every sequence.
+    // pending), the transaction can only abort, and the abort's epoch bump restarts every sequence.  (An
+    // UnknownProducerId on a partition this transaction has not acked on never gets here: restartInPlace_, #694.)
     ps.producerId = -1;
     const bool first = std::holds_alternative<NotInTxn>(ps.txn) || std::holds_alternative<Added>(ps.txn);
     if (first) {
@@ -1304,18 +1348,19 @@ void ProducerImpl::applySendOffsets_(const TxnControl& c, const TxnOp& op) {
                    "most 512 bytes");
         return;
     }
-    // #348: nothing to commit - Ok locally, no wire traffic.  AddOffsetsToTxn would open the transaction on the
-    // coordinator (TxnStarted::Yes) and make a commit send an EndTxn for an otherwise empty transaction (Kafka
-    // returns at once).  Checked after the argument validation, before the in-flight check: it needs no scratch.
-    if (c.offsets.empty()) {
-        completeTxn_(op, OpKind::SendOffsets, OpStatus::Ok, 0, {});
-        return;
-    }
-    // #347: one call in flight (the TxnOffsetCommit frames are built from ONE scratch).  A second is refused clearly
-    // - InvalidArgument, not the state-error code 19; the first completes normally and the transaction is not poisoned.
+    // #347/#698: one call in flight (the TxnOffsetCommit frames are built from ONE scratch).  A second - even an empty
+    // one - is refused clearly: InvalidArgument, not the state-error code 19; the first completes normally and the
+    // transaction is not poisoned.  Checked before the empty-list case.
     if (offsetsOp_.index() != 0) {
         refuseTxn_(c, OpStatus::InvalidArgument, 0,
                    "a sendOffsetsToTransaction is already in flight on this producer; wait for its completion");
+        return;
+    }
+    // #348: nothing to commit - Ok locally, no wire traffic.  AddOffsetsToTxn would open the transaction on the
+    // coordinator (TxnStarted::Yes) and make a commit send an EndTxn for an otherwise empty transaction (Kafka
+    // returns at once).  Checked after the in-flight check (#698): it needs no scratch.
+    if (c.offsets.empty()) {
+        completeTxn_(op, OpKind::SendOffsets, OpStatus::Ok, 0, {});
         return;
     }
     OffsetsScratch& sc = *offsetsScratch_;   // allocated at construction of a transactional producer
