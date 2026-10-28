@@ -2028,3 +2028,11 @@ TEST(DdlAuthUnavailableRegression, SecurityBootstrapAnswered48IsRetriedRegressio
     EXPECT_TRUE(f.ok()) << f.describe();
     EXPECT_EQ(seen, 3);
 }
+
+TEST(ClientAuthErrorsRegression, AuthErrorNamesCoverNamespaceCodesRegression) {
+    EXPECT_STREQ(rc::authErrorName(51), "NamespaceSuspended");
+    EXPECT_STREQ(rc::authErrorName(52), "NamespaceLimitExceeded");
+    EXPECT_STREQ(rc::authErrorName(53), "Throttled");
+    EXPECT_STREQ(rc::authErrorName(54), "ViewPaused");
+    EXPECT_EQ(rc::authErrorName(55), nullptr);
+}

@@ -1702,3 +1702,15 @@ TEST(ClientCryptoRegression, AReceiverSlotFromAnEarlierEpisodeNeverSealsAfterAFa
     EXPECT_TRUE(opensUnder(new3, keys2.c2bPrefix, keys2.cipher, fr));
     EXPECT_FALSE(opensUnder(old3, keys1.c2bPrefix, keys1.cipher, fr));
 }
+
+// Handshaking holds no authenticated session (plaintext, forgeable): a corr-0 session-end notice (46 / 51) is ignored.
+TEST(ClientCryptoRegression, SessionEndNoticeIsIgnoredWhileHandshakingRegression) {
+    for (const int16_t code : {int16_t{46}, int16_t{51}}) {
+        FrameFixture f;
+        ASSERT_TRUE(f.srv.valid());
+        (void)intoHandshaking(f, 1'000'000'000LL);
+        ASSERT_EQ(f.m.state(), sm::SessionState::Handshaking);
+        f.m.onErrorResponse(code, "end", /*corr=*/0, 1'000'000'020LL, FrameFixture::kSessionId);
+        EXPECT_EQ(f.m.state(), sm::SessionState::Handshaking) << code;
+    }
+}

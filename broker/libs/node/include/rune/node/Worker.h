@@ -8272,8 +8272,9 @@ private:
         WorkerReturn ret = produceAnswer_(ProduceOrigin::WorkerIngress, msg.sessionId, msg.correlationId,
                                           msg.topicId, msg.partition);
         ret.directAck = directAck;
-        ret.errorCode = static_cast<int16_t>(ackSink_->clientVersionOf(msg.sessionId) >= pc::kClientVersionNamespaces
-                                                 ? pc::ErrorCode::NamespaceSuspended : pc::ErrorCode::InvalidRequest);
+        // NamespaceSuspended; a client older than 14 is answered InvalidRequest by produceErrorForClient when the
+        // ProduceResponse is encoded for its session (DataMessages.h encodeFor) - the ONE mapping site for 51/52/53.
+        ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NamespaceSuspended);
         enqueueReturn_(ret);
         return 1;
     }

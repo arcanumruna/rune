@@ -656,11 +656,6 @@ public:
         const std::size_t idx = find_(sessionId);
         return idx == kNone ? nullptr : &grants_[idx];
     }
-    /// Cold (a refusal's answer code): the session's ConnectRequest.clientVersion (0 = no such session).
-    [[nodiscard]] int32_t clientVersionOf(int64_t sessionId) const noexcept {
-        const std::size_t idx = find_(sessionId);
-        return idx == kNone ? 0 : clientVersion_[idx];
-    }
     /// Issue #259: swap `words` into TABLE `tableId` (the old buffer comes back in `words`): no allocation.  Every
     /// session bound to it sees the new bits at once.  False = an id beyond the store (never sent by the runtime).
     bool installWriteGrants(int64_t tableId, std::vector<uint64_t>& words, bool grantAll, uint64_t /*epoch*/,

@@ -492,8 +492,8 @@ inline constexpr int32_t kBrokerVersion                           = 8;   // what
         return ErrorCode::NotLeader;   // Phase 2b E2: a pre-v6 client's retriable code
     if (ec == ErrorCode::ConcurrentTransactions && !clientUnderstandsProduceTxnVerify(clientVersion)) [[unlikely]]
         return ErrorCode::NotLeader;   // issue #112: a pre-v13 client's retriable code
-    if ((ec == ErrorCode::NamespaceLimitExceeded || ec == ErrorCode::Throttled) && clientVersion < kClientVersionNamespaces) [[unlikely]]
-        return ErrorCode::InvalidRequest;   // namespaces Phase 2 Task 11: the Phase 1 codes exist only for a v14+ client
+    if ((ec == ErrorCode::NamespaceSuspended || ec == ErrorCode::NamespaceLimitExceeded || ec == ErrorCode::Throttled) && clientVersion < kClientVersionNamespaces) [[unlikely]]
+        return ErrorCode::InvalidRequest;   // namespaces Phase 2 Task 11: the namespace codes (51-53) exist only for a v14+ client
     return ec;
 }
 

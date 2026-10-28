@@ -83,6 +83,10 @@ enum class OpStatus : uint8_t {
     case 46: return "SessionRevoked";
     case 47: return "PasswordChangeRequired";
     case 48: return "AuthUnavailable";   // issues #15 / #111: this broker cannot vouch for its security state: retriable
+    case 51: return "NamespaceSuspended";
+    case 52: return "NamespaceLimitExceeded";
+    case 53: return "Throttled";
+    case 54: return "ViewPaused";
     default: return nullptr;
     }
 }
