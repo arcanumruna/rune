@@ -452,6 +452,17 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
                            "in RUNE_PEERS (7th and 8th segments); until then new clients use the declared egress path");
         }
         for (auto& p : cfg.peers) {
+            const auto d = deriveShardBasePorts(p.id, W);
+            if (!d && (p.ingressBasePort == 0 || p.replBasePort == 0 || p.egressControlBasePort == 0))
+                appendWarn(out.warnings, "node id " + std::to_string(p.id) + " is outside the derived shard "
+                           "port range [0, 126] — advertise its replBase:ingressBase:egressControlBase in RUNE_PEERS");
+            if (p.ingressBasePort == 0 && d)       { p.ingressBasePort = static_cast<uint16_t>(d->ingress); portsDerived = true; }
+            if (p.replBasePort == 0 && d)          { p.replBasePort = static_cast<uint16_t>(d->repl); portsDerived = true; }
+            if (p.egressControlBasePort == 0 && d) { p.egressControlBasePort = static_cast<uint16_t>(d->egressControl); portsDerived = true; }
+            if (p.id == cfg.nodeId && p.workerCount == 0) p.workerCount = W;
+        }
+        // Peers' response-control ports (after their egress bases are resolved above).
+        for (auto& p : cfg.peers) {
             if (p.id == cfg.nodeId) {
                 if (p.responseControlBasePort == 0 && cfg.responseControlBasePort)
                     p.responseControlBasePort = static_cast<uint16_t>(*cfg.responseControlBasePort);
@@ -466,16 +477,6 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
                 if (p.responseControlBasePort == 0)    p.responseControlBasePort = static_cast<uint16_t>(prc->workerBase);
                 if (p.gatewayResponseControlPort == 0) p.gatewayResponseControlPort = static_cast<uint16_t>(prc->gateway);
             }
-        }
-        for (auto& p : cfg.peers) {
-            const auto d = deriveShardBasePorts(p.id, W);
-            if (!d && (p.ingressBasePort == 0 || p.replBasePort == 0 || p.egressControlBasePort == 0))
-                appendWarn(out.warnings, "node id " + std::to_string(p.id) + " is outside the derived shard "
-                           "port range [0, 126] — advertise its replBase:ingressBase:egressControlBase in RUNE_PEERS");
-            if (p.ingressBasePort == 0 && d)       { p.ingressBasePort = static_cast<uint16_t>(d->ingress); portsDerived = true; }
-            if (p.replBasePort == 0 && d)          { p.replBasePort = static_cast<uint16_t>(d->repl); portsDerived = true; }
-            if (p.egressControlBasePort == 0 && d) { p.egressControlBasePort = static_cast<uint16_t>(d->egressControl); portsDerived = true; }
-            if (p.id == cfg.nodeId && p.workerCount == 0) p.workerCount = W;
         }
         if (portsDerived) mark("shardPorts");
     }

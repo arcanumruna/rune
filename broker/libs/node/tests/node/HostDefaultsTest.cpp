@@ -834,7 +834,7 @@ TEST(HostDefaults, InvalidMtuIsRefusedAndGarbageCoreBaseDisables) {
     auto r = parse({{"RUNE_PEERS", "0@127.0.0.1:40110:40200:40220:40600:40500:40400"}});
     ASSERT_TRUE(r.config.has_value()) << r.error;
     EXPECT_EQ(r.config->peers[0].egressControlBasePort, 40400);
-    EXPECT_FALSE(parse({{"RUNE_PEERS", "0@127.0.0.1:1:2:3:4:5:6:7:8"}}).config.has_value()) << "max 8 segments";
+    EXPECT_FALSE(parse({{"RUNE_PEERS", "0@127.0.0.1:1:2:3:4:5:6:7:8:9"}}).config.has_value()) << "max 8 segments";
 }
 
 // REGRESSION (k3s, broker 7ad0b2a): cluster.sh-style config — client bind
@@ -1117,8 +1117,11 @@ TEST(HostDefaultsRegression, NodeBoundPortsListsEveryPortTheNodeBindsRegression)
     ASSERT_TRUE(d);
     std::vector<int32_t> want = {40112, 40202, 40222, d->ingress, d->ingress + 1, d->repl, d->repl + 1,
                                  d->egressControl, d->egressControl + 1};
+    const auto rc = deriveResponseControlPorts(d->egressControl, 2);
+    ASSERT_TRUE(rc);
+    for (const int32_t p : {rc->gateway, rc->workerBase, rc->workerBase + 1}) want.push_back(p);
     std::sort(want.begin(), want.end());
-    EXPECT_EQ(nodeBoundPorts(c), want) << "consensus, client, replication + every worker's three shard ports";
+    EXPECT_EQ(nodeBoundPorts(c), want) << "consensus, client, replication + every worker's three shard ports + the response-control ports";
 }
 
 TEST(HostDefaultsRegression, BoundPortInsideTheEphemeralRangeWarnsUnlessReservedRegression) {

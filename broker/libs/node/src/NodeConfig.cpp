@@ -598,9 +598,7 @@ std::optional<std::string> NodeConfig::validateShardConfig() const {
         binds.push_back({ingressBase + w, "workerIngress" + tag});
         binds.push_back({replBase + w, "workerRepl" + tag});
         binds.push_back({egressBase + w, "workerEgressControl" + tag});
-        if (responseControlBasePort) binds.push_back({*responseControlBasePort + w, "workerResponseControl" + tag});
     }
-    if (gatewayResponseControlPort) binds.push_back({*gatewayResponseControlPort, "gatewayResponseControl"});
     for (std::size_t i = 0; i < binds.size(); ++i)
         for (std::size_t j = i + 1; j < binds.size(); ++j)
             if (binds[i].port == binds[j].port)

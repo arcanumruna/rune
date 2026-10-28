@@ -3,10 +3,10 @@
 //
 // Mechanic (exact channel strings, as built by aeron::ChannelUriStringBuilder):
 //   server : request subscription  aeron:udp?endpoint=127.0.0.1:<S_REQ>                          (stream 3001)
-//   client : response subscription aeron:udp?control-mode=response|control=127.0.0.1:<S_RSP>      (stream 3002)
+//   client : response subscription aeron:udp?control=127.0.0.1:<S_RSP>|control-mode=response      (stream 3002)
 //   client : request publication   aeron:udp?endpoint=127.0.0.1:<S_REQ>|response-correlation-id=<rsp sub registrationId>
 //   server : per request image, EXCLUSIVE response publication
-//            aeron:udp?control-mode=response|control=127.0.0.1:<S_RSP>|response-correlation-id=<image->correlationId()>
+//            aeron:udp?control=127.0.0.1:<S_RSP>|control-mode=response|response-correlation-id=<image->correlationId()>
 //
 // Findings (each guarded by a test below):
 //   * OneControlPortServesManyClients: N exclusive response publications share ONE response-control port
@@ -32,7 +32,6 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
-#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -203,7 +202,6 @@ TEST(ResponseEgressSpikeRegression, OneControlPortServesManyClientsRegression) {
         ASSERT_TRUE(p) << "response publication never resolved for session " << session;
         pubBySession[session] = p;
     }
-    std::printf("TMPSTR %s\nTMPSTR %s\nTMPSTR %s\nTMPSTR %s\n", ("aeron:udp?endpoint=" + reqEp).c_str(), respSubChannel(rspCtl).c_str(), reqPubChannel(reqEp, 123).c_str(), rspPubChannel(rspCtl, 456).c_str());
     ASSERT_EQ(pubBySession.size(), static_cast<size_t>(N));
     ASSERT_TRUE(pumpUntil([&] {
         for (auto& [s, p] : pubBySession) if (!p->isConnected()) return false;
