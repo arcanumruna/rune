@@ -17,6 +17,12 @@
 #include <sstream>
 #include <type_traits>
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <rune/client/detail/SecureZero.h>
+
 #ifdef RUNE_CLI_LIVE_ENABLED
 #include <rune/client/view/ViewPlanAuthor.h>
 #include <rune/protocol/client/SchemaMessages.h>
@@ -392,26 +398,40 @@ void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std:
     if (rid) out << "  request-id " << requestIdHex(*rid) << "\n";
 }
 
-/// Reads the whole script text: a file, or @p stdinStream for "-".
+/// Reads the whole script text: a file, or @p stdinStream for "-".  The text may hold password literals (#305): it is
+/// read through a fixed buffer and grown with appendWiped, so no copy of it is freed unwiped (no stringstream).
 bool readScript(const std::string& path, std::istream& stdinStream, std::string& text, std::ostream& err) {
+    char chunk[4096];
+    struct ChunkWipe { char* b; ~ChunkWipe() { rune::client::detail::secureZero(b, sizeof chunk); } } chunkWipe{chunk};
+    rune::client::detail::wipeString(text);
     if (path == "-") {
-        std::ostringstream buf;
-        buf << stdinStream.rdbuf();
-        text = buf.str();
+        std::streambuf* sb = stdinStream.rdbuf();
+        for (std::streamsize n; sb != nullptr && (n = sb->sgetn(chunk, sizeof chunk)) > 0;)
+            rune::client::detail::appendWiped(text, std::string_view(chunk, static_cast<std::size_t>(n)));
         return true;
     }
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
         err << "rune: cannot open file: " << path << "\n";
         return false;
     }
-    std::ostringstream buf;
-    buf << f.rdbuf();
-    if (f.bad()) {
+    bool ok = true;
+    for (;;) {
+        const ssize_t n = ::read(fd, chunk, sizeof chunk);
+        if (n == 0) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+            break;
+        }
+        rune::client::detail::appendWiped(text, std::string_view(chunk, static_cast<std::size_t>(n)));
+    }
+    ::close(fd);
+    if (!ok) {
+        rune::client::detail::wipeString(text);
         err << "rune: cannot read file: " << path << "\n";
         return false;
     }
-    text = buf.str();
     return true;
 }
 
@@ -700,8 +720,8 @@ bool QlRun::awaitLastSecurityDdl() {
 }
 
 bool QlRun::run(const PSecurity& s, const rc::DdlOptions& ddl) {
-    ql::SecurityPlan plan = s.plan;   // the client wipes this copy; the Prepared's own is wiped by its destructor
-    const auto r = broker.client().securityDdlAndWait(std::move(plan), ddl, broker.ddlTimeout());
+    // The client wipes its copy (the by-value parameter); the Prepared's own is wiped here and by its destructor.
+    const auto r = broker.client().securityDdlAndWait(s.plan, ddl, broker.ddlTimeout());
     s.wipe();
     broker.flushVerbose(err);
     if (r.errorCode != 0) return failBroker(r.errorCode, r.detail);

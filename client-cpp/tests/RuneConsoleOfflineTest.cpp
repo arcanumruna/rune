@@ -5,12 +5,17 @@
 
 #include <fcntl.h>
 #include <pty.h>
+#include <poll.h>
+#include <sched.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <signal.h>
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -26,6 +31,7 @@
 #include "rune/ql/Parser.h"
 
 #include "QlEngine.h"   // src/cli: splitStatements, the engine's internal seams
+#include "support/AllocCounter.h"
 
 namespace fs = std::filesystem;
 
@@ -762,6 +768,95 @@ TEST(ConsoleOfflineRegression, WipeStringZeroesTheWholeCapacityRegression) {
     for (std::size_t i = 0; i < 100; ++i) ASSERT_EQ(p[i], 0) << "byte " << i;
 }
 
+
+// ---- C6 review: adversarial credential hygiene of the console (#305) ----------------------------------------------
+// The freed-memory scan (AllocCounter): every heap block freed while it is armed is searched for the password literal
+// (from its second byte: a cleared string keeps all but the first).  Test-owned copies (the input stream, the
+// script text) outlive the window.
+namespace {
+constexpr const char kConsoleNeedle[] = "console-needle-c6-0001-xyz";
+struct ConsoleFreedScan {
+    ConsoleFreedScan() { alloc_counter::scanFreedForThisThread(kConsoleNeedle + 1, sizeof kConsoleNeedle - 2); }
+    ~ConsoleFreedScan() { alloc_counter::scanFreedForThisThread(nullptr, 0); }
+    long hits() const { return alloc_counter::freedHitsThisThread(); }
+};
+// Runs `rune console <args>` on `stdinText` with the scan armed only around the call itself.
+long freedHitsOfConsole(std::vector<std::string> args, const std::string& stdinText, ConsoleRun& r) {
+    args.insert(args.begin(), "console");
+    std::istringstream in(stdinText);
+    std::ostringstream out, err;
+    long hits = -1;
+    {
+        ConsoleFreedScan scan;
+        r.rc = rune::cli::run(std::move(args), in, out, err);
+        hits = scan.hits();
+    }
+    r.out = out.str();
+    r.err = err.str();
+    return hits;
+}
+std::string manyStatements(int n) {   // enough text after the password for every buffer to grow several times
+    std::string s;
+    for (int i = 0; i < n; ++i) s += "drop topic padding_topic_" + std::to_string(i) + ";\n";
+    return s;
+}
+} // namespace
+
+TEST(RuneConsoleOfflineRegression, AScriptPasswordLiteralLeavesNoFreedCopyAdversarialRegression) {
+    // `-f -` (the documented way to pass a password literal) and `-f <file>`: the script text, its growth copies,
+    // the statement texts and the parsed / prepared statements.
+    const std::string script = std::string("create user script_user with password '") + kConsoleNeedle + "';\n" +
+                               "alter user script_user set password '" + kConsoleNeedle + "';\n" + manyStatements(2000);
+    ConsoleRun r;
+    EXPECT_EQ(freedHitsOfConsole({"-f", "-", "--dry-run"}, script, r), 0) << "stdin script: a freed block held it";
+    EXPECT_EQ(r.rc, 0) << r.err;
+    EXPECT_EQ(r.out.find(kConsoleNeedle + 1), std::string::npos) << "the plan never prints the password";
+    const fs::path file = writeScript("c6_password_script.rql", script);
+    EXPECT_EQ(freedHitsOfConsole({"-f", file.string(), "--dry-run"}, "", r), 0) << "file script: a freed block held it";
+    EXPECT_EQ(r.rc, 0) << r.err;
+    fs::remove(file);
+}
+
+TEST(RuneConsoleOfflineRegression, AnInteractivePasswordLiteralLeavesNoFreedCopyAdversarialRegression) {
+    // The REPL: a long line (the line buffer grows while the password is in it) and a statement continued over many
+    // lines (the statement text grows after the password line).
+    std::string longLine = std::string("create user repl_user with password '") + kConsoleNeedle + "'; -- " +
+                           std::string(5000, 'x') + "\n";
+    std::string continued = std::string("alter user repl_user set password\n'") + kConsoleNeedle + "'\n";
+    for (int i = 0; i < 400; ++i) continued += "-- a comment line inside the statement " + std::to_string(i) + "\n";
+    continued += ";\n";
+    ConsoleRun r;
+    EXPECT_EQ(freedHitsOfConsole({"--dry-run"}, longLine + continued + manyStatements(50), r), 0)
+        << "interactive: a freed block held the password literal";
+    EXPECT_EQ(r.rc, 0) << r.err;
+    EXPECT_EQ(r.out.find(kConsoleNeedle + 1), std::string::npos);
+}
+
+TEST(RuneConsoleOfflineRegression, AMovedFromPreparedSecurityKeepsNoShortPasswordInPlaceAdversarialRegression) {
+    // A short (in-place) password survives a move in the moved-from string: PSecurity's wipe must reach it.
+    namespace engine = rune::cli::engine;
+    auto st = rune::ql::parse("create user u with password 'shortpw-7q';");
+    ASSERT_TRUE(st.has_value());
+    auto plan = rune::ql::applySecurityPlan(*st);
+    ASSERT_TRUE(plan.has_value());
+    auto holds = [](const engine::PSecurity& p) {
+        const std::string_view raw(reinterpret_cast<const char*>(&p), sizeof p);
+        return raw.find("hortpw-7q") != std::string_view::npos;
+    };
+    engine::PSecurity a{std::move(*plan)};
+    EXPECT_EQ(plan->password.find("hortpw-7q"), std::string::npos);
+    const std::string_view planRaw(reinterpret_cast<const char*>(&plan->password), sizeof plan->password);
+    EXPECT_EQ(planRaw.find("hortpw-7q"), std::string_view::npos) << "the moved-from plan kept the password in place";
+    engine::PSecurity b{std::move(a)};
+    EXPECT_FALSE(holds(a)) << "move-constructed from";
+    EXPECT_EQ(b.plan.password, "shortpw-7q");
+    engine::PSecurity c;
+    c = std::move(b);
+    EXPECT_FALSE(holds(b)) << "move-assigned from";
+    c.wipe();
+    EXPECT_FALSE(holds(c)) << "wiped";
+}
+
 namespace {
 struct FdBuf final : std::streambuf {
     int fd;
@@ -811,4 +906,148 @@ TEST(RuneConsolePtyRegression, SigintAtPasswordPromptRestoresEchoRegression) {
     EXPECT_NE(t.c_lflag & ECHO, 0u) << "echo stayed off after Ctrl-C at the password prompt";
     ::close(master);
     ::close(slave);
+}
+
+// ── C6 adversarial review (#306): every signal at the password prompt leaves the terminal as it found it ────────────
+namespace {
+int g_childSlave = -1;   // the forked child's pty, for its own test handler (a handler reaches only globals)
+void childHandlerThatReturns(int) {   // '!' when the prompt handed it an echoing terminal first, '?' when not
+    termios t{};
+    const bool echo = ::tcgetattr(g_childSlave, &t) == 0 && (t.c_lflag & ECHO) != 0;
+    (void)!::write(g_childSlave, echo ? "!" : "?", 1);
+}
+
+struct PromptChild {
+    pid_t pid = -1;
+    int master = -1, slave = -1;
+    std::string seen;
+    ~PromptChild() {
+        if (pid > 0) { ::kill(pid, SIGKILL); ::waitpid(pid, nullptr, 0); }
+        if (master >= 0) ::close(master);
+        if (slave >= 0) ::close(slave);
+    }
+    /// Reads the master until `marker` shows (or 10 s pass with no progress): a wait on the child's output.
+    bool readUntil(std::string_view marker) {
+        for (int i = 0; i < 4096; ++i) {
+            if (seen.find(marker) != std::string::npos) return true;
+            pollfd p{master, POLLIN, 0};
+            if (::poll(&p, 1, 10'000) <= 0) return false;
+            char buf[256];
+            const ssize_t n = ::read(master, buf, sizeof buf);
+            if (n <= 0) return false;
+            seen.append(buf, static_cast<std::size_t>(n));
+        }
+        return false;
+    }
+    [[nodiscard]] bool echoOn() const {
+        termios t{};
+        return ::tcgetattr(slave, &t) == 0 && (t.c_lflag & ECHO) != 0;
+    }
+    /// Waits until the slave's echo flag is `on` (10 s cap): the handler runs asynchronously to kill().
+    bool awaitEcho(bool on) const {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (echoOn() != on) {
+            if (std::chrono::steady_clock::now() > until) return false;
+            ::sched_yield();
+        }
+        return true;
+    }
+};
+
+/// Forks a child that prompts on a fresh pty after `setup` and reports "DONE:<ok>:<password>" when the prompt
+/// returns.  Returns once the prompt shows (echo is off and the handlers are in by then).
+template <class Setup>
+void startPromptChild(PromptChild& c, Setup setup) {
+    ASSERT_EQ(::openpty(&c.master, &c.slave, nullptr, nullptr, nullptr), 0);
+    ASSERT_TRUE(c.echoOn()) << "a fresh pty echoes";
+    c.pid = ::fork();
+    ASSERT_GE(c.pid, 0);
+    if (c.pid == 0) {
+        const rlimit noCore{0, 0};
+        ::setrlimit(RLIMIT_CORE, &noCore);   // SIGQUIT dumps core by default
+        for (const int sig : {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP}) ::signal(sig, SIG_DFL);
+        g_childSlave = c.slave;
+        setup();
+        FdBuf fb(c.slave);
+        std::ostream errStream(&fb);
+        std::string pw;
+        const bool ok = rune::cli::console::promptPasswordOnFd(c.slave, "u", pw, errStream);
+        errStream << "DONE:" << ok << ":" << pw << ":" << std::flush;
+        ::_exit(0);
+    }
+    ASSERT_TRUE(c.readUntil("password for u: ")) << "saw: " << c.seen;
+}
+} // namespace
+
+TEST(RuneConsolePtyRegression, EveryTerminatingSignalAtThePromptRestoresEchoAdversarialRegression) {
+    for (const int sig : {SIGINT, SIGTERM, SIGHUP, SIGQUIT}) {
+        SCOPED_TRACE(::strsignal(sig));
+        PromptChild c;
+        startPromptChild(c, [] {});
+        if (HasFatalFailure()) return;
+        ASSERT_FALSE(c.echoOn()) << "echo is off at the prompt";
+        ASSERT_EQ(::kill(c.pid, sig), 0);
+        int status = 0;
+        ASSERT_EQ(::waitpid(c.pid, &status, 0), c.pid);
+        c.pid = -1;
+        EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == sig) << "the child dies of the signal, status " << status;
+        EXPECT_TRUE(c.echoOn()) << "echo stayed off after the signal at the password prompt";
+    }
+}
+
+TEST(RuneConsolePtyRegression, AnOldSignalHandlerThatReturnsKeepsTheTypedPasswordUnechoedAdversarialRegression) {
+    // The application's own SIGINT handler runs and returns: the prompt goes on, so echo must be off again and the
+    // prompt's handler back in before the password is typed.
+    PromptChild c;
+    startPromptChild(c, [] {
+        struct sigaction sa{};
+        sa.sa_handler = &childHandlerThatReturns;
+        sigemptyset(&sa.sa_mask);
+        ::sigaction(SIGINT, &sa, nullptr);
+    });
+    if (HasFatalFailure()) return;
+    for (int round = 1; round <= 2; ++round) {   // twice: the prompt's handler must be back in after the first
+        SCOPED_TRACE(round);
+        ASSERT_EQ(::kill(c.pid, SIGINT), 0);
+        ASSERT_TRUE(c.readUntil(std::string(static_cast<std::size_t>(round), '!')))
+            << "the old handler ran after the prompt restored the terminal ('?': it was not): " << c.seen;
+        ASSERT_TRUE(c.awaitEcho(false)) << "echo stayed on after the old handler returned, mid-prompt";
+    }
+    const std::string kTyped = "typed-pw-c6-0306";
+    ASSERT_EQ(::write(c.master, (kTyped + "\n").data(), kTyped.size() + 1), static_cast<ssize_t>(kTyped.size() + 1));
+    ASSERT_TRUE(c.readUntil("DONE:")) << c.seen;
+    ASSERT_TRUE(c.readUntil(":" + kTyped + ":")) << "the prompt read the password: " << c.seen;
+    const auto done = c.seen.find("DONE:");
+    EXPECT_EQ(c.seen.substr(0, done).find(kTyped), std::string::npos) << "the terminal echoed the password: " << c.seen;
+    EXPECT_NE(c.seen.find("DONE:1:"), std::string::npos);
+    int status = 0;
+    ASSERT_EQ(::waitpid(c.pid, &status, 0), c.pid);
+    c.pid = -1;
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
+    EXPECT_TRUE(c.echoOn()) << "echo is back on after the prompt";
+}
+
+TEST(RuneConsolePtyRegression, AStopAndContinueAtThePromptEchoesWhileStoppedOnlyAdversarialRegression) {
+    PromptChild c;
+    startPromptChild(c, [] { ::setpgid(0, 0); });   // its own group: a stop is not discarded as an orphan's
+    if (HasFatalFailure()) return;
+    for (int round = 1; round <= 2; ++round) {
+        SCOPED_TRACE(round);
+        ASSERT_EQ(::kill(c.pid, SIGTSTP), 0);
+        int status = 0;
+        ASSERT_EQ(::waitpid(c.pid, &status, WUNTRACED), c.pid);
+        ASSERT_TRUE(WIFSTOPPED(status)) << "the child stops, status " << status;
+        EXPECT_TRUE(c.echoOn()) << "the shell gets an echoing terminal while the prompt is stopped";
+        ASSERT_EQ(::kill(c.pid, SIGCONT), 0);
+        ASSERT_TRUE(c.awaitEcho(false)) << "echo stayed on after the prompt resumed";
+    }
+    const std::string kTyped = "typed-pw-c6-tstp";
+    ASSERT_EQ(::write(c.master, (kTyped + "\n").data(), kTyped.size() + 1), static_cast<ssize_t>(kTyped.size() + 1));
+    ASSERT_TRUE(c.readUntil(":" + kTyped + ":")) << c.seen;
+    EXPECT_EQ(c.seen.substr(0, c.seen.find("DONE:")).find(kTyped), std::string::npos) << c.seen;
+    int status = 0;
+    ASSERT_EQ(::waitpid(c.pid, &status, 0), c.pid);
+    c.pid = -1;
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
+    EXPECT_TRUE(c.echoOn());
 }

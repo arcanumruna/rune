@@ -1,5 +1,6 @@
 #pragma once
 // Zeroing the optimiser may not elide (password / key material is wiped after use).
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 
@@ -20,6 +21,19 @@ inline void secureZero(void* p, std::size_t n) noexcept {
 inline void wipeString(std::string& s) noexcept {
     if (s.capacity() != 0) secureZero(s.data(), s.capacity());
     s.clear();
+}
+
+/// `dst += add`, but a growth never frees an unwiped buffer: when `add` does not fit, the contents move to a new
+/// allocation (at least double) and the old one is wiped before it is freed.  For text that may hold a password.
+inline void appendWiped(std::string& dst, std::string_view add) {
+    if (dst.size() + add.size() > dst.capacity()) {
+        std::string grown;
+        grown.reserve(std::max(dst.size() + add.size(), 2 * dst.capacity()));
+        grown.append(dst);
+        wipeString(dst);
+        dst.swap(grown);   // `grown` now holds the old (wiped) buffer
+    }
+    dst.append(add);
 }
 
 /// A password in a fixed buffer: never allocates, never throws, wiped on every change and on destruction.
@@ -65,10 +79,8 @@ public:
     void assign(std::string_view v) { wipe(); s_.assign(v); }
     [[nodiscard]] bool empty() const noexcept { return s_.empty(); }
     [[nodiscard]] std::string_view view() const noexcept { return s_; }
-    void wipe() noexcept {
-        if (!s_.empty()) secureZero(s_.data(), s_.size());
-        s_.clear();
-    }
+    /// The whole capacity: a moved-from or shrunk string keeps old bytes past its size (C6 review).
+    void wipe() noexcept { wipeString(s_); }
 private:
     std::string s_;
 };

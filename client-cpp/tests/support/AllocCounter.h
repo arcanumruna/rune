@@ -1,5 +1,6 @@
 // tests/support/AllocCounter.h — counts global operator new calls in a window.
 #pragma once
+#include <cstddef>
 namespace alloc_counter {
 void start() noexcept;
 long stop() noexcept;
@@ -17,6 +18,12 @@ long  externalThisThread() noexcept;
 /// test proves it reached the branch it targets.
 void failNthAllocationThisThread(long n) noexcept;
 bool injectedFailureFiredThisThread() noexcept;
+/// C6 review (#257 / #305): freed-memory scan.  While armed on the calling thread, every block released through the
+/// replaced operator delete is searched (its whole usable size) for `needle` before it is freed;
+/// freedHitsThisThread() is how many blocks still held it - an unwiped plaintext copy.  A null needle disarms.
+/// `needle` must outlive the window (a string literal).
+void scanFreedForThisThread(const char* needle, std::size_t len) noexcept;
+long freedHitsThisThread() noexcept;
 } // namespace alloc_counter
 
 /// OpenSslAllocCounter.cpp (linked into rune_client_crypto_regression_tests only): true when the CRYPTO_set_mem_functions

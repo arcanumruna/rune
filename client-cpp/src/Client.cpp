@@ -61,7 +61,31 @@ int64_t nsAfter(int64_t nowNs, int64_t ms) noexcept {
     if (ms >= (INT64_MAX - std::max<int64_t>(nowNs, 0)) / kNsPerMs) return INT64_MAX;
     return nowNs + ms * kNsPerMs;
 }
-ClientConfig validatedConfig(ClientConfig c) {
+void validateConfigInPlace(ClientConfig& c);
+// #257 (C6 review): validates `c` and moves it out.  The password (given, or read from passwordFile) is wiped from
+// `c` on every exit - a later refusal (no TLS, a bad iteration cap) or a bad_alloc never frees an unwiped copy, and
+// the moved-from string's in-place (SSO) bytes are zeroed too.
+ClientConfig validatedConfig(ClientConfig& c) {
+    try {
+        validateConfigInPlace(c);
+    } catch (...) {
+        detail::wipeString(c.password);
+        throw;
+    }
+    ClientConfig out(std::move(c));
+    detail::wipeString(c.password);
+    return out;
+}
+// The ClientAgent's config with the password MOVED out of `c` (never copied); `c.password` is left wiped.
+agent::AgentConfig agentConfigTakingPassword(ClientConfig& c) {
+    std::string pw = std::move(c.password);
+    detail::wipeString(c.password);
+    struct Wipe { std::string& s; ~Wipe() { detail::wipeString(s); } } wipePw{pw};
+    agent::AgentConfig a = toAgentConfig(c);   // copies an empty password
+    a.session.password = std::move(pw);
+    return a;
+}
+void validateConfigInPlace(ClientConfig& c) {
     // A negative timeout or retry budget has no meaning (0 = none / at once); refused, never silently clamped.
     if (c.connectTimeoutMs < 0 || c.pingTimeoutMs < 0 || c.ddlTimeoutMs < 0)
         throw std::invalid_argument("ClientConfig: connectTimeoutMs / pingTimeoutMs / ddlTimeoutMs must be >= 0");
@@ -108,7 +132,6 @@ ClientConfig validatedConfig(ClientConfig c) {
         throw std::invalid_argument("ClientConfig: offerCrypto with the system trust store needs a certificate name: "
                                     "set tlsExpectHost (the gateway channel '" + c.gatewayChannel + "' names no host), "
                                     "or pin a CA bundle with tlsTrustPem");
-    return c;
 }
 // F8c C8: the runner start latch (spec §3.4) — one empty record on a
 // stack-local OneToOneRingBuffer of the smallest useful capacity.
@@ -221,16 +244,14 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
 // ---------------------------------------------------------------------------
 
 Client::Client(ClientConfig cfg)
-    : cfg_(validatedConfig(std::move(cfg)))
-    , agent_(toAgentConfig(cfg_))
+    : cfg_(validatedConfig(cfg))
+    , agent_(agentConfigTakingPassword(cfg_))
     , partitionRouter_(metadataCache_)
     , catalogReader_(std::make_unique<CatalogReader>(*this))   // eagerly, on the owning thread (I2)
     , securityReader_(std::make_unique<SecurityReader>(*this))   // authentication Task 8: same rule
 {
-    // Review B M4: the agent's sessions hold the credential from here on (one owner, wiped when replaced); the Client's
-    // own copy is not kept.
-    detail::wipeString(cfg_.password);
-    detail::wipeString(cfg.password);   // the moved-from parameter may keep short contents in place
+    // Review B M4: the agent's sessions hold the credential from here on (one owner, wiped when replaced); the Client
+    // keeps no copy - validatedConfig and agentConfigTakingPassword moved it out and wiped every source (#257).
     if (cfg_.traceDdlRetries) ddlRetryNotes_.reserve(kMaxDdlRetryNotes);   // push_back never reallocates on the duty thread
     // #514: the silent-leader scan runs four times per keepalive interval.
     silentCheckPeriodNs_ = (cfg_.keepaliveIntervalNs > 0 ? cfg_.keepaliveIntervalNs
@@ -1624,15 +1645,12 @@ OpResult Client::alterTopicConfig(std::string_view name, uint32_t expectedVersio
 
 OpResult Client::securityDdl(rune::ql::SecurityPlan plan, const DdlOptions& ddl, CompletionTarget target, Token token) {
     namespace rpc = rune::protocol::client;
+    // The plaintext is wiped (whole capacity) on every exit, a throw included (C6 review).
+    struct Wipe { rune::ql::SecurityPlan& p; ~Wipe() { detail::wipeString(p.password); } } wipePlan{plan};
     rpc::SecurityDdl msg;
     security::VerifierStorage vs;
     // Throws std::invalid_argument for a short password BEFORE anything is sent (D9).
-    try {
-        security::fillSecurityDdl(plan, cfg_.scramIterations, cfg_.minPasswordLength, vs, msg);
-    } catch (...) {
-        detail::secureZero(plan.password.data(), plan.password.size());
-        throw;
-    }
+    security::fillSecurityDdl(plan, cfg_.scramIterations, cfg_.minPasswordLength, vs, msg);
     DdlOptions d = ddl;
     d.statement  = plan.statement;   // D10: ONLY the redacted statement ever travels
     msg.ext      = ddlExt_(d);
@@ -1657,8 +1675,7 @@ OpResult Client::securityDdl(rune::ql::SecurityPlan plan, const DdlOptions& ddl,
         res = issueDdl_(OpKind::SecurityDdl, target, token, std::span<const uint8_t>(frame.data(), n), msg.ext,
                         rpc::MessageHeader::ENCODED_SIZE, secret);   // the extension follows the header directly (D36)
     }
-    detail::secureZero(plan.password.data(), plan.password.size());   // the verifier is built: the password is not needed
-    return res;
+    return res;   // wipePlan: the verifier is built, the password is not needed
 }
 
 OpResult Client::bootstrapSecurity(std::string_view adminName, std::string_view oneTimePassword,
@@ -2904,9 +2921,12 @@ DdlResult Client::dropTopicAndWait(std::string_view name, const DdlOptions& ddl,
 
 SecurityDdlResult Client::securityDdlAndWait(rune::ql::SecurityPlan plan, const DdlOptions& ddl,
                                              std::chrono::milliseconds timeout) {
+    // C6 review: a BackPressured issue is re-issued, so every attempt gets its own copy of the plan (never a
+    // moved-from one: an empty grantee / pattern / password); securityDdl wipes each copy, this frame wipes its own.
+    struct Wipe { rune::ql::SecurityPlan& p; ~Wipe() { detail::wipeString(p.password); } } wipePlan{plan};
     SecurityDdlResult result;
     andWait_("securityDdl()", timeout, 0,
-             [&](Completions& q, Token t) { return securityDdl(std::move(plan), ddl, q, t); },
+             [&](Completions& q, Token t) { return securityDdl(plan, ddl, q, t); },
              [&](const Completion& c, std::span<const uint8_t> p) {
                  if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("securityDdl()", c, p);
                  const DdlResult r = ddlResultOf(c, p);

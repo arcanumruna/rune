@@ -1612,6 +1612,7 @@ if(BUILD_TESTING)
         add_executable(rune_client_auth_tests
             tests/client/ClientAuthErrorsTest.cpp
             tests/client/ClientConnectRegressionTest.cpp
+            tests/support/AllocCounter.cpp   # C6 review: zero-alloc password install + freed-copy scan
         )
         target_include_directories(rune_client_auth_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
         target_link_libraries(rune_client_auth_tests PRIVATE rune_client_api GTest::gtest_main)
@@ -1767,6 +1768,7 @@ if(BUILD_TESTING)
     add_executable(rune_cli_offline_tests
         tests/RuneCliOfflineTest.cpp
         tests/RuneConsoleOfflineTest.cpp
+        tests/support/AllocCounter.cpp   # C6 review: freed-copy scan of the console's password buffers
     )
     target_include_directories(rune_cli_offline_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/cli)   # QlEngine.h / CliSupport.h (internal)
     target_link_libraries(rune_cli_offline_tests PRIVATE rune_cli_lib GTest::gtest_main $<$<PLATFORM_ID:Linux>:util>)

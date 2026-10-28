@@ -161,6 +161,33 @@ TEST(SessionMachineAuthRegression, InstallPasswordDoesNotAllocateAndWipesTheOldS
     EXPECT_FALSE(m.installPassword(big));
 }
 
+namespace {
+// True when the object's own bytes (where libstdc++ keeps a string of <= 15 chars in place) still hold `needle`.
+template <class T> bool bytesHold(const T& o, std::string_view needle) {
+    // libstdc++ zeroes the first byte of a moved-from in-place string: the rest of the password is what remains.
+    const std::string_view raw(reinterpret_cast<const char*>(&o), sizeof(T));
+    return raw.find(needle.substr(1)) != std::string_view::npos;
+}
+} // namespace
+
+TEST(SessionMachineAuthRegression, AMovedFromSecretStringKeepsNoShortPasswordInPlaceAdversarialRegression) {
+    // C6 review: a moved-from std::string of <= 15 chars keeps its bytes in place with size 0, so a size-based wipe
+    // of the moved-from SecretString misses them.  Both move paths; a short (in-place) and a long password.
+    namespace d = rune::client::detail;
+    for (const std::string_view pw : {std::string_view("shortpw-9q"), std::string_view("a-much-longer-password-9q")}) {
+        d::SecretString a; a.assign(pw);
+        d::SecretString b(std::move(a));
+        EXPECT_FALSE(bytesHold(a, pw)) << "move-constructed from: '" << pw << "' left in place";
+        EXPECT_EQ(b.view(), pw);
+        d::SecretString c; c.assign("x");
+        c = std::move(b);
+        EXPECT_FALSE(bytesHold(b, pw)) << "move-assigned from: '" << pw << "' left in place";
+        EXPECT_EQ(c.view(), pw);
+        c.assign("y");
+        EXPECT_FALSE(bytesHold(c, pw)) << "re-assigned: the old password left in place";
+    }
+}
+
 TEST(SessionMachineAuthRegression, AWrongServerSignatureIsRejectedNeverConnected) {
     Rig t; t.connectAuthRequired();
     Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));

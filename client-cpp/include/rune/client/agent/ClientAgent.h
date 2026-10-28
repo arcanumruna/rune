@@ -925,6 +925,9 @@ private:
     // Members
     // -------------------------------------------------------------------------
 
+    /// The one password copy, shared by every session's machine.  Declared first (#257, C6 review): the constructor
+    /// moves the password into it before anything that can throw, and it outlives every session pointing at it.
+    detail::FixedSecret secret_;
     AgentConfig cfg_;
 
     // ---- Transport (SHARED across all sessions; agent-thread owned) ----------
@@ -943,7 +946,6 @@ private:
     /// Authentication (Task 7): the duty thread's salted-password cache, shared by every session's machine
     /// (a client with one session per broker pays PBKDF2 once per verifier).  Agent-thread only.
     session::ScramCache scramCache_;
-    detail::FixedSecret secret_;   // the one password copy, shared by every session's machine
 
     /// The seed (single) session — sessions_[0].  Pool-of-1 accessor: identical to
     /// the previous single-session member for both agent-internal doWork and the

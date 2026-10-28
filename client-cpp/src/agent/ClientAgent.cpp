@@ -64,8 +64,20 @@ int32_t ringTotalBytes(int32_t cap) noexcept {
 // Construction
 // ---------------------------------------------------------------------------
 
+namespace {
+// #257 (C6 review): the password goes into the agent's fixed secret and is wiped from the config BEFORE anything can
+// throw (an over-cap refusal, the transport, the ring, bad_alloc), so no unwiped heap copy is ever freed.
+AgentConfig takingPassword(AgentConfig& cfg, detail::FixedSecret& secret) {
+    const bool fits = secret.assign(cfg.session.password);
+    detail::wipeString(cfg.session.password);
+    if (!fits)
+        throw std::invalid_argument("password longer than " + std::to_string(detail::FixedSecret::kCapacity) + " bytes");
+    return std::move(cfg);
+}
+} // namespace
+
 ClientAgent::ClientAgent(AgentConfig cfg)
-    : cfg_(std::move(cfg))
+    : cfg_(takingPassword(cfg, secret_))
     , transport_(cfg_.transport)
     , ringBuf_(makeAlignedBuffer(
           static_cast<std::size_t>(ringTotalBytes(cfg_.ringCapacity)),
@@ -73,10 +85,6 @@ ClientAgent::ClientAgent(AgentConfig cfg)
     , ring_(ringBuf_.get(), static_cast<std::size_t>(ringTotalBytes(cfg_.ringCapacity)))
     , egressObserver_(nullptr)
 {
-    if (!secret_.assign(cfg_.session.password))
-        throw std::invalid_argument("password longer than " + std::to_string(detail::FixedSecret::kCapacity) + " bytes");
-    detail::wipeString(cfg_.session.password);
-    detail::wipeString(cfg.session.password);   // the moved-from parameter may keep short contents in place
     mnDebug_ = std::getenv("RUNE_MN_DEBUG") != nullptr;
     produceAcks_.reserve(static_cast<std::size_t>(cfg_.egressPollLimit) * 4);
     // Seed the endpoint-keyed session collection with the seed session

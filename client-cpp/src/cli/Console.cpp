@@ -25,6 +25,7 @@
 #include <cstring>
 #include <iostream>
 #include <istream>
+#include <iterator>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -123,27 +124,34 @@ namespace {
 termios                g_savedTermios{};
 termios                g_quietTermios{};
 volatile sig_atomic_t  g_promptFd = -1;
-struct sigaction       g_oldInt{}, g_oldTerm{}, g_oldHup{}, g_oldTstp{};
+constexpr int          kPromptSignals[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP};
+struct sigaction       g_old[std::size(kPromptSignals)]{};
 struct sigaction       g_ours{};
 
+const struct sigaction* oldActionOf(int sig) noexcept {
+    for (std::size_t i = 0; i < std::size(kPromptSignals); ++i)
+        if (kPromptSignals[i] == sig) return &g_old[i];
+    return nullptr;
+}
+
+/// Async-signal-safe only (tcsetattr, sigaction, sigprocmask, raise).  Puts the terminal back, re-delivers the
+/// signal to the disposition that was there before the prompt (die, stop, or the application's own handler), and —
+/// when that returns (a continue after a stop, an ignored signal, a handler that returns) — the prompt goes on, so
+/// echo goes off again and this handler goes back in (C6 review, #306).
 void restoreTerminalOnSignal(int sig) {
+    const int savedErrno = errno;
     const int fd = g_promptFd;
     if (fd >= 0) ::tcsetattr(fd, TCSANOW, &g_savedTermios);
+    if (const struct sigaction* old = oldActionOf(sig)) ::sigaction(sig, old, nullptr);
     sigset_t unblock;
     sigemptyset(&unblock);
     sigaddset(&unblock, sig);
-    if (sig == SIGTSTP) {
-        ::sigaction(SIGTSTP, &g_oldTstp, nullptr);
-        ::sigprocmask(SIG_UNBLOCK, &unblock, nullptr);
-        ::raise(SIGTSTP);   // stops here until SIGCONT
-        if (fd >= 0) ::tcsetattr(fd, TCSANOW, &g_quietTermios);
-        ::sigaction(SIGTSTP, &g_ours, nullptr);
-        return;
-    }
-    const struct sigaction* old = sig == SIGINT ? &g_oldInt : sig == SIGTERM ? &g_oldTerm : &g_oldHup;
-    ::sigaction(sig, old, nullptr);
     ::sigprocmask(SIG_UNBLOCK, &unblock, nullptr);
-    ::raise(sig);
+    ::raise(sig);   // dies, stops until SIGCONT, or runs the old handler here
+    ::sigprocmask(SIG_BLOCK, &unblock, nullptr);   // the kernel unblocks it again on return
+    ::sigaction(sig, &g_ours, nullptr);
+    if (fd >= 0) ::tcsetattr(fd, TCSANOW, &g_quietTermios);
+    errno = savedErrno;
 }
 } // namespace
 
@@ -154,12 +162,11 @@ bool promptPasswordOnFd(int fd, const std::string& user, std::string& password, 
         bool on; int fd; const termios& t;
         ~Restore() {
             if (!on) return;
-            ::sigaction(SIGINT, &g_oldInt, nullptr);
-            ::sigaction(SIGTERM, &g_oldTerm, nullptr);
-            ::sigaction(SIGHUP, &g_oldHup, nullptr);
-            ::sigaction(SIGTSTP, &g_oldTstp, nullptr);
+            // Terminal first: a signal arriving after it finds our handler, which restores it again — harmless.
+            // Handlers first would leave a window where the old default kills the process with echo off.
             ::tcsetattr(fd, TCSANOW, &t);
             g_promptFd = -1;
+            for (std::size_t i = 0; i < std::size(kPromptSignals); ++i) ::sigaction(kPromptSignals[i], &g_old[i], nullptr);
         }
     } restore{haveTermios, fd, saved};
     if (haveTermios) {
@@ -168,14 +175,13 @@ bool promptPasswordOnFd(int fd, const std::string& user, std::string& password, 
         g_quietTermios.c_lflag &= ~static_cast<tcflag_t>(ECHO);
         g_promptFd = fd;
         // Handlers first, then echo off: a signal at any point finds the terminal restorable.  No SA_RESTART: a read
-        // interrupted by a stop / continue returns EINTR and readPasswordLine retries it.
+        // interrupted by a stop / continue returns EINTR and readPasswordLine retries it.  Each handled signal is
+        // blocked while the handler runs, so a second one never interleaves with a restore / re-quiet.
         g_ours = {};
         g_ours.sa_handler = &restoreTerminalOnSignal;
         sigemptyset(&g_ours.sa_mask);
-        ::sigaction(SIGINT, &g_ours, &g_oldInt);
-        ::sigaction(SIGTERM, &g_ours, &g_oldTerm);
-        ::sigaction(SIGHUP, &g_ours, &g_oldHup);
-        ::sigaction(SIGTSTP, &g_ours, &g_oldTstp);
+        for (const int sig : kPromptSignals) sigaddset(&g_ours.sa_mask, sig);
+        for (std::size_t i = 0; i < std::size(kPromptSignals); ++i) ::sigaction(kPromptSignals[i], &g_ours, &g_old[i]);
         ::tcsetattr(fd, TCSANOW, &g_quietTermios);
     }
     err << "password for " << user << ": " << std::flush;
@@ -290,6 +296,16 @@ struct BatchWipe {
 bool prepareAll(std::string_view origin, std::string_view src, const engine::PrepareOptions& opts,
                 std::vector<PreparedStatement>& out, std::ostream& err) {
     auto parsed = rune::ql::parseScript(src);
+    struct ParsedWipe {   // the parsed statements hold their password literals (#305)
+        decltype(parsed)& r;
+        ~ParsedWipe() {
+            if (!r) return;
+            for (auto& st : *r) {
+                if (auto* c = std::get_if<rune::ql::CreateUserDef>(&st)) rune::client::detail::wipeString(c->password);
+                else if (auto* a = std::get_if<rune::ql::AlterUserDef>(&st)) rune::client::detail::wipeString(a->password);
+            }
+        }
+    } parsedWipe{parsed};
     auto prefix = [&](std::size_t n) {
         if (!origin.empty()) err << origin << ":statement " << n << ": ";
     };
@@ -390,9 +406,9 @@ int runInteractive(Exec& exec, const ConsoleOptions& o, LineSource& in, std::ost
             text = std::move(c->text);
             rune::client::detail::wipeString(c->text);
         } else if (isExitCommand(line)) return 0;
-        text += line;
-        rune::client::detail::wipeString(line);   // consumed into `text`
-        text += '\n';
+        rune::client::detail::appendWiped(text, line);   // growth never frees an unwiped copy (#305)
+        rune::client::detail::wipeString(line);          // consumed into `text`
+        rune::client::detail::appendWiped(text, "\n");
         switch (rune::ql::classifyInput(text)) {
             case rune::ql::InputState::Empty: state = AwaitingStatement{}; break;
             case rune::ql::InputState::Incomplete: state = ContinuingStatement{std::move(text)}; break;
@@ -417,7 +433,24 @@ struct StreamLineSource final : LineSource {
     std::istream& in;
     explicit StreamLineSource(std::istream& s) : in(s) {}
     bool next(std::string& line) override {
-        if (!std::getline(in, line)) return false;
+        // std::getline would grow `line` and free unwiped copies of a typed password (#305): read char by char.
+        rune::client::detail::wipeString(line);
+        std::streambuf* sb = in.rdbuf();
+        if (sb == nullptr) { in.setstate(std::ios::badbit); return false; }
+        bool any = false;
+        for (;;) {
+            const auto c = sb->sbumpc();
+            if (std::char_traits<char>::eq_int_type(c, std::char_traits<char>::eof())) {
+                in.setstate(any ? std::ios::eofbit : std::ios::eofbit | std::ios::failbit);
+                if (!any) return false;
+                break;
+            }
+            any = true;
+            const char ch = std::char_traits<char>::to_char_type(c);
+            if (ch == '\n') break;
+            const char one[1] = {ch};
+            rune::client::detail::appendWiped(line, std::string_view(one, 1));
+        }
         if (!line.empty() && line.back() == '\r') line.pop_back();   // CRLF terminals / files
         return true;
     }

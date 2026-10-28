@@ -61,16 +61,18 @@ struct PHistory     { rune::catalog::HistoryFilter filter; std::string text; };
 /// Authentication (Task 8): a security DDL — the plan holds the plaintext password, wiped when the statement is done.
 struct PSecurity {
     mutable rune::ql::SecurityPlan plan;
+    // Every source a move leaves behind is wiped: a moved-from string keeps a short password in place (C6 review).
     PSecurity() = default;
-    explicit PSecurity(rune::ql::SecurityPlan p) : plan(std::move(p)) {}
-    PSecurity(PSecurity&&) noexcept = default;
-    PSecurity& operator=(PSecurity&&) noexcept = default;
+    explicit PSecurity(rune::ql::SecurityPlan&& p) : plan(std::move(p)) { rune::client::detail::wipeString(p.password); }
+    PSecurity(PSecurity&& o) noexcept : plan(std::move(o.plan)) { o.wipe(); }
+    PSecurity& operator=(PSecurity&& o) noexcept {
+        if (this != &o) { wipe(); plan = std::move(o.plan); o.wipe(); }
+        return *this;
+    }
     PSecurity(const PSecurity&) = delete;
     PSecurity& operator=(const PSecurity&) = delete;
     ~PSecurity() { wipe(); }
-    void wipe() const noexcept {
-        if (!plan.password.empty()) rune::client::detail::secureZero(plan.password.data(), plan.password.size());
-    }
+    void wipe() const noexcept { rune::client::detail::wipeString(plan.password); }   // the whole capacity
 };
 /// SHOW USERS / ROLES / GRANTS / SECURITY HISTORY — client-side replays of `__security`.
 struct PSecShow {
