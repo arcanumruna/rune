@@ -2638,7 +2638,28 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         if (b->attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b->attemptDeadlineNs;
         return;
     }
-    // D: rejected, but an earlier attempt may be stored — outcome unknown.
+    // Issue #222: auth refusals (44..47) are answered before the append: when this was the batch's ONLY attempt it
+    // was definitely not stored — fail it without marking the partition unresolved (no epoch bump).  A retransmit's
+    // refusal proves nothing about the earlier attempt: that stays the outcome-unknown path (D) below.
+    if (ec >= static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed) &&
+        ec <= static_cast<int16_t>(rune::protocol::client::ErrorCode::PasswordChangeRequired) &&
+        b->attempts == 1) {
+        emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
+                      OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
+        txnNoteLoss_(OpStatus::BrokerError, static_cast<uint16_t>(ec), AbortKind::BumpEpoch);
+        completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
+                       static_cast<uint16_t>(ec), b->tier2, b->recordCount);
+        // The newest sequences were never used: give them back, so the next batch continues the sequence.
+        // Otherwise the later in-flight batches meet the gap (OutOfOrderSequence) and C3 re-sequences them.
+        if (b->baseSequence >= 0 && b->producerId == ps.producerId && b->producerEpoch == ps.epoch &&
+            b->baseSequence + b->recordCount == ps.nextBaseSequence) {
+            ps.nextBaseSequence = b->baseSequence;
+        }
+        releaseResolved_(ps, *b);
+        reclaimAckRing_(ps);
+        return;
+    }
+    // D: rejected, but an earlier attempt may be stored — outcome unknown (44..47 after a retransmit too).
     emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
                   OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
     txnNoteLoss_(OpStatus::BrokerError, static_cast<uint16_t>(ec), AbortKind::BumpEpoch);   // Task 6

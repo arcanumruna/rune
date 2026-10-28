@@ -5,6 +5,7 @@
 #include "rune/cli/CatalogCommands.h"
 #include "rune/cli/SecurityCommands.h"
 
+#include <rune/client/Completion.h>
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/Serialize.h>
 
@@ -146,6 +147,8 @@ std::string descriptorText(const std::vector<uint8_t>& blob) {
 }
 
 std::string_view errorCodeName(uint16_t code) noexcept {
+    // Issue #225: the auth names have one source, rune::client::authErrorName.
+    if (const char* a = rune::client::authErrorName(code)) return a;
     static constexpr std::string_view kNames[] = {
         "OK", "ProtocolVersion", "NotLeader", "Redirect", "SessionExpired", "UnknownSession", "Internal",
         "UnknownTopic", "UnknownPartition", "NotPartitionLeader", "MinIsrViolation", "StaleGeneration",

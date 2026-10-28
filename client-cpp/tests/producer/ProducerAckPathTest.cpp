@@ -1076,6 +1076,86 @@ TEST(ProducerSequence, OutOfOrderOnTheNextInLineBatchFailsItAndResequencesTheRes
     EXPECT_FALSE(impl.hasInFlight());
 }
 
+// Issue #222: an auth refusal (44..47) is answered before the append: on a batch's ONLY attempt it is a definite
+// non-append - no epoch bump, and the sequence is given back.
+TEST(ProducerSequence, NotAuthorizedOnAFirstAttemptIsNotAppendedAndKeepsTheSequenceRegression) {
+    for (const int16_t code : {int16_t{44}, int16_t{45}, int16_t{46}, int16_t{47}}) {
+        SCOPED_TRACE(code);
+        ProducerImpl impl(ackCfg(8, /*lingerUs=*/0));
+        AckLedger L;
+        L.attachBatches(impl);
+        SeqCapture cap;
+        const auto sink = cap.fn();
+        sendOne(impl, sink, 0);
+        ASSERT_EQ(cap.frames.size(), 1u);
+        const int16_t e0 = cap.frames[0].epoch;
+        EXPECT_EQ(cap.frames[0].baseSequence, 0);
+        impl.onProduceResponse(cap.frames[0].corrId, -1, code);
+        ASSERT_EQ(L.batchAcks.size(), 1u);
+        EXPECT_EQ(L.batchAcks[0].errorCode, code);
+        EXPECT_EQ(L.batchAcks[0].producerEpoch, e0);
+        EXPECT_EQ(impl.producerEpoch(), e0) << "no bump";
+        EXPECT_FALSE(impl.hasInFlight());
+        sendOne(impl, sink, 0);
+        ASSERT_EQ(cap.frames.size(), 2u);
+        EXPECT_EQ(cap.frames[1].epoch, e0);
+        EXPECT_EQ(cap.frames[1].baseSequence, 0) << "the sequence continues, nothing consumed";
+        impl.onProduceResponse(cap.frames[1].corrId, 7, 0);
+        ASSERT_EQ(L.batchAcks.size(), 2u);
+        EXPECT_EQ(L.batchAcks[1].errorCode, 0);
+        EXPECT_EQ(L.batchAcks[1].producerEpoch, e0);
+        EXPECT_EQ(L.batchAcks[1].baseSequence, 0);
+    }
+}
+
+// Issue #222: the refused batch is not the newest sequence holder's last: the later in-flight batch meets the gap
+// (OutOfOrderSequence) and C3 re-sequences it.
+TEST(ProducerSequence, NotAuthorizedAheadOfInFlightBatchesLetsTheGapResequenceThemRegression) {
+    ProducerImpl impl(ackCfg(8, /*lingerUs=*/0));
+    AckLedger L;
+    L.attachBatches(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    sendOne(impl, sink, 0);
+    sendOne(impl, sink, 0);
+    ASSERT_EQ(cap.frames.size(), 2u);
+    const int16_t e0 = cap.frames[0].epoch;
+    EXPECT_EQ(cap.frames[1].baseSequence, 1);
+    impl.onProduceResponse(cap.frames[0].corrId, -1, 45);
+    ASSERT_EQ(L.batchAcks.size(), 1u);
+    EXPECT_EQ(L.batchAcks[0].errorCode, 45);
+    EXPECT_EQ(impl.producerEpoch(), e0) << "no bump from the refusal itself";
+    impl.onProduceResponse(cap.frames[1].corrId, -1, kOos);
+    EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1));
+    impl.flushBatches(kNow, 42, sink);
+    ASSERT_EQ(cap.frames.size(), 3u);
+    EXPECT_EQ(cap.frames[2].epoch, static_cast<int16_t>(e0 + 1));
+    EXPECT_EQ(cap.frames[2].baseSequence, 0);
+    impl.onProduceResponse(cap.frames[2].corrId, 9, 0);
+    ASSERT_EQ(L.batchAcks.size(), 2u);
+    EXPECT_EQ(L.batchAcks[1].errorCode, 0);
+    EXPECT_FALSE(impl.hasInFlight());
+}
+
+// Issue #222: a refusal of a RETRANSMIT proves nothing about the earlier attempt: outcome unknown, re-identified.
+TEST(ProducerSequence, NotAuthorizedOnARetransmitStaysOutcomeUnknownRegression) {
+    ProducerImpl impl(ackCfg(8, /*lingerUs=*/0));
+    AckLedger L;
+    L.attachBatches(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    sendOne(impl, sink, 0);
+    const int16_t e0 = cap.frames[0].epoch;
+    const int64_t t1 = kNow + 1'000LL * 1'000'000LL;  // past produceTimeoutMs
+    ASSERT_EQ(impl.retransmitStalled(t1, sink), 1);
+    ASSERT_EQ(cap.frames.size(), 2u);
+    impl.onProduceResponse(cap.frames[1].corrId, -1, 45);
+    ASSERT_EQ(L.batchAcks.size(), 1u);
+    EXPECT_EQ(L.batchAcks[0].errorCode, 45);
+    EXPECT_FALSE(impl.hasInFlight());
+    EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1));
+}
+
 // OOS behind an unresolved older batch: parked (no completion, no bump); the
 // older batch is fast-retransmitted ONCE (the gap's frame, not every older
 // one); when it resolves the parked batches go out again, in sequence order,

@@ -776,8 +776,10 @@ public:
     [[nodiscard]] AuthStatus authStatus() const;
 
     /// The broker error code that ended the seed session for good (SessionRevoked 46, AuthenticationFailed 44, ...), or 0
-    /// while the session is not Rejected.  The duty thread only (Invoker owner / a callback); any other thread gets 0.
-    [[nodiscard]] int16_t sessionRejectCode() const noexcept;
+    /// while the session is not Rejected.  Same threading rule as state(): the duty thread (Invoker owner / a callback)
+    /// reads the machine, the owner thread (Thread mode) the latest published status; any other thread throws
+    /// std::logic_error.
+    [[nodiscard]] int16_t sessionRejectCode() const;
 
     // -------------------------------------------------------------------------
     // Control ops (F8c C3) — completion tokens, no futures
@@ -1112,9 +1114,12 @@ public:
     /// topic has evolved: it binds to (and every send() stamps) the version it
     /// was actually compiled against, instead of whatever is latest.
     ///
-    /// A broker errorCode (no version has that fingerprint — UnknownSchema or
-    /// equivalent) throws the same "stale generated type" error as an exact
-    /// descriptor mismatch did before Task 18 added fingerprint selection.
+    /// Issue #22: a failure throws std::runtime_error with one of three messages.  UnknownTopic is ambiguous (the
+    /// topic is missing, or no version has that fingerprint): one more GetTopicSchema(name, latest) tells them apart.
+    ///   - "topic '<name>' does not exist" - the topic is not defined;
+    ///   - "generated type is stale — rerun rune schema generate" - the topic exists but no version has T's
+    ///     fingerprint, or the returned descriptor does not match it;
+    ///   - "the broker refused '<name>' (error <code>[ <Name>])" - any other broker error.
     ///
     /// Belt-and-suspenders (consistency with TypedTopic::fromSchema, which
     /// still performs this check on its own completion path): even on a
@@ -1153,6 +1158,11 @@ public:
                 name, r.errorCode, timeout - (std::chrono::steady_clock::now() - started)));
         return T::lineage(rune::codec::deserialize(std::span<const uint8_t>(r.descriptorBlob)));
     }
+
+    /// Internal (Issue #22): the open failure for a GetTopicSchema(name, fingerprint) error `code`; cold path, throws,
+    /// never returns.  @p remaining is what is left of the caller's wait budget (the UnknownTopic probe waits at most
+    /// that long and is skipped when nothing is left).
+    [[noreturn]] void throwOpenTopicFailure(std::string_view name, uint16_t code, std::chrono::nanoseconds remaining);
 
     /// Issue #435: the message for a failed schema-lineage request.  On UnknownTopic it probes the latest schema
     /// (fingerprint 0): served -> the broker predates lineage; UnknownTopic -> the topic does not exist.  Runs on the
@@ -1317,8 +1327,11 @@ private:
     /// The one body of both openTopicAndWait overloads: the topic's schema, checked against T's fingerprint.
     template <class T>
     TopicSchemaResult openTypedSchema_(std::string_view name, std::chrono::nanoseconds timeout) {
+        const auto started = std::chrono::steady_clock::now();
         TopicSchemaResult r = getTopicSchemaAndWait(name, T::kFingerprint, timeout);
-        if (r.errorCode != 0 || !schemaMatches(T::kFingerprint, std::span<const uint8_t>(r.descriptorBlob))) {
+        if (r.errorCode != 0)   // Issue #22: missing topic / stale type / another refusal
+            throwOpenTopicFailure(name, r.errorCode, timeout - (std::chrono::steady_clock::now() - started));
+        if (!schemaMatches(T::kFingerprint, std::span<const uint8_t>(r.descriptorBlob))) {
             throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
         }
         return r;
@@ -1439,8 +1452,10 @@ private:
         uint8_t authMode  = static_cast<uint8_t>(rune::protocol::client::AuthMode::InProcess);   // brokerAuthMode()
         uint8_t passwordChangeRequired = 0;                                                      // one-time password
         uint8_t authenticated = 0;                                                               // review B I3: an earned session
-        uint8_t pad[4]{};
+        int16_t rejectCode = 0;   // issue #310: the seed's reject code while Rejected
+        uint8_t pad[2]{};
     };
+    static_assert(sizeof(SeedStatus) == 16);
 
     // -------------------------------------------------------------------------
     // Runner

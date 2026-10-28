@@ -586,11 +586,81 @@ TEST(OpenTopicGate, StaleFingerprintStillThrows) {
     h.gw->getVersion   = 2;
     h.gw->getBlob      = serialize(makeCharsV2Descriptor());
     h.gw->getErrorCode = 0;
+    h.gw->unknownFingerprintErrorCode = 7;   // Issue #22: the real broker's UnknownTopic
 
     GateGatewayPump pump(*h.gw);
-    EXPECT_THROW((void)h.client->openTopicAndWait<StubV1>("characters"), std::runtime_error)
-        << "openTopicAndWait must throw when the broker has no version "
-           "matching T::kFingerprint";
+    try {
+        (void)h.client->openTopicAndWait<StubV1>("characters");
+        ADD_FAILURE() << "openTopicAndWait must throw when the broker has no version matching T::kFingerprint";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("stale"), std::string::npos) << e.what();
+    }
+}
+
+namespace {
+// Issue #22: the what() of openTopicAndWait<StubV1> ("" and an ADD_FAILURE when nothing is thrown).
+template <class Open>
+std::string openFailure(Open&& open) {
+    try {
+        open();
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+    ADD_FAILURE() << "openTopicAndWait did not throw";
+    return {};
+}
+}  // namespace
+
+// Issue #22: UnknownTopic for the fingerprint is ambiguous; a topic that does not exist is reported as missing,
+// never as a stale generated type.
+TEST(OpenTopicGateRegression, AnUndefinedTopicIsReportedAsMissingNotStaleRegression) {
+    GateHarness h(1346, 1347);
+    h.build();
+    h.connectAndWait();
+    h.gw->getErrorCode                = 7;
+    h.gw->unknownFingerprintErrorCode = 7;
+    h.gw->getBlob                     = {};
+    GateGatewayPump pump(*h.gw);
+    const std::string msg = openFailure([&] { (void)h.client->openTopicAndWait<StubV1>("nope"); });
+    EXPECT_NE(msg.find("does not exist"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("stale"), std::string::npos) << msg;
+}
+
+// Issue #22: the topic exists but has no version with this fingerprint: still the stale-type message, on both overloads.
+TEST(OpenTopicGateRegression, AnUnknownFingerprintOfAnExistingTopicIsStillStaleRegression) {
+    GateHarness h(1348, 1349);
+    h.build();
+    h.connectAndWait();
+    h.gw->getTopicId                  = 0x40000002;
+    h.gw->getVersion                  = 2;
+    h.gw->getBlob                     = serialize(makeCharsV2Descriptor());
+    h.gw->getErrorCode                = 0;
+    h.gw->unknownFingerprintErrorCode = 7;
+    GateGatewayPump pump(*h.gw);
+    const std::string owning = openFailure([&] { (void)h.client->openTopicAndWait<StubV1>("characters"); });
+    EXPECT_NE(owning.find("stale"), std::string::npos) << owning;
+    EXPECT_EQ(owning.find("does not exist"), std::string::npos) << owning;
+    rune::client::Producer shared = h.client->producer();
+    const std::string borrowed = openFailure([&] { (void)h.client->openTopicAndWait<StubV1>("characters", shared); });
+    EXPECT_NE(borrowed.find("stale"), std::string::npos) << borrowed;
+    h.gw->getErrorCode = 7;
+    h.gw->getBlob      = {};
+    const std::string missing = openFailure([&] { (void)h.client->openTopicAndWait<StubV1>("nope", shared); });
+    EXPECT_NE(missing.find("does not exist"), std::string::npos) << missing;
+    EXPECT_EQ(missing.find("stale"), std::string::npos) << missing;
+}
+
+// Issue #22: any other broker error is named, not reported as a stale type.
+TEST(OpenTopicGateRegression, AnotherBrokerErrorIsNamedRegression) {
+    GateHarness h(1350, 1351);
+    h.build();
+    h.connectAndWait();
+    h.gw->unknownFingerprintErrorCode = 45;
+    GateGatewayPump pump(*h.gw);
+    const std::string msg = openFailure([&] { (void)h.client->openTopicAndWait<StubV1>("characters"); });
+    EXPECT_NE(msg.find("error 45"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("NotAuthorized"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("stale"), std::string::npos) << msg;
 }
 
 // ===========================================================================

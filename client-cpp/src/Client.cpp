@@ -750,10 +750,19 @@ session::SessionState Client::state() const {
     return static_cast<session::SessionState>(seedStatusCache_.state);
 }
 
-int16_t Client::sessionRejectCode() const noexcept {
-    if (std::this_thread::get_id() != dutyThreadId_) return 0;
-    const auto& m = agent_.seedMachine();
-    return m.state() == session::SessionState::Rejected ? m.rejectCode() : int16_t{0};
+int16_t Client::sessionRejectCode() const {
+    const auto me = std::this_thread::get_id();
+    if (me == dutyThreadId_) {
+        const auto& m = agent_.seedMachine();
+        return m.state() == session::SessionState::Rejected ? m.rejectCode() : int16_t{0};
+    }
+    // Issue #310: state()'s rule - the owner thread reads the published status, any other thread is refused.
+    if (me != ownerThread_) {
+        throw std::logic_error(
+            "Client::sessionRejectCode(): call from the owner (constructing) thread or a duty-cycle callback");
+    }
+    (void)seedStatus_.drainLatest(seedStatusCache_);
+    return seedStatusCache_.rejectCode;
 }
 
 AuthStatus Client::authStatus() const {
@@ -800,6 +809,7 @@ void Client::publishSeedStatus_(session::SessionState st, int64_t sid) noexcept 
         seedStatusLast_.authMode               = static_cast<uint8_t>(m.brokerAuthMode());
         seedStatusLast_.passwordChangeRequired = m.passwordChangeRequired() ? 1 : 0;
         seedStatusLast_.authenticated          = m.authenticated() ? 1 : 0;
+        seedStatusLast_.rejectCode = st == session::SessionState::Rejected ? m.rejectCode() : int16_t{0};   // #310
     }
     seedStatusDirty_ = !seedStatus_.tryPublish(seedStatusLast_);
 }
@@ -2870,6 +2880,34 @@ std::string Client::lineageFailure(std::string_view topic, uint16_t code, std::c
                "' (upgrade the broker to generate a type that reads every version)";
     if (probe.errorCode == kUnknownTopic) return "lineage: topic '" + std::string(topic) + "' does not exist";
     return plain(probe.errorCode);
+}
+
+void Client::throwOpenTopicFailure(std::string_view name, uint16_t code, std::chrono::nanoseconds remaining) {
+    constexpr auto kUnknownTopic = static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownTopic);
+    const auto refused = [&](uint16_t c) {
+        std::string msg = "openTopic: the broker refused '" + std::string(name) + "' (error " + std::to_string(c);
+        if (const char* an = authErrorName(c)) msg += std::string(" ") + an;
+        else if (c == kUnknownTopic) msg += " UnknownTopic";
+        return msg + ")";
+    };
+    if (code == kUnknownTopic && remaining > std::chrono::nanoseconds::zero()) {
+        // The broker answers UnknownTopic for a missing topic AND for an unknown fingerprint: ask for the latest.
+        TopicSchemaResult latest;
+        bool probed = true;
+        try {
+            latest = getTopicSchemaAndWait(name, uint64_t{0}, remaining);
+        } catch (const std::exception&) {
+            probed = false;   // a probe that timed out proves nothing: name the original code
+        }
+        if (probed) {
+            if (latest.errorCode == kUnknownTopic)
+                throw std::runtime_error("openTopic: topic '" + std::string(name) + "' does not exist");
+            if (latest.errorCode == 0)
+                throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
+            code = latest.errorCode;
+        }
+    }
+    throw std::runtime_error(refused(code));
 }
 
 TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, uint64_t requestedFingerprint,

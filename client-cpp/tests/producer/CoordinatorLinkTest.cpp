@@ -717,3 +717,77 @@ TEST(CoordinatorLinkRegression, ANonTransactionalProducerHoldsOnlyTheSlotsItCanU
     EXPECT_EQ(CoordinatorLink(0, fake.sink(), 0, 0).slotCapacity(), 1u);
     EXPECT_EQ(CoordinatorLink(0, fake.sink(), 0, 99).slotCapacity(), CoordinatorLink::kMaxCoordRequests);
 }
+
+// ============================================================================================================
+// C15 review - adversarial pass over #340 (slot capacity, per-state fields)
+// ============================================================================================================
+
+// #340 item 4 x input bounds: a plain link holds ONE slot, so an answer whose correlation id names any other slot index
+// (1 .. 7, the transactional range, and the 8-bit max) is foreign - ignored, never indexed past the allocation - and the
+// real request is still settled by its own answer.  RED (mutation, under ASan): the `i >= capacity_` guard removed.
+TEST(CoordinatorLinkRegression, APlainLinkIgnoresAnswersNamingASlotItDoesNotHaveAdversarialRegression) {
+    FakeCoordinator fake;
+    CoordinatorLink link(0, fake.sink(), 0, 1);
+    ASSERT_EQ(link.slotCapacity(), 1u);
+    CoordinatorLink::Slot* s = send(link, ReqKind::InitProducerId);
+    ASSERT_NE(s, nullptr);
+    ASSERT_EQ(pumpNoExpiry(link, 1), 1);
+    const uint32_t seq = static_cast<uint32_t>(s->corrId & 0xFFFFFFFF);
+    for (const uint8_t slot : {uint8_t{1}, uint8_t{2}, uint8_t{7}, uint8_t{255}}) {
+        const int64_t foreign = rp::coordcorr::make(0, slot, seq);
+        ASSERT_TRUE(rp::coordcorr::isCoord(foreign));
+        ASSERT_EQ(rp::coordcorr::slot(foreign), slot);
+        for (const int16_t code : {int16_t{0}, kNotCoord, kConcurrent, kFenced}) {
+            const auto f = FakeCoordinator::answer(ReqKind::InitProducerId, foreign, code);
+            EXPECT_EQ(link.onAnswer(asAnswer(f, ReqKind::InitProducerId, foreign, code), 2), nullptr)
+                << "slot " << int(slot) << " code " << code;
+        }
+    }
+    EXPECT_TRUE(std::holds_alternative<CoordinatorLink::InFlight>(s->state)) << "the real request is untouched";
+    EXPECT_EQ(fake.rediscovers, 0) << "a foreign NotCoordinator asks for nothing";
+    const auto f = FakeCoordinator::answer(ReqKind::InitProducerId, s->corrId, 0);
+    EXPECT_EQ(link.onAnswer(asAnswer(f, ReqKind::InitProducerId, s->corrId, 0), 3), s);
+}
+
+// #340 item 2: the retry attempt lives in the Sent states and survives every hop between them - InFlight -> Backoff ->
+// InFlight -> (session change) Unsent -> InFlight -> Backoff: the second ConcurrentTransactions backs off for attempt 2,
+// not 1, and a NotCoordinator after that waits for attempt 3.  A released and re-acquired slot starts again at 0.
+// RED (mutation): carry<Unsent> in onSessionChanged dropping the attempt (the second backoff is backoffNs(1)).
+TEST(CoordinatorLinkRegression, TheRetryAttemptSurvivesASessionChangeAndResetsOnReacquireAdversarialRegression) {
+    FakeCoordinator fake;
+    CoordinatorLink link(0, fake.sink());
+    CoordinatorLink::Slot* s = send(link, ReqKind::AddPartitions);
+    ASSERT_NE(s, nullptr);
+    int64_t now = 1;
+    ASSERT_EQ(pumpNoExpiry(link, now), 1);
+    auto answerWith = [&](int16_t code) {
+        const auto f = FakeCoordinator::answer(ReqKind::AddPartitions, s->corrId, code);
+        return link.onAnswer(asAnswer(f, ReqKind::AddPartitions, s->corrId, code), now);
+    };
+    EXPECT_EQ(answerWith(kConcurrent), nullptr);   // attempt 1
+    now += CoordinatorLink::backoffNs(1);
+    ASSERT_EQ(pumpNoExpiry(link, now), 1);
+    fake.sid = 88;
+    link.onSessionChanged();                         // InFlight -> Unsent
+    ASSERT_TRUE(std::holds_alternative<CoordinatorLink::Unsent>(s->state));
+    ASSERT_EQ(pumpNoExpiry(link, now), 1);
+    EXPECT_EQ(answerWith(kConcurrent), nullptr);     // attempt 2
+    const int64_t at = now;
+    EXPECT_EQ(pumpNoExpiry(link, at + CoordinatorLink::backoffNs(1)), 0) << "attempt 2 waits backoffNs(2), not (1)";
+    EXPECT_EQ(pumpNoExpiry(link, at + CoordinatorLink::backoffNs(2) - 1), 0);
+    now = at + CoordinatorLink::backoffNs(2);
+    ASSERT_EQ(pumpNoExpiry(link, now), 1);
+    EXPECT_EQ(answerWith(kNotCoord), nullptr);       // attempt 3
+    link.onCoordinatorMoved();
+    EXPECT_EQ(pumpNoExpiry(link, now + CoordinatorLink::backoffNs(2)), 0) << "attempt 3 waits backoffNs(3)";
+    now += CoordinatorLink::backoffNs(3);
+    ASSERT_EQ(pumpNoExpiry(link, now), 1);
+    EXPECT_EQ(answerWith(0), s);
+    link.release(*s);
+    CoordinatorLink::Slot* again = send(link, ReqKind::AddPartitions);
+    ASSERT_EQ(again, s) << "the same slot";
+    ASSERT_EQ(pumpNoExpiry(link, now), 1);
+    const auto f = FakeCoordinator::answer(ReqKind::AddPartitions, again->corrId, kConcurrent);
+    EXPECT_EQ(link.onAnswer(asAnswer(f, ReqKind::AddPartitions, again->corrId, kConcurrent), now), nullptr);
+    EXPECT_EQ(pumpNoExpiry(link, now + CoordinatorLink::backoffNs(1)), 1) << "a fresh request starts at attempt 1";
+}

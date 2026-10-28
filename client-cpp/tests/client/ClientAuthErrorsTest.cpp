@@ -22,6 +22,8 @@
 #include <optional>
 #include <fstream>
 #include <string>
+#include <thread>
+#include <stdexcept>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
@@ -136,6 +138,56 @@ TEST(ClientAuthErrorsRegression, WrongPasswordFailsConnectWithAuthenticationFail
     EXPECT_EQ(r.client.authStatus().kind, rc::AuthStatus::Kind::Anonymous);
 }
 
+// Issue #310: sessionRejectCode() follows state()'s threading rule - the duty thread reads the machine, the owner
+// thread (Thread mode) the published seed status, any other thread is refused.
+TEST(ClientAuthErrorsRegression, SessionRejectCodeFollowsTheStateThreadingRuleRegression) {
+    {   // Invoker mode: the owner is the duty thread.
+        Rig r(authCfg(4166, "ws1", "not the password!"));
+        test_support::TestCq cq(r.client);
+        auto f = r.connectOp(cq);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+        ASSERT_TRUE(r.drive([&] { return r.client.state() == rc::session::SessionState::Rejected; }));
+        EXPECT_EQ(r.client.sessionRejectCode(), 44);
+    }
+    // Thread mode: a runner thread drives the client; the real clock (the fake one is a plain global).
+    rc::ClientConfig c = authCfg(4168, "ws1", "not the password!");
+    c.runnerMode = rc::RunnerMode::Thread;
+    c.nanoClock  = nullptr;
+    rc::Client                   client(c);
+    test_support::InvokerGateway gw(c.dataDir + "/aeron", c.gatewayChannel, c.gatewayStreamId, c.egressChannel,
+                                    c.egressStreamId);
+    gw.authMode   = pc::AuthMode::Required;
+    gw.tlsCertPem = testPem("server.pem");
+    gw.tlsKeyPem  = testPem("server.key");
+    gw.addUser("ws1", kPw);
+    const auto driveGw = [&](auto&& pred) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            gw.pump();
+            if (pred()) return true;
+        }
+        return false;
+    };
+    EXPECT_EQ(client.sessionRejectCode(), 0) << "never rejected";
+    ASSERT_TRUE(driveGw([&] { return gw.ready(); }));
+    test_support::TestCq cq(client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+    ASSERT_TRUE(driveGw([&] { return f.ready(); }));
+    ASSERT_TRUE(f.failed());
+    ASSERT_TRUE(driveGw([&] { return client.state() == rc::session::SessionState::Rejected; }));
+    EXPECT_EQ(client.sessionRejectCode(), 44) << "owner thread, Thread mode";
+    bool threw = false;
+    std::thread other([&] {
+        try {
+            (void)client.sessionRejectCode();
+        } catch (const std::logic_error&) {
+            threw = true;
+        }
+    });
+    other.join();
+    EXPECT_TRUE(threw) << "a foreign thread is refused, as state() does";
+}
+
 TEST(ClientAuthErrorsRegression, UnknownUserIsTheSameFailureAsAWrongPassword) {
     Rig r(authCfg(3704, "nobody", kPw));
     test_support::TestCq cq(r.client);
@@ -170,6 +222,60 @@ TEST(ClientAuthErrorsRegression, ARateLimitedLoginReportsRetryAfterOnTheConnectF
     ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000));
     EXPECT_EQ(f.outcome().c.errorCode, 44);
     EXPECT_EQ(f.outcome().c.aux, 800) << "Completion::aux = the broker's retryAfterMs";
+}
+
+// Issue #226: the retry hint has a typed accessor; Completion::aux carries it only for a refused Connect.
+TEST(ClientAuthErrorsRegression, RetryAfterIsReadableThroughItsTypedAccessorRegression) {
+    {
+        rc::ClientConfig c = authCfg(4160, "ws1", "not the password!");
+        c.connectTimeoutMs = 120'000;
+        Rig r(c);
+        r.gw.retryAfterMsOnFailure = 800;
+        test_support::TestCq cq(r.client);
+        auto f = r.connectOp(cq);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000));
+        EXPECT_EQ(f.outcome().c.aux, 800);
+        EXPECT_EQ(rc::retryAfterMs(f.outcome().c), 800);
+    }
+    {
+        rc::ClientConfig c = authCfg(4162, "ws1", "not the password!");
+        Rig r(c);
+        r.gw.retryAfterMsOnFailure = 0;
+        test_support::TestCq cq(r.client);
+        auto f = r.connectOp(cq);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+        EXPECT_EQ(f.outcome().c.errorCode, 44);
+        EXPECT_EQ(rc::retryAfterMs(f.outcome().c), 0);
+    }
+    {   // C4: a retry-after beyond the connect deadline fails the connect NotConnected with the hint.
+        rc::ClientConfig c = authCfg(4164, "ws1", "not the password!");
+        c.connectTimeoutMs = 2'000;
+        Rig r(c);
+        r.gw.retryAfterMsOnFailure = 5'000;
+        test_support::TestCq cq(r.client);
+        auto f = r.connectOp(cq);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000));
+        EXPECT_EQ(f.outcome().c.status, rc::OpStatus::NotConnected);
+        EXPECT_EQ(rc::retryAfterMs(f.outcome().c), 5'000);
+    }
+    rc::Completion other{};
+    other.op = rc::OpKind::DefineTopic; other.status = rc::OpStatus::Ok; other.aux = 5;
+    EXPECT_EQ(rc::retryAfterMs(other), 0);
+    rc::Completion notAuth{};
+    notAuth.op = rc::OpKind::Connect; notAuth.status = rc::OpStatus::BrokerError; notAuth.errorCode = 45; notAuth.aux = 5;
+    EXPECT_EQ(rc::retryAfterMs(notAuth), 0);
+    rc::Completion refused{};
+    refused.op = rc::OpKind::Connect; refused.status = rc::OpStatus::BrokerError; refused.errorCode = 44; refused.aux = 5;
+    EXPECT_EQ(rc::retryAfterMs(refused), 5);
+    constexpr rc::Completion kOther = [] {
+        rc::Completion c{}; c.op = rc::OpKind::DefineTopic; c.status = rc::OpStatus::Ok; c.aux = 5; return c;
+    }();
+    constexpr rc::Completion kNotAuth = [] {
+        rc::Completion c{}; c.op = rc::OpKind::Connect; c.status = rc::OpStatus::BrokerError; c.errorCode = 45; c.aux = 5;
+        return c;
+    }();
+    static_assert(rc::retryAfterMs(kOther) == 0);
+    static_assert(rc::retryAfterMs(kNotAuth) == 0);
 }
 
 // C4 review (#461 / #519): a retry-after that outlives the connect deadline.  The deadline falls inside the paced retry;

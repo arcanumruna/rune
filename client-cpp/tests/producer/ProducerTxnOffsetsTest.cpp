@@ -1348,3 +1348,111 @@ TEST(ProducerTxnControlRegression, MaxSizeControlMessageIsEncodedWithoutOverflow
         EXPECT_EQ(r.d(c.token).code, kInvalidTxnState) << static_cast<int>(k);
     }
 }
+
+// ============================================================================================================
+// C15 review - adversarial pass over #347 / #348 (every txn state x an empty / a second sendOffsets)
+// ============================================================================================================
+
+// #348 x protocol state: an EMPTY sendOffsets is Ok locally only inside a good transaction.  Every other state answers
+// as a non-empty call would (Uninitialized / Ready / Committing / Aborting: 19; AbortableError: the poison), and an
+// invalid group is still InvalidArgument (validation before emptiness).  No state sends anything for it.
+// RED (mutation): the empty-offsets early return moved ahead of the state gates in applyTxnControl (Ok in Ready).
+TEST(ProducerTxnOffsetsRegression, EmptySendOffsetsInEveryTxnStateAdversarialRegression) {
+    Rig r;
+    auto expect19 = [&](Token t, const char* where) {
+        ASSERT_EQ(r.d(t).times, 1) << where;
+        EXPECT_EQ(r.d(t).status, OpStatus::BrokerError) << where;
+        EXPECT_EQ(r.d(t).code, kInvalidTxnState) << where;
+    };
+    expect19(r.sendOffsets({}, "grp"), "Uninitialized");
+    r.ready();
+    expect19(r.sendOffsets({}, "grp"), "Ready");
+    r.begin();
+    for (const std::string& bad : {std::string(), std::string(rp::kMaxTxnGroupIdBytes + 1, 'g')}) {
+        const Token t = r.sendOffsets({}, bad);
+        ASSERT_EQ(r.d(t).times, 1);
+        EXPECT_EQ(r.d(t).status, OpStatus::InvalidArgument) << "group of " << bad.size() << " bytes";
+    }
+    const Token ok = r.sendOffsets({}, std::string(rp::kMaxTxnGroupIdBytes, 'g'));
+    ASSERT_EQ(r.d(ok).times, 1);
+    EXPECT_EQ(r.d(ok).status, OpStatus::Ok) << "a max-length group is valid";
+    // Committing (EndTxn on the wire).
+    const Token a = r.sendOffsets(offsetsOf(1));
+    r.sendOk(a);
+    ASSERT_EQ(r.d(a).status, OpStatus::Ok);
+    r.apply(TxnControl::Kind::Commit);
+    r.tick();
+    ASSERT_EQ(r.impl->txnStateDuty(), TxnState::CommittingTransaction);
+    expect19(r.sendOffsets({}, "grp"), "Committing");
+    r.answerFrame(r.lastOf(rpc::EndTxn::TEMPLATE_ID), rp::ReqKind::EndTxn, 0);
+    // Aborting.
+    r.begin();
+    const Token b = r.sendOffsets(offsetsOf(1));
+    r.sendOk(b);
+    r.apply(TxnControl::Kind::Abort);
+    r.tick();
+    ASSERT_EQ(r.impl->txnStateDuty(), TxnState::AbortingTransaction);
+    expect19(r.sendOffsets({}, "grp"), "Aborting");
+    r.answerFrame(r.lastOf(rpc::EndTxn::TEMPLATE_ID), rp::ReqKind::EndTxn, 0);
+    // AbortableError: the poison, not Ok.
+    r.begin();
+    r.impl->testPoison(OpStatus::BrokerError, 77, rp::AbortKind::Plain);
+    const Token p = r.sendOffsets({}, "grp");
+    ASSERT_EQ(r.d(p).times, 1);
+    EXPECT_EQ(r.d(p).status, OpStatus::BrokerError) << "an empty call does not hide the poison";
+    EXPECT_EQ(r.d(p).code, 77u);
+    r.tick(10 * kMs);
+    EXPECT_EQ(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).size(), 2u) << "only the two real calls sent AddOffsets";
+}
+
+// #347 x concurrency: the same refused call repeated while the first runs, then the first FAILS.  Each refusal
+// completes once with InvalidArgument and is never touched again; the first's failure alone poisons the transaction
+// (its code, not the refusal's); a later call gets the poison; after the abort a new transaction's call runs (the
+// scratch was freed).  RED (mutation): the in-flight check after the scratch copy (the refused call overwrites the
+// running call's group: the TxnOffsetCommit names grp-b).
+TEST(ProducerTxnOffsetsRegression, RefusedSecondCallsDuringAFailingFirstKeepOnlyTheFirstsOutcomeAdversarialRegression) {
+    Rig r;
+    r.inTxn();
+    const Token a = r.sendOffsets(offsetsOf(2), "grp-a");
+    std::vector<Token> refused;
+    for (int i = 0; i < 3; ++i) {
+        refused.push_back(r.sendOffsets(offsetsOf(1), "grp-b"));
+        ASSERT_EQ(r.d(refused.back()).times, 1);
+        EXPECT_EQ(r.d(refused.back()).status, OpStatus::InvalidArgument);
+    }
+    r.tick();
+    r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+    r.tick();
+    const auto commits = r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID);
+    ASSERT_EQ(commits.size(), 1u);
+    const auto m = rpc::TxnOffsetCommit::decode(r.cap.data(commits[0]), commits[0].len);
+    ASSERT_TRUE(m.has_value());
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(m->groupId.data()), m->groupId.size()), "grp-a")
+        << "the refused calls never touched the running call's scratch";
+    r.answerFrame(commits[0], rp::ReqKind::TxnOffsetCommit, ec(rpc::ErrorCode::NotAuthorized));
+    ASSERT_EQ(r.d(a).times, 1);
+    EXPECT_EQ(r.d(a).status, OpStatus::BrokerError);
+    EXPECT_EQ(r.d(a).code, uec(rpc::ErrorCode::NotAuthorized));
+    ASSERT_EQ(r.impl->txnStateDuty(), TxnState::AbortableError);
+    for (const Token t : refused) {
+        EXPECT_EQ(r.d(t).times, 1) << "a refused call completed again";
+        EXPECT_EQ(r.d(t).status, OpStatus::InvalidArgument);
+    }
+    const Token late = r.sendOffsets(offsetsOf(1), "grp-c");
+    ASSERT_EQ(r.d(late).times, 1);
+    EXPECT_EQ(r.d(late).code, uec(rpc::ErrorCode::NotAuthorized)) << "a call after the failure gets the poison";
+    const Token ab = r.apply(TxnControl::Kind::Abort);
+    r.tick();
+    r.tick();
+    if (!r.cap.of(rpc::EndTxn::TEMPLATE_ID).empty()) {
+        r.answerFrame(r.lastOf(rpc::EndTxn::TEMPLATE_ID), rp::ReqKind::EndTxn, 0);
+    }
+    ASSERT_EQ(r.d(ab).times, 1);
+    EXPECT_EQ(r.d(ab).status, OpStatus::Ok);
+    r.begin();
+    const Token d = r.sendOffsets(offsetsOf(1), "grp-d");
+    EXPECT_EQ(r.d(d).times, 0) << "the next transaction's call runs";
+    r.sendOk(d);
+    ASSERT_EQ(r.d(d).times, 1);
+    EXPECT_EQ(r.d(d).status, OpStatus::Ok);
+}

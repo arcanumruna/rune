@@ -30,6 +30,7 @@
 #include <rune/client/detail/SecureZero.h>
 #include "rune/ql/Parser.h"
 
+#include <rune/client/Completion.h>
 #include "QlEngine.h"   // src/cli: splitStatements, the engine's internal seams
 #include "support/AllocCounter.h"
 
@@ -1374,4 +1375,15 @@ TEST(ConsoleOfflineRegression, LineLengthBoundaryIsExactAdversarialRegression) {
     EXPECT_EQ(count(over.err, "input line too long"), 1u) << over.err;
     EXPECT_EQ(count(over.out, " partitions 1"), 1u) << "the next line is read whole: " << over.out;
     EXPECT_EQ(over.err.find("1:1: "), std::string::npos) << "the tail of the dropped line is not parsed: " << over.err;
+}
+
+// Issue #225: the CLI prints the auth names from the client's one source (authErrorName); the rest stay on its table.
+TEST(CliErrorNamesRegression, CliAndClientNamesAgreeFor44To48Regression) {
+    for (uint16_t code = 44; code <= 48; ++code) {
+        SCOPED_TRACE(code);
+        ASSERT_NE(rune::client::authErrorName(code), nullptr);
+        EXPECT_EQ(rune::cli::engine::errorCodeName(code), std::string_view(rune::client::authErrorName(code)));
+    }
+    EXPECT_EQ(rune::cli::engine::errorCodeName(43), "PartitionDataReset");
+    EXPECT_EQ(rune::cli::engine::errorCodeName(49), "RecordEgressUnavailable");
 }
