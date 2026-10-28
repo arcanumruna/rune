@@ -12,7 +12,7 @@
 //   * B-3 / B-4 (KIP-360): a sequence gap makes the abort bump the epoch (InitProducerId after EndTxn(abort));
 //     once EndTxn(abort) is answered the end phase is Bumping (then InDoubt{Bump} if the bump times out), so a
 //     retried abort re-sends ONLY the bump;
-//   * #345: a commit also bumps once a sequence passed kTxnSeqBumpAt (after EndTxn(commit) is answered OK: Bumping, then
+//   * #345: a commit OR an abort also bumps once a sequence passed kTxnSeqBumpAt (after EndTxn(commit) is answered OK: Bumping, then
 //     the commit completes Ok; a failed bump completes it Ok and the producer is FatalError);
 //   * m15: TxnStarted::Maybe + 19 on EndTxn(abort) = nothing was open: the abort is done;
 //   * FD6: 17 / 18 -> FatalError(Fenced); 19 or 45 / 47 on EndTxn, any non-retriable InitProducerId ->
@@ -645,8 +645,9 @@ void ProducerImpl::enterFatal_(OpStatus st, uint16_t errorCode, std::string_view
 }
 
 void ProducerImpl::endDone_(int64_t nowNs) noexcept {
-    if (auto* ab = std::get_if<Aborting>(&txn_); ab != nullptr && ab->kind == AbortKind::BumpEpoch) {
-        // B-3 (KIP-360): the aborted transaction left a sequence gap - bump the epoch (InitProducerId for this
+    if (auto* ab = std::get_if<Aborting>(&txn_); ab != nullptr && (ab->kind == AbortKind::BumpEpoch || seqBumpDue_())) {
+        // B-3 (KIP-360): the aborted transaction left a sequence gap - or, #345, an abort (like a commit) left a
+        // partition's sequence space more than half used - bump the epoch (InitProducerId for this
         // transactional id) and restart every sequence before Ready; the abort completes after the bump.  B-4:
         // from here nothing is open on the broker: Bumping / InDoubt{Bump} - a retried abort re-sends only the bump.
         ab->op.deadlineNs = nowNs + txnOpTimeoutNs_();
@@ -774,7 +775,7 @@ void ProducerImpl::onTxnInitAnswer_(const CoordAnswer& a, CoordinatorLink::Slot&
         }
         return;
     }
-    // The bump follows an abort (B-3) or, #345, a commit whose sequences passed kTxnSeqBumpAt.
+    // The bump follows an abort (B-3), #345 an abort whose sequences passed kTxnSeqBumpAt, or a commit whose sequences passed kTxnSeqBumpAt.
     const auto* ab = std::get_if<Aborting>(&txn_);
     auto*       cm = std::get_if<Committing>(&txn_);
     const auto* b  = ab != nullptr ? std::get_if<Bumping>(&ab->phase)

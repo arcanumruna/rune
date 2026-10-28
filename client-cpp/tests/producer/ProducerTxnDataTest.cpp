@@ -3314,3 +3314,41 @@ TEST(ProducerTxnDataRegression, AnAddPartitionsAnswerWithUnrequestedResultsLeave
     EXPECT_EQ(r.acks.times(921), 1);
     EXPECT_EQ(r.acks.status(921), OpStatus::Ok);
 }
+
+// #345 x the sibling end path: an ABORT (Plain - nothing lost, no gap) that leaves a partition's sequence space more
+// than half used must bump the epoch exactly like such a commit, else an abort-heavy producer still walks the
+// sequence to INT32_MAX across transactions and loses a transaction there.
+// RED (today): endDone_ checks seqBumpDue_() for Committing only - the abort completes with no InitProducerId and the
+// next transaction's batch goes out at kTxnSeqBumpAt + 1.
+TEST(ProducerTxnDataRegression, AnAbortPastTheSequenceThresholdBumpsTheEpochAdversarialRegression) {
+    Rig r;
+    r.initOk(77, 0);
+    r.impl->debugSetNextSequenceForTest(kTopic, 0, rp::kTxnSeqBumpAt);
+    r.begin();
+    ASSERT_EQ(r.send(0, 1), SendResult::Ok);
+    r.tick();
+    r.answerAdd(0);
+    r.tick();
+    ASSERT_EQ(r.wire.size(), 1u);
+    ASSERT_NO_FATAL_FAILURE(answerWire(r, 0, 0, 100));
+    ASSERT_EQ(r.state(), TxnState::InTransaction);
+    Op abort = r.abort();
+    r.tick();
+    ASSERT_EQ(r.endTxns(), 1u);
+    EXPECT_EQ(r.lastEnd()->commit, uint8_t{0});
+    r.endAnswer();
+    r.tick();
+    EXPECT_FALSE(abort.ready()) << "the abort completes after the bump";
+    ASSERT_EQ(initsOn(r), 2u) << "an InitProducerId after EndTxn(abort): the sequence space is more than half used";
+    r.answer(Rig::initAnswer(r.last(rpc::InitProducerId::TEMPLATE_ID)->corrId, 77, 1));
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::Ok);
+    r.begin();
+    ASSERT_EQ(r.send(0, 2), SendResult::Ok);
+    r.tick();
+    r.answerAdd(0);
+    r.tick();
+    ASSERT_EQ(r.wire.size(), 2u);
+    EXPECT_EQ(r.wire[1].baseSeq, 0);
+    EXPECT_EQ(r.wire[1].epoch, 1);
+}

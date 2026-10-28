@@ -105,9 +105,9 @@ inline constexpr int32_t kMsgDirectClaimAbort = 8; // #656: an Invoker claim abo
 // reading any data.
 inline constexpr std::size_t kTxnCtlHeaderBytes = 48;
 /// #345: a transactional producer's sequences continue across transactions under one epoch, so a busy partition would
-/// reach INT32_MAX and lose the transaction that hits it.  After an EndTxn(commit) is answered OK, if ANY partition's
-/// next base sequence is above this threshold (half of the sequence space) the commit's end phase bumps the epoch
-/// (InitProducerId with the current identity) and every partition restarts at 0 before the commit completes Ok.  A
+/// reach INT32_MAX and lose the transaction that hits it.  After an EndTxn(commit or abort) is answered OK, if ANY partition's
+/// next base sequence is above this threshold (half of the sequence space) the end phase bumps the epoch
+/// (InitProducerId with the current identity) and every partition restarts at 0 before the commit/abort completes.  A
 /// single transaction that writes more than 2^30 records to one partition can still exhaust the space mid-transaction:
 /// that stays AbortableError (no bump is possible while a transaction is open).
 inline constexpr int32_t kTxnSeqBumpAt = 1 << 30;
