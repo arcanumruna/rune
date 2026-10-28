@@ -54,6 +54,20 @@ void wire(rc::GroupConsumer& gc, Consumed& led) {
 }
 } // namespace
 
+namespace {
+// #676: an injected duty clock for the metadata-timer tests (single test thread).
+int64_t g_routingClockNs = 1'000'000'000LL;
+int64_t routingClock() noexcept { return g_routingClockNs; }
+RigOptions routingClockOptions(int64_t stepNs = 1'000'000) {
+    RigOptions o;
+    g_routingClockNs = 1'000'000'000LL;
+    o.nanoClock      = &routingClock;
+    o.manualNs       = &g_routingClockNs;
+    o.stepNs         = stepNs;
+    return o;
+}
+} // namespace
+
 // RED on main: partition 1 is led by node 1, the member is assigned both
 // partitions — its Subscribe for partition 1 went to the seed (node 0), which
 // refused it, so partition 1 was never consumed.  The fix routes each group
@@ -1297,7 +1311,7 @@ TEST(GroupRoutingRegression, PartitionLedByAnOldNodeIsParkedNotSilentlyStalledRe
 // (advertising v3).  RED (round 4): parking set metadataWanted and every
 // metadata answer unparked it — ~5 requests per second, a log line each.
 TEST(GroupRoutingRegression, OldLeaderNodeNeverPollsMetadataAndResumesAfterUpgradeRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: the 1.5 s window runs on the duty clock
     o.keepaliveNs       = 50'000'000;
     o.responseTimeoutNs = 400'000'000;
     GroupRig r(4153, 4154, o);
@@ -1318,11 +1332,8 @@ TEST(GroupRoutingRegression, OldLeaderNodeNeverPollsMetadataAndResumesAfterUpgra
     ASSERT_TRUE(r.drive([&] { return r.client.testSessionCount() > 1 &&
                                      r.client.testSessionStateAt(1) == rc::session::SessionState::Connected; }));
     const int mdBefore = r.gw.metadataRequests;
-    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);  // a bounded window, not a sleep
-    while (std::chrono::steady_clock::now() < until) {
-        r.client.doWork();
-        r.gw.pump();
-    }
+    const int64_t until = g_routingClockNs + 1'500'000'000LL;   // a bounded duty-clock window, not a sleep
+    ASSERT_TRUE(r.drive([&] { return g_routingClockNs >= until; }, 100'000));
     EXPECT_EQ(r.gw.metadataRequests, mdBefore) << "a pre-v3 leader made the client poll metadata";
     EXPECT_EQ(r.subAt(1, n1), nullptr);
     EXPECT_FALSE(gc.finished());
@@ -2610,7 +2621,7 @@ TEST(GroupRoutingRegression, NewSubscribeRedirectedBeforeAnyMetadataStillFollows
 // subscription binds exactly once.  RED (no session check): node 1 got the
 // Subscribe too.
 TEST(GroupRoutingRegression, RedirectFromAnEarlierSessionNeverBindsASubscriptionTwiceRegression) {
-    GroupRig r(4247, 4248);
+    GroupRig r(4247, 4248, routingClockOptions());   // #676: duty-clock timers, no wall windows
     const auto [n1, p1port] = r.addNode(4247);
     r.gw.moreBrokers   = {{1, "127.0.0.1", p1port}};
     r.gw.partitions    = {{1, 0, 0, 1, 4247, ""}};
@@ -2637,7 +2648,8 @@ TEST(GroupRoutingRegression, RedirectFromAnEarlierSessionNeverBindsASubscription
                    "127.0.0.1:" + std::to_string(p1port), s1, corr);
     ASSERT_TRUE(r.drive([&] { return r.client.testStaleSubscribeRedirects() >= 1 || r.subAt(0, n1) != nullptr; }))
         << "the late Redirect was neither ignored nor followed";
-    (void)r.drive([&] { return r.subAt(0, n1) != nullptr; }, 300'000);
+    const int64_t quietUntil = g_routingClockNs + 2'000'000'000LL;   // a bounded duty-clock window
+    (void)r.drive([&] { return r.subAt(0, n1) != nullptr || g_routingClockNs >= quietUntil; }, 100'000);
     EXPECT_EQ(r.subAt(0, n1), nullptr) << "DUPLICATE: a Redirect from an earlier session bound the subscription on node 1";
     EXPECT_EQ(r.client.testStaleSubscribeRedirects(), 1u);
     EXPECT_EQ(r.client.testTransport().ingressChannel(), seedBefore) << "the stale Redirect moved the seed";
@@ -2753,7 +2765,7 @@ TEST(GroupRoutingRegression, SeedBoundPlainSubscriptionEndsExplicitlyWhenTheSeed
 // carry the MetadataRequest.
 // RED (before the fix): no MetadataRequest ever reaches node 1 after the seed died.
 TEST(GroupRoutingRegression, MetadataIsAskedThroughALiveNodeSessionWhileTheSeedIsDownRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: the 5 s deadline runs on the duty clock
     o.keepaliveNs       = 50'000'000LL;    // 50 ms
     o.responseTimeoutNs = 400'000'000LL;   // the seed goes stale 400 ms after its node died
     GroupRig r(4261, 4262, o);
@@ -2775,13 +2787,9 @@ TEST(GroupRoutingRegression, MetadataIsAskedThroughALiveNodeSessionWhileTheSeedI
     const int beforeN1 = askedAt(n1);
     r.gw.deadEndpoints.insert(0);      // the seed's broker dies (hears nothing more)
     r.gw.silentEndpoints.insert(n1);   // node 1 answers no NEW connect (the seed cannot fail over to it)
-    const auto t0 = std::chrono::steady_clock::now();
+    const int64_t deadline = g_routingClockNs + 5'000'000'000LL;
     bool asked = false;
-    for (const auto deadline = t0 + std::chrono::seconds(5); std::chrono::steady_clock::now() < deadline && !asked;) {
-        r.client.doWork();
-        r.gw.pump();
-        asked = askedAt(n1) > beforeN1;
-    }
+    (void)r.drive([&] { asked = askedAt(n1) > beforeN1; return asked || g_routingClockNs >= deadline; }, 1'000'000);
     EXPECT_TRUE(asked) << "the new leader must be learnt from a live broker's session while the seed is down";
     EXPECT_NE(r.client.testSessionStateAt(0), rc::session::SessionState::Connected) << "the seed is down";
     EXPECT_GE(r.client.testMetadataViaOtherSession(), 1u);
@@ -3734,7 +3742,7 @@ TEST(GroupRoutingRegression, AGroupMemberAloneOnACrashedLeaderMovesItsFetchBefor
 // No refresh storm: a live but idle leader answers every keepalive Ping, so it is never silent and the bound
 // reader on it never arms a metadata refresh.
 TEST(GroupRoutingRegression, AnIdleButLiveLeaderDoesNotTriggerRefreshStormRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty-clock keepalives and refresh backoff
     o.keepaliveNs       = 50'000'000;
     o.responseTimeoutNs = 60'000'000'000;
     GroupRig r(4555, 4556, o);
@@ -3849,7 +3857,7 @@ TEST(GroupRoutingRegression, ASilentLeaderStillNamedKeepsABoundedRefreshPaceThen
 // reader was never moved or re-sent, and its pushes still arrive on the original subscription.
 // RED by mutation: report every Connected session as silent in leaderSessionsSilentMask (refreshes never stop).
 TEST(GroupRoutingRegression, ALeaderSilentThenBackStopsRefreshingAndKeepsItsReaderAdversarialRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty-clock keepalives and refresh backoff
     o.keepaliveNs       = 50'000'000;
     o.responseTimeoutNs = 60'000'000'000;
     GroupRig r(4565, 4566, o);
@@ -4088,20 +4096,6 @@ TEST(GroupRoutingRegression, LaggingMetadataAnswersNeverPostponeTheArmedRefreshA
     EXPECT_LE(r.gw.pings - pingsBefore, 30) << "the refresh that confirms the second redirect was postponed by "
                                                "lagging answers (each re-armed it with a doubled backoff)";
 }
-
-namespace {
-// #676: an injected duty clock for the metadata-timer tests (single test thread).
-int64_t g_routingClockNs = 1'000'000'000LL;
-int64_t routingClock() noexcept { return g_routingClockNs; }
-RigOptions routingClockOptions(int64_t stepNs = 1'000'000) {
-    RigOptions o;
-    g_routingClockNs = 1'000'000'000LL;
-    o.nanoClock      = &routingClock;
-    o.manualNs       = &g_routingClockNs;
-    o.stepNs         = stepNs;
-    return o;
-}
-} // namespace
 
 // The armed metadata refresh is driven by the injected duty clock (rule 2: one injected clock), not by the wall
 // clock.  Same setup as the #651 test: the second redirect's guess stays provisional, so a refresh is armed.  With

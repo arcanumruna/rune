@@ -6345,19 +6345,21 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         partitionRouter_.setTopicPartitionCount(topicId, maxP + 1);
     }
 
-    // MD1 IMPORTANT-3: a fresh authoritative map arrived — reset the backoff to
+    // MD1 IMPORTANT-3: a fresh authoritative map arrived - reset the backoff to
     // its initial interval so a future no-progress episode starts from the floor,
-    // and disarm any pending refresh (we just refreshed).
-    nextMetadataRefreshAt_ = std::chrono::steady_clock::time_point::max();
+    // and disarm the pending refresh (we just refreshed).
+    nextMetadataRefreshAtNs_ = kMetadataRefreshNotArmed;   // MUTATION651
     if (metadataCache_.anyProvisional()) {
         // R2-1: an answer that leaves a redirect's guess unconfirmed (requested
         // before a later redirect of the burst, or a partition the answer omits)
-        // must not end the refresh cycle — re-arm WITHOUT resetting the backoff,
-        // so a guess that is never confirmed backs off to the cap instead of
-        // polling every 100 ms forever.
+        // must not end the refresh cycle - keep it armed WITHOUT resetting the
+        // backoff, so a guess that is never confirmed backs off to the cap instead
+        // of polling every 100 ms forever.
+        // #651: idempotent while armed - a lagging answer never postpones the armed refresh.
         scheduleMetadataRefresh();
     } else {
-        metadataBackoffNs_ = kMetadataBackoffInitNs;
+        nextMetadataRefreshAtNs_ = kMetadataRefreshNotArmed;   // a fresh authoritative map: disarm
+        metadataBackoffNs_       = kMetadataBackoffInitNs;
     }
 
     // A fresh cluster view: group members follow their partitions' leaders
@@ -6521,11 +6523,10 @@ void Client::scheduleMetadataRefresh() noexcept {
     // deadline forward forever (it would never fire) and blow the backoff to the
     // cap instantly.  So only arm+double when NOT already armed; the doubling
     // then happens once per fired-then-rescheduled episode.
-    if (nextMetadataRefreshAt_ != std::chrono::steady_clock::time_point::max()) {
+    if (nextMetadataRefreshAtNs_ != kMetadataRefreshNotArmed) {
         return; // already armed — leave the pending deadline in place
     }
-    nextMetadataRefreshAt_ = std::chrono::steady_clock::now() +
-        std::chrono::nanoseconds(metadataBackoffNs_);
+    nextMetadataRefreshAtNs_ = now() + metadataBackoffNs_;   // duty clock (injected in tests)
 
     if (metadataBackoffNs_ <= kMetadataBackoffMaxNs / 2) {
         metadataBackoffNs_ *= 2;
@@ -6570,14 +6571,14 @@ void Client::tickMetadataRefresh() noexcept {
         metadataAnswerByNs_ = 0;
         scheduleMetadataRefresh();
     }
-    if (nextMetadataRefreshAt_ == std::chrono::steady_clock::time_point::max()) {
+    if (nextMetadataRefreshAtNs_ == kMetadataRefreshNotArmed) {
         return; // not armed
     }
-    if (std::chrono::steady_clock::now() < nextMetadataRefreshAt_) return;
+    if (std::chrono::steady_clock::now().time_since_epoch().count() < nextMetadataRefreshAtNs_) return; // MUTATIONCLK
     // DR client bug 1: through any Connected session; none -> stays armed (the
     // next sweep retries; a session that connects asks on its own).
     if (!sendMetadataRequestAnywhere_()) return;
-    nextMetadataRefreshAt_ = std::chrono::steady_clock::time_point::max(); // disarm
+    nextMetadataRefreshAtNs_ = kMetadataRefreshNotArmed; // disarm
 }
 
 void Client::noteMetadataSent_() noexcept {
