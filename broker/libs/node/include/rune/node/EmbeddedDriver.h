@@ -28,6 +28,7 @@ extern "C" {
 #include "rune/protocol/net/rune_gso_bindings.h"
 }
 #include <rune/aeronutil/AeronPump.h>
+#include <rune/node/DriverDirLock.h>
 #include <rune/node/NodeConfig.h>
 
 #include <rune/consensus/ControlRing.h>
@@ -179,6 +180,7 @@ private:
     // must outlive the driver (members are destroyed after close()).
     rune::consensus::PeerResolutionInbox nameInbox_;
     rune_peer_name_lookup_t              nameLookup_{};
+    std::optional<DriverDirLock> dirLock_;   // held from construction to the end of close(); see DriverDirLock.h
     aeron_driver_context_t* ctx_    = nullptr;
     aeron_driver_t*         driver_ = nullptr;
     rune_gso_bindings_t*    gso_    = nullptr;   // owned; outlives ctx_ (Aeron points at it)

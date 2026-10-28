@@ -23,6 +23,7 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <variant>
 
@@ -37,7 +38,7 @@ public:
     struct Resolving { int64_t regId; int64_t deadlineNs; };
     struct Ready     { std::shared_ptr<Handle> handle; };
     struct TimedOut  { int64_t regId; int64_t retryAtNs; };
-    struct Rejected  { int64_t retryAtNs; };
+    struct Rejected  { int64_t retryAtNs; std::exception_ptr cause; };  // cause: what add()/find() threw
     using State = std::variant<Unstarted, Resolving, Ready, TimedOut, Rejected>;
 
     Resolution(int64_t timeoutNs, int64_t retryBackoffNs) noexcept
@@ -59,7 +60,7 @@ public:
         try {
             h = registry.find(r.regId);
         } catch (...) {
-            state_ = Rejected{nowNs + retryBackoffNs_};
+            state_ = Rejected{nowNs + retryBackoffNs_, std::current_exception()};
             return ResolveStatus::Failed;
         }
         if (h) {
@@ -85,6 +86,11 @@ public:
     [[nodiscard]] bool rejected() const noexcept {
         return std::holds_alternative<Rejected>(state_);
     }
+    /// The exception add()/find() threw when Rejected (nullptr otherwise).
+    [[nodiscard]] std::exception_ptr rejectCause() const noexcept {
+        const Rejected* j = std::get_if<Rejected>(&state_);
+        return j ? j->cause : nullptr;
+    }
     [[nodiscard]] const State& state() const noexcept { return state_; }
 
     /// Drops the handle on the owning thread and returns to Unstarted.
@@ -96,7 +102,7 @@ private:
         try {
             state_ = Resolving{registry.add(), nowNs + timeoutNs_};
         } catch (...) {
-            state_ = Rejected{nowNs + retryBackoffNs_};
+            state_ = Rejected{nowNs + retryBackoffNs_, std::current_exception()};
             return ResolveStatus::Failed;
         }
         return ResolveStatus::Pending;

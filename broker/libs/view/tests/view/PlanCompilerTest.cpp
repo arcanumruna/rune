@@ -46,6 +46,21 @@ TEST(PlanCompilerRejectRegression, CompileRejectsUnknownAndVarLenAndMissingKey) 
       EXPECT_FALSE(rune::view::compileView(v,s2,1).has_value()); }
 }
 
+// #667: a zero-width FixedStr output column is a compile refusal (a DDL error), never an exception.
+TEST(PlanCompilerRejectRegression, ZeroWidthFixedStrOutputIsRefusedNotThrownRegression) {
+    auto d = rune::codec::DescriptorBuilder("c3",1)
+        .add("id", rune::codec::PrimType::Int64, 1, true).addFixedStr("code", 4).build();
+    const rune::codec::Descriptor* s3[]={&d};
+    rune::view::ViewPlan v; v.viewName="z"; v.key="id"; v.sources={{7,"id"}};
+    v.output={{"id",rune::codec::PrimType::Int64,0,"id",rune::view::MergeRule::Replace},
+              {"code",rune::codec::PrimType::FixedStr,0,"code",rune::view::MergeRule::Replace}};
+    ASSERT_TRUE(rune::view::compileView(v,s3,1).has_value());
+    d.fields[1].fixedLen = 0;   // bypass the builder
+    std::expected<rune::view::CompileResult, rune::view::CompileError> r;
+    EXPECT_NO_THROW(r = rune::view::compileView(v,s3,1));
+    EXPECT_FALSE(r.has_value());
+}
+
 // Whole-branch review Bug B: ClientGateway::handleGetViewRow canonicalizes a
 // probe key into a FIXED 8-byte buffer and partitions via FNV-1a64 over that
 // exact span, but the PRODUCER partitions a narrow (<8-byte) key by its

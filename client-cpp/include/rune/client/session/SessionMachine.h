@@ -385,6 +385,8 @@ public:
     // ------------------------------------------------------------------------
     [[nodiscard]] SessionState state()         const noexcept { return state_; }
     [[nodiscard]] int64_t      sessionId()     const noexcept { return sessionId_; }
+    /// #426: true when `sid` names the session whose keys this machine discarded while it was encrypted.
+    [[nodiscard]] bool namesRetiredSealedSession(int64_t sid) const noexcept { return sid != 0 && sid == retiredSealedSid_; }
     [[nodiscard]] int64_t      keepaliveCorrelationId() const noexcept { return cfg_.keepaliveCorrelationId; }
     [[nodiscard]] int64_t      correlationId() const noexcept { return correlationId_; }
     [[nodiscard]] int           redirectCount() const noexcept { return redirectCount_; }
@@ -575,8 +577,8 @@ public:
         if (state_ == SessionState::Connected || state_ == SessionState::Handshaking ||
             state_ == SessionState::Authenticating ||
             state_ == SessionState::Closed || state_ == SessionState::Rejected) return;
+        discardCrypto_();   // before the id clears: it records the sealed episode's id (#426)
         sessionId_   = 0;
-        cryptoState_ = CryptoState{};
         // Fix round 5 (N4-M1): Connecting keeps its episode — the next NEW request replaces
         // it (a different requestCorrelationId); dropping it here would make tickConnecting's
         // requireCrypto-without-TLS rule turn a transient move into a terminal Rejected.
@@ -805,7 +807,7 @@ public:
             // their own count, renewed only once a sealed frame proves the keys - a broker that fails every final leg
             // is retried maxConnectRetries times, then Backoff / Disconnected, never a reconnect storm.
             hs_.reset();
-            cryptoState_      = CryptoState{};
+            discardCrypto_();
             lastConnectError_ = code;
             ++connectFailures_;
             if (unprovenFinalLegRetries_ < cfg_.maxConnectRetries) {
@@ -1164,6 +1166,17 @@ private:
         return ++correlationIdCounter_;
     }
 
+    /// #426: the id of the encrypted session whose keys are about to be dropped is remembered, so a frame the broker
+    /// still seals under that discarded key (its lease has not expired) is never mistaken for a clear frame.
+    void retireSealedSessionId_() noexcept {
+        if (cryptoState_.encrypted && sessionId_ != 0) retiredSealedSid_ = sessionId_;
+    }
+    /// Every crypto reset goes through here; it runs BEFORE any `sessionId_ = 0` on the same path.
+    void discardCrypto_() noexcept {
+        retireSealedSessionId_();
+        cryptoState_ = CryptoState{};
+    }
+
     /// Encode + send a ConnectRequest using the current config.
     /// If resetSessionId, sessionId_ is set to 0 (fresh connect).
     /// Otherwise the existing sessionId_ is used as a resume hint scaffold.
@@ -1173,6 +1186,7 @@ private:
     ///         fresh external connect() (freshEpisode=true).
     void doConnect(int64_t nowNs, bool resetSessionId, bool freshEpisode) noexcept {
         if (resetSessionId) {
+            retireSealedSessionId_();   // #426: the crypto reset below comes after the id clears
             sessionId_ = 0;
             authenticatedSessionId_ = 0;   // a fresh episode: no earlier login can be resumed
         }
@@ -1283,7 +1297,7 @@ private:
     /// offer — degrade, don't hard-fail a connect attempt over local TLS init.
     void beginCryptoHandshake_() noexcept {
         if (!cfg_.offerCrypto) return;  // toggle off — byte-identical pre-Task-5 connect
-        cryptoState_ = CryptoState{};   // N-I1: no key of an earlier session survives a fresh episode
+        discardCrypto_();   // N-I1: no key of an earlier session survives a fresh episode
         brokerKeysProven_ = false;      // PR #476 review: proven again only by a sealed frame of THIS episode
         hs_.reset();
         std::string host;
@@ -1451,7 +1465,7 @@ private:
         lastConnectError_ = static_cast<int16_t>(static_cast<uint16_t>(rpc::ErrorCode::AuthenticationFailed));
         rejectCode_       = lastConnectError_;
         ++connectFailures_;
-        cryptoState_ = CryptoState{};
+        discardCrypto_();
         transitionTo(SessionState::Rejected);
     }
 
@@ -1485,7 +1499,7 @@ private:
         lastConnectError_ = static_cast<int16_t>(static_cast<uint16_t>(ec));
         authInfo_.retryAfterMs = retryAfterMs;
         ++connectFailures_;
-        cryptoState_ = CryptoState{};
+        discardCrypto_();
         if (retryAfterMs > 0 &&   // Issue #519: a rate-limited login before Live is a bounded retry, not a verdict
             retryTransientRefusal_(static_cast<int16_t>(static_cast<uint16_t>(ec)),
                                       nowNs + static_cast<int64_t>(retryAfterMs) * 1'000'000LL, nowNs)) {
@@ -1514,7 +1528,7 @@ private:
         // A live session the broker ended (ErrorResponse 48, corr 0) is no connect in progress: the caller's path.
         if (reconnectsForever_() || state_ == SessionState::Connected) return false;
         hs_.reset();
-        cryptoState_            = CryptoState{};
+        discardCrypto_();
         scram_.reset();
         sessionId_              = 0;     // the refused broker session is gone: the retry is fresh
         authenticatedSessionId_ = 0;
@@ -1535,7 +1549,7 @@ private:
     /// connect; a retriable connect failure (Backoff for a reconnect-forever session that was Live - the seed failover
     /// moves it to another broker - Disconnected otherwise, the caller's connect retry).
     void onAuthUnavailable_(int64_t nowNs) noexcept {
-        cryptoState_            = CryptoState{};
+        discardCrypto_();
         sessionId_              = 0;
         authenticatedSessionId_ = 0;
         ++authUnavailable_;
@@ -1546,7 +1560,7 @@ private:
     void failAuthLocal_() noexcept {
         lastConnectError_ = static_cast<int16_t>(static_cast<uint16_t>(rune::protocol::client::ErrorCode::Internal));
         rejectCode_       = lastConnectError_;
-        cryptoState_      = CryptoState{};
+        discardCrypto_();
         transitionTo(SessionState::Rejected);
     }
 
@@ -1577,7 +1591,10 @@ private:
         everLive_            = true;   // T15a R1 latch
         // PR #476 review: an encrypted session's Backoff is renewed only once a sealed frame proves the keys
         // (onSealedFrameOpened) - an optimistic Connected followed by a final-leg failure keeps its growing delay.
-        if (!cryptoState_.encrypted) backoff_ = {};
+        if (!cryptoState_.encrypted) {
+            backoff_ = {};
+            if (sessionId_ == retiredSealedSid_) retiredSealedSid_ = 0;   // #426: a plaintext episode resuming the SAME id: its frames are legitimately clear; a new id never reads the old sealed ack
+        }
         lastConnectError_    = 0;      // I2: refused attempts are history now
         transitionTo(SessionState::Connected);
     }
@@ -1686,7 +1703,7 @@ private:
     /// terminal Rejected (onHandshakeFailed_).
     void onHandshakeTimedOut_(int64_t nowNs) noexcept {
         hs_.reset();
-        cryptoState_      = CryptoState{};
+        discardCrypto_();
         sessionId_        = 0;                 // the half-made broker session is abandoned: the retry is fresh
         lastConnectError_ = kHandshakeTimedOut;
         ++connectFailures_;
@@ -1729,7 +1746,7 @@ private:
     /// Rejected.  lastConnectError() reports the code.
     void onPreTlsRefusal_(int16_t code, int64_t nowNs) noexcept {
         hs_.reset();
-        cryptoState_      = CryptoState{};
+        discardCrypto_();
         lastConnectError_ = code;
         ++connectFailures_;
         if (state_ == SessionState::Connecting || state_ == SessionState::Handshaking) {
@@ -1868,6 +1885,9 @@ private:
 
     SessionState  state_            = SessionState::Disconnected;
     int64_t       sessionId_        = 0;
+    /// The session id of the last episode whose keys were discarded while encrypted; a frame naming it that no live
+    /// key opens is old-episode ciphertext and is never read in clear (#426).
+    int64_t       retiredSealedSid_ = 0;
     int64_t       correlationId_    = 0;
     int64_t       correlationIdCounter_ = 0;
 

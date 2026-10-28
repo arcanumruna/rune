@@ -1251,6 +1251,9 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         try {
             const rune::codec::Descriptor d =
                 rune::codec::deserialize(std::span<const uint8_t>(m.blob.data(), m.blob.size()));
+            // #667: a NEW definition may not carry a width-0 FixedStr (replay of historical events still accepts it).
+            if (const auto* zf = rune::codec::zeroWidthFixedStr(d))
+                return Rejected(reject(kInvalidSchema, "FixedStr column '" + zf->name + "' needs a width of at least 1"));
             uint32_t past = static_cast<uint32_t>(d.fields.size());
             for (const auto& f : d.fields) past = std::max<uint32_t>(past, uint32_t{f.id} + 1);
             if (past > 0xFFFF) return Rejected(reject(kInvalidSchema));

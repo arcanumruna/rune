@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <new>
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
@@ -86,12 +87,16 @@ int AeronTransport::dutyCycle() noexcept {
     // defence after mediaDriverTimeoutMsFor(); nothing relies on it alone.
     int work = pumpDriverFromCaller_();
     if (pumpObserver_ != nullptr) [[unlikely]] pumpObserver_(pumpObserverCtx_, PumpStep::Driver);
-    if (aeron_) {
+    if (aeron_ && conductorFault_ == nullptr) {
         try {
             work += aeron_->conductorAgentInvoker().invoke();
         } catch (...) {
             // AgentInvoker routes SourcedException to the error handler; anything
-            // else is contained here — dutyCycle() is noexcept.
+            // else is contained here — dutyCycle() is noexcept.  A conductor that
+            // threw (bad_alloc mid-update) is half-updated: record the fault and
+            // never invoke it again; closed() reports the transport as closed.
+            conductorFault_ = std::current_exception();
+            std::fprintf(stderr, "rune-client: aeron client conductor failed; the transport is closed\n");
         }
         if (pumpObserver_ != nullptr) [[unlikely]] pumpObserver_(pumpObserverCtx_, PumpStep::Conductor);
     }
@@ -203,6 +208,8 @@ void AeronTransport::startBody_() {
     PubRegistry preg{*aeron_, cfg_.ingressChannel, cfg_.ingressStreamId};
     SubRegistry sreg{*aeron_, cfg_.egressChannel, cfg_.egressStreamId};
     pumpUntil_([&] {
+        // A faulted conductor is half-updated: never poll (find) against it.
+        if (conductorFault_ != nullptr) return true;
         const int64_t now = resolveNow_();
         const bool pubOk = pubRes.poll(preg, now) == ResolveStatus::Ready;
         const bool subOk = subRes.poll(sreg, now) == ResolveStatus::Ready;
@@ -211,6 +218,8 @@ void AeronTransport::startBody_() {
     if (pubRes.ready() == nullptr || subRes.ready() == nullptr) {
         const std::string why = pubRes.rejected() || subRes.rejected() ? "rejected by the driver"
                                                                         : "timed out";
+        std::exception_ptr rejectCause = pubRes.rejectCause();
+        if (rejectCause == nullptr) rejectCause = subRes.rejectCause();
         // #432: a handle that did resolve is released while its conductor is
         // still alive (its dtor locks the conductor's admin mutex); left to the
         // unwinding below it would outlive aeron_.reset() and abort the process.
@@ -218,6 +227,15 @@ void AeronTransport::startBody_() {
         subRes.reset();
         aeron_.reset();
         stopEmbeddedDriver();
+        if (conductorFault_ != nullptr) std::rethrow_exception(conductorFault_);
+        if (rejectCause != nullptr) {
+            try {
+                std::rethrow_exception(rejectCause);
+            } catch (const std::bad_alloc&) {
+                throw;  // an allocation failure is reported as one, not as a driver rejection
+            } catch (...) {
+            }
+        }
         throw std::runtime_error("AeronTransport: resolving ExclusivePublication/Subscription " + why +
                                  " (ingressChannel=" + cfg_.ingressChannel +
                                  " egressChannel=" + cfg_.egressChannel + ")");
@@ -577,26 +595,26 @@ bool AeronTransport::retarget(const std::string& newIngressChannel) noexcept {
 void AeronTransport::startEmbeddedDriver() {
     const std::string aeronDir = (fs::path{cfg_.dataDir} / "aeron").string();
 
+    // The dir is owned through an exclusive flock on a lock file next to it (DriverDirLock.h), not judged from
+    // Aeron's 1 s heartbeat: a live holder is refused whatever its heartbeat age (dir_delete_on_start cannot
+    // wipe a live driver's dir, so an unguarded start degrades into an opaque init failure or produce timeout),
+    // and a holder killed without a clean shutdown releases the lock with its process.
+    {
+        std::string lockErr;
+        dirLock_ = DriverDirLock::tryAcquire(aeronDir, lockErr);
+        if (!dirLock_) {
+            throw std::runtime_error(
+                "AeronTransport: aeron dir '" + aeronDir + "' is already in use by a live media "
+                "driver (a prior client instance may still be running) or its lock cannot be taken: " +
+                lockErr + ". Use a distinct dataDir, or ensure the previous instance exited.");
+        }
+    }
+
     if (aeron_driver_context_init(&driverCtx_) < 0) {
+        dirLock_.reset();
         throw std::runtime_error(
             std::string("AeronTransport: aeron_driver_context_init failed: ") +
             aeron_errmsg());
-    }
-
-    // Silent-failure guard: if an ACTIVE media driver already holds this aeron
-    // dir, dir_delete_on_start cannot wipe it and the start degrades into a
-    // cryptic init failure or an opaque produce timeout (the stale-dir hang we
-    // hit under SIGKILL'd prior clients).  Detect it and fail LOUDLY with a
-    // clear, actionable message instead.
-    if (aeron_is_driver_active(aeronDir.c_str(), /*timeout_ms=*/1000,
-                               +[](const char*){})) {
-        aeron_driver_context_close(driverCtx_);
-        driverCtx_ = nullptr;
-        throw std::runtime_error(
-            "AeronTransport: aeron dir '" + aeronDir + "' is already in use by an "
-            "ACTIVE media driver (a prior client instance may still be running, or "
-            "was killed without clean shutdown so its driver is still holding the "
-            "dir). Use a distinct dataDir, or ensure the previous instance exited.");
     }
 
     aeron_driver_context_set_dir(driverCtx_, aeronDir.c_str());
@@ -781,6 +799,7 @@ void AeronTransport::stopEmbeddedDriver() noexcept {
         driverCtx_ = nullptr;
     }
     releaseGso_();
+    dirLock_.reset();   // last: the dir is only free once the driver and its context are closed
 }
 
 void AeronTransport::releaseGso_() noexcept {
