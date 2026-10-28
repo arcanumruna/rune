@@ -68,6 +68,7 @@
 #include <rune/protocol/CatalogTypes.h>
 #include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/client/NamespaceMessages.h>
+#include <rune/protocol/client/NamespaceUsageMessages.h>
 #include <rune/client/NamespaceLimitFields.h>
 
 #include <chrono>
@@ -1073,6 +1074,13 @@ public:
                                            std::chrono::milliseconds timeout = std::chrono::seconds(30));
     NamespaceResult<void> resumeNamespace(std::string_view name, std::chrono::milliseconds timeout = std::chrono::seconds(30));
     NamespaceResult<void> deleteNamespace(std::string_view name, std::chrono::milliseconds timeout = std::chrono::seconds(30));
+    /// Phase 2 Task 16 (D29): `name`'s limits next to its current usage on the broker answering (NamespaceUsage 84 ->
+    /// NamespaceUsageResponse 85; the completion payload is the raw response frame).  A cluster admin, or a user of the namespace
+    /// holding DESCRIBE ON NAMESPACE; anyone else gets NotAuthorized.  The blocking form returns the decoded response; a broker
+    /// refusal is the error (DdlResult: errorCode + detail).
+    OpResult namespaceUsage(std::string_view name, CompletionTarget target, Token token);
+    NamespaceResult<rune::protocol::client::NamespaceUsageResponse>
+    namespaceUsage(std::string_view name, std::chrono::milliseconds timeout = std::chrono::seconds(30));
     /// Every namespace this session may see, in nsId order (pages internally).
     NamespaceResult<std::vector<rune::protocol::client::NamespaceInfo>>
     listNamespaces(std::chrono::milliseconds timeout = std::chrono::seconds(30));

@@ -92,6 +92,10 @@ unqualified (`t` means `a/t` for `a/alice`). Only a cluster admin may name an ob
 rune namespace create a --broker rune-1:40200 --user admin --password-file admin.pw
 rune namespace list --broker rune-1:40200 --user admin --password-file admin.pw           # nsId, name, state (--json: limits too)
 rune namespace limits a --set max-topics=100 --broker rune-1:40200 --user admin --password-file admin.pw   # no --set: print
+rune namespace usage a --broker rune-1:40200 --user admin --password-file admin.pw          # each limit next to its usage (--json too)
+rune namespace suspend a --read-only --broker rune-1:40200 --user admin --password-file admin.pw   # or --reject-all
+rune namespace resume a --broker rune-1:40200 --user admin --password-file admin.pw
+rune namespace delete a --broker rune-1:40200 --user admin --password-file admin.pw           # asks on a terminal; --yes to skip, refused without a terminal
 ```
 
 | Role | Can do |

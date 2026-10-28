@@ -42,6 +42,7 @@
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/MetadataMessages.h>
+#include <rune/protocol/client/NamespaceUsageMessages.h>
 #include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
@@ -1295,6 +1296,7 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::SecurityBootstrap:
         case pc::TemplateId::NamespaceDdl:
         case pc::TemplateId::ListNamespaces:
+        case pc::TemplateId::NamespaceUsage:
         case pc::TemplateId::AuthClientFirst:
         case pc::TemplateId::AuthClientFinal:
         case pc::TemplateId::GetViewRow:
@@ -1413,6 +1415,9 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             break;
         case pc::TemplateId::ListNamespaces:
             handleListNamespaces(buf, len);
+            break;
+        case pc::TemplateId::NamespaceUsage:   // Phase 2 Task 16 (D29): answered by the gateway itself (no admin ring)
+            handleNamespaceUsage(buf, len);
             break;
         // Task 20: point read of a materialized view row — routed to the owning
         // worker via the same op/return plumbing as PushRead.
@@ -10011,6 +10016,99 @@ void ClientGateway::handleListNamespaces(const uint8_t* buf, std::size_t len)
                        adminSink_->submitListNamespaces(m.sessionId, m.correlationId, m.afterNsId, m.max,
                                                         sessionNsId_(*session), clusterAdmin),
                        "ListNamespaces: admin ring full", "ListNamespaces: request larger than the admin ring message");
+}
+
+// NamespaceUsage (84), Phase 2 Task 16 (D29): the namespace's limits next to its CURRENT usage.  Answered by the gateway on the
+// control thread, no append, any broker: the aggregator's last totals and rates (worker counters summed over this node), this
+// gateway's own connection counts, and the live object counts of its ObjectIndex / TopicRegistry (the catalog's effects).
+// Usage is per NODE, like every limit enforcement input (D24).  Authorization: a cluster admin, or a session of the namespace
+// itself holding DESCRIBE (or ADMIN) ON NAMESPACE "<name>"; a foreign / unknown name is NotAuthorized for everyone else (the
+// answer never says whether the namespace exists).  Fields with no usage meaning here (schemas, schema versions, groups, users,
+// message / batch / retention, open transactions, txn time, replication, acks, features) read 0 = n/a.
+void ClientGateway::handleNamespaceUsage(const uint8_t* buf, std::size_t len)
+{
+    auto msgOpt = pc::NamespaceUsageRequest::decode(buf, len);
+    if (!msgOpt) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "NamespaceUsage body undecodable");
+        return;
+    }
+    const pc::NamespaceUsageRequest& m = *msgOpt;
+    Session* session = sessions_.find(m.sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, "NamespaceUsage for unknown session");
+        return;
+    }
+    if (session->clientVersion < pc::kClientVersionNamespaces) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "NamespaceUsage needs client version 14");
+        return;
+    }
+    const rune::catalog::NamespaceRecord* rec = namespaces_.registry().byName(m.name);
+    const bool clusterAdmin = gateExempt_(*session);
+    bool allowed = clusterAdmin && rec != nullptr;
+    if (!allowed && rec != nullptr && sessionNsId_(*session) == rec->nsId) {
+        const auto& perms = permsOf_(*session);
+        namespace rsec = rune::security;
+        allowed = perms.allowsName(rsec::ResourceType::Namespace, rec->name, rsec::opBit(rsec::Operation::Describe)) ||
+                  perms.allowsName(rsec::ResourceType::Namespace, rec->name, rsec::opBit(rsec::Operation::Admin));
+    }
+    if (!allowed) {
+        pc::ErrorResponse er;
+        er.sessionId     = m.sessionId;
+        er.correlationId = m.correlationId;
+        // A cluster admin may learn that the name does not exist; nobody else learns anything about it.
+        er.code    = static_cast<int16_t>(clusterAdmin ? pc::ErrorCode::InvalidRequest : pc::ErrorCode::NotAuthorized);
+        er.message = clusterAdmin ? std::string_view("no such namespace") : std::string_view("not authorized");
+        sendAnswer_(*session, scratch_.data(), er.encode(scratch_.data()));
+        return;
+    }
+
+    pc::NamespaceUsageResponse r;
+    r.sessionId     = m.sessionId;
+    r.correlationId = m.correlationId;
+    r.code          = 0;
+    r.state         = static_cast<uint8_t>(rune::catalog::tagOf(rec->state));
+    r.limits        = rec->limits;
+    auto& u = r.usage;
+    // Catalog counts: the live objects of the namespace on this node's index.
+    uint64_t topics = 0, partitionsTotal = 0, partitionsMax = 0, views = 0;
+    objectIndex_.forEachInNs(rec->nsId, [&](int32_t id, const rune::gateway::ObjectEntry& e) {
+        if (e.type == rune::security::ResourceType::View) { ++views; return; }
+        if (e.type != rune::security::ResourceType::Topic) return;
+        ++topics;
+        if (topicRegistry_ != nullptr)
+            if (const rune::node::TopicSpec* t = topicRegistry_->topic(id); t != nullptr && t->partitionCount > 0) {
+                partitionsTotal += static_cast<uint64_t>(t->partitionCount);
+                partitionsMax = std::max<uint64_t>(partitionsMax, static_cast<uint64_t>(t->partitionCount));
+            }
+    });
+    u[0] = topics; u[1] = partitionsMax; u[2] = partitionsTotal; u[3] = views;
+    // The slot's counters: the aggregator's last totals / rates, and this gateway's connections.
+    const uint16_t slot = nsSlots_.slotOf(rec->nsId);
+    if (slot != rune::node::kNoNsSlot) {
+        using rune::node::NsMetric;
+        if (nsAggregator_ != nullptr) {
+            u[8]  = nsAggregator_->totalOf(slot, NsMetric::DiskBytes);
+            u[13] = nsAggregator_->rateOf(slot, NsMetric::ProduceBytes);
+            u[14] = nsAggregator_->rateOf(slot, NsMetric::ProduceRecords);
+            u[15] = nsAggregator_->rateOf(slot, NsMetric::FetchBytes);
+            u[16] = nsAggregator_->rateOf(slot, NsMetric::RequestOps);
+            u[17] = nsAggregator_->rateOf(slot, NsMetric::QueryCycles);
+            u[23] = nsAggregator_->totalOf(slot, NsMetric::ViewMemBytes);
+        }
+        if (slot < nsConns_.size()) {
+            const NsConnSlot& c = nsConns_[slot];
+            uint64_t perUserMax = 0;
+            for (const auto& [uid, n] : c.perUser) perUserMax = std::max<uint64_t>(perUserMax, n);
+            u[18] = c.total; u[19] = perUserMax; u[20] = perUserMax;
+        }
+    }
+    static_assert(pc::NamespaceUsageResponse::encodedSize() <= kScratchSize, "NamespaceUsageResponse exceeds the scratch frame");
+    const std::size_t n = r.encode(scratch_.data(), scratch_.size());
+    if (n == 0) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "NamespaceUsage: encode");
+        return;
+    }
+    sendReliable_(*session, scratch_.data(), n);
 }
 
 std::optional<rune::gateway::Denial> ClientGateway::verifyOwnCredentialChange_(Session& session, const pc::SecurityDdl& m,

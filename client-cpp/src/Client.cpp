@@ -1507,6 +1507,16 @@ OpResult Client::listNamespaces(uint32_t afterNsId, uint16_t max, CompletionTarg
     return issueControl_(OpKind::ListNamespaces, target, token, std::span<const uint8_t>(frame.data(), n), 0);
 }
 
+OpResult Client::namespaceUsage(std::string_view name, CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::NamespaceUsageRequest msg;
+    msg.name.assign(name);
+    std::vector<uint8_t> frame(msg.encodedSize());
+    const std::size_t n = msg.encode(frame.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueControl_(OpKind::NamespaceUsage, target, token, std::span<const uint8_t>(frame.data(), n), 0);
+}
+
 OpResult Client::dropView(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token) {
     namespace rpc = rune::protocol::client;
     rpc::DropView msg;
@@ -2999,6 +3009,31 @@ Client::listNamespaces(std::chrono::milliseconds timeout) {
         after = page->nextAfter;
     }
     return out;
+}
+
+Client::NamespaceResult<rune::protocol::client::NamespaceUsageResponse>
+Client::namespaceUsage(std::string_view name, std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    DdlResult err;
+    std::optional<rpc::NamespaceUsageResponse> got;
+    andWait_("namespaceUsage()", timeout, 64u << 10,
+             [&](Completions& q, Token t) { return namespaceUsage(name, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status == OpStatus::BrokerError) {
+                     err.errorCode = c.errorCode;
+                     err.detail.assign(reinterpret_cast<const char*>(p.data()), p.size());
+                     return;
+                 }
+                 throwForStatus_("namespaceUsage()", c, p);
+                 got = rpc::NamespaceUsageResponse::decode(p.data(), p.size());
+             });
+    if (err.errorCode != 0) return std::unexpected(std::move(err));
+    if (!got) throw std::runtime_error("namespaceUsage(): undecodable NamespaceUsageResponse");
+    if (got->code != 0) {
+        err.errorCode = static_cast<uint16_t>(got->code);
+        return std::unexpected(std::move(err));
+    }
+    return *got;
 }
 
 std::vector<std::pair<std::string, int32_t>> Client::listTopics(std::chrono::nanoseconds timeout) {
@@ -4495,6 +4530,18 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if (len < rune::protocol::client::MessageHeader::ENCODED_SIZE) break;
         const auto corr = static_cast<int64_t>(rune::protocol::client::detail::getLE64(buf, 16));
         if (const std::size_t i = findCtl_(corr); i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::ListNamespaces) {
+            PendingCtl p = takeCtl_(i);
+            completeCtl_(p, OpStatus::Ok, 0, 0, 0, std::span<const uint8_t>(buf, len),
+                         detail::CompletionRing::Overflow::TooLarge);
+        }
+        break;
+    }
+
+    // ---- Phase 2 Task 16: NamespaceUsageResponse (85) — the raw frame is the payload (the caller decodes).
+    case codec::TemplateId::NamespaceUsageResponse: {
+        if (len < rune::protocol::client::MessageHeader::ENCODED_SIZE) break;
+        const auto corr = static_cast<int64_t>(rune::protocol::client::detail::getLE64(buf, 16));
+        if (const std::size_t i = findCtl_(corr); i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::NamespaceUsage) {
             PendingCtl p = takeCtl_(i);
             completeCtl_(p, OpStatus::Ok, 0, 0, 0, std::span<const uint8_t>(buf, len),
                          detail::CompletionRing::Overflow::TooLarge);

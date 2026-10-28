@@ -1557,6 +1557,7 @@ public:
         case pc::TemplateId::SecurityBootstrap: handleSecurityBootstrap(buf, len); break;
         case pc::TemplateId::NamespaceDdl:     handleNamespaceDdl(buf, len); break;
         case pc::TemplateId::ListNamespaces:   handleListNamespaces(buf, len); break;
+        case pc::TemplateId::NamespaceUsage:   handleNamespaceUsage(buf, len); break;
         default: break;
         }
     }
@@ -2032,6 +2033,7 @@ private:
     // Namespaces Task 7: NamespaceDdl (81) and ListNamespaces (82).
     void handleNamespaceDdl     (const uint8_t* buf, std::size_t len);
     void handleListNamespaces   (const uint8_t* buf, std::size_t len);
+    void handleNamespaceUsage   (const uint8_t* buf, std::size_t len);   // Phase 2 Task 16 (D29)
     // Task 20: GetViewRow (72) — build a GetViewRow WorkerOp routed to the
     // owning worker (same op/return plumbing as PushRead); the worker's
     // ViewRowResult is encoded as a ViewRowResponse (73) in drainWorkerReturns_.

@@ -19,7 +19,7 @@ constexpr RateRow kRates[] = {
 
 void NsLimitAggregator::resetSlot_(uint16_t slot) noexcept {
     const std::size_t s = slot;
-    for (std::size_t m = 0; m < kNsMetrics; ++m) { total_[s * kNsMetrics + m] = 0; prevTotal_[s * kNsMetrics + m] = 0; }
+    for (std::size_t m = 0; m < kNsMetrics; ++m) { total_[s * kNsMetrics + m] = 0; prevTotal_[s * kNsMetrics + m] = 0; rate_[s * kNsMetrics + m] = 0; }
     for (std::size_t src = 0; src < sources_; ++src)
         for (std::size_t m = 0; m < kNsMetrics; ++m) last_[(s * sources_ + src) * kNsMetrics + m] = 0;
     for (std::size_t k = 0; k < kThrottleKinds; ++k) { debt_[s * kThrottleKinds + k] = 0; sentUntil_[s * kThrottleKinds + k] = 0; }
@@ -53,6 +53,7 @@ int NsLimitAggregator::doWork(int64_t nowNs) {
             const std::size_t ki = s * kThrottleKinds + static_cast<std::size_t>(r.kind);
             const uint64_t delta = total_[mi] - prevTotal_[mi];
             prevTotal_[mi] = total_[mi];
+            rate_[mi] = static_cast<uint64_t>((static_cast<__uint128_t>(delta) * 1'000'000'000ull) / static_cast<uint64_t>(elapsed));
             const uint64_t limit = L.*(r.limit);
             int64_t until = 0;
             if (limit == 0) {

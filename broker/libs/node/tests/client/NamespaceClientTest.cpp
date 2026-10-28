@@ -2,8 +2,10 @@
 // setNamespaceLimits) and the REAL `rune namespace` / `rune ql` CLI against a REAL authenticating BrokerNode.
 // Also the Task 8 rows 1, 6 and 8 (a namespace admin's security DDL) through QL text and the CLI.
 #include "support/AuthBroker.h"
+#include "support/AuthRig.h"
 
 #include <rune/cli/Cli.h>
+#include <rune/cli/NamespaceCommands.h>
 #include <rune/client/Client.h>
 #include <rune/client/NamespaceLimitFields.h>
 
@@ -14,11 +16,13 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
 using namespace rune::node;
 using namespace rune::node::test;
+namespace grants = rune::node::test::grants;
 namespace pc = rune::protocol::client;
 namespace rc = rune::client;
 namespace fs = std::filesystem;
@@ -53,11 +57,8 @@ const pc::NamespaceInfo* findNs(const std::vector<pc::NamespaceInfo>& v, const s
 }
 
 fs::path scratchDir() {
-    static const fs::path d = [] {
-        fs::path p = fs::temp_directory_path() / ("rune_ns_cli_test_" + std::to_string(::getpid()));
-        fs::create_directories(p);
-        return p;
-    }();
+    static const fs::path d = fs::temp_directory_path() / ("rune_ns_cli_test_" + std::to_string(::getpid()));
+    fs::create_directories(d);   // every call: each test's ScratchCleanup removes it on exit
     return d;
 }
 std::string writeTemp(const std::string& name, const std::string& content) {
@@ -221,4 +222,161 @@ TEST(NamespaceCliRegression, CreateListLimitsAndEscalationRowsRegression) {
     // ... and a namespace admin cannot run namespace DDL (cluster admin only).
     EXPECT_EQ(runCli({"namespace", "create", "n2", "--broker", b.endpoint(), "--user", "a/nsadmin", "--password-file", nsPw},
                      &out, &err), 1);
+}
+
+// ── Phase 2 Task 16 (D29): `rune namespace suspend | resume | delete | usage` end to end ───────────────────────────────────────
+// Interaction matrix (verb x namespace state x TTY):
+//   | verb                         | state before            | input                      | expected                                          | test
+//   |------------------------------|-------------------------|----------------------------|---------------------------------------------------|-----
+//   | suspend --read-only / --reject-all | active            | exactly one mode           | state follows in `list`; no / both modes = usage 2 | NamespaceCliRegression.SuspendResumeDeleteRegression
+//   | resume                       | suspended               | -                          | active again                                      | NamespaceCliRegression.SuspendResumeDeleteRegression
+//   | delete --yes                 | active                  | -                          | the namespace leaves `list`                       | NamespaceCliRegression.SuspendResumeDeleteRegression
+//   | delete (no --yes)            | active                  | no TTY / TTY "n" / TTY "y" | refused (1) / aborted (1) / deleted (0)           | NamespaceCliRegression.DeleteWithoutYesPromptsRegression
+//   | usage                        | 1 topic of 2 partitions | table / --json             | `limit value usage` rows with the counts          | NamespaceCliRegression.UsageTableRegression
+//   | suspend / resume / delete / usage | unknown name       | -                          | exit 1 with the broker's refusal                  | NamespaceCliRegression.UnknownNamespaceRegression
+namespace {
+std::string stateOf(AuthBroker& b, const std::string& adminPw, const std::string& name) {
+    std::string out, err;
+    if (runCli({"namespace", "list", "--json", "--broker", b.endpoint(), "--user", "admin", "--password-file", adminPw}, &out, &err) != 0)
+        return "?";
+    const std::string key = "\"name\":\"" + name + "\",\"state\":\"";
+    const auto at = out.find(key);
+    if (at == std::string::npos) return "";   // gone
+    const auto from = at + key.size();
+    return out.substr(from, out.find('"', from) - from);
+}
+bool waitState(AuthBroker& b, const std::string& pw, const std::string& name, const std::string& want) {
+    const auto deadline = std::chrono::steady_clock::now() + 30s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (stateOf(b, pw, name) == want) return true;
+        std::this_thread::sleep_for(50ms);
+    }
+    return stateOf(b, pw, name) == want;
+}
+}  // namespace
+
+TEST(NamespaceCliRegression, SuspendResumeDeleteRegression) {
+    ScratchCleanup cleanup;
+    AuthBroker b("nsclisrd");
+    b.bootstrapAdmin(kAdminPw);
+    const std::string pw = writeTemp("admin-pw", std::string(kAdminPw) + "\n");
+    const std::vector<std::string> as = {"--broker", b.endpoint(), "--user", "admin", "--password-file", pw};
+    auto with = [&](std::vector<std::string> args) { args.insert(args.end(), as.begin(), as.end()); return args; };
+    std::string out, err;
+    ASSERT_EQ(runCli(with({"namespace", "create", "s"}), &out, &err), 0) << err;
+
+    EXPECT_EQ(runCli(with({"namespace", "suspend", "s"}), &out, &err), 2) << "a mode is required";
+    EXPECT_NE(err.find("exactly one of --read-only or --reject-all"), std::string::npos) << err;
+    EXPECT_EQ(runCli(with({"namespace", "suspend", "s", "--read-only", "--reject-all"}), &out, &err), 2) << "both modes";
+    EXPECT_EQ(stateOf(b, pw, "s"), "active") << "a usage error changed nothing";
+
+    ASSERT_EQ(runCli(with({"namespace", "suspend", "s", "--read-only"}), &out, &err), 0) << err;
+    EXPECT_NE(out.find("suspended namespace s (read-only)"), std::string::npos) << out;
+    EXPECT_EQ(stateOf(b, pw, "s"), "suspended-read-only");
+    ASSERT_EQ(runCli(with({"namespace", "suspend", "s", "--reject-all"}), &out, &err), 0) << err;
+    EXPECT_EQ(stateOf(b, pw, "s"), "suspended-reject-all");
+    ASSERT_EQ(runCli(with({"namespace", "resume", "s"}), &out, &err), 0) << err;
+    EXPECT_NE(out.find("resumed namespace s"), std::string::npos) << out;
+    EXPECT_EQ(stateOf(b, pw, "s"), "active");
+
+    ASSERT_EQ(runCli(with({"namespace", "delete", "s", "--yes"}), &out, &err), 0) << err;
+    EXPECT_NE(out.find("deleting namespace s"), std::string::npos) << out;
+    EXPECT_TRUE(waitState(b, pw, "s", "")) << "the namespace is erased (the reaper drives the delete to completion)";
+}
+
+TEST(NamespaceCliRegression, DeleteWithoutYesPromptsRegression) {
+    ScratchCleanup cleanup;
+    AuthBroker b("nsclidel");
+    b.bootstrapAdmin(kAdminPw);
+    const std::string pw = writeTemp("admin-pw", std::string(kAdminPw) + "\n");
+    ASSERT_EQ(runCli({"namespace", "create", "d", "--broker", b.endpoint(), "--user", "admin", "--password-file", pw}), 0);
+    const std::vector<std::string> args = {"delete", "d", "--broker", b.endpoint(), "--user", "admin", "--password-file", pw,
+                                           "--tls-ca", AuthBroker::tlsCaFile().string()};
+    auto del = [&](const std::string& input, bool tty, std::string& out, std::string& err) {
+        std::istringstream in(input);
+        std::ostringstream o, e;
+        const int rc = rune::cli::cmdNamespace(args, in, tty, o, e);
+        out = o.str();
+        err = e.str();
+        return rc;
+    };
+    std::string out, err;
+    // Not a terminal: refused, nothing asked, nothing deleted - even when stdin happens to hold a "y".
+    EXPECT_EQ(del("y\n", false, out, err), 1);
+    EXPECT_NE(err.find("without --yes"), std::string::npos) << err;
+    EXPECT_EQ(err.find("[y/N]"), std::string::npos) << "no prompt without a terminal: " << err;
+    EXPECT_EQ(stateOf(b, pw, "d"), "active");
+    // A terminal: the prompt names the namespace; anything but yes aborts.
+    for (const char* no : {"n\n", "\n", "nope\n", ""}) {
+        EXPECT_EQ(del(no, true, out, err), 1) << "[" << no << "]";
+        EXPECT_NE(err.find("Delete namespace 'd'"), std::string::npos) << err;
+        EXPECT_NE(err.find("[y/N]"), std::string::npos) << err;
+        EXPECT_NE(err.find("aborted"), std::string::npos) << err;
+        EXPECT_EQ(stateOf(b, pw, "d"), "active") << "an unconfirmed delete deletes nothing";
+    }
+    // A terminal and "y": deleted.
+    EXPECT_EQ(del("y\n", true, out, err), 0) << err;
+    EXPECT_TRUE(waitState(b, pw, "d", "")) << "confirmed: the namespace is gone";
+}
+
+TEST(NamespaceCliRegression, UsageTableRegression) {
+    ScratchCleanup cleanup;
+    AuthBroker b("nscliusage");
+    b.bootstrapAdmin(kAdminPw);
+    const std::string pw = writeTemp("admin-pw", std::string(kAdminPw) + "\n");
+    const std::vector<std::string> as = {"--broker", b.endpoint(), "--user", "admin", "--password-file", pw};
+    auto with = [&](std::vector<std::string> args) { args.insert(args.end(), as.begin(), as.end()); return args; };
+    std::string out, err;
+    ASSERT_EQ(runCli(with({"namespace", "create", "u", "--max-topics", "5"}), &out, &err), 0) << err;
+    b.createUser("u/w", "namespace-user-password-12",
+                 {grants::prefix(grants::SO::Create, grants::ST::Topic, ""), grants::prefix(grants::SO::Describe, grants::ST::Topic, "")});
+    auto w = makeClient(b, "u/w", "namespace-user-password-12");
+    ASSERT_EQ(w->defineTopicAndWait("t", 2, "", false, {}, 60s).errorCode, 0);
+
+    // The table: header, state line, `limit  value  usage` rows; the topic count is next to its limit.
+    bool seen = false;
+    for (int i = 0; i < 200 && !seen; ++i) {
+        ASSERT_EQ(runCli(with({"namespace", "usage", "u"}), &out, &err), 0) << err;
+        seen = squeeze(out).find("\nmax-topics 5 1\n") != std::string::npos;
+        if (!seen) std::this_thread::sleep_for(50ms);
+    }
+    EXPECT_TRUE(seen) << out;
+    EXPECT_EQ(out.rfind("namespace u (active)\n", 0), 0u) << out;
+    EXPECT_NE(squeeze(out).find("\nlimit value usage\n"), std::string::npos) << out;
+    EXPECT_NE(squeeze(out).find("\nmax-partitions-total 0 2\n"), std::string::npos) << "partitions total: " << out;
+    EXPECT_NE(squeeze(out).find("\nmax-schemas 0 -\n"), std::string::npos) << "no usage meaning prints '-': " << out;
+    // JSON.
+    ASSERT_EQ(runCli(with({"namespace", "usage", "u", "--json"}), &out, &err), 0) << err;
+    EXPECT_NE(out.find("\"name\":\"u\",\"state\":\"active\",\"limits\":{\"max-topics\":5,"), std::string::npos) << out;
+    EXPECT_NE(out.find("\"usage\":{\"max-topics\":1,"), std::string::npos) << out;
+    // A suspended namespace reports its state.
+    ASSERT_EQ(runCli(with({"namespace", "suspend", "u", "--read-only"}), &out, &err), 0) << err;
+    ASSERT_EQ(runCli(with({"namespace", "usage", "u"}), &out, &err), 0) << err;
+    EXPECT_EQ(out.rfind("namespace u (suspended-read-only)\n", 0), 0u) << out;
+}
+
+TEST(NamespaceCliRegression, UnknownNamespaceRegression) {
+    ScratchCleanup cleanup;
+    AuthBroker b("nscliunk");
+    b.bootstrapAdmin(kAdminPw);
+    const std::string pw = writeTemp("admin-pw", std::string(kAdminPw) + "\n");
+    const std::vector<std::string> as = {"--broker", b.endpoint(), "--user", "admin", "--password-file", pw};
+    auto with = [&](std::vector<std::string> args) { args.insert(args.end(), as.begin(), as.end()); return args; };
+    std::string out, err;
+    for (const auto& cmd : std::vector<std::vector<std::string>>{
+             {"namespace", "suspend", "zz", "--read-only"}, {"namespace", "resume", "zz"}, {"namespace", "delete", "zz", "--yes"},
+             {"namespace", "usage", "zz"}}) {
+        EXPECT_EQ(runCli(with(cmd), &out, &err), 1) << cmd[1];
+        EXPECT_NE(err.find("rune namespace " + cmd[1] + ":"), std::string::npos) << err;
+        EXPECT_TRUE(out.empty()) << cmd[1] << " printed on stdout: " << out;
+    }
+    EXPECT_NE(err.find("no such namespace"), std::string::npos) << "usage names the problem: " << err;
+    // A subcommand without a name, and an unknown subcommand: usage errors.
+    for (const char* verb : {"suspend", "resume", "delete", "usage"})
+        EXPECT_EQ(runCli(with({"namespace", verb}), &out, &err), 2) << verb;
+    EXPECT_EQ(runCli(with({"namespace", "frobnicate"}), &out, &err), 2);
+    EXPECT_NE(err.find("unknown subcommand 'frobnicate'"), std::string::npos) << err;
+    // `default` cannot be suspended or deleted (the broker refuses; the namespace stays active).
+    EXPECT_EQ(runCli(with({"namespace", "delete", "default", "--yes"}), &out, &err), 1);
+    EXPECT_EQ(stateOf(b, pw, "default"), "active");
 }

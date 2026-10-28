@@ -53,6 +53,7 @@ public:
         last_.assign(cap * sources_ * kNsMetrics, 0);
         total_.assign(cap * kNsMetrics, 0);
         prevTotal_.assign(cap * kNsMetrics, 0);
+        rate_.assign(cap * kNsMetrics, 0);
         debt_.assign(cap * kThrottleKinds, 0);
         sentUntil_.assign(cap * kThrottleKinds, 0);
         sentViewOver_.assign(cap, 0);
@@ -107,6 +108,10 @@ public:
     [[nodiscard]] uint64_t totalOf(uint16_t slot, NsMetric m) const noexcept {
         return slot < slots_.capacity() ? total_[static_cast<std::size_t>(slot) * kNsMetrics + static_cast<std::size_t>(m)] : 0;
     }
+    /// The rate of a counter over the last tick (units per second); 0 before the first tick and for the gauges.  Usage (84).
+    [[nodiscard]] uint64_t rateOf(uint16_t slot, NsMetric m) const noexcept {
+        return slot < slots_.capacity() ? rate_[static_cast<std::size_t>(slot) * kNsMetrics + static_cast<std::size_t>(m)] : 0;
+    }
     [[nodiscard]] uint64_t debtOf(uint16_t slot, ThrottleKind k) const noexcept {
         return slot < slots_.capacity() ? debt_[static_cast<std::size_t>(slot) * kThrottleKinds + static_cast<std::size_t>(k)] : 0;
     }
@@ -133,6 +138,7 @@ private:
     std::vector<uint64_t> last_;        // [slot][source][metric]
     std::vector<uint64_t> total_;       // [slot][metric]
     std::vector<uint64_t> prevTotal_;   // [slot][metric] at the previous tick (rates)
+    std::vector<uint64_t> rate_;        // [slot][metric] units per second over the last tick
     std::vector<uint64_t> debt_;        // [slot][throttle kind]
     std::vector<int64_t>  sentUntil_;   // [slot][throttle kind] the last broadcast deadline
     std::vector<uint8_t>  sentViewOver_;

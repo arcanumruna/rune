@@ -1145,6 +1145,16 @@ Review Focus list and the matrix).
 - **View-memory overshoot:** a view may exceed its limit by at most one fold pass (one batch) plus one table chunk per
   view before it pauses; with the Task 14 aggregator, by one tick of folds plus one chunk per view. Over means
   usage > limit (a view exactly at its limit still folds).
+- **Aggregator lag (Task 14):** every aggregated limit (rates, disk, view memory) is enforced from the workers' paced
+  reports, so a namespace may exceed it by what its node produces in about one report interval plus one aggregator tick
+  (`RUNE_NS_LIMIT_TICK_US`, default 10 ms) before the Throttle / ViewMemOver reaches the workers; the rate debt carries
+  the excess into the next window, so the long-run rate converges on the limit. The retry-after of a Throttled
+  ProduceResponse rides `logStartOffset` (the frame has no trailer; the ErrorResponse trailer of Task 3 is used where an
+  ErrorResponse is the carrier). Produce handled inline on the control thread (no worker pool) is not rate-limited.
+- **Usage coverage (Task 16):** `NamespaceUsage` reports per node, from what the gateway holds: topics, partitions
+  (per topic maximum and total) and views from its object index, disk / view memory / rates from the aggregator, and
+  connections from its own table. Schemas, schema versions, groups, users, open transactions and the size / retention /
+  replication / acks / feature fields have no usage meaning there and read 0 (the CLI prints `-`).
 - **No version bump:** the new codes are gated on client ≥ 14 and no wire layout changes for older peers; there are
   no mixed-version clusters.
 - **Phase 1 limits size:** the limits record is 256 bytes with 29 fields (`28*8 + 4 + 4 + 3*8`), not 272 bytes and

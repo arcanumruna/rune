@@ -1814,6 +1814,13 @@ if(BUILD_TESTING)
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_client_tests PROPERTIES TIMEOUT 600)
 
+        # Namespaces Phase 2 Task 16 (D29): NamespaceUsage (84) through the REAL client against ONE real broker.
+        add_executable(rune_namespace_usage_tests tests/client/NamespaceUsageRegressionTest.cpp)
+        target_include_directories(rune_namespace_usage_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_usage_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_usage_tests PROPERTIES TIMEOUT 600)
+
         # Namespaces Phase 2 Task 5 (D19): namespace-scoped group / transactional ids; groups and transactions in every
         # namespace (stores, coordinator, reserved prefix, and the REAL client against ONE real broker).
         add_executable(rune_ns_keyed_stores_tests tests/node/NsKeyedStoresRegressionTest.cpp)

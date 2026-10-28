@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <set>
 #include <sstream>
 #include <string>
@@ -116,6 +117,17 @@ TEST(NamespaceCliRegression, UsageRegression) {
         {{"namespace", "limits", "a", "--set"}, "--set needs"},
         {{"namespace", "limits", "a", "--set", "nope=1", "--broker", "h:1"}, "unknown limit 'nope'"},
         {{"namespace", "limits", "a", "--set", "max-topics", "--broker", "h:1"}, "expected <limit>=N"},
+        // Phase 2 Task 16 (D29): suspend / resume / delete / usage.
+        {{"namespace", "suspend"}, "a namespace <name> is required"},
+        {{"namespace", "suspend", "a", "--broker", "h:1"}, "exactly one of --read-only or --reject-all"},
+        {{"namespace", "suspend", "a", "--read-only", "--reject-all", "--broker", "h:1"}, "exactly one of --read-only or --reject-all"},
+        {{"namespace", "suspend", "a", "--readonly", "--broker", "h:1"}, "unknown option '--readonly'"},
+        {{"namespace", "resume"}, "a namespace <name> is required"},
+        {{"namespace", "resume", "a", "--yes", "--broker", "h:1"}, "unknown option '--yes'"},
+        {{"namespace", "delete"}, "a namespace <name> is required"},
+        {{"namespace", "delete", "a", "--force", "--broker", "h:1"}, "unknown option '--force'"},
+        {{"namespace", "usage"}, "a namespace <name> is required"},
+        {{"namespace", "usage", "a", "--csv", "--broker", "h:1"}, "unknown option '--csv'"},
     };
     for (const auto& c : cases) {
         const auto r = runCli(c.args);
@@ -126,7 +138,9 @@ TEST(NamespaceCliRegression, UsageRegression) {
     // No broker named (and none in RUNE_BROKER): a usage error before anything connects.
     if (std::getenv("RUNE_BROKER") == nullptr) {
         for (std::vector<std::string> a : std::vector<std::vector<std::string>>{
-                 {"namespace", "create", "a"}, {"namespace", "list"}, {"namespace", "limits", "a"}}) {
+                 {"namespace", "create", "a"}, {"namespace", "list"}, {"namespace", "limits", "a"},
+                 {"namespace", "suspend", "a", "--read-only"}, {"namespace", "resume", "a"}, {"namespace", "delete", "a", "--yes"},
+                 {"namespace", "usage", "a"}}) {
             const auto r = runCli(a);
             EXPECT_EQ(r.code, 2) << r.err;
             EXPECT_NE(r.err.find("--broker host:port is required"), std::string::npos) << r.err;
@@ -135,4 +149,58 @@ TEST(NamespaceCliRegression, UsageRegression) {
     // The top-level usage lists the namespace commands.
     const auto top = runCli({"help"});
     EXPECT_NE((top.out + top.err).find("rune namespace list"), std::string::npos);
+}
+
+// Phase 2 Task 16: `delete` without --yes never reaches a broker unless a person confirmed on a terminal.  OFFLINE: every case
+// ends before any connection (the broker endpoint is unreachable; a connect would hang or fail differently).
+TEST(NamespaceCliRegression, DeletePromptOfflineRegression) {
+    const std::vector<std::string> args = {"delete", "a", "--broker", "127.0.0.1:1"};
+    auto del = [&](const std::string& input, bool tty) {
+        std::istringstream in(input);
+        std::ostringstream o, e;
+        const int rc = rune::cli::cmdNamespace(args, in, tty, o, e);
+        return CliRun{rc, o.str(), e.str()};
+    };
+    const auto noTty = del("y\n", false);
+    EXPECT_EQ(noTty.code, 1);
+    EXPECT_NE(noTty.err.find("refusing to delete namespace 'a' without --yes"), std::string::npos) << noTty.err;
+    EXPECT_EQ(noTty.err.find("[y/N]"), std::string::npos) << "no prompt without a terminal";
+    for (const char* no : {"n\n", "\n", "nope\n", "", "yess\n"}) {
+        const auto r = del(no, true);
+        EXPECT_EQ(r.code, 1) << "[" << no << "]";
+        EXPECT_NE(r.err.find("Delete namespace 'a'"), std::string::npos) << r.err;
+        EXPECT_NE(r.err.find("[y/N]"), std::string::npos) << r.err;
+        EXPECT_NE(r.err.find("aborted"), std::string::npos) << r.err;
+        EXPECT_TRUE(r.out.empty());
+    }
+    // The 3-argument form (what `run` calls) with a non-terminal stdin in a test process: refused.
+    const auto viaRun = runCli({"namespace", "delete", "a", "--broker", "127.0.0.1:1"});
+    EXPECT_EQ(viaRun.code, 1);
+    EXPECT_NE(viaRun.err.find("without --yes"), std::string::npos) << viaRun.err;
+}
+
+TEST(NamespaceCliRegression, UsageFormatRegression) {
+    rpc::NamespaceUsageResponse r;
+    r.state = 1;
+    r.limits.maxTopics = 5;
+    r.limits.maxDiskBytes = 1000;
+    r.usage[0] = 3;       // max-topics
+    r.usage[2] = 7;       // max-partitions-total
+    r.usage[8] = 400;     // max-disk-bytes
+    r.usage[4] = 99;      // max-schemas: no usage meaning in this build -> printed as '-', whatever the wire carries
+    const std::string t = rune::cli::formatNamespaceUsage("acme", r);
+    EXPECT_EQ(t.rfind("namespace acme (suspended-read-only)\n", 0), 0u) << t;
+    std::string squeezed;
+    for (bool sp = false; const char c : t) { if (c == ' ') { if (!sp) squeezed += c; sp = true; } else { squeezed += c; sp = false; } }
+    EXPECT_NE(squeezed.find("\nlimit value usage\n"), std::string::npos) << t;
+    EXPECT_NE(squeezed.find("\nmax-topics 5 3\n"), std::string::npos) << t;
+    EXPECT_NE(squeezed.find("\nmax-partitions-total 0 7\n"), std::string::npos) << t;
+    EXPECT_NE(squeezed.find("\nmax-disk-bytes 1000 400\n"), std::string::npos) << t;
+    EXPECT_NE(squeezed.find("\nmax-schemas 0 -\n"), std::string::npos) << t;
+    EXPECT_EQ(std::count(t.begin(), t.end(), '\n'), 1 + 1 + 29) << "state line + header + one row per limit";
+    const std::string j = rune::cli::formatNamespaceUsageJson("ac\"me", r);
+    EXPECT_EQ(j.rfind("{\"name\":\"ac\\\"me\",\"state\":\"suspended-read-only\",\"limits\":{\"max-topics\":5,", 0), 0u) << j;
+    EXPECT_NE(j.find("\"usage\":{\"max-topics\":3,"), std::string::npos) << j;
+    EXPECT_EQ(j.find("max-schemas\":99"), std::string::npos) << "no usage for a field without a meaning: " << j;
+    EXPECT_EQ(j.back(), '\n');
 }

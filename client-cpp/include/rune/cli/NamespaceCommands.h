@@ -7,6 +7,10 @@
 //   rune namespace list [--json]
 //   rune namespace limits <name>                           prints every limit
 //   rune namespace limits <name> --set <limit>=N ...       read-modify-write: the other limits keep their values
+//   rune namespace suspend <name> --read-only|--reject-all   Phase 2 Task 16 (D21): exactly one mode
+//   rune namespace resume <name>
+//   rune namespace delete <name> [--yes]                    without --yes: prompts on a terminal, refuses otherwise
+//   rune namespace usage <name> [--json]                    every limit next to its current usage on the broker answered
 //
 // <limit> is one of the kebab-case names in rune/client/NamespaceLimitFields.h (max-topics, ..., feature-bits).
 // Credentials and TLS as every connecting command (`--user`, `--password-file`, `--tls-ca`, ...).
@@ -16,10 +20,13 @@
 
 #include <rune/client/NamespaceLimitFields.h>
 #include <rune/protocol/client/NamespaceMessages.h>
+#include <rune/protocol/client/NamespaceUsageMessages.h>
 
 #include <expected>
+#include <istream>
 #include <ostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace rune::cli {
@@ -42,10 +49,18 @@ applyNamespaceLimitSets(rune::protocol::NamespaceLimits base, const std::vector<
 /// One `<limit>  <value>` line per field, in field order.
 [[nodiscard]] std::string formatNamespaceLimits(const rune::protocol::NamespaceLimits&);
 
+/// `limit  value  usage` (aligned, header row) after a `namespace <state>` line; a field with no usage meaning prints `-`.
+[[nodiscard]] std::string formatNamespaceUsage(std::string_view name, const rune::protocol::client::NamespaceUsageResponse&);
+/// `{"name":..,"state":..,"limits":{..},"usage":{..}}` + '\n'.
+[[nodiscard]] std::string formatNamespaceUsageJson(std::string_view name, const rune::protocol::client::NamespaceUsageResponse&);
+
 /// Prints the `rune namespace` usage lines.
 void printNamespaceUsage(std::ostream& err);
 
 /// `rune namespace create|list|limits …`: args are everything after "namespace".
 int cmdNamespace(const std::vector<std::string>& args, std::ostream& out, std::ostream& err);
+/// The same with the confirmation input of `delete` (no --yes): `interactive` says `in` is a terminal that may be asked
+/// (false = refuse without --yes).  The 3-argument form reads std::cin and asks only when stdin is a TTY.
+int cmdNamespace(const std::vector<std::string>& args, std::istream& in, bool interactive, std::ostream& out, std::ostream& err);
 
 } // namespace rune::cli

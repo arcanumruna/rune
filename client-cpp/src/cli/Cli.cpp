@@ -12,6 +12,8 @@
 #include "rune/cli/Console.h"
 #include "rune/cli/CatalogCommands.h"
 #include "rune/cli/NamespaceCommands.h"
+
+#include <unistd.h>
 #include "rune/cli/SecurityCommands.h"
 #include "CliSupport.h"
 
@@ -475,7 +477,9 @@ int run(std::vector<std::string> args, std::istream& in, std::ostream& out, std:
         return cmdSecurity(std::vector<std::string>(args.begin() + 1, args.end()), out, err);
     }
     if (cmd == "namespace") {
-        return rune::cli::cmdNamespace(std::vector<std::string>(args.begin() + 1, args.end()), out, err);
+        // `delete` without --yes asks on a terminal: the injected stream is the console only when it is std::cin.
+        return rune::cli::cmdNamespace(std::vector<std::string>(args.begin() + 1, args.end()), in,
+                                       &in == &std::cin && ::isatty(STDIN_FILENO) != 0, out, err);
     }
 
     err << "rune: unknown command '" << cmd << "'\n";
