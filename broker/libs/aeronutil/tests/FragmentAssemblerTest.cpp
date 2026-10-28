@@ -29,6 +29,7 @@ struct Term {
         buf.putInt32(f.frameOffset, DataFrameHeader::LENGTH + f.length);
         buf.putUInt8(f.frameOffset + DataFrameHeader::FLAGS_FIELD_OFFSET, flags);
         buf.putInt32(f.frameOffset + DataFrameHeader::SESSION_ID_FIELD_OFFSET, sessionId);
+        buf.putInt32(f.frameOffset + DataFrameHeader::TERM_OFFSET_FIELD_OFFSET, f.frameOffset);
         std::memcpy(bytes.data() + f.payloadOffset, payload.data(), payload.size());
         tail = aeron::util::BitUtil::align(f.payloadOffset + f.length, FrameDescriptor::FRAME_ALIGNMENT);
         return f;
@@ -53,10 +54,12 @@ template <class Asm>
 void feed(Asm& a, Term& t, const Term::Frame& f, Sink& s) {
     FrameHeader fh(t, f.frameOffset);
     Header& h = fh.h;
+    // Aeron 1.51 delivery (cpp_wrapper Image.h): a buffer over the payload only, offset 0.
+    AtomicBuffer payload(t.bytes.data() + f.payloadOffset, static_cast<std::size_t>(f.length));
     a.onFragment([&s](AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l, Header&) {
         s.msgs.emplace_back(reinterpret_cast<const char*>(b.buffer() + o), static_cast<std::size_t>(l));
         s.ptrs.push_back(b.buffer() + o);
-    }, t.buf, f.payloadOffset, f.length, h);
+    }, payload, 0, f.length, h);
 }
 } // namespace
 
@@ -108,12 +111,13 @@ TEST(FragmentAssemblerRegression, ControlledAbortRedeliversTheEndFragment) {
     auto deliver = [&](const Term::Frame& f) {
         FrameHeader fh(t, f.frameOffset);
         Header& h = fh.h;
+        AtomicBuffer payload(t.bytes.data() + f.payloadOffset, static_cast<std::size_t>(f.length));   // Aeron 1.51 delivery
         return a.onFragment([&](AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l, Header&) {
             ++calls;
             if (calls == 1) return aeron::ControlledPollAction::ABORT;   // back-pressured consumer
             got.emplace_back(reinterpret_cast<const char*>(b.buffer() + o), static_cast<std::size_t>(l));
             return aeron::ControlledPollAction::CONTINUE;
-        }, t.buf, f.payloadOffset, f.length, h);
+        }, payload, 0, f.length, h);
     };
     EXPECT_EQ(deliver(f1), aeron::ControlledPollAction::CONTINUE);
     EXPECT_EQ(deliver(f2), aeron::ControlledPollAction::ABORT);
