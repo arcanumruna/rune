@@ -104,10 +104,10 @@ struct Completion {
                                  ///< ...,45=NotAuthorized: no READ on the view)
     uint32_t payloadLen = 0;     ///< bytes of inline payload
     uint32_t reservedBytes = 0;  ///< credit returned to the Completions on consume (§2.2)
-    uint32_t reserved0 = 0;      ///< BatchAck: producerEpoch; GetTopicSchema: the topic's partitionCount
-                                 ///< (Phase 2b Part C; 0 = a pre-2b broker that does not report it);
-                                 ///< DDL ops: the generated requestId's lo (0 = the caller's explicit
-                                 ///< requestId — Client::requestIdOf)
+    uint32_t reserved0 = 0;      ///< BatchAck: producerEpoch; GetTopicSchema: the topic's partitionCount;
+                                 ///< DDL ops: the generated requestId's low 32 bits (Phase 2b Part C; 0 = a pre-2b
+                                 ///< broker that does not report it, or the caller's explicit requestId -
+                                 ///< Client::requestIdOf)
 };
 static_assert(sizeof(Completion) == 40);
 

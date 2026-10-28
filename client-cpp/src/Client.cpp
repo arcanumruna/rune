@@ -2169,7 +2169,7 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
         DdlOfferedOn sentOn;
         if (const auto* a = std::get_if<DdlAwaitingResend>(&d->retry)) {
             if (nowNs < a->resendAtNs) { ++i; continue; }
-            const DdlAwaitingResend due = *a;
+            DdlAwaitingResend due = *a;
             switch (offerDdl_(*d, nowNs, sentOn)) {
             case Offer::Accepted:
                 setDdlRetry_(*d, DdlNotLeaderSeen{due.redirects, due.budgetEndNs, due.backoffNs, sentOn});
@@ -2182,9 +2182,15 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
                     ++work;
                     break;
                 }
+                // Issue #97: the resend was refused because the target node's session is not up.  Record it in the
+                // state itself (SessionLost and AuthUnavailable are stronger statements and stay).
+                if (due.cause == DdlResendCause::NotLeader || due.cause == DdlResendCause::NodeUnreachable) {
+                    due.cause = DdlResendCause::NodeUnreachable;
+                    std::get<DdlAwaitingResend>(d->retry).cause = DdlResendCause::NodeUnreachable;
+                }
                 // Fix round 2 (I-1): toward a seed that can never reconnect: end now.
                 if (d->endpoint.empty() && seedCannotReconnect_()) {
-                    if (due.cause == DdlResendCause::SessionLost) {
+                    if (due.cause == DdlResendCause::SessionLost || due.cause == DdlResendCause::NodeUnreachable) {
                         constexpr std::string_view kWhy =
                             "session lost: the seed can never reconnect (it may have been applied; a retry with "
                             "the same requestId is exact)";
@@ -2209,7 +2215,17 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
                 // the sweep ends it Timeout (the DDL timed out); a shorter
                 // budget ends it NotLeader here.
                 if (nowNs >= due.budgetEndNs && nowNs < p.deadlineNs) {
-                    if (due.cause == DdlResendCause::SessionLost) {
+                    if (due.cause == DdlResendCause::NodeUnreachable) {
+                        // Issue #97: a NotLeader redirect to a node whose session never came up - the request was
+                        // never answered there, so it is a session loss, not a NotLeader.
+                        constexpr std::string_view kWhy =
+                            "node unreachable: the request's node session was not re-established within its retry "
+                            "budget (it may have been applied; a retry with the same requestId is exact)";
+                        PendingCtl dead = takeCtl_(i);
+                        completeCtl_(dead, OpStatus::SessionLost, ddlNoValue(dead.op), 0, 0,
+                                     std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kWhy.data()),
+                                                              kWhy.size()));
+                    } else if (due.cause == DdlResendCause::SessionLost) {
                         // F1: the DDL's session was lost and never came back
                         // inside the budget — a session loss, not a NotLeader.
                         constexpr std::string_view kWhy =
@@ -2225,7 +2241,7 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
                                  "AuthUnavailable: retry budget exhausted", ddlNoValue(p.op));
                     } else {
                         failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader),
-                                 "not leader: retry budget exhausted (the node could not be reached)",
+                                 "not leader: retry budget exhausted",
                                  ddlNoValue(p.op));
                     }
                     ++work;
@@ -5521,7 +5537,18 @@ int Client::watchProduceRoutes_(int64_t nowNs) noexcept {
     // Review B I1: a leader node's session that is Rejected (its user was revoked there, or its login was refused)
     // can never carry its partitions' batches: they fail NOW with the session's code (46 / 44), not after the
     // delivery timeout.  A metadata refresh that moves the partition re-routes new sends as it always does.
-    if (agent_.rejectedLeaderSessions() != 0) [[unlikely]] producerHub_.failRoutedBroker(&rejectedRouteTrampoline, &agent_);
+    //
+    // Issue #60 - edge-triggered, O(1) when idle.  The sweep runs when a leader session ENTERED Rejected since the last
+    // one (rejectedEpoch), or when a produce offer met a Rejected leader after a sweep (the routing site in
+    // ClientAgent::offerProduceToLeader_ raises takeRejectedRouteHit).  Invariant: a Rejected leader is terminal, so
+    // after a sweep every batch on its routes is failed and any later one is caught by that routing-site flag.
+    const bool routeHit = agent_.takeRejectedRouteHit();
+    const uint64_t rejEpoch = agent_.rejectedEpoch();
+    if (rejEpoch != rejectedEpochSeen_ || routeHit) [[unlikely]] {
+        rejectedEpochSeen_ = rejEpoch;
+        ++routedBrokerSweeps_;
+        producerHub_.failRoutedBroker(&rejectedRouteTrampoline, &agent_);
+    }
     // Review MEDIUM-2: a produce attempt timed out (Kafka: a request timeout
     // requests a metadata update) — the partition may have moved silently.
     bool ask = producerHub_.takeMetadataWanted();

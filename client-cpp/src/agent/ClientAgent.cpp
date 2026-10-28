@@ -717,13 +717,8 @@ ClientAgent::StateSnapshot ClientAgent::stateAndSessionId() const noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// SessionIo implementation (agent thread only)
+// Seed-transport helpers (agent thread only)
 // ---------------------------------------------------------------------------
-
-bool ClientAgent::sendFrame(const uint8_t* buf, std::size_t len) {
-    if (failed_) [[unlikely]] return false;  // T15b: a failed client does no I/O
-    return transport_.offer(buf, len);
-}
 
 bool ClientAgent::retarget(const std::string& newIngressChannel) noexcept {
     // FIX F8: forward to the transport's noexcept, non-throwing retarget.
@@ -1197,6 +1192,8 @@ bool ClientAgent::retargetSeedOnConnectRedirect_(const std::string& endpoint) no
     }
 }
 
+void SessionEndpointIo::onRejected() noexcept { agent->noteSessionRejected_(owner); }
+
 std::string SessionEndpointIo::ingressChannel() const {
     if (owner == &agent->seedSession()) return agent->seedChannel();   // D4 r2: the seed by identity
     return endpoint;
@@ -1654,6 +1651,10 @@ bool ClientAgent::offerProduceToLeader_(int32_t topicId, int32_t partition,
             // Leader session still connecting: hold the batch (retried next cycle;
             // produceResendFn_ re-drives it on connect).
             if (sid == 0 || leader.machine.state() != session::SessionState::Connected) {
+                // Issue #60 invariant: a Rejected leader never carries a batch.  The sweep (watchProduceRoutes_)
+                // runs once per Rejected edge; a batch routed here AFTER it raises this flag so the owner sweeps
+                // once more and fails it - never re-swept per cycle.
+                if (leader.machine.state() == session::SessionState::Rejected) [[unlikely]] rejectedRouteHit_ = true;
                 ++heldOffers_;  // DR-7: the owner asks for metadata (the leader may have moved)
                 return false;
             }

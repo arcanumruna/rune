@@ -324,9 +324,9 @@ TEST_P(ClientDdlTimingMatrixRegression, ExactlyOneCompletionAndNoLeftoverState) 
         EXPECT_EQ(c.status, rc::OpStatus::NotConnected);
         break;
     case Timing::ResendPastBudgetEnd:
-        EXPECT_EQ(c.status, rc::OpStatus::BrokerError);
-        EXPECT_EQ(c.errorCode, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
-        EXPECT_NE(payloadText(f).find("could not be reached"), std::string::npos) << payloadText(f);
+        // Issue #97: the seed refused every resend (its node was not reachable) - a session loss, not a NotLeader.
+        EXPECT_EQ(c.status, rc::OpStatus::SessionLost);
+        EXPECT_EQ(payloadText(f).rfind("node unreachable", 0), 0u) << payloadText(f);
         break;
     case Timing::SeedLostWhileSent:
         ASSERT_TRUE(f.ok()) << f.describe();
@@ -363,6 +363,58 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<std::tuple<DdlOp, Timing>>& i) {
         return std::string(name(std::get<0>(i.param))) + "_" + name(std::get<1>(i.param));
     });
+
+// Issue #97 (F1): a DDL redirected to a node whose session never comes up ends SessionLost ("node unreachable"),
+// never NotLeader - the request may have been applied.  The budget (300 ms) is shorter than the DDL timeout (3 s).
+TEST(ClientDdlRegression, DdlWithUnreachableNodeCompletesSessionLostNotNotLeaderRegression) {
+    rc::ClientConfig cfg = invokerCfg(4446, 4447);
+    cfg.ddlRetryBudget = std::chrono::milliseconds(300);
+    Rig r(cfg);
+    r.connect();
+    const std::string nowhere = udp(rune::client::testing::allocFreeUdpPort());   // no node listens there
+    int answers = 0;
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        if (answers++ == 0) r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId);
+        else                r.answerError(ep, pc::ErrorCode::Redirect, nowhere, m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/20'000'000)) << "the DDL must end, not hang";
+    const auto& c = f.outcome().c;
+    EXPECT_EQ(c.status, rc::OpStatus::SessionLost);
+    EXPECT_EQ(payloadText(f).rfind("node unreachable", 0), 0u) << payloadText(f);
+    EXPECT_GE(answers, 2) << "the redirect to the unreachable node was followed";
+    r.passes(100, 20'000'000);
+    EXPECT_EQ(cq.timesCompleted(f.token()), 1);
+    EXPECT_EQ(r.client.testPendingControlOps(), 0u);
+}
+
+// Issue #97 (F1): the node is up and keeps answering NotLeader - the budget ends NotLeader with no "unreachable" claim.
+TEST(ClientDdlRegression, DdlNotLeaderUntilBudgetEndsReportsNotLeaderWithoutUnreachableTextRegression) {
+    rc::ClientConfig cfg = invokerCfg(4448, 4449);
+    cfg.ddlRetryBudget = std::chrono::milliseconds(300);
+    Rig r(cfg);
+    r.connect();
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/20'000'000)) << "the DDL must end, not hang";
+    const auto& c = f.outcome().c;
+    EXPECT_EQ(c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(c.errorCode, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
+    const std::string text = payloadText(f);
+    EXPECT_EQ(text.find("could not be reached"), std::string::npos) << text;
+    EXPECT_EQ(text.find("unreachable"), std::string::npos) << text;
+    EXPECT_NE(text.find("not leader: retry budget exhausted"), std::string::npos) << text;
+}
 
 // I1 (review): the catalog leader's session is lost after the redirected DDL
 // reached it (it may have appended); the DDL is re-sent toward the seed with

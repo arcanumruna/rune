@@ -27,6 +27,7 @@
 //     unknown/bad     → drop (never crash)
 
 #pragma once
+#include <cassert>
 
 #include <rune/client/transport/AeronTransport.h>
 #include <rune/client/session/SessionMachine.h>
@@ -120,6 +121,8 @@ struct SessionEndpointIo : session::SessionIo {
     bool retargetToLastKnownLeader() noexcept override;
     /// Issue #115: the seed's current default-publication channel; a leader session's own endpoint.
     [[nodiscard]] std::string ingressChannel() const override;
+    /// Issue #60: the session entered Rejected - the agent counts the edge (leader sessions only).
+    void onRejected() noexcept override;
 };
 
 struct Session {
@@ -209,7 +212,7 @@ struct AgentConfig {
 // ClientAgent
 // ---------------------------------------------------------------------------
 
-class ClientAgent : public session::SessionIo {
+class ClientAgent {
 public:
     // Egress observer: called for every decoded egress frame from the gateway.
     // (ConnectResponse, ErrorResponse, Pong — plus any others you forward.)
@@ -222,7 +225,7 @@ public:
     // -------------------------------------------------------------------------
 
     explicit ClientAgent(AgentConfig cfg);
-    ~ClientAgent() override;
+    ~ClientAgent();
 
     // Non-copyable, non-movable (owns transport, ring buffer).
     ClientAgent(const ClientAgent&)            = delete;
@@ -481,10 +484,22 @@ public:
     /// Review B I1: sessions other than the seed that are Rejected (revoked / login refused) — cheap check (the
     /// session list is cluster-sized).  The owner then fails the routes they carried.
     [[nodiscard]] uint32_t rejectedLeaderSessions() const noexcept {
+#ifndef NDEBUG
         uint32_t n = 0;
         for (std::size_t i = 1; i < sessions_.size(); ++i)
             if (sessions_[i]->machine.state() == session::SessionState::Rejected) ++n;
-        return n;
+        assert(n == rejectedSessions_ && "rejectedSessions_ must equal the recount");
+#endif
+        return rejectedSessions_;   // issue #60: O(1) - kept at the Rejected edge (SessionEndpointIo::onRejected)
+    }
+    /// Issue #60: bumped on every transition of a leader session INTO Rejected (it is terminal, so never decremented).
+    [[nodiscard]] uint64_t rejectedEpoch() const noexcept { return rejectedEpoch_; }
+    /// Issue #60: true once since the last call if a produce offer met a Rejected leader session (the routing site
+    /// refused it); the owner then sweeps the routes once.  Reading clears it.
+    [[nodiscard]] bool takeRejectedRouteHit() noexcept {
+        const bool hit = rejectedRouteHit_;
+        rejectedRouteHit_ = false;
+        return hit;
     }
     /// Review B I1: the Rejected leader session's reject code (46 / 44 ...) when (topicId, partition) is routed through
     /// one, else 0.  Never opens a session.
@@ -880,11 +895,11 @@ public:
 
 private:
     // -------------------------------------------------------------------------
-    // SessionIo implementation (called only on the agent thread)
+    // Seed-transport helpers (agent thread only).  ClientAgent is NOT a SessionIo (issue #178): the only session
+    // send path is SessionEndpointIo::sendFrame, which seals per destination.
     // -------------------------------------------------------------------------
-    bool sendFrame(const uint8_t* buf, std::size_t len) override;
-    bool retarget(const std::string& newIngressChannel) noexcept override;
-    [[nodiscard]] std::string ingressChannel() const override { return transport_.ingressChannel(); }   // issue #115
+    bool retarget(const std::string& newIngressChannel) noexcept;
+    [[nodiscard]] std::string ingressChannel() const { return transport_.ingressChannel(); }   // issue #115
 
     // -------------------------------------------------------------------------
     // Command message type IDs for the ring
@@ -977,6 +992,9 @@ private:
     };
     detail::FlatIndexMap        routeIndex_;   // routeKey(t,p) -> routes_ index
     uint64_t                    heldOffers_ = 0;  // DR-7: see heldOffers()
+    uint32_t                    rejectedSessions_ = 0;   // issue #60: leader sessions in Rejected (edge-counted)
+    uint64_t                    rejectedEpoch_    = 0;   // issue #60: bumped on every edge into Rejected
+    bool                        rejectedRouteHit_ = false;   // issue #60: a produce offer met a Rejected leader
     std::vector<PartitionRoute> routes_;
     std::vector<uint32_t>       freeRoutes_;
     std::vector<ProduceAck>     produceAcks_;  // reserved in the ctor; owner clears
@@ -1020,6 +1038,11 @@ private:
     // Used by SessionEndpointIo::sendFrame — offers a session's control frame to
     // that session's endpoint over the shared transport (default ingress stream id).
     friend struct SessionEndpointIo;
+    void noteSessionRejected_(const Session* s) noexcept {
+        if (s == nullptr || s == &seedSession()) return;   // the seed's Rejected fails the Client for good
+        ++rejectedSessions_;
+        ++rejectedEpoch_;
+    }
     bool offerControlTo(Session& owner, const uint8_t* buf, std::size_t len) noexcept;
     /// Open a NEW session to `endpoint` (async connect, disjoint corrId range).
     Session& openSession_(const std::string& endpoint) noexcept;

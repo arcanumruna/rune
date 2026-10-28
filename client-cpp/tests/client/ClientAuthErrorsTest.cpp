@@ -701,6 +701,80 @@ TEST(ClientAuthErrorsRegression, ARevokedLeaderNodeSessionFailsItsRequestsSessio
     EXPECT_TRUE(viaSeed.ok()) << viaSeed.describe();
 }
 
+// Issue #60: the Rejected-route sweep is edge-triggered.  A node session entering Rejected fails its routes' batches
+// ONCE (one failRoutedBroker sweep), not every duty cycle for as long as the session stays Rejected.
+namespace {
+struct RejectedNodeRig {
+    TwoNodeRig r;
+    test_support::TestCq cq;
+    std::optional<rc::Producer> p;
+    std::vector<test_support::PendingOp> sends;
+    const std::vector<uint8_t> val = std::vector<uint8_t>(16, 0x5C);
+    explicit RejectedNodeRig(int32_t in) : r(in), cq(r.client) {}
+    // Connects, leaves 3 batches in flight on node 1 (p0's leader), then revokes node 1's session.
+    void setupAndRevoke() {
+        ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+        auto conn = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.connect(q, t); });
+        ASSERT_TRUE(r.drive([&] { return conn.ready(); }));
+        ASSERT_TRUE(conn.ok()) << conn.describe();
+        ASSERT_TRUE(r.drive([&] { return r.client.testLeaderFor(1, 0) == 1; }));
+        r.gw.replyAcks = false;
+        rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::Leader; pcfg.lingerUs = 60'000'000; pcfg.batchBytes = 64 * 1024;
+        pcfg.maxInFlight = 8; pcfg.produceTimeoutMs = 60'000; pcfg.deliveryTimeoutMs = 120'000;
+        p.emplace(r.client.producer(pcfg));
+        const auto topic = r.client.topic("t");
+        for (int i = 0; i < 3; ++i) {
+            sends.push_back(cq.send(*p, topic, TwoNodeRig::keyFor(0), val));
+            ASSERT_TRUE(sends.back().accepted());
+            p->flush();
+            r.passes(30);
+        }
+        ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() >= 1; }));
+        r.gw.subscribeLeader[0] = r.n1;
+        sub.emplace(r.client.subscribe(topic, 0, {}, &noopRecords));
+        ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty() && sub->subscriptionId() != 0; }));
+        ASSERT_EQ(r.gw.subscribed.back().endpoint, r.n1);
+        ASSERT_EQ(r.client.routedBrokerSweeps(), 0u) << "no Rejected session yet: no sweep";
+        r.gw.revokeSession(r.gw.subscribed.back().sessionId, r.n1);
+    }
+    std::optional<rc::Subscription> sub;
+};
+} // namespace
+
+TEST(ProduceRouteRegression, RejectedBrokerFailsItsRoutesOnceNotEveryCycleRegression) {
+    RejectedNodeRig t(3870);
+    ASSERT_NO_FATAL_FAILURE(t.setupAndRevoke());
+    t.r.passes(50);
+    for (auto& s : t.sends) {
+        ASSERT_TRUE(s.ready());
+        EXPECT_EQ(s.outcome().c.status, rc::OpStatus::BrokerError);
+        EXPECT_EQ(s.outcome().c.errorCode, 46);
+    }
+    EXPECT_EQ(t.r.client.testSessionStateAt(1), rc::session::SessionState::Rejected);
+    const uint64_t afterFirst = t.r.client.routedBrokerSweeps();
+    EXPECT_EQ(afterFirst, 1u) << "one Rejected edge = one sweep";
+    t.r.passes(50);   // N further idle cycles with the session still Rejected
+    EXPECT_EQ(t.r.client.routedBrokerSweeps(), afterFirst) << "an idle Rejected session is not re-swept each cycle";
+}
+
+TEST(ProduceRouteRegression, ABatchRoutedToARejectedBrokerAfterTheSweepStillFailsRegression) {
+    RejectedNodeRig t(3872);
+    ASSERT_NO_FATAL_FAILURE(t.setupAndRevoke());
+    t.r.passes(50);
+    ASSERT_EQ(t.r.client.routedBrokerSweeps(), 1u);
+    auto later = t.cq.send(*t.p, t.r.client.topic("t"), TwoNodeRig::keyFor(0), t.val);   // routed AFTER the sweep
+    ASSERT_TRUE(later.accepted());
+    t.p->flush();
+    ASSERT_TRUE(t.r.drive([&] { return later.ready(); })) << "the late batch was held behind the Rejected session";
+    EXPECT_EQ(later.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(later.outcome().c.errorCode, 46);
+    const uint64_t sweeps = t.r.client.routedBrokerSweeps();
+    EXPECT_EQ(sweeps, 2u) << "the refused routing raised exactly one more sweep";
+    t.r.passes(50);
+    EXPECT_EQ(t.r.client.routedBrokerSweeps(), sweeps);
+    EXPECT_EQ(t.r.client.rejectedLeaderSessionsForTest(), 1u);
+}
+
 // #291: a TRANSACTIONAL producer whose batches wait on a leader node session that goes Rejected fails them at once
 // (the Review-B path reaches transactional producers too) and its transaction is abortable.
 TEST(ClientAuthErrorsRegression, ATransactionalProducerWithBatchesOnARejectedLeaderNodeSessionFailsAtOnceRegression) {

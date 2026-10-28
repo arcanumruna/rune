@@ -209,3 +209,66 @@ TEST(SubscriberHubRecordsRegression, AHoledBatchDeliversItsOwnOffsetsRegression)
     EXPECT_EQ(b.impl->nextOffset, 13);
     EXPECT_EQ(b.hub.malformedBatches(), 0u);
 }
+
+// ---- Issue #180: a RecordBatch header recordCount that disagrees with its body is rejected ------------------
+namespace {
+// Set the header's recordCount and re-seal the CRC (the CRC covers the count: a hostile or corrupt broker re-seals).
+std::vector<uint8_t> withCount(std::vector<uint8_t> b, uint32_t count) {
+    namespace pb = rune::protocol::batch;
+    for (int i = 0; i < 4; ++i) b[static_cast<std::size_t>(pb::kRecordCountOffset + i)] = static_cast<uint8_t>(count >> (8 * i));
+    const uint32_t crc = rune::protocol::crc32c(b.data() + pb::kAttributesOffset, b.size() - pb::kAttributesOffset);
+    for (int i = 0; i < 4; ++i) b[static_cast<std::size_t>(pb::kCrcOffset + i)] = static_cast<uint8_t>(crc >> (8 * i));
+    return b;
+}
+std::size_t visited(const rc::codec::RecordsView& v) {
+    std::size_t n = 0;
+    v.forEachRecord([&](std::string_view, std::string_view, int64_t, int64_t) { ++n; });
+    return n;
+}
+}   // namespace
+
+// Table: header count in {actual-1, actual+1, 0, max int32, max uint32 (-1)} x body in {empty, 1 record, many}.
+// Every disagreeing batch is invalid (the reader's ensureValid), a view over it visits nothing, and the subscriber
+// counts it malformed and neither delivers nor moves the position.
+TEST(RecordsViewRegression, HeaderCountDisagreeingWithBodyIsRejectedRegression) {
+    int cases = 0;
+    for (const int32_t actual : {0, 1, 2, 7, 40}) {
+        const auto good = batchAt(0, actual);
+        std::vector<uint32_t> counts{static_cast<uint32_t>(actual + 1), 0u, 0x7FFFFFFFu, 0xFFFFFFFFu, 0x80000000u};
+        if (actual > 0) counts.push_back(static_cast<uint32_t>(actual - 1));
+        for (const uint32_t cnt : counts) {
+            if (cnt == static_cast<uint32_t>(actual)) continue;
+            const auto bad = withCount(good, cnt);
+            SCOPED_TRACE("actual=" + std::to_string(actual) + " headerCount=" + std::to_string(cnt));
+            rune::protocol::RecordBatchReader reader(bad.data(), bad.size());
+            EXPECT_FALSE(reader.ensureValid()) << "the CRC is valid; the count disagrees with the body";
+            Bound b(kTopic, 100 + cases, 500 + cases);
+            const auto view = b.view(bad, 0);
+            EXPECT_EQ(visited(view), 0u) << "a view over a disagreeing batch visits nothing";
+            b.hub.onRecords(view);
+            EXPECT_TRUE(b.delivered.empty()) << "a partial or over-read batch is never delivered";
+            EXPECT_EQ(b.hub.malformedBatches(), 1u);
+            EXPECT_EQ(b.impl->nextOffset, 0) << "the position does not move";
+            ++cases;
+        }
+    }
+    EXPECT_GE(cases, 25) << "vacuity guard: the table ran";
+}
+
+TEST(RecordsViewRegression, HeaderCountMatchingBodyDecodesEveryRecordRegression) {
+    int cases = 0;
+    for (const int32_t actual : {0, 1, 2, 7, 40}) {
+        const auto good = batchAt(0, actual);
+        SCOPED_TRACE("actual=" + std::to_string(actual));
+        rune::protocol::RecordBatchReader reader(good.data(), good.size());
+        EXPECT_TRUE(reader.ensureValid());
+        Bound b(kTopic, 200 + cases, 600 + cases);
+        const auto view = b.view(good, 0);
+        EXPECT_EQ(visited(view), static_cast<std::size_t>(actual));
+        b.hub.onRecords(view);
+        EXPECT_EQ(b.delivered, range(0, actual));
+        EXPECT_EQ(b.hub.malformedBatches(), 0u);
+        ++cases;
+    }
+    EXPECT_EQ(cases, 5);
+}

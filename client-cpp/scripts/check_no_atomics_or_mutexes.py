@@ -55,6 +55,10 @@ SCAN_DIRS = ("src", "include")
 # Docker images (rune_ql_probe), so it is scanned like examples/; the rest of
 # tests/ is not.
 FUTURE_ONLY_DIRS = ("examples", "bench", "tools", "tests/e2e")  # tests/e2e: shipped probe apps (C9 fix1)
+# Issue #182: the world-server example is the reference for users, so it is held to the FULL law (every kind, no
+# allowlist) like src/ + include/: the Invoker pattern (one thread drives doWork), no mutex / atomic.  The other
+# examples are still future-only (their harness code predates the law).
+STRICT_EXAMPLE_FILES = ("examples/rune_produce_subscribe.cpp",)
 SOURCE_EXTS = {".cpp", ".h", ".hpp", ".cc", ".cxx", ".ipp", ".inl"}
 
 # kind -> regex.  Matched on comment/string-stripped text.  Order matters only
@@ -322,6 +326,16 @@ def evaluate(files: dict, ring_files: set, slice_b: dict):
     return violations
 
 
+def evaluate_strict_examples(files: dict):
+    """STRICT_EXAMPLE_FILES: every kind, no allowlist; a listed file that is missing is a violation too."""
+    present = {rel: txt for rel, txt in files.items() if rel in STRICT_EXAMPLE_FILES}
+    violations = evaluate(present, set(), {})
+    for rel in STRICT_EXAMPLE_FILES:
+        if rel not in files:
+            violations.append(f"{rel}: listed in STRICT_EXAMPLE_FILES but not found")
+    return violations
+
+
 def evaluate_futures(files: dict):
     """Only the FUTURE kind, no allowlist (FUTURE_ONLY_DIRS and --futures)."""
     violations = []
@@ -456,6 +470,16 @@ SELFTEST_ALLOW = [
     ("unlisted_future_fails", {"src/a.cpp": "auto f = std::async(fn);"}, set(), {}, 1),
 ]
 
+SELFTEST_STRICT = [
+    # (name, files, expected violations) for evaluate_strict_examples
+    ("strict_example_mutex_fails", {"examples/rune_produce_subscribe.cpp": "std::mutex m;"}, 1),
+    ("strict_example_atomic_include_fails",
+     {"examples/rune_produce_subscribe.cpp": "#include <atomic>\nstd::atomic<bool> b;"}, 2),
+    ("strict_example_clean_ok", {"examples/rune_produce_subscribe.cpp": "int x = 0;"}, 0),
+    ("strict_example_missing_fails", {}, 1),
+    ("other_example_not_strict", {"examples/rune_produce_subscribe.cpp": "int x;", "examples/dr_client.cpp": "std::mutex m;"}, 0),
+]
+
 SELFTEST_FUTURES = [
     # (name, files, expected violations) for evaluate_futures (FUTURE_ONLY_DIRS)
     ("example_future_fails", {"examples/e.cpp": "#include <future>\nauto f = c.connect(); f.get();\n"
@@ -500,6 +524,10 @@ def run_selftest():
         v = evaluate(files, ring, sliceb)
         if len(v) != want_v:
             failures.append(f"allowlist '{name}': expected {want_v} violation(s), got {len(v)}: {v}")
+    for name, files, want_v in SELFTEST_STRICT:
+        v = evaluate_strict_examples(files)
+        if len(v) != want_v:
+            failures.append(f"strict-examples '{name}': expected {want_v} violation(s), got {len(v)}: {v}")
     for name, files, want_v in SELFTEST_FUTURES:
         v = evaluate_futures(files)
         if len(v) != want_v:
@@ -530,7 +558,7 @@ def main(argv):
     if "--selftest" in argv:
         print(f"check_no_atomics_or_mutexes: self-test OK "
               f"({len(SELFTEST_DETECT)} detector + {len(SELFTEST_ALLOW)} allowlist + "
-              f"{len(SELFTEST_FUTURES)} futures-scope + {len(SELFTEST_TESTS)} test-tree fixtures)")
+              f"{len(SELFTEST_STRICT)} strict-example + {len(SELFTEST_FUTURES)} futures-scope + {len(SELFTEST_TESTS)} test-tree fixtures)")
         return 0
     args = [a for a in argv if not a.startswith("--")]
     root = Path(args[0]) if args else Path(__file__).resolve().parent.parent
@@ -584,7 +612,9 @@ def main(argv):
               f"packaged_task/async)")
         return 0
     violations = evaluate(files, RING_FILES, SLICE_B)
-    violations += evaluate_futures(collect(root, FUTURE_ONLY_DIRS))
+    example_files = collect(root, FUTURE_ONLY_DIRS)
+    violations += evaluate_futures(example_files)
+    violations += evaluate_strict_examples(example_files)
     if violations:
         print(f"check_no_atomics_or_mutexes: {len(violations)} violation(s)")
         for v in violations:

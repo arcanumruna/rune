@@ -592,6 +592,9 @@ public:
     /// Test hook: producers adopted by the duty-cycle thread.
     [[nodiscard]] std::size_t testProducerCount() const noexcept { return producerHub_.size(); }
     /// Test hook: fill the agent command ring so the next registration finds it full.
+    /// Issue #60: how many Rejected-route sweeps ran (edge-triggered: one per Rejected edge / refused routing).
+    [[nodiscard]] uint64_t routedBrokerSweeps() const noexcept { return routedBrokerSweeps_; }
+    [[nodiscard]] uint32_t rejectedLeaderSessionsForTest() const noexcept { return agent_.rejectedLeaderSessions(); }
     [[nodiscard]] std::string_view testAgentSecret() const noexcept { return agent_.secretForTest().view(); }
     /// The command ring's record area (not the position trailer): a consumed record must be zeroed.
     [[nodiscard]] std::span<const uint8_t> testCommandRingBytes() noexcept {
@@ -1338,8 +1341,10 @@ private:
     struct DdlNotLeaderSeen  { int redirects; int64_t budgetEndNs; int64_t backoffNs; DdlOfferedOn on; };
     /// Why a DDL waits for its resend: a NotLeader answer, or its session was
     /// lost before any answer (Task 5 re-review F1: past the budget the first
-    /// ends BrokerError NotLeader, the second OpStatus::SessionLost).
-    enum class DdlResendCause : uint8_t { NotLeader, SessionLost, AuthUnavailable };   // Issue #607: AuthUnavailable ends with 48
+    /// ends BrokerError NotLeader, the second OpStatus::SessionLost).  Issue #97: NodeUnreachable = a NotLeader
+    /// answer whose resend was refused because the target node's session is not up; past the budget it ends
+    /// SessionLost too (the request may have been applied), not NotLeader.
+    enum class DdlResendCause : uint8_t { NotLeader, SessionLost, AuthUnavailable, NodeUnreachable };   // Issue #607: AuthUnavailable ends with 48
     /// Not in flight: re-sent at resendAtNs (if refused then, every cycle after, until budgetEndNs).
     struct DdlAwaitingResend {
         int redirects; int64_t budgetEndNs; int64_t backoffNs; int64_t resendAtNs;
@@ -1811,6 +1816,8 @@ private:
     std::vector<uint64_t> routeConnectFailuresSeen_;  // DR-7: per session, last seen connectFailures()
     std::vector<uint8_t>  routeSessionUp_;            // DR-7 review M1: per session, Connected last pass
     uint64_t              heldOffersSeen_ = 0;        // DR-7: last seen agent_.heldOffers()
+    uint64_t              rejectedEpochSeen_ = 0;     // issue #60: agent_.rejectedEpoch() at the last route sweep
+    uint64_t              routedBrokerSweeps_ = 0;    // issue #60: failRoutedBroker sweeps run (test-visible)
     // DR-15: Subscribes whose Redirect named an unreachable node — re-sent (only
     // they) after a fresh metadata answer and a doubling backoff.
     int retryRedirectedSubscribes_(int64_t nowNs);

@@ -914,16 +914,21 @@ if((BUILD_BENCHMARKS OR BUILD_TESTING) AND aeron_FOUND)
 
     # Phase 2b Part B — zero-copy produce gate: send vs tryClaim vs typed send vs
     # typed claim (p50/p99 + steady-state allocations; exit 1 if a claim form allocates)
+    # #377: the claim-schema headers (and tests/support) exist only where the generator source does (guard above).
+    if(TARGET generate_claim_schema_headers)
     add_executable(rune_producer_claim_bench bench/ProducerClaimBench.cpp tests/support/AllocCounter.cpp)
     target_include_directories(rune_producer_claim_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${RUNE_CLAIM_GEN_DIR})
     target_link_libraries(rune_producer_claim_bench PRIVATE rune_client_api rune_client_producer)
     add_dependencies(rune_producer_claim_bench generate_claim_schema_headers)
+    endif()
 
     # Phase 2b F Task 14 — transactional vs plain acked on every produce path (p50/p99, records/s, 0 allocations)
+    if(TARGET generate_claim_schema_headers)
     add_executable(rune_producer_txn_bench bench/ProducerTxnBench.cpp tests/support/AllocCounter.cpp)
     target_include_directories(rune_producer_txn_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${RUNE_CLAIM_GEN_DIR})
     target_link_libraries(rune_producer_txn_bench PRIVATE rune_client_api rune_client_producer)
     add_dependencies(rune_producer_txn_bench generate_claim_schema_headers)
+    endif()
 
     # F8c C1(a) — M2ORingBuffer tryClaim/commit micro-bench (producer hot path)
     add_executable(rune_m2o_claim_bench
@@ -1089,7 +1094,9 @@ if(BUILD_TESTING)
         tests/client/PlayerEventSchemaTest.cpp   # Phase 2c Task 4
     )
     target_include_directories(rune_schema_codec_smoke_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include "${RUNE_CLAIM_GEN_DIR}/gen")
-    add_dependencies(rune_schema_codec_smoke_tests generate_claim_schema_headers)
+    if(TARGET generate_claim_schema_headers)   # #377: guarded like the generator itself
+        add_dependencies(rune_schema_codec_smoke_tests generate_claim_schema_headers)
+    endif()
     target_link_libraries(rune_schema_codec_smoke_tests PRIVATE rune_codec GTest::gtest_main)
     gtest_discover_tests(rune_schema_codec_smoke_tests)
 
@@ -1200,6 +1207,7 @@ if(BUILD_TESTING)
         add_executable(rune_agent_tests
             tests/agent/ClientAgentTest.cpp
             tests/agent/SessionLivenessRegressionTest.cpp
+            tests/agent/SessionIoSealTest.cpp
         )
         target_include_directories(rune_agent_tests PRIVATE
             ${RUNE_PROTOCOL_INCLUDE}
@@ -1580,8 +1588,10 @@ if(BUILD_TESTING)
             tests/support/AllocCounter.cpp
         )
         target_include_directories(rune_invoker_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
-        target_include_directories(rune_invoker_tests PRIVATE ${RUNE_CLAIM_GEN_DIR} "${RUNE_CLAIM_GEN_DIR}/gen")   # player_event.gen.h
-        add_dependencies(rune_invoker_tests generate_claim_schema_headers)
+        if(TARGET generate_claim_schema_headers)   # #377: guarded like the generator itself
+            target_include_directories(rune_invoker_tests PRIVATE ${RUNE_CLAIM_GEN_DIR} "${RUNE_CLAIM_GEN_DIR}/gen")   # player_event.gen.h
+            add_dependencies(rune_invoker_tests generate_claim_schema_headers)
+        endif()
         target_link_libraries(rune_invoker_tests PRIVATE rune_client_api GTest::gtest_main)
         if(UNIX AND NOT APPLE)
             find_library(UUID_LIB_INVOKER uuid)

@@ -111,6 +111,10 @@ struct SessionIo {
     /// (once per connect episode).  Default: unknown.
     [[nodiscard]] virtual std::string ingressChannel() const { return {}; }
 
+    /// Edge notification (cold path): the machine just entered terminal Rejected (once per session; Rejected is
+    /// never left).  Default: ignored.  Lets the owner keep an O(1) rejected-session count instead of rescanning.
+    virtual void onRejected() noexcept {}
+
     virtual ~SessionIo() = default;
 };
 
@@ -1140,7 +1144,9 @@ private:
     void transitionTo(SessionState next) noexcept {
         if (state_ == SessionState::Closed) return;  // terminal
         if (next != SessionState::Authenticating) scram_.reset();   // the exchange's variables live in that state only
+        const bool intoRejected = next == SessionState::Rejected && state_ != SessionState::Rejected;
         state_ = next;
+        if (intoRejected) io_.onRejected();   // edge: once per session (Rejected is terminal)
     }
 
     /// Generate a monotonically increasing correlationId.
