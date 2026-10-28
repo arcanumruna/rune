@@ -30,6 +30,16 @@ extern "C" {
 #include <thread>
 #include <vector>
 
+// Aeron's own default (2 up to 1.41, 4 from 1.51), read from a fresh context rather than hard-coded.
+inline uint32_t aeronDefaultMsgsPerSend() {
+    aeron_driver_context_t* c = nullptr;
+    if (aeron_driver_context_init(&c) < 0) return 0;
+    const uint32_t v = aeron_driver_context_get_network_publication_max_messages_per_send(c);
+    aeron_driver_context_close(c);
+    return v;
+}
+
+
 namespace {
 using Clock = std::chrono::steady_clock;
 constexpr auto kDeadline = std::chrono::seconds(20);
@@ -450,6 +460,11 @@ TEST(UdpGsoBindings, DataLossRecoversWithGroOn) {
 }
 
 TEST(UdpGsoBindings, Ipv6RoundTrip) {
+    if (const int fd = ::socket(AF_INET6, SOCK_DGRAM, 0); fd < 0) {
+        GTEST_SKIP() << "host has no IPv6 (socket(AF_INET6) failed, errno " << errno << ")";
+    } else {
+        ::close(fd);
+    }
     Rig r;
     ASSERT_TRUE(r.start(1, 1408)) << aeron_errmsg();
     roundTrip(r, r, "aeron:udp?endpoint=[::1]:24608|mtu=1408", mixedSizes(1408, 70));
@@ -475,7 +490,7 @@ TEST(UdpGsoBindings, EmbeddedDriverInstallsGsoByDefault) {
     off.udpGso = false;
     rune::node::EmbeddedDriver b(off, rune::node::DriverMode::Threaded);
     EXPECT_FALSE(b.udpGsoActive());
-    EXPECT_EQ(b.maxMessagesPerSend(), 2u) << "GSO off: Aeron's default batching, unchanged";
+    EXPECT_EQ(b.maxMessagesPerSend(), aeronDefaultMsgsPerSend()) << "GSO off: Aeron's default batching, unchanged";
 
     rune::node::EmbeddedDriverConfig explicitCfg = on;
     explicitCfg.dir += "-explicit";
@@ -570,5 +585,5 @@ TEST(UdpGsoBindings, LoopbackMtuKeepsAeronDefaultMsgsPerSendRegression) {
     c.mtuBytes = 65504;
     rune::node::EmbeddedDriver d(c, rune::node::DriverMode::Threaded);
     EXPECT_TRUE(d.udpGsoActive());
-    EXPECT_EQ(d.maxMessagesPerSend(), 2u);
+    EXPECT_EQ(d.maxMessagesPerSend(), aeronDefaultMsgsPerSend());
 }
