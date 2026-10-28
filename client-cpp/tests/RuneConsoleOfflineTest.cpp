@@ -2151,3 +2151,27 @@ TEST(ConsoleSeamRegression, FdSeamRefusesAScriptFromStdinRegression) {
     EXPECT_EQ(rc, 2) << err.str();
     EXPECT_NE(err.str().find("-f -"), std::string::npos) << err.str();
 }
+
+// #702 review attack: an EMPTY script and a comments-only script.  `rune console -f` ends rc 0 before any broker is
+// needed; both live seams must end exactly the same way (the endpoint is never contacted).  Mutation (the seams back
+// to an empty batch and no script read): they go on to the broker and fail - red.
+TEST(ConsoleSeamRegression, LiveSeamsEndAnEmptyScriptLikeConsoleAdversarialRegression) {
+    const std::vector<std::pair<std::string, std::string>> scripts{
+        {"seam_empty.rql", ""}, {"seam_comments.rql", "-- nothing to run\n\n   \n-- still nothing\n"}};
+    for (const auto& [name, body] : scripts) {
+        const fs::path f = writeScript(name, body);
+        const ConsoleRun ref = console({"--broker", "127.0.0.1:1", "-f", f.string()});
+        ASSERT_EQ(ref.rc, 0) << name << ": " << ref.err;
+        for (const bool viaFd : {true, false}) {
+            std::ostringstream out, err;
+            uint64_t pumps = 0;
+            const std::vector<std::string> args{"console", "--broker", "127.0.0.1:1", "-f", f.string()};
+            const int rc = viaFd ? rune::cli::console::runLiveOnFdForTest(args, STDIN_FILENO, out, err, &pumps)
+                                 : rune::cli::console::runLiveOnStdinForTest(args, nullptr, out, err, &pumps);
+            EXPECT_EQ(rc, ref.rc) << name << (viaFd ? " fd" : " stdin") << " seam: " << err.str();
+            EXPECT_EQ(err.str(), ref.err) << name << (viaFd ? " fd" : " stdin") << " seam";
+            EXPECT_EQ(out.str(), ref.out) << name << (viaFd ? " fd" : " stdin") << " seam";
+            EXPECT_EQ(pumps, 0u) << "no live session was opened";
+        }
+    }
+}

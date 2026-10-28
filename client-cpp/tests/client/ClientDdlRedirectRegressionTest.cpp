@@ -1229,3 +1229,107 @@ TEST(RoutedCtlRegression, BackPressureOnAConnectedNodeIsNotNodeUnreachableRegres
     ASSERT_TRUE(r.drive([&] { for (auto& o : ops) if (!o.ready()) return false; return true; }, /*stepNs=*/1'000'000));
     for (auto& o : ops) EXPECT_TRUE(o.ok()) << o.describe();
 }
+
+// ── #687 review attacks (adversarial) ──
+
+// Back-pressure on the SEED's resend (AwaitingResend path): a NotLeader without an endpoint makes the op re-send
+// toward the seed; every re-offer is then refused (Retry) while the seed session stays Connected.  That is
+// back-pressure, not an unreachable node: past the retry budget the op ends BrokerError NotLeader "retry budget
+// exhausted", never SessionLost "node unreachable".  Mutation (the cause set to NodeUnreachable on every Retry):
+// SessionLost - red.
+TEST(RoutedCtlRegression, BackPressuredSeedResendPastBudgetIsNotLeaderNotUnreachableAdversarialRegression) {
+    using Offer = rune::client::transport::AeronTransport::OfferResult;
+    rc::ClientConfig cfg = invokerCfg(4480, 4481);
+    cfg.ddlRetryBudget = std::chrono::milliseconds(300);
+    cfg.ddlTimeoutMs   = 5'000;
+    Rig r(cfg);
+    r.connect();
+    int answered = 0;
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        ++answered;
+        r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId);
+        r.client.testForceIngressOffers(Offer::Retry, 1'000'000);   // from now on the seed is back-pressured
+    };
+    test_support::TestCq cq(r.client);
+    const int64_t t0 = g_now;
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/20'000'000)) << "the DDL must end, not hang";
+    r.client.testForceIngressOffers(Offer::Retry, 0);
+    EXPECT_EQ(answered, 1) << "no resend got through the back-pressured seed";
+    EXPECT_GT(r.client.testIngressOfferRefused(), 0u) << "precondition: the resends were refused";
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::BrokerError) << payloadText(f);
+    EXPECT_EQ(f.outcome().c.errorCode, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_NE(payloadText(f).find("retry budget exhausted"), std::string::npos) << payloadText(f);
+    EXPECT_LT(g_now - t0, int64_t{2'000'000'000}) << "the 300 ms budget ends it, not the 5 s deadline";
+    r.passes(50, 20'000'000);
+    EXPECT_EQ(cq.timesCompleted(f.token()), 1);
+    EXPECT_EQ(r.client.testPendingControlOps(), 0u);
+}
+
+// The held path toward the seed's OWN channel: a first-answer Redirect naming the seed's physical ingress maps to
+// session 0, and every offer there is refused while the seed stays Connected (back-pressure).  The op is held past its
+// retry budget (no "node unreachable": the node IS up) and is answered once the seed drains.  Mutation (the held
+// path ending SessionLost without checking the node's session): SessionLost at the budget's end - red.
+TEST(RoutedCtlRegression, RedirectToTheSeedsOwnChannelUnderBackPressureIsHeldUntilAnsweredAdversarialRegression) {
+    using Offer = rune::client::transport::AeronTransport::OfferResult;
+    rc::ClientConfig cfg = invokerCfg(4482, 4483);
+    cfg.ddlRetryBudget = std::chrono::milliseconds(300);
+    cfg.ddlTimeoutMs   = 5'000;
+    Rig r(cfg);
+    r.connect();
+    int seen = 0;
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        if (++seen == 1) {
+            r.answerError(ep, pc::ErrorCode::Redirect, cfg.gatewayChannel, m->sessionId, m->correlationId);
+            r.client.testForceIngressOffers(Offer::Retry, 1'000'000);
+            return;
+        }
+        pc::DdlResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId;
+        resp.objectId = 4; resp.newVersion = 7;
+        r.gw.sendDdlResponse(ep, resp);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return seen >= 1; }, /*stepNs=*/1'000'000));
+    r.passes(40, 20'000'000);   // 800 ms: well past the 300 ms budget, inside the 5 s deadline
+    EXPECT_GT(r.client.testIngressOfferRefused(), 0u) << "precondition: the held offers were refused";
+    EXPECT_FALSE(f.ready()) << "a back-pressured but connected seed ended the held op: " << payloadText(f);
+    r.client.testForceIngressOffers(Offer::Retry, 0);   // the seed drains
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/1'000'000));
+    EXPECT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(seen, 2) << "the same op reached the seed exactly once more";
+    EXPECT_EQ(cq.timesCompleted(f.token()), 1);
+}
+
+// GetViewRow that dies on the redirect cap at a NODE carries that node's route and the broker's Redirect code (3), with
+// the client-side kNotLeader in the result.  Mutation (no route text): red.
+TEST(RoutedCtlRegression, GetViewRowRedirectCapNamesTheNodeRouteAndBrokerCode3AdversarialRegression) {
+    Rig r(invokerCfg(4484, 4485));
+    const std::string nodeCh = udp(rune::client::testing::allocFreeUdpPort());
+    const int node = r.gw.addNode(nodeCh, 4484);
+    r.connect();
+    int atNode = 0;
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        if (ep == node) ++atNode;
+        r.answerError(ep, pc::ErrorCode::Redirect, nodeCh, m->sessionId, m->correlationId);   // always "ask nodeCh"
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/1'000'000));
+    EXPECT_EQ(atNode, rc::Client::kMaxDdlRedirects) << "it died at the node, after following every allowed redirect";
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(f.getViewRowResult().status, rc::ViewRowResult::kNotLeader);
+    const std::string text = payloadText(f);
+    EXPECT_NE(text.find("redirected more than"), std::string::npos) << text;
+    EXPECT_NE(text.find("(route: " + nodeCh + ", broker code 3)"), std::string::npos) << text;
+    EXPECT_EQ(text.find("route: seed"), std::string::npos) << text;
+}

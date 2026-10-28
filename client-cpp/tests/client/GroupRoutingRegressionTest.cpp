@@ -13,6 +13,7 @@
 // more nodes).  Subscribe leadership is modelled by InvokerGateway::
 // subscribeLeader.  Everything is single-threaded and condition-driven: no
 // sleeps; every wait is a bounded pump loop.
+#include <limits>
 #include <optional>
 #include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
@@ -4394,4 +4395,105 @@ TEST(SubscribeClockRegression, SubscribeTimeoutFollowsTheInjectedClockRegression
     EXPECT_TRUE(sub.finished());
     EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::TimedOut);
     EXPECT_EQ(errors, 1) << "onError fires once per timed-out Subscribe";
+}
+
+// ── C23 review attacks (adversarial) ──
+
+// #705, the other order: the NEWEST request (B) is answered first, then the lagging answer to the older one (A).  B's
+// answer clears the answer timer; A's late answer neither re-arms it nor triggers anything: no further
+// MetadataRequest however far the duty clock runs (there is no periodic refresh).  Mutation (`>` for `>=` in
+// onMetadataResponse: the newest answer no longer clears its own timer): a spurious re-ask - red.
+TEST(GroupRoutingRegression, NewestMetadataAnswerFirstThenTheLaggingOneAsksNoMoreAdversarialRegression) {
+    constexpr int64_t kStepNs = 100'000'000LL;
+    RigOptions o        = routingClockOptions(100'000);
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 2'000'000'000;
+    GroupRig r(4711, 4712, o);
+    r.gw.partitions   = {{1, 0, 0, 1, 4711, ""}};
+    r.gw.holdMetadata = true;
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.gw.metadataCorrIds.empty(); }, 20'000));
+    r.opt.stepNs = kStepNs;
+    const int64_t corrA = r.gw.metadataCorrIds.front();
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataCorrIds.back() > corrA; }, 20'000))
+        << "precondition: the timed-out request was never re-asked";
+    const int64_t corrB = r.gw.metadataCorrIds.back();
+    r.opt.stepNs = 0;
+    for (int i = 0; i < 20; ++i) { r.client.doWork(); r.gw.pump(); }
+    ASSERT_EQ(r.gw.metadataCorrIds.back(), corrB) << "precondition: B is the newest request";
+    const std::size_t asked = r.gw.metadataCorrIds.size();
+    r.gw.sendMetadata(r.seedSid, corrB, 0);   // the newest answered first
+    for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
+    r.gw.sendMetadata(r.seedSid, corrA, 0);   // then the lagging one
+    r.opt.stepNs = 10'000'000;
+    const int64_t t0 = g_routingClockNs;
+    (void)r.drive([&] { return r.gw.metadataCorrIds.size() > asked || g_routingClockNs - t0 >= 20'000'000'000LL; },
+                  10'000);
+    EXPECT_GE(g_routingClockNs - t0, 20'000'000'000LL) << "precondition: the duty clock ran 10 response timeouts";
+    EXPECT_EQ(r.gw.metadataCorrIds.size(), asked) << "the answered newest request was asked again";
+}
+
+// #701, a clock JUMP: the duty clock leaps 5 s (five heartbeat and five auto-commit intervals) in one go, then walks on
+// 900 ms in 150 ms steps (each step passes a 100 ms sweep).  Exactly one Heartbeat and one OffsetCommit go out per
+// jump - the timers re-arm from now, never a catch-up burst over the following sweeps.  (The session's own keepalive /
+// response timeouts are set past the jump: a jump beyond them is, correctly, a silent seed.)  Mutations: the hub back
+// on steady_clock (none fire: red); a catch-up re-arm (next += interval: one more per sweep - red).
+TEST(GroupClockRegression, ClockJumpFiresOneHeartbeatAndOneAutoCommitNotABurstAdversarialRegression) {
+    RigOptions o        = routingClockOptions(100'000);
+    o.keepaliveNs       = 20'000'000'000LL;
+    o.responseTimeoutNs = 60'000'000'000LL;
+    GroupRig r(4713, 4714, o);
+    r.gw.groupAssignment = {{1, 0}};
+    rc::GroupConfig gcfg;
+    gcfg.autoCommit           = true;
+    gcfg.autoCommitIntervalMs = 1'000;
+    gcfg.sessionTimeoutMs     = 3'000;   // heartbeat every 1 s
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr; })) << "precondition: the member is Stable";
+    const auto sub = *r.subAt(0, 0);
+    r.opt.stepNs = 0;
+    for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
+    for (int round = 0; round < 3; ++round) {
+        r.gw.pushRecords(sub, static_cast<int64_t>(round) * 5, 5);   // a new position each round: a commit is owed
+        for (int i = 0; i < 100; ++i) { r.client.doWork(); r.gw.pump(); }
+        ASSERT_GE(led.records[0], (round + 1) * 5) << "precondition: the records were consumed";
+        const std::size_t commits = r.gw.offsetCommits.size();
+        const int         beats   = r.gw.heartbeats;
+        g_routingClockNs += 5'000'000'000LL;
+        for (int i = 0; i < 100; ++i) { r.client.doWork(); r.gw.pump(); }
+        for (int step = 0; step < 6; ++step) {   // 900 ms more: short of the next interval, six sweeps
+            g_routingClockNs += 150'000'000LL;
+            for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
+        }
+        EXPECT_EQ(r.gw.offsetCommits.size(), commits + 1) << "round " << round << ": one auto-commit per jump";
+        EXPECT_EQ(r.gw.heartbeats, beats + 1) << "round " << round << ": one heartbeat per jump";
+    }
+}
+
+// #701, input bound: subscribeTimeoutMs = INT64_MAX.  The relative timeout saturates and the duty thread's adoption
+// stamp (now + timeout) saturates too: the Subscribe never times out however far the clock runs.  Mutation (a plain
+// add at adoption: the deadline wraps negative): TimedOut on the first sweep - red.
+TEST(SubscribeClockRegression, MaxSubscribeTimeoutSaturatesAndNeverTimesOutAdversarialRegression) {
+    RigOptions o         = routingClockOptions(100'000);
+    o.subscribeTimeoutMs = std::numeric_limits<int64_t>::max();
+    GroupRig r(4715, 4716, o);
+    int errors = 0;
+    r.client.onError([&](const std::string&) { ++errors; });
+    r.gw.holdSubscribeResponses = true;   // the stub never answers
+    r.connect();
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                  [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty(); })) << "precondition: the Subscribe reached the stub";
+    r.opt.stepNs = 0;
+    for (int i = 0; i < 300; ++i) { r.client.doWork(); r.gw.pump(); }
+    EXPECT_FALSE(sub.finished()) << "timed out at once: the deadline wrapped";
+    g_routingClockNs += 3'600'000'000'000LL;   // an hour on
+    for (int i = 0; i < 300; ++i) { r.client.doWork(); r.gw.pump(); }
+    EXPECT_FALSE(sub.finished()) << "a saturated (never) deadline timed out";
+    EXPECT_EQ(errors, 0);
 }
