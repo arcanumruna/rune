@@ -2742,6 +2742,8 @@ private:
         const char* tail = op.tail();   // SBE var data: one call (it advances the decode position)
         std::memcpy(k.sendMaster.data(), tail, 32);
         std::memcpy(k.recvMaster.data(), tail + 32, 32);
+        // Issue #546: wipe the masters from the op's ring bytes now that they are copied (`k` scrubs itself).
+        rune::crypto::secureZero({reinterpret_cast<uint8_t*>(const_cast<char*>(tail)), WorkerOp::kPeerKeysBytes});
         ++peerLinkKeysSeen_;
         // This worker's own replication plane (a transport built PeerSealed); none (legacy gateway-routed
         // replication) or PeerPlain: nothing to install.

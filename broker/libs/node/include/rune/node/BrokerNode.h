@@ -563,6 +563,9 @@ public:
                 if (decodePeerLinkKeys(p, n, m)) worker_.onPeerLinkKeys(m);
                 else if (badControlFrames_++ % 1024 == 0)
                     spdlog::error("AdminWorkerAgent: malformed kMsgPeerLinkKeys (len={}) refused", n);
+                // Issue #546: the decoded masters die here - scrubbed (the installed copy lives in the plane's slot).
+                rune::crypto::secureZero({m.sendMaster.data(), m.sendMaster.size()});
+                rune::crypto::secureZero({m.recvMaster.data(), m.recvMaster.size()});
                 return;
             }
             if (tid == kMsgPurgeDroppedDir) {

@@ -26,6 +26,7 @@ extern "C" {
 #include <rune/node/RuneMetrics.h>
 #include <chrono>
 #include <map>
+#include <random>
 #include <sstream>
 #include <thread>
 
@@ -218,6 +219,66 @@ TEST(PeerLinkAgentRegression, AnAgentWithNoPeersTicksQuietly) {
     PeerLinkAgent a(rig.aeron, std::move(p));
     EXPECT_EQ(a.doWork(AgentRig::nowNs()), 0);
     EXPECT_EQ(a.establishedPeers(), 0);
+}
+
+// Issue #554: a flood of forged HelloV2s (a real peer id and key id, random nonces and shares) onto a responder's
+// peer-auth stream is answered at most kHelloAnswersPerCycle per duty cycle; the rest are shed before any crypto.  The
+// real initiator still links afterwards (its Hello is retried).  Mutation: removing the budget in onFrame_ -> every
+// Hello answered, helloShed() == 0 -> red.
+TEST(PeerLinkAgentRegression, AHelloFloodIsAnsweredAtMostTheBudgetPerDutyCycleAdversarialRegression) {
+    AgentRig rig;
+    rig.start(2, keysOf('k'), 102);   // the responder of the pair (1, 2)
+    PeerLinkAgent& b = *rig.agents[2];
+    const std::string bChannel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rig.ports[1]);
+    const int64_t regId = rig.aeron->addPublication(bChannel, kPeerAuthStream);
+    std::shared_ptr<aeron::Publication> pub;
+    const auto connectBy = std::chrono::steady_clock::now() + 10s;
+    for (int i = 0; i < 10'000'000 && !(pub && pub->isConnected()) && std::chrono::steady_clock::now() < connectBy; ++i) {
+        if (!pub) pub = rig.aeron->findPublication(regId);
+        (void)b.doWork(AgentRig::nowNs());
+        std::this_thread::yield();
+    }
+    ASSERT_TRUE(pub && pub->isConnected());
+    // Settle: the responder's own NoLink pokes etc. are not Hellos; nothing is answered yet.
+    ASSERT_EQ(b.helloAnswered() + b.helloShed(), 0u);
+
+    constexpr int kFlood = 64;
+    std::mt19937_64 rng(554);
+    const uint64_t keyId = keysOf('k').current.keyId;
+    for (int i = 0; i < kFlood; ++i) {
+        pl::PeerHelloV2 h; h.from = 1; h.to = 2; h.keyId = keyId; h.incarnation = rng();
+        for (auto& x : h.nonceA) x = static_cast<uint8_t>(rng());
+        for (auto& x : h.shareA) x = static_cast<uint8_t>(rng());
+        std::array<uint8_t, pl::PeerHelloV2::kSize> wire{};
+        h.encode(wire.data());
+        aeron::concurrent::AtomicBuffer ab(wire.data(), wire.size());
+        int64_t r = -1;
+        for (int t = 0; t < 1'000'000 && (r = pub->offer(ab, 0, static_cast<aeron::util::index_t>(wire.size()))) < 0; ++t)
+            std::this_thread::yield();
+        ASSERT_GE(r, 0) << "offer " << i;
+    }
+    // Drive the responder until every forged Hello was consumed (answered or shed); at most the budget per cycle.
+    int cycles = 0;
+    uint64_t maxPerCycle = 0;
+    const auto drainBy = std::chrono::steady_clock::now() + 10s;
+    for (int i = 0; i < 10'000'000 && b.helloAnswered() + b.helloShed() < static_cast<uint64_t>(kFlood) &&
+                    std::chrono::steady_clock::now() < drainBy; ++i) {
+        const uint64_t before = b.helloAnswered();
+        (void)b.doWork(AgentRig::nowNs());
+        ++cycles;
+        maxPerCycle = std::max(maxPerCycle, b.helloAnswered() - before);
+        std::this_thread::yield();
+    }
+    ASSERT_EQ(b.helloAnswered() + b.helloShed(), static_cast<uint64_t>(kFlood)) << "every forged Hello consumed";
+    EXPECT_LE(maxPerCycle, static_cast<uint64_t>(PeerLinkAgent::kHelloAnswersPerCycle));
+    EXPECT_LE(b.helloAnswered(), static_cast<uint64_t>(PeerLinkAgent::kHelloAnswersPerCycle) * static_cast<uint64_t>(cycles));
+    EXPECT_GT(b.helloShed(), 0u) << "a burst larger than the budget is shed";
+    EXPECT_EQ(b.establishedPeers(), 0);
+
+    rig.start(1, keysOf('k'), 101);   // the real initiator still links within the usual bound
+    ASSERT_TRUE(rig.runUntil(2000ms, [&] {
+        return rig.agents[1]->establishedPeers() == 1 && rig.agents[2]->establishedPeers() == 1;
+    })) << "shed " << b.helloShed();
 }
 
 // ---- Part 2: BrokerNodes, authMode Enabled ------------------------------------------------------------------

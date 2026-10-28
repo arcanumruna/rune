@@ -10,15 +10,21 @@ extern "C" {
 #include <Aeron.h>
 #include <Context.h>
 
+#include <rune/aeronutil/testing/FreePort.h>
 #include <rune/consensus/AeronIngress.h>
 #include <rune/consensus/ConsensusAdapter.h>
 #include <rune/consensus/IngressRing.h>
+#include <rune/consensus/ConsensusMessages.h>
 #include <rune/consensus/UdpMessageSink.h>
 #include <rune/node/EmbeddedDriver.h>
+#include <rune/node/PeerLinkAgent.h>
 #include <rune/peerlink/PeerFrameCrypto.h>
 #include <rune/peerlink/PeerHandshake.h>
+#include <rune/replication/AeronPartitionTransport.h>
+#include <rune/replication/PartitionReplica.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/replication/WorkerReplicationTransport.h>
+#include <rune/storage/Log.h>
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -317,4 +323,145 @@ TEST(PeerFrameAllocRegression, IdleKeepalivesAllocateNothingAdversarialRegressio
     EXPECT_EQ(ingress.authFrames(1), opened0 + 400) << "every keepalive was really sealed, sent and opened";
     EXPECT_EQ(adapter.ignoredFrameCount(), 0);
     EXPECT_EQ(handler.calls, 0u);
+}
+
+// Issue #275 (f): the two other sealed planes in steady state, on the thread that owns them.
+//   - legacy replication: two sealed AeronPartitionTransports (sender id 1) driving a real leader / follower
+//     PartitionReplica pair - the follower's fetch, the leader's (empty) response, both sealed and opened;
+//   - consensus: UdpMessageSink seals consensus frames, AeronIngress opens them into the IngressRing, the adapter
+//     dispatches them.
+// Mutation: a std::vector built per sealed frame in AeronPartitionTransport's send path (or the sink's) turns this red.
+TEST(PeerFrameAllocRegression, SealedLegacyAndConsensusPathsAllocateNothingRegression) {
+    namespace rc = rune::consensus;
+    ASSERT_TRUE(kHooked);
+    MediaDriver driver;
+    aeron::Context ctx; ctx.aeronDir(driver.dir());
+    auto aeron = aeron::Aeron::connect(ctx);
+
+    // ---- legacy replication (the control-thread AeronPartitionTransport) ----
+    const fs::path dir = fs::temp_directory_path() / ("rune_pfa_logs_" + std::to_string(::getpid()));
+    fs::create_directories(dir / "l"); fs::create_directories(dir / "f");
+    {
+        constexpr int32_t kL = 710, kF = 711;
+        rune::storage::Log ldrLog((dir / "l").string()), flwLog((dir / "f").string());
+        rr::AeronPartitionTransport ldr(aeron, "aeron:ipc", kL, 1, 4 * 1024 * 1024, rune::aeronutil::AeronPump{}, pl::PeerFrameCrypto(1, 1));
+        rr::AeronPartitionTransport flw(aeron, "aeron:ipc", kF, 2, 4 * 1024 * 1024, rune::aeronutil::AeronPump{}, pl::PeerFrameCrypto(2, 1));
+        ldr.setPublicationMaxMessageBytes(rr::aeronMaxMessageLength(64 * 1024));
+        flw.setPublicationMaxMessageBytes(rr::aeronMaxMessageLength(64 * 1024));
+        ldr.addPeer(2, "aeron:ipc", kF);
+        flw.addPeer(1, "aeron:ipc", kL);
+        ASSERT_TRUE(ldr.installPeerLink(2, linkFor(true)));
+        ASSERT_TRUE(flw.installPeerLink(1, linkFor(false)));
+        auto cfg = [](rr::NodeId self) {
+            rr::PartitionConfig c;
+            c.partitionId = 0; c.selfId = self; c.replicaLagMaxMs = 5000; c.replicaLagMaxOffset = 100000; c.minIsr = 1;
+            c.fetchIntervalNs = 5'000'000LL; c.isrCheckIntervalNs = 10'000'000LL; c.maxFetchBytes = 1 << 20;
+            return c;
+        };
+        const std::vector<rr::NodeId> nodes{1, 2};
+        rr::PartitionReplica leader(cfg(1), rr::Role::Leader, 1, nodes, nodes, &ldrLog, &ldr);
+        rr::PartitionReplica follower(cfg(2), rr::Role::Follower, 1, nodes, nodes, &flwLog, &flw);
+        ldr.registerReplica(0, 0, &leader);
+        flw.registerReplica(0, 0, &follower);
+        int64_t simNs = 0;
+        auto step = [&] { simNs += 5'000'000LL; (void)ldr.poll(simNs); (void)flw.poll(simNs); leader.doWork(simNs); follower.doWork(simNs); };
+        for (int i = 0; i < 5; ++i) { std::vector<uint8_t> v(64, static_cast<uint8_t>(i)); ASSERT_GE(leader.append(v), 0); }
+        const rr::Offset target = leader.logEndOffset();
+        for (int i = 0; i < 20'000 && !(follower.logEndOffset() >= target && leader.highWatermark() >= target); ++i) {
+            step(); std::this_thread::sleep_for(100us);
+        }
+        ASSERT_GE(follower.logEndOffset(), target) << "warm-up: the sealed fetch loop converged";
+        for (int i = 0; i < 500; ++i) step();   // steady state: empty fetches, every buffer sized
+        const uint64_t ldrFrames0 = ldr.authFrames(2), flwFrames0 = flw.authFrames(1);
+        {
+            Armed armed;
+            for (int i = 0; i < 2000; ++i) step();
+        }
+        EXPECT_EQ(gAllocs.load(), 0u) << "the sealed legacy replication plane allocated in steady state";
+        EXPECT_GT(ldr.authFrames(2), ldrFrames0) << "fetch requests really reached the leader, sealed";
+        EXPECT_GT(flw.authFrames(1), flwFrames0) << "fetch responses really reached the follower, sealed";
+        EXPECT_EQ(ldr.peerFrameDrops() + flw.peerFrameDrops(), 0u);
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+
+    // ---- consensus (UdpMessageSink -> AeronIngress -> IngressRing -> ConsensusAdapter) ----
+    constexpr int32_t kStream = 712;
+    rc::IngressRing ring(64 * 1024);
+    rc::AeronIngress ingress(aeron, "aeron:ipc", kStream, ring, rune::aeronutil::AeronPump{}, pl::PeerFrameCrypto(2, 0));
+    std::unordered_map<rc::NodeId, rc::UdpMessageSink::PeerEndpoint> eps{{2, {"aeron:ipc", kStream}}};
+    rc::UdpMessageSink sink(aeron, eps, rune::aeronutil::AeronPump{}, rc::PeerResolutionSource{}, pl::PeerFrameCrypto(1, 0));
+    ASSERT_TRUE(sink.installPeerLink(2, linkFor(true)));
+    ASSERT_TRUE(ingress.installPeerLink(1, linkFor(false)));
+    NoopConsensusHandler handler;
+    rc::ConsensusAdapter adapter{handler};
+    std::array<uint8_t, rc::CommitPositionMsg::TOTAL_SIZE> commit{};
+    std::array<uint8_t, rc::AppendPositionMsg::TOTAL_SIZE> append{};
+    auto round = [&](int64_t i) {
+        (void)rc::CommitPositionMsg::encode(commit.data(), 0, /*term=*/1, /*logPosition=*/i, /*leader=*/1);
+        (void)rc::AppendPositionMsg::encode(append.data(), 0, /*term=*/1, /*logPosition=*/i, /*follower=*/1, /*flags=*/0);
+        sink.send(2, commit.data(), commit.size());
+        sink.send(2, append.data(), append.size());
+        (void)ingress.poll(10);
+        (void)ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len) {
+            adapter.onFragment(0, b.buffer() + off, static_cast<std::size_t>(len));
+        }, 64);
+    };
+    for (int i = 0; i < 5000 && handler.calls == 0; ++i) { round(i); std::this_thread::sleep_for(1ms); }   // the publication connects
+    ASSERT_GT(handler.calls, 0u) << "consensus frames never got through";
+    for (int i = 0; i < 200; ++i) round(i);
+    const uint64_t calls0 = handler.calls;
+    {
+        Armed armed;
+        for (int i = 0; i < 2000; ++i) round(1000 + i);
+    }
+    EXPECT_EQ(gAllocs.load(), 0u) << "the sealed consensus plane allocated on the control thread in steady state";
+    EXPECT_GT(handler.calls, calls0) << "consensus frames really flowed during the armed window";
+    EXPECT_EQ(ingress.peerFrameDrops() + sink.peerFrameDrops(), 0u);
+    EXPECT_EQ(adapter.ignoredFrameCount(), 0);
+}
+
+// Issue #275 (g): an idle Established PeerLinkAgent - the control thread's per-cycle doWork (the subscription poll and
+// every handshake's tick) plus the authenticated-frame observation BrokerNode feeds it - allocates nothing.
+// Mutation: a std::string built per tick in PeerLinkAgent::doWork turns this red.
+TEST(PeerFrameAllocRegression, AnIdleEstablishedPeerLinkAgentAllocatesNothingRegression) {
+    ASSERT_TRUE(kHooked);
+    MediaDriver driver;
+    aeron::Context ctx; ctx.aeronDir(driver.dir());
+    auto aeron = aeron::Aeron::connect(ctx);
+    std::string k(48, 'k');
+    auto m = rune::crypto::deriveClusterKey({reinterpret_cast<const uint8_t*>(k.data()), k.size()});
+    ASSERT_TRUE(m);
+    const uint16_t ports[2] = {rune::aeronutil::testing::allocFreeUdpPort(), rune::aeronutil::testing::allocFreeUdpPort()};
+    auto chan = [&](int i) { return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(ports[i]); };
+    std::unique_ptr<rune::node::PeerLinkAgent> agents[2];
+    for (int i = 0; i < 2; ++i) {
+        rune::node::PeerLinkAgent::Params p;
+        p.selfId = i + 1; p.incarnation = 100 + static_cast<uint64_t>(i); p.streamId = 41; p.keys = {*m, std::nullopt};
+        p.bindChannel = chan(i);
+        p.peers.push_back({2 - i, chan(1 - i)});
+        agents[i] = std::make_unique<rune::node::PeerLinkAgent>(aeron, std::move(p));
+    }
+    auto nowNs = [] { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    for (int i = 0; i < 10'000 && !(agents[0]->establishedPeers() == 1 && agents[1]->establishedPeers() == 1); ++i) {
+        for (auto& a : agents) (void)a->doWork(nowNs());
+        std::this_thread::sleep_for(1ms);
+    }
+    ASSERT_EQ(agents[0]->establishedPeers(), 1);
+    ASSERT_EQ(agents[1]->establishedPeers(), 1);
+    for (int i = 0; i < 200; ++i) for (auto& a : agents) (void)a->doWork(nowNs());   // drain any late handshake frame
+    uint64_t auth = 0;
+    {
+        Armed armed;
+        for (int i = 0; i < 5000; ++i) {
+            const int64_t now = nowNs();
+            for (int a = 0; a < 2; ++a) {
+                (void)agents[a]->doWork(now);
+                agents[a]->observeAuthFrames(2 - a, ++auth, now);   // the transports' liveness counter, as BrokerNode feeds it
+            }
+        }
+    }
+    EXPECT_EQ(gAllocs.load(), 0u) << "an idle established PeerLinkAgent allocated on the control thread";
+    EXPECT_EQ(agents[0]->establishedPeers(), 1);
+    EXPECT_EQ(agents[1]->establishedPeers(), 1);
 }
