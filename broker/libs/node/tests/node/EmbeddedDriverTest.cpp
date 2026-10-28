@@ -17,6 +17,8 @@
 #include <csignal>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <cstdio>
+#include <fcntl.h>
 
 using namespace rune::node;
 namespace fs = std::filesystem;
@@ -159,6 +161,61 @@ TEST(EmbeddedDriverRegression, ADirIsReusableAfterItsHolderIsDestroyedRegression
     TmpDir d;
     { EmbeddedDriver a(cfgAt(d.path), DriverMode::Invoker); }
     EXPECT_NO_THROW(EmbeddedDriver b(cfgAt(d.path), DriverMode::Invoker));
+}
+
+// ---- #654 adversarial review: the dir lock's fd, its throw paths and its spellings ----
+namespace {
+/// The fds of this process open on `path` (via /proc/self/fd).
+std::vector<int> fdsOpenOn(const std::string& path) {
+    std::vector<int> out;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator("/proc/self/fd", ec)) {
+        std::error_code lec;
+        const fs::path target = fs::read_symlink(e.path(), lec);
+        if (!lec && target == fs::path(path)) out.push_back(std::stoi(e.path().filename().string()));
+    }
+    return out;
+}
+} // namespace
+
+// The lock fd must never leak into an exec'd child: a leaked fd keeps the dir "in use" for as long as the child
+// lives, after the broker itself has exited.  Exactly one fd, close-on-exec.
+TEST(EmbeddedDriverRegression, TheDirLockFdIsCloseOnExecAdversarialRegression) {
+    TmpDir d;
+    EmbeddedDriver a(cfgAt(d.path), DriverMode::Invoker);
+    const std::vector<int> fds = fdsOpenOn(d.path.string() + ".lock");
+    ASSERT_EQ(fds.size(), 1u) << "exactly one fd holds the lock";
+    const int flags = ::fcntl(fds[0], F_GETFD);
+    ASSERT_GE(flags, 0);
+    EXPECT_NE(flags & FD_CLOEXEC, 0) << "the lock fd is inherited across exec";
+}
+
+// A constructor that throws AFTER the lock was taken (an idle strategy Aeron refuses) releases it: the next start on
+// the same dir succeeds and no fd on the lock file is left open.
+TEST(EmbeddedDriverRegression, AStartThatThrowsAfterTakingTheLockReleasesItAdversarialRegression) {
+    TmpDir d;
+    auto bad = cfgAt(d.path);
+    bad.idleStrategy = "no-such-idle-strategy";
+    for (int i = 0; i < 3; ++i)
+        EXPECT_THROW(EmbeddedDriver(bad, DriverMode::Threaded), std::runtime_error) << "attempt " << i;
+    EXPECT_TRUE(fdsOpenOn(d.path.string() + ".lock").empty()) << "a failed start leaked the lock fd";
+    EXPECT_NO_THROW(EmbeddedDriver ok(cfgAt(d.path), DriverMode::Invoker));
+}
+
+// Spellings that differ only in trailing slashes name the same dir and the same lock; a stale lock FILE (left by a
+// killed holder, nobody holding it) never blocks a start.
+TEST(EmbeddedDriverRegression, TrailingSlashSpellingsShareOneLockAdversarialRegression) {
+    TmpDir d;
+    {   // a stale lock file and a stale dir: reclaimed
+        fs::create_directories(d.path);
+        { std::FILE* f = std::fopen((d.path.string() + ".lock").c_str(), "w"); ASSERT_NE(f, nullptr); std::fclose(f); }
+    }
+    EmbeddedDriver a(cfgAt(d.path), DriverMode::Invoker);
+    for (const std::string& alias : {d.path.string() + "/", d.path.string() + "//"}) {
+        auto c = cfgAt(d.path);
+        c.dir = alias;
+        EXPECT_THROW(EmbeddedDriver b(c, DriverMode::Invoker), std::runtime_error) << alias;
+    }
 }
 
 TEST(EmbeddedDriverRegression, AeronSpaceCheck) {
