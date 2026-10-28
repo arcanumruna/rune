@@ -103,7 +103,7 @@ bool PollingFdLineSource::next(std::string& line) {
             continue;
         }
         if (n < 0) return false;
-        const ssize_t got = ::read(fd_, buf_.data() + len_, buf_.size() - len_);
+        const ssize_t got = readFn_(fd_, buf_.data() + len_, buf_.size() - len_);
         if (got < 0 && errno == EINTR) continue;
         if (got <= 0) {
             if (len_ == 0 || discarding_) return false;

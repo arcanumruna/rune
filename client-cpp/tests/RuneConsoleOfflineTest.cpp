@@ -316,6 +316,30 @@ TEST(ConsolePollingSourceRegression, PumpsTheClientWhileTheTerminalIsIdle) {
     ::close(fds[0]); ::close(fds[1]);
 }
 
+namespace {
+int g_eagainReads = 0;
+ssize_t eagainThenRead(int fd, void* b, std::size_t n) {   // #672: first read reports EAGAIN, then the real one
+    if (g_eagainReads++ == 0) { errno = EAGAIN; return -1; }
+    return ::read(fd, b, n);
+}
+}
+
+TEST(ConsolePollingSourceRegression, EagainOnANonBlockingFdIsNotEndOfInputRegression) {
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    int idle = 0;
+    rune::cli::console::PollingFdLineSource src(fds[0], &countIdle, &idle);
+    g_eagainReads = 0;
+    src.setReadFnForTest(&eagainThenRead);
+    ASSERT_EQ(::write(fds[1], "line\n", 5), 5);   // poll reports POLLIN, the first read then says EAGAIN
+    std::string line;
+    ASSERT_TRUE(src.next(line)) << "EAGAIN is a spurious wakeup, not end of input";
+    EXPECT_EQ(line, "line");
+    EXPECT_GE(src.idlePumps, 1u);
+    EXPECT_GE(g_eagainReads, 2);
+    ::close(fds[0]); ::close(fds[1]);
+}
+
 TEST(ConsolePollingSourceRegression, AnOverlongLineIsReportedAndDiscardedNotRunTogetherWithTheNextOne) {
     int fds[2];
     ASSERT_EQ(::pipe(fds), 0);

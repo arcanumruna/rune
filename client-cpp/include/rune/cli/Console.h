@@ -63,10 +63,14 @@ struct PollingFdLineSource final : LineSource {
     /// Test seam: the whole read buffer (consumed lines must not linger in it).
     [[nodiscard]] std::string_view heldBytesForTest() const noexcept { return {buf_.data(), buf_.size()}; }
 
+    /// Test seam (#672): replaces ::read so a test can inject EAGAIN after poll reported POLLIN.
+    void setReadFnForTest(ssize_t (*fn)(int, void*, std::size_t)) noexcept { readFn_ = fn; }
+
     uint64_t       idlePumps = 0;        // test seam
     std::ostream*  err       = nullptr;  // where the "input line too long" error goes (null: silent)
 
 private:
+    ssize_t                  (*readFn_)(int, void*, std::size_t) = &::read;
     int                        fd_;
     void                     (*idle_)(void*) noexcept;
     void*                      ctx_;
