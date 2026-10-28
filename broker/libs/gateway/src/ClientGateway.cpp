@@ -7205,6 +7205,19 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             resp.rowLen        = static_cast<uint32_t>(ret.recordCount);
             resp.rowBytes      = rowBytes.data();
             resp.rowBytesLen   = static_cast<uint32_t>(rowBytes.size());
+            // Namespaces Phase 2 Task 12 (D26): a view paused over its namespace's memory limit.  Client >= 14: status
+            // ViewPaused (54) with the paused fold offset (the worker's lastOffset) as 8 LE bytes; older: InvalidRequest.
+            uint8_t pausedOffsetLe[8];
+            if (ret.errorCode == static_cast<int16_t>(pc::ViewRowResponse::kViewPaused)) [[unlikely]] {
+                if (session->clientVersion >= pc::kClientVersionNamespaces) {
+                    for (int b = 0; b < 8; ++b)
+                        pausedOffsetLe[b] = static_cast<uint8_t>(static_cast<uint64_t>(ret.lastOffset) >> (8 * b));
+                    resp.rowBytes    = pausedOffsetLe;
+                    resp.rowBytesLen = 8;
+                } else {
+                    resp.status = pc::ViewRowResponse::kInvalidRequest;
+                }
+            }
             const std::size_t need = resp.encodedSize();
             if (need > kScratchSize) [[unlikely]] {
                 // Fix round 2 (I4): a row larger than the egress frame is answered

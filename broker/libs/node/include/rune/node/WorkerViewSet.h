@@ -92,6 +92,21 @@ namespace rune::node {
 // and monotone (Recovering -> RebuildingViews -> (CatchingUp ->) Ready), except Ready -> CatchingUp on a new source leadership.
 enum class ViewReadiness : uint8_t { Recovering, RebuildingViews, CatchingUp, Ready };
 
+// Namespaces Phase 2 Task 12 (D26): a view's run state over its namespace's memory limit.  ORTHOGONAL to ViewReadiness
+// (a paused view keeps its Ready / CatchingUp state so the resume needs no re-derivation) and a variant, never a flag:
+//   ViewRunning                      - folds as before;
+//   ViewPaused{OverLimit, offset}    - the namespace is over maxViewMemoryBytes: the view stopped folding at `offset`
+//                                      (== its foldCursor) and reads answer ViewPaused (54) with that offset; on resume it
+//                                      folds on from `offset`, so the table equals a recompute from the log.
+enum class ViewPauseReason : uint8_t { OverLimit = 1 };
+struct ViewRunning {};
+struct ViewPaused { ViewPauseReason reason = ViewPauseReason::OverLimit; int64_t offset = 0; };
+using ViewPauseState = std::variant<ViewRunning, ViewPaused>;
+
+// The namespace a source partition (hence its views) lives in, as the owning worker's log tag.  Default = untagged
+// (kNoNsSlot): the instance is not charged to any namespace (unit tests, transient sources, which carry no tag).
+struct NsTag { uint16_t slot = kNoNsSlot; uint32_t nsId = 0; };
+
 // Task 19b: split an on-disk view checkpoint file into its individual Task-12
 // records.  The file a ViewSnapshotIoAgent writes is a BARE concatenation of
 // rune::view::encodeDelta() wire records (the 8-byte routing header is stripped
@@ -222,6 +237,12 @@ struct ViewInstance {
     // RebuildingViews; driveRebuild is the only one that raises it back to Ready.
     ViewReadiness                      readiness       = ViewReadiness::Ready;
 
+    // Task 12 (D26): the view-memory pause, the namespace this instance is charged to, and the bytes charged so far.
+    ViewPauseState                     pause{ViewRunning{}};
+    uint16_t                           nsSlot          = kNoNsSlot;
+    uint32_t                           nsId            = 0;
+    std::size_t                        memCharged      = 0;
+
     // C1 (Task 22 fix round 1): the source replica's leadershipGeneration() this
     // table is caught up under; 0 = never driven by a leader.  A read is served
     // only while it equals the replica's CURRENT generation (an ex-leader's frozen
@@ -341,7 +362,7 @@ public:
     // absent key (terminal NotFound) from a view still rebuilding (RETRIABLE
     // NotReady) from a served row (Ok).  getRow returns the row pointer; this is
     // the out-of-band reason when it returns nullptr.
-    enum class RowStatus : uint8_t { Ok, NotFound, NotReady };
+    enum class RowStatus : uint8_t { Ok, NotFound, NotReady, Paused };
 
     // Readiness of the (view, partition) instance.  Returns Ready when no such
     // instance is hosted here (nothing to gate — consistent with allViewsReady
@@ -375,7 +396,7 @@ public:
     int driveRebuild(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
                      int64_t committedTail, const rune::view::AbortedTxnFilter& aborted, int64_t nowNs,
                      const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
-                     bool leaderHwConfirmed = true) {
+                     bool leaderHwConfirmed = true, NsTag ns = {}) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end()) return 0;
@@ -384,6 +405,7 @@ public:
             auto vit = views_.find(instKey(viewTopicId, partition));
             if (vit == views_.end()) continue;  // not hosted-for-recovery here
             ViewInstance& inst = vit->second;
+            adoptNs_(inst, ns);
             if (inst.readiness == ViewReadiness::Ready) continue;  // already caught up
             work += driveView_(inst, readRange, committedTail, aborted, transientSrc, leaderGen, leaderHwConfirmed);
             if (inst.foldCursor >= committedTail) {
@@ -419,7 +441,7 @@ public:
     int driveFolds(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
                    int64_t bound, const rune::view::AbortedTxnFilter& aborted, int64_t nowNs,
                    const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
-                     bool leaderHwConfirmed = true) {
+                     bool leaderHwConfirmed = true, NsTag ns = {}) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end()) return 0;
@@ -430,6 +452,7 @@ public:
             // driveRebuild/materializeRecoveryInstancesFor already use.
             ViewInstance* inst = getOrCreate_(viewTopicId, partition, bound);
             if (inst == nullptr) continue;  // defensive: template must exist
+            adoptNs_(*inst, ns);
             work += driveView_(*inst, readRange, bound, aborted, transientSrc, leaderGen, leaderHwConfirmed);
         }
         return work;
@@ -473,12 +496,14 @@ public:
     }
     /// The serve path's view of one hosted instance (one lookup): the leadership it is caught up under and how far it
     /// folded (issue #82, the read-your-writes barrier).  nullptr leadership = not hosted.
-    struct InstanceServeState { uint64_t leadership = 0; int64_t foldCursor = 0; bool hosted = false; bool ready = false; };
+    struct InstanceServeState { uint64_t leadership = 0; int64_t foldCursor = 0; bool hosted = false; bool ready = false;
+                                bool paused = false; int64_t pausedOffset = 0; };
     [[nodiscard]] InstanceServeState instanceServeState(int32_t viewTopicId, int32_t partition) const noexcept {
         const auto it = views_.find(instKey(viewTopicId, partition));
         if (it == views_.end()) return {};
+        const ViewPaused* pz = std::get_if<ViewPaused>(&it->second.pause);
         return InstanceServeState{it->second.foldLeadership, it->second.foldCursor, true,
-                                  it->second.readiness == ViewReadiness::Ready};
+                                  it->second.readiness == ViewReadiness::Ready, pz != nullptr, pz ? pz->offset : 0};
     }
 
     /// VLS B.3: is `topicId` a view this worker has the plan of -- i.e. a view SINK id?  Pure read of worker-owned
@@ -489,21 +514,97 @@ public:
     // NsSlotRelease ops (the worker thread is the only caller).  Task 12 (view memory) is its first consumer: a view
     // charges its chunks to its namespace's slot and checks the (slot, nsId) tag with nsTagMatches().
     void onNsSlotAssign(uint16_t slot, uint32_t nsId, const rune::protocol::NamespaceLimits& l) {
-        if (nsSlots_.nsIdAt(slot) != nsId && !nsSlots_.place(slot, nsId)) { ++nsSlotMismatches_; return; }
+        if (nsSlots_.nsIdAt(slot) != nsId) {
+            if (!nsSlots_.place(slot, nsId)) { ++nsSlotMismatches_; return; }
+            nsViewMem_[slot] = 0; nsViewMemOver_[slot] = 0;   // a reused slot starts from zero usage
+        }
         nsSlots_.setLimits(slot, l);
+        recomputeViewMemOver_(slot);   // a raised limit resumes the slot's views on their next pass
     }
-    void onNsSlotRelease(uint16_t slot, uint32_t nsId) { if (!nsSlots_.release(slot, nsId)) ++nsSlotMismatches_; }
+    void onNsSlotRelease(uint16_t slot, uint32_t nsId) {
+        if (!nsSlots_.release(slot, nsId)) { ++nsSlotMismatches_; return; }
+        nsViewMem_[slot] = 0; nsViewMemOver_[slot] = 0;
+    }
+    /// Task 12: the namespace's view memory on this worker (sum of its instances' chunk bytes) and whether it is over.
+    [[nodiscard]] uint64_t nsViewMemBytes(uint16_t slot) const noexcept { return slot < nsViewMem_.size() ? nsViewMem_[slot] : 0; }
+    [[nodiscard]] bool     nsViewMemOver(uint16_t slot) const noexcept { return slot < nsViewMemOver_.size() && nsViewMemOver_[slot] != 0; }
+    [[nodiscard]] uint64_t viewResumesForTest() const noexcept { return viewResumes_; }
+    [[nodiscard]] uint64_t viewPausesForTest() const noexcept { return viewPauses_; }
     [[nodiscard]] bool nsTagMatches(uint16_t slot, uint32_t nsId) noexcept {
         if (nsSlots_.matches(slot, nsId)) return true;
         ++nsSlotMismatches_;
         return false;
     }
-    void configureNsSlots(uint32_t capacity) { nsSlots_.reset(capacity); }
+    void configureNsSlots(uint32_t capacity) {
+        nsSlots_.reset(capacity);
+        nsViewMem_.assign(nsSlots_.capacity(), 0);
+        nsViewMemOver_.assign(nsSlots_.capacity(), 0);
+    }
+    [[nodiscard]] uint32_t nsSlotCapacity() const noexcept { return nsSlots_.capacity(); }
     [[nodiscard]] const NsSlotTable& nsSlotsForTest() const noexcept { return nsSlots_; }
     [[nodiscard]] uint64_t nsSlotMismatchesForTest() const noexcept { return nsSlotMismatches_; }
 private:
     NsSlotTable nsSlots_;
     uint64_t    nsSlotMismatches_ = 0;
+    // Task 12 (D26): per-slot view memory (chunk bytes) and the over-limit byte the fold gate reads.  Worker-owned arrays
+    // sized to the slot table; Task 14 replaces the local over decision with the aggregator's ViewMemOver message.
+    std::vector<uint64_t> nsViewMem_     = std::vector<uint64_t>(NsSlotTable::kDefaultCapacity, 0);
+    std::vector<uint8_t>  nsViewMemOver_ = std::vector<uint8_t>(NsSlotTable::kDefaultCapacity, 0);
+    uint64_t viewPauses_ = 0, viewResumes_ = 0;
+
+    [[nodiscard]] static std::size_t instanceMemory_(const ViewInstance& inst) noexcept {
+        std::size_t m = inst.table.memoryBytes();
+        if (inst.agg) {
+            m += inst.agg->contributors.memoryBytes() + inst.agg->groups.memoryBytes();
+            if (inst.agg->blocks) m += inst.agg->blocks->memoryBytes();
+        }
+        return m;
+    }
+    void recomputeViewMemOver_(uint16_t slot) noexcept {
+        if (slot >= nsViewMemOver_.size()) return;
+        const uint64_t limit = nsSlots_.limits(slot).maxViewMemoryBytes;
+        nsViewMemOver_[slot] = (limit != 0 && nsViewMem_[slot] > limit) ? 1 : 0;
+    }
+    /// Charge the instance's current memory to its slot (one compare when nothing grew).
+    void chargeMem_(ViewInstance& inst) noexcept {
+        if (inst.nsSlot == kNoNsSlot) return;
+        const std::size_t m = instanceMemory_(inst);
+        if (m == inst.memCharged) return;
+        if (!nsSlots_.matches(inst.nsSlot, inst.nsId)) { ++nsSlotMismatches_; return; }   // stale tag: never charge another namespace
+        nsViewMem_[inst.nsSlot] = nsViewMem_[inst.nsSlot] + m - inst.memCharged;
+        inst.memCharged = m;
+        recomputeViewMemOver_(inst.nsSlot);
+    }
+    void releaseMem_(ViewInstance& inst) noexcept {
+        if (inst.nsSlot == kNoNsSlot || inst.memCharged == 0) return;
+        if (nsSlots_.matches(inst.nsSlot, inst.nsId)) {
+            nsViewMem_[inst.nsSlot] -= std::min<uint64_t>(nsViewMem_[inst.nsSlot], inst.memCharged);
+            recomputeViewMemOver_(inst.nsSlot);
+        }
+        inst.memCharged = 0;
+    }
+    /// The first drive that carries the source's namespace tag adopts it (cold, once per instance).
+    void adoptNs_(ViewInstance& inst, NsTag ns) noexcept {
+        if (ns.slot == kNoNsSlot || inst.nsSlot != kNoNsSlot) return;
+        if (!nsSlots_.matches(ns.slot, ns.nsId)) { ++nsSlotMismatches_; return; }
+        inst.nsSlot = ns.slot;
+        inst.nsId   = ns.nsId;
+        chargeMem_(inst);
+    }
+    /// The fold gate: false = the instance is (still) paused.  An array index, an nsId compare and one byte.
+    [[nodiscard]] bool nsViewGate_(ViewInstance& inst) noexcept {
+        const bool over = nsViewMemOver_[inst.nsSlot] != 0 && nsSlots_.matches(inst.nsSlot, inst.nsId);
+        if (std::holds_alternative<ViewPaused>(inst.pause)) {
+            if (over) return false;
+            inst.pause = ViewRunning{};   // resume: the fold continues from foldCursor (== the paused offset)
+            ++viewResumes_;
+            return true;
+        }
+        if (!over) return true;
+        inst.pause = ViewPaused{ViewPauseReason::OverLimit, inst.foldCursor};
+        ++viewPauses_;
+        return false;
+    }
 public:
     [[nodiscard]] bool viewOutputFingerprint(int32_t viewTopicId, uint64_t& out) const {
         const auto it = templates_.find(viewTopicId);
@@ -622,6 +723,9 @@ private:
                    const rune::view::AbortedTxnFilter& aborted,
                    const TransientBounds* transientSrc, uint64_t leaderGen, bool leaderHwConfirmed) {
         int work = 0;
+        // 00. Task 12 (D26): the namespace is over its view-memory limit -> pause at foldCursor (reads answer
+        //     ViewPaused); back under it -> resume from that same foldCursor.  Untagged instances skip this.
+        if (inst.nsSlot != kNoNsSlot && !nsViewGate_(inst)) return work;
         // 0. Phase 2b E: a TRANSIENT source — reconcile THIS instance's cursor
         //    against the source's live range (no extra hash lookups: the caller
         //    already holds the instance).  Disk sources pass nullptr.
@@ -691,6 +795,7 @@ private:
                      : rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view,
                                              passBound, cursor, aborted);
         inst.foldCursor = cursor;
+        chargeMem_(inst);   // Task 12: the pass may have appended chunks
         work += static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted +
                                  st.skippedMalformed + st.skippedNoGroup);
         inst.counters.skippedAborted   += st.skippedAborted;

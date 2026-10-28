@@ -682,7 +682,11 @@ public:
     // BrokerNode (Task 19), before the runner starts — single-threaded, like
     // setOwnedDirect().  nullptr (the default) => the view-fold drive in
     // doWork is skipped entirely; the duty cycle is bit-for-bit unchanged.
-    void setViewSet(WorkerViewSet* vs) noexcept { viewSet_ = vs; }
+    void setViewSet(WorkerViewSet* vs) noexcept {
+        viewSet_ = vs;
+        // Task 12: the view set's per-slot arrays follow this worker's slot table size.
+        if (vs != nullptr && vs->nsSlotCapacity() != nsSlots_.capacity()) vs->configureNsSlots(nsSlots_.capacity());
+    }
     [[nodiscard]] WorkerViewSet* viewSet() const noexcept { return viewSet_; }
 
     // Task 16: this worker's view restart-readiness, for the GetViewRow serve
@@ -4144,6 +4148,12 @@ private:
                 return ViewServe::Answered;
             }
             const WorkerViewSet::InstanceServeState st = viewSet_->instanceServeState(viewTopicId, partition);
+            if (st.paused) [[unlikely]] {   // Task 12 (D26): over the namespace's view memory; lastOffset = the paused offset
+                ret.errorCode  = static_cast<int16_t>(RS::kViewPaused);
+                ret.lastOffset = st.pausedOffset;
+                enqueueReturn_(std::move(ret));
+                return ViewServe::Answered;
+            }
             if (!st.hosted || st.leadership != srcRep->leadershipGeneration()) {   // not folded under THIS leadership yet
                 ret.errorCode = static_cast<int16_t>(RS::kNotReady);
                 enqueueReturn_(std::move(ret));
@@ -4176,6 +4186,8 @@ private:
             return ViewServe::Answered;
         } else if (rs == WorkerViewSet::RowStatus::NotReady) {
             ret.errorCode = static_cast<int16_t>(RS::kNotReady);
+        } else if (rs == WorkerViewSet::RowStatus::Paused) {
+            ret.errorCode = static_cast<int16_t>(RS::kViewPaused);
         } else {
             ret.errorCode = static_cast<int16_t>(RS::kAbsentKey);
         }
@@ -6587,7 +6599,7 @@ private:
                     return readNoFault_(log, from, kPushMaxChunkBytes, to);
                 };
                 work += driveViewsOf_(topicId, partition, readRange, bound, aborted, nowNs, nullptr,
-                                      replica->leadershipGeneration(), hwConfirmed);
+                                      replica->leadershipGeneration(), hwConfirmed, NsTag{log->nsSlot(), log->nsId()});
             } else {
                 // Phase 2b E: a TRANSIENT source — zero-copy view into the
                 // replica's own ring (same thread).  The fold itself stops at its
@@ -6627,7 +6639,7 @@ private:
     int driveViewsOf_(int32_t topicId, int32_t partition, ReadRangeFn& readRange,
                       int64_t bound, const rune::view::AbortedTxnFilter& aborted, int64_t nowNs,
                       const rune::replication::PartitionReplica* transientRep,
-                      uint64_t leaderGen, bool leaderHwConfirmed) {
+                      uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns = {}) {
         int work = 0;
         TransientBounds tb;
         const TransientBounds* tbp = nullptr;
@@ -6643,10 +6655,10 @@ private:
         if (viewSet_->hasRecovery()) [[unlikely]] {
             viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
             work += viewSet_->driveRebuild(topicId, partition, readRange, bound, aborted, nowNs, tbp, leaderGen,
-                                           leaderHwConfirmed);
+                                           leaderHwConfirmed, ns);
         }
         work += viewSet_->driveFolds(topicId, partition, readRange, bound, aborted, nowNs, tbp, leaderGen,
-                                     leaderHwConfirmed);
+                                     leaderHwConfirmed, ns);
         return work;
     }
 

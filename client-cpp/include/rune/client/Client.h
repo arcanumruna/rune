@@ -220,6 +220,9 @@ struct ViewRowResult {
     static constexpr uint16_t kBusy            = 6;
     static constexpr uint16_t kRowTooLarge     = 7;   ///< the row exceeds the broker's egress frame (no bytes)
     static constexpr uint16_t kNotAuthorized   = 45;  ///< the session may not READ the view (no bytes; never retried)
+    /// The view is paused over its namespace's memory limit (client version 14); rowBytes = the paused fold offset as one
+    /// little-endian i64 (8 bytes).  Retriable once the limit is raised or memory falls.
+    static constexpr uint16_t kViewPaused      = 54;
     /// Client-side only: the view's source-partition leader was not reached within
     /// the retry budget; never sent by a broker.  NB: a GetViewRow's deadline is
     /// pingTimeoutMs (not ddlTimeoutMs); when that is shorter than ddlRetryBudget

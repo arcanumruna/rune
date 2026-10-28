@@ -1838,6 +1838,13 @@ if(BUILD_TESTING)
                               rune_client_api aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_ns_disk_limit_tests PROPERTIES TIMEOUT 900)
 
+        # Namespaces Phase 2 Task 12 (D26): the namespace view-memory limit pauses views at an offset and resumes them.
+        add_executable(rune_ns_view_memory_tests tests/node/NsViewMemoryRegressionTest.cpp)
+        target_include_directories(rune_ns_view_memory_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_ns_view_memory_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
+                              aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_ns_view_memory_tests PROPERTIES TIMEOUT 300)
+
         # Namespaces Phase 2 Task 7 (D17, D18; rule 16): the namespace reaper - the state machine over a real CatalogState,
         # and three real AdminWorkers (leader change after each durable step).
         add_executable(rune_namespace_reaper_tests tests/node/NamespaceReaperRegressionTest.cpp)

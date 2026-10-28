@@ -24,6 +24,7 @@ enum class LimitArea : uint8_t {
     Connections,  // gateway, per node (Task 10)
     Txn,          // transaction coordinator (Task 10)
     Disk,         // worker, per node (Task 11)
+    ViewMemory,   // worker's view set (Task 12)
 };
 
 enum class LimitCell : uint8_t { Below = 0, At = 1, Above = 2 };
@@ -65,6 +66,8 @@ inline constexpr std::array kLimitRows = {
     LimitRow{"max-txn-time-ms",          22, LimitArea::Txn,     30000, 52, "InitProducerId(timeout)",     "a timeout == the maximum"},
     // ---- Task 11: disk ---------------------------------------------------------------------------------------
     LimitRow{"max-disk-bytes",            8, LimitArea::Disk, 16384, 52, "leader produce",            "the produce that brings usage to the limit"},
+    // ---- Task 12: view memory (limit = 2 table chunks; codeAbove 54 = ViewPaused, the read answer of a paused view) ------
+    LimitRow{"max-view-memory-bytes",    23, LimitArea::ViewMemory,   2, 54, "GetViewRow after the fold", "the fold that brings the view to exactly the limit still serves"},
 };
 // clang-format on
 

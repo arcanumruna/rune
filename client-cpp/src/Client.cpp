@@ -2873,7 +2873,8 @@ ViewRowResult Client::getViewRowAndWait(int32_t viewTopicId, uint64_t keyU64, ui
                  // Closed) is.
                  if (c.status != OpStatus::BrokerError) throwForStatus_("getViewRow()", c, p);
                  result.status = (c.status == OpStatus::Ok) ? ViewRowResult::kOk : c.errorCode;
-                 if (result.status == ViewRowResult::kOk) result.rowBytes.assign(p.begin(), p.end());
+                 if (result.status == ViewRowResult::kOk || result.status == ViewRowResult::kViewPaused)
+                     result.rowBytes.assign(p.begin(), p.end());   // kViewPaused: the paused offset, 8 LE bytes
              });
     return result;
 }

@@ -1142,7 +1142,9 @@ Review Focus list and the matrix).
   client picks `acks` per request.
 - **Connections per node:** the connection limit is per node, not cluster-wide, so it needs no cross-node
   coordination on the login path.
-- **View-memory overshoot:** a view may exceed its limit by at most one event batch before it pauses.
+- **View-memory overshoot:** a view may exceed its limit by at most one fold pass (one batch) plus one table chunk per
+  view before it pauses; with the Task 14 aggregator, by one tick of folds plus one chunk per view. Over means
+  usage > limit (a view exactly at its limit still folds).
 - **No version bump:** the new codes are gated on client ≥ 14 and no wire layout changes for older peers; there are
   no mixed-version clusters.
 - **Phase 1 limits size:** the limits record is 256 bytes with 29 fields (`28*8 + 4 + 4 + 3*8`), not 272 bytes and
