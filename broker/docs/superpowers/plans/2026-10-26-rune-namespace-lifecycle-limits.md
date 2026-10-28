@@ -1190,3 +1190,20 @@ Run the plan with superpowers:subagent-driven-development:
 
 Implementers never spawn subagents; at most 3 agents run at once. Root-cause diagnosis of any red test stays with the
 controller (CLAUDE.md rule 14).
+
+## Execution status (2026-10-28)
+
+- **Done and pushed** on `claude/tender-wozniak-co3crp`: Tasks 1–16 (Batches 1–3), the post-Batch-3 checkpoint fixes
+  (`2743a1be`) and the Task 15 ABAB baseline (`d322cff0`, in BENCHMARKING.md).
+- **Checkpoint after Batch 3:** full local `-R Regression -LE latency` green except one ENOSPC-only failure
+  (container disk) and two load flakes (#695). The sanitizer workflow re-run on `2743a1be` was in progress; the first
+  run (on `7ba1c2b9`) showed TSan/ASan failures in `ConsensusCandidacyElectionRegression` (wall-clock window),
+  `ShardModeRegression.SequentialShardResolveKeepsEarlierShardsAlive`,
+  `FilterBrokerCell.Cell/Group_EqAndIn_LeaderMove`, `AuthDdlAnswerStallRegression.SubscribeRacingRevokeStaysEndedShard`,
+  `AuthStressRegression.SeededRandomGrantRevokeTrafficHoldsEveryInvariant` (all green in the plain build) and one TSan
+  shard killed for memory. Next: read that run, root-cause what still fails, rerun only failed tests.
+- **Next:** Batch 4 = Tasks 17–20 (one implementer, focused tests at the end), then the full suite + ASan/TSan once
+  more and the final whole-branch review. Phase 3 is not approved.
+- **Process rules (owner):** batches of 4–5 tasks per mid-tier implementer, no per-task test or review rounds; focused
+  tests after each batch; full Regression + sanitizers only every 3 batches (and once before the final review).
+- **Parked issues from Phase 2:** #661, #662, #663, #695, #696, #697.
