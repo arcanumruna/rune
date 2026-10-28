@@ -3158,6 +3158,9 @@ int Client::dutyCycle(int64_t nowNs) {
             if (coordIdx() != 0) [[unlikely]] syncCoordinatorSession_();
             const int64_t gsid = coordSessionId_();  // the coordinator's session (the seed's by default)
             work += groupConsumerHub_.flushRequestedCommits(gsid);
+            // #371: a pending seek / seekToCommitted progresses on THIS pass (its OffsetFetch answer, its
+            // resubscribe, its completion), not on the 100 ms sweep.
+            work += groupConsumerHub_.driveRewinds(nowNs, gsid, coordSendFn_);
             if (groupConsumerHub_.pendingLeaves() != 0) work += groupConsumerHub_.retryPendingLeaves(gsid);
             // M2: refused fetch Unsubscribes are re-offered every pass until sent / moot.
             if (groupConsumerHub_.pendingFetchUnsubscribes() != 0) work += groupConsumerHub_.retryFetchUnsubscribes();
@@ -3507,7 +3510,7 @@ void Client::sweepTimeouts(int64_t nowNs) {
         // LOW-2), and MEDIUM-2: OffsetFetch for start offsets still unknown.
         (void)groupConsumerHub_.reconcileFetch();
         (void)groupConsumerHub_.retryOffsetFetch(nowNs, gsid, sendFn);
-        // F8c C4: commitSync deadlines on the duty clock -> Timeout.
+        // F8c C4: commitSync deadlines on the duty clock -> Timeout (a rewind progresses per pass: driveRewinds).
         (void)groupConsumerHub_.sweepCommitSyncTimeouts(nowNs);
     }
 

@@ -257,6 +257,17 @@ struct GroupConsumerImpl {
     static constexpr int64_t kUnseededSentinel = -1;
     std::map<TopicPartition, int64_t>   assignment;   // topicPartition → nextOffset (or sentinel)
 
+    /// C16 (#357.4): where this partition is in a seek / seekToCommitted (the pending `rewind` waits on every
+    /// partition that is not Bound).  Transitions: a rewind applied -> RewindAwaitingOffset (seekToCommitted: the
+    /// start offset is unknown) or RewindAwaitingRebind (seek: the offset is given); an OffsetFetch answer that seeds
+    /// it, or advanceRewind_ seeing offsetKnown, -> RewindAwaitingRebind; its new subscription bound -> Bound; the
+    /// rewind ending (any status, incl. close / rejoin: completeRewind_) -> Bound; revoke / rejoin erase the entry.
+    enum class FetchPhase : uint8_t {
+        Bound,                 ///< no rewind owns it
+        RewindAwaitingOffset,  ///< restarted, position unseeded (offsetKnown == false): waits for the OffsetFetch answer
+        RewindAwaitingRebind,  ///< start offset known: waits for its new subscription to bind (an answer never moves it)
+    };
+
     // Fetch routing (distributed partition leadership; duty thread only).  One
     // entry per assigned partition while Stable: the ONE subscription instance
     // whose records this member accepts for it (C1).  The member subscribes
@@ -274,7 +285,8 @@ struct GroupConsumerImpl {
         bool     offsetKnown    = false;  // OffsetFetch answered (OK) for it this generation
         bool     parked         = false;  // refused: retried on fresh metadata
         uint32_t rewindEpoch    = 0;      // bumped by every rewind applied to this partition (a delivery callback's seek wins over the post-callback advance)
-        bool     rewound        = false;  // Task 10: restarted by a seek, not yet re-bound (the pending Rewind waits on it)
+        FetchPhase phase        = FetchPhase::Bound;
+        int64_t  staleFetchCorr = 0;      // #357.5: the OffsetFetch in flight when a seek positioned this partition - its answer must not move it
         uint8_t  redirects      = 0;      // consecutive Redirects without a bind
         uint8_t  egressRefusals = 0;      // PR #441 F4: RecordEgressUnavailable answers since the last bind
         uint8_t  authUnavailable = 0;     // C4 review (#607): AuthUnavailable (48) answers since the last bind
@@ -530,14 +542,20 @@ public:
     ///   (or the group was not Stable when applied);  SessionLost — the session went down;
     ///   Timeout     — GroupConfig::commitSyncTimeoutMs of duty time;  Closed — close() / Client close.
     /// Records already handed to onRecords before the command applied stay delivered.
+    /// Background completion (#357.3): Timeout and SessionLost end only the COMPLETION.  The rewound partitions are
+    /// not undone: their positions stay unseeded (nothing is auto-committed for them) and the consumer keeps
+    /// re-fetching the committed offsets and resubscribing from them in the background once the session / answer is
+    /// back, so the rewind still converges; only a caller that needs to know WHEN must issue it again.
     /// Synchronous rejections are those of commitSync.  Callable from inside a callback.
     OpResult seekToCommitted(CompletionTarget target, Token token);
     /// Cold-path blocking form; throws SessionLostError on SessionLost, GroupOpError on any other non-Ok outcome.
     void seekToCommittedAndWait(std::chrono::nanoseconds timeout = std::chrono::seconds(60));
 
     /// Restart ONE assigned partition at `offset` (the others are untouched).  Completion as
-    /// seekToCommitted (op = OpKind::Seek), plus OpStatus::InvalidArgument (payload "partition not
-    /// assigned") when `tp` is not in the assignment — that check needs duty-side state (G6).
+    /// seekToCommitted (op = OpKind::Seek, including the background completion of Timeout / SessionLost), plus
+    /// OpStatus::InvalidArgument (payload "partition not assigned") when the group is Stable and `tp` is not in the
+    /// assignment — that check needs duty-side state (G6).  While the group is NOT Stable (a rebalance) it completes
+    /// Rejoined, exactly like seekToCommitted: a transient condition, not a caller error.
     OpResult seek(TopicPartition tp, int64_t offset, CompletionTarget target, Token token);
     /// Fire-and-forget: issues the token form with an internal handler and drops the COMPLETION: an
     /// unassigned partition is reported only by the token / AndWait forms (G6).  A refusal at
@@ -545,8 +563,8 @@ public:
     /// bounded time then throws std::runtime_error; WrongThread / Closed throw std::runtime_error
     /// naming the status; offset < 0 throws std::invalid_argument.
     void seek(TopicPartition tp, int64_t offset);
-    /// Cold-path blocking form; throws std::invalid_argument for an unassigned partition,
-    /// SessionLostError on SessionLost, GroupOpError on any other non-Ok outcome.
+    /// Cold-path blocking form; throws std::invalid_argument for an unassigned partition (group Stable),
+    /// SessionLostError on SessionLost, GroupOpError (Rejoined while rebalancing) on any other non-Ok outcome.
     void seekAndWait(TopicPartition tp, int64_t offset, std::chrono::nanoseconds timeout = std::chrono::seconds(60));
 
     /// Deactivate this consumer: no more dispatch occurs, a pending commitSync

@@ -3055,7 +3055,13 @@ protected:
         sink_.clear();
         fr_.offers.clear();
     }
-    int sweep(int64_t atNs) { g_hubNowNs = atNs; return hub_->sweepCommitSyncTimeouts(atNs); }
+    // C16 (#371): a pending rewind progresses on every duty pass (driveRewinds), the commitSync / retry timers on the
+    // 100 ms sweep: the Client runs both on a sweep pass, so this helper does too.
+    int sweep(int64_t atNs) {
+        g_hubNowNs = atNs;
+        const int n = hub_->driveRewinds(atNs, kSessionId, sink_.fn());
+        return n + hub_->sweepCommitSyncTimeouts(atNs);
+    }
     FakeFetchRouter fr_;
 };
 

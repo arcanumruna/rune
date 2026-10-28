@@ -2477,7 +2477,7 @@ TEST(OffsetCommitDurabilityRegression, AFetchOfAParkedCommitIsRetriableUntilItsR
         static int32_t of(void* ctx, int64_t) noexcept { return static_cast<Version*>(ctx)->v; }
     };
     const auto unstable = static_cast<int16_t>(pc::ErrorCode::UnstableOffsetCommit);
-    const auto notCoord = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+    const auto notCoord = static_cast<int16_t>(pc::ErrorCode::NotLeader);   // #472: what a client below 10 is answered
     for (const int32_t version : {10, 9}) {
         SCOPED_TRACE(::testing::Message() << "version=" << version);
         const std::string group = "g471v" + std::to_string(version);
@@ -2650,7 +2650,7 @@ TEST(OffsetCommitDurabilityRegression, AFullParkRefusesNotCoordinatorWithoutAppe
 }
 
 // #438 × request kind × client version: Free serves; Held / Unknown answer the retriable code (50 to a client >= 10
-// or of unknown version, NotCoordinator below) and append nothing.
+// or of unknown version, NotLeader below - #472) and append nothing.
 TEST(OffsetCommitDurabilityRegression, HoldStateByRequestByClientVersionMatrixRegression) {
     using H = rune::coordination::TxnOffsetHold;
     struct Probe {
@@ -2662,7 +2662,7 @@ TEST(OffsetCommitDurabilityRegression, HoldStateByRequestByClientVersionMatrixRe
         static int32_t of(void* ctx, int64_t) noexcept { return static_cast<Version*>(ctx)->v; }
     };
     const auto unstable = static_cast<int16_t>(pc::ErrorCode::UnstableOffsetCommit);
-    const auto notCoord = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+    const auto notCoord = static_cast<int16_t>(pc::ErrorCode::NotLeader);   // #472: what a client below 10 is answered
     int row = 0;
     for (const H hold : {H::Free, H::Held, H::Unknown}) {
         for (const int32_t version : {-1, 9, 10}) {
@@ -2701,6 +2701,70 @@ TEST(OffsetCommitDurabilityRegression, HoldStateByRequestByClientVersionMatrixRe
                 EXPECT_EQ(CommitRig::codeOf(g.out, n), refused);
                 EXPECT_EQ(g.rep.logEndOffset(), leo) << "a plain record was appended over a held key";
             }
+        }
+    }
+}
+
+// #472: a client below 10 does not know UnstableOffsetCommit (50).  The code it is answered for a transaction-held
+// offset must be one its v9 hub waits out WITHOUT leaving the group: v9 classifyGroupAnswer_ sends NotCoordinator /
+// RebalanceInProgress / UnknownMember / IllegalGeneration / StaleGeneration to a REJOIN (a rebalance of the whole
+// group per answer, for as long as the hold lasts), and every code outside the rejoin / refuse sets (NotLeader among
+// them) to a paced re-fetch.  Pinned per request type (OffsetFetch, fetch-all, plain OffsetCommit) and version.
+// RED (the old NotCoordinator for version 9): the v9 rows answer a rejoin code.
+TEST(OffsetCommitDurabilityRegression, OldClientHeldOffsetAnswerNeverForcesARejoinRegression) {
+    using H = rune::coordination::TxnOffsetHold;
+    struct Probe {
+        H hold = H::Held;
+        static H of(void* ctx, const std::string&, const TopicPartition&) { return static_cast<Probe*>(ctx)->hold; }
+    };
+    struct Version {
+        int32_t v = -1;
+        static int32_t of(void* ctx, int64_t) noexcept { return static_cast<Version*>(ctx)->v; }
+    };
+    // The codes a v9 GroupConsumerHub answers with a rejoin (classifyGroupAnswer_ -> GroupVerdict::Rejoin).
+    const auto isV9Rejoin = [](int16_t code) {
+        using EC = pc::ErrorCode;
+        const auto ec = static_cast<EC>(code);
+        return ec == EC::NotCoordinator || ec == EC::RebalanceInProgress || ec == EC::UnknownMember ||
+               ec == EC::IllegalGeneration || ec == EC::StaleGeneration;
+    };
+    struct Row { int32_t version; pc::ErrorCode want; };
+    const Row rows[] = {{9, pc::ErrorCode::NotLeader}, {5, pc::ErrorCode::NotLeader},
+                        {10, pc::ErrorCode::UnstableOffsetCommit}, {pc::kClientVersion, pc::ErrorCode::UnstableOffsetCommit},
+                        {-1, pc::ErrorCode::UnstableOffsetCommit}};
+    int n = 0;
+    for (const H hold : {H::Held, H::Unknown}) {
+        for (const Row& row : rows) {
+            const std::string group = "g472_" + std::to_string(n++);
+            SCOPED_TRACE(::testing::Message() << "hold=" << static_cast<int>(hold) << " version=" << row.version);
+            CommitRig g(group);
+            Probe probe{H::Free};
+            Version ver{row.version};
+            g.svc.setClientVersionResolverForTest(&Version::of, &ver);
+            ASSERT_EQ(g.commit(group, 40), 0u);
+            g.fetch();
+            g.svc.doWork(g.clock);
+            probe.hold = hold;
+            g.svc.setTxnOffsetHoldProbe(&Probe::of, &probe);
+            const auto want = static_cast<int16_t>(row.want);
+            // OffsetFetch of one entry
+            std::size_t len = g.svc.handleOffsetFetch(g.req, encodeOffsetFetch(g.req, 1, g.corr++, group, kTestTopicId, 0),
+                                                      g.clock, g.out, sizeof g.out);
+            auto f = pc::OffsetFetchResponse::decode(g.out, len);
+            ASSERT_TRUE(f && f->results.size() == 1u);
+            EXPECT_EQ(f->results[0].errorCode, want) << "OffsetFetch";
+            EXPECT_FALSE(row.version >= 0 && row.version < 10 && isV9Rejoin(f->results[0].errorCode));
+            // OffsetFetch of every committed offset
+            len = g.svc.handleOffsetFetch(g.req, encodeOffsetFetchAll(g.req, 1, g.corr++, group), g.clock, g.out, sizeof g.out);
+            f = pc::OffsetFetchResponse::decode(g.out, len);
+            ASSERT_TRUE(f && f->results.size() == 1u);
+            EXPECT_EQ(f->results[0].errorCode, want) << "OffsetFetch (all)";
+            EXPECT_FALSE(row.version >= 0 && row.version < 10 && isV9Rejoin(f->results[0].errorCode));
+            // plain OffsetCommit
+            len = g.commit(group, 41);
+            ASSERT_GT(len, 0u);
+            EXPECT_EQ(CommitRig::codeOf(g.out, len), want) << "OffsetCommit";
+            EXPECT_FALSE(row.version >= 0 && row.version < 10 && isV9Rejoin(CommitRig::codeOf(g.out, len)));
         }
     }
 }
@@ -4289,7 +4353,7 @@ TEST(GroupCoordinationServiceRegression, SessionTimeoutBelowTheMinimumIsRaisedTo
 // ===========================================================================
 // #498: a fetch-all answered only the retriable {-1, -1} sentinel while ANY key of the group had a record above the
 // high watermark, so steady commits on one key starved a listing of all the others.  Each unstable key is now listed
-// with the retriable code (UnstableOffsetCommit from client 10, NotCoordinator below) and offset -1 - exactly as a
+// with the retriable code (UnstableOffsetCommit from client 10, NotLeader below - #472) and offset -1 - exactly as a
 // specific fetch answers it - and every stable key with its offset.  #471 holds: an unstable value is never served.
 // ===========================================================================
 namespace {
@@ -4333,7 +4397,7 @@ TEST(OffsetCommitDurabilityRegression, AFetchAllListsStableKeysWhileAnotherKeyIs
         FetchVersion498 ver{version};
         g.svc.setClientVersionResolverForTest(&FetchVersion498::of, &ver);
         const auto retriable = static_cast<int16_t>(version >= 10 ? pc::ErrorCode::UnstableOffsetCommit
-                                                                  : pc::ErrorCode::NotCoordinator);
+                                                                  : pc::ErrorCode::NotLeader);
         ASSERT_EQ(commit498(g, group, kTestTopicId, 0, 11), 0u);
         ASSERT_EQ(commit498(g, group, kTestTopicId, 1, 22), 0u);
         g.fetch();
@@ -4800,7 +4864,7 @@ TEST(GroupCoordinationServiceRegression, TheLargestMemberLeavingMidRebalanceLeav
 }
 
 // Version skew (#498): for every client version, a fetch-all lists a stable key with its offset and an unstable key
-// with exactly the code a specific fetch of that key answers (UnstableOffsetCommit from 10, NotCoordinator below), never
+// with exactly the code a specific fetch of that key answers (UnstableOffsetCommit from 10, NotLeader below - #472), never
 // a value.  RED (UnstableOffsetCommit for every version): the rows below 10 differ from the specific fetch.
 TEST(OffsetCommitDurabilityRegression, AFetchAllAnswersEachUnstableKeyLikeASpecificFetchForEveryClientVersionAdversarialRegression) {
     for (const int32_t version : {pc::kClientVersion, 10, 9, 5, 4, 1}) {
@@ -4814,7 +4878,7 @@ TEST(OffsetCommitDurabilityRegression, AFetchAllAnswersEachUnstableKeyLikeASpeci
         g.svc.doWork(g.clock);
         ASSERT_EQ(commitCode616(g, group, g.member, g.gen, 1, 22), 0);   // parked: above the high watermark
         const auto want = static_cast<int16_t>(version >= 10 ? pc::ErrorCode::UnstableOffsetCommit
-                                                             : pc::ErrorCode::NotCoordinator);
+                                                             : pc::ErrorCode::NotLeader);
         const auto specific = fetchOne616(g, group, 1);
         EXPECT_EQ(specific, std::make_pair(want, int64_t{-1}));
         const auto all = fetchAll498(g, group);

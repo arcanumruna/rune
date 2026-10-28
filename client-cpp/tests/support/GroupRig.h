@@ -43,6 +43,11 @@ struct RigOptions {
     int64_t connectTimeoutMs  = 0;  // 0 = the client default
     bool    reconnectForever  = false;
     int64_t pingTimeoutMs     = 0;  // 0 = the client default
+    // C16: an injected duty clock.  nanoClock = the client's clock function; when manualNs is set, drive() adds
+    // stepNs to *manualNs once per pass (stepNs = 0 freezes the clock).  nullptr = the real steady clock.
+    rc::NanoClock nanoClock   = nullptr;
+    int64_t*      manualNs    = nullptr;
+    int64_t       stepNs      = 0;
 };
 
 struct GroupRig {
@@ -96,6 +101,7 @@ struct GroupRig {
         c.responseTimeoutNs   = o.responseTimeoutNs;
         if (o.connectTimeoutMs > 0) c.connectTimeoutMs = o.connectTimeoutMs;
         c.reconnectForeverAfterLive = o.reconnectForever;
+        c.nanoClock = o.nanoClock;
         if (o.pingTimeoutMs > 0) c.pingTimeoutMs = o.pingTimeoutMs;
         rc::TopicSpec ts;
         ts.name           = "t";
@@ -112,6 +118,7 @@ struct GroupRig {
     template <class P>
     bool drive(P&& pred, int cap = 400'000) {
         for (int i = 0; i < cap; ++i) {
+            if (opt.manualNs != nullptr) *opt.manualNs += opt.stepNs;
             client.doWork();
             gw.pump();
             if (pred()) return true;

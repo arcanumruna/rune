@@ -147,7 +147,7 @@ void GroupConsumerHub::completeRewind_(GroupConsumerImpl& impl, OpStatus st, std
     // Cleared BEFORE delivery: a handler may issue a new rewind (applied directly on this
     // thread) — it must find none pending to supersede.
     impl.rewind = R::NoRewind{};
-    for (auto& [tp, fs] : impl.fetch) fs.rewound = false;
+    for (auto& [tp, fs] : impl.fetch) fs.phase = GroupConsumerImpl::FetchPhase::Bound;
     Completion c;
     c.token = token;
     c.op    = kind;
@@ -169,13 +169,13 @@ bool GroupConsumerHub::rewindInFlight_(const GroupConsumerImpl& impl) noexcept {
 bool GroupConsumerHub::rewindAdmissible_(const GroupConsumerImpl& impl, bool isSeek, const TopicPartition& seekTp,
                                          OpStatus& st, std::string_view& text) const {
     if (!impl.active) { st = OpStatus::Closed; return false; }
-    if (isSeek) {
-        if (impl.state != GroupConsumerState::Stable || impl.assignment.find(seekTp) == impl.assignment.end()) {
-            st = OpStatus::InvalidArgument; text = "partition not assigned"; return false;
-        }
-    } else if (impl.state != GroupConsumerState::Stable) {
-        // The (re)join re-seeds every position from the committed offsets anyway.
+    if (impl.state != GroupConsumerState::Stable) {
+        // The (re)join re-seeds every position from the committed offsets anyway: a transient condition, not a
+        // caller error (#357.1) - seek and seekToCommitted answer the same.
         st = OpStatus::Rejoined; return false;
+    }
+    if (isSeek && impl.assignment.find(seekTp) == impl.assignment.end()) {
+        st = OpStatus::InvalidArgument; text = "partition not assigned"; return false;
     }
     if (!routed_()) { st = OpStatus::InvalidArgument; text = "fetch routing unavailable"; return false; }
     return true;
@@ -223,12 +223,21 @@ void GroupConsumerHub::advanceRewind_(GroupConsumerImpl& impl, int64_t nowNs) {
         return;
     }
     // A rewound partition is re-bound once its new subscription is answered / fed.
+    using Phase = R::FetchPhase;
     bool anyUnknown = false, anyUnbound = false;
     for (auto& [tp, fs] : impl.fetch) {
-        if (!fs.rewound) continue;
-        if (!fs.offsetKnown) { anyUnknown = true; continue; }
-        if (fs.epoch != 0 && fs.subscriptionId != 0) fs.rewound = false;
-        else anyUnbound = true;
+        switch (fs.phase) {
+        case Phase::Bound:
+            break;
+        case Phase::RewindAwaitingOffset:
+            if (!fs.offsetKnown) { anyUnknown = true; break; }
+            fs.phase = Phase::RewindAwaitingRebind;   // the answer seeded it
+            [[fallthrough]];
+        case Phase::RewindAwaitingRebind:
+            if (fs.epoch != 0 && fs.subscriptionId != 0) fs.phase = Phase::Bound;
+            else anyUnbound = true;
+            break;
+        }
     }
     if (auto* a = std::get_if<R::RewindAwaitFetch>(&impl.rewind)) {
         if (anyUnknown) return;
@@ -294,7 +303,9 @@ void GroupConsumerHub::startRewind_(GroupConsumerImpl* impl, OpKind kind, const 
         dropFetch_(tp, fs);        // pushes of the old instance are ignored (instance identity)
         pos             = newPos;  // kUnseededSentinel: auto-commit can never commit a stale position
         fs.offsetKnown  = known;
-        fs.rewound      = true;
+        fs.phase        = known ? R::FetchPhase::RewindAwaitingRebind : R::FetchPhase::RewindAwaitingOffset;
+        // #357.5: a seek positions the partition itself - the fetch in flight (if any) must not move it later.
+        fs.staleFetchCorr = known ? impl->offsetFetchCorrId : 0;
         ++fs.rewindEpoch;          // a callback-applied rewind survives the post-callback advance
         fs.parked       = false;
         fs.redirects    = 0;
@@ -307,24 +318,37 @@ void GroupConsumerHub::startRewind_(GroupConsumerImpl* impl, OpKind kind, const 
         for (auto& [tp, pos] : impl->assignment) restart(tp, pos, GroupConsumerImpl::kUnseededSentinel, /*known=*/false);
         impl->rewind = R::RewindAwaitFetch{kind, target, token, deadlineNs, impl->generationId};
     }
-    // An OffsetFetch in flight may predate the rewind (its committed offsets could be older than
-    // a commit already sent): its answer is ignored; the retry pass sends a fresh one for the
-    // partitions whose start offset is unknown.
-    impl->offsetFetchCorrId     = 0;
-    impl->offsetFetchPhase      = GroupConsumerImpl::OffsetFetchPhase::Idle;
-    impl->offsetFetchDueNs      = 0;
-    impl->offsetFetchBackoffNs  = 0;
+    // seekToCommitted: an OffsetFetch in flight may predate the rewind (its committed offsets could be older than
+    // a commit already sent): its answer is ignored; the next pass sends a fresh one for the partitions whose start
+    // offset is unknown.  A seek (#357.5) covers only partitions it positions itself (fenced by staleFetchCorr), so
+    // an unrelated Assign fetch in flight is kept: its answer still seeds the other partitions.
+    if (!isSeek) {
+        impl->offsetFetchCorrId     = 0;
+        impl->offsetFetchPhase      = GroupConsumerImpl::OffsetFetchPhase::Idle;
+        impl->offsetFetchDueNs      = 0;
+        impl->offsetFetchBackoffNs  = 0;
+    }
     if (isSeek) (void)reconcileImpl_(*impl);   // the start offset is known: resubscribe now
+}
+
+int GroupConsumerHub::driveRewinds(int64_t nowNs, int64_t sessionId, const SendFn& sendFn) {
+    int n = 0;
+    for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
+        GroupConsumerImpl* const impl = impls_[ix];
+        if (std::holds_alternative<GroupConsumerImpl::NoRewind>(impl->rewind)) continue;
+        advanceRewind_(*impl, nowNs);   // Task 10: bound / fetched / rejoined / timed out
+        ++n;
+        if (std::holds_alternative<GroupConsumerImpl::RewindAwaitFetch>(impl->rewind)) {
+            (void)retryOffsetFetchFor_(*impl, nowNs, sessionId, sendFn);   // #371: now, not on the next sweep
+        }
+    }
+    return n;
 }
 
 int GroupConsumerHub::sweepCommitSyncTimeouts(int64_t nowNs) {
     int n = 0;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];
-        if (!std::holds_alternative<GroupConsumerImpl::NoRewind>(impl->rewind)) {
-            advanceRewind_(*impl, nowNs);   // Task 10: bound / fetched / rejoined / timed out
-            ++n;
-        }
         if (impl->hasCommitSync && nowNs >= impl->commitSync.deadlineNs) {
             // C4 review: a deadline inside a transient retry carries the broker's last code (e.g. 48).
             completeCommitSync_(*impl, OpStatus::Timeout, impl->commitSync.lastRetriedCode);
@@ -1319,45 +1343,50 @@ int GroupConsumerHub::retryOffsetFetch(int64_t nowNs, int64_t sessionId, const S
     if (!routed_() || !sessionConnected_) return 0;
     int sent = 0;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix];
-        if (!impl->active || impl->state != GroupConsumerState::Stable) continue;
-        bool missing = false;
-        for (const auto& [tp, pos] : impl->assignment) {
-            const auto f = impl->fetch.find(tp);
-            if (f == impl->fetch.end() || !f->second.offsetKnown) { missing = true; break; }
-        }
-        if (!missing) {
-            impl->offsetFetchBackoffNs = 0;
-            continue;
-        }
-        // Answer deadline of a fetch in flight: a lost answer is re-sent, a
-        // slow one never duplicated (the coordinator evicts a member silent
-        // for sessionTimeoutMs anyway).
-        const int64_t answerTimeoutNs = int64_t{impl->cfg.sessionTimeoutMs} * 1'000'000LL;
-        using Phase = GroupConsumerImpl::OffsetFetchPhase;
-        switch (impl->offsetFetchPhase) {
-        case Phase::Sent:       // the eager Stable-entry / Assign fetch: arm its deadline
-            impl->offsetFetchPhase      = Phase::Awaiting;
-            impl->offsetFetchAnswerByNs = nowNs + answerTimeoutNs;
-            continue;
-        case Phase::Awaiting:
-            if (nowNs < impl->offsetFetchAnswerByNs) continue;   // still in flight
-            break;                                               // unanswered: re-send
-        case Phase::Idle:
-            if (nowNs < impl->offsetFetchDueNs) continue;        // paced
-            break;
-        }
-        if (sendOffsetFetchFor_(*impl, sessionId, sendFn, /*unknownOnly=*/true)) {
-            impl->offsetFetchPhase      = Phase::Awaiting;
-            impl->offsetFetchAnswerByNs = nowNs + answerTimeoutNs;
-        }
-        // Pacing only (the answer, not this clock, decides): 100 ms doubling to 2 s.
-        impl->offsetFetchBackoffNs = impl->offsetFetchBackoffNs == 0
-            ? 100'000'000LL : std::min<int64_t>(impl->offsetFetchBackoffNs * 2, 2'000'000'000LL);
-        impl->offsetFetchDueNs = nowNs + impl->offsetFetchBackoffNs;
-        ++sent;
+        sent += retryOffsetFetchFor_(*impls_[ix], nowNs, sessionId, sendFn);
     }
     return sent;
+}
+
+int GroupConsumerHub::retryOffsetFetchFor_(GroupConsumerImpl& impl, int64_t nowNs, int64_t sessionId, const SendFn& sendFn)
+{
+    if (!routed_() || !sessionConnected_) return 0;
+    if (!impl.active || impl.state != GroupConsumerState::Stable) return 0;
+    bool missing = false;
+    for (const auto& [tp, pos] : impl.assignment) {
+        const auto f = impl.fetch.find(tp);
+        if (f == impl.fetch.end() || !f->second.offsetKnown) { missing = true; break; }
+    }
+    if (!missing) {
+        impl.offsetFetchBackoffNs = 0;
+        return 0;
+    }
+    // Answer deadline of a fetch in flight: a lost answer is re-sent, a
+    // slow one never duplicated (the coordinator evicts a member silent
+    // for sessionTimeoutMs anyway).
+    const int64_t answerTimeoutNs = int64_t{impl.cfg.sessionTimeoutMs} * 1'000'000LL;
+    using Phase = GroupConsumerImpl::OffsetFetchPhase;
+    switch (impl.offsetFetchPhase) {
+    case Phase::Sent:       // the eager Stable-entry / Assign fetch: arm its deadline
+        impl.offsetFetchPhase      = Phase::Awaiting;
+        impl.offsetFetchAnswerByNs = nowNs + answerTimeoutNs;
+        return 0;
+    case Phase::Awaiting:
+        if (nowNs < impl.offsetFetchAnswerByNs) return 0;   // still in flight
+        break;                                              // unanswered: re-send
+    case Phase::Idle:
+        if (nowNs < impl.offsetFetchDueNs) return 0;        // paced
+        break;
+    }
+    if (sendOffsetFetchFor_(impl, sessionId, sendFn, /*unknownOnly=*/true)) {
+        impl.offsetFetchPhase      = Phase::Awaiting;
+        impl.offsetFetchAnswerByNs = nowNs + answerTimeoutNs;
+    }
+    // Pacing only (the answer, not this clock, decides): 100 ms doubling to 2 s.
+    impl.offsetFetchBackoffNs = impl.offsetFetchBackoffNs == 0
+        ? 100'000'000LL : std::min<int64_t>(impl.offsetFetchBackoffNs * 2, 2'000'000'000LL);
+    impl.offsetFetchDueNs = nowNs + impl.offsetFetchBackoffNs;
+    return 1;
 }
 
 // #440: what the coordinator's version allows.  A coordinator below the needed version while another CONNECTED session
@@ -2137,8 +2166,11 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
             if (it == impl->assignment.end()) continue;
             if (routed_()) {
                 // Task 10: a seek() positioned this partition explicitly — an answer never moves it.
+                // (#357.5: nor does the answer of the fetch that was in flight when the seek positioned it.)
                 const auto f = impl->fetch.find(tp);
-                if (f != impl->fetch.end() && f->second.rewound && f->second.offsetKnown) continue;
+                if (f != impl->fetch.end() &&
+                    (f->second.phase == GroupConsumerImpl::FetchPhase::RewindAwaitingRebind ||
+                     f->second.staleFetchCorr == opt->correlationId)) continue;
             }
             if (it->second == GroupConsumerImpl::kUnseededSentinel ||
                 it->second < r.offset) {
@@ -2154,7 +2186,13 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
                 // reads every refilled record — never Latest (silent loss).
                 it->second = 0;
             }
-            if (routed_()) impl->fetch[tp].offsetKnown = true;
+            if (routed_()) {
+                auto& fs = impl->fetch[tp];
+                fs.offsetKnown = true;
+                if (fs.phase == GroupConsumerImpl::FetchPhase::RewindAwaitingOffset) {
+                    fs.phase = GroupConsumerImpl::FetchPhase::RewindAwaitingRebind;   // seeded by the answer
+                }
+            }
         }
         if (refused) {
             refuse_(*impl, refusedWhy);

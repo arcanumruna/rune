@@ -9,6 +9,9 @@
 #include <rune/client/Completions.h>
 #include <rune/client/agent/AgentRingMessages.h>
 #include <rune/client/detail/HubCommand.h>
+#include <rune/client/detail/OpTarget.h>
+#include <rune/client/group/GroupConsumerHub.h>
+#include <rune/protocol/client/OffsetMessages.h>
 
 #include <chrono>
 #include <map>
@@ -69,14 +72,21 @@ struct Fixture {
         c.autoCommitIntervalMs = commitMs;
         return c;
     }
+    // `holdFetch`: the Assign OffsetFetch is held at the gateway from the start (the fixture then does not wait for
+    // the subscriptions; the test releases the answer).
     Fixture(int32_t in, int32_t eg, std::vector<std::pair<int32_t, int32_t>> assigned,
             rc::GroupConfig gcfg = cfgOf(false, 30000, 5000),
-            std::map<std::pair<int32_t, int32_t>, int64_t> committed = {})
-        : r(in, eg), gc(prepare(in, std::move(assigned), gcfg, std::move(committed))) {
+            std::map<std::pair<int32_t, int32_t>, int64_t> committed = {}, RigOptions ro = {}, bool holdFetch = false)
+        : r(in, eg, ro), gc(prepare(in, std::move(assigned), gcfg, std::move(committed))) {
         wire(gc, seen);
+        r.gw.holdOffsetFetch = holdFetch;
         r.connect();
         EXPECT_TRUE(r.drive([&] { return !r.gw.pendingJoins.empty(); }));
         r.gw.releaseJoins();
+        if (holdFetch) {
+            EXPECT_TRUE(r.drive([&] { return r.gw.offsetFetches > 0; }));
+            return;
+        }
         for (const auto& [t, p] : r.gw.groupAssignment) {
             EXPECT_TRUE(r.drive([&] { return r.gw.latestSubscription(t, p) != nullptr; })) << "no subscription for " << p;
         }
@@ -116,6 +126,24 @@ bool staysFalseFor(GroupRig& r, P&& pred, std::chrono::milliseconds ms) {
         return std::chrono::steady_clock::now() - start > ms;
     }, 80'000'000);
     return !fired;
+}
+
+// C16: a manual duty clock.  Setup runs with a 100 us step per pass; freeze() stops it (and runs a few passes so no
+// sweep that was already due is still pending): from then on only message transit can make progress.
+int64_t g_clockNs = 1'000'000'000LL;
+int64_t manualClock() noexcept { return g_clockNs; }
+RigOptions manualClockOptions() {
+    RigOptions o;
+    g_clockNs  = 1'000'000'000LL;
+    o.nanoClock = &manualClock;
+    o.manualNs  = &g_clockNs;
+    o.stepNs    = 100'000;
+    return o;
+}
+void freeze(GroupRig& r) {
+    for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }   // drain a sweep that was already due
+    r.opt.stepNs = 0;
+    for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
 }
 
 } // namespace
@@ -530,4 +558,312 @@ TEST(GroupSeekRegression, ABlockingRewindWaitTimeoutIsATypedGroupOpErrorAdversar
     EXPECT_FALSE(untyped) << "the wait timeout escaped as a plain std::runtime_error";
     EXPECT_TRUE(typed);
     EXPECT_EQ(st, rc::OpStatus::Timeout);
+}
+
+// ===========================================================================
+// C16 (#371, #357): a rewind progresses on the duty pass, not on the 100 ms sweep
+// ===========================================================================
+
+// #371: with the clock frozen (so no 100 ms sweep can ever fire) seekToCommitted still sends its OffsetFetch,
+// takes the answer, resubscribes and completes Ok.  RED before the fix: the OffsetFetch and the completion were
+// reachable only from the sweep (never completes with the clock frozen).
+TEST(GroupSeekRegression, SeekToCommittedCompletesWithoutWaitingForTheSweepRegression) {
+    Fixture f(5601, 5602, {{kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000), {{{kTopic, 1}, 40}}, manualClockOptions());
+    freeze(f.r);
+    const int fetches = f.r.gw.offsetFetches;
+    const rc::Token t = f.tok();
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, t, 20'000)) << "the rewind needed the sweep";
+    EXPECT_EQ(f.done[t].c.status, rc::OpStatus::Ok);
+    EXPECT_EQ(f.done[t].times, 1);
+    EXPECT_EQ(f.r.gw.offsetFetches, fetches + 1) << "exactly one OffsetFetch for the rewind";
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 1)->fromOffset, 40);
+}
+
+TEST(GroupSeekRegression, SeekCompletesWithoutWaitingForTheSweepRegression) {
+    Fixture f(5603, 5604, {{kTopic, 0}, {kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000), {}, manualClockOptions());
+    freeze(f.r);
+    const rc::Token t = f.tok();
+    ASSERT_EQ(f.gc.seek({kTopic, 1}, 7, rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, t, 20'000)) << "the seek needed the sweep";
+    EXPECT_EQ(f.done[t].c.status, rc::OpStatus::Ok);
+    EXPECT_EQ(f.done[t].times, 1);
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 1)->fromOffset, 7);
+}
+
+// ===========================================================================
+// C16 (#357.1): a seek while the group is not Stable reports Rejoined, like seekToCommitted
+// ===========================================================================
+
+TEST(GroupSeekRegression, SeekDuringARebalanceCompletesRejoinedNotInvalidArgumentRegression) {
+    Fixture f(5605, 5606, {{kTopic, 1}}, Fixture::cfgOf(false, 600, 5000));   // a heartbeat every 200 ms
+    f.r.gw.rebalancing = true;
+    ASSERT_TRUE(f.r.drive([&] { return !f.r.gw.pendingJoins.empty(); }, 40'000'000)) << "the member never went to rejoin";
+    const rc::Token t = f.tok(), u = f.tok();
+    ASSERT_EQ(f.gc.seek({kTopic, 1}, 5, rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), u), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, t));
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, u));
+    EXPECT_EQ(f.done[t].c.status, rc::OpStatus::Rejoined) << "seek and seekToCommitted must agree";
+    EXPECT_EQ(f.done[u].c.status, rc::OpStatus::Rejoined);
+    EXPECT_EQ(f.done[t].times, 1);
+    // The blocking forms map it the same way: a typed GroupOpError(Rejoined), never std::invalid_argument.
+    for (int form = 0; form < 2; ++form) {
+        bool rejoined = false, other = false;
+        try {
+            if (form == 0) f.gc.seekAndWait({kTopic, 1}, 5, std::chrono::seconds(5));
+            else           f.gc.seekToCommittedAndWait(std::chrono::seconds(5));
+        } catch (const rc::GroupOpError& e) {
+            rejoined = e.status() == rc::OpStatus::Rejoined;
+        } catch (...) {
+            other = true;
+        }
+        EXPECT_TRUE(rejoined) << "form " << form;
+        EXPECT_FALSE(other) << "form " << form;
+    }
+}
+
+// Guard: a partition that is NOT assigned while Stable keeps InvalidArgument (also in the blocking form).
+TEST(GroupSeekRegression, SeekOnANonAssignedPartitionWhileStableStaysInvalidArgumentRegression) {
+    Fixture f(5607, 5608, {{kTopic, 1}});
+    const rc::Token t = f.tok();
+    ASSERT_EQ(f.gc.seek({kTopic, 0}, 5, rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, t));
+    EXPECT_EQ(f.done[t].c.status, rc::OpStatus::InvalidArgument);
+    EXPECT_EQ(f.done[t].text, "partition not assigned");
+    EXPECT_THROW(f.gc.seekAndWait({kTopic, 0}, 5, std::chrono::seconds(5)), std::invalid_argument);
+}
+
+// ===========================================================================
+// C16 (#357.5): a seek keeps an unrelated Assign OffsetFetch in flight
+// ===========================================================================
+
+// The Assign fetch (both partitions) is in flight when a seek positions p1.  Exactly ONE OffsetFetch goes on the
+// wire: its answer seeds p0 from the committed offset and leaves the seeked p1 alone (the seek's offset wins even
+// though the answer carries p1 too).  Mutations: an unconditional reset of the fetch -> two fetches; dropping the
+// fence (staleFetchCorr) -> the answer moves p1 to its committed offset and the seeked records are dropped.
+TEST(GroupSeekRegression, ASeekOnOnePartitionKeepsAnUnrelatedAssignFetchRegression) {
+    Fixture f(5609, 5610, {{kTopic, 0}, {kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000),
+              {{{kTopic, 0}, 30}, {{kTopic, 1}, 55}}, manualClockOptions(), /*holdFetch=*/true);
+    ASSERT_EQ(f.r.gw.offsetFetches, 1) << "the Assign fetch";
+    const rc::Token t = f.tok();
+    ASSERT_EQ(f.gc.seek({kTopic, 1}, 3, rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, t, 20'000));
+    EXPECT_EQ(f.done[t].c.status, rc::OpStatus::Ok);
+    ASSERT_NE(f.r.gw.latestSubscription(kTopic, 1), nullptr);
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 1)->fromOffset, 3);
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 0), nullptr) << "p0 is unseeded until the Assign answer";
+    // Many sweeps pass (300 ms of duty clock): no second fetch may go out.
+    for (int i = 0; i < 4'000; ++i) { f.r.client.doWork(); f.r.gw.pump(); }
+    EXPECT_EQ(f.r.gw.offsetFetches, 1) << "the seek cancelled the Assign fetch (a second OffsetFetch was sent)";
+    // The held answer arrives: p0 is seeded from it, p1 keeps the seek.
+    f.r.gw.holdOffsetFetch = false;
+    f.r.gw.releaseOffsetFetches();
+    ASSERT_TRUE(f.r.drive([&] { return f.r.gw.latestSubscription(kTopic, 0) != nullptr; }, 20'000))
+        << "p0 was never seeded from the Assign answer";
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 0)->fromOffset, 30);
+    EXPECT_EQ(f.r.gw.offsetFetches, 1);
+    const auto s1 = *f.r.gw.latestSubscription(kTopic, 1);
+    EXPECT_EQ(s1.fromOffset, 3);
+    f.r.gw.pushRecords(s1, 3, 7);
+    ASSERT_TRUE(f.consumed(1, 7)) << "the answer moved the seeked partition: its records were dropped";
+    EXPECT_EQ(f.seen.offsets[1].front(), 3);
+}
+
+// ===========================================================================
+// C16 (#357.4): FetchSub::rewound is state - every phase handles every event
+// ===========================================================================
+
+namespace {
+
+// A bare hub (no Client, no network): one Stable consumer over p0 / p1 with both partitions bound.  The router is a
+// fake that accepts every Subscribe; completions go straight to the handler target.
+struct PhaseRig {
+    using Hub   = rune::client::group::GroupConsumerHub;
+    using Impl  = rune::client::GroupConsumerImpl;
+    using Phase = Impl::FetchPhase;
+    static constexpr int64_t kSid = 77;
+
+    struct Seenc { int times = 0; rc::OpStatus status = rc::OpStatus::Ok; };
+
+    Hub                     hub;
+    std::unique_ptr<Impl>   impl = std::make_unique<Impl>();
+    std::map<rc::Token, Seenc> seen;
+    int64_t                 now = 1'000'000'000;
+    int                     subscribes = 0;
+    rune::client::group::SendFn send = [](int32_t, const uint8_t*, std::size_t) { return true; };
+    const rc::TopicPartition p0{kTopic, 0}, p1{kTopic, 1};
+
+    static uint32_t leader(void*, int32_t, int32_t) { return 0; }
+    static int64_t  sid(void*, uint32_t) { return kSid; }
+    static uint64_t epoch(void*, uint32_t) { return 1; }
+    static rune::client::detail::SendResult offer(void* ctx, uint32_t, const uint8_t*, std::size_t) {
+        ++static_cast<PhaseRig*>(ctx)->subscribes;
+        return rune::client::detail::SendResult::Accepted;
+    }
+    static void onDone(void* ctx, const rc::Completion& c, std::span<const uint8_t>) noexcept {
+        auto& s = static_cast<PhaseRig*>(ctx)->seen[c.token];
+        ++s.times;
+        s.status = c.status;
+    }
+
+    PhaseRig() {
+        Hub::FetchRouter fr;
+        fr.ctx = this; fr.leaderSession = &leader; fr.sessionId = &sid; fr.epoch = &epoch; fr.offer = &offer;
+        hub.setFetchRouter(fr);
+        hub.setSessionConnected(true, kSid, 1);
+        impl->groupId      = "g";
+        impl->topicIds     = {kTopic};
+        impl->cfg.autoCommit = false;
+        impl->memberId     = "m";
+        impl->generationId = 1;
+        impl->state        = rc::GroupConsumerState::Stable;
+        impl->active       = true;
+        impl->assignment[p0] = 0;
+        impl->assignment[p1] = 0;
+        impl->fetch[p0].offsetKnown = true;
+        impl->fetch[p1].offsetKnown = true;
+        hub.add(impl.get());
+        (void)hub.reconcileFetch();
+        bindAll();
+    }
+    void bindAll() {
+        int64_t n = 100;
+        for (auto& [tp, fs] : impl->fetch) {
+            if (fs.epoch != 0 && fs.subscriptionId == 0 && fs.corrId != 0) (void)hub.onFetchSubscribeResponse(fs.corrId, 0, ++n);
+        }
+    }
+    void drive() { for (int i = 0; i < 3; ++i) { now += 1'000; (void)hub.driveRewinds(now, kSid, send); } }
+    rune::client::detail::HubCommand cmd(rune::client::detail::HubCommand::Op op, rc::Token t, int64_t off = 0,
+                                         rc::TopicPartition tp = {}) {
+        rune::client::detail::HubCommand c;
+        c.op = op; c.handle = reinterpret_cast<uint64_t>(impl.get()); c.a = static_cast<int64_t>(t); c.d = off;
+        c.e = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(tp.topicId)) << 32) | static_cast<uint32_t>(tp.partition));
+        rune::client::detail::OpTarget target;
+        target.handler = rc::CompletionHandler{&onDone, this};
+        rune::client::detail::encodeTarget(target, c);
+        return c;
+    }
+    using Op = rune::client::detail::HubCommand::Op;
+    void seek(rc::Token t, int64_t off) { hub.applyCommandDirect(cmd(Op::GroupSeek, t, off, p1), now); }
+    void seekToCommitted(rc::Token t) { hub.applyCommandDirect(cmd(Op::GroupSeekToCommitted, t), now); }
+    // The OffsetFetch answer to the latest fetch: p0 -> 10, p1 -> 20.
+    void answerOffsetFetch() {
+        if (impl->offsetFetchCorrId == 0) impl->offsetFetchCorrId = Hub::kOffsetFetchCorrTag | 999;   // an answer needs a fetch in flight
+        rune::protocol::client::OffsetFetchResult r[2]{};
+        r[0].topicId = kTopic; r[0].partition = 0; r[0].offset = 10;
+        r[1].topicId = kTopic; r[1].partition = 1; r[1].offset = 20;
+        rune::protocol::client::OffsetFetchResponse m;
+        m.sessionId = kSid; m.correlationId = impl->offsetFetchCorrId;
+        std::vector<uint8_t> buf(rune::protocol::client::OffsetFetchResponse::encodedSizeFor(2));
+        const std::size_t n = m.encode(buf.data(), std::span<const rune::protocol::client::OffsetFetchResult>(r, 2));
+        hub.onOffsetFetchResponse(buf.data(), n);
+    }
+    Phase phaseOf(const rc::TopicPartition& tp) const { return impl->fetch.at(tp).phase; }
+};
+
+enum class Start { AwaitingOffset, AwaitingRebind, Bound };
+enum class Event { OffsetAnswered, RebindAnswered, Revoke, Rejoin, Close, SecondSeek };
+
+struct Expect {
+    bool        entry;        // p1's FetchSub still exists
+    PhaseRig::Phase phase;    // meaningful when entry
+    int         t1Times;      // completions of the first rewind
+    rc::OpStatus t1Status;    // meaningful when t1Times == 1
+    int         t2Times;      // completions of the second rewind (SecondSeek only: pending => 0)
+};
+
+} // namespace
+
+TEST(GroupSeekRegression, EveryFetchPhaseHandlesEveryEventRegression) {
+    using P = PhaseRig::Phase;
+    using S = rc::OpStatus;
+    struct Row { Start start; Event ev; Expect x; const char* name; };
+    const Row rows[] = {
+        // ---- RewindAwaitingOffset: seekToCommitted, the OffsetFetch answer not yet in ----
+        {Start::AwaitingOffset, Event::OffsetAnswered, {true, P::Bound, 1, S::Ok, 0}, "AwaitingOffset+OffsetAnswered (seed -> rebind -> bound; Ok once the rebind is answered)"},
+        {Start::AwaitingOffset, Event::RebindAnswered, {true, P::RewindAwaitingOffset, 0, S::Ok, 0}, "AwaitingOffset+RebindAnswered (no subscription exists: no-op)"},
+        {Start::AwaitingOffset, Event::Revoke,         {false, P::Bound, 1, S::Rejoined, 0}, "AwaitingOffset+Revoke"},
+        {Start::AwaitingOffset, Event::Rejoin,         {false, P::Bound, 1, S::Rejoined, 0}, "AwaitingOffset+Rejoin"},
+        {Start::AwaitingOffset, Event::Close,          {false, P::Bound, 1, S::Closed, 0}, "AwaitingOffset+Close"},
+        {Start::AwaitingOffset, Event::SecondSeek,     {true, P::RewindAwaitingRebind, 1, S::Superseded, 0}, "AwaitingOffset+SecondSeek"},
+        // ---- RewindAwaitingRebind: seek p1, the new subscription not yet answered ----
+        {Start::AwaitingRebind, Event::OffsetAnswered, {true, P::RewindAwaitingRebind, 0, S::Ok, 0}, "AwaitingRebind+OffsetAnswered (never moves a seeked partition)"},
+        {Start::AwaitingRebind, Event::RebindAnswered, {true, P::Bound, 1, S::Ok, 0}, "AwaitingRebind+RebindAnswered"},
+        {Start::AwaitingRebind, Event::Revoke,         {false, P::Bound, 1, S::Rejoined, 0}, "AwaitingRebind+Revoke"},
+        {Start::AwaitingRebind, Event::Rejoin,         {false, P::Bound, 1, S::Rejoined, 0}, "AwaitingRebind+Rejoin"},
+        {Start::AwaitingRebind, Event::Close,          {false, P::Bound, 1, S::Closed, 0}, "AwaitingRebind+Close"},
+        {Start::AwaitingRebind, Event::SecondSeek,     {true, P::RewindAwaitingRebind, 1, S::Superseded, 0}, "AwaitingRebind+SecondSeek"},
+        // ---- Bound: the rewind already completed Ok ----
+        {Start::Bound, Event::OffsetAnswered, {true, P::Bound, 1, S::Ok, 0}, "Bound+OffsetAnswered"},
+        {Start::Bound, Event::RebindAnswered, {true, P::Bound, 1, S::Ok, 0}, "Bound+RebindAnswered (duplicate)"},
+        {Start::Bound, Event::Revoke,         {false, P::Bound, 1, S::Ok, 0}, "Bound+Revoke"},
+        {Start::Bound, Event::Rejoin,         {false, P::Bound, 1, S::Ok, 0}, "Bound+Rejoin"},
+        {Start::Bound, Event::Close,          {false, P::Bound, 1, S::Ok, 0}, "Bound+Close"},
+        {Start::Bound, Event::SecondSeek,     {true, P::RewindAwaitingRebind, 1, S::Ok, 0}, "Bound+SecondSeek"},
+    };
+    constexpr rc::Token T1 = 1, T2 = 2;
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        PhaseRig r;
+        // ---- reach the start phase ----
+        switch (row.start) {
+        case Start::AwaitingOffset:
+            r.seekToCommitted(T1);
+            r.drive();   // sends the OffsetFetch; the answer is held back
+            ASSERT_EQ(r.phaseOf(r.p1), P::RewindAwaitingOffset);
+            ASSERT_EQ(r.phaseOf(r.p0), P::RewindAwaitingOffset);
+            break;
+        case Start::AwaitingRebind:
+            r.seek(T1, 3);
+            ASSERT_EQ(r.phaseOf(r.p1), P::RewindAwaitingRebind);
+            ASSERT_EQ(r.phaseOf(r.p0), P::Bound) << "a seek restarts one partition only";
+            break;
+        case Start::Bound:
+            r.seek(T1, 3);
+            r.bindAll();
+            r.drive();
+            ASSERT_EQ(r.phaseOf(r.p1), P::Bound);
+            ASSERT_EQ(r.seen[T1].times, 1);
+            break;
+        }
+        // ---- the event ----
+        switch (row.ev) {
+        case Event::OffsetAnswered:
+            r.answerOffsetFetch();
+            if (row.start == Start::AwaitingOffset) {
+                EXPECT_EQ(r.phaseOf(r.p1), P::RewindAwaitingRebind) << "the answer seeds it and starts the rebind wait";
+                EXPECT_EQ(r.impl->assignment[r.p1], 20);
+                r.bindAll();   // now the subscription instance answers
+            } else {
+                EXPECT_EQ(r.impl->assignment[r.p1], row.start == Start::AwaitingRebind ? 3 : r.impl->assignment[r.p1])
+                    << "an answer never moves a seeked partition";
+            }
+            break;
+        case Event::RebindAnswered: r.bindAll(); break;
+        case Event::Revoke:
+            r.impl->assignment.erase(r.p1);
+            ++r.impl->generationId;
+            (void)r.hub.reconcileFetch();
+            break;
+        case Event::Rejoin: r.hub.onCoordinatorMoved(); break;
+        case Event::Close:
+            r.hub.applyCommandDirect(r.cmd(PhaseRig::Op::GroupClose, 0), r.now);
+            break;
+        case Event::SecondSeek: r.seek(T2, 5); break;
+        }
+        r.drive();
+        r.drive();   // more passes never complete anything again
+        // ---- the outcome ----
+        const Expect& x = row.x;
+        EXPECT_EQ(r.impl->fetch.count(r.p1) != 0, x.entry);
+        if (x.entry && r.impl->fetch.count(r.p1) != 0) EXPECT_EQ(r.phaseOf(r.p1), x.phase);
+        if (row.ev == Event::SecondSeek) {
+            ASSERT_EQ(r.impl->fetch.count(r.p0), 1u);
+            EXPECT_EQ(r.phaseOf(r.p0), P::Bound) << "the superseded rewind released every partition it owned";
+        }
+        EXPECT_EQ(r.seen[T1].times, x.t1Times);
+        if (x.t1Times == 1) EXPECT_EQ(r.seen[T1].status, x.t1Status);
+        EXPECT_EQ(r.seen[T2].times, x.t2Times) << "the second rewind is still pending";
+    }
 }
