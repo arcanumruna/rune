@@ -719,6 +719,89 @@ TEST(ProducerTxnDataRegression, RecordReachingDutyOutsideATransactionIsNeverProd
     }
 }
 
+// #700: a batch answered NotAuthorized on its FIRST attempt was definitely not appended.  When its sequence is given
+// back (it was the newest) the partition has no gap, so the transaction aborts WITHOUT an epoch bump: the abort sends
+// EndTxn(abort) and no InitProducerId, and the next transaction's first batch on that partition carries the same epoch
+// and the given-back sequence.  When a NEWER batch is in flight behind the refused one its sequence stays used (a gap
+// the broker would meet): the abort still bumps the epoch.
+// RED (mutation): txnNoteLoss_ asks for BumpEpoch in both legs (leg 1 sends an InitProducerId).
+TEST(ProducerTxnDataRegression, NotAuthorizedOnAFirstAttemptAbortsWithoutAnEpochBumpRegression) {
+    constexpr uint16_t kNotAuth = uec(rpc::ErrorCode::NotAuthorized);
+    auto inits = [](const Rig& r) {
+        std::size_t n = 0;
+        for (const auto& f : r.fake.offered) n += f.templateId == rpc::InitProducerId::TEMPLATE_ID ? 1 : 0;
+        return n;
+    };
+    {   // leg 1: the only batch, sequence given back
+        Rig r;
+        r.initOk(42, 0);
+        ASSERT_EQ(inits(r), 1u);
+        r.begin();
+        ASSERT_EQ(r.send(0, 1), SendResult::Ok);
+        r.tick();
+        r.answerAdd(0);
+        r.tick();
+        ASSERT_EQ(r.wire.size(), 1u);
+        EXPECT_EQ(r.wire[0].baseSeq, 0);
+        r.hub.onProduceResponse(r.wire[0].corrId, -1, ec(rpc::ErrorCode::NotAuthorized));
+        ASSERT_EQ(r.state(), TxnState::AbortableError);
+        Op commit = r.commit();
+        ASSERT_TRUE(commit.ready());
+        EXPECT_EQ(commit.status(), OpStatus::BrokerError);
+        EXPECT_EQ(commit.code(), kNotAuth);
+        Op abort = r.abort();
+        r.ticks(3);
+        ASSERT_EQ(r.endTxns(), 1u);
+        EXPECT_EQ(r.lastEnd()->commit, uint8_t{0}) << "EndTxn(abort)";
+        r.endAnswer();
+        r.ticks(4);
+        ASSERT_TRUE(abort.ready());
+        EXPECT_EQ(abort.status(), OpStatus::Ok);
+        EXPECT_EQ(inits(r), 1u) << "the batch was definitely not appended and its sequence is back: no epoch bump";
+        EXPECT_EQ(r.state(), TxnState::Ready);
+        // The next transaction continues under the same epoch from the given-back sequence.
+        r.begin();
+        ASSERT_EQ(r.send(0, 2), SendResult::Ok);
+        r.tick();
+        r.answerAdd(0);
+        r.tick();
+        ASSERT_EQ(r.wire.size(), 2u);
+        EXPECT_EQ(r.wire[1].epoch, r.wire[0].epoch) << "same epoch";
+        EXPECT_EQ(r.wire[1].baseSeq, 0) << "the given-back sequence";
+        EXPECT_EQ(r.wire[1].pid, r.wire[0].pid);
+    }
+    {   // leg 2: a newer batch is in flight behind the refused one: its sequence is NOT given back
+        Rig r;
+        r.initOk(42, 0);
+        r.begin();
+        ASSERT_EQ(r.send(0, 1), SendResult::Ok);
+        r.tick();
+        r.answerAdd(0);
+        r.tick();
+        ASSERT_EQ(r.send(0, 2), SendResult::Ok);
+        r.tick();
+        ASSERT_EQ(r.wire.size(), 2u);
+        EXPECT_EQ(r.wire[0].baseSeq, 0);
+        EXPECT_EQ(r.wire[1].baseSeq, 1);
+        r.hub.onProduceResponse(r.wire[0].corrId, -1, ec(rpc::ErrorCode::NotAuthorized));   // the older, newer in flight
+        ASSERT_EQ(r.state(), TxnState::AbortableError);
+        r.wire[1].acked = true;
+        r.hub.onProduceResponse(r.wire[1].corrId, 0, 0);
+        Op commit = r.commit();
+        ASSERT_TRUE(commit.ready());
+        EXPECT_EQ(commit.code(), kNotAuth);
+        Op abort = r.abort();
+        r.ticks(3);
+        ASSERT_EQ(r.endTxns(), 1u);
+        r.endAnswer();
+        r.ticks(4);
+        EXPECT_EQ(inits(r), 2u) << "a used sequence is a gap: the abort bumps the epoch";
+        r.answer(Rig::initAnswer(r.last(rpc::InitProducerId::TEMPLATE_ID)->corrId, 42, 1));
+        ASSERT_TRUE(abort.ready());
+        EXPECT_EQ(abort.status(), OpStatus::Ok);
+    }
+}
+
 // Task 5 carry: a record that fails delivery inside a transaction poisons it - a commit never sends EndTxn(commit)
 // over lost data.  (a) a sent batch answered with a non-retriable error, (b) a sent batch with no answer by the
 // delivery timeout while the commit waits for it, (c) a void record never sent (its partition never added) past
@@ -746,11 +829,12 @@ TEST(ProducerTxnDataRegression, FailedDeliveryInsideATransactionPoisonsItRegress
         ASSERT_EQ(r.endTxns(), 1u);
         EXPECT_EQ(r.lastEnd()->commit, uint8_t{0});
         r.endAnswer();
-        r.tick();   // the batch's outcome was unknown: the abort bumps the epoch (KIP-360)
-        ASSERT_NE(r.last(rpc::InitProducerId::TEMPLATE_ID), nullptr);
-        r.answer(Rig::initAnswer(r.last(rpc::InitProducerId::TEMPLATE_ID)->corrId, 42, 1));
+        r.tick();   // #700: definitely not appended, its sequence given back: no epoch bump (see NotAuthorizedOnAFirstAttempt...)
         ASSERT_TRUE(abort.ready());
         EXPECT_EQ(abort.status(), OpStatus::Ok);
+        std::size_t inits = 0;
+        for (const auto& f : r.fake.offered) inits += f.templateId == rpc::InitProducerId::TEMPLATE_ID ? 1 : 0;
+        EXPECT_EQ(inits, 1u) << "only initTransactions' InitProducerId: no epoch bump";
     }
     {
         Rig r;

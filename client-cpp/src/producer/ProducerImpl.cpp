@@ -2678,17 +2678,19 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
     if (ec >= static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed) &&
         ec <= static_cast<int16_t>(rune::protocol::client::ErrorCode::PasswordChangeRequired) &&
         b->attempts == 1) {
-        emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
-                      OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
-        txnNoteLoss_(OpStatus::BrokerError, static_cast<uint16_t>(ec), AbortKind::BumpEpoch);
-        completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
-                       static_cast<uint16_t>(ec), b->tier2, b->recordCount);
         // The newest sequences were never used: give them back, so the next batch continues the sequence.
         // Otherwise the later in-flight batches meet the gap (OutOfOrderSequence) and C3 re-sequences them.
-        if (b->baseSequence >= 0 && b->producerId == ps.producerId && b->producerEpoch == ps.epoch &&
-            b->baseSequence + b->recordCount == ps.nextBaseSequence) {
-            ps.nextBaseSequence = b->baseSequence;
-        }
+        const bool givenBack = b->baseSequence >= 0 && b->producerId == ps.producerId && b->producerEpoch == ps.epoch &&
+                               b->baseSequence + b->recordCount == ps.nextBaseSequence;
+        emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
+                      OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
+        // #700: a batch definitely not appended whose sequence is given back leaves no gap: the transaction can abort
+        // without an epoch bump.  A batch behind a newer one in flight keeps its sequence (a gap): BumpEpoch.
+        txnNoteLoss_(OpStatus::BrokerError, static_cast<uint16_t>(ec),
+                     givenBack ? AbortKind::Plain : AbortKind::BumpEpoch);
+        completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
+                       static_cast<uint16_t>(ec), b->tier2, b->recordCount);
+        if (givenBack) ps.nextBaseSequence = b->baseSequence;
         releaseResolved_(ps, *b);
         reclaimAckRing_(ps);
         if (isPartitionRefusal_(static_cast<uint16_t>(ec))) {
