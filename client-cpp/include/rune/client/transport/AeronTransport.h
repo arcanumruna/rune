@@ -109,7 +109,9 @@ public:
 
     /// True once the Aeron client closed itself (inter-service timeout, driver
     /// timeout).  Offers then fail; the owner decides whether to rebuild.
-    [[nodiscard]] bool closed() const noexcept { return aeron_ && aeron_->isClosed(); }
+    [[nodiscard]] bool closed() const noexcept {
+        return conductorFault_ != nullptr || (aeron_ && aeron_->isClosed());
+    }
 
     /// The default ingress publication's current channel (changes on retarget()).
     /// Owner thread only.
@@ -422,6 +424,9 @@ private:
     std::unique_ptr<detail::OneToOneRingBuffer> driverCtl_;
     // The one thread allowed to pump (see bindPumpThread()).  Debug-checked.
     std::thread::id         pumpOwner_{};
+    /// Set (once, by the duty/pump thread) when the Aeron client conductor threw: a conductor that has thrown
+    /// is half-updated and is never invoked again; closed() reports it.
+    std::exception_ptr      conductorFault_{};
 
     void startEmbeddedDriver();
     void stopEmbeddedDriver() noexcept;

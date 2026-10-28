@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <new>
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
@@ -86,12 +87,16 @@ int AeronTransport::dutyCycle() noexcept {
     // defence after mediaDriverTimeoutMsFor(); nothing relies on it alone.
     int work = pumpDriverFromCaller_();
     if (pumpObserver_ != nullptr) [[unlikely]] pumpObserver_(pumpObserverCtx_, PumpStep::Driver);
-    if (aeron_) {
+    if (aeron_ && conductorFault_ == nullptr) {
         try {
             work += aeron_->conductorAgentInvoker().invoke();
         } catch (...) {
             // AgentInvoker routes SourcedException to the error handler; anything
-            // else is contained here — dutyCycle() is noexcept.
+            // else is contained here — dutyCycle() is noexcept.  A conductor that
+            // threw (bad_alloc mid-update) is half-updated: record the fault and
+            // never invoke it again; closed() reports the transport as closed.
+            conductorFault_ = std::current_exception();
+            std::fprintf(stderr, "rune-client: aeron client conductor failed; the transport is closed\n");
         }
         if (pumpObserver_ != nullptr) [[unlikely]] pumpObserver_(pumpObserverCtx_, PumpStep::Conductor);
     }
@@ -203,6 +208,8 @@ void AeronTransport::startBody_() {
     PubRegistry preg{*aeron_, cfg_.ingressChannel, cfg_.ingressStreamId};
     SubRegistry sreg{*aeron_, cfg_.egressChannel, cfg_.egressStreamId};
     pumpUntil_([&] {
+        // A faulted conductor is half-updated: never poll (find) against it.
+        if (conductorFault_ != nullptr) return true;
         const int64_t now = resolveNow_();
         const bool pubOk = pubRes.poll(preg, now) == ResolveStatus::Ready;
         const bool subOk = subRes.poll(sreg, now) == ResolveStatus::Ready;
@@ -211,6 +218,8 @@ void AeronTransport::startBody_() {
     if (pubRes.ready() == nullptr || subRes.ready() == nullptr) {
         const std::string why = pubRes.rejected() || subRes.rejected() ? "rejected by the driver"
                                                                         : "timed out";
+        std::exception_ptr rejectCause = pubRes.rejectCause();
+        if (rejectCause == nullptr) rejectCause = subRes.rejectCause();
         // #432: a handle that did resolve is released while its conductor is
         // still alive (its dtor locks the conductor's admin mutex); left to the
         // unwinding below it would outlive aeron_.reset() and abort the process.
@@ -218,6 +227,15 @@ void AeronTransport::startBody_() {
         subRes.reset();
         aeron_.reset();
         stopEmbeddedDriver();
+        if (conductorFault_ != nullptr) std::rethrow_exception(conductorFault_);
+        if (rejectCause != nullptr) {
+            try {
+                std::rethrow_exception(rejectCause);
+            } catch (const std::bad_alloc&) {
+                throw;  // an allocation failure is reported as one, not as a driver rejection
+            } catch (...) {
+            }
+        }
         throw std::runtime_error("AeronTransport: resolving ExclusivePublication/Subscription " + why +
                                  " (ingressChannel=" + cfg_.ingressChannel +
                                  " egressChannel=" + cfg_.egressChannel + ")");
