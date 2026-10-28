@@ -531,14 +531,15 @@ TEST(ProducerTxnOffsetsRegression, EmptySendOffsetsCompletesLocallyWithNoWireTra
     EXPECT_EQ(r.impl->txnStateDuty(), TxnState::Ready);
 }
 
-// #348: an empty call while a real one runs completes Ok at once and leaves the running call alone.
-TEST(ProducerTxnOffsetsRegression, EmptySendOffsetsDuringARunningCallLeavesItAloneRegression) {
+// #348 / #698: an empty call while a real one runs is refused (InvalidArgument; one call at a time) and leaves the
+// running call alone.
+TEST(ProducerTxnOffsetsRegression, EmptySendOffsetsDuringARunningCallIsRefusedAndLeavesItAloneRegression) {
     Rig r;
     r.inTxn();
     const Token a = r.sendOffsets(offsetsOf(2), "grp-a");
     const Token e = r.sendOffsets({}, "grp-e");
     ASSERT_EQ(r.d(e).times, 1);
-    EXPECT_EQ(r.d(e).status, OpStatus::Ok);
+    EXPECT_EQ(r.d(e).status, OpStatus::InvalidArgument);
     EXPECT_EQ(r.d(a).times, 0);
     r.sendOk(a);
     ASSERT_EQ(r.d(a).times, 1);
@@ -1403,6 +1404,37 @@ TEST(ProducerTxnOffsetsRegression, EmptySendOffsetsInEveryTxnStateAdversarialReg
     EXPECT_EQ(r.d(p).code, 77u);
     r.tick(10 * kMs);
     EXPECT_EQ(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).size(), 2u) << "only the two real calls sent AddOffsets";
+}
+
+// #698: one sendOffsets at a time applies to an EMPTY second call too (the in-flight check runs before the empty-list
+// shortcut): InvalidArgument, no frame; the first one is untouched and completes Ok when answered.  An empty call with
+// nothing in flight is still Ok locally.
+// RED (mutation): the empty-list check moved back ahead of the in-flight check (the empty call completes Ok).
+TEST(ProducerTxnOffsetsRegression, AnEmptySendOffsetsWhileOneIsInFlightIsInvalidArgumentRegression) {
+    Rig r;
+    r.inTxn();
+    const Token first = r.sendOffsets(offsetsOf(2), "grp-a");
+    r.tick();   // AddOffsetsToTxn on the wire, unanswered: the first call is in flight
+    ASSERT_EQ(r.cap.of(rpc::AddOffsetsToTxn::TEMPLATE_ID).size(), 1u);
+    const std::size_t framesBefore = r.cap.frames.size();
+    const Token second = r.sendOffsets({}, "grp-a");
+    ASSERT_EQ(r.d(second).times, 1);
+    EXPECT_EQ(r.d(second).status, OpStatus::InvalidArgument) << "a second call, even an empty one, is refused";
+    r.tick();
+    EXPECT_EQ(r.cap.frames.size(), framesBefore) << "the refusal sends nothing";
+    EXPECT_EQ(r.d(first).times, 0);
+    r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+    r.tick();
+    for (const auto& f : r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID)) {
+        if (r.d(first).times == 0) r.answerFrame(f, rp::ReqKind::TxnOffsetCommit, 0);
+    }
+    ASSERT_EQ(r.d(first).times, 1);
+    EXPECT_EQ(r.d(first).status, OpStatus::Ok);
+    EXPECT_EQ(r.d(second).times, 1) << "the refused call is never completed again";
+    EXPECT_EQ(r.impl->txnStateDuty(), TxnState::InTransaction) << "the transaction is not poisoned";
+    const Token third = r.sendOffsets({}, "grp-a");
+    ASSERT_EQ(r.d(third).times, 1);
+    EXPECT_EQ(r.d(third).status, OpStatus::Ok) << "nothing in flight: an empty list completes Ok locally";
 }
 
 // #347 x concurrency: the same refused call repeated while the first runs, then the first FAILS.  Each refusal

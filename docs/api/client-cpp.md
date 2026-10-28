@@ -394,9 +394,10 @@ try {
   they return -1 / `TxnState::Uninitialized` / `false` and touch nothing. `producerId()` is also -1 after `FatalError`.
 - Transaction call limits (all complete `InvalidArgument`, never the state error 19): at most 4 `commitTransaction` /
   `abortTransaction` calls join a pending one, at most 8 `flush` calls are pending, and one
-  `sendOffsetsToTransaction` runs at a time (a second completes `InvalidArgument` with "a sendOffsetsToTransaction is
-  already in flight on this producer; wait for its completion"; the first completes normally and the transaction stays
-  good). An empty offsets list completes `Ok` locally with no wire traffic.
+  `sendOffsetsToTransaction` runs at a time (a second, even an empty one, completes `InvalidArgument` with "a
+  sendOffsetsToTransaction is already in flight on this producer; wait for its completion"; the first completes
+  normally and the transaction stays good). An empty offsets list otherwise completes `Ok` locally with no wire
+  traffic.
 - `UnknownProducerId` (28) inside a transaction aborts it (the commit completes `BrokerError(28)`); the app aborts and
   redoes the transaction, which runs under epoch+1 from sequence 0. KIP-360 (the coordinator keeping the transaction
   across the epoch bump) is not implemented.

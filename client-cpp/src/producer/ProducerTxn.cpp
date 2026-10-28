@@ -1006,7 +1006,8 @@ void ProducerImpl::onAddPartitionsAnswer_(const CoordAnswer& a, CoordinatorLink:
     default:
         break;
     }
-    // Per partition: its own result when the response names it, else the request's (worst) code.
+    // Per partition: its own result when the response names it; an unnamed one fails (a parsed answer) or takes the
+    // request's (worst) code (an ErrorResponse).
     std::optional<rpc::AddPartitionsToTxnResponse> m;
     if (!a.anyKind) m = rpc::AddPartitionsToTxnResponse::decode(a.frame.data(), a.frame.size());
     bool     anyOk    = false;
@@ -1015,7 +1016,8 @@ void ProducerImpl::onAddPartitionsAnswer_(const CoordAnswer& a, CoordinatorLink:
         PartitionState& ps = *partitions_[slot];
         const auto* ad = std::get_if<Adding>(&ps.txn);
         if (ad == nullptr || ad->slot != &s) continue;
-        int16_t code = worst;
+        // #698: a parsed answer that does not name this partition fails it (InvalidRequest): the broker never said Ok.
+        int16_t code = m ? static_cast<int16_t>(kInvalidRequest) : worst;
         if (m) {
             for (std::size_t i = 0; i < m->results.size(); ++i) {
                 const auto r = m->results[i];
@@ -1304,18 +1306,19 @@ void ProducerImpl::applySendOffsets_(const TxnControl& c, const TxnOp& op) {
                    "most 512 bytes");
         return;
     }
-    // #348: nothing to commit - Ok locally, no wire traffic.  AddOffsetsToTxn would open the transaction on the
-    // coordinator (TxnStarted::Yes) and make a commit send an EndTxn for an otherwise empty transaction (Kafka
-    // returns at once).  Checked after the argument validation, before the in-flight check: it needs no scratch.
-    if (c.offsets.empty()) {
-        completeTxn_(op, OpKind::SendOffsets, OpStatus::Ok, 0, {});
-        return;
-    }
-    // #347: one call in flight (the TxnOffsetCommit frames are built from ONE scratch).  A second is refused clearly
-    // - InvalidArgument, not the state-error code 19; the first completes normally and the transaction is not poisoned.
+    // #347/#698: one call in flight (the TxnOffsetCommit frames are built from ONE scratch).  A second - even an empty
+    // one - is refused clearly: InvalidArgument, not the state-error code 19; the first completes normally and the
+    // transaction is not poisoned.  Checked before the empty-list case.
     if (offsetsOp_.index() != 0) {
         refuseTxn_(c, OpStatus::InvalidArgument, 0,
                    "a sendOffsetsToTransaction is already in flight on this producer; wait for its completion");
+        return;
+    }
+    // #348: nothing to commit - Ok locally, no wire traffic.  AddOffsetsToTxn would open the transaction on the
+    // coordinator (TxnStarted::Yes) and make a commit send an EndTxn for an otherwise empty transaction (Kafka
+    // returns at once).  Checked after the in-flight check (#698): it needs no scratch.
+    if (c.offsets.empty()) {
+        completeTxn_(op, OpKind::SendOffsets, OpStatus::Ok, 0, {});
         return;
     }
     OffsetsScratch& sc = *offsetsScratch_;   // allocated at construction of a transactional producer

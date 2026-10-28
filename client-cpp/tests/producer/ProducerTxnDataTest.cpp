@@ -327,7 +327,7 @@ struct Rig {
         const OfferedFrame* f = pendingAdd();
         ASSERT_NE(f, nullptr) << "no AddPartitionsToTxn offered";
         answeredAdds.push_back(f->corrId);
-        answer(FakeCoordinator::answer(rp::ReqKind::AddPartitions, f->corrId, code));
+        answer(fake.answerAdd(f->corrId, code));
     }
 
     // ---- data ----
@@ -1208,7 +1208,7 @@ void answerAddFor(Rig& r, int32_t part, int16_t code) {
     const OfferedFrame* f = addFor(r, part);
     ASSERT_NE(f, nullptr) << "no AddPartitionsToTxn names partition " << part;
     r.answeredAdds.push_back(f->corrId);
-    r.answer(FakeCoordinator::answer(rp::ReqKind::AddPartitions, f->corrId, code));
+    r.answer(r.fake.answerAdd(f->corrId, code));
 }
 
 }  // namespace
@@ -2032,7 +2032,7 @@ TEST(ProducerTxnDataRegression, AddPartitionsRetriesConcurrentTransactionsRegres
     r.ticks(3);
     ASSERT_EQ(r.adds().size(), 1u);
     const int64_t corr = r.adds()[0]->corrId;
-    const auto busy = FakeCoordinator::answer(rp::ReqKind::AddPartitions, corr, ec(rpc::ErrorCode::ConcurrentTransactions));
+    const auto busy = r.fake.answerAdd(corr, ec(rpc::ErrorCode::ConcurrentTransactions));
     r.answer(busy);
     r.ticks(4);   // within the first backoff step
     EXPECT_TRUE(r.wire.empty()) << "no data while AddPartitions is retried";
@@ -2043,7 +2043,7 @@ TEST(ProducerTxnDataRegression, AddPartitionsRetriesConcurrentTransactionsRegres
     r.answer(busy);
     r.tick(5 * kMs);
     ASSERT_EQ(r.adds().size(), 3u);
-    r.answer(FakeCoordinator::answer(rp::ReqKind::AddPartitions, corr, 0));
+    r.answer(r.fake.answerAdd(corr, 0));
     r.tick();
     EXPECT_EQ(r.wire.size(), 1u) << "the record after its AddPartitions OK";
 }
@@ -2076,7 +2076,7 @@ TEST(ProducerTxnDataRegression, NotCoordinatorRediscoversThenRetriesRegression) 
     r.ticks(3);
     ASSERT_EQ(r.adds().size(), 1u);
     const int64_t corr = r.adds()[0]->corrId;
-    r.answer(FakeCoordinator::answer(rp::ReqKind::AddPartitions, corr, ec(rpc::ErrorCode::NotCoordinator)));
+    r.answer(r.fake.answerAdd(corr, ec(rpc::ErrorCode::NotCoordinator)));
     EXPECT_EQ(r.fake.rediscovers, 1) << "NotCoordinator must ask for a re-discovery";
     r.ticks(64, 10 * kMs);
     EXPECT_EQ(r.adds().size(), 1u) << "re-sent before the coordinator moved";
@@ -2084,7 +2084,7 @@ TEST(ProducerTxnDataRegression, NotCoordinatorRediscoversThenRetriesRegression) 
     r.hub.onCoordinatorMoved();
     r.tick();
     ASSERT_EQ(r.adds().size(), 2u) << "not re-sent after the re-discovery";
-    r.answer(FakeCoordinator::answer(rp::ReqKind::AddPartitions, corr, 0));
+    r.answer(r.fake.answerAdd(corr, 0));
     r.tick();
     EXPECT_EQ(r.wire.size(), 1u) << "the record after its AddPartitions OK";
 }
@@ -2390,7 +2390,7 @@ TEST(ProducerTxnDataRegression, SeededRandomTxnsCompleteEveryRecordOnceNeverFail
                 const int16_t code = (fault == 1 && !addFailed) ? ec(rpc::ErrorCode::InvalidTxnState) : int16_t{0};
                 addFailed = addFailed || code != 0;
                 r.answeredAdds.push_back(f->corrId);
-                r.answer(FakeCoordinator::answer(rp::ReqKind::AddPartitions, f->corrId, code));
+                r.answer(r.fake.answerAdd(f->corrId, code));
             }
             if (rng() % 2 == 0) r.ackAll();
         };
