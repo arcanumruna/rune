@@ -39,6 +39,7 @@
 #include "rune/node/CatalogPartition.h"
 #include "rune/node/CatalogReadServer.h"
 #include "rune/node/NamespaceLimitDefaults.h"
+#include "rune/node/NamespaceReaper.h"
 #include "rune/node/SecurityAdmin.h"
 #include <rune/peerlink/PeerFrameCrypto.h>
 #include "rune/node/SecurityApplier.h"
@@ -143,6 +144,14 @@ struct AdminDeps {
     NamespaceLimitDefaults nsDefaults;
     /// RUNE_MAX_NAMESPACES: a Create when the registry holds this many (default included) is refused (52 / 39).
     uint32_t maxNamespaces = 1024;
+    /// Namespaces Phase 2 Task 7: how the namespace reaper asks the CONTROL thread (which owns the offset and
+    /// transaction-state stores and the transaction coordinator) for one idempotent step of a delete - production posts
+    /// kA2cNsReapRequest on the admin->control FIFO and the answer returns as kMsgNsReapResult (onNsReapResult).
+    /// false = could not be queued now (retried next pass).  Unset (rigs without a control thread): there is nothing to
+    /// clean on a control thread, so every such step counts as done at once.
+    std::function<bool(const ReapRequestMsg&)> askControl;
+    /// RUNE_NS_DELETE_BATCH (tombstones per control call).
+    uint32_t nsDeleteBatch = 256;
 };
 
 // ---------------------------------------------------------------------------
@@ -355,12 +364,19 @@ public:
     [[nodiscard]] const SecurityAdmin* securityAdmin() const noexcept { return securityAdmin_ ? &*securityAdmin_ : nullptr; }
     /// Test seam (the 3-node suites): while held, doWork does not run the `__security` applier.
     void holdSecurityApplyForTest(bool on) noexcept { securityApplyHeldForTest_ = on; }
+    /// Test seam: while held, the `__security` leader issues no NamespacePurged.
+    void holdSecurityPurgeForTest(bool on) noexcept { if (securityAdmin_) securityAdmin_->holdPurgeForTest(on); }
     /// Issue #603 probes (admin thread): the behind verdict and how many edges were posted.
     [[nodiscard]] bool securityBehindForTest() const noexcept { return securityBehind_.behind(); }
     [[nodiscard]] uint64_t securityBehindEdgesForTest() const noexcept { return securityBehindEdges_; }
 
     /// Drive the plane, the replica and the applier; advance / start DDL.
     int doWork(int64_t nowNs);
+
+    /// control -> admin (Task 7): the answer of one reaper control request.
+    void onNsReapResult(const ReapResultMsg& m) noexcept { reaper_.onControlResult(m.correlation, m.status); }
+    [[nodiscard]] NamespaceReaper& reaperForTest() noexcept { return reaper_; }
+    [[nodiscard]] const NamespaceReaper& reaper() const noexcept { return reaper_; }
 
     // ── Introspection ───────────────────────────────────────────────────────
     [[nodiscard]] rune::replication::PartitionReplica* catalogReplica() const noexcept { return catalogReplica_; }
@@ -482,6 +498,8 @@ private:
     // Answers — every exit of a STARTED DDL goes through answer_(req, Response),
     // the ONE place answeredCount() moves; respond_ only encodes (a queue-overflow
     // refusal, never started, calls it directly).
+    /// Task 13: backing text of the SetLimits retention warning (cold; the answer is sent before the next DDL starts).
+    std::string warnScratch_;
     struct Response {
         uint16_t         code            = 0;
         std::string_view detail;
@@ -492,6 +510,9 @@ private:
         int32_t          gateTopicId     = -1;
         uint64_t         viewFingerprint = 0;
     };
+    /// Suspend into the mode the namespace is already in, or Resume of an ACTIVE one: the answer to give with no event
+    /// appended (nullopt = not a no-op).
+    [[nodiscard]] std::optional<Response> namespaceNoOp_(const NamespaceDdlMsg& m, const rune::catalog::CatalogState& s) const;
     void answer_(const DdlRequest& req, const Response& r);
     void answer_(const DdlRequest& req, uint16_t code, std::string_view detail = {}, int32_t topicId = -1,
                  uint16_t version = 0);
@@ -564,6 +585,13 @@ private:
     uint64_t ddlRefusedFdBudget_ = 0;   ///< issue #296
     bool     applyHeldForTest_  = false;   // holdApplyForTest (test seam only)
     bool     answersHeldForTest_ = false;  // holdAnswersForTest (test seam only)
+
+    // Namespaces Phase 2 Task 7: drives every DELETING namespace to removal.  Stepped on the catalog leader only.
+    NamespaceReaper reaper_;
+    uint64_t        deferredControlDone_ = 0;   // a rig without a control thread: the correlation to answer Done next pass
+    struct ReaperPortImpl;   // the reaper's hands (AdminWorker.cpp)
+    int stepReaper_(int64_t nowNs);
+    [[nodiscard]] static bool isReaperRequest_(const DdlRequest& req) noexcept;
 
     // The booted applier's goLive, owed to the admin thread's first pass (Task 16).
     std::optional<LiveEffects> pendingLive_;

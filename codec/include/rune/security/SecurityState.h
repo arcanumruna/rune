@@ -51,6 +51,10 @@ struct Applied {
     SessionEffect effect = SessionEffect::None;
     std::vector<uint64_t> affectedUsers;       // the users whose sessions the effect applies to (sorted)
     uint32_t nsId = 0;                         // the event's namespace
+    /// NamespacePurged only: when `effect` is Revoke (affectedUsers = the erased users), the surviving users whose
+    /// permissions changed and need a Refresh.  Empty for every other event (and when effect is Refresh, whose
+    /// affectedUsers already is the refresh set).
+    std::vector<uint64_t> refreshedUsers;
 };
 struct RequestRecord { int64_t offset = -1; EventKind kind{}; uint64_t objectId = 0; uint32_t newVersion = 0;
                        uint64_t requestFingerprint = 0; };
@@ -108,6 +112,9 @@ private:
 [[nodiscard]] std::expected<Applied, ApplyError> previewApplied(const SecurityState& s, const SecurityEvent& e);  // the leader's dry run
 [[nodiscard]] std::string_view applyErrorName(ApplyError::Code) noexcept;
 [[nodiscard]] std::string_view refusalName(Refusal) noexcept;
+/// True iff a grant's resource names namespace `nsName`: a Namespace resource called `nsName`, or any resource whose name
+/// is qualified into it (`nsName/...`).  Shared by the NamespacePurged apply and hasNamespaceRecords.
+[[nodiscard]] bool grantNamesNamespace(const GrantSpec&, std::string_view nsName) noexcept;
 [[nodiscard]] bool validName(std::string_view) noexcept;     // [A-Za-z0-9._@-]{1,128}, not "__…" (D7)
 /// D10, D16, D17.  `roleNsId` / `roleNsName`: the namespace of the role (or user) the grant is for.
 ///   Cluster: only roleNsId == 0.  Namespace: ops {Admin, Describe}, an Exact pattern whose name is the namespace's own

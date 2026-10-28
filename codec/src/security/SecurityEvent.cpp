@@ -52,13 +52,15 @@ std::optional<Violation> checkOps(uint16_t fv, const Ops& ops) noexcept {
 std::optional<Violation> checkFormatVer(uint16_t v) noexcept {
     return (v == kFormatV1 || v == kFormatV2) ? std::nullopt : std::optional<Violation>(Violation::UnknownFormatVer);
 }
-std::optional<Violation> checkKind(uint16_t k) noexcept {
-    return (k >= static_cast<uint16_t>(EventKind::CreateUser) && k <= static_cast<uint16_t>(EventKind::Bootstrap))
+std::optional<Violation> checkKind(uint16_t fv, uint16_t k) noexcept {
+    // NamespacePurged (11) exists in formatVer 2 only: in a formatVer-1 event it is an unknown kind.
+    const uint16_t last = static_cast<uint16_t>(fv >= kFormatV2 ? EventKind::NamespacePurged : EventKind::Bootstrap);
+    return (k >= static_cast<uint16_t>(EventKind::CreateUser) && k <= last)
         ? std::nullopt : std::optional<Violation>(Violation::UnknownKind);
 }
 std::optional<Violation> validate(const SecurityEvent& e) noexcept {
     if (auto v = checkFormatVer(e.formatVer)) return v;
-    if (auto v = checkKind(static_cast<uint16_t>(e.kind))) return v;
+    if (auto v = checkKind(e.formatVer, static_cast<uint16_t>(e.kind))) return v;
     if (e.kind != kindOf(e.ops)) return Violation::KindOpsMismatch;
     if (e.formatVer == kFormatV1 && e.nsId != 0) return Violation::BadEnum;   // formatVer 1 has no nsId field
     return checkOps(e.formatVer, e.ops);
@@ -112,7 +114,7 @@ void putOps(Writer& w, const Ops& ops) {
             w.e8(o.grantee); putGrant(w, o.grant);
         } else if constexpr (std::is_same_v<T, GrantRoleOps> || std::is_same_v<T, RevokeRoleOps>) {
             w.u64(o.roleId); w.str16(o.roleName);
-        }   // DropUser / CreateRole / DropRole: empty body
+        }   // DropUser / CreateRole / DropRole / NamespacePurged: empty body
     }, ops);
 }
 
@@ -178,6 +180,7 @@ std::expected<Ops, DecodeError> getOps(Reader& r, EventKind kind) {
     case EventKind::RevokeRole: {
         RevokeRoleOps o; if (!r.u64(o.roleId) || !r.str16(o.roleName)) return std::unexpected(DecodeError::Truncated); return o;
     }
+    case EventKind::NamespacePurged: return Ops{NamespacePurgedOps{}};
     }
     return std::unexpected(DecodeError::UnknownKind);   // unreachable: the kind was validated first
 }
@@ -227,7 +230,7 @@ std::expected<SecurityEvent, DecodeError> decode(std::span<const uint8_t> bytes)
         if (!r.u16(e.formatVer)) return std::unexpected(DecodeError::Truncated);
         if (auto v = checkFormatVer(e.formatVer)) return std::unexpected(asDecodeError(*v));
         if (!r.u16(kind)) return std::unexpected(DecodeError::Truncated);
-        if (auto v = checkKind(kind)) return std::unexpected(asDecodeError(*v));
+        if (auto v = checkKind(e.formatVer, kind)) return std::unexpected(asDecodeError(*v));
         e.kind = static_cast<EventKind>(kind);
         if (e.formatVer >= kFormatV2 && !r.u32(e.nsId)) return std::unexpected(DecodeError::Truncated);
         if (!r.u64(e.objectId) || !r.u32(e.prevVersion) || !r.u32(e.newVersion) || !r.i64(e.timestampMs) ||
@@ -255,6 +258,7 @@ std::string_view kindName(EventKind k) noexcept {
     case EventKind::DropRole: return "DropRole";     case EventKind::Grant: return "Grant";
     case EventKind::Revoke: return "Revoke";         case EventKind::GrantRole: return "GrantRole";
     case EventKind::RevokeRole: return "RevokeRole"; case EventKind::Bootstrap: return "Bootstrap";
+    case EventKind::NamespacePurged: return "NamespacePurged";
     }
     return "?";
 }

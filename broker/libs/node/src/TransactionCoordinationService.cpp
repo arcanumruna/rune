@@ -29,6 +29,7 @@
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <cstdlib>
 #include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/NsResolve.h>
 #include <rune/gateway/TopicRegistry.h>
 
 #include <rune/transaction/ControlMarker.h>
@@ -66,6 +67,7 @@ int16_t txnErrorToProtocol(int txnErr) noexcept {
         case 4:  return static_cast<int16_t>(ErrorCode::InvalidTxnState);
         case 5:  return static_cast<int16_t>(ErrorCode::InvalidTxnState);
         case 6:  return static_cast<int16_t>(ErrorCode::ConcurrentTransactions);  // retriable (Kafka)
+        case 8:  return static_cast<int16_t>(ErrorCode::NamespaceLimitExceeded);  // Task 10 (D24): maxOpenTxns / maxTxnTimeMs
         default: return static_cast<int16_t>(ErrorCode::Internal);
     }
 }
@@ -406,18 +408,21 @@ int64_t TransactionCoordinationService::requestPid_(int64_t pid, int64_t session
 // retriably).  Only a coordinator wired without a registry (unit rigs) names topics
 // "topic_<id>" — its markers go through the by-name test seam.  Cold.
 // ---------------------------------------------------------------------------
-bool TransactionCoordinationService::topicNameOf_(int32_t topicId, std::string& out)
+TransactionCoordinationService::TopicLookup
+TransactionCoordinationService::topicNameOf_(uint32_t nsId, int32_t topicId, std::string& out)
 {
     if (topics_ != nullptr) {
         const auto* spec = topics_->topic(topicId);
-        if (spec == nullptr) return false;
+        if (spec == nullptr) return TopicLookup::Unknown;
+        // Review U2: a topic of another namespace than the id's is treated exactly as "does not exist" (UnknownTopic).
+        if (spec->nsId != nsId) return TopicLookup::Foreign;
         out = spec->name;
-        return true;
+        return TopicLookup::Ok;
     }
     char numBuf[32];
     const int n = std::snprintf(numBuf, sizeof(numBuf), "topic_%d", topicId);
     out.assign(numBuf, static_cast<size_t>(n > 0 ? n : 0));
-    return true;
+    return TopicLookup::Ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -429,9 +434,6 @@ int16_t TransactionCoordinationService::verifyTxnPartition(int64_t producerId, i
     if (!ensureLoaded_(nowNs)) return static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
     tx::TopicPartition tp;
     tp.partition = partition;
-    // A topic this registry does not know (yet) is never judged: retriable (the
-    // client re-sends; once applied, the name matches what AddPartitions registered).
-    if (!topicNameOf_(topicId, tp.topic)) return static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions);
     const tx::TransactionMetadata* meta = nullptr;
     if (const auto it = pidIndex_.find(producerId); it != pidIndex_.end()) {
         meta = coordinator_.metadata(it->second);
@@ -442,6 +444,14 @@ int16_t TransactionCoordinationService::verifyTxnPartition(int64_t producerId, i
         if (meta == nullptr) return static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);   // no such transaction
         if (pidIndex_.size() > 2 * coordinator_.size() + 1024) [[unlikely]] pidIndex_.clear();   // stale ids
         pidIndex_.emplace(producerId, meta->txnId);
+    }
+    // A topic this registry does not know (yet) is never judged: retriable (the client re-sends; once applied, the name
+    // matches what AddPartitions registered).  Review U2: a topic of another namespace than the transactional id's
+    // is "does not exist" (UnknownTopic, non-retriable) - the verification never matches it by name.
+    switch (topicNameOf_(rune::coordination::parseScopedId(meta->txnId).nsId, topicId, tp.topic)) {
+        case TopicLookup::Ok: break;
+        case TopicLookup::Unknown: return static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions);
+        case TopicLookup::Foreign: return static_cast<int16_t>(pc::ErrorCode::UnknownTopic);
     }
     if (producerEpoch < meta->producerEpoch) return static_cast<int16_t>(pc::ErrorCode::ProducerFenced);
     if (producerEpoch > meta->producerEpoch) return static_cast<int16_t>(pc::ErrorCode::InvalidProducerEpoch);
@@ -462,38 +472,78 @@ int16_t TransactionCoordinationService::verifyTxnPartition(int64_t producerId, i
 // ---------------------------------------------------------------------------
 // #358 class: answers and markers wait for the __transaction_state records they depend on to COMMIT.
 // ---------------------------------------------------------------------------
-size_t TransactionCoordinationService::handleInitProducerId(const uint8_t* buf, size_t len, int64_t nowNs,
-                                                            uint8_t* out, size_t outCap)
+// Namespaces Phase 2 Task 4: the gateway's revoke / suspend / delete hooks.  Control thread; only a Loaded coordinator
+// holds transactions (an Unloaded one answers 0).  The abort is the coordinator's internal one: PrepareAbort is
+// persisted (here, through the same gate as a timeout abort) and doWork() hands the ABORT markers out.
+uint32_t TransactionCoordinationService::abortAllForSession(int64_t sessionId, int64_t nowNs)
 {
-    if (parkNextTxn_(buf, len, pc::TemplateId::InitProducerId, nowNs)) return 0;   // #557: answered by replayNextTxn_
+    if (loadState_ != LoadState::Loaded) return 0;
+    return coordinator_.abortAllForSession(sessionId, nowNs);
+}
+
+ReapStatus TransactionCoordinationService::tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs)
+{
+    if (txnState_ == nullptr) return ReapStatus::Done;   // no transaction-state store (a rig): nothing to remove
+    if (loadState_ != LoadState::Loaded) return ReapStatus::Refused;
+    (void)coordinator_.abortAllForNamespace(nsId, nowNs);   // idempotent: anything still open ends now
+    if (coordinator_.anyUnsettledForNamespace(nsId)) return ReapStatus::Refused;
+    rune::replication::PartitionReplica* r = txnState_->replica();
+    const rune::replication::Offset leo0 = r->logEndOffset();
+    const bool none = txnState_->tombstoneNamespace(nsId, batch, nowNs);
+    if (!none) return r->logEndOffset() > leo0 ? ReapStatus::More : ReapStatus::Refused;
+    // Nothing left to write: Done only once every tombstone is committed (a leader change must not resurrect a key).
+    return r->highWatermark() >= r->logEndOffset() ? ReapStatus::Done : ReapStatus::More;
+}
+
+std::optional<std::size_t> TransactionCoordinationService::liveKeysOfNamespaceForTest(uint32_t nsId) const
+{
+    if (txnState_ == nullptr || loadState_ != LoadState::Loaded) return std::nullopt;   // unknown: store not loaded
+    return txnState_->liveKeysOfNamespaceForTest(nsId);
+}
+
+uint32_t TransactionCoordinationService::abortAllForNamespace(uint32_t nsId, int64_t nowNs)
+{
+    if (loadState_ != LoadState::Loaded) return 0;
+    return coordinator_.abortAllForNamespace(nsId, nowNs);
+}
+
+size_t TransactionCoordinationService::handleInitProducerId(const uint8_t* buf, size_t len, int64_t nowNs,
+                                                            uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
+{
+    if (parkNextTxn_(buf, len, pc::TemplateId::InitProducerId, nowNs, ctx)) return 0;   // #557: answered by replayNextTxn_
     beginRequest_();
-    return finishRequest_(buf, len, out, outCap, handleInitProducerId_(buf, len, nowNs, out, outCap));
+    return finishRequest_(buf, len, out, outCap, handleInitProducerId_(buf, len, nowNs, out, outCap, ctx));
 }
 size_t TransactionCoordinationService::handleAddPartitions(const uint8_t* buf, size_t len, int64_t nowNs,
-                                                           uint8_t* out, size_t outCap)
+                                                           uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
 {
-    if (parkNextTxn_(buf, len, pc::TemplateId::AddPartitionsToTxn, nowNs)) return 0;   // #557: answered by replayNextTxn_
+    if (parkNextTxn_(buf, len, pc::TemplateId::AddPartitionsToTxn, nowNs, ctx)) return 0;   // #557: answered by replayNextTxn_
     beginRequest_();
-    return finishRequest_(buf, len, out, outCap, handleAddPartitions_(buf, len, nowNs, out, outCap));
+    return finishRequest_(buf, len, out, outCap, handleAddPartitions_(buf, len, nowNs, out, outCap, ctx));
 }
 size_t TransactionCoordinationService::handleAddOffsets(const uint8_t* buf, size_t len, int64_t nowNs,
-                                                        uint8_t* out, size_t outCap)
+                                                        uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
 {
-    if (parkNextTxn_(buf, len, pc::TemplateId::AddOffsetsToTxn, nowNs)) return 0;   // #557: answered by replayNextTxn_
+    if (parkNextTxn_(buf, len, pc::TemplateId::AddOffsetsToTxn, nowNs, ctx)) return 0;   // #557: answered by replayNextTxn_
     beginRequest_();
-    return finishRequest_(buf, len, out, outCap, handleAddOffsets_(buf, len, nowNs, out, outCap));
+    return finishRequest_(buf, len, out, outCap, handleAddOffsets_(buf, len, nowNs, out, outCap, ctx));
 }
 size_t TransactionCoordinationService::handleTxnOffsetCommit(const uint8_t* buf, size_t len, int64_t nowNs,
-                                                             uint8_t* out, size_t outCap)
+                                                             uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
 {
     beginRequest_();
-    return finishRequest_(buf, len, out, outCap, handleTxnOffsetCommit_(buf, len, nowNs, out, outCap));
+    return finishRequest_(buf, len, out, outCap, handleTxnOffsetCommit_(buf, len, nowNs, out, outCap, ctx));
 }
 size_t TransactionCoordinationService::handleEndTxn(const uint8_t* buf, size_t len, int64_t nowNs,
-                                                    uint8_t* out, size_t outCap)
+                                                    uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
 {
     beginRequest_();
-    return finishRequest_(buf, len, out, outCap, handleEndTxn_(buf, len, nowNs, out, outCap));
+    return finishRequest_(buf, len, out, outCap, handleEndTxn_(buf, len, nowNs, out, outCap, ctx));
 }
 
 bool TransactionCoordinationService::persist_(const tx::TransactionMetadata& meta)
@@ -563,7 +613,8 @@ size_t TransactionCoordinationService::finishRequest_(const uint8_t* buf, size_t
 // ---------------------------------------------------------------------------
 // #557: the next transaction's first leg is parked while the previous one's markers land (see the header).
 // ---------------------------------------------------------------------------
-bool TransactionCoordinationService::parkNextTxn_(const uint8_t* buf, size_t len, pc::TemplateId tid, int64_t nowNs)
+bool TransactionCoordinationService::parkNextTxn_(const uint8_t* buf, size_t len, pc::TemplateId tid, int64_t nowNs,
+                                                  const rune::coordination::NsRequestContext& ctx)
 {
     if (parkedNextTxn_.size() >= maxParkedNextTxn_) return false;   // over the cap: the handler answers 27
     int64_t                  sessionId = 0, producerId = 0;
@@ -592,7 +643,7 @@ bool TransactionCoordinationService::parkNextTxn_(const uint8_t* buf, size_t len
         default: return false;
     }
     if (id.empty() || !ensureLoaded_(nowNs)) return false;   // unloaded: the handler answers NotCoordinator
-    txnIdScratch_.assign(reinterpret_cast<const char*>(id.data()), id.size());
+    rune::gateway::scopeClientIdInto(ctx, idView_(id), txnIdScratch_);   // Phase 2 Task 5 (D19)
     const auto* meta = coordinator_.metadata(txnIdScratch_);
     if (meta == nullptr || (meta->state != tx::TxnState::PrepareCommit && meta->state != tx::TxnState::PrepareAbort))
         return false;
@@ -602,6 +653,7 @@ bool TransactionCoordinationService::parkNextTxn_(const uint8_t* buf, size_t len
     ParkedNextTxn p;
     p.sessionId  = sessionId;
     p.templateId = static_cast<uint16_t>(tid);
+    p.ctx        = ctx;   // the replay keeps the parked request's namespace context
     if (!spareBufs_.empty()) { p.request = std::move(spareBufs_.back()); spareBufs_.pop_back(); }
     p.request.assign(buf, buf + len);
     parkedNextTxn_.push_back(std::move(p));
@@ -630,11 +682,11 @@ int TransactionCoordinationService::replayNextTxn_(int64_t nowNs)
         size_t answered = 0;
         switch (static_cast<pc::TemplateId>(p.templateId)) {
             case pc::TemplateId::InitProducerId:
-                answered = handleInitProducerId(b, k, nowNs, replayOut_.data(), replayOut_.size()); break;
+                answered = handleInitProducerId(b, k, nowNs, replayOut_.data(), replayOut_.size(), p.ctx); break;
             case pc::TemplateId::AddPartitionsToTxn:
-                answered = handleAddPartitions(b, k, nowNs, replayOut_.data(), replayOut_.size()); break;
+                answered = handleAddPartitions(b, k, nowNs, replayOut_.data(), replayOut_.size(), p.ctx); break;
             case pc::TemplateId::AddOffsetsToTxn:
-                answered = handleAddOffsets(b, k, nowNs, replayOut_.data(), replayOut_.size()); break;
+                answered = handleAddOffsets(b, k, nowNs, replayOut_.data(), replayOut_.size(), p.ctx); break;
             default: break;   // unreachable: only these three are parked
         }
         if (answered != 0) {
@@ -763,7 +815,8 @@ void TransactionCoordinationService::dropDeferred_()
 // ---------------------------------------------------------------------------
 size_t TransactionCoordinationService::handleInitProducerId_(
     const uint8_t* buf, size_t len, int64_t nowNs,
-    uint8_t* out, size_t outCap)
+    uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
 {
     if (outCap < rune::gateway::kTxnMinOutCap) [[unlikely]] haltTxnOutCapBreach_(outCap);   // fix round 3 (I3)
     auto msgOpt = pc::InitProducerId::decode(buf, len);
@@ -773,6 +826,9 @@ size_t TransactionCoordinationService::handleInitProducerId_(
             buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const auto& msg = *msgOpt;
+    if (rune::coordination::reservedClientId(idView_(msg.transactionalId))) [[unlikely]]   // D19: the scoped-id prefix is reserved
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
 
     // Build response shell (sessionId/correlationId always echoed).
     pc::InitProducerIdResponse resp;
@@ -791,9 +847,7 @@ size_t TransactionCoordinationService::handleInitProducerId_(
     // Decode transactionalId as std::optional<std::string_view>.
     std::optional<tx::TransactionalId> txnIdOpt;
     if (!msg.transactionalId.empty()) {
-        txnIdScratch_.assign(
-            reinterpret_cast<const char*>(msg.transactionalId.data()),
-            msg.transactionalId.size());
+        rune::gateway::scopeClientIdInto(ctx, idView_(msg.transactionalId), txnIdScratch_);   // D19
         txnIdOpt = txnIdScratch_;
     }
 
@@ -830,9 +884,16 @@ size_t TransactionCoordinationService::handleInitProducerId_(
 
     resp.producerId    = result.producerId;
     resp.producerEpoch = result.producerEpoch;
-    resp.errorCode     = txnErrorToProtocol(result.errorCode);
+    resp.errorCode     = nsLimitForClient_(txnErrorToProtocol(result.errorCode), msg.sessionId);
     if (outCap < pc::InitProducerIdResponse::ENCODED_SIZE) return answerCannotFit_(buf, len, out, outCap);
     return resp.encode(out);
+}
+
+int16_t TransactionCoordinationService::nsLimitForClient_(int16_t code, int64_t sessionId) const
+{
+    if (code != static_cast<int16_t>(pc::ErrorCode::NamespaceLimitExceeded) || gateway_ == nullptr) return code;
+    const int32_t v = gateway_->sessionClientVersion(sessionId);
+    return v >= 0 && v < pc::kClientVersionNamespaces ? static_cast<int16_t>(pc::ErrorCode::InvalidRequest) : code;
 }
 
 // ---------------------------------------------------------------------------
@@ -840,7 +901,8 @@ size_t TransactionCoordinationService::handleInitProducerId_(
 // ---------------------------------------------------------------------------
 size_t TransactionCoordinationService::handleAddPartitions_(
     const uint8_t* buf, size_t len, int64_t nowNs,
-    uint8_t* out, size_t outCap)
+    uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
 {
     if (outCap < rune::gateway::kTxnMinOutCap) [[unlikely]] haltTxnOutCapBreach_(outCap);   // fix round 3 (I3)
     auto msgOpt = pc::AddPartitionsToTxn::decode(buf, len);
@@ -850,6 +912,9 @@ size_t TransactionCoordinationService::handleAddPartitions_(
             buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const auto& msg = *msgOpt;
+    if (rune::coordination::reservedClientId(idView_(msg.transactionalId))) [[unlikely]]   // D19: the scoped-id prefix is reserved
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
 
     // NotCoordinator fence — build minimal response (F15 §5.1: only while Loaded).
     if (!ensureLoaded_(nowNs)) {
@@ -876,9 +941,7 @@ size_t TransactionCoordinationService::handleAddPartitions_(
     }
 
     // Decode txnId.
-    txnIdScratch_.assign(
-        reinterpret_cast<const char*>(msg.transactionalId.data()),
-        msg.transactionalId.size());
+    rune::gateway::scopeClientIdInto(ctx, idView_(msg.transactionalId), txnIdScratch_);   // D19
 
     // Build partition vector.  Protocol sends topicId (int32) + partition (int32).
     // TransactionCoordinator needs topic name strings (resolved via TopicRegistry).
@@ -888,22 +951,26 @@ size_t TransactionCoordinationService::handleAddPartitions_(
     // get its marker (the marker dispatch resolves names), pinning the LSO forever.
     partitionScratch_.clear();
     const size_t partCount = msg.partitions.size();
-    bool unknownTopic = false;
+    TopicLookup lookup = TopicLookup::Ok;
+    const uint32_t txnNs = rune::coordination::parseScopedId(txnIdScratch_).nsId;
     for (size_t i = 0; i < partCount; ++i) {
         auto tp = msg.partitions[i];
         tx::TopicPartition txtp;
         txtp.partition = tp.partition;
-        if (!topicNameOf_(tp.topicId, txtp.topic)) { unknownTopic = true; break; }
+        const TopicLookup l = topicNameOf_(txnNs, tp.topicId, txtp.topic);
+        if (l == TopicLookup::Foreign) { lookup = l; break; }   // Foreign wins over Unknown: UnknownTopic, non-retriable
+        if (l == TopicLookup::Unknown) lookup = l;
         partitionScratch_.push_back(std::move(txtp));
     }
-    if (unknownTopic) [[unlikely]] {
+    if (lookup != TopicLookup::Ok) [[unlikely]] {
+        const int16_t refusal = static_cast<int16_t>(lookup == TopicLookup::Foreign ? pc::ErrorCode::UnknownTopic
+                                                                                    : pc::ErrorCode::ConcurrentTransactions);
         const size_t needed = pc::AddPartitionsToTxnResponse::encodedSizeFor(partCount);
         if (outCap < needed) return answerCannotFit_(buf, len, out, outCap);
         partResultScratch_.clear();
         for (size_t i = 0; i < partCount; ++i) {
             auto tp = msg.partitions[i];
-            partResultScratch_.push_back({tp.topicId, tp.partition,
-                                          static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions)});
+            partResultScratch_.push_back({tp.topicId, tp.partition, refusal});
         }
         pc::AddPartitionsToTxnResponse resp;
         resp.sessionId     = msg.sessionId;
@@ -917,6 +984,7 @@ size_t TransactionCoordinationService::handleAddPartitions_(
 
     // Persist before responding (pass the real coordinatorEpoch, not literal 0).
     if (result.ok()) {
+        coordinator_.noteSession(txnIdScratch_, msg.sessionId);   // Task 4: abortAllForSession finds it
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
             (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
@@ -925,7 +993,7 @@ size_t TransactionCoordinationService::handleAddPartitions_(
 
     // Encode response: one result entry per partition with the same error code.
     // Reuse partResultScratch_ (pre-reserved member) — no per-call alloc.
-    const int16_t errCode = txnErrorToProtocol(concurrentIfPreparing_(result.errorCode));
+    const int16_t errCode = nsLimitForClient_(txnErrorToProtocol(concurrentIfPreparing_(result.errorCode)), msg.sessionId);
     const size_t needed = pc::AddPartitionsToTxnResponse::encodedSizeFor(partCount);
     if (outCap < needed) return answerCannotFit_(buf, len, out, outCap);
 
@@ -946,7 +1014,8 @@ size_t TransactionCoordinationService::handleAddPartitions_(
 // ---------------------------------------------------------------------------
 size_t TransactionCoordinationService::handleAddOffsets_(
     const uint8_t* buf, size_t len, int64_t nowNs,
-    uint8_t* out, size_t outCap)
+    uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
 {
     if (outCap < rune::gateway::kTxnMinOutCap) [[unlikely]] haltTxnOutCapBreach_(outCap);   // fix round 3 (I3)
     auto msgOpt = pc::AddOffsetsToTxn::decode(buf, len);
@@ -956,6 +1025,9 @@ size_t TransactionCoordinationService::handleAddOffsets_(
             buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const auto& msg = *msgOpt;
+    if (rune::coordination::reservedClientId(idView_(msg.transactionalId)) || rune::coordination::reservedClientId(idView_(msg.groupId))) [[unlikely]]   // D19: the scoped-id prefix is reserved
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
 
     pc::AddOffsetsToTxnResponse resp;
     resp.sessionId     = msg.sessionId;
@@ -968,12 +1040,8 @@ size_t TransactionCoordinationService::handleAddOffsets_(
     }
 
     // Decode txnId and groupId.
-    txnIdScratch_.assign(
-        reinterpret_cast<const char*>(msg.transactionalId.data()),
-        msg.transactionalId.size());
-    groupIdScratch_.assign(
-        reinterpret_cast<const char*>(msg.groupId.data()),
-        msg.groupId.size());
+    rune::gateway::scopeClientIdInto(ctx, idView_(msg.transactionalId), txnIdScratch_);   // D19
+    rune::gateway::scopeClientIdInto(ctx, idView_(msg.groupId), groupIdScratch_);   // D19
 
     // addOffsetsToTxn registers the group so it's included in the commit.
     // The actual offset values are sent via TxnOffsetCommit (templateId 51).
@@ -988,13 +1056,14 @@ size_t TransactionCoordinationService::handleAddOffsets_(
 
     // Persist before responding (pass the real coordinatorEpoch, not literal 0).
     if (result.ok()) {
+        coordinator_.noteSession(txnIdScratch_, msg.sessionId);   // Task 4: abortAllForSession finds it
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
             (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
         }
     }
 
-    resp.errorCode = txnErrorToProtocol(concurrentIfPreparing_(result.errorCode));
+    resp.errorCode = nsLimitForClient_(txnErrorToProtocol(concurrentIfPreparing_(result.errorCode)), msg.sessionId);
     if (outCap < pc::AddOffsetsToTxnResponse::ENCODED_SIZE) return answerCannotFit_(buf, len, out, outCap);
     return resp.encode(out);
 }
@@ -1004,7 +1073,8 @@ size_t TransactionCoordinationService::handleAddOffsets_(
 // ---------------------------------------------------------------------------
 size_t TransactionCoordinationService::handleTxnOffsetCommit_(
     const uint8_t* buf, size_t len, int64_t nowNs,
-    uint8_t* out, size_t outCap)
+    uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
 {
     if (outCap < rune::gateway::kTxnMinOutCap) [[unlikely]] haltTxnOutCapBreach_(outCap);   // fix round 3 (I3)
     auto msgOpt = pc::TxnOffsetCommit::decode(buf, len);
@@ -1014,6 +1084,9 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit_(
             buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const auto& msg = *msgOpt;
+    if (rune::coordination::reservedClientId(idView_(msg.transactionalId)) || rune::coordination::reservedClientId(idView_(msg.groupId))) [[unlikely]]   // D19: the scoped-id prefix is reserved
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
 
     // NotCoordinator fence — encode all entries with NotCoordinator using
     // partResultScratch_ directly (no per-call vector alloc).
@@ -1034,12 +1107,8 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit_(
     }
 
     // Decode txnId and groupId.
-    txnIdScratch_.assign(
-        reinterpret_cast<const char*>(msg.transactionalId.data()),
-        msg.transactionalId.size());
-    groupIdScratch_.assign(
-        reinterpret_cast<const char*>(msg.groupId.data()),
-        msg.groupId.size());
+    rune::gateway::scopeClientIdInto(ctx, idView_(msg.transactionalId), txnIdScratch_);   // D19
+    rune::gateway::scopeClientIdInto(ctx, idView_(msg.groupId), groupIdScratch_);   // D19
 
     // #125 (KIP-447): a member block is fenced exactly like an OffsetCommit; a refusal adds nothing.  A legacy frame
     // (no block) has no member to check (Kafka compatibility).
@@ -1069,9 +1138,13 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit_(
     // #112 review (same class as AddPartitions): an unknown topic id is refused retriably,
     // never recorded under a "topic_<id>" placeholder the group would never resolve.
     offsetsScratch_.clear();
+    const uint32_t groupNs = rune::coordination::parseScopedId(groupIdScratch_).nsId;
     for (const auto& e : msg.entries) {
         rune::coordination::TopicPartition tp;
-        if (!topicNameOf_(e.topicId, tp.topic)) [[unlikely]]
+        const TopicLookup l = topicNameOf_(groupNs, e.topicId, tp.topic);
+        if (l == TopicLookup::Foreign) [[unlikely]]   // Review U2: another namespace's topic does not exist for this group
+            return answerAll(static_cast<int16_t>(pc::ErrorCode::UnknownTopic));
+        if (l == TopicLookup::Unknown) [[unlikely]]
             return answerAll(static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
         tp.partition = e.partition;
         offsetsScratch_[tp] = e.offset;
@@ -1088,6 +1161,7 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit_(
 
     // Persist before responding (pass the real coordinatorEpoch, not literal 0).
     if (result.ok()) {
+        coordinator_.noteSession(txnIdScratch_, msg.sessionId);   // Task 4: abortAllForSession finds it
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
             (void)persist_(*meta);   // #358 class: the answer waits for the record (finishRequest_)
@@ -1118,7 +1192,8 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit_(
 // ---------------------------------------------------------------------------
 size_t TransactionCoordinationService::handleEndTxn_(
     const uint8_t* buf, size_t len, int64_t nowNs,
-    uint8_t* out, size_t outCap)
+    uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
 {
     if (outCap < rune::gateway::kTxnMinOutCap) [[unlikely]] haltTxnOutCapBreach_(outCap);   // fix round 3 (I3)
     auto msgOpt = pc::EndTxn::decode(buf, len);
@@ -1128,6 +1203,9 @@ size_t TransactionCoordinationService::handleEndTxn_(
             buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const auto& msg = *msgOpt;
+    if (rune::coordination::reservedClientId(idView_(msg.transactionalId))) [[unlikely]]   // D19: the scoped-id prefix is reserved
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
 
     pc::EndTxnResponse resp;
     resp.sessionId     = msg.sessionId;
@@ -1140,9 +1218,7 @@ size_t TransactionCoordinationService::handleEndTxn_(
     }
 
     // Decode txnId.
-    txnIdScratch_.assign(
-        reinterpret_cast<const char*>(msg.transactionalId.data()),
-        msg.transactionalId.size());
+    rune::gateway::scopeClientIdInto(ctx, idView_(msg.transactionalId), txnIdScratch_);   // D19
 
     const bool commit = (msg.commit != 0);
     const auto result = coordinator_.endTransaction(
@@ -1225,7 +1301,7 @@ void TransactionCoordinationService::dispatchMarkers_(
     for (const auto& tp : parts) {
         const auto batch = tx::ControlMarker::build(producerId, producerEpoch, ct, coordinatorEpoch);
         if (gateway_ && topics_) {
-            const auto topicIdOpt = topics_->topicIdForName(tp.topic);
+            const auto topicIdOpt = topics_->topicIdForName(rune::coordination::parseScopedId(txnId).nsId, tp.topic);
             if (!topicIdOpt.has_value()) {
                 spdlog::warn("TCS: marker for unknown topic '{}' partition={} — skipped", tp.topic, tp.partition);
                 continue;

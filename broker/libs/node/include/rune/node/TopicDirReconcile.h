@@ -70,6 +70,24 @@ struct TopicDirReconciliation {
 reconcileTopicDirs(const std::string& dataDir, const std::vector<TopicSpec>& catalogTopics,
                    std::span<const int32_t> droppedIds, int64_t nowUnixSeconds);
 
+// ─── Deleted namespaces (Phase 2 Task 7, D18) ─────────────────────────────────
+// A namespace's erase renames ns-<id> to ns-<id>.deleting and removes it off-thread.  At boot (before the reconcile
+// above) every such leftover is settled against the BOOTED catalog:
+//   * ns-<id>.deleting whose nsId is ERASED (not in the registry, id below nextNsId) -> removed;
+//   * ns-<id>.deleting whose nsId is DELETING                                       -> kept (its erase is still to come);
+//   * ns-<id>.deleting whose nsId is LIVE (active / suspended)                      -> a fatal mismatch: logged at
+//     critical and listed in `liveMismatch` (the broker refuses to start);
+//   * ns-<id> (no suffix) whose nsId is ERASED (a crash between the erase and the rename) -> moved to .deleting, removed.
+struct NsDirFact { uint32_t nsId = 0; bool deleting = false; };   // one entry per namespace the registry holds
+struct NsDeletingReconciliation {
+    std::vector<std::filesystem::path> removed;        // ns-<id>.deleting removed (an erased nsId)
+    std::vector<std::filesystem::path> keptDeleting;   // ns-<id>.deleting of a DELETING nsId, left alone
+    std::vector<std::filesystem::path> liveMismatch;   // ns-<id>.deleting of a LIVE nsId: fatal
+    std::vector<std::filesystem::path> erasedDirs;     // ns-<id> of an erased nsId, moved to .deleting and removed
+};
+[[nodiscard]] NsDeletingReconciliation reconcileNsDeletingDirs(const std::string& dataDir, std::span<const NsDirFact> facts,
+                                                               uint32_t nextNsId);
+
 // ─── The catch-up sentinel (fix round 1, R2) ──────────────────────────────────
 // `dataDir/.catalog-catchup`: "pending\n" = a broker booted with a local catalog it could not trust
 // (empty while catalog-made topic dirs exist) and its catch-up has not completed; "caughtup <offset>\n"

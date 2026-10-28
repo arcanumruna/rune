@@ -7,7 +7,10 @@
 #include <array>
 #include <charconv>
 #include <cstdlib>
+#include <iostream>
 #include <sstream>
+
+#include <unistd.h>
 
 #ifdef RUNE_CLI_LIVE_ENABLED
 #include <rune/client/Client.h>
@@ -220,6 +223,142 @@ int cmdLimits(std::vector<std::string> args, std::ostream& out, std::ostream& er
 #endif
 }
 
+int cmdSuspend(std::vector<std::string> args, std::ostream& out, std::ostream& err) {
+    std::string name;
+    if (!takeName(args, name)) return namespaceUsageError("suspend", err, "a namespace <name> is required");
+    ParsedArgs a;
+    if (!parseArgs("namespace suspend", args, {"--broker"}, {"--read-only", "--reject-all"}, a, err)) {
+        printNamespaceUsage(err);
+        return 2;
+    }
+    if (a.has("--read-only") == a.has("--reject-all"))
+        return namespaceUsageError("suspend", err, "exactly one of --read-only or --reject-all is required");
+    const std::string endpoint = endpointOf(a);
+    if (endpoint.empty()) return namespaceUsageError("suspend", err, "--broker host:port is required");
+#ifdef RUNE_CLI_LIVE_ENABLED
+    engine::LiveBroker broker;
+    if (!broker.open(engine::liveOptionsOf(a, endpoint, false), err)) return 1;
+    try {
+        const bool readOnly = a.has("--read-only");
+        const auto r = broker.client().suspendNamespace(
+            name, readOnly ? rpc::NsSuspendMode::ReadOnly : rpc::NsSuspendMode::RejectAll, broker.ddlTimeout());
+        if (!r) return refused(err, "suspend", r.error());
+        out << "suspended namespace " << name << (readOnly ? " (read-only)" : " (reject-all)") << "\n";
+        return 0;
+    } catch (const std::exception& e) {
+        err << "rune: " << e.what() << "\n";
+        return 1;
+    }
+#else
+    (void)out;
+    err << "rune namespace suspend: live mode requires RUNE_CLI_LIVE_ENABLED and a real Aeron build.\n";
+    return 1;
+#endif
+}
+
+int cmdResume(std::vector<std::string> args, std::ostream& out, std::ostream& err) {
+    std::string name;
+    if (!takeName(args, name)) return namespaceUsageError("resume", err, "a namespace <name> is required");
+    ParsedArgs a;
+    if (!parseArgs("namespace resume", args, {"--broker"}, {}, a, err)) {
+        printNamespaceUsage(err);
+        return 2;
+    }
+    const std::string endpoint = endpointOf(a);
+    if (endpoint.empty()) return namespaceUsageError("resume", err, "--broker host:port is required");
+#ifdef RUNE_CLI_LIVE_ENABLED
+    engine::LiveBroker broker;
+    if (!broker.open(engine::liveOptionsOf(a, endpoint, false), err)) return 1;
+    try {
+        const auto r = broker.client().resumeNamespace(name, broker.ddlTimeout());
+        if (!r) return refused(err, "resume", r.error());
+        out << "resumed namespace " << name << "\n";
+        return 0;
+    } catch (const std::exception& e) {
+        err << "rune: " << e.what() << "\n";
+        return 1;
+    }
+#else
+    (void)out;
+    err << "rune namespace resume: live mode requires RUNE_CLI_LIVE_ENABLED and a real Aeron build.\n";
+    return 1;
+#endif
+}
+
+int cmdDelete(std::vector<std::string> args, std::istream& in, bool interactive, std::ostream& out, std::ostream& err) {
+    std::string name;
+    if (!takeName(args, name)) return namespaceUsageError("delete", err, "a namespace <name> is required");
+    ParsedArgs a;
+    if (!parseArgs("namespace delete", args, {"--broker"}, {"--yes"}, a, err)) {
+        printNamespaceUsage(err);
+        return 2;
+    }
+    const std::string endpoint = endpointOf(a);
+    if (endpoint.empty()) return namespaceUsageError("delete", err, "--broker host:port is required");
+    // Deleting drops every object of the namespace: without --yes it is confirmed on a terminal and refused anywhere else.
+    if (!a.has("--yes")) {
+        if (!interactive) {
+            err << "rune namespace delete: refusing to delete namespace '" << name
+                << "' without --yes (not a terminal: nothing to confirm with)\n";
+            return 1;
+        }
+        err << "Delete namespace '" << name << "' and every topic, view, user and group in it? This cannot be undone. [y/N] "
+            << std::flush;
+        std::string answer;
+        std::getline(in, answer);
+        if (answer != "y" && answer != "Y" && answer != "yes" && answer != "YES") {
+            err << "rune namespace delete: aborted\n";
+            return 1;
+        }
+    }
+#ifdef RUNE_CLI_LIVE_ENABLED
+    engine::LiveBroker broker;
+    if (!broker.open(engine::liveOptionsOf(a, endpoint, false), err)) return 1;
+    try {
+        const auto r = broker.client().deleteNamespace(name, broker.ddlTimeout());
+        if (!r) return refused(err, "delete", r.error());
+        out << "deleting namespace " << name << " (its sessions are closed and its objects dropped in steps)\n";
+        return 0;
+    } catch (const std::exception& e) {
+        err << "rune: " << e.what() << "\n";
+        return 1;
+    }
+#else
+    (void)out;
+    err << "rune namespace delete: live mode requires RUNE_CLI_LIVE_ENABLED and a real Aeron build.\n";
+    return 1;
+#endif
+}
+
+int cmdUsage(std::vector<std::string> args, std::ostream& out, std::ostream& err) {
+    std::string name;
+    if (!takeName(args, name)) return namespaceUsageError("usage", err, "a namespace <name> is required");
+    ParsedArgs a;
+    if (!parseArgs("namespace usage", args, {"--broker"}, {"--json"}, a, err)) {
+        printNamespaceUsage(err);
+        return 2;
+    }
+    const std::string endpoint = endpointOf(a);
+    if (endpoint.empty()) return namespaceUsageError("usage", err, "--broker host:port is required");
+#ifdef RUNE_CLI_LIVE_ENABLED
+    engine::LiveBroker broker;
+    if (!broker.open(engine::liveOptionsOf(a, endpoint, false), err)) return 1;
+    try {
+        const auto r = broker.client().namespaceUsage(name, broker.ddlTimeout());
+        if (!r) return refused(err, "usage", r.error());
+        out << (a.has("--json") ? formatNamespaceUsageJson(name, *r) : formatNamespaceUsage(name, *r));
+        return 0;
+    } catch (const std::exception& e) {
+        err << "rune: " << e.what() << "\n";
+        return 1;
+    }
+#else
+    (void)out;
+    err << "rune namespace usage: live mode requires RUNE_CLI_LIVE_ENABLED and a real Aeron build.\n";
+    return 1;
+#endif
+}
+
 } // namespace
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -312,6 +451,49 @@ std::string formatNamespaceLimits(const rp::NamespaceLimits& l) {
     return o.str();
 }
 
+namespace {
+// The fields whose usage this build can report (see ClientGateway::handleNamespaceUsage); the rest print `-`.
+bool hasUsage(std::size_t i) noexcept {
+    switch (i) {
+        case 0: case 1: case 2: case 3: case 8: case 13: case 14: case 15: case 16: case 17: case 18: case 19: case 20: case 23:
+            return true;
+        default:
+            return false;
+    }
+}
+}  // namespace
+
+std::string formatNamespaceUsage(std::string_view name, const rpc::NamespaceUsageResponse& r) {
+    std::size_t w = 5;
+    for (const auto& f : rcl::kNamespaceLimitFields) w = std::max(w, f.name.size());
+    std::ostringstream o;
+    o << "namespace " << name << " (" << stateName(r.state) << ")\n";
+    auto row = [&](const std::string& k, const std::string& v, const std::string& u) {
+        o << k << std::string(w - k.size() + 2, ' ') << v << std::string(v.size() < 12 ? 12 - v.size() : 0, ' ') << "  " << u << "\n";
+    };
+    row("limit", "value", "usage");
+    for (std::size_t i = 0; i < rcl::kNamespaceLimitFields.size(); ++i)
+        row(std::string(rcl::kNamespaceLimitFields[i].name), std::to_string(rcl::namespaceLimitGet(r.limits, i)),
+            hasUsage(i) ? std::to_string(r.usage[i]) : std::string("-"));
+    return o.str();
+}
+
+std::string formatNamespaceUsageJson(std::string_view name, const rpc::NamespaceUsageResponse& r) {
+    std::ostringstream o;
+    o << "{\"name\":" << jsonString(name) << ",\"state\":\"" << stateName(r.state) << "\",\"limits\":{";
+    for (std::size_t i = 0; i < rcl::kNamespaceLimitFields.size(); ++i)
+        o << (i ? "," : "") << "\"" << rcl::kNamespaceLimitFields[i].name << "\":" << rcl::namespaceLimitGet(r.limits, i);
+    o << "},\"usage\":{";
+    bool first = true;
+    for (std::size_t i = 0; i < rcl::kNamespaceLimitFields.size(); ++i) {
+        if (!hasUsage(i)) continue;
+        o << (first ? "" : ",") << "\"" << rcl::kNamespaceLimitFields[i].name << "\":" << r.usage[i];
+        first = false;
+    }
+    o << "}}\n";
+    return o.str();
+}
+
 void printNamespaceUsage(std::ostream& err) {
     err << "  rune namespace create <name> [--<limit> N ...] --broker host:port\n"
         << "      Creates a namespace (ADMIN ON CLUSTER).  Limits not named take the broker's defaults.\n"
@@ -319,6 +501,14 @@ void printNamespaceUsage(std::ostream& err) {
         << "      Lists every namespace: nsId, name, state (and every limit with --json).\n"
         << "  rune namespace limits <name> [--set <limit>=N ...] --broker host:port\n"
         << "      Prints the namespace's limits; with --set, changes the named ones (the others keep their values).\n"
+        << "  rune namespace suspend <name> --read-only|--reject-all --broker host:port\n"
+        << "      Suspends a namespace (ADMIN ON CLUSTER): read-only serves reads and refuses writes; reject-all ends its sessions.\n"
+        << "  rune namespace resume <name> --broker host:port\n"
+        << "      Resumes a suspended namespace.\n"
+        << "  rune namespace delete <name> [--yes] --broker host:port\n"
+        << "      Deletes a namespace and every object in it.  Asks on a terminal; without --yes it refuses anywhere else.\n"
+        << "  rune namespace usage <name> [--json] --broker host:port\n"
+        << "      Prints each limit next to its current usage (a cluster admin, or DESCRIBE ON NAMESPACE in its own namespace).\n"
         << "  <limit>, 0 = unlimited where the limit allows it:";
     for (std::size_t i = 0; i < rcl::kNamespaceLimitFields.size(); ++i)
         err << (i % 4 == 0 ? "\n      " : " ") << rcl::kNamespaceLimitFields[i].name;
@@ -326,6 +516,10 @@ void printNamespaceUsage(std::ostream& err) {
 }
 
 int cmdNamespace(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
+    return cmdNamespace(args, std::cin, ::isatty(STDIN_FILENO) != 0, out, err);
+}
+
+int cmdNamespace(const std::vector<std::string>& args, std::istream& in, bool interactive, std::ostream& out, std::ostream& err) {
     if (args.empty()) {
         err << "rune namespace: a subcommand is required\n";
         printNamespaceUsage(err);
@@ -335,6 +529,10 @@ int cmdNamespace(const std::vector<std::string>& args, std::ostream& out, std::o
     if (args[0] == "create") return cmdCreate(std::move(rest), out, err);
     if (args[0] == "list") return cmdList(rest, out, err);
     if (args[0] == "limits") return cmdLimits(std::move(rest), out, err);
+    if (args[0] == "suspend") return cmdSuspend(std::move(rest), out, err);
+    if (args[0] == "resume") return cmdResume(std::move(rest), out, err);
+    if (args[0] == "delete") return cmdDelete(std::move(rest), in, interactive, out, err);
+    if (args[0] == "usage") return cmdUsage(std::move(rest), out, err);
     err << "rune namespace: unknown subcommand '" << args[0] << "'\n";
     printNamespaceUsage(err);
     return 2;

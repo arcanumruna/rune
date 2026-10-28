@@ -37,6 +37,14 @@ struct CleanerViewChannel {
     static constexpr int32_t     kViewMsgType   = 1;
     static constexpr int32_t     kAckMsgType    = 2;
     static constexpr int32_t     kPolicyMsgType = 3;
+    // Namespaces Phase 2 Task 13 (D27): a namespace slot's retention maximums, so the cleaner clamps a topic's effective
+    // retention to min(topic, namespace maximum) at each pass:
+    //   kNsLimitMsgType: [slot:u16][pad:u16][nsId:u32][maxRetentionMs:u64][maxRetentionBytes:u64]  (0 = unlimited)
+    //   nsId == kNsLimitFree releases the slot.  Idempotent; a topic whose Log tag does not match the slot's nsId is
+    //   not clamped by it (a stale message never applies to another namespace).
+    static constexpr int32_t     kNsLimitMsgType = 4;
+    static constexpr std::size_t kNsLimitBytes   = 24;
+    static constexpr uint32_t    kNsLimitFree    = 0xFFFFFFFFu;
     static constexpr std::size_t kPolicyHeaderBytes = 4 + 2;
     static constexpr std::size_t kPolicyEntryBytes  = 1 + 8;
     static constexpr std::size_t kHeaderBytes   = 24;

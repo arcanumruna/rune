@@ -270,6 +270,7 @@ bool WorkerViewSet::uninstallView(int32_t viewTopicId) {
     bool had = templates_.erase(viewTopicId) != 0;
     for (auto it = views_.begin(); it != views_.end();) {
         if (static_cast<int32_t>(static_cast<uint32_t>(it->first >> 32)) == viewTopicId) {
+            releaseMem_(it->second);   // Task 12: the namespace's view memory falls with the view
             it = views_.erase(it);   // frees the instance's table / aggregate / pending delta
             had = true;
         } else {
@@ -649,6 +650,11 @@ const uint8_t* WorkerViewSet::getRow(int32_t viewTopicId, int32_t partition, uin
         return nullptr;
     }
     outLayout = &it->second.layout;
+    // Task 12 (D26): a view paused over its namespace's memory limit answers Paused (never a stale row).
+    if (std::holds_alternative<ViewPaused>(it->second.pause)) {
+        if (outStatus != nullptr) *outStatus = RowStatus::Paused;
+        return nullptr;
+    }
     // SERVE-GUARD: a view still rebuilding after a restart must NEVER serve a
     // half-built row — surface a RETRIABLE not-ready instead (Review-focus #5).
     if (it->second.readiness != ViewReadiness::Ready) {

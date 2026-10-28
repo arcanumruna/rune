@@ -1070,3 +1070,71 @@ TEST(SessionMachineAuthRegression, AHaltedBrokerAnswerFailsOverInsteadOfRejectin
         EXPECT_EQ(t.m->sessionId(), 0) << forever << ": reconnect fresh, never resume the ended session";
     }
 }
+
+// A corr-0 SessionRevoked(46) / NamespaceSuspended(51) notice naming this session ends it in EVERY state that holds the
+// session id (Connected, Authenticating, Resuming, Backoff): Rejected(code), never resumed, never retried forever.  A
+// machine that holds no session id yet (Connecting) ignores it and continues.  (Handshaking: ClientCryptoRegression.)
+TEST(SessionMachineAuthRegression, SessionEndNoticeEveryStateRegression) {
+    enum class At { Connecting, Authenticating, Connected, Resuming, Backoff };
+    for (const At at : {At::Connecting, At::Authenticating, At::Connected, At::Resuming, At::Backoff}) {
+        for (const int code : {46, 51}) {
+            for (const bool forever : {false, true}) {
+                if (at == At::Backoff && !forever) continue;   // Backoff exists only with reconnectForeverAfterLive
+                SCOPED_TRACE("state=" + std::to_string(static_cast<int>(at)) + " code=" + std::to_string(code) +
+                             " forever=" + std::to_string(forever));
+                Rig t("ws1", "correct horse battery", forever, /*allowUnauthenticated=*/at != At::Authenticating);
+                int64_t now = 1;
+                if (at == At::Connecting) {
+                    t.m->connect(0);
+                } else if (at == At::Authenticating) {
+                    t.connectAuthRequired(now);
+                } else {
+                    t.m->connect(0);
+                    t.m->onConnectResponse(0, -1, 42, t.io.lastCorrelation(), now);
+                    ASSERT_EQ(t.m->state(), sm::SessionState::Connected);
+                    if (at == At::Resuming || at == At::Backoff) {
+                        t.m->onTransportDisconnected(now);
+                        ASSERT_EQ(t.m->state(), sm::SessionState::Resuming);
+                    }
+                    if (at == At::Backoff) {
+                        int i = 0;
+                        for (; i < 256 && t.m->state() != sm::SessionState::Backoff; ++i) {
+                            now += t.cfg.connectTimeoutNs + 1;
+                            t.m->tick(now);
+                        }
+                        ASSERT_LT(i, 256) << "never reached Backoff";
+                    }
+                }
+                const sm::SessionState expectState =
+                    at == At::Connecting ? sm::SessionState::Connecting : sm::SessionState::Rejected;
+                t.m->onErrorResponse(static_cast<int16_t>(code), "end", /*corr=*/0, now + 1, /*noticeSessionId=*/42);
+                EXPECT_EQ(t.m->state(), expectState);
+                if (at != At::Connecting) {
+                    EXPECT_EQ(t.m->rejectCode(), code);
+                    const std::size_t before = t.io.frames.size();
+                    for (int i = 0; i < 64; ++i) t.m->tick(now + 1 + (i + 1) * 10'000'000'000LL);
+                    EXPECT_EQ(t.m->state(), sm::SessionState::Rejected) << "never retried";
+                    EXPECT_EQ(t.io.frames.size(), before) << "no frame after the end";
+                }
+            }
+        }
+    }
+}
+
+// A login answered 46 / 51 (AuthServerFinal error) is non-retriable: Rejected(code) with or without
+// reconnectForeverAfterLive.
+TEST(SessionMachineAuthRegression, LoginAnsweredSessionEndCodeIsRejectedRegression) {
+    for (const int code : {46, 51}) {
+        for (const bool forever : {false, true}) {
+            SCOPED_TRACE("code=" + std::to_string(code) + " forever=" + std::to_string(forever));
+            Rig t("ws1", "correct horse battery", forever);
+            t.connectAuthRequired();
+            Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
+            std::string combined; (void)t.serverFirst(srv, t.clientFirst(), combined);
+            t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = static_cast<int16_t>(code)}, 3);
+            EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
+            EXPECT_EQ(t.m->rejectCode(), code);
+            EXPECT_TRUE(sm::SessionMachine::nonRetriableConnectError(static_cast<int16_t>(code)));
+        }
+    }
+}

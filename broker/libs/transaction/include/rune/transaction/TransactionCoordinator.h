@@ -80,6 +80,7 @@
 //   (In-memory only here; P5-3 adds durable transaction log + replay.)
 // ---------------------------------------------------------------------------
 
+#include <rune/coordination/NsScopedId.h>
 #include <rune/transaction/Types.h>
 #include <rune/transaction/ProducerIdAllocator.h>
 #include <rune/protocol/ProducerIdBinding.h>
@@ -114,6 +115,8 @@ struct InitProducerIdResult {
     static constexpr int kConcurrentTransactions = 6;
     /// The producerId space is exhausted (INT64_MAX) — NOT retriable.
     static constexpr int kProducerIdsExhausted   = 7;
+    /// Namespaces Phase 2 Task 10 (D24): the transaction timeout is above the namespace's maxTxnTimeMs.
+    static constexpr int kNamespaceLimit         = 8;
 
     [[nodiscard]] bool ok() const noexcept { return errorCode == kOk; }
 };
@@ -132,6 +135,8 @@ struct AddPartitionsResult {
     /// F15 m2: the caller holds the NEW identity of an overflow fence whose
     /// PrepareAbort is still resolving — retriable (wire 27).
     static constexpr int kConcurrentTransactions = 6;
+    /// Namespaces Phase 2 Task 10 (D24): the namespace already holds maxOpenTxns open transactions.
+    static constexpr int kNamespaceLimit         = 8;
 
     [[nodiscard]] bool ok() const noexcept { return errorCode == kOk; }
 };
@@ -241,6 +246,11 @@ struct TransactionMetadata {
     /// (via OffsetApplyCallback), discarded on ABORT.
     /// Persisted to TransactionLog so a recovered PrepareCommit can re-apply them.
     std::vector<PendingTxnOffset> pendingOffsets;
+
+    /// Namespaces Phase 2 Task 4: the gateway session that last opened / extended this transaction (0 = none known).
+    /// NOT persisted: a coordinator that reloads (failover) has no live session of the old coordinator's node; the
+    /// transaction then ends by its timeout or by abortAllForNamespace.  Set by noteSession().
+    int64_t sessionId{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -509,6 +519,42 @@ public:
     /// Returns 0 when there is no work. NEVER spins.
     int doWork(int64_t nowNs);
 
+    /// Namespaces Phase 2 Task 5: every Ongoing transaction whose scoped id belongs to namespace `nsId` takes
+    /// exactly the timeout-abort transition (PrepareAbort, markersPending, persisted).  Returns the count.  No
+    /// allocation.  (Task 4 calls it on suspend / delete.)
+    uint32_t abortAllForNamespace(uint32_t nsId, int64_t nowNs);
+
+    /// Namespaces Phase 2 Task 10 (D24): the namespace's transaction limits (0 = unlimited), fed on the control thread
+    /// from the catalog apply (every namespace record upsert).  maxOpenTxns bounds the Ongoing transactions at the
+    /// start of a new one (InitProducerId never opens one; AddPartitions / AddOffsets do); maxTxnTimeMs bounds the
+    /// timeout an InitProducerId may ask for (an unspecified one is clamped) and the timeout sweep uses
+    /// min(transaction timeout, namespace maximum).  Both 0 removes the entry.  Cold.
+    void setNamespaceTxnLimits(uint32_t nsId, uint64_t maxOpenTxns, uint64_t maxTxnTimeMs) {
+        if (maxOpenTxns == 0 && maxTxnTimeMs == 0) nsTxnLimits_.erase(nsId);
+        else nsTxnLimits_[nsId] = NsTxnLimits{maxOpenTxns, maxTxnTimeMs};
+    }
+
+    /// Namespaces Phase 2 Task 4: the same internal abort for every Ongoing transaction that session `sessionId`
+    /// opened (noteSession).  Returns the count.  No allocation.  The gateway calls it on every session revoke.
+    uint32_t abortAllForSession(int64_t sessionId, int64_t nowNs);
+
+    /// Namespaces Phase 2 Task 7: true while any transaction of namespace `nsId` is not at rest - Ongoing, or Prepare*
+    /// (its completion would still persist a record under its key).  Cold scan.
+    [[nodiscard]] bool anyUnsettledForNamespace(uint32_t nsId) const noexcept {
+        for (const auto& [id, meta] : txnMap_) {
+            if (meta.state == TxnState::Empty || meta.state == TxnState::CompleteCommit ||
+                meta.state == TxnState::CompleteAbort || meta.state == TxnState::Dead) continue;
+            if (rune::coordination::parseScopedId(id).nsId == nsId) return true;
+        }
+        return false;
+    }
+
+    /// Records the session that drives `txnId` (the service calls it after a successful AddPartitions / AddOffsets /
+    /// TxnOffsetCommit).  Unknown id: no-op.
+    void noteSession(const TransactionalId& txnId, int64_t sessionId) noexcept {
+        if (auto it = txnMap_.find(txnId); it != txnMap_.end()) it->second.sessionId = sessionId;
+    }
+
     // -----------------------------------------------------------------------
     // pendingMarkerTransactions — B1/B2 resolution API
     // -----------------------------------------------------------------------
@@ -604,7 +650,13 @@ private:
     OffsetApplyCallback offsetApplyCb_;
     CheckedOffsetApplyCallback checkedOffsetApplyCb_;
 
+    void beginInternalAbort_(TransactionMetadata& meta);   ///< the timeout-abort transition (doWork, abortAllForNamespace)
+
     /// Primary state: transactionalId → TransactionMetadata.
+    struct NsTxnLimits { uint64_t maxOpenTxns = 0; uint64_t maxTxnTimeMs = 0; };
+    std::unordered_map<uint32_t, NsTxnLimits> nsTxnLimits_;   ///< empty unless a namespace sets a limit
+    /// True when namespace `nsId` already holds its maxOpenTxns Ongoing transactions (a cold scan, only for a limited ns).
+    [[nodiscard]] bool nsOpenTxnsAtLimit_(const TransactionalId& txnId) const;
     std::unordered_map<TransactionalId, TransactionMetadata> txnMap_;
 };
 

@@ -1033,6 +1033,23 @@ ConfigResult parseNodeConfig(
         const std::string_view sv(raw);
         cfg.anonymousRead = (sv == "1" || sv == "true" || sv == "TRUE");
     }
+    for (const auto& [name, field] : {std::pair<const char*, int32_t*>{"RUNE_ANONYMOUS_MAX_CONNECTIONS", &cfg.anonymousMaxConnections},
+                                      std::pair<const char*, int32_t*>{"RUNE_ANONYMOUS_REQUEST_OPS_PER_SEC", &cfg.anonymousRequestOpsPerSec}}) {
+        if (const char* raw = getenv_fn(name); raw && *raw) {   // namespaces Phase 2 Task 10 (#236)
+            int64_t v = 0;
+            if (!parseInt64Positive(raw, v) || v > NodeConfig::kMaxAnonymousCap)
+                return {{}, std::string(name) + " must be an integer in [1, " + std::to_string(NodeConfig::kMaxAnonymousCap) +
+                                "], got: " + raw};
+            *field = static_cast<int32_t>(v);
+        }
+    }
+    if (const char* raw = getenv_fn("RUNE_NS_LIMIT_TICK_US"); raw && *raw) {   // namespaces Phase 2 Task 14 (D28)
+        int64_t v = 0;
+        if (!parseInt64Positive(raw, v) || v < NodeConfig::kMinNsLimitTickUs || v > NodeConfig::kMaxNsLimitTickUs)
+            return {{}, std::string("RUNE_NS_LIMIT_TICK_US must be an integer in [") + std::to_string(NodeConfig::kMinNsLimitTickUs) +
+                            ", " + std::to_string(NodeConfig::kMaxNsLimitTickUs) + "], got: " + raw};
+        cfg.nsLimitTickUs = static_cast<int32_t>(v);
+    }
     if (const char* raw = getenv_fn("RUNE_AUTH_TIMEOUT_MS"); raw && *raw) {
         int64_t v = 0;
         if (!parseInt64Positive(raw, v))
@@ -1055,6 +1072,12 @@ ConfigResult parseNodeConfig(
                 if (k.set != nullptr) *k.set = true;
             }
         }
+    }
+    if (const char* raw = getenv_fn("RUNE_NS_DELETE_BATCH"); raw && *raw) {   // namespaces Phase 2 Task 6b (D20)
+        int32_t v = 0;
+        if (!parseInt32(raw, v) || v < 1 || v > 65536)
+            return {{}, std::string("RUNE_NS_DELETE_BATCH must be an integer in [1, 65536], got: ") + raw};
+        cfg.nsDeleteBatch = static_cast<uint32_t>(v);
     }
     if (const char* raw = getenv_fn("RUNE_PEER_AUTH_STREAM_ID"); raw && *raw) {
         int32_t v = 0;

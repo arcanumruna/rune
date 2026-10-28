@@ -60,6 +60,10 @@ public:
         READ_LEASE = static_cast<std::uint8_t>(24),
         FILTER_SCHEMA = static_cast<std::uint8_t>(25),
         TXN_VERIFY_RESULT = static_cast<std::uint8_t>(26),
+        NS_SLOT_ASSIGN = static_cast<std::uint8_t>(27),
+        NS_SLOT_RELEASE = static_cast<std::uint8_t>(28),
+        NS_THROTTLE = static_cast<std::uint8_t>(29),
+        NS_VIEW_MEM_OVER = static_cast<std::uint8_t>(30),
         TEST_TASK = static_cast<std::uint8_t>(200),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
@@ -95,6 +99,10 @@ public:
             case static_cast<std::uint8_t>(24): return READ_LEASE;
             case static_cast<std::uint8_t>(25): return FILTER_SCHEMA;
             case static_cast<std::uint8_t>(26): return TXN_VERIFY_RESULT;
+            case static_cast<std::uint8_t>(27): return NS_SLOT_ASSIGN;
+            case static_cast<std::uint8_t>(28): return NS_SLOT_RELEASE;
+            case static_cast<std::uint8_t>(29): return NS_THROTTLE;
+            case static_cast<std::uint8_t>(30): return NS_VIEW_MEM_OVER;
             case static_cast<std::uint8_t>(200): return TEST_TASK;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
@@ -133,6 +141,10 @@ public:
             case READ_LEASE: return "READ_LEASE";
             case FILTER_SCHEMA: return "FILTER_SCHEMA";
             case TXN_VERIFY_RESULT: return "TXN_VERIFY_RESULT";
+            case NS_SLOT_ASSIGN: return "NS_SLOT_ASSIGN";
+            case NS_SLOT_RELEASE: return "NS_SLOT_RELEASE";
+            case NS_THROTTLE: return "NS_THROTTLE";
+            case NS_VIEW_MEM_OVER: return "NS_VIEW_MEM_OVER";
             case TEST_TASK: return "TEST_TASK";
             case NULL_VALUE: return "NULL_VALUE";
         }

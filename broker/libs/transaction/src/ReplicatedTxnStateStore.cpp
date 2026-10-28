@@ -10,6 +10,7 @@
 
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 #include <rune/transaction/detail/Crc32c.h>
+#include <rune/coordination/NsScopedId.h>
 
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>  // RecordBatchReader (for rebuildFromLog)
@@ -192,6 +193,32 @@ rune::replication::Offset ReplicatedTxnStateStore::putPidBlockCeiling(ProducerId
     const rune::replication::Offset base = replica_->appendKeyed(
         key, std::span<const uint8_t>(rec.data(), rec.size()), /*acksAll=*/true);
     return base < 0 ? -1 : base;   // persistedPidCeiling_ folds only committed records (rebuild)
+}
+
+// ---------------------------------------------------------------------------
+// tombstoneNamespace (Task 6b)
+// ---------------------------------------------------------------------------
+bool ReplicatedTxnStateStore::tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t /*nowNs*/)
+{
+    if (nsId == 0) return true;   // `default` is never deleted
+    if (batch == 0) batch = 1;
+    uint32_t written = 0;
+    for (auto it = index_.begin(); it != index_.end() && written < batch;) {
+        if (rune::coordination::parseScopedId(it->first).nsId != nsId) { ++it; continue; }
+        const std::span<const uint8_t> key{reinterpret_cast<const uint8_t*>(it->first.data()), it->first.size()};
+        if (replica_->appendKeyed(key, std::span<const uint8_t>{}, /*acksAll=*/true) < 0) return false;   // gated
+        it = index_.erase(it);
+        ++written;
+    }
+    return written == 0;
+}
+
+std::size_t ReplicatedTxnStateStore::liveKeysOfNamespaceForTest(uint32_t nsId) const
+{
+    std::size_t n = 0;
+    for (const auto& kv : index_)
+        if (rune::coordination::parseScopedId(kv.first).nsId == nsId) ++n;
+    return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -378,10 +405,15 @@ void ReplicatedTxnStateStore::rebuildFromLog()
             if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) break;
 
             // Each outer batch has exactly 1 record: key="", value=<our payload>.
-            reader.forEachRecord([this](std::string_view /*key*/,
+            reader.forEachRecord([this](std::string_view key,
                                   std::string_view val,
                                   int64_t /*offset*/,
                                   int64_t /*ts*/) {
+                // Task 6b (D20): an empty value is a TOMBSTONE of the transactional id in the record key.
+                if (val.empty()) {
+                    if (!key.empty()) index_.erase(TransactionalId(key));
+                    return;
+                }
                 applyRecord(val);
             });
 

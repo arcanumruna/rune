@@ -15,6 +15,8 @@
 // Namespace: rune::gateway
 // C++23.
 
+#include <rune/coordination/NsScopedId.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -24,6 +26,10 @@ namespace rune::gateway {
 struct IGroupRequestHandler {
     virtual ~IGroupRequestHandler() = default;
 
+    // Namespaces Phase 2 Task 5 (D19): `ctx` is the request's namespace context; the group id is turned into its
+    // scoped id (rune/coordination/NsScopedId.h) right after decode, and a client id with the reserved prefix is
+    // answered InvalidRequest.  Responses echo the id the client sent.
+    //
     // Each method decodes the request from buf[0..len-1], acts, encodes the
     // response into out[0..outCap-1], and returns the number of bytes written.
     // 0 means "no answer" (the gateway answers Internal) - except for
@@ -36,34 +42,40 @@ struct IGroupRequestHandler {
     virtual size_t handleJoinGroup   (const uint8_t* buf, size_t len,
                                       int32_t clientVersion,   // the session's negotiated version: gates the filter trailer
                                       int64_t nowNs,
-                                      uint8_t* out, size_t outCap) = 0;
+                                      uint8_t* out, size_t outCap,
+                                      const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     virtual size_t handleSyncGroup   (const uint8_t* buf, size_t len,
                                       int64_t nowNs,
-                                      uint8_t* out, size_t outCap) = 0;
+                                      uint8_t* out, size_t outCap,
+                                      const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     virtual size_t handleHeartbeat   (const uint8_t* buf, size_t len,
                                       int64_t nowNs,
-                                      uint8_t* out, size_t outCap) = 0;
+                                      uint8_t* out, size_t outCap,
+                                      const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     virtual size_t handleLeaveGroup  (const uint8_t* buf, size_t len,
                                       int64_t nowNs,
-                                      uint8_t* out, size_t outCap) = 0;
+                                      uint8_t* out, size_t outCap,
+                                      const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     virtual size_t handleOffsetCommit(const uint8_t* buf, size_t len,
                                       int64_t nowNs,
-                                      uint8_t* out, size_t outCap) = 0;
+                                      uint8_t* out, size_t outCap,
+                                      const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     virtual size_t handleOffsetFetch (const uint8_t* buf, size_t len,
                                       int64_t nowNs,
-                                      uint8_t* out, size_t outCap) = 0;
+                                      uint8_t* out, size_t outCap,
+                                      const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     // No-hang fix rounds 4-5 (item 8 / N23, pre-v5 clients): the gateway
     // answers an old client UnknownMember in place of an Internal /
     // InvalidRequest it would ignore; these make that answer TRUE (the old
     // client re-joins on it).  Cold paths.  Default: nothing to evict.
     //
-    // evictMember: the request's own (group, member) — only if that member is
+    // evictMember: the request's own (group, member); `groupId` is the SCOPED id (the gateway scopes it) — only if that member is
     // mapped to `sessionId` (another session's member is never touched);
     // `memberId` empty = every member of `sessionId` in `groupId` (OffsetFetch
     // names the group only).  Other groups on the same session are untouched.

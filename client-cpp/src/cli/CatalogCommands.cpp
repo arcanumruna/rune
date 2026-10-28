@@ -634,7 +634,8 @@ std::optional<std::string> issueEvent(rc::Client& c, const cat::CatalogState& st
                 return failureOf(r.errorCode, r.detail);
             } else {   // Namespace events are not replayed: namespace DDL is cluster-admin only, issued with `rune namespace`
                 static_assert(std::is_same_v<T, cat::NamespaceCreatedOps> || std::is_same_v<T, cat::NamespaceLimitsSetOps> ||
-                              std::is_same_v<T, cat::NamespaceStateChangedOps> || std::is_same_v<T, cat::NamespaceDeletedOps>);
+                              std::is_same_v<T, cat::NamespaceStateChangedOps> || std::is_same_v<T, cat::NamespaceDeletedOps> ||
+                              std::is_same_v<T, cat::NamespaceDeleteStepOps>);
                 return std::string("a namespace event (") + std::string(cat::kindName(e.kind)) + ") cannot be replayed yet";
             }
         },

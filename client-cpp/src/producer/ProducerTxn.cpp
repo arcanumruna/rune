@@ -13,7 +13,7 @@
 //     once EndTxn(abort) is answered the end phase is Bumping (then InDoubt{Bump} if the bump times out), so a
 //     retried abort re-sends ONLY the bump;
 //   * m15: TxnStarted::Maybe + 19 on EndTxn(abort) = nothing was open: the abort is done;
-//   * FD6: 17 / 18 -> FatalError(Fenced); 19 or 45 / 47 on EndTxn, any non-retriable InitProducerId ->
+//   * FD6: 17 / 18 -> FatalError(Fenced); 19 or 44..47 / 51 / 52 on EndTxn, any non-retriable InitProducerId ->
 //     FatalError(BrokerError code); 39 on the FIRST EndTxn -> AbortableError(39); a leg's 19 / 45 / unknown ->
 //     AbortableError; SessionRevoked -> FatalError(BrokerError 46);
 //   * Task 6: once an EndTxn(commit) may have landed (it was re-sent after an in-doubt timeout), only a definite

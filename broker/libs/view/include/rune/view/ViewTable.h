@@ -108,6 +108,10 @@ public:
     // `put` needs a row-id beyond the current total chunk capacity.
     size_t chunkCount() const noexcept { return chunks_.size(); }
 
+    // Namespaces Phase 2 Task 12 (D26): the row-slab memory, chunkCount x bytes per chunk.  O(1) and incremental by
+    // construction (chunks only ever append), so the view set charges it without scanning.
+    size_t memoryBytes() const noexcept { return chunks_.size() * rowsPerChunk_ * static_cast<size_t>(layout_.rowLen); }
+
     // Task 5 test/bench hooks (Task 7's benchmark depends on these):
     //
     // Worst single-op cost (microseconds) any one put()/erase() call ever

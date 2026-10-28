@@ -1922,6 +1922,17 @@ TEST(ProtocolVersionsRegression, ProduceConcurrentTransactionsIsGatedOnClientThi
     EXPECT_EQ(rpc::produceErrorForClient(E::InvalidTxnState, 12), E::InvalidTxnState);
 }
 
+// The namespace codes (51-53) reach a produce answer only for clients >= 14 (older: InvalidRequest).
+TEST(ProtocolVersionsRegression, ProduceErrorForOldClientNamespaceSuspendedRegression) {
+    using E = rpc::ErrorCode;
+    for (const E ec : {E::NamespaceSuspended, E::NamespaceLimitExceeded, E::Throttled}) {
+        EXPECT_EQ(rpc::produceErrorForClient(ec, rpc::kClientVersionNamespaces), ec) << static_cast<int>(ec);
+        EXPECT_EQ(rpc::produceErrorForClient(ec, rpc::kClientVersionNamespaces - 1), E::InvalidRequest) << static_cast<int>(ec);
+        EXPECT_EQ(rpc::produceErrorForClient(ec, 1), E::InvalidRequest) << static_cast<int>(ec);
+    }
+    EXPECT_EQ(rpc::produceErrorForClient(E::ViewPaused, 1), E::ViewPaused) << "only 51-53 are mapped";
+}
+
 TEST(ProtocolVersions, FilterIsElevenAndBrokerSix) {
     EXPECT_EQ(rpc::kClientVersionFilter, 11);
     EXPECT_EQ(rpc::kBrokerVersionFilter, 6);

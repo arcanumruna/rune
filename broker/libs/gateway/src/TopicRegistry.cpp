@@ -81,6 +81,7 @@ TopicRegistry::buildLive_(const rune::node::TopicSpec& spec, int32_t id)
         auto logPtr = std::make_unique<rune::storage::Log>(
             partDir.string(), spec.segmentRollBytes);
         logPtr->recover();
+        logPtr->setNsTag(spec.nsId, spec.nsSlot);   // Namespaces Phase 2 Task 8: before any worker sees the log
 
         spdlog::debug(
             "TopicRegistry: topic='{}' partition={} dir='{}' LEO={}",

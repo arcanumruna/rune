@@ -2,6 +2,8 @@
 #include <rune/protocol/SecurityTypes.h>
 #include <rune/protocol/client/Dispatch.h>
 #include <rune/protocol/client/NamespaceMessages.h>
+#include <rune/protocol/client/NamespaceUsageMessages.h>
+#include <rune/protocol/client/ControlMessages.h>
 #include <gtest/gtest.h>
 #include <cstring>
 #include <string>
@@ -109,7 +111,7 @@ TEST(NamespaceMessagesRegression, DdlRoundTripRegression) {
     pc::NamespaceDdlRequest bad;
     bad.ext = ext(); bad.name = "a";
     std::vector<uint8_t> out(bad.encodedSize() + 8);
-    bad.kind = static_cast<pc::NamespaceDdlKind>(3);
+    bad.kind = static_cast<pc::NamespaceDdlKind>(6);
     EXPECT_EQ(bad.encode(out.data()), 0u);
     bad.kind = static_cast<pc::NamespaceDdlKind>(0);
     EXPECT_EQ(bad.encode(out.data()), 0u);
@@ -210,7 +212,7 @@ TEST(NamespaceMessagesRegression, TemplateDispatchRegression) {
         EXPECT_EQ(fc.status, pc::FrameStatus::Ok) << tid;
         EXPECT_EQ(fc.templateId, tid);
     }
-    for (const uint16_t tid : {uint16_t{84}, uint16_t{95}}) {
+    for (const uint16_t tid : {uint16_t{86}, uint16_t{95}}) {
         auto b = header(tid, 1, 2, 0);
         EXPECT_EQ(pc::checkFrame(b.data(), b.size()).status, pc::FrameStatus::UnknownTemplate) << tid;
     }
@@ -228,4 +230,139 @@ TEST(NamespaceMessagesRegression, ErrorCodeValuesRegression) {
     EXPECT_EQ(static_cast<uint16_t>(pc::ErrorCode::NamespaceLimitExceeded), 52);
     EXPECT_EQ(static_cast<uint16_t>(pc::ErrorCode::Throttled), 53);
     EXPECT_EQ(static_cast<uint16_t>(pc::ErrorCode::ViewPaused), 54);
+}
+
+namespace {
+pc::NamespaceDdlRequest ddl(pc::NamespaceDdlKind k) {
+    pc::NamespaceDdlRequest m;
+    m.sessionId = 1; m.correlationId = 2; m.ext = ext(); m.kind = k; m.name = "acme";
+    m.presentMask = {0x03, 0, 0, 0}; m.limits = distinctLimits();
+    return m;
+}
+std::vector<uint8_t> enc(const pc::NamespaceDdlRequest& m) {
+    std::vector<uint8_t> b(m.encodedSize() + 8, 0);
+    const std::size_t n = m.encode(b.data());
+    b.resize(n);
+    return b;
+}
+} // namespace
+
+TEST(NamespaceDdlRegression, SuspendCarriesModeByteRegression) {
+    for (const auto mode : {pc::NsSuspendMode::ReadOnly, pc::NsSuspendMode::RejectAll}) {
+        auto m = ddl(pc::NamespaceDdlKind::Suspend); m.mode = mode;
+        gWire = enc(m);
+        ASSERT_EQ(gWire.size(), m.encodedSize());
+        ASSERT_EQ(gWire.size(), pc::MessageHeader::ENCODED_SIZE + pc::extEncodedSize(m.ext) + 1u + 2u + m.name.size() + 1u);
+        auto d = pc::NamespaceDdlRequest::decode(gWire.data(), gWire.size());
+        ASSERT_TRUE(d);
+        EXPECT_EQ(d->name, "acme"); EXPECT_EQ(d->kind, pc::NamespaceDdlKind::Suspend); EXPECT_EQ(d->mode, mode);
+        for (const uint8_t bad : {uint8_t{0}, uint8_t{3}}) {
+            auto p = gWire; p.back() = bad;
+            EXPECT_FALSE(pc::NamespaceDdlRequest::decode(p.data(), p.size())) << int(bad);
+        }
+    }
+    auto bad = ddl(pc::NamespaceDdlKind::Suspend); bad.mode = static_cast<pc::NsSuspendMode>(3);
+    std::vector<uint8_t> out(bad.encodedSize() + 8);
+    EXPECT_EQ(bad.encode(out.data()), 0u);
+}
+
+TEST(NamespaceDdlRegression, ResumeAndDeleteCarryNameOnlyRegression) {
+    for (const auto k : {pc::NamespaceDdlKind::Resume, pc::NamespaceDdlKind::Delete}) {
+        auto m = ddl(k);
+        gWire = enc(m);
+        EXPECT_EQ(gWire.size(), 24u + pc::extEncodedSize(m.ext) + 1u + 2u + m.name.size());
+        auto d = pc::NamespaceDdlRequest::decode(gWire.data(), gWire.size());
+        ASSERT_TRUE(d);
+        EXPECT_EQ(d->kind, k); EXPECT_EQ(d->name, "acme");
+        auto withLimits = gWire;
+        withLimits.insert(withLimits.end(), pc::kNamespacePresentMaskBytes + rp::kNamespaceLimitsBytes, 0);
+        EXPECT_FALSE(pc::NamespaceDdlRequest::decode(withLimits.data(), withLimits.size()));
+        auto extra = gWire; extra.push_back(0);
+        EXPECT_FALSE(pc::NamespaceDdlRequest::decode(extra.data(), extra.size()));
+    }
+}
+
+TEST(NamespaceDdlRegression, TruncatedAtEveryOffsetRegression) {
+    for (uint8_t k = 1; k <= 5; ++k) {
+        auto m = ddl(static_cast<pc::NamespaceDdlKind>(k));
+        const auto full = enc(m);
+        ASSERT_FALSE(full.empty()) << int(k);
+        EXPECT_TRUE(pc::NamespaceDdlRequest::decode(full.data(), full.size())) << int(k);
+        for (std::size_t len = 0; len < full.size(); ++len) {
+            std::vector<uint8_t> part(full.begin(), full.begin() + static_cast<std::ptrdiff_t>(len));
+            EXPECT_FALSE(pc::NamespaceDdlRequest::decode(part.data(), part.size())) << "kind " << int(k) << " len " << len;
+        }
+    }
+}
+
+TEST(NamespaceDdlRegression, KindOutOfRangeRefusedRegression) {
+    auto m = ddl(pc::NamespaceDdlKind::Resume);
+    auto b = enc(m);
+    const std::size_t kindOff = pc::MessageHeader::ENCODED_SIZE + pc::extEncodedSize(m.ext);
+    for (const uint8_t k : {uint8_t{0}, uint8_t{6}}) {
+        auto p = b; p[kindOff] = k;
+        EXPECT_FALSE(pc::NamespaceDdlRequest::decode(p.data(), p.size())) << int(k);
+    }
+}
+
+TEST(NamespaceUsageRegression, RoundTripRegression) {
+    pc::NamespaceUsageRequest q; q.sessionId = 5; q.correlationId = 6; q.name = "acme";
+    std::vector<uint8_t> qb(q.encodedSize());
+    ASSERT_EQ(q.encode(qb.data()), qb.size());
+    auto dq = pc::NamespaceUsageRequest::decode(qb.data(), qb.size());
+    ASSERT_TRUE(dq);
+    EXPECT_EQ(dq->name, "acme"); EXPECT_EQ(dq->sessionId, 5); EXPECT_EQ(dq->correlationId, 6);
+    q.name.clear();
+    EXPECT_EQ(q.encode(qb.data()), 0u);
+
+    pc::NamespaceUsageResponse r;
+    r.sessionId = 7; r.correlationId = 8; r.code = 0; r.state = 2; r.limits = distinctLimits();
+    for (std::size_t i = 0; i < r.usage.size(); ++i) r.usage[i] = 1000 + i;
+    std::vector<uint8_t> rb(pc::NamespaceUsageResponse::encodedSize());
+    ASSERT_EQ(r.encode(rb.data(), rb.size()), rb.size());
+    auto d = pc::NamespaceUsageResponse::decode(rb.data(), rb.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->sessionId, 7); EXPECT_EQ(d->correlationId, 8); EXPECT_EQ(d->code, 0); EXPECT_EQ(d->state, 2);
+    EXPECT_EQ(d->limits, r.limits);
+    for (std::size_t i = 0; i < r.usage.size(); ++i) EXPECT_EQ(d->usage[i], 1000u + i) << i;
+    for (std::size_t len = 0; len < rb.size(); ++len) {
+        std::vector<uint8_t> part(rb.begin(), rb.begin() + static_cast<std::ptrdiff_t>(len));
+        EXPECT_FALSE(pc::NamespaceUsageResponse::decode(part.data(), part.size())) << len;
+    }
+    auto extra = rb; extra.push_back(0);
+    EXPECT_FALSE(pc::NamespaceUsageResponse::decode(extra.data(), extra.size()));
+}
+
+TEST(NamespaceUsageRegression, ShortCapReturnsZeroRegression) {
+    pc::NamespaceUsageResponse r;
+    const std::size_t sz = pc::NamespaceUsageResponse::encodedSize();
+    EXPECT_EQ(sz, 24u + 3u + rp::kNamespaceLimitsBytes + 8u * 29u);
+    std::vector<uint8_t> b(sz);
+    EXPECT_EQ(r.encode(b.data(), sz - 1), 0u);
+    EXPECT_EQ(r.encode(b.data(), sz), sz);
+}
+
+TEST(ThrottledRegression, RetryAfterRoundTripRegression) {
+    pc::ErrorResponse e;
+    e.sessionId = 1; e.correlationId = 2; e.code = static_cast<int16_t>(pc::ErrorCode::Throttled);
+    e.message = "slow down"; e.retryAfterNs = 123456789012ULL;
+    std::vector<uint8_t> b(28 + e.message.size() + 8);
+    ASSERT_EQ(e.encode(b.data()), b.size());
+    auto d = pc::ErrorResponse::decode(b.data(), b.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->retryAfterNs, 123456789012ULL); EXPECT_EQ(d->message, "slow down");
+    std::vector<uint8_t> t(b.begin(), b.end() - 8);
+    auto d2 = pc::ErrorResponse::decode(t.data(), t.size());
+    ASSERT_TRUE(d2);
+    EXPECT_EQ(d2->retryAfterNs, 0u);
+    e.code = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
+    std::vector<uint8_t> o(64);
+    EXPECT_EQ(e.encode(o.data()), 28 + e.message.size());
+}
+
+TEST(DispatchRegression, Templates84And85RoutedRegression) {
+    EXPECT_TRUE(pc::isKnownTemplate(84));
+    EXPECT_TRUE(pc::isKnownTemplate(85));
+    EXPECT_FALSE(pc::isKnownTemplate(86));
+    EXPECT_FALSE(pc::isKnownTemplate(95));
 }

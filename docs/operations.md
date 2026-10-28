@@ -92,6 +92,10 @@ unqualified (`t` means `a/t` for `a/alice`). Only a cluster admin may name an ob
 rune namespace create a --broker rune-1:40200 --user admin --password-file admin.pw
 rune namespace list --broker rune-1:40200 --user admin --password-file admin.pw           # nsId, name, state (--json: limits too)
 rune namespace limits a --set max-topics=100 --broker rune-1:40200 --user admin --password-file admin.pw   # no --set: print
+rune namespace usage a --broker rune-1:40200 --user admin --password-file admin.pw          # each limit next to its usage (--json too)
+rune namespace suspend a --read-only --broker rune-1:40200 --user admin --password-file admin.pw   # or --reject-all
+rune namespace resume a --broker rune-1:40200 --user admin --password-file admin.pw
+rune namespace delete a --broker rune-1:40200 --user admin --password-file admin.pw           # asks on a terminal; --yes to skip, refused without a terminal
 ```
 
 | Role | Can do |
@@ -103,11 +107,75 @@ rune namespace limits a --set max-topics=100 --broker rune-1:40200 --user admin 
 - **Foreign objects answer exactly like missing ones**: same error code and message, so a name in another namespace is
   never revealed. A namespace admin sees only its own namespace in `rune namespace list`.
 - **Anonymous read is off by default.** Only a cluster admin turns it on, and only for `default`.
-- **Limits are stored, not enforced**, until Phase 2. Consumer-group and transactional requests outside `default` are
-  refused until Phase 2 as well.
+- Consumer groups and transactions work in every namespace: the same group id or transactional id in two namespaces
+  is two groups or two producers, with independent offsets, membership and fencing.
 - The data lives under `<data>/ns-<nsId>/topics/<name>/`. A cluster with namespaces is a new cluster; there is no
   in-place upgrade.
 - The 3-node check is `docker/namespace-e2e.sh` ([testing](testing.md#end-to-end-docker-suites)).
+
+### Lifecycle: suspend, resume, delete
+
+Only a cluster admin changes a namespace's state (`ADMIN ON CLUSTER`). A state change is one catalog event, so it takes
+effect on every node when that event applies; no timer is involved.
+
+| State | Served | Refused | Sessions |
+|---|---|---|---|
+| Active | everything its grants allow | - | - |
+| Suspended, read-only | fetch, metadata, view and QL reads, offset fetch, group join, sync, heartbeat, leave | produce, every DDL (topic, view, schema, user, grant), transactions, offset commit: `NamespaceSuspended (51)` | kept; open transactions are aborted when the suspend applies |
+| Suspended, reject-all | nothing | every request; a login with the right password gets `NamespaceSuspended (51)`, a wrong password `AuthenticationFailed (44)` | every session of the namespace is closed when the suspend applies |
+| Deleting | nothing: it answers like a name that never existed | everything; a login gets `AuthenticationFailed (44)` | closed when the delete applies |
+
+- The cluster admin is exempt from both suspend modes. A client older than version 14 does not know code 51 and gets
+  `InvalidRequest (39)` instead; the same holds for codes 52 to 54 below.
+- `resume` returns a suspended namespace to Active; suspending in the mode a namespace is already in, or resuming an Active
+  one, is an Ok no-op (suspending in the other mode switches it). `default` cannot be deleted. Suspend, resume and delete of an unknown or Deleting name answer exactly like
+  any unknown name.
+- **Delete** is one event, and that event is the commit point: the namespace is DELETING at once and **its name is free
+  at once** (a new `create` of the same name gets a new nsId and sees nothing of the old namespace). The reaper on the
+  `__catalog` leader then aborts the open transactions, drops the views, topics and schemas, tombstones the consumer-group
+  offsets and the transaction state, and purges the users, roles and grants. Every step is recorded in the catalog, so a
+  crash or a leader change at any point is finished by whichever broker leads next. When all steps are done the namespace
+  leaves `rune namespace list`, every node renames `ns-<id>` to `ns-<id>.deleting` and removes it, and the boot reconcile
+  removes any leftover. A DELETING namespace still counts toward `RUNE_MAX_NAMESPACES`.
+- `RUNE_NS_DELETE_BATCH` (default 256) bounds the tombstones and drops the reaper issues per pass.
+
+### Limits
+
+`rune namespace limits <name> --set <limit>=N` stores a limit (`0` = unlimited where the limit allows it); every limit is
+enforced, each with one precise code:
+
+| Limit | Checked | Refused with |
+|---|---|---|
+| `max-topics`, `max-partitions-per-topic`, `max-partitions-total`, `max-views`, `max-schemas`, `max-versions-per-schema`, `max-groups`, `max-users` | at the DDL (groups at a new group's first join, users at `CREATE USER`) | `NamespaceLimitExceeded (52)` |
+| `min-replication-factor`, `max-replication-factor`, `lowest-acks`, `lowest-min-insync` | at topic DDL; the acks floor at every produce | `NamespaceLimitExceeded (52)` |
+| feature bits | the `compaction`, `views`, `txns`, `anonymous read` and `scram` bits are enforced at the DDL or at connect / login. The `ql`, `sql` and `redis` bits are stored only: there is no serving path for them yet | `NamespaceLimitExceeded (52)` |
+| `max-connections`, `max-connections-per-user`, `max-sessions-per-user`, `max-open-txns`, `max-txn-time-ms` | at login / `InitProducerId` / `AddPartitions`, **per node** | `NamespaceLimitExceeded (52)` |
+| `max-disk-bytes` | measured on the node that leads the partition | produce on the leader: `NamespaceLimitExceeded (52)`; follower apply, replication catch-up and the log cleaner are never refused |
+| `max-message-bytes`, `max-batch-bytes` | the worker's produce intake on the leader. A batch longer than `max-batch-bytes`, or a record whose length field (its body bytes) is longer than `max-message-bytes`, is refused and nothing is appended. The record fields are checked against that length field; a batch whose records do not match their length fields or the header's record count, or that has trailing bytes, is malformed and refused. 0 = unlimited | `NamespaceLimitExceeded (52)`; a malformed batch: `InvalidRequest (39)` |
+| `max-retention-ms`, `max-retention-bytes` | a topic DDL above the maximum is refused; the cleaner applies `min(topic retention, namespace maximum)` | `NamespaceLimitExceeded (52)` at DDL |
+| `produce-bytes-per-sec`, `produce-records-per-sec`, `fetch-bytes-per-sec`, `request-ops-per-sec`, `query-cycles-per-sec` | a per-namespace aggregator compares the node's usage with `limit x elapsed` every `RUNE_NS_LIMIT_TICK_US` (default 10000) | `Throttled (53)` carrying a retry-after; the client library waits it out and retries |
+| `max-view-memory-bytes` | the node's view chunks | the namespace's views pause at their offset and a view read answers `ViewPaused (54)`; they resume when memory falls or the limit is raised |
+
+- **Lowering a limit deletes nothing**, except the retention maximum: objects over a lowered count stay and the next
+  create is refused; a lowered retention maximum deletes old segments on the next retention pass and the SetLimits is answered Ok with the warning `retention clamped on N topics` in the
+  DDL response's detail.
+- Rates, disk and view memory are enforced from the workers' paced reports, so a namespace can exceed one by what its
+  node produces in about one report interval plus one aggregator tick before the throttle arrives; the rate debt carries
+  the excess forward and the long-run rate converges on the limit. A rate limit never makes a follower refuse a replicated
+  batch, so `acks=all` never stalls on it.
+- `rune namespace usage <name>` prints each limit next to its current usage on the node it asks (counts, disk, view
+  memory, connections and rates; fields with no usage meaning print `-`).
+- Anonymous sessions have their own caps: `RUNE_ANONYMOUS_MAX_CONNECTIONS` (default 16) and
+  `RUNE_ANONYMOUS_REQUEST_OPS_PER_SEC` (default 1000).
+
+The error codes, all gated on client version 14:
+
+| Code | Name | Meaning |
+|---|---|---|
+| 51 | `NamespaceSuspended` | the namespace is suspended and this request is not served in that mode |
+| 52 | `NamespaceLimitExceeded` | a count, durability, feature, connection, transaction or disk limit |
+| 53 | `Throttled` | a rate limit; for a v14+ client the retry-after in ns rides `ProduceResponse.logStartOffset` |
+| 54 | `ViewPaused` | the view is paused over its namespace's memory limit |
 
 ## Metrics
 
@@ -156,6 +224,14 @@ sampling the file; the broker keeps no history.
 | 1000235 | `rune-peer-frame-drops` | counter | control | Inter-broker frames dropped for want of a link or because they did not open. |
 | 1000240 | `rune-txn-offset-commits-stuck` | gauge | control | Transaction commits waiting because the group coordinator refuses their consumer-group offsets. Alert on a non-zero value that persists. |
 | 1000241 | `rune-txn-offset-stuck-age-ms` | gauge | control | Age of the oldest of those, in ms. A WARN names it every 30 s while any is stuck. |
+| 1000242 | `rune-ns-slot-mismatch` | counter | control | Namespace slot tags refused by the gateway or a worker (`rune.ns.slot_mismatch`): a message or request whose (slot, nsId) pair the receiver's slot table does not hold. Any rise is a bug. |
+
+Per-namespace metrics (one series per namespace on this node, allocated when the namespace is created and freed when it is
+erased; the key is the namespace id and the slot's owner tag is the namespace id too):
+
+| Type id | Label | Kind | Owner | Meaning |
+|---|---|---|---|---|
+| 1000300 | `rune-ns-slot` | gauge | control | The node-local slot of the namespace (`default` is slot 0). The slot is the index of every per-namespace array on the hot path. |
 
 The owner is the one thread that writes the metric: `control` the broker's control agent, `observer` the role and ISR
 observer, `provisioner` the segment provisioner. Type id 1000204 (a metadata commit position that was never published) has no row, and

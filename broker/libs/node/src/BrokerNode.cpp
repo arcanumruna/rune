@@ -1634,6 +1634,30 @@ void BrokerNode::buildWorkerPool() {
         workerPool_->assignFromRegistry(*replicaRegistry_);
         // R-M1: boot (runners not started): every worker knows the ids the catalog already dropped.
         for (int32_t w = 0; w < workerPool_->workerCount(); ++w) workerPool_->worker(w).setDroppedTopicsDirect(bootDroppedIds_);
+        // Namespaces Phase 2 Task 8 (D22): boot (runners not started): every worker's slot table is the boot table.
+        for (int32_t w = 0; w < workerPool_->workerCount(); ++w) {
+            Worker& wk = workerPool_->worker(w);
+            wk.configureNsSlots(nsSlots_.capacity());
+            for (uint32_t sl = 0; sl < nsSlots_.capacity(); ++sl)
+                if (nsSlots_.nsIdAt(static_cast<uint16_t>(sl)) != NsSlotTable::kFreeSlot) {
+                    const uint32_t nsId = nsSlots_.nsIdAt(static_cast<uint16_t>(sl));
+                    wk.applyNsSlotAssignDirect(static_cast<uint16_t>(sl), nsId, nsSlots_.limits(static_cast<uint16_t>(sl)));
+                    // Review U1: the DELETING gate is rebuilt from the booted catalog - a live event may never come
+                    // while the reaper waits.
+                    if (sl < nsDeletingAtBoot_.size() && nsDeletingAtBoot_[sl])
+                        wk.applyNsThrottleDirect(static_cast<uint16_t>(sl), nsId, ThrottleKind::NsDeleting, 0);
+                }
+        }
+        // Namespaces Phase 2 Task 14 (D28): the limit aggregator (control thread) starts from the boot slot table; every worker
+        // reports its per-slot usage to it at the same period.
+        nsAggregator_.configure(nsSlots_.capacity(), static_cast<uint32_t>(workerPool_->workerCount()),
+                                static_cast<int64_t>(config_.nsLimitTickUs) * 1000);
+        for (uint32_t sl = 0; sl < nsSlots_.capacity(); ++sl)
+            if (nsSlots_.nsIdAt(static_cast<uint16_t>(sl)) != NsSlotTable::kFreeSlot)
+                nsAggregator_.onSlotAssign(static_cast<uint16_t>(sl), nsSlots_.nsIdAt(static_cast<uint16_t>(sl)),
+                                           nsSlots_.limits(static_cast<uint16_t>(sl)));
+        for (int32_t w = 0; w < workerPool_->workerCount(); ++w)
+            workerPool_->worker(w).setNsReportIntervalNs(static_cast<int64_t>(config_.nsLimitTickUs) * 1000);
         // Task 10 fix 3 (I2): ops are only routed after an inline reconcile, so
         // the SetOwnership that governs them is always ahead of them.
         workerPool_->setRegistry(replicaRegistry_.get());
@@ -2115,8 +2139,15 @@ void BrokerNode::buildGateway() {
         gateway_->setBootObjects(std::move(bootObjects_));   // authentication Task 12: the catalog's live topics / views at boot
         // Namespaces Task 9: the login's namespace mirror starts from the booted catalog (the applier is still on this
         // startup thread - buildAdminWorker adopts it later); every later change arrives as kA2cNamespaceUpserted.
+        gateway_->configureNsSlots(nsSlots_.capacity());
+        for (uint32_t sl = 0; sl < nsSlots_.capacity(); ++sl)   // the authoritative boot slots first (self-assign is then a no-op)
+            if (nsSlots_.nsIdAt(static_cast<uint16_t>(sl)) != NsSlotTable::kFreeSlot)
+                gateway_->onNsSlotAssign(static_cast<uint16_t>(sl), nsSlots_.nsIdAt(static_cast<uint16_t>(sl)),
+                                         nsSlots_.limits(static_cast<uint16_t>(sl)));
         if (bootApplier_) gateway_->setBootNamespaces(bootApplier_->state().namespaces());
         gateway_->setAnonymousRead(config_.anonymousRead);   // spec §11: RUNE_ANONYMOUS_READ, off by default
+        gateway_->setAnonymousCaps(config_.anonymousMaxConnections, config_.anonymousRequestOpsPerSec);   // #236 (Task 10)
+        gateway_->setNsLimitAggregator(&nsAggregator_);   // Task 14: worker usage reports -> the aggregator (same thread)
         // Authentication Task 10 (D4/D32): the gateway's OWN copy of the cluster keys (loaded on this startup thread,
         // validated by validateAuth) verifies the bootstrap proof.  Dev / in-process configs hold none.
         // Review C I4: the keys validated in start() ARE the keys in use - one load, handed out as copies; Enabled with
@@ -3001,6 +3032,13 @@ void BrokerNode::buildGateway() {
         if (runtimeAgent_) {
             cleanerViewChannel_ = runtimeAgent_->enableCleanerView();   // Task 8: also the policy-override ring
             cleanerAgent_->attachViewChannel(cleanerViewChannel_);
+            // Task 13 (D27): the cleaner starts with the boot table's retention maximums.
+            for (uint32_t sl = 0; sl < nsSlots_.capacity(); ++sl) {
+                const uint32_t id = nsSlots_.nsIdAt(static_cast<uint16_t>(sl));
+                if (id == NsSlotTable::kFreeSlot) continue;
+                const auto& L = nsSlots_.limits(static_cast<uint16_t>(sl));
+                postCleanerNsLimit_(static_cast<uint16_t>(sl), id, L.maxRetentionMs, L.maxRetentionBytes);
+            }
         }
         cleanerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
             *cleanerAgent_, cleanerIdleStrategy_, cleanerClock_);
@@ -3215,7 +3253,10 @@ void BrokerNode::createMetrics_() {
         }
     }
 
-    const std::int64_t required = metrics::requiredSlots({kNodeMetricCount, 0, 0, 0, 0, 16});   // D55
+    // Namespaces Phase 2 Task 8 (D22, D55): one per-namespace row per namespace the node can hold.
+    nsSlots_.reset(static_cast<uint32_t>(config_.maxNamespaces));
+    nsMetricSlots_.assign(nsSlots_.capacity(), metrics::SlotWriter{});
+    const std::int64_t required = metrics::requiredSlots(runeCapacityPlan(config_.maxNamespaces));   // D55
     const std::int32_t maxSlots = config_.metricsMaxSlotsOverrideForTest >= 0
                                       ? config_.metricsMaxSlotsOverrideForTest
                                       : static_cast<std::int32_t>(required);
@@ -3776,6 +3817,10 @@ BrokerNode::AdminBehindSnap BrokerNode::adminSecurityBehindForTest() {
     });
 }
 
+void BrokerNode::holdSecurityPurgeForTest(bool on) {
+    onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdSecurityPurgeForTest(on); });
+}
+
 void BrokerNode::holdSecurityApplyForTest(bool on) {
     onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdSecurityApplyForTest(on); });
 }
@@ -3976,6 +4021,7 @@ void BrokerNode::bootFromCatalog_() {
 
     bootDroppedIds_ = droppedTopicIds(bootApplier_->state());
     bootTopics_ = std::move(catalogTopics);
+    bootAssignNsSlots_();   // Namespaces Phase 2 Task 8: slots from the booted catalog, before any topic is built
 
     const auto nowSeconds = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -3996,6 +4042,20 @@ void BrokerNode::bootFromCatalog_() {
         break;
     case BootReconcile::RunNow:
     case BootReconcile::RunNowAndClearSentinel: {
+        {   // Phase 2 Task 7 (D18): the leftovers of deleted namespaces, judged against the booted catalog, first.
+            std::vector<NsDirFact> facts;
+            bootApplier_->state().namespaces().forEach([&](const cat::NamespaceRecord& r) {
+                facts.push_back(NsDirFact{r.nsId, std::holds_alternative<cat::NsDeleting>(r.state)});
+            });
+            const NsDeletingReconciliation nsr = reconcileNsDeletingDirs(
+                config_.dataDir, facts, bootApplier_->state().namespaces().nextNsId());
+            nsDirMismatchesAtBoot_ = nsr.liveMismatch.size();
+            if (!nsr.liveMismatch.empty())
+                throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: " +
+                                         std::to_string(nsr.liveMismatch.size()) + " namespace dir(s) named '*.deleting' belong to a "
+                                         "LIVE namespace (first: " + nsr.liveMismatch.front().string() +
+                                         ") - refusing to start; see the critical log lines");
+        }
         (void)reconcileTopicDirs(config_.dataDir, bootTopics_, bootDroppedIds_, nowSeconds);
         if (decision == BootReconcile::RunNowAndClearSentinel && !removeCatchUpSentinel(config_.dataDir))
             spdlog::error("BrokerNode[{}]: cannot remove the catch-up sentinel in {} — the next boot reconciles "
@@ -4350,6 +4410,11 @@ void BrokerNode::buildAdminWorker() {
         };
         deps.nsDefaults.limits = config_.nsDefaultLimits;
         deps.maxNamespaces     = static_cast<uint32_t>(config_.maxNamespaces);
+        // Namespaces Phase 2 Task 7: the reaper's requests to the control thread, and its tombstone batch.
+        deps.askControl = [this](const ReapRequestMsg& m) {
+            return adminWorkerAgent_ != nullptr && adminWorkerAgent_->postNsReapRequest(m);
+        };
+        deps.nsDeleteBatch = config_.nsDeleteBatch;
         // Issues #15 / #111: the `__security` catch-up verdict -> the control thread's SecurityServing.
         deps.securityServing = [this](bool caughtUp, int64_t leaderHw, int32_t epoch, bool asLeader, int64_t knownEnd,
                                       bool behind, bool held) {
@@ -4378,6 +4443,7 @@ void BrokerNode::buildAdminWorker() {
         bootSecurityApplier_.reset();
         if (holdCatalogApplyAtBootForTest_) adminWorkerAgent_->worker().holdApplyForTest(true);
         if (holdSecurityApplyAtBootForTest_) adminWorkerAgent_->worker().holdSecurityApplyForTest(true);
+        if (holdReaperAtBootForTest_) adminWorkerAgent_->worker().reaperForTest().setIssueBudgetForTest(0);
         if (bootReconcileDeferred_) {
             adminWorkerAgent_->worker().deferTopicDirReconcile(config_.dataDir);
         }
@@ -5016,9 +5082,27 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             if (tid == kA2cNamespaceUpserted) {   // namespaces Task 9: a namespace record -> the gateway's login mirror
                 rune::catalog::NamespaceRecord rec;
                 if (decodeNamespaceUpserted(p, n, rec)) {
+                    onNsUpserted_(rec);   // Namespaces Phase 2 Task 8: the slot is assigned before anyone sees the record
                     if (gateway_) gateway_->onNamespaceUpserted(rec);
                 } else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
                     spdlog::error("BrokerNode[{}]: malformed kA2cNamespaceUpserted (len={}) skipped", config_.nodeId, n);
+                return;
+            }
+            if (tid == kA2cNamespaceErased) {   // namespaces Phase 2 Task 3: a deleted namespace -> the gateway's mirror
+                uint32_t nsId = 0;
+                if (decodeNamespaceErased(p, n, nsId)) {
+                    onNsErasedSlot_(nsId);   // D22: the slot is freed on the erase (never on NamespaceDeleted)
+                    if (gateway_) gateway_->onNamespaceErased(nsId);
+                    onNamespaceErasedDisk_(nsId);   // D18: ns-<id> -> ns-<id>.deleting, purged off-thread
+                } else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+                    spdlog::error("BrokerNode[{}]: malformed kA2cNamespaceErased (len={}) skipped", config_.nodeId, n);
+                return;
+            }
+            if (tid == kA2cNsReapRequest) {   // Phase 2 Task 7: one step of a namespace delete, on the control thread
+                ReapRequestMsg m;
+                if (decodeReapRequest(p, n, m)) onNsReapRequest_(m);
+                else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+                    spdlog::error("BrokerNode[{}]: malformed kA2cNsReapRequest (len={}) skipped", config_.nodeId, n);
                 return;
             }
             if (tid == kA2cViewUninstall) {
@@ -5047,11 +5131,19 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     // Control (runtime) thread = the single producer of every worker ring.
     if (workerPool_) work += schemaFanout_.pump(*workerPool_);
     if (workerPool_) work += topicDroppedFanout_.pump(*workerPool_);   // R-M1
+    if (workerPool_ && nsAggregator_.slotCapacity() != 0) {            // Namespaces Phase 2 Task 14 (D28): one tick per period
+        if (nsAggregator_.doWork(nowNs) > 0)
+            nsAggregator_.drain([&](const Throttle& t) { nsSlotFanout_.post(t); }, [&](const ViewMemOver& v) { nsSlotFanout_.post(v); });
+    }
+    if (workerPool_) work += nsSlotFanout_.pump(*workerPool_);         // Namespaces Phase 2 Task 8 (D22)
+    publishNsSlotMetrics_();
     // Task 19: retry any view-plan install frames a worker ring could not take.
     if (!viewFanoutBacklog_.empty()) work += pumpViewFanout_();
     // Catalog history Task 8: the drop sequence's later steps + ring-full retries.
     if (!droppedAwaitingRetire_.empty()) [[unlikely]] work += serviceDroppedTopics_();
-    if (!purgeOutbox_.empty() || !cleanerPolicyOutbox_.empty()) [[unlikely]] work += pumpCatalogOutboxes_();
+    if (!erasedNsAwaitingRename_.empty()) [[unlikely]] work += serviceErasedNamespaces_();   // Phase 2 Task 7 (D18)
+    if (!purgeOutbox_.empty() || !cleanerPolicyOutbox_.empty() || !cleanerNsLimitOutbox_.empty() || !reapResultOutbox_.empty()) [[unlikely]]
+        work += pumpCatalogOutboxes_();
 
     // (3) Drain response frames (admin → control) → session egress.
     //     C1 / M7: through the DDL answer gate — a DefineTopic / CreateView OK
@@ -5648,6 +5740,7 @@ void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool is
     if (gateway_) gateway_->onCatalogObjectApplied(m.nsId, m.topicId, m.name, isView);
     TopicSpec spec = topicSpecFromCatalog(m);
     spec.viewSink = isView;   // VLS B.2
+    spec.nsSlot   = nsSlots_.slotOf(spec.nsId);   // Namespaces Phase 2 Task 8 (kNoNsSlot would be a bug: the worker refuses it)
     // Step 3: a create whose name a dropped topic still holds (its dir not renamed
     // away yet) waits — FIFO per name, behind any create of that name already waiting.
     bool behind = catalogNameHeldByDrop_(spec.nsId, spec.name);
@@ -5762,7 +5855,7 @@ void BrokerNode::dropRuntimeTopic_(int32_t topicId, uint32_t nsId, const std::st
     }
     // Groups resolve topic names in the default namespace only (namespaces Task 6): a drop in another namespace
     // never rebalances a default-namespace group subscribed to the same name.
-    if (groupCoordService_ && d.nsId == 0) (void)groupCoordService_->onTopicDropped(d.name, nowNs);   // groups rebalance it away
+    if (groupCoordService_) (void)groupCoordService_->onTopicDropped(d.name, nowNs, d.nsId);   // groups rebalance it away
     drop_step::AwaitingRetire retire;
     for (int32_t part = 0; part < partitions; ++part) {
         rune::replication::PartitionReplica* r = replicaRegistry_ ? replicaRegistry_->lookup(topicId, part) : nullptr;
@@ -5859,6 +5952,191 @@ int BrokerNode::serviceDroppedTopics_() {
     return work;
 }
 
+// Namespaces Phase 2 Task 7: one step of a namespace delete asked by the reaper (catalog leader's admin thread).  Runs on the
+// control thread, which owns the transaction coordinator and the offset / transaction-state stores.  Idempotent; the
+// answer (Done / More / Refused) always goes back, and the reaper retries anything not Done.
+void BrokerNode::onNsReapRequest_(const ReapRequestMsg& m) {
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    ReapStatus st = ReapStatus::Done;
+    switch (m.op) {
+    case ReapOp::AbortTxns:
+        // Only the loaded coordinator holds transactions (the others return 0): the gateway's apply of the namespace state
+        // change already aborted them on that node; this re-issue covers a coordinator that loaded since.
+        if (txnCoordService_) (void)txnCoordService_->abortAllForNamespace(m.nsId, nowNs);
+        st = ReapStatus::Done;
+        break;
+    case ReapOp::TombstoneGroups:
+        if (groupCoordService_) st = groupCoordService_->tombstoneNamespace(m.nsId, m.batch, nowNs);
+        break;
+    case ReapOp::TombstoneTxnState:
+        if (txnCoordService_) st = txnCoordService_->tombstoneNamespace(m.nsId, m.batch, nowNs);
+        break;
+    }
+    reapResultOutbox_.push_back(ReapResultMsg{m.correlation, st});
+    (void)pumpCatalogOutboxes_();
+}
+
+// ---------------------------------------------------------------------------
+// Namespaces Phase 2 Task 8 (D22) - the node's namespace slots.
+// ---------------------------------------------------------------------------
+// Startup thread, right after the boot replay: one slot per namespace of the booted catalog, in nsId order (the boot sink
+// posts the final state, so a node that restarts after an erase may number later namespaces differently - nothing relies
+// on the numbers), and the boot topics get their namespace's slot before they are built.
+void BrokerNode::bootAssignNsSlots_() {
+    if (!bootApplier_) return;
+    nsDeletingAtBoot_.assign(nsSlots_.capacity(), 0);
+    bootApplier_->state().namespaces().forEach([this](const rune::catalog::NamespaceRecord& rec) {
+        const auto slot = nsSlots_.assign(rec.nsId);
+        if (!slot) { ++nsSlotAssignFailures_; spdlog::error("BrokerNode[{}]: no free namespace slot for nsId {} at boot (bug)", config_.nodeId, rec.nsId); return; }
+        nsSlots_.setLimits(*slot, rec.limits);
+        if (std::holds_alternative<rune::catalog::NsDeleting>(rec.state)) nsDeletingAtBoot_[*slot] = 1;
+        registerNsMetric_(*slot, rec);
+    });
+    for (TopicSpec& t : bootTopics_) t.nsSlot = nsSlots_.slotOf(t.nsId);
+}
+
+void BrokerNode::registerNsMetric_(uint16_t slot, const rune::catalog::NamespaceRecord& rec) {
+    if (!metricsReady_ || slot >= nsMetricSlots_.size() || nsMetricSlots_[slot].slot() >= 0) return;
+    std::uint8_t keyBytes[kRoleKeyLength];
+    encodeRoleKey(keyBytes, static_cast<std::int32_t>(rec.nsId));
+    const std::span<const std::byte> key{reinterpret_cast<const std::byte*>(keyBytes), kRoleKeyLength};
+    // The label is bounded by kMaxLabelLength (364); a namespace name is <= 63 bytes.
+    const std::string label = "rune-ns-slot ns=" + rec.name + " ns_id=" + std::to_string(rec.nsId) + " node=" + std::to_string(config_.nodeId);
+    const metrics::AllocResult r = metricsWriter_.allocate(static_cast<std::int32_t>(RuneNsMetric::Slot), metrics::MetricKind::Gauge,
+                                                           static_cast<std::int64_t>(rec.nsId), key, label);
+    if (r.status != metrics::AllocStatus::Ok) {
+        spdlog::error("BrokerNode[{}]: no metric slot for namespace {} ({})", config_.nodeId, rec.nsId, metricsAllocStatusName(r.status));
+        return;
+    }
+    nsMetricSlots_[slot] = r.writer;
+    r.writer.set(static_cast<std::int64_t>(slot));
+}
+
+void BrokerNode::freeNsMetric_(uint16_t slot) {
+    if (slot >= nsMetricSlots_.size() || nsMetricSlots_[slot].slot() < 0) return;
+    (void)metricsWriter_.free(nsMetricSlots_[slot].slot());
+    nsMetricSlots_[slot] = metrics::SlotWriter{};
+}
+
+// Control thread: NamespaceCreated / NamespaceLimitsSet / state change / delete step.  The first record of an nsId assigns
+// its slot (lowest free); every record refreshes the limits the gateway and the workers hold.  Idempotent.
+void BrokerNode::onNsUpserted_(const rune::catalog::NamespaceRecord& rec) {
+    const uint16_t had = nsSlots_.slotOf(rec.nsId);
+    const auto slot = nsSlots_.assign(rec.nsId);
+    if (!slot) {   // unreachable: the AdminWorker refuses a Create at RUNE_MAX_NAMESPACES first (DELETING ones count)
+        ++nsSlotAssignFailures_;
+        spdlog::error("BrokerNode[{}]: no free namespace slot for nsId {} (bug: capacity {})", config_.nodeId, rec.nsId, nsSlots_.capacity());
+        return;
+    }
+    // Spec §4: DELETING refuses every request from the NamespaceDeleted commit on.  The topics are dropped later, one
+    // reaper step at a time; until then every worker refuses a produce to them (UnknownTopic) - an acked record would be
+    // erased with the namespace.  Posted after the assign below on a new slot (same FIFO): see the end of this function.
+    const bool deleting = std::holds_alternative<rune::catalog::NsDeleting>(rec.state);
+    if (had != kNoNsSlot && nsSlots_.limits(*slot) == rec.limits) {   // a state change / step: limits unchanged
+        if (deleting && workerPool_) nsSlotFanout_.post(Throttle{*slot, rec.nsId, ThrottleKind::NsDeleting, 0});
+        return;
+    }
+    nsSlots_.setLimits(*slot, rec.limits);
+    registerNsMetric_(*slot, rec);
+    if (gateway_) gateway_->onNsSlotAssign(*slot, rec.nsId, rec.limits);
+    nsAggregator_.onSlotAssign(*slot, rec.nsId, rec.limits);   // Task 14: new owner -> zero usage; refresh -> next tick applies
+    if (workerPool_) nsSlotFanout_.post(NsSlotAssign{*slot, rec.nsId, rec.limits});
+    postCleanerNsLimit_(*slot, rec.nsId, rec.limits.maxRetentionMs, rec.limits.maxRetentionBytes);   // Task 13 (D27)
+    if (deleting && workerPool_) nsSlotFanout_.post(Throttle{*slot, rec.nsId, ThrottleKind::NsDeleting, 0});
+}
+
+void BrokerNode::postCleanerNsLimit_(uint16_t slot, uint32_t nsId, uint64_t maxRetentionMs, uint64_t maxRetentionBytes) {
+    if (!cleanerViewChannel_) return;   // no cleaner: nothing to clamp (the boot attach re-posts every slot)
+    std::array<uint8_t, CleanerViewChannel::kNsLimitBytes> f{};
+    std::memcpy(f.data(), &slot, 2);
+    std::memcpy(f.data() + 4, &nsId, 4);
+    std::memcpy(f.data() + 8, &maxRetentionMs, 8);
+    std::memcpy(f.data() + 16, &maxRetentionBytes, 8);
+    cleanerNsLimitOutbox_.push_back(f);
+    (void)pumpCatalogOutboxes_();
+}
+
+void BrokerNode::onNsErasedSlot_(uint32_t nsId) {
+    const uint16_t slot = nsSlots_.slotOf(nsId);
+    if (slot == kNoNsSlot || nsId == 0) return;
+    if (!nsSlots_.release(slot, nsId)) return;
+    freeNsMetric_(slot);
+    if (gateway_) gateway_->onNsSlotFreed(slot, nsId);
+    nsAggregator_.onSlotFreed(slot, nsId);
+    if (workerPool_) nsSlotFanout_.post(NsSlotRelease{slot, nsId});
+    postCleanerNsLimit_(slot, CleanerViewChannel::kNsLimitFree, 0, 0);
+}
+
+void BrokerNode::publishNsSlotMetrics_() noexcept {
+    if (!metricsReady_ || !gateway_) return;
+    const auto total = static_cast<std::int64_t>(gateway_->nsSlotMismatchTotal());
+    if (total != lastNsMismatchPublished_) { lastNsMismatchPublished_ = total; controlSet_(RuneMetric::NsSlotMismatch, total); }
+}
+
+uint32_t BrokerNode::nsConnectionsForTest(uint32_t nsId) {
+    return onControlThreadForTest([&] { return gateway_ ? gateway_->nsConnectionsForTest(nsId) : 0u; });
+}
+
+uint32_t BrokerNode::anonymousSessionsForTest() {
+    return onControlThreadForTest([&] { return gateway_ ? gateway_->anonymousSessionsForTest() : 0u; });
+}
+
+uint16_t BrokerNode::nsSlotOfForTest(uint32_t nsId) {
+    return onControlThreadForTest([&] { return nsSlots_.slotOf(nsId); });
+}
+
+std::vector<std::pair<uint16_t, uint32_t>> BrokerNode::nsSlotsForTest() {
+    return onControlThreadForTest([&] {
+        std::vector<std::pair<uint16_t, uint32_t>> v;
+        for (uint32_t s = 0; s < nsSlots_.capacity(); ++s)
+            if (nsSlots_.nsIdAt(static_cast<uint16_t>(s)) != NsSlotTable::kFreeSlot)
+                v.emplace_back(static_cast<uint16_t>(s), nsSlots_.nsIdAt(static_cast<uint16_t>(s)));
+        return v;
+    });
+}
+
+// D18: a namespace left the catalog.  Its directory moves to ns-<id>.deleting (atomic, never deleted in place) and the
+// admin thread removes it off-thread (kMsgPurgeDroppedDir); a crash in between is finished by the boot reconcile.  The
+// rename waits until every topic the namespace dropped finished its own retire sequence (its Logs are closed and its
+// segment provisioning stopped): nothing may write below a directory that moved.
+void BrokerNode::onNamespaceErasedDisk_(uint32_t nsId) {
+    if (nsId == 0) return;
+    if (std::find(erasedNsAwaitingRename_.begin(), erasedNsAwaitingRename_.end(), nsId) == erasedNsAwaitingRename_.end())
+        erasedNsAwaitingRename_.push_back(nsId);
+    (void)serviceErasedNamespaces_();
+}
+
+int BrokerNode::serviceErasedNamespaces_() {
+    namespace fs = std::filesystem;
+    int work = 0;
+    for (std::size_t i = 0; i < erasedNsAwaitingRename_.size();) {
+        const uint32_t nsId = erasedNsAwaitingRename_[i];
+        const bool dropping = std::any_of(droppedAwaitingRetire_.begin(), droppedAwaitingRetire_.end(),
+                                          [nsId](const DroppedTopic& d) { return d.nsId == nsId; });
+        if (dropping) { ++i; continue; }
+        erasedNsAwaitingRename_.erase(erasedNsAwaitingRename_.begin() + static_cast<std::ptrdiff_t>(i));
+        ++work;
+        const fs::path from = nsRoot(fs::path(config_.dataDir), nsId);
+        std::error_code ec;
+        if (!fs::exists(fs::symlink_status(from, ec))) continue;   // a namespace that never held a topic has no dir
+        const fs::path to = from.string() + ".deleting";
+        if (fs::exists(fs::symlink_status(to, ec))) fs::remove_all(to, ec);   // a leftover of an earlier crash: cold, rare
+        ec.clear();
+        fs::rename(from, to, ec);
+        if (ec) {
+            spdlog::error("BrokerNode[{}]: renaming the deleted namespace dir '{}' -> '{}' failed: {} - left for the "
+                          "boot reconcile", config_.nodeId, from.string(), to.string(), ec.message());
+            continue;
+        }
+        spdlog::info("BrokerNode[{}]: namespace {} erased - its data moved to '{}' (purged off-thread)", config_.nodeId,
+                     nsId, to.string());
+        purgeOutbox_.push_back(to.string());
+    }
+    if (!purgeOutbox_.empty()) work += pumpCatalogOutboxes_();
+    return work;
+}
+
 int BrokerNode::pumpCatalogOutboxes_() {
     int work = 0;
     if (!purgeOutbox_.empty() && adminWorkerAgent_) {
@@ -5878,6 +6156,31 @@ int BrokerNode::pumpCatalogOutboxes_() {
         work += static_cast<int>(sent);
     } else if (!purgeOutbox_.empty()) {
         purgeOutbox_.clear();   // no admin thread: the boot purge removes them
+    }
+    if (!reapResultOutbox_.empty() && adminWorkerAgent_) {   // Phase 2 Task 7: reaper answers; never dropped
+        std::size_t sent = 0;
+        OneToOneByteRing& ring = adminWorkerAgent_->controlToAdminRing();
+        for (const ReapResultMsg& r : reapResultOutbox_) {
+            uint8_t frame[kReapResultWireLen];
+            writeReapResult(frame, r);
+            if (!ring.write(frame, sizeof(frame), kMsgNsReapResult)) break;
+            ++sent;
+        }
+        reapResultOutbox_.erase(reapResultOutbox_.begin(), reapResultOutbox_.begin() + static_cast<std::ptrdiff_t>(sent));
+        work += static_cast<int>(sent);
+    }
+    if (!cleanerNsLimitOutbox_.empty()) {
+        std::size_t sent = 0;
+        if (cleanerViewChannel_) {
+            for (const auto& f : cleanerNsLimitOutbox_) {
+                if (!cleanerViewChannel_->view.write(f.data(), f.size(), CleanerViewChannel::kNsLimitMsgType)) break;
+                ++sent;
+            }
+        } else {
+            sent = cleanerNsLimitOutbox_.size();
+        }
+        cleanerNsLimitOutbox_.erase(cleanerNsLimitOutbox_.begin(), cleanerNsLimitOutbox_.begin() + static_cast<std::ptrdiff_t>(sent));
+        work += static_cast<int>(sent);
     }
     if (!cleanerPolicyOutbox_.empty()) {
         std::size_t sent = 0;

@@ -648,7 +648,7 @@ TEST(DispatchCheckFrame, UnsupportedVersionDataTemplate) {
 }
 
 // ===========================================================================
-// 5. UnknownTemplate — ids 0, 22, 45(*), 84, 99, 65535 (8, 12..15, 64 are known)
+// 5. UnknownTemplate — ids 0, 22, 45(*), 86, 99, 65535 (8, 12..15, 64 are known)
 //    (valid schema + version but unknown id)
 //    Note: 16-21 (Produce..Unsubscribe) are KNOWN (PB-1/PB-2/PB-3).
 //          32-44 (JoinGroup..Assign) are KNOWN (CG-1).
@@ -786,12 +786,12 @@ TEST(DispatchCheckFrame, KnownTemplatesEightyOneToEightyThree) {
     }
 }
 
-TEST(DispatchCheckFrame, UnknownTemplateEightyFour) {
-    // 84 = first unassigned id in schema/view range after ListNamespacesResponse=83
-    auto buf = makeValidHeaderBuf(84);
+TEST(DispatchCheckFrame, UnknownTemplateEightySix) {
+    // 86 = first unassigned id in schema/view range after NamespaceUsageResponse=85
+    auto buf = makeValidHeaderBuf(86);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
-    EXPECT_EQ(fc.templateId, 84u);
+    EXPECT_EQ(fc.templateId, 86u);
 }
 
 TEST(DispatchCheckFrame, UnknownTemplateNinetyNine) {
@@ -976,7 +976,7 @@ TEST(DispatchIsKnownTemplate, KnownBoundaries) {
         EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
     }
     EXPECT_TRUE(rpc::isKnownTemplate(83));
-    EXPECT_FALSE(rpc::isKnownTemplate(84));
+    EXPECT_FALSE(rpc::isKnownTemplate(86));
     EXPECT_FALSE(rpc::isKnownTemplate(95));
     EXPECT_FALSE(rpc::isKnownTemplate(65535));
 }

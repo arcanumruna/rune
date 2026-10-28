@@ -119,11 +119,11 @@ public:
 /// The transaction coordinator's view of markers (refused / landed).
 class MarkerSpy final : public rune::gateway::ITxnRequestHandler {
 public:
-    size_t handleInitProducerId(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-    size_t handleAddPartitions(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-    size_t handleAddOffsets(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-    size_t handleTxnOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-    size_t handleEndTxn(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+    size_t handleInitProducerId(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+    size_t handleAddPartitions(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+    size_t handleAddOffsets(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+    size_t handleTxnOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+    size_t handleEndTxn(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
     void onControlMarkerRefused(int32_t, int32_t, int64_t, int16_t ec, int32_t) override {
         ++refused;
         lastRefused = ec;

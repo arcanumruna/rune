@@ -104,6 +104,8 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     NamespaceDdl            = 81,
     ListNamespaces          = 82,
     ListNamespacesResponse  = 83,
+    NamespaceUsage          = 84,
+    NamespaceUsageResponse  = 85,
 };
 
 enum class ErrorCode : uint16_t {
@@ -354,6 +356,7 @@ inline constexpr int32_t kClientVersionReceiverKeys               = 12;  // per-
 //   (non-retriable).  A broker answers a session below 13 NotLeader instead of 27 (their retriable code).
 inline constexpr int32_t kClientVersionTxnVerify                  = 13;  // produce ConcurrentTransactions (issue #112)
 // 14 — namespaces (plan 2026-10-26-rune-namespaces): NamespaceDdl (81), ListNamespaces (82), ListNamespacesResponse (83),
+//   NamespaceUsage (84), NamespaceUsageResponse (85) (no version bump: unknown to older peers, never sent to them),
 //   `ns/name` qualified names, the session namespace on login, and error codes 51-54 (NamespaceSuspended,
 //   NamespaceLimitExceeded, Throttled, ViewPaused).  A session below 14 is answered InvalidRequest (39) for 81-83 and
 //   never sent 51-54.  Broker 8 announces it.
@@ -491,6 +494,8 @@ inline constexpr int32_t kBrokerVersion                           = 8;   // what
         return ErrorCode::NotLeader;   // Phase 2b E2: a pre-v6 client's retriable code
     if (ec == ErrorCode::ConcurrentTransactions && !clientUnderstandsProduceTxnVerify(clientVersion)) [[unlikely]]
         return ErrorCode::NotLeader;   // issue #112: a pre-v13 client's retriable code
+    if ((ec == ErrorCode::NamespaceSuspended || ec == ErrorCode::NamespaceLimitExceeded || ec == ErrorCode::Throttled) && clientVersion < kClientVersionNamespaces) [[unlikely]]
+        return ErrorCode::InvalidRequest;   // namespaces Phase 2 Task 11: the namespace codes (51-53) exist only for a v14+ client
     return ec;
 }
 

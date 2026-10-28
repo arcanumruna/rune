@@ -66,6 +66,7 @@ struct Applied {
     int32_t   createdTopicId = -1;   // CreateTopic / CreateView / AlterView: the new (sink) topic id
     int32_t   droppedTopicId = -1;   // DropTopic / DropView / AlterView: the retired (sink) topic id
     uint32_t  nsId           = 0;    // the event's namespace (the subject, for a namespace kind)
+    bool      nsErased       = false;   // this event completed a DELETING namespace and it left the registry
 };
 /// What an applied DDL answered — replayed to a retry with the same requestId (ruling 9).
 struct RequestRecord {

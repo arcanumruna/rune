@@ -20,6 +20,8 @@ add_library(rune_node
     src/CatalogApplier.cpp
     src/SecurityApplier.cpp
     src/SecurityAdmin.cpp
+    src/NamespaceReaper.cpp
+    src/NsLimitAggregator.cpp
     src/PeerLinkAgent.cpp
     src/CatalogReadServer.cpp
     src/CatalogEffectFrames.cpp
@@ -1091,6 +1093,27 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_worker_enforcement_regression_tests)
     # D23 (D19-D21 review L2): the hot-path B tests that replace the global
     # operator new / delete (binary-wide) run in their own binary.
+    # Namespaces Phase 2 Task 11 (D25): the namespace disk limit at the owning worker (HotPathBRig, no Aeron).
+    add_executable(rune_ns_disk_worker_tests tests/integration/NsDiskWorkerRegressionTest.cpp)
+    target_include_directories(rune_ns_disk_worker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration)
+    target_link_libraries(rune_ns_disk_worker_tests PRIVATE rune_node rune_replication rune_storage rune_transaction GTest::gtest_main)
+    gtest_discover_tests(rune_ns_disk_worker_tests)
+    # max-message-bytes / max-batch-bytes at the owning worker's produce intake (HotPathBRig, no Aeron).
+    add_executable(rune_ns_produce_size_tests tests/node/NsProduceSizeLimitRegressionTest.cpp)
+    target_include_directories(rune_ns_produce_size_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration)
+    target_link_libraries(rune_ns_produce_size_tests PRIVATE rune_node rune_replication rune_storage rune_transaction GTest::gtest_main)
+    gtest_discover_tests(rune_ns_produce_size_tests)
+    # Namespaces Phase 2 Task 14 (D22, D28): the Throttle message at the owning worker (HotPathBRig, no Aeron).
+    add_executable(rune_ns_throttle_worker_tests tests/integration/NamespaceThrottleWorkerRegressionTest.cpp)
+    target_include_directories(rune_ns_throttle_worker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration)
+    target_link_libraries(rune_ns_throttle_worker_tests PRIVATE rune_node rune_replication rune_storage rune_transaction GTest::gtest_main)
+    gtest_discover_tests(rune_ns_throttle_worker_tests)
+    # Namespaces Phase 2 Task 15: the namespace gate and counters allocate nothing (AllocWindow replaces operator new here).
+    add_executable(rune_ns_hotpath_alloc_tests tests/integration/NsHotPathAllocRegressionTest.cpp tests/support/AllocWindow.cpp)
+    target_include_directories(rune_ns_hotpath_alloc_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_ns_hotpath_alloc_tests PRIVATE rune_node rune_view rune_codec rune_replication rune_storage
+                          rune_transaction GTest::gtest_main)
+    gtest_discover_tests(rune_ns_hotpath_alloc_tests)
     add_executable(rune_hotpath_b_alloc_regression_tests
         tests/integration/HotPathBAllocRegressionTest.cpp)
     target_link_libraries(rune_hotpath_b_alloc_regression_tests PRIVATE
@@ -1796,6 +1819,119 @@ if(BUILD_TESTING)
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_client_tests PROPERTIES TIMEOUT 600)
 
+        # Namespaces Phase 2 Task 16 (D29): NamespaceUsage (84) through the REAL client against ONE real broker.
+        add_executable(rune_namespace_usage_tests tests/client/NamespaceUsageRegressionTest.cpp)
+        target_include_directories(rune_namespace_usage_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_usage_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_usage_tests PROPERTIES TIMEOUT 600)
+
+        # Namespaces Phase 2 Task 5 (D19): namespace-scoped group / transactional ids; groups and transactions in every
+        # namespace (stores, coordinator, reserved prefix, and the REAL client against ONE real broker).
+        add_executable(rune_ns_keyed_stores_tests tests/node/NsKeyedStoresRegressionTest.cpp)
+        target_include_directories(rune_ns_keyed_stores_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_ns_keyed_stores_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_ns_keyed_stores_tests PROPERTIES TIMEOUT 600)
+
+        # Namespaces Phase 2 Task 8 (D22): per-node namespace slots, the broadcast to every worker and the gateway.
+        add_executable(rune_ns_slot_tests tests/node/NsSlotRegressionTest.cpp)
+        target_include_directories(rune_ns_slot_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_ns_slot_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_ns_slot_tests PROPERTIES TIMEOUT 900)
+
+        # Namespaces Phase 2 Task 9 (D23): maxUsers, the acks floor and the Txns / AuthScram features through the REAL client.
+        add_executable(rune_limit_broker_tests tests/client/LimitEnforcementBrokerRegressionTest.cpp)
+        target_include_directories(rune_limit_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_limit_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_limit_broker_tests PROPERTIES TIMEOUT 900)
+
+        # Namespaces Phase 2 Task 10 (D24, #236): connection counts per namespace and node, open txns and txn time.
+        add_executable(rune_ns_connection_tests tests/client/NsConnectionLimitRegressionTest.cpp)
+        target_include_directories(rune_ns_connection_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_ns_connection_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_ns_connection_tests PROPERTIES TIMEOUT 900)
+
+        # Namespaces Phase 2 Task 11 (D25): the namespace disk limit through the REAL client (1 node and 3 nodes).
+        add_executable(rune_ns_disk_limit_tests tests/client/NsDiskLimitRegressionTest.cpp)
+        target_include_directories(rune_ns_disk_limit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_ns_disk_limit_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_ns_disk_limit_tests PROPERTIES TIMEOUT 900)
+
+        # Namespaces Phase 2 Task 14 (D28): the rate throttle through the REAL client / a raw v14 session against a real broker.
+        add_executable(rune_ns_throttle_tests tests/client/NamespaceThrottleRegressionTest.cpp)
+        target_include_directories(rune_ns_throttle_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_ns_throttle_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_ns_throttle_tests PROPERTIES TIMEOUT 900)
+
+        # Namespaces Phase 2 Task 15: the gateway's Suspended refusal allocates nothing (real broker, AllocWindow on the control thread).
+        add_executable(rune_ns_hotpath_suspend_alloc_tests tests/client/NsHotPathSuspendAllocRegressionTest.cpp tests/support/AllocWindow.cpp)
+        target_include_directories(rune_ns_hotpath_suspend_alloc_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_ns_hotpath_suspend_alloc_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_ns_hotpath_suspend_alloc_tests PROPERTIES TIMEOUT 600)
+
+        # Namespaces Phase 2 Task 12 (D26): the namespace view-memory limit pauses views at an offset and resumes them.
+        add_executable(rune_ns_view_memory_tests tests/node/NsViewMemoryRegressionTest.cpp)
+        target_include_directories(rune_ns_view_memory_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_ns_view_memory_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
+                              aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_ns_view_memory_tests PROPERTIES TIMEOUT 300)
+
+        # Namespaces Phase 2 Task 13 (D27): the retention clamp in the cleaner.
+        add_executable(rune_retention_clamp_tests tests/node/RetentionClampRegressionTest.cpp)
+        target_include_directories(rune_retention_clamp_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_retention_clamp_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
+                              aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_retention_clamp_tests PROPERTIES TIMEOUT 300)
+
+        # Namespaces Phase 2 Task 14 (D25, D26, D28): the limit aggregator (pure, injected clock).
+        add_executable(rune_ns_limit_aggregator_tests tests/node/NsLimitAggregatorRegressionTest.cpp)
+        target_include_directories(rune_ns_limit_aggregator_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_ns_limit_aggregator_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_ns_limit_aggregator_tests PROPERTIES TIMEOUT 120)
+
+        # Namespaces Phase 2 Task 7 (D17, D18; rule 16): the namespace reaper - the state machine over a real CatalogState,
+        # and three real AdminWorkers (leader change after each durable step).
+        add_executable(rune_namespace_reaper_tests tests/node/NamespaceReaperRegressionTest.cpp)
+        target_include_directories(rune_namespace_reaper_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_reaper_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
+                              aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_reaper_tests PROPERTIES TIMEOUT 600)
+
+        # Namespaces Phase 2 Task 7 (D17, D18): delete to the end through the REAL client against ONE real broker.
+        add_executable(rune_namespace_delete_tests tests/client/NamespaceDeleteRegressionTest.cpp)
+        target_include_directories(rune_namespace_delete_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_delete_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_delete_tests PROPERTIES TIMEOUT 900)
+
+        # Namespaces Phase 2 Task 6b (D20): tombstones of a deleted namespace's offsets and transaction state.
+        add_executable(rune_namespace_tombstone_tests tests/node/NamespaceTombstoneRegressionTest.cpp)
+        target_link_libraries(rune_namespace_tombstone_tests PRIVATE rune_node rune_coordination rune_transaction
+                              rune_replication rune_storage GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_tombstone_tests PROPERTIES TIMEOUT 300)
+
+        # Namespaces Phase 2 Task 4: open transactions abort on suspend, delete and every session revoke (coordinator
+        # unit tests + the REAL client against ONE real broker).
+        add_executable(rune_txn_abort_on_suspend_tests tests/client/TxnAbortOnSuspendRegressionTest.cpp tests/support/AllocWindow.cpp)
+        target_include_directories(rune_txn_abort_on_suspend_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_txn_abort_on_suspend_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_txn_abort_on_suspend_tests PROPERTIES TIMEOUT 600)
+
+        # Namespaces Phase 2 Task 3: suspend / resume / delete through the REAL client against ONE real broker.
+        add_executable(rune_namespace_suspend_tests tests/client/NamespaceSuspendRegressionTest.cpp)
+        target_include_directories(rune_namespace_suspend_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_suspend_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_suspend_tests PROPERTIES TIMEOUT 600)
+
         # Authentication Task 11: the SCRAM login in the session handshake against ONE real authenticating broker
         # (raw frames: AuthWireClient + the rune-crypto SCRAM client).
         add_executable(rune_auth_login_tests tests/node/AuthLoginTest.cpp)
@@ -1937,11 +2073,21 @@ if(BUILD_TESTING)
         target_include_directories(rune_namespace_admin_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_namespace_admin_tests PRIVATE rune_node rune_view rune_replication rune_codec aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_admin_tests PROPERTIES TIMEOUT 360)
+        # Namespaces Phase 2 Task 9 (D23): the count, durability and feature limits through the REAL AdminWorker.
+        add_executable(rune_limit_ddl_tests tests/node/LimitEnforcementDdlRegressionTest.cpp)
+        target_include_directories(rune_limit_ddl_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_limit_ddl_tests PRIVATE rune_node rune_view rune_replication rune_codec aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_limit_ddl_tests PROPERTIES TIMEOUT 360)
         # Namespaces Task 8 (spec §4): the `__security` leader's namespace resolution and guard (no escalation).
         add_executable(rune_namespace_escalation_tests tests/node/NamespaceEscalationTest.cpp)
         target_include_directories(rune_namespace_escalation_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_namespace_escalation_tests PRIVATE rune_node rune_view rune_replication rune_codec aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_escalation_tests PROPERTIES TIMEOUT 360)
+        # Namespaces Phase 2 Task 6a: the `__security` leader issues NamespacePurged for a DELETING namespace.
+        add_executable(rune_security_ns_purge_tests tests/node/SecurityNamespacePurgeTest.cpp)
+        target_include_directories(rune_security_ns_purge_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_security_ns_purge_tests PRIVATE rune_node rune_view rune_replication rune_codec aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_security_ns_purge_tests PROPERTIES TIMEOUT 360)
         # Namespaces Task 9 (spec §2, §11): the session's namespace from the login (`ns/user`), anonymous read.
         add_executable(rune_namespace_login_tests tests/node/NamespaceLoginTest.cpp)
         target_include_directories(rune_namespace_login_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -1961,16 +2107,40 @@ if(BUILD_TESTING)
         target_link_libraries(rune_namespace_matrix_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_matrix_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900 LABELS small)
         rune_regression_batches(rune_namespace_matrix_tests 2)
+        # Namespaces Phase 2 Task 17 (spec §8): the lifecycle matrix (support/NamespaceLifecycleMatrixExpectations.h): 300 sequential
+        # cells on one real broker plus 36 timing cells (real brokers, CatalogTrio, the limit aggregator).
+        add_executable(rune_namespace_lifecycle_matrix_tests tests/node/NamespaceLifecycleMatrixTest.cpp)
+        target_include_directories(rune_namespace_lifecycle_matrix_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_lifecycle_matrix_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_lifecycle_matrix_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900 LABELS small)
+        rune_regression_batches(rune_namespace_lifecycle_matrix_tests 6 TIMEOUT 1800)
+        # Final review U2/U3: cross-namespace group/txn references and recreate-before-purge (real broker).
+        add_executable(rune_namespace_cross_ref_tests tests/node/NamespaceCrossRefRegressionTest.cpp)
+        target_include_directories(rune_namespace_cross_ref_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_cross_ref_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_cross_ref_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900 LABELS small)
+        rune_regression_batches(rune_namespace_cross_ref_tests 1)
         # Namespaces Task 13 (spec §8): seeded, model-checked stress on one real broker (one ctest entry per seed).
         add_executable(rune_namespace_stress_tests tests/node/NamespaceStressTest.cpp)
         target_include_directories(rune_namespace_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-        target_link_libraries(rune_namespace_stress_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
-        gtest_discover_tests(rune_namespace_stress_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900)
+        target_link_libraries(rune_namespace_stress_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        # Phase 2 Task 18: the lifecycle ops, transactions through a real client and the 3-node leader-change variant.
+        gtest_discover_tests(rune_namespace_stress_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 3600)
         # Namespaces Task 14 (spec §8): the 3-node slice, including the matrix's 14 LeaderChange timing cells.
         add_executable(rune_namespace_trio_tests tests/node/NamespaceTrioTest.cpp)
         target_include_directories(rune_namespace_trio_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_namespace_trio_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_trio_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900)
+
+        # Namespaces Phase 2 Task 19 (spec §8): the lifecycle on three real authenticating brokers.
+        add_executable(rune_namespace_lifecycle_trio_tests tests/node/NamespaceLifecycleTrioRegressionTest.cpp)
+        target_include_directories(rune_namespace_lifecycle_trio_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_namespace_lifecycle_trio_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_namespace_lifecycle_trio_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 1200)
 
         # Catalog history Task 17: TestCluster::defineTopic — the in-process way to create a
         # topic now that the static topic list / NodeConfig::topics are gone (DDL over the wire on real

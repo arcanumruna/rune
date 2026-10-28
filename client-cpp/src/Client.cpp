@@ -1575,11 +1575,12 @@ OpResult Client::dropTopic(std::string_view name, const DdlOptions& ddl, Complet
 OpResult Client::namespaceDdl(rune::protocol::client::NamespaceDdlKind kind, std::string_view name,
                               const std::array<uint8_t, rune::protocol::client::kNamespacePresentMaskBytes>& presentMask,
                               const rune::protocol::NamespaceLimits& limits, const DdlOptions& ddl,
-                              CompletionTarget target, Token token) {
+                              CompletionTarget target, Token token, rune::protocol::client::NsSuspendMode mode) {
     namespace rpc = rune::protocol::client;
     if (name.empty()) return OpResult::InvalidArgument;
     rpc::NamespaceDdlRequest msg;
     msg.kind        = kind;
+    msg.mode        = mode;
     msg.name        = std::string(name);
     msg.presentMask = presentMask;
     msg.limits      = limits;
@@ -1601,6 +1602,16 @@ OpResult Client::listNamespaces(uint32_t afterNsId, uint16_t max, CompletionTarg
     const std::size_t n = msg.encode(frame.data());
     if (n == 0) return OpResult::InvalidArgument;
     return issueControl_(OpKind::ListNamespaces, target, token, std::span<const uint8_t>(frame.data(), n), 0);
+}
+
+OpResult Client::namespaceUsage(std::string_view name, CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::NamespaceUsageRequest msg;
+    msg.name.assign(name);
+    std::vector<uint8_t> frame(msg.encodedSize());
+    const std::size_t n = msg.encode(frame.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueControl_(OpKind::NamespaceUsage, target, token, std::span<const uint8_t>(frame.data(), n), 0);
 }
 
 OpResult Client::dropView(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token) {
@@ -3104,7 +3115,9 @@ ViewRowResult Client::getViewRowAndWait(int32_t viewTopicId, uint64_t keyU64, ui
                  // Closed) is.
                  if (c.status != OpStatus::BrokerError) throwForStatus_("getViewRow()", c, p);
                  result.status = (c.status == OpStatus::Ok) ? ViewRowResult::kOk : c.errorCode;
-                 if (result.status == ViewRowResult::kOk) result.rowBytes.assign(p.begin(), p.end());
+                 if (result.status == ViewRowResult::kOk || result.status == ViewRowResult::kViewPaused ||
+                     result.status == ViewRowResult::kThrottled)
+                     result.rowBytes.assign(p.begin(), p.end());   // kViewPaused: the paused offset, 8 LE bytes
              });
     return result;
 }
@@ -3136,6 +3149,63 @@ Client::NamespaceResult<void> Client::setNamespaceLimits(std::string_view name, 
              },
              [&](const Completion& c, std::span<const uint8_t> p) {
                  if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("setNamespaceLimits()", c, p);
+                 r = ddlResultOf(c, p);
+                 r.requestId = requestIdOf(c);
+             });
+    if (r.errorCode != 0) return std::unexpected(std::move(r));
+    return {};
+}
+
+namespace {
+// Suspend / Resume / Delete carry no limits.
+const std::array<uint8_t, rune::protocol::client::kNamespacePresentMaskBytes> kNoMask{};
+}  // namespace
+
+Client::NamespaceResult<void> Client::suspendNamespace(std::string_view name, rune::protocol::client::NsSuspendMode mode,
+                                                       std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    DdlResult r;
+    andWait_("suspendNamespace()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return namespaceDdl(rpc::NamespaceDdlKind::Suspend, name, kNoMask, rune::protocol::NamespaceLimits{},
+                                     DdlOptions{}, q, t, mode);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("suspendNamespace()", c, p);
+                 r = ddlResultOf(c, p);
+                 r.requestId = requestIdOf(c);
+             });
+    if (r.errorCode != 0) return std::unexpected(std::move(r));
+    return {};
+}
+
+Client::NamespaceResult<void> Client::resumeNamespace(std::string_view name, std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    DdlResult r;
+    andWait_("resumeNamespace()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return namespaceDdl(rpc::NamespaceDdlKind::Resume, name, kNoMask, rune::protocol::NamespaceLimits{},
+                                     DdlOptions{}, q, t);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("resumeNamespace()", c, p);
+                 r = ddlResultOf(c, p);
+                 r.requestId = requestIdOf(c);
+             });
+    if (r.errorCode != 0) return std::unexpected(std::move(r));
+    return {};
+}
+
+Client::NamespaceResult<void> Client::deleteNamespace(std::string_view name, std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    DdlResult r;
+    andWait_("deleteNamespace()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return namespaceDdl(rpc::NamespaceDdlKind::Delete, name, kNoMask, rune::protocol::NamespaceLimits{},
+                                     DdlOptions{}, q, t);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("deleteNamespace()", c, p);
                  r = ddlResultOf(c, p);
                  r.requestId = requestIdOf(c);
              });
@@ -3197,6 +3267,31 @@ Client::listNamespaces(std::chrono::milliseconds timeout) {
         after = page->nextAfter;
     }
     return out;
+}
+
+Client::NamespaceResult<rune::protocol::client::NamespaceUsageResponse>
+Client::namespaceUsage(std::string_view name, std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    DdlResult err;
+    std::optional<rpc::NamespaceUsageResponse> got;
+    andWait_("namespaceUsage()", timeout, 64u << 10,
+             [&](Completions& q, Token t) { return namespaceUsage(name, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status == OpStatus::BrokerError) {
+                     err.errorCode = c.errorCode;
+                     err.detail.assign(reinterpret_cast<const char*>(p.data()), p.size());
+                     return;
+                 }
+                 throwForStatus_("namespaceUsage()", c, p);
+                 got = rpc::NamespaceUsageResponse::decode(p.data(), p.size());
+             });
+    if (err.errorCode != 0) return std::unexpected(std::move(err));
+    if (!got) throw std::runtime_error("namespaceUsage(): undecodable NamespaceUsageResponse");
+    if (got->code != 0) {
+        err.errorCode = static_cast<uint16_t>(got->code);
+        return std::unexpected(std::move(err));
+    }
+    return *got;
 }
 
 std::vector<std::pair<std::string, int32_t>> Client::listTopics(std::chrono::nanoseconds timeout) {
@@ -3379,10 +3474,11 @@ void Client::enterFailed_() {
         const int16_t rc = sm.rejectCode();
         using Ec = rune::protocol::client::ErrorCode;
         if (rc == static_cast<int16_t>(Ec::AuthenticationFailed) || rc == static_cast<int16_t>(Ec::SessionRevoked) ||
-            rc == static_cast<int16_t>(Ec::Internal)) {
+            rc == static_cast<int16_t>(Ec::NamespaceSuspended) || rc == static_cast<int16_t>(Ec::Internal)) {
             std::string why = sm.rejectDetail();
             if (why.empty()) why = rc == static_cast<int16_t>(Ec::AuthenticationFailed) ? "authentication failed"
                                   : rc == static_cast<int16_t>(Ec::SessionRevoked)      ? "the session was revoked"
+                                  : rc == static_cast<int16_t>(Ec::NamespaceSuspended)  ? "the namespace was suspended"
                                                                                          : "login failed locally";
             completeConnect_(OpStatus::BrokerError, 0, static_cast<uint16_t>(rc), why,
                              static_cast<int64_t>(sm.authRetryAfterMs()));
@@ -3395,9 +3491,11 @@ void Client::enterFailed_() {
     // from the ring and completed) and complete every accepted, unacknowledged
     // record Closed — exactly once (ProducerImpl's Discarding life).
     // Authentication (D26): a REVOKED session completes the records it accepted but never sent SessionRevoked
-    // (BrokerError 46), like the ones already in flight — not Closed.
-    if (agent_.seedMachine().rejectCode() == static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionRevoked))
-        producerHub_.failCloseAll(OpStatus::BrokerError, static_cast<uint16_t>(rune::protocol::client::ErrorCode::SessionRevoked));
+    // (BrokerError 46), like the ones already in flight — not Closed.  A RejectAll suspend's end (51) likewise.
+    if (const int16_t rc = agent_.seedMachine().rejectCode();
+        rc == static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionRevoked) ||
+        rc == static_cast<int16_t>(rune::protocol::client::ErrorCode::NamespaceSuspended))
+        producerHub_.failCloseAll(OpStatus::BrokerError, static_cast<uint16_t>(rc));
     else
         producerHub_.failCloseAll(OpStatus::Closed);
     // Pending control ops can never be answered now.
@@ -3685,12 +3783,16 @@ bool Client::onAuthErrorResponse_(const codec::ErrorResponseView& e) {
     const auto snap = agent_.stateAndSessionId();
 
     if (e.correlationId == 0) {
-        if (ec != rpc::ErrorCode::SessionRevoked) return false;   // a session-level 44 concerns the login (below)
+        // a session-level 44 concerns the login (below); 51 = a RejectAll suspend ended the session (client v14)
+        if (ec != rpc::ErrorCode::SessionRevoked && ec != rpc::ErrorCode::NamespaceSuspended) return false;
         // D26: the session-level notice.  Only the SEED's own session ends the Client's work; the agent already
         // put that session's machine in Rejected (a notice naming a session this client left was dropped by the
         // agent's F-A C1 guard and arrives here with the id of no session we hold).
         if (e.sessionId != 0 && e.sessionId != snap.sessionId) return true;
-        onSeedRevoked_(msg);
+        // Only a notice the machine honoured (it is Rejected now: Connected / Authenticating / Resuming / Backoff naming
+        // our session) ends the Client's work; one it ignored (no established session, e.g. Connecting) moves nothing.
+        if (agent_.seedMachine().state() != session::SessionState::Rejected) return true;
+        onSeedRevoked_(msg, code);
         return true;
     }
 
@@ -3724,13 +3826,12 @@ bool Client::onAuthErrorResponse_(const codec::ErrorResponseView& e) {
     return false;   // control ops / DDL / connect: the generic tail completes them with the code
 }
 
-void Client::onSeedRevoked_(std::string_view text) {
-    constexpr uint16_t kRevoked = static_cast<uint16_t>(rune::protocol::client::ErrorCode::SessionRevoked);
+void Client::onSeedRevoked_(std::string_view text, uint16_t code) {   // 46, or 51 (a RejectAll suspend)
     // Every in-flight request: a pending connect, every control op, every unanswered produce batch.
-    failAllControlWithCode_(kRevoked, text);
-    producerHub_.onSessionRevoked(kRevoked);   // in-flight batches + Phase 2b F: a transactional producer goes FatalError
+    failAllControlWithCode_(code, text);
+    producerHub_.onSessionRevoked(code);   // in-flight batches + Phase 2b F: a transactional producer goes FatalError
     // Every subscription and group consumer of the session.
-    (void)subscriberHub_.endAllLive(SubscriptionFailReason::SessionRevoked, kRevoked);
+    (void)subscriberHub_.endAllLive(SubscriptionFailReason::SessionRevoked, code);
     (void)groupConsumerHub_.revokeAll();
     // The seed machine is Rejected(SessionRevoked): the duty cycle's failure tail (enterFailed_) closes the rest
     // — nothing reconnects (D26).
@@ -3904,9 +4005,11 @@ void Client::onEgressFrame(codec::TemplateId tid,
         }
 
         // Authentication (Task 7): codes 44..47 — a refused / revoked subscription or group fetch, a rejected
-        // produce batch, a revoked session.  Never routed (Redirect / NotLeader) and never retried.
+        // produce batch, a revoked session.  Never routed (Redirect / NotLeader) and never retried.  Namespaces
+        // Phase 2: NamespaceSuspended (51) the same way (a RejectAll suspend ends the session at corr 0).
         if (ec == rpc::ErrorCode::AuthenticationFailed || ec == rpc::ErrorCode::NotAuthorized ||
-            ec == rpc::ErrorCode::SessionRevoked || ec == rpc::ErrorCode::PasswordChangeRequired) {
+            ec == rpc::ErrorCode::SessionRevoked || ec == rpc::ErrorCode::PasswordChangeRequired ||
+            ec == rpc::ErrorCode::NamespaceSuspended) {
             if (onAuthErrorResponse_(*opt)) break;
         }
 
@@ -4736,6 +4839,18 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if (len < rune::protocol::client::MessageHeader::ENCODED_SIZE) break;
         const auto corr = static_cast<int64_t>(rune::protocol::client::detail::getLE64(buf, 16));
         if (const std::size_t i = findCtl_(corr); i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::ListNamespaces) {
+            PendingCtl p = takeCtl_(i);
+            completeCtl_(p, OpStatus::Ok, 0, 0, 0, std::span<const uint8_t>(buf, len),
+                         detail::CompletionRing::Overflow::TooLarge);
+        }
+        break;
+    }
+
+    // ---- Phase 2 Task 16: NamespaceUsageResponse (85) — the raw frame is the payload (the caller decodes).
+    case codec::TemplateId::NamespaceUsageResponse: {
+        if (len < rune::protocol::client::MessageHeader::ENCODED_SIZE) break;
+        const auto corr = static_cast<int64_t>(rune::protocol::client::detail::getLE64(buf, 16));
+        if (const std::size_t i = findCtl_(corr); i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::NamespaceUsage) {
             PendingCtl p = takeCtl_(i);
             completeCtl_(p, OpStatus::Ok, 0, 0, 0, std::span<const uint8_t>(buf, len),
                          detail::CompletionRing::Overflow::TooLarge);

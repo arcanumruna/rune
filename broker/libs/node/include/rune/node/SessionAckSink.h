@@ -675,12 +675,15 @@ public:
         if (n != 0) std::memcpy(t.bits.data() + first, words, n * 8);   // little-endian hosts only
         return true;
     }
-    /// Session `sessionId` now uses table `tableId` (< 0: deny everything).  False = unknown session / bad id.
+    /// Session `sessionId` now uses table `tableId` (-2: suspended ReadOnly, other < 0: deny everything).  False =
+    /// unknown session / bad id.
     bool bindWriteGrants(int64_t sessionId, int64_t tableId, uint64_t epoch, uint64_t owner) noexcept {
         const std::size_t idx = find_(sessionId);
         if (idx == kNone || tableId >= static_cast<int64_t>(kMaxWritePermTables)) return false;
         WriteGrantSlot& g = grants_[idx];
-        g.table    = tableId < 0 ? denyWriteTable() : &permTables_[static_cast<std::size_t>(tableId)];
+        g.table    = tableId == -2 ? suspendedWriteTable()
+                   : tableId < 0   ? denyWriteTable()
+                                   : &permTables_[static_cast<std::size_t>(tableId)];
         g.epoch    = epoch;
         g.ownerTag = rune::protocol::pidOwnerTag(owner);
         return true;
@@ -1070,6 +1073,11 @@ private:
         r.partition      = a.partition;
         r.baseOffset     = a.baseOffset;
         r.logStartOffset = a.logStartOffset;
+        // Task 14 (D28): a Throttled retry-after only to a v14+ client (encodeFor answers it InvalidRequest), as the
+        // gateway path does.
+        if (a.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::Throttled) &&
+            clientVersion < rune::protocol::client::kClientVersionNamespaces)
+            r.logStartOffset = -1;
         // D6: UnknownProducerId only to clients that understand it (else OOS —
         // the pre-D6 answer), and (review M4) the pre-D6 38 B frame to them.
         r.encodeFor(dst, clientVersion);

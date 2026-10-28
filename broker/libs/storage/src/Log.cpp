@@ -412,6 +412,16 @@ void Log::publishSnapshotView_() {
     snapBack_ = static_cast<uint8_t>(prev & kSnapIndex);
 }
 
+void Log::recomputeSealedBytes_() noexcept {
+    // Namespaces Phase 2 Task 11 (D25): the sealed segments' bytes (everything but the last = active segment), re-summed
+    // on every segments_ change - roll, compaction swap, retention delete, truncate, reload, recover: cold, never per
+    // append.  bytesOnDisk() adds the active segment's live size.
+    int64_t sealed = 0;
+    if (!segments_.empty())
+        for (auto it = segments_.begin(); std::next(it) != segments_.end(); ++it) sealed += it->second->sizeBytes();
+    sealedBytes_ = sealed;
+}
+
 void Log::snapshotAppendSealed_(SegMap::iterator sealed) {
     // The published entries must mirror every sealed segment but the new one
     // (a log driven before its first publish — never recovered — or any other
@@ -422,6 +432,7 @@ void Log::snapshotAppendSealed_(SegMap::iterator sealed) {
         publishSealedSnapshotFrom_(sealed->first);
         return;
     }
+    recomputeSealedBytes_();   // Task 11: the roll fast path does not rebuild the snapshot
     LogSegment& seg = *sealed->second;
     const int64_t ts = sealedEntryTs(seg, newlySealedMaxTs_);
     snapPushBack_(SegInfo{sealed->first, seg.sizeBytes(), ts, std::next(sealed)->first, seg.tsLineage()});
@@ -437,6 +448,7 @@ void Log::snapshotDropFront_(std::size_t k) {
     if (snapDir_ && k <= live && live - k == sealedNow &&
         (sealedNow == 0 || snapAt_(snapBegin_ + k).baseOffset == segments_.begin()->first)) [[likely]] {
         snapBegin_ += k;
+        recomputeSealedBytes_();   // Task 11: the retention prefix drop does not rebuild the snapshot
         publishSnapshotView_();
         return;
     }
@@ -530,6 +542,7 @@ void Log::publishSealedSnapshotFrom_(int64_t fromBase) {
         ++i;
     }
     if (!diverged && i < snapEnd_) divergeAt(i);   // trailing entries removed (truncation)
+    recomputeSealedBytes_();   // Task 11 (D25): every segments_ change that rebuilds the snapshot re-sums the sealed bytes
     // CP-5.1: the recovery scan is consumed by the first publish after recover().
     recoveryMaxTimestamps_.clear();
     ++snapRebuilds_;

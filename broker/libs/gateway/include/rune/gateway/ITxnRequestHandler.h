@@ -12,6 +12,8 @@
 // Namespace: rune::gateway
 // C++23.
 
+#include <rune/coordination/NsScopedId.h>
+
 #include <cstddef>
 #include <climits>
 #include <cstdint>
@@ -24,6 +26,10 @@ inline constexpr std::size_t kTxnMinOutCap = 64;
 struct ITxnRequestHandler {
     virtual ~ITxnRequestHandler() = default;
 
+    // Namespaces Phase 2 Task 5 (D19): `ctx` is the request's namespace context; the transactional id (and the group
+    // id of AddOffsets / TxnOffsetCommit) is turned into its scoped id right after decode; an id with the reserved
+    // prefix is answered InvalidRequest; an empty transactional id stays empty.  Responses echo the client's ids.
+    //
     // Each method decodes the request from buf[0..len-1], acts, encodes the
     // response into out[0..outCap-1], and returns the number of bytes written.
     //
@@ -49,27 +55,32 @@ struct ITxnRequestHandler {
     // InitProducerId (templateId 45) — allocate or refresh a producer identity.
     virtual size_t handleInitProducerId (const uint8_t* buf, size_t len,
                                          int64_t nowNs,
-                                         uint8_t* out, size_t outCap) = 0;
+                                         uint8_t* out, size_t outCap,
+                                         const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     // AddPartitionsToTxn (templateId 47) — record partitions in the transaction.
     virtual size_t handleAddPartitions  (const uint8_t* buf, size_t len,
                                          int64_t nowNs,
-                                         uint8_t* out, size_t outCap) = 0;
+                                         uint8_t* out, size_t outCap,
+                                         const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     // AddOffsetsToTxn (templateId 49) — bind consumer-group offsets to the txn.
     virtual size_t handleAddOffsets     (const uint8_t* buf, size_t len,
                                          int64_t nowNs,
-                                         uint8_t* out, size_t outCap) = 0;
+                                         uint8_t* out, size_t outCap,
+                                         const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     // TxnOffsetCommit (templateId 51) — commit consumer offsets within the txn.
     virtual size_t handleTxnOffsetCommit(const uint8_t* buf, size_t len,
                                          int64_t nowNs,
-                                         uint8_t* out, size_t outCap) = 0;
+                                         uint8_t* out, size_t outCap,
+                                         const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     // EndTxn (templateId 53) — begin commit or abort of the transaction.
     virtual size_t handleEndTxn         (const uint8_t* buf, size_t len,
                                          int64_t nowNs,
-                                         uint8_t* out, size_t outCap) = 0;
+                                         uint8_t* out, size_t outCap,
+                                         const rune::coordination::NsRequestContext& ctx = {}) = 0;
 
     // A COMMIT/ABORT control marker this node could not append (NotLeader,
     // MinIsrViolation, ...).  Never silently dropped and never "landed": the
@@ -90,6 +101,17 @@ struct ITxnRequestHandler {
     // partition's marker landed.  Cold path; default no-op for test doubles.
     virtual void onControlMarkerLanded(int32_t /*topicId*/, int32_t /*partition*/,
                                        int64_t /*producerId*/, int32_t /*coordinatorEpoch*/) {}
+
+    // Namespaces Phase 2 Task 4: abort (through the coordinator's internal abort: PrepareAbort, then ABORT markers) every
+    // Ongoing transaction that session `sessionId` opened, resp. every Ongoing transaction of namespace `nsId`.  Called
+    // by the gateway on every session revoke and on a namespace suspend / delete.  Returns the count aborted; 0 when this
+    // node is not the loaded coordinator.  Control thread, cold.  Default (test doubles): nothing to abort.
+    virtual uint32_t abortAllForSession(int64_t /*sessionId*/, int64_t /*nowNs*/) { return 0; }
+    virtual uint32_t abortAllForNamespace(uint32_t /*nsId*/, int64_t /*nowNs*/) { return 0; }
+
+    // Namespaces Phase 2 Task 10 (D24): a namespace's open-transaction and transaction-time limits (0 = unlimited), fed by
+    // the gateway on every namespace record upsert (and cleared on the erase).  Control thread, cold.  Default: ignored.
+    virtual void setNamespaceTxnLimits(uint32_t /*nsId*/, uint64_t /*maxOpenTxns*/, uint64_t /*maxTxnTimeMs*/) {}
 
     // F15-FU1 (#112, KIP-890 part 1): may a transactional data batch of (producerId,
     // producerEpoch) open a transaction on (topicId, partition)?  Asked by a partition

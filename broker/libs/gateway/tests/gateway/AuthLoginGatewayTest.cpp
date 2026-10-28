@@ -11,6 +11,7 @@
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/MetadataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/client/SecurityMessages.h>
@@ -2328,6 +2329,160 @@ TEST(AuthLoginRegression, AClientFirstWithACommaInTheNonceIsAnsweredMalformedReg
     EXPECT_FALSE(rig.gw.hasSessionForTest(sid));
     EXPECT_EQ(rig.gw.loginsFailed(), before + 1);
     EXPECT_TRUE(rig.logContains("reason=malformed"));
+}
+
+// ===========================================================================
+// Namespaces Phase 2 Task 10 (D24, #236): per-node connection counts and the anonymous caps, at the gateway with the
+// injected clock (no Aeron, no sleeps).
+//
+// Interaction matrix:
+//   | limit / cap                 | operation                | state                    | expected                                  | test
+//   |-----------------------------|--------------------------|--------------------------|-------------------------------------------|-----
+//   | max-connections 2           | login after the proof    | 0, 1, 2 live sessions    | ok, ok, refused (44 below v14)            | AdmissionAtLimitAndReleaseRegression
+//   | max-connections-per-user 1  | login of the same user   | one live, another user   | same user refused, other user ok          | PerUserAndSessionsPerUserRegression
+//   | max-sessions-per-user 1     | login of the same user   | one live                 | refused                                   | PerUserAndSessionsPerUserRegression
+//   | the count                   | Disconnect / reap        | each close path          | back to 0                                 | AdmissionAtLimitAndReleaseRegression
+//   | anonymous cap 3             | 4th anonymous session    | first request            | refused 52, the first three served        | AnonymousCapRegression
+//   | anonymous ops 4/s           | 5th op in the burst      | clock advanced           | Throttled(retryAfter), then served again  | AnonymousOpsBucketRegression
+// ===========================================================================
+namespace {
+
+void setDefaultNsLimits(Rig& rig, const std::function<void(rune::protocol::NamespaceLimits&)>& f) {
+    rune::catalog::NamespaceRecord rec;
+    rec.nsId = 0; rec.name = "default"; rec.version = 1;
+    f(rec.limits);
+    rig.gw.onNamespaceUpserted(rec);
+}
+
+std::vector<uint8_t> metadataFrame(int64_t sid, int64_t corr) {
+    pc::MetadataRequest m;
+    m.sessionId = sid; m.correlationId = corr;
+    std::vector<uint8_t> b(m.encodedSize() + 16); b.resize(m.encode(b.data())); return b;
+}
+
+/// The error code of the ErrorResponse answering `corr`, -1 when it was answered by something else (served).
+int errorCodeFor(const Rig& rig, int64_t sid, int64_t corr, uint64_t* retryAfter = nullptr) {
+    for (auto it = rig.seen.rbegin(); it != rig.seen.rend(); ++it) {
+        if (it->sid != sid || it->corr != corr) continue;
+        if (it->tid != static_cast<uint16_t>(pc::TemplateId::ErrorResponse)) return -1;
+        const auto e = pc::ErrorResponse::decode(it->bytes.data(), it->bytes.size());
+        if (!e) return -2;
+        if (retryAfter) *retryAfter = e->retryAfterNs;
+        return e->code;
+    }
+    return -3;
+}
+
+}  // namespace
+
+TEST(NsConnectionLimitRegression, AdmissionAtLimitAndReleaseRegression) {
+    Rig rig;
+    setDefaultNsLimits(rig, [](auto& l) { l.maxConnections = 2; });
+    const auto a = rig.login("ws1", {kTestPasswordA, ""});
+    const auto b = rig.login("ws2", {kTestPasswordA, ""});
+    ASSERT_TRUE(a.fin && b.fin);
+    EXPECT_EQ(a.fin->errorCode, 0) << "below";
+    EXPECT_EQ(b.fin->errorCode, 0) << "at: usage == limit";
+    EXPECT_EQ(rig.gw.nsConnectionsForTest(0), 2u);
+    const auto c = rig.login("ws1", {kTestPasswordA, ""});
+    ASSERT_TRUE(c.fin.has_value());
+    EXPECT_EQ(c.fin->errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed)) << "above (a v9 session sees 44)";
+    EXPECT_EQ(rig.gw.nsConnectionsForTest(0), 2u) << "a refused login is never counted";
+    // The count is given back on every close path.
+    rig.gw.closeSessionForTest(a.sid);                        // a client Disconnect / revoke / suspend all end here
+    EXPECT_EQ(rig.gw.nsConnectionsForTest(0), 1u);
+    const auto d = rig.login("ws1", {kTestPasswordA, ""});
+    EXPECT_EQ(d.fin->errorCode, 0) << "room is back";
+    EXPECT_EQ(rig.gw.nsConnectionsForTest(0), 2u);
+    rig.gw.reapExpiredForTest(1'000'000'000'000LL);           // the idle timeout reaps every session
+    EXPECT_EQ(rig.gw.nsConnectionsForTest(0), 0u) << "reaped sessions are given back";
+    // Lowered below usage: live sessions stay, a new login is refused until usage is under the limit.
+    const auto e = rig.login("ws1", {kTestPasswordA, ""});
+    const auto f = rig.login("ws2", {kTestPasswordA, ""});
+    ASSERT_EQ(e.fin->errorCode, 0);
+    ASSERT_EQ(f.fin->errorCode, 0);
+    setDefaultNsLimits(rig, [](auto& l) { l.maxConnections = 1; });
+    EXPECT_EQ(rig.gw.nsConnectionsForTest(0), 2u) << "lowering never closes a session";
+    EXPECT_NE(rig.login("ws1", {kTestPasswordA, ""}).fin->errorCode, 0);
+}
+
+TEST(NsConnectionLimitRegression, PerUserAndSessionsPerUserRegression) {
+    for (const bool sessions : {false, true}) {
+        Rig rig;
+        setDefaultNsLimits(rig, [&](auto& l) { (sessions ? l.maxSessionsPerUser : l.maxConnectionsPerUser) = 1; });
+        const auto a = rig.login("ws1", {kTestPasswordA, ""});
+        EXPECT_EQ(a.fin->errorCode, 0) << "at";
+        EXPECT_NE(rig.login("ws1", {kTestPasswordA, ""}).fin->errorCode, 0) << "above: the same user twice";
+        EXPECT_EQ(rig.login("ws2", {kTestPasswordA, ""}).fin->errorCode, 0) << "another user is unaffected";
+        EXPECT_EQ(rig.gw.nsConnectionsForTest(0), 2u);
+        rig.gw.closeSessionForTest(a.sid);
+        EXPECT_EQ(rig.login("ws1", {kTestPasswordA, ""}).fin->errorCode, 0) << "released";
+    }
+}
+
+TEST(NsConnectionLimitRegression, AnonymousCapRegression) {
+    Rig rig;
+    rig.gw.setAnonymousRead(true);
+    rig.gw.setAnonymousCaps(/*maxConnections=*/3, /*opsPerSec=*/1000);
+    std::vector<int64_t> sids;
+    for (int i = 0; i < 4; ++i) {
+        const int64_t sid = rig.gw.injectTestSession(0, pc::kClientVersionNamespaces);
+        rig.gw.setSessionAuthForTest(sid, AuthAwaitingFirst{1'000'000'000, 50});
+        sids.push_back(sid);
+    }
+    for (int i = 0; i < 3; ++i) {
+        const int64_t corr = ++rig.corr;
+        rig.send(metadataFrame(sids[static_cast<std::size_t>(i)], corr));
+        EXPECT_EQ(errorCodeFor(rig, sids[static_cast<std::size_t>(i)], corr), -1) << "anonymous session " << i << " is served";
+    }
+    EXPECT_EQ(rig.gw.anonymousSessionsForTest(), 3u);
+    const int64_t corr4 = ++rig.corr;
+    rig.send(metadataFrame(sids[3], corr4));
+    EXPECT_EQ(errorCodeFor(rig, sids[3], corr4), static_cast<int>(pc::ErrorCode::NamespaceLimitExceeded)) << "the 4th is refused";
+    EXPECT_EQ(rig.gw.anonymousSessionsForTest(), 3u);
+    EXPECT_NE(std::get_if<AuthAnonymousRead>(rig.gw.sessionAuthForTest(sids[0])), nullptr);
+    EXPECT_EQ(std::get_if<AuthAnonymousRead>(rig.gw.sessionAuthForTest(sids[3])), nullptr) << "it did not become an anonymous reader";
+    rig.gw.closeSessionForTest(sids[0]);
+    EXPECT_EQ(rig.gw.anonymousSessionsForTest(), 2u) << "released";
+    const int64_t corr5 = ++rig.corr;
+    rig.send(metadataFrame(sids[3], corr5));
+    EXPECT_EQ(errorCodeFor(rig, sids[3], corr5), -1) << "served once there is room";
+    EXPECT_EQ(rig.gw.anonymousSessionsForTest(), 3u);
+}
+
+TEST(NsConnectionLimitRegression, AnonymousOpsBucketRegression) {
+    Rig rig;
+    rig.gw.setAnonymousRead(true);
+    rig.gw.setAnonymousCaps(16, /*opsPerSec=*/4);   // T = 250 ms, burst = 4 ops
+    const int64_t sid = rig.gw.injectTestSession(0, pc::kClientVersionNamespaces);
+    rig.gw.setSessionAuthForTest(sid, AuthAwaitingFirst{1'000'000'000'000LL, 50});
+    constexpr int64_t kT = 250'000'000;
+    rig.gw.setNowNsForTest(0);
+    for (int i = 0; i < 4; ++i) {
+        const int64_t corr = ++rig.corr;
+        rig.send(metadataFrame(sid, corr));
+        EXPECT_EQ(errorCodeFor(rig, sid, corr), -1) << "burst op " << i;
+    }
+    uint64_t retry = 0;
+    const int64_t over = ++rig.corr;
+    rig.send(metadataFrame(sid, over));
+    EXPECT_EQ(errorCodeFor(rig, sid, over, &retry), static_cast<int>(pc::ErrorCode::Throttled)) << "the 5th op in the same instant";
+    EXPECT_EQ(retry, static_cast<uint64_t>(kT)) << "retry after exactly one interval";
+    rig.gw.setNowNsForTest(kT);   // the injected clock advances one interval: one token
+    const int64_t again = ++rig.corr;
+    rig.send(metadataFrame(sid, again));
+    EXPECT_EQ(errorCodeFor(rig, sid, again), -1) << "served after the retry-after";
+    const int64_t immediately = ++rig.corr;
+    rig.send(metadataFrame(sid, immediately));
+    EXPECT_EQ(errorCodeFor(rig, sid, immediately), static_cast<int>(pc::ErrorCode::Throttled)) << "and only one token was earned";
+    rig.gw.setNowNsForTest(10 * kT);   // a long idle refills the whole burst, no more
+    int served = 0;
+    for (int i = 0; i < 6; ++i) {
+        const int64_t corr = ++rig.corr;
+        rig.send(metadataFrame(sid, corr));
+        if (errorCodeFor(rig, sid, corr) == -1) ++served;
+    }
+    EXPECT_EQ(served, 4) << "the burst is capped at one second of ops";
 }
 
 // ── Issue #665: version skew at the unauthenticated-session cap ────────────────────────────────────────────────────────

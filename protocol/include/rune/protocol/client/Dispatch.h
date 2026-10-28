@@ -108,9 +108,10 @@ struct FrameCheck {
         tid <= static_cast<uint16_t>(TemplateId::EndTxnResponse)) {
         return true;
     }
-    // 0b/0c schema + view-engine range + catalog-history DDL + security DDL + namespaces: 64..83
+    // 0b/0c schema + view-engine range + catalog-history DDL + security DDL + namespaces: 64..85 (...NamespaceDdl=81, ListNamespaces=82,
+    // ListNamespacesResponse=83, NamespaceUsage=84, NamespaceUsageResponse=85; 86-95 gap -> UnknownTemplate)
     if (tid >= static_cast<uint16_t>(TemplateId::DefineTopic) &&
-        tid <= static_cast<uint16_t>(TemplateId::ListNamespacesResponse)) {
+        tid <= static_cast<uint16_t>(TemplateId::NamespaceUsageResponse)) {
         return true;
     }
     return false;

@@ -25,6 +25,9 @@ constexpr int16_t kUnknownMember          = static_cast<int16_t>(rpc::ErrorCode:
 constexpr int16_t kAuthenticationFailed   = static_cast<int16_t>(rpc::ErrorCode::AuthenticationFailed);  // 44..47
 constexpr int16_t kPasswordChangeRequired = static_cast<int16_t>(rpc::ErrorCode::PasswordChangeRequired);
 constexpr int16_t kAuthUnavailable        = static_cast<int16_t>(rpc::ErrorCode::AuthUnavailable);         // 48
+constexpr int16_t kNamespaceSuspended     = static_cast<int16_t>(rpc::ErrorCode::NamespaceSuspended);      // 51
+constexpr int16_t kNamespaceLimitExceeded = static_cast<int16_t>(rpc::ErrorCode::NamespaceLimitExceeded);  // 52
+constexpr int16_t kThrottled              = static_cast<int16_t>(rpc::ErrorCode::Throttled);               // 53
 }  // namespace
 
 Verdict CoordinatorLink::classify(ReqKind kind, int16_t ec) noexcept {
@@ -42,7 +45,12 @@ Verdict CoordinatorLink::classify(ReqKind kind, int16_t ec) noexcept {
     if (ec == kNotLeader && (kind == ReqKind::AddPartitions || kind == ReqKind::TxnOffsetCommit)) return Verdict::Retry;
     // Authentication (44..47): a login or a grant is an admin's act - never retried.  InitProducerId and
     // EndTxn cannot go on without it (fatal); the other legs fail only the transaction (abortable).
-    if (ec >= kAuthenticationFailed && ec <= kPasswordChangeRequired) {
+    // Namespaces Phase 2: Throttled (53) is a rate limit - retried with backoff until the request's deadline.
+    if (ec == kThrottled) return Verdict::Retry;
+    // NamespaceSuspended (51) / NamespaceLimitExceeded (52) are an admin's act like 44..47 (a suspend, a limit): a re-send
+    // gets the same answer.  Same split: InitProducerId / EndTxn fatal, the data legs abortable.
+    if ((ec >= kAuthenticationFailed && ec <= kPasswordChangeRequired) || ec == kNamespaceSuspended ||
+        ec == kNamespaceLimitExceeded) {
         return (kind == ReqKind::InitProducerId || kind == ReqKind::EndTxn) ? Verdict::Fatal : Verdict::Abortable;
     }
     // #125 (KIP-447): the TxnOffsetCommit's member block was fenced (the group rebalanced / the member is gone):

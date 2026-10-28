@@ -662,6 +662,34 @@ TEST(CoordinatorLinkRegression, ARefusedRediscoveryIsAskedAgainOnTheNextPumpRegr
     ASSERT_EQ(pumpNoExpiry(link, 3 + CoordinatorLink::backoffNs(1)), 2) << "both re-send after the move (and backoff)";
 }
 
+// Namespaces Phase 2 (Task 17 matrix, Timing/TxnOpen_SuspendRO): NamespaceSuspended (51) and NamespaceLimitExceeded (52)
+// are an admin's act, like 44..47: re-sending cannot change the answer.  InitProducerId / EndTxn cannot go on (Fatal),
+// the data legs fail only the transaction (Abortable).  Throttled (53) is the one retriable namespace code.  RED before:
+// EndTxn 51 fell into "retried until 0 / 19 / 17 / 18" and the commit hung until its deadline (154 re-sends in 15 s).
+TEST(CoordinatorLinkRegression, NamespaceRefusalsAreNeverRetriedRegression) {
+    constexpr int16_t k51 = static_cast<int16_t>(rpc::ErrorCode::NamespaceSuspended);
+    constexpr int16_t k52 = static_cast<int16_t>(rpc::ErrorCode::NamespaceLimitExceeded);
+    constexpr int16_t k53 = static_cast<int16_t>(rpc::ErrorCode::Throttled);
+    for (const int16_t ec : {k51, k52}) {
+        EXPECT_EQ(CoordinatorLink::classify(ReqKind::InitProducerId, ec), Verdict::Fatal) << ec;
+        EXPECT_EQ(CoordinatorLink::classify(ReqKind::EndTxn, ec), Verdict::Fatal) << ec;
+        for (ReqKind k : {ReqKind::AddPartitions, ReqKind::AddOffsets, ReqKind::TxnOffsetCommit})
+            EXPECT_EQ(CoordinatorLink::classify(k, ec), Verdict::Abortable) << ec << " kind " << static_cast<int>(k);
+    }
+    for (ReqKind k : {ReqKind::InitProducerId, ReqKind::EndTxn, ReqKind::AddPartitions, ReqKind::AddOffsets,
+                      ReqKind::TxnOffsetCommit})
+        EXPECT_EQ(CoordinatorLink::classify(k, k53), Verdict::Retry) << "Throttled, kind " << static_cast<int>(k);
+    // Link level: an EndTxn answered 51 is handed back at once (one offer), never parked in a backoff.
+    FakeCoordinator fake;
+    CoordinatorLink link(0, fake.sink());
+    CoordinatorLink::Slot* s = send(link, ReqKind::EndTxn);
+    ASSERT_NE(s, nullptr);
+    ASSERT_EQ(pumpNoExpiry(link, 1), 1);
+    const auto f = FakeCoordinator::answer(ReqKind::EndTxn, s->corrId, k51);
+    EXPECT_EQ(link.onAnswer(asAnswer(f, ReqKind::EndTxn, s->corrId, k51), 2), s) << "handed to the producer";
+    EXPECT_EQ(s->offers, 1u);
+}
+
 // #340: the txn copies of the group fetch tags are asserted against GroupConsumerHub's constants where both headers
 // are visible, and the tag spaces are disjoint as BIT SETS and as classifiers, not merely `!=`.
 TEST(CoordinatorLinkRegression, CoordinatorCorrTagsNeverCollideWithGroupTagsRegression) {

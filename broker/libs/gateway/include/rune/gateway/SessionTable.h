@@ -1,5 +1,6 @@
 #pragma once
 
+#include <rune/catalog/CatalogEvent.h>   // NsStateTag (Session::nsGate)
 #include <cstdio>
 #include <cstdlib>
 // SessionTable.h — Per-session egress tracking for the ClientGateway (BR-4).
@@ -98,6 +99,22 @@ struct Session {
     // never silently start allow-all.  AuthAnonymous is allow-all only on a dev / in-process broker (permsOf_ denies it
     // on an authenticating one).
     SessionAuth                                    auth;
+    // Namespaces Phase 2 Task 3 (D21): the lifecycle gate of this session's namespace (Active = serve everything).  Set
+    // at login from the NamespaceMirror and re-set on every record upsert; the per-request check is one byte compare.
+    rune::catalog::NsStateTag                      nsGate = rune::catalog::NsStateTag::Active;
+    // Namespaces Phase 2 Task 8 (D22): the session's namespace (nsId, node-local nsSlot), cached at login so the hot path
+    // indexes an array: matches() against the gateway's slot table is one compare.  (0, 0) = `default` (also every
+    // dev / anonymous session).
+    uint32_t                                       nsId   = 0;
+    uint16_t                                       nsSlot = 0;
+    // Namespaces Phase 2 Task 10 (D24): this session is counted in its namespace's per-node connection counts (set once
+    // the SCRAM proof verified and the namespace gate passed; undone by the ONE release helper every close path runs).
+    // (connSlot, connNsId) is the slot the count was taken in: a slot reassigned since is never decremented.
+    bool                                           connCounted = false;
+    uint16_t                                       connSlot    = 0xFFFF;
+    uint32_t                                       connNsId    = 0;
+    uint64_t                                       connUserId  = 0;
+    bool                                           anonCounted = false;   // counted against RUNE_ANONYMOUS_MAX_CONNECTIONS
     // D14: the host the session's Connect came from (the Aeron image's sourceIdentity host; the egress host for IPC) -
     // the throttle's key.  "" in unit tests.
     std::string                                    sourceHost;

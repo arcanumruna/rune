@@ -1485,6 +1485,8 @@ public:
     /// LOST producer state it should have kept (not retention).  The batch was
     /// still provably not appended and is re-sequenced (rule U); never a failure.
     [[nodiscard]] uint64_t unknownProducerIdStateLoss() const noexcept { return unknownPidStateLoss_; }
+    /// Task 14 (D28): batches re-sent after a Throttled (53) answer's retry-after.
+    [[nodiscard]] uint64_t throttledBackoffs() const noexcept { return throttledBackoffs_; }
 
     // ---- Task 14 fix3 test seams (owner thread; never used in production) ----
     /// Parses the whole deferred arena and cross-checks it against the live
@@ -2138,6 +2140,7 @@ private:
     // ---- sendBlocking() support (app thread only) -----------------------------
     static int64_t steadyNowNs_() noexcept;
     ClockFn clock_   = &steadyNowNs_;   // overridable by setClockForTesting()
+    uint64_t throttledBackoffs_ = 0;    // Task 14: Throttled (53) answers backed off
     uint64_t unknownPidStateLoss_ = 0;  // D6 review M1: rule U2 occurrences (diagnostic)
     PumpFn  pumpFn_  = nullptr;         // wired by Client::producer(), both modes (fix1 C1)
     void*   pumpCtx_ = nullptr;

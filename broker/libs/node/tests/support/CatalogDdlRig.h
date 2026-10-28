@@ -238,12 +238,12 @@ public:
         return it->second;
     }
     Answer alterAdd(const std::string& topic, const std::string& field,
-                    rune::protocol::RequestId rid = {}, uint16_t expectedVersion = 0) {
+                    rune::protocol::RequestId rid = {}, uint16_t expectedVersion = 0, uint32_t nsId = 0) {
         rune::codec::AlterOp op{};
         op.type = rune::codec::AlterOpType::Add;
         op.name = field;
         op.primType = rune::codec::PrimType::Int64;
-        return alter(topic, {op}, rid, expectedVersion);
+        return alter(topic, {op}, rid, expectedVersion, nsId);
     }
     Answer alterSetCompat(const std::string& topic, rune::codec::CompatMode mode) {
         rune::codec::AlterOp op{};
@@ -252,26 +252,29 @@ public:
         return alter(topic, {op});
     }
     Answer alter(const std::string& topic, const std::vector<rune::codec::AlterOp>& ops,
-                 rune::protocol::RequestId rid = {}, uint16_t expectedVersion = 0) {
+                 rune::protocol::RequestId rid = {}, uint16_t expectedVersion = 0, uint32_t nsId = 0) {
         AlterTopicMsg m;
+        m.nsId = nsId;
         m.session = kSession; m.corr = ++corr_; m.topicName = topic; m.expectedVersion = expectedVersion;
         m.opsBlob = rune::codec::encodeAlterOps(ops);
         m.meta = meta_("", "rig", rid, false);
         return await_(submit_(DdlRequest{std::move(m)}));
     }
     Answer alterConfig(const std::string& topic, std::vector<rune::catalog::ConfigChange> changes,
-                       uint32_t expectedVersion = 0) {
+                       uint32_t expectedVersion = 0, uint32_t nsId = 0) {
         AlterTopicConfigMsg m;
+        m.nsId = nsId;
         m.session = kSession; m.corr = ++corr_; m.name = topic; m.expectedVersion = expectedVersion;
         m.changes = std::move(changes);
         m.meta = meta_("", "rig", {}, false);
         return await_(submit_(DdlRequest{std::move(m)}));
     }
     Answer createView(const std::string& view, const std::string& source, bool extraColumn = false,
-                      uint8_t persistence = 0) {
+                      uint8_t persistence = 0, uint32_t nsId = 0) {
         CreateViewMsg m;
+        m.nsId = nsId;
         m.session = kSession; m.corr = ++corr_; m.viewName = view; m.keyField = "id"; m.persistence = persistence;
-        m.planBlob = plan(view, source, extraColumn);
+        m.planBlob = plan(view, source, extraColumn, nsId);
         m.meta = meta_("", "rig", {}, false);
         return await_(submit_(DdlRequest{std::move(m)}));
     }
@@ -289,8 +292,9 @@ public:
         m.meta = meta_("", "rig", {}, false);
         return await_(submit_(DdlRequest{std::move(m)}));
     }
-    Answer dropTopic(const std::string& topic) {
+    Answer dropTopic(const std::string& topic, uint32_t nsId = 0) {
         DropTopicMsg m;
+        m.nsId = nsId;
         m.session = kSession; m.corr = ++corr_; m.name = topic;
         m.meta = meta_("", "rig", {}, false);
         return await_(submit_(DdlRequest{std::move(m)}));
@@ -444,12 +448,12 @@ public:
     }
     /// An authored plan over `source` (by its CURRENT catalog topic id): id + hp
     /// (+ id again as "id2" when extraColumn).
-    [[nodiscard]] std::vector<uint8_t> plan(const std::string& view, const std::string& source, bool extraColumn) const {
+    [[nodiscard]] std::vector<uint8_t> plan(const std::string& view, const std::string& source, bool extraColumn, uint32_t nsId = 0) const {
         namespace rv = rune::view;
         rv::ViewPlan p;
         p.viewName = view;
         p.key      = "id";
-        const rune::catalog::TopicObject* t = admin_->applier().state().topicByName(rune::catalog::kDefaultNsId, source);
+        const rune::catalog::TopicObject* t = admin_->applier().state().topicByName(nsId, source);
         p.sources.push_back(rv::SourceSpec{t ? t->topicId : 999'999, "id"});
         p.output.push_back(rv::AuthoredField{"id", rune::codec::PrimType::Int64, 0, "id", rv::MergeRule::Replace});
         p.output.push_back(rv::AuthoredField{"hp", rune::codec::PrimType::Int64, 0, "hp", rv::MergeRule::Replace});

@@ -35,6 +35,7 @@ public:
     static constexpr std::size_t kChunkWords = 512;
     static constexpr int         kMaxWorkers = 64;   // validateShardConfig
     static constexpr int64_t     kDenyTable  = -1;   // a bind to nothing
+    static constexpr int64_t     kSuspendedTable = -2;   // a bind to nothing because the namespace is suspended ReadOnly
 
     /// Table `tableId`'s full WRITE bitmap.  Returns the item's sequence number.
     uint64_t shipTable(WorkerPool& pool, uint32_t tableId, std::span<const uint64_t> bits, bool grantAll) {

@@ -5,12 +5,20 @@
 //                       (a view's source) or an objectId that names another namespace's object is "not live" here.
 //   NamespaceCreated    e.nsId == nextNsId() (else BadNsId); name valid (NsName.h) and not "default"; e.objectName ==
 //                       the name; the name is free; versions 0 -> 1; the record is ACTIVE with the event's limits
-//   NamespaceLimitsSet  the namespace exists (else BadNsId); versions chain; the FULL limits record replaces the old
+//   NamespaceLimitsSet  the namespace exists (else BadNsId) and is not DELETING; versions chain; the FULL limits record replaces the old
 //   NamespaceStateChanged
-//                       the namespace exists; versions chain; edges ACTIVE <-> SUSPENDED(mode) and
-//                       ACTIVE | SUSPENDED -> DELETING only; nsId 0 never enters DELETING
-//   NamespaceDeleted    the namespace exists, is DELETING, is not nsId 0; versions chain.  The id is never reused:
-//                       nextNsId() does not move back
+//                       the namespace exists; versions chain; edges ACTIVE -> SUSPENDED(mode), SUSPENDED(m) -> ACTIVE
+//                       and SUSPENDED(m) -> SUSPENDED(other mode) only.  A same-state edge is refused; DELETING is never
+//                       a target (NamespaceDeleted enters it) and never a source.  nsId 0 may be suspended and resumed
+//   NamespaceDeleted    the namespace exists, is ACTIVE or SUSPENDED, is not nsId 0; versions chain.  It enters DELETING
+//                       with pendingTopics / pendingViews = every live object of the namespace and stepMask 0, and
+//                       leaves the name index (the name is reusable).  This event is the commit point: it carries the
+//                       tombstone fingerprint, which the registry folds
+//   NamespaceDeleteStep the namespace exists and is DELETING; versions chain; the step bit (exactly one valid bit) is
+//                       OR-ed into stepMask (an already-set bit still applies: idempotent)
+//   DELETING gate       of the object kinds only DropTopic and DropView pass; each removes its object from the pending
+//                       set.  When pending sets are empty and all four steps are recorded the record is erased (the id
+//                       is never reused: nextNsId() does not move back)
 //   every kind          a requestId other than {0,0} not already applied; the event's own values valid
 #include "ApplyV2.h"
 #include "Wire.h"
@@ -80,6 +88,8 @@ Result created(const CatalogState& s, const CatalogEvent& e, int64_t off, const 
 Result limitsSet(const CatalogState& s, const CatalogEvent& e, int64_t off, const NamespaceLimitsSetOps& o) {
     auto cur = subject(s, e, off);
     if (!cur) return std::unexpected(std::move(cur.error()));
+    if (std::holds_alternative<NsDeleting>((*cur)->state))
+        return fail(off, Code::Precondition, prefix(e) + "namespace " + quoted((*cur)->name) + " is DELETING");
     NamespaceRecord r = **cur;
     r.limits = o.limits;
     r.version = e.newVersion;
@@ -87,22 +97,22 @@ Result limitsSet(const CatalogState& s, const CatalogEvent& e, int64_t off, cons
     return StagedNsUpdate{std::move(r)};
 }
 
-/// D5: ACTIVE <-> SUSPENDED(mode); ACTIVE | SUSPENDED -> DELETING.  Nothing leaves DELETING but Deleted.
+/// D17: ACTIVE -> SUSPENDED(mode); SUSPENDED(m) -> ACTIVE | SUSPENDED(other).  DELETING is entered only by Deleted.
 bool stateEdgeAllowed(const NsState& from, NsStateTag to) noexcept {
-    if (std::holds_alternative<NsDeleting>(from)) return false;
-    if (std::holds_alternative<NsActive>(from)) return to != NsStateTag::Active;
-    return to == NsStateTag::Active || to == NsStateTag::Deleting;   // SUSPENDED: resume or delete, not a mode switch
+    if (to == NsStateTag::Deleting) return false;
+    const NsStateTag cur = tagOf(from);
+    return cur != NsStateTag::Deleting && cur != to;
 }
 
 Result stateChanged(const CatalogState& s, const CatalogEvent& e, int64_t off, const NamespaceStateChangedOps& o) {
     auto cur = subject(s, e, off);
     if (!cur) return std::unexpected(std::move(cur.error()));
+    if (o.to == NsStateTag::Deleting)
+        return fail(off, Code::Precondition, prefix(e) + "a namespace enters DELETING through NamespaceDeleted, not a state change");
     if (!stateEdgeAllowed((*cur)->state, o.to))
         return fail(off, Code::Precondition, prefix(e) + "namespace " + quoted((*cur)->name) + " cannot go from state " +
                                                  std::to_string(static_cast<int>(tagOf((*cur)->state))) + " to " +
                                                  std::to_string(static_cast<int>(o.to)));
-    if (e.nsId == kDefaultNsId && o.to == NsStateTag::Deleting)
-        return fail(off, Code::Precondition, prefix(e) + "the default namespace is never deleted");
     NamespaceRecord r = **cur;
     r.state = stateOf(o.to);
     r.version = e.newVersion;
@@ -114,9 +124,29 @@ Result deleted(const CatalogState& s, const CatalogEvent& e, int64_t off) {
     auto cur = subject(s, e, off);
     if (!cur) return std::unexpected(std::move(cur.error()));
     if (e.nsId == kDefaultNsId) return fail(off, Code::Precondition, prefix(e) + "the default namespace is never deleted");
-    if (!std::holds_alternative<NsDeleting>((*cur)->state))
+    if (std::holds_alternative<NsDeleting>((*cur)->state))
+        return fail(off, Code::Precondition, prefix(e) + "namespace " + quoted((*cur)->name) + " is already DELETING");
+    NsDeleting d;
+    for (const TopicObject* t : s.topics()) if (t->nsId == e.nsId) d.pendingTopics.insert(t->objectId);
+    for (const ViewObject* v : s.views())   if (v->nsId == e.nsId) d.pendingViews.insert(v->objectId);
+    NamespaceRecord r = **cur;
+    r.state = std::move(d);
+    r.version = e.newVersion;
+    r.fingerprint = nsFingerprint(r.nsId, r.name, r.limits, NsStateTag::Deleting);
+    return StagedNsDeleting{std::move(r)};
+}
+
+Result deleteStep(const CatalogState& s, const CatalogEvent& e, int64_t off, const NamespaceDeleteStepOps& o) {
+    auto cur = subject(s, e, off);
+    if (!cur) return std::unexpected(std::move(cur.error()));
+    const auto* d = std::get_if<NsDeleting>(&(*cur)->state);
+    if (d == nullptr)
         return fail(off, Code::Precondition, prefix(e) + "namespace " + quoted((*cur)->name) + " is not DELETING");
-    return StagedNsDelete{e.nsId, (*cur)->name, e.newVersion};
+    NamespaceRecord r = **cur;
+    std::get<NsDeleting>(r.state).stepMask = static_cast<uint8_t>(d->stepMask | o.step);
+    r.version = e.newVersion;
+    r.fingerprint = nsFingerprint(r.nsId, r.name, r.limits, NsStateTag::Deleting);
+    return StagedNsUpdate{std::move(r)};
 }
 
 } // namespace
@@ -134,6 +164,7 @@ std::expected<StagedV2, ApplyError> ApplyV2::run(const CatalogState& s, const Ca
             else if constexpr (std::is_same_v<T, NamespaceLimitsSetOps>)    return limitsSet(s, e, offset, o);
             else if constexpr (std::is_same_v<T, NamespaceStateChangedOps>) return stateChanged(s, e, offset, o);
             else if constexpr (std::is_same_v<T, NamespaceDeletedOps>)      return deleted(s, e, offset);
+            else if constexpr (std::is_same_v<T, NamespaceDeleteStepOps>)   return deleteStep(s, e, offset, o);
             else return fail(offset, Code::BadOps, prefix(e) + "not a namespace body");   // unreachable: kind/ops agree
         }, e.ops);
     }
@@ -141,8 +172,12 @@ std::expected<StagedV2, ApplyError> ApplyV2::run(const CatalogState& s, const Ca
     const NamespaceRecord* ns = s.namespaces().byId(e.nsId);
     if (ns == nullptr)
         return fail(offset, Code::BadNsId, prefix(e) + "namespace " + std::to_string(e.nsId) + " does not exist");
-    if (!std::holds_alternative<NsActive>(ns->state))
-        return fail(offset, Code::Precondition, prefix(e) + "namespace " + quoted(ns->name) + " is not ACTIVE");
+    if (std::holds_alternative<NsDeleting>(ns->state)) {
+        if (e.kind != EventKind::DropTopic && e.kind != EventKind::DropView)   // only the drops may pass
+            return fail(offset, Code::Precondition, prefix(e) + "namespace " + quoted(ns->name) + " is DELETING");
+    }
+    // ACTIVE and SUSPENDED both take object DDL: a suspended namespace refuses its own users at the gateway (the
+    // suspend table), while a cluster admin is exempt (plan D21) and its DDL must apply on every node.
     auto staged = ApplyV1::run(s, e, offset);
     if (!staged) return std::unexpected(std::move(staged.error()));
     return StagedV2{std::move(*staged)};
@@ -152,15 +187,36 @@ uint64_t ApplyV2::fingerprintOfStaged(const CatalogEvent& e, const StagedV2& st)
     return std::visit([&](const auto& x) -> uint64_t {
         using T = std::decay_t<decltype(x)>;
         if constexpr (std::is_same_v<T, Staged>)              return objectFingerprintV2(ApplyV1::fingerprintOfStaged(x), e.nsId);
-        else if constexpr (std::is_same_v<T, StagedNsDelete>) return nsTombstoneFingerprint(x.nsId, x.name, x.finalVersion);
+        else if constexpr (std::is_same_v<T, StagedNsDeleting>)
+            return nsTombstoneFingerprint(x.record.nsId, x.record.name, x.record.version);
         else                                                  return x.record.fingerprint;
     }, st);
 }
 
 Applied ApplyV2::commit(CatalogState& s, const CatalogEvent& e, int64_t offset, uint64_t fingerprint, StagedV2&& st) {
-    if (auto* obj = std::get_if<Staged>(&st)) return ApplyV1::commit(s, e, offset, fingerprint, std::move(*obj));
-
     NamespaceRegistry& reg = s.namespaces_;
+    bool erased = false;
+    // Erases the DELETING record of `nsId` once nothing is pending and every step is recorded.
+    auto eraseIfComplete = [&](uint32_t nsId) {
+        const auto it = reg.byId_.find(nsId);
+        if (it == reg.byId_.end()) return;
+        const auto* d = std::get_if<NsDeleting>(&it->second.state);
+        if (d != nullptr && d->complete()) { reg.byId_.erase(it); erased = true; }   // byName_ went at Deleted
+    };
+
+    if (auto* obj = std::get_if<Staged>(&st)) {
+        Applied a = ApplyV1::commit(s, e, offset, fingerprint, std::move(*obj));
+        if (e.kind == EventKind::DropTopic || e.kind == EventKind::DropView) {
+            const auto it = reg.byId_.find(e.nsId);
+            if (it != reg.byId_.end())
+                if (auto* d = std::get_if<NsDeleting>(&it->second.state)) {
+                    (e.kind == EventKind::DropTopic ? d->pendingTopics : d->pendingViews).erase(e.objectId);
+                    eraseIfComplete(e.nsId);
+                    a.nsErased = erased;
+                }
+        }
+        return a;
+    }
     std::visit([&](auto&& x) {
         using T = std::decay_t<decltype(x)>;
         if constexpr (std::is_same_v<T, StagedNsCreate>) {
@@ -169,13 +225,15 @@ Applied ApplyV2::commit(CatalogState& s, const CatalogEvent& e, int64_t offset, 
             reg.byId_.emplace(x.record.nsId, std::move(x.record));
         } else if constexpr (std::is_same_v<T, StagedNsUpdate>) {
             reg.byId_.at(x.record.nsId) = std::move(x.record);
-        } else if constexpr (std::is_same_v<T, StagedNsDelete>) {
-            reg.byName_.erase(x.name);   // nextNsId_ stays: the id is never reused
-            reg.byId_.erase(x.nsId);
+        } else if constexpr (std::is_same_v<T, StagedNsDeleting>) {
+            reg.byName_.erase(x.record.name);   // DELETING is reachable by id only; nextNsId_ stays (ids are never reused)
+            reg.byId_.at(x.record.nsId) = std::move(x.record);
             reg.tombstoneFold_ = detail::fnvU64(reg.tombstoneFold_ == 0 ? rune::codec::detail::kFnvSeed : reg.tombstoneFold_,
                                                 fingerprint);
         }
     }, st);
+
+    if (e.kind == EventKind::NamespaceDeleteStep) eraseIfComplete(e.nsId);
 
     s.appliedOffset_ = offset;
     if (!e.principal.requestId.none())
@@ -183,7 +241,7 @@ Applied ApplyV2::commit(CatalogState& s, const CatalogEvent& e, int64_t offset, 
                             RequestRecord{.offset = offset, .kind = e.kind, .objectId = e.objectId, .newVersion = e.newVersion,
                                           .topicId = -1, .schemaVersion = 0, .requestFingerprint = e.principal.requestFingerprint});
     return Applied{.kind = e.kind, .objectId = e.objectId, .newVersion = e.newVersion, .fingerprint = fingerprint,
-                   .createdTopicId = -1, .droppedTopicId = -1, .nsId = e.nsId};
+                   .createdTopicId = -1, .droppedTopicId = -1, .nsId = e.nsId, .nsErased = erased};
 }
 
 } // namespace rune::catalog

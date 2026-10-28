@@ -99,9 +99,10 @@ struct Fixture {
     void step() { pump(); worker->doWork(now += 10'000); egress->poll(asmb.handler(), 64); }
     void steps(int n) { for (int i = 0; i < n; ++i) step(); }
 
-    void announce(int64_t sid, bool grantAll) {
+    void announce(int64_t sid, bool grantAll, int32_t clientVersion = 0) {
         WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = sid;
         a.egressStreamId = kEgress; a.egressChannel = kEgressChannel; a.grantAll = grantAll;
+        a.clientVersion = clientVersion;
         ASSERT_TRUE(worker->tryEnqueueOp(std::move(a)));
     }
     void close(int64_t sid) {
@@ -375,6 +376,36 @@ TEST(WorkerWriteGrantRegression, ABindToNoTableDeniesEverythingRegression) {
     f.bind(5, -1, 1);
     f.steps(4);
     EXPECT_FALSE(allowsWrite(*f.slot(5), 1));
+}
+
+// Namespaces Phase 2 (D21): a bind to the SUSPENDED table (-2, the session's namespace is ReadOnly) denies every topic
+// like a bind to nothing, but the worker answers NamespaceSuspended (51) to a v14 client and InvalidRequest to an older
+// one - as the gateway path does - never NotAuthorized; nothing is appended.  A plain deny bind still answers 45.
+TEST(WorkerWriteGrantRegression, ASuspendedBindAnswersNamespaceSuspendedRegression) {
+    Fixture f;
+    f.announce(5, /*grantAll=*/true, pc::kClientVersionNamespaces);
+    f.announce(6, /*grantAll=*/true, pc::kClientVersionNamespaces - 1);
+    f.steps(2);
+    f.bind(5, -2, 1);
+    f.bind(6, -2, 1);
+    f.steps(4);
+    EXPECT_FALSE(allowsWrite(*f.slot(5), 1));
+    EXPECT_EQ(f.slot(5)->table, suspendedWriteTable());
+    const int64_t end = f.log->logEndOffset();
+    f.produce(5, 1);
+    f.produce(6, 2);
+    ASSERT_TRUE(f.awaitAck(1));
+    ASSERT_TRUE(f.awaitAck(2));
+    EXPECT_EQ(f.acks[1].errorCode, static_cast<int16_t>(pc::ErrorCode::NamespaceSuspended));
+    EXPECT_EQ(f.acks[2].errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest)) << "a pre-v14 client";
+    EXPECT_EQ(f.log->logEndOffset(), end) << "a suspended produce appends nothing";
+    EXPECT_EQ(f.worker->workerSuspendedRefusalsForTest(), 2u);
+    EXPECT_EQ(f.worker->workerNotAuthorizedForTest(), 0u);
+    f.bind(5, -1, 2);   // a plain deny (a revoke while suspended) is NotAuthorized again
+    f.steps(4);
+    f.produce(5, 3);
+    ASSERT_TRUE(f.awaitAck(3));
+    EXPECT_EQ(f.acks[3].errorCode, static_cast<int16_t>(pc::ErrorCode::NotAuthorized));
 }
 
 // ── PR #441 adversarial review (issue #259 area): the worker's table store under hostile / racing ops ──

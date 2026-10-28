@@ -129,6 +129,15 @@ public:
     ///          replica is min-ISR-gated.
     rune::replication::Offset putPidBlockCeiling(ProducerId ceiling);
 
+    /// Namespaces Phase 2 Task 6b (D20): at most `batch` TOMBSTONES (record key = the scoped transactional id, empty
+    /// value: what LogCleaner::isTombstone recognises) for the live transactional ids of namespace `nsId`, each erased
+    /// from the in-memory map when appended (ascending id order).  True iff this call found no live id of `nsId` (it
+    /// wrote nothing): n ids take ceil(n / batch) calls returning false, then one returning true.  A refused append
+    /// (min-ISR gate) stops the call (false).  `nsId` 0 is never deleted (true, nothing written).  `batch` 0 = 1.
+    bool tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs);
+    /// Read-only: the number of live transactional ids of namespace `nsId` (the keys tombstoneNamespace would write).
+    [[nodiscard]] std::size_t liveKeysOfNamespaceForTest(uint32_t nsId) const;
+
     /// Highest pid block ceiling folded by rebuildFromLog() (-1 if none).
     [[nodiscard]] ProducerId persistedPidCeiling() const noexcept { return persistedPidCeiling_; }
 

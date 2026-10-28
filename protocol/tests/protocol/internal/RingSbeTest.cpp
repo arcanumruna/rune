@@ -366,7 +366,18 @@ TEST(RingSbeRegression, AuthOpTypesAndTailKindsArePinned) {
     EXPECT_EQ(static_cast<int>(sbe::ReturnType::Value::TXN_VERIFY_REQUEST), 8);
     EXPECT_EQ(sbe::ReturnType::get(8), sbe::ReturnType::Value::TXN_VERIFY_REQUEST);
     EXPECT_STREQ(sbe::ReturnType::c_str(sbe::ReturnType::Value::TXN_VERIFY_REQUEST), "TXN_VERIFY_REQUEST");
-    EXPECT_THROW((void)sbe::OpType::get(27), std::runtime_error);
+    // Namespaces Phase 2 (Tasks 8, 14): the slot assign / release and the throttle / view-memory broadcasts, appended.
+    const std::pair<int, sbe::OpType::Value> ns[] = {{27, sbe::OpType::Value::NS_SLOT_ASSIGN},
+                                                      {28, sbe::OpType::Value::NS_SLOT_RELEASE},
+                                                      {29, sbe::OpType::Value::NS_THROTTLE},
+                                                      {30, sbe::OpType::Value::NS_VIEW_MEM_OVER}};
+    for (const auto& [n, v] : ns) {
+        EXPECT_EQ(static_cast<int>(v), n);
+        EXPECT_EQ(sbe::OpType::get(static_cast<std::uint8_t>(n)), v) << n;
+    }
+    EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::NS_THROTTLE), "NS_THROTTLE");
+    EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::NS_VIEW_MEM_OVER), "NS_VIEW_MEM_OVER");
+    EXPECT_THROW((void)sbe::OpType::get(31), std::runtime_error);
     EXPECT_THROW((void)sbe::ReturnType::get(9), std::runtime_error);
     EXPECT_THROW((void)sbe::TailKind::get(12), std::runtime_error);
 }

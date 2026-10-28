@@ -348,7 +348,9 @@ private:
     }
     void setupAnon() {
         AuthBroker::Options o;
-        o.configure = [](NodeConfig& c) { c.anonymousRead = true; };
+        // The matrix opens one anonymous session per cell and never closes it: lift the anonymous-connection cap
+        // (RUNE_ANONYMOUS_MAX_CONNECTIONS, default 16, Phase 2 Task 10) so the cap does not answer the cells.
+        o.configure = [](NodeConfig& c) { c.anonymousRead = true; c.anonymousMaxConnections = NodeConfig::kMaxAnonymousCap; };
         anon_ = std::make_unique<World>("nsmxanon", std::move(o));
         World& w = *anon_;
         w.r.createNamespace("b");

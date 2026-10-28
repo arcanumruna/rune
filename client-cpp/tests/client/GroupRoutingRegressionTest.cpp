@@ -4226,6 +4226,25 @@ TEST(GroupRoutingRegression, ADeferredJoinWithNoLiveNewerNodeEndsBrokerTooOldNev
         << "no connected node can serve the consumer, yet it waits silently forever (deferred on a stale max)";
 }
 
+// Namespaces Phase 2: a JoinGroup refused NamespaceSuspended (51) or NamespaceLimitExceeded (52) is an admin's act -
+// the consumer finishes RefusedByBroker with that code after ONE join.  RED before: both fell into the Internal-style
+// backoff and re-joined until RetryBudgetExhausted.
+TEST(GroupRoutingRegression, JoinGroupNamespaceRefusalFinishesTheConsumerRegression) {
+    uint16_t port = 4971;
+    for (const auto ec : {rune::protocol::client::ErrorCode::NamespaceSuspended,
+                          rune::protocol::client::ErrorCode::NamespaceLimitExceeded}) {
+        GroupRig r(port, static_cast<uint16_t>(port + 1));
+        port = static_cast<uint16_t>(port + 2);
+        r.gw.holdJoins     = false;
+        r.gw.joinErrorCode = static_cast<int16_t>(ec);
+        auto gc = r.client.subscribeGroup("g", {"t"});
+        r.connect();
+        ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 400'000)) << "joins: " << r.gw.joinGroups;
+        EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker) << static_cast<int>(ec);
+        EXPECT_EQ(r.gw.joinGroups, 1) << static_cast<int>(ec);
+    }
+}
+
 // C18 adversarial review (#651 on the duty clock, deterministic): p1's Subscribe is redirected by the seed to node 1,
 // so the route is a provisional guess and a confirming refresh is armed.  MetadataRequests are held (never answered)
 // and, with the duty clock FROZEN, ten LAGGING answers (to the connect-time request, older than the redirect) land.

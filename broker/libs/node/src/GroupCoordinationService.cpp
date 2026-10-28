@@ -8,6 +8,7 @@
 #include <rune/node/GroupCoordinationService.h>
 #include <rune/node/GroupErrorMapping.h>
 #include <rune/gateway/RequestRejection.h>
+#include <rune/gateway/NsResolve.h>
 
 #include <rune/gateway/ClientGateway.h>  // CG-4: addGroupSubscription / revokeGroupSubscriptions / sendControlFrame
 #include <rune/crypto/Kdf.h>             // issues #123 / #124: the random half of member ids
@@ -23,6 +24,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstring>
+#include <span>
 
 namespace rune::node {
 
@@ -72,6 +74,24 @@ GroupCoordinationService::GroupCoordinationService(
 bool GroupCoordinationService::isLocalCoordinator() const {
     if (localLeader_ >= 0) return localLeader_ == 1;
     return isLeaderFn_ ? isLeaderFn_() : true;
+}
+
+// ---------------------------------------------------------------------------
+// tombstoneNamespace (Phase 2 Task 7)
+// ---------------------------------------------------------------------------
+ReapStatus GroupCoordinationService::tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs) {
+    if (offsets_ == nullptr) return ReapStatus::Done;   // no offset store (a rig): nothing to remove
+    if (!isLocalCoordinator() || !offsetsLoaded_()) return ReapStatus::Refused;
+    rune::replication::PartitionReplica* r = offsets_->replica();
+    const rune::replication::Offset leo0 = r->logEndOffset();
+    const bool none = offsets_->tombstoneNamespace(nsId, batch, nowNs);
+    if (!none) return r->logEndOffset() > leo0 ? ReapStatus::More : ReapStatus::Refused;
+    return r->highWatermark() >= r->logEndOffset() ? ReapStatus::Done : ReapStatus::More;   // all committed
+}
+
+std::optional<std::size_t> GroupCoordinationService::liveKeysOfNamespaceForTest(uint32_t nsId) const {
+    if (offsets_ == nullptr || !isLocalCoordinator() || !offsetsLoaded_()) return std::nullopt;   // unknown: not loaded / not the coordinator
+    return offsets_->liveKeysOfNamespaceForTest(nsId);
 }
 
 // ---------------------------------------------------------------------------
@@ -151,7 +171,7 @@ bool GroupCoordinationService::topicIdAssignable_(int32_t tid) const {
            (gateway_ == nullptr || gateway_->topicAssignable(tid));
 }
 
-coord::TopicPartitionCounts GroupCoordinationService::buildTopicPartitionCounts() const {
+coord::TopicPartitionCounts GroupCoordinationService::buildTopicPartitionCounts(uint32_t nsId) const {
     coord::TopicPartitionCounts counts;
     if (!topics_) return counts;
 
@@ -159,6 +179,7 @@ coord::TopicPartitionCounts GroupCoordinationService::buildTopicPartitionCounts(
     for (int32_t tid = 0; tid < n; ++tid) {
         if (!topicIdAssignable_(tid)) continue;
         const rune::node::TopicSpec* spec = topics_->topic(tid);
+        if (spec->nsId != nsId) continue;   // D19: a group assigns only its own namespace's topics (same local name in two namespaces)
         counts[spec->name] = spec->partitionCount;
     }
     return counts;
@@ -263,7 +284,7 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
         // so we don't call it twice if doWork is already past it.
         if (stateAfter == coord::GroupState::CompletingRebalance && !coord.leaderSynced()) {
             // Auto-assign with RangeAssignor; transitions to Stable.
-            const coord::TopicPartitionCounts partCounts = buildTopicPartitionCounts();
+            const coord::TopicPartitionCounts partCounts = buildTopicPartitionCounts(rune::coordination::parseScopedId(groupId).nsId);
             const coord::SyncResult sr =
                 coord.autoAssignAndSync(partCounts, coord::AssignorType::Range, nowNs);
             if (sr.ok()) {
@@ -371,10 +392,11 @@ bool GroupCoordinationService::rebalanceForSupersededLineage_(const GroupId& gro
     return true;
 }
 
-std::size_t GroupCoordinationService::onTopicDropped(std::string_view topicName, int64_t nowNs) {
+std::size_t GroupCoordinationService::onTopicDropped(std::string_view topicName, int64_t nowNs, uint32_t nsId) {
     if (!isLocalCoordinator()) return 0;
     std::size_t n = 0;
     for (auto& [groupId, coord] : coordinators_) {
+        if (rune::coordination::parseScopedId(groupId).nsId != nsId) continue;   // D19: only that namespace's groups
         bool holds = false;
         for (const auto& m : coord.members())
             for (const auto& tp : m.assignment) holds = holds || tp.topic == topicName;
@@ -405,7 +427,7 @@ void GroupCoordinationService::recordGenLineages_(const GroupId& groupId, const 
     v.clear();
     for (const auto& m : coord.members()) {
         for (const auto& tp : m.assignment) {
-            const auto id = topics_->topicIdForName(tp.topic);
+            const auto id = topics_->topicIdForName(rune::coordination::parseScopedId(groupId).nsId, tp.topic);
             if (!id) continue;
             const uint64_t l = lineageOf_(*id, tp.partition);
             if (l == 0) continue;   // a disk partition
@@ -512,7 +534,7 @@ void GroupCoordinationService::sweepSupersededLineages_(int64_t nowNs) {
         // (b) its committed offsets (R1)
         for (const auto& [tp, co] : offsets_->fetchAll(groupId)) {
             if (co.lineage == 0 || topics_ == nullptr) continue;
-            const auto id = topics_->topicIdForName(tp.topic);
+            const auto id = topics_->topicIdForName(rune::coordination::parseScopedId(groupId).nsId, tp.topic);
             if (!id) continue;
             if (!checkSuperseded_(groupId, *id, tp.partition, co.lineage, /*genEntry=*/false, nowNs))
                 pendingChecks_.push_back(PendingCheck{groupId, *id, tp.partition, co.lineage, false});
@@ -524,12 +546,13 @@ void GroupCoordinationService::sweepSupersededLineages_(int64_t nowNs) {
 
 // ---------------------------------------------------------------------------
 // Lookup topicId → topic name via TopicRegistry.
-// Returns empty string if topics_ is null or topicId is out of range.
+// Returns empty string if topics_ is null, topicId is out of range, or the topic belongs to another namespace than
+// `nsId` (Review U2: a cross-namespace reference is "does not exist", for everyone).
 // ---------------------------------------------------------------------------
-static std::string topicNameForId(rune::gateway::TopicRegistry* topics, int32_t topicId) {
+static std::string topicNameForId(rune::gateway::TopicRegistry* topics, uint32_t nsId, int32_t topicId) {
     if (!topics) return {};
     const rune::node::TopicSpec* spec = topics->topic(topicId);
-    if (!spec) return {};
+    if (!spec || spec->nsId != nsId) return {};
     return spec->name;
 }
 
@@ -574,7 +597,8 @@ void GroupCoordinationService::noteFilterMismatch_(const std::string& groupId, i
 // handleJoinGroup (templateId 32)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleJoinGroup(
-    const uint8_t* buf, size_t len, int32_t clientVersion, int64_t nowNs, uint8_t* out, size_t outCap)
+    const uint8_t* buf, size_t len, int32_t clientVersion, int64_t nowNs, uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
 {
     auto msgOpt = pc::JoinGroup::decode(buf, len, clientVersion);
     if (!msgOpt) {
@@ -584,11 +608,13 @@ size_t GroupCoordinationService::handleJoinGroup(
             buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::JoinGroup& msg = *msgOpt;
+    if (rune::coordination::reservedClientId(idView_(msg.groupId))) [[unlikely]]   // D19: the scoped-id prefix is reserved
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
 
     // CG-7 zero-alloc: assign() into pre-reserved scratch strings; no heap alloc
     // when capacity >= size (capacity grows on first long-string call, then stable).
-    groupIdScratch_.assign(
-        reinterpret_cast<const char*>(msg.groupId.data()), msg.groupId.size());
+    rune::gateway::scopeClientIdInto(ctx, idView_(msg.groupId), groupIdScratch_);   // D19: namespace-scoped id
     memberIdScratch_.assign(
         reinterpret_cast<const char*>(msg.memberId.data()), msg.memberId.size());
     const std::string& groupIdStr  = groupIdScratch_;
@@ -638,11 +664,13 @@ size_t GroupCoordinationService::handleJoinGroup(
     const std::span<const uint8_t> filter = pc::clientUnderstandsFilters(ver) ? msg.filter : std::span<const uint8_t>{};
     // A refused join: never admitted, no state change.  Old clients get the rule's ProtocolVersion; the detail
     // (cold; reserved member string) goes to a session >= 11 only.
-    auto refuseJoin = [&](std::string detail) {
+    auto refuseJoin = [&](std::string detail, bool nsLimit = false) {
         pc::JoinGroupResponse resp;
         resp.sessionId     = msg.sessionId;
         resp.correlationId = msg.correlationId;
-        resp.errorCode     = static_cast<int16_t>(rejectionCodeFor(ver));
+        // Namespaces Phase 2 Task 9: a namespace limit is NamespaceLimitExceeded (52) for a v14+ member, else the old rule.
+        resp.errorCode     = static_cast<int16_t>(nsLimit && ver >= pc::kClientVersionNamespaces ? pc::ErrorCode::NamespaceLimitExceeded
+                                                                                                  : rejectionCodeFor(ver));
         resp.generationId  = 0;
         resp.isLeader      = 0;
         resp.memberId      = std::span<const uint8_t>();
@@ -675,13 +703,26 @@ size_t GroupCoordinationService::handleJoinGroup(
             return refuseJoin("topic id " + std::to_string(tid) +
                               " is a view sink: it holds no records to consume; read the view with the view read API");
         }
-        std::string name = topicNameForId(topics_, tid);
+        std::string name = topicNameForId(topics_, rune::coordination::parseScopedId(groupIdStr).nsId, tid);
         if (!name.empty()) {
             joinTopicsScratch_.push_back(std::move(name));
         }
         // Unknown topicId silently ignored (Assignor ignores topics not in partCounts).
     }
 
+    // Namespaces Phase 2 Task 9 (D23): maxGroups of the group's namespace, at the join that would CREATE a group (count of
+    // distinct group ids of that nsId in coordinators_; count >= limit refuses; 0 = unlimited).  The limit is read from the
+    // gateway's namespace mirror the request carries (ctx.reg).  Cold: only a new group's first join scans.
+    if (ctx.reg != nullptr && coordinators_.find(groupIdStr) == coordinators_.end()) {
+        const uint32_t gns = rune::coordination::parseScopedId(groupIdStr).nsId;
+        if (const auto* nsr = ctx.reg->byId(gns); nsr != nullptr && nsr->limits.maxGroups != 0) {
+            uint64_t have = 0;
+            for (const auto& [id, c] : coordinators_) if (rune::coordination::parseScopedId(id).nsId == gns) ++have;
+            if (have >= nsr->limits.maxGroups)
+                return refuseJoin("namespace limit exceeded: groups (" + std::to_string(have) + " of " +
+                                  std::to_string(nsr->limits.maxGroups) + ")", true);
+        }
+    }
     // #214: the number of coordinated groups is bounded.  Only a join that would CREATE a group is refused (never one
     // to an existing group); empty groups are dropped by doWork, so the room comes back as groups empty.
     if (coordinators_.size() >= static_cast<std::size_t>(maxGroups_) &&
@@ -787,7 +828,7 @@ size_t GroupCoordinationService::handleJoinGroup(
     // Mirrors the doWork() detection path for timer-triggered completions; the
     // guard (!gc.leaderSynced()) ensures this fires at most once per generation.
     if (gc.state() == coord::GroupState::CompletingRebalance && !gc.leaderSynced()) {
-        const coord::TopicPartitionCounts partCounts = buildTopicPartitionCounts();
+        const coord::TopicPartitionCounts partCounts = buildTopicPartitionCounts(rune::coordination::parseScopedId(groupIdStr).nsId);
         const coord::SyncResult sr =
             gc.autoAssignAndSync(partCounts, coord::AssignorType::Range, nowNs);
         if (sr.ok()) {
@@ -821,7 +862,8 @@ size_t GroupCoordinationService::handleJoinGroup(
 // handleSyncGroup (templateId 34)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleSyncGroup(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
 {
     auto msgOpt = pc::SyncGroup::decode(buf, len);
     if (!msgOpt) {
@@ -831,10 +873,12 @@ size_t GroupCoordinationService::handleSyncGroup(
             buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::SyncGroup& msg = *msgOpt;
+    if (rune::coordination::reservedClientId(idView_(msg.groupId))) [[unlikely]]   // D19: the scoped-id prefix is reserved
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
 
     // CG-7 zero-alloc: assign() into pre-reserved scratch strings.
-    groupIdScratch_.assign(
-        reinterpret_cast<const char*>(msg.groupId.data()), msg.groupId.size());
+    rune::gateway::scopeClientIdInto(ctx, idView_(msg.groupId), groupIdScratch_);   // D19: namespace-scoped id
     memberIdScratch_.assign(
         reinterpret_cast<const char*>(msg.memberId.data()), msg.memberId.size());
     const std::string& groupIdStr  = groupIdScratch_;
@@ -909,7 +953,7 @@ size_t GroupCoordinationService::handleSyncGroup(
         // Resolve topic name → topicId via TopicRegistry.
         int32_t topicId = -1;
         if (topics_) {
-            const auto opt = topics_->topicIdForName(tp.topic);
+            const auto opt = topics_->topicIdForName(rune::coordination::parseScopedId(groupIdStr).nsId, tp.topic);
             if (opt) topicId = *opt;
         }
         if (topicId >= 0) {
@@ -929,7 +973,8 @@ size_t GroupCoordinationService::handleSyncGroup(
 // handleHeartbeat (templateId 36)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleHeartbeat(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
 {
     auto msgOpt = pc::Heartbeat::decode(buf, len);
     if (!msgOpt) {
@@ -939,11 +984,13 @@ size_t GroupCoordinationService::handleHeartbeat(
             buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::Heartbeat& msg = *msgOpt;
+    if (rune::coordination::reservedClientId(idView_(msg.groupId))) [[unlikely]]   // D19: the scoped-id prefix is reserved
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
 
     // CG-7 zero-alloc: assign() into pre-reserved scratch strings; no heap alloc
     // once capacity >= size.  Heartbeat is the hottest handler path.
-    groupIdScratch_.assign(
-        reinterpret_cast<const char*>(msg.groupId.data()), msg.groupId.size());
+    rune::gateway::scopeClientIdInto(ctx, idView_(msg.groupId), groupIdScratch_);   // D19: namespace-scoped id
     memberIdScratch_.assign(
         reinterpret_cast<const char*>(msg.memberId.data()), msg.memberId.size());
     const std::string& groupIdStr  = groupIdScratch_;
@@ -985,7 +1032,8 @@ size_t GroupCoordinationService::handleHeartbeat(
 // handleLeaveGroup (templateId 38)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleLeaveGroup(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
 {
     auto msgOpt = pc::LeaveGroup::decode(buf, len);
     if (!msgOpt) {
@@ -995,10 +1043,12 @@ size_t GroupCoordinationService::handleLeaveGroup(
             buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::LeaveGroup& msg = *msgOpt;
+    if (rune::coordination::reservedClientId(idView_(msg.groupId))) [[unlikely]]   // D19: the scoped-id prefix is reserved
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
 
     // CG-7 zero-alloc: assign() into pre-reserved scratch strings.
-    groupIdScratch_.assign(
-        reinterpret_cast<const char*>(msg.groupId.data()), msg.groupId.size());
+    rune::gateway::scopeClientIdInto(ctx, idView_(msg.groupId), groupIdScratch_);   // D19: namespace-scoped id
     memberIdScratch_.assign(
         reinterpret_cast<const char*>(msg.memberId.data()), msg.memberId.size());
     const std::string& groupIdStr  = groupIdScratch_;
@@ -1095,7 +1145,7 @@ int GroupCoordinationService::removeUnauthorizedMembers(int64_t sessionId, int64
     for (auto& [groupId, coord] : coordinators_) {
         // Issue #212: a group whose READ holds is not skipped wholesale - a member of it subscribed to a topic the
         // session may no longer read leaves too.
-        const bool groupOk = check.mayRead(check.ctx, groupId);
+        const bool groupOk = check.mayRead(check.ctx, rune::coordination::parseScopedId(groupId).local);   // D19: authorize the LOCAL name
         if (groupOk && check.mayReadTopic == nullptr) continue;
         evictScratch_.clear();
         for (const auto& member : coord.members()) {
@@ -1189,7 +1239,7 @@ coord::TxnOffsetApply GroupCoordinationService::applyTransactionalOffset(const s
     if (!offsetsLoaded_()) return refuse_(Why::NotLoaded);
     uint64_t lineage = 0;
     if (topics_ != nullptr) {
-        if (const auto id = topics_->topicIdForName(tp.topic)) {
+        if (const auto id = topics_->topicIdForName(rune::coordination::parseScopedId(group).nsId, tp.topic)) {
             lineage = lineageOf_(*id, tp.partition);   // C1: 0 for a disk partition
             if (lineage == kLineagePending) return refuse_(Why::LineagePending);
         }
@@ -1282,7 +1332,8 @@ void GroupCoordinationService::notePlainOffsetCommit_(const std::string& group, 
 // handleOffsetCommit (templateId 40)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleOffsetCommit(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
 {
     auto msgOpt = pc::OffsetCommit::decode(buf, len);
     if (!msgOpt) {
@@ -1292,10 +1343,12 @@ size_t GroupCoordinationService::handleOffsetCommit(
             buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::OffsetCommit& msg = *msgOpt;
+    if (rune::coordination::reservedClientId(idView_(msg.groupId))) [[unlikely]]   // D19: the scoped-id prefix is reserved
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
 
     // CG-7 zero-alloc: assign() into pre-reserved scratch; no heap alloc once stable.
-    groupIdScratch_.assign(
-        reinterpret_cast<const char*>(msg.groupId.data()), msg.groupId.size());
+    rune::gateway::scopeClientIdInto(ctx, idView_(msg.groupId), groupIdScratch_);   // D19: namespace-scoped id
     const std::string& groupIdStr = groupIdScratch_;
 
     // NotCoordinator fence — fires for both empty and non-empty entry lists.
@@ -1402,7 +1455,7 @@ size_t GroupCoordinationService::handleOffsetCommit(
         }
 
         // Resolve topicId → topic name.
-        const std::string topicName = topicNameForId(topics_, e.topicId);
+        const std::string topicName = topicNameForId(topics_, rune::coordination::parseScopedId(groupIdStr).nsId, e.topicId);
         if (topicName.empty()) {
             // Unknown topic — no commit; report UnknownTopic per entry.
             r.errorCode = static_cast<int16_t>(pc::ErrorCode::UnknownTopic);
@@ -1567,7 +1620,8 @@ int16_t GroupCoordinationService::unstableFor_(int64_t sessionId)
 // handleOffsetFetch (templateId 42)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleOffsetFetch(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+    const rune::coordination::NsRequestContext& ctx)
 {
     (void)nowNs;
 
@@ -1579,10 +1633,12 @@ size_t GroupCoordinationService::handleOffsetFetch(
             buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::OffsetFetch& msg = *msgOpt;
+    if (rune::coordination::reservedClientId(idView_(msg.groupId))) [[unlikely]]   // D19: the scoped-id prefix is reserved
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
 
     // CG-7 zero-alloc: assign() into pre-reserved scratch; no heap alloc once stable.
-    groupIdScratch_.assign(
-        reinterpret_cast<const char*>(msg.groupId.data()), msg.groupId.size());
+    rune::gateway::scopeClientIdInto(ctx, idView_(msg.groupId), groupIdScratch_);   // D19: namespace-scoped id
     const std::string& groupIdStr = groupIdScratch_;
 
     // NotCoordinator fence — fires for both empty and non-empty entry lists.
@@ -1696,7 +1752,7 @@ size_t GroupCoordinationService::handleOffsetFetch(
             // Resolve topic name → topicId.
             int32_t topicId = -1;
             if (topics_) {
-                const auto opt = topics_->topicIdForName(tp.topic);
+                const auto opt = topics_->topicIdForName(rune::coordination::parseScopedId(groupIdStr).nsId, tp.topic);
                 if (opt) topicId = *opt;
             }
             if (topicId < 0) continue; // unknown topic — skip
@@ -1730,7 +1786,7 @@ size_t GroupCoordinationService::handleOffsetFetch(
                 break;
             }
 
-            const std::string topicName = topicNameForId(topics_, e.topicId);
+            const std::string topicName = topicNameForId(topics_, rune::coordination::parseScopedId(groupIdStr).nsId, e.topicId);
 
             pc::OffsetFetchResult r;
             r.topicId   = e.topicId;
@@ -1888,7 +1944,7 @@ void GroupCoordinationService::onReachedStable(
             // Resolve topic name → topicId via TopicRegistry.
             int32_t topicId = -1;
             if (topics_) {
-                const auto opt = topics_->topicIdForName(tp.topic);
+                const auto opt = topics_->topicIdForName(rune::coordination::parseScopedId(groupId).nsId, tp.topic);
                 if (opt) topicId = *opt;
             }
             if (topicId < 0) {

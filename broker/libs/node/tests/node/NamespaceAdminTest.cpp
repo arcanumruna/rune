@@ -38,6 +38,9 @@ constexpr uint16_t kCodeExists        = 25;
 constexpr uint16_t kCodeViewSource    = 33;
 constexpr uint16_t kCodeInvalid       = 39;
 constexpr uint16_t kCodeNsLimit       = 52;
+constexpr uint16_t kCodeNotAuthorized = 45;
+
+constexpr uint8_t kKindSuspend = 3, kKindResume = 4, kKindDelete = 5;   // NamespaceDdlKind
 
 std::array<uint8_t, 4> maskOf(std::initializer_list<std::size_t> fields) {
     std::array<uint8_t, 4> m{};
@@ -386,4 +389,112 @@ TEST(NamespaceAdminRegression, LeaderChangeMidCreateRegression) {
     EXPECT_EQ(next.code, kCodeOk) << next.detail;
     EXPECT_EQ(next.objectId, 2u);
     EXPECT_EQ(eventsOfKind(t.recordedLog(2), cat::EventKind::NamespaceCreated).size(), 2u);
+}
+
+// ── Phase 2 Task 2: suspend (3), resume (4), delete (5) ─────────────────────────────────────────────────────────────
+
+namespace {
+CatalogDdlRig::Answer lifecycle(CatalogDdlRig& rig, uint8_t kind, const std::string& name, uint8_t mode = 1,
+                                const std::string& denial = {}) {
+    auto m = rig.namespaceMsg(kind, name);
+    m.mode = mode;
+    m.denial = denial;
+    return rig.submitRaw(rune::node::DdlRequest{std::move(m)});
+}
+} // namespace
+
+// The gateway's verdict rides the message: a non-cluster-admin caller is answered 45 and nothing is appended; the
+// cluster admin (no denial) is Ok.  RED (the denial check skipped for the new kinds): the denied call succeeds.
+TEST(NamespaceAdminRegression, Kinds3To5ClusterAdminOnlyRegression) {
+    CatalogDdlRig rig("ns_life_auth");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.createNamespace("a").code, kCodeOk);
+    const std::string denial = "ADMIN ON CLUSTER is required";
+    for (const uint8_t kind : {kKindSuspend, kKindResume, kKindDelete}) {
+        const auto denied = lifecycle(rig, kind, "a", 1, denial);
+        EXPECT_EQ(denied.code, kCodeNotAuthorized) << int(kind) << " " << denied.detail;
+        EXPECT_EQ(denied.detail, denial);
+    }
+    EXPECT_TRUE(eventsOfKind(rig.recordedLog(), cat::EventKind::NamespaceStateChanged).empty());
+    EXPECT_TRUE(eventsOfKind(rig.recordedLog(), cat::EventKind::NamespaceDeleted).empty());
+    ASSERT_EQ(lifecycle(rig, kKindSuspend, "a", 1).code, kCodeOk);
+    ASSERT_EQ(lifecycle(rig, kKindResume, "a").code, kCodeOk);
+    const auto del = lifecycle(rig, kKindDelete, "a");
+    ASSERT_EQ(del.code, kCodeOk) << del.detail;
+    EXPECT_EQ(del.objectId, 1u);
+    EXPECT_EQ(eventsOfKind(rig.recordedLog(), cat::EventKind::NamespaceStateChanged).size(), 2u);
+    ASSERT_EQ(eventsOfKind(rig.recordedLog(), cat::EventKind::NamespaceDeleted).size(), 1u);
+    EXPECT_EQ(rig.admin().applier().state().namespaces().byName("a"), nullptr) << "DELETING: gone from the name index";
+    ASSERT_NE(rig.admin().applier().state().namespaces().byId(1), nullptr);
+}
+
+TEST(NamespaceAdminRegression, DeleteDefaultRefusedRegression) {
+    CatalogDdlRig rig("ns_life_default");
+    rig.becomeServingLeader();
+    const auto r = lifecycle(rig, kKindDelete, "default");
+    EXPECT_EQ(r.code, kCodeInvalid) << r.detail;
+    EXPECT_TRUE(eventsOfKind(rig.recordedLog(), cat::EventKind::NamespaceDeleted).empty());
+    // the default may be suspended and resumed
+    EXPECT_EQ(lifecycle(rig, kKindSuspend, "default", 2).code, kCodeOk);
+    EXPECT_EQ(lifecycle(rig, kKindResume, "default").code, kCodeOk);
+}
+
+// Suspend into the mode it is already in, and Resume of an ACTIVE namespace, answer Ok and append nothing.
+// RED (an event built for the no-op): a second StateChanged, version 3.
+TEST(NamespaceAdminRegression, SuspendSameModeIsNoOpRegression) {
+    CatalogDdlRig rig("ns_life_noop");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.createNamespace("a").code, kCodeOk);
+    const auto resumeActive = lifecycle(rig, kKindResume, "a");
+    EXPECT_EQ(resumeActive.code, kCodeOk) << resumeActive.detail;
+    EXPECT_EQ(resumeActive.version, 1u);
+    EXPECT_TRUE(eventsOfKind(rig.recordedLog(), cat::EventKind::NamespaceStateChanged).empty());
+    const auto first = lifecycle(rig, kKindSuspend, "a", 1);
+    ASSERT_EQ(first.code, kCodeOk) << first.detail;
+    EXPECT_EQ(first.version, 2u);
+    const auto second = lifecycle(rig, kKindSuspend, "a", 1);
+    EXPECT_EQ(second.code, kCodeOk) << second.detail;
+    EXPECT_EQ(second.version, 2u) << "no version advance";
+    EXPECT_EQ(second.objectId, 1u);
+    EXPECT_EQ(eventsOfKind(rig.recordedLog(), cat::EventKind::NamespaceStateChanged).size(), 1u);
+    // another mode IS a change
+    const auto ra = lifecycle(rig, kKindSuspend, "a", 2);
+    ASSERT_EQ(ra.code, kCodeOk);
+    EXPECT_EQ(ra.version, 3u);
+    EXPECT_EQ(lifecycle(rig, kKindSuspend, "a", 2).version, 3u);
+    EXPECT_EQ(eventsOfKind(rig.recordedLog(), cat::EventKind::NamespaceStateChanged).size(), 2u);
+    const auto ev = eventsOfKind(rig.recordedLog(), cat::EventKind::NamespaceStateChanged);
+    EXPECT_EQ(std::get<cat::NamespaceStateChangedOps>(ev[0].event.ops).to, cat::NsStateTag::SuspendedReadOnly);
+    EXPECT_EQ(std::get<cat::NamespaceStateChangedOps>(ev[1].event.ops).to, cat::NsStateTag::SuspendedRejectAll);
+    // an invalid mode is refused
+    EXPECT_EQ(lifecycle(rig, kKindSuspend, "a", 7).code, kCodeInvalid);
+}
+
+TEST(NamespaceAdminRegression, SuspendResumeDeleteUnknownIsMissingRegression) {
+    CatalogDdlRig rig("ns_life_unknown");
+    rig.becomeServingLeader();
+    for (const uint8_t kind : {kKindSuspend, kKindResume, kKindDelete}) {
+        const auto r = lifecycle(rig, kind, "nope");
+        EXPECT_EQ(r.code, kCodeUnknown) << int(kind) << " " << r.detail;
+    }
+    // a DELETING namespace is Missing by name too
+    ASSERT_EQ(rig.createNamespace("a").code, kCodeOk);
+    ASSERT_EQ(lifecycle(rig, kKindDelete, "a").code, kCodeOk);
+    for (const uint8_t kind : {kKindSuspend, kKindResume, kKindDelete})
+        EXPECT_EQ(lifecycle(rig, kind, "a").code, kCodeUnknown) << int(kind);
+    EXPECT_EQ(rig.setNamespaceLimits("a", maskOf({kFieldMaxViews}), {}).code, kCodeUnknown);
+}
+
+TEST(NamespaceAdminRegression, DdlInDeletingNamespaceIsMissingRegression) {
+    CatalogDdlRig rig("ns_life_ddl");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.createNamespace("a").code, kCodeOk);
+    ASSERT_EQ(rig.define({.name = "t", .partitions = 1, .typed = true, .nsId = 1}).code, kCodeOk);
+    ASSERT_EQ(lifecycle(rig, kKindDelete, "a").code, kCodeOk);
+    const auto d = rig.define({.name = "u", .partitions = 1, .typed = true, .nsId = 1});
+    EXPECT_EQ(d.code, kCodeUnknown) << d.detail;
+    EXPECT_EQ(rig.define({.name = "u", .partitions = 1, .typed = true, .nsId = 99}).code, kCodeUnknown)
+        << "a namespace that never existed";
+    EXPECT_EQ(rig.define({.name = "u", .partitions = 1, .typed = true}).code, kCodeOk) << "the default is unaffected";
+    EXPECT_EQ(eventsOfKind(rig.recordedLog(), cat::EventKind::CreateTopic).size(), 2u);
 }

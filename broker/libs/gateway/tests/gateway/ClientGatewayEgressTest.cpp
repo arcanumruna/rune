@@ -623,14 +623,14 @@ TEST(ClientGatewayEgressRegression, UndecodableHandshakeContinueFailsTheHandshak
 TEST(ClientGatewayEgressRegression, OldClientMalformedJoinGroupIsAnsweredProtocolVersionRegression)
 {
     struct NoGroup final : IGroupRequestHandler {
-        size_t handleJoinGroup(const uint8_t* b, size_t n, int32_t, int64_t, uint8_t* o, size_t c) override {
+        size_t handleJoinGroup(const uint8_t* b, size_t n, int32_t, int64_t, uint8_t* o, size_t c, const rune::coordination::NsRequestContext&) override {
             return encodeRejectionFor(b, n, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), o, c);
         }
-        size_t handleSyncGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-        size_t handleHeartbeat(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-        size_t handleLeaveGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-        size_t handleOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-        size_t handleOffsetFetch(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+        size_t handleSyncGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+        size_t handleHeartbeat(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+        size_t handleLeaveGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+        size_t handleOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+        size_t handleOffsetFetch(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
     } svc;
     CaptureAll cap;
     ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
@@ -660,7 +660,7 @@ TEST(GatewayFilterWireRegression, JoinGroupDecodeIsGatedOnTheSessionsClientVersi
         int calls = 0;
         int32_t lastVersion = -1;
         bool    lastDecodedWithFilter = false;
-        size_t handleJoinGroup(const uint8_t* b, size_t n, int32_t v, int64_t, uint8_t* o, size_t c) override {
+        size_t handleJoinGroup(const uint8_t* b, size_t n, int32_t v, int64_t, uint8_t* o, size_t c, const rune::coordination::NsRequestContext&) override {
             ++calls; lastVersion = v;
             const auto m = pc::JoinGroup::decode(b, n, v);
             lastDecodedWithFilter = m && !m->filter.empty();
@@ -669,11 +669,11 @@ TEST(GatewayFilterWireRegression, JoinGroupDecodeIsGatedOnTheSessionsClientVersi
             ok.sessionId = m->sessionId; ok.correlationId = m->correlationId;
             return c >= ok.encodedSize() ? ok.encode(o) : 0;
         }
-        size_t handleSyncGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-        size_t handleHeartbeat(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-        size_t handleLeaveGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-        size_t handleOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-        size_t handleOffsetFetch(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+        size_t handleSyncGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+        size_t handleHeartbeat(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+        size_t handleLeaveGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+        size_t handleOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+        size_t handleOffsetFetch(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
     } svc;
     CaptureAll cap;
     ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
@@ -1541,24 +1541,24 @@ TEST(ClientGatewayEgressRegression, OldClientGroupErrorIsAnsweredUnknownMemberAn
 {
     struct InternalGroup final : IGroupRequestHandler {
         std::vector<std::string> evicted;
-        size_t handleJoinGroup(const uint8_t*, size_t, int32_t, int64_t, uint8_t*, size_t) override { return 0; }
-        size_t handleSyncGroup(const uint8_t* b, size_t, int64_t, uint8_t* o, size_t) override {
+        size_t handleJoinGroup(const uint8_t*, size_t, int32_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+        size_t handleSyncGroup(const uint8_t* b, size_t, int64_t, uint8_t* o, size_t, const rune::coordination::NsRequestContext&) override {
             const auto h = pc::MessageHeader::decode(b, pc::MessageHeader::ENCODED_SIZE);
             pc::SyncGroupResponse r;
             r.sessionId = h->sessionId; r.correlationId = h->correlationId;
             r.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
             return r.encode(o, {});
         }
-        size_t handleHeartbeat(const uint8_t* b, size_t, int64_t, uint8_t* o, size_t) override {
+        size_t handleHeartbeat(const uint8_t* b, size_t, int64_t, uint8_t* o, size_t, const rune::coordination::NsRequestContext&) override {
             const auto h = pc::MessageHeader::decode(b, pc::MessageHeader::ENCODED_SIZE);
             pc::HeartbeatResponse r;
             r.sessionId = h->sessionId; r.correlationId = h->correlationId;
             r.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);   // an unknown coordinator result
             return r.encode(o);
         }
-        size_t handleLeaveGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-        size_t handleOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-        size_t handleOffsetFetch(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }   // → Internal
+        size_t handleLeaveGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+        size_t handleOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+        size_t handleOffsetFetch(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }   // → Internal
         void evictMember(std::string_view g, std::string_view m, int64_t sid, int64_t) override {
             evicted.push_back("member:" + std::string(g) + "/" + std::string(m) + "/" + std::to_string(sid));
         }

@@ -16,7 +16,9 @@ struct StagedPutUser    { UserObject obj; bool created = false; };
 struct StagedPutRole    { RoleObject obj; bool created = false; };
 struct StagedRemoveUser { Tombstone tomb; };
 struct StagedRemoveRole { Tombstone tomb; std::vector<uint64_t> members; };   // members lose the role
-using StagedChange = std::variant<StagedPutUser, StagedPutRole, StagedRemoveUser, StagedRemoveRole>;
+/// NamespacePurged (formatVer 2): the users and roles to erase, and the surviving ones with their matching grants removed.
+struct StagedPurge { std::vector<uint64_t> eraseUsers, eraseRoles; std::vector<UserObject> putUsers; std::vector<RoleObject> putRoles; };
+using StagedChange = std::variant<StagedPutUser, StagedPutRole, StagedRemoveUser, StagedRemoveRole, StagedPurge>;
 struct Staged { StagedChange change; Applied applied; };   // applied.fingerprint = the resulting object's
 
 struct ApplyV1 {

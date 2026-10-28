@@ -1142,7 +1142,19 @@ Review Focus list and the matrix).
   client picks `acks` per request.
 - **Connections per node:** the connection limit is per node, not cluster-wide, so it needs no cross-node
   coordination on the login path.
-- **View-memory overshoot:** a view may exceed its limit by at most one event batch before it pauses.
+- **View-memory overshoot:** a view may exceed its limit by at most one fold pass (one batch) plus one table chunk per
+  view before it pauses; with the Task 14 aggregator, by one tick of folds plus one chunk per view. Over means
+  usage > limit (a view exactly at its limit still folds).
+- **Aggregator lag (Task 14):** every aggregated limit (rates, disk, view memory) is enforced from the workers' paced
+  reports, so a namespace may exceed it by what its node produces in about one report interval plus one aggregator tick
+  (`RUNE_NS_LIMIT_TICK_US`, default 10 ms) before the Throttle / ViewMemOver reaches the workers; the rate debt carries
+  the excess into the next window, so the long-run rate converges on the limit. The retry-after of a Throttled
+  ProduceResponse rides `logStartOffset` (the frame has no trailer; the ErrorResponse trailer of Task 3 is used where an
+  ErrorResponse is the carrier). Produce handled inline on the control thread (no worker pool) is not rate-limited.
+- **Usage coverage (Task 16):** `NamespaceUsage` reports per node, from what the gateway holds: topics, partitions
+  (per topic maximum and total) and views from its object index, disk / view memory / rates from the aggregator, and
+  connections from its own table. Schemas, schema versions, groups, users, open transactions and the size / retention /
+  replication / acks / feature fields have no usage meaning there and read 0 (the CLI prints `-`).
 - **No version bump:** the new codes are gated on client ≥ 14 and no wire layout changes for older peers; there are
   no mixed-version clusters.
 - **Phase 1 limits size:** the limits record is 256 bytes with 29 fields (`28*8 + 4 + 4 + 3*8`), not 272 bytes and
@@ -1178,3 +1190,22 @@ Run the plan with superpowers:subagent-driven-development:
 
 Implementers never spawn subagents; at most 3 agents run at once. Root-cause diagnosis of any red test stays with the
 controller (CLAUDE.md rule 14).
+
+## Execution status (2026-10-28): Phase 2 done, merged
+
+- **Done:** Tasks 1–20, the post-Batch-3 checkpoint fixes (`2743a1be`) and the Task 15 ABAB baseline (`d322cff0`, in
+  BENCHMARKING.md).
+- **Real e2e** (`broker/docker/namespace-e2e.sh`, default config): green on `00fb85f0`.
+- **Final whole-branch review:**
+  - urgent fixes, verified by tests only (each with a `*Regression*` test and a mutation check):
+    - U1, the DELETING produce gate rebuilt at boot (`403dc20a`);
+    - U2, group and transaction references to another namespace's topics refused (`fa0f4153`);
+    - U3, recreating a name refused until the old grants are purged (`f55354c8`);
+  - non-urgent findings filed as #721–#730.
+- **Postponed at the owner's request** (merge first, NAT-safe egress next), tracked in #736:
+  - the final full Regression suite;
+  - four untracked sanitizer-CI failures;
+  - the hot-path ABAB bench on the final head.
+- **Parked issues from Phase 2:** #661, #662, #663, #695, #696, #697, #721–#730, #736.
+- **Next:** NAT-safe egress (`2026-10-28-rune-nat-egress.md`), then the Arcanum CLI with arcanum-site auth, then
+  TruncateTopic (Phase 3).

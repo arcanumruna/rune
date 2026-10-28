@@ -52,6 +52,7 @@ enum class OpKind : uint8_t {
     // Namespaces (Task 11): namespace DDL (wire 81, answered by DdlResponse 78) and ListNamespaces (82 -> 83).
     NamespaceDdl,       ///< Client::namespaceDdl() / createNamespace() / setNamespaceLimits()
     ListNamespaces,     ///< Client::listNamespaces(afterNsId, max, target, token) / listNamespaces(timeout)
+    NamespaceUsage,     ///< Phase 2 Task 16: Client::namespaceUsage(name, target, token) / namespaceUsage(name, timeout)
 };
 
 enum class OpStatus : uint8_t {
@@ -82,6 +83,10 @@ enum class OpStatus : uint8_t {
     case 46: return "SessionRevoked";
     case 47: return "PasswordChangeRequired";
     case 48: return "AuthUnavailable";   // issues #15 / #111: this broker cannot vouch for its security state: retriable
+    case 51: return "NamespaceSuspended";
+    case 52: return "NamespaceLimitExceeded";
+    case 53: return "Throttled";
+    case 54: return "ViewPaused";
     default: return nullptr;
     }
 }

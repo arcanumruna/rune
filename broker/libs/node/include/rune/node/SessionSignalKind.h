@@ -40,6 +40,14 @@ enum class SessionSignalKind : int64_t {
     /// it on that ring is done.  WorkerReturn::baseOffset = the fence sequence number, ::partition = the worker,
     /// ::sessionId = the ring (0 = op ring, 1 = session-lifecycle ring).  Never dropped (enqueueSignal_).
     FenceAck = 10,
+    /// Namespaces Phase 2 Task 8: NOT a session signal - a worker refused a (nsSlot, nsId) tag its slot table does not
+    /// hold (`rune.ns.slot_mismatch`): WorkerReturn::baseOffset = the worker's cumulative count, ::partition = the worker.
+    NsSlotMismatch = 11,
+    /// Namespaces Phase 2 Task 14 (D28): NOT a session signal - a worker's usage report of ONE namespace metric for the
+    /// limit aggregator: WorkerReturn::sessionId = (nsSlot << 8) | NsMetric, ::correlationId = the slot's nsId,
+    /// ::baseOffset = the value (a cumulative counter for the rates, the current bytes for disk / view memory),
+    /// ::partition = the worker.  Paced; sent only when the value changed.
+    NsUsage = 12,
 };
 
 } // namespace rune::node

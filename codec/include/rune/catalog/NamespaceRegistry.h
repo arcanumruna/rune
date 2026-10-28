@@ -6,15 +6,24 @@
 //
 // A namespace's state is a rich-state variant, each alternative holding exactly what it needs:
 //   NsActive                      the only state a namespace is created in
-//   NsSuspended{mode}             ReadOnly or RejectAll (ACTIVE <-> SUSPENDED)
-//   NsDeleting                    ACTIVE | SUSPENDED -> DELETING; only a DELETING namespace may be Deleted
+//   NsSuspended{mode}             ReadOnly or RejectAll
+//   NsDeleting{pendingTopics, pendingViews, stepMask}
+//                                 what is still left to clean up
+// Lifecycle: ACTIVE <-> SUSPENDED(mode), SUSPENDED(RO) <-> SUSPENDED(RA),
+//   ACTIVE | SUSPENDED --NamespaceDeleted--> DELETING --(objects dropped + 4 steps)--> erased.
+// DELETING is entered only by NamespaceDeleted (never by NamespaceStateChanged), which drops the name from the name
+// index at once: a DELETING namespace is reachable by id only and its name is reusable.  The record is erased when
+// every pending object is dropped and all four NamespaceDeleteStep bits are recorded.
+// Plan D18 lists pendingSchemas; schemas live inside their topic, so dropping the topic drops them.
 #include <rune/catalog/CatalogEvent.h>
+#include <rune/catalog/NamespaceDeleteStep.h>
 #include <rune/catalog/NsName.h>
 #include <rune/protocol/NamespaceLimits.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -43,7 +52,15 @@ struct NsKeyLess {
 
 struct NsActive {};
 struct NsSuspended { NsStateTag mode = NsStateTag::SuspendedReadOnly; };   // SuspendedReadOnly | SuspendedRejectAll
-struct NsDeleting {};
+/// A DELETING namespace: the objectIds still live in it and the cleanup steps recorded so far.
+struct NsDeleting {
+    std::set<uint64_t> pendingTopics, pendingViews;   // objectIds still live in the namespace
+    uint8_t            stepMask = 0;                  // NsDeleteStepBit bits recorded so far
+    [[nodiscard]] bool complete() const noexcept {
+        return pendingTopics.empty() && pendingViews.empty() && stepMask == kNsDeleteAllSteps;
+    }
+    bool operator==(const NsDeleting&) const = default;
+};
 using NsState = std::variant<NsActive, NsSuspended, NsDeleting>;
 
 [[nodiscard]] constexpr NsStateTag tagOf(const NsState& s) noexcept {
@@ -82,7 +99,7 @@ public:
     [[nodiscard]] const NamespaceRecord* byName(std::string_view name) const;
     /// maxEverNsId + 1: never decreases, survives Deleted.
     [[nodiscard]] uint32_t nextNsId() const noexcept { return nextNsId_; }
-    /// Namespaces that exist: excludes Deleted, includes Deleting (and `default`).
+    /// Namespaces that exist: excludes erased ones, includes DELETING ones (and `default`); they count toward limits.
     [[nodiscard]] std::size_t liveCount() const noexcept { return byId_.size(); }
     /// In nsId order.
     template <class F> void forEach(F&& f) const { for (const auto& [id, rec] : byId_) f(rec); }
@@ -116,17 +133,31 @@ public:
         auto it = reg_.byId_.find(rec.nsId);
         if (it != reg_.byId_.end()) {
             if (rec.version < it->second.version) return false;
-            if (it->second.name != rec.name) reg_.byName_.erase(it->second.name);
+            if (it->second.name != rec.name) dropName(it->second.name, rec.nsId);
             it->second = rec;
         } else {
             reg_.byId_.emplace(rec.nsId, rec);
         }
-        reg_.byName_.insert_or_assign(rec.name, rec.nsId);
+        if (std::holds_alternative<NsDeleting>(rec.state)) dropName(rec.name, rec.nsId);   // by id only; the name may be reused
+        else reg_.byName_.insert_or_assign(rec.name, rec.nsId);
         if (rec.nsId >= reg_.nextNsId_) reg_.nextNsId_ = rec.nsId + 1;
+        return true;
+    }
+    /// Removes `nsId` (its name too, if the name is still its).  False = it was not held.
+    bool erase(uint32_t nsId) {
+        const auto it = reg_.byId_.find(nsId);
+        if (it == reg_.byId_.end()) return false;
+        dropName(it->second.name, nsId);
+        reg_.byId_.erase(it);
         return true;
     }
 
 private:
+    /// Erases `name` from the name index only when it maps to `nsId` (a recreated namespace may own it now).
+    void dropName(const std::string& name, uint32_t nsId) {
+        const auto n = reg_.byName_.find(name);
+        if (n != reg_.byName_.end() && n->second == nsId) reg_.byName_.erase(n);
+    }
     NamespaceRegistry reg_;
 };
 

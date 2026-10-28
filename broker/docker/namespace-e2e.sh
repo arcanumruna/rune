@@ -6,15 +6,28 @@
 #   3. the cluster admin creates user `a/admin` and grants it ADMIN ON NAMESPACE a (QL);
 #   4. `a/admin` (session namespace a: bare names) creates user alice, topic t and READ + WRITE on t for alice;
 #   5. alice (RUNE_USER=a/alice) produces N=1000 records to t and consumes them all (rune_produce_subscribe, ws mode,
-#      a plain subscription: group and transactional requests outside `default` are refused until Phase 2);
+#      a plain subscription; groups and transactions work in every namespace);
 #   6. a `default` user (granted READ on every topic prefix "") cannot see `t`: `show topic t;` answers exactly like
 #      `show topic <never created>;` (same exit status, same text modulo the name);
 #   7. `rune namespace list` as a/admin shows exactly `a`;
 #   8. the __catalog leader is killed; once a new one serves, steps 5-7 repeat (on a survivor seed);
 #   9. the whole cluster is stopped and started again (volumes kept); steps 5-7 repeat;
-#  10. `rune namespace limits a --set max-topics=1`, and a read-back shows max-topics 1.  The limit is STORED only:
-#      enforcement is Phase 2, so nothing here asserts a refusal.
+#  10. `rune namespace limits a --set max-topics=1`: the read-back shows it AND a topic create over it is refused with
+#      NamespaceLimitExceeded (52); the limit is then raised (Phase 2: limits are enforced);
+#  11. `rune namespace suspend a --read-only`: alice's produce is refused, a plain consume is served; resume; produce served;
+#  12. `rune namespace suspend a --reject-all`: a live session of a is closed, a login with the right password gets
+#      NamespaceSuspended and with a wrong one AuthenticationFailed; resume; the login works again;
+#  13. `produce-bytes-per-sec` over the limit: alice's client is told Throttled, backs off and every record still lands;
+#  14. the whole cluster is restarted (volumes kept): the max-topics limit and a ReadOnly suspend still hold;
+#  15. `rune namespace delete a --yes` with data of every kind that this script writes (topic records, a consumer group's
+#      committed offsets, users); the erase is awaited through `rune namespace list`; `a` is created again and is EMPTY
+#      (no topic, no user, no old id), and a/alice cannot log in;
+#  16. the whole cluster is restarted once more: the recreated `a` is still empty and the deleted id is still gone.
 #   then print NAMESPACE-E2E: OK and tear down.
+#
+# Not exercised here (covered by the in-process Phase 2 tests, which drive the same code on real brokers): views and
+# transactions as delete data (NamespaceDeleteRegression, NamespaceReaperRegression, TxnAbortOnSuspendRegression) and the
+# 336-cell lifecycle matrix.  The VM run of THIS script is pending (it needs the shared Linux test VM).
 #
 # Client: the rune_produce_subscribe example logs in as the qualified name (RUNE_USER=a/alice) and takes the topic by
 # its client table entry t:0:1 (t is the first and only topic of the fresh cluster, so its id is 0).  Because the
@@ -141,22 +154,27 @@ catalog_leader() {
 # ---- the alice client (rune_produce_subscribe, RUNE_MODE=ws, a plain subscription) --------------------------------------
 EGRESS_N=0
 WS_RC=0; WS_OUT=""
-# ws_run <tag> <seed node 1-3> <user> <password-file> : foreground; sets WS_RC and WS_OUT.
-ws_run() {
-    local tag="$1" seed="$2" user="$3" pw="$4"
+# ws_run_ex <tag> <seed node 1-3> <user> <password-file> <role> <records> [VAR=value ...] : foreground; sets WS_RC and
+# WS_OUT.  role = both | produce | consume; extra VAR=value pairs are passed to the client's environment.
+ws_run_ex() {
+    local tag="$1" seed="$2" user="$3" pw="$4" role="$5" n="$6"; shift 6
+    local extra=() kv
+    for kv in "$@"; do extra+=(-e "${kv}"); done
     EGRESS_N=$(( EGRESS_N + 1 ))
     set +e
-    docker exec -e RUNE_MODE=ws -e RUNE_WS_ROLE=both -e "RUNE_USER=${user}" -e "RUNE_PASSWORD_FILE=${pw}" \
+    docker exec -e RUNE_MODE=ws -e "RUNE_WS_ROLE=${role}" -e "RUNE_USER=${user}" -e "RUNE_PASSWORD_FILE=${pw}" \
         -e "RUNE_TARGET=aeron:udp?endpoint=rune-${seed}:${BROKER_PORT}" \
         -e "RUNE_EGRESS=aeron:udp?endpoint=${TOOLS}:$(( EGRESS_BASE + EGRESS_N ))" \
         -e "RUNE_DATA_DIR=/tmp/ws-${tag}" -e "RUNE_CLIENT_TOPIC_TABLE=${TOPIC_TABLE}" -e RUNE_TIMEOUT_MS=20000 \
-        -e RUNE_PRODUCE_TOPIC=t -e RUNE_CONSUME_TOPIC=t -e "RUNE_PRODUCE_N=${RECORDS}" -e RUNE_QUIET=1 \
+        -e RUNE_PRODUCE_TOPIC=t -e RUNE_CONSUME_TOPIC=t -e "RUNE_PRODUCE_N=${n}" -e RUNE_QUIET=1 "${extra[@]}" \
         "${TOOLS}" timeout "${CLIENT_RUN_S}" /build/build/rune_produce_subscribe \
         > "${WORK_DIR}/${tag}.out" 2> "${WORK_DIR}/${tag}.err"
     WS_RC=$?
     set -e
     WS_OUT="$(cat "${WORK_DIR}/${tag}.out" "${WORK_DIR}/${tag}.err" 2>/dev/null)"
 }
+# ws_run <tag> <seed node 1-3> <user> <password-file> : the step-5 run (produce and consume ${RECORDS}).
+ws_run() { ws_run_ex "$1" "$2" "$3" "$4" both "${RECORDS}"; }
 
 # checks <label> <seed node> : steps 5, 6 and 7.
 checks() {
@@ -273,6 +291,7 @@ log "step 4: a/admin creates alice, topic t and READ + WRITE on t..."
       printf "topic t partitions 1 replicas 3;\n"
       printf "GRANT READ ON TOPIC t TO USER alice;\n"
       printf "GRANT WRITE ON TOPIC t TO USER alice;\n"
+      printf "GRANT READ ON GROUP g TO USER alice;\n"   # step 15's consumer group (default deny: a join needs READ on it)
   } > "${WORK_DIR}/step4.rql" )
 ql_as a/admin /work/aadmin.pw -f /work/step4.rql --broker "rune-3:${BROKER_PORT}" || fail "step 4: a/admin's script failed"
 rm -f "${WORK_DIR}/step4.rql"
@@ -305,23 +324,203 @@ wait_until "${NEWLEADER_WAIT_S}" "a new __catalog leader" new_leader_elected \
 checks "after-leader-kill" "${survivor}"
 
 # ---------------------------------------------------------------------------
+# restart_cluster <label> : stop and start all three nodes (volumes kept) and wait for the admin to be served again.
+# ---------------------------------------------------------------------------
+admin_answers() { ql_as admin /work/admin.pw -e "show users;" --broker "rune-1:${BROKER_PORT}"; }
+restart_cluster() {
+    local label="$1"
+    log "${label}: stopping and starting all three nodes (volumes kept)..."
+    dc stop >/dev/null 2>&1 || fail "${label}: dc stop failed"
+    dc start >/dev/null 2>&1 || fail "${label}: dc start failed"
+    wait_until "${SERVING_WAIT_S}" "the admin answering after the restart" admin_answers \
+        || { for n in 1 2 3; do docker logs --tail 40 "$(cname "${n}")" >&2 || true; done; fail "${label}: the cluster does not serve within ${SERVING_WAIT_S}s of the restart"; }
+}
+
+# ns_row <name> : the `rune namespace list` row of <name>'s ACTIVE or suspended entry ("<nsId> <name> <state>"), or empty.
+ns_row() {
+    ns_as admin /work/admin.pw list --broker "rune-1:${BROKER_PORT}" | awk -v n="$1" 'NR > 1 && $2 == n && $3 != "deleting" {print $1, $2, $3}' | head -1
+}
+# ns_listed <nsId> : succeeds while the id is still listed (in any state, DELETING included).
+ns_listed() {
+    ns_as admin /work/admin.pw list --broker "rune-1:${BROKER_PORT}" | awk -v id="$1" 'NR > 1 && $1 == id {f = 1} END {exit f ? 0 : 1}'
+}
+# expect_refusal <label> <needle> <command...> : the command must FAIL and its output (stdout + stderr) must name <needle>.
+expect_refusal() {
+    local label="$1" needle="$2" out rc; shift 2
+    set +e
+    out=$("$@" 2>&1); rc=$?
+    set -e
+    [ "${rc}" -ne 0 ] || { echo "${out}" >&2; fail "${label}: succeeded (want a refusal naming ${needle})"; }
+    echo "${out}" | grep -q "${needle}" || { echo "${out}" >&2; fail "${label}: refused, but not with ${needle}"; }
+}
+a_admin_topic() { ql_as a/admin /work/aadmin.pw -e "topic $1 partitions 1 replicas 3;" --broker "rune-3:${BROKER_PORT}"; }
+
+# ---------------------------------------------------------------------------
 # Step 9: stop and start the whole cluster (volumes kept), repeat 5-7.
 # ---------------------------------------------------------------------------
-log "step 9: stopping and starting all three nodes (volumes kept)..."
-dc stop >/dev/null 2>&1 || fail "step 9: dc stop failed"
-dc start >/dev/null 2>&1 || fail "step 9: dc start failed"
-admin_answers() { ql_as admin /work/admin.pw -e "show users;" --broker "rune-1:${BROKER_PORT}"; }
-wait_until "${SERVING_WAIT_S}" "the admin answering after the restart" admin_answers \
-    || { for n in 1 2 3; do docker logs --tail 40 "$(cname "${n}")" >&2 || true; done; fail "step 9: the cluster does not serve within ${SERVING_WAIT_S}s of the restart"; }
+restart_cluster "step 9"
 checks "after-restart" 1
 
 # ---------------------------------------------------------------------------
-# Step 10: limits are stored (enforcement is Phase 2) and read back.
+# Step 10: limits are ENFORCED.  max-topics=1 with t existing: a second topic is refused with NamespaceLimitExceeded (52).
 # ---------------------------------------------------------------------------
-log "step 10: rune namespace limits a --set max-topics=1, read back..."
+log "step 10: rune namespace limits a --set max-topics=1: stored, read back, and enforced..."
 ns_as admin /work/admin.pw limits a --set max-topics=1 --broker "rune-1:${BROKER_PORT}" || fail "step 10: limits --set failed"
 lim=$(ns_as admin /work/admin.pw limits a --broker "rune-1:${BROKER_PORT}") || fail "step 10: limits read-back failed"
 echo "${lim}" | grep -qE '^max-topics +1$' || { echo "${lim}" >&2; fail "step 10: the read-back does not show max-topics 1"; }
-log "step 10 OK: max-topics=1 stored (not enforced until Phase 2)"
+expect_refusal "step 10: a second topic over max-topics=1" "NamespaceLimitExceeded" a_admin_topic t2
+usage=$(ns_as admin /work/admin.pw usage a --broker "rune-1:${BROKER_PORT}") || fail "step 10: rune namespace usage a failed"
+echo "${usage}" | grep -qE '^max-topics +1 +1' || { echo "${usage}" >&2; fail "step 10: usage does not show max-topics value 1 with usage 1"; }
+log "step 10 OK: max-topics=1 refused a second topic (usage 1 of 1); the limit stays for the restart check of step 14"
+
+# ---------------------------------------------------------------------------
+# Step 11: suspend a ReadOnly: produce refused, fetch served; resume: produce served.
+# ---------------------------------------------------------------------------
+log "step 11: rune namespace suspend a --read-only..."
+ns_as admin /work/admin.pw suspend a --read-only --broker "rune-1:${BROKER_PORT}" || fail "step 11: suspend --read-only failed"
+ws_run_ex "ro-produce" 2 a/alice /work/alice.pw produce 5
+if [ "${WS_RC}" -eq 0 ] && echo "${WS_OUT}" | grep -q "WS-PRODUCER: acked=5 failed=0"; then
+    echo "${WS_OUT}" | tail -20 >&2; fail "step 11: alice's produce was served in a ReadOnly namespace"
+fi
+# Not just "any failure": the client output must name the suspension (NamespaceSuspended, code 51).
+echo "${WS_OUT}" | grep -qE 'NamespaceSuspended|errorCode=51|\(51\)' \
+    || { echo "${WS_OUT}" | tail -20 >&2; fail "step 11: alice's refused produce does not report NamespaceSuspended (51)"; }
+ws_run_ex "ro-consume" 2 a/alice /work/alice.pw consume 0 "RUNE_CONSUME_EXPECT=${RECORDS}"
+[ "${WS_RC}" -eq 0 ] || { echo "${WS_OUT}" | tail -20 >&2; fail "step 11: alice's fetch was not served in a ReadOnly namespace (exit ${WS_RC})"; }
+ns_as admin /work/admin.pw resume a --broker "rune-1:${BROKER_PORT}" || fail "step 11: resume failed"
+ws_run_ex "ro-resumed" 2 a/alice /work/alice.pw produce "${RECORDS}"
+[ "${WS_RC}" -eq 0 ] && echo "${WS_OUT}" | grep -q "WS-PRODUCER: acked=${RECORDS} failed=0" \
+    || { echo "${WS_OUT}" | tail -20 >&2; fail "step 11: produce is not served after resume"; }
+log "step 11 OK"
+
+# ---------------------------------------------------------------------------
+# Step 12: suspend a RejectAll: a live session is closed, logins get NamespaceSuspended (right password) or
+# AuthenticationFailed (wrong one); resume: the login works.
+# ---------------------------------------------------------------------------
+log "step 12: rune namespace suspend a --reject-all..."
+( set +e   # the client must exit non-zero here (RejectAll ends its session): record that status, never abort on it
+  docker exec -e RUNE_MODE=ws -e RUNE_WS_ROLE=produce -e RUNE_USER=a/alice -e RUNE_PASSWORD_FILE=/work/alice.pw \
+      -e "RUNE_TARGET=aeron:udp?endpoint=rune-1:${BROKER_PORT}" -e "RUNE_EGRESS=aeron:udp?endpoint=${TOOLS}:$(( EGRESS_BASE + 90 ))" \
+      -e RUNE_DATA_DIR=/tmp/ws-live -e "RUNE_CLIENT_TOPIC_TABLE=${TOPIC_TABLE}" -e RUNE_TIMEOUT_MS=20000 \
+      -e RUNE_PRODUCE_TOPIC=t -e RUNE_PRODUCE_N=0 -e RUNE_PRODUCE_INTERVAL_US=20000 -e RUNE_STOP_FILE=/work/never-exists -e RUNE_QUIET=1 \
+      "${TOOLS}" timeout 150 /build/build/rune_produce_subscribe > "${WORK_DIR}/live.out" 2> "${WORK_DIR}/live.err"; echo $? > "${WORK_DIR}/live.rc" ) &
+live_pid=$!
+wait_until 60 "alice's live producer running" grep -q 'WS: READY' "${WORK_DIR}/live.out" || fail "step 12: the live producer never became ready"
+ns_as admin /work/admin.pw suspend a --reject-all --broker "rune-1:${BROKER_PORT}" || fail "step 12: suspend --reject-all failed"
+live_ended() { [ -s "${WORK_DIR}/live.rc" ]; }
+wait_until 90 "alice's live session to be closed" live_ended || {
+    # Which phase hangs: the client's own lines (DONE = the produce loop ended, CLOSED = close() returned) and its threads.
+    echo "--- live.out:" >&2; cat "${WORK_DIR}/live.out" >&2 || true
+    echo "--- live.err (tail):" >&2; tail -20 "${WORK_DIR}/live.err" >&2 || true
+    echo "--- client threads:" >&2
+    docker exec "${TOOLS}" sh -c 'for p in $(pgrep -f rune_produce_subscribe); do for t in /proc/$p/task/*; do echo "$t $(cat $t/comm) $(cat $t/wchan) $(cut -d" " -f3 $t/stat)"; done; done' >&2 || true
+    kill "${live_pid}" 2>/dev/null || true
+    fail "step 12: the live session of a was not closed by RejectAll"
+}
+[ "$(cat "${WORK_DIR}/live.rc")" != "0" ] || fail "step 12: the live producer ended cleanly; RejectAll must end its session with an error"
+wait "${live_pid}" 2>/dev/null || true
+expect_refusal "step 12: alice's login (right password) to a RejectAll namespace" "NamespaceSuspended" \
+    ql_as a/alice /work/alice.pw -e "show grants for user alice;" --broker "rune-2:${BROKER_PORT}"
+( umask 077; printf 'not the password' > "${WORK_DIR}/wrong.pw" )   # the client refuses a password file others can read
+expect_refusal "step 12: a wrong password to a RejectAll namespace" "AuthenticationFailed" \
+    ql_as a/alice /work/wrong.pw -e "show grants for user alice;" --broker "rune-2:${BROKER_PORT}"
+ns_as admin /work/admin.pw resume a --broker "rune-1:${BROKER_PORT}" || fail "step 12: resume failed"
+ws_run_ex "ra-resumed" 2 a/alice /work/alice.pw produce 1
+[ "${WS_RC}" -eq 0 ] && echo "${WS_OUT}" | grep -q "WS-PRODUCER: acked=1 failed=0" \
+    || { echo "${WS_OUT}" | tail -20 >&2; fail "step 12: alice cannot log in and produce after resume (exit ${WS_RC})"; }
+log "step 12 OK"
+
+# ---------------------------------------------------------------------------
+# Step 13: a produce rate over the limit is Throttled; the client backs off and every record lands.
+# ---------------------------------------------------------------------------
+log "step 13: produce-bytes-per-sec=20000: alice is throttled, backs off, and succeeds..."
+ns_as admin /work/admin.pw limits a --set produce-bytes-per-sec=20000 --broker "rune-1:${BROKER_PORT}" || fail "step 13: limits --set failed"
+# The control run: the same 3000 records with no rate limit (limit 0 = unlimited).  Neither the example client nor the broker
+# exposes a Throttled counter to this script (the client backs off silently; the broker's count is a test seam only), so the
+# throttle is proven by contrast with this control, not by a bare "took >= 2".
+ns_as admin /work/admin.pw limits a --set produce-bytes-per-sec=0 --broker "rune-1:${BROKER_PORT}" || fail "step 13: clearing the rate failed"
+t0=${SECONDS}
+ws_run_ex "unthrottled" 1 a/alice /work/alice.pw produce 3000
+base=$(( SECONDS - t0 ))
+[ "${WS_RC}" -eq 0 ] && echo "${WS_OUT}" | grep -q "WS-PRODUCER: acked=3000 failed=0" \
+    || { echo "${WS_OUT}" | tail -20 >&2; fail "step 13: the unthrottled control run did not get every record acked (exit ${WS_RC})"; }
+ns_as admin /work/admin.pw limits a --set produce-bytes-per-sec=20000 --broker "rune-1:${BROKER_PORT}" || fail "step 13: limits --set failed"
+t0=${SECONDS}
+ws_run_ex "throttled" 1 a/alice /work/alice.pw produce 3000
+took=$(( SECONDS - t0 ))
+[ "${WS_RC}" -eq 0 ] && echo "${WS_OUT}" | grep -q "WS-PRODUCER: acked=3000 failed=0" \
+    || { echo "${WS_OUT}" | tail -20 >&2; fail "step 13: the throttled client did not get every record acked (exit ${WS_RC})"; }
+[ "${took}" -ge 2 ] && [ "${took}" -ge $(( base * 2 )) ] && [ "${took}" -gt "${base}" ] \
+    || fail "step 13: 3000 records at 20000 B/s took ${took}s against ${base}s unthrottled; the throttle never made the client wait"
+# A failed record would hide a refused (not retried) Throttled: the throttled run must also report no failure at all.
+echo "${WS_OUT}" | grep -q "failed=0" || fail "step 13: the throttled run reports failed records"
+ns_as admin /work/admin.pw limits a --set produce-bytes-per-sec=0 --broker "rune-1:${BROKER_PORT}" || fail "step 13: clearing the rate failed"
+log "step 13 OK (${took}s throttled, ${base}s unthrottled)"
+
+# ---------------------------------------------------------------------------
+# Step 14: restart the cluster: the max-topics limit and a ReadOnly suspend survive.
+# ---------------------------------------------------------------------------
+log "step 14: suspend a read-only, restart every broker, the limit and the gate still hold..."
+ns_as admin /work/admin.pw suspend a --read-only --broker "rune-1:${BROKER_PORT}" || fail "step 14: suspend --read-only failed"
+restart_cluster "step 14"
+row=$(ns_row a); echo "${row}" | grep -q 'suspended-read-only' || { echo "${row}" >&2; fail "step 14: after the restart a is not suspended-read-only"; }
+ws_run_ex "ro-restart" 1 a/alice /work/alice.pw produce 5
+if [ "${WS_RC}" -eq 0 ] && echo "${WS_OUT}" | grep -q "WS-PRODUCER: acked=5 failed=0"; then
+    echo "${WS_OUT}" | tail -20 >&2; fail "step 14: a ReadOnly namespace served a produce after the restart"
+fi
+echo "${WS_OUT}" | grep -qE 'NamespaceSuspended|errorCode=51|\(51\)' \
+    || { echo "${WS_OUT}" | tail -20 >&2; fail "step 14: the refused produce after the restart does not report NamespaceSuspended (51)"; }
+ns_as admin /work/admin.pw resume a --broker "rune-1:${BROKER_PORT}" || fail "step 14: resume failed"
+expect_refusal "step 14: a second topic over max-topics=1 after the restart" "NamespaceLimitExceeded" a_admin_topic t2
+log "step 14 OK"
+
+# ---------------------------------------------------------------------------
+# Step 15: delete a (topic records, committed group offsets, users), wait for the erase, create it again: empty.
+# ---------------------------------------------------------------------------
+log "step 15: a consumer group commits offsets on t; then rune namespace delete a --yes..."
+ws_run_ex "group" 1 a/alice /work/alice.pw consume 0 RUNE_GROUP_ID=g "RUNE_CONSUME_EXPECT=${RECORDS}"
+[ "${WS_RC}" -eq 0 ] || { echo "${WS_OUT}" | tail -20 >&2; fail "step 15: the group consumer failed (exit ${WS_RC})"; }
+old_row=$(ns_row a); old_id=$(echo "${old_row}" | awk '{print $1}')
+[ -n "${old_id}" ] || fail "step 15: no nsId for a"
+ns_as admin /work/admin.pw delete a --yes --broker "rune-1:${BROKER_PORT}" || fail "step 15: delete a failed"
+still_listed() { ns_listed "${old_id}"; }
+gone() { ! still_listed; }
+wait_until "${SERVING_WAIT_S}" "the deleted namespace ${old_id} to leave the listing" gone || fail "step 15: ns ${old_id} is still listed ${SERVING_WAIT_S}s after the delete"
+# The data is gone from every node's volume: no ns-<old_id> directory (nor ns-<old_id>.deleting) is left.
+ns_dir_gone() {
+    local n out
+    for n in 1 2 3; do
+        out=$(docker exec "$(cname "${n}")" find /var/lib/rune -maxdepth 3 \( -name "ns-${old_id}" -o -name "ns-${old_id}.deleting" \) 2>&1) || return 1
+        [ -z "${out}" ] || return 1
+    done
+}
+wait_until "${SERVING_WAIT_S}" "ns-${old_id} to vanish from every node's data volume" ns_dir_gone \
+    || { for n in 1 2 3; do docker exec "$(cname "${n}")" find /var/lib/rune -maxdepth 3 -name "ns-${old_id}*" >&2 || true; done; fail "step 15: ns-${old_id} is still on a node's data volume"; }
+expect_refusal "step 15: a/alice logging in to the deleted namespace" "AuthenticationFailed" \
+    ql_as a/alice /work/alice.pw -e "show grants for user alice;" --broker "rune-2:${BROKER_PORT}"
+ns_as admin /work/admin.pw create a --broker "rune-1:${BROKER_PORT}" || fail "step 15: creating a again failed"
+new_row=$(ns_row a); new_id=$(echo "${new_row}" | awk '{print $1}')
+[ -n "${new_id}" ] && [ "${new_id}" != "${old_id}" ] || fail "step 15: the re-created a has id '${new_id}' (old ${old_id}): ids are never reused"
+echo "${new_row}" | grep -q 'active' || fail "step 15: the re-created a is not active: ${new_row}"
+# rune schema get prints "unknown topic '<name>'" only for UnknownTopic (7); any other code prints "broker error code N".
+expect_refusal "step 15: the old topic a/t in the re-created namespace" "unknown topic 'a/t'" \
+    txt "${OP_TIMEOUT_S}" rune schema get a/t --user admin --password-file /work/admin.pw --broker "rune-1:${BROKER_PORT}"
+expect_refusal "step 15: the old user a/alice in the re-created namespace" "AuthenticationFailed" \
+    ql_as a/alice /work/alice.pw -e "show grants for user alice;" --broker "rune-3:${BROKER_PORT}"
+lim2=$(ns_as admin /work/admin.pw limits a --broker "rune-1:${BROKER_PORT}") || fail "step 15: limits of the re-created a"
+echo "${lim2}" | grep -qE '^max-topics +1$' && fail "step 15: the re-created a inherited max-topics=1 of the old namespace"
+log "step 15 OK: ${old_id} erased, a re-created as ${new_id}, empty"
+
+# ---------------------------------------------------------------------------
+# Step 16: restart once more: the recreated a is still empty and the deleted id is still gone.
+# ---------------------------------------------------------------------------
+restart_cluster "step 16"
+gone || fail "step 16: the deleted namespace ${old_id} is listed again after the restart"
+row=$(ns_row a); [ "$(echo "${row}" | awk '{print $1}')" = "${new_id}" ] || { echo "${row}" >&2; fail "step 16: after the restart a is not ${new_id}"; }
+expect_refusal "step 16: the old topic a/t after the restart" "unknown topic 'a/t'" \
+    txt "${OP_TIMEOUT_S}" rune schema get a/t --user admin --password-file /work/admin.pw --broker "rune-2:${BROKER_PORT}"
+expect_refusal "step 16: the old user a/alice after the restart" "AuthenticationFailed" \
+    ql_as a/alice /work/alice.pw -e "show grants for user alice;" --broker "rune-3:${BROKER_PORT}"
+log "step 16 OK"
 
 echo "NAMESPACE-E2E: OK"

@@ -48,10 +48,12 @@
 //   lookup — transparent comparators (std::less<>) on the coordinator map.
 // ---------------------------------------------------------------------------
 
+#include <optional>
 #include <spdlog/spdlog.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 #include <rune/transaction/TransactionCoordinator.h>
 #include <rune/transaction/Types.h>
+#include <rune/node/NamespaceReapTypes.h>
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/protocol/client/TxnMessages.h>
@@ -180,15 +182,35 @@ public:
     // Never throws.  Never allocates from heap in steady state.
     // -----------------------------------------------------------------------
     size_t handleInitProducerId (const uint8_t* buf, size_t len,
-                                  int64_t nowNs, uint8_t* out, size_t outCap) override;
+                                  int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
     size_t handleAddPartitions  (const uint8_t* buf, size_t len,
-                                  int64_t nowNs, uint8_t* out, size_t outCap) override;
+                                  int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
     size_t handleAddOffsets     (const uint8_t* buf, size_t len,
-                                  int64_t nowNs, uint8_t* out, size_t outCap) override;
+                                  int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
     size_t handleTxnOffsetCommit(const uint8_t* buf, size_t len,
-                                  int64_t nowNs, uint8_t* out, size_t outCap) override;
+                                  int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
     size_t handleEndTxn         (const uint8_t* buf, size_t len,
-                                  int64_t nowNs, uint8_t* out, size_t outCap) override;
+                                  int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
+
+    /// Namespaces Phase 2 Task 4 (ITxnRequestHandler): abort every Ongoing transaction a revoked session opened / of a
+    /// suspended or deleted namespace.  0 when this node is not the loaded coordinator.
+    uint32_t abortAllForSession(int64_t sessionId, int64_t nowNs) override;
+    uint32_t abortAllForNamespace(uint32_t nsId, int64_t nowNs) override;
+    void setNamespaceTxnLimits(uint32_t nsId, uint64_t maxOpenTxns, uint64_t maxTxnTimeMs) override {
+        coordinator_.setNamespaceTxnLimits(nsId, maxOpenTxns, maxTxnTimeMs);
+    }
+    /// Namespaces Phase 2 Task 7 (the reaper, via the control thread): one batch of tombstones of namespace `nsId`'s
+    /// transaction state.  Refused while this node is not the loaded coordinator, or a transaction of the namespace is
+    /// still open or ending (its completion would persist a record after the tombstone).  More = a batch was written, or
+    /// the tombstones are not yet committed; Done = none left and all committed.
+    ReapStatus tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs);
+    /// Read-only test seam: the live transactional ids of `nsId` in this node's store; 0 when the store is not loaded here.
+    [[nodiscard]] std::optional<std::size_t> liveKeysOfNamespaceForTest(uint32_t nsId) const;   ///< nullopt = unknown (not loaded / not the coordinator)
 
     /// A control marker this node could not append.  NEVER counts as landed: a
     /// retriable refusal (NotLeader, MinIsrViolation, Internal, ...) is re-dispatched
@@ -369,6 +391,7 @@ private:
         int64_t              sessionId  = 0;
         uint16_t             templateId = 0;
         std::vector<uint8_t> request;
+        rune::coordination::NsRequestContext ctx;   ///< Phase 2 Task 5: the parked request's namespace context
     };
     static constexpr std::size_t kMaxParkedNextTxn = 1024;
     /// The replay's answer buffer: the gateway's txn scratch size (ClientGateway::kScratchSize, 68 KiB).
@@ -379,7 +402,11 @@ private:
     std::vector<uint8_t>       replayOut_;          ///< kReplayOutBytes, allocated on the first park
     bool                       nextTxnReplayDue_ = false;   ///< a transaction completed since the last replay
     /// True when the request was parked (the handler then returns 0: deferred).
-    bool parkNextTxn_(const uint8_t* buf, size_t len, rune::protocol::client::TemplateId tid, int64_t nowNs);
+    bool parkNextTxn_(const uint8_t* buf, size_t len, rune::protocol::client::TemplateId tid, int64_t nowNs,
+                      const rune::coordination::NsRequestContext& ctx);
+    [[nodiscard]] static std::string_view idView_(std::span<const uint8_t> b) noexcept {
+        return std::string_view(reinterpret_cast<const char*>(b.data()), b.size());
+    }
     int  replayNextTxn_(int64_t nowNs);
     /// The offset of the last record appended per transactional id (cleared on load: the loaded log is committed);
     /// kUnpersisted when the id's last put was refused.  No entry: the id's state is the loaded (committed) one.
@@ -387,8 +414,10 @@ private:
     /// #112: producer id → its transactional id (a cache for verifyTxnPartition; every hit
     /// is re-validated against the coordinator, cleared on load and when it outgrows the map).
     std::unordered_map<int64_t, rune::transaction::TransactionalId> pidIndex_;
-    /// #112 review: topic id -> name; false = the registry does not know the id (refuse retriably).
-    bool topicNameOf_(int32_t topicId, std::string& out);
+    /// #112 review: topic id -> name in namespace `nsId`.  Unknown = the registry does not know the id (refuse
+    /// retriably); Foreign (Review U2) = the topic belongs to another namespace (UnknownTopic, non-retriable).
+    enum class TopicLookup : uint8_t { Ok, Unknown, Foreign };
+    TopicLookup topicNameOf_(uint32_t nsId, int32_t topicId, std::string& out);
     int64_t requestPutOffset_  = -1;      ///< the newest record the current request appended
     bool    requestPutRefused_ = false;   ///< the current request's append was refused (min-ISR)
     AnswerSinkFn answerSink_    = nullptr;
@@ -410,11 +439,16 @@ private:
     bool gateOpen_(PrepareGate& g);
     int  processPrepareGates_();
     void dropDeferred_();   ///< unload: every parked answer / gated EndTxn answered NotCoordinator
-    size_t handleInitProducerId_ (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
-    size_t handleAddPartitions_  (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
-    size_t handleAddOffsets_     (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
-    size_t handleTxnOffsetCommit_(const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
-    size_t handleEndTxn_         (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
+    size_t handleInitProducerId_ (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx);
+    size_t handleAddPartitions_  (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx);
+    size_t handleAddOffsets_     (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx);
+    size_t handleTxnOffsetCommit_(const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx);
+    size_t handleEndTxn_         (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx);
 
     // ----- #438: a consumer-group (group, tp) is held by at most one unfinished transaction -----
     // From the TxnOffsetCommit that adds it until the holder's Complete* record is COMMITTED on __transaction_state.
@@ -553,6 +587,8 @@ private:
                           const std::vector<rune::transaction::TopicPartition>& parts);
     void resolveMarker_(int64_t producerId);
     [[nodiscard]] int concurrentIfPreparing_(int err) const;
+    /// Task 10 (D24): NamespaceLimitExceeded (52) is for a v14+ session; an older one is answered InvalidRequest (39).
+    [[nodiscard]] int16_t nsLimitForClient_(int16_t code, int64_t sessionId) const;
 
     // F15 §5.1 — coordinator load state machine (control thread only).
     enum class LoadState : uint8_t { Unloaded, Loaded };

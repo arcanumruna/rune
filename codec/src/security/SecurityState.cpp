@@ -116,6 +116,12 @@ std::string_view refusalName(Refusal r) noexcept {
     return "?";
 }
 
+bool grantNamesNamespace(const GrantSpec& g, std::string_view nsName) noexcept {
+    const std::string_view n = g.resource.name;
+    if (g.resource.type == ResourceType::Namespace && n == nsName) return true;
+    return n.size() > nsName.size() && n.starts_with(nsName) && n[nsName.size()] == '/';
+}
+
 bool validName(std::string_view n) noexcept {
     if (n.empty() || n.size() > 128 || n.starts_with("__")) return false;
     for (char c : n) {

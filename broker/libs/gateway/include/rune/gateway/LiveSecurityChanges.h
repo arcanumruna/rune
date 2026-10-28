@@ -28,8 +28,9 @@ struct LiveActions {
     bool endSecurityReads = false;              ///< lost ADMIN ON CLUSTER while holding `__security` reads
     bool endGroups        = false;              ///< lost a group READ grant: the gateway removes the members whose group is no longer readable
     bool endGroupTopics   = false;              ///< lost a topic READ grant: the gateway removes the members subscribed to a topic no longer readable
+    bool endTxns          = false;              ///< lost a WRITE grant on a transactional id or topic: the session's open transactions abort (Task 4)
     [[nodiscard]] bool empty() const noexcept {
-        return ends.empty() && !endCatalogReads && !endSecurityReads && !endGroups && !endGroupTopics;
+        return ends.empty() && !endCatalogReads && !endSecurityReads && !endGroups && !endGroupTopics && !endTxns;
     }
 };
 
