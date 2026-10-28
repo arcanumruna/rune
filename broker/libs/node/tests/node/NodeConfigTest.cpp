@@ -1986,10 +1986,10 @@ TEST(NodeConfigRegression, UnknownRuntimePlacementIsParseError) {
     EXPECT_NE(r.error.find("RUNE_RUNTIME_PLACEMENT"), std::string::npos);
 }
 
-TEST(NodeConfigRegression, PeerEntryWithSevenPortsRejected) {
-    // 6 segments are valid since 2026-10-02 (6th = egressControlBasePort).
+TEST(NodeConfigRegression, PeerEntryWithNinePortsRejected) {
+    // 6 segments are valid since 2026-10-02 (6th = egressControlBasePort); 7th / 8th = response-control ports.
     auto env = base3node();
-    env["RUNE_PEERS"] = "0@h:1:2:3:4:5:6:7,1@h:11,2@h:12";
+    env["RUNE_PEERS"] = "0@h:1:2:3:4:5:6:7:8:9,1@h:11,2@h:12";
     auto r = parseNodeConfig(fakeEnv(env));
     EXPECT_FALSE(r.config.has_value());
 }
@@ -3215,6 +3215,106 @@ TEST(NodeConfigRegression, AnonymousCapsRegression) {
             EXPECT_FALSE(res.config.has_value()) << name << "=" << bad;
             EXPECT_NE(res.error.find(name), std::string::npos) << res.error;
         }
+}
+
+// --- NAT-safe egress: response-control ports (spec 2026-10-26 D3) ---
+TEST(ResponseControlConfigRegression, ParsesEightPeerSegmentsRegression) {
+    auto env = shard3node();
+    env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:40600:40500:40400:40470:40463,"
+                        "1@127.0.0.1:40111:40201:40221:40620:40520:40420:40480,"
+                        "2@127.0.0.1:40112:40202:40222:40640:40540";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->peers[0].responseControlBasePort, 40470);
+    EXPECT_EQ(r.config->peers[0].gatewayResponseControlPort, 40463);
+    EXPECT_EQ(r.config->peers[1].responseControlBasePort, 40480);
+    EXPECT_EQ(r.config->peers[1].gatewayResponseControlPort, 0);
+    EXPECT_EQ(r.config->peers[2].responseControlBasePort, 0);
+    env["RUNE_PEERS"] = "0@h:1:2:3:4:5:6:7:8:9,1@h:11,2@h:12";
+    auto bad = parseNodeConfig(fakeEnv(env));
+    ASSERT_FALSE(bad.config.has_value());
+    EXPECT_NE(bad.error.find("max 8"), std::string::npos) << bad.error;
+}
+
+TEST(ResponseControlConfigRegression, OldSixSegmentPeersStillParseRegression) {
+    auto r = parseNodeConfig(fakeEnv(shard3node()));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    for (const auto& p : r.config->peers) {
+        EXPECT_EQ(p.responseControlBasePort, 0);
+        EXPECT_EQ(p.gatewayResponseControlPort, 0);
+    }
+    EXPECT_FALSE(r.config->responseControlBasePort.has_value());
+    EXPECT_FALSE(r.config->gatewayResponseControlPort.has_value());
+}
+
+TEST(ResponseControlConfigRegression, EnvParsesAndRejectsGarbageRegression) {
+    auto env = shard3node();
+    env["RUNE_RESPONSE_CONTROL_BASE_PORT"]    = "40700";
+    env["RUNE_GATEWAY_RESPONSE_CONTROL_PORT"] = "40699";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->responseControlBasePort, std::optional<int32_t>{40700});
+    EXPECT_EQ(r.config->gatewayResponseControlPort, std::optional<int32_t>{40699});
+    EXPECT_FALSE(r.config->validateShardConfig().has_value());
+    for (const char* name : {"RUNE_RESPONSE_CONTROL_BASE_PORT", "RUNE_GATEWAY_RESPONSE_CONTROL_PORT"}) {
+        auto bad = shard3node();
+        bad[name] = "notaport";
+        auto res = parseNodeConfig(fakeEnv(bad));
+        EXPECT_FALSE(res.config.has_value()) << name;
+        EXPECT_NE(res.error.find(name), std::string::npos) << res.error;
+    }
+}
+
+TEST(ResponseControlConfigRegression, CollisionWithIngressIsRefusedRegression) {
+    auto env = shard3node();
+    env["RUNE_RESPONSE_CONTROL_BASE_PORT"] = "40500";   // == worker 0 ingress
+    auto e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("workerIngress"), std::string::npos) << *e;
+    EXPECT_NE(e->find("workerResponseControl"), std::string::npos) << *e;
+    env = shard3node();
+    env["RUNE_GATEWAY_RESPONSE_CONTROL_PORT"] = "40200";   // == self client port
+    e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("gatewayResponseControl"), std::string::npos) << *e;
+    EXPECT_NE(e->find("clientPort"), std::string::npos) << *e;
+    env = shard3node();
+    env["RUNE_GATEWAY_RESPONSE_CONTROL_PORT"] = "0";
+    e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("RUNE_GATEWAY_RESPONSE_CONTROL_PORT"), std::string::npos) << *e;
+}
+
+TEST(ResponseControlConfigRegression, CoLocatedPeerCollisionIsRefusedRegression) {
+    auto env = shard3node(0);
+    env["RUNE_RESPONSE_CONTROL_BASE_PORT"] = "40700";
+    env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:40600:40500,"
+                        "1@127.0.0.1:40111:40201:40221:40620:40520:40420:40700,"   // peer's response base == ours
+                        "2@127.0.0.1:40112:40202:40222:40640:40540";
+    auto e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("co-located peer 1"), std::string::npos) << *e;
+    EXPECT_NE(e->find("workerResponseControl"), std::string::npos) << *e;
+}
+
+TEST(ResponseControlConfigRegression, SelfAdvertisedDisagreementIsRefusedRegression) {
+    auto env = shard3node(0);
+    env["RUNE_RESPONSE_CONTROL_BASE_PORT"]    = "40700";
+    env["RUNE_GATEWAY_RESPONSE_CONTROL_PORT"] = "40699";
+    env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:40600:40500:40400:40710:40699,"
+                        "1@127.0.0.1:40111:40201:40221:40620:40520,"
+                        "2@127.0.0.1:40112:40202:40222:40640:40540";
+    auto e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("RUNE_RESPONSE_CONTROL_BASE_PORT"), std::string::npos) << *e;
+    EXPECT_NE(e->find("7th"), std::string::npos) << *e;
+    env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:40600:40500:40400:40700:40698,"
+                        "1@127.0.0.1:40111:40201:40221:40620:40520,"
+                        "2@127.0.0.1:40112:40202:40222:40640:40540";
+    e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("RUNE_GATEWAY_RESPONSE_CONTROL_PORT"), std::string::npos) << *e;
+    EXPECT_NE(e->find("8th"), std::string::npos) << *e;
 }
 
 } // namespace rune::node

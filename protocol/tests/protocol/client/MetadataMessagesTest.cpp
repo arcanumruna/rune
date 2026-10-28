@@ -614,12 +614,18 @@ TEST(MetadataMessagesReceiverIdRegression, AReceiverTrailerCountThatDoesNotParal
         rpc::detail::putLE16(b.data(), static_cast<int>(countAt), bad);
         EXPECT_FALSE(rpc::MetadataResponse::decode(b.data(), b.size()).has_value()) << "count " << bad;
     }
-    auto longer = buf;
+    // v16 adds the response-port trailer after the receiver trailer, so bytes after a well-formed receiver trailer are
+    // parsed as that trailer; the "later additive trailer is ignored" rule now applies after the port trailer.
+    auto q0 = p0; q0.responseControlPort = 9;
+    auto q1 = p1; q1.responseControlPort = 8;
+    auto longer = encodeRespFor(rpc::kClientVersionResponseEgress, {q0, q1});
     for (uint8_t x : {uint8_t{0xAA}, uint8_t{0xBB}, uint8_t{0xCC}}) longer.push_back(x);
     const auto dec = rpc::MetadataResponse::decode(longer.data(), longer.size());
     ASSERT_TRUE(dec.has_value()) << "a later additive trailer must be ignored";
     EXPECT_EQ(dec->partitions[0].ingressReceiverId, 1);
     EXPECT_EQ(dec->partitions[1].ingressReceiverId, 255);
+    EXPECT_EQ(dec->partitions[0].responseControlPort, 9);
+    EXPECT_EQ(dec->partitions[1].responseControlPort, 8);
 }
 
 // ===========================================================================

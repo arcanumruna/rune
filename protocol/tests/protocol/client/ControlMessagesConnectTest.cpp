@@ -46,8 +46,9 @@ TEST(ConnectRequestCodec, RoundTripRealistic) {
     req.clientVersion  = 42;
     req.egressChannel  = channel;
 
-    // Total: 24 (header) + 8 (fixed) + 2 (var len) + channel.size()
-    const std::size_t expectedTotal = 24 + 8 + 2 + channel.size();
+    // Total: 24 (header) + 8 (fixed) + 2 (var len) + channel.size(); clientVersion 42 >= 16 adds the always-present
+    // empty crypto block (2+4+2) and the responseCorrelated byte (1).
+    const std::size_t expectedTotal = 24 + 8 + 2 + channel.size() + 9;
 
     std::array<uint8_t, 256> buf{};
     const std::size_t written = req.encode(buf.data());
@@ -497,7 +498,8 @@ TEST(ConnectRequestCodec, IntBoundaryValuesFixedFields) {
         req.clientVersion  = tc.clientVersion;
         req.egressChannel  = "x";   // 1-byte channel so we have a var field
 
-        constexpr std::size_t kExpected = 24u + 8u + 2u + 1u;
+        // A session >= 16 adds the empty crypto block (8 bytes) and the responseCorrelated byte.
+        const std::size_t kExpected = 24u + 8u + 2u + 1u + (tc.clientVersion >= rpc::kClientVersionResponseEgress ? 9u : 0u);
         std::array<uint8_t, 64> buf{};
         const std::size_t written = req.encode(buf.data());
         ASSERT_EQ(written, kExpected);
@@ -1024,7 +1026,8 @@ TEST(ConnectRequestResponseEgressRegression, TruncationNeverMisparsesRegression)
     const std::size_t full = buf.size();
     for (std::size_t cut = 34 + req.egressChannel.size(); cut < full; ++cut) {
         const auto out = rpc::ConnectRequest::decode(buf.data(), cut);
-        if (cut == full - 1) {
+        if (cut == 34 + req.egressChannel.size() || cut == full - 1) {
+            // No crypto block at all (a v4-style frame), or the flag byte missing: both decode with the flag false.
             ASSERT_TRUE(out.has_value());
             EXPECT_FALSE(out->responseCorrelated);
         } else {

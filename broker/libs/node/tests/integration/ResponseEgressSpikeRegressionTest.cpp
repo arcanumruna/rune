@@ -1,25 +1,26 @@
 // ResponseEgressSpikeRegressionTest.cpp — SPIKE (reference + guard) that de-risks NAT-safe egress via Aeron
 // response channels (control-mode=response), against the exact Aeron version this repo links (1.51.0).
 //
-// Mechanic:
-//   server : request subscription  aeron:udp?endpoint=<S_REQ>                       (stream 3001)
-//   client : response subscription aeron:udp?control-mode=response|control=<S_RSP>  (stream 3002)
-//   client : request publication   aeron:udp?endpoint=<S_REQ>|response-correlation-id=<rsp sub registrationId>
+// Mechanic (exact channel strings, as built by aeron::ChannelUriStringBuilder):
+//   server : request subscription  aeron:udp?endpoint=127.0.0.1:<S_REQ>                          (stream 3001)
+//   client : response subscription aeron:udp?control-mode=response|control=127.0.0.1:<S_RSP>      (stream 3002)
+//   client : request publication   aeron:udp?endpoint=127.0.0.1:<S_REQ>|response-correlation-id=<rsp sub registrationId>
 //   server : per request image, EXCLUSIVE response publication
-//            aeron:udp?control-mode=response|control=<S_RSP>|response-correlation-id=<image->correlationId()>
+//            aeron:udp?control-mode=response|control=127.0.0.1:<S_RSP>|response-correlation-id=<image->correlationId()>
 //
 // Findings (each guarded by a test below):
-//   * OneControlPortServesManyClients: N response publications share ONE response-control port (<S_RSP>); each
-//     reaches only its correlated client (no cross-delivery, in order, no loss).
-//   * ReplyFollowsTheObservedSource: the reply goes to the address the request was OBSERVED from (the
-//     request image's source), not to a configured client address — the request source port differs from
-//     the response subscription's, and the reply still arrives.
+//   * OneControlPortServesManyClients: N exclusive response publications share ONE response-control port
+//     (<S_RSP>); each reaches only its correlated client (no cross-delivery, in order, no loss).
+//   * ReplyFollowsTheResponseFlow: the reply goes to the address the client's response-subscription flow
+//     comes from, never to a declared address and not to the request flow's source port (the request
+//     publication and the response subscription are different client sockets; Aeron 1.51 has no `bind`).
 //   * ClientGoneEndsTheResponsePublication: when the client vanishes the response publication goes
-//     not-connected on its own and releasing it frees its driver resources (no per-client leak).
-//   * Response publications can be EXCLUSIVE publications in 1.51 (addExclusivePublication works).
+//     not-connected after Aeron's publication connection timeout and releasing it frees its counters.
 //
-// CONCLUSION: N response publications share ONE response-control port; each reaches only its correlated
-// client, replies follow the observed request source (NAT-safe), and a vanished client self-cleans.
+// CONCLUSION: N exclusive response publications share ONE response-control port; each reaches only its
+// correlated client; replies follow the client's response-subscription flow (no bind/declared address); a
+// vanished client's publication goes not-connected after Aeron's publication connection timeout and frees
+// its counters.
 //
 // Wall time: test 3 waits for Aeron's publication connection timeout (the driver clock is not injectable
 // through EmbeddedDriver); that wait is bounded by a steady_clock deadline AND an iteration cap.
@@ -27,9 +28,11 @@
 #include <rune/node/EmbeddedDriver.h>
 
 #include <Aeron.h>
+#include <ChannelUriStringBuilder.h>
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -101,11 +104,9 @@ std::string respSubChannel(const std::string& rspCtl) {
     return aeron::ChannelUriStringBuilder().media("udp").controlMode(aeron::CONTROL_MODE_RESPONSE)
         .controlEndpoint(rspCtl).build();
 }
-std::string reqPubChannel(const std::string& reqEp, int64_t rspSubRegId, const std::string& bind = {}) {
-    std::string c = aeron::ChannelUriStringBuilder().media("udp").endpoint(reqEp)
+std::string reqPubChannel(const std::string& reqEp, int64_t rspSubRegId) {
+    return aeron::ChannelUriStringBuilder().media("udp").endpoint(reqEp)
         .responseCorrelationId(rspSubRegId).build();
-    if (!bind.empty()) c += "|bind=" + bind;
-    return c;
 }
 std::string rspPubChannel(const std::string& rspCtl, int64_t imageCorrelationId) {
     return aeron::ChannelUriStringBuilder().media("udp").controlMode(aeron::CONTROL_MODE_RESPONSE)
@@ -202,6 +203,7 @@ TEST(ResponseEgressSpikeRegression, OneControlPortServesManyClientsRegression) {
         ASSERT_TRUE(p) << "response publication never resolved for session " << session;
         pubBySession[session] = p;
     }
+    std::printf("TMPSTR %s\nTMPSTR %s\nTMPSTR %s\nTMPSTR %s\n", ("aeron:udp?endpoint=" + reqEp).c_str(), respSubChannel(rspCtl).c_str(), reqPubChannel(reqEp, 123).c_str(), rspPubChannel(rspCtl, 456).c_str());
     ASSERT_EQ(pubBySession.size(), static_cast<size_t>(N));
     ASSERT_TRUE(pumpUntil([&] {
         for (auto& [s, p] : pubBySession) if (!p->isConnected()) return false;
@@ -264,10 +266,9 @@ TEST(ResponseEgressSpikeRegression, OneControlPortServesManyClientsRegression) {
     reqSub.reset();
 }
 
-TEST(ResponseEgressSpikeRegression, ReplyFollowsTheObservedSourceRegression) {
+TEST(ResponseEgressSpikeRegression, ReplyFollowsTheResponseFlowRegression) {
     const std::string reqEp = ep(rune::aeronutil::testing::allocFreeUdpPort());
     const std::string rspCtl = ep(rune::aeronutil::testing::allocFreeUdpPort());
-    const uint16_t bindPort = rune::aeronutil::testing::allocFreeUdpPort();
 
     Node server;
     Client client;
@@ -284,7 +285,7 @@ TEST(ResponseEgressSpikeRegression, ReplyFollowsTheObservedSourceRegression) {
     client.rsp = resolveOnce(pumpAll, [&] { return client.node.aeron->findSubscription(rid); });
     ASSERT_TRUE(client.rsp);
     int64_t pid = client.node.aeron->addPublication(
-        reqPubChannel(reqEp, client.rsp->registrationId(), ep(bindPort)), kReqStream);
+        reqPubChannel(reqEp, client.rsp->registrationId()), kReqStream);
     client.req = resolveOnce(pumpAll, [&] { return client.node.aeron->findPublication(pid); });
     ASSERT_TRUE(client.req);
 
@@ -292,14 +293,22 @@ TEST(ResponseEgressSpikeRegression, ReplyFollowsTheObservedSourceRegression) {
     auto image = reqSub->imageByIndex(0);
     ASSERT_TRUE(image);
     const std::string src = image->sourceIdentity();
-    const std::string suffix = ":" + std::to_string(bindPort);
-    ASSERT_TRUE(src.size() >= suffix.size() && src.compare(src.size() - suffix.size(), suffix.size(), suffix) == 0)
-        << "sourceIdentity=" << src << " expected suffix " << suffix;
+    auto portOf = [](const std::string& hp) { return hp.substr(hp.rfind(':') + 1); };
+    const std::string reqSrcPort = portOf(src);
 
     int64_t pubId = server.aeron->addExclusivePublication(rspPubChannel(rspCtl, image->correlationId()), kRspStream);
     auto rspPub = resolveOnce(pumpAll, [&] { return server.aeron->findExclusivePublication(pubId); });
     ASSERT_TRUE(rspPub);
     ASSERT_TRUE(pumpUntil([&] { return rspPub->isConnected() && client.rsp->isConnected() && client.req->isConnected(); }));
+
+    // The reply goes to the address the client's response-subscription flow comes from — never to a declared
+    // address, and not to the request flow's source port: they are different client sockets.
+    std::vector<std::string> addrs;
+    ASSERT_TRUE(pumpUntil([&] { addrs = client.rsp->localSocketAddresses(); return !addrs.empty(); }))
+        << "response subscription reports no local socket address";
+    ASSERT_EQ(addrs.size(), 1u) << "addrs[0]=" << addrs[0];
+    ASSERT_NE(portOf(addrs[0]), reqSrcPort)
+        << "response flow " << addrs[0] << " vs request source " << src;
 
     uint8_t buf[8] = {};
     aeron::concurrent::AtomicBuffer ab(buf, sizeof(buf));

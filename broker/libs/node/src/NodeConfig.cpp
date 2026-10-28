@@ -87,7 +87,7 @@ static bool parsePort(std::string_view sv, uint16_t& out) {
 }
 
 /// Parse one peer entry of the form
-///   "id@host:consensusPort[:clientPort[:replPort[:replBasePort[:ingressBasePort[:egressControlBasePort]]]]]".
+///   "id@host:consensusPort[:clientPort[:replPort[:replBasePort[:ingressBasePort[:egressControlBasePort[:responseControlBasePort[:gatewayResponseControlPort]]]]]]]".
 /// Optional segments (backward-compatible; absent → 0):
 ///   - "1@host:40111"                         → consensusPort=40111
 ///   - "1@host:40111:40200"                   → + clientPort=40200
@@ -96,7 +96,9 @@ static bool parsePort(std::string_view sv, uint16_t& out) {
 ///     (self-contained worker shards, spec §3.3: worker w uses base + w)
 ///   - 6th segment: egressControlBasePort (per-worker dynamic-MDC egress control,
 ///     advertised to clients for partitions the peer leads; 2026-10-02).
-/// More than 6 port segments is an error.
+///   - 7th / 8th segments: responseControlBasePort / gatewayResponseControlPort (NAT-safe
+///     response-control ports; 0 / absent = not advertised, derived in shard mode).
+/// More than 8 port segments is an error.
 /// Returns an error string on failure or an empty string on success.
 static std::string parsePeer(std::string_view entry, PeerConfig& out) {
     auto at = entry.find('@');
@@ -115,21 +117,21 @@ static std::string parsePeer(std::string_view entry, PeerConfig& out) {
         return std::string("peer host is empty in entry: ") + std::string(entry);
 
     // consensusPort[:clientPort[:replicationPort[:replBasePort[:ingressBasePort]]]]
-    static constexpr const char* kNames[6] = {
+    static constexpr const char* kNames[8] = {
         "consensusPort", "clientPort", "replicationPort", "replBasePort", "ingressBasePort",
-        "egressControlBasePort"};
-    std::array<std::string_view, 6> parts{};
+        "egressControlBasePort", "responseControlBasePort", "gatewayResponseControlPort"};
+    std::array<std::string_view, 8> parts{};
     std::size_t n = 0;
     std::string_view rem = trim(hostPort.substr(firstColon + 1));
     for (;;) {
         if (n == parts.size())
-            return std::string("too many ':' port segments (max 6) in peer entry: ") + std::string(entry);
+            return std::string("too many ':' port segments (max 8) in peer entry: ") + std::string(entry);
         const auto c = rem.find(':');
         parts[n++] = trim(c == std::string_view::npos ? rem : rem.substr(0, c));
         if (c == std::string_view::npos) break;
         rem = rem.substr(c + 1);
     }
-    std::array<uint16_t, 6> ports{};
+    std::array<uint16_t, 8> ports{};
     for (std::size_t i = 0; i < n; ++i) {
         if (!parsePort(parts[i], ports[i]))
             return std::string("peer ") + kNames[i] + " is invalid or out of range in entry: " +
@@ -143,6 +145,8 @@ static std::string parsePeer(std::string_view entry, PeerConfig& out) {
     out.replBasePort    = ports[3];
     out.ingressBasePort = ports[4];
     out.egressControlBasePort = ports[5];
+    out.responseControlBasePort    = ports[6];
+    out.gatewayResponseControlPort = ports[7];
     return {};
 }
 
@@ -537,6 +541,12 @@ std::optional<std::string> NodeConfig::validateShardConfig() const {
     if (auto e = checkBase(workerIngressBasePort, "RUNE_WORKER_INGRESS_BASE_PORT")) return e;
     if (auto e = checkBase(workerReplBasePort, "RUNE_WORKER_REPL_BASE_PORT")) return e;
     if (auto e = checkBase(workerEgressControlBasePort, "RUNE_WORKER_EGRESS_CONTROL_BASE_PORT")) return e;
+    if (responseControlBasePort && (*responseControlBasePort < 1 || *responseControlBasePort + W - 1 > 65535))
+        return "RUNE_RESPONSE_CONTROL_BASE_PORT must be in [1, " + std::to_string(65536 - W) + "], got " +
+               std::to_string(*responseControlBasePort);
+    if (gatewayResponseControlPort && (*gatewayResponseControlPort < 1 || *gatewayResponseControlPort > 65535))
+        return "RUNE_GATEWAY_RESPONSE_CONTROL_PORT must be in [1, 65535], got " +
+               std::to_string(*gatewayResponseControlPort);
     const int32_t ingressBase = *workerIngressBasePort;
     const int32_t replBase    = *workerReplBasePort;
     const int32_t egressBase  = effectiveWorkerEgressControlBasePort();
@@ -566,6 +576,17 @@ std::optional<std::string> NodeConfig::validateShardConfig() const {
                " disagrees with self RUNE_PEERS egressControlBasePort=" + std::to_string(me.egressControlBasePort) +
                " (peers advertise it to clients; an unadvertised base is the DERIVED one — advertise it as the "
                "6th RUNE_PEERS segment)";
+    if (me.responseControlBasePort != 0 && responseControlBasePort &&
+        me.responseControlBasePort != *responseControlBasePort)
+        return "RUNE_RESPONSE_CONTROL_BASE_PORT=" + std::to_string(*responseControlBasePort) +
+               " disagrees with self RUNE_PEERS responseControlBasePort=" + std::to_string(me.responseControlBasePort) +
+               " (peers advertise it to clients; advertise it as the 7th RUNE_PEERS segment)";
+    if (me.gatewayResponseControlPort != 0 && gatewayResponseControlPort &&
+        me.gatewayResponseControlPort != *gatewayResponseControlPort)
+        return "RUNE_GATEWAY_RESPONSE_CONTROL_PORT=" + std::to_string(*gatewayResponseControlPort) +
+               " disagrees with self RUNE_PEERS gatewayResponseControlPort=" +
+               std::to_string(me.gatewayResponseControlPort) +
+               " (peers advertise it to clients; advertise it as the 8th RUNE_PEERS segment)";
 
     struct Bind { int32_t port; std::string what; };
     std::vector<Bind> binds;
@@ -577,7 +598,9 @@ std::optional<std::string> NodeConfig::validateShardConfig() const {
         binds.push_back({ingressBase + w, "workerIngress" + tag});
         binds.push_back({replBase + w, "workerRepl" + tag});
         binds.push_back({egressBase + w, "workerEgressControl" + tag});
+        if (responseControlBasePort) binds.push_back({*responseControlBasePort + w, "workerResponseControl" + tag});
     }
+    if (gatewayResponseControlPort) binds.push_back({*gatewayResponseControlPort, "gatewayResponseControl"});
     for (std::size_t i = 0; i < binds.size(); ++i)
         for (std::size_t j = i + 1; j < binds.size(); ++j)
             if (binds[i].port == binds[j].port)
@@ -589,7 +612,10 @@ std::optional<std::string> NodeConfig::validateShardConfig() const {
         std::vector<Bind> theirs{{p.consensusPort, "consensusPort"}};
         if (p.clientPort != 0)      theirs.push_back({p.clientPort, "clientPort"});
         if (p.replicationPort != 0) theirs.push_back({p.replicationPort, "replicationPort"});
+        if (p.gatewayResponseControlPort != 0) theirs.push_back({p.gatewayResponseControlPort, "gatewayResponseControl"});
         for (int32_t w = 0; w < W; ++w) {
+            if (p.responseControlBasePort != 0)
+                theirs.push_back({p.responseControlBasePort + w, "workerResponseControl[w" + std::to_string(w) + "]"});
             theirs.push_back({p.ingressBasePort + w, "workerIngress[w" + std::to_string(w) + "]"});
             theirs.push_back({p.replBasePort + w, "workerRepl[w" + std::to_string(w) + "]"});
             // Review A-M6: the peer's egress-control ports collide too (found only as a bind failure before).
@@ -818,6 +844,20 @@ ConfigResult parseNodeConfig(
             if (!parseInt32(rawEgPort, port))
                 return {{}, std::string("RUNE_WORKER_EGRESS_CONTROL_BASE_PORT is not a valid integer: ") + rawEgPort};
             cfg.workerEgressControlBasePort = port;
+        }
+        const char* rawRcPort = getenv_fn("RUNE_RESPONSE_CONTROL_BASE_PORT");
+        if (rawRcPort && !std::string_view(rawRcPort).empty()) {
+            int32_t port{};
+            if (!parseInt32(rawRcPort, port))
+                return {{}, std::string("RUNE_RESPONSE_CONTROL_BASE_PORT is not a valid integer: ") + rawRcPort};
+            cfg.responseControlBasePort = port;
+        }
+        const char* rawGwRcPort = getenv_fn("RUNE_GATEWAY_RESPONSE_CONTROL_PORT");
+        if (rawGwRcPort && !std::string_view(rawGwRcPort).empty()) {
+            int32_t port{};
+            if (!parseInt32(rawGwRcPort, port))
+                return {{}, std::string("RUNE_GATEWAY_RESPONSE_CONTROL_PORT is not a valid integer: ") + rawGwRcPort};
+            cfg.gatewayResponseControlPort = port;
         }
         const char* rawEgStream = getenv_fn("RUNE_WORKER_EGRESS_BASE_STREAM");
         if (rawEgStream && !std::string_view(rawEgStream).empty()) {
