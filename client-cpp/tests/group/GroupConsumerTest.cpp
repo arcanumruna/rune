@@ -93,6 +93,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -3990,4 +3991,100 @@ TEST_F(GroupConsumerHubRegression, CtlIdNeverReusesALiveConsumersIdRegression) {
         EXPECT_NE(y.ctlId, o->ctlId) << "Y reuses a live consumer's control id";
     }
     hub_.reset();   // before the locals die: the hub holds raw pointers to them
+}
+
+// C18 adversarial review (#660): the wrapped counter lands on a live consumer's id while BOTH have a Join in flight;
+// the answer to B's Join must reach B only (the router matches by ctlId + seq, GroupConsumerHub onJoinGroupResponse).
+TEST_F(GroupConsumerHubRegression, AWrappedCtlIdNeverRoutesAJoinAnswerToTheWrongConsumerAdversarialRegression) {
+    std::array<GroupConsumerImpl, 2> impl;
+    GroupConsumerHub                 hub;
+    CaptureSink                      sink;
+    for (int i = 0; i < 2; ++i) {
+        impl[i].groupId  = i == 0 ? "grp-a" : "grp-b";
+        impl[i].topicIds = {kTopicId + i};
+        impl[i].cfg.sessionTimeoutMs = 30000;
+        impl[i].cfg.autoCommit       = false;
+        impl[i].active = true;
+        impl[i].state  = GroupConsumerState::Unjoined;
+    }
+    hub.add(&impl[0]);
+    ASSERT_EQ(impl[0].ctlId, 1u);
+    hub.testSetNextCtlId(0xFFFFFFu);   // next candidates: 0 (skipped), then 1 = A's id
+    hub.add(&impl[1]);
+    ASSERT_NE(impl[1].ctlId, 0u);
+    EXPECT_NE(impl[1].ctlId, impl[0].ctlId);   // EXPECT: the routing below is the point
+
+    hub.onConnected(kSessionId, sink.fn());
+    const int64_t corrA = ctlCorrOf(sink, rpc::TemplateId::JoinGroup, "grp-a");
+    const int64_t corrB = ctlCorrOf(sink, rpc::TemplateId::JoinGroup, "grp-b");
+    ASSERT_NE(corrA, 0);
+    ASSERT_NE(corrB, 0);
+    EXPECT_NE(corrA, corrB) << "two live consumers' Joins carry the same correlation id";
+
+    auto rb = makeJoinGroupResponseOK(1, "m-grp-b", corrB);
+    hub.onJoinGroupResponse(rb.data(), rb.size(), kSessionId, sink.fn());
+    EXPECT_EQ(impl[1].state, GroupConsumerState::Syncing) << "B's Join answer never reached B";
+    EXPECT_EQ(impl[0].state, GroupConsumerState::Joining) << "B's Join answer was applied to A";
+    EXPECT_NE(impl[0].memberId, "m-grp-b");
+
+    auto ra = makeJoinGroupResponseOK(1, "m-grp-a", corrA);
+    hub.onJoinGroupResponse(ra.data(), ra.size(), kSessionId, sink.fn());
+    EXPECT_EQ(impl[0].state, GroupConsumerState::Syncing);
+    EXPECT_EQ(impl[0].memberId, "m-grp-a");
+    EXPECT_EQ(impl[1].memberId, "m-grp-b");
+}
+
+// C18 adversarial review (#660): a seeded random add / release model with the counter repeatedly forced onto, next
+// to and past live ids and the 24-bit wrap: every owned consumer's ctlId stays non-zero and unique.
+TEST_F(GroupConsumerHubRegression, CtlIdsStayUniqueUnderARandomAddReleaseModelNearTheWrapAdversarialRegression) {
+    constexpr uint32_t kSeed = 0xC18660u;
+    constexpr int      kPool = 48;
+    constexpr int      kOps  = 6000;
+    std::mt19937 rng(kSeed);
+    std::vector<std::unique_ptr<GroupConsumerImpl>> pool;
+    std::vector<bool> owned(kPool, false);
+    for (int i = 0; i < kPool; ++i) {
+        pool.push_back(std::make_unique<GroupConsumerImpl>());
+        pool.back()->groupId  = "g";
+        pool.back()->topicIds = {kTopicId};
+    }
+    GroupConsumerHub hub;
+    auto pick = [&](bool wantOwned) -> int {
+        std::vector<int> c;
+        for (int i = 0; i < kPool; ++i) if (owned[i] == wantOwned) c.push_back(i);
+        return c.empty() ? -1 : c[rng() % c.size()];
+    };
+    for (int op = 0; op < kOps; ++op) {
+        const uint32_t r = rng() % 10;
+        if (r < 3) {   // force the counter: onto / just before a live id, or onto the wrap
+            const int o = pick(true);
+            if (o >= 0 && (rng() & 1u)) hub.testSetNextCtlId(pool[o]->ctlId - 1u - (rng() % 3u));
+            else                        hub.testSetNextCtlId(0xFFFFFFu - (rng() % 4u));
+        }
+        if (r < 7) {
+            const int f = pick(false);
+            if (f >= 0) {
+                pool[f]->active = true;
+                pool[f]->state  = GroupConsumerState::Unjoined;
+                hub.add(pool[f].get());
+                owned[f] = true;
+            }
+        } else {
+            const int o = pick(true);
+            if (o >= 0) {
+                pool[o]->active = false; pool[o]->leavePending = false; pool[o]->statusDirty = false;
+                ASSERT_TRUE(hub.release(pool[o].get())) << "seed=" << kSeed << " op=" << op;
+                owned[o] = false;
+            }
+        }
+        std::vector<uint32_t> ids;
+        hub.forEachOwned([&](const GroupConsumerImpl& c) { ids.push_back(c.ctlId); });
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            ASSERT_NE(ids[i], 0u) << "seed=" << kSeed << " op=" << op;
+            ASSERT_LE(ids[i], 0xFFFFFFu) << "seed=" << kSeed << " op=" << op;
+            for (std::size_t j = i + 1; j < ids.size(); ++j) {
+                ASSERT_NE(ids[i], ids[j]) << "duplicate ctlId " << ids[i] << " seed=" << kSeed << " op=" << op;
+            }
+        }
+    }
 }

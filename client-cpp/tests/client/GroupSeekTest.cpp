@@ -1105,3 +1105,171 @@ TEST(GroupSeekRegression, ASeekSupersedingSeekToCommittedFetchesTheOtherPartitio
     ASSERT_EQ(rsp->results.size(), 1u);
     EXPECT_EQ(rsp->results[0].partition, 1) << "the fetch must name p1 (p0 is positioned by the seek)";
 }
+
+// ===========================================================================
+// C18 adversarial review (#685, #684): the OffsetFetch machine across a session drop and a superseding seek,
+// attacked through the public API
+// ===========================================================================
+
+namespace {
+// Drives until the seed session is Connected again after `connectsBefore` (a reconnect), then FREEZES the duty clock
+// on that very pass: nothing paced (the 100 ms sweep) can run before the test acts.
+bool reconnectAndFreeze(GroupRig& r, int connectsBefore, int cap = 200'000) {
+    return r.drive([&] {
+        if (r.gw.connectsAt[0] > connectsBefore &&
+            r.client.testSessionStateAt(0) == rc::session::SessionState::Connected) {
+            r.opt.stepNs = 0;
+            return true;
+        }
+        return false;
+    }, cap);
+}
+} // namespace
+
+// #685 x protocol state (an answer of a dead session): seekToCommitted's OffsetFetch is in flight (held) when the
+// seed session drops; while it is down the group's committed offsets move (a transactional commit: 30 -> 44,
+// 55 -> 60).  After the reconnect the dead session's answer (30 / 55) arrives BEFORE the re-send.  It must not seed
+// anything: the partitions start from the re-sent fetch's answer (44 / 60).  RED: the answer is matched by
+// correlationId alone (offsetFetchCorrId survives resetOffsetFetch_), so it seeds 30 / 55 and records 30..43 and
+// 55..59 are re-delivered although they were committed.
+// C18 review finding (the fix round enables it): resetOffsetFetch_ must also forget offsetFetchCorrId.
+TEST(GroupSeekRegression, DISABLED_ADeadSessionsOffsetFetchAnswerNeverSeedsAfterTheReconnectAdversarialRegression) {
+    Fixture f(5725, 5726, {{kTopic, 0}, {kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000),
+              {{{kTopic, 0}, 30}, {{kTopic, 1}, 55}}, manualClockOptions());
+    f.r.gw.holdOffsetFetch = true;
+    const int fetches0 = f.r.gw.offsetFetches;
+    const rc::Token t = f.tok();
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_TRUE(f.r.drive([&] { return f.r.gw.offsetFetches > fetches0; }, 20'000));
+    ASSERT_EQ(f.r.gw.heldOffsetFetches.size(), 1u);   // encoded now: 30 / 55
+    f.r.gw.committedOffsets[{kTopic, 0}] = 44;
+    f.r.gw.committedOffsets[{kTopic, 1}] = 60;
+    const int fetchesHeld = f.r.gw.offsetFetches;
+    const int connects    = f.r.gw.connectsAt[0];
+    f.r.gw.expireSession(f.r.seedSid);
+    ASSERT_TRUE(reconnectAndFreeze(f.r, connects)) << "the seed never reconnected";
+    collect(f.r, f.done);
+    ASSERT_EQ(f.done[t].c.status, rc::OpStatus::SessionLost);
+    ASSERT_EQ(f.r.gw.offsetFetches, fetchesHeld) << "precondition: the re-send already went out";
+    ASSERT_TRUE(f.r.gw.pendingJoins.empty()) << "precondition: the member rejoins (it must stay Stable)";
+    // The dead session's answer lands first.
+    f.r.gw.holdOffsetFetch = false;
+    f.r.gw.releaseOffsetFetches();
+    (void)passesUntil(f.r, f.done, 2'000);
+    // Time moves: the re-sent fetch is answered with the current committed offsets.
+    f.r.opt.stepNs = 100'000;
+    const int64_t until = g_clockNs + 1'000'000'000LL;   // 1 s of duty time: ten sweeps
+    ASSERT_TRUE(f.r.drive([&] { return g_clockNs >= until; }, 20'000));
+    ASSERT_NE(f.r.gw.latestSubscription(kTopic, 0), nullptr);
+    ASSERT_NE(f.r.gw.latestSubscription(kTopic, 1), nullptr);
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 0)->fromOffset, 44) << "the dead session's answer seeded p0";
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 1)->fromOffset, 60) << "the dead session's answer seeded p1";
+}
+
+// #685 x sibling entry point (the eager Assign fetch, not a seek): the Assign OffsetFetch is held when the seed
+// session drops.  No rewind is in flight, so only the Client's paced sweep re-sends; it must do so right after the
+// reconnect, not after sessionTimeoutMs (30 s), and the partitions then start at the committed offsets.
+// Mutation: drop both resetOffsetFetch_ calls -> the fetch stays Awaiting for 30 s of duty time.
+TEST(GroupSeekRegression, AnAssignFetchInFlightAtASessionDropIsResentAfterTheReconnectAdversarialRegression) {
+    Fixture f(5727, 5728, {{kTopic, 0}, {kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000),
+              {{{kTopic, 0}, 30}, {{kTopic, 1}, 55}}, manualClockOptions(), /*holdFetch=*/true);
+    ASSERT_EQ(f.r.gw.heldOffsetFetches.size(), 1u);
+    ASSERT_EQ(f.r.gw.latestSubscription(kTopic, 0), nullptr);
+    const int fetchesHeld = f.r.gw.offsetFetches;
+    const int connects    = f.r.gw.connectsAt[0];
+    f.r.gw.holdOffsetFetch = false;   // the re-sent fetch is answered at once; the dead one is never released
+    f.r.gw.expireSession(f.r.seedSid);
+    ASSERT_TRUE(reconnectAndFreeze(f.r, connects)) << "the seed never reconnected";
+    ASSERT_TRUE(f.r.gw.pendingJoins.empty()) << "precondition: the member stays Stable (no rejoin)";
+    f.r.opt.stepNs = 100'000;
+    const int64_t t0 = g_clockNs;
+    constexpr int64_t kWindowNs = 500'000'000LL;   // far below sessionTimeoutMs (30 s)
+    ASSERT_TRUE(f.r.drive([&] {
+        return (f.r.gw.latestSubscription(kTopic, 0) != nullptr && f.r.gw.latestSubscription(kTopic, 1) != nullptr) ||
+               g_clockNs - t0 > kWindowNs;
+    }, 50'000));
+    EXPECT_GT(f.r.gw.offsetFetches, fetchesHeld) << "no OffsetFetch re-sent within 500 ms after the reconnect";
+    ASSERT_NE(f.r.gw.latestSubscription(kTopic, 0), nullptr) << "p0 never subscribed after the reconnect";
+    ASSERT_NE(f.r.gw.latestSubscription(kTopic, 1), nullptr) << "p1 never subscribed after the reconnect";
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 0)->fromOffset, 30);
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 1)->fromOffset, 55);
+}
+
+// #684 x resources (a storm): the seek that superseded a seekToCommitted stays in RewindResubscribe (its
+// SubscribeResponse is held) while every OffsetFetch for the offset-unknown p1 is answered UnstableOffsetCommit.
+// driveRewinds now calls retryOffsetFetchFor_ on EVERY pass in that state; with the clock frozen 20k passes must
+// still send exactly ONE fetch (the pacing).  Then the hold lifts and time moves: the seek completes Ok once at 7
+// and p1 starts at its committed 55.  Mutations: drop the Idle pacing check -> a fetch per pass; restore the
+// AwaitFetch-only condition -> no fetch at all while frozen.
+TEST(GroupSeekRegression, AResubscribingSeekNeverStormsOffsetFetchesForAHeldPartitionAdversarialRegression) {
+    Fixture f(5729, 5730, {{kTopic, 0}, {kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000),
+              {{{kTopic, 0}, 30}, {{kTopic, 1}, 55}}, manualClockOptions());
+    freeze(f.r);
+    const int fetches0 = f.r.gw.offsetFetches;
+    f.r.gw.offsetFetchErrorCode   = static_cast<int16_t>(rune::protocol::client::ErrorCode::UnstableOffsetCommit);
+    f.r.gw.offsetFetchErrorsNext  = 1'000'000;
+    f.r.gw.holdSubscribeResponses = true;
+    const rc::Token t = f.tok(), u = f.tok();
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_EQ(f.gc.seek({kTopic, 0}, 7, rc::CompletionTarget(f.r.cq), u), rc::OpResult::Accepted);
+    (void)passesUntil(f.r, f.done, 20'000);   // frozen clock
+    ASSERT_EQ(f.done[t].c.status, rc::OpStatus::Superseded);
+    EXPECT_EQ(f.r.gw.offsetFetches, fetches0 + 1)
+        << "RewindResubscribe: the duty pass sent no fetch (0) or stormed (>1) for the held partition";
+    EXPECT_EQ(f.done.count(u), 0u) << "the seek completed before its SubscribeResponse";
+    // The transaction completes and the subscribe answer arrives; duty time moves.
+    f.r.gw.offsetFetchErrorsNext = 0;
+    f.r.gw.releaseSubscribeResponses();
+    f.r.opt.stepNs = 100'000;
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, u, 40'000));
+    EXPECT_EQ(f.done[u].c.status, rc::OpStatus::Ok);
+    EXPECT_EQ(f.done[u].times, 1);
+    EXPECT_EQ(f.done[t].times, 1);
+    ASSERT_TRUE(f.r.drive([&] {
+        const auto* s = f.r.gw.latestSubscription(kTopic, 1);
+        return s != nullptr && s->fromOffset == 55;
+    }, 40'000)) << "p1 never started at its committed offset";
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 0)->fromOffset, 7) << "the seek on p0 was overridden";
+    EXPECT_LE(f.r.gw.offsetFetches, fetches0 + 4) << "paced: 100 ms doubling, then the answer";
+}
+
+// #684 x concurrency (supersede with the fetch already in flight): seekToCommitted's OffsetFetch for p0 + p1 is out
+// (held) when seek(p0, 7) supersedes it.  The superseding seek must not duplicate the in-flight fetch, and when the
+// superseded seekToCommitted's answer (30 / 55) finally lands, p1 takes 55 but p0 KEEPS the seek (7).  Each
+// completion fires exactly once.
+TEST(GroupSeekRegression, ASupersededSeekToCommittedsLateAnswerNeverMovesTheSeekAdversarialRegression) {
+    Fixture f(5731, 5732, {{kTopic, 0}, {kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000),
+              {{{kTopic, 0}, 30}, {{kTopic, 1}, 55}}, manualClockOptions());
+    freeze(f.r);
+    f.r.gw.holdOffsetFetch = true;
+    const int fetches0 = f.r.gw.offsetFetches;
+    const rc::Token t = f.tok(), u = f.tok();
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_TRUE(f.r.drive([&] { return f.r.gw.offsetFetches > fetches0; }, 2'000)) << "seekToCommitted sent no fetch";
+    ASSERT_EQ(f.r.gw.heldOffsetFetches.size(), 1u);
+    ASSERT_EQ(f.gc.seek({kTopic, 0}, 7, rc::CompletionTarget(f.r.cq), u), rc::OpResult::Accepted);
+    (void)passesUntil(f.r, f.done, 5'000);   // frozen clock
+    ASSERT_EQ(f.done[t].c.status, rc::OpStatus::Superseded);
+    EXPECT_EQ(f.r.gw.offsetFetches, fetches0 + 1) << "the superseding seek duplicated the in-flight fetch";
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, u, 5'000)) << "the seek never completed";
+    EXPECT_EQ(f.done[u].c.status, rc::OpStatus::Ok);
+    ASSERT_NE(f.r.gw.latestSubscription(kTopic, 0), nullptr);
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 0)->fromOffset, 7);
+    // The superseded fetch's answer lands.
+    f.r.gw.holdOffsetFetch = false;
+    f.r.gw.releaseOffsetFetches();
+    (void)passesUntil(f.r, f.done, 5'000);
+    f.r.opt.stepNs = 100'000;
+    const int64_t until = g_clockNs + 1'000'000'000LL;   // 1 s of duty time: any sweep runs
+    ASSERT_TRUE(f.r.drive([&] { collect(f.r, f.done); return g_clockNs >= until; }, 20'000));
+    ASSERT_NE(f.r.gw.latestSubscription(kTopic, 1), nullptr);
+    EXPECT_EQ(f.r.gw.latestSubscription(kTopic, 1)->fromOffset, 55);
+    const auto s0 = *f.r.gw.latestSubscription(kTopic, 0);
+    EXPECT_EQ(s0.fromOffset, 7) << "the superseded answer moved the seek";
+    // A moved position (30) without a resubscribe drops the records 7..29 the seek asked for.
+    f.r.gw.pushRecords(s0, 7, 5);   // 7..11
+    ASSERT_TRUE(f.consumed(0, 5)) << "the superseded answer moved p0's position: the seek's records were dropped";
+    EXPECT_EQ(f.seen.offsets[0].front(), 7);
+    EXPECT_EQ(f.done[t].times, 1);
+    EXPECT_EQ(f.done[u].times, 1);
+}

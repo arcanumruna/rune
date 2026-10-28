@@ -4212,3 +4212,42 @@ TEST(GroupRoutingRegression, ADeferredJoinWithNoLiveNewerNodeEndsBrokerTooOldNev
     EXPECT_EQ(gc.failReason(), rc::GroupFailReason::BrokerTooOld)
         << "no connected node can serve the consumer, yet it waits silently forever (deferred on a stale max)";
 }
+
+// C18 adversarial review (#651 on the duty clock, deterministic): p1's Subscribe is redirected by the seed to node 1,
+// so the route is a provisional guess and a confirming refresh is armed.  MetadataRequests are held (never answered)
+// and, with the duty clock FROZEN, ten LAGGING answers (to the connect-time request, older than the redirect) land.
+// They must neither disarm nor postpone the armed refresh: within 1 s of duty time a new MetadataRequest goes out.
+// RED (the unconditional disarm before the provisional check): each lagging answer re-arms at now + a doubled
+// backoff - ten of them push the refresh out to the 30 s cap.
+TEST(GroupRoutingRegression, FrozenClockLaggingMetadataAnswersNeverPostponeTheArmedRefreshAdversarialRegression) {
+    RigOptions o        = routingClockOptions();   // #676: fine steps while connecting
+    o.responseTimeoutNs = 60'000'000'000;          // an unanswered request never re-arms the refresh by itself
+    GroupRig r(4579, 4580, o);
+    const auto [n1, p1port] = r.addNode(4579);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4579, ""}, {1, 1, 0, 1, 4579, ""}};
+    r.gw.subscribeLeader = {{1, n1}};
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests >= 1 && !r.gw.metadataCorrIds.empty(); }, 200'000));
+    const int64_t laggingCorr = r.gw.metadataCorrIds.front();   // answered at connect; older than any redirect
+    r.gw.holdMetadata = true;
+    auto s1 = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()},
+                                 [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr && s1.active(); }, 400'000))
+        << "precondition: the redirected Subscribe never bound on node 1";
+    // Freeze, then the lagging answers.
+    r.opt.stepNs = 0;
+    for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
+    const int before = r.gw.metadataRequests;
+    for (int k = 0; k < 10; ++k) {
+        r.gw.sendMetadata(r.seedSid, laggingCorr, 0);
+        for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
+    }
+    ASSERT_EQ(r.gw.metadataRequests, before) << "precondition: a request went out while the clock stood still";
+    r.opt.stepNs = 1'000'000;   // 1 ms per pass
+    const int64_t t0 = g_routingClockNs;
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > before || g_routingClockNs - t0 >= 1'000'000'000LL; },
+                        5'000));
+    EXPECT_GT(r.gw.metadataRequests, before)
+        << "no refresh within 1 s of duty time: lagging answers postponed the armed refresh";
+}
