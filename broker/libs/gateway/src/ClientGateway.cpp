@@ -8620,7 +8620,7 @@ void ClientGateway::onNamespaceUpserted(const rune::catalog::NamespaceRecord& r)
             revokeSession_(sid, "namespace deleted");
             break;
         case NsStateTag::SuspendedReadOnly:
-            bindDenyTable_(*s);
+            (void)shipPermissions_(*s);   // binds the suspended table (the workers answer NamespaceSuspended)
             break;
         case NsStateTag::Active:
             (void)shipPermissions_(*s);   // resumed (it was ReadOnly: closed sessions are gone): its real permissions again
@@ -9507,8 +9507,18 @@ uint64_t ClientGateway::shipPermissions_(const Session& session)
     if (authMode_ != rune::gateway::GatewayAuthMode::Required || !shardMode_ || !workerPool_) return 0;
     const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth);
     if (a == nullptr) return 0;   // must-change-password / anonymous: the worker slot stays empty (deny)
-    syncPermissionTables_();   // a new table's content goes first: a bind never names a table the workers lack
     const uint64_t epoch = ++permEpoch_;
+    // Namespaces Phase 2 (D21): EVERY ship of a session whose namespace is not Active - a login while suspended, a
+    // grant change, the must-change-password transition, the suspend itself - binds no WRITE: a ReadOnly namespace's
+    // session to the suspended table (answered NamespaceSuspended), any other gate to nothing.  Resume ships the real
+    // table.  The cluster admin is exempt, as on the gateway path.
+    if (session.nsGate != rune::catalog::NsStateTag::Active && !gateExempt_(session))
+        return permissionShipper_.bind(*workerPool_, session.sessionId,
+                                       session.nsGate == rune::catalog::NsStateTag::SuspendedReadOnly
+                                           ? rune::node::PermissionShipper::kSuspendedTable
+                                           : rune::node::PermissionShipper::kDenyTable,
+                                       epoch, a->userId);
+    syncPermissionTables_();   // a new table's content goes first: a bind never names a table the workers lack
     const uint32_t id = a->perms.id();
     return permissionShipper_.bind(*workerPool_, session.sessionId,
                                    id == rune::gateway::PermissionRef::kNoId ? rune::node::PermissionShipper::kDenyTable

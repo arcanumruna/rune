@@ -812,6 +812,7 @@ public:
     [[nodiscard]] bool sessionCryptoLookupForTest(int64_t sid) noexcept { return sessionCrypto_.find(sid) != nullptr; }
     [[nodiscard]] std::size_t sessionCryptoCountForTest() const noexcept { return sessionCrypto_.size(); }
     [[nodiscard]] uint64_t workerNotAuthorizedForTest() const noexcept { return workerNotAuthorized_; }
+    [[nodiscard]] uint64_t workerSuspendedRefusalsForTest() const noexcept { return workerSuspendedRefusals_; }
     [[nodiscard]] uint64_t sessionPermissionChunksSeenForTest() const noexcept { return sessionPermissionChunksSeen_; }
     /// Issue #603 probes: the worker's copy of the "security view behind" flag, the flag ops seen, the produces refused.
     [[nodiscard]] bool securityBehindForTest() const noexcept { return securityBehind_; }
@@ -2172,6 +2173,10 @@ private:
         // (the carrier does not grow); the sink gates it per session version.
         if (ret.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::UnknownProducerId))
             a.logStartOffset = ret.baseOffset;
+        // Namespaces Phase 2 Task 14 (D28): Throttled's retry-after (ns, in lastOffset) rides logStartOffset, as on
+        // the gateway path; the sink drops it for a client below v14.
+        else if (ret.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::Throttled))
+            a.logStartOffset = ret.lastOffset;
         if (!ackSink_->enqueue(a)) [[unlikely]]
             haltInvariant_("session ack queue full (beyond its static bound)", "Task 13 G-A6 bound exceeded", 0);
         WorkerReturn n = ret;
@@ -5795,6 +5800,7 @@ private:
     PermissionStager permStager_;
     uint64_t         sessionPermissionChunksSeen_ = 0;
     uint64_t         workerNotAuthorized_ = 0;   ///< shard produces refused NotAuthorized (counted)
+    uint64_t         workerSuspendedRefusals_ = 0;   ///< shard produces refused NamespaceSuspended (ReadOnly; counted)
     uint64_t         intakeGrantHolds_    = 0;   ///< denied frames held one pass for a lifecycle op in flight
 
     // Task 19: this worker's per-session Records-egress crypto state — see
@@ -8246,6 +8252,21 @@ private:
         return 1;
     }
 
+    /// Namespaces Phase 2 (D21): the session's namespace is suspended ReadOnly (the gateway bound it to
+    /// suspendedWriteTable()): ProduceResponse{NamespaceSuspended} - InvalidRequest for a client older than 14, as the
+    /// gateway path answers - consumed, never appended.
+    [[gnu::cold]] [[gnu::noinline]] int refuseSuspended_(const rune::protocol::client::Produce& msg, uint8_t directAck) {
+        namespace pc = rune::protocol::client;
+        ++workerSuspendedRefusals_;
+        WorkerReturn ret = produceAnswer_(ProduceOrigin::WorkerIngress, msg.sessionId, msg.correlationId,
+                                          msg.topicId, msg.partition);
+        ret.directAck = directAck;
+        ret.errorCode = static_cast<int16_t>(ackSink_->clientVersionOf(msg.sessionId) >= pc::kClientVersionNamespaces
+                                                 ? pc::ErrorCode::NamespaceSuspended : pc::ErrorCode::InvalidRequest);
+        enqueueReturn_(ret);
+        return 1;
+    }
+
     /// Issue #603: answer a direct-ingress produce while the `__security` view is behind: ProduceResponse{AuthUnavailable}
     /// (consumed, never appended), counted, logged rate-limited.
     [[gnu::cold]] [[gnu::noinline]] int refuseSecurityBehind_(const rune::protocol::client::Produce& msg, uint8_t directAck) {
@@ -8426,6 +8447,7 @@ private:
                     return kIngressHeld;                             // seq NOT committed: it re-opens
                 }
                 if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (answered)
+                if (grants != nullptr && grants->table == suspendedWriteTable()) return refuseSuspended_(msg, directAck);
                 return refuseNotAuthorized_(msg, directAck);
             }
             // Issue #122: a producer id is honoured only for the principal it was issued to (its owner tag; the

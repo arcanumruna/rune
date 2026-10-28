@@ -11,7 +11,8 @@
 //   kPermFlagTable  a chunk of table `sessionId`'s full bitmap (nextOffset = first word, hwBound = total words);
 //                   staged and swapped in on the LAST chunk (a partial table is never visible);
 //   kPermFlagPatch  words [nextOffset, +n) of table `sessionId`, resized to hwBound words (a created / dropped object);
-//   kPermFlagBind   session `sessionId` now uses table `nextOffset` (-1 = deny everything); correlationId = epoch,
+//   kPermFlagBind   session `sessionId` now uses table `nextOffset` (-1 = deny everything, -2 = its namespace is
+//                   suspended ReadOnly: deny everything, answered NamespaceSuspended); correlationId = epoch,
 //                   producerId = the principal (#122);
 //   kPermFlagDrop   table `sessionId` is freed: every slot still pointing at it is reset to deny, its bits cleared.
 //   kPermFlagFence / kPermFlagSecurityBehind: no table (see below).
@@ -34,6 +35,9 @@ struct WritePermTable {
 /// The two fixed tables: nothing (default deny) and everything (dev / in-process announces).
 [[nodiscard]] inline const WritePermTable* denyWriteTable() noexcept { static const WritePermTable t{}; return &t; }
 [[nodiscard]] inline const WritePermTable* allowAllWriteTable() noexcept { static const WritePermTable t{{}, true}; return &t; }
+/// Namespaces Phase 2: denies everything like denyWriteTable(), but its address says WHY - the session's namespace is
+/// suspended ReadOnly - so the worker's cold refusal answers NamespaceSuspended instead of NotAuthorized.
+[[nodiscard]] inline const WritePermTable* suspendedWriteTable() noexcept { static const WritePermTable t{}; return &t; }
 
 struct WriteGrantSlot {
     const WritePermTable* table    = denyWriteTable();   ///< never null

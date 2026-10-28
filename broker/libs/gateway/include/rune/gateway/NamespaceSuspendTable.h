@@ -9,6 +9,9 @@
 //               HandshakeContinue, AuthClientFirst, AuthClientFinal: closing and login answer for themselves).
 //   Deleting  : behaves as RejectAll.
 // Cluster admins are exempt - the gateway applies that, not this table.
+// NamespaceDdl (81) is never gated: it is cluster-scoped and only a cluster admin may run it, and the cluster admin is
+// exempt anyway, so a gate could only turn the handler's NotAuthorized into NamespaceSuspended.  Authorization comes
+// before namespace state, as for a caller in any other namespace.
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -37,9 +40,11 @@ constexpr SuspendRow row(uint16_t tid) noexcept {
     switch (tid) {
     // session control: always allowed (closing / login handle themselves)
     case 1: case 3: case 4: case 6: case 10: case 12: case 14: return {tid, A, A};
+    // cluster-scoped, cluster-admin only: the handler's authorization answers (see the header comment)
+    case 81: return {tid, A, A};
     // writes: refused under ReadOnly too
     case 16: case 40: case 45: case 47: case 49: case 51: case 53:
-    case 64: case 68: case 70: case 74: case 75: case 76: case 77: case 79: case 80: case 81:
+    case 64: case 68: case 70: case 74: case 75: case 76: case 77: case 79: case 80:
         return {tid, R, R};
     // reads: served under ReadOnly, refused under RejectAll
     default: return {tid, A, R};

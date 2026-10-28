@@ -18,9 +18,10 @@ using rune::gateway::SuspendAction;
 const std::set<uint16_t> kResponses = {2, 5, 7, 9, 11, 13, 15, 17, 19, 20, 33, 35, 37, 39, 41, 43, 44, 46, 48,
                                        50, 52, 54, 65, 67, 69, 71, 73, 78, 83, 85};
 // D21: refused while ReadOnly.
-const std::set<uint16_t> kReadOnlyRefuses = {16, 40, 45, 47, 49, 51, 53, 64, 68, 70, 74, 75, 76, 77, 79, 80, 81};
-// D30: still allowed while RejectAll (session control).
-const std::set<uint16_t> kRejectAllAllows = {1, 3, 4, 6, 10, 12, 14};
+const std::set<uint16_t> kReadOnlyRefuses = {16, 40, 45, 47, 49, 51, 53, 64, 68, 70, 74, 75, 76, 77, 79, 80};
+// D30: still allowed while RejectAll (session control), plus NamespaceDdl (81): cluster-scoped and cluster-admin only,
+// so its handler's authorization answers a non-admin NotAuthorized in every state (plan 2026-10-26 matrix rule 3).
+const std::set<uint16_t> kRejectAllAllows = {1, 3, 4, 6, 10, 12, 14, 81};
 
 enum class Who { UserInNs, ClusterAdmin };
 

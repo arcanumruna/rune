@@ -15,6 +15,8 @@
 //   | SetLimits            | maxConnections=1, produceBytesPerSec   | 3     | per node: one session each; limit on every worker; | ThrottleOnEveryNode
 //   |                      |                                        |       | Throttled only where the partition leads           |
 //   | produce acks=all     | across suspend RO / resume             | 3     | produced = consumed = every replica's log          | AcksAllNoLossAcrossSuspendResume
+//   | produce (shard path) | RO: a login, a grant change, the suspend | 3     | every later permission ship binds the suspended   | ReadOnlyEveryPermissionShipStaysSuspended
+//   |                      | itself                                 |       | table: 51 at the worker, nothing appended         |
 #include "support/AuthRig.h"
 #include "support/AuthTrio.h"
 
@@ -520,4 +522,59 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
     std::this_thread::sleep_for(200ms);
     EXPECT_EQ(got.load(), total) << "produced != consumed";
     sub.unsubscribe();
+}
+
+// Every permission ship of a ReadOnly namespace's session binds the SUSPENDED table on the workers, not its grants: a
+// login during the suspend, a grant change during it and the suspend itself.  Before the fix only the suspend bound a
+// deny table (answered 45, not 51) and the login / grant change re-shipped the full WRITE table, so the session could
+// produce on the worker-ingress path while its namespace was read-only.
+TEST(NamespaceLifecycleTrioRegression, ReadOnlyEveryPermissionShipStaysSuspendedRegression) {
+    auto w = setupWorld("nslct_roship");
+    World& W = *w;
+    const int leader = W.leaderOf(W.tA);
+    ASSERT_GT(leader, 0);
+    const int64_t alice = W.sid("a/alice", leader);
+    const auto first = W.produce(alice, leader, W.tA, 64);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_EQ(first->errorCode, 0) << "premise: alice writes a/t while `a` is active";
+    auto logEnd = [&] {
+        return W.t.node(leader).onOwnerThreadForTest(W.tA, 0, [](rune::replication::PartitionReplica* r) {
+            return r != nullptr ? r->logEndOffset() : int64_t{-1};
+        });
+    };
+    ASSERT_EQ(W.ns(1, pc::NamespaceDdlKind::Suspend, "a", 1).code, 0);
+    // 1. the suspend itself: the existing session's next produce is refused 51 at the worker (once the bind landed).
+    ASSERT_TRUE(AuthTrio::until(30s, [&] {
+        const auto r = W.produce(alice, leader, W.tA, 64);
+        return r.has_value() && r->errorCode == kSuspended;
+    })) << "the suspend never reached the worker as NamespaceSuspended";
+    const int64_t endAtSuspend = logEnd();
+    // 2. a login while ReadOnly (allowed): its very first produce is refused 51 - its grants were never shipped.
+    const World::Login bob = W.tryLogin(leader, "a/bob");
+    ASSERT_EQ(bob.code, 0) << "ReadOnly still admits a login";
+    const auto rb = W.produce(bob.sid, leader, W.tA, 64);
+    ASSERT_TRUE(rb.has_value());
+    EXPECT_EQ(rb->errorCode, kSuspended) << "a login during ReadOnly shipped its WRITE grants to the worker";
+    // 3. a grant change while ReadOnly re-ships alice's permissions: still the suspended table.
+    {
+        using namespace grants;
+        const AuthGrant g = prefix(SO::Read, ST::Topic, "zz");
+        W.t.grant(1, "a/alice", g.op, g.type, g.kind, g.pattern);
+        ASSERT_TRUE(W.t.awaitDigestsAgree(0, 30s));
+    }
+    for (int i = 0; i < 5; ++i) {
+        const auto r = W.produce(alice, leader, W.tA, 64);
+        ASSERT_TRUE(r.has_value()) << "produce " << i;
+        EXPECT_EQ(r->errorCode, kSuspended) << "produce " << i << " after a grant change during ReadOnly";
+    }
+    EXPECT_EQ(logEnd(), endAtSuspend) << "nothing is appended while ReadOnly";
+    EXPECT_EQ(W.t.node(leader).onWorkerThreadForTest(0, [](Worker& wk) { return wk.workerNotAuthorizedForTest(); }), 0u)
+        << "a suspended session is never answered NotAuthorized by the worker";
+    // Resume ships the real tables: both write again.
+    ASSERT_EQ(W.ns(1, pc::NamespaceDdlKind::Resume, "a").code, 0);
+    for (const int64_t s : {alice, bob.sid})
+        EXPECT_TRUE(AuthTrio::until(30s, [&] {
+            const auto r = W.produce(s, leader, W.tA, 64);
+            return r.has_value() && r->errorCode == 0;
+        })) << "session " << s << " never wrote again after resume";
 }
