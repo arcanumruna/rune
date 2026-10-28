@@ -1052,6 +1052,37 @@ std::string manyStatements(int n) {   // enough text after the password for ever
 }
 } // namespace
 
+TEST(RuneConsoleOfflineRegression, FreedScanIgnoresStaleBytesOfAReusedChunkRegression) {
+    // The flake behind AScriptPasswordLiteralLeavesNoFreedCopy under --gtest_repeat: a chunk freed while the scan was off
+    // (a test-owned, unwiped copy of the script) came back to the code under test, which wrote only part of it; the
+    // stale needle in the untouched tail counted as a hit.  Only bytes written inside the window may count.
+    constexpr std::size_t kSize = 200;
+    char* stale = static_cast<char*>(::operator new(kSize));
+    std::memset(stale, 'x', kSize);
+    std::memcpy(stale + 100, kConsoleNeedle, sizeof kConsoleNeedle - 1);
+    ::operator delete(stale);   // scan off: freed unwiped, like a test temporary
+    long hits = -1;
+    char* reused = nullptr;
+    {
+        ConsoleFreedScan scan;
+        reused = static_cast<char*>(::operator new(kSize));   // the same size class: the allocator hands it back
+        std::memset(reused, 'y', 16);                          // the code under test writes only a prefix
+        const bool sameChunk = reused == stale;
+        ::operator delete(reused);
+        hits = scan.hits();
+        if (!sameChunk) GTEST_SKIP() << "the allocator did not reuse the chunk: nothing to check";
+    }
+    EXPECT_EQ(hits, 0) << "stale bytes of a reused chunk counted as an unwiped secret";
+    // The scan still sees what the window itself writes.
+    {
+        ConsoleFreedScan scan;
+        char* b = static_cast<char*>(::operator new(kSize));
+        std::memcpy(b + 50, kConsoleNeedle, sizeof kConsoleNeedle - 1);
+        ::operator delete(b);
+        EXPECT_EQ(scan.hits(), 1) << "vacuity guard: a needle written inside the window is a hit";
+    }
+}
+
 TEST(RuneConsoleOfflineRegression, AScriptPasswordLiteralLeavesNoFreedCopyAdversarialRegression) {
     // `-f -` (the documented way to pass a password literal) and `-f <file>`: the script text, its growth copies,
     // the statement texts and the parsed / prepared statements.

@@ -21,6 +21,7 @@ bool injectedFailureFiredThisThread() noexcept;
 /// C6 review (#257 / #305): freed-memory scan.  While armed on the calling thread, every block released through the
 /// replaced operator delete is searched (its whole usable size) for `needle` before it is freed;
 /// freedHitsThisThread() is how many blocks still held it - an unwiped plaintext copy.  A null needle disarms.
+/// While armed, every new block starts zeroed, so stale bytes of a reused chunk never count.
 /// `needle` must outlive the window (a string literal).
 void scanFreedForThisThread(const char* needle, std::size_t len) noexcept;
 long freedHitsThisThread() noexcept;
