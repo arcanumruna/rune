@@ -403,7 +403,7 @@ TEST(ResponseEgressSpikeRegression, ClientGoneEndsTheResponsePublicationRegressi
     ASSERT_TRUE(pumpServerUntilWall([&] { return !rspPub->isConnected(); }))
         << "step 1 timed out: response publication stayed connected after the client vanished";
 
-    // rspPub.reset();
+    rspPub.reset();
     size_t owned = 0;
     const bool freed = pumpServerUntilWall([&] { return (owned = countersOwnedBy(*server.aeron, pubRegId)) == 0; });
     EXPECT_TRUE(freed) << "step 2 timed out: " << owned << " counters still owned by closed publication " << pubRegId;
