@@ -14,10 +14,23 @@ namespace rune::cli::console {
 /// `args[0]` is "console".  Interactive input and `-f -` are read from @p in.
 int cmdConsole(const std::vector<std::string>& args, std::istream& in, std::ostream& out, std::ostream& err);
 
+/// Issue #301: the process exit status for a broker error code.  Codes 4..124 pass through unchanged; 1..3 would
+/// collide with the console's own codes (1 error, 2 usage, 3 diff) and >124 does not fit a shell status, so both map
+/// to 125 (the message on stderr names the real code).  0 is never returned.
+int consoleExitStatus(uint16_t brokerCode) noexcept;
+
+/// Issue #308: after a failed statement - the code that ends the session (the session's reject code, else
+/// SessionRevoked when the statement failed with it), or 0 when the session is still usable.
+uint16_t consoleSessionEndCode(uint16_t sessionRejectCode, uint16_t statementErrorCode) noexcept;
+
 /// A line of input; false at EOF.
 struct LineSource {
     virtual ~LineSource() = default;
     virtual bool next(std::string& line) = 0;
+
+    /// Issue #307: true when the most recent next() returned an empty placeholder for an input line that was too
+    /// long (the line was dropped); false after every other return.
+    bool lastLineDiscarded = false;
 };
 
 /// TTY input: poll(2) on `fd` every 50 ms; between polls calls idle(ctx) (pumps the Invoker client, DD9).
@@ -58,6 +71,9 @@ bool promptPasswordOnFd(int fd, const std::string& user, std::string& password, 
 /// Returns what `rune console` would exit with; `*idlePumps` (when non-null) receives the idle pump count.
 int runLiveOnFdForTest(const std::vector<std::string>& args, int fd, std::ostream& out, std::ostream& err,
                        uint64_t* idlePumps);
+
+/// Test seam (Issue #307): the interactive loop of `rune console --dry-run` over @p src.
+int runInteractiveDryRunForTest(LineSource& src, std::ostream& out, std::ostream& err);
 
 /// Test seam: the live console exactly as `rune console` runs it on the process stdin (std::cin, any fd 0: a TTY, a
 /// pipe or a file), with the Client's duty clock replaced by @p nanoClock (null: the steady clock).

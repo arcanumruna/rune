@@ -395,6 +395,20 @@ TEST(RuneConsoleBrokerRegression, CatalogReadRefusalSetsTheScriptExitCodeRegress
     EXPECT_EQ(r.rc, static_cast<int>(rune::protocol::client::ErrorCode::NotAuthorized)) << r.err;
 }
 
+TEST(RuneConsoleBrokerRegression, AwaitOwnWriteRefusalSetsTheScriptExitCodeRegression) {
+    // Issue #309: the DDL is allowed (Create on ok_*), but the read that awaits its own write is refused (no cluster
+    // Describe).  `show history` is the statement that awaits it; the broker's code must reach the exit status.
+    using namespace rune::node::test::grants;
+    AuthBroker b("console_awaitown");
+    b.bootstrapAdmin();
+    b.createUser("u", kUserPw, {prefix(SO::Create, ST::Topic, "ok_")});
+    const std::string pw = writeFile("awaitown.pw", std::string(kUserPw) + "\n");
+    const std::string f = writeFile("awaitown.rql", "topic ok_a partitions 1;\nshow history;\n");
+    const auto r = consoleLive(b, {"-f", f, "--user", "u", "--password-file", pw}, "");
+    EXPECT_EQ(r.rc, static_cast<int>(rune::protocol::client::ErrorCode::NotAuthorized)) << r.err;
+    EXPECT_NE(r.err.find("NotAuthorized"), std::string::npos) << r.err;
+}
+
 TEST(RuneConsoleBrokerRegression, SessionRevokedEndsTheConsoleRegression) {
     // Auth D26 / DD11: the admin disables the user between two input lines; the next statement fails SessionRevoked.
     using namespace rune::node::test::grants;

@@ -2810,6 +2810,27 @@ TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, std::chro
     return getTopicSchemaAndWait(name, /*requestedFingerprint=*/0, timeout);
 }
 
+std::string Client::lineageFailure(std::string_view topic, uint16_t code, std::chrono::nanoseconds timeout) {
+    const auto plain = [&](uint16_t c) {
+        return "lineage: the broker did not serve the schema lineage of '" + std::string(topic) + "' (error " +
+               std::to_string(c) + ")";
+    };
+    constexpr auto kUnknownTopic = static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownTopic);
+    if (code != kUnknownTopic) return plain(code);
+    // An old broker answers UnknownTopic for the lineage request although the topic exists: ask for the latest schema.
+    TopicSchemaResult probe;
+    try {
+        probe = getTopicSchemaAndWait(topic, /*requestedFingerprint=*/0, timeout);
+    } catch (const std::exception&) {
+        return plain(code);
+    }
+    if (probe.errorCode == 0)
+        return "lineage: this broker does not serve the schema lineage of '" + std::string(topic) +
+               "' (upgrade the broker to generate a type that reads every version)";
+    if (probe.errorCode == kUnknownTopic) return "lineage: topic '" + std::string(topic) + "' does not exist";
+    return plain(probe.errorCode);
+}
+
 TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, uint64_t requestedFingerprint,
                                                 std::chrono::nanoseconds timeout) {
     TopicSchemaResult result;
@@ -3033,6 +3054,28 @@ Client::NamespaceResult<void> Client::setNamespaceLimits(std::string_view name, 
     andWait_("setNamespaceLimits()", timeout, 0,
              [&](Completions& q, Token t) {
                  return namespaceDdl(rpc::NamespaceDdlKind::SetLimits, name, kNamespaceFullMask, full, DdlOptions{}, q, t);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("setNamespaceLimits()", c, p);
+                 r = ddlResultOf(c, p);
+                 r.requestId = requestIdOf(c);
+             });
+    if (r.errorCode != 0) return std::unexpected(std::move(r));
+    return {};
+}
+
+Client::NamespaceResult<void> Client::setNamespaceLimits(std::string_view name, const NamespaceLimitsPatch& patch,
+                                                         std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    // Issue #641: only the patch's fields go on the wire (mask = patch.present); the broker merges them onto the
+    // current record.
+    bool any = false;
+    for (const uint8_t b : patch.present) any = any || b != 0;
+    if (!any) throw std::invalid_argument("setNamespaceLimits(): the patch names no limit");
+    DdlResult r;
+    andWait_("setNamespaceLimits()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return namespaceDdl(rpc::NamespaceDdlKind::SetLimits, name, patch.present, patch.values, DdlOptions{}, q, t);
              },
              [&](const Completion& c, std::span<const uint8_t> p) {
                  if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("setNamespaceLimits()", c, p);

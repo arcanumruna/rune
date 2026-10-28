@@ -335,9 +335,11 @@ TEST(ConsolePollingSourceRegression, AnOverlongLineIsReportedAndDiscardedNotRunT
     std::string line;
     ASSERT_TRUE(src.next(line));
     EXPECT_TRUE(line.empty());
+    EXPECT_TRUE(src.lastLineDiscarded) << "Issue #307: the placeholder is flagged";
     EXPECT_NE(err.str().find("input line too long"), std::string::npos) << err.str();
     ASSERT_TRUE(src.next(line));
     EXPECT_EQ(line, "next;") << "the rest of the long line is dropped, the next line is intact";
+    EXPECT_FALSE(src.lastLineDiscarded);
     EXPECT_FALSE(src.next(line));
     writer.join();
     ::close(fds[0]);
@@ -1050,4 +1052,104 @@ TEST(RuneConsolePtyRegression, AStopAndContinueAtThePromptEchoesWhileStoppedOnly
     c.pid = -1;
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
     EXPECT_TRUE(c.echoOn());
+}
+
+// ── C8: exit codes, script parsing order, request-id overflow, over-long lines, session end ────────────────────────
+
+// Issue #23 (schema apply / alter are removed usage errors, rc 2 + "was removed"): already pinned by
+// RuneCliOfflineRegression.SchemaApplyAndAlterAreRemovedWithConsolePointer in tests/RuneCliOfflineTest.cpp.
+
+TEST(ConsoleOfflineRegression, LowBrokerCodesDoNotCollideWithLocalExitCodesRegression) {
+    using rune::cli::console::consoleExitStatus;
+    const std::pair<uint16_t, int> cases[] = {{1, 125}, {2, 125}, {3, 125}, {4, 4},     {30, 30}, {45, 45},
+                                              {46, 46}, {124, 124}, {125, 125}, {300, 125}, {0, 125}};
+    for (const auto& [code, want] : cases) EXPECT_EQ(consoleExitStatus(code), want) << "broker code " << code;
+}
+
+namespace {
+/// Runs `console` with RUNE_BROKER removed from the environment (restored afterwards).
+ConsoleRun consoleWithoutBrokerEnv(std::vector<std::string> args, const std::string& stdinText = {}) {
+    const char* old = std::getenv("RUNE_BROKER");
+    const std::string saved = old != nullptr ? old : "";
+    ::unsetenv("RUNE_BROKER");
+    auto r = console(std::move(args), stdinText);
+    if (old != nullptr) ::setenv("RUNE_BROKER", saved.c_str(), 1);
+    return r;
+}
+} // namespace
+
+TEST(ConsoleOfflineRegression, ScriptIsParsedBeforeTheBrokerIsContactedRegression) {
+    const fs::path bad = writeScript("c8_syntax.rql", "topic ;\n");
+    const auto r = consoleWithoutBrokerEnv({"-f", bad.string()});
+    EXPECT_EQ(r.rc, 1) << r.err;
+    EXPECT_NE(r.err.find("c8_syntax.rql:statement 1: "), std::string::npos) << r.err;
+    EXPECT_EQ(r.err.find("--broker"), std::string::npos) << "the syntax error is reported before any broker is needed: " << r.err;
+    for (const std::string body : {"", "-- only a comment\n"}) {
+        const fs::path empty = writeScript("c8_empty.rql", body);
+        const auto e = consoleWithoutBrokerEnv({"-f", empty.string()});
+        EXPECT_EQ(e.rc, 0) << "'" << body << "': " << e.err;
+        EXPECT_TRUE(e.err.empty()) << e.err;
+    }
+}
+
+TEST(ConsoleOfflineRegression, RequestIdLowBitsOverflowIsRefusedRegression) {
+    const std::string stmts3 = "topic a { x int32 } partitions 1 key x;\ntopic b { x int32 } partitions 1 key x;\ndrop topic c;\n";
+    const std::string stmts2 = "topic a { x int32 } partitions 1 key x;\ntopic b { x int32 } partitions 1 key x;\n";
+    const std::string base   = "0000000000000001fffffffffffffffe";
+    const auto over = console({"-f", writeScript("c8_rid3.rql", stmts3).string(), "--dry-run", "--request-id", base});
+    EXPECT_EQ(over.rc, 1) << over.out;
+    EXPECT_NE(over.err.find("would overflow"), std::string::npos) << over.err;
+    EXPECT_TRUE(over.out.empty()) << "nothing is planned or run: " << over.out;
+    const auto fits = console({"-f", writeScript("c8_rid2.rql", stmts2).string(), "--dry-run", "--request-id", base});
+    EXPECT_EQ(fits.rc, 0) << fits.err;
+    EXPECT_NE(fits.out.find("request-id 0000000000000001ffffffffffffffff\n"), std::string::npos) << fits.out;
+    // The live path refuses before any broker contact too (no --broker needed to see the refusal).
+    const auto live = consoleWithoutBrokerEnv({"-f", writeScript("c8_rid3l.rql", stmts3).string(), "--request-id", base});
+    EXPECT_EQ(live.rc, 1) << live.err;
+    EXPECT_NE(live.err.find("would overflow"), std::string::npos) << live.err;
+}
+
+namespace {
+/// A scripted LineSource: each entry is a line and whether it is the "too long" placeholder.
+struct ScriptedLines final : rune::cli::console::LineSource {
+    struct L { std::string text; bool discarded; };
+    std::vector<L> lines;
+    std::size_t at = 0;
+    bool next(std::string& line) override {
+        if (at >= lines.size()) { lastLineDiscarded = false; return false; }
+        line = lines[at].text;
+        lastLineDiscarded = lines[at].discarded;
+        ++at;
+        return true;
+    }
+};
+} // namespace
+
+TEST(ConsoleOfflineRegression, OverlongLineAbandonsTheContinuedStatementRegression) {
+    ScriptedLines src;
+    src.lines = {{"topic a", false}, {"", true}, {"partitions 1;", false}, {"topic b { x int32 } partitions 1 key x;", false}};
+    std::ostringstream out, err;
+    EXPECT_EQ(rune::cli::console::runInteractiveDryRunForTest(src, out, err), 0);
+    EXPECT_NE(err.str().find("the statement in progress was abandoned (an input line was too long)"), std::string::npos) << err.str();
+    EXPECT_EQ(count(out.str(), "partitions"), 1u) << "exactly one statement is planned (topic b): " << out.str();
+    EXPECT_NE(out.str().find("topic b partitions 1"), std::string::npos) << out.str();
+    EXPECT_EQ(out.str().find("topic a"), std::string::npos) << "a and 'partitions 1' are never joined: " << out.str();
+    // "partitions 1;" alone is a parse error, reported as one.
+    EXPECT_NE(err.str().find("1:1: "), std::string::npos) << err.str();
+}
+
+TEST(ConsoleOfflineRegression, OverlongLineWhileAwaitingAStatementIsSkippedQuietlyRegression) {
+    ScriptedLines src;
+    src.lines = {{"", true}, {"topic b { x int32 } partitions 1 key x;", false}};
+    std::ostringstream out, err;
+    EXPECT_EQ(rune::cli::console::runInteractiveDryRunForTest(src, out, err), 0);
+    EXPECT_EQ(err.str().find("abandoned"), std::string::npos) << err.str();
+    EXPECT_EQ(count(out.str(), "partitions"), 1u) << out.str();
+}
+
+TEST(ConsoleOfflineRegression, AnyRejectedSessionEndsTheConsoleRegression) {
+    using rune::cli::console::consoleSessionEndCode;
+    struct C { uint16_t reject, stmt, want; };
+    for (const C c : {C{0, 0, 0}, C{0, 30, 0}, C{0, 46, 46}, C{44, 0, 44}, C{48, 30, 48}, C{46, 46, 46}})
+        EXPECT_EQ(consoleSessionEndCode(c.reject, c.stmt), c.want) << "reject " << c.reject << " statement " << c.stmt;
 }

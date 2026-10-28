@@ -352,8 +352,7 @@ int cmdSchemaGenerate(const std::vector<std::string>& args,
         }
 
         if (r.errorCode != 0) {
-            err << "rune: broker error code " << r.errorCode
-                << " for topic '" << topic << "'\n";
+            err << "rune: " << client.lineageFailure(topic, r.errorCode, kCliWait) << "\n";   // Issue #435
             return 1;
         }
 

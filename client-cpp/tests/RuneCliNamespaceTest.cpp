@@ -69,6 +69,21 @@ TEST(NamespaceCliRegression, FlagsCoverEveryLimitRegression) {
     for (const auto& f : rcl::kNamespaceLimitFields) EXPECT_NE(u.str().find(f.name), std::string::npos) << f.name;
 }
 
+// Issue #641: the patch built from `--set` flags names exactly the given fields (the wire mask), so the write
+// never carries a stale copy of any other limit.
+TEST(NamespaceCliRegression, LimitSetsBuildAPatchOfOnlyTheNamedFieldsRegression) {
+    const auto patch = rune::cli::namespaceLimitSetsPatch({"max-topics=7", "max-users=0"});
+    ASSERT_TRUE(patch.has_value()) << patch.error();
+    for (std::size_t i = 0; i < rcl::kNamespaceLimitFields.size(); ++i) {
+        const std::string_view name = rcl::kNamespaceLimitFields[i].name;
+        const bool named = name == "max-topics" || name == "max-users";
+        EXPECT_EQ(patch->has(i), named) << name;
+        EXPECT_EQ(rcl::namespaceLimitGet(patch->values, i), name == "max-topics" ? 7u : 0u) << name;
+    }
+    EXPECT_FALSE(rune::cli::namespaceLimitSetsPatch({"max-topics=1", "max-topics=2"}).has_value());
+    EXPECT_FALSE(rune::cli::namespaceLimitSetsPatch({"nope=1"}).has_value());
+}
+
 // `limits <ns> --set k=v`: only the named fields change, every other keeps the value read from the broker.
 TEST(NamespaceCliRegression, LimitsSetReadModifyWriteRegression) {
     rp::NamespaceLimits base{};

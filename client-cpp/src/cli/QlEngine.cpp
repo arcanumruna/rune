@@ -486,13 +486,17 @@ int64_t steadyNowMs() {
 }
 /// Waits (bounded by kCatalogWait) until the client's catalog reader holds `rid`.  The seed broker
 /// serves the catalog up to ITS OWN high watermark, which can trail the leader that answered the DDL.
-std::optional<cat::RequestRecord> awaitOwnWrite(rc::Client& c, const cat::RequestId& rid, std::string& why) {
+std::optional<cat::RequestRecord> awaitOwnWrite(rc::Client& c, const cat::RequestId& rid, std::string& why, uint16_t& brokerCode) {
+    brokerCode = 0;
     auto& reader = c.catalogReader();
     const int64_t deadline = steadyNowMs() + std::chrono::duration_cast<std::chrono::milliseconds>(kCatalogWait).count();
     return awaitRequestVisible(
         [&]() -> std::optional<std::string> {
             const int64_t left = std::max<int64_t>(1, deadline - steadyNowMs());
-            if (auto r = reader.refresh(std::chrono::milliseconds(left)); !r) return catalogReadFailure(r.error());
+            if (auto r = reader.refresh(std::chrono::milliseconds(left)); !r) {
+                brokerCode = r.error().brokerErrorCode;   // Issue #309
+                return catalogReadFailure(r.error());
+            }
             return std::nullopt;
         },
         [&] { return reader.state().request(rid); }, steadyNowMs,
@@ -617,7 +621,9 @@ void LiveBroker::flushVerbose(std::ostream& err) {
 bool QlRun::awaitLastDdl() {
     if (!lastDdl) return true;
     std::string why;
-    if (awaitOwnWrite(broker.client(), *lastDdl, why)) return true;
+    uint16_t code = 0;
+    if (awaitOwnWrite(broker.client(), *lastDdl, why, code)) return true;
+    if (code != 0) lastErrorCode = code;   // Issue #309: the exit status carries the broker's refusal
     return fail("the catalog read did not show this script's last DDL (request id " + requestIdHex(*lastDdl) + "): " + why);
 }
 

@@ -121,8 +121,8 @@ int runLive(const std::string& topic,
         }
 
         if (r.errorCode != 0) {
-            std::cerr << "rune_schema_gen: broker returned error code "
-                      << r.errorCode << " for topic '" << topic << "'\n";
+            std::cerr << "rune_schema_gen: " << client.lineageFailure(topic, r.errorCode, std::chrono::seconds(10))
+                      << "\n";   // Issue #435
             return 1;
         }
 

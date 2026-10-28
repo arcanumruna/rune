@@ -886,6 +886,40 @@ TEST(OpenTopicGate, LineageUnknownFingerprintStillThrowsRegression) {
 }
 
 // ===========================================================================
+// Issue #435: a lineage request an OLD broker answers UnknownTopic (it predates lineage) must not read as "the topic
+// does not exist" when the latest schema of that topic is served.
+// ===========================================================================
+TEST(OpenTopicGateRegression, LineageAgainstAnOldBrokerNamesTheVersionSkewRegression) {
+    GateHarness h(1330, 1331);
+    h.build();
+    h.connectAndWait();
+    h.gw->getTopicId                  = 0x40000011;
+    h.gw->getVersion                  = 1;
+    h.gw->getBlob                     = serialize(makeCharsDescriptor());
+    h.gw->getErrorCode                = 0;   // the latest schema IS served
+    h.gw->unknownFingerprintErrorCode = 7;   // ... but the lineage fingerprint is "unknown topic"
+    GateGatewayPump pump(*h.gw);
+    const std::string msg = h.client->lineageFailure("t", 7, 5s);
+    EXPECT_NE(msg.find("does not serve the schema lineage"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("upgrade"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
+}
+
+TEST(OpenTopicGateRegression, LineageOfAMissingTopicSaysItDoesNotExistRegression) {
+    GateHarness h(1332, 1333);
+    h.build();
+    h.connectAndWait();
+    h.gw->getErrorCode                = 7;
+    h.gw->unknownFingerprintErrorCode = 7;
+    GateGatewayPump pump(*h.gw);
+    const std::string msg = h.client->lineageFailure("t", 7, 5s);
+    EXPECT_NE(msg.find("topic 't' does not exist"), std::string::npos) << msg;
+    // Any other code is named as is, with no probe.
+    const std::string other = h.client->lineageFailure("t", 45, 5s);
+    EXPECT_NE(other.find("did not serve the schema lineage of 't' (error 45)"), std::string::npos) << other;
+}
+
+// ===========================================================================
 // Phase 2b Part C — the broker-reported partition count reaches the client:
 // TopicSchemaResponse trailing partitionCount -> Completion.reserved0 ->
 // TopicSchemaResult.partitionCount.

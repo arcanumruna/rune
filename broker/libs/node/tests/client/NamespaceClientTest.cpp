@@ -174,6 +174,46 @@ TEST(NamespaceClientRegression, CreateListLimitsRegression) {
     EXPECT_EQ(findNs(*list, "c"), nullptr);
 }
 
+// Issue #641: `limits --set` sends only the named fields and the broker merges them onto the CURRENT record.  Two
+// CLI runs for two fields both persist; and a Client holding a STALE read cannot overwrite a field it did not name.
+TEST(NamespaceCliRegression, NamespaceLimitSetsOfDifferentFieldsBothPersistRegression) {
+    AuthBroker b("nslimits641");
+    b.bootstrapAdmin(kAdminPw);
+    const std::string adminPw = writeTemp("admin-pw641", std::string(kAdminPw) + "\n");
+    const std::vector<std::string> as = {"--broker", b.endpoint(), "--user", "admin", "--password-file", adminPw};
+    auto with = [&](std::vector<std::string> args) { args.insert(args.end(), as.begin(), as.end()); return args; };
+    std::string out, err;
+    ASSERT_EQ(runCli(with({"namespace", "create", "a", "--max-topics", "5", "--max-views", "6"}), &out, &err), 0) << err;
+    ASSERT_EQ(runCli(with({"namespace", "limits", "a", "--set", "max-topics=9"}), &out, &err), 0) << err;
+    ASSERT_EQ(runCli(with({"namespace", "limits", "a", "--set", "max-views=11"}), &out, &err), 0) << err;
+    ASSERT_EQ(runCli(with({"namespace", "list", "--json"}), &out, &err), 0) << err;
+    EXPECT_NE(out.find("\"max-topics\":9,"), std::string::npos) << out;
+    EXPECT_NE(out.find("\"max-views\":11,"), std::string::npos) << out;
+
+    // The Client level: `stale` is read once; another writer changes max-topics; a patch naming only max-views,
+    // built next to that stale read, must leave the other writer's max-topics alone.
+    auto c = makeClient(b, "admin", kAdminPw);
+    const auto stale = c->listNamespaces();
+    ASSERT_TRUE(stale.has_value());
+    const auto* sa = findNs(*stale, "a");
+    ASSERT_NE(sa, nullptr);
+    EXPECT_EQ(sa->limits.maxTopics, 9u);
+    rc::NamespaceLimitsPatch other;
+    ASSERT_TRUE(other.set(*rc::namespaceLimitIndex("max-topics"), 21));
+    ASSERT_TRUE(c->setNamespaceLimits("a", other).has_value());
+    rc::NamespaceLimitsPatch mine;
+    ASSERT_TRUE(mine.set(*rc::namespaceLimitIndex("max-views"), 33));
+    ASSERT_TRUE(c->setNamespaceLimits("a", mine).has_value());
+    const auto now = c->listNamespaces();
+    ASSERT_TRUE(now.has_value());
+    const auto* na = findNs(*now, "a");
+    ASSERT_NE(na, nullptr);
+    EXPECT_EQ(na->limits.maxTopics, 21u) << "the other writer's field survives a patch that did not name it";
+    EXPECT_EQ(na->limits.maxViews, 33u);
+    EXPECT_THROW((void)c->setNamespaceLimits("a", rc::NamespaceLimitsPatch{}), std::invalid_argument);
+    c->close();
+}
+
 // The CLI: `rune namespace create|list|limits` end to end, then the Task 8 rows 1, 6 and 8 as a namespace admin of
 // `a` through `rune ql`: GRANT ADMIN ON CLUSTER is NotAuthorized (45), CREATE USER 'b/u2' answers like a missing
 // namespace (39, "no namespace '"), CREATE ROLE is allowed.

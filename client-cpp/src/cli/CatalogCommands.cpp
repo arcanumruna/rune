@@ -706,7 +706,8 @@ int cmdReplay(const std::vector<std::string>& args, std::ostream& out, std::ostr
                 }
                 ++reissued;
                 std::string why;
-                done = awaitOwnWrite(client, rid, why);
+                uint16_t brokerCode = 0;   // Issue #309: replay keeps returning 1
+                done = awaitOwnWrite(client, rid, why, brokerCode);
                 if (!done) {
                     err << "rune: " << head << "the target's catalog (read from " << into << ") did not show request id "
                         << requestIdHex(rid) << " within " << kCatalogWait.count() << " s: " << why << "\n";
