@@ -1,10 +1,12 @@
 // tests/client/ProducerTxnClientTest.cpp - Phase 2b F: the unified Producer against a real Client on Aeron IPC
 // (Invoker mode, the InvokerGateway broker model).  Task 4: broker-assigned ids for every acked producer.
+#include "../support/FreePort.h"
 #include "../support/InvokerGateway.h"
 
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
 #include <rune/client/Key.h>
+#include <rune/client/group/GroupMetadata.h>
 #include <rune/client/TypedTopic.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/producer/ProducerRef.h>
@@ -20,7 +22,6 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <future>
 #include <map>
 #include <memory>
 #include <span>
@@ -28,9 +29,7 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
+#include <poll.h>
 #include <unistd.h>
 
 namespace rc = rune::client;
@@ -351,7 +350,7 @@ std::vector<std::string> sendEveryPath(TxnRig& r, rc::Producer& p, rc::TopicHand
         const std::string a = "batch-a-" + t, b = "batch-b-" + t;
         rc::BatchBuilder bb = p.batch(topic, key);
         bb.add(bytesOf(a)).add(bytesOf(b));
-        bb.send();
+        EXPECT_EQ(bb.send(), rc::OpResult::Accepted);
         sent.push_back(a);
         sent.push_back(b);
         settle(r);
@@ -791,22 +790,48 @@ namespace {
 /// Parks the Thread-mode runner INSIDE a completion callback until opened, so the producer ring cannot drain: the
 /// test thread then fills it deterministically (no timing, no sleeps).  Declare it BEFORE the rig and an Opener AFTER
 /// it, so the runner is always released before the Client closes.
+/// Pipes, not shared sync (the test-tree law, check_no_atomics_or_mutexes --tests): the runner writes 'P' into
+/// toTest when it parked and blocks reading toRunner; open() writes 'G' there.  Each side owns its own ends; the
+/// kernel orders the bytes.  The runner's read has a failure-only deadline (it never decides an outcome).
 struct RunnerGate {
-    std::promise<void>       entered;
-    std::promise<void>       release;
-    std::shared_future<void> releaseF = release.get_future().share();
-    bool                     opened   = false;
+    int  toTest[2]   = {-1, -1};
+    int  toRunner[2] = {-1, -1};
+    bool piped       = false;   // test thread only
+    bool opened      = false;   // test thread only
+    RunnerGate() { piped = ::pipe(toTest) == 0 && ::pipe(toRunner) == 0; }
+    ~RunnerGate() {
+        for (int fd : {toTest[0], toTest[1], toRunner[0], toRunner[1]})
+            if (fd >= 0) ::close(fd);
+    }
+    RunnerGate(const RunnerGate&)            = delete;
+    RunnerGate& operator=(const RunnerGate&) = delete;
     static void on(void* ctx, const rc::Completion&, std::span<const uint8_t>) noexcept {
-        auto* g = static_cast<RunnerGate*>(ctx);
-        g->entered.set_value();
-        g->releaseF.wait();
+        auto*      g = static_cast<RunnerGate*>(ctx);
+        const char c = 'P';
+        (void)!::write(g->toTest[1], &c, 1);
+        pollfd pf{g->toRunner[0], POLLIN, 0};
+        char   in = 0;
+        if (::poll(&pf, 1, 120'000) == 1) (void)!::read(g->toRunner[0], &in, 1);
     }
     [[nodiscard]] rc::CompletionHandler handler() noexcept { return rc::CompletionHandler{&RunnerGate::on, this}; }
-    [[nodiscard]] bool waitEntered() { return entered.get_future().wait_for(std::chrono::seconds(10)) == std::future_status::ready; }
+    /// Pumps the gateway (capped) until the runner reported it parked.
+    template <class Rig>
+    [[nodiscard]] bool waitEntered(Rig& r, int cap = 20'000'000) {
+        if (!piped) return false;
+        for (int i = 0; i < cap; ++i) {
+            r.gw.pump();
+            pollfd pf{toTest[0], POLLIN, 0};
+            char   c = 0;
+            if (::poll(&pf, 1, 0) == 1 && ::read(toTest[0], &c, 1) == 1) return c == 'P';
+            std::this_thread::yield();
+        }
+        return false;
+    }
     void open() {
-        if (!opened) {
-            opened = true;
-            release.set_value();
+        if (!opened && piped) {
+            opened       = true;
+            const char c = 'G';
+            (void)!::write(toRunner[1], &c, 1);
         }
     }
 };
@@ -815,9 +840,12 @@ struct GateOpener {
     ~GateOpener() { g.open(); }
 };
 
-/// Polls `cq` until `n` completions arrived (all kept, in order) or the pass cap is hit.
-bool collect(TxnRig& r, rc::Completions& cq, std::size_t n, std::vector<rc::Completion>& out, int cap = 200'000) {
-    for (int i = 0; i < cap && out.size() < n; ++i) {
+/// Polls `cq` until `n` completions arrived (all kept, in order).  cap < 0 (the default, a positive wait): until they
+/// arrived, with a failure-only 60 s deadline (a Thread-mode runner on a loaded host is not bounded by a pass count).
+/// cap >= 0 (a negative check: nothing more arrives): exactly `cap` passes.
+bool collect(TxnRig& r, rc::Completions& cq, std::size_t n, std::vector<rc::Completion>& out, int cap = -1) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    for (int i = 0; (cap < 0 ? std::chrono::steady_clock::now() < deadline : i < cap) && out.size() < n; ++i) {
         if (r.invoker) r.client->doWork();
         r.gw.pump();
         cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) { out.push_back(c); });
@@ -842,7 +870,7 @@ TEST(ProducerTxnClientRegression, CqCreditReturnsOnBackPressuredAndClosedRegress
 
     // The runner is parked in the completion callback of a flush: the ring cannot drain from here on.
     ASSERT_EQ(p.flush(gate.handler(), 900), rc::OpResult::Accepted);
-    ASSERT_TRUE(gate.waitEntered()) << "the blocker flush never completed";
+    ASSERT_TRUE(gate.waitEntered(r)) << "the blocker flush never completed";
 
     // One accepted op holds credit while the ring fills with records (the credit baseline is NOT zero).
     ASSERT_EQ(p.flush(cq, 1000), rc::OpResult::Accepted);
@@ -873,10 +901,16 @@ TEST(ProducerTxnClientRegression, CqCreditReturnsOnBackPressuredAndClosedRegress
     gate.open();
     std::vector<rc::Completion> done;
     ASSERT_TRUE(collect(r, cq, 1, done));
-    EXPECT_FALSE(collect(r, cq, 2, done, 2'000)) << "a second completion for the one op";
-    ASSERT_EQ(done.size(), 1u);
+    // A progress barrier, not a pass count (Thread mode): a later flush completes only after the runner delivered
+    // everything ahead of it, so a duplicate of 1000 would show up before it.
+    ASSERT_EQ(p.flush(cq, 1001), rc::OpResult::Accepted);
+    ASSERT_TRUE(collect(r, cq, 2, done));
+    EXPECT_FALSE(collect(r, cq, 3, done, 2'000)) << "a third completion";
+    ASSERT_EQ(done.size(), 2u);
     EXPECT_EQ(done[0].token, 1000u);
     EXPECT_EQ(done[0].status, rc::OpStatus::Ok);
+    EXPECT_EQ(done[1].token, 1001u) << "a second completion for the one op";
+    EXPECT_EQ(done[1].status, rc::OpStatus::Ok);
     EXPECT_EQ(cq.reservedBytes(), 0u);
     EXPECT_EQ(cq.outstanding(), 0u);
 
@@ -1014,7 +1048,7 @@ TEST(ProducerTxnClientRegression, BeginBeforeThePreviousEndCompletesIsRefusedReg
     const rc::TopicHandle topic = r.client->topic("t");
     ASSERT_NO_FATAL_FAILURE(initAndBegin(r, p, cq));
     ASSERT_EQ(p.flush(gate.handler(), 900), rc::OpResult::Accepted);
-    ASSERT_TRUE(gate.waitEntered());
+    ASSERT_TRUE(gate.waitEntered(r));
     const rc::Key     key(uint64_t{1});
     const std::string first = "first", second = "second", third = "third";
     ASSERT_EQ(p.trySend(topic, key, bytesOf(first)), rc::SendResult::Ok);
@@ -1060,18 +1094,7 @@ int64_t g_fbNow = 0;
 int64_t fbNow() noexcept { return g_fbNow; }
 constexpr int64_t kFbGraceNs = 5'000'000'000LL;   // Client::kCoordDownFallbackNs (private): the documented 5 s
 
-int fbFreePort() {
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in a{};
-    a.sin_family      = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port        = 0;
-    (void)::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
-    socklen_t len = sizeof a;
-    (void)::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-    ::close(fd);
-    return ntohs(a.sin_port);
-}
+int fbFreePort() { return rune::client::testing::allocFreeUdpPort(); }   // cross-process collision-proof
 std::string fbUdp(int port) { return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port); }
 
 struct FallbackRig {
@@ -1263,4 +1286,164 @@ TEST(ProducerTxnClientRegression, CoordinatorFallbackHappensAfterFiveSecondsNotC
     EXPECT_EQ(r.gw.coordinatorEndpoints.back(), 0) << "the re-offer arrived on the seed node";
     EXPECT_EQ(r.client.testCoordinatorFallbacks(), 1u) << "a second fallback";
     EXPECT_EQ(strs(r.gw.committedValues(0)), (std::vector<std::string>{"fb"}));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// C11 review: adversarial pass over the transactional producer (docs/adversarial-review.md), through the public API.
+// ---------------------------------------------------------------------------------------------------------------
+namespace {
+/// Replays a coordinator answer the client already consumed (or one for a request it never sent): the bytes a stale,
+/// duplicated or reordered network delivery would carry.
+void replayEndTxnAnswer(TxnRig& r, int64_t sessionId, int64_t corrId, int16_t code) {
+    rune::protocol::client::EndTxnResponse rsp;
+    rsp.sessionId     = sessionId;
+    rsp.correlationId = corrId;
+    rsp.errorCode     = code;
+    std::vector<uint8_t> out(rune::protocol::client::EndTxnResponse::ENCODED_SIZE);
+    const std::size_t n = rsp.encode(out.data());
+    r.gw.send(0, out.data(), n);
+}
+int64_t lastEndTxnCorr(const test_support::InvokerGateway& gw) {
+    int64_t c = 0;
+    for (const auto& d : gw.coordDecisions)
+        if (d.kind == test_support::InvokerGateway::TxnFrameKind::EndTxn) c = d.correlationId;
+    return c;
+}
+}  // namespace
+
+// Protocol state (replays, out of order, session loss mid-op) + data integrity.  The EndTxn answer of transaction 1 is
+// replayed (Ok and error codes) while transaction 2 is open, and again while transaction 2's own EndTxn is in flight
+// with its answer lost; a forged answer for a correlation id the client never used is replayed too.  None of them may
+// complete, fail or poison transaction 2; the session then dies, the in-flight EndTxn is re-sent once with its own
+// correlation id, and every record is committed exactly once.
+TEST(ProducerTxnClientRegression, StaleEndTxnAnswerReplayedIntoTheNextTransactionIsIgnoredAdversarialRegression) {
+    for (const bool ring : {false, true}) {
+        SCOPED_TRACE(ring ? "Ring ingress" : "Direct ingress");
+        TxnRig r(rc::RunnerMode::Invoker);
+        r.gw.uniqueSessionIds = true;
+        r.gw.newIdOnResume    = false;
+        r.connect();
+        rc::Producer    p  = ring ? r.client->testProducerWithRingCap(txnCfg(), 64 * 1024) : r.client->producer(txnCfg());
+        rc::Completions cq(*r.client);
+        const rc::TopicHandle topic = r.client->topic("t");
+        const rc::Key         key(uint64_t{1});
+        ASSERT_NO_FATAL_FAILURE(initAndBegin(r, p, cq));
+        const std::string a = "t1-a", b = "t2-b", c = "t2-c";
+        ASSERT_EQ(p.trySend(topic, key, bytesOf(a)), rc::SendResult::Ok);
+        ASSERT_EQ(p.commitTransaction(cq, 201), rc::OpResult::Accepted);
+        ASSERT_TRUE(r.await(cq, 201));
+        ASSERT_EQ(r.got[201].status, rc::OpStatus::Ok);
+        const int64_t sid   = r.gw.lastUniqueSessionId();
+        const int64_t corr1 = lastEndTxnCorr(r.gw);
+        ASSERT_NE(corr1, 0);
+
+        // (1) transaction 2 open, no EndTxn in flight: stale Ok / Fenced / InvalidTxnState answers for txn 1.
+        ASSERT_TRUE(r.drive([&] { return p.state() == rc::TxnState::Ready; }));
+        p.beginTransaction();
+        ASSERT_EQ(p.trySend(topic, key, bytesOf(b)), rc::SendResult::Ok);
+        ASSERT_NO_FATAL_FAILURE(settle(r));
+        for (const int16_t code : {int16_t{0}, int16_t{18}, int16_t{19}}) replayEndTxnAnswer(r, sid, corr1, code);
+        replayEndTxnAnswer(r, sid, corr1 + (int64_t{1} << 20), 0);   // a correlation id never issued
+        ASSERT_NO_FATAL_FAILURE(settle(r));
+        EXPECT_EQ(p.state(), rc::TxnState::InTransaction) << "a stale EndTxn answer moved the open transaction";
+        EXPECT_EQ(r.got.count(202), 0u);
+
+        // (2) txn 2's EndTxn is processed but its answer is lost; the stale answers arrive while it is in flight.
+        ASSERT_EQ(p.trySend(topic, key, bytesOf(c)), rc::SendResult::Ok);
+        r.gw.holdTxnReplies = true;
+        const int endsBefore = r.gw.endTxns;
+        ASSERT_EQ(p.commitTransaction(cq, 202), rc::OpResult::Accepted);
+        ASSERT_TRUE(r.drive([&] { return r.gw.endTxns > endsBefore; })) << "txn 2's EndTxn never left";
+        const int64_t corr2 = lastEndTxnCorr(r.gw);
+        ASSERT_NE(corr2, corr1) << "a new EndTxn reused the old correlation id";
+        for (const int16_t code : {int16_t{0}, int16_t{18}, int16_t{19}}) replayEndTxnAnswer(r, sid, corr1, code);
+        ASSERT_NO_FATAL_FAILURE(settle(r));
+        cq.poll([&](const rc::Completion& x, std::span<const uint8_t>) { r.got[x.token] = x; });
+        EXPECT_EQ(r.got.count(202), 0u) << "a stale answer completed the in-flight commit (status "
+                                         << (r.got.count(202) ? static_cast<int>(r.got[202].status) : -1) << ")";
+        EXPECT_EQ(p.state(), rc::TxnState::CommittingTransaction);
+
+        // (3) the session dies with the EndTxn in flight: it is re-sent with ITS correlation id and completes once.
+        r.gw.expireSession(sid);
+        r.gw.holdTxnReplies = false;
+        ASSERT_TRUE(r.await(cq, 202)) << "the in-flight EndTxn was not re-sent";
+        EXPECT_EQ(r.got[202].status, rc::OpStatus::Ok) << "errorCode " << r.got[202].errorCode;
+        EXPECT_EQ(lastEndTxnCorr(r.gw), corr2);
+        ASSERT_NO_FATAL_FAILURE(settle(r));
+        EXPECT_EQ(strs(r.gw.committedValues(0)), (std::vector<std::string>{a, b, c})) << "exactly once, in order";
+        EXPECT_EQ(r.gw.endTxnCommits, (std::vector<uint8_t>{1, 1}));
+        EXPECT_EQ(cq.outstanding(), 0u);
+        EXPECT_EQ(cq.reservedBytes(), 0u);
+    }
+}
+
+// Input bounds through the public API, both ingress modes: a group id of 0 / 1 / 255 / 256 bytes, 0 / 1 / 1024 /
+// 1025 offsets, a member id at kMaxGroupMemberIdBytes and one past it.  An over-cap call completes InvalidArgument
+// exactly once (never truncated: the coordinator never sees it), hands its credit back and does not poison the
+// transaction; a legal one at every edge reaches the coordinator whole and commits.
+TEST(ProducerTxnClientRegression, SendOffsetsBoundsAtEveryEdgeAdversarialRegression) {
+    for (const bool ring : {false, true}) {
+        SCOPED_TRACE(ring ? "Ring ingress" : "Direct ingress");
+        TxnRig r(rc::RunnerMode::Invoker);
+        r.connect();
+        rc::Producer p = ring ? r.client->testProducerWithRingCap(txnCfg(), 1 << 20) : r.client->producer(txnCfg());
+        rc::Completions cq(*r.client);
+        ASSERT_NO_FATAL_FAILURE(initAndBegin(r, p, cq));
+        std::vector<rc::OffsetEntry> many(1025);
+        for (std::size_t i = 0; i < many.size(); ++i) many[i] = rc::OffsetEntry{1, 0, static_cast<int64_t>(i)};
+        const std::span<const rc::OffsetEntry> all(many);
+        struct Case { const char* what; std::size_t groupLen; std::size_t offsets; std::size_t memberLen; bool ok; };
+        const Case cases[] = {
+            {"group 0", 0, 1, 0, false},       {"group 1", 1, 1, 0, true},
+            {"group 255", 255, 1, 0, true},    {"group 256", 256, 1, 0, false},
+            {"1024 offsets", 3, 1024, 0, true}, {"1025 offsets", 3, 1025, 0, false},
+            {"member max", 3, 1, rc::kMaxGroupMemberIdBytes, true},
+            {"member max+1", 3, 1, rc::kMaxGroupMemberIdBytes + 1, false},
+        };
+        rc::Token tok = 300;
+        for (const Case& k : cases) {
+            SCOPED_TRACE(k.what);
+            const int    commitsBefore = r.gw.txnOffsetCommits;
+            auto staged = [&] {
+                std::size_t n = 0;
+                for (const auto& [pid, v] : r.gw.pendingTxnOffsets) n += v.size();
+                return n;
+            };
+            const std::size_t stagedBefore = staged();
+            std::string  group(k.groupLen, 'g');
+            rc::OpResult res;
+            if (k.memberLen == 0) {
+                res = p.sendOffsetsToTransaction(all.first(k.offsets), group, cq, tok);
+            } else {
+                rc::GroupMetadata gm;
+                gm.groupId      = group;
+                gm.generationId = 3;
+                gm.memberId.assign(k.memberLen, 'm');
+                res = p.sendOffsetsToTransaction(all.first(k.offsets), gm, cq, tok);
+            }
+            ASSERT_EQ(res, rc::OpResult::Accepted) << "the documented form: accepted, then completes";
+            ASSERT_TRUE(r.await(cq, tok));
+            if (k.ok) {
+                EXPECT_EQ(r.got[tok].status, rc::OpStatus::Ok) << "errorCode " << r.got[tok].errorCode;
+                EXPECT_GT(r.gw.txnOffsetCommits, commitsBefore);   // a large set may travel as several requests
+                EXPECT_EQ(staged(), stagedBefore + k.offsets) << "offsets lost or duplicated on the way";
+                EXPECT_EQ(r.gw.lastTxnOffsetGroup, group) << "the group id was truncated";
+            } else {
+                EXPECT_EQ(r.got[tok].status, rc::OpStatus::InvalidArgument);
+                EXPECT_EQ(r.gw.txnOffsetCommits, commitsBefore) << "an over-cap call reached the coordinator";
+                EXPECT_EQ(staged(), stagedBefore);
+            }
+            EXPECT_EQ(p.state(), rc::TxnState::InTransaction) << "the bound check poisoned the transaction";
+            EXPECT_EQ(cq.outstanding(), 0u);
+            EXPECT_EQ(cq.reservedBytes(), 0u);
+            ++tok;
+        }
+        const std::string v = "after-bounds";
+        ASSERT_EQ(p.trySend(r.client->topic("t"), rc::Key(uint64_t{1}), bytesOf(v)), rc::SendResult::Ok);
+        ASSERT_EQ(p.commitTransaction(cq, 400), rc::OpResult::Accepted);
+        ASSERT_TRUE(r.await(cq, 400));
+        EXPECT_EQ(r.got[400].status, rc::OpStatus::Ok) << "errorCode " << r.got[400].errorCode;
+        EXPECT_EQ(strs(r.gw.committedValues(0)), (std::vector<std::string>{v}));
+        EXPECT_EQ((r.gw.committedOffsets[std::make_pair(int32_t{1}, int32_t{0})]), 0) << "the last legal call's single offset (0) committed";
+    }
 }
