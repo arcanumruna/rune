@@ -36,6 +36,11 @@ namespace rune::cli {
 [[nodiscard]] std::string formatGrantsTable(const rune::security::GrantsView&);
 [[nodiscard]] std::string formatSecurityHistoryTable(const std::vector<rune::security::RecordedEvent>&);
 
+/// Reads the whole file at `path` into `bytes` (a key file) without leaving an unwiped copy behind.  Regular files
+/// are read by size; FIFOs and other non-regular files are read to EOF (capped at 64 KiB).  A read error or an
+/// oversize file wipes `bytes`, prints `rune: ...` to `err` and returns false: never a truncated key.
+[[nodiscard]] bool readFileBytes(const std::string& path, std::string& bytes, std::ostream& err);
+
 /// Prints the `rune security` usage lines.
 void printSecurityUsage(std::ostream& err);
 

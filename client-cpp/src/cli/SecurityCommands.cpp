@@ -206,6 +206,54 @@ void printSecurityUsage(std::ostream& err) {
 // ═══════════════════════════════════════════════════════════════════════════
 // rune security
 // ═══════════════════════════════════════════════════════════════════════════
+bool readFileBytes(const std::string& path, std::string& bytes, std::ostream& err) {
+    // #680: plain read(2) straight into the destination: an ifstream's stream buffer would keep an unwiped copy of the
+    // key that is freed with the stream.  A read error never returns a truncated key.
+    constexpr std::size_t kMaxKeyFileBytes = 64 * 1024;
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        err << "rune: cannot read '" << path << "'\n";
+        return false;
+    }
+    const auto fail = [&](const char* tail) {
+        rune::client::detail::wipeString(bytes);
+        ::close(fd);
+        if (tail == nullptr) err << "rune: cannot read '" << path << "'\n";
+        else err << "rune: '" << path << "' " << tail << "\n";
+        return false;
+    };
+    struct stat st {};
+    if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+        const std::size_t n = static_cast<std::size_t>(st.st_size);
+        bytes.assign(n, '\0');   // one allocation of exactly n: the string never grows
+        std::size_t got = 0;
+        while (got < n) {
+            const ssize_t r = ::read(fd, bytes.data() + got, n - got);
+            if (r < 0 && errno == EINTR) continue;
+            if (r < 0) return fail(nullptr);
+            if (r == 0) break;   // the file shrank
+            got += static_cast<std::size_t>(r);
+        }
+        ::close(fd);
+        bytes.resize(got);
+        return true;
+    }
+    // Empty-size or non-regular (FIFO, /proc-like): read until EOF through a wiped stack buffer.
+    bytes.clear();
+    char buf[4096];
+    struct BufWipe { char* b; ~BufWipe() { rune::client::detail::secureZero(b, sizeof(buf)); } } bufWipe{buf};
+    for (;;) {
+        const ssize_t r = ::read(fd, buf, sizeof(buf));
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) return fail(nullptr);
+        if (r == 0) break;
+        if (bytes.size() + static_cast<std::size_t>(r) > kMaxKeyFileBytes) return fail("is too large");
+        rune::client::detail::appendWiped(bytes, std::string_view(buf, static_cast<std::size_t>(r)));
+    }
+    ::close(fd);
+    return true;
+}
+
 namespace {
 
 int securityUsageError(std::string_view cmd, std::ostream& err, const std::string& msg) {
@@ -228,29 +276,6 @@ int cmdGenClusterKey(const std::vector<std::string>& args, std::ostream& out, st
     }
     out << "wrote cluster key " << a.value("--out") << " (64 hex characters, mode 0600)\n";
     return 0;
-}
-
-bool readFileBytes(const std::string& path, std::string& bytes, std::ostream& err) {
-    // #680: plain read(2) straight into the destination: an ifstream's stream buffer would keep an unwiped copy of the
-    // key that is freed with the stream.
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        err << "rune: cannot read '" << path << "'\n";
-        return false;
-    }
-    struct stat st {};
-    const std::size_t n = (::fstat(fd, &st) == 0 && st.st_size > 0) ? static_cast<std::size_t>(st.st_size) : 0;
-    bytes.assign(n, '\0');   // one allocation of exactly n: the string never grows
-    std::size_t got = 0;
-    while (got < n) {
-        const ssize_t r = ::read(fd, bytes.data() + got, n - got);
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) break;
-        got += static_cast<std::size_t>(r);
-    }
-    ::close(fd);
-    bytes.resize(got);
-    return true;
 }
 
 int cmdBootstrap(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {

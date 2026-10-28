@@ -463,7 +463,7 @@ int run(std::vector<std::string> args, std::istream& in, std::ostream& out, std:
         return cmdSchema(args, out, err);
     }
     if (cmd == "ql") {
-        return cmdQl(std::vector<std::string>(args.begin() + 1, args.end()), out, err);
+        return cmdQl(std::vector<std::string>(args.begin() + 1, args.end()), in, out, err);
     }
     if (cmd == "catalog") {
         return cmdCatalog(std::vector<std::string>(args.begin() + 1, args.end()), out, err);

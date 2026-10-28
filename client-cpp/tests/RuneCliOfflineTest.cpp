@@ -47,3 +47,13 @@ TEST(RuneQlCliRegression, UsageListsValidateAndExpectedVersionRegression) {
         EXPECT_NE(top.find(f), std::string::npos) << f << " missing from the top-level `rune ql` usage:\n" << top;
     }
 }
+
+// rune::cli::run must read `ql -f -` from the injected stream, not the process's std::cin (which is empty or the
+// terminal under ctest).  Mutation: put std::cin back in cmdQl -> the script is empty and the output has no statement.
+TEST(RuneCliOfflineRegression, QlScriptFromDashReadsTheInjectedStreamRegression) {
+    std::istringstream in("topic injected_t partitions 1;\n");
+    std::ostringstream out, err;
+    const int rc = rune::cli::run({"ql", "-f", "-", "--dry-run"}, in, out, err);
+    ASSERT_EQ(rc, 0) << err.str();
+    EXPECT_NE(out.str().find("topic injected_t"), std::string::npos) << out.str();
+}

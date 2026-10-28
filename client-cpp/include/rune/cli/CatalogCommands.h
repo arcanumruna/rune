@@ -15,6 +15,7 @@
 #include <rune/catalog/CatalogState.h>
 
 #include <cstdint>
+#include <istream>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -73,7 +74,7 @@ template <class RefreshFn, class LookupFn, class NowFn, class PauseFn>
 void printCatalogUsage(std::ostream& err);
 
 /// `rune ql …`: args are everything after "ql".
-int cmdQl(const std::vector<std::string>& args, std::ostream& out, std::ostream& err);
+int cmdQl(const std::vector<std::string>& args, std::istream& in, std::ostream& out, std::ostream& err);
 /// `rune catalog export|replay|diff …`: args are everything after "catalog".
 int cmdCatalog(const std::vector<std::string>& args, std::ostream& out, std::ostream& err);
 
