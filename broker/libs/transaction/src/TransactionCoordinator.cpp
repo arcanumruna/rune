@@ -134,6 +134,18 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
                  .errorCode  = InitProducerIdResult::kInvalidTxnTimeout };
     }
     int32_t effectiveTimeout = (txnTimeoutMs == 0) ? defaultTxnTimeoutMs_ : txnTimeoutMs;
+    // Namespaces Phase 2 Task 10 (D24): maxTxnTimeMs of the id's namespace.  An explicit timeout above it is refused; an
+    // unspecified one takes the default clamped to it.
+    if (!nsTxnLimits_.empty() && txnId.has_value() && !txnId->empty()) {
+        if (const auto it = nsTxnLimits_.find(rune::coordination::parseScopedId(*txnId).nsId);
+            it != nsTxnLimits_.end() && it->second.maxTxnTimeMs != 0) {
+            const auto cap = it->second.maxTxnTimeMs;
+            if (txnTimeoutMs > 0 && static_cast<uint64_t>(txnTimeoutMs) > cap)
+                return { .producerId = -1, .producerEpoch = -1, .errorCode = InitProducerIdResult::kNamespaceLimit };
+            if (txnTimeoutMs == 0 && static_cast<uint64_t>(effectiveTimeout) > cap)
+                effectiveTimeout = static_cast<int32_t>(std::max<uint64_t>(cap, static_cast<uint64_t>(kMinTxnTimeoutMs)));
+        }
+    }
     if (effectiveTimeout < kMinTxnTimeoutMs || effectiveTimeout > kMaxTxnTimeoutMs) {
         return { .producerId = -1, .producerEpoch = -1,
                  .errorCode  = InitProducerIdResult::kInvalidTxnTimeout };
@@ -282,6 +294,8 @@ AddPartitionsResult TransactionCoordinator::addPartitions(
     }
 
     if (resting) {
+        // Namespaces Phase 2 Task 10 (D24): maxOpenTxns, checked before the transaction starts (nothing mutated).
+        if (nsOpenTxnsAtLimit_(txnId)) return { .errorCode = AddPartitionsResult::kNamespaceLimit };
         // Empty / Complete* → Ongoing: a new transaction starts.
         meta->state        = TxnState::Ongoing;
         meta->txnStartNs   = nowNs;
@@ -403,6 +417,7 @@ AddPartitionsResult TransactionCoordinator::addOffsetsToTxn(
                          meta->state == TxnState::CompleteCommit ||
                          meta->state == TxnState::CompleteAbort;
     if (beginsTxn && resting) {
+        if (nsOpenTxnsAtLimit_(txnId)) return { .errorCode = AddPartitionsResult::kNamespaceLimit };   // Task 10 (D24)
         meta->state        = TxnState::Ongoing;
         meta->txnStartNs   = nowNs;
         meta->fencingEpoch = false;
@@ -539,6 +554,13 @@ int TransactionCoordinator::doWork(int64_t nowNs)
         if (meta.state != TxnState::Ongoing) continue;
 
         int64_t timeoutNs = static_cast<int64_t>(meta.txnTimeoutMs) * 1'000'000LL;
+        // Task 10 (D24): min(the transaction's timeout, its namespace's maxTxnTimeMs) - a lowered limit applies to
+        // transactions already open.
+        if (!nsTxnLimits_.empty()) {
+            if (const auto it = nsTxnLimits_.find(rune::coordination::parseScopedId(id).nsId);
+                it != nsTxnLimits_.end() && it->second.maxTxnTimeMs != 0)
+                timeoutNs = std::min<int64_t>(timeoutNs, static_cast<int64_t>(it->second.maxTxnTimeMs) * 1'000'000LL);
+        }
         if (nowNs - meta.txnStartNs > timeoutNs) {
             beginInternalAbort_(meta);
             ++work;
@@ -546,6 +568,18 @@ int TransactionCoordinator::doWork(int64_t nowNs)
     }
 
     return work;
+}
+
+bool TransactionCoordinator::nsOpenTxnsAtLimit_(const TransactionalId& txnId) const
+{
+    if (nsTxnLimits_.empty()) return false;
+    const uint32_t nsId = rune::coordination::parseScopedId(txnId).nsId;
+    const auto it = nsTxnLimits_.find(nsId);
+    if (it == nsTxnLimits_.end() || it->second.maxOpenTxns == 0) return false;
+    uint64_t open = 0;
+    for (const auto& [id, meta] : txnMap_)
+        if (meta.state == TxnState::Ongoing && rune::coordination::parseScopedId(id).nsId == nsId) ++open;
+    return open >= it->second.maxOpenTxns;
 }
 
 // The coordinator's own abort of an Ongoing transaction (timeout, namespace suspend / delete): PrepareAbort, the

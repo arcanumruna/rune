@@ -109,6 +109,10 @@ struct ITxnRequestHandler {
     virtual uint32_t abortAllForSession(int64_t /*sessionId*/, int64_t /*nowNs*/) { return 0; }
     virtual uint32_t abortAllForNamespace(uint32_t /*nsId*/, int64_t /*nowNs*/) { return 0; }
 
+    // Namespaces Phase 2 Task 10 (D24): a namespace's open-transaction and transaction-time limits (0 = unlimited), fed by
+    // the gateway on every namespace record upsert (and cleared on the erase).  Control thread, cold.  Default: ignored.
+    virtual void setNamespaceTxnLimits(uint32_t /*nsId*/, uint64_t /*maxOpenTxns*/, uint64_t /*maxTxnTimeMs*/) {}
+
     // F15-FU1 (#112, KIP-890 part 1): may a transactional data batch of (producerId,
     // producerEpoch) open a transaction on (topicId, partition)?  Asked by a partition
     // leader for the first such batch of a producer with no open transaction there.

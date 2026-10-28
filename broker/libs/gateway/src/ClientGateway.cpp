@@ -1596,6 +1596,10 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
         --expiringSessions_;
     }
     s->spill = SessionSpill{};
+    // Namespaces Phase 2 Task 10 (D24, #236): the ONE place a session's connection counts are given back - every close
+    // path (client Disconnect, idle timeout, revoke, suspend RejectAll, delete, shutdown) ends in closeSession_.
+    releaseConnection_(*s);
+    if (s->anonCounted) { s->anonCounted = false; if (anonSessions_ > 0) --anonSessions_; }
     if (s->heldByWorkers != 0) --heldSessions_;
     if (s->produceInFlight >= sessionProduceCredits_) --creditBlockedSessions_;   // D8c: its budget dies with it
     if (s->capDeferredOn >= 0) --capDeferredSessions_;                              // R3: its deferral memo too
@@ -3584,7 +3588,14 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     if (session->auth.index() < 3) [[unlikely]] {
         // Namespaces Task 9: a first request that is a Produce makes the anonymous reader too (then 45 below, the
         // session stays) - the same outcome as a Produce after a metadata request.
-        becomeAnonymousIfAllowed_(*session, pc::TemplateId::Produce);
+        if (becomeAnonymousIfAllowed_(*session, pc::TemplateId::Produce)) {   // Task 10 (#236): the anonymous-connection cap
+            if (!answerRejection_(*session, *pc::MessageHeader::decode(buf, len), nsLimitCode_(*session),
+                                  "namespace limit exceeded: anonymous connections", buf, len))
+                noteUnanswerable_(buf, len, "anonymous connection cap");
+            return true;
+        }
+        if (std::holds_alternative<rune::gateway::AuthAnonymousRead>(session->auth) &&
+            anonOpsRefused_(*session, *pc::MessageHeader::decode(buf, len), buf, len)) return true;
         if (session->auth.index() < 3) {
             const auto hdr = pc::MessageHeader::decode(buf, len);
             answerGate_(*session, *hdr, rune::gateway::gateFor(session->auth, pc::TemplateId::Produce, false, false), buf, len);
@@ -8525,11 +8536,14 @@ void ClientGateway::onNsSlotAssign(uint16_t slot, uint32_t nsId, const rune::pro
 {
     if (nsSlots_.nsIdAt(slot) != nsId && !nsSlots_.place(slot, nsId)) { ++nsSlotMismatches_; return; }
     nsSlots_.setLimits(slot, l);
+    if (nsConns_.size() < nsSlots_.capacity()) nsConns_.resize(nsSlots_.capacity());
+    if (slot < nsConns_.size() && nsConns_[slot].perUser.empty()) nsConns_[slot].perUser.reserve(16);   // D24: preallocated at assign
 }
 
 void ClientGateway::onNsSlotRelease(uint16_t slot, uint32_t nsId)
 {
     if (!nsSlots_.release(slot, nsId)) { ++nsSlotMismatches_; return; }
+    if (slot < nsConns_.size()) nsConns_[slot] = NsConnSlot{};   // a reused slot starts from zero usage
     sessions_.forEach([&](Session& s) { if (s.nsSlot == slot && s.nsId == nsId) s.nsSlot = rune::node::kNoNsSlot; });
 }
 
@@ -8539,6 +8553,7 @@ void ClientGateway::onNamespaceUpserted(const rune::catalog::NamespaceRecord& r)
     if (nsSlots_.slotOf(r.nsId) == rune::node::kNoNsSlot) (void)nsSlots_.assign(r.nsId);   // no BrokerNode in front (unit rigs)
     if (!namespaces_.upsert(r)) return;   // an older record: nothing changed
     nsSlots_.setLimits(nsSlots_.slotOf(r.nsId), r.limits);
+    if (txnService_ != nullptr) txnService_->setNamespaceTxnLimits(r.nsId, r.limits.maxOpenTxns, r.limits.maxTxnTimeMs);   // Task 10
     const NsStateTag tag = rune::catalog::tagOf(r.state);
     // Namespaces Phase 2 Task 4: on every node, at the apply of the state change.  Only the node whose transaction
     // coordinator is loaded holds transactions (others return 0), so this covers the transactions whose sessions live
@@ -8597,7 +8612,14 @@ bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std
     // Namespaces Task 9 (spec §11): with RUNE_ANONYMOUS_READ on, a session that sends a request instead of logging in
     // becomes the anonymous reader of `default` (Describe only) rather than ending.  The login legs and the bootstrap
     // keep their D13 meaning.  Off (the default): nothing changes.
-    if (anonymousRead_) [[unlikely]] becomeAnonymousIfAllowed_(*session, tid);
+    if (anonymousRead_) [[unlikely]] {
+        if (becomeAnonymousIfAllowed_(*session, tid)) {   // Task 10 (#236): the anonymous-connection cap
+            if (!answerRejection_(*session, *hdr, nsLimitCode_(*session), "namespace limit exceeded: anonymous connections", buf, len))
+                noteUnanswerable_(buf, len, "anonymous connection cap");
+            return true;
+        }
+        if (std::holds_alternative<AuthAnonymousRead>(session->auth) && anonOpsRefused_(*session, *hdr, buf, len)) return true;
+    }
 
     // A one-time-password session may send exactly `ALTER USER <self> SET PASSWORD`.
     bool selfSetPassword = false;
@@ -8719,7 +8741,7 @@ uint32_t ClientGateway::sessionNsId_(const Session& s) noexcept
     return 0;   // anonymous (dev / in-process / anonymous read) and not-yet-logged-in sessions: `default` (D12)
 }
 
-void ClientGateway::becomeAnonymousIfAllowed_(Session& session, pc::TemplateId tid)
+bool ClientGateway::becomeAnonymousIfAllowed_(Session& session, pc::TemplateId tid)
 {
     // Namespaces Phase 2 Task 9 (D23): anonymous read is also a feature of `default` (bit 0 of featureBits = unrestricted).
     const auto* d = namespaces_.registry().byId(rune::catalog::kDefaultNsId);
@@ -8727,10 +8749,71 @@ void ClientGateway::becomeAnonymousIfAllowed_(Session& session, pc::TemplateId t
         tid != pc::TemplateId::AuthClientFinal && tid != pc::TemplateId::SecurityBootstrap &&
         std::holds_alternative<rune::gateway::AuthAwaitingFirst>(session.auth) &&
         (d == nullptr || rune::node::nsFeatureAllowed(d->limits, rune::protocol::kNsFeatureAnonymousRead))) {
+        // Namespaces Phase 2 Task 10 (#236, D24): the anonymous cap applies before any namespace limit.
+        if (anonSessions_ >= anonMaxConnections_) [[unlikely]] return true;
         session.auth = rune::gateway::AuthAnonymousRead{anonPerms_()};
+        session.anonCounted = true;
+        ++anonSessions_;
         if (d != nullptr)
             session.nsGate = rune::catalog::tagOf(d->state);   // namespaces Phase 2 Task 3: the anonymous reader is `default`'s
     }
+    return false;
+}
+
+bool ClientGateway::anonOpsRefused_(Session& session, const pc::MessageHeader& hdr, const uint8_t* buf, std::size_t len)
+{
+    // GCRA over the injected clock: interval T = 1 s / rate, burst = one second of operations.
+    const int64_t interval = std::max<int64_t>(1, 1'000'000'000LL / static_cast<int64_t>(anonOpsPerSec_));
+    const int64_t tau      = static_cast<int64_t>(anonOpsPerSec_ - 1) * interval;
+    const int64_t t        = std::max(anonTatNs_, nowNs_);
+    if (t - nowNs_ <= tau) [[likely]] {
+        anonTatNs_ = t + interval;
+        return false;
+    }
+    const int64_t retryAfter = t - nowNs_ - tau;
+    if (session.clientVersion >= pc::kClientVersionNamespaces) {
+        pc::ErrorResponse er;
+        er.sessionId     = hdr.sessionId;
+        er.correlationId = hdr.correlationId;
+        er.code          = static_cast<int16_t>(pc::ErrorCode::Throttled);
+        er.retryAfterNs  = static_cast<uint64_t>(retryAfter);
+        sendAnswer_(session, scratch_.data(), er.encode(scratch_.data()));
+    } else if (!answerRejection_(session, hdr, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "anonymous rate limit", buf, len)) {
+        noteUnanswerable_(buf, len, "anonymous rate limit");
+    }
+    return true;
+}
+
+ClientGateway::Admit ClientGateway::admitConnection_(Session& s, uint64_t userId, const rune::catalog::NamespaceRecord& rec, bool exempt)
+{
+    const uint16_t slot = nsSlots_.slotOf(rec.nsId);
+    if (slot == rune::node::kNoNsSlot) return Admit::Ok;   // unreachable: the login's namespace has a slot
+    if (nsConns_.size() < nsSlots_.capacity()) nsConns_.resize(nsSlots_.capacity());   // cold, once (unit rigs)
+    NsConnSlot& c = nsConns_[slot];
+    const uint32_t mine = [&] { const auto it = c.perUser.find(userId); return it == c.perUser.end() ? 0u : it->second; }();
+    const auto& L = rec.limits;
+    if (!exempt) {   // count >= limit refuses ("at -> over"); 0 = unlimited; a cluster admin must always be able to log in
+        if (L.maxConnections != 0 && c.total >= L.maxConnections) return Admit::Connections;
+        if (L.maxConnectionsPerUser != 0 && mine >= L.maxConnectionsPerUser) return Admit::PerUser;
+        if (L.maxSessionsPerUser != 0 && mine >= L.maxSessionsPerUser) return Admit::SessionsPerUser;
+    }
+    ++c.total;
+    ++c.perUser[userId];
+    s.connCounted = true;
+    s.connSlot    = slot;
+    s.connNsId    = rec.nsId;
+    s.connUserId  = userId;
+    return Admit::Ok;
+}
+
+void ClientGateway::releaseConnection_(Session& s) noexcept
+{
+    if (!s.connCounted) return;
+    s.connCounted = false;
+    if (!nsSlots_.matches(s.connSlot, s.connNsId) || s.connSlot >= nsConns_.size()) return;   // the slot was reset / reassigned
+    NsConnSlot& c = nsConns_[s.connSlot];
+    if (c.total > 0) --c.total;
+    if (const auto it = c.perUser.find(s.connUserId); it != c.perUser.end() && --it->second == 0) c.perUser.erase(it);
 }
 
 rune::gateway::PermissionRef ClientGateway::anonPerms_()
@@ -9315,11 +9398,10 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
             return;
         }
     }
-    // Namespaces Phase 2 Task 9 (D23): the AuthScram feature gates SCRAM logins into the namespace (after the proof
-    // verified, so nothing leaks to a guesser); a cluster admin is exempt.
-    if (nsRec != nullptr && !rune::node::nsFeatureAllowed(nsRec->limits, rune::protocol::kNsFeatureAuthScram)) [[unlikely]] {
-        const PermissionRef loginPerms = compilePerms_(ok.userId, ok.nsId);
-        if (authorizeCluster(loginPerms.table(), rune::security::Operation::Admin).has_value()) {
+    // Namespaces Phase 2 Task 9/10 (D23, D24): the AuthScram feature and the connection limits gate a login AFTER the
+    // proof verified (nothing leaks to a guesser); a cluster admin is exempt (it must be able to log in to fix a limit).
+    {
+        const auto refuseLogin = [&](const char* detail) {
             if (session->spill.state == SpillState::Closing) return;
             pc::AuthServerFinal f;
             f.sessionId     = session->sessionId;
@@ -9327,10 +9409,22 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
             f.errorCode     = static_cast<uint16_t>(session->clientVersion >= pc::kClientVersionNamespaces
                                                         ? pc::ErrorCode::NamespaceLimitExceeded
                                                         : pc::ErrorCode::AuthenticationFailed);
-            f.detail        = "namespace limit exceeded: password login is not enabled for this namespace";
+            f.detail        = detail;
             sendAnswer_(*session, scratch_.data(), f.encode(scratch_.data()));
             closeAfterAnswers_(session->sessionId);
+        };
+        const bool clusterAdmin = !authorizeCluster(compilePerms_(ok.userId, ok.nsId).table(), rune::security::Operation::Admin).has_value();
+        if (nsRec != nullptr && !clusterAdmin && !rune::node::nsFeatureAllowed(nsRec->limits, rune::protocol::kNsFeatureAuthScram)) [[unlikely]] {
+            refuseLogin("namespace limit exceeded: password login is not enabled for this namespace");
             return;
+        }
+        if (nsRec != nullptr && !session->connCounted) {
+            switch (admitConnection_(*session, ok.userId, *nsRec, clusterAdmin)) {
+            case Admit::Ok: break;
+            case Admit::Connections:     refuseLogin("namespace limit exceeded: connections"); return;
+            case Admit::PerUser:         refuseLogin("namespace limit exceeded: connections per user"); return;
+            case Admit::SessionsPerUser: refuseLogin("namespace limit exceeded: sessions per user"); return;
+            }
         }
     }
     std::string loginNonce = st->combinedNonce;   // issue #114: before session->auth (which owns *st) is replaced

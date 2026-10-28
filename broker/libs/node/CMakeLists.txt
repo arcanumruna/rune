@@ -1819,6 +1819,13 @@ if(BUILD_TESTING)
                               rune_client_api aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_limit_broker_tests PROPERTIES TIMEOUT 900)
 
+        # Namespaces Phase 2 Task 10 (D24, #236): connection counts per namespace and node, open txns and txn time.
+        add_executable(rune_ns_connection_tests tests/client/NsConnectionLimitRegressionTest.cpp)
+        target_include_directories(rune_ns_connection_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_ns_connection_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_ns_connection_tests PROPERTIES TIMEOUT 900)
+
         # Namespaces Phase 2 Task 7 (D17, D18; rule 16): the namespace reaper - the state machine over a real CatalogState,
         # and three real AdminWorkers (leader change after each durable step).
         add_executable(rune_namespace_reaper_tests tests/node/NamespaceReaperRegressionTest.cpp)

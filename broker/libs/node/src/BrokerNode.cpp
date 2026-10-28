@@ -2131,6 +2131,7 @@ void BrokerNode::buildGateway() {
                                          nsSlots_.limits(static_cast<uint16_t>(sl)));
         if (bootApplier_) gateway_->setBootNamespaces(bootApplier_->state().namespaces());
         gateway_->setAnonymousRead(config_.anonymousRead);   // spec §11: RUNE_ANONYMOUS_READ, off by default
+        gateway_->setAnonymousCaps(config_.anonymousMaxConnections, config_.anonymousRequestOpsPerSec);   // #236 (Task 10)
         // Authentication Task 10 (D4/D32): the gateway's OWN copy of the cluster keys (loaded on this startup thread,
         // validated by validateAuth) verifies the bootstrap proof.  Dev / in-process configs hold none.
         // Review C I4: the keys validated in start() ARE the keys in use - one load, handed out as copies; Enabled with
@@ -6014,6 +6015,14 @@ void BrokerNode::publishNsSlotMetrics_() noexcept {
     if (!metricsReady_ || !gateway_) return;
     const auto total = static_cast<std::int64_t>(gateway_->nsSlotMismatchTotal());
     if (total != lastNsMismatchPublished_) { lastNsMismatchPublished_ = total; controlSet_(RuneMetric::NsSlotMismatch, total); }
+}
+
+uint32_t BrokerNode::nsConnectionsForTest(uint32_t nsId) {
+    return onControlThreadForTest([&] { return gateway_ ? gateway_->nsConnectionsForTest(nsId) : 0u; });
+}
+
+uint32_t BrokerNode::anonymousSessionsForTest() {
+    return onControlThreadForTest([&] { return gateway_ ? gateway_->anonymousSessionsForTest() : 0u; });
 }
 
 uint16_t BrokerNode::nsSlotOfForTest(uint32_t nsId) {

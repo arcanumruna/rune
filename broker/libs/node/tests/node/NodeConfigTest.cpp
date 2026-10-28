@@ -3165,4 +3165,33 @@ TEST(NodeConfigRegression, MaxNamespacesReadWithoutGroupSessionTimeoutRegression
     EXPECT_NE(r.error.find("RUNE_MAX_NAMESPACES"), std::string::npos) << r.error;
 }
 
+// Namespaces Phase 2 Task 10 (#236, D24): the anonymous caps - defaults 16 / 1000, carried when set, bounds-checked.
+TEST(NodeConfigRegression, AnonymousCapsRegression) {
+    auto env = base1node();
+    env["RUNE_AUTH"] = "disabled";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->anonymousMaxConnections, 16);
+    EXPECT_EQ(r.config->anonymousRequestOpsPerSec, 1000);
+    env["RUNE_ANONYMOUS_MAX_CONNECTIONS"] = "3";
+    env["RUNE_ANONYMOUS_REQUEST_OPS_PER_SEC"] = "250";
+    r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->anonymousMaxConnections, 3);
+    EXPECT_EQ(r.config->anonymousRequestOpsPerSec, 250);
+    env["RUNE_ANONYMOUS_MAX_CONNECTIONS"] = "1000000";   // the bound itself
+    r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->anonymousMaxConnections, 1'000'000);
+    for (const char* name : {"RUNE_ANONYMOUS_MAX_CONNECTIONS", "RUNE_ANONYMOUS_REQUEST_OPS_PER_SEC"})
+        for (const char* bad : {"0", "-1", "x", "1000001", "99999999999999999999"}) {
+            auto e = base1node();
+            e["RUNE_AUTH"] = "disabled";
+            e[name] = bad;
+            const auto res = parseNodeConfig(fakeEnv(e));
+            EXPECT_FALSE(res.config.has_value()) << name << "=" << bad;
+            EXPECT_NE(res.error.find(name), std::string::npos) << res.error;
+        }
+}
+
 } // namespace rune::node

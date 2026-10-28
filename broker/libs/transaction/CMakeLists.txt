@@ -55,7 +55,8 @@ if(BUILD_TESTING)
         tests/transaction/ControlBatchBeFormatTest.cpp
         tests/transaction/ReplicatedTxnStateStoreTest.cpp
         tests/transaction/ProducerIdWatermarkRecoveryTest.cpp
-        tests/transaction/F15TxnRegressionTest.cpp)
+        tests/transaction/F15TxnRegressionTest.cpp
+        tests/transaction/NsTxnLimitRegressionTest.cpp)
     target_link_libraries(rune_transaction_tests PRIVATE
         rune_transaction
         rune_replication

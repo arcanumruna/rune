@@ -115,6 +115,8 @@ struct InitProducerIdResult {
     static constexpr int kConcurrentTransactions = 6;
     /// The producerId space is exhausted (INT64_MAX) — NOT retriable.
     static constexpr int kProducerIdsExhausted   = 7;
+    /// Namespaces Phase 2 Task 10 (D24): the transaction timeout is above the namespace's maxTxnTimeMs.
+    static constexpr int kNamespaceLimit         = 8;
 
     [[nodiscard]] bool ok() const noexcept { return errorCode == kOk; }
 };
@@ -133,6 +135,8 @@ struct AddPartitionsResult {
     /// F15 m2: the caller holds the NEW identity of an overflow fence whose
     /// PrepareAbort is still resolving — retriable (wire 27).
     static constexpr int kConcurrentTransactions = 6;
+    /// Namespaces Phase 2 Task 10 (D24): the namespace already holds maxOpenTxns open transactions.
+    static constexpr int kNamespaceLimit         = 8;
 
     [[nodiscard]] bool ok() const noexcept { return errorCode == kOk; }
 };
@@ -520,6 +524,16 @@ public:
     /// allocation.  (Task 4 calls it on suspend / delete.)
     uint32_t abortAllForNamespace(uint32_t nsId, int64_t nowNs);
 
+    /// Namespaces Phase 2 Task 10 (D24): the namespace's transaction limits (0 = unlimited), fed on the control thread
+    /// from the catalog apply (every namespace record upsert).  maxOpenTxns bounds the Ongoing transactions at the
+    /// start of a new one (InitProducerId never opens one; AddPartitions / AddOffsets do); maxTxnTimeMs bounds the
+    /// timeout an InitProducerId may ask for (an unspecified one is clamped) and the timeout sweep uses
+    /// min(transaction timeout, namespace maximum).  Both 0 removes the entry.  Cold.
+    void setNamespaceTxnLimits(uint32_t nsId, uint64_t maxOpenTxns, uint64_t maxTxnTimeMs) {
+        if (maxOpenTxns == 0 && maxTxnTimeMs == 0) nsTxnLimits_.erase(nsId);
+        else nsTxnLimits_[nsId] = NsTxnLimits{maxOpenTxns, maxTxnTimeMs};
+    }
+
     /// Namespaces Phase 2 Task 4: the same internal abort for every Ongoing transaction that session `sessionId`
     /// opened (noteSession).  Returns the count.  No allocation.  The gateway calls it on every session revoke.
     uint32_t abortAllForSession(int64_t sessionId, int64_t nowNs);
@@ -639,6 +653,10 @@ private:
     void beginInternalAbort_(TransactionMetadata& meta);   ///< the timeout-abort transition (doWork, abortAllForNamespace)
 
     /// Primary state: transactionalId → TransactionMetadata.
+    struct NsTxnLimits { uint64_t maxOpenTxns = 0; uint64_t maxTxnTimeMs = 0; };
+    std::unordered_map<uint32_t, NsTxnLimits> nsTxnLimits_;   ///< empty unless a namespace sets a limit
+    /// True when namespace `nsId` already holds its maxOpenTxns Ongoing transactions (a cold scan, only for a limited ns).
+    [[nodiscard]] bool nsOpenTxnsAtLimit_(const TransactionalId& txnId) const;
     std::unordered_map<TransactionalId, TransactionMetadata> txnMap_;
 };
 

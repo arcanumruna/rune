@@ -200,6 +200,9 @@ public:
     /// suspended or deleted namespace.  0 when this node is not the loaded coordinator.
     uint32_t abortAllForSession(int64_t sessionId, int64_t nowNs) override;
     uint32_t abortAllForNamespace(uint32_t nsId, int64_t nowNs) override;
+    void setNamespaceTxnLimits(uint32_t nsId, uint64_t maxOpenTxns, uint64_t maxTxnTimeMs) override {
+        coordinator_.setNamespaceTxnLimits(nsId, maxOpenTxns, maxTxnTimeMs);
+    }
     /// Namespaces Phase 2 Task 7 (the reaper, via the control thread): one batch of tombstones of namespace `nsId`'s
     /// transaction state.  Refused while this node is not the loaded coordinator, or a transaction of the namespace is
     /// still open or ending (its completion would persist a record after the tombstone).  More = a batch was written, or
@@ -579,6 +582,8 @@ private:
                           const std::vector<rune::transaction::TopicPartition>& parts);
     void resolveMarker_(int64_t producerId);
     [[nodiscard]] int concurrentIfPreparing_(int err) const;
+    /// Task 10 (D24): NamespaceLimitExceeded (52) is for a v14+ session; an older one is answered InvalidRequest (39).
+    [[nodiscard]] int16_t nsLimitForClient_(int16_t code, int64_t sessionId) const;
 
     // F15 §5.1 — coordinator load state machine (control thread only).
     enum class LoadState : uint8_t { Unloaded, Loaded };

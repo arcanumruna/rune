@@ -2804,6 +2804,9 @@ public:
     /// The (nsId, slot) pairs of the authoritative table, ascending slot (read ON the control thread).
     [[nodiscard]] std::vector<std::pair<uint16_t, uint32_t>> nsSlotsForTest();
     [[nodiscard]] uint64_t nsSlotAssignFailuresForTest() const noexcept { return nsSlotAssignFailures_; }
+    /// Namespaces Phase 2 Task 10 (D24, #236): this node's gateway counts (read ON the control thread).
+    [[nodiscard]] uint32_t nsConnectionsForTest(uint32_t nsId);
+    [[nodiscard]] uint32_t anonymousSessionsForTest();
 private:
     int  serviceErasedNamespaces_();                                             // control thread: the rename, once its topics retired
     std::vector<uint32_t>                                 erasedNsAwaitingRename_;

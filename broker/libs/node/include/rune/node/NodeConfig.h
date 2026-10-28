@@ -572,6 +572,12 @@ struct NodeConfig {
     // Namespaces Task 9 (spec §11): RUNE_ANONYMOUS_READ=1|true lets an authenticating broker serve a client that never
     // starts SCRAM as the read-only anonymous principal of `default` (schema / catalog reads only).  Off by default.
     bool        anonymousRead    = false;
+    /// Namespaces Phase 2 Task 10 (#236, D24): RUNE_ANONYMOUS_MAX_CONNECTIONS (default 16) - the most anonymous-reader
+    /// sessions one gateway holds - and RUNE_ANONYMOUS_REQUEST_OPS_PER_SEC (default 1000) - the token bucket all of
+    /// them share.  Applied before any namespace limit.  Both are >= 1 (bounded by kMaxAnonymousCap).
+    int32_t     anonymousMaxConnections     = 16;
+    int32_t     anonymousRequestOpsPerSec   = 1000;
+    static constexpr int32_t kMaxAnonymousCap = 1'000'000;
     int32_t     peerAuthStreamId = 40;
     // Issues #15 / #111 (decision M7): a broker serves logins, `__security` reads and security DDL only while its
     // `__security` state is provably current - caught up with the current leader since boot, a leader answer (a

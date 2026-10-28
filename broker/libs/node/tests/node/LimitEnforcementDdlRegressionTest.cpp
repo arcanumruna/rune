@@ -87,7 +87,7 @@ struct Cells {
 
 TEST(LimitEnforcementTableRegression, RowsMatchTheFieldIndexRegression) {
     // The table's indices are the wire order of NamespaceLimits (28 u64 then featureBits).
-    EXPECT_EQ(kLimitRows.size(), 13u);
+    EXPECT_EQ(rowsOfArea(LimitArea::Ddl) + rowsOfArea(LimitArea::Security) + rowsOfArea(LimitArea::Group) + rowsOfArea(LimitArea::Gateway), 13u) << "the Task 9 rows";
     EXPECT_EQ(rowOf("max-topics")->index, 0u);
     EXPECT_EQ(rowOf("max-users")->index, 7u);
     EXPECT_EQ(rowOf("feature-bits")->index, 28u);
@@ -100,7 +100,7 @@ TEST(LimitEnforcementTableRegression, RowsMatchTheFieldIndexRegression) {
     EXPECT_EQ(l.lowestAcks, 7u);
     l = limitsWith(rowOf("feature-bits")->index, 9);
     EXPECT_EQ(l.featureBits, 9u);
-    EXPECT_EQ(kLimitRows.size() * kCellsPerRow, 39u) << "Task 9 rows x {below, at, above}";
+    EXPECT_EQ(13u * kCellsPerRow, 39u) << "Task 9 rows x {below, at, above}";
 }
 
 TEST(LimitEnforcementTableRegression, CountsRegression) {

@@ -372,6 +372,12 @@ public:
     // -----------------------------------------------------------------------
     void setTxnService(rune::gateway::ITxnRequestHandler* service) noexcept {
         txnService_ = service;
+        // Namespaces Phase 2 Task 10 (D24): the booted namespaces' transaction limits (later changes arrive with each
+        // namespace record upsert).  Startup thread.
+        if (txnService_ != nullptr)
+            namespaces_.registry().forEach([this](const rune::catalog::NamespaceRecord& r) {
+                txnService_->setNamespaceTxnLimits(r.nsId, r.limits.maxOpenTxns, r.limits.maxTxnTimeMs);
+            });
     }
 
     // -----------------------------------------------------------------------
@@ -549,12 +555,13 @@ public:
     /// Phase 2 Task 3: a deleted namespace is gone (kA2cNamespaceErased); its sessions were closed at Deleting.
     void onNamespaceErased(uint32_t nsId) {
         (void)namespaces_.erase(nsId);
+        if (txnService_ != nullptr) txnService_->setNamespaceTxnLimits(nsId, 0, 0);   // Task 10
         if (const uint16_t sl = nsSlots_.slotOf(nsId); sl != rune::node::kNoNsSlot && nsId != 0) onNsSlotRelease(sl, nsId);
     }
     // Namespaces Phase 2 Task 8 (D22): this gateway's OWN copy of the node's slot table, fed by the control thread
     // (BrokerNode) before it hands the namespace record to onNamespaceUpserted.  A session caches (nsId, nsSlot) at login;
     // a produce whose tag no longer matches is refused InvalidRequest and counted (`rune.ns.slot_mismatch`).
-    void configureNsSlots(uint32_t capacity) { nsSlots_.reset(capacity); }
+    void configureNsSlots(uint32_t capacity) { nsSlots_.reset(capacity); nsConns_.assign(nsSlots_.capacity(), NsConnSlot{}); }
     void onNsSlotAssign(uint16_t slot, uint32_t nsId, const rune::protocol::NamespaceLimits& l);
     void onNsSlotRelease(uint16_t slot, uint32_t nsId);
     /// Mismatches counted here plus the cumulative counts the workers reported (SessionSignal NsSlotMismatch).
@@ -564,6 +571,23 @@ public:
         return n;
     }
     [[nodiscard]] const rune::node::NsSlotTable& nsSlotsForTest() const noexcept { return nsSlots_; }
+    /// Namespaces Phase 2 Task 10 (#236, D24): RUNE_ANONYMOUS_MAX_CONNECTIONS / RUNE_ANONYMOUS_REQUEST_OPS_PER_SEC.
+    void setAnonymousCaps(int32_t maxConnections, int32_t opsPerSec) noexcept {
+        anonMaxConnections_ = maxConnections > 0 ? static_cast<uint32_t>(maxConnections) : 1u;
+        anonOpsPerSec_      = opsPerSec > 0 ? static_cast<uint32_t>(opsPerSec) : 1u;
+    }
+    /// Authenticated sessions of namespace `nsId` this gateway counts (D24; read ON the control thread).
+    [[nodiscard]] uint32_t nsConnectionsForTest(uint32_t nsId) const noexcept {
+        const uint16_t sl = nsSlots_.slotOf(nsId);
+        return sl < nsConns_.size() ? nsConns_[sl].total : 0;
+    }
+    [[nodiscard]] uint32_t nsUserConnectionsForTest(uint32_t nsId, uint64_t userId) const {
+        const uint16_t sl = nsSlots_.slotOf(nsId);
+        if (sl >= nsConns_.size()) return 0;
+        const auto it = nsConns_[sl].perUser.find(userId);
+        return it == nsConns_[sl].perUser.end() ? 0 : it->second;
+    }
+    [[nodiscard]] uint32_t anonymousSessionsForTest() const noexcept { return anonSessions_; }
     /// Test seam: the check a produce of `sessionId` does against the slot table (counts a mismatch).
     [[nodiscard]] bool sessionNsTagMatchesForTest(int64_t sessionId) {
         Session* s = sessions_.find(sessionId);
@@ -2524,7 +2548,22 @@ private:
     /// Namespaces Task 9: with RUNE_ANONYMOUS_READ on, an AwaitingFirst session that sends a request other than a login
     /// leg / the bootstrap becomes the anonymous reader of `default`.  Both entry points (authGateRefuses_ and
     /// handleProduce's cold branch) call this, so the first request's kind never changes the outcome.
-    void becomeAnonymousIfAllowed_(Session& session, rune::protocol::client::TemplateId tid);
+    /// Returns true when the anonymous-connection cap (RUNE_ANONYMOUS_MAX_CONNECTIONS) refused the conversion: the caller
+    /// answers NamespaceLimitExceeded and the session stays unauthenticated.
+    [[nodiscard]] bool becomeAnonymousIfAllowed_(Session& session, rune::protocol::client::TemplateId tid);
+    /// Task 10 (#236): the anonymous readers share ONE token bucket (GCRA, the injected clock nowNs_); true = refused
+    /// (answered Throttled with retryAfterNs, or InvalidRequest below v14).  Called for a session in AuthAnonymousRead.
+    [[nodiscard]] bool anonOpsRefused_(Session& session, const rune::protocol::client::MessageHeader& hdr, const uint8_t* buf, std::size_t len);
+    // ---- Task 10 (D24): per-node connection counts, by nsSlot.  Admission after the proof and the gate; ONE release.
+    struct NsConnSlot { uint32_t total = 0; std::unordered_map<uint64_t, uint32_t> perUser; };
+    enum class Admit : uint8_t { Ok, Connections, PerUser, SessionsPerUser };
+    [[nodiscard]] Admit admitConnection_(Session& s, uint64_t userId, const rune::catalog::NamespaceRecord& rec, bool exempt);
+    void releaseConnection_(Session& s) noexcept;   ///< closeSession_ is the ONLY caller (every close path goes through it)
+    std::vector<NsConnSlot> nsConns_;
+    uint32_t anonSessions_       = 0;
+    uint32_t anonMaxConnections_ = 16;
+    uint32_t anonOpsPerSec_      = 1000;
+    int64_t  anonTatNs_          = 0;   ///< GCRA theoretical arrival time
     const rune::gateway::SecurityView* securityView_ = nullptr;   // control thread's own mirror (same thread as the gateway)
     bool     securityServing_ = true;           ///< issues #15 / #111: see setSecurityServing
     int64_t  securityKnownEnd_ = -1;            ///< #205: see setSecurityKnownEnd

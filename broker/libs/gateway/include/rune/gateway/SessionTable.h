@@ -107,6 +107,14 @@ struct Session {
     // dev / anonymous session).
     uint32_t                                       nsId   = 0;
     uint16_t                                       nsSlot = 0;
+    // Namespaces Phase 2 Task 10 (D24): this session is counted in its namespace's per-node connection counts (set once
+    // the SCRAM proof verified and the namespace gate passed; undone by the ONE release helper every close path runs).
+    // (connSlot, connNsId) is the slot the count was taken in: a slot reassigned since is never decremented.
+    bool                                           connCounted = false;
+    uint16_t                                       connSlot    = 0xFFFF;
+    uint32_t                                       connNsId    = 0;
+    uint64_t                                       connUserId  = 0;
+    bool                                           anonCounted = false;   // counted against RUNE_ANONYMOUS_MAX_CONNECTIONS
     // D14: the host the session's Connect came from (the Aeron image's sourceIdentity host; the egress host for IPC) -
     // the throttle's key.  "" in unit tests.
     std::string                                    sourceHost;

@@ -67,6 +67,7 @@ int16_t txnErrorToProtocol(int txnErr) noexcept {
         case 4:  return static_cast<int16_t>(ErrorCode::InvalidTxnState);
         case 5:  return static_cast<int16_t>(ErrorCode::InvalidTxnState);
         case 6:  return static_cast<int16_t>(ErrorCode::ConcurrentTransactions);  // retriable (Kafka)
+        case 8:  return static_cast<int16_t>(ErrorCode::NamespaceLimitExceeded);  // Task 10 (D24): maxOpenTxns / maxTxnTimeMs
         default: return static_cast<int16_t>(ErrorCode::Internal);
     }
 }
@@ -869,9 +870,16 @@ size_t TransactionCoordinationService::handleInitProducerId_(
 
     resp.producerId    = result.producerId;
     resp.producerEpoch = result.producerEpoch;
-    resp.errorCode     = txnErrorToProtocol(result.errorCode);
+    resp.errorCode     = nsLimitForClient_(txnErrorToProtocol(result.errorCode), msg.sessionId);
     if (outCap < pc::InitProducerIdResponse::ENCODED_SIZE) return answerCannotFit_(buf, len, out, outCap);
     return resp.encode(out);
+}
+
+int16_t TransactionCoordinationService::nsLimitForClient_(int16_t code, int64_t sessionId) const
+{
+    if (code != static_cast<int16_t>(pc::ErrorCode::NamespaceLimitExceeded) || gateway_ == nullptr) return code;
+    const int32_t v = gateway_->sessionClientVersion(sessionId);
+    return v >= 0 && v < pc::kClientVersionNamespaces ? static_cast<int16_t>(pc::ErrorCode::InvalidRequest) : code;
 }
 
 // ---------------------------------------------------------------------------
@@ -967,7 +975,7 @@ size_t TransactionCoordinationService::handleAddPartitions_(
 
     // Encode response: one result entry per partition with the same error code.
     // Reuse partResultScratch_ (pre-reserved member) — no per-call alloc.
-    const int16_t errCode = txnErrorToProtocol(concurrentIfPreparing_(result.errorCode));
+    const int16_t errCode = nsLimitForClient_(txnErrorToProtocol(concurrentIfPreparing_(result.errorCode)), msg.sessionId);
     const size_t needed = pc::AddPartitionsToTxnResponse::encodedSizeFor(partCount);
     if (outCap < needed) return answerCannotFit_(buf, len, out, outCap);
 
@@ -1037,7 +1045,7 @@ size_t TransactionCoordinationService::handleAddOffsets_(
         }
     }
 
-    resp.errorCode = txnErrorToProtocol(concurrentIfPreparing_(result.errorCode));
+    resp.errorCode = nsLimitForClient_(txnErrorToProtocol(concurrentIfPreparing_(result.errorCode)), msg.sessionId);
     if (outCap < pc::AddOffsetsToTxnResponse::ENCODED_SIZE) return answerCannotFit_(buf, len, out, outCap);
     return resp.encode(out);
 }

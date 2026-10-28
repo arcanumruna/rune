@@ -57,6 +57,12 @@ inline constexpr std::array kLimitRows = {
     LimitRow{"lowest-acks",             26,  LimitArea::Gateway,  2, 52, "Produce(acks)",              "acks=All is served"},
     LimitRow{"lowest-min-insync",       27,  LimitArea::Ddl,      2, 52, "DefineTopic (cluster min ISR)", "min ISR == 2 is created"},
     LimitRow{"feature-bits",            28,  LimitArea::Ddl,      0, 52, "DefineTopic(compacted) / CreateView / InitProducerId / login", "the allowed feature is served"},
+    // ---- Task 10: connections, open txns, txn time -----------------------------------------------------------
+    LimitRow{"max-connections",          18, LimitArea::Connections, 2, 52, "login after the SCRAM proof", "the 2nd session of the namespace on this node"},
+    LimitRow{"max-connections-per-user", 19, LimitArea::Connections, 2, 52, "login after the SCRAM proof", "the user's 2nd session on this node"},
+    LimitRow{"max-sessions-per-user",    20, LimitArea::Connections, 2, 52, "login after the SCRAM proof", "the user's 2nd session on this node"},
+    LimitRow{"max-open-txns",            21, LimitArea::Txn,         2, 52, "AddPartitions opens a txn",   "the 2nd open transaction"},
+    LimitRow{"max-txn-time-ms",          22, LimitArea::Txn,     30000, 52, "InitProducerId(timeout)",     "a timeout == the maximum"},
 };
 // clang-format on
 
