@@ -156,9 +156,9 @@ and [contributing](https://github.com/arcanumruna/rune/wiki/Contributing).
 ## License and links
 
 Rune is source-available, not open source. It is licensed under the
-[Arcanum Realms Community License](LICENSE), version 1.1. The license is the binding text; this summary is not.
+[Arcanum Realms Community License](LICENSE), version 1.2. The license is the binding text; this summary is not.
 
-| Free under the license | Needs a commercial license |
+| Free under the license | Not allowed |
 |---|---|
 | Running Rune in production as the backend of your own games and services, including ones you sell | Offering Rune's log, database or view functionality to others as a hosted or managed service |
 | Having a cloud provider, contractor or consultant host, deploy or support it for you | Selling or licensing Rune, or a fork of it, as a product in its own right |
@@ -166,7 +166,7 @@ Rune is source-available, not open source. It is licensed under the
 | Evaluation, benchmarks, research and teaching | |
 
 The license includes a patent grant and a 30-day cure period. Contributions are accepted under its section 7.
-Third-party components keep their own licenses: see [NOTICE](NOTICE). For a commercial license, contact Arcanum Realms LTD.
+Third-party components keep their own licenses: see [NOTICE](NOTICE). For anything else outside the license, contact Arcanum Realms LTD.
 
 [Website](https://arcanum.regressorspath.com/rune/) · [API page](https://arcanum.regressorspath.com/rune/docs.html) ·
 [Self-host page](https://arcanum.regressorspath.com/rune/selfhost.html) ·
