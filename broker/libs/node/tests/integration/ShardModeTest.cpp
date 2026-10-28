@@ -949,6 +949,39 @@ TEST(ShardModeRegression, SequentialShardResolveKeepsEarlierShardsAlive) {
     node.stop();
 }
 
+// The last shard's driver start blocks for 2x the client liveness timeout.  No shard client may exist yet
+// while a driver is constructed, so every shard must still serve.
+TEST(ShardModeRegression, SlowShardDriverStartKeepsEarlierShardClientsAliveRegression) {
+    TmpDir dir{"slowdrv"}, cdir{"slowdrvc"};
+    constexpr int32_t kWorkers = 3;
+    const auto ports = ShardPorts::discover(1, kWorkers);
+    auto cfg = makeShardConfig(0, dir.path, ports, 1, kWorkers, /*fused=*/false);
+    constexpr int32_t kTopicParts = 12;
+    constexpr int64_t kLivenessNs = 2'000'000'000;           // > driver timer interval (1 s)
+    cfg.shardClientLivenessTimeoutNs = kLivenessNs;
+    BrokerNode node{cfg};
+    node.setShardDriverBuildStallForTest(kWorkers - 1, std::chrono::milliseconds{2 * kLivenessNs / 1'000'000});
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ASSERT_EQ(defineShardTopic({&node}, kTopicParts), 0);
+    ShardTestClient c(cdir.path);
+    const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
+    ASSERT_GT(sid, 0);
+    for (int32_t w = 0; w < kWorkers; ++w) {
+        int32_t part = -1;
+        for (int32_t p = 0; p < kTopicParts && part < 0; ++p)
+            if (node.workerForPartitionForTest(0, p) == w) part = p;
+        ASSERT_GE(part, 0) << "no partition routed to worker " << w;
+        EXPECT_FALSE(node.onOwnerThreadForTest(0, part, [&node, w](rune::replication::PartitionReplica*) {
+            return node.shardClientClosedForTest(w);
+        })) << "shard " << w << " client died while a later shard resolved";
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, w), kClientStream, sid, 0, part,
+                                    /*acks=*/0, makeBatch(2), /*maxAttempts=*/20);
+        EXPECT_TRUE(ack.has_value()) << "shard " << w << " does not serve";
+    }
+    node.stop();
+}
+
 // ---------------------------------------------------------------------------
 // Task 10 fix 1 — fsyncgate fail-stop + io backend selection, end to end.
 // ---------------------------------------------------------------------------
