@@ -153,7 +153,7 @@ enforced, each with one precise code:
 | `max-disk-bytes` | measured on the node that leads the partition | produce on the leader: `NamespaceLimitExceeded (52)`; follower apply, replication catch-up and the log cleaner are never refused |
 | `max-message-bytes`, `max-batch-bytes` | the worker's produce intake on the leader. A batch longer than `max-batch-bytes`, or a record whose encoded length is longer than `max-message-bytes`, is refused and nothing is appended. 0 = unlimited | `NamespaceLimitExceeded (52)` |
 | `max-retention-ms`, `max-retention-bytes` | a topic DDL above the maximum is refused; the cleaner applies `min(topic retention, namespace maximum)` | `NamespaceLimitExceeded (52)` at DDL |
-| `produce-bytes-per-sec`, `produce-records-per-sec`, `fetch-bytes-per-sec`, `request-ops-per-sec`, `query-cycles-per-sec` | a per-namespace aggregator compares the node's usage with `limit x elapsed` every `RUNE_NS_LIMIT_TICK_US` (default 1000) | `Throttled (53)` carrying a retry-after; the client library waits it out and retries |
+| `produce-bytes-per-sec`, `produce-records-per-sec`, `fetch-bytes-per-sec`, `request-ops-per-sec`, `query-cycles-per-sec` | a per-namespace aggregator compares the node's usage with `limit x elapsed` every `RUNE_NS_LIMIT_TICK_US` (default 10000) | `Throttled (53)` carrying a retry-after; the client library waits it out and retries |
 | `max-view-memory-bytes` | the node's view chunks | the namespace's views pause at their offset and a view read answers `ViewPaused (54)`; they resume when memory falls or the limit is raised |
 
 - **Lowering a limit deletes nothing**, except the retention maximum: objects over a lowered count stay and the next
@@ -174,7 +174,7 @@ The error codes, all gated on client version 14:
 |---|---|---|
 | 51 | `NamespaceSuspended` | the namespace is suspended and this request is not served in that mode |
 | 52 | `NamespaceLimitExceeded` | a count, durability, feature, connection, transaction or disk limit |
-| 53 | `Throttled` | a rate limit; the response carries `retryAfterNs` |
+| 53 | `Throttled` | a rate limit; for a v14+ client the retry-after in ns rides `ProduceResponse.logStartOffset` |
 | 54 | `ViewPaused` | the view is paused over its namespace's memory limit |
 
 ## Metrics

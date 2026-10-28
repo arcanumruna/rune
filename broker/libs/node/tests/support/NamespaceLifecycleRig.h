@@ -18,7 +18,12 @@
 #include "support/NamespaceLifecycleMatrixExpectations.h"
 #include "support/NamespaceRig.h"
 
+#include <rune/catalog/CatalogEvent.h>
+#include <rune/catalog/CatalogReplayer.h>
 #include <rune/node/Worker.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/replication/PartitionReplica.h>
+#include <rune/storage/Log.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -56,6 +61,7 @@ public:
         bool topicsRemain = true;       ///< LowerBelowUsage: both topics still exist
         int followUpCode = kNoAnswer;   ///< LowerBelowUsage: a CreateTopic after the op (root; resumed first)
         std::string warning;            ///< OkWithWarning: the answer's detail
+        rune::protocol::NamespaceLimits limitsBefore;  ///< the target's stored limits before the op (by name)
         rune::protocol::NamespaceLimits limitsAfter;   ///< the target's stored limits after the op (by name)
     };
 
@@ -204,6 +210,7 @@ public:
         if (!twin) holdReaper();   // a DELETING namespace stays DELETING for the whole cell
         if (!twin) prepare(name, t, ord, c);
         const Observed before = observe(name);
+        cell.limitsBefore = before.limits;
         cell.nsIdBefore = before.nsId != 0 ? before.nsId : deletingIdOf(name);
         const Login s = login(c, t, name, ord);
         if (s.code != 0) {
@@ -229,8 +236,7 @@ public:
     /// every DELETING namespace runs to its end (bounded memory and slots over hundreds of cells).
     void cleanup(const std::string& name, Target t) {
         if (t == Target::Default) restoreDefault();
-        else if (t != Target::Missing && observe(name).byName != Target::Missing) (void)ns(root(), pc::NamespaceDdlKind::Delete, name);
-        else if (t == Target::Missing && observe(name).byName != Target::Missing) (void)ns(root(), pc::NamespaceDdlKind::Delete, name);
+        else if (observe(name).byName != Target::Missing) (void)ns(root(), pc::NamespaceDdlKind::Delete, name);
         releaseReaper();
     }
 
@@ -298,7 +304,6 @@ public:
     /// Restart the broker over the same data and log root in again (the other sessions are gone).  The reaper is held again.
     void restart(bool holdReaper) {
         w_->r.restart();
-        nsWireReset();
         w_->root = loginRoot();
         w_->rootUsed = Clock::now();
         if (holdReaper) holdReaper_();
@@ -354,6 +359,43 @@ public:
         }
         return pred();
     }
+    /// The number of `kind` events of namespace `nsId` in the node's whole __catalog log (committed or not).
+    [[nodiscard]] std::size_t catalogEventCount(rune::catalog::EventKind kind, uint32_t nsId) {
+        BrokerNode& n = w_->r.broker().node();
+        return n.onAdminThreadForTest([&n, kind, nsId]() -> std::size_t {
+            rune::replication::PartitionReplica* r = n.catalogReplicaForTest();
+            if (r == nullptr) return 0;
+            rune::storage::Log& log = *r->log();
+            std::size_t count = 0;
+            int64_t next = 0;
+            const int64_t leo = log.logEndOffset();
+            while (next < leo) {
+                const std::vector<uint8_t> data = log.read(next, 1 << 22);
+                if (data.empty()) break;
+                const int64_t before = next;
+                std::size_t pos = 0;
+                while (pos < data.size()) {
+                    rune::protocol::RecordBatchReader reader(data.data() + pos, data.size() - pos);
+                    if (!reader.ensureValid()) break;
+                    const auto tl = static_cast<std::size_t>(reader.totalLength());
+                    reader.forEachRecord([&](std::string_view, std::string_view val, int64_t off, int64_t) {
+                        if (off < next) return;
+                        auto ev = rune::catalog::decode(
+                            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(val.data()), val.size()));
+                        if (!ev) throw std::logic_error("LcRig: a __catalog record does not decode");
+                        count += ev->kind == kind && ev->nsId == nsId ? 1 : 0;
+                        next = off + 1;
+                    });
+                    if (tl == 0) break;
+                    pos += tl;
+                }
+                if (next == before) break;
+            }
+            return count;
+        });
+    }
+    /// The namespace's slot in the node's authoritative slot table is free (read ON the control thread).
+    [[nodiscard]] bool nsSlotFreed(uint32_t nsId) { return w_->r.broker().node().nsSlotOfForTest(nsId) == kNoNsSlot; }
     /// The id is gone from the root listing (erased).
     bool erased(uint32_t nsId) {
         for (const Seen& s : list()) if (s.nsId == nsId) return false;
@@ -394,7 +436,6 @@ private:
     static void need(bool ok, const std::string& what) {
         if (!ok) throw std::runtime_error("LcRig: " + what);
     }
-    void nsWireReset() {}
     int64_t loginRoot() {
         const int64_t sid = w_->r.login("admin", AuthBroker::kAdminPassword, pc::kClientVersionNamespaces);
         return sid;
@@ -427,6 +468,8 @@ private:
     /// The caller's session for the cell: the cluster admin's, a fresh login of the namespace's user, a foreign user, or an
     /// anonymous connection.  `code` != 0: the login was refused with it.
     Login login(Caller c, Target t, const std::string& name, int) {
+        // On target Missing the NsAdminSame / UserInNs callers log in as s/admin and s/user: the standing users of the
+        // foreign namespace `s`, because the missing namespace has no users of its own.
         const bool standing = t == Target::Missing;
         switch (c) {
             case Caller::ClusterAdmin: return {root(), 0};

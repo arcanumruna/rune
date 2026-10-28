@@ -93,6 +93,11 @@ TEST_P(NamespaceLifecycleMatrixRegression, Cell) {
     const LcRig::Cell got = rig.run(p.op, p.caller, p.target, p.ordinal);
     const std::string label = cellName(p) + ": want " + describe(want) + ", got code " + std::to_string(got.a.code) +
                               " [" + got.a.detail + "] after=" + name(got.after) + (got.deletingEntry ? "+deleting" : "");
+    {   // every observed code is one the matrix can emit
+        const auto codes = expectedCodes();
+        EXPECT_TRUE(got.a.code == 0 || std::find(codes.begin(), codes.end(), static_cast<ErrorCode>(got.a.code)) != codes.end())
+            << label << ": code " << got.a.code << " is not in expectedCodes()";
+    }
     const bool loginTime = (p.caller == LcCaller::NsAdminSame || p.caller == LcCaller::UserInNs) &&
                            (p.target == LcTarget::SuspendedRA || p.target == LcTarget::Deleting);
     EXPECT_EQ(got.loginRefused, loginTime) << label << ": the op is sent iff the caller could log in";
@@ -142,6 +147,13 @@ TEST_P(NamespaceLifecycleMatrixRegression, Cell) {
         const auto& o = got;
         if (p.op == LcOp::SetLimitsRaise) EXPECT_GT(o.limitsAfter.maxTopics, 5000u) << label << ": the raised limit is stored";
         else EXPECT_EQ(o.limitsAfter.maxRetentionMs, 1u) << label << ": the lowered retention is stored";
+    }
+    // A refused SetLimits changed no stored limit: read back the way the accepted cells do.
+    if (!ran && !got.loginRefused && (p.op == LcOp::SetLimitsRaise || p.op == LcOp::SetLimitsLowerBelowUsage ||
+                                      p.op == LcOp::SetLimitsLowerRetention)) {
+        for (std::size_t i = 0; i < rune::protocol::kNamespaceLimitFieldCount; ++i)
+            EXPECT_EQ(LcRig::getField(got.limitsAfter, static_cast<int>(i)), LcRig::getField(got.limitsBefore, static_cast<int>(i)))
+                << label << ": limit field " << i << " changed by a refused SetLimits";
     }
     // A caller that is not the cluster admin changed nothing anywhere else: the target is as prepared.
     if (!ran) {
@@ -233,12 +245,24 @@ void crashMidDelete(const TCell& p) {
     EXPECT_FALSE(std::filesystem::exists(nsRoot(rig.dataDir(), id))) << "ns-<id> directory";
     EXPECT_FALSE(std::filesystem::exists(std::filesystem::path(nsRoot(rig.dataDir(), id).string() + ".deleting")));
     EXPECT_EQ(rig.tryLogin("d/u").code, static_cast<int>(ErrorCode::AuthenticationFailed)) << "the namespace's user is gone";
+    EXPECT_TRUE(rig.broker().node().nsKeyedStoresCleanForTest(id)) << "a live consumer-offset or transaction-state key of the deleted namespace";
+    EXPECT_TRUE(rig.nsSlotFreed(id)) << "the deleted namespace's slot is still held";
+    EXPECT_EQ(rig.catalogEventCount(rune::catalog::EventKind::DropTopic, id), 2u) << "each topic dropped exactly once";
+    EXPECT_EQ(rig.catalogEventCount(rune::catalog::EventKind::NamespaceDeleteStep, id), 4u) << "each step bit recorded exactly once";
+    EXPECT_EQ(rig.catalogEventCount(rune::catalog::EventKind::NamespaceDeleted, id), 1u);
+    const auto oldTopics = rig.topicIds(nm);
+    ASSERT_EQ(oldTopics.size(), 2u);
+    for (const int32_t t : oldTopics)
+        EXPECT_EQ(rig.auth().produce(rig.rootSid(), t), static_cast<int>(ErrorCode::UnknownTopic)) << "old topic id " << t;
     // The name is free and the new namespace sees nothing of the old one.
     ASSERT_EQ(rig.ns(rig.rootSid(), pc::NamespaceDdlKind::Create, nm).code, 0);
     const auto again = rig.observe(nm);
     EXPECT_NE(again.nsId, id);
     EXPECT_EQ(again.byName, LcTarget::Active);
-    EXPECT_GE(rig.auth().defineTopic(rig.rootSid(), "d/t"), 0) << "no topic of the old namespace remains in the way";
+    {   // the re-created namespace lists none of the old namespace's topics
+        const auto md = rig.rootMetadata();
+        for (const int32_t t : oldTopics) EXPECT_FALSE(std::binary_search(md.begin(), md.end(), t)) << "old topic " << t << " listed";
+    }
     EXPECT_EQ(rig.tryLogin("d/u").code, static_cast<int>(ErrorCode::AuthenticationFailed)) << "no old user";
 }
 
@@ -314,7 +338,7 @@ void followerCatchUp(const TCell& p) {
     }
     f.trio.deisolate(3);
     ASSERT_TRUE(f.trio.awaitConverged());
-    ASSERT_TRUE(f.awaitErased(3) || p.variant != 1) << "the follower never saw the erase";
+    ASSERT_TRUE(p.variant != 1 || f.awaitErased(3)) << "the follower never saw the erase";
     for (int i = 0; i < 200; ++i) f.trio.pump();
     ASSERT_TRUE(f.trio.awaitConverged());
     EXPECT_TRUE(f.trio.allDigestsEqual()) << "the follower's catalog differs from the leader's";

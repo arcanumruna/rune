@@ -26,6 +26,7 @@
 
 #include "support/AuthRig.h"
 #include "support/CatalogTrio.h"
+#include "support/NamespaceLifecycleMatrixExpectations.h"
 
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
@@ -54,6 +55,11 @@ namespace pc = rune::protocol::client;
 namespace rc = rune::client;
 using Clk = std::chrono::steady_clock;
 
+namespace nslc = rune::node::test::nslc;   // the matrix expectations header: the one source of the codes
+constexpr int kSuspended = static_cast<int>(nslc::ErrorCode::NamespaceSuspended);
+constexpr int kLimit = static_cast<int>(nslc::ErrorCode::NamespaceLimitExceeded);
+constexpr int kAuthFailed = static_cast<int>(nslc::ErrorCode::AuthenticationFailed);
+constexpr int kUnknownTopic = static_cast<int>(nslc::ErrorCode::UnknownTopic);
 constexpr int32_t kMissingId = 98'765;
 constexpr int kRestartEvery = 50;
 constexpr std::size_t kMaxNamespaces = 8;
@@ -369,7 +375,7 @@ protected:
             // A limit lowered by SetLimits: at or over it the create is refused and nothing changes (lowering deleted nothing).
             // Under it the count rule (topics alone, or topics plus view sinks) is the broker's: not modelled, skipped.
             if (n.topics.size() < n.maxTopics) return stepProbe(step);
-            ASSERT_EQ(r_.defineTopicCode(rootSid(), full(n, local)), static_cast<int>(pc::ErrorCode::NamespaceLimitExceeded))
+            ASSERT_EQ(r_.defineTopicCode(rootSid(), full(n, local)), kLimit)
                 << "create topic past maxTopics=" << n.maxTopics << " in " << n.name;
             trace_ += " refused-at-limit";
             return;
@@ -498,8 +504,13 @@ protected:
         platformAbort(n->nsId);
         closeTxnClient(n->name);
         evictSessions(n->users);
-        for (const std::string& u : g.users)
-            ASSERT_NE(loginCode(u), 0) << "a user of the deleted namespace " << n->name << " logged in";
+        for (const std::string& u : g.users) {
+            // AuthUnavailable (48) is the broker's own transient "my __security view is behind a committed event": it refuses
+            // and serves again once applied.  Wait it out (bounded), then the answer must be exactly AuthenticationFailed.
+            int code = loginCode(u);
+            for (int i = 0; i < 500 && code == static_cast<int>(pc::ErrorCode::AuthUnavailable); ++i) code = loginCode(u);
+            ASSERT_EQ(code, kAuthFailed) << "a user of the deleted namespace " << n->name << " must be refused AuthenticationFailed";
+        }
         gone_.push_back(std::move(g));
         ns_.erase(ns_.begin() + (n - ns_.data()));
     }
@@ -555,7 +566,7 @@ protected:
             ASSERT_EQ(code, 0) << "produce in an ACTIVE namespace";
             n->acked[it->first].push_back("");
         } else {
-            ASSERT_EQ(code, static_cast<int>(pc::ErrorCode::NamespaceSuspended)) << "produce in a ReadOnly namespace (invariant 8)";
+            ASSERT_EQ(code, kSuspended) << "produce in a ReadOnly namespace (invariant 8)";
         }
     }
     void stepCommitOffset() {
@@ -575,7 +586,7 @@ protected:
             ASSERT_EQ(code, 0) << "commit in an ACTIVE namespace";
             n->committed[it->first] = next;
         } else {
-            ASSERT_EQ(code, static_cast<int>(pc::ErrorCode::NamespaceSuspended)) << "OffsetCommit in a ReadOnly namespace (invariant 8)";
+            ASSERT_EQ(code, kSuspended) << "OffsetCommit in a ReadOnly namespace (invariant 8)";
         }
         if (n->committed.count(it->first))
             ASSERT_EQ(r_.committedOffset(sid, group, it->second), n->committed[it->first])
@@ -813,6 +824,8 @@ protected:
                 const Answer a = schemaOf(rootSid(), q);
                 ASSERT_NE(a.code, 0) << "topic " << q << " of the deleted namespace " << it->name << " still resolves (invariant 6)";
             }
+            for (const int32_t id : it->topicIds)   // by id: a produce to the old topic id answers UnknownTopic
+                ASSERT_EQ(r_.produce(rootSid(), id), kUnknownTopic) << "topic id " << id << " of the deleted namespace " << it->name << " still resolves (invariant 6)";
             for (const int32_t v : it->viewIds) {
                 const Answer a = viewRowOf(rootSid(), v);
                 ASSERT_NE(a.code, 0) << "view id " << v << " of the deleted namespace " << it->name << " still readable (invariant 6)";
@@ -851,12 +864,15 @@ protected:
         ASSERT_TRUE(awaitIds(want)) << "after restart: model topics not all listed";
         const Fingerprint f2 = fingerprint();
         ASSERT_TRUE(f1 == f2) << "restart changed the world (invariant 3)\n  before: " << show(f1) << "\n  after:  " << show(f2);
+        // the delete invariant survives the restart: no deleted namespace holds a live offset or transaction-state key
+        for (const GoneNs& g : gone_)
+            ASSERT_TRUE(r_.broker().node().nsKeyedStoresCleanForTest(g.nsId)) << "deleted " << g.name << " (id " << g.nsId << ") still holds a keyed-store key after the restart";
         // the gates survived: a RejectAll namespace refuses its logins, a ReadOnly one its produce
         for (const NsModel& n : ns_) {
             if (n.state == 2 && !n.users.empty())
-                ASSERT_EQ(loginCode(n.users[0]), static_cast<int>(pc::ErrorCode::NamespaceSuspended)) << n.name << " RejectAll after restart";
+                ASSERT_EQ(loginCode(n.users[0]), kSuspended) << n.name << " RejectAll after restart";
             if (n.state == 1 && !n.topics.empty() && !n.users.empty())
-                ASSERT_EQ(r_.produce(userSid(n.users[0]), n.topics.begin()->second), static_cast<int>(pc::ErrorCode::NamespaceSuspended))
+                ASSERT_EQ(r_.produce(userSid(n.users[0]), n.topics.begin()->second), kSuspended)
                     << n.name << " ReadOnly after restart";
         }
     }
@@ -1019,7 +1035,7 @@ protected:
             if (n.state != 0 || rnd(2) == 0) continue;
             if (n.limited && n.topics < n.maxTopics) return;   // under a lowered limit: the count rule is the broker's, not modelled
             const auto a = trio_.define(leader_, {.name = "t" + std::to_string(step), .partitions = 1, .nsId = n.nsId});
-            if (n.limited) ASSERT_EQ(a.code, static_cast<int>(rune::protocol::client::ErrorCode::NamespaceLimitExceeded)) << name << " at maxTopics";
+            if (n.limited) ASSERT_EQ(a.code, kLimit) << name << " at maxTopics";
             else { ASSERT_EQ(a.code, 0) << name; ++n.topics; }
             return;
         }
@@ -1162,6 +1178,6 @@ protected:
 
 TEST_P(NamespaceLifecycleStressTrioRegression, SeededModelRegression) { run(); }
 
-INSTANTIATE_TEST_SUITE_P(Seeds, NamespaceLifecycleStressTrioRegression, ::testing::Range(1u, 7u));
+INSTANTIATE_TEST_SUITE_P(Seeds, NamespaceLifecycleStressTrioRegression, ::testing::Range(1u, 21u));
 
 }  // namespace rune::node::test

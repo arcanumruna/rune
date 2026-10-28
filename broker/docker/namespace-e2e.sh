@@ -381,6 +381,9 @@ ws_run_ex "ro-produce" 2 a/alice /work/alice.pw produce 5
 if [ "${WS_RC}" -eq 0 ] && echo "${WS_OUT}" | grep -q "WS-PRODUCER: acked=5 failed=0"; then
     echo "${WS_OUT}" | tail -20 >&2; fail "step 11: alice's produce was served in a ReadOnly namespace"
 fi
+# Not just "any failure": the client output must name the suspension (NamespaceSuspended, code 51).
+echo "${WS_OUT}" | grep -qE 'NamespaceSuspended|errorCode=51|\(51\)' \
+    || { echo "${WS_OUT}" | tail -20 >&2; fail "step 11: alice's refused produce does not report NamespaceSuspended (51)"; }
 ws_run_ex "ro-consume" 2 a/alice /work/alice.pw consume 0 "RUNE_CONSUME_EXPECT=${RECORDS}"
 [ "${WS_RC}" -eq 0 ] || { echo "${WS_OUT}" | tail -20 >&2; fail "step 11: alice's fetch was not served in a ReadOnly namespace (exit ${WS_RC})"; }
 ns_as admin /work/admin.pw resume a --broker "rune-1:${BROKER_PORT}" || fail "step 11: resume failed"
@@ -420,14 +423,27 @@ log "step 12 OK"
 # ---------------------------------------------------------------------------
 log "step 13: produce-bytes-per-sec=20000: alice is throttled, backs off, and succeeds..."
 ns_as admin /work/admin.pw limits a --set produce-bytes-per-sec=20000 --broker "rune-1:${BROKER_PORT}" || fail "step 13: limits --set failed"
+# The control run: the same 3000 records with no rate limit (limit 0 = unlimited).  Neither the example client nor the broker
+# exposes a Throttled counter to this script (the client backs off silently; the broker's count is a test seam only), so the
+# throttle is proven by contrast with this control, not by a bare "took >= 2".
+ns_as admin /work/admin.pw limits a --set produce-bytes-per-sec=0 --broker "rune-1:${BROKER_PORT}" || fail "step 13: clearing the rate failed"
+t0=${SECONDS}
+ws_run_ex "unthrottled" 1 a/alice /work/alice.pw produce 3000
+base=$(( SECONDS - t0 ))
+[ "${WS_RC}" -eq 0 ] && echo "${WS_OUT}" | grep -q "WS-PRODUCER: acked=3000 failed=0" \
+    || { echo "${WS_OUT}" | tail -20 >&2; fail "step 13: the unthrottled control run did not get every record acked (exit ${WS_RC})"; }
+ns_as admin /work/admin.pw limits a --set produce-bytes-per-sec=20000 --broker "rune-1:${BROKER_PORT}" || fail "step 13: limits --set failed"
 t0=${SECONDS}
 ws_run_ex "throttled" 1 a/alice /work/alice.pw produce 3000
 took=$(( SECONDS - t0 ))
 [ "${WS_RC}" -eq 0 ] && echo "${WS_OUT}" | grep -q "WS-PRODUCER: acked=3000 failed=0" \
     || { echo "${WS_OUT}" | tail -20 >&2; fail "step 13: the throttled client did not get every record acked (exit ${WS_RC})"; }
-[ "${took}" -ge 2 ] || fail "step 13: 3000 records at 20000 B/s took ${took}s; the throttle never made the client wait"
+[ "${took}" -ge 2 ] && [ "${took}" -ge $(( base * 2 )) ] && [ "${took}" -gt "${base}" ] \
+    || fail "step 13: 3000 records at 20000 B/s took ${took}s against ${base}s unthrottled; the throttle never made the client wait"
+# A failed record would hide a refused (not retried) Throttled: the throttled run must also report no failure at all.
+echo "${WS_OUT}" | grep -q "failed=0" || fail "step 13: the throttled run reports failed records"
 ns_as admin /work/admin.pw limits a --set produce-bytes-per-sec=0 --broker "rune-1:${BROKER_PORT}" || fail "step 13: clearing the rate failed"
-log "step 13 OK (${took}s)"
+log "step 13 OK (${took}s throttled, ${base}s unthrottled)"
 
 # ---------------------------------------------------------------------------
 # Step 14: restart the cluster: the max-topics limit and a ReadOnly suspend survive.
@@ -440,6 +456,8 @@ ws_run_ex "ro-restart" 1 a/alice /work/alice.pw produce 5
 if [ "${WS_RC}" -eq 0 ] && echo "${WS_OUT}" | grep -q "WS-PRODUCER: acked=5 failed=0"; then
     echo "${WS_OUT}" | tail -20 >&2; fail "step 14: a ReadOnly namespace served a produce after the restart"
 fi
+echo "${WS_OUT}" | grep -qE 'NamespaceSuspended|errorCode=51|\(51\)' \
+    || { echo "${WS_OUT}" | tail -20 >&2; fail "step 14: the refused produce after the restart does not report NamespaceSuspended (51)"; }
 ns_as admin /work/admin.pw resume a --broker "rune-1:${BROKER_PORT}" || fail "step 14: resume failed"
 expect_refusal "step 14: a second topic over max-topics=1 after the restart" "NamespaceLimitExceeded" a_admin_topic t2
 log "step 14 OK"
@@ -456,6 +474,16 @@ ns_as admin /work/admin.pw delete a --yes --broker "rune-1:${BROKER_PORT}" || fa
 still_listed() { ns_listed "${old_id}"; }
 gone() { ! still_listed; }
 wait_until "${SERVING_WAIT_S}" "the deleted namespace ${old_id} to leave the listing" gone || fail "step 15: ns ${old_id} is still listed ${SERVING_WAIT_S}s after the delete"
+# The data is gone from every node's volume: no ns-<old_id> directory (nor ns-<old_id>.deleting) is left.
+ns_dir_gone() {
+    local n out
+    for n in 1 2 3; do
+        out=$(docker exec "$(cname "${n}")" find /var/lib/rune -maxdepth 3 \( -name "ns-${old_id}" -o -name "ns-${old_id}.deleting" \) 2>&1) || return 1
+        [ -z "${out}" ] || return 1
+    done
+}
+wait_until "${SERVING_WAIT_S}" "ns-${old_id} to vanish from every node's data volume" ns_dir_gone \
+    || { for n in 1 2 3; do docker exec "$(cname "${n}")" find /var/lib/rune -maxdepth 3 -name "ns-${old_id}*" >&2 || true; done; fail "step 15: ns-${old_id} is still on a node's data volume"; }
 expect_refusal "step 15: a/alice logging in to the deleted namespace" "AuthenticationFailed" \
     ql_as a/alice /work/alice.pw -e "show topics;" --broker "rune-2:${BROKER_PORT}"
 ns_as admin /work/admin.pw create a --broker "rune-1:${BROKER_PORT}" || fail "step 15: creating a again failed"

@@ -19,6 +19,7 @@
 //   |                      | itself                                 |       | table: 51 at the worker, nothing appended         |
 #include "support/AuthRig.h"
 #include "support/AuthTrio.h"
+#include "support/NamespaceLifecycleMatrixExpectations.h"
 
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
@@ -54,10 +55,12 @@ using RequestId = rune::protocol::RequestId;
 namespace {
 
 constexpr int kNoAns = 0xFFFF;
-constexpr int kSuspended = static_cast<int>(pc::ErrorCode::NamespaceSuspended);
-constexpr int kLimit = static_cast<int>(pc::ErrorCode::NamespaceLimitExceeded);
-constexpr int kThrottled = static_cast<int>(pc::ErrorCode::Throttled);
-constexpr int kAuthFailed = static_cast<int>(pc::ErrorCode::AuthenticationFailed);
+namespace nslc = rune::node::test::nslc;   // the matrix expectations header: the one source of the codes
+constexpr int kSuspended = static_cast<int>(nslc::ErrorCode::NamespaceSuspended);
+constexpr int kLimit = static_cast<int>(nslc::ErrorCode::NamespaceLimitExceeded);
+constexpr int kThrottled = static_cast<int>(nslc::ErrorCode::Throttled);
+constexpr int kAuthFailed = static_cast<int>(nslc::ErrorCode::AuthenticationFailed);
+constexpr int kSessionRevoked = static_cast<int>(nslc::ErrorCode::SessionRevoked);
 
 struct Ans { int code = kNoAns; uint64_t id = 0; std::string detail; };
 
@@ -180,8 +183,9 @@ public:
                 int64_t s = 0;
                 try { s = sid(user, id); } catch (const std::exception&) { continue; }
                 last = await(f(id, s), 15s);
-                if (last.code == kNoAns || last.code == 44 || last.code == 46) { forget(id); continue; }
-                if (last.code != 2 && last.code != 3 && last.code != 48) return last;
+                if (last.code == kNoAns || last.code == kAuthFailed || last.code == kSessionRevoked) { forget(id); continue; }
+                if (last.code != static_cast<int>(pc::ErrorCode::NotLeader) && last.code != static_cast<int>(pc::ErrorCode::Redirect) &&
+                    last.code != static_cast<int>(pc::ErrorCode::AuthUnavailable)) return last;
             }
             if (Clock3::now() >= deadline) return last;
             std::this_thread::sleep_for(50ms);
@@ -467,6 +471,7 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
     rc::Completions cq(c);
     uint64_t key = 0;
     struct Tally { int ok = 0, refused = 0, other = 0; int lastCode = 0; int lastStatus = 0; };
+    int acked = 0;   // every burst's acked records, not only the last burst's
     auto burst = [&](int n) {
         Tally tl;
         const std::vector<uint8_t> v(64, 9);
@@ -484,6 +489,7 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
             });
             std::this_thread::sleep_for(1ms);
         }
+        acked += tl.ok;
         return tl;
     };
     const Tally before = burst(50);
@@ -501,7 +507,7 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
     ASSERT_TRUE(AuthTrio::until(30s, [&] { after = burst(50); return after.ok == 50; })) << "after resume: ok " << after.ok << ", other " << after.other;
     p.close();
 
-    const int total = before.ok + after.ok;
+    const int total = acked;
     // Every replica holds exactly the acked records.
     for (int n = 1; n <= 3; ++n) {
         const int64_t end = W.t.node(n).onOwnerThreadForTest(W.tA, 0, [](rune::replication::PartitionReplica* r) {
@@ -518,8 +524,11 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
     rc::SubscribeOptions so;
     so.from = rc::From::earliest();
     rc::Subscription sub = c.subscribe(th, 0, so, [&](const rc::Record&) { ++got; });
-    EXPECT_TRUE(AuthTrio::until(40s, [&] { return got.load() >= total; })) << "consumed " << got.load() << " of " << total;
-    std::this_thread::sleep_for(200ms);
+    // Bounded wait until the consumer has read up to the log end offset, then compare with what was acked.
+    const int64_t logEnd = W.t.node(1).onOwnerThreadForTest(W.tA, 0, [](rune::replication::PartitionReplica* r) {
+        return r != nullptr ? r->logEndOffset() : int64_t{-1};
+    });
+    EXPECT_TRUE(AuthTrio::until(40s, [&] { return got.load() >= logEnd; })) << "consumed " << got.load() << " of log end " << logEnd;
     EXPECT_EQ(got.load(), total) << "produced != consumed";
     sub.unsubscribe();
 }
