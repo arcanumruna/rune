@@ -58,7 +58,7 @@ struct EmbeddedDriverConfig {
     /// Hosts this driver's endpoints use (loopback decides the derived MTU).
     /// Empty = loopback.
     std::vector<std::string> endpointHosts;
-    int32_t     maxMessagesPerSend = 0;      ///< 0 = Aeron default (2), or 16 when GSO can group at this MTU
+    int32_t     maxMessagesPerSend = 0;      ///< 0 = Aeron default (4 since 1.51), or 16 when GSO can group at this MTU
     bool        udpGso             = true;   ///< install rune_gso bindings (Linux UDP GSO/GRO; else stock)
     bool        epollPoll          = true;   ///< A7: epoll-first transport polling (Linux; else stock)
     int32_t     senderIoVector     = 0;      ///< 0 = Aeron default

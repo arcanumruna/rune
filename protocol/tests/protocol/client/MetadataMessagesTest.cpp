@@ -621,3 +621,122 @@ TEST(MetadataMessagesReceiverIdRegression, AReceiverTrailerCountThatDoesNotParal
     EXPECT_EQ(dec->partitions[0].ingressReceiverId, 1);
     EXPECT_EQ(dec->partitions[1].ingressReceiverId, 255);
 }
+
+// ===========================================================================
+// v16 NAT-safe egress: response-port trailer
+// ===========================================================================
+namespace {
+struct PortsFixture {
+    std::vector<rpc::BrokerEntry>    brokers;
+    std::vector<rpc::PartitionEntry> parts;
+    PortsFixture() {
+        brokers.resize(2);
+        brokers[0].nodeId = 1; brokers[0].port = 7001; brokers[0].host = "a.example"; brokers[0].responseControlPort = 9001;
+        brokers[1].nodeId = 2; brokers[1].port = 7002; brokers[1].host = "b.example"; brokers[1].responseControlPort = 9002;
+        parts.resize(3);
+        const int32_t ports[3] = {9101, 9102, 0};
+        for (int i = 0; i < 3; ++i) {
+            parts[i].topicId = 5; parts[i].partition = i; parts[i].leaderId = 1; parts[i].leaderEpoch = 3;
+            parts[i].ingressStreamId = 100 + i; parts[i].responseControlPort = ports[i];
+        }
+    }
+    rpc::MetadataResponse response(int32_t clientVersion) const {
+        rpc::MetadataResponse r;
+        r.sessionId = 1; r.correlationId = 2; r.clientVersion = clientVersion;
+        r.brokers = std::span<const rpc::BrokerEntry>(brokers);
+        r.partitions = std::span<const rpc::PartitionEntry>(parts);
+        return r;
+    }
+};
+std::vector<uint8_t> encodeMd(const rpc::MetadataResponse& r) {
+    std::vector<uint8_t> buf(r.encodedSize());
+    const std::size_t n = r.encode(buf.data());
+    EXPECT_EQ(n, buf.size());
+    return buf;
+}
+} // namespace
+
+TEST(MetadataResponsePortsRegression, RoundTripsBrokerAndPartitionPortsRegression) {
+    PortsFixture f;
+    const auto buf = encodeMd(f.response(16));
+    const auto out = rpc::MetadataResponse::decode(buf.data(), buf.size());
+    ASSERT_TRUE(out.has_value());
+    ASSERT_EQ(out->brokers.size(), 2u);
+    ASSERT_EQ(out->partitions.size(), 3u);
+    EXPECT_EQ(out->brokers[0].responseControlPort, 9001);
+    EXPECT_EQ(out->brokers[1].responseControlPort, 9002);
+    EXPECT_EQ(out->partitions[0].responseControlPort, 9101);
+    EXPECT_EQ(out->partitions[1].responseControlPort, 9102);
+    EXPECT_EQ(out->partitions[2].responseControlPort, 0);
+    EXPECT_EQ(out->brokers[1].host, "b.example");
+    EXPECT_EQ(out->partitions[2].ingressStreamId, 102);
+}
+
+TEST(MetadataResponsePortsRegression, BelowV16WritesNoPortsRegression) {
+    PortsFixture f;
+    const auto old = encodeMd(f.response(15));
+    PortsFixture zero;
+    for (auto& b : zero.brokers) b.responseControlPort = 0;
+    for (auto& p : zero.parts) p.responseControlPort = 0;
+    EXPECT_EQ(old, encodeMd(zero.response(15)));
+    const auto out = rpc::MetadataResponse::decode(old.data(), old.size());
+    ASSERT_TRUE(out.has_value());
+    for (const auto& b : out->brokers) EXPECT_EQ(b.responseControlPort, 0);
+    for (const auto& p : out->partitions) EXPECT_EQ(p.responseControlPort, 0);
+}
+
+TEST(MetadataResponsePortsRegression, AllZeroPortsAtV16IsUnchangedRegression) {
+    PortsFixture f;
+    for (auto& b : f.brokers) b.responseControlPort = 0;
+    for (auto& p : f.parts) p.responseControlPort = 0;
+    EXPECT_EQ(encodeMd(f.response(16)), encodeMd(f.response(15)));
+}
+
+TEST(MetadataResponsePortsRegression, OldDecoderStopsBeforeThePortsRegression) {
+    PortsFixture f;
+    f.parts[1].ingressEndpoint = "w.example:7100";
+    f.parts[1].ingressReceiverId = 2;
+    const auto resp = f.response(16);
+    const auto buf = encodeMd(resp);
+    const std::size_t trailer = 2u + 2u * 4u + 2u + 3u * 4u;
+    const auto out = rpc::MetadataResponse::decode(buf.data(), buf.size() - trailer);
+    ASSERT_TRUE(out.has_value());
+    for (const auto& b : out->brokers) EXPECT_EQ(b.responseControlPort, 0);
+    for (const auto& p : out->partitions) EXPECT_EQ(p.responseControlPort, 0);
+    EXPECT_EQ(out->partitions[1].ingressReceiverId, 2);
+    EXPECT_EQ(out->partitions[1].ingressEndpoint, "w.example:7100");
+}
+
+TEST(MetadataResponsePortsRegression, TornOrMismatchedPortTrailerIsRejectedRegression) {
+    PortsFixture f;
+    const auto buf = encodeMd(f.response(16));
+    const std::size_t trailer = 2u + 2u * 4u + 2u + 3u * 4u;
+    const std::size_t start = buf.size() - trailer;
+    // start itself is a valid absent-trailer frame; every cut strictly inside is torn.
+    for (std::size_t cut = start + 1; cut < buf.size(); ++cut)
+        EXPECT_FALSE(rpc::MetadataResponse::decode(buf.data(), cut).has_value()) << "cut=" << cut;
+    auto badBrokers = buf;
+    badBrokers[start] = 3;
+    EXPECT_FALSE(rpc::MetadataResponse::decode(badBrokers.data(), badBrokers.size()).has_value());
+    auto badParts = buf;
+    badParts[start + 2 + 8] = 4;
+    EXPECT_FALSE(rpc::MetadataResponse::decode(badParts.data(), badParts.size()).has_value());
+}
+
+TEST(MetadataResponsePortsRegression, WithEndpointsAndReceiverIdsRegression) {
+    PortsFixture f;
+    f.parts[0].ingressEndpoint = "w0.example:7100";
+    f.parts[1].ingressEndpoint = "w1.example:7101";
+    f.parts[0].ingressReceiverId = 1;
+    f.parts[2].ingressReceiverId = 3;
+    const auto buf = encodeMd(f.response(16));
+    const auto out = rpc::MetadataResponse::decode(buf.data(), buf.size());
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->partitions[0].ingressEndpoint, "w0.example:7100");
+    EXPECT_EQ(out->partitions[1].ingressEndpoint, "w1.example:7101");
+    EXPECT_TRUE(out->partitions[2].ingressEndpoint.empty());
+    EXPECT_EQ(out->partitions[0].ingressReceiverId, 1);
+    EXPECT_EQ(out->partitions[2].ingressReceiverId, 3);
+    EXPECT_EQ(out->brokers[0].responseControlPort, 9001);
+    EXPECT_EQ(out->partitions[1].responseControlPort, 9102);
+}

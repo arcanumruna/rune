@@ -39,6 +39,11 @@ namespace rune::protocol::client {
 // This mirrors the additive blockLength/avail-gated idiom used elsewhere in
 // this codec (see Produce's BODY_FIXED_V0/V1 in DataMessages.h) without
 // bumping kProtocolVersion.
+//
+// v16 (NAT-safe egress, kClientVersionResponseEgress): the crypto block is ALWAYS present (empty fields encode as
+// zero-length var fields: 2+4+2 bytes), followed by one byte responseCorrelated (0 or 1; anything else is rejected).
+// A frame with clientVersion < 16 is byte-identical to before.  On decode a v16 frame that ends right after the
+// crypto block has responseCorrelated = false; bytes after the flag are ignored (later additive fields).
 // ---------------------------------------------------------------------------
 struct ConnectRequest {
     int64_t      sessionId       = 0;
@@ -51,6 +56,7 @@ struct ConnectRequest {
     std::span<const uint8_t> cipherList;    // client-preferred cipher ids, in order
     std::string_view         handshakeBytes; // opening handshake blob (e.g. TLS ClientHello)
     std::string_view         authToken;      // optional bearer/auth token
+    bool responseCorrelated = false;  // v16: replies ride an Aeron response publication (see kClientVersionResponseEgress)
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::Connect); // 1
     static constexpr uint16_t BODY_FIXED  = 8;  // fixed body bytes (not counting header or var fields)
@@ -58,6 +64,7 @@ struct ConnectRequest {
     /// Encode the full frame into buf.  buf must be large enough:
     ///   MessageHeader::ENCODED_SIZE + BODY_FIXED + 2 + egressChannel.size()
     ///   [+ 2+cipherList.size() + 4+handshakeBytes.size() + 2+authToken.size() if offering crypto]
+    ///   [at clientVersion >= 16: the crypto block is always written (+2+4+2 when empty) and then +1 flag byte]
     /// Returns total bytes written.
     std::size_t encode(uint8_t* buf) const noexcept {
         // Write header
@@ -83,13 +90,15 @@ struct ConnectRequest {
         // so an old-style ConnectRequest (no crypto fields set) encodes to
         // byte-identical output as before this task.
         const bool offersCrypto = !cipherList.empty() || !handshakeBytes.empty() || !authToken.empty();
-        if (offersCrypto) {
+        const bool writeCryptoBlock = offersCrypto || clientVersion >= kClientVersionResponseEgress;
+        if (writeCryptoBlock) {
             pos += putVarBytes(buf + pos, cipherList.data(), static_cast<uint16_t>(cipherList.size()));
             pos += putVarBytes32(buf + pos,
                                  reinterpret_cast<const uint8_t*>(handshakeBytes.data()),
                                  static_cast<uint32_t>(handshakeBytes.size()));
             pos += putVarStr(buf + pos, authToken);
         }
+        if (clientVersion >= kClientVersionResponseEgress) buf[pos++] = responseCorrelated ? 1 : 0;
 
         return pos;
     }
@@ -135,6 +144,13 @@ struct ConnectRequest {
             msg.handshakeBytes = std::string_view(reinterpret_cast<const char*>(hbData), hbLen);
 
             if (!getVarStr(buf, avail, pos, msg.authToken)) return std::nullopt;
+        }
+
+        // v16: the response-correlated flag follows the crypto block; absent = false.
+        if (msg.clientVersion >= kClientVersionResponseEgress && pos < avail) {
+            const uint8_t f = buf[pos++];
+            if (f > 1) return std::nullopt;
+            msg.responseCorrelated = f == 1;
         }
 
         return msg;

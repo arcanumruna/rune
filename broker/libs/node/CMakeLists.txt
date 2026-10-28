@@ -1268,6 +1268,10 @@ if(BUILD_TESTING)
             target_link_libraries(rune_aeron_pump_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_aeron_pump_tests PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
+            add_executable(rune_response_egress_spike_tests tests/integration/ResponseEgressSpikeRegressionTest.cpp)
+            target_link_libraries(rune_response_egress_spike_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_response_egress_spike_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
             # A9: worker ring doorbells (op / session / ret_ space wait), parked shard runner wake,
             # ADMIN_ACTION retry on worker claims — REAL invoker driver.
             add_executable(rune_worker_doorbell_tests tests/node/WorkerDoorbellTest.cpp)

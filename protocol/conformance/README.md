@@ -9,6 +9,7 @@ conformance/
   vectors/               — 10 committed golden .bin files
     connect_request.bin                  (67 bytes)
     connect_request_empty_channel.bin    (34 bytes)
+    connect_request_v16_response.bin     (43 bytes, NAT-safe egress)
     connect_response.bin                 (38 bytes)
     connect_response_redirect.bin        (38 bytes)
     connect_response_v3.bin              (42 bytes, brokerVersion 3; the two above are the v0 form)
