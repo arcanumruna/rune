@@ -397,7 +397,8 @@ log "step 11 OK"
 # AuthenticationFailed (wrong one); resume: the login works.
 # ---------------------------------------------------------------------------
 log "step 12: rune namespace suspend a --reject-all..."
-( docker exec -e RUNE_MODE=ws -e RUNE_WS_ROLE=produce -e RUNE_USER=a/alice -e RUNE_PASSWORD_FILE=/work/alice.pw \
+( set +e   # the client must exit non-zero here (RejectAll ends its session): record that status, never abort on it
+  docker exec -e RUNE_MODE=ws -e RUNE_WS_ROLE=produce -e RUNE_USER=a/alice -e RUNE_PASSWORD_FILE=/work/alice.pw \
       -e "RUNE_TARGET=aeron:udp?endpoint=rune-1:${BROKER_PORT}" -e "RUNE_EGRESS=aeron:udp?endpoint=${TOOLS}:$(( EGRESS_BASE + 90 ))" \
       -e RUNE_DATA_DIR=/tmp/ws-live -e "RUNE_CLIENT_TOPIC_TABLE=${TOPIC_TABLE}" -e RUNE_TIMEOUT_MS=20000 \
       -e RUNE_PRODUCE_TOPIC=t -e RUNE_PRODUCE_N=0 -e RUNE_PRODUCE_INTERVAL_US=20000 -e RUNE_STOP_FILE=/work/never-exists -e RUNE_QUIET=1 \
