@@ -983,6 +983,16 @@ public:
         namespace rpc = rune::protocol::client;
         const auto ec = static_cast<rpc::ErrorCode>(static_cast<uint16_t>(code));
 
+        // A session-end notice (corr 0, SessionRevoked 46 / NamespaceSuspended 51) naming THIS session is terminal in every state
+        // that holds the session id and speaks over an established session: Authenticating, Resuming, Backoff (Connected below).
+        // Rejected, never resumed, never retried - also with reconnectForeverAfterLive.  Connecting / Handshaking hold no
+        // established session (the ConnectResponse / the TLS keys are still owed; a plaintext notice proves nothing): ignored.
+        if ((ec == rpc::ErrorCode::SessionRevoked || ec == rpc::ErrorCode::NamespaceSuspended) && incomingCorrelationId == 0 &&
+            (state_ == SessionState::Authenticating || state_ == SessionState::Resuming || state_ == SessionState::Backoff)) {
+            if (sessionId_ != 0 && noticeSessionId == sessionId_) rejectSessionEnd_(ec);
+            return;
+        }
+
         if (state_ == SessionState::Connected) {
             // F-A C1 (defence in depth): a session-fatal notice naming ANOTHER session (one this machine already
             // left) never moves this one.  0 = the notice names no session (kept: the old behaviour).
@@ -1001,9 +1011,7 @@ public:
                 // dropped / disabled — or {NamespaceSuspended 51, corr 0}: a RejectAll suspend of the user's namespace
                 // (client version 14; an older client gets 46).  The broker closes the session:
                 // terminal, never resumed or reconnected (a reconnect is AuthenticationFailed anyway).
-                rejectCode_       = static_cast<int16_t>(static_cast<uint16_t>(ec));
-                lastConnectError_ = rejectCode_;
-                transitionTo(SessionState::Rejected);
+                rejectSessionEnd_(ec);
             }
             return;
         }
@@ -1684,6 +1692,13 @@ private:
     // T15a R1 — never give up once Live (reconnectForeverAfterLive).
     // ------------------------------------------------------------------------
 
+    /// The broker ended this session for good (46 / 51): terminal Rejected(code).
+    void rejectSessionEnd_(rune::protocol::client::ErrorCode ec) noexcept {
+        rejectCode_       = static_cast<int16_t>(static_cast<uint16_t>(ec));
+        lastConnectError_ = rejectCode_;
+        transitionTo(SessionState::Rejected);
+    }
+
     /// Non-retriable broker answers: retrying cannot change them.
     /// client<->broker TLS/AEAD (Task 5): HandshakeFailed (cert verify failure,
     /// bad token, decrypt failure, ...) joins ProtocolVersion here — retrying the
@@ -1691,7 +1706,9 @@ private:
     [[nodiscard]] static bool isNonRetriable_(rune::protocol::client::ErrorCode ec) noexcept {
         return ec == rune::protocol::client::ErrorCode::ProtocolVersion ||
                ec == rune::protocol::client::ErrorCode::HandshakeFailed ||
-               ec == rune::protocol::client::ErrorCode::AuthenticationFailed;   // credentials are cluster-wide (D27)
+               ec == rune::protocol::client::ErrorCode::AuthenticationFailed ||   // credentials are cluster-wide (D27)
+               ec == rune::protocol::client::ErrorCode::SessionRevoked ||         // the user is gone / disabled
+               ec == rune::protocol::client::ErrorCode::NamespaceSuspended;       // RejectAll suspend of the user's namespace
     }
 
     [[nodiscard]] bool reconnectsForever_() const noexcept {
@@ -1743,6 +1760,10 @@ private:
         }
         lastConnectError_ = static_cast<int16_t>(static_cast<uint16_t>(ec));   // I2
         ++connectFailures_;
+        if (ec == rpc::ErrorCode::SessionRevoked || ec == rpc::ErrorCode::NamespaceSuspended) {
+            rejectSessionEnd_(ec);   // the login itself was answered "this user / namespace is ended": terminal, flag or not
+            return;
+        }
         if (!cfg_.reconnectForeverAfterLive) {
             transitionTo(SessionState::Disconnected);  // today's behaviour, unchanged
             return;

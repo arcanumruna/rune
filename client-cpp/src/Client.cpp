@@ -3660,6 +3660,9 @@ bool Client::onAuthErrorResponse_(const codec::ErrorResponseView& e) {
         // put that session's machine in Rejected (a notice naming a session this client left was dropped by the
         // agent's F-A C1 guard and arrives here with the id of no session we hold).
         if (e.sessionId != 0 && e.sessionId != snap.sessionId) return true;
+        // Only a notice the machine honoured (it is Rejected now: Connected / Authenticating / Resuming / Backoff naming
+        // our session) ends the Client's work; one it ignored (no established session, e.g. Connecting) moves nothing.
+        if (agent_.seedMachine().state() != session::SessionState::Rejected) return true;
         onSeedRevoked_(msg, code);
         return true;
     }

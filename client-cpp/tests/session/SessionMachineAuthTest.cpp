@@ -1082,7 +1082,7 @@ TEST(SessionMachineAuthRegression, SessionEndNoticeEveryStateRegression) {
                 if (at == At::Backoff && !forever) continue;   // Backoff exists only with reconnectForeverAfterLive
                 SCOPED_TRACE("state=" + std::to_string(static_cast<int>(at)) + " code=" + std::to_string(code) +
                              " forever=" + std::to_string(forever));
-                Rig t("ws1", "correct horse battery", forever);
+                Rig t("ws1", "correct horse battery", forever, /*allowUnauthenticated=*/at != At::Authenticating);
                 int64_t now = 1;
                 if (at == At::Connecting) {
                     t.m->connect(0);
