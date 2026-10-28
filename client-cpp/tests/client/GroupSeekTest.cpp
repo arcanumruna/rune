@@ -1054,3 +1054,54 @@ TEST(GroupSeekRegression, DriveRewindsAllocatesNothingIdleOrPendingAdversarialRe
     EXPECT_GT(sends, warmSends) << "the window never re-sent the fetch (the attack did not reach the send path)";
     EXPECT_EQ(r.seen[T].times, 0) << "the rewind ended inside the window (deadline 30 s)";
 }
+
+// ===========================================================================
+// C18 (#685, #684): the OffsetFetch machine across a session drop, and a seek that supersedes seekToCommitted
+// ===========================================================================
+
+// #685: a seekToCommitted whose OffsetFetch answer is held (in flight) when the seed session drops.  The answer can
+// never come over the new session; the fetch machine stayed Awaiting until sessionTimeoutMs (30 s here) before it
+// re-sent.  Now the session transition resets it: a NEW OffsetFetch goes out within 500 ms of duty time after the
+// reconnect.  Mutation: drop the resetOffsetFetch_ calls (setSessionConnected, onSessionDown) -> no new fetch.
+TEST(GroupSeekRegression, SeekToCommittedRefetchesRightAfterASessionDropRegression) {
+    Fixture f(5721, 5722, {{kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000), {{{kTopic, 1}, 40}}, manualClockOptions());
+    f.r.gw.holdOffsetFetch = true;
+    const int fetches0 = f.r.gw.offsetFetches;
+    const rc::Token t = f.tok();
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_TRUE(f.r.drive([&] { return f.r.gw.offsetFetches > fetches0; }, 20'000)) << "the fetch never went out";
+    const int fetchesHeld = f.r.gw.offsetFetches;
+
+    const int connects = f.r.gw.connectsAt[0];
+    f.r.gw.expireSession(f.r.seedSid);
+    ASSERT_TRUE(f.r.drive([&] { return f.r.gw.connectsAt[0] > connects; }, 50'000)) << "the seed never reconnected";
+    const int64_t t0 = g_clockNs;
+    constexpr int64_t kWindowNs = 500'000'000LL;   // far below sessionTimeoutMs (30 s)
+    EXPECT_TRUE(f.r.drive([&] { return f.r.gw.offsetFetches > fetchesHeld || g_clockNs - t0 > kWindowNs; }, 50'000));
+    EXPECT_GT(f.r.gw.offsetFetches, fetchesHeld)
+        << "no new OffsetFetch within 500 ms of duty time after the reconnect (waited for sessionTimeoutMs)";
+}
+
+// #684: a seek that supersedes a seekToCommitted leaves RewindResubscribe while the OTHER partition is still
+// offset-unknown; its fetch waited for the Client's 100 ms sweep.  Both commands are issued back to back (one duty
+// drain), so the seekToCommitted never sent its fetch.  The duty clock is frozen: the sweep cannot fire, so the
+// OffsetFetch for p1 can only come from driveRewinds.  Mutation: restore the AwaitFetch-only condition -> none.
+TEST(GroupSeekRegression, ASeekSupersedingSeekToCommittedFetchesTheOtherPartitionsAtOnceRegression) {
+    Fixture f(5723, 5724, {{kTopic, 0}, {kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000),
+              {{{kTopic, 0}, 30}, {{kTopic, 1}, 55}}, manualClockOptions());
+    freeze(f.r);
+    f.r.gw.holdOffsetFetch = true;   // the answer is held: its entries show which partitions were asked
+    const int fetches0 = f.r.gw.offsetFetches;
+    const rc::Token t = f.tok(), u = f.tok();
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_EQ(f.gc.seek({kTopic, 0}, 7, rc::CompletionTarget(f.r.cq), u), rc::OpResult::Accepted);
+    (void)passesUntil(f.r, f.done, 200);   // frozen clock
+    ASSERT_EQ(f.done[t].c.status, rc::OpStatus::Superseded);
+    ASSERT_EQ(f.r.gw.offsetFetches, fetches0 + 1) << "no OffsetFetch for the offset-unknown partition on the duty pass";
+    ASSERT_EQ(f.r.gw.heldOffsetFetches.size(), 1u);
+    const auto& frame = f.r.gw.heldOffsetFetches.front();
+    const auto rsp = rune::protocol::client::OffsetFetchResponse::decode(frame.data(), frame.size());
+    ASSERT_TRUE(rsp.has_value());
+    ASSERT_EQ(rsp->results.size(), 1u);
+    EXPECT_EQ(rsp->results[0].partition, 1) << "the fetch must name p1 (p0 is positioned by the seek)";
+}
