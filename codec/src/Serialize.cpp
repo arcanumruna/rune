@@ -253,6 +253,11 @@ Descriptor deserialize(std::span<const uint8_t> blob) {
         }
 
         if (type == PrimType::FixedStr) {
+            // Same failure type as every other malformed field in this function (never the builder's
+            // invalid_argument): a descriptor blob claiming a zero-width FixedStr is corrupt or hostile.
+            if (fixedLen == 0) {
+                throw std::runtime_error("deserialize: FixedStr field has zero width");
+            }
             builder.addFixedStrTagged(std::move(fieldName), tag, fixedLen,
                                       sinceVersion, untilVersion, isKeyByte != 0);
         } else {

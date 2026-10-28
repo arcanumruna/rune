@@ -109,6 +109,11 @@ public:
     DescriptorBuilder& addFixedStrTagged(std::string name, uint16_t tag, uint16_t len,
                                          uint16_t sinceVersion, uint16_t untilVersion,
                                          bool isKey) {
+        // A zero-width FixedStr has no storage: the column could never hold a value and every row layout built
+        // from it would be degenerate.  Refused here, at definition time (#667).
+        if (len == 0) {
+            throw std::invalid_argument("FixedStr column '" + name + "' needs a width of at least 1");
+        }
         FieldDescriptor f;
         f.name         = std::move(name);
         f.id           = tag;

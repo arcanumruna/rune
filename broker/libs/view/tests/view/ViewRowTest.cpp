@@ -42,6 +42,19 @@ TEST(ViewRow, VarLenColumnRejected) {
     EXPECT_THROW(buildRowLayout(d), std::invalid_argument);
 }
 
+// #667: a descriptor that bypasses the builder (hand-assembled fields) still never yields a zero-width slot.
+TEST(ViewRowRegression, BuildRowLayoutRefusesAZeroWidthFixedStrRegression) {
+    auto d = DescriptorBuilder("v",1).add("id",PrimType::Int64,1,true).addFixedStr("code",4).build();
+    EXPECT_NO_THROW(buildRowLayout(d));
+    d.fields[1].fixedLen = 0;
+    try {
+        buildRowLayout(d);
+        FAIL() << "a zero-width FixedStr produced a layout";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("FixedStr column 'code' has width 0"), std::string::npos);
+    }
+}
+
 TEST(ViewRow, SlotValueCodecRoundTripsEveryFixedType) {
     using P = rune::codec::PrimType;
     uint8_t buf[8];

@@ -354,6 +354,24 @@ TEST_F(DdlMalformedRequestRegression, DefineWithGarbageDescriptorIsInvalidSchema
     expectAnsweredUntouched(c, kInvalidSchema);
 }
 
+// #667: a descriptor carrying a zero-width FixedStr is malformed: refused, nothing registered or appended.
+TEST_F(DdlMalformedRequestRegression, DefineWithZeroWidthFixedStrDescriptorIsInvalidSchemaRegression) {
+    // FixedStr is the LAST field: its fixedLen (u16 LE) precedes the trailing untilVersion (u16 LE).
+    std::vector<uint8_t> blob = rune::codec::serialize(
+        rune::codec::DescriptorBuilder("character", 1)
+            .add("id", rune::codec::PrimType::Int64, 1, /*isKey=*/true)
+            .addFixedStr("zone", 8)
+            .build());
+    ASSERT_EQ(blob[blob.size() - 4], 8u);
+    blob[blob.size() - 4] = 0;
+    DefineTopicMsg m; m.name = "m"; m.keyField = "id"; m.blob = std::move(blob);
+    const uint64_t events = h.eventsAppended();
+    const int64_t c = h.submitRawDefine(std::move(m));
+    h.settle();
+    expectAnsweredUntouched(c, kInvalidSchema);
+    EXPECT_EQ(h.eventsAppended(), events);
+}
+
 // Catalog history (ruling 3): an EMPTY descriptor is an untyped topic, no longer a
 // malformed define — a ring frame the decode could not read is its own
 // alternative (MalformedDdl, below), so an empty blob never stands for one.
