@@ -1342,6 +1342,36 @@ TEST(StorageFailStopRegression, OpQueuedBeforeOwnershipMoveAnswersNotLeaderRegre
     EXPECT_EQ(log2.logEndOffset(), 0) << "no op is redirected to another log either";
 }
 
+TEST(StorageFailStopRegression, NamespaceDiskScanSkipsAReplicaMovedByAQueuedSetOwnershipRegression) {
+    // Namespaces Phase 2 (D25): the per-namespace disk recount walks owned_.  A SetOwnership still queued on the
+    // ingress ring when the scan comes due must be applied first: the recount never reads a replica (and its log)
+    // this worker no longer owns.  Mutation: run the scan before the ingress drain -> slot 3 counts the moved log.
+    TmpDir d, d2;
+    Log movedLog(d.path.string(), 64LL * 1024 * 1024); movedLog.recover();
+    Log keptLog(d2.path.string(), 64LL * 1024 * 1024); keptLog.recover();
+    movedLog.setNsTag(7, 3);
+    keptLog.setNsTag(8, 4);
+    (void)movedLog.append(batchAt(0, 4, 64), 3);
+    (void)keptLog.append(batchAt(0, 2, 64), 1);
+    ASSERT_GT(movedLog.bytesOnDisk(), 0);
+    ASSERT_GT(keptLog.bytesOnDisk(), 0);
+    NullTransport t;
+    PartitionReplica moved(cfg(1), Role::Leader, 1, {1}, {1}, &movedLog, &t);
+    PartitionReplica kept(cfg(1, 1, 1, 1), Role::Leader, 1, {1}, {1}, &keptLog, &t);
+    moved.setRegistryHandle(1, 11);
+    kept.setRegistryHandle(2, 12);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&moved, &kept});
+    WorkerOp own;
+    own.type = WorkerOp::Type::SetOwnership;
+    own.ownedSet = {&kept};
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(own)));
+    w.doWork(1);   // the first pass is past the (unarmed) scan deadline: the scan runs in this pass
+    ASSERT_FALSE(w.ownsReplicaForTest(&moved));
+    EXPECT_EQ(w.nsDiskBytesForTest(3), 0) << "the moved replica's log is not counted (nor read)";
+    EXPECT_EQ(w.nsDiskBytesForTest(4), keptLog.bytesOnDisk()) << "the kept replica's log is counted";
+}
+
 // ============================================================================
 // Fix round 3 — id + incarnation ownership guard, ordering, F7, I1.
 // ============================================================================

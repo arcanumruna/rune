@@ -132,10 +132,13 @@ TEST(NsScopedIdRegression, RoundTripAndDefaultIsIdentityRegression) {
     const co::ScopedIdView v7 = co::parseScopedId(s7);
     EXPECT_EQ(v7.nsId, 7u);
     EXPECT_EQ(v7.local, "g");
-    const co::ScopedIdView vMax = co::parseScopedId(co::scopedId(0xFFFFFFFEu, "grp"));
+    // The view borrows its input: keep each scoped string alive while the view is read.
+    const std::string sMax = co::scopedId(0xFFFFFFFEu, "grp");
+    const co::ScopedIdView vMax = co::parseScopedId(sMax);
     EXPECT_EQ(vMax.nsId, 0xFFFFFFFEu);
     EXPECT_EQ(vMax.local, "grp");
-    const co::ScopedIdView vEmpty = co::parseScopedId(co::scopedId(3, ""));
+    const std::string sEmpty = co::scopedId(3, "");
+    const co::ScopedIdView vEmpty = co::parseScopedId(sEmpty);
     EXPECT_EQ(vEmpty.nsId, 3u);
     EXPECT_EQ(vEmpty.local, "");
     // Little-endian: nsId 0x01020304.
@@ -491,7 +494,6 @@ std::vector<std::pair<int64_t, std::string>> consumeAndCommit(AuthBroker& b, con
     auto c = newClient(b, user, {t});
     rc::GroupConfig gcfg;
     gcfg.autoCommit       = false;
-    gcfg.autoOffsetReset  = rc::OffsetReset::Earliest;
     gcfg.sessionTimeoutMs = 10'000;
     rc::GroupConsumer gc = c->subscribeGroup(group, {t.name}, gcfg);
     Collected got;

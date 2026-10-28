@@ -1797,7 +1797,6 @@ public:
         // pass and every mode — never behind data ops or any backlog.
         work += drainSessionOps_();
         work += beginPushPass_();   // F5: push budget + last pass's deferred reads first
-        if (nowNs >= nextDiskScanNs_) [[unlikely]] scanNamespaceDisk_(nowNs);   // Namespaces Phase 2 Task 11 (D25)
         if (nowNs >= nextNsReportNs_) [[unlikely]] {   // Task 14: the first tick only arms the deadline (nothing to report yet)
             const bool armed = nextNsReportNs_ != kNsReportUnarmed;
             nextNsReportNs_ = nowNs + nsReportIntervalNs_;
@@ -1915,6 +1914,9 @@ public:
             work += pushSubscriptions_(nowNs);
         }
 
+        // Namespaces Phase 2 Task 11 (D25): the disk recount walks owned_, so it runs only after this pass's
+        // ingress drain applied any queued SetOwnership — never over a replica this worker no longer owns.
+        if (nowNs >= nextDiskScanNs_) [[unlikely]] scanNamespaceDisk_(nowNs);
         // Step 6.5: drain cleaner/retention/staging queues (disk-backed only).
         for (auto* replica : owned_) {
             if (replica && replica->isDiskBacked()) {
@@ -2030,6 +2032,7 @@ private:
             work += reapDurableCompletions_();
         }
         // Cold tail: consumer egress push, cleaner drains, time-gated log sync.
+        if (nowNs >= nextDiskScanNs_) [[unlikely]] scanNamespaceDisk_(nowNs);   // after the drain (see doWork)
         {
             FLIGHT_RECORDER_SLOW_SPAN_RUNTIME(flight_recorder::Site::ShStageColdTail, frW);
             work += pushSubscriptions_(nowNs);

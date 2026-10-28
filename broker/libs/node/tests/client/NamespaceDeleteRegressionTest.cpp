@@ -149,7 +149,6 @@ TEST(NamespaceDeleteRegression, RecreateSeesNothingOld) {
         ASSERT_EQ(p.closeAndWait(30s), rc::OpStatus::Ok);
         rc::GroupConfig gcfg;
         gcfg.autoCommit = false;
-        gcfg.autoOffsetReset = rc::OffsetReset::Earliest;
         gcfg.sessionTimeoutMs = 10'000;
         rc::GroupConsumer gc = ua->subscribeGroup("g", {"t"}, gcfg);
         std::atomic<size_t> n{0};
@@ -208,7 +207,6 @@ TEST(NamespaceDeleteRegression, RecreateSeesNothingOld) {
     // only the 3 new records.
     rc::GroupConfig gcfg;
     gcfg.autoCommit = false;
-    gcfg.autoOffsetReset = rc::OffsetReset::Earliest;
     gcfg.sessionTimeoutMs = 10'000;
     rc::GroupConsumer gc = ua2->subscribeGroup("g", {"t"}, gcfg);
     std::mutex mu;
