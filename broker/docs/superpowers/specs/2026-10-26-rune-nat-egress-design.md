@@ -57,8 +57,8 @@ Decisions:
   explicit base derives none and warns (`RUNE_RESPONSE_CONTROL_BASE_PORT`, `RUNE_GATEWAY_RESPONSE_CONTROL_PORT`; port 0 =
   not available, the node serves new clients on the old path). Peers advertise them as `RUNE_PEERS` segments 7 and 8.
   They are advertised in Metadata next to `egressControlPort`, and added to `nodeBoundPorts`, the MTU host list and
-  `docs/operations.md`. Task 2 decides whether several response publications can share one control port; if not,
-  the design stops and comes back here.
+  `docs/operations.md`. Task 2 confirmed on Aeron 1.51.0 that several exclusive response publications share one
+  control port, each reaching only its correlated client (`ResponseEgressSpikeRegression.*`).
 - **D4.** **Wire.** A new `kClientVersionResponseEgress`:
   - **New clients** send an empty `egressChannel` and a `responseCorrelated` flag. The broker answers only on the
     response publication.
