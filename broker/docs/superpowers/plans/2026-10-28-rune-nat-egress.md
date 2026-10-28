@@ -87,6 +87,9 @@ See spec §5.
 - Wire them into `nodeBoundPorts` and `nodeEndpointHosts`, `RUNE_PEERS` advertising, Metadata, and the startup port
   collision checks.
 - Document them in `docs/configuration.md` and `docs/operations.md` (firewall table).
+- **Layout depends on W.** Worker `w`'s response-control port is `egressBase + 63 - W + w`, so changing `RUNE_WORKERS`
+  moves every worker's port. Every node must agree on W (it already must for shard routing); firewall rules cover
+  `egressBase + 32 .. egressBase + 63`.
 
 ### Task 5: gateway (D2, D4)
 - **New client** (`clientVersion >= kClientVersionResponseEgress` and `responseCorrelated`):
@@ -97,7 +100,14 @@ See spec §5.
 - **Old client:** the unchanged declared path.
 - **Both paths:** the session's source address comes from `image.sourceIdentity()` (fixes #227;
   `DdlPrincipalSourceIsTheImageRegression`).
-- **Per-(session, worker) record egress, legacy mode:** the same response publication rule.
+- **Per-(session, worker) record egress, legacy mode (deviation):** keeps the declared channel. One request
+  publication correlates exactly one response subscription, so a legacy per-worker Records flow cannot be correlated
+  without a new client request flow. Filed as #745; shard mode (the default) is covered by Task 6.
+- **Redirect:** for sessions `>= kClientVersionResponseEgress` the Redirect message is
+  `leaderClientEndpoint + "#" + leaderGatewayResponsePort` (no suffix when the port is 0).
+- **Metadata:** `BrokerEntry.responseControlPort` is filled; `PartitionEntry.responseControlPort` stays 0 until
+  Task 6.
+- `kBrokerVersion` becomes 9.
 - **Tests:**
   - `ResponseEgressGatewayRegression.*`: a new client connects with an unroutable declared channel and still gets its
     ConnectResponse;
@@ -107,11 +117,10 @@ See spec §5.
 ### Task 6: workers, shard mode (D2, D6)
 - `SessionAnnouncer` ships the client's ingress image key (the client's Aeron `sessionId` on each worker's ingress)
   in place of the channel for new clients.
-- On its own thread, the worker creates:
-  - the `SessionAckSink` response publication;
-  - the per-session Records response publication.
-
-  Both use the bounded `WorkerEgress`-style resolve.
+- On its own thread, the worker creates ONE response publication per (client, worker), carrying both the
+  `SessionAckSink` acks and the session's Records, with the bounded `WorkerEgress`-style resolve. One request
+  publication (the client's ingress to that worker) correlates exactly one response subscription, so acks and
+  Records cannot ride separate response flows.
 - A subscribe that arrives before its response publication resolves parks, as #118's `AwaitingEgress` does today.
 - **Tests:**
   - `ResponseEgressWorkerRegression.*`: acks and Records reach a new client on response publications only;
@@ -127,6 +136,11 @@ See spec §5.
 - `SessionMachine` sends `responseCorrelated`, and falls back to the declared channel when the broker's version is
   older.
 - `ShardConfig` stops offsetting egress ports for response egress.
+- The client needs the seed's gateway response-control port before its first connect (a config value, as Aeron
+  Archive's response channel). It learns the leader's port from the Redirect `#port` suffix and every broker's port
+  from Metadata.
+- The client keeps its declared egress subscription, so an older broker can still answer on it.
+- client-cpp `ConnectRequest` sends `responseCorrelated = 1`; `kClientVersion` becomes 16.
 - **Tests:** client unit tests for the version fallback and the subscription/publication order.
 
 ### Task 8: integration slice
