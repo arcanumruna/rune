@@ -1092,6 +1092,11 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_worker_enforcement_regression_tests)
     # D23 (D19-D21 review L2): the hot-path B tests that replace the global
     # operator new / delete (binary-wide) run in their own binary.
+    # Namespaces Phase 2 Task 11 (D25): the namespace disk limit at the owning worker (HotPathBRig, no Aeron).
+    add_executable(rune_ns_disk_worker_tests tests/integration/NsDiskWorkerRegressionTest.cpp)
+    target_include_directories(rune_ns_disk_worker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration)
+    target_link_libraries(rune_ns_disk_worker_tests PRIVATE rune_node rune_replication rune_storage rune_transaction GTest::gtest_main)
+    gtest_discover_tests(rune_ns_disk_worker_tests)
     add_executable(rune_hotpath_b_alloc_regression_tests
         tests/integration/HotPathBAllocRegressionTest.cpp)
     target_link_libraries(rune_hotpath_b_alloc_regression_tests PRIVATE
@@ -1825,6 +1830,13 @@ if(BUILD_TESTING)
         target_link_libraries(rune_ns_connection_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_ns_connection_tests PROPERTIES TIMEOUT 900)
+
+        # Namespaces Phase 2 Task 11 (D25): the namespace disk limit through the REAL client (1 node and 3 nodes).
+        add_executable(rune_ns_disk_limit_tests tests/client/NsDiskLimitRegressionTest.cpp)
+        target_include_directories(rune_ns_disk_limit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_ns_disk_limit_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_ns_disk_limit_tests PROPERTIES TIMEOUT 900)
 
         # Namespaces Phase 2 Task 7 (D17, D18; rule 16): the namespace reaper - the state machine over a real CatalogState,
         # and three real AdminWorkers (leader change after each durable step).

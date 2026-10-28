@@ -1784,6 +1784,7 @@ public:
         // pass and every mode — never behind data ops or any backlog.
         work += drainSessionOps_();
         work += beginPushPass_();   // F5: push budget + last pass's deferred reads first
+        if (nowNs >= nextDiskScanNs_) [[unlikely]] scanNamespaceDisk_(nowNs);   // Namespaces Phase 2 Task 11 (D25)
         // Re-check I6: one INFO line the first pass a consumer is connected to THIS
         // worker's MDC egress (every mode); latched, so one branch per pass after it.
         if (workerEgress_ && !workerEgress_->connectedLogged()) [[unlikely]]
@@ -6179,9 +6180,29 @@ private:
     // (`rune.ns.slot_mismatch`, reported to the control thread as a SessionSignal) and refused, never applied.
     NsSlotTable nsSlots_;
     uint64_t    nsSlotMismatches_ = 0;
+    // ---- Namespaces Phase 2 Task 11 (D25): THIS worker's disk usage per namespace slot.  nsDiskBytes_[slot] is the sum of
+    // Log::bytesOnDisk() (O(1) per log) over the disk logs this worker owns - leader and follower replicas alike -
+    // re-derived every kDiskScanIntervalNs and bumped by each leader append in between; nsOverDisk_[slot] is the one byte
+    // the leader produce path reads.  Per WORKER until Task 14's aggregator sums the node (a per-node check is not yet
+    // possible: a namespace's partitions spread over the workers).  Follower apply, catch-up, the cleaner and internal
+    // topics (topicId < 0) never read it.
+    static constexpr int64_t kDiskScanIntervalNs = 50'000'000;
+    std::vector<int64_t> nsDiskBytes_ = std::vector<int64_t>(NsSlotTable::kDefaultCapacity, 0);
+    std::vector<uint8_t> nsOverDisk_  = std::vector<uint8_t>(NsSlotTable::kDefaultCapacity, 0);
+    int64_t              nextDiskScanNs_ = 0;
+    uint64_t             overDiskRefusals_ = 0;
 public:
+    [[nodiscard]] int64_t  nsDiskBytesForTest(uint16_t slot) const noexcept { return slot < nsDiskBytes_.size() ? nsDiskBytes_[slot] : 0; }
+    [[nodiscard]] bool     nsOverDiskForTest(uint16_t slot) const noexcept { return slot < nsOverDisk_.size() && nsOverDisk_[slot] != 0; }
+    [[nodiscard]] uint64_t overDiskRefusalsForTest() const noexcept { return overDiskRefusals_; }
+    /// Test seam: run the periodic disk scan now.
+    void scanNamespaceDiskForTest(int64_t nowNs) { scanNamespaceDisk_(nowNs); }
     /// Boot only (before the runner starts): size the slot table to RUNE_MAX_NAMESPACES.
-    void configureNsSlots(uint32_t capacity) { nsSlots_.reset(capacity); }
+    void configureNsSlots(uint32_t capacity) {
+        nsSlots_.reset(capacity);
+        nsDiskBytes_.assign(nsSlots_.capacity(), 0);
+        nsOverDisk_.assign(nsSlots_.capacity(), 0);
+    }
     [[nodiscard]] const NsSlotTable& nsSlotsForTest() const noexcept { return nsSlots_; }
     [[nodiscard]] uint64_t nsSlotMismatchesForTest() const noexcept { return nsSlotMismatches_; }
     /// Test seam: deliver a namespace slot message exactly as the ring would.
@@ -6212,6 +6233,27 @@ private:
         if (!nsSlots_.release(slot, nsId)) { noteNsSlotMismatch_(); return false; }
         if (viewSet_ != nullptr) viewSet_->onNsSlotRelease(slot, nsId);
         return true;
+    }
+    /// Cold, every kDiskScanIntervalNs: recount each slot's bytes from the owned disk logs and set the over-disk byte.
+    [[gnu::cold]] void scanNamespaceDisk_(int64_t nowNs) {
+        nextDiskScanNs_ = nowNs + kDiskScanIntervalNs;
+        std::fill(nsDiskBytes_.begin(), nsDiskBytes_.end(), int64_t{0});
+        for (const auto* r : owned_) {
+            if (r == nullptr || !r->isDiskBacked()) continue;
+            const rune::storage::Log* l = r->log();
+            if (l == nullptr || l->nsSlot() >= nsDiskBytes_.size()) continue;
+            nsDiskBytes_[l->nsSlot()] += l->bytesOnDisk();
+        }
+        for (uint32_t s = 0; s < nsDiskBytes_.size(); ++s) {
+            const uint64_t limit = nsSlots_.limits(static_cast<uint16_t>(s)).maxDiskBytes;
+            nsOverDisk_[s] = limit != 0 && static_cast<uint64_t>(nsDiskBytes_[s]) >= limit ? 1 : 0;
+        }
+    }
+    /// Hot path (one add, one compare): a leader append of `bytes` to a user topic of `slot`.
+    [[gnu::always_inline]] void noteDiskAppend_(uint16_t slot, std::size_t bytes) noexcept {
+        nsDiskBytes_[slot] += static_cast<int64_t>(bytes);
+        if (static_cast<uint64_t>(nsDiskBytes_[slot]) >= nsSlots_.limits(slot).maxDiskBytes && nsSlots_.limits(slot).maxDiskBytes != 0)
+            nsOverDisk_[slot] = 1;
     }
     [[gnu::cold]] void executeNsSlotAssignWire_(sbe::WorkerOp& op) {
         rune::protocol::NamespaceLimits l;
@@ -8463,6 +8505,15 @@ private:
             enqueueReturn_(ret);
             return 1;
         }
+        // Namespaces Phase 2 Task 11 (D25): a LEADER produce to a user topic of a namespace over its disk limit is refused
+        // (one byte load); nothing is appended.  Internal topics (topicId < 0), follower apply, catch-up and the cleaner
+        // never get here / never read it.
+        if (log != nullptr && f.topicId >= 0 && nsOverDisk_[log->nsSlot()] != 0) [[unlikely]] {
+            ++overDiskRefusals_;
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NamespaceLimitExceeded);
+            enqueueReturn_(ret);
+            return 1;
+        }
         // F15 §2.3 produce gate (see executeProduceWire_) + PSM <-> log
         // consistency: an idempotent batch is validated only against a producer
         // state proven consistent with this log (see psm_).
@@ -8663,6 +8714,7 @@ private:
         if (replica) {
             replica->onLeaderLogAppended();
         }
+        if (log != nullptr && f.topicId >= 0) noteDiskAppend_(log->nsSlot(), rbSpan.size());   // Task 11 (D25)
 
         // F15 §2.1 (C1): RC update in the same invocation as the append; a
         // duplicate retry was registered with its original.

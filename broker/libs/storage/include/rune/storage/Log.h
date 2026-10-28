@@ -1216,6 +1216,9 @@ private:
     /// offset / timestamp floor may have moved).  Entries that compare equal
     /// are kept (shared); the rest of the tail is written fresh.
     void publishSealedSnapshotFrom_(int64_t fromBase);
+    /// Namespaces Phase 2 Task 11 (D25): sealedBytes_ = the sizes of every segment but the active one.  Cold: run at every
+    /// segments_ change that does not already rebuild the snapshot (roll fast path, retention prefix drop).
+    void recomputeSealedBytes_() noexcept;
     /// The cleaner's view of persistedRp_ (single writer: the owner).
     alignas(64) std::atomic<int64_t> cleanerPersistedRp_{kRecoveryPointUnknown};
     void setPersistedRp_(int64_t v) noexcept {

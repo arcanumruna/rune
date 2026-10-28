@@ -63,6 +63,8 @@ inline constexpr std::array kLimitRows = {
     LimitRow{"max-sessions-per-user",    20, LimitArea::Connections, 2, 52, "login after the SCRAM proof", "the user's 2nd session on this node"},
     LimitRow{"max-open-txns",            21, LimitArea::Txn,         2, 52, "AddPartitions opens a txn",   "the 2nd open transaction"},
     LimitRow{"max-txn-time-ms",          22, LimitArea::Txn,     30000, 52, "InitProducerId(timeout)",     "a timeout == the maximum"},
+    // ---- Task 11: disk ---------------------------------------------------------------------------------------
+    LimitRow{"max-disk-bytes",            8, LimitArea::Disk, 16384, 52, "leader produce",            "the produce that brings usage to the limit"},
 };
 // clang-format on
 

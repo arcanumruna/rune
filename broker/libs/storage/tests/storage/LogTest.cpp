@@ -2812,3 +2812,46 @@ TEST(LogWriteFailStopRegression, RealKernelShortWriteIsFailStopRegression) {
         std::filesystem::remove_all(dir);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Namespaces Phase 2 Task 11 (D25): Log::bytesOnDisk() is O(1) and always equals the segments' bytes - after append,
+// roll, retention delete, truncate, and a reopen (rebuilt from the recovered segments).  Never totalBytes() on a hot path.
+// ---------------------------------------------------------------------------
+TEST(OverDiskRegression, BytesOnDiskMatchesFilesAfterRestartRegression) {
+    auto dir = makeTempDir("rune_log_bytes");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    int64_t beforeRestart = 0;
+    {
+        Log log(dir.string(), /*segmentRollBytes*/ 256);
+        EXPECT_EQ(log.bytesOnDisk(), log.totalBytes()) << "empty";
+        int64_t off = 0;
+        int64_t last = 0;
+        for (int i = 0; i < 60; ++i) {
+            RecordBatchBuilder b(off, 1000 + i); b.append("k", "value-" + std::to_string(i), 1000 + i);
+            off = log.append(b.build(), off);
+            EXPECT_EQ(log.bytesOnDisk(), log.totalBytes()) << "append " << i;
+            EXPECT_GE(log.bytesOnDisk(), last) << "grows with every append (including a roll)";
+            last = log.bytesOnDisk();
+        }
+        ASSERT_GT(log.segmentBaseOffsets().size(), 2u) << "the test rolled";
+        const int64_t full = log.bytesOnDisk();
+        // Retention (size): the oldest sealed segments go, the count falls by exactly their bytes.
+        ASSERT_GT(log.deleteOldSegments(/*retainBytes=*/full / 2), 0);
+        EXPECT_EQ(log.bytesOnDisk(), log.totalBytes()) << "after the retention delete";
+        EXPECT_LT(log.bytesOnDisk(), full);
+        // Truncate (a follower's divergence repair).
+        ASSERT_TRUE(log.truncateTo(log.logEndOffset() - 3));
+        EXPECT_EQ(log.bytesOnDisk(), log.totalBytes()) << "after the truncate";
+        beforeRestart = log.bytesOnDisk();
+    }
+    Log reopened(dir.string(), 256);
+    (void)reopened.recover();
+    EXPECT_EQ(reopened.bytesOnDisk(), reopened.totalBytes()) << "rebuilt at open";
+    EXPECT_EQ(reopened.bytesOnDisk(), beforeRestart) << "the same bytes after a restart";
+    // Mutation guard: the counter is the files, not a running tally - a segment file's logical size is what it counts.
+    int64_t files = 0;
+    for (const auto& e : std::filesystem::directory_iterator(dir))
+        if (e.path().extension() == ".log") files += static_cast<int64_t>(std::filesystem::file_size(e.path()));
+    EXPECT_LE(reopened.bytesOnDisk(), files) << "never more than the .log files hold";
+    std::filesystem::remove_all(dir);
+}
