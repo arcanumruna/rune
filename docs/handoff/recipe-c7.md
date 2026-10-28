@@ -1,6 +1,6 @@
 # Batch C7 — client error reporting (issues #22, #222, #226, #225, #310)
 
-Repo `.`, branch `claude/kind-bardeen-ze6yl0` (already checked out — do NOT switch, do NOT push, do NOT commit;
+Repo `the repo root`, branch `claude/kind-bardeen-ze6yl0` (already checked out — do NOT switch, do NOT push, do NOT commit;
 the coordinator commits). Read `CLAUDE.md` first. You are an implementer: never spawn subagents.
 
 Build trees (exist, Ninja Debug): `build-client` (client) and `build` (broker). Disk is tight: do NOT create new build

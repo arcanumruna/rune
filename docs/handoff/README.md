@@ -1,50 +1,36 @@
-# Session handoff — 2026-10-28 (delete this folder before PR #691 merges)
+# Session handoff — 2026-10-28 (updated) (delete this folder before PR #691 merges)
 
 This is the working state of the client-batch and M-batch program, saved before a session pause. The next session
 reads this file first, then removes `docs/handoff/` in its first commit on this branch.
 
-## Branch `claude/kind-bardeen-ze6yl0` (PR #691)
+## Branch `claude/kind-bardeen-ze6yl0` (PR #691) — state at 0c82c7b and later
 
-- **Committed and verified:** C16, C8 (+ review fixes), C17, the #180 control-marker urgent fix, C14 (+ review fix),
-  C15, and the TxnStress model update (f4fa08c).
-  - The client checkpoint at f4fa08c is green: `ctest -R Regression -LE latency` in `build-client` passed 1700/1700.
-- **WIP commit 33637b0 (unverified):** two agent runs were cut off mid-way.
-  - **C7 implementation** (`recipe-c7.md`; issues #22 #222 #225 #226 #310). It touches Client.h/.cpp,
-    Completion.h, QlEngine.cpp, ProducerImpl.cpp, ClientAuthErrorsTest, ProducerAckPathTest,
-    RuneConsoleOfflineTest and OpenTopicGateTest.
-    - Check each recipe part against the diff: failing test first, the fix, then the mutation check.
-    - Finish what is missing.
-  - **C15 Opus review tests** (`review-c15.md`). They are in CoordinatorLinkTest and ProducerTxn{,Data,Offsets}Test.
-    - Re-run the review from the brief.
-    - Keep the finished tests; any test exposing a real bug stays `DISABLED_` until it is fixed.
-- **Broker checkpoint:** the broker `-R Regression -LE latency` suite (9608 tests) was started but did not finish.
-  - Rebuild the test executables by name. The list is `ctest -R Regression -LE latency --show-only=json-v1`, taking
-    the basename of each command.
-  - Then run it.
+- **Done and verified:** C16, C8, C17, the #180 control-marker fix, C14, C15.
+  - The C15 Opus review rated it mergeable and added 11 adversarial tests (already committed).
+  - Its minor findings were filed as #698 and #699. #340 got a comment and is now `Refs`, not `Closes`, in the PR.
+- **C7 is implemented** (`recipe-c7.md`; #22 #222 #225 #226 #310). All parts are green, with mutation checks. Its Opus review
+  (`review-c7.md`) was running when this snapshot was taken. Run it again if no report exists, then do its fix round.
+  - WIP commit 937a5c5 captured a C7 mutation (`if (false &&`) in ProducerImpl.cpp. Later commits have the
+    correct line. Grep for `if (false &&` before merging.
+- **C18** (`recipe-c18.md`; #651 #676 #660 #685 #684) was mid-implementation. The C7 agent may have clobbered
+  C18 Client.cpp edits around 08:17. Check that `nextMetadataRefreshAt_` (old name) is gone and the #651
+  else-branch is in `onMetadataResponse`, then finish C18, review it, and add its Closes lines to the PR.
+- **C19** (`recipe-c19.md`; #692 #693 #689 #656 #655 #657 #675 #674 #673) was mid-implementation. Check each part
+  against the diff and finish what is missing, then review it and add its Closes lines.
+- **Broker checkpoint:** the first run hit "No space left on device" (521 environmental failures: Bus error,
+  `cannot create directories`). Re-run the failed tests alone at `-j2` when no agent is building:
+  `ctest --rerun-failed -j2 --output-on-failure` in `build`.
+- **Shared-tree rules for agents** are in `shared-tree-rules.md`. Mutations are undone edit by edit, never by
+  restoring a whole-file copy. Builds use `TMPDIR=/dev/shm/<name>` and `-j2`.
 
 ## Next steps, in order
 
-1. **Verify the WIP and finish both:**
-   - build the client test targets;
-   - run the focused suites;
-   - run the ratchet: `python3 client-cpp/scripts/check_no_atomics_or_mutexes.py --tests client-cpp` must print OK.
-2. **Finish C15 and C7:**
-   - C15: the review, then its fix round.
-   - C7: review it (Opus, adversarial: `docs/adversarial-review.md`), then its fix round.
-   - Add `Closes #22 #222 #225 #226 #310` lines to PR #691 (one per line). #638 is not part of C7.
-3. **Merge PR #691:**
-   - Checkpoint first: broker and client Regression suites.
-   - Remove `docs/handoff/` before merging.
-   - After the merge, verify that every Closes issue closed. #335 stays open, since it is only partly fixed.
-4. **M28 fix round** (PR #619, branch `bugfix/medium-batch-28`):
-   - F1: void the Proof in the `establishAsResponder_` deferral.
-   - F3: the scrubs.
-   - F4: the fanout cap drops the oldest.
-   - Add the attack tests in `m28-attack-tests/`: A1 and A4 are red at the PR head; A2, A3, A5 and A6 are guards.
-   - Merge, then close #584 #545 #540 #546 #554 #274. #275 is only part-fixed: comment on it instead.
-5. **M29** (`recipe-m29.md`: #608 #444 #518), then **M30**.
-6. **Remaining client batches** (see `client-batch-plan.md`): C9 runs after M30. Check which C batches are still open
-   with `list_issues`.
+1. Finish C7's review, C18 and C19, each with an Opus review and a fix round. Add the Closes lines to PR #691.
+2. Run the client and broker Regression checkpoint (broker at low parallelism; mind the disk).
+3. Remove `docs/handoff/` and merge PR #691. Verify that every Closes issue closed; #335 and #340 stay open.
+4. C20 (#672 #690 #681 #680 #678 #682 #671 #495 #688 #668), then C21 (#654 #679 #667 #664 #665 #426 #475).
+   See `client-batch-plan.md`. #687 is possibly deferred.
+5. The M batches (M28 fix round on PR #619, M29, M30) come after the client batches, at the owner's direction.
 
 ## Rules carried over
 

@@ -1,6 +1,6 @@
 # Opus review — client batch C15 (transactional producer leftovers), commit 301a321 (+ f4fa08c model update)
 
-Repo ., branch claude/kind-bardeen-ze6yl0 (checked out — do NOT switch, commit, push or stash; the
+Repo the repo root, branch claude/kind-bardeen-ze6yl0 (checked out — do NOT switch, commit, push or stash; the
 coordinator commits). Read CLAUDE.md, client-cpp/CLAUDE.md and docs/adversarial-review.md FIRST.
 Never spawn subagents. Do not fix product code: you report and write tests.
 
