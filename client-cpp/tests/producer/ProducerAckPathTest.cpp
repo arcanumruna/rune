@@ -1156,6 +1156,175 @@ TEST(ProducerSequence, NotAuthorizedOnARetransmitStaysOutcomeUnknownRegression) 
     EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1));
 }
 
+// ---- C7 adversarial review (#222): the definite-non-append path against every sibling path ----
+
+// #222: the NEWEST batch is refused on its first attempt while an older one is still in flight (another lane's answer
+// overtakes): its sequence is given back, the next batch reuses it under the same epoch, and nothing is bumped.
+TEST(ProducerSequence, NotAuthorizedOnTheNewestBatchOvertakingAnOlderOneGivesItsSequenceBackAdversarialRegression) {
+    ProducerImpl impl(ackCfg(8, /*lingerUs=*/0));
+    AckLedger L;
+    L.attachBatches(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    sendOne(impl, sink, 0);  // A: seq 0
+    sendOne(impl, sink, 0);  // B: seq 1
+    ASSERT_EQ(cap.frames.size(), 2u);
+    const int16_t e0 = cap.frames[0].epoch;
+    impl.onProduceResponse(cap.frames[1].corrId, -1, 45);  // B refused first
+    ASSERT_EQ(L.batchAcks.size(), 1u);
+    EXPECT_EQ(L.batchAcks[0].errorCode, 45);
+    EXPECT_EQ(L.batchAcks[0].baseSequence, 1);
+    EXPECT_TRUE(impl.hasInFlight()) << "A is still in flight";
+    EXPECT_EQ(impl.producerEpoch(), e0);
+    sendOne(impl, sink, 0);  // C
+    ASSERT_EQ(cap.frames.size(), 3u);
+    EXPECT_EQ(cap.frames[2].epoch, e0);
+    EXPECT_EQ(cap.frames[2].baseSequence, 1) << "C continues right after A: B's sequence was never stored";
+    impl.onProduceResponse(cap.frames[0].corrId, 10, 0);
+    impl.onProduceResponse(cap.frames[2].corrId, 11, 0);
+    ASSERT_EQ(L.batchAcks.size(), 3u);
+    EXPECT_EQ(L.batchAcks[1].errorCode, 0);
+    EXPECT_EQ(L.batchAcks[2].errorCode, 0);
+    EXPECT_EQ(L.batchAcks[2].producerEpoch, e0);
+    EXPECT_EQ(impl.producerEpoch(), e0) << "no bump anywhere";
+    EXPECT_FALSE(impl.hasInFlight());
+}
+
+// #222: giving the sequence back must never make an UNRESOLVED partition look resolved.  A is refused with an
+// outcome-unknown code (it may be stored), then B (the newest) is refused 45 on its first attempt: once nothing is in
+// flight the partition must still re-identify, so A's sequence is never reused under the same epoch.
+TEST(ProducerSequence, NotAuthorizedOnAFirstAttemptNeverClearsAnUnresolvedPartitionAdversarialRegression) {
+    ProducerImpl impl(ackCfg(8, /*lingerUs=*/0));
+    AckLedger L;
+    L.attachBatches(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    sendOne(impl, sink, 0);  // A: seq 0
+    sendOne(impl, sink, 0);  // B: seq 1
+    ASSERT_EQ(cap.frames.size(), 2u);
+    const int16_t e0 = cap.frames[0].epoch;
+    impl.onProduceResponse(cap.frames[0].corrId, -1, /*StorageError: outcome unknown*/ 26);
+    impl.onProduceResponse(cap.frames[1].corrId, -1, 45);
+    ASSERT_EQ(L.batchAcks.size(), 2u);
+    EXPECT_FALSE(impl.hasInFlight());
+    EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1)) << "A's outcome is unknown: re-identified";
+    sendOne(impl, sink, 0);
+    ASSERT_EQ(cap.frames.size(), 3u);
+    EXPECT_EQ(cap.frames[2].epoch, static_cast<int16_t>(e0 + 1)) << "never A's sequence under A's epoch";
+    EXPECT_EQ(cap.frames[2].baseSequence, 0);
+}
+
+// #222: a late 45 to a SUPERSEDED first attempt (the batch was already retransmitted) is not this batch's answer: it
+// neither fails the batch nor gives its sequence back; the retransmit's answer decides.
+TEST(ProducerSequence, ALateNotAuthorizedOfASupersededFirstAttemptIsIgnoredAdversarialRegression) {
+    ProducerImpl impl(ackCfg(8, /*lingerUs=*/0));
+    AckLedger L;
+    L.attachBatches(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    sendOne(impl, sink, 0);
+    const int16_t e0 = cap.frames[0].epoch;
+    const int64_t t1 = kNow + 1'000LL * 1'000'000LL;  // past produceTimeoutMs
+    ASSERT_EQ(impl.retransmitStalled(t1, sink), 1);
+    ASSERT_EQ(cap.frames.size(), 2u);
+    impl.onProduceResponse(cap.frames[0].corrId, -1, 45);  // the first attempt's late refusal
+    EXPECT_TRUE(L.batchAcks.empty());
+    EXPECT_TRUE(impl.hasInFlight());
+    impl.onProduceResponse(cap.frames[1].corrId, 5, 0);
+    ASSERT_EQ(L.batchAcks.size(), 1u);
+    EXPECT_EQ(L.batchAcks[0].errorCode, 0);
+    EXPECT_EQ(impl.producerEpoch(), e0);
+    sendOne(impl, sink, 0, t1);
+    ASSERT_EQ(cap.frames.size(), 3u);
+    EXPECT_EQ(cap.frames[2].baseSequence, 1) << "the stored batch's sequence stays consumed";
+}
+
+// #222: a re-offer after a leader change (NotLeader -> new route) is a second attempt: its 45 proves nothing about the
+// first one, which the old leader may have stored.  Outcome unknown, re-identified.
+TEST(ProducerSequence, NotAuthorizedOnAReofferAfterALeaderChangeStaysOutcomeUnknownAdversarialRegression) {
+    ProducerImpl impl(ackCfg(8, /*lingerUs=*/0));
+    AckLedger L;
+    L.attachBatches(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    sendOne(impl, sink, 0);
+    const int16_t e0 = cap.frames[0].epoch;
+    impl.onProduceResponse(cap.frames[0].corrId, -1,
+                           static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader));
+    EXPECT_TRUE(L.batchAcks.empty()) << "NotLeader is retriable";
+    ASSERT_EQ(impl.resendRouteParked(), 1);
+    impl.flushBatches(kNow, 42, sink);
+    ASSERT_EQ(cap.frames.size(), 2u) << "re-offered on the new route";
+    impl.onProduceResponse(cap.frames[1].corrId, -1, 45);
+    ASSERT_EQ(L.batchAcks.size(), 1u);
+    EXPECT_EQ(L.batchAcks[0].errorCode, 45);
+    EXPECT_FALSE(impl.hasInFlight());
+    EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1));
+    sendOne(impl, sink, 0);
+    ASSERT_EQ(cap.frames.size(), 3u);
+    EXPECT_EQ(cap.frames[2].epoch, static_cast<int16_t>(e0 + 1));
+    EXPECT_EQ(cap.frames[2].baseSequence, 0);
+}
+
+// #222: a Tier-2 batch (its own first-send path) refused 45 on its first attempt: definitely not stored, its
+// sequences (two records) are given back.
+TEST(ProducerSequence, NotAuthorizedOnATier2FirstAttemptIsNotAppendedAdversarialRegression) {
+    ProducerImpl impl(ackCfg(8, /*lingerUs=*/0));
+    AckLedger L;
+    L.attachBatches(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    {
+        rune::client::BatchBuilder bb(&impl, 1, 0);
+        bb.add(kVal);
+        bb.add(kVal);
+        ASSERT_EQ(bb.send(), OpResult::Accepted);
+    }
+    pump(impl, sink);
+    ASSERT_EQ(cap.frames.size(), 1u);
+    const int16_t e0 = cap.frames[0].epoch;
+    impl.onProduceResponse(cap.frames[0].corrId, -1, 45);
+    ASSERT_EQ(L.batchAcks.size(), 1u);
+    EXPECT_EQ(L.batchAcks[0].errorCode, 45);
+    EXPECT_EQ(L.batchAcks[0].recordCount, 2);
+    EXPECT_EQ(impl.producerEpoch(), e0);
+    sendOne(impl, sink, 0);
+    ASSERT_EQ(cap.frames.size(), 2u);
+    EXPECT_EQ(cap.frames[1].epoch, e0);
+    EXPECT_EQ(cap.frames[1].baseSequence, 0);
+}
+
+// #222 input bounds: only 44..47 are definite non-appends.  43 (PartitionDataReset) right below stays the
+// outcome-unknown path; 48 (AuthUnavailable) right above stays retriable (no completion, same identity).
+TEST(ProducerSequence, OnlyCodes44To47TakeTheDefiniteNonAppendPathAdversarialRegression) {
+    {
+        ProducerImpl impl(ackCfg(8, /*lingerUs=*/0));
+        AckLedger L;
+        L.attachBatches(impl);
+        SeqCapture cap;
+        const auto sink = cap.fn();
+        sendOne(impl, sink, 0);
+        const int16_t e0 = cap.frames[0].epoch;
+        impl.onProduceResponse(cap.frames[0].corrId, -1, 43);
+        ASSERT_EQ(L.batchAcks.size(), 1u);
+        EXPECT_EQ(L.batchAcks[0].errorCode, 43);
+        EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1)) << "43: outcome unknown";
+    }
+    {
+        ProducerImpl impl(ackCfg(8, /*lingerUs=*/0));
+        AckLedger L;
+        L.attachBatches(impl);
+        SeqCapture cap;
+        const auto sink = cap.fn();
+        sendOne(impl, sink, 0);
+        const int16_t e0 = cap.frames[0].epoch;
+        impl.onProduceResponse(cap.frames[0].corrId, -1, 48);
+        EXPECT_TRUE(L.batchAcks.empty()) << "48: retried, not failed";
+        EXPECT_TRUE(impl.hasInFlight());
+        EXPECT_EQ(impl.producerEpoch(), e0);
+    }
+}
+
 // #689: a PARTITION-REFUSAL answer (UnknownTopic / UnknownPartition / NotAuthorized / NamespaceSuspended) fails the
 // records still lingering in that partition's builder at once, with the same code - they are never sent (and refused)
 // again after the linger / the delivery timeout.  A retriable code leaves them alone.

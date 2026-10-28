@@ -31,6 +31,7 @@
 #include "rune/ql/Parser.h"
 
 #include <rune/client/Completion.h>
+#include <rune/protocol/client/Protocol.h>
 #include "QlEngine.h"   // src/cli: splitStatements, the engine's internal seams
 #include "support/AllocCounter.h"
 
@@ -1386,4 +1387,21 @@ TEST(CliErrorNamesRegression, CliAndClientNamesAgreeFor44To48Regression) {
     }
     EXPECT_EQ(rune::cli::engine::errorCodeName(43), "PartitionDataReset");
     EXPECT_EQ(rune::cli::engine::errorCodeName(49), "RecordEgressUnavailable");
+}
+
+// C7 adversarial review (#225) input bounds: the printed failure line carries the client's auth name for 44..48;
+// the table's ends and codes past it still resolve (0, the last code, last+1, u16 max).
+TEST(CliErrorNamesRegression, BrokerFailureLinesAndTableBoundsAdversarialRegression) {
+    for (uint16_t code = 44; code <= 48; ++code) {
+        SCOPED_TRACE(code);
+        EXPECT_EQ(rune::cli::engine::brokerFailure(code, "d"),
+                  std::string(rune::client::authErrorName(code)) + " (" + std::to_string(code) + ") d");
+    }
+    namespace pc = rune::protocol::client;
+    constexpr auto kLast = static_cast<uint16_t>(pc::ErrorCode::ViewPaused);
+    EXPECT_EQ(rune::cli::engine::errorCodeName(0), "OK");
+    EXPECT_EQ(rune::cli::engine::errorCodeName(kLast), "ViewPaused");
+    EXPECT_EQ(rune::cli::engine::errorCodeName(kLast + 1), "UnknownErrorCode");
+    EXPECT_EQ(rune::cli::engine::errorCodeName(0xFFFF), "UnknownErrorCode");
+    EXPECT_EQ(rune::cli::engine::brokerFailure(0xFFFF, ""), "UnknownErrorCode (65535)");
 }

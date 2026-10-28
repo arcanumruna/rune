@@ -58,7 +58,7 @@ namespace {
 // #676: an injected duty clock for the metadata-timer tests (single test thread).
 int64_t g_routingClockNs = 1'000'000'000LL;
 int64_t routingClock() noexcept { return g_routingClockNs; }
-RigOptions routingClockOptions(int64_t stepNs = 1'000'000) {
+RigOptions routingClockOptions(int64_t stepNs = 10'000) {
     RigOptions o;
     g_routingClockNs = 1'000'000'000LL;
     o.nanoClock      = &routingClock;
@@ -1325,6 +1325,7 @@ TEST(GroupRoutingRegression, OldLeaderNodeNeverPollsMetadataAndResumesAfterUpgra
     Consumed led;
     wire(gc, led);
     r.connect();
+    r.opt.stepNs = 1'000'000;   // #676: connected (real-time handshake needed fine steps); the window runs coarser
     ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
     r.gw.releaseJoins();
     ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr && r.gw.connectsAt[n1] > 0; }));
@@ -2775,6 +2776,7 @@ TEST(GroupRoutingRegression, MetadataIsAskedThroughALiveNodeSessionWhileTheSeedI
     r.gw.subscribeLeader = {{0, 0}, {1, n1}};
     r.gw.groupProtocol   = false;
     r.connect();
+    r.opt.stepNs = 1'000'000;   // #676: connected (real-time handshake needed fine steps); the window runs coarser
     PlainLedger led;
     auto s1 = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()}, led.handler(1));
     ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr && s1.subscriptionId() == r.subAt(1, n1)->subscriptionId; }))
@@ -2789,7 +2791,11 @@ TEST(GroupRoutingRegression, MetadataIsAskedThroughALiveNodeSessionWhileTheSeedI
     r.gw.silentEndpoints.insert(n1);   // node 1 answers no NEW connect (the seed cannot fail over to it)
     const int64_t deadline = g_routingClockNs + 5'000'000'000LL;
     bool asked = false;
-    (void)r.drive([&] { asked = askedAt(n1) > beforeN1; return asked || g_routingClockNs >= deadline; }, 1'000'000);
+    (void)r.drive([&] {   // #676: until asked AND the seed is stale on the duty clock (or the duty-clock deadline)
+        asked = asked || askedAt(n1) > beforeN1;
+        return (asked && r.client.testSessionStateAt(0) != rc::session::SessionState::Connected) ||
+               g_routingClockNs >= deadline;
+    }, 1'000'000);
     EXPECT_TRUE(asked) << "the new leader must be learnt from a live broker's session while the seed is down";
     EXPECT_NE(r.client.testSessionStateAt(0), rc::session::SessionState::Connected) << "the seed is down";
     EXPECT_GE(r.client.testMetadataViaOtherSession(), 1u);

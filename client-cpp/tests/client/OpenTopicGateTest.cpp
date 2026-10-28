@@ -663,6 +663,82 @@ TEST(OpenTopicGateRegression, AnotherBrokerErrorIsNamedRegression) {
     EXPECT_EQ(msg.find("stale"), std::string::npos) << msg;
 }
 
+namespace {
+// C7 adversarial review (#22): the what() of a direct throwOpenTopicFailure call.
+std::string openFailureText(Client& c, std::string_view name, uint16_t code, std::chrono::nanoseconds left) {
+    try {
+        c.throwOpenTopicFailure(name, code, left);
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+    ADD_FAILURE() << "throwOpenTopicFailure returned";
+    return {};
+}
+}  // namespace
+
+// #22 budget bound: with nothing left of the caller's budget the UnknownTopic probe is NOT sent (a sent one would be
+// served and say "stale"): the plain code is named.  With budget left the same call probes.
+TEST(OpenTopicGateRegression, OpenFailureWithNoBudgetLeftSkipsTheProbeAdversarialRegression) {
+    GateHarness h(1352, 1353);
+    h.build();
+    h.connectAndWait();
+    h.gw->getBlob      = serialize(makeCharsV2Descriptor());
+    h.gw->getErrorCode = 0;
+    GateGatewayPump pump(*h.gw);
+    const int before = h.gw->getTopicSchemaSeen;
+    for (const std::chrono::nanoseconds left :
+         {std::chrono::nanoseconds{0}, std::chrono::nanoseconds{-1}, std::chrono::nanoseconds{-10s}}) {
+        const std::string msg = openFailureText(*h.client, "characters", 7, left);
+        EXPECT_NE(msg.find("refused 'characters' (error 7 UnknownTopic)"), std::string::npos) << left.count() << ": " << msg;
+        EXPECT_EQ(msg.find("stale"), std::string::npos) << msg;
+        EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
+    }
+    EXPECT_EQ(h.gw->getTopicSchemaSeen, before) << "no probe without budget";
+    EXPECT_NE(openFailureText(*h.client, "characters", 7, 5s).find("stale"), std::string::npos);
+    EXPECT_EQ(h.gw->getTopicSchemaSeen, before + 1);
+}
+
+// #22: a probe that is never answered proves nothing - the original code is named (never "does not exist" or
+// "stale"), within the remaining budget.
+TEST(OpenTopicGateRegression, OpenFailureProbeTimeoutNamesTheOriginalCodeAdversarialRegression) {
+    GateHarness h(1354, 1355);
+    h.build();
+    h.connectAndWait();
+    h.gw->replyGetTopicSchema = false;
+    GateGatewayPump pump(*h.gw);
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string msg = openFailureText(*h.client, "characters", 7, 200ms);
+    const auto took = std::chrono::steady_clock::now() - t0;
+    EXPECT_NE(msg.find("(error 7 UnknownTopic)"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("stale"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
+    EXPECT_LT(took, 3s) << "bounded by the remaining budget";
+}
+
+// #22: the probe itself refused names the PROBE's code (an auth name when it has one, the bare number for an unknown
+// code); a non-UnknownTopic code is never probed at all.
+TEST(OpenTopicGateRegression, OpenFailureProbeRefusalAndOtherCodesAreNamedAdversarialRegression) {
+    GateHarness h(1356, 1357);
+    h.build();
+    h.connectAndWait();
+    GateGatewayPump pump(*h.gw);
+    h.gw->getErrorCode = 45;
+    std::string msg = openFailureText(*h.client, "characters", 7, 5s);
+    EXPECT_NE(msg.find("(error 45 NotAuthorized)"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("does not exist"), std::string::npos) << msg;
+    h.gw->getErrorCode = 0x7FFF;
+    msg = openFailureText(*h.client, "characters", 7, 5s);
+    EXPECT_NE(msg.find("(error 32767)"), std::string::npos) << msg;
+    h.gw->getErrorCode = 0;   // a probe WOULD be served: only skipping it gives the plain code
+    const int before = h.gw->getTopicSchemaSeen;
+    for (const uint16_t code : {uint16_t{1}, uint16_t{6}, uint16_t{8}, uint16_t{46}, uint16_t{0xFFFF}}) {
+        msg = openFailureText(*h.client, "characters", code, 5s);
+        EXPECT_NE(msg.find("(error " + std::to_string(code)), std::string::npos) << code << ": " << msg;
+        EXPECT_EQ(msg.find("stale"), std::string::npos) << code << ": " << msg;
+    }
+    EXPECT_EQ(h.gw->getTopicSchemaSeen, before) << "only UnknownTopic is probed";
+}
+
 // ===========================================================================
 // Regression: a broker that answers Ok (errorCode 0) to a fingerprint-
 // selecting GetTopicSchema but hands back a descriptor blob whose ACTUAL

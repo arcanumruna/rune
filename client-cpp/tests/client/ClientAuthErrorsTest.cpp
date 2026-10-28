@@ -188,6 +188,113 @@ TEST(ClientAuthErrorsRegression, SessionRejectCodeFollowsTheStateThreadingRuleRe
     EXPECT_TRUE(threw) << "a foreign thread is refused, as state() does";
 }
 
+// C7 adversarial review (#310): every thread class.  Invoker mode: a foreign thread is refused too (it used to read 0).
+// Thread mode: a duty-cycle callback (onError, on the runner thread) reads the machine; a foreign thread is refused
+// before any connect as well as after the reject; the owner reads 0 before the reject.
+TEST(ClientAuthErrorsRegression, SessionRejectCodeOnEveryThreadClassAdversarialRegression) {
+    {
+        Rig r(authCfg(4170, "ws1", "not the password!"));
+        bool threwBefore = false;
+        std::thread before([&] {
+            try { (void)r.client.sessionRejectCode(); } catch (const std::logic_error&) { threwBefore = true; }
+        });
+        before.join();
+        EXPECT_TRUE(threwBefore) << "Invoker mode: a foreign thread is refused";
+        test_support::TestCq cq(r.client);
+        auto f = r.connectOp(cq);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+        ASSERT_TRUE(r.drive([&] { return r.client.state() == rc::session::SessionState::Rejected; }));
+        EXPECT_EQ(r.client.sessionRejectCode(), 44);
+        bool threwAfter = false;
+        std::thread after([&] {
+            try { (void)r.client.sessionRejectCode(); } catch (const std::logic_error&) { threwAfter = true; }
+        });
+        after.join();
+        EXPECT_TRUE(threwAfter) << "Invoker mode, rejected: a foreign thread is still refused (never a silent 0)";
+    }
+    rc::ClientConfig c = authCfg(4172, "ws1", "not the password!");
+    c.runnerMode = rc::RunnerMode::Thread;
+    c.nanoClock  = nullptr;
+    rc::Client client(c);
+    // Written on the runner thread inside onError; read on this thread only after close() joined the runner.
+    int16_t inCallback  = -1;
+    bool    callbackRan = false;
+    client.onError([&](const std::string&) {
+        if (callbackRan) return;
+        callbackRan = true;
+        try { inCallback = client.sessionRejectCode(); } catch (const std::logic_error&) { inCallback = -2; }
+    });
+    test_support::InvokerGateway gw(c.dataDir + "/aeron", c.gatewayChannel, c.gatewayStreamId, c.egressChannel,
+                                    c.egressStreamId);
+    gw.authMode   = pc::AuthMode::Required;
+    gw.tlsCertPem = testPem("server.pem");
+    gw.tlsKeyPem  = testPem("server.key");
+    gw.addUser("ws1", kPw);
+    const auto driveGw = [&](auto&& pred) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            gw.pump();
+            if (pred()) return true;
+        }
+        return false;
+    };
+    bool threwBefore = false;
+    std::thread before([&] {
+        try { (void)client.sessionRejectCode(); } catch (const std::logic_error&) { threwBefore = true; }
+    });
+    before.join();
+    EXPECT_TRUE(threwBefore) << "Thread mode, never connected: a foreign thread is refused";
+    ASSERT_TRUE(driveGw([&] { return gw.ready(); }));
+    test_support::TestCq cq(client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+    ASSERT_TRUE(driveGw([&] { return f.ready(); }));
+    ASSERT_TRUE(f.failed());
+    ASSERT_TRUE(driveGw([&] { return client.state() == rc::session::SessionState::Rejected; }));
+    EXPECT_EQ(client.sessionRejectCode(), 44);
+    client.close();   // joins the runner: its writes in onError are visible from here on
+    EXPECT_TRUE(callbackRan);
+    EXPECT_EQ(inCallback, 44) << "a duty-cycle callback reads the machine";
+}
+
+// C7 adversarial review (#226) input bounds: the hint is a u32 on the wire - 1 and the u32 maximum both come back
+// exactly (no sign flip), on the BrokerError and on the NotConnected (hint beyond the deadline) completions; every
+// other op / status / code reads 0.
+TEST(ClientAuthErrorsRegression, RetryAfterBoundsReadBackExactlyAdversarialRegression) {
+    {   // 1 ms: retried within the budget, then the BrokerError verdict.
+        rc::ClientConfig c = authCfg(4174, "ws1", "not the password!");
+        c.connectTimeoutMs = 120'000;
+        Rig r(c);
+        r.gw.retryAfterMsOnFailure = 1;
+        test_support::TestCq cq(r.client);
+        auto f = r.connectOp(cq);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000));
+        EXPECT_EQ(f.outcome().c.errorCode, 44);
+        EXPECT_EQ(rc::retryAfterMs(f.outcome().c), 1) << f.describe();
+    }
+    {   // u32 max: far beyond the connect deadline -> NotConnected with the hint.
+        rc::ClientConfig c = authCfg(4176, "ws1", "not the password!");
+        c.connectTimeoutMs = 2'000;
+        Rig r(c);
+        r.gw.retryAfterMsOnFailure = UINT32_MAX;
+        test_support::TestCq cq(r.client);
+        auto f = r.connectOp(cq);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000));
+        EXPECT_EQ(f.outcome().c.status, rc::OpStatus::NotConnected) << f.describe();
+        EXPECT_EQ(rc::retryAfterMs(f.outcome().c), static_cast<int64_t>(UINT32_MAX));
+    }
+    const auto mk = [](rc::OpKind op, rc::OpStatus st, uint16_t ec) {
+        rc::Completion c{};
+        c.op = op; c.status = st; c.errorCode = ec; c.aux = 7;
+        return c;
+    };
+    EXPECT_EQ(rc::retryAfterMs(mk(rc::OpKind::Connect, rc::OpStatus::NotConnected, 44)), 7);
+    EXPECT_EQ(rc::retryAfterMs(mk(rc::OpKind::Connect, rc::OpStatus::Timeout, 44)), 0);
+    EXPECT_EQ(rc::retryAfterMs(mk(rc::OpKind::Connect, rc::OpStatus::Ok, 44)), 0);
+    EXPECT_EQ(rc::retryAfterMs(mk(rc::OpKind::Connect, rc::OpStatus::NotConnected, 48)), 0);
+    EXPECT_EQ(rc::retryAfterMs(mk(rc::OpKind::Connect, rc::OpStatus::BrokerError, 43)), 0);
+    EXPECT_EQ(rc::retryAfterMs(mk(rc::OpKind::Ping, rc::OpStatus::BrokerError, 44)), 0);
+}
+
 TEST(ClientAuthErrorsRegression, UnknownUserIsTheSameFailureAsAWrongPassword) {
     Rig r(authCfg(3704, "nobody", kPw));
     test_support::TestCq cq(r.client);
