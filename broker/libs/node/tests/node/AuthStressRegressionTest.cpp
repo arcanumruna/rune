@@ -623,6 +623,9 @@ private:
     void check_() {
         observe_();
         checkEndedSilent_();
+        markDisabledSessionsDead_();
+    }
+    void markDisabledSessionsDead_() {
         // a disabled user's sessions are dead the moment the DISABLE is answered - even when a later ENABLE is already
         // sent or answered (the broker closed them at the DISABLE; an ENABLE never revives a session).  Only a session
         // whose login the test saw BEFORE that answer was open at the DISABLE (reconnects run only once every change is
@@ -641,6 +644,8 @@ private:
                Clock::now() < end && fail_.empty())
             pump_(2ms);
         if (!fail_.empty()) return;
+        // a DISABLE answered during the drain closed its sessions too (an ENABLE after it never revives them)
+        markDisabledSessionsDead_();
         // sessions of a user disabled at the end are dead; the model decides
         const pm::Model& fin = states_.back();
         for (Sess& s : sess_) if (!fin.isEnabled(user_(s.user))) s.alive = false;
@@ -803,8 +808,16 @@ TEST(AuthStressRegression, SeededRandomGrantRevokeTrafficHoldsEveryInvariant) {
     AuthBroker::Options o;
     o.shard = true;
     AuthRig rig("stress", o);
+    // a real client keeps its session alive (a Keepalive every 1 s): building the 6 wire clients below starts 6 Aeron
+    // drivers, which can outlast the gateway's 10 s idle lease of the sessions the rig already logged in
+    rig.c().keepSessionsAlive(true);
+    rig.broker().admin().raw().keepSessionsAlive(true);
     std::vector<AuthWireClient*> wires;
-    for (int i = 0; i < 6; ++i) { wires.push_back(&rig.broker().wire()); wires.back()->cacheSaltedPasswords(true); }
+    for (int i = 0; i < 6; ++i) {
+        wires.push_back(&rig.broker().wire());
+        wires.back()->cacheSaltedPasswords(true);
+        for (ShardTestClient* c : {&rig.c(), &rig.broker().admin().raw()}) c->pollFor(std::chrono::milliseconds{2}, [] { return false; });
+    }
     Tally tally;
     const auto t0 = Clock::now();
     for (int seed = first; seed < first + seeds; ++seed) {
