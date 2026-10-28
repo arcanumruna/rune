@@ -1912,6 +1912,9 @@ private:
     void onInitAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& s) noexcept;
     void onInitExpired_(CoordinatorLink::Slot& s) noexcept;
     void assignIdentity_(int64_t pid, int16_t epoch) noexcept;
+    /// #694 (rule U3): an UnknownProducerId on a transactional partition none of whose batches this transaction had
+    /// acked: the sequences restart at 0 under the SAME producer id and epoch and every live batch is re-stamped.
+    void restartInPlace_(PartitionState& ps) noexcept;
     void restampInflight_(PartitionState& ps) noexcept;
     void publishStatus_() noexcept;
     void drainStatus_() noexcept { statusRing_.drainLatest(appStatus_); }

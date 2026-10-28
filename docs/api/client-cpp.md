@@ -398,9 +398,11 @@ try {
   sendOffsetsToTransaction is already in flight on this producer; wait for its completion"; the first completes
   normally and the transaction stays good). An empty offsets list otherwise completes `Ok` locally with no wire
   traffic.
-- `UnknownProducerId` (28) inside a transaction aborts it (the commit completes `BrokerError(28)`); the app aborts and
-  redoes the transaction, which runs under epoch+1 from sequence 0. KIP-360 (the coordinator keeping the transaction
-  across the epoch bump) is not implemented.
+- `UnknownProducerId` (28) inside a transaction (KIP-360): after retention, while this transaction has not yet written to
+  that partition (none of its batches acked there), the producer restarts that partition's sequences at 0 under the same
+  producer id and epoch and the transaction continues. When this transaction's own acked data on that partition is
+  gone, the transaction is abortable (the commit completes `BrokerError(28)`) and the abort bumps the epoch, so the
+  redone transaction runs under epoch+1 from sequence 0.
 - A newer producer with the same `transactionalId` fences the old one: its next operation fails and its state is
   `FatalError`.
 - `ProducerConfig::tier2Slots` (default 64) is the pool of Tier-2 batch slots; with every slot in use `batch()` returns a

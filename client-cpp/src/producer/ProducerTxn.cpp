@@ -1150,7 +1150,8 @@ static_assert(ProducerImpl::kTxnResetUnknownPid == static_cast<uint16_t>(rpc::Er
 void ProducerImpl::txnResetPartition_(PartitionState& ps, uint16_t cause) noexcept {
     // KIP-360: a transactional producer's epoch belongs to its coordinator - a local bump would put this
     // partition's data under an epoch no EndTxn ever ends.  The partition sends nothing new (not Added, its id
-    // pending), the transaction can only abort, and the abort's epoch bump restarts every sequence.
+    // pending), the transaction can only abort, and the abort's epoch bump restarts every sequence.  (An
+    // UnknownProducerId on a partition this transaction has not acked on never gets here: restartInPlace_, #694.)
     ps.producerId = -1;
     const bool first = std::holds_alternative<NotInTxn>(ps.txn) || std::holds_alternative<Added>(ps.txn);
     if (first) {

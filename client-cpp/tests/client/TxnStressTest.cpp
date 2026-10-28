@@ -318,7 +318,9 @@ private:
         for (; gapsSeen_ < gw_->seqGapEvents.size(); ++gapsSeen_) {
             const int16_t code = gw_->seqGapEvents[gapsSeen_];
             ++stats_["seqGap" + std::to_string(code)];
-            model_.produceGap(code);
+            const bool txnData = gapsSeen_ < gw_->seqGapTxnData.size() && gw_->seqGapTxnData[gapsSeen_] != 0;
+            if (code == 28 && !txnData) ++stats_["restartAfterGap28"];   // #694: absorbed in place, the txn continues
+            model_.produceGap(code, txnData);
             note("  sequence gap " + std::to_string(code) + " injected -> " + txm::name(model_.state));
         }
         for (; decisionsSeen_ < gw_->coordDecisions.size(); ++decisionsSeen_) {
@@ -434,7 +436,8 @@ private:
             if (b.producerId < 0) continue;
             const auto key = std::make_tuple(b.producerId, b.producerEpoch, b.partition);
             const auto it  = next.find(key);
-            const int32_t want = it == next.end() ? 0 : it->second;
+            // #694: the first batch after an absorbed 28 (the broker held no state) restarts at 0 under the same epoch.
+            const int32_t want = (it == next.end() || b.restart) ? 0 : it->second;
             if (b.baseSequence != want) {
                 fail("sequence gap: pid " + std::to_string(b.producerId) + " epoch " + std::to_string(b.producerEpoch) + " partition " +
                      std::to_string(b.partition) + " batch at " + std::to_string(b.baseSequence) + ", expected " + std::to_string(want));

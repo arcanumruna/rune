@@ -2483,6 +2483,15 @@ int ProducerImpl::flushBatches(
 //         provably duplicate-free (no window at all, unlike U1).  The acked-
 //         data case is counted (unknownProducerIdStateLoss: the broker lost
 //         state it should have kept); it is never an app-visible failure.
+//         U3 (transactional, #694 / KIP-360).  A transactional epoch belongs to the coordinator, so U1 / U2's
+//         re-sequencing (a new identity) can only abort the transaction.  But UnknownProducerId means the broker
+//         holds NO producer state for us on this partition, i.e. none of our batches remain there.  If NONE of the
+//         CURRENT transaction's batches was acked on it (Added::ackedBatches == 0), the sequences restart at 0
+//         under the SAME producer id and epoch (restartInPlace_): the broker accepts sequence 0 from an unknown
+//         producer, the epoch is still the coordinator's so EndTxn still ends this data, and the transaction is
+//         kept.  If it already had a batch acked here, that data was lost on the broker: today's behaviour holds
+//         (AbortableError with 28, the abort bumps the epoch).  C3 (a failed predecessor's gap) is unchanged: a
+//         gap still poisons.
 //     lastAckedOffset (per partition) = the max last offset of every OK (B).
 // ---------------------------------------------------------------------------
 
@@ -2530,6 +2539,12 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         completeSlice_(ps, b->ackStart, b->ackCount, off, OpStatus::Ok, 0, b->tier2, b->recordCount);
         if (b->baseSequence >= 0 && b->producerId == ps.producerId && b->producerEpoch == ps.epoch) {
             ps.lastAckedSeq = std::max(ps.lastAckedSeq, b->baseSequence + b->recordCount - 1);
+            // #694: this transaction now has data on the broker for this partition (an ack of the CURRENT identity).
+            if (txnBatchAttrs_ != 0) [[unlikely]] {
+                if (auto* ad = std::get_if<Added>(&ps.txn); ad != nullptr && ad->ackedBatches != UINT32_MAX) {
+                    ++ad->ackedBatches;
+                }
+            }
         }
         // D6: the max acked LAST offset (a known-old OK -1 carries none).
         if (off >= 0) ps.lastAckedOffset = std::max(ps.lastAckedOffset, off + b->recordCount - 1);
@@ -2626,6 +2641,13 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
                          "the broker lost producer state (batch not appended; re-sequenced)\n",
                          ps.topicId, ps.partition, static_cast<long long>(ps.lastAckedOffset),
                          static_cast<long long>(logStartOffset));
+        }
+        // U3 (transactional, #694): see the rule below.
+        if (txnBatchAttrs_ != 0) [[unlikely]] {
+            if (const auto* ad = std::get_if<Added>(&ps.txn); ad != nullptr && ad->ackedBatches == 0) {
+                restartInPlace_(ps);
+                return;
+            }
         }
         resequence_(ps, kTxnResetUnknownPid);
         return;
@@ -2888,6 +2910,18 @@ void ProducerImpl::resequence_(PartitionState& ps, uint16_t cause) noexcept {
     resetPartition_(ps, cause);
     if (ps.producerId < 0) return;   // epoch overflow: the stored batches are re-stamped when the new id arrives
     restampInflight_(ps);
+}
+
+void ProducerImpl::restartInPlace_(PartitionState& ps) noexcept {
+    // #694: the producer id and epoch are kept (the coordinator's); only this partition's sequence space restarts.
+    ps.nextBaseSequence = 0;
+    ps.lastAckedSeq     = -1;
+    ps.unresolved       = false;
+    std::fprintf(stderr,
+                 "ProducerImpl: topic=%d part=%d UnknownProducerId after retention: sequences restart at 0 under the "
+                 "same epoch; the transaction continues\n",
+                 ps.topicId, ps.partition);
+    restampInflight_(ps);   // b and every batch behind it: from 0, the same identity, parked for the re-send
 }
 
 void ProducerImpl::restampInflight_(PartitionState& ps) noexcept {

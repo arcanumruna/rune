@@ -487,6 +487,14 @@ struct InvokerGateway {
     std::deque<int16_t> seqGapCodes;
     int                 injectedSeqGaps = 0;
     std::vector<int16_t> seqGapEvents;
+    /// #694: parallel to seqGapEvents: 1 when the open transaction already had a batch appended on that (topic,
+    /// partition) when the gap was injected (so an injected 28 meant "this transaction's own data is gone": the
+    /// client aborts), 0 otherwise (an injected 28 then restarts the partition's sequences in place: the transaction
+    /// continues; always 0 for a 20).
+    std::vector<uint8_t> seqGapTxnData;
+    /// #694: injected 28s that the client absorbs by restarting the partition's sequences under the same epoch (no
+    /// abort, no epoch bump).  The gateway forgets the producer's state for that partition, the way retention would.
+    int restartsAfterGap = 0;
     /// #373: a transactional InitProducerId answered OK after an injected gap and before the next such init: the
     /// KIP-360 epoch bump (the poisoned transaction's abort re-inits the id).  A replacement producer's init after a gap
     /// counts too.
@@ -600,9 +608,11 @@ struct InvokerGateway {
         int16_t producerEpoch = -1;
         int32_t baseSequence = -1;
         int64_t baseOffset = 0;
+        bool    restart = false;   ///< #694: the first batch after an injected 28 restart: its sequence starts again at 0
         std::vector<std::vector<uint8_t>> values;
     };
     std::vector<LogBatch> log;
+    std::set<std::tuple<int32_t, int64_t, int32_t>> restartPending_;   ///< (topic, pid, partition) awaiting its first restarted batch
     /// A read_committed reader's view of `partition`: plain batches and committed transactional ones, in log order.
     [[nodiscard]] std::vector<std::vector<uint8_t>> committedValues(int32_t partition) const {
         std::vector<std::vector<uint8_t>> out;
@@ -1363,7 +1373,24 @@ private:
                 seqGapCodes.pop_front();
                 ++injectedSeqGaps;
                 seqGapEvents.push_back(gap);
-                gapSinceInit_ = true;
+                bool txnData = false;
+                if (gap == static_cast<int16_t>(rp::ErrorCode::UnknownProducerId)) {
+                    for (const auto& lb : log) {
+                        if (lb.fate == TxnFate::Open && lb.producerId == pv.producerId && lb.topicId == pv.topicId &&
+                            lb.partition == pv.partition) {
+                            txnData = true;
+                            break;
+                        }
+                    }
+                    if (!txnData) {   // #694: the broker holds no state for us here (retention): forget it
+                        if (gapIt != seqStates.end()) seqStates.erase(gapIt);
+                        restartPending_.insert(gapKey);
+                        ++restartsAfterGap;
+                    }
+                }
+                seqGapTxnData.push_back(txnData ? 1 : 0);
+                const bool restart = gap == static_cast<int16_t>(rp::ErrorCode::UnknownProducerId) && !txnData;
+                if (!restart) gapSinceInit_ = true;   // a restart is absorbed in place: no abort, no epoch bump follows
                 ackAt(pr, gap, 0, gap == static_cast<int16_t>(rp::ErrorCode::UnknownProducerId) ? logStartOffset : -1);
                 return;
             }
@@ -1381,6 +1408,7 @@ private:
             lb.producerEpoch = pv.producerEpoch;
             lb.baseSequence  = pv.baseSequence;
             lb.baseOffset    = nextOffset;
+            lb.restart       = restartPending_.erase(std::make_tuple(pv.topicId, pv.producerId, pv.partition)) != 0;
             lb.fate = (r.attributes() & rune::protocol::batch::kAttrTransactional) != 0 ? TxnFate::Open : TxnFate::NotTxn;
             r.forEachRecord([&](std::string_view, std::string_view v, int64_t, int64_t) {
                 lb.values.emplace_back(v.begin(), v.end());
