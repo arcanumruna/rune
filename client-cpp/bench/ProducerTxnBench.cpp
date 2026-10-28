@@ -123,7 +123,12 @@ void deliverOp(void*, const rune::client::detail::OpTarget& t, const Completion&
 
 // ---- the duty thread: a ProducerHub + an at-once coordinator / broker -----------------------------------------
 struct Duty {
-    struct Req { int64_t corrId; uint16_t templateId; };
+    struct Req {
+        int64_t  corrId;
+        uint16_t templateId;
+        std::array<rpc::TxnPartitionResult, kPartitions> parts{};   // #698: the answer names every partition asked
+        std::size_t nParts = 0;
+    };
     struct Batch { int64_t corrId; int32_t records; };
     ProducerImpl*          impl;
     int64_t                warmRecords;   // count allocations once this many records are acknowledged ...
@@ -142,7 +147,20 @@ struct Duty {
         auto* d = static_cast<Duty*>(ctx);
         if (d->nReqs == d->reqs.size()) return rp::CoordinatorSink::Offer::Retry;
         const auto h = rpc::MessageHeader::decode(b, n);
-        if (h) d->reqs[d->nReqs++] = Req{h->correlationId, h->templateId};
+        if (h) {
+            Req& q       = d->reqs[d->nReqs++];
+            q.corrId     = h->correlationId;
+            q.templateId = h->templateId;
+            q.nParts     = 0;
+            if (h->templateId == rpc::AddPartitionsToTxn::TEMPLATE_ID) {
+                if (const auto m = rpc::AddPartitionsToTxn::decode(b, n)) {
+                    for (std::size_t i = 0; i < m->partitions.size(); ++i) {
+                        if (q.nParts == q.parts.size()) die("AddPartitionsToTxn names more partitions than the bench expects");
+                        q.parts[q.nParts++] = {m->partitions[i].topicId, m->partitions[i].partition, 0};
+                    }
+                }
+            }
+        }
         return rp::CoordinatorSink::Offer::Accepted;
     }
     static int64_t session(void*) noexcept { return 77; }
@@ -183,7 +201,10 @@ struct Duty {
                 case rpc::EndTxn::TEMPLATE_ID:             kind = rp::ReqKind::EndTxn; ++endsAnswered; break;
                 default: die("unexpected coordinator request");
                 }
-                const auto a = test_support::FakeCoordinator::answer(kind, r.corrId, 0);
+                const auto a = kind == rp::ReqKind::AddPartitions
+                    ? test_support::FakeCoordinator::answerNaming(
+                          r.corrId, 0, std::span<const rpc::TxnPartitionResult>(r.parts.data(), r.nParts))
+                    : test_support::FakeCoordinator::answer(kind, r.corrId, 0);
                 (void)hub.onCoordinatorResponse(a.templateId, a.data(), a.len, now);
             }
             nReqs = 0;
