@@ -381,6 +381,11 @@ try {
 - `TxnState`: `Uninitialized`, `Initializing`, `Ready`, `InTransaction`, `CommittingTransaction`,
   `AbortingTransaction`, `AbortableError`, `FatalError`. After a timeout in `CommittingTransaction` the outcome is in doubt:
   retry the same `commitTransactionAndWait()`.
+- Sequences continue across transactions under one epoch. After a commit lands, if any partition's sequence counter is
+  above 2^30 the commit also bumps the epoch (one `InitProducerId`, every partition restarts at 0) and completes `Ok` once
+  the bump is answered; if that bump fails the commit still completes `Ok` (it landed) and the producer is `FatalError`.
+  A single transaction that writes more than 2^30 records to one partition can still exhaust the sequence space
+  mid-transaction (no bump is possible while a transaction is open): it becomes abortable.
 - Other methods: `flush`, `close`, `closeAndWait`, `producerId()`, `producerEpoch()`, `transactionActive()`. A transactional
   producer needs `WRITE` on its transactional id.
 - A `ReadCommitted` consumer sees a transaction's records only after commit.

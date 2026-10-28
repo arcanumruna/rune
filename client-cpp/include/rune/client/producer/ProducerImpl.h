@@ -104,6 +104,13 @@ inline constexpr int32_t kMsgDirectClaimAbort = 8; // #656: an Invoker claim abo
 // kMaxGroupMemberIdBytes) travels as the 48-byte header ONLY: the duty side completes it InvalidArgument without
 // reading any data.
 inline constexpr std::size_t kTxnCtlHeaderBytes = 48;
+/// #345: a transactional producer's sequences continue across transactions under one epoch, so a busy partition would
+/// reach INT32_MAX and lose the transaction that hits it.  After an EndTxn(commit) is answered OK, if ANY partition's
+/// next base sequence is above this threshold (half of the sequence space) the commit's end phase bumps the epoch
+/// (InitProducerId with the current identity) and every partition restarts at 0 before the commit completes Ok.  A
+/// single transaction that writes more than 2^30 records to one partition can still exhaust the space mid-transaction:
+/// that stays AbortableError (no bump is possible while a transaction is open).
+inline constexpr int32_t kTxnSeqBumpAt = 1 << 30;
 
 // CLAIM_BATCH layout (kMsgClaimBatch payload): [0..33] exactly as SEND_RECORD
 // (topicId, partition, keyLen, inline key, flags = 0, ackHandle = 0), then
@@ -2057,6 +2064,8 @@ private:
     /// EndTxn's final OK (or an unstarted transaction): the epoch bump first when required, else Ready.
     void endDone_(int64_t nowNs) noexcept;
     /// Committing / Aborting -> Ready; the op and its joiners complete Ok.
+    /// #345: does any partition's next base sequence exceed kTxnSeqBumpAt?  (control path: a scan of the partitions)
+    [[nodiscard]] bool seqBumpDue_() const noexcept;
     void finishTxn_() noexcept;
     /// The pending end op's deadline: InDoubt, the op completes Timeout.  `releaseSlot`: false when the link
     /// itself expired the slot (it releases it afterwards).

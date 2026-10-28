@@ -1390,8 +1390,142 @@ TEST(ProducerTxnDataRegression, ErrorOfASupersededAttemptIsIgnoredRegression) {
     EXPECT_FALSE(r.impl->hasInFlight());
 }
 
+// ---- #345: a proactive epoch bump after a commit, before the sequence space runs out ----------------------------------
+// Sequences continue across transactions under one epoch, so a long-lived producer would reach INT32_MAX on a busy
+// partition and lose that transaction.  After EndTxn(commit) is answered OK, if any partition's next base sequence is
+// above kTxnSeqBumpAt the commit's end phase bumps the epoch exactly like a BumpEpoch abort (InitProducerId with the
+// current identity, every partition restarts at 0 under the new epoch) and only then completes Ok.
+
+namespace {
+std::size_t countInits(const Rig& r) {
+    std::size_t n = 0;
+    for (const auto& f : r.fake.offered) n += f.templateId == rpc::InitProducerId::TEMPLATE_ID ? 1 : 0;
+    return n;
+}
+/// A transaction with one acked record on partition 0 whose sequence started at `startSeq`, then its commit up to the
+/// answer of EndTxn(commit).  Returns the commit op (not yet completed when a bump follows).
+Op commitAfterSequence(Rig& r, int32_t startSeq) {
+    r.impl->debugSetNextSequenceForTest(kTopic, 0, startSeq);
+    r.begin();
+    EXPECT_EQ(r.send(0, 1), SendResult::Ok);
+    r.tick();
+    r.answerAdd(0);
+    r.tick();
+    EXPECT_EQ(r.wire.size(), 1u);
+    EXPECT_EQ(r.wire[0].baseSeq, startSeq);
+    answerWire(r, 0, 0, 100);
+    Op commit = r.commit();
+    r.tick();
+    EXPECT_EQ(r.endTxns(), 1u);
+    r.endAnswer();
+    return commit;
+}
+}  // namespace
+
+// RED (mutation): seqBumpDue_ returning false (the commit completes Ok with no InitProducerId, and the next batch
+// goes out at the huge sequence); or the Committing case dropped from onTxnInitAnswer_ (the commit never completes).
+TEST(ProducerTxnDataRegression, ACommitPastTheSequenceThresholdBumpsTheEpochRegression) {
+    Rig r;
+    r.initOk(77, 0);
+    ASSERT_EQ(countInits(r), 1u);
+    Op commit = commitAfterSequence(r, rp::kTxnSeqBumpAt + 1);
+    EXPECT_FALSE(commit.ready()) << "the commit completes after the bump";
+    EXPECT_EQ(r.state(), TxnState::CommittingTransaction);
+    r.tick();
+    ASSERT_EQ(countInits(r), 2u) << "an InitProducerId on the wire before the commit completes";
+    EXPECT_EQ(r.endTxns(), 1u) << "the commit is not sent again";
+    EXPECT_FALSE(commit.ready());
+    r.answer(Rig::initAnswer(r.last(rpc::InitProducerId::TEMPLATE_ID)->corrId, 77, 1));
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+    EXPECT_EQ(r.state(), TxnState::Ready);
+    // The next transaction: every partition restarts at 0 under the new epoch.
+    r.begin();
+    ASSERT_EQ(r.send(0, 2), SendResult::Ok);
+    ASSERT_EQ(r.send(1, 3), SendResult::Ok);
+    r.tick();
+    r.answerAdd(0);
+    r.ticks(2);
+    ASSERT_EQ(r.wire.size(), 3u);
+    for (std::size_t i = 1; i < 3; ++i) {
+        EXPECT_EQ(r.wire[i].baseSeq, 0) << "partition " << r.wire[i].partition;
+        EXPECT_EQ(r.wire[i].epoch, 1) << "partition " << r.wire[i].partition;
+        EXPECT_EQ(r.wire[i].pid, 77);
+    }
+    EXPECT_NE(r.wire[1].partition, r.wire[2].partition);
+}
+
+TEST(ProducerTxnDataRegression, ACommitBelowTheSequenceThresholdDoesNotBumpRegression) {
+    Rig r;
+    r.initOk(77, 0);
+    Op commit = commitAfterSequence(r, rp::kTxnSeqBumpAt - 1);   // one record: the counter is exactly kTxnSeqBumpAt
+    ASSERT_TRUE(commit.ready()) << "nothing to bump";
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+    r.ticks(3);
+    EXPECT_EQ(countInits(r), 1u) << "no InitProducerId after initTransactions";
+    EXPECT_EQ(r.state(), TxnState::Ready);
+}
+
+// A bump that fails AFTER the commit landed: the commit completes Ok (it did land), the producer is FatalError with the
+// bump's status; a later op is refused with it.  18 -> Fenced; a non-retriable broker code -> BrokerError.
+TEST(ProducerTxnDataRegression, AFailedBumpAfterACommitCompletesTheCommitOkAndIsFatalRegression) {
+    struct Case { int16_t code; OpStatus status; };
+    for (const Case c : {Case{ec(rpc::ErrorCode::ProducerFenced), OpStatus::Fenced},
+                         Case{ec(rpc::ErrorCode::NotAuthorized), OpStatus::BrokerError}}) {
+        SCOPED_TRACE(c.code);
+        Rig r;
+        r.initOk(77, 0);
+        Op commit = commitAfterSequence(r, rp::kTxnSeqBumpAt + 1);
+        r.tick();
+        ASSERT_EQ(countInits(r), 2u);
+        ASSERT_FALSE(commit.ready());
+        r.answer(FakeCoordinator::answer(rp::ReqKind::InitProducerId, r.last(rpc::InitProducerId::TEMPLATE_ID)->corrId, c.code));
+        ASSERT_TRUE(commit.ready());
+        EXPECT_EQ(commit.status(), OpStatus::Ok) << "the commit landed";
+        EXPECT_EQ(r.state(), TxnState::FatalError);
+        Op next = r.commit();   // refused with the bump's status
+        ASSERT_TRUE(next.ready());
+        EXPECT_EQ(next.status(), c.status);
+        EXPECT_EQ(next.code(), static_cast<uint16_t>(c.code));
+        r.begin();
+        EXPECT_EQ(r.state(), TxnState::FatalError) << "a begin after the failed bump changes nothing";
+    }
+}
+
+// The bump is unanswered past the op timeout: the commit completes Timeout (in doubt, at the bump); an abort is
+// refused (the commit landed); the retried commit re-sends ONLY InitProducerId (never EndTxn) and its answer completes
+// the retry Ok.
+TEST(ProducerTxnDataRegression, ABumpTimeoutAfterACommitIsInDoubtAndTheRetryFinishesItRegression) {
+    Rig r;
+    r.initOk(77, 0);
+    Op commit = commitAfterSequence(r, rp::kTxnSeqBumpAt + 1);
+    r.tick();
+    ASSERT_EQ(countInits(r), 2u);
+    r.tick(r.cfg.transactionOpTimeoutMs * kMs + kMs);
+    r.tick();
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Timeout) << "in doubt: the bump is unknown";
+    EXPECT_EQ(r.state(), TxnState::CommittingTransaction);
+    Op ab = r.abort();
+    ASSERT_TRUE(ab.ready());
+    EXPECT_EQ(ab.status(), OpStatus::BrokerError) << "an abort over a landed commit is refused";
+    EXPECT_EQ(ab.code(), uint16_t{19});
+    EXPECT_EQ(r.state(), TxnState::CommittingTransaction);
+    Op retry = r.commit();
+    r.tick();
+    EXPECT_EQ(countInits(r), 3u) << "the retry re-sends the bump";
+    EXPECT_EQ(r.endTxns(), 1u) << "and never EndTxn";
+    EXPECT_FALSE(retry.ready());
+    r.answer(Rig::initAnswer(r.last(rpc::InitProducerId::TEMPLATE_ID)->corrId, 77, 1));
+    ASSERT_TRUE(retry.ready());
+    EXPECT_EQ(retry.status(), OpStatus::Ok);
+    EXPECT_EQ(r.state(), TxnState::Ready);
+}
+
 // The per-partition int32 sequence never overflows: before the counter would pass INT32_MAX the transaction
 // becomes abortable with an epoch bump (the coordinator owns the epoch); no frame ever carries a wrapped sequence.
+// (#345: this is the IN-transaction exhaustion leg, > 2^30 records to one partition within ONE transaction: no bump is
+// possible while a transaction is open.  Across transactions the commit bumps first - see the kTxnSeqBumpAt tests.)
 TEST(ProducerTxnDataRegression, SequenceCounterNeverOverflowsInt32Regression) {
     Rig r;
     r.initOk(77, 0);
