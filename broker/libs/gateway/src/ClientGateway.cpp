@@ -8528,7 +8528,9 @@ std::string ClientGateway::sourceHostOf_(std::string_view egressChannel) const
 
 bool ClientGateway::gateExempt_(const Session& s) const
 {
-    return !rune::gateway::authorizeCluster(permsOf_(s), rune::security::Operation::Admin).has_value();
+    // Task 15 (rule 4): the allows-check itself - authorizeCluster builds a std::string denial for every non-admin, and this runs
+    // on every request of a suspended namespace's session (the refusal path).
+    return permsOf_(s).allowsCluster(rune::security::opBit(rune::security::Operation::Admin));
 }
 
 uint16_t ClientGateway::suspendedCode_(const Session& s) const noexcept

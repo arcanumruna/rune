@@ -1103,6 +1103,12 @@ if(BUILD_TESTING)
     target_include_directories(rune_ns_throttle_worker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration)
     target_link_libraries(rune_ns_throttle_worker_tests PRIVATE rune_node rune_replication rune_storage rune_transaction GTest::gtest_main)
     gtest_discover_tests(rune_ns_throttle_worker_tests)
+    # Namespaces Phase 2 Task 15: the namespace gate and counters allocate nothing (AllocWindow replaces operator new here).
+    add_executable(rune_ns_hotpath_alloc_tests tests/integration/NsHotPathAllocRegressionTest.cpp tests/support/AllocWindow.cpp)
+    target_include_directories(rune_ns_hotpath_alloc_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_ns_hotpath_alloc_tests PRIVATE rune_node rune_view rune_codec rune_replication rune_storage
+                          rune_transaction GTest::gtest_main)
+    gtest_discover_tests(rune_ns_hotpath_alloc_tests)
     add_executable(rune_hotpath_b_alloc_regression_tests
         tests/integration/HotPathBAllocRegressionTest.cpp)
     target_link_libraries(rune_hotpath_b_alloc_regression_tests PRIVATE
@@ -1850,6 +1856,13 @@ if(BUILD_TESTING)
         target_link_libraries(rune_ns_throttle_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_ns_throttle_tests PROPERTIES TIMEOUT 900)
+
+        # Namespaces Phase 2 Task 15: the gateway's Suspended refusal allocates nothing (real broker, AllocWindow on the control thread).
+        add_executable(rune_ns_hotpath_suspend_alloc_tests tests/client/NsHotPathSuspendAllocRegressionTest.cpp tests/support/AllocWindow.cpp)
+        target_include_directories(rune_ns_hotpath_suspend_alloc_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_ns_hotpath_suspend_alloc_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_ns_hotpath_suspend_alloc_tests PROPERTIES TIMEOUT 600)
 
         # Namespaces Phase 2 Task 12 (D26): the namespace view-memory limit pauses views at an offset and resumes them.
         add_executable(rune_ns_view_memory_tests tests/node/NsViewMemoryRegressionTest.cpp)
