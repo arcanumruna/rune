@@ -18,7 +18,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <fcntl.h>
+#include <aeronmd/aeronmd.h>
 
 using namespace rune::node;
 namespace fs = std::filesystem;
@@ -216,6 +219,63 @@ TEST(EmbeddedDriverRegression, TrailingSlashSpellingsShareOneLockAdversarialRegr
         c.dir = alias;
         EXPECT_THROW(EmbeddedDriver b(c, DriverMode::Invoker), std::runtime_error) << alias;
     }
+}
+
+// #654 review — FAILING (not committed).  A live driver that holds no lock (a pre-#654 broker or client during a
+// rolling upgrade, a stock aeronmd, any raw C-API driver) must still be refused: the heartbeat check was the only
+// guard against it.  Today the new driver takes the (free) lock and dir_delete_on_start wipes the live driver's dir.
+TEST(EmbeddedDriverRegression, ALiveDriverThatHoldsNoLockIsRefusedAdversarialRegression) {
+    TmpDir d;
+    aeron_driver_context_t* ctx = nullptr;
+    aeron_driver_t* raw = nullptr;
+    ASSERT_EQ(aeron_driver_context_init(&ctx), 0);
+    aeron_driver_context_set_dir(ctx, d.path.c_str());
+    aeron_driver_context_set_threading_mode(ctx, AERON_THREADING_MODE_SHARED);
+    aeron_driver_context_set_term_buffer_length(ctx, 64 * 1024);
+    ASSERT_EQ(aeron_driver_init(&raw, ctx), 0);
+    ASSERT_EQ(aeron_driver_start(raw, /*manual_main_loop=*/true), 0);
+    for (int i = 0; i < 16; ++i) aeron_driver_main_do_work(raw);   // heartbeat written: live by Aeron's rule
+    ASSERT_TRUE(aeron_is_driver_active(d.path.c_str(), 10000, [](const char*) {}));
+    EXPECT_THROW(EmbeddedDriver b(cfgAt(d.path), DriverMode::Invoker), std::runtime_error)
+        << "a second driver started on a live driver's dir (and wiped it)";
+    aeron_driver_close(raw);   // also closes ctx
+}
+
+// #654 review — FAILING (not committed).  The lock is keyed by the path STRING, not by the dir: "dir/." locks
+// "dir/..lock" (a file INSIDE the dir) and a symlink "L" -> dir locks "L.lock", so both take a free lock and run
+// dir_delete_on_start over the live driver's dir.  "dir/." deletes every file in it before rmdir(".") fails with
+// EINVAL; the symlink spelling starts a second driver on the same dir.  Either way the live driver loses its cnc.dat.
+TEST(EmbeddedDriverRegression, AnotherSpellingOfTheSameDirIsRefusedAdversarialRegression) {
+    TmpDir d;
+    TmpDir link;
+    EmbeddedDriver a(cfgAt(d.path), DriverMode::Invoker);
+    const fs::path cnc = d.path / "cnc.dat";
+    ASSERT_TRUE(fs::exists(cnc));
+    fs::create_directory_symlink(d.path, link.path);
+    for (const std::string& alias : {d.path.string() + "/.", link.path.string()}) {
+        auto c = cfgAt(d.path);
+        c.dir = alias;
+        EXPECT_THROW(EmbeddedDriver b(c, DriverMode::Invoker), std::runtime_error) << alias;
+        EXPECT_TRUE(fs::exists(cnc)) << "starting on '" << alias << "' wiped the live driver's dir";
+    }
+    std::error_code ec;
+    fs::remove(link.path, ec);
+    fs::remove(d.path.string() + "/..lock", ec);
+}
+
+// #654 review: a symlink planted at the lock path is refused (O_NOFOLLOW), never followed: the link's target is
+// not locked, created or modified.
+TEST(EmbeddedDriverRegression, LockPathSymlinkIsRefusedNotFollowedAdversarialRegression) {
+    TmpDir d;
+    TmpDir target;
+    {
+        std::ofstream(target.path) << "precious";
+    }
+    fs::create_symlink(target.path, d.path.string() + ".lock");
+    EXPECT_THROW(EmbeddedDriver b(cfgAt(d.path), DriverMode::Invoker), std::runtime_error);
+    std::ifstream in(target.path);
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(content, "precious");
 }
 
 TEST(EmbeddedDriverRegression, AeronSpaceCheck) {

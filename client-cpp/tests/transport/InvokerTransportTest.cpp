@@ -787,3 +787,64 @@ TEST(InvokerTransportDirLockRegression, ADirIsReusableAfterItsHolderIsStoppedReg
     EXPECT_NO_THROW(b.start());
     b.stop();
 }
+
+// #654 review: a live driver that holds no lock (a pre-lock client or broker, a stock aeronmd, a raw C-API driver)
+// is still refused, from the pid in its cnc.dat; its dir is never wiped.
+TEST(InvokerTransportDirLockRegression, ALiveDriverThatHoldsNoLockIsRefusedRegression) {
+    const Config cfg = invokerConfig("aeron:ipc", "aeron:ipc", 3203);
+    const std::string aeronDir = (std::filesystem::path{cfg.dataDir} / "aeron").string();
+    std::filesystem::create_directories(cfg.dataDir);
+    aeron_driver_context_t* ctx = nullptr;
+    aeron_driver_t* raw = nullptr;
+    ASSERT_EQ(aeron_driver_context_init(&ctx), 0);
+    aeron_driver_context_set_dir(ctx, aeronDir.c_str());
+    aeron_driver_context_set_threading_mode(ctx, AERON_THREADING_MODE_SHARED);
+    aeron_driver_context_set_term_buffer_length(ctx, 64 * 1024);
+    ASSERT_EQ(aeron_driver_init(&raw, ctx), 0);
+    ASSERT_EQ(aeron_driver_start(raw, /*manual_main_loop=*/true), 0);
+    for (int i = 0; i < 16; ++i) aeron_driver_main_do_work(raw);
+    ASSERT_TRUE(aeron_is_driver_active(aeronDir.c_str(), 10000, [](const char*) {}));
+    {
+        Transport b{cfg};
+        EXPECT_THROW(b.start(), std::runtime_error) << "a second driver started on a live lock-less driver's dir";
+        b.stop();
+    }
+    EXPECT_TRUE(std::filesystem::exists(std::filesystem::path{aeronDir} / "cnc.dat")) << "the live driver's dir was wiped";
+    aeron_driver_close(raw);
+    std::error_code ec;
+    std::filesystem::remove_all(cfg.dataDir, ec);
+}
+
+// #654 review: the lock is keyed by the canonical dir, so "dir/." and a symlink alias share the live holder's lock.
+TEST(InvokerTransportDirLockRegression, AnotherSpellingOfTheSameDirIsRefusedRegression) {
+    const Config cfg = invokerConfig("aeron:ipc", "aeron:ipc", 3204);
+    Transport a{cfg};
+    a.start();
+    const std::filesystem::path cnc = std::filesystem::path{cfg.dataDir} / "aeron" / "cnc.dat";
+    ASSERT_TRUE(std::filesystem::exists(cnc));
+    // The lock sits next to the aeron dir, so the aliasing spelling is a data dir whose "aeron" IS a symlink to the
+    // live driver's dir (its "aeron.lock" would be a different file without canonicalisation).
+    const std::string link = uniqueDir("inv_tr_link");
+    std::filesystem::create_directories(link);
+    std::filesystem::create_directory_symlink(std::filesystem::path{cfg.dataDir} / "aeron", std::filesystem::path{link} / "aeron");
+    for (const std::string& alias : {cfg.dataDir + "/.", link}) {
+        Config c = cfg;
+        c.dataDir = alias;
+        Transport b{c};
+        // The refusal must come from the SHARED LOCK (not from Aeron's own 1 s heartbeat check, which `a` -- never
+        // pumped after start() -- would fail once stale).
+        try {
+            b.start();
+            ADD_FAILURE() << "no refusal for " << alias;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("is held by a live driver"), std::string::npos) << alias << ": " << e.what();
+        }
+        b.stop();
+        EXPECT_TRUE(std::filesystem::exists(cnc)) << "starting on '" << alias << "' wiped the live driver's dir";
+    }
+    a.stop();
+    std::error_code ec;
+    std::filesystem::remove_all(link, ec);
+    std::filesystem::remove(link + "/aeron.lock", ec);
+    std::filesystem::remove_all(cfg.dataDir, ec);
+}
