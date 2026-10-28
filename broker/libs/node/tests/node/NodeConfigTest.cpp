@@ -2295,6 +2295,68 @@ TEST(NodeConfigTest, PsmLogConsistencyRegression_ProducerIdExpirationDefaultAndO
     EXPECT_EQ(r3.config->producerIdExpirationMs, 7LL * 24 * 3600 * 1000) << "invalid -> default";
 }
 
+TEST(ResponseControlConfigRegression, SegmentSevenOrEightZeroIsRefusedRegression) {
+    auto env = shard3node();
+    env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:40600:40500:40400:0,"
+                        "1@127.0.0.1:40111:40201:40221:40620:40520,"
+                        "2@127.0.0.1:40112:40202:40222:40640:40540";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_FALSE(r.config.has_value());
+    EXPECT_NE(r.error.find("responseControlBasePort"), std::string::npos) << r.error;
+    env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:40600:40500:40400:40700:0,"
+                        "1@127.0.0.1:40111:40201:40221:40620:40520,"
+                        "2@127.0.0.1:40112:40202:40222:40640:40540";
+    r = parseNodeConfig(fakeEnv(env));
+    ASSERT_FALSE(r.config.has_value());
+    EXPECT_NE(r.error.find("gatewayResponseControlPort"), std::string::npos) << r.error;
+}
+
+TEST(ResponseControlConfigRegression, LegacyGatewayResponsePortValidatedRegression) {
+    auto mk = [](const char* port, bool egress = false, int workers = 1) {
+        auto env = legacyEnv(base3node());
+        env["RUNE_PEERS"] = "0@rune-1:40110:40200:40220,1@rune-2:40111:40201:40221,2@rune-3:40112:40202:40222";
+        env["RUNE_GATEWAY_RESPONSE_CONTROL_PORT"] = port;
+        if (egress) env["RUNE_PER_WORKER_EGRESS"] = "true";
+        env["RUNE_WORKERS"] = std::to_string(workers);
+        return env;
+    };
+    auto err = [](std::map<std::string, std::string> env) -> std::optional<std::string> {
+        auto r = parseNodeConfig(fakeEnv(std::move(env)));
+        if (!r.config) return r.error;
+        return r.config->validateShardConfig();
+    };
+    auto probe = parseNodeConfig(fakeEnv(mk("45000")));
+    ASSERT_TRUE(probe.config.has_value()) << probe.error;
+    ASSERT_FALSE(probe.config->shardMode());
+    const PeerConfig& me = probe.config->self();
+    EXPECT_FALSE(err(mk("45000")).has_value());                        // free port accepted
+    auto e = err(mk("70000"));
+    ASSERT_TRUE(e.has_value());                                        // out of range
+    EXPECT_NE(e->find("RUNE_GATEWAY_RESPONSE_CONTROL_PORT"), std::string::npos) << *e;
+    e = err(mk(std::to_string(me.consensusPort).c_str()));
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("consensusPort"), std::string::npos) << *e;
+    ASSERT_NE(me.clientPort, 0);
+    e = err(mk(std::to_string(me.clientPort).c_str()));
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("clientPort"), std::string::npos) << *e;
+    if (me.replicationPort != 0) {
+        e = err(mk(std::to_string(me.replicationPort).c_str()));
+        ASSERT_TRUE(e.has_value());
+        EXPECT_NE(e->find("replicationPort"), std::string::npos) << *e;
+    }
+    // Per-worker egress in legacy mode: the gateway port must avoid egressBase + w.
+    auto env = mk("45000", true, 2);
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    ASSERT_TRUE(r.config->perWorkerEgressEnabled);
+    const int32_t eb = r.config->effectiveWorkerEgressControlBasePort();
+    env["RUNE_GATEWAY_RESPONSE_CONTROL_PORT"] = std::to_string(eb + 1);
+    e = err(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("workerEgressControl"), std::string::npos) << *e;
+}
+
 } // namespace rune::node
 
 // REGRESSION (integ/perf-defaults, shard default): RUNE_CLIENT_ENDPOINT given as
@@ -3251,11 +3313,16 @@ TEST(ResponseControlConfigRegression, EnvParsesAndRejectsGarbageRegression) {
     auto env = shard3node();
     env["RUNE_RESPONSE_CONTROL_BASE_PORT"]    = "40700";
     env["RUNE_GATEWAY_RESPONSE_CONTROL_PORT"] = "40699";
+    env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:40600:40500:40400:40700:40699,"   // advertised: accepted
+                        "1@127.0.0.1:40111:40201:40221:40620:40520,"
+                        "2@127.0.0.1:40112:40202:40222:40640:40540";
     auto r = parseNodeConfig(fakeEnv(env));
     ASSERT_TRUE(r.config.has_value()) << r.error;
     EXPECT_EQ(r.config->responseControlBasePort, std::optional<int32_t>{40700});
     EXPECT_EQ(r.config->gatewayResponseControlPort, std::optional<int32_t>{40699});
     EXPECT_FALSE(r.config->validateShardConfig().has_value());
+    env["RUNE_PEERS"] = shard3node()["RUNE_PEERS"];   // unadvertised: peers compute nothing for node 0
+    EXPECT_TRUE(shardErr(env).has_value());
     for (const char* name : {"RUNE_RESPONSE_CONTROL_BASE_PORT", "RUNE_GATEWAY_RESPONSE_CONTROL_PORT"}) {
         auto bad = shard3node();
         bad[name] = "notaport";
@@ -3268,12 +3335,18 @@ TEST(ResponseControlConfigRegression, EnvParsesAndRejectsGarbageRegression) {
 TEST(ResponseControlConfigRegression, CollisionWithIngressIsRefusedRegression) {
     auto env = shard3node();
     env["RUNE_RESPONSE_CONTROL_BASE_PORT"] = "40500";   // == worker 0 ingress
+    env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:40600:40500:40400:40500,"
+                        "1@127.0.0.1:40111:40201:40221:40620:40520,"
+                        "2@127.0.0.1:40112:40202:40222:40640:40540";
     auto e = shardErr(env);
     ASSERT_TRUE(e.has_value());
     EXPECT_NE(e->find("workerIngress"), std::string::npos) << *e;
     EXPECT_NE(e->find("workerResponseControl"), std::string::npos) << *e;
     env = shard3node();
     env["RUNE_GATEWAY_RESPONSE_CONTROL_PORT"] = "40200";   // == self client port
+    env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:40600:40500:40400:40700:40200,"
+                        "1@127.0.0.1:40111:40201:40221:40620:40520,"
+                        "2@127.0.0.1:40112:40202:40222:40640:40540";
     e = shardErr(env);
     ASSERT_TRUE(e.has_value());
     EXPECT_NE(e->find("gatewayResponseControl"), std::string::npos) << *e;
@@ -3288,7 +3361,7 @@ TEST(ResponseControlConfigRegression, CollisionWithIngressIsRefusedRegression) {
 TEST(ResponseControlConfigRegression, CoLocatedPeerCollisionIsRefusedRegression) {
     auto env = shard3node(0);
     env["RUNE_RESPONSE_CONTROL_BASE_PORT"] = "40700";
-    env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:40600:40500,"
+    env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:40600:40500:40400:40700,"
                         "1@127.0.0.1:40111:40201:40221:40620:40520:40420:40700,"   // peer's response base == ours
                         "2@127.0.0.1:40112:40202:40222:40640:40540";
     auto e = shardErr(env);

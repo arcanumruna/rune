@@ -22,7 +22,7 @@ value as false). *ring/size* values must be powers of two; any other value keeps
 | Variable | Default | Meaning |
 |---|---|---|
 | `RUNE_NODE_ID` | required | This node's integer id. It must appear in `RUNE_PEERS`. |
-| `RUNE_PEERS` | required | Comma-separated `id@host:consensusPort[:clientPort[:replicationPort[:replBasePort[:ingressBasePort[:egressControlBasePort[:responseControlBasePort[:gatewayResponseControlPort]]]]]]]` for every node including this one. Ids are unique; whitespace is trimmed; an empty or trailing entry is refused. Ports are 1 to 65535; more than eight port segments are refused. The 7th and 8th segments advertise the [response-control ports](#derived-ports) (`0` or absent = derived in shard mode). A single node needs only the consensus port (`0@127.0.0.1:40111`). **A multi-node cluster needs the first three ports** (`id@host:40111:40200:40222`: consensus, client, replication): peers replicate partitions and the `__catalog` over the replication port, and followers redirect clients to the client port. The shipped compose files use exactly that. In shard mode (the default) the per-worker ports are derived from the node id when the later optional segments are absent (see [derived ports](#derived-ports)). `host` is the **advertised** name peers dial. With authentication on: at most 16 peers and node ids up to 65535. |
+| `RUNE_PEERS` | required | Comma-separated `id@host:consensusPort[:clientPort[:replicationPort[:replBasePort[:ingressBasePort[:egressControlBasePort[:responseControlBasePort[:gatewayResponseControlPort]]]]]]]` for every node including this one. Ids are unique; whitespace is trimmed; an empty or trailing entry is refused. Ports are 1 to 65535; more than eight port segments are refused. The 7th and 8th segments advertise the [response-control ports](#derived-ports) (absent = derived in shard mode; `0` is refused; add them only after every node runs this version, older nodes refuse entries with more than six segments). A single node needs only the consensus port (`0@127.0.0.1:40111`). **A multi-node cluster needs the first three ports** (`id@host:40111:40200:40222`: consensus, client, replication): peers replicate partitions and the `__catalog` over the replication port, and followers redirect clients to the client port. The shipped compose files use exactly that. In shard mode (the default) the per-worker ports are derived from the node id when the later optional segments are absent (see [derived ports](#derived-ports)). `host` is the **advertised** name peers dial. With authentication on: at most 16 peers and node ids up to 65535. |
 | `RUNE_CLIENT_ENDPOINT` | required | `host:port` the client gateway listens on (the broker prepends `aeron:udp?endpoint=`). A value that already starts with `aeron:` is used as given, so both forms work. Use `0.0.0.0:40200` to bind every interface. |
 | `RUNE_DATA_DIR` | required | Writable directory for node state, the term log, the catalog and security logs, and partition logs. The image entrypoint defaults it to `/var/lib/rune`. |
 | `RUNE_CLUSTER_KEY_FILE` | required unless `RUNE_AUTH=disabled` | Shared cluster key file: at least 32 bytes after trailing whitespace is trimmed, not readable by group or others. See [operations](operations.md#the-cluster-key). |
@@ -53,8 +53,8 @@ value as false). *ring/size* values must be powers of two; any other value keeps
 | `RUNE_WORKER_INGRESS_BASE_PORT` | derived per node id | Base UDP port of the per-worker ingress endpoints (1 to 65535). |
 | `RUNE_WORKER_REPL_BASE_PORT` | derived per node id | Base UDP port of the per-worker replication endpoints (1 to 65535). |
 | `RUNE_WORKER_EGRESS_CONTROL_BASE_PORT` | none (legacy mode binds `40300`; shard mode derives it) | Base UDP control port of the per-worker dynamic-MDC egress. |
-| `RUNE_RESPONSE_CONTROL_BASE_PORT` | derived (see below) | Base UDP port of the per-worker response-control endpoints (worker `w` binds base + `w`); 7th `RUNE_PEERS` segment. Unset and not derivable = new clients use the declared egress path. |
-| `RUNE_GATEWAY_RESPONSE_CONTROL_PORT` | derived (see below) | UDP port of the gateway's response-control endpoint; 8th `RUNE_PEERS` segment. |
+| `RUNE_RESPONSE_CONTROL_BASE_PORT` | derived (see below) | Base UDP port of the per-worker response-control endpoints (worker `w` binds base + `w`); 7th `RUNE_PEERS` segment. Shard mode only (ignored with a warning in legacy mode). Absent = derived; `0` is refused. Unset and not derivable = new clients use the declared egress path. An env value that peers do not compute for this node and that the 7th segment does not advertise refuses to start. |
+| `RUNE_GATEWAY_RESPONSE_CONTROL_PORT` | derived (see below) | UDP port of the gateway's response-control endpoint; 8th `RUNE_PEERS` segment. Applies in shard and legacy mode. Absent = derived (shard mode); `0` is refused. In shard mode an env value that peers do not compute for this node and that the 8th segment does not advertise refuses to start. |
 | `RUNE_WORKER_EGRESS_CONTROL_HOST` | derived | Host bound for the egress control port. An explicit loopback host on a node advertised at a non-loopback host refuses to start. |
 | `RUNE_PEER_BIND_HOST` | derived | Address the node binds its peer-facing sockets on. Default: the advertised host when it is numeric, else `0.0.0.0`. |
 
@@ -70,10 +70,10 @@ clients or peers reach the node through Docker port mappings.
 
 The response-control ports (one for the gateway, one per worker) sit in the unused top of the node's egress-control block,
 so there is no extra range: the gateway binds `egress + 63` and worker `w` binds `egress + 63 - W + w` (`egress` = the block's
-egress control base, `W` = `RUNE_WORKERS`). They are derived only for 1 to 31 workers and only when the egress control base is
-the derived one. With an explicit `RUNE_WORKER_EGRESS_CONTROL_BASE_PORT` (or more than 31 workers) none are derived and the node
-logs a warning: set `RUNE_RESPONSE_CONTROL_BASE_PORT` and `RUNE_GATEWAY_RESPONSE_CONTROL_PORT` and advertise them in
-`RUNE_PEERS` (7th and 8th segments). They bind on the egress control host.
+egress control base, `W` = `RUNE_WORKERS`). Every node derives a node's ports by one rule: for 1 to 31 workers, when that node's `RUNE_PEERS` 6th segment is
+absent or equals its derived egress base. When it advertises another egress base (or there are more than 31 workers) none are
+derived and the node logs a warning: set `RUNE_RESPONSE_CONTROL_BASE_PORT` and `RUNE_GATEWAY_RESPONSE_CONTROL_PORT` and advertise
+them in `RUNE_PEERS` (7th and 8th segments, only after every node runs this version). They bind on the egress control host.
 
 ## Storage
 

@@ -97,7 +97,7 @@ static bool parsePort(std::string_view sv, uint16_t& out) {
 ///   - 6th segment: egressControlBasePort (per-worker dynamic-MDC egress control,
 ///     advertised to clients for partitions the peer leads; 2026-10-02).
 ///   - 7th / 8th segments: responseControlBasePort / gatewayResponseControlPort (NAT-safe
-///     response-control ports; 0 / absent = not advertised, derived in shard mode).
+///     response-control ports; absent = derived (shard mode); 0 is refused).
 /// More than 8 port segments is an error.
 /// Returns an error string on failure or an empty string on success.
 static std::string parsePeer(std::string_view entry, PeerConfig& out) {
@@ -522,6 +522,32 @@ std::optional<std::string> NodeConfig::validateShardConfig() const {
                    "advertised as " + adv + ": clients on other hosts cannot reach per-worker egress (it would "
                    "silently fall back to legacy egress) — unset it (derived) or set a reachable address";
     }
+    {
+        // Response-control ports: range checks in both modes (the gateway port applies in legacy mode too).
+        const int32_t Wr = workerCount >= 1 ? workerCount : 1;
+        if (gatewayResponseControlPort && (*gatewayResponseControlPort < 1 || *gatewayResponseControlPort > 65535))
+            return "RUNE_GATEWAY_RESPONSE_CONTROL_PORT must be in [1, 65535], got " +
+                   std::to_string(*gatewayResponseControlPort);
+        if (responseControlBasePort && (*responseControlBasePort < 1 || *responseControlBasePort + Wr - 1 > 65535))
+            return "RUNE_RESPONSE_CONTROL_BASE_PORT must be in [1, " + std::to_string(65536 - Wr) + "], got " +
+                   std::to_string(*responseControlBasePort);
+        if (!shardMode() && gatewayResponseControlPort) {
+            const int32_t g = *gatewayResponseControlPort;
+            auto clash = [g](const char* what) {
+                return "port collision: gatewayResponseControl and " + std::string(what) + " both bind " +
+                       std::to_string(g);
+            };
+            const PeerConfig& s = self();
+            if (g == s.consensusPort) return clash("consensusPort");
+            if (s.clientPort != 0 && g == s.clientPort) return clash("clientPort");
+            if (s.replicationPort != 0 && g == s.replicationPort) return clash("replicationPort");
+            if (perWorkerEgressEnabled) {
+                const int32_t eb = effectiveWorkerEgressControlBasePort();
+                for (int32_t w = 0; w < Wr; ++w)
+                    if (g == eb + w) return clash(("workerEgressControl[w" + std::to_string(w) + "]").c_str());
+            }
+        }
+    }
     if (!shardMode()) return std::nullopt;
 
     const int32_t W = workerCount >= 1 ? workerCount : 1;
@@ -541,12 +567,6 @@ std::optional<std::string> NodeConfig::validateShardConfig() const {
     if (auto e = checkBase(workerIngressBasePort, "RUNE_WORKER_INGRESS_BASE_PORT")) return e;
     if (auto e = checkBase(workerReplBasePort, "RUNE_WORKER_REPL_BASE_PORT")) return e;
     if (auto e = checkBase(workerEgressControlBasePort, "RUNE_WORKER_EGRESS_CONTROL_BASE_PORT")) return e;
-    if (responseControlBasePort && (*responseControlBasePort < 1 || *responseControlBasePort + W - 1 > 65535))
-        return "RUNE_RESPONSE_CONTROL_BASE_PORT must be in [1, " + std::to_string(65536 - W) + "], got " +
-               std::to_string(*responseControlBasePort);
-    if (gatewayResponseControlPort && (*gatewayResponseControlPort < 1 || *gatewayResponseControlPort > 65535))
-        return "RUNE_GATEWAY_RESPONSE_CONTROL_PORT must be in [1, 65535], got " +
-               std::to_string(*gatewayResponseControlPort);
     const int32_t ingressBase = *workerIngressBasePort;
     const int32_t replBase    = *workerReplBasePort;
     const int32_t egressBase  = effectiveWorkerEgressControlBasePort();
@@ -576,17 +596,20 @@ std::optional<std::string> NodeConfig::validateShardConfig() const {
                " disagrees with self RUNE_PEERS egressControlBasePort=" + std::to_string(me.egressControlBasePort) +
                " (peers advertise it to clients; an unadvertised base is the DERIVED one — advertise it as the "
                "6th RUNE_PEERS segment)";
-    if (me.responseControlBasePort != 0 && responseControlBasePort &&
-        me.responseControlBasePort != *responseControlBasePort)
+    if (responseControlBasePort && me.responseControlBasePort != *responseControlBasePort)
         return "RUNE_RESPONSE_CONTROL_BASE_PORT=" + std::to_string(*responseControlBasePort) +
-               " disagrees with self RUNE_PEERS responseControlBasePort=" + std::to_string(me.responseControlBasePort) +
-               " (peers advertise it to clients; advertise it as the 7th RUNE_PEERS segment)";
-    if (me.gatewayResponseControlPort != 0 && gatewayResponseControlPort &&
-        me.gatewayResponseControlPort != *gatewayResponseControlPort)
+               (me.responseControlBasePort == 0
+                    ? std::string(" is not advertised: peers compute no response-control port for this node")
+                    : " disagrees with self RUNE_PEERS responseControlBasePort=" +
+                          std::to_string(me.responseControlBasePort)) +
+               " — advertise it as the 7th RUNE_PEERS segment (only after every node runs this version)";
+    if (gatewayResponseControlPort && me.gatewayResponseControlPort != *gatewayResponseControlPort)
         return "RUNE_GATEWAY_RESPONSE_CONTROL_PORT=" + std::to_string(*gatewayResponseControlPort) +
-               " disagrees with self RUNE_PEERS gatewayResponseControlPort=" +
-               std::to_string(me.gatewayResponseControlPort) +
-               " (peers advertise it to clients; advertise it as the 8th RUNE_PEERS segment)";
+               (me.gatewayResponseControlPort == 0
+                    ? std::string(" is not advertised: peers compute no response-control port for this node")
+                    : " disagrees with self RUNE_PEERS gatewayResponseControlPort=" +
+                          std::to_string(me.gatewayResponseControlPort)) +
+               " — advertise it as the 8th RUNE_PEERS segment (only after every node runs this version)";
 
     struct Bind { int32_t port; std::string what; };
     std::vector<Bind> binds;

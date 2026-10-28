@@ -53,9 +53,7 @@ Decisions:
 - **D3.** **Response-control endpoints.** Each publisher thread has one response-control port: the gateway, and each
   worker. They sit in the unused top of the node's egress-control block (decided 2026-10-28): gateway =
   `egressBase + 63`, worker `w` = `egressBase + 63 - W + w` (the dynamic-MDC egress uses `egressBase + w`), valid for
-  W <= 31 so the two sets never overlap. They are derived only when the egress-control base is the derived one; an
-  explicit base derives none and warns (`RUNE_RESPONSE_CONTROL_BASE_PORT`, `RUNE_GATEWAY_RESPONSE_CONTROL_PORT`; port 0 =
-  not available, the node serves new clients on the old path). Peers advertise them as `RUNE_PEERS` segments 7 and 8.
+  W <= 31 so the two sets never overlap. Every node derives a node's ports by one rule: when that node's RUNE_PEERS 6th segment is absent or equals its derived egress base, from the derived block; otherwise none, and a warning (`RUNE_RESPONSE_CONTROL_BASE_PORT`, `RUNE_GATEWAY_RESPONSE_CONTROL_PORT` then set them; an unadvertised env value that differs from what peers compute refuses to start). A node with none serves new clients on the declared path. Peers advertise them as `RUNE_PEERS` segments 7 and 8. Segments 7 and 8 are added only after every node runs this version: older nodes refuse entries with more than 6 segments.
   They are advertised in Metadata next to `egressControlPort`, and added to `nodeBoundPorts`, the MTU host list and
   `docs/operations.md`. Task 2 confirmed on Aeron 1.51.0 that several exclusive response publications share one
   control port, each reaching only its correlated client (`ResponseEgressSpikeRegression.*`).

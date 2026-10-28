@@ -181,7 +181,7 @@ struct PeerConfig {
     uint16_t egressControlBasePort = 0;
     // NAT-safe egress (spec 2026-10-26-rune-nat-egress-design.md D3): the response-control UDP ports
     // the per-session reply publications' `control=` endpoints use.  7th and 8th RUNE_PEERS segments;
-    // 0 = not advertised (derived in shard mode from the DERIVED egress block, HostDefaults.h).
+    // absent = derived (shard mode, from the DERIVED egress block, HostDefaults.h); 0 is refused by the parser.
     // responseControlBasePort: worker w binds base + w; gatewayResponseControlPort: the gateway's.
     uint16_t responseControlBasePort    = 0;
     uint16_t gatewayResponseControlPort = 0;
@@ -743,7 +743,7 @@ struct NodeConfig {
     /// Response-control ports (NAT-safe egress; every per-session reply rides an Aeron response publication
     /// whose `control=` endpoint is one of these).  Bound on effectiveResponseControlHost().  0 / nullopt =
     /// not available: clients then use the declared egress path.  In shard mode they are derived from the
-    /// DERIVED egress block (HostDefaults.h deriveResponseControlPorts); an explicit egress base derives none.
+    /// DERIVED egress block (HostDefaults.h deriveResponseControlPorts) when this node advertises no, or the derived, egress base.
     ///   - responseControlBasePort: worker w binds base + w (shard mode).  RUNE_RESPONSE_CONTROL_BASE_PORT.
     ///   - gatewayResponseControlPort: the gateway's.  RUNE_GATEWAY_RESPONSE_CONTROL_PORT.
     std::optional<int32_t> responseControlBasePort;
