@@ -1419,7 +1419,7 @@ TEST(ResponseControlConfigRegression, UnadvertisedEnvResponsePortRefusedRegressi
         const auto e = c.validateShardConfig();
         ASSERT_TRUE(e.has_value());
         EXPECT_NE(e->find("RUNE_RESPONSE_CONTROL_BASE_PORT"), std::string::npos) << *e;
-        EXPECT_NE(e->find("not advertised"), std::string::npos) << *e;
+        EXPECT_NE(e->find("disagrees"), std::string::npos) << *e;   // self entry = what peers compute
     }
     {
         NodeConfig c = shardNode(0, 2);
@@ -1438,6 +1438,7 @@ TEST(ResponseControlConfigRegression, UnadvertisedEnvResponsePortRefusedRegressi
         const auto e = c.validateShardConfig();
         ASSERT_TRUE(e.has_value());
         EXPECT_NE(e->find("RUNE_RESPONSE_CONTROL_BASE_PORT"), std::string::npos) << *e;
+        EXPECT_NE(e->find("not advertised"), std::string::npos) << *e;   // peers compute none
     }
     {   // advertised: accepted
         NodeConfig c = shardNode(0, 2);

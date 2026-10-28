@@ -58,8 +58,9 @@ Decisions:
   `docs/operations.md`. Task 2 confirmed on Aeron 1.51.0 that several exclusive response publications share one
   control port, each reaching only its correlated client (`ResponseEgressSpikeRegression.*`).
 - **D4.** **Wire.** A new `kClientVersionResponseEgress`:
-  - **New clients** send an empty `egressChannel` and a `responseCorrelated` flag. The broker answers only on the
-    response publication.
+  - **New clients** send their declared `egressChannel` AND `responseCorrelated = 1` (an older broker ignores the
+    flag and answers on the declared channel; a broker >= 9 ignores the declared channel when the flag is set and
+    answers only on the response publication).
   - **Older clients** keep the declared-channel path unchanged, so mixed versions keep working.
   - The gateway records the session's source address from the image's `sourceIdentity`, never from the declared
     channel. This fixes #227 for both paths.
