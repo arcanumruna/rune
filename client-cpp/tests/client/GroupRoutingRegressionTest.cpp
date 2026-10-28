@@ -73,7 +73,7 @@ RigOptions routingClockOptions(int64_t stepNs = 1'000'000) {
 // refused it, so partition 1 was never consumed.  The fix routes each group
 // Subscribe to the partition's LEADER session, stamped with that session's id.
 TEST(GroupRoutingRegression, MemberConsumesPartitionsLedByTwoNodesRegression) {
-    GroupRig r(4101, 4102);
+    GroupRig r(4101, 4102, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4101);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, /*leader*/ 0, 1, 4101, ""}, {1, 1, /*leader*/ 1, 1, 4101, ""}};
@@ -115,7 +115,7 @@ TEST(GroupRoutingRegression, MemberConsumesPartitionsLedByTwoNodesRegression) {
 // a seed-level redirect (transport retarget + reconnect of the coordinator
 // session) and partition 1 was never subscribed on node 1.
 TEST(GroupRoutingRegression, RedirectedGroupSubscribeReroutesToTheLeaderRegression) {
-    GroupRig r(4103, 4104);
+    GroupRig r(4103, 4104, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4103);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4103, ""}, {1, 1, /*stale leader*/ 0, 1, 4103, ""}};
@@ -151,7 +151,7 @@ TEST(GroupRoutingRegression, RedirectedGroupSubscribeReroutesToTheLeaderRegressi
 // parks the partition until a metadata answer names the leader; the member
 // then subscribes there.
 TEST(GroupRoutingRegression, NotLeaderGroupSubscribeConvergesOnMetadataRegression) {
-    GroupRig r(4105, 4106);
+    GroupRig r(4105, 4106, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4105);
     r.gw.moreBrokers        = {{1, "127.0.0.1", p1port}};
     r.gw.partitions         = {{1, 0, 0, 1, 4105, ""}, {1, 1, /*stale*/ 0, 1, 4105, ""}};
@@ -214,7 +214,7 @@ TEST(GroupRoutingRegression, AFiveSecondLeaderlessPartitionStillBindsWhenALeader
 // replay of what it already consumed) and unsubscribe the old node-1
 // subscription.
 TEST(GroupRoutingRegression, LeaderChangeResubscribesOnTheNewLeaderRegression) {
-    GroupRig r(4107, 4108);
+    GroupRig r(4107, 4108, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4107);
     const auto [n2, p2port] = r.addNode(4107);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
@@ -268,7 +268,7 @@ TEST(GroupRoutingRegression, LeaderChangeResubscribesOnTheNewLeaderRegression) {
 // and be assigned again.  RED on main: every group frame after the redirect
 // arrives on node 1 (NotCoordinator), generation 2 never assigns.
 TEST(GroupRoutingRegression, MemberRejoinsTheCoordinatorAfterARedirectedSubscribeRegression) {
-    GroupRig r(4109, 4110);
+    GroupRig r(4109, 4110, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4109);
     r.gw.moreBrokers         = {{1, "127.0.0.1", p1port}};
     r.gw.partitions          = {{1, 0, 0, 1, 4109, ""}, {1, 1, /*stale*/ 0, 1, 4109, ""}};
@@ -340,7 +340,7 @@ const test_support::InvokerGateway::Subscribed* newSubAt(const test_support::Inv
 // loss.  Now: the new subscription starts at the committed offset (5) and the
 // commits never pass what was consumed contiguously.
 TEST(GroupRoutingRegression, StaleRecordsAfterRejoinNeverMoveThePositionRegression) {
-    GroupRig r(4111, 4112);
+    GroupRig r(4111, 4112, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4111);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4111, ""}, {1, 1, 1, 1, 4111, ""}};
@@ -396,7 +396,7 @@ TEST(GroupRoutingRegression, StaleRecordsAfterRejoinNeverMoveThePositionRegressi
 // MEDIUM-3: a batch entirely below the position (a re-delivery) is skipped,
 // never handed to the application again.  RED: it was delivered.
 TEST(GroupRoutingRegression, BatchBelowThePositionIsNotRedeliveredRegression) {
-    GroupRig r(4117, 4118);
+    GroupRig r(4117, 4118, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4117);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4117, ""}, {1, 1, 1, 1, 4117, ""}};
@@ -423,7 +423,7 @@ TEST(GroupRoutingRegression, BatchBelowThePositionIsNotRedeliveredRegression) {
 // must itself ask for metadata, and the answer (node 2 leads) re-routes p1,
 // which resumes on node 2 from the member's position.  RED: p1 stalled forever.
 TEST(GroupRoutingRegression, DeadLeaderNodeSessionReroutesItsPartitionsRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.keepaliveNs       = 50'000'000;   // 50 ms
     o.responseTimeoutNs = 400'000'000;  // the session machine's own staleness rule
     GroupRig r(4119, 4120, o);
@@ -459,7 +459,7 @@ TEST(GroupRoutingRegression, DeadLeaderNodeSessionReroutesItsPartitionsRegressio
 // back (still the leader) the session is re-driven and p1 is consumed.  RED: the
 // dead session was re-used forever and p1 never consumed.
 TEST(GroupRoutingRegression, NeverConnectedLeaderSessionIsRevivedRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.connectTimeoutMs = 300;  // a short first-connect budget
     GroupRig r(4121, 4122, o);
     const auto [n1, p1port] = r.addNode(4121);
@@ -489,7 +489,7 @@ TEST(GroupRoutingRegression, NeverConnectedLeaderSessionIsRevivedRegression) {
 // NotCoordinator): the start offset is fetched again, and the leader-node
 // subscription is made.  RED: the partition was never subscribed.
 TEST(GroupRoutingRegression, ErroredOffsetFetchIsRetriedRegression) {
-    GroupRig r(4123, 4124);
+    GroupRig r(4123, 4124, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4123);
     r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
     r.gw.partitions            = {{1, 0, 0, 1, 4123, ""}, {1, 1, 1, 1, 4123, ""}};
@@ -515,7 +515,7 @@ TEST(GroupRoutingRegression, ErroredOffsetFetchIsRetriedRegression) {
 // (main / fix round 0): node 1's group records also reached the topic-b handler
 // when the per-node subscription ids collided.
 TEST(GroupRoutingRegression, CollidingSessionIdsNeverCrossDeliverRegression) {
-    GroupRig r(4125, 4126);
+    GroupRig r(4125, 4126, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4125);
     r.gw.uniqueSessionIds  = false;  // every node assigns session id 42
     r.gw.perEndpointSubIds = true;   // per-node counters, node-prefixed (cluster-unique)
@@ -554,7 +554,7 @@ TEST(GroupRoutingRegression, CollidingSessionIdsNeverCrossDeliverRegression) {
 // must follow the partition (route + leader session), never move the seed.
 // RED: the seed transport was retargeted to the redirect target.
 TEST(GroupRoutingRegression, ProduceRedirectNeverMovesTheCoordinatorSessionRegression) {
-    GroupRig r(4127, 4128);
+    GroupRig r(4127, 4128, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4127);
     r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
     r.gw.partitions  = {};  // no routes yet
@@ -587,7 +587,7 @@ TEST(GroupRoutingRegression, ProduceRedirectNeverMovesTheCoordinatorSessionRegre
 // MEDIUM-7: a group consumer created AFTER connect() joins at once.  RED: it
 // stayed Unjoined until the next seed (re)connect.
 TEST(GroupRoutingRegression, GroupConsumerCreatedAfterConnectJoinsRegression) {
-    GroupRig r(4129, 4130);
+    GroupRig r(4129, 4130, routingClockOptions());
     r.gw.holdJoins       = false;
     r.gw.groupAssignment = {{1, 0}};
     r.connect();
@@ -611,7 +611,7 @@ struct TwoLeaders {
     int      n1 = 0, p1port = 0;
     Consumed led;
     std::unique_ptr<rc::GroupConsumer> gc;
-    explicit TwoLeaders(int32_t in, int32_t eg, RigOptions o = {}, rc::GroupConfig gcfg = {})
+    explicit TwoLeaders(int32_t in, int32_t eg, RigOptions o = routingClockOptions(), rc::GroupConfig gcfg = {})
         : r(in, eg, o) {
         std::tie(n1, p1port) = r.addNode(in);
         r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
@@ -655,7 +655,7 @@ TEST(GroupRoutingRegression, TransactionMarkerGapIsConsumedPastRegression) {
 // consumed — demultiplexed by the (cluster-unique) subscriptionId.  RED (fix
 // round 1): the unknown source + colliding ids dropped every batch.
 TEST(GroupRoutingRegression, RecordsFromANonSessionSourceAreConsumedRegression) {
-    GroupRig r(4133, 4134);
+    GroupRig r(4133, 4134, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4133);
     const auto [w1, w1port] = r.addNode(4133);  // node 1's worker publication (no session)
     (void)w1port;
@@ -712,7 +712,7 @@ TEST(GroupRoutingRegression, StaleConnectResponseChangesNothingRegression) {
 // client keeps asking (backoff-paced) and moves p1 once node 2 is named.  RED
 // (fix round 1): one metadata request per loss — p1 stalled.
 TEST(GroupRoutingRegression, StaleMetadataAfterALeaderLossIsAskedAgainRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.keepaliveNs       = 50'000'000;
     o.responseTimeoutNs = 400'000'000;
     o.reconnectForever  = true;
@@ -747,7 +747,7 @@ TEST(GroupRoutingRegression, StaleMetadataAfterALeaderLossIsAskedAgainRegression
 // p1 is assigned there (node 1 reachable again), the session is re-driven.  RED
 // (fix round 1): only a NEWLY Disconnected session was revived — p1 stalled.
 TEST(GroupRoutingRegression, AlreadyDisconnectedLeaderSessionIsRevivedRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.connectTimeoutMs = 300;
     GroupRig r(4139, 4140, o);
     const auto [n1, p1port] = r.addNode(4139);
@@ -787,7 +787,7 @@ TEST(GroupRoutingRegression, AlreadyDisconnectedLeaderSessionIsRevivedRegression
 // partition another node leads finishes with a distinct, documented reason
 // (never a seed redirect).
 TEST(GroupRoutingRegression, PlainSubscribeRedirectedWhileGroupActiveReportsWhyRegression) {
-    GroupRig r(4141, 4142);
+    GroupRig r(4141, 4142, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4141);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4141, ""}, {2, 0, 1, 1, 4141, ""}};
@@ -815,7 +815,7 @@ TEST(GroupRoutingRegression, PlainSubscribeRedirectedWhileGroupActiveReportsWhyR
 // (round 2): the member accepted them pre-bind (same session, unretired id),
 // jumped to the log end and skipped its own records.
 TEST(GroupRoutingRegression, PlainSubscriptionNeverFeedsAPendingGroupSubscriptionRegression) {
-    GroupRig r(4143, 4144);
+    GroupRig r(4143, 4144, routingClockOptions());
     r.gw.partitions      = {{1, 0, 0, 1, 4143, ""}};
     r.gw.groupAssignment = {{1, 0}};
     auto gc = r.client.subscribeGroup("g", {"t"});
@@ -849,7 +849,7 @@ TEST(GroupRoutingRegression, PlainSubscriptionNeverFeedsAPendingGroupSubscriptio
 // the abandoned unanswered instance blocked every later Subscribe on that
 // session — p1 stalled forever.
 TEST(GroupRoutingRegression, LostSubscribeResponseNeverBlocksAReassignRegression) {
-    GroupRig r(4145, 4146);
+    GroupRig r(4145, 4146, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4145);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4145, ""}, {1, 1, 1, 1, 4145, ""}};
@@ -878,7 +878,7 @@ TEST(GroupRoutingRegression, LostSubscribeResponseNeverBlocksAReassignRegression
 // joins: it finishes with GroupFailReason::BrokerTooOld.  RED (round 2): it
 // joined (and would lose records on the old broker's auto-subscriptions).
 TEST(GroupRoutingRegression, GroupConsumerRefusesABrokerTooOldRegression) {
-    GroupRig r(4147, 4148);
+    GroupRig r(4147, 4148, routingClockOptions());
     r.gw.advertisedBrokerVersion = -1;  // an older broker's 38-byte ConnectResponse
     r.gw.groupAssignment         = {{1, 0}};
     auto gc = r.client.subscribeGroup("g", {"t"});
@@ -893,7 +893,7 @@ TEST(GroupRoutingRegression, GroupConsumerRefusesABrokerTooOldRegression) {
 // GroupFailReason::RefusedByBroker, no JoinGroup storm.  RED (round 2): it
 // re-joined forever.
 TEST(GroupRoutingRegression, JoinGroupRefusedForVersionFinishesTheConsumerRegression) {
-    GroupRig r(4149, 4150);
+    GroupRig r(4149, 4150, routingClockOptions());
     r.gw.holdJoins     = false;
     r.gw.joinErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::ProtocolVersion);
     auto gc = r.client.subscribeGroup("g", {"t"});
@@ -907,7 +907,7 @@ TEST(GroupRoutingRegression, JoinGroupRefusedForVersionFinishesTheConsumerRegres
 // InvalidRequest (39) — non-retriable, like ProtocolVersion: the consumer
 // finishes RefusedByBroker instead of re-joining with the same bytes forever.
 TEST(GroupRoutingRegression, JoinGroupInvalidRequestFinishesTheConsumerRegression) {
-    GroupRig r(4181, 4182);
+    GroupRig r(4181, 4182, routingClockOptions());
     r.gw.holdJoins     = false;
     r.gw.joinErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::InvalidRequest);
     auto gc = r.client.subscribeGroup("g", {"t"});
@@ -921,7 +921,7 @@ TEST(GroupRoutingRegression, JoinGroupInvalidRequestFinishesTheConsumerRegressio
 // grant / login problem, not a transient one: the consumer finishes with the matching reason after ONE join —
 // it used to fall into the Backoff verdict and re-join until its retry budget ran out.
 TEST(GroupRoutingRegression, JoinGroupNotAuthorizedFinishesTheConsumerWithoutRejoinRegression) {
-    GroupRig r(4183, 4184);
+    GroupRig r(4183, 4184, routingClockOptions());
     r.gw.holdJoins     = false;
     r.gw.joinErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotAuthorized);
     auto gc = r.client.subscribeGroup("g", {"t"});
@@ -932,7 +932,7 @@ TEST(GroupRoutingRegression, JoinGroupNotAuthorizedFinishesTheConsumerWithoutRej
 }
 
 TEST(GroupRoutingRegression, JoinGroupSessionRevokedFinishesTheConsumerRegression) {
-    GroupRig r(4185, 4186);
+    GroupRig r(4185, 4186, routingClockOptions());
     r.gw.holdJoins     = false;
     r.gw.joinErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionRevoked);
     auto gc = r.client.subscribeGroup("g", {"t"});
@@ -968,7 +968,7 @@ TEST(GroupRoutingRegression, SyncGroupInvalidRequestFinishesTheConsumerRegressio
 // Internal on JoinGroup: re-joined with an exponential backoff, and refused
 // once the budget is spent — never a tight JoinGroup <-> Internal storm.
 TEST(GroupRoutingRegression, JoinGroupInternalBacksOffThenRefusesRegression) {
-    GroupRig r(4185, 4186);
+    GroupRig r(4185, 4186, routingClockOptions());
     r.gw.holdJoins     = false;
     r.gw.joinErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
     auto gc = r.client.subscribeGroup("g", {"t"});
@@ -982,7 +982,7 @@ TEST(GroupRoutingRegression, JoinGroupInternalBacksOffThenRefusesRegression) {
 }
 
 TEST(GroupRoutingRegression, SyncGroupInternalBacksOffThenRefusesRegression) {
-    GroupRig r(4187, 4188);
+    GroupRig r(4187, 4188, routingClockOptions());
     r.gw.holdJoins     = false;
     r.gw.syncErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
     auto gc = r.client.subscribeGroup("g", {"t"});
@@ -995,7 +995,7 @@ TEST(GroupRoutingRegression, SyncGroupInternalBacksOffThenRefusesRegression) {
 // A Heartbeat the broker could not serve (Internal): the member re-joins (the
 // broker may have evicted it) — it used to stay Stable (silent split-brain).
 TEST(GroupRoutingRegression, HeartbeatInternalRejoinsNeverStaysStableRegression) {
-    GroupRig r(4189, 4190);
+    GroupRig r(4189, 4190, routingClockOptions());
     r.gw.holdJoins       = false;
     r.gw.groupAssignment = {{1, 0}};
     rc::GroupConfig gcfg;
@@ -1009,7 +1009,7 @@ TEST(GroupRoutingRegression, HeartbeatInternalRejoinsNeverStaysStableRegression)
 }
 
 TEST(GroupRoutingRegression, HeartbeatInvalidRequestFinishesTheConsumerRegression) {
-    GroupRig r(4191, 4192);
+    GroupRig r(4191, 4192, routingClockOptions());
     r.gw.holdJoins       = false;
     r.gw.groupAssignment = {{1, 0}};
     rc::GroupConfig gcfg;
@@ -1025,7 +1025,7 @@ TEST(GroupRoutingRegression, HeartbeatInvalidRequestFinishesTheConsumerRegressio
 // the consumer is refused — it used to skip the entry and wait forever for a
 // start offset that never came.
 TEST(GroupRoutingRegression, OffsetFetchRejectedFinishesTheConsumerRegression) {
-    GroupRig r(4193, 4194);
+    GroupRig r(4193, 4194, routingClockOptions());
     r.gw.holdJoins             = false;
     r.gw.groupAssignment       = {{1, 0}};
     r.gw.offsetFetchRejectNext = 1;
@@ -1038,7 +1038,7 @@ TEST(GroupRoutingRegression, OffsetFetchRejectedFinishesTheConsumerRegression) {
 // I2: a retriable per-entry error is re-fetched (paced) — but within a budget:
 // a broker that never serves it finishes the consumer instead of looping forever.
 TEST(GroupRoutingRegression, OffsetFetchRetriableErrorIsBoundedRegression) {
-    GroupRig r(4195, 4196);
+    GroupRig r(4195, 4196, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4195);
     r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
     r.gw.partitions            = {{1, 0, 0, 1, 4195, ""}, {1, 1, 1, 1, 4195, ""}};
@@ -1060,7 +1060,7 @@ TEST(GroupRoutingRegression, OffsetFetchRetriableErrorIsBoundedRegression) {
 // (paced) and the consumer recovers once the broker answers.  RED before: the first 48 refused the consumer for good.
 TEST(GroupRoutingRegression, OffsetFetchAnswered48IsRefetchedAndRecoversRegression) {
     for (const bool wholeRequest : {true, false}) {
-        GroupRig r(wholeRequest ? 4930 : 4932, wholeRequest ? 4931 : 4933);
+        GroupRig r(wholeRequest ? 4930 : 4932, wholeRequest ? 4931 : 4933, routingClockOptions());
         const auto [n1, p1port] = r.addNode(wholeRequest ? 4930 : 4932);
         r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
         const int32_t gwPort = wholeRequest ? 4930 : 4932;
@@ -1089,7 +1089,7 @@ TEST(GroupRoutingRegression, OffsetFetchAnswered48IsRefetchedAndRecoversRegressi
 // C4 review (#607 class): a broker that answers every OffsetFetch 48 ends the consumer within the same budget as any
 // other retriable OffsetFetch error (RetryBudgetExhausted), never a fast refusal and never a loop.
 TEST(GroupRoutingRegression, OffsetFetchAnswered48ForeverIsBoundedRegression) {
-    GroupRig r(4934, 4935);
+    GroupRig r(4934, 4935, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4934);
     r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
     r.gw.partitions            = {{1, 0, 0, 1, 4934, ""}, {1, 1, 1, 1, 4934, ""}};
@@ -1113,7 +1113,7 @@ TEST(GroupRoutingRegression, OffsetCommitRejectionCompletesCommitSyncRegression)
     for (const auto code : {rune::protocol::client::ErrorCode::InvalidRequest,
                             rune::protocol::client::ErrorCode::Internal}) {
         const int32_t base = code == rune::protocol::client::ErrorCode::InvalidRequest ? 4211 : 4213;
-        GroupRig r(base, base + 1);
+        GroupRig r(base, base + 1, routingClockOptions());
         r.gw.holdJoins             = false;
         r.gw.groupAssignment       = {{1, 0}};
         r.gw.offsetCommitErrorCode = static_cast<int16_t>(code);
@@ -1146,7 +1146,7 @@ TEST(GroupRoutingRegression, OffsetCommitRejectionCompletesCommitSyncRegression)
 // the backoff budget, so the consumer finishes RetryBudgetExhausted after a
 // bounded number of rejoins.
 TEST(GroupRoutingRegression, HeartbeatInternalForeverIsRefusedAfterTheBudgetRegression) {
-    GroupRig r(4215, 4216);
+    GroupRig r(4215, 4216, routingClockOptions());
     r.gw.holdJoins          = false;
     r.gw.groupAssignment    = {{1, 0}};
     r.gw.heartbeatErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
@@ -1166,7 +1166,7 @@ TEST(GroupRoutingRegression, HeartbeatInternalForeverIsRefusedAfterTheBudgetRegr
 // (RetryBudgetExhausted).  RED (round 3): re-fetched every 2 s forever, Stable,
 // never finished, no signal.
 TEST(GroupRoutingRegression, OffsetFetchNotCoordinatorForeverWithHeartbeatOkTerminatesRegression) {
-    GroupRig r(4217, 4218);
+    GroupRig r(4217, 4218, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4217);
     r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
     r.gw.partitions            = {{1, 0, 0, 1, 4217, ""}, {1, 1, 1, 1, 4217, ""}};
@@ -1195,7 +1195,7 @@ TEST(GroupRoutingRegression, OffsetFetchNotCoordinatorForeverWithHeartbeatOkTerm
 // neither the OffsetFetch budget nor the Internal backoff budget: a second
 // failover later recovers the same way.
 TEST(GroupRoutingRegression, OffsetFetchNotCoordinatorFailoverRejoinsWithoutSpendingTheBudgetRegression) {
-    GroupRig r(4219, 4220);
+    GroupRig r(4219, 4220, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4219);
     r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
     r.gw.partitions            = {{1, 0, 0, 1, 4219, ""}, {1, 1, 1, 1, 4219, ""}};
@@ -1275,7 +1275,7 @@ TEST(GroupRoutingRegression, OffsetFetchInFlightIsNeverDuplicatedByTheRetryPassR
 // never subscribes p1 there (parked, logged) and keeps consuming p0.  RED
 // (round 3): it subscribed p1 on the old node.
 TEST(GroupRoutingRegression, PartitionLedByAnOldNodeIsParkedNotSilentlyStalledRegression) {
-    GroupRig r(4151, 4152);
+    GroupRig r(4151, 4152, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4151);
     r.gw.advertisedBrokerVersionAt[n1] = -1;  // node 1: an older broker's ConnectResponse
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
@@ -1359,7 +1359,7 @@ TEST(GroupRoutingRegression, OldLeaderNodeNeverPollsMetadataAndResumesAfterUpgra
 // session a partition routes to asks for metadata (Kafka: a failed connection
 // requests a metadata update); the answer re-routes the held batch.
 TEST(GroupRoutingRegression, ProduceRoutedToADeadLeaderFollowsTheFailoverRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.connectTimeoutMs = 300;
     GroupRig r(4141, 4142, o);
     const auto [n1, p1port] = r.addNode(4141);
@@ -1398,7 +1398,7 @@ TEST(GroupRoutingRegression, ProduceRoutedToADeadLeaderFollowsTheFailoverRegress
 // converges whenever the failover completes.  RED (9eccba0): the given-up session
 // raised no more events, the stale route stuck, every batch hit the delivery timeout.
 TEST(GroupRoutingRegression, ProduceFollowsAFailoverThatOutlastsTheConnectBudgetRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.connectTimeoutMs = 300;
     GroupRig r(4143, 4144, o);
     const auto [n1, p1port] = r.addNode(4143);
@@ -1439,7 +1439,7 @@ TEST(GroupRoutingRegression, ProduceFollowsAFailoverThatOutlastsTheConnectBudget
 // for metadata and the stored batch is re-offered on the new leader at once (same
 // identity).  RED (9eccba0): no refresh and a node-route move re-offered nothing.
 TEST(GroupRoutingRegression, BatchSentToALeaderThatDiesFollowsTheFailoverRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.connectTimeoutMs  = 300;
     o.keepaliveNs       = 600'000'000'000;   // the session never notices the death by itself:
     o.responseTimeoutNs = 600'000'000'000;   // only the attempt timeout can trigger the refresh
@@ -1484,7 +1484,7 @@ TEST(GroupRoutingRegression, BatchSentToALeaderThatDiesFollowsTheFailoverRegress
 // metadata (Kafka: a leader that is not ready requests a metadata update, paced by
 // the retry backoff).  RED (9bcc6e6): no refresh before the delivery timeout.
 TEST(GroupRoutingRegression, BatchHeldOnAConnectingDeadLeaderAsksForMetadataRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.connectTimeoutMs = 600'000;                   // no connect failure within this test
     GroupRig r(4147, 4148, o);
     const auto [n1, p1port] = r.addNode(4147);
@@ -1629,7 +1629,7 @@ TEST(GroupRoutingRegression, TxnProducerOnAFollowerInitsOnTheCoordinatorRegressi
 // member re-joins on the new coordinator's session — first seed -> node 1,
 // then node 1 -> node 2 (a coordinator session to a coordinator session).
 TEST(GroupRoutingRegression, CoordinatorFailoverWhileStableRejoinsTheNewCoordinatorRegression) {
-    GroupRig r(4135, 4136);
+    GroupRig r(4135, 4136, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4135);
     const auto [n2, p2port] = r.addNode(4135);
     r.gw.moreBrokers         = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
@@ -1677,7 +1677,7 @@ TEST(GroupRoutingRegression, CoordinatorFailoverWhileStableRejoinsTheNewCoordina
 // already joined (an answer to a frame sent to the follower before the move)
 // changes nothing — no rebalance, no new session, no reconnect.
 TEST(GroupRoutingRegression, LateNotCoordinatorNamingTheCurrentCoordinatorIsANoOpRegression) {
-    GroupRig r(4137, 4138);
+    GroupRig r(4137, 4138, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4137);
     r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
     r.gw.partitions            = {{1, 0, n1, 1, 4137, ""}, {1, 1, n1, 1, 4137, ""}};
@@ -1716,7 +1716,7 @@ TEST(GroupRoutingRegression, LateNotCoordinatorNamingTheCurrentCoordinatorIsANoO
 // would register a ghost member.  RED with the unconditional re-join of
 // Joining members on every connect (a0f61a1): two JoinGroups.
 TEST(GroupRoutingRegression, ResumeKeepingTheSessionIdKeepsTheHeldJoinRegression) {
-    GroupRig r(4139, 4140);
+    GroupRig r(4139, 4140, routingClockOptions());
     r.gw.partitions      = {{1, 0, 0, 1, 4139, ""}, {1, 1, 0, 1, 4139, ""}};
     r.gw.groupAssignment = {{1, 0}, {1, 1}};
     r.gw.holdJoins       = true;
@@ -1785,7 +1785,7 @@ TEST(GroupRoutingRegression, NotCoordinatorWithAConnectCorrIdNeverFailsTheConnec
 // reachable the member joins there.  Paced by the session's own connect budget
 // (no loop at round-trip speed).
 TEST(GroupRoutingRegression, UnreachableCoordinatorFallsBackToTheSeedAndRetriesRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.connectTimeoutMs = 300;   // the coordinator session gives up after 4 x 300 ms
     GroupRig r(4143, 4144, o);
     const auto [n1, p1port] = r.addNode(4143);
@@ -1847,7 +1847,7 @@ void moveSeedToNode1(GroupRig& r, int n1, int p1port, int32_t topicIdx, std::opt
 // d22a757: the answer was taken for "the coordinator is already the seed" (a
 // no-op) and the InitProducerId was never re-sent.
 TEST(GroupRoutingRegression, TxnCoordinatorOnTheBootstrapAfterASeedRetargetRegression) {
-    GroupRig r(4171, 4172);
+    GroupRig r(4171, 4172, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4171);
     r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
     r.gw.holdJoins   = false;
@@ -1888,7 +1888,7 @@ TEST(GroupRoutingRegression, TxnCoordinatorOnTheBootstrapAfterASeedRetargetRegre
 // while the seed sits on node 1.  RED at d22a757: one JoinGroup to node 1,
 // NotCoordinator{bootstrap} ignored, never joined.
 TEST(GroupRoutingRegression, GroupCoordinatorOnTheBootstrapAfterASeedRetargetRegression) {
-    GroupRig r(4173, 4174);
+    GroupRig r(4173, 4174, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4173);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4173, ""}, {1, 1, 0, 1, 4173, ""}};
@@ -1918,7 +1918,7 @@ TEST(GroupRoutingRegression, GroupCoordinatorOnTheBootstrapAfterASeedRetargetReg
 // must reach that session, never the healthy seed.  RED at d22a757: the seed
 // went Resuming and reconnected; the coordinator session never learned.
 TEST(GroupRoutingRegression, SessionExpiredForTheCoordinatorSessionNeverHitsTheSeedRegression) {
-    GroupRig r(4175, 4176);
+    GroupRig r(4175, 4176, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4175);
     r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
     r.gw.partitions            = {{1, 0, n1, 1, 4175, ""}, {1, 1, n1, 1, 4175, ""}};
@@ -1960,7 +1960,7 @@ TEST(GroupRoutingRegression, SessionExpiredForTheCoordinatorSessionNeverHitsTheS
 // r2 LOW-5: a commitSync of a member whose coordinator is a session of its own
 // goes there (coordDirectSendTrampoline_), stamped with that session's id.
 TEST(GroupRoutingRegression, CommitSyncRidesTheCoordinatorSessionRegression) {
-    GroupRig r(4177, 4178);
+    GroupRig r(4177, 4178, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4177);
     r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
     r.gw.partitions            = {{1, 0, n1, 1, 4177, ""}, {1, 1, n1, 1, 4177, ""}};
@@ -2005,7 +2005,7 @@ TEST(GroupRoutingRegression, CommitSyncRidesTheCoordinatorSessionRegression) {
 // some unrelated refresh.  It now matches the instance id, asks for metadata
 // and re-subscribes on the new leader FROM ITS POSITION.
 TEST(GroupRoutingRegression, BoundFetchSubscriptionAnsweredNotLeaderMovesToTheNewLeaderRegression) {
-    GroupRig r(4223, 4224);
+    GroupRig r(4223, 4224, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4223);
     const auto [n2, p2port] = r.addNode(4223);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
@@ -2051,7 +2051,7 @@ TEST(GroupRoutingRegression, BoundFetchSubscriptionAnsweredNotLeaderMovesToTheNe
 // (deliverFrom == 15) and a consumer iterating it from deliverFrom sees every
 // record exactly once.  RED: deliverFrom stayed 0 — 12..14 handed over twice.
 TEST(GroupRoutingRegression, MovedFetchSubscriptionStraddlingBatchSkipsConsumedRecordsRegression) {
-    GroupRig r(4225, 4226);
+    GroupRig r(4225, 4226, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4225);
     const auto [n2, p2port] = r.addNode(4225);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
@@ -2099,7 +2099,7 @@ TEST(GroupRoutingRegression, MovedFetchSubscriptionStraddlingBatchSkipsConsumedR
 // every record is handed over exactly once.  RED (forEachRecord without the
 // deliverFrom filter): 12..14 handed over twice.
 TEST(GroupRoutingRegression, RecordSetIterationSkipsAStraddlingReDeliveryWithoutAppCooperationRegression) {
-    GroupRig r(4229, 4230);
+    GroupRig r(4229, 4230, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4229);
     const auto [n2, p2port] = r.addNode(4229);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
@@ -2145,7 +2145,7 @@ TEST(GroupRoutingRegression, RecordSetIterationSkipsAStraddlingReDeliveryWithout
 // would resume from 21.  Expected: no onRecords for the note, the position
 // stays 15, the move resumes there and every record arrives exactly once.
 TEST(GroupRoutingRegression, GroupFetchInstanceNeverActsOnAPositionNoteRegression) {
-    GroupRig r(4227, 4228);
+    GroupRig r(4227, 4228, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4227);
     const auto [n2, p2port] = r.addNode(4227);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
@@ -2245,7 +2245,7 @@ int subscribesFor(const test_support::InvokerGateway& gw, int32_t p) {
 // abandoned session (a real broker drops it when that session expires: a
 // silent stall).
 TEST(GroupRoutingRegression, TwoBoundSubscriptionsOnOneSeedOnlyOneMovesRegression) {
-    GroupRig r(4231, 4232);
+    GroupRig r(4231, 4232, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4231);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4231, ""}, {1, 1, 0, 1, 4231, ""}};
@@ -2301,7 +2301,7 @@ TEST(GroupRoutingRegression, TwoBoundSubscriptionsOnOneSeedOnlyOneMovesRegressio
 // node 1.  RED: an answer on a non-seed session was ignored (the subscription
 // stayed bound to a node that no longer serves it).
 TEST(GroupRoutingRegression, HomedMovedSubscriptionMovesAgainFromItsNodeSessionRegression) {
-    GroupRig r(4233, 4234);
+    GroupRig r(4233, 4234, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4233);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4233, ""}};
@@ -2354,7 +2354,7 @@ TEST(GroupRoutingRegression, HomedMovedSubscriptionMovesAgainFromItsNodeSessionR
 // lost-session re-arm in SubscriberHub::driveHomed disabled): never
 // re-subscribed on node 2.
 TEST(GroupRoutingRegression, MovedSubscriptionWhoseNodeSessionIsLostIsReArmedRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.keepaliveNs       = 50'000'000;   // 50 ms
     o.responseTimeoutNs = 400'000'000;  // the session machine's own staleness rule
     GroupRig r(4235, 4236, o);
@@ -2403,7 +2403,7 @@ TEST(GroupRoutingRegression, MovedSubscriptionWhoseNodeSessionIsLostIsReArmedReg
 // leads — never wait for the seed.  RED (the retry went through the seed's
 // redirected-subscribe path, gated on the dead seed): never re-subscribed.
 TEST(GroupRoutingRegression, MovedSubscriptionAnsweredNotLeaderByItsNewLeaderRetriesThereWithoutTheSeedRegression) {
-    GroupRig r(4237, 4238);
+    GroupRig r(4237, 4238, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4237);
     const auto [n2, p2port] = r.addNode(4237);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
@@ -2448,7 +2448,7 @@ TEST(GroupRoutingRegression, MovedSubscriptionAnsweredNotLeaderByItsNewLeaderRet
 // position; once answered it seeds and consumes from the answer (-1: the reset
 // policy, the log start).  Pins the client half of the broker's contract.
 TEST(GroupRoutingRegression, OffsetFetchAnsweredNotLeaderWhileTheLineageSettlesIsRetriedRegression) {
-    GroupRig r(4239, 4240);
+    GroupRig r(4239, 4240, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4239);
     r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
     r.gw.partitions            = {{1, 0, 0, 1, 4239, ""}, {1, 1, 1, 1, 4239, ""}};
@@ -2480,7 +2480,7 @@ TEST(GroupRoutingRegression, OffsetFetchAnsweredNotLeaderWhileTheLineageSettlesI
 // (silent loss of the first records after a restart).  RED (the seed followed a
 // Latest default): the subscription did not start at the log start.
 TEST(GroupRoutingRegression, TransientNoCommittedOffsetSeedsTheLogStartNeverLatestRegression) {
-    GroupRig r(4241, 4242);
+    GroupRig r(4241, 4242, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4241);
     r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
     r.gw.partitions            = {{1, 0, 0, 1, 4241, ""}, {1, 1, 1, 1, 4241, ""}};
@@ -2513,7 +2513,7 @@ TEST(GroupRoutingRegression, TransientNoCommittedOffsetSeedsTheLogStartNeverLate
 // exactly once.  RED (the historical Client-level retarget): the seed moved to
 // node 1 and the two bound subscriptions were stranded (silent stall).
 TEST(GroupRoutingRegression, NewSubscribeRedirectedFollowsPerPartitionAndNeverMovesTheSeedRegression) {
-    GroupRig r(4243, 4244);
+    GroupRig r(4243, 4244, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4243);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4243, ""}, {1, 1, 0, 1, 4243, ""}, {1, 2, 1, 1, 4243, ""}};
@@ -2568,7 +2568,7 @@ TEST(GroupRoutingRegression, NewSubscribeRedirectedFollowsPerPartitionAndNeverMo
 // and the subscription binds on that node's own session.  RED (gated on
 // multiNodeRouting()): the seed moved.
 TEST(GroupRoutingRegression, NewSubscribeRedirectedBeforeAnyMetadataStillFollowsPerPartitionRegression) {
-    GroupRig r(4245, 4246);
+    GroupRig r(4245, 4246, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4245);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4245, ""}, {1, 1, 0, 1, 4245, ""}, {1, 2, 1, 1, 4245, ""}};
@@ -2679,7 +2679,7 @@ TEST(GroupRoutingRegression, RedirectFromAnEarlierSessionNeverBindsASubscription
 // receives every post-restart record exactly once.  RED (no claim): the resume
 // bound at 20 and the floor dropped the refilled records 0..5 (silent loss).
 TEST(GroupRoutingRegression, PlainSubscriptionNeverCarriesAPositionAcrossALineageChangeRegression) {
-    GroupRig r(4249, 4250);
+    GroupRig r(4249, 4250, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4249);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4249, ""}, {1, 2, 1, 1, 4249, ""}};
@@ -2726,7 +2726,7 @@ TEST(GroupRoutingRegression, PlainSubscriptionNeverCarriesAPositionAcrossALineag
 // homed on a node's own session is untouched (driveHomed owns it).  RED (no
 // end on seed loss): s0 stayed active with no subscription broker-side.
 TEST(GroupRoutingRegression, SeedBoundPlainSubscriptionEndsExplicitlyWhenTheSeedSessionIsLostRegression) {
-    GroupRig r(4251, 4252);
+    GroupRig r(4251, 4252, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4251);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4251, ""}, {1, 2, 1, 1, 4251, ""}};
@@ -2824,6 +2824,10 @@ rc::OpStatus sendOne(GroupRig& r, rc::Producer& p, const std::string& topic, uin
 }
 template <class P>
 bool driveFor(GroupRig& r, std::chrono::milliseconds budget, P&& pred) {
+    if (r.opt.manualNs != nullptr && r.opt.stepNs > 0) {   // #676: the budget is duty-clock time, not wall time
+        const int64_t until = *r.opt.manualNs + std::chrono::duration_cast<std::chrono::nanoseconds>(budget).count();
+        return r.drive([&] { return pred() || *r.opt.manualNs >= until; }, 50'000'000) && pred();
+    }
     for (const auto deadline = std::chrono::steady_clock::now() + budget; std::chrono::steady_clock::now() < deadline;) {
         r.client.doWork();
         r.gw.pump();
@@ -2832,10 +2836,17 @@ bool driveFor(GroupRig& r, std::chrono::milliseconds budget, P&& pred) {
     return false;
 }
 RigOptions failoverOpts() {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: the 50 ms keepalive / 400 ms response windows run on the duty clock
     o.keepaliveNs       = 50'000'000LL;    // 50 ms
     o.responseTimeoutNs = 400'000'000LL;   // a dead node is noticed 400 ms later
     o.connectTimeoutMs  = 300;
+    return o;
+}
+RigOptions failoverRealClockOpts() {   // tests that measure wall time, sleep, or hold a gateway reply in real time
+    RigOptions o = failoverOpts();
+    o.nanoClock = nullptr;
+    o.manualNs  = nullptr;
+    o.stepNs    = 0;
     return o;
 }
 }  // namespace
@@ -3140,7 +3151,7 @@ TEST(GroupRoutingRegression, ClientStallDoesNotMoveTheSeedRegression) {
     r.gw.groupProtocol = false;
     r.connect();
     ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
-    std::this_thread::sleep_for(600ms);   // the client stalls (nothing pumped)
+    g_routingClockNs += 600'000'000LL;   // #676: the client stalls 600 ms of duty-clock time (nothing pumped)
     EXPECT_TRUE(driveFor(r, 5s, [&] {
         return r.client.testSessionStateAt(0) == rc::session::SessionState::Connected;
     }));
@@ -3213,7 +3224,7 @@ namespace {
 /// Two nodes; the seed's node dies and its failover connect to node 1 is held open
 /// (delayed connect replies): returns once the seed is mid-failover (not Connected).
 RigOptions slowConnectOpts() {   // the failover's connect is held open (delayed reply) but inside its timeout
-    RigOptions o = failoverOpts();
+    RigOptions o = failoverRealClockOpts();
     o.connectTimeoutMs = 3000;
     return o;
 }
@@ -3338,9 +3349,9 @@ TEST(GroupRoutingRegression, ControlOpEndsNotConnectedOnlyWhenTheSeedCannotRecon
         ASSERT_TRUE(driveFor(r, 5s, [&] { return r.client.testSessionStateAt(0) != rc::session::SessionState::Connected; }));
         auto waiting = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.ping(std::vector<uint8_t>{1}, q, t); });
         ASSERT_TRUE(driveFor(r, 5s, [&] { return r.gw.connectsAt[n1] >= 1; })) << "the failover reaches node 1";
-        const auto tStop = std::chrono::steady_clock::now();
+        const int64_t tStop = g_routingClockNs;   // #676: measured on the duty clock
         EXPECT_TRUE(driveFor(r, 6s, [&] { return waiting.ready(); }));
-        EXPECT_LT(std::chrono::steady_clock::now() - tStop, 5s) << "N-M2: RED is the 20 s ping Timeout";
+        EXPECT_LT(g_routingClockNs - tStop, 5'000'000'000LL) << "N-M2: RED is the 20 s ping Timeout";
         EXPECT_EQ(waiting.status(), rc::OpStatus::NotConnected) << waiting.describe();
         auto ping = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.ping(std::vector<uint8_t>{1}, q, t); });
         auto ddl  = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
@@ -3364,10 +3375,10 @@ TEST(GroupRoutingRegression, WaitingControlOpTimesOutWithinItsOwnBudgetRegressio
     r.gw.deadEndpoints = {0, n1};
     ASSERT_TRUE(driveFor(r, 5s, [&] { return r.client.testSessionStateAt(0) != rc::session::SessionState::Connected; }));
     test_support::TestCq cq(r.client);
-    const auto t0 = std::chrono::steady_clock::now();
+    const int64_t t0 = g_routingClockNs;   // #676: measured on the duty clock
     auto ping = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.ping(std::vector<uint8_t>{1}, q, t); });
     ASSERT_TRUE(driveFor(r, 5s, [&] { return ping.ready(); }));
-    const auto took = std::chrono::steady_clock::now() - t0;
+    const auto took = std::chrono::nanoseconds(g_routingClockNs - t0);
     EXPECT_EQ(ping.status(), rc::OpStatus::Timeout) << ping.describe();
     EXPECT_GE(took, 600ms);
     EXPECT_LT(took, 5s) << "fix round 3 (N-M2): a wall bound load cannot break (RED, no deadline, is a hang)";
@@ -3484,12 +3495,12 @@ TEST(GroupRoutingRegression, ShardClientFailsOverWithinTheStaleThresholdWithDefa
     r.connect();
     ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
     r.gw.deadEndpoints.insert(0);
-    const auto t0 = std::chrono::steady_clock::now();
+    const int64_t t0 = g_routingClockNs;   // #676: measured on the duty clock
     EXPECT_TRUE(driveFor(r, 10s, [&] {
         return r.client.testSessionStateAt(0) == rc::session::SessionState::Connected &&
                rc::agent::ClientAgent::sameEndpoint(r.client.testSeedChannel(), udp(p1port));
     })) << "the shard client did not fail over within the stale threshold";
-    EXPECT_LT(std::chrono::steady_clock::now() - t0, 8s) << "N-M2: RED is >= 20.4 s (400 ms + 4 x 5 s)";
+    EXPECT_LT(std::chrono::nanoseconds(g_routingClockNs - t0), 8s) << "N-M2: RED is >= 20.4 s (400 ms + 4 x 5 s)";
     (void)n1;
 }
 
@@ -3513,7 +3524,7 @@ int subscribesAt(const test_support::InvokerGateway& gw, int32_t p, int ep) {
 // EPOCH change re-routed them), so a reader created within that window of the
 // crash ended TimedOut (subscribeTimeoutMs, 10 s).
 TEST(GroupRoutingRegression, PlainReaderCreatedRightAfterALeaderCrashBindsOnTheNewLeaderRegression) {
-    GroupRig r(4501, 4502);   // default session timeouts: node 1's session is not yet seen stale
+    GroupRig r(4501, 4502, routingClockOptions());   // default session timeouts: node 1's session is not yet seen stale
     const auto [n1, p1port] = r.addNode(4501);
     const auto [n2, p2port] = r.addNode(4501);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
@@ -3555,7 +3566,7 @@ TEST(GroupRoutingRegression, PlainReaderCreatedRightAfterALeaderCrashBindsOnTheN
 // clean leadership move) resumes on node 2 from exactly its next offset, releases node 1's instance, and drops the
 // old instance's late records — every offset delivered once, in order, none lost.
 TEST(GroupRoutingRegression, ABoundReaderFollowsALiveLeaderMoveWithoutLossOrDuplicateAdversarialRegression) {
-    GroupRig r(4511, 4512);
+    GroupRig r(4511, 4512, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4511);
     const auto [n2, p2port] = r.addNode(4511);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
@@ -3595,7 +3606,7 @@ TEST(GroupRoutingRegression, ABoundReaderFollowsALiveLeaderMoveWithoutLossOrDupl
 // whose Subscribe went to node 1, binds on the seed once fresh metadata names it — before node 1's session is
 // seen stale.
 TEST(GroupRoutingRegression, APendingReaderOnACrashedLeaderFollowsTheRouteToTheSeedAdversarialRegression) {
-    GroupRig r(4513, 4514);
+    GroupRig r(4513, 4514, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4513);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4513, ""}, {1, 1, 1, 1, 4513, ""}};
@@ -3628,7 +3639,7 @@ TEST(GroupRoutingRegression, APendingReaderOnACrashedLeaderFollowsTheRouteToTheS
 // Resources / no churn: a homed Subscribe a HEALTHY node registered but whose answer is still out keeps a
 // backoff-paced metadata refresh armed (#365) — and the refreshes, naming the same leader, never re-send it.
 TEST(GroupRoutingRegression, AnUnansweredHealthySubscribeIsNeverResentByTheRefreshItArmsAdversarialRegression) {
-    GroupRig r(4515, 4516);
+    GroupRig r(4515, 4516, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4515);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4515, ""}, {1, 1, 1, 1, 4515, ""}};
@@ -3666,7 +3677,7 @@ bool settleRefreshes(GroupRig& r) {
 // responseTimeoutNs is set to 60 s: the stale path cannot be what moves it.
 // RED (before): nothing moves within the drive cap (the session stays Connected, no Subscribe reaches node 2).
 TEST(GroupRoutingRegression, ABoundReaderAloneOnACrashedLeaderMovesBeforeTheSessionIsStaleRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.keepaliveNs       = 50'000'000;
     o.responseTimeoutNs = 60'000'000'000;
     GroupRig r(4551, 4552, o);
@@ -3708,7 +3719,7 @@ TEST(GroupRoutingRegression, ABoundReaderAloneOnACrashedLeaderMovesBeforeTheSess
 // The group twin: a member whose only assigned partition is led by the crashed node keeps its fetch armed the
 // same way - the fetch moves to node 2 before node 1's session is seen stale.
 TEST(GroupRoutingRegression, AGroupMemberAloneOnACrashedLeaderMovesItsFetchBeforeTheSessionIsStaleRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.keepaliveNs       = 50'000'000;
     o.responseTimeoutNs = 60'000'000'000;
     GroupRig r(4553, 4554, o);
@@ -3777,7 +3788,7 @@ TEST(GroupRoutingRegression, AnIdleButLiveLeaderDoesNotTriggerRefreshStormRegres
 // fetch depends on may pace metadata refreshes.
 // RED by mutation: drop the usesSession / fetchUses filter in watchSilentLeaders_ (every silent bit refreshes).
 TEST(GroupRoutingRegression, ASilentNodeCarryingNoReaderArmsNoRefreshAdversarialRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.keepaliveNs       = 50'000'000;
     o.responseTimeoutNs = 60'000'000'000;
     GroupRig r(4561, 4562, o);
@@ -3820,7 +3831,7 @@ TEST(GroupRoutingRegression, ASilentNodeCarryingNoReaderArmsNoRefreshAdversarial
 // metadata names a new leader the reader moves there before the old session is declared stale.
 // RED by mutation: drop the scheduleMetadataRefresh() call in watchSilentLeaders_ (no refresh, never moves).
 TEST(GroupRoutingRegression, ASilentLeaderStillNamedKeepsABoundedRefreshPaceThenMovesOnElectionAdversarialRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.keepaliveNs       = 50'000'000;
     o.responseTimeoutNs = 60'000'000'000;
     GroupRig r(4563, 4564, o);
@@ -3901,7 +3912,7 @@ TEST(GroupRoutingRegression, ALeaderSilentThenBackStopsRefreshingAndKeepsItsRead
 // skips session 0 and a refresh would be asked on the dead seed first, so the reader waits for the seed
 // session's stale timeout (responseTimeoutNs) before anything moves it.
 TEST(GroupRoutingRegression, ABoundReaderOnACrashedSeedMovesBeforeTheSeedIsStaleAdversarialRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.keepaliveNs       = 50'000'000;
     o.responseTimeoutNs = 60'000'000'000;
     GroupRig r(4567, 4568, o);
@@ -3938,7 +3949,7 @@ struct SeedRig {
     std::optional<rc::Subscription> other_;
     std::optional<rc::Subscription> sub_;
     static RigOptions opts() {
-        RigOptions o;
+        RigOptions o = routingClockOptions();   // #676: duty clock
         o.keepaliveNs       = 50'000'000;
         o.responseTimeoutNs = 60'000'000'000;
         return o;
@@ -4038,7 +4049,7 @@ TEST(GroupRoutingRegression, AReaderMovedOffACrashedSeedIsNotSubscribedTwiceWhen
 // RED by mutation: remove the seed branch in watchSilentLeaders_, or ask the seed first in
 // sendMetadataRequestAnywhere_.
 TEST(GroupRoutingRegression, AGroupFetchOnACrashedSeedMovesBeforeTheSeedIsStaleRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.keepaliveNs       = 50'000'000;
     o.responseTimeoutNs = 60'000'000'000;
     GroupRig r(4577, 4578, o);
@@ -4073,7 +4084,7 @@ TEST(GroupRoutingRegression, AGroupFetchOnACrashedSeedMovesBeforeTheSeedIsStaleR
 // Client::onMetadataResponse and re-arms it at now + a doubled backoff, pushing the confirming request out (39
 // Pings here, ~0.65 s, instead of the first backoff step).  Fix: keep an armed deadline while a guess is provisional.
 TEST(GroupRoutingRegression, LaggingMetadataAnswersNeverPostponeTheArmedRefreshAdversarialRegression) {
-    RigOptions o;
+    RigOptions o = routingClockOptions();   // #676: duty clock
     o.keepaliveNs       = 50'000'000;
     o.responseTimeoutNs = 60'000'000'000;
     GroupRig r(4569, 4570, o);
@@ -4146,7 +4157,7 @@ TEST(GroupRoutingRegression, MetadataRefreshFollowsTheInjectedClockRegression) {
 // A rolling upgrade: node 1 (a partition leader) is already current and stays connected while the coordinator (the
 // seed) is rolled back to an older broker: the consumer's join waits, it does not end.
 TEST(GroupRoutingRegression, AConsumerDefersWhenItsCoordinatorReconnectsOntoAnOlderNodeRegression) {
-    GroupRig r(4590, 4591);
+    GroupRig r(4590, 4591, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4590);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, /*leader*/ 0, 1, 4590, ""}, {1, 1, /*leader*/ 1, 1, 4590, ""}};
@@ -4189,7 +4200,7 @@ TEST(GroupRoutingRegression, AConsumerDefersWhenItsCoordinatorReconnectsOntoAnOl
 // versions, no timer.  RED before the fix: the gate used the highest version EVER seen (sticky), so the consumer
 // stayed active, unjoined, failReason None, through any number of reconnects onto the old node.
 TEST(GroupRoutingRegression, ADeferredJoinWithNoLiveNewerNodeEndsBrokerTooOldNeverHangsAdversarialRegression) {
-    GroupRig r(4594, 4595);
+    GroupRig r(4594, 4595, routingClockOptions());
     r.gw.groupAssignment = {{1, 0}};
     auto gc = r.client.subscribeGroup("g", {"t"});
     r.connect();
