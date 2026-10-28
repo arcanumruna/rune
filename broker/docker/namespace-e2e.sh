@@ -502,7 +502,8 @@ ns_as admin /work/admin.pw create a --broker "rune-1:${BROKER_PORT}" || fail "st
 new_row=$(ns_row a); new_id=$(echo "${new_row}" | awk '{print $1}')
 [ -n "${new_id}" ] && [ "${new_id}" != "${old_id}" ] || fail "step 15: the re-created a has id '${new_id}' (old ${old_id}): ids are never reused"
 echo "${new_row}" | grep -q 'active' || fail "step 15: the re-created a is not active: ${new_row}"
-expect_refusal "step 15: the old topic a/t in the re-created namespace" "UnknownTopic" \
+# rune schema get prints "unknown topic '<name>'" only for UnknownTopic (7); any other code prints "broker error code N".
+expect_refusal "step 15: the old topic a/t in the re-created namespace" "unknown topic 'a/t'" \
     txt "${OP_TIMEOUT_S}" rune schema get a/t --user admin --password-file /work/admin.pw --broker "rune-1:${BROKER_PORT}"
 expect_refusal "step 15: the old user a/alice in the re-created namespace" "AuthenticationFailed" \
     ql_as a/alice /work/alice.pw -e "show grants for user alice;" --broker "rune-3:${BROKER_PORT}"
@@ -516,7 +517,7 @@ log "step 15 OK: ${old_id} erased, a re-created as ${new_id}, empty"
 restart_cluster "step 16"
 gone || fail "step 16: the deleted namespace ${old_id} is listed again after the restart"
 row=$(ns_row a); [ "$(echo "${row}" | awk '{print $1}')" = "${new_id}" ] || { echo "${row}" >&2; fail "step 16: after the restart a is not ${new_id}"; }
-expect_refusal "step 16: the old topic a/t after the restart" "UnknownTopic" \
+expect_refusal "step 16: the old topic a/t after the restart" "unknown topic 'a/t'" \
     txt "${OP_TIMEOUT_S}" rune schema get a/t --user admin --password-file /work/admin.pw --broker "rune-2:${BROKER_PORT}"
 expect_refusal "step 16: the old user a/alice after the restart" "AuthenticationFailed" \
     ql_as a/alice /work/alice.pw -e "show grants for user alice;" --broker "rune-3:${BROKER_PORT}"
