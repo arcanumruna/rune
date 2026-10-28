@@ -106,6 +106,38 @@ public:
             std::move(leaderView));
     }
 
+
+    // NAT-safe egress Task 5 (spec D3): the Redirect message a follower answers a Connect of `clientVersion` with, when
+    // the leader (node 12) advertises gateway response-control port `leaderPort` (0 = none).
+    std::string redirectMessageFor(int32_t clientVersion, int32_t leaderPort, int32_t egressStream) {
+        const std::string leaderEndpoint = "192.0.2.2:40200";
+        buildGateway([&]() -> LeaderView {
+            return LeaderView{/*isLeader=*/false, leaderEndpoint, /*leaderNodeId=*/12};
+        });
+        gw_->setResponseControl("", {{12, leaderPort}, {kThisNodeId, 8400}});
+        auto client = makeClient(egressStream);
+        pump([&]() { return client.ingressPub->isConnected(); }, nullptr, nullptr, kPumpIter, "waitPubConnected");
+        pc::ConnectRequest req;
+        req.correlationId  = 7;
+        req.egressStreamId = client.egressStreamId;
+        req.clientVersion  = clientVersion;
+        req.egressChannel  = client.egressChannel;
+        std::vector<uint8_t> sc(req.encodedSize());
+        offerBounded(*client.ingressPub, sc.data(), req.encode(sc.data()), "RedirectConnect");
+        std::optional<pc::ErrorResponse> errResp;
+        std::string errMsg;
+        aeron::FragmentAssembler asm_([&](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t offset,
+                                          aeron::util::index_t flen, aeron::Header&) {
+            auto dec = pc::ErrorResponse::decode(reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+                                                 static_cast<std::size_t>(flen));
+            if (dec) { errMsg = std::string(dec->message); errResp = *dec; }
+        });
+        pump([&]() { return errResp.has_value(); }, &*client.egressSub, &asm_, kPumpIter, "Redirect");
+        EXPECT_TRUE(errResp.has_value());
+        if (errResp) EXPECT_EQ(errResp->code, static_cast<int16_t>(pc::ErrorCode::Redirect));
+        return errMsg;
+    }
+
     // -----------------------------------------------------------------------
     // TestClient
     // -----------------------------------------------------------------------
@@ -305,6 +337,20 @@ TEST_F(GatewayRedirectFixture, Follower_Redirects_Connect) {
         << "correlationId must be echoed";
     EXPECT_EQ(gw_->sessionCount(), 0u)
         << "No session must be created on redirect";
+}
+
+// ===========================================================================
+// NAT-safe egress Task 5 (D3): a Redirect to a session >= 16 ends with "#<leader gateway response-control port>";
+// a session of 15 gets the bare endpoint; a leader with no port gives the bare endpoint to every session.
+// ===========================================================================
+TEST_F(GatewayRedirectFixture, RedirectCarriesLeaderResponsePortRegression) {
+    EXPECT_EQ(redirectMessageFor(pc::kClientVersionResponseEgress, 8455, kEgressBase + 10), "192.0.2.2:40200#8455");
+}
+TEST_F(GatewayRedirectFixture, RedirectToOldSessionIsTheBareEndpointRegression) {
+    EXPECT_EQ(redirectMessageFor(pc::kClientVersionResponseEgress - 1, 8455, kEgressBase + 11), "192.0.2.2:40200");
+}
+TEST_F(GatewayRedirectFixture, RedirectToLeaderWithoutPortIsTheBareEndpointRegression) {
+    EXPECT_EQ(redirectMessageFor(pc::kClientVersionResponseEgress, 0, kEgressBase + 12), "192.0.2.2:40200");
 }
 
 // ===========================================================================

@@ -1272,6 +1272,12 @@ if(BUILD_TESTING)
             target_link_libraries(rune_response_egress_spike_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_response_egress_spike_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
+            # NAT-safe egress Task 5: the gateway answers a v16 client on a response publication (real BrokerNode).
+            add_executable(rune_response_egress_gateway_tests tests/integration/ResponseEgressGatewayRegressionTest.cpp)
+            target_include_directories(rune_response_egress_gateway_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+            target_link_libraries(rune_response_egress_gateway_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_response_egress_gateway_tests PROPERTIES TIMEOUT 360 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
             # A9: worker ring doorbells (op / session / ret_ space wait), parked shard runner wake,
             # ADMIN_ACTION retry on worker claims — REAL invoker driver.
             add_executable(rune_worker_doorbell_tests tests/node/WorkerDoorbellTest.cpp)
