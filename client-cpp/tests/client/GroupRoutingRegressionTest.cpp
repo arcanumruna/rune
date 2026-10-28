@@ -2593,7 +2593,12 @@ TEST(GroupRoutingRegression, NewSubscribeRedirectedBeforeAnyMetadataStillFollows
     // No metadata answer yet: the follow is HELD — the seed never moves.
     ASSERT_TRUE(r.drive([&] { return r.client.testRedirectFollowsHeld() >= 1; }))
         << "the follow was neither held nor done before any metadata (skipped)";
-    (void)r.drive([&] { return false; }, 200'000);
+    {   // #701: the Subscribe deadline is on the duty clock now: this quiet wait is passes, not 200 s of duty time
+        const int64_t step = r.opt.stepNs;
+        r.opt.stepNs       = 0;
+        (void)r.drive([&] { return false; }, 200'000);
+        r.opt.stepNs = step;
+    }
     EXPECT_EQ(r.client.testTransport().ingressChannel(), seedBefore) << "the held follow moved the SEED";
     // The first metadata answer arrives: the follow goes per partition.
     ASSERT_FALSE(r.gw.metadataCorrIds.empty());
@@ -4291,4 +4296,102 @@ TEST(GroupRoutingRegression, FrozenClockLaggingMetadataAnswersNeverPostponeTheAr
                         5'000));
     EXPECT_GT(r.gw.metadataRequests, before)
         << "no refresh within 1 s of duty time: lagging answers postponed the armed refresh";
+}
+
+// ===========================================================================
+// #701: every timer the duty thread checks runs on the injected duty clock (rule: one clock).  The group hub's
+// heartbeat / auto-commit / rejoin-backoff timers and the Subscribe deadline used to sample the wall steady clock.
+// ===========================================================================
+
+// A Stable member with auto-commit (100 ms) and a 1 s heartbeat (session timeout 3 s): with the duty clock FROZEN no
+// OffsetCommit / Heartbeat goes out however many passes run; once the clock is advanced past the interval exactly one
+// OffsetCommit goes out, and past the heartbeat interval one Heartbeat.  RED (the hub sampling steady_clock): the
+// advance fires nothing - only wall time (<< 100 ms here) moves its timers.
+TEST(GroupClockRegression, AutoCommitAndHeartbeatFollowTheInjectedClockRegression) {
+    GroupRig r(4701, 4702, routingClockOptions(100'000));
+    r.gw.groupAssignment = {{1, 0}};
+    rc::GroupConfig gcfg;
+    gcfg.autoCommit           = true;
+    gcfg.autoCommitIntervalMs = 100;
+    gcfg.sessionTimeoutMs     = 3'000;
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr; })) << "precondition: the member is Stable";
+    const auto sub = *r.subAt(0, 0);
+    r.gw.pushRecords(sub, 0, 5);
+    ASSERT_TRUE(r.drive([&] { return led.records[0] >= 5; })) << "precondition: the records were consumed";
+    // Freeze, and let every already-due timer fire once (a few passes at the frozen instant).
+    r.opt.stepNs = 0;
+    for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
+    const std::size_t commits = r.gw.offsetCommits.size();
+    const int         beats   = r.gw.heartbeats;
+    for (int i = 0; i < 200; ++i) { r.client.doWork(); r.gw.pump(); }
+    EXPECT_EQ(r.gw.offsetCommits.size(), commits) << "an auto-commit fired while the duty clock stood still";
+    EXPECT_EQ(r.gw.heartbeats, beats) << "a heartbeat fired while the duty clock stood still";
+
+    g_routingClockNs += 250'000'000LL;   // past the 100 ms auto-commit interval, short of the 1 s heartbeat
+    for (int i = 0; i < 200; ++i) { r.client.doWork(); r.gw.pump(); }
+    EXPECT_EQ(r.gw.offsetCommits.size(), commits + 1) << "advancing the duty clock fires exactly one auto-commit";
+    EXPECT_EQ(r.gw.heartbeats, beats) << "the heartbeat is not due yet";
+
+    g_routingClockNs += 1'100'000'000LL;   // past the heartbeat interval
+    for (int i = 0; i < 200; ++i) { r.client.doWork(); r.gw.pump(); }
+    EXPECT_EQ(r.gw.heartbeats, beats + 1) << "advancing the duty clock fires exactly one heartbeat";
+}
+
+// A rejoin with backoff (the coordinator answers a heartbeat Internal): no JoinGroup while the duty clock is frozen,
+// one once it passed the 20 ms backoff.  RED (the backoff on steady_clock): none after the advance.
+TEST(GroupClockRegression, RejoinBackoffFollowsTheInjectedClockRegression) {
+    GroupRig r(4703, 4704, routingClockOptions(100'000));
+    r.gw.groupAssignment = {{1, 0}};
+    rc::GroupConfig gcfg;
+    gcfg.sessionTimeoutMs = 3'000;   // heartbeat every 1 s
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr; })) << "precondition: the member is Stable";
+    r.opt.stepNs = 0;
+    for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
+    r.gw.heartbeatErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
+    g_routingClockNs += 1'100'000'000LL;   // the heartbeat is due: it is sent and answered Internal -> backoff rejoin
+    const int beats = r.gw.heartbeats;
+    for (int i = 0; i < 200 && r.gw.heartbeats == beats; ++i) { r.client.doWork(); r.gw.pump(); }
+    ASSERT_GT(r.gw.heartbeats, beats) << "precondition: the heartbeat went out";
+    for (int i = 0; i < 100; ++i) { r.client.doWork(); r.gw.pump(); }   // its answer lands: Rejoining, backoff armed
+    r.gw.heartbeatErrorCode = 0;
+    const int joins = r.gw.joinGroups;
+    for (int i = 0; i < 300; ++i) { r.client.doWork(); r.gw.pump(); }
+    EXPECT_EQ(r.gw.joinGroups, joins) << "a rejoin went out inside its backoff while the duty clock stood still";
+    g_routingClockNs += 150'000'000LL;   // past the (<= 20 ms) backoff and one sweep
+    for (int i = 0; i < 300; ++i) { r.client.doWork(); r.gw.pump(); }
+    EXPECT_EQ(r.gw.joinGroups, joins + 1) << "advancing the duty clock past the backoff sends the rejoin";
+}
+
+// A Subscribe nobody answers: with the duty clock frozen it never times out however many passes run; once the clock
+// passes subscribeTimeoutMs it ends TimedOut and onError fires once.  RED (the deadline stamped on steady_clock by
+// the app thread): it timed out in wall time, or never when the duty clock jumped.
+TEST(SubscribeClockRegression, SubscribeTimeoutFollowsTheInjectedClockRegression) {
+    GroupRig r(4705, 4706, routingClockOptions(100'000));
+    int errors = 0;
+    r.client.onError([&](const std::string&) { ++errors; });
+    r.gw.holdSubscribeResponses = true;   // the stub never answers
+    r.connect();
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                  [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty(); })) << "precondition: the Subscribe reached the stub";
+    r.opt.stepNs = 0;
+    for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
+    for (int i = 0; i < 2000; ++i) { r.client.doWork(); r.gw.pump(); }
+    EXPECT_FALSE(sub.finished()) << "timed out while the duty clock stood still";
+    EXPECT_EQ(errors, 0);
+    g_routingClockNs += 11'000'000'000LL;   // past the 10 s default subscribeTimeoutMs
+    for (int i = 0; i < 300; ++i) { r.client.doWork(); r.gw.pump(); }
+    EXPECT_TRUE(sub.finished());
+    EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::TimedOut);
+    EXPECT_EQ(errors, 1) << "onError fires once per timed-out Subscribe";
 }

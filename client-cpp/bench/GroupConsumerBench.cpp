@@ -162,14 +162,14 @@ static rcc::RecordsView makeRecordsView(int32_t topicId, int32_t partition,
 // Build a GroupConsumerImpl in Stable state with N partitions assigned.
 // sendBuf pre-allocated to 4 KiB; commitEntriesScratch pre-reserved.
 // ---------------------------------------------------------------------------
+static constexpr int64_t kTimerNever = INT64_MAX;   // a timer that never fires within the run
+static constexpr int64_t kTimerDue   = 0;           // a timer already due
 static std::unique_ptr<rune::client::GroupConsumerImpl>
 makeStableImpl(int nPartitions,
                int32_t topicId    = 0,
                int32_t sessionTimeoutMs = 30000,
-               std::chrono::steady_clock::time_point hbDeadline  =
-                   std::chrono::steady_clock::now() + std::chrono::hours{1},
-               std::chrono::steady_clock::time_point acDeadline  =
-                   std::chrono::steady_clock::now() + std::chrono::hours{1})
+               int64_t hbDeadlineNs = kTimerNever,   // duty-clock ns the doWork loops pass (#701)
+               int64_t acDeadlineNs = kTimerNever)
 {
     auto impl = std::make_unique<rune::client::GroupConsumerImpl>();
     impl->groupId       = "bench-group";
@@ -181,8 +181,8 @@ makeStableImpl(int nPartitions,
     impl->cfg.autoCommit = true;
     impl->cfg.autoCommitIntervalMs = 5000;
     impl->sendBuf.resize(4096);
-    impl->nextHeartbeat  = hbDeadline;
-    impl->nextAutoCommit = acDeadline;
+    impl->nextHeartbeatNs  = hbDeadlineNs;
+    impl->nextAutoCommitNs = acDeadlineNs;
 
     // Assign N partitions with position 0 (seeded — not sentinel).
     for (int p = 0; p < nPartitions; ++p) {
@@ -273,12 +273,12 @@ BENCHMARK(BM_GCHub_OnRecords)
 // ===========================================================================
 // BM_GCHub_DoWork_HeartbeatCadence — doWork() with heartbeat timer fired.
 //
-// We arm impl->nextHeartbeat = now() so the timer fires on the very first
+// We arm impl->nextHeartbeatNs = 0 (due) so the timer fires on the very first
 // doWork call. After each doWork, we re-arm the timer to fire again on the
 // next call (simulating the cadence path, not just one call).
 //
 // This exercises: snapshot load, active check, commit drain, heartbeat arm +
-// encode + sendFn call, re-arm nextHeartbeat.
+// encode + sendFn call, re-arm nextHeartbeatNs.
 //
 // Gate: p99 < 100µs. Zero-alloc assertion (two-phase).
 // ===========================================================================
@@ -293,8 +293,8 @@ static void BM_GCHub_DoWork_HeartbeatCadence(benchmark::State& state)
         1,
         /*topicId=*/0,
         /*sessionTimeoutMs=*/30000,
-        /*hbDeadline=*/std::chrono::steady_clock::now() - std::chrono::seconds{1},
-        /*acDeadline=*/std::chrono::steady_clock::now() + std::chrono::hours{1});
+        /*hbDeadlineNs=*/kTimerDue,
+        /*acDeadlineNs=*/kTimerNever);
     hub.add(impl.get());
 
     int64_t clk = 1'000'000'000LL;
@@ -303,7 +303,7 @@ static void BM_GCHub_DoWork_HeartbeatCadence(benchmark::State& state)
     for (int i = 0; i < 50; ++i) {
         hub.doWork(clk, sessionId, sendFn);
         // Re-arm the heartbeat timer to fire on next call.
-        impl->nextHeartbeat = std::chrono::steady_clock::now() - std::chrono::seconds{1};
+        impl->nextHeartbeatNs = kTimerDue;
         clk += 1'000LL;
     }
 
@@ -314,7 +314,7 @@ static void BM_GCHub_DoWork_HeartbeatCadence(benchmark::State& state)
     // Phase 1: timing loop — no alloc tracking.
     for (auto _ : state) {
         // Re-arm so heartbeat fires on this iteration.
-        impl->nextHeartbeat = std::chrono::steady_clock::now() - std::chrono::seconds{1};
+        impl->nextHeartbeatNs = kTimerDue;
         clk += 1'000LL;
 
         const int64_t t0 = nowNsI();
@@ -330,7 +330,7 @@ static void BM_GCHub_DoWork_HeartbeatCadence(benchmark::State& state)
     g_allocCount.store(0, std::memory_order_relaxed);
     g_allocEnabled.store(true, std::memory_order_release);
     for (int i = 0; i < kAllocCheckIter; ++i) {
-        impl->nextHeartbeat = std::chrono::steady_clock::now() - std::chrono::seconds{1};
+        impl->nextHeartbeatNs = kTimerDue;
         clk += 1'000LL;
         const int work = hub.doWork(clk, sessionId, sendFn);
         benchmark::DoNotOptimize(work);
@@ -376,8 +376,8 @@ static void BM_GCHub_DoWork_CommitCadence(benchmark::State& state)
         nPartitions,
         /*topicId=*/0,
         /*sessionTimeoutMs=*/30000,
-        /*hbDeadline=*/std::chrono::steady_clock::now() + std::chrono::hours{1},
-        /*acDeadline=*/std::chrono::steady_clock::now() - std::chrono::seconds{1});
+        /*hbDeadlineNs=*/kTimerNever,
+        /*acDeadlineNs=*/kTimerDue);
     hub.add(impl.get());
 
     int64_t clk = 1'000'000'000LL;
@@ -385,7 +385,7 @@ static void BM_GCHub_DoWork_CommitCadence(benchmark::State& state)
     // Warm-up.
     for (int i = 0; i < 50; ++i) {
         hub.doWork(clk, sessionId, sendFn);
-        impl->nextAutoCommit = std::chrono::steady_clock::now() - std::chrono::seconds{1};
+        impl->nextAutoCommitNs = kTimerDue;
         clk += 1'000LL;
     }
 
@@ -395,7 +395,7 @@ static void BM_GCHub_DoWork_CommitCadence(benchmark::State& state)
 
     // Phase 1: timing loop — no alloc tracking.
     for (auto _ : state) {
-        impl->nextAutoCommit = std::chrono::steady_clock::now() - std::chrono::seconds{1};
+        impl->nextAutoCommitNs = kTimerDue;
         clk += 1'000LL;
 
         const int64_t t0 = nowNsI();
@@ -411,7 +411,7 @@ static void BM_GCHub_DoWork_CommitCadence(benchmark::State& state)
     g_allocCount.store(0, std::memory_order_relaxed);
     g_allocEnabled.store(true, std::memory_order_release);
     for (int i = 0; i < kAllocCheckIter; ++i) {
-        impl->nextAutoCommit = std::chrono::steady_clock::now() - std::chrono::seconds{1};
+        impl->nextAutoCommitNs = kTimerDue;
         clk += 1'000LL;
         const int work = hub.doWork(clk, sessionId, sendFn);
         benchmark::DoNotOptimize(work);

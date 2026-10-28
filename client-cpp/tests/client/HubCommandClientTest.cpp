@@ -264,8 +264,16 @@ struct HubRig {
     rc::ClientConfig             cfg;
     rc::Client                   client;
     test_support::InvokerGateway gw;
-    explicit HubRig(int32_t in, std::size_t termBytes = 0, rc::NanoClock clock = nullptr, int64_t closeTimeoutMs = 1)
-        : cfg(withOpts(hubCfg(in, in + 1, rc::RunnerMode::Invoker), termBytes, clock, closeTimeoutMs)), client(cfg),
+    // subscribeTimeoutMs > 0: a Subscribe's deadline is on the duty clock (#701), so a test that jumps that clock
+    // past the 10 s default sets its own bound.
+    explicit HubRig(int32_t in, std::size_t termBytes = 0, rc::NanoClock clock = nullptr, int64_t closeTimeoutMs = 1,
+                    int64_t subscribeTimeoutMs = 0)
+        : cfg([&] {
+              rc::ClientConfig c = withOpts(hubCfg(in, in + 1, rc::RunnerMode::Invoker), termBytes, clock, closeTimeoutMs);
+              if (subscribeTimeoutMs > 0) c.subscribeTimeoutMs = subscribeTimeoutMs;
+              return c;
+          }()),
+          client(cfg),
           gw(cfg.dataDir + "/aeron", cfg.gatewayChannel, cfg.gatewayStreamId,
              cfg.egressChannel, cfg.egressStreamId) {}
 
@@ -796,7 +804,7 @@ TEST(HubCommandClient, SubscribeFromOnConnectedCallbackReachesTheBrokerRegressio
 // session) that the push binds.  A is kept pending by losing its first
 // SubscribeResponse.
 TEST(HubCommandClient, SubscribeFromARecordHandlerInTheReconnectPollReachesTheBrokerRegression) {
-    HubRig r(4016, 0, &hubNow);
+    HubRig r(4016, 0, &hubNow, 1, /*subscribeTimeoutMs=*/600'000);   // A must outlive the 11 s duty-clock jump below
     r.connect();
     std::unique_ptr<rc::Subscription> b;
     int got = 0;

@@ -323,15 +323,16 @@ struct GroupConsumerImpl {
     // C1: consecutive backoff rejoins (Internal / unclassified errors) and the
     // earliest time the next JoinGroup may go out.
     uint32_t backoffRejoins = 0;
-    std::chrono::steady_clock::time_point rejoinNotBefore{};
+    int64_t rejoinNotBeforeNs = 0;   // duty-clock ns (0 = now / past)
     // C4 review (#607): consecutive Heartbeats answered AuthUnavailable (48) in this Stable episode
     // (cap: GroupConsumerHub::kMaxHeartbeatAuthUnavailable); any other answer resets it.
     uint32_t hbAuthUnavailable = 0;
 
     // ---- Timers (duty thread) -------------------------------------------------
-    std::chrono::steady_clock::time_point nextHeartbeat;
-    std::chrono::steady_clock::time_point nextAutoCommit;
-    std::chrono::steady_clock::time_point joinDeadline;  // for rejoin backoff guard
+    // All in duty-clock ns (the hub's injected clock: GroupConsumerHub::setClock); 0 = now / past.
+    int64_t nextHeartbeatNs  = 0;
+    int64_t nextAutoCommitNs = 0;
+    int64_t joinDeadlineNs   = 0;  // for rejoin backoff guard
     // D4: the session id the Join / Sync in flight went out on (0 = refused /
     // not sent: held while the coordinator session connects).  A connect of THAT
     // session (a resume keeping its id) keeps the in-flight join — re-sending it

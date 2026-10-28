@@ -8,7 +8,7 @@
 //   Joining    → [JoinGroupResponse err] → Rejoining
 //   Syncing    → [SyncGroupResponse OK]  → Stable   (fire onAssigned; arm timers)
 //   Syncing    → [SyncGroupResponse err] → Rejoining
-//   Stable     → [HeartbeatResponse OK]  → Stable   (update nextHeartbeat)
+//   Stable     → [HeartbeatResponse OK]  → Stable   (update nextHeartbeatNs)
 //   Stable     → [HeartbeatResponse RebalanceInProgress] → Rejoining
 //   Stable     → [HeartbeatResponse NotCoordinator]      → Rejoining
 //   Stable     → [Assign frame]          → Stable   (fire revoked+assigned)
@@ -62,9 +62,7 @@ static int64_t nowNsToMs(int64_t nowNs) noexcept {
     return nowNs / 1'000'000LL;
 }
 
-static std::chrono::steady_clock::time_point tpNow() noexcept {
-    return std::chrono::steady_clock::now();
-}
+static constexpr int64_t msToNs(int64_t ms) noexcept { return ms * 1'000'000LL; }
 
 // Build a byte span from a std::string (for encoding groupId / memberId).
 static std::span<const uint8_t> strSpan(const std::string& s) noexcept {
@@ -478,7 +476,7 @@ void GroupConsumerHub::rejoinWithBackoff_(GroupConsumerImpl& impl) {
     // 20 ms doubling, capped at 1 s: the whole budget spends ~3.3 s.
     const auto shift = std::min<uint32_t>(impl.backoffRejoins - 1, 6u);
     const auto delay = std::chrono::milliseconds(std::min<int64_t>(int64_t{20} << shift, 1000));
-    impl.rejoinNotBefore = tpNow() + delay;
+    impl.rejoinNotBeforeNs = nowNs_() + delay.count() * 1'000'000LL;
     toRejoining_(impl);
 }
 
@@ -497,7 +495,7 @@ void GroupConsumerHub::rejoinForOffsetFetch_(GroupConsumerImpl& impl) {
     }
     // 20 ms doubling, capped at 1 s (as rejoinWithBackoff_).
     const auto shift = std::min<uint32_t>(impl.offsetFetchRejoins - 1, 6u);
-    impl.rejoinNotBefore = tpNow() + std::chrono::milliseconds(std::min<int64_t>(int64_t{20} << shift, 1000));
+    impl.rejoinNotBeforeNs = nowNs_() + msToNs(std::min<int64_t>(int64_t{20} << shift, 1000));
     toRejoining_(impl);
 }
 
@@ -702,7 +700,6 @@ int64_t GroupConsumerHub::nextCtlCorr_(GroupConsumerImpl& impl) noexcept
 // sendJoinGroup — runner thread
 // ---------------------------------------------------------------------------
 
-/*static*/
 void GroupConsumerHub::sendJoinGroup(GroupConsumerImpl& impl,
                                      int64_t sessionId,
                                      const SendFn& sendFn)
@@ -727,7 +724,7 @@ void GroupConsumerHub::sendJoinGroup(GroupConsumerImpl& impl,
     impl.joinSessionId = sendFn(0, impl.sendBuf.data(), len) ? sessionId : 0;  // D4
 
     impl.state = GroupConsumerState::Joining;
-    impl.joinDeadline = tpNow() + std::chrono::milliseconds(impl.cfg.sessionTimeoutMs);
+    impl.joinDeadlineNs = nowNs_() + msToNs(impl.cfg.sessionTimeoutMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -1580,7 +1577,7 @@ int GroupConsumerHub::doWork(int64_t nowNs,
                               const SendFn& sendFn)
 {
     int work = 0;
-    const auto now = std::chrono::steady_clock::now();
+    const int64_t now = nowNs;   // the duty clock, as passed by the caller
     if (anyJoinDeferred_) [[unlikely]] recheckDeferredJoins_();   // #440: the newer node may be gone
 
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
@@ -1600,7 +1597,7 @@ int GroupConsumerHub::doWork(int64_t nowNs,
             // Awaiting JoinGroupResponse. Guard against stale join (timeout).
             // D4: a Join the coordinator session refused (back-pressure) is
             // re-offered on the next pass once that session is connected.
-            if (now >= impl->joinDeadline || (impl->joinSessionId == 0 && sessionConnected_ && sessionId != 0)) {
+            if (now >= impl->joinDeadlineNs || (impl->joinSessionId == 0 && sessionConnected_ && sessionId != 0)) {
                 // Re-send JoinGroup (rejoin guard expired).
                 if (tryJoin_(*impl, sessionId, sendFn)) ++work;   // #440: a deferred join sends nothing
             }
@@ -1609,25 +1606,24 @@ int GroupConsumerHub::doWork(int64_t nowNs,
         case GroupConsumerState::Syncing:
             // Awaiting SyncGroupResponse. Guard with join deadline (D4: or the
             // Sync was refused — re-join at once once connected).
-            if (now >= impl->joinDeadline || (impl->joinSessionId == 0 && sessionConnected_ && sessionId != 0)) {
+            if (now >= impl->joinDeadlineNs || (impl->joinSessionId == 0 && sessionConnected_ && sessionId != 0)) {
                 toRejoining_(*impl);
             }
             break;
 
         case GroupConsumerState::Stable: {
             // ---- Heartbeat timer --------------------------------------------
-            if (now >= impl->nextHeartbeat) {
+            if (now >= impl->nextHeartbeatNs) {
                 sendHeartbeat(*impl, sessionId, sendFn);
                 const int32_t intervalMs = impl->cfg.sessionTimeoutMs / 3;
-                impl->nextHeartbeat = now + std::chrono::milliseconds(intervalMs);
+                impl->nextHeartbeatNs = now + msToNs(intervalMs);
                 ++work;
             }
 
             // ---- Auto-commit timer ------------------------------------------
-            if (impl->cfg.autoCommit && now >= impl->nextAutoCommit) {
+            if (impl->cfg.autoCommit && now >= impl->nextAutoCommitNs) {
                 (void)sendOffsetCommit(*impl, sessionId, sendFn, /*correlationId=*/0);
-                impl->nextAutoCommit =
-                    now + std::chrono::milliseconds(impl->cfg.autoCommitIntervalMs);
+                impl->nextAutoCommitNs = now + msToNs(impl->cfg.autoCommitIntervalMs);
                 ++work;
             }
             break;
@@ -1636,7 +1632,7 @@ int GroupConsumerHub::doWork(int64_t nowNs,
         case GroupConsumerState::Rejoining:
             // Re-send JoinGroup — at once for a rebalance signal, after the
             // backoff for an Internal / unclassified error (C1).
-            if (now < impl->rejoinNotBefore) break;
+            if (now < impl->rejoinNotBeforeNs) break;
             if (tryJoin_(*impl, sessionId, sendFn)) ++work;   // #440
             break;
         }
@@ -1984,11 +1980,10 @@ void GroupConsumerHub::onSyncGroupResponse(const uint8_t* buf, std::size_t len,
             }
 
             // Arm heartbeat and auto-commit timers.
-            const auto now  = tpNow();
+            const int64_t now  = nowNs_();
             const int32_t hbMs = impl->cfg.sessionTimeoutMs / 3;
-            impl->nextHeartbeat  = now + std::chrono::milliseconds(hbMs);
-            impl->nextAutoCommit =
-                now + std::chrono::milliseconds(impl->cfg.autoCommitIntervalMs);
+            impl->nextHeartbeatNs  = now + msToNs(hbMs);
+            impl->nextAutoCommitNs = now + msToNs(impl->cfg.autoCommitIntervalMs);
 
             // #431: heartbeat answers of earlier episodes (sent before this Sync) are no longer applied.
             impl->hbSeqLo = impl->ctlSeq + 1;

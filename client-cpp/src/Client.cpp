@@ -318,6 +318,7 @@ Client::Client(ClientConfig cfg)
     cqFree_.assign(kMaxCqs, 0);  // FIFO ring of released slots (I3)
     releases_.reserve(16);       // C7: handle releases (cold; grows only on a burst of releases)
     groupConsumerHub_.setSessionConnected(false);  // fix3: not connected until the first connect
+    groupConsumerHub_.setClock(cfg_.nanoClock);   // #701: its timers run on the duty clock (nullptr = steady, as nowNs())
     // F8c C4: commitSync completions go through the completion-queue registry.
     groupConsumerHub_.setCompletionSink(detail::CompletionSink{&Client::deliverTrampoline_, this});
     subscriberHub_.setSessionConnected(false);
@@ -3344,8 +3345,7 @@ int Client::dutyCycle(int64_t nowNs) {
     // session — held Subscribes flushed, a lost session's ones re-armed.
     if (subscriberHub_.homedCount() != 0) [[unlikely]] {
         work += subscriberHub_.driveHomed(
-            agent_.seedSession().machine.sessionId(),
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg_.subscribeTimeoutMs));
+            agent_.seedSession().machine.sessionId(), nsAfter(nowNs, cfg_.subscribeTimeoutMs), nowNs);
         // #365: an unanswered Subscribe on a node session keeps the backoff-paced
         // refresh armed (idempotent while armed) — its leader may have crashed;
         // the answer re-routes it (driveHomed follows a moved route).
@@ -3619,11 +3619,6 @@ void Client::runLoop() {
 // ---------------------------------------------------------------------------
 
 void Client::sweepTimeouts(int64_t nowNs) {
-    // Subscribe deadlines are created on app threads with steady_clock, so
-    // they keep their own steady_clock sample (control-op deadlines are on the
-    // duty clock: sweepControl_ below).
-    const auto now = std::chrono::steady_clock::now();
-
     // --- Producer delivery timeouts (duty-cycle thread; no lock — ack rings are single-owner) ---
     // Producer deadlines are on the duty-cycle clock (injected in tests): any
     // pending ProduceResponse ack older than produceTimeoutMs is failed so
@@ -3646,7 +3641,7 @@ void Client::sweepTimeouts(int64_t nowNs) {
     // A Subscribe that gets no SubscribeResponse within subscribeTimeoutMs is
     // failed (active cleared) so the app is never left polling forever.
     {
-        const int timedOut = subscriberHub_.sweepTimedOut(now);
+        const int timedOut = subscriberHub_.sweepTimedOut(nowNs);
         // Silent-failure gap: the timeout is an explicit failure (failReason
         // TimedOut) AND reaches the app's onError, once per Subscribe.
         for (int i = 0; i < timedOut && cbError_; ++i) {
@@ -3663,10 +3658,8 @@ void Client::sweepTimeouts(int64_t nowNs) {
     // very first doWork call after a state transition (no extra latency).
     if (!groupConsumerHub_.empty()) {
         const int64_t gsid = coordSessionId_();  // D4: the coordinator session (the seed by default)
-        const int64_t wallNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now.time_since_epoch()).count();
         const group::SendFn& sendFn = coordSendFn_;
-        groupConsumerHub_.doWork(wallNs, gsid, sendFn);
+        groupConsumerHub_.doWork(nowNs, gsid, sendFn);
         // Pass-driven re-offer of transiently refused Subscribes and of routes a
         // produce redirect moved (parked partitions wait for fresh metadata —
         // LOW-2), and MEDIUM-2: OffsetFetch for start offsets still unknown.
@@ -4018,8 +4011,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
             const auto snap = agent_.stateAndSessionId();
             if (subscriberHub_.answeredOnItsSession(opt->correlationId, opt->sessionId, snap.sessionId) &&
                 subscriberHub_.restartFromLogStart(
-                    opt->correlationId, snap.sessionId,
-                    std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg_.subscribeTimeoutMs))) {
+                    opt->correlationId, snap.sessionId, nsAfter(now(), cfg_.subscribeTimeoutMs))) {
                 break;
             }
         }
@@ -4036,7 +4028,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
             const auto snap = agent_.stateAndSessionId();
             if (subscriberHub_.rearmMovedAway(
                     opt->correlationId, nextCorrId_, nextCorrId_ + 1, opt->sessionId, snap.sessionId,
-                    std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg_.subscribeTimeoutMs))) {
+                    nsAfter(now(), cfg_.subscribeTimeoutMs))) {
                 opt->correlationId = nextCorrId_;
                 nextCorrId_ += 2;
             }
@@ -4326,7 +4318,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     subscriberHub_.chargeNotLeaderRetry(opt->correlationId, producer::ProducerImpl::kMaxRedirects)) {
                     (void)subscriberHub_.holdMovedForRetry(
                         opt->correlationId,
-                        std::chrono::steady_clock::now() + std::chrono::nanoseconds(redirectedResendBackoffNs_));
+                        now() + redirectedResendBackoffNs_);
                     redirectedResendBackoffNs_ =
                         std::min<int64_t>(redirectedResendBackoffNs_ * 2, kRedirectedResendMaxNs);
                     requestMetadataNow_();
@@ -5457,16 +5449,16 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
         impl->onHistoryEpoch = std::move(opts.onHistoryEpoch);
     }
 
-    // M2 FIX: a deadline so sweepTimedOut() can fail this subscribe if
-    // SubscribeResponse never arrives (mirrors produce-ack timeout sweep).
-    const auto subscribeDL = std::chrono::steady_clock::now() +
-                             std::chrono::milliseconds(cfg_.subscribeTimeoutMs);
+    // M2 FIX: a timeout so sweepTimedOut() can fail this subscribe if
+    // SubscribeResponse never arrives (mirrors produce-ack timeout sweep).  #701: relative - the duty thread
+    // stamps the absolute deadline on the duty clock at adoption (an app thread never reads the injected clock).
+    const int64_t subscribeTimeoutNs = nsAfter(0, cfg_.subscribeTimeoutMs);
 
     // F8a: encode on this thread (pure), then hand the request to the duty
     // thread, which registers it as pending and sends the Subscribe frame.
     auto req = subscriber::SubscriberHub::makeSubscribeRequest(
         impl.get(), /*sessionId (stamped on adoption)=*/0, partitionKnown, opts.from.toWire(),
-        static_cast<uint8_t>(opts.isolation), keyBytes, subscribeDL);
+        static_cast<uint8_t>(opts.isolation), keyBytes, subscribeTimeoutNs);
     // F8a fix4 M1: a Subscribe frame no ingress publication can carry fails
     // HERE, synchronously — it never reaches the duty thread (where it could
     // only be dropped as Fatal).
@@ -5850,7 +5842,7 @@ int Client::retryRedirectedSubscribes_(int64_t nowNs) {
         redirectedSubscribes_.clear();
         return 0;
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg_.subscribeTimeoutMs);
+    const int64_t deadline = nsAfter(now(), cfg_.subscribeTimeoutMs);
     int sent = 0;
     for (const int64_t corr : redirectedSubscribes_) {
         sent += subscriberHub_.resendOne(
@@ -6033,7 +6025,8 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
             cmd, unsubCorrId, snap.sessionId,
             [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                 return agent_.submitSend(fb, fl);
-            });
+            },
+            now());
         if (adopted != nullptr && adopted->status.consumerOrphaned() && !adopted->releaseNoted) {
             adopted->releaseNoted = true;  // its handle orphaned the release before this adoption
             noteOrphan_(detail::HandleKind::Subscription, adopted, adopted->orphanFence);
