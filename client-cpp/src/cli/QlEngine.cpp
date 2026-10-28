@@ -29,6 +29,15 @@ namespace rune::cli::engine {
 
 using namespace rune::cli::support;
 
+// Short aliases are private to this translation unit (issue #317: the header spells the namespaces out).
+namespace cat = rune::catalog;
+namespace ql  = rune::ql;
+namespace sec = rune::security;
+#ifdef RUNE_CLI_LIVE_ENABLED
+namespace rc  = rune::client;
+namespace rpc = rune::protocol::client;
+#endif
+
 std::string hex16(uint64_t v) {
     char b[17];
     std::snprintf(b, sizeof b, "%016llx", static_cast<unsigned long long>(v));
@@ -492,6 +501,7 @@ bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredenti
     cfg.gatewayChannel = toChannel(o.endpoint);
     cfg.clientName     = "rune-cli";
     cfg.runnerMode     = rc::RunnerMode::Invoker;
+    cfg.nanoClock      = o.nanoClock;
     cfg.traceDdlRetries = o.verbose;
     std::string egress = o.egress;
     if (egress.empty()) {
@@ -516,14 +526,7 @@ bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredenti
         err << "rune: --cli-stream-in/--cli-stream-out must be integers\n";
         return false;
     }
-    if (!o.dataDir.empty()) {
-        cfg.dataDir = o.dataDir;   // the caller's directory, used as is (and left in place)
-    } else {   // a private scratch directory per client, removed on close
-        dir_ = ScopedDir(std::filesystem::temp_directory_path() /
-                         ("rune-cli-" + std::to_string(::getpid()) + "-" + std::to_string(reinterpret_cast<std::uintptr_t>(this)) + "-" +
-                          std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())));
-        cfg.dataDir = dir_.path().string();
-    }
+    cfg.dataDir = resolveDataDir(o.dataDir, dir_);   // empty = a private scratch directory, removed on close (#315)
     // Authentication (Task 8): who to log in as.  --user / RUNE_USER and --password-file / RUNE_PASSWORD_FILE;
     // a password is NEVER taken from argv (parseArgs refuses --password) or from the environment.
     // Issue #121: the only connection the CLI opens without credentials is `rune security bootstrap`'s.

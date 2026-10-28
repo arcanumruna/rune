@@ -427,7 +427,9 @@ int runLiveSession(const ConsoleOptions& opts, std::string_view script, const Li
     int rc = 0;
     if (!o.scriptPath.empty()) {
         rc = runScript(exec, o, script, err);
-    } else if (input.fd >= 0 || (input.canPrompt && ::isatty(STDIN_FILENO))) {
+    } else if (input.fd >= 0 || input.canPrompt) {
+        // The process stdin (a TTY or a pipe, #311) is polled and the client pumped while it is idle; only an injected
+        // non-stdin stream (StreamLineSource below) is read blocking.
         PollingFdLineSource src(input.fd >= 0 ? input.fd : STDIN_FILENO, &pumpClient, &broker);
         src.err = &err;
         rc = runInteractive(exec, o, src, out, err);
@@ -467,6 +469,20 @@ int cmdConsole(const std::vector<std::string>& args, std::istream& in, std::ostr
         return runInteractive(exec, o, src, out, err);
     }
     return runLive(o, in, script, out, err);
+}
+
+int runLiveOnStdinForTest([[maybe_unused]] const std::vector<std::string>& args,
+                          [[maybe_unused]] int64_t (*nanoClock)() noexcept, [[maybe_unused]] std::ostream& out,
+                          std::ostream& err, [[maybe_unused]] uint64_t* idlePumps) {
+#ifdef RUNE_CLI_LIVE_ENABLED
+    ConsoleOptions o;
+    if (const int rc = parseConsoleOptions(args, o, err); rc != 0) return rc;
+    o.live.nanoClock = nanoClock;
+    return runLiveSession(o, {}, LiveInput{&std::cin, -1, true, idlePumps}, out, err);
+#else
+    err << "rune console: live mode requires RUNE_CLI_LIVE_ENABLED\n";
+    return 1;
+#endif
 }
 
 int runLiveOnFdForTest([[maybe_unused]] const std::vector<std::string>& args, [[maybe_unused]] int fd,

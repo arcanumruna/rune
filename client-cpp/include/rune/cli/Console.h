@@ -42,4 +42,9 @@ private:
 int runLiveOnFdForTest(const std::vector<std::string>& args, int fd, std::ostream& out, std::ostream& err,
                        uint64_t* idlePumps);
 
+/// Test seam: the live console exactly as `rune console` runs it on the process stdin (std::cin, any fd 0: a TTY, a
+/// pipe or a file), with the Client's duty clock replaced by @p nanoClock (null: the steady clock).
+int runLiveOnStdinForTest(const std::vector<std::string>& args, int64_t (*nanoClock)() noexcept, std::ostream& out,
+                          std::ostream& err, uint64_t* idlePumps);
+
 } // namespace rune::cli::console

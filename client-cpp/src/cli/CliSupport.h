@@ -196,6 +196,19 @@ private:
     std::filesystem::path path_;
 };
 
+/// The embedded driver's data directory for `--cli-data-dir <requested>` (issue #315): a non-empty value is the
+/// caller's directory, used as is and left in place; an EMPTY value (absent flag, or `--cli-data-dir ""`) is a fresh
+/// private scratch directory under the temp dir, owned by `scratch` and removed with it.  Every CLI command that
+/// connects resolves the flag through here, so an empty value means the same everywhere.
+[[nodiscard]] inline std::string resolveDataDir(const std::string& requested, ScopedDir& scratch) {
+    if (!requested.empty()) return requested;
+    scratch = ScopedDir(std::filesystem::temp_directory_path() /
+                        ("rune-cli-" + std::to_string(::getpid()) + "-" +
+                         std::to_string(reinterpret_cast<std::uintptr_t>(&scratch)) + "-" +
+                         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())));
+    return scratch.path().string();
+}
+
 /// One connected Client for one broker.  Invoker mode: this thread is the duty thread, so the
 /// DDL retry notes (--verbose) are read race-free.
 inline std::string envOr(const char* name) {

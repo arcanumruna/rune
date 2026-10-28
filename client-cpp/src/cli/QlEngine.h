@@ -31,42 +31,38 @@
 
 namespace rune::cli::engine {
 
-namespace cat = rune::catalog;
-namespace ql  = rune::ql;
-namespace sec = rune::security;
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Formatting helpers shared with CatalogCommands.cpp
 // ═══════════════════════════════════════════════════════════════════════════
 [[nodiscard]] std::string hex16(uint64_t v);
 [[nodiscard]] std::string orDash(std::string s);
-[[nodiscard]] const char* persistenceName(cat::Persistence p) noexcept;
+[[nodiscard]] const char* persistenceName(rune::catalog::Persistence p) noexcept;
 [[nodiscard]] const char* compatName(rune::codec::CompatMode m) noexcept;
 [[nodiscard]] std::string descriptorText(const std::vector<uint8_t>& blob);
 
 inline constexpr std::size_t kHistoryColumns = 8;
-[[nodiscard]] std::array<std::string, kHistoryColumns> historyColumns(const cat::RecordedEvent& r);
+[[nodiscard]] std::array<std::string, kHistoryColumns> historyColumns(const rune::catalog::RecordedEvent& r);
 
 [[nodiscard]] std::string_view errorCodeName(uint16_t code) noexcept;
 /// `<CodeName> (<code>) <detail>`
 [[nodiscard]] std::string brokerFailure(uint16_t code, const std::string& detail);
-[[nodiscard]] std::string requestIdHex(const cat::RequestId& id);
+[[nodiscard]] std::string requestIdHex(const rune::catalog::RequestId& id);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Preparing statements
 // ═══════════════════════════════════════════════════════════════════════════
 /// A statement ready to run: every refusal that needs no broker happened while preparing it.
-struct PDefine      { ql::DefineTopicPlan plan; bool validate = false; };
-struct PAlter       { ql::AlterTopicPlan plan; };
-struct PAlterConfig { ql::AlterTopicConfigPlan plan; };
+struct PDefine      { rune::ql::DefineTopicPlan plan; bool validate = false; };
+struct PAlter       { rune::ql::AlterTopicPlan plan; };
+struct PAlterConfig { rune::ql::AlterTopicConfigPlan plan; };
 struct PDropTopic   { std::string name; };
 struct PDropView    { std::string name; };
-struct PHistory     { cat::HistoryFilter filter; std::string text; };
+struct PHistory     { rune::catalog::HistoryFilter filter; std::string text; };
 /// Authentication (Task 8): a security DDL — the plan holds the plaintext password, wiped when the statement is done.
 struct PSecurity {
-    mutable ql::SecurityPlan plan;
+    mutable rune::ql::SecurityPlan plan;
     PSecurity() = default;
-    explicit PSecurity(ql::SecurityPlan p) : plan(std::move(p)) {}
+    explicit PSecurity(rune::ql::SecurityPlan p) : plan(std::move(p)) {}
     PSecurity(PSecurity&&) noexcept = default;
     PSecurity& operator=(PSecurity&&) noexcept = default;
     PSecurity(const PSecurity&) = delete;
@@ -79,20 +75,20 @@ struct PSecurity {
 /// SHOW USERS / ROLES / GRANTS / SECURITY HISTORY — client-side replays of `__security`.
 struct PSecShow {
     enum class Kind { Users, Roles, Grants, History } kind = Kind::Users;
-    sec::GranteeKind who = sec::GranteeKind::User;       // Grants
+    rune::security::GranteeKind who = rune::security::GranteeKind::User;       // Grants
     std::string name;                                    // Grants / History filter
-    std::optional<sec::AsOf> at;                         // Grants
-    sec::HistoryFilter filter;                           // History
+    std::optional<rune::security::AsOf> at;                         // Grants
+    rune::security::HistoryFilter filter;                           // History
     std::string text;
 };
-struct PAsOf        { cat::ObjectType kind = cat::ObjectType::Topic; std::string name; cat::AsOf at; std::string text; };
-struct PDiff        { cat::AsOf a, b; std::string onlyTopic; bool restrictToTopic = false; std::string text; };
+struct PAsOf        { rune::catalog::ObjectType kind = rune::catalog::ObjectType::Topic; std::string name; rune::catalog::AsOf at; std::string text; };
+struct PDiff        { rune::catalog::AsOf a, b; std::string onlyTopic; bool restrictToTopic = false; std::string text; };
 using Prepared = std::variant<PDefine, PAlter, PAlterConfig, PDropTopic, PDropView, PHistory, PAsOf, PDiff, PSecurity, PSecShow>;
 
 /// Statement `n` of a script (1-based) sees this id: {hi, lo + n - 1}.
 struct IdSeq {
-    std::optional<cat::RequestId> base;
-    [[nodiscard]] cat::RequestId at(std::size_t n) const { return {base->hi, base->lo + (n - 1)}; }
+    std::optional<rune::catalog::RequestId> base;
+    [[nodiscard]] rune::catalog::RequestId at(std::size_t n) const { return {base->hi, base->lo + (n - 1)}; }
 };
 
 struct PrepareOptions {
@@ -102,9 +98,9 @@ struct PrepareOptions {
 
 /// Parse-and-plan one statement.  nullopt + `why` when it is refused (versions beyond u16, a bad
 /// setting, an undecodable time).
-[[nodiscard]] std::optional<Prepared> prepare(const ql::Statement&, const PrepareOptions&, std::string& why);
+[[nodiscard]] std::optional<Prepared> prepare(const rune::ql::Statement&, const PrepareOptions&, std::string& why);
 
-void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std::ostream& out);
+void printPlan(const Prepared& p, const std::optional<rune::catalog::RequestId>& rid, std::ostream& out);
 
 /// Reads the whole script text: a file, or @p stdinStream for "-".
 [[nodiscard]] bool readScript(const std::string& path, std::istream& stdinStream, std::string& text, std::ostream& err);
@@ -118,26 +114,25 @@ void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std:
 // ═══════════════════════════════════════════════════════════════════════════
 #ifdef RUNE_CLI_LIVE_ENABLED
 
-namespace rc  = rune::client;
-namespace rpc = rune::protocol::client;
 
-[[nodiscard]] std::string catalogReadFailure(const rc::CatalogReadError& e);
-[[nodiscard]] std::string securityReadFailure(const rc::CatalogReadError& e);
+[[nodiscard]] std::string catalogReadFailure(const rune::client::CatalogReadError& e);
+[[nodiscard]] std::string securityReadFailure(const rune::client::CatalogReadError& e);
 [[nodiscard]] int64_t steadyNowMs();
 /// Waits (bounded by kCatalogWait) until the client's catalog reader holds `rid`.  The seed broker
 /// serves the catalog up to ITS OWN high watermark, which can trail the leader that answered the DDL.
-[[nodiscard]] std::optional<cat::RequestRecord> awaitOwnWrite(rc::Client& c, const cat::RequestId& rid, std::string& why);
+[[nodiscard]] std::optional<rune::catalog::RequestRecord> awaitOwnWrite(rune::client::Client& c, const rune::catalog::RequestId& rid, std::string& why);
 
 /// What LiveBroker::open needs.
 struct LiveOptions {
     std::string endpoint;            // host:port or an aeron: channel
     std::string egress;              // "" = RUNE_EGRESS, else derived for UDP (localEgressFor)
-    std::string streamIn, streamOut, dataDir;   // hidden test overrides ("" = default)
+    std::string streamIn, streamOut, dataDir;   // hidden test overrides ("" = default; an empty dataDir = a private scratch dir)
     bool        verbose = false;
     std::string user, passwordFile;  // credentials ("" = RUNE_USER / RUNE_PASSWORD_FILE)
     std::string password;            // an interactively prompted password (never from argv / env); wiped by the caller
     std::string tlsCa, tlsHost;      // issue #13: --tls-ca / --tls-host ("" = RUNE_TLS_CA_FILE / RUNE_TLS_HOST)
     bool        insecurePlaintext = false;   // --insecure-plaintext: no TLS, and never credentials
+    int64_t   (*nanoClock)() noexcept = nullptr;   // test seam: the Client's duty clock (null = steady clock)
 };
 
 /// The LiveOptions the `--broker` / `--cli-*` / `--user` / `--password-file` flags of `a` describe.
@@ -156,7 +151,7 @@ public:
     bool open(const LiveOptions& o, std::ostream& err, bool withCredentials = true, bool quietFailure = false);
     void close() noexcept;
 
-    [[nodiscard]] rc::Client& client() { return *client_; }
+    [[nodiscard]] rune::client::Client& client() { return *client_; }
     /// The text of the last failed open() (the exception message), for callers that explain it themselves.
     [[nodiscard]] const std::string& lastFailure() const noexcept { return lastFailure_; }
     [[nodiscard]] std::chrono::milliseconds ddlTimeout() const noexcept { return ddlTimeout_; }
@@ -166,7 +161,7 @@ public:
 
 private:
     support::ScopedDir          dir_;
-    std::unique_ptr<rc::Client> client_;
+    std::unique_ptr<rune::client::Client> client_;
     std::chrono::milliseconds   ddlTimeout_{15'000};
     bool                        verbose_ = false;
     std::string                 lastFailure_;
@@ -182,29 +177,29 @@ struct QlRun {
     std::size_t index = 1;
     OutputStyle style = OutputStyle::Ql;
     uint16_t lastErrorCode = 0;              // the broker code of the last failure (0: local / transport)
-    std::optional<cat::RequestId> lastDdl;   // the last DDL this run issued: reads after it must show it
-    std::optional<cat::RequestId> lastSecurityDdl;   // a SHOW after a security DDL waits until the reader shows it
+    std::optional<rune::catalog::RequestId> lastDdl;   // the last DDL this run issued: reads after it must show it
+    std::optional<rune::catalog::RequestId> lastSecurityDdl;   // a SHOW after a security DDL waits until the reader shows it
 
     std::string origin;   // -f path: when set, script errors read "<origin>:statement N: …" (the console; rune ql keeps "statement N: …")
 
-    bool exec(const Prepared& p, const std::string& text, const std::optional<cat::RequestId>& rid);
+    bool exec(const Prepared& p, const std::string& text, const std::optional<rune::catalog::RequestId>& rid);
 
     bool fail(const std::string& msg);
     /// A broker refusal: records its code in lastErrorCode, then fail()s with `<Name> (<code>) <detail>`.
     bool failBroker(uint16_t code, const std::string& detail);
     /// A catalog / security READ failure: records the broker code it carried (e.g. SessionRevoked), then fail()s with `msg`.
-    bool failRead(const std::string& msg, const rc::CatalogReadError& e);
+    bool failRead(const std::string& msg, const rune::client::CatalogReadError& e);
 
-    bool run(const PDefine& s, const rc::DdlOptions& ddl);
-    bool run(const PAlter& s, const rc::DdlOptions& ddl);
-    bool run(const PAlterConfig& s, const rc::DdlOptions& ddl);
-    bool run(const PDropTopic& s, const rc::DdlOptions& ddl);
-    bool run(const PSecurity& s, const rc::DdlOptions& ddl);
-    bool run(const PSecShow& s, const rc::DdlOptions&);
-    bool run(const PDropView& s, const rc::DdlOptions& ddl);
-    bool run(const PHistory& s, const rc::DdlOptions&);
-    bool run(const PAsOf& s, const rc::DdlOptions&);
-    bool run(const PDiff& s, const rc::DdlOptions&);
+    bool run(const PDefine& s, const rune::client::DdlOptions& ddl);
+    bool run(const PAlter& s, const rune::client::DdlOptions& ddl);
+    bool run(const PAlterConfig& s, const rune::client::DdlOptions& ddl);
+    bool run(const PDropTopic& s, const rune::client::DdlOptions& ddl);
+    bool run(const PSecurity& s, const rune::client::DdlOptions& ddl);
+    bool run(const PSecShow& s, const rune::client::DdlOptions&);
+    bool run(const PDropView& s, const rune::client::DdlOptions& ddl);
+    bool run(const PHistory& s, const rune::client::DdlOptions&);
+    bool run(const PAsOf& s, const rune::client::DdlOptions&);
+    bool run(const PDiff& s, const rune::client::DdlOptions&);
 
 private:
     bool awaitLastDdl();

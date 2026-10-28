@@ -27,3 +27,23 @@ TEST(RuneCliOffline, UsageListsConsoleAndReadOnlySchema) {
     EXPECT_EQ(u.find("schema apply"), std::string::npos) << u;
     EXPECT_EQ(u.find("schema alter"), std::string::npos) << u;
 }
+
+TEST(RuneQlCliRegression, UsageListsValidateAndExpectedVersionRegression) {
+    // #304: `rune ql`'s usage names --validate and --expected-version (the flags it parses), on a bad flag and in the
+    // top-level usage.
+    std::ostringstream out, err;
+    ASSERT_EQ(rune::cli::run({"ql", "--no-such-flag"}, out, err), 2);
+    const std::string own = err.str();
+    std::ostringstream out2, err2;
+    ASSERT_EQ(rune::cli::run({}, out2, err2), 1);
+    const std::string all = err2.str();
+    const auto from = all.find("  rune ql");
+    const auto to = all.find("  rune catalog export");
+    ASSERT_NE(from, std::string::npos) << all;
+    ASSERT_NE(to, std::string::npos) << all;
+    const std::string top = all.substr(from, to - from);
+    for (const char* f : {"-e", "-f", "--dry-run", "--verbose", "--request-id", "--validate", "--expected-version", "--broker"}) {
+        EXPECT_NE(own.find(f), std::string::npos) << f << " missing from `rune ql`'s own usage:\n" << own;
+        EXPECT_NE(top.find(f), std::string::npos) << f << " missing from the top-level `rune ql` usage:\n" << top;
+    }
+}

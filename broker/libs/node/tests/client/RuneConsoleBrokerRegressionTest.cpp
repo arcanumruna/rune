@@ -10,10 +10,13 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <sstream>
+#include <streambuf>
 #include <string>
 #include <thread>
 #include <vector>
@@ -53,10 +56,76 @@ std::string writeFile(const std::string& name, const std::string& content) {
 
 constexpr const char* kUserPw = "console-user-pw-1234";
 
+std::size_t countOf(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto pos = hay.find(needle); pos != std::string::npos; pos = hay.find(needle, pos + needle.size())) ++n;
+    return n;
+}
+
+/// How many CreateTopic events the node's __catalog holds for `name`.
+std::size_t createTopicCount(const std::vector<rune::catalog::RecordedEvent>& ev, const std::string& name) {
+    std::size_t n = 0;
+    for (const auto& e : ev)
+        if (e.event.objectName == name && std::holds_alternative<rune::catalog::CreateTopicOps>(e.event.ops)) ++n;
+    return n;
+}
+
+/// The AlterSchema events for `name`, in catalog order (copies: the caller's event vector may be a temporary).
+std::vector<rune::catalog::CatalogEvent> alterSchemaEvents(const std::vector<rune::catalog::RecordedEvent>& ev,
+                                                                  const std::string& name) {
+    std::vector<rune::catalog::CatalogEvent> out;
+    for (const auto& e : ev)
+        if (e.event.objectName == name && std::holds_alternative<rune::catalog::AlterSchemaOps>(e.event.ops)) out.push_back(e.event);
+    return out;
+}
+
+/// A thread-safe output sink: the console thread writes, the test thread polls it (no shared std::ostringstream).
+class SyncBuf : public std::streambuf {
+public:
+    [[nodiscard]] std::string str() {
+        std::lock_guard<std::mutex> g(m_);
+        return s_;
+    }
+
+protected:
+    int_type overflow(int_type c) override {
+        if (c != traits_type::eof()) {
+            std::lock_guard<std::mutex> g(m_);
+            s_.push_back(static_cast<char>(c));
+        }
+        return c;
+    }
+    std::streamsize xsputn(const char* p, std::streamsize n) override {
+        std::lock_guard<std::mutex> g(m_);
+        s_.append(p, static_cast<std::size_t>(n));
+        return n;
+    }
+
+private:
+    std::mutex  m_;
+    std::string s_;
+};
+
+/// An ostream onto a SyncBuf: written by a console thread, read (str()) by the test thread.
+struct Sink : SyncBuf, std::ostream {
+    Sink() : std::ostream(static_cast<SyncBuf*>(this)) {}
+};
+
+/// Polls `cond` (yielding) until it holds; false when the hard cap is hit - a failure, never a hang.
+template <class Cond>
+bool waitUntil(Cond&& cond, std::chrono::milliseconds cap = 20s) {
+    const auto end = std::chrono::steady_clock::now() + cap;
+    for (std::uint64_t i = 0; i < 400'000'000ull && std::chrono::steady_clock::now() < end; ++i) {
+        if (cond()) return true;
+        std::this_thread::yield();
+    }
+    return cond();
+}
+
 /// A console on a pipe in its own thread (the pipe plays the terminal).
 struct PipeConsole {
     int fds[2]{-1, -1};
-    std::ostringstream out, err;
+    Sink out, err;   // read by the test thread while the console thread writes
     uint64_t pumps = 0;
     int rc = -1;
     std::thread t;
@@ -103,7 +172,12 @@ TEST(RuneConsoleBrokerRegression, InteractiveDefinesAltersAndReadsInOneSessionRe
                 ASSERT_FALSE(c->schema->descriptorBlob.empty()) << "descriptor blob must be non-empty";
                 const auto d = rune::codec::deserialize(std::span<const uint8_t>(c->schema->descriptorBlob));
                 EXPECT_EQ(d.name, "player");
-                EXPECT_EQ(d.fields.size(), 2u);
+                // #313: the stored descriptor is the script's - field names AND types, in order, not just a count.
+                ASSERT_EQ(d.fields.size(), 2u);
+                EXPECT_EQ(d.fields[0].name, "id");
+                EXPECT_EQ(d.fields[0].type, rune::codec::PrimType::Int64);
+                EXPECT_EQ(d.fields[1].name, "name");
+                EXPECT_EQ(d.fields[1].type, rune::codec::PrimType::String);
             }
             if (e.event.objectName == "ticks") {
                 sawTicks = true;
@@ -116,6 +190,15 @@ TEST(RuneConsoleBrokerRegression, InteractiveDefinesAltersAndReadsInOneSessionRe
         }
     }
     EXPECT_TRUE(sawPlayer && sawTicks && sawLevel) << "player create, transient ticks create and the level ADD were all issued";
+    // #313: exactly one CreateTopic per topic the script defines (a retry or a double issue would add a second).
+    EXPECT_EQ(createTopicCount(ev, "player"), 1u);
+    EXPECT_EQ(createTopicCount(ev, "ticks"), 1u);
+    const auto alters = alterSchemaEvents(ev, "player");
+    ASSERT_EQ(alters.size(), 1u) << "one ALTER statement, one AlterSchema event";
+    ASSERT_EQ(std::get<rune::catalog::AlterSchemaOps>(alters[0].ops).ops.size(), 1u);
+    const auto& add = std::get<rune::catalog::AlterSchemaOps>(alters[0].ops).ops[0];
+    EXPECT_EQ(add.name, "level");
+    EXPECT_EQ(add.primType, rune::codec::PrimType::Int32) << "the added column's type reached the broker";
 }
 
 TEST(RuneConsoleBrokerRegression, OneSessionForEveryStatementRegression) {
@@ -193,6 +276,74 @@ TEST(RuneConsoleBrokerRegression, ScriptDefinesThenAltersWithExpectedVersionRegr
     }
     EXPECT_TRUE(sawAdd) << "ADD nickname reached the broker";
     EXPECT_TRUE(sawCompat) << "SET COMPATIBILITY backward reached the broker";
+    // #313: exactly one define, and the alter was checked against the version the define produced.  The broker accepts a
+    // non-zero expectedVersion only when it equals the stored version, so the accepted event's prevVersion IS the
+    // value the gate matched (the event itself does not carry the request field).
+    const auto ev = b.catalogEvents();
+    EXPECT_EQ(createTopicCount(ev, "characters"), 1u) << "exactly one CreateTopic for the one `topic` statement";
+    uint32_t createdVersion = 0;
+    for (const auto& e : ev)
+        if (e.event.objectName == "characters" && std::holds_alternative<rune::catalog::CreateTopicOps>(e.event.ops)) createdVersion = e.event.newVersion;
+    const auto alters = alterSchemaEvents(ev, "characters");
+    ASSERT_EQ(alters.size(), 1u);
+    EXPECT_EQ(alters[0].prevVersion, createdVersion) << "the alter applied on top of the version the define created";
+    EXPECT_EQ(alters[0].prevVersion, 1u) << "the version the test passed as --expected-version";
+    EXPECT_EQ(alters[0].newVersion, createdVersion + 1);
+}
+
+TEST(RuneConsoleBrokerRegression, ExpectedVersionIsTheOneTheBrokerChecksRegression) {
+    // #313: the value after --expected-version is what the broker compares - proven with values read back from the
+    // catalog events the test captured (never a literal the product could also hard-code), in both directions.
+    OneBroker b("console_evcas");
+    ASSERT_EQ(consoleLive(b, {"-f", writeFile("cas1.rql", "topic cas { id int64 } partitions 1 key id;\n")}, "").rc, 0);
+    auto stored = [&] {   // the topic's stored schema version = the newest event's newVersion
+        uint32_t v = 0;
+        for (const auto& e : b.catalogEvents())
+            if (e.event.objectName == "cas") v = e.event.newVersion;
+        return v;
+    };
+    uint32_t v = stored();
+    ASSERT_GE(v, 1u);
+    for (int round = 0; round < 3; ++round) {   // the gate follows the stored version: v, v+1, v+2 all pass
+        const std::string f = writeFile("cas_ok" + std::to_string(round) + ".rql",
+                                        "alter topic cas add column c" + std::to_string(round) + " int32;\n");
+        const auto r = consoleLive(b, {"-f", f, "--expected-version", std::to_string(v)}, "");
+        ASSERT_EQ(r.rc, 0) << "expected version " << v << ": " << r.err;
+        const auto alters = alterSchemaEvents(b.catalogEvents(), "cas");
+        ASSERT_EQ(alters.size(), static_cast<std::size_t>(round) + 1);
+        EXPECT_EQ(alters.back().prevVersion, v) << "the gate matched the version the test passed";
+        EXPECT_EQ(alters.back().newVersion, v + 1);
+        v = stored();
+        EXPECT_EQ(v, alters.back().newVersion);
+    }
+    const auto before = b.catalogEvents().size();
+    for (const uint32_t wrong : {v - 1, v + 1, v + 4}) {   // any other value is a conflict, and nothing is issued
+        const std::string f = writeFile("cas_bad.rql", "alter topic cas add column bad" + std::to_string(wrong) + " int32;\n");
+        const auto r = consoleLive(b, {"-f", f, "--expected-version", std::to_string(wrong)}, "");
+        EXPECT_EQ(r.rc, static_cast<int>(rune::protocol::client::ErrorCode::SchemaConflict)) << wrong << ": " << r.err;
+    }
+    EXPECT_EQ(b.catalogEvents().size(), before) << "a refused alter appends nothing";
+    // 0 / absent = unconditional.
+    const auto u = consoleLive(b, {"-f", writeFile("cas_any.rql", "alter topic cas add column any1 int32;\n")}, "");
+    EXPECT_EQ(u.rc, 0) << u.err;
+}
+
+TEST(RuneConsoleBrokerRegression, AlterOnlyScriptIssuesNoCreateTopicRegression) {
+    // #313: a script with only ALTER statements never defines a topic.
+    OneBroker b("console_alteronly");
+    ASSERT_EQ(consoleLive(b, {"-f", writeFile("ao1.rql", "topic ao { id int64 } partitions 1 key id;\n")}, "").rc, 0);
+    const auto before = b.catalogEvents();
+    ASSERT_EQ(createTopicCount(before, "ao"), 1u);
+    const auto r = consoleLive(b, {"-f", writeFile("ao2.rql",
+        "alter topic ao add column a int32;\nalter topic ao add column b int32;\n")}, "");
+    ASSERT_EQ(r.rc, 0) << r.err;
+    const auto after = b.catalogEvents();
+    EXPECT_EQ(createTopicCount(after, "ao"), 1u) << "still the one CreateTopic from the first script";
+    std::size_t creates = 0;
+    for (std::size_t i = before.size(); i < after.size(); ++i)
+        if (std::holds_alternative<rune::catalog::CreateTopicOps>(after[i].event.ops)) ++creates;
+    EXPECT_EQ(creates, 0u) << "the alter-only script appended no CreateTopic";
+    EXPECT_EQ(alterSchemaEvents(after, "ao").size(), 2u) << "one AlterSchema per ALTER statement";
 }
 
 TEST(RuneConsoleBrokerRegression, IdlePromptKeepsTheSessionAliveRegression) {
@@ -252,7 +403,10 @@ TEST(RuneConsoleBrokerRegression, SessionRevokedEndsTheConsoleRegression) {
     PipeConsole c({"console", "--broker", b.endpoint(), "--user", "u", "--password-file", pw, "--tls-ca",
                    AuthBroker::tlsCaFile().string()});   // issue #13: credentials only over TLS
     c.send("topic ok_a partitions 1;\n");
-    std::this_thread::sleep_for(500ms);
+    // The login and the first statement must be done before the admin disables the user (a fixed 500 ms is not enough
+    // under load: the disable then lands before the connect and the login itself fails).
+    ASSERT_TRUE(waitUntil([&] { return c.out.str().find("ok topic ok_a") != std::string::npos; }))
+        << "out: " << c.out.str() << "\nerr: " << c.err.str();
     b.disableUser("u");
     std::this_thread::sleep_for(1500ms);   // the console pumps while idle and learns the session ended
     c.send("topic ok_b partitions 1;\ntopic ok_c partitions 1;\n");
@@ -261,4 +415,90 @@ TEST(RuneConsoleBrokerRegression, SessionRevokedEndsTheConsoleRegression) {
     EXPECT_NE(c.err.str().find("the session ended"), std::string::npos) << c.err.str();
     EXPECT_NE(c.out.str().find("ok topic ok_a"), std::string::npos) << c.out.str();
     EXPECT_EQ(c.out.str().find("ok topic ok_c"), std::string::npos) << "no statement after the revoke ran";
+    // #313: the console stops READING at the revoke.  Prompts are printed before each read: one before `ok_a`, one
+    // before `ok_b` (the statement that learned the session ended) and none after it - not "no ok_c", which a dead
+    // client would also give.
+    EXPECT_EQ(countOf(c.out.str(), "rune> "), 2u) << c.out.str();
+    EXPECT_EQ(countOf(c.err.str(), "the session ended"), 1u) << "reported once: " << c.err.str();
+}
+
+namespace {
+// The injected duty clock of the piped-stdin test: the real steady clock plus an offset only the test advances.
+std::atomic<int64_t>  gClockOffsetNs{0};
+std::atomic<uint64_t> gClockSamples{0};
+int64_t pipedTestClock() noexcept {
+    gClockSamples.fetch_add(1, std::memory_order_relaxed);
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() +
+           gClockOffsetNs.load(std::memory_order_relaxed);
+}
+
+/// Process stdin (fd 0) replaced by the read end of a pipe for the scope; restored after.
+struct StdinPipe {
+    int fds[2]{-1, -1};
+    int saved = -1;
+    StdinPipe() {
+        if (::pipe(fds) != 0) throw std::runtime_error("pipe");
+        saved = ::dup(STDIN_FILENO);
+        if (saved < 0 || ::dup2(fds[0], STDIN_FILENO) < 0) throw std::runtime_error("dup2");
+    }
+    void send(const std::string& s) { ASSERT_EQ(::write(fds[1], s.data(), s.size()), static_cast<ssize_t>(s.size())); }
+    void closeWriter() {
+        if (fds[1] >= 0) { ::close(fds[1]); fds[1] = -1; }
+    }
+    ~StdinPipe() {
+        closeWriter();
+        if (saved >= 0) { ::dup2(saved, STDIN_FILENO); ::close(saved); }
+        if (fds[0] >= 0) ::close(fds[0]);
+    }
+};
+
+} // namespace
+
+TEST(RuneConsoleBrokerRegression, PipedStdinGapKeepsTheSessionAliveRegression) {
+    // #311: the console reads the process stdin through the polling source whether or not it is a terminal, so a gap on
+    // a pipe (`slow-producer | rune console`) pumps the client and keeps the session.  The duty clock is injected and
+    // advanced one second per step, past the stale-session window (responseTimeoutNs), each step waiting for the
+    // console to have sampled the clock again (= to have pumped the client while blocked for input).
+    OneBroker b("console_piped");
+    const uint64_t connectsBefore = b.node().testConnectsAccepted();
+    StdinPipe in;
+    Sink outBuf, errBuf;
+    std::ostream& out = outBuf;
+    std::ostream& err = errBuf;
+    gClockOffsetNs = 0;
+    gClockSamples = 0;
+    uint64_t pumps = 0;
+    int rc = -1;
+    std::thread t([&] {
+        rc = rune::cli::console::runLiveOnStdinForTest({"console", "--broker", b.endpoint()}, &pipedTestClock, out, err, &pumps);
+    });
+    auto finish = [&] {
+        in.closeWriter();
+        if (t.joinable()) t.join();
+    };
+    in.send("topic piped1 partitions 1;\n");
+    const bool first = waitUntil([&] { return outBuf.str().find("ok topic piped1") != std::string::npos; });
+    if (!first) { finish(); FAIL() << "the first statement never completed: " << errBuf.str(); }
+
+    const int64_t windowNs = rune::client::session::SessionConfig::kDefaultResponseTimeoutNs;
+    const int steps = static_cast<int>(windowNs / 1'000'000'000LL) + 4;   // 4 s past the window
+    for (int i = 0; i < steps; ++i) {
+        gClockOffsetNs.fetch_add(1'000'000'000LL);
+        const uint64_t target = gClockSamples.load() + 2;
+        if (!waitUntil([&] { return gClockSamples.load() >= target; }, 5s)) {
+            finish();
+            FAIL() << "step " << i << ": the console blocked on the idle pipe and never pumped the client (clock sampled "
+                   << gClockSamples.load() << " times)";
+        }
+    }
+    in.send("topic piped2 partitions 1;\n");   // a second statement, after a gap longer than the stale window
+    const bool second = waitUntil([&] { return outBuf.str().find("ok topic piped2") != std::string::npos; });
+    finish();
+    EXPECT_TRUE(second) << "out: " << outBuf.str() << "\nerr: " << errBuf.str();
+    EXPECT_EQ(rc, 0) << errBuf.str();
+    EXPECT_EQ(countOf(outBuf.str(), "ok topic piped"), 2u) << "both statements ran on the one session: " << outBuf.str();
+    EXPECT_EQ(errBuf.str().find("closed"), std::string::npos) << errBuf.str();
+    EXPECT_EQ(errBuf.str().find("session"), std::string::npos) << errBuf.str();
+    EXPECT_GT(pumps, static_cast<uint64_t>(steps)) << "the idle pump ran during the gap";
+    EXPECT_EQ(b.node().testConnectsAccepted() - connectsBefore, 1u) << "no reconnect: one connected client for the whole session";
 }

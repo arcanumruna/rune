@@ -1766,6 +1766,7 @@ endif()
 
 # ── Catalog history Task 15: `rune ql` / `rune catalog` offline tests ──────────
 # --dry-run, .rcat files, the pure row / step-check functions (no broker, nothing blocks).
+    target_include_directories(rune_cli_offline_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/cli)   # QlEngine.h / CliSupport.h (internal)
 if(BUILD_TESTING)
     add_executable(rune_cli_catalog_tests
         tests/RuneCliCatalogTest.cpp
