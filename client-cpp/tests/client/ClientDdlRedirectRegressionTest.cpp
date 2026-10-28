@@ -1333,3 +1333,53 @@ TEST(RoutedCtlRegression, GetViewRowRedirectCapNamesTheNodeRouteAndBrokerCode3Ad
     EXPECT_NE(text.find("(route: " + nodeCh + ", broker code 3)"), std::string::npos) << text;
     EXPECT_EQ(text.find("route: seed"), std::string::npos) << text;
 }
+
+// ── Whole-branch review (C21–C23) attacks ──
+
+// #687 x the budget selection: a Redirect-held op toward an unreachable node is bounded by ITS OWN budget - a DDL by
+// ddlRetryBudget, a GetViewRow by viewReadRetryBudget - never by the other one.  Both ops are held at once on one
+// client whose two budgets differ (300 ms vs 1.5 s) and whose op timeouts are far away (20 s): the read ends
+// "node unreachable" after ~300 ms of duty clock, the DDL after ~1.5 s.
+// RED (mutation): the isDdlOp(...) selection in onDdlRedirect_'s DdlHeldForNode budget swapped or fixed to one budget.
+TEST(RoutedCtlRegression, HeldDdlAndHeldViewReadEachEndAtTheirOwnBudgetAdversarialRegression) {
+    rc::ClientConfig cfg = invokerCfg(4490, 4491);
+    cfg.ddlRetryBudget      = std::chrono::milliseconds(1'500);
+    cfg.viewReadRetryBudget = std::chrono::milliseconds(300);
+    cfg.ddlTimeoutMs        = 20'000;
+    cfg.pingTimeoutMs       = 20'000;
+    Rig r(cfg);
+    r.connect();
+    const std::string nowhere = udp(rune::client::testing::allocFreeUdpPort());   // no node listens there
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        r.answerError(ep, pc::ErrorCode::Redirect, nowhere, m->sessionId, m->correlationId);
+    };
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        r.answerError(ep, pc::ErrorCode::Redirect, nowhere, m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    const int64_t t0 = g_now;
+    auto ddl  = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    auto read = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(ddl.accepted());
+    ASSERT_TRUE(read.accepted());
+    ASSERT_TRUE(r.drive([&] { return read.ready(); }, /*stepNs=*/10'000'000)) << "the read must end, not hang";
+    const int64_t readEndedAfter = g_now - t0;
+    EXPECT_GE(readEndedAfter, int64_t{300'000'000}) << "the read ended before its own 300 ms budget";
+    EXPECT_LT(readEndedAfter, int64_t{1'000'000'000}) << "the read was held on the DDL's 1.5 s budget";
+    EXPECT_EQ(read.outcome().c.status, rc::OpStatus::SessionLost) << payloadText(read);
+    EXPECT_EQ(payloadText(read).rfind("node unreachable", 0), 0u) << payloadText(read);
+    EXPECT_FALSE(ddl.ready()) << "the DDL ended on the read's 300 ms budget";
+    ASSERT_TRUE(r.drive([&] { return ddl.ready(); }, /*stepNs=*/10'000'000)) << "the DDL must end, not hang";
+    const int64_t ddlEndedAfter = g_now - t0;
+    EXPECT_GE(ddlEndedAfter, int64_t{1'500'000'000});
+    EXPECT_LT(ddlEndedAfter, int64_t{3'000'000'000}) << "the DDL outlived its own budget";
+    EXPECT_EQ(ddl.outcome().c.status, rc::OpStatus::SessionLost) << payloadText(ddl);
+    r.passes(100, 20'000'000);
+    EXPECT_EQ(cq.timesCompleted(ddl.token()), 1);
+    EXPECT_EQ(cq.timesCompleted(read.token()), 1);
+    EXPECT_EQ(r.client.testPendingControlOps(), 0u);
+}
