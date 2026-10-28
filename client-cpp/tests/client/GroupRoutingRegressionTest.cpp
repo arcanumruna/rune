@@ -4497,3 +4497,47 @@ TEST(SubscribeClockRegression, MaxSubscribeTimeoutSaturatesAndNeverTimesOutAdver
     EXPECT_FALSE(sub.finished()) << "a saturated (never) deadline timed out";
     EXPECT_EQ(errors, 0);
 }
+
+// ── Whole-branch review (C21–C23) attacks ──
+
+// #705 x the fan-out (I4): a route failure asks EVERY Connected session, each with its own corrId (seed N, node N+1).
+// The seed answers the round; the node's broker stays silent (a connected but wedged node).  The round WAS answered:
+// no MetadataRequest is re-sent however far the duty clock runs.  After the seed's answer every further request is
+// answered at once (holdMetadata off), so a spurious re-ask shows up as exactly one extra request.
+// RED (today): metadataAnswerCorr_ is the round's LAST corrId (the node's), so the seed's answer (N < N+1) never
+// clears the timer; a response timeout later the client asks again.
+TEST(GroupRoutingRegression, AFanOutRoundAnsweredByTheSeedAloneIsNotReAskedAdversarialRegression) {
+    RigOptions o = routingClockOptions(100'000);
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 2'000'000'000;
+    GroupRig r(4723, 4724, o);
+    const auto [n1, p1port] = r.addNode(4723);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 1, 1, 4723, ""}};   // t/0 led by node 1: its session is Connected
+    r.gw.subscribeLeader = {{0, n1}};
+    r.connect();
+    auto s0 = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                 [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, n1) != nullptr && s0.active(); }));
+    r.opt.stepNs = 0;   // settle with the duty clock frozen
+    for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
+    r.gw.holdMetadata = true;
+    const std::size_t asked = r.gw.metadataCorrIds.size();
+    r.client.testRequestMetadataNow();   // a route failure: fan out
+    for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
+    ASSERT_EQ(r.gw.metadataCorrIds.size(), asked + 2) << "precondition: the seed AND node 1 were asked";
+    int64_t seedCorr = 0;
+    for (std::size_t i = asked; i < r.gw.metadataCorrIds.size(); ++i)
+        if (r.gw.metadataEndpoints[i] == 0) seedCorr = r.gw.metadataCorrIds[i];
+    ASSERT_NE(seedCorr, 0) << "precondition: one request went to the seed";
+    r.gw.sendMetadata(r.seedSid, seedCorr, 0);   // the seed answers; node 1's request stays unanswered
+    for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
+    r.gw.holdMetadata = false;
+    r.opt.stepNs = 10'000'000;
+    const int64_t t0 = g_routingClockNs;
+    (void)r.drive([&] { return g_routingClockNs - t0 >= 20'000'000'000LL; }, 10'000);
+    EXPECT_GE(g_routingClockNs - t0, 20'000'000'000LL) << "precondition: the duty clock ran 10 response timeouts";
+    EXPECT_EQ(r.gw.metadataCorrIds.size(), asked + 2)
+        << "the answered fan-out round was asked again (the seed's answer did not clear the round's timer)";
+    (void)s0;
+}

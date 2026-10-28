@@ -6662,11 +6662,16 @@ bool Client::sendMetadataRequestAnywhere_() noexcept {
 
 int Client::sendMetadataRequestEverywhere_() noexcept {
     int sent = 0;
+    // corrIds come from the single monotonic nextCorrId_, so every request of this round is >= roundFloor and every
+    // request of an earlier round is < it: an answer from ANY session of the newest round clears the timer (a wedged
+    // node never answers), while a lagging answer from an older round still does not (#705).
+    const int64_t roundFloor = nextCorrId_;
     const auto snap = agent_.stateAndSessionId();
     if (snap.state == session::SessionState::Connected && snap.sessionId != 0 && sendMetadataRequest(snap.sessionId))
         ++sent;
     const auto n = static_cast<uint32_t>(agent_.sessionCount());
     for (uint32_t i = 1; i < n; ++i) sent += offerMetadataOnNode_(i) ? 1 : 0;
+    if (sent > 0) metadataAnswerCorr_ = roundFloor;
     return sent;
 }
 
