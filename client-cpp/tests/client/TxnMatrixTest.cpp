@@ -102,6 +102,55 @@ TEST(TxnMatrixCountRegression, CellCountsArePinned) {
     EXPECT_EQ(rules[static_cast<uint8_t>(mx::Outcome::RedoneOnce)], 19);
 }
 
+// #369: expected() is the single source of every status code a handler asserts: its outcome is expect()'s, and its
+// codes are consistent per rule.  The cell counts per (rule, op status, end status) are pinned from the plan.
+TEST(TxnMatrixCountRegression, ExpectedStatusCodesAreConsistentPerRuleRegression) {
+    // counts[outcome][opStatus][endStatus]
+    int counts[9][3][3]{};
+    int r9OpFenced = 0, r9OpOk = 0;
+    for (uint8_t o = 0; o < mx::kOps; ++o) {
+        for (uint8_t e = 0; e < mx::kEntities; ++e) {
+            for (uint8_t t = 0; t < mx::kTimings; ++t) {
+                const auto op = static_cast<mx::Op>(o);
+                const auto en = static_cast<mx::Entity>(e);
+                const auto tm = static_cast<mx::Timing>(t);
+                if (mx::naRule(op, en, tm)) continue;
+                const mx::Expected x = mx::expected(op, en, tm);
+                ASSERT_EQ(x.outcome, mx::expect(op, en, tm)) << mx::name(op) << "/" << mx::name(en) << "/" << mx::name(tm);
+                // A code is carried only by BrokerError; Ok and Fenced pin none.
+                EXPECT_EQ(x.opStatus == mx::Status::BrokerError, x.opCode == mx::kInvalidTxnState)
+                    << mx::name(op) << "/" << mx::name(en) << "/" << mx::name(tm);
+                EXPECT_EQ(x.endStatus == mx::Status::BrokerError, x.endCode == mx::kInvalidTxnState)
+                    << mx::name(op) << "/" << mx::name(en) << "/" << mx::name(tm);
+                ++counts[static_cast<uint8_t>(x.outcome)][static_cast<uint8_t>(x.opStatus)][static_cast<uint8_t>(x.endStatus)];
+                if (x.outcome == mx::Outcome::Fenced) (x.opStatus == mx::Status::Fenced ? r9OpFenced : r9OpOk)++;
+            }
+        }
+    }
+    auto at = [&](mx::Outcome o, mx::Status op, mx::Status end) {
+        return counts[static_cast<uint8_t>(o)][static_cast<uint8_t>(op)][static_cast<uint8_t>(end)];
+    };
+    using O = mx::Outcome;
+    using S = mx::Status;
+    EXPECT_EQ(at(O::Delivered, S::Ok, S::Ok), 18) << "R1";
+    EXPECT_EQ(at(O::DeliveredOnce, S::Ok, S::Ok), 9) << "R2";
+    EXPECT_EQ(at(O::AtMostOnce, S::Ok, S::Ok), 9) << "R3";
+    EXPECT_EQ(at(O::Refused, S::BrokerError, S::Ok), 57) << "R4-R6: the op is refused with 19, the commit before it is Ok";
+    EXPECT_EQ(at(O::CommittedVisible, S::Ok, S::Ok), 19) << "R7";
+    EXPECT_EQ(at(O::FailsTxn, S::BrokerError, S::BrokerError), 19) << "R8: the op and the commit both carry 19";
+    // R9: an op that needs the coordinator (the new partition's 9 data ops and the offsets leg) completes Fenced; an
+    // added partition's 9 data ops are acknowledged by their leader (Ok); every commit / later op is Fenced.
+    EXPECT_EQ(at(O::Fenced, S::Fenced, S::Fenced), 10) << "R9 op Fenced";
+    EXPECT_EQ(at(O::Fenced, S::Ok, S::Fenced), 9) << "R9 op Ok";
+    EXPECT_EQ(r9OpFenced, 10);
+    EXPECT_EQ(r9OpOk, 9);
+    EXPECT_EQ(at(O::CommittedVisibleOnce, S::Ok, S::Ok), 19) << "R10";
+    EXPECT_EQ(at(O::RedoneOnce, S::Ok, S::Ok), 19) << "R11";
+    int sum = 0;
+    for (auto& a : counts) for (auto& b : a) for (int c : b) sum += c;
+    EXPECT_EQ(sum, 188) << "every applicable cell is in exactly one bucket above";
+}
+
 namespace {
 
 int g_ctr = 0;
@@ -565,19 +614,29 @@ public:
     }
 };
 
-// Drives one cell.
-// (#369 item 5b, not done: the status / error codes of an outcome still live in the handlers below; expect() names only
-// the Outcome.  Moving them into TxnMatrixExpectations.h is not a mechanical move - the handlers differ per timing and
-// per op form - so it stays listed in the issue.)
+// Drives one cell.  Every status / error code a handler asserts is read from `want` = mx::expected() (#369): the
+// op's own completion (opStatus / opCode) and the commit's / later ops' (endStatus / endCode).
 class CellRunner {
 public:
-    explicit CellRunner(Cell c) : r(c), c_(c), outcome(mx::expect(c.op, c.ent, c.tm)) {}
+    explicit CellRunner(Cell c) : r(c), c_(c), want(mx::expected(c.op, c.ent, c.tm)), outcome(want.outcome) {}
     void run();
 
 private:
-    Rig       r;
-    Cell      c_;
+    Rig         r;
+    Cell        c_;
+    mx::Expected want;
     mx::Outcome outcome;
+
+    [[nodiscard]] static rc::OpStatus statusFor(mx::Status s) {
+        switch (s) {
+        case mx::Status::Ok:          return rc::OpStatus::Ok;
+        case mx::Status::BrokerError: return rc::OpStatus::BrokerError;
+        case mx::Status::Fenced:      return rc::OpStatus::Fenced;
+        }
+        return rc::OpStatus::Ok;
+    }
+    [[nodiscard]] rc::OpStatus opStatus() const { return statusFor(want.opStatus); }
+    [[nodiscard]] rc::OpStatus endStatus() const { return statusFor(want.endStatus); }
 
     void plainSteady();
     void plainSessionLost();
@@ -718,7 +777,7 @@ void CellRunner::plainSteady() {
     r.checkAllocs(is);
     r.checkExactlyOnce(is, true);
     if (is.token != 0) {
-        EXPECT_EQ(statusOf(r, is), rc::OpStatus::Ok);
+        EXPECT_EQ(statusOf(r, is), opStatus());
         if (c_.ent == mx::Entity::PlainNoAck) EXPECT_EQ(is.viaCq ? r.comps[is.token].back().value : r.acks[is.token].back().baseOffset, -1);
     }
     checkVisible(true);   // a read_committed and a read_uncommitted reader each see every record once
@@ -768,7 +827,7 @@ void CellRunner::plainSessionLost() {
     r.checkAllocs(is);
     r.checkExactlyOnce(is, acked);
     if (is.token != 0) {
-        EXPECT_EQ(statusOf(r, is), rc::OpStatus::Ok);
+        EXPECT_EQ(statusOf(r, is), opStatus());
     }
     if (acked) {
         checkVisible(true);   // exactly one copy of every record, the re-sent batch deduplicated
@@ -808,13 +867,13 @@ void CellRunner::txnSteady() {
     ASSERT_TRUE(r.drive([&] { return r.batchAcksCoverAccepted() && tokenDone(is); }));
     r.settle();
     if (isOffsets()) {
-        EXPECT_EQ(statusOf(r, is), rc::OpStatus::Ok);
+        EXPECT_EQ(statusOf(r, is), opStatus());
         EXPECT_EQ((r.gw->committedOffsets[{kTopicId, 0}]), 3) << "the offsets are staged until the commit";
     }
     r.commitOk(kTokCommit);
     r.checkAllocs(is);
     r.checkExactlyOnce(is, true);
-    if (is.token != 0) EXPECT_EQ(statusOf(r, is), rc::OpStatus::Ok);
+    if (is.token != 0) EXPECT_EQ(statusOf(r, is), opStatus());
     EXPECT_EQ(r.comps[kTokCommit].size(), 1u);
     checkVisible(true);
     EXPECT_EQ(r.gw->visibleBatches(0, Gw::TxnFate::Open), 0u) << "nothing left undecided";
@@ -874,8 +933,8 @@ void CellRunner::txnRefused() {
         // An offsets leg is a token op: accepted, then refused by the machine with InvalidTxnState.
         ASSERT_TRUE(is.accepted);
         ASSERT_TRUE(r.await(kTokOp));
-        EXPECT_EQ(r.done(kTokOp).status, rc::OpStatus::BrokerError);
-        EXPECT_EQ(r.done(kTokOp).errorCode, 19);
+        EXPECT_EQ(r.done(kTokOp).status, opStatus());
+        EXPECT_EQ(r.done(kTokOp).errorCode, want.opCode);
     } else {
         EXPECT_TRUE(is.refused) << "the op was not refused";
         EXPECT_FALSE(is.accepted);
@@ -886,7 +945,8 @@ void CellRunner::txnRefused() {
     }
     if (commitIssued) {
         ASSERT_TRUE(r.await(kTokCommit));
-        EXPECT_EQ(r.done(kTokCommit).status, rc::OpStatus::Ok) << "errorCode " << r.done(kTokCommit).errorCode;
+        EXPECT_EQ(r.done(kTokCommit).status, endStatus()) << "errorCode " << r.done(kTokCommit).errorCode;
+        EXPECT_EQ(r.done(kTokCommit).errorCode, want.endCode);
         EXPECT_EQ(r.comps[kTokCommit].size(), 1u);
         ASSERT_TRUE(r.drive([&] { return r.p->state() == rc::TxnState::Ready; }));
     }
@@ -939,8 +999,8 @@ void CellRunner::txnAbortable() {
     const rc::Token ct = kTokCommit;
     ASSERT_EQ(r.p->commitTransaction(*r.cq, ct), rc::OpResult::Accepted);
     ASSERT_TRUE(r.await(ct));
-    EXPECT_EQ(r.done(ct).status, rc::OpStatus::BrokerError);
-    EXPECT_EQ(r.done(ct).errorCode, 19);
+    EXPECT_EQ(r.done(ct).status, endStatus());
+    EXPECT_EQ(r.done(ct).errorCode, want.endCode);
     EXPECT_EQ(r.comps[ct].size(), 1u);
     ASSERT_NO_FATAL_FAILURE(r.abortOk(kTokAbort));
     EXPECT_EQ(r.p->state(), rc::TxnState::Ready);
@@ -950,8 +1010,8 @@ void CellRunner::txnAbortable() {
     // TxnMatrixRegression.UnsentRecordsOfAPoisonedTxnCompleteAtOnceRegression.
     if (is.accepted && is.token != 0) {
         ASSERT_TRUE(r.drive([&] { return tokenDone(is); })) << "the op's token never completed";
-        EXPECT_EQ(statusOf(r, is), rc::OpStatus::BrokerError);
-        EXPECT_EQ(codeOf(r, is), 19);
+        EXPECT_EQ(statusOf(r, is), opStatus());
+        EXPECT_EQ(codeOf(r, is), want.opCode);
     }
     r.settle();
     const auto after = r.wire();
@@ -988,7 +1048,7 @@ void CellRunner::txnFenced() {
     ASSERT_TRUE(is.accepted) << "the handle's gate is open until the machine learns of the fence";
     ASSERT_EQ(r.p->commitTransaction(*r.cq, kTokCommit), rc::OpResult::Accepted);
     ASSERT_TRUE(r.await(kTokCommit));
-    EXPECT_EQ(r.done(kTokCommit).status, rc::OpStatus::Fenced);
+    EXPECT_EQ(r.done(kTokCommit).status, endStatus());
     EXPECT_EQ(r.comps[kTokCommit].size(), 1u);
     ASSERT_TRUE(r.drive([&] { return tokenDone(is); }));
     r.settle();
@@ -1005,12 +1065,12 @@ void CellRunner::txnFenced() {
     if (is.token != 0) {
         const rc::OpStatus st = statusOf(r, is);
         if (isOffsets() || !added()) {
-            EXPECT_EQ(st, rc::OpStatus::Fenced) << "an op that needs the coordinator completes Fenced";
+            EXPECT_EQ(st, opStatus()) << "an op that needs the coordinator completes " << mx::name(want.opStatus);
         } else {
             // An added partition's batch goes straight to the partition leader; it may be acknowledged before the
             // coordinator reveals the fence at the commit (EndTxn follows the data): the token is Ok.  Its records
             // are never visible (checked below).
-            EXPECT_EQ(st, rc::OpStatus::Ok) << "the leader acknowledged the batch before the coordinator revealed the fence";
+            EXPECT_EQ(st, opStatus()) << "the leader acknowledged the batch before the coordinator revealed the fence";
         }
     }
     EXPECT_EQ(r.p->state(), rc::TxnState::FatalError);
@@ -1023,7 +1083,7 @@ void CellRunner::txnFenced() {
     const auto wire0 = r.wire();
     ASSERT_EQ(r.p->commitTransaction(*r.cq, kTokAbort), rc::OpResult::Accepted);
     ASSERT_TRUE(r.await(kTokAbort));
-    EXPECT_EQ(r.done(kTokAbort).status, rc::OpStatus::Fenced);
+    EXPECT_EQ(r.done(kTokAbort).status, endStatus());
     r.settle(600);
     EXPECT_EQ(r.wire(), wire0) << "a frame left a fenced producer";
 }
@@ -1067,11 +1127,11 @@ void CellRunner::txnSessionLost() {
         ASSERT_TRUE(r.await(kTokAbort));
         last = kTokAbort;
     }
-    EXPECT_EQ(r.done(last).status, rc::OpStatus::Ok) << "errorCode " << r.done(last).errorCode;
+    EXPECT_EQ(r.done(last).status, endStatus()) << "errorCode " << r.done(last).errorCode;
     ASSERT_TRUE(r.drive([&] { return r.p->state() == rc::TxnState::Ready; }));
     r.checkAllocs(is);
     r.checkExactlyOnce(is, true);
-    if (is.token != 0) EXPECT_EQ(statusOf(r, is), rc::OpStatus::Ok);
+    if (is.token != 0) EXPECT_EQ(statusOf(r, is), opStatus());
     checkVisible(true);   // every record exactly once: the re-sent batch was deduplicated by (pid, epoch, sequence)
     EXPECT_EQ(r.gw->visibleBatches(0, Gw::TxnFate::Open), 0u);
     if (isOffsets()) EXPECT_EQ((r.gw->committedOffsets[{kTopicId, 0}]), 5);
@@ -1102,7 +1162,7 @@ void CellRunner::txnRewind() {
     ASSERT_TRUE(r.drive([&] { return r.batchAcksCoverAccepted() && tokenDone(first); }));
     if (first.token != 0) {
         ASSERT_TRUE(r.await(kTokWarm) || !first.viaCq);
-        EXPECT_EQ(statusOf(r, first), rc::OpStatus::Ok);
+        EXPECT_EQ(statusOf(r, first), opStatus());
     }
     ASSERT_NO_FATAL_FAILURE(r.abortOk(kTokAbort));
     r.settle();
@@ -1142,7 +1202,7 @@ void CellRunner::txnRewind() {
     r.settle();
     r.checkAllocs(redo);
     r.checkExactlyOnce(redo, true);
-    if (redo.token != 0) EXPECT_EQ(statusOf(r, redo), rc::OpStatus::Ok);
+    if (redo.token != 0) EXPECT_EQ(statusOf(r, redo), opStatus());
     EXPECT_EQ(r.committed(0), Rig::sorted(r.expectVisible)) << "the redo is committed and visible exactly once";
     EXPECT_EQ(r.gw->visibleBatches(0, Gw::TxnFate::Aborted), abortedBatches) << "the aborted attempt stays aborted";
     EXPECT_EQ((r.gw->committedOffsets[{kTopicId, 0}]), 5) << "the group's committed offset advanced exactly by the redo";
@@ -1203,8 +1263,10 @@ TEST(TxnMatrixRegression, UnsentRecordsOfAPoisonedTxnCompleteAtOnceRegression) {
     }
     ASSERT_TRUE(done) << "the unsent record's token did not complete while the transaction waited for its abort";
     ASSERT_EQ(r.acks[kTokOp].size(), 1u);
+    const mx::Expected ex = mx::expected(mx::Op::TrySendAck, mx::Entity::TxnNewPartition, mx::Timing::AbortableError);
+    ASSERT_EQ(ex.opStatus, mx::Status::BrokerError);
     EXPECT_EQ(r.acks[kTokOp][0].status, rc::OpStatus::BrokerError);
-    EXPECT_EQ(r.acks[kTokOp][0].errorCode, 19);
+    EXPECT_EQ(r.acks[kTokOp][0].errorCode, ex.opCode);
     EXPECT_EQ(r.p->state(), rc::TxnState::AbortableError) << "no abort was issued: the transaction still waits for one";
     ASSERT_NO_FATAL_FAILURE(r.abortOk(kTokAbort));
     r.settle();

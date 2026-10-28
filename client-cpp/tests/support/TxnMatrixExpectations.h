@@ -2,7 +2,7 @@
 //
 // SINGLE SOURCE OF TRUTH for "what must happen when <op> is issued on <entity> at <timing>".  The unit matrix
 // (TxnMatrixTest, Task 12), the seeded stress model (Task 13) and the real-broker slice (Task 11) all read
-// expect() / naRule(); no test hard-codes an outcome.  The rules are the plan's "Interaction matrix" section
+// expect() / expected() / naRule(); no test hard-codes an outcome or a status code.  The rules are the plan's "Interaction matrix" section
 // (NA1-NA3, R1-R11) verbatim, top-down; header-only and constexpr so the cell counts are pinned at compile time
 // too.  Pure data: no dependency on the client.
 #pragma once
@@ -93,6 +93,60 @@ enum class Outcome : uint8_t {
     return Outcome::Delivered;
 }
 
+/// The completion status kinds the matrix expects (pure data: the test maps them to rune::client::OpStatus).
+enum class Status : uint8_t { Ok, BrokerError, Fenced };
+
+/// #369: everything an applicable cell asserts about status codes, derived from the cell's rule (R1..R11) - the single
+/// source the handlers read, so no handler hard-codes an op's status or code.
+///   opStatus / opCode   : how the op's own token completes (an offsets leg, or a data op that carries a token).  Refused
+///                         (R4-R6): the offsets leg completes BrokerError 19; a data op is refused synchronously and has
+///                         no completion (the code is the one the refusal carries).  R8: the op, when it was accepted,
+///                         completes with the poison (BrokerError 19).  R9: Fenced for an op that needs the coordinator
+///                         (an offsets leg, a new partition's data op); Ok for an added partition's data op (its batch
+///                         goes straight to the leader and is acknowledged before the coordinator reveals the fence).
+///                         The Fenced code is not pinned (0).
+///   endStatus / endCode : how the transaction's commit (R6: the commit issued before the op) and every later op of a
+///                         fenced producer complete: Ok, except R8 (BrokerError 19, the commit of a poisoned
+///                         transaction) and R9 (Fenced).
+struct Expected {
+    Outcome  outcome   = Outcome::Delivered;
+    Status   opStatus  = Status::Ok;
+    uint16_t opCode    = 0;
+    Status   endStatus = Status::Ok;
+    uint16_t endCode   = 0;
+    [[nodiscard]] constexpr bool operator==(const Expected&) const noexcept = default;
+};
+inline constexpr uint16_t kInvalidTxnState = 19;
+
+/// The expected outcome AND status codes of an APPLICABLE cell.
+[[nodiscard]] constexpr Expected expected(Op op, Entity e, Timing t) noexcept {
+    Expected x;
+    x.outcome = expect(op, e, t);
+    switch (x.outcome) {
+    case Outcome::Refused:
+        x.opStatus = Status::BrokerError;
+        x.opCode   = kInvalidTxnState;
+        break;
+    case Outcome::FailsTxn:
+        x.opStatus  = Status::BrokerError;
+        x.opCode    = kInvalidTxnState;
+        x.endStatus = Status::BrokerError;
+        x.endCode   = kInvalidTxnState;
+        break;
+    case Outcome::Fenced:
+        x.opStatus  = (op == Op::SendOffsets || e == Entity::TxnNewPartition) ? Status::Fenced : Status::Ok;
+        x.endStatus = Status::Fenced;
+        break;
+    default:   // R1-R3, R7, R10, R11: everything completes Ok
+        break;
+    }
+    return x;
+}
+
+[[nodiscard]] constexpr const char* name(Status s) noexcept {
+    constexpr const char* n[] = {"Ok", "BrokerError", "Fenced"};
+    return n[static_cast<uint8_t>(s)];
+}
 [[nodiscard]] constexpr const char* name(Op o) noexcept {
     constexpr const char* n[] = {"Send", "SendTo", "TrySendCq", "TrySendAck", "Batch",
                                  "TryClaim", "ClaimBatch", "TypedSend", "TypedClaim", "SendOffsets"};
