@@ -16,6 +16,9 @@
 #include <rune/client/producer/Producer.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/client/producer/ProducerImpl.h>
+#include <rune/client/producer/ProduceFrameBuilder.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/DataMessages.h>
 
 #include <gtest/gtest.h>
 
@@ -1386,3 +1389,358 @@ TEST(ProducerClaimAllocRegression, DirectClaimAbortAndDestructorAllocateNothingR
     EXPECT_EQ(alloc_counter::stop(), 0L) << "Invoker abort / destructor / refused claims must not allocate";
 }
 
+
+// ===========================================================================
+// C10 (#331): claim test gaps.  Every drive loop is iteration-capped; nothing sleeps.
+// ===========================================================================
+namespace {
+
+/// Acks every frame `cap` has offered that `acked` has not yet seen (baseOffset = 100 * frame index).
+void ackNewFrames(ProducerImpl& impl, const FrameCapture& cap, std::size_t& acked) {
+    while (acked < cap.corrs.size()) {
+        impl.onProduceResponse(cap.corrs[acked], static_cast<int64_t>(acked) * 100, 0);
+        ++acked;
+    }
+}
+
+bool containsRun(const std::vector<std::vector<uint8_t>>& frames, uint8_t b, std::size_t run) {
+    for (const auto& f : frames) {
+        std::size_t n = 0;
+        for (const uint8_t c : f) {
+            n = (c == b) ? n + 1 : 0;
+            if (n >= run) return true;
+        }
+    }
+    return false;
+}
+
+struct CloseTokenLog {
+    std::vector<rc::Completion> got;
+    static void fn(void* ctx, const rc::Completion& c, std::span<const uint8_t>) noexcept {
+        static_cast<CloseTokenLog*>(ctx)->got.push_back(c);
+    }
+    rc::CompletionHandler handler() { return rc::CompletionHandler{&CloseTokenLog::fn, this}; }
+};
+
+}  // namespace
+
+// #331: the pointer the caller wrote through IS the decoded record value of the captured frame (offset equality,
+// not range containment): no copy of the claim sits between the caller's span and the wire bytes.
+TEST(ProducerClaimRegression, ClaimedValueIsTheDecodedRecordValueRegression) {
+    DirectRig r;
+    FrameCapture cap;
+    cap.keepRaw = true;
+    rc::Claim a = r.p.tryClaim(kTopic, Key(uint64_t{5}), 4);
+    ASSERT_TRUE(a) << static_cast<int>(a.result());
+    fill(a.buffer(), "WXYZ");
+    const uint8_t* aPtr = a.buffer().data();
+    ASSERT_TRUE(a.commit());
+    rc::BatchClaim b = r.p.claimBatch(kTopic, Key(uint64_t{5}), 3, 2);
+    ASSERT_TRUE(b);
+    fill(b.record(0), "B1");
+    fill(b.record(1), "B2");
+    fill(b.record(2), "B3");
+    const uint8_t* bPtr[3] = {b.record(0).data(), b.record(1).data(), b.record(2).data()};
+    ASSERT_TRUE(b.commit());
+    r.pass(cap.fn());
+    ASSERT_EQ(cap.frames, 1);
+    ASSERT_EQ(cap.recs.size(), 4u);
+    EXPECT_EQ(cap.recs[0].value, "WXYZ");
+    EXPECT_EQ(cap.recs[0].frameBase + cap.recs[0].valueOffset, aPtr) << "the claim span IS the decoded value";
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(cap.recs[1 + i].frameBase + cap.recs[1 + i].valueOffset, bPtr[i]) << "batch record " << i;
+    }
+    // The frame bytes at that offset (the capture's own copy) carry the written value.
+    EXPECT_EQ(0, std::memcmp(cap.rawFrames[0].data() + cap.recs[0].valueOffset, "WXYZ", 4));
+}
+
+// #331: back-pressure loses nothing AND keeps every record's bytes and the claim order.
+TEST(ProducerClaimRegression, BackPressuredClaimsLandWholeAndInOrderRegression) {
+    auto* impl = new ProducerImpl(voidCfg(), 4 * 1024);
+    Producer p(impl);
+    std::vector<rc::Claim>   held;
+    std::vector<std::string> expect;
+    for (int i = 0; i < 10'000; ++i) {
+        rc::Claim c = p.tryClaim(kTopic, Key(uint64_t{7}), 64);
+        if (!c) {
+            ASSERT_EQ(c.result(), SendResult::BackPressured);
+            break;
+        }
+        const std::string v(64, static_cast<char>('a' + i % 26));
+        fill(c.buffer(), v);
+        expect.push_back(v);
+        held.push_back(std::move(c));
+    }
+    ASSERT_GT(expect.size(), 2u);
+    ASSERT_LT(expect.size(), 10'000u) << "a 4 KiB ring must fill";
+    for (auto& c : held) ASSERT_TRUE(c.commit());
+    FrameCapture cap;
+    pump(*impl, cap.fn());
+    EXPECT_EQ(cap.values(), expect) << "every record's bytes, in claim order";
+}
+
+// #331: a claim batch that sits in the ring under a full in-flight window (the builder is at batchBytes, so the
+// ring drain ABORTs at it) lands WHOLE - one RecordBatch, contiguous offsets, no foreign record between - once an
+// ack opens the window.
+TEST(ProducerClaimRegression, ARingHeldClaimBatchLandsWholeWhenTheWindowOpensRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks        = Acks::Leader;
+    cfg.maxInFlight = 1;
+    cfg.batchBytes  = 256;
+    auto* impl = new ProducerImpl(cfg, 64 * 1024);
+    Producer p(impl);
+    const Key key(uint64_t{2});
+    FrameCapture cap;
+    std::size_t  acked = 0;
+    ASSERT_EQ(p.trySend(kTopic, key, bytes("A")), SendResult::Ok);
+    pump(*impl, cap.fn());
+    ASSERT_EQ(cap.frames, 1) << "A is in flight: the window (1) is full";
+    int fillers = 0;
+    for (; fillers < 64; ++fillers) {  // fill the builder to batchBytes: the next ring record cannot be admitted
+        if (p.trySend(kTopic, key, std::vector<uint8_t>(40, 'F')) != SendResult::Ok) break;
+    }
+    ASSERT_GT(fillers, 0);
+    rc::BatchClaim b = p.claimBatch(kTopic, key, 3, 40);
+    ASSERT_TRUE(b) << static_cast<int>(b.result());
+    for (uint32_t i = 0; i < 3; ++i) std::memset(b.record(i).data(), 'x' + static_cast<int>(i), 40);
+    ASSERT_TRUE(b.commit());
+    pump(*impl, cap.fn());
+    EXPECT_EQ(cap.frames, 1) << "window full: nothing else leaves";
+    for (int i = 0; i < 64 && cap.recs.size() < static_cast<std::size_t>(1 + fillers + 3); ++i) {
+        ackNewFrames(*impl, cap, acked);
+        pump(*impl, cap.fn());
+    }
+    ASSERT_EQ(cap.recs.size(), static_cast<std::size_t>(1 + fillers + 3));
+    EXPECT_EQ(cap.recs[0].value, "A");
+    const std::size_t first = cap.recs.size() - 3;
+    for (std::size_t i = 1; i < first; ++i) EXPECT_EQ(cap.recs[i].value, std::string(40, 'F'));
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(cap.recs[first + i].value, std::string(40, static_cast<char>('x' + i))) << "claim order and bytes";
+        EXPECT_EQ(cap.recs[first + i].frame, cap.recs[first].frame) << "the claimed batch is never split";
+        EXPECT_EQ(cap.recs[first + i].offset, cap.recs[first].offset + i) << "contiguous offsets";
+    }
+}
+
+// #331: batchRecords: a claimBatch that would take an open RecordBatch over batchRecords flushes that batch first
+// and lands whole in the next one - in the ring (the drain holds it) and in Direct mode (BackPressured, retried).
+TEST(ProducerClaimRegression, ClaimBatchOverBatchRecordsFlushesRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.lingerUs     = 60'000'000;  // only the flush ends a batch
+    cfg.batchRecords = 3;
+    const Key key(uint64_t{2});
+    {   // Ring
+        auto* impl = new ProducerImpl(cfg, 64 * 1024);
+        Producer p(impl);
+        ASSERT_EQ(p.trySend(kTopic, key, bytes("A")), SendResult::Ok);
+        ASSERT_EQ(p.trySend(kTopic, key, bytes("B")), SendResult::Ok);
+        rc::BatchClaim b = p.claimBatch(kTopic, key, 2, 2);  // 2 + 2 > batchRecords (3)
+        ASSERT_TRUE(b);
+        fill(b.record(0), "C1");
+        fill(b.record(1), "C2");
+        ASSERT_TRUE(b.commit());
+        p.flush();
+        FrameCapture cap;
+        pump(*impl, cap.fn());
+        ASSERT_EQ(cap.values(), (std::vector<std::string>{"A", "B", "C1", "C2"}));
+        EXPECT_EQ(cap.frames, 2);
+        EXPECT_EQ(cap.recs[0].frame, cap.recs[1].frame);
+        EXPECT_EQ(cap.recs[2].frame, cap.recs[3].frame) << "the claimed batch is whole";
+        EXPECT_NE(cap.recs[1].frame, cap.recs[2].frame) << "A,B were flushed before it";
+        EXPECT_EQ(cap.recs[2].offset, 0);
+        EXPECT_EQ(cap.recs[3].offset, 1);
+    }
+    {   // Direct
+        DirectRig r(cfg);
+        ASSERT_EQ(r.p.trySend(kTopic, key, bytes("A")), SendResult::Ok);
+        ASSERT_EQ(r.p.trySend(kTopic, key, bytes("B")), SendResult::Ok);
+        FrameCapture cap;
+        EXPECT_EQ(r.p.claimBatch(kTopic, key, 2, 2).result(), SendResult::BackPressured);
+        r.pass(cap.fn());  // the refused claim requested the flush
+        ASSERT_EQ(cap.frames, 1);
+        rc::BatchClaim b = r.p.claimBatch(kTopic, key, 2, 2);
+        ASSERT_TRUE(b) << static_cast<int>(b.result());
+        fill(b.record(0), "C1");
+        fill(b.record(1), "C2");
+        ASSERT_TRUE(b.commit());
+        r.p.flush();
+        r.pass(cap.fn());
+        ASSERT_EQ(cap.values(), (std::vector<std::string>{"A", "B", "C1", "C2"}));
+        EXPECT_EQ(cap.frames, 2);
+        EXPECT_EQ(cap.recs[2].frame, cap.recs[3].frame);
+        EXPECT_NE(cap.recs[1].frame, cap.recs[2].frame);
+    }
+}
+
+// #331: Invoker mode, a Tier-2 batch queued while a Direct claim is open: nothing leaves (the half-written claim
+// is never flushed), and once the claim settles the order is the submission order (A, the claim, then the batch).
+TEST(ProducerClaimRegression, Tier2BatchQueuedBehindADirectClaimSendsAfterItSettlesRegression) {
+    DirectRig r;
+    const Key key(uint64_t{5});
+    ASSERT_EQ(r.p.trySend(kTopic, key, bytes("A")), SendResult::Ok);
+    rc::Claim c = r.p.tryClaim(kTopic, key, 4);
+    ASSERT_TRUE(c) << static_cast<int>(c.result());
+    auto t2 = r.p.batch(kTopic, key);
+    t2.add(bytes("X"));
+    t2.add(bytes("Y"));
+    ASSERT_EQ(t2.send(), rc::OpResult::Accepted);
+    FrameCapture cap;
+    r.pass(cap.fn());
+    EXPECT_EQ(cap.frames, 0) << "an open claim is never flushed half-written, and nothing overtakes it";
+    fill(c.buffer(), "CCCC");
+    ASSERT_TRUE(c.commit());
+    for (int i = 0; i < 8; ++i) r.pass(cap.fn());
+    EXPECT_EQ(cap.values(), (std::vector<std::string>{"A", "CCCC", "X", "Y"}));
+}
+
+// #331: closeImmediately() from inside an ack handler (the pendingFail_ path): the walk that fired the handler
+// finishes first, then every still-pending acked record - sent-unacked, queued and a committed claim - fails
+// exactly once, an open claim is abandoned, and nothing more leaves.
+TEST(ProducerClaimRegression, CloseImmediatelyFromAHandlerFailsPendingClaimsRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks        = Acks::Leader;
+    cfg.maxInFlight = 1;
+    DirectRig r(cfg);
+    test_support::AckLedger L;
+    struct Ctx {
+        Producer*                p = nullptr;
+        test_support::AckLedger* L = nullptr;
+        int                      calls = 0;
+    } ctx{&r.p, &L};
+    r.p.onAck(
+        [](void* c, rc::Token t, int64_t v, rc::OpStatus st, uint16_t ec) noexcept {
+            auto* x = static_cast<Ctx*>(c);
+            test_support::AckLedger::onAck(x->L, t, v, st, ec);
+            if (x->calls++ == 0) (void)x->p->closeImmediately();  // the first completion closes the producer
+        },
+        &ctx);
+    const Key key(uint64_t{1});
+    FrameCapture cap;
+    r.pass(cap.fn());
+    ASSERT_EQ(r.p.trySend(kTopic, key, bytes("A"), rc::AckToken{1}), SendResult::Ok);
+    r.pass(cap.fn());
+    ASSERT_EQ(cap.frames, 1) << "A is in flight (window 1)";
+    ASSERT_EQ(r.p.trySend(kTopic, key, bytes("B"), rc::AckToken{2}), SendResult::Ok);  // queued behind the window
+    {
+        rc::Claim c3 = r.p.tryClaim(kTopic, key, 1, rc::AckToken{3});
+        ASSERT_TRUE(c3);
+        c3.buffer()[0] = 'C';
+        ASSERT_TRUE(c3.commit());
+    }
+    rc::Claim open = r.p.tryClaim(kTopic, key, 1, rc::AckToken{4});  // still open when the handler fires
+    ASSERT_TRUE(open);
+    r.pass(cap.fn());
+    ASSERT_EQ(cap.frames, 1);
+
+    r.impl->onProduceResponse(cap.corrs[0], 10, 0);  // A's ack -> handler -> closeImmediately()
+    EXPECT_EQ(ctx.calls, 3) << "A (Ok) then B and the committed claim failed by the deferred fail-all";
+    EXPECT_EQ(L.times(1), 1);
+    EXPECT_EQ(L.last[1].status, rc::OpStatus::Ok);
+    for (const rc::Token t : {rc::Token{2}, rc::Token{3}}) {
+        EXPECT_EQ(L.times(t), 1) << "token " << t << " completes exactly once";
+        EXPECT_NE(L.last[t].status, rc::OpStatus::Ok) << "token " << t;
+    }
+    EXPECT_EQ(L.times(4), 0) << "an uncommitted claim was never accepted: no completion";
+    EXPECT_FALSE(open.commit()) << "abandoned by the close";
+    r.pass(cap.fn());
+    EXPECT_EQ(cap.frames, 1) << "nothing is sent after the close";
+    EXPECT_EQ(r.p.trySend(kTopic, key, bytes("late"), rc::AckToken{5}), SendResult::Closed);
+    EXPECT_EQ(L.times(5), 0);
+}
+
+// #331: a recycled in-flight buffer (garbage from earlier, larger frames) never reaches the next Direct claim's
+// frame: its bytes equal a frame built from scratch by the protocol encoders (header, record framing,
+// headerCount - every byte).
+TEST(ProducerClaimRegression, DirectClaimAfterARecycledBufferIsByteExactRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks        = Acks::Leader;
+    cfg.maxInFlight = 2;  // two slots: from the third frame on, the builder is handed a slot's earlier (0xEE-filled) frame
+    DirectRig r(cfg);
+    const Key key(uint64_t{9});
+    FrameCapture cap;
+    cap.keepRaw = true;
+    std::size_t acked = 0;
+    for (int round = 0; round < 8; ++round) {  // big 0xEE frames: the slots' buffers hold garbage once recycled
+        rc::Claim c = r.p.tryClaim(kTopic, key, 300, rc::AckToken{static_cast<uint64_t>(round + 1)});
+        ASSERT_TRUE(c) << "round " << round;
+        std::memset(c.buffer().data(), 0xEE, c.buffer().size());
+        ASSERT_TRUE(c.commit());
+        r.pass(cap.fn());
+        ackNewFrames(*r.impl, cap, acked);
+    }
+    ASSERT_EQ(acked, 8u);
+    rc::Claim last = r.p.tryClaim(kTopic, key, 10, rc::AckToken{99});
+    ASSERT_TRUE(last);
+    fill(last.buffer(), "0123456789");
+    ASSERT_TRUE(last.commit());
+    r.pass(cap.fn());
+    ASSERT_EQ(cap.frames, 9);
+    const std::vector<uint8_t>& got = cap.rawFrames.back();
+    const auto                  v   = rc::codec::decodeProduce(got.data(), got.size());
+    ASSERT_TRUE(v.has_value());
+    rune::protocol::RecordBatchReader rd(v->recordBatch.data(), v->recordBatch.size());
+    ASSERT_EQ(rd.recordCount(), 1);
+    // The expected frame, from scratch: the same record through a fresh builder + the decoded Produce header.
+    rune::protocol::client::Produce hdr;
+    hdr.sessionId      = v->sessionId;
+    hdr.correlationId  = v->correlationId;
+    hdr.topicId        = v->topicId;
+    hdr.partition      = v->partition;
+    hdr.partitionKnown = v->partitionKnown;
+    hdr.acks           = v->acks;
+    hdr.producerId     = v->producerId;
+    hdr.producerEpoch  = v->producerEpoch;
+    hdr.baseSequence   = v->baseSequence;
+    rc::producer::ProduceFrameBuilder fresh(0, rd.baseTimestamp());
+    const auto kb = key.bytes();
+    fresh.append(std::string_view(reinterpret_cast<const char*>(kb.data()), kb.size()), "0123456789",
+                 rd.baseTimestamp());
+    fresh.setProducerId(v->producerId);
+    fresh.setProducerEpoch(v->producerEpoch);
+    fresh.setBaseSequence(v->baseSequence);
+    const std::size_t len = fresh.seal(hdr);
+    ASSERT_EQ(len, got.size());
+    rc::transport::sealFrame(fresh.data(), len, rc::producer::ProduceFrameBuilder::frameCrc());  // the accepted offer's CRC
+    std::size_t firstDiff = len;
+    for (std::size_t i = 0; i < len; ++i) {
+        if (fresh.data()[i] != got[i]) { firstDiff = i; break; }
+    }
+    EXPECT_EQ(firstDiff, len) << "the claim frame is byte-exact (first differing byte, of " << len
+                              << "; batch starts at " << rc::producer::ProduceFrameBuilder::kBatchStart
+                              << ", records at " << rc::producer::ProduceFrameBuilder::kRecordsStart
+                              << "; got=" << static_cast<int>(firstDiff < len ? got[firstDiff] : 0)
+                              << " want=" << static_cast<int>(firstDiff < len ? fresh.data()[firstDiff] : 0) << ")";
+}
+
+// #331: the close path (begin-close -> abandonOpenClaimForClose, as Producer::close() / Client::close() do): the
+// caller keeps writing its span AFTER the close was issued; the drain delivers the records before the claim and no
+// offered frame ever contains the written pattern.
+TEST(ProducerClaimRegression, WritingAnAbandonedClaimSpanAfterCloseNeverReachesAFrameRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.acks = Acks::Leader;
+    DirectRig r(cfg);
+    const Key key(uint64_t{1});
+    ASSERT_EQ(r.p.trySend(kTopic, key, bytes("A"), rc::AckToken{1}), SendResult::Ok);
+    rc::Claim c = r.p.tryClaim(kTopic, key, 64);
+    ASSERT_TRUE(c);
+    CloseTokenLog closeLog;
+    ASSERT_EQ(r.impl->beginClose(rc::CompletionTarget(closeLog.handler()), 9), rc::OpResult::Accepted);
+    r.impl->abandonOpenClaimForClose();  // what Producer::close() does once the close is issued
+    ASSERT_EQ(r.impl->claimsAbandoned(), 1u);
+    std::memset(c.buffer().data(), 0xAB, c.buffer().size());  // written after the abandon
+
+    FrameCapture cap;
+    cap.keepRaw = true;
+    std::size_t acked = 0;
+    for (int i = 0; i < 16 && closeLog.got.empty(); ++i) {
+        r.pass(cap.fn());
+        ackNewFrames(*r.impl, cap, acked);
+        if (!r.impl->lifeOpen()) (void)r.impl->closeDuty(kNow);  // the hub's drain check
+    }
+    std::memset(c.buffer().data(), 0xAB, c.buffer().size());  // and again while the drain is finishing
+    r.pass(cap.fn());
+    EXPECT_EQ(cap.values(), std::vector<std::string>{"A"}) << "the record before the claim drains";
+    EXPECT_FALSE(containsRun(cap.rawFrames, 0xAB, 8)) << "the abandoned span never reaches a frame";
+    ASSERT_EQ(closeLog.got.size(), 1u);
+    EXPECT_EQ(closeLog.got[0].status, rc::OpStatus::Ok);
+    EXPECT_FALSE(c.commit());
+}

@@ -390,3 +390,83 @@ TEST(GatewayCryptoRegression, AKeyedWaveWithoutAKeyStillDropsAtOnceRegression) {
     EXPECT_EQ(w.intakeKeyHoldsForTest(), 0u);
     EXPECT_EQ(w.decryptFailuresForTest(), 1u);
 }
+
+// ── #535: the announcer's receiver-key derivation fails ──────────────────────────────────────────────────────────────
+
+namespace {
+/// A derivation that fails for ONE worker (id 1 = worker 0) and is the real one for every other id.
+bool deriveFailsForWorkerZero(const cr::AeadKey& c2b, uint8_t receiverId, cr::AeadKey& out) noexcept {
+    return receiverId != 1 && cr::deriveReceiverKey(c2b, receiverId, out);
+}
+}  // namespace
+
+// SessionAnnouncer::announce derives each worker's receiver key; when that fails for worker w it must ship NO key for w
+// (c2bKeyValid false: a half-derived key is never shipped) and the worker must refuse the session's encrypted produce -
+// a frame sealed under the real key, one sealed under the all-zero key a half-derived announce would have shipped, and a
+// plaintext frame are ALL dropped (counted), nothing is appended, nothing is held as "key pending", and no frame is ever
+// decoded as plaintext.  The announce itself still completes (the other workers are unaffected).
+// RED (mutation): `op.c2bKeyValid = true` on the failure branch - the worker then installs the zero key and opens the
+// frame sealed under it, which is appended.
+TEST(GatewayCryptoRegression, AnnouncerDeriveFailureFailsClosedAdversarialRegression) {
+    {   // One worker, whose derivation fails: nothing it receives is appended.
+        GatewayProduceRig r{ProduceTopicMode::StaticRouted};
+        SessionKeys k;
+        installGatewayCrypto(*r.gw.sessionCryptoForTest(r.sid), k, pc::kClientVersion);
+        rune::node::SessionAnnouncer ann(/*grantAll=*/true);
+        ann.setDeriveReceiverKeyForTest(&deriveFailsForWorkerZero);
+        ASSERT_TRUE(ann.announce(r.pool, r.sid, "aeron:ipc", 7, pc::kClientVersion, /*sessionEncrypted=*/true,
+                                 /*keyReady=*/true, k.b2c, k.b2cPrefix, kCipher, k.c2b, k.c2bPrefix))
+            << "a failed derivation for one worker still completes the announce (fail closed at that worker)";
+        r.pass();
+        auto& w = r.pool.worker(0);
+        ASSERT_TRUE(w.sessionCryptoLookupForTest(r.sid)) << "the session is announced as ENCRYPTED, never as plaintext";
+        const int64_t before = records(r);
+
+        // 1. What an honest client sends: sealed for receiver 1 under the real derived key.  The worker holds no key.
+        const auto honest = sealFor(k.receiverKey(1), k.c2bPrefix, /*receiverId=*/1, /*seq=*/1, r.produceFrame(700));
+        EXPECT_EQ(w.handleIngressFrameForTest(honest.data(), honest.size(), r.now), 0) << "no key: dropped, not held";
+        EXPECT_EQ(w.decryptFailuresForTest(), 1u);
+        EXPECT_EQ(w.intakeKeyHoldsForTest(), 0u) << "a derivation failure is not a key still on its way";
+        // 2. The key a broker that shipped the failed derivation would hold: all zero bytes (derive leaves `out` as is).
+        const auto underZero = sealFor(cr::AeadKey{}, k.c2bPrefix, /*receiverId=*/1, /*seq=*/2, r.produceFrame(701));
+        EXPECT_EQ(w.handleIngressFrameForTest(underZero.data(), underZero.size(), r.now), 0)
+            << "a frame sealed under the zero key must not open: no half-derived key was installed";
+        EXPECT_EQ(w.decryptFailuresForTest(), 2u);
+        // 3. The same produce in the clear, for the encrypted session: refused, never decoded as plaintext.
+        const auto plainFrame = r.produceFrame(702);
+        EXPECT_EQ(w.handleIngressFrameForTest(plainFrame.data(), plainFrame.size(), r.now), 0);
+        for (int i = 0; i < 4; ++i) r.pass();
+        EXPECT_EQ(records(r), before) << "a frame was appended by a worker whose receiver key never derived";
+    }
+    {   // Two workers: only worker 0's derivation fails; worker 1 gets its own key and opens its frame.
+        rune::node::WorkerPool pool{2, rune::metadata::ShardRouter(2), 1 << 22, 1 << 25, 64, 64};
+        pool.setRunnersStartedForTest(true);
+        SessionKeys k;
+        constexpr int64_t kSid = 78;
+        rune::node::SessionAnnouncer ann(/*grantAll=*/true);
+        ann.setDeriveReceiverKeyForTest(&deriveFailsForWorkerZero);
+        ASSERT_TRUE(ann.announce(pool, kSid, "aeron:ipc", 7, pc::kClientVersion, true, true, k.b2c, k.b2cPrefix, kCipher,
+                                 k.c2b, k.c2bPrefix));
+        for (int i = 0; i < 4; ++i) { (void)pool.worker(0).doWork(1'000 + i); (void)pool.worker(1).doWork(1'000 + i); }
+        ASSERT_TRUE(pool.worker(0).sessionCryptoLookupForTest(kSid));
+        ASSERT_TRUE(pool.worker(1).sessionCryptoLookupForTest(kSid));
+
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.append("k", "v", 1000);
+        const auto batch = b.build();
+        pc::Produce m;
+        m.sessionId = kSid; m.correlationId = 1; m.topicId = 0; m.partition = 0; m.partitionKnown = 1;
+        m.acks = 0; m.producerId = -1; m.producerEpoch = 0; m.baseSequence = -1;
+        m.recordBatch = std::span<const uint8_t>(batch);
+        std::vector<uint8_t> plain(m.encodedSize());
+        m.encode(plain.data());
+
+        const auto forW0 = sealFor(k.receiverKey(1), k.c2bPrefix, 1, 1, plain);
+        EXPECT_EQ(pool.worker(0).handleIngressFrameForTest(forW0.data(), forW0.size(), 2'000), 0);
+        EXPECT_EQ(pool.worker(0).decryptFailuresForTest(), 1u) << "worker 0 has no key: its own frame fails the AEAD";
+        const auto forW1 = sealFor(k.receiverKey(2), k.c2bPrefix, 2, 1, plain);
+        (void)pool.worker(1).handleIngressFrameForTest(forW1.data(), forW1.size(), 2'001);
+        EXPECT_EQ(pool.worker(1).decryptFailuresForTest(), 0u) << "worker 1's derivation worked: its frame opens";
+        EXPECT_EQ(pool.worker(1).c2bWrongReceiverDropsForTest(), 0u);
+    }
+}

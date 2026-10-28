@@ -231,3 +231,89 @@ TEST(ProduceFrameBuilderRegression, GarbageInRecycledStorageNeverReachesTheSeale
         ASSERT_EQ(std::vector<uint8_t>(fb.data(), fb.data() + len), expect) << "iter=" << iter;
     }
 }
+
+// #333: a rolled-back reservation leaves NO trace — the frame sealed after
+// append(r1), mark, reserve(r2), rollback, append(r3) equals the frame of a builder that never saw r2
+// (record count, offsetDelta of r3, maxTimestamp, bytes).
+TEST(ProduceFrameBuilderRegression, AppendAfterRollbackMatchesANeverReservedBuilderRegression) {
+    const int64_t base = 5000;
+    rpc::Produce hdr{};
+    hdr.partitionKnown = 1;
+    {
+        ProduceFrameBuilder x(0, base);
+        x.append("k1", "value-one", base + 1);
+        const ProduceFrameBuilder::Mark m = x.mark();
+        const std::size_t at = x.reserveRecord("k2", 64, base + 9'000);  // later max timestamp
+        std::memset(x.data() + at, 0xAB, 64);
+        x.rollback(m);
+        x.append("k3", "value-three", base + 3);
+        ProduceFrameBuilder y(0, base);
+        y.append("k1", "value-one", base + 1);
+        y.append("k3", "value-three", base + 3);
+        ASSERT_EQ(x.recordCount(), 2);
+        ASSERT_EQ(x.recordCount(), y.recordCount());
+        const std::size_t lx = x.seal(hdr);
+        const std::size_t ly = y.seal(hdr);
+        ASSERT_EQ(lx, ly);
+        EXPECT_EQ(0, std::memcmp(x.data(), y.data(), lx));
+        // r3's offsetDelta really is 1 (not 2): decode it back.
+        rune::protocol::RecordBatchReader rd(x.data() + ProduceFrameBuilder::kBatchStart,
+                                             lx - ProduceFrameBuilder::kBatchStart);
+        EXPECT_EQ(rd.maxTimestamp(), base + 3);
+    }
+    {   // Mark taken at the empty batch.
+        ProduceFrameBuilder x(0, base);
+        const ProduceFrameBuilder::Mark m = x.mark();
+        (void)x.reserveRecord("zz", 10, base + 77);
+        x.rollback(m);
+        x.append("k1", "value-one", base + 1);
+        ProduceFrameBuilder y(0, base);
+        y.append("k1", "value-one", base + 1);
+        const std::size_t lx = x.seal(hdr);
+        const std::size_t ly = y.seal(hdr);
+        ASSERT_EQ(lx, ly);
+        EXPECT_EQ(0, std::memcmp(x.data(), y.data(), lx));
+    }
+}
+
+// #333: reserveExtra(kRecordOverheadMax + key + value) must cover the WORST record framing.  The worst a record
+// can cost: a 2^27-byte value (5-byte length + 5-byte valueLen varints), a 1 MiB key (3-byte keyLen) and a
+// timestamp delta of 2^62 (10-byte varlong) = 26 of the 32 bytes.  (A 5-byte varint needs a value >= 2^27; the
+// frame is only resized, never touched, so the 128 MiB stays virtual.)
+TEST(ProduceFrameBuilderRegression, ReserveExtraBoundHoldsAtMaximumRecordOverheadRegression) {
+    struct Case { std::size_t keyLen, valueLen; int64_t tsDelta; };
+    const Case cases[] = {
+        {0, 0, 0},
+        {1, 63, 1},
+        {200, 100'000, int64_t{1} << 40},
+        {1u << 20, 1u << 27, int64_t{1} << 62},
+    };
+    for (const Case& c : cases) {
+        ProduceFrameBuilder fb(0, 0);
+        const std::string key(c.keyLen, 'k');
+        const std::size_t bound = ProduceFrameBuilder::kRecordOverheadMax + c.keyLen + c.valueLen;
+        fb.reserveExtra(bound);
+        const uint8_t*    d      = fb.data();
+        const std::size_t before = fb.size();
+        const std::size_t at     = fb.reserveRecord(key, c.valueLen, c.tsDelta);
+        EXPECT_EQ(fb.data(), d) << "reserveExtra(bound) must keep data() stable, keyLen=" << c.keyLen;
+        const std::size_t written = fb.size() - before;
+        EXPECT_LE(written, bound) << "record framing exceeds kRecordOverheadMax, keyLen=" << c.keyLen;
+        EXPECT_EQ(at + c.valueLen + 1, fb.size());
+    }
+}
+
+#if GTEST_HAS_DEATH_TEST
+// #333: a Mark taken AFTER the current end (stale / larger) must be refused, not silently grow the frame over
+// unwritten bytes.  Debug builds assert; release builds (no assert, no hot-path branch) skip the statement.
+TEST(ProduceFrameBuilderRegression, RollbackToAStaleLargerMarkIsRefusedRegression) {
+    ProduceFrameBuilder fb(0, 0);
+    fb.append("k", "v", 1);
+    const ProduceFrameBuilder::Mark small = fb.mark();
+    (void)fb.reserveRecord("k", 500, 2);
+    const ProduceFrameBuilder::Mark stale = fb.mark();
+    fb.rollback(small);
+    fb.reserveExtra(4096);  // release builds: the stale grow stays inside capacity (no throw from noexcept)
+    EXPECT_DEBUG_DEATH(fb.rollback(stale), "stale Mark");
+}
+#endif

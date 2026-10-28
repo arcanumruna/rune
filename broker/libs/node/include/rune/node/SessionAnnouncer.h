@@ -135,7 +135,7 @@ public:
                     clientVersion, rune::protocol::client::kBrokerVersion);
                 rune::crypto::AeadKey ingressKey{};
                 const bool ok = receiverKeys
-                    ? rune::crypto::deriveReceiverKey(c2b, static_cast<uint8_t>(w + 1), ingressKey)
+                    ? deriveReceiverKey_(c2b, static_cast<uint8_t>(w + 1), ingressKey)
                     : (std::memcpy(ingressKey.bytes, c2b.bytes, 32), true);
                 op.c2bKeyValid = ok;
                 if (ok) {
@@ -196,6 +196,13 @@ public:
     /// announced session is denied until its PermissionShipper update lands.  Set ONCE from the gateway's auth mode
     /// (setAuthMode / the gateway constructor); the default is false (deny): an announcer that forgets fails closed.
     void setGrantAll(bool grantAll) noexcept { grantAll_ = grantAll; }
+
+    /// The receiver-key derivation signature (rune::crypto::deriveReceiverKey).
+    using DeriveReceiverKeyFn = bool (*)(const rune::crypto::AeadKey&, uint8_t, rune::crypto::AeadKey&) noexcept;
+    /// Test seam (#535, cold path - a session announce): replaces the derivation so a test can make it fail for one
+    /// worker id and prove the announce fails closed (`c2bKeyValid` false, no key shipped).  A plain per-instance function
+    /// pointer: no global, no thread_local, one indirect call per worker per announce.
+    void setDeriveReceiverKeyForTest(DeriveReceiverKeyFn f) noexcept { deriveReceiverKey_ = f; }
     [[nodiscard]] bool grantAll() const noexcept { return grantAll_; }
 
     static constexpr std::size_t kBacklogWarnAt = 1024;
@@ -224,6 +231,7 @@ private:
     std::vector<Closing>    closing_;
     std::size_t             closeWarnAt_ = kBacklogWarnAt;
     bool                    grantAll_ = false;   // default deny (Task 14); the gateway sets it explicitly
+    DeriveReceiverKeyFn     deriveReceiverKey_ = &rune::crypto::deriveReceiverKey;   // #535 test seam
 };
 
 } // namespace rune::node

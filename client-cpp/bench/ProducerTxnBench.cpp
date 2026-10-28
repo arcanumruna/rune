@@ -146,7 +146,7 @@ struct Duty {
         return rp::CoordinatorSink::Offer::Accepted;
     }
     static int64_t session(void*) noexcept { return 77; }
-    static void    rediscover(void*) noexcept {}
+    static bool    rediscover(void*) noexcept { return true; }   // #376: CoordinatorSink::rediscover returns bool now (the bench did not build)
 
     void run() {
         rp::ProducerHub hub;

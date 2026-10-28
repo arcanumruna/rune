@@ -311,6 +311,10 @@ struct CryptoState {
     // per receiver per session).  Populated alongside `send` in finishHandshake_.
     rune::crypto::AeadKey c2bKey{};
     uint8_t               c2bPrefix[rune::crypto::kNoncePrefix] = {};
+    // #535 test seam (cold path: the FIRST derivation per receiver slot): the receiver-key derivation selectSendSlot
+    // uses.  Production never changes it; a test installs a failing one to prove an underivable key seals nothing.
+    bool (*deriveReceiverKeyFn)(const rune::crypto::AeadKey&, uint8_t, rune::crypto::AeadKey&) noexcept =
+        &rune::crypto::deriveReceiverKey;
     struct ReceiverSend {
         std::optional<rune::crypto::AeadCipher> cipher;
         uint64_t sendSeq = 0;

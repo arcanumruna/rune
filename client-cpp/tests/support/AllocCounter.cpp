@@ -11,6 +11,7 @@ std::atomic<bool> g_on{false};
 std::atomic<long> g_count{0};
 thread_local bool t_on    = false;  // test instrumentation (startThisThread)
 thread_local long t_count = 0;
+thread_local long t_ext   = 0;  // the part of t_count that came from noteExternal()
 } // namespace
 
 void* operator new(std::size_t n) {
@@ -64,10 +65,19 @@ long stop() noexcept {
 }
 void startThisThread() noexcept {
     t_count = 0;
+    t_ext   = 0;
     t_on    = true;
 }
 long stopThisThread() noexcept {
     t_on = false;
     return t_count;
 }
+void noteExternal() noexcept {
+    if (g_on.load(std::memory_order_relaxed)) g_count.fetch_add(1, std::memory_order_relaxed);
+    if (t_on) {
+        ++t_count;
+        ++t_ext;
+    }
+}
+long externalThisThread() noexcept { return t_ext; }
 } // namespace alloc_counter

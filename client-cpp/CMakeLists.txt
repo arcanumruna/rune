@@ -893,6 +893,45 @@ if((BUILD_TESTING OR BUILD_BENCHMARKS) AND NOT TARGET generate_characters_header
     add_custom_target(generate_characters_header DEPENDS "${CHARACTERS_GEN_H}")
 endif()
 
+# ── Hand-rolled benches (no google-benchmark) ────────────────────────────────
+# Built with BUILD_BENCHMARKS and ALSO with BUILD_TESTING (#376): each one has a tiny-size smoke ctest
+# (ClientBenchSmokeRegression.*, below) so a bench that stops building, crashes or fails its own gate turns the suite red
+# instead of rotting until the next manual benchmark run.  The google-benchmark ones stay in the block below.
+if((BUILD_BENCHMARKS OR BUILD_TESTING) AND aeron_FOUND)
+    # F8c C6 — acked producer path (token acks) micro-bench (in-process, no Aeron)
+    add_executable(rune_producer_acked_bench bench/ProducerAckedBench.cpp)
+    target_include_directories(rune_producer_acked_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_producer_acked_bench PRIVATE rune_client_api rune_client_producer)
+
+    # F8c C7 — the producer hot path THROUGH THE HANDLE (Producer::trySend, void + acked)
+    add_executable(rune_shard_route_bench bench/ShardRouteBench.cpp)
+    target_include_directories(rune_shard_route_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_shard_route_bench PRIVATE rune_client_api)
+
+    add_executable(rune_producer_handle_bench bench/ProducerHandleBench.cpp)
+    target_include_directories(rune_producer_handle_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_producer_handle_bench PRIVATE rune_client_api rune_client_producer)
+
+    # Phase 2b Part B — zero-copy produce gate: send vs tryClaim vs typed send vs
+    # typed claim (p50/p99 + steady-state allocations; exit 1 if a claim form allocates)
+    add_executable(rune_producer_claim_bench bench/ProducerClaimBench.cpp tests/support/AllocCounter.cpp)
+    target_include_directories(rune_producer_claim_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${RUNE_CLAIM_GEN_DIR})
+    target_link_libraries(rune_producer_claim_bench PRIVATE rune_client_api rune_client_producer)
+    add_dependencies(rune_producer_claim_bench generate_claim_schema_headers)
+
+    # Phase 2b F Task 14 — transactional vs plain acked on every produce path (p50/p99, records/s, 0 allocations)
+    add_executable(rune_producer_txn_bench bench/ProducerTxnBench.cpp tests/support/AllocCounter.cpp)
+    target_include_directories(rune_producer_txn_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${RUNE_CLAIM_GEN_DIR})
+    target_link_libraries(rune_producer_txn_bench PRIVATE rune_client_api rune_client_producer)
+    add_dependencies(rune_producer_txn_bench generate_claim_schema_headers)
+
+    # F8c C1(a) — M2ORingBuffer tryClaim/commit micro-bench (producer hot path)
+    add_executable(rune_m2o_claim_bench
+        bench/M2OClaimBench.cpp
+    )
+    target_link_libraries(rune_m2o_claim_bench PRIVATE rune_client_producer)
+endif()
+
 # ── Benchmarks ────────────────────────────────────────────────────────────────
 if(BUILD_BENCHMARKS AND aeron_FOUND)
     add_executable(rune_client_bench
@@ -950,32 +989,11 @@ if(BUILD_BENCHMARKS AND aeron_FOUND)
         endif()
     endif()
 
-    # F8c C6 — acked producer path (token acks) micro-bench (in-process, no Aeron)
-    add_executable(rune_producer_acked_bench bench/ProducerAckedBench.cpp)
-    target_include_directories(rune_producer_acked_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE})
-    target_link_libraries(rune_producer_acked_bench PRIVATE rune_client_api rune_client_producer)
-
-    # F8c C7 — the producer hot path THROUGH THE HANDLE (Producer::trySend, void + acked)
-    add_executable(rune_shard_route_bench bench/ShardRouteBench.cpp)
-    target_include_directories(rune_shard_route_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE})
-    target_link_libraries(rune_shard_route_bench PRIVATE rune_client_api)
-
-    add_executable(rune_producer_handle_bench bench/ProducerHandleBench.cpp)
-    target_include_directories(rune_producer_handle_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE})
-    target_link_libraries(rune_producer_handle_bench PRIVATE rune_client_api rune_client_producer)
-
     # LAT-1 h/i/j (backlog B) — producer encode + CRC cost under back-pressure
     add_executable(rune_producer_encode_bench bench/ProducerEncodeBench.cpp)
     target_include_directories(rune_producer_encode_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     target_link_libraries(rune_producer_encode_bench PRIVATE
         rune_client_api rune_client_producer benchmark::benchmark)
-
-    # Phase 2b Part B — zero-copy produce gate: send vs tryClaim vs typed send vs
-    # typed claim (p50/p99 + steady-state allocations; exit 1 if a claim form allocates)
-    add_executable(rune_producer_claim_bench bench/ProducerClaimBench.cpp tests/support/AllocCounter.cpp)
-    target_include_directories(rune_producer_claim_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${RUNE_CLAIM_GEN_DIR})
-    target_link_libraries(rune_producer_claim_bench PRIVATE rune_client_api rune_client_producer)
-    add_dependencies(rune_producer_claim_bench generate_claim_schema_headers)
 
     # Phase 2b Part C — TypedTopic::send keyed-routing cost (in-process, no Aeron)
     add_executable(rune_typed_topic_send_bench bench/TypedTopicSendBench.cpp)
@@ -986,18 +1004,6 @@ if(BUILD_BENCHMARKS AND aeron_FOUND)
         ${RUNE_PROTOCOL_INCLUDE}
         "${CMAKE_CURRENT_BINARY_DIR}/gen")
     target_link_libraries(rune_typed_topic_send_bench PRIVATE rune_codec benchmark::benchmark)
-
-    # Phase 2b F Task 14 — transactional vs plain acked on every produce path (p50/p99, records/s, 0 allocations)
-    add_executable(rune_producer_txn_bench bench/ProducerTxnBench.cpp tests/support/AllocCounter.cpp)
-    target_include_directories(rune_producer_txn_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${RUNE_CLAIM_GEN_DIR})
-    target_link_libraries(rune_producer_txn_bench PRIVATE rune_client_api rune_client_producer)
-    add_dependencies(rune_producer_txn_bench generate_claim_schema_headers)
-
-    # F8c C1(a) — M2ORingBuffer tryClaim/commit micro-bench (producer hot path)
-    add_executable(rune_m2o_claim_bench
-        bench/M2OClaimBench.cpp
-    )
-    target_link_libraries(rune_m2o_claim_bench PRIVATE rune_client_producer)
 
     # F12 — per-duty-cycle producer cost vs partition count (in-process, no Aeron)
     add_executable(rune_producer_flush_scaling_bench
@@ -1160,6 +1166,7 @@ if(BUILD_TESTING)
     add_executable(rune_client_crypto_regression_tests
         tests/crypto/ClientCryptoRegressionTest.cpp
         tests/support/AllocCounter.cpp   # PR #528 review: zero-alloc receiver-key seal gate
+        tests/support/OpenSslAllocCounter.cpp   # #535: OpenSSL's CRYPTO_malloc counts into the same window (this binary only)
     )
     target_link_libraries(rune_client_crypto_regression_tests PRIVATE rune_client rune_crypto GTest::gtest_main)
     target_include_directories(rune_client_crypto_regression_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
@@ -1844,6 +1851,37 @@ if(BUILD_TESTING AND aeron_FOUND)
         endif()
     endif()
     gtest_discover_tests(rune_cli_live_tests)
+endif()
+
+# ── #376: bench smoke ctests ───────────────────────────────────────────────────
+# Every hand-rolled bench runs once at a tiny size (seconds): it must build, run, print its RESULT and exit 0 - the
+# benches return non-zero on their own gates (a claim form that allocates, a lost ack, a wedged duty loop).  Labelled
+# bench-smoke; they are NOT latency gates (the numbers at this size mean nothing).  Run: ctest -L bench-smoke.
+if(BUILD_TESTING AND aeron_FOUND)
+    function(rune_add_bench_smoke name binary)   # remaining args: ENV entries KEY=VALUE
+        add_test(NAME ClientBenchSmokeRegression.${name} COMMAND ${binary})
+        set_tests_properties(ClientBenchSmokeRegression.${name} PROPERTIES
+            ENVIRONMENT "${ARGN}" TIMEOUT 120 LABELS bench-smoke)
+    endfunction()
+    rune_add_bench_smoke(rune_producer_acked_bench rune_producer_acked_bench ACKED_RECORDS=500)
+    foreach(_mode void acked)
+        rune_add_bench_smoke(rune_producer_handle_bench_${_mode} rune_producer_handle_bench
+            HANDLE_RECORDS=500 HANDLE_MODE=${_mode})
+    endforeach()
+    rune_add_bench_smoke(rune_shard_route_bench rune_shard_route_bench ROUTE_SENDS=200 ROUTE_SAMPLES=1)
+    foreach(_mode send claim typed_send typed_claim)
+        foreach(_ingress thread invoker)
+            rune_add_bench_smoke(rune_producer_claim_bench_${_mode}_${_ingress} rune_producer_claim_bench
+                CLAIM_RECORDS=500 CLAIM_MODE=${_mode} CLAIM_INGRESS=${_ingress})
+        endforeach()
+    endforeach()
+    # 13 transactions of 1000 records: the bench's minimum (a multiple of 1000 above its 10-transaction warm-up; a shorter
+    # warm-up would trip its zero-allocation gate on first-touch growth), well under a second.
+    rune_add_bench_smoke(rune_producer_txn_bench rune_producer_txn_bench TXN_RECORDS=13000)
+    foreach(_mode single mpsc)
+        rune_add_bench_smoke(rune_m2o_claim_bench_${_mode} rune_m2o_claim_bench
+            CLAIM_RECORDS=1000 CLAIM_REPS=1 CLAIM_RING_CAP=65536 CLAIM_MODE=${_mode})
+    endforeach()
 endif()
 
 # ── Install (the Conan package; see conanfile.py) ─────────────────────────────

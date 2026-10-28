@@ -75,8 +75,10 @@ int main() {
     const bool    invoker    = envStr("CLAIM_INGRESS", "thread") == "invoker";
     const int64_t N          = envI64("CLAIM_RECORDS", 1'000'000);
     const int32_t partitions = static_cast<int32_t>(envI64("CLAIM_PARTITIONS", 8));
-    constexpr int64_t kWarm  = 10'000;
-    if (N <= kWarm) {
+    // #376: the warm-up is 10'000 records (CLAIM_WARMUP) but never more than half of N, so a tiny smoke run
+    // (CLAIM_RECORDS=500) still has a steady-state phase; the default run is unchanged.
+    const int64_t kWarm = std::min<int64_t>(envI64("CLAIM_WARMUP", 10'000), N / 2);
+    if (N <= kWarm || kWarm < 1) {
         std::fprintf(stderr, "CLAIM_RECORDS must exceed the %lld-record warm-up\n", static_cast<long long>(kWarm));
         return 2;
     }

@@ -137,7 +137,7 @@ struct SendSlot {
     auto& slot = crypto.workerSend[idx];
     if (!slot.cipher.has_value()) {
         rune::crypto::AeadKey derived{};
-        if (!rune::crypto::deriveReceiverKey(crypto.c2bKey, receiverId, derived)) return {};   // fail closed
+        if (!crypto.deriveReceiverKeyFn(crypto.c2bKey, receiverId, derived)) return {};   // fail closed
         slot.cipher.emplace(crypto.cipher, derived, crypto.c2bPrefix);
     }
     return SendSlot{&*slot.cipher, &slot.sendSeq, receiverId};
