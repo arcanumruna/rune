@@ -30,9 +30,16 @@
 
 namespace rune::protocol::client {
 
-enum class NamespaceDdlKind : uint8_t { Create = 1, SetLimits = 2 /* 3 Suspend, 4 Resume, 5 Delete: Phase 2 */ };
+enum class NamespaceDdlKind : uint8_t { Create = 1, SetLimits = 2, Suspend = 3, Resume = 4, Delete = 5 };
+
+/// Suspend flavour (kind 3 only): ReadOnly refuses writes, RejectAll refuses every request.
+enum class NsSuspendMode : uint8_t { ReadOnly = 1, RejectAll = 2 };
 
 inline constexpr std::size_t kNamespacePresentMaskBytes = 4;
+
+[[nodiscard]] constexpr bool validSuspendMode(uint8_t m) noexcept {
+    return m >= static_cast<uint8_t>(NsSuspendMode::ReadOnly) && m <= static_cast<uint8_t>(NsSuspendMode::RejectAll);
+}
 
 /// True when `mask` has limit field `i` (0..kNamespaceLimitFieldCount-1) marked present.
 [[nodiscard]] constexpr bool namespaceMaskHas(const std::array<uint8_t, kNamespacePresentMaskBytes>& mask,
@@ -47,13 +54,21 @@ struct NamespaceDdlRequest {
     std::string name;
     std::array<uint8_t, kNamespacePresentMaskBytes> presentMask{};   // bit i = limit field i given; 29 fields
     NamespaceLimits limits;
+    NsSuspendMode mode = NsSuspendMode::ReadOnly;   // kind 3 only
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::NamespaceDdl);
     static constexpr uint16_t BODY_FIXED  = 0;
 
     [[nodiscard]] std::size_t encodedSize() const noexcept {
-        return MessageHeader::ENCODED_SIZE + BODY_FIXED + extEncodedSize(ext) + 1u + 2u + name.size() +
-               kNamespacePresentMaskBytes + kNamespaceLimitsBytes;
+        std::size_t tail = 0;
+        switch (kind) {
+            case NamespaceDdlKind::Create:
+            case NamespaceDdlKind::SetLimits: tail = kNamespacePresentMaskBytes + kNamespaceLimitsBytes; break;
+            case NamespaceDdlKind::Suspend:   tail = 1u; break;
+            case NamespaceDdlKind::Resume:
+            case NamespaceDdlKind::Delete:    tail = 0; break;
+        }
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + extEncodedSize(ext) + 1u + 2u + name.size() + tail;
     }
     std::size_t encode(uint8_t* buf) const noexcept;
     static std::optional<NamespaceDdlRequest> decode(const uint8_t* buf, std::size_t avail) noexcept;
@@ -115,13 +130,17 @@ struct ListNamespacesResponse {
 
 inline std::size_t NamespaceDdlRequest::encode(uint8_t* buf) const noexcept {
     const auto k = static_cast<uint8_t>(kind);
-    if (k < static_cast<uint8_t>(NamespaceDdlKind::Create) || k > static_cast<uint8_t>(NamespaceDdlKind::SetLimits)) return 0;
+    if (k < static_cast<uint8_t>(NamespaceDdlKind::Create) || k > static_cast<uint8_t>(NamespaceDdlKind::Delete)) return 0;
+    const bool hasLimits = kind == NamespaceDdlKind::Create || kind == NamespaceDdlKind::SetLimits;
+    if (kind == NamespaceDdlKind::Suspend && !validSuspendMode(static_cast<uint8_t>(mode))) return 0;
     if (!extFits(ext) || !fitsVarLen16(name.size())) return 0;
-    if ((presentMask[3] & 0xE0u) != 0) return 0;   // bits 29..31 are reserved
+    if (hasLimits && (presentMask[3] & 0xE0u) != 0) return 0;   // bits 29..31 are reserved
     std::size_t pos = detail::putAuthHeader(buf, TEMPLATE_ID, BODY_FIXED, sessionId, correlationId);
     pos += putExt(buf + pos, ext);
     buf[pos++] = k;
     pos += putVarStr(buf + pos, name);
+    if (kind == NamespaceDdlKind::Suspend) { buf[pos++] = static_cast<uint8_t>(mode); return pos; }
+    if (!hasLimits) return pos;
     for (std::size_t i = 0; i < kNamespacePresentMaskBytes; ++i) buf[pos++] = presentMask[i];
     encodeLimits(limits, buf + pos);
     return pos + kNamespaceLimitsBytes;
@@ -136,11 +155,18 @@ inline std::optional<NamespaceDdlRequest> NamespaceDdlRequest::decode(const uint
     if (!getExt(buf, avail, pos, m.ext)) return std::nullopt;
     if (pos + 1u > avail) return std::nullopt;
     const uint8_t k = buf[pos++];
-    if (k < static_cast<uint8_t>(NamespaceDdlKind::Create) || k > static_cast<uint8_t>(NamespaceDdlKind::SetLimits)) return std::nullopt;
+    if (k < static_cast<uint8_t>(NamespaceDdlKind::Create) || k > static_cast<uint8_t>(NamespaceDdlKind::Delete)) return std::nullopt;
     m.kind = static_cast<NamespaceDdlKind>(k);
     std::string_view nm;
     if (!getVarStr(buf, avail, pos, nm) || nm.empty()) return std::nullopt;
     m.name.assign(nm);
+    if (m.kind == NamespaceDdlKind::Suspend) {
+        if (pos + 1u > avail || !validSuspendMode(buf[pos])) return std::nullopt;
+        m.mode = static_cast<NsSuspendMode>(buf[pos++]);
+        return pos == avail ? std::optional<NamespaceDdlRequest>(std::move(m)) : std::nullopt;
+    }
+    if (m.kind == NamespaceDdlKind::Resume || m.kind == NamespaceDdlKind::Delete)
+        return pos == avail ? std::optional<NamespaceDdlRequest>(std::move(m)) : std::nullopt;
     if (pos + kNamespacePresentMaskBytes + kNamespaceLimitsBytes > avail) return std::nullopt;
     for (std::size_t i = 0; i < kNamespacePresentMaskBytes; ++i) m.presentMask[i] = buf[pos++];
     if ((m.presentMask[3] & 0xE0u) != 0) return std::nullopt;

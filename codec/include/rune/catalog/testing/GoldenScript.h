@@ -171,6 +171,12 @@ public:
         emit(NamespaceDeletedOps{}, r.name, 0, r.version, std::move(stmt));
     }
 
+    void nsDeleteStep(uint32_t nsId, uint8_t step, std::string stmt) {
+        const NamespaceRecord& r = record(nsId);
+        NsScope g(*this, nsId);
+        emit(NamespaceDeleteStepOps{step}, r.name, 0, r.version, std::move(stmt));
+    }
+
     std::vector<CatalogEvent> take() && { return std::move(events_); }
 
 private:
@@ -376,13 +382,14 @@ inline cd::AlterOp setCompatOp(cd::CompatMode m) {
     return std::move(b).take();
 }
 
-/// The 13 formatVer-2 golden events, offsets 0..12 (tests/catalog/golden/v2/namespaces.rcat):
+/// The 19 formatVer-2 golden events, offsets 0..18 (tests/catalog/golden/v2/namespaces.rcat):
 ///    0 NamespaceCreated alpha (1)   1 NamespaceCreated beta (2)   2 NamespaceCreated gamma (3)
 ///    3 CreateTopic t in alpha       4 CreateTopic t in beta  (the same name, two namespaces)
 ///    5 NamespaceLimitsSet beta (maxTopics 40)
 ///    6 CreateTopic players in default (typed)   7 CreateView v in alpha over t
-///    8 NamespaceStateChanged gamma -> SuspendedReadOnly   9 ... -> Active   10 ... -> Deleting
-///   11 NamespaceDeleted gamma     12 DropTopic t in beta
+///    8 NamespaceStateChanged gamma -> SuspendedReadOnly   9 ... -> SuspendedRejectAll   10 ... -> Active
+///   11 CreateTopic g in gamma     12 NamespaceDeleted gamma (-> DELETING)   13 DropTopic g in gamma
+///   14..17 NamespaceDeleteStep gamma (bits 1, 2, 4, 8; the last one erases gamma)   18 DropTopic t in beta
 [[nodiscard]] inline std::vector<CatalogEvent> goldenScriptV2() {
     namespace cd = rune::codec;
     golden_detail::ScriptBuilder b(kFormatV2);
@@ -425,9 +432,16 @@ inline cd::AlterOp setCompatOp(cd::CompatMode m) {
         b.createView("v", std::move(v), "CREATE VIEW v AS SELECT id FROM t");
     }
     b.nsState(3, NsStateTag::SuspendedReadOnly, "SUSPEND NAMESPACE gamma READ ONLY");
+    b.nsState(3, NsStateTag::SuspendedRejectAll, "SUSPEND NAMESPACE gamma REJECT ALL");
     b.nsState(3, NsStateTag::Active, "RESUME NAMESPACE gamma");
-    b.nsState(3, NsStateTag::Deleting, "DELETE NAMESPACE gamma");
-    b.nsDelete(3, "DELETE NAMESPACE gamma (finalize)");
+    b.inNs(3);
+    b.createTopic("g", CreateTopicOps{}, "CREATE TOPIC g");
+    b.nsDelete(3, "DELETE NAMESPACE gamma");
+    b.dropTopic("g", "DROP TOPIC g");
+    b.nsDeleteStep(3, TxnsAborted, "DELETE STEP gamma txns");
+    b.nsDeleteStep(3, GroupsTombstoned, "DELETE STEP gamma groups");
+    b.nsDeleteStep(3, TxnStateTombstoned, "DELETE STEP gamma txn state");
+    b.nsDeleteStep(3, SecurityPurged, "DELETE STEP gamma security");
     b.inNs(2);
     b.dropTopic("t", "DROP TOPIC t");
     return std::move(b).take();

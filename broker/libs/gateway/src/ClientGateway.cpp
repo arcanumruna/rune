@@ -1,6 +1,7 @@
 // ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 
 #include <rune/catalog/NsName.h>
+#include <rune/node/NamespaceLimitCheck.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/LogSafe.h>  // issue #232: client-supplied names in log lines
 #include <rune/view/PlanSources.h>
@@ -41,6 +42,7 @@
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/MetadataMessages.h>
+#include <rune/protocol/client/NamespaceUsageMessages.h>
 #include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
@@ -79,7 +81,6 @@ namespace pc = rune::protocol::client;
 
 // Namespaces Task 10: the fixed refusal texts (D7: they never echo a name, so they reveal no foreign object).
 constexpr const char* kMalformedNameDetail = "malformed qualified name";
-const Denial kGroupTxnOutsideDefault{45, "not authorized: groups and transactions exist only in the default namespace"};
 
 // ---------------------------------------------------------------------------
 // Startup-only synchronous resolve budget: the ingress subscription in the
@@ -1295,6 +1296,7 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::SecurityBootstrap:
         case pc::TemplateId::NamespaceDdl:
         case pc::TemplateId::ListNamespaces:
+        case pc::TemplateId::NamespaceUsage:
         case pc::TemplateId::AuthClientFirst:
         case pc::TemplateId::AuthClientFinal:
         case pc::TemplateId::GetViewRow:
@@ -1309,6 +1311,12 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
     // Authentication Task 10 (D13 + the bootstrap-window ruling): while the broker requires authentication an
     // unauthenticated session may only keep itself alive - and, in the bootstrap window, send SecurityBootstrap.
     if (authMode_ == rune::gateway::GatewayAuthMode::Required && authGateRefuses_(tid, buf, len)) return true;
+
+    // Namespaces Phase 2 Task 3 (D21): a suspended namespace refuses what its mode says.  Produce is gated inside
+    // handleProduce on the session it already looked up; every other templates' check is one constexpr array load.
+    if (rune::gateway::suspendGateChecked(static_cast<uint16_t>(tid)) && tid != pc::TemplateId::Produce &&
+        nsGateRefuses_(static_cast<uint16_t>(tid), buf, len))
+        return true;
 
     switch (tid) {
         case pc::TemplateId::Connect:
@@ -1407,6 +1415,9 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             break;
         case pc::TemplateId::ListNamespaces:
             handleListNamespaces(buf, len);
+            break;
+        case pc::TemplateId::NamespaceUsage:   // Phase 2 Task 16 (D29): answered by the gateway itself (no admin ring)
+            handleNamespaceUsage(buf, len);
             break;
         // Task 20: point read of a materialized view row — routed to the owning
         // worker via the same op/return plumbing as PushRead.
@@ -1590,6 +1601,10 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
         --expiringSessions_;
     }
     s->spill = SessionSpill{};
+    // Namespaces Phase 2 Task 10 (D24, #236): the ONE place a session's connection counts are given back - every close
+    // path (client Disconnect, idle timeout, revoke, suspend RejectAll, delete, shutdown) ends in closeSession_.
+    releaseConnection_(*s);
+    if (s->anonCounted) { s->anonCounted = false; if (anonSessions_ > 0) --anonSessions_; }
     if (s->heldByWorkers != 0) --heldSessions_;
     if (s->produceInFlight >= sessionProduceCredits_) --creditBlockedSessions_;   // D8c: its budget dies with it
     if (s->capDeferredOn >= 0) --capDeferredSessions_;                              // R3: its deferral memo too
@@ -1936,6 +1951,24 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
     const auto kind = static_cast<K>(ret.lastOffset);
     if (kind == K::PeerFrameDrops) [[unlikely]] {   // Task 16: not a session signal - a worker's plane drop count
         if (peerDropFn_ != nullptr) peerDropFn_(peerDropCtx_, ret.partition, static_cast<uint64_t>(ret.baseOffset));
+        return;
+    }
+    if (kind == K::NsSlotMismatch) [[unlikely]] {   // namespaces Phase 2 Task 8: a worker's cumulative count
+        if (ret.partition >= 0 && ret.partition < 4096) {
+            if (workerNsSlotMismatches_.size() <= static_cast<std::size_t>(ret.partition))
+                workerNsSlotMismatches_.resize(static_cast<std::size_t>(ret.partition) + 1, 0);
+            workerNsSlotMismatches_[static_cast<std::size_t>(ret.partition)] = static_cast<uint64_t>(ret.baseOffset);
+        }
+        return;
+    }
+    if (kind == K::NsUsage) [[unlikely]] {   // namespaces Phase 2 Task 14 (D28): sessionId = (slot << 8) | metric
+        if (nsAggregator_ != nullptr && ret.partition >= 0 && ret.sessionId >= 0) {
+            const auto metric = static_cast<std::size_t>(ret.sessionId & 0xFF);
+            if (metric < rune::node::kNsMetrics)
+                (void)nsAggregator_->report(static_cast<uint32_t>(ret.partition), static_cast<uint16_t>(ret.sessionId >> 8),
+                                            static_cast<uint32_t>(ret.correlationId), static_cast<rune::node::NsMetric>(metric),
+                                            static_cast<uint64_t>(ret.baseOffset));
+        }
         return;
     }
     if (kind == K::EgressReleased) {                                  // retire-on-ack: the worker let go
@@ -3230,19 +3263,21 @@ void ClientGateway::evictOldClientMember_(Session& session, uint16_t tid, const 
     const auto sv = [](std::span<const uint8_t> b) {
         return std::string_view(reinterpret_cast<const char*>(b.data()), b.size());
     };
+    // Phase 2 Task 5 (D19): the service keys groups by their scoped id.  Cold path (an old client's error answer).
+    const rune::coordination::NsRequestContext nsCtx{sessionNsId_(session), permsOf_(session).isRoot(), &namespaces_.registry()};
     if (tid == static_cast<uint16_t>(pc::TemplateId::Heartbeat)) {
         if (const auto m = pc::Heartbeat::decode(buf, len)) {
-            groupService_->evictMember(sv(m->groupId), sv(m->memberId), session.sessionId, nowNs);
+            groupService_->evictMember(rune::gateway::scopeClientId(nsCtx, sv(m->groupId)), sv(m->memberId), session.sessionId, nowNs);
             return;
         }
     } else if (tid == static_cast<uint16_t>(pc::TemplateId::SyncGroup)) {
         if (const auto m = pc::SyncGroup::decode(buf, len)) {
-            groupService_->evictMember(sv(m->groupId), sv(m->memberId), session.sessionId, nowNs);
+            groupService_->evictMember(rune::gateway::scopeClientId(nsCtx, sv(m->groupId)), sv(m->memberId), session.sessionId, nowNs);
             return;
         }
     } else if (tid == static_cast<uint16_t>(pc::TemplateId::OffsetFetch)) {
         if (const auto m = pc::OffsetFetch::decode(buf, len)) {
-            groupService_->evictMember(sv(m->groupId), std::string_view{}, session.sessionId, nowNs);
+            groupService_->evictMember(rune::gateway::scopeClientId(nsCtx, sv(m->groupId)), std::string_view{}, session.sessionId, nowNs);
             return;
         }
     }
@@ -3570,7 +3605,14 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     if (session->auth.index() < 3) [[unlikely]] {
         // Namespaces Task 9: a first request that is a Produce makes the anonymous reader too (then 45 below, the
         // session stays) - the same outcome as a Produce after a metadata request.
-        becomeAnonymousIfAllowed_(*session, pc::TemplateId::Produce);
+        if (becomeAnonymousIfAllowed_(*session, pc::TemplateId::Produce)) {   // Task 10 (#236): the anonymous-connection cap
+            if (!answerRejection_(*session, *pc::MessageHeader::decode(buf, len), nsLimitCode_(*session),
+                                  "namespace limit exceeded: anonymous connections", buf, len))
+                noteUnanswerable_(buf, len, "anonymous connection cap");
+            return true;
+        }
+        if (std::holds_alternative<rune::gateway::AuthAnonymousRead>(session->auth) &&
+            anonOpsRefused_(*session, *pc::MessageHeader::decode(buf, len), buf, len)) return true;
         if (session->auth.index() < 3) {
             const auto hdr = pc::MessageHeader::decode(buf, len);
             answerGate_(*session, *hdr, rune::gateway::gateFor(session->auth, pc::TemplateId::Produce, false, false), buf, len);
@@ -3581,6 +3623,28 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // One predictable branch on a control-thread bool.
     if (securityBehind_) [[unlikely]] {
         answerSecurityBehind_(*session, *pc::MessageHeader::decode(buf, len), buf, len);
+        return true;
+    }
+    // Namespaces Phase 2 Task 3 (D21): a suspended namespace takes no produce (one byte compare; the refusal is cold).
+    if (session->nsGate != rune::catalog::NsStateTag::Active) [[unlikely]]
+        if (!gateExempt_(*session)) {
+            answerSuspended_(*session, *pc::MessageHeader::decode(buf, len), buf, len);
+            return true;
+        }
+    // Namespaces Phase 2 Task 8 (D22): the session's (nsId, nsSlot) must still be what the slot table holds - one array
+    // index and a compare.  A stale tag is refused and counted, never applied to another namespace.
+    if (!nsTagMatches_(*session)) [[unlikely]] {
+        if (!answerRejection_(*session, *pc::MessageHeader::decode(buf, len),
+                              static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "namespace slot mismatch", buf, len))
+            noteUnanswerable_(buf, len, "namespace slot mismatch");
+        return true;
+    }
+    // Namespaces Phase 2 Task 9 (D23): the acks floor of the session's namespace, per produce (a client picks acks per
+    // request): one slot-array load and a compare.  wire acks 0 = Leader, 1 = All; lowestAcks >= 2 requires All.
+    if (!rune::node::nsAcksAllowed(nsSlots_.limits(session->nsSlot), msg.acks)) [[unlikely]] {
+        if (!answerRejection_(*session, *pc::MessageHeader::decode(buf, len), nsLimitCode_(*session),
+                              "namespace limit exceeded: acks below the namespace's lowest acks", buf, len))
+            noteUnanswerable_(buf, len, "namespace acks floor");
         return true;
     }
     // Authentication Task 12 (D30, spec §2.1): WRITE on the topic - ONE index test, ONE bounds check, ONE byte load
@@ -7162,6 +7226,21 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             resp.rowLen        = static_cast<uint32_t>(ret.recordCount);
             resp.rowBytes      = rowBytes.data();
             resp.rowBytesLen   = static_cast<uint32_t>(rowBytes.size());
+            // Namespaces Phase 2 Task 12 (D26): a view paused over its namespace's memory limit.  Client >= 14: status
+            // ViewPaused (54) with the paused fold offset (the worker's lastOffset) as 8 LE bytes; older: InvalidRequest.
+            uint8_t pausedOffsetLe[8];
+            // Task 14 (D28): Throttled (53) is the same shape - the retry-after ns rides lastOffset.
+            if (ret.errorCode == static_cast<int16_t>(pc::ViewRowResponse::kViewPaused) ||
+                ret.errorCode == static_cast<int16_t>(pc::ViewRowResponse::kThrottled)) [[unlikely]] {
+                if (session->clientVersion >= pc::kClientVersionNamespaces) {
+                    for (int b = 0; b < 8; ++b)
+                        pausedOffsetLe[b] = static_cast<uint8_t>(static_cast<uint64_t>(ret.lastOffset) >> (8 * b));
+                    resp.rowBytes    = pausedOffsetLe;
+                    resp.rowBytesLen = 8;
+                } else {
+                    resp.status = pc::ViewRowResponse::kInvalidRequest;
+                }
+            }
             const std::size_t need = resp.encodedSize();
             if (need > kScratchSize) [[unlikely]] {
                 // Fix round 2 (I4): a row larger than the egress frame is answered
@@ -7224,6 +7303,10 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 resp.partition      = ret.partition;
                 resp.baseOffset     = 0;
                 resp.logStartOffset = ec == pc::ErrorCode::UnknownProducerId ? ret.baseOffset : -1;
+                // Task 14 (D28): Throttled carries the retry-after in ns (the worker's lastOffset) in logStartOffset; a
+                // client below v14 is answered InvalidRequest by encodeFor and gets no retry-after.
+                if (ec == pc::ErrorCode::Throttled && session->clientVersion >= pc::kClientVersionNamespaces)
+                    resp.logStartOffset = ret.lastOffset;
                 static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
                               "scratch too small for ProduceResponse");
                 // D6 review M4: the pre-D6 38 B frame below clientVersion 2.
@@ -7795,10 +7878,6 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
         noteUnanswerable_(buf, len, "group message for unknown session");
         return;
     }
-    // Namespaces Task 10 (D8): phase 1 keys groups and transactional ids by id alone, so a session outside
-    // `default` (root included) is refused before the coordinator redirect or any coordinator state.
-    if ((sessionNsId_(*session) != 0 || rootOutsideDefault_(*session, tid, buf, len))
-        && deny_(*session, kGroupTxnOutsideDefault, buf, len)) return;
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
     if (denyGroupRequest_(*session, tid, buf, len)) return;                 // authentication Task 12 (D18)
 
@@ -7824,27 +7903,28 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
     // Dispatch to the service.  The service encodes the response into scratch_.
     // Capacity is passed so handlers bound-check BEFORE writing each element;
     // the post-write guard below is a final safety net only.
+    const rune::coordination::NsRequestContext nsCtx{sessionNsId_(*session), permsOf_(*session).isRoot(), &namespaces_.registry()};
     std::size_t encoded = 0;
     const std::size_t cap = scratch_.size();
     const auto templateId = static_cast<pc::TemplateId>(tid);
     switch (templateId) {
         case pc::TemplateId::JoinGroup:
-            encoded = groupService_->handleJoinGroup(buf, len, session->clientVersion, nowNs, scratch_.data(), cap);
+            encoded = groupService_->handleJoinGroup(buf, len, session->clientVersion, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::SyncGroup:
-            encoded = groupService_->handleSyncGroup(buf, len, nowNs, scratch_.data(), cap);
+            encoded = groupService_->handleSyncGroup(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::Heartbeat:
-            encoded = groupService_->handleHeartbeat(buf, len, nowNs, scratch_.data(), cap);
+            encoded = groupService_->handleHeartbeat(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::LeaveGroup:
-            encoded = groupService_->handleLeaveGroup(buf, len, nowNs, scratch_.data(), cap);
+            encoded = groupService_->handleLeaveGroup(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::OffsetCommit:
-            encoded = groupService_->handleOffsetCommit(buf, len, nowNs, scratch_.data(), cap);
+            encoded = groupService_->handleOffsetCommit(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::OffsetFetch:
-            encoded = groupService_->handleOffsetFetch(buf, len, nowNs, scratch_.data(), cap);
+            encoded = groupService_->handleOffsetFetch(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         default:
             // Unreachable: onClientFrame_ routes only the six group request ids here.
@@ -7962,40 +8042,38 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
         noteUnanswerable_(buf, len, "txn message for unknown session");
         return;
     }
-    // Namespaces Task 10 (D8): phase 1 keys groups and transactional ids by id alone, so a session outside
-    // `default` (root included) is refused before the coordinator redirect or any coordinator state.
-    // An InitProducerId with no transactional id is exempt: it mints a cluster-unique id for an idempotent producer
-    // and keys nothing by name, and every client producer sends one before its first produce.
-    const bool plainProducerIdRequest = tid == static_cast<uint16_t>(pc::TemplateId::InitProducerId) && [&] {
-        const auto m = pc::InitProducerId::decode(buf, len);
-        return m.has_value() && m->transactionalId.empty();
-    }();
-    if (((sessionNsId_(*session) != 0 && !plainProducerIdRequest) || rootOutsideDefault_(*session, tid, buf, len))
-        && deny_(*session, kGroupTxnOutsideDefault, buf, len)) return;
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
     if (denyTxnRequest_(*session, tid, buf, len)) return;                   // authentication Task 12 (D18)
+    // Namespaces Phase 2 Task 9 (D23): the Txns feature is checked at the first transactional call (InitProducerId).
+    if (tid == static_cast<uint16_t>(pc::TemplateId::InitProducerId) &&
+        !rune::node::nsFeatureAllowed(nsSlots_.limits(session->nsSlot), rune::protocol::kNsFeatureTxns)) [[unlikely]] {
+        if (!answerRejection_(*session, *hdrOpt, nsLimitCode_(*session), "namespace limit exceeded: transactions are not enabled for this namespace", buf, len))
+            noteUnanswerable_(buf, len, "namespace txns feature");
+        return;
+    }
 
     std::size_t encoded = 0;
     // Fix round 3 (I3): the scratch always holds any fixed-size txn answer and
     // any rejection — a handler's 0 can only mean "deferred" (ITxnRequestHandler).
     static_assert(kScratchSize >= kTxnMinOutCap, "txn handlers need kTxnMinOutCap");
+    const rune::coordination::NsRequestContext nsCtx{sessionNsId_(*session), permsOf_(*session).isRoot(), &namespaces_.registry()};
     const std::size_t cap = scratch_.size();
     const auto templateId = static_cast<pc::TemplateId>(tid);
     switch (templateId) {
         case pc::TemplateId::InitProducerId:
-            encoded = txnService_->handleInitProducerId(buf, len, nowNs, scratch_.data(), cap);
+            encoded = txnService_->handleInitProducerId(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::AddPartitionsToTxn:
-            encoded = txnService_->handleAddPartitions(buf, len, nowNs, scratch_.data(), cap);
+            encoded = txnService_->handleAddPartitions(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::AddOffsetsToTxn:
-            encoded = txnService_->handleAddOffsets(buf, len, nowNs, scratch_.data(), cap);
+            encoded = txnService_->handleAddOffsets(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::TxnOffsetCommit:
-            encoded = txnService_->handleTxnOffsetCommit(buf, len, nowNs, scratch_.data(), cap);
+            encoded = txnService_->handleTxnOffsetCommit(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         case pc::TemplateId::EndTxn:
-            encoded = txnService_->handleEndTxn(buf, len, nowNs, scratch_.data(), cap);
+            encoded = txnService_->handleEndTxn(buf, len, nowNs, scratch_.data(), cap, nsCtx);
             break;
         default:
             // Unreachable: onClientFrame_ routes only the five txn request ids here.
@@ -8459,6 +8537,98 @@ std::string ClientGateway::sourceHostOf_(std::string_view egressChannel) const
     return std::string(rune::consensus::PeerHostTable::endpointHost(egressChannel));
 }
 
+bool ClientGateway::gateExempt_(const Session& s) const
+{
+    // Task 15 (rule 4): the allows-check itself - authorizeCluster builds a std::string denial for every non-admin, and this runs
+    // on every request of a suspended namespace's session (the refusal path).
+    return permsOf_(s).allowsCluster(rune::security::opBit(rune::security::Operation::Admin));
+}
+
+uint16_t ClientGateway::suspendedCode_(const Session& s) const noexcept
+{
+    return static_cast<uint16_t>(s.clientVersion >= pc::kClientVersionNamespaces ? pc::ErrorCode::NamespaceSuspended
+                                                                                  : pc::ErrorCode::InvalidRequest);
+}
+
+uint16_t ClientGateway::nsLimitCode_(const Session& s) const noexcept
+{
+    return static_cast<uint16_t>(s.clientVersion >= pc::kClientVersionNamespaces ? pc::ErrorCode::NamespaceLimitExceeded
+                                                                                  : pc::ErrorCode::InvalidRequest);
+}
+
+void ClientGateway::answerSuspended_(Session& s, const pc::MessageHeader& hdr, const uint8_t* buf, std::size_t len)
+{
+    if (!answerRejection_(s, hdr, suspendedCode_(s), "namespace suspended", buf, len))
+        noteUnanswerable_(buf, len, "namespace suspended");
+}
+
+bool ClientGateway::nsGateRefuses_(uint16_t tid, const uint8_t* buf, std::size_t len)
+{
+    const auto hdr = pc::MessageHeader::decode(buf, len);
+    if (!hdr) return false;                                // the handler answers / notes it
+    Session* s = sessions_.find(hdr->sessionId);
+    if (s == nullptr || s->nsGate == rune::catalog::NsStateTag::Active) return false;
+    if (rune::gateway::suspendAction(tid, s->nsGate) != rune::gateway::SuspendAction::Refuse) return false;
+    if (gateExempt_(*s)) return false;
+    answerSuspended_(*s, *hdr, buf, len);
+    return true;
+}
+
+void ClientGateway::onNsSlotAssign(uint16_t slot, uint32_t nsId, const rune::protocol::NamespaceLimits& l)
+{
+    if (nsSlots_.nsIdAt(slot) != nsId && !nsSlots_.place(slot, nsId)) { ++nsSlotMismatches_; return; }
+    nsSlots_.setLimits(slot, l);
+    if (nsConns_.size() < nsSlots_.capacity()) nsConns_.resize(nsSlots_.capacity());
+    if (slot < nsConns_.size() && nsConns_[slot].perUser.empty()) nsConns_[slot].perUser.reserve(16);   // D24: preallocated at assign
+}
+
+void ClientGateway::onNsSlotFreed(uint16_t slot, uint32_t nsId)
+{
+    if (!nsSlots_.release(slot, nsId)) { ++nsSlotMismatches_; return; }
+    if (slot < nsConns_.size()) nsConns_[slot] = NsConnSlot{};   // a reused slot starts from zero usage
+    sessions_.forEach([&](Session& s) { if (s.nsSlot == slot && s.nsId == nsId) s.nsSlot = rune::node::kNoNsSlot; });
+}
+
+void ClientGateway::onNamespaceUpserted(const rune::catalog::NamespaceRecord& r)
+{
+    using rune::catalog::NsStateTag;
+    if (nsSlots_.slotOf(r.nsId) == rune::node::kNoNsSlot) (void)nsSlots_.assign(r.nsId);   // no BrokerNode in front (unit rigs)
+    if (!namespaces_.upsert(r)) return;   // an older record: nothing changed
+    nsSlots_.setLimits(nsSlots_.slotOf(r.nsId), r.limits);
+    if (txnService_ != nullptr) txnService_->setNamespaceTxnLimits(r.nsId, r.limits.maxOpenTxns, r.limits.maxTxnTimeMs);   // Task 10
+    const NsStateTag tag = rune::catalog::tagOf(r.state);
+    // Namespaces Phase 2 Task 4: on every node, at the apply of the state change.  Only the node whose transaction
+    // coordinator is loaded holds transactions (others return 0), so this covers the transactions whose sessions live
+    // on other gateways or are already gone.  Idempotent.
+    if (tag != NsStateTag::Active && txnService_ != nullptr) (void)txnService_->abortAllForNamespace(r.nsId, nowNs_);
+    nsGateScratch_.clear();
+    sessions_.forEach([&](Session& s) {
+        // Only sessions past the login's first leg carry a namespace; the login itself sets the gate of the rest.
+        if (s.auth.index() < 2 || sessionNsId_(s) != r.nsId || s.nsGate == tag) return;
+        nsGateScratch_.push_back(s.sessionId);
+        s.nsGate = tag;
+    });
+    // Outside the forEach: revoke / bind erase or touch sessions.
+    for (const int64_t sid : nsGateScratch_) {
+        Session* s = sessions_.find(sid);
+        if (s == nullptr || gateExempt_(*s)) continue;
+        switch (tag) {
+        case NsStateTag::SuspendedRejectAll:
+            revokeSession_(sid, "namespace suspended", suspendedCode_(*s));
+            break;
+        case NsStateTag::Deleting:
+            revokeSession_(sid, "namespace deleted");
+            break;
+        case NsStateTag::SuspendedReadOnly:
+            bindDenyTable_(*s);
+            break;
+        case NsStateTag::Active:
+            (void)shipPermissions_(*s);   // resumed (it was ReadOnly: closed sessions are gone): its real permissions again
+            break;
+        }
+    }
+}
+
 bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std::size_t len)
 {
     using namespace rune::gateway;
@@ -8484,7 +8654,14 @@ bool ClientGateway::authGateRefuses_(pc::TemplateId tid, const uint8_t* buf, std
     // Namespaces Task 9 (spec §11): with RUNE_ANONYMOUS_READ on, a session that sends a request instead of logging in
     // becomes the anonymous reader of `default` (Describe only) rather than ending.  The login legs and the bootstrap
     // keep their D13 meaning.  Off (the default): nothing changes.
-    if (anonymousRead_) [[unlikely]] becomeAnonymousIfAllowed_(*session, tid);
+    if (anonymousRead_) [[unlikely]] {
+        if (becomeAnonymousIfAllowed_(*session, tid)) {   // Task 10 (#236): the anonymous-connection cap
+            if (!answerRejection_(*session, *hdr, nsLimitCode_(*session), "namespace limit exceeded: anonymous connections", buf, len))
+                noteUnanswerable_(buf, len, "anonymous connection cap");
+            return true;
+        }
+        if (std::holds_alternative<AuthAnonymousRead>(session->auth) && anonOpsRefused_(*session, *hdr, buf, len)) return true;
+    }
 
     // A one-time-password session may send exactly `ALTER USER <self> SET PASSWORD`.
     bool selfSetPassword = false;
@@ -8606,12 +8783,79 @@ uint32_t ClientGateway::sessionNsId_(const Session& s) noexcept
     return 0;   // anonymous (dev / in-process / anonymous read) and not-yet-logged-in sessions: `default` (D12)
 }
 
-void ClientGateway::becomeAnonymousIfAllowed_(Session& session, pc::TemplateId tid)
+bool ClientGateway::becomeAnonymousIfAllowed_(Session& session, pc::TemplateId tid)
 {
+    // Namespaces Phase 2 Task 9 (D23): anonymous read is also a feature of `default` (bit 0 of featureBits = unrestricted).
+    const auto* d = namespaces_.registry().byId(rune::catalog::kDefaultNsId);
     if (anonymousRead_ && authMode_ == GatewayAuthMode::Required && tid != pc::TemplateId::AuthClientFirst &&
         tid != pc::TemplateId::AuthClientFinal && tid != pc::TemplateId::SecurityBootstrap &&
-        std::holds_alternative<rune::gateway::AuthAwaitingFirst>(session.auth))
+        std::holds_alternative<rune::gateway::AuthAwaitingFirst>(session.auth) &&
+        (d == nullptr || rune::node::nsFeatureAllowed(d->limits, rune::protocol::kNsFeatureAnonymousRead))) {
+        // Namespaces Phase 2 Task 10 (#236, D24): the anonymous cap applies before any namespace limit.
+        if (anonSessions_ >= anonMaxConnections_) [[unlikely]] return true;
         session.auth = rune::gateway::AuthAnonymousRead{anonPerms_()};
+        session.anonCounted = true;
+        ++anonSessions_;
+        if (d != nullptr)
+            session.nsGate = rune::catalog::tagOf(d->state);   // namespaces Phase 2 Task 3: the anonymous reader is `default`'s
+    }
+    return false;
+}
+
+bool ClientGateway::anonOpsRefused_(Session& session, const pc::MessageHeader& hdr, const uint8_t* buf, std::size_t len)
+{
+    // GCRA over the injected clock: interval T = 1 s / rate, burst = one second of operations.
+    const int64_t interval = std::max<int64_t>(1, 1'000'000'000LL / static_cast<int64_t>(anonOpsPerSec_));
+    const int64_t tau      = static_cast<int64_t>(anonOpsPerSec_ - 1) * interval;
+    const int64_t t        = std::max(anonTatNs_, nowNs_);
+    if (t - nowNs_ <= tau) [[likely]] {
+        anonTatNs_ = t + interval;
+        return false;
+    }
+    const int64_t retryAfter = t - nowNs_ - tau;
+    if (session.clientVersion >= pc::kClientVersionNamespaces) {
+        pc::ErrorResponse er;
+        er.sessionId     = hdr.sessionId;
+        er.correlationId = hdr.correlationId;
+        er.code          = static_cast<int16_t>(pc::ErrorCode::Throttled);
+        er.retryAfterNs  = static_cast<uint64_t>(retryAfter);
+        sendAnswer_(session, scratch_.data(), er.encode(scratch_.data()));
+    } else if (!answerRejection_(session, hdr, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "anonymous rate limit", buf, len)) {
+        noteUnanswerable_(buf, len, "anonymous rate limit");
+    }
+    return true;
+}
+
+ClientGateway::Admit ClientGateway::admitConnection_(Session& s, uint64_t userId, const rune::catalog::NamespaceRecord& rec, bool exempt)
+{
+    const uint16_t slot = nsSlots_.slotOf(rec.nsId);
+    if (slot == rune::node::kNoNsSlot) return Admit::Ok;   // unreachable: the login's namespace has a slot
+    if (nsConns_.size() < nsSlots_.capacity()) nsConns_.resize(nsSlots_.capacity());   // cold, once (unit rigs)
+    NsConnSlot& c = nsConns_[slot];
+    const uint32_t mine = [&] { const auto it = c.perUser.find(userId); return it == c.perUser.end() ? 0u : it->second; }();
+    const auto& L = rec.limits;
+    if (!exempt) {   // count >= limit refuses ("at -> over"); 0 = unlimited; a cluster admin must always be able to log in
+        if (L.maxConnections != 0 && c.total >= L.maxConnections) return Admit::Connections;
+        if (L.maxConnectionsPerUser != 0 && mine >= L.maxConnectionsPerUser) return Admit::PerUser;
+        if (L.maxSessionsPerUser != 0 && mine >= L.maxSessionsPerUser) return Admit::SessionsPerUser;
+    }
+    ++c.total;
+    ++c.perUser[userId];
+    s.connCounted = true;
+    s.connSlot    = slot;
+    s.connNsId    = rec.nsId;
+    s.connUserId  = userId;
+    return Admit::Ok;
+}
+
+void ClientGateway::releaseConnection_(Session& s) noexcept
+{
+    if (!s.connCounted) return;
+    s.connCounted = false;
+    if (!nsSlots_.matches(s.connSlot, s.connNsId) || s.connSlot >= nsConns_.size()) return;   // the slot was reset / reassigned
+    NsConnSlot& c = nsConns_[s.connSlot];
+    if (c.total > 0) --c.total;
+    if (const auto it = c.perUser.find(s.connUserId); it != c.perUser.end() && --it->second == 0) c.perUser.erase(it);
 }
 
 rune::gateway::PermissionRef ClientGateway::anonPerms_()
@@ -8833,71 +9077,6 @@ std::size_t ClientGateway::filterFetchAllByRead_(const Session& session, const u
     out.sessionId     = resp->sessionId;
     out.correlationId = resp->correlationId;
     return out.encode(scratch_.data(), std::span<const pc::OffsetFetchResult>(fetchFilterScratch_));
-}
-
-bool ClientGateway::rootOutsideDefault_(const Session& session, uint16_t tid, const uint8_t* buf, std::size_t len) const
-{
-    if (!permsOf_(session).isRoot()) return false;
-    const auto topicOut = [&](int32_t id) {
-        const rune::gateway::ObjectEntry* e = objectIndex_.at(id);
-        return e != nullptr && e->nsId != 0;
-    };
-    const auto nameOut = [&](std::span<const uint8_t> id) {   // an opaque id unless qualified by a live namespace
-        const auto res = resolve_(session, sv(id));
-        return res.r == rune::gateway::Resolved::Found && res.nsId != 0;
-    };
-    switch (static_cast<pc::TemplateId>(tid)) {
-        case pc::TemplateId::JoinGroup:
-            if (const auto m = pc::JoinGroup::decode(buf, len, session.clientVersion)) {
-                if (nameOut(m->groupId)) return true;
-                for (const int32_t t : m->subscribedTopicIds) if (topicOut(t)) return true;
-            }
-            return false;
-        case pc::TemplateId::SyncGroup:
-            if (const auto m = pc::SyncGroup::decode(buf, len)) return nameOut(m->groupId);
-            return false;
-        case pc::TemplateId::Heartbeat:
-            if (const auto m = pc::Heartbeat::decode(buf, len)) return nameOut(m->groupId);
-            return false;
-        case pc::TemplateId::LeaveGroup:
-            if (const auto m = pc::LeaveGroup::decode(buf, len)) return nameOut(m->groupId);
-            return false;
-        case pc::TemplateId::OffsetCommit:
-            if (const auto m = pc::OffsetCommit::decode(buf, len)) {
-                if (nameOut(m->groupId)) return true;
-                for (const auto& e : m->entries) if (topicOut(e.topicId)) return true;
-            }
-            return false;
-        case pc::TemplateId::OffsetFetch:
-            if (const auto m = pc::OffsetFetch::decode(buf, len)) {
-                if (nameOut(m->groupId)) return true;
-                for (const auto& e : m->entries) if (topicOut(e.topicId)) return true;
-            }
-            return false;
-        case pc::TemplateId::InitProducerId:
-            if (const auto m = pc::InitProducerId::decode(buf, len)) return nameOut(m->transactionalId);
-            return false;
-        case pc::TemplateId::AddPartitionsToTxn:
-            if (const auto m = pc::AddPartitionsToTxn::decode(buf, len)) {
-                if (nameOut(m->transactionalId)) return true;
-                for (const auto& p : m->partitions) if (topicOut(p.topicId)) return true;
-            }
-            return false;
-        case pc::TemplateId::AddOffsetsToTxn:
-            if (const auto m = pc::AddOffsetsToTxn::decode(buf, len))
-                return nameOut(m->transactionalId) || nameOut(m->groupId);
-            return false;
-        case pc::TemplateId::TxnOffsetCommit:
-            if (const auto m = pc::TxnOffsetCommit::decode(buf, len)) {
-                if (nameOut(m->transactionalId) || nameOut(m->groupId)) return true;
-                for (const auto& e : m->entries) if (topicOut(e.topicId)) return true;
-            }
-            return false;
-        case pc::TemplateId::EndTxn:
-            if (const auto m = pc::EndTxn::decode(buf, len)) return nameOut(m->transactionalId);
-            return false;
-        default: return false;   // an undecodable body is the service's InvalidRequest
-    }
 }
 
 bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len)
@@ -9235,6 +9414,61 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
         return;
     }
     const LoginOk& ok = std::get<LoginOk>(verdict);
+    // Namespaces Phase 2 Task 3 (D21): the verdict is computed first (a wrong proof already got its 44 above), so a
+    // suspended or deleted namespace leaks nothing to someone who does not hold the password.  A namespace that is
+    // gone or being deleted is indistinguishable from a bad password; a RejectAll one answers 51 (44 below client
+    // version 14) to every user but a cluster admin.  Neither charges the throttle.
+    const rune::catalog::NamespaceRecord* const nsRec = namespaces_.registry().byId(ok.nsId);
+    const rune::catalog::NsStateTag nsTag = nsRec != nullptr ? rune::catalog::tagOf(nsRec->state) : rune::catalog::NsStateTag::Deleting;
+    if (nsTag == rune::catalog::NsStateTag::Deleting) [[unlikely]] {
+        failLogin_(*session, hdr->correlationId, 0);
+        return;
+    }
+    if (nsTag == rune::catalog::NsStateTag::SuspendedRejectAll) [[unlikely]] {
+        const PermissionRef loginPerms = compilePerms_(ok.userId, ok.nsId);
+        if (authorizeCluster(loginPerms.table(), rune::security::Operation::Admin).has_value()) {   // not a cluster admin
+            if (session->spill.state == SpillState::Closing) return;
+            pc::AuthServerFinal f;
+            f.sessionId     = session->sessionId;
+            f.correlationId = hdr->correlationId;
+            f.errorCode     = suspendedCode_(*session) == static_cast<uint16_t>(pc::ErrorCode::NamespaceSuspended)
+                                  ? static_cast<uint16_t>(pc::ErrorCode::NamespaceSuspended)
+                                  : static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed);
+            f.detail        = "namespace suspended";
+            sendAnswer_(*session, scratch_.data(), f.encode(scratch_.data()));
+            closeAfterAnswers_(session->sessionId);
+            return;
+        }
+    }
+    // Namespaces Phase 2 Task 9/10 (D23, D24): the AuthScram feature and the connection limits gate a login AFTER the
+    // proof verified (nothing leaks to a guesser); a cluster admin is exempt (it must be able to log in to fix a limit).
+    {
+        const auto refuseLogin = [&](const char* detail) {
+            if (session->spill.state == SpillState::Closing) return;
+            pc::AuthServerFinal f;
+            f.sessionId     = session->sessionId;
+            f.correlationId = hdr->correlationId;
+            f.errorCode     = static_cast<uint16_t>(session->clientVersion >= pc::kClientVersionNamespaces
+                                                        ? pc::ErrorCode::NamespaceLimitExceeded
+                                                        : pc::ErrorCode::AuthenticationFailed);
+            f.detail        = detail;
+            sendAnswer_(*session, scratch_.data(), f.encode(scratch_.data()));
+            closeAfterAnswers_(session->sessionId);
+        };
+        const bool clusterAdmin = !authorizeCluster(compilePerms_(ok.userId, ok.nsId).table(), rune::security::Operation::Admin).has_value();
+        if (nsRec != nullptr && !clusterAdmin && !rune::node::nsFeatureAllowed(nsRec->limits, rune::protocol::kNsFeatureAuthScram)) [[unlikely]] {
+            refuseLogin("namespace limit exceeded: password login is not enabled for this namespace");
+            return;
+        }
+        if (nsRec != nullptr && !session->connCounted) {
+            switch (admitConnection_(*session, ok.userId, *nsRec, clusterAdmin)) {
+            case Admit::Ok: break;
+            case Admit::Connections:     refuseLogin("namespace limit exceeded: connections"); return;
+            case Admit::PerUser:         refuseLogin("namespace limit exceeded: connections per user"); return;
+            case Admit::SessionsPerUser: refuseLogin("namespace limit exceeded: sessions per user"); return;
+            }
+        }
+    }
     std::string loginNonce = st->combinedNonce;   // issue #114: before session->auth (which owns *st) is replaced
     ++loginsOk_;
     loginThrottle_.onSuccess(user, session->sourceHost, nowNs_);
@@ -9245,6 +9479,9 @@ void ClientGateway::handleAuthClientFinal_(const uint8_t* buf, std::size_t len)
                      session->sessionId);
     if (ok.mustChangePassword) session->auth = AuthPasswordChangeRequired{ok.userId, ok.user, std::move(loginNonce), ok.nsId};
     else session->auth = AuthAuthenticated{ok.userId, ok.user, compilePerms_(ok.userId, ok.nsId), std::move(loginNonce), ok.nsId};
+    session->nsGate = nsTag;
+    session->nsId   = ok.nsId;
+    session->nsSlot = nsSlots_.slotOf(ok.nsId);   // namespaces Phase 2 Task 8: cached for the hot path
     // Authentication Task 13: announce-before-accept for permissions - the workers learn this session's WRITE bitmap
     // BEFORE the client learns it is logged in, so it can never produce ahead of its grants.
     const uint64_t shipEpoch = shipPermissions_(*session);
@@ -9438,9 +9675,24 @@ void ClientGateway::onSecurityApplied(int64_t offset, const rune::security::Appl
         } else {
             const char* reason = "password changed (TERMINATE SESSIONS)";
             if (applied.kind == rune::security::EventKind::DropUser) reason = "user dropped";
+            else if (applied.kind == rune::security::EventKind::NamespacePurged) reason = "namespace deleted";
             else if (const auto* u = securityView_->state().userById(applied.objectId); u != nullptr && !u->enabled) reason = "user disabled";
             for (const int64_t sid : liveScratch_) revokeSession_(sid, reason);
         }
+    }
+    // Namespaces Phase 2 Task 6a: a NamespacePurged also strips the purged namespace's grants from SURVIVING users
+    // (`refreshedUsers`, sorted): their sessions recompile their permissions, whatever the main effect was (and even
+    // when no user was erased, i.e. `affectedUsers` is empty or already the refresh set).
+    if (!applied.refreshedUsers.empty()) {
+        liveScratch_.clear();
+        sessions_.forEach([&](Session& s) {
+            uint64_t uid = 0;
+            if (const auto* a = std::get_if<AuthAuthenticated>(&s.auth)) uid = a->userId;
+            else if (const auto* p = std::get_if<AuthPasswordChangeRequired>(&s.auth)) uid = p->userId;
+            else return;
+            if (std::binary_search(applied.refreshedUsers.begin(), applied.refreshedUsers.end(), uid)) liveScratch_.push_back(s.sessionId);
+        });
+        for (const int64_t sid : liveScratch_) refreshSession_(sid);
     }
     applyTracking_ = false;
     noteEnforced_(offset, applyOpWorkers_, permissionShipper_.queuedSeq() != shippedBefore);
@@ -9506,6 +9758,8 @@ void ClientGateway::executeLiveActions_(Session& s, const rune::gateway::LiveAct
             sendErrorOn_(s, corr, static_cast<uint16_t>(pc::ErrorCode::NotAuthorized), d ? std::string_view(d->detail) : std::string_view("not authorized"));
         s.securityReadCorrs.clear();
     }
+    // Task 4: a lost WRITE grant aborts the session's open transactions (they could no longer be ended by it).
+    if (act.endTxns && txnService_ != nullptr) (void)txnService_->abortAllForSession(s.sessionId, nowNs_);
     // Group members: a lost group READ removes the member (its next Heartbeat / Commit / Fetch answers 45); issue #212:
     // a lost READ on a topic a member subscribed to removes that member too (its group rebalances now; the re-join is
     // refused by the join check) - a consumer must not keep an assignment of a topic it may no longer read.
@@ -9526,7 +9780,7 @@ void ClientGateway::executeLiveActions_(Session& s, const rune::gateway::LiveAct
     }
 }
 
-void ClientGateway::revokeSession_(int64_t sid, std::string_view reason)
+void ClientGateway::revokeSession_(int64_t sid, std::string_view reason, uint16_t code)
 {
     using namespace rune::gateway;
     Session* s = sessions_.find(sid);
@@ -9544,7 +9798,6 @@ void ClientGateway::revokeSession_(int64_t sid, std::string_view reason)
     // to nothing FIRST, on the permission shipper's FIFO: the event's lifecycle fence follows it, so the DDL's OK is
     // released only once every worker refuses this session's produce, whatever the close's progress.
     bindDenyTable_(*s);
-    const auto code = static_cast<uint16_t>(pc::ErrorCode::SessionRevoked);
     // Each live subscription (and admin-log read) completes SessionRevoked on its correlation id.  PR #459 F3 (the #109
     // class): a subscription a WORKER pushes is ended by that worker - its 46 follows its last Records on the same
     // egress, and it is forgotten here first so the close below sends no plain Unsubscribe that would cancel the end.
@@ -9561,6 +9814,10 @@ void ClientGateway::revokeSession_(int64_t sid, std::string_view reason)
     // Issue #212: a revoked session is terminal (never resumed): its group members leave now, so their groups
     // rebalance at once instead of at the members' heartbeat timeout.
     if (groupService_ != nullptr) groupService_->removeSessionMembers(sid, nowNs_);
+    // Namespaces Phase 2 Task 4: for EVERY reason (password change, user drop / disable, namespace suspend / delete /
+    // purge) the session's open transactions abort now (PrepareAbort + ABORT markers), so a read_committed reader's
+    // LSO never waits for the transaction timeout of a producer that can no longer end it.
+    if (txnService_ != nullptr) (void)txnService_->abortAllForSession(sid, nowNs_);
     closeAfterAnswers_(sid);   // issue #119: every 46 is delivered first, even when spilled
 }
 
@@ -9765,6 +10022,99 @@ void ClientGateway::handleListNamespaces(const uint8_t* buf, std::size_t len)
                        adminSink_->submitListNamespaces(m.sessionId, m.correlationId, m.afterNsId, m.max,
                                                         sessionNsId_(*session), clusterAdmin),
                        "ListNamespaces: admin ring full", "ListNamespaces: request larger than the admin ring message");
+}
+
+// NamespaceUsage (84), Phase 2 Task 16 (D29): the namespace's limits next to its CURRENT usage.  Answered by the gateway on the
+// control thread, no append, any broker: the aggregator's last totals and rates (worker counters summed over this node), this
+// gateway's own connection counts, and the live object counts of its ObjectIndex / TopicRegistry (the catalog's effects).
+// Usage is per NODE, like every limit enforcement input (D24).  Authorization: a cluster admin, or a session of the namespace
+// itself holding DESCRIBE (or ADMIN) ON NAMESPACE "<name>"; a foreign / unknown name is NotAuthorized for everyone else (the
+// answer never says whether the namespace exists).  Fields with no usage meaning here (schemas, schema versions, groups, users,
+// message / batch / retention, open transactions, txn time, replication, acks, features) read 0 = n/a.
+void ClientGateway::handleNamespaceUsage(const uint8_t* buf, std::size_t len)
+{
+    auto msgOpt = pc::NamespaceUsageRequest::decode(buf, len);
+    if (!msgOpt) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "NamespaceUsage body undecodable");
+        return;
+    }
+    const pc::NamespaceUsageRequest& m = *msgOpt;
+    Session* session = sessions_.find(m.sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, "NamespaceUsage for unknown session");
+        return;
+    }
+    if (session->clientVersion < pc::kClientVersionNamespaces) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "NamespaceUsage needs client version 14");
+        return;
+    }
+    const rune::catalog::NamespaceRecord* rec = namespaces_.registry().byName(m.name);
+    const bool clusterAdmin = gateExempt_(*session);
+    bool allowed = clusterAdmin && rec != nullptr;
+    if (!allowed && rec != nullptr && sessionNsId_(*session) == rec->nsId) {
+        const auto& perms = permsOf_(*session);
+        namespace rsec = rune::security;
+        allowed = perms.allowsName(rsec::ResourceType::Namespace, rec->name, rsec::opBit(rsec::Operation::Describe)) ||
+                  perms.allowsName(rsec::ResourceType::Namespace, rec->name, rsec::opBit(rsec::Operation::Admin));
+    }
+    if (!allowed) {
+        pc::ErrorResponse er;
+        er.sessionId     = m.sessionId;
+        er.correlationId = m.correlationId;
+        // A cluster admin may learn that the name does not exist; nobody else learns anything about it.
+        er.code    = static_cast<int16_t>(clusterAdmin ? pc::ErrorCode::InvalidRequest : pc::ErrorCode::NotAuthorized);
+        er.message = clusterAdmin ? std::string_view("no such namespace") : std::string_view("not authorized");
+        sendAnswer_(*session, scratch_.data(), er.encode(scratch_.data()));
+        return;
+    }
+
+    pc::NamespaceUsageResponse r;
+    r.sessionId     = m.sessionId;
+    r.correlationId = m.correlationId;
+    r.code          = 0;
+    r.state         = static_cast<uint8_t>(rune::catalog::tagOf(rec->state));
+    r.limits        = rec->limits;
+    auto& u = r.usage;
+    // Catalog counts: the live objects of the namespace on this node's index.
+    uint64_t topics = 0, partitionsTotal = 0, partitionsMax = 0, views = 0;
+    objectIndex_.forEachInNs(rec->nsId, [&](int32_t id, const rune::gateway::ObjectEntry& e) {
+        if (e.type == rune::security::ResourceType::View) { ++views; return; }
+        if (e.type != rune::security::ResourceType::Topic) return;
+        ++topics;
+        if (topicRegistry_ != nullptr)
+            if (const rune::node::TopicSpec* t = topicRegistry_->topic(id); t != nullptr && t->partitionCount > 0) {
+                partitionsTotal += static_cast<uint64_t>(t->partitionCount);
+                partitionsMax = std::max<uint64_t>(partitionsMax, static_cast<uint64_t>(t->partitionCount));
+            }
+    });
+    u[0] = topics; u[1] = partitionsMax; u[2] = partitionsTotal; u[3] = views;
+    // The slot's counters: the aggregator's last totals / rates, and this gateway's connections.
+    const uint16_t slot = nsSlots_.slotOf(rec->nsId);
+    if (slot != rune::node::kNoNsSlot) {
+        using rune::node::NsMetric;
+        if (nsAggregator_ != nullptr) {
+            u[8]  = nsAggregator_->totalOf(slot, NsMetric::DiskBytes);
+            u[13] = nsAggregator_->rateOf(slot, NsMetric::ProduceBytes);
+            u[14] = nsAggregator_->rateOf(slot, NsMetric::ProduceRecords);
+            u[15] = nsAggregator_->rateOf(slot, NsMetric::FetchBytes);
+            u[16] = nsAggregator_->rateOf(slot, NsMetric::RequestOps);
+            u[17] = nsAggregator_->rateOf(slot, NsMetric::QueryCycles);
+            u[23] = nsAggregator_->totalOf(slot, NsMetric::ViewMemBytes);
+        }
+        if (slot < nsConns_.size()) {
+            const NsConnSlot& c = nsConns_[slot];
+            uint64_t perUserMax = 0;
+            for (const auto& [uid, n] : c.perUser) perUserMax = std::max<uint64_t>(perUserMax, n);
+            u[18] = c.total; u[19] = perUserMax; u[20] = perUserMax;
+        }
+    }
+    static_assert(pc::NamespaceUsageResponse::encodedSize() <= kScratchSize, "NamespaceUsageResponse exceeds the scratch frame");
+    const std::size_t n = r.encode(scratch_.data(), scratch_.size());
+    if (n == 0) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "NamespaceUsage: encode");
+        return;
+    }
+    sendReliable_(*session, scratch_.data(), n);
 }
 
 std::optional<rune::gateway::Denial> ClientGateway::verifyOwnCredentialChange_(Session& session, const pc::SecurityDdl& m,
@@ -10176,6 +10526,19 @@ bool ClientGateway::sendControlFrame(int64_t sessionId,
     if (!session) {
         spdlog::debug("ClientGateway::sendControlFrame: unknown sessionId={} — dropped", sessionId);
         return false;
+    }
+    // Namespaces Phase 2 Task 9: a DdlResponse the admin thread answered NamespaceLimitExceeded (52) reaches a client
+    // below v14 as InvalidRequest (39); the admin thread does not know the session's version.  Cold: only that code.
+    if (session->clientVersion < pc::kClientVersionNamespaces && len > pc::MessageHeader::ENCODED_SIZE + 2) [[unlikely]] {
+        if (const auto h = pc::MessageHeader::decode(buf, len);
+            h && h->templateId == static_cast<uint16_t>(pc::TemplateId::DdlResponse) &&
+            (buf[pc::MessageHeader::ENCODED_SIZE] | (buf[pc::MessageHeader::ENCODED_SIZE + 1] << 8)) ==
+                static_cast<int>(pc::ErrorCode::NamespaceLimitExceeded)) {
+            ddlDowngradeScratch_.assign(buf, buf + len);
+            ddlDowngradeScratch_[pc::MessageHeader::ENCODED_SIZE]     = static_cast<uint8_t>(pc::ErrorCode::InvalidRequest);
+            ddlDowngradeScratch_[pc::MessageHeader::ENCODED_SIZE + 1] = 0;
+            buf = ddlDowngradeScratch_.data();
+        }
     }
     // No-hang (R2): every answer delivered through here (DDL responses from the
     // admin thread, deferred EndTxn answers, Assign) is queued and retried under

@@ -116,6 +116,16 @@
            correlationId = the worker's request id, replErrorCode = the client ErrorCode (0 = the partition is
            registered in the producer's ongoing transaction).  Ownership-gated. -->
       <validValue name="TXN_VERIFY_RESULT">26</validValue>
+      <!-- Namespaces Phase 2 Task 8 (D22): control -> EVERY worker on the worker ingress ring.  NS_SLOT_ASSIGN: topicId =
+           nsSlot, nextOffset = nsId, tail (TailKind = DESCRIPTOR_BLOB) = the 256-byte encoded NamespaceLimits.
+           NS_SLOT_RELEASE: topicId = nsSlot, nextOffset = nsId.  Cold; never ownership-gated. -->
+      <validValue name="NS_SLOT_ASSIGN">27</validValue>
+      <validValue name="NS_SLOT_RELEASE">28</validValue>
+      <!-- Namespaces Phase 2 Task 14 (D26, D28): control -> EVERY worker (cold: on a CHANGE only), no tail.  NS_THROTTLE:
+           topicId = nsSlot, nextOffset = nsId, partition = ThrottleKind, hwBound = untilNs (0 = clear).  NS_VIEW_MEM_OVER:
+           topicId = nsSlot, nextOffset = nsId, partition = 0 / 1.  Never ownership-gated. -->
+      <validValue name="NS_THROTTLE">29</validValue>
+      <validValue name="NS_VIEW_MEM_OVER">30</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica

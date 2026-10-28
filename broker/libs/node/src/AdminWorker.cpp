@@ -2,6 +2,7 @@
 // See AdminWorker.h.
 #include "rune/node/AdminWorker.h"
 
+#include <rune/node/NamespaceLimitCheck.h>
 #include <rune/node/CatalogEffectFrames.h>
 #include <rune/node/FdBudget.h>
 #include <rune/node/PersistenceMode.h>
@@ -17,6 +18,7 @@
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/SchemaMessages.h>   // kSchemaLineageFingerprint (#418)
 #include <rune/replication/PartitionReplica.h>
+#include <rune/security/SecurityQueries.h>
 #include <rune/replication/WorkerReplicationTransport.h>   // the __catalog plane (Task 6)
 #include <rune/view/AggState.h>      // rune::view::isAggregateView (Phase 2a)
 #include <rune/view/PlanCompiler.h>  // rune::view::compileView
@@ -211,7 +213,7 @@ uint64_t requestFingerprint(const DdlRequest& req) noexcept {
             // The statement as resolved by the client: kind, name, the present mask and the given limits.
             // Never the denial or the client version (a retry from an upgraded client is the same statement).
             f.s(m.meta.statement);
-            f.u(m.kind); f.s(m.name);
+            f.u(m.kind); f.s(m.name); f.u(m.mode);
             for (uint8_t b : m.mask) f.u(b);
             uint8_t raw[rune::protocol::kNamespaceLimitsBytes];
             rune::protocol::encodeLimits(m.limits, raw);
@@ -283,7 +285,8 @@ AdminWorker::AdminWorker(SchemaRegistry& reg,
     , viewRegistry_(viewRegistry != nullptr ? viewRegistry : ownViews_.get())
     , catalogReplica_(catalogReplica)
     , catalogPlane_(catalogPlane)
-    , applier_(catalogDirOf(catalogReplica), reg, *viewRegistry_) {
+    , applier_(catalogDirOf(catalogReplica), reg, *viewRegistry_)
+    , reaper_(deps_.nsDeleteBatch) {
     securityCatchUp_ = SecurityCatchUp{deps_.securityMaxStalenessNs};   // issues #15 / #111: F from the config
     if (catalogReplica_ != nullptr) {
         // One max fetch + the batch framing slack the worker's scratch carries.
@@ -741,7 +744,73 @@ int AdminWorker::doWork(int64_t nowNs) {
         startNext_(nowNs);
         ++work;
     }
+    work += stepReaper_(nowNs);   // after the DDL queue: a client DDL in flight keeps its turn
     return work;
+}
+
+// Namespaces Phase 2 Task 7: the reaper's hands.  Admin thread only.
+struct AdminWorker::ReaperPortImpl final : ReaperPort {
+    AdminWorker& w;
+    explicit ReaperPortImpl(AdminWorker& worker) : w(worker) {}
+    bool askControl(uint64_t correlation, ReapOp op, uint32_t nsId, uint32_t batch) override {
+        if (!w.deps_.askControl) {   // no control thread in this rig: nothing it owns needs cleaning (answered next pass)
+            w.deferredControlDone_ = correlation;
+            return true;
+        }
+        return w.deps_.askControl(ReapRequestMsg{correlation, op, nsId, batch});
+    }
+    bool submitDrop(uint64_t correlation, uint32_t nsId, bool isView, const std::string& name) override {
+        if (w.pending_.size() >= kMaxPendingDdl) return false;
+        DdlMeta meta;
+        meta.statement     = std::string(isView ? "DROP VIEW " : "DROP TOPIC ") + name + "; -- namespace delete";
+        meta.clientName    = "rune-broker";
+        meta.authenticated = "__system";   // not a valid user name: only the broker itself writes it
+        if (isView) {
+            DropViewMsg m;
+            m.session = kReaperSession; m.corr = static_cast<int64_t>(correlation); m.name = name; m.meta = std::move(meta); m.nsId = nsId;
+            w.submit(DdlRequest{std::move(m)});
+        } else {
+            DropTopicMsg m;
+            m.session = kReaperSession; m.corr = static_cast<int64_t>(correlation); m.name = name; m.meta = std::move(meta); m.nsId = nsId;
+            w.submit(DdlRequest{std::move(m)});
+        }
+        return true;
+    }
+    bool submitDeleteStep(uint64_t correlation, uint32_t nsId, uint8_t step) override {
+        if (w.pending_.size() >= kMaxPendingDdl) return false;
+        NamespaceDdlMsg m;
+        m.session = kReaperSession; m.corr = static_cast<int64_t>(correlation);
+        m.kind = kNsDdlInternalDeleteStep; m.mode = step; m.nsId = nsId;
+        m.meta.statement     = "NAMESPACE DELETE STEP " + std::to_string(step) + "; -- namespace delete";
+        m.meta.clientName    = "rune-broker";
+        m.meta.authenticated = "__system";
+        w.submit(DdlRequest{std::move(m)});
+        return true;
+    }
+    bool securityClean(uint32_t nsId, std::string_view name) override {
+        if (!w.securityApplier_) return true;   // no __security on this broker (a rig): nothing to purge
+        return !rune::security::hasNamespaceRecords(w.securityApplier_->state(), nsId, name);
+    }
+};
+
+int AdminWorker::stepReaper_(int64_t nowNs) {
+    if (catalogReplica_ == nullptr) return 0;
+    if (!isLeader() || applier_.halted()) {   // only the catalog leader steps it; a lost leadership drops its in-flight work
+        reaper_.onLeadershipLost();
+        deferredControlDone_ = 0;
+        return 0;
+    }
+    if (deferredControlDone_ != 0) {
+        const uint64_t c = deferredControlDone_;
+        deferredControlDone_ = 0;
+        reaper_.onControlResult(c, ReapStatus::Done);
+    }
+    ReaperPortImpl port{*this};
+    return reaper_.doWork(nowNs, applier_.state(), port);
+}
+
+bool AdminWorker::isReaperRequest_(const DdlRequest& req) noexcept {
+    return std::visit([](const auto& m) noexcept { return m.session == kReaperSession; }, req);
 }
 
 // Issues #15 / #111 (decision M7): is this broker's `__security` state caught up and fresh?  Posted on change.
@@ -876,6 +945,14 @@ void AdminWorker::startNext_(int64_t nowNs) {
     if (const auto* ns = std::get_if<NamespaceDdlMsg>(&req); ns != nullptr && !ns->denial.empty()) {
         answer_(req, kNotAuthorized, ns->denial);
         return;
+    }
+
+    // 3c. Suspend to the mode it is already in, or Resume of an ACTIVE namespace: nothing to append.
+    if (const auto* ns = std::get_if<NamespaceDdlMsg>(&req)) {
+        if (const auto noop = namespaceNoOp_(*ns, state)) {
+            answer_(req, *noop);
+            return;
+        }
     }
 
     // 4. Build the event against the applied catalog (the dry run is its gate).
@@ -1072,6 +1149,7 @@ std::optional<cat::RequestRecord> AdminWorker::recordOfLastApplied_(int64_t offs
     case cat::EventKind::NamespaceLimitsSet:
     case cat::EventKind::NamespaceStateChanged:
     case cat::EventKind::NamespaceDeleted:
+    case cat::EventKind::NamespaceDeleteStep:
         return r;   // namespaces Task 7: objectId is the nsId, never a topic's objectId
     case cat::EventKind::CreateTopic:
     case cat::EventKind::CreateView:
@@ -1154,10 +1232,27 @@ void AdminWorker::answerOk_(const DdlRequest& req, const cat::RequestRecord& r) 
         viewFp = *fp;
     }
     const int32_t gate = r.kind == cat::EventKind::AlterView ? r.topicId : -1;
-    answer_(req, Response{kOK, {}, r.topicId, r.schemaVersion, r.objectId, r.newVersion, gate, viewFp});
+    // Namespaces Phase 2 Task 13 (D27): SetLimits is Ok with a warning when it lowered the retention maximum under topics.
+    std::string_view detail;
+    if (r.kind == cat::EventKind::NamespaceLimitsSet) {
+        const cat::CatalogState& st = applier_.state();
+        if (const cat::NamespaceRecord* nsr = st.namespaces().byId(static_cast<uint32_t>(r.objectId))) {
+            if (const uint64_t n = countRetentionClamped(st, nsr->nsId, nsr->limits); n != 0) {
+                warnScratch_ = "retention clamped on " + std::to_string(n) + " topics";
+                detail = warnScratch_;
+            }
+        }
+    }
+    answer_(req, Response{kOK, detail, r.topicId, r.schemaVersion, r.objectId, r.newVersion, gate, viewFp});
 }
 
 void AdminWorker::respond_(const DdlRequest& req, const Response& r) {
+    // Task 7: the reaper's own DDL is answered to the reaper, never to a session.
+    if (isReaperRequest_(req)) {
+        const int64_t corr = std::visit([](const auto& m) noexcept { return m.corr; }, req);
+        reaper_.onDdlResult(static_cast<uint64_t>(corr), r.code);
+        return;
+    }
     // A detail rides an ErrorResponse for the pre-v8 response types (their own
     // frames have no detail field) — InvalidRequest only (spec §9).
     const bool viaError = r.code == kInvalidRequest && !r.detail.empty() && deps_.respondError;
@@ -1189,6 +1284,17 @@ void AdminWorker::respond_(const DdlRequest& req, const Response& r) {
 AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::CatalogState& s) const {
     Built b = std::visit([&](const auto& m) -> Built {
         using M = std::decay_t<decltype(m)>;
+        // An object DDL names its namespace by id: one that is gone, or DELETING, is Missing for every caller.
+        if constexpr (!std::is_same_v<M, NamespaceDdlMsg> && !std::is_same_v<M, ListNamespacesMsg> &&
+                      !std::is_same_v<M, MalformedDdl>) {
+            const cat::NamespaceRecord* nsr = s.namespaces().byId(m.nsId);
+            // D17: the catalog drops (DropTopic, DropView) are accepted on a DELETING namespace - the reaper's own,
+            // never a client's (a client cannot name a DELETING namespace; its name left the index).
+            constexpr bool isDrop = std::is_same_v<M, DropTopicMsg> || std::is_same_v<M, DropViewMsg>;
+            const bool deletingOk = isDrop && m.session == kReaperSession;
+            if (nsr == nullptr || (std::holds_alternative<cat::NsDeleting>(nsr->state) && !deletingOk))
+                return Rejected(reject(kUnknownTopic, "no namespace with id " + std::to_string(m.nsId)));
+        }
         if constexpr (std::is_same_v<M, DefineTopicMsg>)      return buildDefine_(m, s);
         else if constexpr (std::is_same_v<M, AlterTopicMsg>)  return buildAlter_(m, s);
         else if constexpr (std::is_same_v<M, CreateViewMsg>)  return buildCreateView_(m, s);
@@ -1201,6 +1307,15 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
         else                                                  return buildAlterConfig_(m, s);
     }, req);
     if (!b) return b;
+
+    // Namespaces Phase 2 Task 9 (D23): the namespace's count, durability and feature limits, against the applied catalog,
+    // before anything is appended (nothing is applied on a refusal).  After the build, so a duplicate name or a bad
+    // request keeps its own, more specific answer.  A client below v14 sees InvalidRequest (the gateway maps the code).
+    if (!std::holds_alternative<NamespaceDdlMsg>(req)) {
+        if (const cat::NamespaceRecord* nsr = s.namespaces().byId(b->nsId); nsr != nullptr)
+            if (auto why = nsLimitRefusal(nsr->limits, s, *b, deps_.brokerCount, deps_.topicMinIsr))
+                return Rejected(reject(kNamespaceLimitExceeded, std::move(*why)));
+    }
 
     // The principal, statement and time (spec §4; F22: timestampMs is the
     // leader's wall clock when the event is built for its append).
@@ -1513,10 +1628,39 @@ AdminWorker::Built AdminWorker::buildAlterConfig_(const AlterTopicConfigMsg& m, 
     return e;
 }
 
+std::optional<AdminWorker::Response> AdminWorker::namespaceNoOp_(const NamespaceDdlMsg& m,
+                                                                 const cat::CatalogState& s) const {
+    namespace pc = rune::protocol::client;
+    const auto kind = static_cast<pc::NamespaceDdlKind>(m.kind);
+    if (kind != pc::NamespaceDdlKind::Suspend && kind != pc::NamespaceDdlKind::Resume) return std::nullopt;
+    const cat::NamespaceRecord* rec = s.namespaces().byName(m.name);
+    if (rec == nullptr) return std::nullopt;   // buildNamespace_ answers Missing
+    const bool same = kind == pc::NamespaceDdlKind::Resume
+        ? std::holds_alternative<cat::NsActive>(rec->state)
+        : (m.mode == 1 && cat::tagOf(rec->state) == cat::NsStateTag::SuspendedReadOnly) ||
+          (m.mode == 2 && cat::tagOf(rec->state) == cat::NsStateTag::SuspendedRejectAll);
+    if (!same) return std::nullopt;
+    return Response{kOK, {}, -1, 0, rec->nsId, rec->version, -1, 0};
+}
+
 AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const cat::CatalogState& s) const {
     namespace pc = rune::protocol::client;
     const cat::NamespaceRegistry& nss = s.namespaces();
     cat::CatalogEvent e;
+    if (m.kind == kNsDdlInternalDeleteStep) {   // Task 7: the reaper's NamespaceDeleteStep; never from the wire
+        if (m.session != kReaperSession) return Rejected(reject(kInvalidRequest, "unknown namespace DDL kind 6"));
+        const cat::NamespaceRecord* rec = nss.byId(m.nsId);
+        if (rec == nullptr || !std::holds_alternative<cat::NsDeleting>(rec->state))
+            return Rejected(reject(kUnknownTopic, "no DELETING namespace with id " + std::to_string(m.nsId)));
+        if (!cat::validDeleteStep(m.mode)) return Rejected(reject(kInvalidRequest, "invalid namespace delete step"));
+        e.nsId        = rec->nsId;
+        e.objectId    = rec->nsId;
+        e.objectName  = rec->name;
+        e.prevVersion = rec->version;
+        e.newVersion  = rec->version + 1;
+        e.ops         = cat::NamespaceDeleteStepOps{m.mode};
+        return e;
+    }
     switch (static_cast<pc::NamespaceDdlKind>(m.kind)) {
     case pc::NamespaceDdlKind::Create: {
         if (!rune::catalog::validNamespaceName(m.name))
@@ -1552,6 +1696,31 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
         e.prevVersion = rec->version;
         e.newVersion  = rec->version + 1;
         e.ops = cat::NamespaceLimitsSetOps{resolveLimits(m.mask, m.limits, base)};
+        return e;
+    }
+    case pc::NamespaceDdlKind::Suspend:
+    case pc::NamespaceDdlKind::Resume:
+    case pc::NamespaceDdlKind::Delete: {
+        const cat::NamespaceRecord* rec = nss.byName(m.name);   // never a DELETING one: its name left the index
+        if (rec == nullptr) return Rejected(reject(kUnknownTopic, "no namespace named " + quotedName(m.name)));
+        const auto kind = static_cast<pc::NamespaceDdlKind>(m.kind);
+        if (kind == pc::NamespaceDdlKind::Delete) {
+            if (rec->nsId == rune::catalog::kDefaultNsId)
+                return Rejected(reject(kInvalidRequest, "the default namespace cannot be deleted"));
+            e.ops = cat::NamespaceDeletedOps{};
+        } else if (kind == pc::NamespaceDdlKind::Resume) {
+            e.ops = cat::NamespaceStateChangedOps{cat::NsStateTag::Active};
+        } else {
+            if (!pc::validSuspendMode(m.mode)) return Rejected(reject(kInvalidRequest, "invalid suspend mode"));
+            e.ops = cat::NamespaceStateChangedOps{static_cast<pc::NsSuspendMode>(m.mode) == pc::NsSuspendMode::ReadOnly
+                                                      ? cat::NsStateTag::SuspendedReadOnly
+                                                      : cat::NsStateTag::SuspendedRejectAll};
+        }
+        e.nsId        = rec->nsId;
+        e.objectId    = rec->nsId;
+        e.objectName  = rec->name;
+        e.prevVersion = rec->version;
+        e.newVersion  = rec->version + 1;
         return e;
     }
     }

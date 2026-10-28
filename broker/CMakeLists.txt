@@ -520,6 +520,15 @@ if(BUILD_BENCHMARKS)
         benchmark/ControlDutyCycleBench.cpp)
     target_link_libraries(ControlDutyCycleBench PRIVATE metrics benchmark::benchmark)
 
+    # ── NamespaceHotPathBench (namespaces Phase 2 Task 15) — produce / fetch / point read with the namespace gate and counters;
+    #    compiled unchanged at the Phase 1 merge for the A side of the ABAB (see the file header).
+    add_executable(NamespaceHotPathBench
+        benchmark/BenchmarkMain.cpp
+        bench/NamespaceHotPathBench.cpp)
+    target_include_directories(NamespaceHotPathBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/benchmark ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(NamespaceHotPathBench PRIVATE rune_storage rune_replication rune_transaction rune_node rune_view rune_codec
+                          benchmark::benchmark)
+
     add_executable(rune_broker_benchmark
         benchmark/BenchmarkMain.cpp
         benchmark/StorageBenchmark.cpp

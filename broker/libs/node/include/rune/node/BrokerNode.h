@@ -77,6 +77,8 @@
 #include <rune/node/SecurityServing.h>
 #include <rune/node/SchemaFanout.h>
 #include <rune/node/TopicDroppedFanout.h>
+#include <rune/node/NsSlotFanout.h>
+#include <rune/node/NsSlotTable.h>
 #include <rune/node/PeerLinkAgent.h>
 #include <rune/node/PeerLinkFanout.h>
 #include <rune/peerlink/ClusterKeys.h>
@@ -445,6 +447,7 @@ public:
         m.limits  = w.limits;
         m.denial.assign(denial);
         m.clientVersion = clientVersion;
+        m.mode = static_cast<uint8_t>(w.mode);
         return submitDdl_(m);
     }
     rune::gateway::AdminSubmit submitListNamespaces(int64_t sessionId, int64_t correlationId, uint32_t afterNsId,
@@ -567,6 +570,13 @@ public:
             }
             if (tid == kMsgPurgeDroppedDir) {
                 onPurgeDroppedDir_(std::string_view(reinterpret_cast<const char*>(p), n));
+                return;
+            }
+            if (tid == kMsgNsReapResult) {   // Phase 2 Task 7: the control thread's answer to a reaper request
+                ReapResultMsg m;
+                if (decodeReapResult(p, n, m)) worker_.onNsReapResult(m);
+                else if (badControlFrames_++ % 1024 == 0)
+                    spdlog::error("AdminWorkerAgent: malformed kMsgNsReapResult (len={}) refused", n);
                 return;
             }
             if (badControlFrames_++ % 1024 == 0)
@@ -894,6 +904,12 @@ public:
             writeSecurityServing(p, caughtUp, leaderHw, epoch, asLeader, knownEnd, behind, held);
         });
     }
+    /// Namespaces Phase 2 Task 7 - ADMIN thread only (deps.askControl): the reaper's request to the control thread, on the
+    /// effect FIFO behind every applied event it follows (never dropped).
+    bool postNsReapRequest(const ReapRequestMsg& m) {
+        postCatalog_(kA2cNsReapRequest, kReapRequestWireLen, [&](uint8_t* p) { writeReapRequest(p, m); });
+        return true;
+    }
     [[nodiscard]] SecurityBootEffects securityBootEffects() const { return SecurityBootEffects{}; }
     [[nodiscard]] SecurityEffects securitySinkForBootStash() { return securitySink_(); }
     /// The `__security` replica's ISR channel (kA2cSecurityAlterIsr) - the control thread forwards it to the controller.
@@ -1207,6 +1223,9 @@ private:
         fx.namespaceUpserted = [this](const rune::catalog::NamespaceRecord& r) {   // namespaces Task 9: login mirror
             postCatalog_(kA2cNamespaceUpserted, namespaceUpsertedWireLen(r.name),
                          [&](uint8_t* p) { writeNamespaceUpserted(p, r); });
+        };
+        fx.namespaceErased = [this](uint32_t nsId) {   // namespaces Phase 2 Task 3: the mirror forgets it
+            postCatalog_(kA2cNamespaceErased, kNamespaceErasedWireLen, [&](uint8_t* p) { writeNamespaceErased(p, nsId); });
         };
         fx.topicDropped = [this](int32_t topicId, uint32_t nsId, const std::string& name) {
             postCatalog_(kA2cCatalogTopicDropped, catalogTopicDroppedWireLen(name),
@@ -1696,6 +1715,7 @@ public:
     }
     /// Test-only (Task 16): the topics / dropped ids the boot replay produced (immutable after start()).
     [[nodiscard]] const std::vector<TopicSpec>& bootTopicsForTest() const noexcept { return bootTopics_; }
+    [[nodiscard]] std::size_t nsDirMismatchesAtBootForTest() const noexcept { return nsDirMismatchesAtBoot_; }
     [[nodiscard]] const std::vector<int32_t>& bootDroppedIdsForTest() const noexcept { return bootDroppedIds_; }
     /// Test-only (F6): the open-file need the boot budget estimated from bootTopics_ (immutable after start()).
     [[nodiscard]] uint64_t fdNeedAtBootForTest() const noexcept { return fdNeedAtBoot_; }
@@ -2761,6 +2781,39 @@ private:
     std::vector<PendingCreateBehindDrop>                  pendingCreatesBehindDrop_;   // FIFO (per name)
     std::vector<std::string>                              purgeOutbox_;        // kMsgPurgeDroppedDir ring-full retry
     std::vector<std::vector<uint8_t>>                     cleanerPolicyOutbox_;  // kPolicyMsgType ring-full retry
+    std::vector<std::array<uint8_t, CleanerViewChannel::kNsLimitBytes>> cleanerNsLimitOutbox_;   // kNsLimitMsgType ring-full retry (Task 13)
+    void postCleanerNsLimit_(uint16_t slot, uint32_t nsId, uint64_t maxRetentionMs, uint64_t maxRetentionBytes);   // control thread
+    std::vector<ReapResultMsg>                            reapResultOutbox_;     // kMsgNsReapResult ring-full retry (Task 7)
+    void onNsReapRequest_(const ReapRequestMsg& m);                              // control thread (Task 7)
+    void onNamespaceErasedDisk_(uint32_t nsId);                                  // control thread (Task 7, D18)
+    // Namespaces Phase 2 Task 8 (D22): the node's AUTHORITATIVE slot table (control thread).  Slot 0 = `default`.  The
+    // gateway, every worker and every worker's view set keep their own copy, fed from here (gateway: direct, same thread;
+    // workers: nsSlotFanout_ on the worker rings).  Each namespace has one per-node gauge in the metrics file whose
+    // owner tag is the nsId (a reader tells a reused slot from the old one).
+    NsSlotTable                                           nsSlots_;
+    NsSlotFanout                                          nsSlotFanout_;
+    NsLimitAggregator                                     nsAggregator_;       // Task 14 (D28): control thread only
+    std::vector<metrics::SlotWriter>                      nsMetricSlots_;       // by nsSlot; unbound (slot() < 0) = none
+    uint64_t                                              nsSlotAssignFailures_ = 0;   // a bug if ever non-zero
+    std::int64_t                                          lastNsMismatchPublished_ = 0;
+    void bootAssignNsSlots_();                                                   // startup thread: from the booted catalog
+    void onNsUpserted_(const rune::catalog::NamespaceRecord& rec);               // control thread: assign / refresh + broadcast
+    void onNsErasedSlot_(uint32_t nsId);                                         // control thread: release + broadcast
+    void registerNsMetric_(uint16_t slot, const rune::catalog::NamespaceRecord& rec);
+    void freeNsMetric_(uint16_t slot);
+    void publishNsSlotMetrics_() noexcept;
+public:
+    [[nodiscard]] uint16_t nsSlotOfForTest(uint32_t nsId);   // read ON the control thread
+    /// The (nsId, slot) pairs of the authoritative table, ascending slot (read ON the control thread).
+    [[nodiscard]] std::vector<std::pair<uint16_t, uint32_t>> nsSlotsForTest();
+    [[nodiscard]] uint64_t nsSlotAssignFailuresForTest() const noexcept { return nsSlotAssignFailures_; }
+    /// Namespaces Phase 2 Task 10 (D24, #236): this node's gateway counts (read ON the control thread).
+    [[nodiscard]] uint32_t nsConnectionsForTest(uint32_t nsId);
+    [[nodiscard]] uint32_t anonymousSessionsForTest();
+private:
+    int  serviceErasedNamespaces_();                                             // control thread: the rename, once its topics retired
+    std::vector<uint32_t>                                 erasedNsAwaitingRename_;
+    std::size_t                                           nsDirMismatchesAtBoot_ = 0;   // '*.deleting' dirs of a live namespace (fatal)
     CleanerViewChannel*                                   cleanerViewChannel_ = nullptr;   // owned by runtimeAgent_
     void fanoutViewPlan_(ViewPlanUpdateMsg msg);   // control thread
     int  pumpViewFanout_();                        // control thread (every cycle)

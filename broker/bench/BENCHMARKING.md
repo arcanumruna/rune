@@ -158,6 +158,21 @@ produce, fetch or query path. The 5.9 µs is for the bench's own small process. 
 open fd, so a broker holding 4000 fds (segments, sockets) spends about 0.8 ms per sample on the control thread, over the
 50 µs gate. Measured by opening 4000 extra fds in the bench process.
 
+**`NamespaceHotPathBench`** (`broker/bench/NamespaceHotPathBench.cpp`, `-DBUILD_BENCHMARKS=ON`) measures produce, fetch and
+view point read with namespaces on and limits set (the slot tag check, the throttle compare and the per-namespace counters).
+Side A is the Phase 1 merge `4f7e53bb` with the same bench file (everything namespace-specific is under `RUNE_NSB`), side
+B the Phase 2 tip; both built `-O3 -DNDEBUG`, interleaved ABAB on a shared dev host (not a prepared box).
+
+| case | A p50 / p99 | B p50 / p99 | delta p50 / p99 | source |
+|---|---|---|---|---|
+| produce 256 B (n=5) | 1.96 / 6.84 µs | 1.30 / 5.96 µs | within spread | namespaces Phase 2 Task 15, 2026-10-28 |
+| produce 1 KiB (n=15) | 2.20 / 8.79 µs | 2.12 / 8.93 µs | −3.9% / +1.6% | same |
+| fetch (n=15) | 29.8 / 90.9 µs | 30.7 / 93.9 µs | +3.3% / +3.3% | same |
+| view point read (n=5) | 0.55 / 1.57 µs | 0.55 / 1.56 µs | none (gate < 50 µs) | same |
+
+Every shift is inside the run-to-run range (fetch p99 range 72–129 µs on A, 72–156 µs on B). The fetch path's added
+cost is one `throttleUntilNs` compare and one counter add per request (Task 14). Re-run on a prepared box before quoting.
+
 ## Checklist
 
 1. Take the lock; run `vm-bench-prepare.sh`; read its log.

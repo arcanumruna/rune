@@ -7,7 +7,7 @@
 //   * Listings: metadata lists only the session's own namespace's topics (root: all).
 //   * A foreign or unknown namespace in a NAME: the same answer bytes (after the header) for "bravo/x" and
 //     "nosuchns/x", and no answer echoes the foreign namespace's name.
-//   * D8: a session outside `default` is refused every group and transaction request before the coordinator sees it.
+//   * Phase 2 Task 5 (D19): groups and transactions work in every namespace; their ids are namespace-scoped.
 //   * A malformed qualified name is 40 (InvalidTopicName) on every name-taking request, root included.
 //
 // Interaction matrix (caller × target × operation):
@@ -22,9 +22,9 @@
 //   | alpha/alice     | bravo/x vs nosuchns/x           | schema, define, alter, config, drop topic, | identical body, | ErrorMessageNoForeignName
 //   |                 |                                 | create, drop, alter view                   | no "bravo"      |
 //   | alpha/alice     | bravo ids                       | subscribe, getViewRow                      | no foreign name | ErrorMessageNoForeignName
-//   | alpha/alice     | any group / transactional id    | join, sync, heartbeat, leave, commit,      | 45, coordinator | GroupTxnRefusedOutsideDefault
-//   |                 |                                 | fetch, init pid, add parts/offsets, txn    | untouched       |
-//   |                 |                                 | commit, end txn                            |                 |
+//   | alpha/alice     | her group / transactional id    | join, heartbeat, commit, fetch, leave,     | ok, alpha-scoped| GroupTxnWorkOutsideDefault
+//   |                 |                                 | init pid                                   |                 |
+//   | root            | alpha/cg, alpha/tx, unknown/tx  | join, commit, init pid                     | ok, scoped      | RootGroupTxnCrossNamespace
 //   | alice, root     | a//x, /x, a/, a/b/c             | every name-taking request                  | 40              | MalformedName
 #include "support/AllocWindow.h"
 #include "support/AuthRig.h"
@@ -222,70 +222,49 @@ TEST(NamespaceGatewayRegression, ErrorMessageNoForeignNameRegression) {
     }
 }
 
-// ── D8: groups and transactions exist only in `default` ────────────────────────────────────────────────────────
-TEST(NamespaceGatewayRegression, GroupTxnRefusedOutsideDefaultRegression) {
+// ── Phase 2 Task 5 (D19): groups and transactions work in every namespace (the Phase 1 D8 refusal is lifted) ───
+TEST(NamespaceGatewayRegression, GroupTxnWorkOutsideDefaultRegression) {
     NsGw g;
     AuthRig& r = g.r;
-    EXPECT_EQ(r.joinGroup(g.alice, "cgA", {g.mine}), kNotAuthorized) << "JoinGroup";
-    EXPECT_EQ(r.syncGroup(g.alice, "cgA", "m", 1), kNotAuthorized) << "SyncGroup";
-    EXPECT_EQ(r.heartbeat(g.alice, "cgA", "m"), kNotAuthorized) << "Heartbeat";
-    EXPECT_EQ(r.leaveGroup(g.alice, "cgA", "m"), kNotAuthorized) << "LeaveGroup";
-    EXPECT_EQ(r.offsetCommit(g.alice, "cgA", r.orders), kNotAuthorized) << "OffsetCommit";
-    EXPECT_EQ(r.offsetFetch(g.alice, "cgA", r.orders), kNotAuthorized) << "OffsetFetch";
-    EXPECT_EQ(r.initProducerId(g.alice, "txA"), kNotAuthorized) << "InitProducerId";
-    EXPECT_EQ(r.addPartitions(g.alice, "txA", g.mine), kNotAuthorized) << "AddPartitionsToTxn";
-    EXPECT_EQ(r.addOffsets(g.alice, "txA", "cgA"), kNotAuthorized) << "AddOffsetsToTxn";
-    EXPECT_EQ(r.txnOffsetCommit(g.alice, "txA", "cgA", r.orders), kNotAuthorized) << "TxnOffsetCommit";
-    EXPECT_EQ(r.endTxn(g.alice, "txA"), kNotAuthorized) << "EndTxn";
-    // The coordinator never saw them: alice's commit left no offset, and her join no member / generation.
-    EXPECT_EQ(r.committedOffset(g.root, "cgA", r.orders), r.committedOffset(g.root, "cgUntouched", r.orders))
-        << "alice's OffsetCommit reached the coordinator";
-    const auto joined = r.joinStable(g.root, "cgA", {r.orders});
-    const auto fresh = r.joinStable(g.root, "cgFresh", {r.orders});
-    ASSERT_GE(fresh.second, 0);
-    EXPECT_EQ(joined.second, fresh.second) << "alice's JoinGroup reached the coordinator (an extra generation)";
-    // Root in `default` keeps groups and transactions (control).
-    EXPECT_EQ(r.initProducerId(g.root, "txRoot"), kOk);
+    // alpha/alice's group `cgA` lives in alpha: join, heartbeat, commit, fetch, leave all work (were 45).
+    const auto joined = r.joinStable(g.alice, "cgA", {g.mine});
+    ASSERT_GE(joined.second, 0) << "JoinGroup in alpha";
+    EXPECT_EQ(r.heartbeatAt(g.alice, "cgA", joined.first, joined.second), kOk) << "Heartbeat";
+    EXPECT_EQ(r.commitAs(g.alice, "cgA", joined.first, joined.second, g.mine, 7), kOk) << "OffsetCommit";
+    EXPECT_EQ(r.committedOffset(g.alice, "cgA", g.mine), 7) << "OffsetFetch";
+    // The same id in `default` is another group: root's unqualified `cgA` saw no commit; "alpha/cgA" is alice's.
+    EXPECT_NE(r.committedOffset(g.root, "cgA", g.mine), 7) << "alpha's group leaked into default";
+    EXPECT_EQ(r.committedOffset(g.root, "alpha/cgA", g.mine), 7) << "root reaches alpha's group by its qualified id";
+    EXPECT_EQ(r.leaveGroup(g.alice, "cgA", joined.first), kOk) << "LeaveGroup";
+    EXPECT_EQ(r.initProducerId(g.alice, "txA"), kOk) << "InitProducerId with a transactional id (was 45)";
+    EXPECT_EQ(r.initProducerId(g.alice, ""), kOk) << "idempotent InitProducerId";
 }
 
-/// D8 covers transactional ids only: an InitProducerId WITHOUT one mints a cluster-unique producer id for an
-/// idempotent producer and touches no (ns, id)-keyed state, so a namespace user gets it (the C++ client's producer
-/// always asks for one before its first produce; found by docker/namespace-e2e.sh step 5). A principal with no topic
-/// WRITE still gets 45 (#211), and a transactional id stays refused.
-/// Mutation: drop the `plainProducerIdRequest` exemption in ClientGateway's txn handler -> alice's first call is 45.
+/// An InitProducerId WITHOUT a transactional id mints a cluster-unique producer id; a principal with no topic WRITE
+/// still gets 45 (#211).  (Phase 1 exempted this request from the D8 refusal; Phase 2 lifts the refusal itself.)
 TEST(NamespaceGatewayRegression, IdempotentProducerIdOutsideDefaultRegression) {
     NsGw g;
     AuthRig& r = g.r;
     EXPECT_EQ(r.initProducerId(g.alice, ""), kOk) << "idempotent InitProducerId for alpha/alice";
-    EXPECT_EQ(r.initProducerId(g.alice, "txA"), kNotAuthorized) << "a transactional id stays refused outside default";
+    EXPECT_EQ(r.initProducerId(g.alice, "txA"), kOk) << "a transactional id works in alpha (Phase 2)";
     r.broker().createUser("alpha/nowrite", AuthRig::kPw, {prefix(SO::Read, ST::Topic, "")});
     const int64_t nowrite = r.login("alpha/nowrite");
     EXPECT_EQ(r.initProducerId(nowrite, ""), kNotAuthorized) << "no topic WRITE mints no producer id (#211)";
 }
 
-/// D8, the cluster admin's half (namespaces Task 12 matrix): root logs in to `default`, so the session-nsId check
-/// passes it; naming a group or transaction THROUGH another namespace - a non-default topic id, or a group /
-/// transactional id qualified by an existing non-default namespace - is still refused 45 before the coordinator.
-/// Mutation: drop the `rootOutsideDefault_` term in ClientGateway's group / txn handlers → every refusal below is 0.
-TEST(NamespaceGatewayRegression, RootGroupTxnOutsideDefaultRegression) {
+/// Root reaches another namespace's groups and transactional ids by qualifying them ("alpha/cg"); an unqualified id
+/// is root's own (`default`); a qualifier root cannot resolve is an opaque local id in root's namespace.
+TEST(NamespaceGatewayRegression, RootGroupTxnCrossNamespaceRegression) {
     NsGw g;
     AuthRig& r = g.r;
-    EXPECT_EQ(r.joinGroup(g.root, "cgR", {g.mine}), kNotAuthorized) << "JoinGroup on an alpha topic";
-    EXPECT_EQ(r.offsetCommit(g.root, "cgR", g.mine), kNotAuthorized) << "OffsetCommit on an alpha topic";
-    EXPECT_EQ(r.offsetFetch(g.root, "cgR", g.mine), kNotAuthorized) << "OffsetFetch on an alpha topic";
-    EXPECT_EQ(r.joinGroup(g.root, "alpha/cg", {r.orders}), kNotAuthorized) << "JoinGroup on an alpha-qualified group";
-    EXPECT_EQ(r.initProducerId(g.root, "alpha/tx"), kNotAuthorized) << "InitProducerId on an alpha-qualified txn id";
-    EXPECT_EQ(r.addPartitions(g.root, "txR", g.mine), kNotAuthorized) << "AddPartitionsToTxn on an alpha topic";
-    EXPECT_EQ(r.addOffsets(g.root, "txR", "bravo/cg"), kNotAuthorized) << "AddOffsetsToTxn on a bravo-qualified group";
-    EXPECT_EQ(r.txnOffsetCommit(g.root, "txR", "cgR", g.mine), kNotAuthorized) << "TxnOffsetCommit on an alpha topic";
-    // The coordinator never saw the join: a fresh group's first generation equals the refused one's.
-    const auto joined = r.joinStable(g.root, "cgR", {r.orders});
-    const auto fresh = r.joinStable(g.root, "cgRFresh", {r.orders});
-    ASSERT_GE(fresh.second, 0);
-    EXPECT_EQ(joined.second, fresh.second) << "root's refused JoinGroup reached the coordinator";
-    // Controls: `default` topics, "default/"-qualified and unknown-qualifier ids (opaque in phase 1) stay allowed.
+    const auto joined = r.joinStable(g.root, "alpha/cgX", {g.mine});
+    ASSERT_GE(joined.second, 0) << "root's JoinGroup on an alpha-qualified group over an alpha topic";
+    EXPECT_EQ(r.commitAs(g.root, "alpha/cgX", joined.first, joined.second, g.mine, 3), kOk);
+    EXPECT_EQ(r.committedOffset(g.alice, "cgX", g.mine), 3) << "alice's unqualified `cgX` IS root's `alpha/cgX`";
+    EXPECT_NE(r.committedOffset(g.root, "cgX", g.mine), 3) << "root's unqualified `cgX` is the default group";
+    EXPECT_EQ(r.initProducerId(g.root, "alpha/tx"), kOk);
     EXPECT_EQ(r.initProducerId(g.root, "default/tx"), kOk);
-    EXPECT_EQ(r.initProducerId(g.root, "nosuchns/tx"), kOk);
+    EXPECT_EQ(r.initProducerId(g.root, "nosuchns/tx"), kOk) << "an unknown qualifier is an opaque local id";
     EXPECT_EQ(r.offsetFetch(g.root, "cgR", r.orders), kOk);
 }
 

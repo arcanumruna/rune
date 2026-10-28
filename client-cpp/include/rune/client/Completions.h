@@ -157,6 +157,7 @@ public:
         case OpKind::ListTopics:
         case OpKind::GetViewRow:  // Task 21: response carries a variable rowBytes payload
         case OpKind::ListNamespaces:  // Namespaces (Task 11): the raw ListNamespacesResponse frame
+        case OpKind::NamespaceUsage:  // Phase 2 Task 16: the raw NamespaceUsageResponse frame
             return detail::CompletionRing::completionRecordBytes(cfg_.maxResultBytes);
         default:
             return detail::CompletionRing::completionRecordBytes(cfg_.maxErrorText);

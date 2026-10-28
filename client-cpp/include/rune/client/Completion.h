@@ -52,6 +52,7 @@ enum class OpKind : uint8_t {
     // Namespaces (Task 11): namespace DDL (wire 81, answered by DdlResponse 78) and ListNamespaces (82 -> 83).
     NamespaceDdl,       ///< Client::namespaceDdl() / createNamespace() / setNamespaceLimits()
     ListNamespaces,     ///< Client::listNamespaces(afterNsId, max, target, token) / listNamespaces(timeout)
+    NamespaceUsage,     ///< Phase 2 Task 16: Client::namespaceUsage(name, target, token) / namespaceUsage(name, timeout)
 };
 
 enum class OpStatus : uint8_t {

@@ -201,7 +201,13 @@ WorkerReturn runGetViewRow(Worker& w, int32_t viewTopicId, int32_t partition,
 
     WorkerReturn captured{};
     int count = 0;
-    w.drainReturn([&](WorkerReturn r) { captured = std::move(r); ++count; });
+    // Namespaces Phase 2 Task 14: the worker also reports its per-slot usage to the limit aggregator (SessionSignal NsUsage) on
+    // the same return ring; only the ViewRowResult is the answer under test.
+    w.drainReturn([&](WorkerReturn r) {
+        if (r.type != WorkerReturn::Type::ViewRowResult) return;
+        captured = std::move(r);
+        ++count;
+    });
     EXPECT_EQ(count, 1) << "exactly one ViewRowResult expected";
     return captured;
 }

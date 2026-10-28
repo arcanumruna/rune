@@ -35,6 +35,8 @@ inline constexpr uint64_t kBasicV1Digests[] = {
 
 // tests/catalog/golden/v2/namespaces.rcat, printed by `make_catalog_golden <out> v2` when formatVer 2 was
 // introduced (namespaces plan, Task 3).  Frozen like the v1 pins.
+// One deliberate regeneration (namespace lifecycle plan, Phase 2 Task 2): the script now follows the suspend / resume /
+// delete lifecycle (offsets 9..18); offsets 0..8 are unchanged.
 inline constexpr uint64_t kNamespacesV2Digests[] = {
     0xa56fb60911627d63ull,   // offset 0 NamespaceCreated
     0x5dbeca0a0de4d0e8ull,   // offset 1 NamespaceCreated
@@ -45,9 +47,15 @@ inline constexpr uint64_t kNamespacesV2Digests[] = {
     0xc2976eae7e70723cull,   // offset 6 CreateTopic
     0xe7a629b69dd5f8f3ull,   // offset 7 CreateView
     0x375fd0620005f4f0ull,   // offset 8 NamespaceStateChanged
-    0xac972125f691c8fdull,   // offset 9 NamespaceStateChanged
-    0x18c99adb9b990162ull,   // offset 10 NamespaceStateChanged
-    0xf2dd7c59594c1763ull,   // offset 11 NamespaceDeleted (tombstone fold, F6)
-    0x5677c3637e380eadull,   // offset 12 DropTopic
+    0x209fd56cf2ca8e09ull,   // offset 9 NamespaceStateChanged
+    0x7af43314ac9ceeaaull,   // offset 10 NamespaceStateChanged
+    0x8eebcfa188df1628ull,   // offset 11 CreateTopic
+    0x34dafc904b79b204ull,   // offset 12 NamespaceDeleted
+    0x3b7704af7ddba96eull,   // offset 13 DropTopic
+    0x20d133821f89b81cull,   // offset 14 NamespaceDeleteStep
+    0xd7fd3376d755c8a9ull,   // offset 15 NamespaceDeleteStep
+    0xb941a145e6b355d0ull,   // offset 16 NamespaceDeleteStep
+    0x1e8a7d79d4e2d1e5ull,   // offset 17 NamespaceDeleteStep
+    0xe36227922641b793ull,   // offset 18 DropTopic
 };
 } // namespace rune::catalog::golden

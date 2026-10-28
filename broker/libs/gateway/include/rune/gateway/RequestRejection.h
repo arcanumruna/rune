@@ -170,7 +170,8 @@ inline constexpr std::size_t kMaxRejectionBytes = 64;
     }
     case T::Ping:
     case T::MetadataRequest:
-    case T::ListNamespaces: {     // ListNamespacesResponse (83) has no error field
+    case T::ListNamespaces:       // ListNamespacesResponse (83) has no error field
+    case T::NamespaceUsage: {     // NamespaceUsageResponse (85) is too large for a rejection: ErrorResponse (Phase 2 Task 16)
         pc::ErrorResponse r;
         r.sessionId = sessionId; r.correlationId = correlationId; r.code = ec;
         return r.encode(out);

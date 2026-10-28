@@ -6,7 +6,7 @@
 #   3. the cluster admin creates user `a/admin` and grants it ADMIN ON NAMESPACE a (QL);
 #   4. `a/admin` (session namespace a: bare names) creates user alice, topic t and READ + WRITE on t for alice;
 #   5. alice (RUNE_USER=a/alice) produces N=1000 records to t and consumes them all (rune_produce_subscribe, ws mode,
-#      a plain subscription: group and transactional requests outside `default` are refused until Phase 2);
+#      a plain subscription; groups and transactions work in every namespace);
 #   6. a `default` user (granted READ on every topic prefix "") cannot see `t`: `show topic t;` answers exactly like
 #      `show topic <never created>;` (same exit status, same text modulo the name);
 #   7. `rune namespace list` as a/admin shows exactly `a`;

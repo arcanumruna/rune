@@ -59,7 +59,15 @@ enum class RuneMetric : std::int32_t {
     // 1'000'236 - 1'000'239 reserved
     StuckTxnOffsetCommits      = 1'000'240,
     StuckTxnOffsetAgeMs        = 1'000'241,
+    NsSlotMismatch             = 1'000'242,   // monotonic: namespace slot tags refused (gateway + every worker)
 };
+
+/// Per-namespace rows (namespaces Phase 2 Task 8): allocated per namespace on the control thread when it is created,
+/// freed when it is erased; key = the 4-byte LE nsId, owner tag = the nsId.  kPerNamespaceNodeMetrics sizes the file.
+enum class RuneNsMetric : std::int32_t {
+    Slot = 1'000'300,   // gauge: the namespace's node-local slot
+};
+inline constexpr std::int32_t kPerNamespaceNodeMetrics = 1;
 
 enum class MetricOwner : std::uint8_t { Control, Observer, Provisioner };
 
@@ -77,7 +85,7 @@ using M = RuneMetric;
 }  // namespace detail
 
 /// One row per live metric, in type-id order.  The row index is the slot index in BrokerNode::slots_.
-inline constexpr std::array<RuneMetricDef, 30> kRuneMetrics = {{
+inline constexpr std::array<RuneMetricDef, 31> kRuneMetrics = {{
     {detail::M::Role,                      detail::K::Gauge,   "rune-cluster-node-role",                       detail::O::Observer},
     {detail::M::Term,                      detail::K::Gauge,   "rune-cluster-leadership-term",                 detail::O::Observer},
     {detail::M::StuckMarkers,              detail::K::Gauge,   "rune-txn-stuck-markers",                       detail::O::Control},
@@ -108,12 +116,19 @@ inline constexpr std::array<RuneMetricDef, 30> kRuneMetrics = {{
     {detail::M::PeerFrameDrops,            detail::K::Counter, "rune-peer-frame-drops",                        detail::O::Control},
     {detail::M::StuckTxnOffsetCommits,     detail::K::Gauge,   "rune-txn-offset-commits-stuck",                detail::O::Control},
     {detail::M::StuckTxnOffsetAgeMs,       detail::K::Gauge,   "rune-txn-offset-stuck-age-ms",                 detail::O::Control},
+    {detail::M::NsSlotMismatch,            detail::K::Counter, "rune-ns-slot-mismatch",                        detail::O::Control},
 }};
 
 /// The metric's type id in the metrics file (D61: the enumerator value, equal to the old Aeron counter type id).
 [[nodiscard]] constexpr std::int32_t typeIdOf(RuneMetric m) noexcept { return static_cast<std::int32_t>(m); }
 
 inline constexpr std::int32_t kNodeMetricCount = static_cast<std::int32_t>(kRuneMetrics.size());
+
+/// The file capacity plan of a node that serves up to `maxNamespaces` namespaces (D55).
+[[nodiscard]] constexpr metrics::CapacityPlan runeCapacityPlan(std::int32_t maxNamespaces) noexcept {
+    return {kNodeMetricCount, maxNamespaces, 0, 0, kPerNamespaceNodeMetrics, 16};
+}
+
 
 /// The kRuneMetrics row of `id`; -1 when `id` has no row.  Constexpr, so a call with a constant id folds to the index.
 [[nodiscard]] constexpr std::int32_t runeMetricRow(RuneMetric id) noexcept {

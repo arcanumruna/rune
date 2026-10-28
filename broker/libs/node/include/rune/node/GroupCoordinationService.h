@@ -49,6 +49,7 @@
 #include <rune/coordination/GroupCoordinator.h>
 #include <rune/coordination/ReplicatedOffsetStore.h>
 #include <rune/coordination/TxnOffsetApply.h>
+#include <rune/node/NamespaceReapTypes.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/gateway/IGroupRequestHandler.h>
 
@@ -62,6 +63,8 @@
 #include <functional>
 #include <unordered_map>
 #include <map>
+#include <span>
+#include <string_view>
 #include <string>
 #include <vector>
 
@@ -253,18 +256,28 @@ public:
     // cap the entry count to what fits.
     // Never throws.  Never allocates from heap in steady state.
     // -----------------------------------------------------------------------
-    size_t handleJoinGroup   (const uint8_t* buf, size_t len, int32_t clientVersion, int64_t nowNs, uint8_t* out, size_t outCap) override;
-    size_t handleSyncGroup   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
-    size_t handleHeartbeat   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
-    size_t handleLeaveGroup  (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
-    size_t handleOffsetCommit(const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
-    size_t handleOffsetFetch (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
+    size_t handleJoinGroup   (const uint8_t* buf, size_t len, int32_t clientVersion, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
+    size_t handleSyncGroup   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
+    size_t handleHeartbeat   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
+    size_t handleLeaveGroup  (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
+    size_t handleOffsetCommit(const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
+    size_t handleOffsetFetch (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap,
+        const rune::coordination::NsRequestContext& ctx = {}) override;
     /// No-hang fix round 4 (item 8): every member tracked on `sessionId` leaves
     /// its group (subscriptions revoked, session mapping dropped).  Cold.
     void evictSessionMembers(int64_t sessionId, int64_t nowNs) override;
     /// Authentication Task 14: every member of `sessionId` whose group the check refuses leaves; issue #212: so does
     /// every member of `sessionId` subscribed to a topic `check.mayReadTopic` refuses (cold).
     int removeUnauthorizedMembers(int64_t sessionId, int64_t nowNs, GroupReadCheck check) override;
+    /// Namespaces Phase 2 Task 7 (the reaper, via the control thread): one batch of tombstones of namespace `nsId`'s
+    /// committed consumer offsets.  Refused while this node is not the loaded group coordinator.  More = a batch was
+    /// written, or the tombstones are not yet committed; Done = none left and all committed.
+    ReapStatus tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs);
     /// Issue #212: the session was revoked (terminal) - every member tracked on it leaves its group now (cold).
     void removeSessionMembers(int64_t sessionId, int64_t nowNs) override;
     /// No-hang fix round 5 (N23): only the request's (group, member) on `sessionId`
@@ -281,7 +294,7 @@ public:
     // Coordinator only; idempotent (a group already rebalancing is left as is).
     // Returns the number of groups rebalanced.  Cold.
     // -----------------------------------------------------------------------
-    std::size_t onTopicDropped(std::string_view topicName, int64_t nowNs);
+    std::size_t onTopicDropped(std::string_view topicName, int64_t nowNs, uint32_t nsId = 0);
 
     /// The topic -> partition-count map a rebalance assigns from (test seam, cold).
     [[nodiscard]] rune::coordination::TopicPartitionCounts topicPartitionCountsForTest() const {
@@ -295,7 +308,10 @@ private:
 
     /// Build a TopicPartitionCounts map from the TopicRegistry for autoAssignAndSync.
     /// Cold path — called only on join-timeout transition.
-    rune::coordination::TopicPartitionCounts buildTopicPartitionCounts() const;
+    rune::coordination::TopicPartitionCounts buildTopicPartitionCounts(uint32_t nsId = 0) const;
+    [[nodiscard]] static std::string_view idView_(std::span<const uint8_t> b) noexcept {
+        return std::string_view(reinterpret_cast<const char*>(b.data()), b.size());
+    }
 
     // CG-4: called from doWork on the PreparingRebalance entry for a group.
     // Revokes all group push subscriptions and sends empty Assign (revoke) to

@@ -90,9 +90,12 @@ struct CatalogEffects {
     std::function<void(const rune::catalog::TopicObject&)>               topicApplied;     // CreateTopic only
     std::function<void(const SinkSpec&)>                                 sinkApplied;      // sink of Create/AlterView (F27)
     // A namespace was created, or its limits / state changed (NamespaceCreated, NamespaceLimitsSet,
-    // NamespaceStateChanged): the namespace's record AFTER the event.  Boot posts every namespace once, before any
-    // topic.  NamespaceDeleted posts nothing here (Phase 2 owns the delete effects).
+    // NamespaceStateChanged, NamespaceDeleted, NamespaceDeleteStep): the namespace's record AFTER the event (a DELETING
+    // record included).  Boot posts every namespace once, before any topic.
     std::function<void(const rune::catalog::NamespaceRecord&)>           namespaceUpserted;
+    // A DELETING namespace finished (every object dropped, all four steps recorded) and left the catalog; fires after
+    // the effects of the event that completed it.
+    std::function<void(uint32_t nsId)>                                   namespaceErased;
     std::function<void(int32_t topicId, uint32_t nsId, const std::string& name)> topicDropped;   // DropTopic, retired sink
     std::function<void(int32_t topicId, std::span<const rune::catalog::ConfigChange>)> topicConfig;
     // Validators fan-out of versions fromVersion..current: live passes the current version (earlier ones were

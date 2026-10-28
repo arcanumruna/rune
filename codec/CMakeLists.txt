@@ -246,7 +246,8 @@ add_executable(rune_catalog_tests
     tests/catalog/CatalogReplayerTest.cpp
     tests/catalog/CatalogQueriesTest.cpp
     tests/catalog/CatalogGoldenTest.cpp
-    tests/catalog/NamespaceCatalogV2Test.cpp)
+    tests/catalog/NamespaceCatalogV2Test.cpp
+    tests/catalog/NamespaceLifecycleApplyRegressionTest.cpp)
 target_link_libraries(rune_catalog_tests PRIVATE rune_catalog GTest::gtest_main)
 target_compile_definitions(rune_catalog_tests PRIVATE
     RUNE_CATALOG_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/catalog/golden")

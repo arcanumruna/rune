@@ -20,6 +20,7 @@
 //   bytes32 ops  = u8 opsTag (== kind) + the kind's body (see CatalogEvent.cpp)
 // str16 = u16 length + bytes; str32/bytes32 = u32 length + bytes.
 // Golden byte vectors for every kind pin this layout (tests/catalog/CatalogEventTest.cpp).
+#include <rune/catalog/NamespaceDeleteStep.h>
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/PrimType.h>
 #include <rune/protocol/CatalogTypes.h>
@@ -45,14 +46,15 @@ enum class EventKind : uint16_t {
     CreateView = 7, AlterView = 8, DropView = 9,
     // formatVer 2 (namespaces): the subject namespace is the event's nsId.
     NamespaceCreated = 32, NamespaceLimitsSet = 33, NamespaceStateChanged = 34, NamespaceDeleted = 35,
+    NamespaceDeleteStep = 36,
 };
 inline constexpr uint16_t kFormatV1          = 1;
 inline constexpr uint16_t kFormatV2          = 2;
 inline constexpr uint16_t kCurrentFormatVer  = kFormatV2;
-/// Kinds 32..63 are reserved: formatVer 1 refuses all of them, formatVer 2 accepts 32..35 and refuses 36..63.
+/// Kinds 32..63 are reserved: formatVer 1 refuses all of them, formatVer 2 accepts 32..36 and refuses 37..63.
 inline constexpr uint16_t kReservedKindFirst = 32;
 inline constexpr uint16_t kReservedKindLast  = 63;
-inline constexpr uint16_t kLastNamespaceKind = 35;
+inline constexpr uint16_t kLastNamespaceKind = 36;
 
 enum class Persistence : uint8_t { Disk = 0, Transient = 1 };
 
@@ -136,20 +138,24 @@ struct NamespaceLimitsSetOps    { rune::protocol::NamespaceLimits limits;
 struct NamespaceStateChangedOps { NsStateTag to = NsStateTag::Active;
                                   bool operator==(const NamespaceStateChangedOps&) const = default; };
 struct NamespaceDeletedOps      { bool operator==(const NamespaceDeletedOps&) const = default; };
+/// One cleanup step of a DELETING namespace is done: `step` is exactly one NamespaceDeleteStep.h bit.
+struct NamespaceDeleteStepOps   { uint8_t step = 0;
+                                  bool operator==(const NamespaceDeleteStepOps&) const = default; };
 
 /// The body of each event kind.  Alternative order is NOT the kind number any more (kinds 10..31 are unused):
 /// kKindOfAlt / altOf below are the one mapping, and the ops tag byte on the wire is the KIND.
 using Ops = std::variant<CreateTopicOps, DropTopicOps, AlterTopicConfigOps, CreateSchemaOps,
                          AlterSchemaOps, SetCompatibilityOps, CreateViewOps, AlterViewOps, DropViewOps,
-                         NamespaceCreatedOps, NamespaceLimitsSetOps, NamespaceStateChangedOps, NamespaceDeletedOps>;
+                         NamespaceCreatedOps, NamespaceLimitsSetOps, NamespaceStateChangedOps, NamespaceDeletedOps,
+                         NamespaceDeleteStepOps>;
 
-inline constexpr std::array<EventKind, 13> kKindOfAlt = {
+inline constexpr std::array<EventKind, 14> kKindOfAlt = {
     EventKind::CreateTopic, EventKind::DropTopic, EventKind::AlterTopicConfig, EventKind::CreateSchema,
     EventKind::AlterSchema, EventKind::SetCompatibility, EventKind::CreateView, EventKind::AlterView,
     EventKind::DropView, EventKind::NamespaceCreated, EventKind::NamespaceLimitsSet,
-    EventKind::NamespaceStateChanged, EventKind::NamespaceDeleted};
+    EventKind::NamespaceStateChanged, EventKind::NamespaceDeleted, EventKind::NamespaceDeleteStep};
 
-/// The Ops alternative index of `k`; -1 for a kind that has none (10..31, 36 and up).
+/// The Ops alternative index of `k`; -1 for a kind that has none (10..31, 37 and up).
 [[nodiscard]] constexpr int altOf(EventKind k) noexcept {
     for (std::size_t i = 0; i < kKindOfAlt.size(); ++i)
         if (kKindOfAlt[i] == k) return static_cast<int>(i);
@@ -167,7 +173,7 @@ constexpr bool kindTableBijective() noexcept {
     return true;
 }
 }
-static_assert(std::variant_size_v<Ops> == 13 && kKindOfAlt.size() == 13, "one Ops alternative per EventKind 1..9, 32..35");
+static_assert(std::variant_size_v<Ops> == 14 && kKindOfAlt.size() == 14, "one Ops alternative per EventKind 1..9, 32..36");
 static_assert(detail::kindTableBijective(), "kKindOfAlt must be a bijection onto the Ops alternatives");
 static_assert(detail::kOpsAt<EventKind::CreateTopic, CreateTopicOps> &&
               detail::kOpsAt<EventKind::DropTopic, DropTopicOps> &&
@@ -181,7 +187,8 @@ static_assert(detail::kOpsAt<EventKind::CreateTopic, CreateTopicOps> &&
               detail::kOpsAt<EventKind::NamespaceCreated, NamespaceCreatedOps> &&
               detail::kOpsAt<EventKind::NamespaceLimitsSet, NamespaceLimitsSetOps> &&
               detail::kOpsAt<EventKind::NamespaceStateChanged, NamespaceStateChangedOps> &&
-              detail::kOpsAt<EventKind::NamespaceDeleted, NamespaceDeletedOps>,
+              detail::kOpsAt<EventKind::NamespaceDeleted, NamespaceDeletedOps> &&
+              detail::kOpsAt<EventKind::NamespaceDeleteStep, NamespaceDeleteStepOps>,
               "kKindOfAlt must list each kind at the index of its Ops alternative");
 
 /// Until authentication exists: session id, client name and source address.  Afterwards

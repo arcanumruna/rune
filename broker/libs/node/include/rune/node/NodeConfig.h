@@ -85,6 +85,9 @@ struct TopicSpec {
     int32_t     topicId        = -1;
     /// Namespaces plan Task 6: the namespace the topic lives in (its dir is topicsRoot(dataDir, nsId)/<name>).
     uint32_t    nsId           = 0;
+    /// Namespaces Phase 2 Task 8 (D22): the node-local metric slot of the topic's namespace (0 = `default`); stamped on
+    /// every partition Log (Log::setNsTag) so the hot path indexes an array.
+    uint16_t    nsSlot         = 0;
     /// VLS B.2: a view's sink -- a replica-less, catalog-only namespace (no log, no dir, no replica); its rows live
     /// in the source owner's WorkerViewSet.  Set by the catalog sink effect (live and boot) only.
     bool        viewSink       = false;
@@ -569,6 +572,16 @@ struct NodeConfig {
     // Namespaces Task 9 (spec §11): RUNE_ANONYMOUS_READ=1|true lets an authenticating broker serve a client that never
     // starts SCRAM as the read-only anonymous principal of `default` (schema / catalog reads only).  Off by default.
     bool        anonymousRead    = false;
+    /// Namespaces Phase 2 Task 10 (#236, D24): RUNE_ANONYMOUS_MAX_CONNECTIONS (default 16) - the most anonymous-reader
+    /// sessions one gateway holds - and RUNE_ANONYMOUS_REQUEST_OPS_PER_SEC (default 1000) - the token bucket all of
+    /// them share.  Applied before any namespace limit.  Both are >= 1 (bounded by kMaxAnonymousCap).
+    int32_t     anonymousMaxConnections     = 16;
+    int32_t     anonymousRequestOpsPerSec   = 1000;
+    static constexpr int32_t kMaxAnonymousCap = 1'000'000;
+    /// Namespaces Phase 2 Task 14 (D28): RUNE_NS_LIMIT_TICK_US - the period of the namespace limit aggregator (and of the
+    /// workers' usage reports to it).  Default 10000, range [1000, 1000000].
+    int32_t     nsLimitTickUs = 10'000;
+    static constexpr int32_t kMinNsLimitTickUs = 1'000, kMaxNsLimitTickUs = 1'000'000;
     int32_t     peerAuthStreamId = 40;
     // Issues #15 / #111 (decision M7): a broker serves logins, `__security` reads and security DDL only while its
     // `__security` state is provably current - caught up with the current leader since boot, a leader answer (a
@@ -584,6 +597,10 @@ struct NodeConfig {
     int64_t     securityMaxStalenessMs     = 1'000;
     int64_t     securityStaleSessionEndMs  = 10'000;
     int64_t     securityGateDeadlineMs     = 5'000;
+    /// Namespaces Phase 2 Task 6b (D20): RUNE_NS_DELETE_BATCH - how many tombstones the namespace reaper writes per
+    /// doWork when it removes a deleted namespace's offsets and transaction state (default 256, range 1..65536; an
+    /// invalid value refuses to start).
+    uint32_t    nsDeleteBatch              = 256;
     /// F and R as the broker applies them: never below liveness + 501 ms / F + 1 ms (a default raised by long election
     /// timings or RUNE_BROKER_LIVENESS_TIMEOUT_MS; an explicit env value that violates it is refused at parse).
     [[nodiscard]] int64_t effectiveSecurityMaxStalenessMs() const noexcept {

@@ -12,14 +12,23 @@ using rune::security::ResourceType;
 
 /// true when `before` held a READ grant on a `type` resource that `after` no longer holds verbatim.  Conservative: a
 /// grant swapped for a wider pattern also answers true - the executor then re-checks against the new table.
-bool readGrantLost(const PermissionTable& before, const PermissionTable& after, ResourceType type) {
+bool grantLost(const PermissionTable& before, const PermissionTable& after, ResourceType type, Operation op) {
     const auto b = before.grants();
     const auto a = after.grants();
     for (const rune::security::GrantSpec& g : b) {
-        if (g.op != Operation::Read || g.resource.type != type) continue;
+        if (g.op != op || g.resource.type != type) continue;
         if (std::find(a.begin(), a.end(), g) == a.end()) return true;
     }
     return false;
+}
+bool readGrantLost(const PermissionTable& before, const PermissionTable& after, ResourceType type) {
+    return grantLost(before, after, type, Operation::Read);
+}
+/// Task 4: a WRITE grant lost on a transactional id or a topic - an open transaction of the session may no longer
+/// be written or ended by it.  Conservative like readGrantLost.
+bool txnWriteGrantLost(const PermissionTable& before, const PermissionTable& after) {
+    return grantLost(before, after, ResourceType::TransactionalId, Operation::Write) ||
+           grantLost(before, after, ResourceType::Topic, Operation::Write);
 }
 /// A group READ grant lost: the executor re-checks every member's group.
 bool groupReadGrantLost(const PermissionTable& before, const PermissionTable& after) {
@@ -48,6 +57,7 @@ LiveActions refreshActions(const PermissionTable& before, const PermissionTable&
     out.endSecurityReads = !s.securityReadCorrs.empty() && !after.allowsCluster(rune::security::opBit(Operation::Admin));
     out.endGroups        = groupReadGrantLost(before, after);
     out.endGroupTopics   = topicReadGrantLost(before, after);
+    out.endTxns          = txnWriteGrantLost(before, after);
     return out;
 }
 

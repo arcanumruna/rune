@@ -167,11 +167,11 @@ struct FakeChannel {
 struct FakeTcs final : rune::gateway::ITxnRequestHandler {
     struct Done { int32_t topicId; int32_t partition; int64_t pid; int16_t err; int32_t epoch; bool landed; };
     std::vector<Done> done;
-    size_t handleInitProducerId(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-    size_t handleAddPartitions(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-    size_t handleAddOffsets(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-    size_t handleTxnOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-    size_t handleEndTxn(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+    size_t handleInitProducerId(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+    size_t handleAddPartitions(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+    size_t handleAddOffsets(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+    size_t handleTxnOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
+    size_t handleEndTxn(const uint8_t*, size_t, int64_t, uint8_t*, size_t, const rune::coordination::NsRequestContext&) override { return 0; }
     void onControlMarkerRefused(int32_t t, int32_t p, int64_t pid, int16_t err, int32_t epoch) override {
         done.push_back({t, p, pid, err, epoch, false});
     }

@@ -69,6 +69,7 @@
 #include <rune/protocol/CatalogTypes.h>
 #include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/client/NamespaceMessages.h>
+#include <rune/protocol/client/NamespaceUsageMessages.h>
 #include <rune/client/NamespaceLimitFields.h>
 
 #include <chrono>
@@ -221,6 +222,12 @@ struct ViewRowResult {
     static constexpr uint16_t kBusy            = 6;
     static constexpr uint16_t kRowTooLarge     = 7;   ///< the row exceeds the broker's egress frame (no bytes)
     static constexpr uint16_t kNotAuthorized   = 45;  ///< the session may not READ the view (no bytes; never retried)
+    /// The view is paused over its namespace's memory limit (client version 14); rowBytes = the paused fold offset as one
+    /// little-endian i64 (8 bytes).  Retriable once the limit is raised or memory falls.
+    static constexpr uint16_t kViewPaused      = 54;
+    /// The namespace is over its query / request-ops rate (client version 14); rowBytes = the retry-after in ns as one
+    /// little-endian i64 (8 bytes).
+    static constexpr uint16_t kThrottled       = 53;
     /// Client-side only: the view's source-partition leader was not reached within
     /// the retry budget; never sent by a broker.  NB: a GetViewRow's deadline is
     /// pingTimeoutMs (not ddlTimeoutMs) and its retry budget is viewReadRetryBudget;
@@ -1070,7 +1077,8 @@ public:
     OpResult namespaceDdl(rune::protocol::client::NamespaceDdlKind kind, std::string_view name,
                           const std::array<uint8_t, rune::protocol::client::kNamespacePresentMaskBytes>& presentMask,
                           const rune::protocol::NamespaceLimits& limits, const DdlOptions& ddl,
-                          CompletionTarget target, Token token);
+                          CompletionTarget target, Token token,
+                          rune::protocol::client::NsSuspendMode mode = rune::protocol::client::NsSuspendMode::ReadOnly);
     /// One page of namespaces with nsId > afterNsId (at most `max`; the broker caps it): completes Ok with the raw
     /// ListNamespacesResponse frame as payload (decode with rune::protocol::client::ListNamespacesResponse::decode;
     /// reserve 64 KiB), or BrokerError.  Only the session's own namespace unless it is a cluster admin.
@@ -1085,6 +1093,20 @@ public:
     /// Replaces the namespace's whole limits record with `full`.
     NamespaceResult<void> setNamespaceLimits(std::string_view name, const rune::protocol::NamespaceLimits& full,
                                              std::chrono::milliseconds timeout = std::chrono::seconds(30));
+    /// Phase 2 Task 3 (D21): suspends `name` (ReadOnly: reads served, writes and DDL refused with NamespaceSuspended;
+    /// RejectAll: every session of it ends and its logins are refused), resumes it, or deletes it (sessions closed,
+    /// objects dropped in steps, the record erased).  ADMIN ON CLUSTER; Resume of an Active namespace is an Ok no-op.
+    NamespaceResult<void> suspendNamespace(std::string_view name, rune::protocol::client::NsSuspendMode mode,
+                                           std::chrono::milliseconds timeout = std::chrono::seconds(30));
+    NamespaceResult<void> resumeNamespace(std::string_view name, std::chrono::milliseconds timeout = std::chrono::seconds(30));
+    NamespaceResult<void> deleteNamespace(std::string_view name, std::chrono::milliseconds timeout = std::chrono::seconds(30));
+    /// Phase 2 Task 16 (D29): `name`'s limits next to its current usage on the broker answering (NamespaceUsage 84 ->
+    /// NamespaceUsageResponse 85; the completion payload is the raw response frame).  A cluster admin, or a user of the namespace
+    /// holding DESCRIBE ON NAMESPACE; anyone else gets NotAuthorized.  The blocking form returns the decoded response; a broker
+    /// refusal is the error (DdlResult: errorCode + detail).
+    OpResult namespaceUsage(std::string_view name, CompletionTarget target, Token token);
+    NamespaceResult<rune::protocol::client::NamespaceUsageResponse>
+    namespaceUsage(std::string_view name, std::chrono::milliseconds timeout = std::chrono::seconds(30));
     /// Every namespace this session may see, in nsId order (pages internally).
     NamespaceResult<std::vector<rune::protocol::client::NamespaceInfo>>
     listNamespaces(std::chrono::milliseconds timeout = std::chrono::seconds(30));

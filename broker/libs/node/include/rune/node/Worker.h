@@ -71,6 +71,9 @@
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/node/OrderedWaitQueue.h>
 #include <rune/node/RcState.h>
+#include <rune/node/NsLimitAggregator.h>
+#include <rune/node/NsRingMessages.h>
+#include <rune/node/NsSlotTable.h>
 #include <rune/node/ReturnFifo.h>
 #include <rune/node/WorkerViewSet.h>
 #include <rune/node/SessionAckSink.h>
@@ -681,7 +684,11 @@ public:
     // BrokerNode (Task 19), before the runner starts — single-threaded, like
     // setOwnedDirect().  nullptr (the default) => the view-fold drive in
     // doWork is skipped entirely; the duty cycle is bit-for-bit unchanged.
-    void setViewSet(WorkerViewSet* vs) noexcept { viewSet_ = vs; }
+    void setViewSet(WorkerViewSet* vs) noexcept {
+        viewSet_ = vs;
+        // Task 12: the view set's per-slot arrays follow this worker's slot table size.
+        if (vs != nullptr && vs->nsSlotCapacity() != nsSlots_.capacity()) vs->configureNsSlots(nsSlots_.capacity());
+    }
     [[nodiscard]] WorkerViewSet* viewSet() const noexcept { return viewSet_; }
 
     // Task 16: this worker's view restart-readiness, for the GetViewRow serve
@@ -1272,6 +1279,7 @@ public:
             }
             break;
         case WorkerOp::Type::FilterSchema:   // Phase 2c: the evolving descriptor blob, like SchemaUpdate
+        case WorkerOp::Type::NsSlotAssign:   // Namespaces Phase 2 Task 8: the encoded NamespaceLimits (256 B)
         case WorkerOp::Type::SchemaUpdate:
             // Task 7: descriptor blob carried as the variable tail.
             // topicId is already encoded in the scalar field.
@@ -1789,6 +1797,12 @@ public:
         // pass and every mode — never behind data ops or any backlog.
         work += drainSessionOps_();
         work += beginPushPass_();   // F5: push budget + last pass's deferred reads first
+        if (nowNs >= nextDiskScanNs_) [[unlikely]] scanNamespaceDisk_(nowNs);   // Namespaces Phase 2 Task 11 (D25)
+        if (nowNs >= nextNsReportNs_) [[unlikely]] {   // Task 14: the first tick only arms the deadline (nothing to report yet)
+            const bool armed = nextNsReportNs_ != kNsReportUnarmed;
+            nextNsReportNs_ = nowNs + nsReportIntervalNs_;
+            if (armed) work += reportNsUsage_();
+        }
         // Re-check I6: one INFO line the first pass a consumer is connected to THIS
         // worker's MDC egress (every mode); latched, so one branch per pass after it.
         if (workerEgress_ && !workerEgress_->connectedLogged()) [[unlikely]]
@@ -2679,6 +2693,19 @@ private:
             break;
         case WorkerOp::Type::TopicDropped:
             markTopicDropped_(op.topicId());
+            break;
+        case WorkerOp::Type::NsSlotAssign:
+            executeNsSlotAssignWire_(op);
+            break;
+        case WorkerOp::Type::NsSlotRelease:
+            executeNsSlotReleaseWire_(op);
+            break;
+        case WorkerOp::Type::NsThrottle:      // Namespaces Phase 2 Task 14 (D28)
+            applyNsThrottle_(static_cast<uint16_t>(op.topicId()), static_cast<uint32_t>(op.nextOffset()),
+                             static_cast<ThrottleKind>(op.partition()), op.hwBound());
+            break;
+        case WorkerOp::Type::NsViewMemOver:   // Task 14 (D26)
+            applyNsViewMemOver_(static_cast<uint16_t>(op.topicId()), static_cast<uint32_t>(op.nextOffset()), op.partition() != 0);
             break;
         case WorkerOp::Type::PeerLinkKeys:
             executePeerLinkKeysWire_(op);
@@ -4078,7 +4105,27 @@ private:
         enqueueReturn_(std::move(ret));
     }
 
+    /// Task 14 (D28): the cycles one view read costs are charged to its namespace's queryCycles (two counter reads and
+    /// one add).  The read's slot is the source log's; a transient source is untagged and not charged.
     ViewServe serveViewRead_(ViewReadReq& r) {
+        lastViewReadSlot_ = kNoNsSlot;
+        const uint64_t t0 = readCycleCounter_();
+        const ViewServe v = serveViewReadImpl_(r);
+        if (lastViewReadSlot_ != kNoNsSlot) nsHot_[lastViewReadSlot_].queryCycles += readCycleCounter_() - t0;
+        return v;
+    }
+    [[nodiscard]] static uint64_t readCycleCounter_() noexcept {
+#if defined(__x86_64__)
+        return __builtin_ia32_rdtsc();
+#elif defined(__aarch64__)
+        uint64_t v;
+        asm volatile("mrs %0, cntvct_el0" : "=r"(v));
+        return v;
+#else
+        return 0;
+#endif
+    }
+    ViewServe serveViewReadImpl_(ViewReadReq& r) {
         const int32_t  viewTopicId = r.viewTopicId;
         const int32_t  partition   = r.partition;
         const uint64_t keyU64      = r.key;
@@ -4142,7 +4189,25 @@ private:
                 enqueueReturn_(std::move(ret));
                 return ViewServe::Answered;
             }
+            if (rune::storage::Log* const sl = srcRep->isDiskBacked() ? srcRep->log() : nullptr; sl != nullptr && src >= 0) {   // Task 14: count + pace (one add, one compare); a transient source has no Log and no namespace tag
+                NsHot& nh = nsHot_[sl->nsSlot()];
+                ++nh.requestOps;
+                lastViewReadSlot_ = sl->nsSlot();
+                if (passNowNs_ < nh.queryUntil) [[unlikely]] {
+                    ++throttledRefusals_;
+                    ret.errorCode  = static_cast<int16_t>(RS::kThrottled);
+                    ret.lastOffset = nh.queryUntil - passNowNs_;
+                    enqueueReturn_(std::move(ret));
+                    return ViewServe::Answered;
+                }
+            }
             const WorkerViewSet::InstanceServeState st = viewSet_->instanceServeState(viewTopicId, partition);
+            if (st.paused) [[unlikely]] {   // Task 12 (D26): over the namespace's view memory; lastOffset = the paused offset
+                ret.errorCode  = static_cast<int16_t>(RS::kViewPaused);
+                ret.lastOffset = st.pausedOffset;
+                enqueueReturn_(std::move(ret));
+                return ViewServe::Answered;
+            }
             if (!st.hosted || st.leadership != srcRep->leadershipGeneration()) {   // not folded under THIS leadership yet
                 ret.errorCode = static_cast<int16_t>(RS::kNotReady);
                 enqueueReturn_(std::move(ret));
@@ -4175,6 +4240,8 @@ private:
             return ViewServe::Answered;
         } else if (rs == WorkerViewSet::RowStatus::NotReady) {
             ret.errorCode = static_cast<int16_t>(RS::kNotReady);
+        } else if (rs == WorkerViewSet::RowStatus::Paused) {
+            ret.errorCode = static_cast<int16_t>(RS::kViewPaused);
         } else {
             ret.errorCode = static_cast<int16_t>(RS::kAbsentKey);
         }
@@ -4315,6 +4382,20 @@ private:
             ret.setPushEffectiveBound(-1);
             enqueueReturn_(ret);
             return;
+        }
+
+        // Namespaces Phase 2 Task 14 (D28): a namespace over its fetch-bytes (or request-ops) rate is not read for: the
+        // read is UNANSWERED (the gateway re-issues it on its next push cycle, nothing parks), which paces delivery to the
+        // limit.  One array index and one compare; internal topics (topicId < 0) are never paced.
+        if (log != nullptr && topicId >= 0) {
+            NsHot& nh = nsHot_[log->nsSlot()];
+            ++nh.requestOps;
+            if (passNowNs_ < nh.fetchUntil) [[unlikely]] {
+                ++throttledRefusals_;
+                ret.setPushEffectiveBound(-1);
+                enqueueReturn_(ret);
+                return;
+            }
         }
 
         // F15 §2.4 (I-B): the read_committed decision for the GATEWAY push path
@@ -4495,6 +4576,7 @@ private:
         pushBudgetLeft_ -= std::min(total, pushBudgetLeft_);
         ++pushReadChunks_;
         pushReadBytes_ += total;
+        if (log != nullptr) nsHot_[log->nsSlot()].fetchBytes += total;   // Task 14 (D28): one add
         return PushChunk::Written;
     }
 
@@ -6174,6 +6256,195 @@ private:
     static std::size_t ptrHash_(const void* p) noexcept {
         return static_cast<std::size_t>((reinterpret_cast<uintptr_t>(p) >> 4) * 0x9E3779B97F4A7C15ull);
     }
+    // ---- Namespaces Phase 2 Task 8 (D22): this worker's OWN namespace slot table, fed by NsSlotAssign / NsSlotRelease
+    // ops on the ingress ring (FIFO with every other op).  Fixed arrays sized RUNE_MAX_NAMESPACES at start; the hot
+    // path (produceCore_) is one matches() call - an array index and a compare.  A mismatch is counted
+    // (`rune.ns.slot_mismatch`, reported to the control thread as a SessionSignal) and refused, never applied.
+    NsSlotTable nsSlots_;
+    uint64_t    nsSlotMismatches_ = 0;
+    // ---- Namespaces Phase 2 Task 11 (D25): THIS worker's disk usage per namespace slot.  nsDiskBytes_[slot] is the sum of
+    // Log::bytesOnDisk() (O(1) per log) over the disk logs this worker owns - leader and follower replicas alike -
+    // re-derived every kDiskScanIntervalNs and bumped by each leader append in between; nsOverDisk_[slot] is the one byte
+    // the leader produce path reads.  Per WORKER until Task 14's aggregator sums the node (a per-node check is not yet
+    // possible: a namespace's partitions spread over the workers).  Follower apply, catch-up, the cleaner and internal
+    // topics (topicId < 0) never read it.
+    //
+    // Task 14 (D25, D28): the over-disk byte is no longer decided here.  The control thread's aggregator sums every
+    // worker's per-slot bytes (reported below) and broadcasts Throttle{Disk, INT64_MAX} / 0; nsOverDisk_ only mirrors it.
+    // The byte accounting (nsDiskBytes_) stays: it is what this worker reports.
+    static constexpr int64_t kDiskScanIntervalNs = 50'000'000;
+    std::vector<int64_t> nsDiskBytes_ = std::vector<int64_t>(NsSlotTable::kDefaultCapacity, 0);
+    std::vector<uint8_t> nsOverDisk_  = std::vector<uint8_t>(NsSlotTable::kDefaultCapacity, 0);
+    int64_t              nextDiskScanNs_ = 0;
+    uint64_t             overDiskRefusals_ = 0;
+    // ---- Task 14 (D28): per-slot rate counters (one add each on the hot path) and the throttle deadlines the aggregator
+    // broadcasts (one compare).  One struct per slot = one or two cache lines; arrays sized to the slot table at start.
+    struct NsHot {
+        uint64_t produceBytes = 0, produceRecords = 0, fetchBytes = 0, requestOps = 0, queryCycles = 0;
+        int64_t  produceUntil = 0;   ///< max(ProduceBytes, ProduceRecords, RequestOps): the one compare a produce pays
+        int64_t  fetchUntil   = 0;   ///< max(FetchBytes, RequestOps)
+        int64_t  queryUntil   = 0;   ///< max(QueryCycles, RequestOps)
+        int64_t  until[kThrottleKinds] = {};
+    };
+    std::vector<NsHot>    nsHot_ = std::vector<NsHot>(NsSlotTable::kDefaultCapacity);
+    std::vector<uint64_t> nsLastReport_ = std::vector<uint64_t>(NsSlotTable::kDefaultCapacity * kNsMetrics, 0);
+    int64_t               nsReportIntervalNs_ = 5'000'000;
+    static constexpr int64_t kNsReportUnarmed = std::numeric_limits<int64_t>::min();
+    int64_t               nextNsReportNs_ = kNsReportUnarmed;
+    uint64_t              throttledRefusals_ = 0;
+    uint16_t              lastViewReadSlot_ = kNoNsSlot;
+public:
+    [[nodiscard]] int64_t  nsDiskBytesForTest(uint16_t slot) const noexcept { return slot < nsDiskBytes_.size() ? nsDiskBytes_[slot] : 0; }
+    [[nodiscard]] bool     nsOverDiskForTest(uint16_t slot) const noexcept { return slot < nsOverDisk_.size() && nsOverDisk_[slot] != 0; }
+    [[nodiscard]] uint64_t overDiskRefusalsForTest() const noexcept { return overDiskRefusals_; }
+    [[nodiscard]] uint64_t throttledRefusalsForTest() const noexcept { return throttledRefusals_; }
+    [[nodiscard]] int64_t  nsThrottleUntilForTest(uint16_t slot, ThrottleKind k) const noexcept {
+        return slot < nsHot_.size() ? nsHot_[slot].until[static_cast<std::size_t>(k)] : 0;
+    }
+    [[nodiscard]] uint64_t nsCounterForTest(uint16_t slot, NsMetric m) const noexcept {
+        if (slot >= nsHot_.size()) return 0;
+        const NsHot& h = nsHot_[slot];
+        switch (m) {
+            case NsMetric::ProduceBytes:   return h.produceBytes;
+            case NsMetric::ProduceRecords: return h.produceRecords;
+            case NsMetric::FetchBytes:     return h.fetchBytes;
+            case NsMetric::RequestOps:     return h.requestOps;
+            case NsMetric::QueryCycles:    return h.queryCycles;
+            case NsMetric::DiskBytes:      return static_cast<uint64_t>(nsDiskBytes_[slot]);
+            default:                       return viewSet_ != nullptr ? viewSet_->nsViewMemBytes(slot) : 0;
+        }
+    }
+    /// How often this worker reports its per-slot usage to the aggregator (set from RUNE_NS_LIMIT_TICK_US at start).
+    void setNsReportIntervalNs(int64_t ns) noexcept { nsReportIntervalNs_ = ns < 1 ? 1 : ns; }
+    /// Test seam: deliver an aggregator message exactly as the ring would.
+    void applyNsThrottleDirect(uint16_t slot, uint32_t nsId, ThrottleKind k, int64_t untilNs) { applyNsThrottle_(slot, nsId, k, untilNs); }
+    void applyNsViewMemOverDirect(uint16_t slot, uint32_t nsId, bool on) { applyNsViewMemOver_(slot, nsId, on); }
+    /// Test seam: the usage report exactly as doWork sends it (every slot whose value changed since the last report).
+    int reportNsUsageForTest() { return reportNsUsage_(); }
+    /// Test seam: run the periodic disk scan now.
+    void scanNamespaceDiskForTest(int64_t nowNs) { scanNamespaceDisk_(nowNs); }
+    /// Boot only (before the runner starts): size the slot table to RUNE_MAX_NAMESPACES.
+    void configureNsSlots(uint32_t capacity) {
+        nsSlots_.reset(capacity);
+        nsDiskBytes_.assign(nsSlots_.capacity(), 0);
+        nsOverDisk_.assign(nsSlots_.capacity(), 0);
+        nsHot_.assign(nsSlots_.capacity(), NsHot{});
+        nsLastReport_.assign(static_cast<std::size_t>(nsSlots_.capacity()) * kNsMetrics, 0);
+    }
+    [[nodiscard]] const NsSlotTable& nsSlotsForTest() const noexcept { return nsSlots_; }
+    [[nodiscard]] uint64_t nsSlotMismatchesForTest() const noexcept { return nsSlotMismatches_; }
+    /// Test seam: deliver a namespace slot message exactly as the ring would.
+    void applyNsSlotAssignDirect(uint16_t slot, uint32_t nsId, const rune::protocol::NamespaceLimits& l) { applyNsSlotAssign_(slot, nsId, l); }
+    bool applyNsSlotReleaseDirect(uint16_t slot, uint32_t nsId) { return applyNsSlotRelease_(slot, nsId); }
+    /// Test seam: the hot-path check a stale (slot, nsId) tag goes through (counts + reports on a mismatch).
+    bool checkNsTagForTest(uint16_t slot, uint32_t nsId) { return checkNsTag_(slot, nsId); }
+private:
+    /// Hot path: does this worker's table hold `nsId` in `slot`?  Counts a mismatch.
+    [[nodiscard]] bool checkNsTag_(uint16_t slot, uint32_t nsId) {
+        if (nsSlots_.matches(slot, nsId)) [[likely]] return true;
+        noteNsSlotMismatch_();
+        return false;
+    }
+    [[gnu::cold]] [[gnu::noinline]] void noteNsSlotMismatch_() {
+        ++nsSlotMismatches_;
+        (void)trySessionSignal_(0, SessionSignalKind::NsSlotMismatch, static_cast<int64_t>(nsSlotMismatches_));
+    }
+    [[gnu::cold]] void applyNsSlotAssign_(uint16_t slot, uint32_t nsId, const rune::protocol::NamespaceLimits& l) {
+        if (nsSlots_.nsIdAt(slot) != nsId) {
+            if (!nsSlots_.place(slot, nsId)) {
+                noteNsSlotMismatch_();   // the slot is out of range or holds another namespace: never applied
+                return;
+            }
+            resetNsSlotState_(slot);     // a reused slot starts from zero usage and no throttle (D22)
+        }
+        nsSlots_.setLimits(slot, l);
+        if (viewSet_ != nullptr) viewSet_->onNsSlotAssign(slot, nsId, l);
+    }
+    [[gnu::cold]] bool applyNsSlotRelease_(uint16_t slot, uint32_t nsId) {
+        if (!nsSlots_.release(slot, nsId)) { noteNsSlotMismatch_(); return false; }
+        if (viewSet_ != nullptr) viewSet_->onNsSlotFreed(slot, nsId);
+        resetNsSlotState_(slot);
+        return true;
+    }
+    /// Cold: zero a slot's counters, throttles and over-disk byte (a new owner, or the owner's erase).
+    void resetNsSlotState_(uint16_t slot) noexcept {
+        if (slot >= nsHot_.size()) return;
+        nsHot_[slot] = NsHot{};
+        nsOverDisk_[slot] = 0;
+        nsDiskBytes_[slot] = 0;
+        for (std::size_t m = 0; m < kNsMetrics; ++m) nsLastReport_[static_cast<std::size_t>(slot) * kNsMetrics + m] = 0;
+    }
+    /// Cold (a CHANGE, from the aggregator): set one throttle deadline.  The (slot, nsId) tag is checked: a message for
+    /// a namespace that no longer owns the slot is dropped and counted, never applied to the new owner (D22).
+    [[gnu::cold]] void applyNsThrottle_(uint16_t slot, uint32_t nsId, ThrottleKind kind, int64_t untilNs) {
+        if (!checkNsTag_(slot, nsId) || static_cast<std::size_t>(kind) >= kThrottleKinds) return;
+        NsHot& h = nsHot_[slot];
+        h.until[static_cast<std::size_t>(kind)] = untilNs;
+        if (kind == ThrottleKind::Disk) nsOverDisk_[slot] = untilNs != 0 ? 1 : 0;
+        const auto u = [&](ThrottleKind k) { return h.until[static_cast<std::size_t>(k)]; };
+        h.produceUntil = std::max({u(ThrottleKind::ProduceBytes), u(ThrottleKind::ProduceRecords), u(ThrottleKind::RequestOps)});
+        h.fetchUntil   = std::max(u(ThrottleKind::FetchBytes), u(ThrottleKind::RequestOps));
+        h.queryUntil   = std::max(u(ThrottleKind::QueryCycles), u(ThrottleKind::RequestOps));
+    }
+    [[gnu::cold]] void applyNsViewMemOver_(uint16_t slot, uint32_t nsId, bool on) {
+        if (!checkNsTag_(slot, nsId)) return;
+        if (viewSet_ != nullptr) viewSet_->onViewMemOver(slot, nsId, on);
+    }
+    /// Cold, paced: report every slot metric that changed since the last report to the aggregator (a SessionSignal on the
+    /// return ring).  A full ring keeps the metric unreported (retried next interval) - never a spin, never dropped.
+    int reportNsUsage_() {
+        int sent = 0;
+        const std::size_t cap = nsHot_.size();
+        for (std::size_t sl = 0; sl < cap; ++sl) {
+            const uint32_t nsId = nsSlots_.nsIdAt(static_cast<uint16_t>(sl));
+            if (nsId == NsSlotTable::kFreeSlot) continue;
+            const NsHot& h = nsHot_[sl];
+            const uint64_t vals[kNsMetrics] = {h.produceBytes, h.produceRecords, h.fetchBytes, h.requestOps, h.queryCycles,
+                                               static_cast<uint64_t>(nsDiskBytes_[sl]),
+                                               viewSet_ != nullptr ? viewSet_->nsViewMemBytes(static_cast<uint16_t>(sl)) : 0};
+            for (std::size_t m = 0; m < kNsMetrics; ++m) {
+                uint64_t& last = nsLastReport_[sl * kNsMetrics + m];
+                if (vals[m] == last) continue;
+                WorkerReturn r;
+                r.type          = WorkerReturn::Type::SessionSignal;
+                r.sessionId     = static_cast<int64_t>((sl << 8) | m);
+                r.correlationId = static_cast<int64_t>(nsId);
+                r.partition     = workerId_;
+                r.lastOffset    = static_cast<int64_t>(SessionSignalKind::NsUsage);
+                r.baseOffset    = static_cast<int64_t>(vals[m]);
+                if (!retFifo_.empty() || !tryWriteReturn_(r)) { ++sessionSignalsDeferred_; return sent; }
+                last = vals[m];
+                ++sent;
+            }
+        }
+        return sent;
+    }
+    /// Cold, every kDiskScanIntervalNs: recount each slot's bytes from the owned disk logs and set the over-disk byte.
+    [[gnu::cold]] void scanNamespaceDisk_(int64_t nowNs) {
+        nextDiskScanNs_ = nowNs + kDiskScanIntervalNs;
+        std::fill(nsDiskBytes_.begin(), nsDiskBytes_.end(), int64_t{0});
+        for (const auto* r : owned_) {
+            if (r == nullptr || !r->isDiskBacked()) continue;
+            const rune::storage::Log* l = r->log();
+            if (l == nullptr || l->nsSlot() >= nsDiskBytes_.size()) continue;
+            nsDiskBytes_[l->nsSlot()] += l->bytesOnDisk();
+        }
+    }
+    /// Hot path (one add, one compare): a leader append of `bytes` to a user topic of `slot`.
+    [[gnu::always_inline]] void noteDiskAppend_(uint16_t slot, std::size_t bytes) noexcept {
+        nsDiskBytes_[slot] += static_cast<int64_t>(bytes);
+    }
+    [[gnu::cold]] void executeNsSlotAssignWire_(sbe::WorkerOp& op) {
+        rune::protocol::NamespaceLimits l;
+        // SBE var-data order: the length first, then tail() (which advances past the data).
+        const uint32_t tailLen = op.tailLength();
+        const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
+        if (!rune::protocol::decodeLimits(tail, tailLen, l)) { noteNsSlotMismatch_(); return; }
+        applyNsSlotAssign_(static_cast<uint16_t>(op.topicId()), static_cast<uint32_t>(op.nextOffset()), l);
+    }
+    [[gnu::cold]] void executeNsSlotReleaseWire_(sbe::WorkerOp& op) {
+        (void)applyNsSlotRelease_(static_cast<uint16_t>(op.topicId()), static_cast<uint32_t>(op.nextOffset()));
+    }
     // ---- Ownership table: ownedInc_[registryId] = the incarnation this worker
     // owns (0 = not owned).  Dense, indexed by the registry id carried in the op.
     std::vector<uint32_t> ownedInc_;
@@ -6495,7 +6766,7 @@ private:
                     return readNoFault_(log, from, kPushMaxChunkBytes, to);
                 };
                 work += driveViewsOf_(topicId, partition, readRange, bound, aborted, nowNs, nullptr,
-                                      replica->leadershipGeneration(), hwConfirmed);
+                                      replica->leadershipGeneration(), hwConfirmed, NsTag{log->nsSlot(), log->nsId()});
             } else {
                 // Phase 2b E: a TRANSIENT source — zero-copy view into the
                 // replica's own ring (same thread).  The fold itself stops at its
@@ -6535,7 +6806,7 @@ private:
     int driveViewsOf_(int32_t topicId, int32_t partition, ReadRangeFn& readRange,
                       int64_t bound, const rune::view::AbortedTxnFilter& aborted, int64_t nowNs,
                       const rune::replication::PartitionReplica* transientRep,
-                      uint64_t leaderGen, bool leaderHwConfirmed) {
+                      uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns = {}) {
         int work = 0;
         TransientBounds tb;
         const TransientBounds* tbp = nullptr;
@@ -6551,10 +6822,10 @@ private:
         if (viewSet_->hasRecovery()) [[unlikely]] {
             viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
             work += viewSet_->driveRebuild(topicId, partition, readRange, bound, aborted, nowNs, tbp, leaderGen,
-                                           leaderHwConfirmed);
+                                           leaderHwConfirmed, ns);
         }
         work += viewSet_->driveFolds(topicId, partition, readRange, bound, aborted, nowNs, tbp, leaderGen,
-                                     leaderHwConfirmed);
+                                     leaderHwConfirmed, ns);
         return work;
     }
 
@@ -8413,6 +8684,38 @@ private:
             enqueueReturn_(ret);
             return 1;
         }
+        // Namespaces Phase 2 Task 8 (D22): the topic's (nsId, nsSlot) tag must match THIS worker's slot table.  One array
+        // index and a compare.  A slot this worker has not been told about yet (the assign is still queued behind a full
+        // ring) is the retriable NotLeader; a slot that holds another namespace is a stale tag: InvalidRequest.
+        if (log != nullptr && !nsSlots_.matches(log->nsSlot(), log->nsId())) [[unlikely]] {
+            const bool unassigned = nsSlots_.nsIdAt(log->nsSlot()) == NsSlotTable::kFreeSlot;
+            noteNsSlotMismatch_();
+            ret.errorCode = static_cast<int16_t>(unassigned ? pc::ErrorCode::NotLeader : pc::ErrorCode::InvalidRequest);
+            enqueueReturn_(ret);
+            return 1;
+        }
+        // Namespaces Phase 2 Task 11 (D25): a LEADER produce to a user topic of a namespace over its disk limit is refused
+        // (one byte load); nothing is appended.  Internal topics (topicId < 0), follower apply, catch-up and the cleaner
+        // never get here / never read it.
+        if (log != nullptr && f.topicId >= 0) {
+            NsHot& nh = nsHot_[log->nsSlot()];
+            ++nh.requestOps;   // Task 14 (D28): one add ...
+            if (nsOverDisk_[log->nsSlot()] != 0) [[unlikely]] {
+                ++overDiskRefusals_;
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NamespaceLimitExceeded);
+                enqueueReturn_(ret);
+                return 1;
+            }
+            // ... and one compare.  Throttled (53): the retry-after rides lastOffset (an error answer carries no offset);
+            // the gateway puts it on the wire.  Nothing is appended.
+            if (nowNs < nh.produceUntil) [[unlikely]] {
+                ++throttledRefusals_;
+                ret.errorCode  = static_cast<int16_t>(pc::ErrorCode::Throttled);
+                ret.lastOffset = nh.produceUntil - nowNs;
+                enqueueReturn_(ret);
+                return 1;
+            }
+        }
         // F15 §2.3 produce gate (see executeProduceWire_) + PSM <-> log
         // consistency: an idempotent batch is validated only against a producer
         // state proven consistent with this log (see psm_).
@@ -8612,6 +8915,12 @@ private:
         // GR-4 Mode A: advance the replica's LEO/HW after successful append.
         if (replica) {
             replica->onLeaderLogAppended();
+        }
+        if (log != nullptr && f.topicId >= 0) {   // Task 11 (D25) + Task 14 (D28): the append's bytes and records, one add each
+            noteDiskAppend_(log->nsSlot(), rbSpan.size());
+            NsHot& nh = nsHot_[log->nsSlot()];
+            nh.produceBytes   += rbSpan.size();
+            nh.produceRecords += static_cast<uint64_t>(ret.lastOffset - ret.baseOffset + 1);
         }
 
         // F15 §2.1 (C1): RC update in the same invocation as the append; a

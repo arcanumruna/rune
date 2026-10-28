@@ -12,6 +12,8 @@
 #include <unistd.h>
 
 #include <gtest/gtest.h>
+
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <string>
@@ -784,6 +786,26 @@ TEST(NodeConfigRegression, SecurityServingBoundsAreParsedAndValidatedRegression)
     EXPECT_EQ(r3.config->effectiveSecurityStaleSessionEndMs(), 60'502);
     env3["RUNE_SECURITY_MAX_STALENESS_MS"] = "30000";   // explicit and below the floor
     EXPECT_FALSE(parseNodeConfig(fakeEnv(env3)).error.empty());
+}
+
+// Namespaces Phase 2 Task 6b (D20): RUNE_NS_DELETE_BATCH - default 256, range 1..65536, anything else refuses to start.
+TEST(NodeConfigRegression, NsDeleteBatchIsParsedAndBoundedRegression) {
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_EQ(r.config->nsDeleteBatch, 256u);
+    for (const char* ok : {"1", "256", "65536"}) {
+        auto env = base1node();
+        env["RUNE_NS_DELETE_BATCH"] = ok;
+        auto g = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(g.error.empty()) << ok << ": " << g.error;
+        EXPECT_EQ(g.config->nsDeleteBatch, static_cast<uint32_t>(std::stoul(ok)));
+    }
+    for (const char* bad : {"0", "-1", "65537", "many", "12x", "4294967296"}) {
+        auto env = base1node();
+        env["RUNE_NS_DELETE_BATCH"] = bad;
+        const auto g = parseNodeConfig(fakeEnv(env));
+        EXPECT_NE(g.error.find("RUNE_NS_DELETE_BATCH"), std::string::npos) << bad;
+    }
 }
 
 // CP3 I4: RUNE_BROKER_LIVENESS_TIMEOUT_MS — default 0 (the agent uses 3 x the leader-heartbeat timeout); a positive value
@@ -3143,6 +3165,56 @@ TEST(NodeConfigRegression, MaxNamespacesReadWithoutGroupSessionTimeoutRegression
     r = parseNodeConfig(fakeEnv(env));
     EXPECT_FALSE(r.config.has_value());
     EXPECT_NE(r.error.find("RUNE_MAX_NAMESPACES"), std::string::npos) << r.error;
+}
+
+// Namespaces Phase 2 Task 14 (D28): RUNE_NS_LIMIT_TICK_US - default 10000, carried when set, range [1000, 1000000].
+TEST(NodeConfigRegression, NsLimitTickRegression) {
+    auto env = base1node();
+    env["RUNE_AUTH"] = "disabled";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->nsLimitTickUs, 10'000);
+    for (const char* ok : {"1000", "1000000", "25000"}) {
+        env["RUNE_NS_LIMIT_TICK_US"] = ok;
+        r = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(r.config.has_value()) << ok << ": " << r.error;
+        EXPECT_EQ(r.config->nsLimitTickUs, std::atoi(ok));
+    }
+    for (const char* bad : {"999", "1000001", "0", "-5", "x", "1e3"}) {
+        env["RUNE_NS_LIMIT_TICK_US"] = bad;
+        r = parseNodeConfig(fakeEnv(env));
+        EXPECT_FALSE(r.config.has_value()) << bad;
+        EXPECT_NE(r.error.find("RUNE_NS_LIMIT_TICK_US"), std::string::npos) << r.error;
+    }
+}
+
+// Namespaces Phase 2 Task 10 (#236, D24): the anonymous caps - defaults 16 / 1000, carried when set, bounds-checked.
+TEST(NodeConfigRegression, AnonymousCapsRegression) {
+    auto env = base1node();
+    env["RUNE_AUTH"] = "disabled";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->anonymousMaxConnections, 16);
+    EXPECT_EQ(r.config->anonymousRequestOpsPerSec, 1000);
+    env["RUNE_ANONYMOUS_MAX_CONNECTIONS"] = "3";
+    env["RUNE_ANONYMOUS_REQUEST_OPS_PER_SEC"] = "250";
+    r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->anonymousMaxConnections, 3);
+    EXPECT_EQ(r.config->anonymousRequestOpsPerSec, 250);
+    env["RUNE_ANONYMOUS_MAX_CONNECTIONS"] = "1000000";   // the bound itself
+    r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->anonymousMaxConnections, 1'000'000);
+    for (const char* name : {"RUNE_ANONYMOUS_MAX_CONNECTIONS", "RUNE_ANONYMOUS_REQUEST_OPS_PER_SEC"})
+        for (const char* bad : {"0", "-1", "x", "1000001", "99999999999999999999"}) {
+            auto e = base1node();
+            e["RUNE_AUTH"] = "disabled";
+            e[name] = bad;
+            const auto res = parseNodeConfig(fakeEnv(e));
+            EXPECT_FALSE(res.config.has_value()) << name << "=" << bad;
+            EXPECT_NE(res.error.find(name), std::string::npos) << res.error;
+        }
 }
 
 } // namespace rune::node

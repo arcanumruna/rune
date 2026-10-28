@@ -2535,6 +2535,21 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         if (b->attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b->attemptDeadlineNs;
         return;
     }
+    // Namespaces Phase 2 Task 14 (D28): Throttled (53) - the namespace is over its produce rate.  Definitely not appended
+    // (the worker refuses before the append), the route is right: re-sent unchanged (same identity, a new attempt) after the
+    // broker's retry-after (carried in logStartOffset; absent/garbage -> kRetriableBackoffNs), floored at 1 ms and capped by
+    // the delivery timeout so a wrong value can neither spin nor park the batch past it.
+    if (ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::Throttled)) {
+        FLIGHT_RECORDER_MARK_ARG_VAL_PRODUCE(flight_recorder::Site::ClientRetriable, flight_recorder::foldCorr(correlationId),
+                                     static_cast<uint16_t>(ec), 0.0);
+        const int64_t hint = logStartOffset > 0 ? logStartOffset : kRetriableBackoffNs;
+        const int64_t backoffNs = std::min<int64_t>(std::max<int64_t>(hint, 1'000'000LL), cfg_.produceTimeoutMs * 1'000'000LL);
+        b->attemptDeadlineNs = lastNowNs_ + backoffNs;
+        b->retriableBackoff  = true;
+        ++throttledBackoffs_;
+        if (b->attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b->attemptDeadlineNs;
+        return;
+    }
     // Phase 2b E2 (ruling 2): TransientLogFull (42) — the leader's transient
     // ring is full of not-yet-replicated records; definitely not appended, the
     // route is right (no park, no metadata) — exactly MinIsrViolation's retry.

@@ -197,16 +197,13 @@ inline Outcome expect(Op o, Caller c, Target t, Timing = Timing::Sequential) {
         if (o == Op::CreateNamespace) return t == Target::Missing ? Outcome::ok() : Outcome::exists(kTopicExists);
         return t == Target::Missing ? Outcome::missing() : Outcome::ok();
     }
-    // 4. groups and transactions: only a `default` session on a `default` target (D8: root too).  Every non-root
-    //    caller of the rig lives outside `default`.
-    if (o == Op::GroupJoin || o == Op::TxnInit) {
-        if (!root) return Outcome::notAuthorized();
-        if (t == Target::OwnNs || t == Target::ForeignNs) return Outcome::notAuthorized();
-        // A missing transactional id is created; a join names topics it does not check (a member may subscribe
-        // before a topic exists, as in Kafka), so both answer Ok.
-        if (t == Target::Missing) return Outcome::ok();
-        return Outcome::ok();
-    }
+    // 4. groups and transactions (Phase 2 Task 5, D19: they work in every namespace).  A transactional id is a name
+    //    resolved in the caller's namespace (a qualifier the caller cannot see is an opaque id of its own), so
+    //    InitProducerId answers Ok for every caller holding the write grant, whatever the target.  A join is
+    //    id-addressed (its topic id): the general rules apply, except that root's join names a topic id it does not
+    //    check (a member may subscribe before a topic exists, as in Kafka), so it answers Ok on a Missing target.
+    if (o == Op::TxnInit) return granted(o, c) ? Outcome::ok() : Outcome::notAuthorized();
+    if (o == Op::GroupJoin && t == Target::Missing && root) return Outcome::ok();
     // 5. ForeignNs: root and the target namespace's own admin (logged into it, naming it unqualified)
     if (t == Target::ForeignNs) {
         if (root || c == Caller::NsAdminSame) return todays(o);

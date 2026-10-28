@@ -118,6 +118,8 @@ public:
     [[nodiscard]] uint64_t startedCount() const noexcept { return started_; }
     [[nodiscard]] uint64_t answeredCount() const noexcept { return answered_; }
     [[nodiscard]] uint64_t eventsAppended() const noexcept { return eventsAppended_; }
+    /// NamespacePurged events this leader appended on its own.
+    [[nodiscard]] uint64_t purgesIssued() const noexcept { return purgesIssued_; }
     [[nodiscard]] std::size_t pendingCount() const noexcept { return pending_.size(); }
     [[nodiscard]] uint64_t pendingRefused() const noexcept { return pendingRefused_; }
     [[nodiscard]] bool hasInFlight() const noexcept { return !std::holds_alternative<Idle>(inFlight_); }
@@ -144,6 +146,12 @@ private:
     void startBootstrap_(const SecurityBootstrapMsg& m, int64_t nowNs, SecurityRequest& req);
     /// Preview, encode and append `e`; false = answered already.
     bool appendEvent_(SecurityRequest& req, rune::security::SecurityEvent e, int64_t nowNs);
+    /// Namespaces Phase 2 Task 6a: the leader's own NamespacePurged for the lowest-nsId DELETING namespace that still
+    /// has security records.  Derived from the two applied states on every pass (no timer, no in-flight memory): the
+    /// leader only reaches here when LeaderServing, i.e. every appended event is applied, so a purge appended earlier
+    /// has already removed its records and nothing is issued twice; a crash or a leader change just re-derives it
+    /// (the apply is idempotent).  True = one event appended.
+    bool issuePurge_(int64_t nowNs);
     void answer_(const SecurityRequest& req, uint16_t code, std::string_view detail = {}, uint64_t objectId = 0,
                  uint32_t newVersion = 0, int64_t gateOffset = -1);
     [[nodiscard]] static std::pair<int64_t, int64_t> sessionCorrOf_(const SecurityRequest& req) noexcept;
@@ -157,7 +165,7 @@ private:
     std::variant<Idle, AwaitingCommit>   inFlight_;
     std::deque<SecurityRequest>          pending_;
     std::vector<uint8_t>                 eventBuf_;   // the encoded event (capacity reused)
-    uint64_t started_ = 0, answered_ = 0, eventsAppended_ = 0, pendingRefused_ = 0;
+    uint64_t started_ = 0, answered_ = 0, eventsAppended_ = 0, pendingRefused_ = 0, purgesIssued_ = 0;
 };
 
 } // namespace rune::node

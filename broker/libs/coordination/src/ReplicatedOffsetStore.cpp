@@ -31,6 +31,7 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/coordination/ReplicatedOffsetStore.h>
+#include <rune/coordination/NsScopedId.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <algorithm>
@@ -72,6 +73,21 @@ inline int64_t getLE64(const uint8_t* p) {
     uint64_t u = 0;
     for (int i = 0; i < 8; ++i) u |= static_cast<uint64_t>(p[i]) << (i * 8);
     return static_cast<int64_t>(u);
+}
+
+/// Decodes key_bytes = groupLen(u16) group topicLen(u16) topic partition(i32).  False when cut short.
+bool decodeKeyBytes(const uint8_t* kp, std::size_t ksz, std::string& group, std::string& topic, int32_t& partition) {
+    if (ksz < 2u) return false;
+    const uint16_t groupLen = getLE16(kp); kp += 2; ksz -= 2;
+    if (ksz < groupLen) return false;
+    group.assign(reinterpret_cast<const char*>(kp), groupLen); kp += groupLen; ksz -= groupLen;
+    if (ksz < 2u) return false;
+    const uint16_t topicLen = getLE16(kp); kp += 2; ksz -= 2;
+    if (ksz < topicLen) return false;
+    topic.assign(reinterpret_cast<const char*>(kp), topicLen); kp += topicLen; ksz -= topicLen;
+    if (ksz < 4u) return false;
+    partition = getLE32(kp);
+    return true;
 }
 
 } // namespace
@@ -192,6 +208,33 @@ rune::replication::Offset ReplicatedOffsetStore::commitAt(const GroupId&        
 }
 
 // ---------------------------------------------------------------------------
+// tombstoneNamespace (Task 6b)
+// ---------------------------------------------------------------------------
+
+bool ReplicatedOffsetStore::tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t /*nowNs*/)
+{
+    if (nsId == 0) return true;   // `default` is never deleted
+    if (batch == 0) batch = 1;
+    uint32_t written = 0;
+    for (auto git = index_.begin(); git != index_.end() && written < batch;) {
+        if (parseScopedId(git->first).nsId != nsId) { ++git; continue; }
+        TpMap& tps = git->second;
+        for (auto tit = tps.begin(); tit != tps.end() && written < batch;) {
+            encodeKey(git->first, tit->first);
+            const rune::replication::Offset base = replica_->appendKeyed(
+                std::span<const uint8_t>(keyScratch_.data(), keyScratch_.size()), std::span<const uint8_t>{},
+                /*acksAll=*/true);
+            if (base < 0) return false;   // min-ISR gated: the next call resumes here
+            tit = tps.erase(tit);
+            ++written;
+        }
+        if (tps.empty()) git = index_.erase(git);
+        else ++git;
+    }
+    return written == 0;
+}
+
+// ---------------------------------------------------------------------------
 // fetch
 // ---------------------------------------------------------------------------
 
@@ -230,9 +273,22 @@ ReplicatedOffsetStore::fetchAll(const GroupId& group) const
 // val_bytes = offset(int64) + tsNs(int64) + metaLen(uint16) + meta
 // ---------------------------------------------------------------------------
 
-void ReplicatedOffsetStore::applyRecord(std::string_view /*unused_key*/,
+void ReplicatedOffsetStore::applyRecord(std::string_view recordKey,
                                          std::string_view payload)
 {
+    // Task 6b (D20): a TOMBSTONE - the record key is the offset's key_bytes, the value is empty (the null-value marker
+    // LogCleaner::isTombstone recognises): erase the key.  A pre-CP-1 record has an empty key and is never empty-valued.
+    if (payload.empty()) {
+        std::string g, t;
+        int32_t part = 0;
+        if (!decodeKeyBytes(reinterpret_cast<const uint8_t*>(recordKey.data()), recordKey.size(), g, t, part)) return;
+        if (auto git = index_.find(g); git != index_.end()) {
+            git->second.erase(TopicPartition{std::move(t), part});
+            if (git->second.empty()) index_.erase(git);
+        }
+        return;
+    }
+
     // The wrapper record always has an empty key; all our data is in the value
     // (the payload we passed to append()).
     const auto* p = reinterpret_cast<const uint8_t*>(payload.data());

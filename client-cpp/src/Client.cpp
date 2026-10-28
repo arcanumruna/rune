@@ -1565,11 +1565,12 @@ OpResult Client::dropTopic(std::string_view name, const DdlOptions& ddl, Complet
 OpResult Client::namespaceDdl(rune::protocol::client::NamespaceDdlKind kind, std::string_view name,
                               const std::array<uint8_t, rune::protocol::client::kNamespacePresentMaskBytes>& presentMask,
                               const rune::protocol::NamespaceLimits& limits, const DdlOptions& ddl,
-                              CompletionTarget target, Token token) {
+                              CompletionTarget target, Token token, rune::protocol::client::NsSuspendMode mode) {
     namespace rpc = rune::protocol::client;
     if (name.empty()) return OpResult::InvalidArgument;
     rpc::NamespaceDdlRequest msg;
     msg.kind        = kind;
+    msg.mode        = mode;
     msg.name        = std::string(name);
     msg.presentMask = presentMask;
     msg.limits      = limits;
@@ -1591,6 +1592,16 @@ OpResult Client::listNamespaces(uint32_t afterNsId, uint16_t max, CompletionTarg
     const std::size_t n = msg.encode(frame.data());
     if (n == 0) return OpResult::InvalidArgument;
     return issueControl_(OpKind::ListNamespaces, target, token, std::span<const uint8_t>(frame.data(), n), 0);
+}
+
+OpResult Client::namespaceUsage(std::string_view name, CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::NamespaceUsageRequest msg;
+    msg.name.assign(name);
+    std::vector<uint8_t> frame(msg.encodedSize());
+    const std::size_t n = msg.encode(frame.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueControl_(OpKind::NamespaceUsage, target, token, std::span<const uint8_t>(frame.data(), n), 0);
 }
 
 OpResult Client::dropView(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token) {
@@ -3004,7 +3015,9 @@ ViewRowResult Client::getViewRowAndWait(int32_t viewTopicId, uint64_t keyU64, ui
                  // Closed) is.
                  if (c.status != OpStatus::BrokerError) throwForStatus_("getViewRow()", c, p);
                  result.status = (c.status == OpStatus::Ok) ? ViewRowResult::kOk : c.errorCode;
-                 if (result.status == ViewRowResult::kOk) result.rowBytes.assign(p.begin(), p.end());
+                 if (result.status == ViewRowResult::kOk || result.status == ViewRowResult::kViewPaused ||
+                     result.status == ViewRowResult::kThrottled)
+                     result.rowBytes.assign(p.begin(), p.end());   // kViewPaused: the paused offset, 8 LE bytes
              });
     return result;
 }
@@ -3043,6 +3056,63 @@ Client::NamespaceResult<void> Client::setNamespaceLimits(std::string_view name, 
     return {};
 }
 
+namespace {
+// Suspend / Resume / Delete carry no limits.
+const std::array<uint8_t, rune::protocol::client::kNamespacePresentMaskBytes> kNoMask{};
+}  // namespace
+
+Client::NamespaceResult<void> Client::suspendNamespace(std::string_view name, rune::protocol::client::NsSuspendMode mode,
+                                                       std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    DdlResult r;
+    andWait_("suspendNamespace()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return namespaceDdl(rpc::NamespaceDdlKind::Suspend, name, kNoMask, rune::protocol::NamespaceLimits{},
+                                     DdlOptions{}, q, t, mode);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("suspendNamespace()", c, p);
+                 r = ddlResultOf(c, p);
+                 r.requestId = requestIdOf(c);
+             });
+    if (r.errorCode != 0) return std::unexpected(std::move(r));
+    return {};
+}
+
+Client::NamespaceResult<void> Client::resumeNamespace(std::string_view name, std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    DdlResult r;
+    andWait_("resumeNamespace()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return namespaceDdl(rpc::NamespaceDdlKind::Resume, name, kNoMask, rune::protocol::NamespaceLimits{},
+                                     DdlOptions{}, q, t);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("resumeNamespace()", c, p);
+                 r = ddlResultOf(c, p);
+                 r.requestId = requestIdOf(c);
+             });
+    if (r.errorCode != 0) return std::unexpected(std::move(r));
+    return {};
+}
+
+Client::NamespaceResult<void> Client::deleteNamespace(std::string_view name, std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    DdlResult r;
+    andWait_("deleteNamespace()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return namespaceDdl(rpc::NamespaceDdlKind::Delete, name, kNoMask, rune::protocol::NamespaceLimits{},
+                                     DdlOptions{}, q, t);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError && c.status != OpStatus::Ok) throwForStatus_("deleteNamespace()", c, p);
+                 r = ddlResultOf(c, p);
+                 r.requestId = requestIdOf(c);
+             });
+    if (r.errorCode != 0) return std::unexpected(std::move(r));
+    return {};
+}
+
 Client::NamespaceResult<std::vector<rune::protocol::client::NamespaceInfo>>
 Client::listNamespaces(std::chrono::milliseconds timeout) {
     namespace rpc = rune::protocol::client;
@@ -3071,6 +3141,31 @@ Client::listNamespaces(std::chrono::milliseconds timeout) {
         after = page->nextAfter;
     }
     return out;
+}
+
+Client::NamespaceResult<rune::protocol::client::NamespaceUsageResponse>
+Client::namespaceUsage(std::string_view name, std::chrono::milliseconds timeout) {
+    namespace rpc = rune::protocol::client;
+    DdlResult err;
+    std::optional<rpc::NamespaceUsageResponse> got;
+    andWait_("namespaceUsage()", timeout, 64u << 10,
+             [&](Completions& q, Token t) { return namespaceUsage(name, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status == OpStatus::BrokerError) {
+                     err.errorCode = c.errorCode;
+                     err.detail.assign(reinterpret_cast<const char*>(p.data()), p.size());
+                     return;
+                 }
+                 throwForStatus_("namespaceUsage()", c, p);
+                 got = rpc::NamespaceUsageResponse::decode(p.data(), p.size());
+             });
+    if (err.errorCode != 0) return std::unexpected(std::move(err));
+    if (!got) throw std::runtime_error("namespaceUsage(): undecodable NamespaceUsageResponse");
+    if (got->code != 0) {
+        err.errorCode = static_cast<uint16_t>(got->code);
+        return std::unexpected(std::move(err));
+    }
+    return *got;
 }
 
 std::vector<std::pair<std::string, int32_t>> Client::listTopics(std::chrono::nanoseconds timeout) {
@@ -4600,6 +4695,18 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if (len < rune::protocol::client::MessageHeader::ENCODED_SIZE) break;
         const auto corr = static_cast<int64_t>(rune::protocol::client::detail::getLE64(buf, 16));
         if (const std::size_t i = findCtl_(corr); i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::ListNamespaces) {
+            PendingCtl p = takeCtl_(i);
+            completeCtl_(p, OpStatus::Ok, 0, 0, 0, std::span<const uint8_t>(buf, len),
+                         detail::CompletionRing::Overflow::TooLarge);
+        }
+        break;
+    }
+
+    // ---- Phase 2 Task 16: NamespaceUsageResponse (85) — the raw frame is the payload (the caller decodes).
+    case codec::TemplateId::NamespaceUsageResponse: {
+        if (len < rune::protocol::client::MessageHeader::ENCODED_SIZE) break;
+        const auto corr = static_cast<int64_t>(rune::protocol::client::detail::getLE64(buf, 16));
+        if (const std::size_t i = findCtl_(corr); i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::NamespaceUsage) {
             PendingCtl p = takeCtl_(i);
             completeCtl_(p, OpStatus::Ok, 0, 0, 0, std::span<const uint8_t>(buf, len),
                          detail::CompletionRing::Overflow::TooLarge);

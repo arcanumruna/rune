@@ -135,6 +135,15 @@ public:
     ///          rebuild here would silently recover no committed offsets.
     bool rebuildFromLog();
 
+    /// Namespaces Phase 2 Task 6b (D20): writes at most `batch` TOMBSTONES (the record key of the offset, an empty
+    /// value: what LogCleaner::isTombstone recognises, so compaction removes the key) for live offsets whose group id
+    /// belongs to namespace `nsId` (NsScopedId), and erases them from the in-memory map as each is appended.  Returns
+    /// true iff this call found no live key of `nsId` (it then wrote nothing): a namespace of n keys takes
+    /// ceil(n / batch) calls that return false, then one that returns true.  Resumable and idempotent: tombstoned keys
+    /// are no longer live, so the next call continues.  A refused append (min-ISR gate) stops the call (false).
+    /// `nsId` 0 (`default`) is never deleted: nothing is written, true.  `batch` 0 counts as 1.  Control thread, cold.
+    bool tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs);
+
     /// The __consumer_offsets replica this store appends to / rebuilds from.
     [[nodiscard]] rune::replication::PartitionReplica* replica() const noexcept { return replica_; }
 

@@ -64,6 +64,7 @@
 #include <rune/gateway/SecurityView.h>
 #include <rune/gateway/SessionAuth.h>
 #include <rune/gateway/Authorizer.h>
+#include <rune/gateway/NamespaceSuspendTable.h>
 #include <rune/gateway/NsResolve.h>
 #include <rune/gateway/LiveSecurityChanges.h>
 #include <rune/gateway/ObjectIndex.h>
@@ -96,6 +97,8 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 #include <rune/metadata/RoutingImage.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/node/RecordsPush.h>
+#include <rune/node/NsSlotTable.h>
+#include <rune/node/NsLimitAggregator.h>
 #include <rune/node/UnauthLogLimiter.h>
 #include <rune/node/SessionAnnouncer.h>
 #include <rune/node/PermissionShipper.h>
@@ -370,6 +373,12 @@ public:
     // -----------------------------------------------------------------------
     void setTxnService(rune::gateway::ITxnRequestHandler* service) noexcept {
         txnService_ = service;
+        // Namespaces Phase 2 Task 10 (D24): the booted namespaces' transaction limits (later changes arrive with each
+        // namespace record upsert).  Startup thread.
+        if (txnService_ != nullptr)
+            namespaces_.registry().forEach([this](const rune::catalog::NamespaceRecord& r) {
+                txnService_->setNamespaceTxnLimits(r.nsId, r.limits.maxOpenTxns, r.limits.maxTxnTimeMs);
+            });
     }
 
     // -----------------------------------------------------------------------
@@ -536,8 +545,58 @@ public:
     void setBootObjects(rune::gateway::ObjectIndex objects) { objectIndex_ = std::move(objects); }
     /// Namespaces Task 9 (spec §2): the booted catalog's namespaces (startup thread, before any thread runs), then
     /// the applier's namespaceUpserted effects (kA2cNamespaceUpserted, control drain) - the login lookup's mirror.
-    void setBootNamespaces(const rune::catalog::NamespaceRegistry& r) { namespaces_ = rune::catalog::NamespaceMirror(r); }
-    void onNamespaceUpserted(const rune::catalog::NamespaceRecord& r) { (void)namespaces_.upsert(r); }
+    void setBootNamespaces(const rune::catalog::NamespaceRegistry& r) {
+        namespaces_ = rune::catalog::NamespaceMirror(r);
+        // A gateway with no BrokerNode in front of it (unit rigs) keeps its own slots: lowest free, in nsId order.
+        r.forEach([this](const rune::catalog::NamespaceRecord& rec) { (void)nsSlots_.assign(rec.nsId); });
+    }
+    /// Phase 2 Task 3: also re-gates the namespace's live sessions (ReadOnly: bound to the deny table; RejectAll /
+    /// Deleting: closed; resumed: real permissions re-shipped).
+    void onNamespaceUpserted(const rune::catalog::NamespaceRecord& r);
+    /// Phase 2 Task 3: a deleted namespace is gone (kA2cNamespaceErased); its sessions were closed at Deleting.
+    void onNamespaceErased(uint32_t nsId) {
+        (void)namespaces_.erase(nsId);
+        if (txnService_ != nullptr) txnService_->setNamespaceTxnLimits(nsId, 0, 0);   // Task 10
+        if (const uint16_t sl = nsSlots_.slotOf(nsId); sl != rune::node::kNoNsSlot && nsId != 0) onNsSlotFreed(sl, nsId);
+    }
+    // Namespaces Phase 2 Task 8 (D22): this gateway's OWN copy of the node's slot table, fed by the control thread
+    // (BrokerNode) before it hands the namespace record to onNamespaceUpserted.  A session caches (nsId, nsSlot) at login;
+    // a produce whose tag no longer matches is refused InvalidRequest and counted (`rune.ns.slot_mismatch`).
+    void configureNsSlots(uint32_t capacity) { nsSlots_.reset(capacity); nsConns_.assign(nsSlots_.capacity(), NsConnSlot{}); }
+    void onNsSlotAssign(uint16_t slot, uint32_t nsId, const rune::protocol::NamespaceLimits& l);
+    void onNsSlotFreed(uint16_t slot, uint32_t nsId);
+    /// Mismatches counted here plus the cumulative counts the workers reported (SessionSignal NsSlotMismatch).
+    [[nodiscard]] uint64_t nsSlotMismatchTotal() const noexcept {
+        uint64_t n = nsSlotMismatches_;
+        for (const uint64_t w : workerNsSlotMismatches_) n += w;
+        return n;
+    }
+    /// Namespaces Phase 2 Task 14 (D28): the node's limit aggregator (control thread, the gateway's own thread).  Worker usage
+    /// reports (SessionSignal NsUsage) are forwarded to it; the usage query (template 84) reads its totals.
+    void setNsLimitAggregator(rune::node::NsLimitAggregator* a) noexcept { nsAggregator_ = a; }
+    [[nodiscard]] const rune::node::NsSlotTable& nsSlotsForTest() const noexcept { return nsSlots_; }
+    /// Namespaces Phase 2 Task 10 (#236, D24): RUNE_ANONYMOUS_MAX_CONNECTIONS / RUNE_ANONYMOUS_REQUEST_OPS_PER_SEC.
+    void setAnonymousCaps(int32_t maxConnections, int32_t opsPerSec) noexcept {
+        anonMaxConnections_ = maxConnections > 0 ? static_cast<uint32_t>(maxConnections) : 1u;
+        anonOpsPerSec_      = opsPerSec > 0 ? static_cast<uint32_t>(opsPerSec) : 1u;
+    }
+    /// Authenticated sessions of namespace `nsId` this gateway counts (D24; read ON the control thread).
+    [[nodiscard]] uint32_t nsConnectionsForTest(uint32_t nsId) const noexcept {
+        const uint16_t sl = nsSlots_.slotOf(nsId);
+        return sl < nsConns_.size() ? nsConns_[sl].total : 0;
+    }
+    [[nodiscard]] uint32_t nsUserConnectionsForTest(uint32_t nsId, uint64_t userId) const {
+        const uint16_t sl = nsSlots_.slotOf(nsId);
+        if (sl >= nsConns_.size()) return 0;
+        const auto it = nsConns_[sl].perUser.find(userId);
+        return it == nsConns_[sl].perUser.end() ? 0 : it->second;
+    }
+    [[nodiscard]] uint32_t anonymousSessionsForTest() const noexcept { return anonSessions_; }
+    /// Test seam: the check a produce of `sessionId` does against the slot table (counts a mismatch).
+    [[nodiscard]] bool sessionNsTagMatchesForTest(int64_t sessionId) {
+        Session* s = sessions_.find(sessionId);
+        return s != nullptr && nsTagMatches_(*s);
+    }
     /// Namespaces Task 9 (spec §11, RUNE_ANONYMOUS_READ, off by default): in Required mode a session that sends a
     /// request without logging in becomes AuthAnonymousRead (nsId 0, Describe-only) instead of being ended.
     void setAnonymousRead(bool on) noexcept { anonymousRead_ = on; }
@@ -1498,6 +1557,7 @@ public:
         case pc::TemplateId::SecurityBootstrap: handleSecurityBootstrap(buf, len); break;
         case pc::TemplateId::NamespaceDdl:     handleNamespaceDdl(buf, len); break;
         case pc::TemplateId::ListNamespaces:   handleListNamespaces(buf, len); break;
+        case pc::TemplateId::NamespaceUsage:   handleNamespaceUsage(buf, len); break;
         default: break;
         }
     }
@@ -1973,6 +2033,7 @@ private:
     // Namespaces Task 7: NamespaceDdl (81) and ListNamespaces (82).
     void handleNamespaceDdl     (const uint8_t* buf, std::size_t len);
     void handleListNamespaces   (const uint8_t* buf, std::size_t len);
+    void handleNamespaceUsage   (const uint8_t* buf, std::size_t len);   // Phase 2 Task 16 (D29)
     // Task 20: GetViewRow (72) — build a GetViewRow WorkerOp routed to the
     // owning worker (same op/return plumbing as PushRead); the worker's
     // ViewRowResult is encoded as a ViewRowResponse (73) in drainWorkerReturns_.
@@ -2465,6 +2526,16 @@ private:
     static void noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr);
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
     rune::catalog::NamespaceMirror namespaces_;   ///< namespaces Task 9: control thread's copy (login lookup)
+    rune::node::NsSlotTable nsSlots_;             ///< namespaces Phase 2 Task 8: this gateway's own slot table
+    uint64_t                nsSlotMismatches_ = 0;
+    rune::node::NsLimitAggregator* nsAggregator_ = nullptr;   ///< Task 14: not owned; same thread
+    std::vector<uint64_t>   workerNsSlotMismatches_;   ///< cumulative, per worker (SessionSignal NsSlotMismatch)
+    /// One array index and a compare; counts a mismatch.
+    [[nodiscard]] bool nsTagMatches_(const Session& s) noexcept {
+        if (nsSlots_.matches(s.nsSlot, s.nsId)) [[likely]] return true;
+        ++nsSlotMismatches_;
+        return false;
+    }
     bool anonymousRead_ = false;                  ///< namespaces Task 9: RUNE_ANONYMOUS_READ (off by default)
     /// Namespaces Task 9: the session's namespace (AuthAuthenticated / AuthPasswordChangeRequired; 0 otherwise -
     /// anonymous and not-yet-logged-in sessions are `default`'s, D12).
@@ -2484,7 +2555,22 @@ private:
     /// Namespaces Task 9: with RUNE_ANONYMOUS_READ on, an AwaitingFirst session that sends a request other than a login
     /// leg / the bootstrap becomes the anonymous reader of `default`.  Both entry points (authGateRefuses_ and
     /// handleProduce's cold branch) call this, so the first request's kind never changes the outcome.
-    void becomeAnonymousIfAllowed_(Session& session, rune::protocol::client::TemplateId tid);
+    /// Returns true when the anonymous-connection cap (RUNE_ANONYMOUS_MAX_CONNECTIONS) refused the conversion: the caller
+    /// answers NamespaceLimitExceeded and the session stays unauthenticated.
+    [[nodiscard]] bool becomeAnonymousIfAllowed_(Session& session, rune::protocol::client::TemplateId tid);
+    /// Task 10 (#236): the anonymous readers share ONE token bucket (GCRA, the injected clock nowNs_); true = refused
+    /// (answered Throttled with retryAfterNs, or InvalidRequest below v14).  Called for a session in AuthAnonymousRead.
+    [[nodiscard]] bool anonOpsRefused_(Session& session, const rune::protocol::client::MessageHeader& hdr, const uint8_t* buf, std::size_t len);
+    // ---- Task 10 (D24): per-node connection counts, by nsSlot.  Admission after the proof and the gate; ONE release.
+    struct NsConnSlot { uint32_t total = 0; std::unordered_map<uint64_t, uint32_t> perUser; };
+    enum class Admit : uint8_t { Ok, Connections, PerUser, SessionsPerUser };
+    [[nodiscard]] Admit admitConnection_(Session& s, uint64_t userId, const rune::catalog::NamespaceRecord& rec, bool exempt);
+    void releaseConnection_(Session& s) noexcept;   ///< closeSession_ is the ONLY caller (every close path goes through it)
+    std::vector<NsConnSlot> nsConns_;
+    uint32_t anonSessions_       = 0;
+    uint32_t anonMaxConnections_ = 16;
+    uint32_t anonOpsPerSec_      = 1000;
+    int64_t  anonTatNs_          = 0;   ///< GCRA theoretical arrival time
     const rune::gateway::SecurityView* securityView_ = nullptr;   // control thread's own mirror (same thread as the gateway)
     bool     securityServing_ = true;           ///< issues #15 / #111: see setSecurityServing
     int64_t  securityKnownEnd_ = -1;            ///< #205: see setSecurityKnownEnd
@@ -2534,6 +2620,18 @@ public:
 private:
     /// true = refused here: the auth gate (gateFor) answered AuthenticationFailed (and ended the session) or
     /// PasswordChangeRequired (the session stays) in the request's own response type.
+    /// Namespaces Phase 2 Task 3 (D21): refuses `tid` (answered NamespaceSuspended, or InvalidRequest for a client below
+    /// kClientVersionNamespaces) when the session's namespace is suspended and the table says so.  Cold: only
+    /// templates some gate refuses reach it.  Cluster admins are exempt.  True = consumed.
+    [[nodiscard]] bool nsGateRefuses_(uint16_t tid, const uint8_t* buf, std::size_t len);
+    [[nodiscard]] uint16_t suspendedCode_(const Session& s) const noexcept;
+    /// Namespaces Phase 2 Task 9: NamespaceLimitExceeded (52) for a v14+ session, InvalidRequest (39) below.
+    [[nodiscard]] uint16_t nsLimitCode_(const Session& s) const noexcept;
+    std::vector<uint8_t> ddlDowngradeScratch_;   ///< sendControlFrame: a DdlResponse 52 -> 39 copy for an old client (cold)
+    /// Answers a request refused by the namespace gate (the same answer on the dispatch and the Produce path).
+    void answerSuspended_(Session& s, const rune::protocol::client::MessageHeader& hdr, const uint8_t* buf, std::size_t len);
+    /// True when `s` is exempt from the namespace gate (ADMIN ON CLUSTER).  Cold: only the refuse path asks.
+    [[nodiscard]] bool gateExempt_(const Session& s) const;
     [[nodiscard]] bool authGateRefuses_(rune::protocol::client::TemplateId tid, const uint8_t* buf, std::size_t len);
     /// The gate's answer: AuthenticationFailed + end, or PasswordChangeRequired (the session stays), in the request's own type.
     void answerGate_(Session& session, const rune::protocol::client::MessageHeader& hdr, rune::gateway::AuthGate gate,
@@ -2587,11 +2685,6 @@ private:
     [[nodiscard]] std::size_t filterFetchAllByRead_(const Session& session, const uint8_t* reqBuf, std::size_t reqLen,
                                                     std::size_t encoded);
     [[nodiscard]] bool denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
-    /// Namespaces D8, the cluster admin's half: root logs in to `default`, so the session-nsId check passes it; a
-    /// group / txn request naming a non-default topic id, or a group / transactional id qualified by an existing
-    /// non-default namespace, is still outside `default`.  Non-root sessions: false (their nsId check, then their
-    /// grants, decide).  Zero allocation (zero-copy decoders).
-    [[nodiscard]] bool rootOutsideDefault_(const Session& session, uint16_t tid, const uint8_t* buf, std::size_t len) const;
     [[nodiscard]] bool denyTxnRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
     template <class Msg> [[nodiscard]] std::optional<rune::gateway::Denial> authorizeCatalogDdl_(const Session& session, const Msg& m,
                                                                                                std::string_view local) const;
@@ -2628,11 +2721,13 @@ private:
     uint64_t applyOpWorkers_   = 0;   ///< bit w: an Unsubscribe of this event went to worker w's op ring
     void onEnforceFenceAck_(int32_t worker, int ring, uint64_t seq) noexcept;
     void promoteEnforced_() noexcept;
+    std::vector<int64_t> nsGateScratch_;         ///< namespaces Phase 2 Task 3: sessions re-gated by one upsert (capacity persists)
     std::vector<int64_t> liveScratch_;           ///< reused session-id list (capacity persists)
     /// Recompile one session's table, end what lost READ, ship the WRITE bits.
     void refreshSession_(int64_t sid);
     /// Revoke one session: SessionRevoked on every live subscription, then session-level (corr 0) with `reason`, then close.
-    void revokeSession_(int64_t sid, std::string_view reason);
+    void revokeSession_(int64_t sid, std::string_view reason,
+                        uint16_t code = static_cast<uint16_t>(rune::protocol::client::ErrorCode::SessionRevoked));
     /// Issue #196: on the shard path, bind `s` to the deny table on the permission shipper's FIFO, so the workers refuse
     /// its direct produce whatever its close's progress.  No-op off the shard path.
     void bindDenyTable_(Session& s);
